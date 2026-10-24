@@ -24,8 +24,11 @@ plugins that the system frameworks load (Metal: `MetalPluginName`; OpenGL ES: `I
 renderer plugin in /System/Library/Extensions that Apple's GLEngine drives: notes section 15). Our kernel publishes this service
 (0201), and patch 0205 adds the plugin names. So the drivers load the normal way, in every process.
 
-Order of work: OpenGL ES first (iOS 16 CoreAnimation and CoreImage fall back to OpenGL ES when no
-Metal device exists, so this alone accelerates the whole UI), Metal second (apps, and newer iOS).
+Order of work (owner's decision, 2026-10-25): **Metal first, OpenGL ES second.** CoreAnimation and
+CoreImage try Metal before OpenGL ES, so a working NegroniMetal device accelerates the whole UI, apps and
+newer iOS versions; ios-flame drew the 20H392 home screen this way (Metal -> metal2vulkan -> Turnip).
+The OpenGL ES plugin (with Mesa softpipe) is the fallback when Metal fails or is turned off
+(`negronimetal=0`). Safety: the Metal plugin's allow-list, crash counter and boot-arg prevent a black UI.
 
 ## Status (2026-10-25)
 
