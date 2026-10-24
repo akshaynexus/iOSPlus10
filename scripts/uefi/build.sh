@@ -6,6 +6,7 @@
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 TARGET=${1:-DEBUG}
+# CLEAN=1 scripts/uefi/build.sh: start from an empty Build/ (needed after the native macOS build)
 MU=$EXT/Mu-Silicium-negroni
 # NuGet-type deps (mu_nasm) without NuGet.exe/Mono: curl + unzip + state file
 "$REPO/scripts/uefi/fetch-extdeps.sh"
@@ -18,7 +19,7 @@ MU=$EXT/Mu-Silicium-negroni
   export UNIXNU_ROOT='$EXT/UniXNU'
   python3 Platforms/OnePlus/negroniPkg/DeviceBuild.py --setup -t $TARGET
   python3 Platforms/OnePlus/negroniPkg/DeviceBuild.py --update -t $TARGET
-  python3 build_uefi.py -d negroni -r $TARGET"
+  python3 build_uefi.py -d negroni -r $TARGET ${CLEAN:+-c}"   # CLEAN=1: clean build (e.g. after build-macos.sh)
 fd=$MU/Build/negroniPkg/${TARGET}_CLANGPDB/FV/SILICIUM_UEFI.fd
 mkdir -p "$OUT/mu"
 cp "$fd" "$OUT/mu/SILICIUM_UEFI-$TARGET.fd"

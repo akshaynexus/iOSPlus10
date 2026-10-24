@@ -20,6 +20,13 @@ else
   echo "DarwinBoot: refusal-on-screen.patch already applied (or does not apply)"
 fi
 
+# 1b. our own Mu fixes (patches/mu/*.patch), skipped when already applied
+for pt in "$REPO"/patches/mu/*.patch; do
+  [ -f "$pt" ] || continue
+  if git -C "$MU" apply --reverse --check "$pt" 2>/dev/null; then echo "Mu patch already applied: $(basename "$pt")"
+  else git -C "$MU" apply "$pt"; echo "Mu patch applied: $(basename "$pt")"; fi
+done
+
 "$REPO/scripts/uefi/patch-dxe.sh" "${1:-$BACKUP/images/uefi.img}"
 python3 "$REPO/scripts/uefi/binaries.py" "$MU/Binaries/r0q" "$OUT/uefi/modules" "$OUT/uefi/patched" \
   "$OUT/uefi/Binaries-negroni"

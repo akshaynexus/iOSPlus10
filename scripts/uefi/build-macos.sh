@@ -9,7 +9,8 @@
 #   (Mu-Basetools_extdep/MacOs-ARM-64; stuart's host name on Apple silicon).
 # - NuGet deps: scripts/uefi/fetch-extdeps.sh (curl). nasm is not used for AARCH64 targets.
 # - Python: out/venv (Mu requirements, scripts/setup/native-tools.sh).
-# The Mu tree and its Build/ folder are shared with scripts/uefi/build.sh: do not run both at once.
+# The Mu tree and its Build/ folder are shared with scripts/uefi/build.sh: do not run both at once;
+# after this script, run the container build with CLEAN=1.
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 [ "$(uname -s)" = Darwin ] || { echo "macOS only; on Linux use scripts/uefi/build.sh" >&2; exit 1; }

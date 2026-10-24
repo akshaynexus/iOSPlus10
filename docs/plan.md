@@ -28,6 +28,19 @@ Status date: 2026-10-24.
 - iOS root built on macOS (`make root`): 11 GiB used of 16 GiB, 173 apps, fsck_hfs OK;
   sparse image `~/op10-apple/ios16-root.simg` (11.6 GB, sha256 d5d4437d...).
 
+## First boot (2026-10-24, 19:48)
+
+- Flash: userdata from fastbootd (45 x 256 MiB, 303 s), then vendor_boot_a, vbmeta_a, dtbo_a,
+  boot_a, slot a: all OKAY.
+- Screen: the ABL log text, then **DarwinBoot's green bar** ("the kernel entry code ran"), then
+  nothing. Debug image (`negronifb_noconsole=0`, `negroniusb=2`): same screen, no USB device.
+  -> the kernel stops before its console starts.
+- Likely cause: Mu "Kernel RAM" was 0x840000000+0x140000000 (the port's later iOS 17 / 4K value; the
+  notes say that setup hangs right after the green bar). The 16K iOS 16 kernel needs
+  0x841000000+0x13F000000, so DarwinBoot's window (0x841004000) keeps a 32 MiB-aligned VA-PA delta
+  (slop NOTES 2026-10-20). Fixed in `patches/mu/0001-negroni-kernel-ram-16k.patch` (applied by
+  `scripts/uefi/prepare.sh`); Mu and both boot images rebuilt.
+
 ## Phase 1: iOS 16 (existing negroni port)
 
 1. ~~Measure the 12 GB memory map~~ (done over adb root). Optional: shim probe with `fastboot boot`.
