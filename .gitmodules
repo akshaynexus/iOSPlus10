@@ -12,12 +12,12 @@
 	branch = dev
 [submodule "external/Mu-Silicium-negroni"]
 	path = external/Mu-Silicium-negroni
-	url = https://github.com/pawlickerr/Mu-Silicum-negroni.git
+	url = https://github.com/akshaynexus/Mu-Silicum-negroni.git
 	branch = main
 [submodule "external/UniXNU"]
 	path = external/UniXNU
-	url = https://github.com/UniXNU/UniXNU.git
-	branch = main
+	url = https://github.com/akshaynexus/UniXNU.git
+	branch = iosplus10
 [submodule "external/UniXNU-ios26"]
 	path = external/UniXNU-ios26
 	url = https://github.com/none24smu/UniXNU.git
@@ -57,8 +57,3 @@
 	path = external/hackios-xnu-userland
 	url = https://github.com/oosexgang/hackios-xnu-userland.git
 	branch = main
-[submodule "Mu-Silicium-negroni"]
-	url = https://github.com/akshaynexus/Mu-Silicum-negroni.git
-[submodule "UniXNU"]
-	url = https://github.com/akshaynexus/UniXNU.git
-	branch = iosplus10
