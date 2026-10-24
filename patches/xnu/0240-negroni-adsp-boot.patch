@@ -1,0 +1,1173 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1897319..590cde5 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/negroni_touch.c			standard
+ bsd/dev/negroni_cpufreq.c		standard
+ bsd/dev/negroni_adreno.c		standard
+ bsd/dev/negroni_wifi.c			standard
++bsd/dev/negroni_adsp.c			standard
+ bsd/dev/negroni_rpmh.c			standard
+ bsd/dev/negroni_spmi.c			standard
+ bsd/dev/negroni_usb.c			standard
+diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
+new file mode 100644
+index 0000000..4c63e52
+--- /dev/null
++++ b/bsd/dev/negroni_adsp.c
+@@ -0,0 +1,955 @@
++/*
++ * NEGRONI (SM8450) audio DSP (ADSP, the Hexagon in LPASS) start: stage (a) of the iOSPlus10
++ * audio plan (docs/audio-plan.md). UNTESTED ON HARDWARE.
++ *
++ * Off by default. Boot-arg negroniadsp=1 runs the steps on a kernel thread of its own;
++ * negroniadsp_step=N stops after step N (default 8, all). Every line starts "NEGRONI ADSP:".
++ *
++ *   1  reads   SMEM (0x80900000, 2 MiB): $TOC, the apps<->ADSP partition (hosts 0 and 2), its
++ *              items; the ADSP's SMP2P item 443 (if present the ADSP has run since the reset:
++ *              stop, it is not started twice), its last words (item 423)
++ *   2  reads   the ADSP firmware area (negroni_ufs_adsp_area_read: 32 MiB right before the GPU
++ *              firmware area; scripts/audio/mkadsparea.py): header, adsp.mdt (ELF32, Qualcomm
++ *              MDT: program header segment, PT_LOAD segments in adsp.bNN, hash segment), the
++ *              SHA-256 of each file, the load span fits the carveout
++ *   3  writes  RPMh: lcx.lvl and lmx.lvl at level 384 (negroni_rpmh_arc_vote; the live DT cx/mx
++ *              supplies; Linux qcom_q6v5_pas proxy votes. hackios redwood_adsp.c: without them the
++ *              DSP died with "SFR Init: wdog or kernel error suspected.")
++ *   4  writes  AOSS QMP (0xc300000; Linux qcom_aoss.c): link and channel up if they are not, then
++ *              "{class: image, res: load_state, name: adsp, val: on}"
++ *   5  asks    TrustZone: PAS init image (PAS id 1, metadata = ELF header + program headers +
++ *              hash segment, Linux qcom_mdt_read_metadata), then PAS mem setup (carveout, span)
++ *   6  writes  the carveout 0x85700000 + 0x2800000 (live DT adsp_region; the Mu memory map
++ *              keeps it reserved in "PIL Reserved"): zero, each PT_LOAD at p_paddr - min p_paddr
++ *              (relocatable image), read back and compared by SHA-256
++ *   7  writes  SMEM: our SMP2P item 429 (allocated under TCSR mutex 3 like qcom_smem_alloc),
++ *              entry "master-kernel" = 0, features SSR-ACK; IPCC ring (client 3 LPASS, signal 2)
++ *   8  asks    TrustZone: PAS auth and reset (id 1); polls item 443 entry "slave-kernel" for
++ *              ready (bit 1), handover (bit 2), fatal (bit 0) for negroniadsp_wait seconds
++ *              (default 10). Handover: the rail votes are dropped (as Linux does). No ready or
++ *              fatal: last words, PAS shutdown. Ready: the ADSP stays up; the GLINK SMEM items
++ *              (478/479/480) are reported (GLINK itself is stage (b)).
++ *
++ * More boot-args: negroniadsp_pause=MS before each write step (default 0; >0 helps to see the
++ * last line in the USB log before a hang), negroniadsp_unvote=0 keeps the rail votes after
++ * handover.
++ *
++ * Addresses: the phone's live DT (out/live.dts: remoteproc-adsp@03000000, qcom,smp2p-adsp,
++ * qcom,ipcc@ed18000, power-controller@c300000, hwlock / syscon@1f40000, adsp_region), layouts
++ * from Linux (qcom_q6v5_pas.c, mdt_loader.c, smem.c, smp2p.c, qcom_aoss.c, qcom_hwspinlock.c)
++ * and the SM7325 template hackios-xnu-kernel bsd/dev/redwood_adsp.c (APSL 2.0).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include <libkern/crypto/sha2.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern uint64_t kvtophys(vm_offset_t va);
++extern kern_return_t thread_terminate(thread_t);
++extern void IOSleep(unsigned int milliseconds);
++extern int negroni_ufs_adsp_area_read(uint64_t at, void *dst, uint32_t count);
++extern int negroni_rpmh_arc_vote(const char *res, unsigned level);
++void negroni_adsp_init(void);
++
++#define STEPS                   8
++
++/* ---- addresses (live DT) ---- */
++#define SMEM_PHYS               0x80900000UL
++#define SMEM_SIZE               0x00200000u
++#define ADSP_MEM_PHYS           0x85700000UL    /* adsp_region@85e00000 { reg = <0 0x85700000 0 0x2800000> } */
++#define ADSP_MEM_SIZE           0x02800000u
++#define IPCC_PHYS               0x0ed18000UL
++#define AOSS_PHYS               0x0c300000UL
++#define AOSS_SIZE               0x400u
++#define TCSR_MUTEX_PHYS         0x01f43000UL    /* syscon@1f40000, stride 0x1000, smem hwlocks = <&tcsr_mutex 3> */
++
++/* ---- SCM / PAS (same encoding as negroni_adreno.c) ---- */
++#define SCM_64                  (1ull << 30)
++#define SCM_SIP                 (2ull << 24)
++#define SCM_CALL(svc, cmd)      ((uint64_t)(svc) << 8 | (cmd))
++#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
++#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
++#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
++#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
++#define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
++#define SCM_ONE_VALUE           1
++#define SCM_THREE_VALUES        3
++#define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)
++#define SCM_INTERRUPTED         1
++#define PAS_ADSP                1
++
++/* ---- SMEM (smem.c) ---- */
++#define SMEM_APPS               0
++#define SMEM_ADSP               2               /* qcom,remote-pid */
++#define SMEM_GLOBAL             0xfffe
++#define SMEM_CANARY             0xa5a5
++#define ITEM_CRASH_REASON       423
++#define ITEM_SMP2P_OURS         429             /* qcom,smem = <443 429>: inbound, outbound */
++#define ITEM_SMP2P_THEIRS       443
++#define ITEM_GLINK_DESC         478
++#define ITEM_GLINK_FIFO0        479
++#define ITEM_GLINK_FIFO1        480
++
++/* ---- SMP2P (smp2p.c) ---- */
++#define SMP2P_MAGIC             0x504d5324      /* "$SMP" */
++#define SMP2P_VERSION           1
++#define SMP2P_FEATURE_SSR_ACK   1u
++#define SMP2P_ENTRIES           16
++#define SMP2P_ITEM_SIZE         (20 + 20 * SMP2P_ENTRIES)
++#define DSP_FATAL               (1u << 0)       /* slave-kernel bits: remoteproc interrupts-extended */
++#define DSP_READY               (1u << 1)
++#define DSP_HANDOVER            (1u << 2)
++#define DSP_STOP_ACK            (1u << 3)
++
++/* ---- IPCC (qcom-ipcc.c) ---- */
++#define IPCC_SEND_ID            0x0c
++#define IPCC_CLIENT_AOP         0u
++#define IPCC_CLIENT_LPASS       3u
++#define IPCC_SIGNAL_SMP2P       2u
++
++/* ---- AOSS QMP (qcom_aoss.c) ---- */
++#define QMP_MAGIC               0x00
++#define QMP_MAGIC_VALUE         0x4d41494c      /* "LIAM" */
++#define QMP_VERSION             0x04
++#define QMP_UCORE_LINK          0x0c
++#define QMP_UCORE_LINK_ACK      0x10
++#define QMP_UCORE_CH            0x14
++#define QMP_UCORE_CH_ACK        0x18
++#define QMP_MCORE_LINK          0x24
++#define QMP_MCORE_LINK_ACK      0x28
++#define QMP_MCORE_CH            0x2c
++#define QMP_MCORE_CH_ACK        0x30
++#define QMP_MCORE_MBOX_SIZE     0x34
++#define QMP_MCORE_MBOX_OFFSET   0x38
++#define QMP_UP                  0x0000ffffu
++#define QMP_MSG_LEN             64u
++
++/* ---- firmware area (scripts/audio/mkadsparea.py) ---- */
++#define AREA_MAGIC              "NEGRADSP"
++#define AREA_MAX                64
++#define AREA_HEADER             8192u
++#define AREA_SIZE               (32u << 20)
++#define CHUNK                   (1u << 20)
++
++struct area_entry {
++	char name[48];
++	uint32_t offset, size;
++	uint8_t sha256[32];
++};
++struct area_header {
++	char magic[8];
++	uint32_t version, count;
++	struct area_entry entry[AREA_MAX];
++};
++
++/* ---- MDT (mdt_loader.c) ---- */
++#define PT_LOAD                 1
++#define MDT_TYPE(flags)         (((flags) >> 24) & 7)
++#define MDT_TYPE_HASH           2
++#define MDT_RELOCATABLE         (1u << 27)
++#define MAX_SEGMENTS            48
++
++struct seg {
++	uint32_t type, offset, paddr, filesz, memsz, flags;
++};
++
++static uint32_t step, last_step = STEPS, pause_ms, wait_s = 10, unvote = 1;
++static vm_offset_t smem, ipcc, aoss, tcsr;
++static struct area_header *area;                /* kmem, AREA_HEADER bytes */
++static uint8_t *mdt;                            /* kmem copy of adsp.mdt */
++static uint32_t mdt_size, nseg, min_pa, max_pa;
++static struct seg segs[MAX_SEGMENTS];
++static bool relocatable, rails_on;
++static uint32_t our_item;
++
++#define say(fmt, ...) printf("NEGRONI ADSP: %u " fmt "\n", step, ##__VA_ARGS__)
++
++static void
++announce(const char *what)
++{
++	say("about to: %s", what);
++	if (pause_ms) {
++		IOSleep(pause_ms);
++	}
++}
++
++/* 32-bit accesses only (SMEM, QMP message RAM and IPCC implement 32-bit accesses). */
++static uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static void
++wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb osh" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static int32_t
++scm(const char *what, uint64_t function, uint64_t args, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *answer)
++{
++	uint64_t session = 0;
++
++	say("SCM %s: smc %#llx (%#llx, %#llx, %#llx)", what, function, a0, a1, a2);
++	for (int i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
++		register uint64_t x1 __asm__("x1") = args;
++		register uint64_t x2 __asm__("x2") = a0;
++		register uint64_t x3 __asm__("x3") = a1;
++		register uint64_t x4 __asm__("x4") = a2;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
++		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		session = x6;
++		if (x0 != SCM_INTERRUPTED) {
++			say("SCM %s -> %d, answer %#llx", what, (int32_t)x0, x1);
++			*answer = x1;
++			return (int32_t)x0;
++		}
++	}
++	say("SCM %s keeps returning interrupted", what);
++	return -1;
++}
++
++/* ---- SMEM ---- */
++
++/* Partition of hosts (a, b): offset from the SMEM base, 0 if none. */
++static uint32_t
++smem_partition(uint16_t a, uint16_t b, uint32_t *size, uint32_t *cacheline)
++{
++	uint32_t toc = SMEM_SIZE - 0x1000;
++
++	if (rd32(smem, toc) != 0x434f5424 /* "$TOC" */ || rd32(smem, toc + 4) != 1) {
++		return 0;
++	}
++	uint32_t count = rd32(smem, toc + 8);
++	for (uint32_t i = 0; i < count && i < 64; i++) {
++		uint32_t e = toc + 32 + 48 * i;
++		uint32_t off = rd32(smem, e), sz = rd32(smem, e + 4), hosts = rd32(smem, e + 12);
++		uint16_t h0 = (uint16_t)hosts, h1 = (uint16_t)(hosts >> 16);
++		if (off == 0 || sz == 0 || !((h0 == a && h1 == b) || (h0 == b && h1 == a))) {
++			continue;
++		}
++		if ((uint64_t)off + sz > toc || rd32(smem, off) != 0x54525024 /* "$PRT" */ || rd32(smem, off + 8) != sz) {
++			return 0;
++		}
++		*size = sz;
++		*cacheline = rd32(smem, e + 16);
++		return off;
++	}
++	return 0;
++}
++
++/* Item in partition p (uncached list, then cached list): offset of its data, 0 if absent. */
++static uint32_t
++smem_find_in(uint32_t p, uint32_t psize, uint32_t cacheline, uint32_t item, uint32_t *size)
++{
++	uint32_t free_uncached = rd32(smem, p + 12), free_cached = rd32(smem, p + 16);
++
++	if (free_uncached > psize || free_cached > psize) {
++		return 0;
++	}
++	for (uint32_t at = 32; at + 16 <= free_uncached;) {
++		uint32_t w0 = rd32(smem, p + at), sz = rd32(smem, p + at + 4), pad = rd32(smem, p + at + 8);
++		if ((w0 & 0xffff) != SMEM_CANARY || sz > psize) {
++			break;
++		}
++		if ((w0 >> 16) == item) {
++			*size = sz - (pad & 0xffff);
++			return p + at + 16 + (pad >> 16);
++		}
++		at += 16 + (pad >> 16) + sz;
++	}
++	if (cacheline == 0 || (cacheline & (cacheline - 1))) {
++		return 0;
++	}
++	uint32_t back = (16 + cacheline - 1) & ~(cacheline - 1);
++	for (uint32_t at = psize - back; at > free_cached && at < psize;) {
++		uint32_t w0 = rd32(smem, p + at), sz = rd32(smem, p + at + 4), pad = rd32(smem, p + at + 8);
++		if ((w0 & 0xffff) != SMEM_CANARY || sz > at) {
++			break;
++		}
++		if ((w0 >> 16) == item) {
++			*size = sz - (pad & 0xffff);
++			return p + at - sz;
++		}
++		if (sz + back > at) {
++			break;
++		}
++		at -= sz + back;
++	}
++	return 0;
++}
++
++static uint32_t
++smem_item(uint32_t item, uint32_t *size)
++{
++	static const uint16_t hosts[2][2] = { { SMEM_APPS, SMEM_ADSP }, { SMEM_GLOBAL, SMEM_GLOBAL } };
++
++	for (unsigned h = 0; h < 2; h++) {
++		uint32_t psize = 0, cacheline = 0, p = smem_partition(hosts[h][0], hosts[h][1], &psize, &cacheline);
++		uint32_t at = p ? smem_find_in(p, psize, cacheline, item, size) : 0;
++		if (at) {
++			return at;
++		}
++	}
++	return 0;
++}
++
++static void
++last_words(void)
++{
++	char text[81];
++	uint32_t size = 0, at = smem_item(ITEM_CRASH_REASON, &size);
++
++	if (at == 0 || size == 0) {
++		say("item %u (last words): not there", ITEM_CRASH_REASON);
++		return;
++	}
++	bzero(text, sizeof(text));
++	for (uint32_t i = 0; i < MIN(size, (uint32_t)sizeof(text) - 1) / 4; i++) {
++		uint32_t w = rd32(smem, at + 4 * i);
++		memcpy(text + 4 * i, &w, 4);
++	}
++	say("ADSP LAST WORDS (item %u, %u bytes): \"%s\"", ITEM_CRASH_REASON, size, text);
++}
++
++/* Value of entry `name` in an SMP2P item at `at`; false if the entry is not there. */
++static bool
++smp2p_value(uint32_t at, const char *name, uint32_t *value)
++{
++	if (rd32(smem, at) != SMP2P_MAGIC) {
++		return false;
++	}
++	uint32_t valid = rd32(smem, at + 12) >> 16;
++	for (uint32_t i = 0; i < valid && i < SMP2P_ENTRIES; i++) {
++		char n[17];
++		for (uint32_t w = 0; w < 4; w++) {
++			uint32_t v = rd32(smem, at + 20 + 20 * i + 4 * w);
++			memcpy(n + 4 * w, &v, 4);
++		}
++		n[16] = 0;
++		if (strncmp(n, name, 16) == 0) {
++			*value = rd32(smem, at + 36 + 20 * i);
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++step_survey(void)
++{
++	uint32_t psize = 0, cacheline = 0, size = 0, p, at, value = 0;
++	uint64_t answer = 0;
++
++	smem = ml_io_map_wcomb(SMEM_PHYS, SMEM_SIZE);
++	p = smem_partition(SMEM_APPS, SMEM_ADSP, &psize, &cacheline);
++	if (p == 0) {
++		say("stop: no SMEM partition for hosts 0/2 ($TOC %#x)", rd32(smem, SMEM_SIZE - 0x1000));
++		return false;
++	}
++	say("SMEM partition 0/2 at %#lx, %#x bytes, cacheline %u, free uncached %#x cached %#x", SMEM_PHYS + p, psize,
++	    cacheline, rd32(smem, p + 12), rd32(smem, p + 16));
++	at = smem_item(ITEM_SMP2P_THEIRS, &size);
++	if (at != 0) {
++		bool have = smp2p_value(at, "slave-kernel", &value);
++		say("stop: ADSP SMP2P item %u is there (slave-kernel %s %#x): the ADSP has run since the reset; "
++		    "not started twice", ITEM_SMP2P_THEIRS, have ? "=" : "missing", value);
++		last_words();
++		return false;
++	}
++	say("no ADSP SMP2P item %u: the ADSP has not run since the reset", ITEM_SMP2P_THEIRS);
++	at = smem_item(ITEM_SMP2P_OURS, &size);
++	say("our SMP2P item %u: %s", ITEM_SMP2P_OURS, at ? "present (an earlier kernel made it)" : "absent");
++	scm("PAS is supported (adsp)", SCM_64 | SCM_SIP | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, PAS_ADSP, 0, 0, &answer);
++	if (answer != 1) {
++		say("stop: TrustZone does not report PAS image %u", PAS_ADSP);
++		return false;
++	}
++	return true;
++}
++
++/* ---- firmware area ---- */
++
++static const struct area_entry *
++area_file(const char *name)
++{
++	for (uint32_t i = 0; area && i < area->count; i++) {
++		if (strncmp(area->entry[i].name, name, sizeof(area->entry[i].name)) == 0) {
++			return &area->entry[i];
++		}
++	}
++	return NULL;
++}
++
++/* SHA-256 of an area file, read in CHUNK pieces through buf (kmem, CHUNK bytes). */
++static bool
++area_check(const struct area_entry *e, uint8_t *buf)
++{
++	SHA256_CTX ctx;
++	uint8_t digest[32];
++
++	SHA256_Init(&ctx);
++	for (uint32_t at = 0; at < e->size; at += CHUNK) {
++		uint32_t n = MIN(CHUNK, e->size - at);
++		if (negroni_ufs_adsp_area_read(e->offset + at, buf, n) != 0) {
++			return false;
++		}
++		SHA256_Update(&ctx, buf, n);
++	}
++	SHA256_Final(digest, &ctx);
++	return memcmp(digest, e->sha256, 32) == 0;
++}
++
++static bool
++step_firmware(void)
++{
++	vm_offset_t a = 0, b = 0, m = 0;
++	const struct area_entry *e;
++	uint32_t phoff, phnum, bytes = 0;
++	bool ok = false;
++
++	if (kmem_alloc(kernel_map, &a, AREA_HEADER, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, &b, CHUNK, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		say("stop: no memory");
++		goto out;
++	}
++	area = (struct area_header *)a;
++	if (negroni_ufs_adsp_area_read(0, area, AREA_HEADER) != 0 || memcmp(area->magic, AREA_MAGIC, 8) != 0 ||
++	    area->version != 1 || area->count == 0 || area->count > AREA_MAX) {
++		say("stop: no ADSP firmware area (scripts/audio/mkadsparea.py + dd; magic %.8s)", area->magic);
++		goto out;
++	}
++	for (uint32_t i = 0; i < area->count; i++) {
++		struct area_entry *x = &area->entry[i];
++		x->name[47] = 0;
++		if (x->offset < AREA_HEADER || x->offset > AREA_SIZE || x->size > AREA_SIZE - x->offset) {
++			say("stop: area entry %u (%s) out of range", i, x->name);
++			goto out;
++		}
++	}
++	say("firmware area: %u files", area->count);
++	e = area_file("adsp.mdt");
++	if (e == NULL || e->size < 52 || e->size > PAGE_SIZE || !area_check(e, (uint8_t *)b)) {
++		say("stop: adsp.mdt missing, too big for one page, or SHA-256 mismatch");
++		goto out;
++	}
++	if (kmem_alloc(kernel_map, &m, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    negroni_ufs_adsp_area_read(e->offset, (void *)m, e->size) != 0) {
++		goto out;
++	}
++	mdt = (uint8_t *)m;
++	mdt_size = e->size;
++	memcpy(&phoff, mdt + 28, 4);
++	phnum = (uint32_t)(mdt[44] | mdt[45] << 8);
++	if (memcmp(mdt, "\177ELF\1\1", 6) != 0 || phnum == 0 || phnum > MAX_SEGMENTS || phoff + 32 * phnum > mdt_size) {
++		say("stop: adsp.mdt is not an ELF32 LE header with <= %u program headers", MAX_SEGMENTS);
++		goto out;
++	}
++	nseg = phnum;
++	min_pa = ~0u;
++	max_pa = 0;
++	for (uint32_t i = 0; i < nseg; i++) {
++		uint32_t ph[8];
++		memcpy(ph, mdt + phoff + 32 * i, sizeof(ph));
++		segs[i] = (struct seg){ ph[0], ph[1], ph[3], ph[4], ph[5], ph[6] };
++		if (segs[i].type != PT_LOAD || segs[i].memsz == 0 || MDT_TYPE(segs[i].flags) == MDT_TYPE_HASH) {
++			continue;
++		}
++		relocatable |= (segs[i].flags & MDT_RELOCATABLE) != 0;
++		min_pa = MIN(min_pa, segs[i].paddr);
++		max_pa = MAX(max_pa, segs[i].paddr + segs[i].memsz);
++		if (segs[i].filesz == 0) {
++			continue;
++		}
++		char name[16];
++		snprintf(name, sizeof(name), "adsp.b%02u", i);
++		const struct area_entry *f = area_file(name);
++		if (f == NULL || f->size != segs[i].filesz || segs[i].filesz > segs[i].memsz) {
++			say("stop: %s missing or not %u bytes", name, segs[i].filesz);
++			goto out;
++		}
++		if (!area_check(f, (uint8_t *)b)) {
++			say("stop: %s SHA-256 mismatch", name);
++			goto out;
++		}
++		bytes += f->size;
++	}
++	max_pa = (max_pa + 0xfff) & ~0xfffu;
++	say("adsp.mdt: %u program headers, load %#x..%#x (%u KiB), %u KiB of segments, %s", nseg, min_pa, max_pa,
++	    (max_pa - min_pa) >> 10, bytes >> 10, relocatable ? "relocatable" : "fixed");
++	if (min_pa == ~0u || max_pa - min_pa > ADSP_MEM_SIZE || (!relocatable && (min_pa < ADSP_MEM_PHYS ||
++	    max_pa > ADSP_MEM_PHYS + ADSP_MEM_SIZE))) {
++		say("stop: the image does not fit the carveout %#lx + %#x", ADSP_MEM_PHYS, ADSP_MEM_SIZE);
++		goto out;
++	}
++	ok = true;
++out:
++	if (b) {
++		kmem_free(kernel_map, b, CHUNK);
++	}
++	return ok;
++}
++
++/* ---- rails, AOP ---- */
++
++static bool
++step_rails(void)
++{
++	announce("vote RPMh lcx.lvl and lmx.lvl to level 384 (ADSP proxy votes)");
++	if (negroni_rpmh_arc_vote("lcx.lvl", 384) != 0 || negroni_rpmh_arc_vote("lmx.lvl", 384) != 0) {
++		say("stop: rail vote failed");
++		return false;
++	}
++	rails_on = true;
++	return true;
++}
++
++static void
++kick(uint32_t client, uint32_t signal)
++{
++	wr32(ipcc, IPCC_SEND_ID, client << 16 | signal);
++}
++
++static bool
++qmp_wait(uint32_t off, uint32_t want, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms; i++) {
++		if (rd32(aoss, off) == want) {
++			return true;
++		}
++		IOSleep(1);
++	}
++	return rd32(aoss, off) == want;
++}
++
++static bool
++step_aop(void)
++{
++	static const char text[] = "{class: image, res: load_state, name: adsp, val: on}";
++	uint32_t words[QMP_MSG_LEN / 4] = { 0 }, box, boxsize;
++
++	ipcc = ml_io_map(IPCC_PHYS, 0x1000);
++	aoss = ml_io_map(AOSS_PHYS, AOSS_SIZE);
++	if (rd32(aoss, QMP_MAGIC) != QMP_MAGIC_VALUE || rd32(aoss, QMP_VERSION) != 1) {
++		say("stop: AOSS QMP magic %#x version %u", rd32(aoss, QMP_MAGIC), rd32(aoss, QMP_VERSION));
++		return false;
++	}
++	box = rd32(aoss, QMP_MCORE_MBOX_OFFSET);
++	boxsize = rd32(aoss, QMP_MCORE_MBOX_SIZE);
++	if ((box & 3) || box < 0x3c || boxsize < QMP_MSG_LEN + 4 || box + boxsize > AOSS_SIZE) {
++		say("stop: QMP mailbox at %#x size %#x does not fit", box, boxsize);
++		return false;
++	}
++	if (rd32(aoss, QMP_MCORE_LINK) == QMP_UP && rd32(aoss, QMP_MCORE_LINK_ACK) == QMP_UP &&
++	    rd32(aoss, QMP_MCORE_CH) == QMP_UP && rd32(aoss, QMP_UCORE_CH) == QMP_UP && rd32(aoss, QMP_MCORE_CH_ACK) == QMP_UP) {
++		say("QMP link and channel are already up");
++	} else {
++		announce("open the QMP link and channel to the AOP (qmp_open)");
++		wr32(aoss, QMP_UCORE_LINK_ACK, rd32(aoss, QMP_UCORE_LINK));
++		wr32(aoss, QMP_MCORE_LINK, QMP_UP);
++		kick(IPCC_CLIENT_AOP, 0);
++		if (!qmp_wait(QMP_MCORE_LINK_ACK, QMP_UP, 1000)) {
++			say("stop: AOP does not ack our QMP link");
++			return false;
++		}
++		wr32(aoss, QMP_MCORE_CH, QMP_UP);
++		kick(IPCC_CLIENT_AOP, 0);
++		if (!qmp_wait(QMP_UCORE_CH, QMP_UP, 1000)) {
++			say("stop: AOP does not open its QMP channel");
++			return false;
++		}
++		wr32(aoss, QMP_UCORE_CH_ACK, QMP_UP);
++		kick(IPCC_CLIENT_AOP, 0);
++		if (!qmp_wait(QMP_MCORE_CH_ACK, QMP_UP, 1000)) {
++			say("stop: AOP does not ack our QMP channel");
++			return false;
++		}
++		say("QMP OPEN");
++	}
++	if (rd32(aoss, box) != 0) {
++		say("stop: QMP mailbox still holds %u bytes", rd32(aoss, box));
++		return false;
++	}
++	memcpy(words, text, sizeof(text));
++	announce("send the AOP \"adsp load_state on\"");
++	for (uint32_t i = 0; i < QMP_MSG_LEN / 4; i++) {
++		wr32(aoss, box + 4 + 4 * i, words[i]);
++	}
++	wr32(aoss, box, QMP_MSG_LEN);
++	kick(IPCC_CLIENT_AOP, 0);
++	if (!qmp_wait(box, 0, 1000)) {
++		wr32(aoss, box, 0);
++		say("stop: AOP does not take the QMP message");
++		return false;
++	}
++	say("AOP took \"%s\"", text);
++	return true;
++}
++
++/* ---- PAS ---- */
++
++static bool
++step_pas_init(void)
++{
++	vm_offset_t page = 0;
++	uint64_t answer = ~0ull;
++	uint32_t ehdr = segs[0].filesz, hash = ~0u;
++
++	for (uint32_t i = 0; i < nseg; i++) {
++		if (MDT_TYPE(segs[i].flags) == MDT_TYPE_HASH) {
++			hash = i;
++			break;
++		}
++	}
++	if (segs[0].type == PT_LOAD || hash == ~0u || ehdr == 0 || ehdr > mdt_size ||
++	    (uint64_t)ehdr + segs[hash].filesz > PAGE_SIZE) {
++		say("stop: no usable ELF-header/hash segments (hash segment %u)", hash);
++		return false;
++	}
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	/* qcom_mdt_read_metadata: ELF header + program headers, then the hash segment. */
++	memcpy((void *)page, mdt, ehdr);
++	if (ehdr + segs[hash].filesz == mdt_size) {
++		memcpy((void *)(page + ehdr), mdt + ehdr, segs[hash].filesz);           /* packed after the headers */
++	} else if ((uint64_t)segs[hash].offset + segs[hash].filesz <= mdt_size) {
++		memcpy((void *)(page + ehdr), mdt + segs[hash].offset, segs[hash].filesz);
++	} else {
++		char name[16];
++		snprintf(name, sizeof(name), "adsp.b%02u", hash);
++		const struct area_entry *f = area_file(name);
++		if (f == NULL || f->size != segs[hash].filesz ||
++		    negroni_ufs_adsp_area_read(f->offset, (void *)(page + ehdr), f->size) != 0) {
++			say("stop: hash segment %s not readable", name);
++			return false;
++		}
++	}
++	clean_dcache((vm_offset_t)page, PAGE_SIZE, FALSE);      /* TrustZone reads memory, not our cache */
++	announce("hand the ADSP metadata to TrustZone (PAS init image, id 1)");
++	if (scm("PAS init image (adsp)", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_ADSP,
++	    kvtophys(page), 0, &answer) != 0 || answer != 0) {
++		say("stop: TrustZone refuses the ADSP metadata (%#llx)", answer);
++		return false;
++	}
++	say("TRUSTZONE ACCEPTS THE ADSP SIGNATURE");
++	if (relocatable) {
++		answer = ~0ull;
++		if (scm("PAS mem setup (adsp)", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_ADSP, ADSP_MEM_PHYS,
++		    max_pa - min_pa, &answer) != 0 || answer != 0) {
++			say("stop: TrustZone refuses the carveout (%#llx)", answer);
++			return false;
++		}
++		say("TrustZone takes the carveout %#lx + %#x", ADSP_MEM_PHYS, max_pa - min_pa);
++	}
++	return true;
++}
++
++static void
++pas_shutdown(const char *why)
++{
++	uint64_t answer = ~0ull;
++
++	say("PAS shutdown: %s", why);
++	scm("PAS shutdown (adsp)", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_ADSP, 0, 0, &answer);
++}
++
++static bool
++step_load(void)
++{
++	vm_offset_t buf = 0;
++	volatile uint64_t *mem;
++	bool ok = false;
++
++	if (kmem_alloc(kernel_map, &buf, CHUNK, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	announce("zero the carveout 0x85700000 + 40 MiB and write the PT_LOAD segments");
++	mem = (volatile uint64_t *)ml_io_map_wcomb(ADSP_MEM_PHYS, ADSP_MEM_SIZE);
++	for (uint32_t i = 0; i < ADSP_MEM_SIZE / 8; i++) {
++		mem[i] = 0;
++	}
++	for (uint32_t i = 0; i < nseg; i++) {
++		struct seg *s = &segs[i];
++		if (s->type != PT_LOAD || s->memsz == 0 || MDT_TYPE(s->flags) == MDT_TYPE_HASH || s->filesz == 0) {
++			continue;
++		}
++		char name[16];
++		snprintf(name, sizeof(name), "adsp.b%02u", i);
++		const struct area_entry *f = area_file(name);
++		uint32_t base = (relocatable ? 0 : (uint32_t)(min_pa - ADSP_MEM_PHYS)) + (s->paddr - min_pa);
++		SHA256_CTX ctx;
++		uint8_t digest[32];
++
++		if (f == NULL || (base & 7)) {
++			say("stop: %s missing or not 8-byte aligned (+%#x)", name, base);
++			goto out;
++		}
++		for (uint32_t at = 0; at < f->size; at += CHUNK) {
++			uint32_t n = MIN(CHUNK, f->size - at);
++			if (negroni_ufs_adsp_area_read(f->offset + at, (void *)buf, n) != 0) {
++				say("stop: read error in %s", name);
++				goto out;
++			}
++			uint32_t words = n / 8;
++			const uint64_t *src = (const uint64_t *)buf;
++			for (uint32_t w = 0; w < words; w++) {
++				mem[(base + at) / 8 + w] = src[w];
++			}
++			for (uint32_t t = words * 8; t < n; t++) {
++				((volatile uint8_t *)mem)[base + at + t] = ((const uint8_t *)buf)[t];
++			}
++		}
++		/* read back */
++		SHA256_Init(&ctx);
++		for (uint32_t at = 0; at < f->size; at += CHUNK) {
++			uint32_t n = MIN(CHUNK, f->size - at);
++			for (uint32_t t = 0; t < n; t++) {
++				((uint8_t *)buf)[t] = ((volatile uint8_t *)mem)[base + at + t];
++			}
++			SHA256_Update(&ctx, (const void *)buf, n);
++		}
++		SHA256_Final(digest, &ctx);
++		if (memcmp(digest, f->sha256, 32) != 0) {
++			say("stop: %s does not read back from the carveout (+%#x)", name, base);
++			goto out;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	say("segments written at %#lx and read back OK", ADSP_MEM_PHYS);
++	ok = true;
++out:
++	ml_io_unmap((vm_offset_t)mem, ADSP_MEM_SIZE);
++	kmem_free(kernel_map, buf, CHUNK);
++	return ok;
++}
++
++/* ---- our SMP2P item ---- */
++
++static bool
++smem_alloc_ours(void)
++{
++	uint32_t psize = 0, cacheline = 0, p = smem_partition(SMEM_APPS, SMEM_ADSP, &psize, &cacheline);
++	uint32_t size = (SMP2P_ITEM_SIZE + 7) & ~7u, owner = ~0u, at;
++	bool made = false;
++
++	if (p == 0) {
++		return false;
++	}
++	tcsr = ml_io_map(TCSR_MUTEX_PHYS, 0x1000);
++	for (uint32_t ms = 0; ms <= 1000; ms++) {
++		wr32(tcsr, 0, 1);               /* QCOM_MUTEX_APPS_PROC_ID */
++		owner = rd32(tcsr, 0);
++		if (owner == 1) {
++			break;
++		}
++		IOSleep(1);
++	}
++	if (owner != 1) {
++		say("stop: SMEM hwlock 3 held by %u", owner);
++		return false;
++	}
++	uint32_t free_uncached = rd32(smem, p + 12), free_cached = rd32(smem, p + 16);
++	for (at = 32; at < free_uncached;) {
++		uint32_t w0 = rd32(smem, p + at), sz = rd32(smem, p + at + 4), pad = rd32(smem, p + at + 8);
++		if ((w0 & 0xffff) != SMEM_CANARY || (w0 >> 16) == ITEM_SMP2P_OURS || sz > psize) {
++			break;
++		}
++		at += 16 + (pad >> 16) + sz;
++	}
++	if (at != free_uncached || free_uncached > free_cached || at + 16 + size > free_cached) {
++		say("stop: SMEM partition walk ends at +%#x, free uncached +%#x cached +%#x: nothing written", at,
++		    free_uncached, free_cached);
++		goto out;
++	}
++	wr32(smem, p + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
++	wr32(smem, p + at + 4, size);
++	wr32(smem, p + at + 8, size - SMP2P_ITEM_SIZE);         /* padding_data, padding_hdr 0 */
++	wr32(smem, p + at + 12, 0);
++	wr32(smem, p + 12, at + 16 + size);
++	made = true;
++out:
++	wr32(tcsr, 0, 0);
++	return made;
++}
++
++static bool
++step_smp2p(void)
++{
++	static const char name[16] = "master-kernel";
++	uint32_t size = 0, w[4];
++
++	announce("create/fill our SMP2P item 429 in SMEM (TCSR mutex 3) and ring the ADSP (IPCC 3/2)");
++	our_item = smem_item(ITEM_SMP2P_OURS, &size);
++	if (our_item == 0) {
++		if (!smem_alloc_ours()) {
++			return false;
++		}
++		our_item = smem_item(ITEM_SMP2P_OURS, &size);
++	}
++	if (our_item == 0 || size < SMP2P_ITEM_SIZE) {
++		say("stop: our item %u not found after allocation", ITEM_SMP2P_OURS);
++		return false;
++	}
++	for (uint32_t at = 0; at < SMP2P_ITEM_SIZE; at += 4) {
++		wr32(smem, our_item + at, 0);
++	}
++	wr32(smem, our_item, SMP2P_MAGIC);
++	wr32(smem, our_item + 8, SMEM_APPS | SMEM_ADSP << 16);         /* local, remote pid */
++	memcpy(w, name, sizeof(w));
++	for (uint32_t i = 0; i < 4; i++) {
++		wr32(smem, our_item + 20 + 4 * i, w[i]);
++	}
++	wr32(smem, our_item + 12, SMP2P_ENTRIES | 1u << 16);           /* total 16, valid 1 */
++	wr32(smem, our_item + 4, SMP2P_FEATURE_SSR_ACK << 8);
++	wr32(smem, our_item + 4, SMP2P_FEATURE_SSR_ACK << 8 | SMP2P_VERSION);  /* version last (smp2p.c) */
++	kick(IPCC_CLIENT_LPASS, IPCC_SIGNAL_SMP2P);
++	say("our SMP2P item at %#lx: magic %#x version %#x pids %#x counts %#x", SMEM_PHYS + our_item,
++	    rd32(smem, our_item), rd32(smem, our_item + 4), rd32(smem, our_item + 8), rd32(smem, our_item + 12));
++	return true;
++}
++
++/* ---- start ---- */
++
++static bool
++step_start(void)
++{
++	uint64_t answer = ~0ull;
++	uint32_t theirs = 0, size = 0, value = 0, last = ~0u, ms;
++	bool ready = false, fatal = false;
++
++	announce("ask TrustZone to authenticate and start the ADSP (PAS auth and reset, id 1)");
++	if (scm("PAS auth and reset (adsp)", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_ADSP, 0, 0,
++	    &answer) != 0 || answer != 0) {
++		say("stop: TrustZone does not start the ADSP (%#llx)", answer);
++		pas_shutdown("auth and reset failed");
++		return false;
++	}
++	say("TRUSTZONE HAS RELEASED THE ADSP FROM RESET; waiting %u s for ready", wait_s);
++	for (ms = 0; ms < wait_s * 1000; ms++) {
++		if (theirs == 0) {
++			theirs = smem_item(ITEM_SMP2P_THEIRS, &size);
++			if (theirs) {
++				say("+%u ms: ADSP SMP2P item %u appears (%u bytes, version %#x)", ms, ITEM_SMP2P_THEIRS, size,
++				    rd32(smem, theirs + 4));
++			}
++		}
++		if (theirs && smp2p_value(theirs, "slave-kernel", &value) && value != last) {
++			say("+%u ms: slave-kernel = %#x%s%s%s%s", ms, value, value & DSP_FATAL ? " FATAL" : "",
++			    value & DSP_READY ? " READY" : "", value & DSP_HANDOVER ? " HANDOVER" : "",
++			    value & DSP_STOP_ACK ? " STOP-ACK" : "");
++			last = value;
++			if ((value & DSP_HANDOVER) && rails_on && unvote) {
++				(void)negroni_rpmh_arc_vote("lcx.lvl", 0);
++				(void)negroni_rpmh_arc_vote("lmx.lvl", 0);
++				rails_on = false;
++				say("proxy rail votes dropped (handover)");
++			}
++			if (value & DSP_FATAL) {
++				fatal = true;
++				break;
++			}
++			if (value & DSP_READY) {
++				ready = true;
++				break;
++			}
++		}
++		IOSleep(1);
++	}
++	if (!ready) {
++		say("%s after %u ms", fatal ? "ADSP REPORTS FATAL" : "NO READY FROM THE ADSP", ms);
++		last_words();
++		pas_shutdown(fatal ? "fatal" : "no ready");
++		return false;
++	}
++	say("THE ADSP IS UP after %u ms", ms);
++	/* Linux drops the proxy votes on handover; wait up to 2 s more for it. */
++	for (uint32_t t = 0; t < 2000 && rails_on && unvote; t++) {
++		if (smp2p_value(theirs, "slave-kernel", &value) && (value & DSP_HANDOVER)) {
++			(void)negroni_rpmh_arc_vote("lcx.lvl", 0);
++			(void)negroni_rpmh_arc_vote("lmx.lvl", 0);
++			rails_on = false;
++			say("+%u ms: handover (slave-kernel = %#x): proxy rail votes dropped", ms + t, value);
++		}
++		IOSleep(1);
++	}
++	if (rails_on) {
++		say("no handover seen: the rail votes stay at level 384");
++	}
++	for (uint32_t item = ITEM_GLINK_DESC; item <= ITEM_GLINK_FIFO1; item++) {
++		uint32_t at = smem_item(item, &size);
++		say("GLINK SMEM item %u: %s (%u bytes)", item, at ? "present" : "absent", at ? size : 0);
++	}
++	return true;
++}
++
++static bool (*const steps[STEPS])(void) = {
++	step_survey, step_firmware, step_rails, step_aop, step_pas_init, step_load, step_smp2p, step_start,
++};
++
++static void
++adsp_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	bool failed = false;
++
++	for (step = 1; step <= last_step; step++) {
++		if (!steps[step - 1]()) {
++			failed = true;
++			break;
++		}
++	}
++	if (failed && step >= 5 && step < 8) {
++		pas_shutdown("a step after PAS init failed");
++	}
++	if (failed && rails_on) {
++		(void)negroni_rpmh_arc_vote("lcx.lvl", 0);
++		(void)negroni_rpmh_arc_vote("lmx.lvl", 0);
++	}
++	printf("NEGRONI ADSP: done (asked 1..%u, %s at %u)\n", last_step, failed ? "stopped" : "complete",
++	    MIN(step, last_step));
++	(void)thread_terminate(current_thread());
++}
++
++void
++negroni_adsp_init(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("negroniadsp", &on, sizeof(on));
++	if (on == 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("negroniadsp_step", &last_step, sizeof(last_step));
++	(void)PE_parse_boot_argn("negroniadsp_pause", &pause_ms, sizeof(pause_ms));
++	(void)PE_parse_boot_argn("negroniadsp_wait", &wait_s, sizeof(wait_s));
++	(void)PE_parse_boot_argn("negroniadsp_unvote", &unvote, sizeof(unvote));
++	last_step = MIN(MAX(last_step, 1u), (uint32_t)STEPS);
++	printf("NEGRONI ADSP: steps 1..%u (UNTESTED stage (a): PAS id 1, carveout %#lx)\n", last_step, ADSP_MEM_PHYS);
++	if (kernel_thread_start(adsp_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("NEGRONI ADSP: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_rpmh.c b/bsd/dev/negroni_rpmh.c
+index d46182f..34d7fe3 100644
+--- a/bsd/dev/negroni_rpmh.c
++++ b/bsd/dev/negroni_rpmh.c
+@@ -13,6 +13,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int negroni_rpmh_vreg_enable(const char *res, unsigned mv);
+ int negroni_rpmh_wifi_enable(const char *res, unsigned mv);
++int negroni_rpmh_arc_vote(const char *res, unsigned level);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ /* SM8450 apps_rsc drv-2 (sm8450.dtsi rsc@17a00000: tcs-offset 0xd00, ACTIVE 3, SLEEP 2, WAKE 2, CONTROL 0) */
+@@ -47,6 +48,8 @@ int negroni_rpmh_wifi_enable(const char *res, unsigned mv);
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_ARC          3u
++#define RH_MODE_ARC     (-2)    /* rh_send: one ARC command, data = level index (hlvl) */
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_db;
+@@ -277,7 +280,9 @@ rh_send(uint32_t address, unsigned mv, int mode)
+ 	/* voltage, optional mode, enable last (VRM: +0 voltage mV, +4 enable, +8 mode) */
+ 	uint32_t offsets[3] = {0, 8, 4}, values[3] = {mv, (uint32_t)mode, 1};
+ 	unsigned ncmd = 3;
+-	if (mode < 0) {
++	if (mode == RH_MODE_ARC) {
++		ncmd = 1;               /* ARC (rpmhpd): +0 = level index */
++	} else if (mode < 0) {
+ 		offsets[1] = 4;
+ 		values[1] = 1;
+ 		ncmd = 2;
+@@ -391,6 +396,96 @@ negroni_rpmh_wifi_enable(const char *res, unsigned mv)
+ 	return EINVAL;
+ }
+ 
++/*
++ * ARC (rpmhpd) resource: address and the level index (hlvl) of the first cmd-db
++ * level >= `level` (Linux rpmhpd_update_level_mapping / rpmhpd_aggregate_corner).
++ */
++static int
++rh_lookup_arc(const char *res, unsigned level, uint32_t *address, unsigned *hlvl)
++{
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave != RH_ARC || (entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			continue;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16);
++			uint32_t data = aux + rh_db16(e + 22), len = rh_db16(e + 20);
++			if ((addr >> 16) != RH_ARC || (addr & 15u) || len < 2 || len > 32 || !rh_range(data, len)) {
++				printf("NEGRONI RPMH: invalid ARC entry for %s\n", res);
++				return EINVAL;
++			}
++			for (unsigned l = 0; l < len / 2; ++l) {
++				unsigned v = rh_db16(data + 2 * l);
++				printf("NEGRONI RPMH: %s addr=%#x hlvl %u = vlvl %u\n", res, addr, l, v);
++				if (v >= level) {
++					*address = addr;
++					*hlvl = l;
++					return 0;
++				}
++				if (l > 0 && v == 0) {
++					break;
++				}
++			}
++			printf("NEGRONI RPMH: %s has no level >= %u\n", res, level);
++			return ERANGE;
++		}
++	}
++	printf("NEGRONI RPMH: no ARC resource %s\n", res);
++	return ENODEV;
++}
++
++/*
++ * Level vote on an LPASS rail for the audio DSP start (negroni_adsp.c; Linux
++ * qcom_q6v5_pas proxy votes on the lcx/lmx power domains). level 0 drops the vote.
++ */
++int
++negroni_rpmh_arc_vote(const char *res, unsigned level)
++{
++	if (!res || (strcmp(res, "lcx.lvl") && strcmp(res, "lmx.lvl")) || level > 416) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	unsigned hlvl = 0;
++	if (rh_poisoned) {
++		printf("NEGRONI RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_arc(res, level, &address, &hlvl);
++	}
++	if (!error) {
++		printf("NEGRONI RPMH: ARC %s level %u -> hlvl %u\n", res, level, hlvl);
++		error = rh_send(address, hlvl, RH_MODE_ARC);
++	}
++out:
++	if (error) {
++		printf("NEGRONI RPMH: ARC vote failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ /* Read-only cmd-db lookup of a VRM resource address (Wi-Fi survey, negroni_wifi.c). */
+ int negroni_rpmh_lookup(const char *res, uint32_t *address);
+ 
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 76b4d9d..109ff93 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -56,6 +56,7 @@ extern void negroni_touch_init(void);
+ extern void negroni_cpufreq_init(void);
+ extern void negroni_adreno_init(void);
+ extern void negroni_wifi_init(void);
++extern void negroni_adsp_init(void);
+ extern void negroni_probe_menu(void);
+ extern void negroni_usb_probe(void);
+ 
+@@ -742,6 +743,7 @@ negroni_ufs_init(void)
+ 	negroni_probe_menu();
+ 	negroni_adreno_init();
+ 	negroni_wifi_init();
++	negroni_adsp_init();            /* boot-arg negroniadsp=1 (default off): own thread */
+ 	negroni_keys_init();
+ 	negroni_touch_init();
+ 	negroni_usb_probe();
+@@ -927,6 +929,50 @@ negroni_fw_load(void)
+ 	}
+ }
+ 
++/*
++ * Audio DSP firmware area (bsd/dev/negroni_adsp.c, scripts/audio/mkadsparea.py in iOSPlus10):
++ * NEGRONI_ADSP_AREA_SIZE right before the GPU firmware area, written with dd like it. The ADSP
++ * image (adsp.mdt + 25 segments, 18 MiB) does not fit the 8 MiB / 16-entry GPU area.
++ * Read-only: copies `count` bytes at byte `at` of the area to `dst` (kernel memory).
++ */
++#define NEGRONI_ADSP_AREA_SIZE    (32u << 20)
++#define NEGRONI_ADSP_AREA_BLOCKS  (NEGRONI_ADSP_AREA_SIZE / UFS_BLOCK)
++
++int negroni_ufs_adsp_area_read(uint64_t at, void *dst, uint32_t count);
++
++int
++negroni_ufs_adsp_area_read(uint64_t at, void *dst, uint32_t count)
++{
++	const uint8_t *bounce = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint8_t *to = (uint8_t *)dst;
++
++	if (!su.ready || su.nblocks < 4 * (NEGRONI_LOG_BLOCKS + NEGRONI_FW_BLOCKS + NEGRONI_ADSP_AREA_BLOCKS) ||
++	    at > NEGRONI_ADSP_AREA_SIZE || count > NEGRONI_ADSP_AREA_SIZE - at) {
++		return EINVAL;
++	}
++	uint64_t base = su.first_block + su.nblocks - NEGRONI_LOG_BLOCKS - NEGRONI_FW_BLOCKS - NEGRONI_ADSP_AREA_BLOCKS;
++	while (count > 0) {
++		uint32_t skip = (uint32_t)(at % UFS_BLOCK);
++		uint32_t n = MIN(count, BOUNCE_SIZE - skip);
++		uint32_t nblk = (skip + n + UFS_BLOCK - 1) / UFS_BLOCK;
++		int error;
++
++		lck_mtx_lock(&negroni_ufs_lock);
++		error = ufs_read_blocks(base + at / UFS_BLOCK, nblk);
++		if (!error) {
++			memcpy(to, bounce + skip, n);
++		}
++		lck_mtx_unlock(&negroni_ufs_lock);
++		if (error) {
++			return error;
++		}
++		to += n;
++		at += n;
++		count -= n;
++	}
++	return 0;
++}
++
+ struct negroni_log_header {
+ 	char magic[8];
+ 	uint32_t version, size;

@@ -6,12 +6,14 @@ BG := scripts/bg.sh
 OS := $(shell uname -s)
 
 .PHONY: help status tools op10tool colima image backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
-        kernel devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog
+        kernel kernel-local kernel-ci xcode15 ssh devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog
 
 help:
 	@echo "setup:   make tools | op10tool | colima (macOS) | image"
 	@echo "backup:  make backup-ota | backup-dump (adb root)"
 	@echo "uefi:    make mu  (= setup-mu + mu-prepare + mu-build) | mu-build-macos (native, no container)"
+	@echo "kernel:  make xcode15 (once) | kernel-local (our patches, Xcode 15) | kernel-ci | kernel (slop CI download)"
+	@echo "ssh:     make ssh (dropbear/dash/toybox for iOS; added to the next root)"
 	@echo "ios16:   make kernel | devicetree | dmgs | boot | root (sudo) | simg"
 	@echo "build:   make ios16  (kernel devicetree dmgs boot root simg, in order)"
 	@echo "flash:   make flash CONFIRM=yes | flash-boot CONFIRM=yes (no userdata) | flash-restore CONFIRM=yes"
@@ -50,6 +52,18 @@ mu-build:
 	$(BG) mu-build scripts/uefi/build.sh DEBUG
 mu-build-macos:
 	$(BG) mu-build-macos scripts/uefi/build-macos.sh DEBUG
+
+# --- kernel (our patches/xnu on top of the negroni port) ------------------------------------
+xcode15:
+	$(BG) xcode15 scripts/kernel/install-xcode15.sh
+kernel-local:
+	$(BG) kernel-local scripts/kernel/build-local.sh
+kernel-ci:
+	$(BG) kernel-ci scripts/kernel/ci-build.sh
+
+# --- SSH over USB (userland/ssh) -----------------------------------------------------------
+ssh:
+	$(BG) ssh-build sh -c 'userland/ssh/fetch.sh && userland/ssh/build.sh'
 
 # --- iOS 16 --------------------------------------------------------------------------------
 kernel:

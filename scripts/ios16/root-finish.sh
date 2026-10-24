@@ -7,6 +7,8 @@
 # 2. removable Apple apps from /private/var/staged_system_apps into /Applications
 #    (as external/slop/negroni-ios/tools/install-staged-apps.sh)
 # 1b. our changes: scripts/ios16/root-tweaks-extra.py (MIGRATION=skip|once)
+# 1c. SSH over USB + ue0 network service: scripts/net/root-add-ssh.sh (SSH=1; default on when
+#     out/ssh/ios is built, SSH=0 to leave it out)
 # 3. remove host metadata folders (macOS creates .fseventsd/.Spotlight-V100 on mount)
 set -euo pipefail
 R=$1
@@ -16,6 +18,8 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 
 python3 "$REPO/external/slop/tools/sweet-root-tweaks.py" "$R"
 python3 "$REPO/scripts/ios16/root-tweaks-extra.py" "$R" --migration "${MIGRATION:-skip}"   # our changes (jobs, feature flag)
+if [ -z "${SSH:-}" ] && [ -x "$REPO/out/ssh/ios/dropbearmulti" ]; then SSH=1; fi
+SSH=${SSH:-0} sh "$REPO/scripts/net/root-add-ssh.sh" "$R"
 
 n=0
 for app in "$R"/private/var/staged_system_apps/*.app; do
