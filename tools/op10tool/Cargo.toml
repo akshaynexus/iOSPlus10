@@ -1,0 +1,20 @@
+[package]
+name = "op10tool"
+version = "0.1.0"
+edition = "2021"
+description = "iOSPlus10 binary tools: img2simg, ipsw-get, uefi-unpack, uefi-portpatch, im4p"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
+flate2 = "1"
+libc = "0.2"
+lzfse_rust = "0.2"
+lzma-rs = "0.3"
+ureq = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

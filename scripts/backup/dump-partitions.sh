@@ -1,7 +1,7 @@
 #!/bin/sh
 # Read-only backup of the phone's partitions over adb root (Magisk).
 #
-#   scripts/dump-partitions.sh [outdir]      (default ~/op10-backup/partitions)
+#   scripts/backup/dump-partitions.sh [outdir]      (default ~/op10-backup/partitions)
 #
 # Each partition is streamed through gzip; SHA256SUMS holds the hash of the RAW data,
 # computed on the phone. Skipped: super, userdata (too large / user data), logdump,

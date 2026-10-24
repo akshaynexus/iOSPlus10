@@ -1,46 +1,62 @@
 # Build the iOS 16 boot chain (NE2211)
 
-Every step is a script. Run each long step in tmux: `scripts/bg.sh NAME COMMAND...`, then
-`scripts/bg.sh -s NAME`. Host setup first: `docs/setup-macos.md` or `docs/setup-linux.md`.
+Host setup first: [setup-macos.md](setup-macos.md) or [setup-linux.md](setup-linux.md).
+Each `make` target runs a script; long ones start a detached tmux job (`scripts/bg.sh`).
+Check jobs with `make status`; logs are in `logs/NAME.log`.
 
-## Native or container
+## Flow
 
-Only the Mu-Silicium UEFI build uses the container. Upstream supports only Linux/Windows x86_64:
-its `stuart` build downloads x86_64-only NuGet tools (iasl and others) and uses GNU
-`aarch64-linux-gnu-` binutils with Clang. On macOS the container runs through Rosetta.
-
-| Step | Script | Runs |
-|---|---|---|
-| Native tools (cross GCC, gawk, rsync, AOSP mkbootimg, pyfatfs venv) | `scripts/native-tools.sh` | native |
-| Mu submodules + negroni patches | `scripts/setup-mu.sh` | native (git) |
-| Qualcomm DXEs from the stock uefi.img, r0q patches, `Binaries/negroni` | `scripts/mu-prepare.sh` | native (Python) |
-| Mu UEFI (`SILICIUM_UEFI-DEBUG.fd`) | `scripts/mu-build.sh` | **container** |
-| Kernel from the slop CI | `scripts/fetch-kernel.sh` | native (gh) |
-| Apple D22AP device tree | `scripts/fetch-d22ap-adt.sh` | native (Python, macOS libcompression or `lzfse`) |
-| ADT, payload, `boot_a.img`, `vendor_boot_a.img` | `scripts/ios16-build.sh` | native (`scripts/native-env.sh`) |
-| iOS DMGs (32 parallel range requests) | `scripts/fetch-ios16-dmgs.sh` | native (Python + curl) |
-| iOS root image (HFS+) | `scripts/ios16-root-macos.sh` (sudo) | native macOS; Linux: the port's `build-ios16-root.sh` |
-| Android sparse image | `scripts/ios16-root-simg.sh` | native (`scripts/img2simg.py`) |
-
-`scripts/native-env.sh` puts `out/tools/bin` first in PATH. On macOS it links the names the
-port's scripts call (`aarch64-linux-gnu-gcc/objcopy/readelf/nm`, `awk` with `strtonum`) to
-Homebrew `aarch64-elf-*` and `gawk`.
-
-## Order
-
-```sh
-scripts/bg.sh tools  scripts/native-tools.sh
-scripts/bg.sh mu-all sh -c 'scripts/setup-mu.sh && scripts/mu-prepare.sh && scripts/mu-build.sh DEBUG'
-scripts/bg.sh kernel scripts/fetch-kernel.sh
-scripts/fetch-d22ap-adt.sh                       # 33 KB
-scripts/bg.sh dmgs   scripts/fetch-ios16-dmgs.sh
-scripts/bg.sh ios16  scripts/ios16-build.sh      # after mu-all and kernel
-scripts/bg.sh root   sudo scripts/ios16-root-macos.sh   # tmux attach -t root for the password
-scripts/bg.sh simg   scripts/ios16-root-simg.sh
+```
+make tools  make op10tool  make image                        one-time setup
+     |
+make mu  ──────────────► out/mu/SILICIUM_UEFI-DEBUG.fd       Mu UEFI (container)
+make kernel ───────────► out/kernel/kernel.macho             xnu-8796 from the slop CI
+make devicetree ───────► ~/op10-apple/d22ap.adt              Apple /product data
+     |
+make boot ─────────────► out/ios16/boot_a.img, vendor_boot_a.img, esp.img, negroni.adt
+     |
+make dmgs ─────────────► ~/op10-apple/20H392/*.dmg           3 DMGs from the IPSW
+make root  (sudo) ─────► ~/op10-apple/ios16-root.img         HFS+ root
+make simg ─────────────► ~/op10-apple/ios16-root.simg        for fastboot
 ```
 
-Outputs: `out/ios16/{negroni.adt,esp.img,boot_a.img,vendor_boot_a.img,SHA256SUMS}`,
-`~/op10-apple/ios16-root.{img,simg}`.
+## Steps and scripts
+
+| `make` | Script | macOS | Linux |
+|---|---|---|---|
+| `tools` | `scripts/setup/native-tools.sh` | Homebrew aarch64-elf-gcc, gawk, rsync; AOSP mkbootimg; uv venv + pyfatfs | apt cross GCC, gawk, rsync; same |
+| `op10tool` | `scripts/setup/build-op10tool.sh` | `cargo build` -> `out/bin/op10tool` | same |
+| `colima` | `scripts/setup/colima-up.sh` | Colima VM with Rosetta | not needed |
+| `image` | `scripts/setup/docker-image.sh` | x86_64 build image (Rosetta) | x86_64 build image (native) |
+| `mu` | `scripts/uefi/setup-mu.sh`, `prepare.sh`, `build.sh` | setup + prepare native, build in container | same |
+| `kernel` | `scripts/ios16/fetch-kernel.sh` | `gh run download` | same |
+| `devicetree` | `scripts/ios16/fetch-d22ap-adt.sh` | `op10tool ipsw-get` + `op10tool im4p` | same |
+| `boot` | `scripts/ios16/build.sh` | native (`scripts/lib/native-env.sh`) | native |
+| `dmgs` | `scripts/ios16/fetch-dmgs.sh` | `op10tool ipsw-get` (32 threads) | same |
+| `root` | `scripts/ios16/root.sh` | `root-macos.sh`: native APFS + HFS+ (`hdiutil`, `newfs_hfs`) | `root-linux.sh`: apfs-fuse + hfsplus loop mount |
+| `simg` | `scripts/ios16/root-simg.sh` | `op10tool img2simg` | same |
+
+Both root scripts end with `scripts/ios16/root-finish.sh` (bring-up tweaks, staged apps).
+
+## Why one step uses a container
+
+The Mu-Silicium UEFI build (EDK2 `stuart`) is supported upstream only on Linux/Windows x86_64: it
+downloads x86_64-only NuGet tools (iasl and others) and uses GNU `aarch64-linux-gnu-` binutils
+with Clang. Everything else runs natively on macOS and Linux.
+
+## Tools: Rust vs Python vs shell
+
+- `tools/op10tool` (Rust, one binary): `img2simg`, `ipsw-get`, `uefi-unpack`, `uefi-portpatch`,
+  `im4p`. Binary formats, large files, parallel downloads. Checked against the earlier Python
+  versions with `tools/op10tool/tests/compare-python.sh` (all outputs identical).
+- Python (short glue): `scripts/lib/conf.py`, `scripts/uefi/binaries.py`,
+  `scripts/uefi/patch-locate.py`, and the port's own tools in `external/slop`.
+- Shell: orchestration in `scripts/`.
+
+## Outputs
+
+- `out/ios16/`: `negroni.adt`, `esp.img`, `cmdline.txt`, `boot_a.img`, `vendor_boot_a.img`, `SHA256SUMS`
+- `~/op10-apple/`: Apple files and the root image (never in git)
 
 ## Known traps (from the port's notes)
 

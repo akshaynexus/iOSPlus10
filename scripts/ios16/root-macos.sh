@@ -3,17 +3,18 @@
 # macOS. Same result as external/slop/negroni-ios/tools/build-ios16-root.sh (Linux: apfs-fuse +
 # hfsplus loop mount), but with macOS's own APFS and HFS+ support. No Sileo (SKIP_SILEO in the port).
 #
-#   sudo scripts/ios16-root-macos.sh [OUT.img]        (default $APPLE/ios16-root.img)
-#   in tmux:  scripts/bg.sh root sudo scripts/ios16-root-macos.sh   (then: tmux attach -t root,
+#   sudo scripts/ios16/root-macos.sh [OUT.img]        (default $APPLE/ios16-root.img)
+#   in tmux:  scripts/bg.sh root sudo scripts/ios16/root-macos.sh   (then: tmux attach -t root,
 #             type the sudo password, detach with Ctrl-b d)
 #
-# Needs: the three DMGs in $APPLE/20H392 (scripts/fetch-ios16-dmgs.sh), Homebrew rsync (3.x; macOS's
-# openrsync lacks -H), python3. Then: scripts/ios16-root-simg.sh (Android sparse image for fastboot).
+# Needs: the three DMGs in $APPLE/20H392 (scripts/ios16/fetch-dmgs.sh), Homebrew rsync (3.x; macOS's
+# openrsync lacks -H), python3. Then: scripts/ios16/root-simg.sh (Android sparse image for fastboot).
+# Linux: scripts/ios16/root-linux.sh. Shared last steps: scripts/ios16/root-finish.sh.
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
 U=${SUDO_USER:-$USER}
 H=$(dscl . -read "/Users/$U" NFSHomeDirectory | awk '{print $2}')
-REPO=$(cd "$(dirname "$0")/.." && pwd)
+REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SLOP=$REPO/external/slop
 APPLE=${APPLE:-$H/op10-apple}
 D=$APPLE/20H392
@@ -22,7 +23,7 @@ SIZE=${SIZE:-16g}
 RSYNC=$(command -v /opt/homebrew/bin/rsync || command -v /usr/local/bin/rsync || true)
 [ -n "$RSYNC" ] && "$RSYNC" --version | head -1 | grep -q 'version 3' || { echo "need Homebrew rsync 3.x (brew install rsync)" >&2; exit 1; }
 for f in 087-86698-044.dmg 087-86593-047.dmg 087-86715-047.dmg; do
-  [ -f "$D/$f" ] || { echo "missing $D/$f (scripts/fetch-ios16-dmgs.sh)" >&2; exit 1; }
+  [ -f "$D/$f" ] || { echo "missing $D/$f (scripts/ios16/fetch-dmgs.sh)" >&2; exit 1; }
 done
 [ ! -e "$OUT" ] || { echo "refusing to overwrite $OUT" >&2; exit 1; }
 
@@ -102,26 +103,12 @@ printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
   '<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' > "$kb/systembag.kb"
 chown 0:0 "$kb/systembag.kb"; chmod 0600 "$kb/systembag.kb"
 
-# 5. bring-up changes (launchd, Setup skipped, activation, containers, ...)
-python3 "$SLOP/tools/sweet-root-tweaks.py" "$R"
-
-# 6. removable Apple apps from staged_system_apps into /Applications (as install-staged-apps.sh)
-n=0
-for app in "$R"/private/var/staged_system_apps/*.app; do
-  [ -d "$app" ] || continue
-  name=$(basename "$app")
-  rm -rf "$R/Applications/$name" "$R/System/Library/AppPlaceholders/$name"
-  mv "$app" "$R/Applications/$name"; n=$((n + 1))
-done
-echo "moved $n staged apps; /Applications has $(ls "$R/Applications" | grep -c '\.app$') apps"
-
-# 7. no macOS metadata in the iOS root
-rm -rf "$R/.fseventsd" "$R/.Spotlight-V100" "$R/.Trashes" "$R/.metadata_never_index" "$R/.TemporaryItems"
-df -h "$R" | tail -1
+# 5. bring-up tweaks, staged apps, no macOS metadata (shared with root-linux.sh)
+bash "$REPO/scripts/ios16/root-finish.sh" "$R"
 sync
 umount "$R"
 fsck_hfs -fy "$dev" || true
 fsck_hfs -fn "$dev"
 chown "$U" "$OUT"
 ls -l "$OUT"
-echo "next: scripts/bg.sh simg scripts/ios16-root-simg.sh"
+echo "next: scripts/bg.sh simg scripts/ios16/root-simg.sh"

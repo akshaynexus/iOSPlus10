@@ -20,11 +20,11 @@ The backup lives in `~/op10-backup/`:
 | `images/` | Small images extracted with `payload-dumper-go`, plus `SHA256SUMS` |
 | `getvar-all.txt` | fastbootd variables and partition sizes |
 | `RESTORE.md` | Short restore notes |
-| `partitions/` | All 121 small partitions as `NAME.img.gz` + `SHA256SUMS` (raw hashes) + GPT head/tail of LUNs sda-sdf (`scripts/dump-partitions.sh`); includes the unique ones (modemst1/2, fsg, fsc, persist, oplusreserve*) |
+| `partitions/` | All 121 small partitions as `NAME.img.gz` + `SHA256SUMS` (raw hashes) + GPT head/tail of LUNs sda-sdf (`scripts/backup/dump-partitions.sh`); includes the unique ones (modemst1/2, fsg, fsc, persist, oplusreserve*) |
 | `magisk/boot_a-magisk-v30.7.img` | The Magisk-patched boot image now in `boot_a` |
 | `device/` | `iomem.txt`, `live.dtb` (the DTB that ABL passed to Android), `partitions.txt` |
 
-To make the backup again: `scripts/fetch-stock-ota.sh`, then
+To make the backup again: `scripts/backup/fetch-stock-ota.sh`, then
 `payload-dumper-go -o images -p boot,vendor_boot,dtbo,vbmeta,vbmeta_system,vbmeta_vendor,uefi,abl,xbl,xbl_config <zip>`.
 
 Not in the backup: user data, `super`, `logdump`, `rawdump`. Never flash or erase the unique

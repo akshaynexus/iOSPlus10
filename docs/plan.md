@@ -10,10 +10,10 @@ Status date: 2026-10-24.
 - Research: stack map, PAC analysis of xnu-12377, GPU path (`docs/research-report.md`).
 - UEFI firmware check: NE2211 `uefi.img` matches the build the negroni Mu patches target.
 - Root: Magisk 30.7 in `boot_a`; adb root works.
-- Unique partitions and GPT dumped (`scripts/dump-partitions.sh`, 121 partitions, 540 MB gz).
+- Unique partitions and GPT dumped (`scripts/backup/dump-partitions.sh`, 121 partitions, 540 MB gz).
 - RAM measured (`docs/device-facts.md`): 9 GiB contiguous at 0x840000000, so the port's memory
   map and `--dram 840000000:C0000000` need no change for 12 GB.
-- Build environment: `docker/Dockerfile` (x86_64, Rosetta on macOS), `scripts/setup-mu.sh`
+- Build environment: `docker/Dockerfile` (x86_64, Rosetta on macOS), `scripts/uefi/setup-mu.sh`
   (Mu submodules at the pinned commits; Silicium-ACPI at its real base 2d465ad + patch),
   tmux runner `scripts/bg.sh`.
 

@@ -5,8 +5,8 @@ are proprietary, so they are not in any repo. We take them from the stock `uefi.
 official OTA and port the Galaxy S22 (r0q) patches onto them.
 
 ```sh
-scripts/setup-mu.sh        # once: Mu submodules + negroni patches
-scripts/mu-prepare.sh      # unpack, patch, build Binaries/negroni, check references
+scripts/uefi/setup-mu.sh        # once: Mu submodules + negroni patches
+scripts/uefi/prepare.sh      # unpack, patch, build Binaries/negroni, check references
 ```
 
 Inputs: `~/op10-backup/images/uefi.img` (`BOOT.MXF.2.0-00925.2-WAIPIO-1.81484.5`) and
@@ -19,11 +19,11 @@ copied to `external/Mu-Silicium-negroni/Binaries/negroni`.
 
 | Script | Job |
 |---|---|
-| `scripts/uefi-unpack.py` | Pure-Python FV/FFS unpacker (gzip + LZMA GUID sections). One folder per FILE_GUID with `pe32.efi`, `depex.bin`, `raw.bin`, `name.txt`; `index.tsv`. Replaces UEFIExtract. |
-| `scripts/uefi-portpatch.py` | Ports byte patches by masked aarch64 context (from slop `portpatch2.py`). New: patched branches are re-aimed by code match of the r0q destination; `--skip` for a known-missing run; `--byte OFF=OLD:NEW` for a checked data patch. |
-| `scripts/mu-patch-dxe.sh` | Runs the port for the 7 patched drivers. |
-| `scripts/mu-binaries.py` | Mirrors the r0q INFs by FILE_GUID into `Binaries/negroni`, fills sections from our modules, uses `out/uefi/patched/X.efi` where an INF names `X.patched.efi`, copies raw files (panel XMLs, configs) to `RawFiles/`. |
-| `scripts/uefi-patch-locate.py` | Diagnostic: shows a code window of our driver next to its best match in a reference build. |
+| `scripts/uefi/unpack.py` | Pure-Python FV/FFS unpacker (gzip + LZMA GUID sections). One folder per FILE_GUID with `pe32.efi`, `depex.bin`, `raw.bin`, `name.txt`; `index.tsv`. Replaces UEFIExtract. |
+| `scripts/uefi/portpatch.py` | Ports byte patches by masked aarch64 context (from slop `portpatch2.py`). New: patched branches are re-aimed by code match of the r0q destination; `--skip` for a known-missing run; `--byte OFF=OLD:NEW` for a checked data patch. |
+| `scripts/uefi/patch-dxe.sh` | Runs the port for the 7 patched drivers. |
+| `scripts/uefi/binaries.py` | Mirrors the r0q INFs by FILE_GUID into `Binaries/negroni`, fills sections from our modules, uses `out/uefi/patched/X.efi` where an INF names `X.patched.efi`, copies raw files (panel XMLs, configs) to `RawFiles/`. |
+| `scripts/uefi/patch-locate.py` | Diagnostic: shows a code window of our driver next to its best match in a reference build. |
 
 ## Result (2026-10-24)
 

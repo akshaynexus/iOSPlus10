@@ -1,13 +1,13 @@
 #!/bin/sh
 # Build Mu-Silicium negroniPkg in the build container.
-#   scripts/mu-build.sh [DEBUG|RELEASE]      (default DEBUG, like the port)
+#   scripts/uefi/build.sh [DEBUG|RELEASE]      (default DEBUG, like the port)
 # Output: out/mu/SILICIUM_UEFI-<target>.fd (copied from the Mu Build/ folder).
-# Long: run it as  scripts/bg.sh mu-build scripts/mu-build.sh
+# Long: run it as  scripts/bg.sh mu-build scripts/uefi/build.sh
 set -eu
-. "$(dirname "$0")/env.sh"
+. "$(dirname "$0")/../lib/env.sh"
 TARGET=${1:-DEBUG}
 MU=$EXT/Mu-Silicium-negroni
-"$REPO/scripts/in-docker.sh" sh -c "cd '$MU' && UNIXNU_ROOT='$EXT/UniXNU' python3 build_uefi.py -d negroni -r $TARGET"
+"$REPO/scripts/setup/in-docker.sh" sh -c "cd '$MU' && UNIXNU_ROOT='$EXT/UniXNU' python3 build_uefi.py -d negroni -r $TARGET"
 fd=$MU/Build/negroniPkg/${TARGET}_CLANGPDB/FV/SILICIUM_UEFI.fd
 mkdir -p "$OUT/mu"
 cp "$fd" "$OUT/mu/SILICIUM_UEFI-$TARGET.fd"

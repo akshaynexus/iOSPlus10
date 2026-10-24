@@ -14,7 +14,7 @@ Read first: `docs/plan.md` (status and next step), `docs/research-report.md` (st
   shell commands. Build products go to `out/`, logs to `logs/` (both git-ignored).
 - **Everything that can take more than a few seconds runs in tmux**, never in the foreground and
   never as an agent-background command: downloads (curl, aria2c, `gh run download`, remotezip),
-  every `docker build` / `docker run` / `scripts/in-docker.sh` call, Mu and shim builds, partition
+  every `docker build` / `docker run` / `scripts/setup/in-docker.sh` call, Mu and shim builds, partition
   dumps, image conversion, large fastboot flashes, CI waits. Use `scripts/bg.sh NAME COMMAND...`;
   check with `scripts/bg.sh -s NAME`; the log is `logs/NAME.log`, the exit code `logs/NAME.exit`.
   The job must survive the end of the agent session. Foreground commands are only for quick checks.
@@ -43,10 +43,14 @@ Read first: `docs/plan.md` (status and next step), `docs/research-report.md` (st
 ## Build environment
 
 - Everything runs natively except the Mu UEFI build (`docs/build-ios16.md` has the table).
-  Native tools: `scripts/native-tools.sh`; run with them: `scripts/native-env.sh <command>`.
+- Entry point: `Makefile` (`make help`). Scripts by stage: `scripts/{setup,backup,uefi,ios16,lib}`.
+- Language rule: binary formats, large files and parallel I/O go into the Rust CLI
+  `tools/op10tool` (one binary, macOS + Linux); short glue stays shell or Python. A new Rust command
+  must match the old tool's output (`tools/op10tool/tests/compare-python.sh`).
+  Native tools: `scripts/setup/native-tools.sh`; run with them: `scripts/lib/native-env.sh <command>`.
 - `docker/Dockerfile`: Ubuntu 24.04 x86_64 for the Mu build (stuart + x86_64 NuGet tools).
-- macOS (Apple silicon): `scripts/colima-up.sh` (Colima + Rosetta), then `scripts/docker-image.sh`.
-- Linux x86_64: Docker, then `scripts/docker-image.sh`.
-- Run tools in the container: `scripts/in-docker.sh <command>` (repo mounted at the same path,
+- macOS (Apple silicon): `scripts/setup/colima-up.sh` (Colima + Rosetta), then `scripts/setup/docker-image.sh`.
+- Linux x86_64: Docker, then `scripts/setup/docker-image.sh`.
+- Run tools in the container: `scripts/setup/in-docker.sh <command>` (repo mounted at the same path,
   `~/op10-backup` read-only).
 - Setup per OS: `docs/setup-macos.md`, `docs/setup-linux.md`.

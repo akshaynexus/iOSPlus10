@@ -1,8 +1,8 @@
 #!/bin/sh
 # Download the official OxygenOS full OTA for a OnePlus 10 Pro build and check its MD5.
 #
-#   scripts/fetch-stock-ota.sh [model] [version] [outdir]
-#   scripts/fetch-stock-ota.sh NE2211 'NE2211_16.0.3.530(EX01)' ~/op10-backup
+#   scripts/backup/fetch-stock-ota.sh [model] [version] [outdir]
+#   scripts/backup/fetch-stock-ota.sh NE2211 'NE2211_16.0.3.530(EX01)' ~/op10-backup
 #
 # The catalog is roms.danielspringer.at/api/ota.php. Its source_url is a OnePlus
 # downloadCheck URL that redirects to a signed CDN link; the CDN needs the okhttp

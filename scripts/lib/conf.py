@@ -6,7 +6,7 @@
 import sys, tomllib
 from pathlib import Path
 
-cfg = tomllib.loads((Path(__file__).resolve().parents[1] / 'config/negroni-ne2211.toml').read_text())
+cfg = tomllib.loads((Path(__file__).resolve().parents[2] / 'config/negroni-ne2211.toml').read_text())
 v = cfg
 for k in sys.argv[1].split('.'):
     v = v[k]

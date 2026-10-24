@@ -1,5 +1,6 @@
 # Shared settings, sourced by the other scripts.
-REPO=$(cd "$(dirname "$0")/.." && pwd)
+# repo root: git toplevel of the calling script (works at any folder depth)
+REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || (cd "$(dirname "$0")/../.." && pwd))
 EXT=$REPO/external
 OUT=$REPO/out                                   # build products (git-ignored)
 BACKUP=${BACKUP:-$HOME/op10-backup}             # stock backup, never in git

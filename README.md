@@ -7,36 +7,42 @@ port on this phone.
 The Cortex-X2/A710/A510 cores have ARMv8.3 PAC (`paca pacg`), so the arm64e iOS 26 userland can
 run without the shared-cache rewrite that phones without PAC need.
 
+## Quick start
+
+```sh
+git clone --recurse-submodules git@github.com:akshaynexus/iOSPlus10.git && cd iOSPlus10
+make help           # all targets; long ones run in tmux (make status)
+```
+
+Host setup: [docs/setup-macos.md](docs/setup-macos.md), [docs/setup-linux.md](docs/setup-linux.md).
+Build flow: [docs/build-ios16.md](docs/build-ios16.md). Status and next step: [docs/plan.md](docs/plan.md).
+
 ## Layout
 
 ```
-CLAUDE.md                rules for agents (and humans): repo-only work, tmux, phone safety
+Makefile                 entry point (macOS + Linux); long targets start tmux jobs
+CLAUDE.md                rules for agents and humans: repo-only work, tmux, phone safety
+config/
+  negroni-ne2211.toml    board config: kernel CI run, ADT args, boot args, boot image params
 docs/
   plan.md                phases and status (read first)
-  build-ios16.md         build order, native vs container, known traps
+  build-ios16.md         flow, scripts per OS, native vs container, known traps
+  setup-macos.md         host setup on macOS (Homebrew, Colima + Rosetta)
+  setup-linux.md         host setup on Linux
   uefi-binaries.md       Qualcomm DXEs + ported r0q patches
   research-report.md     stack map, iOS 16 and iOS 26 tracks, GPU path, blockers
   device-facts.md        measured CPU, RAM map, firmware, storage
   backup-and-restore.md  device state, stock backup, restore commands
-  setup-macos.md         host setup on macOS (Colima + Rosetta)
-  setup-linux.md         host setup on Linux
-docker/                  x86_64 build container (cross GCC, Mu toolchain, mkbootimg)
+docker/                  x86_64 container for the Mu UEFI build only
 scripts/
-  bg.sh                  run a long job in tmux (logs/NAME.log)
-  native-tools.sh        install native tools; native-env.sh runs a command with them
-  ios16-build.sh         ADT, payload, boot_a, vendor_boot_a
-  ios16-root-macos.sh    iOS root image on macOS (sudo); ios16-root-simg.sh -> sparse
-  fetch-kernel.sh, fetch-d22ap-adt.sh, fetch-ios16-dmgs.sh, ipsw-get.py   inputs
-  mu-prepare.sh, mu-build.sh, uefi-*.py, mu-*.py                           Mu UEFI
-  img2simg.py, im4p-extract.py, conf.py                                    helpers
-  env.sh                 shared paths and Docker config
-  colima-up.sh           macOS: start Colima with Rosetta
-  docker-image.sh        build the container image
-  in-docker.sh           run a command in the container
-  setup-mu.sh            Mu-Silicium submodules + negroni patches
-  fetch-stock-ota.sh     download and check the official full OTA
-  dump-partitions.sh     back up all small partitions over adb root
-  uefi-fv-extract.py     extract the Qualcomm DXEs from a stock uefi.img
+  bg.sh                  run a job in tmux (logs/NAME.log, logs/NAME.exit)
+  lib/                   env.sh (paths), native-env.sh (native tools in PATH), conf.py (config)
+  setup/                 native-tools, build-op10tool, colima-up, docker-image, in-docker
+  backup/                fetch-stock-ota, dump-partitions
+  uefi/                  setup-mu, prepare (patch-dxe + binaries.py), build, patch-locate.py
+  ios16/                 fetch-kernel, fetch-d22ap-adt, fetch-dmgs, build, root(-macos|-linux|-finish), root-simg
+tools/op10tool/          Rust CLI: img2simg, ipsw-get, uefi-unpack, uefi-portpatch, im4p
+                         (tests/: Python reference versions + compare-python.sh)
 external/                submodules (see below)
 ```
 
@@ -72,5 +78,5 @@ Mu-Silicium has its own submodules; initialize them only when you build the UEFI
 
 ## License
 
-The files in `docs/` and `scripts/` are MIT. Each submodule keeps its own license; `slop` and
+The files in `docs/`, `scripts/` and `tools/` are MIT. Each submodule keeps its own license; `slop` and
 `UniXNU-negroni` have no license file.

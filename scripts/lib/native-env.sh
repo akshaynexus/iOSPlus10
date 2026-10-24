@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run a command with the native build tools first in PATH (no container):
-#   scripts/native-env.sh <command...>
+#   scripts/lib/native-env.sh <command...>
 # The port's scripts call aarch64-linux-gnu-{gcc,objcopy,readelf,nm}, awk with strtonum and
 # mkbootimg. On macOS this maps them to Homebrew aarch64-elf-* and gawk (out/tools/bin links);
 # on Linux the real cross tools are used. mkbootimg = AOSP Python script; python3 = out/venv.
@@ -16,7 +16,7 @@ if [ "$(uname -s)" = Darwin ]; then
 fi
 ln -sf "$OUT/tools/mkbootimg/mkbootimg.py" "$B/mkbootimg"
 ln -sf "$OUT/tools/mkbootimg/unpack_bootimg.py" "$B/unpack_bootimg"
-ln -sf "$REPO/scripts/img2simg.py" "$B/img2simg"
+ln -sf "$OUT/bin/op10tool" "$B/op10tool"
 PATH=$B:$OUT/venv/bin:$PATH
 export PATH
 exec "$@"

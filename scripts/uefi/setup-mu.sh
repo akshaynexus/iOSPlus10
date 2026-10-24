@@ -7,9 +7,9 @@
 # patches/silicium-acpi-negroni.patch.
 # All nested submodules (also OpenSSL's krb5, wycheproof, ...) are fetched here with --depth 1:
 # otherwise the Mu build's setup step clones them at full depth inside the container (slow).
-# This step cleans the Binaries submodule, so run scripts/mu-prepare.sh after it.
+# This step cleans the Binaries submodule, so run scripts/uefi/prepare.sh after it.
 set -eu
-. "$(dirname "$0")/env.sh"
+. "$(dirname "$0")/../lib/env.sh"
 MU=$EXT/Mu-Silicium-negroni
 cd "$MU"
 
@@ -36,10 +36,26 @@ for p in $(git config -f .gitmodules --get-regexp 'submodule\..*\.path' | awk '{
   echo "$p @ $(git -C "$p" rev-parse --short HEAD)"
 done
 
+# Repair nested submodules left half-cloned by an interrupted run (no valid HEAD): deinit them and
+# drop their git data, so the update below clones them again.
+repair() {
+  parent=$1
+  [ -f "$parent/.gitmodules" ] || return 0
+  gd=$(git -C "$parent" rev-parse --absolute-git-dir)
+  git config -f "$parent/.gitmodules" --get-regexp 'submodule\..*\.path' | awk '{print $2}' | while read -r sp; do
+    if [ -e "$parent/$sp/.git" ] && ! git -C "$parent/$sp" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+      echo "repairing broken nested submodule $parent/$sp"
+      git -C "$parent" submodule deinit -q -f -- "$sp" || true
+      rm -rf "${gd:?}/modules/$sp" "${parent:?}/$sp"
+    fi
+  done
+}
+
 # nested submodules (BaseTools brotli, MipiSysT, cmocka, OpenSSL test suites, ...)
 for p in Mu_Basecore Common/Mu Common/Mu_OEM_Sample Common/Features/mu_feature_dfci Common/Features/mu_feature_config \
          Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl; do
-  git -C "$p" submodule update -q --init --recursive --depth 1 --jobs 8
+  repair "$p"
+  git -C "$p" submodule update -q --init --recursive --depth 1 --jobs 8 --checkout --force
 done
 
 sh patches/apply.sh

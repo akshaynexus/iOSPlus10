@@ -1,8 +1,8 @@
 #!/bin/sh
 # Port the r0q (Galaxy S22) UEFI driver patches onto the NE2211 Qualcomm DXEs.
-#   scripts/mu-patch-dxe.sh [uefi.img]      (default ~/op10-backup/images/uefi.img)
-# 1. scripts/uefi-unpack.py   -> out/uefi/modules/<GUID>/ (+ index.tsv)
-# 2. scripts/uefi-portpatch.py per driver: r0q X.efi vs X.patched.efi (Device-Binaries/r0q) gives
+#   scripts/uefi/patch-dxe.sh [uefi.img]      (default ~/op10-backup/images/uefi.img)
+# 1. op10tool uefi-unpack   -> out/uefi/modules/<GUID>/ (+ index.tsv)
+# 2. op10tool uefi-portpatch per driver: r0q X.efi vs X.patched.efi (Device-Binaries/r0q) gives
 #    the patch; it is matched by masked code context in our module -> out/uefi/patched/<r0q name>.efi
 #    Extra arguments per driver (last column):
 #    - PmicDxe: --skip 0x131c8, the r0q power-button check has no counterpart in the OnePlus build.
@@ -10,12 +10,14 @@
 #      code context cannot find data, so it is applied as a checked byte: 0xf55c 00 -> 01.
 # A driver whose port fails is reported and left unpatched (see docs/uefi-binaries.md).
 set -eu
-. "$(dirname "$0")/env.sh"
+. "$(dirname "$0")/../lib/env.sh"
 IMG=${1:-$BACKUP/images/uefi.img}
 R=$EXT/Mu-Silicium-negroni/Binaries/r0q/QcomPkg/Drivers
 M=$OUT/uefi/modules
 P=$OUT/uefi/patched
-python3 "$REPO/scripts/uefi-unpack.py" "$IMG" "$M"
+OP=$OUT/bin/op10tool
+[ -x "$OP" ] || "$REPO/scripts/setup/build-op10tool.sh"
+"$OP" uefi-unpack "$IMG" "$M"
 mkdir -p "$P"
 guid() { awk -F'\t' -v n="$1" '$3 == n { print $1 }' "$M/index.tsv"; }
 
@@ -26,7 +28,7 @@ while IFS='|' read -r name ref outname extra; do
   [ -n "$g" ] || { echo "== $name: not found in uefi.img"; continue; }
   echo "== $name ($g)"
   # shellcheck disable=SC2086
-  if python3 "$REPO/scripts/uefi-portpatch.py" "$R/$ref.efi" "$R/$ref.patched.efi" \
+  if "$OP" uefi-portpatch "$R/$ref.efi" "$R/$ref.patched.efi" \
        "$M/$g/pe32.efi" "$P/$outname.efi" $extra; then :; else
     echo "   FAILED: $name"; rm -f "$P/$outname.efi"
   fi

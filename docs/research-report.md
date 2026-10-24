@@ -52,7 +52,7 @@ The community repos say that they are AI-written, so claims were judged by code 
   `BOOT.MXF.2.0-00925.2-WAIPIO-1` and all 8 documented patch sites hold the expected instructions
   (PmicDxe 0x3e70/0x3e84 `bl`, SPMIDxe 0x2e80 prologue, UFSDxe 0xcad0 `bl`, TzDxeLA 0xf55c 0x00,
   UsbMsdDxe 0x40d1 0x10, UsbConfigDxe 0x51d8 `ldrb/cbz`, ClockDxe 0xedd0 plausible). The OTA
-  `uefi.img` is the input; no on-device dump is needed. `scripts/uefi-fv-extract.py` extracts the
+  `uefi.img` is the input; no on-device dump is needed. `scripts/uefi/unpack.py` extracts the
   92 DXEs (gzip GUID sections).
 - **RAM:** 12 GB instead of about 8 GB. Measure the memory map again (shim probe) and fix
   MemoryMapLib and `--dram 840000000:C0000000`.

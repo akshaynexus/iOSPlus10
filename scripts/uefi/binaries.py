@@ -5,8 +5,8 @@ external/slop/uefi/negroni/mkbinaries.py, which reads UEFIExtract output instead
     mu-binaries.py REF_R0Q MODULES PATCHED OUT
 
 REF_R0Q  Device-Binaries/r0q (INF templates, matched by FILE_GUID)
-MODULES  scripts/uefi-unpack.py output (<GUID>/pe32.efi, depex.bin, ...)
-PATCHED  scripts/mu-patch-dxe.sh output (<name>.efi, used where an INF names <name>.patched.efi)
+MODULES  `op10tool uefi-unpack` output (<GUID>/pe32.efi, depex.bin, ...)
+PATCHED  scripts/uefi/patch-dxe.sh output (<name>.efi, used where an INF names <name>.patched.efi)
 OUT      Binaries/negroni
 
 Files without a FILE_GUID match (r0q-only drivers) are listed and skipped. Raw files whose UI name

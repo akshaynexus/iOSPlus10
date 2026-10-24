@@ -16,3 +16,4 @@ out/
 inputs/
 .DS_Store
 logs/
+tools/op10tool/target/
