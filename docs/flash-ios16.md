@@ -20,6 +20,10 @@ make flash CONFIRM=yes        # whole chain, in tmux; follow with: make status /
    `boot_a` <- `out/ios16/boot_a.img` (shim + Mu UEFI + iOS payload).
 3. `fastboot set_active a`, reboot.
 
+From iOS (re-flash): hold Volume Up + Volume Down + Power until the bootloader appears, then
+`make flash CONFIRM=yes`. Step 0 writes the stock `vendor_boot_a` and `dtbo_a` back (from
+`~/op10-backup/images`) so the recovery's fastbootd starts; step 2 writes ours again.
+
 Why userdata first, from fastbootd:
 - fastbootd runs from the recovery, which needs the stock `vendor_boot` and `dtbo`;
 - the OnePlus bootloader's sparse flash lost writes beyond ~8 GiB on the NE2213 (port notes), and

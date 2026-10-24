@@ -1,7 +1,10 @@
 #!/bin/sh
 # Flash the whole iOS 16 boot chain in the right order (one command; run it in tmux: make flash).
 #   CONFIRM=yes scripts/flash/all.sh [--skip-userdata]
-# Phone: Android with USB debugging, or already in fastbootd / bootloader fastboot mode.
+# Phone: Android with USB debugging, or in fastbootd / bootloader fastboot mode (from iOS: hold
+# Volume Up + Volume Down + Power until the bootloader appears).
+#  0. bootloader (only when the phone is not in Android or fastbootd, e.g. iOS is installed):
+#     stock vendor_boot_a + dtbo_a, so the recovery's fastbootd starts
 #  1. fastbootd:  userdata <- iOS root (fastboot splits it to the device's 256 MiB download limit)
 #  2. bootloader: vendor_boot_a, vbmeta_a (verification off), erase dtbo_a, boot_a
 #  3. set slot a active, reboot
@@ -34,7 +37,13 @@ to_bootloader() {
 
 if [ "${1:-}" != --skip-userdata ]; then
   echo "== 1/3 userdata (fastbootd)"
-  if ! fastboot getvar is-userspace 2>&1 | grep -q "is-userspace: yes"; then to_fastbootd; fi
+  if ! fastboot getvar is-userspace 2>&1 | grep -q "is-userspace: yes"; then
+    if [ -z "$(adb devices | tail -n +2 | grep device)" ] && [ -n "$(fastboot devices)" ]; then
+      echo "== 0/3 stock vendor_boot_a + dtbo_a (bootloader), so fastbootd can start"
+      "$F" recovery --yes
+    fi
+    to_fastbootd
+  fi
   "$F" userdata --yes
   to_bootloader
 else

@@ -19,7 +19,10 @@ touch; power/volume keys; USB live kernel log (`make usblog`).
 (no fuel gauge driver) · sound (no ADSP/AudioReach stack) · display brightness and sleep (no backlight
 service, no DCS command) · reboot to fastboot from iOS · widgets show "Waiting..." · first boot ~16 min.
 
-**Built, not flashed yet:**
+**Built, not flashed yet (2026-10-25 00:20):** kernel out/kernel/local-20261024-184940 (all 15 patches
+0200-0260, sha256 f8091a66...), boot_a.img 59f3dc82..., root ~/op10-apple/ios16-root.simg f0ec8142... (SSH,
+Bold Text off, 9 jobs dropped). Older notes below:
+
 - `out/ios16/` normal image: ADT with `/chosen` MAC addresses, `negroniusb=2`, `negronifb_noconsole=1`
   (no debug text over the UI). Fixes the 16 min first boot [I: same fix worked in 3 other ports].
 - `~/op10-apple/ios16-root.simg` (sha256 `3630f5f7...`) with all `root-tweaks-extra.py` tweaks.
@@ -180,6 +183,9 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   the ABL sparse flash loses writes past ~8 GiB (port notes, NE2213).
 - Sparse image: `op10tool img2simg` (holes = DONT_CARE, zero data = FILL). The android-sparse crate's encoder is not safe for this.
 - One USB cable worked for adb but not for fastboot: use the cable that works in fastboot mode [V].
+- Re-flash from iOS: fastbootd needs the stock vendor_boot_a + dtbo_a (iOS replaces them):
+  `scripts/flash/all.sh` step 0 (`ios16.sh recovery`) restores both in the bootloader first [I: recovery
+  partition is separate on NE2211, so boot_a does not matter].
 - Fastboot: Volume Up + Volume Down + Power. In Mu: Volume Up = front page, Volume Down = boot menu.
 
 ## 8. Host and tooling gotchas (error -> fix)
