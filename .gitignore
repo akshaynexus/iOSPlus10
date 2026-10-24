@@ -15,3 +15,4 @@ dumps/
 out/
 inputs/
 .DS_Store
+logs/

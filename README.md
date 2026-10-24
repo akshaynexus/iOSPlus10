@@ -10,12 +10,24 @@ run without the shared-cache rewrite that phones without PAC need.
 ## Layout
 
 ```
+CLAUDE.md                rules for agents (and humans): repo-only work, tmux, phone safety
 docs/
+  plan.md                phases and status (read first)
   research-report.md     stack map, iOS 16 and iOS 26 tracks, GPU path, blockers
+  device-facts.md        measured CPU, RAM map, firmware, storage
   backup-and-restore.md  device state, stock backup, restore commands
-  plan.md                phases and status
+  setup-macos.md         host setup on macOS (Colima + Rosetta)
+  setup-linux.md         host setup on Linux
+docker/                  x86_64 build container (cross GCC, Mu toolchain, mkbootimg)
 scripts/
+  bg.sh                  run a long job in tmux (logs/NAME.log)
+  env.sh                 shared paths and Docker config
+  colima-up.sh           macOS: start Colima with Rosetta
+  docker-image.sh        build the container image
+  in-docker.sh           run a command in the container
+  setup-mu.sh            Mu-Silicium submodules + negroni patches
   fetch-stock-ota.sh     download and check the official full OTA
+  dump-partitions.sh     back up all small partitions over adb root
   uefi-fv-extract.py     extract the Qualcomm DXEs from a stock uefi.img
 external/                submodules (see below)
 ```

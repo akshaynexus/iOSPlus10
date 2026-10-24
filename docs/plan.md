@@ -9,10 +9,17 @@ Status date: 2026-10-24.
 - Stock backup: official full OTA (MD5 checked) and extracted images in `~/op10-backup/`.
 - Research: stack map, PAC analysis of xnu-12377, GPU path (`docs/research-report.md`).
 - UEFI firmware check: NE2211 `uefi.img` matches the build the negroni Mu patches target.
+- Root: Magisk 30.7 in `boot_a`; adb root works.
+- Unique partitions and GPT dumped (`scripts/dump-partitions.sh`, 121 partitions, 540 MB gz).
+- RAM measured (`docs/device-facts.md`): 9 GiB contiguous at 0x840000000, so the port's memory
+  map and `--dram 840000000:C0000000` need no change for 12 GB.
+- Build environment: `docker/Dockerfile` (x86_64, Rosetta on macOS), `scripts/setup-mu.sh`
+  (Mu submodules at the pinned commits; Silicium-ACPI at its real base 2d465ad + patch),
+  tmux runner `scripts/bg.sh`.
 
 ## Phase 1: iOS 16 (existing negroni port)
 
-1. Shim probe with `fastboot boot` (no write): measure the 12 GB memory map, MIDR, PSCI, GIC.
+1. ~~Measure the 12 GB memory map~~ (done over adb root). Optional: shim probe with `fastboot boot`.
 2. Mu UEFI: extract DXEs from the OTA `uefi.img`, run `portpatch2.py` / `mkbinaries.py`, fix
    MemoryMapLib for 12 GB, build `negroniPkg` DEBUG.
 3. Kernel from slop CI run 40007883255; ADT with the new `--dram`; payload; `boot_a` image.
