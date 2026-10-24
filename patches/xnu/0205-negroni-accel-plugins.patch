@@ -18,7 +18,7 @@ index 53debdc..8943b76 100644
 + *    We never set IOGLESMetalBundleName, so the OpenGL ES choice does not depend on the
 + *    "UseMetal" preference or IOGLESDefaultUseMetal.
 + *  - MetalPluginName = "NegroniMetal", MetalPluginClassName = "NegroniMTLDevice" (boot-arg
-+ *    negronimetal=1, default 0). Metal.framework MTLRegisterDevices loads the bundle and calls
++ *    negronimetal, default 1: Metal first, owner). Metal.framework MTLRegisterDevices loads the bundle and calls
 + *    -initWithAcceleratorPort:; a nil device is skipped (docs/metal-design.md).
 + *  The properties are set before registerService(), so the first lookup already sees them.
   *
@@ -29,7 +29,7 @@ index 53debdc..8943b76 100644
  IOAcceleratorES::start(IOService *provider)
  {
 -	uint32_t enabled = 1;
-+	uint32_t enabled = 1, gl = 1, metal = 0;
++	uint32_t enabled = 1, gl = 1, metal = 1;
  
  	PE_parse_boot_argn("negroniaccel", &enabled, sizeof(enabled));
  	if (enabled == 0 || !IOService::start(provider)) {

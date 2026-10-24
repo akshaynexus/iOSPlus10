@@ -28,7 +28,8 @@ Order of work (owner's decision, 2026-10-25): **Metal first, OpenGL ES second.**
 CoreImage try Metal before OpenGL ES, so a working NegroniMetal device accelerates the whole UI, apps and
 newer iOS versions; ios-flame drew the 20H392 home screen this way (Metal -> metal2vulkan -> Turnip).
 The OpenGL ES plugin (with Mesa softpipe) is the fallback when Metal fails or is turned off
-(`negronimetal=0`). Safety: the Metal plugin's allow-list, crash counter and boot-arg prevent a black UI.
+(`negronimetal=0`). Kernel defaults (0205): `negronimetal=1` (Metal on), `negronigl=1` (GL fallback on).
+When NegroniMetal is missing or returns no device, CoreAnimation/CoreImage use EAGL -> NegroniGL. Safety: the Metal plugin's allow-list, crash counter and boot-arg prevent a black UI.
 
 ## Status (2026-10-25)
 
