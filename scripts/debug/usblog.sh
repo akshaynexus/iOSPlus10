@@ -6,6 +6,9 @@
 # This waits for that interface, gives the host 192.168.7.1/24 and writes every packet with a
 # host timestamp to logs/usblog-<date>.txt (and stdout). Python stdlib only. The address is
 # applied again after every phone reboot (new interface), so boot loops are logged too.
+# USBLOG_SETTIME=1 (default): each time the interface comes up, also send this host's clock to the
+# kernel command server ("settime <unix s>.<us>" to 192.168.7.2:5141, patch 0212; retried for 30 s
+# until the kernel replies). USBLOG_SETTIME=0 turns it off.
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 MAC=02:00:5e:77:ee:01
@@ -31,6 +34,28 @@ set_addr() {
           ip addr replace 192.168.7.1/24 dev "$1"; ip link set "$1" up ;;
   esac
 }
+# One "settime" to the phone (patch 0212), retried once a second for 30 s until a reply comes
+# (ARP and the kernel's link can lag the interface). Older kernels answer "error: unknown command".
+send_time() {
+  r=$(python3 - <<'PY' 2>&1
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('192.168.7.1', 0))
+s.settimeout(1)
+for _ in range(30):
+    t = time.time()
+    try:
+        s.sendto(f'settime {int(t)}.{int(t % 1 * 1e6):06d}'.encode(), ('192.168.7.2', 5141))
+        print(s.recv(512).decode('utf-8', 'replace').strip())
+        break
+    except OSError:
+        time.sleep(0.2)
+else:
+    print('no reply in 30 s')
+PY
+)
+  echo "$(date +%H:%M:%S) ==== usblog: settime: $r" | tee -a "$LOG"
+}
 # Each phone reboot makes a new USB interface without our address: keep (re)applying it, so the
 # log continues across reboots (and boot loops). Marks each (re)connect in the log.
 watch_if() {
@@ -39,6 +64,7 @@ watch_if() {
     IF=$(find_if)
     if [ -n "$IF" ] && ! has_addr "$IF"; then
       set_addr "$IF" && echo "$(date +%H:%M:%S) ==== usblog: $IF up (192.168.7.1 <-> phone 192.168.7.2)" | tee -a "$LOG"
+      [ "${USBLOG_SETTIME:-1}" = 1 ] && { send_time & }
     elif [ -z "$IF" ] && [ -n "$last" ]; then
       echo "$(date +%H:%M:%S) ==== usblog: phone interface gone (reboot or unplug)" | tee -a "$LOG"
     fi

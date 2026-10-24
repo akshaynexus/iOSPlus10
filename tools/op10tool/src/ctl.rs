@@ -3,12 +3,14 @@
 //! USB Ethernet link (192.168.7.1, set up by scripts/debug/usblog.sh). The kernel accepts only 192.168.7.1 as
 //! the source and replies to the sending port: "pong" for ping, "ok <command>" before a reset, power off or
 //! panic (which follows 500 ms later), "error: ..." otherwise.
+//! Calendar (patch 0212, bsd/dev/negroni_rtc.c from 0203): `settime` sends "settime <unix s>.<us>" with this
+//! host's clock (reply "ok settime ..."), `time` asks "time" (reply "time <s> rtc <counter> offset <n> source ...").
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const PORT: u16 = 5141;
 const HOST_IP: &str = "192.168.7.1";
@@ -27,17 +29,26 @@ pub enum Command {
     Poweroff,
     /// panic("requested over USB"), so the panic log path runs
     Panic,
+    /// Set the phone's calendar to this host's clock (UTC); the kernel keeps the PMIC RTC offset
+    Settime,
+    /// Show the phone's calendar, RTC counter and offset (no change)
+    Time,
 }
 
 impl Command {
-    fn word(self) -> &'static str {
+    fn word(self) -> String {
         match self {
-            Command::Ping => "ping",
-            Command::Reboot => "reboot",
-            Command::Bootloader => "bootloader",
-            Command::Recovery => "recovery",
-            Command::Poweroff => "poweroff",
-            Command::Panic => "panic",
+            Command::Ping => "ping".into(),
+            Command::Reboot => "reboot".into(),
+            Command::Bootloader => "bootloader".into(),
+            Command::Recovery => "recovery".into(),
+            Command::Poweroff => "poweroff".into(),
+            Command::Panic => "panic".into(),
+            Command::Settime => {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                format!("settime {}.{:06}", now.as_secs(), now.subsec_micros())
+            }
+            Command::Time => "time".into(),
         }
     }
 }
@@ -95,6 +106,26 @@ pub fn run(cmd: Command, host: &str) -> Result<()> {
                 }
             }
             bail!("no pong from {phone} in 2 s")
+        }
+        Command::Settime | Command::Time => {
+            // No reset: resend every 500 ms like ping (each settime carries the host's time at sending).
+            let deadline = start + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                send()?;
+                let slot = (Instant::now() + Duration::from_millis(500)).min(deadline);
+                if let Some(reply) = recv(&sock, phone, slot)? {
+                    if reply.starts_with("error") {
+                        bail!("{phone}: {reply}");
+                    }
+                    println!("{phone}: {reply}");
+                    if let Some(t) = reply.strip_prefix("time ").and_then(|r| r.split(' ').next()?.parse::<i64>().ok()) {
+                        let host = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+                        println!("phone - host = {} s", t - host);
+                    }
+                    return Ok(());
+                }
+            }
+            bail!("no reply from {phone} in 2 s (kernel without patch 0212 replies \"error: unknown command\")")
         }
         _ => {
             // Sent once: a reset or panic must not run twice.

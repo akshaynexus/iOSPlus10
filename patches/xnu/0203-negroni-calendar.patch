@@ -1,0 +1,659 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 063d6c4..503bf9e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -375,6 +375,7 @@ bsd/pthread/pthread_shims.c		standard
+ bsd/pthread/negroni_pthread_init.c	standard
+ bsd/pthread/negroni_pthread_support.c	standard
+ bsd/pthread/negroni_pthread_synch.c	standard
++bsd/dev/negroni_rtc.c			standard
+ bsd/pthread/pthread_priority.c		standard
+ bsd/pthread/pthread_workqueue.c		standard
+ 
+diff --git a/bsd/dev/negroni_rtc.c b/bsd/dev/negroni_rtc.c
+new file mode 100644
+index 0000000..2d26c62
+--- /dev/null
++++ b/bsd/dev/negroni_rtc.c
+@@ -0,0 +1,563 @@
++/*
++ * NEGRONI: calendar (wall-clock) time (OnePlus 10 Pro 5G, SM8450, PMK8350).
++ *
++ * Before this file the platform expert had no getUTCTimeOfDay(): the
++ * IOPlatformExpert default returns 0, clock_initialize_calendar() then
++ * moved the "UTC" time up to the uptime, and userland saw
++ * 1969-12-31 16:xx (Pacific) = the epoch + the uptime.
++ *
++ * Sources, in this order:
++ *  1. The PMK8350 RTC (SPMI SID 0, RTC_RW peripheral 0x61, DT rtc@6100
++ *     "qcom,pmk8350-rtc"; Linux rtc-pm8xxx.c pmk8350_regs: ctrl 0x6146
++ *     bit 7 = enabled, 32-bit little-endian seconds at 0x6148..0x614b).
++ *     Read like pm8xxx_rtc_read_raw(): the 4 bytes, then byte 0 again; a
++ *     smaller byte 0 means a carry during the read, so read once more.
++ *     The DT has no "allow-set-time": like Linux and Android (time_daemon)
++ *     this code never writes the RTC. Wall time = RTC + an offset:
++ *       - boot-arg negronirtcoff=<seconds> (wins over the saved offset), or
++ *       - the offset saved in /private/var/db/negroni_rtc (below).
++ *     Boot-arg negronirtc=0: no PMIC access at all.
++ *  2. A floor: the kernel build date (00:00 UTC of __DATE__, minus one day
++ *     for the build host's time zone), or the last saved wall time if that
++ *     is later. The calendar never starts below the floor, so it is sane
++ *     even with no RTC and no offset.
++ *  3. A set from outside: settimeofday() (iOS timed, date(1)), or the host
++ *     over USB (UDP 5141 "settime", patch 0212). Both end in
++ *     clock_set_calendar_microtime() -> PESetUTCTimeOfDay() ->
++ *     negroni_rtc_set(): the new offset = time - RTC is kept in memory and
++ *     written (thread call, off the caller's thread) to
++ *     /private/var/db/negroni_rtc as text ("offset", "rtc", "wall"). At the
++ *     next boot negroni_rtc_load_saved() (bsd_init, after the root mount,
++ *     before launchd) applies it. If the RTC went backwards (counter reset)
++ *     the offset is not used; the saved wall time is a floor then.
++ *     The root is read-only until launchd remounts it: a failed write is
++ *     tried again every 30 s, 60 times.
++ * Without a readable RTC the clock is the floor + the uptime, and a set
++ * moves it (also kept in the file as the next floor).
++ *
++ * Log prefix "NEGRONI RTC:".
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/mount.h>
++#include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <sys/kauth.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/thread_call.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "negroni_spmi_keys.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++void negroni_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs);
++void negroni_rtc_set(clock_sec_t secs, clock_nsec_t nsecs);
++void negroni_rtc_load_saved(void);
++int negroni_calendar_settime(uint64_t secs, uint32_t usecs, char *reply, size_t size);
++void negroni_calendar_describe(char *reply, size_t size);
++
++#define NC_CORE_PA      0x0c400000u     /* SPMI arbiter v7 core (APID map at +0x2000) */
++#define NC_CORE_SIZE    0x3000u
++#define NC_OBS_PA       0x0c440000u     /* observer channels, EE 0 first */
++#define NC_OBS_SIZE     0x8000u
++#define NC_CNFG_PA      0x0c42d000u     /* owner table, 4 * APID, bits 2:0 = owner EE */
++#define NC_RTC_PPID     0x061u          /* SID 0, RTC_RW 0x6100 */
++#define NC_RTC_CTRL     0x46u           /* 0x6146, bit 7 = RTC enabled */
++#define NC_RTC_READ     0x48u           /* 0x6148..0x614b, seconds, little endian */
++#define NC_RTC_ENABLE   0x80u
++
++#define NC_FILE         "/private/var/db/negroni_rtc"
++#define NC_MIN_TIME     1577836800ull   /* 2020-01-01: smaller "settime" values are refused */
++#define NC_MAX_TIME     4102444800ull   /* 2100-01-01 */
++#define NC_RETRY_S      30
++#define NC_RETRIES      60
++
++static LCK_GRP_DECLARE(nc_grp, "negroni_rtc");
++static LCK_MTX_DECLARE(nc_lock, &nc_grp);
++
++static struct {
++	bool        inited;
++	bool        rtc_ok;          /* the RTC is mapped, enabled and was read once */
++	int         apid;
++	struct sk_arbiter arb;
++	uint64_t    floor;           /* seconds */
++	bool        bootarg_off_set;
++	int64_t     bootarg_off;
++	int64_t     offset;          /* wall = RTC + offset (rtc_ok) */
++	const char *source;          /* where the current time came from (log, "time" command) */
++	uint64_t    soft_wall_ns;    /* wall time at soft_abs: the clock without the RTC */
++	uint64_t    soft_abs;
++	bool        set_this_boot;   /* settimeofday / USB settime / saved file applied */
++	bool        root_ready;      /* negroni_rtc_load_saved() ran: the file may be written */
++	bool        dirty;           /* the file does not hold the current offset */
++	unsigned    retries;
++	bool        saved_valid;     /* the file's contents (last read or written) */
++	int64_t     saved_offset;
++	uint64_t    saved_wall;
++	uint32_t    saved_rtc;
++	bool        saved_has_rtc;
++	thread_call_t persist_call;
++} nc;
++
++/* __DATE__ ("Oct 25 2026") as days since 1970-01-01; -1 if it does not parse. */
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdate-time"
++static const char nc_build_date[] = __DATE__;
++#pragma clang diagnostic pop
++
++static int64_t
++nc_days_from_civil(int64_t y, int m, int d)
++{
++	/* H. Hinnant's days_from_civil */
++	y -= m <= 2;
++	int64_t era = (y >= 0 ? y : y - 399) / 400;
++	int64_t yoe = y - era * 400;
++	int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
++	int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++	return era * 146097 + doe - 719468;
++}
++
++static int64_t
++nc_build_days(void)
++{
++	static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
++	const char *s = nc_build_date;
++	int m = 0, d = 0, y = 0;
++
++	for (int i = 0; i < 12; i++) {
++		if (strncmp(s, months + 3 * i, 3) == 0) {
++			m = i + 1;
++		}
++	}
++	for (int i = 4; i < 6; i++) {
++		if (s[i] >= '0' && s[i] <= '9') {
++			d = d * 10 + (s[i] - '0');
++		}
++	}
++	for (int i = 7; i < 11; i++) {
++		if (s[i] < '0' || s[i] > '9') {
++			return -1;
++		}
++		y = y * 10 + (s[i] - '0');
++	}
++	if (m == 0 || d < 1 || d > 31 || y < 2024) {
++		return -1;
++	}
++	return nc_days_from_civil(y, m, d);
++}
++
++/* One register byte of the RTC_RW peripheral. 0 = done. */
++static int
++nc_read8(uint8_t reg, uint8_t *v)
++{
++	return sk_read8(&nc.arb, nc.apid, reg, v);
++}
++
++/* The 32-bit seconds counter, as pm8xxx_rtc_read_raw(). 0 = done. Caller holds nc_lock. */
++static int
++nc_rtc_raw(uint32_t *secs)
++{
++	uint8_t b[4], again;
++
++	for (int tries = 0; tries < 2; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (nc_read8((uint8_t)(NC_RTC_READ + i), &b[i]) != 0) {
++				return -1;
++			}
++		}
++		if (nc_read8(NC_RTC_READ, &again) != 0) {
++			return -1;
++		}
++		if (again >= b[0]) {
++			*secs = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static uint64_t
++nc_abs_ns(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns;
++}
++
++/* The clock without the RTC: soft base + the time since it was set. Caller holds nc_lock. */
++static uint64_t
++nc_soft_now_ns(void)
++{
++	return nc.soft_wall_ns + nc_abs_ns(mach_absolute_time() - nc.soft_abs);
++}
++
++static void
++nc_soft_set(uint64_t wall_ns)
++{
++	nc.soft_wall_ns = wall_ns;
++	nc.soft_abs = mach_absolute_time();
++}
++
++static void nc_persist(thread_call_param_t p0, thread_call_param_t p1);
++
++/* Once, in thread context, under nc_lock: boot-args, floor, SPMI mapping, first RTC read. */
++static void
++nc_init(void)
++{
++	int enabled = 1;
++	uint8_t ctrl = 0;
++	uint32_t raw = 0;
++
++	if (nc.inited) {
++		return;
++	}
++	nc.inited = true;
++	nc.apid = -1;
++	nc.persist_call = thread_call_allocate_with_options(nc_persist, NULL, THREAD_CALL_PRIORITY_LOW, 0);
++
++	int64_t days = nc_build_days();
++	nc.floor = days > 0 ? (uint64_t)(days - 1) * 86400ull : 1729000000ull;
++	(void)PE_parse_boot_argn("negronirtc", &enabled, sizeof(enabled));
++	nc.bootarg_off_set = PE_parse_boot_argn("negronirtcoff", &nc.bootarg_off, sizeof(nc.bootarg_off));
++
++	if (!enabled) {
++		printf("NEGRONI RTC: PMIC RTC off (negronirtc=0)\n");
++	} else {
++		nc.arb.core = (volatile uint32_t *)ml_io_map(NC_CORE_PA, NC_CORE_SIZE);
++		nc.arb.obs = (volatile uint32_t *)ml_io_map(NC_OBS_PA, NC_OBS_SIZE);
++		vm_offset_t cnfg = ml_io_map(NC_CNFG_PA, 0x1000);
++		nc.arb.ee = 0;
++		int rc = (nc.arb.core && nc.arb.obs) ? sk_find_apid(&nc.arb, NC_RTC_PPID, &nc.apid) : -1;
++		if (rc != 0) {
++			printf("NEGRONI RTC: RTC_RW 0x6100 not found on SPMI (arbiter %#x, rc %d)\n",
++			    nc.arb.core ? nc.arb.core[0] : 0, rc);
++		} else if (nc_read8(NC_RTC_CTRL, &ctrl) != 0 || nc_rtc_raw(&raw) != 0) {
++			printf("NEGRONI RTC: RTC_RW APID %d read failed\n", nc.apid);
++		} else {
++			unsigned owner = cnfg ? (*(volatile uint32_t *)(cnfg + 4u * (uint32_t)nc.apid) & 7u) : 9u;
++			printf("NEGRONI RTC: PMK8350 RTC APID %d (write owner EE %u), ctrl %#04x (%s), counter %u s\n",
++			    nc.apid, owner, ctrl, (ctrl & NC_RTC_ENABLE) ? "enabled" : "NOT enabled", raw);
++			nc.rtc_ok = (ctrl & NC_RTC_ENABLE) != 0;
++		}
++	}
++
++	uint64_t t;
++	if (nc.rtc_ok) {
++		int64_t off = nc.bootarg_off_set ? nc.bootarg_off : 0;
++		t = (uint64_t)((int64_t)raw + off);
++		nc.source = nc.bootarg_off_set ? "RTC + boot-arg negronirtcoff" : "RTC counter (no offset yet)";
++		if ((int64_t)raw + off < 0 || t < nc.floor) {
++			t = nc.floor;
++			nc.source = nc.bootarg_off_set ? "build-date floor (RTC + negronirtcoff below it)" :
++			    "build-date floor (RTC counter below it)";
++		}
++		nc.offset = (int64_t)t - (int64_t)raw;
++	} else {
++		t = nc.floor;
++		nc.source = "build-date floor (no RTC)";
++	}
++	nc_soft_set(t * NSEC_PER_SEC);
++	printf("NEGRONI RTC: boot calendar %llu s from the %s; floor %llu (build %s), offset %lld\n",
++	    t, nc.source, nc.floor, nc_build_date, nc.rtc_ok ? nc.offset : 0);
++}
++
++/* NegroniPlatformExpert::getUTCTimeOfDay(): thread context. */
++void
++negroni_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs)
++{
++	uint32_t raw;
++	uint64_t ns;
++
++	if (!preemption_enabled() || ml_at_interrupt_context()) {
++		/* cannot block (no caller does this today): the last value + the uptime, unlocked */
++		ns = nc.inited ? nc_soft_now_ns() : 0;
++		*secs = (clock_sec_t)(ns / NSEC_PER_SEC);
++		*nsecs = (clock_nsec_t)(ns % NSEC_PER_SEC);
++		return;
++	}
++	lck_mtx_lock(&nc_lock);
++	nc_init();
++	if (nc.rtc_ok && nc_rtc_raw(&raw) == 0) {
++		ns = (uint64_t)((int64_t)raw + nc.offset) * NSEC_PER_SEC;
++		nc_soft_set(ns);
++	} else {
++		ns = nc_soft_now_ns();
++	}
++	lck_mtx_unlock(&nc_lock);
++	*secs = (clock_sec_t)(ns / NSEC_PER_SEC);
++	*nsecs = (clock_nsec_t)(ns % NSEC_PER_SEC);
++}
++
++/* NegroniPlatformExpert::setUTCTimeOfDay(), from clock_set_calendar_microtime(): may block. */
++void
++negroni_rtc_set(clock_sec_t secs, clock_nsec_t nsecs)
++{
++	uint32_t raw;
++	bool schedule;
++
++	lck_mtx_lock(&nc_lock);
++	nc_init();
++	int64_t before = nc.offset;
++	nc_soft_set((uint64_t)secs * NSEC_PER_SEC + nsecs);
++	if (nc.rtc_ok && nc_rtc_raw(&raw) == 0) {
++		nc.offset = (int64_t)secs - (int64_t)raw;
++		if (nc.offset - before > 1 || before - nc.offset > 1) {
++			printf("NEGRONI RTC: time set to %lu s: RTC %u, offset %lld (was %lld)\n",
++			    (unsigned long)secs, raw, nc.offset, before);
++		}
++	} else {
++		printf("NEGRONI RTC: time set to %lu s (no RTC: clock from the uptime)\n", (unsigned long)secs);
++	}
++	nc.source = "set (settimeofday or USB settime)";
++	nc.set_this_boot = true;
++	nc.dirty = true;
++	nc.retries = 0;
++	schedule = nc.root_ready && nc.persist_call != NULL;
++	lck_mtx_unlock(&nc_lock);
++	if (schedule) {
++		thread_call_enter(nc.persist_call);
++	}
++}
++
++/* Parses "key value" lines of the file. */
++static void
++nc_parse(char *text)
++{
++	char *p = text;
++
++	nc.saved_valid = false;
++	nc.saved_has_rtc = false;
++	nc.saved_wall = 0;
++	nc.saved_offset = 0;
++	if (strncmp(p, "negroni-rtc 1\n", 14) != 0) {
++		return;
++	}
++	while (*p != 0) {
++		char *key = p;
++		while (*p != 0 && *p != ' ' && *p != '\n') {
++			p++;
++		}
++		if (*p != ' ') {
++			if (*p == '\n') {
++				p++;
++			}
++			continue;
++		}
++		*p++ = 0;
++		bool neg = *p == '-';
++		if (neg) {
++			p++;
++		}
++		uint64_t v = 0;
++		while (*p >= '0' && *p <= '9') {
++			v = v * 10 + (uint64_t)(*p++ - '0');
++		}
++		if (strcmp(key, "offset") == 0) {
++			nc.saved_offset = neg ? -(int64_t)v : (int64_t)v;
++			nc.saved_valid = true;
++		} else if (strcmp(key, "rtc") == 0) {
++			nc.saved_rtc = (uint32_t)v;
++			nc.saved_has_rtc = true;
++		} else if (strcmp(key, "wall") == 0) {
++			nc.saved_wall = v;
++		}
++		while (*p != 0 && *p != '\n') {
++			p++;
++		}
++		if (*p == '\n') {
++			p++;
++		}
++	}
++}
++
++/*
++ * bsd_init, after the root mount and before launchd: the saved offset
++ * (or the saved wall time as a floor), then file writes are allowed.
++ */
++void
++negroni_rtc_load_saved(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	char buf[160];
++	int resid = 0, error;
++	uint64_t apply = 0;
++	uint32_t raw = 0;
++	bool schedule;
++
++	bzero(buf, sizeof(buf));
++	error = vnode_open(NC_FILE, FREAD, 0, 0, &vp, ctx);
++	if (error == 0) {
++		error = vn_rdwr(UIO_READ, vp, buf, sizeof(buf) - 1, 0, UIO_SYSSPACE, IO_NODELOCKED,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++
++	lck_mtx_lock(&nc_lock);
++	nc_init();
++	nc.root_ready = true;
++	if (error == 0) {
++		nc_parse(buf);
++	}
++	clock_sec_t now_s;
++	clock_usec_t now_us;
++	clock_get_calendar_microtime(&now_s, &now_us);
++	const char *what;
++	if (error != 0) {
++		what = error == ENOENT ? "no saved offset yet (" NC_FILE ")" : "saved offset not readable";
++	} else if (!nc.saved_valid) {
++		what = "saved file not understood: ignored";
++	} else if (nc.set_this_boot) {
++		what = "time already set this boot: saved offset not used";
++	} else if (nc.bootarg_off_set) {
++		what = "boot-arg negronirtcoff given: saved offset not used";
++	} else if (nc.rtc_ok && nc_rtc_raw(&raw) == 0 && (!nc.saved_has_rtc || raw >= nc.saved_rtc) &&
++	    (int64_t)raw + nc.saved_offset > 0) {
++		apply = (uint64_t)((int64_t)raw + nc.saved_offset);
++		what = "RTC + saved offset";
++		if (apply < nc.saved_wall || apply < nc.floor) {
++			apply = MAX(nc.saved_wall, nc.floor);
++			what = "saved wall time (RTC + saved offset below it)";
++		}
++	} else if (nc.saved_wall > (uint64_t)now_s) {
++		apply = nc.saved_wall;
++		what = nc.rtc_ok ? "saved wall time as floor (RTC went backwards: offset not used)" :
++		    "saved wall time as floor (no RTC)";
++	} else {
++		what = "saved wall time is not later than the clock: not used";
++	}
++	if (apply != 0 && apply <= (uint64_t)now_s + 1 && apply + 1 >= (uint64_t)now_s) {
++		apply = 0;      /* already right */
++	}
++	printf("NEGRONI RTC: %s: %s (calendar %lu s%s%llu)\n", NC_FILE, what, (unsigned long)now_s,
++	    apply ? " -> " : "", apply ? apply : 0ull);
++	schedule = nc.dirty && nc.persist_call != NULL;
++	lck_mtx_unlock(&nc_lock);
++
++	if (apply != 0) {
++		clock_set_calendar_microtime((clock_sec_t)apply, 0);   /* -> negroni_rtc_set() */
++		lck_mtx_lock(&nc_lock);
++		nc.source = "saved offset (" NC_FILE ")";
++		/* the file already holds this offset: no rewrite */
++		nc.dirty = !(nc.saved_valid && nc.offset == nc.saved_offset);
++		schedule = nc.dirty;
++		lck_mtx_unlock(&nc_lock);
++	}
++	if (schedule) {
++		thread_call_enter(nc.persist_call);
++	}
++}
++
++/* Thread call: write the offset file (dirty only), try again later on an error (read-only root). */
++static void
++nc_persist(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	char text[160];
++	uint32_t raw = 0;
++	int resid = 0;
++
++	lck_mtx_lock(&nc_lock);
++	if (!nc.dirty) {
++		lck_mtx_unlock(&nc_lock);
++		return;
++	}
++	bool has_rtc = nc.rtc_ok && nc_rtc_raw(&raw) == 0;
++	int64_t offset = nc.offset;
++	uint64_t wall = has_rtc ? (uint64_t)((int64_t)raw + offset) : nc_soft_now_ns() / NSEC_PER_SEC;
++	if (has_rtc) {
++		snprintf(text, sizeof(text), "negroni-rtc 1\noffset %lld\nrtc %u\nwall %llu\n", offset, raw, wall);
++	} else {
++		snprintf(text, sizeof(text), "negroni-rtc 1\noffset 0\nwall %llu\n", wall);
++	}
++	nc.dirty = false;
++	lck_mtx_unlock(&nc_lock);
++
++	int error = vnode_open(NC_FILE, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, S_IRUSR | S_IWUSR,
++	    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error == 0) {
++		error = vn_rdwr(UIO_WRITE, vp, text, (int)strlen(text), 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++		if (error == 0) {
++			error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++		}
++		(void)vnode_close(vp, FWRITE, ctx);
++	}
++
++	lck_mtx_lock(&nc_lock);
++	if (error == 0) {
++		nc.saved_valid = true;
++		nc.saved_offset = offset;
++		nc.saved_wall = wall;
++		nc.saved_rtc = raw;
++		nc.saved_has_rtc = has_rtc;
++		printf("NEGRONI RTC: saved offset %lld (wall %llu) to %s\n", has_rtc ? offset : 0ll, wall, NC_FILE);
++	} else if (!nc.dirty) {
++		nc.dirty = true;
++		if (nc.retries++ < NC_RETRIES) {
++			if (nc.retries == 1) {
++				printf("NEGRONI RTC: %s not written (error %d): again every %d s\n", NC_FILE, error, NC_RETRY_S);
++			}
++			uint64_t deadline;
++			clock_interval_to_deadline(NC_RETRY_S, NSEC_PER_SEC, &deadline);
++			thread_call_enter_delayed(nc.persist_call, deadline);
++		} else {
++			printf("NEGRONI RTC: %s not written (error %d): giving up until the next set\n", NC_FILE, error);
++		}
++	}
++	lck_mtx_unlock(&nc_lock);
++}
++
++/* USB "settime <secs>[.<usecs>]" (patch 0212). 0 = set; the reply text goes into reply. */
++int
++negroni_calendar_settime(uint64_t secs, uint32_t usecs, char *reply, size_t size)
++{
++	clock_sec_t old_s;
++	clock_usec_t old_us;
++
++	if (secs < NC_MIN_TIME || secs >= NC_MAX_TIME || usecs >= USEC_PER_SEC) {
++		snprintf(reply, size, "error: time %llu out of range", secs);
++		return -1;
++	}
++	clock_get_calendar_microtime(&old_s, &old_us);
++	clock_set_calendar_microtime((clock_sec_t)secs, (clock_usec_t)usecs);
++	lck_mtx_lock(&nc_lock);
++	nc.source = "USB settime";
++	snprintf(reply, size, "ok settime %llu (was %lu, %s offset %lld)", secs, (unsigned long)old_s,
++	    nc.rtc_ok ? "RTC" : "no RTC,", nc.rtc_ok ? nc.offset : 0ll);
++	lck_mtx_unlock(&nc_lock);
++	printf("NEGRONI RTC: USB settime %llu.%06u (calendar was %lu.%06u)\n", secs, usecs,
++	    (unsigned long)old_s, old_us);
++	return 0;
++}
++
++/* USB "time": the calendar and its source. */
++void
++negroni_calendar_describe(char *reply, size_t size)
++{
++	clock_sec_t s;
++	clock_usec_t us;
++	uint32_t raw = 0;
++
++	clock_get_calendar_microtime(&s, &us);
++	lck_mtx_lock(&nc_lock);
++	nc_init();
++	bool has_rtc = nc.rtc_ok && nc_rtc_raw(&raw) == 0;
++	if (has_rtc) {
++		snprintf(reply, size, "time %lu rtc %u offset %lld source %s", (unsigned long)s, raw, nc.offset, nc.source);
++	} else {
++		snprintf(reply, size, "time %lu rtc none source %s", (unsigned long)s, nc.source);
++	}
++	lck_mtx_unlock(&nc_lock);
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 6b8f456..884fb7a 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1039,6 +1039,12 @@ bsd_init(void)
+ #endif /* CONFIG_IMAGEBOOT */
+ #endif /* CONFIG_BASESYSTEMROOT */
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/* The saved RTC offset is on the root volume: apply it before launchd (bsd/dev/negroni_rtc.c). */
++	extern void negroni_rtc_load_saved(void);
++	negroni_rtc_load_saved();
++#endif
++
+ 	/* Initialize signal state for process 0. */
+ 	bsd_init_kprintf("calling siginit\n");
+ 	siginit(kernproc);
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index 2cef819..31cf5aa 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -94,6 +94,16 @@ IOKitInitializeTime( void )
+ 	} else {
+ 		IOLog("NEGRONI: no IORTC provider, calendar from the platform (no 30 s wait)\n");
+ 	}
++	/*
++	 * The calendar comes from NegroniPlatformExpert::getUTCTimeOfDay()
++	 * (bsd/dev/negroni_rtc.c). Without the platform expert,
++	 * PEGetUTCTimeOfDay() gives 0 (the epoch): wait for it (it is
++	 * normally registered long before bsd_init).
++	 */
++	t.tv_sec = 10;
++	if (IOService::waitForService(IOService::serviceMatching("IOPlatformExpert"), &t) == NULL) {
++		IOLog("NEGRONI: no platform expert after 10 s: the calendar starts at the epoch\n");
++	}
+ // RTC is not present on this target
+ #elif !defined(BCM2837)
+ 	IOService::waitForService(
+diff --git a/iokit/Kernel/arm/NegroniPlatformExpert.cpp b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+index 311dd97..9f67282 100644
+--- a/iokit/Kernel/arm/NegroniPlatformExpert.cpp
++++ b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+@@ -18,6 +18,8 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	void getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs) APPLE_KEXT_OVERRIDE;
++	void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(NegroniPlatformExpert, IODTPlatformExpert);
+@@ -135,4 +137,26 @@ NegroniPlatformExpert::processTopLevel(IORegistryEntry *root)
+  * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
+  * is what the iPhone userland (MobileGestalt) expects.
+  */
++
++/*
++ * Calendar time (bsd/dev/negroni_rtc.c): the PMK8350 RTC + an offset, or
++ * a build-date floor. Without these overrides IOPlatformExpert returned 0
++ * and the calendar started at the epoch (1969-12-31 in Pacific time).
++ */
++extern "C" {
++void negroni_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs);
++void negroni_rtc_set(clock_sec_t secs, clock_nsec_t nsecs);
++}
++
++void
++NegroniPlatformExpert::getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs)
++{
++	negroni_rtc_get(secs, nsecs);
++}
++
++void
++NegroniPlatformExpert::setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs)
++{
++	negroni_rtc_set(secs, nsecs);
++}
+ #endif /* NEGRONI */

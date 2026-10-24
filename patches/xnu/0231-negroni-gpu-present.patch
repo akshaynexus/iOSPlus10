@@ -1,8 +1,8 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 1897319..e30000b 100644
+index 503bf9e..77dae55 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -114,6 +114,7 @@ bsd/dev/negroni_wifi.c			standard
+@@ -115,6 +115,7 @@ bsd/dev/negroni_wifi.c			standard
  bsd/dev/negroni_rpmh.c			standard
  bsd/dev/negroni_spmi.c			standard
  bsd/dev/negroni_usb.c			standard
@@ -272,10 +272,10 @@ index 0000000..7b87559
 +
 +#endif /* _NEGRONI_GPU_BLIT_H */
 diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
-index 670d826..f652fa6 100644
+index e47a082..77b4a68 100644
 --- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
 +++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
-@@ -29,12 +29,28 @@
+@@ -29,12 +29,29 @@
   * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
   * enabled it, through the port they registered (IOConnectSetNotificationPort).
   *
@@ -283,7 +283,8 @@ index 670d826..f652fa6 100644
 + * layer whose surface the GPU rendered (RedwoodGPU marks it at submission,
 + * NegroniSurface::gpuFence) is copied into the panel memory by the A730's 2D
 + * engine (NegroniGPUPresent), queued behind the render on the GPU's ring: no
-+ * CPU copy and no wait, at up to negronifb_gpuhz (default 60) frames a second.
++ * CPU copy and no wait, at every vsync tick (NEGRONI_FB_VSYNC_US, 120 Hz) or
++ * negronifb_gpuhz frames a second if that is lower.
 + * Its surface is held in use (IOSurfaceIsInUse, state page +0x18) from SwapEnd
 + * until the copy's fence is done, so CoreAnimation renders the next frame into
 + * another surface of its swap chain: the source side is double-buffered. The
@@ -304,7 +305,7 @@ index 670d826..f652fa6 100644
  
  extern "C" int negroni_console_muted;     /* osfmk/console/serial_console.c */
  extern "C" char negroni_gpu_badge[24];   /* bsd/dev/negroni_adreno.c */
-@@ -93,6 +109,9 @@ class IOMobileFramebuffer : public IOService {
+@@ -93,6 +110,9 @@ class IOMobileFramebuffer : public IOService {
  
  OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
  
@@ -314,7 +315,7 @@ index 670d826..f652fa6 100644
  class IOMobileFramebufferUserClient;
  
  class AppleCLCD : public IOMobileFramebuffer {
-@@ -121,12 +140,24 @@ public:
+@@ -121,12 +141,24 @@ public:
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -340,17 +341,18 @@ index 670d826..f652fa6 100644
  };
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -207,6 +238,9 @@ AppleCLCD::start(IOService *provider)
+@@ -207,6 +239,10 @@ AppleCLCD::start(IOService *provider)
  	uint32_t hz = 10;
  	PE_parse_boot_argn("negronifb_hz", &hz, sizeof(hz));
- 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
-+	uint32_t gpuhz = 60;
+ 	fFlushTicks = (hz == 0 || hz >= 1000000u / NEGRONI_FB_VSYNC_US) ? 1 : (1000000u / NEGRONI_FB_VSYNC_US) / hz;
++	/* GPU frames: every vsync tick (the panel rate) unless negronifb_gpuhz asks for fewer */
++	uint32_t gpuhz = 1000000u / NEGRONI_FB_VSYNC_US;
 +	PE_parse_boot_argn("negronifb_gpuhz", &gpuhz, sizeof(gpuhz));
-+	fGpuFlushTicks = (gpuhz == 0 || gpuhz >= 60) ? 1 : 60 / gpuhz;
++	fGpuFlushTicks = (gpuhz == 0 || gpuhz >= 1000000u / NEGRONI_FB_VSYNC_US) ? 1 : (1000000u / NEGRONI_FB_VSYNC_US) / gpuhz;
  	fVsync->setTimeoutUS(NEGRONI_FB_VSYNC_US);
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
-@@ -243,6 +277,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -243,6 +279,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  			fb->fFadeStep = step + 1;
  		}
  		IOLockUnlock(fb->fLock);
@@ -362,7 +364,7 @@ index 670d826..f652fa6 100644
  		if (step <= 6) {
  			for (uint32_t y = 0; y < fb->fHeight; y++) {
  				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
-@@ -254,23 +293,79 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -254,23 +295,79 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		sender->setTimeoutUS(NEGRONI_FB_VSYNC_US);
  		return;
  	}
@@ -444,7 +446,7 @@ index 670d826..f652fa6 100644
  void
  AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
  {
-@@ -311,10 +406,39 @@ static uint64_t negroni_fb_swap_count;
+@@ -311,10 +408,39 @@ static uint64_t negroni_fb_swap_count;
  void
  AppleCLCD::swap(const uint8_t *rec)
  {
@@ -484,7 +486,7 @@ index 670d826..f652fa6 100644
  	if ((++negroni_fb_swap_count % 1000) == 0) {
  		IOLog("NEGRONI FB: %llu swaps\n", negroni_fb_swap_count);
  	}
-@@ -404,11 +528,17 @@ negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t
+@@ -404,11 +530,17 @@ negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t
  	negroni_draw_text_badge(pixels, rowBytes, width, height, negroni_wifi_badge, negroni_wifi_badge_color, 96 + 84);
  }
  
@@ -504,7 +506,7 @@ index 670d826..f652fa6 100644
  
  
  	if (!fConsolePaused) {
-@@ -483,11 +613,36 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -483,11 +615,36 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
  		    (uint64_t)(sx + w) * 4;
@@ -543,7 +545,7 @@ index 670d826..f652fa6 100644
  			if (dy == 0 && dx == 0 && h >= 150 && w >= (int32_t)fWidth / 2) {
  				topRedrawn = true;      /* this frame rewrote the status bar's left ear */
  			}
-@@ -499,10 +654,24 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -499,10 +656,24 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		s->release();
  	}

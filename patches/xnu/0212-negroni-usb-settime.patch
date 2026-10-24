@@ -1,0 +1,65 @@
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index 28fdc2a..c345bae 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -583,6 +583,10 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+  *   recovery    reboot reason 1 (recovery), then the reset
+  *   poweroff    PSCI SYSTEM_OFF (negroni_power_off(), boot-arg negronipoweroff)
+  *   panic       panic("requested over USB"), so the panic log path runs
++ *   settime S[.U]  set the calendar to S seconds (+U us) since 1970 UTC
++ *               (bsd/dev/negroni_rtc.c keeps the RTC offset); reply
++ *               "ok settime S (was ..., RTC offset N)" (patch 0212)
++ *   time        reply "time S rtc R offset N source ..." (no change)
+  * The last five reply "ok <command>" and act UD_CTL_DELAY_MS later, so the
+  * reply and the console log still reach the host. The reason is written
+  * at once (negroni_reboot.c); if it cannot be set the reply says so and
+@@ -600,6 +604,8 @@ enum { UD_CTL_NONE, UD_CTL_RESET, UD_CTL_POWEROFF, UD_CTL_PANIC };
+ extern int negroni_reboot_set_reason(unsigned reason);
+ extern void negroni_reboot_reset(void);
+ extern void negroni_power_off(void);
++extern int negroni_calendar_settime(uint64_t secs, uint32_t usecs, char *reply, size_t size);
++extern void negroni_calendar_describe(char *reply, size_t size);
+ 
+ static const struct {
+ 	const char *name;
+@@ -776,6 +782,40 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		ud_ctl_reply(f, "pong");
+ 		return true;
+ 	}
++	if (strcmp(cmd, "time") == 0 || strncmp(cmd, "settime ", 8) == 0) {
++		/* calendar commands (0212): no reset, so also allowed while one is pending */
++		char treply[160];
++		if (cmd[0] == 't') {
++			negroni_calendar_describe(treply, sizeof(treply));
++		} else {
++			const char *q = cmd + 8;
++			uint64_t secs = 0;
++			uint32_t usecs = 0, digits = 0;
++			bool ok = *q >= '0' && *q <= '9';
++			while (*q >= '0' && *q <= '9' && secs < 100000000000ull) {
++				secs = secs * 10 + (uint64_t)(*q++ - '0');
++			}
++			if (*q == '.') {
++				for (q++; *q >= '0' && *q <= '9'; q++) {
++					if (digits < 6) {
++						usecs = usecs * 10 + (uint32_t)(*q - '0');
++						digits++;
++					}
++				}
++				for (; digits < 6; digits++) {
++					usecs *= 10;
++				}
++			}
++			if (!ok || *q != 0) {
++				snprintf(treply, sizeof(treply), "error: settime needs <unix seconds>[.<fraction>]");
++			} else {
++				(void)negroni_calendar_settime(secs, usecs, treply, sizeof(treply));
++			}
++		}
++		printf("NEGRONI CTL: %s\n", treply);
++		ud_ctl_reply(f, treply);
++		return true;
++	}
+ 	if (ud.ctl_action != UD_CTL_NONE) {
+ 		printf("NEGRONI CTL: busy (a reset or panic is pending)\n");
+ 		ud_ctl_reply(f, "error: busy");

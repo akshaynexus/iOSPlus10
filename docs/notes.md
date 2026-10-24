@@ -105,7 +105,7 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 | Reboot reason | PMK8350 (SPMI SID 0) SDAM 0x7100 + 0x48 = reg 0x7148, bits 1-7 (value << 1): bootloader = 2, recovery = 1; then PSCI SYSTEM_RESET. The imem restart_reason (0x146aa65c) does NOT work | Android DT `qcom,reboot-reason` [V], slop NOTES:55 |
 | USB | kernel `negroniusb=2` = CDC-ECM device: phone 192.168.7.2, Mac 192.168.7.1, host MAC 02:00:5e:77:ee:01; console as UDP to :5140; iOS sees `ue0` | `scripts/debug/usblog.sh` [V] |
 | Audio | AudioReach (GPR/q6apm, not APR); 2x TFA9874 on i2c13 (0x34/0x35, reset gpio50/51) via TERTIARY_TDM_RX_0; WCD9385 over SoundWire; ADSP remoteproc@30000000, PAS id 1, mem 0x85e00000 size 0x2100000, smp2p pid 2; ADSP firmware in `modem_a` | slop NOTES "audio plan" [V DT] |
-| Wi-Fi | QCA6490 (no driver in any port) | [I from DT] |
+| Wi-Fi | QCA6490 on PCIe0 (`qcom,cnss-qca6490`), PCI 17cb:1103 expected; MSI via GICv3 ITS; no driver in any port | `out/live.dts:13840`, [wifi-plan.md](wifi-plan.md) [V DT] |
 
 ## 4. iOS userland facts
 
@@ -122,9 +122,8 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   @rpath policy, fixed by AMFI policy 0221), Shortcuts 1, PosterBoard 1.
 - Owner report 2026-10-24 [V]: turning on **Bold Text** hung iOS; after the restart it loops with repeated
   crashes and ReportCrash output on the screen (debug image). No USB log of it: the log ends at 21:43:59,
-  before the hang. Cause unknown [I: a respring + font cache rebuild under CPU rendering, then a crash on
-  boot with the pref set]. Pref: `com.apple.Accessibility` in /var/mobile/Library/Preferences [I].
-  Recovery: re-flash `userdata` (fresh root). Capture `make usblog` during the next attempt.
+  before the hang. The next capture found the cause (ROOT CAUSE line below). Pref:
+  `com.apple.Accessibility` / `EnhancedTextLegibilityEnabled` in /var/mobile/Library/Preferences [V, section 14].
 - SpringBoard in `logs/usblog-20261024-195455.txt` [V]: **no SpringBoard crash** in 19:54-21:43 (the hang
   came later and was not logged: the old usblog.sh lost the link at the first phone reboot; fixed
   2026-10-24). Its 1724 syslog lines are warnings only: 310 "trying to set state of nil layer",
@@ -241,19 +240,23 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 - Wi-Fi: write a QCA6490 driver, or use USB networking only?
 - iOS 26: does QuartzCore render without Metal? ([research-report.md](research-report.md))
 
-## 12. Wi-Fi (2026-10-24)
+## 12. Wi-Fi (2026-10-24, reviewed 2026-10-25: docs/reviews/codex-2026-10-25.md)
 
-- [V] `out/kernel/wt-wifi/bsd/dev/negroni_wifi.c` in base has Wi-Fi survey steps 1–9; steps 1–4 are reads, steps 5–8 enable supplies/clocks and train PCIe0, and step 9 reads PCI ID/class/BAR registers (source comments in `external/slop/negroni-ios/xnu/patches/0120-negroni-wifi-pcie-link.patch`).
-- [V] The current port code does not assign the endpoint BAR or enable an MSI/MSI-X vector; new patch `patches/xnu/0260-negroni-wlan-pcie-inventory.patch` adds an opt-in `negroniwlan=1` and read-only BAR/capability inventory (worktree source; not run on hardware).
-- [V] Wi-Fi worktree branch `wifi` commit `a559154` contains the inventory source change; no push was made (`out/kernel/wt-wifi`).
-- [V] Wi-Fi docs, extraction script and patch export are committed locally on `main`; no push was made.
-- [V] XNU single-file syntax check of `bsd/dev/negroni_wifi.c` succeeded against `out/kernel/buildtree`; it emitted three warnings already present in the source (two shadowed locals and the existing `delay` signedness conversion).
-- [V] `scripts/bg.sh wifi-fw scripts/wifi/extract-fw.sh` completed with exit 0 using the NE2211 OTA; its run log is `logs/wifi-fw.log` and WLAN outputs are ignored under `out/firmware/wlan/`.
-- [V] Extracted `amss.bin` SHA-256 is `d3328c8a78a1839c13bb33b6d20a4dd5fb4f8d57c4d8a1b482b037485bff40d9`, `m3.bin` is `7446e09fb911c690368d7b2c41216854ddfc7938d6a9d01ce3faa5f21cbc90b5`, and `regdb.bin` is `51808db5a23dc10346335e957ce88b8396d2e7c1870d7c67a2c0602a90f4fb32` (`out/firmware/wlan/SHA256SUMS`).
-- [V] The stock modem FAT image lists `bdwlan.*` calibration files; this extraction did not find `board-2.bin` (`out/firmware/modem/modem.img`, `out/firmware/wlan/`).
-- [I] MHI/BHI download is not safe to enable until a verified endpoint BAR mapping, DMA allocation/cache contract, and kernel-accessible firmware buffer are implemented; no MHI or BHI command has been issued in this round (`docs/wifi-plan.md`).
+- [V] `bsd/dev/negroni_wifi.c` (slop 0106/0109/0120/0122) has survey steps 1-9: 1-4 read, 5-8 write (GCC, five RPMh votes, WLAN_EN, PHY, root port, iATU, PERST, link), 9 reads bus 1 ID/class/BAR0/BAR1. Steps 5-9 never ran on a phone (no `NEGRONI WIFI` line in `logs/usblog-*.txt`; slop NOTES:805).
+- [V] Patch 0260 (`out/kernel/wt-wifi`, uncommitted on top of `a559154`): step 10 reads endpoint command/status, BAR0 and the MSI/MSI-X capability list, no writes; `negroniwlan=1` (default 0) = `negroniwifi=10`; the probe menu still wins. Not run on hardware.
+- [V] MSI on PCIe0 goes through the GICv3 ITS 0x17140000 (`msi-map` RID 0x100 -> DeviceID 0x5981); the SPI MSI node `qcom,pcie0_msi@0x17110040` is disabled (`out/live.dts:1327,20793,20866-20873`). Our XNU has no ITS code (`git grep GITS_`).
+- [V] ath11k requests only MSI (`PCI_IRQ_MSI`), no INTx (`ath11k/pci.c` `ath11k_pci_alloc_msi`).
+- [V] Endpoint DMA goes through the apps SMMU: `iommu-map` RID 0x100 -> SID 0x1c01 (`out/live.dts:20818`).
+- [V] DT has a sixth WLAN supply `wlan-ant-switch` = pmr735a_l7 2.8 V; step 6 does not vote it (`out/live.dts:13870-13871`).
+- [V] Linux tells WCN6855 hw2.0 / hw2.1 / QCA2066 / QCA6698AQ apart only through TCSR_SOC_HW_VERSION / SUB_VER via BAR0 (`ath11k/pci.c` `ath11k_pci_probe`); our chip's revision is unknown.
+- [V] Stock modem `image/` has amss.bin + amss20.bin (both `WLAN.HSP.2.0-01229`), m3.bin, regdb.bin, 170 `bdwlan.*`, 24 `bdwlang.*` (ELF board files), no wpss, no board-2.bin (`out/firmware/wlan/LISTING.txt`).
+- [V] cnss2 loads amss20.bin for MHI major version 2, else amss.bin; board file `bdwlan.e%02x` by QMI board id, `bdwlang.*` when chip_id & 0x10 (cnss2 `pci.c` / `qmi.c`, Xiaomi marble kernel).
+- [V] ath11k accepts an ELF board file over QMI (BDF type ELF, `ath11k_qmi_load_bdf_qmi`), so no board-2.bin is needed.
+- [V] ath11k QMI order: ind_register + host_cap -> REQUEST_MEM -> respond_mem -> FW_MEM_READY -> target_cap -> BDF/regdb -> m3_info -> FW_READY -> wlan_cfg + mode (`ath11k/qmi.c`). "msa_ready" and "cal_report" are ath10k terms, not ath11k.
+- [V] `scripts/wifi/extract-fw.sh` (reworked 2026-10-25) extracts 198 files into `out/firmware/wlan/` with LISTING.txt + SHA256SUMS, modem.img sha256 `bcd07e89...` (`logs/wifi-fw.log`). The first version missed amss20.bin and bdwlang.*, and its run passed `MODEM_IMG=` as an argument, which it ignored.
+- [I] Effort for WPA2 Wi-Fi: about 3-5 months of focused work (`docs/wifi-plan.md`).
 
-## 12. Camera (research handoff, 2026-10-24)
+## 13. Camera (research handoff, 2026-10-24)
 
 - [V] `out/live.dts:22144-22578` exposes four Qualcomm camera sensor slots on CCI0/CCI1 and CSIPHY subdevice indices 1, 2, 5, 0; it does not provide sensor model names, I2C addresses, or complete lane maps.
 - [V] `out/live.dts:22130-22578` includes actuator, EEPROM and OIS nodes; OIS identifiers include LC898128 and LC898124.
@@ -265,19 +268,22 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 - [I] iOS has no documented third-party CMIO/DAL custom-camera extension route; a fake AppleH10CamIn provider is a research-grade route to stock capture apps.
 - [I] First action: offline decode of stock DTBO/vendor camera modules, then one sensor's guarded CCI chip-ID probe. See [camera-plan.md](camera-plan.md).
 
-## 13. Bold Text (research, 2026-10-24)
-- [V] `AccessibilitySettings.bundle/AccessibilitySettings` strings include `boldTextEnabled:`, `setBoldTextEnabled:specifier:`, and `legibilityWeight`; source: offline strings inspection of `/private/tmp/blwork/root` while mounted.
-- [V] UIKit names its app notification `UIAccessibilityBoldTextStatusDidChangeNotification`; it is an `NSNotification`, and public API exposes `UIAccessibility.isBoldTextEnabled`; sources: Apple UIKit documentation linked in `docs/boldtext-crash.md`.
-- [V] Public iOS 16 evidence identifies preference `com.apple.Accessibility:EnhancedTextLegibilityEnabled`; Apple device-management accessibility command names corresponding command field `BoldTextEnabled`; source: Apple Device Management docs and iOS reproduction linked in `docs/boldtext-crash.md`.
-- [V] Offline font inventory seen in the root included `CoreUI/SFUI.ttf`, Helvetica Neue families, and other Core/CoreUI fonts; source: `find` output from `/private/tmp/blwork/root/System/Library/Fonts` while mounted.
-- [V] `root-tweaks-extra.py` and slop `sweet-root-tweaks.py` do not remove font files; sources: those scripts.
-- [V] No log records the Bold Text incident: `logs/usblog-20261024-195455.txt` ends before the reported hang; cause remains undiagnosed.
-- [I] The leading hypothesis is a SpringBoard/UIKit restart or rendering path under CPU-only software drawing; there is no direct crash trace.
-- [I] No exact Darwin notification, CoreText/fontd cache rebuild event, or proven managed restriction that disables the switch was established; do not describe the UIKit notification as Darwin.
-- [V] Added `scripts/ios16/root-tweaks-boldtext.py`, which saves `EnhancedTextLegibilityEnabled=false` in a newly built root; it resets startup state but does not lock/hide the Settings switch; source: script.
-- [V] Recovery and next-attempt capture steps are documented in `docs/boldtext-crash.md`; they were not run and the phone was not touched.
+## 14. Bold Text (2026-10-24, reviewed 2026-10-25)
 
-## 13. Display (from the brightness agent, 2026-10-24)
+- [V] Root cause: SpringBoard NULL call in `CI::GLContext::init` via `+[CUIShapeEffectStack sharedCIContext]` (section 4 and "CoreImage/PosterBoard crash"); details: [boldtext-crash.md](boldtext-crash.md).
+- [V] Pref: `com.apple.Accessibility` / `EnhancedTextLegibilityEnabled` (only such string in the 20H392 cache, in libAccessibility.dylib); `_AXSEnhanceTextLegibilityEnabledGlobal` reads it with `_AXSGetPreferenceValue` and tests == 1 (`ipsw dyld disass --vaddr 0x191998934`).
+- [V] The switch is in `AccessibilitySettings.bundle` (`setBoldTextEnabled:specifier:`) and in DisplayAndBrightnessSettings (shared cache strings).
+- [V] libAccessibility has the strings `com.apple.accessibility.text.legibility.status` and `com.apple.accessibility.cache.enhance.text.legibility` [I: Darwin notify names].
+- [V] `scripts/ios16/root-tweaks-boldtext.py` writes the key false (binary plist, other keys kept, 501:501, 0600); idempotent; its output equals the file in the current built root (sha256 `71639153...`) (review test on a scratch copy, 2026-10-25).
+- [I] Recovery without a re-flash: push the plist over SSH and reboot (`docs/boldtext-crash.md`); not tested. The phone has no `killall`.
+
+## 15. Display (from the brightness agent, 2026-10-24)
+
+- Reference for 120 Hz smoothness [V: external/ios-s9 HEAD 7b72f7c, a separate clone of syncmodz/ios-s9
+  (Galaxy S9), not a submodule]: zero-copy scanout (display engine VIG0/VIG1 + QSEED3 fetch backboardd's
+  framebuffers directly), SwapWait that waits for the shown frame, CPU copy of dirty rows only. Same idea as
+  bergamota xnu/patches-11215/0211 (fb-direct-scanout) and 0127 (fb-zero-copy). Candidate for a display
+  patch (0252+) after 120 Hz vsync is tested [I: register layout differs on SM8450 DPU].
 
 - Panel: Samsung AMB670YF08 (S6E3HC3 IC), AMOLED, DSI command mode, DSC 1.2, DSI0 only; UEFI sets
   1080x2412 @120 Hz with DSIEnableAutoRefresh=True: the MDP scans the RAM framebuffer on each TE, no
@@ -297,7 +303,7 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   dyld_shared_cache_arm64; `scripts/kernel/prepare-src.sh` -> 129 applied, 4 usual skips].
   Kernel image not rebuilt yet, phone not booted with it [I].
 
-## 14. Metal (2026-10-25, Metal agent)
+## 16. Metal (2026-10-25, Metal agent)
 
 Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](metal-design.md). Code: `userland/metal/`, `scripts/metal/`.
 
@@ -344,3 +350,45 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - [I, strong] PosterBoard loop: extension discovery never calls back (empty ExtensionFoundation catalog: no AMFI op 0x60, bergamota docs/EXTENSION_CACHE.md, same 20H392). A SpringBoard XPC (focus mode / selected configuration) stores a switcher configuration first. Then the prewarm XPC runs the first update -> setupForFirstTime -> assert. This matches slop NOTES (no .appex ever starts, LS cache without the 10 providers).
 - [I] Fix for Crash 2: a kernel with 0221 (bits 1+2: op 0x60, AMFI IOService) and 0223, plus a LaunchServices re-seed. A fresh root has no LS cache (this root: no private/var/mobile/Containers/Data). An already-booted userdata needs `.../Containers/Data/InternalDaemon/*/Library/Caches/com.apple.LaunchServices*` deleted (bergamota). Without the re-seed, bergamota saw a different PosterBoard crash (NSInvalidArgumentException, nil in dictionaryWithObjects in the same setup method). slop's negroni-poster-register (registerPlugin for the 10 providers) stays a fallback, not proven.
 - [V] Crash 1 status: no fix implemented in this repo. The analysis above lists the hook points (internalContextWithEAGLContext:options:, CoreUI flatten) and the injection constraints for the owner to decide.
+
+## Clock and clonefile (2026-10-25, patches 0203, 0204, 0212; details: patches/xnu/README-clock.md)
+
+- [V] 1969 cause: `NegroniPlatformExpert` had no `getUTCTimeOfDay()`; `IOPlatformExpert::getGMTTimeOfDay()` returns 0 (iokit/Kernel/IOPlatformExpert.cpp:394).
+- [V] `clock_initialize_calendar()` then sets the calendar to the uptime ("UTC is less then sys time"), so `1969-12-31 16:17` (Pacific) = epoch + 17 min uptime (osfmk/kern/clock.c:1052-1100, logs/usblog-20261024-235438.txt).
+- [V] PMK8350 RTC: DT `rtc@6100` "qcom,pmk8350-rtc", reg `<0x6100 0x6200>`, no `allow-set-time` (out/live.dts:12621).
+- [V] Linux rtc-pm8xxx.c pmk8350_regs: ctrl 0x6146 (bit 7 enable), write 0x6140, read 0x6148 (4 bytes LE), alarm_rw 0x6240; read = 4 bytes, re-read byte 0, again on carry; without allow-set-time the driver keeps an offset (nvmem/UEFI), never writes the counter (torvalds/linux master).
+- [I] The raw RTC counter on this phone may not be wall time (Android time_daemon keeps the offset); not measured yet: the 0203 boot log prints it (`NEGRONI RTC: ... counter N s`).
+- [V] 0203: `bsd/dev/negroni_rtc.c` reads the RTC through the v7 arbiter observer (header negroni_spmi_keys.h, as the keys driver), never writes the PMIC; wall = counter + offset (boot-arg `negronirtcoff`, else `/private/var/db/negroni_rtc`); floor = build date - 1 day; `negronirtc=0` = no PMIC access (source).
+- [V] 0203: settimeofday and USB settime reach `negroni_rtc_set()` through `PESetUTCTimeOfDay()`; a thread call saves the offset file, retry every 30 s x 60 while the root is read-only (source).
+- [V] 0203: IOKitInitializeTime (NEGRONI) waits up to 10 s for the platform expert, else the calendar would read 0 (source).
+- [V] 0212: USB commands `settime <s>[.<frac>]` and `time` on UDP 5141; host: `op10tool ctl settime|time`; `scripts/debug/usblog.sh` sends settime on each interface up (`USBLOG_SETTIME=1` default) (source).
+- [V] 0212 is a separate patch because dxb applies patches in name order and 0203 comes before 0210 (the command server) (out/kernel/local/dxb/build.sh:472).
+- [V] `hfs_clonefile` is not clonefile(2): it is step 2 of `hfs_relocate()` (copy a file's data to new blocks inside the file); callers: defragment-on-open in `hfs_vnop_open()` (8+ extents, after 3 min uptime) and hot files (bsd/negroni_hfs/core/hfs_readwrite.c:5440, hfs_vnops.c:634).
+- [V] ERANGE source: `hfs_vnop_blockmap()` returns ERANGE for a read at/after EOF (hfs_readwrite.c:3346); `cluster_write_copy()` pre-reads `[trunc_page(writebase), oldEOF)` when the write starts mid-page (vfs_cluster.c:3758), and that range is past EOF.
+- [V] Why only here: writebase = block count x 4 KiB is often not 16 KiB-page aligned on this 16K kernel; with 4 KiB pages it is always aligned (source analysis).
+- [V] `negroni_ufs.c` answered DKIOCISSOLIDSTATE with ENOTTY, so HFS had no HFS_SSD and relocation/hot files were on (hfs_vfsops.c:1298, hfs_readwrite.c:5487).
+- [V] Error count: 5 in usblog-20261024-195455.txt, 85 in usblog-20261024-235438.txt at ~7 s intervals (grep).
+- [I] The ~7 s rhythm is the SpringBoard crash loop re-opening one fragmented file; each failure is restored (truncate to ff_size), no data loss.
+- [V] 0204: `negroniclone` bits (default 3): bit 0 = DKIOCISSOLIDSTATE 1 (HFS_SSD: no relocation, no hot files); bit 1 = 16K-safe hfs_clonefile (first chunk ends on a page boundary, oldEOF = max(trunc_page(writebase), ff_size)); 0 = stock (source).
+- [V] All patches/xnu/0*.patch apply in name order on base a5b0203 except 0231 (NegroniFramebuffer.cpp:207, not touched by 0203/0204/0212) (`git apply --check`, 2026-10-25).
+- [V] Full local build with 0203/0204/0212 (2026-10-25 04:50-04:54 local, Xcode 15.4): exit 0, `out/kernel/local-20261024-232438/kernel.development.negroni` sha256 69af8f1a00679ce9..., all 02xx applied except 0231 (another agent's patch, NegroniFramebuffer.cpp:207); strings "NEGRONI RTC: boot calendar", "NEGRONI HFS: clonefile", "NEGRONI UFS: solid state" present (logs/kernel-local.log).
+- [V] Worktree `out/kernel/wt-clock` (branch `clock`): d1ccc64 = 0200+0210+0211, 19b3cc4 = 0203, 8fe5eac = 0212, ccc6719 = 0204. Not tested on the phone yet.
+
+## Battery (2026-10-25, patches 0270-0271; details: patches/xnu/README-battery.md)
+
+- [V] In `base` no IOPMPowerSource is registered: slop 0089 removed the NegroniBattery personality from iokit/KernelConfigTables.cpp; the class is still compiled (iokit/conf/files.arm64).
+- [V] The old NegroniBattery is the sweet PM6150 driver: SID 0 0x1006/0x1007/0x100d/0x110b/0x1310/0x48c0; on SM8450 SID 0 is PMK8350 and 0x1300 is PON (keys) (out/live.dts pon_hlos@1300).
+- [V] The old bsd/dev/negroni_spmi.c used sweet arbiter v5 addresses (core 0x0c440000, obs 0x0e600000, cnfg 0x0c40a000) and rejected versions >= 0x70000000; SM8450 is v7 (live DT qcom,spmi@c42d000 reg list: cnfg 0xc42d000, core 0xc400000, chnls 0xc500000, obsrvr 0xc440000, intr 0xc4c0000).
+- [V] The old class published CurrentCapacity/MaxCapacity in mAh; iOS UI readers want percent with MaxCapacity 100 (bergamota 0130, HackiOS RedwoodBattery.cpp).
+- [V] Battery: 2S (two cells in series), 5000 mAh (DT qcom,vbatt_num 2, qcom,batt_capacity_mah 0x1388; OnePlus oplus_battery_sm8450.c DOUBLE_SERIES_WOUND_CELLS).
+- [V] Fuel gauge: external gauge IC read by the ADSP (DT qcom,battery_charger: qcom,external_gauge, qcom,fg_info_package_read_support, oplus,chg_ops "plat-pmic"); out/live.dts has no I2C gauge node; none of the gauge compatibles in stock oplus_chg.ko/oplus_chg_v2.ko (bq27541, bq28z610, zy0602/3, sh366002, nfg8011b, cw2217) is in the DT (strings + grep).
+- [V] OnePlus official source (OnePlusOSS android_kernel_modules_and_devicetree_oneplus_sm8450, branch oneplus/sm8450_v_15.0.0_oneplus_10_pro, oplus_battery_sm8450.c) reads the gauge through GLINK only: OEM opcode 0x10000, data[0] temp 0.1 C, [1] current uA, [2] voltage uV, [3] SoC hundredths %, [4] remaining mAh per cell, [5] cycles, [6] FCC.
+- [V] OnePlus battmgr property enum = upstream sm8350 for 0..23 (CAPACITY 4, VOLT_NOW 7, CURR_NOW 9, TEMP 12, CHG_COUNTER 14, CYCLE_COUNT 15, CHG_FULL_DESIGN 16, CHG_FULL 17); owner 32778, get opcodes 0x30 battery / 0x32 USB / 0x34 wireless (oplus_battery_sm8450.h).
+- [V] HLOS-reachable battery data = PMK8350 VADC (ADC7) at SID 0 0x3100: 0x38f vbat_sns 1/3, 0x38e vph_pwr 1/3, 0x311 usb_in_v_div_16 1/16, 0x3a1 ichg_fb 1000/305185, 0x317 iin_fb 32/100, 0x310 chg_temp, 0x146 hot_pocket_therm (OPLUS skin_temp_chan) (live DT vadc@3100).
+- [V] No battery NTC channel exists in the ADC7 HLOS list; PM8350B charger/QBG are not in the HLOS DT (only temp-alarm 0xa00, PBS 0x1900, BCL 0x4700, GPIO 0x8800, haptics 0xf000, AMOLED 0xf800-0xfa00).
+- [V] ADC7 conversion needs writes (Linux adc7_configure): 0x40 APP_SID, 0x42-0x45 params/channel/settle, 0x47 CONV_REQ 0x80; result 0x50/0x51; volts = code * 1.875 V / 0x70e4 * den / num (qcom-spmi-adc5.c, qcom-vadc-common.c).
+- [I] The 1/3 VBAT value is the mean cell voltage (ADC max 1.875 V x 3 = 5.6 V cannot see a 6-9 V pack; either 1S-side node or a 1/6 hardware divider on the pack); `negronibatt=2` logs vph and the 2S midpoint (0x396) to settle it.
+- [V] 0270/0271 apply in name order after all other patches/xnu patches on base a5b0203 (`git apply --check`, 2026-10-25).
+- [V] 0271 boot-arg negronibatt: 0 = no power source (old kernel), 1 = VADC estimate (default), 2 = 1 + raw line per poll + SID 1/3 APID census, 3 = static 100 % on AC; log prefix `NEGRONI BATTERY:` (source).
+- [I] Without the ADSP nobody configures the PM8350B charger; whether it charges at all is unknown: the `ichg` value in the 0271 log shows it.
+- [I] Exact SoC needs the ADSP charger PD (GLINK PMIC_RTR_ADSP_APPS, after the audio ADSP work); README-battery.md section 6 lists the messages.

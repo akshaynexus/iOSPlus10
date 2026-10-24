@@ -1,0 +1,135 @@
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 76b4d9d..cd4cf27 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -581,6 +581,27 @@ negroni_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int fla
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+ 		*o = 1;
+ 		return 0;
++	case DKIOCISSOLIDSTATE: {
++		/*
++		 * UFS is flash. Without this HFS treats the root as a hard disk
++		 * (no HFS_SSD): it relocates ("defragments") fragmented files on
++		 * open and runs hot-file clustering, both through hfs_relocate()
++		 * -> hfs_clonefile(), which failed with ERANGE on this 16 KiB-page
++		 * kernel (patch 0204). Boot-arg negroniclone bit 0 (default on).
++		 */
++		static bool logged;
++		int clone = 3;
++		PE_parse_boot_argn("negroniclone", &clone, sizeof(clone));
++		if (!(clone & 1)) {
++			return ENOTTY;
++		}
++		if (!logged) {
++			logged = true;
++			printf("NEGRONI UFS: solid state (HFS: no file relocation, no hot files; negroniclone bit 0)\n");
++		}
++		*f = 1;
++		return 0;
++	}
+ 	default:
+ 		return ENOTTY;
+ 	}
+diff --git a/bsd/negroni_hfs/core/hfs_readwrite.c b/bsd/negroni_hfs/core/hfs_readwrite.c
+index 6a182c4..dac15c4 100644
+--- a/bsd/negroni_hfs/core/hfs_readwrite.c
++++ b/bsd/negroni_hfs/core/hfs_readwrite.c
+@@ -61,6 +61,7 @@
+ #include <vm/vm_kern.h>
+ 
+ #include <IOKit/IOBSD.h>
++#include <pexpert/pexpert.h>
+ 
+ #include <sys/kdebug.h>
+ 
+@@ -5713,6 +5714,37 @@ hfs_clonefile(struct vnode *vp, int blkstart, int blkcnt, int blksize)
+ 	iosize = bufsize = MIN(copysize, 128 * 1024);
+ 	offset = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/*
++	 * NEGRONI (16 KiB pages, 4 KiB HFS blocks): the copy target
++	 * writebase = blkstart * 4 KiB is often not page aligned. Then
++	 * cluster_write() pre-reads the start of the first page, from
++	 * trunc_page(writebase) up to its oldEOF argument (writebase + offset).
++	 * That range is past the file's EOF (ff_size <= writebase), and
++	 * hfs_vnop_blockmap() refuses reads at or past EOF with ERANGE: every
++	 * relocation of a file whose copy did not start on a page boundary
++	 * failed with "hfs_clonefile: cluster_write failed - 34" (stock xnu
++	 * only has 4 KiB pages on HFS volumes, where this cannot happen).
++	 * Fix (boot-arg negroniclone bit 1, default on):
++	 *  - the first chunk ends on a page boundary, so every later chunk
++	 *    starts page aligned and needs no pre-read;
++	 *  - the first chunk passes oldEOF = max(trunc_page(writebase), ff_size):
++	 *    the pre-read then covers only bytes below EOF (old data, written
++	 *    back unchanged), and a page that starts at or past EOF is zero
++	 *    filled up to writebase instead of read (these bytes are past EOF
++	 *    in the old blocks, which hfs_relocate() then frees).
++	 */
++	static int negroni_clone = -1;
++	if (negroni_clone < 0) {
++		int v = 3;
++		PE_parse_boot_argn("negroniclone", &v, sizeof(v));
++		negroni_clone = v;
++	}
++	const bool negroni_fix = (negroni_clone & 2) != 0;
++	const off_t negroni_head = (off_t)((uint64_t)writebase & PAGE_MASK_64);
++	const off_t negroni_eof = VTOF(vp)->ff_size;
++#endif
++
+ 	hfs_unlock(VTOC(vp));
+ 
+ #if CONFIG_PROTECT
+@@ -5726,7 +5758,20 @@ hfs_clonefile(struct vnode *vp, int blkstart, int blkcnt, int blksize)
+ 	auio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
+ 
+ 	while (offset < copysize) {
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++		off_t old_eof = writebase + (off_t)offset;
++		if (negroni_fix) {
++			iosize = MIN(copysize - offset, bufsize);
++			if (offset == 0 && negroni_head != 0) {
++				iosize = MIN(iosize, (size_t)(128 * 1024 - negroni_head));
++				old_eof = MAX(writebase - negroni_head, negroni_eof);
++			}
++		} else {
++			iosize = MIN(copysize - offset, iosize);
++		}
++#else
+ 		iosize = MIN(copysize - offset, iosize);
++#endif
+ 
+ 		uio_reset(auio, offset, UIO_SYSSPACE, UIO_READ);
+ 		uio_addiov(auio, (uintptr_t)bufp, iosize);
+@@ -5745,9 +5790,15 @@ hfs_clonefile(struct vnode *vp, int blkstart, int blkcnt, int blksize)
+ 		uio_reset(auio, writebase + offset, UIO_SYSSPACE, UIO_WRITE);
+ 		uio_addiov(auio, (uintptr_t)bufp, iosize);
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++		error = cluster_write(vp, auio, old_eof,
++		                      writebase + offset + iosize,
++		                      uio_offset(auio), 0, IO_NOCACHE | IO_SYNC);
++#else
+ 		error = cluster_write(vp, auio, writebase + offset,
+ 		                      writebase + offset + iosize,
+ 		                      uio_offset(auio), 0, IO_NOCACHE | IO_SYNC);
++#endif
+ 		if (error) {
+ 			printf("hfs_clonefile: cluster_write failed - %d\n", error);
+ 			break;
+@@ -5760,6 +5811,15 @@ hfs_clonefile(struct vnode *vp, int blkstart, int blkcnt, int blksize)
+ 		offset += iosize;
+ 	}
+ 	uio_free(auio);
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	static unsigned negroni_logged;
++	if (negroni_fix && negroni_logged < 20) {
++		negroni_logged++;
++		printf("NEGRONI HFS: clonefile %s: %zu bytes to %#llx (page offset %#llx, EOF %#llx)\n",
++		    error ? "failed" : "done", copysize, (unsigned long long)writebase,
++		    (unsigned long long)negroni_head, (unsigned long long)negroni_eof);
++	}
++#endif
+ 
+ 	if ((blksize & PAGE_MASK)) {
+ 		/*
