@@ -35,7 +35,7 @@ cleanup() {
   for m in "$work"/root "$work"/os "$work"/sysos "$work"/appos; do
     mount | grep -q " on $m " && umount "$m" 2>/dev/null || true
   done
-  for d in "${devs[@]}"; do hdiutil detach -force "$d" >/dev/null 2>&1 || true; done
+  for d in ${devs[@]+"${devs[@]}"}; do hdiutil detach -force "$d" >/dev/null 2>&1 || true; done
   rmdir "$work"/* "$work" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -46,7 +46,7 @@ attach() {
   [ "${3:-}" = raw ] && extra=(-imagekey diskimage-class=CRawDiskImage)
   mkdir -p "$mnt"
   local plist dev
-  plist=$(hdiutil attach -readonly -nobrowse -noverify -noautoopen "${extra[@]}" -mountpoint "$mnt" -plist "$img")
+  plist=$(hdiutil attach -readonly -nobrowse -noverify -noautoopen ${extra[@]+"${extra[@]}"} -mountpoint "$mnt" -plist "$img")
   dev=$(printf '%s' "$plist" | python3 -c 'import plistlib,sys; e=plistlib.loads(sys.stdin.buffer.read())["system-entities"]; print(min(x["dev-entry"] for x in e))')
   devs+=("$dev")
   echo "attached $(basename "$img") -> $mnt ($dev)"
@@ -60,7 +60,7 @@ attach "$D/087-86715-047.dmg" "$work/appos" raw
 # 2. empty case-sensitive journaled HFS+ image (sparse file)
 mkfile -n "$SIZE" "$OUT"
 dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$OUT" | awk 'NR==1{print $1}')
-devs=("$dev" "${devs[@]}")
+devs=("$dev" ${devs[@]+"${devs[@]}"})
 newfs_hfs -s -J -v iOSRoot "$dev"
 mkdir -p "$work/root"
 mount -t hfs -o nobrowse "$dev" "$work/root"
