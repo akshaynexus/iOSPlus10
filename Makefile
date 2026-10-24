@@ -6,7 +6,7 @@ BG := scripts/bg.sh
 OS := $(shell uname -s)
 
 .PHONY: help status tools op10tool colima image backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
-        kernel devicetree dmgs boot root simg ios16 flash flash-boot flash-restore
+        kernel devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug
 
 help:
 	@echo "setup:   make tools | op10tool | colima (macOS) | image"
@@ -76,5 +76,10 @@ flash:
 	$(BG) flash env CONFIRM=$(CONFIRM) scripts/flash/all.sh
 flash-boot:
 	$(BG) flash env CONFIRM=$(CONFIRM) scripts/flash/all.sh --skip-userdata
+# debug variant: kernel log on the panel (negronifb_noconsole=0) -> out/ios16-debug
+boot-debug:
+	$(BG) ios16-debug env IOS16_OUT=$(CURDIR)/out/ios16-debug BOOTARGS_DROP="negronifb_noconsole=" BOOTARGS_ADD="negronifb_noconsole=0 -enable_kprintf_spam" sh -c 'mkdir -p $$IOS16_OUT && cp out/ios16/negroni.adt out/ios16/vendor_boot_a.img $$IOS16_OUT/ && scripts/ios16/build.sh payload && scripts/ios16/build.sh boot'
+flash-boot-debug:
+	$(BG) flash env CONFIRM=$(CONFIRM) IOS16_OUT=$(CURDIR)/out/ios16-debug scripts/flash/all.sh --skip-userdata
 flash-restore:
 	$(BG) flash-restore env CONFIRM=$(CONFIRM) scripts/flash/restore.sh

@@ -13,7 +13,8 @@ set -eu
 . "$(dirname "$0")/../lib/env.sh"
 STEP=${1:-all}
 C="python3 $REPO/scripts/lib/conf.py"
-O=$OUT/ios16
+# Variants: IOS16_OUT=out/ios16-debug BOOTARGS_DROP="negronifb_noconsole=" BOOTARGS_ADD="negronifb_noconsole=0"
+O=${IOS16_OUT:-$OUT/ios16}
 mkdir -p "$O"
 DTB=$REPO/$($C bootimg.dtb)
 FD=$OUT/mu/SILICIUM_UEFI-DEBUG.fd
@@ -25,7 +26,13 @@ adt() {
 
 payload() {
   [ -f "$OUT/kernel/kernel.macho" ] || { echo "missing out/kernel/kernel.macho (scripts/ios16/fetch-kernel.sh)" >&2; exit 1; }
-  args=$($C payload.kernel_args)
+  args=""
+  for a in $($C payload.kernel_args); do
+    keep=1
+    for d in ${BOOTARGS_DROP:-}; do case "$a" in "$d"*) keep=0 ;; esac; done
+    [ $keep = 1 ] && args="$args $a"
+  done
+  args="${args# } ${BOOTARGS_ADD:-}"; args="${args% }"
   printf '%s\n' "$args" > "$O/cmdline.txt"
   "$REPO/scripts/lib/native-env.sh" python3 "$REPO/$($C payload.tool)" "$(cd "$OUT/kernel" && pwd -P)/$(readlink "$OUT/kernel/kernel.macho")" \
     "$O/negroni.adt" "$O/esp.img" --cmdline "$args" \
