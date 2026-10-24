@@ -4,7 +4,10 @@
 #
 # Special case: the fork pins Silicium-ACPI to 5d26c38, a commit that only existed in the
 # author's local tree. README-negroni.md gives the real base, 2d465ad, plus
-# patches/silicium-acpi-negroni.patch. OpenSSL is used without its own nested submodules.
+# patches/silicium-acpi-negroni.patch.
+# All nested submodules (also OpenSSL's krb5, wycheproof, ...) are fetched here with --depth 1:
+# otherwise the Mu build's setup step clones them at full depth inside the container (slow).
+# This step cleans the Binaries submodule, so run scripts/mu-prepare.sh after it.
 set -eu
 . "$(dirname "$0")/env.sh"
 MU=$EXT/Mu-Silicium-negroni
@@ -33,8 +36,9 @@ for p in $(git config -f .gitmodules --get-regexp 'submodule\..*\.path' | awk '{
   echo "$p @ $(git -C "$p" rev-parse --short HEAD)"
 done
 
-# nested submodules (BaseTools brotli, MipiSysT, cmocka, ...), not for OpenSSL
-for p in Mu_Basecore Common/Mu Common/Mu_OEM_Sample Common/Features/mu_feature_dfci Common/Features/mu_feature_config; do
+# nested submodules (BaseTools brotli, MipiSysT, cmocka, OpenSSL test suites, ...)
+for p in Mu_Basecore Common/Mu Common/Mu_OEM_Sample Common/Features/mu_feature_dfci Common/Features/mu_feature_config \
+         Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl; do
   git -C "$p" submodule update -q --init --recursive --depth 1 --jobs 8
 done
 
