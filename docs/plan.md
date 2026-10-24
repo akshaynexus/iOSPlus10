@@ -41,6 +41,15 @@ Status date: 2026-10-24.
   (slop NOTES 2026-10-20). Fixed in `patches/mu/0001-negroni-kernel-ram-16k.patch` (applied by
   `scripts/uefi/prepare.sh`); Mu and both boot images rebuilt.
 
+## iOS 16 boots on the NE2211 (2026-10-24, 20:10)
+
+With the Kernel RAM fix (debug image: `negroniusb=2`, `negronifb_noconsole=0`), the live USB log
+(`make usblog`) shows the iOS userland: backboardd ("NEGRONI FB: display on"), SpringBoard
+(AppleKeyStore calls), com.apple.datamigrator (first-boot migration), thermalmonitord,
+CAReportingService, localizationswitcherd, symptomsd. bluetoothd and fairplayd.H2 are relaunched
+every ~10 s (no hardware; the port dropped their jobs in its later root). Next: the screen state,
+then the normal image (`make flash-boot`).
+
 ## Phase 1: iOS 16 (existing negroni port)
 
 1. ~~Measure the 12 GB memory map~~ (done over adb root). Optional: shim probe with `fastboot boot`.
