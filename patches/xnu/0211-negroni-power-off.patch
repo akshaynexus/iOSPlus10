@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/negroni_reboot.c b/bsd/dev/negroni_reboot.c
-index a7e0749..38afa66 100644
+index a7e0749..b24c180 100644
 --- a/bsd/dev/negroni_reboot.c
 +++ b/bsd/dev/negroni_reboot.c
 @@ -1,5 +1,5 @@
@@ -105,7 +105,7 @@ index a7e0749..38afa66 100644
 +static uint32_t nr_arb, nr_apids;
 +static bool nr_arb_attempted, nr_arb_ready;
 +static int nr_poweroff_mode;                    /* boot-arg negronipoweroff */
-+static int nr_panic_secs = 30;                  /* boot-arg negronipanic */
++static int nr_panic_secs;                       /* boot-arg negronipanic (0 = stay) */
 +static int nr_panic_reason;                     /* boot-arg negronipanicreason */
 +static bool nr_prepared;
  
@@ -414,7 +414,7 @@ index a7e0749..38afa66 100644
 +
 +/*
 + * Panic: the panic text stays on the screen for negronipanic seconds
-+ * (default 30), then reset with reason negronipanicreason (default 0).
++ * (default 0 = stay, the owner's choice), then reset with reason negronipanicreason (default 0).
 + * negronipanic=0: stay on the panic screen (never returns).
 + */
 +void

@@ -27,10 +27,15 @@ if [ ! -d "$W/dxb/.git" ]; then
   # libfirehose_kernel is built arm64e-only; the NEGRONI kernel is plain arm64
   sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' "$W/dxb/build.sh"
 fi
-# our patches: always the current set (a changed patch needs CLEAN=1, since xnu is patched once)
+# our patches: always the current set
+rm -f "$W"/dxb/patches/0[2-9][0-9][0-9]-*.patch
 cp "$REPO"/patches/xnu/*.patch "$W/dxb/patches/" 2>/dev/null || true
-# rebuild the kernel binary each run (dxb skips build_xnu when it exists)
-rm -f "$W"/dxb/build/xnu.obj/kernel.*
+# every run patches a fresh xnu copy (the port's stage scripts refuse to run twice on one tree);
+# the built helpers (mig, ctf tools, headers, libfirehose) in fakeroot/ are kept
+XNU_TAG=xnu-8796.141.3
+[ -d "$W/xnu-pristine/.git" ] || git clone -q --depth 1 --branch "$XNU_TAG" https://github.com/apple-oss-distributions/xnu.git "$W/xnu-pristine"
+rm -rf "${W:?}/dxb/xnu" "${W:?}/dxb/build/xnu.obj" "${W:?}/dxb/build/xnu.sym"
+cp -R "$W/xnu-pristine" "$W/dxb/xnu"
 
 cd "$W/dxb"
 export PATH="$W/bin:$PATH" DEVELOPER_DIR="$APP/Contents/Developer"
@@ -39,7 +44,7 @@ xcodebuild -version
 bash build.sh 2>&1 | tee "$W/build.log"
 D=$OUT/kernel/local-$(date -u +%Y%m%d-%H%M%S)
 mkdir -p "$D"
-cp fakeroot/System/Library/Kernels/kernel.* "$D/"
+find fakeroot/System/Library/Kernels -maxdepth 1 -type f -name "kernel.*" -exec cp {} "$D/" \;
 grep -E "Applying patch|Skipping patch" "$W/build.log" | sed 's|.*/patches/||' > "$D/patch-report.txt" || true
 (cd "$D" && shasum -a 256 kernel.* > SHA256SUMS)
 ln -sfn "$(basename "$D")/kernel.$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]').negroni" "$OUT/kernel/kernel.macho"

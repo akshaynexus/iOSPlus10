@@ -153,7 +153,7 @@ Startup log line: `NEGRONI CTL: commands on udp 192.168.7.2:5141 on (boot-arg ne
 
 ```
 NEGRONI REBOOT: SPMI arbiter 0x7xxxxxxx, SDAM 0x7100 APID n (EE 0)      (at platform start, 0211)
-NEGRONI REBOOT: power off = PSCI SYSTEM_OFF, panic = reset after 30 s (reason 0)
+NEGRONI REBOOT: power off = PSCI SYSTEM_OFF, panic = stay on the screen (negronipanic=0)
 NEGRONI CTL: "ping" from 192.168.7.1:53122
 NEGRONI CTL: "bootloader" from 192.168.7.1:53123
 NEGRONI REBOOT: SDAM 0x7100 +0x48 0x00 -> 0x04
@@ -285,7 +285,7 @@ Nothing in the negroni tree swallows the request. The missing part was the last 
 |---|---|
 | `kPEHaltCPU` (also `kPEUPSDelayHaltCPU`, mapped by IOKit) | log `NEGRONI: power off`, sleep 300 ms (if the thread may block), `negroni_power_off()` |
 | `kPERestartCPU` | log `NEGRONI: restart`, sleep 300 ms, reboot reason 0 (normal), PSCI `SYSTEM_RESET` |
-| `kPEPanicRestartCPU` | `negroni_panic_restart()`: panic text stays on the screen `negronipanic` s (default 30), then reason `negronipanicreason` (default 0) and reset; `negronipanic=0` stays on the panic screen for ever |
+| `kPEPanicRestartCPU` | `negroni_panic_restart()`: panic text stays on the screen `negronipanic` s (default 0 = stay for ever, owner's choice 2026-10-24), then reason `negronipanicreason` (default 0) and reset; `negronipanic=0` stays on the panic screen for ever |
 | `kPEPanicBegin` | marks the panic: a later `kPEHaltCPU`/`kPERestartCPU` goes to `negroni_panic_restart()` (the panic path calls `halt_all_cpus(TRUE)` after a refused panic restart) |
 | all other types (panic callouts) | nothing, return 0 |
 
@@ -342,16 +342,16 @@ SoC drop PS_HOLD with PSCI `SYSTEM_RESET`. The PMIC then powers off instead of a
 | Boot-arg | Default | Effect |
 |---|---|---|
 | `negronipoweroff=0/1/2` | 0 | power off method (table above) |
-| `negronipanic=N` | 30 | after a panic: reset after N s; 0 = stay on the panic screen |
+| `negronipanic=N` | 0 | after a panic: reset after N s; 0 = stay on the panic screen (default, as before 0211) |
 | `negronipanicreason=N` | 0 | reboot reason for the panic reset (2 = fastboot, for `fastboot boot` work) |
 
-Before 0211 a panic stayed on the screen for ever. Use `negronipanic=0` for the old behavior.
+A panic stays on the screen for ever, as before 0211 (owner's choice). `negronipanic=30` resets after 30 s.
 
 ### Log lines (0211)
 
 ```
 NEGRONI: platform expert registered, halt/restart hook set
-NEGRONI REBOOT: power off = PSCI SYSTEM_OFF, panic = reset after 30 s (reason 0)
+NEGRONI REBOOT: power off = PSCI SYSTEM_OFF, panic = stay on the screen (negronipanic=0)
 CPU halted
 NEGRONI: power off
 NEGRONI REBOOT: PSCI SYSTEM_OFF
@@ -378,13 +378,13 @@ PSCI return codes: -1 NOT_SUPPORTED, -2 INVALID_PARAMETERS, -3 DENIED.
    (a userland problem: read the launchd/SpringBoard lines before it).
 4. A restart from userland (`ssh root@192.168.7.2 reboot`, `scripts/net/ssh-phone.sh`): log
    `MACH Reboot`, `NEGRONI: restart`, then a reset.
-5. `op10tool ctl panic`: panic text on the screen, after 30 s a reset. With `negronipanic=0`:
+5. `op10tool ctl panic`: panic text stays on the screen (default). With `negronipanic=30`, a reset after 30 s;
    no reset. With `negronipanicreason=2`: the reset goes to fastboot.
 
 ### Risks (0211)
 
-- A panic now resets after 30 s (before: the phone stayed on the panic screen). Photos of the
-  panic screen must be taken in that time, or use `negronipanic=0`.
+- With `negronipanic=N` (N > 0) a panic resets after N s: take photos of the panic screen in that
+  time. The default (0) keeps the panic screen, as before 0211.
 - `SYSTEM_OFF` behavior under Gunyah/TZ is not known yet. If it returns, the default only logs.
 - The PMIC fallback writes PON_PBS registers with offsets that are not verified for GEN3; it is
   off by default and refuses to write if the type/subtype check fails.

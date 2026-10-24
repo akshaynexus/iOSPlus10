@@ -36,9 +36,10 @@ service, no DCS command) · reboot to fastboot from iOS · widgets show "Waiting
 | GPU userland: Mesa freedreno A730 + EAGL dylib | `userland/negronigl/`, `scripts/gpu/`, `docs/gpu-userland.md` | kernel GPU work |
 | SSH over USB + Mac internet sharing | `userland/ssh/`, `scripts/net/`, `docs/usb-network.md` | root rebuild |
 | Audio plan + ADSP firmware + ADSP start | `docs/audio-plan.md`, `scripts/audio/`, `patches/xnu/0240` | kernel build |
-| Brightness (DCS 0x51) + display sleep | `patches/xnu/0250-0251` | kernel build |
-| Power off (PSCI SYSTEM_OFF) + `poweroff` command | `patches/xnu/0211` | kernel build |
+| Brightness (DCS 0x51) + display sleep | `patches/xnu/0250-0251` (done) | kernel build |
+| Power off (PSCI SYSTEM_OFF) + `poweroff` command | `patches/xnu/0211` (done; panic stays on screen: `negronipanic=0` default, owner) | kernel build |
 | **Metal on Vulkan (Turnip)**: main GPU goal | `userland/metal/`, `scripts/metal/`, `docs/metal-plan.md` | GPU kernel ABI + Turnip build |
+| Bold Text crash loop (Codex agent) | `docs/boldtext-crash.md`, `scripts/ios16/root-tweaks-boldtext.py` | research |
 | Wi-Fi QCA6490 (ath11k-style: PCIe, MHI, QMI, WMI, Apple80211) | `patches/xnu/0260-0269`, `docs/wifi-plan.md`, `scripts/wifi/` | kernel build |
 | Camera feasibility + plan | `docs/camera-plan.md` | research |
 
@@ -107,6 +108,21 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   before the hang. Cause unknown [I: a respring + font cache rebuild under CPU rendering, then a crash on
   boot with the pref set]. Pref: `com.apple.Accessibility` in /var/mobile/Library/Preferences [I].
   Recovery: re-flash `userdata` (fresh root). Capture `make usblog` during the next attempt.
+- SpringBoard in `logs/usblog-20261024-195455.txt` [V]: **no SpringBoard crash** in 19:54-21:43 (the hang
+  came later and was not logged: the old usblog.sh lost the link at the first phone reboot; fixed
+  2026-10-24). Its 1724 syslog lines are warnings only: 310 "trying to set state of nil layer",
+  CATransformLayer property warnings, "Unbalanced calls to begin/end appearance transitions",
+  UICollectionViewFlowLayout size warnings. ReportCrash ran twice: 21:31:47 (ReportMemoryException
+  after a burst of daemon launches) and 21:39:41 (activityawardsd abort).
+- **Clock is 1969-12-31** in userland timestamps [V: `1969-12-31 17:22:49 SpringBoard[26:245]`]: no RTC /
+  calendar source. Expect TLS, certificates, keychain item dates and anything time-based to misbehave
+  [I]. 0200 only removes the 30 s wait; a real calendar source (PMK8350 RTC, or time from the host
+  over USB) is still needed.
+- `hfs_clonefile: cluster_write failed - 34` (ERANGE) 5 times [V] (21:31:42, 21:39:41, 21:40:11, ...):
+  clonefile on the HFS+ root fails; writes that rely on clonefile (atomic plist/database copies) can
+  fail [I]. Reference fix: ios-flame xnu/patches/0100 (clonefile fallback).
+- Thread-count high watermark (32) warnings: appleaccountd, lsd, contextstored, cfprefsd, suggestd,
+  healthd, siriinferenced [V] (diagnostic only).
 - Owner report [V]: "slide to power off" does nothing (kernel halt path: patch 0211 in progress);
   the power button takes ~10 s to turn the screen off (CPU rendering; brightness/sleep agent).
 - Root tweaks (`scripts/ios16/root-tweaks-extra.py`, on top of slop's `sweet-root-tweaks.py`): drop
@@ -213,3 +229,29 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 - [I] iOS 16's D22AP camera path likely expects AppleH10CamIn/Apple ISP private interfaces; validate daemon and driver names against the local 20H392 root before implementation.
 - [I] iOS has no documented third-party CMIO/DAL custom-camera extension route; a fake AppleH10CamIn provider is a research-grade route to stock capture apps.
 - [I] First action: offline decode of stock DTBO/vendor camera modules, then one sensor's guarded CCI chip-ID probe. See [camera-plan.md](camera-plan.md).
+
+## 13. Bold Text (research, 2026-10-24)
+- [V] `AccessibilitySettings.bundle/AccessibilitySettings` strings include `boldTextEnabled:`, `setBoldTextEnabled:specifier:`, and `legibilityWeight`; source: offline strings inspection of `/private/tmp/blwork/root` while mounted.
+- [V] UIKit names its app notification `UIAccessibilityBoldTextStatusDidChangeNotification`; it is an `NSNotification`, and public API exposes `UIAccessibility.isBoldTextEnabled`; sources: Apple UIKit documentation linked in `docs/boldtext-crash.md`.
+- [V] Public iOS 16 evidence identifies preference `com.apple.Accessibility:EnhancedTextLegibilityEnabled`; Apple device-management accessibility command names corresponding command field `BoldTextEnabled`; source: Apple Device Management docs and iOS reproduction linked in `docs/boldtext-crash.md`.
+- [V] Offline font inventory seen in the root included `CoreUI/SFUI.ttf`, Helvetica Neue families, and other Core/CoreUI fonts; source: `find` output from `/private/tmp/blwork/root/System/Library/Fonts` while mounted.
+- [V] `root-tweaks-extra.py` and slop `sweet-root-tweaks.py` do not remove font files; sources: those scripts.
+- [V] No log records the Bold Text incident: `logs/usblog-20261024-195455.txt` ends before the reported hang; cause remains undiagnosed.
+- [I] The leading hypothesis is a SpringBoard/UIKit restart or rendering path under CPU-only software drawing; there is no direct crash trace.
+- [I] No exact Darwin notification, CoreText/fontd cache rebuild event, or proven managed restriction that disables the switch was established; do not describe the UIKit notification as Darwin.
+- [V] Added `scripts/ios16/root-tweaks-boldtext.py`, which saves `EnhancedTextLegibilityEnabled=false` in a newly built root; it resets startup state but does not lock/hide the Settings switch; source: script.
+- [V] Recovery and next-attempt capture steps are documented in `docs/boldtext-crash.md`; they were not run and the phone was not touched.
+
+## 13. Display (from the brightness agent, 2026-10-24)
+
+- Panel: Samsung AMB670YF08 (S6E3HC3 IC), AMOLED, DSI command mode, DSC 1.2, DSI0 only; UEFI sets
+  1080x2412 @120 Hz with DSIEnableAutoRefresh=True: the MDP scans the RAM framebuffer on each TE, no
+  kernel kick [V: out/live.dts, Mu panel XML Panel_samsung_amb670yf08_1440_3216_dsc_cmd.xml].
+- Brightness: DCS 0x51 + 2-byte DBV (high byte first), normal 1..0x7ff, HBM 0x800..0xfff; LP mode; UEFI
+  init already sends 0x53=0x28 [V]. DSI0 0x0AE94000 (size 0x400, dsi-ctrl-hw-v2.6), MDSS 0x0AE00000,
+  MDP INTF 0x0AE36000 [V DT].
+- CoreBrightness (20H392) finds `AppleARMBacklight` with `backlight-control=true`; without
+  `new-backlight-architecture` it uses the legacy path (`brightness`, `FadePeriod`, `backlight-level`
+  in IODisplayParameters) [V disassembly]. Details: patches/xnu/README-brightness.md.
+- The ~10 s power-button-to-dark delay is iOS sending RequestPowerChange late; 0251 adds a kernel
+  fast-off on a short power-key press (< 700 ms) [I until tested].
