@@ -4,7 +4,7 @@
 	branch = main
 [submodule "external/slop"]
 	path = external/slop
-	url = https://github.com/MellysInformejtik/slop.git
+	url = https://github.com/akshaynexus/slop.git
 	branch = main
 [submodule "external/UniXNU-negroni"]
 	path = external/UniXNU-negroni

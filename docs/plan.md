@@ -1,6 +1,6 @@
 # Plan and status
 
-Status date: 2026-10-24.
+Status date: 2026-10-25.
 
 ## Done
 
@@ -27,6 +27,8 @@ Status date: 2026-10-24.
   build (`SILICIUM_UEFI-DEBUG.fd`).
 - iOS root built on macOS (`make root`): 11 GiB used of 16 GiB, 173 apps, fsck_hfs OK;
   sparse image `~/op10-apple/ios16-root.simg` (11.6 GB, sha256 d5d4437d...).
+- Vsync raised to 120 Hz in slop patches 0046/0056/0061 (`NEGRONI_FB_VSYNC_US` 8333); patch set
+  re-applies cleanly (129 applied, 4 usual skips). Next: rebuild the kernel image and boot it.
 
 ## First boot (2026-10-24, 19:48)
 

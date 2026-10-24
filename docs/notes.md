@@ -290,6 +290,12 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   in IODisplayParameters) [V disassembly]. Details: patches/xnu/README-brightness.md.
 - The ~10 s power-button-to-dark delay is iOS sending RequestPowerChange late; 0251 adds a kernel
   fast-off on a short power-key press (< 700 ms) [I until tested].
+- Vsync 120 Hz (2026-10-25): slop patches 0046/0056/0061 set `NEGRONI_FB_VSYNC_US` to 8333 (was
+  16667 = 60 Hz) and derive `fFlushTicks` from it, so `negronifb_hz` keeps its meaning. The panel
+  scans at 120 Hz, the vsync timer was the 60 Hz limit. 20H392 dyld shared cache has no
+  MobileGestalt/ProMotion key, so iOS takes the rate from the driver [V: grep of
+  dyld_shared_cache_arm64; `scripts/kernel/prepare-src.sh` -> 129 applied, 4 usual skips].
+  Kernel image not rebuilt yet, phone not booted with it [I].
 
 ## 14. Metal (2026-10-25, Metal agent)
 
