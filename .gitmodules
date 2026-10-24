@@ -57,3 +57,8 @@
 	path = external/hackios-xnu-userland
 	url = https://github.com/oosexgang/hackios-xnu-userland.git
 	branch = main
+[submodule "Mu-Silicium-negroni"]
+	url = https://github.com/akshaynexus/Mu-Silicum-negroni.git
+[submodule "UniXNU"]
+	url = https://github.com/akshaynexus/UniXNU.git
+	branch = iosplus10

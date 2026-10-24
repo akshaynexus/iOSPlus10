@@ -2,16 +2,23 @@
 
 These are the HackiOS-family projects we found: every public port of Apple's XNU and iOS userland
 to Android phones that was useful to us, plus the UEFI and loader projects the negroni chain is
-built on. All are git submodules pinned to a commit. We do not commit changes inside them; our
-changes live in this repo (`scripts/`, `patches/`, `config/`, `tools/`) and are applied by scripts.
+built on. All are git submodules pinned to a commit.
+
+**Forks (2026-10-25):** the five repos the build actually needs are forked to `akshaynexus` and our
+changes are committed there, so a clone of this repo gets a working submodule: `Mu-Silicum-negroni`
+(`main`) with nested `mu_basecore` (`iosplus10`) and `Silicium-ACPI` (`main`), plus `UniXNU`
+(`iosplus10`) with nested `DarwinBoot` (`main`). `origin` in each local checkout points at our fork,
+`upstream` at the original. Reference-only submodules stay on their original URLs with no changes;
+for those we still keep our work in this repo (`scripts/`, `patches/`, `config/`, `tools/`) and apply
+it with scripts.
 
 ## Needed to build (the build reads these)
 
 | Submodule | Used by | What we take from it |
 |---|---|---|
 | `slop` (MellysInformejtik/slop) | `scripts/kernel/prepare-src.sh`, kernel CI, `scripts/ios16/build.sh`, `scripts/ios16/root-*.sh`, `scripts/uefi/*` | The negroni port: 125 xnu-8796 kernel patches + 3 staging scripts (`negroni-ios/xnu/patches`), the shim (`shim/`), `mkadt.py` + `adt.py`, `mkdarwinboot.py`, `sweet-root-tweaks.py`, `mkiosroot.sh` (Linux root), `remotezip.py`, the UEFI patch tools. **Required.** |
-| `Mu-Silicium-negroni` (pawlickerr/Mu-Silicum-negroni) | `scripts/uefi/setup-mu.sh`, `prepare.sh`, `build.sh`, `build-macos.sh` | The Mu-Silicium UEFI tree with `negroniPkg`, built into `SILICIUM_UEFI.fd`. Our fix on top: `patches/mu/`. **Required.** |
-| `UniXNU` (UniXNU/UniXNU) | the Mu build (`UNIXNU_ROOT`), `scripts/uefi/prepare.sh` | `package/UniXNUPkg` (boot manager) and the `drivers/DarwinBoot` submodule (loads XNU), linked into the Mu build. **Required.** |
+| `Mu-Silicium-negroni` (**akshaynexus/Mu-Silicum-negroni**, fork of pawlickerr) | `scripts/uefi/setup-mu.sh`, `prepare.sh`, `build.sh`, `build-macos.sh` | The Mu-Silicium UEFI tree with `negroniPkg`, built into `SILICIUM_UEFI.fd`. Our fix on top: `patches/mu/`, plus committed in the fork: `Kernel RAM` at `0x841000000`. Nested `mu_basecore` (branch `iosplus10`: timer freq PCD fallback, boot menu Power Off/Exit, USB `TPL_CALLBACK`, AArch64 `.text`, runtime variable write protection) and `Silicium-ACPI` (`Platforms/OnePlus/negroni` SSDT/Touch/GPU tables) also on our forks. **Required.** |
+| `UniXNU` (**akshaynexus/UniXNU**, branch `iosplus10`, fork of UniXNU/UniXNU) | the Mu build (`UNIXNU_ROOT`), `scripts/uefi/prepare.sh` | `package/UniXNUPkg` (boot manager) and the `drivers/DarwinBoot` submodule (loads XNU, fork **akshaynexus/DarwinBoot** on `main` with the boot-refused-on-screen debug), linked into the Mu build. Branch `iosplus10` = upstream `main` minus 30 commits + our DarwinBoot pointer (keeps the tested state). **Required.** |
 
 ## Reference only (read, compared, ported from; not used by the build)
 
