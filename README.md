@@ -27,6 +27,7 @@ config/
 docs/
   plan.md                phases and status (read first)
   build-ios16.md         flow, scripts per OS, native vs container, known traps
+  flash-ios16.md         make flash / flash-boot / flash-restore, order and why
   setup-macos.md         host setup on macOS (Homebrew, Colima + Rosetta)
   setup-linux.md         host setup on Linux
   uefi-binaries.md       Qualcomm DXEs + ported r0q patches
@@ -42,6 +43,7 @@ scripts/
   backup/                fetch-stock-ota, dump-partitions
   uefi/                  setup-mu, prepare (patch-dxe + binaries.py), build, patch-locate.py
   ios16/                 fetch-kernel, fetch-d22ap-adt, fetch-dmgs, build, root(-macos|-linux|-finish), root-simg
+  flash/                 all.sh (whole chain), restore.sh (back to stock), ios16.sh (single steps)
 tools/op10tool/          Rust CLI: img2simg, ipsw-get, uefi-unpack, uefi-portpatch, im4p
                          (tests/: Python reference versions + compare-python.sh)
 external/                submodules (see below)

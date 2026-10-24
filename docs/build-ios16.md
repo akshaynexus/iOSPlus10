@@ -83,6 +83,11 @@ Everything else runs natively on macOS and Linux.
 | Root image | the OS, SystemOS and AppOS trees are copied by three rsync processes at the same time |
 | Independent steps | separate tmux jobs (`make mu`, `make kernel`, `make dmgs` can all run at once) |
 
+## Flash
+
+`make flash CONFIRM=yes` (whole chain) and `make flash-restore CONFIRM=yes` (back to Android):
+see [flash-ios16.md](flash-ios16.md). `make ios16` runs every build step after the Mu UEFI in order.
+
 ## Outputs
 
 - `out/ios16/`: `negroni.adt`, `esp.img`, `cmdline.txt`, `boot_a.img`, `vendor_boot_a.img`, `SHA256SUMS`

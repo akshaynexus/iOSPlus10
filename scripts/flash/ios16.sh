@@ -44,7 +44,7 @@ boot)        bootloader; need "$O/boot_a.img"; run fastboot flash boot_a "$O/boo
 userdata)
   need "$APPLE/ios16-root.simg"
   userspace || { echo "phone is not in fastbootd: run 'adb reboot fastboot' (or 'fastboot reboot fastboot')" >&2; exit 1; }
-  run fastboot -S 512M flash userdata "$APPLE/ios16-root.simg" ;;
+  run fastboot flash userdata "$APPLE/ios16-root.simg" ;;   # fastboot splits to the device max-download-size (fastbootd: 256 MiB)
 active)      bootloader; run fastboot set_active a; run fastboot reboot ;;
 *) sed -n 2,17p "$0"; exit 1 ;;
 esac

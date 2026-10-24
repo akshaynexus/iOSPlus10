@@ -6,13 +6,15 @@ BG := scripts/bg.sh
 OS := $(shell uname -s)
 
 .PHONY: help status tools op10tool colima image backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
-        kernel devicetree dmgs boot root simg
+        kernel devicetree dmgs boot root simg ios16 flash flash-boot flash-restore
 
 help:
 	@echo "setup:   make tools | op10tool | colima (macOS) | image"
 	@echo "backup:  make backup-ota | backup-dump (adb root)"
 	@echo "uefi:    make mu  (= setup-mu + mu-prepare + mu-build) | mu-build-macos (native, no container)"
 	@echo "ios16:   make kernel | devicetree | dmgs | boot | root (sudo) | simg"
+	@echo "build:   make ios16  (kernel devicetree dmgs boot root simg, in order)"
+	@echo "flash:   make flash CONFIRM=yes | flash-boot CONFIRM=yes (no userdata) | flash-restore CONFIRM=yes"
 	@echo "status:  make status"
 
 status:
@@ -63,3 +65,16 @@ root:
 	@echo "type the sudo password: tmux attach -t root  (detach: Ctrl-b d)"
 simg:
 	$(BG) simg scripts/ios16/root-simg.sh
+
+# all iOS 16 build steps after the Mu UEFI, in order, in one tmux job (root asks for sudo once)
+ios16:
+	$(BG) ios16-all sh -c 'scripts/ios16/fetch-kernel.sh && scripts/ios16/fetch-d22ap-adt.sh && scripts/ios16/fetch-dmgs.sh && scripts/ios16/build.sh && sudo scripts/ios16/root.sh && scripts/ios16/root-simg.sh'
+	@echo "sudo password: tmux attach -t ios16-all  (detach: Ctrl-b d)"
+
+# --- flash (phone connected; each target needs CONFIRM=yes) ---------------------------------
+flash:
+	$(BG) flash env CONFIRM=$(CONFIRM) scripts/flash/all.sh
+flash-boot:
+	$(BG) flash env CONFIRM=$(CONFIRM) scripts/flash/all.sh --skip-userdata
+flash-restore:
+	$(BG) flash-restore env CONFIRM=$(CONFIRM) scripts/flash/restore.sh
