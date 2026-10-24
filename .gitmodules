@@ -1,0 +1,32 @@
+[submodule "external/ios-sweet"]
+	path = external/ios-sweet
+	url = https://github.com/akshaynexus/ios-sweet.git
+	branch = main
+[submodule "external/slop"]
+	path = external/slop
+	url = https://github.com/MellysInformejtik/slop.git
+	branch = main
+[submodule "external/UniXNU-negroni"]
+	path = external/UniXNU-negroni
+	url = https://github.com/pawlickerr/UniXNU-negroni.git
+	branch = dev
+[submodule "external/Mu-Silicium-negroni"]
+	path = external/Mu-Silicium-negroni
+	url = https://github.com/pawlickerr/Mu-Silicum-negroni.git
+	branch = main
+[submodule "external/UniXNU"]
+	path = external/UniXNU
+	url = https://github.com/UniXNU/UniXNU.git
+	branch = main
+[submodule "external/UniXNU-ios26"]
+	path = external/UniXNU-ios26
+	url = https://github.com/none24smu/UniXNU.git
+	branch = ios26
+[submodule "external/UniXNU-zeta"]
+	path = external/UniXNU-zeta
+	url = https://github.com/none24smu/UniXNU-zeta.git
+	branch = main
+[submodule "external/UniXNU-pong"]
+	path = external/UniXNU-pong
+	url = https://github.com/Chengdong-Yu/UniXNU-pong.git
+	branch = main

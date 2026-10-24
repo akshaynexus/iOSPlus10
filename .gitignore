@@ -1,0 +1,17 @@
+# Keep device dumps, serial numbers, firmware and Apple artifacts out of git.
+*.img
+*.simg
+*.zip
+*.ipsw
+*.dmg
+*.bin
+*.efi
+*.fd
+*.macho
+*.adt
+getvar*.txt
+backup/
+dumps/
+out/
+inputs/
+.DS_Store
