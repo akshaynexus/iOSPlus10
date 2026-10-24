@@ -194,6 +194,8 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 
 - [V] `out/kernel/wt-wifi/bsd/dev/negroni_wifi.c` in base has Wi-Fi survey steps 1–9; steps 1–4 are reads, steps 5–8 enable supplies/clocks and train PCIe0, and step 9 reads PCI ID/class/BAR registers (source comments in `external/slop/negroni-ios/xnu/patches/0120-negroni-wifi-pcie-link.patch`).
 - [V] The current port code does not assign the endpoint BAR or enable an MSI/MSI-X vector; new patch `patches/xnu/0260-negroni-wlan-pcie-inventory.patch` adds an opt-in `negroniwlan=1` and read-only BAR/capability inventory (worktree source; not run on hardware).
+- [V] Wi-Fi worktree branch `wifi` commit `a559154` contains the inventory source change; no push was made (`out/kernel/wt-wifi`).
+- [V] Wi-Fi docs, extraction script and patch export are committed locally on `main`; no push was made.
 - [V] XNU single-file syntax check of `bsd/dev/negroni_wifi.c` succeeded against `out/kernel/buildtree`; it emitted three warnings already present in the source (two shadowed locals and the existing `delay` signedness conversion).
 - [V] `scripts/bg.sh wifi-fw scripts/wifi/extract-fw.sh` completed with exit 0 using the NE2211 OTA; its run log is `logs/wifi-fw.log` and WLAN outputs are ignored under `out/firmware/wlan/`.
 - [V] Extracted `amss.bin` SHA-256 is `d3328c8a78a1839c13bb33b6d20a4dd5fb4f8d57c4d8a1b482b037485bff40d9`, `m3.bin` is `7446e09fb911c690368d7b2c41216854ddfc7938d6a9d01ce3faa5f21cbc90b5`, and `regdb.bin` is `51808db5a23dc10346335e957ce88b8396d2e7c1870d7c67a2c0602a90f4fb32` (`out/firmware/wlan/SHA256SUMS`).
