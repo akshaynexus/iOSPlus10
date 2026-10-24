@@ -16,7 +16,9 @@
      (slop commit b4766ca, HackiOS, UniXNU-zeta lite list).
 2. ExtensionKit feature flag enforce_xpc_cache_code_signing = off, else installd rejects every
    app extension (sailfish feature_flags(), lines 138-143).
-3. Migration: "skip" (default) keeps slop's LastSystemVersion (fast first boot, fewer app
+3. Preferences: FBLaunchWatchdogScale 20 (frontboard, springboard), DMLastMigrationResults
+   success (HackiOS userland/var/mobile/Library/Preferences).
+4. Migration: "skip" (default) keeps slop's LastSystemVersion (fast first boot, fewer app
    extensions registered); "once" uses sailfish's sentinel /private/var/datamigrator/migrate and
    removes LastSystemVersion (DataMigration runs one time; widgets/wallpapers register).
 """
@@ -26,6 +28,15 @@ DROP = ['com.apple.fairplayd.H2', 'com.apple.voicemail.vmd', 'com.apple.ReportCr
         'com.apple.spindump', 'com.apple.tailspind', 'com.apple.aggregated',
         'com.apple.aggregated.addaily', 'com.apple.bluetoothd']
 MOBILE = 501
+
+def merge_pref(root, name, values):
+    path = os.path.join(root, 'private/var/mobile/Library/Preferences', name + '.plist')
+    data = plistlib.load(open(path, 'rb')) if os.path.exists(path) else {}
+    data.update(values)
+    with open(path, 'wb') as fh:
+        plistlib.dump(data, fh, fmt=plistlib.FMT_BINARY)
+    os.chown(path, MOBILE, MOBILE); os.chmod(path, 0o600)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -68,7 +79,15 @@ def main():
         os.chown(os.path.join(s, 'migrate'), MOBILE, MOBILE)
         print('migration: once (sentinel /private/var/datamigrator/migrate)')
     else:
-        print('migration: skip (LastSystemVersion kept)')
+        # HackiOS userland/var/mobile/Library/Preferences/com.apple.migration.plist
+        merge_pref(r, 'com.apple.migration', {
+            'DMLastMigrationResults': {'buildVersion': '20H392', 'success': True}})
+        print('migration: skip (LastSystemVersion kept, DMLastMigrationResults success)')
+
+    # HackiOS: a slow app launch on this CPU-rendered UI must not be killed by FrontBoard
+    for dom in ('com.apple.frontboard', 'com.apple.springboard'):
+        merge_pref(r, dom, {'FBLaunchWatchdogScale': 20})
+    print('FBLaunchWatchdogScale 20 (frontboard, springboard)')
 
 if __name__ == '__main__':
     main()
