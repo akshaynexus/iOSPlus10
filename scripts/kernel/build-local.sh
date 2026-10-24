@@ -33,13 +33,15 @@ if [ ! -d "$W/dxb/.git" ]; then
   git init -q "$W/dxb"
   git -C "$W/dxb" fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build "$DXB_SHA"
   git -C "$W/dxb" checkout -q FETCH_HEAD
-  cp "$EXT"/slop/negroni-ios/xnu/patches/*.patch "$EXT"/slop/negroni-ios/xnu/patches/*.sh "$W/dxb/patches/"
   # libfirehose_kernel is built arm64e-only; the NEGRONI kernel is plain arm64
   sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' "$W/dxb/build.sh"
 fi
-# our patches: always the current set
-rm -f "$W"/dxb/patches/0[2-9][0-9][0-9]-*.patch
+# the port's patches (external/slop) and ours: always the current set (numbered files are ours/slop's;
+# dxb's own patches have names without a number)
+rm -f "$W"/dxb/patches/[0-9][0-9][0-9][0-9]-*.patch "$W"/dxb/patches/[0-9][0-9][0-9][0-9]-*.sh
+cp "$EXT"/slop/negroni-ios/xnu/patches/*.patch "$EXT"/slop/negroni-ios/xnu/patches/*.sh "$W/dxb/patches/"
 cp "$REPO"/patches/xnu/*.patch "$W/dxb/patches/" 2>/dev/null || true
+echo "slop $(git -C "$EXT/slop" rev-parse --short HEAD), $(ls "$REPO"/patches/xnu/*.patch | wc -l | tr -d ' ') patches/xnu"
 # every run patches a fresh xnu copy (the port's stage scripts refuse to run twice on one tree);
 # the built helpers (mig, ctf tools, headers, libfirehose) in fakeroot/ are kept
 XNU_TAG=xnu-8796.141.3
