@@ -34,6 +34,8 @@ docs/
   research-report.md     stack map, iOS 16 and iOS 26 tracks, GPU path, blockers
   device-facts.md        measured CPU, RAM map, firmware, storage
   gpu-plan.md            GPU path: ios-sailfish reference, A730 state, steps
+  external-repos.md      every submodule: needed to build vs reference only
+  boot-speed.md          boot-time findings from the reference ports + status
   backup-and-restore.md  device state, stock backup, restore commands
 docker/                  x86_64 container for the Mu UEFI build only
 scripts/
@@ -50,6 +52,9 @@ external/                submodules (see below)
 ```
 
 ## Submodules
+
+Only `slop`, `Mu-Silicium-negroni` and `UniXNU` are needed to build; the others are the reference
+HackiOS-family ports we read and port from. Details: [docs/external-repos.md](docs/external-repos.md).
 
 | Path | Upstream | Role |
 |---|---|---|

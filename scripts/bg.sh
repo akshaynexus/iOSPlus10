@@ -6,7 +6,7 @@
 #   scripts/bg.sh -l                  list sessions
 #
 # Output goes to logs/NAME.log (git-ignored). When the command ends, logs/NAME.exit holds its
-# exit code and the session closes. Attach with: tmux attach -t NAME
+# exit code and the session closes; a desktop notification reports it (scripts/lib/notify.sh). Attach with: tmux attach -t NAME
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 LOGS=$REPO/logs
@@ -29,5 +29,6 @@ rm -f "$LOGS/$n.exit"
 # The command goes into a file, so quotes in it need no escaping.
 { echo "cd '$REPO' || exit 1"; for a in "$@"; do printf "'%s' " "$(printf '%s' "$a" | sed "s/'/'\\\\''/g")"; done; echo; } > "$LOGS/$n.cmd"
 tmux new-session -d -s "$n" -c "$REPO" \
-  "sh '$LOGS/$n.cmd' > '$LOGS/$n.log' 2>&1; echo \$? > '$LOGS/$n.exit'"
+  "sh '$LOGS/$n.cmd' > '$LOGS/$n.log' 2>&1; rc=\$?; echo \$rc > '$LOGS/$n.exit'; \
+   '$REPO/scripts/lib/notify.sh' \"$n finished (exit \$rc)\""
 echo "started $n (log: logs/$n.log)"

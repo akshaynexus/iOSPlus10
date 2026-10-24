@@ -1,0 +1,75 @@
+name: negroni-xnu
+# xnu-8796.141.3 (iOS 16 era) for the OnePlus 10 Pro (MACHINE_CONFIG=NEGRONI):
+# darwin-xnu-build + the negroni port's patches (fetched from MellysInformejtik/slop at SLOP_SHA)
+# + this repo's patches/ (iOSPlus10, 0200-...). Same build recipe as slop's negroni-ios.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+  push:
+    branches: [main]
+concurrency:
+  group: negroni-xnu-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  SLOP_REPO: https://github.com/MellysInformejtik/slop
+  MACOS_VERSION: "13.5"
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: NEGRONI
+jobs:
+  build:
+    # macos-14 ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI (Xcode 16 does not)
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch build script and port patches
+        run: |
+          set -eu
+          SLOP_SHA=$(cat SLOP_SHA)
+          git init -q dxb && git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA" && git -C dxb checkout -q FETCH_HEAD
+          git init -q slop && git -C slop fetch -q --depth 1 "$SLOP_REPO" "$SLOP_SHA" && git -C slop checkout -q FETCH_HEAD
+          cp slop/negroni-ios/xnu/patches/*.patch slop/negroni-ios/xnu/patches/*.sh dxb/patches/
+          cp patches/*.patch dxb/patches/ 2>/dev/null || true
+          # libfirehose_kernel is built arm64e-only; the NEGRONI kernel is plain arm64
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          ls dxb/patches
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+      - name: Build
+        working-directory: dxb
+        run: bash build.sh 2>&1 | tee ../build.log; test "${PIPESTATUS[0]}" = 0
+      - name: Patch report
+        if: always()
+        run: grep -E "Applying patch|Skipping patch" build.log | sed 's|.*/patches/||' | tee patch-report.txt || true
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          cp patch-report.txt out/ 2>/dev/null || true
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: negroni-xnu-kernel
+          path: out/
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: build.log
