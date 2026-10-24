@@ -1,0 +1,370 @@
+diff --git a/iokit/Kernel/arm/NegroniKeyStore.cpp b/iokit/Kernel/arm/NegroniKeyStore.cpp
+index d59b6bf..7073fbf 100644
+--- a/iokit/Kernel/arm/NegroniKeyStore.cpp
++++ b/iokit/Kernel/arm/NegroniKeyStore.cpp
+@@ -10,9 +10,14 @@
+  * answer is kIOReturnNotFound; answering with a handle is the path a
+  * userspace reboot takes, so no bag file is needed.
+  *
+- * Every call is logged (selector, caller, argument shapes, result) so the
+- * next selectors the system needs show up on the console; unknown ones fail
+- * with kIOReturnUnsupported.
++ * The first calls of each selector are logged (selector, caller, argument
++ * shapes, result) so the next selectors the system needs show up on the
++ * console; unknown ones fail with kIOReturnUnsupported. Boot-arg
++ * negroniaks_log=1 logs every call.
++ *
++ * Boot-arg negroniaks (bit mask, default 3):
++ *   bit 0  "no passcode": lock state 0x6 and device state sls 3 (else 0x4 / 0)
++ *   bit 1  key wrap/unwrap (selectors 10/11, else kIOReturnUnsupported)
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -23,6 +28,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <libkern/c++/OSString.h>
++#include <pexpert/pexpert.h>
+ #include <sys/proc.h>
+ 
+ /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
+@@ -34,30 +40,62 @@ enum {
+ 	kAKSSetSystem        = 5,
+ 	kAKSLoadBag          = 6,
+ 	kAKSGetLockState     = 7,
++	kAKSLockDevice       = 8,
+ 	kAKSUnlockDevice     = 9,
+-	kAKSWrapKey          = 10,
+-	kAKSUnwrapKey        = 11,
++	kAKSWrapKey          = 10,      /* in: handle, class; key. out: class; wrapped key */
++	kAKSUnwrapKey        = 11,      /* in: handle, class; wrapped key. out: key */
+ 	kAKSUnlockBag        = 12,
+ 	kAKSLockBag          = 13,
+ 	kAKSGetSystem        = 14,
+ 	kAKSGetDeviceState   = 17,
+-	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
++	kAKSGetBagUUID       = 23,      /* out: 16 bytes */
+ 	kAKSAssertHold       = 26,
+ 	kAKSAssertDrop       = 27,
++	kAKSGetConfiguration = 31,      /* out: DER */
++	kAKSLockDeviceNow    = 32,
++	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
++	kAKSGeneration       = 40,
+ 	kAKSUnloadSessionBags = 55,
++	kAKSAssertPromote    = 100,
++	kAKSAssertConsume    = 101,     /* aks_assert_consume */
+ 	kAKSNotifyStateSet   = 102,
+ 	kAKSNotifyStateIsSet = 103,
+-	kAKSAssertConsume    = 101,     /* aks_assert_consume */
++	kAKSPrewarm          = 115,
+ };
+ 
+ /* The system (device) bag handle. */
+ #define NEGRONI_AKS_SYSTEM_HANDLE 0
+ 
+ /*
+- * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
++ * aks lock state bits (aks_get_lock_state): bit 1 "no passcode", bit 2
++ * "unlocked since boot" (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear
++ * lock bits = unlocked. Device state "sls" (MKBGetDeviceLockState): 0
++ * unlocked, 1 locked, 2 locking, 3 disabled (no passcode).
++ *
++ * With 0x4 / sls 0 (a passcode device that is unlocked) contextstored,
++ * SpringBoard, coreduetd and corespeechd ask for the device state (selector
++ * 17) in storms (ios-sailfish saw thousands a minute from coreduetd).
++ * ios-sailfish 0180 and HackiOS (MiniAppleKeyStore.cpp) answer "no
++ * passcode": 0x6 and sls 3.
+  */
+-#define NEGRONI_AKS_LOCK_STATE    0x4
++#define NEGRONI_AKS_LOCK_STATE_NOPASSCODE  0x6
++#define NEGRONI_AKS_SLS_NOPASSCODE         3
++#define NEGRONI_AKS_LOCK_STATE_UNLOCKED    0x4     /* negroniaks bit 0 clear: the old answer */
++#define NEGRONI_AKS_SLS_UNLOCKED           0
++
++#define NEGRONI_AKS_OPT_NOPASSCODE         0x1
++#define NEGRONI_AKS_OPT_WRAP               0x2
++
++static uint32_t negroni_aks_options = NEGRONI_AKS_OPT_NOPASSCODE | NEGRONI_AKS_OPT_WRAP;
++static uint32_t negroni_aks_log_all;
++static bool negroni_aks_notify_state;  /* first-unlock notification posted (selector 102) */
++
++static uint8_t
++negroni_aks_lock_state(void)
++{
++	return (negroni_aks_options & NEGRONI_AKS_OPT_NOPASSCODE) ?
++	       NEGRONI_AKS_LOCK_STATE_NOPASSCODE : NEGRONI_AKS_LOCK_STATE_UNLOCKED;
++}
+ 
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+@@ -74,9 +112,12 @@ AppleKeyStore::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++	(void)PE_parse_boot_argn("negroniaks", &negroni_aks_options, sizeof(negroni_aks_options));
++	(void)PE_parse_boot_argn("negroniaks_log", &negroni_aks_log_all, sizeof(negroni_aks_log_all));
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 	registerService();
+-	IOLog("NEGRONI AKS: AppleKeyStore registered (no passcode, unlocked)\n");
++	IOLog("NEGRONI AKS: AppleKeyStore registered (unlocked, lock state 0x%x, key wrap %s)\n",
++	    negroni_aks_lock_state(), (negroni_aks_options & NEGRONI_AKS_OPT_WRAP) ? "on" : "off");
+ 	return true;
+ }
+ 
+@@ -99,15 +140,28 @@ AppleKeyStoreUserClient::clientClose(void)
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Copy len bytes to the caller's output structure (inband or descriptor). */
++/*
++ * Copy len bytes to the caller's output structure (inband or descriptor).
++ * An out-of-line buffer (above 4096 bytes, e.g. HackiOS says the
++ * configuration query) is not wired by IOUserClient: wire it around the copy.
++ */
+ static IOReturn
+ negroni_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ {
+ 	if (args->structureOutputDescriptor != NULL) {
+-		if (len > args->structureOutputDescriptor->getLength()) {
++		IOMemoryDescriptor *md = args->structureOutputDescriptor;
++		if (len > md->getLength()) {
+ 			return kIOReturnNoSpace;
+ 		}
+-		args->structureOutputDescriptor->writeBytes(0, buf, len);
++		IOReturn ret = md->prepare();
++		if (ret != kIOReturnSuccess) {
++			return ret;
++		}
++		IOByteCount done = md->writeBytes(0, buf, len);
++		md->complete();
++		if (done != len) {
++			return kIOReturnVMError;
++		}
+ 		args->structureOutputDescriptorSize = len;
+ 		return kIOReturnSuccess;
+ 	}
+@@ -140,18 +194,20 @@ negroni_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
+ /*
+  * Device state (selector 17): a DER SET of key/INTEGER pairs that libaks
+  * decode_extended_state reads: ss state, sls lock state (MKBGetDeviceLockState:
+- * 0 = unlocked), sb backoff, sfa failed attempts, sgs generation, sas
+- * assertions, sgpe grace period, srcd recovery countdown.
++ * 0 unlocked, 3 disabled = no passcode), sb backoff, sfa failed attempts,
++ * sgs generation, sas assertions, sgpe grace period, srcd recovery countdown.
+  */
+ static IOReturn
+ negroni_aks_device_state(IOExternalMethodArguments *args)
+ {
+-	static const struct {
++	bool nopasscode = (negroni_aks_options & NEGRONI_AKS_OPT_NOPASSCODE) != 0;
++	const struct {
+ 		const char *key;
+ 		uint8_t value;
+ 	} fields[] = {
+-		{ "ss", NEGRONI_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
+-		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
++		{ "ss", negroni_aks_lock_state() },
++		{ "sls", (uint8_t)(nopasscode ? NEGRONI_AKS_SLS_NOPASSCODE : NEGRONI_AKS_SLS_UNLOCKED) },
++		{ "sb", 0 }, { "sfa", 0 }, { "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+ 	uint8_t buf[128];
+ 	uint32_t n = 2;
+@@ -163,6 +219,94 @@ negroni_aks_device_state(IOExternalMethodArguments *args)
+ 	return negroni_aks_struct_out(args, buf, n);
+ }
+ 
++/* Device configuration (selector 31, HackiOS): backoff delay, grace period, max unlock attempts. */
++static IOReturn
++negroni_aks_configuration(IOExternalMethodArguments *args)
++{
++	uint8_t buf[64];
++	uint32_t n = 2;
++	n += negroni_aks_der_pair(buf + n, "bd", 0);
++	n += negroni_aks_der_pair(buf + n, "gp", 0);
++	n += negroni_aks_der_pair(buf + n, "mua", 10);
++	buf[0] = 0x31;
++	buf[1] = (uint8_t)(n - 2);
++	return negroni_aks_struct_out(args, buf, n);
++}
++
++/*
++ * Key wrap / unwrap (selectors 10 / 11), from HackiOS MiniAppleKeyStore.cpp
++ * (also ios-flame 0123). securityd gives each keychain item (and each
++ * keychain metadata key) its own key and has AKS wrap it with the key of the
++ * item's protection class before it stores it; to read the item it asks for
++ * the unwrap. Seen: "securityd sel 10 arg0 0 in 2/32 out 1/40": handle and
++ * class, a 32-byte key in, the class and a 40-byte wrapped key out (8 bytes
++ * longer, like AES key wrap, RFC 3394).
++ *
++ * There is no SEP and no secret on this device. The "wrapped" key is a mark
++ * ("HKwr"), the class, 3 zero bytes and the key mixed with a fixed pattern:
++ * a reversible encoding, NOT encryption. Anybody who can read the keychain
++ * database (/private/var/Keychains) can recover every item. The format is
++ * the HackiOS/flame one, so the encoding is the same on all these ports.
++ */
++#define NEGRONI_AKS_WRAP_HDR   8
++#define NEGRONI_AKS_KEY_MAX    64
++static const uint8_t negroni_aks_wrap_mark[4] = { 'H', 'K', 'w', 'r' };
++
++static void
++negroni_aks_wrap_mix(uint8_t *bytes, uint32_t len)
++{
++	for (uint32_t i = 0; i < len; i++) {
++		bytes[i] ^= (uint8_t)(0x5a + 37 * i);
++	}
++}
++
++static IOReturn
++negroni_aks_wrap(IOExternalMethodArguments *args)
++{
++	uint8_t wrapped[NEGRONI_AKS_WRAP_HDR + NEGRONI_AKS_KEY_MAX];
++	uint32_t len = args->structureInputSize;
++
++	/* Keys are small: always inband (out of line starts above 4096 bytes). */
++	if (args->structureInputDescriptor != NULL || args->structureInput == NULL ||
++	    len == 0 || len > NEGRONI_AKS_KEY_MAX || args->scalarInputCount < 2) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(wrapped, negroni_aks_wrap_mark, sizeof(negroni_aks_wrap_mark));
++	wrapped[4] = (uint8_t)args->scalarInput[1];
++	wrapped[5] = wrapped[6] = wrapped[7] = 0;
++	memcpy(wrapped + NEGRONI_AKS_WRAP_HDR, args->structureInput, len);
++	negroni_aks_wrap_mix(wrapped + NEGRONI_AKS_WRAP_HDR, len);
++	IOReturn ret = negroni_aks_struct_out(args, wrapped, NEGRONI_AKS_WRAP_HDR + len);
++	if (ret == kIOReturnSuccess && args->scalarOutputCount >= 1) {
++		args->scalarOutput[0] = args->scalarInput[1];
++		args->scalarOutputCount = 1;
++	} else {
++		args->scalarOutputCount = 0;
++	}
++	return ret;
++}
++
++static IOReturn
++negroni_aks_unwrap(IOExternalMethodArguments *args)
++{
++	uint8_t key[NEGRONI_AKS_KEY_MAX];
++	const uint8_t *wrapped = (const uint8_t *)args->structureInput;
++	uint32_t len = args->structureInputSize;
++
++	if (args->structureInputDescriptor != NULL || wrapped == NULL ||
++	    len <= NEGRONI_AKS_WRAP_HDR || len > NEGRONI_AKS_WRAP_HDR + sizeof(key) ||
++	    memcmp(wrapped, negroni_aks_wrap_mark, sizeof(negroni_aks_wrap_mark)) != 0) {
++		return kIOReturnBadArgument;
++	}
++	len -= NEGRONI_AKS_WRAP_HDR;
++	memcpy(key, wrapped + NEGRONI_AKS_WRAP_HDR, len);
++	negroni_aks_wrap_mix(key, len);
++	args->scalarOutputCount = 0;
++	IOReturn ret = negroni_aks_struct_out(args, key, len);
++	bzero(key, sizeof(key));
++	return ret;
++}
++
+ static uint32_t
+ negroni_aks_struct_out_size(IOExternalMethodArguments *args)
+ {
+@@ -187,15 +331,54 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	case kAKSOpen:
+ 	case kAKSUnloadBag:
+ 	case kAKSSetSystem:
++	case kAKSLockDevice:            /* no passcode: the device never locks */
++	case kAKSLockDeviceNow:
+ 	case kAKSUnlockDevice:
+ 	case kAKSUnlockBag:
+ 	case kAKSLockBag:
+ 	case kAKSAssertHold:
+ 	case kAKSAssertDrop:
++	case kAKSAssertPromote:
+ 	case kAKSAssertConsume:
+ 	case kAKSUnloadSessionBags:
++	case kAKSPrewarm:
++		args->scalarOutputCount = 0;
++		break;
+ 	case kAKSNotifyStateSet:
++		negroni_aks_notify_state = true;
++		args->scalarOutputCount = 0;
++		break;
++	case kAKSGeneration:
++		if (out_scalars >= 1) {
++			args->scalarOutput[0] = 0;
++			args->scalarOutputCount = 1;
++		}
++		break;
++	case kAKSGetBagUUID: {
++		static const uint8_t uuid[16] = {
++			'n', 'e', 'g', 'r', 'o', 'n', 'i', 0, 'k', 'e', 'y', 'b', 'a', 'g', 0, 1,
++		};
++		args->scalarOutputCount = 0;
++		ret = negroni_aks_struct_out(args, uuid, sizeof(uuid));
++		break;
++	}
++	case kAKSGetConfiguration:
+ 		args->scalarOutputCount = 0;
++		ret = negroni_aks_configuration(args);
++		break;
++	case kAKSWrapKey:
++		if (!(negroni_aks_options & NEGRONI_AKS_OPT_WRAP)) {
++			ret = kIOReturnUnsupported;
++			break;
++		}
++		ret = negroni_aks_wrap(args);
++		break;
++	case kAKSUnwrapKey:
++		if (!(negroni_aks_options & NEGRONI_AKS_OPT_WRAP)) {
++			ret = kIOReturnUnsupported;
++			break;
++		}
++		ret = negroni_aks_unwrap(args);
+ 		break;
+ 	case kAKSGetSystem:
+ 		if (out_scalars < 1) {
+@@ -210,16 +393,16 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		args->scalarOutput[0] = NEGRONI_AKS_LOCK_STATE;
++		args->scalarOutput[0] = negroni_aks_lock_state();
+ 		args->scalarOutputCount = 1;
+ 		break;
+ 	case kAKSNotifyStateIsSet:
+-		/* Nothing was ever set: answer "not set". */
++		/* Set once keybagd posted the first-unlock notification (selector 102). */
+ 		if (out_scalars < 1) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		args->scalarOutput[0] = 0;
++		args->scalarOutput[0] = negroni_aks_notify_state;
+ 		args->scalarOutputCount = 1;
+ 		break;
+ 	case kAKSGetDeviceState:
+@@ -232,10 +415,23 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("NEGRONI AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	/*
++	 * A few lines per selector (sailfish 0180): the device state is asked
++	 * for thousands of times. Failures get their own budget, so a new
++	 * failing caller still shows up after the successes used theirs.
++	 */
++	static uint8_t logged_ok[128], logged_fail[128];
++	uint8_t *count = selector < 128 ? (ret == kIOReturnSuccess ? &logged_ok[selector] :
++	    &logged_fail[selector]) : NULL;
++	if (negroni_aks_log_all || count == NULL || *count < 5) {
++		if (count != NULL && *count < 5) {
++			(*count)++;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("NEGRONI AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* NEGRONI */

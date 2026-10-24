@@ -1,0 +1,31 @@
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index d74c063..2cef819 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -77,8 +77,25 @@ IOKitInitializeTime( void )
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/*
++	 * NEGRONI: no driver publishes IORTC (the PMK8350 RTC on SPMI has none),
++	 * so this wait always ran its full 30 s at every boot. Skip it:
++	 * clock_initialize_calendar() below reads PEGetUTCTimeOfDay() exactly as
++	 * it did after the timeout. Boot-arg negronirtcwait=N waits up to N s
++	 * again (for an RTC driver test). After ios-sailfish 0086 / pong.
++	 */
++	uint32_t negroni_rtc_wait = 0;
++	PE_parse_boot_argn("negronirtcwait", &negroni_rtc_wait, sizeof(negroni_rtc_wait));
++	if (negroni_rtc_wait != 0) {
++		t.tv_sec = negroni_rtc_wait;
++		IOService::waitForService(
++			IOService::resourceMatching("IORTC"), &t );
++	} else {
++		IOLog("NEGRONI: no IORTC provider, calendar from the platform (no 30 s wait)\n");
++	}
+ // RTC is not present on this target
+-#ifndef BCM2837
++#elif !defined(BCM2837)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif

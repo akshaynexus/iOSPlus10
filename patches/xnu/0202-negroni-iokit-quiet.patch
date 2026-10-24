@@ -1,0 +1,61 @@
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 1a7b493..d1db2b0 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1200,7 +1200,16 @@ IOService::iokitDaemonLaunched(void)
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/* NEGRONI takes the hold only with negronidaemonhold=1 (IOStartIOKit.cpp). */
++	extern bool gIONegroniDaemonBusyHold;
++	if (gIONegroniDaemonBusyHold) {
++		gIONegroniDaemonBusyHold = false;
++		getServiceRoot()->adjustBusy(-1);
++	}
++#else
+ 	getServiceRoot()->adjustBusy(-1);
++#endif
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+ }
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index 2cef819..e96e915 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -194,6 +194,11 @@ ConfigureIOKit(void)
+ 	gRootNub->configureDefaults();
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI) && !NO_KEXTD
++/* The registry root holds a busy count for the IOKit daemon (IOService.cpp reads it). */
++bool gIONegroniDaemonBusyHold;
++#endif
++
+ void
+ StartIOKitMatching(void)
+ {
+@@ -205,7 +210,23 @@ StartIOKitMatching(void)
+ 	}
+ 
+ #if !NO_KEXTD
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/*
++	 * NEGRONI: this kernel is built as XNU_TARGET_OS_OSX, so the hold below
++	 * waits for kernelmanagerd, which iOS does not have: nothing ever drops
++	 * it, the registry root stays busy and IOKit never quiesces (callers of
++	 * IOKitWaitQuiet such as configd's InterfaceNamer wait for their whole
++	 * timeout). Take no hold; iokitDaemonLaunched() drops it only if it was
++	 * taken. Boot-arg negronidaemonhold=1 takes it as before. After
++	 * ios-sailfish 0166 / bergamota 0123 (ios-topaz 0128).
++	 */
++	uint32_t negroni_daemon_hold = 0;
++	PE_parse_boot_argn("negronidaemonhold", &negroni_daemon_hold, sizeof(negroni_daemon_hold));
++	if (negroni_daemon_hold != 0 && OSKext::iokitDaemonAvailable()) {
++		gIONegroniDaemonBusyHold = true;
++#else
+ 	if (OSKext::iokitDaemonAvailable()) {
++#endif
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been

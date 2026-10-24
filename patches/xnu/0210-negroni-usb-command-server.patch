@@ -1,0 +1,560 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1897319..063d6c4 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@ bsd/dev/memdev.c			standard
+ bsd/dev/negroni_ufs.c			standard
+ bsd/dev/negroni_sample.c			standard
+ bsd/dev/negroni_keys.c			standard
++bsd/dev/negroni_reboot.c		standard
+ bsd/dev/negroni_touch.c			standard
+ bsd/dev/negroni_cpufreq.c		standard
+ bsd/dev/negroni_adreno.c		standard
+diff --git a/bsd/dev/negroni_reboot.c b/bsd/dev/negroni_reboot.c
+new file mode 100644
+index 0000000..a7e0749
+--- /dev/null
++++ b/bsd/dev/negroni_reboot.c
+@@ -0,0 +1,244 @@
++/*
++ * NEGRONI: restart with a reboot reason (OnePlus 10 Pro 5G, SM8450).
++ *
++ * ABL reads the reboot reason from the PMK8350 SDAM: the Android DT's
++ * `qcom,reboot-reason` nvmem cell is SID 0, SDAM block 0x7100, byte 0x48,
++ * bits 7:1 (value << 1, bit 0 is kept). Values: 1 = recovery,
++ * 2 = bootloader (fastboot), 0 = normal. The reason is written with one
++ * read-modify-write of register 0x7148, then a PSCI SYSTEM_RESET follows.
++ * (The IMEM restart_reason at 0x146aa65c does not select a mode here.)
++ *
++ * The PMIC is reached through the SPMI PMIC arbiter, version 7 (Linux
++ * drivers/spmi/spmi-pmic-arb.c, sm8450.dtsi spmi@c400000, qcom,ee = <0>):
++ *   core   0x0c400000  version at +0, APID count at +4 bits 10:0,
++ *                      APID map at +0x2000 + 4*apid (bits 19:8 = PPID)
++ *   chnls  0x0c500000  read/write channel of an APID at 0x1000*apid
++ *   obsrvr 0x0c440000  observer (read) channel at 0x8000*ee + 0x20*apid
++ *   cnfg   0x0c42d000  owner table, 4*apid, bits 2:0 = EE that may write
++ * Channel registers: CMD +0x00, STATUS +0x08 (bit 0 done, bits 3:1
++ * failed/denied/dropped), WDATA0 +0x10, RDATA0 +0x18. Command word:
++ * opcode << 27 | register byte << 4 | (byte count - 1); EXT_WRITEL = 0,
++ * EXT_READL = 1. Like Linux, the write is only issued when the owner table
++ * gives the SDAM APID to EE 0; otherwise the reason is not set and the
++ * reset is a plain one. The keys driver (negroni_keys.c) reads this arbiter
++ * the same way (core + observer) on this hardware.
++ *
++ * Adapted from slop unixnu-negroni/package/BootResetCore.h + BootReset.c
++ * (SM8550 "sheng", same arbiter layout and SDAM cell).
++ *
++ * Callers: thread context, one at a time (the USB command server).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int negroni_reboot_set_reason(unsigned reason);
++void negroni_reboot_reset(void);
++void negroni_reboot(unsigned reason);
++
++#define NR_CORE_PA              0x0c400000u
++#define NR_CORE_SIZE            0x3000u
++#define NR_CHNLS_PA             0x0c500000u
++#define NR_OBS_PA               0x0c440000u
++#define NR_CNFG_PA              0x0c42d000u
++#define NR_EE                   0u
++
++#define NR_VERSION_V7_MIN       0x70000000u
++#define NR_VERSION_V8_MIN       0x80000000u
++#define NR_FEATURES             0x04u
++#define NR_APID_MAP             0x2000u
++#define NR_MAX_APIDS            1024u
++#define NR_CHNL_STRIDE          0x1000u
++#define NR_OBS_EE_STRIDE        0x8000u
++#define NR_OBS_APID_STRIDE      0x20u
++
++#define NR_CMD                  0x00u
++#define NR_STATUS               0x08u
++#define NR_WDATA0               0x10u
++#define NR_RDATA0               0x18u
++#define NR_OP_EXT_WRITEL        0u
++#define NR_OP_EXT_READL         1u
++#define NR_STATUS_DONE          (1u << 0)
++#define NR_STATUS_ERRORS        0x0eu
++
++#define NR_SDAM_PPID            0x071u          /* SID 0, peripheral 0x71 (0x7100) */
++#define NR_REASON_REG           0x48u           /* 0x7148 */
++#define NR_REASON_MASK          0xfeu
++#define NR_REASON_SHIFT         1
++
++#define PSCI_SYSTEM_RESET       0x84000009ull
++
++static bool nr_attempted, nr_ready;
++static vm_offset_t nr_obs, nr_chn;              /* this APID's observer / read-write channel */
++
++static uint32_t
++nr_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++nr_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static uint32_t
++nr_cmd(uint32_t op, uint32_t reg)
++{
++	return (op << 27) | ((reg & 0xffu) << 4);     /* byte count 1 */
++}
++
++/* 0 done, 1 timeout, 2 the arbiter reported an error */
++static int
++nr_wait(vm_offset_t ch)
++{
++	for (unsigned i = 0; i < 2000; i++) {
++		uint32_t s = nr_rd(ch, NR_STATUS);
++		if (s & NR_STATUS_DONE) {
++			return (s & NR_STATUS_ERRORS) ? 2 : 0;
++		}
++		delay(1);
++	}
++	return 1;
++}
++
++/* Finds the SDAM APID, checks that EE 0 may write it and maps its channels. */
++static bool
++nr_open(void)
++{
++	if (nr_attempted) {
++		return nr_ready;
++	}
++	nr_attempted = true;
++	vm_offset_t core = ml_io_map(NR_CORE_PA, NR_CORE_SIZE);
++	vm_offset_t cnfg = ml_io_map(NR_CNFG_PA, 0x1000);
++	if (core == 0 || cnfg == 0) {
++		printf("NEGRONI REBOOT: SPMI map failed\n");
++		return false;
++	}
++	uint32_t arb = nr_rd(core, 0), apids = nr_rd(core, NR_FEATURES) & 0x7ffu;
++	if (arb < NR_VERSION_V7_MIN || arb >= NR_VERSION_V8_MIN || apids == 0 || apids > NR_MAX_APIDS) {
++		printf("NEGRONI REBOOT: unknown SPMI arbiter %#x (%u APIDs)\n", arb, apids);
++		return false;
++	}
++	/* As Linux picks it: the first mapping, replaced by one this EE owns. */
++	int apid = -1;
++	unsigned owner = 0;
++	for (uint32_t i = 0; i < apids; i++) {
++		uint32_t map = nr_rd(core, NR_APID_MAP + 4 * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != NR_SDAM_PPID) {
++			continue;
++		}
++		unsigned o = nr_rd(cnfg, 4 * i) & 7u;
++		if (apid < 0 || o == NR_EE) {
++			apid = (int)i;
++			owner = o;
++		}
++	}
++	if (apid < 0) {
++		printf("NEGRONI REBOOT: SDAM 0x7100 not in the SPMI APID map\n");
++		return false;
++	}
++	if (owner != NR_EE) {
++		printf("NEGRONI REBOOT: SDAM APID %d is owned by EE %u, not EE %u: no reboot reason\n",
++		    apid, owner, NR_EE);
++		return false;
++	}
++	uint32_t obs_off = NR_OBS_EE_STRIDE * NR_EE + NR_OBS_APID_STRIDE * (uint32_t)apid;
++	vm_offset_t obs_page = ml_io_map(NR_OBS_PA + (obs_off & ~0xfffu), 0x1000);
++	nr_chn = ml_io_map(NR_CHNLS_PA + NR_CHNL_STRIDE * (uint32_t)apid, NR_CHNL_STRIDE);
++	if (obs_page == 0 || nr_chn == 0) {
++		printf("NEGRONI REBOOT: SPMI channel map failed\n");
++		return false;
++	}
++	nr_obs = obs_page + (obs_off & 0xfffu);
++	nr_ready = true;
++	printf("NEGRONI REBOOT: SPMI arbiter %#x, SDAM APID %d (EE %u)\n", arb, apid, owner);
++	return true;
++}
++
++static int
++nr_read(uint8_t *value)
++{
++	nr_wr(nr_obs, NR_CMD, nr_cmd(NR_OP_EXT_READL, NR_REASON_REG));
++	int rc = nr_wait(nr_obs);
++	if (rc == 0) {
++		*value = (uint8_t)nr_rd(nr_obs, NR_RDATA0);
++	}
++	return rc;
++}
++
++static int
++nr_write(uint8_t value)
++{
++	nr_wr(nr_chn, NR_WDATA0, value);
++	nr_wr(nr_chn, NR_CMD, nr_cmd(NR_OP_EXT_WRITEL, NR_REASON_REG));
++	return nr_wait(nr_chn);
++}
++
++/*
++ * Reboot reason field of 0x7148 = reason (0 normal, 1 recovery,
++ * 2 bootloader); bit 0 is kept. 0 = set and read back, -1 = not set.
++ */
++int
++negroni_reboot_set_reason(unsigned reason)
++{
++	uint8_t before = 0, after = 0;
++
++	if (reason > 0x7f || !nr_open()) {
++		return -1;
++	}
++	int rc = nr_read(&before);
++	if (rc) {
++		printf("NEGRONI REBOOT: read of 0x7148 failed (%d)\n", rc);
++		return -1;
++	}
++	uint8_t next = (uint8_t)((before & ~NR_REASON_MASK) | ((reason << NR_REASON_SHIFT) & NR_REASON_MASK));
++	if (next == before) {
++		printf("NEGRONI REBOOT: 0x7148 = %#04x already (reason %u)\n", before, reason);
++		return 0;
++	}
++	rc = nr_write(next);
++	if (rc == 0) {
++		rc = nr_read(&after);
++	}
++	if (rc || after != next) {
++		printf("NEGRONI REBOOT: write of 0x7148 %#04x -> %#04x failed (rc %d, read back %#04x)\n",
++		    before, next, rc, after);
++		return -1;
++	}
++	printf("NEGRONI REBOOT: 0x7148 %#04x -> %#04x (reason %u)\n", before, after, reason);
++	return 0;
++}
++
++/* PSCI SYSTEM_RESET (SMC conduit, as NegroniCPU's CPU_ON). Returns only if PSCI refused. */
++void
++negroni_reboot_reset(void)
++{
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	printf("NEGRONI REBOOT: PSCI SYSTEM_RESET returned %lld\n", (long long)x0);
++}
++
++/* Reason (best effort: a reason that cannot be set gives a plain reset), then reset. */
++void
++negroni_reboot(unsigned reason)
++{
++	if (negroni_reboot_set_reason(reason) != 0) {
++		printf("NEGRONI REBOOT: reason %u not set, plain reset\n", reason);
++	}
++	negroni_reboot_reset();
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index f50d68b..f68221b 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -220,6 +220,11 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	/* command server (UDP 5141), used by ud_thread only */
++	bool        ctl_enabled;
++	int         ctl_action;
++	uint64_t    ctl_deadline;
++	uint16_t    ctl_ip_id;
+ } ud;
+ 
+ static inline void
+@@ -363,6 +368,7 @@ ud_string(unsigned idx, uint8_t *out)
+ static void ud_rx_arm(void);
+ static void ud_tx_kick_locked(void);
+ static void ud_link_event(bool up);
++static bool ud_ctl_input(const uint8_t *frame, uint32_t len);
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+@@ -486,7 +492,10 @@ ud_rx_done(void)
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
+-	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
++	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN &&
++	    ud_ctl_input((const uint8_t *)(ud.dma + UD_RX), len)) {
++		ud.rx_frames++;         /* a command: taken before the stack */
++	} else if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+ 		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+ 		 * may return a first mbuf of length 0: stripping the header from
+@@ -560,6 +569,241 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ 	return 0;
+ }
+ 
++/*
++ * Command server on 192.168.7.2:5141 (UDP), in the receive path above: a
++ * frame for this port is handled here and never reaches the network stack,
++ * so the commands need no socket or userland and still work while either
++ * hangs, as long as ud_thread runs. Only unfragmented IPv4/UDP from
++ * 192.168.7.1 to 192.168.7.2 is accepted. One ASCII command per datagram
++ * (trailing white space ignored), each logged as "NEGRONI CTL:":
++ *   ping        reply "pong"
++ *   reboot      PSCI SYSTEM_RESET (a reboot reason left in the PMIC is cleared)
++ *   bootloader  reboot reason 2 (ABL fastboot), then the reset
++ *   recovery    reboot reason 1 (recovery), then the reset
++ *   panic       panic("requested over USB"), so the panic log path runs
++ * The last four reply "ok <command>" and act UD_CTL_DELAY_MS later, so the
++ * reply and the console log still reach the host. The reason is written
++ * at once (negroni_reboot.c); if it cannot be set the reply says so and
++ * the reset is a plain one. Replies go straight back to the sender's MAC
++ * and port (no ARP, no socket). Boot-arg negronictl=0 disables the server.
++ * Host side: op10tool ctl <command>.
++ */
++#define UD_CTL_PORT     5141
++#define UD_IP_PHONE     0xc0a80702u     /* 192.168.7.2 */
++#define UD_IP_HOST      0xc0a80701u     /* 192.168.7.1 */
++#define UD_CTL_DELAY_MS 500
++
++enum { UD_CTL_NONE, UD_CTL_RESET, UD_CTL_PANIC };
++
++extern int negroni_reboot_set_reason(unsigned reason);
++extern void negroni_reboot_reset(void);
++
++static const struct {
++	const char *name;
++	unsigned    reason;         /* PMIC reboot reason: 0 normal, 1 recovery, 2 bootloader */
++} ud_ctl_resets[] = {
++	{ "reboot", 0 },
++	{ "recovery", 1 },
++	{ "bootloader", 2 },
++};
++
++static uint16_t
++ud_be16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] << 8 | p[1]);
++}
++
++static uint32_t
++ud_be32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
++static void
++ud_put16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++}
++
++static void
++ud_put32(uint8_t *p, uint32_t v)
++{
++	ud_put16(p, (uint16_t)(v >> 16));
++	ud_put16(p + 2, (uint16_t)v);
++}
++
++/* Internet checksum (RFC 1071): add 16-bit big-endian words, an odd last byte padded with 0. */
++static uint32_t
++ud_sum_add(uint32_t sum, const uint8_t *p, unsigned len)
++{
++	for (unsigned i = 0; i < len; i += 2) {
++		sum += (uint32_t)p[i] << 8 | (i + 1 < len ? p[i + 1] : 0u);
++	}
++	return sum;
++}
++
++static uint16_t
++ud_sum_fold(uint32_t sum)
++{
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	return (uint16_t)~sum;
++}
++
++/* UDP datagram from 192.168.7.2:5141 back to the sender of req (a frame ud_ctl_input accepted). */
++static void
++ud_ctl_reply(const uint8_t *req, const char *text)
++{
++	const uint8_t *rip = req + ETHER_HDR_LEN;
++	const uint8_t *rudp = rip + (rip[0] & 0xfu) * 4;
++	uint32_t n = (uint32_t)strlen(text);
++	uint32_t len = ETHER_HDR_LEN + 20 + 8 + n;
++	mbuf_t m = NULL;
++
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < len) {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		printf("NEGRONI CTL: no mbuf for the reply\n");
++		return;
++	}
++	uint8_t *f = mbuf_data(m);
++	bzero(f, len);
++	memcpy(f, req + ETHER_ADDR_LEN, ETHER_ADDR_LEN);        /* to the sender's MAC */
++	memcpy(f + ETHER_ADDR_LEN, ud_phone_mac, ETHER_ADDR_LEN);
++	ud_put16(f + 12, ETHERTYPE_IP);
++	uint8_t *ip = f + ETHER_HDR_LEN;
++	ip[0] = 0x45;                   /* IPv4, 20-byte header */
++	ud_put16(ip + 2, (uint16_t)(20 + 8 + n));
++	ud_put16(ip + 4, ud.ctl_ip_id++);
++	ud_put16(ip + 6, 0x4000);       /* don't fragment */
++	ip[8] = 64;                     /* TTL */
++	ip[9] = IPPROTO_UDP;
++	ud_put32(ip + 12, UD_IP_PHONE);
++	memcpy(ip + 16, rip + 12, 4);   /* to the sender's address */
++	ud_put16(ip + 10, ud_sum_fold(ud_sum_add(0, ip, 20)));
++	uint8_t *udp = ip + 20;
++	ud_put16(udp, UD_CTL_PORT);
++	memcpy(udp + 2, rudp, 2);       /* to the sender's port */
++	ud_put16(udp + 4, (uint16_t)(8 + n));
++	memcpy(udp + 8, text, n);
++	/* UDP checksum over the pseudo header (addresses, protocol, length) and the datagram */
++	uint32_t sum = ud_sum_add(0, ip + 12, 8) + IPPROTO_UDP + 8 + n;
++	uint16_t csum = ud_sum_fold(ud_sum_add(sum, udp, 8 + n));
++	ud_put16(udp + 6, csum ? csum : 0xffff);
++	mbuf_setlen(m, len);
++	mbuf_pkthdr_setlen(m, len);
++	(void)ud_if_output(ud.ifp, m);
++}
++
++static void
++ud_ctl_schedule(int action)
++{
++	clock_interval_to_deadline(UD_CTL_DELAY_MS, NSEC_PER_MSEC, &ud.ctl_deadline);
++	ud.ctl_action = action;
++}
++
++/* One received frame (Ethernet header first). true = it was for the command server. */
++static bool
++ud_ctl_input(const uint8_t *f, uint32_t len)
++{
++	char cmd[32], reply[80];
++
++	if (!ud.ctl_enabled || len < ETHER_HDR_LEN + 20 + 8 || ud_be16(f + 12) != ETHERTYPE_IP) {
++		return false;
++	}
++	const uint8_t *ip = f + ETHER_HDR_LEN;
++	uint32_t ihl = (ip[0] & 0xfu) * 4, tot = ud_be16(ip + 2);
++	if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != IPPROTO_UDP || tot < ihl + 8 ||
++	    ETHER_HDR_LEN + tot > len || (ud_be16(ip + 6) & 0x3fff) != 0) {
++		return false;           /* not one whole IPv4/UDP datagram: for the stack */
++	}
++	const uint8_t *udp = ip + ihl;
++	if (ud_be32(ip + 16) != UD_IP_PHONE || ud_be16(udp + 2) != UD_CTL_PORT) {
++		return false;
++	}
++	/* From here on the frame is the command server's: it never reaches the stack. */
++	if (ud_be32(ip + 12) != UD_IP_HOST) {
++		printf("NEGRONI CTL: datagram from %u.%u.%u.%u ignored (only 192.168.7.1)\n",
++		    ip[12], ip[13], ip[14], ip[15]);
++		return true;
++	}
++	uint32_t ulen = ud_be16(udp + 4);
++	if (ud_sum_fold(ud_sum_add(0, ip, ihl)) != 0 || ulen < 8 || ulen > tot - ihl) {
++		printf("NEGRONI CTL: malformed datagram ignored\n");
++		return true;
++	}
++	uint32_t n = ulen - 8;
++	const uint8_t *p = udp + 8;
++	while (n > 0 && (p[n - 1] == '\n' || p[n - 1] == '\r' || p[n - 1] == ' ' ||
++	    p[n - 1] == '\t' || p[n - 1] == 0)) {
++		n--;
++	}
++	if (n >= sizeof(cmd)) {
++		printf("NEGRONI CTL: %u-byte command ignored\n", n);
++		ud_ctl_reply(f, "error: unknown command");
++		return true;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		cmd[i] = (p[i] >= 0x20 && p[i] < 0x7f) ? (char)p[i] : '?';
++	}
++	cmd[n] = 0;
++	printf("NEGRONI CTL: \"%s\" from 192.168.7.1:%u\n", cmd, ud_be16(udp));
++
++	if (strcmp(cmd, "ping") == 0) {
++		ud_ctl_reply(f, "pong");
++		return true;
++	}
++	if (ud.ctl_action != UD_CTL_NONE) {
++		printf("NEGRONI CTL: busy (a reset or panic is pending)\n");
++		ud_ctl_reply(f, "error: busy");
++		return true;
++	}
++	if (strcmp(cmd, "panic") == 0) {
++		printf("NEGRONI CTL: panic in %u ms\n", UD_CTL_DELAY_MS);
++		ud_ctl_reply(f, "ok panic");
++		ud_ctl_schedule(UD_CTL_PANIC);
++		return true;
++	}
++	for (unsigned i = 0; i < sizeof(ud_ctl_resets) / sizeof(ud_ctl_resets[0]); i++) {
++		if (strcmp(cmd, ud_ctl_resets[i].name) != 0) {
++			continue;
++		}
++		unsigned reason = ud_ctl_resets[i].reason;
++		bool set = negroni_reboot_set_reason(reason) == 0;
++		snprintf(reply, sizeof(reply), "ok %s%s", cmd,
++		    (set || reason == 0) ? "" : " (reason not set: plain reset)");
++		printf("NEGRONI CTL: %s: reason %u %s, reset in %u ms\n", cmd, reason,
++		    set ? "set" : "NOT set", UD_CTL_DELAY_MS);
++		ud_ctl_reply(f, reply);
++		ud_ctl_schedule(UD_CTL_RESET);
++		return true;
++	}
++	printf("NEGRONI CTL: unknown command\n");
++	ud_ctl_reply(f, "error: unknown command");
++	return true;
++}
++
++/* ud_thread, every tick: run a scheduled reset or panic once its delay is over. */
++static void
++ud_ctl_poll(void)
++{
++	if (ud.ctl_action == UD_CTL_NONE || mach_absolute_time() < ud.ctl_deadline) {
++		return;
++	}
++	int action = ud.ctl_action;
++	ud.ctl_action = UD_CTL_NONE;
++	if (action == UD_CTL_PANIC) {
++		panic("requested over USB");
++	}
++	printf("NEGRONI CTL: PSCI SYSTEM_RESET\n");
++	negroni_reboot_reset();         /* returns only if PSCI refused (logged there) */
++}
++
+ /*
+  * Link state for configd (KernelEventMonitor reads SIOCGIFMEDIA and the
+  * KEV_DL_LINK_ON/OFF events; IPMonitor does not route through a service
+@@ -777,6 +1021,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
++		ud_ctl_poll();
+ 		if ((++ticks % 30000) == 0) {
+ 			printf("NEGRONI USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+ 		}
+@@ -905,6 +1150,11 @@ negroni_usb_gadget_start(vm_offset_t dwc)
+ 		delay(1000);
+ 	}
+ 	printf("NEGRONI USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	int ctl = 1;
++	PE_parse_boot_argn("negronictl", &ctl, sizeof(ctl));
++	ud.ctl_enabled = ctl != 0 && ud.ifp != NULL;
++	printf("NEGRONI CTL: commands on udp 192.168.7.2:%u %s (boot-arg negronictl)\n", UD_CTL_PORT,
++	    ud.ctl_enabled ? "on" : "off");
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

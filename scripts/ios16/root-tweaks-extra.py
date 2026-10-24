@@ -14,6 +14,8 @@
      power log, UniXNU-pong mkjobs.py:216-224).
    - com.apple.bluetoothd: no transport / no device-tree node -> relaunched every 10 s
      (slop commit b4766ca, HackiOS, UniXNU-zeta lite list).
+   - com.apple.activityawardsd: Fitness awards; aborts (sig 6) at launch, relaunched every 10 s
+     (14 crashes in logs/usblog-20261024-195455.txt, first NE2211 boot).
 2. ExtensionKit feature flag enforce_xpc_cache_code_signing = off, else installd rejects every
    app extension (sailfish feature_flags(), lines 138-143).
 3. Preferences: FBLaunchWatchdogScale 20 (frontboard, springboard), DMLastMigrationResults
@@ -26,7 +28,7 @@ import argparse, os, plistlib
 
 DROP = ['com.apple.fairplayd.H2', 'com.apple.voicemail.vmd', 'com.apple.ReportCrash',
         'com.apple.spindump', 'com.apple.tailspind', 'com.apple.aggregated',
-        'com.apple.aggregated.addaily', 'com.apple.bluetoothd']
+        'com.apple.aggregated.addaily', 'com.apple.bluetoothd', 'com.apple.activityawardsd']
 MOBILE = 501
 
 def merge_pref(root, name, values):

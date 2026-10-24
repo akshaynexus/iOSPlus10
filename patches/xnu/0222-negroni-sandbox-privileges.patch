@@ -1,0 +1,81 @@
+diff --git a/bsd/kern/negroni_amfi.c b/bsd/kern/negroni_amfi.c
+index 98e39344..b22245d 100644
+--- a/bsd/kern/negroni_amfi.c
++++ b/bsd/kern/negroni_amfi.c
+@@ -315,7 +315,60 @@ static const struct mac_policy_ops negroni_amfi_mac_ops = {
+  * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
+  * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
+  * Grant that one; log the first denial of each other privilege per process.
++ *
++ * A few more (bsd/sys/priv.h), seen denied on the phone, are granted to the
++ * system's own code only (boot-arg negronisandbox bit 0, default on):
++ *   1002 PRIV_GLOBAL_PROC_INFO  proc_info about processes of other users
++ *        (proc_info.c; read only). aggregated, cloudd. Platform binaries.
++ *   1007 PRIV_DARKBOOT          write the kern.darkboot sysctl (an NVRAM
++ *        flag that hides the boot progress UI next boot). SpringBoard.
++ *        Platform binaries.
++ *   12000 PRIV_SKYWALK_REGISTER_USER_PIPE  register a Skywalk user pipe
++ *        nexus. identityservicesd. Processes with the entitlement
++ *        com.apple.private.skywalk.register-user-pipe (the name xnu's
++ *        skywalk.c sk_priv_chk reports for this privilege).
++ * The check is made on the current process, so only when the credential
++ * asked about is the current thread's (credentials are shared, so the
++ * pointers compare equal).
+  */
++#define NEGRONI_SANDBOX_OPT_PRIV  0x1
++static TUNABLE(uint32_t, negroni_sandbox_options, "negronisandbox", 0x1);
++
++static const struct {
++	int priv;
++	const char *entitlement;        /* NULL: platform binaries */
++} negroni_priv_grants[] = {
++	{ PRIV_GLOBAL_PROC_INFO, NULL },
++	{ PRIV_DARKBOOT, NULL },
++	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
++};
++static uint32_t negroni_priv_granted_logged;
++
++static bool
++negroni_sandbox_priv_allowed(kauth_cred_t cred, int priv)
++{
++	if (!(negroni_sandbox_options & NEGRONI_SANDBOX_OPT_PRIV) || cred != kauth_cred_get()) {
++		return false;
++	}
++	for (unsigned int i = 0; i < sizeof(negroni_priv_grants) / sizeof(negroni_priv_grants[0]); i++) {
++		if (negroni_priv_grants[i].priv != priv) {
++			continue;
++		}
++		proc_t p = current_proc();
++		bool ok = negroni_priv_grants[i].entitlement != NULL ?
++		    negroni_entitlements_bool(negroni_proc_entitlements(p), negroni_priv_grants[i].entitlement) :
++		    csproc_get_platform_binary(p) != 0;
++		if (ok && !(negroni_priv_granted_logged & (1u << i))) {
++			negroni_priv_granted_logged |= 1u << i;
++			char name[20];
++			proc_selfname(name, sizeof(name));
++			printf("NEGRONI Sandbox: %s privilege %d granted (first grant)\n", name, priv);
++		}
++		return ok;
++	}
++	return false;
++}
++
+ #define NEGRONI_PRIV_LOG_MAX      64
+ static struct {
+ 	int  priv;
+@@ -324,11 +377,14 @@ static struct {
+ static int negroni_priv_logged_count;
+ 
+ static int
+-negroni_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
++negroni_sandbox_priv_grant(kauth_cred_t cred, int priv)
+ {
+ 	if (priv == PRIV_WORK_INTERVAL) {
+ 		return 0;
+ 	}
++	if (negroni_sandbox_priv_allowed(cred, priv)) {
++		return 0;
++	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+ 	for (int i = 0; i < negroni_priv_logged_count; i++) {

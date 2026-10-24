@@ -1,0 +1,82 @@
+diff --git a/iokit/Kernel/arm/NegroniAccel.cpp b/iokit/Kernel/arm/NegroniAccel.cpp
+new file mode 100644
+index 0000000..53debdc
+--- /dev/null
++++ b/iokit/Kernel/arm/NegroniAccel.cpp
+@@ -0,0 +1,48 @@
++/*
++ * Empty IOAcceleratorES for NEGRONI: a stand-in so that CoreAnimation does not wait.
++ *
++ * QuartzCore (CAMetalContextCreate) polls IOServiceGetMatchingService(IOServiceMatching(
++ * "IOAcceleratorES")) 300 times, 100 ms apart, in every process that sets up CA rendering
++ * (backboardd, SpringBoard, apps): about 30 s each (live log: "IOK backboardd: matching1 ...
++ * IOAcceleratorES ... -> none", again and again). This service is found at once. It has no
++ * MetalPluginName / MetalPluginClassName and no user client, so Metal (_MTLRegisterDevices)
++ * passes over it and CoreAnimation keeps its CPU renderer.
++ *
++ * A personality in iokit/KernelConfigTables.cpp attaches it below AppleCLCD (as in ios-sailfish
++ * 0166 and bergamota 0122, after ios-topaz 0138). Boot-arg negroniaccel=0 leaves it out.
++ *
++ * Not the GPU: RedwoodGPU (NegroniGPU.cpp, negroniadreno_keep=1) is a separate class and is not
++ * matched by IOAcceleratorES lookups. A real GPU driver that publishes its own IOAcceleratorES
++ * must replace this stub (remove the personality), not add a second one: Metal expects one.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(NEGRONI)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++bool
++IOAcceleratorES::start(IOService *provider)
++{
++	uint32_t enabled = 1;
++
++	PE_parse_boot_argn("negroniaccel", &enabled, sizeof(enabled));
++	if (enabled == 0 || !IOService::start(provider)) {
++		return false;
++	}
++	registerService();
++	IOLog("NEGRONI ACCEL: empty IOAcceleratorES on %s (no Metal plugin; negroniaccel=0 removes it)\n",
++	    provider->getName());
++	return true;
++}
++#endif /* NEGRONI */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 1f7bc86..628f161 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -68,6 +68,11 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'negroni,display';"
+     "   },"
+     "   {"
++    "     'IOClass'         = IOAcceleratorES;"
++    "     'IOProviderClass' = AppleCLCD;"
++    "     'IOMatchCategory' = IOAcceleratorES;"
++    "   },"
++    "   {"
+     "     'IOClass'         = NegroniHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = NegroniHIDButtons;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index e18b275..1f03848 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/NegroniKeyStore.cpp                               optional ioki
+ iokit/Kernel/arm/NegroniWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/NegroniSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/NegroniFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/NegroniAccel.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/NegroniGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/NegroniBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/NegroniHID.cpp                                optional iokitcpp

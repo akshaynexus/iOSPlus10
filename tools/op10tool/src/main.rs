@@ -1,6 +1,7 @@
 //! op10tool: the binary-heavy tools of iOSPlus10 in one cross-platform CLI (macOS, Linux).
 //! Simple glue stays in shell/Python under scripts/.
 
+mod ctl;
 mod im4p;
 mod img2simg;
 mod ipsw;
@@ -51,6 +52,14 @@ enum Cmd {
     },
     /// Extract the payload of an IM4P (raw or LZFSE)
     Im4p { input: PathBuf, output: PathBuf },
+    /// Command to the negroni kernel over USB Ethernet (UDP 5141): ping, reboot, bootloader, recovery, panic
+    Ctl {
+        #[arg(value_enum)]
+        command: ctl::Command,
+        /// the phone's address
+        #[arg(long, default_value = "192.168.7.2")]
+        host: String,
+    },
 }
 
 fn parse_int(s: &str) -> Result<usize, String> {
@@ -69,5 +78,6 @@ fn main() -> Result<()> {
             std::process::exit(if ok { 0 } else { 1 })
         }
         Cmd::Im4p { input, output } => im4p::run(&input, &output),
+        Cmd::Ctl { command, host } => ctl::run(command, &host),
     }
 }

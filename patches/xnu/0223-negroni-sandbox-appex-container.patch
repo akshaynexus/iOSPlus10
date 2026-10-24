@@ -1,0 +1,77 @@
+diff --git a/bsd/kern/negroni_amfi.c b/bsd/kern/negroni_amfi.c
+index b22245d..8170bbf 100644
+--- a/bsd/kern/negroni_amfi.c
++++ b/bsd/kern/negroni_amfi.c
+@@ -28,6 +28,7 @@
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
++#include <sys/kauth.h>
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+@@ -285,8 +286,53 @@ negroni_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *labe
+  */
+ static uint64_t negroni_sandbox_seen;
+ 
++/*
++ * Op 4, container path of a pid (ios-sailfish 0110): arg -> { int64 pid; 0;
++ * char *buf; u64 buf length; 0 }. PlugInKit's checkEnvironment aborts every
++ * app extension ("plugin has invalid sandbox or container: error 2")
++ * without one. App extensions (an executable inside a .appex) that run as
++ * mobile (uid 501) get the mobile home; everything else still gets ENOENT,
++ * like an uncontainerized process on iOS. Boot-arg negroniappex=0: ENOENT
++ * for all, as before.
++ */
++static TUNABLE(uint32_t, negroni_appex_container, "negroniappex", 1);
++
++static int
++negroni_sandbox_container_path(user_addr_t arg)
++{
++	static const char home[] = "/private/var/mobile";
++	uint64_t a[5];
++	char path[MAXPATHLEN];
++	int len = sizeof(path), err = ENOENT;
++
++	if (!negroni_appex_container) {
++		return ENOENT;
++	}
++	if (copyin(arg, a, sizeof(a)) != 0 || a[2] == 0 || a[3] < sizeof(home)) {
++		return ENOENT;
++	}
++	proc_t target = proc_find((int)a[0]);
++	if (target == NULL) {
++		return ESRCH;
++	}
++	kauth_cred_t cred = kauth_cred_proc_ref(target);
++	uid_t uid = kauth_cred_getuid(cred);
++	kauth_cred_unref(&cred);
++	vnode_t vp = proc_getexecutablevnode(target);
++	proc_rele(target);
++	if (vp == NULLVP) {
++		return ENOENT;
++	}
++	if (uid == 501 && vn_getpath(vp, path, &len) == 0 &&
++	    strnstr(path, ".appex/", sizeof(path)) != NULL) {
++		err = copyout(home, (user_addr_t)a[2], sizeof(home));
++	}
++	vnode_put(vp);
++	return err;
++}
++
+ static int
+-negroni_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++negroni_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(negroni_sandbox_seen & (1ULL << call))) {
+ 		negroni_sandbox_seen |= 1ULL << call;
+@@ -295,7 +341,8 @@ negroni_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		printf("NEGRONI Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
++	case 4:         /* container path (pid) */
++		return negroni_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
+ 	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */

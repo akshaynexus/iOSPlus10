@@ -8,7 +8,7 @@ Details that need more space go into the topic docs; link them from here.
 Topic docs: [plan.md](plan.md) (phases) · [device-facts.md](device-facts.md) (measured hardware) ·
 [boot-speed.md](boot-speed.md) · [gpu-plan.md](gpu-plan.md) · [external-repos.md](external-repos.md) ·
 [build-ios16.md](build-ios16.md) · [flash-ios16.md](flash-ios16.md) · [backup-and-restore.md](backup-and-restore.md) ·
-[research-report.md](research-report.md) · [uefi-binaries.md](uefi-binaries.md) · `patches/xnu/README-*.md` (per kernel change).
+[research-report.md](research-report.md) · [uefi-binaries.md](uefi-binaries.md) · [camera-plan.md](camera-plan.md) · `patches/xnu/README-*.md` (per kernel change).
 
 ## 1. Current state (handoff, 2026-10-24)
 
@@ -37,12 +37,20 @@ service, no DCS command) · reboot to fastboot from iOS · widgets show "Waiting
 | SSH over USB + Mac internet sharing | `userland/ssh/`, `scripts/net/`, `docs/usb-network.md` | root rebuild |
 | Audio plan + ADSP firmware + ADSP start | `docs/audio-plan.md`, `scripts/audio/`, `patches/xnu/0240` | kernel build |
 | Brightness (DCS 0x51) + display sleep | `patches/xnu/0250-0251` | kernel build |
+| Power off (PSCI SYSTEM_OFF) + `poweroff` command | `patches/xnu/0211` | kernel build |
+| **Metal on Vulkan (Turnip)**: main GPU goal | `userland/metal/`, `scripts/metal/`, `docs/metal-plan.md` | GPU kernel ABI + Turnip build |
+| Wi-Fi QCA6490 (ath11k-style: PCIe, MHI, QMI, WMI, Apple80211) | `patches/xnu/0260-0269`, `docs/wifi-plan.md`, `scripts/wifi/` | kernel build |
+| Camera feasibility + plan | `docs/camera-plan.md` | research |
+
+Done (2026-10-24, apply together on `base` in name order [V]): 0200-0202 (boot waits, IOKit quiet),
+0210 (UDP 5141 command server, reboot reason), 0220-0223 (AKS, AMFI, Sandbox), `op10tool ctl`.
 
 Patch number ranges: 0200-0209 boot waits, 0210-0219 reboot/control, 0220-0229 AKS/AMFI/Sandbox,
-0230-0239 GPU, 0240-0249 audio, 0250-0259 display. Take a new range for new topics.
+0230-0239 GPU, 0240-0249 audio, 0250-0259 display, 0260-0269 Wi-Fi. Take a new range for new topics.
 
 **Blocker: kernel builds.** See section 5. Decision pending with the owner: install Xcode 15.4 locally
-(needs ~20-30 GB free disk first; 12 GiB free on 2026-10-24) or a CI repo.
+or a CI repo. Disk: 43 GiB free after the 2026-10-24 cleanup (enough). The owner downloads
+`Xcode_15.4.xip` (Apple ID needed).
 
 ## 2. Boot chain and the numbers that matter
 
@@ -91,8 +99,18 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   - `NEGRONI Sandbox:` denials: aggregated priv 1002, SpringBoard 1007, identityservicesd 12000, cloudd 1002.
   - backboardd: `matching IOAcceleratorES -> 0 found` repeated (QuartzCore polls 300 x 100 ms).
   - bluetoothd and fairplayd.H2 relaunch every ~10 s (no hardware); now dropped by `root-tweaks-extra.py`.
+- Crash counts in the same log [V]: activityawardsd 14 (sig 6 at launch, every 10 s: now dropped),
+  mediaserverd 2, assetsd 2, Music 2 (`Library not loaded: @rpath/MusicApplication.framework`: the dyld
+  @rpath policy, fixed by AMFI policy 0221), Shortcuts 1, PosterBoard 1.
+- Owner report 2026-10-24 [V]: turning on **Bold Text** hung iOS; after the restart it loops with repeated
+  crashes and ReportCrash output on the screen (debug image). No USB log of it: the log ends at 21:43:59,
+  before the hang. Cause unknown [I: a respring + font cache rebuild under CPU rendering, then a crash on
+  boot with the pref set]. Pref: `com.apple.Accessibility` in /var/mobile/Library/Preferences [I].
+  Recovery: re-flash `userdata` (fresh root). Capture `make usblog` during the next attempt.
+- Owner report [V]: "slide to power off" does nothing (kernel halt path: patch 0211 in progress);
+  the power button takes ~10 s to turn the screen off (CPU rendering; brightness/sleep agent).
 - Root tweaks (`scripts/ios16/root-tweaks-extra.py`, on top of slop's `sweet-root-tweaks.py`): drop
-  fairplayd.H2, vmd, ReportCrash, spindump, tailspind, aggregated(.addaily), bluetoothd; ExtensionKit
+  fairplayd.H2, vmd, ReportCrash, spindump, tailspind, aggregated(.addaily), bluetoothd, activityawardsd; ExtensionKit
   `enforce_xpc_cache_code_signing` off; `DMLastMigrationResults`; `FBLaunchWatchdogScale 20`;
   `--migration skip|once`.
 - Debug text over the GUI came from `negronifb_noconsole=0` + `-enable_kprintf_spam` in the debug image.
@@ -171,3 +189,15 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 - Does Xcode 15.4's toolchain run on macOS 27 (only the command-line tools are needed)? [I: probably]
 - Wi-Fi: write a QCA6490 driver, or use USB networking only?
 - iOS 26: does QuartzCore render without Metal? ([research-report.md](research-report.md))
+
+## 12. Camera (research handoff, 2026-10-24)
+
+- [V] `out/live.dts:22144-22578` exposes four Qualcomm camera sensor slots on CCI0/CCI1 and CSIPHY subdevice indices 1, 2, 5, 0; it does not provide sensor model names, I2C addresses, or complete lane maps.
+- [V] `out/live.dts:22130-22578` includes actuator, EEPROM and OIS nodes; OIS identifiers include LC898128 and LC898124.
+- [V] `out/live.dts:184-188` reserves camera memory at `0x9f500000` for `0x800000` bytes; line 13481 contains `qcom,vmid-cp-camera-preview-ro`.
+- [V] OnePlus lists main Sony IMX789, ultra-wide Samsung JN1, and telephoto 8 MP/OIS; independent reviews identify telephoto OV08A10 and front Sony IMX615. This does not map modules to DT slots. Source: [camera-plan.md](camera-plan.md), vendor links there.
+- [V] Upstream Linux has a public SM8550 CAMSS binding, but no SM8450 CAMSS variant was found in the examined mainline tree; Qualcomm documents a separate downstream Camera Core Driver and upstream CamSS. Source: [camera-plan.md](camera-plan.md).
+- [V] `external/hackios-xnu-kernel/xnu/files/bsd/dev/redwood_camera.c` is camera work for POCO X5 Pro / redwood and its sensor configuration does not apply to NE2211.
+- [I] iOS 16's D22AP camera path likely expects AppleH10CamIn/Apple ISP private interfaces; validate daemon and driver names against the local 20H392 root before implementation.
+- [I] iOS has no documented third-party CMIO/DAL custom-camera extension route; a fake AppleH10CamIn provider is a research-grade route to stock capture apps.
+- [I] First action: offline decode of stock DTBO/vendor camera modules, then one sensor's guarded CCI chip-ID probe. See [camera-plan.md](camera-plan.md).
