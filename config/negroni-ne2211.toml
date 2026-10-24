@@ -19,6 +19,13 @@ tool = "external/slop/negroni-ios/tools/mkadt.py"
 # 3 GiB of kernel RAM at 0x840000000. Measured NE2211 (docs/device-facts.md): 9 GiB contiguous there.
 args = ["--board", "negroni", "--ufs", "--dram", "840000000:C0000000", "--darwinboot"]
 
+# Extra ADT properties (scripts/ios16/adt-extra.py). Locally administered MACs (02:...):
+# MobileGestalt needs them, else lsd/installd stall per app bundle (15+ min first boot).
+[adt.extra.chosen]
+"mac-address-wifi0" = "02:00:5e:77:ee:10"
+"mac-address-bluetooth0" = "02:00:5e:77:ee:11"
+"mac-address-ethernet0" = "02:00:5e:77:ee:12"
+
 [payload]
 tool = "external/slop/negroni-ios/tools/mkdarwinboot.py"
 volume = "NEGRONIESP"

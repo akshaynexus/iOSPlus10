@@ -22,6 +22,7 @@ FD=$OUT/mu/SILICIUM_UEFI-DEBUG.fd
 adt() {
   # shellcheck disable=SC2046
   python3 "$REPO/$($C adt.tool)" "$O/negroni.adt" $($C adt.args)
+  python3 "$REPO/scripts/ios16/adt-extra.py" "$O/negroni.adt"
 }
 
 payload() {

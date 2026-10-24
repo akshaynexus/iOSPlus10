@@ -6,6 +6,7 @@
 #    activation, containers, migration marker, MediaToolbox, SpringBoard watchdogs)
 # 2. removable Apple apps from /private/var/staged_system_apps into /Applications
 #    (as external/slop/negroni-ios/tools/install-staged-apps.sh)
+# 1b. our changes: scripts/ios16/root-tweaks-extra.py (MIGRATION=skip|once)
 # 3. remove host metadata folders (macOS creates .fseventsd/.Spotlight-V100 on mount)
 set -euo pipefail
 R=$1
@@ -14,6 +15,7 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 [ -d "$R/System/Library/xpc" ] || { echo "$R is not an iOS root" >&2; exit 1; }
 
 python3 "$REPO/external/slop/tools/sweet-root-tweaks.py" "$R"
+python3 "$REPO/scripts/ios16/root-tweaks-extra.py" "$R" --migration "${MIGRATION:-skip}"   # our changes (jobs, feature flag)
 
 n=0
 for app in "$R"/private/var/staged_system_apps/*.app; do
