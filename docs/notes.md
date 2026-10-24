@@ -416,3 +416,21 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - Open question [I]: GLEngine (Apple's GL front end) sits on top of the GLD plugin; the plugin must
   give GLEngine a renderer it accepts (pixel format + context), so the GLD interface must be implemented
   for real, not stubbed. CoreImage retries API 3 then API 2; CA may not retry.
+
+## 16. Wi-Fi facts (Wi-Fi agent, 2026-10-25; OnePlus kernel source e9da592 in out/src/op-kernel)
+
+- [V] SoC version register: BAR0 + 0x224 (family [31:28], device [27:16], major [15:8], minor [7:0])
+  (op-kernel drivers/bus/mhi/host/internal.h:197-205, init.c:981); cnss2 loads amss20.bin when (major & 0xf) == 2,
+  else amss.bin (cnss2/pci.c:5164-5215); ath11k reads the same offset (TCSR_SOC_HW_VERSION).
+- [V] cnss2 sets a 36-bit DMA mask for QCA6490 (cnss2/pci.c:4483-4487); XNU RAM 0x840000000-0x8FFFFFFFF fits.
+  Android uses an SMMU S1 IOVA pool at 0xa0000000 (out/live.dts cnss_pci_iommu_group).
+- [V] MHI config (cnss2 = ath11k for IPCR): channels 20 out / 21 in, 64 elements, event ring 1; event rings
+  32 (control) and 256; sbl_size = seg_len = 512 KiB; fbc_download = true (cnss2/pci.c:93-232, 5522-5524).
+- [V] apps SMMU: qcom,skip-init + qcom,handoff-smrs (out/live.dts:15350-15360); PCIe DMA from SID 0x1c01 may
+  need an SMR/S2CR entry [I]. PCIe0 (pcie@1c00000) is dma-coherent.
+- [V] out/firmware/wlan: ~22.8 MB (amss.bin 5609392 B, amss20.bin 5287936 B, m3.bin 266684 B, regdb.bin
+  24278 B, 194 board files ~60 KB): fits a 32 MiB firmware area like the ADSP one.
+- Risks [I]: no GICv3 ITS driver for MSI (poll first); DMA above 4 GiB may need an SMMU context; no interconnect
+  (BCM) votes for PCIe-DDR yet; survey steps 5-10 never ran on the phone.
+- Trees: out/kernel/wt-wlan3 = full current tree from scripts/kernel/patched-tree.sh (0260 = dcaed1b); the older
+  wt-wlan2 only adds negroni_wifi_pcie_handles() and an unimplemented negroni_wlan_init() declaration.
