@@ -75,9 +75,11 @@ touch "$work/root/.metadata_never_index"
 R=$work/root
 
 copy() { echo "copying $1 -> ${2#"$R"}"; mkdir -p "$2"; "$RSYNC" -aH --numeric-ids "$1/" "$2/"; }
-copy "$work/os" "$R"
-copy "$work/sysos" "$R/private/preboot/Cryptexes/OS"
-copy "$work/appos" "$R/private/preboot/Cryptexes/App"
+# the three trees are independent: copy them at the same time
+copy "$work/os" "$R" & p1=$!
+copy "$work/sysos" "$R/private/preboot/Cryptexes/OS" & p2=$!
+copy "$work/appos" "$R/private/preboot/Cryptexes/App" & p3=$!
+wait $p1; wait $p2; wait $p3
 
 # 3. dyld shared cache where dyld looks at ignition level 1 (hard links), and every cryptex file
 #    without a counterpart in the OS root linked to its root path (as mkiosroot.sh)

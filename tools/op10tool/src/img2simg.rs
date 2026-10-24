@@ -9,6 +9,7 @@
 
 use android_sparse::{Block, Decoder, Reader, Writer};
 use anyhow::{ensure, Context, Result};
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::os::unix::io::AsRawFd;
@@ -43,21 +44,26 @@ pub fn img2simg(input: &Path, output: &Path) -> Result<()> {
     let mut w = Writer::new(BufWriter::with_capacity(1 << 22, File::create(output)?))?;
     let (mut raw, mut fill, mut skip) = (0u64, 0u64, 0u64);
     let mut blk = 0u64;
-    let mut buf = vec![0u8; (B * 1024) as usize];
+    const BATCH: u64 = 4096;                       // 16 MiB per read; blocks classified in parallel
+    let mut buf = vec![0u8; (B * BATCH) as usize];
     for (s, e) in data_ranges(&f, size) {
         let (s, e) = (s / B, e.div_ceil(B));
         for _ in blk..s { w.write_block(&Block::Skip)?; skip += 1; }
         f.seek(SeekFrom::Start(s * B))?;
         let mut k = s;
         while k < e {
-            let n = (e - k).min(1024) as usize;
+            let n = (e - k).min(BATCH) as usize;
             f.read_exact(&mut buf[..n * B as usize])?;
-            for d in buf[..n * B as usize].chunks_exact(B as usize) {
+            let data = &buf[..n * B as usize];
+            // Some(word) = the block repeats one 32-bit word (FILL); None = RAW
+            let kinds: Vec<Option<[u8; 4]>> = data.par_chunks_exact(B as usize).map(|d| {
                 let v = [d[0], d[1], d[2], d[3]];
-                if d.chunks_exact(4).all(|x| x == v) {
-                    w.write_block(&Block::Fill(v))?; fill += 1;
-                } else {
-                    w.write_block(&Block::Raw(Box::new(d.try_into().unwrap())))?; raw += 1;
+                d.chunks_exact(4).all(|x| x == v).then_some(v)
+            }).collect();
+            for (d, kind) in data.chunks_exact(B as usize).zip(kinds) {
+                match kind {
+                    Some(v) => { w.write_block(&Block::Fill(v))?; fill += 1; }
+                    None => { w.write_block(&Block::Raw(Box::new(d.try_into().unwrap())))?; raw += 1; }
                 }
             }
             k += n as u64;

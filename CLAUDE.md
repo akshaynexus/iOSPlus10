@@ -44,6 +44,9 @@ Read first: `docs/plan.md` (status and next step), `docs/research-report.md` (st
 
 - Everything runs natively except the Mu UEFI build (`docs/build-ios16.md` has the table).
 - Entry point: `Makefile` (`make help`). Scripts by stage: `scripts/{setup,backup,uefi,ios16,lib}`.
+- Parallel builds: use all host cores (`$NPROC` from `scripts/lib/env.sh`) for make/git/cargo;
+  Colima gets every core; independent steps run at the same time (separate tmux jobs, `&` + `wait`,
+  rayon in Rust). EDK2 `build` auto-detects the CPU count (no `-n` / MAX_CONCURRENT_THREAD_NUMBER).
 - Language rule: binary formats, large files and parallel I/O go into the Rust CLI
   `tools/op10tool` (one binary, macOS + Linux); short glue stays shell or Python. A new Rust command
   must match the old tool's output (`tools/op10tool/tests/compare-python.sh`).

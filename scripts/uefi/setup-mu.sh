@@ -55,7 +55,7 @@ repair() {
 for p in Mu_Basecore Common/Mu Common/Mu_OEM_Sample Common/Features/mu_feature_dfci Common/Features/mu_feature_config \
          Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl; do
   repair "$p"
-  git -C "$p" submodule update -q --init --recursive --depth 1 --jobs 8 --checkout --force
+  git -C "$p" submodule update -q --init --recursive --depth 1 --jobs "$NPROC" --checkout --force
 done
 
 sh patches/apply.sh

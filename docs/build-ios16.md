@@ -72,6 +72,17 @@ Everything else runs natively on macOS and Linux.
   `scripts/uefi/patch-locate.py`, and the port's own tools in `external/slop`.
 - Shell: orchestration in `scripts/`.
 
+## Parallelism
+
+| Step | How it uses the cores |
+|---|---|
+| Mu UEFI (EDK2 `build`) | auto-detects the CPU count (no `-n` set); in the container that is Colima's CPU count, so `colima-up.sh` gives Colima all host cores |
+| BaseTools (native) | `make -j$(sysctl -n hw.ncpu)` |
+| Submodules | `git submodule update --jobs $NPROC` |
+| op10tool | cargo builds in parallel; `ipsw-get` 32 parallel ranges; `img2simg` classifies 16 MiB batches of blocks with rayon |
+| Root image | the OS, SystemOS and AppOS trees are copied by three rsync processes at the same time |
+| Independent steps | separate tmux jobs (`make mu`, `make kernel`, `make dmgs` can all run at once) |
+
 ## Outputs
 
 - `out/ios16/`: `negroni.adt`, `esp.img`, `cmdline.txt`, `boot_a.img`, `vendor_boot_a.img`, `SHA256SUMS`

@@ -4,6 +4,7 @@ REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2>/dev/null || (cd "$(
 EXT=$REPO/external
 OUT=$REPO/out                                   # build products (git-ignored)
 BACKUP=${BACKUP:-$HOME/op10-backup}             # stock backup, never in git
+NPROC=$(sysctl -n hw.ncpu 2>/dev/null || nproc)   # host CPU count, for -j / --jobs
 # Build container platform: the host's own CPU (no emulation). Mu's prebuilt BaseTools and mu_nasm
 # have Linux-ARM-64 and Linux-x86-64 builds, so arm64 Macs run a native arm64 container.
 # Override with PLATFORM=linux/amd64 (e.g. to compare with the upstream x86_64 CI).
