@@ -7,6 +7,8 @@ set -eu
 . "$(dirname "$0")/../lib/env.sh"
 TARGET=${1:-DEBUG}
 MU=$EXT/Mu-Silicium-negroni
+# NuGet-type deps (mu_nasm) without NuGet.exe/Mono: curl + unzip + state file
+"$REPO/scripts/uefi/fetch-extdeps.sh"
 # build_uefi.py skips stuart setup/update when a Build/ folder exists (e.g. after a stopped run), so
 # the NuGet dependencies (mu_nasm, Mu-Basetools, onecrypto-bin, ...) could stay missing. Run both
 # steps explicitly first; they are quick when everything is already in place.

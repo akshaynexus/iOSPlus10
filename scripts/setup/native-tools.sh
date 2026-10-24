@@ -6,7 +6,7 @@
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 case "$(uname -s)" in
-Darwin) brew install aarch64-elf-gcc gawk rsync ;;
+Darwin) brew install aarch64-elf-gcc gawk rsync llvm lld acpica nasm ;;
 Linux)  sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gawk rsync cpio python3-venv ;;
 esac
 mkdir -p "$OUT/tools"
@@ -14,9 +14,9 @@ mkdir -p "$OUT/tools"
   git clone -q --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg "$OUT/tools/mkbootimg"
 if command -v uv >/dev/null 2>&1; then
   [ -x "$OUT/venv/bin/python3" ] || uv venv -q "$OUT/venv"
-  VIRTUAL_ENV=$OUT/venv uv pip install -q pyfatfs
+  VIRTUAL_ENV=$OUT/venv uv pip install -q pyfatfs pyyaml
 else
   [ -x "$OUT/venv/bin/python3" ] || python3 -m venv "$OUT/venv"
-  "$OUT/venv/bin/pip" install -q pyfatfs
+  "$OUT/venv/bin/pip" install -q pyfatfs pyyaml
 fi
 "$REPO/scripts/lib/native-env.sh" sh -c 'aarch64-linux-gnu-gcc --version | head -1; mkbootimg --help >/dev/null && echo "mkbootimg ok"; python3 -c "import pyfatfs; print(\"pyfatfs ok\")"'

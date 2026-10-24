@@ -5,13 +5,13 @@
 BG := scripts/bg.sh
 OS := $(shell uname -s)
 
-.PHONY: help status tools op10tool colima image backup-ota backup-dump mu mu-prepare mu-build \
+.PHONY: help status tools op10tool colima image backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
         kernel devicetree dmgs boot root simg
 
 help:
 	@echo "setup:   make tools | op10tool | colima (macOS) | image"
 	@echo "backup:  make backup-ota | backup-dump (adb root)"
-	@echo "uefi:    make mu  (= setup-mu + mu-prepare + mu-build)"
+	@echo "uefi:    make mu  (= setup-mu + mu-prepare + mu-build) | mu-build-macos (native, no container)"
 	@echo "ios16:   make kernel | devicetree | dmgs | boot | root (sudo) | simg"
 	@echo "status:  make status"
 
@@ -46,6 +46,8 @@ mu-prepare:
 	$(BG) mu-prepare scripts/uefi/prepare.sh
 mu-build:
 	$(BG) mu-build scripts/uefi/build.sh DEBUG
+mu-build-macos:
+	$(BG) mu-build-macos scripts/uefi/build-macos.sh DEBUG
 
 # --- iOS 16 --------------------------------------------------------------------------------
 kernel:

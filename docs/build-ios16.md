@@ -9,7 +9,7 @@ Check jobs with `make status`; logs are in `logs/NAME.log`.
 ```
 make tools  make op10tool  make image                        one-time setup
      |
-make mu  ──────────────► out/mu/SILICIUM_UEFI-DEBUG.fd       Mu UEFI (container)
+make mu  ──────────────► out/mu/SILICIUM_UEFI-DEBUG.fd       Mu UEFI (container; or mu-build-macos)
 make kernel ───────────► out/kernel/kernel.macho             xnu-8796 from the slop CI
 make devicetree ───────► ~/op10-apple/d22ap.adt              Apple /product data
      |
@@ -24,11 +24,12 @@ make simg ─────────────► ~/op10-apple/ios16-root.sim
 
 | `make` | Script | macOS | Linux |
 |---|---|---|---|
-| `tools` | `scripts/setup/native-tools.sh` | Homebrew aarch64-elf-gcc, gawk, rsync; AOSP mkbootimg; uv venv + pyfatfs | apt cross GCC, gawk, rsync; same |
+| `tools` | `scripts/setup/native-tools.sh` | Homebrew aarch64-elf-gcc, gawk, rsync, llvm, lld, acpica, nasm; AOSP mkbootimg; uv venv (pyfatfs, pyyaml, Mu requirements) | apt cross GCC, gawk, rsync; same |
 | `op10tool` | `scripts/setup/build-op10tool.sh` | `cargo build` -> `out/bin/op10tool` | same |
-| `colima` | `scripts/setup/colima-up.sh` | Colima VM with Rosetta | not needed |
-| `image` | `scripts/setup/docker-image.sh` | x86_64 build image (Rosetta) | x86_64 build image (native) |
-| `mu` | `scripts/uefi/setup-mu.sh`, `prepare.sh`, `build.sh` | setup + prepare native, build in container | same |
+| `colima` | `scripts/setup/colima-up.sh` | Colima VM | not needed |
+| `image` | `scripts/setup/docker-image.sh` | **arm64** build image (native, no Rosetta) | build image for the host CPU |
+| `mu` | `scripts/uefi/setup-mu.sh`, `prepare.sh`, `fetch-extdeps.sh`, `build.sh` | setup + prepare native, build in container | same |
+| `mu-build-macos` | `scripts/uefi/build-macos.sh` | **experimental**: whole Mu build native (Homebrew LLVM, BaseTools from source) | use `mu` |
 | `kernel` | `scripts/ios16/fetch-kernel.sh` | `gh run download` | same |
 | `devicetree` | `scripts/ios16/fetch-d22ap-adt.sh` | `op10tool ipsw-get` + `op10tool im4p` | same |
 | `boot` | `scripts/ios16/build.sh` | native (`scripts/lib/native-env.sh`) | native |
@@ -38,16 +39,24 @@ make simg ─────────────► ~/op10-apple/ios16-root.sim
 
 Both root scripts end with `scripts/ios16/root-finish.sh` (bring-up tweaks, staged apps).
 
-## Why one step uses a container
+## The Mu UEFI build: container, arm64 container, or native
 
-On macOS the x86_64 container runs through Rosetta. x86_64 Mono (which stuart uses for
-`NuGet.exe`) crashes under Rosetta in JIT mode, so `scripts/setup/in-docker.sh` sets
-`MONO_ENV_OPTIONS=--interpreter` on macOS hosts.
+Mu-Silicium (EDK2 `stuart`) is supported upstream only on Linux/Windows hosts. What it needs:
 
+| Need | Where it comes from |
+|---|---|
+| Compiler (CLANGPDB, AARCH64) | only `clang`, `lld-link`, `llvm-lib`: Ubuntu LLVM in the container, Homebrew `llvm` + `lld` natively |
+| BaseTools (`GenFw`, `GenFv`, ...) | prebuilt `Mu-Basetools` (GitHub release): Linux-x86, **Linux-ARM-64**, Windows; no macOS build, so `build-macos.sh` compiles them from `BaseTools/Source/C` |
+| `onecrypto-bin` | GitHub ZIP of ARM target binaries (any host) |
+| `mu_nasm` (NuGet) | `scripts/uefi/fetch-extdeps.sh` downloads the .nupkg with curl (no NuGet.exe, no Mono); not used for AARCH64 code |
 
-The Mu-Silicium UEFI build (EDK2 `stuart`) is supported upstream only on Linux/Windows x86_64: it
-downloads x86_64-only NuGet tools (iasl and others) and uses GNU `aarch64-linux-gnu-` binutils
-with Clang. Everything else runs natively on macOS and Linux.
+- Default: the container for the **host CPU** (`scripts/lib/env.sh` sets `PLATFORM`): native arm64
+  on Apple silicon, so no Rosetta. `PLATFORM=linux/amd64` still works (Rosetta on macOS; then
+  `in-docker.sh` sets `MONO_ENV_OPTIONS=--interpreter`, because x86_64 Mono crashes under Rosetta).
+- `make mu-build-macos`: experimental native macOS build (no Docker). It shares the Mu tree and
+  `Build/` with the container build: run only one at a time.
+
+Everything else runs natively on macOS and Linux.
 
 ## Tools: Rust vs Python vs shell
 
