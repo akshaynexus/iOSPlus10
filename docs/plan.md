@@ -22,6 +22,11 @@ Status date: 2026-10-24.
   kernel run 40007883255), `vendor_boot_a.img` (mainline DTB only), `negroni.adt`, `esp.img`.
 - iOS 16.7.16 DMGs downloaded (CRC-32 checked).
 - GPU reference found: ios-sailfish (`docs/gpu-plan.md`).
+- Native macOS Mu build works too (`make mu-build-macos`: Homebrew LLVM, BaseTools from source, no
+  Docker/Rosetta/Mono) -> `out/mu/SILICIUM_UEFI-DEBUG-macos.fd`. The first boot uses the container
+  build (`SILICIUM_UEFI-DEBUG.fd`).
+- iOS root built on macOS (`make root`): 11 GiB used of 16 GiB, 173 apps, fsck_hfs OK;
+  sparse image `~/op10-apple/ios16-root.simg` (11.6 GB, sha256 d5d4437d...).
 
 ## Phase 1: iOS 16 (existing negroni port)
 
@@ -29,8 +34,10 @@ Status date: 2026-10-24.
 2. Mu UEFI: extract DXEs from the OTA `uefi.img`, run `portpatch2.py` / `mkbinaries.py`, fix
    MemoryMapLib for 12 GB, build `negroniPkg` DEBUG.
 3. Kernel from slop CI run 40007883255; ADT with the new `--dram`; payload; `boot_a` image.
-4. iOS 16.7.16 (iPhone10,3, 20H392) HFS+ root: `make root` (sudo), then `make simg`. **Next.**
-5. Writes, each approved first: `vendor_boot_a`, `vbmeta_a`, erase `dtbo_a`, `boot_a`, `userdata`.
+4. ~~iOS 16.7.16 (iPhone10,3, 20H392) HFS+ root~~ (done).
+5. **Next:** writes with `scripts/flash/ios16.sh`, each approved first. Order: `userdata` from fastbootd
+   (8 GiB ABL sparse issue), then in the bootloader `vendor_boot_a`, `vbmeta_a`, erase `dtbo_a`, `boot_a`,
+   `set_active a` + reboot.
 
 ## Phase 2: iOS 26 kernel and userland
 
