@@ -21,7 +21,9 @@ D=$APPLE/20H392
 OUT=${1:-$APPLE/ios16-root.img}
 SIZE=${SIZE:-16g}
 RSYNC=$(command -v /opt/homebrew/bin/rsync || command -v /usr/local/bin/rsync || true)
-[ -n "$RSYNC" ] && "$RSYNC" --version | head -1 | grep -q 'version 3' || { echo "need Homebrew rsync 3.x (brew install rsync)" >&2; exit 1; }
+# read the whole --version output first: with pipefail, `| head -1` would SIGPIPE rsync and fail
+rv=$([ -n "$RSYNC" ] && "$RSYNC" --version 2>/dev/null || true)
+case "$rv" in *"version 3."*) ;; *) echo "need Homebrew rsync 3.x (brew install rsync)" >&2; exit 1 ;; esac
 for f in 087-86698-044.dmg 087-86593-047.dmg 087-86715-047.dmg; do
   [ -f "$D/$f" ] || { echo "missing $D/$f (scripts/ios16/fetch-dmgs.sh)" >&2; exit 1; }
 done
