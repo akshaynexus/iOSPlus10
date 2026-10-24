@@ -29,14 +29,15 @@ for f in 087-86698-044.dmg 087-86593-047.dmg 087-86715-047.dmg; do
 done
 [ ! -e "$OUT" ] || { echo "refusing to overwrite $OUT" >&2; exit 1; }
 
-work=$(mktemp -d /tmp/iosroot.XXXX)
+# real path: macOS reports mounts under /private/tmp, and cleanup matches mount points by path
+work=$(cd "$(mktemp -d /tmp/iosroot.XXXX)" && pwd -P)
 devs=()
 cleanup() {
   for m in "$work"/root "$work"/os "$work"/sysos "$work"/appos; do
-    mount | grep -q " on $m " && umount "$m" 2>/dev/null || true
+    if mount | grep -q " on $m "; then umount "$m" 2>/dev/null || umount -f "$m" 2>/dev/null || true; fi
   done
   for d in ${devs[@]+"${devs[@]}"}; do hdiutil detach -force "$d" >/dev/null 2>&1 || true; done
-  rmdir "$work"/* "$work" 2>/dev/null || true
+  rmdir "${work:?}"/root "${work:?}"/os "${work:?}"/sysos "${work:?}"/appos "${work:?}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -64,7 +65,11 @@ devs=("$dev" ${devs[@]+"${devs[@]}"})
 newfs_hfs -s -J -v iOSRoot "$dev"
 mkdir -p "$work/root"
 mount -t hfs -o nobrowse "$dev" "$work/root"
-diskutil enableOwnership "$work/root" >/dev/null
+# A manual mount_hfs honors owners (only Disk Arbitration mounts default to ignoring them).
+# Check it: iOS needs root/mobile/_logd ownership preserved.
+touch "$work/root/.owner-test"; chown 272:272 "$work/root/.owner-test"
+[ "$(stat -f %u:%g "$work/root/.owner-test")" = 272:272 ] || { echo "owners are ignored on $work/root" >&2; exit 1; }
+rm -f "$work/root/.owner-test"
 mdutil -i off "$work/root" >/dev/null 2>&1 || true
 touch "$work/root/.metadata_never_index"
 R=$work/root
