@@ -14,6 +14,16 @@ W=$OUT/kernel/local
 [ -d "$APP" ] || { echo "missing $APP: run scripts/kernel/install-xcode15.sh" >&2; exit 1; }
 for t in jq gum cmake ninja; do command -v $t >/dev/null || brew install $t; done
 
+# one build at a time (several agents may start one): wait for the lock, drop a stale one
+mkdir -p "$OUT/kernel"
+L=$OUT/kernel/local.lock
+until mkdir "$L" 2>/dev/null; do
+  pid=$(cat "$L/pid" 2>/dev/null || true)
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "${L:?}"; continue; fi
+  echo "waiting for the running kernel build (pid ${pid:-?}) ..."; sleep 10
+done
+echo $$ > "$L/pid"
+trap 'rm -rf "${L:?}"' EXIT
 [ "${CLEAN:-0}" = 1 ] && rm -rf "${W:?}/dxb"
 mkdir -p "$W/bin" "$W/kdk-empty"
 # dxb's install_deps wants xcodes (CI stubs it too); NEGRONI links no closed KDK library
