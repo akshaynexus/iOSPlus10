@@ -37,13 +37,20 @@ echo "BaseTools: $(ls "$HOSTDIR" | wc -l | tr -d ' ') tools in ${HOSTDIR#"$MU"/}
 
 # 3. NuGet-type deps without NuGet
 "$REPO/scripts/uefi/fetch-extdeps.sh"
+# mu_nasm has no MacOs-ARM-64 build: use Homebrew nasm (not used for AARCH64 code anyway)
+N=$MU/Mu_Basecore/BaseTools/Bin/mu_nasm_extdep
+mkdir -p "$N/MacOs-ARM-64"
+ln -sf "$(command -v nasm)" "$N/MacOs-ARM-64/nasm"
+ln -sf "$(command -v ndisasm)" "$N/MacOs-ARM-64/ndisasm"
 
 # 4. stuart setup/update/build with the native venv
 cd "$MU"
-export UNIXNU_ROOT="$EXT/UniXNU" CLANG_BIN="$L/" PATH="$L:$OUT/venv/bin:$PATH"
+# EDK2's `build` (and GenFds, Trim, ...) are Python wrappers in BaseTools/BinWrappers/PosixLike
+export UNIXNU_ROOT="$EXT/UniXNU" CLANG_BIN="$L/" PYTHON_COMMAND=python3 \
+       PATH="$BT/BinWrappers/PosixLike:$L:$OUT/venv/bin:$PATH"
 python3 Platforms/OnePlus/negroniPkg/DeviceBuild.py --setup -t "$TARGET"
 python3 Platforms/OnePlus/negroniPkg/DeviceBuild.py --update -t "$TARGET"
-python3 build_uefi.py -d negroni -r "$TARGET"
+python3 build_uefi.py -d negroni -r "$TARGET" -c     # clean: Build/ may hold the container's makefiles
 fd=$MU/Build/negroniPkg/${TARGET}_CLANGPDB/FV/SILICIUM_UEFI.fd
 mkdir -p "$OUT/mu"
 cp "$fd" "$OUT/mu/SILICIUM_UEFI-$TARGET-macos.fd"
