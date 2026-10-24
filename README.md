@@ -13,6 +13,8 @@ run without the shared-cache rewrite that phones without PAC need.
 CLAUDE.md                rules for agents (and humans): repo-only work, tmux, phone safety
 docs/
   plan.md                phases and status (read first)
+  build-ios16.md         build order, native vs container, known traps
+  uefi-binaries.md       Qualcomm DXEs + ported r0q patches
   research-report.md     stack map, iOS 16 and iOS 26 tracks, GPU path, blockers
   device-facts.md        measured CPU, RAM map, firmware, storage
   backup-and-restore.md  device state, stock backup, restore commands
@@ -21,6 +23,12 @@ docs/
 docker/                  x86_64 build container (cross GCC, Mu toolchain, mkbootimg)
 scripts/
   bg.sh                  run a long job in tmux (logs/NAME.log)
+  native-tools.sh        install native tools; native-env.sh runs a command with them
+  ios16-build.sh         ADT, payload, boot_a, vendor_boot_a
+  ios16-root-macos.sh    iOS root image on macOS (sudo); ios16-root-simg.sh -> sparse
+  fetch-kernel.sh, fetch-d22ap-adt.sh, fetch-ios16-dmgs.sh, ipsw-get.py   inputs
+  mu-prepare.sh, mu-build.sh, uefi-*.py, mu-*.py                           Mu UEFI
+  img2simg.py, im4p-extract.py, conf.py                                    helpers
   env.sh                 shared paths and Docker config
   colima-up.sh           macOS: start Colima with Rosetta
   docker-image.sh        build the container image

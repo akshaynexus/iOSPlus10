@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build the iOS 16 boot images for the NE2211 (inside the build container).
+# Build the iOS 16 boot images for the NE2211 with the native tools (scripts/native-tools.sh once;
+# scripts/native-env.sh maps the port's aarch64-linux-gnu-* names to Homebrew aarch64-elf-* on macOS).
 #   scripts/ios16-build.sh [adt|payload|boot|vendor_boot|all]      (default all)
 # Run it with tmux:  scripts/bg.sh ios16-build scripts/ios16-build.sh
 #
@@ -26,7 +27,7 @@ payload() {
   [ -f "$OUT/kernel/kernel.macho" ] || { echo "missing out/kernel/kernel.macho (scripts/fetch-kernel.sh)" >&2; exit 1; }
   args=$($C payload.kernel_args)
   printf '%s\n' "$args" > "$O/cmdline.txt"
-  "$REPO/scripts/in-docker.sh" python3 "$REPO/$($C payload.tool)" "$(cd "$OUT/kernel" && pwd -P)/$(readlink "$OUT/kernel/kernel.macho")" \
+  "$REPO/scripts/native-env.sh" python3 "$REPO/$($C payload.tool)" "$(cd "$OUT/kernel" && pwd -P)/$(readlink "$OUT/kernel/kernel.macho")" \
     "$O/negroni.adt" "$O/esp.img" --cmdline "$args" \
     --size-mib "$($C payload.size_mib)" --timeout "$($C payload.timeout)"
 }
@@ -36,11 +37,11 @@ boot() {
   [ -f "$O/esp.img" ] || { echo "missing $O/esp.img (payload step)" >&2; exit 1; }
   # Shim (BOARD=negroni) as the kernel. Ramdisk = Mu FD padded to 1 MiB, then the payload FAT
   # (NegroniBootMemoryDxe finds it at that boundary). Same layout as slop uefi/negroni/shim-mu.sh.
-  "$REPO/scripts/in-docker.sh" sh -c "
+  "$REPO/scripts/native-env.sh" sh -c "
     set -e
     BOARD=negroni DTB='$DTB' '$EXT/slop/shim/build.sh' '$FD' > '$O/shim-build.log'
     rd=\$(mktemp); cp '$FD' \"\$rd\"
-    fvlen=\$(stat -c %s '$FD'); truncate -s \$(( (fvlen + 0xfffff) & ~0xfffff )) \"\$rd\"
+    fvlen=\$(wc -c < '$FD' | tr -d ' '); truncate -s \$(( (fvlen + 0xfffff) & ~0xfffff )) \"\$rd\"
     cat '$O/esp.img' >> \"\$rd\"
     mkbootimg --kernel '$EXT/slop/shim/out/Image' --ramdisk \"\$rd\" --header_version $($C bootimg.header_version) \
       --pagesize $($C bootimg.pagesize) --os_version $($C bootimg.os_version) \
@@ -50,7 +51,7 @@ boot() {
 
 vendor_boot() {
   # Header v4 vendor_boot with only the mainline DTB. Base/offsets/pagesize from the stock image.
-  "$REPO/scripts/in-docker.sh" sh -c "
+  "$REPO/scripts/native-env.sh" sh -c "
     set -e
     t=\$(mktemp -d)
     unpack_bootimg --boot_img '$BACKUP/images/vendor_boot.img' --out \"\$t\" --format mkbootimg > \"\$t/args\"

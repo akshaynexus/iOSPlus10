@@ -42,7 +42,9 @@ Read first: `docs/plan.md` (status and next step), `docs/research-report.md` (st
 
 ## Build environment
 
-- `docker/Dockerfile`: Ubuntu 24.04 x86_64 with the cross GCC, Mu toolchain, mkbootimg, img2simg, dtc.
+- Everything runs natively except the Mu UEFI build (`docs/build-ios16.md` has the table).
+  Native tools: `scripts/native-tools.sh`; run with them: `scripts/native-env.sh <command>`.
+- `docker/Dockerfile`: Ubuntu 24.04 x86_64 for the Mu build (stuart + x86_64 NuGet tools).
 - macOS (Apple silicon): `scripts/colima-up.sh` (Colima + Rosetta), then `scripts/docker-image.sh`.
 - Linux x86_64: Docker, then `scripts/docker-image.sh`.
 - Run tools in the container: `scripts/in-docker.sh <command>` (repo mounted at the same path,
