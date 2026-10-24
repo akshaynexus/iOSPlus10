@@ -20,7 +20,8 @@ OpenGL ES on Adreno 530; ios-flame: Metal on Adreno 640).
 | Metal | a Metal device plugin that translates Metal to Vulkan (metal2vulkan) | `userland/metal/` |
 
 iOS finds GPU drivers through the kernel service `IOAcceleratorES`: its properties name the driver
-plugins that the system frameworks load (Metal: `MetalPluginName`). Our kernel publishes this service
+plugins that the system frameworks load (Metal: `MetalPluginName`; OpenGL ES: `IOGLESBundleName`, a GLD
+renderer plugin in /System/Library/Extensions that Apple's GLEngine drives: notes section 15). Our kernel publishes this service
 (0201), and patch 0205 adds the plugin names. So the drivers load the normal way, in every process.
 
 Order of work: OpenGL ES first (iOS 16 CoreAnimation and CoreImage fall back to OpenGL ES when no

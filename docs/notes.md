@@ -392,3 +392,27 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - [V] 0271 boot-arg negronibatt: 0 = no power source (old kernel), 1 = VADC estimate (default), 2 = 1 + raw line per poll + SID 1/3 APID census, 3 = static 100 % on AC; log prefix `NEGRONI BATTERY:` (source).
 - [I] Without the ADSP nobody configures the PM8350B charger; whether it charges at all is unknown: the `ichg` value in the 0271 log shows it.
 - [I] Exact SoC needs the ADSP charger PD (GLINK PMIC_RTR_ADSP_APPS, after the audio ADSP work); README-battery.md section 6 lists the messages.
+
+## 15. GL driver loading on iOS 16 (GL agent, 2026-10-25) [V: 20H392 shared cache, unslid addresses]
+
+- `eagl_init` 0x1d3f52444 (from -[EAGLSharegroup initWithAPI:sharedWithCompute:]): dlopens
+  OpenGLES's GLEngine.bundle/GLEngine (in the shared cache), calls gliInitializeLibrary with the
+  `IOAcceleratorES` (else `IOAcceleratorESLegacy`) service; GL_BORON=1 sets flag 0x20000000.
+- It fills OpenGLES's `_gli_plugin` table 0x1e25b0da0 with 18 GLI entry points (gliChoosePixelFormat ...
+  gliPresentViewES); needs gliGetVersion != 0 and a non-NULL pixel format from gliChoosePixelFormat,
+  then sets `_eagl_initialized` 0x1e25b0e44.
+- -[EAGLContext commonInitWithAPI:properties:] 0x1d3f513f0: private block 0x40e8 bytes, +0x20
+  GLIContext, +0x28 inline GLI dispatch 0x2060 bytes (1036 slots = NGL_SLOTS), +0x2088 second dispatch;
+  calls gliCreateContextWithShared; nil sharegroup -> nil context.
+- **The renderer plugin (the normal driver route):** libGFXShared `gfxInitializeLibrary` 0x1d3f6e2f0
+  reads the IORegistry property **`IOGLESBundleName`** of each accelerator service
+  (`IOGLESMetalBundleName` if com.apple.opengl UseMetal or `IOGLESDefaultUseMetal`), dlopens
+  `/System/Library/Extensions/<name>.bundle/<name>`, calls `gldInitializeLibrary(services, iodata, mask,
+  getSurfaceProps, getNewSurface, flags)`; needs `gldGetVersion` != 0 with (4, 1, 0x10, d & 0xffff00ff == 0)
+  and all **129** names of `_gfx_gld_names` 0x1dabc2c20 via dlsym, else the plugin is dropped (0x1d3f6ea14).
+- Today: no service has IOGLESBundleName -> no renderer -> nil EAGLContext -> CoreImage calls a zero
+  dispatch (the Bold Text crash). Plan: 0205 adds IOGLESBundleName="NegroniGL" to IOAcceleratorES;
+  ship NegroniGL.bundle as a GLD renderer plugin backed by Mesa (GPU, or softpipe without GPU).
+- Open question [I]: GLEngine (Apple's GL front end) sits on top of the GLD plugin; the plugin must
+  give GLEngine a renderer it accepts (pixel format + context), so the GLD interface must be implemented
+  for real, not stubbed. CoreImage retries API 3 then API 2; CA may not retry.
