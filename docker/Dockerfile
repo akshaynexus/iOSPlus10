@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       mkbootimg android-sdk-libsparse-utils device-tree-compiler cpio acpica-tools xxd file \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt /tmp/requirements.txt
-RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+RUN python3 -m venv --system-site-packages /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
 ENV PATH=/opt/venv/bin:$PATH CLANGPDB_AARCH64_PREFIX=aarch64-linux-gnu- GIT_CONFIG_COUNT=1 \
     GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=*
 WORKDIR /work
