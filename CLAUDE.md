@@ -4,7 +4,8 @@ Goal: iOS on the OnePlus 10 Pro 5G (NE2211, "negroni", SM8450), booted natively 
 Mu-Silicium UEFI + UniXNU/DarwinBoot + XNU. Milestone 1: iOS 16 (existing negroni port).
 Final goal: iOS 26 (arm64e, the CPUs have PAC) with Adreno 730 GPU acceleration.
 
-Read first: `docs/plan.md` (status and next step), `docs/research-report.md` (stack and blockers),
+Read first: **`docs/notes.md`** (knowledge base + handoff: every fact, number, error fix and
+decision we learned; add yours before you stop), `docs/plan.md` (status and next step), `docs/research-report.md` (stack and blockers),
 `docs/backup-and-restore.md` (device state and restore).
 
 ## Rules

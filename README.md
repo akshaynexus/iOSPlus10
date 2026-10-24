@@ -15,6 +15,7 @@ make help           # all targets; long ones run in tmux (make status)
 ```
 
 Host setup: [docs/setup-macos.md](docs/setup-macos.md), [docs/setup-linux.md](docs/setup-linux.md).
+Knowledge base and handoff (read first): [docs/notes.md](docs/notes.md).
 Build flow: [docs/build-ios16.md](docs/build-ios16.md). Status and next step: [docs/plan.md](docs/plan.md).
 
 ## Layout
