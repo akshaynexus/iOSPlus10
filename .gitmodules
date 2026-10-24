@@ -30,3 +30,6 @@
 	path = external/UniXNU-pong
 	url = https://github.com/Chengdong-Yu/UniXNU-pong.git
 	branch = main
+[submodule "external/ios-sailfish"]
+	path = external/ios-sailfish
+	url = https://github.com/joranv1/ios-sailfish.git

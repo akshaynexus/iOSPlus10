@@ -14,9 +14,9 @@ mkdir -p "$OUT/tools"
   git clone -q --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg "$OUT/tools/mkbootimg"
 if command -v uv >/dev/null 2>&1; then
   [ -x "$OUT/venv/bin/python3" ] || uv venv -q "$OUT/venv"
-  VIRTUAL_ENV=$OUT/venv uv pip install -q pyfatfs pyyaml
+  VIRTUAL_ENV=$OUT/venv uv pip install -q pyfatfs pyyaml "setuptools<81"
 else
   [ -x "$OUT/venv/bin/python3" ] || python3 -m venv "$OUT/venv"
-  "$OUT/venv/bin/pip" install -q pyfatfs pyyaml
+  "$OUT/venv/bin/pip" install -q pyfatfs pyyaml "setuptools<81"
 fi
-"$REPO/scripts/lib/native-env.sh" sh -c 'aarch64-linux-gnu-gcc --version | head -1; mkbootimg --help >/dev/null && echo "mkbootimg ok"; python3 -c "import pyfatfs; print(\"pyfatfs ok\")"'
+"$REPO/scripts/lib/native-env.sh" sh -c 'aarch64-linux-gnu-gcc --version | head -1; mkbootimg --help >/dev/null && echo "mkbootimg ok"; python3 -c "import pyfatfs.PyFatFS; print(\"pyfatfs ok\")"'

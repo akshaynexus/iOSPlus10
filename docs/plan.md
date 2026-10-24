@@ -17,13 +17,19 @@ Status date: 2026-10-24.
   (Mu submodules at the pinned commits; Silicium-ACPI at its real base 2d465ad + patch),
   tmux runner `scripts/bg.sh`.
 
+- Mu UEFI built (`out/mu/SILICIUM_UEFI-DEBUG.fd`, 3 MiB; x86_64 container, all 7 r0q patches ported).
+- Boot images built natively and checked: `out/ios16/boot_a.img` (shim + Mu FD + 64 MiB payload,
+  kernel run 40007883255), `vendor_boot_a.img` (mainline DTB only), `negroni.adt`, `esp.img`.
+- iOS 16.7.16 DMGs downloaded (CRC-32 checked).
+- GPU reference found: ios-sailfish (`docs/gpu-plan.md`).
+
 ## Phase 1: iOS 16 (existing negroni port)
 
 1. ~~Measure the 12 GB memory map~~ (done over adb root). Optional: shim probe with `fastboot boot`.
 2. Mu UEFI: extract DXEs from the OTA `uefi.img`, run `portpatch2.py` / `mkbinaries.py`, fix
    MemoryMapLib for 12 GB, build `negroniPkg` DEBUG.
 3. Kernel from slop CI run 40007883255; ADT with the new `--dram`; payload; `boot_a` image.
-4. iOS 16.7.16 (iPhone10,3, 20H392) HFS+ root.
+4. iOS 16.7.16 (iPhone10,3, 20H392) HFS+ root: `make root` (sudo), then `make simg`. **Next.**
 5. Writes, each approved first: `vendor_boot_a`, `vbmeta_a`, erase `dtbo_a`, `boot_a`, `userdata`.
 
 ## Phase 2: iOS 26 kernel and userland

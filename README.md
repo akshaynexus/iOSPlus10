@@ -32,6 +32,7 @@ docs/
   uefi-binaries.md       Qualcomm DXEs + ported r0q patches
   research-report.md     stack map, iOS 16 and iOS 26 tracks, GPU path, blockers
   device-facts.md        measured CPU, RAM map, firmware, storage
+  gpu-plan.md            GPU path: ios-sailfish reference, A730 state, steps
   backup-and-restore.md  device state, stock backup, restore commands
 docker/                  x86_64 container for the Mu UEFI build only
 scripts/
@@ -58,6 +59,7 @@ external/                submodules (see below)
 | `external/UniXNU-ios26` (`ios26`) | none24smu/UniXNU | xnu-12377.121.6 (iOS 26) kernel work |
 | `external/UniXNU-zeta` | none24smu/UniXNU-zeta | iOS 26 on Surface Duo 2 (no PAC): reference |
 | `external/UniXNU-pong` | Chengdong-Yu/UniXNU-pong | iOS 16 on Nothing Phone 2 (SM8475, Adreno 730): reference |
+| `external/ios-sailfish` | joranv1/ios-sailfish | iOS 16 on Pixel 1 with working GPU (Mesa freedreno + EAGL shim): GPU reference |
 
 ```sh
 git clone --recurse-submodules git@github.com:akshaynexus/iOSPlus10.git
