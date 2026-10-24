@@ -39,7 +39,7 @@ service, no DCS command) · reboot to fastboot from iOS · widgets show "Waiting
 | Brightness (DCS 0x51) + display sleep | `patches/xnu/0250-0251` (done) | kernel build |
 | Power off (PSCI SYSTEM_OFF) + `poweroff` command | `patches/xnu/0211` (done; panic stays on screen: `negronipanic=0` default, owner) | kernel build |
 | **Metal on Vulkan (Turnip)**: main GPU goal | `userland/metal/`, `scripts/metal/`, `docs/metal-plan.md` | GPU kernel ABI + Turnip build |
-| Bold Text crash loop (Codex agent) | `docs/boldtext-crash.md`, `scripts/ios16/root-tweaks-boldtext.py` | research |
+| Bold Text crash loop: root cause found (CoreImage EAGL, no GL driver) | `docs/boldtext-crash.md`, `root-tweaks-boldtext.py` (done); CoreImage software fallback + PosterBoard fix: `userland/cifix/` (agent) | root rebuild |
 | Wi-Fi QCA6490 (ath11k-style: PCIe, MHI, QMI, WMI, Apple80211) | `patches/xnu/0260-0269`, `docs/wifi-plan.md`, `scripts/wifi/` | kernel build |
 | Camera feasibility + plan | `docs/camera-plan.md` | research |
 
@@ -123,6 +123,21 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   fail [I]. Reference fix: ios-flame xnu/patches/0100 (clonefile fallback).
 - Thread-count high watermark (32) warnings: appleaccountd, lsd, contextstored, cfprefsd, suggestd,
   healthd, siriinferenced [V] (diagnostic only).
+- **Bold Text crash loop: ROOT CAUSE [V, logs/usblog-20261024-235438.txt, 2026-10-25 00:00, symbolicated
+  with scripts/debug/symbolicate.sh]**: SpringBoard SIGSEGV every ~7 s, pc 0 (NULL call),
+  `CI::GLContext::init() + 204` <- `+[CIContext(Internal) internalContextWithEAGLContext:options:]` <-
+  `+[CIContext contextWithOptions:]` <- `+[CUIShapeEffectStack sharedCIContext]` <-
+  `-[CUICatalog imageByStylingImage:stylePresetName:...]` <- `-[UIImage _imageWithStylePresets:...]`.
+  Bold Text makes UIKit style glyph images through CoreUI -> CoreImage -> its OpenGL ES (EAGL) backend,
+  and with no GL driver a GL function pointer is NULL. Same unslid lr 0x194b3858c as slop's 2026-10-22
+  SpringBoard loop (slop NOTES:569), so any CoreImage-GPU path in any UIKit process can crash.
+  Fix work: CoreImage software fallback (agent, userland/cifix/); the real fix is the GL driver.
+- PosterBoard SIGTRAP loop [V same log]: `-[PBFPosterExtensionDataStore _stateLock_setupSwitcherConfigurationForFirstTime] + 2040`
+  (assertion) <- `_stateLock_updateExtensions:...` <- `prewarmWithCompletion:` <- `-[PRSServer prewarmWithCompletion:]`;
+  matches slop NOTES:800 (poster-provider extensions not registered). 12 SpringBoard + 4 PosterBoard
+  crashes in the first minute of the boot.
+- Crash symbols: `scripts/debug/symbolicate.sh LOG [PROC] [N]` (ipsw + the root image's shared cache,
+  attached read-only). Unslid = address - logged slide.
 - Owner report [V]: "slide to power off" does nothing (kernel halt path: patch 0211 in progress);
   the power button takes ~10 s to turn the screen off (CPU rendering; brightness/sleep agent).
 - Root tweaks (`scripts/ios16/root-tweaks-extra.py`, on top of slop's `sweet-root-tweaks.py`): drop
