@@ -1,0 +1,884 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 1897319..e30000b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/negroni_wifi.c			standard
+ bsd/dev/negroni_rpmh.c			standard
+ bsd/dev/negroni_spmi.c			standard
+ bsd/dev/negroni_usb.c			standard
++bsd/dev/negroni_gpu_blit.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/negroni_gpu_blit.c b/bsd/dev/negroni_gpu_blit.c
+new file mode 100644
+index 0000000..92f6410
+--- /dev/null
++++ b/bsd/dev/negroni_gpu_blit.c
+@@ -0,0 +1,206 @@
++/*
++ * NEGRONI: the A730's 2D engine copies a BGRA8 rectangle (see negroni_gpu_blit.h).
++ *
++ * The stream is the one Mesa 25.0.7 emits for a sysmem 2D blit on A7XX
++ * (gallium fd6_blitter.cc emit_setup + emit_blit_setup + emit_blit_src/dst +
++ * emit_blit_fini; turnip r2d_setup_common/r2d_run), register offsets and fields
++ * from src/freedreno/registers/adreno/a6xx.xml, events from adreno_pm4.xml
++ * (A7XX names), the sysmem CCU layout of the A730 from freedreno_devices.py
++ * (4 CCUs, 256K depth + 64K color each: depth at 0, color at 1 MiB).
++ *
++ * The destination pitch of the 2D engine is in 64-byte units and its base is
++ * 64-byte aligned; the panel's rows are 4320 bytes (1080 pixels). So the copy
++ * is two blits: the even rows and the odd rows, each as an image of twice the
++ * pitch (8640 = 135 * 64). An odd row starts 32 bytes into a 64-byte line: its
++ * blit starts at that line and at x + 8 pixels. The source gets the same
++ * treatment (twice its pitch: a multiple of 128, which A7XX's
++ * SP_PS_2D_SRC_PITCH asks for when the texture type is 2D).
++ */
++#include "negroni_gpu_blit.h"
++
++#if !defined(KERNEL) || defined(ARM64_BOARD_CONFIG_NEGRONI)
++
++/* PM4 */
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_BLIT                 0x2c
++#define CP_EVENT_WRITE7         0x46
++#define BLIT_OP_SCALE           3
++
++/* A7XX events */
++#define EV_CCU_INVALIDATE_DEPTH 0x18
++#define EV_CCU_INVALIDATE_COLOR 0x19
++#define EV_CCU_CLEAN_DEPTH      0x20
++#define EV_CCU_CLEAN_COLOR      0x21
++#define EV_CACHE_CLEAN          0x31
++#define EV_CACHE_INVALIDATE7    0x33
++
++/* registers (dwords) */
++#define GRAS_2D_BLIT_CNTL       0x8400
++#define GRAS_2D_SRC_TL_X        0x8401  /* .. SRC_BR_X, SRC_TL_Y, SRC_BR_Y, DST_TL, DST_BR (0x8406) */
++#define RB_WINDOW_OFFSET        0x8890
++#define RB_WINDOW_OFFSET2       0x88d4
++#define RB_CCU_CNTL2            0x88e5  /* A7XX */
++#define RB_2D_BLIT_CNTL         0x8c00
++#define RB_2D_UNKNOWN_8C01      0x8c01
++#define RB_2D_DST_INFO          0x8c17  /* .. RB_2D_DST lo, hi, RB_2D_DST_PITCH (0x8c1a) */
++#define RB_2D_DST_FLAGS         0x8c20  /* .. lo, hi, pitch */
++#define SP_2D_DST_FORMAT        0xa9bf  /* A7XX (0xacc0 is the A6XX one) */
++#define SP_WINDOW_OFFSET        0xab21  /* A7XX */
++#define SP_PS_2D_SRC_INFO       0xb2c0  /* A7XX: .. SIZE, SRC lo, hi, PITCH (0xb2c4) */
++#define SP_PS_2D_SRC_FLAGS      0xb2ca  /* A7XX: .. lo, hi, pitch */
++#define SP_PS_2D_WINDOW_OFFSET  0xb2d1  /* A7XX */
++#define TPL1_2D_SRC_CNTL        0xb2d2  /* A7XX */
++#define SP_TP_WINDOW_OFFSET     0xb307
++
++/* values */
++#define FMT6_8_8_8_8_UNORM      0x30u
++#define SWAP_WZYX               1u      /* B G R A in memory, as the boot ladder's step 22 fill */
++#define R2D_UNORM8              0x10u
++#define TEX_2D                  1u
++#define BLIT_CNTL_COPY          (FMT6_8_8_8_8_UNORM << 8 | 0xfu << 20 | R2D_UNORM8 << 24)
++#define DST_FORMAT_8888         (FMT6_8_8_8_8_UNORM << 3 | 0xfu << 12)
++#define SURF_INFO_BGRA          (FMT6_8_8_8_8_UNORM | SWAP_WZYX << 10)
++#define SRC_INFO_UNK20_UNK22    (1u << 20 | 1u << 22)   /* Mesa sets both for every 2D source */
++#define CCU_CNTL2_A730_SYSMEM   (0x100u << 23)          /* color at 1 MiB (>> 12), depth at 0, full sizes */
++#define MAX_2D                  16384u
++
++static uint32_t
++odd_parity(uint32_t v)
++{
++	return (0x9669 >> (0xf & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28))) & 1;
++}
++
++static uint32_t
++pkt7(uint32_t opcode, uint32_t words)
++{
++	return 7u << 28 | words | odd_parity(words) << 15 | opcode << 16 | odd_parity(opcode) << 23;
++}
++
++static uint32_t
++pkt4(uint32_t reg, uint32_t count)
++{
++	return 4u << 28 | count | odd_parity(count) << 7 | reg << 8 | odd_parity(reg) << 27;
++}
++
++struct ib {
++	uint32_t *w;
++	uint32_t n, max;
++};
++
++static void
++put(struct ib *b, uint32_t v)
++{
++	if (b->n < b->max) {
++		b->w[b->n] = v;
++	}
++	b->n++;
++}
++
++static void
++event(struct ib *b, uint32_t e)
++{
++	put(b, pkt7(CP_EVENT_WRITE7, 1));
++	put(b, e);
++}
++
++static void
++reg(struct ib *b, uint32_t r, uint32_t v)
++{
++	put(b, pkt4(r, 1));
++	put(b, v);
++}
++
++uint32_t
++negroni_gpu_copy_ib(const struct negroni_gpu_copy *c, uint32_t *words, uint32_t max_words)
++{
++	struct ib b = { .w = words, .n = 0, .max = max_words };
++	uint32_t blits = 0;
++
++	if (c->w == 0 || c->h == 0 || (c->src & 63) || (c->dst & 63) || (c->src_pitch & 63) ||
++	    (c->dst_pitch & 31) || c->src_pitch == 0 || c->dst_pitch == 0 ||
++	    (uint64_t)c->src_pitch * 2 >= (1u << 21) || (uint64_t)c->dst_pitch * 2 / 64 > 0xffffu ||
++	    (uint64_t)c->sx + c->w > c->src_pitch / 4 || (uint64_t)c->sx + c->w > MAX_2D ||
++	    (uint64_t)c->dx + c->w > c->dst_pitch / 4 || c->h > 2 * MAX_2D) {
++		return 0;
++	}
++
++	/* emit_setup: CCU clean + invalidate, texture cache invalidate (the source was just written) */
++	event(&b, EV_CCU_CLEAN_COLOR);
++	event(&b, EV_CCU_CLEAN_DEPTH);
++	event(&b, EV_CCU_INVALIDATE_COLOR);
++	event(&b, EV_CCU_INVALIDATE_DEPTH);
++	event(&b, EV_CACHE_INVALIDATE7);
++	put(&b, pkt7(CP_WAIT_FOR_IDLE, 0));
++	reg(&b, RB_CCU_CNTL2, CCU_CNTL2_A730_SYSMEM);
++	/* what a user submission may have left from binned (GMEM) rendering */
++	reg(&b, RB_WINDOW_OFFSET, 0);
++	reg(&b, RB_WINDOW_OFFSET2, 0);
++	reg(&b, SP_WINDOW_OFFSET, 0);
++	reg(&b, SP_TP_WINDOW_OFFSET, 0);
++	reg(&b, SP_PS_2D_WINDOW_OFFSET, 0);
++	/* emit_blit_setup */
++	reg(&b, RB_2D_BLIT_CNTL, BLIT_CNTL_COPY);
++	reg(&b, GRAS_2D_BLIT_CNTL, BLIT_CNTL_COPY);
++	reg(&b, TPL1_2D_SRC_CNTL, TEX_2D << 29);
++	reg(&b, SP_2D_DST_FORMAT, DST_FORMAT_8888);
++	reg(&b, RB_2D_UNKNOWN_8C01, 0);
++
++	for (uint32_t parity = 0; parity < 2; parity++) {
++		uint32_t rows = c->h > parity ? (c->h - parity + 1) / 2 : 0;
++		if (rows == 0) {
++			continue;
++		}
++		uint64_t row = c->dst + (uint64_t)(c->dy + parity) * c->dst_pitch;
++		uint64_t dst = row & ~63ull;
++		uint32_t x = c->dx + (uint32_t)(row - dst) / 4;
++		uint32_t dpitch = 2 * c->dst_pitch, spitch = 2 * c->src_pitch;
++		uint64_t src = c->src + (uint64_t)(c->sy + parity) * c->src_pitch;
++		uint32_t width = c->sx + c->w;
++
++		if (x + c->w > MAX_2D || rows > MAX_2D || (uint64_t)x + c->w > dpitch / 4) {
++			return 0;
++		}
++		/* emit_blit_texture: coordinates (source 24.8 fixed point, inclusive) */
++		put(&b, pkt4(GRAS_2D_SRC_TL_X, 6));
++		put(&b, c->sx << 8);
++		put(&b, (c->sx + c->w - 1) << 8);
++		put(&b, 0);
++		put(&b, (rows - 1) << 8);
++		put(&b, x);
++		put(&b, (x + c->w - 1) | (rows - 1) << 16);
++		/* emit_blit_src: linear BGRA8, nearest */
++		put(&b, pkt4(SP_PS_2D_SRC_INFO, 5));
++		put(&b, SURF_INFO_BGRA | SRC_INFO_UNK20_UNK22);
++		put(&b, width | rows << 15);
++		put(&b, (uint32_t)src);
++		put(&b, (uint32_t)(src >> 32));
++		put(&b, spitch << 3);
++		put(&b, pkt4(SP_PS_2D_SRC_FLAGS, 3));
++		put(&b, 0);
++		put(&b, 0);
++		put(&b, 0);
++		/* emit_blit_dst */
++		put(&b, pkt4(RB_2D_DST_INFO, 4));
++		put(&b, SURF_INFO_BGRA);
++		put(&b, (uint32_t)dst);
++		put(&b, (uint32_t)(dst >> 32));
++		put(&b, dpitch >> 6);
++		put(&b, pkt4(RB_2D_DST_FLAGS, 3));
++		put(&b, 0);
++		put(&b, 0);
++		put(&b, 0);
++		/* emit_blit_fini (RB_DBG_ECO_CNTL_blit is 0 on the A730, as RB_DBG_ECO_CNTL) */
++		put(&b, pkt7(CP_WAIT_FOR_IDLE, 0));
++		put(&b, pkt7(CP_BLIT, 1));
++		put(&b, BLIT_OP_SCALE);
++		put(&b, pkt7(CP_WAIT_FOR_IDLE, 0));
++		blits++;
++	}
++	/* the pixels out of the CCU and the caches before the fence */
++	event(&b, EV_CCU_CLEAN_COLOR);
++	event(&b, EV_CACHE_CLEAN);
++	put(&b, pkt7(CP_WAIT_FOR_IDLE, 0));
++	return blits != 0 && b.n <= b.max ? b.n : 0;
++}
++
++#endif /* !KERNEL || ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_gpu_blit.h b/bsd/dev/negroni_gpu_blit.h
+new file mode 100644
+index 0000000..7b87559
+--- /dev/null
++++ b/bsd/dev/negroni_gpu_blit.h
+@@ -0,0 +1,43 @@
++/*
++ * NEGRONI: A730 2D-engine copy of a BGRA8 rectangle (the panel present of
++ * iokit/Kernel/arm/NegroniGPU.cpp). Pure C, no kernel headers: the host test
++ * patches/xnu/tests/gpu-blit-ib-test.c (project repo) builds this file as it is.
++ */
++#ifndef _NEGRONI_GPU_BLIT_H
++#define _NEGRONI_GPU_BLIT_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * Copy w x h pixels (4 bytes each, B G R A, no conversion) from (sx, sy) of
++ * the source image to (dx, dy) of the destination image. Addresses are GPU
++ * addresses of row 0, pixel 0. The source must be 64-byte aligned with a
++ * pitch that is a multiple of 64; the destination 64-byte aligned with a
++ * pitch that is a multiple of 32 (the panel's 4320 is 32 * 135, not 64 * n).
++ */
++struct negroni_gpu_copy {
++	uint64_t src;
++	uint32_t src_pitch;
++	uint64_t dst;
++	uint32_t dst_pitch;
++	uint32_t sx, sy, dx, dy, w, h;
++};
++
++/* Words the IB of one copy needs at most. */
++#define NEGRONI_GPU_COPY_WORDS  256
++
++/*
++ * Writes the command stream (PM4 type 4/7 packets) into ib and returns its
++ * length in words; 0 when the copy cannot be expressed (alignment, sizes).
++ */
++uint32_t negroni_gpu_copy_ib(const struct negroni_gpu_copy *c, uint32_t *ib, uint32_t max_words);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _NEGRONI_GPU_BLIT_H */
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 670d826..f652fa6 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -29,12 +29,28 @@
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
++ * GPU present (patch 0231, boot-arg negronifb_gpu, default 1): a swapped
++ * layer whose surface the GPU rendered (RedwoodGPU marks it at submission,
++ * NegroniSurface::gpuFence) is copied into the panel memory by the A730's 2D
++ * engine (NegroniGPUPresent), queued behind the render on the GPU's ring: no
++ * CPU copy and no wait, at up to negronifb_gpuhz (default 60) frames a second.
++ * Its surface is held in use (IOSurfaceIsInUse, state page +0x18) from SwapEnd
++ * until the copy's fence is done, so CoreAnimation renders the next frame into
++ * another surface of its swap chain: the source side is double-buffered. The
++ * panel side is not: ABL's display engine keeps scanning its one buffer (a
++ * flip needs DPU programming, README-gpu-kernel.md), and the copy (well under
++ * a millisecond for 10 MB) can land mid-scan. Every other layer, and any frame
++ * the GPU cannot take, goes the CPU way below (negronifb_gpu=0: always), after
++ * the GPU's copies of the same frame and with the CPU's stale lines over a
++ * GPU-written surface dropped first.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg negronifb_noconsole=1 stops drawing it from
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "NegroniSurface.h"
++#include "NegroniGPU.h"
+ 
+ extern "C" int negroni_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" char negroni_gpu_badge[24];   /* bsd/dev/negroni_adreno.c */
+@@ -93,6 +109,9 @@ class IOMobileFramebuffer : public IOService {
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
++#define NEGRONI_FB_GPU_BUSY               8       /* surfaces held until their GPU copy is done */
++#define NEGRONI_FB_GPU_WAIT_MS            50      /* longest the CPU path waits for the GPU */
++
+ class IOMobileFramebufferUserClient;
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+@@ -121,12 +140,24 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* GPU present (0231) */
++	NegroniSurface *fPendHold[NEGRONI_FB_LAYERS];   /* held surfaces of fPending */
++	bool          fPendGPU;       /* fPending is all GPU-rendered layers */
++	uint32_t      fGpuFlushTicks; /* vsync ticks between GPU presents */
++	struct {
++		NegroniSurface *surface;    /* held and retained */
++		uint32_t        fence;      /* the GPU copy that reads it */
++	}             fBusy[NEGRONI_FB_GPU_BUSY];
++	uint32_t      fLastGPUFence;  /* the newest GPU copy into the panel */
++	uint64_t      fGPUFrames, fCPUFrames;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+-	void present(const uint8_t *rec);
++	uint32_t present(const uint8_t *rec, NegroniSurface *const *held);
++	void releaseBusy(bool all);
++	void keepBusy(NegroniSurface **held, uint32_t fence);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -207,6 +238,9 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("negronifb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	uint32_t gpuhz = 60;
++	PE_parse_boot_argn("negronifb_gpuhz", &gpuhz, sizeof(gpuhz));
++	fGpuFlushTicks = (gpuhz == 0 || gpuhz >= 60) ? 1 : 60 / gpuhz;
+ 	fVsync->setTimeoutUS(NEGRONI_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -243,6 +277,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
++		if (step == 0) {
++			/* a GPU copy still on its way would paint over the fade */
++			NegroniGPUFenceWait(fb->fLastGPUFence, NEGRONI_FB_GPU_WAIT_MS);
++			fb->releaseBusy(false);
++		}
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -254,23 +293,79 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		sender->setTimeoutUS(NEGRONI_FB_VSYNC_US);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	bool flush = fb->fDirty && (count % (fb->fPendGPU ? fb->fGpuFlushTicks : fb->fFlushTicks)) == 0;
+ 	uint8_t *rec = NULL;
++	NegroniSurface *held[NEGRONI_FB_LAYERS] = {};
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(NEGRONI_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, NEGRONI_FB_SWAP_REC_SIZE);
++			memcpy(held, fb->fPendHold, sizeof(held));
++			bzero(fb->fPendHold, sizeof(fb->fPendHold));
+ 			fb->fDirty = false;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
++	fb->releaseBusy(false);
+ 	if (rec != NULL) {
+-		fb->present(rec);
++		uint32_t fence = fb->present(rec, held);
++		fb->keepBusy(held, fence);      /* until the GPU has read them (fence 0: now) */
+ 		IOFreeData(rec, NEGRONI_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(NEGRONI_FB_VSYNC_US);
+ }
+ 
++/*
++ * Held surfaces whose GPU copy is done (all: wait for each, at most NEGRONI_FB_GPU_WAIT_MS)
++ * are given back to CoreAnimation. Work loop only.
++ */
++void
++AppleCLCD::releaseBusy(bool all)
++{
++	for (uint32_t i = 0; i < NEGRONI_FB_GPU_BUSY; i++) {
++		NegroniSurface *s = fBusy[i].surface;
++		if (s == NULL) {
++			continue;
++		}
++		if (all) {
++			NegroniGPUFenceWait(fBusy[i].fence, NEGRONI_FB_GPU_WAIT_MS);
++		} else if (!NegroniGPUFenceDone(fBusy[i].fence)) {
++			continue;
++		}
++		negroni_surface_hold(s, false);
++		s->release();
++		fBusy[i].surface = NULL;
++	}
++}
++
++/* The surfaces of a presented frame stay held until fence (0: released now). Work loop only. */
++void
++AppleCLCD::keepBusy(NegroniSurface **held, uint32_t fence)
++{
++	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++		NegroniSurface *s = held[layer];
++		uint32_t slot = NEGRONI_FB_GPU_BUSY;
++		if (s == NULL) {
++			continue;
++		}
++		for (uint32_t i = 0; fence != 0 && i < NEGRONI_FB_GPU_BUSY && slot == NEGRONI_FB_GPU_BUSY; i++) {
++			if (fBusy[i].surface == NULL) {
++				slot = i;
++			}
++		}
++		if (slot == NEGRONI_FB_GPU_BUSY) {
++			if (fence != 0) {
++				NegroniGPUFenceWait(fence, NEGRONI_FB_GPU_WAIT_MS);
++			}
++			negroni_surface_hold(s, false);
++			s->release();
++			continue;
++		}
++		fBusy[slot].surface = s;
++		fBusy[slot].fence = fence;
++	}
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -311,10 +406,39 @@ static uint64_t negroni_fb_swap_count;
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	NegroniSurface *held[NEGRONI_FB_LAYERS] = {}, *dropped[NEGRONI_FB_LAYERS];
++	uint32_t mask = get32(rec, 0x104);
++	bool gpu = NegroniGPUPresentReady() && mask != 0;
++
++	/* a frame of GPU-rendered layers only: each surface held until the GPU copied it */
++	for (uint32_t layer = 0; gpu && layer < NEGRONI_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		held[layer] = negroni_surface_copy(id);
++		gpu = held[layer] != NULL && held[layer] != fSurface && held[layer]->gpuFence != 0;
++	}
++	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++		if (held[layer] != NULL && !gpu) {
++			OSSafeReleaseNULL(held[layer]);
++		} else if (held[layer] != NULL) {
++			negroni_surface_hold(held[layer], true);
++		}
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, NEGRONI_FB_SWAP_REC_SIZE);
++	memcpy(dropped, fPendHold, sizeof(dropped));    /* a frame replaced before it was shown */
++	memcpy(fPendHold, held, sizeof(fPendHold));
++	fPendGPU = gpu;
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++		if (dropped[layer] != NULL) {
++			negroni_surface_hold(dropped[layer], false);
++			dropped[layer]->release();
++		}
++	}
+ 	if ((++negroni_fb_swap_count % 1000) == 0) {
+ 		IOLog("NEGRONI FB: %llu swaps\n", negroni_fb_swap_count);
+ 	}
+@@ -404,11 +528,17 @@ negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t
+ 	negroni_draw_text_badge(pixels, rowBytes, width, height, negroni_wifi_badge, negroni_wifi_badge_color, 96 + 84);
+ }
+ 
+-void
+-AppleCLCD::present(const uint8_t *rec)
++/*
++ * held: the frame's surfaces swap() holds for a GPU present (NULL entries: that layer, if any,
++ * goes the CPU way). Returns the newest GPU copy's fence, 0 if the CPU did everything.
++ */
++uint32_t
++AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 	bool topRedrawn = false;
++	uint32_t fence = 0;             /* the newest GPU copy of this frame */
++	bool gpuReady = NegroniGPUPresentReady(), cpuCopied = false;
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -483,11 +613,36 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+-		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+-		    s->memory == NULL || last > s->memory->getLength()) {
++		bool fits = !(w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
++		    s->memory == NULL || last > s->memory->getLength());
++		if (!fits) {
+ 			src = 0;
+ 		}
++		uint32_t written = s->gpuFence;
++		if (fits && bpe == 4 && written != 0 && gpuReady && held[layer] == s) {
++			if (dy == 0 && dx == 0 && h >= 150 && w >= (int32_t)fWidth / 2) {
++				topRedrawn = true;
++			}
++			uint32_t f = NegroniGPUPresent(s, fPhys, fRowBytes, fHeight, (uint32_t)sx, (uint32_t)sy,
++			    (uint32_t)dx, (uint32_t)dy, (uint32_t)w, (uint32_t)h);
++			if (f != 0) {
++				fence = f;
++				s->release();
++				continue;
++			}
++		}
++		if (src != 0 && bpe == 4 && fence != 0) {
++			/* this layer lies over a GPU copy of the same frame: after it */
++			NegroniGPUFenceWait(fence, NEGRONI_FB_GPU_WAIT_MS);
++		}
++		if (src != 0 && bpe == 4 && written != 0) {
++			/* the GPU wrote it: done, and none of the CPU's old lines over it */
++			NegroniGPUFenceWait(written, NEGRONI_FB_GPU_WAIT_MS);
++			NegroniGPUSurfaceForCPU(s, (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow,
++			    (uint64_t)h * s->bytesPerRow);
++		}
+ 		if (src != 0 && bpe == 4) {
++			cpuCopied = true;
+ 			if (dy == 0 && dx == 0 && h >= 150 && w >= (int32_t)fWidth / 2) {
+ 				topRedrawn = true;      /* this frame rewrote the status bar's left ear */
+ 			}
+@@ -499,10 +654,24 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (fence != 0) {
++		fLastGPUFence = fence;
++		fGPUFrames++;
++	} else if (cpuCopied) {
++		fCPUFrames++;
++	}
++	if ((fGPUFrames + fCPUFrames) % 1000 == 999) {
++		IOLog("NEGRONI FB: %llu frames by the GPU, %llu by the CPU\n", fGPUFrames, fCPUFrames);
++	}
++	if (fence != 0 && (negroni_clock_shift > 0 || negroni_badges > 0)) {
++		/* the CPU draws over the GPU's picture: after it */
++		NegroniGPUFenceWait(fence, NEGRONI_FB_GPU_WAIT_MS);
++	}
+ 	if (topRedrawn) {
+ 		negroni_shift_clock(fPixels, fRowBytes, fWidth, fHeight);
+ 	}
+ 	negroni_draw_badge(fPixels, fRowBytes, fWidth, fHeight);
++	return fence;
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index 10a8d47..0d4b860 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -1518,4 +1518,261 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 	}
+ 	return msmMethod(selector, args);
+ }
++
++/*
++ * ---- the panel present (NegroniFramebuffer.cpp, patch 0231) ----
++ *
++ * The framebuffer hands over a swapped surface the GPU rendered; the 2D engine copies the
++ * visible rectangle into the panel memory (ABL's continuous-splash buffer, which the display
++ * engine scans out by itself), queued behind the render on the same ring, so nobody waits.
++ * The stream is built by bsd/dev/negroni_gpu_blit.c into one of two kernel command buffers;
++ * up to four surfaces stay mapped (read-only for the GPU) and retained, the oldest whose copy
++ * is done makes room. The panel memory is mapped once. All of it under gGPULock.
++ */
++#include "NegroniGPU.h"
++#include "../../../bsd/dev/negroni_gpu_blit.h"
++
++#define PRESENT_SURFACES        4
++
++static struct {
++	NegroniSurface *        surface;        /* retained, its memory prepared */
++	uint64_t                address, size;
++	uint32_t                fence;          /* the last copy that read it */
++} gPresentMaps[PRESENT_SURFACES];
++static uint32_t gPresentNext;
++static uint64_t gPanelPhys, gPanelAddress, gPanelBytes;
++static IOBufferMemoryDescriptor * gPresentIB[2];
++static uint64_t gPresentIBAddress[2];
++static uint32_t gPresentIBFence[2], gPresentIBNext;
++static int gPresentOn = -1;
++static uint32_t gPresentLogged;
++
++/* gGPULock held. [phys, + size) or the pages of md, at a new GPU address; 0 on failure. */
++static uint64_t
++presentMap(IOMemoryDescriptor * md, uint64_t phys, uint64_t size, bool readOnly)
++{
++	uint64_t address = negroni_gpu_address(size);
++	bool mapped = address != 0;
++
++	for (uint64_t offset = 0; offset < size && mapped; offset += GPU_PAGE) {
++		uint64_t pa = phys + offset;
++		if (md != NULL) {
++			IOByteCount length = 0;
++			pa = md->getPhysicalSegment((IOByteCount)offset, &length, kIOMemoryMapperNone);
++			mapped = pa != 0 && (pa & (GPU_PAGE - 1)) == 0 && length >= GPU_PAGE;
++		}
++		mapped = mapped && negroni_gpu_map(address + offset, pa, readOnly);
++	}
++	if (!mapped) {
++		if (address != 0) {
++			negroni_gpu_unmap(address, size);
++			negroni_gpu_address_free(address, size);
++		}
++		return 0;
++	}
++	negroni_gpu_mapped();
++	return address;
++}
++
++/* gGPULock held. */
++static void
++presentUnmap(uint64_t address, uint64_t size)
++{
++	negroni_gpu_unmap(address, size);
++	negroni_gpu_address_free(address, size);
++}
++
++/* gGPULock held. The GPU address of s's memory (mapped now if it is not), or 0. */
++static uint64_t
++presentSurface(NegroniSurface * s, uint32_t * slot)
++{
++	uint32_t pick = PRESENT_SURFACES;
++	uint64_t size = s->memory->getLength();
++
++	for (uint32_t i = 0; i < PRESENT_SURFACES; i++) {
++		if (gPresentMaps[i].surface == s) {
++			*slot = i;
++			return gPresentMaps[i].address;
++		}
++	}
++	for (uint32_t n = 0; n < PRESENT_SURFACES && pick == PRESENT_SURFACES; n++) {
++		uint32_t i = (gPresentNext + n) % PRESENT_SURFACES;
++		if (gPresentMaps[i].surface == NULL || negroni_gpu_done(gPresentMaps[i].fence)) {
++			pick = i;
++		}
++	}
++	if (pick == PRESENT_SURFACES || size == 0 || (size & PAGE_MASK) || size > GPU_BUFFER_MAX) {
++		return 0;                       /* four copies in flight, or an odd surface */
++	}
++	if (gPresentMaps[pick].surface != NULL) {
++		presentUnmap(gPresentMaps[pick].address, gPresentMaps[pick].size);
++		gPresentMaps[pick].surface->memory->complete();
++		gPresentMaps[pick].surface->release();
++		gPresentMaps[pick].surface = NULL;
++	}
++	if (s->memory->prepare() != kIOReturnSuccess) {
++		return 0;
++	}
++	uint64_t address = presentMap(s->memory, 0, size, true);
++	if (address == 0) {
++		s->memory->complete();
++		return 0;
++	}
++	s->retain();
++	gPresentMaps[pick].surface = s;
++	gPresentMaps[pick].address = address;
++	gPresentMaps[pick].size = size;
++	gPresentMaps[pick].fence = 0;
++	gPresentNext = pick + 1;
++	*slot = pick;
++	return address;
++}
++
++bool
++NegroniGPUPresentReady(void)
++{
++	if (gPresentOn < 0) {
++		int on = 1;
++		PE_parse_boot_argn("negronifb_gpu", &on, sizeof(on));
++		gPresentOn = on != 0;
++	}
++	return gPresentOn > 0 && gGPULock != NULL && negroni_gpu_ready() && !gGPUStopped;
++}
++
++uint32_t
++NegroniGPUPresent(NegroniSurface * s, uint64_t panelPhys, uint32_t pitch, uint32_t rows,
++    uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h)
++{
++	uint32_t words[NEGRONI_GPU_COPY_WORDS], count, fence = 0, slot = 0, ib;
++	uint64_t source, panelBytes = ((uint64_t)pitch * rows + GPU_PAGE - 1) & ~(GPU_PAGE - 1);
++	const char * why = NULL;
++
++	if (!NegroniGPUPresentReady() || s == NULL || s->memory == NULL || s->bytesPerElement != 4 ||
++	    s->elementWidth != 1 || s->elementHeight != 1 || (s->offset & 63) || (s->bytesPerRow & 63) ||
++	    (panelPhys & (GPU_PAGE - 1)) || (uint64_t)dy + h > rows) {
++		return 0;
++	}
++	IOLockLock(gGPULock);
++	if (gGPUStopped) {
++		goto out;
++	}
++	if (gPanelAddress == 0 || gPanelPhys != panelPhys || gPanelBytes != panelBytes) {
++		if (gPanelAddress != 0) {
++			presentUnmap(gPanelAddress, gPanelBytes);
++			gPanelAddress = 0;
++		}
++		gPanelAddress = presentMap(NULL, panelPhys, panelBytes, false);
++		gPanelPhys = panelPhys;
++		gPanelBytes = panelBytes;
++		IOLog("RedwoodGPU: panel memory 0x%llx (%llu bytes) at GPU address 0x%llx\n", panelPhys, panelBytes, gPanelAddress);
++		if (gPanelAddress == 0) {
++			why = "the panel memory cannot be mapped";
++			goto out;
++		}
++	}
++	for (ib = 0; ib < 2; ib++) {
++		if (gPresentIB[ib] == NULL) {
++			IOBufferMemoryDescriptor * md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++			    kIODirectionInOut, PAGE_SIZE, PAGE_SIZE);
++			uint64_t address = md != NULL ? presentMap(md, 0, PAGE_SIZE, true) : 0;
++			if (address == 0) {
++				OSSafeReleaseNULL(md);
++				why = "no command buffer";
++				goto out;
++			}
++			gPresentIB[ib] = md;
++			gPresentIBAddress[ib] = address;
++		}
++	}
++	ib = gPresentIBNext;
++	if (!negroni_gpu_done(gPresentIBFence[ib])) {
++		goto out;                       /* two copies still queued: this frame goes the CPU way */
++	}
++	source = presentSurface(s, &slot);
++	if (source == 0) {
++		goto out;
++	}
++	{
++		struct negroni_gpu_copy copy = {
++			.src = source + s->offset, .src_pitch = s->bytesPerRow,
++			.dst = gPanelAddress, .dst_pitch = pitch,
++			.sx = sx, .sy = sy, .dx = dx, .dy = dy, .w = w, .h = h,
++		};
++		count = negroni_gpu_copy_ib(&copy, words, NEGRONI_GPU_COPY_WORDS);
++	}
++	if (count == 0) {
++		why = "the copy cannot be put to the 2D engine";
++		goto out;
++	}
++	memcpy(gPresentIB[ib]->getBytesNoCopy(), words, count * 4);
++	flush_dcache64((addr64_t)(uintptr_t)gPresentIB[ib]->getBytesNoCopy(), count * 4, FALSE);
++	fence = negroni_gpu_submit(&gPresentIBAddress[ib], &count, 1);
++	if (fence == 0) {
++		negroni_gpu_report("the ring stays full (present)");
++		gGPUStopped = true;
++		goto out;
++	}
++	gPresentIBFence[ib] = fence;
++	gPresentIBNext = ib ^ 1;
++	gPresentMaps[slot].fence = fence;
++	if (gPresentLogged < 4) {
++		gPresentLogged++;
++		IOLog("RedwoodGPU: present %u: surface %u (fence %u) %ux%u from %u,%u to %u,%u, %u words\n", fence,
++		    s->id, s->gpuFence, w, h, sx, sy, dx, dy, count);
++	}
++out:
++	IOLockUnlock(gGPULock);
++	if (why != NULL && gPresentLogged < 8) {
++		gPresentLogged++;
++		IOLog("RedwoodGPU: present of surface %u: %s\n", s->id, why);
++	}
++	return fence;
++}
++
++bool
++NegroniGPUFenceDone(uint32_t fence)
++{
++	bool done;
++
++	if (fence == 0 || gGPULock == NULL) {
++		return true;
++	}
++	IOLockLock(gGPULock);
++	done = negroni_gpu_done(fence) || gGPUStopped;  /* stopped: nothing more will come */
++	IOLockUnlock(gGPULock);
++	return done;
++}
++
++bool
++NegroniGPUFenceWait(uint32_t fence, uint32_t ms)
++{
++	IOReturn ret;
++
++	if (fence == 0 || gGPULock == NULL) {
++		return true;
++	}
++	IOLockLock(gGPULock);
++	ret = gpuWait(fence, ms);
++	IOLockUnlock(gGPULock);
++	return ret == kIOReturnSuccess;
++}
++
++void
++NegroniGPUSurfaceForCPU(NegroniSurface * s, uint64_t offset, uint64_t length)
++{
++	IOMemoryDescriptor * md = s != NULL ? s->memory : NULL;
++	uint64_t end;
++
++	if (md == NULL || length == 0) {
++		return;
++	}
++	end = MIN(round_page_64(offset + length), (uint64_t)md->getLength());
++	for (uint64_t at = trunc_page_64(offset); at < end; at += PAGE_SIZE) {
++		IOByteCount segment = 0;
++		uint64_t pa = md->getPhysicalSegment((IOByteCount)at, &segment, kIOMemoryMapperNone);
++		if (pa != 0 && (pa & PAGE_MASK) == 0) {
++			cachePage(pa);
++		}
++	}
++}
+ #endif /* NEGRONI */
+diff --git a/iokit/Kernel/arm/NegroniGPU.h b/iokit/Kernel/arm/NegroniGPU.h
+new file mode 100644
+index 0000000..2ccab6f
+--- /dev/null
++++ b/iokit/Kernel/arm/NegroniGPU.h
+@@ -0,0 +1,42 @@
++/*
++ * NEGRONI: what the framebuffer (NegroniFramebuffer.cpp) asks of the kept
++ * Adreno 730 (NegroniGPU.cpp): a GPU copy of a swapped IOSurface into the
++ * panel memory, and its fence.
++ */
++#ifndef _NEGRONI_GPU_H
++#define _NEGRONI_GPU_H
++
++#include <pexpert/arm64/board_config.h>
++
++#if defined(NEGRONI)
++#include <stdint.h>
++
++class NegroniSurface;
++
++/* The GPU is kept, answers, and boot-arg negronifb_gpu is not 0 (default 1). */
++bool NegroniGPUPresentReady(void);
++
++/*
++ * Copy w x h BGRA pixels at (sx, sy) of s into the panel memory (physical,
++ * pitch bytes per row, rows rows) at (dx, dy), on the GPU, after everything
++ * submitted before (so after the render that wrote s). Returns the copy's
++ * fence, 0 when it cannot be done (alignment, mapping, GPU stopped): then the
++ * caller copies with the CPU. Does not wait.
++ */
++uint32_t NegroniGPUPresent(NegroniSurface *s, uint64_t panelPhys, uint32_t pitch, uint32_t rows,
++    uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);
++
++/* The fence is done (0 is always done). */
++bool NegroniGPUFenceDone(uint32_t fence);
++
++/* Wait at most ms milliseconds for the fence; true when it is done. */
++bool NegroniGPUFenceWait(uint32_t fence, uint32_t ms);
++
++/*
++ * Before the CPU reads a surface the GPU wrote: its cached lines dropped
++ * (whole pages of [offset, offset + length) of its memory).
++ */
++void NegroniGPUSurfaceForCPU(NegroniSurface *s, uint64_t offset, uint64_t length);
++
++#endif /* NEGRONI */
++#endif /* _NEGRONI_GPU_H */
