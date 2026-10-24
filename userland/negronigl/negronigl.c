@@ -1,0 +1,361 @@
+/*
+ * negronigl: Mesa (gallium freedreno + GLES 3.x) as a library inside iOS processes.
+ *
+ * A minimal gallium frontend (like Mesa's frontends/hgl and ios-sailfish tools/sweetgl/sweetgl.c):
+ * one pipe_screen over the msm DRM emulation (drm/negroni_drm.c), GLES contexts made current
+ * without a drawable. CoreAnimation draws into FBOs only, whose color buffers are IOSurfaces
+ * (surface.c); nothing here needs a window system.
+ *
+ * Load hook: in backboardd (or with NEGRONIGL_EAGL=1) the EAGL shim (eagl.c) is installed.
+ * NEGRONIGL_TEST=1 also runs ngl_selftest() + ngl_surface_selftest() on a thread at load, with
+ * retries while RedwoodGPU is not there yet; results go to the log (log.c).
+ *
+ * Environment (defaults set here, a value in the environment wins):
+ *   FD_MESA_DEBUG=sysmem      no GMEM tiling: GMEM resolves write whole tile rows, past the end
+ *                             of IOSurfaces that are not padded for it (ios-sailfish boot 0154a)
+ *   IR3_SHADER_DEBUG=nofp16   CA's mediump/lowp texture coordinates need fp32 (ios-sailfish)
+ */
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <mach/mach_time.h>
+
+#include "pipe/p_screen.h"
+#include "pipe/p_context.h"
+#include "frontend/api.h"
+#include "state_tracker/st_context.h"
+#include "util/driconf.h"
+#include "util/xmlconfig.h"
+#include "freedreno/drm/freedreno_drm_public.h"
+
+#include "negronigl.h"
+
+#ifndef NEGRONIGL_MESA_VERSION
+#define NEGRONIGL_MESA_VERSION "?"
+#endif
+
+static const driOptionDescription ngl_driconf[] = {
+#include "freedreno/driinfo_freedreno.h"
+};
+
+struct ngl_ctx {
+	struct st_context *st;
+	int api;
+};
+
+static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct pipe_frontend_screen *fscreen;
+static driOptionCache opt_info, opts;
+
+bool
+ngl_env_on(const char *name, bool dflt)
+{
+	const char *v = getenv(name);
+	if (v == NULL || v[0] == 0) {
+		return dflt;
+	}
+	return !(v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
+}
+
+const char *
+ngl_version(void)
+{
+	return "negronigl (Mesa " NEGRONIGL_MESA_VERSION ", freedreno, A730)";
+}
+
+bool
+ngl_gpu_info(struct ngl_gpu_info *info)
+{
+	return ngl_drm_info(info);
+}
+
+bool
+ngl_init(void)
+{
+	pthread_mutex_lock(&init_lock);
+	if (fscreen == NULL) {
+		int fd = ngl_drm_open();
+		if (fd >= 0) {
+			setenv("FD_MESA_DEBUG", "sysmem", 0);
+			setenv("IR3_SHADER_DEBUG", "nofp16", 0);
+			driParseOptionInfo(&opt_info, ngl_driconf, ARRAY_SIZE(ngl_driconf));
+			driParseConfigFiles(&opts, &opt_info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
+			struct pipe_screen_config cfg = {.options = &opts, .options_info = &opt_info};
+			struct pipe_screen *screen = fd_drm_screen_create_renderonly(fd, NULL, &cfg);
+			if (screen == NULL) {
+				ngl_log("negronigl: freedreno screen creation failed");
+				close(fd);
+			} else {
+				struct pipe_frontend_screen *f = calloc(1, sizeof(*f));
+				f->screen = screen;
+				ngl_image_hooks(f);     /* before any context: st reads them at creation */
+				fscreen = f;
+				ngl_log("negronigl: %s, screen %s (%s)", ngl_version(), screen->get_name(screen),
+				    screen->get_vendor(screen));
+			}
+		}
+	}
+	bool ok = fscreen != NULL;
+	pthread_mutex_unlock(&init_lock);
+	return ok;
+}
+
+struct pipe_screen *
+ngl_screen(void)
+{
+	return fscreen ? fscreen->screen : NULL;
+}
+
+struct ngl_ctx *
+ngl_create(int api, struct ngl_ctx *share)
+{
+	if (!ngl_init()) {
+		return NULL;
+	}
+	struct st_context_attribs attribs = {
+		.profile = API_OPENGLES2,
+		.major = api >= 3 ? 3 : 2,
+		/* 3.1: glGetTexLevelParameteriv (rectangle texture sizes in eagl.c) */
+		.minor = api >= 3 ? 1 : 0,
+	};
+	enum st_context_error err = ST_CONTEXT_SUCCESS;
+	struct st_context *st = st_api_create_context(fscreen, &attribs, &err, share ? share->st : NULL);
+	if (st == NULL) {
+		ngl_log("negronigl: GLES %d.%d context failed: %d", attribs.major, attribs.minor, err);
+		return NULL;
+	}
+	struct ngl_ctx *c = calloc(1, sizeof(*c));
+	if (c == NULL) {
+		st_destroy_context(st);
+		return NULL;
+	}
+	c->st = st;
+	c->api = attribs.major;
+	st->frontend_context = c;
+	return c;
+}
+
+bool
+ngl_make_current(struct ngl_ctx *c)
+{
+	return st_api_make_current(c ? c->st : NULL, NULL, NULL);
+}
+
+void
+ngl_destroy(struct ngl_ctx *c)
+{
+	if (c == NULL) {
+		return;
+	}
+	if (st_api_get_current() == c->st) {
+		st_api_make_current(NULL, NULL, NULL);
+	}
+	st_destroy_context(c->st);
+	free(c);
+}
+
+/* ---- self tests ---- */
+
+static double
+ms_since(uint64_t t0)
+{
+	static mach_timebase_info_data_t tb;
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return (double)(mach_absolute_time() - t0) * tb.numer / tb.denom / 1e6;
+}
+
+static GLuint
+shader(GLenum type, const char *src)
+{
+	GLuint s = glCreateShader(type);
+	glShaderSource(s, 1, &src, NULL);
+	glCompileShader(s);
+	GLint ok = 0;
+	glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+	if (!ok) {
+		char log[256] = "";
+		glGetShaderInfoLog(s, sizeof(log), NULL, log);
+		ngl_log("negronigl: selftest shader: %s", log);
+	}
+	return s;
+}
+
+static GLuint
+red_program(void)
+{
+	GLuint prog = glCreateProgram();
+	glAttachShader(prog, shader(GL_VERTEX_SHADER,
+	    "#version 300 es\nlayout(location = 0) in vec2 p;\nvoid main() { gl_Position = vec4(p, 0.0, 1.0); }\n"));
+	glAttachShader(prog, shader(GL_FRAGMENT_SHADER,
+	    "#version 300 es\nprecision mediump float;\nout vec4 c;\nvoid main() { c = vec4(1.0, 0.0, 0.0, 1.0); }\n"));
+	glLinkProgram(prog);
+	return prog;
+}
+
+/* clear blue, red triangle over the lower left half of the bound 256x256 framebuffer */
+static void
+draw_test_frame(GLuint prog)
+{
+	static const float tri[] = {-1, -1, 1, -1, -1, 1};
+	GLuint vbo;
+	glGenBuffers(1, &vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(tri), tri, GL_STATIC_DRAW);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+	glUseProgram(prog);
+	glViewport(0, 0, 256, 256);
+	glClearColor(0, 0, 1, 1);
+	glClear(GL_COLOR_BUFFER_BIT);
+	glDrawArrays(GL_TRIANGLES, 0, 3);
+	glDeleteBuffers(1, &vbo);
+}
+
+bool
+ngl_selftest(void)
+{
+	uint64_t t0 = mach_absolute_time();
+	struct ngl_ctx *c = ngl_create(3, NULL);
+	if (c == NULL || !ngl_make_current(c)) {
+		ngl_log("negronigl: selftest: no context");
+		ngl_destroy(c);
+		return false;
+	}
+	double t_ctx = ms_since(t0);
+	ngl_log("negronigl: GL_VERSION %s / GL_RENDERER %s / GLSL %s", glGetString(GL_VERSION),
+	    glGetString(GL_RENDERER), glGetString(GL_SHADING_LANGUAGE_VERSION));
+
+	GLuint tex, fbo;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 256, 256);
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+	GLenum fbs = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	GLuint prog = red_program();
+	GLint linked = 0;
+	glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+
+	uint64_t t1 = mach_absolute_time();
+	draw_test_frame(prog);
+	static uint8_t px[256 * 256 * 4];
+	glReadPixels(0, 0, 256, 256, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	double t_draw = ms_since(t1);
+	GLenum err = glGetError();
+	const uint8_t *a = &px[(32 * 256 + 32) * 4], *b = &px[(224 * 256 + 224) * 4];
+	bool ok = fbs == GL_FRAMEBUFFER_COMPLETE && linked && err == GL_NO_ERROR &&
+	    a[0] == 255 && a[1] == 0 && a[2] == 0 && a[3] == 255 && b[0] == 0 && b[1] == 0 && b[2] == 255 && b[3] == 255;
+	ngl_log("negronigl: selftest fbo %#x linked %d err %#x px(32,32) %02x%02x%02x%02x px(224,224) %02x%02x%02x%02x "
+	    "context %.1f ms draw+readback %.2f ms: %s", fbs, linked, err, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3],
+	    t_ctx, t_draw, ok ? "PASS" : "FAIL");
+
+	uint64_t t2 = mach_absolute_time();
+	draw_test_frame(prog);
+	glFinish();
+	ngl_log("negronigl: second frame clear+draw+finish %.2f ms", ms_since(t2));
+	glDeleteFramebuffers(1, &fbo);
+	glDeleteTextures(1, &tex);
+	glDeleteProgram(prog);
+	ngl_make_current(NULL);
+	ngl_destroy(c);
+	return ok;
+}
+
+/*
+ * A 256x256 BGRA IOSurface as the color buffer (the path CA's render targets take), triangle
+ * drawn, read back on the CPU through the surface's own mapping.
+ */
+bool
+ngl_surface_selftest(void)
+{
+	const void *keys[] = {kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfacePixelFormat,
+	    kIOSurfaceBytesPerRow};
+	int w = 256, h = 256, bpe = 4, fmt = 'BGRA', pitch = 1024;
+	CFNumberRef vals[5] = {CFNumberCreate(NULL, kCFNumberIntType, &w), CFNumberCreate(NULL, kCFNumberIntType, &h),
+	    CFNumberCreate(NULL, kCFNumberIntType, &bpe), CFNumberCreate(NULL, kCFNumberIntType, &fmt),
+	    CFNumberCreate(NULL, kCFNumberIntType, &pitch)};
+	CFDictionaryRef props = CFDictionaryCreate(NULL, keys, (const void **)vals, 5, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	IOSurfaceRef s = IOSurfaceCreate(props);
+	CFRelease(props);
+	for (int i = 0; i < 5; i++) {
+		CFRelease(vals[i]);
+	}
+	if (s == NULL) {
+		ngl_log("negronigl: surface selftest: IOSurfaceCreate failed");
+		return false;
+	}
+	struct ngl_ctx *c = ngl_create(3, NULL);
+	if (c == NULL || !ngl_make_current(c)) {
+		ngl_destroy(c);
+		CFRelease(s);
+		return false;
+	}
+	GLuint tex, fbo;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	bool bound = ngl_bind_surface(s, GL_TEXTURE_2D, GL_BGRA_EXT, GL_UNSIGNED_BYTE, 0, "selftest");
+	glGenFramebuffers(1, &fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+	GLenum fbs = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	GLuint prog = red_program();
+	draw_test_frame(prog);
+	glFinish();
+	IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+	const uint8_t *base = IOSurfaceGetBaseAddress(s);
+	size_t row = IOSurfaceGetBytesPerRow(s);
+	/* GL row 32 from the bottom = memory row 32 (GL's origin is the first row in memory) */
+	const uint8_t *a = base + 32 * row + 32 * 4, *b = base + 224 * row + 224 * 4;
+	bool ok = bound && fbs == GL_FRAMEBUFFER_COMPLETE && a[2] == 255 && a[0] == 0 && b[0] == 255 && b[2] == 0;
+	ngl_log("negronigl: surface selftest bound %d fbo %#x BGRA(32,32) %02x%02x%02x%02x BGRA(224,224) "
+	    "%02x%02x%02x%02x: %s", bound, fbs, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], ok ? "PASS" : "FAIL");
+	IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+	glDeleteFramebuffers(1, &fbo);
+	glDeleteTextures(1, &tex);
+	glDeleteProgram(prog);
+	ngl_make_current(NULL);
+	ngl_destroy(c);
+	CFRelease(s);
+	return ok;
+}
+
+static void *
+selftest_thread(void *arg)
+{
+	(void)arg;
+	for (int i = 0; i < 120 && !ngl_init(); i++) {   /* RedwoodGPU starts during boot */
+		sleep(1);
+	}
+	if (!ngl_init()) {
+		ngl_log("negronigl: selftest: no GPU after 2 minutes");
+		return NULL;
+	}
+	ngl_selftest();
+	ngl_surface_selftest();
+	return NULL;
+}
+
+__attribute__((constructor)) static void
+ngl_load(void)
+{
+	const char *prog = getprogname();
+	bool eagl = ngl_env_on("NEGRONIGL_EAGL", prog != NULL && strcmp(prog, "backboardd") == 0);
+	ngl_log("negronigl: loaded into %s (pid %d), EAGL shim %s", prog ? prog : "?", getpid(), eagl ? "on" : "off");
+	if (eagl) {
+		ngl_eagl_install();
+	}
+	if (ngl_env_on("NEGRONIGL_TEST", false)) {
+		pthread_t th;
+		if (pthread_create(&th, NULL, selftest_thread, NULL) == 0) {
+			pthread_detach(th);
+		}
+	}
+}

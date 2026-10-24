@@ -1,0 +1,8 @@
+_ngl_init
+_ngl_create
+_ngl_make_current
+_ngl_destroy
+_ngl_selftest
+_ngl_surface_selftest
+_ngl_gpu_info
+_ngl_version

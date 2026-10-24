@@ -1,0 +1,17 @@
+negronigl: build the negronigl target (src/gallium/targets/negronigl) when it is there.
+
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -259,6 +259,12 @@
+     subdir('targets/wgl')
+     subdir('targets/libgl-gdi')
+   endif
++endif
++# negronigl (iOSPlus10 userland/negronigl): freedreno + GLES as one iOS dylib, copied in by
++# scripts/gpu/build.sh
++if (host_machine.system() == 'darwin' and with_gallium_freedreno and with_gles2 and
++    import('fs').exists('targets/negronigl/meson.build'))
++  subdir('targets/negronigl')
+ endif
+ if with_tests
+   subdir('tests')

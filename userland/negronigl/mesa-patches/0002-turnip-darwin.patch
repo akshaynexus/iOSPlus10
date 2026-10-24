@@ -1,0 +1,96 @@
+negronigl: Turnip (freedreno Vulkan, msm) on Darwin/iOS over the libdrm stand-in.
+
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -5,7 +5,8 @@
+ links_vulkan_wsi = []
+ platform_deps = []
+ 
+-if dep_libdrm.found()
++# (Darwin: the libdrm stand-in has no drmDevice API and there is no window system)
++if dep_libdrm.found() and host_machine.system() != 'darwin'
+   files_vulkan_wsi += files('wsi_common_drm.c')
+ endif
+ 
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2709,6 +2709,8 @@
+                                  "pthread condattr init");
+       goto fail_timeline_cond;
+    }
++#ifndef __APPLE__
++   /* (Darwin has no pthread_condattr_setclock: tu_knl_drm.cc waits with a relative timeout there) */
+    if (pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+@@ -2716,6 +2718,7 @@
+                                  "pthread condattr clock setup");
+       goto fail_timeline_cond;
+    }
++#endif
+    if (pthread_cond_init(&device->timeline_cond, &condattr) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+--- a/src/freedreno/vulkan/tu_knl_drm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm.cc
+@@ -348,8 +348,18 @@
+             };
+ 
+             ASSERTED int ret;
++#ifdef __APPLE__
++            /* the condition variable runs on the wall clock here: wait the time left */
++            uint64_t now_ns = os_time_get_nano();
++            uint64_t left_ns = abs_timeout_ns > now_ns ? abs_timeout_ns - now_ns : 0;
++            abstime.tv_sec = left_ns / NSEC_PER_SEC;
++            abstime.tv_nsec = left_ns % NSEC_PER_SEC;
++            ret = pthread_cond_timedwait_relative_np(&dev->timeline_cond,
++                                                     &dev->submit_mutex, &abstime);
++#else
+             ret = pthread_cond_timedwait(&dev->timeline_cond,
+                                          &dev->submit_mutex, &abstime);
++#endif
+             assert(ret != EINVAL);
+             if (os_time_get_nano() >= abs_timeout_ns) {
+                pthread_mutex_unlock(&dev->submit_mutex);
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -352,6 +352,39 @@
+       mesa_logi("Found compatible device '%s'.", path);
+ 
+    return result;
++#elif defined(__APPLE__) && defined(TU_HAS_MSM)
++   /* iOS: no DRM nodes. The msm "device" is the RedwoodGPU user client behind the libdrm
++    * stand-in (iOSPlus10 userland/negronigl/drm), opened by name. */
++   struct tu_instance *instance =
++      container_of(vk_instance, struct tu_instance, vk);
++   int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
++   if (fd < 0)
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   drmVersionPtr version = drmGetVersion(fd);
++   if (!version) {
++      close(fd);
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++   struct tu_physical_device *device = NULL;
++   VkResult result = tu_knl_drm_msm_load(instance, fd, version, &device);
++   drmFreeVersion(version);
++   if (result != VK_SUCCESS) {
++      close(fd);
++      return result;
++   }
++   device->master_fd = -1;
++   device->kgsl_dma_fd = -1;
++   snprintf(device->fd_path, ARRAY_SIZE(device->fd_path), "%s", "RedwoodGPU");
++   device->has_master = false;
++   device->has_local = false;
++   result = tu_physical_device_init(device, instance);
++   if (result != VK_SUCCESS) {
++      close(fd);
++      vk_free(&instance->vk.alloc, device);
++      return result;
++   }
++   list_addtail(&device->vk.link, &instance->vk.physical_devices.list);
++   return VK_SUCCESS;
+ #else
+    return VK_ERROR_INCOMPATIBLE_DRIVER;
+ #endif
