@@ -40,15 +40,25 @@ Both root scripts end with `scripts/ios16/root-finish.sh` (bring-up tweaks, stag
 
 ## Why one step uses a container
 
+On macOS the x86_64 container runs through Rosetta. x86_64 Mono (which stuart uses for
+`NuGet.exe`) crashes under Rosetta in JIT mode, so `scripts/setup/in-docker.sh` sets
+`MONO_ENV_OPTIONS=--interpreter` on macOS hosts.
+
+
 The Mu-Silicium UEFI build (EDK2 `stuart`) is supported upstream only on Linux/Windows x86_64: it
 downloads x86_64-only NuGet tools (iasl and others) and uses GNU `aarch64-linux-gnu-` binutils
 with Clang. Everything else runs natively on macOS and Linux.
 
 ## Tools: Rust vs Python vs shell
 
-- `tools/op10tool` (Rust, one binary): `img2simg`, `ipsw-get`, `uefi-unpack`, `uefi-portpatch`,
-  `im4p`. Binary formats, large files, parallel downloads. Checked against the earlier Python
-  versions with `tools/op10tool/tests/compare-python.sh` (all outputs identical).
+- `tools/op10tool` (Rust, one binary): `img2simg`, `simg2img`, `ipsw-get`, `uefi-unpack`,
+  `uefi-portpatch`, `im4p`. Binary formats, large files, parallel downloads. Libraries where they
+  fit: `zip` (IPSW directory, through an HTTP range reader), `rayon` (parallel chunks), `ureq`,
+  `flate2`, `crc32fast`, `android-sparse` (sparse format; our own block classification, because the
+  crate's encoder would turn zero data into don't-care), `simple_asn1` (IM4P), `lzfse_rust`,
+  `lzma-rs`, `clap`. Hand-written only where no library fits: the Qualcomm FV walker and the
+  aarch64 patch-port masks. `tools/op10tool/tests/compare-python.sh` checks every command against
+  the earlier Python versions (same output; sparse images by decoded content).
 - Python (short glue): `scripts/lib/conf.py`, `scripts/uefi/binaries.py`,
   `scripts/uefi/patch-locate.py`, and the port's own tools in `external/slop`.
 - Shell: orchestration in `scripts/`.

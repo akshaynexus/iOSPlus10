@@ -50,9 +50,17 @@ echo "== img2simg (sparse file with holes, a fill run and random data)"
 mkfile -n 64m "$T/t.img" 2>/dev/null || truncate -s 64M "$T/t.img"
 printf 'hello' | dd of="$T/t.img" bs=1 seek=8192 conv=notrunc 2>/dev/null
 dd if=/dev/urandom of="$T/t.img" bs=4096 seek=5000 count=5000 conv=notrunc 2>/dev/null
+dd if=/dev/zero of="$T/t.img" bs=4096 seek=12000 count=100 conv=notrunc 2>/dev/null   # zero DATA
 python3 "$PY/img2simg.py" "$T/t.img" "$T/py.simg" >/dev/null
-"$OP" img2simg "$T/t.img" "$T/rs.simg" >/dev/null
-check cmp -s "$T/py.simg" "$T/rs.simg"
+"$OP" img2simg "$T/t.img" "$T/rs.simg" | tee "$T/rs.simg.log"
+# The chunk layout differs from the Python tool (android-sparse merges chunks itself), so check the
+# content: both sparse images must decode to the original bytes.
+"$OP" simg2img "$T/rs.simg" "$T/rs.back" >/dev/null
+"$OP" simg2img "$T/py.simg" "$T/py.back" >/dev/null
+printf 'rust decode'; check cmp -s "$T/t.img" "$T/rs.back"
+printf 'python decode'; check cmp -s "$T/t.img" "$T/py.back"
+# zero data blocks must be FILL, never DONT_CARE (stale partition bytes would survive in files)
+printf 'zero data -> fill'; check grep -qE ' [1-9][0-9]* fill' "$T/rs.simg.log"
 
 echo "== ipsw-get (AppOS cryptex, 10 MB, deflated in the IPSW)"
 URL=https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw

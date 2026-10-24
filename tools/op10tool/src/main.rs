@@ -20,13 +20,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Raw image -> Android sparse image (holes -> DONT_CARE, uniform blocks -> FILL)
-    Img2simg {
-        input: PathBuf,
-        output: PathBuf,
-        #[arg(long, default_value_t = 4096)]
-        block: u32,
-    },
+    /// Raw image -> Android sparse image (holes -> DONT_CARE, uniform blocks -> FILL, 4 KiB blocks)
+    Img2simg { input: PathBuf, output: PathBuf },
+    /// Android sparse image -> raw image (for checks)
+    Simg2img { input: PathBuf, output: PathBuf },
     /// Download members of a remote ZIP (IPSW) with parallel range requests; CRC-32 checked
     IpswGet {
         url: String,
@@ -63,7 +60,8 @@ fn parse_int(s: &str) -> Result<usize, String> {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Img2simg { input, output, block } => img2simg::run(&input, &output, block),
+        Cmd::Img2simg { input, output } => img2simg::img2simg(&input, &output),
+        Cmd::Simg2img { input, output } => img2simg::simg2img(&input, &output),
         Cmd::IpswGet { url, outdir, names, jobs, chunk_mib } => ipsw::run(&url, &outdir, &names, jobs, chunk_mib << 20),
         Cmd::UefiUnpack { image, outdir } => uefi::run(&image, &outdir),
         Cmd::UefiPortpatch { orig, patched, target, out, skip, byte } => {

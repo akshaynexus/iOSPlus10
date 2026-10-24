@@ -1,38 +1,20 @@
-//! Extract the payload of an IM4P (Apple firmware container, DER):
+//! Extract the payload of an IM4P (Apple firmware container, DER, parsed with `simple_asn1`):
 //! SEQUENCE { IA5String "IM4P", IA5String type, IA5String desc, OCTET STRING payload, ... }.
-//! Payload raw, or LZFSE ("bvx2"). "complzss" (old kernelcaches) is rejected.
+//! Payload raw, or LZFSE ("bvx2", decoded with `lzfse_rust`). "complzss" is rejected.
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{anyhow, bail, Result};
+use simple_asn1::{from_der, ASN1Block};
 use std::path::Path;
-
-fn der(buf: &[u8], mut i: usize) -> Result<(u8, &[u8], usize)> {
-    ensure!(i + 2 <= buf.len(), "DER: truncated");
-    let tag = buf[i];
-    let mut n = buf[i + 1] as usize;
-    i += 2;
-    if n & 0x80 != 0 {
-        let k = n & 0x7f;
-        n = buf[i..i + k].iter().fold(0usize, |a, &b| a << 8 | b as usize);
-        i += k;
-    }
-    ensure!(i + n <= buf.len(), "DER: length past end");
-    Ok((tag, &buf[i..i + n], i + n))
-}
 
 pub fn run(input: &Path, output: &Path) -> Result<()> {
     let data = std::fs::read(input)?;
-    let (tag, seq, _) = der(&data, 0)?;
-    ensure!(tag == 0x30, "not a DER sequence");
-    let mut items = Vec::new();
-    let mut i = 0;
-    while i < seq.len() {
-        let (t, v, j) = der(seq, i)?;
-        items.push((t, v));
-        i = j;
-    }
-    ensure!(items.first() == Some(&(0x16, &b"IM4P"[..])), "not an IM4P");
-    let kind = String::from_utf8_lossy(items[1].1).into_owned();
-    let Some(&(_, payload)) = items[3..].iter().find(|(t, _)| *t == 0x04) else { bail!("no payload") };
+    let blocks = from_der(&data).map_err(|e| anyhow!("DER: {e:?}"))?;
+    let Some(ASN1Block::Sequence(_, items)) = blocks.first() else { bail!("not a DER sequence") };
+    let text = |i: usize| match items.get(i) { Some(ASN1Block::IA5String(_, s)) => Some(s.clone()), _ => None };
+    if text(0).as_deref() != Some("IM4P") { bail!("not an IM4P"); }
+    let kind = text(1).unwrap_or_default();
+    let payload = items.iter().skip(3).find_map(|b| match b { ASN1Block::OctetString(_, v) => Some(v), _ => None })
+        .ok_or_else(|| anyhow!("no payload"))?;
     let out = if payload.starts_with(b"complzss") {
         bail!("{kind}: complzss payload is not supported")
     } else if payload.starts_with(b"bvx2") {
@@ -40,7 +22,7 @@ pub fn run(input: &Path, output: &Path) -> Result<()> {
         lzfse_rust::decode_bytes(payload, &mut v)?;
         v
     } else {
-        payload.to_vec()
+        payload.clone()
     };
     std::fs::write(output, &out)?;
     println!("{kind}: {} bytes -> {}", out.len(), output.display());
