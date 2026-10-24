@@ -67,6 +67,12 @@ struct nbo {
 	bool used, live;
 };
 
+struct nsync {
+	uint32_t seq;
+	uint64_t point;
+	bool live, signaled;
+};
+
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static io_connect_t conn;
 static enum ngl_abi abi;
@@ -74,8 +80,13 @@ static int null_fd = -1;
 static struct nbo *bos;
 static uint32_t nbos;
 static uint32_t queues;
+static struct nsync *syncs;
+static uint32_t nsyncs;
 static struct ngl_gpu_info info;
 static bool no_cpu_prep_sel;    /* BO_CPU_PREP failed once: the kernel has no such selector */
+
+static int sync_wait(uint32_t *handles, uint64_t *points, unsigned count, int64_t deadline,
+    unsigned flags, uint32_t *first);
 
 static const char *
 abi_name(enum ngl_abi a)
@@ -244,6 +255,31 @@ static struct nbo *
 nbo(uint32_t handle)
 {
 	return handle >= 1 && handle <= nbos && bos[handle - 1].live ? &bos[handle - 1] : NULL;
+}
+
+/* lock held: syncobj handles are stable table indices, like GEM handles. */
+static struct nsync *
+nsync(uint32_t handle)
+{
+	return handle >= 1 && handle <= nsyncs && syncs[handle - 1].live ? &syncs[handle - 1] : NULL;
+}
+
+/* lock held */
+static int
+nsync_new(uint32_t *handle, bool signaled)
+{
+	uint32_t i;
+	for (i = 0; i < nsyncs && syncs[i].live; i++) {}
+	if (i == nsyncs) {
+		struct nsync *v = realloc(syncs, (nsyncs + 1) * sizeof(*v));
+		if (v == NULL)
+			return ENOMEM;
+		syncs = v;
+		nsyncs++;
+	}
+	syncs[i] = (struct nsync){.live = true, .signaled = signaled};
+	*handle = i + 1;
+	return 0;
 }
 
 /* lock held */
@@ -471,14 +507,33 @@ s_cpu_prep(struct drm_msm_gem_cpu_prep *r)
 static int
 s_gem_submit(struct drm_msm_gem_submit *r)
 {
-	if (r->flags & (MSM_SUBMIT_FENCE_FD_IN | MSM_SUBMIT_FENCE_FD_OUT | MSM_SUBMIT_SYNCOBJ_IN |
-	    MSM_SUBMIT_SYNCOBJ_OUT
+	if (r->flags & (MSM_SUBMIT_FENCE_FD_IN | MSM_SUBMIT_FENCE_FD_OUT
 #ifdef MSM_SUBMIT_FENCE_SN_IN
 	    | MSM_SUBMIT_FENCE_SN_IN
 #endif
 	    )) {
 		ngl_log("negronigl: submit flags %#x not supported", r->flags);
 		return EINVAL;
+	}
+	uint32_t stride = r->syncobj_stride ? r->syncobj_stride : sizeof(struct drm_msm_gem_submit_syncobj);
+	if (stride < sizeof(struct drm_msm_gem_submit_syncobj) ||
+	    ((r->flags & MSM_SUBMIT_SYNCOBJ_IN) && (!r->in_syncobjs || !r->nr_in_syncobjs)) ||
+	    ((r->flags & MSM_SUBMIT_SYNCOBJ_OUT) && (!r->out_syncobjs || !r->nr_out_syncobjs)))
+		return EINVAL;
+	/* The kernel ABI only accepts command buffers. Resolve binary input fences in userspace. */
+	for (uint32_t i = 0; (r->flags & MSM_SUBMIT_SYNCOBJ_IN) && i < r->nr_in_syncobjs; i++) {
+		struct drm_msm_gem_submit_syncobj *in = (void *)(uintptr_t)(r->in_syncobjs + (uint64_t)i * stride);
+		if (in->flags & ~MSM_SUBMIT_SYNCOBJ_FLAGS) return EINVAL;
+		uint32_t h = in->handle;
+		if (sync_wait(&h, NULL, 1, INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
+		    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL)) return errno;
+		if (in->flags & MSM_SUBMIT_SYNCOBJ_RESET) {
+			if (drmSyncobjReset(-1, &h, 1)) return errno;
+		}
+	}
+	for (uint32_t i = 0; (r->flags & MSM_SUBMIT_SYNCOBJ_OUT) && i < r->nr_out_syncobjs; i++) {
+		struct drm_msm_gem_submit_syncobj *out = (void *)(uintptr_t)(r->out_syncobjs + (uint64_t)i * stride);
+		if (out->flags & ~MSM_SUBMIT_SYNCOBJ_FLAGS) return EINVAL;
 	}
 	const struct drm_msm_gem_submit_bo *sb = (const void *)(uintptr_t)r->bos;
 	const struct drm_msm_gem_submit_cmd *sc = (const void *)(uintptr_t)r->cmds;
@@ -538,8 +593,20 @@ s_gem_submit(struct drm_msm_gem_submit *r)
 				b->used = true;
 			}
 		}
+		for (uint32_t i = 0; (r->flags & MSM_SUBMIT_SYNCOBJ_OUT) && i < r->nr_out_syncobjs; i++) {
+			struct drm_msm_gem_submit_syncobj *out = (void *)(uintptr_t)(r->out_syncobjs + (uint64_t)i * stride);
+			struct nsync *s = nsync(out->handle);
+			if (s) {
+				s->seq = (uint32_t)seq;
+				s->point = out->point ? out->point : 1;
+				s->signaled = false;
+			} else {
+				e = EINVAL;
+				break;
+			}
+		}
 		pthread_mutex_unlock(&lock);
-		r->fence = (uint32_t)seq;
+		if (e == 0) r->fence = (uint32_t)seq;
 	}
 	free(buf);
 	return e;
@@ -700,10 +767,13 @@ int
 drmGetCap(int fd, uint64_t capability, uint64_t *value)
 {
 	(void)fd;
-	(void)capability;
-	*value = 0;
-	errno = EINVAL;
-	return -1;
+	if (value == NULL) { errno = EFAULT; return -1; }
+	switch (capability) {
+	case DRM_CAP_SYNCOBJ: *value = 1; return 0;
+	case DRM_CAP_SYNCOBJ_TIMELINE: *value = 0; return 0;
+	case DRM_CAP_PRIME: *value = 0; return 0;
+	default: *value = 0; errno = EINVAL; return -1;
+	}
 }
 
 void *
@@ -751,6 +821,7 @@ describe_local(struct redwood_drm_surface *s)
 	s->width = (uint32_t)IOSurfaceGetWidth(ref);
 	s->height = (uint32_t)IOSurfaceGetHeight(ref);
 	s->row_bytes = (uint32_t)IOSurfaceGetBytesPerRow(ref);
+	s->size = IOSurfaceGetAllocSize(ref);
 	s->pixel_format = IOSurfaceGetPixelFormat(ref);
 	s->planes = (uint32_t)IOSurfaceGetPlaneCount(ref);
 	s->offset = (uint32_t)((uintptr_t)IOSurfaceGetBaseAddress(ref) & vm_page_mask);
@@ -770,16 +841,7 @@ redwood_drm_surface(int fd, struct redwood_drm_surface *s)
 		e = msm_call(NGL_MSM_SEL_SURFACE, s, sizeof(*s));
 	} else {
 		/* the size is the one the import told (drmPrimeFDToHandle runs first in fd_bo_from_dmabuf) */
-		uint64_t size = 0;
-		pthread_mutex_lock(&lock);
-		for (uint32_t i = nbos; i > 0 && size == 0; i--) {
-			if (bos[i - 1].live && bos[i - 1].surface == s->surface) {
-				size = bos[i - 1].size;
-			}
-		}
-		pthread_mutex_unlock(&lock);
-		e = describe_local(s) && size ? 0 : ENOENT;
-		s->size = size;
+	e = describe_local(s) && s->size ? 0 : ENOENT;
 	}
 	if (e) {
 		errno = e;
@@ -849,24 +911,139 @@ none(void)
 	return -1;
 }
 
-/* buffers and fences as file descriptors for other processes/drivers: none here */
+/* Syncobjs are binary fence-seqno wrappers. Timeline capability is intentionally zero. */
+int
+drmSyncobjCreate(int fd, uint32_t flags, uint32_t *handle)
+{
+	(void)fd;
+	if (handle == NULL || (flags & ~DRM_SYNCOBJ_CREATE_SIGNALED)) { errno = EINVAL; return -1; }
+	pthread_mutex_lock(&lock);
+	int e = nsync_new(handle, (flags & DRM_SYNCOBJ_CREATE_SIGNALED) != 0);
+	pthread_mutex_unlock(&lock);
+	if (e) { errno = e; return -1; }
+	return 0;
+}
+
+int
+drmSyncobjDestroy(int fd, uint32_t handle)
+{
+	(void)fd;
+	pthread_mutex_lock(&lock);
+	struct nsync *s = nsync(handle);
+	if (s) memset(s, 0, sizeof(*s));
+	pthread_mutex_unlock(&lock);
+	if (!s) { errno = EINVAL; return -1; }
+	return 0;
+}
+
+int
+drmSyncobjReset(int fd, const uint32_t *handles, uint32_t count)
+{
+	(void)fd;
+	if (count && handles == NULL) { errno = EFAULT; return -1; }
+	pthread_mutex_lock(&lock);
+	for (uint32_t i = 0; i < count; i++) {
+		struct nsync *s = nsync(handles[i]);
+		if (!s) { pthread_mutex_unlock(&lock); errno = EINVAL; return -1; }
+		s->seq = 0; s->point = 0; s->signaled = false;
+	}
+	pthread_mutex_unlock(&lock);
+	return 0;
+}
+
+int
+drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t count)
+{
+	(void)fd;
+	if (count && handles == NULL) { errno = EFAULT; return -1; }
+	pthread_mutex_lock(&lock);
+	for (uint32_t i = 0; i < count; i++) {
+		struct nsync *s = nsync(handles[i]);
+		if (!s) { pthread_mutex_unlock(&lock); errno = EINVAL; return -1; }
+		s->seq = 0; s->point = 1; s->signaled = true;
+	}
+	pthread_mutex_unlock(&lock);
+	return 0;
+}
+
+int
+drmSyncobjTimelineSignal(int fd, const uint32_t *handles, const uint64_t *points, uint32_t count)
+{
+	if (count && (!handles || !points)) { errno = EFAULT; return -1; }
+	int ret = drmSyncobjSignal(fd, handles, count);
+	if (ret) return ret;
+	pthread_mutex_lock(&lock);
+	for (uint32_t i = 0; i < count; i++) syncs[handles[i] - 1].point = points[i];
+	pthread_mutex_unlock(&lock);
+	return 0;
+}
+
+int
+drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t count)
+{
+	(void)fd;
+	if (count && (!handles || !points)) { errno = EFAULT; return -1; }
+	pthread_mutex_lock(&lock);
+	for (uint32_t i = 0; i < count; i++) {
+		struct nsync *s = nsync(handles[i]);
+		if (!s) { pthread_mutex_unlock(&lock); errno = EINVAL; return -1; }
+		points[i] = s->signaled || (s->seq && seq_passed(s->seq)) ? (s->point ? s->point : 1) : 0;
+	}
+	pthread_mutex_unlock(&lock);
+	return 0;
+}
+
+static int
+sync_wait(uint32_t *handles, uint64_t *points, unsigned count, int64_t deadline, unsigned flags,
+    uint32_t *first)
+{
+	if (!count || !handles || (flags & ~(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT))) {
+		errno = EINVAL; return -1;
+	}
+	for (;;) {
+		unsigned found = 0;
+		for (unsigned i = 0; i < count; i++) {
+			uint32_t seq = 0; uint64_t point = 0; bool done = false;
+			pthread_mutex_lock(&lock);
+			struct nsync *s = nsync(handles[i]);
+			if (!s) { pthread_mutex_unlock(&lock); errno = EINVAL; return -1; }
+			seq = s->seq; point = s->point; done = s->signaled;
+			pthread_mutex_unlock(&lock);
+			if (!done && seq) done = seq_passed(seq);
+			if (done && (!points || point >= points[i])) {
+				found++;
+				if (first) *first = i;
+			}
+		}
+		if ((flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) ? found == count : found != 0)
+			return 0;
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		int64_t now_ns = (int64_t)now.tv_sec * 1000000000ll + now.tv_nsec;
+		if (deadline != INT64_MAX && now_ns >= deadline) { errno = ETIME; return -1; }
+		struct timespec nap = {.tv_sec = 0, .tv_nsec = 1000000};
+		nanosleep(&nap, NULL);
+	}
+}
+
+int drmSyncobjWait(int fd, uint32_t *h, unsigned n, int64_t t, unsigned f, uint32_t *s)
+{ (void)fd; return sync_wait(h, NULL, n, t, f, s); }
+int drmSyncobjTimelineWait(int fd, uint32_t *h, uint64_t *p, unsigned n, int64_t t, unsigned f, uint32_t *s)
+{ (void)fd; return sync_wait(h, p, n, t, f, s); }
+
+int drmSyncobjTransfer(int fd, uint32_t d, uint64_t dp, uint32_t s, uint64_t sp, uint32_t flags)
+{
+	(void)fd; (void)dp; (void)sp;
+	if (flags) { errno = EINVAL; return -1; }
+	uint64_t point;
+	if (drmSyncobjQuery(fd, &s, &point, 1)) return -1;
+	if (!point) { errno = EINVAL; return -1; }
+	return drmSyncobjSignal(fd, &d, 1);
+}
+
+/* Cross-process sync-file and opaque-fd sharing needs a real fd-backed service. */
 int drmPrimeHandleToFD(int fd, uint32_t h, uint32_t f, int *p) { (void)fd; (void)h; (void)f; (void)p; return none(); }
-int drmSyncobjCreate(int fd, uint32_t f, uint32_t *h) { (void)fd; (void)f; (void)h; return none(); }
-int drmSyncobjDestroy(int fd, uint32_t h) { (void)fd; (void)h; return none(); }
-int drmSyncobjReset(int fd, const uint32_t *h, uint32_t n) { (void)fd; (void)h; (void)n; return none(); }
 int drmSyncobjFDToHandle(int fd, int o, uint32_t *h) { (void)fd; (void)o; (void)h; return none(); }
 int drmSyncobjHandleToFD(int fd, uint32_t h, int *o) { (void)fd; (void)h; (void)o; return none(); }
 int drmSyncobjImportSyncFile(int fd, uint32_t h, int s) { (void)fd; (void)h; (void)s; return none(); }
 int drmSyncobjExportSyncFile(int fd, uint32_t h, int *s) { (void)fd; (void)h; (void)s; return none(); }
-int
-drmSyncobjWait(int fd, uint32_t *h, unsigned n, int64_t t, unsigned f, uint32_t *s)
-{
-	(void)fd; (void)h; (void)n; (void)t; (void)f; (void)s;
-	return none();
-}
-int
-drmSyncobjTimelineWait(int fd, uint32_t *h, uint64_t *p, unsigned n, int64_t t, unsigned f, uint32_t *s)
-{
-	(void)fd; (void)h; (void)p; (void)n; (void)t; (void)f; (void)s;
-	return none();
-}

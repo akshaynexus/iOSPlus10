@@ -2,16 +2,15 @@ negronigl: Turnip (freedreno Vulkan, msm) on Darwin/iOS over the libdrm stand-in
 
 --- a/src/vulkan/wsi/meson.build
 +++ b/src/vulkan/wsi/meson.build
-@@ -5,7 +5,8 @@
- links_vulkan_wsi = []
- platform_deps = []
- 
--if dep_libdrm.found()
-+# (Darwin: the libdrm stand-in has no drmDevice API and there is no window system)
-+if dep_libdrm.found() and host_machine.system() != 'darwin'
-   files_vulkan_wsi += files('wsi_common_drm.c')
- endif
- 
+@@ -48,6 +48,7 @@
+ libvulkan_wsi = static_library(
+   'vulkan_wsi',
+   [files_vulkan_wsi, wsi_entrypoints],
++  c_args : host_machine.system() == 'darwin' ? ['-DHAVE_LIBDRM'] : [],
+   include_directories : [inc_include, inc_src],
+   dependencies : [
+     vulkan_wsi_deps, dep_libdrm, dep_libudev, idep_vulkan_util_headers,
+
 --- a/src/freedreno/vulkan/tu_device.cc
 +++ b/src/freedreno/vulkan/tu_device.cc
 @@ -2709,6 +2709,8 @@
@@ -19,26 +18,25 @@ negronigl: Turnip (freedreno Vulkan, msm) on Darwin/iOS over the libdrm stand-in
        goto fail_timeline_cond;
     }
 +#ifndef __APPLE__
-+   /* (Darwin has no pthread_condattr_setclock: tu_knl_drm.cc waits with a relative timeout there) */
++   /* Darwin has no pthread_condattr_setclock. */
     if (pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC) != 0) {
        pthread_condattr_destroy(&condattr);
        result = vk_startup_errorf(physical_device->instance,
-@@ -2716,6 +2718,7 @@
+@@ -2716,5 +2718,6 @@
                                   "pthread condattr clock setup");
        goto fail_timeline_cond;
     }
 +#endif
     if (pthread_cond_init(&device->timeline_cond, &condattr) != 0) {
        pthread_condattr_destroy(&condattr);
-       result = vk_startup_errorf(physical_device->instance,
 --- a/src/freedreno/vulkan/tu_knl_drm.cc
 +++ b/src/freedreno/vulkan/tu_knl_drm.cc
 @@ -348,8 +348,18 @@
              };
- 
+
              ASSERTED int ret;
 +#ifdef __APPLE__
-+            /* the condition variable runs on the wall clock here: wait the time left */
++            /* Darwin uses a relative condition-variable timeout. */
 +            uint64_t now_ns = os_time_get_nano();
 +            uint64_t left_ns = abs_timeout_ns > now_ns ? abs_timeout_ns - now_ns : 0;
 +            abstime.tv_sec = left_ns / NSEC_PER_SEC;
@@ -54,26 +52,31 @@ negronigl: Turnip (freedreno Vulkan, msm) on Darwin/iOS over the libdrm stand-in
                 pthread_mutex_unlock(&dev->submit_mutex);
 --- a/src/freedreno/vulkan/tu_knl.cc
 +++ b/src/freedreno/vulkan/tu_knl.cc
-@@ -352,6 +352,39 @@
+@@ -26,5 +26,9 @@
+ #include "util/libdrm.h"
+
++#ifdef __APPLE__
++extern "C" int drmOpenWithType(const char *name, const char *busid, int type);
++#endif
++
+ #include "tu_device.h"
+ #include "tu_knl.h"
+ #include "tu_queue.h"
+@@ -352,6 +356,34 @@
        mesa_logi("Found compatible device '%s'.", path);
- 
+
     return result;
 +#elif defined(__APPLE__) && defined(TU_HAS_MSM)
-+   /* iOS: no DRM nodes. The msm "device" is the RedwoodGPU user client behind the libdrm
-+    * stand-in (iOSPlus10 userland/negronigl/drm), opened by name. */
 +   struct tu_instance *instance =
 +      container_of(vk_instance, struct tu_instance, vk);
 +   int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
 +   if (fd < 0)
 +      return VK_ERROR_INCOMPATIBLE_DRIVER;
-+   drmVersionPtr version = drmGetVersion(fd);
-+   if (!version) {
-+      close(fd);
-+      return VK_ERROR_INCOMPATIBLE_DRIVER;
-+   }
++   char driver_name[] = "msm";
++   struct _drmVersion version = { .version_major = 1, .version_minor = 7,
++                                  .name_len = 3, .name = driver_name };
 +   struct tu_physical_device *device = NULL;
-+   VkResult result = tu_knl_drm_msm_load(instance, fd, version, &device);
-+   drmFreeVersion(version);
++   VkResult result = tu_knl_drm_msm_load(instance, fd, &version, &device);
 +   if (result != VK_SUCCESS) {
 +      close(fd);
 +      return result;
@@ -94,3 +97,27 @@ negronigl: Turnip (freedreno Vulkan, msm) on Darwin/iOS over the libdrm stand-in
  #else
     return VK_ERROR_INCOMPATIBLE_DRIVER;
  #endif
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -157,4 +157,11 @@
++darwin_drm_sources = []
++darwin_drm_link_args = []
++if host_machine.system() == 'darwin'
++  darwin_drm_sources = files('../../redwood-drm/negroni_drm.c', '../../redwood-drm/log.c')
++  darwin_drm_link_args = ['-framework', 'IOKit', '-framework', 'IOSurface', '-framework', 'CoreFoundation']
++endif
++
+ libvulkan_freedreno = shared_library(
+   'vulkan_freedreno',
+-  [libtu_files, tu_entrypoints, tu_tracepoints, freedreno_xml_header_files, sha1_h, u_format_pack_h, bvh_spv],
++  [libtu_files, tu_entrypoints, tu_tracepoints, freedreno_xml_header_files, sha1_h, u_format_pack_h, bvh_spv] + darwin_drm_sources,
+   include_directories : libtu_includes,
+@@ -181,6 +188,7 @@
+   c_args : [no_override_init_args, tu_flags],
+   cpp_args : [tu_cpp_args, tu_flags],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
++  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id] +
++              darwin_drm_link_args + (host_machine.system() == 'darwin' ? ['-Wl,-undefined,dynamic_lookup'] : []),
+   link_depends : vulkan_icd_link_depends,
+   install : true,

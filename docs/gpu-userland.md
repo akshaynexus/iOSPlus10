@@ -1,72 +1,105 @@
-# GPU user space (negronigl + Turnip), status 2026-10-24
+# GPU user space: Mesa freedreno, EAGL shim and Turnip
 
-Goal: `out/gpu/negronigl.dylib` (Mesa freedreno GLES behind an EAGL shim, injected into
-backboardd) and `libvulkan_freedreno` (Turnip) for iOS 16 arm64 on the Adreno 730
-(chip id 0x07030001, FD730).
+Target: iOS 16.7.16 (20H392), arm64, OnePlus 10 Pro NE2211, Adreno 730 (Mesa chip id
+`0x07030001`, FD730). Mesa 25.0.7 is cross-compiled for iOS 16.0. The GL path aims to make
+CoreAnimation's OpenGL ES renderer in `backboardd` use freedreno. Turnip provides Vulkan for
+later Metal-on-Vulkan work.
 
-**Status: NOT finished.** The Mesa configure and the GL-side static libraries build.
-negronigl.dylib does not build yet: its sources are incomplete. Turnip does not compile yet.
+## Pinned inputs
 
-## Versions (pins in `scripts/gpu/env.sh`)
-
-| Item | Value |
+| Input | Version |
 |---|---|
-| Mesa | 25.0.7, sha256 `592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6` (archive.mesa3d.org) |
-| freedreno-on-Darwin patches | oosexgang/hackios-xnu-userland `b4c5513e2df93689895d21fd3b93b723a7bcfdd3` (MIT), the same pin as `external/slop/.github/workflows/gpu-mesa.yml`: `freedreno-darwin`, `ir3-round-default`, `ir3-shift-split`, `ir3-ssbo-subdword` (read with `git show COMMIT:tools/mesa/...`) |
-| Our Mesa patch | `userland/negronigl/mesa-patches/0001-negronigl-target.patch` (adds `src/gallium/targets/negronigl`) |
-| Toolchain | Xcode 27.1, iPhoneOS 27.1 SDK, `-target arm64-apple-ios16.0` (checked: LC_BUILD_VERSION minos 16.0), meson 1.7.2 (uv venv `out/gpu/venv`), ninja 1.13.2, brew bison 3.8.2, brew glslang 16.6.0 (needed by Turnip) |
+| Mesa | 25.0.7, SHA-256 `592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6` |
+| HackiOS Darwin patches | `oosexgang/hackios-xnu-userland` `b4c5513e2df93689895d21fd3b93b723a7bcfdd3`, MIT: `freedreno-darwin`, `ir3-round-default`, `ir3-shift-split`, `ir3-ssbo-subdword` |
+| Local Mesa patches | `0001-negronigl-target.patch`, `0002-turnip-darwin.patch` |
+| Cross toolchain | Xcode 27.1 iPhoneOS SDK, `-target arm64-apple-ios16.0`, Meson 1.7.2, Ninja 1.13.2, Homebrew Bison 3.8.2 and glslang 16.6.0 |
 
-## Build steps (macOS; run each one through tmux)
+## Build on macOS
+
+Long jobs use the repository tmux wrapper. It records the log in `logs/gpu-build.log` and the exit
+code in `logs/gpu-build.exit`.
 
 ```sh
-scripts/bg.sh gpu-fetch scripts/gpu/mesa-fetch.sh        # venv, archive + hash, patched tree out/gpu/mesa-25.0.7
-scripts/bg.sh gpu-setup scripts/gpu/mesa-setup.sh        # meson -> out/gpu/mesa-build-ios (copies userland/negronigl in)
-#   NEGRONIGL_TARGET=0 scripts/gpu/mesa-setup.sh         # Mesa + Turnip without our target
-#   VULKAN_DRIVERS= scripts/gpu/mesa-setup.sh            # without Turnip
-scripts/bg.sh gpu-build sh -c 'PATH=$PWD/out/gpu/venv/bin:$PATH ninja -C out/gpu/mesa-build-ios -j$(sysctl -n hw.ncpu)'
+scripts/bg.sh gpu-build scripts/gpu/build.sh
+scripts/bg.sh -s gpu-build
 ```
 
-Linux: `scripts/gpu/env.sh` has a clang + lld + llvm-ar path with `SDK=` pointing to an
-iPhoneOS SDK copied from a Mac. That path is NOT tested.
+The build script fetches the pinned Mesa archive if needed, applies both local patches, configures
+freedreno GLES and Turnip for iOS arm64, builds `negronigl.dylib`, `libvulkan_freedreno.dylib` and
+`ngl_test`, then ad-hoc signs the three Mach-O files. Outputs are in `out/gpu/`. The exact Meson
+setup is in `scripts/gpu/mesa-setup.sh`; `scripts/gpu/env.sh` pins the SDK target and tools.
 
-## Observed results (build `gpu-build1`, NEGRONIGL_TARGET=0, Turnip on)
+Linux cross-builds are not verified. They need an iPhoneOS SDK copied from a Mac and `SDK=/path/to/iPhoneOS.sdk`;
+the script selects clang, lld and LLVM binutils. The Linux path must be confirmed before relying on it.
 
-- Configure: OK (gallium freedreno, vulkan freedreno, freedreno-kmds msm, shared-glapi, GLES2).
-- 737 of 740 steps OK, including `libfreedreno.a`, libmesa, libgallium, glapi.
-- 3 failures, all on the Turnip side:
-  1. `src/vulkan/runtime/vk_drm_syncobj.c`: `drmSyncobjTimelineSignal`, `drmSyncobjSignal`,
-     `drmSyncobjQuery` are not in our `xf86drm.h`.
-  2. `src/vulkan/wsi/wsi_common_drm.c`: `drmDevicePtr`, `drmGetDevice2`, `drmDevicesEqual`,
-     `drmFreeDevice`, `drmSyncobjTransfer` are missing, and `-Werror=missing-prototypes`.
-     There is no window system here, so this file can probably be left out of the build (guess).
-  3. `src/freedreno/vulkan/tu_device.cc:2712`: `pthread_condattr_setclock` does not exist on Darwin.
+Build run `gpu-build` completed with exit 0 on 2026-10-25. `out/gpu/negronigl.dylib` is 15,119,584
+bytes, `out/gpu/libvulkan_freedreno.dylib` is 11,612,528 bytes, and `out/gpu/ngl_test` is 50,256
+bytes. All three are arm64 Mach-O files with `LC_BUILD_VERSION` minimum iOS 16.0 and ad-hoc
+signatures. The Turnip dylib links its own copy of `negroni_drm.c` and `log.c`; `nm -u` showed no
+unresolved DRM symbols. The link uses `-undefined dynamic_lookup`, which Xcode warns is deprecated
+on iOS. `nm -m` reports 650 weak `_wsi_*` symbols as dynamically looked up; their runtime binding
+and the Turnip load path still need a device check.
 
-## What Turnip needs from the kernel ABI (for docs/gpu-abi.md)
+## Installation into a root image
 
-These facts come from the errors above and from Mesa 25.0.7's msm backend. They are not tested on the device.
-- **DRM syncobjs.** The Vulkan runtime syncs the msm Turnip backend with `vk_drm_syncobj`
-  (create, destroy, wait, reset, signal, timeline signal/wait, query, transfer, fd import and export).
-  Two options: (a) the kernel adds syncobj selectors, or (b) negroni_drm.c emulates syncobjs
-  in user space over the msm fence seqnos. With (b), queue submit must accept
-  `MSM_SUBMIT_SYNCOBJ_IN/OUT` without the kernel. Either way the ABI must state it. The
-  scalar ABI rejects these flags today.
-- The same buffer, submit, fence and param requests as freedreno gallium. Turnip also asks
-  for `MSM_PARAM_VA_START/VA_SIZE` (userspace VMA). The emulation answers EINVAL today (msm 1.7 softpin).
+The installer has an explicit guard. Run it only on a mounted scratch or intended root:
 
-## Files
+```sh
+NEGRONIGL=1 scripts/gpu/root-add-negronigl.sh /path/to/MOUNTED_ROOT
+```
 
-- `scripts/gpu/env.sh`, `mesa-fetch.sh`, `mesa-setup.sh`, `sync-target.sh`
-- `userland/negronigl/drm/ngl_abi.h`: the kernel ABI in one header, with two ABIs: scalar
-  (sailfish-style selectors 10-16) and msm struct passthrough (slop 0118 / HackiOS). `NEGRONIGL_ABI` picks one at run time.
-- `userland/negronigl/drm/negroni_drm.c`, `negroni_drm.h`, `xf86drm.h`: libdrm/msm emulation (complete, not compiled yet).
-- `userland/negronigl/{negronigl.c,negronigl.h,log.c,meson.build}`: screen, contexts, self tests, log.
-- `userland/negronigl/surface.c`: **incomplete** (the file stops mid-function).
-- Missing: `eagl.c`, `shaders.c`, `ca_fixes.c`, `gen-gli.py`, `gli-slots.txt`, `exports.txt`,
-  `tools/ngl_test.c`, `scripts/gpu/build.sh`, `scripts/gpu/root-add-negronigl.sh`.
+It installs `/usr/lib/negronigl.dylib`, `/usr/lib/libvulkan_freedreno.dylib` and
+`/usr/lib/vulkan/icd.d/freedreno_icd.json`. It adds
+`DYLD_INSERT_LIBRARIES=/usr/lib/negronigl.dylib` to the `com.apple.backboardd` job's
+`EnvironmentVariables` entry in `System/Library/xpc/launchd.plist`, preserving any existing
+inserted libraries, plist mode and owner. The disposable fake-root check is:
 
-## Kernel-side requirement for injection (not in this scope)
+```sh
+scripts/gpu/test-root-add-negronigl.sh
+```
 
-dyld honours `DYLD_INSERT_LIBRARIES` in backboardd only if the AMFI policy answers
-`amfi_check_dyld_policy_self` (`__mac_syscall("AMFI", 0x5a, ...)`). The slop kernel names
-its policy "NEGRONI AMFI", so dyld ignores the variable. References: ios-flame
-`xnu/patches/0114-flame-amfi-dyld-policy.patch` (MIT), ios-sailfish `0139-sailfish-amfi-dyld-policy.patch`.
+It passed on 2026-10-25. It checks the guard, file copies, existing environment values, idempotence,
+plist mode and owner.
+
+## Kernel interface and limits
+
+`userland/negronigl/drm/ngl_abi.h` supports the scalar `RedwoodGPU` selectors and the MSM struct
+passthrough ABI. The scalar path handles GEM allocation/import, submit, waits, parameters and CPU
+prep. User-space binary syncobjs map to MSM fence sequence numbers; queue-submit input syncobjs wait
+on those fences and output syncobjs receive the returned sequence. `DRM_CAP_SYNCOBJ_TIMELINE` is
+reported as zero. Timeline entry points exist for Mesa compatibility, but timeline points are not
+implemented. Cross-process sync-file/opaque-fd sharing is not supported. The MSM struct ABI's
+kernel-side syncobj submission also remains unimplemented; the default build config selects the
+scalar ABI first.
+
+IOSurfaces are described through the public IOSurface API, imported through the RedwoodGPU
+surface/GEM path and wrapped with Mesa `resource_from_handle`. The current path accepts a single
+plane and formats mapped by `surface.c`. Multi-plane YUV surfaces and the copy fallback for layouts
+that freedreno cannot address are unsupported. `renderbufferStorage:fromDrawable:` still returns
+failure; CoreAnimation's private `attachImage:toCoreSurface:invertedRender:` and
+`texImageIOSurface:` paths use the imported texture resource.
+
+**No phone test has been run.** The kernel GPU service, its IOSurface import behavior, cache
+coherency, fence sequence behavior, CA framebuffer rendering, and backboardd injection must still
+be verified on the device. The userland build alone does not prove the GPU path works. The kernel
+ABI is described in `userland/negronigl/drm/ngl_abi.h`; `docs/gpu-abi.md` is maintained by the kernel
+GPU work and was not present when this userland change was prepared.
+
+## Device testing over SSH
+
+After a root image boots with the kernel GPU service and USB SSH available, use the existing
+`scripts/net/phone-run.sh` workflow. It copies a signed binary to the phone, runs it, prints the
+result and removes the remote copy by default.
+
+```sh
+scripts/net/phone-run.sh -s out/gpu/ngl_test
+SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+clang -target arm64-apple-ios16.0 -isysroot "$SDK" \
+  -Iout/gpu/mesa-25.0.7/include userland/metal/probes/vkprobe.c -o out/gpu/vkprobe
+codesign -s - -f out/gpu/vkprobe
+scripts/net/phone-run.sh -s out/gpu/vkprobe --icd /usr/lib/libvulkan_freedreno.dylib --clear
+```
+
+`ngl_test` checks the GPU identity, a GLES draw/readback and an IOSurface round trip. `vkprobe`
+enumerates Turnip and, with `--clear`, submits a clear and readback. No device results are claimed
+here.

@@ -98,6 +98,23 @@ void ngl_post(int slot);
 #define NGL_POST(i) do { if (__builtin_expect(ngl_check_errors, 0)) ngl_post(i); } while (0)
 void ngl_unsupported(int slot);
 
+/* Hand-written GLI implementations referenced by generated gli_dispatch.c. */
+void ngl_h_DeleteObject(void *, GLuint);
+void ngl_h_ShaderSource(void *, GLuint, GLsizei, const GLchar *const *, const GLint *);
+void ngl_h_CompileShader(void *, GLuint);
+void ngl_h_LinkProgram(void *, GLuint);
+const GLubyte *ngl_h_GetString(void *, GLenum);
+void ngl_h_TexImage2D(void *, GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const GLvoid *);
+void ngl_h_BindTexture(void *, GLenum, GLuint);
+void ngl_h_DeleteTextures(void *, GLsizei, const GLuint *);
+void ngl_h_FramebufferTexture2D(void *, GLenum, GLenum, GLenum, GLuint, GLint);
+void ngl_h_Flush(void *);
+void ngl_h_FinishObjectAPPLE(void *, GLenum, GLint);
+GLboolean ngl_h_TestObjectAPPLE(void *, GLenum, GLuint);
+void ngl_h_FinishFenceAPPLE(void *, GLuint);
+void ngl_h_DrawArrays(void *, GLenum, GLint, GLsizei);
+void ngl_h_DrawElements(void *, GLenum, GLsizei, GLenum, const GLvoid *);
+
 extern void *const ngl_dispatch[NGL_SLOTS];
 extern const char *const ngl_slot_names[NGL_SLOTS];
 

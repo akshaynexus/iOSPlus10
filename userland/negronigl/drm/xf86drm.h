@@ -36,6 +36,10 @@ typedef struct _drmVersion {
 	char *desc;
 } drmVersion, *drmVersionPtr;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 int drmOpenWithType(const char *name, const char *busid, int type);
 int drmIoctl(int fd, unsigned long request, void *arg);
 int drmCommandWrite(int fd, unsigned long index, void *data, unsigned long size);
@@ -43,6 +47,23 @@ int drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long s
 drmVersionPtr drmGetVersion(int fd);
 void drmFreeVersion(drmVersionPtr version);
 int drmGetCap(int fd, uint64_t capability, uint64_t *value);
+
+/* Turnip builds its generic DRM WSI, but iOS has no DRM display device to enumerate. */
+enum { DRM_BUS_PCI = 0, DRM_BUS_USB = 1, DRM_BUS_PLATFORM = 2, DRM_BUS_HOST1X = 3 };
+struct drmPciBusInfo { uint16_t domain; uint8_t bus, dev, func; };
+struct _drmDevice {
+	char **nodes;
+	int available_nodes;
+	int bustype;
+	union { struct drmPciBusInfo *pci; } businfo;
+};
+typedef struct _drmDevice *drmDevicePtr;
+static inline int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
+{ (void)fd; (void)flags; if (device) *device = NULL; return -1; }
+static inline int drmDevicesEqual(drmDevicePtr a, drmDevicePtr b)
+{ (void)a; (void)b; return 0; }
+static inline void drmFreeDevice(drmDevicePtr *device)
+{ if (device) *device = NULL; }
 
 /* "dma-buf" = an IOSurface, by its ID (see redwood_drm_surface) */
 int drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd);
@@ -59,6 +80,11 @@ int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t time
     unsigned flags, uint32_t *first_signaled);
 int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned num_handles,
     int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled);
+int drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t count);
+int drmSyncobjTimelineSignal(int fd, const uint32_t *handles, const uint64_t *points, uint32_t count);
+int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t count);
+int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle,
+    uint64_t src_point, uint32_t flags);
 
 /* Not libdrm: the buffer's memory in this process (replaces mmap() on the device). MAP_FAILED on error. */
 void *redwood_drm_map(int fd, uint32_t handle, uint64_t size);
@@ -73,5 +99,9 @@ struct redwood_drm_surface {
 	uint32_t width, height, pixel_format, planes;
 };
 int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

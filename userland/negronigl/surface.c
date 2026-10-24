@@ -12,6 +12,7 @@
  * are copied into the texture instead and copied again when their seed moves (CPU writes).
  * Design: ios-sailfish tools/sweetgl/eagl.c (bind_surface, copy_surface, surf_res); own code.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,8 +24,11 @@
 #include "frontend/winsys_handle.h"
 #include "util/u_inlines.h"
 #include "drm-uapi/drm_fourcc.h"
+#include "pipe/p_screen.h"
+#include "frontend/winsys_handle.h"
 
 #include "negronigl.h"
+#include "drm/xf86drm.h"
 
 struct ngl_image {
 	struct pipe_resource *res;
@@ -125,26 +129,60 @@ static struct ngl_state *cur_state(void)
 	return ngl_cur ? ngl_cur->st : NULL;
 }
 
-/*
- * NOT IMPLEMENTED in this revision (docs/gpu-userland.md "Open items"): the kernel import ->
- * resource_from_handle -> EGLImage path, the CPU copy fallback and its seed refresh. Until then
- * every IOSurface bind fails (CA then drops that layer) and the functions below do nothing.
- */
 bool
 ngl_bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t plane, const char *why)
 {
-	static int logged;
-	(void)target; (void)format; (void)type;
-	if (logged++ < 20) {
-		ngl_log("negronigl: %s: IOSurface %u plane %u: binding not implemented", why, IOSurfaceGetID(s), plane);
+	static unsigned logged;
+	if (s == NULL || plane != 0 || IOSurfaceGetPlaneCount(s) > 1) return false;
+	size_t w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s), pitch = IOSurfaceGetBytesPerRow(s);
+	unsigned ifmt = 0;
+	enum pipe_format pf = format ? gl_format(format, type, &ifmt) :
+	    surface_format(IOSurfaceGetPixelFormat(s), IOSurfaceGetBytesPerElement(s), &ifmt);
+	bool argb = !format && IOSurfaceGetPixelFormat(s) == 0 && IOSurfaceGetBytesPerElement(s) == 4;
+	if (argb) { pf = PIPE_FORMAT_R8G8B8A8_UNORM; ifmt = GL_RGBA8; }
+	if (pf == PIPE_FORMAT_NONE || !w || !h || pitch > UINT32_MAX) return false;
+	struct redwood_drm_surface info = {.surface = IOSurfaceGetID(s)};
+	if (redwood_drm_surface(-1, &info) != 0) {
+		if (logged++ < 32) ngl_log("negronigl: %s: IOSurface %u describe failed: %d", why, info.surface, errno);
+		return false;
 	}
-	return false;
+	struct pipe_resource templ = {
+		.target = PIPE_TEXTURE_2D, .format = pf, .width0 = (uint32_t)w,
+		.height0 = (uint32_t)h, .depth0 = 1, .array_size = 1,
+		.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET | PIPE_BIND_SHARED,
+	};
+	struct winsys_handle wh = {
+		.type = WINSYS_HANDLE_TYPE_FD, .handle = (int)info.surface,
+		.stride = (unsigned)pitch, .offset = info.offset, .size = info.size,
+		.format = pf, .modifier = DRM_FORMAT_MOD_LINEAR,
+	};
+	struct pipe_screen *screen = ngl_screen();
+	struct pipe_resource *res = screen && screen->resource_from_handle ?
+	    screen->resource_from_handle(screen, &templ, &wh, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE) : NULL;
+	if (res == NULL) {
+		if (logged++ < 32) ngl_log("negronigl: %s: IOSurface %u import failed (%ux%u pitch %u format %#x)",
+		    why, info.surface, (unsigned)w, (unsigned)h, (unsigned)pitch, info.pixel_format);
+		return false;
+	}
+	struct ngl_state *st = cur_state();
+	GLuint tex = 0;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, (GLint *)&tex);
+	if (st) { ngl_copy_forget(st, tex); ngl_set_swizzle(st, target, argb); }
+	struct ngl_image img = {.res = res, .format = pf, .internalformat = ifmt};
+	_mesa_EGLImageTargetTexture2DOES(target, (GLeglImageOES)&img);
+	pipe_resource_reference(&res, NULL);
+	ngl_tex_size(target, 0, (GLsizei)w, (GLsizei)h);
+	if (glGetError() != GL_NO_ERROR) return false;
+	return true;
 }
 
 void
 ngl_copy_forget(struct ngl_state *st, GLuint tex)
 {
-	(void)st; (void)tex;
+	if (st == NULL || tex >= NGL_NAMES) return;
+	struct ngl_copy *c = &st->copies[tex];
+	if (c->surface) CFRelease(c->surface);
+	memset(c, 0, sizeof(*c));
 }
 
 void
@@ -156,6 +194,14 @@ ngl_copy_refresh(struct ngl_state *st, int unit, int *active)
 void
 ngl_set_swizzle(struct ngl_state *st, GLenum target, bool argb)
 {
-	(void)st; (void)target; (void)argb;
-	(void)cur_state;
+	if (st == NULL) return;
+	GLint tex = 0;
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
+	if (tex > 0 && tex < NGL_NAMES && st->tex_argb[tex] != argb) {
+		st->tex_argb[tex] = argb;
+		glTexParameteri(target, GL_TEXTURE_SWIZZLE_R, argb ? GL_ALPHA : GL_RED);
+		glTexParameteri(target, GL_TEXTURE_SWIZZLE_G, argb ? GL_BLUE : GL_GREEN);
+		glTexParameteri(target, GL_TEXTURE_SWIZZLE_B, argb ? GL_GREEN : GL_BLUE);
+		glTexParameteri(target, GL_TEXTURE_SWIZZLE_A, argb ? GL_RED : GL_ALPHA);
+	}
 }
