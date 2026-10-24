@@ -276,3 +276,28 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   in IODisplayParameters) [V disassembly]. Details: patches/xnu/README-brightness.md.
 - The ~10 s power-button-to-dark delay is iOS sending RequestPowerChange late; 0251 adds a kernel
   fast-off on a short power-key press (< 700 ms) [I until tested].
+
+## 14. Metal (2026-10-25, Metal agent)
+
+Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](metal-design.md). Code: `userland/metal/`, `scripts/metal/`.
+
+- Route: NegroniMetal.bundle (`_MTLDevice` subclass) -> UniXNU/ios-flame frontend + bridge (MIT) -> metal2vulkan (AIR -> SPIR-V, Metal on Vulkan; GPL-2.0+ OR LGPL-3.0+) -> Turnip -> kernel [decision, owner priority].
+- ios-flame (Pixel 4, A640) drew the **20H392** home screen with exactly this stack on 2026-10-22; its frontend has the iOS 16 fixes [V ios-flame 745c434 HANDOFF.md "Metal at user quality, step 2"].
+- Metal 20H392 discovery: `IOServiceMatching("IOAcceleratorES")` -> `MetalPluginName` -> `/System/Library/Extensions/<name>.bundle` -> `MetalPluginClassName` or principal class, must subclass `_MTLDevice` -> `initWithAcceleratorPort:` [V disassembly Metal 0x181b144c8, 0x181a3c7c8].
+- A nil from `initWithAcceleratorPort:` is skipped: no device, no crash [V Metal 0x181b14584 `cbz x0`].
+- `MTLAddDevice` is exported; it asserts `MTLDevice` + `MTLDeviceSPI` and calls `initLimits`, `initFeatureQueries` [V Metal 0x181a1b368].
+- iOS 16 has no `MTLCopyAllDevices` (the iOS 27 SDK marks it iOS 18+) [V 20H392 Metal symbols].
+- `_MTLDevice` is 528 bytes on 20H392 (536 on iPadOS 17.7.11: UniXNU's size assert must go) [V ipsw class-dump].
+- AGXMetalA11 227.6.5: principal class `AGXPrincipalDevice : NSObject`; device chain `AGXA11Device : AGXA11FamilyDevice : IOGPUMetalDevice : _MTLDevice` [V class-dump].
+- QuartzCore `default.metallib`: 141 functions (39 vertex, 95 fragment, 7 kernel), AIR 2.5, MSL 3.0; loaded with `newLibraryWithURL:`, specialised with function constants; no `newLibraryWithSource:` [V metallib-info.py, strings].
+- The 20H392 root has 143 metallibs / 16,903 functions; 128 are AIR 2.5 [V `out/metal/spi/metallib-summary.txt`].
+- Apple's MSL front end is on the device (MTLCompilerService, libGPUCompiler 31001.722, libLLVM) separate from the AGX back end [V dsc image list].
+- metal2vulkan 720ef1ce on the Mac, QuartzCore metallib, bare Vulkan 1.2 profile: kernels 3/7, vertex 35/39, fragment 73/95; 20 refusals are FramebufferFetch (Turnip has the extension) [V host-translate.sh; I for Turnip].
+- Mesa 25.0.7 Turnip has **no** `VK_EXT_external_memory_host` (needed for IOSurface textures); UniXNU's `turnip-darwin-kmd.patch` adds it with a kernel host-page import [V tu_device.cc; UniXNU-ios26 patches/mesa].
+- Turnip on Darwin must not read `CTR_EL0` at EL0 (SIGILL) [V UniXNU turnip-darwin-kmd.patch:1394].
+- No PPL on our kernel: the physmap maps managed RAM cacheable, so WC views of managed pages are mismatched aliases; flame used RAM XNU never manages for GPU buffers [V flame HANDOFF 03:40]. Our candidate: 0x900000000-0xA80000000 (outside `--dram 840000000:C0000000`) [I].
+- Mesa FD730 = chip_id 0x07030001, a7xx_gen1, 4 CCU, highest_bank_bit 16 [V Mesa 25.0.7 freedreno_devices.py:1065].
+- Built 2026-10-25: bridge (1 min 46 s), NegroniMetal bundle 21 MB, m2vtest, metalprobe, vkprobe for arm64-apple-ios16.0 [V]; all imports exist in the 20H392 cache (`scripts/metal/check-imports.py` PASS) [V].
+- `ipsw` (brew blacktop/tap/ipsw 3.1.739) reads the 20H392 cache in place: class-dump, disass `--vaddr` (with `--cache` on a writable path: the root mount is read-only), `dyld macho --symbols` [V]. Its nlist dump lacks re-exports (memcpy): check-imports.py also accepts what Apple's own images import [V].
+- CMake for iOS makes `.app` bundles of executables unless `CMAKE_MACOSX_BUNDLE OFF` [V].
+- Gate files on the phone: `/var/db/negronimetal/{clients,off,env,strikes/,cache/,metal.log}`; default clients = probes only, so backboardd keeps the GL path [decision].

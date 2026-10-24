@@ -1,0 +1,15 @@
+# CMake toolchain: iOS 16.0 arm64 (plain arm64, no arm64e: the iPhone X userland of 20H392 is arm64).
+# macOS: the iPhoneOS SDK of Xcode. Linux: clang + lld + an iPhoneOS.sdk copied from a Mac (set SDK).
+set(CMAKE_SYSTEM_NAME iOS)
+set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "")
+set(CMAKE_OSX_DEPLOYMENT_TARGET "$ENV{IOS_MIN}" CACHE STRING "")
+if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET 16.0 CACHE STRING "" FORCE)
+endif()
+if(DEFINED ENV{SDK})
+  set(CMAKE_OSX_SYSROOT "$ENV{SDK}" CACHE PATH "")
+else()
+  set(CMAKE_OSX_SYSROOT iphoneos CACHE STRING "")
+endif()
+set(CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED NO)
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
