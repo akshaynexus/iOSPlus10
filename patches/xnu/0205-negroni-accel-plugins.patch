@@ -1,0 +1,54 @@
+diff --git a/iokit/Kernel/arm/NegroniAccel.cpp b/iokit/Kernel/arm/NegroniAccel.cpp
+index 53debdc..8943b76 100644
+--- a/iokit/Kernel/arm/NegroniAccel.cpp
++++ b/iokit/Kernel/arm/NegroniAccel.cpp
+@@ -5,8 +5,19 @@
+  * "IOAcceleratorES")) 300 times, 100 ms apart, in every process that sets up CA rendering
+  * (backboardd, SpringBoard, apps): about 30 s each (live log: "IOK backboardd: matching1 ...
+  * IOAcceleratorES ... -> none", again and again). This service is found at once. It has no
+- * MetalPluginName / MetalPluginClassName and no user client, so Metal (_MTLRegisterDevices)
+- * passes over it and CoreAnimation keeps its CPU renderer.
++ * user client. Patch 0205 adds the driver plugin names (below); without them Metal
++ * (_MTLRegisterDevices) passes over the service and CoreAnimation keeps its CPU renderer.
++ *
++ * Driver plugin names (0205). Each user-space loader reads its own property; they do not conflict:
++ *  - IOGLESBundleName = "NegroniGL" (boot-arg negronigl, default 1; negronigl=0 removes it).
++ *    libGFXShared gfxInitializeLibrary dlopens /System/Library/Extensions/NegroniGL.bundle,
++ *    the OpenGL ES (GLD) renderer under Apple's GLEngine (docs/gl-renderer-plugin.md).
++ *    We never set IOGLESMetalBundleName, so the OpenGL ES choice does not depend on the
++ *    "UseMetal" preference or IOGLESDefaultUseMetal.
++ *  - MetalPluginName = "NegroniMetal", MetalPluginClassName = "NegroniMTLDevice" (boot-arg
++ *    negronimetal=1, default 0). Metal.framework MTLRegisterDevices loads the bundle and calls
++ *    -initWithAcceleratorPort:; a nil device is skipped (docs/metal-design.md).
++ *  The properties are set before registerService(), so the first lookup already sees them.
+  *
+  * A personality in iokit/KernelConfigTables.cpp attaches it below AppleCLCD (as in ios-sailfish
+  * 0166 and bergamota 0122, after ios-topaz 0138). Boot-arg negroniaccel=0 leaves it out.
+@@ -34,15 +45,24 @@ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ bool
+ IOAcceleratorES::start(IOService *provider)
+ {
+-	uint32_t enabled = 1;
++	uint32_t enabled = 1, gl = 1, metal = 0;
+ 
+ 	PE_parse_boot_argn("negroniaccel", &enabled, sizeof(enabled));
+ 	if (enabled == 0 || !IOService::start(provider)) {
+ 		return false;
+ 	}
++	PE_parse_boot_argn("negronigl", &gl, sizeof(gl));
++	PE_parse_boot_argn("negronimetal", &metal, sizeof(metal));
++	if (gl != 0) {
++		setProperty("IOGLESBundleName", "NegroniGL");
++	}
++	if (metal != 0) {
++		setProperty("MetalPluginName", "NegroniMetal");
++		setProperty("MetalPluginClassName", "NegroniMTLDevice");
++	}
+ 	registerService();
+-	IOLog("NEGRONI ACCEL: empty IOAcceleratorES on %s (no Metal plugin; negroniaccel=0 removes it)\n",
+-	    provider->getName());
++	IOLog("NEGRONI ACCEL: IOAcceleratorES on %s, GL plugin %s (negronigl=%u), Metal plugin %s (negronimetal=%u)\n",
++	    provider->getName(), gl ? "NegroniGL" : "none", gl, metal ? "NegroniMetal" : "none", metal);
+ 	return true;
+ }
+ #endif /* NEGRONI */
