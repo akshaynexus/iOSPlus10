@@ -33,6 +33,21 @@ make flash-boot CONFIRM=yes
 
 Single steps (dry run without `--yes`): `scripts/flash/ios16.sh check|userdata|vendor_boot|vbmeta|dtbo|boot|active`.
 
+## Debugging: live kernel log over USB
+
+The kernel can stream its console over USB Ethernet (slop patches 0072-0077/0119, `negroniusb=2`):
+the phone becomes a CDC-ECM device and sends UDP to `192.168.7.1:5140`. macOS and Linux have a
+built-in CDC-ECM driver.
+
+```sh
+make boot-debug                         # out/ios16-debug: negroniusb=2, kernel log on the panel too
+make usblog                             # listener (sudo once: tmux attach -t usblog) -> logs/usblog-*.txt
+make flash-boot-debug CONFIRM=yes       # phone in fastboot (Volume Up + Volume Down + Power)
+```
+
+`scripts/debug/usblog.sh` waits for the interface (host MAC `02:00:5e:77:ee:01`), sets
+`192.168.7.1/24` and writes every line with a host timestamp.
+
 ## Back to Android
 
 ```sh
