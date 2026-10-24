@@ -12,10 +12,12 @@ Read first: `docs/plan.md` (status and next step), `docs/research-report.md` (st
 - **All work lives in this repo.** Every step is a script in `scripts/` (or `docker/`), documented in
   `docs/`, and works on macOS and Linux. Do not leave work in `/tmp`, scratch folders or one-off
   shell commands. Build products go to `out/`, logs to `logs/` (both git-ignored).
-- **Long tasks run in tmux**, never as a foreground or agent-background command: builds, downloads,
-  partition dumps, flashing of large images, CI waits. Use `scripts/bg.sh NAME COMMAND...`; check with
-  `scripts/bg.sh -s NAME`; the log is `logs/NAME.log`, the exit code `logs/NAME.exit`. The job must
-  survive the end of the agent session.
+- **Everything that can take more than a few seconds runs in tmux**, never in the foreground and
+  never as an agent-background command: downloads (curl, aria2c, `gh run download`, remotezip),
+  every `docker build` / `docker run` / `scripts/in-docker.sh` call, Mu and shim builds, partition
+  dumps, image conversion, large fastboot flashes, CI waits. Use `scripts/bg.sh NAME COMMAND...`;
+  check with `scripts/bg.sh -s NAME`; the log is `logs/NAME.log`, the exit code `logs/NAME.exit`.
+  The job must survive the end of the agent session. Foreground commands are only for quick checks.
 - **Commit and push** completed steps to `origin main` (private repo akshaynexus/iOSPlus10). Update
   `docs/plan.md` after each milestone: what was done, exact results, what is next. Separate
   observations from guesses.

@@ -1,0 +1,58 @@
+# OnePlus 10 Pro NE2211 board config for the iOS 16 track (from external/UniXNU-negroni/board.toml,
+# made on an NE2213). Paths are relative to the iOSPlus10 repo.
+
+[board]
+name = "negroni"
+soc = "SM8450"
+model = "NE2211"
+
+[kernel]
+# xnu-8796 + slop negroni-ios/xnu/patches, built by the slop CI (public artifact, no secrets)
+repo = "MellysInformejtik/slop"
+workflow = "negroni-ios"
+artifact = "negroni-ios-kernel"
+macho = "kernel.development.negroni"
+run = "40007883255"                 # newest green run on 2026-10-24 (kernel 0124); artifact expires 2027-01-21
+
+[adt]
+tool = "external/slop/negroni-ios/tools/mkadt.py"
+# 3 GiB of kernel RAM at 0x840000000. Measured NE2211 (docs/device-facts.md): 9 GiB contiguous there.
+args = ["--board", "negroni", "--ufs", "--dram", "840000000:C0000000", "--darwinboot"]
+
+[payload]
+tool = "external/slop/negroni-ios/tools/mkdarwinboot.py"
+volume = "NEGRONIESP"
+size_mib = 64
+timeout = 3
+kernel_args = [
+  "debug=0xc",
+  "serial=3",
+  "cpus=8",
+  "keepsyms=1",
+  "-noprogress",
+  "rd=ufsroot0",
+  "ufsrw=1",
+  "rootrw=1",
+  "unentitled_ios_sim_launch=1",
+  "ignition_level=1",
+  "wdt_test=no_user_checkin",
+  "launchd_unsecure_cache=1",
+  "wdt=-1",
+  "negronikeys=1",
+  "negronitouch=1",
+  "negroniusb=0",
+  "negronisample=-",
+  "negronifb_noconsole=1",
+  "negronifb_clockshift=100",
+  "negroniwifi=4",
+]
+
+[bootimg]
+# boot_a: ios-sweet shim (BOARD=negroni) as kernel; ramdisk = Mu FD, padded to 1 MiB, + payload FAT
+header_version = 4
+pagesize = 4096
+os_version = "12.0.0"
+os_patch_level = "2026-03-00"
+cmdline = "bootconfig"
+# vendor_boot_a: header v4 with only the mainline DTB (ABL takes the DTB from vendor_boot only)
+dtb = "external/Mu-Silicium-negroni/Platforms/OnePlus/negroniPkg/FdtBlob/sm8450-oneplus-negroni.dtb"
