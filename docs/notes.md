@@ -19,13 +19,27 @@ touch; power/volume keys; USB live kernel log (`make usblog`).
 (no fuel gauge driver) · sound (no ADSP/AudioReach stack) · display brightness and sleep (no backlight
 service, no DCS command) · reboot to fastboot from iOS · widgets show "Waiting..." · first boot ~16 min.
 
-**Built, not flashed yet (2026-10-25 00:20):** kernel out/kernel/local-20261024-184940 (all 15 patches
-0200-0260, sha256 f8091a66...), boot_a.img 59f3dc82..., root ~/op10-apple/ios16-root.simg f0ec8142... (SSH,
-Bold Text off, 9 jobs dropped). Older notes below:
+**Current flash state (2026-10-25 01:45, all flashed and booting [V]):** kernel
+`out/kernel/local-20261024-191117`, `boot_a.img` `faf50996...`, root `~/op10-apple/ios16-root.simg`
+`f0ec8142...` (Bold Text off), `vendor_boot_a` `c29329e0...`, `vbmeta_a` verification off, `dtbo_a`
+erased, slot a. iOS reaches userspace (launchd, backboardd, SpringBoard, datamigrator) on first boot
+in ~1 min [V: `logs/usblog.log` 01:45:17-01:47].
+
+**fastbootd entry, the fix that was missing [V] 2026-10-25:** `fastbootd` boots the KERNEL from
+`boot_a` (with the recovery ramdisk), so with the shim in `boot_a` every `fastboot reboot fastboot`
+and every recovery boot ran the shim on the wrong initrd -> red `LOADER no SWEETXNU payload` screen
+(loader.c:89 magic check, 3 min auto-reset). Fix: flash stock `boot_a` from `~/op10-backup/images`
+before the fastbootd step, flash `userdata`, then write our `boot_a` in the bootloader steps
+(`scripts/flash/ios16.sh recovery` now does this). `fastboot boot recovery.img` is rejected by the
+ABL (`Failed to load/authenticate boot image: Bad Buffer Size`) [V].
+
+**Known gap: the screen stays black at boot until `backboardd` sets brightness [V]** (`NEGRONI BL:
+panel DBV 1024` at 01:45:30, ~13 s after the USB console comes up); the shim/Mu/Apple-logo phases
+never light the panel. Patches 0250/0251 (DCS 0x51) are not in this build. Owner accepts it for now.
 
 - `out/ios16/` normal image: ADT with `/chosen` MAC addresses, `negroniusb=2`, `negronifb_noconsole=1`
   (no debug text over the UI). Fixes the 16 min first boot [I: same fix worked in 3 other ports].
-- `~/op10-apple/ios16-root.simg` (sha256 `3630f5f7...`) with all `root-tweaks-extra.py` tweaks.
+- `~/op10-apple/ios16-root.simg` (sha256 `f0ec8142...`) with all `root-tweaks-extra.py` tweaks.
 - Flash both: `make flash CONFIRM=yes` (needs the owner's approval, phone in fastboot).
 
 **In progress (agents, 2026-10-24), each in its own worktree `out/kernel/wt-*`, outputs below:**

@@ -1,71 +1,104 @@
 # QCA6490 Wi-Fi plan for iOS 16.7.16
 
-Target: NE2211 / SM8450, Qualcomm QCA6490-class WLAN on PCIe0. Linux identifies
-PCI ID `17cb:1103` as WCN6855; the current port uses the WCN6855 hw2.1 ath11k
-profile as its starting point. The goal is a native kernel interface that iOS
-uses as `en0`; USB networking remains a separate debug path.
+Goal: a native kernel Wi-Fi driver for the NE2211 that iOS uses as `en0` (wifid, configd, the
+Settings page). USB networking stays the debug path. Marks: **[V]** seen (source given),
+**[I]** inference.
 
-## Current evidence
+Status (2026-10-25): no Wi-Fi. The kernel has a step-by-step PCIe0 survey (steps 1-9, slop) and
+our read-only step 10 (patch 0260). Steps 5-10 have never run on any phone. There is no MHI,
+QMI or WMI code. Firmware files are extracted (`scripts/wifi/extract-fw.sh`).
 
-- The existing survey patch reads the PCIe0 clock/pin/cmd-db state at steps 1–4.
-- Steps 5–8 vote PCIe clocks and Wi-Fi supplies, release reset, initialize the
-  SM8450 PCIe PHY/root port, and wait for DLLLA. Step 9 reads endpoint ID, class,
-  BAR0 and BAR1. These are code paths; no NE2211 runtime result is recorded in
-  this repo as of 2026-10-24.
-- The current code does not program an endpoint BAR, establish a host virtual
-  mapping for the WLAN register aperture, or enable MSI/MSI-X. New step 10 only
-  inventories the BAR value and interrupt capability list. It does not alter
-  endpoint config space.
-- `negroniwifi=4` is already in the normal config and is read-only. The active
-  stage (a) probe is separately guarded by `negroniwlan=1` and has not been run.
-- Linux ath11k maps WCN6855 hw2.1 to its PCI/MHI path; the Linux source is the
-  protocol reference, not code copied into this port. See the Linux
-  [ath11k PCI driver](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/ath/ath11k/pci.c),
-  [WCN6855 hardware parameters](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/ath/ath11k/core.c),
-  and [MHI interface](https://github.com/torvalds/linux/blob/master/include/linux/mhi.h).
-- Sailfish provides a tested upper-layer design for its different QCA6174 chip:
-  Apple80211-facing IOKit interface, scan/connect state, EAPOL handling and
-  WPA2-PSK handshake. Reuse the design only; it does not establish ath11k/MHI
-  compatibility. See `external/ios-sailfish/xnu/patches/0172*` through `0175*`.
+## Hardware facts
 
-## Stages and estimates
+| Fact | Source |
+|---|---|
+| Chip: `qcom,cnss-qca6490` on PCIe0 (`qcom,wlan-rc-num = 0`), PCI ID 17cb:1103 expected | `out/live.dts:13840-13878`, `negroni_wifi.c` CHIP_ID [V] |
+| Linux drives 17cb:1103 as `WCN6855_DEVICE_ID`; it picks hw2.0 / hw2.1 (or QCA2066 / QCA6698AQ) from TCSR_SOC_HW_VERSION and TCSR_SOC_HW_SUB_VER, read through BAR0. So "hw2.1" is not known for our chip until BAR0 is mapped | Linux `ath11k/pci.c` `ath11k_pci_probe` [V]; our chip version [I, unknown] |
+| Supplies (DT, µV): aon pmr735a_s2 1012000, dig pm8350_s11 966000, io pm8350_s10 1800000, rfa1 pm8350c_s1 1900000-2100000, rfa2 pm8350_s12 1350000, **antenna switch pmr735a_l7 2800000** | `out/live.dts:13860-13871` + phandles 0xc4/0xae/0xc5/0xaf/0xb0/0xb1 [V] |
+| Step 6 votes only the first five supplies; it does not vote `wlan-ant-switch` (L7 of PMR735A). Needed for RF, probably not for the PCIe link | `negroni_wifi.c` step_chip_on [V]; effect [I] |
+| GPIOs: WLAN_EN 80, BT_EN 81, SW_CTRL 82, XO_CLK 204; PCIe0 PERST 94, WAKE 96 | `out/live.dts:13844-13858,20794-20795` [V] |
+| PCIe0: `qcom,pci-msm`, PARF 0x1c00000, PHY 0x1c06000, DBI 0x60000000, config 0x60100000, memory window 0x60300000 + 0x3d00000; `qcom,boot-option = 1` (Android enumerates only when cnss asks) | `out/live.dts:20778-20819` [V] |
+| MSI goes through the **GICv3 ITS** at 0x17140000: `msi-map` RID 0x100 (bus 1) -> ITS DeviceID 0x5981. The SPI-based `qcom,pcie0_msi@0x17110040` node is `status = "disabled"` | `out/live.dts:1327-1332,20793,20866-20873` [V] |
+| Our XNU tree has GICv3 code but no ITS / LPI code (`git grep GITS_` finds nothing) | `out/kernel/xnu` [V] |
+| Legacy INTx: INTA..INTD = GIC SPI 0x95..0x98, global int SPI 0x8c. ath11k asks only for MSI (`PCI_IRQ_MSI`, 32 vectors or 1); it has no INTx path | `out/live.dts:20788-20792` [V]; `ath11k/pci.c:438-460` `ath11k_pci_alloc_msi` [V] |
+| DMA: PCIe0 is behind the apps SMMU: `iommu-map` RID 0x100 -> SID 0x1c01; the cnss IOVA pool is 0xa0000000 + 0x10000000; 32 MiB CMA `cnss_wlan_region` | `out/live.dts:20818,20846-20862,326-332` [V] |
+| `qcom,wlan-cbc-enabled`: Android runs cold-boot calibration before mission mode | `out/live.dts:13853` [V] |
 
-Effort is engineering time after a usable XNU build is available. Estimates do
-not include time waiting for Xcode 15 CI or collecting a device log.
+## Firmware (stock modem image)
 
-| Stage | Work and exit evidence | Effort | USB kernel log / SSH checks |
+`scripts/wifi/extract-fw.sh` copies the files from `image/` of the NON-HLOS (modem) FAT image.
+The modem partition holds all WLAN firmware on this phone; there is no `wpss` file (that is the
+WCN6750 design) [V: `out/firmware/wlan/LISTING.txt`].
+
+| File | Use | Source |
+|---|---|---|
+| `amss.bin` (5609392 B), `amss20.bin` (5287936 B) | WLAN firmware, both `WLAN.HSP.2.0-01229`. Qualcomm cnss2 loads `amss20.bin` when the MHI device major version is 2, else `amss.bin` | strings [V]; cnss2 `pci.c` `cnss_pci_update_fw_name` (Xiaomi marble kernel) [V] |
+| `m3.bin` (266684 B) | M3 firmware; the host gives it to the chip over QMI (`m3_info`) | ath11k `qmi.c` `ath11k_qmi_wlanfw_m3_info_send` [V] |
+| `regdb.bin` | regulatory database (QMI BDF type REGDB) | ath11k `qmi.c` [V] |
+| `bdwlan.eNN` (170 files, incl. `bdwlan.elf`) | board data, ELF. NN = QMI board id in hex; `bdwlan.elf` for board id 0xFF | cnss2 `qmi.c` `cnss_get_bdf_file_name` [V] |
+| `bdwlang.eNN` (24 files) | board data for "GF" chips (QMI chip_id & 0x10) | cnss2 `qmi.c` `CHIP_ID_GF_MASK` [V] |
+| `Data.msc`, `qca6490/Data20.msc` | firmware debug-message decode tables; not needed to run | [I] |
+
+There is no `board-2.bin`. It is not needed: ath11k sends an ELF board file as BDF type ELF
+(`ath11k_qmi_load_bdf_qmi` checks the ELF magic) [V]. Pick the file from the board id and chip id
+of the QMI target capability [V cnss2]. Open question [I]: the Android `WLAN.HSP.2.0` firmware
+expects the cnss2 + qcacld host; ath11k (our protocol reference) is tested with the
+linux-firmware `WCN6855/hw2.x` builds. Feature mismatches in WMI are possible.
+
+Firmware buffer source: the port already loads firmware from areas at the end of `userdata`
+(slop 0103 GPU area, patch 0240 ADSP area, [audio-plan.md](audio-plan.md)) [V]. WLAN needs one
+more area or a slot in an existing one: amss20.bin + m3.bin + one board file + regdb ≈ 5.6 MiB [V sizes].
+
+## Stages and effort
+
+Effort is focused engineering time after the local kernel build (`make kernel-local`), without
+waiting for device tests. Ranges are honest guesses [I]: ath11k is far larger than the ath10k
+driver that Sailfish ported (HAL SRNG rings, REO/WBM, HTT, QMI with many TLVs).
+
+| Stage | Work and exit evidence | Effort [I] | Checks |
 |---|---|---:|---|
-| **a. PCIe link, BAR, interrupts** | Confirm safe supply/clock sequence, `17cb:1103`, link speed/width, BAR sizing and a stable CPU mapping; route MSI/MSI-X or document a working poll/INTx fallback. Existing code reaches link training and reads ID/BAR; BAR assignment and interrupt delivery remain unimplemented. | 2–4 days | USB log: `NEGRONI WIFI: 8 link UP`, endpoint ID, BAR values, MSI/MSI-X capability, then register read/write sanity checks. SSH: `ioreg -l` for the WLAN service and `ifconfig` only after a real interface is published. |
-| **b. MHI and SBL firmware** | Build MHI controller state from the device registers; establish DMA-safe buffers and interrupts; load the SBL image with BHI/BHIe and observe transition from RESET to SBL/RDDM/mission-ready. Firmware bytes are extracted by `scripts/wifi/extract-fw.sh`. Current code does not initialize MHI or issue BHI. | 4–7 days | USB log: MHI version/state, BHI error/status, transfer completion, execution environment and timeout detail. SSH: service remains attached; kernel log shows state transition and no reset loop. |
-| **c. QMI/QRTR and calibration** | Bring up QRTR-over-MHI; implement WLFW QMI service registration; provide AMSS, board data and calibration; complete `msa_ready`, board download, `cal_report`, `FW_READY`, and mission mode. Stock image contains `amss.bin`, `m3.bin`, `regdb.bin`, and `bdwlan.*`; no `board-2.bin` is listed, so generate or convert board data only after confirming format. | 5–8 days | USB log: QRTR node/service IDs, QMI transaction results, board/cal transfer sizes, firmware-ready indication. SSH: radio service status and firmware version; no interface is expected yet. |
-| **d. WMI/HTC/HTT data path and scan** | Implement boot-time WMI control, HTC services, HTT rings, DMA ownership/cache handling, management/data RX/TX and passive scan. Match the exact WCN6855 hw2.1 hardware parameters. | 1–2 weeks | USB log: target capabilities, WMI ready, HTC service map, ring setup, scan start/completion, BSS count and RX/TX completion counters. SSH: `ioreg` sees radio; scan results appear through the kernel interface diagnostics. |
-| **e. Apple80211 interface, connect and security** | Publish the interface in the form iOS expects, with `en0` naming and Apple80211 selectors consumed by `wifid`/MobileWiFi. Reuse Sailfish's IOKit/network interface design. Start with WPA2-PSK/CCMP and the existing kernel-side EAPOL handshake model. Add WPA3-SAE only with a defined iOS userland/key-management contract; do not claim WPA3 from the WPA2 path. | 1–3 weeks | USB log: IOKit match, interface attach, scan/join and EAPOL/key-install events. SSH: `ioreg -r -c IOEthernetInterface`, `ifconfig en0`, `networksetup -listallhardwareports`, then DHCP/route/DNS and reachability. |
-| **f. Power and suspend** | Add safe radio power-down, wake, suspend/resume, runtime power management and error recovery after steady-state traffic is proven. Keep board rails and reset sequencing aligned with SM8450 and QCA firmware behavior. | 4–7 days | USB log: suspend entry/exit, wake reason, MHI state restore and bounded recovery after link loss. SSH: repeat scan/connect/traffic across sleep/wake and check that `en0` remains attached. |
+| **0. Survey on the phone** | Boot once with `negroniwlan=1` (steps 1-10: supplies, link, ID, capabilities). Exit: `NEGRONI WIFI: 9 THE QCA6490 ANSWERS ON PCIe` and step 10 shows MSI/MSI-X. Owner approval needed (it writes GCC/TLMM/PCIe registers and powers the chip). | 1 day | `make usblog`: lines `NEGRONI WIFI: 5..10`, badge `WIFI OK 10` |
+| **a. BAR, SMMU, interrupts** | Assign BAR0 in the 0x60300000 window, enable memory decode + bus master on the endpoint, map BAR0, read TCSR_SOC_HW_VERSION (hw2.0 / hw2.1). Set up an SMMU stream for SID 0x1c01 (bypass or a context bank; the GPU code in `negroni_adreno.c` already programs SMMU CB/SMR). Interrupts: start with polling of the MHI rings; MSI needs a GICv3 ITS driver (DeviceID 0x5981), new code for this XNU. | 1-2 weeks (polling); +1-2 weeks for ITS MSI | USB log: BAR0 value, soc_hw_version, a DMA test write seen by the chip |
+| **b. MHI + firmware download** | MHI controller: BHI for the first 512 KiB (SBL), BHIe for the full image (ath11k `mhi.c`: `sbl_size = SZ_512K`, `seg_len = SZ_512K`, `fbc_download = true`), event/command rings, then EE AMSS and mission state. Firmware from a userdata area. | 1-2 weeks | USB log: MHI state, BHI status, EE changes, no reset loop |
+| **c. QRTR + QMI (WLFW)** | QRTR over the MHI `IPCR` channels. WLFW sequence as in ath11k: server arrive -> `ind_register` + `host_cap` -> REQUEST_MEM indication -> `respond_mem` (host DMA memory for the firmware) -> FW_MEM_READY -> `target_cap` (board id, chip id) -> BDF + regdb download -> `m3_info` -> FW_READY -> `wlan_cfg` + mode. Cold-boot calibration may be needed (`qcom,wlan-cbc-enabled`). | 2-3 weeks | USB log: each QMI response result, board id, firmware version, FW_READY |
+| **d. HTC/WMI/HTT, HAL rings, scan** | Copy engines, HTC services, WMI init/ready, HAL SRNG setup, HTT rings, RX/TX descriptors, then a passive scan. Use the hw params of the detected hw revision (`ath11k/core.c`). | 4-8 weeks | USB log: WMI ready, ring setup, scan results (BSS count) |
+| **e. Apple80211 + en0, WPA2** | Port the Sailfish upper half: `0174` (frames to en0, kernel DHCP), `0175` + `0175-stage-ionetworking.sh` (IOEthernetController, configd names it en0), `0178` (GTK rekey, rejoin), `0179` (Apple80211 events and requests for wifid). WPA2-PSK/CCMP first; WPA3-SAE is separate work. | 2-4 weeks | SSH: `ifconfig en0`, `ioreg -r -c IOEthernetInterface`, DHCP, ping; the Settings page lists networks |
+| **f. Power** | Radio off/on, suspend/resume, recovery after a firmware crash. | 1-2 weeks | repeat scan/join/traffic across sleep |
 
-## Patch scope in this round
+Total [I]: about 3-5 months of focused work for WPA2 Wi-Fi.
 
-`0260-negroni-wlan-pcie-inventory.patch` adds the opt-in `negroniwlan=1`
-path. It runs existing steps 1–9 and reads PCI BAR0 and the standard MSI/MSI-X
-capability list. It does not enable an interrupt, assign BARs, or download
-firmware. The source and patch are marked untested on hardware. Stage (b) is
-planned, not implemented: XNU needs a verified BAR/DMA mapping and a firmware
-buffer source before a BHI DMA transfer is safe. The current port has not
-validated those prerequisites.
+Sailfish (Pixel 1, QCA6174, ath10k) is the reference for the iOS side: its README says the
+Settings page scans, joins WPA2 networks, gets DHCP and Safari loads pages
+(`external/ios-sailfish/README.md:17,32,41`) [V]. Its transport (BMI, ath10k CE/HTT) does not
+apply to QCA6490 (MHI, ath11k) [V: `0170`-`0172` patch headers]. Sailfish has no license file:
+read it as a design reference; do not copy its code ([external-repos.md](external-repos.md)).
 
-## iOS upper-half integration
+## Patch 0260 (this round)
 
-The long-term interface is a kernel-owned `IOEthernetController`/`IOEthernetInterface`
-plus Apple80211 behavior that `wifid` recognizes as `en0`. A plain `ifnet` does
-not make a working Wi-Fi device: scan, association, keys, link state and
-network-service matching must all agree. Sailfish supports the proposed
-interface and WPA2 shape, but its QCA6174 firmware protocol cannot be reused for
-QCA6490. Stage WPA2-PSK/CCMP first; treat WPA3 as a separate capability that
-requires a tested SAE path and userland integration.
+`patches/xnu/0260-negroni-wlan-pcie-inventory.patch` adds step 10 and the boot-arg
+`negroniwlan=1` (default 0). Details: `patches/xnu/README-wifi.md`.
 
-## Firmware extraction
+## Firmware extraction (macOS and Linux)
 
-Run `scripts/wifi/extract-fw.sh` directly for a quick local image, or use
-`scripts/bg.sh wifi-fw scripts/wifi/extract-fw.sh` for OTA payload extraction.
-The script uses `payload-dumper-go` and the repo's read-only `fatcopy.py` reader.
-Firmware and checksums are written under ignored `out/firmware/wlan/` and must
-not be committed. Check `SHA256SUMS` before using firmware in later stages.
+```
+scripts/bg.sh wifi-fw scripts/wifi/extract-fw.sh             # out/firmware/modem/modem.img, else the OTA
+scripts/bg.sh wifi-fw scripts/wifi/extract-fw.sh --dump      # the partition dump modem_a.img.gz
+scripts/bg.sh -s wifi-fw                                     # status + last lines of logs/wifi-fw.log
+```
+
+Needs `python3` and, for the OTA path, `payload-dumper-go` (macOS: `brew install
+payload-dumper-go`; Linux: the release binary, [setup-linux.md](setup-linux.md)). Output:
+`out/firmware/wlan/` (git-ignored) with `LISTING.txt` and `SHA256SUMS`; 198 files on
+NE2211_16.0.3.530 (modem.img sha256 `bcd07e89...`) [V: logs/wifi-fw.log, 2026-10-25].
+Never commit these files.
+
+## References
+
+- Linux ath11k: [pci.c](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/ath/ath11k/pci.c),
+  [core.c](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/ath/ath11k/core.c) (hw params),
+  [mhi.c](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/ath/ath11k/mhi.c),
+  [qmi.c](https://github.com/torvalds/linux/blob/master/drivers/net/wireless/ath/ath11k/qmi.c);
+  MHI host: `drivers/bus/mhi/host/`.
+- Qualcomm cnss2 (file names, board id rules): e.g. [Xiaomi marble kernel cnss2](https://github.com/Pzqqt/android_kernel_xiaomi_marble/tree/HEAD/drivers/net/wireless/cnss2) `pci.c`, `qmi.c`.
+- Existing negroni PCIe code: `external/slop/negroni-ios/xnu/patches/0106` (survey), `0109`
+  (cmd-db), `0120` (PCIe link), `0122-negroni-wifi-supply-votes` (RPMh votes).

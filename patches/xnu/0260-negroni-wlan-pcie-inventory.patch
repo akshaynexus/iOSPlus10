@@ -1,24 +1,24 @@
 diff --git a/bsd/dev/negroni_wifi.c b/bsd/dev/negroni_wifi.c
-index 6d988e5..511c860 100644
+index 6d988e5..0f2354d 100644
 --- a/bsd/dev/negroni_wifi.c
 +++ b/bsd/dev/negroni_wifi.c
-@@ -19,6 +19,7 @@
+@@ -19,6 +19,8 @@
   *   8  writes  the root port (bridge class, bus 0 -> 1), iATU 0 bus 1 config at 0x60100000 (ECAM layout),
   *              iATU 1 memory 0x60300000-0x63ffffff; PERST high, LTSSM on, waits for the link (DLLLA)
   *   9  reads   bus 1 config space: the chip's vendor/device (17cb:1103), class, BAR0
-+ *  10  reads   PCI capability list: BAR assignment and MSI/MSI-X capability presence
++ *  10  reads   bus 1 command/status, BAR0 type and the PCI capability list (MSI / MSI-X present?);
++ *              no config-space writes. negroniwlan=1 runs 1..10 (same as negroniwifi=10)
   *
   * Addresses: sm8450.dtsi pcie@1c00000 / phy@1c06000, gcc-sm8450.c, the phone's DT.
   */
-@@ -459,20 +460,75 @@ step_chip(void)
+@@ -459,17 +461,71 @@ step_chip(void)
  	return id == CHIP_ID;
  }
  
-+/* Read the standard PCI capability list after step 9. The independent
-+ * Apple80211 upper-layer design reference is ios-sailfish patch 0175; it does
-+ * not define this PCI inventory or QCA6490 transport. Do not assign BARs or
-+ * enable interrupts here: the current port has no verified endpoint aperture
-+ * or XNU MSI route. This is an explicit, opt-in inventory step. */
++/* The endpoint's command/status, BAR0 type and capability list (PCI 3.0 6.7: status bit 4,
++ * pointer at 0x34, ID 0x05 MSI, 0x11 MSI-X). Reads only: no BAR is assigned and no vector is
++ * enabled (no XNU MSI route exists for PCIe0 yet). Linux ath11k_pci_probe sizes BAR0 and
++ * enables MSI only after this point. */
 +static bool
 +step_pci_caps(void)
 +{
@@ -27,18 +27,19 @@ index 6d988e5..511c860 100644
 +	bool msi = false, msix = false;
 +
 +	if (!linked || !cfg_bus1) {
-+		printf("NEGRONI WLAN: 10 stop: PCIe config space is not available\n");
++		printf("NEGRONI WIFI: 10 stop: no bus 1 config space (step 9)\n");
 +		return false;
 +	}
++	announce("read the chip's PCI capability list (read only)");
 +	command = rd(cfg_bus1 + 0x04);
 +	status = command >> 16;
 +	bar0 = rd(cfg_bus1 + 0x10);
-+	printf("NEGRONI WLAN: 10 BAR0 %#x (%s, %s), command %#x, status %#x\n",
++	printf("NEGRONI WIFI: 10 BAR0 %#x (%s, %s), command %#x, status %#x\n",
 +	    bar0, (bar0 & 1) ? "I/O" : "memory",
 +	    (bar0 & 1) ? "n/a" : ((bar0 & 6) == 4 ? "64-bit" : "32-bit"),
 +	    command & 0xffff, status);
 +	if (!(status & (1u << 4))) {
-+		printf("NEGRONI WLAN: 10 endpoint reports no capability list\n");
++		printf("NEGRONI WIFI: 10 endpoint reports no capability list\n");
 +		return true;
 +	}
 +	cap = rd(cfg_bus1 + 0x34) & 0xff;
@@ -48,24 +49,24 @@ index 6d988e5..511c860 100644
 +		uint32_t next = (header >> 8) & 0xff;
 +		if (id == 0x05) {
 +			msi = true;
-+			printf("NEGRONI WLAN: 10 MSI capability at %#x control %#x\n", cap, (header >> 16) & 0xffff);
++			printf("NEGRONI WIFI: 10 MSI capability at %#x control %#x\n", cap, (header >> 16) & 0xffff);
 +		} else if (id == 0x11) {
 +			msix = true;
-+			printf("NEGRONI WLAN: 10 MSI-X capability at %#x control %#x\n", cap, (header >> 16) & 0xffff);
++			printf("NEGRONI WIFI: 10 MSI-X capability at %#x control %#x\n", cap, (header >> 16) & 0xffff);
 +		}
 +		if (!next || next == cap) {
 +			break;
 +		}
 +		cap = next;
 +	}
-+	printf("NEGRONI WLAN: 10 interrupt inventory: MSI %s, MSI-X %s; no vector enabled\n",
++	printf("NEGRONI WIFI: 10 interrupt inventory: MSI %s, MSI-X %s; no vector enabled\n",
 +	    msi ? "present" : "absent", msix ? "present" : "absent");
 +	return true;
 +}
 +
  static bool (*const steps[])(void) = {
 -	step_gcc, step_pins, step_rails, step_pcie, step_power, step_chip_on, step_phy, step_link, step_chip,
-+step_gcc, step_pins, step_rails, step_pcie, step_power, step_chip_on, step_phy, step_link, step_chip, step_pci_caps,
++	step_gcc, step_pins, step_rails, step_pcie, step_power, step_chip_on, step_phy, step_link, step_chip, step_pci_caps,
  };
  
  void
@@ -77,13 +78,9 @@ index 6d988e5..511c860 100644
  
  	(void)PE_parse_boot_argn("negroniwifi", &last, sizeof(last));
 +	(void)PE_parse_boot_argn("negroniwlan", &wlan, sizeof(wlan));
++	if (wlan) {
++		last = (uint32_t)(sizeof(steps) / sizeof(steps[0]));   /* opt-in: power, link, ID, step 10 */
++	}
  	if (negroni_probe_wifi != ~0u) {
  		last = negroni_probe_wifi;      /* probe menu (negroni_keys.c) */
  	}
-+	if (wlan) {
-+		/* Separate opt-in: run the complete PCIe stage and read-only BAR/MSI inventory. */
-+		last = (uint32_t)(sizeof(steps) / sizeof(steps[0]));
-+	}
- 	(void)PE_parse_boot_argn("negroniwifi_pause", &pause_ms, sizeof(pause_ms));
- 	if (last == 0) {
- 		return;
