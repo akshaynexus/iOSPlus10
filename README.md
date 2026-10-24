@@ -62,6 +62,11 @@ external/                submodules (see below)
 | `external/UniXNU-zeta` | none24smu/UniXNU-zeta | iOS 26 on Surface Duo 2 (no PAC): reference |
 | `external/UniXNU-pong` | Chengdong-Yu/UniXNU-pong | iOS 16 on Nothing Phone 2 (SM8475, Adreno 730): reference |
 | `external/ios-sailfish` | joranv1/ios-sailfish | iOS 16 on Pixel 1 with working GPU (Mesa freedreno + EAGL shim): GPU reference |
+| `external/ios-sweet-upstream` | dipa-studio/ios-sweet | Upstream of all the sweet-based ports (same commit as our fork today) |
+| `external/bergamota` (`develop`) | ry-diffusion/bergamota | iOS 18.7.8 on POCO F1, **iOS 18 kernel**: reference for the newer-kernel path |
+| `external/ios-apollo` | aTechGeekDev/ios-apollo | iOS 16 on Mi 10T 5G (SM8250): memory-address port of ios-sweet |
+| `external/ios-flame` | NWylynko/ios-flame | iOS 16 on Pixel 4 (SM8150) |
+| `external/hackios-xnu-kernel`, `external/hackios-xnu-userland` | oosexgang | HackiOS (POCO X5 Pro, SM7325): kernel and userland, Mesa GPU path |
 
 ```sh
 git clone --recurse-submodules git@github.com:akshaynexus/iOSPlus10.git
