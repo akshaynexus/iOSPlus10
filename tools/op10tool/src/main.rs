@@ -52,7 +52,7 @@ enum Cmd {
     },
     /// Extract the payload of an IM4P (raw or LZFSE)
     Im4p { input: PathBuf, output: PathBuf },
-    /// Command to the negroni kernel over USB Ethernet (UDP 5141): ping, reboot, bootloader, recovery, panic
+    /// Command to the negroni kernel over USB Ethernet (UDP 5141): ping, reboot, bootloader, recovery, poweroff, panic
     Ctl {
         #[arg(value_enum)]
         command: ctl::Command,

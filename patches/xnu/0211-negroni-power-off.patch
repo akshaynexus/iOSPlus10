@@ -1,0 +1,680 @@
+diff --git a/bsd/dev/negroni_reboot.c b/bsd/dev/negroni_reboot.c
+index a7e0749..38afa66 100644
+--- a/bsd/dev/negroni_reboot.c
++++ b/bsd/dev/negroni_reboot.c
+@@ -1,5 +1,5 @@
+ /*
+- * NEGRONI: restart with a reboot reason (OnePlus 10 Pro 5G, SM8450).
++ * NEGRONI: restart with a reboot reason, power off (OnePlus 10 Pro 5G, SM8450).
+  *
+  * ABL reads the reboot reason from the PMK8350 SDAM: the Android DT's
+  * `qcom,reboot-reason` nvmem cell is SID 0, SDAM block 0x7100, byte 0x48,
+@@ -8,8 +8,21 @@
+  * read-modify-write of register 0x7148, then a PSCI SYSTEM_RESET follows.
+  * (The IMEM restart_reason at 0x146aa65c does not select a mode here.)
+  *
++ * Power off is PSCI SYSTEM_OFF. Boot-arg negronipoweroff (default 0):
++ *   0  SYSTEM_OFF only
++ *   1  SYSTEM_OFF; if it returns, PMIC fallback (below)
++ *   2  PMIC fallback only
++ * PMIC fallback: the PS_HOLD reset type of the PMK8350 PON_PBS block
++ * (SID 0, 0x0800; DT pon_pbs@800 "qcom,system-reset") is set to SHUTDOWN,
++ * then PSCI SYSTEM_RESET drops PS_HOLD, so the PMIC powers off instead of
++ * a restart. Registers as in downstream qpnp-power-on.c and Linux
++ * pm8941-pwrkey.c: PS_HOLD_RST_CTL 0x5a (bits 3:0 type, 4 = SHUTDOWN),
++ * PS_HOLD_RST_CTL2 0x5b (bit 7 enable; cleared during the change, then
++ * 500 us). The write is refused unless 0x0804/0x0805 read type 0x01 (PON)
++ * and subtype 0x08 (GEN3 PBS). NOT verified on this phone.
++ *
+  * The PMIC is reached through the SPMI PMIC arbiter, version 7 (Linux
+- * drivers/spmi/spmi-pmic-arb.c, sm8450.dtsi spmi@c400000, qcom,ee = <0>):
++ * drivers/spmi/spmi-pmic-arb.c; NE2211 DT qcom,spmi@c42d000, qcom,ee = <0>):
+  *   core   0x0c400000  version at +0, APID count at +4 bits 10:0,
+  *                      APID map at +0x2000 + 4*apid (bits 19:8 = PPID)
+  *   chnls  0x0c500000  read/write channel of an APID at 0x1000*apid
+@@ -18,26 +31,34 @@
+  * Channel registers: CMD +0x00, STATUS +0x08 (bit 0 done, bits 3:1
+  * failed/denied/dropped), WDATA0 +0x10, RDATA0 +0x18. Command word:
+  * opcode << 27 | register byte << 4 | (byte count - 1); EXT_WRITEL = 0,
+- * EXT_READL = 1. Like Linux, the write is only issued when the owner table
+- * gives the SDAM APID to EE 0; otherwise the reason is not set and the
+- * reset is a plain one. The keys driver (negroni_keys.c) reads this arbiter
+- * the same way (core + observer) on this hardware.
++ * EXT_READL = 1. Like Linux, a write is only issued when the owner table
++ * gives the APID to EE 0; otherwise the reason is not set and the reset is
++ * a plain one. The keys driver (negroni_keys.c) reads this arbiter the same
++ * way (core + observer) on this hardware.
+  *
+  * Adapted from slop unixnu-negroni/package/BootResetCore.h + BootReset.c
+  * (SM8550 "sheng", same arbiter layout and SDAM cell).
+  *
+- * Callers: thread context, one at a time (the USB command server).
++ * negroni_reboot_prepare() maps everything early (NegroniPlatformExpert
++ * start), so the panic path needs no allocation. Callers: one at a time
++ * (the USB command server, the halt/restart path, the panic path).
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void negroni_reboot_prepare(void);
+ int negroni_reboot_set_reason(unsigned reason);
+ void negroni_reboot_reset(void);
+ void negroni_reboot(unsigned reason);
++void negroni_power_off(void);
++void negroni_panic_restart(void);
++void negroni_reboot_settle(unsigned ms);
+ 
+ #define NR_CORE_PA              0x0c400000u
+ #define NR_CORE_SIZE            0x3000u
+@@ -69,10 +90,36 @@ void negroni_reboot(unsigned reason);
+ #define NR_REASON_MASK          0xfeu
+ #define NR_REASON_SHIFT         1
+ 
++#define NR_PON_PPID             0x008u          /* SID 0, PON_PBS (0x0800) */
++#define NR_PON_TYPE             0x04u
++#define NR_PON_SUBTYPE          0x05u
++#define NR_PON_TYPE_PON         0x01u
++#define NR_PON_SUBTYPE_GEN3_PBS 0x08u
++#define NR_PON_PS_HOLD_RST_CTL  0x5au
++#define NR_PON_PS_HOLD_RST_CTL2 0x5bu
++#define NR_PON_RESET_EN         0x80u
++#define NR_PON_TYPE_MASK        0x0fu
++#define NR_PON_TYPE_SHUTDOWN    0x04u
++
++#define PSCI_SYSTEM_OFF         0x84000008ull
+ #define PSCI_SYSTEM_RESET       0x84000009ull
+ 
+-static bool nr_attempted, nr_ready;
+-static vm_offset_t nr_obs, nr_chn;              /* this APID's observer / read-write channel */
++struct nr_chan {
++	const char *name;
++	uint32_t    ppid;
++	bool        attempted, ready;
++	vm_offset_t obs, chn;   /* this APID's observer / read-write channel */
++};
++
++static struct nr_chan nr_sdam = { .name = "SDAM 0x7100", .ppid = NR_SDAM_PPID };
++static struct nr_chan nr_pon = { .name = "PON_PBS 0x0800", .ppid = NR_PON_PPID };
++static vm_offset_t nr_core, nr_cnfg;
++static uint32_t nr_arb, nr_apids;
++static bool nr_arb_attempted, nr_arb_ready;
++static int nr_poweroff_mode;                    /* boot-arg negronipoweroff */
++static int nr_panic_secs = 30;                  /* boot-arg negronipanic */
++static int nr_panic_reason;                     /* boot-arg negronipanicreason */
++static bool nr_prepared;
+ 
+ static uint32_t
+ nr_rd(vm_offset_t base, uint32_t off)
+@@ -110,126 +157,190 @@ nr_wait(vm_offset_t ch)
+ 	return 1;
+ }
+ 
+-/* Finds the SDAM APID, checks that EE 0 may write it and maps its channels. */
+ static bool
+-nr_open(void)
++nr_arb_open(void)
+ {
+-	if (nr_attempted) {
+-		return nr_ready;
++	if (nr_arb_attempted) {
++		return nr_arb_ready;
+ 	}
+-	nr_attempted = true;
+-	vm_offset_t core = ml_io_map(NR_CORE_PA, NR_CORE_SIZE);
+-	vm_offset_t cnfg = ml_io_map(NR_CNFG_PA, 0x1000);
+-	if (core == 0 || cnfg == 0) {
++	nr_arb_attempted = true;
++	nr_core = ml_io_map(NR_CORE_PA, NR_CORE_SIZE);
++	nr_cnfg = ml_io_map(NR_CNFG_PA, 0x1000);
++	if (nr_core == 0 || nr_cnfg == 0) {
+ 		printf("NEGRONI REBOOT: SPMI map failed\n");
+ 		return false;
+ 	}
+-	uint32_t arb = nr_rd(core, 0), apids = nr_rd(core, NR_FEATURES) & 0x7ffu;
+-	if (arb < NR_VERSION_V7_MIN || arb >= NR_VERSION_V8_MIN || apids == 0 || apids > NR_MAX_APIDS) {
+-		printf("NEGRONI REBOOT: unknown SPMI arbiter %#x (%u APIDs)\n", arb, apids);
++	nr_arb = nr_rd(nr_core, 0);
++	nr_apids = nr_rd(nr_core, NR_FEATURES) & 0x7ffu;
++	if (nr_arb < NR_VERSION_V7_MIN || nr_arb >= NR_VERSION_V8_MIN || nr_apids == 0 || nr_apids > NR_MAX_APIDS) {
++		printf("NEGRONI REBOOT: unknown SPMI arbiter %#x (%u APIDs)\n", nr_arb, nr_apids);
++		return false;
++	}
++	nr_arb_ready = true;
++	return true;
++}
++
++/* Finds the APID of c->ppid, checks that EE 0 may write it and maps its channels. */
++static bool
++nr_open(struct nr_chan *c)
++{
++	if (c->attempted) {
++		return c->ready;
++	}
++	c->attempted = true;
++	if (!nr_arb_open()) {
+ 		return false;
+ 	}
+ 	/* As Linux picks it: the first mapping, replaced by one this EE owns. */
+ 	int apid = -1;
+ 	unsigned owner = 0;
+-	for (uint32_t i = 0; i < apids; i++) {
+-		uint32_t map = nr_rd(core, NR_APID_MAP + 4 * i);
+-		if (map == 0 || ((map >> 8) & 0xfffu) != NR_SDAM_PPID) {
++	for (uint32_t i = 0; i < nr_apids; i++) {
++		uint32_t map = nr_rd(nr_core, NR_APID_MAP + 4 * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != c->ppid) {
+ 			continue;
+ 		}
+-		unsigned o = nr_rd(cnfg, 4 * i) & 7u;
++		unsigned o = nr_rd(nr_cnfg, 4 * i) & 7u;
+ 		if (apid < 0 || o == NR_EE) {
+ 			apid = (int)i;
+ 			owner = o;
+ 		}
+ 	}
+ 	if (apid < 0) {
+-		printf("NEGRONI REBOOT: SDAM 0x7100 not in the SPMI APID map\n");
++		printf("NEGRONI REBOOT: %s not in the SPMI APID map\n", c->name);
+ 		return false;
+ 	}
+ 	if (owner != NR_EE) {
+-		printf("NEGRONI REBOOT: SDAM APID %d is owned by EE %u, not EE %u: no reboot reason\n",
+-		    apid, owner, NR_EE);
++		printf("NEGRONI REBOOT: %s APID %d is owned by EE %u, not EE %u: no write\n",
++		    c->name, apid, owner, NR_EE);
+ 		return false;
+ 	}
+ 	uint32_t obs_off = NR_OBS_EE_STRIDE * NR_EE + NR_OBS_APID_STRIDE * (uint32_t)apid;
+ 	vm_offset_t obs_page = ml_io_map(NR_OBS_PA + (obs_off & ~0xfffu), 0x1000);
+-	nr_chn = ml_io_map(NR_CHNLS_PA + NR_CHNL_STRIDE * (uint32_t)apid, NR_CHNL_STRIDE);
+-	if (obs_page == 0 || nr_chn == 0) {
++	c->chn = ml_io_map(NR_CHNLS_PA + NR_CHNL_STRIDE * (uint32_t)apid, NR_CHNL_STRIDE);
++	if (obs_page == 0 || c->chn == 0) {
+ 		printf("NEGRONI REBOOT: SPMI channel map failed\n");
+ 		return false;
+ 	}
+-	nr_obs = obs_page + (obs_off & 0xfffu);
+-	nr_ready = true;
+-	printf("NEGRONI REBOOT: SPMI arbiter %#x, SDAM APID %d (EE %u)\n", arb, apid, owner);
++	c->obs = obs_page + (obs_off & 0xfffu);
++	c->ready = true;
++	printf("NEGRONI REBOOT: SPMI arbiter %#x, %s APID %d (EE %u)\n", nr_arb, c->name, apid, owner);
+ 	return true;
+ }
+ 
+ static int
+-nr_read(uint8_t *value)
++nr_read(const struct nr_chan *c, uint32_t reg, uint8_t *value)
+ {
+-	nr_wr(nr_obs, NR_CMD, nr_cmd(NR_OP_EXT_READL, NR_REASON_REG));
+-	int rc = nr_wait(nr_obs);
++	nr_wr(c->obs, NR_CMD, nr_cmd(NR_OP_EXT_READL, reg));
++	int rc = nr_wait(c->obs);
+ 	if (rc == 0) {
+-		*value = (uint8_t)nr_rd(nr_obs, NR_RDATA0);
++		*value = (uint8_t)nr_rd(c->obs, NR_RDATA0);
+ 	}
+ 	return rc;
+ }
+ 
+ static int
+-nr_write(uint8_t value)
++nr_write(const struct nr_chan *c, uint32_t reg, uint8_t value)
+ {
+-	nr_wr(nr_chn, NR_WDATA0, value);
+-	nr_wr(nr_chn, NR_CMD, nr_cmd(NR_OP_EXT_WRITEL, NR_REASON_REG));
+-	return nr_wait(nr_chn);
++	nr_wr(c->chn, NR_WDATA0, value);
++	nr_wr(c->chn, NR_CMD, nr_cmd(NR_OP_EXT_WRITEL, reg));
++	return nr_wait(c->chn);
+ }
+ 
+-/*
+- * Reboot reason field of 0x7148 = reason (0 normal, 1 recovery,
+- * 2 bootloader); bit 0 is kept. 0 = set and read back, -1 = not set.
+- */
+-int
+-negroni_reboot_set_reason(unsigned reason)
++/* reg = (reg & ~mask) | (bits & mask), read back. 0 = done, -1 = failed (logged). */
++static int
++nr_update(const struct nr_chan *c, uint32_t reg, uint8_t mask, uint8_t bits)
+ {
+ 	uint8_t before = 0, after = 0;
+-
+-	if (reason > 0x7f || !nr_open()) {
+-		return -1;
+-	}
+-	int rc = nr_read(&before);
++	int rc = nr_read(c, reg, &before);
+ 	if (rc) {
+-		printf("NEGRONI REBOOT: read of 0x7148 failed (%d)\n", rc);
++		printf("NEGRONI REBOOT: %s read of +%#x failed (%d)\n", c->name, reg, rc);
+ 		return -1;
+ 	}
+-	uint8_t next = (uint8_t)((before & ~NR_REASON_MASK) | ((reason << NR_REASON_SHIFT) & NR_REASON_MASK));
++	uint8_t next = (uint8_t)((before & ~mask) | (bits & mask));
+ 	if (next == before) {
+-		printf("NEGRONI REBOOT: 0x7148 = %#04x already (reason %u)\n", before, reason);
+ 		return 0;
+ 	}
+-	rc = nr_write(next);
++	rc = nr_write(c, reg, next);
+ 	if (rc == 0) {
+-		rc = nr_read(&after);
++		rc = nr_read(c, reg, &after);
+ 	}
+ 	if (rc || after != next) {
+-		printf("NEGRONI REBOOT: write of 0x7148 %#04x -> %#04x failed (rc %d, read back %#04x)\n",
+-		    before, next, rc, after);
++		printf("NEGRONI REBOOT: %s write of +%#x %#04x -> %#04x failed (rc %d, read back %#04x)\n",
++		    c->name, reg, before, next, rc, after);
+ 		return -1;
+ 	}
+-	printf("NEGRONI REBOOT: 0x7148 %#04x -> %#04x (reason %u)\n", before, after, reason);
++	printf("NEGRONI REBOOT: %s +%#x %#04x -> %#04x\n", c->name, reg, before, after);
+ 	return 0;
+ }
+ 
+-/* PSCI SYSTEM_RESET (SMC conduit, as NegroniCPU's CPU_ON). Returns only if PSCI refused. */
+-void
+-negroni_reboot_reset(void)
++static int64_t
++nr_psci(uint64_t function)
+ {
+-	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++	register uint64_t x0 __asm__("x0") = function;
+ 	register uint64_t x1 __asm__("x1") = 0;
+ 	register uint64_t x2 __asm__("x2") = 0;
+ 	register uint64_t x3 __asm__("x3") = 0;
+ 	__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
+ 	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+-	printf("NEGRONI REBOOT: PSCI SYSTEM_RESET returned %lld\n", (long long)x0);
++	return (int64_t)x0;
++}
++
++/* Sleeps ms if this thread may block (other threads, the USB log, still run); else returns at once. */
++void
++negroni_reboot_settle(unsigned ms)
++{
++	if (!preemption_enabled() || ml_at_interrupt_context()) {
++		return;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline((event_t)&nr_prepared, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Boot-args and the SPMI mappings, once, in thread context (before any panic needs them). */
++void
++negroni_reboot_prepare(void)
++{
++	if (nr_prepared) {
++		return;
++	}
++	nr_prepared = true;
++	PE_parse_boot_argn("negronipoweroff", &nr_poweroff_mode, sizeof(nr_poweroff_mode));
++	PE_parse_boot_argn("negronipanic", &nr_panic_secs, sizeof(nr_panic_secs));
++	PE_parse_boot_argn("negronipanicreason", &nr_panic_reason, sizeof(nr_panic_reason));
++	(void)nr_open(&nr_sdam);
++	if (nr_poweroff_mode != 0) {
++		(void)nr_open(&nr_pon);
++	}
++	printf("NEGRONI REBOOT: power off = %s, panic = %s %d s (reason %d)\n",
++	    nr_poweroff_mode == 0 ? "PSCI SYSTEM_OFF" : nr_poweroff_mode == 1 ? "SYSTEM_OFF, then PMIC" : "PMIC",
++	    nr_panic_secs > 0 ? "reset after" : "stay", nr_panic_secs, nr_panic_reason);
++}
++
++/*
++ * Reboot reason field of 0x7148 = reason (0 normal, 1 recovery,
++ * 2 bootloader); bit 0 is kept. 0 = set and read back, -1 = not set.
++ */
++int
++negroni_reboot_set_reason(unsigned reason)
++{
++	if (reason > 0x7f || !nr_open(&nr_sdam)) {
++		return -1;
++	}
++	if (nr_update(&nr_sdam, NR_REASON_REG, NR_REASON_MASK, (uint8_t)(reason << NR_REASON_SHIFT)) != 0) {
++		return -1;
++	}
++	printf("NEGRONI REBOOT: reboot reason %u\n", reason);
++	return 0;
++}
++
++/* PSCI SYSTEM_RESET (SMC conduit, as NegroniCPU's CPU_ON). Returns only if PSCI refused. */
++void
++negroni_reboot_reset(void)
++{
++	int64_t rc = nr_psci(PSCI_SYSTEM_RESET);
++	printf("NEGRONI REBOOT: PSCI SYSTEM_RESET returned %lld\n", (long long)rc);
+ }
+ 
+ /* Reason (best effort: a reason that cannot be set gives a plain reset), then reset. */
+@@ -241,4 +352,77 @@ negroni_reboot(unsigned reason)
+ 	}
+ 	negroni_reboot_reset();
+ }
++
++/* PS_HOLD reset type = SHUTDOWN in PON_PBS. 0 = set, -1 = not set (logged). */
++static int
++nr_pon_shutdown_type(void)
++{
++	uint8_t type = 0, subtype = 0;
++
++	if (!nr_open(&nr_pon)) {
++		return -1;
++	}
++	if (nr_read(&nr_pon, NR_PON_TYPE, &type) || nr_read(&nr_pon, NR_PON_SUBTYPE, &subtype) ||
++	    type != NR_PON_TYPE_PON || subtype != NR_PON_SUBTYPE_GEN3_PBS) {
++		printf("NEGRONI REBOOT: PON_PBS type %#04x subtype %#04x, not PON GEN3 PBS: no PMIC power off\n",
++		    type, subtype);
++		return -1;
++	}
++	/* Like qpnp_pon_reset_config(): disable, 500 us (10 sleep clock cycles), type, enable. */
++	if (nr_update(&nr_pon, NR_PON_PS_HOLD_RST_CTL2, NR_PON_RESET_EN, 0) != 0) {
++		return -1;
++	}
++	delay(500);
++	int rc = nr_update(&nr_pon, NR_PON_PS_HOLD_RST_CTL, NR_PON_TYPE_MASK, NR_PON_TYPE_SHUTDOWN);
++	/* Enable again also after a failed type write: the reset must still work. */
++	if (nr_update(&nr_pon, NR_PON_PS_HOLD_RST_CTL2, NR_PON_RESET_EN, NR_PON_RESET_EN) != 0 || rc != 0) {
++		return -1;
++	}
++	return 0;
++}
++
++/* Power off. Returns only if every enabled method failed (all logged). */
++void
++negroni_power_off(void)
++{
++	if (nr_poweroff_mode != 2) {
++		printf("NEGRONI REBOOT: PSCI SYSTEM_OFF\n");
++		int64_t rc = nr_psci(PSCI_SYSTEM_OFF);
++		printf("NEGRONI REBOOT: PSCI SYSTEM_OFF returned %lld\n", (long long)rc);
++		if (nr_poweroff_mode == 0) {
++			printf("NEGRONI REBOOT: no power off (boot-arg negronipoweroff=1 tries the PMIC)\n");
++			return;
++		}
++	}
++	printf("NEGRONI REBOOT: PMIC power off: PS_HOLD reset type SHUTDOWN, then PSCI SYSTEM_RESET\n");
++	if (nr_pon_shutdown_type() != 0) {
++		printf("NEGRONI REBOOT: PMIC power off not possible\n");
++		return;
++	}
++	(void)negroni_reboot_set_reason(0);
++	negroni_reboot_reset();
++}
++
++/*
++ * Panic: the panic text stays on the screen for negronipanic seconds
++ * (default 30), then reset with reason negronipanicreason (default 0).
++ * negronipanic=0: stay on the panic screen (never returns).
++ */
++void
++negroni_panic_restart(void)
++{
++	if (nr_panic_secs > 0) {
++		printf("NEGRONI REBOOT: panic: reset in %d s (boot-arg negronipanic), reason %d\n",
++		    nr_panic_secs, nr_panic_reason);
++		for (int i = 0; i < nr_panic_secs; i++) {
++			delay(1000000);
++		}
++		negroni_reboot((unsigned)nr_panic_reason);
++	} else {
++		printf("NEGRONI REBOOT: panic: staying on the panic screen (negronipanic=0)\n");
++	}
++	for (;;) {
++		__builtin_arm_wfe();
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index f68221b..28fdc2a 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -343,6 +343,7 @@ static const char *const ud_strings[] = {
+ 	NULL, "ios-negroni", "Negroni iOS (USB Ethernet)", "0001", "02005E77EE01",
+ };
+ static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++static const uint8_t ud_host_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x01 };
+ 
+ static uint32_t
+ ud_string(unsigned idx, uint8_t *out)
+@@ -580,8 +581,9 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+  *   reboot      PSCI SYSTEM_RESET (a reboot reason left in the PMIC is cleared)
+  *   bootloader  reboot reason 2 (ABL fastboot), then the reset
+  *   recovery    reboot reason 1 (recovery), then the reset
++ *   poweroff    PSCI SYSTEM_OFF (negroni_power_off(), boot-arg negronipoweroff)
+  *   panic       panic("requested over USB"), so the panic log path runs
+- * The last four reply "ok <command>" and act UD_CTL_DELAY_MS later, so the
++ * The last five reply "ok <command>" and act UD_CTL_DELAY_MS later, so the
+  * reply and the console log still reach the host. The reason is written
+  * at once (negroni_reboot.c); if it cannot be set the reply says so and
+  * the reset is a plain one. Replies go straight back to the sender's MAC
+@@ -593,10 +595,11 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ #define UD_IP_HOST      0xc0a80701u     /* 192.168.7.1 */
+ #define UD_CTL_DELAY_MS 500
+ 
+-enum { UD_CTL_NONE, UD_CTL_RESET, UD_CTL_PANIC };
++enum { UD_CTL_NONE, UD_CTL_RESET, UD_CTL_POWEROFF, UD_CTL_PANIC };
+ 
+ extern int negroni_reboot_set_reason(unsigned reason);
+ extern void negroni_reboot_reset(void);
++extern void negroni_power_off(void);
+ 
+ static const struct {
+ 	const char *name;
+@@ -652,28 +655,29 @@ ud_sum_fold(uint32_t sum)
+ 	return (uint16_t)~sum;
+ }
+ 
+-/* UDP datagram from 192.168.7.2:5141 back to the sender of req (a frame ud_ctl_input accepted). */
+-static void
+-ud_ctl_reply(const uint8_t *req, const char *text)
++/*
++ * One UDP datagram from 192.168.7.2:sport, built here and put on the TX
++ * ring (no socket, no ARP, no route: works while ue0 is down). Does not
++ * print (the log thread uses it). false = no mbuf.
++ */
++static bool
++ud_udp_send(const uint8_t *dst_mac, const uint8_t *dst_ip, uint16_t sport, uint16_t dport,
++    const void *data, uint32_t n)
+ {
+-	const uint8_t *rip = req + ETHER_HDR_LEN;
+-	const uint8_t *rudp = rip + (rip[0] & 0xfu) * 4;
+-	uint32_t n = (uint32_t)strlen(text);
+ 	uint32_t len = ETHER_HDR_LEN + 20 + 8 + n;
+ 	mbuf_t m = NULL;
+ 
+-	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	if (ud.ifp == NULL || mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
+ 	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
+ 	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < len) {
+ 		if (m != NULL) {
+ 			mbuf_freem(m);
+ 		}
+-		printf("NEGRONI CTL: no mbuf for the reply\n");
+-		return;
++		return false;
+ 	}
+ 	uint8_t *f = mbuf_data(m);
+ 	bzero(f, len);
+-	memcpy(f, req + ETHER_ADDR_LEN, ETHER_ADDR_LEN);        /* to the sender's MAC */
++	memcpy(f, dst_mac, ETHER_ADDR_LEN);
+ 	memcpy(f + ETHER_ADDR_LEN, ud_phone_mac, ETHER_ADDR_LEN);
+ 	ud_put16(f + 12, ETHERTYPE_IP);
+ 	uint8_t *ip = f + ETHER_HDR_LEN;
+@@ -684,13 +688,13 @@ ud_ctl_reply(const uint8_t *req, const char *text)
+ 	ip[8] = 64;                     /* TTL */
+ 	ip[9] = IPPROTO_UDP;
+ 	ud_put32(ip + 12, UD_IP_PHONE);
+-	memcpy(ip + 16, rip + 12, 4);   /* to the sender's address */
++	memcpy(ip + 16, dst_ip, 4);
+ 	ud_put16(ip + 10, ud_sum_fold(ud_sum_add(0, ip, 20)));
+ 	uint8_t *udp = ip + 20;
+-	ud_put16(udp, UD_CTL_PORT);
+-	memcpy(udp + 2, rudp, 2);       /* to the sender's port */
++	ud_put16(udp, sport);
++	ud_put16(udp + 2, dport);
+ 	ud_put16(udp + 4, (uint16_t)(8 + n));
+-	memcpy(udp + 8, text, n);
++	memcpy(udp + 8, data, n);
+ 	/* UDP checksum over the pseudo header (addresses, protocol, length) and the datagram */
+ 	uint32_t sum = ud_sum_add(0, ip + 12, 8) + IPPROTO_UDP + 8 + n;
+ 	uint16_t csum = ud_sum_fold(ud_sum_add(sum, udp, 8 + n));
+@@ -698,6 +702,20 @@ ud_ctl_reply(const uint8_t *req, const char *text)
+ 	mbuf_setlen(m, len);
+ 	mbuf_pkthdr_setlen(m, len);
+ 	(void)ud_if_output(ud.ifp, m);
++	return true;
++}
++
++/* UDP datagram from 192.168.7.2:5141 back to the sender of req (a frame ud_ctl_input accepted). */
++static void
++ud_ctl_reply(const uint8_t *req, const char *text)
++{
++	const uint8_t *rip = req + ETHER_HDR_LEN;
++	const uint8_t *rudp = rip + (rip[0] & 0xfu) * 4;
++
++	/* to the sender's MAC, address and port */
++	if (!ud_udp_send(req + ETHER_ADDR_LEN, rip + 12, UD_CTL_PORT, ud_be16(rudp), text, (uint32_t)strlen(text))) {
++		printf("NEGRONI CTL: no mbuf for the reply\n");
++	}
+ }
+ 
+ static void
+@@ -769,6 +787,12 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		ud_ctl_schedule(UD_CTL_PANIC);
+ 		return true;
+ 	}
++	if (strcmp(cmd, "poweroff") == 0) {
++		printf("NEGRONI CTL: power off in %u ms\n", UD_CTL_DELAY_MS);
++		ud_ctl_reply(f, "ok poweroff");
++		ud_ctl_schedule(UD_CTL_POWEROFF);
++		return true;
++	}
+ 	for (unsigned i = 0; i < sizeof(ud_ctl_resets) / sizeof(ud_ctl_resets[0]); i++) {
+ 		if (strcmp(cmd, ud_ctl_resets[i].name) != 0) {
+ 			continue;
+@@ -800,6 +824,10 @@ ud_ctl_poll(void)
+ 	if (action == UD_CTL_PANIC) {
+ 		panic("requested over USB");
+ 	}
++	if (action == UD_CTL_POWEROFF) {
++		negroni_power_off();    /* returns only if every method failed (logged there) */
++		return;
++	}
+ 	printf("NEGRONI CTL: PSCI SYSTEM_RESET\n");
+ 	negroni_reboot_reset();         /* returns only if PSCI refused (logged there) */
+ }
+@@ -1046,6 +1074,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	socket_t so = NULL;
+ 	struct sockaddr_in to;
+ 	uint64_t pos = negroni_log_position();
++	static const uint8_t host_ip[4] = { 192, 168, 7, 1 };
+ 
+ 	pos = pos > 65536 ? pos - 65536 : 0;
+ 	bzero(&to, sizeof(to));
+@@ -1071,7 +1100,18 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			};
+ 			size_t sent = 0;
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
+-				break;          /* no route/ARP yet: retry later */
++				/*
++				 * No route, or ue0 down (if_down_all() in the
++				 * shutdown path): the same datagram as a raw frame
++				 * to the host MAC (ECM iMACAddress), so the last
++				 * lines before a power off or restart still arrive.
++				 */
++				for (int w = 0; w < 20 && ud.txq_count >= UD_TXQ / 2; w++) {
++					ud_sleep_ms(1);
++				}
++				if (!ud_udp_send(ud_host_mac, host_ip, 5140, 5140, chunk, n)) {
++					break;
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/iokit/Kernel/arm/NegroniPlatformExpert.cpp b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+index 13709cd..311dd97 100644
+--- a/iokit/Kernel/arm/NegroniPlatformExpert.cpp
++++ b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+@@ -22,6 +22,60 @@ public:
+ 
+ OSDefineMetaClassAndStructors(NegroniPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * Halt/restart (bsd/dev/negroni_reboot.c). Without a PE_halt_restart hook
++ * IOPlatformExpert::haltRestart() returned -1 for every type, so power off
++ * ("slide to power off": launchd reboot(RB_HALT) -> reboot_kernel() ->
++ * host_reboot(HOST_REBOOT_HALT) -> halt_all_cpus(FALSE) ->
++ * PEHaltRestart(kPEHaltCPU)) and restart only printed "CPU halted" /
++ * "MACH Reboot" and spun; 30 s later "Halt/Restart Timed Out" panicked.
++ *   kPEHaltCPU          PSCI SYSTEM_OFF (boot-arg negronipoweroff)
++ *   kPERestartCPU       reboot reason cleared to normal, PSCI SYSTEM_RESET
++ *   kPEPanicRestartCPU  panic text kept on the screen for negronipanic
++ *                       seconds (default 30), then reset
++ * kPEPanicBegin marks the panic; other types (panic callouts) do nothing.
++ */
++extern "C" {
++void negroni_reboot_prepare(void);
++void negroni_reboot(unsigned reason);
++void negroni_power_off(void);
++void negroni_panic_restart(void);
++void negroni_reboot_settle(unsigned ms);
++}
++
++static bool negroni_in_panic;
++
++static int
++negroni_halt_restart(unsigned int type)
++{
++	switch (type) {
++	case kPEPanicBegin:
++		negroni_in_panic = true;
++		return 0;
++	case kPEHaltCPU:
++		if (negroni_in_panic) {
++			negroni_panic_restart();        /* does not return */
++		}
++		IOLog("NEGRONI: power off\n");
++		negroni_reboot_settle(300);             /* the USB log thread sends the last lines */
++		negroni_power_off();
++		return -1;                              /* refused: halt_all_cpus() spins */
++	case kPERestartCPU:
++		if (negroni_in_panic) {
++			negroni_panic_restart();        /* does not return */
++		}
++		IOLog("NEGRONI: restart\n");
++		negroni_reboot_settle(300);
++		negroni_reboot(0);
++		return -1;
++	case kPEPanicRestartCPU:
++		negroni_panic_restart();                /* does not return */
++		return -1;
++	default:
++		return 0;
++	}
++}
++
+ bool
+ NegroniPlatformExpert::start(IOService *provider)
+ {
+@@ -30,7 +84,9 @@ NegroniPlatformExpert::start(IOService *provider)
+ 		return false;
+ 	}
+ 	registerService();
+-	IOLog("NEGRONI: platform expert registered\n");
++	negroni_reboot_prepare();
++	PE_halt_restart = &negroni_halt_restart;
++	IOLog("NEGRONI: platform expert registered, halt/restart hook set\n");
+ 	return true;
+ }
+ 

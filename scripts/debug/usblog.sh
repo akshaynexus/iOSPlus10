@@ -4,7 +4,8 @@
 # The negroni kernel with negroniusb=2 (slop patches 0072-0077, 0119) is a CDC-ECM USB device
 # (1209:0001, host-side MAC 02:00:5e:77:ee:01) and streams its console to UDP 192.168.7.1:5140.
 # This waits for that interface, gives the host 192.168.7.1/24 and writes every packet with a
-# host timestamp to logs/usblog-<date>.txt (and stdout). Python stdlib only.
+# host timestamp to logs/usblog-<date>.txt (and stdout). Python stdlib only. The address is
+# applied again after every phone reboot (new interface), so boot loops are logged too.
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 MAC=02:00:5e:77:ee:01
@@ -17,17 +18,38 @@ find_if() {
   Linux)  ip -o link | grep -i "$MAC" | awk -F': ' '{print $2}' | cut -d@ -f1 ;;
   esac
 }
-echo "waiting for the phone's USB Ethernet ($MAC)..."
-until [ -n "$(find_if)" ]; do sleep 1; done
-IF=$(find_if)
-case "$(uname -s)" in
-Darwin) ifconfig "$IF" inet 192.168.7.1 netmask 255.255.255.0 up ;;
-Linux)  nmcli dev set "$IF" managed no 2>/dev/null || true
-        ip addr replace 192.168.7.1/24 dev "$IF"; ip link set "$IF" up ;;
-esac
-echo "$IF up: 192.168.7.1 <-> phone 192.168.7.2; log -> $LOG"
+has_addr() {
+  case "$(uname -s)" in
+  Darwin) ifconfig "$1" 2>/dev/null | grep -q "inet 192.168.7.1 " ;;
+  Linux)  ip -o addr show dev "$1" 2>/dev/null | grep -q "192.168.7.1/" ;;
+  esac
+}
+set_addr() {
+  case "$(uname -s)" in
+  Darwin) ifconfig "$1" inet 192.168.7.1 netmask 255.255.255.0 up ;;
+  Linux)  nmcli dev set "$1" managed no 2>/dev/null || true
+          ip addr replace 192.168.7.1/24 dev "$1"; ip link set "$1" up ;;
+  esac
+}
+# Each phone reboot makes a new USB interface without our address: keep (re)applying it, so the
+# log continues across reboots (and boot loops). Marks each (re)connect in the log.
+watch_if() {
+  last=""
+  while :; do
+    IF=$(find_if)
+    if [ -n "$IF" ] && ! has_addr "$IF"; then
+      set_addr "$IF" && echo "$(date +%H:%M:%S) ==== usblog: $IF up (192.168.7.1 <-> phone 192.168.7.2)" | tee -a "$LOG"
+    elif [ -z "$IF" ] && [ -n "$last" ]; then
+      echo "$(date +%H:%M:%S) ==== usblog: phone interface gone (reboot or unplug)" | tee -a "$LOG"
+    fi
+    last=$IF; sleep 1
+  done
+}
+echo "waiting for the phone's USB Ethernet ($MAC); log -> $LOG"
+watch_if &
+trap 'kill $! 2>/dev/null' EXIT INT TERM
 chown "${SUDO_UID:-0}:${SUDO_GID:-0}" "$REPO/logs" 2>/dev/null || true
-exec python3 -u - "$LOG" <<'EOF'
+python3 -u - "$LOG" <<'EOF'
 import socket, sys, time, os
 log = open(sys.argv[1], 'a', buffering=1)
 os.chown(sys.argv[1], int(os.environ.get('SUDO_UID', 0)), int(os.environ.get('SUDO_GID', 0)))

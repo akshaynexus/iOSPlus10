@@ -1,8 +1,8 @@
 //! Commands to the negroni kernel's USB command server (patches/xnu/0210-negroni-usb-command-server.patch,
 //! bsd/dev/negroni_usb.c): one ASCII word per UDP datagram to 192.168.7.2:5141, sent from the host side of the
 //! USB Ethernet link (192.168.7.1, set up by scripts/debug/usblog.sh). The kernel accepts only 192.168.7.1 as
-//! the source and replies to the sending port: "pong" for ping, "ok <command>" before a reset or panic
-//! (which follows 500 ms later), "error: ..." otherwise.
+//! the source and replies to the sending port: "pong" for ping, "ok <command>" before a reset, power off or
+//! panic (which follows 500 ms later), "error: ..." otherwise.
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -23,6 +23,8 @@ pub enum Command {
     Bootloader,
     /// Reboot reason 1 (recovery), then reset
     Recovery,
+    /// PSCI SYSTEM_OFF (boot-arg negronipoweroff selects the PMIC fallback)
+    Poweroff,
     /// panic("requested over USB"), so the panic log path runs
     Panic,
 }
@@ -34,6 +36,7 @@ impl Command {
             Command::Reboot => "reboot",
             Command::Bootloader => "bootloader",
             Command::Recovery => "recovery",
+            Command::Poweroff => "poweroff",
             Command::Panic => "panic",
         }
     }
