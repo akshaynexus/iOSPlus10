@@ -3,6 +3,7 @@
 Status date: 2026-10-25.
 
 ## Done
+- Wi-Fi/audio (2026-10-26): 0262 rebased on slop 0125; `negroniwifi=10` on the phone: PCIe link UP Gen2 x1 and the QCA6490 answers (17cb:1103, MSI at 0x50) [V]. Stage 1 (`negroniwlan=2`, image out/ios16-wlan2 in boot_a) is untested: the phone browned out at 16 % battery before it logged. ADSP step 1 ran (SMEM OK, PAS query answers 0 -> patch 0241 logs it only); HAL plug-in pushed to the live root (scripts/audio/phone-audio.sh): 3 clean boots, 2 boots with the old SIGABRT, undecided. Next: charge the phone, flash khz12 back, then wlan2 + `negroniadsp_step=4` with `negronipanic=30 negronipanicreason=2`.
 
 - Phone bought: OnePlus 10 Pro NE2211, PAC confirmed by adb.
 - Bootloader unlocked (orange state). Auto updates off; stay on 16.0.3.530.
@@ -62,6 +63,11 @@ Status date: 2026-10-25.
   dead-man ignores SIGKILL before the device opened, strike limit env NEGRONIMETAL_STRIKE_LIMIT (4 for *Poster*).
   Built, not tested on the phone (notes.md section 16 end).
 
+- Clock-shift fragments (2026-10-26): the kernel's `negronifb_clockshift` shift ran before the GPU 2D copy had
+  reached the panel memory (fence wait result ignored) and covered 150 rows (54 pt, into the lock screen's date).
+  Patch 0256: shift after the fence (deferred to a later tick when needed), 120 rows (44 pt status bar),
+  `negronifb_clockrows=N`. Images `out/ios16-noshift` (control, no shift) and `out/ios16-0256`. Visual check: owner.
+
 ## First boot (2026-10-24, 19:48)
 
 - Flash: userdata from fastbootd (45 x 256 MiB, 303 s), then vendor_boot_a, vbmeta_a, dtbo_a,
@@ -109,3 +115,4 @@ then the normal image (`make flash-boot`).
 1. Fix the RedwoodGPU user client panic in slop's A730 path.
 2. Port UniXNU NativeAdreno board code (GMU, RSC, votes, cmd-db, SMMU) to SM8450.
 3. Port NativeMetal (metal2vulkan via Turnip FD730) to the iOS 26 Metal interface.
+- 2026-10-26 power off (0214): cause found [V]: PSCI SYSTEM_OFF = PS_HOLD drop, PMIC PS_HOLD reset type was a reset; 0214 sets SHUTDOWN first (GEN3 +0x52/+0x53), prints the PON log at boot. Phone test pending (battery, hold).

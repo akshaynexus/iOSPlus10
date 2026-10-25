@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/negroni_wifi.c b/bsd/dev/negroni_wifi.c
-index 12c1be9..0d20090 100644
+index d38b842..1bdcbde 100644
 --- a/bsd/dev/negroni_wifi.c
 +++ b/bsd/dev/negroni_wifi.c
 @@ -25,6 +25,12 @@
@@ -15,10 +15,11 @@ index 12c1be9..0d20090 100644
   * Addresses: sm8450.dtsi pcie@1c00000 / phy@1c06000, gcc-sm8450.c, the phone's DT.
   */
  #if defined(ARM64_BOARD_CONFIG_NEGRONI)
-@@ -95,6 +101,24 @@ uint32_t negroni_wifi_badge_color = 0x00606060;
+@@ -95,7 +101,24 @@ uint32_t negroni_wifi_badge_color = 0x00606060;
  #define GCC_VOTE_2_PCIE0        0x3fu
  #define WLAN_EN_PIN             80
  #define PERST_PIN               94
+-#define XO_CLK_PIN              204     /* DT wcn6855-pmu xo-clk-gpios */
 +/*
 + * 0262 (iOSPlus10): the power-up and controller details the survey missed, from the phone's own
 + * kernel (OnePlus sm8450 e9da592: drivers/pci/controller/pci-msm.c, cnss2/power.c, cnss2/pci.c),
@@ -28,7 +29,7 @@ index 12c1be9..0d20090 100644
 +#define SW_CTRL_PIN             82
 +#define CLKREQ_PIN              95              /* live.dts pcie0_clkreq_default: function pcie0_clkreqn, pull-up */
 +#define CLKREQ_FUNC             1u              /* pinctrl-sm8450.c PINGROUP(95, pcie0_clkreqn, ...) */
-+#define XO_CLK_PIN              204             /* live.dts qcom,cnss-qca6490 qcom,xo-clk-gpio */
++#define XO_CLK_PIN              204             /* live.dts qcom,cnss-qca6490 qcom,xo-clk-gpio (slop 0125: wcn6855-pmu xo-clk-gpios) */
 +#define TLMM_EGPIO_PRESENT      (1u << 11)      /* pinctrl-sm8450.c egpio_present / egpio_enable */
 +#define TLMM_EGPIO_ENABLE       (1u << 12)
 +#define PARF_SLV_ADDR_SPACE_SIZE_V2     0x358
@@ -40,7 +41,7 @@ index 12c1be9..0d20090 100644
  #define CHIP_ID                 0x110317cbu     /* 17cb:1103 */
  
  static uint32_t pause_ms = 300;
-@@ -173,7 +197,7 @@ static bool
+@@ -174,7 +197,7 @@ static bool
  step_pins(void)
  {
  	static const struct { const char *name; uint32_t pin; } p[] = {
@@ -49,7 +50,7 @@ index 12c1be9..0d20090 100644
  	};
  
  	announce("read the Wi-Fi pins (TLMM)");
-@@ -254,17 +278,23 @@ step_rails(void)
+@@ -255,17 +278,23 @@ step_rails(void)
  static bool
  step_pcie(void)
  {
@@ -77,7 +78,7 @@ index 12c1be9..0d20090 100644
  	printf("NEGRONI WIFI: 4 PHY [0x0] %#x [0x214] %#x\n", rd(phy), rd(phy + 0x214));
  	return true;
  }
-@@ -305,11 +335,28 @@ step_power(void)
+@@ -306,11 +335,28 @@ step_power(void)
  	return ok;
  }
  
@@ -107,7 +108,7 @@ index 12c1be9..0d20090 100644
  }
  
  static bool
-@@ -322,6 +369,10 @@ step_chip_on(void)
+@@ -323,6 +369,10 @@ step_chip_on(void)
  	announce("vote QCA6490 supplies before WLAN_EN (SM8450 apps DRV2)");
  	gpio_out(PERST_PIN, false);
  	gpio_out(WLAN_EN_PIN, false);
@@ -118,10 +119,11 @@ index 12c1be9..0d20090 100644
  	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
  		int error = negroni_rpmh_wifi_enable(rails[i].name, rails[i].mv);
  		printf("NEGRONI WIFI: 6 %s %u mV: errno %d\n", rails[i].name, rails[i].mv, error);
-@@ -330,10 +381,27 @@ step_chip_on(void)
+@@ -331,17 +381,30 @@ step_chip_on(void)
  			return false;
  		}
  	}
+-	/* Linux pwrseq-qcom-wcn (wcn6855): XO clock pin high, WLAN_EN high, then the XO pin low and 50 ms */
 +	/* cnss2 power.c cnss_select_pinctrl_enable: with BT_EN off the QCA6490 PMU needs 100 ms before WLAN_EN */
 +	if (!gpio_level(BT_EN_PIN, false)) {
 +		printf("NEGRONI WIFI: 6 BT_EN is low: wait 100 ms before WLAN_EN (cnss2 PMU sequencing)\n");
@@ -130,14 +132,18 @@ index 12c1be9..0d20090 100644
 +	/*
 +	 * cnss2 power.c cnss_select_pinctrl_state + cnss_set_xo_clk_gpio_state (QCA6490 only): XO_CLK high
 +	 * 100-200 us before WLAN_EN, WLAN_EN high, 1 ms (WLAN_ENABLE_DELAY), XO_CLK held 2-5 ms more for a
-+	 * valid latch, then XO_CLK low.
++	 * valid latch, then XO_CLK low. (slop 0125 pulses the same pin: XO low 10 ms, high 200 us, WLAN_EN,
++	 * 10 ms, XO low; this is the cnss2 timing, with the XO pin driven low 10 ms first as 0125 does.)
 +	 */
-+	gpio_out(XO_CLK_PIN, true);
-+	delay(200);
+ 	gpio_out(XO_CLK_PIN, false);
+ 	delay(10000);
+ 	gpio_out(XO_CLK_PIN, true);
+ 	delay(200);
  	gpio_out(WLAN_EN_PIN, true);
+-	delay(10000);
 +	delay(1000);
 +	delay(5000);
-+	gpio_out(XO_CLK_PIN, false);
+ 	gpio_out(XO_CLK_PIN, false);
 +	printf("NEGRONI WIFI: 6 XO_CLK GPIO%u pulsed around WLAN_EN (cfg %#x)\n", XO_CLK_PIN, rd(tlmm + TLMM_PIN(XO_CLK_PIN)));
  	delay(50000);
 -	printf("NEGRONI WIFI: 6 WLAN_EN out %u, PERST out %u, SW_CTRL in %u\n", (rd(tlmm + TLMM_PIN(WLAN_EN_PIN) + 4) >> 1) & 1,
@@ -148,7 +154,7 @@ index 12c1be9..0d20090 100644
  	return true;
  }
  
-@@ -356,15 +424,42 @@ step_phy(void)
+@@ -364,17 +427,42 @@ step_phy(void)
  		return false;
  	}
  	announce("set the controller up and start the PHY (PARF and PHY writes)");
@@ -167,13 +173,15 @@ index 12c1be9..0d20090 100644
 -	wr(parf + PARF_DBI_BASE_ADDR_V2_HI, 0);
 -	wr(parf + PARF_ATU_BASE_ADDR, (uint32_t)(DBI_PHYS + ATU_OFFSET));
 -	wr(parf + PARF_ATU_BASE_ADDR_HI, 0);
+-	wr(parf + 0x358, 0);                                    /* PARF_SLV_ADDR_SPACE_SIZE_V2: without it DBI, iATU */
+-	wr(parf + 0x35c, 0x80000000);                           /* and bus 1 read 0xffffffff */
 +	/*
 +	 * Where the DBI and the iATU sit in the controller's slave space. Two consistent recipes:
 +	 * 0 (default) the phone's own kernel, pci-msm.c msm_pcie_enable: after the core reset,
 +	 *   DBI base 0 (offset in the slave space), slave space 0x4000000, the ATU base left at its reset
 +	 *   value (the vendor DT maps the iATU at 0x60001000).
-+	 * 1 Linux pcie-qcom.c qcom_pcie_configure_dbi_atu_base: DBI and ATU base = CPU physical addresses
-+	 *   AND slave space 0x80000000_00000000.
++	 * 1 Linux pcie-qcom.c qcom_pcie_configure_dbi_atu_base (= slop 0125): DBI and ATU base = CPU
++	 *   physical addresses AND slave space 0x80000000_00000000.
 +	 * Before 0262 the survey wrote the Linux addresses without the slave space size: the DBI was
 +	 * not decoded and every DBI/config read gave 0xffffffff (photo 2026-10-25).
 +	 */
@@ -197,7 +205,7 @@ index 12c1be9..0d20090 100644
  	clear(parf + PARF_SYS_CTRL, 1u << 29);                  /* MAC_PHY_POWERDOWN_IN_P2_D_MUX_EN */
  	set(parf + PARF_MHI_CLOCK_RESET_CTRL, 1u << 4);         /* BYPASS */
  	clear(parf + PARF_PM_CTRL, 1u << 5);                    /* REQ_NOT_ENTR_L1 */
-@@ -389,6 +484,21 @@ step_phy(void)
+@@ -399,6 +487,21 @@ step_phy(void)
  	printf("NEGRONI WIFI: 7 PHY PCS_STATUS1 %#x (%s), pipe %#x\n", status, (status & (1u << 6)) ? "NOT ready" : "ready",
  	    rd(gcc + GCC_PCIE_0_PIPE));
  	controller = !(status & (1u << 6));
@@ -219,7 +227,7 @@ index 12c1be9..0d20090 100644
  	return controller;
  }
  
-@@ -407,17 +517,30 @@ atu(vm_offset_t base, unsigned index, uint32_t type, uint64_t from, uint64_t lim
+@@ -417,17 +520,30 @@ atu(vm_offset_t base, unsigned index, uint32_t type, uint64_t from, uint64_t lim
  	wr(r + 0x04, 1u << 31);
  }
  
@@ -254,7 +262,7 @@ index 12c1be9..0d20090 100644
  	set(dbi + 0x8bc, 1u);                                   /* DBI_RO_WR_EN */
  	wr(dbi + 0x08, (rd(dbi + 0x08) & 0xff) | 0x0604u << 16);        /* PCI-to-PCI bridge */
  	clear(dbi + 0x70 + 0x14, 1u << 6);                      /* no hot plug */
-@@ -426,35 +549,46 @@ step_link(void)
+@@ -436,35 +552,46 @@ step_link(void)
  	wr(dbi + 0x14, 0);
  	wr(dbi + 0x18, 0x00010100);                             /* primary 0, secondary 1, subordinate 1 */
  	set(dbi + 0x04, 2u | 4u);                               /* memory, bus master */

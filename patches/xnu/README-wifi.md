@@ -91,6 +91,14 @@ from 0120's in 3 RX values (0x0e3c 0x12 vs 0x16, 0x0e40 0x01 vs 0x04, 0x10d8 0x0
 LDOs (pm8350 l5/l6, vendor DT vreg-0p9/1p8) are not voted (UFS/USB use the same LDOs, so ABL leaves
 them on [I]); no interconnect (pcie_noc) vote.
 
+### Phone test 2026-10-26 (0262 rebased on slop 0125) [V]
+
+Boot-arg `negroniwifi=10`, image out/ios16-wifi10, USB log 00:00:35: `7 root port DBI ID 17cb:0110, LNKCAP 0x524c13`,
+`8 try 1: link UP: LNKSTA 0x3012 (gen 2 x1), ELBI 0x11401 (state 0x11 L0)`, `9 bus 1 device 17cb:1103`,
+`10 MSI capability at 0x50 control 0x10a`, `done (asked 10)`. The vendor DBI recipe (default) works. Slop 0125
+now carries its own XO_CLK pulse and the Linux slave-space writes; the rebased 0262 replaces both with the cnss2
+timing and the two recipes (notes.md section 16, 2026-10-26).
+
 ## 0261-negroni-wlan-mhi-fw.patch
 
 Stage 1 of the driver: claim BAR0, choose the firmware, download it over MHI (BHI + BHIe), reach

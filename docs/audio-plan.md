@@ -119,7 +119,16 @@ platform code (`README-aks-amfi.md`) [V], and HackiOS loaded an unsigned plug-in
 should load [I]. The HAL can also refuse a bundle for other reasons [U]: the USB log then shows
 mediaserverd as before, with no `NegroniAudio:` line.
 
-## Stage a: ADSP start (patch 0240, builds, UNTESTED)
+Phone test 2026-10-26 (`scripts/audio/phone-audio.sh push`, live root, no root rebuild) [V]: the plug-in and
+VirtualAudio are on the phone's root now. 3 boots without a mediaserverd crash, 2 boots (low battery period) with
+the old SIGABRT and one SIGTRAP in a plug-in factory's `xpc_connection_send_message`; not decided yet. Details:
+docs/notes.md section 17 (2026-10-26). `phone-audio.sh revert` undoes the change.
+
+## Stage a: ADSP start (patch 0240, builds; step 1 ran on the phone 2026-10-26, patch 0241)
+
+Phone result 2026-10-26 [V]: step 1 parses SMEM (partition 0/2 at 0x80acf000) and finds no SMP2P items; the
+PAS-is-supported SCM query answers 0 and stopped the run. Patch 0241 makes that answer a note (Linux's PAS driver
+never asks). Steps 2-8 are still untested (notes.md section 17).
 
 Files: `patches/xnu/0240-negroni-adsp-boot.patch` (made in `out/kernel/tree-audio`, a
 `scripts/kernel/patched-tree.sh` tree; `git diff HEAD~1`). New `bsd/dev/negroni_adsp.c`;

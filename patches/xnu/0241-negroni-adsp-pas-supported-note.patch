@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
+index d9ed1b8..da0c990 100644
+--- a/bsd/dev/negroni_adsp.c
++++ b/bsd/dev/negroni_adsp.c
+@@ -401,10 +401,15 @@ step_survey(void)
+ 	say("no ADSP SMP2P item %u: the ADSP has not run since the reset", ITEM_SMP2P_THEIRS);
+ 	at = smem_item(ITEM_SMP2P_OURS, &size);
+ 	say("our SMP2P item %u: %s", ITEM_SMP2P_OURS, at ? "present (an earlier kernel made it)" : "absent");
++	/*
++	 * 0241: on the NE2211 this query answers 0 for image 1 (USB log 2026-10-26 00:00:35, smc 0x42000207
++	 * -> 0, answer 0), but Linux's qcom_q6v5_pas never asks it (only the mss and wcnss drivers do), and the
++	 * GPU zap PAS calls with the same encoding succeed on this TrustZone. So the answer is logged, not obeyed.
++	 */
+ 	scm("PAS is supported (adsp)", SCM_64 | SCM_SIP | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, PAS_ADSP, 0, 0, &answer);
+ 	if (answer != 1) {
+-		say("stop: TrustZone does not report PAS image %u", PAS_ADSP);
+-		return false;
++		say("note: TrustZone does not report PAS image %u as supported (answer %#llx); Linux never asks, so "
++		    "the steps go on", PAS_ADSP, answer);
+ 	}
+ 	return true;
+ }

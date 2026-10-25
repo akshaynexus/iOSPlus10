@@ -405,6 +405,21 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   fence per layer (`fPendFences`), no wait; a layer whose gpuFence moved on goes the CPU way instead of a 2D copy
   behind newer work (one in-order ring). Kernel local-20261025-175017, image out/ios16-0254b [I until booted].
 
+- Clock-shift fragments (2026-10-26, display agent; patch 0256, README-gpu-kernel.md section 12 "0256").
+  [V code] `negronifb_clockshift=100` shifts the left half of the top rows of the panel memory by hand after each
+  copy. With 0231/0254 every frame is a GPU 2D copy; `present()` waited 8 ms for the copy's fence and shifted
+  whether or not the wait passed, so a slow copy got the previous (already shifted) rows shifted again, then the
+  engine wrote the new rows unshifted: duplicated/offset digit fragments. [V] The strip was 150 panel rows = 54 pt
+  (panel 1080x2412 in logical 1125x2436, fOffY 12); the status bar is 44 pt = panel row 120, so the lock screen's
+  date line (below 44 pt) was inside the strip. Fix: shift only after the fence passed (else pending, done by a
+  later tick, `shiftTick()`), strip 120 rows (`negronifb_clockrows=N`), parse the shift arg before the first
+  frame. Panel memory is write-combine, so no cache effect is involved. Images: `out/ios16-noshift` (kernel
+  local-20261025-214340, no clockshift arg: the control), `out/ios16-0256` (0256, config args). [I] Visual result:
+  not seen by the agent; the owner checks. [I] The date's exact y on the lock screen is not measured.
+- No userland lever for the ear [V grep]: `scripts/ios16/root-tweaks-extra.py` and docs have no status-bar /
+  notch / safe-area tweak; the only ways to move the status bar's clock are the kernel shift (`negronifb_clockshift`)
+  or the whole-picture shift (`negronifb_shift=N`, cuts the bottom rows).
+
 ## 16. Metal (2026-10-25, Metal agent)
 
 Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](metal-design.md). Code: `userland/metal/`, `scripts/metal/`.
@@ -884,6 +899,36 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - Next (stage 2): QRTR TX/RX buffers on MHI 20/21, QMI WLFW (ind_register/host_cap/respond_mem/target_cap/BDF/m3_info/
   FW_READY), then HTC/WMI/HTT + HAL rings + scan, then en0 (Sailfish upper half). Details: docs/wifi-plan.md.
 
+### 2026-10-26 Wi-Fi phone test (Wi-Fi/audio agent; patch 0262 rebased on slop 0125, image out/ios16-wifi10)
+
+- [V] 0262 rebased: slop 0125 (`0125-negroni-wifi-rails-xo-slave.patch`) adds its own XO_CLK pulse in step_chip_on
+  and the Linux slave-space writes (0x358 = 0, 0x35c = 0x80000000) in step_phy. The rebased 0262 keeps the cnss2
+  timing (XO low 10 ms, high 200 us, WLAN_EN, 6 ms, XO low) and the two DBI recipes (vendor recipe 0 default;
+  `negroniwifi_dbi=1` = Linux = slop 0125). Build `kernel-wifi3`: out/kernel/local-20261025-182812 (sha256
+  3658ff04...), all patches applied, only the 4 usual dxb skips.
+- [V] **THE QCA6490 ANSWERS ON PCIe** (USB log 2026-10-26 00:00:35, boot-args `negroniwifi=10`, image
+  out/ios16-wifi10 boot_a sha256 4c24ab25...): `7 PHY PCS_STATUS1 0x86 (ready)`, `7 root port DBI ID 17cb:0110,
+  LNKCAP 0x524c13, ELBI SYS_STTS 0x1`, `8 root port class 0x60400, buses 0x10100, LNKCTL2 0x10002, iATU0
+  0x4/0x80000000`, `8 try 1: link UP: LNKSTA 0x3012 (gen 2 x1), ELBI 0x11401 (state 0x11 L0), LTSSM 0x111`,
+  `9 bus 1 device 17cb:1103, class 0x28000, BAR0 0x4, BAR1 0`, `10 BAR0 0x4 (memory, 64-bit), command 0, status
+  0x10`, `10 MSI capability at 0x50 control 0x10a`, `10 interrupt inventory: MSI present, MSI-X absent`, `done
+  (asked 10)`. The vendor DBI recipe (recipe 0) works; recipe 1 is untested. Steps 5-6 lines are before the USB
+  console came up (not in the log). The link trained on the first try at Gen2 x1.
+- [V] The wifi10 image booted to the home screen 5 times (00:00, 00:38, 00:48, 01:14, 01:22) with the survey to
+  step 10 and `negroniadsp=1 negroniadsp_step=2`; no panic line in logs/usblog.log.
+- [V] Image out/ios16-wlan2 (boot_a sha256 59c305dc..., kernel out/kernel/local-20261025-214340 sha256 6ea6ab49...,
+  args `negroniwifi=10 negroniwlan=2 negroniadsp=1 negroniadsp_step=4`) was flashed at 03:14 and NEVER produced a
+  USB log line (no `NEGRONI WLAN` line exists in logs/usblog.log). [I] Cause unknown: the battery was at 16 %
+  (3687 mV, -458 mA, usbin=0 mV: the phone does not charge under our kernel) at 01:31 and the phone was already in
+  USB up/down cycles without kernel text from 01:32:37 (01:32:37, 02:03:10, 02:04:20, 02:04:38: `en10 up`, then
+  `settime: no reply`, then `interface gone`), so a brownout restart loop is the most likely cause, not stage 1.
+  Stage 1 (negroniwlan=2) is still UNTESTED.
+- Lesson: test images must carry `negronipanic=30 negronipanicreason=2` so a panic comes back to fastboot by itself
+  (a panic screen with the default `negronipanic=0` cannot be left remotely), and the battery must be above ~50 %
+  before a test cycle (the phone drains 0.5-1.9 A and never charges under our kernel).
+- Next: when the phone is charged, boot ios16-wlan2 again (or rebuild it with `negronipanic=30
+  negronipanicreason=2`), read the `NEGRONI WLAN` lines (README-wifi.md 0261 table), fix the first failing MHI step.
+
 ## 17. Audio (audio agent, 2026-10-25; details: docs/audio-plan.md)
 
 - [V] 20H392 HAL plug-in paths: /System/Library/Audio/Plug-Ins/HAL, /Library/Audio/Plug-Ins/HAL, /Library/Apple/Audio/Plug-Ins/HAL (shared cache strings). Apple drivers there are plain arm64 bundles, CFPlugInTypes 443ABAB8-...; BasebandVoice.driver's table = NULL + 22 function pointers (same as the macOS SDK AudioServerPlugInDriverInterface).
@@ -896,6 +941,37 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - [I] Without the NXP module only the on-chip protections stay: keep the gain low (TDMSPKG <= 3 for the first test).
 - [V] 0240 review vs Linux (smem, smp2p, qcom_aoss, mdt_loader, PAS SCM): layouts and order match. Fix: RPMh votes retry EBUSY up to 1 s (rail_vote), since touch/Wi-Fi share the RPMh try-lock. Full build OK: out/kernel/local-20261025-102834 (kernel sha256 58fffc0c..., all 19 patches/xnu applied).
 - [V] Root image 16 GiB (root-macos.sh SIZE=16g): the firmware areas at the end of userdata do not overlap HFS+.
+
+### 2026-10-26 audio phone test (Wi-Fi/audio agent; scripts/audio/phone-audio.sh, patch 0241)
+
+- [V] Before any audio change (boot 22:38, kernel 0254b+0236+0237): mediaserverd pid 28 ran for 3 h with no
+  `CRASH mediaserverd` line; the first-boot SIGABRT of 2026-10-24 did not repeat on this root.
+- [V] `scripts/audio/phone-audio.sh push` (new; does on the live root what root-add-audio.sh does on an image,
+  then kills mediaserverd so launchd restarts it; the phone has no awk/killall/launchctl; macOS tar needs
+  COPYFILE_DISABLE=1 or AppleDouble `._*` files land in the bundle) installed
+  /System/Library/Audio/Plug-Ins/HAL/NegroniAudio.driver (sha256 fe9c1f71...) and moved VirtualAudio.plugin
+  back to /Library/Audio/Plug-Ins/HAL at 23:57. THIS CHANGE IS STILL ON THE PHONE'S ROOT (`phone-audio.sh revert`
+  undoes it).
+- [V] Result: the restarted mediaserverd (pid 507) ran until the reboot; the next 3 boots (00:00, 00:38, 00:48) had
+  no mediaserverd crash. The boots at 01:14 and 01:22 had crashes: 3 x SIGABRT in 50 s at 01:14:35-48, SIGABRT at
+  01:31:11 (both = `abort <- demangling_terminate_handler <- _objc_terminate <- std::terminate`, the same uncaught
+  exception as 2026-10-24, logs/symb-ms2.log) and one SIGTRAP `__xpc_api_misuse`/`_os_object_retain` in
+  `_xpc_connection_send_message` called from a plug-in factory function (`CFPlugInInstanceCreate <-
+  HALS_PlugInManager::CreatePlugIn`, main image + 0x437a674; also once at 23:58:33 right after the push).
+  [I] The factory that sends XPC is not NegroniAudio (it has no XPC code) but one of the Apple drivers or
+  VirtualAudio racing a restart; the SIGABRTs at 01:14/01:31 coincide with the low-battery period (29 % -> 16 %),
+  so whether the plug-in helps or hurts is NOT decided: 3 clean boots vs 2 boots with crashes.
+- [V] ADSP step 1 (`negroniadsp=1 negroniadsp_step=2`, 00:00:35): `SMEM partition 0/2 at 0x80acf000, 0x30000
+  bytes, cacheline 32, free uncached 0x4060 cached 0x30000`, `no ADSP SMP2P item 443`, `our SMP2P item 429:
+  absent`, `SCM PAS is supported (adsp): smc 0x42000207 (0x1, 0, 0) -> 0, answer 0`, `stop: TrustZone does not
+  report PAS image 1`. So SMEM parsing works on the phone; TrustZone answers "not supported" to the query.
+- [V] Patch 0241 (`0241-negroni-adsp-pas-supported-note.patch`, 22 lines): the answer is logged, not obeyed
+  (Linux qcom_q6v5_pas never asks it; only mss/wcnss do; the GPU zap PAS calls use the same SMC encoding
+  0x420002xx without the fast-call bit and succeed: `SCM PAS auth and reset (zap) -> 0`). Built in
+  out/kernel/local-20261025-214340 (6ea6ab49...). Step 2 (firmware area + SHA-256) and steps 3-4 are untested: the
+  wlan2 image with `negroniadsp_step=4` never produced a log (see section 16, battery).
+- Next: with a charged phone, `negroniadsp=1 negroniadsp_step=4` (reads the area, votes the rails, QMP), then the
+  full run; keep `phone-audio.sh status` + `grep "CRASH mediaserverd"` over several boots to decide stage 0.
 
 ## 17. GPU kernel round 2 (2026-10-25; patches 0232-0234, details: patches/xnu/README-gpu-kernel.md sections 8-11)
 
@@ -1122,3 +1198,24 @@ Patches (2026-10-25, regenerated with scripts/kernel/patched-tree.sh in out/kern
   `negroniwifi=10` (+ `negroniwlan=2` only after step 10 passed once). Expect the 0262 lines of README-wifi;
   the key lines are `7 root port DBI ID 17cb:....` (not ffff) and `8 try N: link UP ... state 0x11 L0`, then
   `9 bus 1 device 17cb:1103`. If step 7 stops with "DBI does not answer": `negroniwifi_dbi=1`.
+
+## 22. Power off (2026-10-26, patch 0214; details: patches/xnu/README-reboot.md "0214")
+
+- [V] Owner symptom: "Shut down" / `op10tool ctl poweroff` ends in a reboot into iOS. Log 2026-10-26
+  (logs/usblog.log): `poweroff` at 00:47:38, `NEGRONI REBOOT: PSCI SYSTEM_OFF` (no `returned` line), `en10 up`
+  at 00:48:27 = 49 s. `reboot` (PSCI `SYSTEM_RESET`) at 00:37:34, `en10 up` at 00:38:22 = 48 s. Same timing:
+  `SYSTEM_OFF` was a reset.
+- [V] Cause: TZ implements SYSTEM_OFF and SYSTEM_RESET by dropping PS_HOLD; the PMK8350 PON_PBS
+  `PS_HOLD_RST_CTL` type decides (reset or shutdown). 0211 never set it (default mode = SYSTEM_OFF only).
+  Android sets SHUTDOWN before every power off and HARD_RESET before every reset (`msm-poweroff.c`,
+  `qpnp-power-on.c`, OnePlus sm8450 kernel, branch `oneplus/sm8450_b_16.0_oneplus_10_pro`).
+- [V] 0211's PMIC fallback used GEN1/2 offsets `+0x5a/+0x5b`; PON GEN3 (PMK8350, subtype 0x08) has
+  `PS_HOLD_RST_CTL` at `+0x52`, `CTL2` at `+0x53` (`qpnp-power-on.c` line 88-90). GEN3 has no PON/POFF reason
+  registers; the PMIC PON log is in SDAM 0x7400 (`pmic-pon-log.c`: +0x45 count, +0x46 push ptr, +0x47 push
+  SDAM, 4-byte entries at +0x4b..+0xbf).
+- [V] 0214: power off = PS_HOLD type SHUTDOWN, then SYSTEM_OFF (SYSTEM_RESET if it returns); restart sets
+  HARD_RESET if the type reads SHUTDOWN; boot prints the type and the decoded PON log (`NEGRONI PON LOG:`).
+- [I] Not tested on the phone yet (battery empty, brownout loop; coordinator hold). The USB auto-boot after a
+  shutdown (PON trigger `USB_CHARGER`) is a separate case; the PON log at the next boot shows which one it was.
+- [I] Fastboot-menu "Power off" is ABL code; 0214 does not cover it. With the cable in it is likely the same
+  USB_CHARGER auto-boot.
