@@ -16,6 +16,8 @@
 # 1g. Metal driver plugin NegroniMetal.bundle + probes: scripts/metal/root-add-metal.sh (METAL=1; default on
 #     when out/metal/stage is built, METAL=0 to leave it out). Only processes in
 #     /var/db/negronimetal/clients get a device (default: the probes; METAL_CLIENTS="... backboardd SpringBoard")
+# 1h. PowerMenu.app (bootloader/restart/shut down) + setuid helper: scripts/ios16/root-add-powermenu.sh
+#     (POWERMENU=1; default on when out/powermenu/PowerMenu.app is built, POWERMENU=0 to leave it out)
 # 3. remove host metadata folders (macOS creates .fseventsd/.Spotlight-V100 on mount)
 set -euo pipefail
 R=$1
@@ -32,6 +34,8 @@ AUDIO=${AUDIO:-0} sh "$REPO/scripts/audio/root-add-audio.sh" "$R"   # docs/audio
 NEGRONIGL=${NEGRONIGL:-0} sh "$REPO/scripts/gpu/root-add-negronigl.sh" "$R"   # GL driver plugin (docs/gpu-userland.md)
 if [ -z "${METAL:-}" ] && [ -d "$REPO/out/metal/stage/usr/local/bin" ]; then METAL=1; fi
 METAL=${METAL:-0} sh "$REPO/scripts/metal/root-add-metal.sh" "$R"   # Metal driver plugin (docs/metal-plan.md)
+if [ -z "${POWERMENU:-}" ] && [ -x "$REPO/out/powermenu/PowerMenu.app/PowerMenu" ]; then POWERMENU=1; fi
+POWERMENU=${POWERMENU:-0} sh "$REPO/scripts/ios16/root-add-powermenu.sh" "$R"   # power menu app (userland/rebootapp/README.md)
 
 n=0
 for app in "$R"/private/var/staged_system_apps/*.app; do

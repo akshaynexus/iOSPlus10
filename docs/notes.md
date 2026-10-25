@@ -162,6 +162,31 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   `--migration skip|once`.
 - Debug text over the GUI came from `negronifb_noconsole=0` + `-enable_kprintf_spam` in the debug image.
   The normal image uses `negronifb_noconsole=1` and keeps the log on USB only.
+- **PowerMenu.app (2026-10-25, details: userland/rebootapp/README.md):** owner's UIKit app, 3 buttons, setuid
+  helper `/usr/local/libexec/powermenu-helper` (root:mobile 4750, caller = uid 0 or parent
+  `/Applications/PowerMenu.app/PowerMenu`). Hook `scripts/ios16/root-add-powermenu.sh` (POWERMENU=1 default when
+  built); running phone: `scripts/net/phone-add-powermenu.sh` (not run). Nothing tested on the phone yet.
+  - [V] `userland/rebootapp/build.sh` reproduces the owner's hand-built PowerMenu.app byte for byte (flags: no -O,
+    `-fobjc-arc -framework UIKit -framework Foundation -framework QuartzCore`; signed with a copy of
+    userland/ssh/entitlements.plist). Two runs give the same bytes.
+  - [V] ld (ld-27037.1, Xcode 27.1) puts the output path into LC_UUID: the same object linked to two paths gives two
+    UUIDs. Link with a relative `-o` in a fixed folder for reproducible binaries.
+  - [V] Apps run as mobile; `reboot(2)` needs euid 0 (`suser()`, kern_xxx.c); no negroni MAC hook checks reboot.
+    The app's own `reboot()` call could not work.
+  - [V] The negroni kernel has `CONFIG_SETUID` (buildtree DEVELOPMENT_ARM64_NEGRONI Makefile) and sets no MNT_NOSUID on
+    the root; the iOS root has no /private/etc/fstab. [I] So setuid binaries on the root work; check `mount` on the phone.
+  - [V] No kernel has `kern.negroni_reboot_mode`. The 0210 `bootloader` command is only for UDP frames on ue0 from
+    192.168.7.1; 0211 restart always writes reason 0. [I] A process on the phone cannot select fastboot: needs a
+    kernel sysctl (small patch). The helper exits 3 for "bootloader" and does not reboot.
+  - [V] 20H392 installd: an app with the bundle id of a system app needs `container-required`, or `no-container` +
+    `platform-application` (installd string). PowerMenu has the second pair.
+  - [V] A new root has no LaunchServices `.csstore` and no `/var/mobile/Library/MobileInstallation/LastBuildInfo.plist`
+    (checked on a built root). [I] The first boot builds the app database from /Applications, so no staged-app list
+    or installd step is needed (InstalledContentLibrary knows systemAppsDirectory and private/var/staged_system_apps).
+  - [V] Stock apps have `UIRequiredDeviceCapabilities` = arm64 (Preferences, MobileSafari); Camera also has SBAppTags
+    `still-camera`. PowerMenu's Info.plist asks only arm64.
+  - [I] On a running phone `LSApplicationWorkspace registerApplicationDictionary:` (ApplicationType System) registers
+    an app in /Applications (bergamota NOTES 2026-10-20, Poco F1, sweetuicache; its iOS version then not checked); our tool: pmregister.
 
 ## 5. Kernel build facts
 

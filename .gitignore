@@ -18,3 +18,7 @@ inputs/
 logs/
 tools/op10tool/target/
 __pycache__/
+# Hand builds in the source folder (userland/rebootapp/build.sh writes to out/powermenu/).
+userland/rebootapp/PowerMenu
+userland/rebootapp/*.app/
+userland/rebootapp/_CodeSignature/
