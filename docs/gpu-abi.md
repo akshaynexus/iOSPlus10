@@ -1,11 +1,16 @@
-# RedwoodGPU user-client ABI (kernel patches 0230 + 0231)
+# RedwoodGPU user-client ABI (kernel patches 0230-0234)
 
 This document is the kernel side of the GPU interface. User space (`userland/negronigl`,
 header `userland/negronigl/drm/ngl_abi.h`) implements against it. Kernel source:
 `iokit/Kernel/arm/NegroniGPU.cpp` (patches `patches/xnu/0230-negroni-gpu-surface-import.patch`,
-`0231-negroni-gpu-present.patch`). Background and test plan: `patches/xnu/README-gpu-kernel.md`.
+`0231-negroni-gpu-present.patch`, `0232-negroni-gpu-host-import.patch` (selector 0x49),
+`0233-negroni-gpu-per-client-va.patch` (own GPU tables per client), `0234-negroni-fb-zero-copy.patch`
+(display scanout, no user-space call)). Background and test plan: `patches/xnu/README-gpu-kernel.md`.
 
-Status: written and syntax-checked against the CI build tree. **Not built by CI, not booted.**
+Status: 0230-0234 build in the local full build (`scripts/kernel/build-local.sh`). **Not booted.**
+Changes of 2026-10-25 (round 2): 0x49 USERPTR (section 4), `NegroniGPUABI` text (section 2), per-client
+GPU tables with `negronigpu_pt=1` and the window that depends on it (section 5), host-import cache rules
+(section 6), zero-copy scanout (section 8), new boot-args (section 9).
 
 ## 1. Which ABI
 
@@ -14,7 +19,7 @@ The user client has **two ABIs on the same connection**. Both match `ngl_abi.h` 
 | ABI | `ngl_abi.h` name | Selectors | Use |
 |---|---|---|---|
 | scalar | `NGL_ABI_SCALAR` | 10-16 | Mesa freedreno (GL) with sailfish's `sweet_drm.c` model |
-| msm | `NGL_ABI_MSM_STRUCT` | 0x09, 0x40-0x4c, 0x7e | Turnip (Vulkan, the Metal path) and freedreno through a libdrm pass-through |
+| msm | `NGL_ABI_MSM_STRUCT` | 0x09, 0x40-0x4c (0x49 = USERPTR), 0x7e | Turnip (Vulkan, the Metal path) and freedreno through a libdrm pass-through |
 
 - The scalar ABI is the ios-sailfish `SweetGPU` selector table 10-16 (section 3 lists every
   difference). It is the default of `NEGRONIGL_ABI=auto`.
@@ -30,7 +35,7 @@ The user client has **two ABIs on the same connection**. Both match `ngl_abi.h` 
 | Class | `RedwoodGPU` (`IOServiceMatching("RedwoodGPU")`, provider `IOResources`) |
 | Open | `IOServiceOpen(service, mach_task_self(), 0, &connect)` (type 0) |
 | User client | `RedwoodGPUUserClient` |
-| Property | `NegroniGPUABI` = `"scalar 10-16, msm 0x09 0x40-0x4c 0x7e"` |
+| Property | `NegroniGPUABI` = `"scalar 10-16, msm 0x09 0x40-0x4c 0x7e, userptr 0x49, va shared"` (`va per-client` with `negronigpu_pt=1`). A kernel without 0232 has no `userptr` in the text. |
 | Exists when | boot-args `negroniadreno=22 negroniadreno_keep=1` (and `negroniadreno_service` not 0), and all 22 ladder steps pass. The ladder runs when the root device is found, so the service appears after IOKit's first matching. Poll for it. |
 | Memory map | `IOConnectMapMemory64(connect, handle, mach_task_self(), &addr, &size, kIOMapAnywhere)`: memory type = GEM handle. This is the `mmap()` of `MSM_INFO_GET_OFFSET` (`handle << 32`). |
 
@@ -52,6 +57,8 @@ the same name is a kernel link failure.
 | `kIOReturnBusy` | EBUSY | CPU_PREP with "do not wait" (NOSYNC, scalar 16): not done yet |
 | `kIOReturnNotReady` | ENODEV | the GPU is stopped (hang detected) or not kept |
 | `kIOReturnUnsupported` | ENOSYS | selector or flag that is not implemented |
+| `kIOReturnNotPermitted` | EPERM | 0x49 from a task that did not open the connection |
+| `kIOReturnBusy` (submit) | EBUSY | `negronigpu_pt=1`: the GPU did not get idle within 60 s for a table switch |
 | `kIOReturnVMError` | EIO | copyin/copyout or wiring failed |
 | `kIOReturnNotOpen` | EIO | the client is closing |
 
@@ -118,7 +125,7 @@ ones of Linux `include/uapi/drm/msm_drm.h` (Mesa 25.0.7 `include/drm-uapi/msm_dr
 | 0x46 | GEM_SUBMIT | implemented | see below |
 | 0x47 | WAIT_FENCE | implemented | `fence` up to the last submitted one (else EINVAL); `timeout` absolute `CLOCK_MONOTONIC`, capped at 60 s; `queueid` ignored (one ring); no client lock |
 | 0x48 | GEM_MADVISE | stub | `retained` = 1 (nothing is purged) |
-| 0x49 | GEM_SVM_NEW | not implemented | ENOSYS |
+| 0x49 | redwood_drm_userptr | implemented (0232) | not Linux (Linux: GEM_SVM_NEW, unused by Mesa): a buffer over the caller's own pages (below) |
 | 0x4a | SUBMITQUEUE_NEW | implemented | returns id 1, 2, ...; `prio` must be 0 (PRIORITIES = 1); `flags` (ALLOW_PREEMPT) ignored. All queues share the one ring. |
 | 0x4b | SUBMITQUEUE_CLOSE | stub | success (input: bare `uint32_t` id) |
 | 0x4c | SUBMITQUEUE_QUERY | implemented | `MSM_SUBMITQUEUE_PARAM_FAULTS` only: a `uint32_t` (1 after a GPU hang, else 0) copied to `data` (up to `len` bytes); `len` set to 4 |
@@ -171,11 +178,49 @@ struct redwood_drm_surface {
 };
 ```
 
+0x49 `struct redwood_drm_userptr` (`userland/negronigl/drm/xf86drm.h`, `ngl_abi.h` `NGL_MSM_SEL_USERPTR`), 24 bytes
+exactly (else EINVAL):
+
+```c
+struct redwood_drm_userptr {
+	uint64_t pointer;       /* in: address in the caller, 16 KiB (PAGE_SIZE) aligned */
+	uint64_t size;          /* in: bytes, a multiple of 16 KiB, at most 256 MiB */
+	uint32_t flags;         /* in: NGL_USERPTR_READ_ONLY (0x1): the GPU only reads; other bits EINVAL */
+	uint32_t handle;        /* out: GEM handle */
+};
+```
+
+- For VK_EXT_external_memory_host (Turnip) and `newBufferWithBytesNoCopy:` (Metal).
+- The kernel wires the pages while the handle lives (`IOMemoryDescriptor::withAddressRange` +
+  `prepare`). The GPU keeps the pages that were there at import, also when the program unmaps or
+  remaps the range later. Free with 0x09 (GEM_CLOSE).
+- Without `READ_ONLY` the pages must be writable (else `kIOReturnVMError`, EIO). With it, read-only
+  memory can be imported and the GPU mapping is read-only.
+- Only the task that opened the connection (else EPERM). At most 1 GiB of host imports per client
+  (else ENOMEM), apart from the 1 GiB of own buffers.
+- GEM_INFO works as for other buffers (GET_IOVA, SET_IOVA, GET_FLAGS = `MSM_BO_CACHED` (+
+  `GPU_READONLY`)). `GET_OFFSET` answers, but `IOConnectMapMemory64` of such a handle is refused
+  (`kIOReturnUnsupported`): the program has its own mapping.
+- Cache rules: section 6 ("host import" row).
+
 ## 5. GPU addresses
 
-- One SMMU context (the 3D core's) for every client, 39-bit, 4 KiB pages. **A client's GPU
-  commands can read and write every other client's GPU memory.** Acceptable on this
-  single-user bring-up device only (as ios-sailfish, HackiOS).
+- One SMMU context (the 3D core's), 39-bit, 4 KiB pages. Two layouts (boot-arg `negronigpu_pt`):
+
+| | `negronigpu_pt=0` (default): shared | `negronigpu_pt=1` (0233): per client |
+|---|---|---|
+| Tables | one set for every client | one set per open connection; the kernel's part (0..4 GiB: ring, microcode, scratch, the present's mappings) is the same in each |
+| Isolation | **none: a client's GPU commands can read and write every other client's GPU memory** | a client's commands reach only its own buffers and the kernel's part |
+| Kernel-chosen addresses | 0x1_0000_0000 .. 0x40_0000_0000, shared | the client's own 0x10_0000_0000 .. 0x40_0000_0000; the kernel's own 0x2000_0000 .. 0x1_0000_0000 |
+| `VA_START` / `VA_SIZE` | a 4 GiB window reserved for this client in the shared range (different per client) | 0x1_0000_0000 / 16 GiB, the same in every client (Linux A730: 16 GiB) |
+| Cost | none | the GPU must be idle to switch tables: a submission of client B after one of client A waits until A's work is done (up to 60 s, else EBUSY); kernel present copies need no switch |
+
+  User space must take `VA_START` / `VA_SIZE` from GET_PARAM and not assume values. The table
+  switch is done by the CPU (TTBR0 of the context, then TLBIASID), not by `CP_SMMU_TABLE_UPDATE`
+  from the ring: that needs the CP's SMMU aperture on our context (a TrustZone call, context 2
+  here, Linux puts the GPU in context 0) and nothing of it is tested on this phone
+  (`patches/xnu/README-gpu-kernel.md` section 8). If the context does not take the new tables, the
+  GPU is declared stopped (FAULTS = 1, every submit `kIOReturnNotReady`).
 - Kernel-chosen addresses: first fit in 0x1_0000_0000 .. 0x40_0000_0000, 64 KiB granule. A
   buffer keeps its address while it lives.
 - Userspace-chosen addresses (Turnip's `has_set_iova`): the first `GET_PARAM VA_START` or
@@ -193,6 +238,8 @@ struct redwood_drm_surface {
 | own (scalar BO_NEW, msm GEM_NEW `CACHED` or pool off) | **cached**, kernel memory XNU manages | non-cacheable | the kernel: at each submission it cleans the pages the CPU wrote since the last one (pmap modified bit); CPU_PREP drops the CPU's lines. |
 | pool (msm GEM_NEW `WC`/`UNCACHED`, boot-arg `negronigpu_pool=MiB`) | write-combined, RAM XNU does not manage | non-cacheable | nobody needs to: no cacheable view of it exists |
 | import (IOSurface) | cached (the IOSurface's own mapping) | non-cacheable | the kernel cleans and drops the lines at import and cleans written pages at each submission |
+| host import (0x49) | cached (the program's own mapping) | non-cacheable | as import: clean + drop at import, written pages cleaned at each submission that lists the buffer; after GPU writes the program calls CPU_PREP (0x44) or drops the lines itself (`dc civac`, Turnip's `vkInvalidateMappedMemoryRanges`). Expose such memory as `HOST_CACHED` without `HOST_COHERENT`. |
+| IOSurface in a display slot (0234, backboardd's framebuffers with `negronifb_zerocopy=1`) | cached, RAM XNU does not manage | non-cacheable | the kernel cleans and drops the whole surface by kernel address at import. Its pages have no pmap modified bit, so **CPU writes after import are not cleaned at submit**: a GPU-rendered framebuffer must not be written by the CPU. |
 
 Rules for user space:
 
@@ -231,7 +278,7 @@ numbers, and one ring runs every submission in order. User space emulates syncob
   export as a Mach port) if cross-process sharing through a real fd is needed. The number
   space 0x20-0x2f is kept free for them.
 
-## 8. Present (patch 0231, no user-space call)
+## 8. Present (patches 0231 and 0234, no user-space call)
 
 User space does not call anything to present. When an IOSurface that was imported (scalar 12
 or 0x7e) is listed in a submission, the kernel marks it "GPU-written" with that fence. When
@@ -241,7 +288,18 @@ visible rectangle into the panel memory, queued behind the render on the same ri
 ends when the copy's fence is done, so CoreAnimation renders the next frame into another
 surface of its swap chain. Requirements for this path: BGRA 4 bytes per pixel, surface offset
 and bytes per row multiples of 64 (the IOSurface stand-in asks for 64-byte rows). Other frames
-take the CPU copy. Boot-args: `negronifb_gpu=0` (CPU only), `negronifb_gpuhz` (default 60).
+take the CPU copy. Boot-args: `negronifb_gpu=0` (CPU only), `negronifb_gpuhz` (default: every vsync
+tick, 120).
+
+Zero-copy (0234, `negronifb_zerocopy=1`): backboardd's canvas-sized BGRA framebuffers (1125x2436)
+are placed in display slots of the splash region (3 slots after the panel memory at 0xB8000000). A
+frame that is one such framebuffer alone, full canvas, is not copied: the display engine's pipes are
+pointed at it (crop 22,12, the centred 1080x2412 part) and it is on screen from the next 120 Hz frame.
+A GPU-rendered one is flipped at the first vsync tick after its fence is done. The shown framebuffer
+and the pending one are held in use; `SwapWait` (IOMobileFramebuffer selector 6, called by
+CoreAnimation) waits at most 50 ms until the swap it names is on screen. For the GL/Metal drivers
+this means: import the framebuffer (0x7e or scalar 12), render, submit, then let CoreAnimation swap;
+nothing else. Do not CPU-write a framebuffer after the GPU rendered into it (section 6).
 
 ## 9. Boot-args
 
@@ -253,5 +311,9 @@ take the CPU copy. Boot-args: `negronifb_gpu=0` (CPU only), `negronifb_gpuhz` (d
 | `negronigpu_pool=MiB` | 0 | write-combined pool of RAM XNU does not manage, for msm `WC` buffers (max 2048) |
 | `negronigpu_poolbase=PA` | 0x980000000 | pool start (16 KiB aligned; refused if XNU manages it) |
 | `negronifb_gpu=0` | 1 | present GPU-rendered surfaces with the CPU |
-| `negronifb_gpuhz=N` | 60 | GPU presents per second (vsync ticks) |
+| `negronifb_gpuhz=N` | 120 | GPU copies per second (vsync ticks) |
+| `negronigpu_pt=1` | 0 | per-client GPU tables (section 5) |
+| `negronifb_zerocopy=1` | 0 | zero-copy scanout of backboardd's framebuffers (section 8); needs `negronifb_noconsole=1`, no `negronibadge`, no `negronifb_shift` |
+| `negronifb_dpuprobe=0` | 1 | do not read (log) the display engine's registers at boot |
+| `negronifb_ctl=N` | auto | the display engine's CTL for flushes (auto: the one driving DSI0, else 0) |
 | `negronifb_hz=N` | 10 | CPU presents per second (unchanged) |

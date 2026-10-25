@@ -1,0 +1,203 @@
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index 0d4b860..ac5b85e 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -11,8 +11,10 @@
+  *            and our NGL_ABI_SCALAR): bo new/free/import, submit, wait, info, cpu prep.
+  *   msm      selector = DRM_COMMAND_BASE + DRM_MSM_* (0x40-0x4c) or 0x09 (GEM_CLOSE), the Linux
+  *            msm structure in and out (slop 0118, HackiOS redwood-drm, NGL_ABI_MSM_STRUCT), plus
+- *            0x7e: an IOSurface as a buffer (struct redwood_drm_surface). What Linux does with
+- *            mmap() is IOConnectMapMemory64 with the memory type = the buffer's handle.
++ *            0x7e: an IOSurface as a buffer (struct redwood_drm_surface), and 0x49: the caller's own
++ *            pages as a buffer (struct redwood_drm_userptr, VK_EXT_external_memory_host; msm's unused
++ *            GEM_SVM_NEW number). What Linux does with mmap() is IOConnectMapMemory64 with the memory
++ *            type = the buffer's handle.
+  *
+  * Memory. A buffer of our own is wired kernel memory (IOBufferMemoryDescriptor), mapped CACHED
+  * in the kernel and in the program: a write-combined mapping of memory XNU manages is a second,
+@@ -24,7 +26,9 @@
+  * ask for MSM_BO_WC come from RAM XNU does not manage (negronigpu_poolbase, default 0x980000000:
+  * above Mu's "Kernel RAM" and XNU's 3 GiB, System RAM to Linux), mapped write-combined everywhere:
+  * coherent without cache maintenance, which Vulkan's HOST_COHERENT memory (Turnip) needs.
+- * IOSurface imports are the surface's own pages (NegroniSurface.cpp), cleaned at import.
++ * IOSurface imports are the surface's own pages (NegroniSurface.cpp), cleaned at import. Host
++ * imports (0x49) are the caller's pages, wired while the handle lives, cleaned at import; the CPU
++ * keeps its own cached mapping (rules as for imports: docs/gpu-abi.md section 6).
+  *
+  * GPU addresses: one SMMU context for every client (as HackiOS and sailfish), 39-bit, 4K pages.
+  * Each client may reserve a window of its own (MSM_PARAM_VA_START/VA_SIZE) and place buffers in
+@@ -97,6 +101,7 @@ enum {
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
++	kRedwoodUserptr         = 0x49,         /* not Linux's (its GEM_SVM_NEW): struct redwood_drm_userptr */
+ 	kRedwoodSurface         = 0x7e,         /* not Linux's: struct redwood_drm_surface */
+ };
+ 
+@@ -176,6 +181,15 @@ struct redwood_drm_surface {
+ 	uint32_t offset, row_bytes;     /* out: first pixel in the buffer, bytes per row */
+ 	uint32_t width, height, pixel_format, planes;
+ };
++/* 0x49: a buffer over the caller's own pages (ngl_abi.h NGL_MSM_SEL_USERPTR, xf86drm.h) */
++struct redwood_drm_userptr {
++	uint64_t pointer;               /* in: PAGE_SIZE (16 KiB) aligned address in the caller */
++	uint64_t size;                  /* in: bytes, a multiple of PAGE_SIZE */
++	uint32_t flags;                 /* in: kUserptrReadOnly */
++	uint32_t handle;                /* out */
++};
++#define kUserptrReadOnly        0x1u    /* NGL_USERPTR_READ_ONLY: the GPU only reads the pages */
++
+ /* scalar submit: header, IBs, handles (ngl_abi.h ngl_submit_hdr / ngl_submit_ib) */
+ struct scalar_submit {
+ 	uint32_t nr_ibs, nr_bos;
+@@ -224,6 +238,7 @@ struct scalar_ib {
+ #define GPU_BUFFERS_MAX         16384u
+ #define GPU_BUFFER_MAX          (256ull << 20)
+ #define GPU_CLIENT_BYTES        (1024ull << 20)         /* own wired memory per client */
++#define GPU_CLIENT_HOST_BYTES   (1024ull << 20)         /* the client's own pages wired by host imports */
+ #define GPU_SUBMIT_CMDS         512u
+ #define GPU_SUBMIT_BOS          GPU_BUFFERS_MAX
+ #define GPU_SUBMIT_BYTES        (1u << 20)
+@@ -234,7 +249,7 @@ struct scalar_ib {
+ #define GPU_POOL_BASE           0x980000000ull
+ #define GPU_POOL_MAX_MIB        2048u
+ 
+-enum { kBufferFree = 0, kBufferOwn, kBufferPool, kBufferImport };
++enum { kBufferFree = 0, kBufferOwn, kBufferPool, kBufferImport, kBufferHost };
+ 
+ static IOLock * gGPULock;                       /* around the GPU (negroni_gpu_...), the pool, the present */
+ static bool gGPUStopped;                        /* a submission has not come back: nothing is waited for again */
+@@ -438,7 +453,7 @@ RedwoodGPU::start(IOService * provider)
+ 		return false;
+ 	}
+ 	setProperty(kIOUserClientClassKey, "RedwoodGPUUserClient");
+-	setProperty("NegroniGPUABI", "scalar 10-16, msm 0x09 0x40-0x4c 0x7e");
++	setProperty("NegroniGPUABI", "scalar 10-16, msm 0x09 0x40-0x4c 0x7e, userptr 0x49");
+ 	registerService();
+ 	IOLog("RedwoodGPU: registered\n");
+ 	return true;
+@@ -477,6 +492,7 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	struct gpu_buffer *     fBuffers;               /* handle n is fBuffers[n - 1] */
+ 	uint32_t                fCap;
+ 	uint64_t                fOwnBytes;
++	uint64_t                fHostBytes;             /* host imports (0x49) */
+ 	uint64_t                fWindow;                /* MSM_PARAM_VA_START (0: none asked for) */
+ 	uint32_t                fNextQueue;
+ 	uint32_t                fSubmits;
+@@ -495,6 +511,7 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	void freeAll(void);
+ 	IOReturn makeBuffer(uint64_t size, uint32_t flags, bool scalar, uint32_t * handle);
+ 	IOReturn importSurface(uint32_t id, uint32_t * handle);
++	IOReturn importHost(uint64_t pointer, uint64_t size, uint32_t flags, uint32_t * handle);
+ 	IOReturn setAddress(struct gpu_buffer * b, uint64_t address);
+ 	IOReturn submitIBs(const uint64_t * addresses, const uint32_t * words, uint32_t count,
+ 	    const uint32_t * handles, uint32_t nhandles, uint32_t * fence);
+@@ -702,6 +719,8 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 	}
+ 	if (b->kind == kBufferOwn || b->kind == kBufferPool) {
+ 		fOwnBytes -= b->size;
++	} else if (b->kind == kBufferHost) {
++		fHostBytes -= b->size;
+ 	}
+ 	if (done != kIOReturnSuccess) {
+ 		IOLog("RedwoodGPU: the GPU is not done with a buffer of %llu bytes: it stays its own\n", b->size);
+@@ -902,6 +921,69 @@ RedwoodGPUUserClient::importSurface(uint32_t id, uint32_t * handle)
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * fLock held. 0x49: the caller's pages [pointer, pointer + size) as a buffer (Turnip's
++ * VK_EXT_external_memory_host, Metal's newBufferWithBytesNoCopy:). The pages are wired
++ * (prepare) while the handle lives, so the GPU keeps the pages that were there at import even if
++ * the program unmaps or remaps the range. Read-only (kUserptrReadOnly): wired for reading only
++ * (read-only memory of the program can be imported) and mapped read-only for the GPU. Cache rules
++ * as for an IOSurface import: cleaned and dropped now, the CPU's later writes cleaned at each
++ * submission that lists it, CPU_PREP after GPU writes. Only the task that opened the connection.
++ */
++IOReturn
++RedwoodGPUUserClient::importHost(uint64_t pointer, uint64_t size, uint32_t flags, uint32_t * handle)
++{
++	bool readOnly = (flags & kUserptrReadOnly) != 0;
++	struct gpu_buffer * b;
++
++	if ((flags & ~kUserptrReadOnly) != 0 || pointer == 0 || size == 0 || (pointer & PAGE_MASK) ||
++	    (size & PAGE_MASK) || size > GPU_BUFFER_MAX || pointer + size < pointer) {
++		return kIOReturnBadArgument;
++	}
++	if (current_task() != fTask) {
++		return kIOReturnNotPermitted;
++	}
++	if (fHostBytes + size > GPU_CLIENT_HOST_BYTES) {
++		return kIOReturnNoMemory;
++	}
++	b = newBuffer(handle);
++	if (b == NULL) {
++		IOLog("RedwoodGPU: %s has no handles left\n", fName);
++		return kIOReturnNoResources;
++	}
++	b->kind = kBufferHost;
++	b->size = size;
++	b->readOnly = readOnly;
++	b->flags = MSM_BO_CACHED | (readOnly ? MSM_BO_GPU_READONLY : 0);
++	b->memory = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)pointer, (mach_vm_size_t)size,
++	    readOnly ? kIODirectionOut : kIODirectionInOut, fTask);
++	if (b->memory == NULL) {
++		dropBuffer(b);
++		return kIOReturnNoMemory;
++	}
++	if (b->memory->prepare() != kIOReturnSuccess) {
++		dropBuffer(b);
++		return kIOReturnVMError;        /* not mapped, or not writable without kUserptrReadOnly */
++	}
++	b->prepared = true;
++	if (!takePages(b)) {
++		dropBuffer(b);
++		return kIOReturnVMError;
++	}
++	for (uint32_t p = 0; p < b->npages; p++) {
++		cachePage(b->pa[p]);
++		if (pmap_valid_page((ppnum_t)(b->pa[p] >> PAGE_SHIFT))) {
++			pmap_clear_modify((ppnum_t)(b->pa[p] >> PAGE_SHIFT));
++		}
++	}
++	if (!mapAnywhere(b)) {
++		dropBuffer(b);
++		return kIOReturnNoMemory;
++	}
++	fHostBytes += size;
++	return kIOReturnSuccess;
++}
++
+ /*
+  * fLock held. MSM_INFO_SET_IOVA: 0 takes the buffer's GPU address away (Turnip, before it
+  * reuses the range); otherwise the buffer moves to that address, which must be in this client's
+@@ -1052,7 +1134,9 @@ RedwoodGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, I
+ 
+ 	IOLockLock(fLock);
+ 	b = fClosed ? NULL : buffer(type);
+-	if (b != NULL) {
++	if (b != NULL && b->kind == kBufferHost) {
++		ret = kIOReturnUnsupported;     /* the program has its own mapping of these pages */
++	} else if (b != NULL) {
+ 		b->memory->retain();
+ 		*memory = b->memory;
+ 		*options = b->kind == kBufferPool ? kIOMapWriteCombineCache : kIOMapDefaultCache;
+@@ -1246,6 +1330,7 @@ RedwoodGPUUserClient::msmMethod(uint32_t selector, IOExternalMethodArguments * a
+ 		struct msm_submitqueue_query query;
+ 		struct drm_gem_close close;
+ 		struct redwood_drm_surface surface;
++		struct redwood_drm_userptr userptr;
+ 		uint32_t queueId;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+@@ -1324,6 +1409,10 @@ RedwoodGPUUserClient::msmMethod(uint32_t selector, IOExternalMethodArguments * a
+ 	case kRedwoodSurface:
+ 		ret = surfaceRequest(&r.surface);
+ 		break;
++	case kRedwoodUserptr:
++		ret = size == sizeof(r.userptr) ? importHost(r.userptr.pointer, r.userptr.size, r.userptr.flags,
++		    &r.userptr.handle) : kIOReturnBadArgument;
++		break;
+ 	default:
+ 		IOLog("RedwoodGPU: request %#x (%zu bytes) is not known here\n", selector, size);
+ 		ret = kIOReturnUnsupported;

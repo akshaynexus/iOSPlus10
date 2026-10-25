@@ -1,0 +1,689 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index f4dfd24..13be243 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -2047,10 +2047,55 @@ gpu_stop(void)
+ 
+ static bool gpu_kept;
+ static uint32_t gpu_fence;
+-static struct {
++
++/* A first-fit list of free GPU address ranges (the kernel's, and each client's with negronigpu_pt=1). */
++struct gpu_range {
+ 	uint64_t start, size;
+-} gpu_free[1024];
+-static unsigned gpu_free_count;
++};
++struct gpu_heap {
++	struct gpu_range *free;
++	unsigned count, cap;
++};
++static struct gpu_range gpu_free[1024];
++static struct gpu_heap gpu_heap = { gpu_free, 0, sizeof(gpu_free) / sizeof(gpu_free[0]) };
++
++/*
++ * Per-client GPU address spaces (boot-arg negronigpu_pt=1, default 0; patch 0233). Each client
++ * gets its own translation tables; the kernel's part, root entries 0..GPU_KERNEL_ROOTS-1
++ * (0..4 GiB: ring, microcode, scratch, the present's mappings), points to the same level-2 tables
++ * in every root, so the kernel's commands work under any client's tables. The CPU switches the
++ * 3D core's SMMU context (TTBR0, then TLBIASID) between two submissions of different clients
++ * while the core is idle (every fence done, the ring read to its end); the first submission after
++ * a switch starts with a UCHE invalidate (the GPU caches by GPU address). Not the Linux way
++ * (CP_SMMU_TABLE_UPDATE from the ring): that needs the CP's SMMU aperture on our context bank
++ * (TrustZone call QCOM_SCM_SVC_MP 0x0c, cmd 0x1b, in Linux qcom_scm_set_gpu_smmu_aperture) and the
++ * hypervisor's agreement; our context is 2, not the 0 Linux's adreno-smmu gives the GPU, and
++ * nothing of it is tested on this phone. The CPU switch uses only register writes the ladder
++ * already makes (step 19: TTBR0 of this context, read back).
++ */
++#define GPU_KERNEL_ROOTS        4u                      /* root entries shared by every table: 0..4 GiB */
++#define GPU_KERNEL_HEAP_START   0x20000000ull           /* kernel-chosen addresses with negronigpu_pt=1 */
++#define GPU_KERNEL_HEAP_END     ((uint64_t)GPU_KERNEL_ROOTS << 30)
++#define GPU_VM_WINDOW_START     0x100000000ull          /* a client's MSM_PARAM_VA_START (Turnip's own addresses) */
++#define GPU_VM_WINDOW_SIZE      0x400000000ull          /* 16 GiB, as Linux's A730 address_space_size */
++#define GPU_VM_HEAP_START       0x1000000000ull         /* a client's kernel-chosen addresses */
++#define GPU_VM_HEAP_SIZE        0x3000000000ull         /* to 256 GiB; the context's limit is 512 GiB (39 bits) */
++#define GPU_VM_PAGES            2048u                   /* PAGE_SIZE pages of tables per client: 8192 tables */
++#define GPU_IDLE_US             2000u                   /* longest wait for the ring to be read to its end */
++#define EVENT_CACHE_INVALIDATE7 0x33                    /* adreno_pm4.xml CACHE_INVALIDATE7 (A7XX) */
++
++struct negroni_gpu_vm {
++	uint64_t *root;
++	uint64_t root_phys;
++	unsigned page_count, tables_left;
++	vm_offset_t pages[GPU_VM_PAGES];
++	struct gpu_range ranges[1024];
++	struct gpu_heap heap;
++};
++
++static bool gpu_per_client;             /* negronigpu_pt=1 */
++static uint64_t gpu_root_current;       /* the root (physical) TTBR0 of the 3D core's context has now */
++static bool gpu_invalidate_next;        /* the next submission starts with a UCHE invalidate */
+ 
+ bool negroni_gpu_ready(void);
+ bool negroni_gpu_parameter(uint32_t which, uint64_t *value);
+@@ -2067,6 +2112,17 @@ bool negroni_gpu_fence_valid(uint32_t fence);
+ uint32_t negroni_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+ void negroni_gpu_report(const char *why);
+ bool negroni_gpu_expected(void);
++bool negroni_gpu_per_client(void);
++struct negroni_gpu_vm *negroni_gpu_vm_create(void);
++bool negroni_gpu_vm_destroy(struct negroni_gpu_vm *vm);
++uint64_t negroni_gpu_vm_address(struct negroni_gpu_vm *vm, uint64_t size);
++void negroni_gpu_vm_address_free(struct negroni_gpu_vm *vm, uint64_t address, uint64_t size);
++bool negroni_gpu_vm_map(struct negroni_gpu_vm *vm, uint64_t address, uint64_t phys, bool read_only);
++void negroni_gpu_vm_unmap(struct negroni_gpu_vm *vm, uint64_t address, uint64_t size);
++void negroni_gpu_vm_mapped(struct negroni_gpu_vm *vm);
++bool negroni_gpu_vm_current(const struct negroni_gpu_vm *vm);
++bool negroni_gpu_vm_switch(struct negroni_gpu_vm *vm);
++uint64_t negroni_gpu_vm_window(uint64_t *size);
+ extern void NegroniGPUStart(void);
+ 
+ bool
+@@ -2123,19 +2179,21 @@ gpu_address_span(uint64_t size)
+ 	return (size + (GPU_ADDRESS_GRANULE - 1)) & ~(GPU_ADDRESS_GRANULE - 1);
+ }
+ 
+-/* First fit out of the free list; the address is the buffer's until negroni_gpu_address_free(). 0: none left. */
+-uint64_t
+-negroni_gpu_address(uint64_t size)
++/* First fit out of a free list; the address is the caller's until heap_free(). 0: none left. */
++static uint64_t
++heap_alloc(struct gpu_heap *heap, uint64_t size)
+ {
++	struct gpu_range *f = heap->free;
++
+ 	size = gpu_address_span(size);
+-	for (unsigned i = 0; i < gpu_free_count; i++) {
+-		if (gpu_free[i].size >= size) {
+-			uint64_t address = gpu_free[i].start;
+-
+-			gpu_free[i].start += size;
+-			gpu_free[i].size -= size;
+-			if (gpu_free[i].size == 0) {
+-				memmove(&gpu_free[i], &gpu_free[i + 1], (--gpu_free_count - i) * sizeof(gpu_free[0]));
++	for (unsigned i = 0; i < heap->count; i++) {
++		if (f[i].size >= size) {
++			uint64_t address = f[i].start;
++
++			f[i].start += size;
++			f[i].size -= size;
++			if (f[i].size == 0) {
++				memmove(&f[i], &f[i + 1], (--heap->count - i) * sizeof(f[0]));
+ 			}
+ 			return address;
+ 		}
+@@ -2143,30 +2201,44 @@ negroni_gpu_address(uint64_t size)
+ 	return 0;
+ }
+ 
+-void
+-negroni_gpu_address_free(uint64_t address, uint64_t size)
++static void
++heap_free(struct gpu_heap *heap, uint64_t address, uint64_t size)
+ {
++	struct gpu_range *f = heap->free;
+ 	unsigned at;
+ 
+ 	size = gpu_address_span(size);
+-	for (at = 0; at < gpu_free_count && gpu_free[at].start < address; at++) {
++	for (at = 0; at < heap->count && f[at].start < address; at++) {
+ 	}
+-	if (at > 0 && gpu_free[at - 1].start + gpu_free[at - 1].size == address) {
+-		gpu_free[at - 1].size += size;
+-		if (at < gpu_free_count && address + size == gpu_free[at].start) {
+-			gpu_free[at - 1].size += gpu_free[at].size;
+-			memmove(&gpu_free[at], &gpu_free[at + 1], (--gpu_free_count - at) * sizeof(gpu_free[0]));
++	if (at > 0 && f[at - 1].start + f[at - 1].size == address) {
++		f[at - 1].size += size;
++		if (at < heap->count && address + size == f[at].start) {
++			f[at - 1].size += f[at].size;
++			memmove(&f[at], &f[at + 1], (--heap->count - at) * sizeof(f[0]));
+ 		}
+-	} else if (at < gpu_free_count && address + size == gpu_free[at].start) {
+-		gpu_free[at].start = address;
+-		gpu_free[at].size += size;
+-	} else if (gpu_free_count < sizeof(gpu_free) / sizeof(gpu_free[0])) {
+-		memmove(&gpu_free[at + 1], &gpu_free[at], (gpu_free_count++ - at) * sizeof(gpu_free[0]));
+-		gpu_free[at].start = address;
+-		gpu_free[at].size = size;
++	} else if (at < heap->count && address + size == f[at].start) {
++		f[at].start = address;
++		f[at].size += size;
++	} else if (heap->count < heap->cap) {
++		memmove(&f[at + 1], &f[at], (heap->count++ - at) * sizeof(f[0]));
++		f[at].start = address;
++		f[at].size = size;
+ 	}
+ }
+ 
++/* The kernel's GPU addresses (every client's too with negronigpu_pt=0). 0: none left. */
++uint64_t
++negroni_gpu_address(uint64_t size)
++{
++	return heap_alloc(&gpu_heap, size);
++}
++
++void
++negroni_gpu_address_free(uint64_t address, uint64_t size)
++{
++	heap_free(&gpu_heap, address, size);
++}
++
+ bool
+ negroni_gpu_map(uint64_t address, uint64_t phys, bool read_only)
+ {
+@@ -2253,6 +2325,236 @@ negroni_gpu_expected(void)
+ 	return last >= 22 && keep != 0 && service != 0;
+ }
+ 
++/* ---- per-client tables (negronigpu_pt=1) ---- */
++
++bool
++negroni_gpu_per_client(void)
++{
++	return gpu_per_client;
++}
++
++/* A zeroed 4K table of vm's (tables come four to a PAGE_SIZE page, given back with the vm). */
++static uint64_t *
++vm_new_table(struct negroni_gpu_vm *vm)
++{
++	uint64_t *table;
++
++	if (vm->tables_left == 0) {
++		vm_offset_t page = 0;
++		if (vm->page_count == GPU_VM_PAGES ||
++		    kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return NULL;
++		}
++		vm->pages[vm->page_count++] = page;
++		vm->tables_left = PAGE_SIZE / 4096;
++	}
++	table = (uint64_t *)(vm->pages[vm->page_count - 1] + PAGE_SIZE - 4096 * vm->tables_left--);
++	to_memory((vm_offset_t)table, 4096);    /* zeroed: the walker must not see old lines */
++	return table;
++}
++
++/* The level-3 entry for address in vm's tables (made on the way when make is set), or NULL. */
++static uint64_t *
++vm_entry(struct negroni_gpu_vm *vm, uint64_t address, bool make)
++{
++	uint64_t *table = vm->root;
++
++	for (unsigned shift = 30; shift >= 21; shift -= 9) {
++		uint64_t *entry = &table[(address >> shift) & 0x1ff];
++		if (*entry & 1) {
++			table = (uint64_t *)phystokv(*entry & PTE_ADDRESS);
++			continue;
++		}
++		if (!make || (table = vm_new_table(vm)) == NULL) {
++			return NULL;
++		}
++		*entry = kvtophys((vm_offset_t)table) | PTE_TABLE;
++		to_memory((vm_offset_t)entry, sizeof(*entry));
++	}
++	return &table[(address >> 12) & 0x1ff];
++}
++
++/*
++ * A client's tables: a root whose kernel entries are the kernel's (the same level-2 tables, made
++ * at gpu_keep), its own address list. NULL when negronigpu_pt is 0 or there is no memory.
++ * gGPULock held (NegroniGPU.cpp), as for every negroni_gpu_vm_* call.
++ */
++struct negroni_gpu_vm *
++negroni_gpu_vm_create(void)
++{
++	struct negroni_gpu_vm *vm = NULL;
++
++	if (!gpu_per_client || !gpu_kept || core_space.root == NULL ||
++	    kmem_alloc(kernel_map, (vm_offset_t *)&vm, round_page(sizeof(*vm)), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	vm->root = vm_new_table(vm);
++	if (vm->root == NULL) {
++		(void)negroni_gpu_vm_destroy(vm);
++		return NULL;
++	}
++	for (unsigned i = 0; i < GPU_KERNEL_ROOTS; i++) {
++		vm->root[i] = core_space.root[i];
++	}
++	to_memory((vm_offset_t)vm->root, 4096);
++	vm->root_phys = kvtophys((vm_offset_t)vm->root);
++	vm->heap.free = vm->ranges;
++	vm->heap.cap = sizeof(vm->ranges) / sizeof(vm->ranges[0]);
++	vm->ranges[0].start = GPU_VM_HEAP_START;
++	vm->ranges[0].size = GPU_VM_HEAP_SIZE;
++	vm->heap.count = 1;
++	return vm;
++}
++
++/*
++ * Its tables given back. The 3D core must not be able to walk them: when they are the context's
++ * now, the context goes back to the kernel's tables first (the caller waited for the GPU); if that
++ * cannot be done, everything stays allocated (false: leaked on purpose).
++ */
++bool
++negroni_gpu_vm_destroy(struct negroni_gpu_vm *vm)
++{
++	if (vm == NULL) {
++		return true;
++	}
++	if (vm->root_phys != 0 && gpu_root_current == vm->root_phys && !negroni_gpu_vm_switch(NULL)) {
++		printf("NEGRONI GPU: a client's tables are still the GPU's: kept\n");
++		return false;
++	}
++	for (unsigned i = 0; i < vm->page_count; i++) {
++		kmem_free(kernel_map, vm->pages[i], PAGE_SIZE);
++	}
++	kmem_free(kernel_map, (vm_offset_t)vm, round_page(sizeof(*vm)));
++	return true;
++}
++
++/* vm NULL: the kernel's addresses. */
++uint64_t
++negroni_gpu_vm_address(struct negroni_gpu_vm *vm, uint64_t size)
++{
++	return vm == NULL ? negroni_gpu_address(size) : heap_alloc(&vm->heap, size);
++}
++
++void
++negroni_gpu_vm_address_free(struct negroni_gpu_vm *vm, uint64_t address, uint64_t size)
++{
++	if (vm == NULL) {
++		negroni_gpu_address_free(address, size);
++	} else {
++		heap_free(&vm->heap, address, size);
++	}
++}
++
++/* One 4K page at a client address (never in the kernel's part); vm NULL: the kernel's tables. */
++bool
++negroni_gpu_vm_map(struct negroni_gpu_vm *vm, uint64_t address, uint64_t phys, bool read_only)
++{
++	uint64_t *entry;
++
++	if (vm == NULL) {
++		return negroni_gpu_map(address, phys, read_only);
++	}
++	if ((address >> 39) || (address >> 30) < GPU_KERNEL_ROOTS || phys == 0 ||
++	    (entry = vm_entry(vm, address, true)) == NULL) {
++		return false;
++	}
++	*entry = phys | PTE_GMU | PTE_UNPRIVILEGED | (read_only ? PTE_READ_ONLY : 0) | PTE_PAGE;
++	to_memory((vm_offset_t)entry, sizeof(*entry));
++	return true;
++}
++
++void
++negroni_gpu_vm_unmap(struct negroni_gpu_vm *vm, uint64_t address, uint64_t size)
++{
++	if (vm == NULL) {
++		negroni_gpu_unmap(address, size);
++		return;
++	}
++	for (uint64_t offset = 0; offset < size; offset += 4096) {
++		uint64_t a = address + offset, *entry;
++		if (!(a >> 39) && (a >> 30) >= GPU_KERNEL_ROOTS && (entry = vm_entry(vm, a, false)) != NULL) {
++			*entry = 0;
++			to_memory((vm_offset_t)entry, sizeof(*entry));
++		}
++	}
++	negroni_gpu_vm_mapped(vm);
++}
++
++/* After map/unmap: the TLB forgotten if these are the context's tables now (the next switch flushes it otherwise). */
++void
++negroni_gpu_vm_mapped(struct negroni_gpu_vm *vm)
++{
++	if (vm == NULL || gpu_root_current == vm->root_phys) {
++		negroni_gpu_mapped();
++	}
++}
++
++/* vm's tables (NULL: the kernel's) are the 3D core's context's now. */
++bool
++negroni_gpu_vm_current(const struct negroni_gpu_vm *vm)
++{
++	return gpu_root_current == (vm != NULL ? vm->root_phys : core_space.tables[0].phys);
++}
++
++/*
++ * The 3D core's context to vm's tables (NULL: the kernel's). Only while the core is idle: every
++ * submission's fence done (the caller waits for negroni_gpu_last() first) and the ring read to its
++ * end. false: not idle, or the context did not take the new TTBR0.
++ */
++bool
++negroni_gpu_vm_switch(struct negroni_gpu_vm *vm)
++{
++	static unsigned logged;
++	uint64_t root = vm != NULL ? vm->root_phys : core_space.tables[0].phys;
++	uint64_t ttbr = root | (uint64_t)core_space.context << 48;
++	uint32_t cb = smmu_cb(&core_space), rptr = ~0u;
++
++	if (!gpu_kept || root == 0) {
++		return false;
++	}
++	if (root == gpu_root_current) {
++		return true;
++	}
++	if (!negroni_gpu_done(gpu_fence)) {
++		return false;
++	}
++	for (unsigned i = 0; i < GPU_IDLE_US / 10 && (rptr = rd(gpu_regs + GPU_WORD(REG_CP_RB_RPTR))) != ring_at; i++) {
++		delay(10);
++	}
++	if (rptr != ring_at) {
++		printf("NEGRONI GPU: no table switch: the ring is read to %u of %u\n", rptr, ring_at);
++		return false;
++	}
++	__asm__ volatile ("dsb sy");
++	wr(smmu + cb + SMMU_CB_TTBR0, (uint32_t)ttbr);
++	wr(smmu + cb + SMMU_CB_TTBR0 + 4, (uint32_t)(ttbr >> 32));
++	__asm__ volatile ("dsb sy");
++	gpu_root_current = root;                /* whatever the read-back says: the TLB goes either way */
++	negroni_gpu_mapped();
++	gpu_invalidate_next = true;
++	if (rd(smmu + cb + SMMU_CB_TTBR0) != (uint32_t)ttbr || rd(smmu + cb + SMMU_CB_TTBR0 + 4) != (uint32_t)(ttbr >> 32)) {
++		printf("NEGRONI GPU: the SMMU context did not take TTBR0 %#llx (reads %#x:%#x): per-client tables off\n",
++		    ttbr, rd(smmu + cb + SMMU_CB_TTBR0 + 4), rd(smmu + cb + SMMU_CB_TTBR0));
++		return false;
++	}
++	if (logged < 8) {
++		logged++;
++		printf("NEGRONI GPU: the 3D core's tables are now %s (root %#llx)\n", vm != NULL ? "a client's" : "the kernel's",
++		    root);
++	}
++	return true;
++}
++
++/* A client's own window (MSM_PARAM_VA_START/VA_SIZE) with negronigpu_pt=1: the same place in every client's tables. */
++uint64_t
++negroni_gpu_vm_window(uint64_t *size)
++{
++	*size = GPU_VM_WINDOW_SIZE;
++	return GPU_VM_WINDOW_START;
++}
++
+ static void
+ ring_fence(uint32_t event, uint32_t at, uint32_t fence)
+ {
+@@ -2267,7 +2569,7 @@ ring_fence(uint32_t event, uint32_t at, uint32_t fence)
+ uint32_t
+ negroni_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+ {
+-	uint32_t wanted = 48 + 4 * count, room = 0;
++	uint32_t wanted = 50 + 4 * count, room = 0;
+ 
+ 	for (int i = 0; i < 20000; i++) {
+ 		room = (rd(gpu_regs + GPU_WORD(REG_CP_RB_RPTR)) + RING_WORDS - ring_at - 1) % RING_WORDS;
+@@ -2286,6 +2588,12 @@ negroni_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
+ 	ring(CP_SYNC_THREADS | CP_SET_THREAD_BR);
+ 	ring_command(CP_THREAD_CONTROL, 1);
+ 	ring(CP_SET_THREAD_BOTH);
++	if (gpu_invalidate_next) {
++		/* new tables since the last submission: nothing the GPU cached under the old ones stays */
++		ring_command(CP_EVENT_WRITE7, 1);
++		ring(EVENT_CACHE_INVALIDATE7);
++		gpu_invalidate_next = false;
++	}
+ 	ring_command(CP_SET_MARKER, 1);
+ 	ring(0x101);                    /* IFPC disable */
+ 	ring_command(CP_SET_MARKER, 1);
+@@ -2340,6 +2648,11 @@ negroni_gpu_report(const char *why)
+ 	    rd(gpu_regs + GPU_WORD(REG_CP_RB_RPTR)), ring_at, rd(gpu_regs + GPU_WORD(REG_RBBM_STATUS)),
+ 	    rd(gpu_regs + GPU_WORD(REG_CP_HW_FAULT)), rd(gpu_regs + GPU_WORD(REG_CP_INTERRUPT_STATUS)),
+ 	    rd(gpu_regs + GPU_WORD(REG_CP_SCRATCH_REG2)));
++	if (gpu_per_client) {
++		uint32_t cb = smmu_cb(&core_space);
++		printf("NEGRONI GPU: tables %#llx (kernel's %#llx), TTBR0 %#x:%#x\n", gpu_root_current, core_space.tables[0].phys,
++		    rd(smmu + cb + SMMU_CB_TTBR0 + 4), rd(smmu + cb + SMMU_CB_TTBR0));
++	}
+ 	space_faulted(&core_space);
+ }
+ 
+@@ -2408,7 +2721,24 @@ gpu_keep(void)
+ 	gpu_fence = 0;
+ 	gpu_free[0].start = GPU_ADDRESSES_START;
+ 	gpu_free[0].size = GPU_ADDRESSES_SIZE;
+-	gpu_free_count = 1;
++	gpu_heap.count = 1;
++	gpu_root_current = core_space.tables[0].phys;
++	uint32_t pt = 0;
++
++	(void)PE_parse_boot_argn("negronigpu_pt", &pt, sizeof(pt));
++	if (pt != 0) {
++		/* the kernel's part of every table: its level-2 tables exist from now on and never move */
++		bool made = core_space.root != NULL;
++		for (unsigned i = 0; made && i < GPU_KERNEL_ROOTS; i++) {
++			made = space_next(&core_space, &core_space.root[i], true) != NULL;
++		}
++		if (made) {
++			gpu_per_client = true;
++			gpu_free[0].start = GPU_KERNEL_HEAP_START;
++			gpu_free[0].size = GPU_KERNEL_HEAP_END - GPU_KERNEL_HEAP_START;
++		}
++		printf("NEGRONI GPU: per-client GPU tables %s\n", made ? "on (negronigpu_pt=1)" : "OFF: no kernel tables");
++	}
+ 	gpu_kept = true;
+ 	snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU KEPT");
+ 	printf("NEGRONI GPU: the 3D core stays on; RedwoodGPU for programs\n");
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index ac5b85e..1cdf031 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -30,9 +30,12 @@
+  * imports (0x49) are the caller's pages, wired while the handle lives, cleaned at import; the CPU
+  * keeps its own cached mapping (rules as for imports: docs/gpu-abi.md section 6).
+  *
+- * GPU addresses: one SMMU context for every client (as HackiOS and sailfish), 39-bit, 4K pages.
+- * Each client may reserve a window of its own (MSM_PARAM_VA_START/VA_SIZE) and place buffers in
+- * it (MSM_INFO_SET_IOVA, Turnip's userspace iova); otherwise the kernel picks.
++ * GPU addresses: one SMMU context (the 3D core's), 39-bit, 4K pages. Default: one set of tables
++ * for every client (as HackiOS and sailfish); each client may reserve a window of its own
++ * (MSM_PARAM_VA_START/VA_SIZE) and place buffers in it (MSM_INFO_SET_IOVA, Turnip's userspace
++ * iova); otherwise the kernel picks. Boot-arg negronigpu_pt=1 (patch 0233): every client has its
++ * own tables (negroni_gpu_vm_*, bsd/dev/negroni_adreno.c), so its commands reach only its own
++ * buffers and the kernel's part (0..4 GiB); the window is then the same 16 GiB in every client.
+  *
+  * Fences: one ring, one sequence for every client and queue. A submission's fence is done when
+  * the 3D core has written it (negroni_gpu_done). A wait that sees the completed fence not move
+@@ -79,6 +82,18 @@ uint32_t negroni_gpu_completed(void);
+ bool negroni_gpu_fence_valid(uint32_t fence);
+ uint32_t negroni_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+ void negroni_gpu_report(const char * why);
++struct negroni_gpu_vm;
++bool negroni_gpu_per_client(void);
++struct negroni_gpu_vm * negroni_gpu_vm_create(void);
++bool negroni_gpu_vm_destroy(struct negroni_gpu_vm * vm);
++uint64_t negroni_gpu_vm_address(struct negroni_gpu_vm * vm, uint64_t size);
++void negroni_gpu_vm_address_free(struct negroni_gpu_vm * vm, uint64_t address, uint64_t size);
++bool negroni_gpu_vm_map(struct negroni_gpu_vm * vm, uint64_t address, uint64_t phys, bool read_only);
++void negroni_gpu_vm_unmap(struct negroni_gpu_vm * vm, uint64_t address, uint64_t size);
++void negroni_gpu_vm_mapped(struct negroni_gpu_vm * vm);
++bool negroni_gpu_vm_current(const struct negroni_gpu_vm * vm);
++bool negroni_gpu_vm_switch(struct negroni_gpu_vm * vm);
++uint64_t negroni_gpu_vm_window(uint64_t * size);
+ void NegroniGPUStart(void);
+ void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ boolean_t pmap_valid_page(ppnum_t pn);
+@@ -453,7 +468,8 @@ RedwoodGPU::start(IOService * provider)
+ 		return false;
+ 	}
+ 	setProperty(kIOUserClientClassKey, "RedwoodGPUUserClient");
+-	setProperty("NegroniGPUABI", "scalar 10-16, msm 0x09 0x40-0x4c 0x7e, userptr 0x49");
++	setProperty("NegroniGPUABI", negroni_gpu_per_client() ? "scalar 10-16, msm 0x09 0x40-0x4c 0x7e, userptr 0x49, va per-client" :
++	    "scalar 10-16, msm 0x09 0x40-0x4c 0x7e, userptr 0x49, va shared");
+ 	registerService();
+ 	IOLog("RedwoodGPU: registered\n");
+ 	return true;
+@@ -494,6 +510,9 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	uint64_t                fOwnBytes;
+ 	uint64_t                fHostBytes;             /* host imports (0x49) */
+ 	uint64_t                fWindow;                /* MSM_PARAM_VA_START (0: none asked for) */
++	uint64_t                fWindowSize;
++	struct negroni_gpu_vm * fVM;                    /* own tables (negronigpu_pt=1), else NULL: the shared ones */
++	bool                    fLeaked;                /* a buffer stayed the GPU's: the tables must stay too */
+ 	uint32_t                fNextQueue;
+ 	uint32_t                fSubmits;
+ 	uint32_t                fCalls;
+@@ -555,6 +574,15 @@ RedwoodGPUUserClient::start(IOService * provider)
+ 	if (!negroni_gpu_ready() || gGPULock == NULL || OSDynamicCast(RedwoodGPU, provider) == NULL) {
+ 		return false;
+ 	}
++	if (negroni_gpu_per_client()) {
++		IOLockLock(gGPULock);
++		fVM = negroni_gpu_vm_create();
++		IOLockUnlock(gGPULock);
++		if (fVM == NULL) {
++			IOLog("RedwoodGPU: no GPU tables for %s\n", fName);
++			return false;
++		}
++	}
+ 	return IOUserClient::start(provider);
+ }
+ 
+@@ -628,13 +656,13 @@ RedwoodGPUUserClient::mapBuffer(struct gpu_buffer * b, uint64_t address)
+ 	IOLockLock(gGPULock);
+ 	for (uint32_t p = 0; p < b->npages && mapped; p++) {
+ 		for (uint64_t sub = 0; sub < PAGE_SIZE && mapped; sub += GPU_PAGE) {
+-			mapped = negroni_gpu_map(address + (uint64_t)p * PAGE_SIZE + sub, b->pa[p] + sub, b->readOnly);
++			mapped = negroni_gpu_vm_map(fVM, address + (uint64_t)p * PAGE_SIZE + sub, b->pa[p] + sub, b->readOnly);
+ 		}
+ 	}
+ 	if (!mapped) {
+-		negroni_gpu_unmap(address, b->size);
++		negroni_gpu_vm_unmap(fVM, address, b->size);
+ 	} else {
+-		negroni_gpu_mapped();
++		negroni_gpu_vm_mapped(fVM);
+ 		b->address = address;
+ 		b->userAddress = false;
+ 	}
+@@ -649,14 +677,14 @@ RedwoodGPUUserClient::mapAnywhere(struct gpu_buffer * b)
+ 	uint64_t address;
+ 
+ 	IOLockLock(gGPULock);
+-	address = negroni_gpu_address(b->size);
++	address = negroni_gpu_vm_address(fVM, b->size);
+ 	IOLockUnlock(gGPULock);
+ 	if (address != 0 && mapBuffer(b, address)) {
+ 		return true;
+ 	}
+ 	if (address != 0) {
+ 		IOLockLock(gGPULock);
+-		negroni_gpu_address_free(address, b->size);
++		negroni_gpu_vm_address_free(fVM, address, b->size);
+ 		IOLockUnlock(gGPULock);
+ 	}
+ 	IOLog("RedwoodGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", b->size);
+@@ -671,9 +699,9 @@ RedwoodGPUUserClient::unmapBuffer(struct gpu_buffer * b)
+ 		return;
+ 	}
+ 	IOLockLock(gGPULock);
+-	negroni_gpu_unmap(b->address, b->size);
++	negroni_gpu_vm_unmap(fVM, b->address, b->size);
+ 	if (!b->userAddress) {
+-		negroni_gpu_address_free(b->address, b->size);
++		negroni_gpu_vm_address_free(fVM, b->address, b->size);
+ 	}
+ 	IOLockUnlock(gGPULock);
+ 	b->address = 0;
+@@ -724,6 +752,7 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 	}
+ 	if (done != kIOReturnSuccess) {
+ 		IOLog("RedwoodGPU: the GPU is not done with a buffer of %llu bytes: it stays its own\n", b->size);
++		fLeaked = true;
+ 		OSSafeReleaseNULL(b->umap);     /* the program's view goes; the pages and the GPU's stay */
+ 		bzero(b, sizeof(*b));           /* memory, surface and page list leak on purpose */
+ 		return;
+@@ -743,11 +772,28 @@ RedwoodGPUUserClient::freeAll(void)
+ 				freeBuffer(&fBuffers[i]);
+ 			}
+ 		}
+-		if (fWindow != 0) {
++		if (fWindow != 0 && fVM == NULL) {
+ 			IOLockLock(gGPULock);
+ 			negroni_gpu_address_free(fWindow, GPU_VA_WINDOW);
+ 			IOLockUnlock(gGPULock);
+-			fWindow = 0;
++		}
++		fWindow = 0;
++		if (fVM != NULL) {
++			IOLockLock(gGPULock);
++			if (!fLeaked && !negroni_gpu_vm_current(fVM)) {
++				fLeaked = !negroni_gpu_vm_destroy(fVM);
++			} else if (!fLeaked) {
++				/* its tables are the 3D core's now: back to the kernel's once the GPU is idle */
++				if (gpuWait(negroni_gpu_last(), 1000) != kIOReturnSuccess || !negroni_gpu_vm_switch(NULL) ||
++				    !negroni_gpu_vm_destroy(fVM)) {
++					fLeaked = true;
++				}
++			}
++			IOLockUnlock(gGPULock);
++			if (fLeaked) {
++				IOLog("RedwoodGPU: %s: its GPU tables stay (the GPU may still use them)\n", fName);
++			}
++			fVM = NULL;
+ 		}
+ 	}
+ 	IOLockUnlock(fLock);
+@@ -1008,7 +1054,7 @@ RedwoodGPUUserClient::setAddress(struct gpu_buffer * b, uint64_t address)
+ 		return kIOReturnSuccess;
+ 	}
+ 	if (fWindow == 0 || (address & PAGE_MASK) || address < fWindow ||
+-	    address + b->size > fWindow + GPU_VA_WINDOW || address + b->size < address) {
++	    address + b->size > fWindow + fWindowSize || address + b->size < address) {
+ 		return kIOReturnBadArgument;
+ 	}
+ 	for (uint32_t i = 0; i < fCap; i++) {
+@@ -1072,6 +1118,27 @@ RedwoodGPUUserClient::submitIBs(const uint64_t * addresses, const uint32_t * wor
+ 		}
+ 	}
+ 	IOLockLock(gGPULock);
++	/*
++	 * Own tables (negronigpu_pt=1): the 3D core switches to them only when it is idle, so the
++	 * work of the client before is waited for first (gpuWait lets go of the lock meanwhile; another
++	 * client may switch again: then wait again).
++	 */
++	for (uint32_t tries = 0; fVM != NULL && !gGPUStopped && !negroni_gpu_vm_current(fVM); tries++) {
++		IOReturn idle = tries < 16 ? gpuWait(negroni_gpu_last(), GPU_WAIT_MAX_MS) : kIOReturnTimeout;
++		if (idle != kIOReturnSuccess) {
++			IOLockUnlock(gGPULock);
++			IOLog("RedwoodGPU: %s: the GPU does not get idle for a table switch (0x%x)\n", fName, idle);
++			return idle == kIOReturnTimeout ? kIOReturnBusy : kIOReturnNotReady;
++		}
++		if (negroni_gpu_vm_current(fVM) || !negroni_gpu_done(negroni_gpu_last())) {
++			continue;               /* another submission came meanwhile: wait for it too */
++		}
++		if (!negroni_gpu_vm_switch(fVM)) {
++			/* idle, and still the context did not take the tables: nothing is safe to run any more */
++			negroni_gpu_report("table switch failed");
++			gGPUStopped = true;
++		}
++	}
+ 	if (gGPUStopped || !negroni_gpu_ready()) {
+ 		IOLockUnlock(gGPULock);
+ 		return kIOReturnNotReady;
+@@ -1161,15 +1228,18 @@ RedwoodGPUUserClient::getParam(struct msm_param * p)
+ 		return kIOReturnSuccess;
+ 	case MSM_PARAM_VA_START:
+ 	case MSM_PARAM_VA_SIZE:
+-		if (fWindow == 0) {
++		if (fWindow == 0 && fVM != NULL) {
++			fWindow = negroni_gpu_vm_window(&fWindowSize);  /* own tables: the same window in every client */
++		} else if (fWindow == 0) {
+ 			IOLockLock(gGPULock);
+ 			fWindow = negroni_gpu_address(GPU_VA_WINDOW);
+ 			IOLockUnlock(gGPULock);
+ 			if (fWindow == 0) {
+ 				return kIOReturnNoMemory;
+ 			}
++			fWindowSize = GPU_VA_WINDOW;
+ 		}
+-		p->value = p->param == MSM_PARAM_VA_START ? fWindow : GPU_VA_WINDOW;
++		p->value = p->param == MSM_PARAM_VA_START ? fWindow : fWindowSize;
+ 		return kIOReturnSuccess;
+ 	default:
+ 		return negroni_gpu_parameter(p->param, &p->value) ? kIOReturnSuccess : kIOReturnBadArgument;

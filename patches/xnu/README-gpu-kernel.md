@@ -1,4 +1,4 @@
-# GPU kernel patches 0230, 0231 (Adreno 730: RedwoodGPU, IOSurface import, GPU present)
+# GPU kernel patches 0230-0234 (Adreno 730: RedwoodGPU, imports, per-client tables, present, zero-copy scanout)
 
 Status (2026-10-25): written, syntax-checked, host-tested (the 2D command stream). **No CI build,
 no boot yet.** Base: branch `base` of `out/kernel/xnu` (xnu-8796.141.3 + dxb + slop 0001-0124).
@@ -9,6 +9,14 @@ Worktree `out/kernel/wt-gpu-kernel`, branch `gpu-kernel`, commits `0230` then `0
 |---|---|---|
 | 0230-negroni-gpu-surface-import | `iokit/Kernel/arm/NegroniGPU.cpp`, `bsd/dev/negroni_adreno.c`, `iokit/Kernel/arm/NegroniSurface.{h,cpp}` | RedwoodGPU lifetime and memory fixes, IOSurface import, both user-client ABIs (scalar 10-16 and msm), userspace GPU addresses, write-combined pool, GPU page-table fixes |
 | 0231-negroni-gpu-present | `bsd/dev/negroni_gpu_blit.{c,h}` (new), `iokit/Kernel/arm/NegroniGPU.{h,cpp}`, `iokit/Kernel/arm/NegroniFramebuffer.cpp`, `bsd/conf/files` | GPU present: the A730's 2D engine copies GPU-rendered swapped surfaces into the panel memory; surfaces held in use until the copy is done |
+| 0232-negroni-gpu-host-import | `iokit/Kernel/arm/NegroniGPU.cpp` | msm selector 0x49 (`struct redwood_drm_userptr`): the caller's own pages as a GEM buffer (VK_EXT_external_memory_host) |
+| 0233-negroni-gpu-per-client-va | `bsd/dev/negroni_adreno.c`, `iokit/Kernel/arm/NegroniGPU.cpp` | boot-arg `negronigpu_pt=1`: own GPU translation tables per client, CPU-switched TTBR0 (section 8) |
+| 0234-negroni-fb-zero-copy | `iokit/Kernel/arm/NegroniFramebuffer.cpp`, `NegroniSurface.{h,cpp}`, `NegroniGPU.cpp`, `NegroniPlatformExpert.cpp` | read-only display-engine probe at boot; boot-arg `negronifb_zerocopy=1`: backboardd's framebuffers in splash-region slots, shown by the display engine directly (section 9) |
+
+Round 2 (2026-10-25): 0232-0234 written in `out/kernel/tree-gpu2` (branch `patched`, commits
+`0232-...`, `0233-...`, `0234-...` on top of the 0231 commit; `git diff 0231-commit 0232-commit` = 0232,
+and so on). They apply after 0231 and before 0240-0260 (0240, 0250, 0251, 0260 checked to apply on
+top). Full local build: section 10.
 
 The user-client ABI is in [`docs/gpu-abi.md`](../../docs/gpu-abi.md). Host test of the 2D
 stream: [`tests/gpu-blit-ib-test.c`](tests/gpu-blit-ib-test.c).
@@ -186,3 +194,75 @@ present path keys on. Mesa renders straight into CoreAnimation's surfaces.
   after a hang.
 - `pmap_clear_modify` / `pmap_is_modified` per page at each submit costs CPU time with many
   large cached buffers (Turnip lists every buffer in every submit): another reason for the pool.
+
+## 8. Per-client GPU tables (0233, `negronigpu_pt=1`, default 0)
+
+- Why the CPU switches the tables [I]: Linux (a6xx_set_pagetable) has the CP write TTBR0 with
+  `CP_SMMU_TABLE_UPDATE` from the ring. That needs (1) the CP's SMMU aperture on the GPU's context
+  bank: a TrustZone call (`qcom_scm_set_gpu_smmu_aperture`, SCM service 0x0c command 0x1b) or a
+  firmware default, and Linux's adreno-smmu gives the GPU context bank 0 for it; (2) the hypervisor
+  (Gunyah) to let the CP's writes through. Our 3D core runs in context 2 [V: slop NOTES boot 0113,
+  "3D core context 2"], context 0 is skipped by `space_pick`, and none of this was tried on the phone.
+  The ladder already writes TTBR0 of context 2 from the CPU and reads it back (step 19) [V], so the
+  CPU switch uses only proven register access.
+- Layout: root entries 0..3 (0..4 GiB) of every client's root point to the kernel's level-2
+  tables, made at `gpu_keep` so they never change: ring 0x01000000, SQE, scratch, and the kernel's
+  own addresses 0x2000_0000..0x1_0000_0000 (present mappings, present IBs, panel memory). Clients:
+  window 0x1_0000_0000 + 16 GiB (SET_IOVA), kernel-chosen 0x10_0000_0000..0x40_0000_0000.
+- Switch (`negroni_gpu_vm_switch`, gGPULock held): every fence done (the submitter waits with
+  `gpuWait`, which lets the lock go), the ring read to its end (rptr == wptr, 2 ms), then TTBR0 =
+  root | context << 48, TLBIASID + TLBSYNC; the next submission starts with `CACHE_INVALIDATE7`
+  (UCHE caches by GPU address). One ASID for all tables, so the TLB is flushed at each switch; a
+  client's map/unmap flushes it only when its tables are the current ones. The kernel's present IBs
+  run under any client's tables (no switch, no wait).
+- A TTBR0 that does not read back, or a ring that does not drain after the fences: the GPU is
+  declared stopped (no more submissions). A client whose buffers the GPU did not finish keeps its
+  tables allocated for good (same rule as the buffers).
+- Cost [I]: serialisation at client changes (backboardd + one app: at most a few switches per frame,
+  each after the GPU is idle). Default stays 0 until a phone test (section 11) shows it works.
+
+## 9. Zero-copy scanout (0234, `negronifb_zerocopy=1`, default 0)
+
+- Reference: ios-s9 0096 (SDM845 SDE, VIG0/VIG1, slots in the splash region, SwapWait) [V on S9:
+  "frames shown zero-copy"], same idea as bergamota 0127/0211.
+- SM8450 SDE facts used [V out/live.dts `qcom,mdss_mdp@ae00000`]: MDSS 0x0ae00000 (len 0x84000);
+  SSPP VIG0-3 +0x5000/0x7000/0x9000/0xb000, DMA0-3 +0x25000..0x2b000; CTL0-5 +0x16000..0x1b000;
+  INTF 1 = DSI; splash region 0xb8000000 size 0x2b00000; apps-SMMU hands off the display stream
+  (`qcom,handoff-smrs = <0x2800 0x402>`). Register layout and CTL_FLUSH bits (VIG0 0, VIG1 1, VIG2 2,
+  VIG3 18, DMA0 11, DMA1 12, DMA2 24, DMA3 25, CTL 17) from sde_hw_sspp.c / sde_hw_ctl.c [I: from
+  memory of the Qualcomm/Linux sources, not from a local copy].
+- Boot (always, read only, `negronifb_dpuprobe=0` skips): one log line per SSPP (`NEGRONI FB: DPU
+  VIG0 addr ... size ... xy ... stride ...`) and per CTL; the pipe(s) whose SRC0_ADDR is the panel
+  memory are ABL's. Expected: one pipe 1080x2412 (or two of 540) at row 0, stride 4320.
+- Slots [V log 2026-10-24: backboardd makes two 1125x2436 BGRA framebuffers, bpr 4608, 11239424
+  bytes, and swaps them in turn]: 3 slots of 0xb04000 after the panel memory (0xb89f0000..). The
+  surfaces are mapped cached in the kernel and in backboardd (RAM XNU does not manage, so no
+  alias with the physical aperture).
+- Flip: SRC0_ADDR = slot, YSTRIDE0 = 4608, SRC_XY = ABL's + (22,12), then CTL_FLUSH; taken at the
+  next frame start (the panel's 120 Hz autorefresh). If the engine does not take a flush within
+  100 ms, zero-copy turns itself off and the pipes go back to the panel memory.
+- Frames that are not one full-canvas slot layer (several layers, other processes' surfaces) take
+  the 0231 GPU copy or the CPU copy; the pipes go back to the panel memory after that copy. Display
+  off and a panic (`negroni_fb_panic` from kPEPanicBegin) do the same, so the fade and the panic text
+  stay visible.
+
+## 10. Build (round 2)
+
+See the status in `docs/gpu-status.md` and the handoff in `docs/notes.md` (kernel path, patch report).
+
+## 11. Hardware test plan, round 2 (after section 6)
+
+1. Same image, no new boot-args: look for the `NEGRONI FB: DPU ...` lines and `NEGRONI FB: zero-copy
+   off (boot-arg ...)`. Check that one or two pipes show `addr 0xb8000000`. Send the lines to the
+   kernel agent; if the layout check failed, the line says why.
+2. `negronifb_zerocopy=1` (keep `negronifb_noconsole=1`): expect `NEGRONI SURF: 3 display slots`,
+   `backboardd create ... slot 0` / `slot 1`, `flip N: slot ... taken after ... us` (< 8400 us). The UI
+   must look as before (clock shift included), with no tearing; scroll and check smoothness. Black or
+   frozen picture: reboot, boot with `negronifb_zerocopy=0`, report the flip lines.
+3. With the GPU (GL) path on as well: `flip N: ... (GPU, ...)` lines; no CPU copies (`frames by the
+   CPU` stays low).
+4. `negronigpu_pt=1` with the GPU path and a Turnip probe running beside backboardd: expect `the 3D
+   core's tables are now a client's` lines, no `SMMU FAULT`, no `table switch failed`. A fault with FAR
+   below 0x1_0000_0000: the kernel's part is missing in a client root.
+5. Turnip host import: a probe that imports a malloc'd 16 KiB-aligned buffer (0x49), lets the GPU
+   write it, CPU_PREP, and checks the bytes.

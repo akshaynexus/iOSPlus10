@@ -1,0 +1,992 @@
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 77b4a68..0aeca4c 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -45,6 +45,29 @@
+  * the GPU's copies of the same frame and with the CPU's stale lines over a
+  * GPU-written surface dropped first.
+  *
++ * Zero-copy scanout (patch 0234, boot-arg negronifb_zerocopy=1, default 0):
++ * the display engine (SM8450 SDE) fetches backboardd's framebuffers itself.
++ * start() reads the engine's state (read only, always; boot-arg
++ * negronifb_dpuprobe=0 skips it) and finds the source pipe(s) whose address
++ * is the panel memory (ABL's splash layout). When the layout is the expected
++ * one, the rest of ABL's splash region becomes display slots that
++ * NegroniSurface.cpp gives backboardd's canvas-sized BGRA framebuffers. A swap
++ * of one such framebuffer alone, full canvas, is then shown by pointing the
++ * pipes at it (source address, stride, crop offset of the centred panel part)
++ * and a CTL flush: the engine takes the new address at its next frame start
++ * (the panel's 120 Hz refresh), so nothing tears and no CPU or GPU copies the
++ * frame. A GPU-rendered one is flipped once its fence is done (checked every
++ * vsync tick, nobody waits); for a CPU-rendered one the rows CoreAnimation
++ * wrote (the swaps' dirty regions) are cleaned from the CPU caches first. The
++ * shown and the pending framebuffer stay held in use; SwapWait (selector 6)
++ * waits (at most 50 ms) until the swap it names is on screen, as the S9 port
++ * (external/ios-s9 0096) does. The clock shift is done in the framebuffer
++ * itself while it is shown and undone before CoreAnimation gets it back. Any
++ * other frame takes the copy paths above, and the pipes go back to the panel
++ * memory once it holds that frame; display off and a panic do that too. No
++ * zero-copy with negronibadge=1, with the console drawn over the GUI
++ * (negronifb_noconsole=0) or with negronifb_shift.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg negronifb_noconsole=1 stops drawing it from
+@@ -73,6 +96,9 @@ extern "C" unsigned char iso_font[256 * 16];
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" void negroni_fb_panic(void);
++
+ enum {
+ 	kNegroniFBGetLayerDefaultSurface  = 3,
+ 	kNegroniFBSwapBegin               = 4,
+@@ -110,6 +136,61 @@ class IOMobileFramebuffer : public IOService {
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
++/*
++ * Zero-copy scanout (0234): the SM8450 SDE as the phone's device tree describes it
++ * (out/live.dts qcom,mdss_mdp@ae00000: qcom,sde-sspp-off, qcom,sde-ctl-off, offsets from MDSS
++ * 0x0ae00000) and the register layout of Qualcomm's sde_hw_sspp.c / sde_hw_ctl.c (Linux
++ * dpu_hw_sspp.c / dpu_hw_ctl.c: the same offsets and CTL_FLUSH bits).
++ */
++#define NEGRONI_MDSS_PA                   0x0ae00000UL
++#define NEGRONI_MDSS_LEN                  0x84000
++#define NEGRONI_SPLASH_PA                 0xb8000000ULL   /* cont_splash_region, 0x2b00000 (DT, Mu "Display Reserved") */
++#define NEGRONI_SPLASH_END                (0xb8000000ULL + 0x2b00000ULL)
++#define NEGRONI_ZC_SLOTS                  3
++#define NEGRONI_ZC_LATCH_TICKS            12      /* 100 ms without the engine taking a flush: zero-copy off */
++#define NEGRONI_ZC_WAIT_MS                50      /* longest SwapWait */
++#define NEGRONI_ZC_CLOCK_ROWS             150     /* the clock shift's rows (negroni_shift_clock) */
++#define NEGRONI_SSPPS                     8
++#define NEGRONI_CTLS                      6
++#define SSPP_SRC_SIZE                     0x00
++#define SSPP_SRC_XY                       0x08
++#define SSPP_OUT_SIZE                     0x0c
++#define SSPP_OUT_XY                       0x10
++#define SSPP_SRC0_ADDR                    0x14
++#define SSPP_SRC_YSTRIDE0                 0x24
++#define SSPP_SRC_FORMAT                   0x30
++#define SSPP_SRC_OP_MODE                  0x38
++#define CTL_LAYER0                        0x00
++#define CTL_TOP                           0x14
++#define CTL_FLUSH                         0x18
++#define CTL_INTF_ACTIVE                   0xf4
++#define CTL_FETCH_PIPE_ACTIVE             0xfc
++#define CTL_FLUSH_CTL                     (1u << 17)
++#define CTL_INTF_DSI0                     (1u << 1)       /* INTF_1 (qcom,sde-intf-type "dp dsi dsi dp") */
++
++static const uint32_t negroni_sspp_off[NEGRONI_SSPPS] = {
++	0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000,
++};
++static const uint8_t negroni_sspp_flush[NEGRONI_SSPPS] = { 0, 1, 2, 18, 11, 12, 24, 25 };
++static const char *const negroni_sspp_name[NEGRONI_SSPPS] = {
++	"VIG0", "VIG1", "VIG2", "VIG3", "DMA0", "DMA1", "DMA2", "DMA3",
++};
++static const uint32_t negroni_ctl_off[NEGRONI_CTLS] = { 0x16000, 0x17000, 0x18000, 0x19000, 0x1a000, 0x1b000 };
++
++static inline uint32_t
++negroni_dpu_rd(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++negroni_dpu_wr(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++static uint32_t get32(const uint8_t *p, uint32_t off);
++
+ #define NEGRONI_FB_GPU_BUSY               8       /* surfaces held until their GPU copy is done */
+ #define NEGRONI_FB_GPU_WAIT_MS            50      /* longest the CPU path waits for the GPU */
+ 
+@@ -151,6 +232,19 @@ public:
+ 	}             fBusy[NEGRONI_FB_GPU_BUSY];
+ 	uint32_t      fLastGPUFence;  /* the newest GPU copy into the panel */
+ 	uint64_t      fGPUFrames, fCPUFrames;
++	/* zero-copy scanout (0234); the fZC* pointers, fZCNext* and the swap ids under fLock */
++	vm_offset_t   fMdss;
++	bool          fZCReady;       /* layout as expected and negronifb_zerocopy=1 */
++	bool          fZCActive;      /* the pipes fetch a framebuffer, not the panel memory */
++	bool          fPendZC;        /* fPending is a zero-copy frame (fPendHold[0]) */
++	bool          fZCNextValid;   /* a flush the engine has not taken yet (fZCNext NULL: the panel memory) */
++	uint32_t      fZCPipes, fZCPipe[2], fZCFlush, fZCCtl;
++	uint32_t      fZCAblXY[2], fZCAblStride[2], fZCAblAddr[2];    /* ABL's values: the panel memory */
++	NegroniSurface *fZCShown;     /* on screen now (retained, held); NULL: the panel memory */
++	NegroniSurface *fZCNext;      /* flushed, not taken yet (retained, held) */
++	uint32_t      fZCNextID, fZCNextTicks;
++	uint32_t      fEndedID, fPresentedID;   /* swap ids: the last SwapEnd, the last one shown */
++	uint64_t      fZCFrames;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -159,8 +253,20 @@ public:
+ 	uint32_t present(const uint8_t *rec, NegroniSurface *const *held);
+ 	void releaseBusy(bool all);
+ 	void keepBusy(NegroniSurface **held, uint32_t fence);
++	void zeroCopyInit(void);
++	NegroniSurface *zeroCopySurface(const uint8_t *rec);
++	bool zeroCopyLatched(void);
++	void zeroCopyRetire(bool tick);
++	void zeroCopyUnshow(NegroniSurface *s);
++	void zeroCopyShiftClock(NegroniSurface *s, uintptr_t k, bool gpu);
++	void zeroCopyRestore(void);
++	void zeroCopyStop(bool now);
++	void flip(NegroniSurface *s, uint32_t id);
++	void swapWait(uint32_t id);
+ };
+ 
++static AppleCLCD *negroni_fb_zc;          /* for the panic hook (negroni_fb_panic) */
++
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -244,6 +350,7 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("negronifb_gpuhz", &gpuhz, sizeof(gpuhz));
+ 	fGpuFlushTicks = (gpuhz == 0 || gpuhz >= 1000000u / NEGRONI_FB_VSYNC_US) ? 1 : (1000000u / NEGRONI_FB_VSYNC_US) / gpuhz;
+ 	fVsync->setTimeoutUS(NEGRONI_FB_VSYNC_US);
++	zeroCopyInit();
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -260,6 +367,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++
++	fb->zeroCopyRetire(true);       /* the engine took the last flip: the frame before goes back */
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -284,6 +393,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			NegroniGPUFenceWait(fb->fLastGPUFence, NEGRONI_FB_GPU_WAIT_MS);
+ 			fb->releaseBusy(false);
+ 		}
++		fb->zeroCopyStop(true);         /* the fade and the dark panel are in the panel memory */
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+@@ -295,7 +405,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		sender->setTimeoutUS(NEGRONI_FB_VSYNC_US);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % (fb->fPendGPU ? fb->fGpuFlushTicks : fb->fFlushTicks)) == 0;
++	bool flush = fb->fDirty && (fb->fPendZC || (count % (fb->fPendGPU ? fb->fGpuFlushTicks : fb->fFlushTicks)) == 0);
++	bool zc = flush && fb->fPendZC && fb->fZCReady;
++	if (zc && (fb->fZCNextValid || !NegroniGPUFenceDone(fb->fPendHold[0]->gpuFence))) {
++		flush = false;          /* the last flip is not taken yet, or the GPU is not done with it: next tick */
++	}
+ 	uint8_t *rec = NULL;
+ 	NegroniSurface *held[NEGRONI_FB_LAYERS] = {};
+ 	if (flush) {
+@@ -305,13 +419,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			memcpy(held, fb->fPendHold, sizeof(held));
+ 			bzero(fb->fPendHold, sizeof(fb->fPendHold));
+ 			fb->fDirty = false;
++			fb->fPendZC = false;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	fb->releaseBusy(false);
+-	if (rec != NULL) {
++	if (rec != NULL && zc) {
++		fb->flip(held[0], get32(rec, 0x50));    /* takes held[0]'s retain and hold */
++		IOFreeData(rec, NEGRONI_FB_SWAP_REC_SIZE);
++	} else if (rec != NULL) {
+ 		uint32_t fence = fb->present(rec, held);
++		if (fb->fZCActive) {
++			/* the panel memory has this frame (the GPU's copy done) before the pipes go back to it */
++			NegroniGPUFenceWait(fence, NEGRONI_FB_GPU_WAIT_MS);
++			fb->zeroCopyStop(false);
++		}
+ 		fb->keepBusy(held, fence);      /* until the GPU has read them (fence 0: now) */
++		IOLockLock(fb->fLock);
++		if (get32(rec, 0x50) > fb->fPresentedID && !fb->fZCNextValid) {
++			fb->fPresentedID = get32(rec, 0x50);
++		}
++		IOLockUnlock(fb->fLock);
+ 		IOFreeData(rec, NEGRONI_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(NEGRONI_FB_VSYNC_US);
+@@ -410,8 +538,21 @@ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	NegroniSurface *held[NEGRONI_FB_LAYERS] = {}, *dropped[NEGRONI_FB_LAYERS];
+ 	uint32_t mask = get32(rec, 0x104);
+-	bool gpu = NegroniGPUPresentReady() && mask != 0;
++	NegroniSurface *zc = zeroCopySurface(rec);       /* retained, or NULL */
++	bool gpu = zc == NULL && NegroniGPUPresentReady() && mask != 0;
+ 
++	if (fZCReady) {
++		/* every display slot must catch up with these rows before it is shown again (0234) */
++		bool part = rec[0x260] != 0;
++		int64_t y0 = (int32_t)get32(rec, 0x254), y1 = y0 + (int32_t)get32(rec, 0x25c);
++		y0 = y0 < 0 ? 0 : y0;
++		y1 = y1 > (int64_t)fLogicalH ? (int64_t)fLogicalH : y1;
++		negroni_surface_slots_dirty(part ? (int32_t)(y0 < y1 ? y0 : 0) : -1, part ? (int32_t)(y0 < y1 ? y1 : 0) : -1);
++	}
++	if (zc != NULL) {
++		held[0] = zc;           /* held in use from now until the engine shows another frame */
++		negroni_surface_hold(zc, true);
++	}
+ 	/* a frame of GPU-rendered layers only: each surface held until the GPU copied it */
+ 	for (uint32_t layer = 0; gpu && layer < NEGRONI_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+@@ -421,7 +562,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		held[layer] = negroni_surface_copy(id);
+ 		gpu = held[layer] != NULL && held[layer] != fSurface && held[layer]->gpuFence != 0;
+ 	}
+-	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++	for (uint32_t layer = 0; zc == NULL && layer < NEGRONI_FB_LAYERS; layer++) {
+ 		if (held[layer] != NULL && !gpu) {
+ 			OSSafeReleaseNULL(held[layer]);
+ 		} else if (held[layer] != NULL) {
+@@ -433,6 +574,11 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(dropped, fPendHold, sizeof(dropped));    /* a frame replaced before it was shown */
+ 	memcpy(fPendHold, held, sizeof(fPendHold));
+ 	fPendGPU = gpu;
++	fPendZC = zc != NULL;
++	fEndedID = get32(rec, 0x50);
++	if (fPowerOff) {
++		fPresentedID = fEndedID;        /* nothing is shown while off: SwapWait must not wait */
++	}
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
+ 	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
+@@ -676,6 +822,398 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
+ 	return fence;
+ }
+ 
++/* ---- zero-copy scanout (0234) ---- */
++
++/*
++ * Read what ABL left in the display engine (read only) and check it is the layout the flips
++ * assume: one pipe, or two side by side, fetching the panel memory from row 0 with its stride.
++ * Then, with negronifb_zerocopy=1, the rest of the splash region becomes display slots.
++ */
++void
++AppleCLCD::zeroCopyInit(void)
++{
++	int on = 0, probe = 1, quiet = 0, badge = 0;
++	uint32_t ctl = ~0u, width = 0;
++	const char *why = NULL;
++
++	PE_parse_boot_argn("negronifb_zerocopy", &on, sizeof(on));
++	PE_parse_boot_argn("negronifb_dpuprobe", &probe, sizeof(probe));
++	PE_parse_boot_argn("negronifb_noconsole", &quiet, sizeof(quiet));
++	PE_parse_boot_argn("negronibadge", &badge, sizeof(badge));
++	PE_parse_boot_argn("negronifb_ctl", &ctl, sizeof(ctl));
++	if (!probe && !on) {
++		return;
++	}
++	if (fPhys != NEGRONI_SPLASH_PA) {
++		IOLog("NEGRONI FB: zero-copy: the panel memory 0x%llx is not the splash region\n", fPhys);
++		return;
++	}
++	fMdss = ml_io_map(NEGRONI_MDSS_PA, NEGRONI_MDSS_LEN);
++	if (fMdss == 0) {
++		IOLog("NEGRONI FB: zero-copy: no mapping of the display engine\n");
++		return;
++	}
++	for (uint32_t p = 0; p < NEGRONI_SSPPS; p++) {
++		vm_offset_t b = fMdss + negroni_sspp_off[p];
++		uint32_t addr = negroni_dpu_rd(b + SSPP_SRC0_ADDR);
++		IOLog("NEGRONI FB: DPU %s addr 0x%x size 0x%x xy 0x%x out 0x%x at 0x%x stride 0x%x format 0x%x op 0x%x\n",
++		    negroni_sspp_name[p], addr, negroni_dpu_rd(b + SSPP_SRC_SIZE), negroni_dpu_rd(b + SSPP_SRC_XY),
++		    negroni_dpu_rd(b + SSPP_OUT_SIZE), negroni_dpu_rd(b + SSPP_OUT_XY), negroni_dpu_rd(b + SSPP_SRC_YSTRIDE0),
++		    negroni_dpu_rd(b + SSPP_SRC_FORMAT), negroni_dpu_rd(b + SSPP_SRC_OP_MODE));
++		if (addr == (uint32_t)fPhys && fZCPipes < 2) {
++			fZCPipe[fZCPipes++] = p;
++		} else if (addr == (uint32_t)fPhys) {
++			why = "more than two pipes fetch the panel memory";
++		}
++	}
++	for (uint32_t c = 0; c < NEGRONI_CTLS; c++) {
++		vm_offset_t b = fMdss + negroni_ctl_off[c];
++		uint32_t intf = negroni_dpu_rd(b + CTL_INTF_ACTIVE);
++		IOLog("NEGRONI FB: DPU CTL%u layer 0x%x 0x%x 0x%x 0x%x top 0x%x flush 0x%x intf 0x%x fetch 0x%x\n", c,
++		    negroni_dpu_rd(b + CTL_LAYER0), negroni_dpu_rd(b + CTL_LAYER0 + 4), negroni_dpu_rd(b + CTL_LAYER0 + 8),
++		    negroni_dpu_rd(b + CTL_LAYER0 + 12), negroni_dpu_rd(b + CTL_TOP), negroni_dpu_rd(b + CTL_FLUSH), intf,
++		    negroni_dpu_rd(b + CTL_FETCH_PIPE_ACTIVE));
++		if (ctl == ~0u && (intf & CTL_INTF_DSI0)) {
++			ctl = c;
++		}
++	}
++	if (ctl >= NEGRONI_CTLS) {
++		ctl = 0;
++	}
++	fZCCtl = negroni_ctl_off[ctl];
++	for (uint32_t i = 0; i < fZCPipes; i++) {
++		vm_offset_t b = fMdss + negroni_sspp_off[fZCPipe[i]];
++		uint32_t size = negroni_dpu_rd(b + SSPP_SRC_SIZE);
++		fZCAblAddr[i] = negroni_dpu_rd(b + SSPP_SRC0_ADDR);
++		fZCAblXY[i] = negroni_dpu_rd(b + SSPP_SRC_XY);
++		fZCAblStride[i] = negroni_dpu_rd(b + SSPP_SRC_YSTRIDE0);
++		if ((size >> 16) != fHeight || (fZCAblXY[i] >> 16) != 0 || (fZCAblXY[i] & 0xffff) != width ||
++		    (fZCAblStride[i] & 0xffff) != fRowBytes) {
++			why = "the pipes' layout differs (size, crop or stride)";
++		}
++		width += size & 0xffff;
++		fZCFlush |= 1u << negroni_sspp_flush[fZCPipe[i]];
++	}
++	fZCFlush |= CTL_FLUSH_CTL;
++	uint64_t base = fPhys + round_page((uint64_t)fRowBytes * fHeight);
++	uint64_t slotSize = trunc_page((NEGRONI_SPLASH_END - base) / NEGRONI_ZC_SLOTS);
++	if (why != NULL) {
++	} else if (fZCPipes == 0) {
++		why = "no pipe fetches the panel memory";
++	} else if (width != fWidth) {
++		why = "the pipes do not cover the panel's width";
++	} else if (fOffX < 0 || fOffY < 0 || (uint32_t)fOffX + fWidth > fLogicalW || (uint32_t)fOffY + fHeight > fLogicalH) {
++		why = "the canvas does not cover the panel (negronifb_shift)";
++	} else if (slotSize < round_page((uint64_t)fLogicalW * 4 * fLogicalH)) {
++		why = "no room for display slots in the splash region";
++	} else if (!on) {
++		why = "off (boot-arg negronifb_zerocopy=1 turns it on)";
++	} else if (!quiet) {
++		why = "off: the console draws over the GUI (negronifb_noconsole=0)";
++	} else if (badge) {
++		why = "off: negronibadge=1 draws into the panel memory";
++	}
++	IOLog("NEGRONI FB: zero-copy %s: %u pipe(s) %s%s%s at CTL%u, flush bits 0x%x, %u slots of %llu bytes at 0x%llx, crop %d,%d\n",
++	    why != NULL ? why : "ready", fZCPipes, fZCPipes ? negroni_sspp_name[fZCPipe[0]] : "-", fZCPipes > 1 ? "+" : "",
++	    fZCPipes > 1 ? negroni_sspp_name[fZCPipe[1]] : "", ctl, fZCFlush, NEGRONI_ZC_SLOTS, slotSize, base, fOffX, fOffY);
++	if (why == NULL) {
++		fZCReady = true;
++		negroni_fb_zc = this;
++		negroni_surface_set_display_slots(base, slotSize, NEGRONI_ZC_SLOTS, fLogicalW, fLogicalH, NEGRONI_FB_FORMAT_BGRA);
++	}
++}
++
++/* The display slot surface a swap shows alone in layer 0, full canvas (retained), or NULL. */
++NegroniSurface *
++AppleCLCD::zeroCopySurface(const uint8_t *rec)
++{
++	const uint8_t *a = rec + 0x64, *b = rec + 0xc4;
++
++	if (!fZCReady || (get32(rec, 0x104) & 0xf) != 1 || get32(a, 0) != 0 || get32(a, 4) != 0 ||
++	    get32(b, 0) != 0 || get32(b, 4) != 0 || get32(a, 8) != fLogicalW || get32(a, 12) != fLogicalH ||
++	    get32(b, 8) != fLogicalW || get32(b, 12) != fLogicalH) {
++		return NULL;
++	}
++	NegroniSurface *s = negroni_surface_copy(get32(rec, 0x54));
++	if (s != NULL && (s->slot < 0 || s->width != fLogicalW || s->height != fLogicalH || s->phys == 0 ||
++	    s->bytesPerRow > 0xffff || (s->bytesPerRow & 63) != 0 || s->phys + s->allocSize > NEGRONI_SPLASH_END)) {
++		OSSafeReleaseNULL(s);
++	}
++	return s;
++}
++
++/* The engine took the last flush (it clears the bits at the frame start that applies them). */
++bool
++AppleCLCD::zeroCopyLatched(void)
++{
++	return fMdss == 0 || (negroni_dpu_rd(fMdss + fZCCtl + CTL_FLUSH) & fZCFlush) == 0;
++}
++
++/*
++ * A taken flush: the frame shown before goes back to CoreAnimation. tick (work loop): count the
++ * vsyncs a flush waits; too many and zero-copy is off for good.
++ */
++void
++AppleCLCD::zeroCopyRetire(bool tick)
++{
++	NegroniSurface *old = NULL;
++	bool stuck = false;
++
++	if (fMdss == 0) {
++		return;
++	}
++	IOLockLock(fLock);
++	if (fZCNextValid && zeroCopyLatched()) {
++		old = fZCShown;
++		fZCShown = fZCNext;
++		fZCNext = NULL;
++		fZCNextValid = false;
++		if (fZCNextID > fPresentedID) {
++			fPresentedID = fZCNextID;
++		}
++	} else if (fZCNextValid && tick && ++fZCNextTicks > NEGRONI_ZC_LATCH_TICKS) {
++		stuck = true;
++	}
++	IOLockUnlock(fLock);
++	if (old != NULL) {
++		zeroCopyUnshow(old);
++	}
++	if (stuck) {
++		IOLog("NEGRONI FB: zero-copy off: the display engine does not take flushes (CTL_FLUSH 0x%x)\n",
++		    negroni_dpu_rd(fMdss + fZCCtl + CTL_FLUSH));
++		fZCReady = false;
++		zeroCopyStop(true);
++	}
++}
++
++/* No longer shown: the clock shift undone, the hold and the reference given back. */
++void
++AppleCLCD::zeroCopyUnshow(NegroniSurface *s)
++{
++	if (s->saved && s->save != NULL) {
++		uintptr_t k = s->kernelAddress();
++		uint32_t half = fWidth / 2, bpr = s->bytesPerRow;
++		if (k != 0) {
++			uintptr_t top = k + (uint64_t)fOffY * bpr;
++			for (uint32_t y = 0; y < NEGRONI_ZC_CLOCK_ROWS; y++) {
++				memcpy((uint32_t *)(top + (uint64_t)y * bpr) + fOffX, (uint32_t *)s->save + (uint64_t)y * half,
++				    (size_t)half * 4);
++			}
++			negroni_surface_cache(top, (uint64_t)NEGRONI_ZC_CLOCK_ROWS * bpr, kNegroniCacheFlush);
++		}
++		s->saved = false;
++	}
++	negroni_surface_hold(s, false);
++	s->release();
++}
++
++/*
++ * negronifb_clockshift on a frame the engine shows itself: the left ear of the status bar
++ * shifted in the framebuffer (as negroni_shift_clock does in the panel memory), its pixels kept
++ * to put back when CoreAnimation gets the framebuffer again (zeroCopyUnshow).
++ */
++void
++AppleCLCD::zeroCopyShiftClock(NegroniSurface *s, uintptr_t k, bool gpu)
++{
++	uint32_t half = fWidth / 2, bpr = s->bytesPerRow, size = NEGRONI_ZC_CLOCK_ROWS * half * 4;
++
++	if (negroni_clock_shift < 0) {
++		negroni_clock_shift = 0;
++		PE_parse_boot_argn("negronifb_clockshift", &negroni_clock_shift, sizeof(negroni_clock_shift));
++		if (negroni_clock_shift < 0 || negroni_clock_shift > 400) {
++			negroni_clock_shift = 0;
++		}
++	}
++	uint32_t n = (uint32_t)negroni_clock_shift;
++	if (n == 0 || n >= half || s->saved || (uint64_t)fOffY + NEGRONI_ZC_CLOCK_ROWS > s->height ||
++	    (uint64_t)fOffX + half > s->width) {
++		return;
++	}
++	if (s->save == NULL) {
++		s->save = IOMallocData(size);
++		s->saveSize = s->save != NULL ? size : 0;
++		if (s->save == NULL) {
++			return;
++		}
++	}
++	uintptr_t top = k + (uint64_t)fOffY * bpr;
++	if (gpu) {
++		/* the GPU's pixels from memory, not lines the CPU caches may still hold from before */
++		negroni_surface_cache(top, (uint64_t)NEGRONI_ZC_CLOCK_ROWS * bpr, kNegroniCacheFlush);
++	}
++	for (uint32_t y = 0; y < NEGRONI_ZC_CLOCK_ROWS; y++) {
++		uint32_t *row = (uint32_t *)(top + (uint64_t)y * bpr) + fOffX;
++		uint32_t edge = row[0];
++		memcpy((uint32_t *)s->save + (uint64_t)y * half, row, (size_t)half * 4);
++		memmove(row + n, row, (size_t)(half - n) * 4);
++		for (uint32_t x = 0; x < n; x++) {
++			row[x] = edge;
++		}
++	}
++	negroni_surface_cache(top, (uint64_t)NEGRONI_ZC_CLOCK_ROWS * bpr, kNegroniCacheClean);
++	s->saved = true;
++}
++
++/* ABL's values back in the pipes: they fetch the panel memory from the next frame on. No lock (panic). */
++void
++AppleCLCD::zeroCopyRestore(void)
++{
++	if (fMdss == 0 || fZCPipes == 0) {
++		return;
++	}
++	for (uint32_t i = 0; i < fZCPipes; i++) {
++		vm_offset_t b = fMdss + negroni_sspp_off[fZCPipe[i]];
++		negroni_dpu_wr(b + SSPP_SRC_YSTRIDE0, fZCAblStride[i]);
++		negroni_dpu_wr(b + SSPP_SRC_XY, fZCAblXY[i]);
++		negroni_dpu_wr(b + SSPP_SRC0_ADDR, fZCAblAddr[i]);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	negroni_dpu_wr(fMdss + fZCCtl + CTL_FLUSH, fZCFlush);
++}
++
++/*
++ * The pipes back on the panel memory (it must hold the frame to show). now: everything held is
++ * given back at once (display off, a stuck engine); else when the engine takes the flush. Work loop.
++ */
++void
++AppleCLCD::zeroCopyStop(bool now)
++{
++	NegroniSurface *shown = NULL, *next = NULL;
++	bool active = fZCActive;
++
++	if (!active && fZCShown == NULL && fZCNext == NULL && !fZCNextValid) {
++		return;
++	}
++	for (uint32_t i = 0; i < 80 && fZCNextValid && !zeroCopyLatched(); i++) {
++		delay_for_interval(500, kMicrosecondScale);
++	}
++	zeroCopyRetire(false);
++	if (active) {
++		zeroCopyRestore();
++	}
++	IOLockLock(fLock);
++	fZCActive = false;
++	if (now || fZCNextValid) {
++		shown = fZCShown;
++		next = fZCNext;
++		fZCShown = fZCNext = NULL;
++		fZCNextValid = false;
++		fPresentedID = fEndedID;
++	} else if (active) {
++		fZCNextValid = true;            /* back to the panel memory: the shown one goes when it is taken */
++		fZCNextID = fPresentedID;
++		fZCNextTicks = 0;
++	}
++	IOLockUnlock(fLock);
++	if (shown != NULL) {
++		zeroCopyUnshow(shown);
++	}
++	if (next != NULL) {
++		zeroCopyUnshow(next);
++	}
++	static uint32_t logged;
++	if (active && logged < 32) {
++		logged++;
++		IOLog("NEGRONI FB: zero-copy paused: the pipes fetch the panel memory again\n");
++	}
++}
++
++/* Show slot surface s (retained and held: taken over) from the next frame on. Work loop. */
++void
++AppleCLCD::flip(NegroniSurface *s, uint32_t id)
++{
++	static uint32_t logged;
++	uintptr_t k = s->kernelAddress();
++	uint32_t y0 = 0, y1 = 0, bpr = s->bytesPerRow;
++	bool gpu = s->gpuFence != 0;
++
++	if (!fConsolePaused) {
++		fConsolePaused = true;
++		negroni_console_muted = 1;      /* zero-copy needs negronifb_noconsole=1 */
++	}
++	if (k == 0) {
++		negroni_surface_hold(s, false);
++		s->release();
++		return;
++	}
++	if (negroni_surface_take_dirty(s, &y0, &y1) && !gpu) {
++		/* the rows CoreAnimation's CPU renderer wrote, out of the CPU caches for the engine */
++		y0 = y0 > (uint32_t)fOffY ? y0 : (uint32_t)fOffY;
++		y1 = y1 < (uint32_t)fOffY + fHeight ? y1 : (uint32_t)fOffY + fHeight;
++		if (y0 < y1) {
++			negroni_surface_cache(k + (uint64_t)y0 * bpr, (uint64_t)(y1 - y0) * bpr, kNegroniCacheClean);
++		}
++	}
++	zeroCopyShiftClock(s, k, gpu);
++	for (uint32_t i = 0; i < fZCPipes; i++) {
++		vm_offset_t b = fMdss + negroni_sspp_off[fZCPipe[i]];
++		uint32_t x = (fZCAblXY[i] & 0xffff) + (uint32_t)fOffX, y = (fZCAblXY[i] >> 16) + (uint32_t)fOffY;
++		negroni_dpu_wr(b + SSPP_SRC_YSTRIDE0, (fZCAblStride[i] & 0xffff0000u) | bpr);
++		negroni_dpu_wr(b + SSPP_SRC_XY, y << 16 | x);
++		negroni_dpu_wr(b + SSPP_SRC0_ADDR, (uint32_t)s->phys);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	negroni_dpu_wr(fMdss + fZCCtl + CTL_FLUSH, fZCFlush);
++	IOLockLock(fLock);
++	fZCActive = true;
++	fZCNext = s;
++	fZCNextValid = true;
++	fZCNextID = id;
++	fZCNextTicks = 0;
++	IOLockUnlock(fLock);
++	fZCFrames++;
++	if (logged < 4) {
++		/* bring-up: how long the engine takes to apply a flip (expected: up to one 8.3 ms frame) */
++		uint64_t t0 = mach_absolute_time(), ns;
++		uint32_t i;
++		logged++;
++		for (i = 0; i < 80 && !zeroCopyLatched(); i++) {
++			delay_for_interval(250, kMicrosecondScale);
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		IOLog("NEGRONI FB: flip %u: slot %d at 0x%llx (%s, rows %u-%u cleaned), %s after %llu us\n", id, s->slot,
++		    s->phys, gpu ? "GPU" : "CPU", y0, y1, zeroCopyLatched() ? "taken" : "NOT taken", ns / 1000);
++	} else if (fZCFrames % 1000 == 0) {
++		IOLog("NEGRONI FB: %llu frames shown zero-copy\n", fZCFrames);
++	}
++}
++
++/*
++ * SwapWait: until swap id is on screen (the engine took its flip), at most NEGRONI_ZC_WAIT_MS.
++ * CoreAnimation passes the swap that showed its other framebuffer before it draws into this one
++ * again (ios-s9 0096), so this keeps it out of the framebuffer the engine is fetching. Returns at
++ * once when no zero-copy frame is on its way (copied frames: as before).
++ */
++void
++AppleCLCD::swapWait(uint32_t id)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(NEGRONI_ZC_WAIT_MS, kMillisecondScale, &deadline);
++	for (;;) {
++		zeroCopyRetire(false);
++		IOLockLock(fLock);
++		bool done = id == 0 || !fZCReady || fPowerOff || id > fEndedID || fPresentedID >= id ||
++		    (!fPendZC && !fZCNextValid);
++		IOLockUnlock(fLock);
++		if (done || mach_absolute_time() >= deadline) {
++			break;
++		}
++		delay_for_interval(500, kMicrosecondScale);
++	}
++}
++
++/* Panic (NegroniPlatformExpert.cpp kPEPanicBegin): the panic text is drawn into the panel memory. */
++extern "C" void
++negroni_fb_panic(void)
++{
++	AppleCLCD *fb = negroni_fb_zc;
++
++	if (fb != NULL && fb->fZCReady) {
++		fb->zeroCopyRestore();
++	}
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -821,6 +1359,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		}
+ 		break;
+ 	case kNegroniFBSwapWait:
++		if (args->scalarInputCount >= 1) {
++			fFB->swapWait((uint32_t)args->scalarInput[0]);
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index 1cdf031..582e6fe 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -960,6 +960,10 @@ RedwoodGPUUserClient::importSurface(uint32_t id, uint32_t * handle)
+ 			pmap_clear_modify((ppnum_t)(b->pa[p] >> PAGE_SHIFT));
+ 		}
+ 	}
++	if (s->slot >= 0 && s->kernelAddress() != 0) {
++		/* a display slot (0234): memory XNU does not manage, cached in the CPU: by kernel address */
++		negroni_surface_cache(s->kernelAddress(), size, kNegroniCacheFlush);
++	}
+ 	if (!mapAnywhere(b)) {
+ 		dropBuffer(b);
+ 		return kIOReturnNoMemory;
+@@ -1925,6 +1929,14 @@ NegroniGPUSurfaceForCPU(NegroniSurface * s, uint64_t offset, uint64_t length)
+ 	if (md == NULL || length == 0) {
+ 		return;
+ 	}
++	if (s->slot >= 0) {
++		/* a display slot (0234): not XNU's memory, so not through the physical aperture */
++		uintptr_t k = s->kernelAddress();
++		if (k != 0 && offset < md->getLength()) {
++			negroni_surface_cache(k + offset, MIN(length, md->getLength() - offset), kNegroniCacheFlush);
++		}
++		return;
++	}
+ 	end = MIN(round_page_64(offset + length), (uint64_t)md->getLength());
+ 	for (uint64_t at = trunc_page_64(offset); at < end; at += PAGE_SIZE) {
+ 		IOByteCount segment = 0;
+diff --git a/iokit/Kernel/arm/NegroniPlatformExpert.cpp b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+index 9f67282..64fa412 100644
+--- a/iokit/Kernel/arm/NegroniPlatformExpert.cpp
++++ b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+@@ -43,6 +43,7 @@ void negroni_reboot(unsigned reason);
+ void negroni_power_off(void);
+ void negroni_panic_restart(void);
+ void negroni_reboot_settle(unsigned ms);
++void negroni_fb_panic(void);            /* NegroniFramebuffer.cpp: zero-copy pipes back on the panel memory */
+ }
+ 
+ static bool negroni_in_panic;
+@@ -53,6 +54,7 @@ negroni_halt_restart(unsigned int type)
+ 	switch (type) {
+ 	case kPEPanicBegin:
+ 		negroni_in_panic = true;
++		negroni_fb_panic();             /* the panic text must be on screen (0234) */
+ 		return 0;
+ 	case kPEHaltCPU:
+ 		if (negroni_in_panic) {
+diff --git a/iokit/Kernel/arm/NegroniSurface.cpp b/iokit/Kernel/arm/NegroniSurface.cpp
+index 51b7041..62473e2 100644
+--- a/iokit/Kernel/arm/NegroniSurface.cpp
++++ b/iokit/Kernel/arm/NegroniSurface.cpp
+@@ -24,6 +24,12 @@
+  *
+  * Values, notifications, accelerators and shared events are accepted and
+  * ignored (logged once per selector).
++ *
++ * Zero-copy scanout (patch 0234): when NegroniFramebuffer.cpp found the
++ * display engine as it expects (boot-arg negronifb_zerocopy=1), backboardd's
++ * canvas-sized BGRA framebuffers are placed in display slots of the splash
++ * region instead of kernel memory, mapped cached in the kernel and in
++ * backboardd; the framebuffer cleans the rows the CPU wrote before it shows one.
+  */
+ #include "NegroniSurface.h"
+ 
+@@ -75,6 +81,11 @@ static uint32_t      negroni_surface_creates_logged;
+ static uint64_t      negroni_surface_wired;       /* bytes of buffer surfaces */
+ #define NEGRONI_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
++/* Display slots (negroni_surface_set_display_slots), under negroni_surface_lock. */
++static uint64_t      negroni_slot_phys, negroni_slot_size;
++static uint32_t      negroni_slot_count, negroni_slot_width, negroni_slot_height, negroni_slot_format;
++static NegroniSurface *negroni_slot_surface[NEGRONI_SURFACE_MAX_SLOTS];      /* weak: cleared by free() */
++
+ OSDefineMetaClassAndStructors(NegroniSurface, OSObject);
+ 
+ void
+@@ -83,6 +94,17 @@ NegroniSurface::free()
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&negroni_surface_wired);
+ 	}
++	if (slot >= 0 && slot < NEGRONI_SURFACE_MAX_SLOTS) {
++		IOLockLock(negroni_surface_lock);
++		if (negroni_slot_surface[slot] == this) {
++			negroni_slot_surface[slot] = NULL;
++		}
++		IOLockUnlock(negroni_surface_lock);
++	}
++	if (save != NULL) {
++		IOFreeData(save, saveSize);
++		save = NULL;
++	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+@@ -98,7 +120,7 @@ NegroniSurface::kernelAddress()
+ 	}
+ 	IOLockLock(negroni_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = memory->map(kernelMapCache != 0 ? kernelMapCache : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(negroni_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -116,6 +138,96 @@ negroni_surface_hold(NegroniSurface *s, bool on)
+ 	    NEGRONI_SURFACE_STATE_IN_USE));
+ }
+ 
++void
++negroni_surface_cache(uintptr_t va, uint64_t len, int op)
++{
++	uintptr_t a = va & ~(uintptr_t)63, end = va + len;
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (; a < end; a += 64) {
++		if (op == kNegroniCacheClean) {
++			__asm__ volatile ("dc cvac, %0" : : "r"(a) : "memory");
++		} else {
++			__asm__ volatile ("dc civac, %0" : : "r"(a) : "memory");
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void negroni_surface_init_lock(void);
++
++void
++negroni_surface_set_display_slots(uint64_t phys, uint64_t slotSize, uint32_t count,
++    uint32_t width, uint32_t height, uint32_t pixelFormat)
++{
++	negroni_surface_init_lock();
++	IOLockLock(negroni_surface_lock);
++	negroni_slot_phys = phys;
++	negroni_slot_size = slotSize;
++	negroni_slot_count = count < NEGRONI_SURFACE_MAX_SLOTS ? count : NEGRONI_SURFACE_MAX_SLOTS;
++	negroni_slot_width = width;
++	negroni_slot_height = height;
++	negroni_slot_format = pixelFormat;
++	IOLockUnlock(negroni_surface_lock);
++	IOLog("NEGRONI SURF: %u display slots of %llu bytes at 0x%llx for %ux%u 0x%x\n",
++	    negroni_slot_count, slotSize, phys, width, height, pixelFormat);
++}
++
++/* A free slot for s (backboardd's framebuffer geometry), or -1. Lock held. */
++static int
++negroni_surface_slot_take_locked(NegroniSurface *s)
++{
++	if (negroni_slot_count == 0 || s->pixelFormat != negroni_slot_format || s->width != negroni_slot_width ||
++	    s->height != negroni_slot_height || s->planeCount != 0 || s->offset != 0 ||
++	    s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 ||
++	    (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || s->allocSize > negroni_slot_size) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < negroni_slot_count; i++) {
++		if (negroni_slot_surface[i] == NULL) {
++			negroni_slot_surface[i] = s;
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++void
++negroni_surface_slots_dirty(int32_t y0, int32_t y1)
++{
++	if (negroni_surface_lock == NULL || (y0 >= 0 && y0 >= y1)) {
++		return;
++	}
++	IOLockLock(negroni_surface_lock);
++	for (uint32_t i = 0; i < negroni_slot_count; i++) {
++		NegroniSurface *s = negroni_slot_surface[i];
++		if (s == NULL) {
++			continue;
++		}
++		uint32_t a = y0 < 0 ? 0 : (uint32_t)y0;
++		uint32_t b = y0 < 0 ? s->height : (y1 > (int32_t)s->height ? s->height : (uint32_t)y1);
++		if (s->dirtyY0 >= s->dirtyY1) {
++			s->dirtyY0 = a;
++			s->dirtyY1 = b;
++		} else {
++			s->dirtyY0 = a < s->dirtyY0 ? a : s->dirtyY0;
++			s->dirtyY1 = b > s->dirtyY1 ? b : s->dirtyY1;
++		}
++	}
++	IOLockUnlock(negroni_surface_lock);
++}
++
++bool
++negroni_surface_take_dirty(NegroniSurface *s, uint32_t *y0, uint32_t *y1)
++{
++	IOLockLock(negroni_surface_lock);
++	*y0 = s->dirtyY0;
++	*y1 = s->dirtyY1 < s->height ? s->dirtyY1 : s->height;
++	s->dirtyY0 = s->dirtyY1 = 0;
++	IOLockUnlock(negroni_surface_lock);
++	return *y0 < *y1;
++}
++
+ static uint32_t *
+ negroni_surface_seed(NegroniSurface *s)
+ {
+@@ -223,6 +335,7 @@ negroni_surface_alloc(void)
+ 		return NULL;
+ 	}
+ 	bzero(s->state->getBytesNoCopy(), page_size);
++	s->slot = -1;
+ 	return s;
+ }
+ 
+@@ -696,7 +809,38 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = negroni_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	char who[32];
++	proc_selfname(who, sizeof(who));
++	int slot = -1;
++	if (ret == kIOReturnSuccess && strcmp(who, "backboardd") == 0) {
++		IOLockLock(negroni_surface_lock);
++		slot = negroni_surface_slot_take_locked(s);
++		IOLockUnlock(negroni_surface_lock);
++	}
++	if (ret == kIOReturnSuccess && slot >= 0) {
++		/*
++		 * Zero-copy: a framebuffer of backboardd's in a display slot (memory XNU does not
++		 * manage), cached for CoreAnimation's CPU renderer; NegroniFramebuffer.cpp cleans the
++		 * rows it wrote before the display engine fetches them.
++		 */
++		s->slot = slot;
++		s->phys = negroni_slot_phys + (uint64_t)slot * negroni_slot_size;
++		s->memory = IOMemoryDescriptor::withPhysicalAddress(s->phys, s->allocSize, kIODirectionInOut);
++		s->mapCache = kIOMapCopybackCache;
++		s->kernelMapCache = kIOMapCopybackCache;
++		uintptr_t k = s->memory != NULL ? s->kernelAddress() : 0;
++		if (k == 0) {
++			ret = kIOReturnNoMemory;
++		} else {
++			bzero((void *)k, s->allocSize);
++			negroni_surface_cache(k, s->allocSize, kNegroniCacheFlush);
++			s->dirtyY0 = 0;
++			s->dirtyY1 = s->height;
++			if (!negroni_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&negroni_surface_wired) +
+ 		    s->allocSize <= NEGRONI_SURFACE_WIRED_MAX) {
+@@ -715,13 +859,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			}
+ 		}
+ 	}
+-	if (ret != kIOReturnSuccess || negroni_surface_creates_logged < 64) {
+-		char name[32];
+-		proc_selfname(name, sizeof(name));
++	if (ret != kIOReturnSuccess || negroni_surface_creates_logged < 64 || slot >= 0) {
+ 		negroni_surface_creates_logged++;
+-		IOLog("NEGRONI SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
+-		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+-		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++		IOLog("NEGRONI SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u slot %d -> 0x%x\n",
++		    who, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
++		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), slot, ret);
+ 	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+diff --git a/iokit/Kernel/arm/NegroniSurface.h b/iokit/Kernel/arm/NegroniSurface.h
+index d0138b5..dd3de81 100644
+--- a/iokit/Kernel/arm/NegroniSurface.h
++++ b/iokit/Kernel/arm/NegroniSurface.h
+@@ -45,6 +45,21 @@ public:
+ 	 * presents such surfaces with the GPU once that fence is done.
+ 	 */
+ 	volatile uint32_t         gpuFence;
++	/*
++	 * Zero-copy scanout (patch 0234, NegroniFramebuffer.cpp): backboardd's framebuffers can
++	 * live in display slots of ABL's splash region, which the display engine fetches directly.
++	 * slot: index or -1; phys: the slot's address; dirtyY0/Y1: rows the CPU may have written
++	 * since it was last shown (to clean before the next showing); kernelMapCache: the kernel
++	 * mapping's cache mode (0: write-combined); save: the pixels the clock shift moved while
++	 * shown (put back before CoreAnimation draws into it again).
++	 */
++	int32_t                   slot;
++	uint64_t                  phys;
++	uint32_t                  dirtyY0, dirtyY1;
++	IOOptionBits              kernelMapCache;
++	void                     *save;
++	uint32_t                  saveSize;
++	bool                      saved;
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -71,6 +86,28 @@ NegroniSurface *negroni_surface_create_physical(uint64_t phys, uint32_t width,
+  */
+ void negroni_surface_hold(NegroniSurface *surface, bool on);
+ 
++/*
++ * Zero-copy scanout (0234): count physically contiguous display slots of slotSize bytes at phys
++ * (memory XNU does not manage) for backboardd's width x height pixelFormat framebuffers.
++ */
++#define NEGRONI_SURFACE_MAX_SLOTS         4
++void negroni_surface_set_display_slots(uint64_t phys, uint64_t slotSize, uint32_t count,
++    uint32_t width, uint32_t height, uint32_t pixelFormat);
++
++/* A swap changed rows [y0, y1) of the display (y0 < 0: all of it): every slot surface must catch up. */
++void negroni_surface_slots_dirty(int32_t y0, int32_t y1);
++
++/* Rows of a slot surface written since it was last shown, then forgotten; false if none. */
++bool negroni_surface_take_dirty(NegroniSurface *surface, uint32_t *y0, uint32_t *y1);
++
++/*
++ * Cache maintenance by kernel address over [va, va + len) of a cached mapping: clean (the display
++ * engine or the GPU reads next) or clean + drop (flush: the GPU writes next or wrote). There is no
++ * drop-only: under the hypervisor (stage 2 on) DC IVAC at EL1 cleans too.
++ */
++enum { kNegroniCacheClean = 0, kNegroniCacheFlush = 1 };
++void negroni_surface_cache(uintptr_t va, uint64_t len, int op);
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t negroni_surface_port_in_task(NegroniSurface *surface, task_t task);
+ 
