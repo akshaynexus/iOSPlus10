@@ -490,6 +490,51 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   129/129 table names + gldInitializeLibrary/gldTerminateLibrary; ngl_init uses softpipe when
   RedwoodGPU does not open (NEGRONIGL_DRIVER=softpipe|freedreno, boot-arg negronigl_sw=1).
 
+### 15a. GLI table written: EAGL contexts on Mesa (GL GLI agent, 2026-10-25)
+
+- [V] How EAGL picks up our GLI table (confirmed in out/gpu/re/OpenGLES.s, unslid):
+  - `eagl_init` runs GLEngine's `gliInitializeLibrary` at 0x1d3f52630 (`blr x20`). That path reaches
+    libGFXShared `gfxInitializeLibrary` -> our `gldInitializeLibrary` -> `ngl_gli_register`
+    (plugin/gli_table.c), which overwrites `_gli_plugin[0]` (0x1e25b0da0) with our bundle handle.
+  - Back in eagl_init, the loop at 0x1d3f52648 does `dlsym(_gli_plugin[0], name)` for each name in
+    `_eagl_gli_names` (0x1d3f53350, inline 0x20-byte strings) and stores it at `_gli_plugin[+0x08]`
+    up to `+0x90` (x20 runs 0x08..0x98, step 8 = 18 entries). Because the handle is now ours, it
+    binds our 18 `gli*` exports. If any dlsym returns NULL the loop aborts and EAGL stays
+    uninitialised, so all 18 names must be exported.
+  - eagl_init then calls `_gli_plugin[+0x80]` = `gliGetVersion` (must return != 0) and
+    `_gli_plugin[+0x08]` = `gliChoosePixelFormat(&_gli_pixelformat, attribs)` (must return 0 and store
+    a non-NULL format at _gli_pixelformat 0x1e25b0e38). Then it sets `_eagl_initialized` 0x1e25b0e44.
+    The 18 names match GLEngine's own exported `gli*` symbols (out/gpu/re/GLEngine.symbols.txt).
+- [V] gliBindViewES (+0x88) from -[EAGLContext renderbufferStorage:fromDrawable:] 0x1d3f518f4:
+  `gliBindViewES(GLIContext, nativeWindow, retainedBool, colorformat)`; the method first calls it with
+  nativeWindow=NULL (detach, result ignored), then with the drawable; it returns YES when the second
+  call returns nonzero. GLIContext = EAGL private block +0x20 (our `struct ngl_gli *`).
+- [V] nativeWindow layout (GLEngine `_gliBindViewES` 0x1f6f57940): a struct of function pointers, each
+  taking the struct as arg 0. The drawable's IOSurface is `((fn)nativeWindow[+0x18])(nativeWindow)`;
+  GLEngine then feeds it to `gliSetInteger(0x38e)`/(0x399). Our gliBindViewES takes the same IOSurface
+  from +0x18 and binds it as GL_RENDERBUFFER storage through surface.c (ngl_bind_surface), the same
+  path gliSetInteger(0x38e) uses. [I] We do not run the window's preflight (+0x08, needs GLEngine's own
+  create-buffer callbacks); if the surface is not yet allocated the bind fails cleanly (CGL error).
+- [V] gliPresentViewES (+0x90) from -[EAGLContext presentRenderbuffer:] 0x1d3f51b48:
+  `gliPresentViewES(GLIContext, mode)` (mode 1 = afterMinimumDuration; a time may be in d0). GLEngine's
+  version queues a present on its unpack thread and waits a semaphore (0x1f6f57d08). Ours does glFinish
+  so the render lands in the drawable IOSurface; the CAEAGLLayer swap is CoreAnimation's job. [I] untested.
+- [V] The 18 slots now have code: gli_table.c (ChoosePixelFormat, DestroyPixelFormat, QueryRendererInfo,
+  DestroyRendererInfo, CreateContext, GetAttribute, SetAttribute, CopyAttributes,
+  GetMemoryAnnotationList, GetVersion), gli_context.c (CreateContextWithShared, DestroyContext,
+  SetInteger, GetInteger), gli_view.c (AttachDrawable, AttachDrawableWithOptions, BindViewES,
+  PresentViewES). AttachDrawable/WithOptions are CGL-only; iOS never calls them, so they are no-ops
+  that only keep the dlsym loop from binding NULL.
+- [V] gldChoosePixelFormat (plugin/gld.c) now returns `&ngl_pf` (device id + flags 0x225dd), not 0x2712.
+  The EAGL path reads the format from gli_table.c gliChoosePixelFormat (+0x08), not from the GLD
+  renderer path, because ngl_gli_register redirects _gli_plugin to us; gldChoosePixelFormat is kept
+  consistent for libGFXShared's own device/sharegroup lookup. gldCreateShareGroup already returns 0.
+- [V] Build 2026-10-25 (scripts/bg.sh gpu-build, exit 0): NegroniGL.bundle exports 129/129 GLD names +
+  18/18 GLI names + gldInitializeLibrary/gldTerminateLibrary and nothing else (build.sh check updated,
+  gen-gld.py GLI_NAMES). arm64, minos 16.0, ad hoc signed, codesign -v OK. 14,895,744 bytes.
+- [I] Not run on the phone. ngl_test is an iOS binary, so the GLI entries cannot be exercised on the
+  Mac; the first check is on the phone (EAGLContext non-nil; Bold Text on SpringBoard must not crash).
+
 ## 16. Wi-Fi facts (Wi-Fi agent, 2026-10-25; OnePlus kernel source e9da592 in out/src/op-kernel)
 
 - [V] SoC version register: BAR0 + 0x224 (family [31:28], device [27:16], major [15:8], minor [7:0])
@@ -519,9 +564,24 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   rings, 10 s timeout.
 - [V] apps SMMU at 0x15000000 (0x78 SMRs, 0x4e contexts); PCIe0 stream SID 0x1c01.
 - Trees: out/kernel/wt-wlan4 (patched-tree.sh UPTO 0261, replaces wt-wlan2/wt-wlan3, which are deleted) holds the
-  stage 1 start: negroni_wlan.h, negroni_wifi.c calls negroni_wlan_start() with negroniwlan=2 after survey step 10,
+  stage 1 driver: negroni_wifi.c calls negroni_wlan_start() with negroniwlan=2 after survey step 10,
   negroni_ufs_wlan_area_read() (32 MiB area before the ADSP area: userdata blocks N-19457..N-11266), bsd/conf/files
-  entry. negroni_wlan.c is not written yet, so the tree does not link.
+  entry.
+- [V] Stage 1 (patch 0261) is DONE as code and BUILDS (2026-10-25). Five files: negroni_wlan.{c,h},
+  negroni_wlan_mhi.{c,h}, negroni_wlan_bhi.c; plus negroni_wifi.c (negroniwlan=2 start) and negroni_ufs.c (area read).
+  Each file syntax-checks (scripts/kernel/compile-one.sh) and the full local build links:
+  out/kernel/local-20261025-115947/kernel.development.negroni (sha256 b068b5b4...), patch-report: 0260 + 0261 applied,
+  no 02xx skipped (only the 4 usual dxb skips: TrustCache, iobuffermemd_monterey, skywalk_sonoma, syntax_checker_sonoma).
+  Patch: patches/xnu/0261-negroni-wlan-mhi-fw.patch. Log lines + area recipe: patches/xnu/README-wifi.md (0261 section).
+- [V] Review fix this round: negroni_wlan_mhi_init (MMIO context setup) now runs AFTER the BHI SBL download, not in
+  PBL. CHDBOFF/ERDBOFF and the context base registers are valid only once the chip leaves PBL; Linux programs them in
+  mhi_ready_state_transition after the SBL download (op-kernel pm.c:243, boot.c:546). Also added <kern/clock.h> to the
+  mhi/bhi .c files (delay() decl) and made wlan_rings do integer offset math (no -Wcast-align noise).
+- [I] UNTESTED ON HARDWARE: the survey steps 5-10 and all of stage 1 have never run on a phone, and the 32 MiB WLAN
+  area (scripts/wifi/mkwlanarea.py) is not written to userdata yet. Known deviation from Linux: stage 1 requests M0
+  after the AMSS download, not after SBL; M0 is only needed to start channels (after AMSS), so it should still work.
+- Next (stage 2): QRTR TX/RX buffers on MHI 20/21, QMI WLFW (ind_register/host_cap/respond_mem/target_cap/BDF/m3_info/
+  FW_READY), then HTC/WMI/HTT + HAL rings + scan, then en0 (Sailfish upper half). Details: docs/wifi-plan.md.
 
 ## 17. Audio (audio agent, 2026-10-25; details: docs/audio-plan.md)
 
@@ -556,3 +616,45 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   no `negronibadge`, no `negronifb_shift`); `negronifb_dpuprobe=0` skips the read-only DPU dump.
 - ABI for user space: msm selector 0x49 = `struct redwood_drm_userptr` (as `ngl_abi.h` asked);
   VA_START/VA_SIZE differ by mode (docs/gpu-abi.md sections 4, 5, 6, 8).
+
+## 18. Firmware areas at the end of userdata (2026-10-25; scripts/fw/)
+
+- [V] Boot log today: `NEGRONI ADRENO: 12 stop: no a730_zap.mdt in the firmware area (mkfwarea.py + dd)`.
+  `fastboot flash userdata` erases the areas (also slop NOTES 2026-10-23). Without them RedwoodGPU never starts.
+- [V] N (userdata size in 4096-byte blocks) on THIS phone = 58672399 (getvar `partition-size:userdata:0x37F450F000`).
+  slop's block numbers (27429134.., sda14 219457656 sectors, N = 27432207) are from slop's phone: do not reuse them.
+- [V] Kernel (negroni_ufs.c, wt-wlan4 + tree-gpu2): ufsroot0/rufsroot0 = the GPT partition named by boot-arg
+  `ufsroot` (default `userdata`) on LUN 0; offset 0 = partition first LBA, nblocks = last - first + 1. Logical
+  sector 512 (DEV_BSIZE), device block 4096. Writes only with boot-arg `ufsrw=1`; strategy returns EINVAL past the end.
+- [V] Areas, relative blocks: log N-1025..N-1 (header magic `SWEETLOG`, not NEGRONILOG as the comment says);
+  GPU N-3073..N-1026 (8 MiB, `NEGRONFW`, max 16 files, data from 4 KiB); ADSP N-11265..N-3074 (32 MiB, `NEGRADSP`,
+  max 64, data from 8 KiB); WLAN N-19457..N-11266 (32 MiB, `NEGRWLAN`, max 256, data from 32 KiB). Entry = name[48],
+  u32 offset, u32 size, sha256[32] (88 bytes). The GPU area is read ONCE at boot (negroni_fw_load): reboot after a write.
+- [V] For N = 58672399: GPU seek 58669326 count 2048, ADSP seek 58661134 count 8192, WLAN seek 58652942 count 8192.
+  The HFS+ root is 16777216 KiB = 4194304 blocks (`df -k /` on the phone), far below 58652942.
+- [V] GPU firmware from the OTA vendor image (`out/camera/payload/vendor.img`, payload-dumper-go from
+  NE2211_16.0.3.530_EX01), `/firmware/*` via `dump.erofs --cat`: `scripts/fw/extract-gpu-fw.sh` -> out/firmware/gpu.
+  a730_sqe.fw 4f8b288f.., gmu_gen70000.bin b2d3f0e2.., a730_zap.mbn 905b1311.. = slop's values.
+- [V] a730_zap.mdt here is 2a74e9e9.. (3564 B), NOT slop's 0706695b. Our .mdt = .b00 + .b02; its hash segment holds
+  the SHA-384 of segments 0 and 1; .b01 = the .mbn code segment. The split set is OPLUS-signed (cert "OPLUS
+  Attestation CA"), the .mbn QUALCOMM-signed. [I] slop's .mdt came from another build; ours matches this phone's build.
+- [V] Images (`scripts/fw/build-areas.sh`, checked by `scripts/fw/checkarea.py` against the kernel reader rules):
+  gpu-area.bin 4d0b5bd8b3f9508fcb0d74526c5fc12f99f6e84d885c49e42d067dbffd5b12f8 (7 files),
+  adsp-area.bin 3579eab565436233a9a4ccdb785ddfbdacbbb6669d85cad76ebc07b97adeab72 (29 files, same as the 10-24 build),
+  wlan-area.bin 76b0c6aa1ea3df5d58c7c72655928f6914d8fd39ca5fbe3d1b1711fbbac7fdcb (198 files). In out/firmware, not in git.
+- [V] Phone (read-only checks, 2026-10-25): /dev/rufsroot0 crw-r----- root:operator 18,0; /dev/ufsroot0 brw 1,0 is
+  mounted on / (hfs, journaled, read-write); /usr/local/bin/dd -> toybox 0.8.15 (conv=notrunc,fsync, iflag/oflag
+  *_bytes); sha256sum, cmp, head are toybox; no sysctl, no dmesg; /bin/sh = dash.
+- [I] Write through /dev/rufsroot0 only: XNU spec_open refuses write opens of a mounted block device. If kern.securelevel
+  is >= 1 the char node of a mounted disk is refused too (EPERM/EBUSY); not checked (no sysctl on the phone).
+- [I] fsync on a character device does not flush the UFS device cache. The log thread sends SYNCHRONIZE CACHE (whole
+  LUN) after each log flush (every 10 s when new console text exists); write-areas.sh writes a console line and waits 15 s.
+- `scripts/fw/write-areas.sh` (NOT RUN): without CONFIRM=yes it prints the plan and exits 2. With CONFIRM=yes: finds N on
+  the phone (binary search with 1-block reads), stops if N != 58672399, checks SWEETLOG at N-1025, checks the HFS+ end,
+  never writes below N-19457 or into the log area, pushes + compares sha256, backs up the old area contents to
+  out/firmware/area-backup-DATE/, dd bs=4096 seek=S count=C conv=notrunc,fsync, reads back and compares sha256.
+- [I] One-flash option (described, not done): make a sparse raw file of N*4096 bytes, clone the root into its start,
+  dd the three images at their block offsets (conv=notrunc), then `op10tool img2simg` (holes -> DONT_CARE). One
+  `fastboot flash userdata` then writes root + areas, the log area stays DONT_CARE. Unproven: whether fastbootd wipes
+  the partition per resparsed piece (-S 256M), and whether the ABL/fastbootd accepts a sparse total of exactly N blocks.
+  Test once with a read-back from iOS before relying on it. Ties the root image to this phone's N.
