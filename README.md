@@ -54,7 +54,7 @@ external/                submodules + reference clones (see below)
 
 ## External repos
 
-Five repos are **submodules** (the build reads them). The other twelve are **reference** repos that
+Six repos are **submodules** (the build reads them). The other thirteen are **reference** repos that
 we read and port from: they are not submodules, they are git-ignored, and
 `scripts/setup/get-references.sh` (`make references`) clones them at a pinned commit on demand.
 Details: [docs/external-repos.md](docs/external-repos.md).
@@ -66,6 +66,7 @@ Details: [docs/external-repos.md](docs/external-repos.md).
 | `external/UniXNU` (`iosplus10`) | akshaynexus/UniXNU | submodule | Core: boot manager, DarwinBoot, NativeAdreno, NativeMetal, AirNir |
 | `external/ios-flame` | NWylynko/ios-flame | submodule | iOS 16 on Pixel 4 (SM8150) |
 | `external/hackios-xnu-userland` | oosexgang/hackios-xnu-userland | submodule | HackiOS (POCO X5 Pro, SM7325) userland, Mesa GPU path |
+| `external/metal2vulkan` | steelbrain/metal2vulkan | submodule | Metal shading language / API translation to Vulkan |
 | `external/ios-sweet` | akshaynexus/ios-sweet | reference (scripts/setup/get-references.sh) | Original sweet port: shim, mkadt, root tools |
 | `external/ios-sweet-upstream` | dipa-studio/ios-sweet | reference (scripts/setup/get-references.sh) | Upstream of all the sweet-based ports (same commit as our fork today) |
 | `external/UniXNU-negroni` (`dev`) | pawlickerr/UniXNU-negroni | reference (scripts/setup/get-references.sh) | Board file, payload and boot image scripts |
@@ -78,6 +79,7 @@ Details: [docs/external-repos.md](docs/external-repos.md).
 | `external/hackios-xnu-kernel` | oosexgang/hackios-xnu-kernel | reference (scripts/setup/get-references.sh) | HackiOS (POCO X5 Pro, SM7325) kernel |
 | `external/ios-s9` | syncmodz/ios-s9 | reference (scripts/setup/get-references.sh) | iOS 16 on Samsung Galaxy S9 (SM-G9600): shim, XNU patches, drivers |
 | `external/Chlorophyll` | ry-diffusion/Chlorophyll | reference (scripts/setup/get-references.sh) | Bergamota's Metal driver (AIR -> NIR -> ir3 over freedreno, Adreno 630), MIT |
+| `external/ios-spes` | AdyaGMD/ios-spes | reference (scripts/setup/get-references.sh) | iOS on Redmi Note 11 (SM6225) |
 
 ```sh
 git clone --recurse-submodules git@github.com:akshaynexus/iOSPlus10.git
@@ -98,7 +100,24 @@ Mu-Silicium has its own submodules; initialize them only when you build the UEFI
 - Write only `boot_a`, `vendor_boot_a`, `vbmeta_a`, `dtbo_a` and `userdata`. Keep slot B, the GPT
   and the unique partitions (modemst, fsg, persist, oplusreserve) unchanged.
 
+## Credits
+
+This project builds directly upon groundbreaking work across the open-source XNU and Android porting communities:
+- [slop](https://github.com/MellysInformejtik/slop) (MellysInformejtik / akshaynexus): Negroni XNU kernel patches, device shim, and root tools.
+- [UniXNU](https://github.com/UniXNU/UniXNU) & [DarwinBoot](https://github.com/UniXNU/DarwinBoot): Unified UEFI boot manager and XNU loader on ARM64.
+- [Mu-Silicium](https://github.com/Project-Silicium/Mu-Silicium) / [Mu-Silicium-negroni](https://github.com/pawlickerr/Mu-Silicium-negroni) (pawlickerr, Project Silicium): TianoCore / Microsoft Project Mu UEFI firmware tree for negroni.
+- [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland) & [hackios-xnu-kernel](https://github.com/oosexgang/hackios-xnu-kernel) (OOSEX GANG): HackiOS userland integration and Mesa/EAGL userspace.
+- [ios-sweet](https://github.com/dipa-studio/ios-sweet) (dipa-studio): The foundational XNU-on-Qualcomm port from which this ecosystem originated.
+- [ios-sailfish](https://github.com/joranv1/ios-sailfish) (joranv1): Working GPU acceleration on iOS (Mesa freedreno + EAGL shim) and fast boot optimizations.
+- [Chlorophyll](https://github.com/ry-diffusion/Chlorophyll) (ry-diffusion): AIR -> NIR -> ir3 Metal driver translation layer.
+- [metal2vulkan](https://github.com/steelbrain/metal2vulkan) (steelbrain): Metal shading language / API translation to Vulkan.
+- [Mesa](https://mesa3d.org/) / freedreno: Open-source Gallium Adreno driver and Turnip Vulkan driver.
+- [Apple Inc.](https://opensource.apple.com/): Open-source releases of the XNU kernel and Darwin libraries (APSL 2.0).
+
+See [CREDITS.md](CREDITS.md) for full attributions and upstream details.
+
 ## License
 
-The files in `docs/`, `scripts/` and `tools/` are MIT. Each external repo keeps its own license; `slop` and
-`UniXNU-negroni` have no license file.
+- Project files in `docs/`, `scripts/`, `userland/negronigl/`, and `tools/` (including `op10tool`) are licensed under the [MIT License](LICENSE).
+- Submodules and third-party components retain their upstream licenses (BSD-2-Clause-Patent, Project Mu BSD-2-Clause, MIT, LGPL-3.0/GPL-2.0, APSL-2.0, etc.).
+- Verbatim license texts and third-party copyright notices are collected in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

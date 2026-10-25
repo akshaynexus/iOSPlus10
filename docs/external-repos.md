@@ -15,13 +15,16 @@ changes are committed there, so a clone of this repo gets a working submodule: `
 for those we still keep our work in this repo (`scripts/`, `patches/`, `config/`, `tools/`) and apply
 it with scripts.
 
-## Needed to build (the build reads these)
+## Needed to build (the build reads these submodules)
 
-| Submodule | Used by | What we take from it |
-|---|---|---|
-| `slop` (MellysInformejtik/slop) | `scripts/kernel/prepare-src.sh`, kernel CI, `scripts/ios16/build.sh`, `scripts/ios16/root-*.sh`, `scripts/uefi/*` | The negroni port: 125 xnu-8796 kernel patches + 3 staging scripts (`negroni-ios/xnu/patches`), the shim (`shim/`), `mkadt.py` + `adt.py`, `mkdarwinboot.py`, `sweet-root-tweaks.py`, `mkiosroot.sh` (Linux root), `remotezip.py`, the UEFI patch tools. **Required.** |
-| `Mu-Silicium-negroni` (**akshaynexus/Mu-Silicum-negroni**, fork of pawlickerr) | `scripts/uefi/setup-mu.sh`, `prepare.sh`, `build.sh`, `build-macos.sh` | The Mu-Silicium UEFI tree with `negroniPkg`, built into `SILICIUM_UEFI.fd`. Our fix on top: `patches/mu/`, plus committed in the fork: `Kernel RAM` at `0x841000000`. Nested `mu_basecore` (branch `iosplus10`: timer freq PCD fallback, boot menu Power Off/Exit, USB `TPL_CALLBACK`, AArch64 `.text`, runtime variable write protection) and `Silicium-ACPI` (`Platforms/OnePlus/negroni` SSDT/Touch/GPU tables) also on our forks. **Required.** |
-| `UniXNU` (**akshaynexus/UniXNU**, branch `iosplus10`, fork of UniXNU/UniXNU) | the Mu build (`UNIXNU_ROOT`), `scripts/uefi/prepare.sh` | `package/UniXNUPkg` (boot manager) and the `drivers/DarwinBoot` submodule (loads XNU, fork **akshaynexus/DarwinBoot** on `main` with the boot-refused-on-screen debug), linked into the Mu build. Branch `iosplus10` = upstream `main` minus 30 commits + our DarwinBoot pointer (keeps the tested state). **Required.** |
+| Submodule | Used by | What we take from it | License |
+|---|---|---|---|
+| `slop` (MellysInformejtik/slop, fork **akshaynexus/slop**) | `scripts/kernel/prepare-src.sh`, kernel CI, `scripts/ios16/build.sh`, `scripts/ios16/root-*.sh`, `scripts/uefi/*` | The negroni port: 125 xnu-8796 kernel patches + 3 staging scripts (`negroni-ios/xnu/patches`), the shim (`shim/`), `mkadt.py` + `adt.py`, `mkdarwinboot.py`, `sweet-root-tweaks.py`, `mkiosroot.sh` (Linux root), `remotezip.py`, the UEFI patch tools. **Required.** | BSD-2-Clause-Patent / APSL / MIT |
+| `Mu-Silicium-negroni` (**akshaynexus/Mu-Silicum-negroni**, fork of pawlickerr) | `scripts/uefi/setup-mu.sh`, `prepare.sh`, `build.sh`, `build-macos.sh` | The Mu-Silicium UEFI tree with `negroniPkg`, built into `SILICIUM_UEFI.fd`. Our fix on top: `patches/mu/`, plus committed in the fork: `Kernel RAM` at `0x841000000`. Nested `mu_basecore` (branch `iosplus10`: timer freq PCD fallback, boot menu Power Off/Exit, USB `TPL_CALLBACK`, AArch64 `.text`, runtime variable write protection) and `Silicium-ACPI` (`Platforms/OnePlus/negroni` SSDT/Touch/GPU tables) also on our forks. **Required.** | BSD-2-Clause / Project Mu / EDK II |
+| `UniXNU` (**akshaynexus/UniXNU**, branch `iosplus10`, fork of UniXNU/UniXNU) | the Mu build (`UNIXNU_ROOT`), `scripts/uefi/prepare.sh` | `package/UniXNUPkg` (boot manager) and the `drivers/DarwinBoot` submodule (loads XNU, fork **akshaynexus/DarwinBoot** on `main` with the boot-refused-on-screen debug), linked into the Mu build. Branch `iosplus10` = upstream `main` minus 30 commits + our DarwinBoot pointer (keeps the tested state). **Required.** | BSD-2-Clause-Patent |
+| `hackios-xnu-userland` (**oosexgang/hackios-xnu-userland**) | `userland/` build, root layout, Mesa/EAGL userspace | Userland launchd jobs, root tweaks, and Mesa/EAGL integration. **Required.** | MIT |
+| `ios-flame` (**NWylynko/ios-flame**) | `userland/`, `scripts/ios16/` | ADT MAC fix, fairplayd deadlock, IORTC, AMFI policy + IOService stand-in, kernel command server. | MIT |
+| `metal2vulkan` (**steelbrain/metal2vulkan**) | `userland/metal/` | Metal shading language and API translation layer to Vulkan. | GPL-2.0 / LGPL-3.0 |
 
 ## Reference only (read, compared, ported from; not used by the build; `scripts/setup/get-references.sh`)
 
@@ -50,3 +53,10 @@ it with scripts.
 - **Updating**: a submodule pin moves with `git submodule update --remote external/<name>`. A reference
   pin moves by a new COMMIT in the table of `scripts/setup/get-references.sh`; check
   `docs/boot-speed.md` / `docs/gpu-plan.md` for what to re-read.
+
+## Credits & Notices
+
+For complete attribution of upstream projects, contributors, and detailed verbatim license notices, see:
+- [CREDITS.md](../CREDITS.md)
+- [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)
+- [LICENSE](../LICENSE)
