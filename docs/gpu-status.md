@@ -39,7 +39,7 @@ When NegroniMetal is missing or returns no device, CoreAnimation/CoreImage use E
 | GPU present at 120 Hz (0231, rebased on slop 120 Hz) | written, builds, not run on the phone |
 | 120 Hz vsync (slop) | builds; the phone still runs a 60 Hz kernel |
 | OpenGL ES driver (negronigl) | builds; CoreAnimation cannot draw through it yet (renderbuffer step fails) |
-| Software fallback (Mesa softpipe) | partly written, not built (notes 15): driver choice, softpipe winsys, 13 gld functions. The GLI-side file that connects EAGL to Mesa is missing: safety filters stopped two agent runs while they wrote it. Waits for the owner |
+| Software fallback (Mesa softpipe) | builds (2026-10-25): negronigl.dylib + NegroniGL.bundle (129/129 GLD names, 13 real gld functions), softpipe when RedwoodGPU does not open; not run on the phone. The GLI part that connects EAGL to Mesa is not written (safety filters stopped it twice); until then gldChoosePixelFormat refuses and EAGL contexts stay nil. Waits for the owner |
 | Vulkan (Turnip) | links; needs review and the parts Metal uses |
 | Metal plugin + probes | build (iOS 16 arm64, Xcode 27.1 and 15.4); plugin logic passes a host test on the Mac (MoltenVK); not run on the phone. Fast refusals (no RedwoodGPU, no Turnip, `negronimetal=0`), open + IOSurface self-test under a 6 s deadline, frontend gaps for QuartzCore closed (patch flame/0001) |
 | QuartzCore shaders (host, metal2vulkan) | A730 estimate profile: kernels 7/7, vertex 39/39, fragment 93/95 (2 need pixel interlock, Turnip lacks it); bare Vulkan 1.2: fragment 75/95 |
@@ -55,7 +55,7 @@ When NegroniMetal is missing or returns no device, CoreAnimation/CoreImage use E
 
 ## Test on the phone (after the next flash)
 
-1. `ngl_test` over SSH with the software fallback.
+1. `ngl_test` over SSH with the software fallback (`NEGRONIGL_DRIVER=softpipe` forces it).
 2. Bold Text on: SpringBoard must not crash.
 3. GPU path: boot-args `negroniadreno=22 negroniadreno_keep=1`; `ngl_test`, then the UI.
 4. Vulkan/Metal probes: `scripts/metal/phone-test.sh`.

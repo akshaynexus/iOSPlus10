@@ -3,7 +3,8 @@
  *   ngl_test            GPU info, FBO triangle self test, IOSurface self test
  *   ngl_test -w SECS    wait up to SECS for RedwoodGPU first
  * Output on stdout (NEGRONIGL_LOG=stderr is set unless the environment has NEGRONIGL_LOG).
- * Exit 0: all tests passed, 1: a test failed, 2: no GPU.
+ * Without RedwoodGPU the library uses softpipe (CPU); NEGRONIGL_DRIVER=softpipe forces it.
+ * Exit 0: all tests passed, 1: a test failed, 2: no screen at all.
  */
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,6 +21,7 @@ bool ngl_init(void);
 bool ngl_selftest(void);
 bool ngl_surface_selftest(void);
 bool ngl_gpu_info(struct ngl_gpu_info *info);
+bool ngl_soft(void);
 const char *ngl_version(void);
 
 int
@@ -39,14 +41,18 @@ main(int argc, char **argv)
 		up = ngl_init();
 	}
 	if (!up) {
-		printf("no GPU: RedwoodGPU service missing or not answering\n");
+		printf("no gallium screen: neither freedreno nor softpipe\n");
 		return 2;
 	}
+	if (ngl_soft()) {
+		printf("driver: softpipe (CPU; RedwoodGPU not opened or NEGRONIGL_DRIVER=softpipe)\n");
+	} else {
 	struct ngl_gpu_info gi = {0};
 	ngl_gpu_info(&gi);
 	printf("RedwoodGPU: ABI %s, chip %#llx, GMEM %llu KiB, max %llu MHz\n",
 	    gi.abi == 1 ? "scalar" : gi.abi == 2 ? "msm" : "?", (unsigned long long)gi.chip_id,
 	    (unsigned long long)gi.gmem_size >> 10, (unsigned long long)gi.max_freq / 1000000);
+	}
 	bool a = ngl_selftest();
 	bool b = ngl_surface_selftest();
 	printf("selftest %s, surface selftest %s\n", a ? "PASS" : "FAIL", b ? "PASS" : "FAIL");

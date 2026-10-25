@@ -42,24 +42,26 @@ and the Turnip load path still need a device check.
 
 ## Installation into a root image
 
-The installer has an explicit guard. Run it only on a mounted scratch or intended root:
+`scripts/gpu/build.sh` also makes `out/gpu/NegroniGL.bundle` (`NegroniGL` + `Info.plist`, ad hoc
+signed). It exports the 129 GLD names of libGFXShared's table plus `gldInitializeLibrary` and
+`gldTerminateLibrary`; the build fails if one is missing. The hook in `scripts/ios16/root-finish.sh`
+installs it when `NEGRONIGL=1`:
 
 ```sh
-NEGRONIGL=1 scripts/gpu/root-add-negronigl.sh /path/to/MOUNTED_ROOT
+NEGRONIGL=1 scripts/gpu/root-add-negronigl.sh /path/to/MOUNTED_ROOT     # as root
+scripts/gpu/test-root-add-negronigl.sh                                   # fake-root check, no root needed
 ```
 
-It installs `/usr/lib/negronigl.dylib`, `/usr/lib/libvulkan_freedreno.dylib` and
-`/usr/lib/vulkan/icd.d/freedreno_icd.json`. It adds
-`DYLD_INSERT_LIBRARIES=/usr/lib/negronigl.dylib` to the `com.apple.backboardd` job's
-`EnvironmentVariables` entry in `System/Library/xpc/launchd.plist`, preserving any existing
-inserted libraries, plist mode and owner. The disposable fake-root check is:
+It copies the bundle to `/System/Library/Extensions/NegroniGL.bundle` (root:wheel, 755/644) and
+removes the old `DYLD_INSERT_LIBRARIES=/usr/lib/negronigl.dylib` entry of backboardd if a root has it.
+The fake-root check passed on 2026-10-25.
 
-```sh
-scripts/gpu/test-root-add-negronigl.sh
-```
+Status: libGFXShared can load the bundle, but the GLI part (EAGL contexts on Mesa) is not written.
+Until it is, `gldChoosePixelFormat` returns 0x2712 and EAGL contexts stay nil, as without the plugin.
 
-It passed on 2026-10-25. It checks the guard, file copies, existing environment values, idempotence,
-plist mode and owner.
+Driver choice in `ngl_init`: freedreno when RedwoodGPU opens, else softpipe (CPU, IOSurfaces mapped in
+place by `sw_winsys.c`). `NEGRONIGL_DRIVER=softpipe|freedreno` or the boot-arg `negronigl_sw=1` override.
+Turnip is no longer built by `build.sh`; `scripts/gpu/turnip-build.sh` owns it.
 
 ## Kernel interface and limits
 

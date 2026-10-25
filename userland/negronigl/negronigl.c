@@ -23,6 +23,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <mach/mach_time.h>
+#include <sys/sysctl.h>
 
 #include "pipe/p_screen.h"
 #include "pipe/p_context.h"
@@ -31,6 +32,8 @@
 #include "util/driconf.h"
 #include "util/xmlconfig.h"
 #include "freedreno/drm/freedreno_drm_public.h"
+#include "softpipe/sp_public.h"
+#include "frontend/sw_winsys.h"
 
 #include "negronigl.h"
 
@@ -64,7 +67,7 @@ ngl_env_on(const char *name, bool dflt)
 const char *
 ngl_version(void)
 {
-	return "negronigl (Mesa " NEGRONIGL_MESA_VERSION ", freedreno, A730)";
+	return "negronigl (Mesa " NEGRONIGL_MESA_VERSION ", freedreno A730 / softpipe)";
 }
 
 bool
@@ -73,29 +76,89 @@ ngl_gpu_info(struct ngl_gpu_info *info)
 	return ngl_drm_info(info);
 }
 
+/*
+ * Which gallium driver: NEGRONIGL_DRIVER=freedreno|softpipe|auto in the environment, else the
+ * boot-arg negronigl_sw=1 (softpipe in every process), else auto: freedreno when RedwoodGPU opens,
+ * softpipe when it does not (no GPU kernel path, or a sandbox without access to it).
+ */
+enum ngl_driver { NGL_DRV_AUTO, NGL_DRV_FREEDRENO, NGL_DRV_SOFTPIPE };
+
+static enum ngl_driver
+wanted_driver(void)
+{
+	const char *e = getenv("NEGRONIGL_DRIVER");
+	if (e != NULL && (strcmp(e, "softpipe") == 0 || strcmp(e, "sw") == 0)) {
+		return NGL_DRV_SOFTPIPE;
+	}
+	if (e != NULL && (strcmp(e, "freedreno") == 0 || strcmp(e, "gpu") == 0)) {
+		return NGL_DRV_FREEDRENO;
+	}
+	char args[1024] = "";
+	size_t n = sizeof(args) - 1;
+	if (sysctlbyname("kern.bootargs", args, &n, NULL, 0) == 0) {
+		args[n < sizeof(args) ? n : sizeof(args) - 1] = 0;
+		for (char *p = strstr(args, "negronigl_sw="); p != NULL; p = strstr(p + 1, "negronigl_sw=")) {
+			if ((p == args || p[-1] == ' ') && p[13] == '1') {
+				return NGL_DRV_SOFTPIPE;
+			}
+		}
+	}
+	return NGL_DRV_AUTO;
+}
+
+static bool soft;
+
+bool
+ngl_soft(void)
+{
+	return soft;
+}
+
+static struct pipe_screen *
+freedreno_screen(void)
+{
+	int fd = ngl_drm_open();
+	if (fd < 0) {
+		return NULL;
+	}
+	setenv("FD_MESA_DEBUG", "sysmem", 0);
+	setenv("IR3_SHADER_DEBUG", "nofp16", 0);
+	driParseOptionInfo(&opt_info, ngl_driconf, ARRAY_SIZE(ngl_driconf));
+	driParseConfigFiles(&opts, &opt_info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
+	struct pipe_screen_config cfg = {.options = &opts, .options_info = &opt_info};
+	struct pipe_screen *screen = fd_drm_screen_create_renderonly(fd, NULL, &cfg);
+	if (screen == NULL) {
+		ngl_log("negronigl: freedreno screen creation failed");
+		close(fd);
+	}
+	return screen;
+}
+
 bool
 ngl_init(void)
 {
 	pthread_mutex_lock(&init_lock);
 	if (fscreen == NULL) {
-		int fd = ngl_drm_open();
-		if (fd >= 0) {
-			setenv("FD_MESA_DEBUG", "sysmem", 0);
-			setenv("IR3_SHADER_DEBUG", "nofp16", 0);
-			driParseOptionInfo(&opt_info, ngl_driconf, ARRAY_SIZE(ngl_driconf));
-			driParseConfigFiles(&opts, &opt_info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
-			struct pipe_screen_config cfg = {.options = &opts, .options_info = &opt_info};
-			struct pipe_screen *screen = fd_drm_screen_create_renderonly(fd, NULL, &cfg);
-			if (screen == NULL) {
-				ngl_log("negronigl: freedreno screen creation failed");
-				close(fd);
+		enum ngl_driver want = wanted_driver();
+		struct pipe_screen *screen = want != NGL_DRV_SOFTPIPE ? freedreno_screen() : NULL;
+		if (screen == NULL && want != NGL_DRV_FREEDRENO) {
+			struct sw_winsys *ws = ngl_sw_winsys_create();
+			screen = ws ? softpipe_create_screen(ws) : NULL;
+			if (screen == NULL && ws != NULL) {
+				ws->destroy(ws);
+			}
+			soft = screen != NULL;
+		}
+		if (screen != NULL) {
+			struct pipe_frontend_screen *f = calloc(1, sizeof(*f));
+			if (f == NULL) {
+				screen->destroy(screen);
 			} else {
-				struct pipe_frontend_screen *f = calloc(1, sizeof(*f));
 				f->screen = screen;
 				ngl_image_hooks(f);     /* before any context: st reads them at creation */
 				fscreen = f;
-				ngl_log("negronigl: %s, screen %s (%s)", ngl_version(), screen->get_name(screen),
-				    screen->get_vendor(screen));
+				ngl_log("negronigl: %s, screen %s (%s)%s", ngl_version(), screen->get_name(screen),
+				    screen->get_vendor(screen), soft ? ", CPU (softpipe)" : "");
 			}
 		}
 	}
@@ -124,6 +187,10 @@ ngl_create(int api, struct ngl_ctx *share)
 	};
 	enum st_context_error err = ST_CONTEXT_SUCCESS;
 	struct st_context *st = st_api_create_context(fscreen, &attribs, &err, share ? share->st : NULL);
+	if (st == NULL && attribs.major == 3 && attribs.minor == 1) {
+		attribs.minor = 0;              /* a driver without ES 3.1 */
+		st = st_api_create_context(fscreen, &attribs, &err, share ? share->st : NULL);
+	}
 	if (st == NULL) {
 		ngl_log("negronigl: GLES %d.%d context failed: %d", attribs.major, attribs.minor, err);
 		return NULL;
@@ -343,6 +410,7 @@ selftest_thread(void *arg)
 	return NULL;
 }
 
+#ifndef NGL_PLUGIN       /* NegroniGL.bundle: libGFXShared loads it; plugin/gli.c is the entry */
 __attribute__((constructor)) static void
 ngl_load(void)
 {
@@ -359,3 +427,4 @@ ngl_load(void)
 		}
 	}
 }
+#endif

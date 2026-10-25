@@ -1,7 +1,8 @@
 #!/bin/sh
 # Configure the patched Mesa tree (scripts/gpu/mesa-fetch.sh) for iOS arm64 (minimum iOS 16.0):
-# gallium freedreno + GLES 2/3, static libraries, no window system, no LLVM, our negronigl target
-# (userland/negronigl, copied into the tree first). -> out/gpu/mesa-build-ios
+# gallium freedreno + softpipe (the CPU fallback of NegroniGL.bundle) + GLES 2/3, static libraries,
+# no window system, no LLVM, our negronigl target (userland/negronigl, copied into the tree first).
+# -> out/gpu/mesa-build-ios
 #   scripts/gpu/mesa-setup.sh [extra meson -D options]
 set -eu
 . "$(cd "$(dirname "$0")" && pwd)/env.sh"
@@ -47,7 +48,7 @@ rm -rf "$MESA_BUILD"
 meson setup "$MESA_BUILD" "$MESA_SRC" --cross-file "$CROSS" --wrap-mode=nofallback \
   --buildtype=release -Db_ndebug=true -Ddefault_library=static \
   -Dplatforms= -Degl=disabled -Dglx=disabled -Dgbm=disabled -Dglvnd=disabled -Dosmesa=false \
-  -Dgallium-drivers=freedreno -Dfreedreno-kmds=msm -Dvulkan-drivers="${VULKAN_DRIVERS-freedreno}" -Dllvm=disabled \
+  -Dgallium-drivers=freedreno,softpipe -Dfreedreno-kmds=msm -Dvulkan-drivers="${VULKAN_DRIVERS-freedreno}" -Dllvm=disabled \
   -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
   -Dzstd=disabled -Dexpat=disabled -Dxmlconfig=disabled -Dshader-cache=disabled \
   -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled -Dbuild-tests=false \
