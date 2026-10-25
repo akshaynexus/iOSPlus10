@@ -1,0 +1,533 @@
+Turnip (Mesa freedreno Vulkan, msm KMD) on iOS 16 over the RedwoodGPU user client (userland/negronigl/drm, copied
+to src/redwood-drm by scripts/gpu/turnip-build.sh): device discovery without DRM nodes, IOConnectMapMemory64 maps,
+no fd-based external handles, VK_EXT_external_memory_host (HOST_CACHED types; noted IOSurfaces by ID, other pages via USERPTR 0x49), no CTR_EL0 read at EL0, relative
+condition-variable waits, chained fixups. Applies after the HackiOS patches (scripts/gpu/env.sh HACKIOS_PATCHES).
+
+--- a/meson.build
++++ b/meson.build
+@@ -1716,7 +1716,7 @@
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if host_machine.system() == 'darwin' and with_gallium_freedreno
++if host_machine.system() == 'darwin' and (with_gallium_freedreno or with_freedreno_vk)
+   # No DRM on this system: freedreno's requests go to the kernel's driver through a stand-in
+   # for libdrm (src/redwood-drm, put there by Darwin on redwood's tools/mk-mesa.sh; its one
+   # source file is built with freedreno's drm layer, src/freedreno/drm).
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -54,6 +54,8 @@
+ libvulkan_wsi = static_library(
+   'vulkan_wsi',
+   [files_vulkan_wsi, wsi_entrypoints],
++  # Darwin: libdrm is the stand-in in src/redwood-drm, so wsi_common_drm.c is built; its prototypes need HAVE_LIBDRM.
++  c_args : host_machine.system() == 'darwin' ? ['-DHAVE_LIBDRM'] : [],
+   include_directories : [inc_include, inc_src],
+   dependencies : [
+     vulkan_wsi_deps, dep_libdrm, dep_libudev, idep_vulkan_util_headers,
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -154,9 +154,24 @@
+   '-Wno-write-strings',
+ ])
+ 
++# Darwin (iOS): the libdrm stand-in (userland/negronigl/drm, copied to src/redwood-drm) talks to the RedwoodGPU
++# user client over its msm struct ABI. Its own ABI switch (NEGRONI_TU_ABI) keeps NEGRONIGL_ABI for the GL library.
++darwin_drm_sources = []
++darwin_drm_link_args = []
++if host_machine.system() == 'darwin'
++  darwin_drm_sources = files('../../redwood-drm/negroni_drm.c', '../../redwood-drm/log.c')
++  darwin_drm_link_args = ['-framework', 'IOKit', '-framework', 'IOSurface', '-framework', 'CoreFoundation']
++  # Mach-O "weak" is weak_import: the entrypoint tables' weak references to entrypoints that no layer defines
++  # (wsi_*, ...) need a definition at link time, so they are looked up at load time and resolve to NULL (as Mesa's
++  # lavapipe does with b_lundef=false). -fixup_chains: LC_DYLD_CHAINED_FIXUPS, which ld would drop for
++  # -undefined dynamic_lookup; the old format imports dyld_stub_binder, a local symbol in the iOS 16.7.16 libdyld.
++  darwin_drm_link_args += ['-Wl,-undefined,dynamic_lookup', '-Wl,-fixup_chains']
++  tu_flags += ['-DNGL_ABI_AUTO_FIRST=NGL_ABI_MSM_STRUCT', '-DNGL_ABI_ENV="NEGRONI_TU_ABI"']
++endif
++
+ libvulkan_freedreno = shared_library(
+   'vulkan_freedreno',
+-  [libtu_files, tu_entrypoints, tu_tracepoints, freedreno_xml_header_files, sha1_h, u_format_pack_h, bvh_spv],
++  [libtu_files, tu_entrypoints, tu_tracepoints, freedreno_xml_header_files, sha1_h, u_format_pack_h, bvh_spv] + darwin_drm_sources,
+   include_directories : libtu_includes,
+   link_with : [
+     libfreedreno_ir3,
+@@ -181,7 +196,7 @@
+   c_args : [no_override_init_args, tu_flags],
+   cpp_args : [tu_cpp_args, tu_flags],
+   gnu_symbol_visibility : 'hidden',
+-  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],
++  link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id] + darwin_drm_link_args,
+   link_depends : vulkan_icd_link_depends,
+   install : true,
+ )
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -51,6 +51,14 @@
+ 
+ uint64_t os_page_size = 4096;
+ 
++/* Darwin (iOS): the libdrm stand-in has no fds behind its handles (no dma-buf, sync_file, opaque fd) and buffer
++ * memory comes from IOConnectMapMemory64, so no placed maps either. */
++#ifdef __APPLE__
++#define DARWIN_NO_FD true
++#else
++#define DARWIN_NO_FD false
++#endif
++
+ static int
+ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
+ {
+@@ -173,11 +181,11 @@
+       .KHR_dynamic_rendering = true,
+       .KHR_dynamic_rendering_local_read = true,
+       .KHR_external_fence = true,
+-      .KHR_external_fence_fd = true,
++      .KHR_external_fence_fd = !DARWIN_NO_FD,
+       .KHR_external_memory = true,
+-      .KHR_external_memory_fd = true,
++      .KHR_external_memory_fd = !DARWIN_NO_FD,
+       .KHR_external_semaphore = true,
+-      .KHR_external_semaphore_fd = true,
++      .KHR_external_semaphore_fd = !DARWIN_NO_FD,
+       .KHR_format_feature_flags2 = true,
+       .KHR_fragment_shading_rate = device->info->a6xx.has_attachment_shading_rate,
+       .KHR_get_memory_requirements2 = true,
+@@ -268,7 +276,8 @@
+       .EXT_extended_dynamic_state = true,
+       .EXT_extended_dynamic_state2 = true,
+       .EXT_extended_dynamic_state3 = true,
+-      .EXT_external_memory_dma_buf = true,
++      .EXT_external_memory_dma_buf = !DARWIN_NO_FD,
++      .EXT_external_memory_host = device->has_host_import,
+       .EXT_filter_cubic = device->info->a6xx.has_tex_filter_cubic,
+       .EXT_fragment_density_map = true,
+       .EXT_global_priority = true,
+@@ -286,7 +295,7 @@
+       .EXT_legacy_vertex_attributes = true,
+       .EXT_line_rasterization = true,
+       .EXT_load_store_op_none = true,
+-      .EXT_map_memory_placed = true,
++      .EXT_map_memory_placed = !DARWIN_NO_FD,
+       .EXT_memory_budget = true,
+       .EXT_multi_draw = true,
+       .EXT_mutable_descriptor_type = true,
+@@ -662,9 +671,9 @@
+    features->legacyDithering = true;
+ 
+    /* VK_EXT_map_memory_placed */
+-   features->memoryMapPlaced = true;
++   features->memoryMapPlaced = !DARWIN_NO_FD;
+    features->memoryMapRangePlaced = false;
+-   features->memoryUnmapReserve = true;
++   features->memoryUnmapReserve = !DARWIN_NO_FD;
+ 
+    /* VK_EXT_multi_draw */
+    features->multiDraw = true;
+@@ -1203,6 +1212,9 @@
+    os_get_page_size(&os_page_size);
+    props->minPlacedMemoryMapAlignment = os_page_size;
+ 
++   /* VK_EXT_external_memory_host: the kernel imports whole 16 KiB pages (iOS user pages, docs/gpu-abi.md). */
++   props->minImportedHostPointerAlignment = 16384;
++
+    /* VK_EXT_multi_draw */
+    props->maxMultiDrawCount = 2048;
+ 
+@@ -2709,6 +2721,8 @@
+                                  "pthread condattr init");
+       goto fail_timeline_cond;
+    }
++#ifndef __APPLE__
++   /* Darwin has no pthread_condattr_setclock; tu_knl_drm.cc waits relative times there. */
+    if (pthread_condattr_setclock(&condattr, CLOCK_MONOTONIC) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+@@ -2716,6 +2730,7 @@
+                                  "pthread condattr clock setup");
+       goto fail_timeline_cond;
+    }
++#endif
+    if (pthread_cond_init(&device->timeline_cond, &condattr) != 0) {
+       pthread_condattr_destroy(&condattr);
+       result = vk_startup_errorf(physical_device->instance,
+@@ -3013,6 +3028,32 @@
+ vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName)
+ {
+    return tu_GetInstanceProcAddr(instance, pName);
++}
++
++#ifdef __APPLE__
++/* iOS has no Khronos loader: the metal2vulkan runtime opens this library by path and looks up the loader's own
++ * name (UniXNU turnip-darwin-kmd.patch, MIT). Turnip is the only driver there. */
++PUBLIC
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vkGetInstanceProcAddr(VkInstance instance, const char *pName)
++{
++   return tu_GetInstanceProcAddr(instance, pName);
++}
++#endif
++
++/* VK_EXT_external_memory_host: the pages keep the owner's cached CPU mapping and the GPU's view is non-cacheable, so
++ * only HOST_CACHED types without HOST_COHERENT fit (docs/gpu-abi.md section 6, "host import"): after GPU writes,
++ * vkInvalidateMappedMemoryRanges drops the CPU's lines (dc civac); the kernel cleans CPU-written pages at submit. */
++static uint32_t
++tu_host_import_type_bits(const struct tu_physical_device *pdev)
++{
++   uint32_t bits = 0;
++   for (uint32_t i = 0; i < pdev->memory.type_count; i++) {
++      VkMemoryPropertyFlags f = pdev->memory.types[i];
++      if ((f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
++         bits |= 1u << i;
++   }
++   return bits;
+ }
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+@@ -3047,7 +3088,20 @@
+    const VkImportMemoryFdInfoKHR *fd_info =
+       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+ 
+-   if (fd_info && fd_info->handleType) {
++   const VkImportMemoryHostPointerInfoEXT *host_info =
++      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
++
++   if (host_info && host_info->handleType) {
++      if (host_info->handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++          !device->physical_device->has_host_import ||
++          !(tu_host_import_type_bits(device->physical_device) & (1u << pAllocateInfo->memoryTypeIndex)) ||
++          (((uintptr_t) host_info->pHostPointer | pAllocateInfo->allocationSize) & 16383)) {
++         result = vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++      } else {
++         result = tu_bo_init_host(device, &mem->bo, host_info->pHostPointer,
++                                  pAllocateInfo->allocationSize);
++      }
++   } else if (fd_info && fd_info->handleType) {
+       assert(fd_info->handleType ==
+                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
+              fd_info->handleType ==
+@@ -3153,6 +3207,22 @@
+ 
+    *pMem = tu_device_memory_to_handle(mem);
+ 
++   return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL
++tu_GetMemoryHostPointerPropertiesEXT(
++   VkDevice _device,
++   VkExternalMemoryHandleTypeFlagBits handleType,
++   const void *pHostPointer,
++   VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
++{
++   VK_FROM_HANDLE(tu_device, device, _device);
++   const struct tu_physical_device *pdev = device->physical_device;
++   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++       !pdev->has_host_import || ((uintptr_t) pHostPointer & 16383))
++      return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   pMemoryHostPointerProperties->memoryTypeBits = tu_host_import_type_bits(pdev);
+    return VK_SUCCESS;
+ }
+ 
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -120,6 +120,7 @@
+    int32_t reserved_set_idx;
+ 
+    bool has_set_iova;
++   bool has_host_import; /* VK_EXT_external_memory_host (Darwin) */
+    bool has_raytracing;
+    uint64_t va_start;
+    uint64_t va_size;
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -20,6 +20,14 @@
+ 
+ #include "vk_debug_utils.h"
+ 
++#ifdef __APPLE__
++/* Darwin: the libdrm stand-in (src/redwood-drm: xf86drm.h + negroni_drm.c, linked into this library) is the real
++ * libdrm here; without this, util/libdrm.h gives stubs (drmGetVersion = NULL). */
++#include <sys/sysctl.h>
++#ifndef HAVE_LIBDRM
++#define HAVE_LIBDRM 1
++#endif
++#endif
+ #include "util/libdrm.h"
+ 
+ #include "tu_device.h"
+@@ -56,6 +64,15 @@
+    (*out_bo)->dump = flags & TU_BO_ALLOC_ALLOW_DUMP;
+ 
+    return VK_SUCCESS;
++}
++
++VkResult
++tu_bo_init_host(struct tu_device *dev, struct tu_bo **bo, void *pointer,
++                uint64_t size)
++{
++   if (!dev->instance->knl->bo_init_host)
++      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   return dev->instance->knl->bo_init_host(dev, bo, pointer, size);
+ }
+ 
+ VkResult
+@@ -124,7 +141,13 @@
+          return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                           "Failed to replace mapping with reserved memory");
+    } else {
++#ifdef __APPLE__
++      /* An IOConnectMapMemory64 mapping: munmap would leave the kernel's map object behind, which later unmaps
++       * whatever then lives at this address. */
++      redwood_drm_unmap(dev->fd, bo->gem_handle, bo->map);
++#else
+       munmap(bo->map, bo->size);
++#endif
+    }
+ 
+    bo->map = NULL;
+@@ -194,7 +217,16 @@
+ if (!(DETECT_ARCH_AARCH64 || DETECT_ARCH_X86 || DETECT_ARCH_X86_64))
+    return 0;
+ 
+-#if DETECT_ARCH_AARCH64 &&                                                   \
++#if DETECT_ARCH_AARCH64 && defined(__APPLE__)
++   /* Darwin traps the EL0 read of CTR_EL0 (SIGILL kills the process that hosts the driver). hw.cachelinesize is
++    * the kernel's answer; the SM8450 cores (Cortex-X2/A710/A510) have 64-byte lines. A size that is too small
++    * only costs extra maintenance operations, one that is too large skips lines: take the smaller one. */
++   uint64_t line = 0;
++   size_t len = sizeof(line);
++   if (sysctlbyname("hw.cachelinesize", &line, &len, NULL, 0) != 0 || line == 0 || line > 64)
++      line = 64;
++   return (uint32_t) line;
++#elif DETECT_ARCH_AARCH64 &&                                                   \
+    (!defined(_SC_LEVEL1_DCACHE_LINESIZE) || DETECT_OS_ANDROID)
+    /* Bionic does not implement _SC_LEVEL1_DCACHE_LINESIZE properly: */
+    uint64_t ctr_el0;
+@@ -352,6 +384,41 @@
+       mesa_logi("Found compatible device '%s'.", path);
+ 
+    return result;
++#elif defined(__APPLE__) && defined(TU_HAS_MSM)
++   /* Darwin: no DRM nodes. The libdrm stand-in opens the RedwoodGPU user client (msm struct ABI,
++    * docs/gpu-abi.md) and hands out a dup of /dev/null as the "fd". */
++   struct tu_instance *instance =
++      container_of(vk_instance, struct tu_instance, vk);
++   int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
++   if (fd < 0)
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   drmVersionPtr version = drmGetVersion(fd);
++   if (!version) {
++      close(fd);
++      return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
++   struct tu_physical_device *device = NULL;
++   VkResult result = tu_knl_drm_msm_load(instance, fd, version, &device);
++   drmFreeVersion(version);
++   if (result != VK_SUCCESS) {
++      close(fd);
++      return result;
++   }
++   device->master_fd = -1;
++   device->kgsl_dma_fd = -1;
++   snprintf(device->fd_path, ARRAY_SIZE(device->fd_path), "%s", "RedwoodGPU");
++   device->has_master = false;
++   device->has_local = false;
++   result = tu_physical_device_init(device, instance);
++   if (result != VK_SUCCESS) {
++      close(fd);
++      vk_free(&instance->vk.alloc, device);
++      return result;
++   }
++   list_addtail(&device->vk.link, &instance->vk.physical_devices.list);
++   if (TU_DEBUG(STARTUP))
++      mesa_logi("Found the RedwoodGPU user client (msm ABI).");
++   return VK_SUCCESS;
+ #else
+    return VK_ERROR_INCOMPATIBLE_DRIVER;
+ #endif
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -71,6 +71,8 @@
+    bool implicit_sync : 1;
+    bool never_unmap : 1;
+    bool cached_non_coherent : 1;
++   /* VK_EXT_external_memory_host: map is the caller's own pointer; never unmap it. */
++   bool host_ptr : 1;
+ 
+    bool dump;
+ 
+@@ -96,6 +98,9 @@
+                        enum tu_bo_alloc_flags flags, const char *name);
+    VkResult (*bo_init_dmabuf)(struct tu_device *dev, struct tu_bo **out_bo,
+                               uint64_t size, int prime_fd);
++   /* Optional (VK_EXT_external_memory_host): a BO over the caller's own pages at pointer. */
++   VkResult (*bo_init_host)(struct tu_device *dev, struct tu_bo **out_bo,
++                            void *pointer, uint64_t size);
+    int (*bo_export_dmabuf)(struct tu_device *dev, struct tu_bo *bo);
+    VkResult (*bo_map)(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
+    void (*bo_allow_dump)(struct tu_device *dev, struct tu_bo *bo);
+@@ -162,6 +167,10 @@
+ }
+ 
+ VkResult
++tu_bo_init_host(struct tu_device *dev, struct tu_bo **bo, void *pointer,
++                uint64_t size);
++
++VkResult
+ tu_bo_init_dmabuf(struct tu_device *dev,
+                   struct tu_bo **bo,
+                   uint64_t size,
+--- a/src/freedreno/vulkan/tu_knl_drm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm.cc
+@@ -70,9 +70,14 @@
+       return;
+    }
+ 
+-   if (bo->map) {
++   if (bo->map && !bo->host_ptr) {
+       TU_RMV(bo_unmap, dev, bo);
++#ifdef __APPLE__
++      /* IOConnectMapMemory64 mapping (redwood_drm_map): give it back through IOKit. */
++      redwood_drm_unmap(dev->fd, bo->gem_handle, bo->map);
++#else
+       munmap(bo->map, bo->size);
++#endif
+    }
+ 
+    TU_RMV(bo_destroy, dev, bo);
+@@ -348,8 +353,21 @@
+             };
+ 
+             ASSERTED int ret;
++#ifdef __APPLE__
++            /* Darwin has no pthread_condattr_setclock (the condition variable is on the realtime clock):
++             * wait the time left on CLOCK_MONOTONIC instead, at most 1 s per round (the loop checks again). */
++            uint64_t now_ns = os_time_get_nano();
++            uint64_t left_ns = abs_timeout_ns > now_ns ? abs_timeout_ns - now_ns : 0;
++            if (left_ns > NSEC_PER_SEC)
++               left_ns = NSEC_PER_SEC;
++            abstime.tv_sec = left_ns / NSEC_PER_SEC;
++            abstime.tv_nsec = left_ns % NSEC_PER_SEC;
++            ret = pthread_cond_timedwait_relative_np(&dev->timeline_cond,
++                                                     &dev->submit_mutex, &abstime);
++#else
+             ret = pthread_cond_timedwait(&dev->timeline_cond,
+                                          &dev->submit_mutex, &abstime);
++#endif
+             assert(ret != EINVAL);
+             if (os_time_get_nano() >= abs_timeout_ns) {
+                pthread_mutex_unlock(&dev->submit_mutex);
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -191,7 +191,13 @@
+ static VkResult
+ msm_device_init(struct tu_device *dev)
+ {
++#ifdef __APPLE__
++   /* Darwin: fd_path names the IOKit service, not a node; the stand-in shares one connection per process, so the
++    * device's fd sees the same GPU VA window (MSM_PARAM_VA_START) as the physical device's. */
++   int fd = drmOpenWithType("msm", NULL, DRM_NODE_RENDER);
++#else
+    int fd = open(dev->physical_device->fd_path, O_RDWR | O_CLOEXEC);
++#endif
+    if (fd < 0) {
+       return vk_startup_errorf(
+             dev->physical_device->instance, VK_ERROR_INITIALIZATION_FAILED,
+@@ -610,6 +616,10 @@
+             enum tu_bo_alloc_flags flags,
+             const char *name)
+ {
++#ifdef __APPLE__
++   /* The kernel makes whole 16 KiB pages and maps all of them at the GPU address: reserve as much. */
++   size = align64(size, 16384);
++#endif
+    struct drm_msm_gem_new req = {
+       .size = size,
+       .flags = 0
+@@ -732,17 +742,64 @@
+    return result;
+ }
+ 
++#ifdef __APPLE__
++/* VK_EXT_external_memory_host: a GEM buffer over the caller's pages (negroni_drm.c redwood_drm_host_import: the noted
++ * IOSurface whose memory starts there by ID, 0x7e, else the kernel's user-page import, 0x49 = 0232). The CPU keeps
++ * the caller's mapping (IOConnectMapMemory64 of a 0x49 handle is refused); the buffer is "mapped" at pointer and
++ * never unmapped by us. */
+ static VkResult
++msm_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer,
++                 uint64_t size)
++{
++   uint32_t gem_handle = 0;
++   uint64_t bo_size = 0;
++   int err = redwood_drm_host_import(dev->fd, pointer, size, &gem_handle, &bo_size);
++   if (err)
++      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                       "host import of %p (%" PRIu64 " bytes): errno %d", pointer, size, err);
++
++   struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
++   assert(bo && bo->gem_handle == 0);
++
++   msm_vma_lock(dev);
++   /* the GPU address range must cover all of the kernel's pages (bo_size >= size) */
++   VkResult result = tu_bo_init(dev, NULL, bo, gem_handle, MAX2(bo_size, size), 0,
++                                TU_BO_ALLOC_NO_FLAGS, "host import");
++   msm_vma_unlock(dev);
++   if (result != VK_SUCCESS) {
++      memset(bo, 0, sizeof(*bo));
++      return result;
++   }
++
++   bo->map = pointer;
++   bo->host_ptr = true;
++   bo->never_unmap = true;
++   /* the caller's mapping is cacheable: vkFlush/InvalidateMappedMemoryRanges clean/drop lines */
++   bo->cached_non_coherent = true;
++   *out_bo = bo;
++   return VK_SUCCESS;
++}
++#endif
++
++static VkResult
+ msm_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+ {
+    uint64_t offset = tu_gem_info(dev, bo->gem_handle, MSM_INFO_GET_OFFSET);
+    if (!offset)
+       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+ 
++#ifdef __APPLE__
++   /* Darwin: the buffer's memory is IOConnectMapMemory64 of memory type = handle (docs/gpu-abi.md section 2); no
++    * placed maps (VK_EXT_map_memory_placed is off on Darwin). */
++   if (placed_addr != NULL)
++      return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
++   void *map = redwood_drm_map(dev->fd, bo->gem_handle, bo->size);
++#else
+    /* TODO: Should we use the wrapper os_mmap() like Freedreno does? */
+    void *map = mmap(placed_addr, bo->size, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | (placed_addr != NULL ? MAP_FIXED : 0),
+                     dev->fd, offset);
++#endif
+    if (map == MAP_FAILED)
+       return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
+ 
+@@ -974,6 +1031,9 @@
+       .submitqueue_close = msm_submitqueue_close,
+       .bo_init = msm_bo_init,
+       .bo_init_dmabuf = msm_bo_init_dmabuf,
++#ifdef __APPLE__
++      .bo_init_host = msm_bo_init_host,
++#endif
+       .bo_export_dmabuf = tu_drm_export_dmabuf,
+       .bo_map = msm_bo_map,
+       .bo_allow_dump = msm_bo_allow_dump,
+@@ -1051,6 +1111,9 @@
+    device->has_set_iova = !tu_drm_get_va_prop(device, &device->va_start,
+                                               &device->va_size);
+    device->has_raytracing = tu_drm_get_raytracing(device);
++#ifdef __APPLE__
++   device->has_host_import = true;  /* noted IOSurfaces always (0x7e); other pages need kernel 0232 (0x49) */
++#endif
+ 
+    device->has_preemption = tu_drm_has_preemption(device);
+ 

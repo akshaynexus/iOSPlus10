@@ -106,6 +106,6 @@ cache maintenance at EL0, sandbox-openable user client), plus `MetalPluginName =
 GPU user-space agent (docs/gpu-userland.md): a Turnip `libvulkan_freedreno.dylib` for arm64-apple-ios16.0, release,
 with `VK_EXT_external_memory_host`, an exported `vkGetInstanceProcAddr` (or `vk_icdGetInstanceProcAddr`), no EL0
 `CTR_EL0` read, no iOS-16-missing imports (`scripts/metal/check-imports.py` checks), at
-`out/gpu/mesa-build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib` or a path in `TURNIP_DYLIB`.
+`out/gpu/turnip/libvulkan_freedreno.dylib` (`scripts/gpu/turnip-build.sh`, the only script that stages it) or a path in `TURNIP_DYLIB`.
 
 Integrator: `scripts/metal/build.sh` then `METAL=1 scripts/metal/root-add-metal.sh ROOT` (after the SSH step).

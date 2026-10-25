@@ -18,9 +18,9 @@ FLAME=$EXT/ios-flame
 FLAME_COMMIT=745c434
 FLAME_SRC=$MSRC/flame
 
-# Turnip (libvulkan_freedreno.dylib) comes from the GPU user-space build (docs/gpu-userland.md).
+# Turnip (libvulkan_freedreno.dylib): the one staged copy, written and checked by scripts/gpu/turnip-build.sh.
 # Override with TURNIP_DYLIB=... when it lives elsewhere.
-TURNIP_DYLIB=${TURNIP_DYLIB:-$OUT/gpu/mesa-build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib}
+TURNIP_DYLIB=${TURNIP_DYLIB:-$OUT/gpu/turnip/libvulkan_freedreno.dylib}
 
 IOS_MIN=${IOS_MIN:-16.0}
 PLUGIN_NAME=${PLUGIN_NAME:-NegroniMetal}         # bundle /System/Library/Extensions/NegroniMetal.bundle

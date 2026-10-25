@@ -9,7 +9,7 @@
  *  NGL_ABI_SCALAR      answered here, over seven scalar selectors (design of ios-sailfish
  *                      tools/sweetgl/sweet_drm.c; this is our own code):
  *    GEM_NEW / GEM_CLOSE   BO_NEW / BO_FREE: pinned pages, a GPU VA chosen by the kernel
- *                          ("softpin", msm 1.7) and a write-combined user mapping made by it
+ *                          ("softpin", msm 1.7) and a cached user mapping made by it
  *    GEM_INFO              GET_IOVA from our table; GET_OFFSET is handle << 32 (unused: the
  *                          mapping comes from redwood_drm_map, not from mmap)
  *    GEM_SUBMIT            SUBMIT: CMD_BUF/CTX_RESTORE cmds become IBs (bo VA + offset, dwords);
@@ -84,9 +84,16 @@ static struct nsync *syncs;
 static uint32_t nsyncs;
 static struct ngl_gpu_info info;
 static bool no_cpu_prep_sel;    /* BO_CPU_PREP failed once: the kernel has no such selector */
+static bool no_userptr_sel;     /* USERPTR (0x49) answered ENOSYS: kernel without 0232 */
 
 static int sync_wait(uint32_t *handles, uint64_t *points, unsigned count, int64_t deadline,
     unsigned flags, uint32_t *first);
+
+/* The environment variable that picks the ABI. Turnip's copy of this file has its own (scripts/gpu/turnip-build.sh:
+ * NEGRONI_TU_ABI), so a NEGRONIGL_ABI meant for the GL library in the same process does not move Turnip. */
+#ifndef NGL_ABI_ENV
+#define NGL_ABI_ENV "NEGRONIGL_ABI"
+#endif
 
 static const char *
 abi_name(enum ngl_abi a)
@@ -167,7 +174,7 @@ probe_msm(void)
 static enum ngl_abi
 wanted_abi(void)
 {
-	const char *e = getenv("NEGRONIGL_ABI");
+	const char *e = getenv(NGL_ABI_ENV);
 	if (e && strcmp(e, "scalar") == 0) {
 		return NGL_ABI_SCALAR;
 	}
@@ -185,6 +192,14 @@ connect_dev(void)
 	if (svc == IO_OBJECT_NULL) {
 		return;
 	}
+	/* docs/gpu-abi.md section 2: "scalar 10-16, msm ..., userptr 0x49, va shared|va per-client"; no "userptr" = no 0232 */
+	char abitext[128] = "?";
+	CFTypeRef prop = IORegistryEntryCreateCFProperty(svc, CFSTR("NegroniGPUABI"), kCFAllocatorDefault, 0);
+	if (prop && CFGetTypeID(prop) == CFStringGetTypeID())
+		CFStringGetCString((CFStringRef)prop, abitext, sizeof(abitext), kCFStringEncodingUTF8);
+	if (prop)
+		CFRelease(prop);
+	no_userptr_sel = strstr(abitext, "userptr") == NULL;
 	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
 	IOObjectRelease(svc);
 	if (kr != KERN_SUCCESS) {
@@ -209,9 +224,9 @@ connect_dev(void)
 	}
 	info.abi = abi;
 	null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
-	ngl_log("negronigl: %s open, %s ABI, chip %#llx, GMEM %llu KiB, max %llu MHz", NGL_GPU_SERVICE,
+	ngl_log("negronigl: %s open, %s ABI, chip %#llx, GMEM %llu KiB, max %llu MHz, kernel ABI \"%s\"", NGL_GPU_SERVICE,
 	    abi_name(abi), (unsigned long long)info.chip_id, (unsigned long long)info.gmem_size >> 10,
-	    (unsigned long long)info.max_freq / 1000000);
+	    (unsigned long long)info.max_freq / 1000000, abitext);
 }
 
 int
@@ -337,6 +352,68 @@ seq_wait(uint32_t seq, uint64_t ms)
 	}
 }
 
+/* ---- fences of either ABI (one global 32-bit sequence, docs/gpu-abi.md section 7) ---- */
+
+static int64_t
+mono_ns(void)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);   /* Darwin: mach_continuous_time, the kernel's msm clock */
+	return (int64_t)now.tv_sec * 1000000000ll + now.tv_nsec;
+}
+
+static bool
+seq_before(uint32_t a, uint32_t b)
+{
+	return (int32_t)(a - b) < 0;
+}
+
+/* msm WAIT_FENCE until deadline_ns (CLOCK_MONOTONIC; <= now: only ask). 0 or errno. */
+static int
+msm_fence_wait(uint32_t seq, int64_t deadline_ns)
+{
+	struct drm_msm_wait_fence w = {.fence = seq};
+	if (deadline_ns > 0) {
+		w.timeout.tv_sec = deadline_ns / 1000000000ll;
+		w.timeout.tv_nsec = deadline_ns % 1000000000ll;
+	}
+	return msm_call(NGL_MSM_SEL(DRM_MSM_WAIT_FENCE), &w, sizeof(w));
+}
+
+static bool seq_passed(uint32_t seq);
+static int seq_wait(uint32_t seq, uint64_t ms);
+
+/* Has the GPU passed fence seq? Never blocks. */
+static bool
+fence_passed(uint32_t seq)
+{
+	if (abi == NGL_ABI_MSM_STRUCT)
+		return msm_fence_wait(seq, 0) == 0;
+	return seq_passed(seq);
+}
+
+/* Wait in the kernel for seq until deadline_ns (CLOCK_MONOTONIC, INT64_MAX = no limit), in rounds of at most
+ * 5 s (the kernel caps one wait at 60 s). 0, ETIMEDOUT or another errno. */
+static int
+fence_wait_until(uint32_t seq, int64_t deadline_ns)
+{
+	for (;;) {
+		int64_t now = mono_ns(), until = deadline_ns;
+		if (until != INT64_MAX && now >= until)
+			return fence_passed(seq) ? 0 : ETIMEDOUT;
+		if (until == INT64_MAX || until - now > 5000000000ll)
+			until = now + 5000000000ll;
+		int e;
+		if (abi == NGL_ABI_MSM_STRUCT) {
+			e = msm_fence_wait(seq, until);
+		} else {
+			e = seq_wait(seq, (uint64_t)(until - now) / 1000000 + 1);
+		}
+		if (e != ETIMEDOUT)
+			return e;
+	}
+}
+
 /*
  * msm timeouts are absolute times. freedreno-darwin.patch makes them on CLOCK_MONOTONIC_RAW
  * (msm_priv.h get_abs_timeout): the same clock here. -> milliseconds from now.
@@ -458,7 +535,7 @@ s_gem_info(struct drm_msm_gem_info *r)
 			break;
 #ifdef MSM_INFO_GET_FLAGS
 		case MSM_INFO_GET_FLAGS:
-			r->value = MSM_BO_WC;
+			r->value = MSM_BO_CACHED;       /* scalar BO_NEW and imports: cached CPU view (docs/gpu-abi.md section 6) */
 			break;
 #endif
 		default:
@@ -504,6 +581,141 @@ s_cpu_prep(struct drm_msm_gem_cpu_prep *r)
 	return 0;
 }
 
+/*
+ * Syncobjs of a submission (both ABIs; the kernel ignores in_syncobjs/out_syncobjs, docs/gpu-abi.md section 7).
+ * In: one ring runs every submission of every process in order, so a syncobj that already carries a fence needs
+ * no wait; one with no fence yet is waited for until it gets one (Linux refuses it: EINVAL after 10 s here).
+ * NEGRONIGL_SYNC_CPU_WAIT=1 makes the CPU wait for the fence itself as well (debug aid).
+ */
+static uint32_t
+submit_stride(const struct drm_msm_gem_submit *r)
+{
+	return r->syncobj_stride ? r->syncobj_stride : sizeof(struct drm_msm_gem_submit_syncobj);
+}
+
+static int
+submit_syncobjs_check(const struct drm_msm_gem_submit *r)
+{
+	uint32_t stride = submit_stride(r);
+	if (stride < sizeof(struct drm_msm_gem_submit_syncobj) ||
+	    ((r->flags & MSM_SUBMIT_SYNCOBJ_IN) && r->nr_in_syncobjs && !r->in_syncobjs) ||
+	    ((r->flags & MSM_SUBMIT_SYNCOBJ_OUT) && r->nr_out_syncobjs && !r->out_syncobjs))
+		return EINVAL;
+	for (uint32_t i = 0; (r->flags & MSM_SUBMIT_SYNCOBJ_IN) && i < r->nr_in_syncobjs; i++) {
+		const struct drm_msm_gem_submit_syncobj *in = (const void *)(uintptr_t)(r->in_syncobjs + (uint64_t)i * stride);
+		if (in->flags & ~MSM_SUBMIT_SYNCOBJ_FLAGS)
+			return EINVAL;
+	}
+	for (uint32_t i = 0; (r->flags & MSM_SUBMIT_SYNCOBJ_OUT) && i < r->nr_out_syncobjs; i++) {
+		const struct drm_msm_gem_submit_syncobj *out = (const void *)(uintptr_t)(r->out_syncobjs + (uint64_t)i * stride);
+		if (out->flags & ~MSM_SUBMIT_SYNCOBJ_FLAGS)
+			return EINVAL;
+	}
+	return 0;
+}
+
+static int
+submit_syncobjs_in(const struct drm_msm_gem_submit *r)
+{
+	int e = submit_syncobjs_check(r);
+	if (e || !(r->flags & MSM_SUBMIT_SYNCOBJ_IN))
+		return e;
+	static int cpu_wait = -1;
+	if (cpu_wait < 0) {
+		const char *v = getenv("NEGRONIGL_SYNC_CPU_WAIT");
+		cpu_wait = v && v[0] == '1';
+	}
+	uint32_t stride = submit_stride(r);
+	for (uint32_t i = 0; i < r->nr_in_syncobjs; i++) {
+		const struct drm_msm_gem_submit_syncobj *in = (const void *)(uintptr_t)(r->in_syncobjs + (uint64_t)i * stride);
+		uint32_t h = in->handle;
+		pthread_mutex_lock(&lock);
+		struct nsync *sy = nsync(h);
+		bool has_fence = sy && (sy->signaled || sy->seq);
+		uint32_t seq = sy ? sy->seq : 0;
+		pthread_mutex_unlock(&lock);
+		if (!sy)
+			return EINVAL;
+		if (!has_fence) {
+			if (sync_wait(&h, NULL, 1, mono_ns() + 10000000000ll, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
+			    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE, NULL)) {
+				ngl_log("negronigl: submit waits on syncobj %u that never got a fence", h);
+				return EINVAL;
+			}
+			pthread_mutex_lock(&lock);
+			sy = nsync(h);
+			seq = sy ? sy->seq : 0;
+			pthread_mutex_unlock(&lock);
+		}
+		if (cpu_wait && seq && fence_wait_until(seq, INT64_MAX))
+			return EIO;
+	}
+	return 0;
+}
+
+/* After a submission the kernel took: in-syncobjs with MSM_SUBMIT_SYNCOBJ_RESET lose their fence (as on Linux, only
+ * when the submit succeeds; the ring orders the new work after it). */
+static void
+submit_syncobjs_reset(const struct drm_msm_gem_submit *r)
+{
+	if (!(r->flags & MSM_SUBMIT_SYNCOBJ_IN))
+		return;
+	uint32_t stride = submit_stride(r);
+	for (uint32_t i = 0; i < r->nr_in_syncobjs; i++) {
+		const struct drm_msm_gem_submit_syncobj *in = (const void *)(uintptr_t)(r->in_syncobjs + (uint64_t)i * stride);
+		uint32_t h = in->handle;
+		if (in->flags & MSM_SUBMIT_SYNCOBJ_RESET)
+			(void)drmSyncobjReset(-1, &h, 1);
+	}
+}
+
+/* lock not held: after the kernel answered fence seq for this submission */
+static int
+submit_syncobjs_out(const struct drm_msm_gem_submit *r, uint32_t seq)
+{
+	if (!(r->flags & MSM_SUBMIT_SYNCOBJ_OUT))
+		return 0;
+	uint32_t stride = submit_stride(r);
+	int e = 0;
+	pthread_mutex_lock(&lock);
+	for (uint32_t i = 0; i < r->nr_out_syncobjs; i++) {
+		const struct drm_msm_gem_submit_syncobj *out = (const void *)(uintptr_t)(r->out_syncobjs + (uint64_t)i * stride);
+		struct nsync *sy = nsync(out->handle);
+		if (!sy) {
+			e = EINVAL;
+			continue;
+		}
+		sy->seq = seq;
+		sy->point = out->point ? out->point : 1;
+		sy->signaled = false;
+	}
+	pthread_mutex_unlock(&lock);
+	return e;
+}
+
+/* msm ABI: the kernel runs the submission; the syncobjs are ours. */
+static int
+msm_gem_submit(struct drm_msm_gem_submit *r)
+{
+	int e = submit_syncobjs_in(r);
+	if (e)
+		return e;
+	struct drm_msm_gem_submit k = *r;
+	k.flags &= ~(MSM_SUBMIT_SYNCOBJ_IN | MSM_SUBMIT_SYNCOBJ_OUT);
+	k.in_syncobjs = k.out_syncobjs = 0;
+	k.nr_in_syncobjs = k.nr_out_syncobjs = 0;
+	k.syncobj_stride = 0;
+	e = msm_call(NGL_MSM_SEL(DRM_MSM_GEM_SUBMIT), &k, sizeof(k));
+	if (e) {
+		ngl_log("negronigl: msm submit (%u cmds, %u bos): errno %d", r->nr_cmds, r->nr_bos, e);
+		return e;
+	}
+	r->fence = k.fence;
+	r->fence_fd = k.fence_fd;
+	submit_syncobjs_reset(r);
+	return submit_syncobjs_out(r, k.fence);
+}
+
 static int
 s_gem_submit(struct drm_msm_gem_submit *r)
 {
@@ -515,26 +727,9 @@ s_gem_submit(struct drm_msm_gem_submit *r)
 		ngl_log("negronigl: submit flags %#x not supported", r->flags);
 		return EINVAL;
 	}
-	uint32_t stride = r->syncobj_stride ? r->syncobj_stride : sizeof(struct drm_msm_gem_submit_syncobj);
-	if (stride < sizeof(struct drm_msm_gem_submit_syncobj) ||
-	    ((r->flags & MSM_SUBMIT_SYNCOBJ_IN) && (!r->in_syncobjs || !r->nr_in_syncobjs)) ||
-	    ((r->flags & MSM_SUBMIT_SYNCOBJ_OUT) && (!r->out_syncobjs || !r->nr_out_syncobjs)))
-		return EINVAL;
-	/* The kernel ABI only accepts command buffers. Resolve binary input fences in userspace. */
-	for (uint32_t i = 0; (r->flags & MSM_SUBMIT_SYNCOBJ_IN) && i < r->nr_in_syncobjs; i++) {
-		struct drm_msm_gem_submit_syncobj *in = (void *)(uintptr_t)(r->in_syncobjs + (uint64_t)i * stride);
-		if (in->flags & ~MSM_SUBMIT_SYNCOBJ_FLAGS) return EINVAL;
-		uint32_t h = in->handle;
-		if (sync_wait(&h, NULL, 1, INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
-		    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL)) return errno;
-		if (in->flags & MSM_SUBMIT_SYNCOBJ_RESET) {
-			if (drmSyncobjReset(-1, &h, 1)) return errno;
-		}
-	}
-	for (uint32_t i = 0; (r->flags & MSM_SUBMIT_SYNCOBJ_OUT) && i < r->nr_out_syncobjs; i++) {
-		struct drm_msm_gem_submit_syncobj *out = (void *)(uintptr_t)(r->out_syncobjs + (uint64_t)i * stride);
-		if (out->flags & ~MSM_SUBMIT_SYNCOBJ_FLAGS) return EINVAL;
-	}
+	int se = submit_syncobjs_in(r);
+	if (se)
+		return se;
 	const struct drm_msm_gem_submit_bo *sb = (const void *)(uintptr_t)r->bos;
 	const struct drm_msm_gem_submit_cmd *sc = (const void *)(uintptr_t)r->cmds;
 	size_t len = sizeof(struct ngl_submit_hdr) + (size_t)r->nr_cmds * sizeof(struct ngl_submit_ib) +
@@ -593,20 +788,10 @@ s_gem_submit(struct drm_msm_gem_submit *r)
 				b->used = true;
 			}
 		}
-		for (uint32_t i = 0; (r->flags & MSM_SUBMIT_SYNCOBJ_OUT) && i < r->nr_out_syncobjs; i++) {
-			struct drm_msm_gem_submit_syncobj *out = (void *)(uintptr_t)(r->out_syncobjs + (uint64_t)i * stride);
-			struct nsync *s = nsync(out->handle);
-			if (s) {
-				s->seq = (uint32_t)seq;
-				s->point = out->point ? out->point : 1;
-				s->signaled = false;
-			} else {
-				e = EINVAL;
-				break;
-			}
-		}
 		pthread_mutex_unlock(&lock);
-		if (e == 0) r->fence = (uint32_t)seq;
+		r->fence = (uint32_t)seq;
+		submit_syncobjs_reset(r);
+		e = submit_syncobjs_out(r, (uint32_t)seq);
 	}
 	free(buf);
 	return e;
@@ -674,6 +859,8 @@ command(unsigned long index, void *data, unsigned long size)
 		return ENODEV;
 	}
 	if (abi == NGL_ABI_MSM_STRUCT) {
+		if (index == DRM_MSM_GEM_SUBMIT && size >= sizeof(struct drm_msm_gem_submit))
+			return msm_gem_submit(data);
 		return msm_call(NGL_MSM_SEL(index), data, size);
 	}
 	return s_command(index, data);
@@ -904,6 +1091,125 @@ drmPrimeFDToHandle(int fd, int surface_id, uint32_t *handle)
 	return 0;
 }
 
+/* ---- host pages (VK_EXT_external_memory_host) ---- */
+
+struct nsurf {
+	uintptr_t base;
+	uint64_t size;
+	uint32_t surface;
+};
+#define NSURF_MAX 512
+static struct nsurf surfs[NSURF_MAX];
+static uint32_t nsurf_next;
+
+/* exported: NegroniMetal's frontend finds it with dlsym in Turnip's image */
+__attribute__((visibility("default"))) void
+redwood_drm_note_surface(const void *base, uint64_t size, uint32_t surface)
+{
+	if (!base || !size || !surface)
+		return;
+	pthread_mutex_lock(&lock);
+	uint32_t slot = nsurf_next;
+	for (uint32_t i = 0; i < NSURF_MAX; i++) {
+		if (surfs[i].base == (uintptr_t)base) {
+			slot = i;
+			break;
+		}
+	}
+	surfs[slot] = (struct nsurf){(uintptr_t)base, size, surface};
+	if (slot == nsurf_next)
+		nsurf_next = (nsurf_next + 1) % NSURF_MAX;
+	pthread_mutex_unlock(&lock);
+}
+
+/* The noted IOSurface whose memory starts at p and holds size bytes, checked against IOSurface itself (a freed
+ * surface's address can come back for another one). 0 = none. */
+static uint32_t
+surface_at(uintptr_t p, uint64_t size)
+{
+	uint32_t id = 0;
+	pthread_mutex_lock(&lock);
+	for (uint32_t i = 0; i < NSURF_MAX && !id; i++) {
+		if (surfs[i].base == p && size <= ((surfs[i].size + NGL_PAGE - 1) & ~(NGL_PAGE - 1)))
+			id = surfs[i].surface;
+	}
+	pthread_mutex_unlock(&lock);
+	if (!id)
+		return 0;
+	IOSurfaceRef ref = IOSurfaceLookup(id);
+	bool same = ref && (uintptr_t)IOSurfaceGetBaseAddress(ref) == p;
+	if (ref)
+		CFRelease(ref);
+	return same ? id : 0;
+}
+
+int
+redwood_drm_host_import(int fd, void *pointer, uint64_t size, uint32_t *handle, uint64_t *bo_size)
+{
+	(void)fd;
+	uintptr_t p = (uintptr_t)pointer;
+	if (conn == IO_OBJECT_NULL)
+		return ENODEV;
+	if (!p || !size || (p & (NGL_PAGE - 1)))
+		return EINVAL;
+	uint64_t whole = (size + NGL_PAGE - 1) & ~(NGL_PAGE - 1);
+	int e;
+	/* A noted IOSurface by ID first: the present path (0231/0234) knows only 0x7e / scalar 12 imports. */
+	uint32_t id = surface_at(p, size);
+	if (!id) {
+		if (abi != NGL_ABI_MSM_STRUCT || no_userptr_sel) {
+			ngl_log("negronigl: host import of %p (+%llu): not a noted IOSurface, and no USERPTR (%s)", pointer,
+			    (unsigned long long)size, abi != NGL_ABI_MSM_STRUCT ? "scalar ABI" : "kernel without 0232");
+			return ENOSYS;
+		}
+		if (whole > NGL_USERPTR_MAX)
+			return EINVAL;
+		struct redwood_drm_userptr u = {.pointer = p, .size = whole};
+		e = msm_call(NGL_MSM_SEL_USERPTR, &u, sizeof(u));
+		if (e == EIO) {
+			/* kIOReturnVMError: the pages are not writable. Import them read-only for the GPU. */
+			u = (struct redwood_drm_userptr){.pointer = p, .size = whole, .flags = NGL_USERPTR_READ_ONLY};
+			e = msm_call(NGL_MSM_SEL_USERPTR, &u, sizeof(u));
+			if (e == 0)
+				ngl_log("negronigl: host import of %p (+%llu): read-only pages, the GPU only reads them", pointer,
+				    (unsigned long long)whole);
+		}
+		if (e == ENOSYS) {
+			no_userptr_sel = true;
+			ngl_log("negronigl: USERPTR (selector 0x49): ENOSYS, kernel without 0232; only noted IOSurfaces import");
+			return ENOSYS;
+		}
+		if (e) {
+			ngl_log("negronigl: USERPTR of %p (+%llu): errno %d", pointer, (unsigned long long)whole, e);
+			return e;
+		}
+		*handle = u.handle;
+		*bo_size = whole;
+		return 0;
+	}
+	if (abi == NGL_ABI_MSM_STRUCT) {
+		struct redwood_drm_surface s = {.surface = id};
+		e = msm_call(NGL_MSM_SEL_SURFACE, &s, sizeof(s));
+		if (e)
+			return e;
+		if (s.offset != 0 || s.size < size) {
+			/* the surface's pixels must start at the buffer's first byte, as at its base address */
+			struct drm_gem_close c = {.handle = s.handle};
+			msm_call(NGL_MSM_SEL_GEM_CLOSE, &c, sizeof(c));
+			return EINVAL;
+		}
+		*handle = s.handle;
+		*bo_size = s.size;
+		return 0;
+	}
+	e = ngl_drm_import_surface(id, handle, bo_size);
+	if (e == 0 && *bo_size < size) {
+		s_gem_close(*handle);
+		return EINVAL;
+	}
+	return e;
+}
+
 static int
 none(void)
 {
@@ -983,44 +1289,89 @@ drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t count)
 {
 	(void)fd;
 	if (count && (!handles || !points)) { errno = EFAULT; return -1; }
-	pthread_mutex_lock(&lock);
 	for (uint32_t i = 0; i < count; i++) {
+		pthread_mutex_lock(&lock);
 		struct nsync *s = nsync(handles[i]);
-		if (!s) { pthread_mutex_unlock(&lock); errno = EINVAL; return -1; }
-		points[i] = s->signaled || (s->seq && seq_passed(s->seq)) ? (s->point ? s->point : 1) : 0;
+		bool ok = s != NULL, signaled = s && s->signaled;
+		uint32_t seq = s ? s->seq : 0;
+		uint64_t point = s && s->point ? s->point : 1;
+		pthread_mutex_unlock(&lock);
+		if (!ok) { errno = EINVAL; return -1; }
+		points[i] = signaled || (seq && fence_passed(seq)) ? point : 0;
 	}
-	pthread_mutex_unlock(&lock);
 	return 0;
 }
 
+/*
+ * drmSyncobjWait / TimelineWait over the emulated syncobjs. deadline: CLOCK_MONOTONIC ns (Mesa's), INT64_MAX = none.
+ * Linux semantics: a syncobj without a fence is EINVAL unless WAIT_FOR_SUBMIT; WAIT_AVAILABLE (Mesa's WAIT_PENDING)
+ * is satisfied once a fence is there. Points: a binary syncobj counts as its point (1) when it is done.
+ * Blocking: fences are one ordered sequence, so "all" waits for the newest pending fence and "any" for the oldest,
+ * in the kernel; only syncobjs that still lack a fence are polled (1 ms).
+ */
 static int
 sync_wait(uint32_t *handles, uint64_t *points, unsigned count, int64_t deadline, unsigned flags,
     uint32_t *first)
 {
-	if (!count || !handles || (flags & ~(DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT))) {
-		errno = EINVAL; return -1;
+	const unsigned known = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
+	    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;
+	if (!count || !handles || (flags & ~known)) {
+		errno = EINVAL;
+		return -1;
 	}
+	const bool all = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL;
 	for (;;) {
 		unsigned found = 0;
+		bool unsubmitted = false, have_target = false;
+		uint32_t target = 0;
 		for (unsigned i = 0; i < count; i++) {
-			uint32_t seq = 0; uint64_t point = 0; bool done = false;
 			pthread_mutex_lock(&lock);
-			struct nsync *s = nsync(handles[i]);
-			if (!s) { pthread_mutex_unlock(&lock); errno = EINVAL; return -1; }
-			seq = s->seq; point = s->point; done = s->signaled;
+			struct nsync *sy = nsync(handles[i]);
+			uint32_t seq = sy ? sy->seq : 0;
+			uint64_t point = sy ? sy->point : 0;
+			bool signaled = sy && sy->signaled;
 			pthread_mutex_unlock(&lock);
-			if (!done && seq) done = seq_passed(seq);
-			if (done && (!points || point >= points[i])) {
-				found++;
-				if (first) *first = i;
+			if (!sy) {
+				errno = EINVAL;
+				return -1;
 			}
+			bool point_ok = !points || (point ? point : 1) >= points[i] || points[i] == 0;
+			if ((!signaled && !seq) || !point_ok) {
+				unsubmitted = true;     /* no fence (for this point) yet */
+				continue;
+			}
+			bool done = signaled || (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE) || fence_passed(seq);
+			if (done) {
+				if (found++ == 0 && first)
+					*first = i;
+				continue;
+			}
+			if (!have_target || (all ? seq_before(target, seq) : seq_before(seq, target)))
+				target = seq;
+			have_target = true;
 		}
-		if ((flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) ? found == count : found != 0)
+		if (all ? found == count : found != 0)
 			return 0;
-		struct timespec now;
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		int64_t now_ns = (int64_t)now.tv_sec * 1000000000ll + now.tv_nsec;
-		if (deadline != INT64_MAX && now_ns >= deadline) { errno = ETIME; return -1; }
+		if (unsubmitted && !(flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE))) {
+			errno = EINVAL;
+			return -1;
+		}
+		int64_t now = mono_ns();
+		if (deadline != INT64_MAX && now >= deadline) {
+			errno = ETIME;
+			return -1;
+		}
+		if (have_target && !(all && unsubmitted)) {
+			/* With syncobjs still lacking a fence ("any" only here), one of them may get a fence or a CPU
+			 * signal meanwhile: wait in rounds of 1 ms then. */
+			int64_t until = unsubmitted ? now + 1000000 : deadline;
+			int e = fence_wait_until(target, until < deadline ? until : deadline);
+			if (e && e != ETIMEDOUT) {
+				errno = e == ENODEV ? ENODEV : EIO;
+				return -1;
+			}
+			continue;
+		}
 		struct timespec nap = {.tv_sec = 0, .tv_nsec = 1000000};
 		nanosleep(&nap, NULL);
 	}
@@ -1031,14 +1382,21 @@ int drmSyncobjWait(int fd, uint32_t *h, unsigned n, int64_t t, unsigned f, uint3
 int drmSyncobjTimelineWait(int fd, uint32_t *h, uint64_t *p, unsigned n, int64_t t, unsigned f, uint32_t *s)
 { (void)fd; return sync_wait(h, p, n, t, f, s); }
 
+/* Binary to binary (no timelines here): dst gets src's fence (or its signaled state). */
 int drmSyncobjTransfer(int fd, uint32_t d, uint64_t dp, uint32_t s, uint64_t sp, uint32_t flags)
 {
 	(void)fd; (void)dp; (void)sp;
 	if (flags) { errno = EINVAL; return -1; }
-	uint64_t point;
-	if (drmSyncobjQuery(fd, &s, &point, 1)) return -1;
-	if (!point) { errno = EINVAL; return -1; }
-	return drmSyncobjSignal(fd, &d, 1);
+	pthread_mutex_lock(&lock);
+	struct nsync *src = nsync(s), *dst = nsync(d);
+	if (src && dst) {
+		dst->seq = src->seq;
+		dst->signaled = src->signaled;
+		dst->point = src->point;
+	}
+	pthread_mutex_unlock(&lock);
+	if (!src || !dst) { errno = EINVAL; return -1; }
+	return 0;
 }
 
 /* Cross-process sync-file and opaque-fd sharing needs a real fd-backed service. */

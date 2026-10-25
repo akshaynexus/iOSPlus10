@@ -54,7 +54,7 @@ Nothing in this file ran on the phone.
 
 - Everything on the phone: Metal discovery through patch 0205, Turnip on the A730, the kernel user client, the
   self-test, CA pipelines with real function constants and vertex layouts, present.
-- The staged Turnip does not export `redwood_drm_note_surface` yet. Without it (and without a kernel user-page import)
+- (Fixed in round 3: Turnip exports `redwood_drm_note_surface`.) Before that, without it (and without a kernel user-page import)
   the self-test fails and the plugin returns nil. The GPU agent's uncommitted `negroni_drm.c` has the function.
 - The A730 profile is an estimate. CA's real pipeline variants are not tested.
 - The new texture answers (swizzle, compression, sparse, `gpuResourceID`) are plain values. Only a non-identity swizzle
@@ -70,3 +70,26 @@ Nothing in this file ran on the phone.
 4. Stage 4: add `backboardd` to `/var/db/negronimetal/clients`, restart backboardd, look at the panel. The kill switches:
    `touch /var/db/negronimetal/off` or boot-arg `negronimetal=0`.
 5. Host: capture a real Turnip profile on the phone (vkprobe / vulkaninfo) and rerun `host-translate.sh` with it.
+
+## Round 3: Turnip rebuild for the Metal path (GPU/Turnip agent, 2026-10-25)
+
+- [V] DRM layer review (`userland/negronigl/drm`, against docs/gpu-abi.md). Kept: syncobj emulation on fence numbers
+  (submit in/out, WAIT_FOR_SUBMIT, WAIT_AVAILABLE, transfer copies the fence), kernel waits for "all"/"any",
+  `NGL_ABI_ENV`, `redwood_drm_note_surface`, IOSurface host import by ID. Fixed: host import order (a noted IOSurface
+  goes by ID through 0x7e, so the present path sees it; other pages by 0x49 USERPTR as in the final gpu-abi.md of
+  07ae8ca, READ_ONLY retry, no more calls when the kernel has no 0232); the `NegroniGPUABI` text goes into the open
+  log line; Turnip imports host pointers only into HOST_CACHED, non-coherent types; `MSM_SUBMIT_SYNCOBJ_RESET` now resets only after
+  the kernel took the submission; scalar GET_FLAGS = `MSM_BO_CACHED` (section 6); comments that said write-combined
+  or "fence page" (sections 3 and 6).
+- [V] Turnip has its own tree and patch: `userland/turnip/mesa-patches/0001-turnip-darwin.patch` (the earlier agent's
+  unsaved edits + `-DHAVE_LIBDRM` for wsi + `-Wl,-fixup_chains`). `scripts/gpu/turnip-build.sh` builds it (exit 0)
+  and fails the build when a check fails: arm64, minos 16.0, LC_DYLD_CHAINED_FIXUPS, no dyld_stub_binder, no strong
+  load-time lookups, exports `redwood_drm_note_surface` + `vk(_icd)GetInstanceProcAddr`.
+- [V] It is the only script that stages Turnip: `out/gpu/turnip/libvulkan_freedreno.dylib` (TURNIP_DYLIB default).
+- [V] `scripts/metal/build.sh` exit 0; `check-imports.py` PASS (0 missing) for NegroniMetal, Turnip, vkprobe,
+  metalprobe, m2vtest.
+- Untested: everything on the phone. [I] 4222 weak flat-namespace lookups at Turnip load (time not measured).
+  USERPTR (0232) and the per-client tables (0233: VA window 0x1_0000_0000 + 16 GiB, submit EBUSY after a 60 s table
+  switch wait; [I] Turnip then reports device lost) are not exercised by any test. GPU writes into an imported
+  IOSurface need a CPU cache drop before the CPU reads them (Turnip marks the buffer cached-non-coherent:
+  vkInvalidateMappedMemoryRanges does it; whether the frontend calls it is not checked).

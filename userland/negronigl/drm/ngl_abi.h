@@ -41,7 +41,7 @@ enum ngl_abi {
 
 /* ---- NGL_ABI_SCALAR: selectors (IOConnectCallScalarMethod unless noted) ---- */
 enum {
-	/* in: size.  out: handle, GPU VA, user address of a write-combined mapping in the caller */
+	/* in: size.  out: handle, GPU VA, user address of a cached mapping in the caller (docs/gpu-abi.md section 6) */
 	NGL_SEL_BO_NEW          = 10,
 	/* in: handle */
 	NGL_SEL_BO_FREE         = 11,
@@ -51,7 +51,7 @@ enum {
 	NGL_SEL_SUBMIT          = 13,
 	/* in: seq, timeout ms (0: just ask; the kernel caps it at 60000).  kIOReturnTimeout: not yet */
 	NGL_SEL_WAIT            = 14,
-	/* out: chip id, GMEM size, GMEM base, max freq (Hz), user address of the read-only fence page */
+	/* out: chip id, GMEM size, GMEM base, max freq (Hz), 0 (no fence page: poll with NGL_SEL_WAIT) */
 	NGL_SEL_INFO            = 15,
 	/* in: handle.  the GPU is done with it: drop CPU cache lines over what the GPU wrote */
 	NGL_SEL_BO_CPU_PREP     = 16,
@@ -70,6 +70,13 @@ struct ngl_submit_ib {
 #define NGL_MSM_SEL_GEM_CLOSE   0x09u           /* DRM_IOCTL_GEM_CLOSE */
 #define NGL_MSM_SEL_SURFACE     0x7eu           /* not Linux's: struct redwood_drm_surface (xf86drm.h) */
 #define NGL_MSM_SURFACE_DESCRIBE 0xffffffffu    /* .handle = this: only describe, make no buffer */
+/* docs/gpu-abi.md section 4, kernel patch 0232: struct redwood_drm_userptr (xf86drm.h, 24 bytes), a GEM buffer over the
+ * caller's own pages (VK_EXT_external_memory_host, newBufferWithBytesNoCopy:). Linux's slot DRM_MSM_GEM_SVM_NEW, unused
+ * by Mesa. Only the task that opened the connection (else EPERM); at most 256 MiB per buffer, 1 GiB of host imports per
+ * client (ENOMEM); IOConnectMapMemory64 of such a handle is refused. A kernel without 0232 answers ENOSYS. */
+#define NGL_MSM_SEL_USERPTR     0x49u
+#define NGL_USERPTR_READ_ONLY   0x1u            /* the GPU only reads the pages (read-only memory can be imported) */
+#define NGL_USERPTR_MAX         (256ull << 20)
 
 /*
  * msm GET_PARAM answers that the scalar ABI does not ask the kernel for (A730 = Adreno 730,

@@ -100,6 +100,32 @@ struct redwood_drm_surface {
 };
 int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
 
+/* Not libdrm: NGL_MSM_SEL_USERPTR (ngl_abi.h, docs/gpu-abi.md section 4). The kernel wires [pointer, pointer + size)
+ * of the caller while the handle lives; the CPU keeps its own (cached) mapping. */
+struct redwood_drm_userptr {
+	uint64_t pointer;                       /* in: 16 KiB aligned user address */
+	uint64_t size;                          /* in: bytes, multiple of 16 KiB, at most 256 MiB */
+	uint32_t flags;                         /* in: NGL_USERPTR_READ_ONLY or 0 */
+	uint32_t handle;                        /* out: GEM handle */
+};
+#ifdef __cplusplus
+static_assert(sizeof(struct redwood_drm_userptr) == 24, "docs/gpu-abi.md: 24 bytes exactly");
+#else
+_Static_assert(sizeof(struct redwood_drm_userptr) == 24, "docs/gpu-abi.md: 24 bytes exactly");
+#endif
+
+/*
+ * Not libdrm: a GEM handle over the caller's pages at pointer (VK_EXT_external_memory_host). The IOSurface whose memory
+ * starts at pointer (noted before with redwood_drm_note_surface) is imported by ID (0x7e, scalar 12): only such imports
+ * take part in the kernel's present path (docs/gpu-abi.md section 8). Other pages: USERPTR (0x49, kernel 0232; msm ABI
+ * only), read-only pages with NGL_USERPTR_READ_ONLY. After GPU writes the CPU must drop its lines (CPU_PREP or dc civac).
+ * *bo_size = the buffer's size (whole 16 KiB pages). 0 or errno (ENOSYS: no way to import these pages here).
+ */
+int redwood_drm_host_import(int fd, void *pointer, uint64_t size, uint32_t *handle, uint64_t *bo_size);
+/* Not libdrm, exported by Turnip (NegroniMetal's frontend calls it through dlsym before each IOSurface import):
+ * IOSurface `surface` is mapped at base (its IOSurfaceGetBaseAddress) for size bytes. */
+void redwood_drm_note_surface(const void *base, uint64_t size, uint32_t surface);
+
 #ifdef __cplusplus
 }
 #endif

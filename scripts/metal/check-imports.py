@@ -46,6 +46,7 @@ IMAGES = {
     "IOSurface": ["/System/Library/Frameworks/IOSurface.framework/IOSurface"],
     "IOKit": ["/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit"],
     "Security": ["/System/Library/Frameworks/Security.framework/Security"],
+    "libz": ["/usr/lib/libz.1.dylib"],
 }
 SYM = re.compile(r"\s(_[^\s]+)\s*$")
 
