@@ -5,7 +5,7 @@ before you stop (facts, numbers, errors and their fixes, decisions). Keep one fa
 source. Mark each fact: **[V]** = seen (log, source, measurement), **[I]** = inference / guess.
 Details that need more space go into the topic docs; link them from here.
 
-Topic docs: [plan.md](plan.md) (phases) · **[gpu-status.md](gpu-status.md) (GPU work record)** · [device-facts.md](device-facts.md) (measured hardware) ·
+Topic docs: [plan.md](plan.md) (phases) · **[gpu-status.md](gpu-status.md) (GPU work record)** · [metal-management.md](metal-management.md) (enable/disable Metal, strikes, troubleshooting) · [device-facts.md](device-facts.md) (measured hardware) ·
 [boot-speed.md](boot-speed.md) · [gpu-plan.md](gpu-plan.md) · [external-repos.md](external-repos.md) ·
 [build-ios16.md](build-ios16.md) · [flash-ios16.md](flash-ios16.md) · [backup-and-restore.md](backup-and-restore.md) ·
 [research-report.md](research-report.md) · [uefi-binaries.md](uefi-binaries.md) · [camera-plan.md](camera-plan.md) · `patches/xnu/README-*.md` (per kernel change).

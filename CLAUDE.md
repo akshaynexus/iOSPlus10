@@ -59,6 +59,7 @@ decision we learned; add yours before you stop), `docs/plan.md` (status and next
   `tools/op10tool` (one binary, macOS + Linux); short glue stays shell or Python. A new Rust command
   must match the old tool's output (`tools/op10tool/tests/compare-python.sh`).
   Native tools: `scripts/setup/native-tools.sh`; run with them: `scripts/lib/native-env.sh <command>`.
+- Metal management (enable/disable, clearing strikes, logs): see `docs/metal-management.md`.
 - `docker/Dockerfile`: Ubuntu 24.04 x86_64 for the Mu build (stuart + x86_64 NuGet tools).
 - macOS (Apple silicon): `scripts/setup/colima-up.sh` (Colima + Rosetta), then `scripts/setup/docker-image.sh`.
 - Linux x86_64: Docker, then `scripts/setup/docker-image.sh`.
