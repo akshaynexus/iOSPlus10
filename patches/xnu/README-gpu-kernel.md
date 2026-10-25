@@ -424,6 +424,54 @@ a 3 ms copy). With 0254 the tick no longer waits for a render, so the copy (2.5-
 only long work left on the tick, and fixed deadlines keep the period. Do it only if `late ticks` stays
 high after 0254.
 
+### 0256 (clock shift after the GPU copy, status-bar rows only; 2026-10-26, display agent)
+
+Symptom (owner's photos, 2026-10-26): fragments of digits left of the lock screen's big clock ("12" twice,
+shifted), the date line garbled, top-left of the screen. Boot-arg `negronifb_clockshift=100` is in the
+config (slop 0112/0114 `negroni_shift_clock`: the left half of the top rows moved 100 px right, so the
+status bar's clock clears the camera hole).
+
+Cause [V code, out/kernel/local tree after 0254]:
+1. Since 0231/0254 every frame is a GPU 2D copy into the panel memory (STAT `gpu 40..61`, `cpu 0`, `zc 0`).
+   `present()` queued the copy, waited `NegroniGPUFenceWait(fence, 8 ms)` and then ran
+   `negroni_shift_clock()` on the panel memory *without looking at the wait's result*. When the copy was
+   not done in 8 ms (the ring is in order: Metal's own work from backboardd sits before it), the CPU
+   shifted the rows that were still there (the previous frame, already shifted) a second time, and the 2D
+   engine then wrote the new frame's rows unshifted over or between them: digits shifted by 100 and 200 px
+   next to each other, rows mixed. The panel memory is write-combine (`negroni_surface_create_physical`,
+   `kIOMapWriteCombineCache`), so this is not a CPU-cache effect.
+2. The strip was 150 panel rows. Panel 1080x2412, logical 1125x2436 at 3x, `fOffY` 12: panel row 150 =
+   logical row 162 = 54 pt. The status bar is 44 pt (logical row 132 = panel row 120). Rows 44..54 pt on
+   the lock screen hold the top of the date line [I: the date's exact y is not measured], so the shift cut
+   and moved it even when the race in (1) did not happen. The lock screen's status bar shows no clock, so
+   nothing in the 44 pt strip needs the shift there, and nothing is lost by the smaller strip.
+
+What 0256 does (`0256-negroni-fb-clock-shift-after-gpu.patch`, NegroniFramebuffer.cpp only):
+- `NEGRONI_FB_CLOCK_ROWS` 120 (boot-arg `negronifb_clockrows=N`, 1..300, default 120) replaces the
+  hard-coded 150 in `negroni_shift_clock`, both `topRedrawn` tests and the zero-copy save/restore
+  (`NEGRONI_ZC_CLOCK_ROWS` is gone; `negroni_clock_rows()`).
+- `present()`: the shift on a GPU-copied frame runs only when the copy's fence passed inside the 8 ms
+  wait. Otherwise the shift is kept (`fShiftFence`, `fShiftPending`) and `shiftTick()` (every vsync tick,
+  work loop, after `zeroCopyRetire`) does it once the fence is done. A newer frame that rewrites the top
+  (`topRedrawn`) replaces or clears the pending shift (its copy overwrites the strip anyway). CPU-copied
+  frames shift at once, as before.
+- `negroni_clock_shift_px()` parses `negronifb_clockshift` once, also before the first shift (the old
+  code's `negroni_clock_shift > 0` test was false until the first `negroni_shift_clock()` call).
+- Log (first 8): `NEGRONI FB: clock shift after fence N (deferred D, done late L)`: D = shifts put off
+  because the 8 ms wait timed out, L = shifts done by a later tick. No line at all = every copy passed
+  inside the wait (the race of cause 1 never happened in that run, the row cut of cause 2 still did).
+
+Measurement order: (a) `out/ios16-noshift` (kernel local-20261025-214340, `BOOTARGS_DROP="negronifb_clockshift="`):
+no shift at all; the fragments must be gone and the status bar's clock sits under the camera hole.
+(b) `out/ios16-0256` (kernel with 0256, config args): fragments gone, clock clear of the hole, date whole.
+If (b) still shows fragments with no `clock shift after fence` lines, the cause is not the shift race:
+look at the 2D copy itself (0231) or at the renderer.
+
+Build (2026-10-26 03:22): kernel `out/kernel/local-20261025-215209` (sha256 449a5d18..., 0256 applied, the 4
+usual dxb skips), image `out/ios16-0256` (boot_a sha256 57c6cc5a..., config cmdline). Control image `out/ios16-noshift`
+(boot_a a3d456cf..., kernel local-20261025-214340, no `negronifb_clockshift`). Not flashed: the phone was in a
+brownout reboot loop (empty battery) when they were built.
+
 ## 13. ios-spes deltas (kernel work the GL path needs; plan only, nothing built here)
 
 Reference: `external/ios-spes` (SM6225, A610, same 20H392 root). Its UI runs on GL at a frame median of

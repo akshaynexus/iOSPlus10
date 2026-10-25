@@ -414,7 +414,7 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   date line (below 44 pt) was inside the strip. Fix: shift only after the fence passed (else pending, done by a
   later tick, `shiftTick()`), strip 120 rows (`negronifb_clockrows=N`), parse the shift arg before the first
   frame. Panel memory is write-combine, so no cache effect is involved. Images: `out/ios16-noshift` (kernel
-  local-20261025-214340, no clockshift arg: the control), `out/ios16-0256` (0256, config args). [I] Visual result:
+  local-20261025-214340, no clockshift arg: the control), `out/ios16-0256` (0256, kernel local-20261025-215209, config args). Not flashed (phone battery empty). [I] Visual result:
   not seen by the agent; the owner checks. [I] The date's exact y on the lock screen is not measured.
 - No userland lever for the ear [V grep]: `scripts/ios16/root-tweaks-extra.py` and docs have no status-bar /
   notch / safe-area tweak; the only ways to move the status bar's clock are the kernel shift (`negronifb_clockshift`)

@@ -1,0 +1,254 @@
+From: iOSPlus10 display agent
+Subject: [PATCH] negroni fb: clock shift after the GPU copy, status-bar rows only (0256)
+
+negronifb_clockshift on GPU-copied frames (0231/0254): the shift ran on the panel memory
+before the 2D copy was done (fence wait result ignored), so it shifted the previous
+frame's rows a second time under the engine's write. Now: shift only once the copy's
+fence is done (deferred to a later tick, fShiftFence). The strip is the status bar only:
+120 panel rows (44 pt at 3x less fOffY 12), boot-arg negronifb_clockrows=N; it was 150
+(54 pt, into the lock screen's date line). Zero-copy (0234) uses the same rows.
+
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index d651970..dd0a321 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -101,6 +101,19 @@
+  * fence as done. The waits left on the tick are for the frame's own 2D copy (the render is
+  * done before it is queued), at most NEGRONI_FB_GPU_COPY_WAIT_MS.
+  *
++ * Clock shift after the GPU copy (patch 0256): negronifb_clockshift moves the status bar's
++ * left ear in the panel memory by hand (negroni_shift_clock). On a frame the GPU 2D engine
++ * copies, the CPU must shift only after that copy has reached the panel memory: a shift on
++ * rows the engine has not written yet shifts the previous frame's (already shifted) rows a
++ * second time, and the engine then writes the new rows unshifted around them (fragments of
++ * digits beside the clock, the top of the lock screen's date garbled). The tick waits for the
++ * copy's fence (at most NEGRONI_FB_GPU_COPY_WAIT_MS); when it is not done in time the shift
++ * is kept pending (fShiftFence) and done by the next tick that finds the fence done. The
++ * strip is the status bar only: NEGRONI_FB_CLOCK_ROWS panel rows (boot-arg
++ * negronifb_clockrows=N, 1..300), 120 = the 44 pt status bar at 3x (132 logical rows) less
++ * the 12 rows above the panel (fOffY); the old 150 reached 54 pt, into the lock screen's
++ * date line.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg negronifb_noconsole=1 stops drawing it from
+@@ -191,7 +204,7 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ #define NEGRONI_ZC_SLOTS                  3
+ #define NEGRONI_ZC_LATCH_TICKS            12      /* 100 ms without the engine taking a flush: zero-copy off */
+ #define NEGRONI_ZC_WAIT_MS                50      /* longest SwapWait before 0254 (now: no wait) */
+-#define NEGRONI_ZC_CLOCK_ROWS             150     /* the clock shift's rows (negroni_shift_clock) */
++#define NEGRONI_FB_CLOCK_ROWS             120     /* 0256: the clock shift's panel rows (negronifb_clockrows) */
+ #define NEGRONI_SSPPS                     8
+ #define NEGRONI_CTLS                      6
+ #define SSPP_SRC_SIZE                     0x00
+@@ -277,6 +290,10 @@ public:
+ 		uint32_t        fence;      /* the GPU copy that reads it */
+ 	}             fBusy[NEGRONI_FB_GPU_BUSY];
+ 	uint32_t      fLastGPUFence;  /* the newest GPU copy into the panel */
++	uint32_t      fShiftFence;    /* 0256: the GPU copy of the top rows whose clock shift is still to do */
++	bool          fShiftPending;
++	uint64_t      fShiftDeferred, fShiftLate;      /* 0256: shifts put off / done by a later tick */
++	uint32_t      fShiftLogged;
+ 	uint64_t      fGPUFrames, fCPUFrames;
+ 	/* zero-copy scanout (0234); the fZC* pointers, fZCNext* and the swap ids under fLock */
+ 	vm_offset_t   fMdss;
+@@ -335,6 +352,7 @@ public:
+ 	void zeroCopyRetire(bool tick);
+ 	void zeroCopyUnshow(NegroniSurface *s);
+ 	void zeroCopyShiftClock(NegroniSurface *s, uintptr_t k, bool gpu);
++	void shiftTick(void);
+ 	void zeroCopyRestore(void);
+ 	void zeroCopyStop(bool now);
+ 	void flip(NegroniSurface *s, uint32_t id);
+@@ -479,6 +497,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->statTick(now);
+ 	}
+ 	fb->zeroCopyRetire(true);       /* the engine took the last flip: the frame before goes back */
++	fb->shiftTick();                /* 0256: a clock shift left over from a slow GPU copy */
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -958,12 +977,26 @@ negroni_draw_text_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uin
+  * punch-hole camera; the rest of the picture is untouched. Done after each copy.
+  */
+ static int negroni_clock_shift = -1;
++static int negroni_clock_rows_arg = -1;
+ 
+-static void
+-negroni_shift_clock(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
++/* 0256: the strip the shift moves, in panel rows: the status bar only (negronifb_clockrows). */
++static uint32_t
++negroni_clock_rows(void)
+ {
+-	const uint32_t rows = 150;
++	if (negroni_clock_rows_arg < 0) {
++		negroni_clock_rows_arg = NEGRONI_FB_CLOCK_ROWS;
++		PE_parse_boot_argn("negronifb_clockrows", &negroni_clock_rows_arg, sizeof(negroni_clock_rows_arg));
++		if (negroni_clock_rows_arg < 1 || negroni_clock_rows_arg > 300) {
++			negroni_clock_rows_arg = NEGRONI_FB_CLOCK_ROWS;
++		}
++	}
++	return (uint32_t)negroni_clock_rows_arg;
++}
+ 
++/* The shift in panel pixels (0: off), parsed once (0256: also before the first shift). */
++static uint32_t
++negroni_clock_shift_px(void)
++{
+ 	if (negroni_clock_shift < 0) {
+ 		negroni_clock_shift = 0;
+ 		PE_parse_boot_argn("negronifb_clockshift", &negroni_clock_shift, sizeof(negroni_clock_shift));
+@@ -971,7 +1004,14 @@ negroni_shift_clock(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_
+ 			negroni_clock_shift = 0;
+ 		}
+ 	}
+-	uint32_t n = (uint32_t)negroni_clock_shift, half = width / 2;
++	return (uint32_t)negroni_clock_shift;
++}
++
++static void
++negroni_shift_clock(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
++{
++	const uint32_t rows = negroni_clock_rows();
++	uint32_t n = negroni_clock_shift_px(), half = width / 2;
+ 	if (n == 0 || n >= half || rows > height) {
+ 		return;
+ 	}
+@@ -1014,6 +1054,7 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 	bool topRedrawn = false;
+ 	uint32_t fence = 0;             /* the newest GPU copy of this frame */
+ 	bool gpuReady = NegroniGPUPresentReady(), cpuCopied = false;
++	const int32_t clockRows = (int32_t)negroni_clock_rows();
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -1099,7 +1140,7 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 		bool stale = written != 0 && !NegroniGPUFenceDone(written);
+ 		bool behind = s->gpuFence != written && !NegroniGPUFenceDone(s->gpuFence);
+ 		if (fits && bpe == 4 && written != 0 && !stale && !behind && gpuReady && held[layer] == s) {
+-			if (dy == 0 && dx == 0 && h >= 150 && w >= (int32_t)fWidth / 2) {
++			if (dy == 0 && dx == 0 && h >= clockRows && w >= (int32_t)fWidth / 2) {
+ 				topRedrawn = true;
+ 			}
+ 			uint32_t f = NegroniGPUPresent(s, fPhys, fRowBytes, fHeight, (uint32_t)sx, (uint32_t)sy,
+@@ -1122,7 +1163,7 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			cpuCopied = true;
+-			if (dy == 0 && dx == 0 && h >= 150 && w >= (int32_t)fWidth / 2) {
++			if (dy == 0 && dx == 0 && h >= clockRows && w >= (int32_t)fWidth / 2) {
+ 				topRedrawn = true;      /* this frame rewrote the status bar's left ear */
+ 			}
+ 			for (int32_t y = 0; y < h; y++) {
+@@ -1142,17 +1183,53 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 	if ((fGPUFrames + fCPUFrames) % 1000 == 999) {
+ 		IOLog("NEGRONI FB: %llu frames by the GPU, %llu by the CPU\n", fGPUFrames, fCPUFrames);
+ 	}
+-	if (fence != 0 && (negroni_clock_shift > 0 || negroni_badges > 0)) {
++	bool copied = true;             /* the GPU's copy of this frame is in the panel memory */
++	if (fence != 0 && (negroni_clock_shift_px() > 0 || negroni_badges > 0)) {
+ 		/* the CPU draws over the GPU's picture: after it */
+-		NegroniGPUFenceWait(fence, NEGRONI_FB_GPU_COPY_WAIT_MS);
+-	}
+-	if (topRedrawn) {
+-		negroni_shift_clock(fPixels, fRowBytes, fWidth, fHeight);
++		copied = NegroniGPUFenceWait(fence, NEGRONI_FB_GPU_COPY_WAIT_MS);
++	}
++	if (topRedrawn && negroni_clock_shift_px() > 0) {
++		if (fence != 0 && !copied) {
++			/* 0256: not yet in the panel memory: the shift waits for the fence (shiftTick); a
++			 * shift now would move the previous frame's rows again, under the engine's write */
++			fShiftFence = fence;
++			fShiftPending = true;
++			fShiftDeferred++;
++		} else {
++			fShiftPending = false;
++			negroni_shift_clock(fPixels, fRowBytes, fWidth, fHeight);
++		}
++	} else if (topRedrawn) {
++		fShiftPending = false;
+ 	}
+ 	negroni_draw_badge(fPixels, fRowBytes, fWidth, fHeight);
+ 	return fence;
+ }
+ 
++/*
++ * 0256: the clock shift of a frame whose GPU copy was not done when present() ran. Work loop,
++ * every vsync tick: as soon as the fence is done the strip is shifted, once. A newer frame that
++ * rewrote the top (present() with topRedrawn) replaces or clears it before this runs.
++ */
++void
++AppleCLCD::shiftTick(void)
++{
++	if (!fShiftPending) {
++		return;
++	}
++	if (!NegroniGPUFenceDone(fShiftFence)) {
++		return;
++	}
++	fShiftPending = false;
++	fShiftLate++;
++	negroni_shift_clock(fPixels, fRowBytes, fWidth, fHeight);
++	if (fShiftLogged < 8) {
++		fShiftLogged++;
++		IOLog("NEGRONI FB: clock shift after fence %u (deferred %llu, done late %llu)\n", fShiftFence,
++		    fShiftDeferred, fShiftLate);
++	}
++}
++
+ /* ---- zero-copy scanout (0234) ---- */
+ 
+ /*
+@@ -1326,11 +1403,11 @@ AppleCLCD::zeroCopyUnshow(NegroniSurface *s)
+ 		uint32_t half = fWidth / 2, bpr = s->bytesPerRow;
+ 		if (k != 0) {
+ 			uintptr_t top = k + (uint64_t)fOffY * bpr;
+-			for (uint32_t y = 0; y < NEGRONI_ZC_CLOCK_ROWS; y++) {
++			for (uint32_t y = 0; y < negroni_clock_rows(); y++) {
+ 				memcpy((uint32_t *)(top + (uint64_t)y * bpr) + fOffX, (uint32_t *)s->save + (uint64_t)y * half,
+ 				    (size_t)half * 4);
+ 			}
+-			negroni_surface_cache(top, (uint64_t)NEGRONI_ZC_CLOCK_ROWS * bpr, kNegroniCacheFlush);
++			negroni_surface_cache(top, (uint64_t)negroni_clock_rows() * bpr, kNegroniCacheFlush);
+ 		}
+ 		s->saved = false;
+ 	}
+@@ -1346,7 +1423,7 @@ AppleCLCD::zeroCopyUnshow(NegroniSurface *s)
+ void
+ AppleCLCD::zeroCopyShiftClock(NegroniSurface *s, uintptr_t k, bool gpu)
+ {
+-	uint32_t half = fWidth / 2, bpr = s->bytesPerRow, size = NEGRONI_ZC_CLOCK_ROWS * half * 4;
++	uint32_t half = fWidth / 2, bpr = s->bytesPerRow, rows = negroni_clock_rows(), size = rows * half * 4;
+ 
+ 	if (negroni_clock_shift < 0) {
+ 		negroni_clock_shift = 0;
+@@ -1356,7 +1433,7 @@ AppleCLCD::zeroCopyShiftClock(NegroniSurface *s, uintptr_t k, bool gpu)
+ 		}
+ 	}
+ 	uint32_t n = (uint32_t)negroni_clock_shift;
+-	if (n == 0 || n >= half || s->saved || (uint64_t)fOffY + NEGRONI_ZC_CLOCK_ROWS > s->height ||
++	if (n == 0 || n >= half || s->saved || (uint64_t)fOffY + rows > s->height ||
+ 	    (uint64_t)fOffX + half > s->width) {
+ 		return;
+ 	}
+@@ -1370,9 +1447,9 @@ AppleCLCD::zeroCopyShiftClock(NegroniSurface *s, uintptr_t k, bool gpu)
+ 	uintptr_t top = k + (uint64_t)fOffY * bpr;
+ 	if (gpu) {
+ 		/* the GPU's pixels from memory, not lines the CPU caches may still hold from before */
+-		negroni_surface_cache(top, (uint64_t)NEGRONI_ZC_CLOCK_ROWS * bpr, kNegroniCacheFlush);
++		negroni_surface_cache(top, (uint64_t)rows * bpr, kNegroniCacheFlush);
+ 	}
+-	for (uint32_t y = 0; y < NEGRONI_ZC_CLOCK_ROWS; y++) {
++	for (uint32_t y = 0; y < rows; y++) {
+ 		uint32_t *row = (uint32_t *)(top + (uint64_t)y * bpr) + fOffX;
+ 		uint32_t edge = row[0];
+ 		memcpy((uint32_t *)s->save + (uint64_t)y * half, row, (size_t)half * 4);
+@@ -1381,7 +1458,7 @@ AppleCLCD::zeroCopyShiftClock(NegroniSurface *s, uintptr_t k, bool gpu)
+ 			row[x] = edge;
+ 		}
+ 	}
+-	negroni_surface_cache(top, (uint64_t)NEGRONI_ZC_CLOCK_ROWS * bpr, kNegroniCacheClean);
++	negroni_surface_cache(top, (uint64_t)rows * bpr, kNegroniCacheClean);
+ 	s->saved = true;
+ }
+ 

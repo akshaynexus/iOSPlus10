@@ -68,6 +68,11 @@ Status date: 2026-10-25.
   Patch 0256: shift after the fence (deferred to a later tick when needed), 120 rows (44 pt status bar),
   `negronifb_clockrows=N`. Images `out/ios16-noshift` (control, no shift) and `out/ios16-0256`. Visual check: owner.
 
+- Power off (2026-10-26, patch 0214): "Shut down" and `op10tool ctl poweroff` rebooted because PSCI SYSTEM_OFF only
+  drops PS_HOLD and the PMK8350 PS_HOLD reset type was a reset [V, log timing]; 0214 sets the type SHUTDOWN
+  first (PON GEN3 registers +0x52/+0x53; 0211 used +0x5a/+0x5b) and prints the PMIC PON log at boot. Built; phone
+  test pending (battery empty, hold). Fastboot-menu power off is ABL: not covered (notes.md section 22).
+
 ## First boot (2026-10-24, 19:48)
 
 - Flash: userdata from fastbootd (45 x 256 MiB, 303 s), then vendor_boot_a, vbmeta_a, dtbo_a,
@@ -115,4 +120,3 @@ then the normal image (`make flash-boot`).
 1. Fix the RedwoodGPU user client panic in slop's A730 path.
 2. Port UniXNU NativeAdreno board code (GMU, RSC, votes, cmd-db, SMMU) to SM8450.
 3. Port NativeMetal (metal2vulkan via Turnip FD730) to the iOS 26 Metal interface.
-- 2026-10-26 power off (0214): cause found [V]: PSCI SYSTEM_OFF = PS_HOLD drop, PMIC PS_HOLD reset type was a reset; 0214 sets SHUTDOWN first (GEN3 +0x52/+0x53), prints the PON log at boot. Phone test pending (battery, hold).
