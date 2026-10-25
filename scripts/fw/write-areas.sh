@@ -1,4 +1,7 @@
 #!/bin/sh
+# WARNING (2026-10-25): the phone had a kernel panic seconds after this script's first SSH command, which reads
+# blocks of /dev/rufsroot0 with dd while the root on the same partition is mounted [I: cause not proven; the panic
+# log was not read]. Prefer AREAS=1 scripts/ios16/root-simg.sh (the areas go into the userdata flash).
 # Write the firmware areas (GPU, ADSP, WLAN) to the end of userdata from the running iOS over SSH.
 #   scripts/fw/write-areas.sh                 local checks + the plan only; writes nothing
 #   CONFIRM=yes scripts/fw/write-areas.sh     write (ASK THE OWNER FIRST: this writes userdata)

@@ -578,8 +578,21 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   mhi_ready_state_transition after the SBL download (op-kernel pm.c:243, boot.c:546). Also added <kern/clock.h> to the
   mhi/bhi .c files (delay() decl) and made wlan_rings do integer offset math (no -Wcast-align noise).
 - [I] UNTESTED ON HARDWARE: the survey steps 5-10 and all of stage 1 have never run on a phone, and the 32 MiB WLAN
-  area (scripts/wifi/mkwlanarea.py) is not written to userdata yet. Known deviation from Linux: stage 1 requests M0
-  after the AMSS download, not after SBL; M0 is only needed to start channels (after AMSS), so it should still work.
+  area (scripts/wifi/mkwlanarea.py) is not written to userdata yet.
+- [V] Opus review 2026-10-25 (docs/reviews/wifi-0261-2026-10-25.md), fixed in wt-wlan4, patch regenerated, full build
+  out/kernel/local-20261025-121738 (sha256 6d69c2b0...), 0261 applied, no 02xx skipped. Facts learned:
+  - ml_io_unmap() of an ml_io_map()/ml_io_map_wcomb() mapping PANICS: io_submap is a permanent kernel_map entry and
+    vm_map_delete panics on it (osfmk/arm/io_map.c:76-130, vm_map.c:8182-8189). Unmappable RAM views need
+    ml_io_map_unmappable(pa, size, VM_WIMG_WCOMB=0x6). negroni_adsp.c:742 still has this bug (negroniadsp=1 only).
+  - A PCI BAR must sit at a size-aligned address: a 2 MiB BAR0 goes to 0x60400000, not 0x60300000 (window start).
+  - MHI 64-bit doorbells: write the high word first, the low word triggers (op-kernel main.c:84-89).
+  - Linux MHI order: BHI SBL -> MHICTRL RESET clear + MHISTATUS READY -> mhi_init_mmio -> event-ring wp + doorbells
+    -> M0 -> wake doorbell 127 = 1 -> EE event SBL -> BHIe -> EE AMSS -> channels (pm.c:193-258, 767-781). The old
+    "M0 after AMSS" deviation is gone.
+  - Failure path: MHICTRL RESET + PCIe bus master off before the DMA pool is freed. SHA-256 mismatch stops.
+  - Default negroniwlan_to is now 10000 ms (cnss2 10 s).
+  - Open [I]: SMMU SID 0x1c01 may block chip DMA (symptom: BHI SBL error/time-out); MHI CTRL/DATA window is the
+    pool only (stage 2 must widen it).
 - Next (stage 2): QRTR TX/RX buffers on MHI 20/21, QMI WLFW (ind_register/host_cap/respond_mem/target_cap/BDF/m3_info/
   FW_READY), then HTC/WMI/HTT + HAL rings + scan, then en0 (Sailfish upper half). Details: docs/wifi-plan.md.
 
@@ -658,3 +671,14 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   `fastboot flash userdata` then writes root + areas, the log area stays DONT_CARE. Unproven: whether fastbootd wipes
   the partition per resparsed piece (-S 256M), and whether the ABL/fastbootd accepts a sparse total of exactly N blocks.
   Test once with a read-back from iOS before relying on it. Ties the root image to this phone's N.
+- [V] 2026-10-25 17:45: kernel panic seconds after `scripts/fw/write-areas.sh` opened its first SSH session (its first
+  command reads blocks 0 and N of /dev/rufsroot0 with dd while / is mounted from the same ufsroot0). Nothing was
+  written. [I] The raw read is the likely trigger; the panic log (log area N-1025) was not read, because reading it
+  from iOS needs the same raw read. After the panic the phone came up in the bootloader (fastboot), `fastboot reboot`
+  booted iOS again.
+- Preferred route since then: the areas go into the userdata flash. `AREAS=1 scripts/ios16/root-simg.sh IMG` clones IMG,
+  extends it to N = 58672399 blocks (sparse), dd's the 3 areas at N-3073 / N-11265 / N-19457, reads them back and
+  makes one sparse image of N blocks (holes = DONT_CARE). Fake-root test [V]: total_blocks 58672399, area hashes OK.
+  [I] Not yet proven on the phone: that fastbootd writes the DONT_CARE-heavy image of the full partition size.
+- `sudo scripts/ios16/root-update.sh IN.img OUT.img metal powermenu ...`: APFS clone of an existing root + only the named
+  hooks (no DMG rebuild), stops if /var is not a symlink before or after the hooks.
