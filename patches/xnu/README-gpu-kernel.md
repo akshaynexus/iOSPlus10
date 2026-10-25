@@ -535,6 +535,23 @@ Reference: `external/ios-spes` (SM6225, A610, same 20H392 root). Its UI runs on 
    `NEGRONI ADRENO: 22 blit 2.5 Mpx in N us (AO ticks M), CP cycles C (F MHz); raw AO ..`.
    (2.592 Mpx; the integer print says 2.5.) Expect ~1.5 ms at 220 MHz, ~0.4 ms at 818 MHz, ~17 ms at 19.2 MHz.
 
+5. Late copy from the watch (once, at the first watch second >= 5; the USB console attaches only at step 21,
+   so the step-17/18 lines above are not on USB). Behind `negronigpu_clkdump`: the clock dump again
+   (`22 clock dump from the watch (late copy): ...`, `gpucc[..]`, `GMU log head`), `late 17 cmd-db <name> ...`
+   (cached), `late 17 vote {0, 1, L, B} (negronigpu_level N, M MHz): <ack>; 18 revote (on|off): <ack>`,
+   `late HFI queue 0..2: status .. size .. read .. write .. dropped ..`, `late HFI debug queue[0..] = <8 dwords>`
+   (up to 32 dwords below its write index), `late HFI F2H messages read: N`, and `late F2H i: id I hdr ..` (the
+   last 16 F2H messages hfi_send read; id 100 = F2H_MSG_ERROR). Behind `negronigpu_revote`: `late
+   GX_BW_PERF_VOTE a third time (CP running): ...`, `late third vote acked, error 0`, then after 100 ms
+   `22 gxclk N MHz 100 ms after the third vote (...)` and `22 clock dump after the third vote: ...`.
+
+### Phone result, first boot of 0236 (2026-10-25, `out/ios16-clk`, level 12 + revote)
+- [V] `20 gxclk 5 MHz with the CP running (CP cycles +57413 in AO ticks +211648)`; `22 blit 2.5 Mpx in 31943 us
+  ... (5 MHz)`; the watch says `gxclk 5 MHz` every 10 s. The GX core clock is near 5 MHz; the vote does not get
+  to it. The step-17/18 lines were lost (USB log starts at step 21): item 5 repeats them.
+- [I] 5 MHz is below XO (19.2 MHz): the GX clock is a divided source, or PERF_CP_ALWAYS_COUNT counts a
+  slower clock than the core clock. The blit time (32 ms) agrees with a slow clock, not with a counter error.
+
 ### How to read them
 - PLL L value x 19.2 MHz (+ alpha/65536 x 19.2) = the PLL output [I Lucid EVO layout: +0 MODE (bit 31 lock
   det, bit 0 output enable), +4 L, +8 ALPHA]. PLL0 L 0 or mode bit 0 clear = the GX PLL does not run.
@@ -559,3 +576,11 @@ place to find them. Conflict: on GMU parts (A6xx non-legacy, A7xx) the GMU firmw
 (GDSC through OOB GPU_SET, DCVS through HFI). A CPU write races the GMU: the GMU can reprogram or gate GX on
 IFPC/slumber, and a frequency the GMU does not know breaks its ACD and its RPMh votes. So the CPU path is
 only a test (fixed level, IFPC off), not a driver.
+
+### 0237: PERF_TABLE frequencies in kHz
+
+The GMU takes the GX and CX frequencies of the HFI PERF_TABLE in kHz (Linux `a6xx_hfi_send_perf_table`:
+`gpu_freqs[i] / 1000` from Hz). Before 0237 the table held MHz (`gpu_khz[i] / 1000`), so every vote asked for
+a sub-MHz clock: the 0236 probe measured `gxclk 5 MHz`, PLL0 L 13 at levels 1 and 12, a 2.5 Mpx blit in 32 ms.
+Proof after 0237 (`make usblog`): `20 gxclk N MHz with the CP running` near the voted level, `22 blit 2.5 Mpx in`
+about 1500 us at 220 MHz / 400 us at 818 MHz, and the clock dump's PLL0 L field (= MHz / 19.2).

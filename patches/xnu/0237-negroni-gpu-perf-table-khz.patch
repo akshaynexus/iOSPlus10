@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -1555,11 +1555,13 @@
+ 	for (uint32_t i = 0; i < ng; i++) {
+ 		perf[3 + 3 * i] = arc_vote(gfx, gfx_n, mx, mx_n, gpu_level[i]);
+ 		perf[3 + 3 * i + 1] = 0xffffffff;
+-		perf[3 + 3 * i + 2] = gpu_khz[i] / 1000;
++		/* 0237: the GMU wants kHz (Linux a6xx_hfi_send_perf_table: gpu_freqs[i] Hz / 1000); MHz here asked
++		 * for an 818 kHz GPU and the GX PLL stayed at its floor (phone: gxclk 5 MHz, PLL0 L 13 at every vote) */
++		perf[3 + 3 * i + 2] = gpu_khz[i];
+ 	}
+ 	for (uint32_t i = 0; i < nc; i++) {
+ 		perf[3 + 48 + 2 * i] = arc_vote(cx, cx_n, mx, mx_n, gmu_level[i]);
+-		perf[3 + 48 + 2 * i + 1] = gmu_khz[i] / 1000;
++		perf[3 + 48 + 2 * i + 1] = gmu_khz[i];       /* 0237: kHz */
+ 	}
+ 	printf("NEGRONI ADRENO: 17 GX vote top %#x, CX vote 200 MHz %#x\n", perf[3 + 3 * (ng - 1)], perf[3 + 48 + 2]);
+ 	if (!hfi_send("PERF_TABLE", HFI_MSG_PERF_TABLE, perf, sizeof(perf))) {

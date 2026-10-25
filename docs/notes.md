@@ -434,7 +434,7 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   - [V] The 2 fragments left are `inplace_copy_lpf/lph`: RasterOrderGroups needs `fragmentShaderPixelInterlock`; Mesa 25.0.7 Turnip has no `VK_EXT_fragment_shader_interlock` (tu_device.cc). [I] CA uses them only when the device reports raster order groups.
   - [I] The A730 profile is vk12-floor limits + features/extensions read from Mesa 25.0.7 tu_device.cc for FD730, not a capture. The 4 tile kernels pass only as tile pipelines (CA needs tile-shader support to use them). Function constants are stand-ins (zero/false), not CA's values.
   - [V] `scripts/metal/selector-gap.py`: QuartzCore names 222 Metal protocol selectors; the flame frontend lacked 20 (MTLTexture swizzle/compression/sparse/parent-relative/gpuResourceID, pipeline/sampler gpuResourceID, makeAliasable, queue SPI finish). Patch `userland/metal/patches/flame/0001-*` adds them: 0 missing. [I] A string match is not proof of a call.
-  - [V] The 20H392 root is attached read-only at `/private/tmp/iosroot-ro` (another agent's mount of `~/op10-apple/ios16-root-new.img`). Copy of QuartzCore's metallib: `out/metal/ref/QuartzCore.default.metallib`.
+  - [V] The 20H392 root is attached read-only at `/private/tmp/iosroot-ro` (mounted from `~/op10-apple/ios16-root.img`; `ios16-root-new.img` was deleted 2026-10-25, 16 GiB). Copy of QuartzCore's metallib: `out/metal/ref/QuartzCore.default.metallib`.
   - [V] Turnip's DRM layer exports `redwood_drm_note_surface(base, size, surface ID)` (negroni_drm.c, GPU agent, uncommitted). The frontend patch calls it before each IOSurface import, so a host-pointer import goes through kernel 0x7e by surface ID. The staged Turnip (00:22 build) does not export it yet: the plugin logs this, and on the phone the self-test then refuses the device [I].
   - [V] The staged Turnip dylib uses LC_DYLD_INFO_ONLY and imports `dyld_stub_binder`. In the 20H392 cache that symbol is `local` in libdyld (`ipsw dyld symaddr`). [I] dyld4 may still bind it; a Turnip link with chained fixups removes the doubt.
   - [V] Plugin host test on the Mac (`scripts/metal/host-plugin-test.sh`, MoltenVK as the loader): the cases unlisted, off, no GPU, 1 ms timeout (twice, strikes = 2), dead-man and device pass. The device case ran the IOSurface clear self-test through the frontend (681 ms).
@@ -843,6 +843,22 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   `negronigpu_revote=0|1` (default 1 when `negronigpu_level>0`: the same vote again after the GPU_SET ack).
   Offsets from mesa a6xx.xml (RBBM_PERFCTR_CP[0] 0x300 on A7XX, 0x400 on A6XX). [I] CP clock = GX core
   clock; [I] AO counters at 19.2 MHz. Not booted yet.
+- GPU clock probe, phone result (2026-10-25, `out/ios16-clk`, level 12 + revote): [V] `20 gxclk 5 MHz with the CP
+  running (CP cycles +57413 in AO ticks +211648)`, `22 blit 2.5 Mpx in 31943 us (5 MHz)`, watch `gxclk 5 MHz`.
+  The GX clock sits near 5 MHz whatever the vote. [V] USB log attaches at step 21: step-17/18 lines are lost.
+  0236 amended: the watch at 5 s prints a late copy (clock dump, cmd-db levels, vote/revote acks, HFI queues,
+  last 16 F2H messages) and, with `negronigpu_revote`, votes a third time and measures gxclk 100 ms later
+  (README-gpu-kernel.md section 14 item 5). Image `out/ios16-clk2`.
+
+- GPU clock root cause (2026-10-25, patch 0237): [V phone, 0236 probe] with the HFI vote at level 1 or 12 the
+  GX PLL0 (gpucc+0x0, Lucid OLE layout: OPMODE +0x04, L +0x10, ALPHA +0x14, CONFIG_CTL +0x20 = 0x20485699 as in
+  gpucc-sm8450.c) stays at L 13 (0x0044000d, 250 MHz; CAL_L 0x44), the CP cycle counter gives `gxclk 5 MHz`, the
+  2.5 Mpx 2D blit takes 32 ms, every vote is acked (error 0), the HFI queues have no drops and no F2H_MSG_ERROR,
+  cmd-db gfx.lvl = 0 56 64 80 128 144 192 224 256 320 384 416. [V code] negroni_adreno.c filled the PERF_TABLE
+  frequencies as `gpu_khz[i] / 1000` and `gmu_khz[i] / 1000` = MHz; the GMU firmware takes kHz (Linux
+  a6xx_hfi_send_perf_table: `gpu_freqs[i] / 1000` from Hz). So the GMU was asked for an 818 kHz GPU and a 500 kHz
+  GMU clock. 0237 sends kHz. Expected after 0237: PLL0 L near 42 at level 12 (818 MHz) and `gxclk` 220 MHz at the
+  default vote; the UI frame cost (60 ms per command buffer, ~10 ms per draw at 5 MHz) drops by the clock ratio [I].
 
 ## 18. Firmware areas at the end of userdata (2026-10-25; scripts/fw/)
 
