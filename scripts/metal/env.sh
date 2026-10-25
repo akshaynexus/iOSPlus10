@@ -28,6 +28,11 @@ PLUGIN_CLASS=${PLUGIN_CLASS:-NegroniMTLDevice}   # NSPrincipalClass + kernel Met
 
 case "$(uname -s)" in
 Darwin)
+  if [ -z "${DEVELOPER_DIR:-}" ] && [ -d "/Applications/Xcode_15.4.app/Contents/Developer" ]; then
+    export DEVELOPER_DIR="/Applications/Xcode_15.4.app/Contents/Developer"
+  fi
+  export CC="$(xcrun -f clang)"
+  export CXX="$(xcrun -f clang++)"
   SDK=${SDK:-$(xcrun --sdk iphoneos --show-sdk-path)}
   ;;
 *)

@@ -661,7 +661,7 @@ static void watchdog_start(void)
 		CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
 		load_env();
-		const long timeout_ms = env_num("NEGRONIMETAL_OPEN_MS", 6000);
+		const long timeout_ms = env_num("NEGRONIMETAL_OPEN_MS", 20000);
 		const bool test = env_num("NEGRONIMETAL_SELFTEST", 1) != 0;
 
 		uint64_t registryID = 0;

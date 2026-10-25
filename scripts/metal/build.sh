@@ -71,6 +71,7 @@ if [ -f "$BUILD/NegroniMetal" ]; then
   cp "$BUILD/NegroniMetal" "$B/$PLUGIN_NAME"
   dsymutil "$B/$PLUGIN_NAME" -o "$MOUT/$PLUGIN_NAME.dSYM" 2>/dev/null || true
   "$STRIP" -x "$B/$PLUGIN_NAME"
+  sign "$B/$PLUGIN_NAME"
   sed -e "s/@NAME@/$PLUGIN_NAME/g" -e "s/@CLASS@/$PLUGIN_CLASS/g" "$METAL/plugin/Info.plist.in" > "$B/Info.plist"
   # Control file in the bundle, readable by every process that loads the plugin (sandboxed apps too; NegroniMetal.mm).
   # Every push replaces it. The owner's own lists: /var/db/negronimetal/clients, and BUNDLE/clients.local (not staged).

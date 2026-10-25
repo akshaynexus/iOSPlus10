@@ -1,0 +1,102 @@
+NegroniMetal addition to NativeBridgeMetalFrontend.mm:
+- Implement MTLFunction protocol conformance on NBFunction to resolve 'fragmentFunction/vertexFunction is not a MTLFunction' in backboardd/SpringBoard.
+- Implement NBLibrary -newFunctionWithName:constantValues:pipelineLibrary:error: for specialized pipeline libraries.
+- Synchronize command buffer execution before host buffer release (defer scheduled in backboardd, wait completed on scheduled wait) to prevent SIGSEGV during page unmap.
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -345,7 +345,7 @@
+ @interface NBLibrary : NBObject
+ @property(nonatomic) NmbLibrary *handle;
+ @end
+-@interface NBFunction : NBObject
++@interface NBFunction : NBObject <MTLFunction>
+ @property(nonatomic) NmbFunction *handle;
+ @property(nonatomic,copy) NSString *name;
+ @property(nonatomic) MTLFunctionType functionType;
+@@ -353,7 +353,19 @@
+ @end
+ @implementation NBFunction
+ - (void)dealloc {nmb_function_release(_handle);}
++- (id<MTLDevice>)device {return gDeviceObject;}
+ - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
++- (NSDictionary<NSString *, MTLFunctionConstant *> *)functionConstantsDictionary {return @{};}
++- (NSArray<MTLVertexAttribute *> *)vertexAttributes {return @[];}
++- (NSArray<MTLAttribute *> *)stageInputAttributes {return @[];}
++- (MTLPatchType)patchType {return MTLPatchTypeNone;}
++- (NSInteger)patchControlPointCount {return -1;}
++- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex {(void)bufferIndex;return nil;}
++- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex reflection:(MTLAutoreleasedArgument *)reflection {(void)bufferIndex;(void)reflection;return nil;}
++- (BOOL)conformsToProtocol:(Protocol *)aProtocol {
++ if(protocol_isEqual(aProtocol, @protocol(MTLFunction)))return YES;
++ return [super conformsToProtocol:aProtocol];
++}
+ @end
+ // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
+ @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
+@@ -442,6 +454,10 @@
+  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
+  handler(function,error);
+ }
++- (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values pipelineLibrary:(id)pipelineLibrary error:(NSError **)error {
++ (void)pipelineLibrary;
++ return [self newFunctionWithName:name constantValues:values error:error];
++}
+ - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
+ // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
+ // runtime does when the function is made.
+@@ -1099,7 +1115,17 @@
+   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
+   void *context=(__bridge_retained void *)self;
+   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
+-     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle))return;
++     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
++   static int syncCommit = -1;
++   if(syncCommit < 0) {
++    const char *env = getenv("NEGRONIMETAL_SYNC");
++    syncCommit = (env && env[0] != '0') || access("/private/var/db/negronimetal/sync", F_OK) == 0;
++   }
++   if(syncCommit == 1) {
++    [self waitUntilCompleted];
++   }
++   return;
++  }
+   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
+   [self refuse:[@"commit: " stringByAppendingString:lastError()]];
+  }
+@@ -1115,6 +1141,11 @@
+ }
+ - (void)waitUntilScheduled {
+  if(!self.committed)return;
++ static bool isBackboardd = (strcmp(getprogname(), "backboardd") == 0);
++ if(isBackboardd || getenv("NEGRONIMETAL_SYNC")) {
++  [self waitUntilCompleted];
++  return;
++ }
+  const uint64_t began=nowUs();
+  if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
+   NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
+@@ -1123,7 +1154,13 @@
+  gTimeWaitScheduled.add(began);
+ }
+ @end
+-static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
++static void scheduled(void *context) {
++ static bool isBackboardd = (strcmp(getprogname(), "backboardd") == 0);
++ if(isBackboardd || getenv("NEGRONIMETAL_DEFER_SCHEDULED")) {
++  return;
++ }
++ [(__bridge NBCommandBuffer *)context didSchedule];
++}
+ // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
+ static void completed(void *context) {
+  gCompleted++;
+@@ -1136,6 +1173,9 @@
+   CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
+   if(r.index==commandBuffer.commitIndex)r.callbackUs=took;
+  }
++ if(!commandBuffer.schedulingDelivered) {
++  [commandBuffer didSchedule];
++ }
+  [commandBuffer finish];
+ }

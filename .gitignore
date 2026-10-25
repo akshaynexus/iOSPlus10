@@ -22,3 +22,6 @@ __pycache__/
 userland/rebootapp/PowerMenu
 userland/rebootapp/*.app/
 userland/rebootapp/_CodeSignature/
+external/Chlorophyll/
+external/ios-s9/
+skills/
