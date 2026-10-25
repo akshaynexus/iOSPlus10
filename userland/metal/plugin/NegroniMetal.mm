@@ -40,6 +40,7 @@
 #import <objc/runtime.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#include <mach-o/loader.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -372,6 +373,40 @@ static void load_env(void)
 		}
 	}
 	fclose(ef);
+}
+
+/* __TEXT vmsize of the Mach-O image loaded at `base` (0 if none) */
+static uint64_t text_size(const void *base)
+{
+	const struct mach_header_64 *mh = (const struct mach_header_64 *)base;
+	if (!mh || mh->magic != MH_MAGIC_64)
+		return 0;
+	const uint8_t *lc = (const uint8_t *)(mh + 1);
+	for (uint32_t i = 0; i < mh->ncmds; i++, lc += ((const struct load_command *)lc)->cmdsize) {
+		const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+		if (seg->cmd == LC_SEGMENT_64 && !strcmp(seg->segname, "__TEXT"))
+			return seg->vmsize;
+	}
+	return 0;
+}
+
+/*
+ * Load addresses of this bundle and of Turnip, one line, for crash symbolication (a backboardd crash with its pc in
+ * Turnip and callers in m2v could not be symbolicated without them): atos -o <image or dSYM> -l BASE ADDR.
+ * nlog writes it to /dev/console and NMTL_DIR/metal.log (when that file exists).
+ */
+static void log_images(const void *self_base, const char *turnip)
+{
+	const void *tu_base = NULL;
+	void *h = dlopen(turnip, RTLD_NOW | RTLD_NOLOAD);
+	void *sym = h ? dlsym(h, "vk_icdGetInstanceProcAddr") : NULL;
+	Dl_info tu = { 0 };
+	if (sym && dladdr(sym, &tu))
+		tu_base = tu.dli_fbase;
+	const char *policy = getenv("NEGRONIMETAL_POLICY");
+	nlog("images NegroniMetal %p text 0x%llx turnip %p text 0x%llx (m2v policy %s)", self_base,
+	     (unsigned long long)text_size(self_base), tu_base, (unsigned long long)text_size(tu_base),
+	     policy && *policy ? policy : "compositor (default)");
 }
 
 /* ---- fast checks before Turnip opens: each one is a clean "no device" ---- */
@@ -756,6 +791,7 @@ static void watchdog_start(void)
 		Dl_info self_info = { 0 };
 		dladdr((void *)sm2_logs, &self_info);
 		nlog("image base %p (atos -o NegroniMetal.dSYM -l BASE ADDR)", self_info.dli_fbase);
+		log_images(self_info.dli_fbase, turnip.UTF8String);
 		if (device) {
 			/*
 			 * QuartzCore uploads asset-catalog images straight from CGImageTextureData, in Apple's GPU tiled layout of the

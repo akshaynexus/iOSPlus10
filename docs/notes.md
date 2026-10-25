@@ -399,6 +399,11 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   give-up only after 500 ms AND a RedwoodGPU client close, or after 2 s without any fence progress
   (`gave up on fence N of surface M`, `gave-up` count); SwapWait answers 0 only when that id (or a later one)
   is on screen, else kIOReturnBusy at once, in all modes. No present thread (README has what it would need).
+  [V phone, first 0254 image, Metal backboardd 2 min] the tick works (gpu-wait skips 85/s, late ticks from the
+  copies only), but every CPU copy took 51-54 ms: present() waited on `s->gpuFence`, which Turnip moves to the
+  newest in-flight submission (every BO is listed in every submit). Amended 0254: present() uses the swap-time
+  fence per layer (`fPendFences`), no wait; a layer whose gpuFence moved on goes the CPU way instead of a 2D copy
+  behind newer work (one in-order ring). Kernel local-20261025-175017, image out/ios16-0254b [I until booted].
 
 ## 16. Metal (2026-10-25, Metal agent)
 
@@ -475,6 +480,39 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   - [I] `used` > 0 means a no-copy buffer was freed under GPU work through a path that still does not retain it; the GPU still
     reads the wired pages, but the frontend's retention has a gap there. CPU_PREP drops lines over the whole buffer, not the
     range.
+
+- Compositor policy and crash symbolication (2026-10-25, policy agent; built, not tested on the phone):
+  - [V] m2v 720ef1ce emulates two per-pixel Metal answers by default: Metal's colour-write rounding on 8-bit unorm and
+    sRGB attachments that store the output as written (`pipeline/color_writes.rs` `color_writes`/`exact_writes`; off only
+    with `VkProperty::MetalColorWrites`, which `driver_facts.rs` `DEVIATIONS` gives to MoltenVK 1.4.1 on the M3 Max and M4
+    alone), and Metal's exact 8-bit linear filter (`DevicePolicy::UNTRUSTED` `unorm8_linear_filter: Exact`; the device
+    filter needs `DeviceWithinOneCode` AND a `DriverDeviation::Unorm8LinearFilter` row: NVIDIA, RADV, ANV, lavapipe, no
+    Turnip). Both bridges used `DeviceOptions::default()`; m2v has no env var for either. [I, audit] ~35 instructions per
+    unorm channel, ~70 + a 4 KiB table read per sRGB channel.
+  - [V] A `MetalColorWrites` row is format-agnostic (it drops the rounding on every unorm/snorm/10:10:10:2 format) and no
+    policy switches it off, so `m2v/0003-negroni-compositor-policy.patch` adds `DevicePolicy::color_writes`
+    (`ColorWritesPolicy::{Exact (default), DeviceUnorm8, DeviceUnorm8Srgb}`, in `ProfileFields`, so in the fingerprint:
+    a policy change gives new shader-cache keys). `DeviceUnorm8` maps each `Unorm{bits:8}` channel to
+    `ChannelWrite::Device` (R8/RG8/RGBA8/BGRA8/ARGB8 Unorm, and the alpha of the 8-bit sRGB formats); `DeviceUnorm8Srgb`
+    also the sRGB channels. Half-float and the other formats keep their rules. The patch also adds a Turnip row
+    (`DriverId::MESA_TURNIP`, vendorID 0x5143, any GPU, Mesa 25.0.7) of `Unorm8LinearFilter`: "NegroniMetal: unmeasured
+    on A730, accepted for a UI compositor [I]". A newer Turnip release counts as "Beyond" (taken, announced once).
+  - [I] Turnip reports `driverVersion` = VK_MAKE_VERSION(25,0,7) (Mesa's vk_get_driver_version); not read on the phone.
+    If it reports something else, the filter row does not match and the filter stays exact (safe).
+  - `flame/0007-negroni-device-policy.patch`: both bridges take `objects::negroni_policy()`, from env
+    `NEGRONIMETAL_POLICY`: `exact` (m2v defaults), `compositor` (default, also unset/unknown: device 8-bit unorm filter +
+    device 8-bit unorm colour writes, containment ON), `compositor-srgb`, `unsafe` (compositor + `containment: UnsafeOff`
+    + `isolation: Off`, set together as derive.rs:108 needs). Set it in /var/db/negronimetal/env (docs/metal-management.md).
+  - Plugin: after "image base ...", one line `NMTL[pid name]: images NegroniMetal 0x... text 0x... turnip 0x... text 0x...
+    (m2v policy NAME)` (dladdr on Turnip's `vk_icdGetInstanceProcAddr`, __TEXT vmsize from the Mach-O header). It goes
+    through nlog, so to /dev/console and /var/db/negronimetal/metal.log when that file exists [V: sm2_logs]. Symbolicate:
+    `atos -o out/gpu/turnip/libvulkan_freedreno.dylib -l TURNIP_BASE PC` (the unstripped Turnip; the bundle copy is
+    stripped). Reason: a backboardd crash (pc in Turnip, callers in m2v, far 0x0) had no Turnip base.
+  - [V] Build: fetch (m2v/0003, flame/0007 apply), bridge 1m27s, `scripts/metal/build.sh` check-imports PASS (0 missing).
+    Staged NegroniMetal 21,925,072 bytes sha256 2d8fc104...0807 (__TEXT 0x132c000); stripped Turnip 10,975,456 bytes
+    sha256 7cb29818...05ea. m2v unit tests not run (a driver_facts test that lists the Unorm8LinearFilter rows may need
+    the Turnip row).
+  - Next: A/B on the phone, GPU ms per CA frame with `NEGRONIMETAL_POLICY=exact` vs default, then `compositor-srgb`.
 
 ## CoreImage/PosterBoard crash (analysis 2026-10-25; addresses = unslid 20H392 cache, slide 0x1f750000 in logs/usblog-20261024-235438.txt)
 
@@ -795,6 +833,16 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   refuse a high level without a matching ACD/CX setup; look for `17 HFI GX_BW_PERF_VOTE ack, error 0`.
 - Test order (no config change; boot image variants with BOOTARGS_ADD, README-gpu-kernel.md section 12):
   (a) `negronifb_zerocopy=1`, (b) `negronifb_zerocopy=1 negronigpu_level=12`.
+- GPU clock probe (2026-10-25, patch 0236; README-gpu-kernel.md section 14): [V phone] a CoreAnimation frame
+  costs the GPU ~60 ms at level 1 and at level 12 (ack error 0), ~45-100 Mpx/s per command buffer = XO-like.
+  [V code] the watch `CX`/`GX` words are GDSC power bits (gpucc+0x9108/0x905c), not clocks; the vote goes out at
+  step 17 before OOB GPU_SET (step 18) and never again; no code touches the GFX3D RCG or the GPU PLLs; cmd-db
+  arrays were 16 u16. New boot-args: `negronigpu_clkdump=0` (default 1: gpucc PLL0/PLL1/0x9000 dumps, all cmd-db
+  levels, GMU log head), `negronigpu_gxclk=0` (default 1: CP perf counter 0 = PERF_CP_ALWAYS_COUNT,
+  `gxclk N MHz` in steps 18/20 and the watch line), `negronigpu_timetest=0` (default 1: `22 blit ... us`),
+  `negronigpu_revote=0|1` (default 1 when `negronigpu_level>0`: the same vote again after the GPU_SET ack).
+  Offsets from mesa a6xx.xml (RBBM_PERFCTR_CP[0] 0x300 on A7XX, 0x400 on A6XX). [I] CP clock = GX core
+  clock; [I] AO counters at 19.2 MHz. Not booted yet.
 
 ## 18. Firmware areas at the end of userdata (2026-10-25; scripts/fw/)
 

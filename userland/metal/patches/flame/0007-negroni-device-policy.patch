@@ -1,0 +1,66 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (on top of flame/0001-0006), applied by scripts/metal/fetch-sources.sh:
+the m2v device policy from env NEGRONIMETAL_POLICY in both bridges (nmb_device_open and the self-test open), through
+objects::negroni_policy(). Values: exact (m2v defaults), compositor (default: device 8-bit unorm linear filter and
+8-bit unorm color writes, containment on), compositor-srgb (compositor + device sRGB encode), unsafe (compositor +
+containment UnsafeOff + isolation Off). Needs m2v/0003 (ColorWritesPolicy, the Turnip filter row).
+
+Only in out/metal/src/flame/phone/metal2: Info.plist
+Only in out/metal/src/flame/phone/metal2: NativeBridgeMetalFrontend.h
+Only in out/metal/src/flame/phone/metal2: NativeBridgeMetalFrontend.mm
+Only in out/metal/src/flame/phone/metal2: SweetMetal2.mm
+Only in out/metal/src/flame/phone/metal2/bridge: LICENSE
+Only in out/metal/src/flame/phone/metal2/bridge: NativeMetalBridge.h
+--- a/phone/metal2/bridge/NativeMetalBridge.rs
++++ b/phone/metal2/bridge/NativeMetalBridge.rs
+@@ -84,6 +84,7 @@
+ 
+ fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
+     let mut options = DeviceOptions::default();
++    options.policy = objects::negroni_policy();
+     options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
+     // No macOS release names this host; answer as the newest measured Metal.
+     options.metal_level = Some(MetalLevel::NEWEST);
+Only in out/metal/src/flame/phone/metal2/bridge: NativeMetalObjects.h
+--- a/phone/metal2/bridge/NativeMetalObjects.rs
++++ b/phone/metal2/bridge/NativeMetalObjects.rs
+@@ -149,6 +149,28 @@
+     }
+ }
+ 
++/// NegroniMetal: the device policy from env NEGRONIMETAL_POLICY (docs/metal-management.md).
++/// - `exact`: metal2vulkan's defaults (Metal's 8-bit linear filter and color-write rounding emulated, containment on).
++/// - `compositor` (default, also when unset or unknown): the device's 8-bit unorm linear filter (Turnip row, m2v/0003)
++///   and the device's 8-bit unorm color-write conversion; containment and isolation on.
++/// - `compositor-srgb`: `compositor` plus the device's 8-bit sRGB encode on color writes.
++/// - `unsafe`: `compositor` plus containment UnsafeOff and isolation Off (no bounds checks).
++pub(crate) fn negroni_policy() -> metal2vulkan::device::DevicePolicy {
++    use metal2vulkan::device::{ColorWritesPolicy, ContainmentPolicy, DevicePolicy, GuestIsolation, Unorm8LinearFilterPolicy};
++    let mut policy = DevicePolicy::default();
++    let name = std::env::var("NEGRONIMETAL_POLICY").unwrap_or_default();
++    if name == "exact" {
++        return policy;
++    }
++    policy.unorm8_linear_filter = Unorm8LinearFilterPolicy::DeviceWithinOneCode;
++    policy.color_writes = if name == "compositor-srgb" { ColorWritesPolicy::DeviceUnorm8Srgb } else { ColorWritesPolicy::DeviceUnorm8 };
++    if name == "unsafe" {
++        policy.containment = ContainmentPolicy::UnsafeOff;
++        policy.isolation = GuestIsolation::Off;
++    }
++    policy
++}
++
+ /// # Safety
+ /// `loader` and `cache` are C strings.
+ #[unsafe(no_mangle)]
+@@ -160,6 +182,7 @@
+         // SAFETY: the caller's contract.
+         let (loader, cache) = unsafe { (CStr::from_ptr(loader), CStr::from_ptr(cache)) };
+         let mut options = DeviceOptions::default();
++        options.policy = negroni_policy();
+         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
+         options.metal_level = Some(MetalLevel::NEWEST);
+         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
+Only in out/metal/src/flame/phone/metal2/bridge: patches
+Only in out/metal/src/flame/phone/metal2: build.sh
+Only in out/metal/src/flame/phone/metal2: m2vtest.c
+Only in out/metal/src/flame/phone: turnip

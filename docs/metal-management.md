@@ -81,6 +81,30 @@ The telemetry row `J nocopy-dealloc inflight=N used=N | hostinv n=N r=N kb=N` (f
 buffers freed while GPU work was in flight (`used` = still listed by a runtime command buffer: should stay 0) and m2v's
 host-import cache invalidations. No new env or file knob.
 
+### m2v Device Policy (`NEGRONIMETAL_POLICY`)
+The plugin loads `KEY=VALUE` lines of `/var/db/negronimetal/env` before the device opens. `NEGRONIMETAL_POLICY`
+selects the metal2vulkan device policy (flame/0007, m2v/0003):
+
+| Value | 8-bit linear filter | 8-bit colour writes | Bounds checks (containment) |
+|---|---|---|---|
+| `exact` | Metal's, emulated | Metal's rounding, emulated (unorm + sRGB) | on |
+| `compositor` (default, also unset) | Turnip's own | Turnip's conversion for 8-bit unorm; sRGB emulated | on |
+| `compositor-srgb` | Turnip's own | Turnip's conversion for 8-bit unorm and sRGB | on |
+| `unsafe` | Turnip's own | as `compositor` | **off** (and guest isolation off) |
+
+A/B test (restart the client, for example `killall backboardd`, after a change):
+
+```sh
+scripts/net/ssh-phone.sh "echo NEGRONIMETAL_POLICY=exact >> /private/var/db/negronimetal/env"
+# back to the default: remove the line
+scripts/net/ssh-phone.sh "cd /private/var/db/negronimetal && grep -v '^NEGRONIMETAL_POLICY=' env > env.new; mv env.new env"
+```
+
+The policy is in the shader-cache key, so the first frames after a change compile new pipelines. The log line
+`images NegroniMetal 0x... text 0x... turnip 0x... text 0x... (m2v policy NAME)` shows the active value and the
+load addresses for crash symbolication: `atos -o out/gpu/turnip/libvulkan_freedreno.dylib -l TURNIP_BASE PC`,
+`atos -o NegroniMetal.dSYM -l BASE PC`.
+
 ### On-Device XNUtils App
 The installed **XNUtils** app (`/Applications/XNUtils.app`) displays:
 * Active Metal Device Name (`Turnip Adreno (TM) 730` or `Software Renderer`)

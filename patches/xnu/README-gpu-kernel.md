@@ -369,8 +369,15 @@ What 0254 does:
    A GPU copy (0231) is now queued only after the render is done, so the waits left on the tick are for the
    frame's own 2D copy (clock shift, badges, a CPU layer over it, the switch back from zero-copy), at most
    `NEGRONI_FB_GPU_COPY_WAIT_MS` (8 ms). The fade at display off keeps its 50 ms wait.
-   Exception [I, rare]: a surface rendered again after its swap (fence newer than the one checked) still
-   gets the old 50 ms wait in present(), because the CPU must not copy it before its fence.
+   Swap-time fences (0254 amendment, 2026-10-25): swap() records each layer's `gpuFence` at SwapEnd
+   (`fPendFences`), and present() uses that one, not `s->gpuFence` at copy time. No fence wait is left in
+   present() for the CPU copy; `NegroniGPUSurfaceForCPU` (the cache drop) still runs before the memcpy.
+   Reason [V phone, first 0254 image]: `cpu 5`/s at 51-54 ms each, because Turnip lists every buffer of the
+   device in every submission, so each surface's `gpuFence` always names the newest in-flight work. The
+   swap-time fence is enough: CA renders into a surface again only after SwapWait returned 0 for its swap,
+   i.e. after we copied it. The 0231 2D copy cannot be queued "behind the swap-time fence" only: the ring is
+   in order, so a copy waits behind every newer submission. So a layer whose `s->gpuFence` has moved on and
+   is not done goes the CPU way (no GPU copy); with Turnip that is nearly every GPU-written layer [I].
 3. Latest wins, without starvation: a newer SwapEnd replaces the pending record, but the first record that
    waits for its fence is kept as the "older" one (`fOld`, copy frames only, not zero-copy). The tick shows
    the newest record whose fence passed: the pending one (the older one is then dropped), else the older
@@ -400,8 +407,10 @@ high when the GPU is slow, `present()` copy avg back to the CPU-copy time, no 51
 client: `gave up on fence ...` lines about 0.5 s after the crash only if the GPU stops making progress or
 a client closed; never on a slow GPU without a close.
 
-Build (2026-10-25): kernel `out/kernel/local-20261025-173319` (sha256 ee9ac20f..., 0254 applied, 0262 the known
-skip), boot image variant `out/ios16-present` (boot_a.img sha256 af5d91e4..., the config's cmdline, no extra args).
+Build (2026-10-25): first version: kernel `out/kernel/local-20261025-173319` (sha256 ee9ac20f...), image
+`out/ios16-present` (boot_a af5d91e4...). Amended (swap-time fences): kernel `out/kernel/local-20261025-175017`
+(sha256 e51e7339..., 0236 and 0254 applied, 0262 the known skip), image `out/ios16-0254b` (boot_a sha256
+20a82fb6..., the config's cmdline, no extra args).
 [V] `scripts/bg.sh` does not pass variables set before it into tmux: `IOS16_OUT=x scripts/bg.sh NAME build.sh`
 writes into out/ios16. Use `scripts/bg.sh NAME env IOS16_OUT=x BOOTARGS_ADD=... scripts/ios16/build.sh` (the recipe
 above is fixed).
@@ -472,3 +481,81 @@ Reference: `external/ios-spes` (SM6225, A610, same 20H392 root). Its UI runs on 
    `0114-spes-vibrator-probe.patch` (97 lines): `spesvib=1` raises the vibrator enable GPIO (TLMM 36) for
    300 ms from `bsd/dev/spes_vib.c` to learn whether the PMIC LPG PWM is needed; a first-look probe, not a
    driver.
+
+## 14. GPU clock (0236, `negronigpu_clkdump` / `_gxclk` / `_timetest` / `_revote`)
+
+### Facts before 0236
+- [V phone 2026-10-25] One CoreAnimation frame through Turnip costs the GPU ~60 ms at GX level 1
+  (220 MHz, bw 3) and at level 12 (818 MHz, bw 11, `17 HFI GX_BW_PERF_VOTE ack, error 0`). Throughput per
+  command buffer is ~45-100 Mpx/s, near what an A730 at the 19.2 MHz XO would do.
+- [V code] The GPU WATCH words `CX` / `GX` are GDSC power registers (`GPUCC_CX_GDSCR` gpucc+0x9108,
+  `GPUCC_GX_GDSCR` gpucc+0x905c), not clocks. Before 0236 the driver never read a GX clock or PLL.
+- [V code] Perf table: GX `{vote = (rpmh level << 16) | (mx index << 8) | gfx index, acd 0xffffffff, MHz}`
+  for 0, 220, 285, 317, 350, 421, 492, 545, 599, 640, 734, 791, 818 MHz; GMU 200/500 MHz.
+- [V code] The cmd-db level arrays were 16 u16 (32 bytes). "gfx top 0" in the step-17 line is padding.
+- [V code] Step 17 sends GX_BW_PERF_VOTE (HFI 30) BEFORE the OOB GPU_SET of step 18, and never again.
+- [V code] The driver programs only the GMU and HUB RCGs (gpucc 0x9318, 0x93ec). It never touches a
+  GFX3D RCG or a GPU PLL. gpucc (0x03d90000, 0xa000) is mapped.
+- [V code] Every submit ends with CCU invalidates + CACHE_CLEAN fences + CP_WAIT_TIMESTAMP (0231).
+- Reference [V apollo, external/ios-apollo/NOTES.md:33]: A650 printed `pll0 mode 0xd9000005 L 0x1f`
+  (0x1f x 19.2 = 595 MHz) from gpucc PLL0.
+
+### What 0236 prints
+1. `negronigpu_clkdump` (default 1). At the end of step 17, after the step-18 OOB GPU_SET ack, and after a
+   revote (3):
+   - `NEGRONI ADRENO: N clock dump <when>: GX GDSC %x, PLL0 mode %x L %x alpha %x, PLL1 mode %x L %x alpha %x`
+   - `NEGRONI ADRENO: gpucc[0x0] = ...`, `gpucc[0x20]` (PLL0 +0x0..0x40), `gpucc[0x1000]`, `gpucc[0x1020]`
+     (PLL1), `gpucc[0x9000]` .. `gpucc[0x90e0]` (GX branch/RCG area), 8 dwords per line.
+   - `NEGRONI ADRENO: N GMU log head: <16 dwords>` (the watch reads dword 0 only).
+   - Step 17 also prints `17 cmd-db gfx.lvl raw B bytes, N levels: ...` (same for mx.lvl, cx.lvl): the raw
+     aux length and every level. The arrays now hold 32 entries; the votes still use the first 16, so the
+     vote math is the same as before.
+2. `negronigpu_gxclk` (default 1). CP perf counter 0 = `PERF_CP_ALWAYS_COUNT` (counts every CP clock),
+   `RBBM_PERFCTR_CNTL` = 1, programmed after the OOB ack (step 18) and again after CP_ME_INIT (step 20).
+   Each measurement is 10 ms of CPU delay:
+   `NEGRONI ADRENO: 18 gxclk N MHz after the OOB GPU_SET ack (CP cycles +C in AO ticks +T, SEL0 .., PERFCTR_CNTL ..)`,
+   the same `after the revote` and `20 gxclk N MHz with the CP running`. The watch line ends with
+   `| gxclk N MHz`: CP cycles / GMU AO ticks x 19.2 since the last printed line (0 = GX off, first line, or
+   the counter went back). Every read is behind the GX GDSC PWR_ON check.
+   Registers (mesa `src/freedreno/registers/adreno/a6xx.xml`): `CP_PERFCTR_CP_SEL[0]` 0x08d0,
+   `RBBM_PERFCTR_CP[0]` 0x0300/0x0301 (A7XX-; A6XX uses 0x0400), `RBBM_PERFCTR_CNTL` 0x0500,
+   `CP_ALWAYS_ON_COUNTER` 0x0980 (reg64), `A7XX_PERF_CP_ALWAYS_COUNT` 0; GMU AO `GMU_ALWAYS_ON_COUNTER_L/H`
+   (a6xx_gmu.xml 0x5088/0x5089 = GPU dword 0x1f888/0x1f889). [I] Linux a6xx_hw_init selects CP0 =
+   ALWAYS_COUNT and a7xx_submit samples `RBBM_PERFCTR_CP(0)` + `CP_ALWAYS_ON_COUNTER` the same way; [I] the
+   CP clock is the GX core clock; [I] both AO counters run at 19.2 MHz.
+3. `negronigpu_revote` (default 1 when `negronigpu_level` > 0, else 0). After the OOB GPU_SET ack: the same
+   `{0, 1, level, bw}` again:
+   `NEGRONI ADRENO: 18 GX_BW_PERF_VOTE again after GPU_SET: level L (M MHz), bw level B`,
+   `17 HFI send GX_BW_PERF_VOTE ...`, `17 HFI GX_BW_PERF_VOTE ack, error E`, `18 revote acked, error 0` (or
+   `NOT ACKED or error (going on)`: the ladder goes on), then dump (1) and a measurement (2) again.
+   Step 17's vote is unchanged.
+4. `negronigpu_timetest` (default 1). Step 22 brackets its 1080x2400 three-band fill with CP_REG_TO_MEM
+   (opcode 0x3e, CNT 2, 64B) of `CP_ALWAYS_ON_COUNTER` and `RBBM_PERFCTR_CP[0]` into the scratch page
+   (+0x300..+0x320):
+   `NEGRONI ADRENO: 22 blit 2.5 Mpx in N us (AO ticks M), CP cycles C (F MHz); raw AO ..`.
+   (2.592 Mpx; the integer print says 2.5.) Expect ~1.5 ms at 220 MHz, ~0.4 ms at 818 MHz, ~17 ms at 19.2 MHz.
+
+### How to read them
+- PLL L value x 19.2 MHz (+ alpha/65536 x 19.2) = the PLL output [I Lucid EVO layout: +0 MODE (bit 31 lock
+  det, bit 0 output enable), +4 L, +8 ALPHA]. PLL0 L 0 or mode bit 0 clear = the GX PLL does not run.
+- `gxclk` near 19 MHz with a level-12 vote = the GX clock stays on XO: the vote does not reach the clock.
+  `gxclk` near the voted MHz but a slow blit = the clock is right and the cost is elsewhere (the fences and
+  the cache cleans of each submit, memory bandwidth, Turnip).
+- Compare `18 gxclk ... after the OOB GPU_SET ack` with `... after the revote`: if only the revote raises it,
+  the vote order (step 17 before GPU_SET) is the bug. Keep `negronigpu_revote=1` then.
+- `22 blit` gives the GPU-side time without the CPU poll loop of `ring_run`. Its `F MHz` must agree with
+  `gxclk`; if it does not, one of the counters is not what the [I] items above say.
+- `gpucc[0x9000..]` before / after GPU_SET: an RCG CFG word that changes source bits [10:8] shows the
+  GMU switching the GX source. No change at all = the GMU does not program the GX RCG.
+
+### Fallback (not in 0236): CPU-side GX clock
+If `gxclk` stays at ~19 MHz after the revote: program the GX clock from the CPU, as spes 0107 does on A610
+(no GMU there). Needed: (a) PLL0 configure + enable: L, ALPHA, USER_CTL, CONFIG_CTL(_U/_U1), TEST_CTL, then
+MODE (reset/bypass/output bits, wait LOCK_DET bit 31) (Linux `clk_lucid_evo_pll_configure`, gpucc-sm8450.c
+`gpu_cc_pll0_config`); (b) the GX GFX3D RCG: CFG source = PLL0 out, divider, then CMD_RCGR UPDATE; (c) the GX
+GFX3D branch CBCR enable; (d) the matching RPMh gfx/mx corner (else the clock outruns the rail voltage).
+[I] Offsets for (b)/(c) on SM8450 are not known yet: the 0236 dump of gpucc 0x9000..0x9100 is the first
+place to find them. Conflict: on GMU parts (A6xx non-legacy, A7xx) the GMU firmware owns GX power and clock
+(GDSC through OOB GPU_SET, DCVS through HFI). A CPU write races the GMU: the GMU can reprogram or gate GX on
+IFPC/slumber, and a frequency the GMU does not know breaks its ACD and its RPMh votes. So the CPU path is
+only a test (fixed level, IFPC off), not a driver.

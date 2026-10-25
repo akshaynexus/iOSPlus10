@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
-index 9c17bbe..1124b29 100644
+index 9c17bbe..d651970 100644
 --- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
 +++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
 @@ -60,8 +60,9 @@
@@ -72,17 +72,18 @@ index 9c17bbe..1124b29 100644
  
  class IOMobileFramebufferUserClient;
  
-@@ -277,9 +300,28 @@ public:
+@@ -277,13 +300,33 @@ public:
  	uint32_t      fStatWaits, fStatWaitTimeouts;
  	uint64_t      fStatWaitAbs, fStatWaitMaxAbs;
  	uint64_t      fRefreshTicks;  /* 0253: one vsync period in mach ticks (0: negronifb_carefresh=0) */
 +	/* 0254: fixed-deadline vsync and fences the tick does not wait for (work loop only) */
 +	uint64_t      fTickAbs, fDeadline;      /* one period, the deadline of the tick now running */
 +	uint32_t      fPendFence, fPendFenceSurface;  /* the newest GPU fence of fPending's surfaces (under fLock) */
++	uint32_t      fPendFences[NEGRONI_FB_LAYERS]; /* each layer's swap-time fence (0: not GPU-written) */
 +	uint8_t       fOld[NEGRONI_FB_SWAP_REC_SIZE];  /* an older copied frame that waits for its fence */
 +	NegroniSurface *fOldHold[NEGRONI_FB_LAYERS];
 +	bool          fOldValid;
-+	uint32_t      fOldFence, fOldFenceSurface;
++	uint32_t      fOldFence, fOldFenceSurface, fOldFences[NEGRONI_FB_LAYERS];
 +	uint32_t      fWaitFence;     /* the oldest fence the tick is waiting for (0: none) */
 +	uint64_t      fWaitT0;        /* when the tick first saw it */
 +	uint32_t      fWaitCloses;    /* NegroniGPUClientCloses() then */
@@ -101,7 +102,12 @@ index 9c17bbe..1124b29 100644
  	void addClient(IOMobileFramebufferUserClient *client);
  	void removeClient(IOMobileFramebufferUserClient *client);
  	void swap(const uint8_t *rec);
-@@ -295,7 +337,7 @@ public:
+-	uint32_t present(const uint8_t *rec, NegroniSurface *const *held);
++	uint32_t present(const uint8_t *rec, NegroniSurface *const *held, const uint32_t *fences);
+ 	void releaseBusy(bool all);
+ 	void keepBusy(NegroniSurface **held, uint32_t fence);
+ 	void zeroCopyInit(void);
+@@ -295,7 +338,7 @@ public:
  	void zeroCopyRestore(void);
  	void zeroCopyStop(bool now);
  	void flip(NegroniSurface *s, uint32_t id);
@@ -110,7 +116,7 @@ index 9c17bbe..1124b29 100644
  };
  
  static AppleCLCD *negroni_fb_zc;          /* for the panic hook (negroni_fb_panic) */
-@@ -385,9 +427,13 @@ AppleCLCD::start(IOService *provider)
+@@ -385,9 +428,13 @@ AppleCLCD::start(IOService *provider)
  	uint32_t stats = 1;
  	PE_parse_boot_argn("negronifb_stats", &stats, sizeof(stats));
  	fStats = stats != 0;
@@ -126,7 +132,7 @@ index 9c17bbe..1124b29 100644
  	zeroCopyInit();
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
-@@ -465,27 +511,60 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -465,27 +512,63 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  				}
  			}
  		}
@@ -158,6 +164,7 @@ index 9c17bbe..1124b29 100644
 -	NegroniSurface *held[NEGRONI_FB_LAYERS] = {};
 -	if (flush) {
 +	NegroniSurface *held[NEGRONI_FB_LAYERS] = {}, *gone[NEGRONI_FB_LAYERS] = {};
++	uint32_t fences[NEGRONI_FB_LAYERS] = {};
 +	if (flush || older) {
  		rec = (uint8_t *)IOMallocData(NEGRONI_FB_SWAP_REC_SIZE);
 -		if (rec != NULL) {
@@ -165,12 +172,14 @@ index 9c17bbe..1124b29 100644
 +			/* 0254: the older frame's fence passed first: shown now, the newer one stays pending */
 +			memcpy(rec, fb->fOld, NEGRONI_FB_SWAP_REC_SIZE);
 +			memcpy(held, fb->fOldHold, sizeof(held));
++			memcpy(fences, fb->fOldFences, sizeof(fences));
 +			bzero(fb->fOldHold, sizeof(fb->fOldHold));
 +			fb->fOldValid = false;
 +			fb->fStatGaveUp += gaveUp;
 +		} else if (rec != NULL) {
  			memcpy(rec, fb->fPending, NEGRONI_FB_SWAP_REC_SIZE);
  			memcpy(held, fb->fPendHold, sizeof(held));
++			memcpy(fences, fb->fPendFences, sizeof(fences));
  			bzero(fb->fPendHold, sizeof(fb->fPendHold));
  			fb->fDirty = false;
  			fb->fPendZC = false;
@@ -193,7 +202,16 @@ index 9c17bbe..1124b29 100644
  	fb->releaseBusy(false);
  	if (rec != NULL && zc) {
  		fb->flip(held[0], get32(rec, 0x50));    /* takes held[0]'s retain and hold */
-@@ -506,18 +585,102 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -493,7 +576,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->fStatZC++;
+ 	} else if (rec != NULL) {
+ 		uint64_t t0 = mach_absolute_time();
+-		uint32_t fence = fb->present(rec, held);
++		uint32_t fence = fb->present(rec, held, fences);
+ 		uint64_t dt = mach_absolute_time() - t0;
+ 		fb->fStatCopyAbs += dt;
+ 		if (dt > fb->fStatCopyMaxAbs) {
+@@ -506,18 +589,102 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		}
  		if (fb->fZCActive) {
  			/* the panel memory has this frame (the GPU's copy done) before the pipes go back to it */
@@ -299,7 +317,7 @@ index 9c17bbe..1124b29 100644
  }
  
  /*
-@@ -536,8 +699,8 @@ negroni_fb_abs_us(uint64_t abs)
+@@ -536,8 +703,8 @@ negroni_fb_abs_us(uint64_t abs)
  void
  AppleCLCD::statTick(uint64_t now)
  {
@@ -310,7 +328,7 @@ index 9c17bbe..1124b29 100644
  	}
  	fStatLastTick = now;
  	if (fStatT0 == 0) {
-@@ -554,12 +717,13 @@ AppleCLCD::statTick(uint64_t now)
+@@ -554,12 +721,13 @@ AppleCLCD::statTick(uint64_t now)
  	uint64_t waitMax = __atomic_exchange_n(&fStatWaitMaxAbs, 0, __ATOMIC_RELAXED);
  	uint32_t copies = fStatCPU + fStatGPU;
  	IOLog("NEGRONI FB STAT: swaps/s %u presents/s %u (cpu %u gpu %u zc %u) copy avg/max us %llu/%llu "
@@ -327,7 +345,7 @@ index 9c17bbe..1124b29 100644
  	fStatCopyAbs = fStatCopyMaxAbs = 0;
  }
  
-@@ -577,7 +741,7 @@ AppleCLCD::releaseBusy(bool all)
+@@ -577,7 +745,7 @@ AppleCLCD::releaseBusy(bool all)
  		}
  		if (all) {
  			NegroniGPUFenceWait(fBusy[i].fence, NEGRONI_FB_GPU_WAIT_MS);
@@ -336,7 +354,7 @@ index 9c17bbe..1124b29 100644
  			continue;
  		}
  		negroni_surface_hold(s, false);
-@@ -602,8 +766,8 @@ AppleCLCD::keepBusy(NegroniSurface **held, uint32_t fence)
+@@ -602,8 +770,8 @@ AppleCLCD::keepBusy(NegroniSurface **held, uint32_t fence)
  			}
  		}
  		if (slot == NEGRONI_FB_GPU_BUSY) {
@@ -347,18 +365,27 @@ index 9c17bbe..1124b29 100644
  			}
  			negroni_surface_hold(s, false);
  			s->release();
-@@ -687,12 +851,40 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -687,12 +855,51 @@ AppleCLCD::swap(const uint8_t *rec)
  			negroni_surface_hold(held[layer], true);
  		}
  	}
 +	/* 0254: the newest GPU fence of the frame's surfaces; the tick shows the frame once it is done */
-+	uint32_t pendFence = 0, pendSurface = 0;
++	/*
++	 * Swap-time fences are the right ones: CoreAnimation renders into a surface again only after
++	 * SwapWait said its swap is on screen, so no later GPU write to it is for this frame. The
++	 * surface's gpuFence moves on with every submission that lists it (Turnip lists every buffer
++	 * of the device), so at copy time it names unrelated newer work.
++	 */
++	uint32_t pendFence = 0, pendSurface = 0, pendFences[NEGRONI_FB_LAYERS] = {};
 +	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
 +		uint32_t id = get32(rec, 0x54 + 4 * layer);
 +		if (!(mask & (1u << layer)) || id == 0) {
 +			continue;
 +		}
 +		NegroniSurface *s = held[layer] != NULL ? held[layer] : negroni_surface_copy(id);
++		if (s != NULL && s != fSurface) {
++			pendFences[layer] = s->gpuFence;
++		}
 +		if (s != NULL && s != fSurface && s->gpuFence != 0 &&
 +		    (pendFence == 0 || (int32_t)(s->gpuFence - pendFence) > 0)) {
 +			pendFence = s->gpuFence;
@@ -376,6 +403,7 @@ index 9c17bbe..1124b29 100644
 +		bzero(fPendHold, sizeof(fPendHold));
 +		fOldFence = fPendFence;
 +		fOldFenceSurface = fPendFenceSurface;
++		memcpy(fOldFences, fPendFences, sizeof(fOldFences));
 +		fOldValid = true;
 +	}
  	memcpy(fPending, rec, NEGRONI_FB_SWAP_REC_SIZE);
@@ -385,21 +413,40 @@ index 9c17bbe..1124b29 100644
  	fPendZC = zc != NULL;
 +	fPendFence = pendFence;
 +	fPendFenceSurface = pendSurface;
++	memcpy(fPendFences, pendFences, sizeof(fPendFences));
  	fEndedID = get32(rec, 0x50);
  	if (fPowerOff) {
  		fPresentedID = fEndedID;        /* nothing is shown while off: SwapWait must not wait */
-@@ -886,7 +1078,9 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
+@@ -797,10 +1004,11 @@ negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t
+ 
+ /*
+  * held: the frame's surfaces swap() holds for a GPU present (NULL entries: that layer, if any,
+- * goes the CPU way). Returns the newest GPU copy's fence, 0 if the CPU did everything.
++ * goes the CPU way). fences: each layer's swap-time GPU fence (0254), done or given up when the
++ * tick calls this. Returns the newest GPU copy's fence, 0 if the CPU did everything.
+  */
+ uint32_t
+-AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
++AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32_t *fences)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 	bool topRedrawn = false;
+@@ -885,8 +1093,12 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
+ 		if (!fits) {
  			src = 0;
  		}
- 		uint32_t written = s->gpuFence;
+-		uint32_t written = s->gpuFence;
 -		if (fits && bpe == 4 && written != 0 && gpuReady && held[layer] == s) {
-+		/* 0254: vsyncFired showed this frame after its fences: one not done now was given up */
++		uint32_t written = fences[layer];      /* 0254: the swap-time fence, not s->gpuFence */
++		/* 0254: not done now = given up. Newer work that lists s (s->gpuFence moved on): the ring is
++		 * in order, so a 2D copy would wait behind it; the CPU copies now instead. */
 +		bool stale = written != 0 && !NegroniGPUFenceDone(written);
-+		if (fits && bpe == 4 && written != 0 && !stale && gpuReady && held[layer] == s) {
++		bool behind = s->gpuFence != written && !NegroniGPUFenceDone(s->gpuFence);
++		if (fits && bpe == 4 && written != 0 && !stale && !behind && gpuReady && held[layer] == s) {
  			if (dy == 0 && dx == 0 && h >= 150 && w >= (int32_t)fWidth / 2) {
  				topRedrawn = true;
  			}
-@@ -900,11 +1094,14 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
+@@ -900,11 +1112,11 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
  		}
  		if (src != 0 && bpe == 4 && fence != 0) {
  			/* this layer lies over a GPU copy of the same frame: after it */
@@ -409,15 +456,12 @@ index 9c17bbe..1124b29 100644
  		if (src != 0 && bpe == 4 && written != 0) {
 -			/* the GPU wrote it: done, and none of the CPU's old lines over it */
 -			NegroniGPUFenceWait(written, NEGRONI_FB_GPU_WAIT_MS);
-+			/* the GPU wrote it: done (or given up), and none of the CPU's old lines over it */
-+			if (stale && !fencePassed(written, s->id, NULL)) {
-+				/* rendered again after its swap (not given up): as before 0254 */
-+				NegroniGPUFenceWait(written, NEGRONI_FB_GPU_WAIT_MS);
-+			}
++			/* the GPU wrote it: its swap-time fence passed (the tick checked it, no wait here), and
++			 * none of the CPU's old lines over it */
  			NegroniGPUSurfaceForCPU(s, (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow,
  			    (uint64_t)h * s->bytesPerRow);
  		}
-@@ -932,7 +1129,7 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
+@@ -932,7 +1144,7 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
  	}
  	if (fence != 0 && (negroni_clock_shift > 0 || negroni_badges > 0)) {
  		/* the CPU draws over the GPU's picture: after it */
@@ -426,7 +470,7 @@ index 9c17bbe..1124b29 100644
  	}
  	if (topRedrawn) {
  		negroni_shift_clock(fPixels, fRowBytes, fWidth, fHeight);
-@@ -1298,29 +1495,28 @@ AppleCLCD::flip(NegroniSurface *s, uint32_t id)
+@@ -1298,29 +1510,28 @@ AppleCLCD::flip(NegroniSurface *s, uint32_t id)
  }
  
  /*
@@ -473,7 +517,7 @@ index 9c17bbe..1124b29 100644
  	if (fStats) {
  		uint64_t dt = mach_absolute_time() - t0;
  		__atomic_fetch_add(&fStatWaits, 1, __ATOMIC_RELAXED);
-@@ -1333,6 +1529,7 @@ AppleCLCD::swapWait(uint32_t id)
+@@ -1333,6 +1544,7 @@ AppleCLCD::swapWait(uint32_t id)
  		    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
  		}
  	}
@@ -481,7 +525,7 @@ index 9c17bbe..1124b29 100644
  }
  
  /* Panic (NegroniPlatformExpert.cpp kPEPanicBegin): the panic text is drawn into the panel memory. */
-@@ -1494,7 +1691,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -1494,7 +1706,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  		break;
  	case kNegroniFBSwapWait:
  		if (args->scalarInputCount >= 1) {

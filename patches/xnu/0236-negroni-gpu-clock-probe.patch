@@ -1,0 +1,334 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -1225,6 +1225,7 @@
+ 
+ static vm_offset_t cmd_db;
+ static uint32_t hfi_seq;
++static uint32_t cmd_db_raw_len;        /* patch 0236: the last entry's aux length before the cap */
+ 
+ static uint32_t
+ db32(uint32_t off)
+@@ -1255,6 +1256,7 @@
+ 			*address = db32(e + 16);
+ 			if (aux) {
+ 				uint32_t lo = db32(e + 20), len = lo & 0xffff, off = data + (lo >> 16);
++				cmd_db_raw_len = len;
+ 				len = MIN(len, *aux_len);
+ 				for (uint32_t b = 0; b < len; b++) {
+ 					aux[b] = (uint8_t)(db32((off + b) & ~3u) >> (8 * ((off + b) & 3)));
+@@ -1349,8 +1351,143 @@
+ 	}
+ 	printf("NEGRONI ADRENO: 17 stop: no ack for %s\n", what);
+ 	return false;
++}
++
++/*
++ * GPU clock probe (patch 0236): what the GX clock really runs at. Boot-args, all default 1:
++ * negronigpu_clkdump (gpucc PLL0/PLL1/GX-area dumps, cmd-db levels, GMU log head at the end of
++ * step 17, after the OOB GPU_SET ack and after a revote), negronigpu_gxclk (CP perf counter 0 counts
++ * every CP clock: "gxclk N MHz" in steps 18/20 and the watch line), negronigpu_timetest (step 22 times
++ * its blit on the GPU). negronigpu_revote (default 1 with negronigpu_level>0, else 0): the
++ * GX_BW_PERF_VOTE again after the OOB GPU_SET ack. Registers (mesa a6xx.xml): CP_PERFCTR_CP_SEL[0]
++ * 0x08d0, RBBM_PERFCTR_CP[0] 0x0300 (A7XX-; A6XX has 0x0400), RBBM_PERFCTR_CNTL 0x0500,
++ * CP_ALWAYS_ON_COUNTER 0x0980 (reg64), PERF_CP_ALWAYS_COUNT 0; GMU_ALWAYS_ON_COUNTER_L/H
++ * (a6xx_gmu.xml 0x5088/0x5089). Linux a6xx_hw_init selects CP0 = PERF_CP_ALWAYS_COUNT the same way.
++ * PLL layout (Linux gpucc-sm8450.c, Lucid EVO): PLL0 at +0x0, PLL1 at +0x1000, +0 MODE, +4 L, +8 ALPHA.
++ */
++#define GPUCC_PLL0              0x0000
++#define GPUCC_PLL1              0x1000
++#define GPUCC_GX_AREA           0x9000
++#define GMU_AO_COUNTER_H        0x1f889
++#define CLK_CP_PERFCTR_CP_SEL_0 0x08d0          /* dword, GPU space */
++#define CLK_RBBM_PERFCTR_CP_0   0x0300          /* A7XX-; lo, hi */
++#define CLK_RBBM_PERFCTR_CNTL   0x0500
++#define CLK_CP_ALWAYS_ON        0x0980          /* lo, hi; 19.2 MHz */
++#define CLK_PERF_CP_ALWAYS_COUNT 0
++#define CLK_AT                  0x300           /* in the scratch page: step 22's AO/cycle samples */
++
++static uint32_t clk_dump = 1, clk_probe = 1, clk_timetest = 1;
++static uint32_t vote_level = 1, vote_bw = 3, vote_arg;
++static uint64_t
++rd64(vm_offset_t lo)
++{
++	uint32_t hi = rd(lo + 4), l = rd(lo), hi2 = rd(lo + 4);
++
++	if (hi2 != hi) {
++		l = rd(lo);
++	}
++	return (uint64_t)hi2 << 32 | l;
++}
++
++static uint64_t
++ao_now(void)
++{
++	return rd64(gmu + GMU_REG(GMU_AO_COUNTER_L));
++}
++
++static uint64_t
++gx_cycles(void)
++{
++	return rd64(gpu_regs + 4 * (vm_offset_t)CLK_RBBM_PERFCTR_CP_0);
++}
++
++/* cycles of the CP clock over ticks of the 19.2 MHz always-on counter */
++static uint32_t
++clk_mhz(uint64_t cycles, uint64_t ticks)
++{
++	return ticks ? (uint32_t)(cycles * 192 / (ticks * 10)) : 0;
++}
++
++static void
++gpucc_dump(uint32_t from, uint32_t to)
++{
++	for (uint32_t off = from; off < to; off += 32) {
++		uint32_t v[8];
++		for (uint32_t i = 0; i < 8; i++) {
++			v[i] = rd(gpucc + off + 4 * i);
++		}
++		printf("NEGRONI ADRENO: gpucc[%#x] = %08x %08x %08x %08x %08x %08x %08x %08x\n", off,
++		    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
++	}
++}
++
++static void
++clock_dump(const char *when)
++{
++	if (!clk_dump) {
++		return;
++	}
++	printf("NEGRONI ADRENO: %u clock dump %s: GX GDSC %#x, PLL0 mode %#x L %#x alpha %#x, PLL1 mode %#x L %#x alpha %#x\n",
++	    step, when, rd(gpucc + GPUCC_GX_GDSCR), rd(gpucc + GPUCC_PLL0), rd(gpucc + GPUCC_PLL0 + 4),
++	    rd(gpucc + GPUCC_PLL0 + 8), rd(gpucc + GPUCC_PLL1), rd(gpucc + GPUCC_PLL1 + 4), rd(gpucc + GPUCC_PLL1 + 8));
++	gpucc_dump(GPUCC_PLL0, GPUCC_PLL0 + 0x40);
++	gpucc_dump(GPUCC_PLL1, GPUCC_PLL1 + 0x40);
++	gpucc_dump(GPUCC_GX_AREA, GPUCC_GX_AREA + 0x100);
++	to_memory(gmu_log.memory, 64);
++	const volatile uint32_t *l = (const volatile uint32_t *)gmu_log.memory;
++	printf("NEGRONI ADRENO: %u GMU log head: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x "
++	    "%08x %08x\n", step, l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], l[8], l[9], l[10], l[11], l[12], l[13],
++	    l[14], l[15]);
++}
++
++/* Only while GX has power: CP perf counter 0 counts every CP clock (needs RBBM_PERFCTR_CNTL 1). */
++static void
++clock_probe_start(void)
++{
++	if (!clk_probe || !(rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON)) {
++		return;
++	}
++	wr(gpu_regs + 4 * (vm_offset_t)CLK_CP_PERFCTR_CP_SEL_0, CLK_PERF_CP_ALWAYS_COUNT);
++	wr(gpu_regs + 4 * (vm_offset_t)CLK_RBBM_PERFCTR_CNTL, 1);
++}
++
++static void
++clock_measure(const char *when)
++{
++	if (!clk_probe || !(rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON)) {
++		return;
++	}
++	uint64_t c0 = gx_cycles(), a0 = ao_now();
++	delay(10000);
++	uint64_t c1 = gx_cycles(), a1 = ao_now();
++	printf("NEGRONI ADRENO: %u gxclk %u MHz %s (CP cycles +%llu in AO ticks +%llu, SEL0 %#x, PERFCTR_CNTL %#x)\n", step,
++	    clk_mhz(c1 - c0, a1 - a0), when, c1 - c0, a1 - a0, rd(gpu_regs + 4 * (vm_offset_t)CLK_CP_PERFCTR_CP_SEL_0),
++	    rd(gpu_regs + 4 * (vm_offset_t)CLK_RBBM_PERFCTR_CNTL));
+ }
+ 
++/* the raw aux length of a cmd-db entry (cmd_db_find with a 0-byte buffer) */
++static uint32_t
++cmd_db_raw(const char *name)
++{
++	uint8_t none;
++	uint32_t a, n = 0;
++
++	return cmd_db_find(name, &a, &none, &n) ? cmd_db_raw_len : 0;
++}
++
++static void
++print_levels(const char *name, const uint16_t *v, uint32_t n)
++{
++	char line[256];
++	int at = 0;
++
++	for (uint32_t i = 0; i < n && at < (int)sizeof(line) - 8; i++) {
++		at += snprintf(line + at, sizeof(line) - at, " %u", v[i]);
++	}
++	line[at] = 0;
++	printf("NEGRONI ADRENO: 17 cmd-db %s raw %u bytes, %u levels:%s\n", name, cmd_db_raw(name), n, line);
++}
++
+ /* sm8450.dtsi gpu_opp_table (ascending) and the GMU's OPPs; RPMh corner levels */
+ static const uint32_t gpu_khz[] = { 0, 220000, 285000, 317000, 350000, 421000, 492000, 545000, 599000, 640000,
+ 	                            734000, 791000, 818000 };
+@@ -1361,7 +1498,7 @@
+ static bool
+ step_hfi_messages(void)
+ {
+-	static uint16_t gfx[16], mx[16], cx[16];
++	static uint16_t gfx[32], mx[32], cx[32];        /* 32: all levels for the patch-0236 print */
+ 	uint32_t gfx_n = sizeof(gfx), mx_n = sizeof(mx), cx_n = sizeof(cx), a;
+ 	static uint32_t perf[3 + 16 * 3 + 4 * 2], bw[6 + 6 + 12 + 8 + 16 * 8];
+ 
+@@ -1369,6 +1506,9 @@
+ 		printf("NEGRONI ADRENO: 17 stop: the GMU does not run\n");
+ 		return false;
+ 	}
++	(void)PE_parse_boot_argn("negronigpu_clkdump", &clk_dump, sizeof(clk_dump));
++	(void)PE_parse_boot_argn("negronigpu_gxclk", &clk_probe, sizeof(clk_probe));
++	(void)PE_parse_boot_argn("negronigpu_timetest", &clk_timetest, sizeof(clk_timetest));
+ 	cmd_db = ml_io_map(CMD_DB_PHYS, CMD_DB_SIZE);
+ 	if (!cmd_db || db32(4) != 0x0c0330db ||
+ 	    !cmd_db_find("gfx.lvl", &a, (uint8_t *)gfx, &gfx_n) || !cmd_db_find("mx.lvl", &a, (uint8_t *)mx, &mx_n) ||
+@@ -1379,6 +1519,15 @@
+ 	gfx_n /= 2;
+ 	mx_n /= 2;
+ 	cx_n /= 2;
++	if (clk_dump) {
++		print_levels("gfx.lvl", gfx, gfx_n);
++		print_levels("mx.lvl", mx, mx_n);
++		print_levels("cx.lvl", cx, cx_n);
++	}
++	/* the votes use the first 16 levels, as before patch 0236 */
++	gfx_n = MIN(gfx_n, 16);
++	mx_n = MIN(mx_n, 16);
++	cx_n = MIN(cx_n, 16);
+ 	printf("NEGRONI ADRENO: 17 arc levels: gfx %u, mx %u, cx %u (gfx top %u)\n", gfx_n, mx_n, cx_n,
+ 	    gfx_n ? gfx[gfx_n - 1] : 0);
+ 
+@@ -1450,10 +1599,14 @@
+ 		vote[3] = bw[1] - 1;
+ 		printf("NEGRONI ADRENO: GX level %u (%u MHz), bw level %u\n", level, gpu_khz[level] / 1000, vote[3]);
+ 	}
++	vote_arg = level;
++	vote_level = vote[2];
++	vote_bw = vote[3];
+ 	if (!hfi_send("GX_BW_PERF_VOTE", 30, vote, sizeof(vote))) {
+ 		return false;
+ 	}
+ 	printf("NEGRONI ADRENO: 17 GMU TAKES ITS TABLES AND IS STARTED\n");
++	clock_dump("at the end of step 17");
+ 	return !space_faulted(&gmu_space);
+ }
+ 
+@@ -1487,6 +1640,21 @@
+ 	}
+ 	gx_on = true;
+ 	printf("NEGRONI ADRENO: 18 3D CORE POWERED: RBBM_STATUS %#x\n", rd(gpu_regs + 4 * GPU_RBBM_STATUS));
++	clock_dump("after the OOB GPU_SET ack");
++	clock_probe_start();
++	clock_measure("after the OOB GPU_SET ack");
++	/* patch 0236: Linux votes after the GMU runs the GPU too (a6xx_gmu_set_freq -> a6xx_hfi_set_freq) */
++	uint32_t revote = vote_arg > 0;
++	(void)PE_parse_boot_argn("negronigpu_revote", &revote, sizeof(revote));
++	if (revote) {
++		uint32_t vote[4] = { 0, 1 /* blocking ack */, vote_level, vote_bw };
++		printf("NEGRONI ADRENO: 18 GX_BW_PERF_VOTE again after GPU_SET: level %u (%u MHz), bw level %u\n",
++		    vote_level, gpu_khz[vote_level] / 1000, vote_bw);
++		bool ok = hfi_send("GX_BW_PERF_VOTE", 30, vote, sizeof(vote));
++		printf("NEGRONI ADRENO: 18 revote %s\n", ok ? "acked, error 0" : "NOT ACKED or error (going on)");
++		clock_dump("after the revote");
++		clock_measure("after the revote");
++	}
+ 	return !space_faulted(&gmu_space);
+ }
+ 
+@@ -1777,6 +1945,8 @@
+ 		return false;
+ 	}
+ 	printf("NEGRONI ADRENO: 20 THE 3D CORE TAKES COMMANDS\n");
++	clock_probe_start();
++	clock_measure("with the CP running");
+ 	return true;
+ }
+ 
+@@ -1914,7 +2084,18 @@
+ #define TARGET_HEIGHT           2400
+ #define TARGET_ROW              4352
+ 
++/* CP_REG_TO_MEM of one 64-bit register pair into the scratch page (patch 0236) */
++#define CP_REG_TO_MEM           0x3e
+ static void
++ring_sample(uint32_t reg, uint32_t at)
++{
++	ring_command(CP_REG_TO_MEM, 3);
++	ring(reg | 2u << 18 | 1u << 30);        /* CNT 2, 64B */
++	ring(CORE_SCRATCH_ADDRESS + at);
++	ring(0);
++}
++
++static void
+ ring_fill(uint32_t top, uint32_t bottom, uint32_t r, uint32_t g, uint32_t b)
+ {
+ 	ring_register(REG_GRAS_2D_DST_TL, top << 16);
+@@ -1950,6 +2131,14 @@
+ 	for (uint32_t i = 0; i < core_space.table_count; i++) {
+ 		to_memory((vm_offset_t)core_space.tables[i].table, 4096);
+ 	}
++	volatile uint64_t *t = (volatile uint64_t *)(core_scratch.memory + CLK_AT);
++	if (clk_timetest) {
++		/* patch 0236: AO counter and CP cycles before and after the blit, as Linux a7xx_submit does */
++		t[0] = t[1] = t[2] = t[3] = 0;
++		to_memory(core_scratch.memory, 4096);
++		ring_sample(CLK_CP_ALWAYS_ON, CLK_AT);
++		ring_sample(CLK_RBBM_PERFCTR_CP_0, CLK_AT + 8);
++	}
+ 	ring_fill(0, 800, 255, 128, 0);
+ 	ring_fill(800, 1600, 255, 255, 255);
+ 	ring_fill(1600, TARGET_HEIGHT, 0, 128, 255);
+@@ -1958,9 +2147,21 @@
+ 	ring_command(CP_EVENT_WRITE7, 1);
+ 	ring(EVENT_CACHE_CLEAN);
+ 	ring_command(CP_WAIT_FOR_IDLE, 0);
++	if (clk_timetest) {
++		ring_sample(CLK_CP_ALWAYS_ON, CLK_AT + 16);
++		ring_sample(CLK_RBBM_PERFCTR_CP_0, CLK_AT + 24);
++		ring_command(CP_WAIT_FOR_IDLE, 0);
++	}
+ 	if (!ring_run("fill a picture")) {
+ 		return false;
+ 	}
++	if (clk_timetest) {
++		to_memory(core_scratch.memory, 4096);
++		uint64_t ticks = t[2] - t[0], cycles = t[3] - t[1];
++		printf("NEGRONI ADRENO: 22 blit %u.%u Mpx in %llu us (AO ticks %llu), CP cycles %llu (%u MHz); raw AO %#llx..%#llx\n",
++		    TARGET_WIDTH * TARGET_HEIGHT / 1000000, TARGET_WIDTH * TARGET_HEIGHT / 100000 % 10, ticks * 10 / 192, ticks,
++		    cycles, clk_mhz(cycles, ticks), t[0], t[2]);
++	}
+ 	to_memory(core_target.memory, core_target.size);
+ 	const volatile uint8_t *px = (const volatile uint8_t *)core_target.memory;
+ 	uint32_t mid = 1200 * TARGET_ROW + 2160, last = 2399 * TARGET_ROW + 4316;
+@@ -2681,6 +2882,7 @@
+ {
+ 	uint32_t last[14] = { 0 };
+ 	bool first = true;
++	uint64_t clk_cycles = 0, clk_ao = 0;    /* patch 0236: the last print's samples */
+ 
+ 	for (uint32_t second = 1;; second++) {
+ 		uint32_t now[14];
+@@ -2707,10 +2909,22 @@
+ 		now[12] = rd(gmu + GMU_REG(GMU_HFI_CTRL_STATUS));
+ 		now[13] = *(volatile uint32_t *)(core_scratch.memory + 0x80);  /* the core's copy of its ring rptr */
+ 		if (first || memcmp(now, last, sizeof(now)) != 0 || second % 10 == 0) {
+-			printf("NEGRONI GPU WATCH %u s: AO %#x CX %#x GX %#x RSC %#x q1w %u log0 %#x | rptr %#x RBBM %#x "
+-			    "HW_FAULT %#x INT0 %#x | SGFSR %#x FSR core %#x gmu %#x | HFI %#x rptr-copy %#x\n", second,
++			/* gxclk: CP cycles over AO ticks since the last line; 0: GX off, first line, or the counter reset */
++			uint32_t gxclk = 0;
++			if (clk_probe && gx) {
++				uint64_t c = gx_cycles(), a = ao_now();
++				if (clk_ao && c >= clk_cycles && a > clk_ao) {
++					gxclk = clk_mhz(c - clk_cycles, a - clk_ao);
++				}
++				clk_cycles = c;
++				clk_ao = a;
++			} else {
++				clk_ao = 0;
++			}
++			printf("NEGRONI GPU WATCH %u s: AO %#x CX %#x GX %#x RSC %#x q1w %u log0 %#x | rptr %#x RBBM %#x "
++			    "HW_FAULT %#x INT0 %#x | SGFSR %#x FSR core %#x gmu %#x | HFI %#x rptr-copy %#x | gxclk %u MHz\n", second,
+ 			    rd(gmu + GMU_REG(GMU_AO_COUNTER_L)), now[0], now[1], now[2], now[3], now[4], now[5], now[6],
+-			    now[7], now[8], now[9], now[10], now[11], now[12], now[13]);
++			    now[7], now[8], now[9], now[10], now[11], now[12], now[13], gxclk);
+ 			if (now[10] & SMMU_FSR_ALL) {
+ 				space_faulted(&core_space);
+ 			}
