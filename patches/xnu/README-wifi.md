@@ -47,6 +47,50 @@ BAR0 0xffffffff`, `done (asked 10)`. Step 9 stopped (the ID is not 17cb:1103), s
   0290 (io_submap budget, notes.md "io_submap").
 - Why the DBI does not answer and the chip is not detected: notes.md section 16 (part 2, open).
 
+## 0262-negroni-wlan-power-up.patch
+
+File: `bsd/dev/negroni_wifi.c` only (survey steps 4, 6, 7, 8; slop lines, changed in our patch).
+Made in `out/kernel/tree-wifi2` (patched-tree.sh, commit after 0261). Sources: the phone's kernel
+(out/src/op-kernel e9da592: `drivers/pci/controller/pci-msm.c`, `cnss2/power.c`, `cnss2/pci.c`),
+`out/live.dts`, the vendor `waipio-pcie.dtsi`, Linux `pcie-qcom.c`, `pinctrl-sm8450.c`, `gcc-sm8450.c`.
+It runs only in the opt-in write steps (`negroniwifi>=6` or `negroniwlan>=1`); the default
+`negroniwifi=4` gets only one more read line in step 4.
+
+| Step | Change | Source |
+|---|---|---|
+| 4 | also prints PARF DBI base (0x350/0x354), slave space size (0x358/0x35c), ATU base (0x634/0x638) as ABL left them; PARF/PHY mapped once (step 7 reuses them) | read only |
+| 6 | GPIO95 CLKREQ# -> function 1 `pcie0_clkreqn`, 2 mA, pull-up | live.dts `pcie0_clkreq_default`, pinctrl-sm8450.c PINGROUP(95) |
+| 6 | BT_EN (GPIO81) low -> 100 ms before WLAN_EN | cnss2 power.c `cnss_select_pinctrl_enable` |
+| 6 | XO_CLK GPIO204 high, 200 us, WLAN_EN high, 1 ms + 5 ms, XO_CLK low (eGPIO pin: bit 12 claims it for the TLMM) | cnss2 power.c:819-904 `cnss_set_xo_clk_gpio_state`, live.dts `qcom,xo-clk-gpio` |
+| 7 | DBI/iATU decode, recipe 0 (default, vendor): after the core BCR, PARF 0x350 = 0, 0x358 = 0x4000000, ATU base untouched; recipe 1 (`negroniwifi_dbi=1`, Linux): DBI 0x60000000, ATU 0x60001000, 0x358 = 0, 0x35c = 0x80000000 | pci-msm.c:4394/4422 + DT `qcom,slv-addr-space-size`; pcie-qcom.c:440-465 |
+| 7 | after the PHY: reads the root port DBI ID, LNKCAP, ELBI SYS_STTS; ID 0xffffffff -> stop | pci-msm.c reads LNKCAP before PERST |
+| 8 | LNKCTL2 target speed Gen2 (2.5/5 GT/s) | cnss2 pci.c `cnss_pci_enumerate` (QCA6490 "link issues if it boots up with Gen3") |
+| 8 | link = LNKSTA DLLLA and ELBI XMLH_LINK_UP; up to `negroniwifi_tries` (default 3, 1..10) tries: PERST low + LTSSM_EN off, 100 ms, PERST high, 1 ms, LTSSM_EN, 1 s wait | pci-msm.c `msm_pcie_link_train`, cnss2 LINK_TRAINING_RETRY_MAX_TIMES 3 |
+
+Why recipe 0 is the default [V source, I effect]: it is what the phone's own kernel does after the
+core reset (the same BCR the survey pulses in step 7), so the reset value of the ATU base is the one
+the vendor uses with its iATU at 0x60001000. The 0120 code wrote Linux's DBI/ATU addresses without
+Linux's slave-space size; then the DBI is not decoded, which matches the photo (all reads
+0xffffffff). If recipe 0 still reads 0xffffffff at step 7, boot once with `negroniwifi_dbi=1`.
+
+New log lines (`NEGRONI WIFI:`):
+- `4 PARF DBI base H:L, slave space H:L, ATU base H:L` (only when CFG AHB runs at step 4)
+- `6 CLKREQ GPIO95 cfg 0x.. (function 1, pull-up), PERST low, WLAN_EN low`
+- `6 BT_EN is low: wait 100 ms before WLAN_EN (cnss2 PMU sequencing)`
+- `6 XO_CLK GPIO204 pulsed around WLAN_EN (cfg 0x..)`
+- `6 WLAN_EN out 1, PERST out 0, XO_CLK out 0, SW_CTRL in N, BT_EN in N, CLKREQ in N`
+- `7 vendor|Linux recipe (negroniwifi_dbi=N): DBI base .., slave space .., ATU base ..`
+- `7 root port DBI ID 17cb:xxxx, LNKCAP 0x.., ELBI SYS_STTS 0x..` or `7 stop: the DBI does not answer ...`
+- `8 root port class 0x60400.., buses 0x10100, LNKCTL2 0x..2, iATU0 0x4/0x80000000`
+- `8 try N: link UP|DOWN: LNKSTA 0x.. (gen G xW), ELBI 0x.. (state 0x.. NAME), LTSSM 0x..`
+
+Reading the step 8 state [I]: DETECT_QUIET/DETECT_ACT = the chip's receiver is not seen (power,
+WLAN_EN/XO_CLK, PERST or refclk/CLKREQ); POLL_* or CFG_* = the chip is seen but training fails
+(PHY tuning, speed); L0 (0x11) with DLLLA = link up. [I] Not done yet: the vendor PHY table differs
+from 0120's in 3 RX values (0x0e3c 0x12 vs 0x16, 0x0e40 0x01 vs 0x04, 0x10d8 0x0f vs 0x07); the PCIe PHY
+LDOs (pm8350 l5/l6, vendor DT vreg-0p9/1p8) are not voted (UFS/USB use the same LDOs, so ABL leaves
+them on [I]); no interconnect (pcie_noc) vote.
+
 ## 0261-negroni-wlan-mhi-fw.patch
 
 Stage 1 of the driver: claim BAR0, choose the firmware, download it over MHI (BHI + BHIe), reach

@@ -817,3 +817,33 @@ Patches (2026-10-25, regenerated with scripts/kernel/patched-tree.sh in out/kern
   (2) GPIO95 CLKREQ# is not muxed to pcie0_clkreqn (func 1, pull-up; live.dts pcie0_clkreq_default).
   (3) cnss2 drives XO_CLK GPIO204 high >= 100 us before WLAN_EN, then low 2-5 ms after (power.c:819-904);
   the survey never drives it. (4) cnss2 waits 100 ms after BT_EN off before WLAN_EN (power.c:934).
+
+## 21. Wi-Fi PCIe power-up fixes (2026-10-25, io-fix agent part 2; patch 0262, details: patches/xnu/README-wifi.md "0262")
+
+- [V] Photo 2026-10-25: step 7 PHY ready (PCS_STATUS1 0x86), step 8 LNKSTA read 0xffffffff, PARF_LTSSM 0x180
+  (LTSSM_EN + state 0 DETECT_QUIET), step 9 bus 1 ID 0xffffffff.
+- [V source] DBI decode: Linux pcie-qcom.c:440-465 writes PARF 0x350/0x354 (DBI) and 0x634/0x638 (ATU) as CPU
+  physical addresses AND 0x358 = 0, 0x35c = 0x80000000 (slave space). The phone's kernel (pci-msm.c:4394/4422,
+  after the core BCR in msm_pcie_clk_init) writes 0x350 = 0 and 0x358 = qcom,slv-addr-space-size 0x4000000 and
+  never the ATU base (vendor DT iATU at 0x60001000). Slop 0120 wrote the Linux addresses without the size.
+  [I] That leaves the DBI undecoded = every DBI/config read 0xffffffff. 0262: vendor recipe by default,
+  `negroniwifi_dbi=1` = the complete Linux recipe.
+- [V source] cnss2 (power.c:819-960) for QCA6490: XO_CLK GPIO204 (live.dts qcom,xo-clk-gpio) high 100-200 us
+  before WLAN_EN, WLAN_EN, 1 ms, XO_CLK held 2-5 ms more, then low; with BT_EN (GPIO81) low a 100 ms wait before
+  WLAN_EN. GPIO204 is an eGPIO pin: TLMM ctl bit 12 claims it (pinctrl-sm8450.c egpio_enable 12, present 11).
+- [V source] GPIO95 = CLKREQ# (function 1 pcie0_clkreqn, pull-up, live.dts pcie0_clkreq_default); slop never muxed it.
+- [V source] cnss2 pci.c cnss_pci_enumerate sets the QCA6490 RC to Gen2 first and retries link training 3 times.
+- [V source] GCC PCIe0 branch/vote registers in slop match Linux gcc-sm8450.c and vendor gcc-waipio.c (CLKREF_EN 0x9c004).
+- [V source] The iATU programming (CFG0 type 4, target bus << 24) matches pci-msm.c msm_pcie_iatu_config.
+- [I] Open: vendor PHY table differs in 3 RX values; PCIe PHY LDOs (pm8350 l5/l6) and pcie_noc not voted.
+- Sources fetched (sparse, git-ignored): out/src/op-kernel drivers/pci/controller/pci-msm.c,
+  drivers/clk/qcom/gcc-waipio.c; out/src/wlan-linux drivers/pci/controller/dwc/pcie-qcom.c, pcie-designware*,
+  drivers/phy/qualcomm/phy-qcom-qmp-pcie.c, drivers/clk/qcom/gcc-sm8450.c.
+- [V] Build 2026-10-25 (`kernel-wifi2b`; the first `kernel-wifi2` run skipped 0262 because the patch held a
+  Finder .DS_Store binary hunk: regenerate patches with `git diff A B -- <files>`): 
+  `out/kernel/local-20261025-131141/kernel.development.negroni` (sha256 efb378bd...), patch-report: all 28
+  patches/xnu applied (0200-0262, 0270, 0271, 0290), only the 4 usual dxb skips. kernel.macho points to it.
+  [I] Not booted. Phone test (owner approval first; the survey writes GCC/TLMM/RPMh/PCIe):
+  `negroniwifi=10` (+ `negroniwlan=2` only after step 10 passed once). Expect the 0262 lines of README-wifi;
+  the key lines are `7 root port DBI ID 17cb:....` (not ffff) and `8 try N: link UP ... state 0x11 L0`, then
+  `9 bus 1 device 17cb:1103`. If step 7 stops with "DBI does not answer": `negroniwifi_dbi=1`.
