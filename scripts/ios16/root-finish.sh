@@ -7,9 +7,12 @@
 # 2. removable Apple apps from /private/var/staged_system_apps into /Applications
 #    (as external/slop/negroni-ios/tools/install-staged-apps.sh)
 # 1b. our changes: scripts/ios16/root-tweaks-extra.py (MIGRATION=skip|once)
-# 1d. Bold Text rollback default: keep EnhancedTextLegibilityEnabled off pending diagnosis.
-# 1c. SSH over USB + ue0 network service: scripts/net/root-add-ssh.sh (SSH=1; default on when
+# 1c. Bold Text off: scripts/ios16/root-tweaks-boldtext.py (Bold Text on = SpringBoard crash loop
+#     in CoreImage's GL backend, docs/boldtext-crash.md)
+# 1d. SSH over USB + ue0 network service: scripts/net/root-add-ssh.sh (SSH=1; default on when
 #     out/ssh/ios is built, SSH=0 to leave it out)
+# 1e. audio HAL plug-in + VirtualAudio back: scripts/audio/root-add-audio.sh (AUDIO=1; default off)
+# 1f. OpenGL ES driver plugin NegroniGL.bundle: scripts/gpu/root-add-negronigl.sh (NEGRONIGL=1; default off)
 # 3. remove host metadata folders (macOS creates .fseventsd/.Spotlight-V100 on mount)
 set -euo pipefail
 R=$1
@@ -19,9 +22,11 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 
 python3 "$REPO/external/slop/tools/sweet-root-tweaks.py" "$R"
 python3 "$REPO/scripts/ios16/root-tweaks-extra.py" "$R" --migration "${MIGRATION:-skip}"   # our changes (jobs, feature flag)
-python3 "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$R"                    # safe startup default while Bold Text is under investigation
+python3 "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$R"                    # Bold Text off (docs/boldtext-crash.md)
 if [ -z "${SSH:-}" ] && [ -x "$REPO/out/ssh/ios/dropbearmulti" ]; then SSH=1; fi
 SSH=${SSH:-0} sh "$REPO/scripts/net/root-add-ssh.sh" "$R"
+AUDIO=${AUDIO:-0} sh "$REPO/scripts/audio/root-add-audio.sh" "$R"   # docs/audio-plan.md stage 0
+NEGRONIGL=${NEGRONIGL:-0} sh "$REPO/scripts/gpu/root-add-negronigl.sh" "$R"   # GL driver plugin (docs/gpu-userland.md)
 
 n=0
 for app in "$R"/private/var/staged_system_apps/*.app; do

@@ -52,7 +52,7 @@ never light the panel. Patches 0250/0251 (DCS 0x51) are not in this build. Owner
 | GPU kernel: IOSurface import + present | `patches/xnu/0230-0231`, `docs/gpu-abi.md` | kernel build |
 | GPU userland: Mesa freedreno A730 + EAGL dylib | `userland/negronigl/`, `scripts/gpu/`, `docs/gpu-userland.md` | kernel GPU work |
 | SSH over USB + Mac internet sharing | `userland/ssh/`, `scripts/net/`, `docs/usb-network.md` | root rebuild |
-| Audio plan + ADSP firmware + ADSP start | `docs/audio-plan.md`, `scripts/audio/`, `patches/xnu/0240` | kernel build |
+| Audio: stage 0 HAL plug-in (built), ADSP start 0240 (builds), GPR/TFA plan | `docs/audio-plan.md`, `userland/audio/`, `scripts/audio/`, `patches/xnu/0240` | phone test (root `AUDIO=1`, `negroniadsp=1`) |
 | Brightness (DCS 0x51) + display sleep | `patches/xnu/0250-0251` (done) | kernel build |
 | Power off (PSCI SYSTEM_OFF) + `poweroff` command | `patches/xnu/0211` (done; panic stays on screen: `negronipanic=0` default, owner) | kernel build |
 | **Metal on Vulkan (Turnip)**: main GPU goal | `userland/metal/`, `scripts/metal/`, `docs/metal-plan.md` | GPU kernel ABI + Turnip build |
@@ -104,7 +104,7 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 | GPU | Adreno 730 (Mesa chip id 0x07030001, "FD730"); slop's 22-step bring-up ladder passed once | [gpu-plan.md](gpu-plan.md) |
 | Reboot reason | PMK8350 (SPMI SID 0) SDAM 0x7100 + 0x48 = reg 0x7148, bits 1-7 (value << 1): bootloader = 2, recovery = 1; then PSCI SYSTEM_RESET. The imem restart_reason (0x146aa65c) does NOT work | Android DT `qcom,reboot-reason` [V], slop NOTES:55 |
 | USB | kernel `negroniusb=2` = CDC-ECM device: phone 192.168.7.2, Mac 192.168.7.1, host MAC 02:00:5e:77:ee:01; console as UDP to :5140; iOS sees `ue0` | `scripts/debug/usblog.sh` [V] |
-| Audio | AudioReach (GPR/q6apm, not APR); 2x TFA9874 on i2c13 (0x34/0x35, reset gpio50/51) via TERTIARY_TDM_RX_0; WCD9385 over SoundWire; ADSP remoteproc@30000000, PAS id 1, mem 0x85e00000 size 0x2100000, smp2p pid 2; ADSP firmware in `modem_a` | slop NOTES "audio plan" [V DT] |
+| Audio | AudioReach (GPR/q6apm, not APR); 2x TFA9874 on i2c13 (0x34/0x35, reset gpio50/51, active-high) on **TERT MI2S (I2S, 3.072 MHz BCLK), not TDM**; WCD9385 over SoundWire; ADSP remoteproc@03000000, PAS id 1, carveout **0x85700000 size 0x2800000** (node name says 85e00000), smp2p pid 2; ADSP firmware in `modem_a` | live DT, `out/audio-src/odm/etc/resourcemanager.xml:518` [V]; [audio-plan.md](audio-plan.md) |
 | Wi-Fi | QCA6490 on PCIe0 (`qcom,cnss-qca6490`), PCI 17cb:1103 expected; MSI via GICv3 ITS; no driver in any port | `out/live.dts:13840`, [wifi-plan.md](wifi-plan.md) [V DT] |
 
 ## 4. iOS userland facts
@@ -511,3 +511,37 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   stage 1 start: negroni_wlan.h, negroni_wifi.c calls negroni_wlan_start() with negroniwlan=2 after survey step 10,
   negroni_ufs_wlan_area_read() (32 MiB area before the ADSP area: userdata blocks N-19457..N-11266), bsd/conf/files
   entry. negroni_wlan.c is not written yet, so the tree does not link.
+
+## 17. Audio (audio agent, 2026-10-25; details: docs/audio-plan.md)
+
+- [V] 20H392 HAL plug-in paths: /System/Library/Audio/Plug-Ins/HAL, /Library/Audio/Plug-Ins/HAL, /Library/Apple/Audio/Plug-Ins/HAL (shared cache strings). Apple drivers there are plain arm64 bundles, CFPlugInTypes 443ABAB8-...; BasebandVoice.driver's table = NULL + 22 function pointers (same as the macOS SDK AudioServerPlugInDriverInterface).
+- [V] mediaserverd SIGABRT (logs/symb-mediaserverd.log) = std::terminate in a dispatch block (uncaught exception); the block is not in the backtrace.
+- [V] Stage 0 plug-in `userland/audio/build.sh`: arm64, minos 16.0, ad hoc signed, layout check vs SDK 23/23, host test PASS; root hook `AUDIO=1 scripts/audio/root-add-audio.sh` (via root-finish.sh, default off), tested on a fake root. Not on the phone yet.
+- [V] Speaker path on Android: PAL `MI2S-LPAIF-RX-TERTIARY` 2 ch 48 kHz S24, VI `MI2S-LPAIF-TX-TERTIARY`; BCLK 48000 x 2 x 32 = 3.072 MHz (AK msm_common.c:443-458); the TDM tert node (1.536 MHz) is not used. Speaker data on SD1 = GPIO124, VI on SD0 = GPIO122 (ACDB I2S sink iid 0x425A).
+- [V] GPR: header 24 bytes (word 0 = 0x1860 for header only), domains APPS 3 / ADSP 2, ADSP ports APM 1, PRM 2, AMDB 3; DT ports 3/7/0x17 are APPS-side. SPF ready = APM_CMD_GET_SPF_STATE 0x01001021 -> 0x02001007 status 1. PRM clock 0x104 (TER MI2S IBIT) via PARAM_ID_RSC_AUDIO_HW_CLK 0x0800102C.
+- [V] Phone ACDB (odm/etc/acdbdata/acdb_cal.acdb) speaker device graph: SAL -> NXP TFA RX 0x1700B911 (dynamic CAPI, libtfadsp_rx.so) -> SPLITTER -> LOG -> I2S_SINK 0x0700100A; no graph uses TDM_SINK 0x0700100E.
+- [V] TFA9874 has no on-chip DSP; the stock kernel driver never talks to the ADSP; register writes alone start it. Reset GPIO is active-high (1, 5 ms, 0, 5 ms). Container odm/firmware/tfa98xx.cnt: 0x34 slot 0, 0x35 slot 1, profiles receiver/speaker/calibrate.cal. Never write MTP (0xF0..).
+- [I] Without the NXP module only the on-chip protections stay: keep the gain low (TDMSPKG <= 3 for the first test).
+- [V] 0240 review vs Linux (smem, smp2p, qcom_aoss, mdt_loader, PAS SCM): layouts and order match. Fix: RPMh votes retry EBUSY up to 1 s (rail_vote), since touch/Wi-Fi share the RPMh try-lock. Full build OK: out/kernel/local-20261025-102834 (kernel sha256 58fffc0c..., all 19 patches/xnu applied).
+- [V] Root image 16 GiB (root-macos.sh SIZE=16g): the firmware areas at the end of userdata do not overlap HFS+.
+
+## 17. GPU kernel round 2 (2026-10-25; patches 0232-0234, details: patches/xnu/README-gpu-kernel.md sections 8-11)
+
+- [V] Local full build with 0232-0234: `out/kernel/local-20261025-103035/kernel.development.negroni`
+  (sha256 `b88d1274...`), patch-report: every 02xx patch applied (0200-0260), only the 4 usual dxb skips.
+  Not booted. Source tree with one commit per patch: `out/kernel/tree-gpu2`.
+- [V] backboardd makes two 1125x2436 BGRA framebuffers (bpr 4608, 11239424 bytes) and swaps them in turn,
+  layer 0 alone, full canvas (`logs/usblog.log` 2026-10-24 20:10).
+- [V] SM8450 SDE in the live DT: MDSS 0x0ae00000 len 0x84000; SSPP VIG0-3 +0x5000..0xb000, DMA0-3
+  +0x25000..0x2b000; CTL0-5 +0x16000..0x1b000; INTF1 = DSI; splash 0xb8000000 + 0x2b00000; apps SMMU
+  `qcom,handoff-smrs = <0x2800 0x402>` (display stream handed over by the bootloader) (`out/live.dts`).
+- [I] SDE register offsets / CTL_FLUSH bits are from the Linux/Qualcomm driver layout (no local copy;
+  ios-s9 used the same offsets on SDM845 [V there]). The new boot log lines `NEGRONI FB: DPU ...` show the real values.
+- [V] 3D core SMMU context is 2 (slop NOTES boot 0113); Linux's per-process tables need the GPU in context 0
+  plus a TrustZone aperture call. Decision: 0233 switches TTBR0 from the CPU while the GPU is idle, behind
+  `negronigpu_pt=1` (default 0 = shared tables).
+- [I] Under the hypervisor (stage 2 on) DC IVAC at EL1 also cleans; the kernel only uses DC CVAC / DC CIVAC.
+- New boot-args (all default off): `negronigpu_pt=1`, `negronifb_zerocopy=1` (needs `negronifb_noconsole=1`,
+  no `negronibadge`, no `negronifb_shift`); `negronifb_dpuprobe=0` skips the read-only DPU dump.
+- ABI for user space: msm selector 0x49 = `struct redwood_drm_userptr` (as `ngl_abi.h` asked);
+  VA_START/VA_SIZE differ by mode (docs/gpu-abi.md sections 4, 5, 6, 8).

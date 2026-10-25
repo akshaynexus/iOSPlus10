@@ -1,8 +1,8 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 1897319..590cde5 100644
+index 77dae55..8de128a 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -111,6 +111,7 @@ bsd/dev/negroni_touch.c			standard
+@@ -112,6 +112,7 @@ bsd/dev/negroni_touch.c			standard
  bsd/dev/negroni_cpufreq.c		standard
  bsd/dev/negroni_adreno.c		standard
  bsd/dev/negroni_wifi.c			standard
@@ -12,10 +12,10 @@ index 1897319..590cde5 100644
  bsd/dev/negroni_usb.c			standard
 diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
 new file mode 100644
-index 0000000..4c63e52
+index 0000000..be03d77
 --- /dev/null
 +++ b/bsd/dev/negroni_adsp.c
-@@ -0,0 +1,955 @@
+@@ -0,0 +1,978 @@
 +/*
 + * NEGRONI (SM8450) audio DSP (ADSP, the Hexagon in LPASS) start: stage (a) of the iOSPlus10
 + * audio plan (docs/audio-plan.md). UNTESTED ON HARDWARE.
@@ -530,11 +530,33 @@ index 0000000..4c63e52
 +
 +/* ---- rails, AOP ---- */
 +
++/*
++ * negroni_rpmh.c has one TCS behind a try-lock: it answers EBUSY while another thread (touch,
++ * Wi-Fi, GPU init run at the same time as this thread) sends. Retry for up to 1 s, and say so
++ * when a vote (or the drop of a vote) does not go through.
++ */
++static int
++rail_vote(const char *res, unsigned level)
++{
++	int error = EBUSY;
++
++	for (int i = 0; i < 200 && error == EBUSY; i++) {
++		error = negroni_rpmh_arc_vote(res, level);
++		if (error == EBUSY) {
++			IOSleep(5);
++		}
++	}
++	if (error != 0) {
++		say("RPMh vote %s level %u failed: errno %d", res, level, error);
++	}
++	return error;
++}
++
 +static bool
 +step_rails(void)
 +{
 +	announce("vote RPMh lcx.lvl and lmx.lvl to level 384 (ADSP proxy votes)");
-+	if (negroni_rpmh_arc_vote("lcx.lvl", 384) != 0 || negroni_rpmh_arc_vote("lmx.lvl", 384) != 0) {
++	if (rail_vote("lcx.lvl", 384) != 0 || rail_vote("lmx.lvl", 384) != 0) {
 +		say("stop: rail vote failed");
 +		return false;
 +	}
@@ -664,6 +686,7 @@ index 0000000..4c63e52
 +		}
 +	}
 +	clean_dcache((vm_offset_t)page, PAGE_SIZE, FALSE);      /* TrustZone reads memory, not our cache */
++	/* page stays allocated: TrustZone may read it until auth and reset (Linux frees it after). */
 +	announce("hand the ADSP metadata to TrustZone (PAS init image, id 1)");
 +	if (scm("PAS init image (adsp)", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_ADSP,
 +	    kvtophys(page), 0, &answer) != 0 || answer != 0) {
@@ -878,8 +901,8 @@ index 0000000..4c63e52
 +			    value & DSP_STOP_ACK ? " STOP-ACK" : "");
 +			last = value;
 +			if ((value & DSP_HANDOVER) && rails_on && unvote) {
-+				(void)negroni_rpmh_arc_vote("lcx.lvl", 0);
-+				(void)negroni_rpmh_arc_vote("lmx.lvl", 0);
++				(void)rail_vote("lcx.lvl", 0);
++				(void)rail_vote("lmx.lvl", 0);
 +				rails_on = false;
 +				say("proxy rail votes dropped (handover)");
 +			}
@@ -904,8 +927,8 @@ index 0000000..4c63e52
 +	/* Linux drops the proxy votes on handover; wait up to 2 s more for it. */
 +	for (uint32_t t = 0; t < 2000 && rails_on && unvote; t++) {
 +		if (smp2p_value(theirs, "slave-kernel", &value) && (value & DSP_HANDOVER)) {
-+			(void)negroni_rpmh_arc_vote("lcx.lvl", 0);
-+			(void)negroni_rpmh_arc_vote("lmx.lvl", 0);
++			(void)rail_vote("lcx.lvl", 0);
++			(void)rail_vote("lmx.lvl", 0);
 +			rails_on = false;
 +			say("+%u ms: handover (slave-kernel = %#x): proxy rail votes dropped", ms + t, value);
 +		}
@@ -940,8 +963,8 @@ index 0000000..4c63e52
 +		pas_shutdown("a step after PAS init failed");
 +	}
 +	if (failed && rails_on) {
-+		(void)negroni_rpmh_arc_vote("lcx.lvl", 0);
-+		(void)negroni_rpmh_arc_vote("lmx.lvl", 0);
++		(void)rail_vote("lcx.lvl", 0);
++		(void)rail_vote("lmx.lvl", 0);
 +	}
 +	printf("NEGRONI ADSP: done (asked 1..%u, %s at %u)\n", last_step, failed ? "stopped" : "complete",
 +	    MIN(step, last_step));
@@ -1101,7 +1124,7 @@ index d46182f..34d7fe3 100644
  int negroni_rpmh_lookup(const char *res, uint32_t *address);
  
 diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
-index 76b4d9d..109ff93 100644
+index cd4cf27..8a9b3ef 100644
 --- a/bsd/dev/negroni_ufs.c
 +++ b/bsd/dev/negroni_ufs.c
 @@ -56,6 +56,7 @@ extern void negroni_touch_init(void);
@@ -1112,7 +1135,7 @@ index 76b4d9d..109ff93 100644
  extern void negroni_probe_menu(void);
  extern void negroni_usb_probe(void);
  
-@@ -742,6 +743,7 @@ negroni_ufs_init(void)
+@@ -763,6 +764,7 @@ negroni_ufs_init(void)
  	negroni_probe_menu();
  	negroni_adreno_init();
  	negroni_wifi_init();
@@ -1120,7 +1143,7 @@ index 76b4d9d..109ff93 100644
  	negroni_keys_init();
  	negroni_touch_init();
  	negroni_usb_probe();
-@@ -927,6 +929,50 @@ negroni_fw_load(void)
+@@ -948,6 +950,50 @@ negroni_fw_load(void)
  	}
  }
  

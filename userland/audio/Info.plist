@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.iosplus10.audio</string>
+	<key>CFBundleName</key>
+	<string>NegroniAudio</string>
+	<key>CFBundleExecutable</key>
+	<string>NegroniAudio</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>MinimumOSVersion</key>
+	<string>16.0</string>
+	<!-- AudioServerPlugIn type -> our factory (NegroniAudio.c); layout as HackiOS audio_plugin.plist -->
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>82CA15D0-D2F4-4A30-84F6-7924BBC03285</string>
+		</array>
+	</dict>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>82CA15D0-D2F4-4A30-84F6-7924BBC03285</key>
+		<string>NegroniAudio_Create</string>
+	</dict>
+</dict>
+</plist>
