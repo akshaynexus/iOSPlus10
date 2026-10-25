@@ -3,7 +3,7 @@
 #   cmake -S userland/metal -B out/metal/build -G Ninja -DCMAKE_TOOLCHAIN_FILE=userland/metal/cmake/ios-arm64.cmake \
 #         -DNMTL_BRIDGE_LIB=out/metal/bridge/ios/libnative_metal_bridge.a -DNMTL_FLAME_SRC=out/metal/src/flame/phone/metal2
 #   ninja -C out/metal/build
-# Targets: vkprobe and metalprobe always; the plugin (NegroniMetal, a Mach-O bundle) and m2vtest when the bridge
+# Targets: vkprobe, metalprobe, carenderprobe and layerprobe always; the plugin (NegroniMetal, a Mach-O bundle) and m2vtest when the bridge
 # static library and the frontend sources exist.
 cmake_minimum_required(VERSION 3.24)
 project(NegroniMetal LANGUAGES C CXX OBJC OBJCXX)
@@ -38,6 +38,15 @@ add_executable(metalprobe probes/metalprobe.m)
 target_compile_options(metalprobe PRIVATE ${common_warn} -O2 -fobjc-arc)
 target_link_libraries(metalprobe PRIVATE "-framework Foundation" "-framework Metal" "-framework IOSurface"
   "-framework IOKit" "-framework CoreFoundation")
+
+# ---- stage 4a: CoreAnimation over the device in a test process: CARenderer vs renderInContext:, CAMetalLayer drawables.
+# Copied from Chlorophyll (MIT, probes/LICENSE.Chlorophyll); built without ARC, as Chlorophyll builds them.
+foreach(p carenderprobe layerprobe)
+  add_executable(${p} probes/${p}.m)
+  target_compile_options(${p} PRIVATE ${common_warn} -Wno-sign-compare -O1 -g -fno-objc-arc)
+  target_link_libraries(${p} PRIVATE "-framework Foundation" "-framework Metal" "-framework IOSurface" "-framework IOKit"
+    "-framework QuartzCore" "-framework CoreGraphics" "-framework CoreFoundation")
+endforeach()
 
 # ---- the plugin bundle
 if(NMTL_BRIDGE_LIB AND EXISTS "${NMTL_BRIDGE_LIB}" AND EXISTS "${NMTL_FLAME_SRC}/NativeBridgeMetalFrontend.mm")

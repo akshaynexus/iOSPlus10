@@ -302,6 +302,27 @@ Conclusion:
 5. Turnip: test, then port, `ir3-round-default` and `ir3-shift-split` (MIT) and Pong's heap clamp. Copy Chlorophyll's CARenderer
    and CAMetalLayer probes and the all-metallib corpus sweep. Copy `dsc-objc-gap.py` for the iOS 26 phase.
 
+## Ported (2026-10-25)
+
+Action 1 and the probe part of action 5. Host only: nothing ran on the phone. Build (`scripts/metal/build.sh`) exit 0,
+`check-imports.py` PASS (0 missing; QuartzCore and CoreGraphics now checked too), `host-plugin-test.sh` 12 of 12 PASS.
+Details and the table: `docs/metal-plan.md`, section "CoreAnimation fixes from Chlorophyll".
+
+| Item | State |
+|---|---|
+| 1.1 `CA_USE_CGTEXTUREDATA=0` | done, plugin. [V] 20H392 QuartzCore reads it in `CA::Render::create_image` (0x188316d38), once, unset = on. [I] An image made before the device opens keeps CA's value |
+| 1.2 `targetDeviceInfo`, `dedicatedMemorySize`, `sharedMemorySize` | done, flame/0002 (+ `recommendedMaxWorkingSetSize`). [V] `-[_MTLDevice targetDeviceInfo]` = NULL on 20H392; Metal's `MTLPipelineLibraryBuilder::newLibraryWithFile` reads +0x10 without a check (0x181a3f61c) |
+| 1.3 IOSurface seed bump | done, flame/0002; off in backboardd |
+| 1.4 DontCare -> clear | done, flame/0002; colour attachments that are not IOSurfaces |
+| 1.5 skip refused draws | done, flame/0002; also a nil/refused pipeline (its draws are skipped until a pipeline is accepted). Refused render pass begins and other encoder calls still fail the command buffer |
+| 1.6 refuse in `+allocWithZone:` | skipped (not in this round) |
+| 1.7 control files readable in the sandbox | done, plugin: `BUNDLE/off`, `BUNDLE/clients`, `BUNDLE/clients.local`; fail closed on an unreadable `BUNDLE/off`; strikes fall back to the cache directory, none writable = no device. [I] An app that the sandbox hides /var/db from does not see `/var/db/negronimetal/off` or `strikes/gpu-lost`: the bundle's `off` is the switch for those |
+| 1.8 GPU-lost watchdog | done, plugin (backboardd). Trigger: pending command buffers, no completion for 10 s. It does not count failed command buffers, and it does not exit unless `NEGRONIMETAL_WATCHDOG_EXIT=1` |
+| 6 probes + sweep | done: `userland/metal/probes/{carenderprobe.m,layerprobe.m,layerprobe.metal,metallib-sweep.sh}` (copied with the MIT notice `LICENSE.Chlorophyll`), `phone-test.sh 3b` (sweep) and `4a` (probes). `corpus.py` not copied: it drives Chlorophyll's AIR->NIR->ir3 tools, which we do not build |
+
+Licence note: Chlorophyll has no licence file of its own with a copyright line (its `LICENSE.hackios-userland` covers the
+hackios parts). Our notice names "the Chlorophyll authors" [V: README "Licence", SPDX MIT lines].
+
 ## Sub-survey of the other repos (one line each)
 
 - UniXNU (bd127c0): `patches/mesa/turnip-darwin-kmd.patch` has host import, an 8-fence limit and the sandbox grant (zzw).

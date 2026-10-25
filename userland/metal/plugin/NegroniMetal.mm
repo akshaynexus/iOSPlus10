@@ -13,11 +13,24 @@
  * the dead-man switch and the paths are ours.
  *
  * Safety rules (bergamota docs/METAL_ADRENO630.md (a)/(h): a half-working device makes CoreAnimation draw nothing):
- *   - A process gets a device only when it is listed in /var/db/negronimetal/clients ("*" = all, "-NAME" = never NAME).
- *     The default file (scripts/metal/root-add-metal.sh) lists only the probes, so backboardd stays on the GL path.
- *   - /var/db/negronimetal/off (any content) disables the plugin for everyone.
+ *   - Control files live in the bundle too (Chlorophyll plugin/chlorophyll_plugin.m, MIT: every process that loads the plugin
+ *     can read its bundle; a sandboxed app cannot read /var/db, and an unreadable kill switch would fail open):
+ *       BUNDLE/off            (any content) no device in any process: the kill switch that reaches sandboxed apps too
+ *       BUNDLE/clients        the test tools (scripts/metal/build.sh stages it; every push replaces it)
+ *       BUNDLE/clients.local  the owner's list for sandboxed apps (not staged, so a push keeps it)
+ *     and /var/db/negronimetal/{off,clients} as before, for the processes that can read them.
+ *   - A process gets a device only when one of the clients files lists it ("*" = all, "-NAME" = never NAME; a "-NAME" in
+ *     any file wins). The staged files list only the probes, so backboardd stays on the GL path.
+ *   - Fail closed: when BUNDLE/off cannot be checked (stat fails with anything but ENOENT), the process gets no device.
+ *     /var/db/negronimetal/off, when the sandbox hides it (EPERM/EACCES), leaves the decision to BUNDLE/off.
  *   - Dead-man: each open writes a strike file for the process and clears it after 30 s alive. Two strikes in a row
  *     (two crashes inside 30 s after the device opened) disable the plugin for that process until the file is removed.
+ *     Strikes live in /var/db/negronimetal/strikes, else (sandbox) in the process's own cache directory; a process that
+ *     can write neither gets no device.
+ *   - GPU watchdog (backboardd): command buffers pending and none completed for NEGRONIMETAL_WATCHDOG_S seconds (default
+ *     10): it logs, writes /var/db/negronimetal/strikes/gpu-lost (no device for new processes until it is removed) and
+ *     stops handing out the device in this process. No crash; NEGRONIMETAL_WATCHDOG_EXIT=1 adds _exit(0), so launchd
+ *     restarts backboardd without a device (Chlorophyll inject/bgmtl_inject.m does that).
  *   - Any failure (no Turnip, no GPU, exception) returns nil: Metal's _MTLRegisterDevices skips a nil device
  *     (Metal 20H392 0x181b14584: cbz x0 after initWithAcceleratorPort:), so the process takes its CPU/GL paths.
  * Log: /dev/console and /var/db/negronimetal/metal.log (when it exists), lines "NMTL[pid name]: ...".
@@ -27,6 +40,7 @@
 #import <objc/runtime.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <string.h>
@@ -129,34 +143,115 @@ static void missing(const char *cls, const char *sel)
 @end
 
 /* ---- gate ---- */
-static bool listed(void)
+/* The plugin bundle's directory: the control files every process can read (set before the gate runs). */
+static char g_bundle[512];
+
+/* stat() of a control file: 1 = exists, 0 = does not exist, -1 = cannot tell (errno kept in *err) */
+static int ctl_state(const char *path, int *err)
 {
-	FILE *f = fopen(NMTL_DIR "/clients", "r");
+	struct stat st;
+	if (stat(path, &st) == 0)
+		return 1;
+	*err = errno;
+	return (errno == ENOENT || errno == ENOTDIR) ? 0 : -1;
+}
+
+/* NULL when no kill switch is set, else why there is no device (fail closed: an unreadable BUNDLE/off is "off") */
+static const char *off_reason(char *why, size_t size)
+{
+	char path[600];
+	int err = 0;
+	snprintf(path, sizeof(path), "%s/off", g_bundle);
+	switch (ctl_state(path, &err)) {
+	case 1:
+		snprintf(why, size, "%s exists", path);
+		return why;
+	case -1:
+		snprintf(why, size, "cannot check %s (%s): fail closed", path, strerror(err));
+		return why;
+	}
+	err = 0;
+	switch (ctl_state(NMTL_DIR "/off", &err)) {
+	case 1:
+		snprintf(why, size, "%s exists", NMTL_DIR "/off");
+		return why;
+	case -1:
+		/* the sandbox hides /var/db (EPERM/EACCES): BUNDLE/off, checked above, decides. Anything else: closed. */
+		if (err != EPERM && err != EACCES) {
+			snprintf(why, size, "cannot check %s (%s): fail closed", NMTL_DIR "/off", strerror(err));
+			return why;
+		}
+	}
+	err = 0;
+	if (ctl_state(NMTL_DIR "/strikes/gpu-lost", &err) == 1) {
+		snprintf(why, size, "the GPU watchdog marked the GPU lost (rm %s to re-arm)", NMTL_DIR "/strikes/gpu-lost");
+		return why;
+	}
+	return NULL;
+}
+
+/* One clients file: names separated by blanks or commas, "#" starts a comment, "*" = all, "-NAME" = never NAME.
+ * Returns false when the file cannot be read. */
+static bool read_clients(const char *path, bool *yes, bool *no)
+{
+	FILE *f = fopen(path, "r");
 	if (!f)
 		return false;
-	/* names separated by blanks or commas, "#" starts a comment, "*" = all, "-NAME" = never NAME (wins over "*") */
-	bool yes = false, no = false;
 	char line[512];
 	while (fgets(line, sizeof(line), f)) {
 		line[strcspn(line, "#\r\n")] = 0;
 		char *save = NULL;
 		for (char *name = strtok_r(line, " ,\t", &save); name; name = strtok_r(NULL, " ,\t", &save)) {
 			if (name[0] == '-' && !strcmp(name + 1, getprogname()))
-				no = true;
+				*no = true;
 			else if (!strcmp(name, "*") || !strcmp(name, getprogname()))
-				yes = true;
+				*yes = true;
 		}
 	}
 	fclose(f);
+	return true;
+}
+
+/* Listed in any readable clients file, and denied ("-NAME") in none. No readable file: not listed. */
+static bool listed(void)
+{
+	bool yes = false, no = false;
+	char path[600];
+	snprintf(path, sizeof(path), "%s/clients", g_bundle);
+	read_clients(path, &yes, &no);
+	snprintf(path, sizeof(path), "%s/clients.local", g_bundle);
+	read_clients(path, &yes, &no);
+	read_clients(NMTL_DIR "/clients", &yes, &no);
 	return yes && !no;
 }
 
-/* Dead-man: true when this process may open the GPU now. Strikes live in NMTL_DIR/strikes/<name>. */
-static bool deadman_arm(char *path, size_t size)
+/* The directory for this process's strike file: NMTL_DIR/strikes, else (a sandboxed process cannot write /var/db) its own
+ * cache directory. False when neither is writable. */
+static bool strikes_dir(char *dir, size_t size)
 {
 	mkdir(NMTL_DIR "/strikes", 0777);
 	chmod(NMTL_DIR "/strikes", 0777);
-	snprintf(path, size, NMTL_DIR "/strikes/%s", getprogname());
+	snprintf(dir, size, NMTL_DIR "/strikes");
+	if (access(dir, W_OK) == 0)
+		return true;
+	char cache[400];
+	if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache, sizeof(cache)) == 0)
+		return false;
+	snprintf(dir, size, "%snegronimetal-strikes", cache);
+	mkdir(dir, 0700);
+	return access(dir, W_OK) == 0;
+}
+
+/* Dead-man: true when this process may open the GPU now. Strikes live in <strikes_dir>/<name>. A process that cannot
+ * keep a strike file gets no device: without it, a crash loop would never stop. */
+static bool deadman_arm(char *path, size_t size)
+{
+	char dir[450];
+	if (!strikes_dir(dir, sizeof(dir))) {
+		nlog("dead-man: no writable strikes directory (%s/strikes, cache directory): no Metal device", NMTL_DIR);
+		return false;
+	}
+	snprintf(path, size, "%s/%s", dir, getprogname());
 	int strikes = 0;
 	if (FILE *f = fopen(path, "r")) {
 		if (fscanf(f, "%d", &strikes) != 1)
@@ -167,9 +262,13 @@ static bool deadman_arm(char *path, size_t size)
 		nlog("dead-man: %d unclean starts in a row, no Metal device (rm %s to re-arm)", strikes, path);
 		return false;
 	}
-	if (FILE *f = fopen(path, "w")) {
-		fprintf(f, "%d\n", strikes + 1);
-		fclose(f);
+	FILE *f = fopen(path, "w");
+	bool ok = f && fprintf(f, "%d\n", strikes + 1) > 0;
+	if (f && fclose(f) != 0)
+		ok = false;
+	if (!ok) {
+		nlog("dead-man: cannot write %s: no Metal device", path);
+		return false;
 	}
 	return true;
 }
@@ -363,6 +462,68 @@ static void telemetry_loop(void)
 	});
 }
 
+/*
+ * GPU-lost watchdog (backboardd; the design follows Chlorophyll inject/bgmtl_inject.m and docs/FIXES.md, MIT): once a second it
+ * reads the frontend's progress. When command buffers are pending and none completed for limit_s seconds (and the oldest pending
+ * one is that old), the GPU is taken as lost: one log line, the marker NMTL_DIR/strikes/gpu-lost (no device for new processes:
+ * off_reason), and this process hands out no device from now on. The clock runs only while something is pending, so a display
+ * that is off (no commits) never trips it (Chlorophyll's first version counted from launch and switched Metal off for good).
+ */
+static volatile bool g_gpu_lost;
+static void *watchdog_main(void *arg)
+{
+	const long limit_s = (long)(intptr_t)arg;
+	const bool exit_on_loss = env_num("NEGRONIMETAL_WATCHDOG_EXIT", 0) != 0;
+	uint64_t last_completed = UINT64_MAX;
+	long stalled = 0;
+	for (;;) {
+		sleep(1);
+		uint64_t p[4] = { 0 };
+		native_bridge_metal_progress(p);
+		if (p[1] != last_completed || p[2] == 0) {
+			last_completed = p[1];
+			stalled = 0;
+			continue;
+		}
+		if (++stalled < limit_s || p[3] < (uint64_t)limit_s * 1000000)
+			continue;
+		g_gpu_lost = true;
+		nlog("GPU watchdog: %llu command buffers pending, none completed for %ld s (oldest %llu ms; %llu committed, %llu completed): "
+		     "GPU lost, no Metal device for new processes (rm %s to re-arm)%s",
+		     (unsigned long long)p[2], stalled, (unsigned long long)(p[3] / 1000), (unsigned long long)p[0],
+		     (unsigned long long)p[1], NMTL_DIR "/strikes/gpu-lost", exit_on_loss ? "; exit(0) now" : "");
+		if (FILE *f = fopen(NMTL_DIR "/strikes/gpu-lost", "w")) {
+			fprintf(f, "%s[%d] pending=%llu stalled=%lds committed=%llu completed=%llu\n", getprogname(), getpid(),
+				(unsigned long long)p[2], stalled, (unsigned long long)p[0], (unsigned long long)p[1]);
+			fclose(f);
+		} else {
+			nlog("GPU watchdog: cannot write %s: %s", NMTL_DIR "/strikes/gpu-lost", strerror(errno));
+		}
+		if (exit_on_loss)
+			_exit(0);
+		return NULL;
+	}
+}
+
+static void watchdog_start(void)
+{
+	const long limit_s = env_num("NEGRONIMETAL_WATCHDOG_S", 10);
+	if (limit_s <= 0) {
+		nlog("GPU watchdog off (NEGRONIMETAL_WATCHDOG_S=%ld)", limit_s);
+		return;
+	}
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	pthread_t th;
+	int e = pthread_create(&th, &attr, watchdog_main, (void *)(intptr_t)limit_s);
+	pthread_attr_destroy(&attr);
+	if (e)
+		nlog("GPU watchdog: pthread_create: %d", e);
+	else
+		nlog("GPU watchdog on: %ld s without a completion while command buffers are pending", limit_s);
+}
+
 @interface _MTLDevice : NSObject
 @end
 
@@ -380,12 +541,19 @@ static void telemetry_loop(void)
 	static id device;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
-		if (access(NMTL_DIR "/off", F_OK) == 0) {
-			nlog("%s exists: no Metal device", NMTL_DIR "/off");
+		NSString *bundlePath = [[NSBundle bundleForClass:[NMTL_CLASS class]] bundlePath];
+#ifdef NMTL_HOST_TEST
+		if (const char *b = getenv("NMTL_HOST_BUNDLE")) /* the host test's stand-in for the bundle directory */
+			bundlePath = @(b);
+#endif
+		strlcpy(g_bundle, bundlePath.UTF8String ?: "/nonexistent", sizeof(g_bundle));
+		char why[700];
+		if (const char *off = off_reason(why, sizeof(why))) {
+			nlog("%s: no Metal device", off);
 			return;
 		}
 		if (!listed()) {
-			nlog("not listed in %s: no Metal device", NMTL_DIR "/clients");
+			nlog("not listed in %s/clients, %s/clients.local or %s: no Metal device", g_bundle, g_bundle, NMTL_DIR "/clients");
 			return;
 		}
 		if (bootarg_off()) {
@@ -396,8 +564,7 @@ static void telemetry_loop(void)
 			nlog("no RedwoodGPU service (boot-args negroniadreno=22 negroniadreno_keep=1): no Metal device");
 			return;
 		}
-		NSString *bundle = [[NSBundle bundleForClass:[NMTL_CLASS class]] bundlePath];
-		NSString *turnip = [bundle stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];
+		NSString *turnip = [bundlePath stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];
 		if (const char *t = getenv("NEGRONI_TURNIP"))
 			turnip = @(t);
 		if (access(turnip.UTF8String, R_OK) != 0) {
@@ -516,13 +683,29 @@ static void telemetry_loop(void)
 		dladdr((void *)sm2_logs, &self_info);
 		nlog("image base %p (atos -o NegroniMetal.dSYM -l BASE ADDR)", self_info.dli_fbase);
 		if (device) {
+			/*
+			 * QuartzCore uploads asset-catalog images straight from CGImageTextureData, in Apple's GPU tiled layout of the
+			 * compressed data: CoreGraphics read past the mapped file (Chlorophyll plugin/chlorophyll_plugin.m, MIT: SpringBoard
+			 * crash loop), and an Adreno cannot sample that layout anyway. Off: CA decodes those images into plain textures.
+			 * 20H392: CA::Render::create_image reads getenv("CA_USE_CGTEXTUREDATA") once, at its first image, atoi != 0 = on,
+			 * unset = on (QuartzCore 0x188316d38) [V]. Set before the device is returned; an earlier image keeps CA's value [I].
+			 * An NMTL_DIR/env line wins (overwrite 0). CI_USE_MTL_DAG_FOR_CIKL_SRC is not in the 20H392 cache [V]: not set.
+			 */
+			setenv("CA_USE_CGTEXTUREDATA", "0", 0);
 			deadman_clear_later(strike);
+			const long wd = env_num("NEGRONIMETAL_WATCHDOG", -1); /* 1 / 0 force it on / off; default: backboardd only */
 			if (!strcmp(getprogname(), "backboardd"))
 				telemetry_loop();
+			if (wd == 1 || (wd < 0 && !strcmp(getprogname(), "backboardd")))
+				watchdog_start();
 		} else if (!timed_out) {
 			unlink(strike); /* a clean refusal is not a crash; a hang keeps its strike */
 		}
 	});
+	if (g_gpu_lost) {
+		nlog("the GPU watchdog marked the GPU lost: no Metal device");
+		return nil;
+	}
 	return device;
 }
 @end

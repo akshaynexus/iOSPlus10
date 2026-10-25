@@ -1,0 +1,279 @@
+NegroniMetal changes to the ios-flame 745c434 Metal frontend (MIT), on top of 0001. The CoreAnimation fixes that
+Chlorophyll (ry-diffusion/Chlorophyll 787338f, MIT) found on iOS 18 / Adreno 630, written again for this frontend
+(docs/reviews/bergamota-chlorophyll-2026-10-25.md section 3 item 1; its section "Ported"):
+- Device SPI that the 20H392 _MTLDevice answers with NULL (targetDeviceInfo: {0, 0, device name}, Metal's own fallback)
+  or not at all (dedicatedMemorySize 0, sharedMemorySize = physical memory, as UniXNU NativeMetal (MIT);
+  recommendedMaxWorkingSetSize = half of it).
+- A refused or nil render pipeline and a refused draw are skipped and logged once; the command buffer goes on
+  (draws after a refused pipeline are skipped too: the runtime keeps the previous pipeline). Telemetry row N counts them.
+- DontCare colour attachments of textures that are not IOSurfaces start cleared to zero (CA's rounded-corner masks).
+- After a completed command buffer, each IOSurface its GPU work wrote gets a write lock + unlock (seed bump), except in
+  backboardd; NEGRONIMETAL_SEED_BUMP=0/1 overrides.
+- native_bridge_metal_progress: committed/completed/pending counts and the oldest pending age, for the plugin's GPU watchdog.
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.h	2026-10-25 17:40:43
++++ b/phone/metal2/NativeBridgeMetalFrontend.h	2026-10-25 17:51:03
+@@ -11,6 +11,9 @@
+ id native_bridge_metal_open(const char *loader, const char *cache, uint64_t registryID, void (*missing)(const char *, const char *));
+ // NegroniMetal: hook called with an IOSurface's CPU base, byte count and ID before the frontend imports it (null: none).
+ void native_bridge_metal_set_surface_hook(void (*hook)(const void *base, uint64_t bytes, uint32_t surface));
++// NegroniMetal (flame/0002), for the plugin's GPU watchdog: out[0] command buffers committed, out[1] completed, out[2] committed and
++// not yet completed (local refusals not counted), out[3] the age of the oldest of those in microseconds (0: none).
++void native_bridge_metal_progress(uint64_t out[4]);
+ // Bare AIR bitcode as a library (the bridge's fixtures; Metal itself accepts only metallibs).
+ id native_bridge_metal_library_with_air(const void *bytes, size_t length);
+ // One line for the plugin's status report: command buffers committed/failed locally, pipelines made, refusals, the last refusal's text.
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm	2026-10-25 17:40:43
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm	2026-10-25 17:58:33
+@@ -66,6 +66,22 @@
+ #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];sm2_logs(nbText.UTF8String);noteProblem(nbText);}while(0)
+ // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
+ static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
++// NegroniMetal (flame/0002; the behaviour follows Chlorophyll src/bgmtl.m and docs/FIXES.md, MIT):
++// draws the runtime refused and that were skipped (the command buffer goes on), render pipeline settings refused (the encoder skips its
++// draws until a pipeline is accepted), and whether a completed GPU write bumps the IOSurface seed (off in backboardd, see -finish).
++static std::atomic<uint64_t> gDrawsSkipped,gPipelineSetsRefused;
++static bool gSeedBump=true;
++static std::mutex gSkipLock;
++static NSMutableSet<NSString *> *gSkipSeen;
++static void noteSkipped(NSString *what,bool draw) {
++ if(draw)gDrawsSkipped++;else gPipelineSetsRefused++;
++ std::lock_guard<std::mutex> lock(gSkipLock);
++ if(!gSkipSeen)gSkipSeen=[NSMutableSet set];
++ // each distinct text once, at most 64 texts (the counters go on in the telemetry's N row)
++ if(gSkipSeen.count>=64 || [gSkipSeen containsObject:what])return;
++ [gSkipSeen addObject:what];
++ NBLOG(@"native-metal: %@ skipped, the command buffer goes on (logged once): %@",draw?@"draw":@"render pipeline",what);
++}
+ static void noteFormat(uint32_t format,bool made) {
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  if(!made)gTextureRefusals++;
+@@ -546,6 +562,8 @@
+ @property(nonatomic) uint32_t commitIndex;
+ @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
+ @property(nonatomic,strong) NSMutableSet *surfaces;
++// NegroniMetal: the IOSurfaces (IOSurfaceRef as id) this command buffer's GPU work writes, for the seed bump in -finish
++@property(nonatomic,strong) NSMutableSet *writtenSurfaces;
+ // Runtime handles retain GPU storage, but only the Objective-C owner retains
+ // a no-copy deallocator, its memory owner and texture/heap ancestry.
+ @property(nonatomic,strong) NSMutableSet *resourceOwners;
+@@ -553,6 +571,7 @@
+ @property(nonatomic,strong) dispatch_group_t schedulingHandlers;
+ @property(nonatomic) BOOL schedulingDelivered;
+ - (void)refuse:(NSString *)what;
++- (void)wroteTexture:(id)texture;
+ @end
+ @interface NBEncoder : NBObject
+ @property(nonatomic) NmbEncoder *handle;
+@@ -596,6 +615,7 @@
+  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
+  if(texture)[_commandBuffer.resourceOwners addObject:texture];
+  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
++ if(texture && (texture.usage&MTLTextureUsageShaderWrite))[_commandBuffer wroteTexture:texture];   // NegroniMetal: may be written
+  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
+ }
+ - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
+@@ -650,13 +670,26 @@
+ - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
+ @end
+ 
+-@interface NBRenderEncoder : NBEncoder
++@interface NBRenderEncoder : NBEncoder {
++ BOOL _skipDraws;   // NegroniMetal: the last pipeline setting was refused, so the runtime still holds the one before
++}
+ @end
+ @implementation NBRenderEncoder
++// NegroniMetal (Chlorophyll docs/FIXES.md "Black or grey wallpaper", MIT): one refused draw failed the whole command buffer, so the rest of
++// the frame was never drawn. A refused (or nil) render pipeline and a refused draw are now skipped and logged once; the command buffer goes
++// on. The runtime records nothing for a refused draw and keeps the previous state for a refused pipeline (metal2vulkan-runtime render.rs),
++// so the draws after a refused pipeline are skipped too, until a pipeline is accepted.
+ - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
+- if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+- [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
++ if(![(id)state isKindOfClass:[NBRenderPipeline class]]){_skipDraws=YES;noteSkipped(state?@"foreign render pipeline":@"nil render pipeline",false);return;}
++ if(!nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle])) {
++  _skipDraws=YES;noteSkipped([@"setRenderPipelineState: " stringByAppendingString:lastError()],false);return;
++ }
++ _skipDraws=NO;
+ }
++- (bool)drawAllowed {
++ if(_skipDraws)noteSkipped(@"draw after a refused render pipeline",true);
++ return !_skipDraws;
++}
+ - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
+ - (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:2];}
+ - (void)setVertexBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:1];}
+@@ -723,7 +756,8 @@
+ }
+ - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+- [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
++ if(![self drawAllowed])return;
++ if(!nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b))noteSkipped([@"drawPrimitives: " stringByAppendingString:lastError()],true);
+ }
+ - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
+  [self drawPrimitives:t vertexStart:s vertexCount:n instanceCount:i baseInstance:0];
+@@ -733,10 +767,12 @@
+ }
+ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
+                 instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
+- if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
+- [self.commandBuffer.resourceOwners addObject:b];
+  gDraws++;self.commandBuffer->encodedWork.draws++;
+- [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
++ if(![(id)b isKindOfClass:[NBBuffer class]]){noteSkipped(b?@"drawIndexedPrimitives: foreign index buffer":@"drawIndexedPrimitives: nil index buffer",true);return;}
++ [self.commandBuffer.resourceOwners addObject:b];
++ if(![self drawAllowed])return;
++ if(!nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi))
++  noteSkipped([@"drawIndexedPrimitives: " stringByAppendingString:lastError()],true);
+ }
+ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
+                 instanceCount:(NSUInteger)i {
+@@ -781,6 +817,7 @@
+ - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
+               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
+  if(![self textures:NB_OBJECTS(s,d) count:2])return;
++ [self.commandBuffer wroteTexture:d];
+  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
+  [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
+ }
+@@ -797,6 +834,7 @@
+             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
+      destinationOrigin:(MTLOrigin)dO {
+  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
++ [self.commandBuffer wroteTexture:d];
+  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
+  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
+ }
+@@ -808,6 +846,7 @@
+ }
+ - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
+  if(![self textures:NB_OBJECTS(t) count:1])return;
++ [self.commandBuffer wroteTexture:t];
+  [self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"];
+ }
+ - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
+@@ -817,7 +856,7 @@
+ static void scheduled(void *context);
+ @implementation NBCommandBuffer
+ - (instancetype)init {
+- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
++ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+  if(self)createdUs=nowUs();
+  return self;
+ }
+@@ -828,6 +867,10 @@
+ // the command buffer.
+ - (uint64_t)protectionOptions {return 0;}
+ - (void)setProtectionOptions:(uint64_t)options {if(options)[self refuse:[NSString stringWithFormat:@"protection options 0x%llx",options]];}
++- (void)wroteTexture:(id)texture {
++ IOSurfaceRef surface=[texture isKindOfClass:[NBTexture class]]?[(NBTexture *)texture surface]:nullptr;
++ if(surface)[_writtenSurfaces addObject:(__bridge id)surface];
++}
+ - (void)refuse:(NSString *)what {
+  if(!self.encodeFailure){self.encodeFailure=what;NBLOG(@"native-metal: command buffer refused: %@",what);}
+ }
+@@ -882,7 +925,7 @@
+  auto attachment=[&](MTLRenderPassAttachmentDescriptor *a,NmbPassAttachment &out)->bool {
+   if(!a.texture)return true;
+   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
+-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
++  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];[_writtenSurfaces addObject:(__bridge id)texture.surface];}
+   [_resourceOwners addObject:texture];
+   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+   return true;
+@@ -891,6 +934,14 @@
+   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
+   if(!attachment(c,pass.colors[i])){[self refuse:@"foreign color attachment"];return nil;}
+   pass.colors[i].clear[0]=c.clearColor.red;pass.colors[i].clear[1]=c.clearColor.green;pass.colors[i].clear[2]=c.clearColor.blue;pass.colors[i].clear[3]=c.clearColor.alpha;
++  // NegroniMetal (Chlorophyll src/bgmtl.m BGMTLRenderEncoder, MIT): DontCare promises undefined contents, but CoreAnimation builds its
++  // rounded-corner masks in DontCare attachments and blends into texels it never wrote, which Apple GPUs start cleared to zero (else: dark
++  // wedges at widget and dock corners). Colour attachments that are not IOSurfaces (masks, intermediates) start cleared to zero; IOSurface
++  // framebuffers are redrawn whole, and a clear there would cost every frame. With Turnip a DontCare load is the same risk in GMEM [I].
++  if(c.texture && c.loadAction==MTLLoadActionDontCare && ![(NBTexture *)c.texture surface]) {
++   pass.colors[i].load=MTLLoadActionClear;
++   pass.colors[i].clear[0]=pass.colors[i].clear[1]=pass.colors[i].clear[2]=pass.colors[i].clear[3]=0;
++  }
+  }
+  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
+  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
+@@ -937,9 +988,16 @@
+ // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
+ - (void)finish {
+  flushSurfaces(_surfaces);
++ // NegroniMetal (Chlorophyll src/bgmtl.m bgCompleteFrom:, MIT): a GPU write does not move an IOSurface's seed, but consumers cache by it
++ // (a compositor re-uploads a surface it copied only when the seed moved; Bergamota's CAMetalLayer drawables showed the frame of one cycle
++ // earlier). A write lock and unlock is the defined way to bump the seed. Before the completed handlers, so the consumer that a handler
++ // notifies sees the new seed. Not in backboardd (its surfaces are its own framebuffers, which the CPU never reads), not after a local
++ // refusal (nothing was written).
++ if(gSeedBump && !self.failedLocally)
++  for(id surface in _writtenSurfaces){IOSurfaceLock((__bridge IOSurfaceRef)surface,0,nullptr);IOSurfaceUnlock((__bridge IOSurfaceRef)surface,0,nullptr);}
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.
+- [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
++ [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];
+  @synchronized(gInFlight){[gInFlight removeObject:self];}
+  NSArray *completedHandlers;
+  @synchronized(self){
+@@ -1324,8 +1382,22 @@
+   memcpy((uint8_t *)dst+offset+y*dstRow,(const uint8_t *)src+(y0+y)*_row+x0*_texel,w*_texel);
+ }
+ @end
++// NegroniMetal (flame/0002): Metal's private -targetDeviceInfo, type ^{MTLTargetDeviceArch=QI*} on 20H392 (Metal.classdump), the device's
++// name at +0x10. -[_MTLDevice targetDeviceInfo] answers NULL on 20H392 ("mov x0, #0; ret" at 0x181aabb14), and 20H392's
++// MTLPipelineLibraryBuilder::newLibraryWithFile reads +0x10 of the answer without a check when the device responds to the selector, else
++// builds {0, 0, name} itself (0x181a3f604-0x181a3f660) [V]. On iOS 18 the same NULL crashed SpringBoard's Siri orb (Chlorophyll src/bgmtl.m,
++// FIXES.md, 9728eb7, MIT). So the answer is Metal's own fallback: zeros and the device's name (filled at open).
++struct NBTargetDeviceArch {uint64_t arch;uint32_t subtype;const char *name;};
++static NBTargetDeviceArch gTargetDeviceInfo={0,0,"NegroniMetal"};
+ @implementation NBDeviceMethods
+ - (NSString *)name {return gName;}
++- (const void *)targetDeviceInfo {return &gTargetDeviceInfo;}
++// NegroniMetal: _MTLDevice has neither on 20H392 [V Metal.classdump], so each was an unrecognised selector; without them every CIContext
++// creation threw (UniXNU NativeMetal NativeBridgeMetalFrontend.mm, MIT: the same two answers). One memory pool shared with the CPU.
++- (uint64_t)dedicatedMemorySize {return 0;}
++- (uint64_t)sharedMemorySize {return [NSProcessInfo processInfo].physicalMemory;}
++// NegroniMetal: public MTLDevice property that _MTLDevice does not answer on 20H392 either (metalprobe prints it); half of RAM [I].
++- (uint64_t)recommendedMaxWorkingSetSize {return [NSProcessInfo processInfo].physicalMemory/2;}
+ - (uint64_t)registryID {return gRegistryID;}
+ - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
+ - (BOOL)hasUnifiedMemory {return YES;}
+@@ -1600,6 +1672,9 @@
+  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
+  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
++ gTargetDeviceInfo.name=strdup(name);   // NegroniMetal: lives as long as the process
++ // NegroniMetal: the IOSurface seed bump after GPU writes (-finish): off in backboardd; NEGRONIMETAL_SEED_BUMP=0/1 overrides
++ if(const char *bump=getenv("NEGRONIMETAL_SEED_BUMP"))gSeedBump=bump[0]!='0';else gSeedBump=strcmp(getprogname(),"backboardd")!=0;
+  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
+  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
+   for(char *line=waived,*next;*line;line=next){next=strchr(line,'\n');if(next)*next++=0;else next=line+strlen(line);journal(std::string("F ")+line);}}
+@@ -1643,6 +1718,19 @@
+  return gDevice && nmb_device_work_stats(gDevice,out);
+ }
+ 
++extern "C" void native_bridge_metal_progress(uint64_t out[4]) {
++ uint64_t pending=0,oldest=0;const uint64_t now=nowUs();
++ if(gInFlight)@synchronized(gInFlight){
++  for(NBCommandBuffer *commandBuffer in gInFlight) {
++   if(![commandBuffer isKindOfClass:[NBCommandBuffer class]] || commandBuffer.failedLocally)continue;
++   pending++;
++   const uint64_t at=commandBuffer.committedUs;
++   if(at && now>at && now-at>oldest)oldest=now-at;
++  }
++ }
++ out[0]=gCommits.load();out[1]=gCompleted.load();out[2]=pending;out[3]=oldest;
++}
++
+ extern "C" size_t native_bridge_metal_status(char *out,size_t size) {
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  return (size_t)snprintf(out,size,"c%llu/%llu d%llu p%llu x%llu R%llu D%llu F%llu M%llu C%llu B%llu %s | %s",(unsigned long long)gCommits.load(),(unsigned long long)gCommitFailures.load(),(unsigned long long)gCompleted.load(),
+@@ -1750,6 +1838,8 @@
+   (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
+   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
+   (unsigned long long)gDispatches.load(),(unsigned long long)gBlits.load());
++ row("N skipped draws=%llu refused pipelines=%llu seed-bump=%d",(unsigned long long)gDrawsSkipped.load(),
++  (unsigned long long)gPipelineSetsRefused.load(),gSeedBump?1:0);   // NegroniMetal (flame/0002)
+  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
+  row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));
+  row("T function n=%llu total=%llums max=%llums",

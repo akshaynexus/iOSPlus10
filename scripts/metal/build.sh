@@ -1,7 +1,9 @@
 #!/bin/bash
 # Build the Metal path for iOS 16 arm64 and stage it in out/metal/stage (the layout root-add-metal.sh installs):
 #   stage/System/Library/Extensions/NegroniMetal.bundle/{NegroniMetal,Info.plist,libvulkan_freedreno.dylib}
-#   stage/usr/local/bin/{vkprobe,metalprobe,m2vtest}
+#   stage/System/Library/Extensions/NegroniMetal.bundle/clients   (the test tools; every process can read the bundle)
+#   stage/usr/local/bin/{vkprobe,metalprobe,m2vtest,carenderprobe,layerprobe,metallib-sweep.sh}
+#   stage/usr/local/share/negronimetal/{layerprobe.metallib,metallibs.txt}   (stage 4a / 3b inputs)
 #   stage/var/db/negronimetal/clients           (default: the probes only)
 #
 #   scripts/metal/build.sh            probes always; the plugin when the bridge is built (build-bridge.sh)
@@ -32,13 +34,29 @@ STRIP=$(xcrun --sdk iphoneos -f strip 2>/dev/null || command -v llvm-strip || ec
 sign() { codesign -f -s - "$@" 2>/dev/null || ldid -S "$@"; }
 
 rm -rf "$STAGE"
-mkdir -p "$STAGE/usr/local/bin" "$STAGE/var/db/negronimetal"
-for t in vkprobe metalprobe m2vtest; do
+mkdir -p "$STAGE/usr/local/bin" "$STAGE/usr/local/share/negronimetal" "$STAGE/var/db/negronimetal"
+for t in vkprobe metalprobe m2vtest carenderprobe layerprobe; do
   [ -f "$BUILD/$t" ] || continue
   cp "$BUILD/$t" "$STAGE/usr/local/bin/$t"
   "$STRIP" -x "$STAGE/usr/local/bin/$t"
   sign "$STAGE/usr/local/bin/$t"
 done
+# stage 3b: the all-metallib sweep (Chlorophyll ca-sweep.sh, MIT) and its list: every .metallib of the 20H392 root
+# (out/metal/spi/metallibs.txt, scripts/metal/spi-dump.sh), as phone paths
+cp "$METAL/probes/metallib-sweep.sh" "$STAGE/usr/local/bin/metallib-sweep.sh"
+chmod 755 "$STAGE/usr/local/bin/metallib-sweep.sh"
+if [ -f "$MOUT/spi/metallibs.txt" ]; then
+  sed -e 's#^rootmnt/#/#' "$MOUT/spi/metallibs.txt" > "$STAGE/usr/local/share/negronimetal/metallibs.txt"
+else
+  echo "NOTE: no $MOUT/spi/metallibs.txt: stage 3b needs a list argument" >&2
+fi
+# stage 4a: layerprobe's two shaders as AIR for iOS 16 (Xcode's metal compiler; skipped without it)
+if xcrun --sdk iphoneos -f metal > /dev/null 2>&1; then
+  xcrun --sdk iphoneos metal -mios-version-min="$IOS_MIN" -o "$STAGE/usr/local/share/negronimetal/layerprobe.metallib" \
+    "$METAL/probes/layerprobe.metal"
+else
+  echo "NOTE: no metal compiler: layerprobe.metallib not built (layerprobe takes a metallib argument)" >&2
+fi
 
 cat > "$STAGE/var/db/negronimetal/clients" <<'EOF'
 # Processes that get the NegroniMetal Metal device (userland/metal/plugin/NegroniMetal.mm).
@@ -54,6 +72,14 @@ if [ -f "$BUILD/NegroniMetal" ]; then
   dsymutil "$B/$PLUGIN_NAME" -o "$MOUT/$PLUGIN_NAME.dSYM" 2>/dev/null || true
   "$STRIP" -x "$B/$PLUGIN_NAME"
   sed -e "s/@NAME@/$PLUGIN_NAME/g" -e "s/@CLASS@/$PLUGIN_CLASS/g" "$METAL/plugin/Info.plist.in" > "$B/Info.plist"
+  # Control file in the bundle, readable by every process that loads the plugin (sandboxed apps too; NegroniMetal.mm).
+  # Every push replaces it. The owner's own lists: /var/db/negronimetal/clients, and BUNDLE/clients.local (not staged).
+  cat > "$B/clients" <<'EOF2'
+# The test tools, which always get the NegroniMetal device (userland/metal/plugin/NegroniMetal.mm). Staged by
+# scripts/metal/build.sh: a push replaces this file. Put other names in /var/db/negronimetal/clients (unsandboxed
+# processes) or in clients.local next to this file (read by sandboxed apps too; a push keeps it).
+metalprobe m2vtest carenderprobe layerprobe
+EOF2
   if [ -f "$TURNIP_DYLIB" ]; then
     cp "$TURNIP_DYLIB" "$B/libvulkan_freedreno.dylib"
     "$STRIP" -x "$B/libvulkan_freedreno.dylib"

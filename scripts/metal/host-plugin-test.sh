@@ -27,14 +27,27 @@ run() { # case: setup is done by the caller
   echo "== $1"
   if ! NEGRONI_TURNIP=$MVK "$T" "$1"; then fails=$((fails + 1)); fi
 }
+# the bundle's control files (off, clients, clients.local) live in their own directory here
+B=$W/bundle
+mkdir -p "$B"
+export NMTL_HOST_BUNDLE=$B
 : > "$N/metal.log"
 rm -f "$N/clients"; run unlisted
 echo "*" > "$N/clients"; touch "$N/off"; run off; rm -f "$N/off"
+touch "$B/off"; run bundleoff; rm -f "$B/off"
+# a bundle directory the process cannot search: BUNDLE/off cannot be checked, so no device (fail closed)
+mkdir -p "$W/locked"; chmod 000 "$W/locked"; NMTL_HOST_BUNDLE=$W/locked run blocked; chmod 755 "$W/locked"
 NMTL_HOST_NO_GPU=1 run nogpu
 echo "NEGRONIMETAL_OPEN_MS=1" > "$N/env"; run timeout; run timeout; rm -f "$N/env"
 echo "strikes after two timeouts: $(cat "$N/strikes/host-plugin-test" 2>/dev/null || echo none)"
 run deadman
-rm -rf "$N/strikes"; run device
+# listed only in BUNDLE/clients.local (the file a sandboxed app reads), not in NMTL_DIR/clients
+rm -rf "$N/strikes"; rm -f "$N/clients"; echo "host-plugin-test" > "$B/clients.local"; run device
+# GPU watchdog: a command buffer that never completes marks the GPU lost; the next process gets no device
+rm -rf "$N/strikes"
+NEGRONIMETAL_WATCHDOG=1 NEGRONIMETAL_WATCHDOG_S=1 NMTL_HOST_MARKER=$N/strikes/gpu-lost run watchdog
+echo "gpu-lost marker: $(cat "$N/strikes/gpu-lost" 2>/dev/null || echo none)"
+run lost; rm -f "$N/strikes/gpu-lost"
 echo "== plugin log"; cat "$N/metal.log"
 echo "host-plugin-test: $fails failed"
 [ $fails = 0 ]

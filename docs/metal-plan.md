@@ -54,12 +54,16 @@ Effort: one developer, after the kernel GPU user client works. Every stage has a
 | 1 | Metal.framework returns our device | `phone-test.sh 1`: `metalprobe --bundle` (no kernel change), then `metalprobe` with `MetalPluginName` published | `PASS device`, name of the Turnip device, families listed | stage 0; for the second test: kernel properties on IOAcceleratorES | 2-4 days |
 | 2 | command buffers, clear, IOSurface | `phone-test.sh 2` | `PASS clear`, `PASS iosurface` | host-page import (`VK_EXT_external_memory_host`) in Turnip + kernel | 1-2 weeks |
 | 3 | translated shaders run | `phone-test.sh 3`: compute + render from MSL, all QuartzCore pipelines, `m2vtest` | `PASS compute`, `PASS render`, metallib kernels/fragments all built, m2vtest OK | stage 2; MTLCompilerService runs | 1-3 weeks |
+| 3b | every system metallib translates on the phone | `phone-test.sh 3b`: `metallib-sweep.sh` (one `metalprobe --metallib` process per library of the 143 in the 20H392 root; table `/var/tmp/metallib-sweep.tsv`) | no `crashed` or `nodevice` lines; refusals listed per function | stage 3 | hours (one run) |
+| 4a | CoreAnimation draws through our device in a test process | `phone-test.sh 4a`: `layerprobe` (CAMetalLayer drawable -> IOSurface -> CPU readback), `carenderprobe` (7 CARenderer scenes vs `renderInContext:`, PPMs in `/var/tmp/carender`) | `PASS layer`, `PASS` on every scene, small mean diffs | stage 3 | days |
 | 4 | QuartzCore on Metal (backboardd, SpringBoard) | add `backboardd SpringBoard` to `/var/db/negronimetal/clients`, `killall backboardd` (or reboot); photo of the panel; `phone-test.sh log` | home screen drawn, no dead-man strikes; compare fps with the GL path (negronigl) on the same build | stage 3; persistent pipeline cache | 2-4 weeks |
 | 5 | apps | clients `*` minus known-bad (`-chronod`); test apps: a MetalKit triangle app, SpriteKit/SceneKit samples, Safari | each app draws; refusals listed in metal.log `MISSING` lines | stage 4 | open-ended |
 
-Kill switches at every stage: `touch /var/db/negronimetal/off` (no device in any process at its next start),
+Kill switches at every stage: `touch /System/Library/Extensions/NegroniMetal.bundle/off` (no device in any process at
+its next start, sandboxed apps included; `/var/db/negronimetal/off` still works for processes that can read /var/db),
 boot-arg `negronimetal=0` (kernel publishes no `MetalPluginName`, proposal), the dead-man (two crashes in 30 s
-disable a process).
+disable a process), the GPU watchdog in backboardd (pending command buffers and no completion for 10 s: it writes
+`/var/db/negronimetal/strikes/gpu-lost`, and no process gets a device until that file is removed).
 
 ### 5. Risks
 
@@ -95,6 +99,28 @@ disable a process).
   `out/metal/translate/QuartzCore_{floor,a730}/`. Review: `docs/reviews/gpu-turnip-metal-2026-10-25.md`.
 - Next host step: a real A730 Turnip profile (`vulkaninfo --json` from Turnip on Linux with drm-shim, FD_GPU_ID=730,
   as flame did for the A640, or from vkprobe on the phone), then rerun the sweep over all 134 system metallibs.
+
+## CoreAnimation fixes from Chlorophyll (2026-10-25)
+
+Ported from the review [reviews/bergamota-chlorophyll-2026-10-25.md](reviews/bergamota-chlorophyll-2026-10-25.md)
+(section 3 item 1, and the probes of item 6). Code: frontend patch `userland/metal/patches/flame/0002-*`, plugin
+`userland/metal/plugin/NegroniMetal.mm`, probes `userland/metal/probes/` (Chlorophyll MIT notice in `LICENSE.Chlorophyll`).
+Nothing of this ran on the phone yet.
+
+| Fix | Where | Host result |
+|---|---|---|
+| `CA_USE_CGTEXTUREDATA=0` in every process that gets the device. [V] QuartzCore 20H392 `CA::Render::create_image` reads it with `getenv` once, at its first image (unset = on). [I] An image made before the device opens keeps CA's value | plugin | env set (host test `device`) |
+| `targetDeviceInfo` = {0, 0, device name}. [V] `-[_MTLDevice targetDeviceInfo]` answers NULL on 20H392, and `MTLPipelineLibraryBuilder::newLibraryWithFile` reads +0x10 of the answer without a check; when the device does not respond, Metal builds the same {0, 0, name} | flame/0002 | PASS |
+| `dedicatedMemorySize` 0, `sharedMemorySize` = RAM (UniXNU's answers), `recommendedMaxWorkingSetSize` = RAM / 2 [I]. [V] `_MTLDevice` has none of them on 20H392 | flame/0002 | PASS |
+| IOSurface seed bump (write lock + unlock) after a completed command buffer wrote the surface (render attachments, blit destinations, shader-write textures); not in backboardd; `NEGRONIMETAL_SEED_BUMP=0/1` | flame/0002 | PASS (seed 0 -> 1) |
+| DontCare colour attachments that are not IOSurfaces start cleared to zero | flame/0002 | PASS (all texels 0) |
+| A nil or refused render pipeline and a refused draw are skipped and logged once; the command buffer completes. Telemetry row `N skipped draws=... refused pipelines=...` | flame/0002 | PASS (status Completed) |
+| Control files readable in the sandbox: `BUNDLE/off`, `BUNDLE/clients` (the test tools, staged), `BUNDLE/clients.local` (the owner's, kept by a push), plus `/var/db/negronimetal/{off,clients}`. Fail closed when `BUNDLE/off` cannot be checked. Strikes fall back to the process's cache directory; no writable strikes directory = no device | plugin, build.sh | PASS (`bundleoff`, `blocked`, `device` listed only in clients.local) |
+| GPU watchdog in backboardd: 1 Hz; pending command buffers and no completion for `NEGRONIMETAL_WATCHDOG_S` s (default 10): log, `strikes/gpu-lost`, no device from then on; no crash (`NEGRONIMETAL_WATCHDOG_EXIT=1` adds `_exit(0)`) | plugin + `native_bridge_metal_progress` (flame/0002) | PASS (`watchdog`, `lost`) |
+| Probes: `carenderprobe`, `layerprobe` (+ `layerprobe.metallib`), `metallib-sweep.sh` | probes, phone-test 3b/4a | build + import check PASS; not run |
+
+Not ported (not asked in this round): refusal in `+allocWithZone:` (review item 1.6). `CI_USE_MTL_DAG_FOR_CIKL_SRC` is not
+in the 20H392 cache [V], so it is not set.
 
 ## Needs from the other agents
 

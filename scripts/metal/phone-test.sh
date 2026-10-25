@@ -9,13 +9,19 @@
 #   scripts/metal/phone-test.sh 2               command buffers: clear + IOSurface clear
 #   scripts/metal/phone-test.sh 3               shaders: compute + render from MSL, QuartzCore default.metallib pipelines,
 #                                               m2vtest (the bridge's self-test, no Metal.framework)
+#   scripts/metal/phone-test.sh 3b              all system metallibs, one metalprobe --metallib process each
+#                                               (metallib-sweep.sh, from Chlorophyll's sweep; table /var/tmp/metallib-sweep.tsv)
+#   scripts/metal/phone-test.sh 4a              CoreAnimation over our device in test processes, before backboardd (stage 4):
+#                                               layerprobe (CAMetalLayer drawable -> IOSurface -> CPU readback) and
+#                                               carenderprobe (CARenderer scenes vs renderInContext:, PPMs in /var/tmp/carender)
 #   scripts/metal/phone-test.sh log             the plugin log (/var/db/negronimetal/metal.log)
-# No phone writes except `push` (files under /System/Library/Extensions, /usr/local/bin, /var/db/negronimetal).
+# No phone writes except `push` (files under /System/Library/Extensions, /usr/local/bin, /usr/local/share, /var/db/negronimetal)
+# and the test outputs of 3b/4a (/var/tmp/metallib-sweep.tsv, /var/tmp/carender/, the probes' strike files).
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SSHP=$REPO/scripts/net/ssh-phone.sh
 B=/System/Library/Extensions/NegroniMetal.bundle
-stage=${1:?usage: $0 push|0|1|2|3|log}
+stage=${1:?usage: $0 push|0|1|2|3|3b|4a|log}
 mkdir -p "$REPO/logs"
 LOG=$REPO/logs/metal-phone-$stage-$(date +%Y%m%d-%H%M%S).log
 run() { echo "== $*" | tee -a "$LOG"; "$SSHP" "$@" 2>&1 | tee -a "$LOG"; }
@@ -57,10 +63,17 @@ push)
   run "/usr/local/bin/metalprobe --bundle $B --metallib /System/Library/Frameworks/QuartzCore.framework/default.metallib"
   run "/usr/local/bin/m2vtest $B/libvulkan_freedreno.dylib /var/db/negronimetal/cache/m2vtest /System/Library/Frameworks/QuartzCore.framework/default.metallib"
   ;;
+3b)
+  run "/usr/local/bin/metallib-sweep.sh $B /var/tmp/metallib-sweep.tsv"
+  ;;
+4a)
+  run "/usr/local/bin/layerprobe --bundle $B"
+  run "mkdir -p /var/tmp/carender && /usr/local/bin/carenderprobe --bundle $B /var/tmp/carender"
+  ;;
 log)
   run "tail -n 200 /var/db/negronimetal/metal.log"
   ;;
-*) echo "usage: $0 push|0|1|2|3|log" >&2; exit 1 ;;
+*) echo "usage: $0 push|0|1|2|3|3b|4a|log" >&2; exit 1 ;;
 esac
 echo "log: $LOG"
 grep -q "FAIL" "$LOG" && exit 1 || exit 0

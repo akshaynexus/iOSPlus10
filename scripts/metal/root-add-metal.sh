@@ -7,7 +7,8 @@
 #   /usr/local/bin/{vkprobe,metalprobe,m2vtest}      (the SSH test tools, scripts/metal/phone-test.sh)
 #   /private/var/db/negronimetal/{clients,env,cache/,strikes/,metal.log}
 #     clients: processes that get a device (default: the probes only, so backboardd keeps the GL path)
-#     off:     create it to disable the plugin for every process (no reboot needed: next process start)
+#     off:     create it to disable the plugin for every process that can read /var/db (next process start);
+#              /System/Library/Extensions/NegroniMetal.bundle/off reaches sandboxed apps too (NegroniMetal.mm)
 # METAL_CLIENTS="metalprobe m2vtest backboardd SpringBoard" overrides the default clients list.
 # Nothing here changes the kernel: without a MetalPluginName on IOAcceleratorES (patch 0201 has none), Metal never
 # loads the bundle; metalprobe --bundle can still load it by hand (stage 1, docs/metal-plan.md).
