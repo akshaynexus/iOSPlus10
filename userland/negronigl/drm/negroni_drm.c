@@ -693,6 +693,9 @@ submit_syncobjs_out(const struct drm_msm_gem_submit *r, uint32_t seq)
 	return e;
 }
 
+/* last fence the kernel gave this process (lock held to read or write) */
+static uint32_t msm_last_fence;
+
 /* msm ABI: the kernel runs the submission; the syncobjs are ours. */
 static int
 msm_gem_submit(struct drm_msm_gem_submit *r)
@@ -700,6 +703,21 @@ msm_gem_submit(struct drm_msm_gem_submit *r)
 	int e = submit_syncobjs_in(r);
 	if (e)
 		return e;
+	if (r->nr_cmds == 0) {
+		/*
+		 * Fence-only submission (Vulkan: a queue submit with no command buffers that only signals a
+		 * semaphore or fence). Linux msm accepts it; our kernel answers EINVAL, and Turnip then reports
+		 * VK_ERROR_DEVICE_LOST (phone 2026-10-25 18:35: "msm submit (0 cmds, 0 bos): errno 22"). One ring
+		 * runs every submission in order, so this process's last fence covers all its earlier work
+		 * (0 = nothing submitted yet, already passed).
+		 */
+		pthread_mutex_lock(&lock);
+		uint32_t seq = msm_last_fence;
+		pthread_mutex_unlock(&lock);
+		r->fence = seq;
+		submit_syncobjs_reset(r);
+		return submit_syncobjs_out(r, seq);
+	}
 	struct drm_msm_gem_submit k = *r;
 	k.flags &= ~(MSM_SUBMIT_SYNCOBJ_IN | MSM_SUBMIT_SYNCOBJ_OUT);
 	k.in_syncobjs = k.out_syncobjs = 0;
@@ -712,6 +730,10 @@ msm_gem_submit(struct drm_msm_gem_submit *r)
 	}
 	r->fence = k.fence;
 	r->fence_fd = k.fence_fd;
+	pthread_mutex_lock(&lock);
+	if ((int32_t)(k.fence - msm_last_fence) > 0)
+		msm_last_fence = k.fence;
+	pthread_mutex_unlock(&lock);
 	submit_syncobjs_reset(r);
 	return submit_syncobjs_out(r, k.fence);
 }
