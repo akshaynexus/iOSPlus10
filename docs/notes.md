@@ -560,6 +560,16 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - [I] Not run on the phone. ngl_test is an iOS binary, so the GLI entries cannot be exercised on the
   Mac; the first check is on the phone (EAGLContext non-nil; Bold Text on SpringBoard must not crash).
 
+- [V] Review 2026-10-25 (docs/reviews/gpu-gl-plugin-2026-10-25.md section 4) corrects 15a:
+  gldInitializeLibrary did NOT call ngl_gli_register (now it does, every load); eagl_dealloc
+  (0x1d3f52380) dlsym()s `gliTerminateLibrary` from `_gli_plugin[0]` and calls it with no NULL check,
+  so the bundle exports it (19 GLI names; it calls gfxReleaseLibrary and dlcloses GLEngine's handle);
+  gldChoosePixelFormat refuses again (0x2712): its only caller is GLEngine's gliChoosePixelFormat
+  (+0x468), libGFXShared reads only pf+8. CAEAGLLayer native window: +0x08 attach must run before
+  +0x18 begin_iosurface (NULL until attached), +0x10 detach, +0x20 swap(nw, mode, t), +0x30
+  begin_properties; attach takes a reference at +0x80. Sharegroup lead UAF and cross-thread destroy
+  fixed (gli_context.c). Build exit 0; untested on the phone.
+
 ## 16. Wi-Fi facts (Wi-Fi agent, 2026-10-25; OnePlus kernel source e9da592 in out/src/op-kernel)
 
 - [V] SoC version register: BAR0 + 0x224 (family [31:28], device [27:16], major [15:8], minor [7:0])

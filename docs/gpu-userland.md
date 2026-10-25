@@ -56,8 +56,9 @@ It copies the bundle to `/System/Library/Extensions/NegroniGL.bundle` (root:whee
 removes the old `DYLD_INSERT_LIBRARIES=/usr/lib/negronigl.dylib` entry of backboardd if a root has it.
 The fake-root check passed on 2026-10-25.
 
-Status: libGFXShared can load the bundle, but the GLI part (EAGL contexts on Mesa) is not written.
-Until it is, `gldChoosePixelFormat` returns 0x2712 and EAGL contexts stay nil, as without the plugin.
+Status (2026-10-25): the GLI part (EAGL contexts on Mesa) is written and builds. The bundle exports
+all 18 `gli*` entries; `ngl_gli_register` redirects OpenGLES's `_gli_plugin` to us so EAGL binds them,
+and `gldChoosePixelFormat` returns the pixel format (notes section 15a). Not run on the phone yet.
 
 Driver choice in `ngl_init`: freedreno when RedwoodGPU opens, else softpipe (CPU, IOSurfaces mapped in
 place by `sw_winsys.c`). `NEGRONIGL_DRIVER=softpipe|freedreno` or the boot-arg `negronigl_sw=1` override.
@@ -77,9 +78,10 @@ scalar ABI first.
 IOSurfaces are described through the public IOSurface API, imported through the RedwoodGPU
 surface/GEM path and wrapped with Mesa `resource_from_handle`. The current path accepts a single
 plane and formats mapped by `surface.c`. Multi-plane YUV surfaces and the copy fallback for layouts
-that freedreno cannot address are unsupported. `renderbufferStorage:fromDrawable:` still returns
-failure; CoreAnimation's private `attachImage:toCoreSurface:invertedRender:` and
-`texImageIOSurface:` paths use the imported texture resource.
+that freedreno cannot address are unsupported. `renderbufferStorage:fromDrawable:` is now served through
+the GLI plugin (`plugin/gli_view.c` gliBindViewES: the drawable IOSurface becomes GL_RENDERBUFFER
+storage via `surface.c`); CoreAnimation's private `attachImage:toCoreSurface:invertedRender:` and
+`texImageIOSurface:` paths use the imported texture resource. Not run on the phone.
 
 **No phone test has been run.** The kernel GPU service, its IOSurface import behavior, cache
 coherency, fence sequence behavior, CA framebuffer rendering, and backboardd injection must still

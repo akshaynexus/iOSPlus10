@@ -9,8 +9,9 @@
  * the ones not here). Then per accelerator: gldCreateDevice. eagl_init fills OpenGLES's _gli_plugin
  * table with GLEngine's 18 GLI functions, asks gliGetVersion and gliChoosePixelFormat; GLEngine's
  * gliChoosePixelFormat calls our gldChoosePixelFormat. GLEngine itself would need a real GLD
- * renderer (render dispatch, state readback); the bundle does not provide one. The GLI part (the
- * EAGL entry points on Mesa) is not written yet, so gldChoosePixelFormat refuses for now.
+ * renderer (render dispatch, state readback); the bundle does not provide one. Instead
+ * gldInitializeLibrary -> ngl_gli_register (gli_table.c) points _gli_plugin[0] at this bundle, so
+ * eagl_init binds our own gli* entries on Mesa; gldChoosePixelFormat refuses (GLEngine path only).
  * The sharegroup asks libGFXShared for a shared state: gldCreateShareGroup.
  *
  * Rule: no call may crash or block the caller. What is not ready fails with a CGL error code.
@@ -74,6 +75,9 @@ gldInitializeLibrary(const uint32_t *services, void *io_data, uint32_t mask, voi
 		ngl_log("negronigl: NegroniGL.bundle loaded into %s (pid %d): service %#x mask %#x flags %#x",
 		    prog ? prog : "?", getpid(), services ? services[0] : 0, mask, flags);
 	}
+	/* eagl_init is inside GLEngine's gliInitializeLibrary now: hand OpenGLES our GLI table. Every
+	 * load (also after gliTerminateLibrary let libGFXShared unload us); it is idempotent. */
+	ngl_gli_register();
 }
 
 NGL_GLD void
@@ -157,9 +161,14 @@ gldDestroyDevice(void *device)
 }
 
 /*
- * GLEngine's gliChoosePixelFormat (eagl_init) asks each plugin for a pixel format. A format from
- * this plugin would make GLEngine drive it as a full GLD renderer, which it is not. Until the
- * GLI part of the bundle exists, refuse: EAGL init fails cleanly (nil contexts, as without a plugin).
+ * The GLD-plugin pixel format: refused on purpose. The only caller is GLEngine's gliChoosePixelFormat
+ * (plugin record +0x468, GLEngine 0x1f6e96574; libGFXShared, OpenGLES, libGLImage, libCoreVMClient,
+ * CoreImage and QuartzCore never read +0x468 [V out/gpu/re]). GLEngine's gli* functions are bound
+ * only when ngl_gli_register did not install our table (wrong OpenGLES build, or a second
+ * gfxInitializeLibrary that did not reload us). A format here would then make GLEngine drive the
+ * bundle as a GLD renderer (25-entry render dispatch, gldCreateContext ...), which we do not have.
+ * With the refusal eagl_init fails cleanly (nil EAGLContexts). The EAGL path takes ngl_pf from our
+ * own gliChoosePixelFormat (gli_table.c); libGFXShared reads only its device ID (+8, gfxCreateSharedState).
  */
 NGL_GLD int
 gldChoosePixelFormat(void **out, const int *attribs)
@@ -170,7 +179,8 @@ gldChoosePixelFormat(void **out, const int *attribs)
 	}
 	static int logged;
 	if (!__atomic_exchange_n(&logged, 1, __ATOMIC_RELAXED)) {
-		ngl_log("negronigl: NegroniGL: no GLI part yet: no pixel format (EAGL contexts stay nil)");
+		ngl_log("negronigl: NegroniGL gldChoosePixelFormat: GLEngine path (our GLI table is not "
+		    "installed): no pixel format, EAGL contexts stay nil");
 	}
 	return NGL_ERR_BAD_PIXEL_FORMAT;
 }

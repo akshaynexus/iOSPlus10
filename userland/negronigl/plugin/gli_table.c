@@ -22,10 +22,13 @@
  *   +0x80 gliGetVersion          +0x88 gliBindViewES           +0x90 gliPresentViewES
  * EAGL reads +0x08 (choose), +0x30 (createWithShared), +0x38 (destroy), +0x50 (set), +0x58 (get),
  * +0x80 (version), +0x88 (bind), +0x90 (present). The rest exist so the loop never binds NULL.
+ * Also +0x10 (destroy pixel format) and dlsym("gliTerminateLibrary") in eagl_dealloc, so the bundle
+ * exports a 19th name (review 2026-10-25 section 4).
  *
  * Rule: no call crashes or blocks. What is not ready returns a CGL error code.
  */
 #include <dlfcn.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -38,39 +41,100 @@
 #define NGL_UNSLID_gli_plugin        0x1e25b0da0ull
 #define NGL_UNSLID_eagl_initialized  0x1e25b0e44ull
 
+/* code words that must be there, else this is not the 20H392 OpenGLES and nothing is written */
+#define NGL_UNSLID_eagl_init_store   0x1d3f52578ull     /* str x0, [x23, #0xda0]  (_gli_plugin[0] = dlopen) */
+#define NGL_UNSLID_eagl_init_loop    0x1d3f52644ull     /* add x21, x21, #0xda0 ; ldr x0, [x21] (dlsym loop) */
+
+static pthread_mutex_t reg_lock = PTHREAD_MUTEX_INITIALIZER;
+static void *engine;            /* GLEngine's handle that eagl_init stored and we replaced */
+static void *self_handle;       /* our handle in _gli_plugin[0] while installed */
+
+static bool
+code_matches(intptr_t slide)
+{
+	const uint32_t *ev = (const uint32_t *)(uintptr_t)((intptr_t)NGL_UNSLID_EAGLGetVersion + slide);
+	const uint32_t *st = (const uint32_t *)(uintptr_t)((intptr_t)NGL_UNSLID_eagl_init_store + slide);
+	const uint32_t *lp = (const uint32_t *)(uintptr_t)((intptr_t)NGL_UNSLID_eagl_init_loop + slide);
+	return ev[0] == 0xb4000060u && st[0] == 0xf906d2e0u && lp[0] == 0x913682b5u && lp[1] == 0xf94002a0u;
+}
+
+/*
+ * gldInitializeLibrary calls this each time libGFXShared loads the bundle: on the first EAGLSharegroup,
+ * and again after gliTerminateLibrary (below) let libGFXShared unload everything. libGFXShared calls
+ * gldInitializeLibrary before it checks gldGetVersion and the 129 names (0x1d3f6e904).
+ */
 void
 ngl_gli_register(void)
 {
-	static int done;
-	if (__atomic_exchange_n(&done, 1, __ATOMIC_RELAXED)) {
-		return;                 /* register once; gldInitializeLibrary may be called per accelerator */
-	}
 	void *ev = dlsym(RTLD_DEFAULT, "EAGLGetVersion");
 	if (ev == NULL) {
 		ngl_log("negronigl: GLI register: no EAGLGetVersion (OpenGLES not loaded?)");
 		return;
 	}
 	intptr_t slide = (intptr_t)(uintptr_t)ev - (intptr_t)NGL_UNSLID_EAGLGetVersion;
+	if (!code_matches(slide)) {
+		ngl_log("negronigl: GLI register: OpenGLES is not the 20H392 build this bundle knows; not installed");
+		return;
+	}
 	void **gli = (void **)(uintptr_t)((intptr_t)NGL_UNSLID_gli_plugin + slide);
 	const volatile uint8_t *inited = (const uint8_t *)(uintptr_t)((intptr_t)NGL_UNSLID_eagl_initialized + slide);
-	/* eagl_init is mid-flight: GLEngine's handle is at gli[0] and EAGL is not initialized yet. If the
-	 * layout does not match this build, bail without writing (EAGL stays as it was, no crash). */
+	pthread_mutex_lock(&reg_lock);
+	if (self_handle != NULL && gli[0] == self_handle) {
+		pthread_mutex_unlock(&reg_lock);
+		return;                 /* already installed (gldInitializeLibrary per accelerator) */
+	}
+	/* eagl_init is mid-flight: GLEngine's handle is at gli[0] and EAGL is not initialized yet.
+	 * Otherwise bail without writing (EAGL stays as it was, no crash). */
 	if (*inited != 0 || gli[0] == NULL) {
+		pthread_mutex_unlock(&reg_lock);
 		ngl_log("negronigl: GLI register: unexpected state (initialized=%d, plugin0=%p); not installed",
 		    (int)*inited, gli[0]);
 		return;
 	}
 	Dl_info info;
-	if (!dladdr((const void *)&ngl_gli_register, &info) || info.dli_fname == NULL) {
-		return;
+	void *self = NULL;
+	if (dladdr((const void *)&ngl_gli_register, &info) && info.dli_fname != NULL) {
+		self = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD | RTLD_NODELETE);
 	}
-	void *self = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD | RTLD_NODELETE);
 	if (self == NULL) {
+		pthread_mutex_unlock(&reg_lock);
 		ngl_log("negronigl: GLI register: dlopen(self) failed");
 		return;
 	}
+	engine = gli[0];
+	self_handle = self;
 	gli[0] = self;                  /* eagl_init's dlsym loop now binds our gli* exports */
+	pthread_mutex_unlock(&reg_lock);
 	ngl_log("negronigl: GLI table installed in OpenGLES _gli_plugin (slide %#lx)", (long)slide);
+}
+
+/*
+ * Not one of the 18 table names: eagl_dealloc (0x1d3f52380), when the last EAGLSharegroup goes,
+ * calls gliDestroyPixelFormat, then dlsym(_gli_plugin[0], "gliTerminateLibrary") and calls the
+ * result WITHOUT a NULL check, then dlclose(_gli_plugin[0]) (= our handle) and clears it and
+ * _eagl_initialized. GLEngine's own version ends in gfxReleaseLibrary. We balance what eagl_init did
+ * for us: gfxReleaseLibrary (refcount to 0: libGFXShared destroys our devices and unloads the plugin
+ * record; the bundle stays mapped, RTLD_NODELETE), and dlclose of GLEngine's handle. The next
+ * EAGLSharegroup runs eagl_init again, libGFXShared loads us again, and ngl_gli_register installs the
+ * table again. (GLEngine's gliTerminateLibrary is not called: its contexts and its cvm state were
+ * never set up in this path.)
+ */
+NGL_GLD void
+gliTerminateLibrary(void)
+{
+	pthread_mutex_lock(&reg_lock);
+	void *eng = engine;
+	engine = NULL;
+	self_handle = NULL;
+	pthread_mutex_unlock(&reg_lock);
+	void (*release)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "gfxReleaseLibrary");
+	if (release != NULL) {
+		release();
+	}
+	if (eng != NULL) {
+		dlclose(eng);
+	}
+	ngl_log("negronigl: gliTerminateLibrary: last EAGLSharegroup gone, libGFXShared released");
 }
 
 /* +0x08: eagl_init stores *out at _gli_pixelformat; -[EAGLSharegroup init..] needs flags bit 0x100

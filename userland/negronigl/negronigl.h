@@ -96,10 +96,20 @@ struct ngl_gli {
 	struct ngl_state *st;
 	/* GLI-plugin fields (plugin/gli_context.c, gli_view.c); unused by the dylib EAGL shim */
 	void *shared;                   /* gld shared-state pointer = the EAGLSharegroup, NULL if none */
-	void *view;                     /* the drawable bound by gliBindViewES, NULL if none */
-	IOSurfaceRef view_surface;      /* its IOSurface, retained; released on unbind/destroy */
+	struct ngl_gli *share_next;     /* plugin context list (gli_context.c, under its share_lock) */
+	int binds;                      /* threads that have this context as ngl_cur (plugin only) */
+	bool zombie;                    /* destroyed while current on another thread: freed later */
+	void *view;                     /* the attached CAEAGLLayer native window, NULL if none */
+	IOSurfaceRef view_surface;      /* its current IOSurface, retained; released on unbind/destroy */
 	unsigned view_colorformat;
+	GLuint view_rb;                 /* the renderbuffer that has the drawable as storage */
+	void *view_cb[4];               /* EAGLNativeWindowCallbacksRec we gave the window (gli_view.c) */
 };
+
+#ifdef NGL_PLUGIN
+/* plugin/gli_context.c: ngl_bind() reports each switch (counts binds, frees deferred contexts) */
+void ngl_gli_bound(struct ngl_gli *old, struct ngl_gli *g);
+#endif
 
 extern __thread struct ngl_gli *ngl_cur;
 void ngl_bind(struct ngl_gli *g);

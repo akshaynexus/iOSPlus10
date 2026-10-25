@@ -43,17 +43,30 @@ done
 NAMES=$(mktemp)
 grep -v '^#' "$NGL/plugin/gld-names.txt" | grep . > "$NAMES"
 want=$(wc -l < "$NAMES" | tr -d ' ')
+# the 18 _gli_plugin entries eagl_init dlsym()s from our bundle (docs/notes.md section 15); they are
+# exported too (gen-gld.py GLI_NAMES) and are not GLD table names, so allow and check them here
+GLI_NAMES="gliChoosePixelFormat gliDestroyPixelFormat gliQueryRendererInfo gliDestroyRendererInfo
+gliCreateContext gliCreateContextWithShared gliDestroyContext gliAttachDrawable
+gliAttachDrawableWithOptions gliSetInteger gliGetInteger gliGetAttribute gliSetAttribute
+gliCopyAttributes gliGetMemoryAnnotationList gliGetVersion gliBindViewES gliPresentViewES"
+GLI=$(mktemp)
+for n in $GLI_NAMES; do echo "$n"; done > "$GLI"
 syms=$(nm -gU "$B/NegroniGL" | awk '{print $3}' | sed 's/^_//')
 have=$(echo "$syms" | grep -x -F -f "$NAMES" | wc -l | tr -d ' ')
-extra=$(echo "$syms" | grep -v -x -F -f "$NAMES" |
-	grep -v -x -e gldInitializeLibrary -e gldTerminateLibrary -e _mh_bundle_header || true)
-rm -f "$NAMES"
-echo "NegroniGL: $have of $want GLD table names exported"
+gli_have=$(echo "$syms" | grep -x -F -f "$GLI" | wc -l | tr -d ' ')
+extra=$(echo "$syms" | grep -v -x -F -f "$NAMES" | grep -v -x -F -f "$GLI" |
+	grep -v -x -e gldInitializeLibrary -e gldTerminateLibrary -e gliTerminateLibrary -e _mh_bundle_header || true)
+rm -f "$NAMES" "$GLI"
+echo "NegroniGL: $have of $want GLD table names, $gli_have of 18 GLI names exported"
 [ "$have" = "$want" ] || { echo "NegroniGL: GLD exports missing" >&2; fail=1; }
-for n in gldInitializeLibrary gldTerminateLibrary; do
+[ "$gli_have" = 18 ] || { echo "NegroniGL: GLI exports missing (have $gli_have of 18)" >&2; fail=1; }
+# gliTerminateLibrary: eagl_dealloc dlsym()s it from our handle and calls it without a NULL check
+for n in gldInitializeLibrary gldTerminateLibrary gliTerminateLibrary; do
 	echo "$syms" | grep -qx "$n" || { echo "NegroniGL: $n not exported" >&2; fail=1; }
 done
 [ -z "$extra" ] || { echo "NegroniGL: unexpected exports: $extra" >&2; fail=1; }
+# gldInitializeLibrary must install the GLI table (review 2026-10-25 section 4: it once did not)
+grep -q 'ngl_gli_register();' "$NGL/plugin/gld.c" || { echo "NegroniGL: gld.c does not call ngl_gli_register" >&2; fail=1; }
 [ $fail = 0 ] || exit 1
 
 codesign -s - -f "$G/negronigl.dylib"

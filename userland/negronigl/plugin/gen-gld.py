@@ -8,14 +8,28 @@ names of _gfx_gld_names (gld-names.txt, table order = plugin record +0x420 + 8 *
 name drops the plugin. gld.c defines the ones NegroniGL needs (a line that starts with the name and
 "("). Every other name becomes a stub that logs once and returns kCGLBadState (0x2717): GLEngine
 gets no pixel format from this plugin, so a stub call means an unexpected path.
-The exports list = the 129 names + gldInitializeLibrary + gldTerminateLibrary + EXTRA (test hooks).
+The exports list = the 129 names + gldInitializeLibrary + gldTerminateLibrary + the 18 GLI names +
+gliTerminateLibrary (eagl_dealloc calls it unchecked) + EXTRA (test hooks). eagl_init dlsym()s the 18 GLI names from our bundle after ngl_gli_register
+(gli_table.c) points _gli_plugin[0] at us, so they must be exported too; gli_{table,context,view}.c
+define them. Order and offsets: docs/notes.md section 15 [V].
 """
 import re
 import sys
 
 names_file, gld_c, out_c, out_exports = sys.argv[1:5]
 EXTRA_GLD = ['gldInitializeLibrary', 'gldTerminateLibrary']   # looked up by name, not in the table
+# the 18 _gli_plugin entries (+0x08..+0x90) eagl_init binds; gli_{table,context,view}.c define them
+GLI_NAMES = ['gliChoosePixelFormat', 'gliDestroyPixelFormat', 'gliQueryRendererInfo',
+             'gliDestroyRendererInfo', 'gliCreateContext', 'gliCreateContextWithShared',
+             'gliDestroyContext', 'gliAttachDrawable', 'gliAttachDrawableWithOptions',
+             'gliSetInteger', 'gliGetInteger', 'gliGetAttribute', 'gliSetAttribute',
+             'gliCopyAttributes', 'gliGetMemoryAnnotationList', 'gliGetVersion',
+             'gliBindViewES', 'gliPresentViewES']
+# not in the table: eagl_dealloc dlsym()s it from _gli_plugin[0] and calls it with no NULL check
+GLI_EXTRA = ['gliTerminateLibrary']
 EXTRA = []   # test hooks, none yet
+if len(GLI_NAMES) != 18 or len(set(GLI_NAMES)) != 18:
+    sys.exit('gen-gld: expected 18 distinct GLI names, found %d' % len(set(GLI_NAMES)))
 
 names = [l.strip() for l in open(names_file) if l.strip() and not l.startswith('#')]
 if len(names) != 129 or len(set(names)) != 129:
@@ -37,7 +51,7 @@ with open(out_c, 'w') as f:
         f.write('NGL_GLD int %s(void);\n' % n)
         f.write('NGL_GLD int %s(void) { return ngl_gld_unexpected(%d, "%s"); }\n' % (n, i, n))
 with open(out_exports, 'w') as f:
-    for n in names + EXTRA_GLD + EXTRA:
+    for n in names + EXTRA_GLD + GLI_NAMES + GLI_EXTRA + EXTRA:
         f.write('_%s\n' % n)
-print('gen-gld: %d names, %d in gld.c, %d stubs' % (len(names), len(defined & set(names)),
-                                                    len(set(names) - defined)), file=sys.stderr)
+print('gen-gld: %d GLD names, %d in gld.c, %d stubs, %d GLI names + %d' % (len(names),
+      len(defined & set(names)), len(set(names) - defined), len(GLI_NAMES), len(GLI_EXTRA)), file=sys.stderr)

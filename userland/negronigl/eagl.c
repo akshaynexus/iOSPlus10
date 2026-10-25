@@ -51,8 +51,18 @@ lookup(id eagl)
 void
 ngl_bind(struct ngl_gli *g)
 {
+#ifdef NGL_PLUGIN
+	struct ngl_gli *old = ngl_cur;
+#endif
 	ngl_make_current(g ? g->ctx : NULL);
 	ngl_cur = g;
+#ifdef NGL_PLUGIN
+	/* NegroniGL.bundle: a context destroyed on another thread while current here is freed only
+	 * now, after Mesa switched away from it (plugin/gli_context.c gliDestroyContext) */
+	if (old != g) {
+		ngl_gli_bound(old, g);
+	}
+#endif
 }
 
 void
