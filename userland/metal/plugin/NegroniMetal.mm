@@ -105,6 +105,12 @@ extern "C" void sys_dcache_flush(void *start, size_t len)
 /* Metal validation failures abort by default; MPS & co. report one on any non-Apple device: log instead (5 = NSLog). */
 __attribute__((constructor)) static void nmtl_error_mode(void)
 {
+	/* Workaround environment variables (Chlorophyll):
+	 * - CA_USE_CGTEXTUREDATA=0: QuartzCore reads past mapped file for Apple GPU tiled layout in asset catalogs.
+	 * - CI_USE_MTL_DAG_FOR_CIKL_SRC=0: CoreImage crashes in +[CIKernel kernelsWithString:] / SBRendererService with empty argument list.
+	 */
+	setenv("CA_USE_CGTEXTUREDATA", "0", 0);
+	setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
 	void (*set)(unsigned, unsigned) = (void (*)(unsigned, unsigned))dlsym(RTLD_DEFAULT, "MTLFailureTypeSetErrorModeType");
 	for (unsigned t = 0; set && t < 5; t++)
 		set(t, 5);
@@ -156,6 +162,25 @@ static int ctl_state(const char *path, int *err)
 	return (errno == ENOENT || errno == ENOTDIR) ? 0 : -1;
 }
 
+
+/* KEY from the environment (NMTL_DIR/env sets it) as a number, else def */
+static long env_num(const char *key, long def)
+{
+	const char *v = getenv(key);
+	return v && *v ? strtol(v, NULL, 0) : def;
+}
+
+/* The boot session UUID: strikes or markers from an earlier boot do not count */
+static const char *boot_id(void)
+{
+	static char u[64];
+	size_t len = sizeof(u) - 1;
+	if (!u[0] && sysctlbyname("kern.bootsessionuuid", u, &len, NULL, 0) != 0)
+		u[0] = 0;
+	u[sizeof(u) - 1] = 0;
+	return u[0] ? u : "-";
+}
+
 /* NULL when no kill switch is set, else why there is no device (fail closed: an unreadable BUNDLE/off is "off") */
 static const char *off_reason(char *why, size_t size)
 {
@@ -184,8 +209,28 @@ static const char *off_reason(char *why, size_t size)
 	}
 	err = 0;
 	if (ctl_state(NMTL_DIR "/strikes/gpu-lost", &err) == 1) {
-		snprintf(why, size, "the GPU watchdog marked the GPU lost (rm %s to re-arm)", NMTL_DIR "/strikes/gpu-lost");
-		return why;
+		FILE *gf = fopen(NMTL_DIR "/strikes/gpu-lost", "r");
+		char line[256] = "";
+		bool stale = false;
+		if (gf) {
+			if (fgets(line, sizeof(line), gf)) {
+				char *b = strstr(line, "boot=");
+				if (b) {
+					char gboot[64] = "";
+					sscanf(b + 5, "%63s", gboot);
+					if (gboot[0] && strcmp(gboot, boot_id()) != 0)
+						stale = true;
+				}
+			}
+			fclose(gf);
+		}
+		if (stale) {
+			nlog("GPU watchdog: removing stale gpu-lost marker from previous boot (%s)", boot_id());
+			unlink(NMTL_DIR "/strikes/gpu-lost");
+		} else {
+			snprintf(why, size, "the GPU watchdog marked the GPU lost (rm %s to re-arm)", NMTL_DIR "/strikes/gpu-lost");
+			return why;
+		}
 	}
 	return NULL;
 }
@@ -242,6 +287,15 @@ static bool strikes_dir(char *dir, size_t size)
 	return access(dir, W_OK) == 0;
 }
 
+static char g_active_strike[256];
+static void deadman_clean_exit(void)
+{
+	if (g_active_strike[0]) {
+		unlink(g_active_strike);
+		g_active_strike[0] = 0;
+	}
+}
+
 /* Dead-man: true when this process may open the GPU now. Strikes live in <strikes_dir>/<name>. A process that cannot
  * keep a strike file gets no device: without it, a crash loop would never stop. */
 static bool deadman_arm(char *path, size_t size)
@@ -253,32 +307,44 @@ static bool deadman_arm(char *path, size_t size)
 	}
 	snprintf(path, size, "%s/%s", dir, getprogname());
 	int strikes = 0;
+	char file_boot[64] = "";
 	if (FILE *f = fopen(path, "r")) {
-		if (fscanf(f, "%d", &strikes) != 1)
+		if (fscanf(f, "%d %63s", &strikes, file_boot) < 1)
 			strikes = 0;
 		fclose(f);
 	}
-	if (strikes >= 2) {
-		nlog("dead-man: %d unclean starts in a row, no Metal device (rm %s to re-arm)", strikes, path);
+	/* Strikes from an earlier boot do not count (reboot reset) */
+	if (file_boot[0] && strcmp(file_boot, boot_id()) != 0)
+		strikes = 0;
+	const long max_strikes = env_num("NEGRONIMETAL_MAX_STRIKES", 2);
+	if (strikes >= max_strikes) {
+		nlog("dead-man: %d unclean starts in a row (limit %ld), no Metal device (rm %s to re-arm)", strikes, max_strikes, path);
 		return false;
 	}
 	FILE *f = fopen(path, "w");
-	bool ok = f && fprintf(f, "%d\n", strikes + 1) > 0;
+	bool ok = f && fprintf(f, "%d %s\n", strikes + 1, boot_id()) > 0;
 	if (f && fclose(f) != 0)
 		ok = false;
 	if (!ok) {
 		nlog("dead-man: cannot write %s: no Metal device", path);
 		return false;
 	}
+	strlcpy(g_active_strike, path, sizeof(g_active_strike));
+	static dispatch_once_t atexit_once;
+	dispatch_once(&atexit_once, ^{
+		atexit(deadman_clean_exit);
+	});
 	return true;
 }
 
 static void deadman_clear_later(const char *path)
 {
 	char *p = strdup(path);
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 		unlink(p);
 		free(p);
+		if (g_active_strike[0] && !strcmp(g_active_strike, path))
+			g_active_strike[0] = 0;
 	});
 }
 
@@ -327,12 +393,6 @@ static bool gpu_service_present(void)
 	return true;
 }
 
-/* KEY from the environment (NMTL_DIR/env sets it) as a number, else def */
-static long env_num(const char *key, long def)
-{
-	const char *v = getenv(key);
-	return v && *v ? strtol(v, NULL, 0) : def;
-}
 
 /* ---- IOSurface imports: tell Turnip's DRM layer which surface a CPU range is (kernel import by surface ID) ---- */
 static void (*note_surface)(const void *, uint64_t, uint32_t);
@@ -481,6 +541,10 @@ static void *watchdog_main(void *arg)
 		uint64_t p[4] = { 0 };
 		native_bridge_metal_progress(p);
 		if (p[1] != last_completed || p[2] == 0) {
+			if (p[1] > 0 && g_active_strike[0]) {
+				unlink(g_active_strike);
+				g_active_strike[0] = 0;
+			}
 			last_completed = p[1];
 			stalled = 0;
 			continue;
@@ -493,8 +557,8 @@ static void *watchdog_main(void *arg)
 		     (unsigned long long)p[2], stalled, (unsigned long long)(p[3] / 1000), (unsigned long long)p[0],
 		     (unsigned long long)p[1], NMTL_DIR "/strikes/gpu-lost", exit_on_loss ? "; exit(0) now" : "");
 		if (FILE *f = fopen(NMTL_DIR "/strikes/gpu-lost", "w")) {
-			fprintf(f, "%s[%d] pending=%llu stalled=%lds committed=%llu completed=%llu\n", getprogname(), getpid(),
-				(unsigned long long)p[2], stalled, (unsigned long long)p[0], (unsigned long long)p[1]);
+			fprintf(f, "%s[%d] pending=%llu stalled=%lds committed=%llu completed=%llu boot=%s\n", getprogname(), getpid(),
+				(unsigned long long)p[2], stalled, (unsigned long long)p[0], (unsigned long long)p[1], boot_id());
 			fclose(f);
 		} else {
 			nlog("GPU watchdog: cannot write %s: %s", NMTL_DIR "/strikes/gpu-lost", strerror(errno));
@@ -507,7 +571,8 @@ static void *watchdog_main(void *arg)
 
 static void watchdog_start(void)
 {
-	const long limit_s = env_num("NEGRONIMETAL_WATCHDOG_S", 10);
+	const long default_s = (!strcmp(getprogname(), "backboardd")) ? 60 : 30;
+	const long limit_s = env_num("NEGRONIMETAL_WATCHDOG_S", default_s);
 	if (limit_s <= 0) {
 		nlog("GPU watchdog off (NEGRONIMETAL_WATCHDOG_S=%ld)", limit_s);
 		return;
@@ -589,6 +654,8 @@ static void watchdog_start(void)
 		}
 		/* plain rows everywhere: no Apple framebuffer compression, no 10-bit deep framebuffer (ios-flame SweetMetal2.mm) */
 		setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+		setenv("CA_USE_CGTEXTUREDATA", "0", 0);
+		setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
 		CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
@@ -692,6 +759,7 @@ static void watchdog_start(void)
 			 * An NMTL_DIR/env line wins (overwrite 0). CI_USE_MTL_DAG_FOR_CIKL_SRC is not in the 20H392 cache [V]: not set.
 			 */
 			setenv("CA_USE_CGTEXTUREDATA", "0", 0);
+			setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
 			deadman_clear_later(strike);
 			const long wd = env_num("NEGRONIMETAL_WATCHDOG", -1); /* 1 / 0 force it on / off; default: backboardd only */
 			if (!strcmp(getprogname(), "backboardd"))

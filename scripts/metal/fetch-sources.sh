@@ -16,7 +16,9 @@ mkdir -p "$MSRC"
 if [ ! -d "$M2V/.git" ]; then
   git clone --filter=blob:none "$M2V_URL" "$M2V"
 fi
-git -C "$M2V" fetch -q origin "$M2V_COMMIT" 2>/dev/null || git -C "$M2V" fetch -q origin
+if ! git -C "$M2V" cat-file -e "$M2V_COMMIT^{commit}" 2>/dev/null; then
+  git -C "$M2V" fetch -q origin "$M2V_COMMIT" 2>/dev/null || git -C "$M2V" fetch -q origin
+fi
 git -C "$M2V" checkout -q -f "$M2V_COMMIT"
 git -C "$M2V" clean -q -fdx
 echo "metal2vulkan $(git -C "$M2V" rev-parse --short HEAD)"
@@ -45,8 +47,12 @@ done
 
 # 3. Rust toolchain
 if command -v rustup >/dev/null; then
-  rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-  rustup target add aarch64-apple-ios --toolchain "$RUST_TOOLCHAIN"
+  if ! rustup toolchain list | grep -q "^$RUST_TOOLCHAIN"; then
+    rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+  fi
+  if ! rustup target list --toolchain "$RUST_TOOLCHAIN" | grep -q "aarch64-apple-ios (installed)"; then
+    rustup target add aarch64-apple-ios --toolchain "$RUST_TOOLCHAIN"
+  fi
 else
   echo "rustup missing: install it (https://rustup.rs) and run this again" >&2; exit 1
 fi

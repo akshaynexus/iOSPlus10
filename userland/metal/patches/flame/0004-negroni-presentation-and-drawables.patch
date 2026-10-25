@@ -1,0 +1,171 @@
+NegroniMetal changes to the ios-flame 745c434 Metal frontend (MIT), on top of 0001-0003:
+- CAMetalLayer drawable presentation support on NBCommandBuffer:
+  presentDrawable:, presentDrawable:atTime:, presentDrawable:afterMinimumDuration:, presentDrawable:options:,
+  addPresentedHandler:, presentedHandlers. Drawables are presented in -finish, unblocking the compositor/layer.
+- Descriptor variants for command encoders: computeCommandEncoderWithDescriptor:, blitCommandEncoderWithDescriptor:.
+- NBTexture: isDrawable, numFaces, isCompressed, formattedDescription:.
+- Tolerance for compute pipelines and dispatches (like render pipelines/draws): a refused or nil compute pipeline
+  skips dispatches instead of failing the command buffer.
+- Tolerance for tile shaders in NBRenderEncoder: log skipped instead of failing command buffer.
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -238,6 +238,10 @@
+ - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
+ - (id<MTLTexture>)parentTexture {return _parent;}
+ - (NSUInteger)rotation {return 0;}
++- (BOOL)isDrawable {return _surface!=nullptr;}
++- (NSUInteger)numFaces {return (_descriptor.type==MTLTextureTypeCube || _descriptor.type==MTLTextureTypeCubeArray)?6:1;}
++- (BOOL)isCompressed {return NO;}
++- (NSString *)formattedDescription:(NSUInteger)indent {(void)indent;return [self description];}
+ - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
+  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
+  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
+@@ -560,7 +564,7 @@
+ @property(atomic) BOOL committed,failedLocally;
+ @property(nonatomic) uint64_t committedUs;
+ @property(nonatomic) uint32_t commitIndex;
+-@property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
++@property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers,*presentedHandlers,*presents;
+ @property(nonatomic,strong) NSMutableSet *surfaces;
+ // NegroniMetal: the IOSurfaces (IOSurfaceRef as id) this command buffer's GPU work writes, for the seed bump in -finish
+ @property(nonatomic,strong) NSMutableSet *writtenSurfaces;
+@@ -637,14 +641,23 @@
+ }
+ @end
+ 
+-@interface NBComputeEncoder : NBEncoder
++@interface NBComputeEncoder : NBEncoder {
++ BOOL _skipDispatches;
++}
+ @end
+ @implementation NBComputeEncoder
+ - (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
+ - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
+- if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
+- [self check:nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle]) what:"setComputePipelineState"];
++ if(![(id)state isKindOfClass:[NBComputePipeline class]]){_skipDispatches=YES;noteSkipped(state?@"foreign compute pipeline":@"nil compute pipeline",false);return;}
++ if(!nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle])) {
++  _skipDispatches=YES;noteSkipped([@"setComputePipelineState: " stringByAppendingString:lastError()],false);return;
++ }
++ _skipDispatches=NO;
+ }
++- (bool)dispatchAllowed {
++ if(_skipDispatches)noteSkipped(@"dispatch after a refused compute pipeline",true);
++ return !_skipDispatches;
++}
+ - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:0];}
+ - (void)setBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:0];}
+ - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {
+@@ -661,8 +674,10 @@
+ }
+ - (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads {
+  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
++ if(![self dispatchAllowed])return;
+  const uint64_t s[3]={size.width,size.height,size.depth},g[3]={group.width,group.height,group.depth};
+- [self check:nmb_compute_dispatch(self.handle,s,g,threads) what:"dispatch"];
++ if(!nmb_compute_dispatch(self.handle,s,g,threads))
++  noteSkipped([@"dispatch: " stringByAppendingString:lastError()],true);
+ }
+ - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
+ - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
+@@ -743,10 +758,10 @@
+ // reaches one anyway fails its command buffer.
+ - (NSUInteger)tileWidth {return 0;}
+ - (NSUInteger)tileHeight {return 0;}
+-- (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {(void)t;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+-- (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+-- (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+-- (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
++- (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {(void)t;(void)i;noteSkipped(@"tile shaders not supported",false);}
++- (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;noteSkipped(@"tile shaders not supported",false);}
++- (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;noteSkipped(@"tile shaders not supported",false);}
++- (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;noteSkipped(@"tile shaders not supported",false);}
+ - (void)setStencilReferenceValue:(uint32_t)v {[self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"];}
+ - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
+  [self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"];
+@@ -856,7 +871,7 @@
+ static void scheduled(void *context);
+ @implementation NBCommandBuffer
+ - (instancetype)init {
+- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
++ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_presentedHandlers=[NSMutableArray array];_presents=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+  if(self)createdUs=nowUs();
+  return self;
+ }
+@@ -873,7 +888,47 @@
+ }
+ - (void)refuse:(NSString *)what {
+  if(!self.encodeFailure){self.encodeFailure=what;NBLOG(@"native-metal: command buffer refused: %@",what);}
++}
++- (void)presentDrawable:(id<MTLDrawable>)drawable {
++ if(!drawable)return;
++ [_presents addObject:@[ (id)drawable, @0.0, @0.0 ]];
++ if([(id)drawable respondsToSelector:@selector(texture)]) {
++  id tex = [(id)drawable texture];
++  if(tex)[self wroteTexture:tex];
++ }
++}
++- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)presentationTime {
++ if(!drawable)return;
++ [_presents addObject:@[ (id)drawable, @(presentationTime), @0.0 ]];
++ if([(id)drawable respondsToSelector:@selector(texture)]) {
++  id tex = [(id)drawable texture];
++  if(tex)[self wroteTexture:tex];
++ }
++}
++- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration {
++ if(!drawable)return;
++ [_presents addObject:@[ (id)drawable, @0.0, @(duration) ]];
++ if([(id)drawable respondsToSelector:@selector(texture)]) {
++  id tex = [(id)drawable texture];
++  if(tex)[self wroteTexture:tex];
++ }
++}
++- (void)presentDrawable:(id<MTLDrawable>)drawable options:(NSDictionary *)options {
++ (void)options;
++ [self presentDrawable:drawable];
++}
++- (void)addPresentedHandler:(MTLCommandBufferHandler)block {
++ if(block)@synchronized(self){[_presentedHandlers addObject:[block copy]];}
++}
++- (NSArray<MTLCommandBufferHandler> *)presentedHandlers {
++ @synchronized(self){return [_presentedHandlers copy];}
+ }
++- (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDescriptor:(id)d {
++ (void)d;return [self computeCommandEncoder];
++}
++- (id<MTLBlitCommandEncoder>)blitCommandEncoderWithDescriptor:(id)d {
++ (void)d;return [self blitCommandEncoder];
++}
+ - (MTLCommandBufferStatus)status {
+  if(self.failedLocally)return MTLCommandBufferStatusError;
+  return (MTLCommandBufferStatus)nmb_command_buffer_status(_handle);
+@@ -999,13 +1054,26 @@
+  // release point. A retained completed command must not pin every old frame.
+  [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];
+  @synchronized(gInFlight){[gInFlight removeObject:self];}
+- NSArray *completedHandlers;
++ for(NSArray *p in _presents) {
++  id dr = p[0];
++  double at = [p[1] doubleValue], after = [p[2] doubleValue];
++  if(at > 0 && [dr respondsToSelector:@selector(presentAtTime:)])
++   [dr presentAtTime:at];
++  else if(after > 0 && [dr respondsToSelector:@selector(presentAfterMinimumDuration:)])
++   [dr presentAfterMinimumDuration:after];
++  else if([dr respondsToSelector:@selector(present)])
++   [dr present];
++ }
++ [_presents removeAllObjects];
++ NSArray *completedHandlers,*presentedHandlers;
+  @synchronized(self){
+   // A frontend refusal or a failed submission never scheduled. Unblock its waiter without inventing a scheduled event.
+   if(!_schedulingDelivered){_schedulingDelivered=YES;[_scheduledHandlers removeAllObjects];dispatch_group_leave(_schedulingHandlers);}
+   completedHandlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];
++  presentedHandlers=[_presentedHandlers copy];[_presentedHandlers removeAllObjects];
+  }
+  void (^run)(void)=^{
++  for(MTLCommandBufferHandler block in presentedHandlers)block((id<MTLCommandBuffer>)self);
+   for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
+   dispatch_group_leave(self->_handlers);
+  };
