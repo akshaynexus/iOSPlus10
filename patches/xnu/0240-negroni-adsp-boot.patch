@@ -12,10 +12,10 @@ index 77dae55..8de128a 100644
  bsd/dev/negroni_usb.c			standard
 diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
 new file mode 100644
-index 0000000..be03d77
+index 0000000..d9ed1b8
 --- /dev/null
 +++ b/bsd/dev/negroni_adsp.c
-@@ -0,0 +1,978 @@
+@@ -0,0 +1,1011 @@
 +/*
 + * NEGRONI (SM8450) audio DSP (ADSP, the Hexagon in LPASS) start: stage (a) of the iOSPlus10
 + * audio plan (docs/audio-plan.md). UNTESTED ON HARDWARE.
@@ -70,7 +70,7 @@ index 0000000..be03d77
 +#include <libkern/crypto/sha2.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
 +extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 +extern uint64_t kvtophys(vm_offset_t va);
 +extern kern_return_t thread_terminate(thread_t);
@@ -81,11 +81,25 @@ index 0000000..be03d77
 +
 +#define STEPS                   8
 +
++/*
++ * Mappings. ml_io_map and ml_io_map_wcomb take their VA from io_submap: 8 MiB for the whole
++ * kernel (osfmk/arm/io_map.c IO_MAP_SIZE), permanent entries, KMA_NOFAIL. With the GPU ladder
++ * on, the other drivers use most of it, and the 2 MiB SMEM map panicked there ("kmem_alloc(...,
++ * 2097152, ...): failed with 3", photo 2026-10-25). ml_io_unmap of an io_submap address also
++ * panics (vm_map_delete: permanent entry, vm_map.c:8188). So the large RAM views (SMEM 2 MiB,
++ * the 40 MiB carveout) use ml_io_map_unmappable: VA from kernel_map, removable by ml_io_unmap.
++ * Only the small register pages (IPCC, AOSS, TCSR mutex) stay on ml_io_map.
++ * VM_WIMG_WCOMB (osfmk/arm/memory_types.h, not exported to bsd/) = 0x6, Normal non-cacheable,
++ * the same type ml_io_map_wcomb used (Linux maps SMEM and the carveout write-combined too).
++ */
++#define ADSP_WIMG_WCOMB         0x6u
++
 +/* ---- addresses (live DT) ---- */
 +#define SMEM_PHYS               0x80900000UL
 +#define SMEM_SIZE               0x00200000u
 +#define ADSP_MEM_PHYS           0x85700000UL    /* adsp_region@85e00000 { reg = <0 0x85700000 0 0x2800000> } */
 +#define ADSP_MEM_SIZE           0x02800000u
++_Static_assert((ADSP_MEM_SIZE & 0x3fffu) == 0, "ml_io_unmap needs a 16 KiB page multiple (pmap_remove asserts)");
 +#define IPCC_PHYS               0x0ed18000UL
 +#define AOSS_PHYS               0x0c300000UL
 +#define AOSS_SIZE               0x400u
@@ -379,7 +393,14 @@ index 0000000..be03d77
 +	uint32_t psize = 0, cacheline = 0, size = 0, p, at, value = 0;
 +	uint64_t answer = 0;
 +
-+	smem = ml_io_map_wcomb(SMEM_PHYS, SMEM_SIZE);
++	if (smem == 0) {
++		/* kept for the life of the system (GLINK, stage (b), reads it too) */
++		smem = ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, ADSP_WIMG_WCOMB);
++	}
++	if (smem == 0) {
++		say("stop: no mapping of SMEM %#lx + %#x", SMEM_PHYS, SMEM_SIZE);
++		return false;
++	}
 +	p = smem_partition(SMEM_APPS, SMEM_ADSP, &psize, &cacheline);
 +	if (p == 0) {
 +		say("stop: no SMEM partition for hosts 0/2 ($TOC %#x)", rd32(smem, SMEM_SIZE - 0x1000));
@@ -588,8 +609,12 @@ index 0000000..be03d77
 +	static const char text[] = "{class: image, res: load_state, name: adsp, val: on}";
 +	uint32_t words[QMP_MSG_LEN / 4] = { 0 }, box, boxsize;
 +
-+	ipcc = ml_io_map(IPCC_PHYS, 0x1000);
-+	aoss = ml_io_map(AOSS_PHYS, AOSS_SIZE);
++	if (ipcc == 0) {
++		ipcc = ml_io_map(IPCC_PHYS, 0x1000);
++	}
++	if (aoss == 0) {
++		aoss = ml_io_map(AOSS_PHYS, AOSS_SIZE);
++	}
 +	if (rd32(aoss, QMP_MAGIC) != QMP_MAGIC_VALUE || rd32(aoss, QMP_VERSION) != 1) {
 +		say("stop: AOSS QMP magic %#x version %u", rd32(aoss, QMP_MAGIC), rd32(aoss, QMP_VERSION));
 +		return false;
@@ -726,7 +751,13 @@ index 0000000..be03d77
 +		return false;
 +	}
 +	announce("zero the carveout 0x85700000 + 40 MiB and write the PT_LOAD segments");
-+	mem = (volatile uint64_t *)ml_io_map_wcomb(ADSP_MEM_PHYS, ADSP_MEM_SIZE);
++	/* kernel_map VA (not io_submap): ml_io_unmap at "out" removes it; ADSP_MEM_SIZE is 16 KiB aligned */
++	mem = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEM_PHYS, ADSP_MEM_SIZE, ADSP_WIMG_WCOMB);
++	if (mem == NULL) {
++		say("stop: no mapping of the carveout %#lx + %#x", ADSP_MEM_PHYS, ADSP_MEM_SIZE);
++		kmem_free(kernel_map, buf, CHUNK);
++		return false;
++	}
 +	for (uint32_t i = 0; i < ADSP_MEM_SIZE / 8; i++) {
 +		mem[i] = 0;
 +	}
@@ -797,7 +828,9 @@ index 0000000..be03d77
 +	if (p == 0) {
 +		return false;
 +	}
-+	tcsr = ml_io_map(TCSR_MUTEX_PHYS, 0x1000);
++	if (tcsr == 0) {
++		tcsr = ml_io_map(TCSR_MUTEX_PHYS, 0x1000);
++	}
 +	for (uint32_t ms = 0; ms <= 1000; ms++) {
 +		wr32(tcsr, 0, 1);               /* QCOM_MUTEX_APPS_PROC_ID */
 +		owner = rd32(tcsr, 0);

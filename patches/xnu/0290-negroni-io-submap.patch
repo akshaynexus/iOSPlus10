@@ -1,0 +1,58 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index 13be243..e69b803 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -65,6 +65,14 @@
+ #include <kern/sched_prim.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/*
++ * 0290 (iOSPlus10): io_submap is 8 MiB for the whole kernel (osfmk/arm/io_map.c IO_MAP_SIZE,
++ * permanent entries, KMA_NOFAIL: a request that does not fit panics). The GCC (2 MiB) map uses
++ * ml_io_map_unmappable (kernel_map VA) with VM_WIMG_IO (osfmk/arm/memory_types.h, 0x7): the same
++ * Device memory type as ml_io_map, without the io_submap space. Table: docs/notes.md "io_submap".
++ */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++#define ADRENO_WIMG_IO 0x7u
+ extern const void *negroni_fw_get(const char *name, uint32_t *size);
+ extern uint64_t kvtophys(vm_offset_t va);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);     /* osfmk/arm/pmap/pmap.h (pmap_paddr_t) */
+@@ -2774,7 +2782,7 @@ negroni_adreno_init(void)
+ 	}
+ 	last = MIN(last, (uint32_t)(sizeof(steps) / sizeof(steps[0])));
+ 	printf("NEGRONI ADRENO: steps 1..%u\n", last);
+-	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	gcc = ml_io_map_unmappable(GCC_PHYS, GCC_SIZE, ADRENO_WIMG_IO);
+ 	gpucc = ml_io_map(GPUCC_PHYS, GPUCC_SIZE);
+ 	gmu = ml_io_map(GMU_PHYS, GMU_SIZE);
+ 	rscc = ml_io_map(RSCC_PHYS, RSCC_SIZE);
+diff --git a/bsd/dev/negroni_wifi.c b/bsd/dev/negroni_wifi.c
+index 12c1be9..e7db560 100644
+--- a/bsd/dev/negroni_wifi.c
++++ b/bsd/dev/negroni_wifi.c
+@@ -38,6 +38,14 @@
+ #include "negroni_wlan.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/*
++ * 0290 (iOSPlus10): io_submap is 8 MiB for the whole kernel (osfmk/arm/io_map.c IO_MAP_SIZE,
++ * permanent entries, KMA_NOFAIL: a request that does not fit panics). The GCC (2 MiB) and TLMM (840 KiB) map uses
++ * ml_io_map_unmappable (kernel_map VA) with VM_WIMG_IO (osfmk/arm/memory_types.h, 0x7): the same
++ * Device memory type as ml_io_map, without the io_submap space. Table: docs/notes.md "io_submap".
++ */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++#define WIFI_WIMG_IO 0x7u
+ void negroni_wifi_init(void);
+ extern int negroni_rpmh_wifi_enable(const char *res, unsigned mv);
+ extern uint32_t negroni_probe_wifi;
+@@ -583,8 +591,8 @@ negroni_wifi_init(void)
+ 	}
+ 	last = MIN(last, (uint32_t)(sizeof(steps) / sizeof(steps[0])));
+ 	printf("NEGRONI WIFI: steps 1..%u\n", last);
+-	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
+-	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
++	gcc = ml_io_map_unmappable(GCC_PHYS, GCC_SIZE, WIFI_WIMG_IO);
++	tlmm = ml_io_map_unmappable(TLMM_PHYS, TLMM_SIZE, WIFI_WIMG_IO);
+ 	for (step = 1; step <= last; step++) {
+ 		snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WIFI %u", step);
+ 		negroni_wifi_badge_color = 0x00d0a000;

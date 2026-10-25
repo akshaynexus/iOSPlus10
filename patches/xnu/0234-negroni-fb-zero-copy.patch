@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
-index 77b4a68..0aeca4c 100644
+index 77b4a68..61a542e 100644
 --- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
 +++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
 @@ -45,6 +45,29 @@
@@ -32,17 +32,23 @@ index 77b4a68..0aeca4c 100644
   * The panel memory itself is published as an IOSurface and returned as the
   * default framebuffer surface. The kernel text console keeps drawing over
   * the GUI by default: boot-arg negronifb_noconsole=1 stops drawing it from
-@@ -73,6 +96,9 @@ extern "C" unsigned char iso_font[256 * 16];
+@@ -73,6 +96,15 @@ extern "C" unsigned char iso_font[256 * 16];
  #include <kern/clock.h>
  #include <sys/proc.h>
  
-+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/*
++ * The DPU registers (528 KiB) map from kernel_map, not io_submap: io_submap is 8 MiB for the whole
++ * kernel (osfmk/arm/io_map.c) and the GPU ladder + Wi-Fi survey + ADSP fill it (notes "io_submap").
++ * VM_WIMG_IO (osfmk/arm/memory_types.h) = 0x7, Device memory, the type ml_io_map uses.
++ */
++extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++#define NEGRONI_WIMG_IO                   0x7u
 +extern "C" void negroni_fb_panic(void);
 +
  enum {
  	kNegroniFBGetLayerDefaultSurface  = 3,
  	kNegroniFBSwapBegin               = 4,
-@@ -110,6 +136,61 @@ class IOMobileFramebuffer : public IOService {
+@@ -110,6 +142,61 @@ class IOMobileFramebuffer : public IOService {
  
  OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
  
@@ -104,7 +110,7 @@ index 77b4a68..0aeca4c 100644
  #define NEGRONI_FB_GPU_BUSY               8       /* surfaces held until their GPU copy is done */
  #define NEGRONI_FB_GPU_WAIT_MS            50      /* longest the CPU path waits for the GPU */
  
-@@ -151,6 +232,19 @@ public:
+@@ -151,6 +238,19 @@ public:
  	}             fBusy[NEGRONI_FB_GPU_BUSY];
  	uint32_t      fLastGPUFence;  /* the newest GPU copy into the panel */
  	uint64_t      fGPUFrames, fCPUFrames;
@@ -124,7 +130,7 @@ index 77b4a68..0aeca4c 100644
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -159,8 +253,20 @@ public:
+@@ -159,8 +259,20 @@ public:
  	uint32_t present(const uint8_t *rec, NegroniSurface *const *held);
  	void releaseBusy(bool all);
  	void keepBusy(NegroniSurface **held, uint32_t fence);
@@ -145,7 +151,7 @@ index 77b4a68..0aeca4c 100644
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
  class IOMobileFramebufferUserClient : public IOUserClient {
-@@ -244,6 +350,7 @@ AppleCLCD::start(IOService *provider)
+@@ -244,6 +356,7 @@ AppleCLCD::start(IOService *provider)
  	PE_parse_boot_argn("negronifb_gpuhz", &gpuhz, sizeof(gpuhz));
  	fGpuFlushTicks = (gpuhz == 0 || gpuhz >= 1000000u / NEGRONI_FB_VSYNC_US) ? 1 : (1000000u / NEGRONI_FB_VSYNC_US) / gpuhz;
  	fVsync->setTimeoutUS(NEGRONI_FB_VSYNC_US);
@@ -153,7 +159,7 @@ index 77b4a68..0aeca4c 100644
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
  	setProperty("external", false);
-@@ -260,6 +367,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -260,6 +373,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -162,7 +168,7 @@ index 77b4a68..0aeca4c 100644
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
  		(uint32_t)now, (uint32_t)(now >> 32),
-@@ -284,6 +393,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -284,6 +399,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  			NegroniGPUFenceWait(fb->fLastGPUFence, NEGRONI_FB_GPU_WAIT_MS);
  			fb->releaseBusy(false);
  		}
@@ -170,7 +176,7 @@ index 77b4a68..0aeca4c 100644
  		if (step <= 6) {
  			for (uint32_t y = 0; y < fb->fHeight; y++) {
  				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
-@@ -295,7 +405,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -295,7 +411,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		sender->setTimeoutUS(NEGRONI_FB_VSYNC_US);
  		return;
  	}
@@ -183,7 +189,7 @@ index 77b4a68..0aeca4c 100644
  	uint8_t *rec = NULL;
  	NegroniSurface *held[NEGRONI_FB_LAYERS] = {};
  	if (flush) {
-@@ -305,13 +419,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -305,13 +425,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  			memcpy(held, fb->fPendHold, sizeof(held));
  			bzero(fb->fPendHold, sizeof(fb->fPendHold));
  			fb->fDirty = false;
@@ -212,7 +218,7 @@ index 77b4a68..0aeca4c 100644
  		IOFreeData(rec, NEGRONI_FB_SWAP_REC_SIZE);
  	}
  	sender->setTimeoutUS(NEGRONI_FB_VSYNC_US);
-@@ -410,8 +538,21 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -410,8 +544,21 @@ AppleCLCD::swap(const uint8_t *rec)
  {
  	NegroniSurface *held[NEGRONI_FB_LAYERS] = {}, *dropped[NEGRONI_FB_LAYERS];
  	uint32_t mask = get32(rec, 0x104);
@@ -235,7 +241,7 @@ index 77b4a68..0aeca4c 100644
  	/* a frame of GPU-rendered layers only: each surface held until the GPU copied it */
  	for (uint32_t layer = 0; gpu && layer < NEGRONI_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
-@@ -421,7 +562,7 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -421,7 +568,7 @@ AppleCLCD::swap(const uint8_t *rec)
  		held[layer] = negroni_surface_copy(id);
  		gpu = held[layer] != NULL && held[layer] != fSurface && held[layer]->gpuFence != 0;
  	}
@@ -244,7 +250,7 @@ index 77b4a68..0aeca4c 100644
  		if (held[layer] != NULL && !gpu) {
  			OSSafeReleaseNULL(held[layer]);
  		} else if (held[layer] != NULL) {
-@@ -433,6 +574,11 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -433,6 +580,11 @@ AppleCLCD::swap(const uint8_t *rec)
  	memcpy(dropped, fPendHold, sizeof(dropped));    /* a frame replaced before it was shown */
  	memcpy(fPendHold, held, sizeof(fPendHold));
  	fPendGPU = gpu;
@@ -256,7 +262,7 @@ index 77b4a68..0aeca4c 100644
  	fDirty = true;
  	IOLockUnlock(fLock);
  	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
-@@ -676,6 +822,398 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
+@@ -676,6 +828,398 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held)
  	return fence;
  }
  
@@ -286,7 +292,7 @@ index 77b4a68..0aeca4c 100644
 +		IOLog("NEGRONI FB: zero-copy: the panel memory 0x%llx is not the splash region\n", fPhys);
 +		return;
 +	}
-+	fMdss = ml_io_map(NEGRONI_MDSS_PA, NEGRONI_MDSS_LEN);
++	fMdss = ml_io_map_unmappable(NEGRONI_MDSS_PA, NEGRONI_MDSS_LEN, NEGRONI_WIMG_IO);
 +	if (fMdss == 0) {
 +		IOLog("NEGRONI FB: zero-copy: no mapping of the display engine\n");
 +		return;
@@ -655,7 +661,7 @@ index 77b4a68..0aeca4c 100644
  bool
  IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
  {
-@@ -821,6 +1359,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -821,6 +1365,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  		}
  		break;
  	case kNegroniFBSwapWait:
@@ -697,10 +703,10 @@ index 1cdf031..582e6fe 100644
  	for (uint64_t at = trunc_page_64(offset); at < end; at += PAGE_SIZE) {
  		IOByteCount segment = 0;
 diff --git a/iokit/Kernel/arm/NegroniPlatformExpert.cpp b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
-index 9f67282..64fa412 100644
+index 924edb3..430c192 100644
 --- a/iokit/Kernel/arm/NegroniPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
-@@ -43,6 +43,7 @@ void negroni_reboot(unsigned reason);
+@@ -45,6 +45,7 @@ void negroni_restart(void);
  void negroni_power_off(void);
  void negroni_panic_restart(void);
  void negroni_reboot_settle(unsigned ms);
@@ -708,7 +714,7 @@ index 9f67282..64fa412 100644
  }
  
  static bool negroni_in_panic;
-@@ -53,6 +54,7 @@ negroni_halt_restart(unsigned int type)
+@@ -55,6 +56,7 @@ negroni_halt_restart(unsigned int type)
  	switch (type) {
  	case kPEPanicBegin:
  		negroni_in_panic = true;

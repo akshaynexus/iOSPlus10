@@ -69,7 +69,7 @@ index 8a9b3ef..80c87bf 100644
  	char magic[8];
  	uint32_t version, size;
 diff --git a/bsd/dev/negroni_wifi.c b/bsd/dev/negroni_wifi.c
-index 0f2354d..0133f41 100644
+index 9b303fe..12c1be9 100644
 --- a/bsd/dev/negroni_wifi.c
 +++ b/bsd/dev/negroni_wifi.c
 @@ -22,6 +22,9 @@
@@ -90,7 +90,7 @@ index 0f2354d..0133f41 100644
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  void negroni_wifi_init(void);
-@@ -514,6 +518,31 @@ static bool (*const steps[])(void) = {
+@@ -533,6 +537,31 @@ static bool (*const steps[])(void) = {
  	step_gcc, step_pins, step_rails, step_pcie, step_power, step_chip_on, step_phy, step_link, step_chip, step_pci_caps,
  };
  
@@ -122,7 +122,7 @@ index 0f2354d..0133f41 100644
  void
  negroni_wifi_init(void)
  {
-@@ -553,5 +582,12 @@ negroni_wifi_init(void)
+@@ -572,5 +601,12 @@ negroni_wifi_init(void)
  		negroni_wifi_badge_color = 0x000060c0;
  	}
  	printf("NEGRONI WIFI: done (asked %u)\n", last);
@@ -137,10 +137,10 @@ index 0f2354d..0133f41 100644
  #endif /* ARM64_BOARD_CONFIG_NEGRONI */
 diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
 new file mode 100644
-index 0000000..1440bd7
+index 0000000..cad2cb1
 --- /dev/null
 +++ b/bsd/dev/negroni_wlan.c
-@@ -0,0 +1,527 @@
+@@ -0,0 +1,542 @@
 +/*
 + * NEGRONI (SM8450) QCA6490 Wi-Fi driver, stage 1 (patch 0261): BAR0 claim, firmware choice,
 + * firmware download over MHI (BHI + BHIe), the READY -> M0 transition and the start of the IPCR
@@ -172,7 +172,6 @@ index 0000000..1440bd7
 +#include "negroni_wlan.h"
 +#include "negroni_wlan_mhi.h"
 +
-+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
 +extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
@@ -187,6 +186,15 @@ index 0000000..1440bd7
 + * map entry"); ml_io_map_unmappable maps in kernel_map and ml_io_unmap can remove it.
 + */
 +#define WLAN_WIMG_WCOMB 0x6u
++/*
++ * VM_WIMG_IO (same header) = 0x7, Device memory, the type ml_io_map uses. BAR0 (2 MiB) maps with
++ * ml_io_map_unmappable too: io_submap is only 8 MiB for the whole kernel and the GPU ladder and the
++ * survey already use most of it (notes "io_submap"); an io_submap allocation that does not fit
++ * panics (KMA_NOFAIL).
++ */
++#define WLAN_WIMG_IO    0x7u
++/* ml_io_unmap -> pmap_remove asserts a 16 KiB page multiple (MACH_ASSERT is on in DEVELOPMENT) */
++#define WLAN_POOL_MAP   (((vm_size_t)NEGRONI_WLAN_POOL_SIZE + PAGE_MASK) & ~(vm_size_t)PAGE_MASK)
 +
 +/* ---- DMA pool byte layout (sum = NEGRONI_WLAN_POOL_SIZE); each ring aligned to its size ---- */
 +#define OFF_CHCTX       0x0000u         /* channel context array, all 128 channels (5632 B) */
@@ -352,7 +360,7 @@ index 0000000..1440bd7
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +
 +	g_bar_len = (uint32_t)MIN(size, (uint64_t)BAR0_MAP);
-+	g_bar0 = ml_io_map((vm_offset_t)base, g_bar_len);
++	g_bar0 = ml_io_map_unmappable((vm_offset_t)base, g_bar_len, WLAN_WIMG_IO);
 +	if (!g_bar0) {
 +		printf("NEGRONI WLAN: BAR0 map of %#llx failed\n", base);
 +		return ENOMEM;
@@ -475,8 +483,15 @@ index 0000000..1440bd7
 +wlan_cleanup(void)
 +{
 +	if (g_pool_nc) {
-+		ml_io_unmap(g_pool_nc, NEGRONI_WLAN_POOL_SIZE);
++		ml_io_unmap(g_pool_nc, WLAN_POOL_MAP);
 +		g_pool_nc = 0;
++	}
++	if (g_bar0) {
++		/* after wlan_quiesce: nothing reads BAR0 any more */
++		vm_offset_t va = g_bar0 & ~(vm_offset_t)PAGE_MASK;
++		ml_io_unmap(va, ((vm_size_t)g_bar_len + (g_bar0 - va) + PAGE_MASK) & ~(vm_size_t)PAGE_MASK);
++		g_bar0 = 0;
++		g_bar_len = 0;
 +	}
 +	if (g_pool_kva) {
 +		/* drop any line the cacheable view holds, so the next owner reads what is in RAM */

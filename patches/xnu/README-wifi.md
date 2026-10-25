@@ -28,6 +28,25 @@ Expected log on success: `NEGRONI WIFI: 8 link UP`, `NEGRONI WIFI: 9 bus 1 devic
 Build: applies on `base` in name order with all committed `patches/xnu/0*.patch` and links in
 the local Xcode 15.4 kernel build (see `docs/reviews/codex-2026-10-25.md`). Not run on the phone.
 
+### Phone test 2026-10-25 and the 0260 change (regenerated 2026-10-25)
+
+Photo of the panel (survey to step 10, GPU kept on) [V]: `7 PHY PCS_STATUS1 0x86 (ready), pipe 0`,
+`8 link up: LNKSTA 0xffff (gen 15 x63), LTSSM 0x180`, `9 bus 1 device ffff:ffff, class 0xffffff,
+BAR0 0xffffffff`, `done (asked 10)`. Step 9 stopped (the ID is not 17cb:1103), so 0261 did not start.
+
+- [V] "link up" was false: the root port's LNKCTL/LNKSTA read (DBI + 0x80) returned 0xffffffff, and
+  bit 29 of all-ones looks like DLLLA. PARF_LTSSM 0x180 = LTSSM_EN (bit 8) + state 0 (DETECT_QUIET,
+  pci-msm.c mask 0x3f) [I: bit 7 unknown].
+- Change: step 8 treats a 0xffffffff LNKSTA as "link DOWN (DBI does not answer)" and stops; it prints
+  the LTSSM state (`state 0x..`). Step 9 treats a 0xffffffff ID as "no answer" and clears `linked`, so
+  step 10 and `negroni_wifi_pcie_handles` (0261) cannot run.
+- New log lines: `NEGRONI WIFI: 8 link DOWN: the root port's LNKSTA reads 0xffffffff (DBI does not
+  answer), LTSSM 0x.. (state 0x..)`, `NEGRONI WIFI: 8 link UP|DOWN: LNKSTA ... (state 0x..)`,
+  `NEGRONI WIFI: 9 stop: bus 1 config space reads 0xffffffff (no answer: no link)`.
+- The GCC (2 MiB) and TLMM (840 KiB) maps of the survey moved to `ml_io_map_unmappable` in patch
+  0290 (io_submap budget, notes.md "io_submap").
+- Why the DBI does not answer and the chip is not detected: notes.md section 16 (part 2, open).
+
 ## 0261-negroni-wlan-mhi-fw.patch
 
 Stage 1 of the driver: claim BAR0, choose the firmware, download it over MHI (BHI + BHIe), reach
@@ -68,6 +87,12 @@ Sequence (Linux order, op-kernel `drivers/bus/mhi/host`) [V source, I untested o
 7. EE AMSS, then START_CHAN 20 and 21.
 
 All 64-bit doorbells and base registers are written high word first (`main.c` `mhi_write_db`).
+
+Mapping change 2026-10-25 [V source, I untested]: BAR0 (2 MiB) maps with `ml_io_map_unmappable(...,
+VM_WIMG_IO 0x7)` (kernel_map, not the 8 MiB io_submap); the failure path unmaps it after
+`wlan_quiesce`. The pool's WCOMB view is now unmapped with its 16 KiB-rounded size: `ml_io_unmap`
+of 0x691000 bytes would have panicked in `pmap_remove_options` (MACH_ASSERT is on in this
+DEVELOPMENT build, `mach_assert.h`; the end address must be page aligned, pmap.c:4294).
 
 ### Boot log lines (all start "NEGRONI WLAN:")
 

@@ -447,9 +447,18 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - [V] No battery NTC channel exists in the ADC7 HLOS list; PM8350B charger/QBG are not in the HLOS DT (only temp-alarm 0xa00, PBS 0x1900, BCL 0x4700, GPIO 0x8800, haptics 0xf000, AMOLED 0xf800-0xfa00).
 - [V] ADC7 conversion needs writes (Linux adc7_configure): 0x40 APP_SID, 0x42-0x45 params/channel/settle, 0x47 CONV_REQ 0x80; result 0x50/0x51; volts = code * 1.875 V / 0x70e4 * den / num (qcom-spmi-adc5.c, qcom-vadc-common.c).
 - [I] The 1/3 VBAT value is the mean cell voltage (ADC max 1.875 V x 3 = 5.6 V cannot see a 6-9 V pack; either 1S-side node or a 1/6 hardware divider on the pack); `negronibatt=2` logs vph and the 2S midpoint (0x396) to settle it.
-- [V] 0270/0271 apply in name order after all other patches/xnu patches on base a5b0203 (`git apply --check`, 2026-10-25).
-- [V] 0271 boot-arg negronibatt: 0 = no power source (old kernel), 1 = VADC estimate (default), 2 = 1 + raw line per poll + SID 1/3 APID census, 3 = static 100 % on AC; log prefix `NEGRONI BATTERY:` (source).
-- [I] Without the ADSP nobody configures the PM8350B charger; whether it charges at all is unknown: the `ichg` value in the 0271 log shows it.
+- [V] PM8350B BCL (SID 3 0x4700, DT bcl@4700 "qcom,bcl-v5", qcom,pmic7-threshold) is readable without writes: 0x46 MONITOR_EN bit 7, 0x72 VBAT_CONV_REQ, 0x76 VBAT_READ 49.827 mV/bit (0x7f = none), 0x86 IBAT_READ s8 x 78.127 mA (range factor 10, + = discharge, 0 = no new reading); Linux writes MONITOR_EN = 0x80 at probe (OnePlus SM8450 downstream drivers/thermal/qcom/bcl_pmic5.c).
+- [V] DT pm8350b-ibat-lvl0 trip 9000 mA on sensor <0x590 0> = the SID 3 BCL (out/live.dts:9570).
+- [V] A second BCL exists on PM8350C (SID 2 0x4700); 0271 does not use it (DT).
+- [V] 20H392 powerd matches "IOPMPowerSource" and reads CurrentCapacity, MaxCapacity, AppleRawCurrentCapacity, AppleRawMaxCapacity, IsCharging, FullyCharged, ExternalConnected, ExternalChargeCapable, AppleRawExternalConnected, BatteryInstalled, Voltage, Amperage, InstantAmperage, Temperature, CycleCount, DesignCapacity, NominalChargeCapacity, TimeRemaining, AtCriticalLevel, AdapterDetails, BatteryData, PermanentFailureStatus, BatteryCellDisconnectCount (strings of /System/Library/CoreServices/powerd.bundle/powerd); no "AppleSmartBattery" string. 0271 publishes all of them.
+- [V] 0270 (final): `negroni_spmi_arbiter()` maps the arbiter once (core 0x3000, EE 0 observer 0x8000, cnfg 0x1000) for the RTC (0203 `nc_init` now calls it) and the battery; reads use `sk_read8` of negroni_spmi_keys.h (SK_POLLS bounded); a timed-out APID is not used again; writes are locked (only modes 4/5 unlock the ADC7 request registers 0x3140-0x3145/0x3147 when EE 0 owns the VADC APID; each write waits at most 2000 x 1 us) (source).
+- [V] 0270 read allowlist: SID 3 0x47xx, SID 0 0x31xx, SID 3 offsets 0x04/0x05/0x10. No other driver uses a SID 3 APID or 0x031 (keys 0x013/0x18d, reboot 0x071/0x008, RTC 0x061): grep of all patches. The old census also read SID 1 = the keys' GPIO 0x18d channel (a race with the key thread): removed.
+- [V] 0271 boot-arg negronibatt: 0 = no power source (old kernel), 1 = read-only BCL estimate (default), 2 = 1 + raw line per poll + SID 3 census + INT_RT_STS change lines, 3 = static 100 % on AC (no PMIC access), 4 = 1 + VADC conversions (writes the ADC7 request registers), 5 = 4 + the diagnostics of 2; log prefix `NEGRONI BATTERY:` (source).
+- [V] 0271 uses the BCL values only when MONITOR_EN bit 7 is set; it never writes it. With the monitor off and no VADC the service publishes the static 100 % on AC and says why after 3 polls (source).
+- [I] Nobody sets BCL MONITOR_EN without Linux, so it may be 0 after the Mu/UEFI boot: then only `negronibatt=4/5` measure. The first `negronibatt=2` log shows the value.
+- [I] Which node the BCL sees on the 2S pack (1S side or the pack) is not known; VBAT > 5000 mV is halved, and the coulomb count assumes 1S-side current with 5000 mAh.
+- [V] 0270 and 0271 apply on a patched-tree.sh tree of all patches up to 0261 + 0213 (out/kernel/tree-battery, 2026-10-25); compile-one.sh OK for negroni_spmi.c and negroni_rtc.c; NegroniBattery.cpp has no diagnostic with its clang++ line from build.log.
+- [V] The USB driver forces VBUS valid (negroni_usb.c UTMI_OTG_VBUS_VALID), so USB cannot tell a charger; not used.
 - [I] Exact SoC needs the ADSP charger PD (GLINK PMIC_RTR_ADSP_APPS, after the audio ADSP work); README-battery.md section 6 lists the messages.
 
 ## 15. GL driver loading on iOS 16 (GL agent, 2026-10-25) [V: 20H392 shared cache, unslid addresses]
@@ -728,3 +737,80 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   matches (no change). Old kernel: helper exit 3, no reboot.
 - [I] Not tested on the phone: root write from the setuid helper, and that ABL honours reason 2 after a
   `reboot(RB_AUTOBOOT)` (the 0210 `bootloader` UDP command is the comparison).
+
+## 20. io_submap budget and the ADSP panic (2026-10-25, io-fix agent; patches 0234 0240 0260 0261 0290)
+
+- [V] Panic on the phone (photo, GPU kept on `negroniadreno=22 negroniadreno_keep=1`, Wi-Fi survey to
+  step 10, `negroniadsp=1`): `kmem_alloc(0xfffffe1006230e20, 2097152, 0x10002): failed with 3 @vm_kern.c:178`,
+  caller 0xfffffe0007aec438 = end of `___kmem_failed_panic` in `out/kernel/local-20261025-103035` (no KASLR
+  slide). 2097152 = 0x200000 = 0240 step 1 `ml_io_map_wcomb(SMEM_PHYS, SMEM_SIZE)`. 3 = KERN_NO_SPACE.
+  [I] The photo's flags lack a digit: io_map uses KMA_NOFAIL|KMA_PAGEABLE|KMA_PERMANENT = 0x100021.
+- [V] `ml_io_map`, `ml_io_map_wcomb`, `ml_io_map_with_prot` take VA from io_submap: 8 MiB for the whole
+  kernel (osfmk/arm/io_map.c:65), KMA_NOFAIL + KMA_PERMANENT, so a request that does not fit panics.
+  Each map uses round_page(size + (pa & 0x3fff)): the kernel page is 16 KiB (pexpert/arm64/NEGRONI.h
+  `__ARM_16K_PG__`), so a 0x1000 map costs 16 KiB.
+- [V] `ml_io_unmap` of an io_submap address panics: kmem_free(kernel_map) reaches the permanent io_submap
+  entry (vm_map.c:8188 `__vm_map_delete_permanent_panic`).
+- [V] `ml_io_map_unmappable(pa, size, flags)` (osfmk/arm64/machine_routines.c:1574) maps the same way
+  (pmap_map with `flags` as WIMG) but takes VA from kernel_map (KMA_DATA, not permanent); `ml_io_unmap`
+  removes it. WIMG values (osfmk/arm/memory_types.h): VM_WIMG_IO 0x7 (Device, = ml_io_map),
+  VM_WIMG_WCOMB 0x6 (Normal non-cacheable, = ml_io_map_wcomb). Not exported to bsd/: local defines.
+- [V] `ml_io_unmap(addr, size)` needs a 16 KiB multiple: pmap_remove_options panics on an unaligned end
+  (pmap.c:4294, MACH_ASSERT=1 in DEVELOPMENT_ARM64_NEGRONI `mach_assert.h`).
+- [V] Early maps (before STARTUP_SUB_KMEM) use virtual_space_start, not io_submap: fbcon (0xb8000000 +
+  0x2b00000, pe_serial.c:838, serial_init at arm_init.c:540), GICD/GICR (pe_fiq.c, PE_init_platform(TRUE)
+  at arm_init.c:600), both before machine_startup -> kernel_bootstrap. The ADT has no /pram, stram,
+  coresight-reg or cpu-impl-reg (slop mkadt.py): those XNU maps do not run.
+
+io_submap use (KiB, 16 KiB pages). Source: the tree `patched-tree.sh` + every `ml_io_map*` call in
+bsd/dev/negroni_*.c, iokit/Kernel/arm/Negroni*.cpp [V source; boot order and counts I: from the code, not measured]:
+
+| Group (owner) | Maps, when | KiB before | After this fix |
+|---|---|---|---|
+| UFS, USB (slop 0028/0072/0074/0089) | GCC 0x90000, DWC3, QSCRATCH, UFS regs: boot | 688 | same |
+| keys, reboot, RTC, RPMh, touch, cpufreq (slop + 0203/0210/0211) | SPMI/RSC/cmd-db/TLMM pins/EPSS pages: boot | 416 | same |
+| FB DPU/MDSS (0234) | 0x84000, boot (`negronifb_dpuprobe` default 1) | 528 | kernel_map |
+| backlight DSI0 (0250) | 0x400, boot | 16 | same |
+| Wi-Fi survey GCC + TLMM (slop 0106) | 0x1f4200 + 0xd2000, boot with `negroniwifi>=1` (default 4) | 2864 | kernel_map (0290) |
+| Wi-Fi cmd-db, PARF/PHY/DBI/cfg (slop 0109/0120) | steps 3-9 | 128 + 96 | same |
+| Adreno GCC (slop 0097) | 0x1f4200, boot with `negroniadreno>=1` (default 22) | 2016 | kernel_map (0290) |
+| Adreno GPUCC, GMU, RSCC, SMMU (slop 0097-0101) | boot | 592 | same |
+| Adreno GPU regs, CX_MISC, PDC, cmd-db, zap (slop 0108-0111) | GPU steps 15-21 | 480 | same |
+| ADSP SMEM (0240) | 0x200000, step 1 | 2048 | kernel_map |
+| ADSP carveout (0240) | 0x2800000, step 6, then ml_io_unmap (would panic) | 40960 | kernel_map, unmapped |
+| ADSP IPCC, AOSS, TCSR (0240) | steps 4, 7 | 48 | same |
+| WLAN BAR0 (0261) | 0x200000, `negroniwlan=2` | 2048 | kernel_map, unmapped on failure |
+
+Totals (of 8192 KiB): default config (wifi=4, adreno=22) 7248 -> 1840; the photo boot before the ADSP
+7824 -> 2416 (so 368 KiB were free and the 2048 KiB SMEM map panicked [V matches the photo]);
++ ADSP 1-8 + negroniwlan=2 -> 2464. Biggest left: USB GCC 576, Adreno SMMU/GPU regs 256 each.
+Rule for new code: register pages may use `ml_io_map`; anything >= 256 KiB, any RAM view and anything
+that is unmapped uses `ml_io_map_unmappable` + `ml_io_unmap` with the page-rounded size.
+
+Patches (2026-10-25, regenerated with scripts/kernel/patched-tree.sh in out/kernel/tree-iofix, deleted after):
+- 0240: SMEM and carveout -> `ml_io_map_unmappable(..., 0x6)`; carveout unmapped at the end of step 6 on
+  every path (map failure frees the chunk buffer); IPCC/AOSS/TCSR mapped once; static assert carveout 16 KiB multiple.
+- 0234: MDSS -> `ml_io_map_unmappable(..., 0x7)`.
+- 0261: BAR0 -> `ml_io_map_unmappable(..., 0x7)`, unmapped in wlan_cleanup (after wlan_quiesce); the pool
+  view unmap uses round_page(0x691000) = 0x694000 (the old size would have panicked in pmap_remove).
+- 0260: step 8 LNKSTA 0xffffffff = link DOWN (stop); step 9 ID 0xffffffff = no answer, `linked` cleared.
+- 0290 (new, slop lines only): Adreno GCC, Wi-Fi survey GCC and TLMM -> `ml_io_map_unmappable(..., 0x7)`.
+- [I] Small leaks left: Wi-Fi step 4 maps PARF/PHY again in step 7 (32 KiB); NegroniBacklight re-maps DSI0
+  if `negroni_dsi_init` fails once and is called again (only from attach today).
+- [V] 0270 (battery, added to patches/xnu by another agent during this build): the final 0270 maps no new
+  io_submap space in the default mode: the RTC (0203) and the battery share one arbiter mapping (core
+  16 KiB + observer 32 KiB + cnfg 16 KiB, which the RTC mapped alone before); `negronibatt=4/5` add one
+  16 KiB VADC channel page. Nothing is unmapped (battery agent, source).
+- [V] Build 2026-10-25 (`scripts/bg.sh kernel-iofix scripts/kernel/build-local.sh`):
+  `out/kernel/local-20261025-125940/kernel.development.negroni` (sha256 39cb11c5...), patch-report: all 27
+  patches/xnu applied (0200-0261, 0270, 0271, 0290), only the 4 usual dxb skips. `out/kernel/kernel.macho` points to it.
+  [I] Not booted. Next phone test: the same boot-args as the photo; expect no kmem_alloc panic,
+  `NEGRONI ADSP: 1 SMEM partition 0/2 at ...`, and `NEGRONI WIFI: 8 link DOWN: ... 0xffffffff`.
+- Wi-Fi part 2 leads (not yet in any patch) [V source, I effect]: (1) 0120 writes PARF_DBI_BASE_ADDR_V2 and
+  PARF_ATU_BASE_ADDR with CPU physical addresses (Linux qcom_pcie_configure_dbi_atu_base) but not
+  PARF_SLV_ADDR_SPACE_SIZE_V2 0x358 = 0 / _HI 0x35c = 0x80000000, which Linux writes with them
+  (wlan-linux pcie-qcom.c:440-465); the vendor pci-msm.c:4394/4422 instead writes DBI_BASE 0 and
+  SLV_ADDR_SPACE_SIZE 0x4000000. The mix leaves the DBI undecoded -> all-ones reads (matches the photo).
+  (2) GPIO95 CLKREQ# is not muxed to pcie0_clkreqn (func 1, pull-up; live.dts pcie0_clkreq_default).
+  (3) cnss2 drives XO_CLK GPIO204 high >= 100 us before WLAN_EN, then low 2-5 ms after (power.c:819-904);
+  the survey never drives it. (4) cnss2 waits 100 ms after BT_EN off before WLAN_EN (power.c:934).

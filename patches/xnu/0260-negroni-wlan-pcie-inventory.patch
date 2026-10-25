@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/negroni_wifi.c b/bsd/dev/negroni_wifi.c
-index 6d988e5..0f2354d 100644
+index 6d988e5..9b303fe 100644
 --- a/bsd/dev/negroni_wifi.c
 +++ b/bsd/dev/negroni_wifi.c
 @@ -19,6 +19,8 @@
@@ -11,7 +11,42 @@ index 6d988e5..0f2354d 100644
   *
   * Addresses: sm8450.dtsi pcie@1c00000 / phy@1c06000, gcc-sm8450.c, the phone's DT.
   */
-@@ -459,17 +461,71 @@ step_chip(void)
+@@ -433,9 +435,22 @@ step_link(void)
+ 		}
+ 		delay(10000);
+ 	}
+-	printf("NEGRONI WIFI: 8 link %s: LNKSTA %#x (gen %u x%u), LTSSM %#x\n", (status & (1u << 29)) ? "UP" : "down",
+-	    status >> 16, (status >> 16) & 0xf, (status >> 20) & 0x3f, rd(parf + PARF_LTSSM));
++	/*
++	 * 0xffffffff is a failed read, not a status: the DBI did not answer (photo 2026-10-25:
++	 * "link up: LNKSTA 0xffff (gen 15 x63), LTSSM 0x180", then bus 1 read 0xffffffff). Only a
++	 * real LNKSTA with DLLLA (bit 13) set is a link. PARF_LTSSM [5:0] is the LTSSM state
++	 * (pci-msm.c MSM_PCIE_LTSSM_MASK 0x3f; 0x11 = L0), bit 8 our LTSSM_EN.
++	 */
++	uint32_t ltssm = rd(parf + PARF_LTSSM);
++	if (status == 0xffffffffu) {
++		printf("NEGRONI WIFI: 8 link DOWN: the root port's LNKSTA reads 0xffffffff (DBI does not answer), "
++		    "LTSSM %#x (state %#x)\n", ltssm, ltssm & 0x3f);
++		linked = false;
++		return false;
++	}
+ 	linked = (status & (1u << 29)) != 0;
++	printf("NEGRONI WIFI: 8 link %s: LNKSTA %#x (gen %u x%u), LTSSM %#x (state %#x)\n", linked ? "UP" : "DOWN",
++	    status >> 16, (status >> 16) & 0xf, (status >> 20) & 0x3f, ltssm, ltssm & 0x3f);
+ 	return linked;
+ }
+ 
+@@ -455,21 +470,81 @@ step_chip(void)
+ 	    rd(cfg_bus1 + 0x08) >> 8, rd(cfg_bus1 + 0x10), rd(cfg_bus1 + 0x14));
+ 	if (id == CHIP_ID) {
+ 		printf("NEGRONI WIFI: 9 THE QCA6490 ANSWERS ON PCIe\n");
++	} else if (id == 0xffffffffu) {
++		printf("NEGRONI WIFI: 9 stop: bus 1 config space reads 0xffffffff (no answer: no link)\n");
++		linked = false;     /* no step 10, no driver hand-over (negroni_wifi_pcie_handles) */
++	} else {
++		printf("NEGRONI WIFI: 9 stop: %08x is not the QCA6490 (17cb:1103)\n", id);
++		linked = false;
+ 	}
  	return id == CHIP_ID;
  }
  

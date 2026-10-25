@@ -141,6 +141,21 @@ Notes [I]: we advertise SMP2P SSR-ACK but do not implement the ack (only needed 
 restart); only the ACTIVE RPMh set is voted (no sleep/wake sets; fine while XNU does not flush
 RPMh sleep sets).
 
+**Phone test 2026-10-25 (photo, GPU kept on `negroniadreno=22 negroniadreno_keep=1`, Wi-Fi survey to step 10)**
+[V]: `NEGRONI ADSP: steps 1..8 (UNTESTED stage (a)...)`, then
+`panic(cpu 1 caller 0xfffffe0007aec438): kmem_alloc(0xfffffe1006230e20, 2097152, 0x10002): failed with 3 @vm_kern.c:178`.
+- [V] The caller address is the end of `___kmem_failed_panic` in `out/kernel/local-20261025-103035`
+  (no KASLR slide: `nm` gives `___kmem_failed_panic` 0xfffffe0007aec3fc, next symbol 0xfffffe0007aec438).
+- [V] 2097152 = 0x200000 = SMEM_SIZE; step 1 `ml_io_map_wcomb(SMEM_PHYS, SMEM_SIZE)` is the first thing
+  that runs (no "about to" line before it). Error 3 = KERN_NO_SPACE: io_submap (8 MiB, osfmk/arm/io_map.c:65)
+  was full (table: notes.md "io_submap"). [I] The photo's flags 0x10002 lack a digit: io_map passes
+  KMA_NOFAIL | KMA_PAGEABLE | KMA_PERMANENT = 0x100021 (only a KMA_NOFAIL request reaches this panic).
+- Fix (0240 regenerated 2026-10-25, build `kernel-iofix`): SMEM (2 MiB, kept for GLINK) and the
+  40 MiB carveout use `ml_io_map_unmappable(pa, size, VM_WIMG_WCOMB 0x6)` (kernel_map, not io_submap).
+  The carveout `ml_io_unmap` at the end of step 6 is now legal (before, it would have panicked in
+  vm_map_delete on the permanent io_submap entry, vm_map.c:8188). IPCC, AOSS and the TCSR mutex stay
+  on `ml_io_map` (16 KiB each), mapped only once. [I] Untested on the phone.
+
 Boot-args: `negroniadsp=1` (default 0: nothing runs), `negroniadsp_step=N` (stop after N),
 `negroniadsp_wait=S` (ready timeout, default 10), `negroniadsp_pause=MS` (sleep before each write
 step), `negroniadsp_unvote=0` (keep rail votes after handover). It runs on its own kernel thread,
