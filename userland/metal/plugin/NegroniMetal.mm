@@ -31,6 +31,9 @@
 #include <stdarg.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <pthread.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <unistd.h>
 #include "NativeBridgeMetalFrontend.h"
 #include "bridge/NativeMetalObjects.h"
@@ -38,7 +41,9 @@
 #ifndef NMTL_CLASS
 #define NMTL_CLASS NegroniMTLDevice
 #endif
-#define NMTL_DIR "/var/db/negronimetal"
+#ifndef NMTL_DIR
+#define NMTL_DIR "/var/db/negronimetal" /* the host test (scripts/metal/host-plugin-test.sh) sets its own */
+#endif
 
 /* ---- log (the frontend calls sm2_logs: keep that name) ---- */
 extern "C" void sm2_logs(const char *s)
@@ -126,10 +131,6 @@ static void missing(const char *cls, const char *sel)
 /* ---- gate ---- */
 static bool listed(void)
 {
-	if (access(NMTL_DIR "/off", F_OK) == 0) {
-		nlog("%s exists: no Metal device", NMTL_DIR "/off");
-		return false;
-	}
 	FILE *f = fopen(NMTL_DIR "/clients", "r");
 	if (!f)
 		return false;
@@ -201,6 +202,167 @@ static void load_env(void)
 	fclose(ef);
 }
 
+/* ---- fast checks before Turnip opens: each one is a clean "no device" ---- */
+static bool bootarg_off(void)
+{
+	char args[1024] = { 0 };
+	size_t n = sizeof(args) - 1;
+	if (sysctlbyname("kern.bootargs", args, &n, NULL, 0) != 0)
+		return false;
+	for (char *p = strstr(args, "negronimetal="); p; p = strstr(p + 1, "negronimetal="))
+		if ((p == args || p[-1] == ' ') && p[13] == '0')
+			return true;
+	return false;
+}
+
+/* The GPU user client (docs/gpu-abi.md): without RedwoodGPU Turnip has no device, so do not even load it. */
+static bool gpu_service_present(void)
+{
+#ifdef NMTL_HOST_TEST
+	return getenv("NMTL_HOST_NO_GPU") == NULL; /* the Mac has no RedwoodGPU: the test says which answer it wants */
+#endif
+	io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedwoodGPU"));
+	if (!s)
+		return false;
+	IOObjectRelease(s);
+	return true;
+}
+
+/* KEY from the environment (NMTL_DIR/env sets it) as a number, else def */
+static long env_num(const char *key, long def)
+{
+	const char *v = getenv(key);
+	return v && *v ? strtol(v, NULL, 0) : def;
+}
+
+/* ---- IOSurface imports: tell Turnip's DRM layer which surface a CPU range is (kernel import by surface ID) ---- */
+static void (*note_surface)(const void *, uint64_t, uint32_t);
+static void surface_hook(const void *base, uint64_t bytes, uint32_t surface)
+{
+	note_surface(base, bytes, surface);
+}
+static void hook_surfaces(const char *turnip)
+{
+	void *h = dlopen(turnip, RTLD_NOW | RTLD_NOLOAD);
+	note_surface = h ? (void (*)(const void *, uint64_t, uint32_t))dlsym(h, "redwood_drm_note_surface") : NULL;
+	if (note_surface)
+		native_bridge_metal_set_surface_hook(surface_hook);
+	else
+		nlog("Turnip has no redwood_drm_note_surface: IOSurface textures need the kernel's user-page import");
+}
+
+/*
+ * Self-test before the device is handed out (a device that registers but cannot draw makes CoreAnimation draw nothing):
+ * clear a 64x64 IOSurface-backed BGRA8 texture on the GPU and read the surface back on the CPU. That is the render
+ * server's path: IOSurface import (kernel + Turnip), command submission, fence, cache maintenance. When it fails, a
+ * plain texture clear tells "GPU works, surface import does not" from "GPU does not work" in the log. No shaders:
+ * load-action clears only, so no pipeline compile can stall it.
+ */
+static BOOL pixel_ok(uint32_t v) /* BGRA8 (0.25, 0.5, 0.75, 1) = 0xff4080bf, +-1 */
+{
+	int b = v & 0xff, g = (v >> 8) & 0xff, r = (v >> 16) & 0xff, a = v >> 24;
+	return b >= 0xbe && b <= 0xc0 && g >= 0x7f && g <= 0x81 && r >= 0x3f && r <= 0x41 && a == 0xff;
+}
+
+static NSString *clear_into(id<MTLCommandQueue> q, id<MTLTexture> t)
+{
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = t;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0.25, 0.5, 0.75, 1.0);
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	if (!cb)
+		return @"no command buffer";
+	id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+	if (!e)
+		return @"no render encoder";
+	[e endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (cb.status != MTLCommandBufferStatusCompleted)
+		return [NSString stringWithFormat:@"command buffer status %ld error %@", (long)cb.status, cb.error];
+	return nil;
+}
+
+static NSString *selftest(id<MTLDevice> d)
+{
+	const int W = 64, H = 64;
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	if (!q)
+		return @"no command queue";
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+											 width:W height:H mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @(W), (id)kIOSurfaceHeight : @(H), (id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfaceBytesPerRow : @(W * 4), (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+	};
+	IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	NSString *why = s ? nil : @"IOSurfaceCreate failed";
+	if (s) {
+		id<MTLTexture> t = [d newTextureWithDescriptor:td iosurface:s plane:0];
+		why = t ? clear_into(q, t) : @"newTextureWithDescriptor:iosurface:plane: nil";
+		if (!why) {
+			IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+			const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(s);
+			size_t bpr = IOSurfaceGetBytesPerRow(s);
+			int bad = 0;
+			for (int y = 0; y < H; y++)
+				for (int x = 0; x < W; x++)
+					bad += !pixel_ok(((const uint32_t *)(base + y * bpr))[x]);
+			uint32_t first = *(const uint32_t *)base;
+			IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+			if (bad)
+				why = [NSString stringWithFormat:@"IOSurface clear: %d of %d pixels wrong, first 0x%08x", bad, W * H, first];
+		}
+		CFRelease(s);
+	}
+	if (!why)
+		return nil;
+	/* diagnosis only: does the GPU draw into its own memory? */
+	td.storageMode = MTLStorageModeShared;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	NSString *plain = t ? clear_into(q, t) : @"newTextureWithDescriptor: nil";
+	if (!plain) {
+		uint32_t px[64 * 64];
+		[t getBytes:px bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
+		int bad = 0;
+		for (int i = 0; i < W * H; i++)
+			bad += !pixel_ok(px[i]);
+		plain = bad ? [NSString stringWithFormat:@"%d of %d pixels wrong, first 0x%08x", bad, W * H, px[0]] : @"PASS";
+	}
+	return [NSString stringWithFormat:@"%@ (plain texture clear: %@)", why, plain];
+}
+
+/* The open + self-test run on their own thread; the caller waits at most this long (Metal's caller must never hang). */
+@interface NMTLOpen : NSObject
+@property(atomic, strong) id device;
+@property(atomic, copy) NSString *why;
+@property(atomic) BOOL abandoned;
+@end
+@implementation NMTLOpen
+@end
+
+/* backboardd: the frontend's counters every 10 s into NMTL_DIR/metal.log while NMTL_DIR/telemetry exists */
+static void telemetry_loop(void)
+{
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		for (;;) {
+			sleep(10);
+			if (access(NMTL_DIR "/telemetry", F_OK) != 0)
+				continue;
+			static char text[8192];
+			native_bridge_metal_telemetry(text, sizeof(text));
+			int fd = open(NMTL_DIR "/metal.log", O_WRONLY | O_APPEND);
+			if (fd >= 0) {
+				dprintf(fd, "NMTL[%d %s]: telemetry\n%s", getpid(), getprogname(), text);
+				close(fd);
+			}
+		}
+	});
+}
+
 @interface _MTLDevice : NSObject
 @end
 
@@ -218,17 +380,33 @@ static void load_env(void)
 	static id device;
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
+		if (access(NMTL_DIR "/off", F_OK) == 0) {
+			nlog("%s exists: no Metal device", NMTL_DIR "/off");
+			return;
+		}
 		if (!listed()) {
 			nlog("not listed in %s: no Metal device", NMTL_DIR "/clients");
+			return;
+		}
+		if (bootarg_off()) {
+			nlog("boot-arg negronimetal=0: no Metal device");
+			return;
+		}
+		if (!gpu_service_present()) {
+			nlog("no RedwoodGPU service (boot-args negroniadreno=22 negroniadreno_keep=1): no Metal device");
+			return;
+		}
+		NSString *bundle = [[NSBundle bundleForClass:[NMTL_CLASS class]] bundlePath];
+		NSString *turnip = [bundle stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];
+		if (const char *t = getenv("NEGRONI_TURNIP"))
+			turnip = @(t);
+		if (access(turnip.UTF8String, R_OK) != 0) {
+			nlog("no Turnip at %s: no Metal device", turnip.UTF8String);
 			return;
 		}
 		char strike[256];
 		if (!deadman_arm(strike, sizeof(strike)))
 			return;
-		NSString *bundle = [[NSBundle bundleForClass:[NMTL_CLASS class]] bundlePath];
-		NSString *turnip = [bundle stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];
-		if (const char *t = getenv("NEGRONI_TURNIP"))
-			turnip = @(t);
 		/* shader + pipeline cache: NMTL_DIR/cache/<process>, else the sandboxed process's own cache directory */
 		char cache[256];
 		mkdir(NMTL_DIR "/cache", 0777);
@@ -249,20 +427,83 @@ static void load_env(void)
 		CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
 		load_env();
+		const long timeout_ms = env_num("NEGRONIMETAL_OPEN_MS", 6000);
+		const bool test = env_num("NEGRONIMETAL_SELFTEST", 1) != 0;
 
 		uint64_t registryID = 0;
 		if (port)
 			IORegistryEntryGetRegistryEntryID(port, &registryID);
 		double t0 = CFAbsoluteTimeGetCurrent();
-		@try {
-			device = native_bridge_metal_open(turnip.UTF8String, cache, registryID, missing);
-		} @catch (NSException *e) {
-			nlog("device: exception %s", e.reason.UTF8String);
-			device = nil;
+		NMTLOpen *job = [NMTLOpen new];
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		const char *tpath = strdup(turnip.UTF8String);
+		const char *cpath = strdup(cache);
+		/* its own thread with a big stack (Turnip and the translator recurse); the job object outlives a timeout */
+		pthread_attr_t attr;
+		pthread_attr_init(&attr);
+		pthread_attr_setstacksize(&attr, 8 << 20);
+		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+		struct Ctx {
+			void *job, *done;
+			const char *turnip, *cache;
+			uint64_t registryID;
+			bool test;
+		};
+		Ctx *ctx = new Ctx{ (__bridge_retained void *)job, (__bridge_retained void *)done, tpath, cpath, registryID, test };
+		pthread_t th;
+		int e = pthread_create(&th, &attr, [](void *arg) -> void * {
+			Ctx *c = (Ctx *)arg;
+			@autoreleasepool {
+				NMTLOpen *job = (__bridge_transfer NMTLOpen *)c->job;
+				dispatch_semaphore_t done = (__bridge_transfer dispatch_semaphore_t)c->done;
+				id dev = nil;
+				NSString *why = nil;
+				@try {
+					dev = native_bridge_metal_open(c->turnip, c->cache, c->registryID, missing);
+					if (!dev)
+						why = [NSString stringWithFormat:@"open refused: %s", nmb_last_error()];
+					if (dev)
+						hook_surfaces(c->turnip);
+					if (dev && c->test && !job.abandoned) {
+						why = selftest(dev);
+						if (why)
+							why = [@"self-test: " stringByAppendingString:why];
+					}
+				} @catch (NSException *ex) {
+					why = [NSString stringWithFormat:@"exception %@", ex.reason];
+				}
+				job.why = why;
+				job.device = why ? nil : dev;
+				dispatch_semaphore_signal(done);
+			}
+			free((void *)c->turnip);
+			free((void *)c->cache);
+			delete c;
+			return NULL;
+		}, ctx);
+		pthread_attr_destroy(&attr);
+		bool timed_out = false;
+		if (e != 0) {
+			/* no thread: undo the transfers and open on this one, without a deadline */
+			job = (__bridge_transfer NMTLOpen *)ctx->job;
+			(void)(__bridge_transfer dispatch_semaphore_t)ctx->done;
+			free((void *)tpath);
+			free((void *)cpath);
+			delete ctx;
+			nlog("pthread_create: %d: no Metal device", e);
+		} else if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, timeout_ms * NSEC_PER_MSEC)) != 0) {
+			job.abandoned = YES;
+			timed_out = true;
 		}
-		nlog("device %s in %.0f ms (turnip %s, cache %s)%s%s", device ? [[device name] UTF8String] : "refused",
-		     (CFAbsoluteTimeGetCurrent() - t0) * 1000, turnip.UTF8String, cache, device ? "" : ": ",
-		     device ? "" : nmb_last_error());
+		device = timed_out ? nil : job.device;
+		double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000;
+		if (timed_out)
+			nlog("device open/self-test still running after %ld ms: no Metal device (the strike stays; "
+			     "NEGRONIMETAL_OPEN_MS in %s/env changes the limit)", timeout_ms, NMTL_DIR);
+		else
+			nlog("device %s in %.0f ms (turnip %s, cache %s, self-test %s)%s%s",
+			     device ? [[device name] UTF8String] : "refused", ms, turnip.UTF8String, cache,
+			     test ? "on" : "off", job.why ? ": " : "", job.why ? job.why.UTF8String : "");
 		/* Extended-range (XR10) formats: withheld from backboardd (8-bit framebuffer), allowed elsewhere (ios-flame). */
 		if (device && strcmp(getprogname(), "backboardd") != 0)
 			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
@@ -274,10 +515,13 @@ static void load_env(void)
 		Dl_info self_info = { 0 };
 		dladdr((void *)sm2_logs, &self_info);
 		nlog("image base %p (atos -o NegroniMetal.dSYM -l BASE ADDR)", self_info.dli_fbase);
-		if (device)
+		if (device) {
 			deadman_clear_later(strike);
-		else
-			unlink(strike); /* a clean refusal is not a crash */
+			if (!strcmp(getprogname(), "backboardd"))
+				telemetry_loop();
+		} else if (!timed_out) {
+			unlink(strike); /* a clean refusal is not a crash; a hang keeps its strike */
+		}
 	});
 	return device;
 }

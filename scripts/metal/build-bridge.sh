@@ -3,7 +3,7 @@
 # metal2vulkan runtime) as a static library: out/metal/bridge/<target>/libnative_metal_bridge.a
 #   scripts/metal/build-bridge.sh [ios|host]      (host: aarch64-apple-darwin, for checks on the Mac)
 # First: scripts/metal/fetch-sources.sh. Recipe: ios-flame tools/build-m2v-bridge.sh (MIT, 745c434).
-# Run in tmux: scripts/bg.sh metal-bridge scripts/metal/build-bridge.sh
+# Run in tmux: scripts/bg.sh metal-bridge scripts/metal/build-bridge.sh   (BRIDGE_TARGET_DIR=DIR: cargo target dir)
 set -euo pipefail
 . "$(cd "$(dirname "$0")" && pwd)/env.sh"
 target=${1:-ios}
@@ -43,7 +43,7 @@ esac
 export NMB_FIXTURE_AIR=$B/runtime_examples.air NMB_FC_AIR=$B/function_constant.air
 export IPHONEOS_DEPLOYMENT_TARGET=$IOS_MIN MACOSX_DEPLOYMENT_TARGET=14.0
 export CARGO_BUILD_JOBS=$NPROC
-cargo "+$RUST_TOOLCHAIN" build --release --manifest-path "$B/Cargo.toml" --target $triple --target-dir "$B/target"
+cargo "+$RUST_TOOLCHAIN" build --release --manifest-path "$B/Cargo.toml" --target $triple --target-dir "${BRIDGE_TARGET_DIR:-$B/target}"
 mkdir -p "$B/$target"
-cp "$B/target/$triple/release/libnative_metal_bridge.a" "$B/$target/"
+cp "${BRIDGE_TARGET_DIR:-$B/target}/$triple/release/libnative_metal_bridge.a" "$B/$target/"
 ls -la "$B/$target/libnative_metal_bridge.a"

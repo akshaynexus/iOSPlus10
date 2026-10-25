@@ -87,6 +87,12 @@ disable a process).
   (need a tile pipeline: CA uses them only with tile-shader support); 6 functions need their function constants
   (CA supplies them at run time). Vertex descriptors are host stand-ins (16-byte slots), so this checks the
   shader bodies, not CA's layouts. Output: `out/metal/translate/QuartzCore_default/{summary.txt,results.tsv}`.
+- Round 2 (2026-10-25): `host-translate.sh` now answers every pipeline input the compile asks for (vertex attributes,
+  function constants: first accepted type with value zero/false, attachment formats). vk12-floor: kernels 7/7, vertex 39/39,
+  fragment 75/95 (20 FramebufferFetch). Estimated A730 profile (`scripts/metal/a730-profile.py`: vk12-floor limits + the
+  Mesa 25.0.7 tu_device.cc features/extensions for FD730) [I]: kernels 7/7, vertex 39/39, **fragment 93/95**; the 2 left
+  (`inplace_copy_lpf/lph`) need `fragmentShaderPixelInterlock`, which Turnip 25.0.7 lacks. Output:
+  `out/metal/translate/QuartzCore_{floor,a730}/`. Review: `docs/reviews/gpu-turnip-metal-2026-10-25.md`.
 - Next host step: a real A730 Turnip profile (`vulkaninfo --json` from Turnip on Linux with drm-shim, FD_GPU_ID=730,
   as flame did for the A640, or from vkprobe on the phone), then rerun the sweep over all 134 system metallibs.
 

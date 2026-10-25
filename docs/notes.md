@@ -256,17 +256,30 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 - [V] `scripts/wifi/extract-fw.sh` (reworked 2026-10-25) extracts 198 files into `out/firmware/wlan/` with LISTING.txt + SHA256SUMS, modem.img sha256 `bcd07e89...` (`logs/wifi-fw.log`). The first version missed amss20.bin and bdwlang.*, and its run passed `MODEM_IMG=` as an argument, which it ignored.
 - [I] Effort for WPA2 Wi-Fi: about 3-5 months of focused work (`docs/wifi-plan.md`).
 
-## 13. Camera (research handoff, 2026-10-24)
+## 13. Camera (2026-10-24, reviewed 2026-10-25; details: docs/camera-plan.md)
 
-- [V] `out/live.dts:22144-22578` exposes four Qualcomm camera sensor slots on CCI0/CCI1 and CSIPHY subdevice indices 1, 2, 5, 0; it does not provide sensor model names, I2C addresses, or complete lane maps.
-- [V] `out/live.dts:22130-22578` includes actuator, EEPROM and OIS nodes; OIS identifiers include LC898128 and LC898124.
-- [V] `out/live.dts:184-188` reserves camera memory at `0x9f500000` for `0x800000` bytes; line 13481 contains `qcom,vmid-cp-camera-preview-ro`.
-- [V] OnePlus lists main Sony IMX789, ultra-wide Samsung JN1, and telephoto 8 MP/OIS; independent reviews identify telephoto OV08A10 and front Sony IMX615. This does not map modules to DT slots. Source: [camera-plan.md](camera-plan.md), vendor links there.
-- [V] Upstream Linux has a public SM8550 CAMSS binding, but no SM8450 CAMSS variant was found in the examined mainline tree; Qualcomm documents a separate downstream Camera Core Driver and upstream CamSS. Source: [camera-plan.md](camera-plan.md).
-- [V] `external/hackios-xnu-kernel/xnu/files/bsd/dev/redwood_camera.c` is camera work for POCO X5 Pro / redwood and its sensor configuration does not apply to NE2211.
-- [I] iOS 16's D22AP camera path likely expects AppleH10CamIn/Apple ISP private interfaces; validate daemon and driver names against the local 20H392 root before implementation.
-- [I] iOS has no documented third-party CMIO/DAL custom-camera extension route; a fake AppleH10CamIn provider is a research-grade route to stock capture apps.
-- [I] First action: offline decode of stock DTBO/vendor camera modules, then one sensor's guarded CCI chip-ID probe. See [camera-plan.md](camera-plan.md).
+- [V] Slot map (DT `cell-index` = CAMX `cameraId`; `out/camera/dt-table.txt`, `out/camera/modules.txt`
+  from `scripts/camera/inventory.sh`): 0 rear main IMX789 (CCI0 M0, 0x34, CSIPHY1, C-PHY 3 trios,
+  AF AK7377, OIS LC898128); 1 ultra-wide S5KJN1 (CCI0 M1, 0x20, CSIPHY2, 4-lane D-PHY, fixed focus);
+  2 front IMX615 (CCI1 M1, 0x20, CSIPHY5, 4-lane D-PHY); 3 tele OV08A10 (CCI1 M0, 0x6c, CSIPHY0,
+  2-lane D-PHY, AF AK7377, OIS LC898124 on CCI0 M1). Addresses 8-bit. MCLK 19.2 MHz.
+- [V] Rails, GPIOs, chip IDs and power order per slot: table in docs/camera-plan.md. VIO of all
+  sensors is pm8350c_l2 1.8 V; the other rails are PM8010 (i/j) LDOs.
+- [V] `camera_region@9f500000` (0x800000) is the `memory-region` of the ICP (`qcom,lx7`, `fw_name`
+  CAMERA_ICP). `qcom,vmid-cp-camera-preview-ro` (`out/live.dts:13481`) is in the generic
+  `qcom,secure-buffer` node, not tied to that region.
+- [V] CAMERA_ICP (.mdt/.bNN, .mbn, .elf) is in /vendor/firmware, signed (attestation chain); the
+  OnePlus camera-kernel loads it with `qcom_mdt_load` + `qcom_scm_pas_auth_and_reset(33)`. It serves
+  IPE/BPS only (`nrt-device`); raw RDI capture should not need it [I].
+- [V] Mainline Linux (5b0764a) has no sm8450 CAMSS binding (sm8550/sm8650 exist). Exact driver:
+  OnePlus camera-kernel in `out/src/op-modules`.
+- [V] iOS 16 root: `applecamerad` (starts on IOResources property `applecamerad`, loads the ISP
+  firmware), `H10ISP.mediacapture` + `H10ISPServices` in the shared cache, CMCapture `D22/` plists;
+  no `cameracaptured`. ADT: `isp,t8015`, `AppleH10CamIn` (`out/camera/ios-stack.txt`).
+- [I] Our XNU has no Apple kexts: stock capture needs an AppleH10CamIn-like service (reverse
+  engineering). Own app on a device node is the first realistic target.
+- [I] Next: stage 1 chip-ID read on slot 1 or 2 (needs new camcc + CCI code; RPMh votes exist).
+- DT node name trap: the front sensor node is `com,cam-sensor2`; match on `compatible`.
 
 ## 14. Bold Text (2026-10-24, reviewed 2026-10-25)
 
@@ -327,6 +340,16 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - `ipsw` (brew blacktop/tap/ipsw 3.1.739) reads the 20H392 cache in place: class-dump, disass `--vaddr` (with `--cache` on a writable path: the root mount is read-only), `dyld macho --symbols` [V]. Its nlist dump lacks re-exports (memcpy): check-imports.py also accepts what Apple's own images import [V].
 - CMake for iOS makes `.app` bundles of executables unless `CMAKE_MACOSX_BUNDLE OFF` [V].
 - Gate files on the phone: `/var/db/negronimetal/{clients,off,env,strikes/,cache/,metal.log}`; default clients = probes only, so backboardd keeps the GL path [decision].
+- Round 2 (2026-10-25, review `docs/reviews/gpu-turnip-metal-2026-10-25.md`):
+  - [V] QuartzCore `default.metallib` host translation with the stand-in loop (vertex attributes, function constants, attachment formats; `scripts/metal/host-translate.sh`): vk12-floor kernels 7/7, vertex 39/39, fragment 75/95 (20 = FramebufferFetch); A730 estimate profile (`scripts/metal/a730-profile.py`) kernels 7/7, vertex 39/39, **fragment 93/95**.
+  - [V] The 2 fragments left are `inplace_copy_lpf/lph`: RasterOrderGroups needs `fragmentShaderPixelInterlock`; Mesa 25.0.7 Turnip has no `VK_EXT_fragment_shader_interlock` (tu_device.cc). [I] CA uses them only when the device reports raster order groups.
+  - [I] The A730 profile is vk12-floor limits + features/extensions read from Mesa 25.0.7 tu_device.cc for FD730, not a capture. The 4 tile kernels pass only as tile pipelines (CA needs tile-shader support to use them). Function constants are stand-ins (zero/false), not CA's values.
+  - [V] `scripts/metal/selector-gap.py`: QuartzCore names 222 Metal protocol selectors; the flame frontend lacked 20 (MTLTexture swizzle/compression/sparse/parent-relative/gpuResourceID, pipeline/sampler gpuResourceID, makeAliasable, queue SPI finish). Patch `userland/metal/patches/flame/0001-*` adds them: 0 missing. [I] A string match is not proof of a call.
+  - [V] The 20H392 root is attached read-only at `/private/tmp/iosroot-ro` (another agent's mount of `~/op10-apple/ios16-root-new.img`). Copy of QuartzCore's metallib: `out/metal/ref/QuartzCore.default.metallib`.
+  - [V] Turnip's DRM layer exports `redwood_drm_note_surface(base, size, surface ID)` (negroni_drm.c, GPU agent, uncommitted). The frontend patch calls it before each IOSurface import, so a host-pointer import goes through kernel 0x7e by surface ID. The staged Turnip (00:22 build) does not export it yet: the plugin logs this, and on the phone the self-test then refuses the device [I].
+  - [V] The staged Turnip dylib uses LC_DYLD_INFO_ONLY and imports `dyld_stub_binder`. In the 20H392 cache that symbol is `local` in libdyld (`ipsw dyld symaddr`). [I] dyld4 may still bind it; a Turnip link with chained fixups removes the doubt.
+  - [V] Plugin host test on the Mac (`scripts/metal/host-plugin-test.sh`, MoltenVK as the loader): the cases unlisted, off, no GPU, 1 ms timeout (twice, strikes = 2), dead-man and device pass. The device case ran the IOSurface clear self-test through the frontend (681 ms).
+  - [V] The plugin and the frontend compile for arm64-apple-ios16.0 with Xcode 27.1 (`scripts/metal/build.sh`) and with Xcode 15.4 (iPhoneOS 17.5 SDK). Import check vs the 20H392 cache: PASS.
 
 ## CoreImage/PosterBoard crash (analysis 2026-10-25; addresses = unslid 20H392 cache, slide 0x1f750000 in logs/usblog-20261024-235438.txt)
 
@@ -416,6 +439,45 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - Open question [I]: GLEngine (Apple's GL front end) sits on top of the GLD plugin; the plugin must
   give GLEngine a renderer it accepts (pixel format + context), so the GLD interface must be implemented
   for real, not stubbed. CoreImage retries API 3 then API 2; CA may not retry.
+- Answer [V] (GL agent round 2, out/gpu/re): GLEngine needs a real GLD renderer (a 25-entry render dispatch that
+  reads GLEngine state); stub gld functions cannot make GLEngine contexts work.
+- [V] gfxInitializeLibrary: plugin function table at +0x420 + 8 x (index in plugin/gld-names.txt).
+  gldCreateDevice(&dev+0x18, mask, &dev+0x20), device ID at +0x10. A pixel format needs +8 = device ID and +0xc bit
+  0x100 (API 3 also 0x20000). gfxCreateSharedState calls gldCreateShareGroup, which must return 0.
+- [V] EAGL uses these GLI entries: CreateContextWithShared, DestroyContext, SetInteger, GetInteger, BindViewES,
+  PresentViewES, ChoosePixelFormat, DestroyPixelFormat, GetVersion. texImageIOSurface: = gliSetInteger(0x38e,
+  {surface ID, target, internal format, w, h, format, type, plane, 0}) then gliSetInteger(0x399, {target, invert}).
+  Context flags 0x10/0x20/0x40 = API 1/2/3. getMacroContextPrivate returns priv+0x20.
+- State (2026-10-25, not built): negronigl.c picks freedreno (RedwoodGPU opens) or softpipe (NEGRONIGL_DRIVER, boot-arg
+  negronigl_sw=1); sw_winsys.c (softpipe display targets = memory or IOSurface); plugin/gld.c + gen-gld.py (13 real
+  gld functions, stubs return 0x2717, 129-name check); mesa-setup.sh adds softpipe (Mesa not rebuilt). Missing: the
+  GLI-side file that connects EAGL contexts to Mesa (two agent runs were stopped by safety filters while writing it),
+  meson targets, Info.plist, root hook. scripts/gpu/build.sh still copies Turnip into out/gpu (conflicts with
+  turnip-build.sh).
+- [V] (2026-10-25, second GL agent) gfxInitializeLibrary 0x1d3f6e2f0: plugin record function table
+  = +0x420 + 8 * index in `_gfx_gld_names` (userland/negronigl/plugin/gld-names.txt); plugin ID =
+  gldGetVersion's 4th value | 0x20000 (0x400 is special); per accelerator `gldCreateDevice(&dev+0x18,
+  dev mask, &dev+0x20)` with the device ID (plugin ID | count << 24) already at dev+0x10; nonzero ->
+  device dropped. Apple: AppleMetalGLRenderer gldGetVersion = (4, 1, 0x10, 0x7f00).
+- [V] GLD pixel format (AppleMetalGLRenderer GLRPixelFormat::preflight): +0 next, +8 device ID
+  (0x01007f00; GLEngine gliChoosePixelFormat ORs 0x20000), +0xc flags 0x225dd. EAGLSharegroup init
+  needs flags bit 0x100 and, for API 3, 0x20000 (masks 0, 0, 0x20000 at 0x1d3f5331c), then
+  gfxCreateSharedState(&pf+8) -> plugin gldCreateShareGroup(device, &out, 4) must return 0.
+- [V] EAGL uses only these GLI entries: CreateContextWithShared(&priv+0x20, pf, gfx shared state,
+  priv+0x28, priv+0x2088, flags 0x10/0x20/0x40 = API 1/2/3), DestroyContext, SetInteger, GetInteger,
+  BindViewES (renderbufferStorage:fromDrawable:, bool), PresentViewES, ChoosePixelFormat,
+  DestroyPixelFormat, GetVersion. `-texImageIOSurface:...invert:` = SetInteger(0x38e, {surface ID,
+  target, internal format, w, h, format, type, plane, 0}) then SetInteger(0x399, {target, invert});
+  attachImage:toCoreSurface: maps the IOSurface format and calls it. glFoo() of OpenGLES = TLS
+  key 30 -> priv; x0 = [priv+0x20]; jump [priv+0x28 + 8 * slot] (glClear slot 10, glDisable 63).
+- [V] GLEngine is a full GL engine: AppleMetalGLRenderer's gldPopulateContextDispatch copies a
+  25-entry render dispatch (0xc8 bytes); a GLEngine context needs a real GLD renderer that reads
+  GLEngine state. Decision (coordinator, 2026-10-25): no GLD renderer; the bundle gives EAGL the GLI
+  entries on Mesa. Status: that GLI part is NOT written (a safety classifier stopped it); until it
+  exists, NegroniGL's gldChoosePixelFormat returns 0x2712, so EAGL contexts stay nil as before.
+- [V] Build (scripts/gpu/build.sh): Mesa 25.0.7 freedreno + softpipe, NegroniGL.bundle exports
+  129/129 table names + gldInitializeLibrary/gldTerminateLibrary; ngl_init uses softpipe when
+  RedwoodGPU does not open (NEGRONIGL_DRIVER=softpipe|freedreno, boot-arg negronigl_sw=1).
 
 ## 16. Wi-Fi facts (Wi-Fi agent, 2026-10-25; OnePlus kernel source e9da592 in out/src/op-kernel)
 
@@ -432,5 +494,20 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   24278 B, 194 board files ~60 KB): fits a 32 MiB firmware area like the ADSP one.
 - Risks [I]: no GICv3 ITS driver for MSI (poll first); DMA above 4 GiB may need an SMMU context; no interconnect
   (BCM) votes for PCIe-DDR yet; survey steps 5-10 never ran on the phone.
-- Trees: out/kernel/wt-wlan3 = full current tree from scripts/kernel/patched-tree.sh (0260 = dcaed1b); the older
-  wt-wlan2 only adds negroni_wifi_pcie_handles() and an unimplemented negroni_wlan_init() declaration.
+- [V] amss.bin and amss20.bin have no second ELF at 512 KiB: BHI loads the first 512 KiB (SBL), BHIe loads the
+  whole file (xxd; Linux mhi boot.c mhi_fw_load_handler).
+- [V] The phone's DT has no qcom,set-wlaon-pwr-ctrl, so cnss2 does not touch WLAON_QFPROM_PWR_CTRL before MHI
+  (cnss2/main.c:3544, out/live.dts:13840-13878).
+- [V] Linux ath11k uses a 32-bit coherent DMA mask; cnss2 uses 36 bits for both masks. XNU RAM starts at
+  0x840000000, so all MHI contexts and rings are above 4 GiB. [I] Risk: the firmware may need coherent memory below
+  4 GiB; Android avoids this with SMMU IOVAs (smmu_iova_ipa 0xb0000000).
+- [V] UFS and USB on this port already DMA to physical addresses from cacheable kmem_alloc_contig memory +
+  flush_dcache64 (negroni_ufs.c:701, negroni_usb.c:1166). pmap_enter accepts WCOMB on managed RAM (pmap.c:6104, 10647).
+- [V] ath11k WCN6855 map: window register 0x310c, window base 0x80000, TCSR_SOC_HW_SUB_VER 0x1910010. ath11k MHI:
+  2 event rings (32, 256), IPCR 20/21 on event ring 1, 128 channels, 20 s timeout; cnss2: 32 channels, 3 event
+  rings, 10 s timeout.
+- [V] apps SMMU at 0x15000000 (0x78 SMRs, 0x4e contexts); PCIe0 stream SID 0x1c01.
+- Trees: out/kernel/wt-wlan4 (patched-tree.sh UPTO 0261, replaces wt-wlan2/wt-wlan3, which are deleted) holds the
+  stage 1 start: negroni_wlan.h, negroni_wifi.c calls negroni_wlan_start() with negroniwlan=2 after survey step 10,
+  negroni_ufs_wlan_area_read() (32 MiB area before the ADSP area: userdata blocks N-19457..N-11266), bsd/conf/files
+  entry. negroni_wlan.c is not written yet, so the tree does not link.

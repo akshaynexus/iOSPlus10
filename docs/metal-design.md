@@ -147,7 +147,8 @@ the selector table:
 | `/System/Library/Extensions/NegroniMetal.bundle/{NegroniMetal,Info.plist,libvulkan_freedreno.dylib}` | the plugin + Turnip |
 | `/var/db/negronimetal/clients` | processes that get a device; default `metalprobe m2vtest` |
 | `/var/db/negronimetal/off` | exists = no device for anyone |
-| `/var/db/negronimetal/env` | KEY=VALUE for the plugin's processes (TU_DEBUG, MESA_LOG_FILE, METAL2VULKAN_*) |
+| `/var/db/negronimetal/env` | KEY=VALUE for the plugin's processes (TU_DEBUG, MESA_LOG_FILE, METAL2VULKAN_*; `NEGRONIMETAL_OPEN_MS` = open + self-test deadline, default 6000; `NEGRONIMETAL_SELFTEST=0` skips the IOSurface clear self-test) |
+| `/var/db/negronimetal/telemetry` | exists = backboardd writes the frontend's counters to metal.log every 10 s |
 | `/var/db/negronimetal/strikes/<proc>` | dead-man counter (2 = disabled for that process) |
 | `/var/db/negronimetal/cache/<proc>/` | metal2vulkan + Turnip pipeline caches |
 | `/var/db/negronimetal/metal.log` | log (also /dev/console), lines `NMTL[pid name]:` |
@@ -163,6 +164,9 @@ the selector table:
 | host shader check (metal2vulkan CLI, QuartzCore metallib, vk12-floor profile) | `scripts/metal/host-translate.sh` | `out/metal/translate/` | see metal-plan.md |
 | install into a root | `METAL=1 scripts/metal/root-add-metal.sh ROOT` | bundle, probes, `/var/db/negronimetal` | written; not run on a real root yet |
 | phone tests over SSH | `scripts/metal/phone-test.sh push|0|1|2|3|log` | `logs/metal-phone-*.log` | written; no phone yet |
+| QuartzCore selectors vs the frontend (static) | `scripts/metal/selector-gap.py [--all] [--client NAME]` | stdout | 222 named, 0 missing after patch flame/0001 [V] |
+| plugin logic on the Mac (MoltenVK as loader, host bridge) | `scripts/metal/build-bridge.sh host`, then `scripts/metal/host-plugin-test.sh` | stdout | 7 cases PASS [V] |
+| estimated A730 Vulkan profile for the host check | `scripts/metal/a730-profile.py FLOOR.json OUT.json` | `out/metal/profiles/` | estimate [I] |
 
 Linux: the same scripts with an iPhoneOS SDK copied from a Mac in `SDK=`, clang/lld, `cmake`, `ninja`,
 `llvm-as`, Rust 1.98.0 with `aarch64-apple-ios`; `ldid` replaces `codesign` (build.sh falls back to it).
@@ -185,7 +189,8 @@ before any public release), or move the bridge into its own dylib.
 | File | Origin |
 |---|---|
 | `userland/metal/plugin/NegroniMetal.mm` | ours (design of flame `SweetMetal2.mm`: device swap, CA prefs, XR10 rule, `sys_dcache_flush`); gate, dead-man, paths new |
-| `userland/metal/probes/{vkprobe.c,metalprobe.m}` | ours |
+| `userland/metal/probes/{vkprobe.c,metalprobe.m}`, `userland/metal/tests/host-plugin-test.mm` | ours |
+| `userland/metal/patches/flame/0001-negroni-surface-hook-qc-selectors.patch` | ours: IOSurface hook for Turnip's `redwood_drm_note_surface`, QuartzCore selectors the frontend lacked |
 | `userland/metal/CMakeLists.txt`, `cmake/ios-arm64.cmake`, `plugin/Info.plist.in` | ours |
 | `scripts/metal/*` | ours (bridge recipe from flame `tools/build-m2v-bridge.sh`, MIT) |
 | frontend, bridge, m2vtest | fetched from `external/ios-flame` at 745c434 (not copied into git); our changes go in `userland/metal/patches/flame/` |

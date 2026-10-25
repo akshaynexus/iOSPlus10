@@ -1,0 +1,131 @@
+NegroniMetal changes to the ios-flame 745c434 Metal frontend (MIT):
+- native_bridge_metal_set_surface_hook: the plugin is told each IOSurface's CPU range and ID before its import
+  (Turnip's negroni_drm.c redwood_drm_note_surface imports the surface by ID: kernel 0230 has no user-page import).
+- QuartzCore 20H392 selectors the frontend lacked (scripts/metal/selector-gap.py): MTLTexture swizzle/compression/
+  sparse/shareable/parent-relative/rootResource/gpuResourceID answers, identity-swizzle views, makeAliasable,
+  pipeline and sampler gpuResourceID/allocatedSize, MTLCommandQueue SPI -finish.
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.h	2026-10-25 12:39:28
++++ b/phone/metal2/NativeBridgeMetalFrontend.h	2026-10-25 12:39:28
+@@ -9,6 +9,8 @@
+ // Opens the process's one device: loader exports vkGetInstanceProcAddr (Turnip), cache is a writable shader-cache directory, registryID is the
+ // accelerator service's registry entry. missing (may be null) is told the class and selector of every unimplemented call.
+ id native_bridge_metal_open(const char *loader, const char *cache, uint64_t registryID, void (*missing)(const char *, const char *));
++// NegroniMetal: hook called with an IOSurface's CPU base, byte count and ID before the frontend imports it (null: none).
++void native_bridge_metal_set_surface_hook(void (*hook)(const void *base, uint64_t bytes, uint32_t surface));
+ // Bare AIR bitcode as a library (the bridge's fixtures; Metal itself accepts only metallibs).
+ id native_bridge_metal_library_with_air(const void *bytes, size_t length);
+ // One line for the plugin's status report: command buffers committed/failed locally, pipelines made, refusals, the last refusal's text.
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm	2026-10-25 12:39:28
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm	2026-10-25 12:39:28
+@@ -114,7 +114,8 @@
+ - (id<MTLHeap>)heap {return _parentHeap;} \
+ - (BOOL)isAliasable {return NO;} \
+ - (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
+-- (void)waitUntilComplete {waitForResource(self);}
++- (void)waitUntilComplete {waitForResource(self);} \
++- (void)makeAliasable {}   /* NegroniMetal: heap aliasing is not tracked; the memory simply stays owned */
+ @interface NBBuffer : NBObject
+ @property(nonatomic) NmbBuffer *handle;
+ @property(nonatomic) MTLResourceOptions options;
+@@ -130,6 +131,7 @@
+ @property(nonatomic,strong) NBBuffer *buffer;
+ @property(nonatomic) IOSurfaceRef surface;
+ @property(nonatomic) NSUInteger offset,rowBytes;
++@property(nonatomic) NSUInteger parentLevel,parentSlice;   // NegroniMetal: a view's first level and slice in its parent
+ @property(nonatomic,strong) id<MTLTexture> parent;
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;
+ @property(nonatomic) NSUInteger heapOffset;
+@@ -164,6 +166,10 @@
+ // caller-owned no-copy buffers do not enter this cache.
+ static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
+ static std::mutex gSurfaceImportLock;
++// NegroniMetal: told the surface's CPU range and ID before each import, so a kernel without a user-page import can import
++// the IOSurface by ID (Turnip's negroni_drm.c redwood_drm_note_surface). Null: nobody listens.
++static void (*gSurfaceHook)(const void *base,uint64_t bytes,uint32_t surface);
++extern "C" void native_bridge_metal_set_surface_hook(void (*hook)(const void *,uint64_t,uint32_t)) {gSurfaceHook=hook;}
+ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  struct Key {uint64_t identity,address,bytes;};
+  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
+@@ -172,6 +178,7 @@
+  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
+  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
+  if(buffer)return buffer;
++ if(gSurfaceHook)gSurfaceHook(base,bytes,IOSurfaceGetID(surface));
+  NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,base,bytes,MTLResourceStorageModeShared);
+  if(!handle){NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+  buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
+@@ -233,8 +240,31 @@
+ }
+ - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
+  const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
+- return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
++ NBTexture *view=(NBTexture *)[self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
++ view.parentLevel=levels.location;view.parentSlice=slices.location;
++ return (id<MTLTexture>)view;
+ }
++// NegroniMetal: QuartzCore names these MTLTexture selectors (scripts/metal/selector-gap.py). Plain answers for a texture with no
++// Apple compression, no sparse tail, no swizzle and no cross-process handle; a non-identity swizzle view is refused (nil, logged).
++- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices
++                                         swizzle:(MTLTextureSwizzleChannels)swizzle {
++ if(swizzle.red==MTLTextureSwizzleRed && swizzle.green==MTLTextureSwizzleGreen && swizzle.blue==MTLTextureSwizzleBlue && swizzle.alpha==MTLTextureSwizzleAlpha)
++  return [self newTextureViewWithPixelFormat:format textureType:type levels:levels slices:slices];
++ if(gMissing)gMissing("NBTexture","newTextureViewWithPixelFormat:textureType:levels:slices:swizzle: (non-identity swizzle)");
++ return nil;
++}
++- (MTLTextureSwizzleChannels)swizzle {return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleAlpha);}
++- (BOOL)allowGPUOptimizedContents {return NO;}
++- (MTLTextureCompressionType)compressionType {return MTLTextureCompressionTypeLossless;}
++- (BOOL)isSparse {return NO;}
++- (NSUInteger)firstMipmapInTail {return _descriptor.levels;}
++- (NSUInteger)tailSizeInBytes {return 0;}
++- (BOOL)isShareable {return NO;}
++- (MTLSharedTextureHandle *)newSharedTextureHandle {if(gMissing)gMissing("NBTexture","newSharedTextureHandle");return nil;}
++- (NSUInteger)parentRelativeLevel {return _parentLevel;}
++- (NSUInteger)parentRelativeSlice {return _parentSlice;}
++- (id<MTLResource>)rootResource {return _parent?[(NBTexture *)_parent rootResource]:(id<MTLResource>)self;}
++- (MTLResourceID)gpuResourceID {MTLResourceID r;r._impl=(uint64_t)(uintptr_t)self;return r;}
+ - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
+  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
+  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
+@@ -424,6 +454,9 @@
+ - (void)dealloc {nmb_compute_pipeline_release(_handle);}
+ - (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
+ - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
++// NegroniMetal: identity for argument tables (not used: no argument buffers here) and no separate shader memory to report
++- (MTLResourceID)gpuResourceID {MTLResourceID r;r._impl=(uint64_t)(uintptr_t)self;return r;}
++- (NSUInteger)allocatedSize {return 0;}
+ @end
+ @interface NBRenderPipeline : NBObject
+ @property(nonatomic) NmbRenderPipeline *handle;
+@@ -435,6 +468,8 @@
+  uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))return 0;
+  return s[0];
+ }
++- (MTLResourceID)gpuResourceID {MTLResourceID r;r._impl=(uint64_t)(uintptr_t)self;return r;}   // NegroniMetal
++- (NSUInteger)allocatedSize {return 0;}
+ @end
+ @interface NBSampler : NBObject
+ @property(nonatomic) NmbSampler *handle;
+@@ -442,6 +477,7 @@
+ @implementation NBSampler
+ - (void)dealloc {nmb_sampler_release(_handle);}
+ - (NSUInteger)pixelFormat {return MTLPixelFormatInvalid;}   // SPI: a sampler built from a plain descriptor names no format
++- (MTLResourceID)gpuResourceID {MTLResourceID r;r._impl=(uint64_t)(uintptr_t)self;return r;}   // NegroniMetal
+ @end
+ @interface NBDepthStencil : NBObject
+ @property(nonatomic) NmbDepthStencil *handle;
+@@ -991,6 +1027,13 @@
+ - (BOOL)setGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
+ - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
+ - (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {(void)d;return [self commandBuffer];}
++// NegroniMetal: SPI -finish waits for every command buffer of this queue that is committed and not yet complete
++- (void)finish {
++ NSArray *pending;
++ @synchronized(gInFlight){pending=[gInFlight allObjects];}
++ for(NBCommandBuffer *commandBuffer in pending)
++  if([commandBuffer isKindOfClass:[NBCommandBuffer class]] && commandBuffer.queue==self)[(id<MTLCommandBuffer>)commandBuffer waitUntilCompleted];
++}
+ @end
+ 
+ // ---- the device ----
