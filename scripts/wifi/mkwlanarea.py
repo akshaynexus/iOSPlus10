@@ -5,9 +5,10 @@
 
 32 MiB: bytes 0..32767 = "NEGRWLAN" | u32 1 | u32 count | 256 x {name[48], u32 offset, u32 size,
 sha256[32]}; files from 32 KiB on, each 4 KiB aligned, named by their basename. Content: every
-regular file of DIR except LISTING.txt and SHA256SUMS (amss.bin, amss20.bin, m3.bin, regdb.bin and
-the ~194 bdwlan.* board files, ~12 MiB). The kernel reads amss*.bin and m3.bin in stage 1; the
-board files and regdb are for the stage 2 QMI BDF download.
+regular file at the top of DIR except LISTING.txt and SHA256SUMS (amss.bin, amss20.bin, m3.bin,
+regdb.bin and the ~194 bdwlan.* board files, ~22 MiB; subdirectories such as qca6490/ are skipped).
+The kernel (negroni_wlan.c wlan_load) reads amss20.bin or amss.bin (by SoC major version) and
+m3.bin in stage 1 and stops on a SHA-256 mismatch; the board files and regdb are for stage 2.
 
 Place on the phone (4096-byte blocks of the userdata partition, N = partition size in blocks):
   persistent log   N-1025 .. N-1          (negroni_ufs.c NEGRONI_LOG_BLOCKS = 1025)
@@ -33,8 +34,9 @@ def main():
     d = sys.argv[2] if len(sys.argv) == 3 else os.path.join(
         os.path.dirname(os.path.abspath(__file__)), '..', '..', 'out', 'firmware', 'wlan')
     files = sorted(e.path for e in os.scandir(d) if e.is_file() and e.name not in SKIP)
-    if not any(os.path.basename(f) in ('amss.bin', 'amss20.bin') for f in files):
-        sys.exit(f'no amss*.bin in {d} (run scripts/wifi/extract-fw.sh)')
+    names = {os.path.basename(f) for f in files}
+    if not names & {'amss.bin', 'amss20.bin'} or 'm3.bin' not in names:
+        sys.exit(f'no amss*.bin or no m3.bin in {d} (run scripts/wifi/extract-fw.sh)')
     if len(files) > MAX:
         sys.exit(f'{len(files)} files, the area holds {MAX}')
     area = bytearray(SIZE)

@@ -4,9 +4,30 @@ Goal: a native kernel Wi-Fi driver for the NE2211 that iOS uses as `en0` (wifid,
 Settings page). USB networking stays the debug path. Marks: **[V]** seen (source given),
 **[I]** inference.
 
-Status (2026-10-25): no Wi-Fi. The kernel has a step-by-step PCIe0 survey (steps 1-9, slop) and
-our read-only step 10 (patch 0260). Steps 5-10 have never run on any phone. There is no MHI,
-QMI or WMI code. Firmware files are extracted (`scripts/wifi/extract-fw.sh`).
+Status (2026-10-25): no Wi-Fi on the phone yet. The kernel has a step-by-step PCIe0 survey
+(steps 1-9, slop) and our read-only step 10 (patch 0260). **Stage 1 (patch 0261) is written and
+builds**: an ath11k-style MHI host that claims BAR0, picks and downloads the firmware over BHI +
+BHIe, reaches mission mode (M0) and starts the IPCR channels 20/21. It runs with `negroniwlan=2`
+on its own kernel thread, so a failure never blocks boot; no MSI (poll). Stages 5-10 of the survey
+and all of stage 1 have never run on a phone. There is no QMI, WMI or HTT code yet (stage 2).
+Firmware files are extracted (`scripts/wifi/extract-fw.sh`) and packed into a 32 MiB area
+(`scripts/wifi/mkwlanarea.py`); the area is not written to the phone yet.
+
+Stage 1 state [V = builds, I = untested on hardware]:
+- [V] Five files compile and link in the local build (patch 0261 applied, no 02xx skipped).
+  Files: `negroni_wlan.{c,h}`, `negroni_wlan_mhi.{c,h}`, `negroni_wlan_bhi.c`; plus the survey
+  hand-over in `negroni_wifi.c` and the area read in `negroni_ufs.c`. Log lines and the area
+  recipe: `patches/xnu/README-wifi.md` (0261 section).
+- [V] Order matches Linux: the MMIO context setup runs after the BHI SBL download, not in PBL
+  (op-kernel `mhi_ready_state_transition`, `pm.c:243` / `boot.c:546`).
+- [I] The firmware choice (amss20.bin when SoC major 2, else amss.bin), the BHI 512 KiB SBL, the
+  BHIe segment vector, the READY -> M0 handshake and the START_CHAN commands follow the ath11k /
+  cnss2 / Linux-MHI references but have not run on the chip.
+- [V] Review 2026-10-25 ([reviews/wifi-0261-2026-10-25.md](reviews/wifi-0261-2026-10-25.md)): the M0
+  order now follows Linux (BHI SBL -> READY -> MMIO -> event rings -> M0 + wake -> EE SBL -> BHIe ->
+  EE AMSS -> channels). Also fixed: an `ml_io_unmap` panic on every failure path, BAR0 not aligned to
+  its size (now 0x60400000 for 2 MiB), unchecked chip offsets, DMA memory freed with bus master on,
+  doorbell word order, SHA-256 mismatch not fatal. Builds: `out/kernel/local-20261025-121738`.
 
 ## Hardware facts
 
@@ -77,6 +98,39 @@ read it as a design reference; do not copy its code ([external-repos.md](externa
 
 `patches/xnu/0260-negroni-wlan-pcie-inventory.patch` adds step 10 and the boot-arg
 `negroniwlan=1` (default 0). Details: `patches/xnu/README-wifi.md`.
+
+## Patch 0261 (stage 1: MHI + firmware download)
+
+`patches/xnu/0261-negroni-wlan-mhi-fw.patch`. The driver reuses the survey's PCIe0 handles, claims
+BAR0 in the 0x60300000 iATU window, enables memory decode + bus master, reads TCSR_SOC_HW_VERSION
+to pick the firmware, reads the firmware from the userdata area into a contiguous DMA pool, then:
+BHI loads the first 512 KiB (SBL); the host programs the MHI contexts; BHIe loads the whole image
+(FBC, 512 KiB-segment vector); the host drives READY -> M0 and starts IPCR channels 20 and 21. It
+keeps the m3 buffer ready for stage 2. Boot-arg `negroniwlan=2`; time-out `negroniwlan_to` (ms, default 10000).
+Full details and every log line: `patches/xnu/README-wifi.md`.
+
+## Stage 2 plan (QRTR + QMI WLFW, then WMI/HTT, then en0)
+
+Stage 1 leaves the chip in mission mode with the two IPCR channels up. Stage 2 adds, in order:
+
+1. **QRTR on MHI 20/21.** Put receive buffers on channel 21 (in) and send on channel 20 (out) with
+   transfer-ring elements and doorbells (the ring/doorbell code exists; add TX/RX buffer handling).
+   Parse the QRTR header (version, type, src/dst node/port). The firmware is one QRTR node; the
+   host is another. Keep polling (no MSI). [I] data event ring is ring 1.
+2. **QMI WLFW.** Over QRTR to the WLFW service, follow ath11k `qmi.c`: server-arrive ->
+   `ind_register` + `host_cap` -> REQUEST_MEM indication -> `respond_mem` (host DMA memory) ->
+   FW_MEM_READY -> `target_cap` (board id, chip id) -> BDF download (pick `bdwlan.eNN` from the
+   board id; regdb is a separate BDF type) -> `m3_info` (the m3 buffer from stage 1) -> FW_READY ->
+   `wlan_cfg` + mode. Cold-boot calibration may be needed (`qcom,wlan-cbc-enabled`). Each QMI
+   message is a little-endian TLV; log every response result.
+3. **HTC / WMI / HTT, HAL rings.** Copy engines, HTC services, WMI init/ready, HAL SRNG rings, HTT
+   setup, RX/TX descriptors, then a passive scan. Use the hw params of the detected hw revision
+   (`ath11k/core.c`). This is the largest part.
+4. **en0.** Port the Sailfish upper half (design reference only, `0174`/`0175`/`0178`/`0179`):
+   frames to en0, IOEthernetController so configd names it en0, Apple80211 events/requests for
+   wifid, WPA2-PSK/CCMP. Exit: `ifconfig en0`, DHCP, the Settings page scans and joins.
+
+Effort and checks per stage: the table above (stages c, d, e).
 
 ## Firmware extraction (macOS and Linux)
 
