@@ -12,16 +12,12 @@ set -euo pipefail
 
 mkdir -p "$MSRC"
 
-# 1. metal2vulkan
-if [ ! -d "$M2V/.git" ]; then
-  git clone --filter=blob:none "$M2V_URL" "$M2V"
-fi
-if ! git -C "$M2V" cat-file -e "$M2V_COMMIT^{commit}" 2>/dev/null; then
-  git -C "$M2V" fetch -q origin "$M2V_COMMIT" 2>/dev/null || git -C "$M2V" fetch -q origin
-fi
-git -C "$M2V" checkout -q -f "$M2V_COMMIT"
-git -C "$M2V" clean -q -fdx
-echo "metal2vulkan $(git -C "$M2V" rev-parse --short HEAD)"
+# 1. metal2vulkan: from the submodule's git objects (external/metal2vulkan), like ios-flame below
+git -C "$M2V_SUB" cat-file -e "$M2V_COMMIT^{commit}" || { echo "external/metal2vulkan lacks $M2V_COMMIT: git submodule update --init external/metal2vulkan" >&2; exit 1; }
+rm -rf "$M2V"; mkdir -p "$M2V"
+git -C "$M2V_SUB" archive "$M2V_COMMIT" | tar -x -C "$M2V"
+git -C "$M2V" init -q && git -C "$M2V" add -A && git -C "$M2V" -c user.name=negroni -c user.email=negroni@local commit -q -m "metal2vulkan $M2V_COMMIT" 
+echo "metal2vulkan $M2V_COMMIT -> $M2V"
 
 # 2. ios-flame frontend + bridge, exported from the submodule objects
 git -C "$FLAME" cat-file -e "$FLAME_COMMIT^{commit}" || { echo "external/ios-flame lacks $FLAME_COMMIT: git -C external/ios-flame fetch" >&2; exit 1; }

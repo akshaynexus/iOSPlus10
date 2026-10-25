@@ -7,9 +7,9 @@ MOUT=$OUT/metal                            # all build products
 MSRC=$MOUT/src                             # fetched sources
 
 # metal2vulkan: AIR -> SPIR-V translator + Metal object model on Vulkan (Rust; GPL-2.0+ OR LGPL-3.0+)
-M2V_URL=https://github.com/steelbrain/metal2vulkan.git
-M2V_COMMIT=720ef1ce
-M2V=$MSRC/metal2vulkan
+M2V_SUB=$EXT/metal2vulkan          # submodule (git objects only, pinned by the gitlink)
+M2V_COMMIT=$(git -C "$M2V_SUB" rev-parse HEAD 2>/dev/null || echo 720ef1ce9ae2a2068999a8675717418b9416283e)
+M2V=$MSRC/metal2vulkan             # working copy with userland/metal/patches/m2v applied
 RUST_TOOLCHAIN=1.98.0
 
 # ios-flame (NWylynko/ios-flame, MIT): the iOS 16.7.16 20H392 Metal frontend + bridge that drew the Pixel 4

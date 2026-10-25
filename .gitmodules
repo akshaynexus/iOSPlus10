@@ -18,3 +18,6 @@
 	path = external/hackios-xnu-userland
 	url = https://github.com/oosexgang/hackios-xnu-userland.git
 	branch = main
+[submodule "external/metal2vulkan"]
+	path = external/metal2vulkan
+	url = https://github.com/steelbrain/metal2vulkan.git
