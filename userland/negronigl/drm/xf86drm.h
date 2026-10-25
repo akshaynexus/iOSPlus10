@@ -12,6 +12,7 @@
 #define NEGRONIGL_XF86DRM_H
 
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -119,9 +120,15 @@ _Static_assert(sizeof(struct redwood_drm_userptr) == 24, "docs/gpu-abi.md: 24 by
  * starts at pointer (noted before with redwood_drm_note_surface) is imported by ID (0x7e, scalar 12): only such imports
  * take part in the kernel's present path (docs/gpu-abi.md section 8). Other pages: USERPTR (0x49, kernel 0232; msm ABI
  * only), read-only pages with NGL_USERPTR_READ_ONLY. After GPU writes the CPU must drop its lines (CPU_PREP or dc civac).
- * *bo_size = the buffer's size (whole 16 KiB pages). 0 or errno (ENOSYS: no way to import these pages here).
+ * *bo_size = the buffer's size (whole 16 KiB pages). *read_only = imported with NGL_USERPTR_READ_ONLY (the GPU only reads
+ * the pages: no cache upkeep is ever needed). 0 or errno (ENOSYS: no way to import these pages here).
  */
-int redwood_drm_host_import(int fd, void *pointer, uint64_t size, uint32_t *handle, uint64_t *bo_size);
+int redwood_drm_host_import(int fd, void *pointer, uint64_t size, uint32_t *handle, uint64_t *bo_size, bool *read_only);
+/* Not libdrm: CPU_PREP (msm 0x44, scalar 16) of a GEM handle with MSM_PREP_NOSYNC (no wait): if the buffer's last
+ * submission is done, the kernel drops the CPU's cache lines over the buffer's pages by their physical addresses, not by a
+ * user address (host imports too, patches/xnu/0230 cpuPrep); else EBUSY. For Turnip's vkInvalidateMappedMemoryRanges of
+ * a writable host import, whose user mapping the program may have taken away. 0 or errno. */
+int redwood_drm_cpu_prep(int fd, uint32_t handle);
 /* Not libdrm, exported by Turnip (NegroniMetal's frontend calls it through dlsym before each IOSurface import):
  * IOSurface `surface` is mapped at base (its IOSurfaceGetBaseAddress) for size bytes. */
 void redwood_drm_note_surface(const void *base, uint64_t size, uint32_t surface);

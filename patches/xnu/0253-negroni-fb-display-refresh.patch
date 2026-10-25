@@ -1,0 +1,63 @@
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 3e647aa..9c17bbe 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -75,6 +75,13 @@
+  * 1.5 x NEGRONI_FB_VSYNC_US after the tick before, and the SwapWait calls (time
+  * waited, calls that hit NEGRONI_ZC_WAIT_MS). The counters start again each line.
+  *
++ * Refresh rate for CoreAnimation (patch 0253, boot-arg negronifb_carefresh, default 1, 0 = off):
++ * QuartzCore (20H392 AppleCLCDDisplay::heartbeat_rate) takes its base quantum from the
++ * "IOMFBDisplayRefresh" dictionary of this service (displayRefreshStepMachTime in mach ticks,
++ * then displayMinRefreshInterval) and falls back to 1/60 s without it. The property gives it
++ * one vsync period (NEGRONI_FB_VSYNC_US), and the vsync notification's third value (the
++ * interval, IOMFBServer::vsync_callback) carries the same tick count instead of 0.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg negronifb_noconsole=1 stops drawing it from
+@@ -269,6 +276,7 @@ public:
+ 	uint64_t      fStatCopyAbs, fStatCopyMaxAbs;
+ 	uint32_t      fStatWaits, fStatWaitTimeouts;
+ 	uint64_t      fStatWaitAbs, fStatWaitMaxAbs;
++	uint64_t      fRefreshTicks;  /* 0253: one vsync period in mach ticks (0: negronifb_carefresh=0) */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void statTick(uint64_t now);
+@@ -385,6 +393,27 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	uint32_t carefresh = 1;
++	PE_parse_boot_argn("negronifb_carefresh", &carefresh, sizeof(carefresh));
++	if (carefresh != 0) {
++		uint64_t ticks;
++		nanoseconds_to_absolutetime((uint64_t)NEGRONI_FB_VSYNC_US * 1000ull, &ticks);
++		OSDictionary *refresh = OSDictionary::withCapacity(2);
++		OSNumber *step = OSNumber::withNumber(ticks, 64);
++		OSNumber *min = OSNumber::withNumber(1ULL, 32);
++		if (refresh != NULL && step != NULL && min != NULL) {
++			refresh->setObject("displayRefreshStepMachTime", step);
++			refresh->setObject("displayMinRefreshInterval", min);
++			setProperty("IOMFBDisplayRefresh", refresh);
++			fRefreshTicks = ticks;
++			IOLog("NEGRONI FB: IOMFBDisplayRefresh step %llu ticks (%u us)\n", ticks, NEGRONI_FB_VSYNC_US);
++		} else {
++			IOLog("NEGRONI FB: IOMFBDisplayRefresh not set (no memory)\n");
++		}
++		OSSafeReleaseNULL(refresh);
++		OSSafeReleaseNULL(step);
++		OSSafeReleaseNULL(min);
++	}
+ 	registerService();
+ 	negroni_backlight_attach(this);
+ 	IOLog("NEGRONI FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+@@ -406,7 +435,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
++		(uint32_t)fb->fRefreshTicks, (uint32_t)(fb->fRefreshTicks >> 32),     /* 0253: interval (0: off) */
+ 	};
+ 
+ 	IOLockLock(fb->fLock);

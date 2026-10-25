@@ -23,8 +23,15 @@
 4. Migration: "skip" (default) keeps slop's LastSystemVersion (fast first boot, fewer app
    extensions registered); "once" uses sailfish's sentinel /private/var/datamigrator/migrate and
    removes LastSystemVersion (DataMigration runs one time; widgets/wallpapers register).
+5. backboardd EnvironmentVariables CA_HEARTBEAT_RATE (env CA_HEARTBEAT, default 120, empty = off):
+   QuartzCore 20H392 (AppleCLCDDisplay::heartbeat_rate) takes 1/CA_HEARTBEAT_RATE as its base quantum
+   before the IOMFBDisplayRefresh property and the 1/60 s default (docs/notes.md section 15). The job
+   lives in System/Library/xpc/launchd.plist (launchd reads only that cache, docs/usb-network.md).
+   Phone-side test without a new root: scripts/metal/phone-heartbeat.sh.
 """
 import argparse, os, plistlib
+
+BACKBOARDD = '/System/Library/LaunchDaemons/com.apple.backboardd.plist'
 
 DROP = ['com.apple.fairplayd.H2', 'com.apple.voicemail.vmd', 'com.apple.ReportCrash',
         'com.apple.spindump', 'com.apple.tailspind', 'com.apple.aggregated',
@@ -54,6 +61,15 @@ def main():
     gone = [k for k, j in list(jobs.items()) if j.get('Label') in DROP]
     for k in gone:
         del jobs[k]
+    hb = os.environ.get('CA_HEARTBEAT', '120')
+    bb = jobs.get(BACKBOARDD)
+    if hb and isinstance(bb, dict):
+        bb.setdefault('EnvironmentVariables', {})['CA_HEARTBEAT_RATE'] = hb
+        print(f'launchd.plist: backboardd CA_HEARTBEAT_RATE={hb}')
+    elif hb:
+        print('launchd.plist: no backboardd job, CA_HEARTBEAT_RATE not set')
+    else:
+        print('launchd.plist: CA_HEARTBEAT empty, backboardd heartbeat left as is')
     with open(path, 'wb') as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
     os.chown(path, st.st_uid, st.st_gid); os.chmod(path, st.st_mode & 0o7777)

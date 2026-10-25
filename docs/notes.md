@@ -355,10 +355,31 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   fast-off on a short power-key press (< 700 ms) [I until tested].
 - Vsync 120 Hz (2026-10-25): slop patches 0046/0056/0061 set `NEGRONI_FB_VSYNC_US` to 8333 (was
   16667 = 60 Hz) and derive `fFlushTicks` from it, so `negronifb_hz` keeps its meaning. The panel
-  scans at 120 Hz, the vsync timer was the 60 Hz limit. 20H392 dyld shared cache has no
-  MobileGestalt/ProMotion key, so iOS takes the rate from the driver [V: grep of
-  dyld_shared_cache_arm64; `scripts/kernel/prepare-src.sh` -> 129 applied, 4 usual skips].
+  scans at 120 Hz, the vsync timer was the 60 Hz limit [V: `scripts/kernel/prepare-src.sh` -> 129
+  applied, 4 usual skips].
+- CoreAnimation's base quantum (2026-10-25) [V disassembly, QuartzCore 20H392, unslid]:
+  `AppleCLCDDisplay::heartbeat_rate` (0x1882dc324) takes, in this order: env `CA_HEARTBEAT_RATE`
+  (1/atof) -> `displayRefreshStepMachTime` (mach time, converted to seconds) -> `displayMinRefreshInterval`
+  (integer, scale 2^-32, units unclear) -> the constant 1/60. Both fields are in a CFDictionary registry
+  property `IOMFBDisplayRefresh` of the IOMobileFramebuffer service (IOMobileFramebufferCopyProperty /
+  IORegistryEntryCreateCFProperty, no selector). Our driver had no such property, so CA ran on 1/60 s quanta.
+  The vsync notification (type 5) carries 3 u64 values from 32-bit halves {count, host timestamp, interval};
+  `IOMFBServer::vsync_callback` (0x1882ba1ec) uses host_ts + interval, and we sent interval 0.
+  Experiment order: (1) env lever on the current kernel: `scripts/metal/phone-heartbeat.sh on` (edits the
+  backboardd job in /System/Library/xpc/launchd.plist, backup /var/db/negronimetal/launchd.plist.orig, reboot);
+  (2) kernel with patch 0253 (`negronifb_carefresh`, default 1: the property with step = 8333 us in mach
+  ticks and min interval 1, and the interval in the vsync notification). Next root images get
+  CA_HEARTBEAT_RATE=120 for backboardd from scripts/ios16/root-tweaks-extra.py (`CA_HEARTBEAT`, empty = off).
+  [I] Not verified: the units of displayMinRefreshInterval; whether CA reads the property only once
+  (before the driver sets it) and caches the heartbeat. launchd's env filter flags only `LD_LIBRARY_PATH`
+  and `DYLD_*` ([V] "CoreImage/PosterBoard crash" section below), so CA_HEARTBEAT_RATE should pass [I].
   Kernel image not rebuilt yet, phone not booted with it [I].
+- 120 Hz measurement (2026-10-25, patch 0252, README-gpu-kernel.md section 12): boot-arg `negronifb_stats`
+  (default 1, `=0` off) logs once a second `NEGRONI FB STAT: swaps/s N presents/s N (cpu N gpu N zc N)
+  copy avg/max us N/N late ticks N swapwait calls N waited us avg/max N/N timeouts N`. [V] The vsync timer
+  re-arms `setTimeoutUS(8333)` at the END of `vsyncFired`, so the real period is 8333 us + the handler time
+  (the CPU copy of ~10.4 MB): a slow copy shows as late ticks (> 1.5 x 8333 us). [I] Before 0252 there was
+  no per-second rate; the old counters log every 1000 swaps/frames only. Not yet booted.
 
 ## 16. Metal (2026-10-25, Metal agent)
 
@@ -405,6 +426,36 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   - [V] Turnip host-pointer imports accept only HOST_CACHED types without HOST_COHERENT (gpu-abi section 6); Turnip has one such type when its L1 line size is known (tu_device.cc:1476, the Darwin sysctl path gives 64). The buffer is cached_non_coherent, so vkInvalidateMappedMemoryRanges drops lines with dc civac.
   - [V] Kernel msm timeouts are on mach_continuous_time (0230 millisecondsUntil), a time in the past = only ask. Darwin user CLOCK_MONOTONIC uses the same counter [I: libc source not read].
   - Staging: `out/gpu/turnip/libvulkan_freedreno.dylib` is the only staged Turnip (scripts/metal/env.sh TURNIP_DYLIB); `out/gpu/libvulkan_freedreno.dylib` is gone [decision].
+- backboardd SIGSEGV every ~18 s on the m2v completion thread (2026-10-25, async-safety agent; not tested on the phone yet):
+  - [V] The fault is the CPU `dc civac` of Turnip `tu_bo_sync_cache` (tu_knl.cc) by the user VA of a host import, called by
+    m2v `CommandBuffer::invalidate_host_imports` (m2v/0001) at the top of `complete()`. CoreAnimation had already unmapped the
+    pages: they are read-only asset pages (usblog "host import of 0x... read-only pages, the GPU only reads them", the 0x49 EIO ->
+    NGL_USERPTR_READ_ONLY retry in negroni_drm.c). The kernel wires host-import pages at import (0232 `importHost`:
+    withAddressRange + prepare), so the GPU side is safe. ab7fc35 hid the fault with a CPU wait; b945b99 made the wait opt-in.
+  - [V] Kernel CPU_PREP (0230 `cpuPrep`, msm 0x44 and scalar 16) waits for the buffer's fence, then calls `cachePage(b->pa[p])` =
+    `flush_dcache64(pa, PAGE_SIZE, TRUE)` over every page: by physical address, for every kind except the pool, kBufferHost
+    included (takePages fills `pa` for host imports). No user VA. It does nothing for a buffer that was never submitted.
+  - [V] The frontend kept no-copy buffers until -finish only for setBuffer/setTexture/blit/attachments; `useResource:` was a
+    no-op and `useResources:`/`useHeap(s):` were missing, and `-[NBBuffer dealloc]` runs the CA deallocator at once.
+  - Change: `redwood_drm_host_import` gets `bool *read_only` (true for a NGL_USERPTR_READ_ONLY import); new
+    `redwood_drm_cpu_prep(fd, handle)` = msm 0x44 with `MSM_PREP_READ | MSM_PREP_NOSYNC`, no wait (kernel cpuPrep with 0 ms:
+    kIOReturnBusy -> EBUSY; scalar s_cpu_prep: EBUSY). A wait would be for the buffer's LAST submission (b->fence), so a later
+    frame that lists the same surface would block m2v's completion thread. Turnip
+    `0002-turnip-darwin-host-import-cache.patch`: a read-only host import is not `cached_non_coherent`; `tu_bo_sync_cache`
+    never touches `bo->map` of a host import in either direction. Flush (CPU-to-GPU): nothing, the kernel cleans written
+    pages at each submission that lists the buffer (gpu-abi.md section 6 rule 1). Invalidate (GPU-to-CPU) of a writable
+    import: CPU_PREP NOSYNC by GEM handle; EBUSY is skipped (a later submission still lists the buffer; its completion drops
+    the lines again) [I: expected and harmless]; any other error is skipped and logged once (mesa_logw).
+  - Change: `scripts/metal/build.sh` now runs `check-imports.py` over the staged binaries and fails on a missing import
+    (IOS_DSC = the cache path, default the `/private/tmp/iosroot-ro` mount; NO_IMPORT_CHECK=1 skips).
+  - Change: `flame/0006-negroni-resource-retention.patch`: useResource(s)/useHeap(s) (all `stages:` forms) add the objects to
+    `resourceOwners`; NBBuffer dealloc counts no-copy deallocations while command buffers are in flight (`inflight`) and those
+    a runtime command buffer still uses (`used`, NBLOG for the first 8). `m2v/0002-negroni-host-invalidate-stats.patch`:
+    counters of `invalidate_host_imports` (C symbol `m2v_negroni_host_invalidate_stat`). Telemetry row:
+    `J nocopy-dealloc inflight=N used=N | hostinv n=CALLS r=RANGES kb=KIB`. NEGRONIMETAL_SYNC / DEFER_SCHEDULED stay opt-in.
+  - [I] `used` > 0 means a no-copy buffer was freed under GPU work through a path that still does not retain it; the GPU still
+    reads the wired pages, but the frontend's retention has a gap there. CPU_PREP drops lines over the whole buffer, not the
+    range.
 
 ## CoreImage/PosterBoard crash (analysis 2026-10-25; addresses = unslid 20H392 cache, slide 0x1f750000 in logs/usblog-20261024-235438.txt)
 
@@ -695,6 +746,14 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   no `negronibadge`, no `negronifb_shift`); `negronifb_dpuprobe=0` skips the read-only DPU dump.
 - ABI for user space: msm selector 0x49 = `struct redwood_drm_userptr` (as `ngl_abi.h` asked);
   VA_START/VA_SIZE differ by mode (docs/gpu-abi.md sections 4, 5, 6, 8).
+- GPU clock (2026-10-25, patch 0235): [V code] step 17 sends ONE HFI GX_BW_PERF_VOTE (id 30)
+  `{0, 1, 1, 3}` = GX level 1 (220 MHz), bw level 3, and nothing votes again. Perf table GX levels 0, 220,
+  285, 317, 350, 421, 492, 545, 599, 640, 734, 791, 818 MHz; GMU 200/500 MHz; BW table 12 levels.
+  New boot-arg `negronigpu_level=N` (default 0 = the old vote): N > 0 (clamped to 12) votes `{0, 1, N, 11}`
+  (top bw level) and logs `NEGRONI ADRENO: GX level N (M MHz), bw level 11`. [I] Untested: the GMU may
+  refuse a high level without a matching ACD/CX setup; look for `17 HFI GX_BW_PERF_VOTE ack, error 0`.
+- Test order (no config change; boot image variants with BOOTARGS_ADD, README-gpu-kernel.md section 12):
+  (a) `negronifb_zerocopy=1`, (b) `negronifb_zerocopy=1 negronigpu_level=12`.
 
 ## 18. Firmware areas at the end of userdata (2026-10-25; scripts/fw/)
 

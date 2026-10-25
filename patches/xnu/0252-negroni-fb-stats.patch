@@ -1,0 +1,173 @@
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 0c3f3bf..3e647aa 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -68,6 +68,13 @@
+  * zero-copy with negronibadge=1, with the console drawn over the GUI
+  * (negronifb_noconsole=0) or with negronifb_shift.
+  *
++ * Per-second statistics (patch 0252, boot-arg negronifb_stats, default 1, 0 = off):
++ * once a second the vsync timer logs one "NEGRONI FB STAT:" line with the swaps,
++ * the frames shown by each path (CPU copy, GPU copy, zero-copy flip), the time
++ * of present() (CPU copy or GPU submit), the vsync ticks that came more than
++ * 1.5 x NEGRONI_FB_VSYNC_US after the tick before, and the SwapWait calls (time
++ * waited, calls that hit NEGRONI_ZC_WAIT_MS). The counters start again each line.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg negronifb_noconsole=1 stops drawing it from
+@@ -254,8 +261,17 @@ public:
+ 	uint32_t      fZCNextID, fZCNextTicks;
+ 	uint32_t      fEndedID, fPresentedID;   /* swap ids: the last SwapEnd, the last one shown */
+ 	uint64_t      fZCFrames;
++	/* per-second statistics (0252); counters written outside the work loop are atomic */
++	bool          fStats;
++	uint64_t      fStatLateAbs, fStatSecAbs;    /* 1.5 vsync periods, 1 s (absolute time) */
++	uint64_t      fStatT0, fStatLastTick;
++	uint32_t      fStatSwaps, fStatCPU, fStatGPU, fStatZC, fStatLate;
++	uint64_t      fStatCopyAbs, fStatCopyMaxAbs;
++	uint32_t      fStatWaits, fStatWaitTimeouts;
++	uint64_t      fStatWaitAbs, fStatWaitMaxAbs;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void statTick(uint64_t now);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -358,6 +374,11 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t gpuhz = 1000000u / NEGRONI_FB_VSYNC_US;
+ 	PE_parse_boot_argn("negronifb_gpuhz", &gpuhz, sizeof(gpuhz));
+ 	fGpuFlushTicks = (gpuhz == 0 || gpuhz >= 1000000u / NEGRONI_FB_VSYNC_US) ? 1 : (1000000u / NEGRONI_FB_VSYNC_US) / gpuhz;
++	uint32_t stats = 1;
++	PE_parse_boot_argn("negronifb_stats", &stats, sizeof(stats));
++	fStats = stats != 0;
++	nanoseconds_to_absolutetime((uint64_t)NEGRONI_FB_VSYNC_US * 1500ull, &fStatLateAbs);
++	nanoseconds_to_absolutetime(1000000000ull, &fStatSecAbs);
+ 	fVsync->setTimeoutUS(NEGRONI_FB_VSYNC_US);
+ 	zeroCopyInit();
+ 
+@@ -378,6 +399,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 
++	if (fb->fStats) {
++		fb->statTick(now);
++	}
+ 	fb->zeroCopyRetire(true);       /* the engine took the last flip: the frame before goes back */
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+@@ -437,8 +461,20 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (rec != NULL && zc) {
+ 		fb->flip(held[0], get32(rec, 0x50));    /* takes held[0]'s retain and hold */
+ 		IOFreeData(rec, NEGRONI_FB_SWAP_REC_SIZE);
++		fb->fStatZC++;
+ 	} else if (rec != NULL) {
++		uint64_t t0 = mach_absolute_time();
+ 		uint32_t fence = fb->present(rec, held);
++		uint64_t dt = mach_absolute_time() - t0;
++		fb->fStatCopyAbs += dt;
++		if (dt > fb->fStatCopyMaxAbs) {
++			fb->fStatCopyMaxAbs = dt;
++		}
++		if (fence != 0) {
++			fb->fStatGPU++;
++		} else {
++			fb->fStatCPU++;
++		}
+ 		if (fb->fZCActive) {
+ 			/* the panel memory has this frame (the GPU's copy done) before the pipes go back to it */
+ 			NegroniGPUFenceWait(fence, NEGRONI_FB_GPU_WAIT_MS);
+@@ -455,6 +491,49 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	sender->setTimeoutUS(NEGRONI_FB_VSYNC_US);
+ }
+ 
++/*
++ * Per-second statistics (0252): from vsyncFired, work loop only. A late tick came more than
++ * 1.5 vsync periods after the one before. One line per second; all counters start again.
++ */
++static uint64_t
++negroni_fb_abs_us(uint64_t abs)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++void
++AppleCLCD::statTick(uint64_t now)
++{
++	if (fStatLastTick != 0 && now - fStatLastTick > fStatLateAbs) {
++		fStatLate++;
++	}
++	fStatLastTick = now;
++	if (fStatT0 == 0) {
++		fStatT0 = now;
++		return;
++	}
++	if (now - fStatT0 < fStatSecAbs) {
++		return;
++	}
++	uint32_t swaps = __atomic_exchange_n(&fStatSwaps, 0, __ATOMIC_RELAXED);
++	uint32_t waits = __atomic_exchange_n(&fStatWaits, 0, __ATOMIC_RELAXED);
++	uint32_t timeouts = __atomic_exchange_n(&fStatWaitTimeouts, 0, __ATOMIC_RELAXED);
++	uint64_t waitAbs = __atomic_exchange_n(&fStatWaitAbs, 0, __ATOMIC_RELAXED);
++	uint64_t waitMax = __atomic_exchange_n(&fStatWaitMaxAbs, 0, __ATOMIC_RELAXED);
++	uint32_t copies = fStatCPU + fStatGPU;
++	IOLog("NEGRONI FB STAT: swaps/s %u presents/s %u (cpu %u gpu %u zc %u) copy avg/max us %llu/%llu "
++	    "late ticks %u swapwait calls %u waited us avg/max %llu/%llu timeouts %u\n",
++	    swaps, copies + fStatZC, fStatCPU, fStatGPU, fStatZC,
++	    copies ? negroni_fb_abs_us(fStatCopyAbs) / copies : 0, negroni_fb_abs_us(fStatCopyMaxAbs),
++	    fStatLate, waits, waits ? negroni_fb_abs_us(waitAbs) / waits : 0, negroni_fb_abs_us(waitMax), timeouts);
++	fStatT0 = now;
++	fStatCPU = fStatGPU = fStatZC = fStatLate = 0;
++	fStatCopyAbs = fStatCopyMaxAbs = 0;
++}
++
+ /*
+  * Held surfaces whose GPU copy is done (all: wait for each, at most NEGRONI_FB_GPU_WAIT_MS)
+  * are given back to CoreAnimation. Work loop only.
+@@ -597,6 +676,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			dropped[layer]->release();
+ 		}
+ 	}
++	__atomic_fetch_add(&fStatSwaps, 1, __ATOMIC_RELAXED);
+ 	if ((++negroni_fb_swap_count % 1000) == 0) {
+ 		IOLog("NEGRONI FB: %llu swaps\n", negroni_fb_swap_count);
+ 	}
+@@ -1197,13 +1277,14 @@ AppleCLCD::flip(NegroniSurface *s, uint32_t id)
+ void
+ AppleCLCD::swapWait(uint32_t id)
+ {
+-	uint64_t deadline;
++	uint64_t deadline, t0 = mach_absolute_time();
++	bool done;
+ 
+ 	clock_interval_to_deadline(NEGRONI_ZC_WAIT_MS, kMillisecondScale, &deadline);
+ 	for (;;) {
+ 		zeroCopyRetire(false);
+ 		IOLockLock(fLock);
+-		bool done = id == 0 || !fZCReady || fPowerOff || id > fEndedID || fPresentedID >= id ||
++		done = id == 0 || !fZCReady || fPowerOff || id > fEndedID || fPresentedID >= id ||
+ 		    (!fPendZC && !fZCNextValid);
+ 		IOLockUnlock(fLock);
+ 		if (done || mach_absolute_time() >= deadline) {
+@@ -1211,6 +1292,18 @@ AppleCLCD::swapWait(uint32_t id)
+ 		}
+ 		delay_for_interval(500, kMicrosecondScale);
+ 	}
++	if (fStats) {
++		uint64_t dt = mach_absolute_time() - t0;
++		__atomic_fetch_add(&fStatWaits, 1, __ATOMIC_RELAXED);
++		__atomic_fetch_add(&fStatWaitAbs, dt, __ATOMIC_RELAXED);
++		if (!done) {
++			__atomic_fetch_add(&fStatWaitTimeouts, 1, __ATOMIC_RELAXED);
++		}
++		uint64_t max = __atomic_load_n(&fStatWaitMaxAbs, __ATOMIC_RELAXED);
++		while (dt > max && !__atomic_compare_exchange_n(&fStatWaitMaxAbs, &max, dt, true,
++		    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++		}
++	}
+ }
+ 
+ /* Panic (NegroniPlatformExpert.cpp kPEPanicBegin): the panic text is drawn into the panel memory. */

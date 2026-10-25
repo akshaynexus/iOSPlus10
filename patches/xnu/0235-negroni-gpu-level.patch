@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index e69b803..faa766f 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -1446,6 +1446,18 @@ step_hfi_messages(void)
+ 	gmu_put("GMU2HOST_INTR_CLR", GMU_GMU2HOST_INTR_CLR, ~0u);
+ 	gmu_put("GMU2HOST_INTR_MASK", 0x1f993, ~1u);
+ 	uint32_t vote[4] = { 0, 1 /* blocking ack */, 1 /* 220 MHz */, 3 /* bw level 3 */ };
++	/* boot-arg negronigpu_level=N (patch 0235): GX perf-table index N (1..ng-1) and the top bw level
++	 * (bw_level_num - 1) instead; 0 or absent: the vote above */
++	uint32_t level = 0;
++	(void)PE_parse_boot_argn("negronigpu_level", &level, sizeof(level));
++	if (level > 0) {
++		if (level > ng - 1) {
++			level = ng - 1;
++		}
++		vote[2] = level;
++		vote[3] = bw[1] - 1;
++		printf("NEGRONI ADRENO: GX level %u (%u MHz), bw level %u\n", level, gpu_khz[level] / 1000, vote[3]);
++	}
+ 	if (!hfi_send("GX_BW_PERF_VOTE", 30, vote, sizeof(vote))) {
+ 		return false;
+ 	}

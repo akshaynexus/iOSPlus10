@@ -77,6 +77,10 @@ Inspect live driver initialization, frame presentation, and device answers:
 scripts/net/ssh-phone.sh "tail -n 50 /private/var/db/negronimetal/metal.log"
 ```
 
+The telemetry row `J nocopy-dealloc inflight=N used=N | hostinv n=N r=N kb=N` (flame/0006, m2v/0002) counts no-copy
+buffers freed while GPU work was in flight (`used` = still listed by a runtime command buffer: should stay 0) and m2v's
+host-import cache invalidations. No new env or file knob.
+
 ### On-Device XNUtils App
 The installed **XNUtils** app (`/Applications/XNUtils.app`) displays:
 * Active Metal Device Name (`Turnip Adreno (TM) 730` or `Software Renderer`)

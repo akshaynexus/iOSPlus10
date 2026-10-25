@@ -1,0 +1,107 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (on top of flame/0001-0005), applied by scripts/metal/fetch-sources.sh:
+resource retention for the asynchronous path (no NEGRONIMETAL_SYNC / NEGRONIMETAL_DEFER_SCHEDULED wait).
+- useResource:usage:(stages:), useResources:count:usage:(stages:), useHeap:(stages:), useHeaps:count:(stages:) add the
+  objects to the command buffer's resourceOwners (as setBuffer/setTexture do), so a no-copy buffer (CoreAnimation's) is
+  not deallocated and its pages unmapped while its GPU work is in flight. Before this they were no-ops or missing.
+- -[NBBuffer dealloc] counts no-copy deallocations while command buffers are in flight, and those a runtime command
+  buffer still uses (NBLOG for the first 8). Telemetry row "J nocopy-dealloc inflight=.. used=.. | hostinv n=.. r=.. kb=..",
+  hostinv = m2v's host-import invalidations (m2v/0002, m2v_negroni_host_invalidate_stat).
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -48,6 +48,10 @@
+ static Timed gTimeWaitScheduled,gTimeWaitCompleted;
+ static Timed gTimeResourceWait;
+ static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
++// NegroniMetal (flame/0006): no-copy buffers whose deallocator ran while command buffers were in flight, and of those the ones a
++// runtime command buffer still used (its pages may be unmapped under the GPU work); m2v's host-import invalidations (m2v/0002).
++static std::atomic<uint64_t> gNoCopyDeallocInFlight,gNoCopyDeallocUsed;
++extern "C" uint64_t m2v_negroni_host_invalidate_stat(uint32_t which);
+ static Timed gTimeSurfaceFlush;
+ static std::atomic<uint64_t> gSurfaceFlushBytes,gSurfaceFlushDuplicates;
+ struct EncodedWork {uint32_t passes,draws,dispatches,blits;uint64_t pixels;};
+@@ -123,6 +127,8 @@
+ // caller's usual resource synchronization. Storage dependency checks are in the runtime.
+ static NSMutableSet *gInFlight;
+ static void waitForResource(id resource);
++@class NBBuffer;
++static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer);
+ // Resource SPI the runtime has no state for: no protected content (Metal's default options), and no owner transfer
+ // (memory attribution is the kernel driver's, by the importing task), refused as not supported.
+ #define NB_RESOURCE_SPI \
+@@ -154,6 +160,7 @@
+ @end
+ @implementation NBBuffer
+ - (void)dealloc {
++ if(_deallocator)noteNoCopyDealloc(self);   // NegroniMetal (flame/0006)
+  const NSUInteger length=nmb_buffer_length(_handle);nmb_buffer_release(_handle);
+  if(_deallocator)_deallocator(_wrapped,length);
+  if(_surfaceOwner)CFRelease(_surfaceOwner);
+@@ -613,6 +620,18 @@
+   if(dependency!=0)[(id<MTLCommandBuffer>)commandBuffer waitUntilCompleted];else gResourceSkipped++;
+  }
+  gTimeResourceWait.add(began);
++}
++// NegroniMetal (flame/0006): a no-copy buffer's memory goes now (its deallocator runs next); is GPU work still using it?
++static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
++ NSArray *pending=nil;@synchronized(gInFlight){pending=gInFlight.count?gInFlight.allObjects:nil;}
++ if(!pending.count)return;
++ gNoCopyDeallocInFlight++;
++ for(NBCommandBuffer *commandBuffer in pending) {
++  if(nmb_command_buffer_uses_buffer(commandBuffer.handle,buffer.handle)<=0)continue;
++  if(gNoCopyDeallocUsed++<8)NBLOG(@"native-metal: no-copy buffer %p (+%lu) deallocated while command buffer %@ uses it",
++   buffer.wrapped,(unsigned long)nmb_buffer_length(buffer.handle),commandBuffer.label);
++  return;
++ }
+ }
+ @implementation NBEncoder
+ - (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
+@@ -655,6 +674,20 @@
+ }
+ - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
+ - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
++// NegroniMetal (flame/0006): useResource(s)/useHeap(s) only keep the objects (and so a no-copy buffer's memory, its deallocator,
++// a texture's IOSurface, a heap's buffers) until the command buffer finishes, as setBuffer/setTexture do. The runtime gets
++// nothing: residency stays its own (argument buffers name the resources), as before.
++- (void)own:(id)resource {if(resource)[_commandBuffer.resourceOwners addObject:resource];}
++- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n usage:(MTLResourceUsage)u {
++ (void)u;for(NSUInteger i=0;i<n;i++)[self own:r[i]];
++}
++- (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {
++ (void)s;[self useResources:r count:n usage:u];
++}
++- (void)useHeap:(id<MTLHeap>)heap {[self own:heap];}
++- (void)useHeap:(id<MTLHeap>)heap stages:(MTLRenderStages)s {(void)s;[self own:heap];}
++- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n {for(NSUInteger i=0;i<n;i++)[self own:h[i]];}
++- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n stages:(MTLRenderStages)s {(void)s;[self useHeaps:h count:n];}
+ - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+  [self check:nmb_encoder_set_buffer_offset(_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"];
+ }
+@@ -700,7 +733,7 @@
+ }
+ - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
+ - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)u;[self own:r];}
+ - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
+ @end
+ 
+@@ -816,7 +849,7 @@
+ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o {
+  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
+ }
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)u;(void)s;[self own:r];}
+ - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
+ - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
+ @end
+@@ -1996,6 +2029,9 @@
+  row("J completed wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()));
+  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
+  row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
++ row("J nocopy-dealloc inflight=%llu used=%llu | hostinv n=%llu r=%llu kb=%llu",(unsigned long long)gNoCopyDeallocInFlight.load(),
++  (unsigned long long)gNoCopyDeallocUsed.load(),(unsigned long long)m2v_negroni_host_invalidate_stat(0),
++  (unsigned long long)m2v_negroni_host_invalidate_stat(1),(unsigned long long)(m2v_negroni_host_invalidate_stat(2)>>10));   // flame/0006
+  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
+   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
+   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());

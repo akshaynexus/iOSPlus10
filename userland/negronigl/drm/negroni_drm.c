@@ -1166,10 +1166,11 @@ surface_at(uintptr_t p, uint64_t size)
 }
 
 int
-redwood_drm_host_import(int fd, void *pointer, uint64_t size, uint32_t *handle, uint64_t *bo_size)
+redwood_drm_host_import(int fd, void *pointer, uint64_t size, uint32_t *handle, uint64_t *bo_size, bool *read_only)
 {
 	(void)fd;
 	uintptr_t p = (uintptr_t)pointer;
+	*read_only = false;
 	if (conn == IO_OBJECT_NULL)
 		return ENODEV;
 	if (!p || !size || (p & (NGL_PAGE - 1)))
@@ -1207,6 +1208,7 @@ redwood_drm_host_import(int fd, void *pointer, uint64_t size, uint32_t *handle, 
 		}
 		*handle = u.handle;
 		*bo_size = whole;
+		*read_only = (u.flags & NGL_USERPTR_READ_ONLY) != 0;
 		return 0;
 	}
 	if (abi == NGL_ABI_MSM_STRUCT) {
@@ -1230,6 +1232,15 @@ redwood_drm_host_import(int fd, void *pointer, uint64_t size, uint32_t *handle, 
 		return EINVAL;
 	}
 	return e;
+}
+
+int
+redwood_drm_cpu_prep(int fd, uint32_t handle)
+{
+	(void)fd;
+	/* NOSYNC: only ask (kernel cpuPrep with 0 ms, s_cpu_prep: EBUSY). No wait for a later submission of the buffer. */
+	struct drm_msm_gem_cpu_prep r = {.handle = handle, .op = MSM_PREP_READ | MSM_PREP_NOSYNC};
+	return command(DRM_MSM_GEM_CPU_PREP, &r, sizeof(r));
 }
 
 static int

@@ -1,0 +1,77 @@
+NegroniMetal: Turnip cache upkeep of Darwin host imports (VK_EXT_external_memory_host, msm_bo_init_host in 0001).
+The program owns the mapping of a host import and may unmap it while the kernel keeps the pages wired (0232), so
+tu_bo_sync_cache never touches bo->map of a host import (dc civac there was the backboardd SIGSEGV on m2v's
+completion thread).
+- msm_bo_init_host: a read-only import (redwood_drm_host_import *read_only, NGL_USERPTR_READ_ONLY) is not
+  cached_non_coherent: the GPU cannot write it.
+- vkFlushMappedMemoryRanges (CPU-to-GPU): nothing for host imports; the kernel cleans their CPU-written pages at each
+  submission that lists them (docs/gpu-abi.md section 6, rule 1).
+- vkInvalidateMappedMemoryRanges (GPU-to-CPU) of a writable host import: the kernel's CPU_PREP by GEM handle with
+  MSM_PREP_NOSYNC (redwood_drm_cpu_prep; lines dropped by physical address). EBUSY (a later submission still lists the
+  buffer) is skipped: expected and harmless [I], that submission's completion drops the lines again. Other errors are
+  skipped as well and logged once.
+
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -7,6 +7,7 @@
+  * Copyright © 2015 Intel Corporation
+  */
+ 
++#include <errno.h>
+ #include <fcntl.h>
+ 
+ #ifdef MAJOR_IN_MKDEV
+@@ -196,6 +197,27 @@
+                  VkDeviceSize size,
+                  enum tu_mem_sync_op op)
+ {
++#ifdef __APPLE__
++   /* Host imports (msm_bo_init_host): the program owns the mapping at bo->map and may unmap it while the kernel keeps
++    * the pages wired, so never a dc by that pointer, in either direction.
++    * CPU-to-GPU: nothing to do. The kernel cleans the CPU-written pages (pmap modified bit) of every host import (0x49
++    * and 0x7e) at each submission that lists the buffer (docs/gpu-abi.md section 6, rule 1).
++    * GPU-to-CPU: read-only imports (not cached_non_coherent) need nothing: the GPU cannot write them. Writable ones: the
++    * kernel's CPU_PREP without a wait (redwood_drm_cpu_prep, MSM_PREP_NOSYNC) drops the CPU's lines by physical address.
++    * EBUSY = a later submission still lists the buffer: skipped, expected and harmless, as the completion of that
++    * submission drops the lines again and the CPU has no valid view of a buffer the GPU may still write. Any other error
++    * is skipped too, logged once. */
++   if (bo->host_ptr) {
++      if (op == TU_MEM_SYNC_CACHE_FROM_GPU && bo->cached_non_coherent) {
++         int err = redwood_drm_cpu_prep(dev->fd, bo->gem_handle);
++         static uint32_t failures;
++         if (err && err != EBUSY && __atomic_fetch_add(&failures, 1, __ATOMIC_RELAXED) == 0)
++            mesa_logw("host import (GEM %u): CPU_PREP errno %d, the CPU's lines stay (logged once)",
++                      bo->gem_handle, err);
++      }
++      return;
++   }
++#endif
+    uintptr_t level1_dcache_size = dev->physical_device->level1_dcache_size;
+    char *start = (char *) bo->map + offset;
+    char *end = start + (size == VK_WHOLE_SIZE ? (bo->size - offset) : size);
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -753,7 +753,8 @@
+ {
+    uint32_t gem_handle = 0;
+    uint64_t bo_size = 0;
+-   int err = redwood_drm_host_import(dev->fd, pointer, size, &gem_handle, &bo_size);
++   bool read_only = false;
++   int err = redwood_drm_host_import(dev->fd, pointer, size, &gem_handle, &bo_size, &read_only);
+    if (err)
+       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                        "host import of %p (%" PRIu64 " bytes): errno %d", pointer, size, err);
+@@ -774,8 +775,11 @@
+    bo->map = pointer;
+    bo->host_ptr = true;
+    bo->never_unmap = true;
+-   /* the caller's mapping is cacheable: vkFlush/InvalidateMappedMemoryRanges clean/drop lines */
+-   bo->cached_non_coherent = true;
++   /* the caller's mapping is cacheable: vkFlush/InvalidateMappedMemoryRanges clean/drop lines (tu_bo_sync_cache:
++    * the kernel's CPU_PREP by handle). A read-only import (NGL_USERPTR_READ_ONLY) never needs that: the GPU cannot
++    * write it, and the program may unmap the pages while the kernel keeps them wired, so a dc civac by pointer
++    * would fault (backboardd SIGSEGV, docs/notes.md section 16). */
++   bo->cached_non_coherent = !read_only;
+    *out_bo = bo;
+    return VK_SUCCESS;
+ }

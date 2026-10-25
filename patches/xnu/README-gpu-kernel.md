@@ -266,3 +266,64 @@ See the status in `docs/gpu-status.md` and the handoff in `docs/notes.md` (kerne
    below 0x1_0000_0000: the kernel's part is missing in a client root.
 5. Turnip host import: a probe that imports a malloc'd 16 KiB-aligned buffer (0x49), lets the GPU
    write it, CPU_PREP, and checks the bytes.
+
+## 12. Per-second display stats (0252) and the GPU clock vote (0235)
+
+- 0252 (`negronifb_stats`, default 1; `negronifb_stats=0` turns it off): once a second the vsync
+  timer (work loop) logs one line and starts all counters again:
+  `NEGRONI FB STAT: swaps/s N presents/s N (cpu N gpu N zc N) copy avg/max us N/N late ticks N
+  swapwait calls N waited us avg/max N/N timeouts N`.
+  - swaps: SwapEnd records from backboardd. presents: frames that got to the panel in that second;
+    cpu = `present()` with no GPU copy, gpu = `present()` with a GPU copy (0231), zc = flips (0234).
+  - copy avg/max: time of the `present()` call (the CPU memcpy, or the GPU submit and the waits in it).
+  - late ticks: vsync timer calls that came more than 1.5 x 8333 us after the call before (the timer
+    is re-armed at the end of the handler, so a slow copy makes the next tick late).
+  - swapwait: selector 6 calls (`swapWait()`, 0234), the time each one waited, and the calls that
+    stopped at the 50 ms limit (`NEGRONI_ZC_WAIT_MS`).
+  - The window is the first tick at or after 1 s, so the numbers are per ~1.00 s, not scaled.
+- 0235 (`negronigpu_level=N`, default 0): N = 0 keeps the step-17 vote `{0, 1, 1, 3}` (GX level 1 =
+  220 MHz, bw level 3). N > 0 (clamped to 12) sends `{0, 1, N, 11}`: GX level N of the perf table
+  (0, 220, 285, 317, 350, 421, 492, 545, 599, 640, 734, 791, 818 MHz) and the top bw level of the
+  12-level BW table (`bw_level_num - 1` = 11). Same HFI message (id 30, 4 words). Log:
+  `NEGRONI ADRENO: GX level N (M MHz), bw level 11`, then the usual `17 HFI GX_BW_PERF_VOTE ack, error 0`.
+  [I] Nothing votes again later, so the level stays for the whole boot.
+
+### Test recipe (120 Hz), in this order
+
+Start from the current config args (`config/negroni-ne2211.toml`: `negronifb_noconsole=1
+negronifb_hz=120 negronifb_clockshift=100 negroniadreno=22 negroniadreno_keep=1 ...`). Do not change
+the config: build a boot image variant with `BOOTARGS_ADD` (scripts/ios16/build.sh).
+
+(a) current args + `negronifb_zerocopy=1`:
+    `IOS16_OUT=out/ios16-zc BOOTARGS_ADD="negronifb_zerocopy=1" scripts/bg.sh ios16-zc scripts/ios16/build.sh`
+    Proof (section 9 and 11): `NEGRONI SURF: 3 display slots`, `flip N: slot ... taken after ... us`
+    (< 8400 us), `NEGRONI FB: N frames shown zero-copy` every 1000 flips. In the STAT line: `zc` near
+    the swaps/s, `cpu` near 0 while the UI is idle or scrolling, `late ticks 0`, swapwait `timeouts 0`
+    and waited max < 8.4 ms. `zero-copy off (...)` means the layout check failed: report the line.
+(b) (a) + `negronigpu_level=12`:
+    `IOS16_OUT=out/ios16-zc12 BOOTARGS_ADD="negronifb_zerocopy=1 negronigpu_level=12" scripts/bg.sh ios16-zc12 scripts/ios16/build.sh`
+    Proof: `NEGRONI ADRENO: GX level 12 (818 MHz), bw level 11` and `17 HFI GX_BW_PERF_VOTE ack,
+    error 0`, ladder 22/22 as before. With the GPU (GL/Metal) path on: `gpu`/`zc` rates in the STAT
+    line go up toward 120 and copy avg goes down against (a). A GMU error or no ack: boot (a) again.
+
+(c) the CoreAnimation heartbeat (CA ran on 1/60 s quanta: no `IOMFBDisplayRefresh` property; docs/notes.md
+    section 15). Try in this order:
+    1. env lever on the current kernel, no new image: `scripts/metal/phone-heartbeat.sh on` (backboardd
+       `CA_HEARTBEAT_RATE=120` in /System/Library/xpc/launchd.plist), then `scripts/net/ssh-phone.sh reboot`.
+       Back: `scripts/metal/phone-heartbeat.sh off` + reboot.
+    2. kernel with 0253 (`negronifb_carefresh`, default 1; `=0` for the A/B test): boot line
+       `NEGRONI FB: IOMFBDisplayRefresh step N ticks (8333 us)` (N = 8333 us in mach ticks: ~159993 if the timer runs at 19.2 MHz [I]),
+       and the vsync notification's interval = the same N.
+    Proof for both: the backboardd log line `CoreAnimation: GetDisplayInfo returned ...` (`scripts/net/phone-log.sh -g GetDisplayInfo backboardd`;
+    kernel log: make usblog) and the STAT line `swaps/s` going from ~60 toward 120.
+
+Goal: `presents/s` 120 (or equal to `swaps/s` when iOS sends fewer) with `late ticks 0`.
+
+### 0253 (`negronifb_carefresh`, default 1)
+
+`AppleCLCD::start` sets `IOMFBDisplayRefresh` = { `displayRefreshStepMachTime` (OSNumber 64-bit) =
+`nanoseconds_to_absolutetime(8333 * 1000)`, `displayMinRefreshInterval` (OSNumber 32-bit) = 1 } beside
+`external` and `DisplayPipePlaneBaseAlignment`, before `registerService()`. `vsyncFired` sends
+values[4..5] = the same tick count (low, high half) instead of 0. `negronifb_carefresh=0`: no property,
+interval 0 (the old behaviour). [I] displayMinRefreshInterval units are unclear (scale 2^-32); CA reads
+the step first, so the value 1 matters only if the step is rejected.
