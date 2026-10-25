@@ -459,6 +459,9 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - [I] Which node the BCL sees on the 2S pack (1S side or the pack) is not known; VBAT > 5000 mV is halved, and the coulomb count assumes 1S-side current with 5000 mAh.
 - [V] 0270 and 0271 apply on a patched-tree.sh tree of all patches up to 0261 + 0213 (out/kernel/tree-battery, 2026-10-25); compile-one.sh OK for negroni_spmi.c and negroni_rtc.c; NegroniBattery.cpp has no diagnostic with its clang++ line from build.log.
 - [V] The USB driver forces VBUS valid (negroni_usb.c UTMI_OTG_VBUS_VALID), so USB cannot tell a charger; not used.
+- [V] Full build 2026-10-25 (`scripts/bg.sh kernel-battery scripts/kernel/build-local.sh`, battery agent): exit 0, `out/kernel/local-20261025-130140/kernel.development.negroni` sha256 f5c01805913a5ed4..., patch-report: all 27 patches/xnu applied (0200-0261, 0270, 0271, 0290; with the io-fix agent's uncommitted 0234/0240/0260/0261), only the 4 usual dxb skips; strings `NEGRONI BATTERY: SPMI arbiter`, `NEGRONI RTC: PMK8350 RTC APID` and the NegroniBattery personality are in the kernel. `out/kernel/kernel.macho` points to it. Not booted.
+- [I] Phone test: boot-args + `negronibatt=2`; check the arbiter/BCL lines (MONITOR_EN, VBAT_CONV_REQ), `raw bcl` vbat 3300-4450 mV, ibat sign on battery/charger, the RTC line still there, the status bar percent; if MONITOR_EN is 0, try `negronibatt=5` (VADC). Details: README-battery.md section 4.
+- [I] Without the ADSP nobody configures the PM8350B charger; whether it charges at all is unknown: the `ibat` sign (BCL) or `ichg` (VADC modes) in the 0271 log shows it.
 - [I] Exact SoC needs the ADSP charger PD (GLINK PMIC_RTR_ADSP_APPS, after the audio ADSP work); README-battery.md section 6 lists the messages.
 
 ## 15. GL driver loading on iOS 16 (GL agent, 2026-10-25) [V: 20H392 shared cache, unslid addresses]
