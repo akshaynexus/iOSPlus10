@@ -35,7 +35,7 @@ docs/
   research-report.md     stack map, iOS 16 and iOS 26 tracks, GPU path, blockers
   device-facts.md        measured CPU, RAM map, firmware, storage
   gpu-plan.md            GPU path: ios-sailfish reference, A730 state, steps
-  external-repos.md      every submodule: needed to build vs reference only
+  external-repos.md      every external repo: submodule (build) vs reference
   boot-speed.md          boot-time findings from the reference ports + status
   backup-and-restore.md  device state, stock backup, restore commands
 docker/                  x86_64 container for the Mu UEFI build only
@@ -49,35 +49,42 @@ scripts/
   flash/                 all.sh (whole chain), restore.sh (back to stock), ios16.sh (single steps)
 tools/op10tool/          Rust CLI: img2simg, ipsw-get, uefi-unpack, uefi-portpatch, im4p
                          (tests/: Python reference versions + compare-python.sh)
-external/                submodules (see below)
+external/                submodules + reference clones (see below)
 ```
 
-## Submodules
+## External repos
 
-Only `slop`, `Mu-Silicium-negroni` and `UniXNU` are needed to build; the others are the reference
-HackiOS-family ports we read and port from. Details: [docs/external-repos.md](docs/external-repos.md).
+Five repos are **submodules** (the build reads them). The other twelve are **reference** repos that
+we read and port from: they are not submodules, they are git-ignored, and
+`scripts/setup/get-references.sh` (`make references`) clones them at a pinned commit on demand.
+Details: [docs/external-repos.md](docs/external-repos.md).
 
-| Path | Upstream | Role |
-|---|---|---|
-| `external/ios-sweet` | akshaynexus/ios-sweet | Original sweet port: shim, mkadt, root tools |
-| `external/slop` | MellysInformejtik/slop | negroni source: 128 xnu-8796 patches, shim BOARD=negroni, UEFI tools, A730 bring-up, kernel CI |
-| `external/UniXNU-negroni` (`dev`) | pawlickerr/UniXNU-negroni | Board file, payload and boot image scripts |
-| `external/Mu-Silicium-negroni` | pawlickerr/Mu-Silicum-negroni | Mu-Silicium UEFI with negroniPkg |
-| `external/UniXNU` | UniXNU/UniXNU | Core: boot manager, DarwinBoot, NativeAdreno, NativeMetal, AirNir |
-| `external/UniXNU-ios26` (`ios26`) | none24smu/UniXNU | xnu-12377.121.6 (iOS 26) kernel work |
-| `external/UniXNU-zeta` | none24smu/UniXNU-zeta | iOS 26 on Surface Duo 2 (no PAC): reference |
-| `external/UniXNU-pong` | Chengdong-Yu/UniXNU-pong | iOS 16 on Nothing Phone 2 (SM8475, Adreno 730): reference |
-| `external/ios-sailfish` | joranv1/ios-sailfish | iOS 16 on Pixel 1 with working GPU (Mesa freedreno + EAGL shim): GPU reference |
-| `external/ios-sweet-upstream` | dipa-studio/ios-sweet | Upstream of all the sweet-based ports (same commit as our fork today) |
-| `external/bergamota` (`develop`) | ry-diffusion/bergamota | iOS 18.7.8 on POCO F1, **iOS 18 kernel**: reference for the newer-kernel path |
-| `external/ios-apollo` | aTechGeekDev/ios-apollo | iOS 16 on Mi 10T 5G (SM8250): memory-address port of ios-sweet |
-| `external/ios-flame` | NWylynko/ios-flame | iOS 16 on Pixel 4 (SM8150) |
-| `external/hackios-xnu-kernel`, `external/hackios-xnu-userland` | oosexgang | HackiOS (POCO X5 Pro, SM7325): kernel and userland, Mesa GPU path |
+| Path | Upstream | Kind | Role |
+|---|---|---|---|
+| `external/slop` | akshaynexus/slop | submodule | negroni source: 128 xnu-8796 patches, shim BOARD=negroni, UEFI tools, A730 bring-up, kernel CI |
+| `external/Mu-Silicium-negroni` | akshaynexus/Mu-Silicum-negroni | submodule | Mu-Silicium UEFI with negroniPkg |
+| `external/UniXNU` (`iosplus10`) | akshaynexus/UniXNU | submodule | Core: boot manager, DarwinBoot, NativeAdreno, NativeMetal, AirNir |
+| `external/ios-flame` | NWylynko/ios-flame | submodule | iOS 16 on Pixel 4 (SM8150) |
+| `external/hackios-xnu-userland` | oosexgang/hackios-xnu-userland | submodule | HackiOS (POCO X5 Pro, SM7325) userland, Mesa GPU path |
+| `external/ios-sweet` | akshaynexus/ios-sweet | reference (scripts/setup/get-references.sh) | Original sweet port: shim, mkadt, root tools |
+| `external/ios-sweet-upstream` | dipa-studio/ios-sweet | reference (scripts/setup/get-references.sh) | Upstream of all the sweet-based ports (same commit as our fork today) |
+| `external/UniXNU-negroni` (`dev`) | pawlickerr/UniXNU-negroni | reference (scripts/setup/get-references.sh) | Board file, payload and boot image scripts |
+| `external/UniXNU-ios26` (`ios26`) | none24smu/UniXNU | reference (scripts/setup/get-references.sh) | xnu-12377.121.6 (iOS 26) kernel work |
+| `external/UniXNU-zeta` | none24smu/UniXNU-zeta | reference (scripts/setup/get-references.sh) | iOS 26 on Surface Duo 2 (no PAC) |
+| `external/UniXNU-pong` | Chengdong-Yu/UniXNU-pong | reference (scripts/setup/get-references.sh) | iOS 16 on Nothing Phone 2 (SM8475, Adreno 730) |
+| `external/ios-sailfish` | joranv1/ios-sailfish | reference (scripts/setup/get-references.sh) | iOS 16 on Pixel 1 with working GPU (Mesa freedreno + EAGL shim): GPU reference |
+| `external/bergamota` (`develop`) | ry-diffusion/bergamota | reference (scripts/setup/get-references.sh) | iOS 18.7.8 on POCO F1, **iOS 18 kernel**: reference for the newer-kernel path |
+| `external/ios-apollo` | aTechGeekDev/ios-apollo | reference (scripts/setup/get-references.sh) | iOS 16 on Mi 10T 5G (SM8250): memory-address port of ios-sweet |
+| `external/hackios-xnu-kernel` | oosexgang/hackios-xnu-kernel | reference (scripts/setup/get-references.sh) | HackiOS (POCO X5 Pro, SM7325) kernel |
+| `external/ios-s9` | syncmodz/ios-s9 | reference (scripts/setup/get-references.sh) | iOS 16 on Samsung Galaxy S9 (SM-G9600): shim, XNU patches, drivers |
+| `external/Chlorophyll` | ry-diffusion/Chlorophyll | reference (scripts/setup/get-references.sh) | Bergamota's Metal driver (AIR -> NIR -> ir3 over freedreno, Adreno 630), MIT |
 
 ```sh
 git clone --recurse-submodules git@github.com:akshaynexus/iOSPlus10.git
 # or, after a plain clone:
 git submodule update --init
+# reference repos, only when you need them (no args = all missing; -l = list and state):
+scripts/setup/get-references.sh [-l | NAME...]
 ```
 
 Mu-Silicium has its own submodules; initialize them only when you build the UEFI
@@ -93,5 +100,5 @@ Mu-Silicium has its own submodules; initialize them only when you build the UEFI
 
 ## License
 
-The files in `docs/`, `scripts/` and `tools/` are MIT. Each submodule keeps its own license; `slop` and
+The files in `docs/`, `scripts/` and `tools/` are MIT. Each external repo keeps its own license; `slop` and
 `UniXNU-negroni` have no license file.

@@ -1,0 +1,84 @@
+#!/bin/sh
+# Fetch the reference-only repos into external/ (they are not submodules; the build does not read them).
+# Usage: get-references.sh            fetch every missing repo
+#        get-references.sh NAME...    fetch the named repos
+#        get-references.sh -l         list the table and the on-disk state
+# A directory that already exists is never changed. REF_DIR=... puts the clones in another folder.
+# Each fetch is a shallow fetch of the pinned commit; if the server refuses it, a full fetch of the branch.
+set -eu
+. "$(dirname "$0")/../lib/env.sh"
+DEST=${REF_DIR:-$EXT}
+
+# NAME URL COMMIT [BRANCH]
+TABLE='
+UniXNU-negroni     https://github.com/pawlickerr/UniXNU-negroni.git   f812002ae3e6b861d23007efdfd9f1c394934ba9 dev
+ios-sweet          https://github.com/akshaynexus/ios-sweet.git       45263bee51df4a0f55cdf9c649af886399488ddb main
+ios-sweet-upstream https://github.com/dipa-studio/ios-sweet.git       45263bee51df4a0f55cdf9c649af886399488ddb main
+UniXNU-ios26       https://github.com/none24smu/UniXNU.git            68c513467bb6c44106c053c410582c1d14f96dd7 ios26
+UniXNU-zeta        https://github.com/none24smu/UniXNU-zeta.git       318b2ea45bca77ca6b7a91c00c87efc8a44597e1 main
+UniXNU-pong        https://github.com/Chengdong-Yu/UniXNU-pong.git    ab74f075320fe54eee24d5d150386e5b0f0f427f main
+ios-sailfish       https://github.com/joranv1/ios-sailfish.git        6f27e41ff249f2680540ebe8ee5ab982c5e641c9
+bergamota          https://github.com/ry-diffusion/bergamota.git      0826e48c3d3f4bd9b0ab7d5af82ed92dfaeec425 develop
+hackios-xnu-kernel https://github.com/oosexgang/hackios-xnu-kernel.git d82c64a3a31cd27a0a0afbf6e213e467e44b1b4c main
+ios-apollo         https://github.com/aTechGeekDev/ios-apollo.git     1c1a199c4f2fcf3484a58a5e8248caffdf14e45e main
+ios-s9             https://github.com/syncmodz/ios-s9.git             7b72f7c0db34fc396498d71bb7e1af90d6f899f3
+Chlorophyll        https://github.com/ry-diffusion/Chlorophyll.git    787338fc7c297f54e2000bca02f4fa36f1154c5a
+'
+
+rows() { printf '%s\n' "$TABLE" | sed '/^[[:space:]]*$/d'; }
+
+list() {
+  printf '%-19s %-8s %-8s %s\n' NAME STATE PIN HEAD
+  rows | while read -r name url commit branch; do
+    d=$DEST/$name
+    if [ -e "$d" ]; then
+      head=$(git -C "$d" rev-parse HEAD 2>/dev/null || echo '?')
+      [ "$head" = "$commit" ] && pin=match || pin=differs
+      printf '%-19s %-8s %-8s %s\n' "$name" present "$pin" "$head"
+    else
+      printf '%-19s %-8s %-8s %s\n' "$name" absent - "(pin $commit${branch:+, branch $branch})"
+    fi
+  done
+}
+
+fetch() { # NAME URL COMMIT [BRANCH]
+  name=$1 url=$2 commit=$3 branch=${4:-}
+  d=$DEST/$name
+  if [ -e "$d" ]; then echo "$name: $d exists, not changed"; return 0; fi
+  tmp=$d.partial
+  rm -rf "$tmp"
+  mkdir -p "$tmp"
+  git -C "$tmp" init -q
+  git -C "$tmp" remote add origin "$url"
+  echo "$name: fetching $commit from $url"
+  if git -C "$tmp" fetch -q --depth 1 origin "$commit"; then
+    git -C "$tmp" checkout -q --detach FETCH_HEAD
+  else
+    echo "$name: commit fetch refused, full fetch of ${branch:-the default branch}"
+    git -C "$tmp" fetch -q origin ${branch:+"$branch"}
+    git -C "$tmp" checkout -q --detach "$commit"
+  fi
+  head=$(git -C "$tmp" rev-parse HEAD)
+  if [ "$head" != "$commit" ]; then echo "$name: HEAD $head is not the pin $commit" >&2; return 1; fi
+  mv "$tmp" "$d"
+  echo "$name: $d at $commit"
+}
+
+if [ "${1:-}" = -l ]; then list; exit 0; fi
+mkdir -p "$DEST"
+fail=0
+if [ $# -eq 0 ]; then
+  while read -r name url commit branch; do
+    fetch "$name" "$url" "$commit" "$branch" </dev/null || fail=1
+  done <<ROWS
+$(rows)
+ROWS
+else
+  for want in "$@"; do
+    row=$(rows | awk -v n="$want" '$1 == n')
+    if [ -z "$row" ]; then echo "$want: not in the table (see -l)" >&2; fail=1; continue; fi
+    # shellcheck disable=SC2086
+    fetch $row || fail=1
+  done
+fi
+exit $fail

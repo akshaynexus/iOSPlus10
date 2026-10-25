@@ -7,15 +7,15 @@ The community repos say that they are AI-written, so claims were judged by code 
 
 ## Repo state
 
-| Repo (submodule) | Last commit | License | State |
+| Repo (kind) | Last commit | License | State |
 |---|---|---|---|
-| `external/slop` (MellysInformejtik/slop) | 2026-10-23 | none (fork of MIT dipa-studio/ios-sweet) | The real source tree: `negroni-ios/` (128 xnu patches, up to 0124), `shim/` with BOARD=negroni, `uefi/negroni/`, NOTES.md. CI `negroni-ios` green: run 40007883255, artifact `negroni-ios-kernel` expires 2027-01-21 [V] |
-| `external/UniXNU-negroni` (pawlickerr, branch `dev`) | 2026-10-22 | none | Board file and scripts. Claims SpringBoard on an NE2213 (CPU rendering, no Wi-Fi); slop logs support it |
-| `external/Mu-Silicium-negroni` (pawlickerr) | 2026-10-23 | BSD-2-Clause | Mu-Silicium with `Platforms/OnePlus/negroniPkg` and submodule patches |
-| `external/UniXNU` (UniXNU core) | 2026-10-24 | BSD-2-Clause-Patent | Targets xnu-10063.141.1 (iOS 17), 4 KiB pages [V] |
-| `external/UniXNU-ios26` (none24smu, branch `ios26`) + `external/UniXNU-zeta` | 2026-10-22 / 24 | NOASSERTION | xnu-12377.121.6 as plain arm64 (no PAC), BCM2837-based config |
-| `external/UniXNU-pong` (Chengdong-Yu) | 2026-10-24 | BSD-2-Clause-Patent | iOS 16.6.1 (iPad7,1 identity) on SM8475 |
-| `external/ios-sweet` (akshaynexus) | — | MIT | The original sweet port; source of the shim, mkadt and root tools |
+| `external/slop` (MellysInformejtik/slop; submodule) | 2026-10-23 | none (fork of MIT dipa-studio/ios-sweet) | The real source tree: `negroni-ios/` (128 xnu patches, up to 0124), `shim/` with BOARD=negroni, `uefi/negroni/`, NOTES.md. CI `negroni-ios` green: run 40007883255, artifact `negroni-ios-kernel` expires 2027-01-21 [V] |
+| `external/UniXNU-negroni` (pawlickerr, branch `dev`; reference, `scripts/setup/get-references.sh`) | 2026-10-22 | none | Board file and scripts. Claims SpringBoard on an NE2213 (CPU rendering, no Wi-Fi); slop logs support it |
+| `external/Mu-Silicium-negroni` (pawlickerr; submodule) | 2026-10-23 | BSD-2-Clause | Mu-Silicium with `Platforms/OnePlus/negroniPkg` and submodule patches |
+| `external/UniXNU` (UniXNU core; submodule) | 2026-10-24 | BSD-2-Clause-Patent | Targets xnu-10063.141.1 (iOS 17), 4 KiB pages [V] |
+| `external/UniXNU-ios26` (none24smu, branch `ios26`) + `external/UniXNU-zeta` (both reference, `scripts/setup/get-references.sh`) | 2026-10-22 / 24 | NOASSERTION | xnu-12377.121.6 as plain arm64 (no PAC), BCM2837-based config |
+| `external/UniXNU-pong` (Chengdong-Yu; reference, `scripts/setup/get-references.sh`) | 2026-10-24 | BSD-2-Clause-Patent | iOS 16.6.1 (iPad7,1 identity) on SM8475 |
+| `external/ios-sweet` (akshaynexus; reference, `scripts/setup/get-references.sh`) | — | MIT | The original sweet port; source of the shim, mkadt and root tools |
 
 ## A. Stack for negroni, bottom to top [V]
 

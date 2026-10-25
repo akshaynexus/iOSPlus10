@@ -5,11 +5,12 @@
 BG := scripts/bg.sh
 OS := $(shell uname -s)
 
-.PHONY: help status tools op10tool colima image backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
+.PHONY: help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
         kernel kernel-local kernel-ci xcode15 ssh devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog
 
 help:
 	@echo "setup:   make tools | op10tool | colima (macOS) | image"
+	@echo "refs:    make references  (reference-only repos into external/, not submodules)"
 	@echo "backup:  make backup-ota | backup-dump (adb root)"
 	@echo "uefi:    make mu  (= setup-mu + mu-prepare + mu-build) | mu-build-macos (native, no container)"
 	@echo "kernel:  make xcode15 (once) | kernel-local (our patches, Xcode 15) | kernel-ci | kernel (slop CI download)"
@@ -28,6 +29,8 @@ tools:
 	$(BG) tools scripts/setup/native-tools.sh
 op10tool:
 	$(BG) op10tool scripts/setup/build-op10tool.sh
+references:
+	$(BG) references scripts/setup/get-references.sh
 colima:
 ifeq ($(OS),Darwin)
 	scripts/setup/colima-up.sh

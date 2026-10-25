@@ -24,6 +24,7 @@ curl https://sh.rustup.rs -sSf | sh      # if cargo is missing
 ```sh
 git clone --recurse-submodules git@github.com:akshaynexus/iOSPlus10.git
 cd iOSPlus10
+make references     # optional: reference-only repos (scripts/setup/get-references.sh, not submodules)
 make tools          # apt cross GCC, gawk, rsync; AOSP mkbootimg; pyfatfs venv
 make op10tool       # Rust CLI -> out/bin/op10tool
 make image          # x86_64 build container for Mu (native on x86_64)

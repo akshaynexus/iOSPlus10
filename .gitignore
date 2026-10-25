@@ -22,6 +22,17 @@ __pycache__/
 userland/rebootapp/PowerMenu
 userland/rebootapp/*.app/
 userland/rebootapp/_CodeSignature/
+# Reference repos (not submodules): fetch with scripts/setup/get-references.sh.
 external/Chlorophyll/
 external/ios-s9/
+external/UniXNU-negroni/
+external/ios-sweet/
+external/ios-sweet-upstream/
+external/UniXNU-ios26/
+external/UniXNU-zeta/
+external/UniXNU-pong/
+external/ios-sailfish/
+external/bergamota/
+external/hackios-xnu-kernel/
+external/ios-apollo/
 skills/

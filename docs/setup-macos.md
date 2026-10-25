@@ -19,6 +19,7 @@ curl https://sh.rustup.rs -sSf | sh          # if cargo is missing
 ```sh
 git clone --recurse-submodules git@github.com:akshaynexus/iOSPlus10.git
 cd iOSPlus10
+make references     # optional: reference-only repos (scripts/setup/get-references.sh, not submodules)
 make tools          # aarch64-elf-gcc, gawk, rsync, AOSP mkbootimg, pyfatfs venv
 make op10tool       # Rust CLI -> out/bin/op10tool
 make colima         # Colima VM with Rosetta, for the x86_64 Mu build container

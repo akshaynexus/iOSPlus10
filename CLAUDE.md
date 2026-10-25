@@ -24,7 +24,9 @@ decision we learned; add yours before you stop), `docs/plan.md` (status and next
   observations from guesses.
 - **Keep out of git:** device dumps, serial numbers, firmware images, OTA files, Apple IPSW/DMG files,
   kernelcaches. `.gitignore` blocks the usual types; check `git status` before each commit.
-- **External repos are submodules** in `external/`. Do not commit changes inside them; put our
+- **External repos live in `external/`.** The 5 required ones (slop, Mu-Silicium-negroni, UniXNU, ios-flame,
+  hackios-xnu-userland) are submodules; the reference ones come from `scripts/setup/get-references.sh`
+  (`make references`), are git-ignored and pinned in that script. Do not commit changes inside either kind; put our
   changes as patches or scripts in this repo and apply them from a script.
 - **Reply style:** ASD-STE100, STE-flavored (short sentences, active voice, technical terms and
   numbers unchanged).

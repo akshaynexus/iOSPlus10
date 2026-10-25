@@ -1,15 +1,7 @@
-[submodule "external/ios-sweet"]
-	path = external/ios-sweet
-	url = https://github.com/akshaynexus/ios-sweet.git
-	branch = main
 [submodule "external/slop"]
 	path = external/slop
 	url = https://github.com/akshaynexus/slop.git
 	branch = main
-[submodule "external/UniXNU-negroni"]
-	path = external/UniXNU-negroni
-	url = https://github.com/pawlickerr/UniXNU-negroni.git
-	branch = dev
 [submodule "external/Mu-Silicium-negroni"]
 	path = external/Mu-Silicium-negroni
 	url = https://github.com/akshaynexus/Mu-Silicum-negroni.git
@@ -18,40 +10,9 @@
 	path = external/UniXNU
 	url = https://github.com/akshaynexus/UniXNU.git
 	branch = iosplus10
-[submodule "external/UniXNU-ios26"]
-	path = external/UniXNU-ios26
-	url = https://github.com/none24smu/UniXNU.git
-	branch = ios26
-[submodule "external/UniXNU-zeta"]
-	path = external/UniXNU-zeta
-	url = https://github.com/none24smu/UniXNU-zeta.git
-	branch = main
-[submodule "external/UniXNU-pong"]
-	path = external/UniXNU-pong
-	url = https://github.com/Chengdong-Yu/UniXNU-pong.git
-	branch = main
-[submodule "external/ios-sailfish"]
-	path = external/ios-sailfish
-	url = https://github.com/joranv1/ios-sailfish.git
-[submodule "external/ios-sweet-upstream"]
-	path = external/ios-sweet-upstream
-	url = https://github.com/dipa-studio/ios-sweet.git
-	branch = main
 [submodule "external/ios-flame"]
 	path = external/ios-flame
 	url = https://github.com/NWylynko/ios-flame.git
-	branch = main
-[submodule "external/bergamota"]
-	path = external/bergamota
-	url = https://github.com/ry-diffusion/bergamota.git
-	branch = develop
-[submodule "external/hackios-xnu-kernel"]
-	path = external/hackios-xnu-kernel
-	url = https://github.com/oosexgang/hackios-xnu-kernel.git
-	branch = main
-[submodule "external/ios-apollo"]
-	path = external/ios-apollo
-	url = https://github.com/aTechGeekDev/ios-apollo.git
 	branch = main
 [submodule "external/hackios-xnu-userland"]
 	path = external/hackios-xnu-userland
