@@ -261,6 +261,10 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 | HDR (BT.2020 PQ) screenshots look washed out on SDR | `sips --matchTo "/System/Library/ColorSync/Profiles/sRGB Profile.icc"` (ffmpeg here has no zscale) |
 | downloading/running prebuilt UEFIExtract was blocked | own unpacker: `op10tool uefi-unpack` |
 
+- `VAR=x scripts/bg.sh NAME cmd` does not pass VAR into the job once a tmux server already runs (the
+  server keeps its own environment): the ios16-gpu12 build wrote into `out/ios16` with the default args
+  (2026-10-25). Write `scripts/bg.sh NAME env VAR=x cmd` instead. [V]
+
 ## 9. Where things are (outside git)
 
 - `~/op10-backup/`: stock OTA `NE2211_16.0.3.530_EX01_full.zip`, `images/`, `partitions/` (121 partitions + GPT),
@@ -380,6 +384,21 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   re-arms `setTimeoutUS(8333)` at the END of `vsyncFired`, so the real period is 8333 us + the handler time
   (the CPU copy of ~10.4 MB): a slow copy shows as late ticks (> 1.5 x 8333 us). [I] Before 0252 there was
   no per-second rate; the old counters log every 1000 swaps/frames only. Not yet booted.
+- Display stalls behind the GPU (2026-10-25, patch 0254, README-gpu-kernel.md section 12 "0254").
+  [V phone, kernel local-20261025-170531] CPU-only boot: `present()` 2.5-3.7 ms avg, 6 ms max; swaps/s up to 81,
+  presents/s 37, late ticks 11-13/s. After backboardd (Metal) crashed with GPU work pending (`RedwoodGPU: the
+  GPU is not done with a buffer ...` 15+ s): every `present()` 51 ms (50 ms `NegroniGPUFenceWait` in the vsync
+  handler + copy), sometimes 650-1073 ms, UI ~1 fps. SwapWait returned at once in copy modes, so CA ran free.
+  [V telemetry] backboardd on Metal at 220 MHz: commit-to-callback 89 ms .. 14 s, one buffer done every ~60 ms,
+  RBBM busy: the GPU is slow, not dead. [V QuartzCore 20H392 disassembly: can_update_ 0x1882be944,
+  swap_wait_timeout 0x18853c088] SwapWait 0 releases CA's surface; non-zero keeps it, CA retries (usleep(100),
+  up to 1 ms) or skips to the next heartbeat. CA keeps 3 surfaces; only SwapWait gates reuse.
+  Design (0254) [I until booted]: fixed-deadline vsync (`wakeAtTime`, deadline += 8333 us, skipped deadlines =
+  late ticks); the tick never waits for a render (frame stays pending until its newest fence is done,
+  `gpu-wait skips`); the first waiting frame is kept as the "older" one so a slow GPU still shows frames;
+  give-up only after 500 ms AND a RedwoodGPU client close, or after 2 s without any fence progress
+  (`gave up on fence N of surface M`, `gave-up` count); SwapWait answers 0 only when that id (or a later one)
+  is on screen, else kIOReturnBusy at once, in all modes. No present thread (README has what it would need).
 
 ## 16. Metal (2026-10-25, Metal agent)
 
@@ -651,6 +670,28 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   +0x18 begin_iosurface (NULL until attached), +0x10 detach, +0x20 swap(nw, mode, t), +0x30
   begin_properties; attach takes a reference at +0x80. Sharegroup lead UAF and cross-thread destroy
   fixed (gli_context.c). Build exit 0; untested on the phone.
+
+- 2026-10-25 (GL path agent, ios-spes port; docs/gpu-userland.md "GL path (ported from ios-spes)"):
+  - [V] ios-spes (Redmi Note 11, A610, same 20H392 iPhone X root) runs CA on GL this way: only backboardd
+    gets an `LC_LOAD_WEAK_DYLIB /redwood/lib/libredwood-gl.dylib` written into the zero header padding
+    (tools/stage-spes-eagl.py), ad hoc re-signed with its entitlements; no launchd/DYLD env change. The
+    bridge is HackiOS eagl.c (8 EAGLContext methods replaced) over libOSMesa (freedreno msm + redwood-drm);
+    a preflight (xnu/graphics/spes_gl_preflight.c: `spesgpu=1`, RedwoodGPU within 30 s, renderer FD610,
+    triangle readback) runs before any method is replaced. Measured there: ~20 fps with stutters at first,
+    all12 frame median 10.8 ms / p90 21.3 ms after queued submissions (0102), 300 MHz GPU clock (0107),
+    MDP direct scanout (0109/0116) and 512 MiB GPU VA.
+  - [V] Ours: `userland/negronigl/eagl.c` already is that bridge (12 EAGLContext selectors, Mesa linked in).
+    New: gate `/var/db/negronigl/{clients,off}` + `ngl_preflight()` (renderer must say FD730, ngl_selftest +
+    ngl_surface_selftest PASS, `NEGRONIGL_WAIT` 30 s, `NEGRONIGL_PREFLIGHT=0` skips, `NEGRONIGL_ALLOW_SW=1`
+    lets softpipe pass) in negronigl.c; `scripts/gpu/stage-backboardd-gl.py` (port of stage-spes-eagl.py:
+    20H392 backboardd has 7808 bytes of load commands and zero padding up to `__text` at 8336, so the 48-byte
+    command fits); `scripts/gpu/gl-build.sh` (stage + check-imports), `scripts/gpu/phone-gl.sh`
+    (push/backboardd/restore/on/off/restart/test/status/log, single files).
+  - [V] Build `gl-build` exit 0: stripped negronigl.dylib 14,214,272 bytes, ngl_test 50,336, staged backboardd
+    1,159,536 (sha256 39cb14d1...), check-imports PASS (0 missing, 264 imports). Not run on the phone.
+  - [I] Risks: the re-signed backboardd under our AMFI (a main executable, not a bundle); the synchronous
+    preflight in backboardd's constructor; `glFinish` on every flush until the kernel waits on per-surface
+    fences (patches/xnu/README-gpu-kernel.md section 13 lists the spes kernel deltas we lack).
 
 ## 16. Wi-Fi facts (Wi-Fi agent, 2026-10-25; OnePlus kernel source e9da592 in out/src/op-kernel)
 

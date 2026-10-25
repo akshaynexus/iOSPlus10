@@ -297,7 +297,10 @@ frame that is one such framebuffer alone, full canvas, is not copied: the displa
 pointed at it (crop 22,12, the centred 1080x2412 part) and it is on screen from the next 120 Hz frame.
 A GPU-rendered one is flipped at the first vsync tick after its fence is done. The shown framebuffer
 and the pending one are held in use; `SwapWait` (IOMobileFramebuffer selector 6, called by
-CoreAnimation) waits at most 50 ms until the swap it names is on screen. For the GL/Metal drivers
+CoreAnimation) returns 0 only when the swap it names (or a later one) is on screen, else
+kIOReturnBusy at once, in every mode (patch 0254; before: a wait of up to 50 ms, zero-copy only).
+With 0254 no frame is copied or flipped before its fence is done (README-gpu-kernel.md section 12,
+"0254"). For the GL/Metal drivers
 this means: import the framebuffer (0x7e or scalar 12), render, submit, then let CoreAnimation swap;
 nothing else. Do not CPU-write a framebuffer after the GPU rendered into it (section 6).
 

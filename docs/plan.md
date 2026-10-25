@@ -37,6 +37,14 @@ Status date: 2026-10-25.
   the current phone (`scripts/metal/phone-heartbeat.sh on` + reboot), then owner-approved `boot_a` tests with the
   new kernel: (a) `negronifb_zerocopy=1`, (b) + `negronigpu_level=12`, (c) 0253 A/B with `negronifb_carefresh=0`
   (patches/xnu/README-gpu-kernel.md section 12).
+- 0254 (2026-10-25): fixed-deadline 120 Hz vsync, no GPU fence wait on the vsync tick (pending frame waits for
+  its fence; give-up only on a client close + 500 ms or 2 s without GPU progress), SwapWait busy until the swap is
+  on screen (all modes); STAT line + `gpu-wait skips N gave-up N`. Kernel `out/kernel/local-20261025-173319` (sha256 ee9ac20f...),
+  image `out/ios16-present`. Not booted.
+- GL path for backboardd (ios-spes route, 2026-10-25): `scripts/gpu/gl-build.sh` stages negronigl.dylib + a backboardd with
+  a weak load command + the gate `/var/db/negronigl/clients`; `scripts/gpu/phone-gl.sh` pushes and switches it
+  (docs/gpu-userland.md "GL path"). Built, check-imports PASS, not run on the phone. Kernel deltas from spes:
+  patches/xnu/README-gpu-kernel.md section 13.
 
 ## First boot (2026-10-24, 19:48)
 

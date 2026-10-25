@@ -295,13 +295,13 @@ negronifb_hz=120 negronifb_clockshift=100 negroniadreno=22 negroniadreno_keep=1 
 the config: build a boot image variant with `BOOTARGS_ADD` (scripts/ios16/build.sh).
 
 (a) current args + `negronifb_zerocopy=1`:
-    `IOS16_OUT=out/ios16-zc BOOTARGS_ADD="negronifb_zerocopy=1" scripts/bg.sh ios16-zc scripts/ios16/build.sh`
+    `scripts/bg.sh ios16-zc env IOS16_OUT=out/ios16-zc BOOTARGS_ADD="negronifb_zerocopy=1" scripts/ios16/build.sh`
     Proof (section 9 and 11): `NEGRONI SURF: 3 display slots`, `flip N: slot ... taken after ... us`
     (< 8400 us), `NEGRONI FB: N frames shown zero-copy` every 1000 flips. In the STAT line: `zc` near
     the swaps/s, `cpu` near 0 while the UI is idle or scrolling, `late ticks 0`, swapwait `timeouts 0`
     and waited max < 8.4 ms. `zero-copy off (...)` means the layout check failed: report the line.
 (b) (a) + `negronigpu_level=12`:
-    `IOS16_OUT=out/ios16-zc12 BOOTARGS_ADD="negronifb_zerocopy=1 negronigpu_level=12" scripts/bg.sh ios16-zc12 scripts/ios16/build.sh`
+    `scripts/bg.sh ios16-zc12 env IOS16_OUT=out/ios16-zc12 BOOTARGS_ADD="negronifb_zerocopy=1 negronigpu_level=12" scripts/ios16/build.sh`
     Proof: `NEGRONI ADRENO: GX level 12 (818 MHz), bw level 11` and `17 HFI GX_BW_PERF_VOTE ack,
     error 0`, ladder 22/22 as before. With the GPU (GL/Metal) path on: `gpu`/`zc` rates in the STAT
     line go up toward 120 and copy avg goes down against (a). A GMU error or no ack: boot (a) again.
@@ -327,3 +327,148 @@ Goal: `presents/s` 120 (or equal to `swaps/s` when iOS sends fewer) with `late t
 values[4..5] = the same tick count (low, high half) instead of 0. `negronifb_carefresh=0`: no property,
 interval 0 (the old behaviour). [I] displayMinRefreshInterval units are unclear (scale 2^-32); CA reads
 the step first, so the value 1 matters only if the step is rejected.
+
+### 0254 (fixed-deadline vsync, no GPU wait on the tick, SwapWait without wait)
+
+File name `0254-negroni-fb-present-thread.patch` (the present thread itself is not in it, see the end).
+Touches NegroniFramebuffer.cpp, and NegroniGPU.cpp/.h for two read-only questions
+(`NegroniGPUFenceCompleted()`, `NegroniGPUClientCloses()`; the GPU's fence bookkeeping is not changed).
+
+Measured before 0254 (phone, 2026-10-25, kernel local-20261025-170531 with 0252) [V]:
+- CPU-only boot (no GPU client): `present()` 2.5-3.7 ms avg, 6 ms max per frame; swaps/s up to 81,
+  presents/s 37, late ticks 11-13 per second.
+- After a Metal client (backboardd) crashed with GPU work pending (`RedwoodGPU: the GPU is not done
+  with a buffer ...` for 15+ s), every `present()` took 51 ms (= `NEGRONI_FB_GPU_WAIT_MS` 50 ms + copy),
+  sometimes 650-1073 ms; the UI fell to ~1 fps. Cause: `present()` runs in the vsync timer handler
+  (`vsyncFired`) and called `NegroniGPUFenceWait(written | fence, 50 ms)` for surfaces with `gpuFence` set;
+  the vsync thread blocked, and the timer was re-armed only at the end of the handler.
+- `SwapWait` (selector 6) returned at once in the copy modes: CA ran free (81 swaps/s for 37 presents).
+- Plugin telemetry (backboardd on Metal, GPU at the 220 MHz vote): commit-to-callback 89 ms .. 14 s per
+  command buffer; 13 buffers committed within 200 ms completed one every ~60 ms; RBBM busy all the time.
+  So the fences do complete: the GPU is slow, not dead.
+
+CoreAnimation facts [V: disassembly, QuartzCore 20H392, unslid]:
+- `CA::WindowServer::IOMFBDisplay::can_update_` (0x1882be944) and `swap_wait_timeout` (0x18853c088):
+  SwapWait = selector 6, scalars {swap_id, flags, 0}. Return 0 releases the surface on CA's side (CA
+  refcount); any non-zero return keeps it held, and CA retries with usleep(100) for up to 1 ms, or skips
+  the frame and tries again at the next heartbeat. It never hangs.
+- CA keeps 3 surfaces (1 shown + up to 2 pending, ids in order). CA does not read the IOSurface kernel
+  in-use state in the display path: only SwapWait gates it.
+- Vsync notification: value 1 = host timestamp (mach ticks), value 2 = interval in mach ticks (0253).
+  TimingElements/SyncRate are read only for external displays (not added).
+
+What 0254 does:
+1. Fixed-deadline vsync: start() arms `wakeAtTime(now + 8333 us)`; each tick re-arms at the previous
+   deadline + 8333 us (`rearm()`), so the period does not depend on the handler's work. A deadline that has
+   already passed is skipped to the next future one; each skipped deadline counts as a late tick. A tick
+   that starts more than half a period (4167 us) after its deadline also counts (`late ticks` is no longer
+   "1.5 periods after the tick before").
+2. No GPU wait on the tick: swap() keeps the newest `gpuFence` of the frame's surfaces (`fPendFence`).
+   The tick shows the frame only when that fence is done (`NegroniGPUFenceDone`, only asks); if not, the
+   record stays pending (`fDirty` set, nothing copied or flipped) and the tick counts a `gpu-wait skip`.
+   A GPU copy (0231) is now queued only after the render is done, so the waits left on the tick are for the
+   frame's own 2D copy (clock shift, badges, a CPU layer over it, the switch back from zero-copy), at most
+   `NEGRONI_FB_GPU_COPY_WAIT_MS` (8 ms). The fade at display off keeps its 50 ms wait.
+   Exception [I, rare]: a surface rendered again after its swap (fence newer than the one checked) still
+   gets the old 50 ms wait in present(), because the CPU must not copy it before its fence.
+3. Latest wins, without starvation: a newer SwapEnd replaces the pending record, but the first record that
+   waits for its fence is kept as the "older" one (`fOld`, copy frames only, not zero-copy). The tick shows
+   the newest record whose fence passed: the pending one (the older one is then dropped), else the older
+   one (the pending one stays). So a GPU slower than CA (60 ms per frame) still puts frames on screen; the
+   lag is the GPU's backlog, not more. Dropped records count as presented once a later id is shown.
+4. Give-up (stale fences): the GPU declared stopped (`gGPUStopped`) already answers every fence as done.
+   Else a fence is given up only (a) when the oldest fence the tick waits for has been pending for more
+   than `NEGRONI_FB_GPU_GIVEUP_MS` (500 ms) since the tick first saw it AND a RedwoodGPU client closed since
+   then (`RedwoodGPU: ... closes`), or (b) when the GPU wrote no fence for `NEGRONI_FB_GPU_STUCK_MS`
+   (2000 ms, the same as RedwoodGPU's own stop rule) while the tick waited. A slow but alive GPU is waited
+   for. A given-up fence covers itself and every older fence (one ring, in order) until the GPU passes it.
+   The frame is then copied by the CPU (no GPU copy behind a dead ring), and the log says once per
+   surface id: `NEGRONI FB: gave up on fence N of surface M`. Held surfaces whose GPU copy has a given-up
+   fence go back to CA too.
+5. SwapWait (all modes, not only zero-copy): one non-blocking check, no delay loop. Returns 0 when id is 0,
+   the display is off, id > the last SwapEnd id, or `fPresentedID >= id` (that record or a later one was
+   copied into the panel memory, or flipped and taken by the engine). Else `kIOReturnBusy` (0xe00002d5) at
+   once. The copy path now also moves the id forward when the pipes go back to the panel memory (it waits
+   for the engine to take that flush, as zero-copy ids do). The STAT field `timeouts` now counts the busy
+   answers, and `waited us` is the time in the call.
+6. STAT line: `... timeouts N gpu-wait skips N gave-up N` (the two new fields at the end; the rest
+   unchanged). gave-up = frames shown with a given-up fence.
+
+Expected on the phone [I, not booted]: CPU-only boot: `late ticks` near 0 (a slow copy no longer moves
+the next deadline), `swaps/s` near `presents/s` (SwapWait now gates CA). Metal client: `gpu-wait skips`
+high when the GPU is slow, `present()` copy avg back to the CPU-copy time, no 51 ms presents. A crashed
+client: `gave up on fence ...` lines about 0.5 s after the crash only if the GPU stops making progress or
+a client closed; never on a slow GPU without a close.
+
+Build (2026-10-25): kernel `out/kernel/local-20261025-173319` (sha256 ee9ac20f..., 0254 applied, 0262 the known
+skip), boot image variant `out/ios16-present` (boot_a.img sha256 af5d91e4..., the config's cmdline, no extra args).
+[V] `scripts/bg.sh` does not pass variables set before it into tmux: `IOS16_OUT=x scripts/bg.sh NAME build.sh`
+writes into out/ios16. Use `scripts/bg.sh NAME env IOS16_OUT=x BOOTARGS_ADD=... scripts/ios16/build.sh` (the recipe
+above is fixed).
+
+Present thread (item 4 of the brief): not done. What it needs: a `thread_call` (or IOWorkLoop of its own)
+woken by the tick, which runs present(), keepBusy() and the switch back from zero-copy. Hazards: fBusy,
+fLastGPUFence, the 0254 wait state and all zeroCopy* state are "work loop only" today; with a second
+thread, the tick's releaseBusy/zeroCopyRetire/flip/fade would race with it, so all of them must move to
+that thread or get a lock of their own (not fLock: swap() and SwapWait take fLock and must not wait behind
+a 3 ms copy). With 0254 the tick no longer waits for a render, so the copy (2.5-3.7 ms measured) is the
+only long work left on the tick, and fixed deadlines keep the period. Do it only if `late ticks` stays
+high after 0254.
+
+## 13. ios-spes deltas (kernel work the GL path needs; plan only, nothing built here)
+
+Reference: `external/ios-spes` (SM6225, A610, same 20H392 root). Its UI runs on GL at a frame median of
+10.8 ms (all12) after these kernel changes. We have the equivalents of some of them (0231 GPU present,
+0234 zero-copy flip, 0235 clock vote); the rest is listed for the kernel agent, with the spes file:line.
+
+1. **Swap backpressure + per-surface fence before present** (spes 0102 `0102-spes-gpu-queued-submissions.patch`:
+   SweetFramebuffer.cpp hunks at `swap()` and `present()`, SweetSurface.h `drawn` field + `SweetSurfaceDrawn()`).
+   `swap()` holds the client while the last frame is not shown yet (1 s limit, then the frame is replaced);
+   `present()` checks every layer's `drawn` fence (500 ms), keeps the swap pending when the GPU is not done
+   and gives up after 10 misses. The surface gets `drawn` = the fence of the last submission that names it
+   (RedwoodGPU.cpp submit path). Ours: 0231 holds presented surfaces until `gpuFence` (keepBusy) but
+   `present()` does not wait for the client's own render fence; the user-space shim does `glFinish` on every
+   flush instead (eagl.c ngl_h_Flush). Delta: record the submit fence per imported surface (import 0x7e), wait
+   on it in `present()` (NegroniFramebuffer.cpp, the 0254 file: coordinate with that agent), and set the
+   property `RedwoodWaitsForGPU = true` on AppleCLCD (spes 0102 line "setProperty(\"RedwoodWaitsForGPU\"") so
+   the shim can drop the `glFinish` (HackiOS eagl.c `display_waits()`; our eagl.c must read it).
+2. **Queued submissions: the caller waits for ring space, not for the GPU** (spes 0102, RedwoodGPU.cpp part;
+   README "0100/0102"). Submit returns after the ring write; completion is a fence the CPU reads. Our scalar
+   ABI already returns a fence sequence (docs/gpu-abi.md); check that `submit` does not wait for idle, and
+   that `wait` has a bounded timeout and logs `newest/completed/rptr/tail` like spes's
+   "GPU not done with surface %u after 500 ms: fence %u, newest %u, completed %u, rptr %u, tail %u".
+3. **Presenter thread with frame backpressure** (spes 0105 `0105-spes-retained-frame-presenter.patch`:
+   `presenterMain`/`presenter()`, `fPendingSurfaces[]` retained through presentation, `kernel_thread_start` in
+   `start()`). Frames are copied/flipped on their own thread, not on the vsync timer; the pending swap's
+   surfaces stay retained until shown. Ours copies in the work-loop vsync handler (0252 "late ticks" shows
+   the cost). Delta: move `present()` to a thread; keep the STAT counters.
+4. **Direct MDP scanout, spes form** (spes 0109 `0109-spes-mdp-direct-scanout.patch`: `SWEET_MDP_VIG0`,
+   `SWEET_MDP_CTL0`, `SRC0_ADDR` +0x14, `YSTRIDE0` +0x24, `CTL_FLUSH` +0x18 = 0x20001 (VIG0 + CTL); gate
+   "VIG0 was found scanning our boot framebuffer"; `sweetfb_direct=0`; 0116 `0116-spes-scanout-pool.patch`:
+   fixed pool 12 x 16 MB slots, slot 11 = black frame; 0124: a frame that copied nothing leaves the pipe;
+   0112: display off = flip to the black slot). Ours (0234) is the same idea on SM8450 (VIG0 +0x5000 from
+   MDSS 0x0ae00000, CTL0 +0x16000, 3 slots after the panel memory, `negronifb_zerocopy=1`, untested). Deltas
+   to take from spes: (a) the pool with a black slot for display off and panic, (b) "a copied frame that
+   copied nothing leaves the pipe where it is" (0124), (c) only `SRC0_ADDR` + `YSTRIDE0` + `CTL_FLUSH` are
+   written, no `SRC_XY` change (we add (22,12): keep ours, the clock shift needs it), (d) the 100 ms
+   "flush not taken" self-disable we already have; spes has none.
+5. **GPU clock** (spes 0097 `spes_gpu_power_probe` read-only inventory of GPUCC 0x05990000; 0107: GFX RCG
+   `cfg = 0x503` = GPLL0 source 5, divider /2, nominal 300 MHz, GCC vote bit 15 at 0x79004, boot-arg
+   `spesgpu_mhz=19|300`; 0120/0127 cpufreq max/step). A610 has no GMU; ours votes through the GMU/HFI (0235
+   `negronigpu_level=N`, 220..818 MHz). No delta: test 0235 at level 12 first (section 12 (b)). spes's lesson
+   that applies: log the selected clock as a config value "not a frequency measurement".
+6. **GPU VA size** (spes NOTES all11: `RedwoodGPU: no addresses left` -> `glFlush: error 0x505`; fixed by 512
+   MiB VA with 2048 slots). Check our per-client VA window (0233) is >= 512 MiB and that a full window logs a
+   clear line, not a silent GL_OUT_OF_MEMORY.
+7. **IOSurface release semantics** (spes 0108: trap 4 detaches, trap 5 releases; 0118: zombies drop their
+   surface; app icons appeared after 0108). Ours: 0230 import by ID; check that a client's exit releases
+   imported GEMs and that detach does not free a surface another process still shows (the "surface leak,
+   0xe00002bd x1872" freeze in spes all4).
+8. **Not GL, summary only** (no port planned here): 0113 `0113-spes-wifi-en0-apple80211.patch` (2326 lines):
+   en0 + Apple80211 for wifid from Topaz 0900 / HackiOS darwin-redwood (`bsd/dev/redwood_apple80211.c`,
+   `redwood_net.c`, `redwood_sta.c`, `spes_sta.c` glue onto the `spes_wlan_*` radio API), AKS key wrap in
+   SweetKeyStore.cpp for keychain items, per-phone MAC from boot-arg `wlan_mac`. Our Wi-Fi work (notes
+   section 16, QCA6490 over MHI) would reuse the Apple80211/en0 half once a radio API exists. 0114
+   `0114-spes-vibrator-probe.patch` (97 lines): `spesvib=1` raises the vibrator enable GPIO (TLMM 36) for
+   300 ms from `bsd/dev/spes_vib.c` to learn whether the PMIC LPG PWM is needed; a first-look probe, not a
+   driver.

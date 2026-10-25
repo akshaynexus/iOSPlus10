@@ -6,9 +6,17 @@
  * without a drawable. CoreAnimation draws into FBOs only, whose color buffers are IOSurfaces
  * (surface.c); nothing here needs a window system.
  *
- * Load hook: in backboardd (or with NEGRONIGL_EAGL=1) the EAGL shim (eagl.c) is installed.
- * NEGRONIGL_TEST=1 also runs ngl_selftest() + ngl_surface_selftest() on a thread at load, with
- * retries while RedwoodGPU is not there yet; results go to the log (log.c).
+ * Load hook (ngl_load): the EAGL shim (eagl.c) is installed in a process only when
+ *   1. the gate says so: /var/db/negronigl/off absent, and the process name is listed in
+ *      /var/db/negronigl/clients ("*" = all, "-NAME" = never NAME; no file = nobody), or
+ *      NEGRONIGL_EAGL=1 in the environment (NEGRONIGL_EAGL=0 = never), and
+ *   2. the preflight passes (ngl_preflight, the port of ios-spes xnu/graphics/spes_gl_preflight.c):
+ *      RedwoodGPU is there within NEGRONIGL_WAIT s (default 30), the screen is freedreno (renderer
+ *      has "FD730"; softpipe only with NEGRONIGL_ALLOW_SW=1), ngl_selftest() and
+ *      ngl_surface_selftest() PASS. NEGRONIGL_PREFLIGHT=0 skips step 2.
+ *   A failed step leaves Apple's EAGL methods untouched, so backboardd runs as before.
+ * NEGRONIGL_TEST=1 also runs the self tests on a thread at load, with retries while RedwoodGPU is
+ * not there yet; results go to the log (log.c).
  *
  * Environment (defaults set here, a value in the environment wins):
  *   FD_MESA_DEBUG=sysmem      no GMEM tiling: GMEM resolves write whole tile rows, past the end
@@ -410,14 +418,114 @@ selftest_thread(void *arg)
 	return NULL;
 }
 
+/* ---- the gate: /var/db/negronigl/{clients,off} (same form as the Metal path's /var/db/negronimetal) ---- */
+
+#define NGL_GATE_DIR "/var/db/negronigl"
+
+/* name listed in /var/db/negronigl/clients: 1 yes, 0 no / no file, -1 listed as "-name" */
+static int
+gate_clients(const char *prog)
+{
+	FILE *f = fopen(NGL_GATE_DIR "/clients", "r");
+	if (f == NULL) {
+		return 0;
+	}
+	int r = 0;
+	char line[512];
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char *save = NULL;
+		for (char *w = strtok_r(line, " \t\r\n", &save); w != NULL; w = strtok_r(NULL, " \t\r\n", &save)) {
+			if (w[0] == '#') {
+				break;
+			}
+			if (w[0] == '-' && strcmp(w + 1, prog) == 0) {
+				r = -1;
+				break;
+			}
+			if (strcmp(w, "*") == 0 || strcmp(w, prog) == 0) {
+				r = 1;
+			}
+		}
+		if (r < 0) {
+			break;
+		}
+	}
+	fclose(f);
+	return r;
+}
+
+static bool
+gate_open(const char *prog)
+{
+	const char *e = getenv("NEGRONIGL_EAGL");
+	if (e != NULL && e[0] != 0) {
+		return ngl_env_on("NEGRONIGL_EAGL", false);
+	}
+	if (access(NGL_GATE_DIR "/off", F_OK) == 0) {
+		ngl_log("negronigl: %s off: EAGL shim not installed in %s", NGL_GATE_DIR "/off", prog);
+		return false;
+	}
+	int c = gate_clients(prog);
+	if (c != 1) {
+		ngl_log("negronigl: %s is not in %s/clients (%s): EAGL shim not installed", prog, NGL_GATE_DIR,
+		    c < 0 ? "listed as -" : "no entry or no file");
+	}
+	return c == 1;
+}
+
+/*
+ * Preflight (ios-spes spes_gl_preflight.c, adapted): a real GPU render must pass before any
+ * Apple method is replaced. Synchronous, in the constructor, as there: backboardd's own EAGL
+ * contexts are made later, after the constructors. No persistent pass flag.
+ */
+static bool
+ngl_preflight(void)
+{
+	if (!ngl_env_on("NEGRONIGL_PREFLIGHT", true)) {
+		ngl_log("negronigl: preflight skipped (NEGRONIGL_PREFLIGHT=0)");
+		return true;
+	}
+	long wait_s = 30;
+	const char *w = getenv("NEGRONIGL_WAIT");
+	if (w != NULL && w[0] != 0) {
+		wait_s = strtol(w, NULL, 10);
+	}
+	uint64_t t0 = mach_absolute_time();
+	bool up = false;
+	for (long i = 0; i <= wait_s * 10 && !(up = ngl_init()); i++) {
+		usleep(100000);                 /* RedwoodGPU starts during boot */
+	}
+	if (!up) {
+		ngl_log("negronigl: preflight FAIL: no GL screen after %ld s: Apple's EAGL kept", wait_s);
+		return false;
+	}
+	if (ngl_soft() && !ngl_env_on("NEGRONIGL_ALLOW_SW", false)) {
+		ngl_log("negronigl: preflight FAIL: screen is softpipe, not the GPU (NEGRONIGL_ALLOW_SW=1 allows it): "
+		    "Apple's EAGL kept");
+		return false;
+	}
+	struct pipe_screen *scr = ngl_screen();
+	const char *renderer = scr ? scr->get_name(scr) : "";
+	if (!ngl_soft() && strstr(renderer, "FD730") == NULL) {
+		ngl_log("negronigl: preflight FAIL: renderer '%s' is not FD730: Apple's EAGL kept", renderer);
+		return false;
+	}
+	bool tri = ngl_selftest();
+	bool surf = tri && ngl_surface_selftest();
+	ngl_log("negronigl: preflight %s renderer=%s triangle=%s iosurface=%s after %.0f ms", tri && surf ? "PASS" : "FAIL",
+	    renderer, tri ? "PASS" : "FAIL", surf ? "PASS" : "FAIL", ms_since(t0));
+	return tri && surf;
+}
+
 #ifndef NGL_PLUGIN       /* NegroniGL.bundle: libGFXShared loads it; plugin/gli.c is the entry */
 __attribute__((constructor)) static void
 ngl_load(void)
 {
 	const char *prog = getprogname();
-	bool eagl = ngl_env_on("NEGRONIGL_EAGL", prog != NULL && strcmp(prog, "backboardd") == 0);
-	ngl_log("negronigl: loaded into %s (pid %d), EAGL shim %s", prog ? prog : "?", getpid(), eagl ? "on" : "off");
-	if (eagl) {
+	prog = prog ? prog : "?";
+	bool eagl = gate_open(prog);
+	ngl_log("negronigl: loaded into %s (pid %d), EAGL shim %s", prog, getpid(), eagl ? "wanted" : "off");
+	if (eagl && ngl_preflight()) {
 		ngl_eagl_install();
 	}
 	if (ngl_env_on("NEGRONIGL_TEST", false)) {
