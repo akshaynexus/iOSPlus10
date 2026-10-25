@@ -103,7 +103,12 @@ fi
 # a missing one fails the build. IOS_DSC = the cache of an attached root; the exports already read are cached in
 # out/metal/spi/exports, so the root needs to be attached only for images not read before. NO_IMPORT_CHECK=1 skips it.
 if [ "${NO_IMPORT_CHECK:-0}" != 1 ]; then
-  IOS_DSC=${IOS_DSC:-/private/tmp/iosroot-ro/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64}
+  # The 20H392 cache: a copy in out/dsc/cache (kept after the raw root image was deleted, 2026-10-26), else an
+  # attached root at /private/tmp/iosroot-ro.
+  if [ -z "${IOS_DSC:-}" ]; then
+    IOS_DSC=$OUT/dsc/cache/dyld_shared_cache_arm64
+    [ -f "$IOS_DSC" ] || IOS_DSC=/private/tmp/iosroot-ro/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64
+  fi
   bins=$(cd "$STAGE" && find . -type f -perm -u+x ! -name '*.sh' | sort)
   (cd "$STAGE" && python3 "$REPO/scripts/metal/check-imports.py" "$IOS_DSC" $bins) ||
     { echo "check-imports: FAILED (missing imports or no cache: attach the root or set IOS_DSC)" >&2; exit 1; }

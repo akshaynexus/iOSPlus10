@@ -291,6 +291,12 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 
 ## 9. Where things are (outside git)
 
+- The 20H392 dyld shared cache (for scripts/metal/check-imports.py and `ipsw dyld` symbolication):
+  `out/dsc/cache/dyld_shared_cache_arm64*` (3.5 GB copy, 2026-10-26). `~/op10-apple` holds only
+  `ios16-root.simg` (the flashed root, fallback); the raw `ios16-root.img` and the `20H392/` IPSW extraction
+  were deleted for disk space; `simg2img ios16-root.simg ios16-root.img` rebuilds the raw image when a root
+  update is needed (then mount read-only for /private/tmp/iosroot-ro).
+
 - `~/op10-backup/`: stock OTA `NE2211_16.0.3.530_EX01_full.zip`, `images/`, `partitions/` (121 partitions + GPT),
   `magisk/`, `device/` (dumps, `live.dtb`), `getvar-all.txt`, `RESTORE.md`.
 - `~/op10-apple/`: `20H392/` DMGs, `d22ap.adt`, `ios16-root.img`, `ios16-root.simg`.
@@ -639,6 +645,11 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - [I] Phone test: boot-args + `negronibatt=2`; check the arbiter/BCL lines (MONITOR_EN, VBAT_CONV_REQ), `raw bcl` vbat 3300-4450 mV, ibat sign on battery/charger, the RTC line still there, the status bar percent; if MONITOR_EN is 0, try `negronibatt=5` (VADC). Details: README-battery.md section 4.
 - [I] Without the ADSP nobody configures the PM8350B charger; whether it charges at all is unknown: the `ibat` sign (BCL) or `ichg` (VADC modes) in the 0271 log shows it.
 - [I] Exact SoC needs the ADSP charger PD (GLINK PMIC_RTR_ADSP_APPS, after the audio ADSP work); README-battery.md section 6 lists the messages.
+- [V] 2026-10-26 phone (kernel 182812, mode 1): the BCL works: `NEGRONI BATTERY: 73% 4085mV -78mA ... source=PM8350B BCL` (22:47-01:31). With the USB cable in all night the pack went 73 % -> 16 % (01:31, -458..-1894 mA); at 68-73 % with `external=1` the net current was only +0..78 mA. The phone then died (02:05, no USB) and was in fastboot at 03:13 (another agent) [logs/usblog.log].
+- [I] So the PM8350B charger takes little or no USB input under our kernel: nobody configures it (the ADSP charger PD is off), XBL/ABL leave an SDP limit (DT `qcom,input_current_usb_ma` 500) or USBIN suspended, and the system draws more than that (CPU top rows + GPU 818 MHz, no idle). `usbin=0mV` in mode 1 means "not measured", not "no VBUS".
+- [V] Slop 0074 (USB VBUS override) sets only the DWC3 PHY's UTMI_OTG_VBUS_VALID/SW_SESSVLD_SEL bits (negroni_usb.c QSCRATCH); it cannot affect the PMIC charger.
+- [V] 2026-10-26 patch 0272 (`patches/xnu/0272-negroni-battery-charger-input.patch`, README-battery.md section 7): SID 3 0x10-0x16 (SMB5 CHGR..MISC) readable; `negroni_spmi_chg_unlock()` opens 0x1042/0x1340/0x1342/0x1365/0x1366/0x1370; `NegroniBattery` logs the charger registers (`charger <state>, USBIN plugged|unplugged[, USBIN SUSPENDED]: st1 .. icl_cfg .. icl_sts .. power_path ..`) and, with `negronichg_ma` (default 500, 0 = read only), writes the input limit, USBIN_MODE_CHG, ICL override, un-suspend and charging enable in the downstream order, at most 5 polls per plug. `ExternalConnected` = USBIN_INT_RT_STS bit 4. Boot-args `negronichg_step` (50|25), `negronichg_force`.
+- [I] The SMB5 register layout and the 50 mA/LSB step on PM8350B are inferred from PM8150B (`smb5-reg.h`) and bergamota's SMB2 notes; no public PM8350B HLOS charger driver exists. The first `charger` line on the phone validates it (values must decode; `icl_sts` half of the request = 25 mA step).
 
 ## 15. GL driver loading on iOS 16 (GL agent, 2026-10-25) [V: 20H392 shared cache, unslid addresses]
 
