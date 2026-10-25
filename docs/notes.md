@@ -731,6 +731,29 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
     preflight in backboardd's constructor; `glFinish` on every flush until the kernel waits on per-surface
     fences (patches/xnu/README-gpu-kernel.md section 13 lists the spes kernel deltas we lack).
 
+- 2026-10-25 23:35 (GL path agent, first phone run of ngl_test):
+  - [V] Crash before the fix: `ngl_test` SIGSEGV, pc 0x0, lr 0x103dd3950, frames 0x103bcabe8 0x103bcad6c.
+    The dylib base was 0x103bb4000 (only base that puts 0x103bcad6c in `ngl_selftest` with 16 KiB
+    alignment); `atos -o out/gpu/negronigl.dylib -l 0x103bb4000` gives lr = `st_api_create_context+620`,
+    then `ngl_create+156`, `ngl_selftest+48`. The instruction is `blr x8` with x8 = `[fscreen+0x18]` =
+    `pipe_frontend_screen.get_param`: Mesa 25.0.7 `st_manager.c:1042` calls
+    `fscreen->get_param(fscreen, ST_MANAGER_BROKEN_INVALIDATE)` with no NULL check, and `ngl_init`
+    allocated the frontend screen with calloc and set only `screen`, `get_egl_image`, `validate_egl_image`.
+    The other unconditional fscreen hooks in st: `get_egl_image`, `validate_egl_image` (set),
+    `set_background_context` (glthread only, off).
+  - [V] Fix: `negronigl.c` `ngl_get_param()` returns 0 (no window drawables: CA draws into FBOs on
+    IOSurface images, glViewport has nothing to invalidate); `ngl_init` sets `f->get_param`. Also
+    `ngl_log_image_base()` (dladdr, once per process) from `ngl_load` and from `gldInitializeLibrary`
+    (plugin/gld.c): `negronigl: image base 0x100fcc000 /usr/lib/negronigl.dylib (atos -o out/gpu/negronigl.dylib -l BASE ADDR)`.
+  - [V] `gl-build` exit 0 (stripped dylib 14,214,448 bytes, sha256 a697d285...), `phone-gl.sh push` OK, then
+    `NEGRONIGL_LOG=stderr /usr/local/bin/ngl_test`: GL_RENDERER FD730, ES 3.2, `selftest ... context 99.3 ms
+    draw+readback 12.88 ms: PASS`, second frame 1.44 ms, `surface selftest ... BGRA(32,32) 0000ffff
+    BGRA(224,224) ff0000ff: PASS`, `selftest PASS, surface selftest PASS`, rc=0. First GPU-rendered GL
+    pixels read back on this phone through the dylib (the pid was 352 < 375 of the crash run: the phone
+    had rebooted in between, possibly with the GPU clock fix kernel [I]).
+  - Next (not done): `phone-gl.sh backboardd`, `on`, `restart` (owner decision; AMFI on the re-signed
+    backboardd is the open risk).
+
 ## 16. Wi-Fi facts (Wi-Fi agent, 2026-10-25; OnePlus kernel source e9da592 in out/src/op-kernel)
 
 - [V] SoC version register: BAR0 + 0x224 (family [31:28], device [27:16], major [15:8], minor [7:0])

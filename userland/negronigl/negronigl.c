@@ -23,6 +23,7 @@
  *                             of IOSurfaces that are not padded for it (ios-sailfish boot 0154a)
  *   IR3_SHADER_DEBUG=nofp16   CA's mediump/lowp texture coordinates need fp32 (ios-sailfish)
  */
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -142,6 +143,38 @@ freedreno_screen(void)
 	return screen;
 }
 
+/* st_api_create_context calls fscreen->get_param unconditionally (st_manager.c, Mesa 25.0.7):
+ * without it the first context jumps to address 0. ST_MANAGER_BROKEN_INVALIDATE = 0: we have no
+ * window drawables (CA draws into FBOs on IOSurface images), so glViewport has nothing to
+ * invalidate. */
+static int
+ngl_get_param(struct pipe_frontend_screen *fs, enum st_manager_param param)
+{
+	(void)fs;
+	(void)param;
+	return 0;
+}
+
+/* Once per process: the load address of this image, so a crash pc/lr can be symbolicated
+ * against the unstripped build (out/gpu/negronigl.dylib, out/gpu/NegroniGL.bundle/NegroniGL). */
+void
+ngl_log_image_base(void)
+{
+	static bool done;
+	if (done) {
+		return;
+	}
+	done = true;
+	Dl_info info = { 0 };
+	if (dladdr((void *)ngl_log_image_base, &info) == 0) {
+		ngl_log("negronigl: image base unknown (dladdr failed)");
+		return;
+	}
+	ngl_log("negronigl: image base %p %s (atos -o out/gpu/%s -l BASE ADDR)", info.dli_fbase,
+	    info.dli_fname ? info.dli_fname : "?",
+	    info.dli_fname && strstr(info.dli_fname, "NegroniGL.bundle") ? "NegroniGL.bundle/NegroniGL" : "negronigl.dylib");
+}
+
 bool
 ngl_init(void)
 {
@@ -163,6 +196,7 @@ ngl_init(void)
 				screen->destroy(screen);
 			} else {
 				f->screen = screen;
+				f->get_param = ngl_get_param;  /* called by every st_api_create_context */
 				ngl_image_hooks(f);     /* before any context: st reads them at creation */
 				fscreen = f;
 				ngl_log("negronigl: %s, screen %s (%s)%s", ngl_version(), screen->get_name(screen),
@@ -525,6 +559,7 @@ ngl_load(void)
 	prog = prog ? prog : "?";
 	bool eagl = gate_open(prog);
 	ngl_log("negronigl: loaded into %s (pid %d), EAGL shim %s", prog, getpid(), eagl ? "wanted" : "off");
+	ngl_log_image_base();
 	if (eagl && ngl_preflight()) {
 		ngl_eagl_install();
 	}

@@ -51,5 +51,6 @@ int ngl_gld_unexpected(int index, const char *name);
  * eagl_init is still inside gliInitializeLibrary (before eagl_init binds the _gli_plugin table).
  */
 void ngl_gli_register(void);
+void ngl_log_image_base(void);  /* negronigl.c: logs the load address once */
 
 #endif

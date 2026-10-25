@@ -74,6 +74,7 @@ gldInitializeLibrary(const uint32_t *services, void *io_data, uint32_t mask, voi
 		const char *prog = getprogname();
 		ngl_log("negronigl: NegroniGL.bundle loaded into %s (pid %d): service %#x mask %#x flags %#x",
 		    prog ? prog : "?", getpid(), services ? services[0] : 0, mask, flags);
+		ngl_log_image_base();
 	}
 	/* eagl_init is inside GLEngine's gliInitializeLibrary now: hand OpenGLES our GLI table. Every
 	 * load (also after gliTerminateLibrary let libGFXShared unload us); it is idempotent. */

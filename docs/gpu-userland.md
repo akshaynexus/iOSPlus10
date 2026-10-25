@@ -170,6 +170,8 @@ scripts/gpu/phone-gl.sh restore       # Apple's backboardd back
 
 Proof lines (backboardd, `/dev/console` + os_log `dev.iosplus10.negronigl`):
 - `negronigl: loaded into backboardd (pid N), EAGL shim wanted`
+- `negronigl: image base 0x... /usr/lib/negronigl.dylib (atos -o out/gpu/negronigl.dylib -l BASE ADDR)`
+  (symbolicate a crash pc/lr against the unstripped build with this base)
 - `negronigl: negronigl (Mesa 25.0.7, freedreno A730 / softpipe), screen FD730 (freedreno)`
 - `negronigl: selftest ... : PASS`, `negronigl: surface selftest ... : PASS`
 - `negronigl: preflight PASS renderer=FD730 triangle=PASS iosurface=PASS after N ms`
@@ -179,7 +181,21 @@ Proof lines (backboardd, `/dev/console` + os_log `dev.iosplus10.negronigl`):
 - Failure: `preflight FAIL`, `GL error 0x... after slot N`, `shader N compile failed`, a black or frozen
   screen (then `off` + `restart`; `restore` if backboardd does not come up at all).
 
-Unverified [I]: nothing of this ran on the phone. Open points: ad hoc re-signed backboardd under our
+Seen on the phone [V] 2026-10-25 23:35, `NEGRONIGL_LOG=stderr /usr/local/bin/ngl_test` (shim off, gate
+empty), after the `get_param` fix (notes.md 15a; before it the first context jumped to address 0):
+```
+negronigl: loaded into ngl_test (pid 352), EAGL shim off
+negronigl: image base 0x100fcc000 /usr/lib/negronigl.dylib (atos -o out/gpu/negronigl.dylib -l BASE ADDR)
+negronigl: RedwoodGPU open, scalar ABI, chip 0x7030001, GMEM 2048 KiB, max 818 MHz, kernel ABI "scalar 10-16, msm 0x09 0x40-0x4c 0x7e, userptr 0x49, va shared"
+negronigl: negronigl (Mesa 25.0.7, freedreno A730 / softpipe), screen FD730 (freedreno)
+negronigl: GL_VERSION OpenGL ES 3.2 Mesa 25.0.7 / GL_RENDERER FD730 / GLSL OpenGL ES GLSL ES 3.20
+negronigl: selftest fbo 0x8cd5 linked 1 err 0 px(32,32) ff0000ff px(224,224) 0000ffff context 99.3 ms draw+readback 12.88 ms: PASS
+negronigl: second frame clear+draw+finish 1.44 ms
+negronigl: surface selftest bound 1 fbo 0x8cd5 BGRA(32,32) 0000ffff BGRA(224,224) ff0000ff: PASS
+selftest PASS, surface selftest PASS
+```
+
+Unverified [I]: the backboardd steps (staged backboardd, gate, preflight in backboardd) did not run yet. Open points: ad hoc re-signed backboardd under our
 AMFI (slop 0025/0035/0036 + 0221 accept ad hoc platform binaries for the Metal bundle, but a main
 executable with entitlements was not tried); the 30 s synchronous preflight delays backboardd's start by
 the GPU's readiness; CA's `renderbufferStorage:fromDrawable:` returns NO on Mesa contexts (not used by

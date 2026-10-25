@@ -56,6 +56,7 @@ struct pipe_screen *ngl_screen(void);
 NGL_API bool ngl_soft(void);            /* the screen is softpipe (CPU), not freedreno */
 struct sw_winsys *ngl_sw_winsys_create(void);   /* sw_winsys.c: memory + IOSurface display targets */
 void ngl_image_hooks(struct pipe_frontend_screen *fscreen);
+void ngl_log_image_base(void);
 void ngl_eagl_install(void);
 bool ngl_env_on(const char *name, bool dflt);
 
