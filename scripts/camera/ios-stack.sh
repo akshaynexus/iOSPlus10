@@ -1,7 +1,10 @@
 #!/bin/sh
 # Offline look at the iOS 16 camera stack in a read-only mounted root (nothing is written there).
 #   scripts/bg.sh camera-ios scripts/camera/ios-stack.sh [IOSROOT]
-# IOSROOT defaults to /tmp/iosroot-ro. Mount it read-only first (docs/camera-plan.md).
+# IOSROOT defaults to /tmp/iosroot-ro. The root image ($IMG, default $APPLE/ios16-root.img, raw HFS+) must be
+# mounted read-only there:
+#   macOS: done by this script when nothing is mounted at IOSROOT (diskutil, read-only)
+#   Linux: sudo mkdir -p /tmp/iosroot-ro && sudo mount -t hfsplus -o loop,ro ~/op10-apple/ios16-root.img /tmp/iosroot-ro
 # ADT (optional): $APPLE/d22ap.adt, APPLE defaults to ~/op10-apple.
 # Output: out/camera/ios-stack.txt. Needs ipsw (macOS: brew install blacktop/tap/ipsw; Linux: the
 # release binary from https://github.com/blacktop/ipsw/releases) and python3.
@@ -14,7 +17,12 @@ R=${1:-/tmp/iosroot-ro}
 APPLE=${APPLE:-$HOME/op10-apple}
 DSC=$R/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64
 O=$OUT/camera/ios-stack.txt
-[ -f "$R/System/Library/CoreServices/SystemVersion.plist" ] || { echo "no iOS root at $R" >&2; exit 1; }
+IMG=${IMG:-$APPLE/ios16-root.img}
+if [ ! -f "$R/System/Library/CoreServices/SystemVersion.plist" ] && [ "$(uname -s)" = Darwin ] && [ -f "$IMG" ]; then
+	dev=$(diskutil image attach --readOnly --noMount "$IMG" | awk '/^\/dev/{print $1; exit}')
+	mkdir -p "$R" && diskutil mount readOnly -mountPoint "$R" "$dev" >/dev/null
+fi
+[ -f "$R/System/Library/CoreServices/SystemVersion.plist" ] || { echo "no iOS root at $R (see the header of $0)" >&2; exit 1; }
 command -v ipsw >/dev/null 2>&1 || { echo "ipsw missing (see the header of $0)" >&2; exit 1; }
 mkdir -p "$OUT/camera"
 {

@@ -57,9 +57,11 @@ bash build.sh 2>&1 | tee "$W/build.log"
 D=$OUT/kernel/local-$(date -u +%Y%m%d-%H%M%S)
 mkdir -p "$D"
 find fakeroot/System/Library/Kernels -maxdepth 1 -type f -name "kernel.*" -exec cp {} "$D/" \;
-grep -E "Applying patch|Skipping patch" "$W/build.log" | sed 's|.*/patches/||' > "$D/patch-report.txt" || true
+grep -E "Applying patch|Skipping patch" "$W/build.log" | sed -E 's#.*(Applying|Skipping) patch:? .*/patches/#\1 #' > "$D/patch-report.txt" || true
 (cd "$D" && shasum -a 256 kernel.* > SHA256SUMS)
 ln -sfn "$(basename "$D")/kernel.$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]').negroni" "$OUT/kernel/kernel.macho"
-echo "skipped patches:"; grep Skipping "$D/patch-report.txt" || echo "  none"
+# dxb skips a patch that does not apply (git apply --check): ours (02xx+) must all apply
+echo "skipped patches:"; grep "^Skipping" "$D/patch-report.txt" || echo "  none"
+if grep -qE "^Skipping 0[2-9][0-9][0-9]-" "$D/patch-report.txt"; then echo "ERROR: a patches/xnu patch did not apply (above)" >&2; fi
 "$REPO/scripts/lib/notify.sh" "local kernel build done: $D"
 ls -l "$D" "$OUT/kernel/kernel.macho"

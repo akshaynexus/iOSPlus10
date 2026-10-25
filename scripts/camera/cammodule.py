@@ -14,7 +14,8 @@ external/hackios-xnu-kernel/tools/camsensor.py; V3.5.1 symbols are 0x3c bytes, n
   resolutionData: 304-byte elements; u32 [21] lane count, [24] settle count, [25] C-PHY flag,
     double at byte 68 = frame rate; streamConfiguration [5]/[6] width/height, [2] data type
   powerSetting: {type, value, delay ms} u32 triples; types are the kernel's
-    msm_camera_power_seq_type (cam_sensor_cmn_header.h)
+    msm_camera_power_seq_type (camera-kernel cam_sensor_utils/cam_sensor_cmn_header.h in
+    OnePlusOSS android_kernel_modules_and_devicetree_oneplus_sm8450, out/src/op-modules)
   actuator/EEPROM/OIS slave address: u16 at byte 28 / 20 / 20 of their driver blocks
 The word positions were found by matching the known chip IDs of all four NE2211 modules; treat
 them as inferred, not as a documented format. Read-only on its inputs. Run with python3 -I.
@@ -23,7 +24,8 @@ import struct
 import sys
 
 PWR = {0: "MCLK", 1: "VANA", 2: "VDIG", 3: "VIO", 4: "VAF", 5: "VAF_PWDM", 6: "CUSTOM_REG1",
-       7: "CUSTOM_REG2", 8: "RESET", 9: "STANDBY", 10: "CUSTOM_GPIO1", 11: "CUSTOM_GPIO2"}
+       7: "CUSTOM_REG2", 8: "RESET", 9: "STANDBY", 10: "CUSTOM_GPIO1", 11: "CUSTOM_GPIO2",
+       12: "VANA1"}  # enum msm_camera_power_seq_type, OnePlus sm8450 camera-kernel (see docstring)
 
 
 def load(path):

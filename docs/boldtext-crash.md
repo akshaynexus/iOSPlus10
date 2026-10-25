@@ -1,47 +1,91 @@
-# Bold Text crash investigation
+# Bold Text crash loop
 
-Status: research from the 2026-10-24 port state. The owner report is real; the crash cause is not established because no log covers the hang.
+Status (2026-10-25): **root cause found** [V]. Bold Text on makes SpringBoard crash every ~7 s,
+because CoreImage uses its OpenGL ES backend and there is no GL driver. The root we build keeps
+Bold Text off. A CoreImage fallback is in work (`userland/cifix/`, separate agent); the real fix is
+the GPU driver. Marks: **[V]** seen (source given), **[I]** inference. Full disassembly notes:
+[notes.md](notes.md), section "CoreImage/PosterBoard crash".
 
-## Findings
+## Evidence
 
-### What the setting changes
+Capture: `logs/usblog-20261024-235438.txt` (`make usblog`, owner turned Bold Text on). Symbols:
+`scripts/debug/symbolicate.sh logs/usblog-20261024-235438.txt` (ipsw + the root's shared cache,
+attached read-only). Re-run 2026-10-25 by the review: same result [V].
 
-- [V] The root's `AccessibilitySettings.bundle/AccessibilitySettings` strings include `boldTextEnabled:`, `setBoldTextEnabled:specifier:`, and `legibilityWeight` (offline binary strings observed from `/private/tmp/blwork/root` while it was mounted).
-- [V] The user preference is `com.apple.Accessibility` / `EnhancedTextLegibilityEnabled`; a public iOS 16 reproduction writes that key, and the Accessibility Settings bundle has a dedicated Bold Text getter/setter. Apple Device Management calls its corresponding setting `BoldTextEnabled` in its accessibility settings command. Sources: [Apple Accessibility Settings command](https://developer.apple.com/documentation/devicemanagement/settingscommand/command-data.dictionary/settings-data.dictionary/accessibilitysettings-data.dictionary), [iOS reproduction](https://github.com/expo/expo/issues/48058).
-- [V] UIKit exposes `UIAccessibilityBoldTextStatusDidChangeNotification` as an `NSNotification` and `UIAccessibility.isBoldTextEnabled`; SwiftUI exposes `LegibilityWeight.bold`. Sources: [UIKit notification](https://developer.apple.com/documentation/uikit/uiaccessibility/boldtextstatusdidchangenotification), [UIKit property](https://developer.apple.com/documentation/uikit/uiaccessibility/isboldtextenabled), [SwiftUI LegibilityWeight](https://developer.apple.com/documentation/swiftui/legibilityweight/bold).
-- [V] Apple says Bold Text increases glyph stroke weight; system fonts and standard UIKit controls adapt, and apps with custom text rendering may need to adapt. Source: [WWDC18 accessibility session](https://developer-mdn.apple.com/videos/play/wwdc2018/230/).
-- [I] UIKit posts the documented notification to observers in each running app process. Settings, SpringBoard, and other UIKit clients can observe the shared preference; this is a system-wide rendering trait, not an operation confined to Settings.
-- [I] The public API notification is not a Darwin notification. No exact Darwin notification name or direct CoreText/fontd cache-rebuild notification was proven from the available strings. Do not treat `UIAccessibilityBoldTextStatusDidChangeNotification` as a Darwin notification.
-- [I] Older iOS versions explicitly restarted the UI after changing Bold Text. Current iOS 16 behavior on this modified root was not captured. A SpringBoard restart/respring is plausible, but full device reboot and font-cache rebuild are unverified here.
+- SpringBoard: 106 crashes in the log, sig 11, pc 0 (a NULL call), slide 0x1f750000 [V].
+- Backtrace (unslid) [V]:
+  `CI::GLContext::init() + 204` (lr 0x194b3858c) <- `CI::GLContext::GLContext(...)` <-
+  `+[CIContext(Internal) internalContextWithEAGLContext:options:]` <- `-[CIContext initWithOptions:]` <-
+  `+[CIContext contextWithOptions:]` <- `+[CUIShapeEffectStack sharedCIContext]` (dispatch_once) <-
+  `-[CUICatalog imageByStylingImage:stylePresetName:styleConfiguration:foregroundColor:scale:]` <-
+  `-[UIImage _imageWithStylePresets:tintColor:traitCollection:]`.
+- Cause in CoreImage: `-[EAGLContext getMacroContextPrivate]` returns NULL, `_wrapGetMacroContext`
+  leaves the GL dispatch table zero, and `CI::GLContext::init` calls table+0xe8 (glDisable) [V, notes.md].
+- iOS 16 CoreImage has only the Metal and GL backends; there is no CPU renderer.
+  `kCIContextUseSoftwareRenderer` (which CoreUI passes) does not avoid GL [V, notes.md].
+- Same lr 0x194b3858c as slop's 2026-10-22 SpringBoard loop without Bold Text (slop `NOTES.md:569`) [V].
+  So any UIKit path that reaches CoreUI's shared CIContext can crash, in any app [V, notes.md].
+- Why Bold Text triggers it [I]: with Bold Text on, UIKit asks CoreUI for styled glyph/image
+  variants (`_imageWithStylePresets:`) during SpringBoard launch. With it off, the earlier log
+  `logs/usblog-20261024-195455.txt` has no SpringBoard crash [V].
 
-### Ranked failure modes for this port
+PosterBoard crashes too in the same log (20 times, sig 5): the assertion in
+`-[PBFPosterExtensionDataStore _stateLock_setupSwitcherConfigurationForFirstTime] + 2040`, reached
+from `-[PRSServer prewarmWithCompletion:]` [V]. That is a separate fault (poster extensions are not
+discovered; see notes.md and slop `NOTES.md:800`). It does not depend on Bold Text [I].
 
-1. **[I, most likely] SpringBoard/UIKit relaunch or initialization/rendering path triggered by the changed global text trait.** The owner reports a hang after the toggle and repeated crashes after restart. This is consistent with a setting that changes system-wide text metrics/weights and the subsequent launch of UIKit clients, but there is no triggering kernel log or crash report, so this is correlation-based, not a diagnosis. CPU-only rendering and the existing slow UI make a long relaunch more likely. `FBLaunchWatchdogScale=20` is already in the root tweak; the base root also sets `BKNoWatchdogs`. `wdt=-1` is in the kernel arguments. These reduce some watchdog risks but do not prove all userspace watchdogs are disabled.
-2. **[I, plausible but weaker] CoreText/CoreUI font selection/layout issue exposed during that relaunch.** The observed root font inventory contained `CoreUI/SFUI.ttf`, Helvetica Neue families, and the system Core/ CoreUI fonts. `root-tweaks-extra.py` changes launch jobs/preferences and does not remove fonts. The root build's font-stripping rules were not inspected while the mount was available, and file presence does not prove that every required named weight/face is valid. No font exception is in the available log.
-3. **[I, low] CPU software-rendering cost or interaction with IOSurface/IOMobileFramebuffer stand-ins.** Those stand-ins and the lack of a GPU can make the relaunch slow or stress rendering, but Bold Text normally changes glyph weight; no evidence links this switch to the framebuffer path or identifies a stand-in crash.
-4. **[I, very low] AKS/keychain storm.** The prior log shows `NEGRONI AKS` failures during ordinary operation. Bold Text has no established keychain dependency, so the normal AKS noise is not evidence for this crash.
-5. **[I, low] Missing Bold font asset.** The seen inventory includes SFUI and many families; no font-removal action appears in `root-tweaks-extra.py` or `sweet-root-tweaks.py`. A missing/corrupt particular face remains possible but is not evidenced.
+## The preference
 
-The only kernel log, `logs/usblog-20261024-195455.txt`, ends at 21:43:59 before the hang. Its ordinary `CRASH <proc>`, `NEGRONI FB:`, and `NEGRONI AKS:` lines cannot identify this incident. The screen's ReportCrash text is kernel console output from the debug image, not a saved crash report by itself.
+- Key: `EnhancedTextLegibilityEnabled` in domain `com.apple.Accessibility`, for the mobile user:
+  `/private/var/mobile/Library/Preferences/com.apple.Accessibility.plist` [V: the only
+  "EnhancedTextLegibilityEnabled" string in the 20H392 cache is in `libAccessibility.dylib`
+  (`ipsw dyld str`), next to the string `com.apple.Accessibility`].
+- `_AXSEnhanceTextLegibilityEnabledGlobal` 0x191998934 reads `kAXSEnhanceTextLegibilityPreference`
+  with `_AXSGetPreferenceValue` and returns "value == 1". `_AXSSetEnhanceTextLegibilityEnabled`
+  0x191998990 calls `_AXSSetEnhanceTextLegibilityEnabledApp(value, NULL)` (global) [V: `ipsw dyld
+  disass --vaddr`]. There is also a per-app variant (`..._App`) [V symbols].
+- Change notifications in libAccessibility: `com.apple.accessibility.text.legibility.status`,
+  `com.apple.accessibility.cache.enhance.text.legibility` [V strings; that they are Darwin notify
+  names is I].
+- The switch exists in two Settings panes: `AccessibilitySettings.bundle` (`setBoldTextEnabled:specifier:`)
+  and `DisplayAndBrightnessSettings` (in the shared cache) [V strings].
 
-## Root default safeguard
+## Root default: `scripts/ios16/root-tweaks-boldtext.py`
 
-`scripts/ios16/root-tweaks-boldtext.py ROOT` writes `false` to `private/var/mobile/Library/Preferences/com.apple.Accessibility.plist:EnhancedTextLegibilityEnabled`, preserving other keys and setting mobile ownership/mode. The existing `scripts/ios16/root-finish.sh` now calls this after the existing root tweaks and before image conversion. This restores the known safe startup state and should break persistence of the reported boot loop on the next root image. It **does not disable or hide the Settings switch** and cannot make a future user toggle safe. No verified managed restriction key that locks this switch was found, and removing only this programmatic specifier from the signed Settings bundle is not a safe offline tweak. Keep Bold Text off until the next capture identifies a fix.
+`scripts/ios16/root-finish.sh` runs it on every root build (macOS `root-macos.sh` and Linux
+`root-linux.sh` both call `root-finish.sh`, as root). It sets `EnhancedTextLegibilityEnabled = false`
+in the binary plist above, keeps other keys, owner 501:501, mode 0600.
 
-## Recovery procedure (write-only plan; not run)
+Review test 2026-10-25 [V]: on a copy of the built root's `Preferences` folder (from
+`~/op10-apple/ios16-root.img`, read-only): two runs give the same file (same sha256); a plist with
+`EnhancedTextLegibilityEnabled = true` and another key comes out `false` with the other key kept;
+the output is `bplist00`, mode 0600, chown(501, 501) is called. The result is byte-identical to the
+file in the current built root (sha256 `71639153...`).
 
-1. Do not reflash or erase `userdata`. Enter the bootloader and use `fastboot boot` with a recovery image that has an HFS+ driver and `plistlib` or an equivalent plist editor. Booting a temporary image does not write a partition. Standard Android recovery images often lack HFS+ support; confirm the chosen recovery can mount HFS+ read-write before use.
-2. In recovery ADB shell, identify the existing `userdata` block device from `/dev/block/by-name/userdata` (or recovery's actual by-name path). Mount it read-write as HFS+ at a temporary mountpoint; do not format, fsck-repair, or repartition it. If the recovery cannot mount HFS+, stop and use a recovery ramdisk with HFS+ support; do not guess a device path or run ext4 tools.
-3. Back up the small preference file to recovery RAM, then edit only `private/var/mobile/Library/Preferences/com.apple.Accessibility.plist`, setting `EnhancedTextLegibilityEnabled` to boolean false and preserving all other keys. Keep owner `501:501`, mode `0600`; flush writes and unmount cleanly.
-4. Reboot normally. If the exact pref path differs in the mounted image, stop and inspect the filesystem rather than creating a second guessed preference. If user data must remain intact, do not flash `userdata` as a recovery shortcut.
+It does not lock the switch. Turning Bold Text on still crashes SpringBoard until CoreImage works.
 
-A separate offline-host option is to copy the whole `userdata` image out through recovery, edit the HFS+ image on a host with HFS+ read/write support, and restore it only after a verified backup and explicit owner approval. This is slower and risks an accidental partition write; prefer a temporary recovery mount.
+## Recovery when Bold Text was turned on
 
-## Next-attempt capture plan
+1. SSH still works during the SpringBoard loop (dropbear and the USB network do not need
+   SpringBoard) [I: SpringBoard is not in their launch path; not tested in the loop]. Make the file
+   on the host and copy it:
+   ```
+   mkdir -p /tmp/bt/private/var/mobile/Library/Preferences
+   sudo python3 scripts/ios16/root-tweaks-boldtext.py /tmp/bt        # macOS or Linux (chown needs root)
+   scripts/net/ssh-phone.sh push /tmp/bt/private/var/mobile/Library/Preferences/com.apple.Accessibility.plist /var/mobile/Library/Preferences/
+   scripts/net/ssh-phone.sh 'chown 501:501 /var/mobile/Library/Preferences/com.apple.Accessibility.plist; chmod 600 /var/mobile/Library/Preferences/com.apple.Accessibility.plist; sync'
+   scripts/net/ssh-phone.sh reboot
+   ```
+   This replaces the whole file (it may hold other accessibility settings). The reboot restarts
+   cfprefsd, which caches preferences; the phone has no `killall` (toybox has only `kill`) [V:
+   `out/ssh/ios/toybox.applets`, no `usr/bin/killall` in the root]. Not tested [I].
+2. If SSH does not answer: re-flash `userdata` with a fresh root (Bold Text off), with the owner's
+   approval: [flash-ios16.md](flash-ios16.md). This erases the iOS user data.
 
-1. Start the kernel capture before the attempt: `make usblog`. Keep the tmux session running; record the generated `logs/usblog-*.txt` filename and host times. The current root's log is kernel-only and stops when USB networking stops.
-2. From a root with SSH enabled and USB networking up, start `scripts/net/phone-log.sh` for unified logging. It streams `oslogstream` output to `logs/phone-log-<date>.txt`; use `scripts/bg.sh phonelog scripts/net/phone-log.sh` for a durable session. Also run `scripts/net/phone-log.sh tail` or `scripts/net/phone-log.sh pull` to preserve any reports under `/private/var/mobile/Library/Logs/CrashReporter`. The current root tweak removes the `com.apple.ReportCrash` launch job, so a missing report is possible; the kernel capture remains necessary.
-3. Record the exact toggle time, whether the screen showed a restart prompt, whether the USB interface dropped, whether the kernel rebooted, and the first return to UI. Do not repeatedly toggle during the first capture.
-4. Search the USB log for `CRASH`, `NEGRONI FB:`, `NEGRONI AKS:`, `watchdog`, `SpringBoard`, `backboardd`, `fontd`, `fontservicesd`, `CoreText`, `CoreUI`, `IOSurface`, `IOMobileFramebuffer`, `panic`, and the timestamp window around the toggle/reboot. Example: `rg -ni 'CRASH|watchdog|SpringBoard|backboardd|fontd|fontservicesd|CoreText|CoreUI|IOSurface|IOMobileFramebuffer|panic|NEGRONI (FB|AKS)' logs/usblog-*.txt`.
-5. Search unified logs and each pulled crash report for the same process names plus `EnhancedTextLegibilityEnabled`, `BoldText`, `legibilityWeight`, `SIGABRT`, `SIGSEGV`, `EXC_BAD_ACCESS`, `jetsam`, and `watchdog`. Preserve the first crash per process and its full termination reason/backtrace. Compare with a baseline capture with Bold Text left off.
-6. Only after there is a crash signature, test one hypothesis at a time (font inventory/face validity, watchdog, or framebuffer). Keep the root's preference false between attempts.
+## Next steps
+
+- CoreImage fallback (agent, `userland/cifix/`): hook points are listed in notes.md
+  (`internalContextWithEAGLContext:options:`, the CoreUI flatten path). Note: launchd drops
+  `DYLD_*` for `com.apple.*` jobs [V, notes.md], so injection needs another route.
+- The GPU driver (EAGL on Mesa, `docs/gpu-userland.md`) removes the cause.
+- Test after either fix: turn Bold Text on with `make usblog` running; expect no `CRASH SpringBoard` lines.

@@ -90,10 +90,15 @@ struct ngl_state {
 struct ngl_gli {
 	void *rctx;                     /* = this; CA reads {rctx, disp[]} */
 	void *disp[NGL_SLOTS];
-	void *eagl;                     /* the EAGLContext (id) */
+	void *eagl;                     /* the EAGLContext (id); NULL in the GLI-plugin path */
 	unsigned api;
 	struct ngl_ctx *ctx;
 	struct ngl_state *st;
+	/* GLI-plugin fields (plugin/gli_context.c, gli_view.c); unused by the dylib EAGL shim */
+	void *shared;                   /* gld shared-state pointer = the EAGLSharegroup, NULL if none */
+	void *view;                     /* the drawable bound by gliBindViewES, NULL if none */
+	IOSurfaceRef view_surface;      /* its IOSurface, retained; released on unbind/destroy */
+	unsigned view_colorformat;
 };
 
 extern __thread struct ngl_gli *ngl_cur;

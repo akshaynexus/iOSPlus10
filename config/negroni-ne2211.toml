@@ -52,6 +52,9 @@ kernel_args = [
   "negronifb_noconsole=1",
   "negronifb_clockshift=100",
   "negroniwifi=4",
+  "negroniadreno=22",
+  "negroniadreno_keep=1",
+  "negronigpu_pool=512",
 ]
 
 [bootimg]

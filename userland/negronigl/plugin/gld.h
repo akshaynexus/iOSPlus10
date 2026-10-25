@@ -46,4 +46,10 @@ extern struct ngl_pixel_format ngl_pf;
 
 int ngl_gld_unexpected(int index, const char *name);
 
+/*
+ * plugin/gli_table.c: hand OpenGLES our 18 GLI entry points. gldInitializeLibrary calls this while
+ * eagl_init is still inside gliInitializeLibrary (before eagl_init binds the _gli_plugin table).
+ */
+void ngl_gli_register(void);
+
 #endif

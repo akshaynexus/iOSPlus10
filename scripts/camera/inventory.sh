@@ -34,6 +34,7 @@ $PY "$REPO/scripts/camera/camdt.py" table "$C/live.dtb" > "$C/dt-table.txt"
 
 # 2. Stock DTBO table: split, decompile, extract the CCI fragments (the camera nodes).
 rm -rf "$C/dtbo"
+mkdir -p "$C/dtbo"
 $PY "$REPO/scripts/camera/camdt.py" split "$BACKUP/images/dtbo.img" "$C/dtbo" > "$C/dtbo/index.txt"
 for f in "$C"/dtbo/*.dtbo; do
 	b=${f%.dtbo}

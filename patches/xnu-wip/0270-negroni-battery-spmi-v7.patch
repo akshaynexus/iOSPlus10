@@ -1,0 +1,352 @@
+diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
+index e009d88..9637369 100644
+--- a/bsd/dev/negroni_spmi.c
++++ b/bsd/dev/negroni_spmi.c
+@@ -1,9 +1,33 @@
+ /*
+- * Battery-only adaptation of input/negroni_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+- * Init is serialized by the single built-in NegroniBattery personality.
+- * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450): PMIC access for the battery service
++ * (iokit/Kernel/arm/NegroniBattery.cpp), SPMI PMIC arbiter version 7.
++ *
++ * Layout (Linux drivers/spmi/spmi-pmic-arb.c v7; live DT qcom,spmi@c42d000,
++ * qcom,ee = <0>, bus 0 = PMK8350 SID 0 ... PM8350B SID 3 ...):
++ *   core   0x0c400000  version at +0, bus 0 APID count at +4 bits 10:0,
++ *                      APID map at +0x2000 + 4*apid (bits 19:8 = PPID)
++ *   cnfg   0x0c42d000  owner table, 4*apid, bits 2:0 = EE that may write
++ *   obsrvr 0x0c440000  observer (read) channel at 0x8000*ee + 0x20*apid
++ *   chnls  0x0c500000  read/write channel of an APID at 0x1000*apid
++ * Channel registers: CMD +0x00, STATUS +0x08 (bit 0 done, bits 3:1 errors),
++ * WDATA0 +0x10, RDATA0 +0x18. Command: opcode << 27 | reg << 4 | (bytes-1);
++ * EXT_WRITEL = 0, EXT_READL = 1. Same access as negroni_keys.c (keys) and
++ * negroni_reboot.c (patch 0210); each user has its own APIDs, so the
++ * channels do not collide.
++ *
++ * The base tree's version of this file used the sweet (SM6150, arbiter v5)
++ * addresses (core 0x0c440000 = the v7 observer here, observer 0x0e600000)
++ * and refused every arbiter >= 0x70000000, so it never worked on SM8450.
++ *
++ * What may be touched (everything else returns -1):
++ *   read   SID 0 peripheral 0x31 (PMK8350 VADC, ADC7 user channel), any reg
++ *          SID 1/3 offsets 0x04/0x05 (peripheral TYPE/SUBTYPE, census only)
++ *   write  SID 0 0x3140-0x3145, 0x3147: ADC7 APP_SID, DIG_PARAM, FAST_AVG,
++ *          CH_SEL, DELAY, CONV_REQ (Linux adc7_configure), only when the
++ *          owner table gives that APID to EE 0. No charger register, no
++ *          interrupt, no enable bit is ever written.
++ * Callers: thread context, serialized by the NegroniBattery work loop (a lock
++ * is held anyway).
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -14,43 +38,118 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-#define SP_CORE_PA 0x0c440000u
+-#define SP_OBS_PA  0x0e600000u
+-#define SP_CFG_PA  0x0c40a000u
+-#define SP_NO_APID 0xffffu
++#define SP_CORE_PA        0x0c400000u
++#define SP_CORE_SIZE      0x3000u
++#define SP_CNFG_PA        0x0c42d000u
++#define SP_CNFG_SIZE      0x1000u
++#define SP_OBS_PA         0x0c440000u
++#define SP_CHNLS_PA       0x0c500000u
++#define SP_EE             0u
+ 
+-static vm_offset_t sp_core, sp_obs, sp_cfg;
++#define SP_V7_MIN         0x70000000u
++#define SP_V8_MIN         0x80000000u
++#define SP_FEATURES       0x04u
++#define SP_APID_MAP       0x2000u
++#define SP_MAX_APIDS      512u            /* PMIC_ARB_MAX_PERIPHS_V7 */
++#define SP_OBS_EE_STRIDE  0x8000u
++#define SP_OBS_STRIDE     0x20u
++#define SP_CHNL_STRIDE    0x1000u
++
++#define SP_CMD            0x00u
++#define SP_STATUS         0x08u
++#define SP_WDATA0         0x10u
++#define SP_RDATA0         0x18u
++#define SP_OP_WRITEL      0u
++#define SP_OP_READL       1u
++#define SP_DONE           (1u << 0)
++#define SP_ERRORS         0x0eu
++#define SP_NO_APID        0xffffu
++
++#define SP_VADC_PPID      0x031u          /* SID 0, PMK8350 VADC 0x3100 */
++
++static vm_offset_t sp_core, sp_cnfg, sp_obs, sp_vadc_chn;
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
++static uint16_t sp_vadc_apid = SP_NO_APID;
++static bool sp_vadc_writable;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+-static bool sp_poisoned[512];
++static bool sp_poisoned[SP_MAX_APIDS];
++/* PPID -> APID cache (a lookup scans the whole map) */
++static struct { uint16_t ppid, apid; } sp_cache[16];
++static unsigned sp_cached;
+ 
+ static uint32_t
+ sp_rd(vm_offset_t base, unsigned off)
+ {
+ 	uint32_t value = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
++	__asm__ volatile ("dmb oshld" ::: "memory");
+ 	return value;
+ }
+ 
++static void
++sp_wr(vm_offset_t base, unsigned off, uint32_t value)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* As Linux picks it: the first mapping, replaced by one this EE owns. */
+ static uint16_t
+-sp_find_apid(unsigned ppid)
++sp_find_apid(unsigned ppid, unsigned *owner)
+ {
+ 	uint16_t found = SP_NO_APID;
++	unsigned found_owner = 7;
+ 	for (unsigned i = 0; i < sp_count; ++i) {
+-		uint32_t map = sp_rd(sp_core, 0x900u + 4u * i);
++		uint32_t map = sp_rd(sp_core, SP_APID_MAP + 4u * i);
+ 		if (!map || ((map >> 8) & 0xfffu) != ppid) {
+ 			continue;
+ 		}
+-		unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * i) & 7u;
+-		if (found == SP_NO_APID || owner == 0) {
++		unsigned o = sp_rd(sp_cnfg, 4u * i) & 7u;
++		if (found == SP_NO_APID || o == SP_EE) {
+ 			found = (uint16_t)i;
++			found_owner = o;
+ 		}
+ 	}
++	if (owner) {
++		*owner = found_owner;
++	}
+ 	return found;
+ }
+ 
++static uint16_t
++sp_apid(unsigned ppid)
++{
++	for (unsigned i = 0; i < sp_cached; ++i) {
++		if (sp_cache[i].ppid == ppid) {
++			return sp_cache[i].apid;
++		}
++	}
++	uint16_t apid = sp_find_apid(ppid, NULL);
++	if (sp_cached < sizeof(sp_cache) / sizeof(sp_cache[0])) {
++		sp_cache[sp_cached].ppid = (uint16_t)ppid;
++		sp_cache[sp_cached].apid = apid;
++		sp_cached++;
++	}
++	return apid;
++}
++
++/* 0 done, -1 error/denied, -2 timeout (the lane is poisoned) */
++static int
++sp_wait(vm_offset_t ch, uint16_t apid)
++{
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t s = sp_rd(ch, SP_STATUS);
++		if (s & SP_DONE) {
++			return (s & SP_ERRORS) ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	return -2;
++}
++
+ int
+ negroni_spmi_init(void)
+ {
+@@ -59,68 +158,111 @@ negroni_spmi_init(void)
+ 	}
+ 	sp_attempted = true;
+ 	sp_lock = IOLockAlloc();
+-	if (!sp_lock) {
++	sp_core = ml_io_map(SP_CORE_PA, SP_CORE_SIZE);
++	sp_cnfg = ml_io_map(SP_CNFG_PA, SP_CNFG_SIZE);
++	if (!sp_lock || !sp_core || !sp_cnfg) {
++		printf("NEGRONI BATTERY: SPMI map failed\n");
+ 		return -1;
+ 	}
+-	sp_core = ml_io_map(SP_CORE_PA, 0x2000);
+-	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+-	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+-	if (!sp_core || !sp_cfg || !sp_obs) {
+-		printf("NEGRONI BATTERY: SPMI mapping failed\n");
++	uint32_t version = sp_rd(sp_core, 0);
++	sp_count = sp_rd(sp_core, SP_FEATURES) & 0x7ffu;
++	if (version < SP_V7_MIN || version >= SP_V8_MIN || !sp_count || sp_count > SP_MAX_APIDS) {
++		printf("NEGRONI BATTERY: unsupported SPMI arbiter %#x (%u APIDs)\n", version, sp_count);
+ 		return -1;
+ 	}
+-	uint32_t arb_version = sp_rd(sp_core, 0);
+-	sp_count = sp_rd(sp_core, 4) & 0x7ffu;
+-	if (arb_version < 0x50000000u || arb_version >= 0x70000000u ||
+-	    !sp_count || sp_count > 512) {
+-		printf("NEGRONI BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
+-		    arb_version, sp_count);
++	sp_obs = ml_io_map(SP_OBS_PA + SP_OBS_EE_STRIDE * SP_EE, SP_OBS_STRIDE * sp_count);
++	if (!sp_obs) {
++		printf("NEGRONI BATTERY: SPMI observer map failed\n");
+ 		return -1;
+ 	}
++	unsigned owner = 7;
++	sp_vadc_apid = sp_find_apid(SP_VADC_PPID, &owner);
++	if (sp_vadc_apid != SP_NO_APID && owner == SP_EE) {
++		sp_vadc_chn = ml_io_map(SP_CHNLS_PA + SP_CHNL_STRIDE * sp_vadc_apid, SP_CHNL_STRIDE);
++		sp_vadc_writable = sp_vadc_chn != 0;
++	}
+ 	sp_ready = true;
+-	printf("NEGRONI BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
+-	    arb_version, sp_count);
++	printf("NEGRONI BATTERY: SPMI arbiter %#x, %u APIDs, VADC 0x3100 APID %d owner EE %u (%s)\n",
++	    version, sp_count, sp_vadc_apid == SP_NO_APID ? -1 : (int)sp_vadc_apid, owner,
++	    sp_vadc_writable ? "conversions allowed" : "no conversions");
+ 	return 0;
+ }
+ 
++bool
++negroni_spmi_vadc_writable(void)
++{
++	return sp_ready && sp_vadc_writable;
++}
++
++static bool
++sp_read_allowed(unsigned sid, unsigned addr)
++{
++	unsigned peripheral = addr >> 8, reg = addr & 0xffu;
++	if (sid == 0 && peripheral == 0x31) {
++		return true;
++	}
++	return (sid == 1 || sid == 3) && (reg == 0x04 || reg == 0x05);
++}
++
+ int
+ negroni_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
+-	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	if (!sp_ready || !out || sid > 0xf || addr > 0xffffu || !sp_read_allowed(sid, addr)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+-	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
++	uint16_t apid = sp_apid((sid << 8) | (addr >> 8));
+ 	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+ 		IOLockUnlock(sp_lock);
+ 		return -1;
+ 	}
+-	unsigned off = 0x80u * apid;
+-	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+-		if (status & 1u) {
+-			if (status & 0x0eu) {
+-				IOLockUnlock(sp_lock);
+-				return -1;
+-			}
+-			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+-			IOLockUnlock(sp_lock);
+-			return 0;
+-		}
+-		delay(1);
++	vm_offset_t ch = sp_obs + SP_OBS_STRIDE * apid;
++	sp_wr(ch, SP_CMD, (SP_OP_READL << 27) | ((addr & 0xffu) << 4));
++	int rc = sp_wait(ch, apid);
++	if (rc == 0) {
++		*out = (uint8_t)sp_rd(ch, SP_RDATA0);
++	} else if (rc == -2) {
++		printf("NEGRONI BATTERY: SPMI read timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
+ 	}
+-	sp_poisoned[apid] = true;
+-	printf("NEGRONI BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+-	    sid, addr, apid);
+ 	IOLockUnlock(sp_lock);
+-	return -1;
++	return rc ? -1 : 0;
++}
++
++int
++negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	/* ADC7 user registers of the PMK8350 VADC only; 0x3146 (EN_CTL1) is not written */
++	if (!sp_ready || !sp_vadc_writable || sid != 0 || addr < 0x3140 || addr > 0x3147 || addr == 0x3146 ||
++	    sp_poisoned[sp_vadc_apid]) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	sp_wr(sp_vadc_chn, SP_WDATA0, value);
++	sp_wr(sp_vadc_chn, SP_CMD, (SP_OP_WRITEL << 27) | ((addr & 0xffu) << 4));
++	int rc = sp_wait(sp_vadc_chn, sp_vadc_apid);
++	if (rc == -2) {
++		printf("NEGRONI BATTERY: SPMI write timeout addr=%#x APID=%u disabled\n", addr, sp_vadc_apid);
++	}
++	IOLockUnlock(sp_lock);
++	return rc ? -1 : 0;
++}
++
++unsigned
++negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max)
++{
++	unsigned n = 0;
++	if (!sp_ready) {
++		return 0;
++	}
++	for (unsigned i = 0; i < sp_count && n < max; ++i) {
++		uint32_t map = sp_rd(sp_core, SP_APID_MAP + 4u * i);
++		if (!map) {
++			continue;
++		}
++		ppids[n] = (uint16_t)((map >> 8) & 0xfffu);
++		owners[n] = (uint8_t)(sp_rd(sp_cnfg, 4u * i) & 7u);
++		n++;
++	}
++	return n;
+ }
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_spmi.h b/bsd/dev/negroni_spmi.h
+index c73b642..bacb394 100644
+--- a/bsd/dev/negroni_spmi.h
++++ b/bsd/dev/negroni_spmi.h
+@@ -1,13 +1,19 @@
+-/* Shared C/C++ interface. Init once, on the NegroniBattery start thread. */
++/* Shared C/C++ interface (bsd/dev/negroni_spmi.c). Init once, on the NegroniBattery start thread. */
+ #ifndef NEGRONI_BATTERY_SPMI_H
+ #define NEGRONI_BATTERY_SPMI_H
+ #include <stdint.h>
++#include <stdbool.h>
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ int negroni_spmi_init(void);
+-/* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
++/* Thread context only; 0 success, -1 failure; *out unchanged on failure. Allowlisted registers only. */
+ int negroni_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* PMK8350 VADC ADC7 request registers (0x3140-0x3145, 0x3147) only, when EE 0 owns the APID. */
++int negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++bool negroni_spmi_vadc_writable(void);
++/* The arbiter's APID map (PPID = SID << 8 | peripheral) and owner EEs; returns the count. */
++unsigned negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max);
+ #ifdef __cplusplus
+ }
+ #endif
