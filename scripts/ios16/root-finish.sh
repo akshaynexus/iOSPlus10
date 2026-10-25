@@ -13,6 +13,9 @@
 #     out/ssh/ios is built, SSH=0 to leave it out)
 # 1e. audio HAL plug-in + VirtualAudio back: scripts/audio/root-add-audio.sh (AUDIO=1; default off)
 # 1f. OpenGL ES driver plugin NegroniGL.bundle: scripts/gpu/root-add-negronigl.sh (NEGRONIGL=1; default off)
+# 1g. Metal driver plugin NegroniMetal.bundle + probes: scripts/metal/root-add-metal.sh (METAL=1; default on
+#     when out/metal/stage is built, METAL=0 to leave it out). Only processes in
+#     /var/db/negronimetal/clients get a device (default: the probes; METAL_CLIENTS="... backboardd SpringBoard")
 # 3. remove host metadata folders (macOS creates .fseventsd/.Spotlight-V100 on mount)
 set -euo pipefail
 R=$1
@@ -27,6 +30,8 @@ if [ -z "${SSH:-}" ] && [ -x "$REPO/out/ssh/ios/dropbearmulti" ]; then SSH=1; fi
 SSH=${SSH:-0} sh "$REPO/scripts/net/root-add-ssh.sh" "$R"
 AUDIO=${AUDIO:-0} sh "$REPO/scripts/audio/root-add-audio.sh" "$R"   # docs/audio-plan.md stage 0
 NEGRONIGL=${NEGRONIGL:-0} sh "$REPO/scripts/gpu/root-add-negronigl.sh" "$R"   # GL driver plugin (docs/gpu-userland.md)
+if [ -z "${METAL:-}" ] && [ -d "$REPO/out/metal/stage/usr/local/bin" ]; then METAL=1; fi
+METAL=${METAL:-0} sh "$REPO/scripts/metal/root-add-metal.sh" "$R"   # Metal driver plugin (docs/metal-plan.md)
 
 n=0
 for app in "$R"/private/var/staged_system_apps/*.app; do

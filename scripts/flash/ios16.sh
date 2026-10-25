@@ -51,7 +51,7 @@ boot)        bootloader; need "$O/boot_a.img"; run fastboot flash boot_a "$O/boo
 userdata)
   need "$APPLE/ios16-root.simg"
   userspace || { echo "phone is not in fastbootd: run 'adb reboot fastboot' (or 'fastboot reboot fastboot')" >&2; exit 1; }
-  run fastboot flash userdata "$APPLE/ios16-root.simg" ;;   # fastboot splits to the device max-download-size (fastbootd: 256 MiB)
+  run fastboot -S 256M flash userdata "$APPLE/ios16-root.simg" ;;   # -S: fixed 256 MiB pieces (fastbootd limit); right after a reboot fastboot can read a wrong limit and send one 2.9 GB piece (usb_write e00002c0)
 active)      bootloader; run fastboot set_active a; run fastboot reboot ;;
 *) sed -n 2,19p "$0"; exit 1 ;;
 esac

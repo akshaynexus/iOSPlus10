@@ -68,10 +68,13 @@ then `negronifb_zerocopy=1`, then `negronigpu_pt=1`).
 
 ## Open items (2026-10-25)
 
-- Cache maintenance after GPU writes into an imported IOSurface: host-imported memory is cached and
-  non-coherent (gpu-abi section 6), but the Metal frontend never calls vkInvalidateMappedMemoryRanges, and the
-  NegroniMetal self-test reads the surface right after the GPU clear. [I] If the GPU is not IO-coherent, the
-  self-test can read stale data and keep Metal off (safe, but no Metal). Fix in the frontend (invalidate after
-  waitUntilCompleted for IOSurface-backed textures) or in the kernel import path.
+- Cache maintenance after GPU writes into an imported IOSurface: checked 2026-10-25, no change needed. The frontend's
+  `flushSurfaces` calls `sys_dcache_flush` for every IOSurface a command buffer uses, at commit and after completion
+  (before completed handlers and before `waitUntilCompleted` returns, so before the self-test's IOSurfaceLock read).
+  libSystem's `sys_dcache_flush` is only `dsb ish` on 20H392 arm64 [V: disassembly], but `NegroniMetal.mm` defines its
+  own (`dc civac` per 64-byte line, `dsb sy`) and the static link binds the frontend's and the bridge's calls to it
+  [V: `nm -u` has no `_sys_dcache_flush`, 3 call sites in the bundle]. Turnip's `vkInvalidateMappedMemoryRanges` is the
+  same EL0 `dc civac` loop (`tu_bo_sync_cache`), not CPU_PREP; Turnip never calls CPU_PREP (GL does, `negroni_drm.c`).
+  Untested on the phone: needs EL0 cache maintenance (SCTLR_EL1.UCI) on our kernel; a trap there is SIGILL.
 - Turnip: 4222 weak flat-namespace lookups at load (cost not measured); submit EBUSY with negronigpu_pt=1 may show as
   "device lost" [I].
