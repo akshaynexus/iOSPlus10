@@ -1,0 +1,45 @@
+NegroniMetal change to the ios-flame 745c434 Metal frontend (MIT), on top of 0001 and 0002:
+- installAnswers: A730 answers for the six device queries the runtime has no answer of its own for on Turnip
+  (metal.log "the device has no answer for ..."): gpuCoreCount 4, maxComputeThreadgroupMemory = maxThreadgroupMemoryLength,
+  maxVertexAmplificationCount 2 (1 where the runtime refuses a count of 2), isLargeMRTSupported / supportsComputeCompressedTextureWrite /
+  supportsConditionalLoadStore NO. Each is logged once ("NegroniMetal A730 answer").
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -1645,13 +1645,35 @@
+ }
+ static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
+ static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
++// NegroniMetal: answers for the queries the runtime has none of its own for on the Adreno 730 (Turnip). Each is what the A730 has or a NO
++// that claims nothing: gpuCoreCount = 4 SP cores (Mesa freedreno_devices.py FD730: num_ccu 4 = num_sp_cores); maxComputeThreadgroupMemory
++// = the runtime's maxThreadgroupMemoryLength (Turnip's maxComputeSharedMemorySize, 32 KiB); maxVertexAmplificationCount = 2 where the runtime
++// supports an amplification count of 2, else 1; isLargeMRTSupported, supportsComputeCompressedTextureWrite and supportsConditionalLoadStore
++// are Apple-GPU features (no Vulkan form): NO.
++static bool fallbackAnswer(const char *name,uint64_t *value) {
++ if(!strcmp(name,"gpuCoreCount")){*value=4;return true;}
++ if(!strcmp(name,"maxComputeThreadgroupMemory")){
++  if(!nmb_device_answer(gDevice,"maxThreadgroupMemoryLength",0,value) || !*value)*value=32768;
++  return true;
++ }
++ if(!strcmp(name,"maxVertexAmplificationCount")){
++  uint64_t two=0;*value=nmb_device_answer(gDevice,"supportsVertexAmplificationCount:",2,&two) && two?2:1;return true;
++ }
++ if(!strcmp(name,"isLargeMRTSupported") || !strcmp(name,"supportsComputeCompressedTextureWrite") || !strcmp(name,"supportsConditionalLoadStore")){
++  *value=0;return true;
++ }
++ return false;
++}
+ static void installAnswers(Class cls) {
+  uint32_t kind=0;
+  for(size_t i=0;const char *name=nmb_device_answer_selector(i,&kind);i++) {
+   SEL sel=sel_registerName(name);uint64_t value=0;
+   switch(kind) {
+   case NMB_ANSWER_COUNT: case NMB_ANSWER_FLAG:
+-   if(!nmb_device_answer(gDevice,name,0,&value)){NBLOG(@"native-metal: no device answer: %@",lastError());continue;}
++   if(!nmb_device_answer(gDevice,name,0,&value)){
++    if(!fallbackAnswer(name,&value)){NBLOG(@"native-metal: no device answer: %@",lastError());continue;}
++    NBLOG(@"native-metal: %s = %llu (NegroniMetal A730 answer)",name,(unsigned long long)value);
++   }
+    // Extended-range 10-bit (XR10) framebuffers are withheld: this display chain presents 8-bit BGRX scanout only. The render server picks its
+    // wide-gamut 64-bit (and Apple-compressed) framebuffer when a device offers them, and the display driver could not show it (int-089: the
+    // swap's surface was '&w4a', 8 bytes per pixel, and every swap was refused).
