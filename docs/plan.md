@@ -58,6 +58,10 @@ Status date: 2026-10-25.
   up to 83 GPU presents/s, late ticks 0. Next: Metal for all processes (SpringBoard), GL path A/B, zero-copy flip,
   then a GPU DCVS governor instead of the fixed level 12.
 
+- Poster extensions on Metal (2026-10-25): XR10 answer NO in every process (AegirPoster XR10 pipelines were refused),
+  dead-man ignores SIGKILL before the device opened, strike limit env NEGRONIMETAL_STRIKE_LIMIT (4 for *Poster*).
+  Built, not tested on the phone (notes.md section 16 end).
+
 ## First boot (2026-10-24, 19:48)
 
 - Flash: userdata from fastbootd (45 x 256 MiB, 303 s), then vendor_boot_a, vbmeta_a, dtbo_a,

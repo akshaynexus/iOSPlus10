@@ -43,10 +43,24 @@ scripts/net/ssh-phone.sh "rm -f /private/var/db/negronimetal/off"
 ## 2. Watchdog & Dead-Man Strikes
 
 ### What are strikes?
-`NegroniMetal` implements a **dead-man safety switch** to prevent permanent black screens. If a process (like `backboardd` or `SpringBoard`) crashes or fails to present a frame within the watchdog window, it receives a strike recorded in `/private/var/db/negronimetal/strikes/<process_name>`.
+`NegroniMetal` implements a **dead-man safety switch** to prevent permanent black screens. A start that fails after the
+device opened gets a strike, recorded in `/private/var/db/negronimetal/strikes/<process_name>` (a sandboxed process:
+`<its cache dir>/negronimetal-strikes/<name>`). The file holds `COUNT BOOT-UUID`; strikes from an earlier boot do not count.
 
-* **Strike Limit:** 2 consecutive unclean starts or watchdog timeouts.
-* **Effect:** Once a process reaches 2 strikes, `NegroniMetal` automatically revokes the GPU device from that process and forces it into CPU fallback mode.
+Rules (NegroniMetal.mm, 2026-10-25):
+* **Strike written** when the device has opened, when the open/self-test hangs past `NEGRONIMETAL_OPEN_MS`, or when the
+  process crashes (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS, SIGABRT) during the open.
+* **No strike** when the process is killed (SIGKILL, e.g. launchd's "extension check-in timeout") before the device
+  opened, or when the open is refused cleanly (a clean refusal also removes the old count).
+* **Strike cleared (clean start)** at the first command buffer that completes after the open (the self-test's command
+  buffer does not count), 15 s after the open, or at `exit()`. Log: `dead-man: strike N armed (device opened, limit L)`,
+  then `dead-man: strike cleared (first command buffer completed T ms after the device opened)`.
+* **Limit:** `NEGRONIMETAL_STRIKE_LIMIT` (default 2; the old name `NEGRONIMETAL_MAX_STRIKES` is still read). Processes whose
+  name ends in `Poster`, `PosterExtension` or `PosterProvider` get twice the limit (default 4): PosterBoard relaunches
+  them several times at boot.
+* **Effect:** at the limit, `NegroniMetal` gives that process no device (`dead-man: N unclean starts in a row (limit L)`).
+  Metal-only processes (the poster extensions) then fail; clear the strikes to re-arm.
+* The backboardd GPU watchdog (`strikes/gpu-lost`) is separate: it does not clear the process strike.
 
 ### How to Check and Clear Strikes
 When the UI feels slow and CPU-rendered despite Metal being enabled, check if strikes have been recorded:
@@ -62,8 +76,10 @@ scripts/net/ssh-phone.sh "rm -f /private/var/db/negronimetal/strikes/*"
 ### Tuning Watchdog Timeouts
 Environment variables in `/private/var/db/negronimetal/env` configure watchdog behavior:
 ```sh
-# Example: relax open/self-test timeout (default 6000 ms) and watchdog timeout (default 60s for backboardd, 30s others)
+# Example: relax open/self-test timeout (default 20000 ms) and watchdog timeout (default 60s for backboardd, 30s others)
 scripts/net/ssh-phone.sh "printf 'NEGRONIMETAL_WATCHDOG_S=60\nNEGRONIMETAL_OPEN_MS=10000\n' > /private/var/db/negronimetal/env"
+# Example: strike limit 3 (6 for the poster extensions); the env file is read before the strike check
+scripts/net/ssh-phone.sh "echo NEGRONIMETAL_STRIKE_LIMIT=3 >> /private/var/db/negronimetal/env"
 ```
 
 ---

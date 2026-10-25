@@ -23,8 +23,11 @@
  *     any file wins). The staged files list only the probes, so backboardd stays on the GL path.
  *   - Fail closed: when BUNDLE/off cannot be checked (stat fails with anything but ENOENT), the process gets no device.
  *     /var/db/negronimetal/off, when the sandbox hides it (EPERM/EACCES), leaves the decision to BUNDLE/off.
- *   - Dead-man: each open writes a strike file for the process and clears it after 30 s alive. Two strikes in a row
- *     (two crashes inside 30 s after the device opened) disable the plugin for that process until the file is removed.
+ *   - Dead-man: a strike file for the process is written when the device has opened (or its open hangs, or the process
+ *     crashes during the open; a SIGKILL before the open finished adds none) and removed at the first command buffer that
+ *     completes after the open, 15 s after the open, or at exit(). NEGRONIMETAL_STRIKE_LIMIT (default 2; twice that for
+ *     the *Poster, *PosterExtension, *PosterProvider extensions) strikes in a row disable the plugin for that process
+ *     until the file is removed.
  *     Strikes live in /var/db/negronimetal/strikes, else (sandbox) in the process's own cache directory; a process that
  *     can write neither gets no device.
  *   - GPU watchdog (backboardd): command buffers pending and none completed for NEGRONIMETAL_WATCHDOG_S seconds (default
@@ -43,6 +46,7 @@
 #include <mach-o/loader.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -295,7 +299,22 @@ static bool strikes_dir(char *dir, size_t size)
 	return access(dir, W_OK) == 0;
 }
 
+/*
+ * Dead-man state. The strike file holds "COUNT BOOT": COUNT unclean starts in a row. The plugin writes COUNT+1 when the
+ * device has opened (or the open hangs past NEGRONIMETAL_OPEN_MS, or the process crashes during the open), and removes the
+ * file at the first command buffer that completes after the open, 15 s after the open, or at exit(). So:
+ *   - a start that is killed (SIGKILL: launchd's extension check-in timeout) before the device opened adds no strike;
+ *   - a crash (SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP/SIGSYS/SIGABRT) during the open adds one (crash_strike, below);
+ *   - a process that completed a command buffer after the open is clean, even when it exits or is killed later.
+ */
 static char g_active_strike[256];
+static char g_strike_line[96]; /* "COUNT+1 BOOT\n", prepared at arm time for the signal handler */
+static size_t g_strike_len;
+static const int k_crash_sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS, SIGABRT };
+#define NMTL_NCRASH (sizeof(k_crash_sigs) / sizeof(k_crash_sigs[0]))
+static struct sigaction g_old_sa[NMTL_NCRASH];
+static volatile sig_atomic_t g_crash_armed;
+
 static void deadman_clean_exit(void)
 {
 	if (g_active_strike[0]) {
@@ -304,8 +323,69 @@ static void deadman_clean_exit(void)
 	}
 }
 
+/* Writes the prepared strike line (async-signal-safe: open/write/close only). */
+static bool write_strike_line(const char *path)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (fd < 0)
+		return false;
+	bool ok = write(fd, g_strike_line, g_strike_len) == (ssize_t)g_strike_len;
+	return close(fd) == 0 && ok;
+}
+
+static void crash_unarm(void)
+{
+	if (!g_crash_armed)
+		return;
+	g_crash_armed = 0;
+	for (size_t i = 0; i < NMTL_NCRASH; i++)
+		sigaction(k_crash_sigs[i], &g_old_sa[i], NULL);
+}
+
+/* A crash while the device opens: write the strike, put the old handler back, let the signal go on (a fault repeats with
+ * the old action when the handler returns; SIGABRT is raised again and is delivered after the return). */
+static void crash_strike(int sig, siginfo_t *info, void *uc)
+{
+	(void)info;
+	(void)uc;
+	if (g_crash_armed && g_active_strike[0])
+		write_strike_line(g_active_strike);
+	crash_unarm();
+	if (sig == SIGABRT)
+		raise(sig);
+}
+
+static void crash_arm(void)
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = crash_strike;
+	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+	sigemptyset(&sa.sa_mask);
+	for (size_t i = 0; i < NMTL_NCRASH; i++)
+		sigaction(k_crash_sigs[i], &sa, &g_old_sa[i]);
+	g_crash_armed = 1;
+}
+
+/* The strike limit: NEGRONIMETAL_STRIKE_LIMIT (else the old NEGRONIMETAL_MAX_STRIKES), default 2. PosterBoard relaunches the
+ * poster extensions (names ending in Poster, PosterExtension, PosterProvider) several times at boot: twice the limit (4). */
+static long strike_limit(void)
+{
+	long limit = env_num("NEGRONIMETAL_STRIKE_LIMIT", env_num("NEGRONIMETAL_MAX_STRIKES", 2));
+	const char *n = getprogname();
+	size_t len = strlen(n);
+	static const char *const sfx[] = { "Poster", "PosterExtension", "PosterProvider" };
+	for (const char *x : sfx) {
+		size_t xl = strlen(x);
+		if (len >= xl && !strcmp(n + len - xl, x))
+			return limit * 2;
+	}
+	return limit;
+}
+
 /* Dead-man: true when this process may open the GPU now. Strikes live in <strikes_dir>/<name>. A process that cannot
- * keep a strike file gets no device: without it, a crash loop would never stop. */
+ * keep a strike file gets no device: without it, a crash loop would never stop. No strike is written here: deadman_mark
+ * (device opened, or the open hangs) or crash_strike (a crash during the open) write it. */
 static bool deadman_arm(char *path, size_t size)
 {
 	char dir[450];
@@ -324,17 +404,15 @@ static bool deadman_arm(char *path, size_t size)
 	/* Strikes from an earlier boot do not count (reboot reset) */
 	if (file_boot[0] && strcmp(file_boot, boot_id()) != 0)
 		strikes = 0;
-	const long max_strikes = env_num("NEGRONIMETAL_MAX_STRIKES", 2);
+	const long max_strikes = strike_limit();
 	if (strikes >= max_strikes) {
 		nlog("dead-man: %d unclean starts in a row (limit %ld), no Metal device (rm %s to re-arm)", strikes, max_strikes, path);
 		return false;
 	}
-	FILE *f = fopen(path, "w");
-	bool ok = f && fprintf(f, "%d %s\n", strikes + 1, boot_id()) > 0;
-	if (f && fclose(f) != 0)
-		ok = false;
-	if (!ok) {
-		nlog("dead-man: cannot write %s: no Metal device", path);
+	int n = snprintf(g_strike_line, sizeof(g_strike_line), "%d %s\n", strikes + 1, boot_id());
+	g_strike_len = n > 0 && n < (int)sizeof(g_strike_line) ? (size_t)n : 0;
+	if (!g_strike_len) {
+		nlog("dead-man: cannot format the strike line: no Metal device");
 		return false;
 	}
 	strlcpy(g_active_strike, path, sizeof(g_active_strike));
@@ -342,18 +420,92 @@ static bool deadman_arm(char *path, size_t size)
 	dispatch_once(&atexit_once, ^{
 		atexit(deadman_clean_exit);
 	});
+	crash_arm();
 	return true;
+}
+
+/* The device opened (or the open hangs): this start counts as unclean until it completes a command buffer. */
+static void deadman_mark(const char *path, const char *why)
+{
+	if (!write_strike_line(path))
+		nlog("dead-man: cannot write %s: %s", path, strerror(errno));
+	crash_unarm();
+	nlog("dead-man: strike %.*s armed (%s, limit %ld)", (int)strcspn(g_strike_line, " "), g_strike_line, why, strike_limit());
+}
+
+/* The open was refused cleanly: not a crash, and the strikes in a row end here. */
+static void deadman_refused(const char *path)
+{
+	crash_unarm();
+	unlink(path);
+	g_active_strike[0] = 0;
+}
+
+static void deadman_clear(const char *path, const char *why)
+{
+	if (!g_active_strike[0] || strcmp(g_active_strike, path) != 0)
+		return;
+	unlink(path);
+	g_active_strike[0] = 0;
+	nlog("dead-man: strike cleared (%s)", why);
 }
 
 static void deadman_clear_later(const char *path)
 {
 	char *p = strdup(path);
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-		unlink(p);
+		deadman_clear(p, "15 s after the device opened");
 		free(p);
-		if (g_active_strike[0] && !strcmp(g_active_strike, path))
-			g_active_strike[0] = 0;
 	});
+}
+
+/*
+ * After the open: poll the frontend's completion count every 250 ms (for up to 120 s). The first command buffer that
+ * completes after the open (the self-test's one is in the baseline) clears the strike, and the pipeline compile time so far
+ * goes into the log once.
+ */
+static void first_completion_watch(const char *path, double t_open)
+{
+	uint64_t p0[4] = { 0 };
+	native_bridge_metal_progress(p0);
+	const uint64_t baseline = p0[1];
+	char *sp = strdup(path);
+	dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+	if (!t) {
+		free(sp);
+		return;
+	}
+	dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC), 250 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+	__block int ticks = 0;
+	dispatch_source_set_event_handler(t, ^{
+		uint64_t p[4] = { 0 };
+		native_bridge_metal_progress(p);
+		const bool done = p[1] > baseline;
+		if (done) {
+			const double ms = (CFAbsoluteTimeGetCurrent() - t_open) * 1000;
+			char why[96];
+			snprintf(why, sizeof(why), "first command buffer completed %.0f ms after the device opened", ms);
+			deadman_clear(sp, why);
+			uint64_t w[10] = { 0 };
+			NmbShaderCacheStats cs;
+			memset(&cs, 0, sizeof(cs));
+			const bool have_w = native_bridge_metal_work_stats(w);
+			const bool have_cs = native_bridge_metal_shader_cache_stats(&cs);
+			if (have_w || have_cs)
+				nlog("pipelines %llu compiled in %llu ms, %llu from cache (longest %llu ms, %llu failed; shader cache %llu hits "
+				     "%llu misses %llu writes; driver pipeline cache %llu hits %llu misses) at the first completed frame, "
+				     "%.0f ms after the device opened",
+				     (unsigned long long)w[0], (unsigned long long)(w[1] / 1000), (unsigned long long)cs.driver_hits,
+				     (unsigned long long)(w[2] / 1000), (unsigned long long)w[4], (unsigned long long)cs.hits,
+				     (unsigned long long)cs.misses, (unsigned long long)cs.writes, (unsigned long long)cs.driver_hits,
+				     (unsigned long long)cs.driver_misses, ms);
+		}
+		if (done || ++ticks >= 480) {
+			dispatch_source_cancel(t);
+			free(sp);
+		}
+	});
+	dispatch_resume(t);
 }
 
 /* KEY=VALUE lines of NMTL_DIR/env into this process before the device opens (TU_DEBUG, MESA_*, METAL2VULKAN_*). */
@@ -583,10 +735,6 @@ static void *watchdog_main(void *arg)
 		uint64_t p[4] = { 0 };
 		native_bridge_metal_progress(p);
 		if (p[1] != last_completed || p[2] == 0) {
-			if (p[1] > 0 && g_active_strike[0]) {
-				unlink(g_active_strike);
-				g_active_strike[0] = 0;
-			}
 			last_completed = p[1];
 			stalled = 0;
 			continue;
@@ -678,9 +826,6 @@ static void watchdog_start(void)
 			nlog("no Turnip at %s: no Metal device", turnip.UTF8String);
 			return;
 		}
-		char strike[256];
-		if (!deadman_arm(strike, sizeof(strike)))
-			return;
 		/* shader + pipeline cache: NMTL_DIR/cache/<process>, else the sandboxed process's own cache directory */
 		char cache[256];
 		mkdir(NMTL_DIR "/cache", 0777);
@@ -702,7 +847,10 @@ static void watchdog_start(void)
 		CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
-		load_env();
+		load_env(); /* before deadman_arm: NMTL_DIR/env can set NEGRONIMETAL_STRIKE_LIMIT */
+		char strike[256];
+		if (!deadman_arm(strike, sizeof(strike)))
+			return;
 		const long timeout_ms = env_num("NEGRONIMETAL_OPEN_MS", 20000);
 		const bool test = env_num("NEGRONIMETAL_SELFTEST", 1) != 0;
 
@@ -780,14 +928,26 @@ static void watchdog_start(void)
 			nlog("device %s in %.0f ms (turnip %s, cache %s, self-test %s)%s%s",
 			     device ? [[device name] UTF8String] : "refused", ms, turnip.UTF8String, cache,
 			     test ? "on" : "off", job.why ? ": " : "", job.why ? job.why.UTF8String : "");
-		/* Extended-range (XR10) formats: withheld from backboardd (8-bit framebuffer), allowed elsewhere (ios-flame). */
-		if (device && strcmp(getprogname(), "backboardd") != 0)
+		if (device)
+			deadman_mark(strike, "device opened");
+		else if (timed_out)
+			deadman_mark(strike, "device open hangs");
+		else
+			deadman_refused(strike);
+		/*
+		 * Extended-range (XR10) formats: NO in every process (the frontend answers NO too, flame 0003). The display chain is
+		 * 8-bit BGRA. With YES, the iOS 16 poster extensions (AegirPoster) render into BGR10_XR_sRGB attachments with source-alpha
+		 * blending, metal2vulkan refuses those pipelines (ExtendedRangeBlend(SrgbForm) not implemented) and the tiles stay empty.
+		 */
+		if (device) {
 			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
 					    imp_implementationWithBlock(^BOOL(id me) {
 						    (void)me;
-						    return YES;
+						    return NO;
 					    }),
 					    "B16@0:8");
+			nlog("supportsExtendedXR10Formats = 0 (NegroniMetal A730 answer: 8-bit BGRA display chain, every process)");
+		}
 		Dl_info self_info = { 0 };
 		dladdr((void *)sm2_logs, &self_info);
 		nlog("image base %p (atos -o NegroniMetal.dSYM -l BASE ADDR)", self_info.dli_fbase);
@@ -804,14 +964,13 @@ static void watchdog_start(void)
 			setenv("CA_USE_CGTEXTUREDATA", "0", 0);
 			setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
 			deadman_clear_later(strike);
+			first_completion_watch(strike, CFAbsoluteTimeGetCurrent());
 			const long wd = env_num("NEGRONIMETAL_WATCHDOG", -1); /* 1 / 0 force it on / off; default: backboardd only */
 			if (!strcmp(getprogname(), "backboardd"))
 				telemetry_loop();
 			if (wd == 1 || (wd < 0 && !strcmp(getprogname(), "backboardd")))
 				watchdog_start();
-		} else if (!timed_out) {
-			unlink(strike); /* a clean refusal is not a crash; a hang keeps its strike */
-		}
+		} /* a clean refusal removed its strike file (deadman_refused); a hang keeps its strike (deadman_mark) */
 	});
 	if (g_gpu_lost) {
 		nlog("the GPU watchdog marked the GPU lost: no Metal device");

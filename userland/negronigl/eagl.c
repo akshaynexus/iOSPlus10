@@ -645,6 +645,52 @@ m_current(id cls, SEL cmd)
 	return current_eagl ? current_eagl : ((id (*)(id, SEL))orig_current)(cls, cmd);
 }
 
+/*
+ * -[IOSurface initWithClientBuffer:] (IOSurfaceWrapClientImage / IOSurfaceWrapClientMemory).
+ * CA::Render::Image::retain_iosurface wraps the pixels of a page-aligned CPU image with
+ * IOSurfaceWrapClientImage (kernel selector 6; 7 = WrapClientMemory). Our kernel's
+ * IOSurfaceRootUserClient (UniXNU-negroni 0046) answers unknown selectors with success and a zeroed
+ * lock result, so IOSurface.framework builds a client with id 0, size 0 and no shared state page
+ * (client + 0x70 = lock result + 8 = NULL). CA::WindowServer::IOSurface::wrap_buffer then calls
+ * iosurface_get_edr_factor -> IOSurfaceGetBulkAttachments, which copies from NULL + 0x30:
+ * backboardd SIGSEGV far 0x30 (docs/notes.md 15a, 2026-10-25). Refuse such a client: the wrap
+ * returns NULL (IOSurfaceWrapClientImage then releases the client), retain_iosurface returns NULL
+ * and GLESContext::retain_image keeps the image without an IOSurface.
+ * Layout [V 20H392]: _ioSurfaceClientCreateWithLockResult copies the lock result to client + 0x68;
+ * IOSurfaceClientGetBulkAttachments reads [client + 0x70] + 0x30; the surface id is at client + 0x80.
+ */
+static IMP orig_wrap_init;
+
+static id
+m_surface_wrap_init(id self, SEL cmd, void *client)
+{
+	if (client != NULL && *(void *const *)((const char *)client + 0x70) == NULL) {
+		static unsigned refused;
+		unsigned n = __atomic_add_fetch(&refused, 1, __ATOMIC_RELAXED);
+		if (n <= 4 || (n & (n - 1)) == 0) {
+			ngl_log("negronigl: IOSurface wrap of client memory refused (id %u, no state page: kernel "
+			    "IOSurfaceRoot selector 6/7 unsupported), %u so far",
+			    *(const uint32_t *)((const char *)client + 0x80), n);
+		}
+		/* -[IOSurface dealloc] releases a NULL client (no-op), then NSObject frees self */
+		((void (*)(id, SEL))objc_msgSend)(self, sel_registerName("release"));
+		return nil;
+	}
+	return ((id (*)(id, SEL, void *))orig_wrap_init)(self, cmd, client);
+}
+
+static void
+surface_wrap_install(void)
+{
+	Class cls = objc_getClass("IOSurface");
+	Method m = cls ? class_getInstanceMethod(cls, sel_registerName("initWithClientBuffer:")) : NULL;
+	if (m == NULL) {
+		ngl_log("negronigl: IOSurface has no initWithClientBuffer:, wrap guard not installed");
+		return;
+	}
+	orig_wrap_init = method_setImplementation(m, (IMP)m_surface_wrap_init);
+}
+
 static IMP
 swap(Class cls, const char *sel, void *imp)
 {
@@ -685,5 +731,6 @@ ngl_eagl_install(void)
 	orig_present = swap(cls, "presentRenderbuffer:", m_present);
 	orig_set_current = swap(meta, "setCurrentContext:", m_set_current);
 	orig_current = swap(meta, "currentContext", m_current);
+	surface_wrap_install();
 	ngl_log("negronigl: EAGL shim installed%s", ngl_check_errors ? " (GL error checks on)" : "");
 }

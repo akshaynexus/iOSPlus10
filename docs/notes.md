@@ -764,6 +764,65 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   - Next (not done): `phone-gl.sh backboardd`, `on`, `restart` (owner decision; AMFI on the re-signed
     backboardd is the open risk).
 
+- 2026-10-25 23:46 (GL path agent, first CoreAnimation run on Mesa; backboardd pid 732 and 747):
+  - [V] Phone: preflight PASS (FD730, triangle, iosurface, 149 ms), `EAGL shim installed`,
+    `EAGLContext 0x16150cbf0 API 3 on Mesa`, then backboardd SIGSEGV far 0x30 5 s later, twice. Slide 0x46768000.
+  - [V] Chain (`ipsw dyld a2s`, 20H392 cache, unslid): pc 0x1d1b01e70 `_platform_memmove+176` <- lr 0x1a3983ffc
+    `IOSurfaceClientGetBulkAttachments+68` <- 0x18833765c `CA::Render::iosurface_get_edr_factor+72` <-
+    0x18835538c `CA::WindowServer::IOSurface::wrap_buffer+236` <- 0x1884088cc `CA::OGL::GLESContext::retain_image+312`
+    <- 0x188406078 `GLESContext::bind_image_impl+424` <- 0x188327448 `OGL::Context::bind_image+260` <- 0x1882efafc
+    `render_contents_background+4380` <- 0x1882d8bf8 `LayerNode::apply+80` <- 0x1882d593c `ImagingNode::render+664`
+    <- 0x1882e8344 `render_layers+332` <- 0x1882d8c48 `LayerNode::apply+160`. Not an EAGL/GLI call: CA crashes
+    before it reaches our shim.
+  - [V] IOSurface.framework (out/gpu/re/IOSurface.s): `_ioSurfaceClientCreateWithLockResult` copies the kernel's
+    lock result to client+0x68; GetBulkAttachments does `memmove(out, [client+0x70]+0x30, n)`, so far 0x30 =
+    lock result +8 (the shared state page) is NULL. Create (sel 0), Lookup (4) and LookupFromMachPort (34) fill it
+    (UniXNU-negroni 0046 `negroni_surface_fill_result`). `IOSurfaceClientWrapClientImage` (sel 6) and
+    `WrapClientMemory` (7) are not handled: the kernel's default case returns success with a zeroed struct, and the
+    framework builds a client with id 0, size 0 and state NULL.
+  - [V] Who calls it: `CA::Render::Image::retain_iosurface` 0x1883c4878 wraps a page-aligned CPU image with
+    `IOSurfaceWrapClientImage`; `GLESContext::retain_image` (type 0x18 image) passes the result to wrap_buffer.
+    The Metal path did not crash in the 150 s run [I: its retain_image did not take this branch].
+  - [V] Same crash and same cause in ios-spes (external/ios-spes/NOTES.md "unhandled IOSurface selector 6"); they
+    fixed it in the kernel (sel 6 handler, bergamota 0120-topaz-sweetsurface-client-memory.patch).
+  - Fix (userland, eagl.c `surface_wrap_install`): `-[IOSurface initWithClientBuffer:]` (the step after
+    WrapClientImage/WrapClientMemory) refuses a client with [client+0x70] == NULL: it releases self and returns
+    nil, IOSurfaceWrapClientImage then releases the client (traps 4/5 on id 0), retain_iosurface returns NULL and
+    retain_image keeps the image without an IOSurface. Log line (first 4, then powers of 2):
+    `negronigl: IOSurface wrap of client memory refused (id 0, no state page: ...), N so far`.
+    [I] CA then uploads the image another way (texture upload); not seen yet. [I] The real fix is in the kernel:
+    sel 6/7 must fail (kIOReturnUnsupported) or be implemented like ios-spes/bergamota 0120.
+  - [V] `gl-build` exit 0: stripped negronigl.dylib 14,214,624 bytes, sha256 e527b636...; backboardd unchanged
+    (39cb14d1...); check-imports PASS (0 missing). Not run on the phone yet.
+- Poster extensions with Metal for all processes (2026-10-25, Metal agent):
+  - [V] The iOS 16 wallpaper extensions (AegirPoster = Astronomy, WeatherPoster, EmojiPosterExtension,
+    PridePosterExtension, PhotosPosterProvider) are Metal-only: with no `MTLDevice` they draw nothing.
+  - [V] The plugin answered `supportsExtendedXR10Formats` = YES in every process except backboardd
+    (NegroniMetal.mm, old lines 783-789); the frontend (ios-flame installAnswers, unchanged by flame/0003) answers NO.
+    With YES, AegirPoster renders into an XR10 sRGB colour attachment (pixel format 555 = MTLPixelFormatBGR10_XR_sRGB
+    [I: from memory]) with SourceAlpha/OneMinusSourceAlpha blending. metal2vulkan refuses those pipelines
+    (`cache/AegirPoster/pipelines.log`: `refused render pipeline: Unsupported { feature: ExtendedRangeBlend(SrgbForm),
+    needs: NotImplemented ... at Color(0) }`), flame/0002 skips the draws ("nil render pipeline"), the tiles stay empty.
+  - [V] Cold start: shader compiles 0.9-2.8 s plus device open 1.9-2.8 s. The extension missed its launch check-in and
+    launchd killed it (SIGKILL, "extension check-in timeout", kernel CRASH line sig 9). The old dead-man wrote the strike
+    before the open and counted each kill as an unclean start; after 2 the next starts got no device and threw
+    `-[__NSArrayM insertObject:atIndex:]: object cannot be nil` in `-[NUNIAegirRenderer
+    getOrCreateUniformBufferforFrameBufferIndex:]` (MTLDevice nil, sig 6).
+  - [I] The display chain is 8-bit BGRA: XR10 buys nothing here.
+  - Change (plugin only; flame/0003 already answers NO, so plugin and frontend now agree):
+    `supportsExtendedXR10Formats` = NO in every process, logged once
+    (`supportsExtendedXR10Formats = 0 (NegroniMetal A730 answer: 8-bit BGRA display chain, every process)`).
+    Dead-man: the strike file is written when the device has opened, when the open hangs past NEGRONIMETAL_OPEN_MS,
+    or by a crash handler (SEGV/BUS/ILL/FPE/TRAP/SYS/ABRT) during the open; a SIGKILL before the open finished adds
+    no strike. The strike is removed at the first command buffer that completes after the open (self-test excluded),
+    15 s after the open, or at exit(). Limit `NEGRONIMETAL_STRIKE_LIMIT` (env, default 2; old name
+    NEGRONIMETAL_MAX_STRIKES still read), twice that (4) for names ending in Poster/PosterExtension/PosterProvider.
+    The backboardd GPU watchdog no longer clears the strike (it cleared it at the self-test's completion).
+    At the first completed command buffer one line: `pipelines N compiled in T ms, M from cache (...)`
+    (native_bridge_metal_work_stats + native_bridge_metal_shader_cache_stats). Pipeline cache dir stays
+    /var/db/negronimetal/cache/<name>. [I] Not run on the phone yet. A SIGKILL after the open but before the first
+    completed command buffer still adds a strike (the limit 4 covers the PosterBoard relaunches).
+
 ## 16. Wi-Fi facts (Wi-Fi agent, 2026-10-25; OnePlus kernel source e9da592 in out/src/op-kernel)
 
 - [V] SoC version register: BAR0 + 0x224 (family [31:28], device [27:16], major [15:8], minor [7:0])
