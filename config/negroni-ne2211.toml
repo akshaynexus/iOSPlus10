@@ -50,6 +50,7 @@ kernel_args = [
   "negroniusb=2",          # USB Ethernet + live kernel log (make usblog); the port used 0
   "negronisample=-",
   "negronifb_noconsole=1",
+  "negronifb_hz=120",
   "negronifb_clockshift=100",
   "negroniwifi=4",
   "negroniadreno=22",

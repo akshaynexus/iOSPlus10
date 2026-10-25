@@ -108,9 +108,16 @@ __attribute__((constructor)) static void nmtl_error_mode(void)
 	/* Workaround environment variables (Chlorophyll):
 	 * - CA_USE_CGTEXTUREDATA=0: QuartzCore reads past mapped file for Apple GPU tiled layout in asset catalogs.
 	 * - CI_USE_MTL_DAG_FOR_CIKL_SRC=0: CoreImage crashes in +[CIKernel kernelsWithString:] / SBRendererService with empty argument list.
+	 * - CA_DISABLE_FRAMEBUFFER_COMPRESSION=1: Adreno 730 does not support Apple's GPU framebuffer compression.
+	 * - CA_FORCE_TRIPLE_BUFFERING=1: allows CoreAnimation to pipeline frame N+1 while N is rendering and N-1 is presenting.
 	 */
 	setenv("CA_USE_CGTEXTUREDATA", "0", 0);
 	setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
+	setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+	setenv("CA_FORCE_TRIPLE_BUFFERING", "1", 1);
+	CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+	CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+	CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 	void (*set)(unsigned, unsigned) = (void (*)(unsigned, unsigned))dlsym(RTLD_DEFAULT, "MTLFailureTypeSetErrorModeType");
 	for (unsigned t = 0; set && t < 5; t++)
 		set(t, 5);

@@ -1,11 +1,22 @@
 NegroniMetal addition to NativeBridgeMetalFrontend.mm:
 - Implement MTLFunction protocol conformance on NBFunction to resolve 'fragmentFunction/vertexFunction is not a MTLFunction' in backboardd/SpringBoard.
 - Implement NBLibrary -newFunctionWithName:constantValues:pipelineLibrary:error: for specialized pipeline libraries.
-- Synchronize command buffer execution before host buffer release (defer scheduled in backboardd, wait completed on scheduled wait) to prevent SIGSEGV during page unmap.
+- Implement NBRenderEncoder -setDepthClipMode: and NBCommandBuffer -userDictionary.
+- Unthrottle compositor pipeline (asynchronous scheduling by default, opt-in sync).
+- Skip redundant CPU surface cache flushing in backboardd.
 
 --- a/phone/metal2/NativeBridgeMetalFrontend.mm
 +++ b/phone/metal2/NativeBridgeMetalFrontend.mm
-@@ -345,7 +345,7 @@
+@@ -307,6 +307,8 @@
+ // range once; no address identity or decision is carried into another phase
+ // or command, and distinct/partially overlapping ranges retain their calls.
+ static void flushSurfaces(NSMutableSet *surfaces) {
++ static bool isBackboardd = (strcmp(getprogname(), "backboardd") == 0);
++ if(isBackboardd)return; // Compositor writes directly to GPU framebuffers; skip redundant CPU cache flushes
+  if(!surfaces.count)return;
+  std::vector<std::pair<uintptr_t,size_t>> ranges;
+  ranges.reserve(surfaces.count);
+@@ -345,7 +347,7 @@
  @interface NBLibrary : NBObject
  @property(nonatomic) NmbLibrary *handle;
  @end
@@ -14,7 +25,7 @@ NegroniMetal addition to NativeBridgeMetalFrontend.mm:
  @property(nonatomic) NmbFunction *handle;
  @property(nonatomic,copy) NSString *name;
  @property(nonatomic) MTLFunctionType functionType;
-@@ -353,7 +353,19 @@
+@@ -353,7 +355,19 @@
  @end
  @implementation NBFunction
  - (void)dealloc {nmb_function_release(_handle);}
@@ -34,7 +45,7 @@ NegroniMetal addition to NativeBridgeMetalFrontend.mm:
  @end
  // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
  @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
-@@ -442,6 +454,10 @@
+@@ -442,6 +456,10 @@
   NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
   handler(function,error);
  }
@@ -45,7 +56,34 @@ NegroniMetal addition to NativeBridgeMetalFrontend.mm:
  - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
  // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
  // runtime does when the function is made.
-@@ -1099,7 +1115,17 @@
+@@ -568,6 +586,7 @@
+ @property(nonatomic,strong) NSMutableSet *surfaces;
+ // NegroniMetal: the IOSurfaces (IOSurfaceRef as id) this command buffer's GPU work writes, for the seed bump in -finish
+ @property(nonatomic,strong) NSMutableSet *writtenSurfaces;
++@property(nonatomic,strong) NSMutableDictionary *userDictionary;
+ // Runtime handles retain GPU storage, but only the Objective-C owner retains
+ // a no-copy deallocator, its memory owner and texture/heap ancestry.
+ @property(nonatomic,strong) NSMutableSet *resourceOwners;
+@@ -728,6 +747,7 @@
+  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
+  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
+ }
++- (void)setDepthClipMode:(MTLDepthClipMode)depthClipMode {(void)depthClipMode;}
+ - (void)setViewport:(MTLViewport)v {
+  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
+  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
+@@ -920,6 +940,10 @@
+ - (void)addPresentedHandler:(MTLCommandBufferHandler)block {
+  if(block)@synchronized(self){[_presentedHandlers addObject:[block copy]];}
+ }
++- (NSMutableDictionary *)userDictionary {
++ if(!_userDictionary)_userDictionary=[NSMutableDictionary new];
++ return _userDictionary;
++}
+ - (NSArray<MTLCommandBufferHandler> *)presentedHandlers {
+  @synchronized(self){return [_presentedHandlers copy];}
+ }
+@@ -1099,7 +1123,17 @@
    // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
    void *context=(__bridge_retained void *)self;
    if(nmb_command_buffer_on_completed(_handle,completed,context) &&
@@ -54,7 +92,7 @@ NegroniMetal addition to NativeBridgeMetalFrontend.mm:
 +   static int syncCommit = -1;
 +   if(syncCommit < 0) {
 +    const char *env = getenv("NEGRONIMETAL_SYNC");
-+    syncCommit = (env && env[0] != '0') || access("/private/var/db/negronimetal/sync", F_OK) == 0;
++    syncCommit = (env && env[0] == '1') || access("/private/var/db/negronimetal/sync", F_OK) == 0;
 +   }
 +   if(syncCommit == 1) {
 +    [self waitUntilCompleted];
@@ -64,26 +102,34 @@ NegroniMetal addition to NativeBridgeMetalFrontend.mm:
    (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
    [self refuse:[@"commit: " stringByAppendingString:lastError()]];
   }
-@@ -1115,6 +1141,11 @@
+@@ -1115,6 +1149,15 @@
  }
  - (void)waitUntilScheduled {
   if(!self.committed)return;
-+ static bool isBackboardd = (strcmp(getprogname(), "backboardd") == 0);
-+ if(isBackboardd || getenv("NEGRONIMETAL_SYNC")) {
++ static int sync = -1;
++ if(sync < 0) {
++  const char *env = getenv("NEGRONIMETAL_SYNC");
++  sync = (env && env[0] == '1') || access("/private/var/db/negronimetal/sync", F_OK) == 0;
++ }
++ if(sync == 1) {
 +  [self waitUntilCompleted];
 +  return;
 + }
   const uint64_t began=nowUs();
   if(!self.failedLocally && !nmb_command_buffer_wait_scheduled(_handle)){
    NBLOG(@"native-metal: waitUntilScheduled refused: %@",lastError());return;
-@@ -1123,7 +1154,13 @@
+@@ -1123,7 +1166,17 @@
   gTimeWaitScheduled.add(began);
  }
  @end
 -static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
 +static void scheduled(void *context) {
-+ static bool isBackboardd = (strcmp(getprogname(), "backboardd") == 0);
-+ if(isBackboardd || getenv("NEGRONIMETAL_DEFER_SCHEDULED")) {
++ static int deferSched = -1;
++ if(deferSched < 0) {
++  const char *env = getenv("NEGRONIMETAL_DEFER_SCHEDULED");
++  deferSched = (env && env[0] == '1');
++ }
++ if(deferSched == 1) {
 +  return;
 + }
 + [(__bridge NBCommandBuffer *)context didSchedule];
@@ -91,7 +137,7 @@ NegroniMetal addition to NativeBridgeMetalFrontend.mm:
  // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
  static void completed(void *context) {
   gCompleted++;
-@@ -1136,6 +1173,9 @@
+@@ -1136,6 +1189,9 @@
    CommitRecord &r=gCommitRing[commandBuffer.commitIndex%32];
    if(r.index==commandBuffer.commitIndex)r.callbackUs=took;
   }
@@ -100,3 +146,4 @@ NegroniMetal addition to NativeBridgeMetalFrontend.mm:
 + }
   [commandBuffer finish];
  }
+ 
