@@ -73,6 +73,12 @@ Status date: 2026-10-25.
   first (PON GEN3 registers +0x52/+0x53; 0211 used +0x5a/+0x5b) and prints the PMIC PON log at boot. Built; phone
   test pending (battery empty, hold). Fastboot-menu power off is ABL: not covered (notes.md section 22).
 
+- Charger input (2026-10-26, patch 0272, README-battery.md section 7): the phone drained to 0 % on USB (16 % at 01:31,
+  -458 mA, cable in). 0272 logs the PM8350B SMB5 charger registers with the battery line and sets the USB input limit
+  to `negronichg_ma` (default 500 mA), un-suspends USBIN and enables charging. Kernel + image `out/ios16-chg` built
+  by the `kernel-chg` job (sha256 in logs/kernel-chg.log and `out/ios16-chg/SHA256SUMS`). Not flashed. Next: the owner
+  flashes it when the phone has charge; check `charger ...` lines, then the thermal/DCVS work (0280/0281).
+
 ## First boot (2026-10-24, 19:48)
 
 - Flash: userdata from fastbootd (45 x 256 MiB, 303 s), then vendor_boot_a, vbmeta_a, dtbo_a,

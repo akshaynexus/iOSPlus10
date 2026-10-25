@@ -1,6 +1,6 @@
 # Battery level and charging state (patches 0270-0271)
 
-Status 2026-10-25: finished, read-only by default, full local build (section 4). Not run on the phone yet.
+Status 2026-10-26: 0270/0271 run on the phone (BCL values, docs/notes.md "Battery"); 0272 (charger input, section 7) built, not run.
 
 Marks: **[V]** seen in source, DT, firmware, build or log. **[I]** inference.
 
@@ -8,6 +8,7 @@ Marks: **[V]** seen in source, DT, firmware, build or log. **[I]** inference.
 |---|---|---|
 | `0270-negroni-battery-spmi-v7.patch` | `bsd/dev/negroni_spmi.c`, `.h`, `bsd/dev/negroni_rtc.c` | one shared SPMI arbiter v7 mapping (RTC of 0203 + battery), the battery's read allowlist (reads with `sk_read8` of `negroni_spmi_keys.h`), the opt-in VADC write path |
 | `0271-negroni-battery-service.patch` | `iokit/Kernel/arm/NegroniBattery.cpp`, `iokit/KernelConfigTables.cpp` | the IOPMPowerSource (AppleSmartBattery key set) and its personality on IOResources |
+| `0272-negroni-battery-charger-input.patch` | `bsd/dev/negroni_spmi.c`, `.h`, `iokit/Kernel/arm/NegroniBattery.cpp` | PM8350B SMB5 charger status in the log, USB input enabled at `negronichg_ma` (section 7) |
 
 ## 1. Why iOS showed a wrong battery level
 
@@ -233,3 +234,77 @@ client to copy), the exact gauge values come from the charger PD:
   later patch [V: source].
 - Reference sources: `scripts/battery/fetch-sources.sh` (Linux upstream, Qualcomm downstream
   `bcl_pmic5.c`, OnePlus official) into `out/research/battery/` (git-ignored).
+
+## 7. Charger input (0272, 2026-10-26)
+
+Why: on the phone the battery line showed the pack draining with the USB cable in
+(`NEGRONI BATTERY: 16% 3687mV -458mA ... external=0 ... usbin=0mV`, 01:31; earlier in the night 68-73 %
+with +0..78 mA when `external=1`) [V: logs/usblog.log]. `usbin=0mV` in mode 1 only means "not measured"
+(the VADC runs in modes 4/5), so the line alone does not say whether VBUS is there. Nothing in our kernel
+configures the PM8350B charger; OxygenOS drives it from the ADSP charger PD, which is off here
+(docs/notes.md "Battery"). The DT asks for 500 mA on an SDP and 2000 mA on a charger
+(`qcom,input_current_usb_ma = <0x1f4>`, `qcom,input_current_charger_ma = <0x7d0>`) [V: out/live.dts
+`qcom,battery_charger`]. Slop 0074 (USB VBUS override) only forces the DWC3 PHY's "VBUS valid" bit; it does
+not touch the PMIC [V: negroni_usb.c QSCRATCH_HS_PHY_CTRL].
+
+Register layout [I: the SMB5 family map of downstream `smb5-reg.h` (PM8150B/PM7250B); bergamota's
+PMI8998 SMB2 notes (external/bergamota/enxerto/charger.c) agree on every offset used here; PM8350B
+itself has no public HLOS charger driver]. SID 3 (the PM8350B, like its BCL 0x4700 and
+`qcom,pm8350b-debug@3`):
+
+| Address | Register | Used bits |
+|---|---|---|
+| 0x1006 | BATTERY_CHARGER_STATUS_1 | [2:0] 0 inhibit 1 trickle 2 precharge 3 fast 4 taper 5 terminated 6 pause 7 disabled |
+| 0x1007 | BATTERY_CHARGER_STATUS_2 | logged |
+| 0x1042 | CHARGING_ENABLE_CMD | [0] charging enabled |
+| 0x1061 / 0x1070 | FAST_CHARGE_CURRENT_CFG / FLOAT_VOLTAGE_CFG | logged, never written |
+| 0x1307 / 0x1308 | APSD_STATUS / APSD_RESULT_STATUS | [0] SDP [1] OCP [2] CDP [3] DCP [4] float [5] QC2 [6] QC3 |
+| 0x1310 | USBIN_INT_RT_STS | [4] USBIN plugged in |
+| 0x1340 | USBIN_CMD_IL | [0] USBIN suspend |
+| 0x1342 | USBIN_CMD_ICL_OVERRIDE | [0] take the CFG limit now (SMB5) |
+| 0x1365 | USBIN_LOAD_CFG | [4] ICL override after APSD |
+| 0x1366 | USBIN_ICL_OPTIONS | [0] USBIN_MODE_CHG (the CFG register sets the limit) |
+| 0x1370 | USBIN_CURRENT_LIMIT_CFG | the limit, 50 mA/LSB [I: PM8150B step; `negronichg_step=25` for 25 mA] |
+| 0x1380 | USBIN_AICL_OPTIONS_CFG | [2] AICL enabled, logged |
+| 0x1506 / 0x150b | TYPE_C_SNK_STATUS / TYPE_C_MISC_STATUS | logged |
+| 0x1607 / 0x1608 | ICL_STATUS / AICL_ICL_STATUS | the limit in force, 50 mA/LSB |
+| 0x160b | POWER_PATH_STATUS | [6] USBIN suspended [4] using USBIN |
+
+What 0272 does:
+- `negroni_spmi.c`: the read allowlist gains SID 3 peripherals 0x10-0x16 (observer reads only).
+  `negroni_spmi_chg_unlock(force)` finds the APIDs of SID 3 0x10 (CHGR) and 0x13 (USBIN), logs their
+  owner EE, and maps one 4 KiB channel window each (two more io_submap pages). With `force` = 0 an APID
+  that another EE owns stays locked (the same rule as the VADC unlock). `negroni_spmi_write` now takes
+  the VADC request registers after the VADC unlock and exactly six charger registers after the charger
+  unlock: 0x1042, 0x1340, 0x1342, 0x1365, 0x1366, 0x1370. A refused write (arbiter status error bits)
+  is logged; a timed-out APID is not used again.
+- `NegroniBattery.cpp`: every poll (20 s) reads the 18 registers above (`readCharger`). One line per
+  change of state/plug/suspend/limit:
+  `NEGRONI BATTERY: charger fast, USBIN plugged: st1 03 st2 .. en 01 fcc .. fv .. apsd ../.. usb_rt 10
+  cmd_il 00 load .. icl_opt .. icl_cfg 0a (500 mA) aicl .. typec ../.. | icl_sts 0a (500 mA) aicl_sts ..
+  power_path ..` (every poll with `negronibatt=2/5`). The main line gains `chg=<state> icl=<mA> pp=<hex>`.
+  `ExternalConnected` now comes from USBIN_INT_RT_STS bit 4 when the registers read.
+- Control (`driveCharger`, boot-arg `negronichg_ma`, default 500, 0 = read only, max 3000): with the
+  cable in, when USBIN is suspended (0x1340 bit 0 or 0x160b bit 6), charging is disabled (0x1042 bit 0
+  clear) or the limit is not ours (0x1370 != ma/step, 0x1366 bit 0 clear, 0x1365 bit 4 clear), it writes
+  in the downstream `smblib_set_icl_current()` order: 0x1370 = ma/step, 0x1366 |= 1, 0x1365 |= 0x10,
+  0x1342 = 1, 0x1340 &= ~1, then 0x1042 |= 1; each only when the value differs; at most 5 polls per
+  plug; then it re-reads 0x1370/0x1340/0x1607/0x160b and logs `charger after set: ...`.
+  Boot-args: `negronichg_step` (25 or 50 mA/LSB, default 50), `negronichg_force=1` (write also when
+  EE 0 does not own the charger APIDs; the arbiter answers a refusal in the status word, no hang [I]).
+- Nothing else changes: no float voltage, no FCC, no JEITA, no Type-C role, no HVDCP.
+
+Verification:
+- [V] 2026-10-26: `git apply --check` on the full tree (all patches up to 0290), `compile-one.sh`
+  OK for `negroni_spmi.c`, `NegroniBattery.cpp` clean with the build's clang++ line (`-fsyntax-only`).
+- [ ] Full build and image: see docs/plan.md (kernel-chg job).
+- Phone (owner flashes `out/ios16-chg`): watch for `charger CHGR 0x1000 APID n (EE e)`, the first
+  `charger ...` line (what XBL left: `cmd_il`, `icl_cfg`, `icl_sts`, `power_path`), `charger set` /
+  `charger after set`, then the main line: `mA` positive with the cable in, `chg=fast` or `taper`.
+  If `icl_sts` shows half of what was asked, the step is 25 mA: boot `negronichg_step=25`. If the
+  owner EE is not 0 and writes are "FAILED", try `negronichg_force=1`; if the arbiter refuses them,
+  the only path left is the ADSP charger PD (section 6).
+
+Risks: the SMB5 layout on PM8350B is inferred (the first `charger` line shows nonsense values if it is
+wrong: e.g. `st1` above 7 bits, `icl_cfg` 0xff); the step size is inferred; a wrong limit above what
+the Mac port gives makes the port drop (AICL stays on and backs off). Writes stop after 5 tries.

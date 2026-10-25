@@ -1,0 +1,471 @@
+diff --git a/bsd/dev/negroni_spmi.h b/bsd/dev/negroni_spmi.h
+--- a/bsd/dev/negroni_spmi.h
++++ b/bsd/dev/negroni_spmi.h
+@@ -24,7 +24,13 @@
+  * succeeds only if EE 0 owns the PMK8350 VADC APID. Only the opt-in VADC mode (negronibatt=4/5) calls it.
+  */
+ bool negroni_spmi_vadc_unlock(void);
+-/* PMK8350 VADC ADC7 request registers (SID 0 0x3140-0x3145, 0x3147) only, after the unlock. */
++/*
++ * 0272: opens the PM8350B SMB5 charger registers for writes (SID 3: 0x1042, 0x1340, 0x1342, 0x1365,
++ * 0x1366, 0x1370). force: also when EE 0 does not own the CHGR/USBIN APIDs. True when unlocked.
++ */
++bool negroni_spmi_chg_unlock(bool force);
++/* PMK8350 VADC ADC7 request registers (SID 0 0x3140-0x3145, 0x3147) after the VADC unlock, the six
++ * charger registers after the charger unlock; everything else fails. */
+ int negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ /* The arbiter's APID map (PPID = SID << 8 | peripheral) and owner EEs; returns the count. */
+ unsigned negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max);
+diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
+--- a/bsd/dev/negroni_spmi.c
++++ b/bsd/dev/negroni_spmi.c
+@@ -28,11 +28,19 @@
+  *   SID 0 peripheral 0x31  PMK8350 VADC (ADC7 HLOS user), any register
+  *   SID 3 offsets 0x04/0x05/0x10 of every peripheral: TYPE/SUBTYPE/INT_RT_STS
+  *          (census and plug-event discovery, negronibatt=2/5)
++ *   SID 3 peripherals 0x10-0x16  PM8350B SMB5 charger (CHGR, DCDC, BATIF, USBIN,
++ *          DCIN, TYPEC, MISC): status and config, any register (patch 0272)
+  * Writes are locked. negroni_spmi_vadc_unlock() (opt-in negronibatt=4/5 only)
+  * opens the ADC7 request registers SID 0 0x3140-0x3145 and 0x3147 (APP_SID,
+  * DIG_PARAM, FAST_AVG, CH_SEL, DELAY, CONV_REQ, as Linux adc7_configure), and
+- * only when the owner table gives that APID to EE 0. 0x3146 (EN_CTL1), charger,
++ * only when the owner table gives that APID to EE 0. 0x3146 (EN_CTL1),
+  * fuel gauge, BCL, interrupt and enable registers are never written.
++ * Patch 0272: negroni_spmi_chg_unlock() (boot-arg negronichg_ma > 0, the default)
++ * opens six SMB5 charger registers of SID 3: 0x1042 CHARGING_ENABLE_CMD,
++ * 0x1340 USBIN_CMD_IL (bit 0 suspend), 0x1342 USBIN_CMD_ICL_OVERRIDE,
++ * 0x1365 USBIN_LOAD_CFG, 0x1366 USBIN_ICL_OPTIONS, 0x1370 USBIN_CURRENT_LIMIT_CFG.
++ * The owner of these APIDs is logged; with negronichg_force=0 (default) a
++ * charger APID that another EE owns stays locked.
+  * A command that times out may complete late: its APID is not used again this
+  * boot. Callers: thread context (a mutex serializes the battery's accesses).
+  */
+@@ -70,6 +78,8 @@
+ 
+ #define SP_VADC_PPID      0x031u          /* SID 0, PMK8350 VADC 0x3100 */
+ #define SP_BCL_PPID       0x347u          /* SID 3, PM8350B BCL 0x4700 */
++#define SP_CHGR_PPID      0x310u          /* SID 3, PM8350B SMB5 CHGR 0x1000 (0272) */
++#define SP_USBIN_PPID     0x313u          /* SID 3, PM8350B SMB5 USBIN 0x1300 (0272) */
+ 
+ static LCK_GRP_DECLARE(sp_grp, "negroni_spmi");
+ static LCK_MTX_DECLARE(sp_map_lock, &sp_grp);   /* the shared mapping */
+@@ -88,6 +98,10 @@
+ static uint16_t sp_vadc_apid = SP_NO_APID, sp_bcl_apid = SP_NO_APID;
+ static bool sp_vadc_unlocked;
+ static bool sp_poisoned[SP_MAX_APIDS];
++/* 0272: the charger's two channel windows, [0] CHGR, [1] USBIN */
++static vm_offset_t sp_chg_chn[2];
++static uint16_t sp_chg_apid[2] = { SP_NO_APID, SP_NO_APID };
++static bool sp_chg_unlocked;
+ 
+ int
+ negroni_spmi_arbiter(struct sk_arbiter *arb, vm_offset_t *cnfg)
+@@ -225,6 +239,47 @@
+ 		sp_vadc_unlocked = ok = sp_vadc_chn != 0;
+ 		printf("NEGRONI BATTERY: VADC APID %u: ADC7 conversion requests %s\n", sp_vadc_apid,
+ 		    ok ? "unlocked (0x3140-0x3145, 0x3147)" : "not possible (map failed)");
++	}
++	lck_mtx_unlock(&sp_lock);
++	return ok;
++}
++
++bool
++negroni_spmi_chg_unlock(bool force)
++{
++	static const uint16_t ppid[2] = { SP_CHGR_PPID, SP_USBIN_PPID };
++	static const char *const name[2] = { "CHGR 0x1000", "USBIN 0x1300" };
++	bool ok = false;
++	lck_mtx_lock(&sp_lock);
++	if (!sp_ready) {
++		/* nothing to unlock */
++	} else if (sp_chg_unlocked) {
++		ok = true;
++	} else {
++		ok = true;
++		for (unsigned i = 0; i < 2; ++i) {
++			unsigned owner = 7;
++			sp_chg_apid[i] = sp_find_apid(ppid[i], &owner);
++			if (sp_chg_apid[i] == SP_NO_APID) {
++				printf("NEGRONI BATTERY: charger %s: no APID: writes stay locked\n", name[i]);
++				ok = false;
++				continue;
++			}
++			if (owner != SP_EE && !force) {
++				printf("NEGRONI BATTERY: charger %s APID %u is owned by EE %u: writes stay locked "
++				    "(negronichg_force=1 tries anyway)\n", name[i], sp_chg_apid[i], owner);
++				ok = false;
++				continue;
++			}
++			/* one 4 KiB channel window each, kept for the boot (never unmapped) */
++			sp_chg_chn[i] = ml_io_map(SP_CHNLS_PA + SP_CHNL_STRIDE * sp_chg_apid[i], SP_CHNL_STRIDE);
++			printf("NEGRONI BATTERY: charger %s APID %u (EE %u): %s\n", name[i], sp_chg_apid[i], owner,
++			    sp_chg_chn[i] ? "writes unlocked" : "channel map failed");
++			if (!sp_chg_chn[i]) {
++				ok = false;
++			}
++		}
++		sp_chg_unlocked = ok;
+ 	}
+ 	lck_mtx_unlock(&sp_lock);
+ 	return ok;
+@@ -237,6 +292,9 @@
+ 	if ((sid == 3 && peripheral == 0x47) || (sid == 0 && peripheral == 0x31)) {
+ 		return true;
+ 	}
++	if (sid == 3 && peripheral >= 0x10 && peripheral <= 0x16) {
++		return true;            /* 0272: SMB5 charger blocks */
++	}
+ 	return sid == 3 && (reg == 0x04 || reg == 0x05 || reg == 0x10);
+ }
+ 
+@@ -266,32 +324,62 @@
+ 	return rc ? -1 : 0;
+ }
+ 
++/* The channel window of a writable register (sp_lock held): the VADC request registers after the
++ * VADC unlock, the six SMB5 charger registers after the charger unlock (0272). */
++static bool
++sp_write_target(unsigned sid, unsigned addr, vm_offset_t *chn, uint16_t *apid)
++{
++	/* ADC7 user registers of the PMK8350 VADC; 0x3146 (EN_CTL1) is not written */
++	if (sid == 0 && addr >= 0x3140 && addr <= 0x3147 && addr != 0x3146) {
++		*chn = sp_vadc_chn;
++		*apid = sp_vadc_apid;
++		return sp_vadc_unlocked;
++	}
++	if (sid == 3 && sp_chg_unlocked) {
++		if (addr == 0x1042) {
++			*chn = sp_chg_chn[0];
++			*apid = sp_chg_apid[0];
++			return *chn != 0;
++		}
++		if (addr == 0x1340 || addr == 0x1342 || addr == 0x1365 || addr == 0x1366 || addr == 0x1370) {
++			*chn = sp_chg_chn[1];
++			*apid = sp_chg_apid[1];
++			return *chn != 0;
++		}
++	}
++	return false;
++}
++
+ int
+ negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value)
+ {
+-	/* ADC7 user registers of the PMK8350 VADC only; 0x3146 (EN_CTL1) is not written */
+-	if (!sp_ready || sid != 0 || addr < 0x3140 || addr > 0x3147 || addr == 0x3146) {
++	vm_offset_t chn = 0;
++	uint16_t apid = SP_NO_APID;
++	if (!sp_ready) {
+ 		return -1;
+ 	}
+ 	lck_mtx_lock(&sp_lock);
+-	if (!sp_vadc_unlocked || sp_poisoned[sp_vadc_apid]) {
++	if (!sp_write_target(sid, addr, &chn, &apid) || sp_poisoned[apid]) {
+ 		lck_mtx_unlock(&sp_lock);
+ 		return -1;
+ 	}
+-	sp_wr(sp_vadc_chn, SP_WDATA0, value);
+-	sp_wr(sp_vadc_chn, SP_CMD, (SP_OP_WRITEL << 27) | ((addr & 0xffu) << 4));
++	sp_wr(chn, SP_WDATA0, value);
++	sp_wr(chn, SP_CMD, (SP_OP_WRITEL << 27) | ((addr & 0xffu) << 4));
+ 	int rc = -2;
+ 	for (unsigned i = 0; i < SP_WRITE_POLLS; ++i) {
+-		uint32_t s = sp_rd(sp_vadc_chn, SP_STATUS);
++		uint32_t s = sp_rd(chn, SP_STATUS);
+ 		if (s & SP_DONE) {
+ 			rc = (s & SP_ERRORS) ? -1 : 0;
++			if (rc) {
++				printf("NEGRONI BATTERY: SPMI write sid=%u addr=%#x APID=%u refused (status %#x)\n", sid, addr, apid, s);
++			}
+ 			break;
+ 		}
+ 		delay(1);
+ 	}
+ 	if (rc == -2) {
+-		sp_poisoned[sp_vadc_apid] = true;
+-		printf("NEGRONI BATTERY: SPMI write timeout addr=%#x APID=%u: APID not used again\n", addr, sp_vadc_apid);
++		sp_poisoned[apid] = true;
++		printf("NEGRONI BATTERY: SPMI write timeout sid=%u addr=%#x APID=%u: APID not used again\n", sid, addr, apid);
+ 	}
+ 	lck_mtx_unlock(&sp_lock);
+ 	return rc ? -1 : 0;
+diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBattery.cpp
+--- a/iokit/Kernel/arm/NegroniBattery.cpp
++++ b/iokit/Kernel/arm/NegroniBattery.cpp
+@@ -73,6 +73,7 @@
+ int negroni_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ int negroni_spmi_apid(unsigned sid, unsigned peripheral, unsigned *owner);
+ bool negroni_spmi_vadc_unlock(void);
++bool negroni_spmi_chg_unlock(bool force);
+ int negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ unsigned negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max);
+ }
+@@ -103,6 +104,38 @@
+ #define BCL_IBAT_UA        78127   /* BCL_IBAT_SCALING_UA x range factor 10 / (1000 x 10) */
+ #define BCL_READS          8
+ 
++/*
++ * PM8350B SMB5 charger (SID 3, blocks CHGR 0x1000 .. MISC 0x1600; patch 0272). Register layout of
++ * the SMB5 family (downstream smb5-reg.h, PM8150B/PM7250B; bergamota's SMB2 notes agree on these
++ * offsets). The PM8350B charger is owned by the ADSP charger PD on OxygenOS; without the ADSP its
++ * registers keep what XBL/ABL left. The step of the current registers is CHG_STEP_MA (50 mA on
++ * PM8150B; boot-arg negronichg_step changes it) [inference for PM8350B].
++ */
++#define CHG_SID            3u
++#define CHG_STATUS1        0x1006u  /* [2:0] 0 inhibit 1 trickle 2 pre 3 fast 4 taper 5 term 6 pause 7 disabled */
++#define CHG_STATUS2        0x1007u
++#define CHG_ENABLE_CMD     0x1042u  /* [0] charging enabled */
++#define CHG_FCC_CFG        0x1061u
++#define CHG_FV_CFG         0x1070u
++#define CHG_APSD_STATUS    0x1307u
++#define CHG_APSD_RESULT    0x1308u  /* [0] SDP [1] OCP [2] CDP [3] DCP [4] float [5] QC2 [6] QC3 */
++#define CHG_USBIN_RT_STS   0x1310u  /* [4] USBIN plugged in */
++#define CHG_USBIN_CMD_IL   0x1340u  /* [0] USBIN suspend */
++#define CHG_USBIN_CMD_ICL_OVERRIDE 0x1342u  /* [0] take USBIN_CURRENT_LIMIT_CFG now (SMB5) */
++#define CHG_USBIN_LOAD_CFG 0x1365u  /* [4] ICL override after APSD */
++#define CHG_USBIN_ICL_OPT  0x1366u  /* [0] USBIN_MODE_CHG: the CFG register sets the limit */
++#define CHG_USBIN_ICL_CFG  0x1370u  /* input current limit, CHG_STEP_MA per LSB */
++#define CHG_USBIN_AICL_OPT 0x1380u  /* [2] AICL enabled */
++#define CHG_TYPEC_SNK_STS  0x1506u  /* detected source Rp */
++#define CHG_TYPEC_MISC_STS 0x150bu  /* [0] CC attached */
++#define CHG_ICL_STATUS     0x1607u  /* the limit in force, CHG_STEP_MA per LSB */
++#define CHG_AICL_ICL_STS   0x1608u
++#define CHG_POWER_PATH_STS 0x160bu  /* [6] USBIN suspended [4] using USBIN */
++#define CHG_STEP_MA        50u
++#define CHG_DEFAULT_MA     500u     /* DT qcom,input_current_usb_ma = 500 (SDP) */
++#define CHG_TRIES          5
++static const char *const kChgState[] = { "inhibit", "trickle", "precharge", "fast", "taper", "terminated", "pause", "disabled" };
++
+ /* One ADC7 channel: virtual channel = sid << 8 | channel (as in the DT). */
+ struct nb_chan {
+ 	uint8_t sid, chan, ratiometric, settle;  /* settle: hw_settle_2 index */
+@@ -165,6 +198,10 @@
+ 	unsigned usbMv;
+ 	int32_t ichgMa, iinMa;
+ 	int centiC;
++	/* 0272: the charger registers (chgRead: all of them read) */
++	bool chgRead;
++	uint8_t st1, st2, chgEn, fcc, fv, apsdSt, apsdRes, usbRt, cmdIl, loadCfg, iclOpt, iclCfg, aiclOpt, typecSnk,
++	    typecMisc, iclSts, aiclSts, powerPath;
+ };
+ 
+ #define NB_RT_MAX          128
+@@ -180,6 +217,10 @@
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal, fVadc, fDiag, fHaveSoc, fCensusDone, fExternal, fIbatSeen, fNoDataLogged;
++	bool fChgWrite;            /* 0272: the charger registers are unlocked */
++	unsigned fChgMa, fChgStep, fChgTries;
++	uint32_t fChgKey;          /* the last logged charger state */
++	uint8_t fChgSt1, fChgIclSts, fChgPowerPath;
+ 	int fMode;
+ 	int32_t fSoc;              /* hundredths of a percent */
+ 	uint64_t fLastNs;
+@@ -199,6 +240,9 @@
+ 	void rtChanges(void);
+ 	void readBcl(nb_sample &s);
+ 	void readVadc(nb_sample &s);
++	void readCharger(nb_sample &s);
++	void driveCharger(nb_sample &s);
++	int chgWrite(unsigned addr, uint8_t value, const char *what);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static int adcCode(const nb_chan &c, uint16_t *code);
+@@ -221,6 +265,12 @@
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = fVadc = fDiag = fHaveSoc = fCensusDone = false;
+ 	fExternal = fIbatSeen = fNoDataLogged = false;
++	fChgWrite = false;
++	fChgMa = CHG_DEFAULT_MA;
++	fChgStep = CHG_STEP_MA;
++	fChgTries = 0;
++	fChgKey = 0xffffffffu;
++	fChgSt1 = fChgIclSts = fChgPowerPath = 0xff;
+ 	fMode = NB_READONLY;
+ 	fSoc = 0;
+ 	fLastNs = 0;
+@@ -398,9 +448,11 @@
+ 
+ 	int flags = (external ? 1 : 0) | (charging ? 2 : 0) | (full ? 4 : 0) | (source << 3);
+ 	if ((int)percent != fLastPercent || flags != fLastFlags) {
+-		IOLog("NEGRONI BATTERY: %u%% %umV %dmA %d.%02dC external=%d charging=%d full=%d source=%s usbin=%umV\n",
++		IOLog("NEGRONI BATTERY: %u%% %umV %dmA %d.%02dC external=%d charging=%d full=%d source=%s usbin=%umV "
++		    "chg=%s icl=%umA pp=%02x\n",
+ 		    percent, mv, ma, centiC / 100, (centiC < 0 ? -centiC : centiC) % 100,
+-		    external, charging, full, kSrcName[source], usbMv);
++		    external, charging, full, kSrcName[source], usbMv,
++		    fChgSt1 == 0xff ? "?" : kChgState[fChgSt1 & 7], fChgIclSts == 0xff ? 0 : fChgIclSts * fChgStep, fChgPowerPath);
+ 		fLastPercent = (int)percent;
+ 		fLastFlags = flags;
+ 	}
+@@ -640,7 +692,113 @@
+ 		}
+ 		IOLog("NEGRONI BATTERY: rt_sts %03x (0x%04x+0x10): 0x%02x -> 0x%02x\n", fRtPpid[i], base, fRtLast[i], rt);
+ 		fRtLast[i] = rt;
++	}
++}
++
++/* 0272: the SMB5 charger registers, read only. s.chgRead only when every register was read. */
++void
++NegroniBattery::readCharger(nb_sample &s)
++{
++	struct { unsigned addr; uint8_t *out; } regs[] = {
++		{ CHG_STATUS1, &s.st1 }, { CHG_STATUS2, &s.st2 }, { CHG_ENABLE_CMD, &s.chgEn }, { CHG_FCC_CFG, &s.fcc },
++		{ CHG_FV_CFG, &s.fv }, { CHG_APSD_STATUS, &s.apsdSt }, { CHG_APSD_RESULT, &s.apsdRes },
++		{ CHG_USBIN_RT_STS, &s.usbRt }, { CHG_USBIN_CMD_IL, &s.cmdIl }, { CHG_USBIN_LOAD_CFG, &s.loadCfg },
++		{ CHG_USBIN_ICL_OPT, &s.iclOpt }, { CHG_USBIN_ICL_CFG, &s.iclCfg }, { CHG_USBIN_AICL_OPT, &s.aiclOpt },
++		{ CHG_TYPEC_SNK_STS, &s.typecSnk }, { CHG_TYPEC_MISC_STS, &s.typecMisc }, { CHG_ICL_STATUS, &s.iclSts },
++		{ CHG_AICL_ICL_STS, &s.aiclSts }, { CHG_POWER_PATH_STS, &s.powerPath },
++	};
++	unsigned ok = 0;
++	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
++		if (negroni_spmi_read(CHG_SID, regs[i].addr, regs[i].out) == 0) {
++			ok++;
++		}
++	}
++	s.chgRead = ok == sizeof(regs) / sizeof(regs[0]);
++	if (!s.chgRead) {
++		if (fChgKey != 0xfffffffeu) {
++			IOLog("NEGRONI BATTERY: charger registers: %u of %u readable (SID 3 0x1000-0x1600 not reachable)\n",
++			    ok, (unsigned)(sizeof(regs) / sizeof(regs[0])));
++			fChgKey = 0xfffffffeu;
++		}
++		return;
++	}
++	fChgSt1 = s.st1;
++	fChgIclSts = s.iclSts;
++	fChgPowerPath = s.powerPath;
++	uint32_t key = (uint32_t)s.st1 | (uint32_t)s.usbRt << 8 | (uint32_t)s.cmdIl << 16 | (uint32_t)s.iclSts << 24;
++	if (key != fChgKey || fDiag) {
++		fChgKey = key;
++		IOLog("NEGRONI BATTERY: charger %s%s%s: st1 %02x st2 %02x en %02x fcc %02x fv %02x apsd %02x/%02x usb_rt %02x "
++		    "cmd_il %02x load %02x icl_opt %02x icl_cfg %02x (%u mA) aicl %02x typec %02x/%02x | icl_sts %02x (%u mA) "
++		    "aicl_sts %02x power_path %02x\n",
++		    kChgState[s.st1 & 7], (s.usbRt & 0x10) ? ", USBIN plugged" : ", USBIN unplugged",
++		    ((s.cmdIl & 1) || (s.powerPath & 0x40)) ? ", USBIN SUSPENDED" : "",
++		    s.st1, s.st2, s.chgEn, s.fcc, s.fv, s.apsdSt, s.apsdRes, s.usbRt, s.cmdIl, s.loadCfg, s.iclOpt, s.iclCfg,
++		    s.iclCfg * fChgStep, s.aiclOpt, s.typecSnk, s.typecMisc, s.iclSts, s.iclSts * fChgStep, s.aiclSts, s.powerPath);
++	}
++}
++
++int
++NegroniBattery::chgWrite(unsigned addr, uint8_t value, const char *what)
++{
++	int rc = negroni_spmi_write(CHG_SID, addr, value);
++	IOLog("NEGRONI BATTERY: charger write %s: %#x = 0x%02x %s\n", what, addr, value, rc ? "FAILED" : "ok");
++	return rc;
++}
++
++/*
++ * 0272: with a cable in, make the charger take USB input at negronichg_ma (default 500 mA; 0 = read only):
++ * the downstream smblib_set_icl_current() order (limit, USBIN_MODE_CHG, ICL override, un-suspend), then
++ * charging enabled. Only registers whose value differs are written; at most CHG_TRIES polls per plug.
++ */
++void
++NegroniBattery::driveCharger(nb_sample &s)
++{
++	if (!(s.usbRt & 0x10)) {
++		fChgTries = 0;          /* unplugged: nothing to do, the next plug gets new tries */
++		return;
++	}
++	unsigned wantRaw = fChgMa / fChgStep;
++	if (wantRaw > 255) {
++		wantRaw = 255;
++	}
++	bool suspended = (s.cmdIl & 1) || (s.powerPath & 0x40);
++	bool chgOff = !(s.chgEn & 1);
++	bool limitWrong = s.iclCfg != wantRaw || !(s.iclOpt & 1) || !(s.loadCfg & 0x10);
++	if (!suspended && !chgOff && !limitWrong) {
++		return;
++	}
++	if (fChgTries >= CHG_TRIES) {
++		return;
++	}
++	fChgTries++;
++	IOLog("NEGRONI BATTERY: charger set (try %u): want %u mA (raw %u, %u mA/LSB)%s%s%s\n", fChgTries, fChgMa, wantRaw,
++	    fChgStep, suspended ? ", un-suspend" : "", chgOff ? ", enable charging" : "", limitWrong ? ", input limit" : "");
++	if (s.iclCfg != wantRaw) {
++		chgWrite(CHG_USBIN_ICL_CFG, (uint8_t)wantRaw, "USBIN_CURRENT_LIMIT_CFG");
++	}
++	if (!(s.iclOpt & 1)) {
++		chgWrite(CHG_USBIN_ICL_OPT, s.iclOpt | 1, "USBIN_ICL_OPTIONS mode_chg");
++	}
++	if (!(s.loadCfg & 0x10)) {
++		chgWrite(CHG_USBIN_LOAD_CFG, s.loadCfg | 0x10, "USBIN_LOAD_CFG icl_override_after_apsd");
+ 	}
++	chgWrite(CHG_USBIN_CMD_ICL_OVERRIDE, 1, "USBIN_CMD_ICL_OVERRIDE");
++	if (s.cmdIl & 1) {
++		chgWrite(CHG_USBIN_CMD_IL, s.cmdIl & ~1u, "USBIN_CMD_IL un-suspend");
++	}
++	if (chgOff) {
++		chgWrite(CHG_ENABLE_CMD, s.chgEn | 1, "CHARGING_ENABLE_CMD");
++	}
++	IOSleep(50);
++	uint8_t a = 0xff, b = 0xff, c = 0xff, d = 0xff;
++	(void)negroni_spmi_read(CHG_SID, CHG_USBIN_ICL_CFG, &a);
++	(void)negroni_spmi_read(CHG_SID, CHG_USBIN_CMD_IL, &b);
++	(void)negroni_spmi_read(CHG_SID, CHG_ICL_STATUS, &c);
++	(void)negroni_spmi_read(CHG_SID, CHG_POWER_PATH_STS, &d);
++	IOLog("NEGRONI BATTERY: charger after set: icl_cfg %02x cmd_il %02x icl_sts %02x (%u mA) power_path %02x\n",
++	    a, b, c, c == 0xff ? 0 : c * fChgStep, d);
++	fChgKey = 0xffffffffu;     /* the next poll logs the new state */
+ }
+ 
+ void
+@@ -664,6 +822,10 @@
+ 	if (fVadc) {
+ 		readVadc(s);
+ 	}
++	readCharger(s);
++	if (s.chgRead && fChgWrite) {
++		driveCharger(s);
++	}
+ 	fIbatSeen = fIbatSeen || (s.bclIbatOk && s.bclIbatNonzero);
+ 
+ 	/* Voltage: the VADC if it measured, else the BCL. */
+@@ -679,8 +841,11 @@
+ 		curKnown = true;
+ 		cur = s.ichgMa;
+ 	}
+-	/* Charger: VBUS when the VADC measures it; else the current direction with hysteresis (full on a charger: ~0 mA keeps the state). */
+-	if (s.usbOk) {
++	/* Charger: the USBIN plug status of the charger (0272); else VBUS when the VADC measures it; else the
++	 * current direction with hysteresis (full on a charger: ~0 mA keeps the state). */
++	if (s.chgRead) {
++		fExternal = (s.usbRt & 0x10) != 0;
++	} else if (s.usbOk) {
+ 		fExternal = s.usbMv >= NB_EXT_MV;
+ 	} else if (curKnown) {
+ 		if (cur >= NB_CUR_MA) {
+@@ -789,6 +954,11 @@
+ 	putNumber("NegroniBatteryChargeCurrent", (UInt32)s.ichgMa);
+ 	putNumber("NegroniBatteryInputCurrent", (UInt32)s.iinMa);
+ 	putNumber("NegroniBatteryBCLMonitor", s.bclMon);
++	putBool("NegroniChargerRead", s.chgRead);
++	putNumber("NegroniChargerStatus1", s.st1);
++	putNumber("NegroniChargerUsbinRtSts", s.usbRt);
++	putNumber("NegroniChargerIclMa", s.chgRead ? s.iclSts * fChgStep : 0);
++	putNumber("NegroniChargerPowerPath", s.powerPath);
+ 	publish(percent, (unsigned)vbat, curKnown ? cur : 0, centiC, external, charging, full, source, s.usbMv, s.iinMa);
+ }
+ 
+@@ -818,7 +988,19 @@
+ 	fDiag = fMode == NB_RO_DIAG || fMode == NB_VADC_DIAG;
+ 	fReal = fMode != NB_STATIC && negroni_spmi_init() == 0;
+ 	fVadc = fReal && (fMode == NB_VADC || fMode == NB_VADC_DIAG) && negroni_spmi_vadc_unlock();
++	/* 0272: charger input (negronichg_ma, default 500; 0 = read only; negronichg_step mA/LSB; negronichg_force) */
++	unsigned chgMa = CHG_DEFAULT_MA, chgStep = CHG_STEP_MA, chgForce = 0;
++	(void)PE_parse_boot_argn("negronichg_ma", &chgMa, sizeof(chgMa));
++	(void)PE_parse_boot_argn("negronichg_step", &chgStep, sizeof(chgStep));
++	(void)PE_parse_boot_argn("negronichg_force", &chgForce, sizeof(chgForce));
++	fChgMa = chgMa > 3000 ? 3000 : chgMa;
++	fChgStep = (chgStep == 25 || chgStep == 50) ? chgStep : CHG_STEP_MA;
++	fChgWrite = fReal && fChgMa > 0 && negroni_spmi_chg_unlock(chgForce != 0);
+ 	if (fReal) {
++		IOLog("NEGRONI BATTERY: charger control %s (negronichg_ma=%u, %u mA/LSB, force=%u)\n",
++		    fChgWrite ? "on" : (fChgMa ? "OFF: registers locked" : "off"), fChgMa, fChgStep, chgForce);
++	}
++	if (fReal) {
+ 		unsigned owner = 7;
+ 		int apid = negroni_spmi_apid(BCL_SID, BCL_BASE >> 8, &owner);
+ 		uint8_t type = 0xff, sub = 0xff, mon = 0xff, conv = 0xff;
