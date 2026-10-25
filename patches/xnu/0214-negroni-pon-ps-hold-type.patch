@@ -1,0 +1,438 @@
+diff --git a/bsd/dev/negroni_reboot.c b/bsd/dev/negroni_reboot.c
+--- a/bsd/dev/negroni_reboot.c
++++ b/bsd/dev/negroni_reboot.c
+@@ -8,18 +8,34 @@
+  * read-modify-write of register 0x7148, then a PSCI SYSTEM_RESET follows.
+  * (The IMEM restart_reason at 0x146aa65c does not select a mode here.)
+  *
+- * Power off is PSCI SYSTEM_OFF. Boot-arg negronipoweroff (default 0):
+- *   0  SYSTEM_OFF only
+- *   1  SYSTEM_OFF; if it returns, PMIC fallback (below)
+- *   2  PMIC fallback only
+- * PMIC fallback: the PS_HOLD reset type of the PMK8350 PON_PBS block
+- * (SID 0, 0x0800; DT pon_pbs@800 "qcom,system-reset") is set to SHUTDOWN,
+- * then PSCI SYSTEM_RESET drops PS_HOLD, so the PMIC powers off instead of
+- * a restart. Registers as in downstream qpnp-power-on.c and Linux
+- * pm8941-pwrkey.c: PS_HOLD_RST_CTL 0x5a (bits 3:0 type, 4 = SHUTDOWN),
+- * PS_HOLD_RST_CTL2 0x5b (bit 7 enable; cleared during the change, then
+- * 500 us). The write is refused unless 0x0804/0x0805 read type 0x01 (PON)
+- * and subtype 0x08 (GEN3 PBS). NOT verified on this phone.
++ * Power off (0214). On this phone PSCI SYSTEM_OFF alone is a reset
++ * [V 2026-10-26: the phone was back in iOS 49 s after SYSTEM_OFF, the same
++ * time as after SYSTEM_RESET]: TZ drops PS_HOLD, and the PMIC does what
++ * its PS_HOLD reset type says. The bootloader leaves that type at a reset.
++ * Android (msm-poweroff.c do_msm_poweroff) first sets the type to
++ * SHUTDOWN (qpnp_pon_system_pwr_off), then drops PS_HOLD; do_msm_restart
++ * sets HARD_RESET (WARM_RESET only for a dump) before every reset.
++ * The kernel does the same: the PS_HOLD reset type of the PMK8350 PON_PBS
++ * block (SID 0, 0x0800; DT pon_pbs@800 "qcom,system-reset") is set to
++ * SHUTDOWN, then PSCI SYSTEM_OFF (if it returns: SYSTEM_RESET, which also
++ * drops PS_HOLD). Before a restart a SHUTDOWN type is set to HARD_RESET.
++ * Boot-arg negronipoweroff (default 0):
++ *   0  PS_HOLD type SHUTDOWN, then SYSTEM_OFF (SYSTEM_RESET if it returns)
++ *   1  SYSTEM_OFF only (the 0211 behavior, for comparison)
++ *   2  PS_HOLD type SHUTDOWN, then SYSTEM_RESET
++ * Registers, downstream qpnp-power-on.c (OnePlus sm8450 kernel): PON GEN3
++ * (subtype 0x08 PBS / 0x09 HLOS) has PS_HOLD_RST_CTL at +0x52 (bits 3:0
++ * type: 1 WARM_RESET, 4 SHUTDOWN, 7 HARD_RESET) and PS_HOLD_RST_CTL2 at
++ * +0x53 (bit 7 enable; cleared during the change, then 500 us); GEN1/GEN2
++ * use +0x5a/+0x5b (0211 wrote these on GEN3: the wrong registers). The
++ * write is refused unless 0x0804/0x0805 read type 0x01 (PON) and subtype
++ * 0x08 (GEN3 PBS). GEN3 has no PON/POFF reason registers; the PMIC PBS
++ * writes a PON log into SDAM 0x7400 (DT pmic-pon-log, downstream
++ * pmic-pon-log.c: +0x45 SDAM count, +0x46 push pointer, +0x47 push SDAM,
++ * FIFO of 4-byte entries {state, event, data1, data0} at +0x4b..+0xbf).
++ * negroni_reboot_prepare() prints the PS_HOLD type and the PON log at
++ * boot ("NEGRONI PON LOG:" lines: the last PON trigger, reset trigger and
++ * reset type tell why the phone started).
+  *
+  * The PMIC is reached through the SPMI PMIC arbiter, version 7 (Linux
+  * drivers/spmi/spmi-pmic-arb.c; NE2211 DT qcom,spmi@c42d000, qcom,ee = <0>):
+@@ -105,24 +121,42 @@
+ #define NR_PON_SUBTYPE          0x05u
+ #define NR_PON_TYPE_PON         0x01u
+ #define NR_PON_SUBTYPE_GEN3_PBS 0x08u
+-#define NR_PON_PS_HOLD_RST_CTL  0x5au
++#define NR_PON_SUBTYPE_GEN3_HLOS 0x09u
++#define NR_PON_PS_HOLD_RST_CTL  0x5au           /* GEN1/GEN2 */
+ #define NR_PON_PS_HOLD_RST_CTL2 0x5bu
++#define NR_PON3_PS_HOLD_RST_CTL 0x52u           /* GEN3 */
++#define NR_PON3_PS_HOLD_RST_CTL2 0x53u
+ #define NR_PON_RESET_EN         0x80u
+ #define NR_PON_TYPE_MASK        0x0fu
++#define NR_PON_TYPE_WARM_RESET  0x01u
+ #define NR_PON_TYPE_SHUTDOWN    0x04u
++#define NR_PON_TYPE_DVDD_SHUTDOWN 0x05u
++#define NR_PON_TYPE_HARD_RESET  0x07u
++#define NR_PON_TYPE_DVDD_HARD_RESET 0x08u
+ 
++#define NR_PONLOG_PPID          0x074u          /* SID 0, SDAM 0x7400: the PMIC PON log */
++#define NR_PONLOG_SDAM_COUNT    0x45u
++#define NR_PONLOG_PUSH_PTR      0x46u
++#define NR_PONLOG_PUSH_SDAM     0x47u
++#define NR_PONLOG_FIFO_START    0x4bu
++#define NR_PONLOG_FIFO_END      0xbfu
++#define NR_PONLOG_FIFO_SIZE     (NR_PONLOG_FIFO_END - NR_PONLOG_FIFO_START + 1)
++
+ #define PSCI_SYSTEM_OFF         0x84000008ull
+ #define PSCI_SYSTEM_RESET       0x84000009ull
+ 
+ struct nr_chan {
+ 	const char *name;
+ 	uint32_t    ppid;
++	bool        readonly;   /* observer reads only: no owner check, no write channel */
+ 	bool        attempted, ready;
+ 	vm_offset_t obs, chn;   /* this APID's observer / read-write channel */
+ };
+ 
+ static struct nr_chan nr_sdam = { .name = "SDAM 0x7100", .ppid = NR_SDAM_PPID };
+ static struct nr_chan nr_pon = { .name = "PON_PBS 0x0800", .ppid = NR_PON_PPID };
++static struct nr_chan nr_ponlog = { .name = "PON LOG SDAM 0x7400", .ppid = NR_PONLOG_PPID, .readonly = true };
++static uint8_t nr_pon_subtype;                  /* 0 = not checked yet / not PON */
+ static vm_offset_t nr_core, nr_cnfg;
+ static uint32_t nr_arb, nr_apids;
+ static bool nr_arb_attempted, nr_arb_ready;
+@@ -219,15 +253,15 @@
+ 		printf("NEGRONI REBOOT: %s not in the SPMI APID map\n", c->name);
+ 		return false;
+ 	}
+-	if (owner != NR_EE) {
++	if (owner != NR_EE && !c->readonly) {
+ 		printf("NEGRONI REBOOT: %s APID %d is owned by EE %u, not EE %u: no write\n",
+ 		    c->name, apid, owner, NR_EE);
+ 		return false;
+ 	}
+ 	uint32_t obs_off = NR_OBS_EE_STRIDE * NR_EE + NR_OBS_APID_STRIDE * (uint32_t)apid;
+ 	vm_offset_t obs_page = ml_io_map(NR_OBS_PA + (obs_off & ~0xfffu), 0x1000);
+-	c->chn = ml_io_map(NR_CHNLS_PA + NR_CHNL_STRIDE * (uint32_t)apid, NR_CHNL_STRIDE);
+-	if (obs_page == 0 || c->chn == 0) {
++	c->chn = c->readonly ? 0 : ml_io_map(NR_CHNLS_PA + NR_CHNL_STRIDE * (uint32_t)apid, NR_CHNL_STRIDE);
++	if (obs_page == 0 || (c->chn == 0 && !c->readonly)) {
+ 		printf("NEGRONI REBOOT: SPMI channel map failed\n");
+ 		return false;
+ 	}
+@@ -251,6 +285,9 @@
+ static int
+ nr_write(const struct nr_chan *c, uint32_t reg, uint8_t value)
+ {
++	if (c->chn == 0) {
++		return -1;
++	}
+ 	nr_wr(c->chn, NR_WDATA0, value);
+ 	nr_wr(c->chn, NR_CMD, nr_cmd(NR_OP_EXT_WRITEL, reg));
+ 	return nr_wait(c->chn);
+@@ -306,8 +343,217 @@
+ 	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+ 	(void)assert_wait_deadline((event_t)&nr_prepared, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * PON_PBS: type 0x01 (PON) and GEN3 PBS subtype 0x08 required (the DT's
++ * qcom,system-reset device). Gives the PS_HOLD_RST_CTL/CTL2 offsets of the
++ * generation. 0 = usable, -1 = not (logged once).
++ */
++static int
++nr_pon_check(uint32_t *ctl, uint32_t *ctl2)
++{
++	uint8_t type = 0, subtype = 0;
++
++	if (!nr_open(&nr_pon)) {
++		return -1;
++	}
++	if (nr_pon_subtype == 0) {
++		if (nr_read(&nr_pon, NR_PON_TYPE, &type) || nr_read(&nr_pon, NR_PON_SUBTYPE, &subtype) ||
++		    type != NR_PON_TYPE_PON || subtype != NR_PON_SUBTYPE_GEN3_PBS) {
++			printf("NEGRONI REBOOT: PON_PBS type %#04x subtype %#04x, not PON GEN3 PBS: no PS_HOLD config\n",
++			    type, subtype);
++			return -1;
++		}
++		nr_pon_subtype = subtype;
++	}
++	bool gen3 = nr_pon_subtype == NR_PON_SUBTYPE_GEN3_PBS || nr_pon_subtype == NR_PON_SUBTYPE_GEN3_HLOS;
++	*ctl = gen3 ? NR_PON3_PS_HOLD_RST_CTL : NR_PON_PS_HOLD_RST_CTL;
++	*ctl2 = gen3 ? NR_PON3_PS_HOLD_RST_CTL2 : NR_PON_PS_HOLD_RST_CTL2;
++	return 0;
+ }
+ 
++static const char *
++nr_pon_type_name(uint8_t type)
++{
++	switch (type & NR_PON_TYPE_MASK) {
++	case NR_PON_TYPE_WARM_RESET:        return "WARM_RESET";
++	case NR_PON_TYPE_SHUTDOWN:          return "SHUTDOWN";
++	case NR_PON_TYPE_DVDD_SHUTDOWN:     return "DVDD_SHUTDOWN";
++	case NR_PON_TYPE_HARD_RESET:        return "HARD_RESET";
++	case NR_PON_TYPE_DVDD_HARD_RESET:   return "DVDD_HARD_RESET";
++	default:                            return "unknown";
++	}
++}
++
++/* The PS_HOLD reset type (bits 3:0 of PS_HOLD_RST_CTL). 0 = read, -1 = not. */
++static int
++nr_pon_type_get(uint8_t *type)
++{
++	uint32_t ctl, ctl2;
++	uint8_t v = 0;
++
++	if (nr_pon_check(&ctl, &ctl2) != 0 || nr_read(&nr_pon, ctl, &v) != 0) {
++		return -1;
++	}
++	*type = v & NR_PON_TYPE_MASK;
++	return 0;
++}
++
++/* Boot-time status line: the PS_HOLD reset type the bootloader left. */
++static void
++nr_pon_status(void)
++{
++	uint32_t ctl, ctl2;
++	uint8_t v = 0, en = 0;
++
++	if (nr_pon_check(&ctl, &ctl2) != 0) {
++		return;
++	}
++	if (nr_read(&nr_pon, ctl, &v) || nr_read(&nr_pon, ctl2, &en)) {
++		printf("NEGRONI REBOOT: PON_PBS PS_HOLD_RST_CTL read failed\n");
++		return;
++	}
++	printf("NEGRONI REBOOT: PON_PBS subtype %#04x: PS_HOLD_RST_CTL +%#x = %#04x (%s), CTL2 +%#x = %#04x (%s)\n",
++	    nr_pon_subtype, ctl, v, nr_pon_type_name(v), ctl2, en, (en & NR_PON_RESET_EN) ? "enabled" : "disabled");
++}
++
++/*
++ * PS_HOLD reset type = type, like qpnp_pon_reset_config(): disable, 500 us
++ * (10 sleep clock cycles), type, enable. 0 = set, -1 = not set (logged).
++ */
++static int
++nr_pon_set_type(uint8_t type)
++{
++	uint32_t ctl, ctl2;
++
++	if (nr_pon_check(&ctl, &ctl2) != 0) {
++		return -1;
++	}
++	if (nr_update(&nr_pon, ctl2, NR_PON_RESET_EN, 0) != 0) {
++		return -1;
++	}
++	delay(500);
++	int rc = nr_update(&nr_pon, ctl, NR_PON_TYPE_MASK, type);
++	/* Enable again also after a failed type write: the reset must still work. */
++	if (nr_update(&nr_pon, ctl2, NR_PON_RESET_EN, NR_PON_RESET_EN) != 0 || rc != 0) {
++		return -1;
++	}
++	printf("NEGRONI REBOOT: PS_HOLD reset type = %s\n", nr_pon_type_name(type));
++	return 0;
++}
++
++static const char *
++nr_pon_log_event_name(uint8_t event)
++{
++	switch (event) {
++	case 0x01: return "PON_TRIGGER";
++	case 0x02: return "OTP_COPY_COMPLETE";
++	case 0x03: return "TRIM_COMPLETE";
++	case 0x04: return "XVLO_CHECK_COMPLETE";
++	case 0x05: return "PMIC_CHECK_COMPLETE";
++	case 0x06: return "RESET_TRIGGER";
++	case 0x07: return "RESET_TYPE";
++	case 0x08: return "WARM_RESET_COUNT";
++	case 0x09: return "FAULT_REASON_1_2";
++	case 0x0a: return "FAULT_REASON_3";
++	case 0x0b: return "PBS_PC_DURING_FAULT";
++	case 0x0c: return "FUNDAMENTAL_RESET";
++	case 0x0d: return "PON_SEQ_START";
++	case 0x0e: return "PON_SUCCESS";
++	case 0x0f: return "WAITING_ON_PSHOLD";
++	case 0x20: return "VREG_READY_CHECK";
++	default:   return event >= 0x10 && event <= 0x1c ? "PMIC_SIDn_FAULT" : "event";
++	}
++}
++
++/* Trigger codes of pmic-pon-log.c (PON triggers and reset triggers share the small codes). */
++static const char *
++nr_pon_log_trigger_name(uint8_t event, uint16_t code)
++{
++	if (event == 0x01) {
++		switch (code) {
++		case 0x0084: return "PS_HOLD";
++		case 0x0085: return "HARD_RESET";
++		case 0x0086: return "RESIN_N";
++		case 0x0087: return "KPDPWR_N";
++		case 0x0621: return "RTC_ALARM";
++		case 0x0640: return "SMPL";
++		case 0x31c2: return "USB_CHARGER";
++		case 0x8732: return "USB_CHARGER";
++		default:     return NULL;
++		}
++	}
++	switch (code) {
++	case 0x0080: return "KPDPWR_N_S2";
++	case 0x0081: return "RESIN_N_S2";
++	case 0x0082: return "KPDPWR_N_AND_RESIN_N_S2";
++	case 0x0083: return "PMIC_WATCHDOG_S2";
++	case 0x0084: return "PS_HOLD";
++	case 0x0085: return "SW_RESET";
++	case 0x0086: return "RESIN_N_DEBOUNCE";
++	case 0x0087: return "KPDPWR_N_DEBOUNCE";
++	default:     return NULL;
++	}
++}
++
++/*
++ * The PMIC PON log (SDAM 0x7400, downstream pmic-pon-log.c), oldest entry
++ * first. Only the first SDAM of the FIFO is decoded (the NE2211 DT lists
++ * one). Read only (observer channel); nothing is written.
++ */
++static void
++nr_pon_log_dump(void)
++{
++	static const char *const states[8] = {
++		"FAULT", "PON", "POFF", "ON", "RESET", "OFF", "FAULT", "WARM_RESET"
++	};
++	uint8_t count = 0, ptr = 0, sdam = 0;
++	uint8_t fifo[NR_PONLOG_FIFO_SIZE];
++
++	if (!nr_open(&nr_ponlog)) {
++		return;
++	}
++	if (nr_read(&nr_ponlog, NR_PONLOG_SDAM_COUNT, &count) || nr_read(&nr_ponlog, NR_PONLOG_PUSH_PTR, &ptr) ||
++	    nr_read(&nr_ponlog, NR_PONLOG_PUSH_SDAM, &sdam)) {
++		printf("NEGRONI PON LOG: SDAM 0x7400 header read failed\n");
++		return;
++	}
++	printf("NEGRONI PON LOG: SDAM 0x7400: %u SDAM(s), push pointer +%#x in SDAM %u\n", count, ptr, sdam);
++	if (ptr < NR_PONLOG_FIFO_START || ptr > NR_PONLOG_FIFO_END || sdam != 0) {
++		printf("NEGRONI PON LOG: not decoded (pointer outside the FIFO, or in another SDAM)\n");
++		return;
++	}
++	for (unsigned i = 0; i < NR_PONLOG_FIFO_SIZE; i++) {
++		if (nr_read(&nr_ponlog, NR_PONLOG_FIFO_START + i, &fifo[i])) {
++			printf("NEGRONI PON LOG: FIFO read failed at +%#x\n", NR_PONLOG_FIFO_START + i);
++			return;
++		}
++	}
++	const unsigned entries = NR_PONLOG_FIFO_SIZE / 4;
++	int start = (int)(ptr - NR_PONLOG_FIFO_START) - (int)(entries * 4);
++	if (start < 0) {
++		start += NR_PONLOG_FIFO_SIZE;
++	}
++	for (unsigned i = 0; i < entries; i++) {
++		unsigned idx = ((unsigned)start + i * 4) % NR_PONLOG_FIFO_SIZE;
++		uint8_t state = fifo[idx], event = fifo[(idx + 1) % NR_PONLOG_FIFO_SIZE];
++		uint8_t data1 = fifo[(idx + 2) % NR_PONLOG_FIFO_SIZE], data0 = fifo[(idx + 3) % NR_PONLOG_FIFO_SIZE];
++		if (state == 0 && event == 0 && data1 == 0 && data0 == 0) {
++			continue;
++		}
++		uint16_t data = (uint16_t)((data1 << 8) | data0);
++		const char *extra = NULL;
++		if (event == 0x01 || event == 0x06) {
++			extra = nr_pon_log_trigger_name(event, data);
++		} else if (event == 0x07) {
++			extra = nr_pon_type_name(data0);
++		}
++		printf("NEGRONI PON LOG: %-10s %-20s data %#06x%s%s\n", states[state & 7],
++		    nr_pon_log_event_name(event), data, extra ? " " : "", extra ? extra : "");
++	}
++}
++
+ /* Boot-args and the SPMI mappings, once, in thread context (before any panic needs them). */
+ void
+ negroni_reboot_prepare(void)
+@@ -320,11 +566,11 @@
+ 	PE_parse_boot_argn("negronipanic", &nr_panic_secs, sizeof(nr_panic_secs));
+ 	PE_parse_boot_argn("negronipanicreason", &nr_panic_reason, sizeof(nr_panic_reason));
+ 	(void)nr_open(&nr_sdam);
+-	if (nr_poweroff_mode != 0) {
+-		(void)nr_open(&nr_pon);
+-	}
++	nr_pon_status();
++	nr_pon_log_dump();
+ 	printf("NEGRONI REBOOT: power off = %s, panic = %s %d s (reason %d)\n",
+-	    nr_poweroff_mode == 0 ? "PSCI SYSTEM_OFF" : nr_poweroff_mode == 1 ? "SYSTEM_OFF, then PMIC" : "PMIC",
++	    nr_poweroff_mode == 0 ? "PS_HOLD SHUTDOWN + PSCI SYSTEM_OFF" :
++	    nr_poweroff_mode == 1 ? "PSCI SYSTEM_OFF only" : "PS_HOLD SHUTDOWN + PSCI SYSTEM_RESET",
+ 	    nr_panic_secs > 0 ? "reset after" : "stay", nr_panic_secs, nr_panic_reason);
+ }
+ 
+@@ -357,9 +603,18 @@
+ void
+ negroni_reboot(unsigned reason)
+ {
++	uint8_t type = 0;
++
+ 	if (negroni_reboot_set_reason(reason) != 0) {
+ 		printf("NEGRONI REBOOT: reason %u not set, plain reset\n", reason);
+ 	}
++	/* A SHUTDOWN type (left by a power off) would make this reset a power off. */
++	if (nr_pon_type_get(&type) == 0 && (type == NR_PON_TYPE_SHUTDOWN || type == NR_PON_TYPE_DVDD_SHUTDOWN)) {
++		printf("NEGRONI REBOOT: PS_HOLD reset type %#x is a shutdown: setting HARD_RESET\n", type);
++		if (nr_pon_set_type(NR_PON_TYPE_HARD_RESET) != 0) {
++			printf("NEGRONI REBOOT: PS_HOLD reset type not set: this reset may power off\n");
++		}
++	}
+ 	negroni_reboot_reset();
+ }
+ 
+@@ -419,52 +674,26 @@
+ 	negroni_reboot(nr_modes[i].reason);
+ }
+ 
+-/* PS_HOLD reset type = SHUTDOWN in PON_PBS. 0 = set, -1 = not set (logged). */
+-static int
+-nr_pon_shutdown_type(void)
+-{
+-	uint8_t type = 0, subtype = 0;
+-
+-	if (!nr_open(&nr_pon)) {
+-		return -1;
+-	}
+-	if (nr_read(&nr_pon, NR_PON_TYPE, &type) || nr_read(&nr_pon, NR_PON_SUBTYPE, &subtype) ||
+-	    type != NR_PON_TYPE_PON || subtype != NR_PON_SUBTYPE_GEN3_PBS) {
+-		printf("NEGRONI REBOOT: PON_PBS type %#04x subtype %#04x, not PON GEN3 PBS: no PMIC power off\n",
+-		    type, subtype);
+-		return -1;
+-	}
+-	/* Like qpnp_pon_reset_config(): disable, 500 us (10 sleep clock cycles), type, enable. */
+-	if (nr_update(&nr_pon, NR_PON_PS_HOLD_RST_CTL2, NR_PON_RESET_EN, 0) != 0) {
+-		return -1;
+-	}
+-	delay(500);
+-	int rc = nr_update(&nr_pon, NR_PON_PS_HOLD_RST_CTL, NR_PON_TYPE_MASK, NR_PON_TYPE_SHUTDOWN);
+-	/* Enable again also after a failed type write: the reset must still work. */
+-	if (nr_update(&nr_pon, NR_PON_PS_HOLD_RST_CTL2, NR_PON_RESET_EN, NR_PON_RESET_EN) != 0 || rc != 0) {
+-		return -1;
+-	}
+-	return 0;
+-}
+-
+ /* Power off. Returns only if every enabled method failed (all logged). */
+ void
+ negroni_power_off(void)
+ {
++	if (nr_poweroff_mode != 1) {
++		printf("NEGRONI REBOOT: PMIC power off: PS_HOLD reset type SHUTDOWN\n");
++		if (nr_pon_set_type(NR_PON_TYPE_SHUTDOWN) != 0) {
++			printf("NEGRONI REBOOT: PS_HOLD reset type not set: the power off may be a reset\n");
++		}
++	}
+ 	if (nr_poweroff_mode != 2) {
+ 		printf("NEGRONI REBOOT: PSCI SYSTEM_OFF\n");
+ 		int64_t rc = nr_psci(PSCI_SYSTEM_OFF);
+ 		printf("NEGRONI REBOOT: PSCI SYSTEM_OFF returned %lld\n", (long long)rc);
+-		if (nr_poweroff_mode == 0) {
+-			printf("NEGRONI REBOOT: no power off (boot-arg negronipoweroff=1 tries the PMIC)\n");
++		if (nr_poweroff_mode == 1) {
++			printf("NEGRONI REBOOT: no power off (negronipoweroff=1: SYSTEM_OFF only)\n");
+ 			return;
+ 		}
+ 	}
+-	printf("NEGRONI REBOOT: PMIC power off: PS_HOLD reset type SHUTDOWN, then PSCI SYSTEM_RESET\n");
+-	if (nr_pon_shutdown_type() != 0) {
+-		printf("NEGRONI REBOOT: PMIC power off not possible\n");
+-		return;
+-	}
++	printf("NEGRONI REBOOT: PSCI SYSTEM_RESET drops PS_HOLD (type SHUTDOWN)\n");
+ 	(void)negroni_reboot_set_reason(0);
+ 	negroni_reboot_reset();
+ }

@@ -1215,6 +1215,9 @@ Patches (2026-10-25, regenerated with scripts/kernel/patched-tree.sh in out/kern
   SDAM, 4-byte entries at +0x4b..+0xbf).
 - [V] 0214: power off = PS_HOLD type SHUTDOWN, then SYSTEM_OFF (SYSTEM_RESET if it returns); restart sets
   HARD_RESET if the type reads SHUTDOWN; boot prints the type and the decoded PON log (`NEGRONI PON LOG:`).
+- [V] Full local build OK (2026-10-26): `out/kernel/local-20261025-215453/kernel.development.negroni` (sha256
+  8b0c01a3...), 167 patches applied, `Applying 0214-negroni-pon-ps-hold-type.patch`, 5 `NEGRONI PON LOG` strings in the
+  kernel. Boot image `out/ios16-0214` (config boot-args, no extra). Not flashed.
 - [I] Not tested on the phone yet (battery empty, brownout loop; coordinator hold). The USB auto-boot after a
   shutdown (PON trigger `USB_CHARGER`) is a separate case; the PON log at the next boot shows which one it was.
 - [I] Fastboot-menu "Power off" is ABL code; 0214 does not cover it. With the cable in it is likely the same

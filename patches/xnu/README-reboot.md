@@ -487,3 +487,86 @@ NEGRONI REBOOT: reboot reason 2
    ABL fastboot (`fastboot devices`). If Android boots: read the `SDAM` lines (same causes as the
    0210 test step 5).
 5. Restart from the app (or `reboot` over SSH) without a mode: `reason normal`, a normal reset.
+
+## 0214: PS_HOLD reset type (power off was a reset)
+
+File: `bsd/dev/negroni_reboot.c` only. Applies after 0213; no later patch touches the file.
+
+### Cause [V, from logs/usblog.log 2026-10-26]
+
+- `op10tool ctl poweroff` at 00:47:38: `NEGRONI CTL: "poweroff"`, `NEGRONI REBOOT: PSCI SYSTEM_OFF`, no
+  `SYSTEM_OFF returned` line (PSCI took the call), interface gone at 00:47:39, `usblog: en10 up` at
+  00:48:27 (49 s).
+- `op10tool ctl reboot` at 00:37:34 (`reboot reason 0`, PSCI `SYSTEM_RESET`): `en10 up` at 00:38:22 (48 s).
+- Same time to the next boot: `SYSTEM_OFF` behaved exactly like `SYSTEM_RESET`. On Qualcomm SoCs TZ
+  implements both by dropping PS_HOLD; the PMIC does what its PS_HOLD reset type says (PMK8350
+  PON_PBS `PS_HOLD_RST_CTL`). The bootloader leaves that type at a reset, and 0211 never set it: the
+  default mode was `SYSTEM_OFF` only. Android does not rely on TZ either: `do_msm_poweroff()`
+  (`drivers/power/reset/msm-poweroff.c`, OnePlus sm8450 kernel) calls
+  `qpnp_pon_system_pwr_off(PON_POWER_OFF_SHUTDOWN)` before `qcom_scm_deassert_ps_hold()`, and
+  `do_msm_restart()` sets `HARD_RESET` (or `WARM_RESET` for a dump) before every reset.
+- Second bug: 0211's PMIC fallback (`negronipoweroff=1/2`) wrote `+0x5a/+0x5b`. Downstream
+  `qpnp-power-on.c`: for PON GEN3 (subtype 0x08 PBS, 0x09 HLOS; PMK8350 is GEN3)
+  `QPNP_PON_PS_HOLD_RST_CTL = base + 0x52`, `CTL2 = base + 0x53`; `0x5a/0x5b` are GEN1/GEN2. GEN3 also
+  "does not have PON/POFF reason registers" (driver comment): the PMIC PBS keeps a PON log in SDAM 0x7400
+  (DT `pmic-pon-log`, nvmem `pon_log` = `sdam@7400`), driver `drivers/soc/qcom/pmic-pon-log.c`.
+- Kept separate [I]: with the USB cable in, the PMIC can boot again after a shutdown (PON trigger
+  `USB_CHARGER`, Android then shows off-mode charging; under our boot chain it is iOS). The PON log at
+  the next boot tells the two cases apart: `PON_TRIGGER USB_CHARGER` after `RESET_TYPE SHUTDOWN`
+  (cable auto-boot) against `RESET_TYPE HARD_RESET`/`WARM_RESET` (the reset case fixed here).
+
+### What 0214 changes
+
+- `negroni_power_off()`, `negronipoweroff=0` (default): PS_HOLD reset type = SHUTDOWN (4), then PSCI
+  `SYSTEM_OFF`; if it returns, reason 0 + PSCI `SYSTEM_RESET` (also drops PS_HOLD). `=1`: `SYSTEM_OFF`
+  only (the 0211 behavior, for A/B). `=2`: type SHUTDOWN, then `SYSTEM_RESET` only.
+- `negroni_reboot()` (restart, panic reset, UDP reboots): if the type reads SHUTDOWN/DVDD_SHUTDOWN
+  (left by a power off), set HARD_RESET (7) first. Otherwise the bootloader's value is kept.
+- GEN3 offsets `+0x52/+0x53`; GEN1/2 keep `+0x5a/+0x5b`. Still refused unless type 0x01, subtype 0x08.
+- Boot: `negroni_reboot_prepare()` always opens PON_PBS and prints the type the bootloader left, then
+  decodes the PON log (read only, observer channel; one SDAM; oldest entry first; all-zero entries
+  skipped). `nr_chan.readonly` skips the owner check and the write channel for the log SDAM.
+
+### Log lines (0214)
+
+```
+NEGRONI REBOOT: SPMI arbiter 0x7xxxxxxx, PON_PBS 0x0800 APID n (EE 0)
+NEGRONI REBOOT: PON_PBS subtype 0x08: PS_HOLD_RST_CTL +0x52 = 0x07 (HARD_RESET), CTL2 +0x53 = 0x80 (enabled)
+NEGRONI PON LOG: SDAM 0x7400: 1 SDAM(s), push pointer +0x.. in SDAM 0
+NEGRONI PON LOG: ON         RESET_TRIGGER        data 0x0084 PS_HOLD
+NEGRONI PON LOG: RESET      RESET_TYPE           data 0x0007 HARD_RESET
+NEGRONI PON LOG: PON        PON_TRIGGER          data 0x0085 HARD_RESET
+NEGRONI REBOOT: power off = PS_HOLD SHUTDOWN + PSCI SYSTEM_OFF, panic = stay 0 s (reason 0)
+NEGRONI REBOOT: PMIC power off: PS_HOLD reset type SHUTDOWN
+NEGRONI REBOOT: PON_PBS 0x0800 +0x53 0x80 -> 0x00
+NEGRONI REBOOT: PON_PBS 0x0800 +0x52 0x07 -> 0x04
+NEGRONI REBOOT: PON_PBS 0x0800 +0x53 0x00 -> 0x80
+NEGRONI REBOOT: PS_HOLD reset type = SHUTDOWN
+NEGRONI REBOOT: PSCI SYSTEM_OFF
+NEGRONI REBOOT: PS_HOLD reset type 0x4 is a shutdown: setting HARD_RESET      (a restart after a power off)
+```
+
+Failure lines: `PON_PBS type .. subtype .., not PON GEN3 PBS: no PS_HOLD config`, `PS_HOLD reset type
+not set: the power off may be a reset`, `PON_PBS APID n is owned by EE m` (then no PMIC config: the
+power off is a reset as before), `NEGRONI PON LOG: ... read failed` / `not decoded`.
+
+### How to test 0214 (phone; wait for the coordinator's go)
+
+1. Boot, `make usblog`: read the `PON_PBS subtype` line (the type the bootloader left; expected 7 or 1,
+   not 4) and the `NEGRONI PON LOG` lines (the last `PON_TRIGGER` says why this boot started).
+2. `op10tool ctl poweroff` with the cable in: the log must show the three `PON_PBS 0x0800 +0x5x` writes and
+   `PS_HOLD reset type = SHUTDOWN`. The phone must switch off. If it boots again, read the new PON log:
+   `RESET_TYPE SHUTDOWN` + `PON_TRIGGER USB_CHARGER` = the cable auto-boot (unplug and test again);
+   `RESET_TYPE HARD_RESET`/`WARM_RESET` = the type write did not take effect (read the write lines).
+3. "Slide to power off": `CPU halted`, `NEGRONI: power off`, then the same lines.
+4. After a power off, boot again and `op10tool ctl reboot`: expect `PS_HOLD reset type 0x4 is a shutdown:
+   setting HARD_RESET` only if the bootloader did not set its own type; then a normal reset.
+5. The fastboot menu "Power off" is ABL code (`qpnp_pon_system_pwr_off` equivalent in ABL/XBL), not the
+   kernel; 0214 does not change it. If it also boots again only with the cable in, it is the same PMIC
+   USB_CHARGER auto-boot [I]; without the cable it should stay off.
+
+### Verification done (0214, no phone)
+
+- The patch applies to the fully patched tree (`git apply --check`, 2026-10-26).
+- Full local build 2026-10-26: `out/kernel/local-20261025-215453` (sha256 8b0c01a3...), 0214 applied; image
+  `out/ios16-0214` (config boot-args). Only `-Wdeclaration-after-statement` warnings, as the 0211 code.
