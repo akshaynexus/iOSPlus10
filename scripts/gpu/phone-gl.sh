@@ -59,7 +59,7 @@ off)
   echo "off: backboardd keeps Apple's EAGL at its next start ($0 restart or reboot)" | tee -a "$LOG"
   ;;
 restart)
-  run "killall backboardd; sleep 3; ps ax | grep -w [b]ackboardd"
+  run 'p=$(ps -A | grep "[/]usr/libexec/backboardd" | sed "s/^ *//" | cut -d" " -f1 | head -1); kill -9 $p; sleep 3; ps -A | grep "[/]usr/libexec/backboardd"'   # no killall on the phone
   ;;
 test)
   run "/usr/local/bin/ngl_test"
