@@ -28,6 +28,13 @@ decision we learned; add yours before you stop), `docs/plan.md` (status and next
   changes as patches or scripts in this repo and apply them from a script.
 - **Reply style:** ASD-STE100, STE-flavored (short sentences, active voice, technical terms and
   numbers unchanged).
+- **Clean old builds after every new build.** The Mac disk is nearly full (a full disk breaks builds and
+  the shared git index). After a new build succeeds, run `scripts/clean-builds.sh --yes` (keeps the 2
+  newest kernels and the linked one, kernel trees changed in the last 3 h, `out/ios16`, `ios16-debug`;
+  removes older `out/kernel/local-*`, idle `out/kernel/tree-*`/`wt-*`, old `out/ios16-*` variants). Agents
+  delete their own scratch trees when they finish. Replace a big image (root `.img`/`.simg`) instead
+  of keeping old copies, unless it is the only fallback. Never copy a directory into itself. Check
+  `df -h` before a large job.
 
 ## Phone safety
 
