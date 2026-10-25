@@ -56,6 +56,7 @@ kernel_args = [
   "negroniadreno=22",
   "negroniadreno_keep=1",
   "negronigpu_pool=512",
+  "negronigpu_level=12",   # fixed 818 MHz GX vote (patches 0235/0237); a DCVS governor comes later
 ]
 
 [bootimg]

@@ -514,6 +514,16 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
     the Turnip row).
   - Next: A/B on the phone, GPU ms per CA frame with `NEGRONIMETAL_POLICY=exact` vs default, then `compositor-srgb`.
 
+- Metal at the real GPU clock (2026-10-25 23:35, kernel 0254b+0236+0237 at level 12, bundle with m2v/0003 compositor
+  policy, clients = backboardd): [V] 150 s without a crash; commit-to-callback 4.5-8 ms per command buffer (rp3 dr39
+  3 Mpx; before: 60 ms to 14 s at ~5 MHz); STAT `presents/s` 17-83 all by the 0231 GPU copy (`gpu N`, cpu 0), copy
+  avg 2 ms, `late ticks 0`, `gpu-wait skips` 3-23 per second (frames shown one tick later), SwapWait busy answers
+  pace CA. CPU-only path on the same kernel: `swaps/s 172 presents/s 120 copy 2.4 ms late ticks 0`.
+  - [V] Metal for ALL processes (clients `*`, 23:38-23:41): SpringBoard and backboardd on the GPU 160 s, no crash of
+    either; command buffers rp7 dr86-272 5.9 Mpx complete in 9.6-13.7 ms; presents all `gpu`, late ticks 0. Only
+    AegirPoster crash-loops (sig 6, dead-manned; wallpaper tiles magenta; separate bug). Config default is now
+    `negronigpu_level=12`.
+
 ## CoreImage/PosterBoard crash (analysis 2026-10-25; addresses = unslid 20H392 cache, slide 0x1f750000 in logs/usblog-20261024-235438.txt)
 
 - [V] SpringBoard sig 11 pc 0 lr 0x194b3858c: `CI::GLContext::init` 0x194b384c0 calls `_GetMacroContext` -> `_wrapGetMacroContext` 0x194b32614, which bzero's a 0x2c8 dispatch table and leaves it zero when `-[EAGLContext getMacroContextPrivate]` returns NULL; init only logs (`ci_logger_render`) and then calls table+0xe8 with w1=0xb71 (glDisable(GL_DEPTH_TEST)) = NULL (ipsw disass).
