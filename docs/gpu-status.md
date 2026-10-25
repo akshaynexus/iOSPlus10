@@ -38,8 +38,9 @@ When NegroniMetal is missing or returns no device, CoreAnimation/CoreImage use E
 | Kernel GPU user client, IOSurface import (0230) | written, builds, not run on the phone |
 | GPU present at 120 Hz (0231, rebased on slop 120 Hz) | written, builds, not run on the phone |
 | 120 Hz vsync (slop) | builds; the phone still runs a 60 Hz kernel |
-| OpenGL ES driver (negronigl) | builds; CoreAnimation cannot draw through it yet (renderbuffer step fails) |
-| Software fallback (Mesa softpipe) | builds (2026-10-25): negronigl.dylib + NegroniGL.bundle (129/129 GLD names, 13 real gld functions), softpipe when RedwoodGPU does not open; not run on the phone. The GLI part that connects EAGL to Mesa is not written (safety filters stopped it twice); until then gldChoosePixelFormat refuses and EAGL contexts stay nil. Waits for the owner |
+| OpenGL ES driver (negronigl) | builds; renderbuffer-from-drawable now wired through the GLI plugin (gli_view.c); not run on the phone |
+| GLI plugin: EAGL contexts on Mesa (plugin/gli_table.c, gli_context.c, gli_view.c) | builds (2026-10-25): NegroniGL.bundle now exports all 18 `gli*` entries; ngl_gli_register points OpenGLES's `_gli_plugin` at us so EAGL binds them (notes 15/15a, [V] disassembly). gliChoosePixelFormat + gliGetVersion let EAGL init; gliCreateContextWithShared makes a Mesa GLES context; gliSetInteger(0x38e) and gliBindViewES bind an IOSurface as renderbuffer storage through surface.c; gliPresentViewES does glFinish. gldChoosePixelFormat no longer refuses (0x2712). Not run on the phone |
+| Software fallback (Mesa softpipe) | builds (2026-10-25): negronigl.dylib + NegroniGL.bundle (129/129 GLD names, 13 real gld functions), softpipe when RedwoodGPU does not open; not run on the phone |
 | Vulkan (Turnip) | builds (2026-10-25, `scripts/gpu/turnip-build.sh`, patch `userland/turnip/mesa-patches/0001`): chained fixups, no `dyld_stub_binder`, exports `redwood_drm_note_surface`; import check vs 20H392 PASS; msm ABI; host import = noted IOSurfaces by ID (0x7e), other pages by USERPTR 0x49 (0232), HOST_CACHED types only; not run on the phone |
 | Metal plugin + probes | build (iOS 16 arm64, Xcode 27.1 and 15.4); plugin logic passes a host test on the Mac (MoltenVK); not run on the phone. Fast refusals (no RedwoodGPU, no Turnip, `negronimetal=0`), open + IOSurface self-test under a 6 s deadline, frontend gaps for QuartzCore closed (patch flame/0001) |
 | QuartzCore shaders (host, metal2vulkan) | A730 estimate profile: kernels 7/7, vertex 39/39, fragment 93/95 (2 need pixel interlock, Turnip lacks it); bare Vulkan 1.2: fragment 75/95 |
@@ -78,3 +79,28 @@ then `negronifb_zerocopy=1`, then `negronigpu_pt=1`).
   Untested on the phone: needs EL0 cache maintenance (SCTLR_EL1.UCI) on our kernel; a trap there is SIGILL.
 - Turnip: 4222 weak flat-namespace lookups at load (cost not measured); submit EBUSY with negronigpu_pt=1 may show as
   "device lost" [I].
+
+## Review: Bergamota + Chlorophyll (2026-10-25)
+
+Full text: [reviews/bergamota-chlorophyll-2026-10-25.md](reviews/bergamota-chlorophyll-2026-10-25.md). Bergamota (iOS 18.7.8,
+Poco F1, Adreno 630) runs CoreAnimation on Metal only. Its Metal driver is Chlorophyll (MIT): AIR -> NIR -> ir3 over Gallium
+freedreno, with no Vulkan. Bergamota itself has no licence file, so we learn from its kernel patches and do not copy them.
+
+- Keep our stack: metal2vulkan + Turnip, the NegroniMetal plugin through `MetalPluginName` (their patch 0232 is our 0205), and
+  our A730 kernel.
+- Copy their CoreAnimation fixes into the plugin and frontend:
+  - `CA_USE_CGTEXTUREDATA=0`;
+  - `targetDeviceInfo`, `dedicatedMemorySize` and `sharedMemorySize`;
+  - the IOSurface seed bump after GPU writes;
+  - DontCare attachments cleared;
+  - refused draws skipped, not failed;
+  - control files readable by sandboxed apps;
+  - a GPU-lost watchdog.
+- Kernel lessons:
+  - Map a zero page after each surface BO, because the GPU writes whole tiles past the end.
+  - Present into 3 kernel-owned scan-out buffers with a GPU blit queued behind the frame, and complete the swap at once. That gave
+    them 38.6 fps and no tearing.
+  - Use single-instruction MMIO accessors under a trapping hypervisor.
+- OpenGL ES: a process with a working Metal device does not reach `CI::GLContext` (notes.md CoreImage section). Freeze NegroniGL
+  GPU work and fix Bold Text by giving SpringBoard and the UIKit processes a Metal device. Test
+  `IOGLESBundleName = AppleMetalGLRenderer` (Apple's GL on Metal, as Droid-VM does) behind a boot-arg.
