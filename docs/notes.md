@@ -12,6 +12,30 @@ Topic docs: [plan.md](plan.md) (phases) · **[gpu-status.md](gpu-status.md) (GPU
 
 ## 1. Current state (handoff, 2026-10-24)
 
+**Handoff 2026-10-26 03:30 (newest; read this first).** The 2026-10-25 19:00 handoff is below it, kept for history.
+- UI is GPU-rendered through Metal for ALL processes (`/var/db/negronimetal/clients` = `*`): NegroniMetal ->
+  ios-flame frontend -> metal2vulkan (submodule external/metal2vulkan) -> Turnip -> RedwoodGPU. [V 2026-10-25
+  23:35-23:41] backboardd 150 s and all processes 160 s without a crash, 4.5-14 ms per command buffer at 818 MHz,
+  up to 83 GPU presents/s, STAT `late ticks 0`. The GL path (ios-spes port, scripts/gpu/phone-gl.sh) is an A/B
+  only: preflight PASS, CA makes its context on Mesa, then a crash from the kernel's unhandled IOSurface
+  selector 6 (guarded in eagl.c, kernel fix pending). Reddit note from the spes author: his UI runs on GLES;
+  ours runs on Metal; both paths exist here.
+- Root causes fixed today (sections 15-17): backboardd SIGSEGV (dc civac over unmapped host imports; Turnip 0002),
+  the display path (0252 stats, 0253 CA refresh property, 0254 no fence waits on the tick + SwapWait Busy,
+  0256 clock-shift after the GPU copy), the GPU clock (0237: the PERF_TABLE was sent in MHz, the GMU takes kHz;
+  the GPU ran at ~5 MHz, now 817 MHz), poster XR10 answer and dead-man rules, power off (0214: PS_HOLD type).
+- Known-good image: `out/ios16-khz12` (kernel 0254b+0236+0237, config args + negronigpu_level=12). Newer full
+  kernels add 0214/0256/0262/0241 (not yet booted). Flash: `out/bin/op10tool ctl bootloader` (normal shell),
+  `IOS16_OUT=out/ios16-khz12 scripts/flash/ios16.sh boot --yes`, `... active --yes`.
+- Open: wallpaper poster extensions (AegirPoster nil buffer, Pride MPS init nil, FitnessWidget metallib compile
+  kill: section 16), Weather/Calendar widgets, Safari WebGPU flashing, thermal/DCVS (GPU fixed at 818 MHz),
+  battery charging (usbin 0 mV under our kernel: the phone drained to brownout during the night; charger patch
+  0272 pending), USB link drops, Wi-Fi (PCIe link + QCA6490 detected with negroniwifi=10 [V]; MHI/BHI next;
+  the wlan2 test image reboot-loops on a low battery), audio (stage 0 HAL plug-in installed, ADSP step 1 passes
+  with 0241). Test images must carry `negronipanic=30 negronipanicreason=2` and a charged battery.
+- bg.sh: `scripts/bg.sh NAME env VAR=x cmd` (a VAR=x prefix does not reach tmux). Kernel builds and flashes by
+  parallel agents use the lock `out/kernel/.lock` (mkdir/rmdir).
+
 **Handoff 2026-10-25 19:00 (newest; read this first).**
 - Phone flashed: userdata = `~/op10-apple/ios16-root.simg` sha256 8f0e2843 (root-update.sh: ios16-root-new.img +
   Metal + PowerMenu; AREAS=1: GPU/ADSP/WLAN firmware areas at the end of userdata); boot_a baea1ceb = kernel
