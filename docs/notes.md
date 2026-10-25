@@ -12,6 +12,25 @@ Topic docs: [plan.md](plan.md) (phases) · **[gpu-status.md](gpu-status.md) (GPU
 
 ## 1. Current state (handoff, 2026-10-24)
 
+**Handoff 2026-10-25 19:00 (newest; read this first).**
+- Phone flashed: userdata = `~/op10-apple/ios16-root.simg` sha256 8f0e2843 (root-update.sh: ios16-root-new.img +
+  Metal + PowerMenu; AREAS=1: GPU/ADSP/WLAN firmware areas at the end of userdata); boot_a baea1ceb = kernel
+  `out/kernel/local-20261025-131141` (all 28 patches/xnu: ...0213 reboot mode, 0234, 0240 + 0290 io_submap fix,
+  0260-0262 Wi-Fi, 0270/0271 battery) with config defaults (negroniadreno=22 keep=1 gpu_pool=512, negroniwifi=4,
+  battery default read-only mode 1, ADSP and WLAN off).
+- [V] on the phone (18:34, kernel 130140): GPU ladder 22/22, RedwoodGPU registered, no faults; Turnip vkprobe
+  finds "Turnip Adreno 730", clear 64x64 PASS. Fence-only submit fix (39b8bf1) removed DeviceLost; the
+  metal2vulkan device opens. Next Metal blocker: IOSurface no-copy host-memory import ("HostMemory,
+  NotRepresentable"); an agent works on userland/metal/patches/m2v + flame 0003 (WIP 5ef0252).
+- [V] 16:52 panic (photo) = io_submap (8 MiB, KMA_NOFAIL) full at the 0240 SMEM map: fixed (0290, 49c361c).
+- Not yet tested on the phone: PowerMenu (app + setuid helper; bootloader needs 0213), battery 0270/0271,
+  Wi-Fi 0262 (needs negroniwifi=10, then negroniwlan=2), audio 0240 (negroniadsp=1, steps first).
+- UI is still CPU-rendered: backboardd/SpringBoard get Metal only when listed in
+  /var/db/negronimetal/clients (stage 4, after probe stages 1-3 pass).
+- Flash recipe: `CONFIRM=yes scripts/flash/all.sh [--skip-userdata]` after `out/bin/op10tool ctl bootloader`
+  (from a normal shell; tmux cannot send UDP: macOS Local Network). Never push files with a "var" directory
+  entry (it replaced the /var symlink once): use scripts/metal/phone-test.sh push (fixed) or the root hooks.
+
 **Works [V]:** the full boot chain on the NE2211; iOS 16.7.16 reaches the home screen (photo, 2026-10-24);
 touch; power/volume keys; USB live kernel log (`make usblog`).
 
