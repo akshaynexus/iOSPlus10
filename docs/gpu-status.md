@@ -65,3 +65,13 @@ then `negronifb_zerocopy=1`, then `negronigpu_pt=1`).
 2. Bold Text on: SpringBoard must not crash.
 3. GPU path: boot-args `negroniadreno=22 negroniadreno_keep=1`; `ngl_test`, then the UI.
 4. Vulkan/Metal probes: `scripts/metal/phone-test.sh`.
+
+## Open items (2026-10-25)
+
+- Cache maintenance after GPU writes into an imported IOSurface: host-imported memory is cached and
+  non-coherent (gpu-abi section 6), but the Metal frontend never calls vkInvalidateMappedMemoryRanges, and the
+  NegroniMetal self-test reads the surface right after the GPU clear. [I] If the GPU is not IO-coherent, the
+  self-test can read stale data and keep Metal off (safe, but no Metal). Fix in the frontend (invalidate after
+  waitUntilCompleted for IOSurface-backed textures) or in the kernel import path.
+- Turnip: 4222 weak flat-namespace lookups at load (cost not measured); submit EBUSY with negronigpu_pt=1 may show as
+  "device lost" [I].
