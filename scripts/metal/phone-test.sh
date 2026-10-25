@@ -25,12 +25,18 @@ push)
   S=$REPO/out/metal/stage
   [ -d "$S/usr/local/bin" ] || { echo "no $S: scripts/metal/build.sh" >&2; exit 1; }
   T=$(mktemp -d)
-  COPYFILE_DISABLE=1 tar --uid 0 --gid 0 -czf "$T/metal.tgz" -C "$S" .
-  "$SSHP" push "$T/metal.tgz" /var/tmp/metal.tgz
+  # Files and symlinks only, no directory entries, and var/ as private/var/: on iOS /var is a symlink
+  # to /private/var, and a "var" directory entry makes the phone's tar replace that symlink with an
+  # empty directory (2026-10-25: that broke /var/root/.ssh and so SSH).
+  (cd "$S" && find System usr var \( -type f -o -type l \) | LC_ALL=C sort) > "$T/list"
+  COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --no-recursion -s '#^var/#private/var/#' -czf "$T/metal.tgz" -C "$S" -T "$T/list"
+  if tar -tzf "$T/metal.tgz" | grep -Eq '(^|/)$|^var/|^\./'; then echo "push: archive has directory or var/ entries" >&2; exit 1; fi
+  "$SSHP" push "$T/metal.tgz" /private/var/tmp/metal.tgz
   rm -rf "$T"
   # keep an existing clients/env on the phone; the probes and the bundle are replaced
-  run 'cd / && mkdir -p /var/db/negronimetal && cp -p /var/db/negronimetal/clients /var/tmp/clients.keep 2>/dev/null;
-       tar -xzpf /var/tmp/metal.tgz -C / && rm /var/tmp/metal.tgz;
+  run 'cd / && [ -L /var ] || { echo "/var is not a symlink: stop"; exit 1; };
+       mkdir -p /var/db/negronimetal && cp -p /var/db/negronimetal/clients /var/tmp/clients.keep 2>/dev/null;
+       tar -xzpf /private/var/tmp/metal.tgz -C / && rm /private/var/tmp/metal.tgz;
        [ -f /var/tmp/clients.keep ] && mv /var/tmp/clients.keep /var/db/negronimetal/clients;
        mkdir -p /var/db/negronimetal/cache /var/db/negronimetal/strikes && chmod 1777 /var/db/negronimetal/cache /var/db/negronimetal/strikes;
        touch /var/db/negronimetal/metal.log && chmod 666 /var/db/negronimetal/metal.log; ls -la '"$B"' /usr/local/bin'
