@@ -1,4 +1,4 @@
-# USB command server, reboot reason, power off (0210, 0211)
+# USB command server, reboot reason, power off, reboot mode (0210, 0211, 0213)
 
 `0210-negroni-usb-command-server.patch` adds a small command server to the negroni USB Ethernet
 (CDC-ECM) driver and a reboot-reason writer for the PMIC. The host sends one word over UDP and
@@ -7,6 +7,10 @@ button combination is necessary. NEGRONI machine config only (`ARM64_BOARD_CONFI
 
 `0211-negroni-power-off.patch` makes the kernel halt/restart path work ("slide to power off" did
 nothing) and adds the `poweroff` command. See "0211: power off and restart" below.
+
+`0213-negroni-reboot-mode.patch` adds the root-only string sysctl `kern.negroni_reboot_mode`. The
+0211 restart path (`reboot(RB_AUTOBOOT)`) uses its reason, so a root process on the phone can
+reboot into ABL fastboot. See "0213: reboot mode sysctl" below.
 
 Base: branch `base` of `out/kernel/xnu`. Work branch: `reboot` in `out/kernel/wt-reboot`.
 0210 = commit `0354535` = `git diff base` of its three files; it applies alone on `base`.
@@ -399,3 +403,87 @@ PSCI return codes: -1 NOT_SUPPORTED, -2 INVALID_PARAMETERS, -3 DENIED.
   `OSDefineMetaClassAndStructors` macro warnings that every IOKit class gets with this clang; `nm`
   shows `_PE_halt_restart` and the `negroni_*` calls. No link.
 - `op10tool ctl poweroff`: tested on 127.0.0.1 only. No packet went to 192.168.7.2.
+
+## 0213: reboot mode sysctl
+
+Goal: a root process on the phone (the PowerMenu helper, `usbreboot`) selects the reboot reason.
+Before 0213 the 0211 restart path always wrote reason 0. The 0210 UDP command `bootloader` works
+only for frames from the computer on `ue0`.
+
+Files: `bsd/dev/negroni_reboot.c`, `iokit/Kernel/arm/NegroniPlatformExpert.cpp`. Made with
+`scripts/kernel/patched-tree.sh OUTDIR 0213` (all patches up to 0212), then `git diff HEAD`.
+0220-0261 apply on top without errors.
+
+### Sysctl
+
+`kern.negroni_reboot_mode`: `CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED`, `SYSCTL_PROC`.
+
+| Value | Reason (as 0210) |
+|---|---|
+| `normal` (default) | 0 |
+| `bootloader` | 2 (ABL fastboot) |
+| `fastboot` | 2 (same as `bootloader`) |
+| `recovery` | 1 |
+
+- Read: the current word (NUL-terminated). Each boot starts with `normal`.
+- Write: root only. `sysctl_root()` refuses a write from non-root (no `CTLFLAG_ANYBODY`,
+  `proc_suser()`), and the handler checks `proc_suser()` again (`EPERM`).
+- The handler accepts the word with or without the NUL and removes trailing `\n`, `\r`, space and
+  tab. An unknown word gives `EINVAL` and the mode does not change. A word of 16 bytes or more
+  gives `EINVAL` (`sysctl_io_string()`).
+- A write only stores the mode. It does not write the PMIC. Log:
+  `NEGRONI REBOOT: reboot mode bootloader (reason 2) for the next restart`.
+- The negroni MAC policies (0221-0223) have no sysctl hook.
+
+### Restart path
+
+`negroni_halt_restart(kPERestartCPU)` calls `negroni_restart()` instead of `negroni_reboot(0)`.
+`negroni_restart()` logs `NEGRONI REBOOT: reason <name>`, then `negroni_reboot(reason)`: the SDAM
+write of 0x7148 (0210/0211 code, read-back check), then PSCI `SYSTEM_RESET`. If the reason cannot
+be set, the reset is a plain one (`reason n not set, plain reset`).
+
+Not changed: halt / power off (`kPEHaltCPU`), the panic paths (`negronipanicreason`), the UDP
+commands (`reboot` still writes 0).
+
+Log of a "Reboot to Bootloader":
+
+```
+NEGRONI REBOOT: reboot mode bootloader (reason 2) for the next restart
+MACH Reboot
+NEGRONI: restart
+NEGRONI REBOOT: reason bootloader
+NEGRONI REBOOT: SDAM 0x7100 +0x48 0x00 -> 0x04
+NEGRONI REBOOT: reboot reason 2
+```
+
+### Userland
+
+- `userland/rebootapp/powermenu-helper.c` `bootloader`: writes `bootloader` with
+  `sysctlbyname()`, reads it back, `sync`, `reboot(RB_AUTOBOOT)`. Without the sysctl (old kernel):
+  exit 3, no reboot.
+- `userland/ssh/usbreboot.c`: `usbreboot bootloader|fastboot|recovery|normal` writes the same
+  sysctl (`fastboot` is sent as `bootloader`). No change was necessary.
+- From a root shell: `sysctl kern.negroni_reboot_mode=bootloader`, then `reboot`.
+
+### Verification done (0213, no phone)
+
+- `scripts/kernel/compile-one.sh` for `negroni_reboot.c`: OK. The only warning
+  (`negroni_panic_restart` could be `noreturn`) is from 0211. `nm` shows
+  `_sysctl__kern_negroni_reboot_mode`, its startup entry and `_negroni_restart`.
+- Full local build (`scripts/kernel/build-local.sh`, 2026-10-25): OK,
+  `out/kernel/local-20261025-122742/kernel.development.negroni` (sha256
+  `4bb9de5738152f07446cd9a63a0c911f989222e0cf708e2e4bcbb2d4f8481181`).
+  Patch report: `Applying 0213-negroni-reboot-mode.patch`, all 24 patches/xnu patches applied, no
+  02xx skipped (only dxb's own TrustCache/iobuffermemd/skywalk/syntax_checker, as before).
+  The kernel has the strings `negroni_reboot_mode` and `NEGRONI REBOOT: reason %s`.
+
+### How to test 0213 (phone)
+
+1. Boot a 0213 kernel. `sysctl kern.negroni_reboot_mode` (root) gives `normal`.
+2. As `mobile`, `sysctl kern.negroni_reboot_mode=bootloader` must fail (`Operation not
+   permitted`). An unknown word as root must fail (`Invalid argument`) and the value stays.
+3. `powermenu-helper check` (SSH root): `bootloader: kern.negroni_reboot_mode`, exit 0.
+4. The app button "Reboot to Bootloader": the log shows the lines above; the phone must stop in
+   ABL fastboot (`fastboot devices`). If Android boots: read the `SDAM` lines (same causes as the
+   0210 test step 5).
+5. Restart from the app (or `reboot` over SSH) without a mode: `reason normal`, a normal reset.

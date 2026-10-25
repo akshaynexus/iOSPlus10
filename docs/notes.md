@@ -717,3 +717,14 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   [I] Not yet proven on the phone: that fastbootd writes the DONT_CARE-heavy image of the full partition size.
 - `sudo scripts/ios16/root-update.sh IN.img OUT.img metal powermenu ...`: APFS clone of an existing root + only the named
   hooks (no DMG rebuild), stops if /var is not a symlink before or after the hooks.
+
+## 19. Reboot mode sysctl (2026-10-25, patch 0213; details: patches/xnu/README-reboot.md "0213")
+
+- [V] `kern.negroni_reboot_mode` (string, `CTLFLAG_RW | CTLFLAG_LOCKED`, root-only write): `normal` (default, 0),
+  `bootloader` / `fastboot` (2), `recovery` (1), the 0210 reason numbers. The 0211 `kPERestartCPU` path calls
+  `negroni_restart()`: log `NEGRONI REBOOT: reason <name>`, SDAM reason write, PSCI `SYSTEM_RESET`. Halt is unchanged.
+- [V] Local build OK: `out/kernel/local-20261025-122742/kernel.development.negroni`, 0213 applied, no 02xx skipped.
+- [V] `powermenu-helper bootloader` already wrote the sysctl and read it back; only comments changed. `usbreboot.c`
+  matches (no change). Old kernel: helper exit 3, no reboot.
+- [I] Not tested on the phone: root write from the setuid helper, and that ABL honours reason 2 after a
+  `reboot(RB_AUTOBOOT)` (the 0210 `bootloader` UDP command is the comparison).

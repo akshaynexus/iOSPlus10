@@ -1,0 +1,126 @@
+diff --git a/bsd/dev/negroni_reboot.c b/bsd/dev/negroni_reboot.c
+index b24c180..b0090f2 100644
+--- a/bsd/dev/negroni_reboot.c
++++ b/bsd/dev/negroni_reboot.c
+@@ -42,10 +42,19 @@
+  * negroni_reboot_prepare() maps everything early (NegroniPlatformExpert
+  * start), so the panic path needs no allocation. Callers: one at a time
+  * (the USB command server, the halt/restart path, the panic path).
++ *
++ * Reboot mode (0213): the string sysctl kern.negroni_reboot_mode
++ * (normal | bootloader | fastboot | recovery, default normal; write: root
++ * only) selects the reason of the next restart, negroni_restart() (the
++ * kPERestartCPU path of reboot(RB_AUTOBOOT)). Reasons as the 0210 UDP
++ * commands: normal 0, recovery 1, bootloader and fastboot 2.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <os/atomic_private.h>
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -56,6 +65,7 @@ void negroni_reboot_prepare(void);
+ int negroni_reboot_set_reason(unsigned reason);
+ void negroni_reboot_reset(void);
+ void negroni_reboot(unsigned reason);
++void negroni_restart(void);
+ void negroni_power_off(void);
+ void negroni_panic_restart(void);
+ void negroni_reboot_settle(unsigned ms);
+@@ -353,6 +363,62 @@ negroni_reboot(unsigned reason)
+ 	negroni_reboot_reset();
+ }
+ 
++/* kern.negroni_reboot_mode: the reason of the next restart (the same numbers as the 0210 commands). */
++static const struct {
++	const char *name;
++	unsigned    reason;
++} nr_modes[] = {
++	{ "normal", 0 },
++	{ "bootloader", 2 },
++	{ "fastboot", 2 },
++	{ "recovery", 1 },
++};
++static unsigned nr_mode;                        /* index into nr_modes, 0 = normal */
++
++static int
++nr_sysctl_reboot_mode(struct sysctl_oid *oidp __unused, void *arg1 __unused, int arg2 __unused,
++    struct sysctl_req *req)
++{
++	char buf[16];
++	int changed = 0;
++
++	/* sysctl_root() already refuses a write without CTLFLAG_ANYBODY from non-root; check again here. */
++	if (req->newptr != USER_ADDR_NULL && req->p != NULL && proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	strlcpy(buf, nr_modes[os_atomic_load(&nr_mode, relaxed)].name, sizeof(buf));
++	int error = sysctl_io_string(req, buf, sizeof(buf), 0, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	/* "bootloader", "bootloader\n" (echo), with or without the NUL */
++	size_t n = strlen(buf);
++	while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' ' || buf[n - 1] == '\t')) {
++		buf[--n] = '\0';
++	}
++	for (unsigned i = 0; i < sizeof(nr_modes) / sizeof(nr_modes[0]); i++) {
++		if (strcmp(buf, nr_modes[i].name) == 0) {
++			os_atomic_store(&nr_mode, i, relaxed);
++			printf("NEGRONI REBOOT: reboot mode %s (reason %u) for the next restart\n",
++			    nr_modes[i].name, nr_modes[i].reason);
++			return 0;
++		}
++	}
++	return EINVAL;                          /* unknown word: the mode does not change */
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, negroni_reboot_mode, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, nr_sysctl_reboot_mode, "A", "NEGRONI reboot mode: normal | bootloader | fastboot | recovery");
++
++/* Restart (kPERestartCPU): the reason of kern.negroni_reboot_mode (default normal = 0), then reset. */
++void
++negroni_restart(void)
++{
++	unsigned i = os_atomic_load(&nr_mode, relaxed);
++	printf("NEGRONI REBOOT: reason %s\n", nr_modes[i].name);
++	negroni_reboot(nr_modes[i].reason);
++}
++
+ /* PS_HOLD reset type = SHUTDOWN in PON_PBS. 0 = set, -1 = not set (logged). */
+ static int
+ nr_pon_shutdown_type(void)
+diff --git a/iokit/Kernel/arm/NegroniPlatformExpert.cpp b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+index 9f67282..924edb3 100644
+--- a/iokit/Kernel/arm/NegroniPlatformExpert.cpp
++++ b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+@@ -32,7 +32,8 @@ OSDefineMetaClassAndStructors(NegroniPlatformExpert, IODTPlatformExpert);
+  * PEHaltRestart(kPEHaltCPU)) and restart only printed "CPU halted" /
+  * "MACH Reboot" and spun; 30 s later "Halt/Restart Timed Out" panicked.
+  *   kPEHaltCPU          PSCI SYSTEM_OFF (boot-arg negronipoweroff)
+- *   kPERestartCPU       reboot reason cleared to normal, PSCI SYSTEM_RESET
++ *   kPERestartCPU       reboot reason of kern.negroni_reboot_mode (0213;
++ *                       default normal), PSCI SYSTEM_RESET
+  *   kPEPanicRestartCPU  panic text kept on the screen for negronipanic
+  *                       seconds (default 30), then reset
+  * kPEPanicBegin marks the panic; other types (panic callouts) do nothing.
+@@ -40,6 +41,7 @@ OSDefineMetaClassAndStructors(NegroniPlatformExpert, IODTPlatformExpert);
+ extern "C" {
+ void negroni_reboot_prepare(void);
+ void negroni_reboot(unsigned reason);
++void negroni_restart(void);
+ void negroni_power_off(void);
+ void negroni_panic_restart(void);
+ void negroni_reboot_settle(unsigned ms);
+@@ -68,7 +70,7 @@ negroni_halt_restart(unsigned int type)
+ 		}
+ 		IOLog("NEGRONI: restart\n");
+ 		negroni_reboot_settle(300);
+-		negroni_reboot(0);
++		negroni_restart();                      /* kern.negroni_reboot_mode (0213) */
+ 		return -1;
+ 	case kPEPanicRestartCPU:
+ 		negroni_panic_restart();                /* does not return */

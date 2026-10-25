@@ -12,10 +12,12 @@
  * The tool accepts exactly one of the four words. It reads no environment variable, opens no
  * file and starts no other program.
  *
- *   restart     sync, reboot(RB_AUTOBOOT)  (kernel 0211: reason 0, PSCI SYSTEM_RESET)
+ *   restart     sync, reboot(RB_AUTOBOOT)  (kernel 0211: reason of kern.negroni_reboot_mode,
+ *               default normal = 0, PSCI SYSTEM_RESET)
  *   shutdown    sync, reboot(RB_HALT)      (kernel 0211: negroni_power_off, PSCI SYSTEM_OFF)
- *   bootloader  set kern.negroni_reboot_mode (or kern.sweet_reboot_mode) = "bootloader", sync,
- *               reboot(RB_AUTOBOOT). If the kernel has no such sysctl: exit 3, no reboot.
+ *   bootloader  set kern.negroni_reboot_mode (or kern.sweet_reboot_mode) = "bootloader", read it
+ *               back, sync, reboot(RB_AUTOBOOT): kernel patch 0213 writes reason 2 (ABL fastboot).
+ *               If the kernel has no such sysctl (before 0213): exit 3, no reboot.
  *   check       caller check and kernel check only; prints the result, does not reboot.
  *
  * Exit codes: 0 check passed (bootloader supported) / 1 reboot(2) or sysctl failed /

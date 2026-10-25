@@ -43,22 +43,25 @@ job in `launchd.plist`, a process that runs all the time, a socket path in `/var
 A notify name cannot check the sender at all. The setuid helper is smaller and its caller check
 is the same.
 
-What the kernel does with each request (kernel `local-20261024-191117` has 0210 + 0211):
+What the kernel does with each request (0210 + 0211 since `local-20261024-191117`; 0213 adds the
+reboot mode):
 
 | Button | Helper | Kernel path |
 |---|---|---|
-| Restart | `sync`, `reboot(RB_AUTOBOOT)` | 0211 `kPERestartCPU`: reason 0, PSCI `SYSTEM_RESET` |
+| Restart | `sync`, `reboot(RB_AUTOBOOT)` | 0211 `kPERestartCPU`: reason of `kern.negroni_reboot_mode` (default normal = 0), PSCI `SYSTEM_RESET` |
 | Shut Down | `sync`, `reboot(RB_HALT)` | 0211 `kPEHaltCPU`: `negroni_power_off()`, PSCI `SYSTEM_OFF` |
-| Reboot to Bootloader | set `kern.negroni_reboot_mode=bootloader`, then as Restart | **not possible yet**: no kernel has this sysctl |
+| Reboot to Bootloader | set `kern.negroni_reboot_mode=bootloader`, read it back, then as Restart | 0213: `negroni_restart()` writes reason 2 (ABL fastboot), PSCI `SYSTEM_RESET` |
 
-Reboot to Bootloader: 0210 writes reason 2 (fastboot) only for the UDP command `bootloader`, and
-only for frames that arrive on `ue0` from 192.168.7.1. A process on the phone cannot reach it
-(its datagram to 192.168.7.2 goes through the loopback path, not the USB receive path). The 0211
-restart path always writes reason 0. So the helper exits with code 3 and the app shows a message
-(use Volume Up + Volume Down + Power, or `op10tool ctl bootloader` from the computer). It does not
-fall back to a normal restart. A small kernel patch (a root-only string sysctl
-`kern.negroni_reboot_mode` that `negroni_halt_restart(kPERestartCPU)` uses as the reason) makes
-the button work without a change here.
+Reboot to Bootloader needs a kernel with patch 0213 (`patches/xnu/README-reboot.md`, "0213").
+0213 adds the root-only string sysctl `kern.negroni_reboot_mode` (`normal`, `bootloader`,
+`fastboot`, `recovery`). The 0211 restart path uses its reason instead of 0 and logs
+`NEGRONI REBOOT: reason bootloader`. The helper writes `bootloader` with `sysctlbyname()`, reads
+the value back (a different value: exit 1, no reboot), then calls `sync` and `reboot(RB_AUTOBOOT)`.
+
+Older kernels (before 0213) have no such sysctl. Then the helper exits with code 3 and the app
+shows a message (use Volume Up + Volume Down + Power, or `op10tool ctl bootloader` from the
+computer). It does not fall back to a normal restart. (The 0210 UDP command `bootloader` is not
+a way for the phone itself: a process on the phone cannot reach the USB receive path.)
 
 `reboot(2)` is the direct path (as `usbreboot`): the kernel kills the processes, syncs and
 unmounts. Apps do not get a launchd-ordered shutdown.
@@ -98,4 +101,7 @@ Not run yet.
 3. Started by the app (uid mobile): the helper gets euid 0 and the parent path check passes.
    Test with the buttons. Over SSH as root, `powermenu-helper check` tests only the kernel side.
 4. Restart and Shut Down end in a reset / power off (0211 paths; `SYSTEM_OFF` is not tested yet).
-5. The first boot of a new root shows the icon. `pmregister` on a running phone.
+5. Reboot to Bootloader with a 0213 kernel: `powermenu-helper check` prints
+   `bootloader: kern.negroni_reboot_mode` (exit 0); the button ends in ABL fastboot
+   (`fastboot devices` shows the phone). Then `fastboot reboot` (the next reason is normal again).
+6. The first boot of a new root shows the icon. `pmregister` on a running phone.
