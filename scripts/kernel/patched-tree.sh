@@ -53,6 +53,7 @@ for f in "$DXB"/patches/*.patch; do
   case "$(basename "$f")" in [0-9][0-9][0-9][0-9]-*) ;; *) cp "$f" "$P/" ;; esac
 done
 cp "$SLOP"/*.patch "$SLOP"/*.sh "$P/"
+rm -f "$P"/0127-negroni-gpu-show.patch   # collides with our 0230; see build-local.sh
 cp "$REPO"/patches/xnu/*.patch "$P/" 2>/dev/null || true
 before() { [ -z "$UPTO" ] || [[ "$(basename "$1")" < "$UPTO" ]]; }
 

@@ -1,6 +1,6 @@
 name: negroni-xnu
 # xnu-8796.141.3 (iOS 16 era) for the OnePlus 10 Pro (MACHINE_CONFIG=NEGRONI):
-# darwin-xnu-build + the negroni port's patches (fetched from MellysInformejtik/slop at SLOP_SHA)
+# darwin-xnu-build + the negroni port's patches (fetched from akshaynexus/slop (our fork; 4a754c1 merges MellysInformejtik main) at SLOP_SHA)
 # + this repo's patches/ (iOSPlus10, 0200-...). Same build recipe as slop's negroni-ios.yml.
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ concurrency:
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
-  SLOP_REPO: https://github.com/MellysInformejtik/slop
+  SLOP_REPO: https://github.com/akshaynexus/slop
   MACOS_VERSION: "13.5"
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: NEGRONI
@@ -34,6 +34,7 @@ jobs:
           git init -q dxb && git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA" && git -C dxb checkout -q FETCH_HEAD
           git init -q slop && git -C slop fetch -q --depth 1 "$SLOP_REPO" "$SLOP_SHA" && git -C slop checkout -q FETCH_HEAD
           cp slop/negroni-ios/xnu/patches/*.patch slop/negroni-ios/xnu/patches/*.sh dxb/patches/
+          rm -f dxb/patches/0127-negroni-gpu-show.patch   # collides with our 0230 present path
           cp patches/*.patch dxb/patches/ 2>/dev/null || true
           # libfirehose_kernel is built arm64e-only; the NEGRONI kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh

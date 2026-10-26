@@ -40,6 +40,8 @@ fi
 # dxb's own patches have names without a number)
 rm -f "$W"/dxb/patches/[0-9][0-9][0-9][0-9]-*.patch "$W"/dxb/patches/[0-9][0-9][0-9][0-9]-*.sh
 cp "$EXT"/slop/negroni-ios/xnu/patches/*.patch "$EXT"/slop/negroni-ios/xnu/patches/*.sh "$W/dxb/patches/"
+# slop 0127 (gpu-show, selector 0x7f) collides with our 0230 present path; our 0231/0234 replace it
+rm -f "$W"/dxb/patches/0127-negroni-gpu-show.patch
 cp "$REPO"/patches/xnu/*.patch "$W/dxb/patches/" 2>/dev/null || true
 echo "slop $(git -C "$EXT/slop" rev-parse --short HEAD), $(ls "$REPO"/patches/xnu/*.patch | wc -l | tr -d ' ') patches/xnu"
 # every run patches a fresh xnu copy (the port's stage scripts refuse to run twice on one tree);
