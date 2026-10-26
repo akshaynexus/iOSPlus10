@@ -15,7 +15,7 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$IN" ] || { echo "missing $IN" >&2; exit 1; }
 [ ! -e "$OUT" ] || { echo "refusing to overwrite $OUT" >&2; exit 1; }
 for h in "$@"; do
-  case $h in metal|powermenu|negronigl|audio|ssh|haptics|bt|tweaks) ;; *) echo "unknown hook $h" >&2; exit 1 ;; esac
+  case $h in metal|powermenu|negronigl|audio|ssh|haptics|bt|camera|fpd|tweaks) ;; *) echo "unknown hook $h" >&2; exit 1 ;; esac
 done
 
 cp -c "$IN" "$OUT"                    # APFS clone: shares blocks with IN until written
