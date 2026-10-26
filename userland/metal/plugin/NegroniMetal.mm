@@ -128,6 +128,33 @@ __attribute__((constructor)) static void nmtl_error_mode(void)
 		set(t, 5);
 }
 
+/*
+ * An uncaught Objective-C exception in a Metal process ends in abort() (sig 6) and the extension's stderr never reaches
+ * the kernel log (AegirPoster: 4 aborts right after the device opened, 2026-10-26, no text). This handler logs the
+ * exception's name, reason and first frames through nlog, then calls the handler that was installed before it.
+ */
+static NSUncaughtExceptionHandler *g_prev_exception_handler;
+static void log_uncaught_exception(NSException *ex)
+{
+	@autoreleasepool {
+		nlog("uncaught exception %s: %s", ex.name.UTF8String ?: "?", ex.reason.UTF8String ?: "?");
+		NSArray *frames = ex.callStackSymbols;
+		NSUInteger n = frames.count < 10 ? frames.count : 10;
+		for (NSUInteger i = 0; i < n; i++)
+			nlog("  %s", [frames[i] UTF8String]);
+	}
+	if (g_prev_exception_handler)
+		g_prev_exception_handler(ex);
+}
+static void install_exception_log(void)
+{
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		g_prev_exception_handler = NSGetUncaughtExceptionHandler();
+		NSSetUncaughtExceptionHandler(log_uncaught_exception);
+	});
+}
+
 /* Selectors the frontend lacks, each logged once (then the usual unrecognised-selector exception follows). */
 static void missing(const char *cls, const char *sel)
 {
@@ -928,9 +955,10 @@ static void watchdog_start(void)
 			nlog("device %s in %.0f ms (turnip %s, cache %s, self-test %s)%s%s",
 			     device ? [[device name] UTF8String] : "refused", ms, turnip.UTF8String, cache,
 			     test ? "on" : "off", job.why ? ": " : "", job.why ? job.why.UTF8String : "");
-		if (device)
+		if (device) {
 			deadman_mark(strike, "device opened");
-		else if (timed_out)
+			install_exception_log();
+		} else if (timed_out)
 			deadman_mark(strike, "device open hangs");
 		else
 			deadman_refused(strike);

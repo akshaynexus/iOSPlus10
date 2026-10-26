@@ -1,0 +1,97 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (on top of flame/0001-0011), applied by scripts/metal/fetch-sources.sh:
+Metal protocol conformance for the frontend's objects.
+MetalPerformanceShaders (20H392 MPSCore) asks `conformsToProtocol:@protocol(MTLCommandBuffer)` in
+-[MPSCommandBufferImageCache initWithCommandBuffer:computeEncoder:], logs "commandBuffer does not conform to the
+MTLCommandBuffer protocol" and answers nil on NO; MPSAutoCache's constructor then dereferences the nil: SpringBoard
+-[SUICOrbView _drawSiriFrame:] SIGSEGV far 0x18 (2026-10-26 13:24:43, the Siri orb). The NB* classes implement the
+selectors one by one and never declared the protocols (NBFunction and NBArgumentEncoder did). This change adopts the public
+protocol of every frontend class at run time (class_addProtocol, next to the MTLTextureImplementation adoption):
+MTLBuffer, MTLTexture, MTLLibrary, MTLComputePipelineState, MTLRenderPipelineState, MTLSamplerState, MTLDepthStencilState,
+MTLEvent, MTLSharedEvent, MTLFence, MTLCommandQueue, MTLCommandBuffer, MTLHeap, MTLCommandEncoder,
+MTLComputeCommandEncoder, MTLRenderCommandEncoder, MTLBlitCommandEncoder, MTLBinaryArchive, MTLArgumentEncoder, MTLFunction.
+Log line: `native-metal: Metal protocols adopted by N of 20 frontend classes`.
+With the protocol accepted, MPS goes on to the device's heap placement sizes (MPSTemporaryImage) and three compute-encoder
+selectors the frontend lacked: the host test raised `-[NativeBridgeMetalDevice heapTextureSizeAndAlignWithDescriptor:]:
+unrecognized selector`. Added: heapTextureSizeAndAlignWithDescriptor: / heapBufferSizeAndAlignWithLength:options: /
+heapAccelerationStructureSizeAndAlignWithSize: (an estimate: linear bytes-per-row from the runtime, every level, slice and
+sample, 16 KiB aligned; placement itself is checked by nmb_heap_new_texture/buffer), and the no-ops
+memoryBarrierWithResources:count:, setImageblockWidth:height:, setStageInRegion: on the compute encoder. Selector gaps still go through
+doesNotRecognizeSelector: (MISSING line, then the exception). Host test: scripts/metal/host-plugin-test.sh case `mps`.
+
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index 6b02073..19440f5 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -829,6 +829,11 @@ - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)b indirectBufferOf
+   noteSkipped([@"dispatchThreadgroupsWithIndirectBuffer: " stringByAppendingString:lastError()],true);
+ }
+ - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
++// NegroniMetal (flame/0012): MetalPerformanceShaders (20H392 MPSCore selector references) also sends these three; the runtime
++// orders compute work itself (a barrier is a no-op here, like memoryBarrierWithScope:), has no imageblocks and no stage-in region.
++- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count {(void)resources;(void)count;}
++- (void)setImageblockWidth:(NSUInteger)width height:(NSUInteger)height {(void)width;(void)height;}
++- (void)setStageInRegion:(MTLRegion)region {(void)region;}
+ @end
+ 
+ @interface NBRenderEncoder : NBEncoder {
+@@ -1819,6 +1824,32 @@ - (void)doesNotRecognizeSelector:(SEL)selector {
+  if(!handle){NBLOG(@"native-metal: heap refused: %@",lastError());return nil;}
+  NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;return (id<MTLHeap>)heap;
+ }
++// NegroniMetal (flame/0012): heap placement sizes. MetalPerformanceShaders sizes its temporary images and buffers with these
++// (MPSTemporaryImage, after the protocol check); a missing answer raised an unrecognized-selector exception in the caller. The
++// runtime has no placement query, so the answer is an estimate: a linear layout from the runtime's bytes-per-row (4 bytes per
++// pixel when it refuses the format), every level, slice and sample added, aligned to 16 KiB (the kernel's page). An
++// over-estimate only costs heap space; placement itself goes through nmb_heap_new_texture/buffer, which check for real.
++- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d {
++ const NSUInteger align=16384;
++ if(!d)return (MTLSizeAndAlign){align,align};
++ uint64_t total=0,w=d.width?:1,h=d.height?:1,depth=d.depth?:1;
++ const uint64_t slices=(d.arrayLength?:1)*(d.textureType==MTLTextureTypeCube||d.textureType==MTLTextureTypeCubeArray?6:1);
++ const uint64_t levels=d.mipmapLevelCount?:1,samples=d.sampleCount?:1;
++ for(uint64_t level=0;level<levels;level++){
++  uint64_t row=gDevice?nmb_device_linear_bytes_per_row(gDevice,(uint64_t)d.pixelFormat,w):0;
++  if(!row)row=w*4;
++  total+=row*h*depth*samples;
++  w=w>1?w/2:1;h=h>1?h/2:1;depth=depth>1?depth/2:1;}
++ total*=slices;
++ return (MTLSizeAndAlign){(NSUInteger)((total+align-1)/align*align),align};
++}
++- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
++ (void)options;const NSUInteger align=16384;
++ return (MTLSizeAndAlign){(length+align-1)/align*align?:align,align};
++}
++- (MTLSizeAndAlign)heapAccelerationStructureSizeAndAlignWithSize:(NSUInteger)size {
++ const NSUInteger align=16384;return (MTLSizeAndAlign){(size+align-1)/align*align?:align,align};
++}
+ - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources count:(NSUInteger)count {
+  NBResourceGroup *group=[NBResourceGroup new];
+  NSMutableArray *held=[NSMutableArray arrayWithCapacity:count];
+@@ -2306,6 +2337,27 @@ static void installAnswers(Class cls) {
+  // MTLTextureImplementation." on every miss (~600 lines/s from backboardd while scrolling).
+  {Protocol *tp=objc_getProtocol("MTLTextureImplementation");if(tp)class_addProtocol([NBTexture class],tp);
+   NBLOG(@"native-metal: MTLTextureImplementation %s",tp?([NBTexture conformsToProtocol:tp]?"adopted":"not adopted"):"missing");}
++ // NegroniMetal (flame/0012): the public Metal protocols. MetalPerformanceShaders (20H392 MPSCore) asks
++ // `conformsToProtocol:@protocol(MTLCommandBuffer)` in -[MPSCommandBufferImageCache initWithCommandBuffer:computeEncoder:],
++ // answers nil on NO, and MPSAutoCache's constructor then dereferences the nil (SpringBoard -[SUICOrbView _drawSiriFrame:],
++ // SIGSEGV far 0x18, 2026-10-26). The classes implement the selectors one by one (doesNotRecognizeSelector: reports a gap), so
++ // conformance is declared here at run time, not in the @interface (no compile-time audit of the long protocols).
++ // @protocol() literals, not objc_getProtocol(name): the runtime only knows a protocol some loaded image references, and 20H392
++ // Metal registers MTLCommandBuffer but not MTLCommandQueue, MTLHeap or the encoder protocols (metalprobe: 15 of 20 by name).
++ {struct{Class cls;Protocol *proto;}adopt[]={
++   {[NBBuffer class],@protocol(MTLBuffer)},{[NBTexture class],@protocol(MTLTexture)},{[NBLibrary class],@protocol(MTLLibrary)},
++   {[NBComputePipeline class],@protocol(MTLComputePipelineState)},{[NBRenderPipeline class],@protocol(MTLRenderPipelineState)},
++   {[NBSampler class],@protocol(MTLSamplerState)},{[NBDepthStencil class],@protocol(MTLDepthStencilState)},
++   {[NBEvent class],@protocol(MTLEvent)},{[NBSharedEvent class],@protocol(MTLSharedEvent)},{[NBFence class],@protocol(MTLFence)},
++   {[NBQueue class],@protocol(MTLCommandQueue)},{[NBCommandBuffer class],@protocol(MTLCommandBuffer)},{[NBHeap class],@protocol(MTLHeap)},
++   {[NBEncoder class],@protocol(MTLCommandEncoder)},{[NBComputeEncoder class],@protocol(MTLComputeCommandEncoder)},
++   {[NBRenderEncoder class],@protocol(MTLRenderCommandEncoder)},{[NBBlitEncoder class],@protocol(MTLBlitCommandEncoder)},
++   {[NBBinaryArchive class],@protocol(MTLBinaryArchive)},{[NBArgumentEncoder class],@protocol(MTLArgumentEncoder)},{[NBFunction class],@protocol(MTLFunction)}};
++  unsigned adopted=0;
++  for(size_t i=0;i<sizeof adopt/sizeof adopt[0];i++){
++   if(!class_conformsToProtocol(adopt[i].cls,adopt[i].proto))class_addProtocol(adopt[i].cls,adopt[i].proto);
++   if([adopt[i].cls conformsToProtocol:adopt[i].proto])adopted++;}
++  NBLOG(@"native-metal: Metal protocols adopted by %u of %zu frontend classes",adopted,sizeof adopt/sizeof adopt[0]);}
+  objc_registerClassPair(cls);
+  gDeviceObject=[cls new];
+  return gDeviceObject;

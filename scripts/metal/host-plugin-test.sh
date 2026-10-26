@@ -19,7 +19,7 @@ xcrun --sdk macosx clang++ -arch arm64 -mmacosx-version-min=14.0 -isysroot "$SDK
   -Wall -Wno-deprecated-declarations -Wno-unused-function -DNMTL_HOST_TEST=1 -DNMTL_DIR="\"$W/nmtl\"" -I"$FRONT" -I"$METAL/plugin" \
   "$METAL/plugin/NegroniMetal.mm" "$FRONT/NativeBridgeMetalFrontend.mm" "$METAL/tests/host-plugin-test.mm" "$BR" \
   -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation \
-  -framework Security -framework QuartzCore -lc++ -o "$W/host-plugin-test"
+  -framework Security -framework QuartzCore -framework MetalPerformanceShaders -lc++ -o "$W/host-plugin-test"
 N=$W/nmtl
 T=$W/host-plugin-test
 fails=0
@@ -45,6 +45,8 @@ run deadman
 rm -rf "$N/strikes"; rm -f "$N/clients"; echo "host-plugin-test" > "$B/clients.local"; run device
 # flame/0011: MSL source in this process (the host GPUCompiler), argument buffers, indirect dispatch
 rm -rf "$N/strikes"; run msl
+# flame/0012: Metal protocol conformance (MetalPerformanceShaders checks it), then an MPS blur through the device
+rm -rf "$N/strikes"; run mps
 # GPU watchdog: a command buffer that never completes marks the GPU lost; the next process gets no device
 rm -rf "$N/strikes"
 NEGRONIMETAL_WATCHDOG=1 NEGRONIMETAL_WATCHDOG_S=1 NMTL_HOST_MARKER=$N/strikes/gpu-lost run watchdog

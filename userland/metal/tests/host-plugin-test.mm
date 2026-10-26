@@ -3,7 +3,9 @@
  * the plugin + frontend + the bridge built for aarch64-apple-darwin, MoltenVK in place of Turnip, the gate directory in
  * a scratch folder (NMTL_DIR) and the bundle's control files in another (NMTL_HOST_BUNDLE). One case per process, because
  * the plugin opens its device once (dispatch_once):
- *   host-plugin-test CASE      CASE = device | msl | unlisted | off | bundleoff | blocked | nogpu | timeout | deadman | watchdog | lost
+ *   host-plugin-test CASE      CASE = device | msl | mps | unlisted | off | bundleoff | blocked | nogpu | timeout | deadman | watchdog | lost
+ * mps (flame/0012): the frontend's objects conform to the public Metal protocols (MetalPerformanceShaders checks the command
+ * buffer and dereferences nil otherwise); then an MPSImageGaussianBlur through the device.
  * msl (flame/0011): MSL source through Apple's front end in this process (GPUCompiler.framework on macOS), a kernel that reads and writes
  * through an argument buffer (newArgumentEncoderWithBufferIndex:, useResource:), newArgumentEncoderWithArguments:, an indirect dispatch,
  * and a compile error that answers nil + the compiler's text.
@@ -14,6 +16,7 @@
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -230,6 +233,52 @@ static NSString *check_msl(id<MTLDevice> d)
 	return nil;
 }
 
+/*
+ * flame/0012: the frontend's objects answer conformsToProtocol: for the public Metal protocols. MetalPerformanceShaders
+ * (20H392 MPSCore) refuses a command buffer that does not, answers nil and SpringBoard's Siri orb then crashes on the nil.
+ * Then an MPSImageGaussianBlur through the device (the host MPS on MoltenVK): a pass is the conformance; the blur's
+ * outcome is printed (its kernels are Apple-GPU AIR that metal2vulkan may refuse) and only an exception fails the case.
+ */
+static NSString *check_mps(id d)
+{
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:16 height:16 mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+	td.storageMode = MTLStorageModeShared;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	id<MTLBuffer> b = [d newBufferWithLength:256 options:MTLResourceStorageModeShared];
+	struct { id obj; Protocol *proto; const char *name; } checks[] = {
+		{ q, @protocol(MTLCommandQueue), "MTLCommandQueue" }, { cb, @protocol(MTLCommandBuffer), "MTLCommandBuffer" },
+		{ ce, @protocol(MTLComputeCommandEncoder), "MTLComputeCommandEncoder" }, { ce, @protocol(MTLCommandEncoder), "MTLCommandEncoder" },
+		{ t, @protocol(MTLTexture), "MTLTexture" }, { t, @protocol(MTLResource), "MTLResource" }, { b, @protocol(MTLBuffer), "MTLBuffer" },
+	};
+	for (auto &c : checks) {
+		if (!c.obj)
+			return [NSString stringWithFormat:@"no object for %s", c.name];
+		if (![c.obj conformsToProtocol:c.proto])
+			return [NSString stringWithFormat:@"%s (%s) does not conform to %s", class_getName(object_getClass(c.obj)), c.name, c.name];
+	}
+	[ce endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	printf("mps: %zu objects conform to their Metal protocols\n", sizeof checks / sizeof checks[0]);
+	@try {
+		MPSImageGaussianBlur *blur = [[MPSImageGaussianBlur alloc] initWithDevice:d sigma:2.0f];
+		id<MTLTexture> dst = [d newTextureWithDescriptor:td];
+		id<MTLCommandBuffer> cb2 = [q commandBuffer];
+		[blur encodeToCommandBuffer:cb2 sourceTexture:t destinationTexture:dst];
+		[cb2 commit];
+		[cb2 waitUntilCompleted];
+		printf("mps: MPSImageGaussianBlur encoded, command buffer status %ld%s%s\n", (long)cb2.status, cb2.error ? ": " : "",
+		       cb2.error ? cb2.error.localizedDescription.UTF8String : "");
+	} @catch (NSException *ex) {
+		return [NSString stringWithFormat:@"MPSImageGaussianBlur raised %@: %@", ex.name, ex.reason];
+	}
+	return nil;
+}
+
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
@@ -247,7 +296,7 @@ int main(int argc, char **argv)
 		id d = [[cls alloc] initWithAcceleratorPort:0];
 		double ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6;
 		printf("case %s: device %s in %.0f ms\n", c, d ? [[d name] UTF8String] : "nil", ms);
-		bool wants = !strcmp(c, "device") || !strcmp(c, "msl") || !strcmp(c, "watchdog");
+		bool wants = !strcmp(c, "device") || !strcmp(c, "msl") || !strcmp(c, "mps") || !strcmp(c, "watchdog");
 		if (wants) {
 			if (!d)
 				return fail(c, @"no device");
@@ -270,6 +319,9 @@ int main(int argc, char **argv)
 				return fail(c, why);
 		if (!strcmp(c, "msl"))
 			if (NSString *why = check_msl(d))
+				return fail(c, why);
+		if (!strcmp(c, "mps"))
+			if (NSString *why = check_mps(d))
 				return fail(c, why);
 		if (!strcmp(c, "watchdog")) {
 			/* NEGRONIMETAL_WATCHDOG=1 NEGRONIMETAL_WATCHDOG_S=1 (the script sets them): a stuck command buffer trips it */

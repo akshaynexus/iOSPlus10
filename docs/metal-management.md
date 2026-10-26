@@ -94,6 +94,13 @@ Every refused buffer, texture, library, render or compute pipeline is logged onc
 options 0: `buffer length N options 0x1 (made again with options 0x0): <first reason>`. The plugin's MPS line
 `MPS feature flags = NO (NegroniMetal A730 answer): ...` lists the MetalPerformanceShaders feature selectors answered NO.
 
+### Protocol conformance and uncaught exceptions (flame/0012, 2026-10-26)
+At device creation the frontend adopts the 20 public Metal protocols for its classes and logs `native-metal: Metal protocols
+adopted by 20 of 20 frontend classes`. MetalPerformanceShaders checks `conformsToProtocol:@protocol(MTLCommandBuffer)` and
+crashed SpringBoard (Siri orb) on the nil it answered before. In a process with a device, an uncaught Objective-C exception is
+logged before the abort: `uncaught exception NAME: REASON` plus up to 10 frames (the extensions' stderr never reaches the
+kernel log).
+
 ### Real-Time Driver Log
 Inspect live driver initialization, frame presentation, and device answers:
 
