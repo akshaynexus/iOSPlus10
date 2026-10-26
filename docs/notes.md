@@ -2512,6 +2512,19 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - [V] Kernel out/kernel/local-20261026-213256 (sha256 80017d10...3d141c5e) has 0325 (rework) + 0326-0329 with 0249/0297/0363:
   257 patches applied, only the 4 dxb skips; kernel.macho points to it. objdump: negroni_wlan_smmu_on calls
   negroni_mmio_try_rd32 5 times and negroni_mmio_try_wr32 3 times (scan reads, claim writes and read-backs).
+- [V] Phone t6 (kernel local-20261026-214005, negroniwlan_smmu=3): the stage-1 claim works under Gunyah (context 6,
+  SMR6 0x80011c00, pool IOVA 0xa0000000); BHI SBL (512 KiB at 0xa0010000) done at once; then MHISTATUS 0 / EE 0 for 10 s,
+  no SMMU fault (FSR 0, sGFSR 0). MHI VER reads 0xdeadbeef in PBL. Cause not known yet.
+- 0339 (renamed from 0337: the number was taken by BT meanwhile) dumps the cnss2 boot registers (BHI all, PBL logging,
+  SBL log pointer, PBL boot cfg/bootstrap status, WLAON power status, scratch, PBL/SBL log SRAM) before the doorbell, after
+  BHI DONE, every 3 s while waiting for READY (now 30 s) and at the time-out; the SBL image's ELF magic through the NC view.
+- Review fixes (Opus REJECT -> fixed): 0325 claim order/skip list/TLBSTATUS/-2/SMR reuse/TLB sync results; 0328 D1-D7
+  (link-desc alignment, buffer ownership + repost list, aligned HW pointers, pdev id 0, REO PN check, decrypted-only
+  after keys, soft data-path failure) + PEER_UNMAP/queue/state notes; 0329 W1-W4 (KRACK: no re-install, TPTK, GTK 16
+  bytes idx 1..3, failed rekey -> down) + INSTALL bit, beacon RSN in message 3, key-complete match, MIC by pointer.
+  [V] adapted HakiOS wpa-test on the changed port: 231 checks, 0 failed.
+- [V] Kernel out/kernel/local-20261026-215923 (sha256 ba34cb32...1c669e): 263 patches applied, only the 4 dxb skips; it
+  was built with the patch still named 0337 (same content; only comments now say 0339); kernel.macho points to it.
 
 ## 38. Camera + audio DMA addressing, iOS camera stream (2026-10-27, kernel agent; patches 0249, 0317, 0318; details: patches/xnu/README-camera.md "0317, 0318 and 0249", plan docs/camera-ios-2026-10-27.md)
 
@@ -2799,11 +2812,17 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   No userdata reflash is needed: the area is in today's DONT_CARE space and the kernel formats it.
 - Host test [V]: `tools/op10tool/tests/bootlog-test.sh` (fake area: panic / clean / wrapped ring / bad CRC; and the
   UDP path against a fake server with 10 % datagram loss: same text).
-- Build [V]: out/kernel/local-20261026-213526/kernel.development.negroni sha256
-  48ba234debdfb15c70f1d8802bb00883e0303634b5f5937c86707da50674b9ed (258 applied incl. 0367; only the 4 dxb skips;
-  link out/kernel/kernel.macho); strings show the NEGRONI BOOTLOG lines, NEGRBLOG/NEGRBOOT, negronibootlog,
-  `bootlog read`. op10tool rebuilt (out/bin/op10tool: `bootlog`, `ctl bootlog`). Not run on the phone; no image.
-- Next (owner): boot image with this kernel (no boot-arg change), then the test in README-bootlog.md: boot,
+- First build: out/kernel/local-20261026-213526 (48ba234d...), superseded by the review build below.
+- Opus review: ACCEPT with conditions, all applied: F1 wear budget (1 s only in the first 5 min, then 5 s; > 256 KiB
+  in 10 s -> 10 s; idle heartbeat 30 s), F2 layout anchor before the gate opens (`NEGRWLAN` at N-19457 or our
+  superblock), F3 gate closed on every setup error, F4 static asserts for 28673/9216/8201, F5 panic write only if
+  the UFS lock is free or `ufsrw` is off, F6 write-areas.sh checks HFS+ end <= N-28673, F7 NUL-terminated header
+  strings; new slot headers zeroed with a new superblock; pure checks in `bsd/dev/negroni_bootlog_core.h`, host test
+  `scripts/kernel/test-bootlog-core.sh` [V] 65 checks, 0 failed. slop's tools/negroni-log-pull.sh (SWEETLOG) is
+  obsolete for kernels with 0367.
+- Owner policy: with 0367 the kernel writes userdata on every boot without `ufsrw=1` (the gated area only).
+  Test images keep `negronilog=0` until the owner accepts this.
+- Next (owner): boot image with the review build (no boot-arg change), then the test in README-bootlog.md: boot,
   `op10tool ctl bootlog`, `op10tool ctl panic`, `op10tool ctl reboot`, after the next boot `make bootlog`.
 - Review fixes (Opus ACCEPT, F1-F4 + N2) and readable probe: 0297 `.alt_entry` on the instruction labels; helper
   report/fsr/ON lines through the refusable accessors; SCTLR only after the claim; probe-REFUSED/CHANGED banks skipped.
@@ -2827,3 +2846,81 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   Gunyah on bank 6 (`SMMU context 6 claimed ... now CBAR 0x1f300 CBA2R 0x1`, SMR6 0x80011c00 -> S2CR6 6, Wi-Fi
   stream 0x1c01 through context 6, IOVA 0xa0000000+, no context or global fault). BHI SBL (512 KiB at IOVA
   0xa0010000) written; then MHI never READY (MHISTATUS 0, EE 0) in 10 s: next is the BHI status/errcode readout.
+
+## 48. USB lost 2-3 s after ADSP up: the ADSP charger firmware owns the HS PHY during its port detection; VOOC HLOS side (2026-10-27, kernel agent; patches 0368, 0369; details patches/xnu/README-usb.md "0368", README-battery.md sections 14-15)
+
+- [V] logs/usblog-20261026-233816.txt 02:42:20 and 02:55:44: the Mac loses the phone 2-3 s after `THE ADSP IS UP`, no
+  device at all, also with 0366. [V] The ADSP image (`out/firmware/adsp/adsp.b14` strings) has `usb_hs_phy_reset`,
+  `usb_hs_phy_set_nondrive_mode`, `usb_hs_phy_toggle_dp`, `usb_hs_phy_dp_high`, `usb_hs_phy_dp_default_state`,
+  `usb_hs_phy_enable_clkref` on `gcc_eusb3_0_clkref_en` = our PHY's ref_clk (live.dts hsphy clocks `<0x23 0x1f>`,
+  GCC id 31, GCC + 0x9c00c), next to its APSD/BC1.2 and VOOC code. [V] negroni_usb.c never set the PHY up; Android
+  starts the gadget after the ADSP and runs the PHY init on each role change. [I] Cause: the ADSP's detection leaves the
+  PHY reset / non-driving / without ref clock. No GLINK message to prevent it is known.
+- 0368: PHY baseline at gadget start, change log (10 ms samples from ADSP start to up + 10 s), repair = soft reconnect
+  with ref clock on + GCC_QUSB2PHY_PRIM_BCR reset (GCC + 0x22000) + Linux qcom_snps_hsphy_init sequence (baseline
+  FSEL/REFCLK/overrides); every 0366 reconnect after an ADSP start also re-inits the PHY. Boot-args
+  `negroniusb_phyfix=0|1|2`, `negroniusb_phyfix_ms`. Also: every PMIC_RTR_ADSP_APPS message logged for 10 s.
+- 0369: VOOC/SuperVOOC HLOS side (enable policy, PMIC park on 0x52, status decode 0x48, 0x59 answer, 8.5 s recovery,
+  MATCH_TEMP, telemetry). Default `negronichg_vooc=0` = USB_VOOCPHY_ENABLE 0 (plain charging); `=1` = allowed for a DCP
+  at 12.0-43.0 C without thermal limit.
+- Build [V]: out/kernel/local-20261026-214742/kernel.development.negroni sha256
+  4eef13848fb7b4e334b4036fb7f019762c2165488706c7028fc115b6993958b9 (260 applied incl. 0368, 0369; only the 4 dxb
+  skips; link out/kernel/kernel.macho). Not booted; no image.
+- Next: RAM boot with `negroniadsp=1 ... negronichg_glink=1` (VOOC off): expect the `PHY change` lines at the ADSP
+  start, then `soft reconnect ...: the PHY differs from the reference`, `PHY re-init #1`, the device back on the Mac.
+  Then (separately) `negronichg_vooc=1` with the SuperVOOC adapter (README-battery.md section 15 test).
+
+## 49. Widgets: 64 MiB jetsam limit + Metal for widgets; zero blocks flashed as DONT_CARE damage 112 root files (2026-10-27 03:05-03:25, Metal agent; details docs/metal-widgets-2026-10-27.md sections 5-7)
+
+- [V] The 30 MiB widget limit: com.apple.jetsamproperties.D22.plist (+ .D221, uname -m iPhone10,3) Version4 > Extension >
+  Override > com.apple.widgetkit-extension {ActiveHardMemoryLimit 30, InactiveHardMemoryLimit 30}, read once by
+  runningboardd (RBJetsamPropertyManager). Now 64/64: scripts/ios16/jetsam_widgets.py, root-tweaks-extra.py step 6
+  (WIDGET_JETSAM_MB, default 64), live scripts/metal/phone-widget-jetsam.sh (kill -9 runningboardd re-reads it; no
+  launchctl on the phone; SpringBoard survives). memlimit.sh shows 64/64 for every widget extension.
+- [V] Plugin memory_rule: the widgetkit clause is removed, only `limit < NEGRONIMETAL_MIN_LIMIT_MB` (40) is left (the
+  value in section 35 that says 48 is wrong: the code default is 40). After respring 03:18:20: FitnessWidget opens the
+  device (759 ms, first frame 275 ms later, 11.5 MiB footprint) and did not crash; it logs `render pipeline skipped:
+  nil render pipeline` (VFX rings pipeline not built by m2v; a Metal item, not a crash).
+- [V] ROOT CAUSE of SleepWidgetExtension/SafariLinkExtension sig 11 + cs_invalid_page: `op10tool img2simg` wrote APFS
+  holes of ios16-root.img as DONT_CARE, also where the HFS+ volume uses the block (zero file data). The flash left old
+  userdata bytes there: 20296 blocks / 79 MiB / 112 files, including dyld_shared_cache_arm64.07/.21/.42 (both copies).
+  SleepWidgetExtension's zero __DATA page holds old bytes on the phone; its crash address is those bytes. Fixed in
+  tools/op10tool/src/img2simg.rs (`hfs_allocated`: allocated hole blocks -> FILL 0). **Rebuild op10tool and the simg
+  before the next root flash.** Live proof: SleepWidgetExtension replaced from the image (bad copy in
+  /var/root/SleepWidgetExtension.bad) runs without crash.
+- [V] Phone note: a push that is not followed by `sync` is lost on a reset some seconds later (HFS journal); phone-test.sh
+  push now syncs.
+- 0367 review build [V]: out/kernel/local-20261026-215004/kernel.development.negroni sha256
+  8793f10ae9727a8fc7487c7e17791db21e8d58949156117a9999e7579e53730c (260 applied, 0367 then 0368 and 0369 on top;
+  only the 4 dxb skips; link out/kernel/kernel.macho). Strings: anchor / `layout not proven` / `UFS busy at the
+  panic` / budget lines. Only warning kinds of the old code (-Wshadow on a local `total`, as at the old flush). Not booted; no image.
+- 0337 (2026-10-27, kernel agent): bluetoothd restarted with reason 3602 (ANTENNA_PREF_B "timedout waiting for
+  controller"). Cause [V, disassembly]: `_BCM_ByteStreamEventParser` drops a vendor answer that has fewer than
+  2 data bytes, so the command never completes. Now every local vendor answer carries 8 bytes (sub-opcode echo +
+  zeros), and 0xfd3c/0xfce9/0xfce2/0xfd48/0xfd47 get status 0. 0x2007 status 0x0c becomes 0 (0 dBm). 0x0c6d now goes
+  to the chip with Simultaneous_LE_Host = 0. Kernel out/kernel/local-20261026-215458 sha256 b5db26ba...
+- Phone t8 (03:19-03:20, kernel local-20261026-214742, main session) [V]: PHY at the ADSP start / ADSP up = baseline, no
+  PHY change, no repair; the drop came 2 s after `glink: start`. The PHY cause is NOT confirmed; the drop follows our
+  charger GLINK traffic. [I] Candidates: 1.5 A input limit on a Mac host port (stock: SDP 500 mA; macOS cuts an
+  overcurrent port = "no USB device at all"), or the usb 13 (VOOC PHY enable) write. 0370: ICL per adapter type as stock
+  (SDP 500, CDP 1500, DCP chg_ma; `negronichg_icl_bytype=0` = old), bisect boot-args `negronichg_wr=<mask>` (1 ICL,
+  2 SUSPEND_PMIC, 4 CHG_EN, 8 FV/FCC, 0x10 VOOC, 0x20 notify, 0x40 other; 0 = read only), `negronichg_wr_delay_s=N`,
+  `+N ms` on every write line (README-battery.md section 16).
+- Opus review fixes applied: 0368 F1-F4 (no PHY init without halt; host port, hold-off 5 s, EUD, not during VOOC; 5 inits per
+  ADSP start; 200 window lines); 0369 B1, B2, F5-F8 (README-battery.md section 15 "Review fixes").
+- Build [V]: out/kernel/local-20261026-220250/kernel.development.negroni sha256
+  79bd77350764f77e952907c46ad07710812080bfe91788879cdb81dd01545269 (263 applied incl. 0368-0370; 4 dxb skips; link
+  out/kernel/kernel.macho). Not booted.
+- Re-review fixes (Opus: 0368 ACCEPT + 1 fix, 0369 N1/N2, 0370 B3/N3): host gate = DSTS.SOFFN moved between two watch
+  samples; READY reads USB_VOOCPHY_STATUS before PMIC writes; un-park restores type limit / saved ICL / 500 mA and resets
+  the write budget; unknown/ACA type: 500 mA floor when ICL < 100 mA; VOOC safety writes bypass `negronichg_wr` and the
+  delay; deferred notify + VOOC-off when the delay ends. Build [V]: out/kernel/local-20261026-221333/kernel.development.negroni
+  sha256 008220510465a5b090a8e7da35ab3162f0cc5d5082b75509b05b02571f42f2ec (263 applied, 4 dxb skips; kernel.macho). Not booted.
+
+## 50. ADSP/USB bisection (2026-10-27 03:51, RAM test t11 on the reflashed root, kernel local-20261026-220250)
+
+- [V] Root reflashed with the fixed img2simg (20304 allocated zero blocks as FILL) via scripts/flash/reflash-root.sh
+  (the documented order: stock recovery images -> fastbootd -> userdata -> bootloader -> iOS chain from ios16-safe).
+- [V] t11: boot log on (`boot 1 reached SpringBoard ... 56.957 s`), ADSP up 03:51:00, PHY registers unchanged,
+  `glink: start ... ICL per adapter type on` at 03:51:00, Mac lost the device at 03:51:02 (same as 03:20 with 1500 mA):
+  the drop comes ~2 s after our charger GLINK client starts, before any input-limit write. Next: negronichg_wr=0.
