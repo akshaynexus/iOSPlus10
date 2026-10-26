@@ -8,10 +8,10 @@ VDEV_STOP. Small DMA buffer helper. negroni_wlan_dp.c / negroni_wlan_wpa.c: plac
 negroni_wlan_wmi.c: join events routed to the join code. Details: patches/xnu/README-wifi.md "0327".
 
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 332bc21..695a0db 100644
+index bb8e3e5..d4b8c14 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -128,6 +128,8 @@ bsd/dev/negroni_wlan_wmi.c		standard
+@@ -127,6 +127,8 @@ bsd/dev/negroni_wlan_wmi.c		standard
  bsd/dev/negroni_wlan_smmu.c		standard
  bsd/dev/negroni_wlan_sta.c		standard
  bsd/dev/negroni_wlan_join.c		standard

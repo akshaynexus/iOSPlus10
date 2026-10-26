@@ -1,0 +1,1609 @@
+0328-negroni-wlan-htt-dp: Wi-Fi, the HTT data path (ath11k dp/hal for WCN6855, polled), 802.3 frames both ways.
+negroni_wlan_dp.c: common rings + one link-descriptor bank + REO routing/aging + DSCP maps after the CE rings
+(ath11k_dp_alloc), REO2SW1..4 before WMI INIT, HTT version + LMAC rings (rx refill, 2 mac buf, 2 rxdma error,
+2 monitor status) + rx buffers + HTT SRING_SETUP + monitor filter off after WMI READY; per peer HTT PEER_MAP,
+default routing, 17 REO queues (WMI reorder queue setup), vdev TX encap / RX decap Ethernet; TX by TCL data ring 0
+(completions WBM2SW0), RX from REO2SW (Ethernet decap, native-Wi-Fi converted), error rings recycle buffers and
+return link descriptors; API negroni_wlan_tx queue (64) and the RX callback; EAPOL kept for 0329. CE4 (HTT out) in
+negroni_wlan_ce.c, windowed register helpers; HTT hooks in negroni_wlan_wmi.c; boot-arg negroniwlan_dp=0 skips it.
+Every device address via negroni_wlan_dma_alloc. Details: patches/xnu/README-wifi.md "0328".
+
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index 913d500..6aadd29 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -344,6 +344,7 @@ wlan_keep_alive(void)
+ 			printf("NEGRONI WLAN: keep-alive %llu s: %u MHI events, %u IPCR packets, %u M1 seen\n",
+ 			    (now - start) / 1000, H.events - ev0, H.rx_packets - rx0, H.m1_seen);
+ 			(void)negroni_wlan_smmu_check("keep-alive");    /* 0325: a line only when a fault appeared */
++			negroni_wlan_dp_report();                       /* 0328 */
+ 		}
+ 		if (g_keep_s && now - start >= (uint64_t)g_keep_s * 1000) {
+ 			printf("NEGRONI WLAN: keep-alive ends after %u s (negroniwlan_keep); the chip keeps running\n", g_keep_s);
+@@ -661,6 +662,7 @@ wlan_cleanup(void)
+ {
+ 	negroni_wlan_wlfw_free();       /* 0266: firmware memory segments (after wlan_quiesce) */
+ 	negroni_wlan_ce_free();         /* 0321: CE rings and buffers */
++	negroni_wlan_dp_free();         /* 0328: DP rings, link descriptors, rx/tx buffers */
+ 	if (H.xfer_nc) {
+ 		ml_io_unmap(H.xfer_nc, WLAN_XFER_SIZE);
+ 		H.xfer_nc = 0;
+@@ -1065,6 +1067,10 @@ wlan_level_ce(void)
+ 	if (error) {
+ 		return error;
+ 	}
++	error = negroni_wlan_dp_common_setup();        /* 0328: DP rings + link descriptors (ath11k_dp_alloc) */
++	if (error) {
++		return error;
++	}
+ 	negroni_wlan_step(28, "HTC READY");
+ 	error = negroni_wlan_ce_wait_ready(&negroni_wlan_ready);
+ 	if (error) {
+diff --git a/bsd/dev/negroni_wlan_ce.c b/bsd/dev/negroni_wlan_ce.c
+index 194fd0c..dfa5188 100644
+--- a/bsd/dev/negroni_wlan_ce.c
++++ b/bsd/dev/negroni_wlan_ce.c
+@@ -43,6 +43,7 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ #define CE_BUF                  2048u           /* src_sz_max of CE0-3 (ce.c:118-160) */
+ #define CE0_N                   16u             /* host CE0 src_nentries (ce.c:121) */
+ #define CE3_N                   32u             /* host CE3 src_nentries (ce.c:144) */
++#define CE4_N                   32u             /* 0328: host CE4 (HTT host->target, 256-byte messages); ath11k 2048 */
+ #define CE1_N                   32u             /* host CE1 dst: ath11k posts 512, 32 is enough for HTC */
+ #define CE2_N                   64u             /* host CE2 dst (WMI events) */
+ #define CE_SRC_DESC             16u             /* hal_ce_srng_src_desc: 4 dwords */
+@@ -56,14 +57,16 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ #define OFF_CE1_STS             (OFF_CE1_DST + CE1_N * CE_DST_DESC)
+ #define OFF_CE2_DST             (OFF_CE1_STS + CE1_N * CE_STS_DESC)
+ #define OFF_CE2_STS             (OFF_CE2_DST + CE2_N * CE_DST_DESC)
++#define OFF_CE4_SRC             (OFF_CE2_STS + CE2_N * CE_STS_DESC)        /* 0328 */
+ #define OFF_BUF                 0x4000u
+ #define OFF_CE0_BUF             OFF_BUF
+ #define OFF_CE3_BUF             (OFF_CE0_BUF + CE0_N * CE_BUF)
+ #define OFF_CE1_BUF             (OFF_CE3_BUF + CE3_N * CE_BUF)
+ #define OFF_CE2_BUF             (OFF_CE1_BUF + CE1_N * CE_BUF)
+-#define CE_AREA                 (OFF_CE2_BUF + CE2_N * CE_BUF)          /* 0x4c000 = 304 KiB */
++#define OFF_CE4_BUF             (OFF_CE2_BUF + CE2_N * CE_BUF)          /* 0328 */
++#define CE_AREA                 (OFF_CE4_BUF + CE4_N * CE_BUF)          /* 0x5c000 = 368 KiB */
+ _Static_assert(HAL_RING_ID_MAX * 4 <= OFF_CE0_SRC, "read-pointer area overlaps the rings");
+-_Static_assert(OFF_CE2_STS + CE2_N * CE_STS_DESC <= OFF_BUF, "rings overlap the buffers");
++_Static_assert(OFF_CE4_SRC + CE4_N * CE_SRC_DESC <= OFF_BUF, "rings overlap the buffers");
+ _Static_assert((CE_AREA & 0x3fffu) == 0, "the CE area is a multiple of 16 KiB pages");
+ 
+ /* ---- SRNG register offsets inside a ring's R0 group (wcn6855_regs, relative to ring base LSB) ---- */
+@@ -108,7 +111,7 @@ struct ce_pipe {
+ static vm_offset_t g_area_kva, g_area_nc;
+ static uint64_t g_area_pa, g_area_dva;
+ static uint32_t g_window = ~0u;
+-static struct ce_pipe g_ce[4];
++static struct ce_pipe g_ce[5];      /* 0328: + CE4 (HTT out) */
+ static bool g_ce_on;
+ static uint8_t g_rx_copy[CE_BUF];
+ 
+@@ -153,6 +156,19 @@ ce_rd(uint32_t off)
+ 	return negroni_wlan_rd(WLAN_WINDOW_START + (off & WLAN_WINDOW_RANGE));
+ }
+ 
++/* 0328: the same windowed access for the data path's UMAC registers (one window owner) */
++void
++negroni_wlan_reg_wr(uint32_t off, uint32_t v)
++{
++	ce_wr(off, v);
++}
++
++uint32_t
++negroni_wlan_reg_rd(uint32_t off)
++{
++	return ce_rd(off);
++}
++
+ static inline volatile uint32_t *
+ area32(uint32_t off)
+ {
+@@ -346,7 +362,7 @@ ce_tx_reap(struct ce_pipe *p)
+ static struct ce_pipe *
+ ce_pipe_get(uint32_t num)
+ {
+-	return (g_ce_on && num < 4) ? &g_ce[num] : NULL;
++	return (g_ce_on && num < 5) ? &g_ce[num] : NULL;
+ }
+ 
+ /* ath11k_ce_send: one buffer, one descriptor; ENOBUFS when the ring is full */
+@@ -356,7 +372,7 @@ negroni_wlan_ce_send(uint32_t pipe, const void *data, uint32_t len, uint32_t tra
+ 	struct ce_pipe *p = ce_pipe_get(pipe);
+ 	struct ce_ring *r;
+ 
+-	if (!p || (pipe != 0 && pipe != 3) || len == 0 || len > CE_BUF) {
++	if (!p || (pipe != 0 && pipe != 3 && pipe != 4) || len == 0 || len > (pipe == 4 ? 256u : CE_BUF)) {
+ 		return EINVAL;
+ 	}
+ 	r = &p->src;
+@@ -378,7 +394,7 @@ negroni_wlan_ce_send(uint32_t pipe, const void *data, uint32_t len, uint32_t tra
+ 	r->hp = next;
+ 	p->pending++;
+ 	ce_ring_commit(r);
+-	negroni_wlan_ce_stats.tx[pipe & 3]++;
++	negroni_wlan_ce_stats.tx[pipe]++;
+ 	return 0;
+ }
+ 
+@@ -388,7 +404,7 @@ negroni_wlan_ce_tx_free(uint32_t pipe)
+ {
+ 	struct ce_pipe *p = ce_pipe_get(pipe);
+ 
+-	if (!p || (pipe != 0 && pipe != 3)) {
++	if (!p || (pipe != 0 && pipe != 3 && pipe != 4)) {
+ 		return 0;
+ 	}
+ 	ce_tx_reap(p);
+@@ -405,6 +421,7 @@ negroni_wlan_ce_poll(void)
+ 	ce_rx_poll(&g_ce[2]);
+ 	ce_tx_reap(&g_ce[0]);
+ 	ce_tx_reap(&g_ce[3]);
++	ce_tx_reap(&g_ce[4]);
+ }
+ 
+ /* free after the chip lost bus mastering (negroni_wlan.c failure path) */
+@@ -464,8 +481,10 @@ negroni_wlan_ce_start(void)
+ 	ce_pipe_rx(&g_ce[1], 1, CE1_N, OFF_CE1_DST, OFF_CE1_STS, OFF_CE1_BUF, WLAN_SHADOW_CE1_DST, WLAN_SHADOW_CE1_STS);
+ 	ce_pipe_rx(&g_ce[2], 2, CE2_N, OFF_CE2_DST, OFF_CE2_STS, OFF_CE2_BUF, WLAN_SHADOW_CE2_DST, WLAN_SHADOW_CE2_STS);
+ 	ce_pipe_tx(&g_ce[3], 3, CE3_N, OFF_CE3_SRC, OFF_CE3_BUF, WLAN_SHADOW_CE3_SRC);
++	ce_pipe_tx(&g_ce[4], 4, CE4_N, OFF_CE4_SRC, OFF_CE4_BUF, WLAN_SHADOW_CE4_SRC);  /* 0328: HTT host->target */
+ 	ce_ring_hw_init(&g_ce[0].src);
+ 	ce_ring_hw_init(&g_ce[3].src);
++	ce_ring_hw_init(&g_ce[4].src);
+ 
+ 	/* proof that the window reaches the CE registers: the base we wrote reads back */
+ 	uint32_t want = (uint32_t)(g_area_dva + OFF_CE0_SRC), got = ce_rd(g_ce[0].src.r0);
+diff --git a/bsd/dev/negroni_wlan_ce.h b/bsd/dev/negroni_wlan_ce.h
+index e50cb7f..b5af44e 100644
+--- a/bsd/dev/negroni_wlan_ce.h
++++ b/bsd/dev/negroni_wlan_ce.h
+@@ -134,6 +134,7 @@ _Static_assert(WLAN_SHADOW_N <= HAL_SHADOW_MAX, "shadow list longer than the v01
+ #define WLAN_SHADOW_CE2_DST     23u
+ #define WLAN_SHADOW_CE2_STS     24u
+ #define WLAN_SHADOW_CE3_SRC     25u
++#define WLAN_SHADOW_CE4_SRC     26u     /* 0328: HTT host->target */
+ 
+ /* ---- 0321: the CE driver (negroni_wlan_ce.c) ---- */
+ /* HTC header (htc.h:12-30): htc_info = eid 7:0 | flags 15:8 | payload length 31:16; ctrl_info = trailer
+@@ -155,7 +156,7 @@ struct negroni_wlan_htc_ready {
+ };
+ 
+ struct negroni_wlan_ce_stats {
+-	uint32_t rx[4], tx[4], tx_done, tx_full, bad_len, bad_ptr;
++	uint32_t rx[5], tx[5], tx_done, tx_full, bad_len, bad_ptr;
+ };
+ extern struct negroni_wlan_ce_stats negroni_wlan_ce_stats;
+ /* every received CE buffer (a private copy, valid during the call); 0322 installs the HTC receiver */
+@@ -168,6 +169,9 @@ int negroni_wlan_ce_send(uint32_t pipe, const void *data, uint32_t len, uint32_t
+ uint32_t negroni_wlan_ce_tx_free(uint32_t pipe);
+ void negroni_wlan_ce_poll(void);
+ void negroni_wlan_ce_free(void);
++/* 0328: BAR0 register access through the CE code's window (offsets >= 0x80000 windowed) */
++void negroni_wlan_reg_wr(uint32_t off, uint32_t v);
++uint32_t negroni_wlan_reg_rd(uint32_t off);
+ /* pure parser of an HTC READY buffer (header included); 0 or EBADMSG (host-tested) */
+ int negroni_wlan_htc_parse_ready(const uint8_t *b, uint32_t len, uint32_t pipe, struct negroni_wlan_htc_ready *out);
+ 
+diff --git a/bsd/dev/negroni_wlan_dp.c b/bsd/dev/negroni_wlan_dp.c
+index 295fe45..9b17e3a 100644
+--- a/bsd/dev/negroni_wlan_dp.c
++++ b/bsd/dev/negroni_wlan_dp.c
+@@ -1,60 +1,1311 @@
+ /*
+- * NEGRONI QCA6490 Wi-Fi: the HTT data path. 0327: placeholders (no data frames yet); 0328 replaces this file.
++ * NEGRONI QCA6490 Wi-Fi (patch 0328): the HTT data path (ath11k dp.c, dp_rx.c, dp_tx.c, hal.c, hal_rx.c, hal_tx.c for
++ * WCN6855 hw2.x: single pdev, 2 rxdma per pdev, rx_mac_buf_ring, shadow registers, htt peer map v1), polled.
++ *
++ *   common setup (after the CE rings, before HTC READY; ath11k_dp_alloc): WBM idle link ring + one link-descriptor
++ *     bank, SW2WBM release, TCL cmd/status, TCL data 0 + its WBM2SW0 completion ring, REO reinject, WBM2SW3 (rx
++ *     release), REO exception/cmd/status, REO hash routing + aging (ath11k_hw_wcn6855_reo_setup), DSCP->TID maps
++ *   REO setup (after SERVICE_READY, before WMI INIT; ath11k_dp_pdev_reo_setup): REO2SW1..4
++ *   pdev setup (after WMI READY + hw mode; ath11k_dp_tx_htt_h2t_ver_req_msg + ath11k_dp_rx_pdev_alloc): HTT version,
++ *     the LMAC rings (refill = host->fw rx buffers, 2 rx_mac_buf, 2 rxdma error dst, 2 monitor status), the rx
++ *     buffers, HTT SRING_SETUP for each, monitor status filter off (ath11k_mac_config_mon_status_default(false))
++ *   peer (join, 0327): HTT PEER_MAP wait, PEER_SET_DEFAULT_ROUTING, a REO queue per TID 0..16
++ *     (ath11k_dp_peer_setup / ath11k_peer_rx_tid_setup), vdev TX encap + RX decap = Ethernet
++ *   data: TX = one TCL data descriptor per 802.3 frame (Ethernet encap), completions on WBM2SW0; RX = REO2SW1..4
++ *     MSDUs (Ethernet decap; native-Wi-Fi decap converted), buffers re-posted; error rings recycle buffers and give
++ *     link descriptors back to WBM.
++ *
++ * Every ring address, buffer and link descriptor is a device address from negroni_wlan_dma_alloc (an IOVA with
++ * negroniwlan_smmu=3). Ring pointers: non-LMAC rings through the shadow registers of the 0320 list (host pointer),
++ * the hardware's pointer in the read-pointer area (rdp); LMAC rings through rdp/wrp memory (HTT gives the firmware
++ * the addresses). Boot-arg negroniwlan_dp=0 skips all of it (0323 behaviour). UNTESTED ON HARDWARE.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <stdarg.h>
+ #include "negroni_wlan.h"
+ #include "negroni_wlan_mhi.h"
++#include "negroni_wlan_ce.h"
++#include "negroni_wlan_wmi.h"
+ #include "negroni_wlan_sta.h"
+ 
+-uint32_t
+-negroni_wlan_dp_caps(void)
++/* ---- UMAC register blocks (hal.h) and wcn6855_regs (hw.c) ---- */
++#define REO_REG                 0x00a38000u
++#define TCL_REG                 0x00a44000u
++#define WBM_REG                 0x00a34000u
++/* R0 relative offsets inside a ring's group (as negroni_wlan_ce.c) */
++#define R0_BASE_MSB             0x04u
++#define R0_ID                   0x08u
++#define R0_MISC                 0x10u
++#define R0_SRC_TP_ADDR_LSB      0x1cu
++#define R0_SRC_TP_ADDR_MSB      0x20u
++#define R0_SRC_INT_IX0          0x30u
++#define R0_SRC_INT_IX1          0x34u
++#define R0_DST_HP_ADDR_LSB      0x14u
++#define R0_DST_HP_ADDR_MSB      0x18u
++#define R0_DST_PRODUCER_INT     0x24u
++#define MISC_LOOPCNT_OFF        (1u << 1)
++#define MISC_SRNG_ENABLE        (1u << 6)
++/* REO / TCL control */
++#define REO1_GEN_ENABLE         0x000u
++#define REO1_DEST_RING_CTRL_IX_2 0x00cu
++#define REO1_DEST_RING_CTRL_IX_3 0x010u
++#define REO1_MISC_CTL           0x630u
++#define REO1_AGING_IX(n)        (0x5bcu + 4u * (n))
++#define REO_AGING_US            (40u * 1000u)
++#define TCL1_CMN_CTRL           0x014u
++#define TCL1_DSCP_TID_MAP       0x02cu
++#define TCL_DSCP_PROG_EN        (1u << 17)
++
++/* ---- ring ids (hal.h) ---- */
++#define RID_REO2SW(n)           (0u + (n))
++#define RID_REO2TCL             4u
++#define RID_SW2REO              5u
++#define RID_REO_CMD             8u
++#define RID_REO_STATUS          9u
++#define RID_SW2TCL(n)           (16u + (n))
++#define RID_SW2TCL_CMD          24u
++#define RID_TCL_STATUS          25u
++#define RID_WBM_IDLE_LINK       104u
++#define RID_WBM_SW_RELEASE      105u
++#define RID_WBM2SW(n)           (106u + (n))
++#define RID_LMAC1               128u
++#define RINGS_PER_LMAC          15u
++#define RID_SW2RXDMA0_BUF       (RID_LMAC1 + 0u)
++#define RID_SW2RXDMA1_BUF       (RID_LMAC1 + 1u)
++#define RID_SW2RXDMA1_STATBUF   (RID_LMAC1 + 4u)
++#define RID_RXDMA2SW0           (RID_LMAC1 + 5u)
++#define RID_MAX                 172u            /* 127 + 3 x 15 */
++#define LMAC_RINGS              45u
++
++/* ---- descriptors (hal_desc.h) ---- */
++#define RBM_IDLE_DESC_LIST      1u
++#define RBM_SW0                 3u              /* TCL 0 -> WBM2SW0 completions (tcl2wbm_rbm_map) */
++#define RBM_SW1                 4u              /* rx buffers (hal_params rx_buf_rbm) */
++#define HAL_TCL_DATA_CMD_TAG    324u
++#define HAL_REO_GET_QUEUE_STATS_TAG 306u
++#define LINK_DESC_SIZE          128u
++#define N_LINK_DESC             4096u           /* ath11k computes ~ 32k for 64 clients; one STA needs few */
++#define RX_BUF                  2048u           /* DP_RX_BUFFER_SIZE */
++#define RX_DESC_SZ              392u            /* sizeof(hal_rx_desc_wcn6855), host-checked */
++#define RXD_MSDU_END_INFO2      44u
++#define RXD_ATTN_INFO2          92u
++#define RXD_MSDU_START_INFO1    104u
++#define RXD_MSDU_START_INFO2    108u
++#define RXD_MSDU_DONE           (1u << 31)
++#define RXD_MPDU_START_INFO1    188u            /* mpdu_start.info1 (host-checked offsets) */
++#define RXD_MPDU_START_INFO2    172u
++#define RXD_MPDU_ENC_VALID      (1u << 9)       /* RX_MPDU_START_INFO1_ENCRYPT_INFO_VALID */
++#define HAL_ENC_OPEN            7u              /* HAL_ENCRYPT_TYPE_OPEN; RX_MPDU_START_INFO2_ENC_TYPE = bits 5:2 */
++#define DECAP_NATIVE_WIFI       1u
++#define DECAP_ETH2              2u
++#define TCL_ENCAP_ETHERNET      2u
++#define TCL_SEARCH_DEFAULT      0u
++#define TCL_ADDRY_EN            2u
++#define WBM_REL_SRC_SW          4u
++#define WBM_REL_DESC_MSDU_LINK  1u
++#define PUSH_ROUTING            1u
++#define HTT_SW_TO_HW            1u
++#define HTT_HW_TO_SW            0u
++#define HTT_SW_TO_SW            2u
++#define HTT_RXDMA_HOST_BUF_RING 0u
++#define HTT_RXDMA_MON_STATUS_RING 1u
++#define HTT_HOST1_TO_FW_RXBUF_RING 5u
++#define HTT_RXDMA_NON_MON_DEST_RING 7u
++#define HTT_H2T_VERSION_REQ     0u
++#define HTT_H2T_SRING_SETUP     0xbu
++#define HTT_H2T_RX_RING_SEL_CFG 0xcu
++#define HTT_T2H_VERSION_CONF    0u
++#define HTT_T2H_PEER_MAP        3u
++#define HTT_T2H_PEER_UNMAP      4u
++#define HTT_T2H_PEER_MAP2       0x1eu
++#define HTT_T2H_PEER_UNMAP2     0x1fu
++#define WMI_PEER_REORDER_QUEUE_SETUP_CMDID 0x6013u
++#define WMI_TAG_REORDER_QUEUE_SETUP_CMD 0x225u
++#define WMI_PEER_SET_DEFAULT_ROUTING 0x13u
++#define WMI_VDEV_SET_PARAM_CMDID 0x5008u
++#define WMI_TAG_VDEV_SET_PARAM_CMD 0x5fu
++#define VDEV_PARAM_TX_ENCAP_TYPE 0x30u
++#define VDEV_PARAM_RX_DECAP_TYPE 0x5bu
++#define HW_TXRX_ETHERNET        2u
++#define NUM_TIDS                17u             /* 0..15 + non-QoS 16 */
++#define QDESC_SIZE              512u            /* hal_rx_reo_queue (128) + 3 ext (128 each), 128-aligned */
++
++/* ---- sizes of our rings (entries) ---- */
++#define N_WBM_REL               64u
++#define N_TCL_CMD               32u
++#define N_TCL_STATUS            32u
++#define N_TCL_DATA              64u
++#define N_TX_COMP               256u
++#define N_REO_REINJECT          32u
++#define N_RX_REL                128u
++#define N_REO_EXCEPT            128u
++#define N_REO_CMD               64u
++#define N_REO_STATUS            64u
++#define N_REO_DST               256u
++#define N_REFILL                512u
++#define N_MAC_BUF               256u
++#define N_ERR_DST               64u
++#define N_MON_STATUS            64u
++#define N_RX_BUFS               (N_REFILL - 1 + 2 * (N_MON_STATUS - 1))
++#define N_TX_BUFS               64u
++#define TX_BUF                  2048u
++#define TXQ_N                   64u
++#define TXQ_FRAME               1600u
++#define EAPOLQ_N                4u
++
++struct dp_ring {
++	bool skip_cont;                         /* review: per ring: the rest of a multi-buffer MSDU is dropped */
++	const char *name;
++	uint32_t ring_id, esz, n, size;         /* esz, size: dwords */
++	bool src, lmac;
++	uint32_t r0, r2;
++	int shadow;                             /* non-LMAC: index into the 0320 shadow list */
++	uint32_t lmac_idx;
++	volatile uint32_t *base;
++	uint64_t dva;
++	uint32_t hp, tp;                        /* dwords */
++};
++
++static bool g_dp_enabled = true, g_dp_on, g_pdev_on;
++static struct nwlan_dma g_rings, g_link, g_rxb, g_txb, g_qd;
++static uint32_t g_rings_used;
++static volatile uint32_t *g_rdp, *g_wrp;
++static uint64_t g_rdp_dva, g_wrp_dva;
++static struct dp_ring R_wbm_idle, R_wbm_rel, R_tcl_cmd, R_tcl_status, R_tcl_data, R_tx_comp, R_reo_reinject, R_rx_rel,
++    R_reo_except, R_reo_cmd, R_reo_status, R_reo_dst[4], R_refill, R_mac_buf[2], R_err_dst[2], R_mon[2];
++static bool g_rx_posted[N_RX_BUFS];             /* true: the buffer belongs to the hardware */
++static uint16_t g_repost[N_RX_BUFS];            /* review D2: host-owned buffers waiting for room in the refill ring */
++static uint32_t g_repost_n, g_rx_unposted;
++static uint32_t g_lpend[2 * 32], g_lpend_n;     /* review: link descriptors waiting for room in SW2WBM */
++static bool g_tx_busy[N_TX_BUFS];
++static uint32_t g_tx_next;
++/* HTT state (set in the service pass) */
++static volatile bool g_htt_ver, g_peer_mapped, g_peer_lost;
++static bool g_secured;                          /* review D6: keys installed: only decrypted frames (and EAPOL) pass */
++static uint32_t g_htt_major, g_htt_minor, g_peer_id;
++static uint8_t g_peer_mac[6];
++/* link */
++static bool g_link_up;
++static uint8_t g_bssid[6];
++static uint32_t g_tcl_meta;
++/* counters */
++static uint64_t g_tx_frames, g_rx_frames, g_tx_drops, g_rx_drops;
++static uint32_t g_rx_err, g_rx_bad, g_tx_fail, g_rel_bufs, g_link_returned, g_htt_other;
++static bool g_in_poll;
++/* TX queue from the API (any thread) */
++static LCK_GRP_DECLARE(dp_grp, "negroni_wlan_dp");
++static LCK_MTX_DECLARE(dp_txq_mtx, &dp_grp);
++static uint8_t g_txq[TXQ_N][TXQ_FRAME];
++static uint16_t g_txq_len[TXQ_N];
++static uint32_t g_txq_head, g_txq_tail;
++
++int negroni_wlan_htt_send(const void *msg, uint32_t len);       /* negroni_wlan_wmi.c */
++
++/* review D7: a data-path failure is soft (the step goes on, scan keeps working): a "DP:" line, not a step failure */
++static int __printflike(2, 3)
++dp_fail(int error, const char *fmt, ...)
++{
++	char why[160];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(why, sizeof(why), fmt, ap);
++	va_end(ap);
++	printf("NEGRONI WLAN: DP: %s (error %d)\n", why, error);
++	return error;
++}
++
++static inline void
++wr32(uint32_t off, uint32_t v)
++{
++	negroni_wlan_reg_wr(off, v);
++}
++
++/* ---- ring memory and pointers ---- */
++static int
++ring_alloc(struct dp_ring *r, const char *name, uint32_t ring_id, uint32_t esz, uint32_t n, bool src, bool lmac,
++    uint32_t r0, uint32_t r2, int shadow)
+ {
++	uint32_t bytes = n * esz * 4, at = (g_rings_used + 63) & ~63u;
++
++	if (at + bytes > g_rings.size) {
++		return dp_fail(ENOMEM, "DP ring %s does not fit the ring area (%u + %u > %u)", name, at, bytes,
++		           g_rings.size);
++	}
++	memset(r, 0, sizeof(*r));
++	r->name = name;
++	r->ring_id = ring_id;
++	r->esz = esz;
++	r->n = n;
++	r->size = n * esz;
++	r->src = src;
++	r->lmac = lmac;
++	r->r0 = r0;
++	r->r2 = r2;
++	r->shadow = shadow;
++	r->lmac_idx = lmac ? ring_id - RID_LMAC1 : 0;
++	r->base = (volatile uint32_t *)(g_rings.nc + at);
++	r->dva = g_rings.dva + at;
++	memset((void *)(uintptr_t)r->base, 0, bytes);
++	g_rings_used = at + bytes;
++	g_rdp[ring_id] = 0;
++	if (lmac) {
++		g_wrp[r->lmac_idx] = 0;
++	}
+ 	return 0;
+ }
+ 
++/* the pointer the other side moves: TP of a source ring, HP of a destination ring (rdp, dwords) */
++static inline uint32_t
++ring_hw_ptr(const struct dp_ring *r)
++{
++	uint32_t v = g_rdp[r->ring_id];
++	__asm__ volatile ("dmb ld" ::: "memory");
++	/* review D3: only an in-range, entry-aligned pointer is believed */
++	return (v < r->size && (v % r->esz) == 0) ? v : (r->src ? r->tp : r->hp);
++}
++
++/* publish our pointer: HP of a source ring, TP of a destination ring (ath11k_hal_srng_access_end) */
++static void
++ring_commit(struct dp_ring *r)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t v = r->src ? r->hp : r->tp;
++	if (r->lmac) {
++		g_wrp[r->lmac_idx] = v;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	} else if (r->shadow >= 0) {
++		negroni_wlan_wr(HAL_SHADOW_REG((uint32_t)r->shadow), v);
++	}
++}
++
++static volatile uint32_t *
++src_next(struct dp_ring *r)
++{
++	r->tp = ring_hw_ptr(r);
++	uint32_t next = (r->hp + r->esz) % r->size;
++	if (next == r->tp) {
++		return NULL;
++	}
++	volatile uint32_t *d = r->base + r->hp;
++	r->hp = next;
++	return d;
++}
++
++static uint32_t
++src_free(struct dp_ring *r)
++{
++	r->tp = ring_hw_ptr(r);
++	return r->tp > r->hp ? (r->tp - r->hp) / r->esz - 1 : (r->size - r->hp + r->tp) / r->esz - 1;
++}
++
++static volatile uint32_t *
++dst_next(struct dp_ring *r)
++{
++	if (r->tp == r->hp) {
++		r->hp = ring_hw_ptr(r);
++		if (r->tp == r->hp) {
++			return NULL;
++		}
++	}
++	volatile uint32_t *d = r->base + r->tp;
++	r->tp = (r->tp + r->esz) % r->size;
++	return d;
++}
++
++/* ath11k_hal_srng_src_hw_init / _dst_hw_init (no MSI, no interrupt thresholds) */
++static void
++ring_hw_init(struct dp_ring *r)
++{
++	uint64_t ptr = g_rdp_dva + 4ull * r->ring_id;
++	uint32_t msb = (uint32_t)((r->dva >> 32) & 0xff) | (r->size << 8);
++
++	wr32(r->r0, (uint32_t)r->dva);
++	wr32(r->r0 + R0_BASE_MSB, msb);
++	if (r->src) {
++		wr32(r->r0 + R0_ID, r->esz);
++		if (r->ring_id == RID_WBM_IDLE_LINK) {
++			wr32(r->r0, (uint32_t)r->dva);
++			wr32(r->r0 + R0_BASE_MSB, msb);
++		}
++		wr32(r->r0 + R0_SRC_INT_IX0, 0);
++		wr32(r->r0 + R0_SRC_INT_IX1, 0);
++		if (r->ring_id != RID_WBM_IDLE_LINK) {
++			wr32(r->r0 + R0_SRC_TP_ADDR_LSB, (uint32_t)ptr);
++			wr32(r->r0 + R0_SRC_TP_ADDR_MSB, (uint32_t)(ptr >> 32));
++		}
++	} else {
++		wr32(r->r0 + R0_ID, (r->ring_id << 8) | r->esz);
++		wr32(r->r0 + R0_DST_PRODUCER_INT, 0);
++		wr32(r->r0 + R0_DST_HP_ADDR_LSB, (uint32_t)ptr);
++		wr32(r->r0 + R0_DST_HP_ADDR_MSB, (uint32_t)(ptr >> 32));
++	}
++	wr32(r->r2, 0);                 /* HP */
++	wr32(r->r2 + 4, 0);             /* TP */
++	g_rdp[r->ring_id] = 0;
++	wr32(r->r0 + R0_MISC, (r->src ? MISC_LOOPCNT_OFF : 0) | MISC_SRNG_ENABLE);
++}
++
++/* ---- rx buffers: slot k at g_rxb + k * 2048, cookie = buf id k + 1 (DP_RXDMA_BUF_COOKIE_BUF_ID, pdev 0) ---- */
++static bool
++rx_post(struct dp_ring *r, uint32_t slot)
++{
++	volatile uint32_t *d = src_next(r);
++	if (!d) {
++		return false;
++	}
++	uint64_t a = g_rxb.dva + (uint64_t)slot * RX_BUF;
++	d[0] = (uint32_t)a;
++	d[1] = (uint32_t)((a >> 32) & 0xff) | (RBM_SW1 << 8) | ((slot + 1) << 11);
++	g_rx_posted[slot] = true;
++	return true;
++}
++
++/* a returned buffer cookie -> its slot, or ~0u */
++static uint32_t
++rx_slot(uint32_t info1)
++{
++	uint32_t cookie = info1 >> 11, id = cookie & 0x3ffffu;
++	return (id >= 1 && id <= N_RX_BUFS) ? id - 1 : ~0u;
++}
++
++/*
++ * Give a consumed buffer back to the refill ring (review D2): a cookie for a slot the hardware does not own is counted
++ * and dropped (never posted twice); a full refill ring keeps the buffer on the repost list (rx_repost).
++ */
++static void
++rx_recycle(uint32_t slot)
++{
++	if (slot >= N_RX_BUFS) {
++		return;
++	}
++	if (!g_rx_posted[slot]) {
++		g_rx_unposted++;
++		return;
++	}
++	g_rx_posted[slot] = false;
++	if (rx_post(&R_refill, slot)) {
++		ring_commit(&R_refill);
++	} else if (g_repost_n < N_RX_BUFS) {
++		g_repost[g_repost_n++] = (uint16_t)slot;
++	}
++}
++
++static void
++rx_repost(void)
++{
++	bool moved = false;
++
++	while (g_repost_n && rx_post(&R_refill, g_repost[g_repost_n - 1])) {
++		g_repost_n--;
++		moved = true;
++	}
++	if (moved) {
++		ring_commit(&R_refill);
++	}
++}
++
++/* ---- common setup (ath11k_dp_alloc), after the CE rings ---- */
++static int
++negroni_wlan_dp_common_setup_inner(void)
++{
++	int error;
++	uint32_t v = 1;
++
++	(void)PE_parse_boot_argn("negroniwlan_dp", &v, sizeof(v));
++	g_dp_enabled = v != 0;
++	memset(g_rx_posted, 0, sizeof(g_rx_posted));    /* review: no state from an earlier run */
++	memset(g_tx_busy, 0, sizeof(g_tx_busy));
++	g_repost_n = g_lpend_n = 0;
++	g_secured = g_peer_lost = false;
++	if (!g_dp_enabled) {
++		printf("NEGRONI WLAN: DP off (negroniwlan_dp=0): no data path, scan only\n");
++		return 0;
++	}
++	if ((error = negroni_wlan_dma_alloc(256u << 10, &g_rings)) || (error = negroni_wlan_dma_alloc(N_LINK_DESC *
++	    LINK_DESC_SIZE, &g_link)) || (error = negroni_wlan_dma_alloc(N_RX_BUFS * RX_BUF, &g_rxb)) ||
++	    (error = negroni_wlan_dma_alloc(N_TX_BUFS * TX_BUF, &g_txb)) ||
++	    (error = negroni_wlan_dma_alloc(NUM_TIDS * QDESC_SIZE, &g_qd))) {
++		return dp_fail(ENOMEM, "no DMA memory for the data path");
++	}
++	/* rdp (u32 per ring id) and wrp (u32 per LMAC ring) at the start of the ring area */
++	g_rdp = (volatile uint32_t *)g_rings.nc;
++	g_rdp_dva = g_rings.dva;
++	g_wrp = (volatile uint32_t *)(g_rings.nc + 1024);
++	g_wrp_dva = g_rings.dva + 1024;
++	memset((void *)g_rings.nc, 0, 2048);
++	g_rings_used = 2048;
++
++	/* WBM idle link ring + link descriptors (ath11k_wbm_idle_ring_setup, ath11k_dp_link_desc_setup) */
++	if ((error = ring_alloc(&R_wbm_idle, "WBM idle link", RID_WBM_IDLE_LINK, 2, N_LINK_DESC, true, false,
++	    WBM_REG + 0x870, WBM_REG + 0x30b0, 13))) {
++		return error;
++	}
++	ring_hw_init(&R_wbm_idle);
++	uint32_t nl = 0;
++	for (uint32_t i = 0; i < N_LINK_DESC; i++) {
++		volatile uint32_t *d = src_next(&R_wbm_idle);
++		if (!d) {
++			break;
++		}
++		uint64_t a = g_link.dva + (uint64_t)i * LINK_DESC_SIZE;
++		d[0] = (uint32_t)a;
++		d[1] = (uint32_t)((a >> 32) & 0xff) | (RBM_IDLE_DESC_LIST << 8) | (0u << 11);   /* cookie = bank 0 */
++		nl++;
++	}
++	ring_commit(&R_wbm_idle);
++
++	/* ath11k_dp_srng_common_setup order */
++	if ((error = ring_alloc(&R_wbm_rel, "SW2WBM release", RID_WBM_SW_RELEASE, 8, N_WBM_REL, true, false, WBM_REG + 0x1e8,
++	    WBM_REG + 0x3018, 14)) ||
++	    (error = ring_alloc(&R_tcl_cmd, "TCL cmd", RID_SW2TCL_CMD, 8, N_TCL_CMD, true, false, TCL_REG + 0x798,
++	    TCL_REG + 0x2018, 11)) ||
++	    (error = ring_alloc(&R_tcl_status, "TCL status", RID_TCL_STATUS, 9, N_TCL_STATUS, false, false, TCL_REG + 0x8a0,
++	    TCL_REG + 0x2030, 12)) ||
++	    (error = ring_alloc(&R_tcl_data, "TCL data 0", RID_SW2TCL(0), 8, N_TCL_DATA, true, false, TCL_REG + 0x690,
++	    TCL_REG + 0x2000, 8)) ||
++	    (error = ring_alloc(&R_tx_comp, "WBM2SW0 tx completion", RID_WBM2SW(0), 8, N_TX_COMP, false, false,
++	    WBM_REG + 0x920, WBM_REG + 0x30c0, 15)) ||
++	    (error = ring_alloc(&R_reo_reinject, "REO reinject", RID_SW2REO, 8, N_REO_REINJECT, true, false, REO_REG + 0x1ec,
++	    REO_REG + 0x3028, 5)) ||
++	    (error = ring_alloc(&R_rx_rel, "WBM2SW3 rx release", RID_WBM2SW(3), 8, N_RX_REL, false, false,
++	    WBM_REG + 0x920 + 3 * 0x58, WBM_REG + 0x30c0 + 3 * 8, 18)) ||
++	    (error = ring_alloc(&R_reo_except, "REO exception", RID_REO2TCL, 16, N_REO_EXCEPT, false, false, REO_REG + 0x454,
++	    REO_REG + 0x3060, 4)) ||
++	    (error = ring_alloc(&R_reo_cmd, "REO cmd", RID_REO_CMD, 10, N_REO_CMD, true, false, REO_REG + 0x194,
++	    REO_REG + 0x3020, 6)) ||
++	    (error = ring_alloc(&R_reo_status, "REO status", RID_REO_STATUS, 26, N_REO_STATUS, false, false, REO_REG + 0x55c,
++	    REO_REG + 0x3078, 7))) {
++		return error;
++	}
++	struct dp_ring *common[] = { &R_wbm_rel, &R_tcl_cmd, &R_tcl_status, &R_tcl_data, &R_tx_comp, &R_reo_reinject,
++		                     &R_rx_rel, &R_reo_except, &R_reo_cmd, &R_reo_status };
++	for (uint32_t i = 0; i < sizeof(common) / sizeof(common[0]); i++) {
++		ring_hw_init(common[i]);
++	}
++	/* TCL data descriptors carry a TLV header (ath11k_hal_tx_init_data_ring) */
++	for (uint32_t i = 0; i < N_TCL_DATA; i++) {
++		R_tcl_data.base[i * R_tcl_data.esz] = (HAL_TCL_DATA_CMD_TAG << 1) | ((7u * 4u) << 10);
++	}
++	/* REO cmd ring: command numbers (ath11k_hal_reo_init_cmd_ring) */
++	for (uint32_t i = 0; i < N_REO_CMD; i++) {
++		R_reo_cmd.base[i * R_reo_cmd.esz + 1] = (i + 1) & 0xffff;
++	}
++	/* REO (ath11k_hw_wcn6855_reo_setup) */
++	uint32_t hash = 1u << 0 | 2u << 4 | 3u << 8 | 4u << 12 | 1u << 16 | 2u << 20 | 3u << 24 | 4u << 28;
++	wr32(REO_REG + REO1_GEN_ENABLE, negroni_wlan_reg_rd(REO_REG + REO1_GEN_ENABLE) | (1u << 2) | (1u << 3));
++	wr32(REO_REG + REO1_MISC_CTL, negroni_wlan_reg_rd(REO_REG + REO1_MISC_CTL) & ~(0xfu << 17));   /* frag dst REO2SW1 */
++	for (uint32_t i = 0; i < 4; i++) {
++		wr32(REO_REG + REO1_AGING_IX(i), REO_AGING_US);
++	}
++	wr32(REO_REG + REO1_DEST_RING_CTRL_IX_2, hash);
++	wr32(REO_REG + REO1_DEST_RING_CTRL_IX_3, hash);
++	/* DSCP -> TID tables (ath11k_hal_tx_set_dscp_tid_map), 48 tables of 24 bytes: tid = dscp >> 3 */
++	uint32_t ctl = negroni_wlan_reg_rd(TCL_REG + TCL1_CMN_CTRL);
++	wr32(TCL_REG + TCL1_CMN_CTRL, ctl | TCL_DSCP_PROG_EN);
++	for (uint32_t id = 0; id < 48; id++) {
++		uint8_t m[24];
++		for (uint32_t i = 0, c = 0; i < 64; i += 8, c += 3) {
++			uint32_t val = 0;
++			for (uint32_t k = 0; k < 8; k++) {
++				val |= ((i + k) >> 3) << (3 * k);
++			}
++			memcpy(m + c, &val, 3);
++		}
++		for (uint32_t i = 0; i < 24; i += 4) {
++			uint32_t w;
++			memcpy(&w, m + i, 4);
++			wr32(TCL_REG + TCL1_DSCP_TID_MAP + id * 24 + i, w);
++		}
++	}
++	wr32(TCL_REG + TCL1_CMN_CTRL, negroni_wlan_reg_rd(TCL_REG + TCL1_CMN_CTRL) & ~TCL_DSCP_PROG_EN);
++	g_dp_on = true;
++	printf("NEGRONI WLAN: DP common rings up: %u link descriptors, TCL data %u, tx completion %u, REO exception %u, "
++	    "ring area %u bytes at device %#llx; TCL data base reads %#x (wrote %#x)\n", nl, N_TCL_DATA, N_TX_COMP,
++	    N_REO_EXCEPT, g_rings_used, g_rings.dva, negroni_wlan_reg_rd(R_tcl_data.r0), (uint32_t)R_tcl_data.dva);
++	if (negroni_wlan_reg_rd(R_tcl_data.r0) != (uint32_t)R_tcl_data.dva) {
++		return dp_fail(EIO, "TCL data ring base does not read back: the UMAC registers are not reached");
++	}
++	return 0;
++}
++
++/* ---- REO destination rings (ath11k_dp_pdev_reo_setup), before WMI INIT ---- */
++static int
++negroni_wlan_dp_reo_setup_inner(void)
++{
++	int error;
++
++	if (!g_dp_on) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < 4; i++) {
++		if ((error = ring_alloc(&R_reo_dst[i], "REO2SW", RID_REO2SW(i), 16, N_REO_DST, false, false,
++		    REO_REG + 0x244 + i * 0x58, REO_REG + 0x3030 + i * 8, (int)i))) {
++			return error;
++		}
++		ring_hw_init(&R_reo_dst[i]);
++	}
++	printf("NEGRONI WLAN: DP REO2SW1..4 up (%u entries each)\n", N_REO_DST);
++	return 0;
++}
++
++/* ---- HTT messages ---- */
++void
++negroni_wlan_dp_htt_rx(const uint8_t *p, uint32_t len)
++{
++	uint32_t w0, w1, w2;
++
++	if (len < 4) {
++		return;
++	}
++	memcpy(&w0, p, 4);
++	switch (w0 & 0xff) {
++	case HTT_T2H_VERSION_CONF:
++		g_htt_minor = (w0 >> 8) & 0xff;
++		g_htt_major = (w0 >> 16) & 0xff;
++		g_htt_ver = true;
++		break;
++	case HTT_T2H_PEER_MAP:
++	case HTT_T2H_PEER_MAP2:
++		if (len >= 12) {
++			memcpy(&w1, p + 4, 4);
++			memcpy(&w2, p + 8, 4);
++			memcpy(g_peer_mac, &w1, 4);
++			g_peer_mac[4] = (uint8_t)w2;
++			g_peer_mac[5] = (uint8_t)(w2 >> 8);
++			g_peer_id = w0 >> 16;
++			g_peer_mapped = true;
++		}
++		break;
++	case HTT_T2H_PEER_UNMAP:
++	case HTT_T2H_PEER_UNMAP2:
++		if ((w0 >> 16) == g_peer_id) {
++			g_peer_mapped = false;
++			if (g_link_up) {
++				g_peer_lost = true;     /* review: the firmware dropped our AP peer: the join goes down */
++			}
++		}
++		break;
++	default:
++		g_htt_other++;
++		break;
++	}
++}
++
++static int
++htt_srng_setup(struct dp_ring *r, uint32_t mac_id, uint32_t htt_type, uint32_t htt_id)
++{
++	uint32_t m[13];
++	uint64_t hp, tp;
++
++	/* ath11k_hal_srng_get_hp_addr / _tp_addr for an LMAC ring */
++	if (r->src) {
++		hp = g_wrp_dva + 4ull * r->lmac_idx;
++		tp = g_rdp_dva + 4ull * r->ring_id;
++	} else {
++		hp = g_rdp_dva + 4ull * r->ring_id;
++		tp = g_wrp_dva + 4ull * r->lmac_idx;
++	}
++	uint32_t pdev = (htt_type == HTT_SW_TO_HW || htt_type == HTT_HW_TO_SW) ? mac_id + 1 : mac_id;
++	memset(m, 0, sizeof(m));
++	m[0] = HTT_H2T_SRING_SETUP | pdev << 8 | htt_id << 16 | htt_type << 24;
++	m[1] = (uint32_t)r->dva;
++	m[2] = (uint32_t)(r->dva >> 32);
++	m[3] = (r->size & 0xffff) | (r->esz << 16) | (htt_type == HTT_SW_TO_HW ? (1u << 25) : 0);
++	m[4] = (uint32_t)hp;
++	m[5] = (uint32_t)(hp >> 32);
++	m[6] = (uint32_t)tp;
++	m[7] = (uint32_t)(tp >> 32);
++	/* msi addr/data 0, intr_info 0 (polled), info2: low threshold 0 */
++	int error = negroni_wlan_htt_send(m, sizeof(m));
++	if (error) {
++		return dp_fail(error, "HTT SRING_SETUP for %s not sent", r->name);
++	}
++	return 0;
++}
++
++/* HTT_H2T_MSG_TYPE_RX_RING_SELECTION_CFG with an empty filter (monitor status off) */
++static int
++htt_ring_filter_off(struct dp_ring *r, uint32_t mac_id)
++{
++	uint32_t m[7];             /* htt_rx_ring_selection_cfg_cmd */
++
++	memset(m, 0, sizeof(m));
++	m[0] = HTT_H2T_RX_RING_SEL_CFG | (mac_id + 1) << 8 | HTT_RXDMA_MON_STATUS_RING << 16;
++	m[1] = RX_BUF;
++	(void)r;
++	return negroni_wlan_htt_send(m, sizeof(m));
++}
++
++/* ---- pdev setup (after WMI READY + hw mode) ---- */
++static int
++negroni_wlan_dp_pdev_setup_inner(void)
++{
++	int error;
++
++	if (!g_dp_on) {
++		return 0;
++	}
++	uint32_t ver = HTT_H2T_VERSION_REQ;
++	g_htt_ver = false;
++	if ((error = negroni_wlan_htt_send(&ver, 4)) ||
++	    (error = negroni_wlan_wmi_wait(&g_htt_ver, 3000, "HTT VERSION_CONF"))) {
++		return error;
++	}
++	printf("NEGRONI WLAN: HTT target version %u.%u%s\n", g_htt_major, g_htt_minor, g_htt_major == 3 ? "" :
++	    " (ath11k needs major 3)");
++	if (g_htt_major != 3) {
++		return dp_fail(ENOTSUP, "HTT major version %u, not 3", g_htt_major);
++	}
++	/* ath11k_dp_rx_pdev_srng_alloc (mac 0, 2 rxdma) */
++	if ((error = ring_alloc(&R_refill, "rx refill", RID_SW2RXDMA0_BUF, 2, N_REFILL, true, true, 0, 0, -1))) {
++		return error;
++	}
++	for (uint32_t i = 0; i < 2; i++) {
++		if ((error = ring_alloc(&R_mac_buf[i], "rx mac buf", RID_SW2RXDMA1_BUF + i * RINGS_PER_LMAC, 2, N_MAC_BUF, true,
++		    true, 0, 0, -1)) ||
++		    (error = ring_alloc(&R_err_dst[i], "rxdma err dst", RID_RXDMA2SW0 + i * RINGS_PER_LMAC, 8, N_ERR_DST, false,
++		    true, 0, 0, -1)) ||
++		    (error = ring_alloc(&R_mon[i], "mon status", RID_SW2RXDMA1_STATBUF + i * RINGS_PER_LMAC, 2, N_MON_STATUS,
++		    true, true, 0, 0, -1))) {
++			return error;
++		}
++	}
++	/* buffers: the refill ring (host -> fw) and the monitor status rings (ath11k_dp_rxdma_pdev_buf_setup) */
++	uint32_t slot = 0, posted = 0;
++	while (slot < N_REFILL - 1 && rx_post(&R_refill, slot)) {
++		slot++;
++		posted++;
++	}
++	ring_commit(&R_refill);
++	for (uint32_t i = 0; i < 2; i++) {
++		for (uint32_t k = 0; k < N_MON_STATUS - 1 && slot < N_RX_BUFS && rx_post(&R_mon[i], slot); k++) {
++			slot++;
++		}
++		ring_commit(&R_mon[i]);
++	}
++	/* HTT SRING_SETUP (ath11k_dp_rx_pdev_alloc order) */
++	if ((error = htt_srng_setup(&R_refill, 0, HTT_SW_TO_SW, HTT_HOST1_TO_FW_RXBUF_RING)) ||
++	    (error = htt_srng_setup(&R_mac_buf[0], 0, HTT_SW_TO_HW, HTT_RXDMA_HOST_BUF_RING)) ||
++	    (error = htt_srng_setup(&R_mac_buf[1], 1, HTT_SW_TO_HW, HTT_RXDMA_HOST_BUF_RING)) ||
++	    (error = htt_srng_setup(&R_err_dst[0], 0, HTT_HW_TO_SW, HTT_RXDMA_NON_MON_DEST_RING)) ||
++	    (error = htt_srng_setup(&R_err_dst[1], 1, HTT_HW_TO_SW, HTT_RXDMA_NON_MON_DEST_RING)) ||
++	    (error = htt_srng_setup(&R_mon[0], 0, HTT_SW_TO_HW, HTT_RXDMA_MON_STATUS_RING)) ||
++	    (error = htt_srng_setup(&R_mon[1], 1, HTT_SW_TO_HW, HTT_RXDMA_MON_STATUS_RING))) {
++		return error;
++	}
++	(void)htt_ring_filter_off(&R_mon[0], 0);
++	(void)htt_ring_filter_off(&R_mon[1], 1);
++	g_pdev_on = true;
++	negroni_wlan_add_poller(negroni_wlan_dp_poll);
++	printf("NEGRONI WLAN: DP pdev rings up: %u rx buffers on the refill ring, %u on the monitor status rings, 7 HTT "
++	    "SRING_SETUP sent, monitor status filter off\n", posted, slot - posted);
++	return 0;
++}
++
++/* ---- peer (join, 0327): HTT peer map, default routing, REO queues, vdev Ethernet mode ---- */
++static int
++vdev_param(uint32_t param, uint32_t value)
++{
++	uint32_t m[4] = { (WMI_TAG_VDEV_SET_PARAM_CMD << 16) | 12, 0, param, value };
++	return negroni_wlan_wmi_send(WMI_VDEV_SET_PARAM_CMDID, m, sizeof(m));
++}
++
++static uint32_t
++tid_to_ac(uint32_t tid)
++{
++	return (tid == 0 || tid == 3) ? 0 : (tid == 1 || tid == 2) ? 1 : (tid == 4 || tid == 5) ? 2 : 3;
++}
++
++/* ath11k_hal_reo_qdesc_setup (ba window 1 -> 2 for QoS TIDs, no PN check, ignore AMPDU flag) */
++static void
++qdesc_setup(volatile uint32_t *q, uint32_t tid)
++{
++	for (uint32_t i = 0; i < QDESC_SIZE / 4; i++) {
++		q[i] = 0;
++	}
++	q[0] = 4u | (8u << 4) | (0xDDBEEFu << 8);          /* owner REO, type queue desc, magic */
++	q[1] = tid & 0xffff;                                /* rx_queue_num */
++	uint32_t ba = tid == 16 ? 1 : 2;
++	q[2] = 1u | (1u << 1) | (tid_to_ac(tid) << 5) | ((ba == 1) ? (1u << 8) : 0) | ((ba - 1) << 11) | (1u << 25);
++	q[3] = 0;                                           /* info1: SSN 0, SVLD 0 */
++	if (tid == 16) {
++		return;
++	}
++	static const uint32_t magic[3] = { 0xADBEEFu, 0xBDBEEFu, 0xCDBEEFu };
++	for (uint32_t e = 0; e < 3; e++) {
++		q[32 + e * 32] = 4u | (9u << 4) | (magic[e] << 8);     /* ext descs after the 128-byte queue desc */
++	}
++}
++
+ int
+ negroni_wlan_dp_wait_peer(const uint8_t mac[6])
+ {
+-	(void)mac;
+-	negroni_wlan_nap(50);   /* no HTT peer map without the data path: give the firmware a moment */
++	int error;
++
++	if (!g_pdev_on) {
++		negroni_wlan_nap(50);   /* no data path: give the firmware a moment for the peer */
++		return 0;
++	}
++	error = negroni_wlan_wmi_wait(&g_peer_mapped, 3000, "HTT PEER_MAP");
++	if (error) {
++		return error;
++	}
++	if (memcmp(g_peer_mac, mac, 6) != 0) {
++		printf("NEGRONI WLAN: DP PEER_MAP for another MAC (%02x:..:%02x), peer id %u\n", g_peer_mac[0], g_peer_mac[5],
++		    g_peer_id);
++	}
++	memcpy(g_bssid, mac, 6);
++	/* ath11k_dp_peer_setup */
++	if ((error = negroni_wlan_peer_set_param(mac, WMI_PEER_SET_DEFAULT_ROUTING, 1u | (1u << 1)))) {
++		return error;
++	}
++	for (uint32_t tid = 0; tid < NUM_TIDS; tid++) {
++		volatile uint32_t *q = (volatile uint32_t *)(g_qd.nc + tid * QDESC_SIZE);
++		uint64_t a = g_qd.dva + (uint64_t)tid * QDESC_SIZE;
++		qdesc_setup(q, tid);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		uint32_t m[1 + 1 + 2 + 6];
++		m[0] = (WMI_TAG_REORDER_QUEUE_SETUP_CMD << 16) | 36;
++		m[1] = 0;                               /* vdev */
++		memset(&m[2], 0, 8);
++		memcpy(&m[2], mac, 6);
++		m[4] = tid;
++		m[5] = (uint32_t)a;
++		m[6] = (uint32_t)(a >> 32);
++		m[7] = tid;                             /* queue_no */
++		m[8] = 1;                               /* ba_window_size_valid */
++		m[9] = 1;                               /* ath11k: ba_win_sz 1 (the qdesc uses 2 for QoS TIDs) */
++		if ((error = negroni_wlan_wmi_send(WMI_PEER_REORDER_QUEUE_SETUP_CMDID, m, sizeof(m)))) {
++			return error;
++		}
++	}
++	/* 802.3 frames both ways (ath11k frame_mode=2, ath11k_mac_op_update_vif_offload) */
++	(void)vdev_param(VDEV_PARAM_TX_ENCAP_TYPE, HW_TXRX_ETHERNET);
++	(void)vdev_param(VDEV_PARAM_RX_DECAP_TYPE, HW_TXRX_ETHERNET);
++	printf("NEGRONI WLAN: DP peer id %u mapped, default routing REO2SW1 + hash, %u REO queues, vdev Ethernet encap/decap\n",
++	    g_peer_id, NUM_TIDS);
+ 	return 0;
+ }
+ 
+ void
+ negroni_wlan_dp_link_up(const uint8_t bssid[6], uint16_t aid)
+ {
+-	(void)bssid;
+ 	(void)aid;
++	memcpy(g_bssid, bssid, 6);
++	/* ath11k_dp_vdev_tx_attach: type 1, vdev id, pdev id */
++	/* review D4: pdev id 0 for single_pdev_only (ath11k wmi.c: pdev id 0 there, dp.c ath11k_dp_vdev_tx_attach) */
++	g_tcl_meta = 1u | (0u << 2) | (0u << 10);
++	lck_mtx_lock(&dp_txq_mtx);
++	g_txq_head = g_txq_tail = 0;            /* review: nothing queued before this link goes out on it */
++	lck_mtx_unlock(&dp_txq_mtx);
++	g_peer_lost = false;
++	g_link_up = g_pdev_on;
+ }
+ 
+ void
+ negroni_wlan_dp_link_down(void)
+ {
++	g_link_up = false;
++	g_peer_mapped = false;
++	g_secured = false;
++	lck_mtx_lock(&dp_txq_mtx);
++	g_txq_head = g_txq_tail = 0;
++	lck_mtx_unlock(&dp_txq_mtx);
+ }
+ 
++uint32_t
++negroni_wlan_dp_caps(void)
++{
++	return g_pdev_on ? NWLAN_CAP_DATA : 0;
++}
++
++/* ---- TX (driver thread): one TCL data descriptor per frame (ath11k_dp_tx + ath11k_hal_tx_cmd_desc_setup) ---- */
++static int
++tcl_send(const uint8_t *frame, uint32_t len)
++{
++	uint32_t slot = N_TX_BUFS;
++
++	if (!g_pdev_on || len < 14 || len > TX_BUF) {
++		return EINVAL;
++	}
++	for (uint32_t k = 0; k < N_TX_BUFS; k++) {
++		uint32_t i = (g_tx_next + k) % N_TX_BUFS;
++		if (!g_tx_busy[i]) {
++			slot = i;
++			break;
++		}
++	}
++	if (slot == N_TX_BUFS) {
++		return ENOBUFS;
++	}
++	volatile uint32_t *d = src_next(&R_tcl_data);
++	if (!d) {
++		return ENOBUFS;
++	}
++	memcpy((void *)(g_txb.nc + slot * TX_BUF), frame, len);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint64_t a = g_txb.dva + (uint64_t)slot * TX_BUF;
++	uint32_t desc_id = (0u) | (slot << 2);                          /* mac 0, msdu id, pool 0 */
++	/* d[0] = TLV header (set at init) */
++	d[1] = (uint32_t)a;
++	d[2] = (uint32_t)((a >> 32) & 0xff) | (RBM_SW0 << 8) | (desc_id << 11);
++	d[3] = (0u) | (TCL_ENCAP_ETHERNET << 2) | (0u << 4) | (TCL_SEARCH_DEFAULT << 12) | (TCL_ADDRY_EN << 14) |
++	    ((g_tcl_meta & 0xffff) << 16);
++	d[4] = len & 0xffff;                                            /* data length, pkt offset 0 */
++	d[5] = (1u << 21) | (0u << 22) | (0u << 26);                    /* TID overwrite, TID 0, lmac 0 */
++	d[6] = 0;                                                       /* dscp table 0, search index 0, cache set 0 */
++	d[7] = 0;
++	g_tx_busy[slot] = true;
++	g_tx_next = (slot + 1) % N_TX_BUFS;
++	ring_commit(&R_tcl_data);
++	g_tx_frames++;
++	return 0;
++}
++
++static void
++tx_complete(void)
++{
++	volatile uint32_t *d;
++	bool moved = false;
++
++	while ((d = dst_next(&R_tx_comp))) {
++		uint32_t desc_id = d[1] >> 11, slot = (desc_id >> 2) & 0x1ffff;
++		uint32_t src = d[2] & 7, reason = (d[2] >> 13) & 0xf;
++		if (slot < N_TX_BUFS) {
++			g_tx_busy[slot] = false;
++		}
++		if (src == 0 && reason != 0) {                          /* TQM: 0 = acked (HAL_WBM_TQM_REL_REASON_FRAME_ACKED) */
++			g_tx_fail++;
++		}
++		moved = true;
++	}
++	if (moved) {
++		ring_commit(&R_tx_comp);
++	}
++}
++
++/* ---- RX ---- */
++static uint8_t g_rx_frame[RX_BUF];
++
++/* native Wi-Fi decap (802.11 3-address header + LLC/SNAP) -> Ethernet II */
++static uint32_t
++nwifi_to_eth(const uint8_t *p, uint32_t len, uint8_t *out)
++{
++	if (len < 24 + 8 || p[24] != 0xaa || p[25] != 0xaa || p[26] != 0x03) {
++		return 0;
++	}
++	uint32_t fc = p[0] | p[1] << 8;
++	const uint8_t *da = p + 4, *sa = (fc & 0x0200) ? p + 16 : p + 10;        /* from DS: addr3 = SA */
++	memcpy(out, da, 6);
++	memcpy(out + 6, sa, 6);
++	memcpy(out + 12, p + 30, 2);                                    /* ethertype after the SNAP header */
++	memcpy(out + 14, p + 32, len - 32);
++	return len - 32 + 14;
++}
++
++static bool g_rx_decrypted;             /* of the frame rx_deliver handles */
++
++static void
++rx_deliver(const uint8_t *eth, uint32_t len)
++{
++	if (len < 14) {
++		g_rx_drops++;
++		return;
++	}
++	g_rx_frames++;
++	if (eth[12] == 0x88 && eth[13] == 0x8e) {                       /* EAPOL: the kernel's WPA2 handshake (0329) */
++		if (memcmp(eth + 6, g_bssid, 6) != 0) {
++			g_rx_drops++;                                   /* review: EAPOL only from our AP */
++			return;
++		}
++		if (negroni_wlan_wpa_rx_eapol(eth + 14, len - 14)) {
++			return;
++		}
++	}
++	if (g_secured && !g_rx_decrypted) {
++		g_rx_drops++;                   /* review D6: after the keys, a frame that was not decrypted is dropped */
++		return;
++	}
++	if (negroni_wlan_sta_state() == NWLAN_STATE_CONNECTED) {
++		negroni_wlan_sta_deliver(eth, len);
++	} else {
++		g_rx_drops++;
++	}
++}
++
++static void
++rx_process_ring(struct dp_ring *r)
++{
++	volatile uint32_t *d;
++	bool moved = false;
++
++	while ((d = dst_next(r))) {
++		moved = true;
++		uint32_t slot = rx_slot(d[1]), push = (d[7] >> 9) & 3, msdu = d[4];      /* info0 = dword 7 */
++		if (slot == ~0u) {
++			g_rx_bad++;
++			continue;
++		}
++		if (!g_rx_posted[slot]) {
++			g_rx_unposted++;        /* review D2: a buffer we do not own: neither read nor posted again */
++			continue;
++		}
++		const uint8_t *b = (const uint8_t *)(g_rxb.nc + slot * RX_BUF);
++		bool cont = (msdu >> 2) & 1;
++		if (push != PUSH_ROUTING || cont || r->skip_cont) {
++			r->skip_cont = cont;            /* a frame larger than a buffer: dropped (ath11k: multi-buffer msdu) */
++			g_rx_err++;
++			rx_recycle(slot);
++			continue;
++		}
++		__asm__ volatile ("dmb ld" ::: "memory");
++		uint32_t attn2, end2, start1, start2, mp1, mp2;
++		memcpy(&mp1, b + RXD_MPDU_START_INFO1, 4);
++		memcpy(&mp2, b + RXD_MPDU_START_INFO2, 4);
++		memcpy(&attn2, b + RXD_ATTN_INFO2, 4);
++		memcpy(&end2, b + RXD_MSDU_END_INFO2, 4);
++		memcpy(&start1, b + RXD_MSDU_START_INFO1, 4);
++		memcpy(&start2, b + RXD_MSDU_START_INFO2, 4);
++		uint32_t mlen = start1 & 0x3fff, pad = (end2 >> 26) & 3, decap = (start2 >> 8) & 3;
++		if (!(attn2 & RXD_MSDU_DONE) || RX_DESC_SZ + pad + mlen > RX_BUF) {
++			g_rx_bad++;
++			rx_recycle(slot);
++			continue;
++		}
++		const uint8_t *data = b + RX_DESC_SZ + pad;
++		/* review D6 (ath11k_dp_rx_h_attn_is_decrypted): encrypted (encrypt info valid, type not OPEN) and decrypt OK */
++		bool decrypted = (mp1 & RXD_MPDU_ENC_VALID) && ((mp2 >> 2) & 0xf) != HAL_ENC_OPEN && ((attn2 >> 10) & 7) == 0;
++		g_rx_decrypted = decrypted;
++		if (decap == DECAP_ETH2) {
++			memcpy(g_rx_frame, data, mlen);
++			rx_recycle(slot);
++			rx_deliver(g_rx_frame, mlen);
++		} else if (decap == DECAP_NATIVE_WIFI && mlen >= 32 && mlen - 32 + 14 <= sizeof(g_rx_frame)) {
++			uint32_t n = nwifi_to_eth(data, mlen, g_rx_frame);
++			rx_recycle(slot);
++			if (n) {
++				rx_deliver(g_rx_frame, n);
++			} else {
++				g_rx_drops++;
++			}
++		} else {
++			rx_recycle(slot);
++			g_rx_drops++;
++		}
++	}
++	if (moved) {
++		ring_commit(r);
++	}
++}
++
++/* a link descriptor back to the WBM idle list (ath11k_dp_rx_link_desc_return) */
++static bool
++link_return_one(uint32_t info0, uint32_t info1)
++{
++	volatile uint32_t *w = src_next(&R_wbm_rel);
++	if (!w) {
++		return false;
++	}
++	for (uint32_t i = 0; i < 8; i++) {
++		w[i] = 0;
++	}
++	w[0] = info0;
++	w[1] = info1;
++	w[2] = WBM_REL_SRC_SW | (0u << 3) | (WBM_REL_DESC_MSDU_LINK << 6);      /* put in idle */
++	ring_commit(&R_wbm_rel);
++	g_link_returned++;
++	return true;
++}
++
++static void
++link_return(uint32_t info0, uint32_t info1)
++{
++	while (g_lpend_n && link_return_one(g_lpend[g_lpend_n - 2], g_lpend[g_lpend_n - 1])) {
++		g_lpend_n -= 2;
++	}
++	if (!link_return_one(info0, info1) && g_lpend_n + 2 <= sizeof(g_lpend) / sizeof(g_lpend[0])) {
++		g_lpend[g_lpend_n++] = info0;
++		g_lpend[g_lpend_n++] = info1;
++	}
++}
++
++/* REO exception and rxdma error entries point at an MSDU link descriptor: recycle its buffers, return it */
++static void
++err_ring(struct dp_ring *r)
++{
++	volatile uint32_t *d;
++	bool moved = false;
++
++	while ((d = dst_next(r))) {
++		moved = true;
++		g_rx_err++;
++		uint64_t la = (uint64_t)d[0] | ((uint64_t)(d[1] & 0xff) << 32);
++		if (la < g_link.dva || la >= g_link.dva + g_link.size || ((la - g_link.dva) % LINK_DESC_SIZE) != 0) {
++			g_rx_bad++;     /* review D1: not one of our 128-byte link descriptors */
++			continue;
++		}
++		volatile uint32_t *ld = (volatile uint32_t *)(g_link.nc + (la - g_link.dva));
++		for (uint32_t i = 0; i < 6; i++) {
++			uint32_t a0 = ld[8 + 4 * i], a1 = ld[8 + 4 * i + 1];
++			if (!a0) {
++				break;
++			}
++			rx_recycle(rx_slot(a1));
++		}
++		link_return(d[0], d[1]);
++	}
++	if (moved) {
++		ring_commit(r);
++	}
++}
++
++/* WBM2SW3: released rx buffers (wbm error path) */
++static void
++rel_ring(void)
++{
++	volatile uint32_t *d;
++	bool moved = false;
++
++	while ((d = dst_next(&R_rx_rel))) {
++		moved = true;
++		uint32_t desc_type = (d[2] >> 6) & 7;
++		if (desc_type == WBM_REL_DESC_MSDU_LINK) {
++			continue;
++		}
++		rx_recycle(rx_slot(d[1]));
++		g_rel_bufs++;
++	}
++	if (moved) {
++		ring_commit(&R_rx_rel);
++	}
++}
++
++/* drain the API's TX queue into the TCL ring (driver thread) */
++static void
++tx_drain(void)
++{
++	static uint8_t f[TXQ_FRAME];
++	for (;;) {
++		uint32_t len = 0;
++		lck_mtx_lock(&dp_txq_mtx);
++		if (g_txq_tail != g_txq_head) {
++			len = g_txq_len[g_txq_tail];
++			memcpy(f, g_txq[g_txq_tail], len);
++		}
++		lck_mtx_unlock(&dp_txq_mtx);
++		if (!len) {
++			return;
++		}
++		if (tcl_send(f, len) == ENOBUFS) {
++			return;                         /* keep it queued; completions free slots */
++		}
++		lck_mtx_lock(&dp_txq_mtx);
++		g_txq_tail = (g_txq_tail + 1) % TXQ_N;
++		lck_mtx_unlock(&dp_txq_mtx);
++	}
++}
++
++/* poller (inside negroni_wlan_service): never sends WMI, never waits */
++void
++negroni_wlan_dp_poll(void)
++{
++	if (!g_pdev_on || g_in_poll) {
++		return;
++	}
++	g_in_poll = true;
++	tx_complete();
++	for (uint32_t i = 0; i < 4; i++) {
++		rx_process_ring(&R_reo_dst[i]);
++	}
++	rx_repost();
++	err_ring(&R_reo_except);
++	err_ring(&R_err_dst[0]);
++	err_ring(&R_err_dst[1]);
++	rel_ring();
++	if (g_link_up) {
++		tx_drain();
++	}
++	/* the shadow-register timer of ath11k: publish the producer pointers again while they are ahead */
++	if (src_free(&R_tcl_data) + 1 < N_TCL_DATA) {
++		ring_commit(&R_tcl_data);
++	}
++	g_in_poll = false;
++}
++
++/* 0329: an EAPOL frame to the AP (Ethernet II, ethertype 0x888e), unencrypted while no key is installed */
+ int
+ negroni_wlan_dp_tx_eapol(const uint8_t *body, uint32_t len)
+ {
+-	(void)body;
+-	(void)len;
+-	return ENOTSUP;
++	uint8_t f[14 + 512];
++
++	if (!g_link_up || len > 512) {
++		return ENOTCONN;
++	}
++	memcpy(f, g_bssid, 6);
++	memcpy(f + 6, negroni_wlan_wmi_mac(), 6);
++	f[12] = 0x88;
++	f[13] = 0x8e;
++	memcpy(f + 14, body, len);
++	return tcl_send(f, 14 + len);
++}
++
++/* true when every TX buffer came back (0329 waits for message 4 before installing the keys) */
++bool
++negroni_wlan_dp_tx_idle(void)
++{
++	tx_complete();
++	for (uint32_t i = 0; i < N_TX_BUFS; i++) {
++		if (g_tx_busy[i]) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* ---- API ---- */
++int
++negroni_wlan_tx(const uint8_t *frame, uint32_t len)
++{
++	int error = 0;
++
++	if (!frame || len < 14 || len > TXQ_FRAME) {
++		return EINVAL;
++	}
++	if (!g_link_up || negroni_wlan_sta_state() != NWLAN_STATE_CONNECTED) {
++		return ENOTCONN;
++	}
++	lck_mtx_lock(&dp_txq_mtx);
++	uint32_t next = (g_txq_head + 1) % TXQ_N;
++	if (next == g_txq_tail) {
++		error = ENOBUFS;
++		g_tx_drops++;
++	} else {
++		memcpy(g_txq[g_txq_head], frame, len);
++		g_txq_len[g_txq_head] = (uint16_t)len;
++		g_txq_head = next;
++	}
++	lck_mtx_unlock(&dp_txq_mtx);
++	return error;
+ }
+ 
+ void
+ negroni_wlan_sta_link_counters(struct nwlan_link *out)
+ {
+-	(void)out;
++	out->tx_frames = g_tx_frames;
++	out->rx_frames = g_rx_frames;
++	out->tx_dropped = g_tx_drops + g_tx_fail;
++	out->rx_dropped = g_rx_drops + g_rx_err + g_rx_bad;
++}
++
++/* one line for the keep-alive log */
++void
++negroni_wlan_dp_report(void)
++{
++	if (!g_pdev_on) {
++		return;
++	}
++	printf("NEGRONI WLAN: DP tx %llu (fail %u, queue drops %llu), rx %llu (drops %llu, errors %u, bad %u), released "
++	    "bufs %u, link descs returned %u, HTT other %u\n", g_tx_frames, g_tx_fail, g_tx_drops, g_rx_frames, g_rx_drops,
++	    g_rx_err, g_rx_bad, g_rel_bufs, g_link_returned, g_htt_other);
++}
++
++/* after the chip lost bus mastering */
++void
++negroni_wlan_dp_free(void)
++{
++	g_pdev_on = g_dp_on = g_link_up = g_secured = false;
++	memset(g_rx_posted, 0, sizeof(g_rx_posted));
++	memset(g_tx_busy, 0, sizeof(g_tx_busy));
++	g_repost_n = g_lpend_n = 0;
++	negroni_wlan_dma_free(&g_rings);
++	negroni_wlan_dma_free(&g_link);
++	negroni_wlan_dma_free(&g_rxb);
++	negroni_wlan_dma_free(&g_txb);
++	negroni_wlan_dma_free(&g_qd);
++	g_rdp = g_wrp = NULL;
++}
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++/* review: HTT PEER_UNMAP of our AP while the link is up */
++bool
++negroni_wlan_dp_peer_lost(void)
++{
++	return g_peer_lost;
+ }
+ 
++/*
++ * Review D5: REO PN replay check on every TID queue after the pairwise key (ath11k_dp_peer_rx_pn_replay_config):
++ * REO_UPDATE_RX_QUEUE with PN check, PN size 48, PN valid, PN 0. Then only decrypted frames pass (D6).
++ */
+ int
+-negroni_wlan_tx(const uint8_t *frame, uint32_t len)
++negroni_wlan_dp_secure(void)
++{
++	if (!g_pdev_on) {
++		return ENXIO;
++	}
++	uint32_t sent = 0;
++	for (uint32_t tid = 0; tid < NUM_TIDS; tid++) {
++		volatile uint32_t *d = src_next(&R_reo_cmd);
++		if (!d) {
++			break;
++		}
++		uint64_t a = g_qd.dva + (uint64_t)tid * QDESC_SIZE;
++		uint32_t num = d[1] & 0xffff;                           /* command number kept (ath11k memset_startat) */
++		d[0] = (419u << 1) | (36u << 10);                       /* HAL_REO_UPDATE_RX_REO_QUEUE, 9 dwords */
++		d[1] = num;                                             /* no status required */
++		d[2] = (uint32_t)a;
++		d[3] = (uint32_t)((a >> 32) & 0xff) | (1u << 19) | (1u << 23) | (1u << 25) | (1u << 29) | (1u << 30);
++		d[4] = (1u << 27);                                      /* PN check on */
++		d[5] = 1u | (1u << 8);                                  /* BA window 2 - 1, PN size 48 */
++		d[6] = d[7] = d[8] = d[9] = 0;                          /* PN 0 */
++		sent++;
++	}
++	ring_commit(&R_reo_cmd);
++	g_secured = true;
++	printf("NEGRONI WLAN: DP PN replay check on %u TID queues; only decrypted frames from now on\n", sent);
++	return sent == NUM_TIDS ? 0 : ENOBUFS;
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++/*
++ * Review D7: the data path is a soft part. A failure prints one line, keeps every DMA area allocated (rings the hardware
++ * already knows stay valid memory), stops using the data path (no NWLAN_CAP_DATA) and lets the level go on (scan).
++ */
++static int
++dp_soft(int error, const char *stage)
+ {
+-	(void)frame;
+-	(void)len;
+-	return ENOTSUP;
++	if (error) {
++		printf("NEGRONI WLAN: DP OFF after %s (error %d): no data path this boot; scan and join frames still work\n", stage,
++		    error);
++		g_dp_on = g_pdev_on = g_link_up = false;
++	}
++	return 0;
+ }
+ 
++int
++negroni_wlan_dp_common_setup(void)
++{
++	return dp_soft(negroni_wlan_dp_common_setup_inner(), "the common rings");
++}
++
++int
++negroni_wlan_dp_reo_setup(void)
++{
++	return dp_soft(negroni_wlan_dp_reo_setup_inner(), "the REO rings");
++}
++
++int
++negroni_wlan_dp_pdev_setup(void)
++{
++	return dp_soft(negroni_wlan_dp_pdev_setup_inner(), "the pdev rings");
++}
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_join.c b/bsd/dev/negroni_wlan_join.c
+index e1e0875..3c2b677 100644
+--- a/bsd/dev/negroni_wlan_join.c
++++ b/bsd/dev/negroni_wlan_join.c
+@@ -1004,6 +1004,10 @@ negroni_wlan_sta_join_service(void)
+ 	if (!J.active) {
+ 		return;
+ 	}
++	if (J.up && !J.lost && negroni_wlan_dp_peer_lost()) {
++		J.lost = true;
++		J.lost_why = "HTT PEER_UNMAP of the AP";             /* 0328 review */
++	}
+ 	if (J.up && !J.lost && negroni_wlan_ms() - J.last_beacon_ms > BEACON_LOSS_MS) {
+ 		J.lost = true;
+ 		J.lost_why = "no beacon for 10 s";
+diff --git a/bsd/dev/negroni_wlan_sta.h b/bsd/dev/negroni_wlan_sta.h
+index 5cb7ed3..e0474fc 100644
+--- a/bsd/dev/negroni_wlan_sta.h
++++ b/bsd/dev/negroni_wlan_sta.h
+@@ -66,6 +66,17 @@ void negroni_wlan_dp_link_up(const uint8_t bssid[6], uint16_t aid);
+ void negroni_wlan_dp_link_down(void);
+ /* 0329: send one EAPOL frame (802.3 payload after the ethertype) to the AP, unencrypted */
+ int negroni_wlan_dp_tx_eapol(const uint8_t *body, uint32_t len);
++/* 0328: the data path stages (negroni_wlan_dp.c) */
++int negroni_wlan_dp_common_setup(void);         /* after the CE rings, before HTC READY */
++int negroni_wlan_dp_reo_setup(void);            /* before WMI INIT */
++int negroni_wlan_dp_pdev_setup(void);           /* after WMI READY + hw mode */
++void negroni_wlan_dp_htt_rx(const uint8_t *p, uint32_t len);   /* HTT target->host messages */
++void negroni_wlan_dp_poll(void);
++bool negroni_wlan_dp_tx_idle(void);
++void negroni_wlan_dp_report(void);
++void negroni_wlan_dp_free(void);
++bool negroni_wlan_dp_peer_lost(void);           /* review: HTT PEER_UNMAP of our AP while the link is up */
++int negroni_wlan_dp_secure(void);               /* review D5/D6: PN check + decrypted frames only, after the keys */
+ 
+ /* negroni_wlan_wpa.c (0327 placeholders, 0329 WPA2-PSK) */
+ uint32_t negroni_wlan_wpa_caps(void);
+diff --git a/bsd/dev/negroni_wlan_wmi.c b/bsd/dev/negroni_wlan_wmi.c
+index 9cee4d5..50c87eb 100644
+--- a/bsd/dev/negroni_wlan_wmi.c
++++ b/bsd/dev/negroni_wlan_wmi.c
+@@ -459,7 +459,8 @@ htc_rx(uint32_t pipe, const uint8_t *b, uint32_t len)
+ 	} else if (f.eid == g_wmi_eid) {
+ 		wmi_event(f.payload, f.payload_len);
+ 	} else if (f.eid == g_htt_eid) {
+-		g_htc_htt++;            /* HTT target -> host: not used before the data path (0324+) */
++		g_htc_htt++;
++		negroni_wlan_dp_htt_rx(f.payload, f.payload_len);      /* 0328: version, peer map/unmap */
+ 	} else {
+ 		g_htc_other++;
+ 	}
+@@ -609,6 +610,17 @@ negroni_wlan_wmi_send(uint32_t cmd, const void *tlvs, uint32_t len)
+ 	return htc_send(g_wmi_eid, m, len + 4);
+ }
+ 
++/* 0328: one HTT host->target message on the HTT endpoint (CE4, no credit flow) */
++int negroni_wlan_htt_send(const void *msg, uint32_t len);
++int
++negroni_wlan_htt_send(const void *msg, uint32_t len)
++{
++	if (g_htt_eid >= HTC_EP_COUNT) {
++		return ENXIO;
++	}
++	return htc_send(g_htt_eid, msg, len);
++}
++
+ /* wait until *flag, servicing the chip */
+ int negroni_wlan_wmi_wait(volatile bool *flag, uint32_t ms, const char *what);
+ int
+@@ -789,6 +801,10 @@ negroni_wlan_wmi_level(void)
+ 	    M.phy_id, M.bands, M.tx_mask_2g, M.rx_mask_2g, M.tx_mask_5g, M.rx_mask_5g,
+ 	    svc_has(WMI_SERVICE_EXT2_MSG) ? "yes" : "no", M.svc_avail ? "yes" : "no");
+ 
++	error = negroni_wlan_dp_reo_setup();   /* 0328: REO2SW rings before WMI INIT (ath11k_core_start) */
++	if (error) {
++		return error;
++	}
+ 	negroni_wlan_step(31, "WMI INIT");
+ 	error = wmi_send_init();
+ 	if (error) {
+@@ -1031,6 +1047,11 @@ wmi_chan_list(void)
+ 		printf("NEGRONI WLAN: WMI PDEV_SET_HW_MODE DBS %s\n", S.hw_mode_resp ? "answered" : "sent (no answer in 2 s; "
+ 		    "going on)");
+ 	}
++	/* 0328: HTT version + the rx rings (ath11k: after the hw mode, before the pdev comes up) */
++	error = negroni_wlan_dp_pdev_setup();
++	if (error) {
++		return error;
++	}
+ 	/* in pieces that fit the WMI endpoint's max message, the later ones with APPEND (wmi.c:2590-2660) */
+ 	uint32_t room = g_ep[g_wmi_eid].max_msg > 4 + 16 + 4 ? (g_ep[g_wmi_eid].max_msg - 4 - 16 - 4) / 28 : 0;
+ 	uint32_t per = MIN(room, NFREQ), sent = 0, sends = 0;

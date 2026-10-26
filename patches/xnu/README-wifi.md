@@ -696,6 +696,45 @@ New lines: `SMMU contexts from N (NUMS2CB M): ..., K skipped (probe/helper verdi
 `SMMU context C claimed: CBAR was X (type t, VMID v) CBA2R Y, now CBAR 0x1f300 CBA2R 0x1`,
 `SMMU context C off (SCTLR 0 1; S2CR s SMR m restored; CBAR/CBA2R left claimed)`.
 
+## Review fixes 0325/0328/0329 and 0339 SBL boot dump (2026-10-27, after phone test t6)
+
+Phone t6 (kernel local-20261026-214005, `negroniwlan=10 negroniwlan_smmu=3`) [V, logs/usblog-t6.txt]: the stage-1 claim
+works under Gunyah (context 6, SMR6 0x80011c00, S2CR6 0x6, pool at IOVA 0xa0000000), `BHI SBL 524288 bytes at
+0xa0010000` finished at once, then MHISTATUS 0 and EE 0 for 10 s (step 9), SMMU context FSR 0 and sGFSR 0 (no fault).
+MHI VER reads 0xdeadbeef in PBL (REGLEN 0x100, BHIOFF 0x100, BHIEOFF 0x224).
+
+Review fixes (Opus review, applied):
+- 0325: claim order CBA2R, CBAR, then SCTLR 0 only after a good claim and only when SCTLR != 0 (as 0249); also skip
+  banks with verdict REWRITE_REFUSED / REWRITE_CHANGED; a bank with TLBSTATUS busy is skipped; try-accessor -2 (no
+  XNUPOST) stops the claim instead of marking READ_ABORT; the SMR reuse rule is the helper's (exact SMR value of ours +
+  S2CR fault/bypass); every TLB sync result is checked (map refuses the IOVA on a time-out).
+- 0328: D1 link-descriptor addresses must be 128-byte aligned inside our bank; D2 a cookie for a buffer the hardware
+  does not own is counted and dropped, a full refill ring keeps the buffer on a repost list; D3 hardware pointers must be
+  entry-aligned; D4 TCL metadata pdev id 0 (single pdev); D5 REO PN replay check (REO UPDATE_RX_QUEUE on the 17 TID
+  queues) after the pairwise key; D6 after the keys only decrypted frames pass (EAPOL from the BSSID excepted); D7 the
+  data path is a soft part (a `DP OFF after ...` line, no NWLAN_CAP_DATA, scan goes on; DMA areas stay allocated);
+  per-ring multi-buffer skip state, HTT PEER_UNMAP of the AP takes the link down, TX/RX ownership state reset on
+  (re)init, the TX queue cleared at link up, a link descriptor that does not fit SW2WBM waits on a list.
+- 0329: W1 a retransmitted message 3 after the keys gets message 4 only (no PTK re-install, no second done), an identical
+  GTK is never installed twice; W2 message 1 derives a temporary PTK, committed only by a good message 3 (wpa_supplicant
+  TPTK), and message 1 outside our handshake is ignored (no PTK rekey); W3 the GTK must be 16 bytes with index 1..3; W4 a
+  failed group-rekey install takes the link down with a line; plus: message 3 needs the INSTALL bit and the AP's beacon
+  RSN element, INSTALL_KEY_COMPLETE must match vdev/index/flags/AP MAC, the bad-MIC decision by pointer
+  (`LX_WPA_WHY_MIC`), secrets wiped with a volatile loop in the port. [V] host test of the changed port: HakiOS
+  tools/wpa-test adapted (TPTK checks + "message 1 after message 3 keeps the PTK"): 231 checks, 0 failed (ASan/UBSan).
+
+0339 (`patches/xnu/0339-negroni-wlan-sbl-boot-dump.patch`, read-only diagnostics, cnss2 `cnss_boot_debug_timeout_hdlr`):
+`BOOT <when>: MHI ...`, `BOOT <when>: BHI IMGADDR .. IMGSIZE .. TXDB .. INTVEC .. EXECENV .. STATUS .. ERRCODE .. ERRDBG ..`,
+`BOOT <when>: TCSR_PBL_LOGGING .. SBL log at .. size .. PBL_WLAN_BOOT_CFG .. PBL_BOOTSTRAP_STATUS .. WLAON_WL_PWR_STATUS ..
+SCRATCH ..`, `BOOT <when>: PBL log ..` (10 words), `BOOT <when>: SBL log ..` (12 words) or `no SBL log`; when = `before
+BHI`, `BHI SBL` (right after DONE), `waiting for READY` (every 3 s), `READY time-out`. Also `SBL image in RAM: 7f 45 4c 46
+.. (ELF)`, `BHI before the doorbell: IMGADDR 0:a0010000 (wrote 0:a0010000) IMGSIZE 0x80000 ...`, `BHI SBL done after N ms,
+status 0x8.......`, `waiting for READY: execution environment E after N ms`. READY now waits MAX(negroniwlan_to, 30 s).
+How to read it [I]: STATUS 0x8xxxxxxx + ERRCODE 0 + PBL log ending in an auth/hash error code = the PBL rejected the SBL
+(image content or the chip saw other bytes: check the ELF line and SMMU); EE moving to 1 (SBL) without READY + an SBL log =
+the SBL runs and stops on something (its log says what: clocks, rails, DDR); TCSR_PBL_LOGGING unchanged from `before BHI`
+= the PBL never jumped. Next steps follow from these lines (no guess here).
+
 ## 0261-negroni-wlan-mhi-fw.patch
 
 Stage 1 of the driver: claim BAR0, choose the firmware, download it over MHI (BHI + BHIe), reach

@@ -7,10 +7,10 @@ keep-alive loop runs the station service. negroni_wlan_wmi.c: every MGMT_RX fram
 negroni_wlan_wmi_scan_start for later scans. Details: patches/xnu/README-wifi.md "0326".
 
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 7b1b78e..332bc21 100644
+index b589810..bb8e3e5 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -126,6 +126,8 @@ bsd/dev/negroni_wlan_qmi.c		standard
+@@ -125,6 +125,8 @@ bsd/dev/negroni_wlan_qmi.c		standard
  bsd/dev/negroni_wlan_ce.c		standard
  bsd/dev/negroni_wlan_wmi.c		standard
  bsd/dev/negroni_wlan_smmu.c		standard
@@ -20,7 +20,7 @@ index 7b1b78e..332bc21 100644
  bsd/dev/negroni_wlan_mhi.c		standard
  bsd/dev/negroni_adsp.c			standard
 diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
-index 0f371f2..b1af0dd 100644
+index 58b54f4..913d500 100644
 --- a/bsd/dev/negroni_wlan.c
 +++ b/bsd/dev/negroni_wlan.c
 @@ -32,6 +32,7 @@
@@ -31,7 +31,7 @@ index 0f371f2..b1af0dd 100644
  #include "negroni_mmio.h"      /* 0325: PARF BDF-to-SID access before the step-6 include below */
  
  extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
-@@ -333,6 +334,9 @@ wlan_keep_alive(void)
+@@ -334,6 +335,9 @@ wlan_keep_alive(void)
  		if (negroni_qrtr.attached) {
  			negroni_wlan_wlfw_idle();
  		}
@@ -41,7 +41,7 @@ index 0f371f2..b1af0dd 100644
  		uint64_t now = negroni_wlan_ms();
  		if (now >= next_log) {
  			next_log = now + 60000;
-@@ -342,6 +346,7 @@ wlan_keep_alive(void)
+@@ -343,6 +347,7 @@ wlan_keep_alive(void)
  		}
  		if (g_keep_s && now - start >= (uint64_t)g_keep_s * 1000) {
  			printf("NEGRONI WLAN: keep-alive ends after %u s (negroniwlan_keep); the chip keeps running\n", g_keep_s);
@@ -49,7 +49,7 @@ index 0f371f2..b1af0dd 100644
  			return 0;
  		}
  		negroni_wlan_nap(20);
-@@ -1108,6 +1113,9 @@ wlan_run(void)
+@@ -1109,6 +1114,9 @@ wlan_run(void)
  		if (g_level < WLAN_LEVEL_AMSS) {
  			return 0;       /* no channel runs yet: nothing to drain */
  		}
@@ -59,7 +59,7 @@ index 0f371f2..b1af0dd 100644
  		error = wlan_keep_alive();
  		if (!error) {
  			return 0;
-@@ -1117,6 +1125,7 @@ wlan_run(void)
+@@ -1118,6 +1126,7 @@ wlan_run(void)
  	if (!g_why_set) {
  		printf("NEGRONI WLAN: step %u %s failed: %s (error %d)\n", g_step, g_step_name, errno_text(error), error);
  	}
@@ -67,7 +67,7 @@ index 0f371f2..b1af0dd 100644
  	snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WLAN STOP %u", g_step);
  	negroni_wifi_badge_color = 0x00c00000;
  	negroni_wlan_smmu_report();     /* 0324: a context fault explains a time-out */
-@@ -1155,6 +1164,7 @@ negroni_wlan_start(void)
+@@ -1156,6 +1165,7 @@ negroni_wlan_start(void)
  	}
  	printf("NEGRONI WLAN: start: levels %u..%u, time-out %u ms per wait, SMMU policy %u\n", WLAN_LEVEL_SBL,
  	    MIN(g_level, (uint32_t)WLAN_LEVEL_MAX), g_timeout_ms, g_smmu_policy);

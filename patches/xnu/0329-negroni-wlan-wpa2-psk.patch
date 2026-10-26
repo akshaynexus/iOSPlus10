@@ -1,0 +1,1161 @@
+0329-negroni-wlan-wpa2-psk: Wi-Fi, WPA2-PSK in the kernel (4-way + group handshake, CCMP keys by WMI).
+negroni_wlan_wpa_crypto.{c,h}: HakiOS wifi/lx/src/lx_wpa.{c,h} (MIT, notice kept; commit a52a4c9d) - SHA-1, HMAC,
+PBKDF2 PMK, PRF PTK, MIC, AES key unwrap, message 2/4/group replies; host test of the port: HakiOS tools/wpa-test,
+195 checks, 0 failed (ASan/UBSan). negroni_wlan_wpa.c: passphrase (8..63 printable) or 64-hex PMK, read_random
+nonce, our RSN element (CCMP/CCMP/PSK, no MFP), EAPOL from the data path queued and handled at the top level,
+message 4 out before WMI_VDEV_INSTALL_KEY pairwise + group (RSC), INSTALL_KEY_COMPLETE checked, then PEER AUTHORIZE ->
+CONNECTED; group rekey; 10 s time-out / bad MIC -> link down (reason 15). No key bytes logged. negroni_wlan_join.c:
+stop when the AP's group cipher is not CCMP. Details: patches/xnu/README-wifi.md "0329".
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index d4b8c14..2b1b71b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -129,6 +129,7 @@ bsd/dev/negroni_wlan_sta.c		standard
+ bsd/dev/negroni_wlan_join.c		standard
+ bsd/dev/negroni_wlan_dp.c		standard
+ bsd/dev/negroni_wlan_wpa.c		standard
++bsd/dev/negroni_wlan_wpa_crypto.c	standard
+ bsd/dev/negroni_wlan_bhi.c		standard
+ bsd/dev/negroni_wlan_mhi.c		standard
+ bsd/dev/negroni_adsp.c			standard
+diff --git a/bsd/dev/negroni_wlan_join.c b/bsd/dev/negroni_wlan_join.c
+index 3c2b677..c7637a2 100644
+--- a/bsd/dev/negroni_wlan_join.c
++++ b/bsd/dev/negroni_wlan_join.c
+@@ -900,6 +900,10 @@ join_run(const uint8_t *ssid, uint32_t ssid_len, const char *psk, uint32_t psk_l
+ 
+ 	uint8_t rsn_ie[32];
+ 	uint32_t rsn_len = rsn ? negroni_wlan_wpa_rsn_ie(rsn_ie, sizeof(rsn_ie)) : 0;   /* 0329 */
++	if (rsn && rsn_len == 0) {
++		join_down(ENOTSUP, 0, "WPA2 not possible with this AP (group cipher)");      /* 0329 */
++		return;
++	}
+ 	ok = false;
+ 	for (uint32_t t = 0; t < JOIN_TRIES && !ok; t++) {
+ 		J.assoc_rx = false;
+diff --git a/bsd/dev/negroni_wlan_wpa.c b/bsd/dev/negroni_wlan_wpa.c
+index cc09144..39971f8 100644
+--- a/bsd/dev/negroni_wlan_wpa.c
++++ b/bsd/dev/negroni_wlan_wpa.c
+@@ -1,63 +1,398 @@
+ /*
+- * NEGRONI QCA6490 Wi-Fi: WPA2-PSK. 0327: placeholders (open networks only); 0329 replaces this file.
++ * NEGRONI QCA6490 Wi-Fi (patch 0329): WPA2-PSK (AKM 00-0f-ac:2, CCMP pairwise and group) in the kernel.
++ *
++ * The arithmetic (PMK, PTK, MIC, key unwrap, message 2/4 and group replies) is HakiOS lx_wpa.c (MIT, ported as
++ * negroni_wlan_wpa_crypto.c, host-tested). This file runs the handshake on the driver thread:
++ *   start (after VDEV_UP): PMK from the passphrase (PBKDF2, 4096 rounds) or the 64-hex PMK, a fresh nonce
++ *     (read_random), the RSN element of our ASSOC REQ; the passphrase is wiped at once
++ *   EAPOL frames from the data path (0328) are queued in the poller and handled in the top-level pass:
++ *     message 1 -> message 2; message 3 -> message 4, then (after message 4 left the TX ring) WMI_VDEV_INSTALL_KEY
++ *     pairwise (index 0) and group (its index, RSC from message 3), each confirmed by INSTALL_KEY_COMPLETE, then
++ *     negroni_wlan_join_handshake_done -> PEER AUTHORIZE -> CONNECTED; a later group message -> reply + new group key
++ *   10 s without a complete handshake, a bad MIC (wrong passphrase) or a refused key -> the join goes down
++ *     (802.11 reason 15, 4-way handshake time-out).
++ * No key or passphrase byte is ever printed. Management frame protection (MFP) is not offered (RSN capabilities 0):
++ * a network that requires it refuses the association. UNTESTED ON HARDWARE.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <sys/random.h>
++#include "negroni_wlan.h"
++#include "negroni_wlan_mhi.h"
++#include "negroni_wlan_wmi.h"
+ #include "negroni_wlan_sta.h"
++#include "negroni_wlan_wpa_crypto.h"
++
++#define WMI_VDEV_INSTALL_KEY_CMDID      0x5009u
++#define TAG_VDEV_INSTALL_KEY_CMD        0x60u
++#define TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT 0x2au
++#define TAG_ARRAY_BYTE                  0x11u
++#define WMI_KEY_PAIRWISE                0u
++#define WMI_KEY_GROUP                   1u
++#define WMI_CIPHER_AES_CCM              4u
++#define HANDSHAKE_MS                    10000u
++#define REASON_4WAY_TIMEOUT             15u
++#define EAPOL_MAX                       640u
++#define EAPOLQ_N                        4u
++
++static struct lx_wpa g_wpa;
++static bool g_active, g_keys_on;
++static uint64_t g_deadline;
++static uint8_t g_rsn[2 + 20];
++static uint8_t g_q[EAPOLQ_N][EAPOL_MAX];
++static uint16_t g_qlen[EAPOLQ_N];
++static volatile uint32_t g_qhead, g_qtail;
++static volatile bool g_key_done;
++static uint32_t g_key_status, g_key_idx_seen, g_key_flags_seen, g_expect_idx, g_expect_flags;
++/* review W1: the group key now installed (never install the same one twice) */
++static uint8_t g_gtk_on[32];
++static uint32_t g_gtk_on_len, g_gtk_on_idx;
++static uint8_t g_ap_rsn[2 + 255];
++
++/* our RSN element: version 1, group CCMP, pairwise CCMP, AKM PSK, capabilities 0 */
++static const uint8_t RSN_IE[22] = {
++	48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0,
++};
+ 
+ uint32_t
+ negroni_wlan_wpa_caps(void)
+ {
+-	return 0;
++	return (negroni_wlan_dp_caps() & NWLAN_CAP_DATA) ? NWLAN_CAP_WPA2_PSK : 0;
++}
++
++/* the AP's RSN group cipher must be CCMP (we install a CCMP group key only) */
++static bool
++ap_group_ccmp(void)
++{
++	const struct nwlan_bss *b = negroni_wlan_join_bss();
++	if (!b) {
++		return false;
++	}
++	for (uint32_t o = 0; o + 2 <= b->ie_len;) {
++		uint32_t el = b->ie[o + 1];
++		if (o + 2 + el > b->ie_len) {
++			break;
++		}
++		const uint8_t *d = b->ie + o + 2;
++		if (b->ie[o] == 48) {
++			return el < 6 || (d[2] == 0x00 && d[3] == 0x0f && d[4] == 0xac && d[5] == 4);
++		}
++		o += 2 + el;
++	}
++	return false;
+ }
+ 
++/* the RSN element body for the ASSOC REQ (without id/length); 0 when we cannot join this network */
+ uint32_t
+ negroni_wlan_wpa_rsn_ie(uint8_t *out, uint32_t cap)
+ {
+-	(void)out;
+-	(void)cap;
+-	return 0;
++	if (cap < sizeof(RSN_IE) - 2) {
++		return 0;
++	}
++	if (!ap_group_ccmp()) {
++		printf("NEGRONI WLAN: WPA2: the AP's group cipher is not CCMP (TKIP?); not supported\n");
++		return 0;
++	}
++	memcpy(out, RSN_IE + 2, sizeof(RSN_IE) - 2);
++	return sizeof(RSN_IE) - 2;
++}
++
++static int
++hexval(char c)
++{
++	return (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
++}
++
++/* the PMK from a passphrase (printable ASCII 8..63) or 64 hex digits; false on a bad value */
++static bool
++make_pmk(const uint8_t *ssid, uint32_t ssid_len, const char *psk, uint32_t psk_len, uint8_t pmk[32])
++{
++	if (psk_len == 64) {
++		for (uint32_t i = 0; i < 32; i++) {
++			int hi = hexval(psk[2 * i]), lo = hexval(psk[2 * i + 1]);
++			if (hi < 0 || lo < 0) {
++				return false;
++			}
++			pmk[i] = (uint8_t)(hi << 4 | lo);
++		}
++		return true;
++	}
++	if (psk_len < 8 || psk_len > 63) {
++		return false;
++	}
++	for (uint32_t i = 0; i < psk_len; i++) {
++		if (psk[i] < 0x20 || psk[i] > 0x7e) {
++			return false;
++		}
++	}
++	lx_wpa_pmk((const unsigned char *)psk, psk_len, ssid, ssid_len, pmk);
++	return true;
+ }
+ 
+ void
+ negroni_wlan_wpa_start(const uint8_t bssid[6], const uint8_t *ssid, uint32_t ssid_len, const char *psk,
+     uint32_t psk_len, const uint8_t *rsn_ie, uint32_t rsn_len)
+ {
+-	(void)bssid;
+-	(void)ssid;
+-	(void)ssid_len;
+-	(void)psk;
+-	(void)psk_len;
+ 	(void)rsn_ie;
+ 	(void)rsn_len;
+-	negroni_wlan_join_handshake_done(ENOTSUP, 0);
++	negroni_wlan_wpa_reset();
++	uint64_t t0 = negroni_wlan_ms();
++	if (!psk || !make_pmk(ssid, ssid_len, psk, psk_len, g_wpa.pmk)) {
++		printf("NEGRONI WLAN: WPA2: the passphrase is not 8..63 printable characters or 64 hex digits\n");
++		negroni_wlan_join_handshake_done(EINVAL, REASON_4WAY_TIMEOUT);
++		return;
++	}
++	memcpy(g_wpa.own, negroni_wlan_wmi_mac(), 6);
++	memcpy(g_wpa.peer, bssid, 6);
++	read_random(g_wpa.own_nonce, sizeof(g_wpa.own_nonce));
++	memcpy(g_rsn, RSN_IE, sizeof(RSN_IE));
++	g_wpa.rsn = g_rsn;
++	g_wpa.rsn_length = sizeof(RSN_IE);
++	/* review: message 3's RSN element must be the beacon's (downgrade check) */
++	const struct nwlan_bss *b = negroni_wlan_join_bss();
++	for (uint32_t o = 0; b && o + 2 <= b->ie_len;) {
++		uint32_t el = b->ie[o + 1];
++		if (o + 2 + el > b->ie_len) {
++			break;
++		}
++		if (b->ie[o] == 48) {
++			memcpy(g_ap_rsn, b->ie + o, 2 + el);
++			g_wpa.ap_rsn = g_ap_rsn;
++			g_wpa.ap_rsn_length = 2 + el;
++			break;
++		}
++		o += 2 + el;
++	}
++	g_active = true;
++	g_deadline = negroni_wlan_ms() + HANDSHAKE_MS;
++	printf("NEGRONI WLAN: WPA2: PMK ready in %llu ms; waiting for message 1\n", negroni_wlan_ms() - t0);
+ }
+ 
+ void
+-negroni_wlan_wpa_service(void)
++negroni_wlan_wpa_reset(void)
+ {
++	negroni_wlan_wipe(&g_wpa, sizeof(g_wpa));
++	negroni_wlan_wipe(g_q, sizeof(g_q));
++	negroni_wlan_wipe(g_gtk_on, sizeof(g_gtk_on));
++	g_gtk_on_len = g_gtk_on_idx = 0;
++	g_qhead = g_qtail = 0;
++	g_active = g_keys_on = false;
+ }
+ 
+-void
+-negroni_wlan_wpa_reset(void)
++/* from the data path's poller: queue only (the handshake runs at the top level) */
++bool
++negroni_wlan_wpa_rx_eapol(const uint8_t *body, uint32_t len)
+ {
++	if (!g_active && !g_keys_on) {
++		return false;
++	}
++	uint32_t next = (g_qhead + 1) % EAPOLQ_N;
++	if (len <= EAPOL_MAX && next != g_qtail) {
++		memcpy(g_q[g_qhead], body, len);
++		g_qlen[g_qhead] = (uint16_t)len;
++		g_qhead = next;
++	}
++	return true;    /* EAPOL never goes to the client */
+ }
+ 
+ void
+ negroni_wlan_wpa_key_event(const uint8_t *p, uint32_t len)
+ {
+-	(void)p;
+-	(void)len;
++	struct wmi_tlv_it it = { p, p + len };
++	const uint8_t *v;
++	uint32_t tag, l;
++
++	while (negroni_wmi_tlv_next(&it, &tag, &v, &l) == 1) {
++		if (tag == TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT && l >= 24) {
++			uint32_t vdev;
++			memcpy(&vdev, v, 4);
++			memcpy(&g_key_idx_seen, v + 12, 4);
++			memcpy(&g_key_flags_seen, v + 16, 4);
++			memcpy(&g_key_status, v + 20, 4);
++			/* review: only the completion of the key we installed (vdev 0, our index and flags, the AP's MAC) */
++			if (vdev == 0 && g_key_idx_seen == g_expect_idx && g_key_flags_seen == g_expect_flags &&
++			    memcmp(v + 4, g_wpa.peer, 6) == 0) {
++				g_key_done = true;
++			}
++			return;
++		}
++	}
++}
++
++/* WMI_VDEV_INSTALL_KEY (ath11k_wmi_vdev_install_key) and wait for INSTALL_KEY_COMPLETE */
++static int
++install_key(uint32_t idx, uint32_t flags, const uint8_t *key, uint32_t key_len, const uint8_t rsc[8])
++{
++	uint8_t m[4 + 100 + 4 + 32];
++	uint32_t w[25];
++
++	if (key_len > 32) {
++		return EINVAL;
++	}
++	memset(w, 0, sizeof(w));
++	w[0] = 0;                                       /* vdev */
++	memcpy(&w[1], g_wpa.peer, 6);                   /* wmi_mac_addr (the AP for both keys in STA mode) */
++	w[3] = idx;
++	w[4] = flags;
++	w[5] = WMI_CIPHER_AES_CCM;
++	if (rsc) {
++		memcpy(&w[6], rsc, 8);                  /* key_rsc_counter */
++	}
++	/* w[8..9] global rsc, w[10..11] tsc, w[12..19] wpi counters */
++	w[20] = key_len;                                /* key_len, txmic 0, rxmic 0, group id valid 0, id 0 */
++	uint32_t h = (TAG_VDEV_INSTALL_KEY_CMD << 16) | sizeof(w);
++	memcpy(m, &h, 4);
++	memcpy(m + 4, w, sizeof(w));
++	uint32_t ka = (key_len + 3) & ~3u;
++	h = (TAG_ARRAY_BYTE << 16) | ka;
++	memcpy(m + 4 + sizeof(w), &h, 4);
++	memset(m + 8 + sizeof(w), 0, ka);
++	memcpy(m + 8 + sizeof(w), key, key_len);
++	g_key_done = false;
++	g_expect_idx = idx;
++	g_expect_flags = flags;
++	int error = negroni_wlan_wmi_send(WMI_VDEV_INSTALL_KEY_CMDID, m, 8 + sizeof(w) + ka);
++	negroni_wlan_wipe(m, sizeof(m));
++	if (!error) {
++		error = negroni_wlan_wmi_wait(&g_key_done, 1000, "INSTALL_KEY_COMPLETE");
++	}
++	if (!error && g_key_status != 0) {
++		error = negroni_wlan_failed(EIO, "INSTALL_KEY %s index %u refused, status %u",
++		           flags == WMI_KEY_GROUP ? "group" : "pairwise", idx, g_key_status);
++	}
++	return error;
+ }
+ 
+-bool
+-negroni_wlan_wpa_rx_eapol(const uint8_t *body, uint32_t len)
++/* review W1: install a group key unless the same key with the same index is already installed */
++static int
++install_group(void)
+ {
+-	(void)body;
+-	(void)len;
+-	return false;
++	if (g_gtk_on_len == g_wpa.group_length && g_gtk_on_idx == g_wpa.group_index &&
++	    memcmp(g_gtk_on, g_wpa.group, g_gtk_on_len) == 0) {
++		printf("NEGRONI WLAN: WPA2: group key %u already installed; not again\n", g_wpa.group_index);
++		return 0;
++	}
++	int error = install_key(g_wpa.group_index, WMI_KEY_GROUP, g_wpa.group, g_wpa.group_length, g_wpa.group_counter);
++	if (!error) {
++		memcpy(g_gtk_on, g_wpa.group, g_wpa.group_length);
++		g_gtk_on_len = g_wpa.group_length;
++		g_gtk_on_idx = g_wpa.group_index;
++	}
++	return error;
++}
++
++/* message 4 must leave unencrypted before the pairwise key exists (mac80211 order) */
++static void
++wait_tx_idle(void)
++{
++	uint64_t deadline = negroni_wlan_ms() + 500;
++	while (!negroni_wlan_dp_tx_idle() && negroni_wlan_ms() < deadline) {
++		if (negroni_wlan_service()) {
++			return;
++		}
++		negroni_wlan_nap(2);
++	}
++}
++
++static void
++fail(int error, const char *why)
++{
++	printf("NEGRONI WLAN: WPA2 handshake failed: %s\n", why);
++	g_active = false;
++	negroni_wlan_wpa_reset();
++	negroni_wlan_join_handshake_done(error, REASON_4WAY_TIMEOUT);
++}
++
++/* top level (keep-alive pass): the queued EAPOL frames and the time-out */
++void
++negroni_wlan_wpa_service(void)
++{
++	static uint8_t reply[LX_WPA_REPLY_MOST], msg[EAPOL_MAX];
++
++	while (g_qtail != g_qhead) {
++		uint32_t len = g_qlen[g_qtail];
++		memcpy(msg, g_q[g_qtail], len);
++		negroni_wlan_wipe(g_q[g_qtail], EAPOL_MAX);
++		g_qtail = (g_qtail + 1) % EAPOLQ_N;
++
++		unsigned rl = 0;
++		const char *why = "";
++		/* review W2: a message 1 (pairwise, ACK, no MIC) outside our handshake is ignored (no PTK rekey support) */
++		if (len >= 7) {
++			uint32_t info = (uint32_t)msg[5] << 8 | msg[6];
++			if ((info & 0x0188u) == 0x0088u && !g_active) {
++				negroni_wlan_wipe(msg, sizeof(msg));
++				continue;
++			}
++		}
++		int r = lx_wpa_message(&g_wpa, msg, len, reply, &rl, &why);
++		negroni_wlan_wipe(msg, sizeof(msg));
++		switch (r) {
++		case LX_WPA_ANSWER:
++			printf("NEGRONI WLAN: WPA2: message 1 -> message 2 (%u bytes)\n", rl);
++			(void)negroni_wlan_dp_tx_eapol(reply, rl);
++			break;
++		case LX_WPA_KEYS: {
++			if (g_keys_on) {
++				/* review W1 (KRACK): a retransmitted message 3: message 4 again, no re-install, no new done */
++				printf("NEGRONI WLAN: WPA2: message 3 again -> message 4 only (keys stay installed)\n");
++				(void)negroni_wlan_dp_tx_eapol(reply, rl);
++				break;
++			}
++			printf("NEGRONI WLAN: WPA2: message 3 (MIC good) -> message 4; installing the keys\n");
++			(void)negroni_wlan_dp_tx_eapol(reply, rl);
++			wait_tx_idle();
++			int error = install_key(0, WMI_KEY_PAIRWISE, g_wpa.pairwise, 16, NULL);
++			if (!error) {
++				error = install_group();
++			}
++			if (!error) {
++				(void)negroni_wlan_dp_secure();        /* 0328 review D5/D6: PN check, decrypted frames only */
++			}
++			if (error) {
++				fail(error, "a key was not installed");
++				return;
++			}
++			g_active = false;
++			g_keys_on = true;               /* group rekeys still come */
++			printf("NEGRONI WLAN: WPA2: pairwise + group key %u installed (CCMP)\n", g_wpa.group_index);
++			negroni_wlan_join_handshake_done(0, 0);
++			break;
++		}
++		case LX_WPA_GROUP: {
++			if (!g_keys_on) {
++				break;                  /* a group message before the 4-way handshake ended: ignored */
++			}
++			(void)negroni_wlan_dp_tx_eapol(reply, rl);
++			wait_tx_idle();
++			int error = install_group();
++			if (error) {
++				/* review W4: no group key = no broadcast/multicast frames: the link goes down, with a line */
++				printf("NEGRONI WLAN: WPA2: group rekey: the new group key was not installed (error %d)\n", error);
++				g_keys_on = false;
++				negroni_wlan_join_handshake_done(error, REASON_4WAY_TIMEOUT);
++				return;
++			}
++			printf("NEGRONI WLAN: WPA2: group key %u current\n", g_wpa.group_index);
++			break;
++		}
++		case LX_WPA_BAD:
++			printf("NEGRONI WLAN: WPA2: key message refused: %s\n", why);
++			if (g_active && why == LX_WPA_WHY_MIC) {           /* review: by code, not by text */
++				fail(EPERM, "bad MIC (wrong passphrase?)");
++				return;
++			}
++			break;
++		default:
++			break;
++		}
++		negroni_wlan_wipe(reply, sizeof(reply));
++	}
++	if (g_active && negroni_wlan_ms() > g_deadline) {
++		fail(ETIMEDOUT, "no complete 4-way handshake in 10 s");
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_wpa_crypto.c b/bsd/dev/negroni_wlan_wpa_crypto.c
+new file mode 100644
+index 0000000..30e2eb3
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_wpa_crypto.c
+@@ -0,0 +1,605 @@
++/*
++ * Ported from HakiOS wifi/lx/src/lx_wpa.c (github HakiOS, commit a52a4c9d, 2026-10-14), MIT License:
++ *
++ * Copyright (c) 2025-2026 the HakiOS authors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * Changes for NEGRONI (patch 0329, review 2026-10-27): temporary PTK (TPTK, committed only after a good message 3),
++ * message 3 needs the INSTALL bit and the AP's RSN element (if given), GTK exactly 16 bytes with index 1..3,
++ * secrets wiped with a volatile loop, LX_WPA_WHY_MIC to tell a bad MIC by pointer; file names, the include of negroni_wlan_wpa_crypto.h, "|| defined(KERNEL)" (XNU), the
++ * ARM64_BOARD_CONFIG_NEGRONI guard; the arithmetic is unchanged.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++/*
++ * The arithmetic of WPA2 with a passphrase (lx_wpa.h): SHA-1 and HMAC over it (FIPS 180, RFC
++ * 2104), the key of a name and a passphrase (PBKDF2, RFC 8018), the function that makes the
++ * handshake's keys out of that key, two addresses and two nonces (IEEE 802.11-2020, 12.7.1.2),
++ * AES decryption and the unwrapping of a key with it (FIPS 197, RFC 3394), and the messages of
++ * the four-way and the group-key handshake (12.7.6, 12.7.7; figure 12-35 is the layout).
++ *
++ * Nothing here is taken from another implementation; the tests in tools/wpa-test check it
++ * against the standards' own examples and against Python's hashlib and "cryptography".
++ * Nothing here is written for speed, and nothing here says a key in a message.
++ */
++#if defined(_KERNEL) || defined(KERNEL)
++#include <sys/param.h>
++#include <sys/systm.h>
++#else
++#include <stdint.h>
++#include <string.h>
++#endif
++
++#include "negroni_wlan_wpa_crypto.h"
++
++/* NEGRONI: a wipe the compiler cannot drop (memset of a dead buffer can be optimised away) */
++static void
++lx_wipe(void *p, unsigned n)
++{
++	volatile uint8_t *v = p;
++
++	while (n--) {
++		*v++ = 0;
++	}
++}
++
++const char LX_WPA_WHY_MIC[] = "its signature is not right (a wrong passphrase gives this)";
++
++/* ---- SHA-1 ------------------------------------------------------------------------------------ */
++
++struct sha1 {
++	uint32_t h[5];
++	uint64_t length;			/* bytes so far */
++	uint8_t block[64];
++};
++
++static uint32_t
++rol(uint32_t x, unsigned n)
++{
++	return (x << n | x >> (32 - n));
++}
++
++static void
++sha1_block(uint32_t h[5], const uint8_t *p)
++{
++	uint32_t w[80], a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
++
++	for (unsigned t = 0; t < 16; t++) {
++		w[t] = (uint32_t)p[4 * t] << 24 | (uint32_t)p[4 * t + 1] << 16 | (uint32_t)p[4 * t + 2] << 8 | p[4 * t + 3];
++	}
++	for (unsigned t = 16; t < 80; t++) {
++		w[t] = rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
++	}
++	for (unsigned t = 0; t < 80; t++) {
++		uint32_t f = t < 20 ? ((b & c) | (~b & d)) + 0x5a827999 : t < 40 ? (b ^ c ^ d) + 0x6ed9eba1 : t < 60 ?
++		    ((b & c) | (b & d) | (c & d)) + 0x8f1bbcdc : (b ^ c ^ d) + 0xca62c1d6;
++		uint32_t next = rol(a, 5) + f + e + w[t];
++
++		e = d;
++		d = c;
++		c = rol(b, 30);
++		b = a;
++		a = next;
++	}
++	h[0] += a;
++	h[1] += b;
++	h[2] += c;
++	h[3] += d;
++	h[4] += e;
++}
++
++static void
++sha1_begin(struct sha1 *s)
++{
++	s->h[0] = 0x67452301;
++	s->h[1] = 0xefcdab89;
++	s->h[2] = 0x98badcfe;
++	s->h[3] = 0x10325476;
++	s->h[4] = 0xc3d2e1f0;
++	s->length = 0;
++}
++
++static void
++sha1_more(struct sha1 *s, const uint8_t *data, unsigned length)
++{
++	for (unsigned i = 0; i < length; i++) {
++		s->block[s->length++ % 64] = data[i];
++		if (s->length % 64 == 0) {
++			sha1_block(s->h, s->block);
++		}
++	}
++}
++
++static void
++sha1_end(struct sha1 *s, uint8_t digest[20])
++{
++	uint64_t bits = s->length * 8;
++	uint8_t tail[8];
++
++	sha1_more(s, (const uint8_t *)"\x80", 1);
++	while (s->length % 64 != 56) {
++		sha1_more(s, (const uint8_t *)"", 1);
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		tail[i] = (uint8_t)(bits >> (56 - 8 * i));
++	}
++	sha1_more(s, tail, 8);
++	for (unsigned i = 0; i < 20; i++) {
++		digest[i] = (uint8_t)(s->h[i / 4] >> (24 - 8 * (i % 4)));
++	}
++}
++
++/* HMAC-SHA1 of several pieces in a row. */
++static void
++hmac_sha1(const uint8_t *key, unsigned key_length, const uint8_t *const pieces[], const unsigned lengths[], unsigned count,
++    uint8_t digest[20])
++{
++	uint8_t pad[64], hashed[20], inner[20];
++	struct sha1 s;
++
++	if (key_length > 64) {
++		sha1_begin(&s);
++		sha1_more(&s, key, key_length);
++		sha1_end(&s, hashed);
++		key = hashed;
++		key_length = 20;
++	}
++	for (unsigned i = 0; i < 64; i++) {
++		pad[i] = (i < key_length ? key[i] : 0) ^ 0x36;
++	}
++	sha1_begin(&s);
++	sha1_more(&s, pad, 64);
++	for (unsigned i = 0; i < count; i++) {
++		sha1_more(&s, pieces[i], lengths[i]);
++	}
++	sha1_end(&s, inner);
++	for (unsigned i = 0; i < 64; i++) {
++		pad[i] ^= 0x36 ^ 0x5c;
++	}
++	sha1_begin(&s);
++	sha1_more(&s, pad, 64);
++	sha1_more(&s, inner, 20);
++	sha1_end(&s, digest);
++	lx_wipe(pad, sizeof(pad));
++	lx_wipe(inner, sizeof(inner));
++}
++
++/* ---- the key of a name and a passphrase -------------------------------------------------------- */
++
++/* PBKDF2 with HMAC-SHA1, 4096 rounds, 32 bytes: two blocks of 20, of the second the first 12. */
++void
++lx_wpa_pmk(const unsigned char *passphrase, unsigned passphrase_length, const unsigned char *name, unsigned name_length,
++    unsigned char pmk[32])
++{
++	for (unsigned block = 1; block <= 2; block++) {
++		const uint8_t number[4] = { 0, 0, 0, (uint8_t)block };
++		const uint8_t *first[2] = { name, number };
++		const unsigned first_lengths[2] = { name_length, 4 };
++		uint8_t u[20], sum[20];
++
++		hmac_sha1(passphrase, passphrase_length, first, first_lengths, 2, u);
++		memcpy(sum, u, 20);
++		for (unsigned round = 1; round < 4096; round++) {
++			const uint8_t *again[1] = { u };
++			const unsigned again_lengths[1] = { 20 };
++
++			hmac_sha1(passphrase, passphrase_length, again, again_lengths, 1, u);
++			for (unsigned i = 0; i < 20; i++) {
++				sum[i] ^= u[i];
++			}
++		}
++		memcpy(pmk + 20 * (block - 1), sum, block == 1 ? 20 : 12);
++		lx_wipe(u, sizeof(u));
++		lx_wipe(sum, sizeof(sum));
++	}
++}
++
++/* The standard's PRF: HMAC-SHA1 of (label, a zero byte, data, a counter byte), block after block. */
++static void
++prf(const uint8_t *key, unsigned key_length, const char *label, const uint8_t *data, unsigned data_length, uint8_t *out,
++    unsigned out_length)
++{
++	uint8_t zero = 0, counter = 0, digest[20];
++	const uint8_t *pieces[4] = { (const uint8_t *)label, &zero, data, &counter };
++	const unsigned lengths[4] = { (unsigned)strlen(label), 1, data_length, 1 };
++
++	for (unsigned done = 0; done < out_length; done += 20, counter++) {
++		hmac_sha1(key, key_length, pieces, lengths, 4, digest);
++		memcpy(out + done, digest, out_length - done < 20 ? out_length - done : 20);
++	}
++	lx_wipe(digest, sizeof(digest));
++}
++
++/* ---- AES-128, decryption only, and the unwrapping of a key --------------------------------------- */
++
++static uint8_t sbox[256], inverse_sbox[256];
++
++static uint8_t
++times(uint8_t a, uint8_t b)			/* in GF(2^8) modulo x^8 + x^4 + x^3 + x + 1 */
++{
++	uint8_t product = 0;
++
++	for (; b != 0; b >>= 1) {
++		if (b & 1) {
++			product ^= a;
++		}
++		a = (uint8_t)(a << 1 ^ (a & 0x80 ? 0x1b : 0));
++	}
++	return (product);
++}
++
++/* FIPS 197, 5.1.1: a byte's inverse in the field, then the affine map. */
++static void
++aes_tables(void)
++{
++	if (sbox[0] != 0) {
++		return;
++	}
++	for (unsigned x = 0; x < 256; x++) {
++		uint8_t inverse = 0, s;
++
++		for (unsigned y = 1; y < 256 && x != 0; y++) {
++			if (times((uint8_t)x, (uint8_t)y) == 1) {
++				inverse = (uint8_t)y;
++				break;
++			}
++		}
++		s = inverse;
++		for (unsigned i = 1; i < 5; i++) {
++			s ^= (uint8_t)(inverse << i | inverse >> (8 - i));
++		}
++		s ^= 0x63;
++		sbox[x] = s;
++		inverse_sbox[s] = (uint8_t)x;
++	}
++}
++
++static void
++aes_keys(const uint8_t key[16], uint8_t round_keys[176])
++{
++	uint8_t constant = 1;
++
++	aes_tables();
++	memcpy(round_keys, key, 16);
++	for (unsigned i = 16; i < 176; i += 4) {
++		uint8_t word[4];
++
++		memcpy(word, round_keys + i - 4, 4);
++		if (i % 16 == 0) {
++			uint8_t first = word[0];
++
++			word[0] = sbox[word[1]] ^ constant;
++			word[1] = sbox[word[2]];
++			word[2] = sbox[word[3]];
++			word[3] = sbox[first];
++			constant = times(constant, 2);
++		}
++		for (unsigned j = 0; j < 4; j++) {
++			round_keys[i + j] = round_keys[i - 16 + j] ^ word[j];
++		}
++	}
++}
++
++/* FIPS 197, 5.3: the inverse cipher on one block (bytes in column order: byte r of column c is s[4c + r]). */
++static void
++aes_decrypt(const uint8_t round_keys[176], uint8_t s[16])
++{
++	for (unsigned i = 0; i < 16; i++) {
++		s[i] ^= round_keys[160 + i];
++	}
++	for (int round = 9; round >= 0; round--) {
++		uint8_t t[16];
++
++		for (unsigned c = 0; c < 4; c++) {		/* the rows shifted back, and the bytes substituted back */
++			for (unsigned r = 0; r < 4; r++) {
++				t[4 * ((c + r) % 4) + r] = inverse_sbox[s[4 * c + r]];
++			}
++		}
++		for (unsigned i = 0; i < 16; i++) {
++			t[i] ^= round_keys[16 * round + i];
++		}
++		if (round == 0) {
++			memcpy(s, t, 16);
++			break;
++		}
++		for (unsigned c = 0; c < 4; c++) {		/* the columns mixed back */
++			const uint8_t *a = t + 4 * c;
++
++			s[4 * c + 0] = times(a[0], 14) ^ times(a[1], 11) ^ times(a[2], 13) ^ times(a[3], 9);
++			s[4 * c + 1] = times(a[0], 9) ^ times(a[1], 14) ^ times(a[2], 11) ^ times(a[3], 13);
++			s[4 * c + 2] = times(a[0], 13) ^ times(a[1], 9) ^ times(a[2], 14) ^ times(a[3], 11);
++			s[4 * c + 3] = times(a[0], 11) ^ times(a[1], 13) ^ times(a[2], 9) ^ times(a[3], 14);
++		}
++	}
++}
++
++/*
++ * RFC 3394, 2.2.2: `wrapped` is 8 bytes longer than what comes out, which goes to `plain`. 0, or -1
++ * if the length is not one a wrapped key has or the check value does not come out.
++ */
++static int
++aes_unwrap(const uint8_t kek[16], const uint8_t *wrapped, unsigned length, uint8_t *plain)
++{
++	unsigned n = length / 8 - 1;
++	uint8_t round_keys[176], a[8], block[16];
++	int good = 0;
++
++	if (length % 8 != 0 || length < 24) {
++		return (-1);
++	}
++	aes_keys(kek, round_keys);
++	memcpy(a, wrapped, 8);
++	memcpy(plain, wrapped + 8, 8 * n);
++	for (int j = 5; j >= 0; j--) {
++		for (unsigned i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)n * (unsigned)j + i;
++
++			memcpy(block, a, 8);
++			for (unsigned k = 0; k < 8; k++) {
++				block[7 - k] ^= (uint8_t)(t >> (8 * k));
++			}
++			memcpy(block + 8, plain + 8 * (i - 1), 8);
++			aes_decrypt(round_keys, block);
++			memcpy(a, block, 8);
++			memcpy(plain + 8 * (i - 1), block + 8, 8);
++		}
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		good |= a[i] ^ 0xa6;
++	}
++	lx_wipe(round_keys, sizeof(round_keys));
++	lx_wipe(block, sizeof(block));
++	return (good == 0 ? 0 : -1);
++}
++
++/* ---- the handshake -------------------------------------------------------------------------------- */
++
++/*
++ * A key message, after the four bytes every EAPOL frame begins with (version, type 3, length):
++ *   4 the kind of descriptor (2: RSN)     5 what the message is (bits below)     7 key length
++ *   9 replay counter (8)     17 nonce (32)     49 IV (16)     65 RSC (8)     73 reserved (8)
++ *   81 MIC (16)     97 length of the key data     99 key data
++ */
++#define AT_KIND		4
++#define AT_INFO		5
++#define AT_REPLAY	9
++#define AT_NONCE	17
++#define AT_RSC		65
++#define AT_MIC		81
++#define AT_DATA_LENGTH	97
++#define AT_DATA		99
++#define MESSAGE_MOST	640
++
++#define INFO_VERSION	0x0007			/* 2: HMAC-SHA1 for the MIC, the AES key wrap for the key data */
++#define INFO_PAIRWISE	0x0008
++#define INFO_INSTALL	0x0040
++#define INFO_ACK	0x0080
++#define INFO_MIC	0x0100
++#define INFO_SECURE	0x0200
++#define INFO_ENCRYPTED	0x1000
++
++static void
++mic_of_key(const uint8_t kck[16], const uint8_t *message, unsigned length, uint8_t mic[16])
++{
++	const uint8_t zeros[16] = { 0 };
++	const uint8_t *pieces[3] = { message, zeros, message + AT_MIC + 16 };
++	const unsigned lengths[3] = { AT_MIC, 16, length - AT_MIC - 16 };
++	uint8_t digest[20];
++
++	hmac_sha1(kck, 16, pieces, lengths, 3, digest);
++	memcpy(mic, digest, 16);
++	lx_wipe(digest, sizeof(digest));
++}
++
++
++/* The keys of the handshake and the pairwise key, from the PMK, both addresses and both nonces. */
++static void
++derive(struct lx_wpa *wpa)
++{
++	uint8_t data[76], keys[48];
++	int own_first = memcmp(wpa->own, wpa->peer, 6) < 0, own_nonce_first = memcmp(wpa->own_nonce, wpa->tpeer_nonce, 32) < 0;
++
++	memcpy(data, own_first ? wpa->own : wpa->peer, 6);
++	memcpy(data + 6, own_first ? wpa->peer : wpa->own, 6);
++	memcpy(data + 12, own_nonce_first ? wpa->own_nonce : wpa->tpeer_nonce, 32);
++	memcpy(data + 44, own_nonce_first ? wpa->tpeer_nonce : wpa->own_nonce, 32);
++	prf(wpa->pmk, 32, "Pairwise key expansion", data, sizeof(data), keys, sizeof(keys));
++	memcpy(wpa->tkck, keys, 16);                    /* NEGRONI: a temporary PTK until message 3 proves it */
++	memcpy(wpa->tkek, keys + 16, 16);
++	memcpy(wpa->tpairwise, keys + 32, 16);
++	lx_wipe(keys, sizeof(keys));
++	wpa->have_tptk = 1;
++}
++
++/* Our message in answer to `message`: the same counter, our bits, our nonce and key data if any, signed. */
++static void
++answer(const uint8_t kck[16], const uint8_t *message, unsigned info, const uint8_t *nonce, const uint8_t *data,
++    unsigned data_length, uint8_t *reply, unsigned *reply_length)
++{
++	unsigned length = AT_DATA + data_length;
++
++	memset(reply, 0, length);
++	reply[0] = message[0];
++	reply[1] = 3;
++	reply[2] = (uint8_t)((length - 4) >> 8);
++	reply[3] = (uint8_t)(length - 4);
++	reply[AT_KIND] = 2;
++	reply[AT_INFO] = (uint8_t)(info >> 8);
++	reply[AT_INFO + 1] = (uint8_t)info;
++	memcpy(reply + AT_REPLAY, message + AT_REPLAY, 8);
++	if (nonce != NULL) {
++		memcpy(reply + AT_NONCE, nonce, 32);
++	}
++	reply[AT_DATA_LENGTH] = (uint8_t)(data_length >> 8);
++	reply[AT_DATA_LENGTH + 1] = (uint8_t)data_length;
++	if (data_length != 0) {
++		memcpy(reply + AT_DATA, data, data_length);
++	}
++	mic_of_key(kck, reply, length, reply + AT_MIC);
++	*reply_length = length;
++}
++
++/* The group key among what message 3 (or a group message) carries: an element 0xdd of the suite 00-0f-ac, kind 1. */
++static int
++group_key(struct lx_wpa *wpa, const uint8_t *data, unsigned length, const uint8_t *counter)
++{
++	for (unsigned at = 0; at + 2 <= length && at + 2 + data[at + 1] <= length; at += 2 + data[at + 1]) {
++		const uint8_t *e = data + at;
++
++		if (e[0] == 0xdd && e[1] == 0) {
++			break;				/* (padding from here on) */
++		}
++		if (e[0] == 0xdd && e[1] == 6 + 16 && e[2] == 0x00 && e[3] == 0x0f && e[4] == 0xac && e[5] == 1 &&
++		    (e[6] & 3) >= 1) {                  /* NEGRONI: CCMP GTK = exactly 16 bytes, key index 1..3 */
++			wpa->group_index = e[6] & 3;
++			wpa->group_length = e[1] - 6u;
++			memcpy(wpa->group, e + 8, wpa->group_length);
++			memcpy(wpa->group_counter, counter, 8);
++			return (0);
++		}
++	}
++	return (-1);
++}
++
++/* NEGRONI: the RSN element message 3 carries (its key data) must be the AP's beacon element, byte for byte */
++static int
++rsn_matches(const struct lx_wpa *wpa, const uint8_t *data, unsigned length)
++{
++	for (unsigned at = 0; at + 2 <= length && at + 2 + data[at + 1] <= length; at += 2 + data[at + 1]) {
++		if (data[at] == 48) {
++			return 2u + data[at + 1] == wpa->ap_rsn_length && memcmp(data + at, wpa->ap_rsn, wpa->ap_rsn_length) == 0;
++		}
++	}
++	return 0;
++}
++
++int
++lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length, unsigned char *reply, unsigned *reply_length,
++    const char **why)
++{
++	uint8_t mic[16], data[MESSAGE_MOST];
++	unsigned info, body, data_length, difference = 0;
++	const char *nothing;
++
++	why = why != NULL ? why : &nothing;
++	*why = "";
++	*reply_length = 0;
++	if (length < 4 || message[1] != 3) {
++		return (LX_WPA_NOTHING);
++	}
++	body = (unsigned)message[2] << 8 | message[3];
++	if (length < AT_DATA || 4 + body > length || 4 + body < AT_DATA || 4 + body > MESSAGE_MOST) {
++		*why = "its length is not a key message's";
++		return (LX_WPA_BAD);
++	}
++	length = 4 + body;
++	info = (unsigned)message[AT_INFO] << 8 | message[AT_INFO + 1];
++	data_length = (unsigned)message[AT_DATA_LENGTH] << 8 | message[AT_DATA_LENGTH + 1];
++	if (message[AT_KIND] != 2) {
++		*why = "it is not an RSN key message (WPA of the first kind?)";
++		return (LX_WPA_BAD);
++	}
++	if ((info & INFO_VERSION) != 2) {
++		*why = "its key descriptor is not version 2 (the network wants another kind of key management)";
++		return (LX_WPA_BAD);
++	}
++	if (AT_DATA + data_length > length) {
++		*why = "its key data is longer than the message";
++		return (LX_WPA_BAD);
++	}
++
++	/* message 1: the access point's nonce, unsigned: only a temporary PTK (NEGRONI: TPTK) */
++	if ((info & (INFO_PAIRWISE | INFO_ACK | INFO_MIC)) == (INFO_PAIRWISE | INFO_ACK)) {
++		memcpy(wpa->tpeer_nonce, message + AT_NONCE, 32);
++		derive(wpa);
++		answer(wpa->tkck, message, 2 | INFO_PAIRWISE | INFO_MIC, wpa->own_nonce, wpa->rsn, wpa->rsn_length, reply,
++		    reply_length);
++		return (LX_WPA_ANSWER);
++	}
++
++	/* everything else is signed, by an access point that has shown it has the key */
++	if (!(info & INFO_MIC) || !(info & INFO_ACK)) {
++		return (LX_WPA_NOTHING);
++	}
++	/* a pairwise message 3 is checked with the temporary PTK when there is one, else with the committed one */
++	int use_t = (info & INFO_PAIRWISE) && wpa->have_tptk;
++	const uint8_t *kck = use_t ? wpa->tkck : wpa->kck, *kek = use_t ? wpa->tkek : wpa->kek;
++	const uint8_t *anonce = use_t ? wpa->tpeer_nonce : wpa->peer_nonce;
++	if (!use_t && !wpa->have_keys) {
++		*why = "it is signed, and there has been no message 1 to make the keys from";
++		return (LX_WPA_BAD);
++	}
++	mic_of_key(kck, message, length, mic);
++	for (unsigned i = 0; i < 16; i++) {
++		difference |= mic[i] ^ message[AT_MIC + i];
++	}
++	if (difference != 0) {
++		*why = LX_WPA_WHY_MIC;
++		return (LX_WPA_BAD);
++	}
++	if (wpa->replay_known && memcmp(message + AT_REPLAY, wpa->replay, 8) <= 0) {
++		*why = "its counter is not beyond the last one's (a message played again)";
++		return (LX_WPA_BAD);
++	}
++	if ((info & INFO_PAIRWISE) && memcmp(message + AT_NONCE, anonce, 32) != 0) {
++		*why = "its nonce is not message 1's";
++		return (LX_WPA_BAD);
++	}
++	if ((info & INFO_PAIRWISE) && !(info & INFO_INSTALL)) {
++		*why = "message 3 without the install bit";
++		return (LX_WPA_BAD);
++	}
++	if (!(info & INFO_ENCRYPTED) || data_length > MESSAGE_MOST || aes_unwrap(kek, message + AT_DATA, data_length, data) != 0) {
++		*why = "its key data does not unwrap";
++		return (LX_WPA_BAD);
++	}
++	if ((info & INFO_PAIRWISE) && wpa->ap_rsn != NULL && !rsn_matches(wpa, data, data_length - 8)) {
++		lx_wipe(data, sizeof(data));
++		*why = "its RSN element is not the one of the AP's beacon (a downgrade?)";
++		return (LX_WPA_BAD);
++	}
++	if (group_key(wpa, data, data_length - 8, message + AT_RSC) != 0) {
++		lx_wipe(data, sizeof(data));
++		*why = "there is no (16-byte, index 1..3) group key in it";
++		return (LX_WPA_BAD);
++	}
++	lx_wipe(data, sizeof(data));
++	memcpy(wpa->replay, message + AT_REPLAY, 8);
++	wpa->replay_known = 1;
++	if (use_t) {                                    /* message 3 proved the temporary PTK: commit it */
++		memcpy(wpa->kck, wpa->tkck, 16);
++		memcpy(wpa->kek, wpa->tkek, 16);
++		memcpy(wpa->pairwise, wpa->tpairwise, 16);
++		memcpy(wpa->peer_nonce, wpa->tpeer_nonce, 32);
++		wpa->have_keys = 1;
++		wpa->have_tptk = 0;
++		lx_wipe(wpa->tkck, 16);
++		lx_wipe(wpa->tkek, 16);
++		lx_wipe(wpa->tpairwise, 16);
++	}
++
++	/* message 3 of the four, or message 1 of a new group key */
++	if (info & INFO_PAIRWISE) {
++		answer(wpa->kck, message, 2 | INFO_PAIRWISE | INFO_MIC | INFO_SECURE, NULL, NULL, 0, reply, reply_length);
++		return (LX_WPA_KEYS);
++	}
++	answer(wpa->kck, message, 2 | INFO_MIC | INFO_SECURE, NULL, NULL, 0, reply, reply_length);
++	return (LX_WPA_GROUP);
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_wpa_crypto.h b/bsd/dev/negroni_wlan_wpa_crypto.h
+new file mode 100644
+index 0000000..8563721
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_wpa_crypto.h
+@@ -0,0 +1,84 @@
++/*
++ * Ported from HakiOS wifi/lx/src/lx_wpa.h (github HakiOS, commit a52a4c9d, 2026-10-14), MIT License:
++ *
++ * Copyright (c) 2025-2026 the HakiOS authors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * Changes for NEGRONI (patch 0329, review 2026-10-27): temporary PTK (TPTK, committed only after a good message 3),
++ * message 3 needs the INSTALL bit and the AP's RSN element (if given), GTK exactly 16 bytes with index 1..3,
++ * secrets wiped with a volatile loop, LX_WPA_WHY_MIC to tell a bad MIC by pointer; file names, the include of negroni_wlan_wpa_crypto.h, "|| defined(KERNEL)" (XNU), the
++ * ARM64_BOARD_CONFIG_NEGRONI guard; the arithmetic is unchanged.
++ */
++/*
++ * WPA2 with a passphrase, as a station sees it: the key a name and a passphrase make, and the
++ * four-way handshake in which an access point and a station prove that key to each other and
++ * arrive at the keys their frames are ciphered with (IEEE 802.11-2020, 12.7; RSN, AKM "PSK",
++ * key descriptor version 2: HMAC-SHA1 and the AES key wrap). lx_wpa.c is the arithmetic and
++ * nothing else -- no radio, no kernel --, so that it runs on the machine the kernel is built on
++ * (tools/wpa-test) as it runs in the kernel.
++ */
++#ifndef _NEGRONI_WLAN_WPA_CRYPTO_H_
++#define _NEGRONI_WLAN_WPA_CRYPTO_H_
++
++/* The key ("PMK") of a network's name and passphrase: 32 bytes. Slow on purpose: 8192 rounds of HMAC-SHA1. */
++void lx_wpa_pmk(const unsigned char *passphrase, unsigned passphrase_length, const unsigned char *name, unsigned name_length,
++    unsigned char pmk[32]);
++
++struct lx_wpa {
++	unsigned char pmk[32];
++	unsigned char own[6], peer[6];		/* the station's address and the access point's */
++	unsigned char own_nonce[32];		/* 32 bytes nobody can guess, fresh for every handshake */
++	const unsigned char *rsn;		/* the station's RSN element as its association request had it ... */
++	unsigned rsn_length;			/* ... which goes into message 2 */
++	/* from here on: lx_wpa.c's */
++	unsigned char peer_nonce[32];
++	unsigned char kck[16], kek[16];		/* the keys the handshake's own messages are signed and ciphered with */
++	unsigned char replay[8];		/* the counter of the last message accepted */
++	/* NEGRONI: message 1 derives into these; message 3 commits them (wpa_supplicant TPTK) */
++	unsigned char tkck[16], tkek[16], tpairwise[16], tpeer_nonce[32];
++	int have_tptk;
++	const unsigned char *ap_rsn;		/* NEGRONI: the AP's RSN element from its beacon (id, length, body), or NULL */
++	unsigned ap_rsn_length;
++	int have_keys, replay_known;
++	/* what comes out of it */
++	unsigned char pairwise[16];		/* the key for frames between the two ("TK", CCMP) */
++	unsigned char group[32];		/* the key the access point sends to everybody with ("GTK") ... */
++	unsigned group_length, group_index;	/* ... its length, and its number (1 to 3) */
++	unsigned char group_counter[8];		/* ... and the packet number its frames have got to ("RSC") */
++};
++
++/*
++ * What a message of the handshake (an EAPOL frame: what follows the Ethernet header of a frame
++ * of type 0x888e) calls for. `reply` has room for LX_WPA_REPLY_MOST bytes.
++ */
++#define LX_WPA_REPLY_MOST	256
++enum {
++	LX_WPA_BAD = -1,		/* not a message that can be answered: *why says what was wrong with it */
++	LX_WPA_NOTHING = 0,		/* not for us to answer (not a key message) */
++	LX_WPA_ANSWER = 1,		/* message 1: send the reply (message 2) */
++	LX_WPA_KEYS = 2,		/* message 3: send the reply (message 4), then both keys are to be used */
++	LX_WPA_GROUP = 3,		/* a new group key later on: send the reply, then use the new group key */
++};
++/* NEGRONI: *why of a message refused for its MIC (a wrong passphrase) is exactly this pointer */
++extern const char LX_WPA_WHY_MIC[];
++int lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length, unsigned char *reply,
++    unsigned *reply_length, const char **why);
++
++#endif

@@ -1,0 +1,196 @@
+0339-negroni-wlan-sbl-boot-dump: Wi-Fi, why the SBL does not come up after the BHI download (phone t6, 2026-10-27).
+The registers cnss2 dumps during MHI power-on (pci.c cnss_boot_debug_timeout_hdlr): MHI regs, all BHI regs (IMGADDR,
+IMGSIZE, TXDB, INTVEC, EXECENV, STATUS, ERRCODE, ERRDBG1-3, SERIAL), TCSR_PBL_LOGGING, the SBL log pointer
+(PCIE_BHI_ERRDBG2/3), PBL_WLAN_BOOT_CFG, PBL_BOOTSTRAP_STATUS, WLAON_WL_PWR_STATUS, PCIe SoC scratch 0-2, the PBL log
+SRAM (QCA6490 0x01403da0) and the SBL log SRAM; plus the SMMU fault check. Printed before the doorbell, right after
+BHI DONE (with the transfer time), every 3 s while waiting for READY and at the time-out. The SBL image's first bytes
+through the non-cacheable view (ELF magic = the RAM content the chip reads), the BHI registers read back before the
+doorbell. READY wait MAX(negroniwlan_to, 30 s) as cnss2 (3x/6x the MHI time-out). Read-only diagnostics.
+
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index 6aadd29..41fd188 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -520,6 +520,74 @@ wlan_pcie_sid(bool program)
+ 	    hash, got, WLAN_EP_BDF, (got == val && !(cfg & 1u)) ? "" : " - DID NOT TAKE, the chip may use SID 0x1c00");
+ }
+ 
++/*
++ * 0339: why the SBL does not come up (phone t6, 2026-10-27: BHI SBL done, then MHISTATUS 0 / EE 0 for 10 s, no SMMU
++ * fault). The registers cnss2 dumps every few seconds during MHI power-on (pci.c cnss_boot_debug_timeout_hdlr):
++ * MHI and BHI registers, the PBL logging register, the SBL log pointer (PCIE_BHI_ERRDBG2/3), PBL_WLAN_BOOT_CFG,
++ * PBL_BOOTSTRAP_STATUS, the SoC scratch registers, the PBL log SRAM (QCA6490: 0x01403da0, 40 bytes) and the SBL log
++ * SRAM (start/size from ERRDBG2/3, at most 48 bytes, inside 0x01400000-0x01800000). Read only; windowed reads
++ * through the CE code's window (0328).
++ */
++#define QCA_TCSR_PBL_LOGGING    0x01b000f8u     /* cnss2 reg.h */
++#define QCA_PCIE_BHI_ERRDBG2    0x01e0e238u
++#define QCA_PCIE_BHI_ERRDBG3    0x01e0e23cu
++#define QCA_PBL_WLAN_BOOT_CFG   0x01e22b34u
++#define QCA_PBL_BOOTSTRAP_STATUS 0x01910008u
++#define QCA_PCIE_SCRATCH_0      0x01e04040u
++#define QCA_PCIE_SCRATCH_1      0x01e04044u
++#define QCA_PCIE_SCRATCH_2      0x01e0405cu
++#define QCA_WLAON_WL_PWR_STATUS 0x01f8002cu
++#define QCA6490_PBL_LOG_SRAM    0x01403da0u
++#define QCA6490_PBL_LOG_MAX     40u
++#define QCA6490_SBL_LOG_MAX     48u
++#define QCA_SRAM_START          0x01400000u
++#define QCA_SRAM_END            0x01800000u
++
++void
++negroni_wlan_boot_dump(struct mhi_host *h, const char *when)
++{
++	uint32_t b = h->bhi;
++
++	if (!g_bar0) {
++		return;
++	}
++	printf("NEGRONI WLAN: BOOT %s: MHI REGLEN %#x VER %#x CFG %#x CTRL %#x STATUS %#x BHIOFF %#x BHIEOFF %#x\n", when,
++	    negroni_wlan_rd(MHI_REGLEN), negroni_wlan_rd(MHI_VER), negroni_wlan_rd(MHI_CFG), negroni_wlan_rd(MHI_CTRL),
++	    negroni_wlan_rd(MHI_STATUS), negroni_wlan_rd(MHI_BHIOFF), negroni_wlan_rd(MHI_BHIEOFF));
++	if (b) {
++		printf("NEGRONI WLAN: BOOT %s: BHI IMGADDR %#x:%08x IMGSIZE %#x TXDB %#x INTVEC %#x EXECENV %#x STATUS %#x ERRCODE %#x "
++		    "ERRDBG %#x %#x %#x SERIAL %#x\n", when, negroni_wlan_rd(b + BHI_IMGADDR_HIGH), negroni_wlan_rd(b + BHI_IMGADDR_LOW),
++		    negroni_wlan_rd(b + BHI_IMGSIZE), negroni_wlan_rd(b + BHI_IMGTXDB), negroni_wlan_rd(b + BHI_INTVEC),
++		    negroni_wlan_rd(b + BHI_EXECENV), negroni_wlan_rd(b + BHI_STATUS), negroni_wlan_rd(b + BHI_ERRCODE),
++		    negroni_wlan_rd(b + BHI_ERRDBG1), negroni_wlan_rd(b + BHI_ERRDBG1 + 4), negroni_wlan_rd(b + BHI_ERRDBG1 + 8),
++		    negroni_wlan_rd(b + BHI_SERIALNU));
++	}
++	uint32_t sbl_start = negroni_wlan_reg_rd(QCA_PCIE_BHI_ERRDBG2), sbl_size = negroni_wlan_reg_rd(QCA_PCIE_BHI_ERRDBG3);
++	printf("NEGRONI WLAN: BOOT %s: TCSR_PBL_LOGGING %#x SBL log at %#x size %#x PBL_WLAN_BOOT_CFG %#x PBL_BOOTSTRAP_STATUS %#x "
++	    "WLAON_WL_PWR_STATUS %#x SCRATCH %#x %#x %#x\n", when, negroni_wlan_reg_rd(QCA_TCSR_PBL_LOGGING), sbl_start, sbl_size,
++	    negroni_wlan_reg_rd(QCA_PBL_WLAN_BOOT_CFG), negroni_wlan_reg_rd(QCA_PBL_BOOTSTRAP_STATUS),
++	    negroni_wlan_reg_rd(QCA_WLAON_WL_PWR_STATUS), negroni_wlan_reg_rd(QCA_PCIE_SCRATCH_0),
++	    negroni_wlan_reg_rd(QCA_PCIE_SCRATCH_1), negroni_wlan_reg_rd(QCA_PCIE_SCRATCH_2));
++	uint32_t w[12];
++	for (uint32_t i = 0; i < QCA6490_PBL_LOG_MAX / 4; i++) {
++		w[i] = negroni_wlan_reg_rd(QCA6490_PBL_LOG_SRAM + 4 * i);
++	}
++	printf("NEGRONI WLAN: BOOT %s: PBL log %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", when, w[0], w[1], w[2], w[3],
++	    w[4], w[5], w[6], w[7], w[8], w[9]);
++	sbl_size = MIN(sbl_size, QCA6490_SBL_LOG_MAX);
++	if (sbl_start >= QCA_SRAM_START && sbl_start < QCA_SRAM_END && sbl_start + sbl_size <= QCA_SRAM_END && sbl_size) {
++		memset(w, 0, sizeof(w));
++		for (uint32_t i = 0; i < sbl_size / 4; i++) {
++			w[i] = negroni_wlan_reg_rd(sbl_start + 4 * i);
++		}
++		printf("NEGRONI WLAN: BOOT %s: SBL log %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n", when, w[0], w[1],
++		    w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
++	} else {
++		printf("NEGRONI WLAN: BOOT %s: no SBL log (start %#x size %#x outside the SRAM)\n", when, sbl_start, sbl_size);
++	}
++	(void)negroni_wlan_smmu_check(when);
++}
++
+ /* Turn off bus mastering: from here on the chip cannot read or write host memory (PCIe BME). */
+ static void
+ wlan_quiesce(struct negroni_wlan_pcie *p)
+@@ -947,6 +1015,19 @@ wlan_level_sbl(void)
+ 		return negroni_wlan_failed(EIO, "the chip is not in PBL (EE %u, MHISTATUS %#x)", ee, st);
+ 	}
+ 
++	/*
++	 * 0339: the image as the chip will read it (through the Normal non-cacheable view = RAM after the clean to PoC):
++	 * an ELF header (7f 45 4c 46) at the start of the SBL; and the state before the doorbell.
++	 */
++	{
++		volatile const uint8_t *img = (volatile const uint8_t *)(g_pool_nc + OFF_FW);
++		printf("NEGRONI WLAN: SBL image in RAM: %02x %02x %02x %02x %02x %02x %02x %02x (%s), %u of %u bytes, device %#llx\n",
++		    img[0], img[1], img[2], img[3], img[4], img[5], img[6], img[7],
++		    (img[0] == 0x7f && img[1] == 'E' && img[2] == 'L' && img[3] == 'F') ? "ELF" : "NOT ELF", MIN(g_fw_size, MHI_SEG),
++		    g_fw_size, g_pool_dva + OFF_FW);
++		negroni_wlan_boot_dump(&H, "before BHI");
++	}
++
+ 	/* BHI: the SBL, the first 512 KiB of the image (op-kernel boot.c:247 mhi_fw_load_bhi, :493 sbl_size) */
+ 	negroni_wlan_step(8, "BHI SBL download");
+ 	return negroni_wlan_bhi_sbl(&H, g_pool_dva + OFF_FW, MIN(g_fw_size, MHI_SEG));
+diff --git a/bsd/dev/negroni_wlan_bhi.c b/bsd/dev/negroni_wlan_bhi.c
+index ce7a5e3..6fa8163 100644
+--- a/bsd/dev/negroni_wlan_bhi.c
++++ b/bsd/dev/negroni_wlan_bhi.c
+@@ -45,6 +45,10 @@ bhi_wait(struct mhi_host *h, uint32_t status_off, uint32_t bhi_err, const char *
+ 			beat += 1000;
+ 		}
+ 		if (st == BHI_ST_DONE) {
++			/* 0339: how long the transfer took and what the chip shows right after it */
++			printf("NEGRONI WLAN: %s done after %llu ms, status %#x, EE %u, MHISTATUS %#x\n", what,
++			    negroni_wlan_ms() - start, reg, negroni_wlan_rd(h->bhi + BHI_EXECENV), negroni_wlan_rd(MHI_STATUS));
++			negroni_wlan_boot_dump(h, what);
+ 			return 0;
+ 		}
+ 		if (st == BHI_ST_ERROR) {
+@@ -79,6 +83,11 @@ negroni_wlan_bhi_sbl(struct mhi_host *h, uint64_t pa, uint32_t size)
+ 	negroni_wlan_wr(h->bhi + BHI_IMGADDR_HIGH, (uint32_t)(pa >> 32));
+ 	negroni_wlan_wr(h->bhi + BHI_IMGADDR_LOW, (uint32_t)pa);
+ 	negroni_wlan_wr(h->bhi + BHI_IMGSIZE, size);
++	/* 0339: the BHI registers must hold what we wrote before the doorbell */
++	printf("NEGRONI WLAN: BHI before the doorbell: IMGADDR %#x:%08x (wrote %#x:%08x) IMGSIZE %#x STATUS %#x INTVEC %#x\n",
++	    negroni_wlan_rd(h->bhi + BHI_IMGADDR_HIGH), negroni_wlan_rd(h->bhi + BHI_IMGADDR_LOW), (uint32_t)(pa >> 32),
++	    (uint32_t)pa, negroni_wlan_rd(h->bhi + BHI_IMGSIZE), negroni_wlan_rd(h->bhi + BHI_STATUS),
++	    negroni_wlan_rd(h->bhi + BHI_INTVEC));
+ 	negroni_wlan_wr(h->bhi + BHI_IMGTXDB, seq);
+ 	printf("NEGRONI WLAN: BHI SBL %u bytes at %#llx, session %u\n", size, pa, seq);
+ 	return bhi_wait(h, h->bhi + BHI_STATUS, h->bhi, "BHI SBL");
+diff --git a/bsd/dev/negroni_wlan_mhi.c b/bsd/dev/negroni_wlan_mhi.c
+index 4c1e2cd..d71caac 100644
+--- a/bsd/dev/negroni_wlan_mhi.c
++++ b/bsd/dev/negroni_wlan_mhi.c
+@@ -107,21 +107,38 @@ negroni_wlan_mhi_ready(struct mhi_host *h)
+ 		return negroni_wlan_failed(ETIMEDOUT, "MHICTRL RESET did not clear in %u ms (MHICTRL %#x)", h->timeout_ms, c);
+ 	}
+ 
+-	deadline = negroni_wlan_ms() + h->timeout_ms;
++	/*
++	 * 0339: cnss2 waits up to 3 x (perf) or 6 x the MHI time-out during power-on (pci.c:1775-1780) and dumps the boot
++	 * registers every few seconds: wait MAX(negroniwlan_to, 30 s) here, a BOOT dump every 3 s and at the end.
++	 */
++	uint64_t t0 = negroni_wlan_ms(), next_dump = t0 + 3000;
++	uint32_t wait_ms = MAX(h->timeout_ms, 30000u), last_ee = ~0u;
++	deadline = t0 + wait_ms;
+ 	do {
+ 		if (mhi_check_status(h, "waiting for READY")) {
++			negroni_wlan_boot_dump(h, "SYSERR while waiting for READY");
+ 			return EIO;
+ 		}
+ 		s = negroni_wlan_rd(MHI_STATUS);
+ 		if (s & MHI_STATUS_READY) {
+-			printf("NEGRONI WLAN: MHISTATUS READY (%#x), execution environment %u\n", s,
++			printf("NEGRONI WLAN: MHISTATUS READY (%#x) after %llu ms, execution environment %u\n", s, negroni_wlan_ms() - t0,
+ 			    negroni_wlan_rd(h->bhi + BHI_EXECENV));
+ 			return 0;
+ 		}
++		uint32_t ee = negroni_wlan_rd(h->bhi + BHI_EXECENV);
++		if (ee != last_ee) {
++			printf("NEGRONI WLAN: waiting for READY: execution environment %u after %llu ms\n", ee, negroni_wlan_ms() - t0);
++			last_ee = ee;
++		}
++		if (negroni_wlan_ms() >= next_dump) {
++			negroni_wlan_boot_dump(h, "waiting for READY");
++			next_dump += 3000;
++		}
+ 		delay(1000);
+ 	} while (negroni_wlan_ms() < deadline);
++	negroni_wlan_boot_dump(h, "READY time-out");
+ 	printf("NEGRONI WLAN: MHISTATUS never READY (%#x)\n", s);
+-	return negroni_wlan_failed(ETIMEDOUT, "MHISTATUS not READY in %u ms (%#x, EE %u)", h->timeout_ms, s,
++	return negroni_wlan_failed(ETIMEDOUT, "MHISTATUS not READY in %u ms (%#x, EE %u)", wait_ms, s,
+ 	           negroni_wlan_rd(h->bhi + BHI_EXECENV));
+ }
+ 
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index b14e7e3..0f29375 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -226,6 +226,10 @@ void negroni_wlan_wlfw_free(void);
+ int negroni_wlan_wlfw_start(struct mhi_host *h);       /* 0320: level 7, WLAN_CFG + WLAN_MODE */
+ void negroni_wlan_wlfw_idle(void);                      /* 0320: keep-alive, late QMI indications */
+ 
++/* 0339: the MHI/BHI/PBL/SBL state in a few lines (cnss2 cnss_boot_debug_timeout_hdlr: mhi regs, scratch regs,
++ * cnss_pci_dump_bl_sram_mem), for the boot of the chip's SBL */
++void negroni_wlan_boot_dump(struct mhi_host *h, const char *when);
++
+ /* negroni_wlan_bhi.c */
+ int negroni_wlan_bhi_sbl(struct mhi_host *h, uint64_t pa, uint32_t size);
+ int negroni_wlan_bhie_image(struct mhi_host *h, uint64_t vec_pa, uint32_t entries);
