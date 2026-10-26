@@ -138,3 +138,26 @@ boot 0097 ran d1 row 15 and d2 row 14 without a fault [V], which is evidence for
    compare `lmh` with the row MHz.
 3. Open an app: `d0 ... MHz` lines go up within 1 s, then back down.
 4. Compare `NEGRONI THERMAL` cpu C and the battery mA line (0271/0272) against the `ios16-pwr` boot.
+
+## 0291: the floor option `negronicpufreq_floor=abl|lut` (2026-10-26)
+
+Status: built in the full set (`pwr-build`), **not booted**. Default `abl` = the 0284 behaviour.
+
+- `lut`: the lowest row of d1 (A710) and d2 (X2) is row 0 of their EPSS LUT instead of the ABL row (d1 17, d2 20:
+  their top rows, boot 0097/0100 [V]). The governor can then step them down to the LUT minimum at idle, and the
+  thermal cap (0280/0283, `negroni_cpufreq_cap(0)` = "deepest") really lowers them. d0 (A510, the boot cluster)
+  keeps its ABL row (12) in both modes [I: no evidence for d0 below its ABL row].
+- The three checks of 0284 use `dom_min_row[]` (ABL row, or 0 with `lut`): the floor (`gov_start`), the cap
+  (`raise_domain`, `negroni_cpufreq_cap`) and `wr_perf_state()`.
+- The LUT rows: [V] the hardware only (no source lists them); 0284 prints them at boot (`dN table (R rows, MHz):
+  ...; ABL row A; floor row F (...)`). No 0284 boot has run yet, so the MHz of row 0 of d1/d2 are not known
+  [I: 300 MHz class, the src 0 row of `read_table()`].
+- Evidence for the change (audit item 2, section "Before 0284"): boot 0097 ran d1 row 15 (2342 MHz) and d2 row 14
+  (2400 MHz), both below their ABL rows, through SpringBoard and Safari without a fault [V slop NOTES.md 2026-10-22].
+  That is evidence, not a test of row 0.
+- Owner decision: `lut` is opt-in per test image (for example `scripts/battery/build-pwr-image.sh pwr-lut
+  "<args> negronicpufreq_floor=lut"`); the default stays `abl` until a boot shows the lowest rows run stable.
+- New line: `NEGRONI CPUFREQ: floor lut (negronicpufreq_floor=lut): d0 row 12, d1 row 0, d2 row 0 (ABL rows 12/17/20)`.
+- Risk [I]: the A710/X2 at their lowest row with a high load: the governor needs 100 ms per row up (18-21 rows to the
+  top = ~2 s); lower `negronicpufreq_hi` or keep `abl` if the UI stutters.
+

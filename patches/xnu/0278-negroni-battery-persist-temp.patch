@@ -1,0 +1,681 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6f53ed3..a92f4f8 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -130,6 +130,7 @@ bsd/dev/negroni_usb.c			standard
+ bsd/dev/negroni_gpu_blit.c		standard
+ bsd/dev/negroni_audio.c			standard
+ bsd/dev/negroni_chg_glink.c		standard
++bsd/dev/negroni_batt_store.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/negroni_batt_store.c b/bsd/dev/negroni_batt_store.c
+new file mode 100644
+index 0000000..bcb20c7
+--- /dev/null
++++ b/bsd/dev/negroni_batt_store.c
+@@ -0,0 +1,199 @@
++/*
++ * NEGRONI (SM8450) patch 0278: the battery percentage kept across boots, in the same way patch 0203
++ * keeps the RTC offset (bsd/dev/negroni_rtc.c: a text file in /private/var/db, read with vnode_open +
++ * vn_rdwr, written by a thread call with O_CREAT | O_TRUNC + VNOP_FSYNC, a failed write tried again
++ * every 30 s, 60 times, while the root is read only).
++ *
++ * File /private/var/db/negroni_batt (text):
++ *   negroni-batt 1
++ *   soc 1234            hundredths of a percent, the value the battery service showed
++ *   wall 1793001749     calendar seconds of the write (for the log only)
++ * The battery service (iokit/Kernel/arm/NegroniBattery.cpp) reads it at its first OCV estimate and uses
++ * it only when it is within 15 % of that estimate (else the estimate wins); it saves on each 1 % change
++ * and at most once a minute.
++ * Log prefix "NEGRONI BATTERY: store:".
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/mount.h>
++#include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <sys/kauth.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
++#include <libkern/libkern.h>
++
++int negroni_batt_store_load(int32_t *soc_centi, uint64_t *wall_s);
++void negroni_batt_store_save(int32_t soc_centi);
++
++#define NB_FILE         "/private/var/db/negroni_batt"
++#define NB_RETRY_S      30
++#define NB_RETRIES      60
++
++static LCK_GRP_DECLARE(nbs_grp, "negroni_batt_store");
++static LCK_MTX_DECLARE(nbs_lock, &nbs_grp);
++static thread_call_t nbs_call;
++static int32_t nbs_want = -1;           /* the value to write; -1 = nothing */
++static int32_t nbs_written = -1;        /* the value in the file */
++static unsigned nbs_retries;
++static bool nbs_logged_fail;
++
++static bool
++root_mounted(void)
++{
++	vnode_t r = vfs_rootvnode();
++	if (r == NULLVP) {
++		return false;
++	}
++	vnode_put(r);
++	return true;
++}
++
++/* 0: *soc_centi (0..10000) and *wall_s set. EAGAIN: no root yet. ENOENT / EINVAL / an I/O error. */
++int
++negroni_batt_store_load(int32_t *soc_centi, uint64_t *wall_s)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	char buf[128];
++	int resid = 0, error;
++	bool magic = false, haveSoc = false;
++	int64_t soc = -1;
++	uint64_t wall = 0;
++
++	if (!root_mounted()) {
++		return EAGAIN;
++	}
++	bzero(buf, sizeof(buf));
++	error = vnode_open(NB_FILE, FREAD, 0, 0, &vp, ctx);
++	if (error != 0) {
++		return error;
++	}
++	error = vn_rdwr(UIO_READ, vp, buf, sizeof(buf) - 1, 0, UIO_SYSSPACE, IO_NODELOCKED,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	(void)vnode_close(vp, FREAD, ctx);
++	if (error != 0) {
++		return error;
++	}
++	/* "key value" lines */
++	for (char *line = buf; line && *line;) {
++		char *nl = strchr(line, '\n');
++		if (nl) {
++			*nl = 0;
++		}
++		char *sp = strchr(line, ' ');
++		if (sp) {
++			*sp = 0;
++			uint64_t v = 0;
++			bool num = sp[1] != 0;
++			for (char *c = sp + 1; *c; c++) {
++				if (*c < '0' || *c > '9' || v > 100000000000ull) {
++					num = false;
++					break;
++				}
++				v = v * 10 + (uint64_t)(*c - '0');
++			}
++			if (strcmp(line, "negroni-batt") == 0 && num && v == 1) {
++				magic = true;
++			} else if (strcmp(line, "soc") == 0 && num) {
++				soc = (int64_t)v;
++				haveSoc = true;
++			} else if (strcmp(line, "wall") == 0 && num) {
++				wall = v;
++			}
++		}
++		line = nl ? nl + 1 : NULL;
++	}
++	if (!magic || !haveSoc || soc < 0 || soc > 10000) {
++		return EINVAL;
++	}
++	*soc_centi = (int32_t)soc;
++	*wall_s = wall;
++	lck_mtx_lock(&nbs_lock);
++	nbs_written = (int32_t)soc;
++	lck_mtx_unlock(&nbs_lock);
++	return 0;
++}
++
++static void
++nbs_persist(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	char text[96];
++	int resid = 0, error;
++	clock_sec_t now_s;
++	clock_usec_t now_us;
++
++	lck_mtx_lock(&nbs_lock);
++	int32_t soc = nbs_want;
++	bool same = soc == nbs_written;
++	lck_mtx_unlock(&nbs_lock);
++	if (soc < 0 || same) {
++		return;
++	}
++	if (!root_mounted()) {
++		error = EAGAIN;
++	} else {
++		clock_get_calendar_microtime(&now_s, &now_us);
++		snprintf(text, sizeof(text), "negroni-batt 1\nsoc %d\nwall %lu\n", soc, (unsigned long)now_s);
++		error = vnode_open(NB_FILE, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, S_IRUSR | S_IWUSR,
++		    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++		if (error == 0) {
++			error = vn_rdwr(UIO_WRITE, vp, text, (int)strlen(text), 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++			    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++			if (error == 0 && resid != 0) {
++				error = EIO;
++			}
++			if (error == 0) {
++				error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++			}
++			(void)vnode_close(vp, FWRITE, ctx);
++		}
++	}
++	lck_mtx_lock(&nbs_lock);
++	if (error == 0) {
++		if (nbs_written < 0) {
++			printf("NEGRONI BATTERY: store: soc %d.%02d%% saved to %s (then on each 1 %% change, at most once a minute)\n",
++			    soc / 100, soc % 100, NB_FILE);
++		}
++		nbs_written = soc;
++		nbs_retries = 0;
++	} else if (nbs_retries++ < NB_RETRIES) {
++		if (!nbs_logged_fail) {
++			nbs_logged_fail = true;
++			printf("NEGRONI BATTERY: store: %s not written (error %d): again every %d s\n", NB_FILE, error, NB_RETRY_S);
++		}
++		uint64_t deadline;
++		clock_interval_to_deadline(NB_RETRY_S, NSEC_PER_SEC, &deadline);
++		thread_call_enter_delayed(nbs_call, deadline);
++	}
++	lck_mtx_unlock(&nbs_lock);
++}
++
++/* Queue a write of soc_centi (a thread call; the caller does not wait). */
++void
++negroni_batt_store_save(int32_t soc_centi)
++{
++	if (soc_centi < 0 || soc_centi > 10000) {
++		return;
++	}
++	lck_mtx_lock(&nbs_lock);
++	if (nbs_call == NULL) {
++		nbs_call = thread_call_allocate_with_options(nbs_persist, NULL, THREAD_CALL_PRIORITY_LOW, 0);
++	}
++	nbs_want = soc_centi;
++	if (nbs_retries >= NB_RETRIES) {
++		nbs_retries = 0;                /* a new value: try again */
++	}
++	thread_call_t c = nbs_call;
++	lck_mtx_unlock(&nbs_lock);
++	if (c != NULL) {
++		thread_call_enter(c);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
+index a7c054d..6851c6b 100644
+--- a/bsd/dev/negroni_spmi.c
++++ b/bsd/dev/negroni_spmi.c
+@@ -60,6 +60,14 @@
+  * of a register that the normal path reads too (BCL 0x4704). The debug bus has no
+  * ownership check: the read allowlist and the same six charger write registers stay
+  * the only limits. A debug command that times out closes the debug path for the boot.
++ *
++ * Patch 0278: (1) negroni_spmi_bcl_monitor_on(): the BCL monitor enable of Linux bcl_pmic5.c
++ * (bcl_configure_bcl_peripheral, :779: MONITOR_EN 0x4746 = BIT(7)), written once and only when the
++ * bit reads clear and EE 0 owns the BCL APID; the one BCL register that is ever written (one write,
++ * then locked again). (2) The AOP QDSS clock vote of 0273 is released ("{class: clock, res: qdss,
++ * val: 0}", Linux qmp_qdss_clk_unprepare, qcom_aoss.c:294-296) on every path where the debug path
++ * ends after the vote: the core map fails, the check read fails, or a later timeout/32 failures
++ * close it. While the debug path is open the vote stays (its reads need the clock).
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -168,6 +176,11 @@ static int sp_chg_route;
+ static int sd_state;                    /* 0 not tried, 1 open, -1 closed */
+ static vm_offset_t sd_core;
+ static unsigned sd_fail_logged, sd_fail_run;   /* status-error lines so far, consecutive status errors */
++/* 0278: the QDSS vote is held / must be released (set under sp_lock, released without it: QMP sleeps) */
++static bool sd_voted, sd_release_pending;
++/* 0278: the BCL MONITOR_EN write window (one write) */
++static vm_offset_t sp_bcl_chn;
++static bool sp_bcl_unlocked;
+ 
+ int
+ negroni_spmi_arbiter(struct sk_arbiter *arb, vm_offset_t *cnfg)
+@@ -430,6 +443,7 @@ sd_xfer(unsigned op, unsigned sid, unsigned addr, uint8_t *value)
+ 				}
+ 				if (++sd_fail_run >= SD_FAIL_CLOSE) {
+ 					sd_state = -1;
++					sd_release_pending = sd_voted;          /* 0278 */
+ 					printf("NEGRONI BATTERY: debug arbiter: debug path closed: %u failures\n", sd_fail_run);
+ 				}
+ 				return 2;
+@@ -443,11 +457,34 @@ sd_xfer(unsigned op, unsigned sid, unsigned addr, uint8_t *value)
+ 		delay(1);
+ 	}
+ 	sd_state = -1;
++	sd_release_pending = sd_voted;                          /* 0278 */
+ 	printf("NEGRONI BATTERY: debug arbiter %s sid=%u addr=%#x: timeout (status %#x): debug path closed\n",
+ 	    op == SD_OP_EXT_WRITEL ? "write" : "read", sid, addr, st);
+ 	return 1;
+ }
+ 
++/* 0278: drop the QDSS clock vote once the debug path is closed. Thread context, sp_lock NOT held. */
++static void
++sd_vote_release(const char *why_closed)
++{
++	char why[96] = "";
++	bool go;
++
++	lck_mtx_lock(&sp_lock);
++	go = sd_voted;
++	sd_voted = sd_release_pending = false;
++	lck_mtx_unlock(&sp_lock);
++	if (!go) {
++		return;
++	}
++	if (qm_send("{class: clock, res: qdss, val: 0}", why, sizeof(why))) {
++		printf("NEGRONI BATTERY: debug arbiter: %s: QDSS clock vote release failed (%s)\n", why_closed, why);
++	} else {
++		printf("NEGRONI BATTERY: debug arbiter: %s: QDSS clock vote released (AOP QMP \"{class: clock, res: qdss, val: 0}\")\n",
++		    why_closed);
++	}
++}
++
+ /* Once per boot (thread context, sleeps). True when the debug path is open. */
+ static bool
+ sd_open(bool check_fuse, bool qdss)
+@@ -488,10 +525,14 @@ sd_open(bool check_fuse, bool qdss)
+ 			return false;
+ 		}
+ 		printf("NEGRONI BATTERY: debug arbiter: the AOP took the QDSS clock vote\n");
++		lck_mtx_lock(&sp_lock);
++		sd_voted = true;                /* 0278 */
++		lck_mtx_unlock(&sp_lock);
+ 	}
+ 	sd_core = ml_io_map(SD_CORE_PA, 0x1000);
+ 	if (!sd_core) {
+ 		printf("NEGRONI BATTERY: debug arbiter: core map failed\n");
++		sd_vote_release("core map failed");     /* 0278 */
+ 		return false;
+ 	}
+ 	printf("NEGRONI BATTERY: debug arbiter: first access of 0x10b14000 (a hang here: the bus has no clock)\n");
+@@ -510,6 +551,9 @@ sd_open(bool check_fuse, bool qdss)
+ 	lck_mtx_unlock(&sp_lock);
+ 	printf("NEGRONI BATTERY: debug arbiter: check read SID 3 0x4704 = %02x (rc %d), normal path %02x (rc %d): %s\n",
+ 	    dbg, rc, nrm, nrc, sd_state > 0 ? "debug path OPEN" : "debug path closed");
++	if (sd_state <= 0) {
++		sd_vote_release("check read failed");   /* 0278 */
++	}
+ 	return sd_state > 0;
+ }
+ 
+@@ -617,7 +661,11 @@ negroni_spmi_read_rc(unsigned sid, unsigned addr, uint8_t *out)
+ 		if (drc == 0) {
+ 			*out = d;
+ 		}
++		bool rel = sd_release_pending;
+ 		lck_mtx_unlock(&sp_lock);
++		if (rel) {
++			sd_vote_release("debug path closed");   /* 0278 */
++		}
+ 		return drc;
+ 	}
+ 	uint16_t apid = ppid == SP_BCL_PPID ? sp_bcl_apid : ppid == SP_VADC_PPID ? sp_vadc_apid :
+@@ -659,6 +707,12 @@ sp_write_target(unsigned sid, unsigned addr, vm_offset_t *chn, uint16_t *apid)
+ 		*apid = sp_vadc_apid;
+ 		return sp_vadc_unlocked;
+ 	}
++	/* 0278: BCL MONITOR_EN, only inside negroni_spmi_bcl_monitor_on() */
++	if (sid == 3 && addr == 0x4746 && sp_bcl_unlocked && sp_bcl_chn && sp_bcl_apid != SP_NO_APID) {
++		*chn = sp_bcl_chn;
++		*apid = sp_bcl_apid;
++		return true;
++	}
+ 	if (sid == 3 && sp_chg_unlocked) {
+ 		if (addr == 0x1042) {
+ 			*chn = sp_chg_chn[0];
+@@ -691,7 +745,11 @@ negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value)
+ 		    addr == 0x1365 || addr == 0x1366 || addr == 0x1370)) {
+ 			drc = sd_xfer(SD_OP_EXT_WRITEL, sid, addr, &v);
+ 		}
++		bool rel = sd_release_pending;
+ 		lck_mtx_unlock(&sp_lock);
++		if (rel) {
++			sd_vote_release("debug path closed");   /* 0278 */
++		}
+ 		return drc ? -1 : 0;
+ 	}
+ 	if (!sp_write_target(sid, addr, &chn, &apid) || sp_poisoned[apid]) {
+@@ -720,6 +778,51 @@ negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value)
+ 	return rc ? -1 : 0;
+ }
+ 
++/*
++ * 0278: the BCL monitor on, as Linux bcl_configure_bcl_peripheral() (bcl_pmic5.c:777-780) does at probe.
++ * Returns 0 when MONITOR_EN bit 7 already reads set (XBL/ABL left it on: no write), 1 when this call set
++ * it (read back), -1 on failure (no APID, another EE owns it, write or read back failed).
++ */
++int
++negroni_spmi_bcl_monitor_on(void)
++{
++	uint8_t v = 0, back = 0;
++	unsigned owner = 7;
++	int rc;
++
++	if (!sp_ready || sp_bcl_apid == SP_NO_APID || negroni_spmi_read(3, 0x4746, &v)) {
++		return -1;
++	}
++	if (v & 0x80u) {
++		return 0;
++	}
++	lck_mtx_lock(&sp_lock);
++	(void)sp_find_apid(SP_BCL_PPID, &owner);
++	if (owner == SP_EE && !sp_poisoned[sp_bcl_apid]) {
++		if (!sp_bcl_chn) {
++			sp_bcl_chn = ml_io_map(SP_CHNLS_PA + SP_CHNL_STRIDE * sp_bcl_apid, SP_CHNL_STRIDE);
++		}
++		sp_bcl_unlocked = sp_bcl_chn != 0;
++	}
++	lck_mtx_unlock(&sp_lock);
++	if (!sp_bcl_unlocked) {
++		printf("NEGRONI BATTERY: BCL MONITOR_EN 0x4746 = %#x (off): not written (APID %u owner EE %u%s)\n", v,
++		    sp_bcl_apid, owner, sp_bcl_chn ? "" : ", no channel window");
++		return -1;
++	}
++	rc = negroni_spmi_write(3, 0x4746, 0x80);
++	lck_mtx_lock(&sp_lock);
++	sp_bcl_unlocked = false;                /* one write, locked again */
++	lck_mtx_unlock(&sp_lock);
++	if (rc == 0) {
++		IOSleep(2);
++		rc = negroni_spmi_read(3, 0x4746, &back);
++	}
++	printf("NEGRONI BATTERY: BCL MONITOR_EN 0x4746 was %#x: wrote 0x80 (bcl_pmic5.c:779): %s, reads %#x\n", v,
++	    rc == 0 && (back & 0x80u) ? "monitor ON" : "FAILED", back);
++	return rc == 0 && (back & 0x80u) ? 1 : -1;
++}
++
+ unsigned
+ negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max)
+ {
+diff --git a/bsd/dev/negroni_spmi.h b/bsd/dev/negroni_spmi.h
+index 647c513..f1fe91f 100644
+--- a/bsd/dev/negroni_spmi.h
++++ b/bsd/dev/negroni_spmi.h
+@@ -43,6 +43,9 @@ int negroni_spmi_chg_route(int arb, bool want_write, bool check_fuse, bool qdss)
+ /* PMK8350 VADC ADC7 request registers (SID 0 0x3140-0x3145, 0x3147) after the VADC unlock, the six
+  * charger registers after the charger unlock; everything else fails. */
+ int negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value);
++/* 0278: BCL MONITOR_EN (0x4746 bit 7) on when it reads off and EE 0 owns the BCL APID (bcl_pmic5.c:779).
++ * 0 already on (no write), 1 set by this call, -1 failure. Thread context. */
++int negroni_spmi_bcl_monitor_on(void);
+ /* The arbiter's APID map (PPID = SID << 8 | peripheral) and owner EEs; returns the count. */
+ unsigned negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max);
+ #ifdef __cplusplus
+diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBattery.cpp
+index 2ab29d2..80de955 100644
+--- a/iokit/Kernel/arm/NegroniBattery.cpp
++++ b/iokit/Kernel/arm/NegroniBattery.cpp
+@@ -17,7 +17,7 @@
+  * SPMI arbiter mapping that the RTC of patch 0203 also uses, bsd/dev/negroni_spmi.c):
+  *   PM8350B BCL, SID 3 0x4700 (live DT bcl@4700 "qcom,bcl-v5", qcom,pmic7-threshold;
+  *   downstream drivers/thermal/qcom/bcl_pmic5.c):
+- *     0x4746 MONITOR_EN   bit 7 = BCL monitor on (Linux sets it at probe; we only read it)
++ *     0x4746 MONITOR_EN   bit 7 = BCL monitor on (Linux sets it at probe; 0278 sets it once when it reads off)
+  *     0x4772 VBAT_CONV_REQ non-zero = VBAT ADC on (Linux registers the vbat zone only then)
+  *     0x4776 VBAT_READ    u8, 49.827 mV per bit; 0x7f = no reading (which node it measures
+  *                         on the 2S pack is not known: above 5 V it is taken as the pack)
+@@ -64,6 +64,15 @@
+  * charger PD over GLINK PMIC_RTR_ADSP_APPS (USB input limit negronichg_ma, default 1500, and charging
+  * enable). This service only shows its state: "chg=glink icl=NNNNmA" in the status line and the
+  * NegroniChargerGlink* properties (the PD's SoC is published as NegroniChargerGlinkSOC, not used here).
++ * Patch 0278: (1) the percentage is kept across boots in /private/var/db/negroni_batt
++ * (bsd/dev/negroni_batt_store.c, the RTC-offset way of 0203); at the first OCV estimate the saved value
++ * is used when it is within 15 % of the estimate (NB_STORE_TRUST), else the estimate wins; saved on a
++ * 1 % change, at most once a minute. (2) Temperature = the cell temperature of the charger PD (GLINK
++ * BATT_TEMP, 0274/0277) when fresh (60 s), else the skin thermistor as before;
++ * NegroniBatteryTemperatureEstimated false with the cell value. (3) The skin (0x146) and XO (0x44,
++ * pmk8350_xo_therm, live.dts:12226-12231) thermistors go to the power hub (negroni_pwr_temp_set) for the
++ * thermal policy (0283), modes 4/5. (4) BCL MONITOR_EN is set once at start when it reads off
++ * (negroni_spmi_bcl_monitor_on, Linux bcl_pmic5.c:779); boot-arg negronibcl_en=0 leaves it alone.
+  * Log prefix "NEGRONI BATTERY:".
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+@@ -89,7 +98,12 @@ bool negroni_spmi_chg_unlock(bool force);
+ int negroni_spmi_chg_route(int arb, bool want_write, bool check_fuse, bool qdss);
+ int negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ unsigned negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max);
++int negroni_spmi_bcl_monitor_on(void);                                  /* 0278 */
++/* bsd/dev/negroni_batt_store.c (0278) */
++int negroni_batt_store_load(int32_t *soc_centi, uint64_t *wall_s);
++void negroni_batt_store_save(int32_t soc_centi);
+ }
++#include <sys/errno.h>
+ 
+ /*
+  * Patch 0276 (the percentage and the plug latency; README-battery.md section 10). CurrentCapacity comes
+@@ -134,6 +148,10 @@ static const char *const kSocSrcName[] = { "none", "ocv", "glink", "gauge" };
+ #define NB_OCV_OUTLIER_MV  250     /* a conversion this far from the filtered voltage is one bad sample (seen: 2742 mV once) */
+ #define NB_REST_MA         100     /* |current| below this: the sample is near the open-circuit voltage */
+ #define NB_GLINK_FRESH_NS  180000000000ull /* the PD's SoC counts for 3 minutes after its last good read */
++#define NB_STORE_TRUST     1500    /* 0278: a saved value more than 15 % from the OCV estimate is not used */
++#define NB_STORE_TRIES     15      /* 0278: polls (20 s) to wait for the root file system */
++#define NB_STORE_MIN_NS    60000000000ull  /* 0278: at most one save a minute */
++#define NB_BATT_T_AGE_MS   60000   /* 0278: the PD's cell temperature counts for 60 s */
+ 
+ /* PM8350B BCL (SID 3 0x4700), downstream bcl_pmic5.c */
+ #define BCL_SID            3u
+@@ -195,6 +213,7 @@ static const nb_chan kUsbIn    = { 3, 0x11, 0, 0, 1, 16 };
+ static const nb_chan kIchg     = { 3, 0xa1, 0, 0, 1000, 305185 };
+ static const nb_chan kIin      = { 3, 0x17, 0, 0, 32, 100 };
+ static const nb_chan kSkin     = { 1, 0x46, 1, 2, 1, 1 };  /* 200 us settle */
++static const nb_chan kXo       = { 0, 0x44, 1, 2, 1, 1 };  /* 0278: pmk8350_xo_therm, ratiometric, 200 us (live.dts:12226-12231) */
+ 
+ /* ADC7 user registers (PMK8350 VADC, SID 0 0x3100), Linux qcom-spmi-adc5.c */
+ #define ADC_BASE           0x3100u
+@@ -241,10 +260,10 @@ struct nb_sample {
+ 	bool adcVbatOk;
+ 	int32_t adcVbatMv;
+ 	unsigned adcVbatN;
+-	bool usbOk, ichgOk, iinOk, tempOk;
++	bool usbOk, ichgOk, iinOk, tempOk, xoOk;
+ 	unsigned usbMv;
+ 	int32_t ichgMa, iinMa;
+-	int centiC;
++	int centiC, xoC;
+ 	/* 0272: the charger registers (chgRead: all of them read) */
+ 	bool chgRead;
+ 	uint8_t st1, st2, chgEn, fcc, fv, apsdSt, apsdRes, usbRt, cmdIl, loadCfg, iclOpt, iclCfg, aiclOpt, typecSnk,
+@@ -293,6 +312,13 @@ private:
+ 	int fSocLogKey;            /* the last logged percent/source/target */
+ 	unsigned fFastMs, fTicks;  /* plug tick period (0 = off) and ticks since the last full read */
+ 	uint64_t fFastNs;          /* uptime of the last plug tick */
++	/* 0278: the saved percentage */
++	bool fStoreDone;           /* the saved value was used or refused (saves start after this) */
++	unsigned fStoreTries;
++	int32_t fLastSavedSoc;     /* -1 = none this boot */
++	uint64_t fLastSaveNs;
++	bool storeTry(int32_t target);
++	void storeSave(uint64_t ns);
+ 	void fastCheck(void);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -354,6 +380,10 @@ NegroniBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fTicks = 0;
+ 	fFastNs = 0;
++	fStoreDone = false;
++	fStoreTries = 0;
++	fLastSavedSoc = -1;
++	fLastSaveNs = 0;
+ 	fLastNs = 0;
+ 	fLowPolls = fFailPolls = 0;
+ 	fLastPercent = -1;
+@@ -687,7 +717,7 @@ NegroniBattery::socFromOcv(int32_t mv)
+ /*
+  * PM8350B BCL VBAT/IBAT: reads only, BCL_READS samples each, 1 ms apart (the work loop thread
+  * sleeps). The values are used only when the monitor is on (MONITOR_EN bit 7: Linux sets it at
+- * probe, we never write it); with the monitor off they go to the raw log line only.
++ * probe; 0278 sets it once at start when it reads off); with the monitor off they go to the raw log line only.
+  * IBAT 0 means "no new reading" (bcl_read_ibat keeps the last value), so it is averaged over the
+  * non-zero samples.
+  */
+@@ -757,6 +787,13 @@ NegroniBattery::readVadc(nb_sample &s)
+ 	s.ichgOk = adcMicro(kIchg, &ichgUa);
+ 	s.iinOk = adcMicro(kIin, &iinUa);
+ 	s.tempOk = adcTemp(kSkin, &s.centiC);
++	s.xoOk = adcTemp(kXo, &s.xoC);                          /* 0278 */
++	if (s.tempOk) {
++		negroni_pwr_temp_set(NEGRONI_PWR_T_SKIN, s.centiC);
++	}
++	if (s.xoOk) {
++		negroni_pwr_temp_set(NEGRONI_PWR_T_XO, s.xoC);
++	}
+ 	s.usbMv = s.usbOk ? (unsigned)(usbUv / 1000) : 0;
+ 	s.ichgMa = s.ichgOk ? (int32_t)(ichgUa / 1000) : 0;
+ 	s.iinMa = s.iinOk ? (int32_t)(iinUa / 1000) : 0;
+@@ -1079,13 +1116,13 @@ NegroniBattery::poll(void)
+ 		int64_t vph = 0, mid = 0;
+ 		bool vphOk = fVadc && adcMicro(kVph, &vph), midOk = fVadc && adcMicro(kVbatMid, &mid);
+ 		IOLog("NEGRONI BATTERY: raw bcl mon %02x conv %02x vbat %s%dmV (%u/%d%s) ibat %s%dmA (%u nonzero) | "
+-		    "vadc vbat %s%dmV (%u/4) vph %s%dmV mid2s %s%dmV usbin %s%umV ichg %s%dmA iin %s%dmA skin %s%d | "
++		    "vadc vbat %s%dmV (%u/4) vph %s%dmV mid2s %s%dmV usbin %s%umV ichg %s%dmA iin %s%dmA skin %s%d xo %s%d | "
+ 		    "cur %s%d ext %d soc %d\n",
+ 		    s.bclMon, s.bclConv, s.bclVbatOk ? "" : "?", s.bclVbatMv, s.bclVbatN, BCL_READS, s.bclPack ? " pack/2" : "",
+ 		    s.bclIbatOk ? "" : "?", s.bclIbatMa, s.bclIbatNonzero,
+ 		    s.adcVbatOk ? "" : "?", s.adcVbatMv, s.adcVbatN, vphOk ? "" : "?", (int)(vph / 1000), midOk ? "" : "?",
+ 		    (int)(mid / 1000), s.usbOk ? "" : "?", s.usbMv, s.ichgOk ? "" : "?", s.ichgMa, s.iinOk ? "" : "?", s.iinMa,
+-		    s.tempOk ? "" : "?", s.centiC, curKnown ? "" : "?", cur, external, fSoc);
++		    s.tempOk ? "" : "?", s.centiC, s.xoOk ? "" : "?", s.xoC, curKnown ? "" : "?", cur, external, fSoc);
+ 	}
+ 	if (source == NB_SRC_STATIC) {
+ 		/* Keep the last estimate; with no estimate yet, the static fallback (the reason after 3 failed polls). */
+@@ -1178,15 +1215,19 @@ NegroniBattery::poll(void)
+ 		fSocSrc = NB_SOC_GLINK;
+ 		fSoc = glinkSoc;
+ 		fHaveSoc = true;
++		fStoreDone = true;       /* 0278: the gauge is the truth: no restore */
+ 	} else if (!fHaveSoc || fSocSrc != NB_SOC_OCV) {
+ 		if (fSocSrc == NB_SOC_GLINK) {
+ 			IOLog("NEGRONI BATTERY: soc source ocv (the charger PD's value is stale; kept %d.%02d%%, estimate %d.%02d%%)\n",
+ 			    fSoc / 100, fSoc % 100, target / 100, target % 100);
+ 		} else {
+ 			fSoc = target;           /* first value: the first sample's table value */
++			(void)storeTry(target);  /* 0278: or the saved value, when it is near the estimate */
+ 		}
+ 		fSocSrc = NB_SOC_OCV;
+ 		fHaveSoc = true;
++	} else if (!fStoreDone && storeTry(target)) {
++		/* 0278: the root came up after the first estimate: the saved value replaces it once */
+ 	} else {
+ 		/* Toward the table value, at most 1 % per NB_SOC_RATE_S, monotonic with the filtered current:
+ 		 * the pack cannot gain charge while the net current leaves it, nor lose charge while it enters.
+@@ -1219,6 +1260,7 @@ NegroniBattery::poll(void)
+ 	if (percent > 100) {
+ 		percent = 100;
+ 	}
++	storeSave(ns);                   /* 0278 */
+ 	/* Charging: the PD's status when it reports one; else the filtered current (no flicker between
+ 	 * the +78 mA and 0 mA polls of a cable that only holds the phone). */
+ 	bool charging;
+@@ -1240,7 +1282,20 @@ NegroniBattery::poll(void)
+ 	}
+ 	/* Skin temperature as the battery's (VADC only); clamped so an outlier cannot stop charging in iOS. */
+ 	int centiC = s.tempOk ? (s.centiC < 0 ? 0 : s.centiC > 4500 ? 4500 : s.centiC) : 2500;
+-	putBool("NegroniBatteryTemperatureEstimated", true);
++	/* 0278: the cell temperature from the charger PD's gauge (GLINK BATT_TEMP) when fresh: a real value, not clamped */
++	int32_t battC = 0;
++	bool tempReal = negroni_pwr_temp_get(NEGRONI_PWR_T_BATT, &battC, NB_BATT_T_AGE_MS) && battC >= -2000 && battC <= 8000;
++	if (tempReal) {
++		centiC = battC;
++	}
++	putBool("NegroniBatteryTemperatureEstimated", !tempReal);
++	putString("NegroniBatteryTemperatureSource", tempReal ? "glink" : s.tempOk ? "skin" : "none");
++	if (s.tempOk) {
++		putNumber("NegroniSkinTemperature", (UInt32)s.centiC);
++	}
++	if (s.xoOk) {
++		putNumber("NegroniXoTemperature", (UInt32)s.xoC);
++	}
+ 	putBool("NegroniBatteryCurrentValid", curKnown);
+ 	putNumber("NegroniBatteryChargeCurrent", (UInt32)s.ichgMa);
+ 	putNumber("NegroniBatteryInputCurrent", (UInt32)s.iinMa);
+@@ -1253,6 +1308,58 @@ NegroniBattery::poll(void)
+ 	publish(percent, (unsigned)vbat, curKnown ? cur : 0, centiC, external, charging, full, source, s.usbMv, s.iinMa);
+ }
+ 
++/*
++ * 0278: the saved percentage (bsd/dev/negroni_batt_store.c). True when it replaced fSoc. Tried at the first
++ * OCV estimate and, while the root is not mounted yet (EAGAIN), at the next NB_STORE_TRIES polls.
++ */
++bool
++NegroniBattery::storeTry(int32_t target)
++{
++	int32_t saved = -1;
++	uint64_t wall = 0;
++
++	if (fStoreDone) {
++		return false;
++	}
++	int rc = negroni_batt_store_load(&saved, &wall);
++	if (rc == EAGAIN && ++fStoreTries < NB_STORE_TRIES) {
++		return false;                       /* no root file system yet: the next poll tries again */
++	}
++	fStoreDone = true;
++	if (rc != 0) {
++		IOLog("NEGRONI BATTERY: store: no saved percentage (%s, error %d): the OCV estimate %d.%02d%% stays\n",
++		    rc == ENOENT ? "no file yet" : rc == EAGAIN ? "no root file system" : rc == EINVAL ? "file not understood" : "read error",
++		    rc, target / 100, target % 100);
++		return false;
++	}
++	int32_t diff = saved > target ? saved - target : target - saved;
++	if (diff > NB_STORE_TRUST) {
++		IOLog("NEGRONI BATTERY: store: saved %d.%02d%% (wall %llu) is %d.%02d %% from the OCV estimate %d.%02d%% (> 15 %%): "
++		    "the estimate wins\n", saved / 100, saved % 100, wall, diff / 100, diff % 100, target / 100, target % 100);
++		return false;
++	}
++	IOLog("NEGRONI BATTERY: store: soc restored %d.%02d%% (saved at wall %llu; OCV estimate %d.%02d%%, %d.%02d %% apart)\n",
++	    saved / 100, saved % 100, wall, target / 100, target % 100, diff / 100, diff % 100);
++	fSoc = saved;
++	return true;
++}
++
++/* 0278: queue a save on a 1 % change (the first one at once), at most once a minute; only after the restore decision. */
++void
++NegroniBattery::storeSave(uint64_t ns)
++{
++	if (!fStoreDone || !fHaveSoc) {
++		return;
++	}
++	int32_t d = fLastSavedSoc < 0 ? 10000 : (fSoc > fLastSavedSoc ? fSoc - fLastSavedSoc : fLastSavedSoc - fSoc);
++	if (d < 100 || (fLastSavedSoc >= 0 && ns - fLastSaveNs < NB_STORE_MIN_NS)) {
++		return;
++	}
++	negroni_batt_store_save(fSoc);
++	fLastSavedSoc = fSoc;
++	fLastSaveNs = ns;
++}
++
+ void
+ NegroniBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -1368,6 +1475,14 @@ NegroniBattery::start(IOService *provider)
+ 		    chgForce, arb, fChgRoutePoll);
+ 	}
+ 	if (fReal) {
++		/* 0278: the BCL monitor on when XBL/ABL left it off (bcl_pmic5.c:779); negronibcl_en=0: never written */
++		unsigned bclEn = 1;
++		(void)PE_parse_boot_argn("negronibcl_en", &bclEn, sizeof(bclEn));
++		if (bclEn) {
++			int r = negroni_spmi_bcl_monitor_on();
++			IOLog("NEGRONI BATTERY: BCL monitor: %s\n", r == 0 ? "already on (no write)" : r == 1 ? "switched on" :
++			    "off and not writable");
++		}
+ 		unsigned owner = 7;
+ 		int apid = negroni_spmi_apid(BCL_SID, BCL_BASE >> 8, &owner);
+ 		uint8_t type = 0xff, sub = 0xff, mon = 0xff, conv = 0xff;

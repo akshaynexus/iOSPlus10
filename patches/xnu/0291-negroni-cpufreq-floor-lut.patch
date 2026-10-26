@@ -1,0 +1,120 @@
+diff --git a/bsd/dev/negroni_cpufreq.c b/bsd/dev/negroni_cpufreq.c
+index 4359759..393cd71 100644
+--- a/bsd/dev/negroni_cpufreq.c
++++ b/bsd/dev/negroni_cpufreq.c
+@@ -8,6 +8,15 @@
+  * addresses: sm8450.dtsi cpufreq@17d91000. Ported for negroni from the
+  * Linux qcom-cpufreq-hw EPSS layout.
+  *
++ * Patch 0291: negronicpufreq_floor=abl|lut (default abl = the 0098 rule). With lut the lowest row of
++ * d1 (A710) and d2 (X2) is row 0 of their EPSS LUT (the table that 0284 prints at boot) instead of the
++ * row ABL left (d1 17, d2 20 = their top rows at boot 0097/0100), so the governor can idle the big
++ * cores at their lowest row and the thermal cap (0280/0283, negroni_cpufreq_cap(0) = the deepest row)
++ * can really lower them. d0 (A510, the boot cluster) keeps its ABL row as the floor in both modes.
++ * Evidence (README-cpufreq.md "Before 0284"): boot 0097 ran d1 row 15 (2342 MHz) and d2 row 14
++ * (2400 MHz), both below their ABL rows, through SpringBoard and Safari without a fault. No boot has
++ * run d1/d2 at their LUT minimum yet: lut is the owner's decision per test image, abl stays the default.
++ * The three checks of 0284 (floor, cap, wr_perf_state) now use dom_min_row[] (ABL row, or 0 with lut). *
+  * Boot args: negronicpufreq=0 leaves the clocks alone; negronicpufreq_mhz=N
+  * caps each domain at the highest row not above N MHz (default 3200,
+  * above every row: the top of each table); a domain is never set below
+@@ -83,6 +92,9 @@ void negroni_cpufreq_mhz_line(char *buf, size_t size);
+ static vm_offset_t dom_base[EPSS_DOMAINS];
+ static uint32_t dom_abl_row[EPSS_DOMAINS], dom_cores[EPSS_DOMAINS];
+ static bool dom_known;
++/* 0291: the lowest row any path may write: the ABL row (abl) or LUT row 0 for d1/d2 (lut) */
++static uint32_t dom_min_row[EPSS_DOMAINS];
++static bool floor_lut;
+ 
+ /* 0284: the table of each domain (rows that go up; the EPSS table ends by repeating a row) */
+ static uint32_t dom_khz[EPSS_DOMAINS][EPSS_TABLE_ROWS];
+@@ -117,12 +129,12 @@ rd_perf_state(uint32_t domain)
+ 	return *(volatile uint32_t *)(dom_base[domain] + EPSS_PERF_STATE);
+ }
+ 
+-/* The one writer of PERF_STATE after boot. Never below the row ABL left (0098). */
++/* The one writer of PERF_STATE after boot. Never below the minimum row (0098: the ABL row; 0291 lut: row 0 for d1/d2). */
+ static inline void
+ wr_perf_state(uint32_t domain, uint32_t row)
+ {
+-	if (row < dom_abl_row[domain]) {
+-		row = dom_abl_row[domain];
++	if (row < dom_min_row[domain]) {
++		row = dom_min_row[domain];
+ 	}
+ 	*(volatile uint32_t *)(dom_base[domain] + EPSS_PERF_STATE) = row;
+ 	dom_row[domain] = row;
+@@ -184,8 +196,9 @@ raise_domain(uint32_t domain, uint32_t cores, uint32_t cap_khz)
+ 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
+ 	dom_base[domain] = base;
+ 	dom_abl_row[domain] = was;
++	dom_min_row[domain] = (floor_lut && domain != 0) ? 0 : was;    /* 0291 */
+ 	dom_cores[domain] = cores;
+-	dom_cap_row[domain] = top > was ? top : was;   /* the cap is never below the ABL row */
++	dom_cap_row[domain] = top > dom_min_row[domain] ? top : dom_min_row[domain];   /* the cap is never below the minimum row */
+ 	dom_row[domain] = was;
+ 	if (was >= top) {
+ 		/* ABL already asked for as much or more: never slow a domain down */
+@@ -391,22 +404,23 @@ gov_start(void)
+ 		for (uint32_t r = 0; r < dom_rows[d] && t < sizeof(tab) - 8; r++) {
+ 			t += snprintf(tab + t, sizeof(tab) - t, "%s%u", r ? "," : "", dom_khz[d][r] / 1000);
+ 		}
+-		printf("NEGRONI CPUFREQ: d%u table (%u rows, MHz): %s; ABL row %u\n", d, dom_rows[d], tab, dom_abl_row[d]);
+-		/* the floor: the ABL row (0098); negronicpufreq_floor_mhz can only raise it */
+-		dom_floor_row[d] = dom_abl_row[d];
++		printf("NEGRONI CPUFREQ: d%u table (%u rows, MHz): %s; ABL row %u; floor row %u (%s)\n", d, dom_rows[d], tab,
++		    dom_abl_row[d], dom_min_row[d], dom_min_row[d] < dom_abl_row[d] ? "negronicpufreq_floor=lut: LUT minimum" : "ABL row");
++		/* the floor: the minimum row (0098 ABL row; 0291 lut: row 0 for d1/d2); negronicpufreq_floor_mhz can only raise it */
++		dom_floor_row[d] = dom_min_row[d];
+ 		if (floor_mhz) {
+ 			uint32_t want = row_for_khz(d, floor_mhz * 1000);
+ 
+ 			if (want > dom_floor_row[d]) {
+ 				dom_floor_row[d] = want;
+-			} else if (want < dom_abl_row[d]) {
+-				printf("NEGRONI CPUFREQ: d%u negronicpufreq_floor_mhz=%u is row %u, below the ABL row %u: floor stays %u\n",
+-				    d, floor_mhz, want, dom_abl_row[d], dom_abl_row[d]);
++			} else if (want < dom_min_row[d]) {
++				printf("NEGRONI CPUFREQ: d%u negronicpufreq_floor_mhz=%u is row %u, below the minimum row %u: floor stays %u\n",
++				    d, floor_mhz, want, dom_min_row[d], dom_min_row[d]);
+ 			}
+ 		}
+ 		cfg_floor_row[d] = dom_floor_row[d];
+ 		if (dom_floor_row[d] > dom_cap_row[d]) {
+-			dom_floor_row[d] = dom_cap_row[d];     /* the cap is never below the ABL row */
++			dom_floor_row[d] = dom_cap_row[d];     /* the cap is never below the minimum row */
+ 		}
+ 		if (dom_row[d] != rd_perf_state(d)) {
+ 			dom_row[d] = rd_perf_state(d);
+@@ -432,6 +446,10 @@ negroni_cpufreq_init(void)
+ 	(void)PE_parse_boot_argn("negronicpufreq", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("negronicpufreq_mhz", &cap_mhz, sizeof(cap_mhz));
+ 	(void)PE_parse_boot_argn("negronicpufreq_gov", &gov_on, sizeof(gov_on));
++	/* 0291: negronicpufreq_floor=abl (default) | lut (or 0 | 1) */
++	char fl[8] = "abl";
++	(void)PE_parse_boot_arg_str("negronicpufreq_floor", fl, sizeof(fl));
++	floor_lut = strcmp(fl, "lut") == 0 || strcmp(fl, "1") == 0;
+ 	if (!enabled) {
+ 		printf("NEGRONI CPUFREQ: disabled (negronicpufreq=0)\n");
+ 		return;
+@@ -446,6 +464,9 @@ negroni_cpufreq_init(void)
+ 		}
+ 	}
+ 	dom_known = true;
++	printf("NEGRONI CPUFREQ: floor %s (negronicpufreq_floor=%s): d0 row %u, d1 row %u, d2 row %u (ABL rows %u/%u/%u)\n",
++	    floor_lut ? "lut" : "abl", fl, dom_min_row[0], dom_min_row[1], dom_min_row[2], dom_abl_row[0], dom_abl_row[1],
++	    dom_abl_row[2]);
+ 	if (gov_on) {
+ 		gov_start();
+ 	} else {
+@@ -475,8 +496,8 @@ negroni_cpufreq_cap(uint32_t mhz)
+ 			continue;
+ 		}
+ 		top = row_for_khz(domain, mhz * 1000);
+-		if (top < dom_abl_row[domain]) {
+-			top = dom_abl_row[domain];
++		if (top < dom_min_row[domain]) {
++			top = dom_min_row[domain];      /* 0291: the ABL row, or row 0 with lut (mhz 0 = the deepest row) */
+ 		}
+ 		dom_cap_row[domain] = top;
+ 		if (gov_on) {

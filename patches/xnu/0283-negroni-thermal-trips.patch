@@ -1,0 +1,328 @@
+diff --git a/bsd/dev/negroni_thermal.c b/bsd/dev/negroni_thermal.c
+index 6268a63..70418bd 100644
+--- a/bsd/dev/negroni_thermal.c
++++ b/bsd/dev/negroni_thermal.c
+@@ -14,6 +14,34 @@
+  * (3200 -> 2400 -> 1800 -> 1400 MHz, negroni_cpufreq_cap, never below the row ABL left);
+  * below negronithermal_cool (60 C): one step back up each. Boot-arg negronithermal=0 turns the
+  * thread off (no readings, no caps).
++ *
++ * Patch 0283 (thermal parity with the DT trips; README-thermal.md "0283"). negronithermal=1 (default)
++ * replaces the one 70/60 C rule with per-zone trips of out/live.dts (thermal-zones), checked every second:
++ *   cpu-110C  any cpu-0-x/cpu-1-x core sensor >= 110 C (cpu4-emerg0-cfg :8042, cpu0-emerg-cfg :8509,
++ *             hysteresis 10 C): Android pauses the core (thermal-pause); we cannot, so the CPU cap goes to
++ *             the deepest row (negroni_cpufreq_cap(0): the ABL row, or the LUT minimum with 0291's
++ *             negronicpufreq_floor=lut).
++ *   gpu-95C   gpuss-0/1 >= 95 C (tj_cfg :8404/:8446, hysteresis 5 C) -> kgsl cooling 0..max (gpu0_cdev
++ *             :8414): the GPU cap goes down one level per second while above, up one per second below 90 C.
++ *   ipa-53C   the OPLUS IPA zone (oplus_thermal_ipa ipa-control-temp 53 C, hysteresis 2 C, :10275) ->
++ *             cpufreq cooling of the three clusters. Its sensor is an OPLUS virtual shell sensor (userspace
++ *             in Android); the proxy here is the skin thermistor pm8350_hot_pocket_therm (0x146) that the
++ *             battery service measures (modes 4/5) [I]. One CPU cap step per 10 s while above, back below 51 C.
++ *   xo-78C / xo-80C  xo-therm (pmk8350_xo_therm, :10087/:10094, hysteresis 8/10 C) -> cpu4/cpu7 freq
++ *             cooling, apc1 pause, gpu state 7 (:10132-10152); 80 C pauses cpu5-7: here both = the deepest CPU
++ *             row and GPU level 5 (421 MHz).
++ *   ddr-90C   ddr sensor >= 90 C (ddr0-config :8812, hysteresis 5 C) -> gold/gold-plus cpufreq cooling
++ *             (:8828): one CPU cap step per 10 s.
++ *   bcl-lvl0/1/2  PM8350B BCL status 0x4708 bits 0/1/2 (bcl_pmic5.c:27,41-43,495-507; the
++ *             pm8350b-bcl-lvlN zones :9602-9764): GPU state 2/4/7 -> level 10/8/5 (734/599/421 MHz),
++ *             cpu5 / cpu6+7 pause -> CPU cap 2400 / 1800 MHz [I: no pause here]; kept 10 s after the bit clears.
++ * The kgsl state k is DT pwrlevel k (818 MHz at 0 ... 220 MHz at 11, live.dts gpu-pwrlevels) = our level
++ * 12 - k (negroni_adreno.c gpu_khz). The GPU floor stays level 4 (350 MHz). The CPU cap is the deepest of
++ * all active trips (3200/2400/1800/1400/deepest). The charger FCC level of 0277 (qcom,thermal-mitigation
++ * 3000/1500/1000/500 mA, :6647; no DT zone uses it: the Android thermal HAL does) is set here [I design]:
++ * skin >= 45 C -> level 3 (1000 mA), ipa-53C or xo-78C -> level 4 (500 mA), back with 2 C hysteresis.
++ * negronithermal=2: the 0280 rule (hottest sensor 70/60 C). negronithermal=0: off (the fallback).
++ * The log line ends with the active trips: "| trip gpu-95C,bcl-lvl0" (or "| trip none").
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -24,9 +52,11 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "negroni_chg_glink.h"     /* 0283: the power hub (skin/XO temperatures) and the charger FCC level */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void negroni_cpufreq_cap(uint32_t mhz);
++extern int negroni_spmi_read(unsigned sid, unsigned addr, uint8_t *out);       /* 0283: BCL status */
+ void negroni_thermal_init(void);
+ uint32_t negroni_thermal_gpu_cap(void);
+ int negroni_thermal_max_c(void);
+@@ -48,14 +78,33 @@ static const char *const sensor_name[TSENS_N][TSENS_SENSORS] = {
+ 	{ "aoss-1", "cpu-0-0", "cpu-0-1", "cpu-0-2", "cpu-0-3", "nspss-0", "nspss-1", "nspss-2", "video",
+ 	  "ddr", "mdmss-0", "mdmss-1", "mdmss-2", "mdmss-3", "camera-0", "camera-1" },
+ };
+-static const uint32_t cpu_steps_mhz[] = { 3200, 2400, 1800, 1400 };
++/* 0283: 0 = the deepest row negroni_cpufreq_cap allows (ABL row, or the LUT minimum with 0291 lut) */
++static const uint32_t cpu_steps_mhz[] = { 3200, 2400, 1800, 1400, 0 };
++#define CPU_STEPS_LEGACY        4       /* the 0280 rule uses the first four */
++#define CPU_STEP_DEEPEST        4
+ 
+ static vm_offset_t tm_base[TSENS_N];
+-static uint32_t hot_c = 70, cool_c = 60;
++static uint32_t hot_c = 70, cool_c = 60, mode = 1;
+ static volatile uint32_t gpu_cap = GPU_LEVEL_TOP;
+ static volatile int max_c_now = -1000;
+ static unsigned cpu_step;               /* index into cpu_steps_mhz */
+-static char line[160];
++static char line[256];
++
++/* 0283: the DT trips (names for the log) */
++enum { T_CPU110, T_GPU95, T_IPA53, T_XO78, T_XO80, T_DDR90, T_BCL0, T_BCL1, T_BCL2, T_N };
++static const char *const trip_name[T_N] = { "cpu-110C", "gpu-95C", "ipa-53C", "xo-78C", "xo-80C", "ddr-90C",
++	                                    "bcl-lvl0", "bcl-lvl1", "bcl-lvl2" };
++static bool trip_on[T_N];
++static uint32_t gpu95_level = GPU_LEVEL_TOP;    /* the stepping cap of gpu-95C */
++static unsigned ipa_step, ddr_step;             /* CPU cap steps of ipa-53C / ddr-90C (0..CPU_STEP_DEEPEST) */
++static uint32_t bcl_clear_tick[3];              /* tick when the BCL bit went clear (hold 10 s) */
++static unsigned chg_level;                      /* the charger FCC level sent to 0277 */
++static bool chg_skin_on;
++#define BCL_STATUS_ADDR         0x4708u /* PM8350B BCL 0x4700 + BCL_IRQ_STATUS 0x08 (bcl_pmic5.c:27) */
++#define BCL_HOLD_S              10
++#define GPU_LEVEL_XO            5       /* kgsl state 7 (live.dts:10152) = 12 - 7 */
++static const uint32_t gpu_level_bcl[3] = { 10, 8, 5 };  /* kgsl state 2/4/7 (:9656, :9717, :9758) */
++static const unsigned cpu_step_bcl[3] = { 1, 2, 2 };    /* 2400 / 1800 / 1800 MHz [I: Android pauses cpu5, cpu6-7] */
+ 
+ /* tenths of a degree C, or -10000 when the sensor has no valid value */
+ static int
+@@ -87,6 +136,128 @@ negroni_thermal_line(char *buf, size_t size)
+ 	strlcpy(buf, line, size);
+ }
+ 
++/* 0283: one trip with hysteresis (tenths or hundredths, the caller's unit). True on a change. */
++static bool
++trip_set(unsigned i, bool known, int v, int on_at, int off_below)
++{
++	bool was = trip_on[i];
++	if (!known) {
++		trip_on[i] = false;
++	} else if (v >= on_at) {
++		trip_on[i] = true;
++	} else if (v < off_below) {
++		trip_on[i] = false;
++	}
++	if (trip_on[i] != was) {
++		printf("NEGRONI THERMAL: trip %s %s (value %d, on at %d, off below %d)\n", trip_name[i], trip_on[i] ? "ON" : "off", v,
++		    on_at, off_below);
++		return true;
++	}
++	return false;
++}
++
++/* 0283: the per-zone policy, every second. cpu/gpu/ddr in tenths of a degree (-10000 = none). True on a change. */
++static bool
++policy_0283(uint32_t tick, int cpu, int gpu, int ddr)
++{
++	bool changed = false;
++	int32_t skin = 0, xo = 0;
++	bool skinOk = negroni_pwr_temp_get(NEGRONI_PWR_T_SKIN, &skin, 60000);
++	bool xoOk = negroni_pwr_temp_get(NEGRONI_PWR_T_XO, &xo, 60000);
++
++	changed |= trip_set(T_CPU110, cpu != -10000, cpu, 1100, 1000);
++	changed |= trip_set(T_GPU95, gpu != -10000, gpu, 950, 900);
++	changed |= trip_set(T_IPA53, skinOk, skin, 5300, 5100);
++	changed |= trip_set(T_XO78, xoOk, xo, 7800, 7000);
++	changed |= trip_set(T_XO80, xoOk, xo, 8000, 7000);
++	changed |= trip_set(T_DDR90, ddr != -10000, ddr, 900, 850);
++	/* BCL levels: the status bits, kept BCL_HOLD_S after they clear */
++	uint8_t bcl = 0;
++	bool bclOk = negroni_spmi_read(3, BCL_STATUS_ADDR, &bcl) == 0;
++	for (unsigned k = 0; k < 3; k++) {
++		bool bit = bclOk && (bcl & (1u << k));
++		bool was = trip_on[T_BCL0 + k];
++		if (bit) {
++			trip_on[T_BCL0 + k] = true;
++			bcl_clear_tick[k] = 0;
++		} else if (was) {
++			if (bcl_clear_tick[k] == 0) {
++				bcl_clear_tick[k] = tick;
++			} else if (tick - bcl_clear_tick[k] >= BCL_HOLD_S) {
++				trip_on[T_BCL0 + k] = false;
++				bcl_clear_tick[k] = 0;
++			}
++		}
++		if (trip_on[T_BCL0 + k] != was) {
++			printf("NEGRONI THERMAL: trip %s %s (BCL status 0x4708 = %#x)\n", trip_name[T_BCL0 + k],
++			    trip_on[T_BCL0 + k] ? "ON" : "off", bcl);
++			changed = true;
++		}
++	}
++	/* gpu-95C: step_wise, one level a second */
++	if (trip_on[T_GPU95]) {
++		if (gpu95_level > GPU_LEVEL_FLOOR) {
++			gpu95_level--;
++		}
++	} else if (gpu < 900 && gpu95_level < GPU_LEVEL_TOP) {
++		gpu95_level++;
++	}
++	/* ipa-53C and ddr-90C: one CPU cap step per 10 s */
++	if (tick % 10 == 0) {
++		if (trip_on[T_IPA53]) {
++			ipa_step += ipa_step < CPU_STEP_DEEPEST;
++		} else if (ipa_step) {
++			ipa_step--;
++		}
++		if (trip_on[T_DDR90]) {
++			ddr_step += ddr_step < CPU_STEP_DEEPEST;
++		} else if (ddr_step) {
++			ddr_step--;
++		}
++	}
++	/* the caps: the deepest of all */
++	uint32_t g = gpu95_level;
++	unsigned c = ipa_step > ddr_step ? ipa_step : ddr_step;
++	if (trip_on[T_XO78] || trip_on[T_XO80]) {
++		g = MIN(g, GPU_LEVEL_XO);
++		c = CPU_STEP_DEEPEST;
++	}
++	if (trip_on[T_CPU110]) {
++		c = CPU_STEP_DEEPEST;
++	}
++	for (unsigned k = 0; k < 3; k++) {
++		if (trip_on[T_BCL0 + k]) {
++			g = MIN(g, gpu_level_bcl[k]);
++			c = MAX(c, cpu_step_bcl[k]);
++		}
++	}
++	if (g < GPU_LEVEL_FLOOR) {
++		g = GPU_LEVEL_FLOOR;
++	}
++	if (g != gpu_cap) {
++		gpu_cap = g;
++		changed = true;
++	}
++	if (c != cpu_step) {
++		cpu_step = c;
++		negroni_cpufreq_cap(cpu_steps_mhz[cpu_step]);
++		changed = true;
++	}
++	/* the charger FCC level (0277) [I design]: skin 45 C -> 1000 mA, ipa-53C or xo-78C -> 500 mA */
++	if (skinOk && skin >= 4500) {
++		chg_skin_on = true;
++	} else if (!skinOk || skin < 4300) {
++		chg_skin_on = false;
++	}
++	unsigned lvl = (trip_on[T_IPA53] || trip_on[T_XO78] || trip_on[T_XO80]) ? 4 : chg_skin_on ? 3 : 0;
++	if (lvl != chg_level) {
++		chg_level = lvl;
++		negroni_chg_glink_set_thermal_level(lvl);
++		changed = true;
++	}
++	return changed;
++}
++
+ __attribute__((noreturn)) static void
+ thermal_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -96,10 +267,13 @@ thermal_thread(void *arg __unused, wait_result_t wr __unused)
+ 		assert_wait_timeout((event_t)&tick, THREAD_UNINT, 1000, NSEC_PER_MSEC);
+ 		thread_block(THREAD_CONTINUE_NULL);
+ 		tick++;
+-		int cpu = -10000, gpu = -10000, ddr = -10000, max = -10000;
++		int cpu = -10000, gpu = -10000, ddr = -10000, max = -10000, cpuss = -10000;
+ 		const char *max_name = "none";
+ 		unsigned valid = 0;
+ 		for (unsigned t = 0; t < TSENS_N; t++) {
++			if (!tm_base[t]) {
++				continue;       /* 0283: a controller that is not mapped or not enabled has no sensors */
++			}
+ 			for (unsigned n = 0; n < TSENS_SENSORS; n++) {
+ 				int v = read_sensor(t, n);
+ 				if (v == -10000) {
+@@ -107,8 +281,10 @@ thermal_thread(void *arg __unused, wait_result_t wr __unused)
+ 				}
+ 				valid++;
+ 				const char *name = sensor_name[t][n];
+-				if (strncmp(name, "cpu", 3) == 0 && v > cpu) {
+-					cpu = v;
++				if (strncmp(name, "cpu-", 4) == 0 && v > cpu) {
++					cpu = v;        /* 0283: the core sensors only (cpu-0-x, cpu-1-x) */
++				} else if (strncmp(name, "cpuss", 5) == 0 && v > cpuss) {
++					cpuss = v;
+ 				} else if (strncmp(name, "gpuss", 5) == 0 && v > gpu) {
+ 					gpu = v;
+ 				} else if (strcmp(name, "ddr") == 0) {
+@@ -122,13 +298,15 @@ thermal_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		max_c_now = max == -10000 ? -1000 : max / 10;
+ 		bool step = false;
+-		if (tick % 10 == 0 && max != -10000) {
++		if (mode == 1) {
++			step = policy_0283(tick, cpu, gpu, ddr);
++		} else if (tick % 10 == 0 && max != -10000) {
+ 			if (max >= (int)hot_c * 10) {
+ 				if (gpu_cap > GPU_LEVEL_FLOOR) {
+ 					gpu_cap--;
+ 					step = true;
+ 				}
+-				if (cpu_step + 1 < sizeof(cpu_steps_mhz) / sizeof(cpu_steps_mhz[0])) {
++				if (cpu_step + 1 < CPU_STEPS_LEGACY) {
+ 					cpu_step++;
+ 					negroni_cpufreq_cap(cpu_steps_mhz[cpu_step]);
+ 					step = true;
+@@ -145,8 +323,27 @@ thermal_thread(void *arg __unused, wait_result_t wr __unused)
+ 				}
+ 			}
+ 		}
+-		snprintf(line, sizeof(line), "cpu %d C gpu %d C ddr %d C max %d C (%s) | gpu cap %u cpu cap %u MHz",
+-		    cpu / 10, gpu / 10, ddr / 10, max / 10, max_name, gpu_cap, cpu_steps_mhz[cpu_step]);
++		/* 0283: + cpuss, skin and xo, the charger level and the active trips */
++		char trips[96];
++		size_t ta = 0;
++		trips[0] = 0;
++		for (unsigned i = 0; i < T_N && mode == 1; i++) {
++			if (trip_on[i]) {
++				ta += snprintf(trips + ta, sizeof(trips) - ta, "%s%s", ta ? "," : "", trip_name[i]);
++			}
++		}
++		int32_t skin = 0, xo = 0;
++		bool skinOk = negroni_pwr_temp_get(NEGRONI_PWR_T_SKIN, &skin, 60000), xoOk = negroni_pwr_temp_get(NEGRONI_PWR_T_XO, &xo, 60000);
++		char cap[16];
++		if (cpu_steps_mhz[cpu_step]) {
++			snprintf(cap, sizeof(cap), "%u MHz", cpu_steps_mhz[cpu_step]);
++		} else {
++			snprintf(cap, sizeof(cap), "deepest");
++		}
++		snprintf(line, sizeof(line), "cpu %d C cpuss %d C gpu %d C ddr %d C skin %s%d C xo %s%d C max %d C (%s) | gpu cap %u "
++		    "cpu cap %s chg lvl %u | trip %s",
++		    cpu / 10, cpuss / 10, gpu / 10, ddr / 10, skinOk ? "" : "?", skin / 100, xoOk ? "" : "?", xo / 100, max / 10,
++		    max_name, gpu_cap, cap, chg_level, mode != 1 ? "legacy-70C" : ta ? trips : "none");
+ 		if (tick == 1 || tick % 60 == 0 || step) {
+ 			printf("NEGRONI THERMAL: %s%s (%u of 32 sensors valid)\n", line, step ? " [step]" : "", valid);
+ 		}
+@@ -155,6 +352,9 @@ thermal_thread(void *arg __unused, wait_result_t wr __unused)
+ 			for (unsigned t = 0; t < TSENS_N; t++) {
+ 				char all[256];
+ 				size_t at = 0;
++				if (!tm_base[t]) {
++					continue;       /* 0283 */
++				}
+ 				for (unsigned n = 0; n < TSENS_SENSORS && at < sizeof(all) - 16; n++) {
+ 					int v = read_sensor(t, n);
+ 					at += snprintf(all + at, sizeof(all) - at, " %s=%d", sensor_name[t][n], v == -10000 ? -999 : v / 10);
+@@ -172,6 +372,7 @@ negroni_thermal_init(void)
+ 	thread_t thread;
+ 
+ 	(void)PE_parse_boot_argn("negronithermal", &enabled, sizeof(enabled));
++	mode = enabled == 2 ? 2 : 1;            /* 0283: 1 = the DT trips, 2 = the 0280 70/60 C rule */
+ 	(void)PE_parse_boot_argn("negronithermal_hot", &hot_c, sizeof(hot_c));
+ 	(void)PE_parse_boot_argn("negronithermal_cool", &cool_c, sizeof(cool_c));
+ 	if (!enabled) {
+@@ -199,8 +400,14 @@ negroni_thermal_init(void)
+ 	if (!tm_base[0] && !tm_base[1]) {
+ 		return;
+ 	}
+-	printf("NEGRONI THERMAL: policy hot %u C cool %u C, GPU cap levels %u..%u, CPU caps 3200/2400/1800/1400 MHz\n",
+-	    hot_c, cool_c, GPU_LEVEL_FLOOR, GPU_LEVEL_TOP);
++	if (mode == 1) {
++		printf("NEGRONI THERMAL: policy DT trips (0283): cpu-110C, gpu-95C, ipa-53C (skin proxy), xo-78C/80C, ddr-90C, "
++		    "bcl-lvl0..2; GPU cap levels %u..%u, CPU caps 3200/2400/1800/1400 MHz/deepest; charger FCC levels 3/4 "
++		    "(negronithermal=2: the 0280 rule)\n", GPU_LEVEL_FLOOR, GPU_LEVEL_TOP);
++	} else {
++		printf("NEGRONI THERMAL: policy hot %u C cool %u C, GPU cap levels %u..%u, CPU caps 3200/2400/1800/1400 MHz "
++		    "(negronithermal=2: the 0280 rule)\n", hot_c, cool_c, GPU_LEVEL_FLOOR, GPU_LEVEL_TOP);
++	}
+ 	if (kernel_thread_start(thermal_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

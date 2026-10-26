@@ -10,6 +10,8 @@ Marks: **[V]** seen in source, DT, firmware, build or log. **[I]** inference.
 | `0271-negroni-battery-service.patch` | `iokit/Kernel/arm/NegroniBattery.cpp`, `iokit/KernelConfigTables.cpp` | the IOPMPowerSource (AppleSmartBattery key set) and its personality on IOResources |
 | `0272-negroni-battery-charger-input.patch` | `bsd/dev/negroni_spmi.c`, `.h`, `iokit/Kernel/arm/NegroniBattery.cpp` | PM8350B SMB5 charger status in the log, USB input enabled at `negronichg_ma` (section 7) |
 | `0276-negroni-battery-soc-source.patch` | `iokit/Kernel/arm/NegroniBattery.cpp` | the percentage: source order gauge (not reachable) > GLINK (0274) > OCV estimate with a rate limit; `soc src=` in the log (section 10) |
+| `0277-negroni-charger-loop.patch` | `bsd/dev/negroni_chg_glink.c`, `.h` | the Android HLOS charge loop over GLINK: float voltage + FCC per the DT JEITA bands every 5 s, the thermal FCC level, the power hub (section 11) |
+| `0278-negroni-battery-persist-temp.patch` | `bsd/dev/negroni_batt_store.c` (new), `bsd/conf/files`, `bsd/dev/negroni_spmi.c`, `.h`, `iokit/Kernel/arm/NegroniBattery.cpp` | the percentage kept across boots, the cell temperature in `Temperature`, skin/XO to the hub, BCL MONITOR_EN, the QDSS vote release (section 12) |
 
 ## 1. Why iOS showed a wrong battery level
 
@@ -585,3 +587,133 @@ Verification:
   (out/ios16-soc/SHA256SUMS). Not booted.
 - Phone: the first line's percent is within 3 % of the rest value; after 10 min at rest with the cable in, the
   percent follows `target` (1 % per 30 s); with 0274 running, `soc src=glink`.
+
+## 11. The charge loop over GLINK (0277, 2026-10-26)
+
+Status: built in the full set (section 12 has the build), **not booted**. The phone runs Android.
+
+Why [V audit docs/audit/2026-10-26-power.md row 6, item 9]: 0274 writes only `USB_INPUT_CURR_LIMIT`, `USB_SUSPEND_PMIC`
+and `BATT_CHG_EN`. On OxygenOS the HLOS loop checks the battery every 5 s (`OPLUS_CHG_UPDATE_INTERVAL_SEC 5`,
+out/src/op-modules/vendor/oplus/kernel/charger/oplus_charger.c:110; `oplus_chg_update_work` :14580 ->
+`oplus_chg_protection_check` :10583 -> `oplus_chg_check_tbatt_is_good` :7950, which on a band change calls
+`oplus_chg_set_float_voltage` + `oplus_chg_set_charging_current` :8028-8029; then `oplus_chg_battery_update_status`
+:11867). Correction (review 2026-10-26): the earlier citation :7556-7558 is `oplus_chg_turn_on_ffc1` (the FFC path).
+OxygenOS writes FV/FCC on a band change; 0277 re-sends them every 5 s (same values, so the PD cannot drift).
+[I] Without it the PD's own defaults decide the charge curve.
+
+What the loop does (`bsd/dev/negroni_chg_glink.c`, `charge_loop()`), only after the 0274 READY, only with USB in,
+every `negronichg_loop_s` (5) s between the 20 s 0274 cycles (review fix: a refused `BATT_CHG_EN = 1` restart
+logs only the first 5 failures, as the FV/FCC writes do):
+1. Reads `BATT_TEMP` (id 12, hundredths of a degree: `oplus_battery_sm8450.c:3060` divides by 10). No valid value
+   (-40..100 C) = no FV/FCC write (logged once): the PD keeps its own values.
+2. Picks the JEITA band (table `kBand`, the decision order of `oplus_chg_check_tbatt_status`, oplus_charger.c:8041-8059;
+   2.0 C hysteresis back toward normal, `HYSTERISIS_DECIDEGC` :7849):
+
+| Band | Battery temperature | FV per cell | FCC | DT source (out/live.dts) |
+|---|---|---|---|---|
+| removed | <= -19.0 C | stop | stop | removed_bat_decidegc 0xbe :6681 (negated, oplus_charger.c:5446) |
+| low | -19.0 .. -10.1 C | stop | stop | oplus_charger.c:8055, :6890-6894 |
+| cold | -10.0 .. -0.1 C | 4435 mV | 600 mA | cold_bat_decidegc 0x64 :6682; 0x1153 :6683; 0x258 :6684 |
+| little_cold | 0 .. 4.9 C | 4435 mV | 1100 mA | :6685; :6686; 0x44c :6687/:6689 |
+| cool | 5.0 .. 11.9 C | 4435 mV | 1100 mA | 0x32 :6694; :6695; :6696 |
+| little_cool | 12.0 .. 15.9 C | 4435 mV | 1100 mA | 0x78 :6702; :6703; :6704 |
+| normal | 16.0 .. 44.9 C | 4435 mV | 1100 mA | 0xa0 :6707; 0x44c :6708; 0x1153 :6709 |
+| warm | 45.0 .. 53.0 C | 4130 mV | 500 mA | 0x1c2 :6712; 0x1022 :6713; 0x1f4 :6717 |
+| hot | > 53.0 C | stop | stop | hot_bat_decidegc 0x212 :6718 (">" at oplus_charger.c:8041) |
+
+   FCC is the plain value (`temp_*_fastchg_current_ma`), not the `pd_`/`qc_` values (2000 mA): 0274 negotiates no
+   PD/QC voltage (5 V, ICL <= 2000 mA). Warm uses the screen-on value 500 mA (`temp_warm_fastchg_current_ma_led_on`,
+   :6717) instead of 1100 mA (:6714): we do not track the screen [I: the lower one is the safe one]. The DT has
+   `_high`/`_low` variants for vbat above 4180 mV; they are equal here (:6687-6696).
+3. "stop" bands: `BATT_CHG_EN` = 0 (`smbchg_charging_disable`, oplus_battery_sm8450.c:9136) every loop; 0274 does not
+   enable it again while stopped (`chg_stopped`, also across a re-plug); the loop writes `BATT_CHG_EN` = 1 when the
+   band is good again.
+4. FV = `BATT_VOLT_MAX` (id 8, mV: `smbchg_float_voltage_set`, oplus_battery_sm8450.c:8194-8226, `write_property_id`
+   with `vfloat_mv` as it is). OxygenOS writes the per-cell value x `vbatt_num` (oplus_charger.c:7252; DT
+   `qcom,vbatt_num = <2>` :6749; `bidirect_cp` is not in the DT, so the x2 branch). The unit is taken from the PD's
+   own value at the first loop: 6000-9000 = pack mV (x2), 3000-4600 = cell mV (x1), anything else = **no FV write**
+   (logged). So the pack value is 8870 mV in the normal band.
+5. FCC = `BATT_CHG_CTRL_LIM` (id 10, uA: `smbchg_set_fastchg_current_raw` :7624-7646) = min(band, thermal level).
+   Thermal level (0283 sets it, `negroni_chg_glink_set_thermal_level()`): 0 none, 1..4 = DT `qcom,thermal-mitigation`
+   3000/1500/1000/500 mA (:6647). With the band maximum of 1100 mA, levels 1-2 change nothing.
+6. Reads back FV and FCC; a difference is logged (bounded). Writes log only on a change or a failure; 5 failed writes
+   in a row stop that write for the plug.
+
+Safety [V code]: `bands_ok()` checks every table row against `FV_DT_MV` 4435 (live.dts:6709) and `FCC_DT_MA` 1100
+(:6708) at start and turns the loop off when a row is above (`REFUSED, loop off`); every write is checked again
+(`fv <= 4435 x scale`, `ma <= 1100`). No FV without a known unit. No write before READY. The FFC values of the DT
+(`ffc_temp_normal_vfloat_mv` 0x1194 = 4500 mV, :6769) are never used.
+
+Power hub (0277, `negroni_chg_glink.h`): `negroni_pwr_temp_set/get` (skin, XO, cell temperature, hundredths of a
+degree, with an age) so the battery service (0278) and the thermal policy (0283) share values without a direct link.
+
+Boot-args: `negronichg_loop=1` (default when `negronichg_glink=1`; 0 = the 0274 behaviour), `negronichg_loop_s` (2..60, 5).
+
+Log lines (prefix `NEGRONI BATTERY: glink:`):
+```
+start: channel PMIC_RTR_ADSP_APPS, input limit 1500 mA, poll 20 s, charge loop on (every 5 s, FV <= 4435 mV/cell, FCC <= 1100 mA)
+loop: battery 28.4 C: band normal (FV 4435 mV/cell, FCC 1100 mA)
+loop: the PD's BATT_VOLT_MAX reads 8870: pack mV (x2, as oplus_charger.c:7252)
+write BATT_VOLT_MAX (FV, mV; 4435 mV/cell) = 8870: ok (ret_code 0)
+write BATT_CHG_CTRL_LIM (FCC, uA; 1100 mA) = 1100000: ok (ret_code 0)
+loop: thermal FCC level 0 -> 3 (1000 mA; band 1100 mA: FCC 1000 mA)
+soc ... | fv 8870 loop on band normal fv 8870 fcc 1100 lvl 0
+```
+
+Risks: [U] whether the PD accepts `BATT_VOLT_MAX`/`BATT_CHG_CTRL_LIM` from the HLOS on this firmware (a `REFUSED`
+line answers it; 5 refusals stop the write). [U] whether the PD's `BATT_VOLT_MAX` reads the pack value (the unit
+rule refuses anything outside both ranges). [I] The PD may run its own JEITA too; ours can only lower the values
+(every value <= the DT). [I] `BATT_TEMP` comes from the gauge through the PD; a stuck value would keep a band (the
+cycle log shows `temp`).
+
+## 12. Percentage across boots, cell temperature, BCL monitor, QDSS release (0278, 2026-10-26)
+
+Status: built in the full set, **not booted**.
+
+What 0278 does:
+- **Percentage kept across boots** (`bsd/dev/negroni_batt_store.c`, new): the way 0203 keeps the RTC offset
+  (`negroni_rtc.c`: text file in `/private/var/db`, `vnode_open` + `vn_rdwr`, writes on a thread call with
+  `VNOP_FSYNC`, retry every 30 s x 60 while the root is read only). File `/private/var/db/negroni_batt`:
+  `negroni-batt 1`, `soc <1/100 %>`, `wall <s>`. NegroniBattery reads it at the first OCV estimate (and, while
+  `vfs_rootvnode()` is NULL, at the next 15 polls). Sanity check: the saved value is used only when it is within
+  15 % of the OCV estimate (`NB_STORE_TRUST` 1500); else the estimate wins (`> 15 %: the estimate wins`). With the
+  GLINK source the gauge value wins and no restore happens. Saves: after the restore decision, on each 1 % change,
+  at most once a minute. [V phone log 2026-10-26 usblog.log:318] The RTC file in the same directory is written at
+  boot, so the directory is writable early.
+- **Temperature**: the cell temperature from the PD's gauge (`BATT_TEMP` over GLINK, through the 0277 hub, fresh
+  for 60 s, -20..80 C) when the PD is READY; then `NegroniBatteryTemperatureEstimated` = false and
+  `NegroniBatteryTemperatureSource` = `glink`; the value is not clamped. Else the skin thermistor as before (clamped
+  0-45 C, `skin`), else 25 C (`none`). New registry keys `NegroniSkinTemperature`, `NegroniXoTemperature`.
+- **XO thermistor**: modes 4/5 read `pmk8350_xo_therm` (VADC SID 0 channel 0x44, ratiometric, 200 us, live.dts:12226-12231)
+  with the skin channel; both go to the hub for 0283 (`xo` in the raw line).
+- **BCL MONITOR_EN** [V audit item 11: never written]: at start, `negroni_spmi_bcl_monitor_on()` reads 0x4746; only
+  when bit 7 is clear and EE 0 owns the BCL APID (phone log: `BCL APID 462 EE 0`), it writes 0x80 (Linux
+  `bcl_configure_bcl_peripheral`, bcl_pmic5.c:777-780) through a one-write window (locked again after it) and reads
+  back. With the bit set (the phone logs `mon 80` today) nothing is written. Boot-arg `negronibcl_en=0` = never.
+- **QDSS vote release** [V audit item 10]: 0273's AOP vote `{class: clock, res: qdss, val: 1}` is now released with
+  `val: 0` (Linux `qmp_qdss_clk_unprepare`, qcom_aoss.c:294-296) on every path where the debug path ends after the
+  vote: core map failed, check read failed, a later timeout or 32 failures. While the debug path is open the vote
+  stays. With `negroniadsp` set no vote is sent (0273), so nothing to release.
+
+Log lines:
+```
+NEGRONI BATTERY: BCL monitor: already on (no write)
+NEGRONI BATTERY: store: no saved percentage (no file yet, error 2): the OCV estimate 9.10% stays
+NEGRONI BATTERY: store: soc restored 41.00% (saved at wall 1793001749; OCV estimate 38.20%, 2.80 % apart)
+NEGRONI BATTERY: store: saved 80.00% (wall ...) is 31.00 % from the OCV estimate 49.00% (> 15 %): the estimate wins
+NEGRONI BATTERY: store: soc 41.00% saved to /private/var/db/negroni_batt (then on each 1 % change, at most once a minute)
+NEGRONI BATTERY: debug arbiter: check read failed: QDSS clock vote released (AOP QMP "{class: clock, res: qdss, val: 0}")
+```
+
+Risks: [I] a phone charged by Android between two iOS boots: the saved value is far from the estimate and the
+15 % rule drops it (the intended case); a smaller change (< 15 %) is shown first and corrected by the 1 %/30 s
+rate. [I] the saved value comes from the OCV estimate itself when GLINK is off, so it carries the table error
+(+-3 % near 10 %). [U] the BCL write path was never used (the bit is set on this phone today).
+
+Verification (2026-10-26, build only):
+- [V] compile-one: negroni_chg_glink.c, negroni_spmi.c, negroni_batt_store.c, NegroniBattery.cpp, no new diagnostic
+  (the `negroni_spmi_keys.h:42` shadow warning is older).
+- [V] Order check: 0277 and 0278 applied with `git apply` on the patched tree at 0276, then the original commits
+  0280..0351 (the set of 17:56) cherry-picked with 0283 before 0284 and 0291 before 0300: the result equals the work tree.
+- [V] Build `pwr-build` (scripts/battery/build-pwr-image.sh, lock out/kernel/.lock held over kernel + image): kernel out/kernel/local-20261026-124827/kernel.development.negroni sha256 01363704dab977e2259aecbe1fb81141133ba5458ec97a59a6b6abf86b981fa3; patch-report applies every patches/xnu patch 0270-0291 incl. 0277/0278/0283/0291 (and the other agent's 0287/0288), only the 4 usual dxb skips; strings `loop: battery`, `store: soc restored`, `trip %s %s (value`, `negronicpufreq_floor`, `QDSS clock vote released` in the kernel. Image out/ios16-pwr was built in that same locked job from that kernel (local-20261026-124827, sha256 01363704...; [V] three 64 KiB pieces of it found byte-equal in out/ios16-pwr/esp.img; the image SHA256SUMS lists only the image files). It is BEFORE review fix 1 (0277 BATT_CHG_EN restart log bound); per the owner the fix gets a kernel-only proof build, the main session builds the combined image. Review fixes 1-4 (2026-10-26 18:5x): kernel-only proof build `pwr-kernel` (IMAGE=0, lock held): out/kernel/local-20261026-132431/kernel.development.negroni sha256 4786905de90c56b9150153d01f33f69ed87bc7769611e494dd111a1c32974b34, 0277/0278/0283/0291 applied, only the 4 usual dxb skips, string `further failures are not logged` (fix 1) in the kernel. 0277 sha256 now in the report. Image (config args + `negronibatt=5 negroniadsp=1 negronichg_glink=1 negronichg_ma=1500 negronifb_sleep=0 negronipanic=30 negronipanicreason=2`): boot_a.img 72ee45050d399b14a1805b55c65c7cd927a90ed45d6b3c8d5596b6582afc9394, vendor_boot_a.img c29329ee..., esp.img 01f9330f..., negroni.adt 12b7654d... (out/ios16-pwr/SHA256SUMS). Not booted. Patch sha256: 0277 cd22073c..., 0278 047a4652..., 0283 564c7390..., 0291 fa95dcd5...
+

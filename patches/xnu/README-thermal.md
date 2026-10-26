@@ -8,6 +8,7 @@ Status 2026-10-26: written, compile-checked, in the full build of the `kernel-pw
 | `0280-negroni-thermal-tsens.patch` | `bsd/dev/negroni_thermal.c` (new), `bsd/conf/files`, `bsd/dev/negroni_ufs.c`, `bsd/dev/negroni_cpufreq.c` | TSENS readings once a second, a line a minute, GPU/CPU caps above 70 C |
 | `0281-negroni-gpu-dcvs.patch` | `bsd/dev/negroni_adreno.c` | busy-based GX perf-level governor on the watch thread |
 | `0282-negroni-usb-reset-reconfigure.patch` | `bsd/dev/negroni_usb.c` | the CDC-ECM data endpoints come back after a host bus reset |
+| `0283-negroni-thermal-trips.patch` | `bsd/dev/negroni_thermal.c` | per-zone DT trips instead of the one 70/60 C rule, BCL level reaction, charger FCC level (section "0283") |
 
 ## Why
 
@@ -76,3 +77,56 @@ slumbers between frames, and nothing reads a temperature [V: docs/notes.md 15-17
 - [I] What makes the Mac reset the bus in the first place is not known (the Mac's unified log for the
   period returned nothing for the USB host subsystem). Candidates: the phone not answering a transfer in
   time while the kernel is busy, or the CPU/GPU load; the fix only makes the link come back.
+
+## 0283: thermal parity with the DT trips (2026-10-26)
+
+Status: built in the full set (`pwr-build`, image `out/ios16-pwr`), **not booted**. Fallbacks: `negronithermal=2`
+(the 0280 70/60 C rule), `negronithermal=0` (off).
+
+Why [V audit docs/audit/2026-10-26-power.md items 3, 4, 13]: 0280 acts at 70 C on the hottest of all 32 sensors
+(modem/aoss/nspss count too) and pulls the GPU and CPU caps down during the 80 C boot burst; the DT acts per zone
+at 95-110 C (GPU/CPU), at 53 C for the OPLUS IPA zone, and on the BCL levels.
+
+The trips (checked every second; DT = out/live.dts thermal-zones):
+
+| Trip | Sensor | On / off | Android (DT) | Here |
+|---|---|---|---|---|
+| `cpu-110C` | any cpu-0-x / cpu-1-x core (not cpuss) | >= 110 / < 100 C | cpu4-emerg0-cfg :8042, cpu0-emerg-cfg :8509 (0x1adb0, hyst 0x2710) -> thermal-pause of the core | CPU cap = the deepest row (`negroni_cpufreq_cap(0)`: the ABL row, or the LUT minimum with 0291 `lut`) |
+| `gpu-95C` | gpuss-0/1 | >= 95 / < 90 C | tj_cfg :8404/:8446 (0x17318, hyst 0x1388) -> gpu0_cdev 0..max :8414 | GPU cap -1 level per second while on, +1 per second below 90 C (floor level 4) |
+| `ipa-53C` | skin thermistor 0x146 (proxy) | >= 53 / < 51 C | oplus_thermal_ipa ipa-control-temp :10275 (0xcf08, hyst 0x7d0) -> cpufreq cooling of cpu0/4/7 | one CPU cap step per 10 s (3200/2400/1800/1400/deepest), back one per 10 s |
+| `xo-78C` / `xo-80C` | pmk8350_xo_therm 0x44 | >= 78 / < 70 C, >= 80 / < 70 C | xo-config0/1 :10087/:10094 -> cpu4/7 freq 15..max, apc1 pause, cdsp, gpu 7 (:10132-10152); 80 C pauses cpu5-7 | CPU cap deepest, GPU cap level 5 (421 MHz) |
+| `ddr-90C` | ddr | >= 90 / < 85 C | ddr0-config :8812 (0x15f90, hyst 0x1388) -> gold/gold-plus cpufreq (:8828) | one CPU cap step per 10 s |
+| `bcl-lvl0/1/2` | PM8350B BCL 0x4708 bits 0/1/2 | bit set / clear for 10 s | pm8350b-bcl-lvl0/1/2 :9602-9764 -> gpu 2/4/7, cpu5 / cpu6-7 pause, modem, cdsp | GPU cap 10/8/5 (734/599/421 MHz), CPU cap 2400/1800/1800 MHz |
+
+- GPU levels: kgsl cooling state k = DT `qcom,gpu-pwrlevel@k` (818, 791, 734, 640, 599, 545, 492, 421, 350, 317,
+  285, 220 MHz for k = 0..11, live.dts gpu-pwrlevels) = our level 12 - k (`gpu_khz[]`, negroni_adreno.c:1539) [V].
+- BCL status register: `BCL_IRQ_STATUS` 0x08 of the BCL block, bits L0/L1/L2 = 0x1/0x2/0x4 (bcl_pmic5.c:27, 41-43;
+  `bcl_read_lbat` :495-507) [V]. Read through the SPMI observer (`negroni_spmi_read`, SID 3 0x47 is on the read
+  allowlist); before NegroniBattery's SPMI init the read fails and the BCL trips stay off.
+- With the default `negronicpufreq_floor=abl` every CPU cap of 0280/0283 is a no-op for d1 (A710) and d2 (X2): their ABL rows (17, 20) are their top rows and no cap goes below the ABL row [V negroni_cpufreq.c `negroni_cpufreq_cap`, README-cpufreq.md]. Until `lut` only the d0 caps and the GPU caps act (LMh still throttles in hardware).
+- No core pause exists here (XNU has no hotplug for this port) [I]: "pause" becomes the deepest CPU row.
+  The cpufreq cap is global (all three domains) [V negroni_cpufreq.c `negroni_cpufreq_cap`].
+- The IPA sensor of Android is an OPLUS virtual shell sensor (`oplus,oplus-thermal`, live.dts:36782-36803, used by a
+  userspace governor) [V]; the skin thermistor is a proxy [I]. Skin and XO come from the battery service (0278) in
+  `negronibatt=4/5` only (the VADC owner); without them `ipa-53C`/`xo-*` stay off.
+- Charger FCC level for 0277 [I design: no DT zone uses the charger cooling device; the Android thermal HAL does]:
+  skin >= 45 C (off < 43 C) -> level 3 = 1000 mA; `ipa-53C` or `xo-78C`/`xo-80C` -> level 4 = 500 mA (DT
+  `qcom,thermal-mitigation` :6647). The battery-temperature bands themselves are in 0277 (JEITA).
+- Also fixed: `cpu` in the line is now the core sensors only (`cpu-` prefix; `cpuss` separately, audit item 3); a
+  TSENS controller that is not mapped is skipped (0280 read it at address 0 + offset).
+
+Log lines:
+```
+NEGRONI THERMAL: policy DT trips (0283): cpu-110C, gpu-95C, ipa-53C (skin proxy), xo-78C/80C, ddr-90C, bcl-lvl0..2; ...
+NEGRONI THERMAL: trip gpu-95C ON (value 952, on at 950, off below 900)
+NEGRONI THERMAL: trip bcl-lvl0 ON (BCL status 0x4708 = 0x1)
+NEGRONI THERMAL: cpu 52 C cpuss 49 C gpu 96 C ddr 47 C skin 38 C xo 41 C max 96 C (gpuss-0) | gpu cap 11 cpu cap 3200 MHz chg lvl 0 | trip gpu-95C [step] (32 of 32 sensors valid)
+```
+The line is also the `NEGRONI GPU WATCH` suffix (0281 copies 160 bytes: the trip list may be cut there; the
+`NEGRONI THERMAL:` line itself has 256).
+
+Risks: [I] the per-zone trips act much later than the 0280 rule (95/110 C instead of 70 C): the skin can get warmer
+before anything acts (LMh still throttles in hardware, audit row 10). `negronithermal=2` gives back the 0280 rule.
+[I] The skin proxy for the IPA zone reads lower or higher than OPLUS's shell estimate. [U] The BCL bits were
+never seen set (no brown-out log with 0283 yet).
+
