@@ -174,7 +174,7 @@ index cad2cb1..17ae758 100644
 +#define SRD(o) negroni_mmio_rd32(smmu + (o))
 +#define SWR(o, v) negroni_mmio_wr32(smmu + (o), (v))
 +	uint32_t scr0 = SRD(SMMU_SCR0), idr0 = SRD(SMMU_IDR0), idr1 = SRD(SMMU_IDR1), gfsr = SRD(SMMU_SGFSR);
-+	uint32_t nsmr = MIN(idr0 & 0xffu, 128u), hit = ~0u, free_smr = ~0u, s2cr = 0;
++	uint32_t nsmr = MIN(MIN(idr0 & 0xffu, 0x78u), 128u), hit = ~0u, free_smr = ~0u, s2cr = 0;
 +	int error = 0;
 +
 +	printf("NEGRONI WLAN: apps SMMU sCR0 %#x (CLIENTPD %u, USFCFG %u, EXIDS %u), IDR0 %#x (%u SMRs), IDR1 %#x, sGFSR %#x\n",
