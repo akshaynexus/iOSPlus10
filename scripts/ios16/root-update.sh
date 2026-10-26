@@ -39,7 +39,9 @@ mdutil -i off "$R" >/dev/null 2>&1 || true
 [ -d "$R/System/Library/xpc" ] || { echo "$IN is not an iOS root" >&2; exit 1; }
 [ -L "$R/var" ] || { echo "$R/var is not a symlink: stop" >&2; exit 1; }
 
-for h in "$@"; do
+# tweaks first: root-tweaks-extra.py rewrites the launchd cache (it drops bluetoothd), so bt must come after it
+hooks=$(printf "%s\n" "$@" | grep -x tweaks || true); hooks="$hooks $(printf "%s\n" "$@" | grep -vx tweaks | tr "\n" " ")"
+for h in $hooks; do
   echo "== hook $h"
   case $h in
     metal)     METAL=1 sh "$REPO/scripts/metal/root-add-metal.sh" "$R" ;;
