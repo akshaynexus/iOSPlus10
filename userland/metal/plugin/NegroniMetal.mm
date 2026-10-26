@@ -51,6 +51,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/syscall.h>
+#include <mach/mach.h>
 #include <pthread.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <unistd.h>
@@ -296,6 +298,68 @@ static bool read_clients(const char *path, bool *yes, bool *no)
 	return true;
 }
 
+/* The jetsam limit of this process, in MiB, from what an unprivileged process can read: task_info phys_footprint +
+ * memorystatus_available_memory() (syscall 534, the bytes left before the per-process limit; 0 when the process has no
+ * limit or is no "app"). 0 = unknown/none. *footprint_mb gets the footprint. */
+static long memory_limit_mb(long *footprint_mb)
+{
+	task_vm_info_data_t vm;
+	mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+	uint64_t footprint = 0, avail = 0;
+	/* limit_bytes_remaining (TASK_VM_INFO rev 4) = memorystatus_available_memory as 64 bits; syscall() returns an int
+	 * and cut the value to 32 bits (review 2026-10-27) */
+	if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &n) == KERN_SUCCESS) {
+		footprint = vm.phys_footprint;
+		if (n >= TASK_VM_INFO_REV4_COUNT)
+			avail = vm.limit_bytes_remaining;
+	}
+	*footprint_mb = (long)(footprint >> 20);
+	if (avail == 0)
+		return 0;
+	return (long)((footprint + avail) >> 20);
+}
+
+/* NSExtensionPointIdentifier of the main bundle ("" when the process is no app extension) */
+static const char *extension_point(void)
+{
+	static char point[128];
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		NSDictionary *ext = [NSBundle mainBundle].infoDictionary[@"NSExtension"];
+		id id_ = [ext isKindOfClass:[NSDictionary class]] ? ext[@"NSExtensionPointIdentifier"] : nil;
+		if ([id_ isKindOfClass:[NSString class]])
+			strlcpy(point, [id_ UTF8String], sizeof(point));
+	});
+	return point;
+}
+
+/* Memory rule (2026-10-27, docs/metal-widgets-2026-10-27.md): a process with a small jetsam limit gets no device. The
+ * plugin and Turnip need about 20 MiB on top of the process (chronod: 31 MiB with the device), and WidgetKit extensions
+ * are limited to 30 MiB: FitnessWidget was killed (sig 9, per-process limit) three times at every boot, 1-8 s after the
+ * device opened, and chronod then gave the widget up. The rule: limit known and below NEGRONIMETAL_MIN_LIMIT_MB (default
+ * 40), or a com.apple.widgetkit-extension (its limit is 30 MiB whether or not the kernel reports it): no device.
+ * NEGRONIMETAL_MIN_LIMIT_MB=0 in NMTL_DIR/env turns the rule off. Returns the reason, or NULL when the device may open. */
+static const char *memory_rule(char *why, size_t size)
+{
+	long footprint = 0;
+	long limit = memory_limit_mb(&footprint);
+	const char *point = extension_point();
+	const long min_mb = env_num("NEGRONIMETAL_MIN_LIMIT_MB", 40); /* 40: chronod (inactive 45 MiB) keeps its device; widgets (30) do not */
+	nlog("memory: footprint %ld MiB, jetsam limit %ld MiB (0 = none/unknown), extension point %s, rule %ld MiB",
+	     footprint, limit, *point ? point : "-", min_mb);
+	if (min_mb <= 0)
+		return NULL;
+	if (limit > 0 && limit < min_mb) {
+		snprintf(why, size, "jetsam limit %ld MiB is below %ld MiB (NEGRONIMETAL_MIN_LIMIT_MB): no Metal device", limit, min_mb);
+		return why;
+	}
+	if (!strcmp(point, "com.apple.widgetkit-extension")) {
+		snprintf(why, size, "WidgetKit extension (30 MiB jetsam limit; reported %ld MiB): no Metal device", limit);
+		return why;
+	}
+	return NULL;
+}
+
 /* Listed in any readable clients file, and denied ("-NAME") in none. No readable file: not listed. */
 static bool listed(void)
 {
@@ -538,6 +602,10 @@ static void first_completion_watch(const char *path, double t_open)
 /* KEY=VALUE lines of NMTL_DIR/env into this process before the device opens (TU_DEBUG, MESA_*, METAL2VULKAN_*). */
 static void load_env(void)
 {
+	static bool done; /* called before the memory rule and again before deadman_arm: read once */
+	if (done)
+		return;
+	done = true;
 	FILE *ef = fopen(NMTL_DIR "/env", "r");
 	if (!ef)
 		return;
@@ -840,6 +908,11 @@ static void watchdog_start(void)
 		}
 		if (bootarg_off()) {
 			nlog("boot-arg negronimetal=0: no Metal device");
+			return;
+		}
+		load_env(); /* NMTL_DIR/env: NEGRONIMETAL_MIN_LIMIT_MB */
+		if (memory_rule(why, sizeof(why))) {
+			nlog("%s", why);
 			return;
 		}
 		if (!gpu_service_present()) {
