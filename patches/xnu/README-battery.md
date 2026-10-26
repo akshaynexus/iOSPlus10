@@ -12,6 +12,7 @@ Marks: **[V]** seen in source, DT, firmware, build or log. **[I]** inference.
 | `0276-negroni-battery-soc-source.patch` | `iokit/Kernel/arm/NegroniBattery.cpp` | the percentage: source order gauge (not reachable) > GLINK (0274) > OCV estimate with a rate limit; `soc src=` in the log (section 10) |
 | `0277-negroni-charger-loop.patch` | `bsd/dev/negroni_chg_glink.c`, `.h` | the Android HLOS charge loop over GLINK: float voltage + FCC per the DT JEITA bands every 5 s, the thermal FCC level, the power hub (section 11) |
 | `0278-negroni-battery-persist-temp.patch` | `bsd/dev/negroni_batt_store.c` (new), `bsd/conf/files`, `bsd/dev/negroni_spmi.c`, `.h`, `iokit/Kernel/arm/NegroniBattery.cpp` | the percentage kept across boots, the cell temperature in `Temperature`, skin/XO to the hub, BCL MONITOR_EN, the QDSS vote release (section 12) |
+| `0365-negroni-battery-charging-ui.patch` | `iokit/Kernel/arm/NegroniBattery.cpp`, `bsd/dev/negroni_chg_glink.c`, `.h` | IsCharging/FullyCharged/AdapterDetails (Watts, FamilyCode)/Amperage/times for the iOS battery UI, with and without the charger PD (section 13) |
 
 ## 1. Why iOS showed a wrong battery level
 
@@ -717,3 +718,67 @@ Verification (2026-10-26, build only):
   0280..0351 (the set of 17:56) cherry-picked with 0283 before 0284 and 0291 before 0300: the result equals the work tree.
 - [V] Build `pwr-build` (scripts/battery/build-pwr-image.sh, lock out/kernel/.lock held over kernel + image): kernel out/kernel/local-20261026-124827/kernel.development.negroni sha256 01363704dab977e2259aecbe1fb81141133ba5458ec97a59a6b6abf86b981fa3; patch-report applies every patches/xnu patch 0270-0291 incl. 0277/0278/0283/0291 (and the other agent's 0287/0288), only the 4 usual dxb skips; strings `loop: battery`, `store: soc restored`, `trip %s %s (value`, `negronicpufreq_floor`, `QDSS clock vote released` in the kernel. Image out/ios16-pwr was built in that same locked job from that kernel (local-20261026-124827, sha256 01363704...; [V] three 64 KiB pieces of it found byte-equal in out/ios16-pwr/esp.img; the image SHA256SUMS lists only the image files). It is BEFORE review fix 1 (0277 BATT_CHG_EN restart log bound); per the owner the fix gets a kernel-only proof build, the main session builds the combined image. Review fixes 1-4 (2026-10-26 18:5x): kernel-only proof build `pwr-kernel` (IMAGE=0, lock held): out/kernel/local-20261026-132431/kernel.development.negroni sha256 4786905de90c56b9150153d01f33f69ed87bc7769611e494dd111a1c32974b34, 0277/0278/0283/0291 applied, only the 4 usual dxb skips, string `further failures are not logged` (fix 1) in the kernel. 0277 sha256 now in the report. Image (config args + `negronibatt=5 negroniadsp=1 negronichg_glink=1 negronichg_ma=1500 negronifb_sleep=0 negronipanic=30 negronipanicreason=2`): boot_a.img 72ee45050d399b14a1805b55c65c7cd927a90ed45d6b3c8d5596b6582afc9394, vendor_boot_a.img c29329ee..., esp.img 01f9330f..., negroni.adt 12b7654d... (out/ios16-pwr/SHA256SUMS). Not booted. Patch sha256: 0277 cd22073c..., 0278 047a4652..., 0283 564c7390..., 0291 fa95dcd5...
 
+
+## 13. Charging state and speed for the iOS UI (0365, 2026-10-27)
+
+Status: compile-checked and built in the full set (see Verification), **not booted**.
+
+Owner goal: the battery shows the charging state and the speed. Phone log before 0365
+(logs/usblog-20261026-233816.txt 02:03-02:05, `negronibatt=5`, cable in, ADSP not up):
+`external=1 charging=0 ... chg=? icl=0mA`; `usbin 5036mV iin 495mA ibat 0mA` at rest, `usbin 4885mV iin 999mA
+ibat -849mA` under load. So iOS saw "connected, not charging": no bolt.
+
+Readers [V `ipsw dyld str` of the 20H392 cache]: `IsCharging`, `ExternalConnected`, `FullyCharged`, `AdapterDetails`
+in UIKitCore and SpringBoard (status bar bolt, `UIDevice.batteryState`, the plug chime); `Is Charging` and
+`AdapterDetails` in BatteryCenter (lock screen "Charging", Batteries widget, from powerd's IOPS dictionaries);
+`InstantAmperage`, `AppleRawCurrentCapacity`, `FullyCharged` in PowerlogCore/PowerlogLiteOperators (Settings >
+Battery graphs); `BatteryInstalled` in libMobileGestalt.
+
+Rule [I, as Apple PMUs and Linux POWER_SUPPLY_STATUS_CHARGING]: `IsCharging` = the charger feeds the battery path.
+Under a load above the input the bolt stays, `Amperage` is negative and the percentage falls (0276 rules unchanged).
+
+What 0365 does (`iokit/Kernel/arm/NegroniBattery.cpp` `chargeState()`; `bsd/dev/negroni_chg_glink.c/.h`):
+- (a) Without the charger PD: `charging` = VBUS >= 4000 mV, not full, and VADC `iin` >= 100 mA (`NB_IIN_MA`) or the
+  filtered battery current > +50 mA. Without `iin` (no VADC): filtered current > -50 mA; without any current:
+  percent < 100. `full` as 0276, and (review C5) also at >= 99 % when the filtered current is between -50 and
+  +100 mA (`NB_TAPER_MA`) or unknown: the charge has tapered, so the OCV estimate cannot show "charging" for ever;
+  a clear discharge under load is not a taper. `AdapterDetails`: `AdapterVoltage` = VBUS, `Current` = `iin`, `Watts` = VBUS x
+  `iin` (rounded), `FamilyCode` 0xe0004007 (USB unknown: the type is the PD's).
+- (b) With the charger PD (0274 READY, SoC fresh): `charging` = external and PD `BATT_STATUS` == 1, `full` = 4 (or
+  100 % and not 1), as HakiOS `hakios.battery.cpp:118-121`. `AdapterDetails` from `USB_VOLT_NOW` x `USB_CURR_NOW`;
+  `FamilyCode` from `USB_ADAP_TYPE` (id 7 = POWER_SUPPLY_PROP_USB_TYPE, `oplus_battery_sm8450.c:231`; 0274 read it,
+  0365 stores it as `usb_type`) with the HakiOS table (SDP 0xe0004000, DCP/HVDCP/BrickID 0xe0004004, CDP
+  0xe0004005, C 0xe0004009, PD/PD_DRP/PD_PPS 0xe000400a, else 0xe0004007). `InstantAmperage` = PD `BATT_CURR_NOW`
+  with its sign learnt from 3 agreeing polls in a row (review C1): status 2 on battery (the current leaves the
+  pack), or the AP's filtered BCL current (+ = charging) when both are above 50 mA. Status 1 alone does not name
+  it: "charging" can come with a net discharge under a load above the input. Until a PD status newer than the
+  plug edge arrives, the VADC rule (a) decides (review C2; `fWhy` "pd stale, ..."), and the 1 s plug tick runs
+  the full read at once when a new PD cycle brings a new `BATT_STATUS` (`charge: PD status 3 -> 1: full read
+  now`). The no-AP-voltage path (PD SoC only) uses the same `chargeState()` (review C3). HakiOS reads `USB_TYPE` id 6 on
+  its Poco X5 Pro firmware; on this OPLUS build the type is id 7 (`[USB_ADAP_TYPE] = POWER_SUPPLY_PROP_USB_TYPE`).
+- `Amperage` = the filtered current, `InstantAmperage` = this poll's (both + = charging; before: both the instant
+  value). `AvgTimeToFull` = missing mAh x 60 / filtered charge current (> 50 mA), `AvgTimeToEmpty` = mAh left x 60 /
+  filtered discharge current on battery, `InstantTimeToEmpty` from the instant current, `TimeRemaining` = the one
+  that applies; 65535 = unknown; 1..65534 (linear, no CV taper [I]).
+- Registry: `NegroniChargeInputMilliwatts`, `NegroniChargeFamilyCode`, `NegroniChargeSource` (vadc/pd),
+  `NegroniChargeReason`.
+- Log, on each change of external/charging/full/source and every 3 full reads (60 s) while plugged:
+```
+NEGRONI BATTERY: charge: 79% external=1 charging=1 full=0 (iin 495 mA avg 0 mA) | adapter 5036mV 495mA 2.49W family 0xe0004007 (vadc) | battery inst 0mA avg 0mA | to full 65535 min to empty 65535 min
+NEGRONI BATTERY: charge: 78% external=1 charging=1 full=0 (iin 999 mA avg -212 mA) | adapter 4885mV 999mA 4.88W family 0xe0004007 (vadc) | battery inst -849mA avg -212mA | to full 65535 min to empty 65535 min
+NEGRONI BATTERY: charge: 80% external=1 charging=1 full=0 (pd status 1) | adapter 9000mV 2000mA 18.00W family 0xe000400a (pd) | battery inst 1800mA avg 1750mA | to full 34 min ...   (with the ADSP)
+NEGRONI BATTERY: charge: the charger PD's BATT_CURR_NOW is negative while charging (3 polls agree; last: status 1, PD -1800 mA, AP avg 1750 mA)   (once, with the ADSP)
+```
+  The 0271 status line now shows `charging=1` with the cable in.
+
+What the owner should see: the bolt in the status bar within ~1 s of plugging in (0276 plug tick, then the full
+read), the plug chime, "Charging" on the lock screen; the percentage rises only when the net current is positive
+(at rest on 5 V/~0.5-1 A it rises slowly; under load it can fall with the bolt shown). Unplug: the bolt goes at the
+next 1 s tick. Speed: `AdapterDetails` Watts (`ioreg -l -w0 -r -c IOPMPowerSource`) and the `charge:` line.
+Today without the ADSP the charger stays at its ~1 A default input limit (section 9), so 2.5-5 W.
+
+Verification (2026-10-27, build only): [V] compile-one NegroniBattery.cpp and negroni_chg_glink.c, no diagnostic in
+the files; full build `hzbat-kernel` (lock held): out/kernel/local-20261026-213038/kernel.development.negroni sha256
+127cae2a976695d78131e9116be18f99daa601010f80aa4520b8de9698ac9c7c (after the review fixes B1, C1-C3, C5), 257 patches applied incl. 0364/0365, only the 4
+usual dxb skips; strings `charge: %u%% external`, `BATT_CURR_NOW is %s`, `NegroniChargeInputMilliwatts` in the
+kernel. Patch sha256 3846e7a73bd24ecd8c636378bdbdf7c65710e6c568f76cc0a71dee3a6effe698. Not booted.

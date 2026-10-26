@@ -1,0 +1,185 @@
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index b34939c..23f04bb 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -88,6 +88,21 @@
+  * one vsync period (NEGRONI_FB_VSYNC_US), and the vsync notification's third value (the
+  * interval, IOMFBServer::vsync_callback) carries the same tick count instead of 0.
+  *
++ * Display modes for CoreAnimation (patch 0364, boot-arg negronifb_modes, default 1, 0 = off): the
++ * properties TimingElements and ColorElements (one timing: the presented size at negronifb_modehz,
++ * default the panel rate divided by the negronifb_hz copy interval (120 with negronifb_hz=120), as SyncRate/PreciseSyncRate in 16.16 fixed point; one 8-bit RGB colour
++ * mode), read by IOMobileFramebufferGetSupportedDigitalOutModes (20H392 IOMobileFramebuffer
++ * kern_GetSupportedDigitalOutModes), and GetBlock (selector 79) block 0x40 at offset 0 (the second
++ * scalar) = the current mode's colour and timing id at +4/+8 (IOMobileFramebufferGetDigitalOutMode
++ * reads 40 bytes; QuartzCore
++ * IOMFBDisplay::fetch_current_iomfb_mode matches them against the modes). QuartzCore keeps the rate as
++ * bits 29..53 of its Display::Mode; -[CADisplayMode refreshRate] = round(that / 65536), and
++ * UIScreen.maximumFramesPerSecond = round(FBSDisplayConfiguration.refreshRate) of the current mode.
++ * Without a mode CADisplayMode falls back to the display's refresh interval. Port of HakiOS
++ * MiniIOMobileFramebuffer.cpp publishModes()/GetBlock (APSL 2.0, a derivative of Apple's XNU like this
++ * kernel; HakiOS LICENSE item 1, (c) 2025-2026 the HakiOS authors). The VRR idle rate (0259) is a
++ * kernel matter and does not change the published mode.
++ *
+  * Vsync tick without GPU waits (patch 0254): the timer is armed for fixed deadlines (the one
+  * before + NEGRONI_FB_VSYNC_US), so the period does not depend on the work of the handler; a
+  * deadline that has passed is skipped (counted as a late tick). The tick never waits for a
+@@ -180,6 +195,7 @@ enum {
+ 	kNegroniFBIsMainDisplay           = 18,
+ 	kNegroniFBGetDotPitch             = 28,
+ 	kNegroniFBNotifications           = 72,
++	kNegroniFBGetBlock                = 79,   /* 0364: block 0x40 = the current mode (colour, timing id) */
+ };
+ 
+ #define NEGRONI_FB_SWAP_REC_SIZE          0x46c
+@@ -698,6 +714,7 @@ public:
+ 	void vrrWakeLocked(void);
+ 	void vrrWork(void);
+ 	void vrrSetRate(uint32_t fps);
++	void publishModes(void);        /* 0364 */
+ 	static void vrrCall(thread_call_param_t p0, thread_call_param_t p1);
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void statTick(uint64_t now);
+@@ -870,6 +887,7 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(step);
+ 		OSSafeReleaseNULL(min);
+ 	}
++	publishModes();                 /* 0364: TimingElements / ColorElements */
+ 	registerService();
+ 	negroni_backlight_attach(this);
+ 	negroni_dsi_esd_start();        /* 0293: negronifb_esd (bsd/dev/negroni_dsi.c) */
+@@ -1567,6 +1585,90 @@ AppleCLCD::vrrCall(thread_call_param_t p0, __unused thread_call_param_t p1)
+ extern "C" uint32_t negroni_dpu_te_rate(uintptr_t intf, uint32_t fps);    /* bsd/dev/negroni_dpu.c (0294) */
+ 
+ /* Mode 2: the tick, CoreAnimation's interval and the refresh property follow the panel rate. */
++/* 0364: one number into a dictionary */
++static void
++negroni_fb_dict_num(OSDictionary *d, const char *key, uint64_t value)
++{
++	OSNumber *n = OSNumber::withNumber(value, 32);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++static bool negroni_fb_modes_on;          /* 0364: TimingElements published (GetBlock 0x40 answers) */
++#define NEGRONI_FB_TIMING_ID              1
++#define NEGRONI_FB_COLOR_ID               1
++
++/*
++ * 0364: the display mode the way CoreAnimation reads it (header comment). Keys and layout as HakiOS
++ * MiniIOMobileFramebuffer.cpp:329-379 (APSL 2.0); the size is the presented one (GetDisplaySize).
++ */
++void
++AppleCLCD::publishModes(void)
++{
++	uint32_t on = 1;
++	/* default: the rate frames really reach the panel (negronifb_hz: one copy every fFlushTicks ticks) */
++	uint32_t hz = 1000000u / NEGRONI_FB_VSYNC_US / (fFlushTicks ? fFlushTicks : 1);
++	PE_parse_boot_argn("negronifb_modes", &on, sizeof(on));
++	PE_parse_boot_argn("negronifb_modehz", &hz, sizeof(hz));
++	if (on == 0) {
++		IOLog("NEGRONI FB: modes: off (negronifb_modes=0): no TimingElements, CoreAnimation uses the refresh interval\n");
++		return;
++	}
++	if (hz < 1 || hz > 1000000u / NEGRONI_FB_VSYNC_US) {
++		hz = 1000000u / NEGRONI_FB_VSYNC_US;
++	}
++	const uint64_t rate = (uint64_t)hz << 16;       /* 16.16 fixed point */
++	OSDictionary *timing = OSDictionary::withCapacity(8);
++	OSDictionary *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4);
++	OSDictionary *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1);
++	OSArray *colors = OSArray::withCapacity(1);
++	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL && timings != NULL && colors != NULL) {
++		negroni_fb_dict_num(color, "ID", NEGRONI_FB_COLOR_ID);
++		negroni_fb_dict_num(color, "PixelEncoding", 0);         /* RGB 4:4:4 */
++		negroni_fb_dict_num(color, "Depth", 8);
++		negroni_fb_dict_num(color, "Colorimetry", 1);
++		negroni_fb_dict_num(color, "EOTF", 1);
++		negroni_fb_dict_num(color, "DynamicRange", 0);
++		negroni_fb_dict_num(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		negroni_fb_dict_num(horizontal, "Active", fLogicalW);
++		negroni_fb_dict_num(horizontal, "Total", fLogicalW);
++		negroni_fb_dict_num(horizontal, "SyncRate", rate);
++		negroni_fb_dict_num(horizontal, "PreciseSyncRate", rate);
++		negroni_fb_dict_num(vertical, "Active", fLogicalH);
++		negroni_fb_dict_num(vertical, "Total", fLogicalH);
++		negroni_fb_dict_num(vertical, "SyncRate", rate);
++		negroni_fb_dict_num(vertical, "PreciseSyncRate", rate);
++		negroni_fb_dict_num(timing, "ID", NEGRONI_FB_TIMING_ID);
++		negroni_fb_dict_num(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++		negroni_fb_modes_on = true;
++		IOLog("NEGRONI FB: modes: TimingElements %ux%u at %u Hz (SyncRate 0x%llx), ColorElements RGB 8-bit, current mode "
++		    "colour %u timing %u (negronifb_modes=1 negronifb_modehz=%u)\n", fLogicalW, fLogicalH, hz,
++		    (unsigned long long)rate, NEGRONI_FB_COLOR_ID, NEGRONI_FB_TIMING_ID, hz);
++	} else {
++		IOLog("NEGRONI FB: modes: not published (no memory)\n");
++	}
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
++
+ void
+ AppleCLCD::vrrSetRate(uint32_t fps)
+ {
+@@ -3529,8 +3631,33 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint64_t out[2] = { 0, 0 };
+ 	uint32_t outCount = 0;
++	uint8_t block[12];              /* 0364: GetBlock answer, copied after the output is cleared */
++	uint32_t blockLen = 0;
+ 
+ 	switch (selector) {
++	case kNegroniFBGetBlock:
++		/* 0364: block 0x40 = the current mode: colour id at +4, timing id at +8; every other block reads zeros */
++		if (args->scalarInputCount >= 1) {
++			static uint64_t seen[4];        /* block ids < 256 already logged */
++			uint64_t id = args->scalarInput[0];
++			uint64_t off = args->scalarInputCount >= 2 ? args->scalarInput[1] : 0;
++			if (id == 0x40 && off == 0 && negroni_fb_modes_on && args->structureOutputDescriptor == NULL &&
++			    args->structureOutput != NULL && args->structureOutputSize >= sizeof(block)) {
++				uint32_t ids[2] = { NEGRONI_FB_COLOR_ID, NEGRONI_FB_TIMING_ID };
++				bzero(block, sizeof(block));
++				memcpy(block + 4, ids, sizeof(ids));
++				blockLen = sizeof(block);
++			}
++			if (id < 256 && !(seen[id / 64] & (1ULL << (id % 64)))) {
++				seen[id / 64] |= 1ULL << (id % 64);
++				char name[32];
++				proc_selfname(name, sizeof(name));
++				IOLog("NEGRONI FB: %s GetBlock 0x%llx (in %u scalars, out %u bytes): %s\n", name, id,
++				    args->scalarInputCount, args->structureOutputSize,
++				    blockLen ? "current mode (colour 1, timing 1)" : "zeros");
++			}
++		}
++		break;
+ 	case kNegroniFBGetLayerDefaultSurface:
+ 		out[0] = negroni_surface_port_in_task(fFB->fSurface, fTask);
+ 		outCount = 1;
+@@ -3626,6 +3753,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	}
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
++		if (blockLen != 0) {
++			memcpy(args->structureOutput, block, blockLen);  /* 0364 */
++		}
+ 	}
+ 	if (selector >= 64 || !(negroni_fb_logged & (1ULL << selector))) {
+ 		if (selector < 64) {

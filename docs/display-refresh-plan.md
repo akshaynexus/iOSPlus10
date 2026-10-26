@@ -208,3 +208,60 @@ Details and log lines: patches/xnu/README-gpu-kernel.md sections 22-26. All defa
   With it, the min-fps hold of mode 1 would be the Android case (no frames while idle); combining both is not done
   (0296 refuses `negronifb_vrr=1|3`, which own AUTOREFRESH_CONFIG).
 - ESD and panel reads: 0293 `negronifb_esd=1` (DCS 0x0a every 5 s, re-init through 0268's wake on a bad value).
+
+## 9. The 120 Hz mode for UIKit and CoreAnimation: patch 0364 (2026-10-27, build-only)
+
+Owner goal: the UI runs at 120 Hz. The kernel already ticks vsync at 120 Hz (`NEGRONI_FB_VSYNC_US` 8333), sets
+`IOMFBDisplayRefresh` (0253) and, only with `negronifb_vrr=1` (0259 VRR), switches to 10 Hz when idle. What was missing is the display mode.
+
+How iOS 16.7 (20H392) gets the refresh rate [V `ipsw dyld disass` of `out/dsc/cache`]:
+- `-[UIScreen maximumFramesPerSecond]` (UIKitCore 0x1890029d0) returns 60 only for apps linked before an old SDK
+  (`dyld_program_sdk_at_least`), else `-[UIScreen _maximumFramesPerSecond]` = round(1 / `_refreshRate`), and
+  `_refreshRate` = 1 / `[FBSDisplayConfiguration refreshRate]` = 1 / the current `CADisplayMode`'s `refreshRate`.
+- `-[CADisplayMode refreshRate]` (QuartzCore 0x1883665f4) = round(bits 29..53 of the packed `Display::Mode` x
+  2^-16): the timing's `SyncRate` in 16.16 fixed point. With no mode (all ones) it falls back to 1 / the display's
+  refresh interval. `IOMFBDisplay::hardware_refresh_rate` (0x188530454) reads the same field.
+- QuartzCore fills its mode set from `IOMobileFramebufferGetSupportedDigitalOutModes` (IOMobileFramebuffer
+  `kern_GetSupportedDigitalOutModes` 0x1af228b48: the service properties `ColorElements` and `TimingElements`) and
+  the current mode from `IOMobileFramebufferGetDigitalOutMode` (0x1af22438c: GetBlock, selector 79, block 0x40,
+  40 bytes; the ids at +4 and +8), matched in `IOMFBDisplay::fetch_current_iomfb_mode` (0x1883a7828). The phone log
+  shows backboardd's `sel 79 ... out 0/40` (and a second block of 1580 bytes); we answered zeros.
+- `AppleCLCDDisplay::minimum_frame_duration` (0x1882bc4d0) gives 2 frames (60 Hz on a 120 Hz panel) only when a
+  flag bit and bit 63 of the mode are set; our mode has bit 63 clear, so the minimum is 1 frame [I: bit 63 is not
+  from a key we publish]. Strings `TimingElements`, `HorizontalAttributes`, `SyncRate`, `PreciseSyncRate` are in
+  IOMobileFramebuffer/QuartzCore; `CADisableMinimumFrameDurationOnPhone` exists (third-party CADisplayLink cap on
+  phones, as on ProMotion iPhones; system UI is not affected [I]).
+
+What 0364 does (`iokit/Kernel/arm/NegroniFramebuffer.cpp`, port of HakiOS `MiniIOMobileFramebuffer.cpp:329-379` and
+its GetBlock case, APSL 2.0):
+- `publishModes()` before `registerService()`: `TimingElements` = one timing (`ID` 1, `HorizontalAttributes`/
+  `VerticalAttributes` with `Active`/`Total` = the presented size 1125 x 2436, `SyncRate` = `PreciseSyncRate` =
+  `negronifb_modehz` << 16; default = 120 / the `negronifb_hz` copy interval (`fFlushTicks`), so 120 with the
+config's `negronifb_hz=120` and 10 with the code default `negronifb_hz=10`), `ColorElements` = one 8-bit RGB mode (`ID` 1).
+- Selector 79 (GetBlock): block 0x40 at offset 0 (the second scalar; IOMobileFramebufferGetDigitalOutMode sends 0)
+  answers colour id 1 at +4 and timing id 1 at +8; other blocks and offsets stay zeros.
+  The output is now written after the generic clearing. Each block id is logged once.
+- Boot-args: `negronifb_modes=0` turns it off (the old behaviour), `negronifb_modehz=N` (1..120).
+- VRR is unchanged: the mode says 120 Hz; with `negronifb_vrr=1` the kernel still drops the tick to 10 Hz when
+  nothing swaps and goes back to 120 Hz on the first swap.
+
+Expected log:
+```
+NEGRONI FB: modes: TimingElements 1125x2436 at 120 Hz (SyncRate 0x780000), ColorElements RGB 8-bit, current mode colour 1 timing 1 (negronifb_modes=1 negronifb_modehz=120)
+NEGRONI FB: backboardd GetBlock 0x40 (in 2 scalars, out 40 bytes): current mode (colour 1, timing 1)
+NEGRONI FB: backboardd GetBlock 0x.. (in 2 scalars, out 1580 bytes): zeros
+NEGRONI FB STAT: swaps/s ~120 presents/s ~120 ...     (during a continuous scroll)
+NEGRONI FB VRR: idle (idle 10 Hz) ...                  (after the scroll, with negronifb_vrr=1)
+```
+Before 0364 [V logs/usblog-20261026-233816.txt]: `swaps/s` max 97, most active seconds 52-66.
+
+Test: scroll Settings for 5 s with the finger kept moving; read `FB STAT`. If CA hangs or draws nothing (HakiOS
+notes "without a mode it draws nothing", so the mode path is the normal one there), boot `negronifb_modes=0`.
+Risks [I]: QuartzCore may now call `SetDigitalOutMode` (accepted, no-op) or read the 1580-byte block (zeros as
+before); a CADisplayLink in a third-party app stays at 60 without `CADisableMinimumFrameDurationOnPhone`.
+
+Verification (2026-10-27, build only): [V] compile-one NegroniFramebuffer.cpp, no diagnostic in the file; full build
+out/kernel/local-20261026-213038/kernel.development.negroni sha256
+127cae2a976695d78131e9116be18f99daa601010f80aa4520b8de9698ac9c7c (after the review fixes B1, C1-C3, C5) (0364 applied, only the 4 dxb skips; strings
+`modes: TimingElements`, `GetBlock 0x%llx`, `PreciseSyncRate`). Patch sha256
+89ba7e3ea2c1c61adf317f6289c51129697d3d4ada23a263f562787eef6e9c46. Not booted.

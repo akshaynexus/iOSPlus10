@@ -1,0 +1,399 @@
+diff --git a/bsd/dev/negroni_chg_glink.c b/bsd/dev/negroni_chg_glink.c
+index e1ba569..9ee5033 100644
+--- a/bsd/dev/negroni_chg_glink.c
++++ b/bsd/dev/negroni_chg_glink.c
+@@ -599,6 +599,7 @@ cycle(void)
+ 	bool adapOk = get(BC_USB_GET, USB_ADAP_TYPE, &adap);
+ 	bool instsOk = get(BC_USB_GET, USB_IN_STATUS, &insts);
+ 	bool suspOk = get(BC_USB_GET, USB_SUSPEND_PMIC, &susp);
++	st.usb_type = adapOk ? (int32_t)adap : -1;                          /* 0365: AdapterDetails FamilyCode */
+ 
+ 	any = good_reads > 0;
+ 	if (any && !st.ready) {
+@@ -857,6 +858,7 @@ chg_thread(__unused void *arg, __unused wait_result_t wr)
+ 	st.wanted = true;
+ 	st.soc_centi = -1;
+ 	st.bstatus = st.usb_online = st.usb_mv = st.icl_ma = -1;
++	st.usb_type = -1;                                                      /* 0365 */
+ 	st.ibat_ma = st.usb_ma = st.temp_centi = INT32_MIN;
+ 	st.band = -1;
+ 	st.fv_mv = st.fcc_ma = -1;
+diff --git a/bsd/dev/negroni_chg_glink.h b/bsd/dev/negroni_chg_glink.h
+index df4f983..ba80ad8 100644
+--- a/bsd/dev/negroni_chg_glink.h
++++ b/bsd/dev/negroni_chg_glink.h
+@@ -36,6 +36,10 @@ struct negroni_chg_glink_status {
+ 	int32_t fv_set_mv;      /* the FV we wrote last (PD units); 0 = none */
+ 	int32_t fcc_set_ma;     /* the FCC we wrote last, mA; 0 = none */
+ 	int32_t fcc_ma;         /* BATT_CHG_CTRL_LIM read back, mA; -1 = unknown */
++	/* 0365: the adapter type for the iOS AdapterDetails FamilyCode */
++	int32_t usb_type;       /* USB_ADAP_TYPE (id 7; POWER_SUPPLY_PROP_USB_TYPE in oplus_battery_sm8450.c:231):
++	                         * Linux POWER_SUPPLY_USB_TYPE_* (1 SDP 2 DCP 3 CDP 4 ACA 5 C 6 PD 7 PD_DRP 8 PD_PPS
++	                         * 9 BrickID), 0x80.. QTI HVDCP; -1 = unknown */
+ };
+ 
+ #ifdef __cplusplus
+diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBattery.cpp
+index 80de955..b0c535f 100644
+--- a/iokit/Kernel/arm/NegroniBattery.cpp
++++ b/iokit/Kernel/arm/NegroniBattery.cpp
+@@ -153,6 +153,34 @@ static const char *const kSocSrcName[] = { "none", "ocv", "glink", "gauge" };
+ #define NB_STORE_MIN_NS    60000000000ull  /* 0278: at most one save a minute */
+ #define NB_BATT_T_AGE_MS   60000   /* 0278: the PD's cell temperature counts for 60 s */
+ 
++/*
++ * Patch 0365: the charging state and speed the iOS battery UI reads (README-battery.md section 13).
++ * Readers in the 20H392 cache: "IsCharging"/"ExternalConnected"/"FullyCharged"/"AdapterDetails" in
++ * UIKitCore and SpringBoard (status bar bolt, UIDevice.batteryState, the chime on the plug edge),
++ * "Is Charging"/"AdapterDetails" in BatteryCenter (lock screen "Charging", widget, through powerd's
++ * IOPS dictionaries), "InstantAmperage"/"AppleRawCurrentCapacity" in Powerlog (Settings > Battery).
++ * IsCharging means "the charger feeds the battery path" (as on Apple's PMUs and the charger PD's
++ * POWER_SUPPLY_STATUS_CHARGING), not "the net current is positive": under a load larger than the input
++ * the bolt stays and the percentage falls (Amperage < 0).
++ *  (a) No charger PD (no ADSP): external = VBUS >= NB_EXT_MV (VADC); charging = external, not full, and
++ *      the charger input current (VADC iin) >= NB_IIN_MA or the filtered battery current > NB_CUR_MA;
++ *      without iin: the filtered current is not a clear discharge (> -NB_CUR_MA); without any current:
++ *      percent < 100. Speed: AdapterDetails AdapterVoltage = VBUS, Current = iin, Watts = VBUS x iin,
++ *      FamilyCode kIOPSFamilyCodeUSBUnknown (the type is the PD's to know).
++ *  (b) Charger PD up (0274, fresh): charging = PD BATT_STATUS 1, full = 4 (HakiOS hakios.battery.cpp
++ *      report()); AdapterDetails from USB_VOLT_NOW x USB_CURR_NOW and FamilyCode from USB_ADAP_TYPE
++ *      (the HakiOS table, family_code(), APSL 2.0; HVDCP as a dedicated charger); InstantAmperage from
++ *      the PD's BATT_CURR_NOW with its sign taken from BATT_STATUS (the convention is learnt once).
++ * Amperage = the filtered current (+ = into the battery), InstantAmperage = this poll's. AvgTimeToFull
++ * (minutes) = the missing charge / the filtered charge current while it is > NB_CUR_MA, AvgTimeToEmpty =
++ * the charge left / the filtered discharge current on battery; TimeRemaining is the one that applies;
++ * 0xffff = unknown (linear estimate, no CV taper modelled [I]).
++ */
++#define NB_IIN_MA          100     /* 0365: charger input current above this: the charger is active */
++#define NB_PLOG_POLLS      3       /* 0365: the "charge:" line at least every 3 full reads (60 s) while plugged */
++#define NB_TAPER_MA        100     /* 0365: at >= 99 % a net current between -NB_CUR_MA and this: full (charge taper) */
++#define NB_PD_VOTES        3       /* 0365: agreeing polls before the PD current sign is taken */
++
+ /* PM8350B BCL (SID 3 0x4700), downstream bcl_pmic5.c */
+ #define BCL_SID            3u
+ #define BCL_BASE           0x4700u
+@@ -319,6 +347,23 @@ private:
+ 	uint64_t fLastSaveNs;
+ 	bool storeTry(int32_t target);
+ 	void storeSave(uint64_t ns);
++	/* 0365: the charging state and speed (adapter, times) that publish() writes */
++	int32_t fAvgMa;            /* Amperage (filtered, + = charging); INT32_MIN = use the instant value */
++	unsigned fAdMv, fAdMa, fAdFamily;   /* AdapterDetails; 0 = the 0271 defaults */
++	const char *fAdSrc;        /* "vadc" / "pd" */
++	unsigned fTtf, fTte;       /* AvgTimeToFull / AvgTimeToEmpty, minutes; 0xffff = unknown */
++	int fPdSign;               /* the PD's BATT_CURR_NOW sign for "charging": +1 / -1, 0 = not learnt */
++	int fPdVote;               /* the sign the last polls voted for, and how many in a row */
++	unsigned fPdVotes;
++	bool fCsExternal;          /* external as chargeState() saw it last */
++	uint64_t fPlugNs;          /* uptime (ns) of the last plug edge: a PD status older than it does not count */
++	uint32_t fGlinkGen;        /* fastCheck(): the PD poll generation and status seen last */
++	int32_t fGlinkBst;
++	int fChgLogKey;            /* the last logged charging state */
++	unsigned fChgLogPolls;
++	char fWhy[48];             /* why charging is what it is (log) */
++	void chargeState(const nb_sample &s, bool external, bool curKnown, int32_t cur, unsigned percent,
++	    int32_t glinkBstatus, bool &charging, bool &full, int &instMa);
+ 	void fastCheck(void);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -391,6 +436,20 @@ NegroniBattery::init(OSDictionary *dictionary)
+ 	fGlinkIcl = -1;
+ 	fGlinkWarned = false;
+ 	fRtCount = 0;
++	fAvgMa = INT32_MIN;        /* 0365 */
++	fAdMv = fAdMa = fAdFamily = 0;
++	fAdSrc = "vadc";
++	fTtf = fTte = 0xffff;
++	fPdSign = 0;
++	fPdVote = 0;
++	fPdVotes = 0;
++	fCsExternal = false;
++	fPlugNs = 0;
++	fGlinkGen = 0;
++	fGlinkBst = -1;
++	fChgLogKey = -1;
++	fChgLogPolls = 0;
++	fWhy[0] = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -479,8 +538,10 @@ NegroniBattery::publish(unsigned percent, unsigned mv, int ma, int centiC, bool
+ 	/* An estimated SOC must not assert a critical shutdown. */
+ 	setAtCriticalLevel(false);
+ 	setVoltage(mv);
+-	setAmperage(ma);
+-	setTimeRemaining(0xffff); /* unknown (AppleSmartBattery's 65535); never zero minutes */
++	/* 0365: Amperage = the filtered current, InstantAmperage = this poll's (both + = charging) */
++	setAmperage(fAvgMa != INT32_MIN ? fAvgMa : ma);
++	/* 0365: minutes to full while charging, to empty on battery; 65535 = unknown; never zero minutes */
++	setTimeRemaining(charging ? fTtf : !external ? fTte : 0xffff);
+ 	setCycleCount(0);         /* unknown without the gauge */
+ 	putBool("FullyCharged", full);
+ 	putBool("built-in", true);
+@@ -493,9 +554,16 @@ NegroniBattery::publish(unsigned percent, unsigned mv, int ma, int centiC, bool
+ 	putNumber("DesignCycleCount9C", 500);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	putNumber("Temperature", (UInt32)centiC);  /* hundredths of a degree C */
+-	putNumber("AvgTimeToEmpty", 0xffff);
+-	putNumber("AvgTimeToFull", 0xffff);
+-	putNumber("InstantTimeToEmpty", 0xffff);
++	putNumber("AvgTimeToEmpty", external ? 0xffff : fTte);     /* 0365 */
++	putNumber("AvgTimeToFull", charging ? fTtf : 0xffff);
++	{
++		unsigned ite = 0xffff;
++		if (!external && ma < -NB_CUR_MA) {
++			uint64_t m = (uint64_t)mah * 60u / (unsigned)(-ma);
++			ite = m < 1 ? 1 : m > 0xfffe ? 0xfffe : (unsigned)m;
++		}
++		putNumber("InstantTimeToEmpty", ite);
++	}
+ 	putNumber("PermanentFailureStatus", 0);
+ 	putNumber("BatteryCellDisconnectCount", 0);
+ 	putBool("CapacityEstimated", fSocSrc != NB_SOC_GLINK && fSocSrc != NB_SOC_GAUGE);
+@@ -521,13 +589,15 @@ NegroniBattery::publish(unsigned percent, unsigned mv, int ma, int centiC, bool
+ 		/* AdapterDetails: FamilyCode 0 = disconnected; 0xe0004007 = kIOPSFamilyCodeUSBUnknown */
+ 		OSDictionary *d;
+ 		if (external) {
+-			int cur = iinMa > 0 ? iinMa : 500;
+-			unsigned volt = usbMv ? usbMv : 5000;
++			/* 0365: the measured adapter (chargeState(): VADC VBUS x iin, or the charger PD's USB values) */
++			int cur = fAdMa > 0 ? (int)fAdMa : iinMa > 0 ? iinMa : 500;
++			unsigned volt = fAdMv ? fAdMv : usbMv ? usbMv : 5000;
++			UInt32 family = fAdFamily ? fAdFamily : 0xe0004007u;
+ 			static const char *const k[] = {kIOPMPSAdapterDetailsVoltage, kIOPMPSAdapterDetailsAmperageKey,
+ 				                        kIOPMPSAdapterDetailsWattsKey, kIOPMPSAdapterDetailsSourceIDKey,
+ 				                        kIOPMPSAdapterDetailsFamilyKey};
+ 			const UInt32 v[] = {volt, (UInt32)cur, (UInt32)(((uint64_t)volt * (unsigned)cur + 500000) / 1000000),
+-				            0, 0xe0004007u};
++				            0, family};
+ 			d = nb_numbers(k, v, 5);
+ 			if (d) {
+ 				d->setObject("IsWireless", kOSBooleanFalse);
+@@ -583,6 +653,155 @@ NegroniBattery::publish(unsigned percent, unsigned mv, int ma, int centiC, bool
+ 	}
+ }
+ 
++/*
++ * 0365: iOS's name for the charger (IOPSKeysPrivate.h kIOPSFamilyCode*) from the PD's USB_ADAP_TYPE
++ * (Linux POWER_SUPPLY_USB_TYPE_*). The table of HakiOS hakios.battery.cpp family_code() (APSL 2.0);
++ * QTI HVDCP (0x80..0x82, oplus_battery_sm8450.h:302) and BrickID as a dedicated charger.
++ */
++static unsigned
++nb_family_code(int32_t usbType)
++{
++	switch (usbType) {
++	case 1: return 0xe0004000u;     /* SDP, a computer's port: kIOPSFamilyCodeUSBHost */
++	case 2: case 9: case 0x80: case 0x81: case 0x82:
++		return 0xe0004004u;     /* DCP (and BrickID, HVDCP): kIOPSFamilyCodeUSBChargingPortDedicated */
++	case 3: return 0xe0004005u;     /* CDP: kIOPSFamilyCodeUSBChargingPortDownstream */
++	case 5: return 0xe0004009u;     /* USB-C current: kIOPSFamilyCodeUSBCTypeC */
++	case 6: case 7: case 8: return 0xe000400au;     /* USB PD: kIOPSFamilyCodeUSBCPD */
++	default: return 0xe0004007u;    /* kIOPSFamilyCodeUSBUnknown */
++	}
++}
++
++/*
++ * 0365: IsCharging / FullyCharged, the adapter and the times (the comment at NB_IIN_MA). glinkBstatus is
++ * the fresh PD BATT_STATUS (1..4) or -1. instMa: InstantAmperage (+ = charging), in/out.
++ */
++void
++NegroniBattery::chargeState(const nb_sample &s, bool external, bool curKnown, int32_t cur, unsigned percent,
++    int32_t glinkBstatus, bool &charging, bool &full, int &instMa)
++{
++	(void)cur;                      /* instMa already holds it */
++	fAdMv = s.usbOk ? s.usbMv : 0;
++	fAdMa = s.iinOk && s.iinMa > 0 ? (unsigned)s.iinMa : 0;
++	fAdFamily = 0xe0004007u;
++	fAdSrc = "vadc";
++	fAvgMa = curKnown ? fCurAvg : INT32_MIN;
++	uint64_t nowAbs, nowNs;
++	clock_get_uptime(&nowAbs);
++	absolutetime_to_nanoseconds(nowAbs, &nowNs);
++	if (external != fCsExternal) {
++		fCsExternal = external;
++		fPlugNs = nowNs;        /* review C2: the PD status must be newer than this edge */
++	}
++	bool pd = glinkBstatus >= 1 && glinkBstatus <= 4;
++	bool pdStale = false;
++#if NB_HAVE_GLINK
++	negroni_chg_glink_status g;
++	if (pd && negroni_chg_glink_get(&g) && g.up && g.ready && g.soc_ns <= fPlugNs) {
++		pd = false;             /* read before the plug edge: the VADC rule until the next PD cycle */
++		pdStale = true;
++	}
++	if (pd && negroni_chg_glink_get(&g) && g.up && g.ready) {
++		if (g.usb_mv > 0) {
++			fAdMv = (unsigned)g.usb_mv;
++		}
++		if (g.usb_ma != INT32_MIN && g.usb_ma > 0) {
++			fAdMa = (unsigned)g.usb_ma;
++		}
++		fAdFamily = nb_family_code(g.usb_type);
++		fAdSrc = "pd";
++		if (g.ibat_ma != INT32_MIN && g.ibat_ma != 0) {
++			/*
++			 * Learn the PD's sign (review C1: "charging" can come with a net discharge under a load above the
++			 * input, so BATT_STATUS 1 does not name it). A vote: status 2 on battery (the current leaves the
++			 * pack), or the AP's own filtered current (BCL, + = charging) when both are above 50 mA; the sign
++			 * is taken after NB_PD_VOTES agreeing polls in a row.
++			 */
++			int vote = 0;
++			const bool big = g.ibat_ma > NB_CUR_MA || g.ibat_ma < -NB_CUR_MA;
++			if (big && glinkBstatus == 2 && !external) {
++				vote = g.ibat_ma > 0 ? -1 : 1;
++			} else if (big && curKnown && (fCurAvg > NB_CUR_MA || fCurAvg < -NB_CUR_MA)) {
++				vote = (g.ibat_ma > 0) == (fCurAvg > 0) ? 1 : -1;
++			}
++			if (fPdSign == 0 && vote != 0) {
++				fPdVotes = vote == fPdVote ? fPdVotes + 1 : 1;
++				fPdVote = vote;
++				if (fPdVotes >= NB_PD_VOTES) {
++					fPdSign = vote;
++					IOLog("NEGRONI BATTERY: charge: the charger PD's BATT_CURR_NOW is %s while charging (%u polls agree; "
++					    "last: status %d, PD %d mA, AP avg %d mA)\n", fPdSign > 0 ? "positive" : "negative", fPdVotes,
++					    glinkBstatus, g.ibat_ma, curKnown ? fCurAvg : 0);
++				}
++			}
++			if (fPdSign != 0) {
++				instMa = g.ibat_ma * fPdSign;
++			}
++		}
++	}
++#endif
++	if (pd) {
++		full = glinkBstatus == 4 || (fSoc >= 10000 && glinkBstatus != 1);
++		charging = external && glinkBstatus == 1 && !full;
++		snprintf(fWhy, sizeof(fWhy), "pd status %d", glinkBstatus);
++	} else {
++		full = external && fSoc >= 10000 && (!curKnown || fCurAvg < NB_FULL_MA);
++		/* review C5: at >= 99 % with the input on and the net current near zero the charge has tapered: full,
++		 * so the OCV estimate cannot show "charging" for ever; a clear discharge (a load) is not a taper */
++		if (external && !full && fSoc >= 9900 &&
++		    (!curKnown || (fCurAvg > -NB_CUR_MA && fCurAvg < NB_TAPER_MA))) {
++			full = true;
++		}
++		if (!external) {
++			charging = false;
++			snprintf(fWhy, sizeof(fWhy), "no VBUS");
++		} else if (full) {
++			charging = false;
++			snprintf(fWhy, sizeof(fWhy), "full");
++		} else if (s.iinOk) {
++			charging = s.iinMa >= NB_IIN_MA || (curKnown && fCurAvg > NB_CUR_MA);
++			snprintf(fWhy, sizeof(fWhy), "%siin %d mA avg %d mA", pdStale ? "pd stale, " : "", s.iinMa,
++			    curKnown ? fCurAvg : 0);
++		} else if (curKnown) {
++			charging = fCurAvg > -NB_CUR_MA;
++			snprintf(fWhy, sizeof(fWhy), "avg %d mA (no iin)", fCurAvg);
++		} else {
++			charging = percent < 100;
++			snprintf(fWhy, sizeof(fWhy), "no current reading");
++		}
++	}
++	/* times: linear in the filtered current [I] */
++	const int32_t avg = curKnown ? fCurAvg : 0;
++	const uint32_t haveMah = (uint32_t)((uint64_t)NB_DESIGN_MAH * (uint32_t)(fSoc < 0 ? 0 : fSoc) / 10000u);
++	const uint32_t missMah = NB_DESIGN_MAH > haveMah ? NB_DESIGN_MAH - haveMah : 0;
++	fTtf = fTte = 0xffff;
++	if (charging && avg > NB_CUR_MA) {
++		uint64_t m = (uint64_t)missMah * 60u / (uint32_t)avg;
++		fTtf = m < 1 ? 1 : m > 0xfffe ? 0xfffe : (unsigned)m;
++	}
++	if (!external && avg < -NB_CUR_MA) {
++		uint64_t m = (uint64_t)haveMah * 60u / (uint32_t)(-avg);
++		fTte = m < 1 ? 1 : m > 0xfffe ? 0xfffe : (unsigned)m;
++	}
++	const uint64_t mw = (uint64_t)fAdMv * fAdMa / 1000u;
++	putNumber("NegroniChargeInputMilliwatts", external ? (UInt32)mw : 0);
++	putNumber("NegroniChargeFamilyCode", external ? fAdFamily : 0);
++	putString("NegroniChargeSource", pd ? "pd" : "vadc");
++	putString("NegroniChargeReason", fWhy);
++	/* one line on a change, else every NB_PLOG_POLLS full reads while plugged */
++	int key = (external ? 1 : 0) | (charging ? 2 : 0) | (full ? 4 : 0) | (pd ? 8 : 0);
++	fChgLogPolls++;
++	if (key != fChgLogKey || (external && fChgLogPolls >= NB_PLOG_POLLS)) {
++		fChgLogKey = key;
++		fChgLogPolls = 0;
++		IOLog("NEGRONI BATTERY: charge: %u%% external=%d charging=%d full=%d (%s) | adapter %umV %umA %u.%02uW family 0x%x (%s) | "
++		    "battery inst %dmA avg %s%dmA | to full %u min to empty %u min\n",
++		    percent, external, charging, full, fWhy, external ? fAdMv : 0, external ? fAdMa : 0,
++		    external ? (unsigned)(mw / 1000) : 0, external ? (unsigned)(mw % 1000 / 10) : 0,
++		    external ? fAdFamily : 0, fAdSrc, instMa, curKnown ? "" : "?", avg, fTtf, fTte);
++	}
++}
++
+ /* 0274: the charger PD state (bsd/dev/negroni_chg_glink.c) into fGlinkIcl and the registry. */
+ void
+ NegroniBattery::glinkStatus(void)
+@@ -1145,8 +1364,14 @@ NegroniBattery::poll(void)
+ 				int32_t mv = g.vbat_mv > 5000 ? g.vbat_mv / 2 : g.vbat_mv > 0 ? g.vbat_mv : 0;
+ 				IOLog("NEGRONI BATTERY: soc %d%% src=glink (no AP voltage; PD vbat %d mV status %d)\n",
+ 				    (fSoc + 50) / 100, g.vbat_mv, g.bstatus);
+-				publish((unsigned)((fSoc + 50) / 100), (unsigned)mv, 0, 2500, g.usb_online > 0, g.bstatus == 1,
+-				    g.bstatus == 4, NB_SRC_STATIC, s.usbMv, s.iinMa);
++				/* 0365 (review C3): the same charging state, adapter and times as the measured path */
++				const bool ext = g.usb_online > 0;
++				const unsigned pct = (unsigned)((fSoc + 50) / 100);
++				bool charging = false, full = false;
++				int instMa = 0;
++				chargeState(s, ext, false, 0, pct, (g.bstatus >= 1 && g.bstatus <= 4) ? g.bstatus : -1, charging, full,
++				    instMa);
++				publish(pct, (unsigned)mv, instMa, 2500, ext, charging, full, NB_SRC_STATIC, s.usbMv, s.iinMa);
+ 				return;
+ 			}
+ #endif
+@@ -1263,14 +1488,11 @@ NegroniBattery::poll(void)
+ 	storeSave(ns);                   /* 0278 */
+ 	/* Charging: the PD's status when it reports one; else the filtered current (no flicker between
+ 	 * the +78 mA and 0 mA polls of a cable that only holds the phone). */
+-	bool charging;
+-	if (glinkSoc >= 0 && glinkBstatus >= 1 && glinkBstatus <= 4) {
+-		full = glinkBstatus == 4 || (fSoc >= 10000 && glinkBstatus != 1);
+-		charging = glinkBstatus == 1 && !full;
+-	} else {
+-		full = external && fSoc >= 10000 && (!curKnown || fCurAvg < NB_FULL_MA);
+-		charging = external && !full && (curKnown ? fCurAvg > NB_CUR_MA : percent < 100);
+-	}
++	/* 0365: the charging state, the adapter and the times (chargeState()) */
++	bool charging = false;
++	int instMa = curKnown ? cur : 0;
++	chargeState(s, external, curKnown, cur, percent,
++	    (glinkSoc >= 0 && glinkBstatus >= 1 && glinkBstatus <= 4) ? glinkBstatus : -1, charging, full, instMa);
+ 	{
+ 		int key = (int)percent | (fSocSrc << 8) | ((target / 100) << 12);
+ 		if (key != fSocLogKey) {
+@@ -1305,7 +1527,7 @@ NegroniBattery::poll(void)
+ 	putNumber("NegroniChargerUsbinRtSts", s.usbRt);
+ 	putNumber("NegroniChargerIclMa", s.chgRead ? s.iclSts * fChgStep : 0);
+ 	putNumber("NegroniChargerPowerPath", s.powerPath);
+-	publish(percent, (unsigned)vbat, curKnown ? cur : 0, centiC, external, charging, full, source, s.usbMv, s.iinMa);
++	publish(percent, (unsigned)vbat, instMa, centiC, external, charging, full, source, s.usbMv, s.iinMa);
+ }
+ 
+ /*
+@@ -1411,6 +1633,25 @@ NegroniBattery::fastCheck(void)
+ 	}
+ 	uint64_t sinceMs = fFastNs && ns > fFastNs ? (ns - fFastNs) / 1000000ull : 0;
+ 	fFastNs = ns;
++#if NB_HAVE_GLINK
++	/* 0365 (review C2): a new PD cycle with a new BATT_STATUS runs the full read at once (the bolt follows in ~1 s) */
++	if (!known || ext == fExternal) {
++		negroni_chg_glink_status g;
++		if (negroni_chg_glink_get(&g) && g.up && g.ready && g.gen != fGlinkGen) {
++			fGlinkGen = g.gen;
++			if (g.bstatus != fGlinkBst) {
++				int was = fGlinkBst;
++				fGlinkBst = g.bstatus;
++				if (was != -1) {
++					IOLog("NEGRONI BATTERY: charge: PD status %d -> %d: full read now\n", was, g.bstatus);
++					fTicks = 0;
++					poll();
++				}
++			}
++		}
++		return;
++	}
++#endif
+ 	if (!known || ext == fExternal) {
+ 		return;
+ 	}
