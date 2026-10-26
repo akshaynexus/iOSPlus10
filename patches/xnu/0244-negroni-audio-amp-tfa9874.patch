@@ -1,0 +1,1545 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index bdbe8ef..308749c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,8 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/negroni_ufs.c			standard
++bsd/dev/negroni_audio_guard.c		standard
++bsd/dev/negroni_tfa.c			standard
+ bsd/dev/negroni_sample.c			standard
+ bsd/dev/negroni_keys.c			standard
+ bsd/dev/negroni_reboot.c		standard
+diff --git a/bsd/dev/negroni_audio.c b/bsd/dev/negroni_audio.c
+index 69539b7..79d455d 100644
+--- a/bsd/dev/negroni_audio.c
++++ b/bsd/dev/negroni_audio.c
+@@ -18,6 +18,14 @@
+  *             ADSP as phys | (SID 0x1801 & 0xf) << 32 (assumes the boot chain lets SID 0x1801 through
+  *             untranslated; no SMMU programming here), the WR EP media format, GRAPH_START
+  *  15  sink   enable /dev/negroni-audio; the write() path hands S16->S24 frames to the WR EP
++ *             (0244: through the speaker guard, negroni_audio_guard.c; with negroniaudio_amp=1 the
++ *             TFA9874 amps are probed here and started on the first non-silent block, stopped after
++ *             3 s of silence or on a fault: negroni_tfa.c)
++ *
++ * 0244 fixes: the TLMM GPIO registers are at 0x0f100000 + 0x1000 * n (pinctrl-sm8450.c; the
++ * touch/Wi-Fi/BT/camera code uses the same base); 0243 wrote 0x0f000000 + n * 0x1000, an unknown
++ * block, and left GPIO121..124 in GPIO function. Only the two 16 KiB pages of GPIO121..124 are mapped
++ * now (32 KiB of io_submap instead of 840 KiB, notes.md section 20).
+  *
+  * Addresses: live DT (apps-smmu@15000000, pinctrl@f000000, remoteproc-adsp). Protocol from Linux
+  * (qcom_glink_native.c, af_qrtr.c, ns.c, qcom_pd_mapper.c, apr.c, q6apm.c, q6prm.c, audioreach.c,
+@@ -43,6 +51,9 @@
+ #include <arm/caches_internal.h>
+ #include <libkern/libkern.h>
+ #include "negroni_adsp.h"
++#include "negroni_audio_guard.h"
++#include "negroni_tfa.h"
++#include <kern/thread.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+@@ -50,9 +61,10 @@ extern uint64_t kvtophys(vm_offset_t va);
+ extern void IOSleep(unsigned int ms);
+ 
+ /* ==== numbers from docs/audio-plan.md ==== */
+-#define TLMM_PHYS               0x0f000000UL     /* pinctrl@f000000 */
++#define TLMM_PHYS               0x0f100000UL     /* GPIO n control register at + n * 0x1000 (0244 fix) */
+ #define TLMM_PIN(n)             ((vm_offset_t)(n) * 0x1000)
+-#define TLMM_SIZE               (TLMM_PIN(210))
++#define I2S_PIN_FIRST           121u             /* mi2s2_sck 121, data0 122, ws 123, data1 124 */
++#define I2S_PIN(n)              (TLMM_PIN(n) - TLMM_PIN(I2S_PIN_FIRST))   /* offset from the GPIO121 mapping */
+ #define APPS_SMMU_PHYS          0x15000000UL
+ #define APPS_SMMU_SIZE          0x100000u
+ #define AUDIO_SID               0x1801u          /* <&apps_smmu 0x1801 0> */
+@@ -468,16 +480,20 @@ step_prm(void)
+ 	clock_on = true;
+ 	/* I2S pins 121..124 to function 1, 8 mA, no pull (output for the sink data on 124) */
+ 	if (tlmm == 0) {
+-		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
++		/* GPIO121..124 = 0xf179000..0xf17cfff: two 16 KiB pages (ml_io_map rounds) */
++		tlmm = ml_io_map(TLMM_PHYS + TLMM_PIN(I2S_PIN_FIRST), TLMM_PIN(4));
+ 	}
+ 	if (tlmm == 0) {
+ 		FAIL("no TLMM mapping");
+ 		return false;
+ 	}
+ 	for (unsigned p = 121; p <= 124; p++) {
+-		wr32(tlmm, (uint32_t)TLMM_PIN(p), 1u << 2 | 3u << 6);     /* FUNC_SEL 1 (mi2s2), DRV 8 mA, no pull */
++		wr32(tlmm, (uint32_t)I2S_PIN(p), 1u << 2 | 3u << 6);     /* FUNC_SEL 1 (mi2s2), DRV 8 mA, no pull */
+ 	}
+-	say("PRM clock up, I2S pins 121..124 to function 1");
++	say("PRM clock up, I2S pins 121..124 to function 1 (ctl %#x %#x %#x %#x at %#lx)",
++	    *(volatile uint32_t *)(tlmm + I2S_PIN(121)), *(volatile uint32_t *)(tlmm + I2S_PIN(122)),
++	    *(volatile uint32_t *)(tlmm + I2S_PIN(123)), *(volatile uint32_t *)(tlmm + I2S_PIN(124)),
++	    TLMM_PHYS + TLMM_PIN(I2S_PIN_FIRST));
+ 	return true;
+ }
+ 
+@@ -888,12 +904,101 @@ static uint32_t busy_drops;                     /* consecutive periods dropped a
+ static bool rebase_logged;
+ static uint64_t frames_in, frames_dropped, frames_played;       /* under audio_lock */
+ /*
+- * SET_VOLUME: `muted` is applied (zero samples). `volume_below` is stored but NOT applied yet: iOS
+- * keeps the D22 speaker in software volume, so the samples come scaled already (stage d note).
++ * SET_VOLUME (0244): `below` (1/8 dB) and `muted` go to the guard; the guard's cap is the 0 dB of
++ * the HAL volume. iOS keeps the D22 speaker in software volume, so the plug-in sends 0 dB normally.
+  */
+ static uint32_t volume_below, muted;
+ static lck_mtx_t *audio_lock;
+ static lck_grp_t *audio_grp;
++static lck_mtx_t *feed_lock;                    /* one feeder at a time (write(), the tone): guard + ring */
++
++/* ==== 0244: the guard and the amps ==== */
++#define SILENCE_PEAK            16u              /* |sample| <= 16 of 32768 (-66 dBFS) is silence */
++#define SILENCE_STOP_MS         3000u
++static uint32_t cap_db = 20;                    /* negroniaudio_capdb: the loudest sample, dB under full scale */
++static uint32_t audio_route = NEGRONI_TFA_ROUTE_SPEAKER;
++static volatile uint64_t last_sound;            /* mach_absolute_time of the last non-silent block */
++static uint64_t amp_retry_at;                   /* no new start attempt before (after a failed one) */
++static bool amps_probed, watch_started;
++static uint32_t amp_starts_ok, amp_starts_failed;
++
++static uint64_t
++ms_to_abs(uint32_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &t);
++	return t;
++}
++
++/* Start the amps for the current route if sound comes and they are off (feeder thread, no lock). */
++static void
++amps_on_sound(void)
++{
++	uint64_t now = mach_absolute_time();
++	int rc;
++
++	last_sound = now;
++	if (!amps_probed || negroni_tfa_playing() || !negroni_tfa_ready() || now < amp_retry_at) {
++		return;
++	}
++	rc = negroni_tfa_start(audio_route);
++	if (rc == 0) {
++		amp_starts_ok++;
++		ng_guard_ramp();
++		say("amps on (%s), guard cap -%u dBFS, clip monitor -%u/8 dB, start %u", audio_route == NEGRONI_TFA_ROUTE_RECEIVER ?
++		    "earpiece" : "speaker", ng_guard_cap_db(), ng_guard_monitor(), amp_starts_ok);
++	} else {
++		amp_starts_failed++;
++		amp_retry_at = now + ms_to_abs(2000);
++		if (amp_starts_failed <= 8) {
++			say("amp start failed (%d), next try in 2 s (%u failures)", rc, amp_starts_failed);
++		}
++	}
++}
++
++/* every 500 ms: the silence timer, every 1 s the amps' status (fault stop, clip monitor) */
++static void
++amp_watch(__unused void *arg, __unused wait_result_t wr)
++{
++	for (uint32_t tick = 0;; tick++) {
++		IOSleep(500);
++		if (!negroni_tfa_playing()) {
++			continue;
++		}
++		if (mach_absolute_time() - last_sound > ms_to_abs(SILENCE_STOP_MS)) {
++			negroni_tfa_stop("3 s of silence");
++			continue;
++		}
++		if (tick & 1) {
++			int rc = negroni_tfa_check(tick % 20 == 1);    /* a status line every 10 s */
++			if (rc == EAGAIN) {
++				ng_guard_monitor_add(8);
++				say("amp reports clipping: guard 1 dB lower (now -%u/8 dB)", ng_guard_monitor());
++			}
++		}
++	}
++}
++
++/* step 15 with negroniaudio_amp=1: probe (reset, revision, table); amps start on sound */
++static void
++amps_setup(void)
++{
++	thread_t th;
++
++	if (!negroni_tfa_wanted()) {
++		say("amps: negroniaudio_amp=0: no amp init (the I2S data reaches amps in power-down: silence)");
++		return;
++	}
++	if (negroni_tfa_probe() != 0) {
++		say("amps: probe failed: no sound (the sink still runs)");
++		return;
++	}
++	amps_probed = true;
++	if (!watch_started && kernel_thread_start(amp_watch, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		watch_started = true;
++	}
++}
+ 
+ /* send one period (PERIOD_BYTES at period index) to the WR EP as a DATA buffer */
+ /*
+@@ -938,36 +1043,26 @@ send_period(uint32_t idx)
+  * thread calls it). audio_lock serializes writers; it is not held across GLINK calls (gpr_rx runs
+  * under the GLINK lock).
+  */
+-static int
+-audio_write(dev_t dev, struct uio *uio, int ioflag)
++/* one frame (already through the guard, Q23) into the ring; a full period goes to the WR EP */
++static void
++sink_put(const int32_t q[2])
+ {
+-	(void)dev; (void)ioflag;
+-	int err = 0;
+-
+-	if (!sink_on || !graph_started) {
+-		return ENODEV;
+-	}
+-	while (uio_resid(uio) >= (user_ssize_t)4) {
+-		int16_t fr[2];                          /* one stereo S16 frame */
+-		int32_t *out;
+-		uint32_t idx;
+-		bool full, busy;
++	int32_t *out;
++	uint32_t idx;
++	bool full, busy;
+ 
+-		err = uiomove((caddr_t)fr, 4, uio);
+-		if (err) {
+-			break;
+-		}
++	{
+ 		lck_mtx_lock(audio_lock);
+ 		idx = ring_head;
+ 		out = (int32_t *)(void *)(ring_bytes() + (uint64_t)idx * PERIOD_BYTES);
+-		out[fill_frames * 2 + 0] = muted ? 0 : (int32_t)fr[0] << 8;      /* S16 -> S24 in 32-bit, Q23 */
+-		out[fill_frames * 2 + 1] = muted ? 0 : (int32_t)fr[1] << 8;
++		out[fill_frames * 2 + 0] = q[0];
++		out[fill_frames * 2 + 1] = q[1];
+ 		fill_frames++;
+ 		frames_in++;
+ 		full = fill_frames == PERIOD_FRAMES;
+ 		lck_mtx_unlock(audio_lock);
+ 		if (!full) {
+-			continue;
++			return;
+ 		}
+ 		negroni_glink_poll();                   /* take the DONE events (and RX_DONEs for our TX intents) */
+ 		lck_mtx_lock(audio_lock);
+@@ -993,7 +1088,7 @@ audio_write(dev_t dev, struct uio *uio, int ioflag)
+ 			busy_drops++;
+ 			frames_dropped += PERIOD_FRAMES;        /* keep ring_head: the slot is filled again */
+ 			lck_mtx_unlock(audio_lock);
+-			continue;
++			return;
+ 		}
+ 		busy_drops = 0;
+ 		clean_dcache((vm_offset_t)out, PERIOD_BYTES, FALSE);
+@@ -1010,6 +1105,49 @@ audio_write(dev_t dev, struct uio *uio, int ioflag)
+ 		}
+ 		lck_mtx_unlock(audio_lock);
+ 	}
++}
++
++/* n <= NG_GUARD_MAX_FRAMES S16 stereo frames: amps on sound, the guard, the ring (feed_lock held) */
++static void
++sink_feed(const int16_t *fr, uint32_t n)
++{
++	int32_t q[2 * NG_GUARD_MAX_FRAMES];
++	uint32_t peak = 0;
++
++	for (uint32_t i = 0; i < 2 * n; i++) {
++		uint32_t a = (uint32_t)(fr[i] < 0 ? -fr[i] : fr[i]);
++		peak = MAX(peak, a);
++	}
++	if (peak > SILENCE_PEAK && !muted) {
++		amps_on_sound();                        /* may take ~100 ms the first time (bit-banged I2C) */
++	}
++	(void)ng_guard_process(fr, q, n, audio_route == NEGRONI_TFA_ROUTE_RECEIVER);
++	for (uint32_t i = 0; i < n; i++) {
++		sink_put(&q[2 * i]);
++	}
++}
++
++static int
++audio_write(dev_t dev, struct uio *uio, int ioflag)
++{
++	(void)dev; (void)ioflag;
++	int16_t fr[2 * NG_GUARD_MAX_FRAMES];
++	int err = 0;
++
++	if (!sink_on || !graph_started) {
++		return ENODEV;
++	}
++	lck_mtx_lock(feed_lock);
++	while (uio_resid(uio) >= (user_ssize_t)4) {
++		uint32_t n = (uint32_t)MIN(uio_resid(uio) / 4, (user_ssize_t)NG_GUARD_MAX_FRAMES);
++
++		err = uiomove((caddr_t)fr, (int)(n * 4), uio);
++		if (err) {
++			break;
++		}
++		sink_feed(fr, n);
++	}
++	lck_mtx_unlock(feed_lock);
+ 	return err;
+ }
+ 
+@@ -1034,6 +1172,7 @@ audio_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
+ 		struct negroni_audio_volume *v = (void *)data;
+ 		volume_below = v->below;
+ 		muted = v->muted;
++		ng_guard_volume(volume_below, muted);
+ 		return 0;
+ 	}
+ 	case NEGRONI_AUDIO_GET_STATS: {
+@@ -1045,8 +1184,8 @@ audio_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
+ 		st->frames_played = frames_played;
+ 		st->state = !sink_on ? NEGRONI_AUDIO_STATE_NOSINK : graph_started ? NEGRONI_AUDIO_STATE_RUNNING :
+ 		    NEGRONI_AUDIO_STATE_IDLE;
+-		st->limiter_gain_q15 = 32768;
+ 		lck_mtx_unlock(audio_lock);
++		ng_guard_stats(&st->peak_in, &st->peak_out, &st->limiter_gain_q15);
+ 		return 0;
+ 	}
+ 	default:
+@@ -1078,6 +1217,7 @@ negroni_audio_init(void)
+ 	}
+ 	audio_grp = lck_grp_alloc_init("negroni_audio", LCK_GRP_ATTR_NULL);
+ 	audio_lock = lck_mtx_alloc_init(audio_grp, LCK_ATTR_NULL);
++	feed_lock = lck_mtx_alloc_init(audio_grp, LCK_ATTR_NULL);
+ 	audio_major = cdevsw_add(-1, &audio_cdevsw);
+ 	if (audio_major < 0) {
+ 		printf("NEGRONI AUDIO: cdevsw_add failed\n");
+@@ -1100,12 +1240,18 @@ step_sink(void)
+ 		return false;
+ 	}
+ 	(void)PE_parse_boot_argn("negroniaudio_v2", &data_v2, sizeof(data_v2));
++	(void)PE_parse_boot_argn("negroniaudio_capdb", &cap_db, sizeof(cap_db));
++	ng_guard_config(cap_db);
++	ng_guard_volume(volume_below, muted);
+ 	busy_drops = 0;
+ 	fill_frames = ring_head = 0;
+ 	periods_sent = os_atomic_load(&write_done_count, relaxed);
+ 	sink_on = true;
+ 	say("data buffers: %s", data_v2 ? "V2 0x0400100A (negroniaudio_v2=1)" : "V1 0x04001000");
++	say("guard: cap -%u dBFS (negroniaudio_capdb, >= %u), 200 Hz high-pass, power + peak limiter", ng_guard_cap_db(),
++	    NG_GUARD_MIN_CAP_DB);
+ 	say("THE SPEAKER SINK IS LIVE: write S16LE stereo 48 kHz to /dev/negroni-audio");
++	amps_setup();
+ 	return true;
+ }
+ 
+@@ -1155,6 +1301,7 @@ negroni_audio_stop(const char *reason)
+ {
+ 	step = 0;
+ 	say("audio stop: %s", reason ? reason : "");
++	negroni_tfa_stop("audio stop");                 /* before the I2S clock goes */
+ 	sink_on = false;
+ 	if (graph_started) {
+ 		(void)graph_mgmt(APM_CMD_GRAPH_STOP);
+diff --git a/bsd/dev/negroni_audio_guard.c b/bsd/dev/negroni_audio_guard.c
+new file mode 100644
+index 0000000..bdfd61e
+--- /dev/null
++++ b/bsd/dev/negroni_audio_guard.c
+@@ -0,0 +1,256 @@
++/*
++ * NEGRONI (SM8450) speaker guard (iOSPlus10 patch 0244): every sample on its way to the TFA9874
++ * amps goes through it, in place of the NXP protection algorithm that Android runs in the ADSP
++ * (module 0x1700B911 with V/I feedback). We have no feedback and no speaker model, so the guard
++ * works from the samples only. Model: hackios-xnu-kernel bsd/dev/redwood_guard.c (APSL 2.0); the
++ * structure and the Q30 tables follow it, the limits are ours.
++ *
++ * Order, per block:
++ *   gain     cap x volume: the cap (negroniaudio_capdb, default 20 dB under full scale, at least
++ *            10 dB) is the loudest any sample can be; the HAL volume (SET_VOLUME, 1/8 dB) and the
++ *            clip monitor (1 dB per clipping report of the amps, at most 12 dB) come on top
++ *   ramp     after an amp start the gain rises from 0 over 20 ms (no pop on a running signal)
++ *   high-pass 2nd-order Butterworth at 200 Hz (a phone speaker gives nothing below its resonance;
++ *            what it gets there only moves the cone and heats the coil)
++ *   power    two averages per channel, 0.2 s and 3 s; the gain goes down so that the 0.2 s power
++ *            stays at or under a full-scale sine at the cap and the 3 s power 3 dB under that
++ *   peaks    no sample above the cap: a limiter that acts at the sample and lets go in 43 ms
++ *   route    the earpiece plays the left slot only (0x34): left = (L + R) / 2, right = 0
++ * Output: S24 in 32-bit (Q23), the WR EP format. Integer math only. One caller at a time (the
++ * sink, under audio_lock); the volume/monitor setters may run on other threads.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "negroni_audio_guard.h"
++
++#define ONE             (1ll << 30)
++#define RMS_FRAMES      9600            /* 0.2 s */
++#define FAST_FRAMES     144000          /* 3 s */
++#define RELEASE_SHIFT   11              /* 2048 frames, 43 ms */
++#define RAMP_FRAMES     960             /* 20 ms */
++
++/* 10^(-n/160), n = 0..47, Q30: n eighths of a dB as an amplitude factor (redwood_guard.c) */
++static const uint32_t eighths[48] = {
++	1073741824, 1058400094, 1043277569, 1028371116, 1013677647, 999194121, 984917536, 970844937, 956973408, 943300077,
++	929822112, 916536722, 903441154, 890532697, 877808678, 865266461, 852903448, 840717079, 828704830, 816864213,
++	805192776, 793688102, 782347808, 771169545, 760150998, 749289885, 738583957, 728030996, 717628817, 707375265,
++	697268218, 687305580, 677485290, 667805313, 658263644, 648858308, 639587356, 630448869, 621440953, 612561743,
++	603809400, 595182112, 586678091, 578295576, 570032831, 561888146, 553859832, 545946228,
++};
++#define SIX_DB          538145694       /* 10^(-6/20), Q30 */
++
++/* 200 Hz high-pass at 48 kHz, Q = 1/sqrt(2) (RBJ cookbook), Q30: b0, b1, b2, a1, a2 */
++static const int64_t hpf_b0 = 1054047540, hpf_b1 = -2108095079, hpf_b2 = 1054047540;
++static const int64_t hpf_a1 = -2107733822, hpf_a2 = 1034714513;
++
++static struct {
++	uint64_t cap;                   /* Q30 amplitude of the cap */
++	uint32_t cap_eighths;
++	volatile uint32_t below;        /* HAL volume, eighths of a dB */
++	volatile uint32_t muted;
++	volatile uint32_t monitor;      /* clip monitor, eighths of a dB */
++	volatile uint32_t ramp;         /* frames left in the soft start */
++	int64_t x1[2], x2[2], y1[2], y2[2];     /* filter state, 1/256 of a full-scale-16-bit sample */
++	uint64_t rms[2], fast[2];       /* Q30 of full-scale square power */
++	uint64_t level;                 /* the power gain at the end of the last block, Q30 */
++	uint64_t envelope;              /* the peak limiter, 1/65536 of a sample */
++	uint32_t peak_in, peak_out;     /* since the last stats call */
++	uint32_t least_gain_q15;
++} g = { .cap_eighths = 160, .level = ONE, .least_gain_q15 = 32768 };
++
++static uint64_t
++amplitude(uint32_t n)
++{
++	uint64_t v = eighths[n % 48];
++
++	for (uint32_t i = 0; i < n / 48 && v != 0; i++) {
++		v = v * SIX_DB >> 30;
++	}
++	return v;
++}
++
++static uint64_t
++isqrt(uint64_t value)
++{
++	uint64_t root = 0, bit = 1ull << 62;
++
++	while (bit > value) {
++		bit >>= 2;
++	}
++	while (bit != 0) {
++		if (value >= root + bit) {
++			value -= root + bit;
++			root = (root >> 1) + bit;
++		} else {
++			root >>= 1;
++		}
++		bit >>= 2;
++	}
++	return root;
++}
++
++static uint64_t
++headroom(uint64_t power, uint64_t limit)
++{
++	return power <= limit ? (uint64_t)ONE : (limit << 30) / power;
++}
++
++void
++ng_guard_config(uint32_t cap_db)
++{
++	cap_db = MIN(MAX(cap_db, NG_GUARD_MIN_CAP_DB), 60u);
++	g.cap_eighths = cap_db * 8;
++	g.cap = amplitude(g.cap_eighths);
++	bzero(g.x1, sizeof(g.x1));
++	bzero(g.x2, sizeof(g.x2));
++	bzero(g.y1, sizeof(g.y1));
++	bzero(g.y2, sizeof(g.y2));
++	bzero(g.rms, sizeof(g.rms));
++	bzero(g.fast, sizeof(g.fast));
++	g.level = ONE;
++	g.envelope = 0;
++}
++
++uint32_t
++ng_guard_cap_db(void)
++{
++	return g.cap_eighths / 8;
++}
++
++void
++ng_guard_volume(uint32_t below, uint32_t muted)
++{
++	g.below = MIN(below, 96u * 8);
++	g.muted = muted;
++}
++
++void
++ng_guard_monitor_add(uint32_t eighths_more)
++{
++	g.monitor = MIN(g.monitor + eighths_more, 12u * 8);
++}
++
++uint32_t
++ng_guard_monitor(void)
++{
++	return g.monitor;
++}
++
++void
++ng_guard_ramp(void)
++{
++	g.ramp = RAMP_FRAMES;
++}
++
++void
++ng_guard_stats(uint32_t *peak_in, uint32_t *peak_out, uint32_t *least_gain_q15)
++{
++	*peak_in = g.peak_in;
++	*peak_out = g.peak_out;
++	*least_gain_q15 = g.least_gain_q15;
++	g.peak_in = g.peak_out = 0;
++	g.least_gain_q15 = 32768;
++}
++
++/*
++ * count <= NG_GUARD_MAX_FRAMES stereo S16 frames in, Q23 frames out. Returns the block's input peak
++ * (|sample|, 0..32768) for the silence timer.
++ */
++uint32_t
++ng_guard_process(const int16_t *in, int32_t *out, uint32_t count, bool receiver)
++{
++	static int32_t work[2 * NG_GUARD_MAX_FRAMES];   /* 1/256 of a 16-bit sample */
++	uint64_t pre, sum[2] = { 0, 0 }, g2 = ONE, gain_now, start = g.level, ceiling;
++	uint32_t peak = 0;
++
++	if (count == 0 || count > NG_GUARD_MAX_FRAMES) {
++		return 0;
++	}
++	/* the gain before everything: cap x volume x monitor (Q30) */
++	pre = g.muted ? 0 : g.cap * amplitude(g.below + g.monitor) >> 30;
++	for (uint32_t i = 0; i < 2 * count; i++) {
++		unsigned c = i & 1;
++		int64_t x, y;
++		int32_t s = in[i];
++		uint32_t a = (uint32_t)(s < 0 ? -s : s);
++
++		if (receiver) {
++			s = c == 0 ? (in[i] + in[i + 1]) / 2 : 0;
++		}
++		peak = MAX(peak, a);
++		x = (int64_t)s * (int64_t)pre >> 22;            /* 1/256 of a sample */
++		y = (hpf_b0 * x + hpf_b1 * g.x1[c] + hpf_b2 * g.x2[c] - hpf_a1 * g.y1[c] - hpf_a2 * g.y2[c]) >> 30;
++		g.x2[c] = g.x1[c];
++		g.x1[c] = x;
++		g.y2[c] = g.y1[c];
++		g.y1[c] = y;
++		work[i] = (int32_t)y;
++		{
++			int64_t w = y >> 8;                     /* back to 16-bit units for the power */
++			sum[c] += (uint64_t)(w * w);
++		}
++	}
++	g.peak_in = MAX(g.peak_in, peak);
++	/* power: 0.2 s average <= a full-scale sine at the cap (half a square's power), 3 s 3 dB under */
++	{
++		uint64_t cap2 = g.cap * g.cap >> 30;            /* the cap's power, Q30 of a square at full scale */
++		uint64_t lim_rms = cap2 / 2, lim_fast = cap2 / 4;
++		for (unsigned c = 0; c < 2; c++) {
++			uint64_t power = (sum[c] / count << 30) / (32768ull * 32768ull), h;
++			g.rms[c] = (uint64_t)((int64_t)g.rms[c] + ((int64_t)power - (int64_t)g.rms[c]) * (int64_t)count / RMS_FRAMES);
++			g.fast[c] = (uint64_t)((int64_t)g.fast[c] + ((int64_t)power - (int64_t)g.fast[c]) * (int64_t)count / FAST_FRAMES);
++			if ((h = headroom(g.rms[c], lim_rms)) < g2) {
++				g2 = h;
++			}
++			if ((h = headroom(g.fast[c], lim_fast)) < g2) {
++				g2 = h;
++			}
++		}
++	}
++	gain_now = isqrt(g2 << 30);
++	if (gain_now > (uint64_t)ONE) {
++		gain_now = ONE;
++	}
++	/* peaks: no sample above the cap (in 1/256-sample units: 32767 * 256 * cap) */
++	ceiling = (32767ull * 256 * g.cap) >> 30;
++	for (uint32_t f = 0; f < count; f++) {
++		uint64_t gain = (uint64_t)((int64_t)start + ((int64_t)gain_now - (int64_t)start) * (int64_t)(f + 1) / (int64_t)count);
++		uint64_t level, pg = 65536;
++		int64_t y[2];
++
++		if (g.ramp) {
++			gain = gain * (RAMP_FRAMES - g.ramp) / RAMP_FRAMES;
++			g.ramp--;
++		}
++		for (unsigned c = 0; c < 2; c++) {
++			y[c] = (int64_t)work[2 * f + c] * (int64_t)gain >> 30;
++		}
++		level = (uint64_t)MAX(y[0] < 0 ? -y[0] : y[0], y[1] < 0 ? -y[1] : y[1]);
++		g.envelope -= g.envelope >> RELEASE_SHIFT;
++		if (level << 16 > g.envelope) {
++			g.envelope = level << 16;
++		}
++		if (ceiling && g.envelope > ceiling << 16) {
++			pg = (ceiling << 32) / g.envelope;
++		}
++		if ((uint32_t)(gain >> 15) * pg / 65536 < g.least_gain_q15) {
++			g.least_gain_q15 = (uint32_t)((gain >> 15) * pg / 65536);
++		}
++		for (unsigned c = 0; c < 2; c++) {
++			int64_t o = y[c] * (int64_t)pg >> 16;   /* 1/256 of a 16-bit sample = Q23 / 1 (2^8 x 2^15) */
++			uint32_t mag;
++			if (o > (int64_t)ceiling) {      /* signed compare: a negative sample stays negative */
++				o = (int64_t)ceiling;
++			} else if (o < -(int64_t)ceiling) {
++				o = -(int64_t)ceiling;
++			}
++			out[2 * f + c] = (int32_t)o;            /* 1/256 of S16 = S24 units */
++			mag = (uint32_t)((o < 0 ? -o : o) >> 8);
++			g.peak_out = MAX(g.peak_out, mag);
++		}
++	}
++	g.level = gain_now;
++	return peak;
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_audio_guard.h b/bsd/dev/negroni_audio_guard.h
+new file mode 100644
+index 0000000..b56532c
+--- /dev/null
++++ b/bsd/dev/negroni_audio_guard.h
+@@ -0,0 +1,23 @@
++/*
++ * NEGRONI speaker guard (negroni_audio_guard.c, iOSPlus10 patch 0244): gain cap, volume, soft
++ * start, 200 Hz high-pass, power and peak limiter. S16 stereo in, S24-in-32 (Q23) stereo out.
++ */
++#ifndef _NEGRONI_AUDIO_GUARD_H_
++#define _NEGRONI_AUDIO_GUARD_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define NG_GUARD_MAX_FRAMES     256u
++#define NG_GUARD_MIN_CAP_DB     10u     /* the cap can not go closer to full scale than this */
++
++void ng_guard_config(uint32_t cap_db);                  /* also resets the filter and averages */
++uint32_t ng_guard_cap_db(void);
++void ng_guard_volume(uint32_t below_eighths, uint32_t muted);
++void ng_guard_monitor_add(uint32_t eighths);
++uint32_t ng_guard_monitor(void);
++void ng_guard_ramp(void);                               /* soft start over 20 ms */
++uint32_t ng_guard_process(const int16_t *in, int32_t *out, uint32_t count, bool receiver);
++void ng_guard_stats(uint32_t *peak_in, uint32_t *peak_out, uint32_t *least_gain_q15);
++
++#endif
+diff --git a/bsd/dev/negroni_tfa.c b/bsd/dev/negroni_tfa.c
+new file mode 100644
+index 0000000..063d2f5
+--- /dev/null
++++ b/bsd/dev/negroni_tfa.c
+@@ -0,0 +1,834 @@
++/*
++ * NEGRONI (SM8450) speaker/earpiece amplifiers: 2x NXP TFA9874 (iOSPlus10 patch 0244, docs/audio-plan.md
++ * stage (c)). UNTESTED ON HARDWARE. Off by default: boot-arg negroniaudio_amp=1.
++ *
++ * Hardware (live DT i2c@a94000, tfa98xx@34/@35; odm resourcemanager.xml; mixer_paths.xml):
++ *   I2C     QUP SE13 pins GPIO48 SDA / GPIO49 SCL. We bit-bang them (the touch driver's tlmm_i2c.h,
++ *           ~100 kHz, internal pull-ups as the DT's qupv3_se13_i2c_active); no GENI programming.
++ *   amps    0x34 (tfa_channel 0, reset GPIO50) and 0x35 (channel 1, reset GPIO51), VDD pm8350_s10
++ *           1.8 V (always on). Reset is active-high: 1, 5 ms, 0, 5 ms (tfa98xx_v6.c tfa98xx_ext_reset).
++ *   data    I2S slave on TERT MI2S (SD1 = GPIO124), 48 kHz, 32-bit slots: 0x34 plays slot 0 (left),
++ *           0x35 slot 1 (right) (container TDMSPKS 0 / 1).
++ *   routes  speaker  = both amps, profile "speaker" (mixer path "speaker": TFA_CHIP_SELECTOR 3)
++ *           earpiece = 0x34 only, profile "receiver" (mixer path "handset": TFA_CHIP_SELECTOR 1 =
++ *                      CHIP_SELECTOR_LEFT = channel 0 = 0x34)
++ *
++ * The TFA9874 has no DSP ("non-DSP TFA", is_probus_device). Register writes alone start it. The
++ * sequence is the vendor driver's cold start (tfa98xx-v6: tfa_dev_start -> tfaRunSpeakerBoost_v6 ->
++ * tfaRunStartup_v6 -> tfa98xx_init_v6 + tfa9874_specific, tfaContWriteRegsDev, tfaContWriteRegsProf,
++ * tfa_dev_set_state INIT_CF, tfaRunStartDSP_v6, tfa_dev_set_state OPERATING), read for the
++ * register values; our own code:
++ *   1 read AUDFS (0x02[3:0]) and FRACTDEL (0x02[10:5])
++ *   2 I2CR: reg 0x00 = 0x0002 (all registers to POR); RST (reg 0x90 bit 0) = 1
++ *   3 keys: 0x0F = 0x5A6B, read 0xFB, 0xA0 = 0xFB ^ 0x005A; key2: 0x0F = 0x5A6B, 0xA1 = 0x005A, 0x0F = 0
++ *   4 the revision table (0x0a74, 0x0b74, 0x0c74; tfa_init_v6.c tfa9874_specific)
++ *   5 AUDFS, FRACTDEL back
++ *   6 the container's device items, then the profile items up to its "default" marker
++ *     (tfa-init.bin, made by scripts/audio/tfa-cnt.py from odm/firmware/tfa98xx.cnt; read from the
++ *     ADSP firmware area, SHA-256 checked; vendor data, not in git)
++ *   7 INIT_CF: MANSCONF (0x01 bit 2) = 1, PWDN (0x00 bit 0) = 0, wait CLKS (0x11 bit 7)
++ *   8 RST = 0 (tfaRunStartDSP_v6; the container's patch "9874_dummy.patch" has no writes)
++ *   9 SWPROFIL (0xEE) = profile + 1, SWVSTEP (0xEF) = 1
++ *  10 OPERATING: PWDN 0, MANSCONF 1, AMPE (0x00 bit 3) = 1
++ * Stop (tfa_dev_stop): PWDN 1, AMPE 0, wait MANSTATE (0x14[6:3]) = 0.
++ * Deviations [I]: the vendor also writes DSP memory (XMEM 512 = 0 through regs 0x90-0x92) in
++ * tfaRunStartDSP_v6; the TFA9874 has no DSP and no such registers in its field map: left out.
++ *
++ * SAFETY (speaker damage). Android runs NXP's protection algorithm in the ADSP (module 0x1700B911,
++ * libtfadsp_rx.so, with V/I feedback on TERT MI2S TX); we do not. What protects the speakers here:
++ *   - TDMSPKG (0x61[9:6]) is an ATTENUATION: gain = 21 dB - TDMSPKG (TFA9874B/TFA9875 data sheet:
++ *     G(TDM-VO) 6..21 dB, 1 dB per code; INPLEV = "TDM output attenuation"). It is held at or ABOVE a
++ *     floor: route speaker at negroniaudio_spkg (default 9 = 12 dB; the container has 7 = 14 dB on 0x34,
++ *     5 = 16 dB on 0x35), route receiver at negroniaudio_rcvg (default 15 = 6 dB, with INPLEV 1 about
++ *     0 dB; the container has 13 = 8 dB, INPLEV 1). Never below the container value (never louder than
++ *     the vendor); read back before AMPE, else no start;
++ *   - the kernel guard in negroni_audio.c (gain cap -20 dBFS by default, high-pass, power and peak
++ *     limiter, silence timer, fault stop);
++ *   - the status registers (vendor check, tfa98xx_v6.c check_err_tfa9874): 0x10 bit 2 = 0 over-
++ *     temperature, bit 3 = 1 over-current, bit 4 = 0 VBAT low, bit 7 = 1 no clock; 0x13 bit 8 = 0 VBAT
++ *     high, bit 9 = 1 clipping. A fault stops the amps and blocks a restart for 10 s;
++ *   - panic/halt: AMPE 0 + PWDN 1, then both reset pins held high (negroni_tfa_panic);
++ *   - MTP (0xF0..0xFF, the factory calibration) is read only; the table loader refuses writes to it.
++ * Log prefix "NEGRONI TFA:".
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <libkern/crypto/sha2.h>
++#include "negroni_touch/tlmm_i2c.h"
++#include "negroni_tfa.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void IOSleep(unsigned int ms);
++extern int negroni_ufs_adsp_area_read(uint64_t at, void *dst, uint32_t count);
++
++#define TFA_TLMM_PHYS           0x0f100000UL     /* GPIO n control at + n * 0x1000 (pinctrl-sm8450.c) */
++#define TFA_PIN_FIRST           48u              /* 48 SDA, 49 SCL, 50 reset 0x34, 51 reset 0x35: one 16 KiB page */
++#define TFA_PIN_OFF(n)          (((n) - TFA_PIN_FIRST) * 0x1000u)
++
++/* bitfields: address << 8 | pos << 4 | (len - 1) (tfa9874_tfafieldnames.h) */
++#define BF_PWDN                 0x0000u
++#define BF_I2CR                 0x0010u
++#define BF_AMPE                 0x0030u
++#define BF_MANSCONF             0x0120u
++#define BF_AUDFS                0x0203u
++#define BF_FRACTDEL             0x0255u
++#define BF_CLKS                 0x1170u
++#define BF_MANSTATE             0x1433u
++#define BF_TDMSPKG              0x6163u
++#define BF_INPLEV               0x0240u
++#define BF_RST                  0x9000u          /* TFA2 family RST: the vendor sets it for every family-2 chip */
++#define REG_SWPROFIL            0xEEu
++#define REG_SWVSTEP             0xEFu
++
++/* tfa-init.bin (scripts/audio/tfa-cnt.py) */
++#define TBL_NAME                "tfa-init.bin"
++#define TBL_MAX                 16384u
++#define TBL_MAX_PROF            8u
++struct tbl_rec {
++	uint8_t i2c, prof, kind, reg;
++	uint16_t field, value, mask, pad;
++} __attribute__((packed));
++#define REC_DEVICE              0xffu
++#define KIND_BF                 1u
++#define KIND_REG                2u
++
++/* the ADSP firmware area header (scripts/audio/mkadsparea.py, negroni_adsp.c) */
++#define AREA_HEADER             8192u
++#define AREA_MAX                64u
++struct area_entry {
++	char name[48];
++	uint32_t offset, size;
++	uint8_t sha256[32];
++};
++
++struct amp {
++	uint8_t addr, rst_pin;
++	const char *where;
++	bool present, playing;
++	uint16_t rev;
++	uint16_t spkg_container[TBL_MAX_PROF];  /* TDMSPKG the container sets per profile (0xffff: none) */
++};
++static struct amp amps[2] = {
++	{ .addr = 0x34, .rst_pin = 50, .where = "top (earpiece, left)" },
++	{ .addr = 0x35, .rst_pin = 51, .where = "bottom (right)" },
++};
++
++static uint32_t amp_on, spkg_floor = 9, rcvg_floor = 15, verbose_starts = 1;
++#define SPKG_DB(v)              (21 - (int)(v))  /* TDMSPKG -> amplifier gain in dB (data sheet) */
++static vm_offset_t pins;                         /* GPIO48 control register */
++static struct tlmm_i2c line;
++static struct gpio_i2c bus;
++static uint8_t *tbl;                            /* tfa-init.bin */
++static uint32_t tbl_nprof, tbl_nrec;
++static const struct tbl_rec *recs;
++static char prof_names[TBL_MAX_PROF][16];
++static int prof_speaker = -1, prof_receiver = -1;
++static bool probed;
++static uint32_t cur_route;
++static uint64_t fault_until;                    /* mach_absolute_time: no restart before */
++static uint32_t starts, faults;
++static bool logging;                            /* this start logs every write */
++
++static LCK_GRP_DECLARE(negroni_tfa_grp, "negroni_tfa");
++static LCK_MTX_DECLARE(negroni_tfa_lock, &negroni_tfa_grp);
++
++#define say(fmt, ...) printf("NEGRONI TFA: " fmt "\n", ##__VA_ARGS__)
++
++static void
++tfa_udelay(unsigned us)
++{
++	delay((int)us);
++}
++
++/* ==== I2C (8-bit register, 16-bit value, MSB first; reads with a repeated start, as regmap) ==== */
++
++static int
++i2c_wr(uint8_t a, uint8_t reg, uint16_t v)
++{
++	uint8_t b[3] = { reg, (uint8_t)(v >> 8), (uint8_t)v };
++	int rc = -1;
++
++	for (int t = 0; t < 3 && rc != 0; t++) {        /* I2C_RETRIES 3 in tfa98xx_v6.c */
++		rc = gpio_i2c_write(&bus, a, b, 3);
++		if (rc != 0) {
++			IOSleep(1);
++		}
++	}
++	return rc;
++}
++
++static int
++i2c_rd_once(uint8_t a, uint8_t reg, uint16_t *v)
++{
++	uint8_t b[2] = { 0, 0 };
++	int rc = gi_start(&bus, a, 0);
++
++	if (rc == 0) {
++		rc = gi_byte(&bus, reg);
++	}
++	if (rc == 0) {
++		rc = gi_start(&bus, a, 1);              /* repeated start */
++	}
++	for (uint32_t i = 0; rc == 0 && i < 2; i++) {
++		uint8_t x = 0;
++		bus.sda(bus.ctx, 1);
++		for (unsigned bit = 0; bit < 8; bit++) {
++			rc = gi_high(&bus);
++			if (rc) {
++				break;
++			}
++			x = (uint8_t)((x << 1) | !!bus.get_sda(bus.ctx));
++			gi_low(&bus);
++		}
++		if (rc) {
++			break;
++		}
++		b[i] = x;
++		bus.sda(bus.ctx, i == 1);               /* ACK the first byte, NACK the last */
++		bus.delay(5);
++		rc = gi_high(&bus);
++		gi_low(&bus);
++		bus.sda(bus.ctx, 1);
++	}
++	int stop = gi_stop(&bus);
++	if (rc == 0) {
++		rc = stop;
++	}
++	*v = (uint16_t)(b[0] << 8 | b[1]);
++	return rc;
++}
++
++static int
++i2c_rd(uint8_t a, uint8_t reg, uint16_t *v)
++{
++	int rc = -1;
++
++	for (int t = 0; t < 3 && rc != 0; t++) {
++		rc = i2c_rd_once(a, reg, v);
++		if (rc != 0) {
++			IOSleep(1);
++		}
++	}
++	return rc;
++}
++
++static int writes_logged;
++
++static int
++reg_wr(struct amp *m, uint8_t reg, uint16_t v, const char *what)
++{
++	int rc = i2c_wr(m->addr, reg, v);
++
++	if (logging || rc) {
++		if (writes_logged++ < 400 || rc) {
++			say("%#x W %#04x = %#06x (%s)%s", m->addr, reg, v, what, rc ? " FAILED" : "");
++		}
++	}
++	return rc;
++}
++
++static int
++bf_get(struct amp *m, uint16_t bf, uint16_t *v)
++{
++	uint16_t r;
++	uint32_t pos = (bf >> 4) & 15u, len = (bf & 15u) + 1;
++	int rc = i2c_rd(m->addr, (uint8_t)(bf >> 8), &r);
++
++	*v = rc ? 0 : (uint16_t)((r >> pos) & ((1u << len) - 1));
++	return rc;
++}
++
++/* tfa_set_bf_v6: read, change the field, write when different */
++static int
++bf_set(struct amp *m, uint16_t bf, uint16_t value, const char *what)
++{
++	uint16_t r, n, msk;
++	uint32_t pos = (bf >> 4) & 15u, len = (bf & 15u) + 1;
++	int rc = i2c_rd(m->addr, (uint8_t)(bf >> 8), &r);
++
++	if (rc) {
++		say("%#x read %#04x for %s FAILED (%d)", m->addr, bf >> 8, what, rc);
++		return rc;
++	}
++	msk = (uint16_t)(((1u << len) - 1) << pos);
++	n = (uint16_t)((r & ~msk) | ((uint32_t)value << pos & msk));
++	return n == r ? 0 : reg_wr(m, (uint8_t)(bf >> 8), n, what);
++}
++
++/* ==== pins ==== */
++
++static void
++pin_out(unsigned pin, int high)
++{
++	volatile uint8_t *p = (volatile uint8_t *)pins;
++
++	*(volatile uint32_t *)(p + TFA_PIN_OFF(pin) + 4) = high ? TLMM_OUT : 0;
++	*(volatile uint32_t *)(p + TFA_PIN_OFF(pin)) = TLMM_FUNC(0) | TLMM_DRIVE_MA(2) | TLMM_PULL_NONE | TLMM_OE;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* ==== the container table ==== */
++
++static int
++table_load(void)
++{
++	vm_offset_t h = 0, t = 0;
++	const struct area_entry *e = NULL;
++	uint32_t count;
++	SHA256_CTX ctx;
++	uint8_t digest[32];
++	int err = ENOENT;
++
++	if (kmem_alloc(kernel_map, &h, AREA_HEADER, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	if (negroni_ufs_adsp_area_read(0, (void *)h, AREA_HEADER) != 0 || memcmp((void *)h, "NEGRADSP", 8) != 0) {
++		say("no ADSP firmware area (scripts/audio/mkadsparea.py + dd)");
++		goto out;
++	}
++	memcpy(&count, (uint8_t *)h + 12, 4);
++	for (uint32_t i = 0; i < MIN(count, AREA_MAX); i++) {
++		const struct area_entry *x = (const struct area_entry *)(h + 16 + i * sizeof(struct area_entry));
++		if (strncmp(x->name, TBL_NAME, sizeof(x->name)) == 0) {
++			e = x;
++		}
++	}
++	if (e == NULL || e->size < 16 || e->size > TBL_MAX) {
++		say("no %s in the ADSP area (scripts/audio/tfa-cnt.py bin, then mkadsparea.py)", TBL_NAME);
++		goto out;
++	}
++	if (kmem_alloc(kernel_map, &t, TBL_MAX, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		err = ENOMEM;
++		goto out;
++	}
++	if (negroni_ufs_adsp_area_read(e->offset, (void *)t, e->size) != 0) {
++		say("%s: read failed", TBL_NAME);
++		err = EIO;
++		goto out;
++	}
++	SHA256_Init(&ctx);
++	SHA256_Update(&ctx, (void *)t, e->size);
++	SHA256_Final(digest, &ctx);
++	if (memcmp(digest, e->sha256, 32) != 0) {
++		say("%s: SHA-256 mismatch", TBL_NAME);
++		err = EIO;
++		goto out;
++	}
++	{
++		const uint8_t *b = (const uint8_t *)t;
++		uint32_t ver, np, nr;
++		memcpy(&ver, b + 4, 4);
++		memcpy(&np, b + 8, 4);
++		memcpy(&nr, b + 12, 4);
++		if (memcmp(b, "NTFA", 4) != 0 || ver != 1 || np == 0 || np > TBL_MAX_PROF ||
++		    16 + np * 16 + (uint64_t)nr * sizeof(struct tbl_rec) > e->size) {
++			say("%s: bad header (version %u, %u profiles, %u records)", TBL_NAME, ver, np, nr);
++			err = EINVAL;
++			goto out;
++		}
++		for (uint32_t i = 0; i < np; i++) {
++			memcpy(prof_names[i], b + 16 + i * 16, 16);
++			prof_names[i][15] = 0;
++			if (strcmp(prof_names[i], "speaker") == 0) {
++				prof_speaker = (int)i;
++			} else if (strcmp(prof_names[i], "receiver") == 0) {
++				prof_receiver = (int)i;
++			}
++		}
++		recs = (const struct tbl_rec *)(b + 16 + np * 16);
++		for (uint32_t i = 0; i < nr; i++) {
++			const struct tbl_rec *r = &recs[i];
++			uint8_t reg = r->kind == KIND_BF ? (uint8_t)(r->field >> 8) : r->reg;
++			if ((r->i2c != 0x34 && r->i2c != 0x35) || (r->prof != REC_DEVICE && r->prof >= np) ||
++			    (r->kind != KIND_BF && r->kind != KIND_REG) || reg >= 0xF0 ||
++			    (r->kind == KIND_BF && (r->field == BF_PWDN || r->field == BF_AMPE || r->field == BF_I2CR))) {
++				/* no MTP writes; power state stays ours (only "calibrate.cal" sets AMPE: never used) */
++				if (r->prof == (uint8_t)prof_speaker || r->prof == (uint8_t)prof_receiver || r->prof == REC_DEVICE) {
++					say("%s: record %u (i2c %#x, profile %u, kind %u, reg %#x) refused", TBL_NAME, i, r->i2c,
++					    r->prof, r->kind, reg);
++					err = EINVAL;
++					goto out;
++				}
++			}
++			if (r->kind == KIND_BF && r->field == BF_TDMSPKG && r->prof != REC_DEVICE) {
++				amps[r->i2c - 0x34].spkg_container[r->prof] = r->value;
++			}
++		}
++		/* the device-level TDMSPKG is the profile's value when the profile has none before "default" */
++		for (uint32_t i = 0; i < nr; i++) {
++			const struct tbl_rec *r = &recs[i];
++			if (r->kind == KIND_BF && r->field == BF_TDMSPKG && r->prof == REC_DEVICE) {
++				for (uint32_t p = 0; p < np; p++) {
++					if (amps[r->i2c - 0x34].spkg_container[p] == 0xffff) {
++						amps[r->i2c - 0x34].spkg_container[p] = r->value;
++					}
++				}
++			}
++		}
++		tbl_nprof = np;
++		tbl_nrec = nr;
++	}
++	tbl = (uint8_t *)t;
++	t = 0;
++	err = 0;
++	say("%s: %u profiles, %u register writes; speaker profile %d, receiver profile %d", TBL_NAME, tbl_nprof,
++	    tbl_nrec, prof_speaker, prof_receiver);
++out:
++	if (t) {
++		kmem_free(kernel_map, t, TBL_MAX);
++	}
++	kmem_free(kernel_map, h, AREA_HEADER);
++	return err;
++}
++
++/* ==== probe ==== */
++
++bool
++negroni_tfa_wanted(void)
++{
++	static bool parsed;
++	if (!parsed) {
++		parsed = true;
++		(void)PE_parse_boot_argn("negroniaudio_amp", &amp_on, sizeof(amp_on));
++		(void)PE_parse_boot_argn("negroniaudio_spkg", &spkg_floor, sizeof(spkg_floor));
++		(void)PE_parse_boot_argn("negroniaudio_rcvg", &rcvg_floor, sizeof(rcvg_floor));
++		(void)PE_parse_boot_argn("negroniaudio_amplog", &verbose_starts, sizeof(verbose_starts));
++		/* a floor below the container value is refused at start (the container value is kept, logged) */
++		spkg_floor = MIN(spkg_floor, 15u);
++		rcvg_floor = MIN(rcvg_floor, 15u);
++	}
++	return amp_on != 0;
++}
++
++static const char *
++rev_name(uint16_t rev)
++{
++	switch (rev) {
++	case 0x0a74: return "0x0a74 (initial, table V25)";
++	case 0x0b74: return "0x0b74 (table V1.6)";
++	case 0x0c74: return "0x0c74";
++	default: return "unknown";
++	}
++}
++
++int
++negroni_tfa_probe(void)
++{
++	int found = 0;
++
++	if (!negroni_tfa_wanted()) {
++		return ENODEV;
++	}
++	lck_mtx_lock(&negroni_tfa_lock);
++	if (probed) {
++		lck_mtx_unlock(&negroni_tfa_lock);
++		return 0;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		for (unsigned p = 0; p < TBL_MAX_PROF; p++) {
++			amps[i].spkg_container[p] = 0xffff;
++		}
++	}
++	say("probe (UNTESTED): pins 48..51 at %#lx, TDMSPKG floors (attenuation) speaker >= %u (%d dB), receiver >= %u "
++	    "(%d dB)", TFA_TLMM_PHYS + TFA_PIN_FIRST * 0x1000, spkg_floor, SPKG_DB(spkg_floor), rcvg_floor, SPKG_DB(rcvg_floor));
++	if (pins == 0) {
++		pins = ml_io_map(TFA_TLMM_PHYS + TFA_PIN_FIRST * 0x1000, 0x4000);      /* one 16 KiB page */
++	}
++	if (pins == 0) {
++		say("no TLMM mapping");
++		lck_mtx_unlock(&negroni_tfa_lock);
++		return ENOMEM;
++	}
++	if (table_load() != 0) {
++		lck_mtx_unlock(&negroni_tfa_lock);
++		return ENOENT;
++	}
++	line.pins = (volatile uint8_t *)pins;            /* SDA = GPIO48 (offset 0), SCL = GPIO49 (0x1000) */
++	tlmm_i2c_init(&bus, &line, tfa_udelay);
++	/* reset pulse on both amps (active-high), as the vendor probe */
++	pin_out(50, 1);
++	pin_out(51, 1);
++	IOSleep(5);
++	pin_out(50, 0);
++	pin_out(51, 0);
++	IOSleep(5);
++	say("reset pulse on GPIO50/51 done; SDA %d SCL %d (1 = released, pull-up)", ti_get_sda(&line) ? 1 : 0,
++	    ti_get_scl(&line) ? 1 : 0);
++	for (unsigned i = 0; i < 2; i++) {
++		struct amp *m = &amps[i];
++		uint16_t rev = 0, r10 = 0, r13 = 0, r14 = 0, mtp = 0, r25 = 0;
++		int rc = -1;
++		for (int t = 0; t < 5 && rc != 0; t++) {   /* the vendor retries the revision read, 2 ms apart */
++			rc = i2c_rd(m->addr, 0x03, &rev);
++			if (rc != 0 || (rev & 0xff) != 0x74) {
++				rc = rc ? rc : -5;
++				IOSleep(2);
++			}
++		}
++		if (rc != 0) {
++			say("%#x %s: no TFA9874 (rc %d, reg 0x03 = %#06x)", m->addr, m->where, rc, rev);
++			continue;
++		}
++		m->rev = rev;
++		(void)i2c_rd(m->addr, 0x10, &r10);
++		(void)i2c_rd(m->addr, 0x13, &r13);
++		(void)i2c_rd(m->addr, 0x14, &r14);
++		(void)i2c_rd(m->addr, 0xF0, &mtp);
++		(void)i2c_rd(m->addr, 0xF5, &r25);
++		say("%#x %s: TFA9874 revision %s; status 0x10 %#06x 0x13 %#06x 0x14 %#06x; MTP 0xF0 %#06x (MTPEX %u), "
++		    "R25C 0xF5 = %u mOhm (DT window 5000..8000) [read only]", m->addr, m->where, rev_name(rev), r10, r13,
++		    r14, mtp, (mtp >> 1) & 1, r25);
++		if (rev != 0x0a74 && rev != 0x0b74 && rev != 0x0c74) {
++			say("%#x: revision %#06x has no vendor init table: this amp will NOT be started", m->addr, rev);
++			continue;
++		}
++		m->present = true;
++		found++;
++	}
++	probed = true;
++	lck_mtx_unlock(&negroni_tfa_lock);
++	say("probe done: %d of 2 amps usable; amps stay in power-down until audio plays", found);
++	return found ? 0 : ENXIO;
++}
++
++/* ==== start / stop ==== */
++
++static int
++rev_table(struct amp *m)
++{
++	static const uint8_t ra[] = { 0x02, 0x51, 0x52, 0x58, 0x61, 0x66, 0x6f, 0x70, 0x73, 0x74, 0x75, 0x83, 0x84, 0x85, 0x88, 0xc4 };
++	static const uint16_t va74[] = { 0x22a8, 0x0020, 0x57dc, 0x16a4, 0x0110, 0x0701, 0x00a3, 0x07f8, 0x0007, 0x5068, 0x0d28, 0x0594, 0x0001, 0x0001, 0x0000, 0x2001 };
++	static const uint16_t vb74[] = { 0x22a8, 0x0020, 0x57dc, 0x16a4, 0x0110, 0x0701, 0x00a3, 0x07f8, 0x0047, 0x5068, 0x0d28, 0x0595, 0x0001, 0x0001, 0x0000, 0x2001 };
++	static const uint8_t rc_[] = { 0x02, 0x52, 0x53, 0x56, 0x61, 0x6f, 0x70, 0x73, 0x74, 0x75, 0x80, 0x83, 0x84 };
++	static const uint16_t vc74[] = { 0x22c8, 0x57dc, 0x003e, 0x0400, 0x0110, 0x00a5, 0x07f8, 0x0047, 0x5098, 0x8d28, 0x0000, 0x0799, 0x0081 };
++	int rc = 0;
++
++	if (m->rev == 0x0a74 || m->rev == 0x0b74) {
++		const uint16_t *v = m->rev == 0x0a74 ? va74 : vb74;
++		for (unsigned i = 0; i < sizeof(ra) && rc == 0; i++) {
++			rc = reg_wr(m, ra[i], v[i], "revision table");
++		}
++	} else {
++		for (unsigned i = 0; i < sizeof(rc_) && rc == 0; i++) {
++			rc = reg_wr(m, rc_[i], vc74[i], "revision table");
++		}
++	}
++	return rc;
++}
++
++/* one container record; TDMSPKG (an attenuation) is held at or above the floor */
++static int
++apply_rec(struct amp *m, const struct tbl_rec *r, uint32_t spkg_min)
++{
++	if (r->kind == KIND_REG) {
++		uint16_t v;
++		int rc = i2c_rd(m->addr, r->reg, &v);
++		if (rc) {
++			return rc;
++		}
++		return reg_wr(m, r->reg, (uint16_t)((v & ~r->mask) | (r->value & r->mask)), "container register");
++	}
++	if (r->field == BF_TDMSPKG && r->value < spkg_min) {
++		if (logging) {
++			say("%#x TDMSPKG %u (%d dB) from the container raised to the floor %u (%d dB)", m->addr, r->value,
++			    SPKG_DB(r->value), spkg_min, SPKG_DB(spkg_min));
++		}
++		return bf_set(m, BF_TDMSPKG, (uint16_t)spkg_min, "TDMSPKG (floor)");
++	}
++	return bf_set(m, r->field, r->value, "container bitfield");
++}
++
++static void
++amp_off(struct amp *m)
++{
++	uint16_t st = 0;
++
++	(void)bf_set(m, BF_PWDN, 1, "PWDN 1 (stop)");
++	(void)bf_set(m, BF_AMPE, 0, "AMPE 0 (stop)");
++	for (int i = 0; i < 20; i++) {                  /* 20 x 5 ms, as the vendor's tfa_dev_stop */
++		if (bf_get(m, BF_MANSTATE, &st) != 0 || st == 0) {
++			break;
++		}
++		IOSleep(5);
++	}
++	m->playing = false;
++}
++
++static int
++amp_start(struct amp *m, int prof, uint32_t spkg_min)
++{
++	uint16_t audfs = 8, fractdel = 0, v, clks = 0, spkg = 0xffff, inplev = 0;
++	int rc;
++	uint32_t n = 0;
++
++	/* 1 */
++	(void)bf_get(m, BF_AUDFS, &audfs);
++	(void)bf_get(m, BF_FRACTDEL, &fractdel);
++	/* 2: I2CR (written without a read: the vendor's TFA_SET_BF_VALUE + TFA_WRITE_REG) */
++	if ((rc = reg_wr(m, 0x00, 1u << 1, "I2CR: registers to POR")) != 0) {
++		return rc;
++	}
++	IOSleep(1);
++	(void)bf_set(m, BF_RST, 1, "RST 1 (tfa98xx_dsp_reset)");
++	/* 3: keys */
++	if ((rc = reg_wr(m, 0x0F, 0x5A6B, "unlock key 1")) != 0 || (rc = i2c_rd(m->addr, 0xFB, &v)) != 0 ||
++	    (rc = reg_wr(m, 0xA0, (uint16_t)(v ^ 0x005A), "key 1 = 0xFB ^ 0x5A")) != 0 ||
++	    (rc = reg_wr(m, 0x0F, 0x5A6B, "key2: unhide")) != 0 || (rc = reg_wr(m, 0xA1, 0x005A, "key2: MTPK unlock")) != 0 ||
++	    (rc = reg_wr(m, 0x0F, 0x0000, "key2: hide")) != 0) {
++		return rc ? rc : EIO;
++	}
++	/* 4 */
++	if ((rc = rev_table(m)) != 0) {
++		return rc;
++	}
++	/* 5 */
++	(void)bf_set(m, BF_AUDFS, audfs, "AUDFS back");
++	(void)bf_set(m, BF_FRACTDEL, fractdel, "FRACTDEL back");
++	/* 6: device items, then the profile items (the table holds only what comes before "default") */
++	for (uint32_t i = 0; i < tbl_nrec; i++) {
++		if (recs[i].i2c == m->addr && recs[i].prof == REC_DEVICE) {
++			if ((rc = apply_rec(m, &recs[i], spkg_min)) != 0) {
++				return rc;
++			}
++			n++;
++		}
++	}
++	for (uint32_t i = 0; i < tbl_nrec; i++) {
++		if (recs[i].i2c == m->addr && recs[i].prof == (uint8_t)prof) {
++			if ((rc = apply_rec(m, &recs[i], spkg_min)) != 0) {
++				return rc;
++			}
++			n++;
++		}
++	}
++	/* the floor also holds when no record sets TDMSPKG (POR value unknown) */
++	if (bf_get(m, BF_TDMSPKG, &spkg) == 0 && spkg < spkg_min) {
++		(void)bf_set(m, BF_TDMSPKG, (uint16_t)spkg_min, "TDMSPKG floor (POR value below it)");
++	}
++	/* 7: INIT_CF */
++	(void)bf_set(m, BF_MANSCONF, 1, "MANSCONF 1 (INIT_CF)");
++	(void)bf_set(m, BF_PWDN, 0, "PWDN 0 (INIT_CF)");
++	for (int i = 0; i < 100; i++) {
++		if (bf_get(m, BF_CLKS, &clks) == 0 && clks) {
++			break;
++		}
++		IOSleep(1);
++	}
++	if (!clks) {
++		say("%#x: no CLKS after 100 ms: no I2S clock reaches the amp (TERT MI2S BCLK/WS on GPIO121/123?)", m->addr);
++		return ENXIO;
++	}
++	/* 8, 9 */
++	(void)bf_set(m, BF_RST, 0, "RST 0 (tfaRunStartDSP)");
++	(void)reg_wr(m, REG_SWPROFIL, (uint16_t)(prof + 1), "SWPROFIL = profile + 1");
++	(void)reg_wr(m, REG_SWVSTEP, 1, "SWVSTEP = vstep 0 + 1");
++	/* the floor, read back, before the amplifier is enabled */
++	if (bf_get(m, BF_TDMSPKG, &spkg) != 0 || spkg < spkg_min) {
++		say("%#x: TDMSPKG read back %u < floor %u (louder than allowed): NOT enabling the amplifier", m->addr, spkg,
++		    spkg_min);
++		return EIO;
++	}
++	(void)bf_get(m, BF_INPLEV, &inplev);
++	/* 10: OPERATING */
++	(void)bf_set(m, BF_PWDN, 0, "PWDN 0 (OPERATING)");
++	(void)bf_set(m, BF_MANSCONF, 1, "MANSCONF 1 (OPERATING)");
++	if ((rc = bf_set(m, BF_AMPE, 1, "AMPE 1 (OPERATING)")) != 0) {
++		return rc;
++	}
++	m->playing = true;
++	{
++		uint16_t r10 = 0, r13 = 0, st = 0;
++		IOSleep(10);
++		(void)i2c_rd(m->addr, 0x10, &r10);       /* the first read clears the sticky bits of the power-up */
++		(void)i2c_rd(m->addr, 0x13, &r13);
++		(void)bf_get(m, BF_MANSTATE, &st);
++		say("%#x %s: AMPE 1, profile \"%s\", %u container writes, TDMSPKG %u = %d dB (container %u, floor %u), INPLEV %u, "
++		    "MANSTATE %u (9 = operating), 0x10 %#06x 0x13 %#06x (normal: 0x0016 / 0x850F)", m->addr, m->where,
++		    prof_names[prof], n, spkg, SPKG_DB(spkg), m->spkg_container[prof], spkg_min, inplev, st, r10, r13);
++	}
++	return 0;
++}
++
++static bool
++fault_latched(void)
++{
++	return fault_until != 0 && mach_absolute_time() < fault_until;
++}
++
++int
++negroni_tfa_start(uint32_t route)
++{
++	int prof, rc = 0;
++	uint32_t spkg_min;
++	bool any = false;
++
++	if (!probed || tbl == NULL) {
++		return ENXIO;
++	}
++	if (route != NEGRONI_TFA_ROUTE_SPEAKER && route != NEGRONI_TFA_ROUTE_RECEIVER) {
++		return EINVAL;
++	}
++	prof = route == NEGRONI_TFA_ROUTE_SPEAKER ? prof_speaker : prof_receiver;
++	spkg_min = route == NEGRONI_TFA_ROUTE_SPEAKER ? spkg_floor : rcvg_floor;
++	if (prof < 0) {
++		say("start: the table has no %s profile", route == NEGRONI_TFA_ROUTE_SPEAKER ? "speaker" : "receiver");
++		return ENOENT;
++	}
++	lck_mtx_lock(&negroni_tfa_lock);
++	if (fault_latched()) {
++		lck_mtx_unlock(&negroni_tfa_lock);
++		return EBUSY;
++	}
++	logging = starts < verbose_starts;
++	writes_logged = 0;
++	starts++;
++	for (unsigned i = 0; i < 2; i++) {
++		struct amp *m = &amps[i];
++		bool wanted = m->present && (route == NEGRONI_TFA_ROUTE_SPEAKER || m->addr == 0x34);
++		uint32_t c = spkg_min;
++		if (m->spkg_container[prof] != 0xffff && c < m->spkg_container[prof]) {
++			if (logging) {
++				say("%#x: TDMSPKG floor %u is below the container's %u: the container value is kept (never louder "
++				    "than the vendor)", m->addr, c, m->spkg_container[prof]);
++			}
++			c = m->spkg_container[prof];                        /* never below the vendor's attenuation */
++		}
++		if (!wanted) {
++			if (m->playing) {
++				amp_off(m);
++			}
++			continue;
++		}
++		say("start %#x %s: route %s, profile \"%s\", TDMSPKG floor %u = %d dB (start %u)", m->addr, m->where,
++		    route == NEGRONI_TFA_ROUTE_SPEAKER ? "speaker" : "earpiece", prof_names[prof], c, SPKG_DB(c), starts);
++		rc = amp_start(m, prof, c);
++		if (rc != 0) {
++			say("start %#x failed (%d): both amps off", m->addr, rc);
++			break;
++		}
++		any = true;
++	}
++	if (rc != 0 || !any) {
++		for (unsigned i = 0; i < 2; i++) {
++			if (amps[i].present) {
++				amp_off(&amps[i]);
++			}
++		}
++		cur_route = NEGRONI_TFA_ROUTE_OFF;
++		rc = rc ? rc : ENXIO;
++	} else {
++		cur_route = route;
++	}
++	logging = false;
++	lck_mtx_unlock(&negroni_tfa_lock);
++	return rc;
++}
++
++void
++negroni_tfa_stop(const char *why)
++{
++	bool was = false;
++
++	if (!probed) {
++		return;
++	}
++	lck_mtx_lock(&negroni_tfa_lock);
++	for (unsigned i = 0; i < 2; i++) {
++		if (amps[i].present && amps[i].playing) {
++			amp_off(&amps[i]);
++			was = true;
++		}
++	}
++	cur_route = NEGRONI_TFA_ROUTE_OFF;
++	lck_mtx_unlock(&negroni_tfa_lock);
++	if (was) {
++		say("amps off: %s", why ? why : "");
++	}
++}
++
++int
++negroni_tfa_check(int log)
++{
++	int bad = 0;
++	char why[96];
++
++	if (!probed) {
++		return 0;
++	}
++	why[0] = 0;
++	lck_mtx_lock(&negroni_tfa_lock);
++	for (unsigned i = 0; i < 2; i++) {
++		struct amp *m = &amps[i];
++		uint16_t r10 = 0, r13 = 0;
++		if (!m->playing) {
++			continue;
++		}
++		if (i2c_rd(m->addr, 0x10, &r10) != 0 || i2c_rd(m->addr, 0x13, &r13) != 0) {
++			snprintf(why, sizeof(why), "%#x: status read failed", m->addr);
++			bad = EIO;
++			break;
++		}
++		if (log) {
++			say("%#x status 0x10 %#06x 0x13 %#06x", m->addr, r10, r13);
++		}
++		if (!(r10 & 1u << 2) || (r10 & 1u << 3) || !(r10 & 1u << 4) || (r10 & 1u << 7) || !(r13 & 1u << 8)) {
++			snprintf(why, sizeof(why), "%#x fault: 0x10 %#06x 0x13 %#06x:%s%s%s%s%s", m->addr, r10, r13,
++			    !(r10 & 1u << 2) ? " OverTemperature" : "", (r10 & 1u << 3) ? " CurrentHigh" : "",
++			    !(r10 & 1u << 4) ? " VbatLow" : "", (r10 & 1u << 7) ? " NoClock" : "",
++			    !(r13 & 1u << 8) ? " VbatHigh" : "");
++			bad = EIO;
++			break;
++		}
++		if (r13 & 1u << 9) {
++			bad = EAGAIN;                   /* clipping: the guard turns down by 1 dB */
++		}
++	}
++	lck_mtx_unlock(&negroni_tfa_lock);
++	if (bad == EIO) {
++		uint64_t ten;
++		faults++;
++		nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &ten);
++		fault_until = mach_absolute_time() + ten;
++		say("FAULT %u: %s: amps off, no restart for 10 s", faults, why);
++		negroni_tfa_stop("fault");
++	}
++	return bad;
++}
++
++bool
++negroni_tfa_playing(void)
++{
++	return cur_route != NEGRONI_TFA_ROUTE_OFF;
++}
++
++bool
++negroni_tfa_ready(void)
++{
++	return probed && tbl != NULL && (amps[0].present || amps[1].present) && !fault_latched();
++}
++
++/* panic/halt: other CPUs are stopped; no lock, no sleep. */
++void
++negroni_tfa_panic(void)
++{
++	if (!probed || pins == 0) {
++		return;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		if (amps[i].present) {
++			(void)gi_stop(&bus);            /* end a transfer that the panic cut */
++			(void)gpio_i2c_write(&bus, amps[i].addr, (const uint8_t[3]){ 0x00, 0x00, 0x01 }, 3);  /* PWDN 1, AMPE 0 */
++		}
++	}
++	pin_out(50, 1);                                 /* reset held: the amps stay off until the next boot */
++	pin_out(51, 1);
++	cur_route = NEGRONI_TFA_ROUTE_OFF;
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_tfa.h b/bsd/dev/negroni_tfa.h
+new file mode 100644
+index 0000000..7853fcc
+--- /dev/null
++++ b/bsd/dev/negroni_tfa.h
+@@ -0,0 +1,31 @@
++/*
++ * NEGRONI (SM8450) speaker/earpiece amplifiers: 2x NXP TFA9874 on QUP SE13 (I2C 0x34 = top, the
++ * earpiece/receiver and the left speaker channel; 0x35 = bottom, the right speaker channel), I2S
++ * data on TERT MI2S (negroni_audio.c). iOSPlus10 patch 0244, docs/audio-plan.md stage (c).
++ * UNTESTED ON HARDWARE. Off by default (boot-arg negroniaudio_amp=1).
++ */
++#ifndef _NEGRONI_TFA_H_
++#define _NEGRONI_TFA_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define NEGRONI_TFA_ROUTE_OFF           0u
++#define NEGRONI_TFA_ROUTE_SPEAKER       1u      /* both amps, container profile "speaker" */
++#define NEGRONI_TFA_ROUTE_RECEIVER      2u      /* 0x34 only, container profile "receiver" (the earpiece) */
++
++bool negroni_tfa_wanted(void);                  /* boot-arg negroniaudio_amp=1 */
++/* Pins, the container table (tfa-init.bin in the ADSP area), reset pulse, revision. Amps stay off. */
++int negroni_tfa_probe(void);
++/* Cold start of the route's amps (the I2S clock must run). 0 = playing; amps are off on an error. */
++int negroni_tfa_start(uint32_t route);
++void negroni_tfa_stop(const char *why);         /* AMPE 0, PWDN 1 on every started amp */
++/* Status registers; a fault (over-temperature, over-current, under-voltage, alarm) stops the amps
++ * and blocks a restart for 10 s. 0 = fine or off. log != 0: one line per amp. */
++int negroni_tfa_check(int log);
++bool negroni_tfa_playing(void);
++bool negroni_tfa_ready(void);                   /* probe passed, no fault latch */
++/* Panic/halt: no locks, best effort: AMPE 0 + PWDN 1 over I2C, then the reset pins held high. */
++void negroni_tfa_panic(void);
++
++#endif
+diff --git a/iokit/Kernel/arm/NegroniPlatformExpert.cpp b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+index 430c192..82f482f 100644
+--- a/iokit/Kernel/arm/NegroniPlatformExpert.cpp
++++ b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+@@ -46,6 +46,7 @@ void negroni_power_off(void);
+ void negroni_panic_restart(void);
+ void negroni_reboot_settle(unsigned ms);
+ void negroni_fb_panic(void);            /* NegroniFramebuffer.cpp: zero-copy pipes back on the panel memory */
++void negroni_tfa_panic(void);           /* negroni_tfa.c (0244): speaker amps off, reset pins held */
+ }
+ 
+ static bool negroni_in_panic;
+@@ -57,12 +58,14 @@ negroni_halt_restart(unsigned int type)
+ 	case kPEPanicBegin:
+ 		negroni_in_panic = true;
+ 		negroni_fb_panic();             /* the panic text must be on screen (0234) */
++		negroni_tfa_panic();            /* no amp left playing a stuck buffer (0244) */
+ 		return 0;
+ 	case kPEHaltCPU:
+ 		if (negroni_in_panic) {
+ 			negroni_panic_restart();        /* does not return */
+ 		}
+ 		IOLog("NEGRONI: power off\n");
++		negroni_tfa_panic();                    /* amps off before the rails go (0244) */
+ 		negroni_reboot_settle(300);             /* the USB log thread sends the last lines */
+ 		negroni_power_off();
+ 		return -1;                              /* refused: halt_all_cpus() spins */
+@@ -71,6 +74,7 @@ negroni_halt_restart(unsigned int type)
+ 			negroni_panic_restart();        /* does not return */
+ 		}
+ 		IOLog("NEGRONI: restart\n");
++		negroni_tfa_panic();                    /* amps off (0244) */
+ 		negroni_reboot_settle(300);
+ 		negroni_restart();                      /* kern.negroni_reboot_mode (0213) */
+ 		return -1;

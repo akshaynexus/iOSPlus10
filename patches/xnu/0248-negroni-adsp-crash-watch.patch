@@ -1,0 +1,131 @@
+diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
+index c4b7083..e3110bb 100644
+--- a/bsd/dev/negroni_adsp.c
++++ b/bsd/dev/negroni_adsp.c
+@@ -191,6 +191,7 @@ static uint32_t mdt_size, nseg, min_pa, max_pa;
+ static struct seg segs[MAX_SEGMENTS];
+ static bool relocatable, rails_on;
+ static uint32_t our_item;
++static bool adsp_running;                       /* 0248: step 8 saw READY, no fatal since */
+ static uint32_t step_budget_ms = 15000;         /* negroniadsp_steptimeout */
+ static char fail_why[192];                           /* reason of the failed step */
+ static const char *const step_names[] = {
+@@ -969,6 +970,7 @@ step_start(void)
+ 		return false;
+ 	}
+ 	say("THE ADSP IS UP after %u ms", ms);
++	adsp_running = true;
+ 	/* Linux drops the proxy votes on handover; wait up to 2 s more for it. */
+ 	for (uint32_t t = 0; t < 2000 && rails_on && unvote; t++) {
+ 		if (smp2p_value(theirs, "slave-kernel", &value) && (value & DSP_HANDOVER)) {
+@@ -1661,6 +1663,56 @@ step_glink(void)
+ }
+ 
+ 
++/*
++ * 0248: the ADSP crash watch (Linux qcom_q6v5.c fatal IRQ -> rproc_report_crash -> qcom_q6v5_request_stop
++ * + qcom_q6v5_pas.c PAS shutdown, read for the order). No interrupt here: a thread reads the ADSP's
++ * slave-kernel SMP2P entry every 200 ms. On FATAL: the ADSP's last words (item 423), the amps off and
++ * the audio sink off (negroni_audio_dsp_lost: no GPR to a dead DSP), GLINK stopped, our master-kernel
++ * "stop" bit (bit 0, qcom,smem-states <... 0> "stop") set + IPCC kick, up to 5 s for STOP-ACK (bit 3),
++ * then PAS shutdown. No restart (the "has run since the reset" gate stays: HackiOS saw a SoC reset on a
++ * second start without a stop-ack). The watch does not see a watchdog bite (a separate LPASS IRQ in
++ * Linux) [I]; GLINK timeouts then show it.
++ */
++static void
++adsp_watch(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t size = 0, value = 0, last = ~0u, theirs;
++
++	say("watch: polling slave-kernel every 200 ms for FATAL");
++	for (;;) {
++		IOSleep(200);
++		theirs = smem_item(ITEM_SMP2P_THEIRS, &size);
++		if (theirs == 0 || !smp2p_value(theirs, "slave-kernel", &value) || value == last) {
++			continue;
++		}
++		say("watch: slave-kernel = %#x%s%s", value, value & DSP_FATAL ? " FATAL" : "", value & DSP_STOP_ACK ? " STOP-ACK" : "");
++		last = value;
++		if (value & DSP_FATAL) {
++			break;
++		}
++	}
++	say("ADSP FATAL AFTER START: audio off, stop, PAS shutdown (no restart in this boot)");
++	last_words();
++	negroni_audio_dsp_lost("ADSP fatal");
++	gl_dead = true;
++	if (our_item) {
++		wr32(smem, our_item + 36, rd32(smem, our_item + 36) | 1u);     /* master-kernel entry 0: "stop" */
++		kick(IPCC_CLIENT_LPASS, IPCC_SIGNAL_SMP2P);
++		for (uint32_t ms = 0; ms < 5000; ms += 10) {
++			if (smp2p_value(theirs, "slave-kernel", &value) && (value & DSP_STOP_ACK)) {
++				say("watch: STOP-ACK after %u ms", ms);
++				break;
++			}
++			IOSleep(10);
++		}
++		wr32(smem, our_item + 36, rd32(smem, our_item + 36) & ~1u);    /* stop bit cleared again (Linux does) */
++		kick(IPCC_CLIENT_LPASS, IPCC_SIGNAL_SMP2P);
++	}
++	pas_shutdown("ADSP fatal after start");
++	adsp_running = false;
++	(void)thread_terminate(current_thread());
++}
++
+ /* steps 10..15 are stage (b) (negroni_audio.c): one bridge per step keeps the timing/fail line. */
+ static bool
+ step_audio(uint32_t n)
+@@ -1719,6 +1771,12 @@ adsp_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 	printf("NEGRONI ADSP: done (asked 1..%u, %s at %u)\n", last_step, failed ? "stopped" : "complete",
+ 	    MIN(step, last_step));
++	if (adsp_running) {
++		thread_t w;
++		if (kernel_thread_start(adsp_watch, NULL, &w) == KERN_SUCCESS) {
++			thread_deallocate(w);
++		}
++	}
+ 	(void)thread_terminate(current_thread());
+ }
+ 
+diff --git a/bsd/dev/negroni_adsp.h b/bsd/dev/negroni_adsp.h
+index e6d6040..205b767 100644
+--- a/bsd/dev/negroni_adsp.h
++++ b/bsd/dev/negroni_adsp.h
+@@ -26,5 +26,7 @@ const char *negroni_audio_step_name(uint32_t n);
+ /* After a failed or a final step: graph down, clock released, sink off (safe to call twice). */
+ void negroni_audio_stop(const char *reason);
+ void negroni_audio_init(void);          /* /dev/negroni-audio (ENODEV until step 15 runs) */
++/* 0248: the ADSP died: amps off, sink off, no more GPR (the graph is gone with the DSP). */
++void negroni_audio_dsp_lost(const char *reason);
+ 
+ #endif
+diff --git a/bsd/dev/negroni_audio.c b/bsd/dev/negroni_audio.c
+index 9974694..35540b3 100644
+--- a/bsd/dev/negroni_audio.c
++++ b/bsd/dev/negroni_audio.c
+@@ -1485,6 +1485,24 @@ negroni_audio_step_name(uint32_t n)
+ 	}
+ }
+ 
++void
++negroni_audio_dsp_lost(const char *reason)
++{
++	say("ADSP LOST (%s): amps off, sink off, graph state dropped (no GPR to a dead DSP)", reason ? reason : "");
++	negroni_tfa_stop("ADSP lost");
++	if (audio_lock) {
++		lck_mtx_lock(audio_lock);
++	}
++	sink_on = false;
++	graph_started = false;
++	graph_opened = false;
++	clock_on = false;
++	mem_map_handle = 0;
++	if (audio_lock) {
++		lck_mtx_unlock(audio_lock);
++	}
++}
++
+ void
+ negroni_audio_stop(const char *reason)
+ {

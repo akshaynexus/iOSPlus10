@@ -1,0 +1,104 @@
+diff --git a/bsd/dev/negroni_audio.c b/bsd/dev/negroni_audio.c
+index 79d455d..f9e174c 100644
+--- a/bsd/dev/negroni_audio.c
++++ b/bsd/dev/negroni_audio.c
+@@ -1226,9 +1226,88 @@ negroni_audio_init(void)
+ 	devfs_make_node(makedev(audio_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "negroni-audio");  /* NEGRONI_AUDIO_DEVICE without the /dev/ */
+ }
+ 
++/*
++ * 0245: negroniaudio_tone=1 (speaker) or 2 (earpiece): a kernel-made 1 kHz sine for 2 s, then 0.5 s
++ * of zeros, through the same guard and ring as write(): the proof the owner HEARS. The sine is full
++ * scale before the guard; the guard's cap (negroniaudio_capdb, default 20) makes it -20 dBFS at the
++ * I2S, and the amps' TDMSPKG attenuation is held at a floor (negroni_tfa.c). Pacing: a period goes out when fewer than
++ * PERIODS - 2 are in flight (DONE events), else after 200 ms anyway (then the sink drops it and the
++ * stats line shows it). The amps go off at the end.
++ */
++static const int16_t sine_1k[48] = {
++	0, 4277, 8481, 12539, 16383, 19947, 23170, 25996, 28377, 30273, 31650, 32487,
++	32767, 32487, 31650, 30273, 28377, 25996, 23170, 19947, 16383, 12539, 8481, 4277,
++	0, -4277, -8481, -12539, -16383, -19947, -23170, -25996, -28377, -30273, -31650, -32487,
++	-32767, -32487, -31650, -30273, -28377, -25996, -23170, -19947, -16384, -12539, -8481, -4277,
++};
++
++static void
++tone_play(uint32_t route)
++{
++	int16_t buf[2 * 240];
++	uint64_t t0 = mach_absolute_time(), ns = 0, done0 = os_atomic_load(&write_done_count, relaxed);
++	uint64_t sent0, drop0;
++	uint32_t pin = 0, pout = 0, gq = 0, waits = 0;
++	const uint32_t tone_periods = 100, quiet_periods = 25;         /* 2 s, 0.5 s */
++
++	lck_mtx_lock(audio_lock);
++	sent0 = periods_sent;
++	drop0 = frames_dropped;
++	lck_mtx_unlock(audio_lock);
++	audio_route = route;
++	say("TONE: 1 kHz, 2 s, %s, -%u dBFS at the I2S (guard cap), amps %s", route == NEGRONI_TFA_ROUTE_RECEIVER ?
++	    "earpiece (left slot, 0x34)" : "speaker (both)", ng_guard_cap_db(), amps_probed ? "probed" : "NOT probed (no sound)");
++	ng_guard_stats(&pin, &pout, &gq);               /* clear the peaks */
++	for (uint32_t p = 0; p < tone_periods + quiet_periods; p++) {
++		uint32_t ms = 0;
++		for (; ms < 200; ms++) {                /* pace on the DONE events */
++			uint64_t inflight;
++			negroni_glink_poll();
++			lck_mtx_lock(audio_lock);
++			inflight = periods_sent - os_atomic_load(&write_done_count, relaxed);
++			lck_mtx_unlock(audio_lock);
++			if (inflight < PERIODS - 2) {
++				break;
++			}
++			IOSleep(1);
++		}
++		if (ms == 200) {
++			waits++;
++		}
++		if (p == 10 && os_atomic_load(&write_done_count, relaxed) == done0) {
++			say("TONE stopped: no DONE event after 10 periods: the ADSP does not take the data (try negroniaudio_v2=1)");
++			break;
++		}
++		for (uint32_t c = 0; c < PERIOD_FRAMES / 240; c++) {
++			for (uint32_t f = 0; f < 240; f++) {
++				int16_t s = p < tone_periods ? sine_1k[f % 48] : 0;   /* 960 and 240 are multiples of 48 */
++				buf[2 * f] = s;
++				buf[2 * f + 1] = s;                    /* the guard mixes L+R to the left slot for the earpiece */
++			}
++			lck_mtx_lock(feed_lock);
++			sink_feed(buf, 240);
++			lck_mtx_unlock(feed_lock);
++		}
++		if (p == tone_periods / 2) {
++			(void)negroni_tfa_check(1);     /* the amps' status in the middle of the tone */
++		}
++	}
++	ng_guard_stats(&pin, &pout, &gq);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	lck_mtx_lock(audio_lock);
++	say("TONE done in %llu ms (2500 expected at the 48 kHz pace): periods sent %llu, DONE %llu, frames dropped %llu, "
++	    "%u periods sent after a 200 ms wait; guard peak in %u out %u (of 32768), least gain %u/32768",
++	    ns / 1000000, periods_sent - sent0, os_atomic_load(&write_done_count, relaxed) - done0,
++	    frames_dropped - drop0, waits, pin, pout, gq);
++	lck_mtx_unlock(audio_lock);
++	negroni_tfa_stop("tone done");
++	audio_route = NEGRONI_TFA_ROUTE_SPEAKER;
++}
++
+ static bool
+ step_sink(void)
+ {
++	uint32_t tone = 0;
+ 	announce_note("enable /dev/negroni-audio");
+ 	if (!graph_started) {
+ 		FAIL("the graph is not started");
+@@ -1252,6 +1331,10 @@ step_sink(void)
+ 	    NG_GUARD_MIN_CAP_DB);
+ 	say("THE SPEAKER SINK IS LIVE: write S16LE stereo 48 kHz to /dev/negroni-audio");
+ 	amps_setup();
++	(void)PE_parse_boot_argn("negroniaudio_tone", &tone, sizeof(tone));
++	if (tone == 1 || tone == 2) {
++		tone_play(tone == 2 ? NEGRONI_TFA_ROUTE_RECEIVER : NEGRONI_TFA_ROUTE_SPEAKER);
++	}
+ 	return true;
+ }
+ 

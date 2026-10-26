@@ -1,0 +1,99 @@
+diff --git a/bsd/dev/negroni_audio.c b/bsd/dev/negroni_audio.c
+index 177221f..9974694 100644
+--- a/bsd/dev/negroni_audio.c
++++ b/bsd/dev/negroni_audio.c
+@@ -177,7 +177,18 @@ extern void IOSleep(unsigned int ms);
+ #define APM_SG_DIR_RX           2u
+ #define APM_SG_SID_PLAYBACK     1u
+ #define APM_CONT_CAP_PP         1u
++#define APM_CONT_CAP_CD         2u
+ #define APM_CONT_CAP_EP         3u
++#define APM_SG_DIR_TX           1u
++/*
++ * 0247: the graph values of the mainline AudioReach topology (audioreach-topology
++ * subgraph-stream-playback.m4: stream container cap CD, stack 8192; subgraph-device-i2s-playback.m4:
++ * device sub-graph direction TX, container cap EP, position STREAM, stack 8192) and the WR EP media
++ * format sent to the module's own GPR port (Linux audioreach.c audioreach_shmem_set_media_format:
++ * dst = module instance id). negroniaudio_graph=1 gives back the 0243 values (stream cap PP, device
++ * direction RX, device position STR_DEV, stacks 4096, media format through the APM).
++ */
++static uint32_t graph_0243;
+ #define APM_CONT_GRAPH_POS_STREAM 1u
+ #define APM_CONT_GRAPH_POS_STR_DEV 3u
+ #define APM_PROC_DOMAIN_ADSP    2u
+@@ -548,7 +559,7 @@ fill_cont(struct cont_block *c, uint32_t id, uint32_t cap, uint32_t pos)
+ 	c->pos = pos;
+ 	c->stack_pid = APM_CONT_PROP_ID_STACK_SIZE;
+ 	c->stack_size = 4;
+-	c->stack = 4096;
++	c->stack = graph_0243 ? 4096 : 8192;
+ 	c->dom_pid = APM_CONT_PROP_ID_PROC_DOMAIN;
+ 	c->dom_size = 4;
+ 	c->dom = APM_PROC_DOMAIN_ADSP;
+@@ -602,7 +613,7 @@ build_graph_open(void)
+ 		p = putobj(p, &pr, sizeof(pr));
+ 		p = put32(p, 2);
+ 		fill_sg(&sg, SG_STREAM, APM_SG_DIR_RX); p = putobj(p, &sg, sizeof(sg));
+-		fill_sg(&sg, SG_DEVICE, APM_SG_DIR_RX); p = putobj(p, &sg, sizeof(sg));
++		fill_sg(&sg, SG_DEVICE, graph_0243 ? APM_SG_DIR_RX : APM_SG_DIR_TX); p = putobj(p, &sg, sizeof(sg));
+ 		p = graph_pkt + ((p - graph_pkt + 7) & ~7u);
+ 	}
+ 	/* 2. CONTAINER_CONFIG: num + 2 containers */
+@@ -613,8 +624,10 @@ build_graph_open(void)
+ 		pr.miid = APM_MODULE_INSTANCE_ID; pr.pid = APM_PARAM_ID_CONTAINER_CONFIG; pr.size = (bodysz + 7) & ~7u;
+ 		p = putobj(p, &pr, sizeof(pr));
+ 		p = put32(p, 2);
+-		fill_cont(&c, CONT_STREAM, APM_CONT_CAP_PP, APM_CONT_GRAPH_POS_STREAM); p = putobj(p, &c, sizeof(c));
+-		fill_cont(&c, CONT_DEVICE, APM_CONT_CAP_EP, APM_CONT_GRAPH_POS_STR_DEV); p = putobj(p, &c, sizeof(c));
++		fill_cont(&c, CONT_STREAM, graph_0243 ? APM_CONT_CAP_PP : APM_CONT_CAP_CD, APM_CONT_GRAPH_POS_STREAM);
++		p = putobj(p, &c, sizeof(c));
++		fill_cont(&c, CONT_DEVICE, APM_CONT_CAP_EP, graph_0243 ? APM_CONT_GRAPH_POS_STR_DEV : APM_CONT_GRAPH_POS_STREAM);
++		p = putobj(p, &c, sizeof(c));
+ 		p = graph_pkt + ((p - graph_pkt + 7) & ~7u);
+ 	}
+ 	/* 3. MODULE_LIST: num lists; list = {sg, cont, nmod} + mod_obj[] */
+@@ -676,8 +689,15 @@ build_graph_open(void)
+ }
+ 
+ /* one SET_CFG param packet to a module instance; body copied from `body`, bodysz bytes. */
++static int set_cfg_to(uint32_t dst_port, uint32_t src_port, uint32_t iid, uint32_t pid, const void *body, uint32_t bodysz);
+ static int
+ set_cfg(uint32_t iid, uint32_t pid, const void *body, uint32_t bodysz)
++{
++	return set_cfg_to(GPR_PORT_APM, GPR_APM_IID, iid, pid, body, bodysz);
++}
++
++static int
++set_cfg_to(uint32_t dst_port, uint32_t src_port, uint32_t iid, uint32_t pid, const void *body, uint32_t bodysz)
+ {
+ 	uint8_t pkt[256] __attribute__((aligned(8)));
+ 	struct gpr_hdr *hdr = (void *)pkt;
+@@ -690,7 +710,7 @@ set_cfg(uint32_t iid, uint32_t pid, const void *body, uint32_t bodysz)
+ 		return EINVAL;
+ 	}
+ 	bzero(pkt, plen);
+-	gpr_build_hdr(hdr, plen, GPR_PORT_APM, GPR_APM_IID, APM_CMD_SET_CFG);
++	gpr_build_hdr(hdr, plen, dst_port, src_port, APM_CMD_SET_CFG);
+ 	cmd->size = plen - sizeof(*hdr) - sizeof(*cmd);
+ 	pr->miid = iid;
+ 	pr->pid = pid;
+@@ -736,6 +756,9 @@ step_graph(void)
+ {
+ 	uint32_t len, status = ~0u;
+ 
++	(void)PE_parse_boot_argn("negroniaudio_graph", &graph_0243, sizeof(graph_0243));
++	say("graph values: %s", graph_0243 ? "0243 (negroniaudio_graph=1)" :
++	    "mainline topology (stream cap CD, device dir TX, pos STREAM, stacks 8192, WR EP format to its port)");
+ 	announce_note("APM: GRAPH_OPEN (WR_SH_MEM_EP -> PCM_CNV -> MFC -> I2S_SINK)");
+ 	len = build_graph_open();
+ 	if (gpr_send_wait(graph_pkt, len, 0, &status) != 0 || status != 0) {
+@@ -881,7 +904,8 @@ step_shmem(void)
+ 		f.sample_rate = 48000; f.bit_width = 24; f.alignment = PCM_LSB_ALIGNED;
+ 		f.bits_per_sample = 32; f.q_factor = 23; f.endianness = PCM_LITTLE_ENDIAN; f.num_channels = 2;
+ 		f.ch[0] = PCM_CHANNEL_L; f.ch[1] = PCM_CHANNEL_R;
+-		if (set_cfg(IID_WR_EP, PARAM_ID_MEDIA_FORMAT, &f, sizeof(f))) {
++		if (graph_0243 ? set_cfg(IID_WR_EP, PARAM_ID_MEDIA_FORMAT, &f, sizeof(f)) :
++		    set_cfg_to(IID_WR_EP, GPR_SRC_PORT, IID_WR_EP, PARAM_ID_MEDIA_FORMAT, &f, sizeof(f))) {
+ 			return false;
+ 		}
+ 	}

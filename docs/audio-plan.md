@@ -1,6 +1,7 @@
 # Audio plan (iOS 16.7.16 on the NE2211, SM8450)
 
-Status date: 2026-10-25. Audio does not work. Nothing in this plan ran on the phone yet.
+Status date: 2026-10-26 (evening). Audio does not work yet. Nothing in this plan ran on the phone yet except ADSP step 1.
+Newest work: section "Implemented 2026-10-26 evening: patches 0244-0248".
 
 Marks: **[V]** verified in code, DT, firmware or logs. **[I]** inference. **[U]** unknown.
 
@@ -20,7 +21,7 @@ is off by default.
 | 0 | mediaserverd stops aborting: HAL plug-in `NegroniAudio.driver` with "Speaker"/"Hawking"/"Actuator"/"Codec", samples dropped. **XPC-misuse crash fix**: BTAudioHALPlugin moved to `HAL.disabled` (its factory sent XPC to absent bluetoothd) | **built, host-tested, on the live root; XPC fix added** (`userland/audio/`, root hook `AUDIO=1`; `scripts/audio/phone-audio.sh`) | phone test |
 | a | ADSP firmware load + start (PAS id 1), SMP2P ready, **GLINK up (step 9)** | **code done, builds, untested** (patches 0240/0242, `negroniadsp=1`) | 1-3 days of tests |
 | b | GLINK + QRTR + GPR, AudioReach graph for the speaker (PRM clock, **TERT MI2S I2S sink**), shared memory | **code done, builds, untested** (patch 0243, `negroniadsp_step=10..15`) | 2-3 weeks of tests, highest risk |
-| c | 2x TFA9874 init over I2C (register writes only), I2S slave | planned (facts below) | 4-7 days |
+| c | 2x TFA9874 init over I2C (register writes only), I2S slave; speaker guard; test tone; earpiece route | **code done, builds, untested** (patches 0244-0246, `negroniaudio_amp=1`, `negroniaudio_tone=1`) | phone test |
 | d | kernel `/dev/negroni-audio` + the stage 0 plug-in writes to it | **code done in stage (b) step 15 (patch 0243); the plug-in stage 1 (ring + writer thread) is built** (ABI in `userland/audio/negroni_audio.h`) | 2-4 days |
 
 The model is HackiOS (`external/hackios-xnu-kernel`, `external/hackios-xnu-userland`). HackiOS plays
@@ -294,6 +295,95 @@ kernel did not take, drops on a full ring, reopens on ENODEV every 2 s. `build.s
 host test 0 failures, arm64 minos 16.0, iOS 16 imports only). Driver sha256
 `7770ccb43a527c236db723280778cdee3371a9a1e55d9376a64eba4f288b6a0b`. ABI `negroni_audio.h`: no change.
 
+## Implemented 2026-10-26 evening: patches 0244-0248 (amps, guard, tone, earpiece, graph, crash watch; build-only)
+
+Read this section first. Nothing here ran on the phone. Audit input: `docs/audit/2026-10-26-audio.md`.
+
+### Which physical path each function uses [V]
+
+| Function | Path on the NE2211 | Source |
+|---|---|---|
+| Speaker | 2x NXP TFA9874 (I2C SE13 `i2c@a94000`, 0x34 + 0x35), I2S data on TERT MI2S (SD1 = GPIO124), both amps, container profile "speaker" | `out/live.dts:14853-14891`; `resourcemanager.xml:519` (`MI2S-LPAIF-RX-TERTIARY`); `mixer_paths.xml:2011` (`TFA_CHIP_SELECTOR 3`, profile `speaker`) |
+| Earpiece | the same TERT MI2S port; **only 0x34** (`TFA_CHIP_SELECTOR 1` = CHIP_SELECTOR_LEFT = `tfa_channel 0` = 0x34) in container profile "receiver". Not the WCD938x EAR output | `resourcemanager.xml:576`; `mixer_paths.xml:2161`; `tfa98xx_v6.c` `tfa98xx_set_stereo_ctl`, `tfa98xx.h:42-44` |
+| SoundWire WSA amps | **not used**: `wsa-macro@3240000` status disabled, both `wsa883x` disabled, `qcom,wsa-max-devs = <0>` | `out/live.dts:27474, 27503, 27517, 27637` |
+| Headphones | `CODEC_DMA-LPAIF_RXTX-RX-0` -> RX macro -> WCD938x HPHL/HPHR over SoundWire (`rx_swr_master`); USB-C analog through `fsa4480` (I2C 0x42) | `resourcemanager.xml:623`; `mixer_paths.xml:2209`; `out/live.dts:14492, 27620, 27646` |
+| Built-in mics | `CODEC_DMA-LPAIF_RXTX-TX-3`; TX macro **digital** mics DMIC3 + DMIC4 (`MSM_DMIC`, LPASS LPI pins `dmic23`/`dmic45`), mic bias from the WCD938x (MIC BIAS3 / MIC BIAS1) | `resourcemanager.xml:117-123`; `mixer_paths.xml:2166` (`handset-mic`), `2100`; `out/live.dts:27127-27235, 27647` |
+| Headset mic + detect | WCD938x AMIC2 (`SWR_MIC5`, ADC2) and MBHC in the WCD938x, USB-C analog | `mixer_paths.xml:1919, 2268`; `out/live.dts:27629-27646` |
+
+So the speaker port TER MI2S of 0243 is right. The audit's "mic = WCD9385 over SoundWire" is half right: the main mics
+are DMICs on the SoC's TX macro; only their bias (and the headset mic) comes from the WCD938x over SoundWire.
+
+### Speaker protection facts [V unless marked]
+
+- The TFA9874 has no DSP ("non-DSP TFA, like TFA9874", `tfa98xx_v6.c` `tfa98xx_dsp_init`; `is_probus_device = 1`,
+  `tfa_dsp_v6.c:296-303`). Android runs NXP's protection algorithm in the ADSP (module 0x1700B911, `libtfadsp_rx.so`,
+  V/I feedback on `MI2S-LPAIF-TX-TERTIARY`; Android's volume also goes to that module: `tfa98xx_send_volume`). There is
+  no "SpeakerBoost" firmware for this chip: the container's patch is `9874_dummy.patch` with no writes
+  (`scripts/audio/tfa-cnt.py dump`).
+- Container `odm/firmware/tfa98xx.cnt` (CRC OK, "PM" 3_01): speaker profile TDMSPKG 7 (0x34) / 5 (0x35) with INPLEV 0 and
+  the DC-DC boost on (DCA 1); receiver profile TDMSPKG 13 with INPLEV 1 and DCA 0; DCMCC (coil current) 11 / 10.
+  TDMSPKG = reg 0x61 bits 9:6 is an ATTENUATION: amplifier gain = 21 dB - TDMSPKG, 1 dB per code (TFA9874B / TFA9875
+  data sheet G(TDM-VO) 6..21 dB, "TDMSPKG = 2 typical = 19 dB"; review 2026-10-26). So the vendor speaker runs 14 dB
+  (0x34) / 16 dB (0x35), the receiver 8 dB minus the INPLEV attenuation. (An earlier note here said "higher = louder": wrong.)
+- Status (vendor check `check_err_tfa9874`): reg 0x10 bit 2 = 0 over-temperature, bit 3 = 1 current high, bit 4 = 0 VBAT
+  low, bit 7 = 1 no clock; reg 0x13 bit 8 = 0 VBAT high, bit 9 = 1 clipping; normal 0x0016 / 0x850F.
+- MTP 0xF0..0xFF holds the factory calibration (R25C 0xF5): read only, the table loader refuses writes there.
+
+### Patches
+
+| Patch | What | Boot-args | Log |
+|---|---|---|---|
+| 0244 `negroni-audio-amp-tfa9874` | (1) TLMM fix: 0243 used 0x0f000000 + n * 0x1000 (wrong block; GPIO121..124 stayed GPIO); now 0x0f100000, only GPIO121..124 mapped (32 KiB of io_submap, not 840 KiB). (2) the speaker guard `negroni_audio_guard.c`: cap (default -20 dBFS), HAL volume applied, 20 ms soft start, 200 Hz high-pass, 0.2 s / 3 s power limits, peak limiter, earpiece mix (L+R)/2 to the left slot. (3) `negroni_tfa.c`: bit-banged I2C on GPIO48/49 (the touch driver's `tlmm_i2c.h`), reset pulse GPIO50/51, revision read, the vendor cold start (I2CR, keys, revision table, container device + profile items, INIT_CF, CLKS wait, OPERATING/AMPE 1), TDMSPKG held at or above an attenuation floor (gain = 21 dB - TDMSPKG; never louder than the container) and read back before AMPE, stop (PWDN 1, AMPE 0, MANSTATE 0). Amps start on the first non-silent block, stop after 3 s of silence, on a fault (10 s restart block), on audio stop, on panic/halt (I2C off + reset pins held high, `NegroniPlatformExpert.cpp`). A clipping report lowers the guard 1 dB (max 12 dB). | `negroniaudio_amp=1` (default 0: amps never touched); `negroniaudio_capdb=N` (default 20, min 10); `negroniaudio_spkg=N` (speaker TDMSPKG floor, default 9 = 12 dB; a value below the container's 7/5 is ignored); `negroniaudio_rcvg=N` (receiver floor, default 15 = 6 dB; below the container's 13 ignored); `negroniaudio_amplog=N` (log every register write of the first N starts, default 1) | `NEGRONI TFA:`, `NEGRONI AUDIO: 15 amps on ...` |
+| 0245 `negroni-audio-test-tone` | 1 kHz sine, 2 s + 0.5 s zeros, through the guard (-20 dBFS at the I2S), paced on the DONE events; stops early when no DONE comes after 10 periods; amps off at the end | `negroniaudio_tone=1` speaker, `=2` earpiece | `TONE: ...`, `TONE done in N ms ... periods sent, DONE, dropped` |
+| 0246 `negroni-audio-earpiece-route` | ioctl `NEGRONI_AUDIO_SET_ROUTE` (1 speaker, 2 receiver; ABI in `userland/audio/negroni_audio.h`), sysctl `kern.negroni_audio_route`, sysctl `kern.negroni_audio_tone` (write 1 or 2: the tone now, root) | `negroniaudio_route=1|2` | `route: ...` |
+| 0247 `negroni-audio-graph-mainline` | graph values of the mainline topology: stream container cap CD, device sub-graph direction TX, device container position STREAM, stacks 8192, WR EP media format to the module's own GPR port (`audioreach-topology` `subgraph-*-playback.m4`, Linux `audioreach.c` shmem media format) | `negroniaudio_graph=1` = the 0243 values | `graph values: ...` |
+| 0248 `negroni-adsp-crash-watch` | after step 8: poll slave-kernel every 200 ms; on FATAL: last words, amps + sink off, GLINK stopped, master-kernel "stop" bit 0 (live DT `qcom,smem-state-names = "stop"`) + kick, 5 s for STOP-ACK, PAS shutdown; no restart | (with `negroniadsp=1`) | `NEGRONI ADSP: watch: ...`, `ADSP FATAL AFTER START` |
+
+Tables and tools: `scripts/audio/tfa-cnt.py dump|bin` (container -> `out/firmware/adsp/tfa-init.bin`, 139 writes, sha256
+0407f7f0...; vendor data, never committed), `scripts/audio/mkadsparea.py` now packs `tfa-init.bin` into the ADSP area
+(30 files), `scripts/audio/test-guard.sh` (host test of the guard: PASS; it found the signed/unsigned clamp bug that
+turned negative samples positive, fixed in 0244), `scripts/audio/build-audio-kernel.sh` (kernel only; `IMAGE=1` adds `out/ios16-audio2`).
+HAL: `NegroniAudio.c` logs the kernel's counters and guard peaks every 30 s (`kernel: ...`); `build.sh` PASS.
+
+Build 2026-10-26 (`scripts/audio/build-audio-kernel.sh`, kernel only by the owner rule; lock out/kernel/.lock held):
+`out/kernel/local-20261026-174012/kernel.development.negroni` sha256
+daf42c442b7cd2a94e7a82d214d1461ab76f2f28292b6ba0e26369d831765af7 (after the TDMSPKG-floor fix); patch-report: 0242-0248 applied, all patches/xnu
+applied, only the 4 usual dxb skips; strings `NEGRONI TFA`, `TONE done`, `negroniaudio_amp`, `ADSP FATAL AFTER START`,
+`negroni_audio_route` are in the kernel. Patch sha256: 0244 00a3de42..., 0245 f2cb2217..., 0246 d636a7e6..., 0247
+d2ddaa44..., 0248 7d851d26.... Not booted.
+
+### Phone test (owner approval needed for each write)
+
+1. Charge to > 50 %. Write the new ADSP area (it now holds `tfa-init.bin`): `python3 -I scripts/audio/mkadsparea.py
+   out/firmware/adsp-area.bin`, then the `dd` line in "Stage a" (userdata, recovery). Without the area the amps stay off
+   (`no tfa-init.bin in the ADSP area`).
+2. Boot the main session's combined image with these boot-args (owner rule: agents build no image):
+   `negroniadsp=1 negroniadsp_step=15 negroniaudio_amp=1 negroniaudio_tone=1 negronipanic=30 negronipanicreason=2`
+   (optional: `negroniaudio_capdb=20`, `negroniaudio_spkg=9`, `negroniaudio_rcvg=15`, `negroniaudio_route=1|2`,
+   `negroniaudio_graph=1`, `negroniaudio_v2=1`, `negroniaudio_amplog=1`). Hold the phone away from the ear.
+3. `make usblog`; pass lines in order: `NEGRONI ADSP: THE ADSP IS UP`, `GLINK UP`, `NEGRONI AUDIO: 11 SPF READY`,
+   `12 PRM clock up, I2S pins 121..124 to function 1 (ctl 0x... )` (expect 0xc4 for each: FUNC 1, 8 mA),
+   `GRAPH_OPEN ok`, `GRAPH STARTED`, `THE SPEAKER SINK IS LIVE`, `NEGRONI TFA: 0x34 top ...: TFA9874 revision 0x0?74`,
+   `0x35 ...`, `probe done: 2 of 2 amps usable`, `TONE: ...`, `NEGRONI TFA: 0x34 ...: AMPE 1, ... MANSTATE 9`,
+   `TONE done in ~2500 ms ... DONE 125`. The owner HEARS 2 s of 1 kHz from both speakers.
+4. Failure map: `no CLKS after 100 ms` = no I2S clock at the amps (PRM clock, pins, graph not running);
+   `TONE stopped: no DONE` = the ADSP does not take the data (try `negroniaudio_v2=1`, then the SMMU); `GRAPH_OPEN failed`
+   = try `negroniaudio_graph=1`; `no TFA9874 (rc -2)` = NACK (I2C pins, reset level).
+5. Earpiece: `sysctl -w kern.negroni_audio_tone=2` over SSH (or `negroniaudio_tone=2`).
+
+### Not done (honest sizes, from the audit and this review)
+
+- Mic (`/dev/negroni-audio-in`, TX graph): needs the LPASS TX macro DMIC setup (MMIO 0x3220000 + its clocks through PRM),
+  the LPI pins, the WCD938x mic bias over the TX/VA SoundWire master (SoundWire master bring-up + WCD938x register access),
+  and a CODEC_DMA TX-3 -> RD_SH_MEM_EP graph. 3000+ lines, weeks. Not started; the HAL "Codec" input stays silent.
+- Headset: WCD938x RX path + MBHC + the fsa4480 USB-C switch: after the mic work. Not started.
+- iOS route to the earpiece: VirtualAudio knows a receiver port ("Built-In Receiver", port type `prec` [I]) but how
+  the HAL plug-in must offer it (a data source on the Speaker output or a separate device) is not known [U]. The kernel
+  side is done (0246); the plug-in does not call SET_ROUTE yet.
+- servreg locator / PD mapper (audit item 3): only if step 11 never reports SPF ready.
+- SMMU context for SID 0x1801 (audit item 4): only if no DONE comes with V1 and V2.
+- No ACDB calibration, no NXP protection algorithm: the guard + the TDMSPKG floors are the only protection.
+
 ## Stage b: GLINK, QRTR, GPR and the AudioReach speaker graph (implemented 2026-10-26, patch 0243; the facts below are the design)
 
 Kernel files (names from the draft `out/kernel/tree-audio/bsd/dev/negroni_audio_internal.h`, not a
@@ -402,7 +492,7 @@ Facts [V unless marked; `TFA` = the OnePlus tfa98xx-v6 driver, the container par
 - Status while playing (Oplus check, `TFA/tfa98xx_v6.c:2998-3032`): reg 0x10 = 0x0016, reg 0x13 =
   0x850F. Faults: 0x10 bit 2 = 0 over-temperature, bit 3 = 1 over-current, bit 4 = 0 VBAT low,
   bit 7 = 1 no clock; 0x13 bit 9 clipping.
-- Speaker gain: TDMSPKG 0x61 bits 9:6 (0..15); dB per step [U]. Impedance window 5000-8000 mOhm
+- Speaker gain: TDMSPKG 0x61 bits 9:6 (0..15) is an attenuation: gain = 21 dB - TDMSPKG (see the 0244 section). Impedance window 5000-8000 mOhm
   (DT); calibration in MTP (MTPEX 0xF0 bit 1, R25C reg 0xF5 in mOhm): **read only, never write MTP**.
 - Bus: SE13 has GPI DMA in the DT but no `qcom,shared`; FIFO use depends on GENI_IF_DISABLE_RO
   (0xa94064 bit 0) [U: read it on the phone]. Fallback: bit-bang on GPIO48/49 at 100 kHz.
@@ -413,7 +503,7 @@ Plan (boot-arg `negroniaudio=3`, log `NEGRONI TFA:`):
    read 0xa94064. No writes but the reset GPIO.
 2. Init without clock: I2CR, keys, the revision table, the container items, profile "speaker";
    read back.
-3. With the stage b clock running: PWDN 0, wait CLKS/PLLS, AMPE 1 at a low TDMSPKG (start at 3);
+3. With the stage b clock running: PWDN 0, wait CLKS/PLLS, AMPE 1 at a high TDMSPKG (low gain; 0244 uses >= 9);
    log the status regs every second.
 
 Safety: no NXP protection algorithm. Only the on-chip protections (OCP, OTP, UVP/OVP, DCMCC coil

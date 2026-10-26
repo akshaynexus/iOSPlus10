@@ -1,0 +1,152 @@
+diff --git a/bsd/dev/negroni_audio.c b/bsd/dev/negroni_audio.c
+index f9e174c..177221f 100644
+--- a/bsd/dev/negroni_audio.c
++++ b/bsd/dev/negroni_audio.c
+@@ -54,6 +54,7 @@
+ #include "negroni_audio_guard.h"
+ #include "negroni_tfa.h"
+ #include <kern/thread.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+@@ -1127,6 +1128,34 @@ sink_feed(const int16_t *fr, uint32_t n)
+ 	}
+ }
+ 
++/*
++ * 0246: the earpiece. NEGRONI_TFA_ROUTE_* = NEGRONI_AUDIO_ROUTE_* (1 speaker, 2 receiver). The amps
++ * stop on a change; the next sound starts the new route (with the guard's 20 ms ramp).
++ */
++_Static_assert(NEGRONI_AUDIO_ROUTE_SPEAKER == NEGRONI_TFA_ROUTE_SPEAKER &&
++    NEGRONI_AUDIO_ROUTE_RECEIVER == NEGRONI_TFA_ROUTE_RECEIVER, "route numbers");
++static int
++route_set(uint32_t r)
++{
++	if (r != NEGRONI_AUDIO_ROUTE_SPEAKER && r != NEGRONI_AUDIO_ROUTE_RECEIVER) {
++		return EINVAL;
++	}
++	if (feed_lock == NULL) {
++		audio_route = r;
++		return 0;
++	}
++	lck_mtx_lock(feed_lock);
++	if (r != audio_route) {
++		audio_route = r;
++		say("route: %s", r == NEGRONI_AUDIO_ROUTE_RECEIVER ? "earpiece (0x34, profile receiver)" : "speaker (both amps)");
++		if (negroni_tfa_playing()) {
++			negroni_tfa_stop("route change");
++		}
++	}
++	lck_mtx_unlock(feed_lock);
++	return 0;
++}
++
+ static int
+ audio_write(dev_t dev, struct uio *uio, int ioflag)
+ {
+@@ -1175,6 +1204,10 @@ audio_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
+ 		ng_guard_volume(volume_below, muted);
+ 		return 0;
+ 	}
++	case NEGRONI_AUDIO_SET_ROUTE: {
++		uint32_t r = *(uint32_t *)(void *)data;
++		return route_set(r);
++	}
+ 	case NEGRONI_AUDIO_GET_STATS: {
+ 		struct negroni_audio_stats *st = (void *)data;
+ 		bzero(st, sizeof(*st));
+@@ -1254,7 +1287,7 @@ tone_play(uint32_t route)
+ 	sent0 = periods_sent;
+ 	drop0 = frames_dropped;
+ 	lck_mtx_unlock(audio_lock);
+-	audio_route = route;
++	(void)route_set(route);
+ 	say("TONE: 1 kHz, 2 s, %s, -%u dBFS at the I2S (guard cap), amps %s", route == NEGRONI_TFA_ROUTE_RECEIVER ?
+ 	    "earpiece (left slot, 0x34)" : "speaker (both)", ng_guard_cap_db(), amps_probed ? "probed" : "NOT probed (no sound)");
+ 	ng_guard_stats(&pin, &pout, &gq);               /* clear the peaks */
+@@ -1301,9 +1334,53 @@ tone_play(uint32_t route)
+ 	    frames_dropped - drop0, waits, pin, pout, gq);
+ 	lck_mtx_unlock(audio_lock);
+ 	negroni_tfa_stop("tone done");
+-	audio_route = NEGRONI_TFA_ROUTE_SPEAKER;
+ }
+ 
++/*
++ * sysctl kern.negroni_audio_route (1 speaker, 2 earpiece) and kern.negroni_audio_tone (write 1 or 2:
++ * the 0245 tone on that route now; root only; needs the running sink). For tests over SSH.
++ */
++static int
++sysctl_audio_route(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int v = (int)audio_route, changed = 0, error;
++
++	error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	return route_set((uint32_t)v);
++}
++SYSCTL_PROC(_kern, OID_AUTO, negroni_audio_route, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_audio_route, "I", "NEGRONI audio route: 1 speaker, 2 earpiece");
++
++static int
++sysctl_audio_tone(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int v = 0, changed = 0, error;
++	uint32_t keep;
++
++	error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (req->p != NULL && proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (v != 1 && v != 2) {
++		return EINVAL;
++	}
++	if (!sink_on || !graph_started) {
++		return ENODEV;
++	}
++	keep = audio_route;
++	tone_play(v == 2 ? NEGRONI_TFA_ROUTE_RECEIVER : NEGRONI_TFA_ROUTE_SPEAKER);
++	(void)route_set(keep);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, negroni_audio_tone, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sysctl_audio_tone, "I", "NEGRONI audio: write 1 (speaker) or 2 (earpiece): 2 s 1 kHz test tone");
++
+ static bool
+ step_sink(void)
+ {
+@@ -1330,6 +1407,11 @@ step_sink(void)
+ 	say("guard: cap -%u dBFS (negroniaudio_capdb, >= %u), 200 Hz high-pass, power + peak limiter", ng_guard_cap_db(),
+ 	    NG_GUARD_MIN_CAP_DB);
+ 	say("THE SPEAKER SINK IS LIVE: write S16LE stereo 48 kHz to /dev/negroni-audio");
++	{
++		uint32_t r = NEGRONI_AUDIO_ROUTE_SPEAKER;
++		(void)PE_parse_boot_argn("negroniaudio_route", &r, sizeof(r));
++		(void)route_set(r);
++	}
+ 	amps_setup();
+ 	(void)PE_parse_boot_argn("negroniaudio_tone", &tone, sizeof(tone));
+ 	if (tone == 1 || tone == 2) {
+diff --git a/bsd/dev/negroni_audio_abi.h b/bsd/dev/negroni_audio_abi.h
+index 165a5b4..d03bb15 100644
+--- a/bsd/dev/negroni_audio_abi.h
++++ b/bsd/dev/negroni_audio_abi.h
+@@ -45,5 +45,13 @@ struct negroni_audio_stats {
+ 
+ #define NEGRONI_AUDIO_SET_VOLUME        _IOW('n', 1, struct negroni_audio_volume)
+ #define NEGRONI_AUDIO_GET_STATS         _IOR('n', 2, struct negroni_audio_stats)
++/*
++ * 0246: the output route of the Speaker stream. SPEAKER: both TFA9874 amps (stereo); RECEIVER: the
++ * top amp only in its "receiver" profile (the earpiece; the kernel plays (L + R) / 2). A change
++ * stops the amps; the next non-silent write starts the new route. Also: sysctl kern.negroni_audio_route.
++ */
++#define NEGRONI_AUDIO_ROUTE_SPEAKER     1u
++#define NEGRONI_AUDIO_ROUTE_RECEIVER    2u
++#define NEGRONI_AUDIO_SET_ROUTE         _IOW('n', 3, uint32_t)
+ 
+ #endif
