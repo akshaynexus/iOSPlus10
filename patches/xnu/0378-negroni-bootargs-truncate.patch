@@ -1,0 +1,41 @@
+0378-negroni-bootargs-truncate: kern.bootargs truncates to the caller's buffer instead of ENOMEM.
+
+Cause of the watchdogd SIGTRAP loop (docs/notes.md, section "watchdogd SIGTRAP"): 0363 raised BOOT_LINE_LENGTH to
+1024. iOS 16 watchdogd (20H392, /usr/libexec/watchdogd) reads kern.bootargs once in a dispatch_once block with
+sysctlbyname("kern.bootargs", buf, &len = 0x260 (608), NULL, 0). With a command line of 608 bytes or more,
+sysctl_io_string(trunc 0) -> SYSCTL_OUT fails with ENOMEM, watchdogd calls _os_crash("could not retrieve device
+boot-args") + brk #1 (pc 0x10000b620) = EXC_BREAKPOINT / SIGTRAP, and launchd respawns it every ~10 s.
+Fix: trunc 1, so a too-small buffer gets the first oldlen-1 bytes + NUL (the 608-byte kernels gave the same 607
+bytes). A size query (oldptr NULL) still returns the full length. The first 8 truncations log
+"NEGRONI: kern.bootargs truncated to N of M bytes for <proc>". No watchdog hardware is touched.
+
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2167,7 +2167,26 @@
+ 	char buf[BOOT_LINE_LENGTH];
+ 
+ 	strlcpy(buf, PE_boot_args(), BOOT_LINE_LENGTH);
+-	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 0, NULL);
++	/*
++	 * negroni 0378: BOOT_LINE_LENGTH is 1024 here (0363), but iOS 16 user space sizes its
++	 * kern.bootargs buffer with the old arm64 value 608 (watchdogd: char[0x260]). A command line of
++	 * 608 bytes or more made SYSCTL_OUT fail with ENOMEM, and watchdogd hit os_crash
++	 * ("could not retrieve device boot-args", SIGTRAP) on each launchd respawn. Truncate to the
++	 * caller's buffer instead (always NUL-terminated): a 608-byte buffer gets the first 607 bytes,
++	 * which is what the 608-byte kernels returned. A size query (oldptr NULL) still gets the full length.
++	 */
++	if (req->oldptr != USER_ADDR_NULL && req->oldlen != 0 &&
++	    req->oldlen < strlen(buf) + 1) {
++		static uint32_t negroni_bootargs_trunc_logged;
++		if (negroni_bootargs_trunc_logged < 8) {
++			char name[32];
++			negroni_bootargs_trunc_logged++;
++			proc_selfname(name, sizeof(name));
++			printf("NEGRONI: kern.bootargs truncated to %lu of %lu bytes for %s\n",
++			    (unsigned long)req->oldlen - 1, (unsigned long)strlen(buf), name);
++		}
++	}
++	error = sysctl_io_string(req, buf, BOOT_LINE_LENGTH, 1, NULL);
+ 	return error;
+ }
+ 

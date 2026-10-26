@@ -602,6 +602,8 @@ Interference check [V code]:
 - `wdt=-1` (config boot-args): the kernel's watchdog stays off; it is not in this path.
 - `watchdogd`: the slop `IOWatchdog` service (slop 0040/0045) accepts every call and has no reset path;
   launchd stops watchdogd during the shutdown [I]. Nothing in the kernel resets the phone in the shutdown path.
+  watchdogd crashed (SIGTRAP, respawn every ~10 s) with boot-args of 608 bytes or more after 0363: kern.bootargs
+  gave ENOMEM to its 608-byte buffer. 0378 truncates instead (docs/notes.md section 51).
 - `negronipanic`: only for panics (`kPEPanicBegin` / `kPEPanicRestartCPU`), not for a normal halt.
 - No change needed: no patch 0215.
 
