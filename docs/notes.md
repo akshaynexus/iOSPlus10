@@ -2232,3 +2232,26 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   anchor each on a unique neighbour; take a fresh patched-tree.sh tree when other agents' patches changed.
 - Stopped by limits: the 0331 BT HCI agent and the seven audit agents (docs/audit/2026-10-26-*.md) hit the session
   limit at 14:25 (reset 17:20); resume them with one message each. The 0331 brief: Linux hci_qca.c/btqca.c port.
+
+## 27. First boot of out/ios16-everything: panic in the apps-SMMU SMR scan (2026-10-26 23:30, main session)
+
+- Flash: userdata (ios16-root.simg, 45 sparse chunks, 310 s in fastbootd), then vendor_boot_a, vbmeta_a, dtbo
+  (erase), boot_a (1b73f70d...), slot a active. Kernel local-20261026-174831 (233 patches).
+- [V] Panic (photo of the screen; USB log empty, the panic came before the USB console was up): `Kernel data abort`,
+  pc 0xfffffe0007546524 = `_wlan_dma_path+0x170`, lr `+0x140` (right after the "apps SMMU sCR0 .. IDR0 .. (113 SMRs)"
+  printf), far 0xfffffe51ad324800 = the SMMU mapping + 0x800 = **SMR0**, esr 0x96000010 = data abort, DFSC 0x10 =
+  synchronous external abort. x8 = 0: the first SMR read faulted. Reads of sCR0 (+0), IDR0 (+0x20), IDR1 (+0x24),
+  sGFSR (+0x48) in the same 16 KiB mapping answered just before (113 SMR groups, EXIDS 0, USFCFG 1, CLIENTPD 0).
+- [V] The same scan is in patches 0263 (wlan_dma_path, Wi-Fi level 2 step 6), 0324 (negroniwlan_smmu=3 path) and
+  0312 (camera level 3 step 13). 0243/0244 (audio) only name the address, they read nothing. The Adreno GPU SMMU
+  (0x3da0000) is a different SMMU and XNU programs its SMR/S2CR fine (ADRENO step 13/19 lines in every usblog).
+- [I] The hypervisor (QHEE/Gunyah) injects the SEA: Linux reports the same ESR 0x96000010 on S2CR writes for a
+  stream the hypervisor refuses (purwa GPU SID 1 patch, 2026-04; lemans S2CR 0xc28). Research agent report:
+  docs/notes.md section 28 (pending).
+- The last line on the screen, `handshake structure not initialized`, is only the kdp shared-memory coredump stage
+  (osfmk/kdp/output_stages/out_shmem.c:499) that runs after the panic text; it is not the error.
+- `negronipanic=30 negronipanicreason=2` did not bring the phone to fastboot within minutes (no `fastboot devices`);
+  the panic screen stayed. Reset by hand (power + volume down).
+- Fallback image `out/ios16-nosmmu` (same ADT/vendor_boot/kernel; boot-args of everything with `negroniwlan=1`
+  (survey only), `negronicam=2`): boot_a 6380e314..., esp 5dc6dc20.... Waiter `flash-nosmmu` flashes boot_a when the
+  phone appears in fastboot.
