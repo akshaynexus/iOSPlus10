@@ -1,0 +1,138 @@
+0343-negroni-wlan-boot-dump-pcie: Wi-Fi, a more precise SBL boot dump (boot-arg negroniwlan_bootdbg, default 1 = on,
+read only). Every 0339 BOOT dump (before BHI, after BHI DONE, every 3 s while waiting for READY, at the time-out) gets
+three more lines: "BOOT <when>: PCIe ..." (chip PCIE_INT_ALL_STATUS / PARF_INT_STATUS / INT_ALL_MASK, PARF_LTSSM,
+PM_STTS, GCC_PCIE_HOT_RST, PCIE_SOC_GLOBAL_RESET, PCIE_SOC_WAKE), "BOOT <when>: WLAON ..." (SOC_POWER_CTRL, Q6 cookie,
+WARM_SW_ENTRY, RESET_DBG_SW_ENTRY, DEBUG, WLPM_SIGNAL, PBL_STACK_CANARY, POWERCTRL_PMU, PCIE_PWR_CTRL, QFPROM_PWR_CTRL;
+not the read-clear SOC_RESET_CAUSE), "BOOT <when>: host PCIe ..." (endpoint and root-port command/status, PCIe DEVSTA,
+root-port secondary status, MSI control) and a "verdict:" line (pending chip PCIe interrupts, a warm-boot entry, an
+abort on the chip's DMA read, root-port error bits). Register names from ath11k pci.h and cnss2 reg.h.
+
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index 165cc70..39bc9eb 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -551,6 +551,10 @@ wlan_pcie_sid(bool program)
+ #define QCA_SRAM_START          0x01400000u
+ #define QCA_SRAM_END            0x01800000u
+ 
++/* 0343: the PCIe-side and WLAON registers of the boot dump (after the 0342 register names); negroniwlan_bootdbg */
++static uint32_t g_bootdbg = 1;
++static void wlan_boot_dump_pcie(const char *when);
++
+ void
+ negroni_wlan_boot_dump(struct mhi_host *h, const char *when)
+ {
+@@ -593,6 +597,7 @@ negroni_wlan_boot_dump(struct mhi_host *h, const char *when)
+ 	} else {
+ 		printf("NEGRONI WLAN: BOOT %s: no SBL log (start %#x size %#x outside the SRAM)\n", when, sbl_start, sbl_size);
+ 	}
++	wlan_boot_dump_pcie(when);      /* 0343 */
+ 	(void)negroni_wlan_smmu_check(when);
+ }
+ 
+@@ -751,6 +756,97 @@ wlan_sw_reset(void)
+ 	return 0;
+ }
+ 
++/*
++ * 0343: a more precise boot dump (negroniwlan_bootdbg=1, the default; 0 = off). The 0339 lines could not tell a
++ * crashed SBL from one that never started, nor a DMA that failed on the bus. Added, read only:
++ *   - chip PCIe side: PCIE_INT_ALL_STATUS / PARF_INT_STATUS / INT_ALL_MASK (a latched hot-reset or link-down interrupt
++ *     = ath11k's "SBL ... crash immediately" case), PARF_LTSSM, PARF_PM_STTS, GCC_PCIE_HOT_RST, PCIE_SOC_GLOBAL_RESET,
++ *     PCIE_SOC_WAKE;
++ *   - WLAON (cnss2 wlaon_reg_access_seq): SOC_POWER_CTRL, Q6 cookie, WARM_SW_ENTRY (non-zero = the Q6 takes the
++ *     warm path), RESET_DBG_SW_ENTRY, WLAON_DEBUG, WLPM_SIGNAL, PBL_STACK_CANARY, POWERCTRL_PMU, PCIE_PWR_CTRL,
++ *     QFPROM_PWR_CTRL. WLAON_SOC_RESET_CAUSE is read-clear: only 0342 reads it;
++ *   - host PCIe side: the endpoint and root-port command/status and PCIe DEVSTA (status bit 28 received target
++ *     abort / bit 29 received master abort on the endpoint = the chip's BHI read got a CA/UR completion; DEVSTA
++ *     bits 0-3 = correctable / non-fatal / fatal / UR detected), the root port's secondary status, the MSI control.
++ * One line "BOOT <when>: PCIe ..." and one line "BOOT <when>: WLAON ...", plus a verdict line.
++ */
++#define QCA_PCIE_PARF_PM_STTS           0x01e08024u
++#define QCA_WLAON_SOC_POWER_CTRL        0x01f80000u
++#define QCA_WLAON_RESET_DBG_SW_ENTRY    0x01f80508u
++#define QCA_WLAON_DEBUG                 0x01f80600u
++#define QCA_WLAON_WLPM_SIGNAL           0x01f80608u
++#define QCA_WLAON_PBL_STACK_CANARY      0x01f80614u
++#define QCA_WLAON_POWERCTRL_PMU         0x01f806b4u
++#define QCA_WLAON_PCIE_PWR_CTRL         0x01f806bcu
++
++/* the PCIe capability (ID 0x10) of a config space, 0 if none (bounded walk) */
++static uint32_t
++wlan_pcie_cap(volatile uint32_t *cfg)
++{
++	for (uint32_t ptr = cfg[0x34 / 4] & 0xfcu, guard = 48; ptr >= 0x40 && guard--; ) {
++		uint32_t h = cfg[ptr / 4];
++		if (h == MHI_ALL_ONES) {
++			return 0;
++		}
++		if ((h & 0xffu) == 0x10u) {
++			return ptr;
++		}
++		ptr = (h >> 8) & 0xfcu;
++	}
++	return 0;
++}
++
++static void
++wlan_boot_dump_pcie(const char *when)
++{
++	if (!g_bootdbg || !g_bar0) {
++		return;
++	}
++	uint32_t ia = negroni_wlan_reg_rd(QCA_PCIE_INT_ALL_STATUS), pi = negroni_wlan_reg_rd(QCA_PCIE_PARF_INT_STATUS);
++	printf("NEGRONI WLAN: BOOT %s: PCIe INT_ALL_STATUS %#x PARF_INT_STATUS %#x INT_ALL_MASK %#x PARF_LTSSM %#x PM_STTS %#x "
++	    "HOT_RST %#x GLOBAL_RESET %#x SOC_WAKE %#x\n", when, ia, pi, negroni_wlan_reg_rd(QCA_PCIE_INT_ALL_MASK),
++	    negroni_wlan_reg_rd(QCA_PCIE_PARF_LTSSM), negroni_wlan_reg_rd(QCA_PCIE_PARF_PM_STTS),
++	    negroni_wlan_reg_rd(QCA_GCC_PCIE_HOT_RST), negroni_wlan_rd(QCA_PCIE_SOC_GLOBAL_RESET),
++	    negroni_wlan_rd(QCA_PCIE_SOC_WAKE));
++	uint32_t warm = negroni_wlan_reg_rd(QCA_WLAON_WARM_SW_ENTRY);
++	printf("NEGRONI WLAN: BOOT %s: WLAON SOC_POWER_CTRL %#x Q6_COOKIE %#x WARM_SW_ENTRY %#x RESET_DBG_SW_ENTRY %#x DEBUG %#x "
++	    "WLPM_SIGNAL %#x PBL_STACK_CANARY %#x POWERCTRL_PMU %#x PCIE_PWR_CTRL %#x QFPROM_PWR_CTRL %#x\n", when,
++	    negroni_wlan_reg_rd(QCA_WLAON_SOC_POWER_CTRL), negroni_wlan_reg_rd(QCA_PCIE_Q6_COOKIE_ADDR), warm,
++	    negroni_wlan_reg_rd(QCA_WLAON_RESET_DBG_SW_ENTRY), negroni_wlan_reg_rd(QCA_WLAON_DEBUG),
++	    negroni_wlan_reg_rd(QCA_WLAON_WLPM_SIGNAL), negroni_wlan_reg_rd(QCA_WLAON_PBL_STACK_CANARY),
++	    negroni_wlan_reg_rd(QCA_WLAON_POWERCTRL_PMU), negroni_wlan_reg_rd(QCA_WLAON_PCIE_PWR_CTRL),
++	    negroni_wlan_reg_rd(QCA_WLAON_QFPROM_PWR_CTRL));
++
++	uint32_t ep_cs = MHI_ALL_ONES, ep_dev = MHI_ALL_ONES, msi = MHI_ALL_ONES;
++	uint32_t rp_cs = MHI_ALL_ONES, rp_sec = MHI_ALL_ONES, rp_dev = MHI_ALL_ONES;
++	if (P.cfg_bus1) {
++		volatile uint32_t *cfg = (volatile uint32_t *)P.cfg_bus1;
++		uint32_t cap = wlan_pcie_cap(cfg);
++		ep_cs = cfg[0x04 / 4];
++		ep_dev = cap ? cfg[(cap + 0x08) / 4] : MHI_ALL_ONES;
++		msi = cfg[0x50 / 4];                    /* survey step 10: MSI capability at 0x50 */
++	}
++	if (P.dbi) {
++		volatile uint32_t *dbi = (volatile uint32_t *)P.dbi;
++		uint32_t cap = wlan_pcie_cap(dbi);
++		rp_cs = dbi[0x04 / 4];
++		rp_sec = dbi[0x1c / 4];
++		rp_dev = cap ? dbi[(cap + 0x08) / 4] : MHI_ALL_ONES;
++	}
++	printf("NEGRONI WLAN: BOOT %s: host PCIe endpoint CMD/STS %#x DEVCTL/STA %#x MSI %#x; root port CMD/STS %#x "
++	    "SEC_STS %#x DEVCTL/STA %#x\n", when, ep_cs, ep_dev, msi, rp_cs, rp_sec, rp_dev);
++
++	/* a verdict from what is set (observations only; the meaning is the PCI spec's and ath11k's) */
++	bool dma_err = ep_cs != MHI_ALL_ONES && (ep_cs & (3u << 28));
++	bool rp_err = rp_sec != MHI_ALL_ONES && (rp_sec & (0xfu << 27));
++	printf("NEGRONI WLAN: BOOT %s: verdict:%s%s%s%s%s\n", when,
++	    (ia && ia != MHI_ALL_ONES) ? " chip PCIe interrupts pending (ath11k: the SBL crashes on them; try negroniwlan_swreset=1)" : "",
++	    (warm && warm != MHI_ALL_ONES) ? " WARM_SW_ENTRY set (ath11k: warm path dead loop; try negroniwlan_swreset=1)" : "",
++	    dma_err ? " the chip received an abort on a DMA read (CA/UR from the host: check the IOVA / SMMU / BDF-to-SID)" : "",
++	    rp_err ? " root port secondary status has error bits" : "",
++	    (!(ia && ia != MHI_ALL_ONES) && !(warm && warm != MHI_ALL_ONES) && !dma_err && !rp_err) ? " no PCIe/WLAON error bit" : "");
++}
++
+ /* Turn off bus mastering: from here on the chip cannot read or write host memory (PCIe BME). */
+ static void
+ wlan_quiesce(struct negroni_wlan_pcie *p)
+@@ -1431,6 +1527,7 @@ negroni_wlan_start(void)
+ 	(void)PE_parse_boot_argn("negroniwlan_smmu", &g_smmu_policy, sizeof(g_smmu_policy));
+ 	(void)PE_parse_boot_argn("negroniwlan_keep", &g_keep_s, sizeof(g_keep_s));
+ 	(void)PE_parse_boot_argn("negroniwlan_swreset", &g_swreset, sizeof(g_swreset));     /* 0342 */
++	(void)PE_parse_boot_argn("negroniwlan_bootdbg", &g_bootdbg, sizeof(g_bootdbg));     /* 0343 */
+ 	g_swreset = MIN(g_swreset, 2u);
+ 	g_timeout_ms = MIN(MAX(g_timeout_ms, 100u), 60000u);
+ 	g_level = MAX(g_level, (uint32_t)WLAN_LEVEL_SBL);

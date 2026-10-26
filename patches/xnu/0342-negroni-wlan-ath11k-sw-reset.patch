@@ -1,0 +1,287 @@
+0342-negroni-wlan-ath11k-sw-reset: Wi-Fi, the ath11k power-up reset before the BHI SBL download, boot-arg
+negroniwlan_swreset (default 0 = off). Phone t6 + the 0339 boot: BHI SBL DONE, no SMMU fault, then EE 0, MHISTATUS 0
+and no SBL log pointer for 30 s. ath11k pci.c ath11k_pci_sw_reset(ab, true) runs before every MHI power-up; cnss2
+skips it because it power-cycles all five rails, which we do not (the aon rail stays on). =1: PARF_LTSSM 0x111 +
+GCC_PCIE_HOT_RST, PCIE_INT_ALL_CLEAR (ath11k: a latched hot-reset interrupt crashes the SBL when it opens its
+interrupts), QFPROM VDD4BLOW off, BHIe vector registers 0 (relative to MHI_BHIEOFF), Q6 cookie read,
+WLAON_WARM_SW_ENTRY = 0 (ath11k: else the Q6 takes the warm path into a dead loop), WLAON_SOC_RESET_CAUSE read-clear.
+=2: also PCIE_SOC_GLOBAL_RESET pulse (10 ms + 10 ms), the window cache forgotten, endpoint BAR0/command checked and
+restored, MHICTRL = RESET, then the PBL SYSERR reset of pm.c mhi_async_power_up. Every value is logged
+("NEGRONI WLAN: SW RESET: ...").
+
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index c6f37ad..165cc70 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -135,6 +135,13 @@ static uint32_t g_fw_size;
+ static const char *g_fw;
+ static bool g_master;                   /* bus master was turned on (BAR0 claimed) */
+ static vm_offset_t g_xfer_kva;          /* 0264: IPCR RX/TX buffers (cacheable view; H.xfer_nc is the NC one) */
++/*
++ * 0342: boot-arg negroniwlan_swreset, the ath11k power-up reset before BHI (wlan_sw_reset): 0 off (the 0261-0341
++ * flow), 1 the clears only (LTSSM, PCIe interrupts, QFPROM power, BHIe vectors, warm-boot entry, reset cause),
++ * 2 the clears + PCIE_SOC_GLOBAL_RESET + MHICTRL RESET (the full ath11k_pci_sw_reset(ab, true) order).
++ */
++static uint32_t g_swreset;
++static uint64_t g_bar_pa;               /* 0342: BAR0 bus address, to check the BAR after a SoC reset */
+ 
+ /* ---- step lines (0263): "step N NAME" before, "step N NAME failed: REASON" on an error ---- */
+ static uint32_t g_step;
+@@ -412,6 +419,7 @@ wlan_bar0(struct negroni_wlan_pcie *p)
+ 	cfg[0x04 / 4] = (cmd & ~1u) | (1u << 1) | (1u << 2);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 
++	g_bar_pa = base;
+ 	g_bar_len = (uint32_t)MIN(size, (uint64_t)BAR0_MAP);
+ 	g_bar0 = ml_io_map_unmappable((vm_offset_t)base, g_bar_len, WLAN_WIMG_IO);
+ 	if (!g_bar0) {
+@@ -588,6 +596,161 @@ negroni_wlan_boot_dump(struct mhi_host *h, const char *when)
+ 	(void)negroni_wlan_smmu_check(when);
+ }
+ 
++/*
++ * 0342: the ath11k power-up reset before the BHI download (wlan-linux ath11k pci.c:380 ath11k_pci_sw_reset(ab, true),
++ * called by ath11k_pci_power_up before mhi_sync_power_up; registers from ath11k pci.h, same values in cnss2 reg.h).
++ * Phone t6 + the 0339 boot: BHI SBL DONE, no SMMU fault, then EE 0 and MHISTATUS 0 for 30 s and no SBL log pointer
++ * (PCIE_BHI_ERRDBG2 0): the SBL never reached its MHI start. ath11k names two causes that fit:
++ *   - PCIE_PCIE_INT_ALL_CLEAR: "When target receive Hotreset, but will set the interrupt. So when download SBL again,
++ *     SBL will open Interrupt and receive it, and crash immediately." (the survey trains the link up to 3 times)
++ *   - WLAON_WARM_SW_ENTRY = 0: "prevent Q6 from continuing warm path and entering dead loop"; WLAON_SOC_RESET_CAUSE
++ *     is read-clear: "prevent Q6 from entering wrong code path". The WLAON block is on the aon rail (pmr735a_s2,
++ *     shared, never cycled by us), so it can keep a warm entry from an earlier boot (Android, or an iOS attempt).
++ * cnss2 (Android) does none of this: it power-cycles all five rails, which we do not. ath11k's clear_vector writes
++ * 0x360/0x368/0x394/0x39c = BHIe 0x324 + TXVECDB/TXVECSTATUS/RXVECDB/RXVECSTATUS (QCA6390); this chip reports
++ * BHIe at 0x224, so the same four registers are written relative to MHI_BHIEOFF. fix_l1ss is false for WCN6855.
++ */
++#define QCA_PCIE_SOC_WAKE               0x3004u         /* BAR0 direct (below the window) */
++#define QCA_PCIE_SOC_GLOBAL_RESET       0x3008u
++#define QCA_PCIE_SOC_GLOBAL_RESET_V     0x1u
++#define QCA_PCIE_PARF_LTSSM             0x01e081b0u
++#define QCA_PARM_LTSSM_VALUE            0x111u
++#define QCA_GCC_PCIE_HOT_RST            0x01e402bcu
++#define QCA_GCC_PCIE_HOT_RST_VAL        0x10u
++#define QCA_PCIE_PARF_INT_STATUS        0x01e08220u
++#define QCA_PCIE_INT_ALL_STATUS         0x01e08224u
++#define QCA_PCIE_INT_ALL_CLEAR          0x01e08228u
++#define QCA_PCIE_INT_ALL_MASK           0x01e0822cu
++#define QCA_WLAON_QFPROM_PWR_CTRL       0x01f8031cu
++#define QCA_QFPROM_VDD4BLOW             0x4u
++#define QCA_PCIE_Q6_COOKIE_ADDR         0x01f80500u
++#define QCA_WLAON_WARM_SW_ENTRY         0x01f80504u
++#define QCA_WLAON_SOC_RESET_CAUSE       0x01f8060cu     /* read-clear: read only in wlan_sw_reset */
++#define QCA_BHIE_TXVECDB                0x3cu
++#define QCA_BHIE_TXVECSTATUS            0x44u
++#define QCA_BHIE_RXVECDB                0x70u
++#define QCA_BHIE_RXVECSTATUS            0x78u
++
++static int
++wlan_sw_reset(void)
++{
++	volatile uint32_t *cfg = (volatile uint32_t *)P.cfg_bus1;
++	uint32_t v, i;
++
++	if (!g_swreset) {
++		printf("NEGRONI WLAN: SW RESET off (negroniwlan_swreset=0): BHI on the chip as the survey left it\n");
++		return 0;
++	}
++	printf("NEGRONI WLAN: SW RESET level %u (ath11k_pci_sw_reset order%s)\n", g_swreset,
++	    g_swreset >= 2 ? ", with PCIE_SOC_GLOBAL_RESET" : ", no SoC reset");
++	negroni_wlan_nap(100);                          /* ath11k: mdelay(100) first */
++
++	/* ath11k_pci_enable_ltssm: PARF_LTSSM = 0x111 (up to 5 writes), then GCC_PCIE_HOT_RST |= 0x10, 5 ms */
++	uint32_t ltssm0 = negroni_wlan_reg_rd(QCA_PCIE_PARF_LTSSM);
++	v = ltssm0;
++	for (i = 0; v != QCA_PARM_LTSSM_VALUE && i < 5; i++) {
++		if (v == MHI_ALL_ONES) {
++			delay(5000);
++		}
++		negroni_wlan_reg_wr(QCA_PCIE_PARF_LTSSM, QCA_PARM_LTSSM_VALUE);
++		v = negroni_wlan_reg_rd(QCA_PCIE_PARF_LTSSM);
++	}
++	uint32_t hot0 = negroni_wlan_reg_rd(QCA_GCC_PCIE_HOT_RST);
++	negroni_wlan_reg_wr(QCA_GCC_PCIE_HOT_RST, hot0 | QCA_GCC_PCIE_HOT_RST_VAL);
++	uint32_t hot = negroni_wlan_reg_rd(QCA_GCC_PCIE_HOT_RST);
++	delay(5000);
++	printf("NEGRONI WLAN: SW RESET: PARF_LTSSM %#x -> %#x (%u writes), GCC_PCIE_HOT_RST %#x -> %#x\n", ltssm0, v, i,
++	    hot0, hot);
++
++	/* ath11k_pci_clear_all_intrs: the interrupts a hot reset / link-down left for the SBL */
++	uint32_t ia = negroni_wlan_reg_rd(QCA_PCIE_INT_ALL_STATUS), pi = negroni_wlan_reg_rd(QCA_PCIE_PARF_INT_STATUS);
++	negroni_wlan_reg_wr(QCA_PCIE_INT_ALL_CLEAR, 0xffffffffu);
++	printf("NEGRONI WLAN: SW RESET: PCIE_INT_ALL_STATUS %#x -> %#x after INT_ALL_CLEAR (PARF_INT_STATUS %#x, mask %#x)\n",
++	    ia, negroni_wlan_reg_rd(QCA_PCIE_INT_ALL_STATUS), pi, negroni_wlan_reg_rd(QCA_PCIE_INT_ALL_MASK));
++
++	/* ath11k_pci_set_wlaon_pwr_ctrl: QFPROM VDD4BLOW off */
++	uint32_t q0 = negroni_wlan_reg_rd(QCA_WLAON_QFPROM_PWR_CTRL);
++	if (q0 != MHI_ALL_ONES) {
++		negroni_wlan_reg_wr(QCA_WLAON_QFPROM_PWR_CTRL, q0 & ~QCA_QFPROM_VDD4BLOW);
++	}
++
++	/* ath11k_mhi_clear_vector: BHIe TX/RX vector doorbell and status = 0 */
++	uint32_t bhie = negroni_wlan_rd(MHI_BHIEOFF);
++	if (bhie != MHI_ALL_ONES && bhie && !(bhie & 3) && bhie < g_bar_len && g_bar_len - bhie >= BHIE_SPAN) {
++		negroni_wlan_wr(bhie + QCA_BHIE_TXVECDB, 0);
++		negroni_wlan_wr(bhie + QCA_BHIE_TXVECSTATUS, 0);
++		negroni_wlan_wr(bhie + QCA_BHIE_RXVECDB, 0);
++		negroni_wlan_wr(bhie + QCA_BHIE_RXVECSTATUS, 0);
++	}
++
++	/* ath11k_pci_clear_dbg_registers: the Q6 cookie, the warm-boot entry = 0, the reset cause (read-clear) */
++	uint32_t cookie = negroni_wlan_reg_rd(QCA_PCIE_Q6_COOKIE_ADDR);
++	uint32_t warm0 = negroni_wlan_reg_rd(QCA_WLAON_WARM_SW_ENTRY);
++	negroni_wlan_nap(10);
++	negroni_wlan_reg_wr(QCA_WLAON_WARM_SW_ENTRY, 0);
++	negroni_wlan_nap(10);
++	uint32_t warm = negroni_wlan_reg_rd(QCA_WLAON_WARM_SW_ENTRY);
++	uint32_t cause = negroni_wlan_reg_rd(QCA_WLAON_SOC_RESET_CAUSE);
++	printf("NEGRONI WLAN: SW RESET: QFPROM_PWR_CTRL %#x -> %#x, BHIe %#x vectors cleared, Q6 cookie %#x, "
++	    "WARM_SW_ENTRY %#x -> %#x, SOC_RESET_CAUSE %#x (read-clear)\n", q0, negroni_wlan_reg_rd(QCA_WLAON_QFPROM_PWR_CTRL),
++	    bhie, cookie, warm0, warm, cause);
++
++	if (g_swreset < 2) {
++		return 0;
++	}
++
++	/* ath11k_pci_soc_global_reset: V bit 10 ms, V off (else the SoC stays in reset), 10 ms */
++	v = negroni_wlan_rd(QCA_PCIE_SOC_GLOBAL_RESET);
++	if (v == MHI_ALL_ONES) {
++		return negroni_wlan_failed(EIO, "PCIE_SOC_GLOBAL_RESET reads 0xffffffff before the reset (link down)");
++	}
++	negroni_wlan_wr(QCA_PCIE_SOC_GLOBAL_RESET, v | QCA_PCIE_SOC_GLOBAL_RESET_V);
++	(void)negroni_wlan_rd(QCA_PCIE_SOC_GLOBAL_RESET);       /* flush the posted write */
++	negroni_wlan_nap(10);
++	negroni_wlan_wr(QCA_PCIE_SOC_GLOBAL_RESET, v & ~QCA_PCIE_SOC_GLOBAL_RESET_V);
++	(void)negroni_wlan_rd(QCA_PCIE_SOC_GLOBAL_RESET);
++	negroni_wlan_nap(10);
++	uint32_t after = negroni_wlan_rd(QCA_PCIE_SOC_GLOBAL_RESET);
++	negroni_wlan_window_forget();                   /* the reset cleared the window register */
++	if (after == MHI_ALL_ONES) {
++		printf("NEGRONI WLAN: SW RESET: PCIE_SOC_GLOBAL_RESET reads 0xffffffff after the reset (link down); stop\n");
++		return negroni_wlan_failed(EIO, "PCIe link down after PCIE_SOC_GLOBAL_RESET");
++	}
++
++	/* the endpoint's BAR0 and command register must survive the SoC reset (ath11k assumes they do) */
++	uint32_t bar = cfg[0x10 / 4], cmd = cfg[0x04 / 4] & 0xffff;
++	bool restored = false;
++	if ((bar & ~0xfu) != (uint32_t)g_bar_pa || (cmd & 6u) != 6u) {
++		cfg[0x10 / 4] = (uint32_t)g_bar_pa;
++		if ((bar & 6u) == 4u) {
++			cfg[0x14 / 4] = (uint32_t)(g_bar_pa >> 32);
++		}
++		cfg[0x04 / 4] = (cmd & ~1u) | (1u << 1) | (1u << 2);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		restored = true;
++	}
++
++	/* ath11k_mhi_set_mhictrl_reset: "after SOC_GLOBAL_RESET, MHISTATUS may still have SYSERR" -> MHICTRL = RESET */
++	uint32_t st = negroni_wlan_rd(MHI_STATUS);
++	negroni_wlan_wr(MHI_CTRL, MHI_CTRL_RESET);
++	negroni_wlan_nap(10);
++	/* not in ath11k (mhi_async_power_up reads the EE next): log when the PBL takes the reset, at most 1 s */
++	uint64_t t0 = negroni_wlan_ms();
++	uint32_t c;
++	do {
++		c = negroni_wlan_rd(MHI_CTRL);
++		if (c == MHI_ALL_ONES || !(c & MHI_CTRL_RESET)) {
++			break;
++		}
++		negroni_wlan_nap(5);
++	} while (negroni_wlan_ms() - t0 < 1000);
++	printf("NEGRONI WLAN: SW RESET: GLOBAL_RESET %#x -> %#x, BAR0 %#x command %#x%s, MHISTATUS was %#x, MHICTRL RESET "
++	    "written: MHICTRL %#x after %llu ms, MHISTATUS %#x, SOC_WAKE %#x\n", v, after, bar, cmd,
++	    restored ? " (restored)" : "", st, c, negroni_wlan_ms() - t0, negroni_wlan_rd(MHI_STATUS),
++	    negroni_wlan_rd(QCA_PCIE_SOC_WAKE));
++	return 0;
++}
++
+ /* Turn off bus mastering: from here on the chip cannot read or write host memory (PCIe BME). */
+ static void
+ wlan_quiesce(struct negroni_wlan_pcie *p)
+@@ -994,6 +1157,10 @@ wlan_level_sbl(void)
+ 	}
+ 
+ 	negroni_wlan_step(7, "PBL check");
++	error = wlan_sw_reset();        /* 0342: negroniwlan_swreset */
++	if (error) {
++		return error;
++	}
+ 	wlan_rings();
+ 	H.bhi = negroni_wlan_rd(MHI_BHIOFF);
+ 	H.bhie = negroni_wlan_rd(MHI_BHIEOFF);
+@@ -1009,6 +1176,24 @@ wlan_level_sbl(void)
+ 	st = negroni_wlan_rd(MHI_STATUS);
+ 	printf("NEGRONI WLAN: BHI off %#x, BHIe off %#x, execution environment %u, MHISTATUS %#x, serial %#x\n",
+ 	    H.bhi, H.bhie, ee, st, negroni_wlan_rd(H.bhi + BHI_SERIALNU));
++	/*
++	 * 0342: with negroniwlan_swreset >= 1, a PBL with SYSERR is reset as Linux does (op-kernel pm.c:1141-1164
++	 * mhi_async_power_up: MHICTRL RESET, wait for the chip to clear it, BHI_INTVEC again).
++	 */
++	if (g_swreset && ee == MHI_EE_PBL && st != MHI_ALL_ONES && (st & MHI_STATUS_SYSERR)) {
++		uint64_t t0 = negroni_wlan_ms();
++		uint32_t c;
++		negroni_wlan_wr(MHI_CTRL, MHI_CTRL_RESET);
++		do {
++			negroni_wlan_nap(5);
++			c = negroni_wlan_rd(MHI_CTRL);
++		} while (c != MHI_ALL_ONES && (c & MHI_CTRL_RESET) && negroni_wlan_ms() - t0 < g_timeout_ms);
++		negroni_wlan_wr(H.bhi + BHI_INTVEC, 0);
++		st = negroni_wlan_rd(MHI_STATUS);
++		ee = negroni_wlan_rd(H.bhi + BHI_EXECENV);
++		printf("NEGRONI WLAN: PBL had SYSERR: MHICTRL RESET -> MHICTRL %#x after %llu ms, now EE %u MHISTATUS %#x\n", c,
++		    negroni_wlan_ms() - t0, ee, st);
++	}
+ 	/* only the cold path: PBL -> BHI (pm.c: MHI_IN_PBL -> DEV_ST_TRANSITION_PBL) */
+ 	if (ee != MHI_EE_PBL || st == MHI_ALL_ONES || (st & MHI_STATUS_SYSERR)) {
+ 		printf("NEGRONI WLAN: the chip is not in PBL (need execution environment 0, no SYSERR); stop\n");
+@@ -1245,13 +1430,15 @@ negroni_wlan_start(void)
+ 	(void)PE_parse_boot_argn("negroniwlan_to", &g_timeout_ms, sizeof(g_timeout_ms));
+ 	(void)PE_parse_boot_argn("negroniwlan_smmu", &g_smmu_policy, sizeof(g_smmu_policy));
+ 	(void)PE_parse_boot_argn("negroniwlan_keep", &g_keep_s, sizeof(g_keep_s));
++	(void)PE_parse_boot_argn("negroniwlan_swreset", &g_swreset, sizeof(g_swreset));     /* 0342 */
++	g_swreset = MIN(g_swreset, 2u);
+ 	g_timeout_ms = MIN(MAX(g_timeout_ms, 100u), 60000u);
+ 	g_level = MAX(g_level, (uint32_t)WLAN_LEVEL_SBL);
+ 	if (g_level > WLAN_LEVEL_MAX) {
+ 		printf("NEGRONI WLAN: negroniwlan=%u asked; this build stops at level %u\n", g_level, WLAN_LEVEL_MAX);
+ 	}
+-	printf("NEGRONI WLAN: start: levels %u..%u, time-out %u ms per wait, SMMU policy %u\n", WLAN_LEVEL_SBL,
+-	    MIN(g_level, (uint32_t)WLAN_LEVEL_MAX), g_timeout_ms, g_smmu_policy);
++	printf("NEGRONI WLAN: start: levels %u..%u, time-out %u ms per wait, SMMU policy %u, SW reset %u\n", WLAN_LEVEL_SBL,
++	    MIN(g_level, (uint32_t)WLAN_LEVEL_MAX), g_timeout_ms, g_smmu_policy, g_swreset);
+ 	negroni_wlan_sta_lifecycle(NWLAN_STATE_STARTING, 0);  /* 0326 */
+ 	if (kernel_thread_start(wlan_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --git a/bsd/dev/negroni_wlan_ce.c b/bsd/dev/negroni_wlan_ce.c
+index dfa5188..2784a4b 100644
+--- a/bsd/dev/negroni_wlan_ce.c
++++ b/bsd/dev/negroni_wlan_ce.c
+@@ -169,6 +169,17 @@ negroni_wlan_reg_rd(uint32_t off)
+ 	return ce_rd(off);
+ }
+ 
++/*
++ * 0342: PCIE_SOC_GLOBAL_RESET clears the window register in the chip (ath11k pci.c ath11k_pci_soc_global_reset
++ * "Restore window register as its content is cleared during hardware global reset"). Forget the cached value, so
++ * the next windowed access writes the select again.
++ */
++void
++negroni_wlan_window_forget(void)
++{
++	g_window = ~0u;
++}
++
+ static inline volatile uint32_t *
+ area32(uint32_t off)
+ {
+diff --git a/bsd/dev/negroni_wlan_ce.h b/bsd/dev/negroni_wlan_ce.h
+index b5af44e..fa0f151 100644
+--- a/bsd/dev/negroni_wlan_ce.h
++++ b/bsd/dev/negroni_wlan_ce.h
+@@ -172,6 +172,7 @@ void negroni_wlan_ce_free(void);
+ /* 0328: BAR0 register access through the CE code's window (offsets >= 0x80000 windowed) */
+ void negroni_wlan_reg_wr(uint32_t off, uint32_t v);
+ uint32_t negroni_wlan_reg_rd(uint32_t off);
++void negroni_wlan_window_forget(void);             /* 0342: after PCIE_SOC_GLOBAL_RESET */
+ /* pure parser of an HTC READY buffer (header included); 0 or EBADMSG (host-tested) */
+ int negroni_wlan_htc_parse_ready(const uint8_t *b, uint32_t len, uint32_t pipe, struct negroni_wlan_htc_ready *out);
+ 

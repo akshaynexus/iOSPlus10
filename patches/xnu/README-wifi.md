@@ -980,3 +980,93 @@ tick, DHCP on en0, and the status-bar Wi-Fi icon. Fake joins tick the network bu
   then drop these two classes and subclass the real ones.
 - Context: 0340/0341 append to the end of `bsd/conf/files`; the `negroni_wifi.c` hunk sits at the top of
   `negroni_wifi_init()`.
+
+## 0342-0343: SBL never reaches MHI READY: ath11k power-up reset + PCIe/WLAON boot dump (2026-10-27)
+
+### What the phone showed [V]
+
+- t6 (logs/usblog-t6.txt) and the 0339 boot (main session, `negroniwifi=10 negroniwlan=10 negroniwlan_smmu=3`): the
+  SMMU stage-1 claim works (context 6), `BHI SBL 524288 bytes at 0xa0010000` ends with status DONE, no context or global
+  SMMU fault, then EE 0 and MHISTATUS 0 for the whole READY wait (10 s in t6, 30 s with 0339).
+- 0339 line: `BOOT waiting for READY: no SBL log (start 0 size 0x30 outside the SRAM)`: PCIE_BHI_ERRDBG2 (the SBL log
+  pointer, cnss2 reg.h 0x01e0e238) is 0. The full 0339 dump of that boot is not in this repo (only this line was
+  handed over).
+
+### What we send, compared with Linux [V source]
+
+| Check | Ours | Linux / cnss2 | Same? |
+|---|---|---|---|
+| Image | first 512 KiB of `amss20.bin` over BHI, then BHIe of the whole file | cnss2 pci.c:5584-5586 `sbl_size = seg_len = SZ_512K`, `fbc_download = true`; boot.c:493 `size = sbl_size` | yes |
+| File name | SoC version 0x400c0210, major & 0xf = 2 -> `amss20.bin` | cnss2 `cnss_pci_update_fw_name`: QCA6490 major 2 -> FW_V2_FILE_NAME `amss20.bin` | yes |
+| BHI registers | STATUS 0, IMGADDR high/low, IMGSIZE, TXDB = random & 0x3fffffff; INTVEC 0 | boot.c:276-282 + pm.c:1123 | yes |
+| DMA address | IOVA 0xa0010000 (32-bit, inside Android's 0xa0000000 window) | ath11k DMA mask 32 bit; cnss2 iova_start from the DT | yes |
+| SBL log read | ERRDBG2/3 through the window, valid range 0x01400000-0x01800000 | cnss2 pci.c:1400-1420 | yes |
+| MHICTRL RESET / SOC reset before BHI | none | ath11k pci.c:380 `ath11k_pci_sw_reset(ab, true)` before every power-up; cnss2: none, but it power-cycles all rails | **no** |
+| MSI | not enabled (no ITS) | ath11k/cnss2 enable MSI before MHI power-up | **no** (guess: not needed for READY) |
+
+Conclusion [I]: the transfer is right and the PBL accepts it (DONE). The SBL then never starts its MHI side (no
+READY, no EE change, no log pointer). The one step Linux does and we do not is ath11k's reset sequence. ath11k gives
+two reasons that match a "BHI DONE, then silence" chip:
+- `ath11k_pci_clear_all_intrs`: "When target receive Hotreset, but will set the interrupt. So when download SBL again,
+  SBL will open Interrupt and receive it, and crash immediately." Our survey trains the link up to 3 times.
+- `ath11k_pci_clear_dbg_registers`: "write 0 to WLAON_WARM_SW_ENTRY to prevent Q6 from continuing warm path and
+  entering dead loop"; WLAON_SOC_RESET_CAUSE is read-clear "to prevent Q6 from entering wrong code path". The WLAON
+  block sits on the aon rail (pmr735a_s2), which we vote on and never cycle; it can keep an earlier boot's state.
+cnss2 can skip all of this because Android turns every WLAN rail off between runs.
+
+### 0342-negroni-wlan-ath11k-sw-reset.patch (boot-arg `negroniwlan_swreset`, default 0)
+
+At step 7, before the PBL check: `wlan_sw_reset()`, the ath11k order (ath11k pci.c:380-396):
+- `=1`: 100 ms; PARF_LTSSM (0x01e081b0) = 0x111 (up to 5 writes) and GCC_PCIE_HOT_RST (0x01e402bc) |= 0x10, 5 ms;
+  PCIE_INT_ALL_CLEAR (0x01e08228) = 0xffffffff; WLAON_QFPROM_PWR_CTRL (0x01f8031c) &= ~0x4; BHIe TXVECDB/TXVECSTATUS/
+  RXVECDB/RXVECSTATUS = 0 (relative to MHI_BHIEOFF: ath11k's fixed 0x360.. assume QCA6390's BHIe 0x324, this chip
+  reports 0x224); Q6 cookie read; WLAON_WARM_SW_ENTRY (0x01f80504) = 0 with 10 ms before and after;
+  WLAON_SOC_RESET_CAUSE (0x01f8060c) read (clears it).
+- `=2`: `=1` + PCIE_SOC_GLOBAL_RESET (BAR0 0x3008) bit 0 for 10 ms, then off, 10 ms; the window cache is forgotten
+  (the reset clears the window register: `negroni_wlan_window_forget`); the endpoint BAR0 and command register are
+  checked and restored if the reset cleared them; MHICTRL = RESET (ath11k_mhi_set_mhictrl_reset), the time until the
+  PBL clears it is logged (max 1 s).
+- With `>=1`, a PBL with SYSERR is reset as pm.c:1141-1164 does (MHICTRL RESET, wait, BHI_INTVEC 0) instead of a stop.
+- fix_l1ss: not done (ath11k core.c: false for WCN6855 hw2.0/hw2.1).
+
+Lines (`NEGRONI WLAN: `): `start: ... SW reset N`; `SW RESET off (negroniwlan_swreset=0) ...` or `SW RESET level N
+(...)`, `SW RESET: PARF_LTSSM A -> B (N writes), GCC_PCIE_HOT_RST A -> B`, `SW RESET: PCIE_INT_ALL_STATUS A -> B after
+INT_ALL_CLEAR (PARF_INT_STATUS .., mask ..)`, `SW RESET: QFPROM_PWR_CTRL .. -> .., BHIe 0x224 vectors cleared, Q6
+cookie .., WARM_SW_ENTRY A -> 0, SOC_RESET_CAUSE ..`; with `=2`: `SW RESET: GLOBAL_RESET A -> B, BAR0 .. command ..
+[(restored)], MHISTATUS was .., MHICTRL RESET written: MHICTRL .. after N ms, MHISTATUS .., SOC_WAKE ..`; failure:
+`PCIE_SOC_GLOBAL_RESET reads 0xffffffff after the reset (link down); stop`.
+
+### 0343-negroni-wlan-boot-dump-pcie.patch (boot-arg `negroniwlan_bootdbg`, default 1, read only)
+
+Each 0339 BOOT dump gets 4 more lines: `BOOT <when>: PCIe INT_ALL_STATUS .. PARF_INT_STATUS .. INT_ALL_MASK ..
+PARF_LTSSM .. PM_STTS .. HOT_RST .. GLOBAL_RESET .. SOC_WAKE ..`, `BOOT <when>: WLAON SOC_POWER_CTRL .. Q6_COOKIE ..
+WARM_SW_ENTRY .. RESET_DBG_SW_ENTRY .. DEBUG .. WLPM_SIGNAL .. PBL_STACK_CANARY .. POWERCTRL_PMU .. PCIE_PWR_CTRL ..
+QFPROM_PWR_CTRL ..`, `BOOT <when>: host PCIe endpoint CMD/STS .. DEVCTL/STA .. MSI ..; root port CMD/STS .. SEC_STS ..
+DEVCTL/STA ..`, `BOOT <when>: verdict: ...` (pending chip PCIe interrupts / WARM_SW_ENTRY set / the chip received an
+abort on a DMA read / root-port error bits / no PCIe/WLAON error bit). WLAON_SOC_RESET_CAUSE is not read here
+(read-clear).
+
+### Test (main session builds the image; no phone work by this agent)
+
+Boot-args, one boot each, in this order:
+1. `negroniwifi=10 negroniwlan=10 negroniwlan_smmu=3` (0343 only: the dump shows whether interrupts are pending or a
+   warm entry is set before BHI; nothing is written).
+2. `... negroniwlan_swreset=1` (the clears, no SoC reset).
+3. `... negroniwlan_swreset=2` (the full ath11k sequence) if 2 still shows no READY.
+
+How to read it [I]:
+- `before BHI` verdict names pending interrupts or WARM_SW_ENTRY, and swreset=1/2 gives `MHISTATUS READY ... after N
+  ms, execution environment 1` -> the cause is found; make swreset the default.
+- `host PCIe endpoint CMD/STS` with bit 28/29 (0x10000000 / 0x20000000) after BHI -> the chip's DMA read got an abort:
+  the DONE was not a good transfer (IOVA/SMMU/BDF-to-SID), not an SBL problem.
+- EE 1 seen, then no READY, an SBL log appears -> the SBL runs and stops on something its log names.
+- All clear, swreset=2 still EE 0 and `WLAON DEBUG`/`PBL_STACK_CANARY` unchanged between `BHI SBL` and `waiting for
+  READY` -> the SBL never ran: next suspects (guesses) are the XO_CLK latch at WLAN_EN (cnss2 QCA6490 only), the
+  antenna-switch/rfa rail modes, and MSI (enable it with the DWC iMSI doorbell).
+
+### 0342/0343 Opus review (2026-10-27): ACCEPT for level 1 and 0343; level 2 opt-in with known risks
+- Level 2: the GLOBAL_RESET readback is a plain read; if the SM8450 root port answers a dead link with a bus error
+  (not all-ones), it panics. Fix later: read it with `negroni_mmio_try_rd32`. After "link down" the failure path
+  (`wlan_quiesce`) writes endpoint config space on a dead link (not checked). BAR0 check/restore use the low dword only.
+- 0343 verdict wording: INT_ALL_STATUS 0x2000/0x2400 are probably bit 13 LINK_UP and bit 10 MMIO_WRITE (pcie-qcom-ep
+  layout, a guess for WCN6855), normal events; ath11k names only bit 1 (SMLH_REQ_RST_LINK_DOWN). Level 1 clears them anyway.
