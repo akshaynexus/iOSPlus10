@@ -2390,3 +2390,21 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   while busy. Counters: a log line every 10 s with traffic and `op10tool ctl usbstats` (new ctl command).
   Fallback: `negroniusb_ring=0` (old one-TRB paths), `negroniusb_pollus=0` (old 1 ms poll).
 - Not tested on the phone yet (build only). Check the boot line `RX ring 32 TRBs, TX batch 32, queue 128`.
+
+## 33. Proofs on the phone, 2026-10-27 01:30-01:38 (main session)
+
+- [V] 0360: the g12 boot (power + peripherals args, kernel local-20261026-200003) panicked in the journal again
+  (same `_memcpy+0x48` from `_end_transaction+0x620`, far 0, esr 0x96000045) and the whole panic text (panic
+  string, registers, pc/lr/far/esr) arrived in logs/usblog-20261026-233816.txt at 01:32:41, followed by
+  `NEGRONI PANIC: USB not configured (waiting for the host): console ring 66777 bytes ...` and `staying on the
+  panic screen (negronipanic=0)`. `op10tool ctl ping` -> `pong (panic)`; `op10tool ctl bootloader` ->
+  `ok bootloader (panic)` and the phone was in fastboot within seconds. No button press needed any more.
+- [V] 0361: boot line `NEGRONI USB: RX ring 32 TRBs, TX batch 32, queue 128 (negroniusb_ring=1)`; raw TCP with
+  netcat (16 MiB): host->phone 36.7 MB/s (was 1.2), phone->host 28.7 MB/s (was 1.1). `op10tool ctl usbstats`:
+  rx 16964 frames, tx 16659 frames, tx drops 251, rx max 26/poll, tx max 32/batch, poll 200 us. The tx drops
+  (251 of 16659) are TCP's own back-off material; a larger TX queue or back-pressure to the stack is a later
+  tune. The host tool out/bin/op10tool must be copied from tools/op10tool/target/release after a cargo build.
+- Bisection: power + peripherals together panic; each alone boots; display+wifi alone boots. Diagnostic patch
+  for the kernel data range in progress (agent).
+- New: scripts/debug/panic-symbolize.sh [LOG [KERNEL]] | -a ADDR...: the last panic in the USB log ->
+  esr/far decoded, pc/lr/caller as symbol+offset, disassembly around pc; saved to logs/panic-<time>.txt.
