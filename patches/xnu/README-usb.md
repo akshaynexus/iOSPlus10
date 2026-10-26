@@ -387,3 +387,115 @@ NEGRONI USB: PHY rails watch end: N changes (APPS votes held); now ...
   `NEGRONI ULOG: end: N lines, N requests, N answers, ...`.
 - Failure lines: `PMIC_LOGS_ADSP_APPS not open (try n, rc 60)` (the charger PD never opens it), `no answer to request #n
   in 1.5 s`, `GLINK: PMIC_LOGS_ADSP_APPS: the ADSP asks for an intent of N bytes: refused` (answer too big).
+
+## 0374: keep the phone a Type-C sink (`negronichg_typec`)
+
+### Observations [V: logs/bootlog-9.txt, t19 boot, `negronichg_glink=0 negroniusb_rails=2 negronichg_ulog=1`]
+
+ULOG times are the ADSP's own counter (19.2 MHz, seconds). The USB times are ms after `THE ADSP IS UP`.
+
+- 58.832-58.914: the charger PD starts. `apsd_result: 2` (SDP), `PartnerType=4, Voltage=5000 mV, Current=1500 mA`
+  (Rp 1.5 A of the Mac), `USB Plug-In Event signalled`. The phone is a sink. This is correct.
+- 58.914: `pmic_glink_open()`, `PmicTccRegister_Init`, `PmicTccPlatform_Init` (the PD starts its own TCPC/TCPM).
+- 58.924 (10 ms later): `TypecModeAsSink: PmSchgTypec_GetSnkSrcMode[0x0]`, `TypeCPartnerType=0`, `bPlugIn[0]`.
+  58.966: `Vbus Voltage = 5 mV`. The Mac took VBUS away: the attach is lost.
+- USB +2110 ms: `PHY change ... utmi0 1010101->21212121 utmi1 0->1010101 ctrl2 6060606->e0e0e0e cfg0 0->3030303`.
+  These are the downstream `dpdm` writes (UTMI_CTRL0 TERMSEL bit 5, UTMI_CTRL1 XCVRSEL, HS_PHY_CTRL2
+  USB2_SUSPEND_N_SEL, CFG0 both overrides). +2161 ms: the overrides go away, `clkref_en 1->80000000` (the ADSP
+  turns the PHY ref clock off: "no cable"), the link goes to suspend L2. The ADSP opens `PMIC_RTR_ADSP_APPS` here.
+- 58.970: `tcpm_state_run: curr=0, next=1` (Look4Connection). `PmSchgTypec_GetPortRole[0x0]` = DRP.
+- 59.548: the CC interrupt. `cid_status = 1`, `GetSnkSrcMode[0x1]`, `GetSourceStatus[0x5]`, `cc[2], ufp[0], dfp[5]`,
+  `CC_STATUS = 28` (Looking4Connection, ConnectResult 0 = the phone shows Rp, CC2 = SRC.Rd).
+  `ROLE_CONTROL = 0x07` (CC1 open, CC2 Rp, DRP 0). `ConnectPartnerType=2` (UFP), `PowerDirection=1` (provider).
+  `OTG_ENABLE_REQ`, `SetVbus: VbusEn=1`, 59.769 ramp 180 ms, `POWER_STATUS = 1C` (SourcingVbus), PD header
+  `DataRole=1, PowerRole=1` (DFP + source). `Source_Capabilities` goes out every 100 ms: `Message Failed` (no GoodCRC).
+- So the Mac port (DRP) became the sink/UFP. A UFP Mac is not a USB host: the gadget has no host. Soft reconnects
+  and PHY re-inits cannot change the Type-C role. Only a reboot resets it (the 0371 reboot after 60 s).
+- `pmic_glink_tx(): glink handle is NULL` (several): the PD sends notifications (for example BC_OTG_ENABLE 0x50) to
+  the AP, but nobody listens (`negronichg_glink=0`).
+
+### Cause [I, strong: every step above is in the PD's log; not yet proven by a fix]
+
+The PD's TCPM start puts the port in DRP and drops the attach. In the new DRP toggle the phone wins the source
+role against the Mac. The phone then waits for PD from a sink that does not answer; the Mac does not get its host role.
+
+Not the cause [V]: our charger GLINK client (t13 with `negronichg_glink=0` drops too), the charger writes (t12),
+the PHY rails (t19 with `negroniusb_rails=2`: `0 changes (APPS votes held)`). The QSCRATCH forced VBUS valid does
+not touch the PMIC (the PMIC reads VBUS and CC itself; the 5 mV comes after the Mac removed VBUS).
+
+### Stock (Android) [V: out/src/op-modules/vendor/oplus/kernel/charger/charger_ic/oplus_battery_sm8450.[ch]]
+
+- usb property ids (enum usb_property_id, .h:219-282, counted): 14 USB_OTG_AP_ENABLE, 15 USB_OTG_SWITCH,
+  17 USB_TYPEC_CC_ORIENTATION, 18 USB_CID_STATUS, 19 USB_TYPEC_MODE, 21 USB_OTG_VBUS_REGULATOR_ENABLE.
+- Write USB_TYPEC_MODE takes PM_TYPEC_PORT_ROLE_TYPE (.h:143-150): DRP 0, SNK 1, SRC 2, DISABLE 3.
+  `oplus_ccdetect_disable()` (:1060) writes SNK 1 ("set UFP mode"); `oplus_ccdetect_enable()` writes DRP.
+- Read USB_TYPEC_MODE gives the role: 0 = sink, other = source (`oplus_check_cc_mode` :10081-10092; `== 1` =
+  OTG online, :8988, :9043).
+- `qcom,otg_scheme = <0x00>` (live.dts:6815) = OTG_SCHEME_CID. The OTG switch (user setting) goes to the PD as
+  USB_OTG_SWITCH (:8887). The PD has `oplus_set_otg_switch_status::set typec_mode = drp|sink_only` and
+  `CidTOEvt_Handler::set typec_mode=snk` (adsp.b14 strings). With HLOS, BC_OTG_ENABLE 0x50 starts the external OTG
+  boost (`otg_notification_handler`, GPIO `qcom,otg-booster-en-gpio`); without HLOS, nothing answers.
+- Linux ucsi_glink / pmic_glink_altmode: no role write at init [I: they only read connector status]. They are not
+  the difference.
+
+### Change (bsd/dev/negroni_chg_glink.c, negroni_adsp.c/.h)
+
+- Boot-arg `negronichg_typec` (default 0 = off, no change). Bits: 1 = sink only, 2 = USB_OTG_SWITCH = 0 (stock OTG
+  off), 4 = watch only (reads and log lines, no write; ignores bits 1 and 2). Any non-zero value logs the role.
+- With `negronichg_glink=1`: part of the charger client. With `negronichg_glink=0`: a typec-only client (same
+  thread, no charger reads or writes, no charge loop). Both need `negroniadsp=1`.
+  `negroni_chg_pmic_wanted()` lets negroni_adsp.c answer the ADSP's OPEN of `PMIC_RTR_ADSP_APPS` in both cases.
+- At the open: read USB_TYPEC_MODE; at the first answer also read CID / OTG switch / CC orientation (one line), then
+  (typec-only) BC_SET_NOTIFY_REQ, then bit 2: USB_OTG_SWITCH = 0, bit 1: USB_TYPEC_MODE = 1 (SNK). This comes before
+  the first charger cycle: the PD's role decision came 0.6 s after its OPEN in t19.
+- Watch: one read every 500 ms for 60 s after the open, then every 5 s, and at each notification 0x50 / 0x51 /
+  0x53 / 0x55 / 0x57. When the read is 1 (source) or a BC_OTG_ENABLE 0x50 came: USB_TYPEC_MODE = SNK again, at most
+  6 times per boot, at least 3 s apart. The sink-only port drops Rp; the Mac must then be the source and the host.
+- Read semantics check (review): right after the first SNK write, one more read. If the role read was not 1 before
+  and is 1 after (a sink-only write cannot make the phone a source), the read is the set role (0 DRP, 1 SNK). Then a
+  read of 1 is not "source": the re-assert runs on a read of 0 (DRP again) or BC_OTG_ENABLE. Log line `typec:
+  USB_TYPEC_MODE reads N before and 1 after the SNK write: the read is the set role ...`.
+- Notification log lines: at most 20 (own budget); the 80 typec lines stay for the reads and writes.
+- With bit 4 (watch only) the typec-only client still sends BC_SET_NOTIFY_REQ (a subscription, no property write).
+- Safety: the SNK role only stops the phone from sourcing VBUS (no OTG boost); charging stays. The role is PD/PMIC
+  state; the stock Android boot runs the PD's TCPM init again (DRP) [I: from t19, the TCPM start sets DRP].
+- Not gated by `negronichg_wr` (0370) or `negronichg_wr_delay_s`.
+- Cost: no OTG (a USB stick on the phone) while it is on. OTG needs `negronichg_typec=0`.
+
+### Boot-args (test)
+
+`negroniadsp=1 ... negronichg_glink=0 negronichg_typec=3 negronichg_ulog=1` (typec-only, both writes), then the same
+with `negronichg_typec=1`. Watch only (role semantics): `negronichg_typec=4`. Keep `negroniusb_lost_reboot=60`.
+
+### Expected lines
+
+- `NEGRONI BATTERY: glink: start (typec only, negronichg_glink=0): channel PMIC_RTR_ADSP_APPS, negronichg_typec 0x3, no charger writes`
+- `NEGRONI ADSP: 10 GLINK: the ADSP opens PMIC_RTR_ADSP_APPS (rcid 7)` (not "not ours")
+- `NEGRONI BATTERY: glink: PMIC_RTR_ADSP_APPS is open (try 1)`
+- `NEGRONI BATTERY: glink: typec: first answer +N ms after the open (open): USB_TYPEC_MODE 0 (...), CID 1, OTG switch ..., CC orientation ...`
+- `NEGRONI BATTERY: glink: typec: write USB_OTG_SWITCH (OTG off) = 0 (first answer): ok (ret_code 0) +N ms after the open`
+- `NEGRONI BATTERY: glink: typec: write USB_TYPEC_MODE (TYPEC_PORT_ROLE_SNK, sink only) = 1 (first answer): ok ...`
+- PD side: `NEGRONI ULOG: ... usb_set_power_supply_properties::set typec_mode[1]`, `... otg switch[0]`, then at the CC
+  interrupt NO `OTG_ENABLE_REQ`; instead `typec mode as sink` with GetSnkSrcMode 0, `PartnerType=4 ... 1500 mA`,
+  `bPlugIn[1]`, PD header `DataRole=0, PowerRole=0`.
+- USB: `soft reconnect #1 ...`, then the Mac sees the device again within a few seconds; no `host lost for 60 s`.
+- Fail signs: `typec: ... REFUSED` (the PD does not take the property), `the phone is the Type-C source (role 1):
+  sink only again (#n of 6)`, `still the source after 6 sink-only writes`.
+
+### Guesses to check on the phone
+
+- [I] The read semantics (0 sink / 1 source) come from the stock HLOS code only. The read-back after the first write
+  (above) finds the "set role" case; before the review fix, that case gave 6 SNK writes in ~18 s (each one may restart
+  the PD's Type-C state machine [I]).
+- [I] If the write lands after the CC decision (no early answer), the re-assert path must move the role.
+- [I] The PD may set DRP again on a CID event (`TypecOrRid_det_Cb::set typec_mode=drp`). Bit 2 (OTG switch off) is
+  there for that case.
+
+### Build [V]
+
+out/kernel/local-20261026-232521/kernel.development.negroni sha256
+d2d943ae8fa17bfe14ca22af9dc0b1801cd8ab6a4b306ac69eb4b55b37c243f9 (273 applied incl. 0374; only the 4 dxb skips; link
+out/kernel/kernel.macho). compile-one of negroni_chg_glink.c and negroni_adsp.c: no diagnostic; the full build shows
+only the old warning kind (-Wdeclaration-after-statement). Patch sha256 1bc62225ec4ab341d659bb3052e6fb12a4d9a31bc304173ba1c0943ecb853f3c. Not booted; no image.
+Review (Opus): read-back fix + notification budget, patch sha256 dd5cd5734530aa606f72ef631795c72b3184c8fc81eee599f719f264f5862560;
+compile-one of negroni_chg_glink.c: no diagnostic. The kernel above does not have the fix: rebuild.

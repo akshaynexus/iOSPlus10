@@ -3082,3 +3082,25 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   answered; RSSI_BOUNDS not built; SSID ENXIO before a join).
 - Default: `negroniwlan_smmu=3 negroniwlan_msi=1` are now in scripts/ios16/variants/everything.args.
 - Next: scan and join a network from Settings; RSSI_BOUNDS; 0342 swreset stays off (not needed).
+
+## 58. USB lost after ADSP up = Type-C role flip: the charger PD's TCPM makes the phone the source; 0374 sink only (2026-10-27, kernel agent; patch 0374, details patches/xnu/README-usb.md "0374")
+
+- [V] t19 (logs/bootlog-9.txt, 0373 ULOG): the PD starts its TCPC/TCPM ~2.1 s after ADSP up; 10 ms later the sink
+  attach is gone (`GetSnkSrcMode[0x0]`, `bPlugIn[0]`, VBUS 5 mV); port role DRP; 0.6 s later the CC interrupt gives
+  `ROLE_CONTROL = 0x07` (Rp on CC2), `ConnectPartnerType=2` (UFP), `PowerDirection=1`, `OTG_ENABLE_REQ`, `POWER_STATUS
+  1C` (phone sources VBUS), PD `DataRole=1 PowerRole=1`, Source_Capabilities without GoodCRC. The Mac became the sink/UFP,
+  so it is no USB host. The PHY dpdm writes and `clkref_en 1->80000000` at +2110/+2161 ms are the PD's "no cable" path.
+- [V] Not the cause: our charger client (t13), charger writes (t12), PHY rails (t19 rails=2 held, 0 changes).
+- [V] SID 3 0x13xx has no APID (`charger USBIN 0x1300: no APID`): the PM8350B charger is not at the SMB5 0x10-0x16
+  map; the stock comment names the Type-C mode register 0x2b44 [I: PM8350B Type-C block at 0x2b00].
+- [V stock code] USB_TYPEC_MODE (usb id 19) write = PM_TYPEC_PORT_ROLE (DRP 0, SNK 1, SRC 2, DISABLE 3); read = 0 sink,
+  other source; USB_OTG_SWITCH 15; OTG scheme CID (`qcom,otg_scheme = <0>`).
+- 0374: boot-arg `negronichg_typec` (default 0): bit 1 = USB_TYPEC_MODE = SNK at the first answer after the PD's OPEN
+  and again when the role reads 1 or BC_OTG_ENABLE 0x50 comes (max 6, 3 s apart); bit 2 = USB_OTG_SWITCH = 0; 4 = watch
+  only. With `negronichg_glink=0` it runs as a typec-only client (no charger writes). Reads every 500 ms for 60 s,
+  then 5 s. [I] Not proven on the phone.
+- Build [V]: out/kernel/local-20261026-232521/kernel.development.negroni sha256
+  d2d943ae8fa17bfe14ca22af9dc0b1801cd8ab6a4b306ac69eb4b55b37c243f9 (273 applied incl. 0374; 4 dxb skips; link
+  out/kernel/kernel.macho). Only the old warning kind. Not booted; no image.
+- Next: RAM boot with t19 args + `negronichg_typec=3` (`negronichg_glink=0`, `negronichg_ulog=1`): expect the typec
+  write lines, PD `set typec_mode[1]`, no `OTG_ENABLE_REQ`, `bPlugIn[1]`, the Mac sees the device again.

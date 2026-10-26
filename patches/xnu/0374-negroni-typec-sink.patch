@@ -1,0 +1,360 @@
+diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
+index 75fdbe9..c56fc7e 100644
+--- a/bsd/dev/negroni_adsp.c
++++ b/bsd/dev/negroni_adsp.c
+@@ -1392,7 +1392,7 @@ gl_poll(void)
+ 			gl_advance(need);
+ 			ch = NULL;
+ 			for (unsigned c = 0; c < NEGRONI_GLINK_CHANNELS; c++) {
+-				if ((c != NEGRONI_GLINK_PMIC || negroni_chg_glink_wanted()) &&
++				if ((c != NEGRONI_GLINK_PMIC || negroni_chg_pmic_wanted()) &&
+ 				    (c != NEGRONI_GLINK_ULOG || negroni_chg_ulog_wanted()) && strcmp(gl_ch[c].name, name) == 0) {
+ 					ch = &gl_ch[c];
+ 				}
+diff --git a/bsd/dev/negroni_adsp.h b/bsd/dev/negroni_adsp.h
+index 016d8b2..84dc207 100644
+--- a/bsd/dev/negroni_adsp.h
++++ b/bsd/dev/negroni_adsp.h
+@@ -11,7 +11,7 @@
+ #define NEGRONI_GLINK_STEP9     2       /* step 9 opens and waits for channels 0..1 only */
+ #define NEGRONI_GLINK_IPCRTR    0       /* QRTR */
+ #define NEGRONI_GLINK_GPR       1       /* "adsp_apps": GPR */
+-#define NEGRONI_GLINK_PMIC      2       /* "PMIC_RTR_ADSP_APPS": charger PD (0274, only with negronichg_glink=1) */
++#define NEGRONI_GLINK_PMIC      2       /* "PMIC_RTR_ADSP_APPS": charger PD (0274: negronichg_glink=1; 0374: or negronichg_typec) */
+ #define NEGRONI_GLINK_ULOG      3       /* "PMIC_LOGS_ADSP_APPS": charger PD log (0373, only with negronichg_ulog=1) */
+ 
+ /* GLINK (negroni_adsp.c) */
+@@ -24,6 +24,8 @@ int negroni_glink_send(unsigned channel, const void *data, uint32_t len);
+ int negroni_glink_open(unsigned channel, unsigned intents, uint32_t wait_ms);
+ /* 0274 (negroni_chg_glink.c): boot-args negronichg_glink=1 and negroniadsp set */
+ bool negroni_chg_glink_wanted(void);
++/* 0374 (negroni_chg_glink.c): PMIC_RTR_ADSP_APPS is ours: negronichg_glink=1, or negronichg_typec != 0 alone */
++bool negroni_chg_pmic_wanted(void);
+ /* 0373 (negroni_chg_glink.c): boot-args negronichg_ulog=1 and negroniadsp set */
+ bool negroni_chg_ulog_wanted(void);
+ 
+diff --git a/bsd/dev/negroni_chg_glink.c b/bsd/dev/negroni_chg_glink.c
+index f9af56c..ef85222 100644
+--- a/bsd/dev/negroni_chg_glink.c
++++ b/bsd/dev/negroni_chg_glink.c
+@@ -169,6 +169,21 @@ static struct {
+ 	uint32_t code, adapter, sub, mw, statuses, recoveries, lines;
+ } vc = { .enable = -1 };
+ 
++/*
++ * 0374: the Type-C port role (README-usb.md "0374"). Boot-arg negronichg_typec (default 0 = off), bits:
++ * 1 = sink only: USB_TYPEC_MODE (usb id 19) = TYPEC_PORT_ROLE_SNK (1) at the first answer after the open,
++ * and again when the phone is the Type-C source (read 1 or BC_OTG_ENABLE 0x50); 2 = USB_OTG_SWITCH (15) = 0
++ * at the first answer (stock OTG switch off); 4 = watch only (reads and log lines, no write). Any value
++ * logs the role. With negronichg_glink=0 a non-zero value runs a typec-only client (no charger writes).
++ */
++#define TC_SINK                 0x1u
++#define TC_OTGSW                0x2u
++#define TC_WATCH                0x4u
++static uint32_t typec_arg;                      /* boot-arg negronichg_typec */
++static bool typec_only;                         /* negronichg_typec != 0 with negronichg_glink=0 */
++static bool tc_ev, tc_otg_req;                  /* under rx_mtx: set by chg_rx (0x50/0x51/0x53/0x55/0x57; 0x50) */
++static uint32_t tc_ev_last;
++
+ 
+ #define LOG(fmt, ...) printf("NEGRONI BATTERY: glink: " fmt "\n", ##__VA_ARGS__)
+ #define LOG_ERR(fmt, ...) do { \
+@@ -192,6 +207,12 @@ negroni_chg_glink_wanted(void)
+ 		(void)PE_parse_boot_argn("negronichg_wr", &wr_mask, sizeof(wr_mask));           /* 0370 */
+ 		(void)PE_parse_boot_argn("negronichg_wr_delay_s", &wr_delay_s, sizeof(wr_delay_s));
+ 		(void)PE_parse_boot_argn("negronichg_icl_bytype", &icl_bytype, sizeof(icl_bytype));
++		(void)PE_parse_boot_argn("negronichg_typec", &typec_arg, sizeof(typec_arg));    /* 0374 */
++		typec_arg &= TC_SINK | TC_OTGSW | TC_WATCH;
++		if (typec_arg & TC_WATCH) {
++			typec_arg = TC_WATCH;           /* watch only: no write bit counts */
++		}
++		typec_only = typec_arg != 0 && on == 0 && adsp != 0;
+ 		wr_delay_s = MIN(wr_delay_s, 3600u);
+ 		vooc_mode = vooc_mode ? 1u : 0u;
+ 		chg_wanted = on != 0 && adsp != 0;
+@@ -203,6 +224,13 @@ negroni_chg_glink_wanted(void)
+ 	return chg_wanted;
+ }
+ 
++/* 0374: the ADSP's PMIC_RTR_ADSP_APPS OPEN is answered (negroni_adsp.c) for the full client or the typec-only one */
++bool
++negroni_chg_pmic_wanted(void)
++{
++	return negroni_chg_glink_wanted() || typec_only;
++}
++
+ bool
+ negroni_chg_glink_get(struct negroni_chg_glink_status *out)
+ {
+@@ -332,6 +360,13 @@ chg_rx(const uint8_t *data, uint32_t len)
+ 		notify_count++;
+ 		notify_last = n;
+ 		vooc_note(n);                   /* 0369 */
++		if (n == 0x50 || n == 0x51 || n == 0x53 || n == 0x55 || n == 0x57) {
++			tc_ev = true;               /* 0374: OTG on/off, CID, Type-C state, plug-in */
++			tc_ev_last = n;
++			if (n == 0x50) {
++				tc_otg_req = true;      /* BC_OTG_ENABLE: the PD wants to source VBUS */
++			}
++		}
+ 		if (n == BC_USB_GET) {
+ 			notify_usb = true;          /* a plug event: the next cycle comes early */
+ 		}
+@@ -1370,6 +1405,203 @@ vooc_reset(const char *why)
+ 	st.icl_set = st.chg_en_set = false;
+ }
+ 
++/*
++ * 0374: keep the phone a Type-C sink (README-usb.md "0374").
++ * [V] logs/bootlog-9.txt (t19, NEGRONI ULOG = the charger PD's own log): ~2.1 s after ADSP up the PD starts its
++ * TCPC/TCPM (PmicTccPlatform_Init, pmic_glink_open); 10 ms later the Type-C partner is gone (GetSnkSrcMode 0,
++ * bPlugIn 0, VBUS 5 mV); PmSchgTypec_GetPortRole = 0 (DRP); 620 ms later the CC interrupt finds Rd on CC2,
++ * ROLE_CONTROL 0x07 (CC2 = Rp), ConnectPartnerType 2 (UFP), PowerDirection 1 (provider), OTG_ENABLE_REQ, VBUS
++ * sourced by the phone, PD header DataRole 1 PowerRole 1 (DFP + source), Source_Capabilities without GoodCRC.
++ * The Mac port (DRP) became the sink/UFP: no USB host for our gadget until a reboot.
++ * Stock (out/src/op-modules/.../oplus_battery_sm8450.c): oplus_ccdetect_disable() writes USB_TYPEC_MODE =
++ * TYPEC_PORT_ROLE_SNK (1) (:1060; PM_TYPEC_PORT_ROLE_TYPE DRP 0, SNK 1, SRC 2, DISABLE 3, .h:143-150); a read of
++ * USB_TYPEC_MODE gives 0 = sink, other = source (oplus_check_cc_mode :10081-10092; == 1 = OTG online :8988).
++ * USB_OTG_SWITCH (15) = 0 is the stock "OTG off" write (:8887). The PD logs "set typec_mode[%d]" on our write.
++ * Not gated by negronichg_wr (its own boot-arg). Costs OTG (a USB stick on the phone) while it is on.
++ */
++#define USB_OTG_SWITCH          15u
++#define USB_TYPEC_CC_ORIENT     17u
++#define USB_CID_STATUS          18u
++#define USB_TYPEC_MODE          19u
++#define TYPEC_PORT_ROLE_SNK     1u
++#define TC_REASSERT_MAX         6u
++#define TC_REASSERT_GAP_NS      (3000ull * NSEC_PER_MSEC)
++#define TC_FAST_NS              (60ull * NSEC_PER_SEC)  /* read every 500 ms for 60 s after the open, then 5 s */
++#define TC_LINES_MAX            80u
++static struct {
++	bool ready;                     /* a USB_TYPEC_MODE read answered with ret_code 0 since the open */
++	bool busy;
++	bool one_is_role;               /* review: the read gave 1 right after our SNK write (read = the set role, not "source") */
++	int32_t last;                   /* last role read, -2 = none */
++	uint32_t asserts, writes_ok, lines, reads, bad, notes;
++	uint64_t open_ns, last_wr_ns, next_ns;
++} tc = { .last = -2 };
++
++#define TC_LOG(fmt, ...) do { \
++	if (tc.lines < TC_LINES_MAX) { tc.lines++; LOG("typec: " fmt, ##__VA_ARGS__); } \
++} while (0)
++
++static uint64_t
++tc_ms(void)
++{
++	return tc.open_ns ? (now_ns() - tc.open_ns) / NSEC_PER_MSEC : 0;
++}
++
++static bool
++tc_write(uint32_t prop, uint32_t value, const char *what, const char *why)
++{
++	uint32_t v = 0, ret = 0;
++	int rc = prop_io(BC_USB_SET, prop, value, &v, &ret);
++
++	TC_LOG("write %s = %u (%s): %s (ret_code %#x) +%llu ms after the open", what, value, why,
++	    rc ? (rc == ETIMEDOUT ? "no answer" : "channel down") : ret ? "REFUSED" : "ok", rc ? 0 : ret, tc_ms());
++	return rc == 0 && ret == 0;
++}
++
++static void
++tc_sink(const char *why)
++{
++	tc.last_wr_ns = now_ns();
++	if (tc_write(USB_TYPEC_MODE, TYPEC_PORT_ROLE_SNK, "USB_TYPEC_MODE (TYPEC_PORT_ROLE_SNK, sink only)", why)) {
++		tc.writes_ok++;
++	}
++}
++
++/* One read of the role; the first answer after the open does the writes. */
++static void
++typec_check(const char *why)
++{
++	uint32_t v = 0, ret = 0;
++	int rc;
++
++	if (typec_arg == 0 || tc.busy || !negroni_glink_up(NEGRONI_GLINK_PMIC)) {
++		return;
++	}
++	tc.busy = true;
++	tc.reads++;
++	rc = prop_io(BC_USB_GET, USB_TYPEC_MODE, 0, &v, &ret);
++	if (rc != 0 || ret != 0) {
++		tc.bad++;
++		if (tc.bad <= 5 || tc.bad % 100 == 0) {
++			TC_LOG("read USB_TYPEC_MODE (%s): %s (ret_code %#x) +%llu ms after the open (%u bad)", why,
++			    rc ? (rc == ETIMEDOUT ? "no answer" : "channel down") : "refused", rc ? 0 : ret, tc_ms(), tc.bad);
++		}
++		tc.busy = false;
++		return;
++	}
++	int32_t role = (int32_t)v;
++	if (!tc.ready) {
++		uint32_t cid = 0, sw = 0, cc = 0, r1 = 1, r2 = 1, r3 = 1;
++		bool cidOk = prop_io(BC_USB_GET, USB_CID_STATUS, 0, &cid, &r1) == 0 && r1 == 0;
++		bool swOk = prop_io(BC_USB_GET, USB_OTG_SWITCH, 0, &sw, &r2) == 0 && r2 == 0;
++		bool ccOk = prop_io(BC_USB_GET, USB_TYPEC_CC_ORIENT, 0, &cc, &r3) == 0 && r3 == 0;
++		tc.ready = true;
++		TC_LOG("first answer +%llu ms after the open (%s): USB_TYPEC_MODE %d (stock: 0 sink, other source/OTG), CID %s%u, "
++		    "OTG switch %s%u, CC orientation %s%u; negronichg_typec %#x (%s)", tc_ms(), why, role, cidOk ? "" : "?", cid,
++		    swOk ? "" : "?", sw, ccOk ? "" : "?", cc, typec_arg,
++		    typec_arg & TC_WATCH ? "watch only" : typec_arg == TC_OTGSW ? "OTG switch off only" : "sink only");
++		if (typec_only) {
++			struct bc_notify_req n = { { BC_OWNER, BC_TYPE_NOTIFY, BC_SET_NOTIFY_REQ }, 0, 0, 0, 0 };
++			TC_LOG("subscribe to notifications (BC_SET_NOTIFY_REQ, for BC_OTG_ENABLE 0x50): %s",
++			    transact(&n, sizeof(n), BC_SET_NOTIFY_REQ, -1) == 0 ? "acked" : "no ack");
++		}
++		if (typec_arg & TC_OTGSW) {
++			(void)tc_write(USB_OTG_SWITCH, 0, "USB_OTG_SWITCH (OTG off)", "first answer");
++		}
++		if (typec_arg & TC_SINK) {
++			uint32_t v2 = 0, r4 = 1;
++			tc_sink("first answer");
++			/* review: learn the read semantics. A sink-only write cannot make the phone a source: 0 before and 1 after = the read gives the set role. */
++			if (role != 1 && prop_io(BC_USB_GET, USB_TYPEC_MODE, 0, &v2, &r4) == 0 && r4 == 0 && v2 == TYPEC_PORT_ROLE_SNK) {
++				tc.one_is_role = true;
++				TC_LOG("USB_TYPEC_MODE reads %d before and 1 after the SNK write: the read is the set role (0 DRP, 1 SNK); sink only again "
++				    "on a read of 0 (DRP) or BC_OTG_ENABLE", role);
++				role = (int32_t)v2;
++			}
++		}
++	} else if (role != tc.last) {
++		TC_LOG("USB_TYPEC_MODE %d -> %d (%s) +%llu ms after the open", tc.last, role, why, tc_ms());
++	}
++	tc.last = role;
++
++	bool otg;
++	lck_mtx_lock(&rx_mtx);
++	otg = tc_otg_req;
++	tc_otg_req = false;
++	lck_mtx_unlock(&rx_mtx);
++	if (otg) {
++		TC_LOG("the PD asks for OTG VBUS (BC_OTG_ENABLE 0x50): the phone is the Type-C source +%llu ms after the open", tc_ms());
++	}
++	bool src = otg || (tc.one_is_role ? role == 0 : role == 1);
++	if ((typec_arg & TC_SINK) && src) {
++		if (tc.asserts >= TC_REASSERT_MAX) {
++			if (tc.asserts == TC_REASSERT_MAX) {
++				tc.asserts++;
++				TC_LOG("still the source after %u sink-only writes: no more (negronichg_typec)", TC_REASSERT_MAX);
++			}
++		} else if (now_ns() - tc.last_wr_ns >= TC_REASSERT_GAP_NS) {
++			tc.asserts++;
++			TC_LOG("the phone is the Type-C source or DRP (role %d%s%s): sink only again (#%u of %u)", role,
++			    tc.one_is_role ? " = set role" : "", otg ? ", BC_OTG_ENABLE" : "", tc.asserts, TC_REASSERT_MAX);
++			tc_sink("source seen");
++		} else {
++			lck_mtx_lock(&rx_mtx);
++			tc_otg_req = tc_otg_req || otg;         /* retry after the gap */
++			lck_mtx_unlock(&rx_mtx);
++		}
++	}
++	tc.busy = false;
++}
++
++/* From idle() every 50 ms: a notification or the read period. */
++static void
++typec_tick(void)
++{
++	bool ev;
++	uint32_t n;
++	uint64_t t;
++
++	if (typec_arg == 0 || tc.open_ns == 0 || tc.busy) {
++		return;
++	}
++	lck_mtx_lock(&rx_mtx);
++	ev = tc_ev;
++	n = tc_ev_last;
++	tc_ev = false;
++	lck_mtx_unlock(&rx_mtx);
++	t = now_ns();
++	if (ev) {
++		if (++tc.notes <= 20) {
++			TC_LOG("notification 0x%x +%llu ms after the open", n, tc_ms());   /* review: max 20, the write lines keep their budget */
++		}
++		typec_check("notification");
++	} else if (t >= tc.next_ns) {
++		typec_check("poll");
++	} else {
++		return;
++	}
++	tc.next_ns = now_ns() + (now_ns() - tc.open_ns < TC_FAST_NS ? 500ull * NSEC_PER_MSEC : 5000ull * NSEC_PER_MSEC);
++}
++
++static void
++typec_open(void)
++{
++	tc.open_ns = now_ns();
++	tc.ready = false;
++	tc.one_is_role = false;
++	tc.last = -2;
++	tc.next_ns = 0;
++	typec_check("open");
++	tc.next_ns = now_ns() + 500ull * NSEC_PER_MSEC;
++}
++
++static void
++typec_closed(void)
++{
++	tc.open_ns = 0;
++	tc.ready = false;
++}
++
+ static bool
+ idle(uint32_t s)
+ {
+@@ -1378,6 +1610,7 @@ idle(uint32_t s)
+ 	for (uint32_t ms = 0; ms < s * 1000; ms += 50) {
+ 		negroni_glink_poll();
+ 		vooc_events();                  /* 0369 */
++		typec_tick();                   /* 0374 */
+ 		if (notify_usb && ms >= 2000) {
+ 			early = true;
+ 			break;
+@@ -1438,8 +1671,14 @@ chg_thread(__unused void *arg, __unused wait_result_t wr)
+ 	LOG("writes: class mask %#x (negronichg_wr: 1 ICL, 2 USB_SUSPEND_PMIC, 4 BATT_CHG_EN, 8 FV/FCC, 0x10 VOOC, 0x20 notify, "
+ 	    "0x40 other), delay %u s, ICL per adapter type %s", wr_mask, wr_delay_s, icl_bytype ? "on" : "off");
+ 	negroni_glink_set_rx(NEGRONI_GLINK_PMIC, chg_rx);    /* before the open: a notification can come at once */
+-	LOG("start: channel PMIC_RTR_ADSP_APPS, input limit %u mA%s, poll %u s, charge loop %s (every %u s, FV <= %u mV/cell, "
+-	    "FCC <= %u mA)", chg_ma, chg_ma ? "" : " (read only)", poll_s, loop_on ? "on" : "off", loop_s, FV_DT_MV, FCC_DT_MA);
++	if (typec_only) {
++		LOG("start (typec only, negronichg_glink=0): channel PMIC_RTR_ADSP_APPS, negronichg_typec %#x, no charger writes",
++		    typec_arg);
++	} else {
++		LOG("start: channel PMIC_RTR_ADSP_APPS, input limit %u mA%s, poll %u s, charge loop %s (every %u s, FV <= %u mV/cell, "
++		    "FCC <= %u mA), negronichg_typec %#x", chg_ma, chg_ma ? "" : " (read only)", poll_s, loop_on ? "on" : "off", loop_s,
++		    FV_DT_MV, FCC_DT_MA, typec_arg);
++	}
+ 	for (;;) {
+ 		if (!negroni_glink_up(NEGRONI_GLINK_IPCRTR)) {
+ 			LOG("GLINK stopped: the charger client ends");
+@@ -1451,6 +1690,7 @@ chg_thread(__unused void *arg, __unused wait_result_t wr)
+ 		if (!negroni_glink_up(NEGRONI_GLINK_PMIC)) {
+ 			if (st.up) {
+ 				LOG_ERR("the ADSP closed PMIC_RTR_ADSP_APPS");
++				typec_closed();                                 /* 0374 */
+ 				st.up = st.ready = false;
+ 				vooc_reset("PMIC_RTR_ADSP_APPS closed");        /* 0369 review F7 */
+ 				publish();
+@@ -1467,6 +1707,11 @@ chg_thread(__unused void *arg, __unused wait_result_t wr)
+ 			}
+ 			st.up = true;
+ 			LOG("PMIC_RTR_ADSP_APPS is open (try %u)", opens);
++			typec_open();           /* 0374: before the first cycle: the PD's role decision comes ~0.6 s after its OPEN */
++		}
++		if (typec_only) {
++			(void)idle(1);          /* 0374: typec_tick() only; no charger reads or writes */
++			continue;
+ 		}
+ 		cycle();
+ 		charge_loop();          /* 0277 */
+@@ -1669,7 +1914,7 @@ negroni_chg_glink_start(void)
+ 	thread_t thread;
+ 
+ 	negroni_chg_ulog_start();       /* 0373: independent of negronichg_glink */
+-	if (!negroni_chg_glink_wanted() || started) {
++	if (!negroni_chg_pmic_wanted() || started) {    /* 0374: or the typec-only client */
+ 		return;
+ 	}
+ 	started = true;
