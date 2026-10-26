@@ -62,3 +62,18 @@ if os.geteuid() == 0:
 os.replace(tmp, path)
 print('negronigl: removed the old backboardd DYLD_INSERT_LIBRARIES entry')
 PY
+
+# 3. the gates (owner, 2026-10-27: acceleration on by default). NEGRONIGL_CLIENTS (default "*") is the
+#    backboardd/EAGL gate /private/var/db/negronigl/clients; NEGRONIGL_APPS (default "* -backboardd") is the
+#    bundle's apps.local (apps get EAGLContexts on Mesa). NEGRONIGL_CLIENTS="" keeps an existing gate.
+G=$R/private/var/db/negronigl
+mkdir -p "$G"; own "$G"; chmod 755 "$G"
+if [ -n "${NEGRONIGL_CLIENTS-*}" ]; then
+  printf '# scripts/gpu/root-add-negronigl.sh, %s\n%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "${NEGRONIGL_CLIENTS-*}" > "$G/clients"
+  own "$G/clients"; chmod 644 "$G/clients"
+fi
+rm -f "$G/off"
+printf '# scripts/gpu/root-add-negronigl.sh, %s\n%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "${NEGRONIGL_APPS-* -backboardd}" > "$EXT/NegroniGL.bundle/apps.local"
+own "$EXT/NegroniGL.bundle/apps.local"; chmod 644 "$EXT/NegroniGL.bundle/apps.local"
+rm -f "$EXT/NegroniGL.bundle/off"
+echo "negronigl: clients = $(grep -v '^#' "$G/clients" 2>/dev/null | tr '\n' ' '), apps.local = $(grep -v '^#' "$EXT/NegroniGL.bundle/apps.local" | tr '\n' ' ')"

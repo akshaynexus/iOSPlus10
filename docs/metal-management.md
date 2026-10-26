@@ -266,3 +266,12 @@ with [V] and the time.
    Repeat with `negronisurf_gpuwait=0` (rebuild `out/ios16-gl2` with `BOOTARGS_ADD="negronisurf_gpuwait=0 negronipanic=30
    negronipanicreason=2" scripts/gpu/build-test-image.sh`): `ioreg -l | grep RedwoodWaitsForGPU` shows `No` and the GL log
    says `flush = glFinish`.
+
+## 6. One switch for both drivers (2026-10-27)
+
+Owner's choice: acceleration on. `scripts/gpu/phone-accel.sh on|off|status` on the live phone = `scripts/metal/phone-metal.sh on "*"`
+(Metal device for every process, strikes cleared, off sentinel removed) + `scripts/gpu/phone-gl.sh on` (backboardd EAGL gate) +
+`phone-gl.sh apps on "* -backboardd"` + a backboardd restart. The files are on the root, so the setting stays across reboots until
+userdata is flashed again. A new root gets the same defaults: `scripts/ios16/root-update.sh` passes `METAL_CLIENTS="*"` to the metal hook
+(`METAL_CLIENTS=""` keeps the probes-only default) and `scripts/gpu/root-add-negronigl.sh` writes `/private/var/db/negronigl/clients` =
+`NEGRONIGL_CLIENTS` (default `*`) and `NegroniGL.bundle/apps.local` = `NEGRONIGL_APPS` (default `* -backboardd`).

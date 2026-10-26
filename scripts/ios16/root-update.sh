@@ -44,7 +44,7 @@ hooks=$(printf "%s\n" "$@" | grep -x tweaks || true); hooks="$hooks $(printf "%s
 for h in $hooks; do
   echo "== hook $h"
   case $h in
-    metal)     METAL=1 sh "$REPO/scripts/metal/root-add-metal.sh" "$R" ;;
+    metal)     METAL=1 METAL_CLIENTS="${METAL_CLIENTS-*}" sh "$REPO/scripts/metal/root-add-metal.sh" "$R" ;;   # owner 2026-10-27: Metal for every process by default (METAL_CLIENTS="" keeps the root default list)
     powermenu) POWERMENU=1 sh "$REPO/scripts/ios16/root-add-powermenu.sh" "$R" ;;
     negronigl) NEGRONIGL=1 sh "$REPO/scripts/gpu/root-add-negronigl.sh" "$R" ;;
     audio)     AUDIO=1 sh "$REPO/scripts/audio/root-add-audio.sh" "$R" ;;
