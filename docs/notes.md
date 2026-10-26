@@ -2823,3 +2823,7 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   refuse a same-value CBAR write (SEA caught by 0297, no panic); banks 0..5 are in use (not tried).
 - [I] A same-value write keeps the stage-2 type (S2_TRANS) that Gunyah keeps for itself; Linux writes the stage-1
   value 0x1f300. Next test: Wi-Fi with negroniwlan_smmu=3 (claim through the try-accessor, a refusal skips the bank).
+- [V] 2026-10-27 03:14, RAM test t6 (negroniwlan_smmu=3): the stage-1 claim with CBAR 0x1f300 is ACCEPTED by
+  Gunyah on bank 6 (`SMMU context 6 claimed ... now CBAR 0x1f300 CBA2R 0x1`, SMR6 0x80011c00 -> S2CR6 6, Wi-Fi
+  stream 0x1c01 through context 6, IOVA 0xa0000000+, no context or global fault). BHI SBL (512 KiB at IOVA
+  0xa0010000) written; then MHI never READY (MHISTATUS 0, EE 0) in 10 s: next is the BHI status/errcode readout.
