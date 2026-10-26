@@ -1,0 +1,731 @@
+Audio + shared helper: an apps-SMMU stage-1 context of our own (new bsd/dev/negroni_smmu_s1.c) for the ADSP
+stream 0x1801: the speaker ring anywhere in RAM, mapped at IOVA 0x10000000 (Android qcom,msm-audio-ion pool), given
+to the ADSP as IOVA | 1 << 32 (msm_audio_ion.c SID bits). 0243 asked for a ring below 4 GiB: impossible, XNU RAM
+starts at 0x840000000. negroniaudio_smmu=0 keeps the old physical path. The helper takes free contexts and SMRs
+from the top down (Wi-Fi 0324/0325 from the bottom up), free context = U-Boot CBAR rule (as 0325) + SCTLR.M off + no
+S2CR into it, CBAR/CBA2R restored at the end, re-reads each SMR and the CBAR before writing; exported claim lock negroni_smmu_claim_lock (scan to
+last write, and teardown) for every SMMU user (Wi-Fi 0325 to take it); map checks the TLB sync;
+camera (0317) uses it too. Details: patches/xnu/README-camera.md "0317-0318, 0249", docs/notes.md section 38.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index cf3bbcf..9d1b566 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -138,6 +138,7 @@ bsd/dev/unix_startup.c			standard
+ 
+ bsd/dev/monotonic.c optional monotonic
+ bsd/dev/dev_perfmon.c optional config_perfmon
++bsd/dev/negroni_smmu_s1.c		standard
+ 
+ bsd/libkern/crc32.c			standard
+ bsd/libkern/random.c			standard
+diff --git a/bsd/dev/negroni_audio.c b/bsd/dev/negroni_audio.c
+index 35540b3..be976b0 100644
+--- a/bsd/dev/negroni_audio.c
++++ b/bsd/dev/negroni_audio.c
+@@ -14,9 +14,11 @@
+  *  12  PRM    PRM_CMD_REQUEST_HW_RSC: TER MI2S IBIT clock (0x104) at 3.072 MHz; the I2S pins
+  *             (GPIO121..124) to function 1 in TLMM
+  *  13  graph  APM_CMD_GRAPH_OPEN (WR_SH_MEM_EP -> PCM_CNV -> MFC -> I2S_SINK), SET_CFG, PREPARE
+- *  14  shmem  SHARED_MEM_MAP_REGIONS of our ring: physically contiguous, below 4 GiB, given to the
+- *             ADSP as phys | (SID 0x1801 & 0xf) << 32 (assumes the boot chain lets SID 0x1801 through
+- *             untranslated; no SMMU programming here), the WR EP media format, GRAPH_START
++ *  14  shmem  SHARED_MEM_MAP_REGIONS of our ring, the WR EP media format, GRAPH_START. 0249: the ring
++ *             goes through an apps-SMMU stage-1 context of ours for SID 0x1801 at IOVA 0x10000000
++ *             (negroni_smmu_s1.c), given to the ADSP as IOVA | (SID 0x1801 & 0xf) << 32, as Android's
++ *             msm_audio_ion.c does (0243 asked for a ring below 4 GiB: impossible, XNU RAM starts at
++ *             0x840000000). negroniaudio_smmu=0: the old physical path (fails unless RAM < 4 GiB).
+  *  15  sink   enable /dev/negroni-audio; the write() path hands S16->S24 frames to the WR EP
+  *             (0244: through the speaker guard, negroni_audio_guard.c; with negroniaudio_amp=1 the
+  *             TFA9874 amps are probed here and started on the first non-silent block, stopped after
+@@ -71,6 +73,16 @@ extern void IOSleep(unsigned int ms);
+ #define AUDIO_SID               0x1801u          /* <&apps_smmu 0x1801 0> */
+ #define AUDIO_IOVA              0x10000000ull     /* qcom,iommu-dma-addr-pool */
+ #define AUDIO_SID_MSW           1u                /* addr_msw = SID & 0xf */
++#include "negroni_smmu_s1.h"
++/*
++ * 0249: Android maps the audio buffers through the apps SMMU: qcom,msm-audio-ion (live.dts:24782-24791)
++ * iommus <&apps_smmu 0x1801 0>, qcom,iommu-dma-addr-pool <0x10000000 0x10000000>, qcom,smmu-sid-mask 0xf;
++ * msm_audio_ion.c msm_audio_ion_get_phys: addr = the dma-buf IOVA of that context | sid << 32
++ * (MSM_AUDIO_SMMU_SID_OFFSET 32). Not a physical address, not a carveout (msm-audio-ion-cma is unused).
++ */
++static const struct negroni_s1_stream audio_streams[] = { { AUDIO_SID, 0 } };
++static struct negroni_s1 audio_s1 = { .name = "NEGRONI AUDIO", .streams = audio_streams, .nstreams = 1 };
++static uint32_t audio_smmu_policy = 1;          /* negroniaudio_smmu: 1 stage-1 context (default), 0 physical */
+ 
+ /* I2S: TERTIARY, SD1 out (GPIO124), internal WS; 48 kHz S24 in 32-bit slots -> BCLK 3.072 MHz */
+ #define CLOCK_ID_TER_MI2S_IBIT  0x104u
+@@ -818,15 +830,34 @@ step_graph(void)
+ 
+ /* ==== step 14: shared memory + WR EP media format + START ==== */
+ 
+-/* Program apps-SMMU SID 0x1801 -> our ring at AUDIO_IOVA (hackios redwood_sound.c). 0243 owns the
+- * SMMU helpers; here we assume the boot chain passes SID 0x1801 untranslated and give the ADSP the
+- * physical address with the SID bit, like redwood_sound's "passed" path. If the SMMU translates,
+- * step 14 fails cleanly and audio stays off (no SoC reset). */
++/* 0249: apps-SMMU SID 0x1801 -> our ring at AUDIO_IOVA through a stage-1 context of ours (as hackios
++ * redwood_sound.c space_on and Android msm_audio_ion.c). With negroniaudio_smmu=0 the 0243 path: the
++ * physical address with the SID bit (needs RAM below 4 GiB: not on this port). On a failure step 14
++ * stops cleanly and audio stays off. */
+ static bool
+ smmu_setup(void)
+ {
+ 	bzero((void *)ring, round_page(RING_BYTES));
+ 	clean_dcache(ring, round_page(RING_BYTES), FALSE);
++	if (audio_smmu_policy != 0) {
++		if (smmu_on) {
++			return true;            /* the context and the ring mapping stay for the boot */
++		}
++		if (negroni_s1_on(&audio_s1) != 0) {
++			FAIL("no apps-SMMU stage-1 context for SID %#x (see the SMMU lines above)", AUDIO_SID);
++			return false;
++		}
++		if (negroni_s1_map_kva(&audio_s1, AUDIO_IOVA, ring, round_page(RING_BYTES)) != 0) {
++			negroni_s1_off(&audio_s1);
++			FAIL("ring map at IOVA %#llx failed", AUDIO_IOVA);
++			return false;
++		}
++		ring_iova = AUDIO_IOVA | ((uint64_t)(AUDIO_SID & 0xf) << 32);
++		smmu_on = true;
++		say("ring %u bytes at phys %#llx -> ADSP address %#llx (SMMU stage 1, SID %#x)", RING_BYTES, kvtophys(ring),
++		    ring_iova, AUDIO_SID);
++		return true;
++	}
+ 	/* a single-piece physical buffer so an untranslated SID sees it as one region */
+ 	if (kvtophys(ring) + RING_BYTES > 0x100000000ull) {
+ 		FAIL("ring at phys %#llx is not below 4 GiB (the SID bits go in addr_msw)", kvtophys(ring));
+@@ -876,8 +907,10 @@ step_shmem(void)
+ {
+ 	announce_note("APM: map our ring, set the WR EP media format, START");
+ 	if (ring == 0) {
+-		/* one physical piece below 4 GiB: the ADSP gets phys | SID bits << 32 */
+-		if (kmem_alloc_contig(kernel_map, &ring, round_page(RING_BYTES), 0, (ppnum_t)(atop(0x100000000ull) - 1), 0,
++		/* 0249: one physical piece anywhere (0243 asked for < 4 GiB: impossible here); the SMMU gives the
++		 * ADSP its 32-bit view (smmu_setup) */
++		(void)PE_parse_boot_argn("negroniaudio_smmu", &audio_smmu_policy, sizeof(audio_smmu_policy));
++		if (kmem_alloc_contig(kernel_map, &ring, round_page(RING_BYTES), 0, 0, 0,
+ 		    KMA_KOBJECT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 			ring = 0;
+ 			FAIL("no memory for the ring");
+diff --git a/bsd/dev/negroni_smmu_s1.c b/bsd/dev/negroni_smmu_s1.c
+new file mode 100644
+index 0000000..c022444
+--- /dev/null
++++ b/bsd/dev/negroni_smmu_s1.c
+@@ -0,0 +1,529 @@
++/*
++ * NEGRONI (SM8450): apps-SMMU stage-1 contexts of our own (patch 0249). See negroni_smmu_s1.h for why
++ * and for the rules that keep this file and the Wi-Fi copy (0324 negroni_wlan_smmu.c) apart.
++ *
++ * Order (Linux arm-smmu.c arm_smmu_write_context_bank / arm_smmu_write_sme, io-pgtable-arm.c; the same
++ * values as negroni_adreno.c (0233) and negroni_wlan_smmu.c (0324) on this SoC): context bank off,
++ * CBA2R (VA64), CBAR (stage 1, stage 2 bypass), TCR2/TCR (39-bit input, 36-bit output, 4 KiB granule),
++ * TTBR0 (+ ASID = context index), MAIR0, fault status clear, TLB invalidate + sync, SCTLR on; then per
++ * stream S2CR (translate, context index) and only then the SMR valid bit. Every global write is read
++ * back; a refused write stops before any DMA, and what was written is put back.
++ * Hardware: live.dts:15350-15370 apps-smmu@15000000 (qcom,qsmmu-v500, qcom,skip-init,
++ * qcom,num-smr-override 0x78, qcom,num-context-banks-override 0x4e). UNTESTED ON HARDWARE.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include "negroni_mmio.h"
++#include "negroni_smmu_s1.h"
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern uint64_t kvtophys(vm_offset_t va);
++extern vm_map_address_t phystokv(uint64_t pa);
++
++#define APPS_SMMU_PHYS          0x15000000ull
++#define APPS_SMMU_SIZE          0x100000ull     /* live.dts:15352 */
++#define S1_WIMG_IO              0x7u
++#define MAX_CTX                 0x4eu           /* qcom,num-context-banks-override */
++#define MAX_SMR                 0x78u           /* qcom,num-smr-override */
++
++#define SMMU_SCR0               0x000
++#define SMMU_SCR0_EXIDENABLE    (1u << 3)
++#define SMMU_IDR0               0x020
++#define SMMU_IDR1               0x024
++#define SMMU_SGFSR              0x048
++#define SMMU_SGFSYNR1           0x054
++#define SMMU_SMR(n)             (0x800u + 4u * (n))
++#define SMMU_S2CR(n)            (0xc00u + 4u * (n))
++#define SMMU_SMR_VALID          (1u << 31)
++#define SMMU_CBAR(n)            (4u * (n))              /* global page 1 */
++#define SMMU_CBFRSYNRA(n)       (0x400u + 4u * (n))     /* global page 1: the faulting stream ID */
++#define SMMU_CBA2R(n)           (0x800u + 4u * (n))     /* global page 1 */
++#define CB_SCTLR                0x00
++#define CB_TCR2                 0x10
++#define CB_TTBR0                0x20
++#define CB_TTBR1                0x28
++#define CB_TCR                  0x30
++#define CB_MAIR0                0x38
++#define CB_MAIR1                0x3c
++#define CB_FSR                  0x58
++#define CB_FAR                  0x60
++#define CB_FSYNR0               0x68
++#define CB_TLBIASID             0x610
++#define CB_TLBSYNC              0x7f0
++#define CB_TLBSTATUS            0x7f4
++#define CBAR_S1                 (1u << 16 | 3u << 8 | 0xfu << 12)
++#define SCTLR_ON                (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)
++#define TCR_39                  (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
++#define TCR2_36                 (1u | 1u << 4 | 7u << 15)
++#define MAIR0                   0xf404ff44u     /* index 0 = Normal non-cacheable; the CPU cleans/invalidates */
++#define FSR_ALL                 0xc00001feu
++#define PTE_VALID               3ull
++#define PTE_ATTR                ((1ull << 10) | (2ull << 8) | (1ull << 6) | (1ull << 11))   /* AF, SH outer, AP unpriv RW, nG */
++#define PTE_ADDR                0x0000fffffffff000ull
++#define S2CR_TYPE(v)            (((v) >> 16) & 3u)
++
++/*
++ * The claim lock (exported, negroni_smmu_s1.h): held from the free-entry scan to the last SMR/S2CR/CBAR write in
++ * negroni_s1_on, and over the whole teardown. Any other apps-SMMU user that claims entries (Wi-Fi 0325) must take
++ * it too; until it does, it is outside this protection (the top-down/bottom-up split and the re-reads remain).
++ */
++static LCK_GRP_DECLARE(negroni_smmu_claim_grp, "negroni_smmu_claim");
++LCK_MTX_DECLARE(negroni_smmu_claim_lock, &negroni_smmu_claim_grp);
++static uint32_t snap_smr[128], snap_s2cr[128];  /* under negroni_smmu_claim_lock */
++
++#define G0R(s, o)       negroni_mmio_rd32((s)->g0 + (o))
++#define G0W(s, o, v)    negroni_mmio_wr32((s)->g0 + (o), (v))
++#define CBR(s, c, o)    negroni_mmio_rd32((s)->cbva + (vm_offset_t)(c) * (s)->page + (o))
++#define CBW(s, c, o, v) negroni_mmio_wr32((s)->cbva + (vm_offset_t)(c) * (s)->page + (o), (v))
++
++static void
++dsb(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* a page-aligned uncached mapping of [pa, pa + size): map and msize for the unmap, the return value at pa */
++static vm_offset_t
++io_map(uint64_t pa, vm_size_t size, vm_offset_t *map, vm_size_t *msize)
++{
++	uint64_t base = pa & ~(uint64_t)PAGE_MASK;
++	vm_size_t len = round_page(size + (vm_size_t)(pa - base));
++	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)base, len, S1_WIMG_IO);
++
++	*map = va;
++	*msize = len;
++	return va ? va + (vm_offset_t)(pa - base) : 0;
++}
++
++static int
++g_put(struct negroni_s1 *s, const char *what, uint32_t off, uint32_t v)
++{
++	G0W(s, off, v);
++	dsb();
++	uint32_t got = G0R(s, off);
++	if (got != v) {
++		printf("%s: SMMU %s reads %#x after writing %#x (the hypervisor refused it?)\n", s->name, what, got, v);
++		return EPERM;
++	}
++	return 0;
++}
++
++static int
++cb_put(struct negroni_s1 *s, const char *what, uint32_t off, uint32_t v)
++{
++	CBW(s, s->cb, off, v);
++	dsb();
++	uint32_t got = CBR(s, s->cb, off);
++	if (got != v) {
++		printf("%s: SMMU context %u %s reads %#x after writing %#x\n", s->name, s->cb, what, got, v);
++		return EPERM;
++	}
++	return 0;
++}
++
++/* invalidate the context's TLB and wait (10 ms at most); false on a time-out */
++static bool
++tlb_sync(struct negroni_s1 *s)
++{
++	CBW(s, s->cb, CB_TLBIASID, s->cb);
++	CBW(s, s->cb, CB_TLBSYNC, 1);
++	for (int i = 0; i < 1000 && (CBR(s, s->cb, CB_TLBSTATUS) & 1); i++) {
++		delay(10);
++	}
++	return (CBR(s, s->cb, CB_TLBSTATUS) & 1) == 0;
++}
++
++static void
++tbl_flush(const void *p, size_t n)
++{
++	for (vm_offset_t a = (vm_offset_t)p & ~(vm_offset_t)63; a < (vm_offset_t)p + n; a += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (a));
++	}
++	dsb();
++}
++
++static uint64_t *
++tbl_new(struct negroni_s1 *s, uint64_t *pa_out)
++{
++	if (s->tleft == 0) {
++		if (s->tpages == NEGRONI_S1_TABLE_PAGES || kmem_alloc(kernel_map, &s->tpage[s->tpages], PAGE_SIZE,
++		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return NULL;
++		}
++		s->tpages++;
++		s->tleft = PAGE_SIZE / 4096;
++	}
++	uint64_t *t = (uint64_t *)(s->tpage[s->tpages - 1] + PAGE_SIZE - 4096 * s->tleft--);
++	tbl_flush(t, 4096);
++	*pa_out = kvtophys((vm_offset_t)t);
++	return t;
++}
++
++static uint64_t *
++tbl_next(struct negroni_s1 *s, uint64_t *entry)
++{
++	uint64_t pa;
++
++	if (*entry & 1) {
++		return (uint64_t *)phystokv(*entry & PTE_ADDR);
++	}
++	uint64_t *t = tbl_new(s, &pa);
++	if (t) {
++		*entry = pa | PTE_VALID;
++		tbl_flush(entry, sizeof(*entry));
++	}
++	return t;
++}
++
++static bool
++map_page(struct negroni_s1 *s, uint64_t iova, uint64_t pa)
++{
++	uint64_t *l2 = tbl_next(s, &s->root[(iova >> 30) & 0x1ff]);
++	uint64_t *l3 = l2 ? tbl_next(s, &l2[(iova >> 21) & 0x1ff]) : NULL;
++
++	if (!l3 || pa == 0) {
++		return false;
++	}
++	uint64_t *e = &l3[(iova >> 12) & 0x1ff];
++	*e = (pa & PTE_ADDR) | PTE_ATTR | PTE_VALID;
++	tbl_flush(e, sizeof(*e));
++	return true;
++}
++
++int
++negroni_s1_map_kva(struct negroni_s1 *s, uint64_t iova, vm_offset_t kva, uint64_t size)
++{
++	if (!s->on || size == 0 || (iova & 0xfff) || (kva & 0xfff) || iova + size > (1ull << 39)) {
++		return EINVAL;
++	}
++	for (uint64_t o = 0; o < size; o += 4096) {
++		if (!map_page(s, iova + o, kvtophys(kva + (vm_offset_t)o))) {
++			printf("%s: SMMU map of IOVA %#llx failed (no table page or no physical page)\n", s->name, iova + o);
++			return ENOMEM;
++		}
++	}
++	s->mapped_pages += (uint32_t)((size + 4095) / 4096);
++	if (!tlb_sync(s)) {
++		printf("%s: SMMU context %u TLB sync does not finish after the map of IOVA %#llx (status %#x)\n", s->name, s->cb,
++		    iova, CBR(s, s->cb, CB_TLBSTATUS));
++		return ETIMEDOUT;
++	}
++	printf("%s: SMMU context %u: IOVA %#llx-%#llx -> phys %#llx.. (%llu KiB)\n", s->name, s->cb, iova, iova + size - 1,
++	    kvtophys(kva), size >> 10);
++	return 0;
++}
++
++void
++negroni_s1_report(struct negroni_s1 *s, const char *when)
++{
++	if (!s->on) {
++		return;
++	}
++	uint32_t fsr = CBR(s, s->cb, CB_FSR), gfsr = G0R(s, SMMU_SGFSR);
++	uint32_t sid = negroni_mmio_rd32(s->g0 + s->page + SMMU_CBFRSYNRA(s->cb));
++	printf("%s: SMMU context %u %s: FSR %#x%s FAR %#x:%#x FSYNR0 %#x stream %#x; sGFSR %#x sGFSYNR1 %#x; %u pages mapped\n",
++	    s->name, s->cb, when, fsr, (fsr & FSR_ALL) ? " (CONTEXT FAULT)" : " (no fault)", CBR(s, s->cb, CB_FAR + 4),
++	    CBR(s, s->cb, CB_FAR), CBR(s, s->cb, CB_FSYNR0), sid & 0xffffu, gfsr, G0R(s, SMMU_SGFSYNR1), s->mapped_pages);
++	if (fsr & FSR_ALL) {
++		CBW(s, s->cb, CB_FSR, fsr);     /* write one to clear */
++	}
++}
++
++uint32_t
++negroni_s1_fsr(struct negroni_s1 *s)
++{
++	return s->on ? CBR(s, s->cb, CB_FSR) & FSR_ALL : 0;
++}
++
++static void
++unmap_all(struct negroni_s1 *s)
++{
++	for (uint32_t i = 0; i < s->tpages; i++) {
++		kmem_free(kernel_map, s->tpage[i], PAGE_SIZE);
++	}
++	s->tpages = s->tleft = 0;
++	s->root = NULL;
++	s->mapped_pages = 0;
++	if (s->cb_map) {
++		ml_io_unmap(s->cb_map, s->cb_size);
++		s->cb_map = s->cbva = 0;
++	}
++	if (s->g0_map) {
++		ml_io_unmap(s->g0_map, s->g0_size);
++		s->g0_map = s->g0 = 0;
++	}
++}
++
++/* the S2CRs and SMRs back as found, the context off (lock held) */
++static void
++undo(struct negroni_s1 *s)
++{
++	for (uint32_t k = 0; k < s->nstreams; k++) {
++		if (!s->written[k]) {
++			continue;
++		}
++		uint32_t n = s->smr[k];
++		if (s->reused[k]) {
++			G0W(s, SMMU_S2CR(n), s->old_s2cr[k]);   /* the SMR stays as it was */
++		} else {
++			G0W(s, SMMU_SMR(n), s->old_smr[k]);     /* invalid first, then the S2CR */
++			dsb();
++			G0W(s, SMMU_S2CR(n), s->old_s2cr[k]);
++		}
++		dsb();
++		printf("%s: SMMU SMR%u %s, S2CR%u = %#x\n", s->name, n, s->reused[k] ? "kept" : "cleared", n, G0R(s, SMMU_S2CR(n)));
++		s->written[k] = false;
++	}
++	if (s->cb != ~0u && s->cbva && s->cb_written) {
++		CBW(s, s->cb, CB_SCTLR, 0);
++		dsb();
++		tlb_sync(s);
++		G0W(s, s->page + SMMU_CBAR(s->cb), s->old_cbar);       /* the bank free again for the U-Boot rule */
++		G0W(s, s->page + SMMU_CBA2R(s->cb), s->old_cba2r);
++		dsb();
++		s->cb_written = false;
++	}
++}
++
++void
++negroni_s1_off(struct negroni_s1 *s)
++{
++	lck_mtx_lock(&negroni_smmu_claim_lock);
++	if (s->on) {
++		negroni_s1_report(s, "at teardown");
++		undo(s);
++		printf("%s: SMMU context %u off\n", s->name, s->cb);
++	}
++	s->on = false;
++	unmap_all(s);
++	s->cb = ~0u;
++	lck_mtx_unlock(&negroni_smmu_claim_lock);
++}
++
++/* does SMR value v (valid) match any stream of the (id, mask) set? */
++static bool
++smr_overlaps(uint32_t v, uint32_t id, uint32_t mask)
++{
++	uint32_t vid = v & 0x7fffu, vmask = (v >> 16) & 0x7fffu;
++	return ((vid ^ id) & ~(vmask | mask) & 0x7fffu) == 0;
++}
++
++/* the CBAR read again right before it is written: another user may have taken the bank since the scan */
++static int
++cbar_still_free(struct negroni_s1 *s)
++{
++	uint32_t now = negroni_mmio_rd32(s->g0 + s->page + SMMU_CBAR(s->cb));
++	if (now != s->old_cbar) {
++		printf("%s: SMMU context %u CBAR changed under us (%#x, was %#x): another driver took it\n", s->name, s->cb, now,
++		    s->old_cbar);
++		return EBUSY;
++	}
++	return 0;
++}
++
++static int
++s1_on_locked(struct negroni_s1 *s)
++{
++	if (s->nstreams == 0 || s->nstreams > NEGRONI_S1_MAX_STREAMS) {
++		return EINVAL;
++	}
++	s->cb = ~0u;
++	s->g0 = io_map(APPS_SMMU_PHYS, 0x2000, &s->g0_map, &s->g0_size);
++	if (!s->g0) {
++		printf("%s: SMMU map failed\n", s->name);
++		return ENOMEM;
++	}
++	uint32_t scr0 = G0R(s, SMMU_SCR0), idr0 = G0R(s, SMMU_IDR0), idr1 = G0R(s, SMMU_IDR1);
++	s->page = (idr1 >> 31) ? 0x10000u : 0x1000u;
++	s->pages = 2u << ((idr1 >> 28) & 7);
++	s->nctx = MIN(idr1 & 0xffu, MAX_CTX);
++	s->nsmr = MIN(MIN(idr0 & 0xffu, MAX_SMR), 128u);
++	printf("%s: SMMU S1 setup: sCR0 %#x IDR0 %#x IDR1 %#x: %u SMRs, %u contexts, %u pages of %#x\n", s->name, scr0, idr0, idr1,
++	    s->nsmr, s->nctx, s->pages, s->page);
++	if (scr0 == ~0u || s->nsmr == 0 || s->nctx < 2 || 2ull * s->pages * s->page > APPS_SMMU_SIZE) {
++		printf("%s: SMMU layout does not fit\n", s->name);
++		return ENXIO;
++	}
++	if (scr0 & SMMU_SCR0_EXIDENABLE) {
++		printf("%s: SMMU uses extended stream IDs; SMR format not handled\n", s->name);
++		return ENOTSUP;
++	}
++	if (s->page != 0x1000u) {               /* global page 1 is then at +0x10000: map both pages again */
++		ml_io_unmap(s->g0_map, s->g0_size);
++		s->g0 = io_map(APPS_SMMU_PHYS, 2 * s->page, &s->g0_map, &s->g0_size);
++		if (!s->g0) {
++			return ENOMEM;
++		}
++	}
++	s->cbva = io_map(APPS_SMMU_PHYS + (uint64_t)s->pages * s->page, (vm_size_t)s->nctx * s->page, &s->cb_map, &s->cb_size);
++	if (!s->cbva) {
++		return ENOMEM;
++	}
++	/* one snapshot of the stream-match table (each read is a hypervisor trap); re-read before each write */
++	for (uint32_t i = 0; i < s->nsmr; i++) {
++		snap_smr[i] = G0R(s, SMMU_SMR(i));
++		snap_s2cr[i] = G0R(s, SMMU_S2CR(i));
++	}
++
++	/* stream-match entries: an SMR equal to ours whose S2CR does not translate is reused; any other valid
++	 * SMR that matches one of our IDs belongs to someone (a double match is a conflict fault): stop */
++	uint32_t taken = 0;     /* bit per stream k: it has an entry */
++	for (uint32_t k = 0; k < s->nstreams; k++) {
++		uint32_t id = s->streams[k].id, mask = s->streams[k].mask, want = SMMU_SMR_VALID | mask << 16 | id;
++		for (uint32_t i = 0; i < s->nsmr; i++) {
++			uint32_t v = snap_smr[i];
++			if (!(v & SMMU_SMR_VALID) || !smr_overlaps(v, id, mask)) {
++				continue;
++			}
++			uint32_t s2 = snap_s2cr[i];
++			if (v == want && S2CR_TYPE(s2) != 0) {
++				s->smr[k] = i;
++				s->reused[k] = true;
++				s->old_smr[k] = v;
++				s->old_s2cr[k] = s2;
++				taken |= 1u << k;
++				printf("%s: SMMU stream %#x/%#x: SMR%u already there (S2CR %#x, %s): reused\n", s->name, id, mask, i, s2,
++				    S2CR_TYPE(s2) == 1 ? "bypass" : "fault");
++				break;
++			}
++			printf("%s: SMMU stream %#x/%#x: SMR%u %#x (S2CR %#x) already matches it: somebody's entry, left alone\n",
++			    s->name, id, mask, i, v, s2);
++			return EBUSY;
++		}
++	}
++	/* free SMRs from the top down (0324 takes them from the bottom up) */
++	uint32_t next = s->nsmr;
++	for (uint32_t k = 0; k < s->nstreams; k++) {
++		if (taken & (1u << k)) {
++			continue;
++		}
++		while (next > 0 && (snap_smr[next - 1] & SMMU_SMR_VALID)) {
++			next--;
++		}
++		if (next == 0) {
++			printf("%s: SMMU has no free stream-match register\n", s->name);
++			return EBUSY;
++		}
++		next--;
++		s->smr[k] = next;
++		s->reused[k] = false;
++		s->old_smr[k] = snap_smr[next];
++		s->old_s2cr[k] = snap_s2cr[next];
++	}
++	/* a free context bank from the top down: the U-Boot qcom-hyp-smmu.c rule on CBAR (S2_TRANS, or
++	 * S1_TRANS_S2_BYPASS with VMID 0xff), no valid SMR translates into it, SCTLR.M = 0 */
++	for (uint32_t c = s->nctx - 1; c >= 1 && s->cb == ~0u; c--) {
++		uint32_t cbar = negroni_mmio_rd32(s->g0 + s->page + SMMU_CBAR(c)), type = (cbar >> 16) & 3u;
++		bool used = !(type == 0 || (type == 1 && (cbar & 0xffu) == 0xffu));
++		for (uint32_t m = 0; !used && m < s->nsmr; m++) {
++			used = (snap_smr[m] & SMMU_SMR_VALID) && S2CR_TYPE(snap_s2cr[m]) == 0 && (snap_s2cr[m] & 0xffu) == c;
++		}
++		if (!used && !(CBR(s, c, CB_SCTLR) & 1)) {
++			s->cb = c;
++			s->old_cbar = cbar;
++			s->old_cba2r = negroni_mmio_rd32(s->g0 + s->page + SMMU_CBA2R(c));
++		}
++	}
++	if (s->cb == ~0u) {
++		printf("%s: SMMU has no free context bank (U-Boot CBAR rule, SCTLR.M, S2CR targets)\n", s->name);
++		return EBUSY;
++	}
++	for (uint32_t k = 0; k < s->nstreams; k++) {
++		printf("%s: SMMU stream %#x mask %#x: SMR%u (%s, was %#x / S2CR %#x) -> context %u\n", s->name, s->streams[k].id,
++		    s->streams[k].mask, s->smr[k], s->reused[k] ? "reused" : "free", s->old_smr[k], s->old_s2cr[k], s->cb);
++	}
++
++	s->root = tbl_new(s, &s->root_pa);
++	if (!s->root) {
++		return ENOMEM;
++	}
++	uint64_t ttbr = s->root_pa | ((uint64_t)s->cb << 48);
++	int error;
++	printf("%s: SMMU context %u free: CBAR %#x CBA2R %#x\n", s->name, s->cb, s->old_cbar, s->old_cba2r);
++	CBW(s, s->cb, CB_SCTLR, 0);
++	dsb();
++	s->cb_written = true;
++	if ((error = g_put(s, "CBA2R", s->page + SMMU_CBA2R(s->cb), 1)) ||       /* VA64 */
++	    (error = cbar_still_free(s)) ||
++	    (error = g_put(s, "CBAR", s->page + SMMU_CBAR(s->cb), CBAR_S1)) ||
++	    (error = cb_put(s, "TCR2", CB_TCR2, TCR2_36)) ||
++	    (error = cb_put(s, "TCR", CB_TCR, TCR_39)) ||
++	    (error = cb_put(s, "TTBR0 lo", CB_TTBR0, (uint32_t)ttbr)) ||
++	    (error = cb_put(s, "TTBR0 hi", CB_TTBR0 + 4, (uint32_t)(ttbr >> 32))) ||
++	    (error = cb_put(s, "MAIR0", CB_MAIR0, MAIR0))) {
++		return error;
++	}
++	CBW(s, s->cb, CB_TTBR1, 0);
++	CBW(s, s->cb, CB_TTBR1 + 4, 0);
++	CBW(s, s->cb, CB_MAIR1, 0);
++	CBW(s, s->cb, CB_FSR, FSR_ALL);
++	if (!tlb_sync(s)) {
++		printf("%s: SMMU TLB sync does not finish\n", s->name);
++		return ETIMEDOUT;
++	}
++	CBW(s, s->cb, CB_SCTLR, SCTLR_ON);
++	dsb();
++	if (!(CBR(s, s->cb, CB_SCTLR) & 1)) {
++		printf("%s: SMMU context %u SCTLR does not take M (%#x)\n", s->name, s->cb, CBR(s, s->cb, CB_SCTLR));
++		return EPERM;
++	}
++	/* the streams: S2CR (translate, context) first, then the SMR; each SMR read again right before */
++	for (uint32_t k = 0; k < s->nstreams; k++) {
++		uint32_t n = s->smr[k], want = SMMU_SMR_VALID | (uint32_t)s->streams[k].mask << 16 | s->streams[k].id;
++		uint32_t now = G0R(s, SMMU_SMR(n));
++		if (s->reused[k] ? now != s->old_smr[k] : (now & SMMU_SMR_VALID) != 0) {
++			printf("%s: SMMU SMR%u changed under us (%#x): another driver took it\n", s->name, n, now);
++			return EBUSY;
++		}
++		s->written[k] = true;
++		if ((error = g_put(s, "S2CR", SMMU_S2CR(n), s->cb))) {         /* type 0 = translate */
++			return error;
++		}
++		if (!s->reused[k] && (error = g_put(s, "SMR", SMMU_SMR(n), want))) {
++			return error;
++		}
++	}
++	s->on = true;
++	for (uint32_t k = 0; k < s->nstreams; k++) {
++		printf("%s: SMMU SMR%u = %#x, S2CR%u = %#x\n", s->name, s->smr[k], G0R(s, SMMU_SMR(s->smr[k])), s->smr[k],
++		    G0R(s, SMMU_S2CR(s->smr[k])));
++	}
++	printf("%s: SMMU context %u ON: SCTLR %#x TTBR0 %#x:%#x (root %#llx), %u stream entr%s translate through it\n", s->name,
++	    s->cb, CBR(s, s->cb, CB_SCTLR), CBR(s, s->cb, CB_TTBR0 + 4), CBR(s, s->cb, CB_TTBR0), s->root_pa, s->nstreams,
++	    s->nstreams == 1 ? "y" : "ies");
++	return 0;
++}
++
++int
++negroni_s1_on(struct negroni_s1 *s)
++{
++	lck_mtx_lock(&negroni_smmu_claim_lock);
++	if (s->on) {
++		lck_mtx_unlock(&negroni_smmu_claim_lock);
++		return 0;
++	}
++	bzero(s->written, sizeof(s->written));
++	s->cb_written = false;
++	int error = s1_on_locked(s);
++	if (error) {
++		printf("%s: SMMU S1 context not set up (errno %d); nothing of ours stays written\n", s->name, error);
++		if (s->g0 && s->cbva) {
++			undo(s);
++		}
++		s->on = false;
++		unmap_all(s);
++		s->cb = ~0u;
++	}
++	lck_mtx_unlock(&negroni_smmu_claim_lock);
++	return error;
++}
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_smmu_s1.h b/bsd/dev/negroni_smmu_s1.h
+new file mode 100644
+index 0000000..f787307
+--- /dev/null
++++ b/bsd/dev/negroni_smmu_s1.h
+@@ -0,0 +1,81 @@
++/*
++ * NEGRONI (SM8450): an apps-SMMU stage-1 translation context of our own for a set of stream IDs
++ * (patch 0249; used by negroni_audio.c for the ADSP stream 0x1801 and by negroni_cam.c (0317) for the
++ * camera IFE and ICP streams).
++ *
++ * Why: XNU's RAM on this port starts at 0x840000000 (ADT --dram 840000000:C0000000), so no buffer of
++ * ours has a 32-bit physical address, and the Gunyah hypervisor turns an S2CR BYPASS entry into FAULT
++ * (README-wifi.md "2026-10-26 panic fix", arm-smmu-qcom.c bypass quirk). A context bank of our own, with
++ * our page tables, is the only DMA path for a 32-bit master: Android does the same (iommu-dma IOVAs from
++ * the DT qcom,iommu-dma-addr-pool / iova-mem-region-* windows).
++ *
++ * The register sequence of patch 0324 (negroni_wlan_smmu.c, the Wi-Fi stream 0x1c01), made generic: one
++ * struct negroni_s1 per user. SCTLR is 0324's (M, TRE, AFE, CFRE, ASIDPNE); the Wi-Fi 0325 rewrite differs there
++ * (HUPCF on, CFRE off, from the DT wlan fault flags): here a context fault aborts the access [I: fine for the
++ * camera and the ADSP, both log and stop on a fault]. TODO: one shared negroni_smmu.c should replace this file and
++ * negroni_wlan_smmu.c (0324) later; until then the two never take the same entries:
++ *   - this file takes free context banks and free stream-match registers from the TOP index down,
++ *     0324 from the bottom up;
++ *   - a context bank is free only by the U-Boot qcom-hyp-smmu.c rule (CBAR type S2_TRANS, or S1_TRANS_S2_BYPASS
++ *     with VMID 0xff; the rule 0325 uses too) and with SCTLR.M = 0 and no valid SMR whose S2CR translates into it;
++ *     a taken bank gets CBAR S1_TRANS_S2_BYPASS VMID 0, so the other user's rule sees it as used;
++ *   - each SMR is read again right before it is written (still invalid, or still the value we reuse);
++ *   - the claim lock negroni_smmu_claim_lock (exported below) is held from the free-entry scan to the last
++ *     SMR/S2CR/CBAR write and over the teardown; the CBAR is read again right before it is written. Wi-Fi
++ *     (0324/0325) is outside the lock until it takes it too.
++ * Every apps-SMMU access is one plain 32-bit ldr/str through negroni_mmio.h (Gunyah traps the global
++ * space and injects an SEA for any other access form).
++ */
++#ifndef _NEGRONI_SMMU_S1_H_
++#define _NEGRONI_SMMU_S1_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <mach/vm_types.h>
++#include <kern/locks.h>
++
++/* 0249: the apps-SMMU claim lock; every driver that claims SMRs/context banks takes it */
++extern lck_mtx_t negroni_smmu_claim_lock;
++
++#define NEGRONI_S1_MAX_STREAMS  6
++#define NEGRONI_S1_TABLE_PAGES  32      /* 16 KiB kernel pages, 4 tables of 4 KiB each: 128 tables */
++
++struct negroni_s1_stream {
++	uint16_t id, mask;              /* one SMR: ID 14:0, MASK 30:16 (live DT iommus = <&apps_smmu id mask>) */
++};
++
++struct negroni_s1 {
++	/* set by the user */
++	const char *name;                       /* log prefix, e.g. "NEGRONI CAM" */
++	const struct negroni_s1_stream *streams;
++	uint32_t nstreams;
++	/* state (zero at start) */
++	bool on;
++	uint32_t cb;                            /* context bank index */
++	uint32_t old_cbar, old_cba2r;           /* restored at the end */
++	bool cb_written;
++	uint32_t page, pages, nctx, nsmr;
++	vm_offset_t g0, cbva;                   /* global pages 0-1, our context bank page */
++	vm_offset_t g0_map, cb_map;             /* the mappings to free (page aligned) */
++	vm_size_t g0_size, cb_size;
++	uint32_t smr[NEGRONI_S1_MAX_STREAMS], old_smr[NEGRONI_S1_MAX_STREAMS], old_s2cr[NEGRONI_S1_MAX_STREAMS];
++	bool reused[NEGRONI_S1_MAX_STREAMS], written[NEGRONI_S1_MAX_STREAMS];
++	vm_offset_t tpage[NEGRONI_S1_TABLE_PAGES];
++	uint32_t tpages, tleft;
++	uint64_t *root;
++	uint64_t root_pa;
++	uint32_t mapped_pages;
++};
++
++/* Context on for all streams of s. 0 or an errno; the reason is printed. On failure nothing stays written. */
++int negroni_s1_on(struct negroni_s1 *s);
++/* Map `size` bytes of kernel memory at `kva` (any physical layout, 4 KiB pages) at device address `iova`. */
++int negroni_s1_map_kva(struct negroni_s1 *s, uint64_t iova, vm_offset_t kva, uint64_t size);
++/* Print the context's fault registers (FSR, FAR, FSYNR0, the faulting stream) and clear them. */
++void negroni_s1_report(struct negroni_s1 *s, const char *when);
++/* The context's fault status (CB_FSR fault bits), 0 when off or no fault: cheap enough for a frame loop. */
++uint32_t negroni_s1_fsr(struct negroni_s1 *s);
++/* After the masters stopped: the SMRs/S2CRs back as found, the context off, the tables freed. */
++void negroni_s1_off(struct negroni_s1 *s);
++
++#endif /* _NEGRONI_SMMU_S1_H_ */

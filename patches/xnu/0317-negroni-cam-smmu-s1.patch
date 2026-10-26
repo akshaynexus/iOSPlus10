@@ -1,0 +1,388 @@
+Camera DMA addressing (negronicam_smmu=3, the default from level 5): frame buffers (0315) and the ICP HFI block
+(0316) anywhere in RAM (0315/0316 asked for < 4 GiB: impossible here), mapped through an apps-SMMU stage-1 context
+of ours (negroni_smmu_s1.c, 0249) for the IFE SMR 0x800/0x460 and, at level 6, the ICP SMRs 0x2000/0x2040/0x2100
+(mask 0x420) + 0x2080/0x400, at IOVAs in Android's windows (frames from 0x10c00000, HFI at fw_uncached 0x10400000
++ shared 0x800000 in Android's layout, IO/IO2 around the discard window). Context fault lines after each frame
+and after the HFI init. ICP PAS SCM loop resumes up to 2000000 times (as 0240). HFI block freed only after the SMMU teardown, kept
+(leaked) when the PAS shutdown fails; at least 1 MiB unmapped IOVA after each buffer.
+
+diff --git a/bsd/dev/negroni_cam.c b/bsd/dev/negroni_cam.c
+index 0cb7167..af77203 100644
+--- a/bsd/dev/negroni_cam.c
++++ b/bsd/dev/negroni_cam.c
+@@ -33,9 +33,14 @@
+  *      (the titan GDSC parent pm8350c_s2_mmcx_voter_level) and the BCM votes of the camera NoC paths:
+  *      CN0 (cam_ahb: apps -> qhs_camera_cfg), MM1 + MM0 + SH0 + MC0 (cam_hf_0: qnm_camnoc_hf -> qns_mem_noc_hf ->
+  *      qns_llcc -> ebi). The votes stay after the run (a lower vote from this DRV could replace a boot vote).
+- *   negronicam_smmu=0|1|2  0 report only, 1 (default) stop before DMA when a camera stream would fault or
++ *   negronicam_smmu=0|1|2|3  0 report only, 1 stop before DMA when a camera stream would fault or
+  *      translate through a context this kernel did not set up, 2 add a bypass SMR/S2CR pair for the stream
+- *      group (as negroniwlan_smmu=2, patch 0263) and remove it again at power down.
++ *      group (as negroniwlan_smmu=2, patch 0263) and remove it again at power down, 3 (0317; the default
++ *      from level 5 on) an apps-SMMU stage-1 context of ours (negroni_smmu_s1.c, 0249) for the IFE stream
++ *      0x800/0x460 (and, at level 6, the four ICP entries of live.dts:22629): frame and HFI buffers anywhere
++ *      in RAM, mapped at 32-bit IOVAs inside Android's windows (live.dts:22583-22672). Policy 1 is the
++ *      default below level 5. Why 3: XNU RAM starts at 0x840000000, so no buffer has a 32-bit physical
++ *      address, and Gunyah turns S2CR bypass into fault (README-wifi.md "2026-10-26 panic fix").
+  * Every step logs "NEGRONI CAM: step N NAME" and "... ok (T us)" or "... failed: reason". A failure
+  * powers down, in the vendor order, everything this file turned on; every wait is bounded.
+  * Runs in its own kernel thread: boot does not wait for it.
+@@ -97,6 +102,7 @@
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>
+ #include <libkern/crypto/sha2.h>
++#include "negroni_smmu_s1.h"
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -334,6 +340,25 @@ static const struct cam_stream_group cam_groups[] = {
+ static uint32_t smmu_policy = 1;
+ static bool dma_ok[NCAMGROUPS];            /* true: the stream group reaches RAM untranslated (bypass) */
+ static uint32_t smr_added[NCAMGROUPS];     /* SMR index + 1 that this file wrote, 0 = none */
++/*
++ * 0317: negronicam_smmu=3. One stage-1 context for the IFE and (level 6) ICP streams; the SMRs are the DT
++ * iommus entries (live.dts:22589 IFE: 8 SIDs = 0x800/0x460 exactly; 22629 ICP: 0x2000/0x2040/0x2100 with
++ * mask 0x420 and 0x2080/0x400 cover the 14 SIDs exactly, not the wider 0x2000/0x5e0 of the level-3 report).
++ * IOVA windows (live.dts): IFE io 0x100000 + 0xffe00000; ICP shared 0x800000 + 0xfc00000, fw_uncached
++ * 0x10400000 + 0x700000, io 0x10c00000 + 0xee300000 minus the discard 0xe0000000 + 0x800000. The frames go
++ * at 0x10c00000 up (inside both io windows), the HFI block at fw_uncached + shared as Android
++ * (cam_icp_hw_mgr.c cam_icp_allocate_hfi_mem: sec heap, qtbl, cmd, msg, dbg 1 MiB each + SFR 8 KiB).
++ */
++static const struct negroni_s1_stream cam_s1_streams[] = {
++	{ 0x800, 0x460 }, { 0x2000, 0x420 }, { 0x2040, 0x420 }, { 0x2100, 0x420 }, { 0x2080, 0x400 },
++};
++static struct negroni_s1 cam_s1 = { .name = "NEGRONI CAM", .streams = cam_s1_streams, .nstreams = 1 };
++static bool dma_s1;                     /* the context is on: device addresses are IOVAs */
++#define CAM_IOVA_IO         0x10c00000ull
++#define CAM_IOVA_IO_END     0xe0000000ull       /* the ICP discard window starts here */
++#define CAM_IOVA_SHARED     0x00800000ull
++#define CAM_IOVA_FWUNC      0x10400000ull
++static uint64_t cam_iova_next = CAM_IOVA_IO;
+ static vm_offset_t cpas, camnoc;
+ static bool cpas_on;
+ 
+@@ -574,6 +599,7 @@ static bool streaming;
+ struct cam_frame {
+ 	vm_offset_t kva;
+ 	uint64_t pa;
++	uint64_t dva;                   /* 0317: the IFE's address (IOVA with negronicam_smmu=3, else pa) */
+ 	vm_size_t alloc;
+ 	uint32_t width, height, stride, bytes, source, done;
+ };
+@@ -658,22 +684,32 @@ struct icp_seg { uint32_t type, offset, paddr, filesz, memsz, flags; };
+ #define QH_TX_IRQ       191u
+ #define QH_READ_IDX     207u
+ #define QH_WRITE_IDX    223u
+-#define HFI_OFF_QTBL    0x000000u
+-#define HFI_OFF_CMDQ    0x001000u       /* ICP_CMD_Q_SIZE_IN_BYTES 4096 */
+-#define HFI_OFF_MSGQ    0x002000u       /* ICP_MSG_Q_SIZE_IN_BYTES 4096 */
+-#define HFI_OFF_SFR     0x003000u       /* sfr_buf: u32 size + 4096 bytes */
+-#define HFI_OFF_DBGQ    0x005000u       /* ICP_DBG_Q_SIZE_IN_BYTES 102400 */
+-#define HFI_OFF_SECHEAP 0x100000u
++/*
++ * 0317: Android's layout (cam_icp_hw_mgr.c cam_icp_allocate_hfi_mem with a fw_uncached region, which our DT
++ * has: live.dts iova-mem-region-fwuncached-region 0x10400000 + 0x700000): the whole fw_uncached region is
++ * one block, sec heap, qtbl, cmd q, msg q, dbg q at 1 MiB steps, SFR 8 KiB; FWUNC_IOVA/SIZE = the region.
++ * The shared memory (SHMEM_PTR) is 1 MiB of ours at the start of the shared region (0x800000).
++ * Offsets inside our one 8 MiB block; with negronicam_smmu=3 [0, 7 MiB) is mapped at 0x10400000 and
++ * [7 MiB, 8 MiB) at 0x800000, else the device address is the physical one.
++ */
++#define HFI_OFF_SECHEAP 0x000000u
+ #define HFI_SECHEAP_LEN 0x100000u
+-#define HFI_OFF_SHMEM   0x200000u
++#define HFI_OFF_QTBL    0x100000u
++#define HFI_OFF_CMDQ    0x200000u       /* ICP_CMD_Q_SIZE_IN_BYTES 4096 used */
++#define HFI_OFF_MSGQ    0x300000u       /* ICP_MSG_Q_SIZE_IN_BYTES 4096 used */
++#define HFI_OFF_DBGQ    0x400000u       /* ICP_DBG_Q_SIZE_IN_BYTES 102400 used */
++#define HFI_OFF_SFR     0x500000u       /* sfr_buf: u32 size + 4096 bytes (8 KiB) */
++#define HFI_FWUNC_LEN   0x700000u       /* the fw_uncached region */
++#define HFI_OFF_SHMEM   0x700000u
+ #define HFI_SHMEM_LEN   0x100000u       /* ICP_SHARED_MEM_IN_BYTES */
+-#define HFI_OFF_FWUNC   0x300000u
+-#define HFI_FWUNC_LEN   0x200000u       /* ICP_UNCACHED_HEAP_SIZE_IN_BYTES */
+-#define HFI_BLOCK       0x500000u
++#define HFI_BLOCK       0x800000u
+ #define HFI_CMD_SYS_INIT      0x10001u  /* hfi_sys_defs.h:62-63 */
+ #define HFI_MSG_SYS_INIT_DONE 0x20001u  /* :116-117 */
+ static vm_offset_t icp_csr, hfi_kva, hfi_uc;
+ static uint64_t hfi_pa;
++static uint64_t hfi_fwunc_dva, hfi_shmem_dva;  /* 0317: the ICP's addresses of the two parts */
++/* the ICP's 32-bit address of HFI block offset off */
++#define HFI_DVA(off)    ((uint32_t)((off) < HFI_OFF_SHMEM ? hfi_fwunc_dva + (off) : hfi_shmem_dva + ((off) - HFI_OFF_SHMEM)))
+ static bool pas_started;
+ static uint32_t icp_branches_on;
+ 
+@@ -835,7 +871,7 @@ icp_scm(const char *what, uint64_t function, uint64_t args, uint64_t a0, uint64_
+ 	uint64_t session = 0;
+ 
+ 	say("  SCM %s: smc %#llx (%#llx, %#llx, %#llx)", what, function, a0, a1, a2);
+-	for (int i = 0; i < 100; i++) {
++	for (int i = 0; i < 2000000; i++) {     /* 0317 (as 0240, 2026-10-27): Linux resumes until done; 100 was too few */
+ 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
+ 		register uint64_t x1 __asm__("x1") = args;
+ 		register uint64_t x2 __asm__("x2") = a0;
+@@ -849,7 +885,7 @@ icp_scm(const char *what, uint64_t function, uint64_t args, uint64_t a0, uint64_
+ 		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+ 		session = x6;
+ 		if (x0 != SCM_INTERRUPTED) {
+-			say("  SCM %s -> %d, answer %#llx", what, (int32_t)x0, x1);
++			say("  SCM %s -> %d, answer %#llx (%d resumes)", what, (int32_t)x0, x1, i);
+ 			*answer = x1;
+ 			return (int32_t)x0;
+ 		}
+@@ -1208,21 +1244,15 @@ static void
+ cam_down(void)
+ {
+ 	say("power down");
++	bool hfi_keep = false;          /* 0317: the ICP may still write the HFI block */
+ 	if (pas_started) {
+ 		uint64_t answer = ~0ull;
+ 		int32_t r = icp_scm("PAS shutdown (camera)", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_CAMERA, 0, 0,
+ 		    &answer);
+ 		say("  ICP PAS shutdown: %d, answer %#llx", r, answer);
++		hfi_keep = r != 0 || answer != 0;
+ 		pas_started = false;
+ 	}
+-	if (hfi_uc) {
+-		ml_io_unmap(hfi_uc, HFI_BLOCK);
+-		hfi_uc = 0;
+-	}
+-	if (hfi_kva) {
+-		kmem_free(kernel_map, hfi_kva, HFI_BLOCK);
+-		hfi_kva = 0;
+-	}
+ 	if (icp_branches_on & 2u) {
+ 		(void)branch_set("cam_cc_icp_clk", camcc + 0x13120, false, true);
+ 	}
+@@ -1343,6 +1373,30 @@ cam_down(void)
+ 			smr_added[g] = 0;
+ 		}
+ 	}
++	if (dma_s1) {
++		/* 0317: the IFE write master and the ICP are stopped above: the streams back as found */
++		negroni_s1_off(&cam_s1);
++		dma_s1 = false;
++		for (unsigned i = 0; i < 2; i++) {
++			frames[i].dva = 0;      /* the frames stay for /dev/negronicam-*, the IOVAs do not */
++		}
++		cam_iova_next = CAM_IOVA_IO;
++	}
++	/* 0317: the HFI block only after the SMMU mappings at 0x10400000/0x800000 are gone (s1 off above), and never
++	 * while the ICP may still run (failed PAS shutdown: the block is leaked on purpose) */
++	if (hfi_kva && hfi_keep) {
++		say("  HFI block at phys %#llx KEPT (leaked on purpose): the ICP PAS shutdown failed", hfi_pa);
++		hfi_uc = 0;
++		hfi_kva = 0;
++	}
++	if (hfi_uc) {
++		ml_io_unmap(hfi_uc, HFI_BLOCK);
++		hfi_uc = 0;
++	}
++	if (hfi_kva) {
++		kmem_free(kernel_map, hfi_kva, HFI_BLOCK);
++		hfi_kva = 0;
++	}
+ 	if (cpas_on) {
+ 		/* cam_cpastop_qchannel_handshake(power_on = false): clear the request, wait QACCEPTN and QDENY = 0,
+ 		 * 50 x 200-250 us (cam_cpas_hw_intf.h:20-24) */
+@@ -1785,6 +1839,18 @@ l3_smmu(void)
+ 		return step_fail("a camera stream group would fault or translate (negronicam_smmu=2 adds a bypass entry, "
+ 		           "=0 tries anyway)");
+ 	}
++	if (smmu_policy == 3 && level >= 5) {
++		/* 0317: our own translation context; IFE only below level 6 (fewer entries taken) */
++		cam_s1.nstreams = level >= 6 ? 5u : 1u;
++		if (negroni_s1_on(&cam_s1) != 0) {
++			return step_fail("no apps-SMMU stage-1 context for the camera streams (negronicam_smmu=3)");
++		}
++		dma_s1 = true;
++		dma_ok[0] = true;
++		dma_ok[1] = level >= 6;
++		say("  camera DMA through SMMU context %u: IFE IOVAs from %#llx%s", cam_s1.cb, CAM_IOVA_IO,
++		    level >= 6 ? ", ICP fw_uncached 0x10400000 + shared 0x800000" : "");
++	}
+ 	return step_ok();
+ }
+ 
+@@ -2001,23 +2067,43 @@ frame_alloc(struct cam_frame *f, uint32_t width, uint32_t height, uint32_t sourc
+ 	if (f->kva == 0) {
+ 		/* two frames: the frame-based WM moves to addr + frame_incr for the next frame until the halt */
+ 		f->alloc = round_page((vm_size_t)f->bytes * 2u);
+-		if (kmem_alloc_contig(kernel_map, &f->kva, f->alloc, 0, (ppnum_t)(atop(0x100000000ull) - 1), 0,
+-		    KMA_KOBJECT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		/* 0317: anywhere in RAM (0315 asked for < 4 GiB: impossible, XNU RAM starts at 0x840000000) */
++		if (kmem_alloc_contig(kernel_map, &f->kva, f->alloc, 0, 0, 0, KMA_KOBJECT, VM_KERN_MEMORY_IOKIT) !=
++		    KERN_SUCCESS) {
+ 			f->kva = 0;
+-			say("  no %lu bytes of contiguous memory below 4 GiB", (unsigned long)f->alloc);
++			say("  no %lu bytes of contiguous memory", (unsigned long)f->alloc);
+ 			return false;
+ 		}
+ 	}
+ 	f->pa = kvtophys(f->kva);
+-	if (f->pa == 0 || f->pa + f->alloc > 0x100000000ull || kvtophys(f->kva + f->alloc - PAGE_SIZE) !=
+-	    f->pa + f->alloc - PAGE_SIZE) {
+-		say("  buffer at phys %#llx is not one piece below 4 GiB", f->pa);
++	if (f->pa == 0 || kvtophys(f->kva + f->alloc - PAGE_SIZE) != f->pa + f->alloc - PAGE_SIZE) {
++		say("  buffer at phys %#llx is not one piece", f->pa);
++		return false;
++	}
++	if (dma_s1) {
++		if (f->dva == 0) {
++			uint64_t iova = cam_iova_next;
++			if (iova + f->alloc > CAM_IOVA_IO_END ||
++			    negroni_s1_map_kva(&cam_s1, iova, f->kva, f->alloc) != 0) {
++				say("  no IOVA for the buffer (SMMU map failed)");
++				return false;
++			}
++			f->dva = iova;
++			/* at least 1 MiB of unmapped IOVA after each buffer: a stray write past it faults */
++			cam_iova_next = (iova + f->alloc + 0x100000ull + 0xfffffull) & ~0xfffffull;
++		}
++	} else if (f->pa + f->alloc > 0x100000000ull) {
++		say("  buffer at phys %#llx has no 32-bit address and the stream is not translated: use negronicam_smmu=3",
++		    f->pa);
+ 		return false;
++	} else {
++		f->dva = f->pa;
+ 	}
+ 	memset((void *)f->kva, FRAME_FILL, f->alloc);
+ 	flush_dcache64((addr64_t)f->pa, (unsigned)f->alloc, TRUE);      /* clean + invalidate: RAM holds the fill */
+-	say("  buffer %s: phys %#llx, %lu bytes (frame %u x %u RAW10, %u bytes per line, %u bytes)", source == 1 ? "TPG" :
+-	    "sensor", f->pa, (unsigned long)f->alloc, width, height, f->stride, f->bytes);
++	say("  buffer %s: phys %#llx, device address %#llx (%s), %lu bytes (frame %u x %u RAW10, %u bytes per line, %u bytes)",
++	    source == 1 ? "TPG" : "sensor", f->pa, f->dva, dma_s1 ? "SMMU IOVA" : "physical", (unsigned long)f->alloc, width,
++	    height, f->stride, f->bytes);
+ 	return true;
+ }
+ 
+@@ -2057,7 +2143,7 @@ capture(struct cam_frame *f, bool from_tpg, uint32_t timeout_ms)
+ 	wr(ife + WM_RDI0 + WM_PACKER_CFG, 0);           /* PACKER_FMT_VER3_PLAIN_128 (bus_ver3.c:54) */
+ 	wr(ife + WM_RDI0 + WM_IMAGE_CFG2, (f->stride + 15u) & ~15u);
+ 	wr(ife + WM_RDI0 + WM_FRAME_INCR, f->bytes);
+-	wr(ife + WM_RDI0 + WM_IMAGE_ADDR, (uint32_t)f->pa);     /* 32-bit IOVA: no "expanded_memory" in the DT */
++	wr(ife + WM_RDI0 + WM_IMAGE_ADDR, (uint32_t)f->dva);    /* 32-bit IOVA: no "expanded_memory" in the DT */
+ 	wr(ife + WM_RDI0 + WM_DROP_PERIOD, 0);
+ 	wr(ife + WM_RDI0 + WM_DROP_PATTERN, 1);
+ 	wr(ife + WM_RDI0 + WM_SUB_PERIOD, 0);
+@@ -2143,6 +2229,9 @@ capture(struct cam_frame *f, bool from_tpg, uint32_t timeout_ms)
+ 	    rd(ife + VFE_BUS_OVERFLOW), rd(ife + VFE_BUS_IMG_VIOLATION), rd(ife + WM_RDI0 + WM_ADDR_STATUS0),
+ 	    rd(ife + WM_RDI0 + WM_DEBUG_STATUS0), rd(ife + WM_RDI0 + WM_DEBUG_STATUS1));
+ 	camnoc_report("after the frame");
++	if (dma_s1) {
++		negroni_s1_report(&cam_s1, ok ? "after the frame" : "after NO FRAME");
++	}
+ 	delay(40000);                           /* let a frame in flight finish into the guard frame */
+ 	wr(ife + WM_RDI0 + WM_CFG, 0);
+ 	wm_on = false;
+@@ -2524,12 +2613,27 @@ static bool
+ l6_hfi(void)
+ {
+ 	step_begin("icp hfi init");
+-	if (kmem_alloc_contig(kernel_map, &hfi_kva, HFI_BLOCK, 0, (ppnum_t)(atop(0x100000000ull) - 1), 0, KMA_KOBJECT,
+-	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	/* 0317: anywhere in RAM (0316 asked for < 4 GiB: impossible here); the ICP sees IOVAs (smmu=3) */
++	if (kmem_alloc_contig(kernel_map, &hfi_kva, HFI_BLOCK, 0, 0, 0, KMA_KOBJECT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		hfi_kva = 0;
+-		return step_fail("no HFI memory below 4 GiB");
++		return step_fail("no HFI memory (8 MiB contiguous)");
+ 	}
+ 	hfi_pa = kvtophys(hfi_kva);
++	if (dma_s1) {
++		if (negroni_s1_map_kva(&cam_s1, CAM_IOVA_FWUNC, hfi_kva + HFI_OFF_SECHEAP, HFI_FWUNC_LEN) != 0 ||
++		    negroni_s1_map_kva(&cam_s1, CAM_IOVA_SHARED, hfi_kva + HFI_OFF_SHMEM, HFI_SHMEM_LEN) != 0) {
++			return step_fail("HFI map through the SMMU");
++		}
++		hfi_fwunc_dva = CAM_IOVA_FWUNC;
++		hfi_shmem_dva = CAM_IOVA_SHARED;
++	} else if (hfi_pa + HFI_BLOCK > 0x100000000ull) {
++		say("  HFI block at phys %#llx has no 32-bit address and the ICP stream is not translated: use "
++		    "negronicam_smmu=3", hfi_pa);
++		return step_fail("no 32-bit HFI address");
++	} else {
++		hfi_fwunc_dva = hfi_pa;
++		hfi_shmem_dva = hfi_pa + HFI_OFF_SHMEM;
++	}
+ 	bzero((void *)hfi_kva, HFI_BLOCK);
+ 	flush_dcache64((addr64_t)hfi_pa, HFI_BLOCK, TRUE);
+ 	/* from here only the non-cacheable view is used (no cached lines of the block are touched again) */
+@@ -2549,7 +2653,7 @@ l6_hfi(void)
+ 	static const uint32_t qsize[3] = { 4096u >> 2, 4096u >> 2, 102400u >> 2 };
+ 	for (uint32_t q = 0; q < 3; q++) {
+ 		QW(q, QH_STATUS) = 1;                   /* QHDR_ACTIVE */
+-		QW(q, QH_START) = (uint32_t)hfi_pa + qoff[q];
++		QW(q, QH_START) = HFI_DVA(qoff[q]);
+ 		QW(q, QH_QSIZE) = qsize[q];
+ 		QW(q, QH_PKTSIZE) = 0;
+ 		QW(q, QH_DROP) = 0;
+@@ -2566,26 +2670,37 @@ l6_hfi(void)
+ 	*(volatile uint32_t *)(hfi_uc + HFI_OFF_SFR) = 4096;    /* sfr_buf.size */
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	vm_offset_t gp = icp_csr;
+-	wr(gp + ICP_GP(HFI_QTBL_PTR), (uint32_t)hfi_pa + HFI_OFF_QTBL);
+-	wr(gp + ICP_GP(HFI_SFR_PTR), (uint32_t)hfi_pa + HFI_OFF_SFR);
+-	wr(gp + ICP_GP(HFI_SHMEM_PTR), (uint32_t)hfi_pa + HFI_OFF_SHMEM);
++	wr(gp + ICP_GP(HFI_QTBL_PTR), HFI_DVA(HFI_OFF_QTBL));
++	wr(gp + ICP_GP(HFI_SFR_PTR), HFI_DVA(HFI_OFF_SFR));
++	wr(gp + ICP_GP(HFI_SHMEM_PTR), HFI_DVA(HFI_OFF_SHMEM));
+ 	wr(gp + ICP_GP(HFI_SHMEM_SIZE), HFI_SHMEM_LEN);
+-	wr(gp + ICP_GP(HFI_SECHEAP_PTR), (uint32_t)hfi_pa + HFI_OFF_SECHEAP);
++	wr(gp + ICP_GP(HFI_SECHEAP_PTR), HFI_DVA(HFI_OFF_SECHEAP));
+ 	wr(gp + ICP_GP(HFI_SECHEAP_SIZE), HFI_SECHEAP_LEN);
+ 	wr(gp + ICP_GP(HFI_QDSS_IOVA), 0);
+ 	wr(gp + ICP_GP(HFI_QDSS_SIZE), 0);
+-	wr(gp + ICP_GP(HFI_IO_IOVA), 0x80000000u);      /* [I] DRAM below 4 GiB as the IO window (bypass) */
+-	wr(gp + ICP_GP(HFI_IO_SIZE), 0x7ff00000u);
+-	wr(gp + ICP_GP(HFI_IO2_IOVA), 0);
+-	wr(gp + ICP_GP(HFI_IO2_SIZE), 0);
+-	wr(gp + ICP_GP(HFI_FWUNC_IOVA), (uint32_t)hfi_pa + HFI_OFF_FWUNC);
++	if (dma_s1) {
++		/* Android's io regions around the discard window (cam_icp_mgr_hfi_resume io_mem / io_mem2) */
++		wr(gp + ICP_GP(HFI_IO_IOVA), 0x10c00000u);
++		wr(gp + ICP_GP(HFI_IO_SIZE), 0xe0000000u - 0x10c00000u);
++		wr(gp + ICP_GP(HFI_IO2_IOVA), 0xe0800000u);
++		wr(gp + ICP_GP(HFI_IO2_SIZE), 0x10c00000u + 0xee300000u - 0xe0800000u);
++	} else {
++		wr(gp + ICP_GP(HFI_IO_IOVA), 0x80000000u);      /* [I] DRAM below 4 GiB as the IO window (bypass) */
++		wr(gp + ICP_GP(HFI_IO_SIZE), 0x7ff00000u);
++		wr(gp + ICP_GP(HFI_IO2_IOVA), 0);
++		wr(gp + ICP_GP(HFI_IO2_SIZE), 0);
++	}
++	wr(gp + ICP_GP(HFI_FWUNC_IOVA), HFI_DVA(HFI_OFF_SECHEAP));
+ 	wr(gp + ICP_GP(HFI_FWUNC_SIZE), HFI_FWUNC_LEN);
+ 	wr(gp + ICP_GP(HFI_INIT_REQ), 1);               /* ICP_INIT_REQUEST_SET */
+ 	uint32_t got = 0;
+ 	/* HFI_POLL_TIMEOUT_US 1.5 s (hfi.c:37-38) */
+ 	bool ok = poll(gp + ICP_GP(HFI_INIT_RESP), 0xffffffffu, 1, 1500000, &got);
+-	say("  HFI block phys %#llx; INIT_RESPONSE %#x (1 = success, 2 = failed), FW_VERSION %#x, CIRQ ob status %#x, "
+-	    "pfault %#x", hfi_pa, got, rd(gp + ICP_GP(HFI_FW_VERSION)), rd(icp_csr + ICP_CIRQ_OFF + CIRQ_OB_STATUS),
++	if (dma_s1) {
++		negroni_s1_report(&cam_s1, ok ? "after the HFI init" : "after NO HFI init response");
++	}
++	say("  HFI block phys %#llx, ICP address qtbl %#x; INIT_RESPONSE %#x (1 = success, 2 = failed), FW_VERSION %#x, "
++	    "CIRQ ob status %#x, pfault %#x", hfi_pa, HFI_DVA(HFI_OFF_QTBL), got, rd(gp + ICP_GP(HFI_FW_VERSION)), rd(icp_csr + ICP_CIRQ_OFF + CIRQ_OB_STATUS),
+ 	    rd(icp_csr + ICP_CIRQ_OFF + CIRQ_PFAULT));
+ 	if (!ok) {
+ 		const char *sfr = (const char *)(hfi_uc + HFI_OFF_SFR + 4);
+@@ -2700,8 +2815,8 @@ cam_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 	if (ok && level >= 3) {
+ 		ok = l3_cpas() && l3_smmu();
+ 		if (ok) {
+-			say("level 3 OK: CPAS/CAMNOC up, IFE DMA %s, ICP DMA %s", dma_ok[0] ? "bypass" : "NOT bypass",
+-			    dma_ok[1] ? "bypass" : "NOT bypass");
++			say("level 3 OK: CPAS/CAMNOC up, IFE DMA %s, ICP DMA %s", dma_s1 ? "SMMU S1" : dma_ok[0] ? "bypass" :
++			    "NOT bypass", dma_s1 ? (dma_ok[1] ? "SMMU S1" : "not needed") : dma_ok[1] ? "bypass" : "NOT bypass");
+ 		}
+ 	}
+ 	if (ok && level >= 4) {
+@@ -2747,7 +2862,9 @@ negroni_cam_init(void)
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("negronicam_pause", &pause_ms, sizeof(pause_ms));
+-	(void)PE_parse_boot_argn("negronicam_smmu", &smmu_policy, sizeof(smmu_policy));
++	if (!PE_parse_boot_argn("negronicam_smmu", &smmu_policy, sizeof(smmu_policy))) {
++		smmu_policy = level >= 5 ? 3u : 1u;     /* 0317: DMA levels need our own context (no 32-bit RAM) */
++	}
+ 	(void)PE_parse_boot_argn("negronicam_src", &src_mask, sizeof(src_mask));
+ 	(void)PE_parse_boot_argn("negronicam_drate", &drate_idx, sizeof(drate_idx));
+ 	(void)PE_parse_boot_argn("negronicam_settle", &settle_cnt, sizeof(settle_cnt));

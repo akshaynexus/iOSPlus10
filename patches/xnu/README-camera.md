@@ -12,6 +12,8 @@ Marks: **[V]** seen in a source (file:line given), **[I]** inference. Nothing he
 | 0314 `negroni-cam-imx789-stream` | `negronicam=4` | IMX789 FTM table (116 writes, stream on), frame counter 0x0005, stream off on every path | `IMX789 frame counter 0x.. -> 0x.. -> 0x..: MOVES (sensor streams)` |
 | 0315 `negroni-cam-csid-ife-rdi` | `negronicam=5` | CSID0 + IFE0 RDI0 frame-based WM -> contiguous buffer < 4 GiB; TPG13 frame, then sensor frame; `/dev/negronicam-tpg`, `/dev/negronicam-sensor` | `FRAME DONE`, `TPG frame sanity: PASS`, `SENSOR frame sanity: PASS`, `level 5 OK` |
 | 0316 `negroni-cam-icp-pas-hfi` | `negronicam=6` | CAMERA_ICP from the ADSP area into camera_region, PAS 33, HFI init + SYS_INIT | `ICP READY: HFI init response SUCCESS`, `ICP message: ... HFI_MSG_SYS_INIT_DONE` |
+| 0317 `negroni-cam-smmu-s1` | `negronicam_smmu=3` (default from level 5) | frame + HFI buffers anywhere in RAM, mapped at 32-bit IOVAs through an apps-SMMU stage-1 context of ours (helper of 0249) | `SMMU context N ON`, `camera DMA through SMMU context N`, `device address 0x10c00000 (SMMU IOVA)` |
+| 0318 `negroni-cam-ios-stream` | `negronicam=7` | `/dev/negronicam`: frame stream for iOS (HakiOS `/dev/hakios-camera` ABI), session on first read | `level 7: /dev/negronicam for iOS`, `ios session: start`, `ios session: N frames in M ms` |
 
 Default (`negronicam` absent or 0): no camera register access, no thread. `negronicam_pause=N` waits N ms
 (max 2000) after each step, for a phone camera on the screen log.
@@ -227,4 +229,123 @@ Keep `negronipanic=30 negronipanicreason=2` as in the other test images.
 - C-PHY settle count and data-rate entry are inferences; a wrong value gives CRC/ECC errors, not damage.
 - ICP: TrustZone loads and starts the firmware; a failed auth leaves the ICP in reset; PAS shutdown runs at power down
   after any PAS step.
-- Memory: the frame buffers (0.75 MiB TPG, 30 MiB sensor, both below 4 GiB) stay allocated for the device nodes.
+- Memory: the frame buffers (0.75 MiB TPG, 30 MiB sensor) stay allocated for the device nodes. 0315 asked for them
+  below 4 GiB: impossible on this port (see 0317 below).
+
+## 0317, 0318 and 0249: DMA addressing and the stream for iOS (2026-10-27, build only)
+
+### The bug [V]
+
+0243 (audio ring), 0315 (frames) and 0316 (HFI 5 MiB) called `kmem_alloc_contig` with `max_pnum = atop(4 GiB) - 1`.
+All XNU RAM on this port is at 0x840000000 or higher (ADT `--dram 840000000:C0000000`), so these allocations always
+failed: no camera level that needs a frame buffer or the ICP queues could run, and audio step 14 always stopped.
+A 32-bit DMA master (IFE, ICP, the ADSP's 32-bit buffer addresses) can reach our RAM only through an SMMU
+translation. Gunyah turns an S2CR BYPASS entry into FAULT (README-wifi.md "2026-10-26 panic fix"), so the only
+path is a stage-1 context bank of our own, as Android does with iommu-dma (IOVAs from the DT windows).
+
+### The helper (0249, `bsd/dev/negroni_smmu_s1.c`)
+
+- Generic copy of the 0324/0325 Wi-Fi sequence: `struct negroni_s1 { name, streams[] (SMR id/mask), ... }`,
+  `negroni_s1_on`, `negroni_s1_map_kva(iova, kva, size)` (any physical layout, 4 KiB pages), `negroni_s1_report`,
+  `negroni_s1_fsr`, `negroni_s1_off`. 3-level 4 KiB tables, 39-bit IOVA, 36-bit PA, MAIR index 0 Normal NC (the CPU
+  cleans/invalidates), CBAR S1_TRANS_S2_BYPASS VMID 0, CBA2R VA64, TCR/TCR2/TTBR0 (ASID = bank), TLB sync, SCTLR on,
+  then S2CR (translate, bank), then the SMR valid bit. Every global write is read back; on a refusal everything is put
+  back before any DMA.
+- Every apps-SMMU access is one 32-bit `ldr`/`str` through `negroni_mmio.h` (0255). Global page 0-1 and the
+  context-bank pages are mapped separately (kernel_map, not io_submap).
+- No collision with Wi-Fi: the helper takes free SMRs and context banks from the TOP index down, 0324/0325 from the
+  bottom up; a context bank is free only by the U-Boot qcom-hyp-smmu.c rule (CBAR S2_TRANS, or S1_TRANS_S2_BYPASS
+  with VMID 0xff; the rule 0325 uses), SCTLR.M = 0 and no valid S2CR into it; a taken bank gets VMID 0, so the other
+  user's rule sees it as used; CBAR/CBA2R are restored at the end; each SMR is read again right before it is
+  written; an existing valid SMR that overlaps one of our stream sets stops the setup (a double match is a conflict
+  fault) unless it equals ours with a non-translate S2CR (then it is reused and restored).
+- Claim lock: `negroni_smmu_claim_lock` (`extern lck_mtx_t`, declared in `negroni_smmu_s1.h`, defined in
+  `negroni_smmu_s1.c`) is held from the free-entry scan to the last SMR/S2CR/CBAR write and over the teardown; the
+  CBAR is read again right before it is written. The Wi-Fi code (0324/0325) is OUTSIDE this lock until it takes it
+  too; until then only the top-down/bottom-up split, the CBAR rule and the re-reads keep the two apart.
+- SCTLR: 0324's value (M, TRE, AFE, CFRE, ASIDPNE). The Wi-Fi 0325 rewrite uses HUPCF and no CFRE (DT wlan fault
+  flags); here a context fault aborts the access [I].
+- `negroni_s1_map_kva` returns ETIMEDOUT when the TLB sync after the map does not finish.
+- TODO: one shared `negroni_smmu.c` should replace this helper and `negroni_wlan_smmu.c` (0324/0325). 0324 was not
+  edited here (the Wi-Fi agent owns it).
+
+### Audio (0249) [V source, I effect]
+
+Android maps the speaker buffers through the apps SMMU: `qcom,msm-audio-ion` (live.dts:24782-24791) has
+`iommus = <&apps_smmu 0x1801 0>`, `qcom,iommu-dma-addr-pool = <0x10000000 0x10000000>`, `qcom,smmu-sid-mask = 0xf`;
+`msm_audio_ion.c msm_audio_ion_get_phys` gives the ADSP the dma-buf IOVA of that context ORed with `sid << 32`.
+No carveout (`msm-audio-ion-cma` is not used with SMMU on). HakiOS `redwood_sound.c space_on` does the same on its
+phone. Source lines: `out/src/op-modules/vendor/qcom/opensource/audio-kernel/dsp/msm_audio_ion.c:37`
+(`MSM_AUDIO_SMMU_SID_OFFSET 32`), `:276-279` (the IOVA ORed with the SID bits), `:901-904` (SID from the iommus cell
+and `qcom,smmu-sid-mask`). 0249: ring from `kmem_alloc_contig` anywhere, a stage-1 context for SID 0x1801, the ring at IOVA 0x10000000,
+the ADSP address `0x1_1000_0000`. `negroniaudio_smmu=0` keeps the 0243 physical path. Proof line:
+`NEGRONI AUDIO: 14 ring 8192 bytes at phys 0x8........ -> ADSP address 0x110000000 (SMMU stage 1, SID 0x1801)`
+(after `NEGRONI AUDIO: SMMU context N ON ...`).
+
+### Camera DMA (0317)
+
+- `negronicam_smmu=3` is the default when `negronicam>=5` (absent boot-arg); `=1`/`=2`/`=0` keep the 0312 paths
+  (they fail at the buffer: `has no 32-bit address ... use negronicam_smmu=3`).
+- Streams (live.dts:22589, 22629): IFE one SMR 0x800/0x460 (exactly the 8 SIDs); level 6 adds the ICP SMRs
+  0x2000/0x420, 0x2040/0x420, 0x2100/0x420, 0x2080/0x400 (exactly the 14 SIDs; the wider 0x2000/0x5e0 of the
+  level-3 report would also catch the JPEG/CDM streams). One context bank for all.
+- IOVAs (Android windows, live.dts:22583-22672): frames from 0x10c00000 (inside the IFE io window 0x100000 +
+  0xffe00000 and the ICP io window), with at least 1 MiB of unmapped IOVA after each buffer. HFI: Android's layout with a fw_uncached region
+  (cam_icp_hw_mgr.c): one 8 MiB block, [0, 7 MiB) at 0x10400000 = sec heap, qtbl, cmd q, msg q, dbg q at 1 MiB steps
+  + SFR; [7, 8 MiB) at 0x800000 = shared memory; FWUNC_IOVA/SIZE 0x10400000/0x700000; IO 0x10c00000 + 0xcf400000,
+  IO2 0xe0800000 + 0x1e700000 (around the discard window 0xe0000000 + 8 MiB, cam_icp_mgr_hfi_resume).
+- Power down: the HFI block is unmapped/freed only after the SMMU teardown (`negroni_s1_off` removes the
+  0x10400000/0x800000 mappings first), and it is kept (leaked on purpose, `HFI block ... KEPT`) when the ICP PAS
+  shutdown fails, because the ICP may still write it.
+- Fault lines: `SMMU context N after the frame|after NO FRAME|after the HFI init: FSR ... stream ...`.
+- 0317 also: the ICP PAS SCM loop resumes up to 2000000 times and logs the count (as 0240, main session request).
+
+### Stream for iOS (0318, `negronicam=7`)
+
+- Nothing runs at boot; `/dev/negronicam` (root:mobile 0660: the reader is mediaserverd, which runs as mobile,
+  uid/gid 501) is published. The first `read()` after an `open()` starts a session
+  thread: level 1-5 bring-up (sensor path, or TPG with `negronicam_src=1`), a ring of 3 frame places (kernel memory,
+  15.3 MB each for 4000x3008 RAW10, mapped at IOVAs from 0x10c00000), the 0315 pipe with frame increment 0, then:
+  at each RDI0 SOF (CSID path irq bit 4 or 12) the next place's IOVA goes to `WM_IMAGE_ADDR` + RUP/AUP; BUF_DONE
+  (bit 14) marks the written place ready. Without SOF bits in 3 frames it programs at BUF_DONE instead.
+- ABI = HakiOS `hakios.camera.h` (`out/src/hackios-next/userland/src/hakios.camera.h`, MIT) with own names: a
+  120-byte header (magic `NCFRAME1`, width, height, stride, format 1 RAW10, bayer `negronicam_bayer` (default 0
+  RGGB [I]), black 64 [I], sequence, mach time, exposure lines, line ns 10636 [I], gain x256 linear (unity 256, max
+  4096), frame lines 3134, margin 48, sensor 1, focus none); `read()` = newest frame not read yet (1 s, the first
+  6 s), EAGAIN on time-out, EIO after a fault; `write()` commands: EXPOSURE (SMIA 0x0202/3, 0x0204/5 with Sony code
+  1024 - 1024/gain [I], 0x0340/1, group hold 0x0104), SENSOR (only 1), KEEP/FOCUS ignored.
+- The session ends after the last close, 1 s without a read, no frame for 1.5 s, or an SMMU context fault (then
+  EIO until reboot): stream off, `cam_down()`, ring freed. Log: `ios session: start`, `ios session: 30 frames in N ms,
+  L late address updates, R read`, `ios session: end (why) after N frames`.
+- capture() is split into `pipe_start()`; the register blocks are mapped once per boot (no VA leak per session).
+- Userland plan: `docs/camera-ios-2026-10-27.md`.
+
+### Boot-args for the camera test boot
+
+| Goal | Boot-args |
+|---|---|
+| frames into memory, IFE through our SMMU context (first test) | `negronicam=5 negronipanic=30 negronipanicreason=2` |
+| TPG only (no sensor power) | `negronicam=5 negronicam_src=1 ...` |
+| ICP (needs the ADSP area with CAMERA_ICP) | `negronicam=6 ...` |
+| stream for iOS (after level 5 passes) | `negronicam=7 ...` (TPG stream: add `negronicam_src=1`) |
+| audio ring through the SMMU | the audio args as before (`negroniadsp_step=15 ...`); `negroniaudio_smmu=0` = old path |
+
+Expected level-5 proof lines (new in 0317, then the 0315 lines):
+
+```
+NEGRONI CAM: SMMU S1 setup: sCR0 ... IDR0 ... IDR1 ...: N SMRs, N contexts, N pages of 0x1000
+NEGRONI CAM: SMMU stream 0x800 mask 0x460: SMR<n> (free, was 0 / S2CR ...) -> context <c>
+NEGRONI CAM: SMMU context <c> free: CBAR ... CBA2R ...
+NEGRONI CAM: SMMU SMR<n> = 0x84600800, S2CR<n> = <c>
+NEGRONI CAM: SMMU context <c> ON: SCTLR 0x1027 TTBR0 ...
+NEGRONI CAM:   camera DMA through SMMU context <c>: IFE IOVAs from 0x10c00000
+NEGRONI CAM: level 3 OK: CPAS/CAMNOC up, IFE DMA SMMU S1, ICP DMA not needed
+NEGRONI CAM: SMMU context <c>: IOVA 0x10c00000-0x10cbbfff -> phys 0x8........ (752 KiB)
+NEGRONI CAM:   buffer TPG: phys 0x8........, device address 0x10c00000 (SMMU IOVA), ...
+NEGRONI CAM:   FRAME DONE: ...
+NEGRONI CAM: SMMU context <c> after the frame: FSR 0 (no fault) ...
+NEGRONI CAM: TPG frame sanity: PASS ...
+```
+
+A refusal reads `SMMU ... reads X after writing Y (the hypervisor refused it?)` or `SMMU ... already matches it:
+somebody's entry, left alone`, then `SMMU S1 context not set up (errno N); nothing of ours stays written`.
