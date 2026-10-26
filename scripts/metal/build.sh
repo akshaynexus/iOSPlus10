@@ -2,7 +2,7 @@
 # Build the Metal path for iOS 16 arm64 and stage it in out/metal/stage (the layout root-add-metal.sh installs):
 #   stage/System/Library/Extensions/NegroniMetal.bundle/{NegroniMetal,Info.plist,libvulkan_freedreno.dylib}
 #   stage/System/Library/Extensions/NegroniMetal.bundle/clients   (the test tools; every process can read the bundle)
-#   stage/usr/local/bin/{vkprobe,metalprobe,m2vtest,carenderprobe,layerprobe,metallib-sweep.sh}
+#   stage/usr/local/bin/{vkprobe,metalprobe,mslprobe,m2vtest,carenderprobe,layerprobe,metallib-sweep.sh}
 #   stage/usr/local/share/negronimetal/{layerprobe.metallib,metallibs.txt}   (stage 4a / 3b inputs)
 #   stage/var/db/negronimetal/clients           (default: the probes only)
 #
@@ -35,7 +35,7 @@ sign() { codesign -f -s - "$@" 2>/dev/null || ldid -S "$@"; }
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/usr/local/bin" "$STAGE/usr/local/share/negronimetal" "$STAGE/var/db/negronimetal"
-for t in vkprobe metalprobe m2vtest carenderprobe layerprobe; do
+for t in vkprobe metalprobe mslprobe m2vtest carenderprobe layerprobe; do
   [ -f "$BUILD/$t" ] || continue
   cp "$BUILD/$t" "$STAGE/usr/local/bin/$t"
   "$STRIP" -x "$STAGE/usr/local/bin/$t"

@@ -129,19 +129,47 @@ The policy is in the shader-cache key, so the first frames after a change compil
 load addresses for crash symbolication: `atos -o out/gpu/turnip/libvulkan_freedreno.dylib -l TURNIP_BASE PC`,
 `atos -o NegroniMetal.dSYM -l BASE PC`.
 
-### MSL source compile (`NEGRONIMETAL_MSL_FRONTEND`, flame/0009)
-WebGPU in Safari (WebGPU.framework, the GPU process `com.apple.WebKit.GPU`) and other clients that compile Metal Shading
-Language text call `newLibraryWithSource:options:error:`. On this device the Metal front end behind that call faults
-(`metalprobe --compute` = SIGSEGV, 2026-10-26), so a process that compiled from source died and was relaunched: a
-WebGPU page flashed black/white while Safari's GPU process restarted. Default now: the device **refuses** source
-libraries cleanly (nil + error, one log line `native-metal: newLibraryWithSource: refused (...)` per process); the page
-shows no WebGPU content, Safari stays up. `NEGRONIMETAL_MSL_FRONTEND=1` in `/var/db/negronimetal/env` tries the Metal
-front end again (diagnosis only: expect the crash, send the `CRASH` lines of `logs/usblog.log`).
+### MSL source compile (`NEGRONIMETAL_MSL_FRONTEND`, flame/0009 + flame/0011)
+WebGPU in Safari (WebGPU.framework, the GPU process `com.apple.WebKit.GPU`), ANGLE's Metal back end (WebGL) and apps compile
+Metal Shading Language text with `newLibraryWithSource:options:error:`. Since flame/0011 the plugin compiles it **in the
+calling process** with Apple's own MSL front end (libGPUCompiler `MTLGPUCompilerBuildFromSourceToBuffer`, the call
+MTLCompilerService makes; `userland/metal/plugin/negroni_msl.h`). No MTLCompilerService XPC is used. The metallib goes to
+metal2vulkan like a file's. A compile error answers nil + an NSError with the compiler text.
+
+| `NEGRONIMETAL_MSL_FRONTEND` | Behaviour |
+| --- | --- |
+| unset, `1`, `inproc` | in-process front end (default) |
+| `xpc` | the base class's compile (MTLCompilerService XPC; faulted on 2026-10-26: diagnosis only) |
+| `0`, `off` | clean refusal (nil + error, one log line per process; flame/0009 behaviour) |
+
+Other knobs (all in `/var/db/negronimetal/env`):
+- `NEGRONIMETAL_MSL_OPTIONS="..."`: extra front-end options after the ones from `MTLCompileOptions`.
+- `NEGRONIMETAL_MSL_DRIVER=0|1`: `1` always puts the driver flags in front (`-x metal -finclude-default-header -internal-isystem
+  DIR/include/metal`), `0` never. Unset: bare options first; when the front end answers "not allowed with 'C'",
+  "'metal_stdlib' file not found" or "unknown type name 'using'", the call is made again with the driver flags, and the
+  process keeps them.
+- `NEGRONIMETAL_MSL_RESOURCE_DIR=DIR`: the front end's header directory (default: the first
+  `/System/Library/PrivateFrameworks/GPUCompiler.framework/Libraries/lib/clang/*` with `include/metal/metal_stdlib`).
+- `NEGRONIMETAL_GPUCOMPILER=PATH`: another libGPUCompiler (default the 20H392 one in the dyld cache).
+
+Crash guard: while a compile runs, `/var/db/negronimetal/strikes/msl-<process>` (sandboxed processes: their temporary
+directory) holds the boot session. A process that finds its own marker from this boot died in the front end: it refuses
+MSL source from then on and logs `an earlier <process> died in the MSL front end this boot`. Remove the file to re-arm.
+
+Log lines: `native-metal: newLibraryWithSource #N: C chars -> B bytes metallib (in process[, driver flags]) in T ms, library L ms`
+(first 8, then powers of two), `native-metal: newLibraryWithSource: MSL front end refused ... : <compiler text>`.
 
 ```sh
-scripts/net/ssh-phone.sh "echo NEGRONIMETAL_MSL_FRONTEND=1 >> /private/var/db/negronimetal/env"   # diagnosis only
-scripts/net/ssh-phone.sh "/usr/local/bin/metalprobe --compute --render"                               # the same path, no Safari
+scripts/net/ssh-phone.sh "/usr/local/bin/mslprobe"                       # front end only (built-in shader), no device
+scripts/net/ssh-phone.sh "/usr/local/bin/mslprobe -O '-std=metal3.0' /path/x.metal -o /tmp/x.metallib"
+scripts/net/ssh-phone.sh "/usr/local/bin/metalprobe --compute --render"  # MSL source -> device -> GPU
 ```
+
+Argument buffers (flame/0011): `newArgumentEncoderWithArguments:`, `-[MTLFunction newArgumentEncoderWithBufferIndex:]` and
+the encoder setters go to metal2vulkan's `ArgumentEncoder`; `useResource(s)`/`useHeap(s)` reach its residency.
+`argumentBuffersSupport` is metal2vulkan's own answer for the device. Indirect draws and dispatches are bridged;
+indirect command buffers are not: `newIndirectCommandBufferWithDescriptor:` answers nil (one log line), an
+`executeCommandsInBuffer:` is skipped (one log line).
 
 ### Idle load knobs and measurement (flame/0010, scripts/metal/idle-stats.sh)
 * `NEGRONIMETAL_SURFACE_FLUSH=0|1` (env file): the per-command-buffer CPU cache invalidate (`dc civac`) over every

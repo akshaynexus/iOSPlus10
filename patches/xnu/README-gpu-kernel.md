@@ -690,3 +690,120 @@ about 1500 us at 220 MHz / 400 us at 818 MHz, and the clock dump's PLL0 L field 
 See `README-thermal.md`. 0281 turns the fixed level-12 vote into a busy-based governor on the watch
 thread (idle 500 ms -> level 4, busy 200 ms -> one level up, max `negronigpu_level`, thermal cap from
 0280). `negronigpu_dcvs=0` restores the 0235 behaviour.
+## 16. GPU power: IFPC and slumber (0285, `negronigpu_ifpc` / `negronigpu_slumber`)
+
+Symptom (owner, 2026-10-26): with Metal on, the GPU runs hot and drains the battery.
+Cause [V code, after 0281]: the GMU starts once; OOB GPU_SET is set at step 18 and never cleared
+(`negroniadreno_keep=1`); 0281 only lowers the GX clock to level 4 (350 MHz) after 500 ms idle. So the GX
+rail and GDSC stay on for the whole boot: no IFPC, no slumber, no GX collapse.
+
+### What KGSL does (out/src/op-kernel/drivers/gpu/msm, the OnePlus gen7 driver) [V]
+- IFPC on gen7 is an HFI feature, not a register: `gen7_hfi_send_ifpc_feature_ctrl` sends
+  `FEATURE_CTRL {HFI_FEATURE_IFPC 9, enable 1, data 0x1680}` (adreno_gen7_hfi.c:563-570), in `gen7_hfi_start`
+  after the perf/bw tables and ACD/BCL, before CORE_FW_START (adreno_gen7_hfi.c:573-620). `gen7_gmu_power_config`
+  writes no `PWR_COL_INTER_FRAME_CTRL/_HYST` (adreno_gen7_gmu.c:224-232; the offsets 0x1f8c0/0x1f8c1 exist in
+  gen7_reg.h:1112-1113 but only the a6xx driver writes them). H2F ids: FEATURE_CTRL 11, PREPARE_SLUMBER 33
+  (adreno_hfi.h:416, 423); `hfi_feature_ctrl_cmd {hdr, feature, enable, data}`, `hfi_prep_slumber_cmd {hdr, bw,
+  freq}` (adreno_hfi.h:540-545, 646-650). HFI minor >= 5 acks with result in word 2 and `gmu_ret_type` in word 3
+  (adreno_gen7_hfi.c:383-414).
+- The CP needs the power-up register list for IFPC: `gen7_cp_init_cmds` sets ME_INIT mask BIT(8) and gives the
+  list address and BIT(31) (dynamic triplets) (adreno_gen7.c:101-147); `gen7_patch_pwrup_reglist` fills it with
+  the current values of `gen7_ifpc_pwrup_reglist` and `gen7_pwrup_reglist` plus the triplet
+  `{PIPE_NONE, RBBM_PERFCTR_CNTL, 1}` (adreno_gen7.c:23-88, 302-350); header `struct cpu_gpu_lock`
+  (kgsl_util.h:37-52).
+- OOB: `set = BIT(30 - 2 req)`, `ack = BIT(31 - req)`, `clear = BIT(31 - 2 req)`; oob_gpu 0, oob_perfcntr 1
+  (adreno_gen7_gmu.c:532-589, kgsl_gmu_core.h:55-61). `gen7_gpu_boot` sets oob_gpu, starts the GPU and CLEARS it
+  at its end (adreno_gen7_gmu.c:2589-2650): with IFPC the GMU then collapses GX by itself.
+- Per submission: no OOB. The ring brackets the work with `CP_SET_MARKER 0x101` / `0x100` (IFPC disable/enable,
+  adreno_gen7_ringbuffer.c:282-283, 408-409) and writes CP_RB_WPTR with `gen7_fenced_write`: write, read
+  `GMU_AHB_FENCE_STATUS` (0x23b13) bit 0 (write dropped), 10 us, write again, up to 200 times
+  (adreno_gen7_ringbuffer.c:177-181, adreno_gen7.c:150-196, kgsl_gmu_core.h:82-93).
+- Slumber: `gen7_power_off` = oob_gpu set, ..., oob_gpu clear (adreno_gen7_gmu.c:2795-2833), then
+  `gen7_gmu_power_off` = wait for the lowest idle level, RPMh votes done, `gen7_gmu_notify_slumber`
+  (PREPARE_SLUMBER, fence to ALLOW), `gen7_gmu_wait_for_idle` (`GPU_CX_BUSY_STATUS` 0x23b0c bit 30 = 0),
+  `gen7_rscc_sleep_sequence` (CM3_SYSRESET 1, RSCC_CONTROL_REQ bit 0, RSC_STATUS0 bit 16, REQ 0), GBIF halt, HFI
+  stop, clocks and CX off (adreno_gen7_gmu.c:2513-2560, 1424-1448, 779-800, 365-400).
+- Wake from slumber is a warm boot, not an OOB: `gen7_gmu_boot` = CX/clocks, `gen7_rscc_wakeup_sequence`
+  (RSCC_CONTROL_REQ bit 1, ACK bit 1, SEQ_BUSY 0), firmware load, register config, CM3 start, HFI start with the
+  tables again (adreno_gen7_gmu.c:1871-1925, 330-361; adreno_gen7_hfi.c:573-640); then `gen7_gpu_boot` = oob_gpu,
+  H2F START, `gen7_start` (all GX registers), `gen7_rb_start` (RB, SQE, ME_INIT, CP_SET_SECURE_MODE 0; the zap
+  shader is loaded only once) (adreno_gen7.c:718-805). The brief's "OOB GPU_SET + wait GX on" alone cannot wake
+  it: after the RSC sleep the CM3 is in reset and does not answer an OOB.
+- Idle levels: `GPU_GMU_CX_GMU_RPMH_POWER_STATE` (0x1f8ec) 0 active, 3 IFPC, 0xf slumber (kgsl_gmu_core.h:72-74);
+  `GMU_GFX_PWR_CLK_STATUS` (0x1f8d0) bit 0 GX GDSC off, bit 1 GX clock off (adreno_gen7_gmu.c:673-683).
+
+### What 0285 does (`0285-negroni-gpu-power-collapse.patch`, negroni_adreno.c only)
+1. `negronigpu_ifpc` (default 1). Step 17 sends FEATURE_CTRL IFPC (0x1680 = 5760 XO ticks = 300 us) after
+   BW_TABLE, before CORE_FW_START. Accepted = acked with word 2 = 0 and (when the ack has 4 words) word 3 = 0.
+   Step 20 then builds the power-up list in the scratch page at +0x400 (53 IFPC pairs + 17 pairs + 1 triplet,
+   588 bytes, values read back after step 20's writes) and sends ME_INIT with BIT(8), the list address and
+   BIT(31). Refused: ME_INIT as before (no list).
+2. After step 22 (`gpu_keep` -> `pm_start`): IFPC accepted -> mode `ifpc`: OOB GPU_SET is cleared (as
+   gen7_gpu_boot). From then on the CPU never reads a collapsed GX:
+   - CP_RB_WPTR: the KGSL fenced write (200 x 10 us). Still dropped: OOB GPU_SET set, write, clear; still lost:
+     submit returns 0 (RedwoodGPU stops, see risks).
+   - Ring room: from the newest fence the core wrote (`fence_pos[fence & 255]` = ring position after that
+     fence's write), not from CP_RB_RPTR.
+   - Table switch (`negronigpu_pt=1`), `negroni_gpu_report`, the WATCH line's GX words and the 5 s late clock
+     report: GX GDSC off = ring read to its end, no read; GX on = held with OOB PERFCNTR (set bit 28, ack bit 30,
+     clear bit 29) for the reads.
+   - DCVS busy = a fence not yet written (no RBBM_STATUS read); votes go to the GMU also while GX is collapsed.
+3. IFPC refused or `negronigpu_ifpc=0`, `negronigpu_slumber=1` (default) -> mode `slumber`: OOB GPU_SET stays
+   held while awake. The watch thread, 2000 ms after the last submission with every fence done, the ring read to
+   its end and RBBM idle: OOB GPU_SET clear, PREPARE_SLUMBER `{0, 0, 0}` (as gpu_stop), fence ALLOW, wait GMU
+   idle (bit 30) and GX GDSC off (100 ms each), GMU interrupts masked, RSC sleep. CX, the GMU clocks, the SMMU
+   and the zap shader stay. The next `negroni_gpu_submit` wakes it under the lock: RSC wake, steps 14-18 again
+   (firmware into the TCMs, GMU start without the RSC/PDC set-up and without new io maps, HFI, tables + vote,
+   OOB GPU_SET), the ring back to word 0, step 20 (registers, SQE after 1 ms, ME_INIT), CP_SET_SECURE_MODE 0.
+   The first wake logs every step; later wakes are quiet (printf is dropped on the waking thread). The clock
+   probe (10 ms per measure) and the clock dumps are skipped on a wake.
+4. IFPC accepted but GX GDSC never off in 10 s of idle: OOB GPU_SET set again and mode `slumber` (with
+   `negronigpu_slumber=1`).
+5. `negronigpu_ifpc=0 negronigpu_slumber=0`: mode `off` = the 0281 behaviour (GX powered, OOB held).
+   `negronigpu_dcvs=0` still gives the fixed vote; the watch then ticks only for the power samples.
+6. Watch thread: ticks of 100 ms while a fence is pending or for 500 ms after the last submission, 250 ms when
+   idle (a submission wakes it), 1000 ms with neither DCVS nor power management. With power management it reads
+   only CX-side words per tick (gpucc GX GDSCR, GMU GFX_PWR_CLK_STATUS); a line is printed on a CX-side change
+   or every 10 s, and only then GX is read (held). One mutex orders submissions, HFI votes, sleep and wake.
+
+### Log lines (first boot, expected)
+- Step 17 (before USB attaches, also in the persistent log): `NEGRONI ADRENO: 17 HFI send FEATURE_CTRL IFPC (id 11,
+  4 dwords, seq N)`, `17 HFI FEATURE_CTRL IFPC ack, error 0`, `NEGRONI GPU PM: 17 FEATURE_CTRL IFPC ACCEPTED (ack 4
+  words: ...)` or `REFUSED`.
+- Step 20: `NEGRONI GPU PM: 20 power-up list at scratch +0x400: 53 IFPC + 17 IFPC/preemption pairs, 1 triplet, 588
+  bytes` (only when accepted), then `20 THE 3D CORE TAKES COMMANDS` as before.
+- After step 22: `NEGRONI GPU PM: IFPC on: OOB GPU_SET released, ...; GX GDSC %#x, power state %#x` or `NEGRONI GPU PM:
+  IFPC refused by the GMU: slumber after 2000 ms idle, warm GMU restart on the next submission` or `NEGRONI GPU PM: off`.
+- WATCH line, a field after `dcvs L busy N%`, before the thermal and cpufreq (0284) fields:
+  `| pm ifpc GX collapsed N% gmu N% pwr 0x3 fenced N max Nus fail N |` or
+  `| pm slumber GX collapsed N% sleeps N wakes N last Nus max Nus |` (N% = share of the watch samples since
+  the last line with the GX GDSC off).
+- IFPC: `NEGRONI GPU PM: WPTR write dropped N times (GX collapsed), taken after N us` (first 8).
+- Slumber: `NEGRONI GPU PM: slumber N in N us: GMU idle, GX off (GDSC ...), RSC asleep (...)`, `NEGRONI GPU PM:
+  first wake: steps 14-21 again ...`, `NEGRONI GPU PM: wake N in N us (asleep N ms), GX GDSC ...` (first 8, then
+  every 100th).
+- Failure lines: `OOB PERFCNTR NOT ACKED`, `WPTR write still dropped after N us ...`, `PREPARE_SLUMBER not acked`,
+  `IFPC acked, but GX never collapsed in N ms of idle ...`, `WAKE FAILED after N us ...: the GPU stays off`.
+
+### Proof on the phone
+`GX collapsed` near 100 % with the UI still, falling while scrolling; `pwr 0x3` on an idle line; the WATCH
+`THERMAL gpu` temperature and the battery current lower than `out/ios16-pwr` under the same use; no `gave up on
+fence` lines and no `RedwoodGPU: ... no answer for 2 s`. Back: `negronigpu_ifpc=0 negronigpu_slumber=0`.
+
+### Risks
+- [I] Not booted. The GMU may refuse FEATURE_CTRL IFPC or accept it and never collapse (then: slumber).
+- [I] KGSL restores only the listed registers after IFPC; the rest of step 20 (RB/SQE base, RB_CNTL, APRIV, QoS,
+  SECVID, HANG_INT, CMDQ, NC_MODE of RBBM) are not in KGSL's lists either, so the GMU/CP must keep them. If not,
+  the first submission after a collapse hangs.
+- GPU does not wake (IFPC exit fails or a slumber wake fails): the fenced write gives up after 2 ms + one OOB try ->
+  submit returns 0 -> RedwoodGPU logs `the ring stays full` and sets gGPUStopped; a failed wake sets `pm_dead` (every
+  later submit returns 0). A wake that writes WPTR but the CP never runs: no fence moves, RedwoodGPU's 2 s rule
+  (`no answer for 2 s`, GPU_HUNG_MS) sets gGPUStopped. In both cases every fence then reads done, and 0254's
+  give-up (gGPUStopped, or no fence for NEGRONI_FB_GPU_STUCK_MS 2000 ms) puts the display on CPU copies. The
+  system watchdog is off in the config (`wdt=-1`), so nothing reboots; the UI goes on without GPU work.
+- A slumber wake takes the SQE start + ME_INIT + HFI round trips, under gGPULock: the frame that wakes the GPU is
+  late by that time (the log gives it).
+- `negroni_gpu_report` and the table switch now wait for the power lock (at most one wake).
+
+Build (2026-10-26): see docs/notes.md section 17 end.
+

@@ -6,7 +6,7 @@
 set -eu
 cd /Users/akshaycm/Documents/GitRepos/iOSPlus10
 K=out/src/op-kernel
-git -C "$K" sparse-checkout add 'drivers/power/supply/*' 'drivers/power/reset/*' 'drivers/thermal/qcom/*' 'drivers/thermal/thermal_core.c' 'drivers/cpufreq/qcom-cpufreq-hw.c' 'drivers/spmi/*' 'drivers/soc/qcom/pmic-pon-log.c' 'drivers/input/misc/qpnp-power-on.c' 'drivers/usb/dwc3/*msm*' 'drivers/usb/dwc3/core.c' 'drivers/gpu/msm/*gmu*' 'drivers/gpu/msm/*gen7*' 'drivers/gpu/msm/kgsl_pwrctrl.c' 'drivers/gpu/msm/adreno-gpulist.h' 'include/dt-bindings/*'
+git -C "$K" sparse-checkout add 'drivers/power/supply/*' 'drivers/power/reset/*' 'drivers/thermal/qcom/*' 'drivers/thermal/thermal_core.c' 'drivers/cpufreq/qcom-cpufreq-hw.c' 'drivers/spmi/*' 'drivers/soc/qcom/pmic-pon-log.c' 'drivers/input/misc/qpnp-power-on.c' 'drivers/usb/dwc3/*msm*' 'drivers/usb/dwc3/core.c' 'drivers/gpu/msm/*gmu*' 'drivers/gpu/msm/*gen7*' 'drivers/gpu/msm/kgsl_pwrctrl.c' 'drivers/gpu/msm/adreno-gpulist.h' 'drivers/gpu/msm/adreno_hfi.h' 'drivers/gpu/msm/adreno.h' 'drivers/gpu/msm/adreno_pm4types.h' 'drivers/gpu/msm/kgsl_util.h' 'include/dt-bindings/*'
 git -C "$K" checkout -q HEAD
 echo "op-kernel added:"; ls "$K/drivers/power/supply" "$K/drivers/thermal/qcom" "$K/drivers/spmi" 2>/dev/null | head -40; ls "$K/drivers/gpu/msm" 2>/dev/null | head -20
 M=out/src/op-modules

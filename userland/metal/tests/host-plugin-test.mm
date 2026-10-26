@@ -3,7 +3,10 @@
  * the plugin + frontend + the bridge built for aarch64-apple-darwin, MoltenVK in place of Turnip, the gate directory in
  * a scratch folder (NMTL_DIR) and the bundle's control files in another (NMTL_HOST_BUNDLE). One case per process, because
  * the plugin opens its device once (dispatch_once):
- *   host-plugin-test CASE      CASE = device | unlisted | off | bundleoff | blocked | nogpu | timeout | deadman | watchdog | lost
+ *   host-plugin-test CASE      CASE = device | msl | unlisted | off | bundleoff | blocked | nogpu | timeout | deadman | watchdog | lost
+ * msl (flame/0011): MSL source through Apple's front end in this process (GPUCompiler.framework on macOS), a kernel that reads and writes
+ * through an argument buffer (newArgumentEncoderWithBufferIndex:, useResource:), newArgumentEncoderWithArguments:, an indirect dispatch,
+ * and a compile error that answers nil + the compiler's text.
  * Prints "PASS CASE" or "FAIL CASE: why". It checks the gate (clients files, kill switches, fail closed), the fast refusals,
  * the open thread with its deadline, the dead-man counter, the self-test (GPU clear into an IOSurface-backed texture through
  * the frontend), the GPU watchdog, and the frontend's CoreAnimation fixes of flame/0002 (device SPI answers, DontCare clear,
@@ -141,6 +144,92 @@ static void commit_stuck(id<MTLDevice> d)
 	});
 }
 
+/* flame/0011: MSL source -> in-process front end -> metallib -> metal2vulkan; argument buffers; indirect dispatch. nil = all good. */
+static NSString *check_msl(id<MTLDevice> d)
+{
+	static NSString *const kSource = @"#include <metal_stdlib>\n"
+		"using namespace metal;\n"
+		"struct Args { device float *out [[id(0)]]; constant float *in [[id(1)]]; };\n"
+		"kernel void viaargs(constant Args &a [[buffer(0)]], uint i [[thread_position_in_grid]]) { a.out[i] = a.in[i] * 2.0f + 1.0f; }\n"
+		"kernel void plain(device float *o [[buffer(0)]], uint i [[thread_position_in_grid]]) { o[i] = float(i) * 3.0f; }\n";
+	NSError *err = nil;
+	MTLCompileOptions *opts = [MTLCompileOptions new];
+	opts.languageVersion = MTLLanguageVersion2_4;
+	id<MTLLibrary> lib = [d newLibraryWithSource:kSource options:opts error:&err];
+	if (!lib)
+		return [NSString stringWithFormat:@"newLibraryWithSource: nil: %@", err.localizedDescription];
+	printf("msl: library %s, functions %s\n", class_getName([(id)lib class]), [[lib.functionNames componentsJoinedByString:@","] UTF8String]);
+	id<MTLFunction> viaargs = [lib newFunctionWithName:@"viaargs"], plain = [lib newFunctionWithName:@"plain"];
+	if (!viaargs || !plain)
+		return @"newFunctionWithName: nil";
+	id<MTLComputePipelineState> p1 = [d newComputePipelineStateWithFunction:viaargs error:&err];
+	if (!p1)
+		return [NSString stringWithFormat:@"pipeline viaargs: %@", err.localizedDescription];
+	id<MTLComputePipelineState> p2 = [d newComputePipelineStateWithFunction:plain error:&err];
+	if (!p2)
+		return [NSString stringWithFormat:@"pipeline plain: %@", err.localizedDescription];
+	id<MTLArgumentEncoder> enc = [viaargs newArgumentEncoderWithBufferIndex:0];
+	if (!enc)
+		return @"newArgumentEncoderWithBufferIndex:0 nil";
+	printf("msl: argument encoder %s encodedLength %lu alignment %lu, argumentBuffersSupport %lu\n", class_getName([(id)enc class]),
+	       (unsigned long)enc.encodedLength, (unsigned long)enc.alignment, (unsigned long)d.argumentBuffersSupport);
+	const NSUInteger N = 64;
+	id<MTLBuffer> in = [d newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out = [d newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> out2 = [d newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> args = [d newBufferWithLength:MAX(enc.encodedLength, (NSUInteger)16) options:MTLResourceStorageModeShared];
+	const uint32_t groups[3] = {N / 32, 1, 1};
+	id<MTLBuffer> indirect = [d newBufferWithBytes:groups length:sizeof(groups) options:MTLResourceStorageModeShared];
+	for (NSUInteger i = 0; i < N; i++)
+		((float *)in.contents)[i] = (float)i;
+	[enc setArgumentBuffer:args offset:0];
+	[enc setBuffer:out offset:0 atIndex:0];
+	[enc setBuffer:in offset:0 atIndex:1];
+	id<MTLCommandQueue> q = [d newCommandQueue];
+	id<MTLCommandBuffer> cb = [q commandBuffer];
+	id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+	[ce setComputePipelineState:p1];
+	[ce setBuffer:args offset:0 atIndex:0];
+	[ce useResource:out usage:MTLResourceUsageWrite];
+	[ce useResource:in usage:MTLResourceUsageRead];
+	[ce dispatchThreadgroups:MTLSizeMake(N / 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+	[ce setComputePipelineState:p2];
+	[ce setBuffer:out2 offset:0 atIndex:0];
+	[ce dispatchThreadgroupsWithIndirectBuffer:indirect indirectBufferOffset:0 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+	[ce endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (cb.status != MTLCommandBufferStatusCompleted)
+		return [NSString stringWithFormat:@"command buffer status %ld: %@", (long)cb.status, cb.error];
+	unsigned bad = 0, bad2 = 0;
+	for (NSUInteger i = 0; i < N; i++) {
+		if (((float *)out.contents)[i] != (float)i * 2.0f + 1.0f)
+			bad++;
+		if (((float *)out2.contents)[i] != (float)i * 3.0f)
+			bad2++;
+	}
+	printf("msl: argument-buffer kernel %u/%lu wrong (out[5] = %g), indirect dispatch %u/%lu wrong (out2[5] = %g)\n", bad, (unsigned long)N,
+	       ((float *)out.contents)[5], bad2, (unsigned long)N, ((float *)out2.contents)[5]);
+	if (bad || bad2)
+		return @"wrong results";
+	MTLArgumentDescriptor *a0 = [MTLArgumentDescriptor argumentDescriptor], *a1 = [MTLArgumentDescriptor argumentDescriptor];
+	a0.dataType = MTLDataTypePointer;
+	a0.index = 0;
+	a1.dataType = MTLDataTypeTexture;
+	a1.index = 1;
+	id<MTLArgumentEncoder> enc2 = [d newArgumentEncoderWithArguments:@[ a0, a1 ]];
+	if (!enc2)
+		return @"newArgumentEncoderWithArguments: nil";
+	printf("msl: newArgumentEncoderWithArguments: encodedLength %lu\n", (unsigned long)enc2.encodedLength);
+	err = nil;
+	id<MTLLibrary> broken = [d newLibraryWithSource:@"#include <metal_stdlib>\nkernel void k(device float *o [[buffer(0)]]) { o[0] = nothing; }\n"
+						options:nil error:&err];
+	if (broken || !err || [err.localizedDescription rangeOfString:@"nothing"].location == NSNotFound)
+		return [NSString stringWithFormat:@"compile error case: library %@, error %@", broken, err];
+	printf("msl: compile error answered: %s\n", [[err.localizedDescription stringByReplacingOccurrencesOfString:@"\n" withString:@" | "] UTF8String]);
+	return nil;
+}
+
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
@@ -158,7 +247,7 @@ int main(int argc, char **argv)
 		id d = [[cls alloc] initWithAcceleratorPort:0];
 		double ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6;
 		printf("case %s: device %s in %.0f ms\n", c, d ? [[d name] UTF8String] : "nil", ms);
-		bool wants = !strcmp(c, "device") || !strcmp(c, "watchdog");
+		bool wants = !strcmp(c, "device") || !strcmp(c, "msl") || !strcmp(c, "watchdog");
 		if (wants) {
 			if (!d)
 				return fail(c, @"no device");
@@ -178,6 +267,9 @@ int main(int argc, char **argv)
 		}
 		if (!strcmp(c, "device"))
 			if (NSString *why = check_fixes(d))
+				return fail(c, why);
+		if (!strcmp(c, "msl"))
+			if (NSString *why = check_msl(d))
 				return fail(c, why);
 		if (!strcmp(c, "watchdog")) {
 			/* NEGRONIMETAL_WATCHDOG=1 NEGRONIMETAL_WATCHDOG_S=1 (the script sets them): a stuck command buffer trips it */

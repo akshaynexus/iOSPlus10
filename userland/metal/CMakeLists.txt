@@ -3,7 +3,7 @@
 #   cmake -S userland/metal -B out/metal/build -G Ninja -DCMAKE_TOOLCHAIN_FILE=userland/metal/cmake/ios-arm64.cmake \
 #         -DNMTL_BRIDGE_LIB=out/metal/bridge/ios/libnative_metal_bridge.a -DNMTL_FLAME_SRC=out/metal/src/flame/phone/metal2
 #   ninja -C out/metal/build
-# Targets: vkprobe, metalprobe, carenderprobe and layerprobe always; the plugin (NegroniMetal, a Mach-O bundle) and m2vtest when the bridge
+# Targets: vkprobe, metalprobe, mslprobe, carenderprobe and layerprobe always; the plugin (NegroniMetal, a Mach-O bundle) and m2vtest when the bridge
 # static library and the frontend sources exist.
 cmake_minimum_required(VERSION 3.24)
 project(NegroniMetal LANGUAGES C CXX OBJC OBJCXX)
@@ -39,6 +39,10 @@ target_compile_options(metalprobe PRIVATE ${common_warn} -O2 -fobjc-arc)
 target_link_libraries(metalprobe PRIVATE "-framework Foundation" "-framework Metal" "-framework IOSurface"
   "-framework IOKit" "-framework CoreFoundation")
 
+# ---- flame/0011: Apple's MSL front end in a process (plugin/negroni_msl.h), no device, no XPC: mslprobe FILE.metal
+add_executable(mslprobe probes/mslprobe.c)
+target_compile_options(mslprobe PRIVATE ${common_warn} -O2)
+
 # ---- stage 4a: CoreAnimation over the device in a test process: CARenderer vs renderInContext:, CAMetalLayer drawables.
 # Copied from Chlorophyll (MIT, probes/LICENSE.Chlorophyll); built without ARC, as Chlorophyll builds them.
 foreach(p carenderprobe layerprobe)
@@ -52,7 +56,7 @@ endforeach()
 if(NMTL_BRIDGE_LIB AND EXISTS "${NMTL_BRIDGE_LIB}" AND EXISTS "${NMTL_FLAME_SRC}/NativeBridgeMetalFrontend.mm")
   add_library(NegroniMetal MODULE plugin/NegroniMetal.mm "${NMTL_FLAME_SRC}/NativeBridgeMetalFrontend.mm")
   set_target_properties(NegroniMetal PROPERTIES PREFIX "" SUFFIX "" OUTPUT_NAME NegroniMetal)
-  target_include_directories(NegroniMetal PRIVATE "${NMTL_FLAME_SRC}")
+  target_include_directories(NegroniMetal PRIVATE "${NMTL_FLAME_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/plugin")   # plugin/negroni_msl.h (flame/0011)
   target_compile_definitions(NegroniMetal PRIVATE NMTL_CLASS=${NMTL_CLASS})
   target_compile_options(NegroniMetal PRIVATE -std=c++17 -fobjc-arc -O2 -g -Wall -Wno-deprecated-declarations
     -Wno-unused-function)

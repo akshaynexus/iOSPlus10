@@ -16,7 +16,7 @@ W=$MOUT/hosttest
 rm -rf "$W" && mkdir -p "$W/nmtl"
 SDKM=$(xcrun --sdk macosx --show-sdk-path)
 xcrun --sdk macosx clang++ -arch arm64 -mmacosx-version-min=14.0 -isysroot "$SDKM" -std=c++17 -fobjc-arc -O1 -g \
-  -Wall -Wno-deprecated-declarations -Wno-unused-function -DNMTL_HOST_TEST=1 -DNMTL_DIR="\"$W/nmtl\"" -I"$FRONT" \
+  -Wall -Wno-deprecated-declarations -Wno-unused-function -DNMTL_HOST_TEST=1 -DNMTL_DIR="\"$W/nmtl\"" -I"$FRONT" -I"$METAL/plugin" \
   "$METAL/plugin/NegroniMetal.mm" "$FRONT/NativeBridgeMetalFrontend.mm" "$METAL/tests/host-plugin-test.mm" "$BR" \
   -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation \
   -framework Security -framework QuartzCore -lc++ -o "$W/host-plugin-test"
@@ -43,6 +43,8 @@ echo "strikes after two timeouts: $(cat "$N/strikes/host-plugin-test" 2>/dev/nul
 run deadman
 # listed only in BUNDLE/clients.local (the file a sandboxed app reads), not in NMTL_DIR/clients
 rm -rf "$N/strikes"; rm -f "$N/clients"; echo "host-plugin-test" > "$B/clients.local"; run device
+# flame/0011: MSL source in this process (the host GPUCompiler), argument buffers, indirect dispatch
+rm -rf "$N/strikes"; run msl
 # GPU watchdog: a command buffer that never completes marks the GPU lost; the next process gets no device
 rm -rf "$N/strikes"
 NEGRONIMETAL_WATCHDOG=1 NEGRONIMETAL_WATCHDOG_S=1 NMTL_HOST_MARKER=$N/strikes/gpu-lost run watchdog

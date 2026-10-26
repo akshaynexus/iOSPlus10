@@ -1,0 +1,903 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (on top of flame/0001-0010), applied by scripts/metal/fetch-sources.sh:
+WebGPU / MSL-source support.
+1. newLibraryWithSource:options:error: compiles MSL in the calling process with Apple's own front end (userland/metal/plugin/negroni_msl.h:
+   libGPUCompiler MTLGPUCompilerBuildFromSourceToBuffer, the call MTLCompilerService makes), no MTLCompilerService XPC. The metallib goes
+   to nmb_library_new. Compile errors answer nil + NSError with the compiler text. NEGRONIMETAL_MSL_FRONTEND=inproc (default) | xpc | 0.
+   Crash guard: NMTL_DIR/strikes/msl-<process> (else the temporary directory) holds the boot session while a compile runs.
+2. Argument buffers over metal2vulkan's ArgumentEncoder: newArgumentEncoderWithArguments:, -[MTLFunction
+   newArgumentEncoderWithBufferIndex:(reflection:)], NBArgumentEncoder (buffers, textures, samplers, pipelines, constantData, nested);
+   useResource(s)/useHeap(s) reach the runtime's residency; texture/sampler gpuResourceID = the runtime's resource ID.
+3. Indirect work: dispatchThreadgroupsWithIndirectBuffer:, drawPrimitives:indirectBuffer:, drawIndexedPrimitives:...indirectBuffer:,
+   the blit copy options: forms. Indirect command buffers stay unbridged: newIndirectCommandBufferWithDescriptor: nil and
+   executeCommandsInBuffer: skipped, each logged once.
+Bridge: new nmb_argument_encoder_*, nmb_encoder_use_resource/heap, nmb_*_gpu_resource_id, nmb_compute_dispatch_indirect,
+nmb_render_draw_(indexed_)indirect, nmb_blit_*_options in NativeMetalObjects.{rs,h}.
+
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index 05f1c11..6b02073 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -25,6 +25,11 @@
+ #include <mach/mach.h>
+ #include "bridge/NativeMetalObjects.h"
+ #include "NativeBridgeMetalFrontend.h"
++#include <sys/sysctl.h>
++#include "negroni_msl.h"   // NegroniMetal (flame/0011): Apple's MSL front end in this process (userland/metal/plugin)
++#ifndef NMTL_DIR
++#define NMTL_DIR "/var/db/negronimetal"   /* NegroniMetal: the plugin's gate directory (the host test sets its own) */
++#endif
+ 
+ extern "C" void sys_dcache_flush(void *start, size_t length);
+ 
+@@ -325,7 +330,9 @@ - (MTLSharedTextureHandle *)newSharedTextureHandle {if(gMissing)gMissing("NBText
+ - (NSUInteger)parentRelativeLevel {return _parentLevel;}
+ - (NSUInteger)parentRelativeSlice {return _parentSlice;}
+ - (id<MTLResource>)rootResource {return _parent?[(NBTexture *)_parent rootResource]:(id<MTLResource>)self;}
+-- (MTLResourceID)gpuResourceID {MTLResourceID r;r._impl=(uint64_t)(uintptr_t)self;return r;}
++// NegroniMetal (flame/0011): the runtime's resource ID, the word an argument buffer holds for this texture (hand-written argument buffers
++// then reach it as encoded ones do); the object's address only when the runtime has none.
++- (MTLResourceID)gpuResourceID {MTLResourceID r;r._impl=nmb_texture_gpu_resource_id(_handle);if(!r._impl)r._impl=(uint64_t)(uintptr_t)self;return r;}
+ - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
+  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
+  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
+@@ -394,6 +401,8 @@ @implementation NBBuffer (Textures)
+ @interface NBLibrary : NBObject
+ @property(nonatomic) NmbLibrary *handle;
+ @end
++@class NBFunction;
++static id<MTLArgumentEncoder> nbFunctionArgumentEncoder(NBFunction *function,NSUInteger index);   // NegroniMetal (flame/0011)
+ @interface NBFunction : NBObject <MTLFunction>
+ @property(nonatomic) NmbFunction *handle;
+ @property(nonatomic,copy) NSString *name;
+@@ -409,8 +418,12 @@ - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
+ - (NSArray<MTLAttribute *> *)stageInputAttributes {return @[];}
+ - (MTLPatchType)patchType {return MTLPatchTypeNone;}
+ - (NSInteger)patchControlPointCount {return -1;}
+-- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex {(void)bufferIndex;return nil;}
+-- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex reflection:(MTLAutoreleasedArgument *)reflection {(void)bufferIndex;(void)reflection;return nil;}
++// NegroniMetal (flame/0011): the argument buffer the function takes at bufferIndex, laid out from its AIR by metal2vulkan.
++- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex {return nbFunctionArgumentEncoder(self,bufferIndex);}
++- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex reflection:(MTLAutoreleasedArgument *)reflection {
++ if(reflection)*reflection=nil;   // no MTLArgument reflection objects here
++ return nbFunctionArgumentEncoder(self,bufferIndex);
++}
+ - (BOOL)conformsToProtocol:(Protocol *)aProtocol {
+  if(protocol_isEqual(aProtocol, @protocol(MTLFunction)))return YES;
+  return [super conformsToProtocol:aProtocol];
+@@ -562,7 +575,7 @@ @interface NBSampler : NBObject
+ @implementation NBSampler
+ - (void)dealloc {nmb_sampler_release(_handle);}
+ - (NSUInteger)pixelFormat {return MTLPixelFormatInvalid;}   // SPI: a sampler built from a plain descriptor names no format
+-- (MTLResourceID)gpuResourceID {MTLResourceID r;r._impl=(uint64_t)(uintptr_t)self;return r;}   // NegroniMetal
++- (MTLResourceID)gpuResourceID {MTLResourceID r;r._impl=nmb_sampler_gpu_resource_id(_handle);if(!r._impl)r._impl=(uint64_t)(uintptr_t)self;return r;}   // NegroniMetal (flame/0011)
+ @end
+ @interface NBDepthStencil : NBObject
+ @property(nonatomic) NmbDepthStencil *handle;
+@@ -643,6 +656,11 @@ @interface NBCommandBuffer : NBObject {
+ - (void)refuse:(NSString *)what;
+ - (void)wroteTexture:(id)texture;
+ @end
++@interface NBHeap : NBObject   // NegroniMetal (flame/0011): declared before the encoders (useHeap:)
++@property(nonatomic) NmbHeap *handle;
++@property(nonatomic) MTLResourceOptions options;
++@property(nonatomic) MTLHeapType heapType;
++@end
+ @interface NBEncoder : NBObject
+ @property(nonatomic) NmbEncoder *handle;
+ @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
+@@ -714,20 +732,47 @@ - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
+ }
+ - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
+ - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
+-// NegroniMetal (flame/0006): useResource(s)/useHeap(s) only keep the objects (and so a no-copy buffer's memory, its deallocator,
+-// a texture's IOSurface, a heap's buffers) until the command buffer finishes, as setBuffer/setTexture do. The runtime gets
+-// nothing: residency stays its own (argument buffers name the resources), as before.
++// NegroniMetal (flame/0006): useResource(s)/useHeap(s) keep the objects (and so a no-copy buffer's memory, its deallocator,
++// a texture's IOSurface, a heap's buffers) until the command buffer finishes, as setBuffer/setTexture do.
++// NegroniMetal (flame/0011): they also reach the runtime (nmb_encoder_use_resource / nmb_encoder_use_heap): an argument buffer holds only
++// addresses and resource IDs, and metal2vulkan makes resident what the encoder names (residency.rs), as Metal does. A refusal is logged
++// once and does not fail the command buffer (the draw then reads what the runtime already holds).
+ - (void)own:(id)resource {if(resource)[_commandBuffer.resourceOwners addObject:resource];}
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {
++ if(!r)return;
++ [self own:r];
++ if([(id)r isKindOfClass:[NBHeap class]]){[self useHeap:(id<MTLHeap>)r stages:s];return;}
++ NmbBuffer *b=[(id)r isKindOfClass:[NBBuffer class]]?[(NBBuffer *)r handle]:nullptr;
++ NmbTexture *t=[(id)r isKindOfClass:[NBTexture class]]?[(NBTexture *)r handle]:nullptr;
++ if(!b && !t){static std::atomic<int> foreign;if(foreign++==0)NBLOG(@"native-metal: useResource: of a %@ is not made resident (logged once)",NSStringFromClass([(id)r class]));return;}
++ if(t && (u&MTLResourceUsageWrite))[_commandBuffer wroteTexture:r];
++ if(t && [(NBTexture *)r surface])[_commandBuffer.surfaces addObject:r];
++ if(!nmb_encoder_use_resource(_handle,b,t,u,s)){static std::atomic<int> refused;if(refused++==0)NBLOG(@"native-metal: useResource: refused (logged once): %@",lastError());}
++}
++- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {[self useResource:r usage:u stages:MTLRenderStageVertex|MTLRenderStageFragment];}
+ - (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n usage:(MTLResourceUsage)u {
+- (void)u;for(NSUInteger i=0;i<n;i++)[self own:r[i]];
++ for(NSUInteger i=0;i<n;i++)[self useResource:r[i] usage:u];
+ }
+ - (void)useResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {
+- (void)s;[self useResources:r count:n usage:u];
++ for(NSUInteger i=0;i<n;i++)[self useResource:r[i] usage:u stages:s];
++}
++- (void)useHeap:(id<MTLHeap>)heap stages:(MTLRenderStages)s {
++ if(!heap)return;
++ [self own:heap];
++ if(![(id)heap isKindOfClass:[NBHeap class]])return;
++ if(!nmb_encoder_use_heap(_handle,[(NBHeap *)heap handle],s)){static std::atomic<int> refused;if(refused++==0)NBLOG(@"native-metal: useHeap: refused (logged once): %@",lastError());}
++}
++- (void)useHeap:(id<MTLHeap>)heap {[self useHeap:heap stages:MTLRenderStageVertex|MTLRenderStageFragment];}
++- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n {for(NSUInteger i=0;i<n;i++)[self useHeap:h[i]];}
++- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n stages:(MTLRenderStages)s {for(NSUInteger i=0;i<n;i++)[self useHeap:h[i] stages:s];}
++// NegroniMetal (flame/0011): indirect command buffers are not bridged (metal2vulkan has them, indirect_command_buffer.rs; this frontend
++// makes none: newIndirectCommandBufferWithDescriptor: answers nil), so an execution has nothing to run: skipped, logged once.
++- (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)icb withRange:(NSRange)range {
++ (void)icb;(void)range;noteSkipped(@"executeCommandsInBuffer:withRange: (indirect command buffers are not bridged)",true);
++}
++- (void)executeCommandsInBuffer:(id<MTLIndirectCommandBuffer>)icb indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o {
++ (void)icb;(void)b;(void)o;noteSkipped(@"executeCommandsInBuffer:indirectBuffer: (indirect command buffers are not bridged)",true);
+ }
+-- (void)useHeap:(id<MTLHeap>)heap {[self own:heap];}
+-- (void)useHeap:(id<MTLHeap>)heap stages:(MTLRenderStages)s {(void)s;[self own:heap];}
+-- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n {for(NSUInteger i=0;i<n;i++)[self own:h[i]];}
+-- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])h count:(NSUInteger)n stages:(MTLRenderStages)s {(void)s;[self useHeaps:h count:n];}
+ - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+  [self check:nmb_encoder_set_buffer_offset(_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"];
+ }
+@@ -773,7 +818,16 @@ - (void)dispatch:(MTLSize)size group:(MTLSize)group threads:(bool)threads {
+ }
+ - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
+ - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)u;[self own:r];}
++// NegroniMetal (flame/0011): metal2vulkan reads the MTLDispatchThreadgroupsIndirectArguments once the work before it completed.
++- (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o threadsPerThreadgroup:(MTLSize)g {
++ gDispatches++;self.commandBuffer->encodedWork.dispatches++;
++ if(![(id)b isKindOfClass:[NBBuffer class]]){noteSkipped(@"dispatchThreadgroupsWithIndirectBuffer: foreign or nil buffer",true);return;}
++ [self own:b];
++ if(![self dispatchAllowed])return;
++ const uint64_t per[3]={g.width,g.height,g.depth};
++ if(!nmb_compute_dispatch_indirect(self.handle,[(NBBuffer *)b handle],o,per))
++  noteSkipped([@"dispatchThreadgroupsWithIndirectBuffer: " stringByAppendingString:lastError()],true);
++}
+ - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
+ @end
+ 
+@@ -889,7 +943,26 @@ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n index
+ - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o {
+  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
+ }
+-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)u;(void)s;[self own:r];}
++// NegroniMetal (flame/0011): indirect draws (MTLDrawPrimitivesIndirectArguments / MTLDrawIndexedPrimitivesIndirectArguments) through
++// metal2vulkan's GPU-side draws (render.rs draw_primitives_indirect).
++- (void)drawPrimitives:(MTLPrimitiveType)t indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o {
++ gDraws++;self.commandBuffer->encodedWork.draws++;
++ if(![(id)b isKindOfClass:[NBBuffer class]]){noteSkipped(@"drawPrimitives:indirectBuffer: foreign or nil buffer",true);return;}
++ [self own:b];
++ if(![self drawAllowed])return;
++ if(!nmb_render_draw_indirect(self.handle,t,[(NBBuffer *)b handle],o))noteSkipped([@"drawPrimitives:indirectBuffer: " stringByAppendingString:lastError()],true);
++}
++- (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)io
++               indirectBuffer:(id<MTLBuffer>)b indirectBufferOffset:(NSUInteger)o {
++ gDraws++;self.commandBuffer->encodedWork.draws++;
++ if(![(id)ib isKindOfClass:[NBBuffer class]] || ![(id)b isKindOfClass:[NBBuffer class]]){
++  noteSkipped(@"drawIndexedPrimitives:indirectBuffer: foreign or nil buffer",true);return;
++ }
++ [self own:ib];[self own:b];
++ if(![self drawAllowed])return;
++ if(!nmb_render_draw_indexed_indirect(self.handle,t,k,[(NBBuffer *)ib handle],io,[(NBBuffer *)b handle],o))
++  noteSkipped([@"drawIndexedPrimitives:indirectBuffer: " stringByAppendingString:lastError()],true);
++}
+ - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
+ - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
+ @end
+@@ -952,6 +1025,24 @@ - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLe
+  const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
+  [self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image) what:"copyFromTexture:toBuffer:"];
+ }
++// NegroniMetal (flame/0011): the options: forms (WebGPU names copyFromBuffer:...toTexture:...options:).
++- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
++            sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
++     destinationOrigin:(MTLOrigin)dO options:(MTLBlitOption)options {
++ if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
++ [self.commandBuffer wroteTexture:d];
++ const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
++ [self check:nmb_blit_buffer_to_texture_options(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b,options)
++        what:"copyFromBuffer:toTexture:options:"];
++}
++- (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
++               toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image
++                options:(MTLBlitOption)options {
++ if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
++ const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth};
++ [self check:nmb_blit_texture_to_buffer_options(self.handle,[(NBTexture *)s handle],slice,level,a,size,[(NBBuffer *)d handle],o,row,image,options)
++        what:"copyFromTexture:toBuffer:options:"];
++}
+ - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
+  if(![self textures:NB_OBJECTS(t) count:1])return;
+  [self.commandBuffer wroteTexture:t];
+@@ -1396,11 +1487,6 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+ // ---- heaps ----
+ // Metal heaps over the runtime's: an automatic heap places each resource, a placement heap takes an offset. Resources made from one keep it
+ // alive (their `heap`); a heap's resources share its storage mode, CPU cache mode and (here) hazard tracking mode.
+-@interface NBHeap : NBObject
+-@property(nonatomic) NmbHeap *handle;
+-@property(nonatomic) MTLResourceOptions options;
+-@property(nonatomic) MTLHeapType heapType;
+-@end
+ @implementation NBHeap
+ - (void)dealloc {nmb_heap_release(_handle);}
+ - (NSUInteger)size {return nmb_heap_size(_handle);}
+@@ -1503,6 +1589,93 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  return true;
+ }
+ 
++// NegroniMetal (flame/0011): MTLArgumentEncoder over metal2vulkan's ArgumentEncoder. Every setter writes the 8-byte word Metal 3 defines (a
++// buffer's GPU address + offset, a texture's or sampler's gpuResourceID) into the argument buffer set, at once, through its mapping.
++// A refused call is logged (first 8) and writes nothing. Residency is the encoders' useResource(s)/useHeap(s), as on Metal.
++@interface NBArgumentEncoder : NBObject <MTLArgumentEncoder>
++@property(nonatomic) NmbArgumentEncoder *handle;
++@end
++static std::atomic<uint64_t> gArgumentRefusals;
++static void argumentRefused(const char *what) {
++ if(gArgumentRefusals++<8)NBLOG(@"native-metal: argument encoder %s refused: %@",what,lastError());
++}
++static id<MTLArgumentEncoder> nbArgumentEncoder(NmbArgumentEncoder *handle) {
++ if(!handle)return nil;
++ NBArgumentEncoder *e=[NBArgumentEncoder new];e.handle=handle;return (id<MTLArgumentEncoder>)e;
++}
++static id<MTLArgumentEncoder> nbFunctionArgumentEncoder(NBFunction *function,NSUInteger index) {
++ NmbArgumentEncoder *handle=nmb_argument_encoder_new_for_function(function.handle,(uint32_t)index);
++ if(!handle){argumentRefused("newArgumentEncoderWithBufferIndex:");return nil;}
++ return nbArgumentEncoder(handle);
++}
++@implementation NBArgumentEncoder
++- (void)dealloc {nmb_argument_encoder_release(_handle);}
++- (id<MTLDevice>)device {return gDeviceObject;}
++- (NSUInteger)encodedLength {return (NSUInteger)nmb_argument_encoder_encoded_length(_handle);}
++- (NSUInteger)alignment {return (NSUInteger)nmb_argument_encoder_alignment(_handle);}
++- (void)setArgumentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o {[self setArgumentBuffer:b startOffset:o arrayElement:0];}
++- (void)setArgumentBuffer:(id<MTLBuffer>)b startOffset:(NSUInteger)o arrayElement:(NSUInteger)element {
++ if(b && ![(id)b isKindOfClass:[NBBuffer class]]){gArgumentRefusals++;NBLOG(@"native-metal: argument encoder: foreign argument buffer");return;}
++ if(!nmb_argument_encoder_set_argument_buffer(_handle,b?[(NBBuffer *)b handle]:nullptr,o,element))argumentRefused("setArgumentBuffer:");
++}
++- (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {
++ if(b && ![(id)b isKindOfClass:[NBBuffer class]]){gArgumentRefusals++;return;}
++ if(!nmb_argument_encoder_set_buffer(_handle,b?[(NBBuffer *)b handle]:nullptr,o,(uint32_t)i))argumentRefused("setBuffer:");
++}
++- (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++)[self setBuffer:b[k] offset:o[k] atIndex:r.location+k];
++}
++- (void)setTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
++ if(t && ![(id)t isKindOfClass:[NBTexture class]]){gArgumentRefusals++;return;}
++ if(!nmb_argument_encoder_set_texture(_handle,t?[(NBTexture *)t handle]:nullptr,(uint32_t)i))argumentRefused("setTexture:");
++}
++- (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++)[self setTexture:t[k] atIndex:r.location+k];
++}
++- (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {
++ if(s && ![(id)s isKindOfClass:[NBSampler class]]){gArgumentRefusals++;return;}
++ if(!nmb_argument_encoder_set_sampler(_handle,s?[(NBSampler *)s handle]:nullptr,(uint32_t)i))argumentRefused("setSamplerState:");
++}
++- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++)[self setSamplerState:s[k] atIndex:r.location+k];
++}
++- (void *)constantDataAtIndex:(NSUInteger)i {
++ void *p=nmb_argument_encoder_constant_data(_handle,(uint32_t)i);
++ if(!p)argumentRefused("constantDataAtIndex:");
++ return p;
++}
++- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)p atIndex:(NSUInteger)i {
++ if(p && ![(id)p isKindOfClass:[NBRenderPipeline class]]){gArgumentRefusals++;return;}
++ if(!nmb_argument_encoder_set_render_pipeline(_handle,p?[(NBRenderPipeline *)p handle]:nullptr,(uint32_t)i))argumentRefused("setRenderPipelineState:");
++}
++- (void)setRenderPipelineStates:(const id<MTLRenderPipelineState> __unsafe_unretained [])p withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++)[self setRenderPipelineState:p[k] atIndex:r.location+k];
++}
++- (void)setComputePipelineState:(id<MTLComputePipelineState>)p atIndex:(NSUInteger)i {
++ if(p && ![(id)p isKindOfClass:[NBComputePipeline class]]){gArgumentRefusals++;return;}
++ if(!nmb_argument_encoder_set_compute_pipeline(_handle,p?[(NBComputePipeline *)p handle]:nullptr,(uint32_t)i))argumentRefused("setComputePipelineState:");
++}
++- (void)setComputePipelineStates:(const id<MTLComputePipelineState> __unsafe_unretained [])p withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++)[self setComputePipelineState:p[k] atIndex:r.location+k];
++}
++- (id<MTLArgumentEncoder>)newArgumentEncoderForBufferAtIndex:(NSUInteger)i {
++ NmbArgumentEncoder *nested=nmb_argument_encoder_new_nested(_handle,(uint32_t)i);
++ if(!nested){argumentRefused("newArgumentEncoderForBufferAtIndex:");return nil;}
++ return nbArgumentEncoder(nested);
++}
++// Not bridged: indirect command buffers, ray tracing, function tables (logged once, nothing written).
++- (void)unbridged:(const char *)what {static std::atomic<int> n;if(n++==0)NBLOG(@"native-metal: argument encoder %s unsupported (logged once)",what);}
++- (void)setIndirectCommandBuffer:(id<MTLIndirectCommandBuffer>)b atIndex:(NSUInteger)i {(void)b;(void)i;[self unbridged:"setIndirectCommandBuffer:"];}
++- (void)setIndirectCommandBuffers:(const id<MTLIndirectCommandBuffer> __unsafe_unretained [])b withRange:(NSRange)r {(void)b;(void)r;[self unbridged:"setIndirectCommandBuffers:"];}
++- (void)setDepthStencilState:(id<MTLDepthStencilState>)d atIndex:(NSUInteger)i {(void)d;(void)i;[self unbridged:"setDepthStencilState:"];}
++- (void)setDepthStencilStates:(const id<MTLDepthStencilState> __unsafe_unretained [])d withRange:(NSRange)r {(void)d;(void)r;[self unbridged:"setDepthStencilStates:"];}
++- (void)setAccelerationStructure:(id<MTLAccelerationStructure>)a atIndex:(NSUInteger)i {(void)a;(void)i;[self unbridged:"setAccelerationStructure:"];}
++- (void)setVisibleFunctionTable:(id<MTLVisibleFunctionTable>)t atIndex:(NSUInteger)i {(void)t;(void)i;[self unbridged:"setVisibleFunctionTable:"];}
++- (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __unsafe_unretained [])t withRange:(NSRange)r {(void)t;(void)r;[self unbridged:"setVisibleFunctionTables:"];}
++- (void)setIntersectionFunctionTable:(id<MTLIntersectionFunctionTable>)t atIndex:(NSUInteger)i {(void)t;(void)i;[self unbridged:"setIntersectionFunctionTable:"];}
++- (void)setIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained [])t withRange:(NSRange)r {(void)t;(void)r;[self unbridged:"setIntersectionFunctionTables:"];}
++@end
++
+ @interface NBDeviceMethods : NSObject
+ @end
+ // Bytes of one texel of the uncompressed formats Core Animation and RenderBox use (4 for the rest).
+@@ -1759,82 +1932,215 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
+  return [(id<MTLDevice>)self newLibraryWithURL:url error:error];
+ }
+ - (id<MTLLibrary>)newDefaultLibrary {return [(id<MTLDevice>)self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:nil];}
+-// NegroniMetal (flame/0009): MSL source. WebGPU.framework (20H392, Safari's GPU process com.apple.WebKit.GPU) builds every shader from
+-// WGSL as MSL text ("#include <metal_stdlib>") and calls newLibraryWithSource:options:error: (out/metal/spi/WebGPU.strings.txt). This class
+-// had no such method, so the message reached -[_MTLDevice newLibraryWithSource:options:error:] (MTLLibraryBuilder::newLibraryWithSource ->
+-// MTLCompilerService). On this device that path does not answer: it faults (metalprobe --compute, 2026-10-26 03:33 and 03:35: SIGSEGV,
+-// far 0x10000001b / 0x7000000000000000, pc in the shared cache, caller chain 0x1811bf0c0 0x1811bef0c 0x1811bea78 unslid, then this
+-// method), and a process that compiles from source dies and is relaunched: Safari's GPU process restarted after each attempt (usblog
+-// "CRASH com.apple.WebKit[300]" + "exec com.apple.WebKit.GPU"), the page area flashing between the old and the empty contents.
+-// Default here: a clean refusal (nil + NSError, logged once per process) so the caller gets a failed shader module instead of a crash.
+-// NEGRONIMETAL_MSL_FRONTEND=1 (NMTL_DIR/env) runs the base class's compile by its IMP ([super ...] here would name NSObject: these
+-// methods are copied into the _MTLDevice subclass) and, when it answers, feeds its bitcode (-[_MTLLibrary bitcodeData]; a metallib when
+-// it starts with "MTLB", else bare AIR) to nmb_library_new like a file's: the path to finish once the fault is understood.
++// NegroniMetal (flame/0009, flame/0011): MSL source. WebGPU.framework (20H392, Safari's GPU process com.apple.WebKit.GPU) builds every
++// shader from WGSL as MSL text ("#include <metal_stdlib>") and calls newLibraryWithSource:options:error: (out/metal/spi/WebGPU.strings.txt),
++// as do ANGLE's Metal back end (WebGL) and apps. -[_MTLDevice newLibraryWithSource:...] goes to MTLCompilerService over XPC, which never ran
++// on this device (no "exec MTLCompilerService" in any usblog; the caller faulted, metalprobe 2026-10-26 03:33).
++// flame/0011: Apple's front end runs in this process instead (negroni_msl.h): libGPUCompiler's MTLGPUCompilerBuildFromSourceToBuffer, the
++// call MTLCompilerService's MTLCompilerObject::buildRequest makes (20H392 0x1bbdabd58), gives a metallib (AIR 2.5 per function on 31001.722
++// [I]); it goes through nmb_library_new like a file's. A compile error answers nil + an NSError with the compiler's text.
++// NEGRONIMETAL_MSL_FRONTEND (NMTL_DIR/env): unset/1/inproc = in this process (default); xpc = the base class's compile (MTLCompilerService);
++// 0/off = the clean refusal of flame/0009. Crash guard: a marker file (NMTL_DIR/strikes/msl-<process>, else the temporary directory) holds the
++// boot session during each compile; a process that finds its marker from this boot died in a compile and refuses from then on (rm to re-arm).
+ static std::atomic<uint64_t> gSourceLibraries,gSourceLibraryFailures;
++static Timed gTimeSourceCompile;
++static int mslFrontEndMode() {   // 0 refuse, 1 in process, 2 XPC (base class)
++ static int mode=-1;
++ if(mode<0){
++  const char *e=getenv("NEGRONIMETAL_MSL_FRONTEND");
++  mode=!e || !e[0] || !strcmp(e,"1") || !strcmp(e,"inproc")?1:!strcmp(e,"xpc")?2:0;
++ }
++ return mode;
++}
++static std::string bootSession() {
++ char uuid[64]={0};size_t n=sizeof(uuid)-1;
++ if(sysctlbyname("kern.bootsessionuuid",uuid,&n,nullptr,0)!=0)return "";
++ return std::string(uuid);
++}
++static NSString *mslMarkerPath() {
++ static NSString *path;
++ static dispatch_once_t once;
++ dispatch_once(&once,^{
++  NSString *name=[@"msl-" stringByAppendingString:@(getprogname())];
++  NSString *dir=@NMTL_DIR "/strikes";
++  if(access(dir.UTF8String,W_OK)!=0)dir=NSTemporaryDirectory();
++  path=dir?[dir stringByAppendingPathComponent:name]:nil;
++ });
++ return path;
++}
++// true: this process may compile. Checks the marker once per process.
++static bool mslGuardAllows(NSString **why) {
++ static int allowed=-1;
++ static std::mutex lock;
++ std::lock_guard<std::mutex> g(lock);
++ if(allowed<0){
++  allowed=1;
++  NSString *path=mslMarkerPath();
++  NSString *old=path?[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil]:nil;
++  const std::string boot=bootSession();
++  if(old.length && !boot.empty() && [old hasPrefix:@(boot.c_str())]){
++   allowed=0;
++   NBLOG(@"native-metal: newLibraryWithSource: an earlier %s died in the MSL front end this boot (%@): MSL source refused in this process (rm the file to re-arm)",getprogname(),path);
++  }
++ }
++ if(!allowed && why)*why=@"an earlier process of this name died in the MSL front end this boot";
++ return allowed==1;
++}
++// The marker exists while any compile of this process runs (compiles on several threads share it).
++static void mslMark(bool on) {
++ static std::mutex lock;
++ static int running;
++ std::lock_guard<std::mutex> g(lock);
++ NSString *path=mslMarkerPath();
++ if(!path)return;
++ if(on){
++  if(running++==0){const std::string boot=bootSession()+"\n";[[NSData dataWithBytes:boot.data() length:boot.size()] writeToFile:path atomically:NO];}
++ } else if(--running==0)unlink(path.UTF8String);
++}
++// MTLCompileOptions -> the front end's option text, as Metal's client writes it (20H392 Metal strings "-std=metal%u.%u ", "-std=ios-metal%u.%u ",
++// "-ffast-math ", "-fno-fast-math ", "-fpreserve-invariance "), plus NEGRONIMETAL_MSL_OPTIONS.
++static std::string mslOptions(MTLCompileOptions *o) {
++ std::string out;
++ if(!o || o.fastMathEnabled)out+="-ffast-math ";else out+="-fno-fast-math ";
++ if(o){
++  const NSUInteger v=(NSUInteger)o.languageVersion;
++  if(v){char b[48];const unsigned major=(unsigned)(v>>16),minor=(unsigned)(v&0xffff);
++   snprintf(b,sizeof(b),major>=3?"-std=metal%u.%u ":"-std=ios-metal%u.%u ",major,minor);out+=b;}
++  if(@available(iOS 14.0, macOS 11.0, *)){if(o.preserveInvariance)out+="-fpreserve-invariance ";}
++  NSDictionary *macros=o.preprocessorMacros;
++  for(NSString *key in macros){
++   NSObject *value=macros[key];
++   NSString *text=[value isKindOfClass:[NSNumber class]]?[(NSNumber *)value stringValue]:[NSString stringWithFormat:@"%@",value];
++   // the front end splits its option text at blanks: a macro whose name or value holds one is skipped (logged once)
++   NSCharacterSet *blank=[NSCharacterSet whitespaceAndNewlineCharacterSet];
++   if([key rangeOfCharacterFromSet:blank].location!=NSNotFound || [text rangeOfCharacterFromSet:blank].location!=NSNotFound){
++    static std::atomic<int> skipped;
++    if(skipped++==0)NBLOG(@"native-metal: newLibraryWithSource: preprocessor macro %@ skipped: its name or value holds a blank (logged once)",key);
++    continue;
++   }
++   out+="-D";out+=key.UTF8String;
++   if(text.length){out+="=";out+=text.UTF8String;}
++   out+=" ";
++  }
++ }
++ if(const char *extra=getenv("NEGRONIMETAL_MSL_OPTIONS")){out+=extra;out+=" ";}
++ return out;
++}
+ - (id<MTLLibrary>)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options error:(NSError **)error {
+  if(!source.length){if(error)*error=nbError(@"newLibraryWithSource: empty source");return nil;}
+- static int frontEnd=-1;
+- if(frontEnd<0){const char *e=getenv("NEGRONIMETAL_MSL_FRONTEND");frontEnd=e && e[0]=='1';}
+- if(!frontEnd){
++ const int mode=mslFrontEndMode();
++ if(mode==0){
+   const uint64_t n=++gSourceLibraryFailures;
+-  if(n==1)NBLOG(@"native-metal: newLibraryWithSource: refused (%lu chars; MSL source is not compiled on this device: the Metal front end faults here; NEGRONIMETAL_MSL_FRONTEND=1 tries it)",(unsigned long)source.length);
+-  journal(std::string("L source refused (no MSL front end)"));
+-  if(error)*error=nbError(@"newLibraryWithSource: MSL source is not compiled on this device (NegroniMetal)");
++  if(n==1)NBLOG(@"native-metal: newLibraryWithSource: refused (%lu chars; NEGRONIMETAL_MSL_FRONTEND=0)",(unsigned long)source.length);
++  journal(std::string("L source refused (NEGRONIMETAL_MSL_FRONTEND=0)"));
++  if(error)*error=nbError(@"newLibraryWithSource: MSL source is not compiled on this device (NEGRONIMETAL_MSL_FRONTEND=0)");
+   return nil;
+  }
+  const uint64_t began=nowUs();
+- id apple=nil;NSError *appleError=nil;
+- Class base=objc_getClass("_MTLDevice");
+- Method m=base?class_getInstanceMethod(base,@selector(newLibraryWithSource:options:error:)):nullptr;
+- if(!m){if(error)*error=nbError(@"newLibraryWithSource: no MSL front end (_MTLDevice lacks the method)");return nil;}
+- NBLOG(@"native-metal: newLibraryWithSource: trying the Metal front end (%lu chars; NEGRONIMETAL_MSL_FRONTEND=1)",(unsigned long)source.length);
+- @try{apple=((id(*)(id,SEL,NSString *,MTLCompileOptions *,NSError **))method_getImplementation(m))(self,@selector(newLibraryWithSource:options:error:),source,options,&appleError);}
+- @catch(NSException *ex){apple=nil;appleError=nbError([NSString stringWithFormat:@"MSL front end raised %@: %@",ex.name,ex.reason]);}
+- if(!apple){
+-  gSourceLibraryFailures++;
+-  NSString *why=appleError.localizedDescription?:@"nil without an error";
+-  NBLOG(@"native-metal: newLibraryWithSource: MSL front end refused %lu chars in %llu ms: %@",(unsigned long)source.length,(unsigned long long)((nowUs()-began)/1000),why);
+-  journal(std::string("L source refused: ")+why.UTF8String);
+-  if(error)*error=appleError?:nbError(@"MSL front end refused");
+-  return nil;
+- }
+  NSData *air=nil;
+- if([apple respondsToSelector:@selector(bitcodeData)])air=((NSData *(*)(id,SEL))objc_msgSend)(apple,@selector(bitcodeData));
+- if(!air.length && [apple respondsToSelector:@selector(libraryDataContents)]){
+-  id contents=((id(*)(id,SEL))objc_msgSend)(apple,@selector(libraryDataContents));   // dispatch_data_t of the compiled library
+-  if(contents){const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map((dispatch_data_t)contents,&bytes,&size);if(bytes && size)air=[NSData dataWithBytes:bytes length:size];(void)mapped;}
++ const char *how="";
++ if(mode==1){
++  NSString *why=nil;
++  if(!mslGuardAllows(&why)){
++   gSourceLibraryFailures++;
++   if(error)*error=nbError([@"newLibraryWithSource: " stringByAppendingString:why]);
++   return nil;
++  }
++  const std::string opts=mslOptions(options);
++  void *lib=nullptr;size_t size=0;char *log=nullptr;int driver=0;
++  mslMark(true);
++  const int ok=nmsl_compile_msl(source.UTF8String,opts.c_str(),&lib,&size,&log,&driver);
++  mslMark(false);
++  gTimeSourceCompile.add(began);
++  NSString *text=log?[NSString stringWithUTF8String:log]:nil;
++  free(log);
++  if(!ok){
++   const uint64_t n=++gSourceLibraryFailures;
++   if(n<=8 || (n&(n-1))==0)
++    NBLOG(@"native-metal: newLibraryWithSource: MSL front end refused %lu chars in %llu ms (options \"%s\"%s): %@",(unsigned long)source.length,
++          (unsigned long long)((nowUs()-began)/1000),opts.c_str(),driver?", driver flags":"",text?:@"no log");
++   journal(std::string("L source failed: ")+std::string(text?text.UTF8String:"no log").substr(0,200));
++   if(error)*error=nbError([NSString stringWithFormat:@"Compilation failed: \n\n%@",text?:@"(no compiler log)"]);
++   return nil;
++  }
++  air=[NSData dataWithBytesNoCopy:lib length:size freeWhenDone:YES];
++  how=driver?"in process, driver flags":"in process";
++ } else {
++  id apple=nil;NSError *appleError=nil;
++  Class base=objc_getClass("_MTLDevice");
++  Method m=base?class_getInstanceMethod(base,@selector(newLibraryWithSource:options:error:)):nullptr;
++  if(!m){if(error)*error=nbError(@"newLibraryWithSource: no MSL front end (_MTLDevice lacks the method)");return nil;}
++  NBLOG(@"native-metal: newLibraryWithSource: trying MTLCompilerService (%lu chars; NEGRONIMETAL_MSL_FRONTEND=xpc)",(unsigned long)source.length);
++  @try{apple=((id(*)(id,SEL,NSString *,MTLCompileOptions *,NSError **))method_getImplementation(m))(self,@selector(newLibraryWithSource:options:error:),source,options,&appleError);}
++  @catch(NSException *ex){apple=nil;appleError=nbError([NSString stringWithFormat:@"MSL front end raised %@: %@",ex.name,ex.reason]);}
++  if(!apple){
++   gSourceLibraryFailures++;
++   NSString *why=appleError.localizedDescription?:@"nil without an error";
++   NBLOG(@"native-metal: newLibraryWithSource: MTLCompilerService refused %lu chars in %llu ms: %@",(unsigned long)source.length,(unsigned long long)((nowUs()-began)/1000),why);
++   if(error)*error=appleError?:nbError(@"MSL front end refused");
++   return nil;
++  }
++  if([apple respondsToSelector:@selector(bitcodeData)])air=((NSData *(*)(id,SEL))objc_msgSend)(apple,@selector(bitcodeData));
++  how="MTLCompilerService";
+  }
+  if(!air.length){
+   gSourceLibraryFailures++;
+-  NBLOG(@"native-metal: newLibraryWithSource: the MSL front end's library (%@) has no bitcode",NSStringFromClass([apple class]));
++  NBLOG(@"native-metal: newLibraryWithSource: no bitcode from the MSL front end (%s)",how);
+   if(error)*error=nbError(@"newLibraryWithSource: no bitcode from the MSL front end");
+   return nil;
+  }
+  const unsigned char *head=(const unsigned char *)air.bytes;
+  const bool metallib=air.length>=4 && memcmp(head,"MTLB",4)==0;
+- NmbLibrary *handle=nmb_library_new(gDevice,air.bytes,air.length,!metallib);gTimeLibrary.add(began);
++ const uint64_t translated=nowUs();
++ NmbLibrary *handle=nmb_library_new(gDevice,air.bytes,air.length,!metallib);gTimeLibrary.add(translated);
+  if(!handle){
+   gSourceLibraryFailures++;
+-  NBLOG(@"native-metal: newLibraryWithSource: %lu bytes (%02x%02x%02x%02x, %s) refused by the runtime: %@",(unsigned long)air.length,head[0],head[1],head[2],head[3],metallib?"metallib":"bare AIR",lastError());
++  NBLOG(@"native-metal: newLibraryWithSource: %lu bytes (%02x%02x%02x%02x, %s, %s) refused by the runtime: %@",(unsigned long)air.length,head[0],head[1],head[2],
++        head[3],metallib?"metallib":"bare AIR",how,lastError());
+   return failWith<id<MTLLibrary>>(error,@"library (MSL source)",nil);
+  }
+  const uint64_t n=++gSourceLibraries;
+  if(n<=8 || (n&(n-1))==0)
+-  NBLOG(@"native-metal: newLibraryWithSource #%llu: %lu chars -> %lu bytes %s in %llu ms (%s)",(unsigned long long)n,(unsigned long)source.length,(unsigned long)air.length,metallib?"metallib":"bare AIR",(unsigned long long)((nowUs()-began)/1000),getprogname());
++  NBLOG(@"native-metal: newLibraryWithSource #%llu: %lu chars -> %lu bytes %s (%s) in %llu ms, library %llu ms (%s)",(unsigned long long)n,
++        (unsigned long)source.length,(unsigned long)air.length,metallib?"metallib":"bare AIR",how,(unsigned long long)((translated-began)/1000),
++        (unsigned long long)((nowUs()-translated)/1000),getprogname());
++ journal(std::string("L source ")+std::to_string(source.length)+" chars -> "+std::to_string(air.length)+" bytes ("+how+")");
+  NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ }
+ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options completionHandler:(MTLNewLibraryCompletionHandler)handler {
+  NSError *error=nil;id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithSource:source options:options error:&error];
+  if(handler)handler(library,error);
+ }
+-// NegroniMetal (flame/0009): WebGPU builds its bind groups with newArgumentEncoderWithArguments: (MTLArgumentDescriptor array). Neither this
+-// frontend nor the bridge exposes argument buffers (NBFunction newArgumentEncoderWithBufferIndex: is nil too), and -[_MTLDevice
+-// newArgumentEncoderWithArguments:] only raises. nil, logged once: WebGPU then makes the bind group layout invalid instead of crashing.
++// NegroniMetal (flame/0011): argument buffers through metal2vulkan's MTLArgumentEncoder (argument_encoder.rs); WebGPU builds its bind groups
++// with newArgumentEncoderWithArguments: (MTLArgumentDescriptor array). argumentBuffersSupport is the runtime's own answer (Tier1 with buffer
++// device addresses, Tier2 with descriptor indexing too: metal2vulkan device/metal.rs).
+ - (id<MTLArgumentEncoder>)newArgumentEncoderWithArguments:(NSArray<MTLArgumentDescriptor *> *)arguments {
++ std::vector<NmbArgumentDescriptor> list;
++ for(MTLArgumentDescriptor *a in arguments)
++  list.push_back(NmbArgumentDescriptor{(uint64_t)a.dataType,(uint64_t)a.index,(uint64_t)a.arrayLength,(uint64_t)a.access,(uint64_t)a.textureType,
++                                       (uint64_t)a.constantBlockAlignment});
++ NmbArgumentEncoder *handle=nmb_argument_encoder_new(gDevice,list.data(),list.size());
++ if(!handle){
++  static std::atomic<uint64_t> refused;
++  if(refused++<4)NBLOG(@"native-metal: newArgumentEncoderWithArguments: (%lu arguments) refused: %@",(unsigned long)arguments.count,lastError());
++  return nil;
++ }
++ return nbArgumentEncoder(handle);
++}
++- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferBinding:(id<MTLBufferBinding>)binding {
+  static std::atomic<uint64_t> asked;
+- if(++asked==1)NBLOG(@"native-metal: newArgumentEncoderWithArguments: (%lu arguments) unsupported: nil (argument buffers are not bridged)",(unsigned long)arguments.count);
+- if(gMissing && asked==1)gMissing("NativeBridgeMetalDevice","newArgumentEncoderWithArguments: (argument buffers, answered nil)");
+- return nil;
++ if(asked++==0)NBLOG(@"native-metal: newArgumentEncoderWithBufferBinding: unsupported (no reflection objects here): nil (logged once)");
++ (void)binding;return nil;
++}
++// NegroniMetal (flame/0011): indirect command buffers are not bridged: nil, logged once (WebGPU then has no render bundles).
++- (id<MTLIndirectCommandBuffer>)newIndirectCommandBufferWithDescriptor:(MTLIndirectCommandBufferDescriptor *)descriptor maxCommandCount:(NSUInteger)count
++                                                               options:(MTLResourceOptions)options {
++ static std::atomic<uint64_t> asked;
++ if(asked++==0){
++  NBLOG(@"native-metal: newIndirectCommandBufferWithDescriptor: (%lu commands) unsupported: nil (logged once)",(unsigned long)count);
++  if(gMissing)gMissing("NativeBridgeMetalDevice","newIndirectCommandBufferWithDescriptor:maxCommandCount:options: (answered nil)");
++ }
++ (void)descriptor;(void)options;return nil;
+ }
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error {
+  return [(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:MTLPipelineOptionNone reflection:nil error:error];
+diff --git a/phone/metal2/bridge/NativeMetalObjects.h b/phone/metal2/bridge/NativeMetalObjects.h
+index fc7865f..469b977 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.h
++++ b/phone/metal2/bridge/NativeMetalObjects.h
+@@ -255,6 +255,39 @@ bool nmb_blit_texture_to_buffer(NmbEncoder *, NmbTexture *source, uint64_t slice
+                                 const uint64_t size[3], NmbBuffer *destination, uint64_t offset, uint64_t bytes_per_row,
+                                 uint64_t bytes_per_image);
+ bool nmb_blit_generate_mipmaps(NmbEncoder *, NmbTexture *);
++/* NegroniMetal (flame/0011): argument buffers (metal2vulkan's MTLArgumentEncoder), residency, indirect work, blit options. */
++typedef struct NmbArgumentEncoder NmbArgumentEncoder;
++typedef struct NmbArgumentDescriptor {
++    uint64_t data_type, index, array_length, access, texture_type, constant_block_alignment;   /* MTLArgumentDescriptor, raw values */
++} NmbArgumentDescriptor;
++NmbArgumentEncoder *nmb_argument_encoder_new(NmbDevice *, const NmbArgumentDescriptor *arguments, size_t count);
++NmbArgumentEncoder *nmb_argument_encoder_new_for_function(NmbFunction *, uint32_t buffer_index);
++NmbArgumentEncoder *nmb_argument_encoder_new_nested(NmbArgumentEncoder *, uint32_t index);
++void nmb_argument_encoder_release(NmbArgumentEncoder *);
++uint64_t nmb_argument_encoder_encoded_length(const NmbArgumentEncoder *);
++uint64_t nmb_argument_encoder_alignment(const NmbArgumentEncoder *);
++bool nmb_argument_encoder_set_argument_buffer(NmbArgumentEncoder *, NmbBuffer *, uint64_t start_offset, uint64_t element);
++bool nmb_argument_encoder_set_buffer(NmbArgumentEncoder *, NmbBuffer *, uint64_t offset, uint32_t index);
++bool nmb_argument_encoder_set_texture(NmbArgumentEncoder *, NmbTexture *, uint32_t index);
++bool nmb_argument_encoder_set_sampler(NmbArgumentEncoder *, NmbSampler *, uint32_t index);
++bool nmb_argument_encoder_set_compute_pipeline(NmbArgumentEncoder *, NmbComputePipeline *, uint32_t index);
++bool nmb_argument_encoder_set_render_pipeline(NmbArgumentEncoder *, NmbRenderPipeline *, uint32_t index);
++void *nmb_argument_encoder_constant_data(NmbArgumentEncoder *, uint32_t index);
++uint64_t nmb_texture_gpu_resource_id(const NmbTexture *);
++uint64_t nmb_sampler_gpu_resource_id(const NmbSampler *);
++/* one of buffer/texture; stages are MTLRenderStages (ignored on a compute encoder) */
++bool nmb_encoder_use_resource(NmbEncoder *, NmbBuffer *buffer, NmbTexture *texture, uint64_t usage, uint64_t stages);
++bool nmb_encoder_use_heap(NmbEncoder *, NmbHeap *, uint64_t stages);
++bool nmb_compute_dispatch_indirect(NmbEncoder *, NmbBuffer *indirect, uint64_t offset, const uint64_t per_group[3]);
++bool nmb_render_draw_indirect(NmbEncoder *, uint64_t primitive, NmbBuffer *indirect, uint64_t offset);
++bool nmb_render_draw_indexed_indirect(NmbEncoder *, uint64_t primitive, uint64_t index_type, NmbBuffer *indices, uint64_t index_offset,
++                                      NmbBuffer *indirect, uint64_t offset);
++bool nmb_blit_buffer_to_texture_options(NmbEncoder *, NmbBuffer *source, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image,
++                                        const uint64_t size[3], NmbTexture *destination, uint64_t slice, uint64_t level,
++                                        const uint64_t origin[3], uint64_t options);
++bool nmb_blit_texture_to_buffer_options(NmbEncoder *, NmbTexture *source, uint64_t slice, uint64_t level, const uint64_t origin[3],
++                                        const uint64_t size[3], NmbBuffer *destination, uint64_t offset, uint64_t bytes_per_row,
++                                        uint64_t bytes_per_image, uint64_t options);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/phone/metal2/bridge/NativeMetalObjects.rs b/phone/metal2/bridge/NativeMetalObjects.rs
+index 1789ce0..b8a801e 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.rs
++++ b/phone/metal2/bridge/NativeMetalObjects.rs
+@@ -2068,3 +2068,271 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
+         Ok(true)
+     })
+ }
++
++// ---- NegroniMetal (flame/0011): argument buffers, residency, indirect work ----
++// metal2vulkan's own MTLArgumentEncoder (argument_encoder.rs): each argument is the 8-byte word a program could write itself (a buffer's
++// Metal address + offset, a texture's or sampler's gpu_resource_id), so encoded and hand-written argument buffers reach the translated
++// functions alike. Nothing is made resident by an encoder: the frontend passes useResource(s)/useHeap(s) through nmb_encoder_use_*.
++
++pub struct NmbArgumentEncoder(metal2vulkan_runtime::ArgumentEncoder);
++
++/// MTLArgumentDescriptor's fields as Metal's raw values.
++#[repr(C)]
++pub struct NmbArgumentDescriptor {
++    pub data_type: u64,
++    pub index: u64,
++    pub array_length: u64,
++    pub access: u64,
++    pub texture_type: u64,
++    pub constant_block_alignment: u64,
++}
++
++/// # Safety
++/// `arguments` holds `count` descriptors.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn nmb_argument_encoder_new(device: *mut NmbDevice, arguments: *const NmbArgumentDescriptor, count: usize)
++                                                  -> *mut NmbArgumentEncoder {
++    guard(std::ptr::null_mut(), || {
++        if arguments.is_null() && count != 0 {
++            return Err("null argument descriptors".into());
++        }
++        // SAFETY: the caller's contract.
++        let raw_arguments = if count == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(arguments, count) } };
++        let mut list = Vec::with_capacity(count);
++        for a in raw_arguments {
++            let mut d = metal2vulkan::bind::ArgumentDescriptor::new(raw::<DataType>(a.data_type, "data type")?,
++                                                                    u32::try_from(a.index).map_err(e("argument index"))?);
++            d.array_length = u32::try_from(a.array_length).map_err(e("array length"))?;
++            d.access = raw::<metal2vulkan::metal::BindingAccess>(a.access, "binding access")?;
++            d.texture_type = raw::<TextureType>(a.texture_type, "texture type")?;
++            d.constant_block_alignment = u32::try_from(a.constant_block_alignment).map_err(e("constant block alignment"))?;
++            list.push(d);
++        }
++        let encoder = get(device)?.0.new_argument_encoder_with_arguments(&list).map_err(e("argument encoder"))?;
++        Ok(boxed(NmbArgumentEncoder(encoder)))
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_new_for_function(function: *mut NmbFunction, buffer_index: u32) -> *mut NmbArgumentEncoder {
++    guard(std::ptr::null_mut(), || {
++        let encoder = get(function)?.0.new_argument_encoder_with_buffer_index(buffer_index).map_err(e("argument encoder"))?;
++        Ok(boxed(NmbArgumentEncoder(encoder)))
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_new_nested(encoder: *mut NmbArgumentEncoder, index: u32) -> *mut NmbArgumentEncoder {
++    guard(std::ptr::null_mut(), || {
++        let nested = get(encoder)?.0.new_argument_encoder_for_buffer_at_index(index).map_err(e("nested argument encoder"))?;
++        Ok(boxed(NmbArgumentEncoder(nested)))
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_release(encoder: *mut NmbArgumentEncoder) {
++    release(encoder)
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_encoded_length(encoder: *const NmbArgumentEncoder) -> u64 {
++    guard(0, || Ok(get(encoder)?.0.encoded_length()))
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_alignment(encoder: *const NmbArgumentEncoder) -> u64 {
++    guard(0, || Ok(get(encoder)?.0.alignment()))
++}
++
++/// setArgumentBuffer:startOffset:arrayElement: (setArgumentBuffer:offset: = element 0); a null buffer sets none.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_argument_buffer(encoder: *mut NmbArgumentEncoder, buffer: *mut NmbBuffer, start_offset: u64,
++                                                           element: u64) -> bool {
++    guard(false, || {
++        let buffer = optional(buffer)?.map(|b| &b.0);
++        get_mut(encoder)?.0.set_argument_buffer_start_offset_array_element(buffer, start_offset, element)
++            .map_err(e("set argument buffer"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_buffer(encoder: *mut NmbArgumentEncoder, buffer: *mut NmbBuffer, offset: u64, index: u32) -> bool {
++    guard(false, || {
++        let buffer = optional(buffer)?.map(|b| &b.0);
++        get(encoder)?.0.set_buffer(buffer, offset, index).map_err(e("argument buffer: set buffer"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_texture(encoder: *mut NmbArgumentEncoder, texture: *mut NmbTexture, index: u32) -> bool {
++    guard(false, || {
++        let texture = optional(texture)?.map(|t| &t.0);
++        get(encoder)?.0.set_texture(texture, index).map_err(e("argument buffer: set texture"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_sampler(encoder: *mut NmbArgumentEncoder, sampler: *mut NmbSampler, index: u32) -> bool {
++    guard(false, || {
++        let sampler = optional(sampler)?.map(|s| &s.0);
++        get(encoder)?.0.set_sampler_state(sampler, index).map_err(e("argument buffer: set sampler"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_compute_pipeline(encoder: *mut NmbArgumentEncoder, pipeline: *mut NmbComputePipeline, index: u32)
++                                                            -> bool {
++    guard(false, || {
++        let pipeline = optional(pipeline)?.map(|p| &p.0);
++        get(encoder)?.0.set_compute_pipeline_state(pipeline, index).map_err(e("argument buffer: set compute pipeline"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_set_render_pipeline(encoder: *mut NmbArgumentEncoder, pipeline: *mut NmbRenderPipeline, index: u32)
++                                                           -> bool {
++    guard(false, || {
++        let pipeline = optional(pipeline)?.map(|p| &p.0);
++        get(encoder)?.0.set_render_pipeline_state(pipeline, index).map_err(e("argument buffer: set render pipeline"))?;
++        Ok(true)
++    })
++}
++
++/// constantDataAtIndex:: the mapped address of the argument at `index` in the argument buffer set.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_argument_encoder_constant_data(encoder: *mut NmbArgumentEncoder, index: u32) -> *mut c_void {
++    guard(std::ptr::null_mut(), || Ok(get(encoder)?.0.constant_data(index).map_err(e("constant data"))?.as_ptr() as *mut c_void))
++}
++
++/// gpuResourceID of a texture / sampler state: the word an argument buffer holds for it.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_texture_gpu_resource_id(texture: *const NmbTexture) -> u64 {
++    guard(0, || Ok(get(texture)?.0.gpu_resource_id().0))
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_sampler_gpu_resource_id(sampler: *const NmbSampler) -> u64 {
++    guard(0, || Ok(get(sampler)?.0.gpu_resource_id().0))
++}
++
++/// useResource:usage:(stages:) for a buffer or a texture (one of them non-null). stages is ignored on a compute encoder.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_encoder_use_resource(encoder: *mut NmbEncoder, buffer: *mut NmbBuffer, texture: *mut NmbTexture, usage: u64,
++                                           stages: u64) -> bool {
++    guard(false, || {
++        let resource: metal2vulkan_runtime::ResourceRef<'_> = match (optional(buffer)?, optional(texture)?) {
++            (Some(b), None) => (&b.0).into(),
++            (None, Some(t)) => (&t.0).into(),
++            _ => return Err("use resource: one buffer or one texture".into()),
++        };
++        let usage = raw::<metal2vulkan::metal::ResourceUsage>(usage, "resource usage")?;
++        match get_mut(encoder)? {
++            NmbEncoder::Compute(c) => c.use_resource(resource, usage),
++            NmbEncoder::Render(r) => r.use_resource(resource, usage, raw::<RenderStages>(stages, "render stages")?),
++            NmbEncoder::Blit(_) => return Err("use resource on a blit encoder".into()),
++        }
++        .map_err(e("use resource"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_encoder_use_heap(encoder: *mut NmbEncoder, heap: *mut NmbHeap, stages: u64) -> bool {
++    guard(false, || {
++        let heap = &get(heap)?.0;
++        match get_mut(encoder)? {
++            NmbEncoder::Compute(c) => c.use_heap(heap),
++            NmbEncoder::Render(r) => r.use_heap(heap, raw::<RenderStages>(stages, "render stages")?),
++            NmbEncoder::Blit(_) => return Err("use heap on a blit encoder".into()),
++        }
++        .map_err(e("use heap"))?;
++        Ok(true)
++    })
++}
++
++/// dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_compute_dispatch_indirect(encoder: *mut NmbEncoder, indirect: *mut NmbBuffer, offset: u64, per_group: *const u64) -> bool {
++    guard(false, || {
++        let g = triple(per_group)?;
++        compute(encoder)?.dispatch_threadgroups_indirect(&get(indirect)?.0, offset, Size::new(g[0], g[1], g[2]))
++            .map_err(e("indirect dispatch"))?;
++        Ok(true)
++    })
++}
++
++/// drawPrimitives:indirectBuffer:indirectBufferOffset:
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_draw_indirect(encoder: *mut NmbEncoder, primitive: u64, indirect: *mut NmbBuffer, offset: u64) -> bool {
++    guard(false, || {
++        render(encoder)?.draw_primitives_indirect(raw::<PrimitiveType>(primitive, "primitive type")?, &get(indirect)?.0, offset)
++            .map_err(e("indirect draw"))?;
++        Ok(true)
++    })
++}
++
++/// drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_draw_indexed_indirect(encoder: *mut NmbEncoder, primitive: u64, index_type: u64, indices: *mut NmbBuffer,
++                                                   index_offset: u64, indirect: *mut NmbBuffer, offset: u64) -> bool {
++    guard(false, || {
++        render(encoder)?.draw_indexed_primitives_indirect(raw::<PrimitiveType>(primitive, "primitive type")?,
++                                                          raw::<IndexType>(index_type, "index type")?, &get(indices)?.0, index_offset,
++                                                          &get(indirect)?.0, offset)
++            .map_err(e("indexed indirect draw"))?;
++        Ok(true)
++    })
++}
++
++/// MTLBlitOption is a bit set (DepthFromDepthStencil 1, StencilFromDepthStencil 2, RowLinearPVRTC 4); the runtime takes one
++/// option per copy. RowLinearPVRTC only changes PVRTC formats, so with a depth/stencil bit it is dropped (a texture is not both).
++/// Depth and stencil together (3) are refused: Metal's validation refuses the pair too, the buffer layout of both planes is
++/// not defined.
++fn blit_option(value: u64) -> Result<BlitOption, String> {
++    const DEPTH: u64 = 1;
++    const STENCIL: u64 = 2;
++    const PVRTC: u64 = 4;
++    if value & !(DEPTH | STENCIL | PVRTC) != 0 {
++        return Err(format!("blit option {value:#x} has bits Metal does not define"));
++    }
++    Ok(match (value & DEPTH != 0, value & STENCIL != 0, value & PVRTC != 0) {
++        (true, true, _) => return Err("blit options DepthFromDepthStencil and StencilFromDepthStencil together".into()),
++        (true, false, _) => BlitOption::DepthFromDepthStencil,
++        (false, true, _) => BlitOption::StencilFromDepthStencil,
++        (false, false, true) => BlitOption::RowLinearPVRTC,
++        (false, false, false) => BlitOption::None,
++    })
++}
++
++/// copyFromBuffer:...toTexture:...options:
++#[unsafe(no_mangle)]
++#[allow(clippy::too_many_arguments)]
++pub extern "C" fn nmb_blit_buffer_to_texture_options(encoder: *mut NmbEncoder, source: *mut NmbBuffer, offset: u64, bytes_per_row: u64,
++                                                     bytes_per_image: u64, extent: *const u64, destination: *mut NmbTexture, slice: u64,
++                                                     level: u64, destination_origin: *const u64, options: u64) -> bool {
++    guard(false, || {
++        blit(encoder)?.copy_from_buffer_to_texture(&get(source)?.0, offset, bytes_per_row, bytes_per_image, size(extent)?,
++                                                   &get(destination)?.0, slice, level, origin(destination_origin)?, blit_option(options)?)
++            .map_err(e("buffer to texture"))?;
++        Ok(true)
++    })
++}
++
++/// copyFromTexture:...toBuffer:...options:
++#[unsafe(no_mangle)]
++#[allow(clippy::too_many_arguments)]
++pub extern "C" fn nmb_blit_texture_to_buffer_options(encoder: *mut NmbEncoder, source: *mut NmbTexture, slice: u64, level: u64,
++                                                     source_origin: *const u64, extent: *const u64, destination: *mut NmbBuffer, offset: u64,
++                                                     bytes_per_row: u64, bytes_per_image: u64, options: u64) -> bool {
++    guard(false, || {
++        blit(encoder)?.copy_from_texture_to_buffer(&get(source)?.0, slice, level, origin(source_origin)?, size(extent)?,
++                                                   &get(destination)?.0, offset, bytes_per_row, bytes_per_image, blit_option(options)?)
++            .map_err(e("texture to buffer"))?;
++        Ok(true)
++    })
++}
