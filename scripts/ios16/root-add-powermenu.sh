@@ -1,12 +1,16 @@
 #!/bin/sh
-# Add XNUtils.app (the owner's app: Metal status + Reboot to Bootloader / Restart / Shut Down; it was
-# PowerMenu.app before 2026-10-25) and its setuid-root helper to a mounted, writable iOS 16 root.
+# Add XNUtils.app (the owner's app: Metal status, the Metal/GL switches, Reboot to Bootloader / Restart /
+# Shut Down; it was PowerMenu.app before 2026-10-25), its setuid-root helper and pmregister to a mounted,
+# writable iOS 16 root.
 # Off unless POWERMENU=1 (root-finish.sh sets it when out/powermenu/XNUtils.app is built; the hook
 # keeps its old name). Run as root (macOS or Linux) so that the owners are right:
 #   POWERMENU=1 scripts/ios16/root-add-powermenu.sh MOUNTED_ROOT
 # Input: out/powermenu from userland/rebootapp/build.sh. Installs:
 #   /Applications/XNUtils.app                   root:wheel, folders 755, files 644, executable 755
-#   /usr/local/libexec/powermenu-helper         root:mobile (0:501), 4750 (setuid root, group mobile only)
+#   /usr/local/libexec/powermenu-helper         root:mobile (0:501), 4750 (setuid root, group mobile only);
+#                                               power verbs + the Metal/GL switch verbs of XNUtils (powermenu-helper.c)
+#   /usr/local/bin/pmregister                   root:wheel 755 (LaunchServices register tool, so that
+#                                               phone-add-powermenu.sh --register-only works on a root-update root)
 # Removes /Applications/PowerMenu.app (the old name, dev.iosplus10.powermenu) if the root has it.
 # Registration: none needed in a new root. A new root has no LaunchServices database and no
 # /var/mobile/Library/MobileInstallation/LastBuildInfo.plist, so the first boot registers every
@@ -23,7 +27,7 @@ S=$REPO/out/powermenu
 APP=XNUtils      # CFBundleExecutable in userland/rebootapp/Info.plist
 OLD=PowerMenu    # the old app name; removed from the root
 [ -d "$R/Applications" ] && [ -f "$R/System/Library/xpc/launchd.plist" ] || { echo "$R does not look like an iOS root" >&2; exit 1; }
-[ -x "$S/$APP.app/$APP" ] && [ -x "$S/powermenu-helper" ] || { echo "no $S/$APP.app or powermenu-helper: run userland/rebootapp/build.sh first" >&2; exit 1; }
+[ -x "$S/$APP.app/$APP" ] && [ -x "$S/powermenu-helper" ] && [ -x "$S/pmregister" ] || { echo "no $S/$APP.app, powermenu-helper or pmregister: run userland/rebootapp/build.sh first" >&2; exit 1; }
 root=1
 [ "$(id -u)" = 0 ] || { root=0; echo "warning: not root; owners stay as they are (test runs only)" >&2; }
 own() { [ $root = 1 ] && chown "$@" || true; }
@@ -59,6 +63,15 @@ own 0:501 "$H.new"
 chmod 4750 "$H.new"
 mv "$H.new" "$H"
 echo "powermenu: installed /usr/local/libexec/powermenu-helper (root:mobile 4750)"
+
+# 2b. pmregister (root:wheel 755): --register-only on the phone needs it (a new root never runs it).
+newdir usr/local/bin
+PM=$R/usr/local/bin/pmregister
+cp "$S/pmregister" "$PM.new"
+own 0:0 "$PM.new"
+chmod 755 "$PM.new"
+mv "$PM.new" "$PM"
+echo "powermenu: installed /usr/local/bin/pmregister (root:wheel 755)"
 
 # 3. registration: a root that booted before has a LaunchServices database; it does not see new apps.
 db=$(find "$R/private/var/containers/Data/System" -maxdepth 4 -name 'com.apple.LaunchServices*.csstore' 2>/dev/null | head -1)

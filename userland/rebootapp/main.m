@@ -2,23 +2,69 @@
 #import <Metal/Metal.h>
 #import <unistd.h>
 #import <spawn.h>
+#import <sys/wait.h>
 
-extern int reboot(int);
 extern char **environ;
-#define RB_AUTOBOOT     0
-#define RB_HALT         0x08
 
-static void run_cmd(const char *path, char *const argv[]) {
-    pid_t pid;
-    posix_spawn(&pid, path, NULL, NULL, argv, environ);
-    int status;
+// The root part of the app (userland/rebootapp/powermenu-helper.c): setuid root, root:mobile 4750,
+// accepts the caller only when the parent process is /Applications/XNUtils.app/XNUtils.
+// The reboot syscall, the reboot-mode sysctl, the switch files and the backboardd kill all need euid 0,
+// so every action goes through it; the app itself never calls the reboot syscall or the usb reboot tool.
+#define HELPER_PATH "/usr/local/libexec/powermenu-helper"
+
+// Run the helper with VERB [ARG]; returns the exit status (or -errno when it could not start),
+// stdout + stderr in *output.
+static int run_helper(NSString *verb, NSString *arg, NSString **output) {
+    int fds[2];
+    if (pipe(fds) != 0) return -errno;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    posix_spawn_file_actions_addclose(&fa, fds[1]);
+    char *const argv2[] = { HELPER_PATH, (char *)verb.UTF8String, NULL };
+    char *const argv3[] = { HELPER_PATH, (char *)verb.UTF8String, (char *)arg.UTF8String, NULL };
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, HELPER_PATH, &fa, NULL, arg ? argv3 : argv2, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    NSMutableData *data = [NSMutableData data];
+    if (rc == 0) {
+        char buf[1024];
+        ssize_t n;
+        while ((n = read(fds[0], buf, sizeof(buf))) > 0) [data appendBytes:buf length:(NSUInteger)n];
+    }
+    close(fds[0]);
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+    if (output) *output = text;
+    if (rc != 0) return -rc;
+    int status = 0;
     waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// KEY=VALUE lines of `powermenu-helper status`.
+static NSDictionary<NSString *, NSString *> *parse_status(NSString *text) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        NSRange eq = [line rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        d[[line substringToIndex:eq.location]] = [line substringFromIndex:eq.location + 1];
+    }
+    return d;
 }
 
 @interface ViewController : UIViewController
 @property (strong, nonatomic) UILabel *gpuNameLabel;
 @property (strong, nonatomic) UILabel *gpuStatusLabel;
 @property (strong, nonatomic) UILabel *gpuDetailsLabel;
+@property (strong, nonatomic) UISegmentedControl *metalControl;
+@property (strong, nonatomic) UISwitch *glSwitch;
+@property (strong, nonatomic) UISwitch *glAppsSwitch;
+@property (strong, nonatomic) UISwitch *glFinishSwitch;
+@property (strong, nonatomic) UILabel *switchStatusLabel;
+@property (nonatomic) BOOL updatingControls;
 @end
 
 @implementation ViewController
@@ -52,6 +98,36 @@ static void run_cmd(const char *path, char *const argv[]) {
     gpuCard.translatesAutoresizingMaskIntoConstraints = NO;
     [scrollView addSubview:gpuCard];
     
+    // Section Header: Switches (NegroniMetal / NegroniGL gate files, written by the helper)
+    UILabel *switchHeader = [[UILabel alloc] init];
+    switchHeader.text = @"GPU SWITCHES";
+    switchHeader.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    switchHeader.textColor = [UIColor secondaryLabelColor];
+    switchHeader.translatesAutoresizingMaskIntoConstraints = NO;
+    [scrollView addSubview:switchHeader];
+
+    UIView *switchCard = [self createSwitchCard];
+    switchCard.translatesAutoresizingMaskIntoConstraints = NO;
+    [scrollView addSubview:switchCard];
+
+    UIStackView *applyStack = [[UIStackView alloc] init];
+    applyStack.axis = UILayoutConstraintAxisVertical;
+    applyStack.spacing = 14.0;
+    applyStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [scrollView addSubview:applyStack];
+
+    [applyStack addArrangedSubview:[self createActionCardWithTitle:@"Restart backboardd (apply)"
+                                                           detail:@"Kills backboardd; SpringBoard and this app restart with it"
+                                                       symbolName:@"arrow.clockwise.circle.fill"
+                                                        tintColor:[UIColor systemIndigoColor]
+                                                           action:@selector(onRestartUITapped)]];
+
+    [applyStack addArrangedSubview:[self createActionCardWithTitle:@"Clear Metal strikes"
+                                                           detail:@"Re-arms the device for processes that crashed with it"
+                                                       symbolName:@"xmark.circle.fill"
+                                                        tintColor:[UIColor systemTealColor]
+                                                           action:@selector(onClearStrikesTapped)]];
+
     // Section Header: Power Actions
     UILabel *powerHeader = [[UILabel alloc] init];
     powerHeader.text = @"POWER ACTIONS";
@@ -110,7 +186,19 @@ static void run_cmd(const char *path, char *const argv[]) {
         [gpuCard.leadingAnchor constraintEqualToAnchor:frameGuide.leadingAnchor constant:20],
         [gpuCard.trailingAnchor constraintEqualToAnchor:frameGuide.trailingAnchor constant:-20],
         
-        [powerHeader.topAnchor constraintEqualToAnchor:gpuCard.bottomAnchor constant:28],
+        [switchHeader.topAnchor constraintEqualToAnchor:gpuCard.bottomAnchor constant:28],
+        [switchHeader.leadingAnchor constraintEqualToAnchor:frameGuide.leadingAnchor constant:24],
+        [switchHeader.trailingAnchor constraintEqualToAnchor:frameGuide.trailingAnchor constant:-20],
+
+        [switchCard.topAnchor constraintEqualToAnchor:switchHeader.bottomAnchor constant:10],
+        [switchCard.leadingAnchor constraintEqualToAnchor:frameGuide.leadingAnchor constant:20],
+        [switchCard.trailingAnchor constraintEqualToAnchor:frameGuide.trailingAnchor constant:-20],
+
+        [applyStack.topAnchor constraintEqualToAnchor:switchCard.bottomAnchor constant:14],
+        [applyStack.leadingAnchor constraintEqualToAnchor:frameGuide.leadingAnchor constant:20],
+        [applyStack.trailingAnchor constraintEqualToAnchor:frameGuide.trailingAnchor constant:-20],
+
+        [powerHeader.topAnchor constraintEqualToAnchor:applyStack.bottomAnchor constant:28],
         [powerHeader.leadingAnchor constraintEqualToAnchor:frameGuide.leadingAnchor constant:24],
         [powerHeader.trailingAnchor constraintEqualToAnchor:frameGuide.trailingAnchor constant:-20],
         
@@ -125,6 +213,209 @@ static void run_cmd(const char *path, char *const argv[]) {
     ]];
     
     [self probeMetalDevice];
+    [self refreshStatus];
+}
+
+#pragma mark - Switches
+
+- (UIView *)switchRowWithTitle:(NSString *)title detail:(NSString *)detail control:(UIView *)control {
+    UIView *row = [[UIView alloc] init];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *titleLbl = [[UILabel alloc] init];
+    titleLbl.text = title;
+    titleLbl.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    titleLbl.textColor = [UIColor labelColor];
+    titleLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:titleLbl];
+
+    UILabel *detailLbl = [[UILabel alloc] init];
+    detailLbl.text = detail;
+    detailLbl.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
+    detailLbl.textColor = [UIColor secondaryLabelColor];
+    detailLbl.numberOfLines = 0;
+    detailLbl.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:detailLbl];
+
+    control.translatesAutoresizingMaskIntoConstraints = NO;
+    [control setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [row addSubview:control];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [titleLbl.topAnchor constraintEqualToAnchor:row.topAnchor],
+        [titleLbl.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [titleLbl.trailingAnchor constraintLessThanOrEqualToAnchor:control.leadingAnchor constant:-12],
+        [detailLbl.topAnchor constraintEqualToAnchor:titleLbl.bottomAnchor constant:2],
+        [detailLbl.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [detailLbl.trailingAnchor constraintLessThanOrEqualToAnchor:control.leadingAnchor constant:-12],
+        [detailLbl.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
+        [control.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [control.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+    ]];
+    return row;
+}
+
+- (UIView *)createSwitchCard {
+    UIView *card = [[UIView alloc] init];
+    card.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    card.layer.cornerRadius = 16.0;
+    card.layer.cornerCurve = kCACornerCurveContinuous;
+
+    UIStackView *stack = [[UIStackView alloc] init];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 16.0;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:stack];
+
+    // Metal: all | probes | off  (helper: metal all|probes|off = phone-metal.sh on "*"|probes|off)
+    UILabel *metalTitle = [[UILabel alloc] init];
+    metalTitle.text = @"Metal (NegroniMetal)";
+    metalTitle.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    metalTitle.textColor = [UIColor labelColor];
+    [stack addArrangedSubview:metalTitle];
+
+    self.metalControl = [[UISegmentedControl alloc] initWithItems:@[@"All processes", @"Probes only", @"Off"]];
+    [self.metalControl addTarget:self action:@selector(onMetalChanged:) forControlEvents:UIControlEventValueChanged];
+    [stack addArrangedSubview:self.metalControl];
+
+    UILabel *metalDetail = [[UILabel alloc] init];
+    metalDetail.text = @"All: every new process gets the Metal device (strikes cleared). Probes: metalprobe and m2vtest only. Off: the off sentinel, CPU rasterization.";
+    metalDetail.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
+    metalDetail.textColor = [UIColor secondaryLabelColor];
+    metalDetail.numberOfLines = 0;
+    [stack addArrangedSubview:metalDetail];
+
+    self.glSwitch = [[UISwitch alloc] init];
+    [self.glSwitch addTarget:self action:@selector(onGLChanged:) forControlEvents:UIControlEventValueChanged];
+    [stack addArrangedSubview:[self switchRowWithTitle:@"GL for backboardd"
+                                                detail:@"NegroniGL EAGL gate (/var/db/negronigl/clients)"
+                                               control:self.glSwitch]];
+
+    self.glAppsSwitch = [[UISwitch alloc] init];
+    [self.glAppsSwitch addTarget:self action:@selector(onGLAppsChanged:) forControlEvents:UIControlEventValueChanged];
+    [stack addArrangedSubview:[self switchRowWithTitle:@"GL for apps"
+                                                detail:@"NegroniGL.bundle apps gate (apps.local = * -backboardd)"
+                                               control:self.glAppsSwitch]];
+
+    self.glFinishSwitch = [[UISwitch alloc] init];
+    [self.glFinishSwitch addTarget:self action:@selector(onGLFinishChanged:) forControlEvents:UIControlEventValueChanged];
+    [stack addArrangedSubview:[self switchRowWithTitle:@"glFinish on every flush"
+                                                detail:@"Default off: glFlush + the kernel swap fence"
+                                               control:self.glFinishSwitch]];
+
+    self.switchStatusLabel = [[UILabel alloc] init];
+    self.switchStatusLabel.text = @"Reading switch files...";
+    self.switchStatusLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1];
+    self.switchStatusLabel.textColor = [UIColor tertiaryLabelColor];
+    self.switchStatusLabel.numberOfLines = 0;
+    [stack addArrangedSubview:self.switchStatusLabel];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.topAnchor constraintEqualToAnchor:card.topAnchor constant:18],
+        [stack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:18],
+        [stack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-18],
+        [stack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-16],
+    ]];
+    return card;
+}
+
+// Read the switch files through the helper and show them. This is the file state only: the
+// plugins read the files once at process start, so a running backboardd may differ until
+// "Restart backboardd (apply)".
+- (void)refreshStatus {
+    NSString *out = nil;
+    int rc = run_helper(@"status", nil, &out);
+    if (rc != 0) {
+        self.switchStatusLabel.text = [NSString stringWithFormat:@"Helper status failed (exit %d): %@", rc,
+                                       [out stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]];
+        self.metalControl.enabled = NO;
+        self.glSwitch.enabled = self.glAppsSwitch.enabled = self.glFinishSwitch.enabled = NO;
+        return;
+    }
+    NSDictionary<NSString *, NSString *> *st = parse_status(out);
+    self.updatingControls = YES;
+    NSString *metal = st[@"METAL"] ?: @"";
+    if ([metal isEqualToString:@"all"]) self.metalControl.selectedSegmentIndex = 0;
+    else if ([metal isEqualToString:@"probes"]) self.metalControl.selectedSegmentIndex = 1;
+    else if ([metal isEqualToString:@"off"]) self.metalControl.selectedSegmentIndex = 2;
+    else self.metalControl.selectedSegmentIndex = UISegmentedControlNoSegment;   // custom list or no file
+    self.metalControl.enabled = YES;
+    self.glSwitch.on = [st[@"GL"] isEqualToString:@"on"];
+    self.glSwitch.enabled = YES;
+    BOOL bundle = [st[@"GLAPPS_BUNDLE"] isEqualToString:@"1"];
+    self.glAppsSwitch.on = [st[@"GLAPPS"] isEqualToString:@"on"];
+    self.glAppsSwitch.enabled = bundle;
+    self.glFinishSwitch.on = [st[@"GLFINISH"] isEqualToString:@"on"];
+    self.glFinishSwitch.enabled = YES;
+    self.updatingControls = NO;
+
+    NSString *clients = [st[@"METAL_CLIENTS"] length] ? st[@"METAL_CLIENTS"] : @"(none)";
+    self.switchStatusLabel.text = [NSString stringWithFormat:
+        @"Files: metal clients \"%@\"%@, strikes %@ • gl clients \"%@\"%@ • apps %@%@ • backboardd pid %@\n"
+        @"File state only: whether the running backboardd has a Metal device is not known here. Changes apply to processes started after them (Restart backboardd).",
+        clients, [st[@"METAL_OFF"] isEqualToString:@"1"] ? @" + off sentinel" : @"",
+        st[@"METAL_STRIKES"] ?: @"?",
+        st[@"GL_CLIENTS"] ?: @"", [st[@"GL_OFF"] isEqualToString:@"1"] ? @" + off sentinel" : @"",
+        bundle ? ([st[@"GLAPPS_LIST"] length] ? st[@"GLAPPS_LIST"] : @"(empty list)") : @"(no NegroniGL.bundle)",
+        [st[@"GLFINISH"] isEqualToString:@"on"] ? @", glFinish on" : @"",
+        st[@"BACKBOARDD_PID"] ?: @"?"];
+}
+
+// Run VERB ARG through the helper; on a non-zero exit show the helper's message. Then re-read the files.
+- (void)applyVerb:(NSString *)verb arg:(NSString *)arg {
+    NSString *out = nil;
+    int rc = run_helper(verb, arg, &out);
+    if (rc != 0) {
+        NSString *msg = [out stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (rc == 3) msg = @"This kernel has no kern.negroni_reboot_mode (patch 0213). Use Volume Up + Volume Down + Power, or op10tool ctl bootloader.";
+        else if (rc == 4) msg = @"The helper refused the caller (the app must be /Applications/XNUtils.app/XNUtils).";
+        else if (rc == 5) msg = @"The helper is not setuid root (install: root:mobile 4750).";
+        else if (rc == 6) msg = @"NegroniGL.bundle is not installed in /System/Library/Extensions.";
+        else if (rc < 0) msg = [NSString stringWithFormat:@"Could not start %s (errno %d).", HELPER_PATH, -rc];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"%@ %@ failed (exit %d)", verb, arg ?: @"", rc]
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+    }
+    [self refreshStatus];
+}
+
+- (void)onMetalChanged:(UISegmentedControl *)c {
+    if (self.updatingControls) return;
+    NSArray *modes = @[@"all", @"probes", @"off"];
+    if (c.selectedSegmentIndex < 0 || c.selectedSegmentIndex >= (NSInteger)modes.count) return;
+    [self applyVerb:@"metal" arg:modes[c.selectedSegmentIndex]];
+}
+
+- (void)onGLChanged:(UISwitch *)sw {
+    if (self.updatingControls) return;
+    [self applyVerb:@"gl" arg:sw.on ? @"on" : @"off"];
+}
+
+- (void)onGLAppsChanged:(UISwitch *)sw {
+    if (self.updatingControls) return;
+    [self applyVerb:@"glapps" arg:sw.on ? @"on" : @"off"];
+}
+
+- (void)onGLFinishChanged:(UISwitch *)sw {
+    if (self.updatingControls) return;
+    [self applyVerb:@"glfinish" arg:sw.on ? @"on" : @"off"];
+}
+
+- (void)onClearStrikesTapped {
+    [self applyVerb:@"strikes-clear" arg:nil];
+}
+
+- (void)onRestartUITapped {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Restart backboardd?"
+                                                                   message:@"backboardd is killed; SpringBoard and this app restart with it. The new processes read the switch files."
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Restart backboardd" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        [self applyVerb:@"restart-ui" arg:nil];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (UIView *)createGPUInfoCard {
@@ -296,8 +587,7 @@ static void run_cmd(const char *path, char *const argv[]) {
                                                                    message:@"The phone will restart and enter fastboot mode."
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
     [alert addAction:[UIAlertAction actionWithTitle:@"Reboot to Bootloader" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        char *const args[] = {"/usr/local/bin/usbreboot", "-f", "bootloader", NULL};
-        run_cmd("/usr/local/bin/usbreboot", args);
+        [self applyVerb:@"bootloader" arg:nil];   // helper: kern.negroni_reboot_mode=bootloader, sync, reboot
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
@@ -308,8 +598,7 @@ static void run_cmd(const char *path, char *const argv[]) {
                                                                    message:@"All running processes will be terminated and the system will reboot."
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
     [alert addAction:[UIAlertAction actionWithTitle:@"Restart" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        sync();
-        reboot(RB_AUTOBOOT);
+        [self applyVerb:@"restart" arg:nil];      // helper: sync, then RB_AUTOBOOT
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
@@ -320,8 +609,7 @@ static void run_cmd(const char *path, char *const argv[]) {
                                                                    message:@"The device will cleanly unmount volumes and power off."
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
     [alert addAction:[UIAlertAction actionWithTitle:@"Shut Down" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        sync();
-        reboot(RB_HALT);
+        [self applyVerb:@"shutdown" arg:nil];     // helper: sync, then RB_HALT
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];

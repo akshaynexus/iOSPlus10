@@ -8,7 +8,8 @@
 #                                       /usr/libexec/backboardd.orig. Takes effect at the next backboardd start.
 #   scripts/gpu/phone-gl.sh restore     /usr/libexec/backboardd.orig back
 #   scripts/gpu/phone-gl.sh on|off      backboardd into / out of /var/db/negronigl/clients (the A/B switch; off also
-#                                       removes /var/db/negronigl/off); then `restart` or a reboot
+#                                       removes /var/db/negronigl/off; a "*" gate gets/loses the "-backboardd" never
+#                                       line, as the XNUtils helper does); then `restart` or a reboot
 #   scripts/gpu/phone-gl.sh restart     kill backboardd (launchd starts it again); SpringBoard restarts with it
 #   scripts/gpu/phone-gl.sh test [--layer [WxH]]   /usr/local/bin/ngl_test (GPU identity, triangle, IOSurface round trip;
 #                                       --layer: a CAEAGLLayer drawable through renderbufferStorage:/presentRenderbuffer:;
@@ -67,11 +68,11 @@ restore)
   run "[ -f /usr/libexec/backboardd.orig ] && cat /usr/libexec/backboardd.orig > /usr/libexec/backboardd && rm /usr/libexec/backboardd.orig && ls -la /usr/libexec/backboardd || echo 'no backboardd.orig'"
   ;;
 on)
-  run "mkdir -p $D && rm -f $D/off && touch $D/clients && grep -qw backboardd $D/clients || echo backboardd >> $D/clients; cat $D/clients"
+  run "mkdir -p $D && rm -f $D/off && touch $D/clients && { grep -vx -- '-backboardd' $D/clients > $D/clients.new || true; } && mv -f $D/clients.new $D/clients && { grep -qx '\*' $D/clients || grep -qw backboardd $D/clients || echo backboardd >> $D/clients; }; cat $D/clients"
   echo "on: backboardd takes the GL path at its next start ($0 restart or reboot)" | tee -a "$LOG"
   ;;
 off)
-  run "rm -f $D/off; [ -f $D/clients ] && grep -vw backboardd $D/clients > $D/clients.new && mv -f $D/clients.new $D/clients; cat $D/clients 2>/dev/null || true"
+  run "rm -f $D/off; [ -f $D/clients ] && { grep -vx backboardd $D/clients > $D/clients.new || true; } && mv -f $D/clients.new $D/clients && { grep -qx '\*' $D/clients && ! grep -qx -- '-backboardd' $D/clients && printf '%s\\n' -backboardd >> $D/clients; }; cat $D/clients 2>/dev/null || true"
   echo "off: backboardd keeps Apple's EAGL at its next start ($0 restart or reboot)" | tee -a "$LOG"
   ;;
 restart)

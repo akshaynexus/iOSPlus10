@@ -275,3 +275,10 @@ Owner's choice: acceleration on. `scripts/gpu/phone-accel.sh on|off|status` on t
 userdata is flashed again. A new root gets the same defaults: `scripts/ios16/root-update.sh` passes `METAL_CLIENTS="*"` to the metal hook
 (`METAL_CLIENTS=""` keeps the probes-only default) and `scripts/gpu/root-add-negronigl.sh` writes `/private/var/db/negronigl/clients` =
 `NEGRONIGL_CLIENTS` (default `*`) and `NegroniGL.bundle/apps.local` = `NEGRONIGL_APPS` (default `* -backboardd`).
+
+On the phone itself, XNUtils.app (`userland/rebootapp`) has the same switches: Metal all / probes / off, GL for backboardd,
+GL for apps, glFinish, Clear Metal strikes and Restart backboardd (apply). Each one is a verb of the setuid helper
+`/usr/local/libexec/powermenu-helper` (`metal all|probes|off`, `gl on|off`, `glapps on|off`, `glfinish on|off`,
+`strikes-clear`, `restart-ui`, `status`) that writes the same files with the same owners and modes as `phone-metal.sh` /
+`phone-gl.sh` (atomic: tmp + rename in the same directory). The app shows the file state only; whether the running backboardd
+has a device is not known to it. `gl off` on a `*` gate writes the `-backboardd` never line (phone-gl.sh off does the same since 2026-10-27).

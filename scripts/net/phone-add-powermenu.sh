@@ -7,7 +7,10 @@
 #   scripts/net/phone-add-powermenu.sh --remove          unregister, delete app, helper and pmregister
 # Every mode first unregisters and deletes the old /Applications/PowerMenu.app (pmregister -u).
 # Use --register-only after a root-update of a root that booted before: its app database still
-# lists PowerMenu.app.
+# lists PowerMenu.app (root-add-powermenu.sh installs /usr/local/bin/pmregister for this).
+# The app's switches and power buttons call /usr/local/libexec/powermenu-helper (verbs: see
+# userland/rebootapp/powermenu-helper.c); the host-side equivalents are scripts/metal/phone-metal.sh and
+# scripts/gpu/phone-gl.sh.
 # Needs: userland/rebootapp/build.sh output in out/powermenu; a root with SSH=1 (dropbear, toybox in
 # /usr/local/bin, scripts/net/root-add-ssh.sh); iOS up with the USB network (scripts/net/ssh-phone.sh).
 # The root filesystem must be writable (it is on this port: rw HFS+ root in userdata).

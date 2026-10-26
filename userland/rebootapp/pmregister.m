@@ -3,12 +3,13 @@
  * phone, so SpringBoard shows it without a new root (scripts/net/phone-add-powermenu.sh).
  * A new root does not need it: the first boot builds the app database from /Applications.
  *
- *   pmregister /Applications/PowerMenu.app        register as a system app
- *   pmregister -u /Applications/PowerMenu.app     unregister
+ *   pmregister /Applications/XNUtils.app          register as a system app
+ *   pmregister -u /Applications/XNUtils.app       unregister (also used for the old PowerMenu.app)
  *
  * Run as root. Uses the private LSApplicationWorkspace API (MobileCoreServices, looked up at run
  * time), as bergamota tools/sweetnet/sweetuicache.m (sideloaded apps in /Applications).
- * Signed with pmregister.entitlements. Our own code.
+ * Signed with pmregister.entitlements. Installed as /usr/local/bin/pmregister (root-add-powermenu.sh
+ * and phone-add-powermenu.sh). Our own code.
  */
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
