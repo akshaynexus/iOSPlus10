@@ -1,0 +1,147 @@
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index d526859..daad54b 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -66,6 +66,7 @@
+ #include <sys/proc.h>
+ #include <sys/errno.h>
+ #include "NegroniSurface.h"
++#include "NegroniGPU.h"          /* 0289: NegroniGPUSurfaceWaitMS for RedwoodGPU::start */
+ 
+ extern "C" {
+ bool negroni_gpu_ready(void);
+@@ -471,8 +472,10 @@ RedwoodGPU::start(IOService * provider)
+ 	setProperty(kIOUserClientClassKey, "RedwoodGPUUserClient");
+ 	setProperty("NegroniGPUABI", negroni_gpu_per_client() ? "scalar 10-16, msm 0x09 0x40-0x4c 0x7e, userptr 0x49, va per-client" :
+ 	    "scalar 10-16, msm 0x09 0x40-0x4c 0x7e, userptr 0x49, va shared");
++	/* 0289: the IOSurface CPU lock waits for the surface's GPU fence (the ios-spes/HackiOS contract) */
++	setProperty("RedwoodWaitsForGPU", NegroniGPUSurfaceWaitMS() != 0 ? kOSBooleanTrue : kOSBooleanFalse);
+ 	registerService();
+-	IOLog("RedwoodGPU: registered\n");
++	IOLog("RedwoodGPU: registered (the IOSurface lock waits up to %u ms for the GPU)\n", NegroniGPUSurfaceWaitMS());
+ 	return true;
+ }
+ 
+@@ -1969,6 +1972,19 @@ NegroniGPUFenceWait(uint32_t fence, uint32_t ms)
+ 	return ret == kIOReturnSuccess;
+ }
+ 
++uint32_t
++NegroniGPUSurfaceWaitMS(void)
++{
++	static uint32_t ms = ~0u;
++
++	if (ms == ~0u) {
++		uint32_t arg = NEGRONI_SURFACE_GPU_WAIT_MS;
++		PE_parse_boot_argn("negronisurf_gpuwait", &arg, sizeof(arg));
++		ms = MIN(arg, 2000u);
++	}
++	return ms;
++}
++
+ void
+ NegroniGPUSurfaceForCPU(NegroniSurface * s, uint64_t offset, uint64_t length)
+ {
+diff --git a/iokit/Kernel/arm/NegroniGPU.h b/iokit/Kernel/arm/NegroniGPU.h
+index 063fb15..37ab104 100644
+--- a/iokit/Kernel/arm/NegroniGPU.h
++++ b/iokit/Kernel/arm/NegroniGPU.h
+@@ -57,5 +57,14 @@ uint32_t NegroniGPUClientCloses(void);
+  */
+ void NegroniGPUSurfaceForCPU(NegroniSurface *s, uint64_t offset, uint64_t length);
+ 
++/*
++ * 0289: how long the IOSurface CPU lock (NegroniSurface.cpp trap 2) waits for a surface's gpuFence
++ * before it answers, in ms: boot-arg negronisurf_gpuwait (default NEGRONI_SURFACE_GPU_WAIT_MS, 0 =
++ * the lock never waits). RedwoodGPU publishes RedwoodWaitsForGPU = true when it is not 0, so a
++ * library can trust glFlush/commit + the lock instead of glFinish/waitUntilCompleted.
++ */
++#define NEGRONI_SURFACE_GPU_WAIT_MS 50          /* the same bound as the framebuffer's NEGRONI_FB_GPU_WAIT_MS */
++uint32_t NegroniGPUSurfaceWaitMS(void);
++
+ #endif /* NEGRONI */
+ #endif /* _NEGRONI_GPU_H */
+diff --git a/iokit/Kernel/arm/NegroniSurface.cpp b/iokit/Kernel/arm/NegroniSurface.cpp
+index 9ffc09d..5e2cba8 100644
+--- a/iokit/Kernel/arm/NegroniSurface.cpp
++++ b/iokit/Kernel/arm/NegroniSurface.cpp
+@@ -17,6 +17,12 @@
+  *   sel 35  create mach port: scalars [id, options], scalar out [port name]
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+  *           (id, options, &seed), 4/5 release (id)
++ *   trap 2  (0289) waits for the surface's last GPU submission (gpuFence, set by
++ *           RedwoodGPU at submit time) up to negronisurf_gpuwait ms and drops the
++ *           CPU's cached lines of a cached mapping before it answers, so a CPU
++ *           reader (a snapshot, CoreAnimation's CPU fallback, a compositor sampling
++ *           an app's surface) sees what the GPU wrote. A stopped GPU is not waited
++ *           for; a wait that runs out is logged (8 times) and answered anyway.
+  *
+  * The lock result tells the library where the surface lives in the
+  * caller's address space: +0 pixels, +8 shared state page (registry id,
+@@ -35,6 +41,7 @@
+  * backboardd; the framebuffer cleans the rows the CPU wrote before it shows one.
+  */
+ #include "NegroniSurface.h"
++#include "NegroniGPU.h"
+ 
+ #if defined(NEGRONI)
+ #include <IOKit/IOService.h>
+@@ -1139,6 +1146,34 @@ negroni_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
+ 	return s;
+ }
+ 
++/*
++ * 0289: before the CPU reads (or writes) a surface the GPU wrote. The last submission that listed
++ * the surface is s->gpuFence (0230 import, also the fence 0254 records at swap time). Wait for it,
++ * bounded (NegroniGPUSurfaceWaitMS; NegroniGPUFenceWait gives up at once when the GPU is stopped),
++ * then drop the CPU's cached lines when the user mapping is cached (write-combined mappings, the
++ * created surfaces' default, have none). Once per fence value: the seed-bump locks of a Metal
++ * process after every completed command buffer cost one fence check, not a page walk each.
++ */
++static void
++negroni_surface_wait_gpu(NegroniSurface *s)
++{
++	uint32_t fence = s->gpuFence;
++	uint32_t ms = NegroniGPUSurfaceWaitMS();
++	static uint32_t gaveUp;
++
++	if (fence == 0 || ms == 0 || fence == s->cpuSeenFence) {
++		return;
++	}
++	if (!NegroniGPUFenceWait(fence, ms) && gaveUp++ < 8) {
++		IOLog("NEGRONI SURF: %s lock of surface %u: the GPU (fence %u) is not done after %u ms: answered anyway\n",
++		    proc_best_name(current_proc()), s->id, fence, ms);
++	}
++	if (s->mapCache != kIOMapWriteCombineCache) {
++		NegroniGPUSurfaceForCPU(s, 0, s->allocSize);
++	}
++	s->cpuSeenFence = fence;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
+     void *, void *, void *)
+@@ -1147,6 +1182,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	negroni_surface_wait_gpu(s);
+ 	IOReturn ret = negroni_surface_seed_out(s, seedOut, false);
+ 	s->release();
+ 	return ret;
+diff --git a/iokit/Kernel/arm/NegroniSurface.h b/iokit/Kernel/arm/NegroniSurface.h
+index 69a45f7..82e49c8 100644
+--- a/iokit/Kernel/arm/NegroniSurface.h
++++ b/iokit/Kernel/arm/NegroniSurface.h
+@@ -45,6 +45,11 @@ public:
+ 	 * presents such surfaces with the GPU once that fence is done.
+ 	 */
+ 	volatile uint32_t         gpuFence;
++	/*
++	 * 0289: the gpuFence the CPU lock (trap 2) last waited for and dropped the cached lines of
++	 * (negroni_surface_wait_gpu): the next lock waits only when the GPU wrote the surface again.
++	 */
++	uint32_t                  cpuSeenFence;
+ 	/*
+ 	 * Zero-copy scanout (patch 0234, NegroniFramebuffer.cpp): backboardd's framebuffers can
+ 	 * live in display slots of ABL's splash region, which the display engine fetches directly.

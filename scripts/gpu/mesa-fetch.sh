@@ -1,7 +1,9 @@
 #!/bin/sh
 # Fetch Mesa (pinned release, SHA-256 checked) and make the patched source tree out/gpu/mesa-VERSION:
 #   1. the freedreno-on-Darwin patches of HackiOS (scripts/gpu/env.sh: HACKIOS_COMMIT, HACKIOS_PATCHES),
-#   2. our patches userland/negronigl/mesa-patches/*.patch (in name order),
+#   2. our patches userland/negronigl/mesa-patches/*.patch (in name order), then the Turnip-on-Darwin
+#      patch userland/turnip/mesa-patches/0001-turnip-darwin.patch (TURNIP_DARWIN_PATCH, shared with
+#      scripts/gpu/turnip-build.sh: one copy of those changes, the GL tree does not build Turnip),
 #   3. src/redwood-drm/: the libdrm header freedreno is built against = our
 #      userland/negronigl/drm/xf86drm.h. The functions themselves are in negronigl (drm/negroni_drm.c).
 # Also makes the Python environment out/gpu/venv (meson, mako, pyyaml, packaging) with uv.
@@ -45,9 +47,9 @@ for p in $HACKIOS_PATCHES; do
   git -C "$HACKIOS" show "$HACKIOS_COMMIT:tools/mesa/$p.patch" |
     patch -s --no-backup-if-mismatch -d "$MESA_SRC" -p1
 done
-for p in "$NGL"/mesa-patches/*.patch; do
+for p in "$NGL"/mesa-patches/*.patch "$TURNIP_DARWIN_PATCH"; do
   [ -f "$p" ] || continue
-  echo "patch negronigl $(basename "$p")"
+  echo "patch $(basename "$(dirname "$(dirname "$p")")") $(basename "$p")"
   patch -s --no-backup-if-mismatch -d "$MESA_SRC" -p1 < "$p"
 done
 find "$MESA_SRC" -name '*.orig' -delete
@@ -64,7 +66,9 @@ EOF
 {
   echo "mesa $MESA_VERSION $MESA_SHA256"
   echo "hackios $HACKIOS_COMMIT: $HACKIOS_PATCHES"
-  for p in "$NGL"/mesa-patches/*.patch; do [ -f "$p" ] && echo "negronigl $(basename "$p") $(shasum -a 256 "$p" | cut -c1-16)"; done
+  for p in "$NGL"/mesa-patches/*.patch "$TURNIP_DARWIN_PATCH"; do
+    [ -f "$p" ] && echo "$(basename "$(dirname "$(dirname "$p")")") $(basename "$p") $(shasum -a 256 "$p" | cut -c1-16)"
+  done
   echo "xf86drm.h $(shasum -a 256 "$NGL/drm/xf86drm.h" | cut -c1-16)"
 } > "$MESA_SRC/NEGRONIGL-SOURCE"
 cat "$MESA_SRC/NEGRONIGL-SOURCE"

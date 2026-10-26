@@ -524,6 +524,45 @@ Test (GL path, phone on): `scripts/gpu/phone-gl.sh backboardd`, `on`, `restart`.
 sel 6` line, no `negronigl: IOSurface wrap of client memory refused` line (userland/negronigl/eagl.c, the
 guard stays in as a fallback) and no backboardd crash with far 0x30.
 
+### 0289: the IOSurface CPU lock waits for the surface's GPU fence (`RedwoodWaitsForGPU`)
+
+Gap (docs/audit/2026-10-26-metal-gl.md section 2.3, notes.md 15a): a CPU reader of a GPU-written surface
+(`IOSurfaceLock` + read: a snapshot, CoreAnimation's CPU fallback, a CPU-composited backboardd sampling an
+app's surface) got the lock at once and could read stale pixels: 0230 marks the surface with the submission's
+fence and 0254 waits on it for the present path only; the lock trap answered without a wait, and the CPU's
+cached lines of a cached mapping were not dropped (`NegroniGPUSurfaceForCPU` ran for the present copy only).
+The GL library therefore defaulted to `glFlush` on trust alone, with `phone-gl.sh finish on` as the safe setting.
+
+What 0289 does (`0289-negroni-iosurface-lock-gpu-wait.patch`; NegroniSurface.cpp/.h, NegroniGPU.cpp/.h):
+- `negroni_surface_wait_gpu()` before `trapLock` answers: when the surface's `gpuFence` is not 0 and differs from
+  `cpuSeenFence` (new field: the fence the lock last handled), `NegroniGPUFenceWait(fence, ms)` with
+  `ms = NegroniGPUSurfaceWaitMS()` (boot-arg `negronisurf_gpuwait`, default `NEGRONI_SURFACE_GPU_WAIT_MS` = 50 like
+  the framebuffer's bound, capped at 2000; 0 = the lock never waits). `gpuWait` gives up at once when `gGPUStopped`
+  (and marks the GPU stopped itself after 2 s without progress), so a dead GPU costs one bounded wait, not a hang.
+  A wait that runs out is logged 8 times (`NEGRONI SURF: <proc> lock of surface N: the GPU (fence F) is not done
+  after 50 ms: answered anyway`) and the lock is answered anyway (never a failure: IOSurface.framework treats a
+  non-zero return as a broken surface).
+- Then `NegroniGPUSurfaceForCPU(s, 0, allocSize)` when `mapCache != kIOMapWriteCombineCache` (slot, wrapped and
+  physical surfaces: cached user mappings; the created surfaces are write-combined, so nothing to drop), and
+  `cpuSeenFence = fence`: a Metal process's seed-bump locks after every completed command buffer (flame/0002) cost
+  one fence compare each, not a page walk.
+- `RedwoodGPU::start` publishes `RedwoodWaitsForGPU` (kOSBooleanTrue unless the boot-arg is 0) and logs
+  `RedwoodGPU: registered (the IOSurface lock waits up to 50 ms for the GPU)`. User space: `userland/negronigl/view.c`
+  reads it once per process (`ngl_drm_kernel_waits_for_gpu`, negroni_drm.c) and uses `glFinish` without it.
+- The unlock trap is unchanged (the CPU wrote; the GPU side cleans before it reads, 0232/0257).
+
+Build (2026-10-26 12:31, full patch set, 197 applied, the 4 usual dxb skips): kernel `out/kernel/local-20261026-123128`
+(sha256 151428d32eeacf2f9c66930009d637796427acf11abc6bde3769513a16d80513), image `out/ios16-gl2` (boot_a sha256
+78c2325993709739bc92c4cdb1be9dd334f34676888c7e0f739e8d857f1cc4b2, esp 851a6735..., vendor_boot c29329ee...; config
+boot-args + `negronipanic=30 negronipanicreason=2`; `scripts/gpu/build-test-image.sh`). Not booted (the phone runs Android).
+
+Test (phone on `out/ios16-gl2`): `make usblog` must show `RedwoodGPU: registered (the IOSurface lock waits up to 50 ms
+for the GPU)`; `ioreg -l | grep RedwoodWaitsForGPU` over SSH shows `Yes`; with the 2026-10-26 GL stage pushed,
+`scripts/gpu/phone-gl.sh test` logs `negronigl: flush = glFlush + kernel fence (default: RedwoodWaitsForGPU)`. A
+`NEGRONI SURF: ... not done after 50 ms` line names a CPU reader that locks a surface while the GPU is still on it
+(expected rarely: a screenshot during a long frame). `negronisurf_gpuwait=0` is the A/B switch (property false,
+the GL library falls back to glFinish).
+
 ## 13. ios-spes deltas (kernel work the GL path needs; plan only, nothing built here)
 
 Reference: `external/ios-spes` (SM6225, A610, same 20H392 root). Its UI runs on GL at a frame median of

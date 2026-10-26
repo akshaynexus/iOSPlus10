@@ -175,8 +175,16 @@ scripts/net/ssh-phone.sh "/usr/local/bin/metalprobe --compute --render"  # MSL s
 Argument buffers (flame/0011): `newArgumentEncoderWithArguments:`, `-[MTLFunction newArgumentEncoderWithBufferIndex:]` and
 the encoder setters go to metal2vulkan's `ArgumentEncoder`; `useResource(s)`/`useHeap(s)` reach its residency.
 `argumentBuffersSupport` is metal2vulkan's own answer for the device. Indirect draws and dispatches are bridged;
-indirect command buffers are not: `newIndirectCommandBufferWithDescriptor:` answers nil (one log line), an
-`executeCommandsInBuffer:` is skipped (one log line).
+indirect command buffers are not: `newIndirectCommandBufferWithDescriptor:` answers nil (one log line, plus a MISSING
+line), an `executeCommandsInBuffer:` is skipped (one log line). Decision 2026-10-26 (audit follow-up): metal2vulkan's
+runtime has them (`crates/metal2vulkan-runtime/src/indirect_command_buffer.rs`), but the ios-flame bridge
+(`out/metal/src/flame/phone/metal2/bridge/NativeMetalBridge.{h,rs}`) has no ICB entry point at all (creation, the
+compute/render command setters, execute), so the frontend has nothing to call; the clean refusal stays until a WebGPU
+or game test logs `executeCommandsInBuffer` skipped lines. Then the work is bridge + frontend (about 15 `nmb_*` calls).
+
+Sync switch: `NEGRONIMETAL_SYNC=1` (env) or the file `/var/db/negronimetal/sync` (NMTL_DIR/sync since flame/0013; the
+host test's own directory on a Mac) makes every commit wait for completion; `NEGRONIMETAL_DEFER_SCHEDULED=1` keeps the
+scheduled handlers until completion.
 
 ### Idle load knobs and measurement (flame/0010, scripts/metal/idle-stats.sh)
 * `NEGRONIMETAL_SURFACE_FLUSH=0|1` (env file): the per-command-buffer CPU cache invalidate (`dc civac`) over every
@@ -197,3 +205,64 @@ The installed **XNUtils** app (`/Applications/XNUtils.app`) displays:
 * Hardware Acceleration status
 * Supported Metal Feature Sets and VRAM limits
 * Quick power controls (Reboot to Bootloader, Restart System, Shut Down)
+
+---
+
+## 4. On-phone test plan (2026-10-26, audit follow-up; the phone ran Android when this was written)
+
+Inputs: Metal bundle `out/metal/stage` (NegroniMetal sha256 7473f41b99b41c4faca0ec957084b3bb1f9010cbd4fd72e55f2be4dfa35ed628, flame/0001-0013, dSYM
+`out/metal/NegroniMetal.dSYM`), GL stage `out/gpu/stage` (2026-10-26, `RedwoodWaitsForGPU` check), kernel image
+`out/ios16-gl2` (0289). Every step: start `make usblog` first (kernel log in `logs/usblog-*.txt`), and keep
+`scripts/net/phone-log.sh tail` running in a second tmux window for the crash reports. Mark each result in docs/notes.md
+with [V] and the time.
+
+1. **Boot `out/ios16-gl2` with the current Metal bundle.** `scripts/flash/ios16.sh` with `IOS16_OUT=out/ios16-gl2`
+   (after the charge and the userdata step of docs/plan.md "Next"). Then `scripts/metal/phone-test.sh push`, then
+   `scripts/net/ssh-phone.sh "rm -f /private/var/db/negronimetal/strikes/*; echo '*' > /private/var/db/negronimetal/clients"`.
+   Read in usblog: `RedwoodGPU: registered (the IOSurface lock waits up to 50 ms for the GPU)` (0289 in), then the
+   `NMTL[... backboardd]: device opened` and `native-metal: Metal protocols adopted by 20 of 20 frontend classes` lines.
+   Pass: backboardd and SpringBoard stay up 3 min (`CRASH` lines in usblog: none for them).
+2. **AegirPoster abort reason** (audit 1.1, row 1). Within the first 2 min after SpringBoard is up, run
+   `scripts/net/ssh-phone.sh "grep -a 'uncaught exception' /private/var/db/negronimetal/metal.log"`. Expected: one
+   `NMTL[pid AegirPoster]: uncaught exception NAME: REASON` line with up to 10 frames (flame/0012 logger). Record NAME,
+   REASON and the first frame in notes.md; that names the selector or nil answer to fix next. If there is no such line
+   but usblog has `CRASH AegirPoster ... sig 6`, read `scripts/net/ssh-phone.sh "tail -n 40
+   /private/var/db/negronimetal/pipelines.log"` and the `MISSING` lines of metal.log (`grep -a MISSING`).
+3. **SpringBoard restart + Siri orb on flame/0012** (row 2). `scripts/gpu/phone-gl.sh restart` (kills backboardd; SpringBoard restarts with it), wait for the home screen,
+   press the side button for Siri. Pass: usblog shows no `CRASH SpringBoard`, the orb animates; metal.log has no new
+   `MISSING` line for SpringBoard. Fail: the `MISSING ... (answered nil)` line names the next MPS selector, or a
+   `commandBuffer does not conform` stderr line means the protocol adoption did not take.
+4. **FitnessWidget jetsam A/B** (row 3). `scripts/net/ssh-phone.sh "printf '*\n-FitnessWidget\n' >
+   /private/var/db/negronimetal/clients"`, then restart SpringBoard as in step 3. Read usblog for 2 min: with
+   `-FitnessWidget` there must be no `CRASH FitnessWidget ... sig 9` (jetsam ns 1 code 7). Then put `*` back and restart
+   again: the crash returns 0.3 s after `NMTL[pid FitnessWidget]: device opened`. Both results together prove the
+   plugin's footprint is the cause (fix candidates: a per-process cap or a lazy Turnip load for widget extensions).
+5. **WebKit GPU-process crash with a dSYM** (row 4). clients = `*` (the GPU process is `com.apple.WebKit.GPU`). In
+   Safari open a WebGL page (for example `https://get.webgl.org`, then `https://webglsamples.org/aquarium/aquarium.html`).
+   Watch usblog for `CRASH com.apple.WebKit.GPU ... sig 11` with `far` in a guard page and a `lr` inside NegroniMetal; the
+   `images NegroniMetal 0x... text 0x...` line of that process in metal.log gives the load address. On the Mac:
+   `atos -o out/metal/NegroniMetal.dSYM/Contents/Resources/DWARF/NegroniMetal -arch arm64 -l TEXT_BASE PC LR`. Record the
+   function; the audit's candidates are a `char *` to a stack buffer kept by a dispatch source in the frontend's journal/log
+   path. Pass without a crash: the page renders for 2 min and the GPU process pid does not change (`ps -A | grep WebKit.GPU`).
+6. **GL A/B on backboardd with kernel 0257 + 0289** (row 6; `out/ios16-gl2` has both). First switch Metal off for
+   backboardd: `scripts/net/ssh-phone.sh "printf '*\n-backboardd\n' > /private/var/db/negronimetal/clients"`. Then
+   `scripts/gpu/phone-gl.sh push`, `scripts/gpu/phone-gl.sh backboardd`, `scripts/gpu/phone-gl.sh on`,
+   `scripts/gpu/phone-gl.sh restart`. Read `scripts/gpu/phone-gl.sh log` and usblog. Pass: `negronigl: preflight PASS
+   renderer=FD730 ...`, `negronigl: flush = glFlush + kernel fence (default: RedwoodWaitsForGPU)`, a `NEGRONI SURF: wrap
+   client memory sel 6: ...` line, no `IOSurface wrap of client memory refused` line, no backboardd `CRASH ... far 0x30`,
+   and the home screen is drawn (presents in `NEGRONI FB STAT`). Fail cases: a far 0x30 crash = 0257 did not take; a
+   `flush = glFinish (the kernel has no RedwoodWaitsForGPU ...)` line = the kernel is not 0289. Back: `phone-gl.sh off`,
+   `phone-gl.sh restore`, clients `*`, `phone-gl.sh restart`.
+7. **flame/0011 on the phone** (row 7). `scripts/net/ssh-phone.sh "/usr/local/bin/mslprobe"` (front end only, no device:
+   pass = a metallib size line, no `died in the MSL front end`), then `scripts/net/ssh-phone.sh "/usr/local/bin/metalprobe
+   --compute --render"` (pass = `PASS compute`, `PASS render`; metal.log `newLibraryWithSource #1: ... in process[, driver
+   flags] in T ms` says which option form the 20H392 front end took). Then in Safari a WebGPU page (for example
+   `https://webgpu.github.io/webgpu-samples/?sample=helloTriangle`; WebGPU must be on in Settings > Safari > Advanced >
+   Feature Flags). Pass: the triangle, no `CRASH com.apple.WebKit.GPU`; `grep -a 'executeCommandsInBuffer' metal.log` empty
+   (a hit = the ICB item of section 3 is needed). A `strikes/msl-com.apple.WebKit.GPU` file left behind = the front end
+   crashed the GPU process: read the CRASH line and `rm` the file to re-arm.
+8. **0289 on a CPU reader.** Take a screenshot (side + volume up) with Metal on: the Photos thumbnail must show the
+   current screen, not an older frame; usblog may show at most a few `NEGRONI SURF: ... not done after 50 ms` lines.
+   Repeat with `negronisurf_gpuwait=0` (rebuild `out/ios16-gl2` with `BOOTARGS_ADD="negronisurf_gpuwait=0 negronipanic=30
+   negronipanicreason=2" scripts/gpu/build-test-image.sh`): `ioreg -l | grep RedwoodWaitsForGPU` shows `No` and the GL log
+   says `flush = glFinish`.

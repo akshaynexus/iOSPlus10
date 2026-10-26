@@ -1,0 +1,35 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (on top of flame/0001-0012), applied by scripts/metal/fetch-sources.sh:
+the NEGRONIMETAL_SYNC file switch of flame/0005 reads NMTL_DIR "/sync" instead of the hard-coded
+"/private/var/db/negronimetal/sync". NMTL_DIR is the plugin's gate directory (/var/db/negronimetal on the phone, the same
+directory the plugin's off/clients/env/strikes files use; /var is /private/var there); the host test
+(scripts/metal/host-plugin-test.sh) builds the frontend with its own NMTL_DIR, so its `sync` file is now the one under its
+work directory, like every other control file (audit docs/audit/2026-10-26-metal-gl.md section 3.1, row 0005). No
+behaviour change on the phone. One comment line at the commit path names both switches.
+
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index 19440f5..3dd5185 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -1293,10 +1293,12 @@ - (void)commit {
+   void *context=(__bridge_retained void *)self;
+   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
+      nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
++   // NegroniMetal (flame/0005, path from flame/0013): NEGRONIMETAL_SYNC=1 or the file NMTL_DIR/sync (the host test's own directory
++   // on a Mac, /var/db/negronimetal on the phone) makes every commit wait for completion.
+    static int syncCommit = -1;
+    if(syncCommit < 0) {
+     const char *env = getenv("NEGRONIMETAL_SYNC");
+-    syncCommit = (env && env[0] == '1') || access("/private/var/db/negronimetal/sync", F_OK) == 0;
++    syncCommit = (env && env[0] == '1') || access(NMTL_DIR "/sync", F_OK) == 0;
+    }
+    if(syncCommit == 1) {
+     [self waitUntilCompleted];
+@@ -1321,7 +1323,7 @@ - (void)waitUntilScheduled {
+  static int sync = -1;
+  if(sync < 0) {
+   const char *env = getenv("NEGRONIMETAL_SYNC");
+-  sync = (env && env[0] == '1') || access("/private/var/db/negronimetal/sync", F_OK) == 0;
++  sync = (env && env[0] == '1') || access(NMTL_DIR "/sync", F_OK) == 0;
+  }
+  if(sync == 1) {
+   [self waitUntilCompleted];

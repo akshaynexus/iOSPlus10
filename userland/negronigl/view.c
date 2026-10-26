@@ -23,8 +23,11 @@
  * section 8). The ring is in order, so a process that samples the surface later (backboardd) is ordered
  * behind the render too. glFinish comes back (the ios-spes default) with NEGRONIGL_FINISH=1, or the
  * file /var/db/negronigl/finish, or (NegroniGL.bundle, readable by sandboxed apps) BUNDLE/finish;
- * NEGRONIGL_FINISH=0 wins over the files. Needed with a kernel older than 0254, or when a CPU reads
- * the surfaces (the kernel's IOSurface lock does not wait for the GPU fence yet).
+ * NEGRONIGL_FINISH=0 wins over the files. Without any of them the kernel decides (2026-10-26, patch
+ * 0289): RedwoodGPU's property RedwoodWaitsForGPU = true says the IOSurface CPU lock waits for the
+ * surface's GPU fence (the ios-spes/HackiOS `display_waits()` contract), so glFlush is enough for the
+ * display chain (0254) and for a CPU reader (a snapshot, CA's CPU fallback); a kernel without the
+ * property (older than 0289) gets glFinish.
  *
  * Rule: never crash the caller. A NULL pointer or a bad surface fails with false (EAGL returns NO).
  * [I] begin_iosurface can wait for a free drawable (CA's drawable timeout), as with Apple's GL.
@@ -89,7 +92,11 @@ want_finish(const char **why)
 		*why = path;
 		return 1;
 	}
-	*why = "default";
+	if (!ngl_drm_kernel_waits_for_gpu()) {
+		*why = "the kernel has no RedwoodWaitsForGPU (older than 0289): the IOSurface lock does not wait for the GPU";
+		return 1;
+	}
+	*why = "default: RedwoodWaitsForGPU";
 	return 0;
 }
 

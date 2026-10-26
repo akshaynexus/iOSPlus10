@@ -1013,7 +1013,9 @@ static void watchdog_start(void)
 			 * crash loop), and an Adreno cannot sample that layout anyway. Off: CA decodes those images into plain textures.
 			 * 20H392: CA::Render::create_image reads getenv("CA_USE_CGTEXTUREDATA") once, at its first image, atoi != 0 = on,
 			 * unset = on (QuartzCore 0x188316d38) [V]. Set before the device is returned; an earlier image keeps CA's value [I].
-			 * An NMTL_DIR/env line wins (overwrite 0). CI_USE_MTL_DAG_FOR_CIKL_SRC is not in the 20H392 cache [V]: not set.
+			 * An NMTL_DIR/env line wins (overwrite 0). CI_USE_MTL_DAG_FOR_CIKL_SRC=0 is set here too (and in nmtl_error_mode
+			 * and the open path): the string is not in the 20H392 cache [V], so it changes nothing on this build; it stays
+			 * for a CoreImage that reads it (Chlorophyll's SBRendererService crash) and costs one setenv.
 			 */
 			setenv("CA_USE_CGTEXTUREDATA", "0", 0);
 			setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);

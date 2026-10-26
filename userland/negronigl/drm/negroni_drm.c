@@ -184,6 +184,24 @@ wanted_abi(void)
 	return NGL_ABI_DEFAULT;
 }
 
+bool
+ngl_drm_kernel_waits_for_gpu(void)
+{
+	static int answer = -1;   /* -1: not read yet */
+	if (answer < 0) {
+		io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(NGL_GPU_SERVICE));
+		if (svc == IO_OBJECT_NULL) {
+			return false;         /* RedwoodGPU not up yet: ask again later */
+		}
+		CFTypeRef prop = IORegistryEntryCreateCFProperty(svc, CFSTR("RedwoodWaitsForGPU"), kCFAllocatorDefault, 0);
+		answer = prop != NULL && CFGetTypeID(prop) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)prop);
+		if (prop)
+			CFRelease(prop);
+		IOObjectRelease(svc);
+	}
+	return answer == 1;
+}
+
 /* lock held */
 static void
 connect_dev(void)

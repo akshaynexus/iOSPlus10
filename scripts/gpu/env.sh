@@ -14,6 +14,9 @@ HACKIOS_PATCHES="freedreno-darwin ir3-round-default ir3-shift-split ir3-ssbo-sub
 
 IOS_MIN=${IOS_MIN:-16.0}
 NGL=$REPO/userland/negronigl            # our sources
+# The one Turnip-on-Darwin patch (userland/turnip owns it; scripts/gpu/turnip-build.sh applies every patch of that
+# directory). The GL tree gets this one too, so both trees carry the same Darwin changes (meson.build, tu_knl.cc).
+TURNIP_DARWIN_PATCH=$REPO/userland/turnip/mesa-patches/0001-turnip-darwin.patch
 G=$OUT/gpu                               # all build products
 DL=$G/dl                                 # downloaded archive (untrusted until the hash matches)
 MESA_SRC=$G/mesa-$MESA_VERSION           # patched Mesa tree

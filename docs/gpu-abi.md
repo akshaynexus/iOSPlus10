@@ -304,6 +304,16 @@ With 0254 no frame is copied or flipped before its fence is done (README-gpu-ker
 this means: import the framebuffer (0x7e or scalar 12), render, submit, then let CoreAnimation swap;
 nothing else. Do not CPU-write a framebuffer after the GPU rendered into it (section 6).
 
+CPU readers (patch 0289, 2026-10-26): the IOSurface lock trap (IOSurfaceRoot trap 2, `IOSurfaceLock`) waits for
+the surface's last submission (`gpuFence`) up to `negronisurf_gpuwait` ms (default 50; a stopped GPU is not waited
+for; a wait that runs out is logged `NEGRONI SURF: <proc> lock of surface N: the GPU (fence F) is not done after
+50 ms: answered anyway`, 8 times) and drops the CPU's cached lines when the user mapping is cached (slot, wrapped
+and physical surfaces; created surfaces are write-combined and need no drop), once per fence value. RedwoodGPU
+publishes the IORegistry property `RedwoodWaitsForGPU` (true unless `negronisurf_gpuwait=0`) and logs
+`RedwoodGPU: registered (the IOSurface lock waits up to 50 ms for the GPU)`: a GL/Metal library reads the property
+and trusts `glFlush` / `commit` + the lock instead of `glFinish` / `waitUntilCompleted` (the ios-spes/HackiOS
+`display_waits()` contract; `userland/negronigl/view.c`).
+
 ## 9. Boot-args
 
 | Boot-arg | Default | Effect |
@@ -320,3 +330,4 @@ nothing else. Do not CPU-write a framebuffer after the GPU rendered into it (sec
 | `negronifb_dpuprobe=0` | 1 | do not read (log) the display engine's registers at boot |
 | `negronifb_ctl=N` | auto | the display engine's CTL for flushes (auto: the one driving DSI0, else 0) |
 | `negronifb_hz=N` | 10 | CPU presents per second (unchanged) |
+| `negronisurf_gpuwait=MS` | 50 | 0289: longest the IOSurface CPU lock waits for the surface's GPU fence (max 2000); 0 = never wait, `RedwoodWaitsForGPU` = false |

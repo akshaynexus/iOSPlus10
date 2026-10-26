@@ -20,6 +20,13 @@ bool ngl_drm_info(struct ngl_gpu_info *info);
 int ngl_drm_import_surface(uint32_t surface, uint32_t *handle, uint64_t *size);
 
 /*
+ * The kernel's IOSurface CPU lock waits for the surface's GPU fence (RedwoodGPU property
+ * RedwoodWaitsForGPU = true, patch 0289): glFlush + the kernel fence is enough for every reader.
+ * false: no RedwoodGPU yet, or a kernel without 0289 (view.c then uses glFinish). Read once.
+ */
+bool ngl_drm_kernel_waits_for_gpu(void);
+
+/*
  * One log line. NEGRONIGL_LOG: "console" (default: /dev/console, the kernel console = serial/USB
  * live log), "oslog", "stderr", "none", or a file path to append to. os_log gets every line too.
  */

@@ -147,7 +147,7 @@ the selector table:
 | `/System/Library/Extensions/NegroniMetal.bundle/{NegroniMetal,Info.plist,libvulkan_freedreno.dylib}` | the plugin + Turnip |
 | `/var/db/negronimetal/clients` | processes that get a device; default `metalprobe m2vtest` |
 | `/var/db/negronimetal/off` | exists = no device for anyone |
-| `/var/db/negronimetal/env` | KEY=VALUE for the plugin's processes (TU_DEBUG, MESA_LOG_FILE, METAL2VULKAN_*; `NEGRONIMETAL_OPEN_MS` = open + self-test deadline, default 6000; `NEGRONIMETAL_SELFTEST=0` skips the IOSurface clear self-test) |
+| `/var/db/negronimetal/env` | KEY=VALUE for the plugin's processes (TU_DEBUG, MESA_LOG_FILE, METAL2VULKAN_*; `NEGRONIMETAL_OPEN_MS` = open + self-test deadline, default 20000; `NEGRONIMETAL_SELFTEST=0` skips the IOSurface clear self-test) |
 | `/var/db/negronimetal/telemetry` | exists = backboardd writes the frontend's counters to metal.log every 10 s |
 | `/var/db/negronimetal/strikes/<proc>` | dead-man counter (2 = disabled for that process) |
 | `/var/db/negronimetal/cache/<proc>/` | metal2vulkan + Turnip pipeline caches |

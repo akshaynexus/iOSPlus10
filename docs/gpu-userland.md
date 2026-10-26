@@ -11,7 +11,7 @@ later Metal-on-Vulkan work.
 |---|---|
 | Mesa | 25.0.7, SHA-256 `592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6` |
 | HackiOS Darwin patches | `oosexgang/hackios-xnu-userland` `b4c5513e2df93689895d21fd3b93b723a7bcfdd3`, MIT: `freedreno-darwin`, `ir3-round-default`, `ir3-shift-split`, `ir3-ssbo-subdword` |
-| Local Mesa patches | `0001-negronigl-target.patch`, `0002-turnip-darwin.patch` |
+| Local Mesa patches | `userland/negronigl/mesa-patches/0001-negronigl-target.patch`, then `userland/turnip/mesa-patches/0001-turnip-darwin.patch` (the one Turnip-on-Darwin patch, shared with `scripts/gpu/turnip-build.sh`; the GL tree's own copy `0002-turnip-darwin.patch` was removed on 2026-10-26: it had drifted and the GL build does not build Turnip) |
 | Cross toolchain | Xcode 27.1 iPhoneOS SDK, `-target arm64-apple-ios16.0`, Meson 1.7.2, Ninja 1.13.2, Homebrew Bison 3.8.2 and glslang 16.6.0 |
 
 ## Build on macOS
@@ -83,11 +83,11 @@ the GLI plugin (`plugin/gli_view.c` gliBindViewES: the drawable IOSurface become
 storage via `surface.c`; since 2026-10-26 the code is `view.c`, shared with the dylib's shim); CoreAnimation's private `attachImage:toCoreSurface:invertedRender:` and
 `texImageIOSurface:` paths use the imported texture resource. Not run on the phone.
 
-**No phone test has been run.** The kernel GPU service, its IOSurface import behavior, cache
-coherency, fence sequence behavior, CA framebuffer rendering, and backboardd injection must still
-be verified on the device. The userland build alone does not prove the GPU path works. The kernel
-ABI is described in `userland/negronigl/drm/ngl_abi.h`; `docs/gpu-abi.md` is maintained by the kernel
-GPU work and was not present when this userland change was prepared.
+**Phone status (2026-10-26):** `ngl_test` passed on the phone on 2026-10-25 23:35 ("Device testing over SSH" below:
+`GL_RENDERER FD730`, triangle and IOSurface selftests PASS), so the kernel GPU service, the IOSurface import and the
+fence path work for a test process. Still unverified on the device: backboardd on GL past CoreAnimation's first frame
+(kernel 0257 and the eagl.c guard are built, not run), the NegroniGL.bundle GLI route for apps, `ngl_test --layer`.
+The kernel ABI is in `userland/negronigl/drm/ngl_abi.h` and `docs/gpu-abi.md`.
 
 ## Device testing over SSH
 
@@ -124,7 +124,7 @@ What spes does (compact):
 | EAGL bridge = HackiOS `userland/src/eagl.c` (ObjC method replacement on EAGLContext) + `gl_osmesa.c` over `libOSMesa.8.dylib` (Mesa 25.0.7, freedreno msm, redwood-drm) | `tools/build-spes-eagl-macos.sh`, `tools/build-spes-mesa-macos.sh` | `userland/negronigl/eagl.c` + `negronigl.c` (one dylib with Mesa linked in, our `drm/negroni_drm.c`); built by `scripts/gpu/build.sh` |
 | preflight before any method is replaced: boot-arg `spesgpu=1`, wait 30 s for `RedwoodGPU`, ES 3.0 context, renderer must say FD610, green triangle on blue read back; else "keeping Apple methods" | `xnu/graphics/spes_gl_preflight.c` | `ngl_preflight()` in `negronigl.c`: gate file instead of the boot-arg, wait `NEGRONIGL_WAIT` s (30), renderer must say `FD730`, `ngl_selftest()` (red triangle, FBO) and `ngl_surface_selftest()` (BGRA IOSurface) must PASS |
 | attachImage fills the mirrored target by a GPU blit instead of a CPU hash+upload; BGRA refills by `glTexSubImage2D` | `tools/eagl-attach-gpu.patch` | not needed: our `surface.c` binds the IOSurface itself as the GL resource (import by IOSurface ID, selector 0x7e), there is no mirror copy |
-| `glFlush` = finish, because the display swaps without waiting for the GPU; `RedwoodWaitsForGPU` property lets the bridge skip it | HackiOS eagl.c `display_waits()`, spes 0102 | `ngl_h_Flush` = `ngl_flush()` (view.c): `glFlush`; the kernel marks the IOSurfaces of the submission with its fence and the display waits on the fence recorded at SwapEnd (0254). `glFinish` with `NEGRONIGL_FINISH=1` or the file `finish` ("Flush and fences" below) |
+| `glFlush` = finish, because the display swaps without waiting for the GPU; `RedwoodWaitsForGPU` property lets the bridge skip it | HackiOS eagl.c `display_waits()`, spes 0102 | `ngl_h_Flush` = `ngl_flush()` (view.c): `glFlush` when RedwoodGPU publishes `RedwoodWaitsForGPU` (kernel 0289: the IOSurface CPU lock waits for the surface's fence; the display waits on the fence recorded at SwapEnd, 0254), else `glFinish`. `glFinish` also with `NEGRONIGL_FINISH=1` or the file `finish` ("Flush and fences" below) |
 | bank layout: `highest_bank_bit = 14` for chip 0x06010001 | `build-spes-mesa-macos.sh` PYBANK | A730 (0x07030001) keeps Mesa's 16 (notes 16); `FD_MESA_DEBUG=sysmem` (spes: `sysmem,noubwc`) |
 
 Differences for the A730: chip id 0x07030001 (FD730, a7xx gen1), our msm-style ABI in `negroni_drm.c`
@@ -219,8 +219,16 @@ contexts, and flush no longer finishes: next section.)
   kernel (0230) sets `gpuFence` of each imported surface in that list to the submission's fence. 0254 records that
   fence at SwapEnd and shows the frame only when it is done (docs/gpu-abi.md section 8).
 - A later reader on the GPU (backboardd sampling an app's surface) is behind the render on the same ring.
-- Not covered [I]: a CPU reader of a GPU-written surface (`IOSurfaceLock` + read): the kernel's lock does not wait for
-  `gpuFence` yet. CA's own frames do not need it; the kernel item is in the report below (notes.md 15a).
+- CPU readers (`IOSurfaceLock` + read: snapshots, CA's CPU fallback, a CPU-composited backboardd sampling an app's
+  surface): kernel patch 0289 (2026-10-26, built into `out/ios16-gl2`, not booted) makes the IOSurface lock trap wait
+  for the surface's `gpuFence` (up to `negronisurf_gpuwait` ms, default 50; a stopped GPU is not waited for) and drop
+  the cached lines of a cached mapping, once per fence value. RedwoodGPU then publishes `RedwoodWaitsForGPU = true`.
+  `view.c` reads that property once per process (`ngl_drm_kernel_waits_for_gpu`): a kernel without it (older than
+  0289) gets `glFinish` on every flush, logged as `negronigl: flush = glFinish (the kernel has no RedwoodWaitsForGPU
+  ...)`; with it, `flush = glFlush + kernel fence (default: RedwoodWaitsForGPU)`. Build 2026-10-26 (`gl-build`, exit
+  0): stripped `negronigl.dylib` 14,233,360 bytes (sha256 38af4413...), `NegroniGL` 13,777,152 (90fc522a...), `ngl_test`
+  50,496 (8f7d3778..., unchanged), check-imports PASS (0 missing); the GL tree now carries `userland/turnip`'s
+  `0001-turnip-darwin.patch` (stamp `turnip 0001-turnip-darwin.patch 4ea756a5`).
 - `glFinish` comes back with `NEGRONIGL_FINISH=1` (environment), the file `/var/db/negronigl/finish`, or
   `NegroniGL.bundle/finish` (readable by sandboxed apps); `NEGRONIGL_FINISH=0` wins over the files.
   `scripts/gpu/phone-gl.sh finish on|off` writes both files. Use it with a kernel older than 0254. Read once per

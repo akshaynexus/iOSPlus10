@@ -7,10 +7,14 @@
 set -eu
 . "$(cd "$(dirname "$0")" && pwd)/env.sh"
 
-PATCH_HASH=$(shasum -a 256 "$NGL/mesa-patches/0002-turnip-darwin.patch" | awk '{print substr($1,1,16)}')
-if [ ! -f "$MESA_SRC/NEGRONIGL-SOURCE" ] || ! grep -q "0002-turnip-darwin.patch $PATCH_HASH" "$MESA_SRC/NEGRONIGL-SOURCE"; then
-	"$REPO/scripts/gpu/mesa-fetch.sh"
-fi
+# the tree is made again when a patch it was made from changed (the stamp lists each patch's hash)
+need_fetch=0
+[ -f "$MESA_SRC/NEGRONIGL-SOURCE" ] || need_fetch=1
+for p in "$NGL"/mesa-patches/*.patch "$TURNIP_DARWIN_PATCH"; do
+	h=$(shasum -a 256 "$p" | awk '{print substr($1,1,16)}')
+	grep -q "$(basename "$p") $h" "$MESA_SRC/NEGRONIGL-SOURCE" 2>/dev/null || need_fetch=1
+done
+[ "$need_fetch" = 0 ] || "$REPO/scripts/gpu/mesa-fetch.sh"
 "$REPO/scripts/gpu/sync-target.sh"
 # configure again when the meson options change (the stamp = hash of mesa-setup.sh)
 SETUP_HASH=$(shasum -a 256 "$REPO/scripts/gpu/mesa-setup.sh" | cut -c1-16)
