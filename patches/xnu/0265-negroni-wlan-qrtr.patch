@@ -1,0 +1,584 @@
+0265-negroni-wlan-qrtr: Wi-Fi level 5 (negroniwlan=5), QRTR over the MHI IPCR channels 20/21.
+New bsd/dev/negroni_wlan_qrtr.{c,h}: QRTR v1/v2 packet decoder with a bounds check on every length
+(af_qrtr.c qrtr_endpoint_post rules), v1 encoder (src node 1, port CTRL / 0x4000), an 8 x 8 KiB RX
+queue filled by the channel-21 callback and drained by negroni_wlan_qrtr_pump, RESUME_TX when the
+chip sets confirm_rx, a server table from NEW_SERVER / DEL_SERVER, BYE handling.
+Step 16 "QRTR HELLO": HELLO to node BCAST (node id still unknown, af_qrtr.c qrtr_hello_work) port
+CTRL, wait for the chip's HELLO ("step 16 QRTR HELLO from node N"). Step 17 "WLFW service lookup":
+wait for NEW_SERVER service 0x45 version 1, any instance ("step 17 WLFW service at node N port P").
+Details: patches/xnu/README-wifi.md "0265".
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 446de80..efcf213 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/negroni_cpufreq.c		standard
+ bsd/dev/negroni_adreno.c		standard
+ bsd/dev/negroni_wifi.c			standard
+ bsd/dev/negroni_wlan.c			standard
++bsd/dev/negroni_wlan_qrtr.c		standard
+ bsd/dev/negroni_wlan_bhi.c		standard
+ bsd/dev/negroni_wlan_mhi.c		standard
+ bsd/dev/negroni_adsp.c			standard
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index 5442901..5bd87f6 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -29,6 +29,7 @@
+ #include <stdarg.h>
+ #include "negroni_wlan.h"
+ #include "negroni_wlan_mhi.h"
++#include "negroni_wlan_qrtr.h"
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+@@ -743,10 +744,26 @@ wlan_level_amss(void)
+ 	return 0;
+ }
+ 
++/* ---- level 5: steps 16-17 (0265: QRTR over IPCR, the chip's name service, the WLFW server) ---- */
++static int
++wlan_level_qrtr(void)
++{
++	int error;
++
++	negroni_wlan_step(16, "QRTR HELLO");
++	error = negroni_wlan_qrtr_hello(&H);
++	if (error) {
++		return error;
++	}
++	negroni_wlan_step(17, "WLFW service lookup");
++	return negroni_wlan_qrtr_find_wlfw(&H);
++}
++
+ static int (*const wlan_levels[WLAN_LEVEL_MAX + 1])(void) = {
+ 	[WLAN_LEVEL_SBL] = wlan_level_sbl,
+ 	[WLAN_LEVEL_MHI] = wlan_level_mhi,
+ 	[WLAN_LEVEL_AMSS] = wlan_level_amss,
++	[WLAN_LEVEL_QRTR] = wlan_level_qrtr,
+ };
+ 
+ /*
+@@ -780,6 +797,7 @@ wlan_run(void)
+ 	if (g_master || g_bar0) {
+ 		wlan_quiesce(&P);       /* before the pool goes back to the VM: no DMA after this */
+ 	}
++	negroni_wlan_qrtr_detach(&H);   /* 0265: no RX callback into the freed buffers */
+ 	wlan_cleanup();
+ 	return error;
+ }
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index b9c796d..8e555cc 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -162,13 +162,15 @@ struct mhi_host {
+  *   2  steps 1-8:   BAR0, firmware, DMA pool, SMMU/clock check, PBL, BHI SBL download
+  *   3  steps 9-12:  MHI READY, MMIO contexts, M0 + device wake, EE SBL
+  *   4  steps 13-15: BHIe full image, EE AMSS (mission), IPCR channels 20/21
++ *   5  steps 16-17: QRTR HELLO, WLFW service lookup (0265, negroni_wlan_qrtr.c)
+  * Each step prints "NEGRONI WLAN: step N NAME" before it starts and, on an error,
+  * "NEGRONI WLAN: step N NAME failed: REASON". Every wait has a time-out (negroniwlan_to).
+  */
+ #define WLAN_LEVEL_SBL          2
+ #define WLAN_LEVEL_MHI          3
+ #define WLAN_LEVEL_AMSS         4
+-#define WLAN_LEVEL_MAX          4       /* the highest level this build implements */
++#define WLAN_LEVEL_QRTR         5       /* 0265 */
++#define WLAN_LEVEL_MAX          5       /* the highest level this build implements */
+ /* level 4 (0264) also posts the RX buffers on channel 21 (cnss2 auto_queue, pci.c:181) */
+ 
+ void negroni_wlan_step(uint32_t n, const char *name);
+diff --git a/bsd/dev/negroni_wlan_qrtr.c b/bsd/dev/negroni_wlan_qrtr.c
+new file mode 100644
+index 0000000..dfe107d
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_qrtr.c
+@@ -0,0 +1,389 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi, level 5 (patch 0265): QRTR over the MHI IPCR channels.
++ * Channel 20 carries host -> chip packets, channel 21 chip -> host (0264). One MHI transfer is
++ * one QRTR packet (Linux net/qrtr/mhi.c qcom_mhi_qrtr_send / dl_callback).
++ *
++ *   step 16  QRTR HELLO:          we send HELLO (v1 header, src node 1 port CTRL, dst node
++ *                                 BCAST until the chip's node is known, af_qrtr.c qrtr_hello_work
++ *                                 + qrtr_node_enqueue); the chip answers HELLO from its node.
++ *   step 17  WLFW service lookup: the chip's name service sends NEW_SERVER for each service;
++ *                                 we wait for service 0x45 version 1 (any instance) and keep its
++ *                                 node and port (the QMI WLFW server, cnss2 qmi.c:3292).
++ *
++ * Every field the chip sends is checked before use (negroni_qrtr_parse follows the rules of
++ * af_qrtr.c qrtr_endpoint_post). Received packets are copied out of the RX buffer by the MHI
++ * poller (rx_cb, which must not send) and handled later by negroni_wlan_qrtr_pump.
++ * Wire format read from Linux net/qrtr (GPL-2.0); this is our own code. UNTESTED ON HARDWARE.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include "negroni_wlan_mhi.h"
++#include "negroni_wlan_qrtr.h"
++
++struct qrtr_state negroni_qrtr;
++
++/* RX queue: filled by rx_cb (inside negroni_wlan_mhi_poll), drained by negroni_wlan_qrtr_pump */
++static uint8_t g_rxq[QRTR_RXQ_N][QRTR_RXQ_LEN];
++static uint32_t g_rxq_len[QRTR_RXQ_N];
++static uint32_t g_rxq_head, g_rxq_count;
++static uint8_t g_txb[WLAN_TX_LEN];      /* one packet being sent (send is never re-entered) */
++
++static inline uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static inline uint32_t
++le16(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++static inline void
++put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++int
++negroni_qrtr_parse(const uint8_t *b, uint32_t len, struct qrtr_pkt *o)
++{
++	uint32_t hdrlen;
++
++	memset(o, 0, sizeof(*o));
++	if (!b || len == 0 || (len & 3)) {
++		return EBADMSG;
++	}
++	o->version = b[0];      /* v1: le32 version, low byte first; v2: u8 version */
++	if (o->version == QRTR_PROTO_VER_1) {
++		if (len < QRTR_HDR_V1_LEN) {
++			return EBADMSG;
++		}
++		o->type = le32(b + 4);
++		o->src_node = le32(b + 8);
++		o->src_port = le32(b + 12);
++		o->confirm_rx = le32(b + 16) != 0;
++		o->size = le32(b + 20);
++		o->dst_node = le32(b + 24);
++		o->dst_port = le32(b + 28);
++		hdrlen = QRTR_HDR_V1_LEN;
++	} else if (o->version == QRTR_PROTO_VER_2) {
++		if (len < QRTR_HDR_V2_LEN) {
++			return EBADMSG;
++		}
++		o->type = b[1];
++		o->confirm_rx = (b[2] & QRTR_FLAGS_CONFIRM_RX) != 0;
++		hdrlen = QRTR_HDR_V2_LEN + b[3];        /* optlen */
++		o->size = le32(b + 4);
++		o->src_node = le16(b + 8);
++		o->src_port = le16(b + 10);
++		o->dst_node = le16(b + 12);
++		o->dst_port = le16(b + 14);
++		if (o->src_port == (QRTR_PORT_CTRL & 0xffff)) {
++			o->src_port = QRTR_PORT_CTRL;
++		}
++		if (o->dst_port == (QRTR_PORT_CTRL & 0xffff)) {
++			o->dst_port = QRTR_PORT_CTRL;
++		}
++	} else {
++		return EBADMSG;
++	}
++	if (o->dst_port == QRTR_PORT_CTRL_LEGACY) {
++		o->dst_port = QRTR_PORT_CTRL;
++	}
++	/* size != 0, inside the buffer, and the buffer is exactly header + size padded to 4 */
++	if (hdrlen > len || o->size == 0 || o->size > len - hdrlen || ((o->size + 3u) & ~3u) != len - hdrlen) {
++		return EBADMSG;
++	}
++	if ((o->type == QRTR_TYPE_NEW_SERVER || o->type == QRTR_TYPE_DEL_SERVER ||
++	    o->type == QRTR_TYPE_RESUME_TX || o->type == QRTR_TYPE_DEL_CLIENT) && o->size < QRTR_CTRL_LEN) {
++		return EBADMSG;
++	}
++	if (o->type != QRTR_TYPE_DATA && o->type != QRTR_TYPE_RESUME_TX && o->dst_port != QRTR_PORT_CTRL) {
++		return EBADMSG;
++	}
++	o->payload = b + hdrlen;
++	return 0;
++}
++
++/* MHI channel 21 callback (inside negroni_wlan_mhi_poll): copy the packet out, nothing else. */
++static void
++qrtr_rx_cb(__unused struct mhi_host *h, const void *data, uint32_t len)
++{
++	if (len == 0 || len > QRTR_RXQ_LEN || g_rxq_count == QRTR_RXQ_N) {
++		if (negroni_qrtr.rx_drop++ < 4) {
++			printf("NEGRONI WLAN: QRTR packet of %u bytes dropped (%s)\n", len,
++			    g_rxq_count == QRTR_RXQ_N ? "queue full" : "size");
++		}
++		return;
++	}
++	uint32_t slot = (g_rxq_head + g_rxq_count) % QRTR_RXQ_N;
++
++	memcpy(g_rxq[slot], data, len);
++	g_rxq_len[slot] = len;
++	g_rxq_count++;
++}
++
++void
++negroni_wlan_qrtr_attach(struct mhi_host *h)
++{
++	if (!negroni_qrtr.attached) {
++		memset(&negroni_qrtr, 0, sizeof(negroni_qrtr));
++		g_rxq_head = g_rxq_count = 0;
++		negroni_qrtr.attached = true;
++	}
++	h->rx_cb = qrtr_rx_cb;
++}
++
++void
++negroni_wlan_qrtr_detach(struct mhi_host *h)
++{
++	h->rx_cb = NULL;
++	negroni_qrtr.data_cb = NULL;
++	negroni_qrtr.attached = false;
++	g_rxq_count = 0;
++}
++
++int
++negroni_wlan_qrtr_send(struct mhi_host *h, uint32_t type, uint32_t src_port, uint32_t dst_node,
++    uint32_t dst_port, const void *payload, uint32_t len)
++{
++	uint32_t padded = (len + 3u) & ~3u;
++
++	if (len == 0 || len > WLAN_TX_LEN - QRTR_HDR_V1_LEN || padded > WLAN_TX_LEN - QRTR_HDR_V1_LEN) {
++		return negroni_wlan_failed(ERANGE, "QRTR payload of %u bytes (max %u)", len,
++		           WLAN_TX_LEN - QRTR_HDR_V1_LEN);
++	}
++	put32(g_txb + 0, QRTR_PROTO_VER_1);
++	put32(g_txb + 4, type);
++	put32(g_txb + 8, QRTR_LOCAL_NODE);
++	put32(g_txb + 12, src_port);
++	put32(g_txb + 16, 0);                   /* confirm_rx: we never ask for RESUME_TX */
++	put32(g_txb + 20, len);
++	put32(g_txb + 24, dst_node);
++	put32(g_txb + 28, dst_port);
++	memcpy(g_txb + QRTR_HDR_V1_LEN, payload, len);
++	memset(g_txb + QRTR_HDR_V1_LEN + len, 0, padded - len);
++	return negroni_wlan_mhi_tx(h, g_txb, QRTR_HDR_V1_LEN + padded);
++}
++
++static int
++qrtr_send_ctrl(struct mhi_host *h, uint32_t cmd, uint32_t dst_node, uint32_t dst_port, uint32_t a, uint32_t b)
++{
++	uint8_t pkt[QRTR_CTRL_LEN];
++
++	memset(pkt, 0, sizeof(pkt));
++	put32(pkt, cmd);
++	put32(pkt + 4, a);
++	put32(pkt + 8, b);
++	return negroni_wlan_qrtr_send(h, cmd, cmd == QRTR_TYPE_RESUME_TX ? QRTR_LOCAL_PORT : QRTR_PORT_CTRL,
++	           dst_node, dst_port, pkt, sizeof(pkt));
++}
++
++static void
++qrtr_new_server(const struct qrtr_pkt *k)
++{
++	struct qrtr_server s = {
++		.service = le32(k->payload + 4), .instance = le32(k->payload + 8),
++		.node = le32(k->payload + 12), .port = le32(k->payload + 16),
++	};
++	struct qrtr_state *q = &negroni_qrtr;
++
++	for (uint32_t i = 0; i < q->nsrv; i++) {
++		if (!memcmp(&q->srv[i], &s, sizeof(s))) {
++			return;
++		}
++	}
++	if (q->nsrv < QRTR_MAX_SERVERS) {
++		q->srv[q->nsrv++] = s;
++	}
++	if (q->new_server_logged < QRTR_NEW_SERVER_LOG_MAX) {   /* the chip may send any number */
++		q->new_server_logged++;
++		printf("NEGRONI WLAN: QRTR NEW_SERVER service %#x version %u instance %u at node %u port %#x (from node %u)\n",
++		    s.service, s.instance & 0xff, s.instance >> 8, s.node, s.port, k->src_node);
++	}
++	if (s.service == WLFW_SERVICE_ID && (s.instance & 0xff) == WLFW_SERVICE_VERS && !q->wlfw_found) {
++		q->wlfw = s;
++		q->wlfw_found = true;
++		q->wlfw_gone = false;
++	}
++}
++
++static void
++qrtr_del_server(const struct qrtr_pkt *k)
++{
++	struct qrtr_server s = {
++		.service = le32(k->payload + 4), .instance = le32(k->payload + 8),
++		.node = le32(k->payload + 12), .port = le32(k->payload + 16),
++	};
++	struct qrtr_state *q = &negroni_qrtr;
++
++	for (uint32_t i = 0; i < q->nsrv; i++) {
++		if (!memcmp(&q->srv[i], &s, sizeof(s))) {
++			q->srv[i] = q->srv[--q->nsrv];
++			break;
++		}
++	}
++	printf("NEGRONI WLAN: QRTR DEL_SERVER service %#x instance %#x node %u port %#x\n", s.service,
++	    s.instance, s.node, s.port);
++	if (q->wlfw_found && !memcmp(&q->wlfw, &s, sizeof(s))) {
++		q->wlfw_gone = true;
++	}
++}
++
++static void
++qrtr_handle(struct mhi_host *h, const uint8_t *buf, uint32_t len)
++{
++	struct qrtr_state *q = &negroni_qrtr;
++	struct qrtr_pkt k;
++
++	if (negroni_qrtr_parse(buf, len, &k)) {
++		if (q->rx_bad++ < 4) {
++			printf("NEGRONI WLAN: QRTR bad packet of %u bytes ignored (first word %#x)\n", len,
++			    len >= 4 ? le32(buf) : 0);
++		}
++		return;
++	}
++	q->rx_ok++;
++	switch (k.type) {
++	case QRTR_TYPE_HELLO:
++		if (!q->hello_rx) {
++			q->hello_rx = true;
++			q->remote_node = k.src_node;
++			printf("NEGRONI WLAN: step 16 QRTR HELLO from node %u\n", k.src_node);
++			printf("NEGRONI WLAN: QRTR header v%u, HELLO src port %#x, dst node %#x port %#x\n",
++			    k.version == QRTR_PROTO_VER_1 ? 1 : 2, k.src_port, k.dst_node, k.dst_port);
++		} else if (k.src_node != q->remote_node) {
++			printf("NEGRONI WLAN: QRTR second HELLO from node %u (first node %u) ignored\n", k.src_node,
++			    q->remote_node);
++		}
++		break;
++	case QRTR_TYPE_NEW_SERVER:
++		qrtr_new_server(&k);
++		break;
++	case QRTR_TYPE_DEL_SERVER:
++		qrtr_del_server(&k);
++		break;
++	case QRTR_TYPE_BYE:
++		q->bye = true;
++		printf("NEGRONI WLAN: QRTR BYE from node %u\n", k.src_node);
++		break;
++	case QRTR_TYPE_RESUME_TX:
++		q->rx_resume++;
++		break;
++	case QRTR_TYPE_DATA:
++		if (k.dst_port != QRTR_LOCAL_PORT || !q->data_cb) {
++			if (q->rx_unrouted++ < 4) {
++				printf("NEGRONI WLAN: QRTR DATA of %u bytes from node %u port %#x to port %#x dropped\n",
++				    k.size, k.src_node, k.src_port, k.dst_port);
++			}
++			break;
++		}
++		q->rx_data++;
++		/* the sender waits for RESUME_TX (af_qrtr.c qrtr_recvmsg -> qrtr_send_resume_tx) */
++		if (k.confirm_rx) {
++			if (!qrtr_send_ctrl(h, QRTR_TYPE_RESUME_TX, k.src_node, k.src_port, QRTR_LOCAL_NODE,
++			    QRTR_LOCAL_PORT)) {
++				q->tx_resume++;
++			}
++		}
++		q->data_cb(k.src_node, k.src_port, k.payload, k.size);
++		break;
++	default:        /* DEL_CLIENT, PING, lookups: nothing for a client-only node */
++		break;
++	}
++}
++
++int
++negroni_wlan_qrtr_pump(struct mhi_host *h)
++{
++	(void)negroni_wlan_mhi_poll(h);
++	while (g_rxq_count) {
++		uint32_t slot = g_rxq_head;
++
++		/* the slot stays counted while it is handled: rx_cb (during a send) cannot reuse it */
++		qrtr_handle(h, g_rxq[slot], g_rxq_len[slot]);
++		g_rxq_head = (g_rxq_head + 1) % QRTR_RXQ_N;
++		g_rxq_count--;
++	}
++	uint32_t st = negroni_wlan_rd(MHI_STATUS);
++	if (h->syserr || h->rddm_seen || st == MHI_ALL_ONES || (st & MHI_STATUS_SYSERR)) {
++		h->syserr = true;
++		return negroni_wlan_failed(EIO, "the chip stopped (MHISTATUS %#x, EE %u, RDDM %u)", st, h->ee,
++		           h->rddm_seen ? 1 : 0);
++	}
++	return 0;
++}
++
++int
++negroni_wlan_qrtr_hello(struct mhi_host *h)
++{
++	struct qrtr_state *q = &negroni_qrtr;
++	uint64_t deadline;
++	int error;
++
++	negroni_wlan_qrtr_attach(h);
++	error = negroni_wlan_qrtr_pump(h);      /* the chip may say HELLO first */
++	if (error) {
++		return error;
++	}
++	error = qrtr_send_ctrl(h, QRTR_TYPE_HELLO, q->hello_rx ? q->remote_node : QRTR_NODE_BCAST,
++	    QRTR_PORT_CTRL, 0, 0);
++	if (error) {
++		return error;
++	}
++	q->hello_sent = true;
++	printf("NEGRONI WLAN: QRTR HELLO sent from node %u (channel 20, %u RX packets so far)\n", QRTR_LOCAL_NODE,
++	    h->rx_packets);
++	deadline = negroni_wlan_ms() + h->timeout_ms;
++	while (!q->hello_rx) {
++		error = negroni_wlan_qrtr_pump(h);
++		if (error) {
++			return error;
++		}
++		if (negroni_wlan_ms() >= deadline) {
++			return negroni_wlan_failed(ETIMEDOUT, "no HELLO from the chip in %u ms (RX packets %u, bad %u, "
++			           "dropped %u, TX done %u of %u)", h->timeout_ms, h->rx_packets, q->rx_bad, q->rx_drop,
++			           h->tx_done, h->tx_packets);
++		}
++		delay(1000);
++	}
++	return 0;
++}
++
++int
++negroni_wlan_qrtr_find_wlfw(struct mhi_host *h)
++{
++	struct qrtr_state *q = &negroni_qrtr;
++	uint64_t deadline = negroni_wlan_ms() + h->timeout_ms;
++	int error;
++
++	while (!q->wlfw_found) {
++		error = negroni_wlan_qrtr_pump(h);
++		if (error) {
++			return error;
++		}
++		if (q->bye) {
++			return negroni_wlan_failed(EIO, "the chip sent BYE before the WLFW service");
++		}
++		if (negroni_wlan_ms() >= deadline) {
++			return negroni_wlan_failed(ETIMEDOUT, "no NEW_SERVER for service %#x version %u in %u ms "
++			           "(%u other servers seen)", WLFW_SERVICE_ID, WLFW_SERVICE_VERS, h->timeout_ms, q->nsrv);
++		}
++		delay(1000);
++	}
++	printf("NEGRONI WLAN: step 17 WLFW service at node %u port %#x\n", q->wlfw.node, q->wlfw.port);
++	printf("NEGRONI WLAN: WLFW instance %#x (version %u, instance id %u), %u servers known\n", q->wlfw.instance,
++	    q->wlfw.instance & 0xff, q->wlfw.instance >> 8, q->nsrv);
++	return 0;
++}
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_qrtr.h b/bsd/dev/negroni_wlan_qrtr.h
+new file mode 100644
+index 0000000..4dc5b36
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_qrtr.h
+@@ -0,0 +1,93 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: QRTR (IPC router) over the MHI IPCR channels 20/21 (patch 0265).
++ * Wire format from Linux net/qrtr (af_qrtr.c struct qrtr_hdr_v1 / qrtr_hdr_v2, ns.c,
++ * include/uapi/linux/qrtr.h; GPL-2.0, values only, no code) and the OnePlus copy in
++ * out/src/op-kernel net/qrtr. UNTESTED ON HARDWARE.
++ *
++ * The host is node QRTR_LOCAL_NODE with one client port (QRTR_LOCAL_PORT). The chip runs its
++ * own name service: after our HELLO it answers with its HELLO and one NEW_SERVER per service
++ * (ns.c ctrl_cmd_hello -> announce_servers). A NEW_LOOKUP never goes over the link (ns.c:
++ * lookups are local only).
++ */
++#ifndef _NEGRONI_WLAN_QRTR_H_
++#define _NEGRONI_WLAN_QRTR_H_
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++
++#include <stdint.h>
++#include <stdbool.h>
++#include "negroni_wlan_mhi.h"
++
++#define QRTR_PROTO_VER_1        1u      /* af_qrtr.c:30 */
++#define QRTR_PROTO_VER_2        3u      /* af_qrtr.c:31 */
++#define QRTR_HDR_V1_LEN         32u     /* 8 x le32 */
++#define QRTR_HDR_V2_LEN         16u     /* u8 x4, le32 size, le16 x4 */
++#define QRTR_CTRL_LEN           20u     /* struct qrtr_ctrl_pkt: le32 cmd + 4 x le32 */
++#define QRTR_NODE_BCAST         0xffffffffu     /* uapi qrtr.h:8 */
++#define QRTR_PORT_CTRL          0xfffffffeu     /* uapi qrtr.h:9 */
++#define QRTR_PORT_CTRL_LEGACY   0xffffu         /* af_qrtr.c:37 */
++#define QRTR_FLAGS_CONFIRM_RX   0x1u            /* v2 flags bit 0 */
++
++/* uapi qrtr.h enum qrtr_pkt_type */
++#define QRTR_TYPE_DATA          1u
++#define QRTR_TYPE_HELLO         2u
++#define QRTR_TYPE_BYE           3u
++#define QRTR_TYPE_NEW_SERVER    4u
++#define QRTR_TYPE_DEL_SERVER    5u
++#define QRTR_TYPE_DEL_CLIENT    6u
++#define QRTR_TYPE_RESUME_TX     7u
++#define QRTR_TYPE_EXIT          8u
++#define QRTR_TYPE_PING          9u
++#define QRTR_TYPE_NEW_LOOKUP    10u
++#define QRTR_TYPE_DEL_LOOKUP    11u
++
++/* CONFIG_QRTR_NODE_ID default 1 (op-kernel net/qrtr/Kconfig:17-19); first ephemeral port 0x4000 */
++#define QRTR_LOCAL_NODE         1u
++#define QRTR_LOCAL_PORT         0x4000u
++
++/* WLFW service (wlan_firmware_service_v01.h:11-12); NEW_SERVER instance = version | ins << 8 */
++#define WLFW_SERVICE_ID         0x45u
++#define WLFW_SERVICE_VERS       0x01u
++
++#define QRTR_MAX_SERVERS        32u
++#define QRTR_NEW_SERVER_LOG_MAX 48u             /* NEW_SERVER lines printed at most */
++#define QRTR_RXQ_N              8u              /* received packets waiting for qrtr_pump */
++#define QRTR_RXQ_LEN            0x2000u         /* 8 KiB per queued packet (WLFW max 1824 + headers) */
++
++/* one decoded packet (all values host order; payload points into the caller's buffer) */
++struct qrtr_pkt {
++	uint32_t version, type, src_node, src_port, dst_node, dst_port, size;
++	bool confirm_rx;
++	const uint8_t *payload;
++};
++
++struct qrtr_server {
++	uint32_t service, instance, node, port;
++};
++
++struct qrtr_state {
++	bool attached, hello_sent, hello_rx, bye;
++	uint32_t remote_node;           /* src node of the chip's HELLO */
++	struct qrtr_server srv[QRTR_MAX_SERVERS];
++	uint32_t nsrv, new_server_logged;
++	bool wlfw_found, wlfw_gone;
++	struct qrtr_server wlfw;
++	uint32_t rx_ok, rx_bad, rx_drop, rx_data, rx_unrouted, rx_resume, tx_resume;
++	/* 0266: QMI layer; called from qrtr_pump for each DATA packet to our port (payload only) */
++	void (*data_cb)(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len);
++};
++
++extern struct qrtr_state negroni_qrtr;
++
++/* pure decoder, every length checked against len (af_qrtr.c qrtr_endpoint_post rules) */
++int negroni_qrtr_parse(const uint8_t *buf, uint32_t len, struct qrtr_pkt *out);
++
++void negroni_wlan_qrtr_attach(struct mhi_host *h);      /* rx_cb on channel 21 */
++void negroni_wlan_qrtr_detach(struct mhi_host *h);
++int negroni_wlan_qrtr_pump(struct mhi_host *h);         /* MHI poll + handle queued packets */
++int negroni_wlan_qrtr_send(struct mhi_host *h, uint32_t type, uint32_t src_port, uint32_t dst_node,
++    uint32_t dst_port, const void *payload, uint32_t len);
++int negroni_wlan_qrtr_hello(struct mhi_host *h);        /* step 16 */
++int negroni_wlan_qrtr_find_wlfw(struct mhi_host *h);    /* step 17 */
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++#endif /* _NEGRONI_WLAN_QRTR_H_ */

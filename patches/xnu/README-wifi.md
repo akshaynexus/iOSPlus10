@@ -154,7 +154,7 @@ New boot-args:
 
 | Boot-arg | Default | Meaning |
 |---|---|---|
-| `negroniwlan=N` | 0 (off) | survey 1..10, then driver levels 2..N (max 4 in this build) |
+| `negroniwlan=N` | 0 (off) | survey 1..10, then driver levels 2..N (max 4 in 0264; 6 with 0265/0266) |
 | `negroniwlan_to=MS` | 10000 | time-out of every wait, 100..60000 |
 | `negroniwlan_smmu=P` | **1** | 0 = step 6 only reports; 1 = stop before the first DMA when a clock vote bit is clear or the SMMU surely faults stream 0x1c01 (S2CR fault, a context we did not set up, or no SMR with USFCFG 1); **2 = WRITE a bypass SMR + S2CR for stream 0x1c01 into the apps SMMU** |
 
@@ -170,6 +170,101 @@ doorbell again. At level 4 nobody reads the RX data yet (QRTR is level 5).
 [I] Open: the restart during the first BHI SBL download (2026-10-26) is not isolated (brownout at 16 %,
 SMMU fault, gated TBU/NoC clock, or a missing PCIe -> DDR interconnect vote). Step 6 and the heartbeat
 lines are there to tell these apart.
+
+## 0265-negroni-wlan-qrtr.patch and 0266-negroni-wlan-qmi-wlfw.patch (2026-10-26)
+
+Files: `bsd/dev/negroni_wlan_qrtr.{c,h}` (0265), `negroni_wlan_qmi.{c,h}` + `negroni_wlfw_tables.h` (0266),
+`negroni_wlan.c` (levels 5/6, `negroni_wlan_fw_file`), `negroni_wlan_mhi.h` (levels), `bsd/conf/files` (two lines right
+after `negroni_wlan.c`, which stays right after `negroni_wifi.c` for 0280/0300/0310/0350; not between `negroni_wlan_mhi.c`
+and `negroni_adsp.c`, which is the context of 0330: a first version put them there and 0330 was skipped). Made in
+`out/kernel/tree-wlan7` (full patch set, one commit per patch). Build-only: not run on the phone.
+
+`negroniwlan=5` runs levels 2..5, `negroniwlan=6` levels 2..6 (`WLAN_LEVEL_MAX` is 6 now).
+
+| Level | Step | Name (log `NEGRONI WLAN: step N NAME`) | What | Source |
+|---|---|---|---|---|
+| 5 | 16 | QRTR HELLO | HELLO (v1 header, src node 1 port CTRL, dst node BCAST/known, port CTRL); wait for the chip's HELLO | af_qrtr.c qrtr_hello_work, qrtr_node_enqueue:781 |
+| 5 | 17 | WLFW service lookup | wait for NEW_SERVER service 0x45, version byte 1, any instance; keep node/port | ns.c ctrl_cmd_hello/announce_servers, qmi_interface.c:52 (instance = vers \| ins << 8) |
+| 6 | 18 | WLFW IND_REGISTER | client id 0x4b4e454c; fw_ready, request_mem, fw_mem_ready, fw_init_done, cal_done = 1 (fw_ready_enable added: ath11k sets it, cnss2 does not, qmi.c:153-160); stop on fw_status ALREADY_REGISTERED | cnss2 qmi.c:133, ath11k qmi.c:1793 |
+| 6 | 19 | WLFW HOST_CAP | num_clients 1, bdf_support 1, m3_support 1, m3_cache_support 1, cal_done 0, host_build_type 2, feature_list 0x5 | cnss2 qmi.c:271 |
+| 6 | 20 | WLFW firmware memory | wait REQUEST_MEM_IND, one contiguous zeroed allocation per segment (<= 32 MiB each, <= 64 MiB total, below 36 bit), RESPOND_MEM; if an allocation fails and <= 5 segments: RESPOND_MEM with 0 segments once, the firmware asks again in smaller pieces | cnss2 qmi.c:410 + 2545, ath11k qmi.c:1886 |
+| 6 | 21 | WLFW FW_MEM_READY + CAP | wait FW_MEM_READY_IND, CAP_REQ, log the ids | cnss2 main.c:509, qmi.c:499 |
+| 6 | 22 | WLFW BDF download | `regdb.bin` type 4 (failure ignored unless `regdb_mandatory`), then the board file type 1 (ELF) in 6144-byte segments, file_id = board id, total_size = remaining bytes | cnss2 main.c:525-531, qmi.c:729 (names), :950 |
+| 6 | 23 | WLFW M3_INFO | addr/size of the m3.bin copy in the DMA pool (pool + 0x610000) | cnss2 qmi.c:1103 |
+| 6 | 24 | WLFW FW_INIT_DONE | wait FW_INIT_DONE_IND (HSP) or FW_READY_IND, MAX(negroniwlan_to, 10 s) | cnss2 qmi.c:159 ("fw_ready is replaced by fw_init_done in HST/HSP") |
+
+Proof lines (all start `NEGRONI WLAN:`):
+- `step 16 QRTR HELLO from node N` and `QRTR header vV, HELLO src port .., dst node .. port ..`
+- `QRTR NEW_SERVER service 0x.. version V instance I at node N port P (from node N)` (one per service)
+- `step 17 WLFW service at node N port P`, `WLFW instance 0x.. (version 1, instance id I), K servers known`
+- `QMI NAME (0xID) response: result R error E` for every request (BDF segments: only on an error)
+- `firmware asks segment i: 0x.. bytes, type T, C config entries`, `segment i type T: 0x.. bytes at 0x..`
+- `chip id 0x.. family 0x.., board id 0x.., soc id 0x.., otp 0x..`
+- `firmware version 0x.., timestamp "...", build "..."` (the strong proof: a string from the chip's firmware)
+- `regdb.bin (type 4) N bytes sent in S segments, file id 0x..`, `bdwlan.elf (type 1) ...`, `host_bdf_data 0x.. (HW_XPA x)`
+- `m3.bin N bytes at 0x..`, `step 24 FW_INIT_DONE_IND received (hang data offset .. length ..)`
+- errors: `step N NAME failed: REASON` as in 0263 (time-out, QMI refusal with result/error, bad message,
+  BYE / DEL_SERVER of the WLFW server, chip SYSERR/RDDM), then the 0263 failure path: MHI reset + bus master off,
+  then the firmware segments, the IPCR buffers and the pool are freed (once).
+
+Badge: `WLAN 16` .. `WLAN 24`, `WLAN OK 6`, `WLAN STOP N`.
+
+Design:
+- QRTR (0265): every received packet is copied out of the channel-21 RX buffer by the MHI poller into an
+  8 x 8 KiB queue, then decoded by `negroni_wlan_qrtr_pump` (never inside the poller, so a handler may send).
+  `negroni_qrtr_parse` checks: length multiple of 4, header fits (v1 32 bytes, v2 16 + optlen), size != 0,
+  size <= rest, buffer == header + size rounded to 4, control payload >= 20 bytes for NEW/DEL_SERVER,
+  DEL_CLIENT, RESUME_TX, non-DATA packets only to port CTRL (af_qrtr.c qrtr_endpoint_post). We send v1 only,
+  confirm_rx 0; when the chip sets confirm_rx we answer RESUME_TX (af_qrtr.c qrtr_send_resume_tx).
+- QMI (0266): one generic encoder/decoder over field tables (`negroni_wlfw_tables.h`, one v01 source line per
+  field). Decode zeroes the C struct, bounds-checks every TLV, nested prefix and array count, skips unknown TLV
+  types, and fails if a mandatory TLV is missing. One request in flight; the response must match msg id + txn
+  id and come from the WLFW node/port. Indications (REQUEST_MEM, FW_MEM_READY, FW_INIT_DONE, FW_READY,
+  CAL_DONE) are kept until a step consumes them (REQUEST_MEM can arrive before the HOST_CAP response).
+- Host test: `scripts/wifi/qmi-host-test.sh TREE` (patches/xnu/tests/wlan-qmi-test.c): exact request bytes,
+  a full BDF segment = 6182 bytes = WLFW_BDF_DOWNLOAD_REQ_MSG_V01_MAX_MSG_LEN (v01.h:648), decode cases, 500 k
+  random/mutated inputs under ASan/UBSan. Result 2026-10-26: ALL PASS.
+
+Firmware files: the area from `scripts/wifi/mkwlanarea.py` already holds `regdb.bin` (24278 bytes),
+`bdwlan.elf` (59932), `bdwlang.elf` and `bdwlan.e01`..`bdwlan.ee1` (198 files, notes.md "Make and write the
+firmware area"). No new script and no new area write is needed. Name rule (cnss2 qmi.c:729-764 + OnePlus
+qmi.c:684-724): board id 0xff -> `bdwlan.elf` (`bdwlang.elf` if chip_id & 0x10); < 0xff -> `bdwlan.eNN`
+(`bdwlang.eNN`); else `bdwlanHH.eLL`. [V] The NE2211 IS in the OnePlus region list: out/live.dts bootargs has
+`prjname=20847` and cnss2 qmi.c:652-659 `is_prj_support_region_id` lists 20847. With region CHN_IN / EU / NA cnss2 loads
+`bdwlan.b0c` / `bdwlan.b0e` / `bdwlan.b0a` (qmi.c:40-42), else `bdwlan.elf`. The vendor firmware has none of the
+`bdwlan.b0x` files (only bdwlan.elf, bdwlang.elf, bdwlan.eNN), so `bdwlan.elf` is the file this phone can load.
+
+Deviations from the task text, with reason [V source]:
+- BDF type 1 (ELF), not 0: `bdwlan.elf`/`.eNN` are ELF files and cnss2 uses CNSS_BDF_ELF = 1 by default
+  (main.h:355-357, main.c:56). Type 0 is CNSS_BDF_BIN (`bdwlan.bin`, not in the area).
+- regdb goes first (cnss2 main.c:525), not after the BDF.
+- HOST_CAP sends no `daemon_support` (no such field in this v01: v01.h:867-932) and no `mem_cfg_mode`
+  (cnss2 does not set it; ath11k sends 0, the default).
+- HOST_CAP TLV 0x12 `gpios` is not sent. For this project (20847) cnss2 sends one entry 0x38242F00 = GPIO 56 output
+  low ("WSA", `needSupportWsa`, qmi.c:258-268 and :309-331); ath11k never sends it. Step-25 candidate if FW_INIT_DONE
+  does not come.
+- IND_REGISTER: fw_ready_enable is added (ath11k sets it; cnss2 does not, qmi.c:153-160).
+- HELLO goes to node 0xffffffff while the chip's node is unknown (af_qrtr.c: `to.sq_node = node->nid` =
+  QRTR_EP_NID_AUTO), not node 0.
+
+[I] Open points: host_build_type 2 assumes a kernel without CONFIG_CNSS2_DEBUG (cnss2 qmi.h:312-321); the DT has
+`qcom,wlan-cbc-enabled` (out/live.dts:13853), so cnss2 runs a cold-boot calibration (WLAN_MODE CALIBRATION, wait
+CAL_DONE, power cycle) before mission mode; level 6 stops at FW_INIT_DONE and does not do it.
+
+New boot-arg values: `negroniwlan=5` (QRTR), `negroniwlan=6` (QMI WLFW). Image: `out/ios16-wlan6` (config args
+with `negroniwifi=10 negroniwlan=6 negronipanic=30 negronipanicreason=2`).
+
+### What step 25+ needs (not written)
+
+1. WLAN_CFG (0x23: CE target pipe config, service-to-pipe map, shadow registers v2/v3) and WLAN_MODE MISSION (0x22),
+   ath11k qmi.c ath11k_qmi_wlanfw_wlan_cfg_send / mode_send, core.c:2278 order (cfg + mode before the CE setup);
+   cold-boot calibration first if we follow cnss2 (`qcom,wlan-cbc-enabled`).
+2. Copy engine (CE) rings in host memory over BAR0 (ath11k ce.c, hal.c SRNG, pci.c window/register access,
+   QCA6390/WCN6855 hw params; polling, no MSI), then HTC (htc.c: service connect for WMI control, HTT data),
+   then WMI (wmi.c: WMI_INIT with the resource config, wait WMI_READY/service-ready events, MAC address).
+3. HTT/DP rings (dp.c, dp_rx.c, dp_tx.c) for data, then the iOS side: an IO80211 / IONetworkingFamily `en0`
+   interface (design reference external/ios-sailfish patches 0174-0179), scan + WPA (wpa_supplicant-style key
+   handling in user space or in the kernel).
 
 ## 0261-negroni-wlan-mhi-fw.patch
 

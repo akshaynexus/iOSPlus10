@@ -1,0 +1,1522 @@
+0266-negroni-wlan-qmi-wlfw: Wi-Fi level 6 (negroniwlan=6), QMI WLFW client, steps 18-24.
+New bsd/dev/negroni_wlan_qmi.{c,h}: a generic QMI TLV encoder/decoder (our code, from the wire
+format: 7-byte header, TLVs, nested string/array prefixes; unknown TLVs skipped, mandatory TLVs
+checked) and the WLFW sequence of cnss2 (qmi.c:133/271/410/499/950/1103, main.c:509):
+IND_REGISTER (fw_ready, fw_init_done, request_mem, fw_mem_ready, cal_done), HOST_CAP (cnss2 fields:
+num_clients 1, bdf/m3/m3_cache support, cal_done 0, build type 2, feature list 0x5), REQUEST_MEM_IND ->
+contiguous segments (<= 64 MiB total, 36-bit) -> RESPOND_MEM (ath11k 0-segment retry once),
+FW_MEM_READY_IND, CAP (chip/board/soc/fw version/build id log), BDF_DOWNLOAD regdb.bin (type 4) then
+bdwlan.elf / bdwlan.eNN (type 1 ELF) in 6144-byte segments, M3_INFO, FW_INIT_DONE_IND (max(negroniwlan_to, 10 s)).
+New bsd/dev/negroni_wlfw_tables.h: the field tables, one source line (v01.c / v01.h) per field.
+Every response: TLV 0x02 result/error logged and checked. Failure path: quiesce, then free once.
+Details: patches/xnu/README-wifi.md "0266".
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index efcf213..bc718a6 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/negroni_adreno.c		standard
+ bsd/dev/negroni_wifi.c			standard
+ bsd/dev/negroni_wlan.c			standard
+ bsd/dev/negroni_wlan_qrtr.c		standard
++bsd/dev/negroni_wlan_qmi.c		standard
+ bsd/dev/negroni_wlan_bhi.c		standard
+ bsd/dev/negroni_wlan_mhi.c		standard
+ bsd/dev/negroni_adsp.c			standard
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index 5bd87f6..de0838d 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -307,9 +307,9 @@ wlan_quiesce(struct negroni_wlan_pcie *p)
+ 	printf("NEGRONI WLAN: MHI reset requested and bus master off, command %#x\n", cfg[0x04 / 4] & 0xffff);
+ }
+ 
+-/* Read one named file from the area into the pool (cacheable view), check SHA-256, push it to RAM. */
++/* Read one named file of the area into dst and check its SHA-256 (0266: shared with level 6). */
+ static int
+-wlan_load(const struct wlan_area_header *hdr, const char *name, uint32_t off, uint32_t cap, uint32_t *out)
++wlan_area_get(const struct wlan_area_header *hdr, const char *name, void *dst, uint32_t cap, uint32_t *out)
+ {
+ 	for (uint32_t i = 0; i < hdr->count; i++) {
+ 		const struct wlan_area_entry *e = &hdr->e[i];
+@@ -321,7 +321,7 @@ wlan_load(const struct wlan_area_header *hdr, const char *name, uint32_t off, ui
+ 			printf("NEGRONI WLAN: %s size %u / offset %#x out of range\n", name, e->size, e->offset);
+ 			return ERANGE;
+ 		}
+-		int error = negroni_ufs_wlan_area_read(e->offset, (void *)(g_pool_kva + off), e->size);
++		int error = negroni_ufs_wlan_area_read(e->offset, dst, e->size);
+ 		if (error) {
+ 			printf("NEGRONI WLAN: %s read error %d\n", name, error);
+ 			return error;
+@@ -329,13 +329,12 @@ wlan_load(const struct wlan_area_header *hdr, const char *name, uint32_t off, ui
+ 		uint8_t digest[32];
+ 		SHA256_CTX c;
+ 		SHA256_Init(&c);
+-		SHA256_Update(&c, (void *)(g_pool_kva + off), e->size);
++		SHA256_Update(&c, dst, e->size);
+ 		SHA256_Final(digest, &c);
+ 		if (memcmp(digest, e->sha256, 32) != 0) {
+ 			printf("NEGRONI WLAN: %s %u bytes loaded, sha-256 MISMATCH; stop\n", name, e->size);
+ 			return EBADMSG;
+ 		}
+-		flush_dcache64((addr64_t)(g_pool_pa + off), e->size, TRUE);
+ 		printf("NEGRONI WLAN: %s %u bytes loaded, sha-256 OK\n", name, e->size);
+ 		*out = e->size;
+ 		return 0;
+@@ -344,6 +343,40 @@ wlan_load(const struct wlan_area_header *hdr, const char *name, uint32_t off, ui
+ 	return ENOENT;
+ }
+ 
++/* Read one named file from the area into the pool (cacheable view), check SHA-256, push it to RAM. */
++static int
++wlan_load(const struct wlan_area_header *hdr, const char *name, uint32_t off, uint32_t cap, uint32_t *out)
++{
++	int error = wlan_area_get(hdr, name, (void *)(g_pool_kva + off), cap, out);
++
++	if (!error) {
++		flush_dcache64((addr64_t)(g_pool_pa + off), *out, TRUE);
++	}
++	return error;
++}
++
++int
++negroni_wlan_fw_file(const char *name, void *dst, uint32_t cap, uint32_t *size)
++{
++	struct wlan_area_header *hdr = NULL;
++	int error;
++
++	if (kmem_alloc(kernel_map, (vm_offset_t *)&hdr, WLAN_AREA_HDR, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	error = negroni_ufs_wlan_area_read(0, hdr, WLAN_AREA_HDR);
++	if (!error && (memcmp(hdr->magic, "NEGRWLAN", 8) != 0 || hdr->version != 1 || hdr->count == 0 ||
++	    hdr->count > WLAN_FW_MAX)) {
++		error = EINVAL;
++	}
++	if (!error) {
++		error = wlan_area_get(hdr, name, dst, cap, size);
++	}
++	kmem_free(kernel_map, (vm_offset_t)hdr, WLAN_AREA_HDR);
++	return error;
++}
++
+ /* Fill the ring/context pointers of H from the pool layout (non-cacheable view). */
+ static void
+ wlan_rings(void)
+@@ -400,6 +433,7 @@ wlan_vector(uint32_t fw_size)
+ static void
+ wlan_cleanup(void)
+ {
++	negroni_wlan_wlfw_free();       /* 0266: firmware memory segments (after wlan_quiesce) */
+ 	if (H.xfer_nc) {
+ 		ml_io_unmap(H.xfer_nc, WLAN_XFER_SIZE);
+ 		H.xfer_nc = 0;
+@@ -759,11 +793,19 @@ wlan_level_qrtr(void)
+ 	return negroni_wlan_qrtr_find_wlfw(&H);
+ }
+ 
++/* ---- level 6: steps 18-24 (0266: QMI WLFW, negroni_wlan_qmi.c) ---- */
++static int
++wlan_level_wlfw(void)
++{
++	return negroni_wlan_wlfw_run(&H, g_m3_size ? g_pool_pa + OFF_M3 : 0, g_m3_size);
++}
++
+ static int (*const wlan_levels[WLAN_LEVEL_MAX + 1])(void) = {
+ 	[WLAN_LEVEL_SBL] = wlan_level_sbl,
+ 	[WLAN_LEVEL_MHI] = wlan_level_mhi,
+ 	[WLAN_LEVEL_AMSS] = wlan_level_amss,
+ 	[WLAN_LEVEL_QRTR] = wlan_level_qrtr,
++	[WLAN_LEVEL_WLFW] = wlan_level_wlfw,
+ };
+ 
+ /*
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index 8e555cc..3b46494 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -163,6 +163,7 @@ struct mhi_host {
+  *   3  steps 9-12:  MHI READY, MMIO contexts, M0 + device wake, EE SBL
+  *   4  steps 13-15: BHIe full image, EE AMSS (mission), IPCR channels 20/21
+  *   5  steps 16-17: QRTR HELLO, WLFW service lookup (0265, negroni_wlan_qrtr.c)
++ *   6  steps 18-24: QMI WLFW IND_REGISTER .. FW_INIT_DONE (0266, negroni_wlan_qmi.c)
+  * Each step prints "NEGRONI WLAN: step N NAME" before it starts and, on an error,
+  * "NEGRONI WLAN: step N NAME failed: REASON". Every wait has a time-out (negroniwlan_to).
+  */
+@@ -170,7 +171,8 @@ struct mhi_host {
+ #define WLAN_LEVEL_MHI          3
+ #define WLAN_LEVEL_AMSS         4
+ #define WLAN_LEVEL_QRTR         5       /* 0265 */
+-#define WLAN_LEVEL_MAX          5       /* the highest level this build implements */
++#define WLAN_LEVEL_WLFW         6       /* 0266 */
++#define WLAN_LEVEL_MAX          6       /* the highest level this build implements */
+ /* level 4 (0264) also posts the RX buffers on channel 21 (cnss2 auto_queue, pci.c:181) */
+ 
+ void negroni_wlan_step(uint32_t n, const char *name);
+@@ -181,6 +183,12 @@ uint32_t negroni_wlan_rd(uint32_t off);
+ void negroni_wlan_wr(uint32_t off, uint32_t v);
+ uint64_t negroni_wlan_ms(void);
+ uint32_t negroni_wlan_seq(void);
++/* 0266: one file of the firmware area into dst (SHA-256 checked); ENOENT if it is not there */
++int negroni_wlan_fw_file(const char *name, void *dst, uint32_t cap, uint32_t *size);
++
++/* negroni_wlan_qmi.c (0266): level 6; free only after the chip lost bus mastering */
++int negroni_wlan_wlfw_run(struct mhi_host *h, uint64_t m3_pa, uint32_t m3_size);
++void negroni_wlan_wlfw_free(void);
+ 
+ /* negroni_wlan_bhi.c */
+ int negroni_wlan_bhi_sbl(struct mhi_host *h, uint64_t pa, uint32_t size);
+diff --git a/bsd/dev/negroni_wlan_qmi.c b/bsd/dev/negroni_wlan_qmi.c
+new file mode 100644
+index 0000000..d8e5555
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_qmi.c
+@@ -0,0 +1,907 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi, level 6 (patch 0266): QMI WLFW over QRTR (0265).
++ *
++ *   step 18  WLFW IND_REGISTER     ask for FW_READY, FW_INIT_DONE, REQUEST_MEM, FW_MEM_READY, CAL_DONE
++ *   step 19  WLFW HOST_CAP         the fields cnss2 sets for QCA6490 (cnss2 qmi.c:271)
++ *   step 20  WLFW firmware memory  wait REQUEST_MEM_IND, allocate contiguous segments, RESPOND_MEM
++ *   step 21  WLFW FW_MEM_READY + CAP   wait FW_MEM_READY_IND, CAP_REQ: chip / board / firmware ids
++ *   step 22  WLFW BDF download     regdb.bin (type 4, may fail), then the board file (type 1, ELF)
++ *   step 23  WLFW M3_INFO          the m3.bin copy that level 2 left in the DMA pool
++ *   step 24  WLFW FW_INIT_DONE     wait FW_INIT_DONE_IND (HSP; FW_READY_IND on older firmware)
++ *
++ * Order and fields: OnePlus cnss2 (out/src/op-kernel drivers/net/wireless/cnss2 qmi.c:133
++ * ind_register, :271 host_cap, :410 respond_mem, :499 tgt_cap, :950 bdf, :1103 m3; main.c:509
++ * cnss_fw_mem_ready_hdlr) and Linux ath11k qmi.c (same WLFW family). Every response is checked
++ * (TLV 0x02 result/error, logged). The generic TLV coder below is our own code, written from the
++ * wire format; the tables are in negroni_wlfw_tables.h. UNTESTED ON HARDWARE.
++ *
++ * The firmware memory segments stay allocated while the chip runs; negroni_wlan_wlfw_free runs
++ * only on the failure path, after the chip lost bus mastering (negroni_wlan.c wlan_quiesce).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include "negroni_wlan.h"
++#include "negroni_wlan_mhi.h"
++#include "negroni_wlan_qrtr.h"
++#include "negroni_wlan_qmi.h"
++#include "negroni_wlfw_tables.h"
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++/* =============================== generic QMI TLV coder =============================== */
++
++struct qw {             /* writer */
++	uint8_t *b;
++	uint32_t cap, pos;
++};
++struct qr {             /* reader, [p, end) */
++	const uint8_t *p, *end;
++};
++
++static uint32_t
++qf_width(uint8_t kind)
++{
++	switch (kind) {
++	case QF_U8: return 1;
++	case QF_U16: return 2;
++	case QF_U32: return 4;
++	case QF_U64: return 8;
++	default: return 0;
++	}
++}
++
++/* C-side load/store of a scalar of `n` bytes (host little endian, unaligned safe) */
++static uint64_t
++c_load(const uint8_t *s, uint32_t n)
++{
++	uint8_t v8;
++	uint16_t v16;
++	uint32_t v32;
++	uint64_t v64;
++
++	switch (n) {
++	case 1: memcpy(&v8, s, 1); return v8;
++	case 2: memcpy(&v16, s, 2); return v16;
++	case 4: memcpy(&v32, s, 4); return v32;
++	default: memcpy(&v64, s, 8); return v64;
++	}
++}
++
++static void
++c_store(uint8_t *d, uint64_t v, uint32_t n)
++{
++	uint8_t v8 = (uint8_t)v;
++	uint16_t v16 = (uint16_t)v;
++	uint32_t v32 = (uint32_t)v;
++
++	switch (n) {
++	case 1: memcpy(d, &v8, 1); break;
++	case 2: memcpy(d, &v16, 2); break;
++	case 4: memcpy(d, &v32, 4); break;
++	default: memcpy(d, &v, 8); break;
++	}
++}
++
++static int
++w_put(struct qw *w, uint64_t v, uint32_t n)
++{
++	if (w->cap - w->pos < n) {
++		return EMSGSIZE;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		w->b[w->pos++] = (uint8_t)(v >> (8 * i));
++	}
++	return 0;
++}
++
++static int
++r_get(struct qr *r, uint32_t n, uint64_t *v)
++{
++	if ((uint32_t)(r->end - r->p) < n) {
++		return EBADMSG;
++	}
++	*v = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		*v |= (uint64_t)r->p[i] << (8 * i);
++	}
++	r->p += n;
++	return 0;
++}
++
++static int qf_enc(const struct qmi_field *f, const uint8_t *base, struct qw *w, int level);
++static int qf_dec(const struct qmi_field *f, uint8_t *base, struct qr *r, int level);
++
++static int
++qf_enc_members(const struct qmi_field *sub, uint16_t n, const uint8_t *base, struct qw *w, int level)
++{
++	for (uint16_t i = 0; i < n; i++) {
++		int e = qf_enc(&sub[i], base, w, level);
++		if (e) {
++			return e;
++		}
++	}
++	return 0;
++}
++
++static int
++qf_enc(const struct qmi_field *f, const uint8_t *base, struct qw *w, int level)
++{
++	const uint8_t *v = base + f->off;
++	uint32_t n = qf_width(f->kind);
++
++	switch (f->kind) {
++	case QF_U8:
++	case QF_U16:
++	case QF_U32:
++	case QF_U64:
++		return w_put(w, c_load(v, n), n);
++	case QF_STRING: {
++		/* nested prefix: u8 when elem_len = max + 1 <= 255 (qmi_encdec.c:131, :247) */
++		uint32_t len = (uint32_t)strnlen((const char *)v, (size_t)f->max + 1);
++		if (len > f->max) {
++			return EINVAL;
++		}
++		if (level > 1) {
++			int e = w_put(w, len, f->max + 1u <= 255u ? 1 : 2);
++			if (e) {
++				return e;
++			}
++		}
++		if (w->cap - w->pos < len) {
++			return EMSGSIZE;
++		}
++		memcpy(w->b + w->pos, v, len);
++		w->pos += len;
++		return 0;
++	}
++	case QF_STRUCT:
++		return qf_enc_members(f->sub, f->nsub, v, w, level + 1);
++	case QF_VARRAY: {
++		uint32_t cnt = (uint32_t)c_load(base + f->count, 4);
++		uint32_t ew = qf_width(f->ekind);
++		int e;
++
++		if (cnt > f->max || (f->lensz != 1 && f->lensz != 2)) {
++			return EINVAL;
++		}
++		e = w_put(w, cnt, f->lensz);
++		if (e) {
++			return e;
++		}
++		if (f->ekind != QF_STRUCT && ew == 1) {         /* byte array: one copy */
++			if (w->cap - w->pos < cnt) {
++				return EMSGSIZE;
++			}
++			memcpy(w->b + w->pos, v, cnt);
++			w->pos += cnt;
++			return 0;
++		}
++		for (uint32_t i = 0; i < cnt; i++) {
++			const uint8_t *el = v + (size_t)i * f->esize;
++			e = f->ekind == QF_STRUCT ? qf_enc_members(f->sub, f->nsub, el, w, level + 1) :
++			    w_put(w, c_load(el, ew), ew);
++			if (e) {
++				return e;
++			}
++		}
++		return 0;
++	}
++	default:
++		return EINVAL;
++	}
++}
++
++static int
++qf_dec_members(const struct qmi_field *sub, uint16_t n, uint8_t *base, struct qr *r, int level)
++{
++	for (uint16_t i = 0; i < n; i++) {
++		int e = qf_dec(&sub[i], base, r, level);
++		if (e) {
++			return e;
++		}
++	}
++	return 0;
++}
++
++static int
++qf_dec(const struct qmi_field *f, uint8_t *base, struct qr *r, int level)
++{
++	uint8_t *v = base + f->off;
++	uint32_t n = qf_width(f->kind);
++	uint64_t x;
++	int e;
++
++	switch (f->kind) {
++	case QF_U8:
++	case QF_U16:
++	case QF_U32:
++	case QF_U64:
++		e = r_get(r, n, &x);
++		if (!e) {
++			c_store(v, x, n);
++		}
++		return e;
++	case QF_STRING: {
++		uint32_t len;
++		if (level > 1) {
++			e = r_get(r, f->max + 1u <= 255u ? 1 : 2, &x);
++			if (e) {
++				return e;
++			}
++			len = (uint32_t)x;
++		} else {
++			len = (uint32_t)(r->end - r->p);        /* the TLV length */
++		}
++		if (len > f->max || (uint32_t)(r->end - r->p) < len) {
++			return EBADMSG;
++		}
++		memcpy(v, r->p, len);
++		v[len] = 0;                                     /* C storage is char[max + 1] */
++		r->p += len;
++		return 0;
++	}
++	case QF_STRUCT:
++		return qf_dec_members(f->sub, f->nsub, v, r, level + 1);
++	case QF_VARRAY: {
++		uint32_t ew = qf_width(f->ekind), cnt;
++		if (f->lensz != 1 && f->lensz != 2) {
++			return EINVAL;
++		}
++		e = r_get(r, f->lensz, &x);
++		if (e) {
++			return e;
++		}
++		cnt = (uint32_t)x;
++		if (cnt > f->max) {
++			return EBADMSG;
++		}
++		c_store(base + f->count, cnt, 4);
++		for (uint32_t i = 0; i < cnt; i++) {
++			uint8_t *el = v + (size_t)i * f->esize;
++			if (f->ekind == QF_STRUCT) {
++				e = qf_dec_members(f->sub, f->nsub, el, r, level + 1);
++			} else {
++				e = r_get(r, ew, &x);
++				if (!e) {
++					c_store(el, x, ew);
++				}
++			}
++			if (e) {
++				return e;
++			}
++		}
++		return 0;
++	}
++	default:
++		return EINVAL;
++	}
++}
++
++int
++negroni_qmi_header(const uint8_t *buf, uint32_t len, uint8_t *type, uint16_t *txn, uint16_t *msg_id,
++    uint16_t *msg_len)
++{
++	if (!buf || len < QMI_HDR_LEN) {
++		return EBADMSG;
++	}
++	*type = buf[0];
++	*txn = (uint16_t)(buf[1] | (buf[2] << 8));
++	*msg_id = (uint16_t)(buf[3] | (buf[4] << 8));
++	*msg_len = (uint16_t)(buf[5] | (buf[6] << 8));
++	if (*msg_len > len - QMI_HDR_LEN) {
++		return EBADMSG;
++	}
++	return 0;
++}
++
++int
++negroni_qmi_encode(const struct qmi_msg_desc *d, uint8_t type, uint16_t txn, const void *c, uint8_t *buf,
++    uint32_t cap, uint32_t *outlen)
++{
++	struct qw w = { .b = buf, .cap = cap, .pos = QMI_HDR_LEN };
++	const uint8_t *base = c;
++
++	if (cap < QMI_HDR_LEN) {
++		return EMSGSIZE;
++	}
++	for (uint16_t i = 0; i < d->n; i++) {
++		const struct qmi_field *f = &d->f[i];
++		uint32_t at = w.pos;
++		int e;
++
++		if (f->valid != QF_MANDATORY && base[f->valid] == 0) {
++			continue;
++		}
++		e = w_put(&w, f->tlv, 1);
++		if (!e) {
++			e = w_put(&w, 0, 2);            /* length, patched below */
++		}
++		if (!e) {
++			e = qf_enc(f, base, &w, 1);
++		}
++		if (e) {
++			return e;
++		}
++		uint32_t tl = w.pos - at - 3;
++		if (tl > 0xffff) {
++			return EMSGSIZE;
++		}
++		buf[at + 1] = (uint8_t)tl;
++		buf[at + 2] = (uint8_t)(tl >> 8);
++	}
++	uint32_t ml = w.pos - QMI_HDR_LEN;
++	if (ml > 0xffff) {
++		return EMSGSIZE;
++	}
++	buf[0] = type;
++	buf[1] = (uint8_t)txn;
++	buf[2] = (uint8_t)(txn >> 8);
++	buf[3] = (uint8_t)d->id;
++	buf[4] = (uint8_t)(d->id >> 8);
++	buf[5] = (uint8_t)ml;
++	buf[6] = (uint8_t)(ml >> 8);
++	*outlen = w.pos;
++	return 0;
++}
++
++int
++negroni_qmi_decode(const struct qmi_msg_desc *d, const uint8_t *buf, uint32_t len, void *c)
++{
++	uint8_t type, *base = c;
++	uint16_t txn, id, ml;
++	uint64_t seen = 0;      /* one bit per table row (tables have < 64 rows) */
++	const uint8_t *p, *end;
++
++	memset(c, 0, d->csize);
++	if (negroni_qmi_header(buf, len, &type, &txn, &id, &ml) || d->n > 64) {
++		return EBADMSG;
++	}
++	p = buf + QMI_HDR_LEN;
++	end = p + ml;
++	while (p < end) {
++		uint32_t t, tl;
++
++		if (end - p < 3) {
++			return EBADMSG;
++		}
++		t = p[0];
++		tl = (uint32_t)p[1] | ((uint32_t)p[2] << 8);
++		p += 3;
++		if ((uint32_t)(end - p) < tl) {
++			return EBADMSG;
++		}
++		for (uint16_t i = 0; i < d->n; i++) {
++			const struct qmi_field *f = &d->f[i];
++			if (f->tlv != t) {
++				continue;
++			}
++			struct qr r = { .p = p, .end = p + tl };
++			if (qf_dec(f, base, &r, 1)) {
++				return EBADMSG;
++			}
++			if (f->valid != QF_MANDATORY) {
++				base[f->valid] = 1;
++			}
++			seen |= 1ull << i;
++			break;          /* trailing bytes in a TLV are ignored (newer firmware) */
++		}
++		p += tl;                /* unknown TLV types are skipped */
++	}
++	for (uint16_t i = 0; i < d->n; i++) {
++		if (d->f[i].valid == QF_MANDATORY && !(seen & (1ull << i))) {
++			return EBADMSG;
++		}
++	}
++	return 0;
++}
++
++/* =============================== WLFW client =============================== */
++
++#define WLFW_MEM_TOTAL_MAX      (64u << 20)     /* refuse a request above 64 MiB in total */
++#define WLFW_SEG_MAX            (32u << 20)
++#define WLFW_FILE_CAP           (256u << 10)    /* regdb.bin 24 KiB, bdwlan.* 59 KiB on 16.0.3.530 */
++#define WLFW_DELAY_SEG_CNT      5u              /* ath11k qmi.h:29 ATH11K_QMI_FW_MEM_REQ_SEGMENT_CNT */
++
++struct wlfw_seg {
++	vm_offset_t kva;
++	uint64_t pa;
++	uint32_t size, alloc, type;
++};
++
++static struct {
++	struct mhi_host *h;
++	uint16_t txn;
++	/* the one request in flight */
++	bool waiting, done;
++	uint16_t wait_id, wait_txn;
++	const struct qmi_msg_desc *wait_d;
++	void *wait_out;
++	int wait_err;
++	/* indications (kept until consumed) */
++	bool req_mem, fw_mem_ready, fw_init_done, fw_ready, cal_done, init_any;
++	uint32_t ind_other, resp_other;
++	struct wlfw_request_mem_ind mem;
++	struct wlfw_fw_init_done_ind init_done;
++	/* results */
++	struct wlfw_seg seg[WLFW_MAX_NUM_MEM_SEG];
++	uint32_t nseg;
++	uint32_t chip_id, board_id;
++} W;
++
++static uint8_t g_qbuf[WLAN_TX_LEN - QRTR_HDR_V1_LEN];  /* one encoded request */
++static struct wlfw_bdf_download_req g_bdf;              /* 6.2 KiB, not on the stack */
++static struct wlfw_cap_resp g_cap;
++static struct wlfw_respond_mem_req g_resp_mem;
++
++/* QRTR DATA from the WLFW server (qrtr_pump context: decode, store, never send) */
++static void
++wlfw_data(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
++{
++	uint8_t type;
++	uint16_t txn, id, ml;
++
++	if (node != negroni_qrtr.wlfw.node || port != negroni_qrtr.wlfw.port ||
++	    negroni_qmi_header(p, len, &type, &txn, &id, &ml)) {
++		if (W.resp_other++ < 4) {
++			printf("NEGRONI WLAN: QMI packet of %u bytes from node %u port %#x ignored\n", len, node, port);
++		}
++		return;
++	}
++	if (type == QMI_RESPONSE) {
++		if (W.waiting && !W.done && id == W.wait_id && txn == W.wait_txn) {
++			W.wait_err = negroni_qmi_decode(W.wait_d, p, len, W.wait_out);
++			W.done = true;
++		} else if (W.resp_other++ < 4) {
++			printf("NEGRONI WLAN: QMI response %#x txn %u not expected (waiting %#x txn %u)\n", id, txn,
++			    W.wait_id, W.wait_txn);
++		}
++		return;
++	}
++	if (type != QMI_INDICATION) {
++		if (W.ind_other++ < 4) {
++			printf("NEGRONI WLAN: QMI message type %u id %#x from the chip ignored\n", type, id);
++		}
++		return;
++	}
++	switch (id) {
++	case WLFW_REQUEST_MEM_IND:
++		if (negroni_qmi_decode(&wlfw_request_mem_ind_d, p, len, &W.mem)) {
++			printf("NEGRONI WLAN: QMI REQUEST_MEM_IND of %u bytes does not decode; ignored\n", len);
++			memset(&W.mem, 0, sizeof(W.mem));
++			break;
++		}
++		W.req_mem = true;
++		break;
++	case WLFW_FW_MEM_READY_IND:
++		W.fw_mem_ready = true;
++		break;
++	case WLFW_FW_INIT_DONE_IND:
++		(void)negroni_qmi_decode(&wlfw_fw_init_done_ind_d, p, len, &W.init_done);
++		W.fw_init_done = W.init_any = true;
++		break;
++	case WLFW_FW_READY_IND:
++		W.fw_ready = W.init_any = true;
++		break;
++	case WLFW_CAL_DONE_IND:
++		W.cal_done = true;
++		break;
++	default:
++		if (W.ind_other++ < 8) {
++			printf("NEGRONI WLAN: QMI indication %#x (%u bytes) ignored\n", id, ml);
++		}
++		break;
++	}
++}
++
++/* pump QRTR until *flag or the time-out; the WLFW server must stay up */
++static int
++wlfw_wait(volatile bool *flag, uint32_t ms, const char *what)
++{
++	uint64_t deadline = negroni_wlan_ms() + ms;
++	int error;
++
++	for (;;) {
++		error = negroni_wlan_qrtr_pump(W.h);
++		if (error) {
++			return error;
++		}
++		if (*flag) {
++			return 0;
++		}
++		if (negroni_qrtr.wlfw_gone || negroni_qrtr.bye) {
++			return negroni_wlan_failed(EIO, "the WLFW server left (%s) while waiting for %s",
++			           negroni_qrtr.bye ? "BYE" : "DEL_SERVER", what);
++		}
++		if (negroni_wlan_ms() >= deadline) {
++			return negroni_wlan_failed(ETIMEDOUT, "no %s in %u ms", what, ms);
++		}
++		delay(1000);
++	}
++}
++
++/*
++ * One request -> response (qmi_send_request + qmi_txn_wait). The response struct starts with
++ * struct wlfw_resp (TLV 0x02); its result/error is logged. allow_error: return 0 on a refusal and
++ * let the caller look at resp (the delayed RESPOND_MEM).
++ */
++static int
++wlfw_txn(const struct qmi_msg_desc *rq, const void *req, const struct qmi_msg_desc *rs, void *resp,
++    bool allow_error, bool quiet)
++{
++	struct wlfw_resp *r = resp;
++	uint32_t len;
++	char what[48];
++	int error;
++
++	W.txn = (uint16_t)(W.txn + 1);
++	if (W.txn == 0) {
++		W.txn = 1;
++	}
++	error = negroni_qmi_encode(rq, QMI_REQUEST, W.txn, req, g_qbuf, sizeof(g_qbuf), &len);
++	if (error) {
++		return negroni_wlan_failed(error, "QMI %s request does not encode (error %d)", rq->name, error);
++	}
++	W.wait_id = rq->id;
++	W.wait_txn = W.txn;
++	W.wait_d = rs;
++	W.wait_out = resp;
++	W.wait_err = 0;
++	W.done = false;
++	W.waiting = true;
++	error = negroni_wlan_qrtr_send(W.h, QRTR_TYPE_DATA, QRTR_LOCAL_PORT, negroni_qrtr.wlfw.node,
++	    negroni_qrtr.wlfw.port, g_qbuf, len);
++	if (!error) {
++		snprintf(what, sizeof(what), "the %s response (0x%02x, txn %u)", rq->name, rq->id, W.txn);
++		error = wlfw_wait(&W.done, W.h->timeout_ms, what);
++	}
++	W.waiting = false;
++	if (error) {
++		return error;
++	}
++	if (W.wait_err) {
++		return negroni_wlan_failed(EBADMSG, "the QMI %s response does not decode", rq->name);
++	}
++	if (!quiet || r->result != QMI_RESULT_SUCCESS) {
++		printf("NEGRONI WLAN: QMI %s (0x%02x) response: result %u error %u\n", rq->name, rq->id, r->result,
++		    r->error);
++	}
++	if (r->result != QMI_RESULT_SUCCESS && !allow_error) {
++		return negroni_wlan_failed(EIO, "QMI %s refused: result %u error %u", rq->name, r->result, r->error);
++	}
++	return 0;
++}
++
++void
++negroni_wlan_wlfw_free(void)
++{
++	for (uint32_t i = 0; i < W.nseg; i++) {
++		if (W.seg[i].kva) {
++			flush_dcache64((addr64_t)W.seg[i].pa, W.seg[i].alloc, TRUE);
++			kmem_free(kernel_map, W.seg[i].kva, W.seg[i].alloc);
++		}
++	}
++	memset(W.seg, 0, sizeof(W.seg));
++	W.nseg = 0;
++}
++
++/* allocate every requested segment: physically contiguous, zeroed, inside the 36-bit MHI window */
++static int
++wlfw_alloc(const struct wlfw_request_mem_ind *m)
++{
++	uint64_t sum = 0;
++
++	for (uint32_t i = 0; i < m->mem_seg_len; i++) {
++		const struct wlfw_mem_seg *s = &m->mem_seg[i];
++		printf("NEGRONI WLAN: firmware asks segment %u: %#x bytes, type %u, %u config entries\n", i, s->size,
++		    s->type, s->mem_cfg_len);
++		if (s->size == 0 || s->size > WLFW_SEG_MAX) {
++			return negroni_wlan_failed(ERANGE, "segment %u size %#x (type %u) refused", i, s->size, s->type);
++		}
++		sum += s->size;
++	}
++	if (m->mem_seg_len == 0 || sum > WLFW_MEM_TOTAL_MAX) {
++		return negroni_wlan_failed(ERANGE, "%u segments of %llu bytes in total refused (max %u)", m->mem_seg_len,
++		           sum, WLFW_MEM_TOTAL_MAX);
++	}
++	for (uint32_t i = 0; i < m->mem_seg_len; i++) {
++		struct wlfw_seg *g = &W.seg[i];
++		vm_offset_t kva = 0;
++		uint32_t alloc = (m->mem_seg[i].size + PAGE_MASK) & ~(uint32_t)PAGE_MASK;
++
++		/* every page below 36 bit (the chip's DMA mask): max_pnum = last page number under 1 << 36 */
++		if (kmem_alloc_contig(kernel_map, &kva, alloc, PAGE_MASK, (ppnum_t)(atop_64(MHI_DMA_MASK + 1) - 1), 0,
++		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("NEGRONI WLAN: no %#x contiguous bytes for segment %u\n", alloc, i);
++			return ENOMEM;
++		}
++		W.nseg = i + 1;
++		g->kva = kva;
++		g->alloc = alloc;
++		g->size = m->mem_seg[i].size;
++		g->type = m->mem_seg[i].type;
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++		g->pa = ptoa_64(pn);
++		if (!pn || g->pa + alloc - 1 > MHI_DMA_MASK) {
++			return negroni_wlan_failed(ERANGE, "segment %u at %#llx outside the 36-bit DMA window", i, g->pa);
++		}
++		flush_dcache64((addr64_t)g->pa, alloc, TRUE);  /* zeroes in RAM, no line left in the cache */
++		printf("NEGRONI WLAN: segment %u type %u: %#x bytes at %#llx\n", i, g->type, g->size, g->pa);
++	}
++	return 0;
++}
++
++static int
++wlfw_respond_mem(uint32_t nseg)
++{
++	struct wlfw_resp_only r;
++
++	memset(&g_resp_mem, 0, sizeof(g_resp_mem));
++	g_resp_mem.mem_seg_len = nseg;
++	for (uint32_t i = 0; i < nseg; i++) {
++		g_resp_mem.mem_seg[i].addr = W.seg[i].pa;
++		g_resp_mem.mem_seg[i].size = W.seg[i].size;
++		g_resp_mem.mem_seg[i].type = W.seg[i].type;
++	}
++	int error = wlfw_txn(&wlfw_respond_mem_req_d, &g_resp_mem, &wlfw_respond_mem_resp_d, &r, nseg == 0, false);
++	if (!error && nseg == 0 && r.resp.result != QMI_RESULT_SUCCESS && r.resp.error != 0) {
++		/* ath11k qmi.c:1943: with zero segments the refusal is expected only with error 0 */
++		return negroni_wlan_failed(EIO, "QMI RESPOND_MEM (0 segments) refused with error %u", r.resp.error);
++	}
++	return error;
++}
++
++/* step 20: REQUEST_MEM_IND -> allocate -> RESPOND_MEM; once ath11k's "smaller chunks" retry */
++static int
++wlfw_memory(void)
++{
++	int error;
++
++	for (int attempt = 0; attempt < 2; attempt++) {
++		error = wlfw_wait(&W.req_mem, W.h->timeout_ms, "REQUEST_MEM_IND");
++		if (error) {
++			return error;
++		}
++		W.req_mem = false;
++		error = wlfw_alloc(&W.mem);
++		if (error == ENOMEM && attempt == 0 && W.mem.mem_seg_len <= WLFW_DELAY_SEG_CNT) {
++			/* ath11k qmi.c:1886-1897: answer 0 segments, the firmware asks again in smaller pieces */
++			negroni_wlan_wlfw_free();
++			printf("NEGRONI WLAN: contiguous allocation failed; RESPOND_MEM with 0 segments (ask smaller)\n");
++			error = wlfw_respond_mem(0);
++			if (error) {
++				return error;
++			}
++			continue;
++		}
++		if (error) {
++			return error == ENOMEM ? negroni_wlan_failed(ENOMEM, "no contiguous memory for the firmware "
++			           "segments") : error;
++		}
++		return wlfw_respond_mem(W.nseg);
++	}
++	return negroni_wlan_failed(ENOMEM, "the second REQUEST_MEM could not be met either");
++}
++
++/* step 22 helper: send one file in <= 6144-byte segments (cnss2 qmi.c:1005-1062) */
++static int
++wlfw_bdf_file(const char *name, uint32_t bdf_type, bool must)
++{
++	struct wlfw_bdf_download_resp r;
++	vm_offset_t kva = 0;
++	uint32_t size = 0, off = 0, seg = 0;
++	int error;
++
++	if (kmem_alloc(kernel_map, &kva, WLFW_FILE_CAP, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return negroni_wlan_failed(ENOMEM, "no memory for %s", name);
++	}
++	error = negroni_wlan_fw_file(name, (void *)kva, WLFW_FILE_CAP, &size);
++	if (error) {
++		kmem_free(kernel_map, kva, WLFW_FILE_CAP);
++		if (!must) {
++			printf("NEGRONI WLAN: %s not sent (error %d); cnss2 goes on without it\n", name, error);
++			return 0;
++		}
++		return negroni_wlan_failed(error, "board file %s not in the firmware area (error %d)", name, error);
++	}
++	while (off < size) {
++		uint32_t n = MIN(size - off, WLFW_MAX_DATA_SIZE);
++
++		memset(&g_bdf, 0, sizeof(g_bdf));
++		g_bdf.valid = 1;
++		g_bdf.file_id_valid = 1;
++		g_bdf.file_id = W.board_id;
++		g_bdf.total_size_valid = 1;
++		g_bdf.total_size = size - off;          /* cnss2 sends the remaining bytes (qmi.c:1011) */
++		g_bdf.seg_id_valid = 1;
++		g_bdf.seg_id = seg;
++		g_bdf.data_valid = 1;
++		g_bdf.data_len = n;
++		memcpy(g_bdf.data, (const void *)(kva + off), n);
++		g_bdf.end_valid = 1;
++		g_bdf.end = (off + n == size) ? 1 : 0;
++		g_bdf.bdf_type_valid = 1;
++		g_bdf.bdf_type = (uint8_t)bdf_type;
++		error = wlfw_txn(&wlfw_bdf_download_req_d, &g_bdf, &wlfw_bdf_download_resp_d, &r, !must, true);
++		if (error) {
++			break;
++		}
++		if (r.resp.result != QMI_RESULT_SUCCESS) {      /* only when !must */
++			printf("NEGRONI WLAN: %s segment %u refused (result %u error %u); cnss2 goes on without it\n",
++			    name, seg, r.resp.result, r.resp.error);
++			break;
++		}
++		off += n;
++		seg++;
++	}
++	kmem_free(kernel_map, kva, WLFW_FILE_CAP);
++	if (!error && off == size) {
++		printf("NEGRONI WLAN: %s (type %u) %u bytes sent in %u segments, file id %#x%s\n", name, bdf_type, size,
++		    seg, W.board_id, r.host_bdf_data_valid ? "" : ", no host_bdf_data");
++		if (r.host_bdf_data_valid) {
++			printf("NEGRONI WLAN: host_bdf_data %#llx (HW_XPA %u)\n", r.host_bdf_data,
++			    (r.host_bdf_data & WLFW_HW_XPA) ? 1 : 0);
++		}
++	}
++	return error;
++}
++
++/* cnss2 qmi.c:729 cnss_get_bdf_file_name (CNSS_BDF_ELF) with the OnePlus default (qmi.c:724) */
++static void
++wlfw_bdf_name(char *name, size_t len)
++{
++	bool gf = (W.chip_id & WLFW_CHIP_ID_GF_MASK) != 0;
++
++	if (W.board_id == 0xff) {
++		snprintf(name, len, gf ? "bdwlang.elf" : "bdwlan.elf");
++	} else if (W.board_id < 0xff) {
++		snprintf(name, len, gf ? "bdwlang.e%02x" : "bdwlan.e%02x", W.board_id);
++	} else {
++		snprintf(name, len, "bdwlan%02x.e%02x", (W.board_id >> 8) & 0xff, W.board_id & 0xff);
++	}
++}
++
++int
++negroni_wlan_wlfw_run(struct mhi_host *h, uint64_t m3_pa, uint32_t m3_size)
++{
++	int error;
++
++	memset(&W, 0, sizeof(W));
++	W.h = h;
++	W.board_id = 0xff;
++	negroni_qrtr.data_cb = wlfw_data;
++
++	negroni_wlan_step(18, "WLFW IND_REGISTER");
++	{
++		struct wlfw_ind_register_req q;
++		struct wlfw_ind_register_resp r;
++
++		memset(&q, 0, sizeof(q));
++		q.fw_ready_enable_valid = q.fw_ready_enable = 1;
++		q.client_id_valid = 1;
++		q.client_id = WLFW_CLIENT_ID;
++		q.request_mem_enable_valid = q.request_mem_enable = 1;
++		q.fw_mem_ready_enable_valid = q.fw_mem_ready_enable = 1;
++		q.fw_init_done_enable_valid = q.fw_init_done_enable = 1;
++		q.cal_done_enable_valid = q.cal_done_enable = 1;
++		error = wlfw_txn(&wlfw_ind_register_req_d, &q, &wlfw_ind_register_resp_d, &r, false, false);
++		if (error) {
++			return error;
++		}
++		if (r.fw_status_valid) {
++			printf("NEGRONI WLAN: IND_REGISTER fw_status %#llx\n", r.fw_status);
++			if (r.fw_status & WLFW_ALREADY_REGISTERED) {
++				/* cnss2 qmi.c:212: a warm firmware; the cold sequence below would not match */
++				return negroni_wlan_failed(EALREADY, "the firmware reports ALREADY_REGISTERED (warm chip)");
++			}
++		}
++	}
++
++	negroni_wlan_step(19, "WLFW HOST_CAP");
++	{
++		struct wlfw_host_cap_req q;
++		struct wlfw_resp_only r;
++
++		memset(&q, 0, sizeof(q));
++		q.num_clients_valid = 1;
++		q.num_clients = 1;
++		q.bdf_support_valid = q.bdf_support = 1;
++		q.m3_support_valid = q.m3_support = 1;
++		q.m3_cache_support_valid = q.m3_cache_support = 1;
++		q.cal_done_valid = 1;           /* cal_done 0: no cold-boot calibration data yet */
++		q.host_build_type_valid = 1;
++		q.host_build_type = WLFW_HOST_BUILD_SECONDARY;
++		q.feature_list_valid = 1;
++		q.feature_list = WLFW_FEATURE_LIST;
++		/* not sent: wake_msi (no MSI), ddr_range (no SMMU stage 1: bypass), mlo_* (KIWI/MANGO only) */
++		error = wlfw_txn(&wlfw_host_cap_req_d, &q, &wlfw_host_cap_resp_d, &r, false, false);
++		if (error) {
++			return error;
++		}
++	}
++
++	negroni_wlan_step(20, "WLFW firmware memory");
++	error = wlfw_memory();
++	if (error) {
++		return error;
++	}
++
++	negroni_wlan_step(21, "WLFW FW_MEM_READY + CAP");
++	error = wlfw_wait(&W.fw_mem_ready, h->timeout_ms, "FW_MEM_READY_IND");
++	if (error) {
++		return error;
++	}
++	{
++		struct wlfw_empty q = { 0 };
++
++		error = wlfw_txn(&wlfw_cap_req_d, &q, &wlfw_cap_resp_d, &g_cap, false, false);
++		if (error) {
++			return error;
++		}
++		W.chip_id = g_cap.chip_info_valid ? g_cap.chip_info.chip_id : 0;
++		W.board_id = g_cap.board_info_valid ? g_cap.board_info.v : 0xff;      /* cnss2 qmi.c:557-560 */
++		printf("NEGRONI WLAN: chip id %#x family %#x, board id %#x, soc id %#x, otp %#x\n", W.chip_id,
++		    g_cap.chip_info_valid ? g_cap.chip_info.chip_family : 0, W.board_id,
++		    g_cap.soc_info_valid ? g_cap.soc_info.v : 0, g_cap.otp_version_valid ? g_cap.otp_version : 0);
++		printf("NEGRONI WLAN: firmware version %#x, timestamp \"%s\", build \"%s\"\n",
++		    g_cap.fw_version_info_valid ? g_cap.fw_version_info.fw_version : 0,
++		    g_cap.fw_version_info_valid ? g_cap.fw_version_info.fw_build_timestamp : "",
++		    g_cap.fw_build_id_valid ? g_cap.fw_build_id : "");
++		printf("NEGRONI WLAN: fw_caps %#llx, voltage %u mV, time freq %u Hz, foundry \"%s\", regdb support %u mandatory %u\n",
++		    g_cap.fw_caps_valid ? g_cap.fw_caps : 0, g_cap.voltage_mv_valid ? g_cap.voltage_mv : 0,
++		    g_cap.time_freq_hz_valid ? g_cap.time_freq_hz : 0, g_cap.foundry_name_valid ? g_cap.foundry_name : "",
++		    g_cap.regdb_support_valid ? g_cap.regdb_support : 0, g_cap.regdb_mandatory_valid ? g_cap.regdb_mandatory : 0);
++	}
++
++	negroni_wlan_step(22, "WLFW BDF download");
++	{
++		char name[48];
++		bool regdb_must = g_cap.regdb_mandatory_valid && g_cap.regdb_mandatory;
++
++		/* cnss2 main.c:525: regdb first, its failure is ignored (unless the firmware calls it mandatory) */
++		error = wlfw_bdf_file("regdb.bin", WLFW_BDF_TYPE_REGDB, regdb_must);
++		if (error) {
++			return error;
++		}
++		wlfw_bdf_name(name, sizeof(name));
++		error = wlfw_bdf_file(name, WLFW_BDF_TYPE_ELF, true);
++		if (error) {
++			return error;
++		}
++	}
++
++	negroni_wlan_step(23, "WLFW M3_INFO");
++	{
++		struct wlfw_m3_info_req q = { .addr = m3_pa, .size = m3_size };
++		struct wlfw_resp_only r;
++
++		if (!m3_pa || !m3_size) {
++			return negroni_wlan_failed(ENOENT, "no m3.bin in the DMA pool");
++		}
++		printf("NEGRONI WLAN: m3.bin %u bytes at %#llx\n", m3_size, m3_pa);
++		error = wlfw_txn(&wlfw_m3_info_req_d, &q, &wlfw_m3_info_resp_d, &r, false, false);
++		if (error) {
++			return error;
++		}
++	}
++
++	negroni_wlan_step(24, "WLFW FW_INIT_DONE");
++	/* HSP firmware sends FW_INIT_DONE_IND (cnss2 qmi.c:159); older firmware FW_READY_IND */
++	error = wlfw_wait(&W.init_any, MAX(h->timeout_ms, 10000u), "FW_INIT_DONE_IND / FW_READY_IND");
++	if (error) {
++		return error;
++	}
++	printf("NEGRONI WLAN: step 24 %s received%s (hang data offset %#x length %u)\n",
++	    W.fw_init_done ? "FW_INIT_DONE_IND" : "FW_READY_IND", W.cal_done ? ", CAL_DONE seen" : "",
++	    W.init_done.hang_data_addr_offset, W.init_done.hang_data_length);
++	return 0;
++}
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_qmi.h b/bsd/dev/negroni_wlan_qmi.h
+new file mode 100644
+index 0000000..4a619e4
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_qmi.h
+@@ -0,0 +1,74 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: a generic QMI TLV encoder/decoder (patch 0266).
++ *
++ * QMI wire format (Linux include/linux/soc/qcom/qmi.h, drivers/soc/qcom/qmi_encdec.c; read, not
++ * copied): a 7-byte header {u8 type; le16 txn_id; le16 msg_id; le16 msg_len}, then msg_len bytes
++ * of TLVs {u8 type; le16 length; value}. Inside a value, all numbers are little endian and packed:
++ *   - a nested string has a length prefix (u8 if max + 1 <= 255, else le16); a top-level
++ *     string has no prefix (the TLV length is the string length);
++ *   - a variable array has an element-count prefix (u8 or le16, set per field), then the elements;
++ *   - a struct is its members in order, with no padding.
++ * Optional TLVs (type >= 0x10) carry a "valid" byte in our C structs, not on the wire. A decoder
++ * skips TLV types it does not know (a newer firmware may add some).
++ *
++ * The message tables are in negroni_wlfw_tables.h. Every length the chip sends is checked.
++ */
++#ifndef _NEGRONI_WLAN_QMI_H_
++#define _NEGRONI_WLAN_QMI_H_
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define QMI_HDR_LEN             7u
++#define QMI_REQUEST             0u      /* qmi.h:32 */
++#define QMI_RESPONSE            2u
++#define QMI_INDICATION          4u
++#define QMI_RESULT_SUCCESS      0u      /* qmi.h QMI_RESULT_SUCCESS_V01 */
++#define QMI_TLV_RESULT          0x02u   /* struct qmi_response_type_v01 {u16 result; u16 error} */
++
++enum {
++	QF_U8 = 1,      /* 1 byte */
++	QF_U16,         /* 2 bytes */
++	QF_U32,         /* 4 bytes (also the v01 signed 4-byte enums) */
++	QF_U64,         /* 8 bytes */
++	QF_STRING,      /* char[max + 1] in C; see above for the prefix */
++	QF_STRUCT,      /* members in `sub` */
++	QF_VARRAY,      /* count prefix (lensz bytes) + elements of `ekind` (QF_U8..QF_U64 or QF_STRUCT) */
++};
++
++#define QF_MANDATORY    (-1)
++
++struct qmi_field {
++	uint8_t tlv;            /* TLV type (top-level fields only; 0 in a nested table) */
++	uint8_t kind;           /* QF_* */
++	uint8_t lensz;          /* QF_VARRAY count prefix / nested QF_STRING length prefix: 1 or 2 */
++	uint8_t ekind;          /* QF_VARRAY element kind */
++	uint16_t off;           /* offset of the value in the C struct */
++	int16_t valid;          /* offset of the u8 valid flag, or QF_MANDATORY */
++	uint16_t count;         /* QF_VARRAY: offset of the uint32_t element count */
++	uint16_t max;           /* QF_VARRAY: max elements; QF_STRING: max characters */
++	uint16_t esize;         /* QF_VARRAY: C size of one element */
++	uint16_t nsub;          /* QF_STRUCT / QF_VARRAY of QF_STRUCT: number of members */
++	const struct qmi_field *sub;
++};
++
++struct qmi_msg_desc {
++	uint16_t id;            /* message id (request and response share it) */
++	const char *name;
++	const struct qmi_field *f;
++	uint16_t n;             /* fields in f */
++	uint32_t csize;         /* sizeof the C struct */
++};
++
++/* Encode `c` as one QMI message (header + TLVs) into buf. 0 or EMSGSIZE / EINVAL. */
++int negroni_qmi_encode(const struct qmi_msg_desc *d, uint8_t type, uint16_t txn, const void *c,
++    uint8_t *buf, uint32_t cap, uint32_t *outlen);
++/* Decode the TLVs of the message at buf (header included) into `c` (zeroed first). 0 or EBADMSG. */
++int negroni_qmi_decode(const struct qmi_msg_desc *d, const uint8_t *buf, uint32_t len, void *c);
++/* Header only: 0 and the fields, or EBADMSG (short, or msg_len beyond len). */
++int negroni_qmi_header(const uint8_t *buf, uint32_t len, uint8_t *type, uint16_t *txn, uint16_t *msg_id,
++    uint16_t *msg_len);
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++#endif /* _NEGRONI_WLAN_QMI_H_ */
+diff --git a/bsd/dev/negroni_wlfw_tables.h b/bsd/dev/negroni_wlfw_tables.h
+new file mode 100644
+index 0000000..fb910fa
+--- /dev/null
++++ b/bsd/dev/negroni_wlfw_tables.h
+@@ -0,0 +1,354 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: the QMI WLFW messages that level 6 uses (patch 0266), as field tables
++ * for the generic coder in negroni_wlan_qmi.c. The C structs are ours (only the fields we send or
++ * read). Each table row names its source: "v01.c:N" is the qmi_elem_info entry of that value in
++ * out/src/op-kernel/drivers/net/wireless/cnss_utils/wlan_firmware_service_v01.c (OnePlus kernel
++ * e9da592), "v01.h:N" the struct or #define in wlan_firmware_service_v01.h. TLV types, element
++ * sizes, length prefixes and maxima are from those lines; ath11k qmi.c has the same numbers for
++ * host_cap 0x10..0x1c (checked). Not copied: written from the field lists.
++ */
++#ifndef _NEGRONI_WLFW_TABLES_H_
++#define _NEGRONI_WLFW_TABLES_H_
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++
++#include <stdint.h>
++#include "negroni_wlan_qmi.h"
++
++/* message ids (v01.h:14-106) */
++#define WLFW_IND_REGISTER       0x0020u /* v01.h:24 */
++#define WLFW_FW_READY_IND       0x0021u /* v01.h:27 */
++#define WLFW_CAP                0x0024u /* v01.h:17 */
++#define WLFW_BDF_DOWNLOAD       0x0025u /* v01.h:62 */
++#define WLFW_HOST_CAP           0x0034u /* v01.h:88 */
++#define WLFW_REQUEST_MEM_IND    0x0035u /* v01.h:31 */
++#define WLFW_RESPOND_MEM        0x0036u /* v01.h:43 */
++#define WLFW_FW_MEM_READY_IND   0x0037u /* v01.h:63 */
++#define WLFW_FW_INIT_DONE_IND   0x0038u /* v01.h:94 */
++#define WLFW_M3_INFO            0x003cu /* v01.h:39 */
++#define WLFW_CAL_DONE_IND       0x003eu /* v01.h:91 */
++
++#define WLFW_MAX_NUM_MEM_SEG    52u     /* v01.h:121 QMI_WLFW_MAX_NUM_MEM_SEG_V01 */
++#define WLFW_MAX_NUM_MEM_CFG    2u      /* v01.h:119 */
++#define WLFW_MAX_DATA_SIZE      6144u   /* v01.h:123 QMI_WLFW_MAX_DATA_SIZE_V01 (BDF segment) */
++#define WLFW_MAX_TIMESTAMP_LEN  32u     /* v01.h:126 */
++#define WLFW_MAX_BUILD_ID_LEN   128u    /* v01.h:112 */
++#define WLFW_MAX_STR_LEN        16u     /* v01.h:129 */
++#define WLFW_CLIENT_ID          0x4b4e454cu     /* cnss2 qmi.c:24, ath11k qmi.h:199 ("KNEL") */
++#define WLFW_ALREADY_REGISTERED 0x01ull /* v01.h:302 fw_status bit */
++#define WLFW_HOST_BUILD_SECONDARY 2u    /* v01.h:213; cnss2 qmi.h:318 (no CONFIG_CNSS2_DEBUG) [I] */
++#define WLFW_HW_XPA             0x01ull /* v01.h:310 host_bdf_data bit */
++#define WLFW_BDF_TYPE_ELF       1u      /* cnss2 main.h:356 CNSS_BDF_ELF (main.c:56 default) */
++#define WLFW_BDF_TYPE_REGDB     4u      /* cnss2 main.h:357 CNSS_BDF_REGDB */
++#define WLFW_CHIP_ID_GF_MASK    0x10u   /* cnss2 qmi.c:36: bdwlang.* files */
++/* feature_list (v01.h:261-266): BOOTSTRAP_CLOCK_SELECT (bit 0: DT qcom,xo-clk-gpio, cnss2
++ * power.c:798) | CNSS_WLAN_EN_SUPPORT (bit 2: wlan_en pinctrl states, power.c:780); no
++ * CNSS_DRV_SUPPORT (bit 1: no qcom,drv-supported in out/live.dts:13840) */
++#define WLFW_FEATURE_LIST       0x5ull
++
++#define QOFF(S, f)      ((uint16_t)__builtin_offsetof(S, f))
++#define QVAL(S, f)      ((int16_t)__builtin_offsetof(S, f##_valid))
++#define QN(a)           ((uint16_t)(sizeof(a) / sizeof((a)[0])))
++/* optional scalar TLV / mandatory scalar TLV / nested scalar member */
++#define F_OPT(t, k, S, f)       { .tlv = (t), .kind = (k), .off = QOFF(S, f), .valid = QVAL(S, f) }
++#define F_MAN(t, k, S, f)       { .tlv = (t), .kind = (k), .off = QOFF(S, f), .valid = QF_MANDATORY }
++#define F_MEM(k, S, f)          { .kind = (k), .off = QOFF(S, f), .valid = QF_MANDATORY }
++#define F_RESULT(S)             { .tlv = QMI_TLV_RESULT, .kind = QF_STRUCT, .off = QOFF(S, resp), \
++	                          .valid = QF_MANDATORY, .sub = wlfw_resp_f, .nsub = 2 }
++
++/* struct qmi_response_type_v01 (qmi.h:112): TLV 0x02 of every response */
++struct wlfw_resp {
++	uint16_t result, error;
++};
++static const struct qmi_field wlfw_resp_f[] = {
++	F_MEM(QF_U16, struct wlfw_resp, result),
++	F_MEM(QF_U16, struct wlfw_resp, error),
++};
++
++/* ---- IND_REGISTER 0x20 (v01.h:434 / v01.c:730, resp v01.c:1139) ---- */
++struct wlfw_ind_register_req {
++	uint8_t fw_ready_enable_valid, fw_ready_enable;
++	uint8_t client_id_valid;
++	uint32_t client_id;
++	uint8_t request_mem_enable_valid, request_mem_enable;
++	uint8_t fw_mem_ready_enable_valid, fw_mem_ready_enable;
++	uint8_t fw_init_done_enable_valid, fw_init_done_enable;
++	uint8_t cal_done_enable_valid, cal_done_enable;
++};
++static const struct qmi_field wlfw_ind_register_req_f[] = {
++	F_OPT(0x10, QF_U8, struct wlfw_ind_register_req, fw_ready_enable),      /* v01.c:741 */
++	F_OPT(0x15, QF_U32, struct wlfw_ind_register_req, client_id),           /* v01.c:841 */
++	F_OPT(0x16, QF_U8, struct wlfw_ind_register_req, request_mem_enable),   /* v01.c:861 */
++	F_OPT(0x17, QF_U8, struct wlfw_ind_register_req, fw_mem_ready_enable),  /* v01.c:881 */
++	F_OPT(0x18, QF_U8, struct wlfw_ind_register_req, fw_init_done_enable),  /* v01.c:901 */
++	F_OPT(0x1b, QF_U8, struct wlfw_ind_register_req, cal_done_enable),      /* v01.c:961 */
++};
++struct wlfw_ind_register_resp {
++	struct wlfw_resp resp;
++	uint8_t fw_status_valid;
++	uint64_t fw_status;
++};
++static const struct qmi_field wlfw_ind_register_resp_f[] = {
++	F_RESULT(struct wlfw_ind_register_resp),                                /* v01.c:1140 */
++	F_OPT(0x10, QF_U64, struct wlfw_ind_register_resp, fw_status),          /* v01.c:1161 */
++};
++
++/* ---- HOST_CAP 0x34 (v01.h:867 / v01.c:3284, resp v01.c:3935) ---- */
++struct wlfw_host_cap_req {
++	uint8_t num_clients_valid;
++	uint32_t num_clients;
++	uint8_t bdf_support_valid, bdf_support;
++	uint8_t m3_support_valid, m3_support;
++	uint8_t m3_cache_support_valid, m3_cache_support;
++	uint8_t cal_done_valid, cal_done;
++	uint8_t mem_cfg_mode_valid, mem_cfg_mode;
++	uint8_t host_build_type_valid;
++	uint32_t host_build_type;
++	uint8_t feature_list_valid;
++	uint64_t feature_list;
++};
++static const struct qmi_field wlfw_host_cap_req_f[] = {
++	F_OPT(0x10, QF_U32, struct wlfw_host_cap_req, num_clients),             /* v01.c:3295 */
++	F_OPT(0x14, QF_U8, struct wlfw_host_cap_req, bdf_support),              /* v01.c:3385 */
++	F_OPT(0x16, QF_U8, struct wlfw_host_cap_req, m3_support),               /* v01.c:3425 */
++	F_OPT(0x17, QF_U8, struct wlfw_host_cap_req, m3_cache_support),         /* v01.c:3445 */
++	F_OPT(0x1a, QF_U8, struct wlfw_host_cap_req, cal_done),                 /* v01.c:3505 */
++	F_OPT(0x1c, QF_U8, struct wlfw_host_cap_req, mem_cfg_mode),             /* v01.c:3545 */
++	F_OPT(0x20, QF_U32, struct wlfw_host_cap_req, host_build_type),         /* v01.c:3626 (s32 enum) */
++	F_OPT(0x27, QF_U64, struct wlfw_host_cap_req, feature_list),            /* v01.c:3767 */
++};
++struct wlfw_resp_only {
++	struct wlfw_resp resp;
++};
++static const struct qmi_field wlfw_resp_only_f[] = {
++	F_RESULT(struct wlfw_resp_only),        /* HOST_CAP v01.c:3936, RESPOND_MEM :4016, M3_INFO :4330 */
++};
++
++/* ---- REQUEST_MEM_IND 0x35 (v01.h:361 mem_seg, v01.c:3955) ---- */
++struct wlfw_mem_cfg {
++	uint64_t offset;
++	uint32_t size;
++	uint8_t secure_flag;
++};
++static const struct qmi_field wlfw_mem_cfg_f[] = {
++	F_MEM(QF_U64, struct wlfw_mem_cfg, offset),                             /* v01.c:247 */
++	F_MEM(QF_U32, struct wlfw_mem_cfg, size),                               /* v01.c:257 */
++	F_MEM(QF_U8, struct wlfw_mem_cfg, secure_flag),                         /* v01.c:267 */
++};
++struct wlfw_mem_seg {
++	uint32_t size;
++	uint32_t type;                  /* enum wlfw_mem_type_enum_v01 (v01.h:170): 1 DDR, 3 M3, 4 CAL ... */
++	uint32_t mem_cfg_len;
++	struct wlfw_mem_cfg mem_cfg[WLFW_MAX_NUM_MEM_CFG];
++};
++static const struct qmi_field wlfw_mem_seg_f[] = {
++	F_MEM(QF_U32, struct wlfw_mem_seg, size),                               /* v01.c:285 */
++	F_MEM(QF_U32, struct wlfw_mem_seg, type),                               /* v01.c:295 (s32 enum) */
++	{ .kind = QF_VARRAY, .lensz = 1, .ekind = QF_STRUCT, .off = QOFF(struct wlfw_mem_seg, mem_cfg),
++	  .valid = QF_MANDATORY, .count = QOFF(struct wlfw_mem_seg, mem_cfg_len), .max = WLFW_MAX_NUM_MEM_CFG,
++	  .esize = sizeof(struct wlfw_mem_cfg), .sub = wlfw_mem_cfg_f, .nsub = 3 },  /* v01.c:305 u8 len, :315 */
++};
++struct wlfw_request_mem_ind {
++	uint32_t mem_seg_len;
++	struct wlfw_mem_seg mem_seg[WLFW_MAX_NUM_MEM_SEG];
++};
++static const struct qmi_field wlfw_request_mem_ind_f[] = {
++	{ .tlv = 0x01, .kind = QF_VARRAY, .lensz = 1, .ekind = QF_STRUCT,
++	  .off = QOFF(struct wlfw_request_mem_ind, mem_seg), .valid = QF_MANDATORY,
++	  .count = QOFF(struct wlfw_request_mem_ind, mem_seg_len), .max = WLFW_MAX_NUM_MEM_SEG,
++	  .esize = sizeof(struct wlfw_mem_seg), .sub = wlfw_mem_seg_f, .nsub = 3 },     /* v01.c:3956 u8 len, :3966 */
++};
++
++/* ---- RESPOND_MEM 0x36 (v01.h:368 mem_seg_resp, v01.c:3985) ---- */
++struct wlfw_mem_seg_resp {
++	uint64_t addr;
++	uint32_t size;
++	uint32_t type;
++	uint8_t restore;
++};
++static const struct qmi_field wlfw_mem_seg_resp_f[] = {
++	F_MEM(QF_U64, struct wlfw_mem_seg_resp, addr),                          /* v01.c:334 */
++	F_MEM(QF_U32, struct wlfw_mem_seg_resp, size),                          /* v01.c:344 */
++	F_MEM(QF_U32, struct wlfw_mem_seg_resp, type),                          /* v01.c:354 (s32 enum) */
++	F_MEM(QF_U8, struct wlfw_mem_seg_resp, restore),                        /* v01.c:364 */
++};
++struct wlfw_respond_mem_req {
++	uint32_t mem_seg_len;
++	struct wlfw_mem_seg_resp mem_seg[WLFW_MAX_NUM_MEM_SEG];
++};
++static const struct qmi_field wlfw_respond_mem_req_f[] = {
++	{ .tlv = 0x01, .kind = QF_VARRAY, .lensz = 1, .ekind = QF_STRUCT,
++	  .off = QOFF(struct wlfw_respond_mem_req, mem_seg), .valid = QF_MANDATORY,
++	  .count = QOFF(struct wlfw_respond_mem_req, mem_seg_len), .max = WLFW_MAX_NUM_MEM_SEG,
++	  .esize = sizeof(struct wlfw_mem_seg_resp), .sub = wlfw_mem_seg_resp_f, .nsub = 4 },   /* v01.c:3986, :3996 */
++};
++
++/* ---- CAP 0x24: empty request (v01.c:1661), response v01.h:580 / v01.c:1670 ---- */
++struct wlfw_empty {
++	uint8_t unused;
++};
++struct wlfw_chip_info {
++	uint32_t chip_id, chip_family;
++};
++static const struct qmi_field wlfw_chip_info_f[] = {
++	F_MEM(QF_U32, struct wlfw_chip_info, chip_id),                          /* v01.c:382 */
++	F_MEM(QF_U32, struct wlfw_chip_info, chip_family),                      /* v01.c:392 */
++};
++struct wlfw_u32_info {
++	uint32_t v;
++};
++static const struct qmi_field wlfw_u32_info_f[] = {
++	F_MEM(QF_U32, struct wlfw_u32_info, v),         /* board_id v01.c:410, soc_id v01.c:428 */
++};
++struct wlfw_fw_version_info {
++	uint32_t fw_version;
++	char fw_build_timestamp[WLFW_MAX_TIMESTAMP_LEN + 1];
++};
++static const struct qmi_field wlfw_fw_version_info_f[] = {
++	F_MEM(QF_U32, struct wlfw_fw_version_info, fw_version),                 /* v01.c:446 */
++	{ .kind = QF_STRING, .lensz = 1, .off = QOFF(struct wlfw_fw_version_info, fw_build_timestamp),
++	  .valid = QF_MANDATORY, .max = WLFW_MAX_TIMESTAMP_LEN },              /* v01.c:456 (33 <= 255: u8 len) */
++};
++struct wlfw_cap_resp {
++	struct wlfw_resp resp;
++	uint8_t chip_info_valid;
++	struct wlfw_chip_info chip_info;
++	uint8_t board_info_valid;
++	struct wlfw_u32_info board_info;
++	uint8_t soc_info_valid;
++	struct wlfw_u32_info soc_info;
++	uint8_t fw_version_info_valid;
++	struct wlfw_fw_version_info fw_version_info;
++	uint8_t fw_build_id_valid;
++	char fw_build_id[WLFW_MAX_BUILD_ID_LEN + 1];
++	uint8_t num_macs_valid, num_macs;
++	uint8_t voltage_mv_valid;
++	uint32_t voltage_mv;
++	uint8_t time_freq_hz_valid;
++	uint32_t time_freq_hz;
++	uint8_t otp_version_valid;
++	uint32_t otp_version;
++	uint8_t fw_caps_valid;
++	uint64_t fw_caps;
++	uint8_t foundry_name_valid;
++	char foundry_name[WLFW_MAX_STR_LEN + 1];
++	uint8_t hang_data_addr_offset_valid;
++	uint32_t hang_data_addr_offset;
++	uint8_t hang_data_length_valid;
++	uint16_t hang_data_length;
++	uint8_t hwid_bitmap_valid, hwid_bitmap;
++	uint8_t regdb_mandatory_valid, regdb_mandatory;
++	uint8_t regdb_support_valid, regdb_support;
++};
++#define F_SUB(t, S, f, tab)     { .tlv = (t), .kind = QF_STRUCT, .off = QOFF(S, f), .valid = QVAL(S, f), \
++	                          .sub = (tab), .nsub = QN(tab) }
++#define F_STR(t, S, f, m)       { .tlv = (t), .kind = QF_STRING, .off = QOFF(S, f), .valid = QVAL(S, f), \
++	                          .max = (m) }
++static const struct qmi_field wlfw_cap_resp_f[] = {
++	F_RESULT(struct wlfw_cap_resp),                                         /* v01.c:1671 */
++	F_SUB(0x10, struct wlfw_cap_resp, chip_info, wlfw_chip_info_f),         /* v01.c:1692 */
++	F_SUB(0x11, struct wlfw_cap_resp, board_info, wlfw_u32_info_f),         /* v01.c:1713 */
++	F_SUB(0x12, struct wlfw_cap_resp, soc_info, wlfw_u32_info_f),           /* v01.c:1734 */
++	F_SUB(0x13, struct wlfw_cap_resp, fw_version_info, wlfw_fw_version_info_f),     /* v01.c:1755 */
++	F_STR(0x14, struct wlfw_cap_resp, fw_build_id, WLFW_MAX_BUILD_ID_LEN),  /* v01.c:1776 (top level: no prefix) */
++	F_OPT(0x15, QF_U8, struct wlfw_cap_resp, num_macs),                     /* v01.c:1796 */
++	F_OPT(0x16, QF_U32, struct wlfw_cap_resp, voltage_mv),                  /* v01.c:1816 */
++	F_OPT(0x17, QF_U32, struct wlfw_cap_resp, time_freq_hz),                /* v01.c:1836 */
++	F_OPT(0x18, QF_U32, struct wlfw_cap_resp, otp_version),                 /* v01.c:1856 */
++	F_OPT(0x1a, QF_U64, struct wlfw_cap_resp, fw_caps),                     /* v01.c:1896 */
++	F_STR(0x1d, struct wlfw_cap_resp, foundry_name, WLFW_MAX_STR_LEN),      /* v01.c:1957 */
++	F_OPT(0x1e, QF_U32, struct wlfw_cap_resp, hang_data_addr_offset),       /* v01.c:1977 */
++	F_OPT(0x1f, QF_U16, struct wlfw_cap_resp, hang_data_length),            /* v01.c:1997 */
++	F_OPT(0x21, QF_U8, struct wlfw_cap_resp, hwid_bitmap),                  /* v01.c:2037 */
++	F_OPT(0x23, QF_U8, struct wlfw_cap_resp, regdb_mandatory),              /* v01.c:2078 */
++	F_OPT(0x24, QF_U8, struct wlfw_cap_resp, regdb_support),                /* v01.c:2098 */
++};
++
++/* ---- BDF_DOWNLOAD 0x25 (v01.h:631 / v01.c:2136, resp v01.c:2285) ---- */
++struct wlfw_bdf_download_req {
++	uint8_t valid;
++	uint8_t file_id_valid;
++	uint32_t file_id;               /* enum wlfw_cal_temp_id_enum_v01; cnss2 puts the board id here */
++	uint8_t total_size_valid;
++	uint32_t total_size;
++	uint8_t seg_id_valid;
++	uint32_t seg_id;
++	uint8_t data_valid;
++	uint32_t data_len;
++	uint8_t data[WLFW_MAX_DATA_SIZE];
++	uint8_t end_valid, end;
++	uint8_t bdf_type_valid, bdf_type;
++};
++static const struct qmi_field wlfw_bdf_download_req_f[] = {
++	F_MAN(0x01, QF_U8, struct wlfw_bdf_download_req, valid),                /* v01.c:2137 */
++	F_OPT(0x10, QF_U32, struct wlfw_bdf_download_req, file_id),             /* v01.c:2157 (s32 enum) */
++	F_OPT(0x11, QF_U32, struct wlfw_bdf_download_req, total_size),          /* v01.c:2177 */
++	F_OPT(0x12, QF_U32, struct wlfw_bdf_download_req, seg_id),              /* v01.c:2197 */
++	{ .tlv = 0x13, .kind = QF_VARRAY, .lensz = 2, .ekind = QF_U8,
++	  .off = QOFF(struct wlfw_bdf_download_req, data), .valid = QVAL(struct wlfw_bdf_download_req, data),
++	  .count = QOFF(struct wlfw_bdf_download_req, data_len), .max = WLFW_MAX_DATA_SIZE,
++	  .esize = 1 },                                                         /* v01.c:2217 u16 len, :2227 */
++	F_OPT(0x14, QF_U8, struct wlfw_bdf_download_req, end),                  /* v01.c:2247 */
++	F_OPT(0x15, QF_U8, struct wlfw_bdf_download_req, bdf_type),             /* v01.c:2267 */
++};
++struct wlfw_bdf_download_resp {
++	struct wlfw_resp resp;
++	uint8_t host_bdf_data_valid;
++	uint64_t host_bdf_data;
++};
++static const struct qmi_field wlfw_bdf_download_resp_f[] = {
++	F_RESULT(struct wlfw_bdf_download_resp),                                /* v01.c:2286 */
++	F_OPT(0x10, QF_U64, struct wlfw_bdf_download_resp, host_bdf_data),      /* v01.c:2307 */
++};
++
++/* ---- M3_INFO 0x3c (v01.c:4300, resp v01.c:4329) ---- */
++struct wlfw_m3_info_req {
++	uint64_t addr;
++	uint32_t size;
++};
++static const struct qmi_field wlfw_m3_info_req_f[] = {
++	F_MAN(0x01, QF_U64, struct wlfw_m3_info_req, addr),                     /* v01.c:4301 */
++	F_MAN(0x02, QF_U32, struct wlfw_m3_info_req, size),                     /* v01.c:4311 */
++};
++
++/* ---- indications without our fields: FW_READY 0x21 (v01.c:1179), FW_MEM_READY 0x37 (v01.c:4035) ---- */
++/* FW_INIT_DONE_IND 0x38 (v01.h:968 / v01.c:4044) */
++struct wlfw_fw_init_done_ind {
++	uint8_t hang_data_addr_offset_valid;
++	uint32_t hang_data_addr_offset;
++	uint8_t hang_data_length_valid;
++	uint16_t hang_data_length;
++};
++static const struct qmi_field wlfw_fw_init_done_ind_f[] = {
++	F_OPT(0x10, QF_U32, struct wlfw_fw_init_done_ind, hang_data_addr_offset),       /* v01.c:4055 */
++	F_OPT(0x11, QF_U16, struct wlfw_fw_init_done_ind, hang_data_length),            /* v01.c:4075 */
++};
++/* CAL_DONE_IND 0x3e (v01.h:1038 / v01.c:4368) */
++struct wlfw_cal_done_ind {
++	uint8_t cal_file_upload_size_valid;
++	uint64_t cal_file_upload_size;
++};
++static const struct qmi_field wlfw_cal_done_ind_f[] = {
++	F_OPT(0x10, QF_U64, struct wlfw_cal_done_ind, cal_file_upload_size),    /* v01.c:4379 */
++};
++
++#define WLFW_MSG(id_, name_, tab, S)    { .id = (id_), .name = (name_), .f = (tab), .n = QN(tab), .csize = sizeof(S) }
++#define WLFW_EMPTY(id_, name_)          { .id = (id_), .name = (name_), .f = NULL, .n = 0, .csize = sizeof(struct wlfw_empty) }
++
++static const struct qmi_msg_desc wlfw_ind_register_req_d = WLFW_MSG(WLFW_IND_REGISTER, "IND_REGISTER", wlfw_ind_register_req_f, struct wlfw_ind_register_req);
++static const struct qmi_msg_desc wlfw_ind_register_resp_d = WLFW_MSG(WLFW_IND_REGISTER, "IND_REGISTER", wlfw_ind_register_resp_f, struct wlfw_ind_register_resp);
++static const struct qmi_msg_desc wlfw_host_cap_req_d = WLFW_MSG(WLFW_HOST_CAP, "HOST_CAP", wlfw_host_cap_req_f, struct wlfw_host_cap_req);
++static const struct qmi_msg_desc wlfw_host_cap_resp_d = WLFW_MSG(WLFW_HOST_CAP, "HOST_CAP", wlfw_resp_only_f, struct wlfw_resp_only);
++static const struct qmi_msg_desc wlfw_request_mem_ind_d = WLFW_MSG(WLFW_REQUEST_MEM_IND, "REQUEST_MEM_IND", wlfw_request_mem_ind_f, struct wlfw_request_mem_ind);
++static const struct qmi_msg_desc wlfw_respond_mem_req_d = WLFW_MSG(WLFW_RESPOND_MEM, "RESPOND_MEM", wlfw_respond_mem_req_f, struct wlfw_respond_mem_req);
++static const struct qmi_msg_desc wlfw_respond_mem_resp_d = WLFW_MSG(WLFW_RESPOND_MEM, "RESPOND_MEM", wlfw_resp_only_f, struct wlfw_resp_only);
++static const struct qmi_msg_desc wlfw_cap_req_d = WLFW_EMPTY(WLFW_CAP, "CAP");
++static const struct qmi_msg_desc wlfw_cap_resp_d = WLFW_MSG(WLFW_CAP, "CAP", wlfw_cap_resp_f, struct wlfw_cap_resp);
++static const struct qmi_msg_desc wlfw_bdf_download_req_d = WLFW_MSG(WLFW_BDF_DOWNLOAD, "BDF_DOWNLOAD", wlfw_bdf_download_req_f, struct wlfw_bdf_download_req);
++static const struct qmi_msg_desc wlfw_bdf_download_resp_d = WLFW_MSG(WLFW_BDF_DOWNLOAD, "BDF_DOWNLOAD", wlfw_bdf_download_resp_f, struct wlfw_bdf_download_resp);
++static const struct qmi_msg_desc wlfw_m3_info_req_d = WLFW_MSG(WLFW_M3_INFO, "M3_INFO", wlfw_m3_info_req_f, struct wlfw_m3_info_req);
++static const struct qmi_msg_desc wlfw_m3_info_resp_d = WLFW_MSG(WLFW_M3_INFO, "M3_INFO", wlfw_resp_only_f, struct wlfw_resp_only);
++static const struct qmi_msg_desc wlfw_fw_init_done_ind_d = WLFW_MSG(WLFW_FW_INIT_DONE_IND, "FW_INIT_DONE_IND", wlfw_fw_init_done_ind_f, struct wlfw_fw_init_done_ind);
++static const struct qmi_msg_desc wlfw_cal_done_ind_d = WLFW_MSG(WLFW_CAL_DONE_IND, "CAL_DONE_IND", wlfw_cal_done_ind_f, struct wlfw_cal_done_ind);
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++#endif /* _NEGRONI_WLFW_TABLES_H_ */
