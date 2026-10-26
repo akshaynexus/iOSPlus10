@@ -1,0 +1,744 @@
+From: iOSPlus10 GPU-recovery agent
+Subject: [PATCH] negroni gpu: KGSL gen7 parity from the 2026-10-26 audit (0298)
+
+docs/audit/2026-10-26-gpu.md section 3, after 0287/0288 (each item has a boot-arg):
+- HWCG on: 53 gen7_0_0_hwcg_regs + RBBM_CLOCK_CNTL 0x8aa8aa82 + 3 GMU AO CGC words (step 20)
+- slumber from IFPC mode after negronigpu_ifpc_slumber ms idle (default 2000); slumber adds
+  KGSL's GBIF halt; every warm boot flushes the SMMU TLB and clears a stale FSR first;
+  IFPC is asked again after every rewake when the GMU accepted it at boot
+- DCVS busy from the GMU busy power counter (XOCLK_0 over the AO counter, KGSL
+  gen7_power_stats); busy tick at negronigpu_busy_pct (50); falls back to the fence rule
+  if the counter does not move
+- CP_PROTECT_CNTL + 45 ranges, CP_CHICKEN_DBG x3 = 1, ME_INIT BIT(11) (DMS off)
+- RB_CNTL without BIT(27): the CP writes its rptr shadow; IFPC ring room from it
+- HFI ack timeout 100 ms after the boot ladder (negronigpu_hfi_ms)
+- a guard page after every kernel-placed GPU buffer (negronigpu_guard)
+- bus votes computed from cmd-db SH0/MC0/ACV aux data + the DT bus-table-ddr, the CNOC
+  CN0 vote (bus-table-cnoc), DCVS bw index = the DT bus-freq of each level
+Not done: ACD (needs the AOP QMP mailbox), preemption (one ring, one priority).
+
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index 7a4f25d..5fe72e0 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -181,6 +181,47 @@ static uint32_t pm_slumber_arg = 1;     /* negronigpu_slumber (default 1): slumb
+ static bool pm_ifpc_ok;                 /* FEATURE_CTRL IFPC acked: step 20 gives the CP its power-up list */
+ static bool pm_rewaking;                /* steps 14-21 run for a slumber wake */
+ static bool rec_active;                 /* patch 0287: steps 14-21 run for a hang recovery (step 17 asks for IFPC again) */
++
++/*
++ * Patch 0298: the KGSL gen7 settings the 2026-10-26 GPU audit (docs/audit/2026-10-26-gpu.md section 3) found
++ * missing. Each one has a boot-arg; 1 = on (default) unless noted.
++ *   negronigpu_hwcg          HWCG: 53 RBBM clock-gating registers + RBBM_CLOCK_CNTL + 3 GMU AO CGC words (step 20)
++ *   negronigpu_protect       CP_PROTECT_CNTL + 45 CP_PROTECT ranges (step 20)
++ *   negronigpu_chicken       CP_CHICKEN_DBG / BV / LPAC = 1: CP icache prefetch off (step 20)
++ *   negronigpu_dms           1 = ME_INIT BIT(11): DMS off (this GPU has no ADRENO_DMS)
++ *   negronigpu_rptr_shadow   RB_CNTL without BIT(27): the CP writes its read pointer to scratch +0x80
++ *   negronigpu_busy_pct      DCVS: a tick is busy at this GMU busy-counter share (default 50; 0 = the old fence rule)
++ *   negronigpu_ifpc_slumber  ms of idle in IFPC mode before slumber (default 2000; 0 = never, as 0285)
++ *   negronigpu_hfi_ms        HFI ack timeout after the boot ladder (default 100, KGSL HFI_RSP_TIMEOUT; boot keeps 1000)
++ *   negronigpu_bwcalc        bus table: DDR votes computed from cmd-db SH0/MC0/ACV aux data and the DT bus-table-ddr
++ *   negronigpu_cnoc          the CNOC (CN0) vote of the DT bus-table-cnoc <0 100>
++ *   negronigpu_bwdt          DCVS bw index = the DT bus-freq of the level (0 = the 0281 linear ramp)
++ */
++static uint32_t k_hwcg = 1, k_protect = 1, k_chicken = 1, k_dms_off = 1, k_rptr_shadow = 1, k_busy_pct = 50;
++static uint32_t k_ifpc_slumber_ms = 2000, k_hfi_ms = 100, k_bwcalc = 1, k_cnoc = 1, k_bwdt = 1;
++static bool k_args_read, hfi_runtime;
++
++static void
++k_args(void)
++{
++	if (k_args_read) {
++		return;
++	}
++	k_args_read = true;
++	(void)PE_parse_boot_argn("negronigpu_hwcg", &k_hwcg, sizeof(k_hwcg));
++	(void)PE_parse_boot_argn("negronigpu_protect", &k_protect, sizeof(k_protect));
++	(void)PE_parse_boot_argn("negronigpu_chicken", &k_chicken, sizeof(k_chicken));
++	(void)PE_parse_boot_argn("negronigpu_dms", &k_dms_off, sizeof(k_dms_off));
++	(void)PE_parse_boot_argn("negronigpu_rptr_shadow", &k_rptr_shadow, sizeof(k_rptr_shadow));
++	(void)PE_parse_boot_argn("negronigpu_busy_pct", &k_busy_pct, sizeof(k_busy_pct));
++	(void)PE_parse_boot_argn("negronigpu_ifpc_slumber", &k_ifpc_slumber_ms, sizeof(k_ifpc_slumber_ms));
++	(void)PE_parse_boot_argn("negronigpu_hfi_ms", &k_hfi_ms, sizeof(k_hfi_ms));
++	(void)PE_parse_boot_argn("negronigpu_bwcalc", &k_bwcalc, sizeof(k_bwcalc));
++	(void)PE_parse_boot_argn("negronigpu_cnoc", &k_cnoc, sizeof(k_cnoc));
++	(void)PE_parse_boot_argn("negronigpu_bwdt", &k_bwdt, sizeof(k_bwdt));
++	k_hfi_ms = k_hfi_ms < 10 ? 10 : k_hfi_ms > 1000 ? 1000 : k_hfi_ms;
++	k_busy_pct = k_busy_pct > 100 ? 100 : k_busy_pct;
++}
+ static thread_t adreno_quiet_thread;    /* printf on this thread is dropped (a quiet wake) */
+ 
+ static bool
+@@ -1357,9 +1398,10 @@ hfi_send(const char *what, uint32_t id, uint32_t *msg, uint32_t bytes)
+ 	}
+ 	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1);
+ 	for (int tries = 0; tries < 3; tries++) {
+-		if (!wait_for(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO), 1, 1, 1000)) {
+-			printf("NEGRONI ADRENO: 17 stop: no HFI response to %s (INTR_INFO %#x)\n", what,
+-			    rd(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO)));
++		/* 0298: KGSL's 100 ms (HFI_RSP_TIMEOUT) once the GPU runs; the boot ladder keeps its 1000 ms */
++		if (!wait_for(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO), 1, 1, hfi_runtime ? k_hfi_ms : 1000)) {
++			printf("NEGRONI ADRENO: 17 stop: no HFI response to %s in %u ms (INTR_INFO %#x)\n", what,
++			    hfi_runtime ? k_hfi_ms : 1000, rd(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO)));
+ 			return false;
+ 		}
+ 		wr(gmu + GMU_REG(GMU_GMU2HOST_INTR_CLR), 1);
+@@ -1543,6 +1585,128 @@ static const uint16_t gpu_level[] = { 0, 56, 56, 64, 64, 80, 128, 144, 192, 224,
+ static const uint32_t gmu_khz[] = { 0, 200000, 500000 };
+ static const uint16_t gmu_level[] = { 0, 64, 128 };
+ 
++/*
++ * Patch 0298: the bus votes as KGSL builds them (adreno_gen7_rpmh.c:121-260 build_rpmh_bw_votes / tcs_cmd_data,
++ * 415-497 build_bw_table): per DT bus level (out/live.dts:21079 qcom,bus-table-ddr, KBps) one TCS word per BCM
++ * (SH0 bus width 16, MC0 4, ACV fixed), unit/width/vcd from the BCM's cmd-db aux data (struct bcm_data
++ * {le32 unit, le16 width, u8 vcd}); the CNOC BCM CN0 (bus width 4) for qcom,bus-table-cnoc <0 100> (21078).
++ * BCM_TCS_CMD (include/soc/qcom/tcs.h): commit bit 30, valid bit 29, vote_x bits 27:14, vote_y bits 13:0.
++ * A BCM that cmd-db does not describe keeps the Linux constants (a730_build_bw_table).
++ */
++#define BCM_CMD(commit, valid, x, y) ((uint32_t)(commit) << 30 | (uint32_t)(valid) << 29 | \
++	((uint32_t)(x) & 0x3fff) << 14 | ((uint32_t)(y) & 0x3fff))
++struct bcm_info {
++	const char *name;
++	uint32_t buswidth;
++	bool fixed;
++	uint32_t addr, unit, width, vcd;
++};
++static const uint32_t ddr_kbps[12] = {          /* out/live.dts:21079 */
++	0, 0xbebc2, 0x1ae1b6, 0x209a8e, 0x28973c, 0x2dc6c0, 0x5caf6a, 0x65ce03, 0x7cb163, 0xa3140c, 0xbe7f17, 0xc7acf1,
++};
++static const uint32_t cnoc_kbps[2] = { 0, 100 };        /* out/live.dts:21078 */
++
++static bool
++bcm_read(struct bcm_info *b)
++{
++	uint8_t aux[8] = { 0 };
++	uint32_t n = sizeof(aux);
++
++	if (!cmd_db_find(b->name, &b->addr, aux, &n) || n < 7) {
++		return false;
++	}
++	b->unit = (uint32_t)aux[0] | (uint32_t)aux[1] << 8 | (uint32_t)aux[2] << 16 | (uint32_t)aux[3] << 24;
++	b->width = (uint32_t)aux[4] | (uint32_t)aux[5] << 8;
++	b->vcd = aux[6];
++	return b->fixed || (b->unit != 0 && b->width != 0 && b->buswidth != 0);
++}
++
++/* tcs_cmd_data with ab = 0 (KGSL votes peak only) */
++static void
++bcm_votes(const struct bcm_info *b, uint32_t count, uint32_t ib, uint32_t *data)
++{
++	for (uint32_t i = 0; i < count; i++) {
++		bool commit = i == count - 1 || b[i].vcd != b[i + 1].vcd;
++		if (b[i].fixed) {
++			data[i] = ib ? BCM_CMD(commit, 1, 0, 8) : BCM_CMD(commit, 0, 0, 0);
++			continue;
++		}
++		uint64_t y = (uint64_t)ib * b[i].width / b[i].buswidth * 1000ull / b[i].unit;
++		if (ib && y == 0) {
++			y = 1;
++		}
++		y = MIN(y, 0x3fffull);
++		data[i] = BCM_CMD(commit, y != 0, 0, y);
++	}
++}
++
++static uint32_t
++bcm_wait_mask(const struct bcm_info *b, uint32_t count)
++{
++	uint32_t mask = 0;
++
++	for (uint32_t i = 0; i < count; i++) {
++		if (i == count - 1 || b[i].vcd != b[i + 1].vcd) {
++			mask |= 1u << i;
++		}
++	}
++	return mask;
++}
++
++/* bw = the HFI BW_TABLE message (hfi_bwtable_cmd) with the Linux constants in; replaced from cmd-db where known */
++static void
++bw_from_cmd_db(uint32_t *bw)
++{
++	struct bcm_info ddr[3] = { { "SH0", 16, false, 0, 0, 0, 0 }, { "MC0", 4, false, 0, 0, 0, 0 }, { "ACV", 0, true, 0, 0, 0, 0 } };
++	struct bcm_info cn = { "CN0", 4, false, 0, 0, 0, 0 };
++	uint32_t *ddr_data = &bw[6 + 6 + 12 + 8], row[3], differ = 0, bw_kept = 0;
++
++	k_args();
++	bool ok = bcm_read(&ddr[0]) && bcm_read(&ddr[1]) && bcm_read(&ddr[2]);
++	printf("NEGRONI ADRENO: 17 BCM cmd-db: SH0 unit %u width %u vcd %u, MC0 unit %u width %u vcd %u, ACV vcd %u (%s)\n",
++	    ddr[0].unit, ddr[0].width, ddr[0].vcd, ddr[1].unit, ddr[1].width, ddr[1].vcd, ddr[2].vcd, ok ? "complete" : "INCOMPLETE");
++	for (uint32_t l = 0; ok && l < 12; l++) {
++		bcm_votes(ddr, 3, ddr_kbps[l], row);
++		for (uint32_t j = 0; j < 3; j++) {
++			differ += row[j] != ddr_data[8 * l + j];
++		}
++		if (l == 11 || l == 6 || l == 1) {
++			printf("NEGRONI ADRENO: 17 bw level %u (%u KBps): SH0 %#x MC0 %#x ACV %#x (Linux constants %#x %#x %#x)\n", l,
++			    ddr_kbps[l], row[0], row[1], row[2], ddr_data[8 * l], ddr_data[8 * l + 1], ddr_data[8 * l + 2]);
++		}
++		if (k_bwcalc) {
++			for (uint32_t j = 0; j < 3; j++) {
++				/* a wrong cmd-db read must not lower a DDR vote: keep the Linux word when its vote_y is larger */
++				if ((row[j] & 0x3fff) < (ddr_data[8 * l + j] & 0x3fff)) {
++					if (bw_kept++ < 8) {
++						printf("NEGRONI ADRENO: 17 bw level %u BCM %u: computed %#x below the Linux constant %#x: constant kept\n",
++						    l, j, row[j], ddr_data[8 * l + j]);
++					}
++					continue;
++				}
++				ddr_data[8 * l + j] = row[j];
++			}
++		}
++	}
++	if (ok && k_bwcalc) {
++		bw[5] = bcm_wait_mask(ddr, 3);
++	}
++	printf("NEGRONI ADRENO: 17 bw table: %s; %u of 36 words differ from the Linux constants (%u kept: never below them); ddr wait mask %#x\n",
++	    ok && k_bwcalc ? "computed from cmd-db" : !ok ? "Linux constants (cmd-db incomplete)" : "Linux constants (negronigpu_bwcalc=0)",
++	    differ, bw_kept, bw[5]);
++	if (k_cnoc && bcm_read(&cn)) {
++		bw[2] = 1;                      /* cnoc_cmds_num */
++		bw[4] = bcm_wait_mask(&cn, 1);  /* cnoc_wait_bitmask */
++		bw[6] = cn.addr;                /* cnoc_cmd_addrs[0] */
++		for (uint32_t l = 0; l < 2; l++) {
++			bcm_votes(&cn, 1, cnoc_kbps[l], &bw[12 + 6 * l]);      /* cnoc_cmd_data[l][0] */
++		}
++		printf("NEGRONI ADRENO: 17 CNOC CN0 %#x unit %u width %u: votes %#x %#x\n", cn.addr, cn.unit, cn.width, bw[12], bw[18]);
++	} else {
++		printf("NEGRONI ADRENO: 17 CNOC vote %s\n", k_cnoc ? "NOT SENT: CN0 not in cmd-db" : "off (negronigpu_cnoc=0)");
++	}
++}
++
+ static bool
+ step_hfi_messages(void)
+ {
+@@ -1627,6 +1791,7 @@ step_hfi_messages(void)
+ 		}
+ 	}
+ 	printf("NEGRONI ADRENO: 17 BCM SH0 %#x MC0 %#x ACV %#x\n", ddr_addrs[0], ddr_addrs[1], ddr_addrs[2]);
++	bw_from_cmd_db(bw);             /* patch 0298 */
+ 	if (!hfi_send("BW_TABLE", HFI_MSG_BW_TABLE, bw, sizeof(bw))) {
+ 		return false;
+ 	}
+@@ -1639,7 +1804,7 @@ step_hfi_messages(void)
+ 	 * recovery (the CM3 reset forgets the feature, as KGSL gen7_gmu_reset -> gen7_boot -> gen7_hfi_start).
+ 	 */
+ 	(void)PE_parse_boot_argn("negronigpu_ifpc", &pm_ifpc_arg, sizeof(pm_ifpc_arg));
+-	if (pm_ifpc_arg && (!pm_rewaking || (rec_active && pm_ifpc_ok))) {
++	if (pm_ifpc_arg && (!pm_rewaking || pm_ifpc_ok)) {     /* 0298: every rewake in IFPC mode (slumber, 0287 recovery) */
+ 		uint32_t feature[4] = { 0, 9 /* HFI_FEATURE_IFPC */, 1, 0x1680 };
+ 		hfi_ack_n = 0;
+ 		memset(hfi_ack, 0, sizeof(hfi_ack));
+@@ -2008,6 +2173,101 @@ pwrup_list_build(void)
+ 	return PWRUP_AT + 4 * n <= 4096;
+ }
+ 
++/*
++ * Patch 0298, step 20 before the SQE base (KGSL gen7_start, adreno_gen7.c:519-557):
++ *  - GMU power counter 0 counts GPU busy (521-523): AO GPU_CX_BUSY_MASK 0xff000000, POWER_COUNTER_SELECT_0
++ *    low byte 0x20, POWER_COUNTER_ENABLE 1; read as XOCLK_0 (19.2 MHz ticks while busy) by the DCVS
++ *  - gen7_protect_init (225-258): CP_PROTECT_CNTL BIT(0,1,3), the 45 ranges of gen7_0_0_protected_regs
++ *    (adreno-gpulist.h; gen7_0_1 uses the same list): start [17:0], count [30:18], no-access [31]
++ *  - CP_CHICKEN_DBG, CP_BV_CHICKEN_DBG, CP_LPAC_CHICKEN_DBG = 1 on gen7_0_x (544-549)
++ *  - gen7_hwcg_set(true) (265-300): GMU AO CGC MODE 0x20000, DELAY 0x10111, HYST 0x5555, the 53 registers of
++ *    gen7_0_0_hwcg_regs (the gen7_0_1 entry, adreno-gpulist.h:2079-2110, uses that list), RBBM_CLOCK_CNTL 0x8aa8aa82
++ * Offsets from gen7_reg.h. The pwrup list (0285) is built after this, so it holds the PROTECT values.
++ */
++#define K_AO_GPU_CX_BUSY_MASK   0x23b0e
++#define K_POWER_COUNTER_ENABLE  0x1f840
++#define K_POWER_COUNTER_SELECT_0 0x1f841
++#define K_POWER_COUNTER_XOCLK_0 0x1f844
++#define K_AO_CGC_MODE_CNTL      0x23b09
++#define K_AO_CGC_DELAY_CNTL     0x23b0a
++#define K_AO_CGC_HYST_CNTL      0x23b0b
++#define K_CP_CHICKEN_DBG        0x0841
++#define K_CP_BV_CHICKEN_DBG     0x0ada
++#define K_CP_LPAC_CHICKEN_DBG   0x0b30
++#define K_CP_PROTECT_CNTL       0x084f
++#define K_CP_PROTECT_REG        0x0850
++#define K_RBBM_CLOCK_CNTL       0x00ae
++
++static const struct { uint32_t idx, start, end, noaccess; } k_protect_regs[] = {
++	{ 0, 0x00000, 0x004ff, 0 }, { 1, 0x0050b, 0x00563, 0 }, { 2, 0x0050e, 0x0050e, 1 }, { 3, 0x00510, 0x00510, 1 },
++	{ 4, 0x00534, 0x00534, 1 }, { 5, 0x005fb, 0x00698, 0 }, { 6, 0x00699, 0x00882, 1 }, { 7, 0x008a0, 0x008a8, 1 },
++	{ 8, 0x008ab, 0x008cf, 1 }, { 9, 0x008d0, 0x00a40, 0 }, { 10, 0x00900, 0x0094d, 1 }, { 11, 0x0098d, 0x00a3f, 1 },
++	{ 12, 0x00a41, 0x00bff, 1 }, { 13, 0x00df0, 0x00df1, 1 }, { 14, 0x00e01, 0x00e01, 1 }, { 15, 0x00e07, 0x00e0f, 1 },
++	{ 16, 0x03c00, 0x03cc3, 1 }, { 17, 0x03cc4, 0x05cc3, 0 }, { 18, 0x08630, 0x087ff, 1 }, { 19, 0x08e00, 0x08e00, 1 },
++	{ 20, 0x08e08, 0x08e08, 1 }, { 21, 0x08e50, 0x08e6f, 1 }, { 22, 0x08e80, 0x09100, 1 }, { 23, 0x09624, 0x097ff, 1 },
++	{ 24, 0x09e40, 0x09e40, 1 }, { 25, 0x09e64, 0x09e71, 1 }, { 26, 0x09e78, 0x09fff, 1 }, { 27, 0x0a630, 0x0a7ff, 1 },
++	{ 28, 0x0ae02, 0x0ae02, 1 }, { 29, 0x0ae50, 0x0ae5f, 1 }, { 30, 0x0ae66, 0x0ae69, 1 }, { 31, 0x0ae6f, 0x0ae72, 1 },
++	{ 32, 0x0b604, 0x0b607, 1 }, { 33, 0x0ec00, 0x0fbff, 1 }, { 34, 0x0fc00, 0x11bff, 0 }, { 35, 0x18400, 0x18453, 1 },
++	{ 36, 0x18454, 0x18458, 0 }, { 37, 0x18459, 0x1a458, 1 }, { 38, 0x1a459, 0x1c458, 1 }, { 39, 0x1c459, 0x1e458, 1 },
++	{ 40, 0x1f400, 0x1f843, 1 }, { 41, 0x1f844, 0x1f8bf, 0 }, { 42, 0x1f860, 0x1f860, 1 }, { 43, 0x1f878, 0x1f8a2, 1 },
++	{ 47, 0x1f8c0, 0x1f8c0, 1 },
++};
++
++static const uint32_t k_hwcg_regs[][2] = {      /* gen7_0_0_hwcg_regs, offsets resolved from gen7_reg.h */
++	{ 0x000b0, 0x02222222 }, { 0x000b4, 0x02022222 }, { 0x000bc, 0x0000f3cf }, { 0x000b8, 0x00000080 },
++	{ 0x000c0, 0x22222220 }, { 0x000c4, 0x22222222 }, { 0x000c8, 0x22222222 }, { 0x000cc, 0x00222222 },
++	{ 0x000e0, 0x77777777 }, { 0x000e4, 0x77777777 }, { 0x000e8, 0x77777777 }, { 0x000ec, 0x00077777 },
++	{ 0x000d0, 0x11111111 }, { 0x000d4, 0x11111111 }, { 0x000d8, 0x11111111 }, { 0x000dc, 0x00011111 },
++	{ 0x0010b, 0x22222222 }, { 0x00110, 0x00000004 }, { 0x0010f, 0x00000002 }, { 0x000f0, 0x22222222 },
++	{ 0x000f4, 0x01002222 }, { 0x000f8, 0x00002220 }, { 0x00100, 0x44000f00 }, { 0x00104, 0x25222022 },
++	{ 0x00105, 0x00555555 }, { 0x00106, 0x00000011 }, { 0x00107, 0x00440044 }, { 0x00108, 0x04222222 },
++	{ 0x00286, 0x00000222 }, { 0x00285, 0x00222222 }, { 0x00114, 0x02222223 }, { 0x00111, 0x00002222 },
++	{ 0x00288, 0x00222222 }, { 0x00287, 0x00002222 }, { 0x0010a, 0x00000000 }, { 0x00116, 0x04104004 },
++	{ 0x00113, 0x00000000 }, { 0x00109, 0x00004000 }, { 0x00115, 0x00000200 }, { 0x00112, 0x00002222 },
++	{ 0x0011b, 0x00002222 }, { 0x0011c, 0x00000000 }, { 0x0011d, 0x00000000 }, { 0x00117, 0x00000002 },
++	{ 0x00284, 0x55555552 }, { 0x00260, 0x00000223 }, { 0x000ae, 0x8aa8aa82 }, { 0x00533, 0x00000182 },
++	{ 0x00044, 0x00000000 }, { 0x00042, 0x00000000 }, { 0x00118, 0x00000222 }, { 0x00119, 0x00000111 },
++	{ 0x0011a, 0x00000555 },
++};
++
++static void
++k_step20(void)
++{
++	k_args();
++	if (k_busy_pct) {
++		wr(gmu + GMU_REG(K_AO_GPU_CX_BUSY_MASK), 0xff000000);
++		wr(gmu + GMU_REG(K_POWER_COUNTER_SELECT_0), (rd(gmu + GMU_REG(K_POWER_COUNTER_SELECT_0)) & ~0xffu) | 0x20);
++		wr(gmu + GMU_REG(K_POWER_COUNTER_ENABLE), 1);
++	}
++	if (k_protect) {
++		wr(gpu_regs + GPU_WORD(K_CP_PROTECT_CNTL), 1u << 0 | 1u << 1 | 1u << 3);
++		for (unsigned i = 0; i < sizeof(k_protect_regs) / sizeof(k_protect_regs[0]); i++) {
++			uint32_t count = k_protect_regs[i].end - k_protect_regs[i].start;
++			wr(gpu_regs + GPU_WORD(K_CP_PROTECT_REG + k_protect_regs[i].idx),
++			    (k_protect_regs[i].start & 0x3ffff) | (count & 0x1fff) << 18 | k_protect_regs[i].noaccess << 31);
++		}
++	}
++	if (k_chicken) {
++		wr(gpu_regs + GPU_WORD(K_CP_CHICKEN_DBG), 1);
++		wr(gpu_regs + GPU_WORD(K_CP_BV_CHICKEN_DBG), 1);
++		wr(gpu_regs + GPU_WORD(K_CP_LPAC_CHICKEN_DBG), 1);
++	}
++	if (k_hwcg) {
++		wr(gmu + GMU_REG(K_AO_CGC_MODE_CNTL), 0x00020000);
++		wr(gmu + GMU_REG(K_AO_CGC_DELAY_CNTL), 0x00010111);
++		wr(gmu + GMU_REG(K_AO_CGC_HYST_CNTL), 0x00005555);
++		for (unsigned i = 0; i < sizeof(k_hwcg_regs) / sizeof(k_hwcg_regs[0]); i++) {
++			wr(gpu_regs + GPU_WORD(k_hwcg_regs[i][0]), k_hwcg_regs[i][1]);
++		}
++		wr(gpu_regs + GPU_WORD(K_RBBM_CLOCK_CNTL), 0x8aa8aa82);
++	}
++	printf("NEGRONI ADRENO: 20 KGSL settings (0298): busy counter %s, CP_PROTECT %s (%u ranges), CHICKEN_DBG %s, HWCG %s "
++	    "(%u registers, RBBM_CLOCK_CNTL %#x), rptr shadow %s, ME_INIT DMS %s\n", k_busy_pct ? "on" : "off",
++	    k_protect ? "on" : "off", (unsigned)(sizeof(k_protect_regs) / sizeof(k_protect_regs[0])), k_chicken ? "1" : "untouched",
++	    k_hwcg ? "on" : "off", (unsigned)(sizeof(k_hwcg_regs) / sizeof(k_hwcg_regs[0])),
++	    rd(gpu_regs + GPU_WORD(K_RBBM_CLOCK_CNTL)), k_rptr_shadow ? "on" : "off", k_dms_off ? "off (BIT(11))" : "default");
++}
++
+ static bool
+ step_core_start(void)
+ {
+@@ -2044,9 +2304,11 @@ step_core_start(void)
+ 	gpu_put("CP_LPAC_APRIV_CNTL", REG_CP_LPAC_APRIV_CNTL, 0xf);
+ 	gpu_put("RB_CMP_DBG_ECO_CNTL", REG_RB_CMP_DBG_ECO_CNTL,
+ 	    rd(gpu_regs + GPU_WORD(REG_RB_CMP_DBG_ECO_CNTL)) | 1u << 11);
++	k_step20();                     /* patch 0298: power counter, CP_PROTECT, CHICKEN_DBG, HWCG (KGSL gen7_start order) */
+ 	gpu_put64("CP_SQE_INSTR_BASE", REG_CP_SQE_INSTR_BASE, CORE_SQE_ADDRESS);
+ 	gpu_put64("CP_RB_BASE", REG_CP_RB_BASE, CORE_RING_ADDRESS);
+-	gpu_put("CP_RB_CNTL", REG_CP_RB_CNTL, CP_RB_CNTL_VALUE);
++	k_args();
++	gpu_put("CP_RB_CNTL", REG_CP_RB_CNTL, k_rptr_shadow ? CP_RB_CNTL_VALUE & ~(1u << 27) : CP_RB_CNTL_VALUE);   /* 0298 */
+ 	gpu_put64("CP_RB_RPTR_ADDR", REG_CP_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x80);
+ 	gpu_put64("CP_BV_RB_RPTR_ADDR", REG_CP_BV_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x100);
+ 
+@@ -2065,7 +2327,7 @@ step_core_start(void)
+ 	ring_command(CP_THREAD_CONTROL, 1);
+ 	ring(1u << 27);
+ 	ring_command(CP_ME_INIT, 7);
+-	ring(1u << 0 | 1u << 1 | 1u << 3 | 1u << 6 | (list ? 1u << 8 : 0));
++	ring(1u << 0 | 1u << 1 | 1u << 3 | 1u << 6 | (list ? 1u << 8 : 0) | (k_dms_off ? 1u << 11 : 0));       /* 0298: BIT(11) DMS off */
+ 	ring(0x00000003);
+ 	ring(0x20000000);
+ 	ring(0x00000002);
+@@ -2523,6 +2785,11 @@ static uint64_t pm_last_submit, pm_asleep_at;
+ static uint32_t pm_sleeps, pm_wakes, pm_wake_us, pm_wake_max_us, pm_sleep_failed, pm_hold_failed;
+ static uint32_t pm_fence_waits, pm_fence_max_us, pm_fence_fails;
+ static uint32_t pm_samples, pm_collapsed, pm_gmu_off;  /* watch samples since the last WATCH line */
++#define K_GBIF_HALT_ACK         0x3c46          /* 0298: GEN7_GBIF_HALT_ACK */
++static uint32_t pm_gbif_logged, pm_ifpc_sleeps, pm_ifpc_skips;
++static uint64_t busy_last_xo, busy_last_ao, busy_acc_xo, busy_acc_ao;   /* 0298: GMU busy counter */
++static bool busy_counter_ok = true;
++static uint32_t busy_zero_ticks;
+ 
+ static bool
+ pm_gx_on(void)
+@@ -2542,7 +2809,7 @@ pm_us_since(uint64_t t0)
+ static const char *
+ pm_name(void)
+ {
+-	return pm_mode == PM_IFPC ? "ifpc" : pm_mode == PM_SLUMBER ? (pm_asleep ? "slumber (asleep)" : "slumber") : "off";
++	return pm_mode == PM_IFPC ? (pm_asleep ? "ifpc (asleep)" : "ifpc") : pm_mode == PM_SLUMBER ? (pm_asleep ? "slumber (asleep)" : "slumber") : "off";
+ }
+ 
+ /* GX may be read by the CPU until gx_release(). PM_IFPC: OOB PERFCNTR; the other modes hold GX already. */
+@@ -2550,7 +2817,10 @@ static bool
+ gx_hold(void)
+ {
+ 	if (pm_mode != PM_IFPC) {
+-		return !(pm_mode == PM_SLUMBER && pm_asleep);
++		return !pm_asleep;
++	}
++	if (pm_asleep) {
++		return false;           /* 0298: IFPC mode slumbers too: the CM3 is in reset, no OOB answer */
+ 	}
+ 	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1u << GMU_OOB_PERF_SET);
+ 	bool acked = wait_for(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO), 1u << GMU_OOB_PERF_ACK, 1u << GMU_OOB_PERF_ACK, 20);
+@@ -2596,6 +2866,12 @@ pm_rptr_estimate(void)
+ {
+ 	uint32_t done = negroni_gpu_completed();
+ 
++	if (k_rptr_shadow) {
++		/* 0298: the CP's own copy (RB_CNTL without BIT(27), CP_RB_RPTR_ADDR = scratch +0x80), as KGSL adreno_get_rptr */
++		volatile uint32_t *shadow = (volatile uint32_t *)(core_scratch.memory + 0x80);
++		to_memory((vm_offset_t)shadow, 4);
++		return *shadow % RING_WORDS;
++	}
+ 	if (gpu_fence - done >= 256) {
+ 		return (ring_at + 1) % RING_WORDS;      /* not known: no room */
+ 	}
+@@ -2689,6 +2965,15 @@ pm_sleep(void)
+ 	wr(gmu + GMU_REG(GMU_RSCC_CONTROL_REQ), 1);
+ 	bool rsc = wait_for(rscc + RSCC_STATUS0, 1u << 16, 1u << 16, 100);
+ 	wr(gmu + GMU_REG(GMU_RSCC_CONTROL_REQ), 0);
++	/* 0298: gen7_halt_gbif (adreno_gen7_gmu.c:2492-2511): client halt, ARB halt, de-assert */
++	wr(gpu_regs + GPU_WORD(REG_GBIF_HALT), 1);
++	bool halt = wait_for(gpu_regs + GPU_WORD(K_GBIF_HALT_ACK), 1, 1, 100);
++	wr(gpu_regs + GPU_WORD(REG_GBIF_HALT), 2);
++	halt = wait_for(gpu_regs + GPU_WORD(K_GBIF_HALT_ACK), 2, 2, 100) && halt;
++	wr(gpu_regs + GPU_WORD(REG_GBIF_HALT), 0);
++	if (!halt && pm_gbif_logged++ < 4) {
++		printf("NEGRONI GPU PM: GBIF halt NOT ACKED at slumber (ack %#x)\n", rd(gpu_regs + GPU_WORD(K_GBIF_HALT_ACK)));
++	}
+ 	pm_asleep = true;
+ 	pm_asleep_at = mach_absolute_time();
+ 	gx_on = false;
+@@ -2716,6 +3001,20 @@ gpu_warm_boot(bool loud, bool *rsc_awake)
+ 	}
+ 	pause_ms = 0;
+ 	pm_rewaking = true;
++	/*
++	 * 0298: KGSL gen7_gmu_boot flushes the SMMU TLB before each boot because CX may not have gone down
++	 * (adreno_gen7_gmu.c:1887-1892; here CX never goes down), and a fault recorded while asleep must not
++	 * fail step 20 (ring_run checks the FSR): print it, then clear it (write-1-to-clear).
++	 */
++	const struct gpu_space *spaces[2] = { &core_space, &gmu_space };
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t cb = smmu_cb(spaces[i]);
++		(void)space_faulted(spaces[i]);
++		wr(smmu + cb + SMMU_CB_FSR, rd(smmu + cb + SMMU_CB_FSR));
++		wr(smmu + cb + SMMU_CB_TLBIASID, spaces[i]->context);
++		wr(smmu + cb + SMMU_CB_TLBSYNC, 1);
++		(void)wait_for(smmu + cb + SMMU_CB_TLBSTATUS, 1, 0, 10);
++	}
+ 	wr(gmu + GMU_REG(GMU_RSCC_CONTROL_REQ), 1u << 1);
+ 	bool rsc = wait_for(gmu + GMU_REG(GMU_RSCC_CONTROL_ACK), 1u << 1, 1u << 1, 100) &&
+ 	    wait_for(rscc + RSCC_SEQ_BUSY_DRV0, ~0u, 0, 100);
+@@ -2758,6 +3057,15 @@ pm_wake(void)
+ 		return false;
+ 	}
+ 	pm_asleep = false;
++	if (pm_mode == PM_IFPC) {
++		/* 0298: woken from an IFPC-mode slumber: as pm_start, OOB GPU_SET back to the GMU */
++		if (pm_ifpc_ok) {
++			pm_gpu_clear();
++		} else {
++			pm_mode = pm_slumber_arg ? PM_SLUMBER : PM_OFF;
++			printf("NEGRONI GPU PM: the GMU refused IFPC after a wake: %s\n", pm_name());
++		}
++	}
+ 	pm_wakes++;
+ 	pm_wake_us = us;
+ 	pm_wake_max_us = MAX(pm_wake_max_us, us);
+@@ -2779,7 +3087,11 @@ pm_start(void)
+ 		fence_pos[i] = ring_at;
+ 	}
+ 	pm_last_submit = mach_absolute_time();
++	k_args();
++	hfi_runtime = true;             /* 0298: KGSL's HFI timeout from now on */
+ 	if (pm_ifpc_ok) {
++		printf("NEGRONI GPU PM: IFPC mode slumbers after %u ms idle (negronigpu_ifpc_slumber; 0 = never); HFI timeout %u ms\n",
++		    k_ifpc_slumber_ms, k_hfi_ms);
+ 		lck_mtx_lock(&gpu_pm_lock);
+ 		pm_mode = PM_IFPC;
+ 		pm_gpu_clear();         /* KGSL gen7_gpu_boot: oob_clear(oob_gpu) once the GPU runs */
+@@ -2819,6 +3131,23 @@ pm_tick(uint32_t idle_for_ms, bool gx, bool late_done)
+ 				pm_mode = PM_SLUMBER;
+ 			}
+ 		}
++		/*
++		 * 0298: KGSL slumbers from IFPC after its idle timer too (gmu_idle_check -> gen7_power_off ->
++		 * gen7_gmu_power_off, adreno_gen7_gmu.c:2870-2913, 2795-2868, 2513-2560): OOB GPU_SET, then the
++		 * slumber sequence of pm_sleep (it checks the ring is idle, PREPARE_SLUMBER, RSC sleep, GBIF halt).
++		 */
++		if (pm_mode == PM_IFPC && k_ifpc_slumber_ms && !pm_asleep && late_done && idle_for_ms >= k_ifpc_slumber_ms) {
++			if (!pm_gpu_set()) {
++				pm_gpu_clear();
++				if (pm_ifpc_skips++ < 4) {
++					printf("NEGRONI GPU PM: IFPC slumber skipped: OOB GPU_SET not acked (GX GDSC %#x)\n", rd(gpucc + GPUCC_GX_GDSCR));
++				}
++			} else if (pm_sleep()) {
++				pm_ifpc_sleeps++;
++			} else if (pm_mode == PM_IFPC) {
++				pm_gpu_clear();         /* not idle (or the GMU said no): back to IFPC */
++			}
++		}
+ 		return;
+ 	}
+ 	if (!pm_asleep && late_done && idle_for_ms >= PM_SLUMBER_MS) {
+@@ -2833,8 +3162,10 @@ pm_line(char *buf, size_t size)
+ 	uint32_t pct = pm_samples ? pm_collapsed * 100 / pm_samples : 0, gpct = pm_samples ? pm_gmu_off * 100 / pm_samples : 0;
+ 
+ 	if (pm_mode == PM_IFPC) {
+-		snprintf(buf, size, "pm ifpc GX collapsed %u%% gmu %u%% pwr %#x fenced %u max %uus fail %u", pct, gpct,
+-		    rd(gmu + GMU_REG(GMU_RPMH_POWER_STATE)), pm_fence_waits, pm_fence_max_us, pm_fence_fails);
++		snprintf(buf, size, "pm %s GX collapsed %u%% gmu %u%% pwr %#x fenced %u max %uus fail %u slumbers %u wakes %u busy %u%%",
++		    pm_name(), pct, gpct, rd(gmu + GMU_REG(GMU_RPMH_POWER_STATE)), pm_fence_waits, pm_fence_max_us, pm_fence_fails,
++		    pm_ifpc_sleeps, pm_wakes, busy_acc_ao ? (uint32_t)(busy_acc_xo * 100 / busy_acc_ao) : 0);
++		busy_acc_xo = busy_acc_ao = 0;
+ 	} else if (pm_mode == PM_SLUMBER) {
+ 		snprintf(buf, size, "pm %s GX collapsed %u%% sleeps %u wakes %u last %uus max %uus", pm_name(), pct, pm_sleeps,
+ 		    pm_wakes, pm_wake_us, pm_wake_max_us);
+@@ -3298,7 +3629,7 @@ negroni_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t co
+ 
+ 	/* patch 0285: one lock with the watch's votes and the slumber; a sleeping GPU is woken first */
+ 	lck_mtx_lock(&gpu_pm_lock);
+-	if (pm_dead || (pm_mode == PM_SLUMBER && pm_asleep && !pm_wake())) {
++	if (pm_dead || (pm_asleep && !pm_wake())) {        /* 0298: a slumber from IFPC mode wakes the same way */
+ 		lck_mtx_unlock(&gpu_pm_lock);
+ 		return 0;
+ 	}
+@@ -3507,7 +3838,7 @@ rec_report(uint32_t n, const char *why)
+ {
+ 	volatile uint32_t *scratch = (volatile uint32_t *)core_scratch.memory;
+ 	uint32_t ccb = smmu_cb(&core_space), gcb = smmu_cb(&gmu_space);
+-	bool asleep = pm_mode == PM_SLUMBER && pm_asleep;
++	bool asleep = pm_asleep;
+ 
+ 	to_memory(core_scratch.memory, 4096);
+ 	printf("NEGRONI GPU RECOVERY: %u: %s: fence %u (bv %u) of %u, wptr %u, pm %s, GX GDSC %#x, power state %#x, GMU AO_INT %#x "
+@@ -3777,6 +4108,14 @@ static uint32_t
+ dcvs_bw_for(uint32_t level, uint32_t top)
+ {
+ 	uint32_t bw_top = 11;           /* bw_level_num - 1 (a730_build_bw_table) */
++	/*
++	 * 0298: the DT bus-freq of each level (out/live.dts:21096..21205: 818 11, 791 11, 734 10, 640 10, 599 8, 545 8,
++	 * 492 6, 421 6, 350 3, 317 2, 285 2, 220 2), index = our perf-table level (0 = off, 1 = 220 .. 12 = 818 MHz)
++	 */
++	static const uint8_t dt_bus[13] = { 0, 2, 2, 2, 3, 6, 6, 8, 8, 10, 10, 11, 11 };
++	if (k_bwdt) {
++		return level < 13 ? dt_bus[level] : bw_top;
++	}
+ 	if (level >= top) {
+ 		return bw_top;
+ 	}
+@@ -3784,6 +4123,40 @@ dcvs_bw_for(uint32_t level, uint32_t top)
+ 	return bw < DCVS_BW_FLOOR ? DCVS_BW_FLOOR : bw > bw_top ? bw_top : bw;
+ }
+ 
++/*
++ * 0298: share (%) of the last tick the GPU was busy, from GMU power counter 0 (XOCLK_0: 19.2 MHz ticks while busy,
++ * enabled at step 20) over the GMU always-on counter; both CX side, no GX hold. ~0u: not used (off, asleep, or
++ * the counter never moves while fences are pending: then the fence rule stays, logged once).
++ */
++static uint32_t
++busy_counter_pct(bool pending)
++{
++	if (!k_busy_pct || !busy_counter_ok || pm_asleep) {
++		busy_last_ao = 0;
++		return ~0u;
++	}
++	uint64_t xo = rd64(gmu + GMU_REG(K_POWER_COUNTER_XOCLK_0)), ao = ao_now();
++	if (busy_last_ao == 0 || ao <= busy_last_ao || xo < busy_last_xo) {
++		busy_last_xo = xo;
++		busy_last_ao = ao;
++		return ~0u;             /* first sample, or the counters restarted (a wake or a recovery) */
++	}
++	uint64_t dxo = xo - busy_last_xo, dao = ao - busy_last_ao;
++	busy_last_xo = xo;
++	busy_last_ao = ao;
++	busy_acc_xo += dxo;
++	busy_acc_ao += dao;
++	if (dxo == 0 && pending) {
++		if (++busy_zero_ticks >= 50) {
++			busy_counter_ok = false;
++			printf("NEGRONI GPU DCVS: the GMU busy counter did not move in 50 ticks with work queued: the fence rule stays\n");
++		}
++	} else if (dxo != 0) {
++		busy_zero_ticks = 0;
++	}
++	return (uint32_t)MIN(dxo * 100 / dao, 100ull);
++}
++
+ /* One governor tick; returns true when it voted. */
+ static bool
+ dcvs_tick(bool gx, bool busy, uint32_t ms, uint32_t *idle_ms, uint32_t *busy_ms, uint32_t *busy_ticks, uint32_t *ticks)
+@@ -3935,7 +4308,11 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 				}
+ 				uint32_t rbbm = pm_mode == PM_OFF && on ? rd(gpu_regs + GPU_WORD(REG_RBBM_STATUS)) : 0;
+ 				bool busy = pm_mode == PM_OFF ? on && ((rbbm & REG_RBBM_STATUS_GPU_BUSY) != 0 || pending) : pending;
+-				bool may_vote = pm_mode == PM_IFPC || (pm_mode == PM_SLUMBER ? !pm_asleep : on);
++				uint32_t cpct = busy_counter_pct(pending);  /* 0298: KGSL gen7_power_stats (adreno_gen7.c:1392-1405) */
++				if (cpct != ~0u) {
++					busy = cpct >= k_busy_pct;
++				}
++				bool may_vote = !pm_asleep && (pm_mode != PM_OFF || on);   /* 0298: never to a sleeping GMU */
+ 				if (dcvs_tick(may_vote, busy, ms, &idle_ms, &busy_ms, &busy_ticks, &ticks)) {
+ 					changes++;
+ 				}
+@@ -3976,7 +4353,7 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 		now[9] = rd(smmu + SMMU_SGFSR);
+ 		now[10] = rd(smmu + smmu_cb(&core_space) + SMMU_CB_FSR);
+ 		now[11] = rd(smmu + smmu_cb(&gmu_space) + SMMU_CB_FSR);
+-		now[12] = pm_mode == PM_SLUMBER && pm_asleep ? 0 : rd(gmu + GMU_REG(GMU_HFI_CTRL_STATUS));
++		now[12] = pm_asleep ? 0 : rd(gmu + GMU_REG(GMU_HFI_CTRL_STATUS));
+ 		now[13] = *(volatile uint32_t *)(core_scratch.memory + 0x80);  /* the core's copy of its ring rptr */
+ 		/* 0285: with power management GX and the GMU log change with every collapse: only the CX words count
+ 		 * as a change, and GX is read (held) only for a line that is printed */
+@@ -4012,7 +4389,7 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 			} else {
+ 				clk_ao = 0;
+ 			}
+-			char pline[112];
++			char pline[176];         /* 0298: + slumbers, wakes, busy */
+ 			pm_line(pline, sizeof(pline));          /* patch 0285 */
+ 			char tline[160];
+ 			negroni_thermal_line(tline, sizeof(tline));
+@@ -4047,8 +4424,8 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 			fault = "no fence written for 2 s with work queued (watch)";
+ 		}
+ 		if (done != gpu_fence && fault == NULL) {
+-			uint32_t ao = pm_mode == PM_SLUMBER && pm_asleep ? 0 : rd(gmu + GMU_REG(GMU_AO_HOST_INTERRUPT_STATUS));
+-			uint32_t init = pm_mode == PM_SLUMBER && pm_asleep ? 0 : rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT));
++			uint32_t ao = pm_asleep ? 0 : rd(gmu + GMU_REG(GMU_AO_HOST_INTERRUPT_STATUS));
++			uint32_t init = pm_asleep ? 0 : rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT));
+ 			if (now[10] & SMMU_FSR_ALL) {
+ 				fault = "SMMU fault in the 3D core's context (watch)";
+ 			} else if (held && now[7] != 0 && now[7] != ~0u) {
+@@ -4063,7 +4440,7 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 			rec_count_seen = rec_count;     /* a recovery restarted the GMU: sample again */
+ 			rec_ao_base = rec_init_base = ~0u;
+ 		}
+-		if (rec_ao_base == ~0u && !(pm_mode == PM_SLUMBER && pm_asleep)) {
++		if (rec_ao_base == ~0u && !pm_asleep) {
+ 			/* only bits that come up after the first sample count (a value left from the boot is not a fault) */
+ 			rec_ao_base = rd(gmu + GMU_REG(GMU_AO_HOST_INTERRUPT_STATUS)) & GMU_AO_INT_WDOG_BITE;
+ 			rec_init_base = rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)) & 0xe00;
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index 6bf28be..f3477a6 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -547,8 +547,50 @@ struct gpu_buffer {
+ 	bool                    readOnly;       /* for the GPU */
+ 	bool                    userAddress;    /* address in the client's window (SET_IOVA) */
+ 	bool                    prepared;       /* memory->prepare() done (imports) */
++	uint64_t                guard;          /* 0298: bytes after the buffer mapped to the trash page (kernel addresses) */
+ };
+ 
++/*
++ * Patch 0298: a guard after every buffer at a kernel-chosen GPU address (the audit's "zero page"; bergamota and
++ * gpu-status.md: the GPU writes whole tiles past a surface's end). One PAGE_SIZE page, writable, shared by every
++ * buffer and never read by the CPU, is mapped for PAGE_SIZE after the buffer, so such a write lands there instead
++ * of in the next buffer or in an SMMU fault. Client-chosen addresses (SET_IOVA, Turnip) get none: the client
++ * packs its own range. Boot-arg negronigpu_guard (default 1).
++ */
++static IOBufferMemoryDescriptor * gTrash;
++static uint64_t gTrashPA;
++static int gGuardOn = -1;
++
++static uint64_t
++guardBytes(void)
++{
++	if (gGuardOn < 0) {
++		int on = 1;
++		PE_parse_boot_argn("negronigpu_guard", &on, sizeof(on));
++		gGuardOn = on != 0;
++	}
++	if (!gGuardOn) {
++		return 0;
++	}
++	if (gTrash == NULL) {
++		IOBufferMemoryDescriptor * md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut,
++		    PAGE_SIZE, PAGE_SIZE);
++		if (md == NULL) {
++			return 0;
++		}
++		bzero(md->getBytesNoCopy(), PAGE_SIZE);
++		flush_dcache64((addr64_t)(uintptr_t)md->getBytesNoCopy(), PAGE_SIZE, FALSE);
++		uint64_t pa = md->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++		if (pa == 0 || !__sync_bool_compare_and_swap(&gTrash, (IOBufferMemoryDescriptor *)NULL, md)) {
++			md->release();          /* another client made it first (or no address) */
++		} else {
++			gTrashPA = pa;
++			IOLog("RedwoodGPU: guard page 0x%llx after every kernel-placed buffer (0298, negronigpu_guard=0 turns it off)\n", pa);
++		}
++	}
++	return gTrashPA != 0 ? PAGE_SIZE : 0;
++}
++
+ class RedwoodGPUUserClient : public IOUserClient
+ {
+ 	OSDeclareDefaultStructors(RedwoodGPUUserClient);
+@@ -713,8 +755,11 @@ RedwoodGPUUserClient::mapBuffer(struct gpu_buffer * b, uint64_t address)
+ 			mapped = negroni_gpu_vm_map(fVM, address + (uint64_t)p * PAGE_SIZE + sub, b->pa[p] + sub, b->readOnly);
+ 		}
+ 	}
++	for (uint64_t sub = 0; mapped && sub < b->guard; sub += GPU_PAGE) {
++		mapped = negroni_gpu_vm_map(fVM, address + b->size + sub, gTrashPA + (sub % PAGE_SIZE), false);
++	}
+ 	if (!mapped) {
+-		negroni_gpu_vm_unmap(fVM, address, b->size);
++		negroni_gpu_vm_unmap(fVM, address, b->size + b->guard);
+ 	} else {
+ 		negroni_gpu_vm_mapped(fVM);
+ 		b->address = address;
+@@ -730,17 +775,19 @@ RedwoodGPUUserClient::mapAnywhere(struct gpu_buffer * b)
+ {
+ 	uint64_t address;
+ 
++	b->guard = guardBytes();        /* 0298 */
+ 	IOLockLock(gGPULock);
+-	address = negroni_gpu_vm_address(fVM, b->size);
++	address = negroni_gpu_vm_address(fVM, b->size + b->guard);
+ 	IOLockUnlock(gGPULock);
+ 	if (address != 0 && mapBuffer(b, address)) {
+ 		return true;
+ 	}
+ 	if (address != 0) {
+ 		IOLockLock(gGPULock);
+-		negroni_gpu_vm_address_free(fVM, address, b->size);
++		negroni_gpu_vm_address_free(fVM, address, b->size + b->guard);
+ 		IOLockUnlock(gGPULock);
+ 	}
++	b->guard = 0;
+ 	IOLog("RedwoodGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", b->size);
+ 	return false;
+ }
+@@ -753,13 +800,14 @@ RedwoodGPUUserClient::unmapBuffer(struct gpu_buffer * b)
+ 		return;
+ 	}
+ 	IOLockLock(gGPULock);
+-	negroni_gpu_vm_unmap(fVM, b->address, b->size);
++	negroni_gpu_vm_unmap(fVM, b->address, b->size + b->guard);
+ 	if (!b->userAddress) {
+-		negroni_gpu_vm_address_free(fVM, b->address, b->size);
++		negroni_gpu_vm_address_free(fVM, b->address, b->size + b->guard);
+ 	}
+ 	IOLockUnlock(gGPULock);
+ 	b->address = 0;
+ 	b->userAddress = false;
++	b->guard = 0;
+ }
+ 
+ /* fLock held; nothing of b is in the GPU (any more). Everything else given back, the slot free. */
+@@ -1123,7 +1171,7 @@ RedwoodGPUUserClient::setAddress(struct gpu_buffer * b, uint64_t address)
+ 			return kIOReturnBadArgument;
+ 		}
+ 	}
+-	unmapBuffer(b);
++	unmapBuffer(b);                 /* b->guard is 0 from here: a client address has no guard (0298) */
+ 	if (!mapBuffer(b, address)) {
+ 		return kIOReturnNoMemory;
+ 	}

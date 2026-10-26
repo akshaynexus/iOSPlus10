@@ -1,0 +1,661 @@
+From: iOSPlus10 GPU-recovery agent
+Subject: [PATCH] negroni cpu: PSCI CPU_SUSPEND idle states (0288)
+
+Before: an idle core ran cpu_idle() -> WFI only (clock gating; the core and its caches
+stay powered). Now, with negronicpuidle=1 (kernel default 0 = WFI only), a core whose
+next timer deadline is at least the DT residency away calls PSCI CPU_SUSPEND with the DT
+param (out/live.dts idle-states: silver-c4/gold-c4 "rail-pc" 0x40000004, residency 4090 /
+4791 us); negronicpuidle=2 adds the cluster states (cluster-d4 l3-off 0x41000044 at >= 5309
+us, cluster-e3 llcc-off 0x4100c344 at >= 13959 us) in platform-coordinated mode.
+
+- PSCI probe at start: VERSION, FEATURES(CPU_SUSPEND) (extended StateID required),
+  FEATURES(SET_SUSPEND_MODE); PC mode is kept (Linux psci_1_0_init default).
+- Entry point negroni_secondary_entry (the CPU_ON entry) -> reset vector ->
+  resume_idle_cpu (already every core's reset handler) -> arm_init_idle_cpu ->
+  cpu_idle_exit(TRUE) -> negroni_cpuidle_resume(): PE_init_cpu (GIC redistributor
+  and CPU interface) and setPop(rtcPop) (the timer's compare value).
+- local-timer-stop: the earliest wake time of the cores that are down goes into the
+  memory-mapped timer frame 0 (0x17421000, CNTP, SPI 8 = INTID 40, routed by IROUTER
+  to that core); its IRQ IPIs every core whose time came (Linux tick broadcast).
+- Guard: 3 power-downs in a row shorter than the residency -> 8 WFI idles.
+- Log: "NEGRONI CPUIDLE: ..." at start, every 60 s per core and state
+  "NEGRONI CPUIDLE: cpuN state S param 0x... entered N times: resumed, returned,
+  denied, short, down ms (%), bcast wakes".
+Boot-args: negronicpuidle (0/1/2), negronicpuidle_mask (0xff), negronicpuidle_bcast (1).
+
+diff --git a/iokit/Kernel/arm/NegroniCPU.cpp b/iokit/Kernel/arm/NegroniCPU.cpp
+index 678edbd..6b016fb 100644
+--- a/iokit/Kernel/arm/NegroniCPU.cpp
++++ b/iokit/Kernel/arm/NegroniCPU.cpp
+@@ -20,6 +20,7 @@
+ 
+ extern "C" void negroni_secondary_entry(void);
+ extern "C" boolean_t negroni_cpu_signal_is_enabled(unsigned int cpu);
++extern "C" void negroni_cpuidle_init(void);     /* osfmk/arm64/negroni_cpuidle.c (0288) */
+ 
+ class NegroniCPU;
+ static NegroniCPU *negroni_cpus[MAX_CPUS];
+@@ -188,6 +189,7 @@ NegroniCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("NEGRONI CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++	negroni_cpuidle_init();         /* 0288: CPU idle states (negronicpuidle, default 0 = WFI only) */
+ 	thread_terminate(current_thread());
+ }
+ 
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index ac8907a..cb14af2 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -88,6 +88,10 @@ void sleep_token_buffer_init(void);
+ #endif
+ 
+ extern uintptr_t resume_idle_cpu;
++#if defined(NEGRONI)
++extern void negroni_cpuidle_idle(void);         /* osfmk/arm64/negroni_cpuidle.c (0288) */
++extern void negroni_cpuidle_resume(void);
++#endif
+ extern uintptr_t start_cpu;
+ vm_address_t   start_cpu_paddr;
+ 
+@@ -587,6 +591,8 @@ cpu_idle(void)
+ 		__builtin_arm_dsb(DSB_SY);
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
++#elif defined(NEGRONI)
++		negroni_cpuidle_idle();         /* 0288: WFI, or a PSCI CPU_SUSPEND state (negronicpuidle) */
+ #else
+ 		__builtin_arm_wfi();
+ #endif
+@@ -640,6 +646,9 @@ cpu_idle_exit(boolean_t from_reset)
+ 
+ 	/* Back from WFI, unlock OSLAR and EDLAR. */
+ 	if (from_reset) {
++#if defined(NEGRONI)
++		negroni_cpuidle_resume();       /* 0288: GIC CPU interface and timer after a PSCI power-down */
++#endif
+ 		configure_coresight_registers(cpu_data_ptr);
+ 	}
+ 
+diff --git a/osfmk/arm64/negroni_cpuidle.c b/osfmk/arm64/negroni_cpuidle.c
+new file mode 100644
+index 0000000..121b1fb
+--- /dev/null
++++ b/osfmk/arm64/negroni_cpuidle.c
+@@ -0,0 +1,495 @@
++/*
++ * NEGRONI (SM8450) CPU idle states, patch 0288.
++ *
++ * Before 0288 an idle core ran XNU's cpu_idle() -> WFI (osfmk/arm64/cpu.c): clock gating only, the
++ * core and its L1/L2 stay powered. This file adds the PSCI CPU_SUSPEND states of the phone's device
++ * tree (out/live.dts:733-775, idle-states; cpus at 512-673; psci node at 1217-1272):
++ *
++ *   silver-c4 "rail-pc"  cpus 0-3   param 0x40000004  entry 800 us  exit  750 us  residency  4090 us  local-timer-stop
++ *   gold-c4   "rail-pc"  cpus 4-7   param 0x40000004  entry 600 us  exit 1550 us  residency  4791 us  local-timer-stop
++ *   cluster-d4 "l3-off"  (cluster)  param 0x41000044  entry 1050 us exit 2500 us  residency  5309 us
++ *   cluster-e3 "llcc-off"(cluster)  param 0x4100c344  entry 2700 us exit 3500 us  residency 13959 us
++ *
++ * The params use the PSCI extended StateID format (bit 30 = power-down, StateID in bits 27:0); the
++ * cluster states are domain-idle-states of the psci cluster-pd (Linux cpuidle-psci-domain.c composes
++ * them in OS-initiated mode). Linux starts PSCI in platform-coordinated mode (drivers/firmware/psci/
++ * psci.c:578-592, psci_1_0_init "Default to PC mode") and moves to OSI only for the hierarchical
++ * domains; this file stays in PC mode: each core asks for its own state, and with negronicpuidle=2 for a
++ * cluster state, which the firmware enters only when every core of the cluster asked for it.
++ *
++ * Boot-arg negronicpuidle (default 0 = WFI only, as before):
++ *   1  a core whose next timer deadline is at least the state's residency away powers down (rail-pc)
++ *   2  + the cluster states (l3-off at >= 5309 us, llcc-off at >= 13959 us)
++ * negronicpuidle_mask (default 0xff: the cores that may power down), negronicpuidle_bcast (default 1).
++ *
++ * Power-down loses the core's state. Entry point = negroni_secondary_entry (start.s, the PSCI CPU_ON
++ * entry), which goes to the reset vector; cpu_machine_idle_init already set every core's reset
++ * handler to resume_idle_cpu, so the core comes back through start_cpu -> arm_init_idle_cpu ->
++ * cpu_idle_exit(TRUE) (XNU's own deep-idle path), where negroni_cpuidle_resume() runs first: the GIC
++ * CPU interface again (PE_init_cpu = pe_init_fiq, as Linux's gic_cpu_pm_notifier -> gic_cpu_sys_reg_init)
++ * and the virtual timer's deadline again (setPop; arm_init_idle_cpu already re-enabled CNTV_CTL and
++ * CNTKCTL). A CPU_SUSPEND that returns did not power down: cpu_idle goes on as after a WFI.
++ *
++ * "local-timer-stop": the core's own timer does not run while it is down. Linux uses a broadcast timer
++ * (the memory-mapped timer, out/live.dts:1344-1357 timer@17420000 "arm,armv7-timer-mem", frame 0 at
++ * 0x17421000, physical-timer SPI 8 = INTID 40). Here the same: the earliest wake time of the cores that
++ * are down is programmed into frame 0's CNTP_CVAL (exit latency earlier), its SPI is routed to that
++ * core, and the interrupt handler (sleh.c NEGRONI path) sends an IPI to every core whose time came.
++ * [I] Under the Gunyah hypervisor the virtual timer of a suspended vCPU may keep working; the broadcast
++ * is then only a second wake source. negronicpuidle_bcast=0 turns it off (only for tests).
++ *
++ * A simple guard against short sleeps (qcom-lpm.c has a history predictor): three power-downs in a row
++ * shorter than the residency -> the next 8 idles of that core are WFI.
++ * Log: "NEGRONI CPUIDLE: ..." at start, then every 60 s one line per core and state:
++ * "NEGRONI CPUIDLE: cpuN state S param 0x... entered N times: ...".
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(NEGRONI)
++#include <stdint.h>
++#include <stdbool.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/misc_protos.h>
++#include <mach/mach_time.h>
++#include <arm/cpu_data.h>
++#include <arm/cpu_data_internal.h>
++#include <arm/cpu_internal.h>
++#include <arm/machine_routines.h>
++#include <arm64/proc_reg.h>
++#include <pexpert/pexpert.h>
++
++extern void negroni_secondary_entry(void);
++extern int setPop(uint64_t time);                               /* osfmk/arm/rtclock.c */
++extern void negroni_gic_spi_enable(uint32_t intid, uint64_t mpidr);     /* pexpert/arm/pe_fiq.c (0288) */
++extern void negroni_gic_spi_route(uint32_t intid, uint64_t mpidr);
++
++void negroni_cpuidle_init(void);
++void negroni_cpuidle_idle(void);
++void negroni_cpuidle_resume(void);
++bool negroni_cpuidle_bcast_irq(uint32_t intid);
++
++#define CI_CPUS                 8
++#define CI_STATES               3       /* 0 core rail-pc, 1 cluster l3-off, 2 cluster llcc-off */
++#define PSCI_VERSION            0x84000000ull
++#define PSCI_FEATURES           0x8400000aull
++#define PSCI_CPU_SUSPEND64      0xc4000001ull
++#define PSCI_SET_SUSPEND_MODE   0x8400000full
++#define PSCI_INVALID_PARAMETERS (-2)
++#define BC_CTL_PHYS             0x17420000ull   /* CNTCTLBase */
++#define BC_FRAME_PHYS           0x17421000ull   /* frame 0, CNTBase0 */
++#define BC_INTID                40              /* frame 0 physical timer: GIC_SPI 8 */
++#define CNTTIDR                 0x08
++#define CNTNSAR                 0x04
++#define CNTACR0                 0x40
++#define CNTACR_ALL              0x3f            /* RPCT RVCT RFRQ RVOFF RWVT RWPT */
++#define CNT_PCT_LO              0x00
++#define CNT_PCT_HI              0x04
++#define CNTP_CVAL_LO            0x20
++#define CNTP_CVAL_HI            0x24
++#define CNTP_CTL                0x2c
++#define CNT_CTL_ENABLE          1u
++#define CNT_CTL_IMASK           2u
++#define CI_SHORT_LIMIT          3
++#define CI_SHORT_SKIP           8
++
++struct ci_state {
++	const char *name;
++	uint32_t param, entry_us, exit_us, residency_us;
++	uint64_t exit_abs, residency_abs;
++};
++
++/* out/live.dts:733-775 */
++static struct ci_state ci_silver = { "silver-c4 rail-pc", 0x40000004, 800, 750, 4090, 0, 0 };
++static struct ci_state ci_gold = { "gold-c4 rail-pc", 0x40000004, 600, 1550, 4791, 0, 0 };
++static struct ci_state ci_l3 = { "cluster-d4 l3-off", 0x41000044, 1050, 2500, 5309, 0, 0 };
++static struct ci_state ci_llcc = { "cluster-e3 llcc-off", 0x4100c344, 2700, 3500, 13959, 0, 0 };
++
++struct ci_cpu {
++	struct ci_state *state[CI_STATES];      /* NULL: not allowed */
++	uint32_t index;                         /* the state being entered (CI_STATES: none) */
++	bool down;                              /* between CPU_SUSPEND and its return or resume */
++	uint64_t t0, mpidr;
++	uint32_t shorts, skip;
++	bool refused[CI_STATES];
++	/* counters (this core writes them; the log thread reads) */
++	uint32_t entered[CI_STATES], resumed[CI_STATES], returned[CI_STATES], denied[CI_STATES], early[CI_STATES];
++	uint64_t asleep_abs[CI_STATES];
++	uint32_t bcast_wakes;
++	int64_t last_rc;
++};
++
++static uint32_t ci_level, ci_mask = 0xff, ci_bcast_arg = 1;
++static bool ci_ready;
++static uint64_t ci_entry_pa;
++static struct ci_cpu ci[CI_CPUS];
++
++static vm_offset_t bc_ctl, bc_frame;
++static bool bc_on;
++static int64_t bc_off;                          /* frame CNTPCT - CNTVCT_EL0 */
++static uint32_t bc_lock_word;
++static uint64_t bc_wake[CI_CPUS];               /* mach time by which core n must be up (0: none) */
++static uint64_t bc_armed;
++static int bc_target = -1;
++static uint32_t bc_irqs;
++static uint32_t ci_log_event;            /* the log thread's wait event (never woken) */
++
++static int64_t
++ci_psci(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = a1;
++	register uint64_t x2 __asm__("x2") = a2;
++	register uint64_t x3 __asm__("x3") = a3;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++                 "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++                 "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int64_t)(int32_t)x0;
++}
++
++static uint32_t
++bc_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++bc_wr(vm_offset_t base, uint32_t off, uint32_t value)
++{
++	*(volatile uint32_t *)(base + off) = value;
++}
++
++static uint64_t
++bc_pct(void)
++{
++	uint32_t hi, lo;
++
++	do {
++		hi = bc_rd(bc_frame, CNT_PCT_HI);
++		lo = bc_rd(bc_frame, CNT_PCT_LO);
++	} while (hi != bc_rd(bc_frame, CNT_PCT_HI));
++	return (uint64_t)hi << 32 | lo;
++}
++
++static void
++bc_lock(void)
++{
++	while (__atomic_exchange_n(&bc_lock_word, 1, __ATOMIC_ACQUIRE)) {
++		while (__atomic_load_n(&bc_lock_word, __ATOMIC_RELAXED)) {
++			__builtin_arm_yield();
++		}
++	}
++}
++
++static void
++bc_unlock(void)
++{
++	__atomic_store_n(&bc_lock_word, 0, __ATOMIC_RELEASE);
++}
++
++/* bc_lock held: frame 0 fires at the earliest wake time of the cores that are down, at that core */
++static void
++bc_program_locked(void)
++{
++	uint64_t min = 0;
++	int who = -1;
++
++	for (int i = 0; i < CI_CPUS; i++) {
++		if (bc_wake[i] != 0 && (min == 0 || bc_wake[i] < min)) {
++			min = bc_wake[i];
++			who = i;
++		}
++	}
++	if (who < 0) {
++		bc_wr(bc_frame, CNTP_CTL, CNT_CTL_IMASK);
++		bc_armed = 0;
++		return;
++	}
++	if (who != bc_target) {
++		negroni_gic_spi_route(BC_INTID, ci[who].mpidr);
++		bc_target = who;
++	}
++	uint64_t cval = (uint64_t)((int64_t)min + bc_off);
++	bc_wr(bc_frame, CNTP_CTL, CNT_CTL_IMASK);
++	bc_wr(bc_frame, CNTP_CVAL_LO, (uint32_t)cval);
++	bc_wr(bc_frame, CNTP_CVAL_HI, (uint32_t)(cval >> 32));
++	bc_wr(bc_frame, CNTP_CTL, CNT_CTL_ENABLE);
++	__builtin_arm_dsb(DSB_SY);
++	bc_armed = min;
++}
++
++/* The wake timer's SPI (sleh.c, NEGRONI IRQ path, interrupts masked): IPI every core whose time came */
++bool
++negroni_cpuidle_bcast_irq(uint32_t intid)
++{
++	if (intid != BC_INTID || !bc_on) {
++		return false;
++	}
++	int self = getCpuDatap()->cpu_number;
++
++	bc_lock();
++	bc_irqs++;
++	bc_wr(bc_frame, CNTP_CTL, CNT_CTL_IMASK);
++	bc_armed = 0;
++	uint64_t now = mach_absolute_time();
++	for (int i = 0; i < CI_CPUS; i++) {
++		if (bc_wake[i] != 0 && bc_wake[i] <= now + ci_silver.exit_abs / 4) {
++			bc_wake[i] = 0;
++			ci[i].bcast_wakes++;
++			if (i != self) {
++				(void)cpu_signal(cpu_datap(i), SIGPnop, NULL, NULL);
++			}
++		}
++	}
++	bc_program_locked();
++	bc_unlock();
++	return true;
++}
++
++static void
++bc_leave(int n)
++{
++	if (!bc_on) {
++		return;
++	}
++	bc_lock();
++	bc_wake[n] = 0;                 /* the timer may still fire for it once: the handler finds nothing */
++	bc_unlock();
++}
++
++/* The deepest allowed state whose residency fits before the next timer deadline */
++static uint32_t
++ci_pick(struct ci_cpu *c, uint64_t now, uint64_t pop)
++{
++	if (pop <= now) {
++		return CI_STATES;
++	}
++	uint64_t left = pop - now;
++	for (int s = CI_STATES - 1; s >= 0; s--) {
++		if (c->state[s] != NULL && !c->refused[s] && left >= c->state[s]->residency_abs) {
++			return (uint32_t)s;
++		}
++	}
++	return CI_STATES;
++}
++
++/* cpu_idle(), interrupts masked, in place of the WFI */
++void
++negroni_cpuidle_idle(void)
++{
++	cpu_data_t *cdp = getCpuDatap();
++	int n = cdp->cpu_number;
++
++	if (!ci_ready || n < 0 || n >= CI_CPUS || ci[n].state[0] == NULL) {
++		__builtin_arm_dsb(DSB_SY);
++		__builtin_arm_wfi();
++		return;
++	}
++	struct ci_cpu *c = &ci[n];
++	uint64_t now = mach_absolute_time();
++	uint32_t s = c->skip ? CI_STATES : ci_pick(c, now, cdp->rtcPop);
++
++	if (c->skip) {
++		c->skip--;
++	}
++	if (s == CI_STATES) {
++		__builtin_arm_dsb(DSB_SY);
++		__builtin_arm_wfi();
++		return;
++	}
++	struct ci_state *st = c->state[s];
++	if (bc_on) {
++		uint64_t wake = cdp->rtcPop > st->exit_abs ? cdp->rtcPop - st->exit_abs : cdp->rtcPop;
++		bc_lock();
++		bc_wake[n] = wake;
++		if (bc_armed == 0 || wake < bc_armed) {
++			bc_program_locked();
++		}
++		bc_unlock();
++	}
++	c->index = s;
++	c->t0 = now;
++	c->entered[s]++;
++	c->down = true;
++	/* the resume path reads this core's record before its caches are back: clean it to the point of coherency */
++	for (uintptr_t a = (uintptr_t)c & ~(uintptr_t)63; a < (uintptr_t)c + sizeof(*c); a += 64) {
++		__asm__ volatile ("dc cvac, %0" : : "r"(a) : "memory");
++	}
++	__builtin_arm_dsb(DSB_SY);
++	int64_t rc = ci_psci(PSCI_CPU_SUSPEND64, st->param, ci_entry_pa, (uint64_t)n);
++	/* returned: no power-down (a pending interrupt, or the firmware said no) */
++	c->down = false;
++	c->last_rc = rc;
++	if (rc == 0) {
++		c->returned[s]++;
++	} else {
++		c->denied[s]++;
++		if (rc == PSCI_INVALID_PARAMETERS) {
++			c->refused[s] = true;   /* this param is not the firmware's: never again on this core */
++		}
++	}
++	bc_leave(n);
++}
++
++/* cpu_idle_exit(TRUE): the core came back through the reset vector (interrupts masked, MMU on) */
++void
++negroni_cpuidle_resume(void)
++{
++	cpu_data_t *cdp = getCpuDatap();
++	int n = cdp->cpu_number;
++
++	if (n < 0 || n >= CI_CPUS || !ci[n].down) {
++		return;
++	}
++	struct ci_cpu *c = &ci[n];
++	uint32_t s = c->index < CI_STATES ? c->index : 0;
++
++	PE_init_cpu();                  /* GIC redistributor wake + CPU interface (lost with the core) */
++	setPop(cdp->rtcPop);            /* the virtual timer's compare value was lost too */
++	uint64_t slept = mach_absolute_time() - c->t0;
++	c->down = false;
++	c->resumed[s]++;
++	c->asleep_abs[s] += slept;
++	if (slept < c->state[s]->residency_abs) {
++		c->early[s]++;
++		if (++c->shorts >= CI_SHORT_LIMIT) {
++			c->shorts = 0;
++			c->skip = CI_SHORT_SKIP;
++		}
++	} else {
++		c->shorts = 0;
++	}
++	bc_leave(n);
++}
++
++static void
++ci_log(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t entered[CI_CPUS][CI_STATES] = {{ 0 }}, resumed[CI_CPUS][CI_STATES] = {{ 0 }};
++	uint64_t asleep[CI_CPUS][CI_STATES] = {{ 0 }}, last = mach_absolute_time();
++
++	for (uint32_t round = 0;; round++) {
++		assert_wait_timeout((event_t)&ci_log_event, THREAD_UNINT, round == 0 ? 10 : 60, NSEC_PER_SEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		uint64_t now = mach_absolute_time(), span_ns;
++		absolutetime_to_nanoseconds(now - last, &span_ns);
++		last = now;
++		for (int n = 0; n < CI_CPUS; n++) {
++			struct ci_cpu *c = &ci[n];
++			for (int s = 0; s < CI_STATES; s++) {
++				if (c->state[s] == NULL) {
++					continue;
++				}
++				uint64_t ns;
++				absolutetime_to_nanoseconds(c->asleep_abs[s] - asleep[n][s], &ns);
++				printf("NEGRONI CPUIDLE: cpu%d state %d param %#x (%s) entered %u times (+%u in %llu s): resumed %u (+%u), "
++				    "returned %u, denied %u (last rc %lld)%s, short %u, down %llu ms (%llu%%), bcast wakes %u\n", n, s + 1,
++				    c->state[s]->param, c->state[s]->name, c->entered[s], c->entered[s] - entered[n][s], span_ns / NSEC_PER_SEC,
++				    c->resumed[s], c->resumed[s] - resumed[n][s], c->returned[s], c->denied[s], c->last_rc,
++				    c->refused[s] ? " REFUSED" : "", c->early[s], ns / NSEC_PER_MSEC, span_ns ? ns * 100 / span_ns : 0,
++				    c->bcast_wakes);
++				entered[n][s] = c->entered[s];
++				resumed[n][s] = c->resumed[s];
++				asleep[n][s] = c->asleep_abs[s];
++			}
++		}
++		if (bc_on) {
++			printf("NEGRONI CPUIDLE: wake timer: %u interrupts, armed %s, target cpu%d\n", bc_irqs, bc_armed ? "yes" : "no",
++			    bc_target);
++		}
++	}
++}
++
++/* frame 0 of the memory-mapped timer as the wake source (Linux arch_timer_mem_frame + arch_timer_mem_find_best_frame) */
++static bool
++bc_start(void)
++{
++	bc_ctl = ml_io_map(BC_CTL_PHYS, 0x1000);
++	bc_frame = ml_io_map(BC_FRAME_PHYS, 0x1000);
++	if (bc_ctl == 0 || bc_frame == 0) {
++		printf("NEGRONI CPUIDLE: wake timer: cannot map 0x%llx/0x%llx\n", BC_CTL_PHYS, BC_FRAME_PHYS);
++		return false;
++	}
++	uint32_t tidr = bc_rd(bc_ctl, CNTTIDR), nsar = bc_rd(bc_ctl, CNTNSAR);
++	bc_wr(bc_ctl, CNTACR0, CNTACR_ALL);
++	uint32_t acr = bc_rd(bc_ctl, CNTACR0);
++	bc_wr(bc_frame, CNTP_CTL, CNT_CTL_IMASK);
++	uint32_t ctl = bc_rd(bc_frame, CNTP_CTL);
++	uint64_t vct0 = mach_absolute_time(), pct = bc_pct(), vct1 = mach_absolute_time();
++	bc_off = (int64_t)(pct - (vct0 + (vct1 - vct0) / 2));
++	bool ok = (tidr & 1) != 0 && (acr & 0x21) == 0x21 && (ctl & 3) == CNT_CTL_IMASK && pct != 0;
++	printf("NEGRONI CPUIDLE: wake timer frame 0 at 0x%llx: CNTTIDR %#x CNTNSAR %#x CNTACR0 %#x CTL %#x, CNTPCT - CNTVCT = %lld ticks: %s\n",
++	    BC_FRAME_PHYS, tidr, nsar, acr, ctl, bc_off, ok ? "usable, INTID 40" : "NOT USABLE");
++	if (!ok) {
++		return false;
++	}
++	negroni_gic_spi_enable(BC_INTID, ci[0].mpidr);
++	bc_target = 0;
++	return true;
++}
++
++/* NegroniCPU::startAll, after every core runs (thread context) */
++void
++negroni_cpuidle_init(void)
++{
++	(void)PE_parse_boot_argn("negronicpuidle", &ci_level, sizeof(ci_level));
++	(void)PE_parse_boot_argn("negronicpuidle_mask", &ci_mask, sizeof(ci_mask));
++	(void)PE_parse_boot_argn("negronicpuidle_bcast", &ci_bcast_arg, sizeof(ci_bcast_arg));
++	if (ci_level == 0) {
++		printf("NEGRONI CPUIDLE: level 0: WFI only (negronicpuidle=1 or 2 for the PSCI states)\n");
++		return;
++	}
++	int64_t ver = ci_psci(PSCI_VERSION, 0, 0, 0);
++	int64_t feat = ci_psci(PSCI_FEATURES, PSCI_CPU_SUSPEND64, 0, 0);
++	int64_t mode = ci_psci(PSCI_FEATURES, PSCI_SET_SUSPEND_MODE, 0, 0);
++	printf("NEGRONI CPUIDLE: PSCI version %lld.%lld, CPU_SUSPEND features %#llx (%s StateID, OSI %s), SET_SUSPEND_MODE %s: "
++	    "platform-coordinated mode (the PSCI default) is kept\n", ver >> 16, ver & 0xffff, feat,
++	    feat < 0 ? "?" : (feat & 2) ? "extended" : "original", feat < 0 ? "?" : (feat & 1) ? "supported" : "no",
++	    mode == 0 ? "present" : "absent");
++	/* PSCI 1.0 FEATURES(CPU_SUSPEND): bit 1 = extended StateID, bit 0 = OS-initiated (Linux uapi psci.h:99-103) */
++	if (feat < 0 || !(feat & 2)) {
++		printf("NEGRONI CPUIDLE: CPU_SUSPEND %s: the DT params are in the extended StateID format: WFI only\n",
++		    feat < 0 ? "is not offered" : "uses the original StateID format");
++		return;
++	}
++	struct ci_state *all[] = { &ci_silver, &ci_gold, &ci_l3, &ci_llcc };
++	for (unsigned i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
++		nanoseconds_to_absolutetime((uint64_t)all[i]->exit_us * NSEC_PER_USEC, &all[i]->exit_abs);
++		nanoseconds_to_absolutetime((uint64_t)all[i]->residency_us * NSEC_PER_USEC, &all[i]->residency_abs);
++	}
++	const ml_topology_info_t *topo = ml_get_topology_info();
++	for (unsigned i = 0; i < topo->num_cpus && i < CI_CPUS; i++) {
++		const ml_topology_cpu_t *t = &topo->cpus[i];
++		if (t->cpu_id >= CI_CPUS) {
++			continue;
++		}
++		struct ci_cpu *c = &ci[t->cpu_id];
++		c->mpidr = t->phys_id;
++		c->index = CI_STATES;
++		if (!(ci_mask & (1u << t->cpu_id))) {
++			continue;
++		}
++		c->state[0] = ((t->phys_id >> 8) & 0xff) < 4 ? &ci_silver : &ci_gold;     /* MPIDR Aff1 0-3: the A510s */
++		if (ci_level >= 2) {
++			c->state[1] = &ci_l3;
++			c->state[2] = &ci_llcc;
++		}
++	}
++	ci_entry_pa = ml_static_vtop((vm_offset_t)&negroni_secondary_entry);
++	bc_on = ci_bcast_arg != 0 && bc_start();
++	if (ci_bcast_arg != 0 && !bc_on) {
++		printf("NEGRONI CPUIDLE: no wake timer: WFI only (negronicpuidle_bcast=0 would power down without it)\n");
++		return;
++	}
++	printf("NEGRONI CPUIDLE: level %u, cores %#x (of %u), entry 0x%llx, wake timer %s; silver param %#x (exit %u us, residency %u us), "
++	    "gold param %#x (exit %u us, residency %u us)%s\n", ci_level, ci_mask, topo->num_cpus, ci_entry_pa, bc_on ? "on" : "OFF",
++	    ci_silver.param, ci_silver.exit_us, ci_silver.residency_us, ci_gold.param, ci_gold.exit_us, ci_gold.residency_us,
++	    ci_level >= 2 ? ", cluster l3-off 0x41000044 (>= 5309 us), llcc-off 0x4100c344 (>= 13959 us)" : "");
++	__atomic_store_n(&ci_ready, true, __ATOMIC_RELEASE);
++	thread_t thread;
++	if (kernel_thread_start(ci_log, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* NEGRONI */
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 4769bdd..356cca8 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -45,6 +45,7 @@
+ #include <kern/thread.h>
+ #if defined(NEGRONI)
+ #include <kern/task.h>
++extern bool negroni_cpuidle_bcast_irq(uint32_t intid);     /* osfmk/arm64/negroni_cpuidle.c (0288) */
+ #endif
+ #include <kern/zalloc_internal.h>
+ #include <mach/exception.h>
+@@ -1998,6 +1999,10 @@ sleh_irq(arm_saved_state_t *state)
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
++	} else if (negroni_cpuidle_bcast_irq(intid)) {
++		/* 0288: the CPU-idle wake timer (memory-mapped timer frame 0) */
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
++		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 		if (cdp->interrupt_handler) {
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index c312a1c..c4ec9d7 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/negroni_early.c	standard
++osfmk/arm64/negroni_cpuidle.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 235267e..41e1c65 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -243,6 +243,41 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* NEGRONI */
+ }
++
++#if defined(NEGRONI)
++/*
++ * Patch 0288: one SPI for the CPU-idle wake timer (osfmk/arm64/negroni_cpuidle.c): Group 1 NS,
++ * priority 0xA0 as the PPIs above, level-sensitive, routed to one PE by affinity (GICD_IROUTER,
++ * Interrupt_Routing_Mode 0), enabled. Offsets: GICv3 architecture (GICD_IGROUPR 0x80,
++ * GICD_ISENABLER 0x100, GICD_IPRIORITYR 0x400, GICD_ICFGR 0xC00, GICD_IROUTER 0x6000).
++ */
++void negroni_gic_spi_route(uint32_t intid, uint64_t mpidr);
++void negroni_gic_spi_enable(uint32_t intid, uint64_t mpidr);
++
++void
++negroni_gic_spi_route(uint32_t intid, uint64_t mpidr)
++{
++	uint64_t aff = (mpidr & 0xffffffull) | ((mpidr >> 32) & 0xff) << 32;
++
++	*(volatile uint64_t *)(gicd_base + 0x6000 + 8 * (vm_offset_t)intid) = aff;
++	__builtin_arm_dsb(DSB_SY);
++}
++
++void
++negroni_gic_spi_enable(uint32_t intid, uint64_t mpidr)
++{
++	uint32_t word = intid / 32, bit = 1u << (intid % 32);
++
++	gicd_write32(0x80 + 4 * word, gicd_read32(0x80 + 4 * word) | bit);
++	*(volatile uint8_t *)(gicd_base + 0x400 + intid) = 0xA0;
++	gicd_write32(0xC00 + 4 * (intid / 16), gicd_read32(0xC00 + 4 * (intid / 16)) & ~(2u << (2 * (intid % 16))));
++	negroni_gic_spi_route(intid, mpidr);
++	gicd_write32(0x100 + 4 * word, bit);
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++}
++#endif /* NEGRONI */
+ #else
+ void
+ pe_init_fiq()

@@ -4,7 +4,7 @@
 #   scripts/kernel/compile-one.sh TREE FILE [-o OUT.o]      (FILE: a .c of bsd/, or a .cpp of iokit/)
 #     TREE  a patched xnu tree (scripts/kernel/patched-tree.sh OUTDIR); its bsd/ osfmk/ ... are
 #           used for the source includes; the generated headers come from the last full build
-#     FILE  path of the .c file, relative to TREE (e.g. bsd/dev/negroni_glink.c)
+#     FILE  path of the .c file, relative to TREE (e.g. bsd/dev/negroni_glink.c; osfmk/ and pexpert/ .c too)
 # Uses the clang command line that build.log recorded for bsd/dev/negroni_adsp.c (all -D/-W flags
 # of DEVELOPMENT_ARM64_NEGRONI). Without -o: -fsyntax-only. Fails while a full build runs (the
 # build deletes build/xnu.obj first).
@@ -30,6 +30,19 @@ case "$FILE" in
   line=${line% *}
   line=${line//-o NegroniBattery.cpo /}
   line=${line//-MD -MF NegroniBattery.d -MP/}
+  ;;
+osfmk/*.c|pexpert/*.c)
+  # an osfmk or pexpert C file (0288): the clang line of osfmk/arm64/negroni_early.c or
+  # pexpert/arm/pe_fiq.c (the component's own flags: MACH_KERNEL_PRIVATE etc.)
+  comp=${FILE%%/*}
+  ref=osfmk/arm64/negroni_early.c; [ "$comp" = pexpert ] && ref=pexpert/arm/pe_fiq.c
+  base=$(basename "$ref" .c)
+  OBJ=$W/dxb/build/xnu.obj/DEVELOPMENT_ARM64_NEGRONI/$comp/DEVELOPMENT
+  line=$(grep -m1 -E "/clang -c .*/${ref//./\\.}\$" "$LOG" || true)
+  [ -n "$line" ] || { echo "no compile line for $ref in $LOG" >&2; exit 1; }
+  line=${line//-I$src\//-I$TREE/}
+  line=${line% *}
+  line=${line//-MD -MF $base.d -MP/}
   ;;
 *)
   line=$(grep -m1 -E '/clang -c .*/bsd/dev/negroni_adsp\.c$' "$LOG" || true)

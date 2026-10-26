@@ -1,0 +1,661 @@
+From: iOSPlus10 GPU-recovery agent
+Subject: [PATCH] negroni gpu: hang detection and recovery (0287)
+
+Before: a lost WPTR write, a full ring or 2 s without a fence set gGPUStopped for the
+rest of the boot; the display fell back to CPU copies until a reboot ("black-outs").
+
+Now, as KGSL gen7_gmu_reset (A730 = gen7_0_0, non-hwsched dispatcher):
+- detect: RedwoodGPU's 2 s fence rule, a full ring / lost WPTR write, the present path,
+  and the GPU watch thread once a second (2 s without a fence with work queued, an SMMU
+  fault in the 3D core's context, CP_HW_FAULT, a new GMU watchdog bite or firmware fault);
+- log: fences, RBBM_STATUS/STATUS3/INT_0, CP rptr/HW_FAULT/INT/PROTECT, IB1/IB2 base and
+  remaining size, both SMMU contexts' FSR/FAR/FSYNR0, GMU AO interrupt status,
+  FW_INIT_RESULT, the GMU log head;
+- reset: GMU interrupts masked, AHB fence ALLOW, CM3 in reset, GBIF GX and CX halt, RBBM
+  SW reset, (negronigpu_recover=2: GX GDSC collapse from the CPU), halts released, RSC
+  sleep, SMMU FSRs cleared; then the 0285 warm boot (RSC wake, steps 14-18 incl. the
+  vote and FEATURE_CTRL IFPC again, ring at word 0, step 20 SQE + ME_INIT, secure mode 0);
+- fences: the fence words take the newest fence; the cut-off range is "failed": client
+  waits answer kIOReturnError, MSM_PARAM_FAULTS += recoveries (Turnip: device lost), the
+  submit queue's fault count counts the client's own cut-off work; the failed submit is
+  sent once more on the new ring;
+- bound: negronigpu_recover_max (default 3) per 60 s, then the GPU stops for good as before.
+Boot-args: negronigpu_recover (default 1; 0 = old behaviour; 2 = + GX GDSC collapse),
+negronigpu_recover_max, negronigpu_recover_watch (default 1). Log: "NEGRONI GPU RECOVERY: ...".
+
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index 2fd526f..7a4f25d 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -180,6 +180,7 @@ static uint32_t pm_ifpc_arg = 1;        /* negronigpu_ifpc (default 1): ask the
+ static uint32_t pm_slumber_arg = 1;     /* negronigpu_slumber (default 1): slumber when IFPC is not on */
+ static bool pm_ifpc_ok;                 /* FEATURE_CTRL IFPC acked: step 20 gives the CP its power-up list */
+ static bool pm_rewaking;                /* steps 14-21 run for a slumber wake */
++static bool rec_active;                 /* patch 0287: steps 14-21 run for a hang recovery (step 17 asks for IFPC again) */
+ static thread_t adreno_quiet_thread;    /* printf on this thread is dropped (a quiet wake) */
+ 
+ static bool
+@@ -1634,10 +1635,11 @@ step_hfi_messages(void)
+ 	 * FEATURE_CTRL (H2F 11) {HFI_FEATURE_IFPC 9, enable 1, data 0x1680} (adreno_gen7_hfi.c
+ 	 * gen7_hfi_send_ifpc_feature_ctrl; 0x1680 = 5760 XO ticks = 300 us of idle before the GMU collapses GX).
+ 	 * HFI minor >= 5 acks with result in word 2 and a gmu_ret_type in word 3 (gen7_hfi_send_generic_req_v5).
+-	 * Not on a slumber wake (that path is only used when IFPC is off).
++	 * Not on a slumber wake (that path is only used when IFPC is off). Patch 0287: again after a hang
++	 * recovery (the CM3 reset forgets the feature, as KGSL gen7_gmu_reset -> gen7_boot -> gen7_hfi_start).
+ 	 */
+ 	(void)PE_parse_boot_argn("negronigpu_ifpc", &pm_ifpc_arg, sizeof(pm_ifpc_arg));
+-	if (pm_ifpc_arg && !pm_rewaking) {
++	if (pm_ifpc_arg && (!pm_rewaking || (rec_active && pm_ifpc_ok))) {
+ 		uint32_t feature[4] = { 0, 9 /* HFI_FEATURE_IFPC */, 1, 0x1680 };
+ 		hfi_ack_n = 0;
+ 		memset(hfi_ack, 0, sizeof(hfi_ack));
+@@ -2699,17 +2701,17 @@ pm_sleep(void)
+ 	return true;
+ }
+ 
+-/* PM_SLUMBER, the lock held, asleep: KGSL's warm boot. false: the GPU stays off for this boot (pm_dead). */
++/*
++ * The lock held, the RSC asleep and the CM3 in reset: KGSL's warm boot (gen7_gmu_boot + gen7_gpu_boot):
++ * RSC wake, steps 14-18, the ring back to word 0, step 20, CP_SET_SECURE_MODE 0. OOB GPU_SET is held
++ * after it. Used by the slumber wake (0285) and the hang recovery (0287). loud: the steps log their lines.
++ */
+ static bool
+-pm_wake(void)
++gpu_warm_boot(bool loud, bool *rsc_awake)
+ {
+-	uint64_t t0 = mach_absolute_time();
+-	uint32_t pause = pause_ms, asleep_ms = pm_us_since(pm_asleep_at) / 1000;
+-	bool loud = pm_wakes == 0;
++	uint32_t pause = pause_ms;
+ 
+-	if (loud) {
+-		printf("NEGRONI GPU PM: first wake: steps 14-21 again with their lines (later wakes are quiet)\n");
+-	} else {
++	if (!loud) {
+ 		adreno_quiet_thread = current_thread();
+ 	}
+ 	pause_ms = 0;
+@@ -2732,6 +2734,22 @@ pm_wake(void)
+ 	pm_rewaking = false;
+ 	pause_ms = pause;
+ 	adreno_quiet_thread = NULL;
++	*rsc_awake = rsc;
++	return ok;
++}
++
++/* PM_SLUMBER, the lock held, asleep: KGSL's warm boot. false: the GPU stays off for this boot (pm_dead). */
++static bool
++pm_wake(void)
++{
++	uint64_t t0 = mach_absolute_time();
++	uint32_t asleep_ms = pm_us_since(pm_asleep_at) / 1000;
++	bool loud = pm_wakes == 0, rsc;
++
++	if (loud) {
++		printf("NEGRONI GPU PM: first wake: steps 14-21 again with their lines (later wakes are quiet)\n");
++	}
++	bool ok = gpu_warm_boot(loud, &rsc);
+ 	uint32_t us = pm_us_since(t0);
+ 	if (!ok) {
+ 		pm_dead = true;
+@@ -3388,6 +3406,268 @@ negroni_gpu_report(const char *why)
+ 	space_faulted(&core_space);
+ }
+ 
++/*
++ * ---- patch 0287: GPU hang detection and recovery ----
++ *
++ * Before 0287 a lost WPTR write, a full ring or 2 s without a fence set gGPUStopped (NegroniGPU.cpp)
++ * for the rest of the boot: every fence then read done, and the display went on with CPU copies.
++ * Reference: the OnePlus KGSL (out/src/op-kernel/drivers/gpu/msm). The A730 is gen7_0_0 with the
++ * non-hwsched dispatcher (adreno-gpulist.h:2045-2073, .gpudev = adreno_gen7_gmu_gpudev); its reset is
++ * gen7_gmu_reset (adreno_gen7.c:1507-1517, adreno_gen7_gmu.c:3127-3146):
++ *   detect   adreno_dispatch.c: drawobj timeout 2000 ms (:50, _adreno_dispatch_check_timeout :2315-2344),
++ *            fault interrupts (adreno_gen7.c:1123-1156: MISHANGDETECT 23, CP_HW_ERROR 9, GPC_ERR 7, UCHE OOB 24),
++ *            GMU AO interrupts (adreno_gen7_gmu.c:1693-1725: watchdog bite bit 0), SMMU page faults;
++ *   log      dispatcher_do_fault (adreno_dispatch.c:1964-2148): RBBM_STATUS/STATUS3, CP_RB_BASE, CP_IB1_BASE,
++ *            snapshot (GMU log);
++ *   reset    gen7_gmu_reset: GPU/GMU interrupts off, HFI stop, gen7_gmu_suspend -> gen7_gmu_pwrctrl_suspend
++ *            (adreno_gen7_gmu.c:1354-1410): AHB fence ALLOW, CM3_SYSRESET 1, GBIF GX halt (if GX on), GBIF CX
++ *            halt, RBBM_SW_RESET_CMD 1 (if GX on), 100 us, GX GDSC off from the CPU; clocks and CX off;
++ *            then gen7_boot (warm boot, the 0285 wake path here);
++ *   fences   the hung ring's timestamps are written as retired (adreno_dispatch.c:2109-2121), the waiters
++ *            see them; Turnip sees MSM_PARAM_FAULTS change (device lost);
++ *   bound    _fault_throttle 3 per 3000 ms per context (adreno_dispatch.c:34-35); here REC_MAX per 60 s for
++ *            the whole GPU, then the GPU stays stopped as before 0287.
++ * Differences: no IRQ (the watch thread polls once a second); CX and the GMU clocks stay on (the RSC sleep
++ * sequence of 0285 instead of CX off); the GX GDSC is collapsed from the CPU only with negronigpu_recover=2.
++ * Boot-args: negronigpu_recover (default 1; 0 = the old stop for good), negronigpu_recover_max (default 3,
++ * 1..16, per 60 s), negronigpu_recover_watch (default 1: the watch thread detects too).
++ */
++#define REC_WINDOW_MS           60000
++#define REC_STALL_MS            2000            /* = RedwoodGPU's GPU_HUNG_MS and KGSL's adreno_drawobj_timeout */
++#define REC_HISTORY             16
++#define REG_RBBM_STATUS3        0x0213
++#define REG_RBBM_SW_RESET_CMD   0x0043
++#define REG_RBBM_GBIF_HALT_ACK  0x0017
++#define REG_GBIF_HALT_ACK       0x3c46
++#define REG_CP_PROTECT_STATUS   0x0824
++#define REG_CP_IB1_BASE         0x0928
++#define REG_CP_IB1_REM_SIZE     0x092a
++#define REG_CP_IB2_BASE         0x092b
++#define REG_CP_IB2_REM_SIZE     0x092d
++#define GMU_AO_HOST_INTERRUPT_CLR    0x23b04
++#define GMU_AO_HOST_INTERRUPT_STATUS 0x23b05
++#define GMU_AHB_FENCE_STATUS_CLR     0x23b14
++#define GMU_AO_INT_WDOG_BITE    (1u << 0)
++
++extern void NegroniGPUWatchFault(const char *why, uint32_t completed);  /* NegroniGPU.cpp (0287) */
++uint32_t negroni_gpu_recoveries(void);
++bool negroni_gpu_fence_failed(uint32_t fence);
++uint32_t negroni_gpu_recovery_lo(uint32_t n);
++bool negroni_gpu_recover(const char *why);
++
++static uint32_t rec_arg = 1, rec_max = 3, rec_watch = 1;
++static bool rec_args_read;
++static uint32_t rec_count, rec_tries;
++static uint64_t rec_times[REC_HISTORY];
++static uint32_t rec_lo[REC_HISTORY], rec_hi[REC_HISTORY];
++
++static void
++rec_args(void)
++{
++	if (rec_args_read) {
++		return;
++	}
++	rec_args_read = true;
++	(void)PE_parse_boot_argn("negronigpu_recover", &rec_arg, sizeof(rec_arg));
++	(void)PE_parse_boot_argn("negronigpu_recover_max", &rec_max, sizeof(rec_max));
++	(void)PE_parse_boot_argn("negronigpu_recover_watch", &rec_watch, sizeof(rec_watch));
++	rec_max = rec_max < 1 ? 1 : rec_max > REC_HISTORY ? REC_HISTORY : rec_max;
++}
++
++/* How many recoveries passed (each one fails a range of fences). */
++uint32_t
++negroni_gpu_recoveries(void)
++{
++	return rec_count;
++}
++
++/* A fence a recovery cut off (it reads done, but its work did not run to its end). */
++bool
++negroni_gpu_fence_failed(uint32_t fence)
++{
++	for (uint32_t i = rec_count > REC_HISTORY ? rec_count - REC_HISTORY : 0; fence != 0 && i < rec_count; i++) {
++		uint32_t lo = rec_lo[i % REC_HISTORY], hi = rec_hi[i % REC_HISTORY];
++		if ((int32_t)(fence - lo) >= 0 && (int32_t)(hi - fence) >= 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* The first fence recovery n failed (0: n is too old to know; the caller counts it as a fault). */
++uint32_t
++negroni_gpu_recovery_lo(uint32_t n)
++{
++	return n < rec_count && rec_count - n <= REC_HISTORY ? rec_lo[n % REC_HISTORY] : 0;
++}
++
++/* The lock held: what the GPU says at the fault (dispatcher_do_fault's header; no snapshot) */
++static void
++rec_report(uint32_t n, const char *why)
++{
++	volatile uint32_t *scratch = (volatile uint32_t *)core_scratch.memory;
++	uint32_t ccb = smmu_cb(&core_space), gcb = smmu_cb(&gmu_space);
++	bool asleep = pm_mode == PM_SLUMBER && pm_asleep;
++
++	to_memory(core_scratch.memory, 4096);
++	printf("NEGRONI GPU RECOVERY: %u: %s: fence %u (bv %u) of %u, wptr %u, pm %s, GX GDSC %#x, power state %#x, GMU AO_INT %#x "
++	    "FW_INIT_RESULT %#x\n", n, why, scratch[GPU_FENCE_AT / 4], scratch[GPU_BV_FENCE_AT / 4], gpu_fence, ring_at, pm_name(),
++	    rd(gpucc + GPUCC_GX_GDSCR), rd(gmu + GMU_REG(GMU_RPMH_POWER_STATE)),
++	    asleep ? 0 : rd(gmu + GMU_REG(GMU_AO_HOST_INTERRUPT_STATUS)), rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)));
++	bool held = !asleep && pm_gx_on() && gx_hold();
++	if (held) {
++		printf("NEGRONI GPU RECOVERY: %u: RBBM_STATUS %#x STATUS3 %#x INT_0 %#x | CP rptr %u HW_FAULT %#x INT %#x PROTECT %#x | "
++		    "IB1 %#x:%08x rem %u | IB2 %#x:%08x rem %u | scratch2 %u\n", n,
++		    rd(gpu_regs + GPU_WORD(REG_RBBM_STATUS)), rd(gpu_regs + GPU_WORD(REG_RBBM_STATUS3)),
++		    rd(gpu_regs + GPU_WORD(REG_RBBM_INT_0_STATUS)), rd(gpu_regs + GPU_WORD(REG_CP_RB_RPTR)),
++		    rd(gpu_regs + GPU_WORD(REG_CP_HW_FAULT)), rd(gpu_regs + GPU_WORD(REG_CP_INTERRUPT_STATUS)),
++		    rd(gpu_regs + GPU_WORD(REG_CP_PROTECT_STATUS)),
++		    rd(gpu_regs + GPU_WORD(REG_CP_IB1_BASE + 1)), rd(gpu_regs + GPU_WORD(REG_CP_IB1_BASE)),
++		    rd(gpu_regs + GPU_WORD(REG_CP_IB1_REM_SIZE)),
++		    rd(gpu_regs + GPU_WORD(REG_CP_IB2_BASE + 1)), rd(gpu_regs + GPU_WORD(REG_CP_IB2_BASE)),
++		    rd(gpu_regs + GPU_WORD(REG_CP_IB2_REM_SIZE)), rd(gpu_regs + GPU_WORD(REG_CP_SCRATCH_REG2)));
++		gx_release();
++	} else {
++		printf("NEGRONI GPU RECOVERY: %u: GX registers not read (GX off, asleep, or the GMU did not hold it)\n", n);
++	}
++	/* the 0233 SMMU fault registers of both contexts, read whether or not a fault bit is set */
++	printf("NEGRONI GPU RECOVERY: %u: SMMU SGFSR %#x | core FSR %#x FAR %#x:%#x FSYNR0 %#x | gmu FSR %#x FAR %#x:%#x\n", n,
++	    rd(smmu + SMMU_SGFSR), rd(smmu + ccb + SMMU_CB_FSR), rd(smmu + ccb + SMMU_CB_FAR + 4), rd(smmu + ccb + SMMU_CB_FAR),
++	    rd(smmu + ccb + SMMU_CB_FSYNR0), rd(smmu + gcb + SMMU_CB_FSR), rd(smmu + gcb + SMMU_CB_FAR + 4), rd(smmu + gcb + SMMU_CB_FAR));
++	to_memory(gmu_log.memory, 64);
++	const volatile uint32_t *l = (const volatile uint32_t *)gmu_log.memory;
++	printf("NEGRONI GPU RECOVERY: %u: GMU log head %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++	    n, l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], l[8], l[9], l[10], l[11], l[12], l[13], l[14], l[15]);
++}
++
++/*
++ * The lock held: gen7_gmu_pwrctrl_suspend without clocks/CX off, then the 0285 RSC sleep (the warm boot
++ * expects the CM3 in reset and the RSC asleep). The GX registers are touched only while the GX GDSC is
++ * on; with the CM3 in reset nothing collapses GX any more, so that check stays true.
++ */
++static void
++rec_reset(uint32_t n, bool collapse)
++{
++	uint64_t t0 = mach_absolute_time();
++
++	wr(gmu + GMU_REG(GMU_INTR_MASK), ~0u);
++	wr(gmu + GMU_REG(GMU_AO_HOST_INTERRUPT_CLR), ~0u);
++	wr(gmu + GMU_REG(GMU_AHB_FENCE_STATUS_CLR), 7);
++	wr(gmu + GMU_REG(GMU_AO_AHB_FENCE_CTRL), 0);
++	__asm__ volatile ("dsb sy");
++	wr(gmu + GMU_REG(GMU_CM3_SYSRESET), 1);
++	__asm__ volatile ("dsb sy");
++	bool gx = pm_gx_on(), gx_halt = false, cx_halt, off;
++	if (gx) {
++		wr(gpu_regs + GPU_WORD(REG_RBBM_GBIF_HALT), 1);
++		gx_halt = wait_for(gpu_regs + GPU_WORD(REG_RBBM_GBIF_HALT_ACK), 1, 1, 100);
++	}
++	wr(gpu_regs + GPU_WORD(REG_GBIF_HALT), 2);
++	cx_halt = wait_for(gpu_regs + GPU_WORD(REG_GBIF_HALT_ACK), 2, 2, 100);
++	if (gx) {
++		wr(gpu_regs + GPU_WORD(REG_RBBM_SW_RESET_CMD), 1);
++		(void)rd(gpu_regs + GPU_WORD(REG_RBBM_SW_RESET_CMD));
++		delay(100);
++		wr(gpu_regs + GPU_WORD(REG_RBBM_SW_RESET_CMD), 0);
++	}
++	if (collapse && pm_gx_on()) {
++		/* negronigpu_recover=2: KGSL's regulator_enable + regulator_disable of the GX GDSC = SW_COLLAPSE from the CPU */
++		wr(gpucc + GPUCC_GX_GDSCR, rd(gpucc + GPUCC_GX_GDSCR) | GDSC_SW_COLLAPSE);
++		(void)wait_for(gpucc + GPUCC_GX_GDSCR, GDSC_PWR_ON, 0, 100);
++	}
++	off = !pm_gx_on();
++	/* the halts end before the GMU boots through the same bus (step 20 writes both 0 again) */
++	if (!off) {
++		wr(gpu_regs + GPU_WORD(REG_RBBM_GBIF_HALT), 0);
++	}
++	wr(gpu_regs + GPU_WORD(REG_GBIF_HALT), 0);
++	wr(gmu + GMU_REG(GMU_RSCC_CONTROL_REQ), 1);
++	bool rsc = wait_for(rscc + RSCC_STATUS0, 1u << 16, 1u << 16, 100);
++	wr(gmu + GMU_REG(GMU_RSCC_CONTROL_REQ), 0);
++	/* FSR is write-1-to-clear; the contexts terminate faulting accesses (SCTLR CFCFG 0): nothing to resume */
++	uint32_t ccb = smmu_cb(&core_space), gcb = smmu_cb(&gmu_space);
++	wr(smmu + ccb + SMMU_CB_FSR, rd(smmu + ccb + SMMU_CB_FSR));
++	wr(smmu + gcb + SMMU_CB_FSR, rd(smmu + gcb + SMMU_CB_FSR));
++	gx_on = false;
++	printf("NEGRONI GPU RECOVERY: %u: reset in %u us: CM3 in reset, GX GBIF halt %s, CX GBIF halt %s, RBBM SW reset %s, GX %s "
++	    "(GDSC %#x%s), RSC %s (%#x)\n", n, pm_us_since(t0), !gx ? "skipped (GX off)" : gx_halt ? "acked" : "NOT ACKED",
++	    cx_halt ? "acked" : "NOT ACKED", gx ? "done" : "skipped", off ? "off" : "on", rd(gpucc + GPUCC_GX_GDSCR),
++	    collapse ? ", collapsed by the CPU" : "", rsc ? "asleep" : "DID NOT SLEEP", rd(rscc + RSCC_STATUS0));
++}
++
++/*
++ * Called with RedwoodGPU's gGPULock held (no submission runs meanwhile), not with gpu_pm_lock.
++ * true: the GPU runs again, every fence up to negroni_gpu_last() reads done, the cut-off ones are
++ * failed (negroni_gpu_fence_failed). false: the GPU stays stopped (the caller sets gGPUStopped).
++ */
++bool
++negroni_gpu_recover(const char *why)
++{
++	rec_args();
++	lck_mtx_lock(&gpu_pm_lock);
++	uint32_t n = ++rec_tries;
++	uint64_t now = mach_absolute_time();
++	uint32_t recent = 0;
++
++	rec_report(n, why);
++	for (uint32_t i = rec_count > REC_HISTORY ? rec_count - REC_HISTORY : 0; i < rec_count; i++) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(now - rec_times[i % REC_HISTORY], &ns);
++		recent += ns < (uint64_t)REC_WINDOW_MS * NSEC_PER_MSEC;
++	}
++	const char *no = !gpu_kept ? "the GPU is not kept" : pm_dead ? "the GPU is off for good (a wake failed)" :
++	    rec_arg == 0 ? "negronigpu_recover=0" : recent >= rec_max ? "too many recoveries in 60 s" : NULL;
++	if (no != NULL) {
++		printf("NEGRONI GPU RECOVERY: %u: no recovery (%s; %u in the last 60 s, max %u): the GPU stays stopped for this boot\n",
++		    n, no, recent, rec_max);
++		lck_mtx_unlock(&gpu_pm_lock);
++		return false;
++	}
++	uint32_t done = negroni_gpu_completed(), last = gpu_fence;
++	rec_reset(n, rec_arg >= 2);
++	bool rsc;
++	rec_active = true;
++	bool ok = gpu_warm_boot(n <= 2, &rsc);  /* the first two recoveries log every step */
++	rec_active = false;
++	uint32_t us = pm_us_since(now);
++	if (!ok) {
++		pm_dead = true;
++		printf("NEGRONI GPU RECOVERY: %u: FAILED after %u us (RSC %s, GX GDSC %#x, FW_INIT_RESULT %#x): the GPU stays stopped "
++		    "for this boot\n", n, us, rsc ? "awake" : "NOT AWAKE", rd(gpucc + GPUCC_GX_GDSCR), rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)));
++		lck_mtx_unlock(&gpu_pm_lock);
++		return false;
++	}
++	/* KGSL writes the hung ring's timestamps as retired; here the fence words take the newest fence */
++	*(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT) = last;
++	*(volatile uint32_t *)(core_scratch.memory + GPU_BV_FENCE_AT) = last;
++	to_memory(core_scratch.memory, 4096);
++	for (unsigned i = 0; i < 256; i++) {
++		fence_pos[i] = ring_at;
++	}
++	rec_lo[rec_count % REC_HISTORY] = done + 1 == 0 ? 1 : done + 1;
++	rec_hi[rec_count % REC_HISTORY] = last;
++	rec_times[rec_count % REC_HISTORY] = now;
++	rec_count++;
++	pm_asleep = false;
++	pm_revote = true;               /* the watch's DCVS takes the level step 17 voted */
++	pm_seen_collapse = false;
++	gpu_invalidate_next = true;
++	pm_last_submit = mach_absolute_time();
++	if (pm_mode == PM_IFPC) {
++		if (pm_ifpc_ok) {
++			pm_gpu_clear();         /* as pm_start: the GMU collapses GX again */
++		} else {
++			pm_mode = pm_slumber_arg ? PM_SLUMBER : PM_OFF;
++		}
++	}
++	snprintf(negroni_gpu_badge, sizeof(negroni_gpu_badge), "GPU RESET %u", rec_count);
++	printf("NEGRONI GPU RECOVERY: %u: done in %u us: fences %u..%u failed (%u), ring at %u, pm %s, GX GDSC %#x; %u recoveries "
++	    "this boot, %u in the last 60 s (max %u)\n", n, us, done + 1, last, last - done, ring_at, pm_name(),
++	    rd(gpucc + GPUCC_GX_GDSCR), rec_count, recent + 1, rec_max);
++	lck_mtx_unlock(&gpu_pm_lock);
++	return true;
++}
++
+ /*
+  * Keep mode, watched (boot-arg negroniadreno_watch, default 1 with negroniadreno_keep=1): once a
+  * second, what the GPU block left running does by itself -- the GMU's always-on counter, the CX and
+@@ -3593,6 +3873,9 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 	bool late_done = false;
+ 	uint32_t idle_ms = 0, busy_ms = 0, busy_ticks = 0, ticks = 0, changes = 0, from = 0;
+ 	uint32_t top = sizeof(gpu_khz) / sizeof(gpu_khz[0]) - 1;
++	uint32_t rec_seen = 0;                  /* patch 0287: the completed fence the watch saw last, and since when */
++	uint64_t rec_moved = mach_absolute_time();
++	uint32_t rec_ao_base = ~0u, rec_init_base = ~0u, rec_count_seen = 0;
+ 
+ 	(void)PE_parse_boot_argn("negronigpu_dcvs", &dcvs_on, sizeof(dcvs_on));
+ 	(void)PE_parse_boot_argn("negronigpu_uifloor", &dcvs_ui_floor, sizeof(dcvs_ui_floor));
+@@ -3750,10 +4033,50 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 			memcpy(last, now, sizeof(now));
+ 			first = false;
+ 		}
++		/*
++		 * Patch 0287: fault detection, once a watch second (KGSL: the dispatcher's 2000 ms drawobj timeout and
++		 * its fault interrupts; here polled): no fence written for GPU_STALL_MS with work queued, an SMMU fault
++		 * in the 3D core's context, CP_HW_FAULT, the GMU watchdog bite or a GMU firmware fault.
++		 */
++		const char *fault = NULL;
++		uint32_t done = negroni_gpu_completed();
++		if (done == gpu_fence || done != rec_seen) {
++			rec_seen = done;
++			rec_moved = mach_absolute_time();
++		} else if (pm_us_since(rec_moved) / 1000 >= REC_STALL_MS) {
++			fault = "no fence written for 2 s with work queued (watch)";
++		}
++		if (done != gpu_fence && fault == NULL) {
++			uint32_t ao = pm_mode == PM_SLUMBER && pm_asleep ? 0 : rd(gmu + GMU_REG(GMU_AO_HOST_INTERRUPT_STATUS));
++			uint32_t init = pm_mode == PM_SLUMBER && pm_asleep ? 0 : rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT));
++			if (now[10] & SMMU_FSR_ALL) {
++				fault = "SMMU fault in the 3D core's context (watch)";
++			} else if (held && now[7] != 0 && now[7] != ~0u) {
++				fault = "CP_HW_FAULT set (watch)";
++			} else if (ao & ~rec_ao_base & GMU_AO_INT_WDOG_BITE) {
++				fault = "GMU watchdog bite (watch)";
++			} else if (init & ~rec_init_base & 0xe00) {
++				fault = "GMU firmware fault, FW_INIT_RESULT bits 9-11 (watch)";
++			}
++		}
++		if (rec_count != rec_count_seen) {
++			rec_count_seen = rec_count;     /* a recovery restarted the GMU: sample again */
++			rec_ao_base = rec_init_base = ~0u;
++		}
++		if (rec_ao_base == ~0u && !(pm_mode == PM_SLUMBER && pm_asleep)) {
++			/* only bits that come up after the first sample count (a value left from the boot is not a fault) */
++			rec_ao_base = rd(gmu + GMU_REG(GMU_AO_HOST_INTERRUPT_STATUS)) & GMU_AO_INT_WDOG_BITE;
++			rec_init_base = rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)) & 0xe00;
++		}
+ 		if (held && pm_mode != PM_OFF) {
+ 			gx_release();
+ 		}
+ 		lck_mtx_unlock(&gpu_pm_lock);
++		if (fault != NULL && rec_watch) {
++			NegroniGPUWatchFault(fault, done);
++			rec_seen = negroni_gpu_completed();
++			rec_moved = mach_absolute_time();
++		}
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index d526859..34c52d4 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -42,6 +42,11 @@
+  * for 2 s while work is outstanding declares the GPU stopped: from then on submissions fail
+  * (kIOReturnNotReady), waits fail, buffers that may still be in use stay wired (never freed
+  * under a GPU that might wake up), MSM_PARAM_FAULTS answers 1 (Vulkan: device lost).
++ * Patch 0287: first the GPU is reset and started again (negroni_gpu_recover, at most
++ * negronigpu_recover_max times in 60 s): the fences it cut off read done but failed; a client wait
++ * on such a fence answers kIOReturnError, MSM_PARAM_FAULTS counts the recoveries (Turnip: device
++ * lost), and the submit queue's fault count counts those that cut off the client's own work.
++ * Only when the recovery is off, fails or comes too often, the GPU stops as before.
+  *
+  * Lifetime (slop 0121-0124): the service exists from the "NegroniGPUKept" resource on; it holds
+  * nothing (no memory, no thread, no mapping) until a program opens it, so its existence alone
+@@ -82,6 +87,11 @@ uint32_t negroni_gpu_completed(void);
+ bool negroni_gpu_fence_valid(uint32_t fence);
+ uint32_t negroni_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+ void negroni_gpu_report(const char * why);
++bool negroni_gpu_recover(const char * why);             /* 0287 */
++uint32_t negroni_gpu_recoveries(void);
++bool negroni_gpu_fence_failed(uint32_t fence);
++uint32_t negroni_gpu_recovery_lo(uint32_t n);
++void NegroniGPUWatchFault(const char * why, uint32_t completed);
+ struct negroni_gpu_vm;
+ bool negroni_gpu_per_client(void);
+ struct negroni_gpu_vm * negroni_gpu_vm_create(void);
+@@ -269,6 +279,25 @@ enum { kBufferFree = 0, kBufferOwn, kBufferPool, kBufferImport, kBufferHost };
+ static IOLock * gGPULock;                       /* around the GPU (negroni_gpu_...), the pool, the present */
+ static bool gGPUStopped;                        /* a submission has not come back: nothing is waited for again */
+ static uint32_t gGPUCloses;                     /* 0254: clients closed (NegroniGPUClientCloses) */
++static uint32_t gGPUFailedLogged;               /* 0287: client waits answered with a failed fence */
++
++/*
++ * Patch 0287, gGPULock held: a hang. Reset and restart the GPU (negroni_gpu_recover logs the fault
++ * and the reset); false: no recovery (off, failed, too often), so the GPU is stopped for good.
++ */
++static bool
++recoverLocked(const char * why)
++{
++	if (gGPUStopped) {
++		return false;
++	}
++	if (negroni_gpu_recover(why)) {
++		IOLog("RedwoodGPU: GPU reset after \"%s\": recovery %u, the work in flight failed\n", why, negroni_gpu_recoveries());
++		return true;
++	}
++	gGPUStopped = true;
++	return false;
++}
+ 
+ static uint64_t
+ msNow(void)
+@@ -322,9 +351,8 @@ gpuWait(uint32_t fence, uint64_t ms)
+ 			seen = completed;
+ 			moved = now;
+ 		} else if (now - moved >= GPU_HUNG_MS) {
+-			negroni_gpu_report("no answer for 2 s");
+-			gGPUStopped = true;
+-			return kIOReturnNotReady;
++			/* 0287: a recovery makes this fence read done (failed); clientWait tells the client */
++			return recoverLocked("no answer for 2 s") ? kIOReturnSuccess : kIOReturnNotReady;
+ 		}
+ 		if (now - began >= ms) {
+ 			return kIOReturnTimeout;
+@@ -332,6 +360,24 @@ gpuWait(uint32_t fence, uint64_t ms)
+ 	}
+ }
+ 
++/*
++ * 0287: gpuWait for a client's own fence (msm WAIT_FENCE, scalar wait, CPU_PREP): a fence a GPU reset
++ * cut off answers kIOReturnError instead of success. gGPULock held.
++ */
++static IOReturn
++clientWait(uint32_t fence, uint64_t ms)
++{
++	IOReturn ret = gpuWait(fence, ms);
++
++	if (ret == kIOReturnSuccess && negroni_gpu_fence_failed(fence)) {
++		if (gGPUFailedLogged++ < 8) {
++			IOLog("RedwoodGPU: fence %u was cut off by GPU reset %u: the wait fails\n", fence, negroni_gpu_recoveries());
++		}
++		ret = kIOReturnError;
++	}
++	return ret;
++}
++
+ /* How long from now an msm time is (CLOCK_MONOTONIC = mach_continuous_time on Darwin), in ms. */
+ static uint64_t
+ millisecondsUntil(const struct msm_timespec * when)
+@@ -516,11 +562,15 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	bool                    fLeaked;                /* a buffer stayed the GPU's: the tables must stay too */
+ 	uint32_t                fNextQueue;
+ 	uint32_t                fSubmits;
++	uint32_t                fLastFence;             /* 0287: this client's newest submission */
++	uint32_t                fRecSeen;               /* 0287: recoveries already checked against fLastFence */
++	uint32_t                fFaults;                /* 0287: recoveries that cut off this client's work */
+ 	uint32_t                fCalls;
+ 	bool                    fClosed;
+ 	char                    fName[24];
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
++	void countFaults(void);
+ 	struct gpu_buffer * newBuffer(uint32_t * handle);
+ 	bool takePages(struct gpu_buffer * b);
+ 	bool mapBuffer(struct gpu_buffer * b, uint64_t address);
+@@ -1149,11 +1199,19 @@ RedwoodGPUUserClient::submitIBs(const uint64_t * addresses, const uint32_t * wor
+ 		IOLockUnlock(gGPULock);
+ 		return kIOReturnNotReady;
+ 	}
++	countFaults();
+ 	negroni_gpu_to_memory(NULL, 0);
+ 	*fence = negroni_gpu_submit(addresses, words, count);
+-	if (*fence == 0) {
+-		negroni_gpu_report("the ring stays full");
+-		gGPUStopped = true;
++	if (*fence == 0 && recoverLocked("the ring stays full or the WPTR write was lost")) {
++		countFaults();
++		*fence = negroni_gpu_submit(addresses, words, count);   /* 0287: once more on the new ring */
++		if (*fence == 0) {
++			negroni_gpu_report("the ring stays full after a GPU reset");
++			gGPUStopped = true;
++		}
++	}
++	if (*fence != 0) {
++		fLastFence = *fence;
+ 	}
+ 	IOLockUnlock(gGPULock);
+ 	if (*fence == 0) {
+@@ -1185,7 +1243,7 @@ RedwoodGPUUserClient::cpuPrep(uint32_t handle, uint64_t ms)
+ 	}
+ 	if (b->fence != 0) {
+ 		IOLockLock(gGPULock);
+-		ret = gpuWait(b->fence, ms);
++		ret = clientWait(b->fence, ms);
+ 		IOLockUnlock(gGPULock);
+ 		if (ret == kIOReturnTimeout && ms == 0) {
+ 			ret = kIOReturnBusy;
+@@ -1226,8 +1284,8 @@ IOReturn
+ RedwoodGPUUserClient::getParam(struct msm_param * p)
+ {
+ 	switch (p->param) {
+-	case MSM_PARAM_FAULTS:
+-		p->value = gGPUStopped ? 1 : 0;
++	case MSM_PARAM_FAULTS:                  /* 0287: + every recovery (msm's global fault count; Turnip: device lost) */
++		p->value = (gGPUStopped ? 1 : 0) + negroni_gpu_recoveries();
+ 		return kIOReturnSuccess;
+ 	case MSM_PARAM_SUSPENDS:
+ 		p->value = 0;
+@@ -1422,7 +1480,7 @@ RedwoodGPUUserClient::msmMethod(uint32_t selector, IOExternalMethodArguments * a
+ 
+ 	if (selector == kMsmWaitFence) {        /* without fLock: other threads submit meanwhile */
+ 		IOLockLock(gGPULock);
+-		ret = gpuWait(r.waitFence.fence, millisecondsUntil(&r.waitFence.timeout));
++		ret = clientWait(r.waitFence.fence, millisecondsUntil(&r.waitFence.timeout));
+ 		IOLockUnlock(gGPULock);
+ 		return ret;
+ 	}
+@@ -1465,7 +1523,10 @@ RedwoodGPUUserClient::msmMethod(uint32_t selector, IOExternalMethodArguments * a
+ 	case kMsmSubmitQueueClose:
+ 		break;
+ 	case kMsmSubmitQueueQuery:
+-		faults = gGPUStopped ? 1 : 0;
++		IOLockLock(gGPULock);
++		countFaults();
++		IOLockUnlock(gGPULock);
++		faults = (gGPUStopped ? 1 : 0) + fFaults;       /* 0287: recoveries that cut off this client's work */
+ 		if (r.query.param != MSM_SUBMITQUEUE_PARAM_FAULTS) {
+ 			ret = kIOReturnBadArgument;
+ 		} else if (r.query.data != 0 && r.query.len != 0 &&
+@@ -1595,7 +1656,7 @@ RedwoodGPUUserClient::scalarMethod(uint32_t selector, IOExternalMethodArguments
+ 			return kIOReturnBadArgument;
+ 		}
+ 		IOLockLock(gGPULock);
+-		ret = gpuWait((uint32_t) args->scalarInput[0], MIN(args->scalarInput[1], (uint64_t) GPU_WAIT_MAX_MS));
++		ret = clientWait((uint32_t) args->scalarInput[0], MIN(args->scalarInput[1], (uint64_t) GPU_WAIT_MAX_MS));
+ 		IOLockUnlock(gGPULock);
+ 		return ret;
+ 	}
+@@ -1900,8 +1961,7 @@ NegroniGPUPresentRects(NegroniSurface * s, uint64_t panelPhys, uint32_t pitch, u
+ 	flush_dcache64((addr64_t)(uintptr_t)gPresentIB[ib]->getBytesNoCopy(), count * 4, FALSE);
+ 	fence = negroni_gpu_submit(&gPresentIBAddress[ib], &count, 1);
+ 	if (fence == 0) {
+-		negroni_gpu_report("the ring stays full (present)");
+-		gGPUStopped = true;
++		(void)recoverLocked("the ring stays full (present)");   /* 0287: this frame goes the CPU way either way */
+ 		goto out;
+ 	}
+ 	gPresentIBFence[ib] = fence;
+@@ -1921,6 +1981,40 @@ out:
+ 	return fence;
+ }
+ 
++/*
++ * 0287, gGPULock held: recoveries since the last check that cut off this client's work (its newest
++ * submission before the recovery was at or after the recovery's first failed fence).
++ */
++void
++RedwoodGPUUserClient::countFaults(void)
++{
++	uint32_t count = negroni_gpu_recoveries();
++
++	for (; fRecSeen < count; fRecSeen++) {
++		uint32_t lo = negroni_gpu_recovery_lo(fRecSeen);
++		if (fLastFence != 0 && (lo == 0 || (int32_t)(fLastFence - lo) >= 0)) {
++			fFaults++;
++		}
++	}
++}
++
++/*
++ * 0287: the GPU watch thread (negroni_adreno.c, without its own lock) saw a fault: recover, unless
++ * the GPU moved on meanwhile (a fence was written) or a wait already recovered it.
++ */
++void
++NegroniGPUWatchFault(const char * why, uint32_t completed)
++{
++	if (gGPULock == NULL) {
++		return;
++	}
++	IOLockLock(gGPULock);
++	if (!gGPUStopped && negroni_gpu_completed() == completed && negroni_gpu_last() != completed) {
++		(void)recoverLocked(why);
++	}
++	IOLockUnlock(gGPULock);
++}
++
+ bool
+ NegroniGPUFenceDone(uint32_t fence)
+ {

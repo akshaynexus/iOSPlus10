@@ -1008,3 +1008,431 @@ vendor_boot_a c29329ee... (copied from out/ios16). Not flashed.
 - Zero-copy (`negronifb_zerocopy=1`, 0234, never booted): no copy at all; try it as an image variant after this.
 - Present on render completion instead of the next tick (saves 0-8.3 ms latency per frame) with a TE-locked tick
   (0259 `negronifb_te=1`).
+
+## 19. Panel wake with the full on-command and the PPS (0268, `negronifb_wake`, default 2)
+
+Files: NegroniBacklight.cpp (`negroni_dsi_packet`, `negroni_dsi_dcs_set_ex`, `negroni_dsi_long_packet`,
+`AppleARMBacklight::wakePanel`), NegroniFramebuffer.cpp (`negroni_fb_autorefresh_pause/resume`, `negroni_fb_te_check`),
+scripts/display/panel-dts-dump.py `--on` (the arrays). Details: README-brightness.md "0268".
+
+- Problem [V phone log 13:24-13:30, kernel 074105, `negronifb_sleep=1`]: every wake logged `display on (sleep-out 133 ms,
+  DCS ok, panel DBV 356)`, the panel stayed black with a purple strip. 0258 sent 0x11, 133 ms, 0x29 only.
+- Android [V display-drivers]: `dsi_display_enable` (dsi_display.c:9147-9170) sends `DSI_CMD_SET_ON` (`dsi_panel_enable`
+  dsi_panel.c:5708-5760), then `dsi_panel_update_pps` (dsi_panel.c:5119-5188) on every display on; before both, the panel
+  is powered and reset (`dsi_panel_power_on`, reset `<1 10 0 5 1 10>` live.dts 35616). Both sets LP (no
+  `on-command-state` in live.dts: dsi_panel.c:2678-2680 default; PPS set LP at :2721). Commands longer than the 64-byte
+  FIFO go from a memory buffer (`dsi_ctrl_validate_and_set_cmd`/`dsi_message_tx` dsi_ctrl.c:1701-1731,
+  `dsi_ctrl_hw_cmn_kickoff_command` dsi_ctrl_hw_cmn.c:870-919; FIFO limit dsi_ctrl.c:1320-1325).
+- The PPS [V]: the on-command's first packet is `39 9E` + 89 bytes (the PPS, version 0x11, Samsung's own write, 90 bytes:
+  too long for the FIFO); the UEFI XML's first packet is the same PPS with version 0x12 and 128 bytes (identical bytes
+  otherwise, `panel-dts-dump.py` compared them). The MIPI PPS packet (0x0A) Android sends after the on-command carries
+  the DSC 1.2 PPS (version byte = qcom,mdss-dsc-version 0x12) = the UEFI's 128 bytes, i.e. the PPS the DPU's DSC
+  encoders were programmed with. So: re-send both, as Android does.
+- DSI controller [V code, I effect]: the panel's sleep-in does not touch the host controller (clocks, command engine,
+  PHY stay as the UEFI left them; Android re-inits it only after its own clock/power off, and skips it with continuous
+  splash, dsi_display.c:9110-9134). No controller re-init. DPU side: the auto-refresh is paused during the set
+  (INTF_TEAR_AUTOREFRESH_CONFIG bit 31 off, `_sde_encoder_autorefresh_disable_seq1` sde_encoder_phys_cmd.c:2015-2042,
+  then wait for the DSI MDP-busy bit) and re-armed after (the saved value, 0x80000001; `sde_hw_intf_setup_autorefresh_config`
+  sde_hw_intf.c:668-686); then 50 ms of the TE count (INT_COUNT_VAL[31:16]), INTF_FRAME_COUNT and the tear interrupt
+  status (+0x804 bits 0 AUTOREFRESH_DONE, 1 WR_PTR); TE without any frame sign: the auto-refresh is switched off and
+  on once more (`re-armed`).
+- Sequence (`negronifb_wake=2`): pause, the 94 packets (each with its DT type; post-waits 12 ms after 0x11, 121 ms after
+  the B9 block), 0x0A PPS (memory DMA), resume, TE check, DBV. `=1`: the same without the two packets that need the
+  memory DMA (9E, 0x0A); `=0`: the 0258 sleep-out. The command buffer: the last 16 KiB of the splash region (0xbaafc000,
+  after the 0234 slots) mapped write-combined; the DSI DMA reads it through the display SMMU context as the pipes read
+  the panel memory [I: the UEFI sent its 129-byte 9E packet by memory DMA too, so the path works under the UEFI's
+  SMMU setup; not tested under XNU]. A memory DMA that does not finish in 25 ms turns the memory path off for the boot.
+- VRR (0259): the on-command ends in the 120 Hz state (`60 00`, `BD[0x14]=00`, B9[0x38]/[0x3A] 02), so an idle state
+  before the sleep is reset by the panel; `vrrWakeLocked` (RequestPowerChange) still sends its exit set from the thread
+  call; the new set lock serialises it with the on-command (before or after, both end at 120 Hz).
+- Log (expected): boot `NEGRONI BL: DSI0 command buffer for long packets mapped at 0xbaafc000 (fifo_ctrl 0x... dma_offset
+  0x...)`, `NEGRONI BL: wake mode 2 (...)`; wake `NEGRONI FB: display on (on-command 94 packets, PPS ok, TE on: 6 TE 6
+  frames tear 0x.. in 50 ms, autorefresh 0x80000001 paused+resumed; sleep-out ~450 ms, DCS ok, panel DBV N)`.
+  `TE MISSING` = no TE after the set (panel not out of sleep). `PPS failed` / a `DSI packet 0x39 cmd 0x9e (90 bytes, from
+  memory) failed -3` line = the memory DMA does not work: boot with `negronifb_wake=1`.
+  `PPS not sent (set incomplete)` = the on-command stopped before its end (a short packet failed), so no 0x0A PPS went.
+- Not changed: the panic wake (0x11/0x29, no lock: a memory DMA is not safe there); the off-command (0x28/0x10).
+- Risks: a memory DMA that faults in the SMMU can stop the DSI command engine (no more DCS until reboot: brightness
+  stuck, no sleep): `negronifb_wake=1`. The on-command with the panel not reset is not what Android does [I: the DDIC
+  accepts every write in sleep-in; the order is the reset one]. If the wake stays black with `TE on`, the pipe/DSC side
+  is the cause (report the line); `negronifb_sleep=0` brings back the working 0275 black-only screen-off.
+
+## 20. Panel double buffering with a DPU base flip (0269, `negronifb_dbuf=1`, default 0)
+
+Files: NegroniFramebuffer.cpp (`dbufInit/dbufTarget/dbufQueued/dbufTick/dbufFlip/dbufPark/dbufOff`, hooks in
+`vsyncFired`, `zeroCopyStop`, `zeroCopyInit` (`fZCLayoutOk`), `statTick`, `negroni_fb_panic`, the GPU copy destination
+`fDrawPhys`), NegroniGPU.cpp (one GPU mapping per panel buffer).
+
+- Why [V code, audit 2.1]: the auto-refresh fetches the panel memory on every TE while the 2D copy or the CPU copy
+  writes it at a free phase: tearing, and a CPU copy (GPU ring full) can overlap a GPU copy still queued.
+- Android [V]: three framebuffers, a commit sets SSPP_SRC0_ADDR (`sde_hw_sspp_setup_sourceaddress` sde_hw_sspp.c:925-948)
+  and CTL_FLUSH (`sde_hw_ctl_trigger_flush_v1` sde_hw_ctl.c:685-711, pipe bits `sspp_tbl` :78-79: VIG0 0, VIG1 1, VIG2 2,
+  VIG3 18, DMA0 11, DMA1 12, DMA2 24, DMA3 25; CTL 17); the engine takes them at the frame start. Under auto-refresh no
+  CTL_START (sde_encoder_phys_cmd.c:2169-2175): the auto-refresh trigger is the frame start [I: whether a flush alone
+  latches under auto-refresh is not in the source; the first 4 flips log `taken after N us`, a flip not taken in 1 s
+  turns 0269 off].
+- Which pipe/CTL [V code, I values]: 0234's boot probe (`negronifb_dpuprobe`, default 1, read only) logs every SSPP and
+  CTL (`NEGRONI FB: DPU VIG0 addr ...`, `NEGRONI FB: DPU CTL2 ... intf 0x2 ...`) and keeps the pipe(s) whose SRC0_ADDR is
+  the panel memory and the CTL whose INTF_ACTIVE has INTF_1 (`negronifb_ctl=N` overrides). These lines were never
+  captured (the USB log starts later): `ioreg`/the boot console have them on the next boot.
+- Buffers: the panel memory 0xb8000000 (ABL's, the console's, the panic's) + `negronifb_dbufn - 1` more (default 3 in
+  all) at 0xb89f0000 and 0xb93e0000 (0x9f0000 each = round_page(4320 x 2412)); end before the 0268 DSI command buffer.
+  Each is a physical NegroniSurface (kernel mapping write-combined, as the panel memory).
+- Flow: `dbufTarget` (tick, before the frame is taken): a one-layer full-panel frame -> a free buffer; none free -> the
+  frame stays pending (`waits`); other frames -> wait until nothing is pending/flipped, then the shown buffer
+  (`in-place`). `present()` writes `fPixels`/`fDrawPhys` (= that buffer); `dbufQueued` marks it pending with the frame's
+  fence (0 = CPU, done). `dbufTick` (tick start and end): flush bits clear -> the flipped buffer is shown, the one before
+  is free; the newest pending buffer whose copy is done (fence, and no presentFinish/0256 shift left on it) -> SRC0_ADDR
+  + CTL_FLUSH. One flip outstanding at a time. Older pending buffers are freed when their fence is done.
+- Two vs three buffers: with two, a GPU frame flips one tick after its copy and the buffer shown before is free one tick
+  after the flip: 60 frames/s at most. Three: 120. CPU frames flip in the same tick (dsb, then the registers).
+- Display off: `zeroCopyStop(true)` (0275 tick 0) parks: the last flip taken, other buffers free, the black goes into the
+  shown buffer (no flip, no stale frame). Panic: `zeroCopyRestore()` (ABL's values = the panel memory) so the panic text
+  shows. The 0268 wake pauses the auto-refresh: no flip latches then, the 1 s timeout does not count.
+- Off: zero-copy on (same splash space), no probe, an unexpected pipe layout (line `0269 double buffering off: ...`).
+- Logs: `NEGRONI FB: 0269 double buffering on: 3 panel buffers of 0x9f0000 at 0xb8000000 0xb89f0000 0xb93e0000, pipe(s)
+  VIG0, CTL at +0x18000, flush bits 0x20001` (pipe/CTL as probed), the first 4 flips `NEGRONI FB: 0269 flip N: buffer B at
+  0x... (fence F), taken after N us, CTL_FLUSH 0x0`, per second `NEGRONI FB DBUF: flips/s N waits N in-place N latch max us
+  N (buffer B shown, -1 flipped, N flips)`. Expected [I]: flips/s = presents/s, latch max <= 8400 us, in-place 0.
+- Risks: a wrong SSPP address or flush blanks or freezes the panel: `negronifb_dbuf=0` (default; the config args do not
+  carry it). A flip that latches mid-frame would tear like before (no worse). A frame drawn by CA with a source smaller
+  than the panel (never seen: CA sends 1125x2436) would leave old rows in the back buffer.
+
+## 21. GPU hang detection and recovery (0287, `negronigpu_recover`, default 1)
+
+Symptom: a lost WPTR write (IFPC), a full ring or 2 s without a fence set `gGPUStopped` for the rest of the boot. Every
+fence then read done, the present path fell back to CPU copies, Turnip saw `MSM_PARAM_FAULTS` 1 (device lost) on every
+new device: "black-outs" until a reboot.
+
+### What KGSL does (out/src/op-kernel/drivers/gpu/msm) [V code]
+- The phone's A730 is `gen7_0_1` (chipid 0x07030001, adreno-gpulist.h:2079-2110; `gen7_0_0` at 2045-2073 is the
+  same driver) with the non-hwsched dispatcher: `.gpudev = &adreno_gen7_gmu_gpudev.base`; its
+  `.reset = gen7_gmu_reset` (adreno_gen7.c:1507-1517).
+- Detection: drawobj timeout 2000 ms (adreno_dispatch.c:50, `_adreno_dispatch_check_timeout` :2315-2344), the soft-fault
+  timer 200 ms (:53, `fault_detect_read` :162-182); RBBM interrupts MISHANGDETECT (23, `adreno_hang_int_callback`
+  adreno.c:368-376), CP_HW_ERROR (9), GPC_ERR (7, adreno_gen7.c:1096-1109), UCHE OOB (24) (table adreno_gen7.c:1123-1156);
+  hang-detect counter `RBBM_INTERFACE_HANG_INT_CNTL = BIT(30) | 0xcfffff` (adreno_gen7.c:508-510, gpulist `hang_detect_cycles`);
+  GMU AO interrupts (adreno_gen7_gmu.c:1693-1725: bit 0 watchdog bite -> NMI, bit 3 fence error, bit 5 AHB error).
+- Fault handling: `dispatcher_do_fault` (adreno_dispatch.c:1964-2148): GMU interrupts masked, RBBM_STATUS3 bit 24 check
+  (SMMU stalled), CP halted, CP_RB_BASE / CP_IB1_BASE read, snapshot, fences of the hung ring written as retired
+  (:2109-2121), `adreno_reset`, the queues replayed or skipped; throttle 3 faults per 3000 ms per context (:34-35).
+- Reset: `gen7_gmu_reset` (adreno_gen7_gmu.c:3127-3146) = GPU and GMU interrupts off, HFI stop, `gen7_gmu_suspend` ->
+  `gen7_gmu_pwrctrl_suspend` (:1354-1410: AHB fence ALLOW, `CM3_SYSRESET` 1, GBIF GX halt (if GX on), GBIF CX halt,
+  `RBBM_SW_RESET_CMD` 1, 100 us, GX GDSC off from the CPU), clocks and CX off, then `gen7_boot` (warm boot).
+
+### What 0287 does (`0287-negroni-gpu-hang-recovery.patch`; negroni_adreno.c, NegroniGPU.cpp)
+- Detection (no GPU interrupt in this port: polled):
+  - RedwoodGPU `gpuWait`: the completed fence did not move for 2 s with this fence outstanding (as before);
+  - `negroni_gpu_submit` returned 0 (ring full, or the IFPC-fenced WPTR write lost) in a client submit or the present copy;
+  - the watch thread, once a watch second: no fence for 2 s with work queued, an SMMU fault in the 3D core's context,
+    CP_HW_FAULT != 0 (only when GX is held for the line), a new GMU watchdog bite (AO_HOST_INTERRUPT_STATUS bit 0) or new
+    FW_INIT_RESULT bits 9-11 (GMU firmware fault; KGSL's NMI rule). It calls `NegroniGPUWatchFault`, which takes gGPULock
+    and recovers only if no fence was written meanwhile. `negronigpu_recover_watch=0` turns this part off.
+- Log (`NEGRONI GPU RECOVERY: N: ...`): fences (BR and BV words, last, wptr), pm mode, GX GDSC, GMU power state, AO
+  interrupt status, FW_INIT_RESULT; with GX held: RBBM_STATUS/STATUS3/INT_0, CP rptr/HW_FAULT/INT/PROTECT_STATUS,
+  IB1/IB2 base and remaining size (0x928-0x92d, gen7_reg.h:104-109), CP_SCRATCH_REG2; SMMU SGFSR and both contexts'
+  FSR/FAR/FSYNR0 (the 0233 registers); the GMU log head (16 dwords).
+- Reset (gpu_pm_lock held): GMU interrupt mask, AO interrupt clear, AHB fence status clear + ALLOW, CM3 in reset; then
+  (only while the GX GDSC is on; with the CM3 in reset nothing collapses GX) GBIF GX halt + ack, GBIF CX halt + ack,
+  RBBM SW reset (1, read back, 100 us, 0); `negronigpu_recover=2` also collapses the GX GDSC from the CPU (SW_COLLAPSE,
+  KGSL's regulator disable); the halts are released (the GMU boots through the same bus; step 20 writes them 0 again);
+  RSC sleep (as 0285 slumber); both SMMU contexts' FSR cleared (W1C; the contexts terminate, nothing to resume). CX and
+  the GMU clocks stay on.
+- Restart: `gpu_warm_boot` (the 0285 wake, now shared): RSC wake, steps 14-18 (firmware into the TCMs, GMU start, HFI,
+  tables, the step-17 vote, FEATURE_CTRL IFPC again when it was accepted at boot, OOB GPU_SET), ring at word 0, step 20
+  (registers, SQE, ME_INIT with the power-up list), CP_SET_SECURE_MODE 0. The first two recoveries log every step.
+  Then: IFPC mode releases OOB GPU_SET again (or falls back to slumber/off when the GMU now refuses IFPC); DCVS re-votes
+  (pm_revote); the next submission invalidates the UCHE.
+- Fences: the BR/BV fence words take the newest fence (KGSL writes the hung ring's timestamps as retired): every waiter
+  sees done. The range (completed + 1 .. newest) is recorded (last 16 recoveries): `negroni_gpu_fence_failed()`.
+  Client waits (msm WAIT_FENCE, scalar wait, GEM_CPU_PREP) on such a fence answer `kIOReturnError`;
+  `MSM_PARAM_FAULTS` = stopped + recoveries (msm's global count: Turnip's `msm_device_check_status`,
+  tu_knl_drm_msm.cc:234-243, sets the device lost; the Metal plugin's dead-man then handles the process);
+  `MSM_SUBMITQUEUE_PARAM_FAULTS` counts only recoveries that cut off this client's own work. A client submit that hit
+  the full ring is sent once more after the reset. Internal waits (buffer free, table switch, present) take the failed
+  fence as done, so the buffers are freed instead of leaked.
+- Bound: `negronigpu_recover_max` (default 3, 1..16) recoveries in 60 s; one more, a failed restart, `pm_dead` or
+  `negronigpu_recover=0`: `no recovery (...)`, gGPUStopped as before 0287. The badge reads `GPU RESET N`.
+
+### Boot-args (0287, and 0298 for the same GPU path)
+| Boot-arg | Default | Meaning |
+|---|---|---|
+| `negronigpu_recover` | 1 | 0 = no recovery (gGPUStopped for good, as before 0287); 1 = CM3 reset + GBIF halts + RBBM SW reset + warm boot; 2 = 1 + GX GDSC collapse from the CPU |
+| `negronigpu_recover_max` | 3 | recoveries allowed in 60 s (1..16); one more stops the GPU for good |
+| `negronigpu_recover_watch` | 1 | 0 = only waiters and submits detect a hang, not the watch thread |
+| `negronigpu_hwcg` | 1 | 0298: HWCG registers at step 20 |
+| `negronigpu_protect` | 1 | 0298: CP_PROTECT_CNTL + 45 ranges |
+| `negronigpu_chicken` | 1 | 0298: CP_CHICKEN_DBG x3 = 1 |
+| `negronigpu_dms` | 1 | 0298: ME_INIT BIT(11) (DMS off) |
+| `negronigpu_rptr_shadow` | 1 | 0298: RB_CNTL without BIT(27), IFPC ring room from the CP's rptr shadow |
+| `negronigpu_busy_pct` | 50 | 0298: DCVS busy threshold on the GMU busy counter; 0 = the fence rule |
+| `negronigpu_ifpc_slumber` | 2000 | 0298: ms idle in IFPC mode before slumber; 0 = never |
+| `negronigpu_hfi_ms` | 100 | 0298: HFI ack timeout after the boot ladder (10..1000) |
+| `negronigpu_guard` | 1 | 0298: guard page after kernel-placed GPU buffers |
+| `negronigpu_bwcalc` | 1 | 0298: DDR bus votes from cmd-db; 0 = the Linux constants |
+| `negronigpu_cnoc` | 1 | 0298: CNOC CN0 vote |
+| `negronigpu_bwdt` | 1 | 0298: DCVS bw index = DT bus-freq; 0 = the 0281 ramp |
+
+### Expected lines [I, not booted]
+`NEGRONI GPU RECOVERY: 1: no answer for 2 s: fence ...`, `... reset in N us: CM3 in reset, GX GBIF halt acked, CX GBIF halt
+acked, RBBM SW reset done, GX on (GDSC ...), RSC asleep`, the step 14-20 lines, `... done in N us: fences A..B failed (N),
+ring at N, pm ifpc, ...`, `RedwoodGPU: GPU reset after "...": recovery 1, the work in flight failed`, `RedwoodGPU: fence N was
+cut off by GPU reset 1: the wait fails`. Afterwards the FB STAT line goes back to `gpu` presents (not only `cpu`).
+
+### Risks
+- [I] The warm boot after a CM3 reset with CX on was designed for slumber (0285) and was never run on the phone (the booted
+  0285 image ran in IFPC mode). If step 14-18 fails after the reset, the GPU stays stopped (as before).
+- [I] With `negronigpu_recover=1` the GX core is reset by RBBM_SW_RESET_CMD only, not power-cycled. A hang the soft reset does
+  not clear shows as a second recovery within seconds; then try `negronigpu_recover=2` (GX GDSC collapse; risk: if the GMU
+  does not clear SW_COLLAPSE on its next GX power-up, step 18 fails and the GPU stays stopped).
+- A legit GPU job over 2 s is reset (KGSL's timeout is the same 2000 ms).
+- Every Turnip device sees the fault count change: backboardd's Metal device is lost on any recovery (msm semantics).
+
+### Build
+2026-10-26 18:21, job `gpur-kernel` (`scripts/gpu/build-gpur.sh`, lock held over kernel + image, every patches/xnu patch up to
+0291 applied incl. 0287/0288, the 4 usual dxb skips): kernel `out/kernel/local-20261026-125146` (sha256
+8f1af35996a7ca6347fbd582630db17369831de58b1af736265884b527c0e9b2, 18 `NEGRONI GPU RECOVERY`/`NEGRONI CPUIDLE` strings),
+image `out/ios16-gpur` (config args + `negronigpu_recover=1 negronicpuidle=1 negronipanic=30 negronipanicreason=2`;
+boot_a 02718ef216f7607d1f84ecd1b1d3bc4009b9428b5f8247e99bc7fae09e485323, esp 0ce4598df2420230f1254003f73516962d5d5ad759fa22d80a326bd5a075781f).
+Not booted. The 0298 build replaced this image (section 27).
+
+### First-boot proof list (sections 19 and 20; review 2026-10-26: approve with fixes)
+
+1. Boot: `NEGRONI BL: DSI0 command buffer for long packets mapped at 0xbaafc000 (fifo_ctrl 0x... dma_offset 0x...)`:
+   record the dma_offset the UEFI left (the address its own memory DMA used; it tells which IOVA space the DSI DMA reads).
+2. Boot: the `NEGRONI FB: DPU ...` probe lines (pipes, CTL) and `NEGRONI FB: 0269 double buffering on: ...`.
+3. First frames: `NEGRONI FB: 0269 flip 1: buffer 1 at 0xb89f0000 (fence F), taken after N us` (N <= ~8400); `NOT taken`
+   or `0269 double buffering off: the display engine does not take flips` = a flush alone does not latch under auto-refresh.
+4. Lock and unlock: `NEGRONI FB: display on (on-command 94 packets, PPS ok, TE on: ...)` AND a correct picture (no black,
+   no purple strip). `TE on` without a picture: report the line (DPU/DSC side).
+
+Review fixes applied: 0234's slot size and its display-surface bound end at NEGRONI_DB_END (splash end - 16 KiB, 0269), so
+they never reach the 0268 DSI buffer on another page/row size; the wake line says `PPS not sent (set incomplete)` when the
+on-command broke off.
+
+### Build (2026-10-26 18:30, sections 19 and 20)
+
+Job `dpu-kernel` (`scripts/display/build-dpu.sh`, lock out/kernel/.lock held across kernel + image): kernel
+`out/kernel/local-20261026-125636` (sha256 dc55e5fd063e2a2e03ba31ea3a120c0607427c80faae9b46af652b63d860707b; 215 patches
+applied incl. 0268, 0269, 0275, 0351; skipped: the 4 usual dxb ones and the uncommitted 0292-0296 of another agent, which
+fail on their own context). Image `out/ios16-dpu` (config args + `negronifb_sleep=1 negronifb_dbuf=1 negronipanic=30
+negronipanicreason=2`): boot_a sha256 fa73ea8835307b583256870bc9c0ef29f012552f4f4ec781a4fa243f6dc9c35b, esp 906860a5...,
+vendor_boot_a c29329ee... (copied from out/ios16). Patch chain check: 0267 -> 0268 -> 0269 -> 0275 -> 0286 -> 0351 (and
+every other committed patch up to 0353) applies with `git apply` in order. Not flashed, not booted.
+
+## 22. DSI command sets by memory DMA, batched like Android (0292, `negronifb_dsidma`, default 0)
+
+Files: new `bsd/dev/negroni_dsi.c`; hooks in NegroniBacklight.cpp (after 0268: `negroni_dsi_dcs_set_ex`,
+`negroni_dsi_dcs_write`, accessors `negroni_dsi_base/enter/leave/in_panic/cmdbuf/cmdbuf_failed`); NegroniFramebuffer.cpp
+(0259 mode 1 HS default). Audit items 2.3 and 2.4 (docs/audit/2026-10-26-display.md).
+
+- Android [V display-drivers]: `dsi_display_set_cmd_tx_ctrl_flags` dsi_display.c:820-858 (FETCH_MEMORY by default; LAST
+  for a packet without `MIPI_DSI_MSG_BATCH_COMMAND` = DT flags byte 0x40), `dsi_message_tx` dsi_ctrl.c:1615-1752 (copy and pad
+  into the 4 KiB uncached buffer, :1245-1290 header byte order {data0, data1, DI, flags}, flags bit 7 last, bit 6 long, bit 5
+  BTA), `dsi_ctrl_hw_cmn_kickoff_command` dsi_ctrl_hw_cmn.c:870-918 (DMA_CTRL 31/30/26/28/24/29, DMA_FIFO_CTRL |= bit 20 |
+  bit 16, DMA_CMD_OFFSET 0x48, DMA_CMD_LENGTH 0x4c, SW trigger 0x90), CMD_DMA_DONE INT_CTRL bit 0 (dsi_ctrl.c:390, 200 ms),
+  then `reset_cmd_fifo` (:990-997). No MDP-idle wait per command (only dsi_display.c:8959, the dynamic-clock path).
+- Ours: `negronifb_dsidma=1`: every set through `negroni_dsi_dcs_set_ex` (the 0259 VRR sets, the 0268 on-command) is sent
+  inside 0268's set lock as batches: packets up to one without the 0x40 flag, one with a wait (the wait follows the batch),
+  or the 4 KiB limit; one MDP-busy wait (20 ms max) per set, not per packet. Buffer: 0268's command buffer at 0xbaafc000
+  (last 16 KiB of the splash region, write-combined; 0268 chose it because the display SMMU context passes the splash
+  region for the pipes [I]), first 4 KiB. `=2`: single DCS writes (brightness, sleep) too. `=0`: 0250/0268 path.
+- Failure: a DMA without CMD_DMA_DONE in 50 ms turns the memory DMA off for the boot (0268's long packets too) and the
+  rest of the set goes packet by packet from the failed batch (`NEGRONI DSI: memory DMA of N bytes (N packets) not done
+  ...`). It does not count toward 0250's 3-failure DSI shutdown.
+- 0259 mode 1 (min-fps `BD[0x14]`) now defaults to HS like the DT state (live.dts 35650); `negronifb_vrr_hs=0` = LP.
+- Lines: `NEGRONI DSI: memory DMA (negronifb_dsidma=1): command sets from 0xbaafc000 (0268's buffer), up to 4096 bytes per
+  DMA`, the first 6 sets: `NEGRONI DSI: set of 721 bytes: 62 packets in N memory DMAs (N bytes), HS, N us, rc 0`.
+  Expected [I]: a 0259 switch in a few ms instead of 100-300 ms; the 0268 wake set in its waits only (12 + 121 ms).
+- Not changed: the fingerprint HBM sets of 0351 (`negroni_fp_send_set`) still go packet by packet (later patch).
+
+## 23. DSI reads, ESD check and panel ID (0293, `negronifb_esd`, default 0)
+
+Files: `bsd/dev/negroni_dsi.c` (read path, ESD thread call), NegroniBacklight.cpp (`negroni_backlight_reinit`,
+`reinitPanel`), NegroniFramebuffer.cpp (`negroni_dsi_esd_start()` in `AppleCLCD::start`).
+
+- Android [V]: `dsi_set_max_return_size` dsi_ctrl.c:1754-1777 (0x37, batched before the read), `dsi_message_rx`
+  :1820-1965 (passes of 10, then 14 bytes; CRC removed; type at `buff[header_offset]`), `clear_rdbk_reg`
+  dsi_ctrl_hw_cmn.c:1037-1043 (RDBK_DATA_CTRL 0x1d4 = 1 then 0), `get_cmd_read_data` :1045-1119 (RDBK_DATA_CTRL >> 16 =
+  bytes, RDBK_DATA3..0 0x78..0x6c big-endian), BTA bit for reads (:1279-1285). ESD (live.dts 35594-35599): DCS read 0x0a,
+  1 byte, LP, expected 0x9d or 0x9f, every 5 s (sde_kms.h:143). Serial: oplus reg 0xa1, 11 bytes, date at index 4
+  (live.dts 35558-35561, oplus_display_private_api.c:754-806).
+- Ours: `negroni_dsi_dcs_read(cmd, out, len, lp)` = a port of the two functions (memory DMA when 0292 is on: 0x37 + 0x06
+  in one DMA; else two FIFO DMAs), then a BTA_DONE poll (INT_CTRL bit 20, 10 ms). `negronifb_esd=1`: 5 s after start
+  (display on) the panel ID once, then 0x0a every 5 s while the display is on. A wrong value twice in a row queues
+  `negroni_backlight_reinit`: the off-command (0x28, 21 ms, 0x10, 101 ms), 0268's wake (on-command + PPS, auto-refresh
+  paused/resumed), the DBV again. `negronifb_wake=0` = no re-init (log only). At most 3 re-inits per boot: the next
+  wrong pair logs `still 0x.. after 3 re-inits: ESD check off for this boot`. 3 failed reads in a row stop the check
+  (a broken read path must never cause a re-init loop). A read takes 0268's set lock first (`negroni_dsi_set_enter/
+  leave`), so it never lands between the batches of a 0259 VRR set or the packets of the 0268 wake. A read whose display went off meanwhile is ignored. `=2`: ID only.
+- Lines: `NEGRONI DSI ESD: negronifb_esd=1: panel ID once, DCS 0x0a every 5 s while the display is on; re-init
+  registered`, `NEGRONI DSI: panel ID da/db/dc .. .. .. (rc 1 1 1), power mode 0a 9c|9d|9f (rc 1), signal 0e .. (rc 1), a1 x
+  11 rc 11: made YYYY-MM-DD hh:mm:ss (reads via memory DMA|FIFO)`, `NEGRONI DSI ESD: power mode 0x9d ok (expect
+  0x9d/0x9f), check every 5000 ms`, every 60 checks `NEGRONI DSI ESD: N checks, ok N, wrong N, read errors N, re-inits N,
+  last 0x..`. The serial bytes stay in the phone log (not in git).
+
+## 24. Tearcheck vsync_count on a rate switch (0294, with `negronifb_vrr=2`; `negronifb_tcfg=0` = off)
+
+File: new `bsd/dev/negroni_dpu.c` (`negroni_dpu_te_rate`), one hunk in 0259's `vrrSetRate`.
+Android [V]: `sde_encoder_phys_cmd_tearcheck_config` sde_encoder_phys_cmd.c:1240-1259 `vsync_count = vsync_clk / (vtotal x
+vrefresh)`; vtotal 2424 in the 120/90/60 FHD timings (live.dts v-front 2, back 8, pulse 2, height 0x96c) -> 66 / 88 / 132.
+Ours: INTF_TEAR_SYNC_CONFIG_VSYNC [18:0] replaced, written with the counter off (bit 19), then on (sde_hw_intf.c:646-658), bit 20 TE pin kept; 0259's
+line time `fTeLineNs` follows, so the TE-lock phase stays right at 60/90 Hz. Line: `NEGRONI DPU: tearcheck vsync_count 66
+-> 132 for 60 Hz (sync_cfg 0x... -> 0x...)`. Back to 66 on the 120 Hz set.
+
+## 25. The TE as an interrupt (0295, `negronifb_teirq=1`, default 0)
+
+Files: `pexpert/arm/pe_fiq.c` (`negroni_spi_register/enable/dispatch`: the first SPI support of this port; GICD IGROUPR,
+IPRIORITYR 0xa0, ICFGR level, IROUTER = the calling CPU, ISENABLER), `osfmk/arm64/sleh.c` (the dispatch before
+`cdp->interrupt_handler`), `bsd/dev/negroni_dpu.c`, NegroniFramebuffer.cpp (`negroni_dpu_start` in start,
+`negroni_dpu_tick` after 0259's teTick in vsyncFired, `negroni_dpu_te_since` in teTick).
+
+- Path [V]: INTF_1 tear interrupt block MDSS + 0x36800 (EN +0, STATUS +4, CLEAR +8; bit 2 RD_PTR), sde_hw_interrupts.c:24-26,
+  184-188 and live.dts `qcom,sde-intf-tear-irq-off`; MDSS HW_INTR_STATUS MDSS + 0x10 (bit 4 = DSI0, live.dts dsi_ctrl0
+  `interrupts <4>`); MDSS line = GIC SPI 0x53 (83) = INTID 115, level (live.dts mdss_mdp `interrupts <0 0x53 4>`).
+- Setup (Android `sde_core_irq_preinstall` + tearcheck_config): MDP top INTR_EN 0x1010 / INTR2_EN 0x1008 / INTF_1
+  INTR_EN 0x361c0 = 0, statuses cleared, RD_PTR_IRQ = VSYNC_INIT_VAL + 1 (Android: vdisplay + 1), tear EN = RD_PTR. DSI0
+  INT_CTRL enables are not touched (0250 polls the status bits); an interrupt with no tear status masks the SPI until the
+  next vsync tick. More than 1000 interrupts in a second: off for the boot.
+- Use: the handler stamps the TE (now minus (line - init) x line time) and 0259's `teTick` takes `sinceTeNs` from that
+  stamp (fresh = less than 25 ms old) instead of the counter sample. The vsync tick stays the 0254 timer (an interrupt
+  handler cannot use an IOTimerEventSource); its deadline moves by the lock as before. So `negronifb_teirq=1` needs
+  `negronifb_te=1` to change the tick phase; alone it only logs.
+- Lines: `NEGRONI DPU TE IRQ: before: mdss intr 0x.. top en ../.. status ../.. intf1 en .. status .., tear en .. status ..,
+  rd_ptr_irq N init 2412 vsync_count 66, dsi0 int_ctrl 0x..`, `NEGRONI DPU TE IRQ: on: INTID 115 (SPI 83, level), INTF_1
+  tear rd_ptr at line 2413 (was N), 3437 ns/line`, per second `NEGRONI DPU TE IRQ: irqs/s 120 rd_ptr 120 foreign 0 (masked 0)
+  TE-to-handler us avg/max N/N`. Expected [I]: irqs/s = rd_ptr = te/s of 0259; `foreign` > 0 only during DCS writes if the
+  UEFI left a DSI interrupt enable on.
+- Risks [I]: first SPI on this port (Gunyah owns the GIC grouping; a write the hypervisor drops = no interrupt, the timer
+  path is unchanged); 0288's PSCI CPU idle must wake the routed CPU (GICv3 wake on a pending SPI):
+  `negronicpuidle=1` + `negronifb_teirq=1` are untested together (test them apart first).
+
+## 26. DPU/DSI power: what the UEFI leaves on, and the no-transfer idle (0296, `negronifb_pwrprobe`, `negronifb_idle=2`)
+
+File: `bsd/dev/negroni_dpu.c`. Android [V]: `sde_core_perf_crtc_update` sde_core_perf.c:984 (per-frame core clock + BW
+votes), `dsi_ctrl_transfer_prepare` dsi_ctrl.c:3560-3605 (DSI clocks + command engine per command), `_sde_encoder_rc_idle`
+sde_encoder.c:2207-2262 after 58 ms (sde_encoder.h:55): IRQs off, DSI clocks off, MDSS GDSC put, BW released
+(sde_core_perf.c:786); ULPS on idle (`qcom,ulps-enabled` live.dts 35554).
+
+What the display needs and what the UEFI leaves [V = DT/driver source; values on the phone: the probe lines, not seen yet]:
+
+| Item | Register (DISP_CC 0x0af00000, GCC 0x00100000) | Source | Needed with auto-refresh on | May drop with `idle=2` and no frame |
+|---|---|---|---|---|
+| MDSS GDSC | DISP_CC 0x9000 (gdsc@af09000), int2 0xb000 | live.dts 1030-1055 | yes | no (register state, panel memory in DDR stays; Android collapses it only with a full restore path) |
+| AHB (iface) | disp_cc_mdss_ahb 0x80a4, gcc_disp_ahb 0x37004 | mdss_mdp clocks | yes | no (every register access) |
+| AXI (bus) | gcc_disp_hf_axi 0x3700c, sf_axi 0x37014 + RPMh BW votes (MM0/SH0, live.dts interconnects) | mdss_mdp clocks/interconnects | yes (fetch) | yes [I] (no fetch) |
+| MDP core | disp_cc_mdss_mdp 0x800c, RCG 0x80ec; lut 0x801c; rot 0x8014 | mdss_mdp clocks | yes | yes [I] (no frame, no kick) |
+| vsync | disp_cc_mdss_vsync 0x8024, RCG 0x811c (19.2 MHz) | mdss_mdp vsync_clk | yes (tearcheck counter) | no (TE lock and the next kick) |
+| DSI byte/intf/pixel | byte0 0x8028, byte0_intf 0x802c, pclk0 0x8004 (RCGs 0x8134, 0x80bc; PLL = DSI PHY) | dsi_ctrl0 clocks | yes (HS link) | yes [I] with ULPS; on before a DCS or a kick |
+| DSI escape | esc0 0x8038 (RCG 0x816c) | dsi_ctrl0 clocks | yes (LP DCS) | yes [I] between DCS |
+| DSI PHY / vdda-1p2 | PHY regs, RPMh LDO | dsi_ctrl0 supply | yes | only with ULPS (not done) |
+
+- Nothing collapses while the auto-refresh scans: every TE the DPU fetches 10.4 MB and the DSI sends it, so every row
+  above stays "yes". This is why 0296 first implements the no-transfer idle; clock gating is the next step (not done:
+  turning a branch off with the CBCR enable bit 0 and back needs the PLL/RCG state the probe shows first).
+- `negronifb_pwrprobe=1` (read-only, maps DISP_CC 64 KiB and the GCC page 0x134000 with `ml_io_map_unmappable`, unmapped
+  after): `NEGRONI DPU PWR: GDSC mdss 0x.. (on|OFF, hw_ctrl N, sw_collapse N) mdss_int2 ...`, `NEGRONI DPU PWR: DISP_CC
+  branches ahb 0x.. ON mdp ... esc1 0x.. off`, `NEGRONI DPU PWR: DISP_CC RCGs (cmd/cfg) mdp 0x../0x.. (on src N div N.N)
+  ...`, `NEGRONI DPU PWR: GCC disp_ahb ... disp_xo ...`, `NEGRONI DPU PWR: DSI0 ctrl .. status .. clk_ctrl .. clk_status ..
+  lane_status .. lane_ctrl .. int_ctrl ..`, `NEGRONI DPU PWR: INTF_1 autorefresh 0x80000001 sync_cfg .., CTL 0x.. flush ..`.
+  The BW votes are not readable here [I: XBL's display driver votes them and they stay].
+- `negronifb_idle=2`: after `negronifb_idle_ms` (default 58) without a swap: Android's `_sde_encoder_autorefresh_disable_seq1`
+  (sde_encoder_phys_cmd.c:2015-2046: TE disconnect = SYNC_CONFIG_VSYNC bit 20 off, AUTOREFRESH_CONFIG bit 31 off, poll until
+  INTF_TEAR_LINE_COUNT is not between 1 and 2411 (`is_ongoing_pptx` :798-830), TE back on). Then each new frame (swap id
+  written to the panel memory, its GPU copy done) gets one CTL_START (CTL + 0x1c of the CTL 0234 found on INTF_1;
+  `trigger_start` :2161-2182, sde_hw_ctl.c:327-334) at the next vsync tick; the next kick waits for that transfer ("pp
+  done": one TE since the kick, more than 200 lines past it, no wr_ptr transfer; at most 50 ms). No frame = nothing on the
+  link, no fetch: the panel shows its RAM (Android's idle). Display off: auto-refresh back on (the 0275 black frame and the
+  0258 sleep need it); after the wake the idle delay starts again. Android's sequence 2
+  (`_sde_encoder_autorefresh_disable_seq2` :2051-2127: the MDP-top debug-bus autorefresh status re-check and the
+  tearcheck write-count reset) is not ported: only sequence 1 runs. Guards: refused with `negronifb_vrr=1|3`,
+  `negronifb_dbuf=1` (0269), `negronifb_zerocopy=1` (0234) or without the 0234 probe; if the INTF frame counter moves under
+  the auto-refresh at start but does not move after 3 kicks in a row, the auto-refresh goes back on for the boot ("3 kicks
+  sent no frame"); if something else turns the auto-refresh on (0268 re-init), the mode goes back to its auto state.
+- Lines: `NEGRONI DPU IDLE: mode 2: after 58 ms without a swap ... INTF frame count A -> B in 30 ms (kicks are checked)`,
+  `NEGRONI DPU IDLE: auto-refresh off (0x80000001 -> 0x00000001), transfer over after N us (entry N)`, per second
+  `NEGRONI DPU IDLE: no auto-refresh (kick per frame), kicks/s N (busy N, timeouts N), N kicks, N idle entries,
+  auto-refresh 0x00000001`, `NEGRONI DPU IDLE: display off: auto-refresh on again (0x80000001)`.
+- Proof = the battery current (0270 lines) on a static screen, `negronifb_idle=0` vs `=2`, same brightness, 60 s each.
+- Risk [I]: the copy into the single panel buffer can still meet the fetch of the previous kick (as with the auto-refresh
+  today); the writer starts before and is faster than the reader, so the panel gets the newer frame whole, not a torn one.
+  0269's double buffer removes it but is refused together with `idle=2` until the flip is kicked too.
+
+### Boot-args of 0292-0296 (all default off except `negronifb_tcfg`)
+
+| Boot-arg | Values | Patch | Effect |
+|---|---|---|---|
+| `negronifb_dsidma` | 0 (default), 1, 2 | 0292 | 1: command sets by batched memory DMA; 2: also single DCS writes |
+| `negronifb_vrr_hs` | -1 (default = HS), 0, 1 | 0292 (0259) | DCS mode of the VRR sets; mode 1 is now HS by default |
+| `negronifb_esd` | 0 (default), 1, 2 | 0293 | 1: panel ID once + 0x0a check every 5 s with re-init; 2: panel ID only |
+| `negronifb_tcfg` | 1 (default), 0 | 0294 | tearcheck vsync_count on a `negronifb_vrr=2` switch |
+| `negronifb_teirq` | 0 (default), 1 | 0295 | TE rd_ptr interrupt stamps for the 0259 lock (with `negronifb_te=1`) |
+| `negronifb_teirq_intid` | 115 (default) | 0295 | GIC INTID of the MDSS line |
+| `negronifb_pwrprobe` | 0 (default), 1 | 0296 | read-only clock/GDSC/DSI dump at start |
+| `negronifb_idle` | 0 (default), 2 | 0296 | no-transfer idle (auto-refresh off, CTL_START per frame) |
+| `negronifb_idle_ms` | 58 (default, min 20) | 0296 | swap-free time before the auto-refresh goes off |
+
+First phone test (suggested): config args + `negronifb_dsidma=1 negronifb_esd=1 negronifb_pwrprobe=1`; then
+`negronifb_te=1 negronifb_teirq=1`; then `negronifb_idle=2` (power A/B with `=0`). Fallback: drop the arg.
+
+### Build (sections 22-26)
+Job `dsi-kernel` (`scripts/display/build-dsi.sh`, lock out/kernel/.lock; kernel only, owner rule 2026-10-26): kernel
+`out/kernel/local-20261026-174206` sha256 a0b050bf05d91e0878af954bc4a4033899f5977aa734198a24df76d0efb26d3c (after the review fixes: ESD re-init cap 3, read under the set lock, 0294 counter off/on); 233 patches applied incl. 0268, 0269, 0292-0296; skipped: only the 4
+usual dxb ones. Not booted. Notes: docs/notes.md section 15 (end); status: docs/plan.md "Display DSI/DPU status".
+
+## 27. KGSL parity from the GPU audit (0298, `0298-negroni-gpu-kgsl-parity.patch`)
+
+Source: `docs/audit/2026-10-26-gpu.md` section 3 (items 2, 3, 4, 6, 8, 9, 10, 11; item 1 = 0287). Files: negroni_adreno.c,
+NegroniGPU.cpp. Every item has a boot-arg (1 = on, the default, unless noted). Not booted.
+
+| Item | What 0298 does | KGSL reference [V] | Boot-arg |
+|---|---|---|---|
+| HWCG | step 20: GMU AO CGC MODE 0x20000 / DELAY 0x10111 / HYST 0x5555, the 53 registers of `gen7_0_0_hwcg_regs` (the gen7_0_1 entry uses that list), RBBM_CLOCK_CNTL 0x8aa8aa82 | adreno_gen7.c:265-300, 557; adreno-gpulist.h gen7_0_0_hwcg_regs, 2079-2110 | `negronigpu_hwcg` |
+| Slumber from IFPC | after `negronigpu_ifpc_slumber` ms (2000) with no work in IFPC mode: OOB GPU_SET, then pm_sleep (idle check, PREPARE_SLUMBER, CX_BUSY, RSC sleep) + `gen7_halt_gbif` (client halt, ARB halt, de-assert); the next submit wakes (warm boot), IFPC asked again, OOB released | gmu_idle_check adreno_gen7_gmu.c:2870-2913, gen7_power_off 2795-2868, gen7_gmu_power_off 2513-2560, gen7_halt_gbif 2492-2511 | `negronigpu_ifpc_slumber` (0 = never) |
+| TLB flush + FSR on wake | every warm boot (slumber wake, 0287 recovery): both SMMU contexts' FSR printed and cleared, TLBIASID + TLBSYNC | adreno_gen7_gmu.c:1887-1892 (`kgsl_mmu_flush_tlb`) | - |
+| DCVS busy counter | step 20 enables GMU power counter 0 (AO CX_BUSY_MASK 0xff000000, SELECT_0 low byte 0x20, ENABLE 1); each DCVS tick: busy = XOCLK_0 delta / AO delta >= `negronigpu_busy_pct` (50 %); no movement for 50 ticks with work queued -> the fence rule (logged once). The pm part of the WATCH line ends with `busy N%` (IFPC mode) | adreno_gen7.c:521-523, gen7_power_stats 1392-1405 | `negronigpu_busy_pct` (0 = fence rule) |
+| CP_PROTECT | CP_PROTECT_CNTL BIT(0,1,3), 45 ranges of `gen7_0_0_protected_regs` | adreno_gen7.c:225-258 | `negronigpu_protect` |
+| CHICKEN_DBG | CP_CHICKEN_DBG, CP_BV_CHICKEN_DBG, CP_LPAC_CHICKEN_DBG = 1 (icache prefetch off on gen7_0_x) | adreno_gen7.c:544-549 | `negronigpu_chicken` |
+| ME_INIT BIT(11) | DMS off (gen7_0_1 has no ADRENO_DMS) | adreno_gen7.c:124-126 | `negronigpu_dms` |
+| rptr shadow | RB_CNTL without BIT(27): the CP writes its read pointer to scratch +0x80; IFPC ring room from it (not from the 256-entry fence estimate) | adreno_gen7.h:186-188, adreno_ringbuffer.c:67-104 | `negronigpu_rptr_shadow` |
+| HFI timeout | 100 ms per ack after the boot ladder (`pm_start`); the ladder keeps 1000 ms (proven) | adreno_hfi.h:404 (HFI_RSP_TIMEOUT) | `negronigpu_hfi_ms` (10..1000) |
+| Guard page | one shared writable page mapped for PAGE_SIZE after every buffer at a kernel-chosen GPU address (GL path); client addresses (SET_IOVA, Turnip) get none | audit 1.5 (bergamota lesson, gpu-status.md) | `negronigpu_guard` |
+| Bus votes | the 12 DDR rows computed from cmd-db SH0 (bus width 16), MC0 (4), ACV (fixed) aux data {unit, width, vcd} and the DT `bus-table-ddr` (KBps); wait mask from the vcds; CNOC CN0 (width 4) for `bus-table-cnoc <0 100>`; a BCM missing from cmd-db keeps the Linux constants. Log: the 3 sample rows next to the old constants and how many words differ | adreno_gen7_rpmh.c:121-260 (tcs_cmd_data, build_rpmh_bw_votes), 415-497 (build_bw_table); DT out/live.dts:21078-21079 | `negronigpu_bwcalc`, `negronigpu_cnoc` |
+| DCVS bw index | the DT `bus-freq` of each level (818/791 -> 11, 734/640 -> 10, 599/545 -> 8, 492/421 -> 6, 350 -> 3, 317/285/220 -> 2) instead of the 0281 linear ramp | DT 21096-21205; kgsl_pwrctrl.c:207-287 | `negronigpu_bwdt` |
+
+Left out (document only):
+- **ACD** (audit item 5): KGSL sends an ACD table from the DT `qcom,acd-level` values and FEATURE_CTRL ACD, and before that an
+  AOP QMP mailbox message `{class: gpu, res: acd, val: 1}` (adreno_gen7_gmu.c:1729-1751, 2104-2146; adreno_gen7_hfi.c:540-561).
+  Nothing in the tree talks QMP; a wrong ACD table can under-volt the GPU. Next step when QMP exists.
+- **Preemption** (audit 1.6, item 12): one ring, one priority; iOS has one GPU client that matters (backboardd).
+- **Completion interrupt** (audit item 7): not in the brief; polling stays.
+
+Expected lines [I, not booted]:
+- step 17: `17 BCM cmd-db: SH0 unit U width W vcd V, MC0 ..., ACV vcd V (complete)`, `17 bw level 11 (13085937 KBps): SH0 ... (Linux
+  constants 0x600030ae 0x60003fe5 0x60000008)`, `17 bw table: computed from cmd-db; N of 36 words differ ...`, `17 CNOC CN0 ...: votes ...`;
+  N = 0 means our constants were already this phone's.
+- step 20: `20 KGSL settings (0298): busy counter on, CP_PROTECT on (45 ranges), CHICKEN_DBG 1, HWCG on (53 registers, RBBM_CLOCK_CNTL
+  0x8aa8aa82), rptr shadow on, ME_INIT DMS off (BIT(11))`, then `20 THE 3D CORE TAKES COMMANDS` as before.
+- `NEGRONI GPU PM: IFPC mode slumbers after 2000 ms idle ...; HFI timeout 100 ms`; WATCH `| pm ifpc GX collapsed N% ... slumbers N wakes N
+  busy N% |`; `NEGRONI GPU PM: slumber N in N us ...`, `first wake ...`, `wake N in N us`.
+- `RedwoodGPU: guard page 0x... after every kernel-placed buffer (0298 ...)` at the first GL buffer.
+
+Risks [I]:
+- HWCG, CP_PROTECT, CHICKEN_DBG and DMS change GPU behaviour that the booted images never had. A step-20 or first-submit failure, a
+  `CP_HW_FAULT` (protect violation) or a hang right after boot: bisect with `negronigpu_protect=0`, then `negronigpu_hwcg=0`,
+  `negronigpu_chicken=0 negronigpu_dms=0`. A protect fault from a user IB is now caught by 0287 (recovery) instead of a stop.
+- The slumber wake was never run on the phone (the booted 0285 image stayed in IFPC); a failed wake = `pm_dead` (GPU stopped, as
+  before). `negronigpu_ifpc_slumber=0` keeps IFPC only.
+- The computed bus votes may differ from the constants; a wrong vote can starve or overfeed DDR. `negronigpu_bwcalc=0` restores the
+  constants, `negronigpu_cnoc=0` drops the CNOC vote.
+- 100 ms HFI timeout: a slow but alive GMU now fails a vote in 100 ms (logged; DCVS retries at the next tick).
+
+Build 2026-10-26 18:47 (job `gpur2-kernel`, all patches up to 0298, the 4 usual dxb skips; compile-one 0 errors): kernel
+`out/kernel/local-20261026-131716` (sha256 7804fca89c4e08e9a1a75f9bc3ba70e3be9171442c6e09d50072afa5ce80332a); `out/ios16-gpur` rebuilt
+with it (boot_a 526eba93e7e6b7a20e56ba767ea26fc2c011fde4e7cd22a46a4d28b491b3d066; args: config + `negronigpu_recover=1 negronicpuidle=1
+negronipanic=30 negronipanicreason=2`, so the 0298 defaults are on). Not booted.
+Review fix F3 (a computed DDR vote below the Linux constant keeps the constant, logged `... constant kept`): kernel
+`out/kernel/local-20261026-174403` (sha256 dfa9a8a550ecc79d89b7478f1c3217850b55efb9c8cacd124893cf26346e887e), no image.
+Proof build after the review fixes (kernel only, no image: owner rule): `out/kernel/local-20261026-131404` (sha256
+3bae1cc92b09479557481b9115b92b7e460c00fb21bf8c0da76265d9ca930b83). `out/ios16-dpu` still holds the first kernel
+(dc55e5fd...); the fixes change only a log text and a bound that today's geometry already met.
