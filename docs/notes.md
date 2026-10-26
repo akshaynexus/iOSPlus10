@@ -2476,10 +2476,12 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   scripts/ios16/build.sh refuses boot-args of 1024 bytes or more. Variant list: scripts/ios16/variants/everything.args.
   The slop shim loader (external/slop/shim/loader.c, 608) is a different boot path (not used with UniXNU).
 
-## 37. Wi-Fi: negroniwlan_smmu=3 default, SMMU re-check, chain review (2026-10-27, kernel agent; patch 0325, details: patches/xnu/README-wifi.md "0325")
+## 37. Wi-Fi: SMMU re-check (0325), API seam, join, HTT data path, WPA2-PSK (2026-10-27, kernel agent; patches 0325-0329, details: patches/xnu/README-wifi.md "0325", "0326-0329")
 
-- Owner approved the SMMU write path: `negroniwlan_smmu=3` (0324 stage-1 context, IOVA 0xa0000000 + 256 MiB) is the
-  default whenever `negroniwlan>=2`; `=1`/`=0` keep the old report-only path.
+- The owner approved the SMMU write path, and 0325 first made `negroniwlan_smmu=3` the default. After the 0249 SEA
+  (section 45: Gunyah refuses GR1 CBAR writes of some "free" banks) the default is `negroniwlan_smmu=1` again; `=3` is
+  opt-in until the bank probe says which banks HLOS may write. 0325 also takes `negroni_smmu_claim_lock` (0249), re-reads
+  the SMR before writing, and its teardown writes only registers that setup proved writable.
 - [V, live.dts pcie0] `iommu-map` RID 0 -> 0x1c00, RID 0x100 -> 0x1c01, `qcom,smmu-sid-base 0x1c00`; wlan iommu group:
   `iommu-faults = stall-disable, HUPCF, no-CFRE, non-fatal`, `iommu-pagetable = coherent`, pcie0 `dma-coherent`.
 - [V, pci-msm.c msm_pcie_config_sid] Android programs the PCIe BDF-to-SID table (PARF 0x2c00 bit 0 BYPASS off, 256
@@ -2494,8 +2496,22 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   kernel.macho points to it (build-local.sh relinks). objdump: every apps-SMMU access in negroni_wlan_smmu.c is a plain
   `ldr w, [x]` / `str w, [x]` (50 / 18); the writeback stores there are page-table entries in RAM.
 - Not run on the phone. Test boot args: `negroniwifi=10 negroniwlan=10 negronipanic=30 negronipanicreason=2`.
-- Next (0326+): join (open) by WMI mgmt tx, then the HTT data path (needed for EAPOL), then WPA2 in the kernel by
-  porting HakiOS wifi/lx lx_wpa.c (MIT), then en0 + DHCP, then the Apple80211 glue.
+- 0326 `bsd/dev/negroni_wlan_api.h`: the seam for the iOS side (caps, register rx/event callbacks, link, scan + results,
+  associate/disassociate, 802.3 TX); every associate ends with LINK_UP or LINK_DOWN, every scan with SCAN_DONE.
+- 0327 join (open): PEER_CREATE before VDEV_START (WCN6855 vdev_start_delay), AUTH/ASSOC by WMI mgmt TX from a DMA slot,
+  PEER_ASSOC from the AP's elements, VDEV_UP, AUTHORIZE; link loss by deauth/kickout/roam/10 s without beacons.
+- 0328 HTT data path (ath11k dp/hal for WCN6855, polled, Ethernet encap/decap): common rings before HTC READY, REO dst
+  before WMI INIT, LMAC rings + HTT SRING_SETUP after READY, REO queues per peer; CE4 for HTT out. `negroniwlan_dp=0` off.
+- 0329 WPA2-PSK: HakiOS lx_wpa.c ported as negroni_wlan_wpa_crypto.c (MIT notice kept); [V] its own host test
+  (tools/wpa-test, reference AP in Python cryptography, ASan/UBSan) on the port: 195 checks, 0 failed. Keys by
+  WMI_VDEV_INSTALL_KEY after message 4 left; no MFP, no TKIP group, no WPA3.
+- None of 0326-0329 has run on the phone; the DMA path needs `negroniwlan_smmu=3` (bank probe) or another IOVA answer.
+- 0325 rework after the SMMU agent's panic decode (FAR = GR1 CBAR(74), a stage-2 bank): banks from MAX(IDR1.NUMS2CB, 1),
+  skip 0249 probe verdicts READ_ABORT/CLAIM_REFUSED/OURS, try-reads and claim writes through 0297 negroni_mmio_try_rd32/wr32
+  (a refusal skips the bank), no CBAR/CBA2R write-back on teardown, TLB sync 500 ms, default still negroniwlan_smmu=1.
+- [V] Kernel out/kernel/local-20261026-213256 (sha256 80017d10...3d141c5e) has 0325 (rework) + 0326-0329 with 0249/0297/0363:
+  257 patches applied, only the 4 dxb skips; kernel.macho points to it. objdump: negroni_wlan_smmu_on calls
+  negroni_mmio_try_rd32 5 times and negroni_mmio_try_wr32 3 times (scan reads, claim writes and read-backs).
 
 ## 38. Camera + audio DMA addressing, iOS camera stream (2026-10-27, kernel agent; patches 0249, 0317, 0318; details: patches/xnu/README-camera.md "0317, 0318 and 0249", plan docs/camera-ios-2026-10-27.md)
 
@@ -2602,8 +2618,8 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   active, Apple/Linux meaning), PD `BATT_STATUS` when the ADSP charger PD is up; `AdapterDetails` Watts/Current/
   AdapterVoltage measured, `FamilyCode` from PD `USB_ADAP_TYPE` (id 7 on OPLUS; HakiOS uses id 6 `USB_TYPE` on its
   Poco firmware); `Amperage` filtered, times to full/empty. New log line `NEGRONI BATTERY: charge: ...`.
-- Build: out/kernel/local-20261026-210122/kernel.development.negroni sha256
-  76421ecaf704b4b27f1da5ac0854f92f334ef4c4686c6f3e7a0f58fecb1bdfed (248 applied incl. 0363-0365, only the 4 dxb
+- Build: out/kernel/local-20261026-213038/kernel.development.negroni sha256
+  127cae2a976695d78131e9116be18f99daa601010f80aa4520b8de9698ac9c7c (after the review fixes B1, C1-C3, C5) (257 applied incl. 0363-0366, only the 4 dxb
   skips). Not run on the phone; no image built. Test with `scripts/ios16/variants/everything.args` (needs
   `negronibatt=5` for VBUS/iin); fallback `negronifb_modes=0`.
 
@@ -2622,9 +2638,13 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   IDLE, property-only IO80211Controller + IONetworkInterface, worker thread, KEV_DL_LINK_ON/OFF, soft radio switch,
   fake radio `negroniwlan_ios=2`. 0341: Apple80211 gets/sets + class-6 events (HakiOS layouts, 16.5). Port of HakiOS
   APSL 2.0 files, notices kept. Numbering 0340-0345 = Wi-Fi iOS side (main session).
-- Build: out/kernel/local-20261026-210736/kernel.development.negroni sha256
-  249afbcc6f2a06bf59e90c969d3d686e607b15f261d7a930f7ba9dfe9c1cc5b5 (251 applied incl. 0326, 0327, 0340, 0341; only the
-  4 dxb skips; link out/kernel/kernel.macho). Not run on the phone; no image built.
+- Opus review REJECT -> fixed: join sequence number + one state-based reconcile (no bit-order decisions; network
+  switch ends up on the new BSS), 40 s join time-out (ETIMEDOUT), en0 down on driver FAILED/OFF, SSID not logged,
+  root only for sets and gets 1/9/11/103 ([V] wifid has no UserName = root), RX in one 2 KiB cluster mbuf (ue0
+  pattern; mbuf_allocpacket panicked on this phone). README-wifi.md "0340-0341" item 8.
+- Build: out/kernel/local-20261026-212322/kernel.development.negroni sha256
+  df262c5674234271c161e1cb03d9862f9baed459f996603a42191ea959122316 (254 applied incl. 0326, 0327, 0340, 0341; only
+  the 4 dxb skips; link out/kernel/kernel.macho). Not run on the phone; no image built.
 - Test: first `negroniwlan_ios=2` (UI only: 3 fake networks, passphrase `negronifake`), then everything.args.
   Expect `NEGRONI WLAN iOS: ... IODeviceTree "wlan" made`, `en0 attached`, `wifid gets/sets ...` lines, and the
   180 s per-type summary (the list of requests still refused).
@@ -2684,11 +2704,19 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   negroniusb_resetend=0, negroniusb_events=0, negroniusb_phycfg=0.
 - [I] Not done: the ADSP may also want a UCSI client (pmic_glink owner 32779) on PMIC_RTR_ADSP_APPS. Linux
   ucsi_glink answers it; we do not. If the re-attach repeats after the ADSP comes up, look there next.
-- Build: out/kernel/local-20261026-211915/kernel.development.negroni sha256
-  fc74bf13c70df36a89bb0cb042b390f536e0acb77627b58d5879dd8450aca411 (253 applied incl. 0366; only the 4 dxb
+- [V] Phone 02:55 (first 0366 build): boot lines OK (GUSB2PHYCFG -> 0x00102400, DEVTEN 0x25f, en10 up, 36 MB/s).
+  ADSP up 02:55:44, Mac lost the device 02:55:46 and saw no USB device at all afterwards: nothing for a reconnect
+  to talk to. [I] The ADSP (VOOC / Type-C data-line switch) takes the lines; another agent investigates.
+- Opus review ACCEPT with fixes, applied: 1 ms after each ENDTRANSFER (also the 0360 panic TX timeout), ep0/1 end
+  with CMDIOC and no FORCERM, 50 ms after the core soft reset, fallbacks restore the old paths (notification end and
+  the resetdrop=0 reset branch gated), the event rule once per episode, 30 s period at once while configured in L2,
+  default negroniusb_events=1 (DEVTEN 0x257, no link state change events).
+- Build (with the review fixes): out/kernel/local-20261026-213752/kernel.development.negroni sha256
+  512a2c450ab79f05a963c442eddafd30d2d941fe42a680d05bc4f75e157f5859 (258 applied incl. 0366; only the 4 dxb
   skips; link out/kernel/kernel.macho). Not run on the phone; no image built.
-- Test: unplug 10 s, replug: expect `no SOF for 3 s`, `soft reconnect #1`, then `bus reset`, `connected`,
-  `configured (1)`, `SOF again after N ms`; en10 back within 5 s of the replug (worst case ~7 s).
+- Test: unplug 10 s, replug: expect `no SOF for 3 s`, then `bus reset`, `connected`, `configured (1)`,
+  `SOF again after N ms`, or `soft reconnect #1 ...: device event without SOF` 1 s after the replug; en10 back
+  within ~3 s of the replug. Link 4/5 instead of 3: `soft reconnect` every 5 s while unplugged.
 
 ## 44. Phone proofs 2026-10-27 02:40-02:51 (main session; boot_a = out/ios16-safe, tests RAM-booted)
 
@@ -2702,3 +2730,96 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   drives the controller over com.apple.uart.bluetooth (LE commands 0x2060/0x202f/0x2031/0x2024/0x201c/0x200f/0x204a/
   0x2074 all Command Complete status 0 at 02:50:07). Battery line `external=1 charging=1` (0365). backboardd
   `GetBlock 0x40 ... current mode (colour 1, timing 1)` (0364). wifid/configd query en0 (0340/0341, fake radio mode).
+
+## 43. Passcode: software keybag in the AppleKeyStore stand-in (2026-10-27, kernel agent; patch 0221-negroni-aks-passcode, details patches/xnu/README-aks-amfi.md "0221 passcode")
+
+- Owner: "passcodes can't be turned on at all". [V] keybagd sets a passcode with libaks selector 15
+  (`aks_change_secret`), then 3 save, 5 set_system, 105 epilogue, 4 unload, 87 invalidate; 0220 answered 15 with
+  kIOReturnUnsupported and always reported "no passcode" (MC `isPasscodeSet` = `MKBGetDeviceLockState() != 3`).
+  No log has a `sel 15` line, so where the owner's try stopped is not known [I].
+- [V] Full selector map with scalar/struct shapes from the 20H392 cache + keybagd/profiled/MobileKeyBagLockState
+  disassembly (`ipsw dyld disass --image AppleKeyStore|MobileKeyBag|ManagedConfiguration`, root image attached
+  read-only); table in the README. Gotchas: passcodes are user pointers in scalars (copyin); keybagd loads
+  systembag.kb only when selector 14 answers 0xe00002f0, and a load failure = `FATAL KEYBAG ERROR` + reboot;
+  lock/unlock events are interest messages 0xe3ffd00d (lock_status) / 0xe3ffd00f (first_unlock) for
+  MobileKeyBagLockState.plugin; wrong passcode = 0xe00002e2.
+- 0221: PBKDF2-HMAC-SHA256 (20000 iterations, random salt, own HMAC on the kernel SHA256_*), 128-byte blob that
+  keybagd keeps in systembag.kb, lock state 0x1/0x4/0x5 and sls 0/1 with a passcode (0x6/3 without), grace period,
+  keybagd-only gate for bag-changing selectors. Fail-open everywhere: no file / foreign or damaged blob /
+  `negroniaks_reset=1` = no passcode. `negroniaks=3` = 0220 behaviour. Lock-screen gate only, no data protection.
+- Host test `scripts/kernel/test-aks-core.sh` (core header taken from the patch): all pass (RFC vectors, PBKDF2 vs
+  CommonCrypto, blob round trip, 128 corruptions refused). Fable review: ACCEPT WITH FIXES, F1-F3 applied.
+- Build: out/kernel/local-20261026-212112/kernel.development.negroni sha256
+  32093879e909256fb806aa2310a97044b79207af3d3f275766639a7e5d80f964 (254 applied; only the 4 dxb skips; link
+  out/kernel/kernel.macho). Not run on the phone; no image built. Owner test and recovery steps: README.
+
+## 45. apps-SMMU stage-1: SEA panic on the CBAR restore; writers default OFF; refusable accesses + bank probe (2026-10-27, SMMU kernel agent; patches 0249, 0297, 0317; details patches/xnu/README-camera.md "2026-10-27: panic ...")
+
+- [V] Panic photo, boot with 0249 (kernel local-20261026-210400): `Kernel data abort`, ESR 0x96000010 (SEA), FAR
+  0xfffffe3006c99128 = global page 1 + 0x128 = CBAR(74), pc in `undo()` at the CBAR restore after the tlb_sync loop.
+  Which setup step failed first is not known.
+- [V source] Linux sm8450 arm-smmu.c: stage-1 banks from IDR1.NUMS2CB up; CBAR 0x1f300; domain free writes SCTLR 0
+  only, never CBAR; TLB sync per context, 500 ms; no power vote. HakiOS (SM7325): lowest free bank (7/8 on hardware),
+  CBAR never restored. [I] Gunyah refuses an HLOS CBAR write of type S2_TRANS; our old helper (and 0325) wrote the
+  old type-0 CBAR back.
+- [V source] xnu `handle_kernel_abort` offers only VM faults to the CONFIG_XNUPOST expected-fault hook: an SEA can
+  not be caught without a patch. 0297 adds `negroni_mmio_try_rd32/wr32` (SEA at that one instruction -> -1).
+- Defaults now OFF: `negroniaudio_smmu` 0, `negronicam_smmu` 1 (opt-in 3), Wi-Fi `negroniwlan_smmu` 1 asked of 0325
+  (one line, Wi-Fi agent). The helper: refusable accesses, banks bottom-up from NUMS2CB, claim = test (skip on
+  refusal, no restore), teardown SCTLR 0 + TLB sync only, 500 ms sync with TBU/TCU ack lines.
+- Probe: `negronismmu_probe=1` (dormant banks get the same-value CBAR write) / `=2` (all banks); one
+  `NEGRONI SMMU PROBE: cb N ...` line per bank + summary lists. Next test: RAM boot with `negronismmu_probe=1` only.
+- Build: out/kernel/local-20261026-212617/kernel.development.negroni sha256
+  5dac8d75b51b4249489505626d14085ec3823b30caeabd6442cfab80e035963b (254 applied incl. 0249/0297/0317/0325; only
+  the 4 dxb skips; link out/kernel/kernel.macho). Not run on the phone; no image built.
+
+## 46. Boot log on userdata: the last 8 boots survive a lost USB link, a hang or a reset (2026-10-27, kernel agent; patch 0367, details patches/xnu/README-bootlog.md)
+
+- [V] Trigger today: a RAM-booted test image started the ADSP, the Mac lost the USB gadget 3 s later, nothing more
+  was seen; the phone reset and stayed at the Apple logo without USB. The USB live log was the only channel.
+- [V code] Before 0367: slop 0047/0121 kept a 4 MiB console ring and wrote it (only with `ufsrw=1`, every 10 s) to ONE
+  area at N-1025 ("SWEETLOG"), overwritten by the next boot within seconds. 0360's `negroni_log_panic` wrote the
+  panic log there only when that thread ran, with `delay()` and printf in the panic path.
+- 0367: new area N-28673 .. N-19458 (36 MiB, right below the WLAN area; NE2211 blocks 58643726 .. 58652941; HFS+
+  root ends at 4194304). Superblock "NEGRBLOG" + 8 slots x (header "NEGRBOOT" + 4 MiB ring). One slot per boot
+  (boot counter), flush every 1 s with new text (5 s heartbeat), SYNCHRONIZE CACHE each time. Always on
+  (`negronilog=0` = off), no `ufsrw=1` needed: a separate write gate allows only the area, set after the kernel
+  checked the HFS+ volume header (volume end <= area start). The old SWEETLOG area is no longer written.
+- Marks: SpringBoard seen (flag + uptime), panic (polled, lockless write from `negroni_log_panic`, 1 s command
+  timeout, first panic line in the header), halt/restart (platform expert), USB ctl reset/power off, resets from
+  the panic hold loop (`/ then: ...`). No mark = reset/hang/power loss; the last flush uptime says when.
+- Reset detector: the 0214 PON log dump now also gives `NEGRONI PON LOG: summary: pon=.. reset=.. type=..` (entries
+  before the last PON trigger = how the previous boot ended); stored in each slot header. [I] PS_HOLD covers both
+  our PSCI reset and a TZ watchdog bite; the boot log end mark separates them.
+- Read back: `op10tool ctl bootlog` (one line), `op10tool bootlog [N]` / `make bootlog` (UDP 5141 `bootlog read A C`,
+  pipelined, resends lost datagrams) -> `logs/bootlog-<boot>.txt` + one summary line per boot + last 5 lines;
+  SSH: `scripts/debug/bootlog-ssh.sh` (`/dev/negronibootlog`, root 0400); dumps: `op10tool bootlog --file`.
+- Layout files: `scripts/ios16/root-simg.sh` (AREAS=1: root must end below N-28673; embeds the superblock from
+  `op10tool bootlog --mkarea`), `scripts/fw/write-areas.sh` (layout comment; accepts NEGRBLOG as the N check).
+  No userdata reflash is needed: the area is in today's DONT_CARE space and the kernel formats it.
+- Host test [V]: `tools/op10tool/tests/bootlog-test.sh` (fake area: panic / clean / wrapped ring / bad CRC; and the
+  UDP path against a fake server with 10 % datagram loss: same text).
+- Build [V]: out/kernel/local-20261026-213526/kernel.development.negroni sha256
+  48ba234debdfb15c70f1d8802bb00883e0303634b5f5937c86707da50674b9ed (258 applied incl. 0367; only the 4 dxb skips;
+  link out/kernel/kernel.macho); strings show the NEGRONI BOOTLOG lines, NEGRBLOG/NEGRBOOT, negronibootlog,
+  `bootlog read`. op10tool rebuilt (out/bin/op10tool: `bootlog`, `ctl bootlog`). Not run on the phone; no image.
+- Next (owner): boot image with this kernel (no boot-arg change), then the test in README-bootlog.md: boot,
+  `op10tool ctl bootlog`, `op10tool ctl panic`, `op10tool ctl reboot`, after the next boot `make bootlog`.
+- Review fixes (Opus ACCEPT, F1-F4 + N2) and readable probe: 0297 `.alt_entry` on the instruction labels; helper
+  report/fsr/ON lines through the refusable accessors; SCTLR only after the claim; probe-REFUSED/CHANGED banks skipped.
+  [V] t4 RAM boot (03:01, negronismmu_probe=1): the EARLY_BOOT lines are not in `op10tool ctl log`. Now the text comes
+  again 60 s after boot (`negronismmu_probe_again`) and from `sysctl kern.negroni_smmu_probe` (root).
+- 0335 review fixes (A1 RX thread in dead mode, A2 no power-on loop, A3 partial frame reset, A4 Command Status
+  answers). 0336: the QCA6490 init gaps for bluetoothd. 0x0c6d gets a local status 0 (the chip answers 0x11).
+  0x0c5a/0x0c5b get local answers, and their bits are set in the 0x1002 mask: bluetoothd checks the mask locally,
+  which gave "status=628", then "HCI initialization failed" and restart reason 108. Details: README-bluetooth.md "0336".
+  Build: out/kernel/local-20261026-214005/kernel.development.negroni sha256
+  78bce8a5e31047414dabfd35e7f17a6dd4db3f6e42814bf6cf2af7af3c344619 (258 applied; only the 4 dxb skips).
+
+## 47. SMMU bank probe on the phone (2026-10-27 03:12, RAM test t5, kernel local-20261026-214005)
+
+- [V] `NEGRONI SMMU PROBE: level 1: 113 SMRs, 75 contexts, NUMS2CB 0, page 0x1000; IDR2 0x5111 sGFSR 0 ...; 6 of
+  113 SMRs valid`; `summary: 75 banks (stage-1 from 0): rewrite OK 0, REFUSED 69, ... 69 aborts caught`; banks 6..74
+  refuse a same-value CBAR write (SEA caught by 0297, no panic); banks 0..5 are in use (not tried).
+- [I] A same-value write keeps the stage-2 type (S2_TRANS) that Gunyah keeps for itself; Linux writes the stage-1
+  value 0x1f300. Next test: Wi-Fi with negroniwlan_smmu=3 (claim through the try-accessor, a refusal skips the bank).
