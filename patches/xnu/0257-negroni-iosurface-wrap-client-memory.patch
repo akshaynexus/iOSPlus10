@@ -1,0 +1,230 @@
+diff --git a/iokit/Kernel/arm/NegroniSurface.cpp b/iokit/Kernel/arm/NegroniSurface.cpp
+index 62473e2..9ffc09d 100644
+--- a/iokit/Kernel/arm/NegroniSurface.cpp
++++ b/iokit/Kernel/arm/NegroniSurface.cpp
+@@ -10,6 +10,9 @@
+  *   sel 0   create: scalar [parent id], struct in = serialized property
+  *           dictionary (binary or XML), struct out = lock result (0xa68)
+  *   sel 4   lookup by id: scalar [id], struct out = lock result
++ *   sel 6   wrap client image (0257): struct in 0x20 = u64 address, u32 width, height,
++ *           pixel format, bytes per element, bytes per row, u32 unused; struct out = lock result
++ *   sel 7   wrap client memory (0257): scalars [address, size], struct out = lock result
+  *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
+  *   sel 35  create mach port: scalars [id, options], scalar out [port name]
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+@@ -49,6 +52,8 @@
+ enum {
+ 	kNegroniSurfaceCreate             = 0,
+ 	kNegroniSurfaceLookup             = 4,
++	kNegroniSurfaceWrapClientImage    = 6,
++	kNegroniSurfaceWrapClientMemory   = 7,
+ 	kNegroniSurfaceLimits             = 13,
+ 	kNegroniSurfaceLookupFromPort     = 34,
+ 	kNegroniSurfaceCreatePort         = 35,
+@@ -106,6 +111,9 @@ NegroniSurface::free()
+ 		save = NULL;
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (wrapped && memory != NULL) {
++		memory->complete();     /* unwire the client's pages (negroni_surface_wrap_task_memory) */
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -535,6 +543,7 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	IOReturn addRef(NegroniSurface *s, NegroniSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(NegroniSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
++	IOReturn wrapClient(uint32_t selector, IOExternalMethodArguments *args);
+ 
+ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+@@ -875,6 +884,157 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	return ret;
+ }
+ 
++/*
++ * Make s's pixels the memory task already has at address (size bytes, page-aligned): the
++ * range is prepared (wired) for as long as the surface lives, as the GPU host import (0232)
++ * does, and every task that looks the surface up maps those same pages. Writable if the pages
++ * are; a picture that is only shown may be read-only (a mapped file). Cached in the kernel
++ * and in user mappings: the CPU wrote the pixels, and NegroniFramebuffer / NegroniGPU clean
++ * cached surfaces (kernelMapCache) before the display engine or the GPU reads them.
++ */
++static IOReturn
++negroni_surface_wrap_task_memory(NegroniSurface *s, task_t task, uint64_t address, uint64_t size)
++{
++	uint64_t length = round_page_64(size);
++	IOMemoryDescriptor *md = NULL;
++	IOReturn held = kIOReturnNoMemory;
++	for (int attempt = 0; attempt < 2 && held != kIOReturnSuccess; attempt++) {
++		OSSafeReleaseNULL(md);
++		md = IOMemoryDescriptor::withAddressRange(address, length,
++		    attempt == 0 ? kIODirectionInOut : kIODirectionOut, task);
++		held = md != NULL ? md->prepare() : kIOReturnNoMemory;
++	}
++	if (held != kIOReturnSuccess) {
++		OSSafeReleaseNULL(md);
++		return kIOReturnVMError;
++	}
++	s->memory = md;
++	s->wrapped = true;
++	s->mapCache = kIOMapDefaultCache;
++	s->kernelMapCache = kIOMapCopybackCache;
++	return kIOReturnSuccess;
++}
++
++/*
++ * IOSurfaceClientWrapClientImage (sel 6; iOS 16.7 IOSurface.framework, out/gpu/re/IOSurface.s:
++ * struct in of 0x20 bytes: +0 address, +8 width, +0xc height, +0x10 pixel format, +0x14 bytes
++ * per element (the framework derives it from the format), +0x18 bytes per row, +0x1c one more
++ * u32 the framework passes through) and IOSurfaceClientWrapClientMemory (sel 7: scalars
++ * address, size): a surface made of the caller's own memory, answered like a created one
++ * (lock result: pixels, state page, id, seed). CoreAnimation's GL renderer wraps page-aligned
++ * CPU images so (CA::Render::Image::retain_iosurface). A zeroed success answer here gave the
++ * framework a client with id 0 and no state page: backboardd SIGSEGV far 0x30 in
++ * IOSurfaceClientGetBulkAttachments (docs/notes.md 15a). Input the driver cannot use is
++ * refused (not success): the framework then returns NULL and its callers take their other path.
++ */
++IOReturn
++IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments *args)
++{
++	static uint32_t failed_logged;          /* one line per failure kind */
++	static uint32_t done_logged;            /* one line per selector */
++	uint64_t address, size;
++	uint32_t width, height, format = 0, bpe, bpr;
++	const char *why = NULL;
++	uint32_t kind = 0;
++	IOReturn ret = kIOReturnUnsupported;
++
++	if (selector == kNegroniSurfaceWrapClientImage) {
++		const uint8_t *in = (const uint8_t *)args->structureInput;
++		if (in == NULL || args->structureInputSize < 0x1c) {
++			why = "bad input size";
++			kind = 1;
++			goto fail;
++		}
++		memcpy(&address, in, 8);
++		memcpy(&width, in + 0x08, 4);
++		memcpy(&height, in + 0x0c, 4);
++		memcpy(&format, in + 0x10, 4);
++		memcpy(&bpe, in + 0x14, 4);
++		memcpy(&bpr, in + 0x18, 4);
++		if (width == 0 || height == 0 || width > NEGRONI_SURFACE_MAX_DIM || height > NEGRONI_SURFACE_MAX_DIM ||
++		    bpe == 0 || bpe > 64 || (uint64_t)bpr < (uint64_t)width * bpe) {
++			why = "bad image geometry";
++			kind = 2;
++			goto fail;
++		}
++		size = (uint64_t)bpr * height;
++	} else {
++		if (args->scalarInputCount < 2) {
++			why = "bad scalar count";
++			kind = 1;
++			goto fail;
++		}
++		address = args->scalarInput[0];
++		size = args->scalarInput[1];
++		width = (uint32_t)size;
++		height = 1;
++		bpe = 1;
++		bpr = (uint32_t)size;
++	}
++	if (address == 0 || size == 0 || size > NEGRONI_SURFACE_MAX_ALLOC || size > UINT32_MAX) {
++		why = "bad address or size";
++		kind = 3;
++		goto fail;
++	}
++	if (address != trunc_page_64(address)) {
++		why = "address not page-aligned";
++		kind = 4;
++		goto fail;
++	}
++	{
++		NegroniSurface *s = negroni_surface_alloc();
++		if (s == NULL) {
++			why = "no memory";
++			kind = 5;
++			ret = kIOReturnNoMemory;
++			goto fail;
++		}
++		ret = negroni_surface_wrap_task_memory(s, fTask, address, size);
++		if (ret != kIOReturnSuccess) {
++			s->release();
++			why = "cannot wire the client range";
++			kind = 6;
++			goto fail;
++		}
++		s->width = width;
++		s->height = height;
++		s->pixelFormat = format;
++		s->bytesPerElement = (uint16_t)bpe;
++		s->elementWidth = 1;
++		s->elementHeight = 1;
++		s->bytesPerRow = bpr;
++		s->offset = 0;
++		s->allocSize = (uint32_t)round_page_64(size);
++		s->planeCount = 0;
++		if (!negroni_surface_publish(s)) {
++			s->release();
++			why = "no free surface id";
++			kind = 7;
++			ret = kIOReturnNoResources;
++			goto fail;
++		}
++		if (!(done_logged & (1u << (selector & 31)))) {
++			done_logged |= 1u << (selector & 31);
++			char who[32];
++			proc_selfname(who, sizeof(who));
++			IOLog("NEGRONI SURF: wrap client memory sel %u: %ux%u bpr %u fmt 0x%x -> id %u (%s, %u bytes)\n",
++			    selector, width, height, bpr, format, s->id, who, s->allocSize);
++		}
++		ret = returnSurface(s, args);    /* takes the creator's user count */
++		s->release();
++		return ret;
++	}
++fail:
++	if (!(failed_logged & (1u << kind))) {
++		failed_logged |= 1u << kind;
++		char who[32];
++		proc_selfname(who, sizeof(who));
++		IOLog("NEGRONI SURF: wrap client memory sel %u refused: %s (%s, in %u bytes, %u scalars) -> 0x%x\n",
++		    selector, why, who, args->structureInputSize, args->scalarInputCount, ret);
++	}
++	return ret;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -893,6 +1053,10 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	}
+ 	case kNegroniSurfaceCreate:
+ 		return create(args);
++	case kNegroniSurfaceWrapClientImage:
++	case kNegroniSurfaceWrapClientMemory:
++		negroni_surf_log_once("sel", selector);
++		return wrapClient(selector, args);
+ 	case kNegroniSurfaceLookup: {
+ 		NegroniSurface *s = negroni_surface_copy((uint32_t)arg0);
+ 		IOReturn ret = kIOReturnNotFound;
+diff --git a/iokit/Kernel/arm/NegroniSurface.h b/iokit/Kernel/arm/NegroniSurface.h
+index dd3de81..69a45f7 100644
+--- a/iokit/Kernel/arm/NegroniSurface.h
++++ b/iokit/Kernel/arm/NegroniSurface.h
+@@ -60,8 +60,14 @@ public:
+ 	void                     *save;
+ 	uint32_t                  saveSize;
+ 	bool                      saved;
++	/*
++	 * Client memory (0257, IOSurfaceWrapClientImage / IOSurfaceWrapClientMemory): memory is a prepared
++	 * (wired) page-aligned range of the creator's task, completed by free(); never counted as wired
++	 * kernel memory. The CPU wrote the pixels, so the mappings are cached.
++	 */
++	bool                      wrapped;
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { wrapped = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */

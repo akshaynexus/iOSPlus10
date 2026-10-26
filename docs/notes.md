@@ -904,8 +904,8 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
     +0x10 format, +0x14 bytes per element, +0x18 bytes per row, +0x1c u32`), sel 7 scalars `address, size`; both
     answer 0xa68 bytes. Bad input returns kIOReturnUnsupported (never a zeroed success). Log once per selector
     `NEGRONI SURF: wrap client memory sel N: WxH bpr B fmt F -> id I`, once per failure kind `... refused: WHY`.
-    The eagl.c guard stays as the fallback. Kernel + image `out/ios16-0257` (sha256 in `logs/kernel-0257.log` and
-    `out/ios16-0257/SHA256SUMS`). Test when the phone is on: `scripts/gpu/phone-gl.sh backboardd`, `on`, `restart`;
+    The eagl.c guard stays as the fallback. Kernel `out/kernel/local-20261026-061605` (sha256 1e3bff08...), image `out/ios16-0257`
+    (boot_a 315fe415..., cmdline as 0256). Test when the phone is on: `scripts/gpu/phone-gl.sh backboardd`, `on`, `restart`;
     pass = a `wrap client memory sel 6` line, no `IOSurface wrap of client memory refused` line, no far 0x30 crash.
   - [V] `gl-build` exit 0: stripped negronigl.dylib 14,214,624 bytes, sha256 e527b636...; backboardd unchanged
     (39cb14d1...); check-imports PASS (0 missing). Not run on the phone yet.

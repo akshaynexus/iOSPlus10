@@ -472,6 +472,58 @@ usual dxb skips), image `out/ios16-0256` (boot_a sha256 57c6cc5a..., config cmdl
 (boot_a a3d456cf..., kernel local-20261025-214340, no `negronifb_clockshift`). Not flashed: the phone was in a
 brownout reboot loop (empty battery) when they were built.
 
+### 0257: IOSurface wrap of client memory (selectors 6 and 7)
+
+Cause (docs/notes.md 15a, 2026-10-25 23:46): CoreAnimation's GL renderer wraps a page-aligned CPU
+image with `IOSurfaceWrapClientImage` (`CA::Render::Image::retain_iosurface`). IOSurface.framework
+calls IOSurfaceRoot selector 6 (WrapClientImage) or 7 (WrapClientMemory) and expects the lock result
+(0xa68 bytes, the same struct selectors 0/4/34 answer). The slop 0046 user client sent 6 and 7 to its
+default case: success with a zeroed struct. The framework then built a client with id 0, size 0 and
+a NULL state page, and `IOSurfaceClientGetBulkAttachments` crashed backboardd (far 0x30).
+
+Input layouts [V, out/gpu/re/IOSurface.s `_IOSurfaceClientWrapClientImage` 0x1a3986580 and
+`_IOSurfaceClientWrapClientMemory` 0x1a3986834, 20H392]:
+- Selector 6: struct input of 0x20 bytes, no scalars: `+0 u64 address` (x5), `+8 u32 width` (w0),
+  `+0xc u32 height` (w1), `+0x10 u32 pixel format` (w2), `+0x14 u32 bytes per element` (w8: the framework
+  derives it from the format by a table: 1, 2, 4, 8 or 16; 'BGRA' = 4 [V], 'RGfA' = 16 [I]), `+0x18 u32 bytes
+  per row` (w3), `+0x1c u32` (w4, passed through; unused here). Output: lock result, 0xa68 bytes.
+- Selector 7: two scalars `address, size`, no struct input. Output: lock result, 0xa68 bytes.
+- On a non-zero return the framework returns NULL at once (no trap, no client). On success it builds
+  the client (`_ioSurfaceClientCreateWithLockResult`); if that fails it calls trap 5 (release failed)
+  with the id at lock result +0x18.
+Same layouts in bergamota `0120-topaz-sweetsurface-client-memory.patch` (ios-spes NOTES.md "unhandled
+IOSurface selector 6").
+
+What 0257 does (`0257-negroni-iosurface-wrap-client-memory.patch`, NegroniSurface.cpp/.h):
+- `wrapClient()` parses the input as above, requires address != 0 and page-aligned, size (bpr x height
+  for 6) 1..256 MiB, width/height 1..16384, bpe 1..64, bpr >= width x bpe. The range is wrapped like the
+  GPU host import of 0232: `IOMemoryDescriptor::withAddressRange(address, round_page(size), InOut, task)`
+  + `prepare()` (wired for the surface's life; a second try with `kIODirectionOut` for read-only pages),
+  `complete()`d in `NegroniSurface::free()` (`wrapped`). The surface is published with a new id, geometry
+  from the input (sel 7: width = size, height 1, bpe 1, bpr = size, format 0), offset 0, no planes, and
+  answered with `returnSurface()`: the same lock result as a created surface (pixels mapped into the
+  task at a new address, state page, id, seed).
+- Cache: `mapCache` = default (cached) and `kernelMapCache` = copyback like backboardd's slot surfaces:
+  the CPU wrote the pixels; the framebuffer and the GPU paths clean cached surfaces before a read.
+  Not counted in `negroni_surface_wired` (the pages belong to the task).
+- Input the driver cannot use returns `kIOReturnUnsupported` (bad size/count, geometry, address, alignment),
+  `kIOReturnVMError` when the range cannot be wired, `kIOReturnNoMemory` / `kIOReturnNoResources` for the
+  surface object / id: never success with a zeroed struct. The framework then returns NULL and
+  `retain_iosurface` keeps the image without an IOSurface (the path the eagl.c guard forced).
+- The default case is unchanged (other unknown selectors still get a zeroed success).
+- Log: once per selector `NEGRONI SURF: wrap client memory sel N: WxH bpr B fmt F -> id I (proc, bytes)`,
+  once per failure kind `NEGRONI SURF: wrap client memory sel N refused: WHY (proc, in X bytes, Y scalars)
+  -> 0x...`, plus the usual `NEGRONI SURF: proc sel 6`.
+
+Build (2026-10-26 06:16, full patch set, the 4 usual dxb skips): kernel `out/kernel/local-20261026-061605`
+(sha256 1e3bff08aa9d2483d0d7c39785c1af38502e383b0cc582070d1b52c0b942f023, 0257 applied), image `out/ios16-0257`
+(boot_a 315fe41507b22b47fbe6b7a98fe85761c054bf8608dc51df3021e56d693ad7e8, same cmdline as `out/ios16-0256`).
+Not flashed: the phone was off (flat battery).
+
+Test (GL path, phone on): `scripts/gpu/phone-gl.sh backboardd`, `on`, `restart`. Pass: a `wrap client memory
+sel 6` line, no `negronigl: IOSurface wrap of client memory refused` line (userland/negronigl/eagl.c, the
+guard stays in as a fallback) and no backboardd crash with far 0x30.
+
 ## 13. ios-spes deltas (kernel work the GL path needs; plan only, nothing built here)
 
 Reference: `external/ios-spes` (SM6225, A610, same 20H392 root). Its UI runs on GL at a frame median of

@@ -68,6 +68,12 @@ Status date: 2026-10-25.
   Patch 0256: shift after the fence (deferred to a later tick when needed), 120 rows (44 pt status bar),
   `negronifb_clockrows=N`. Images `out/ios16-noshift` (control, no shift) and `out/ios16-0256`. Visual check: owner.
 
+- IOSurface wrap of client memory (2026-10-26, patch 0257, README-gpu-kernel.md section 12 "0257"): IOSurfaceRoot
+  selectors 6/7 (WrapClientImage/WrapClientMemory, CoreAnimation's GL renderer) wrap the caller's page-aligned memory
+  as a cached surface and answer the normal lock result; bad input returns kIOReturnUnsupported instead of a zeroed
+  success (the backboardd far 0x30 crash of notes 15a). Built: `out/ios16-0257`. Not flashed (phone off). Test: the GL
+  path (`scripts/gpu/phone-gl.sh backboardd/on/restart`), no `IOSurface wrap of client memory refused` line.
+
 - Power off (2026-10-26, patch 0214): "Shut down" and `op10tool ctl poweroff` rebooted because PSCI SYSTEM_OFF only
   drops PS_HOLD and the PMK8350 PS_HOLD reset type was a reset [V, log timing]; 0214 sets the type SHUTDOWN
   first (PON GEN3 registers +0x52/+0x53; 0211 used +0x5a/+0x5b) and prints the PMIC PON log at boot. Built; phone
