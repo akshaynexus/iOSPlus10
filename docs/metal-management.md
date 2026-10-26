@@ -94,6 +94,17 @@ Every refused buffer, texture, library, render or compute pipeline is logged onc
 options 0: `buffer length N options 0x1 (made again with options 0x0): <first reason>`. The plugin's MPS line
 `MPS feature flags = NO (NegroniMetal A730 answer): ...` lists the MetalPerformanceShaders feature selectors answered NO.
 
+### WebGL in Safari (flame/0014 + flame/0015, 2026-10-27)
+WebGL runs in `com.apple.WebKit.GPU` through ANGLE's Metal back end (`libANGLE-shared.dylib`). Two things of ours blanked every
+canvas (docs/metal-webgl-2026-10-27.md): ANGLE's `IsMetalRendererAvailable` asks `supportsFeatureSet:4` and the frontend answered NO
+to every feature set (0014: answered from `supportsFamily:`), and ANGLE's render passes use resolve textures, late store actions and
+the LOD-clamp sampler selectors (0015: bridge + frontend). Tools: `scripts/net/phone-open-url.sh URL` opens a page in Safari over SSH,
+`scripts/metal/webgl-test.sh` serves a probe page from the Mac and prints what the page reports (context, renderer, pixels, frame
+time), `scripts/metal/angleprobe.sh` runs the ANGLE path as a root CLI (metal.log shows every refusal). A WebGL failure shows up as
+metal.log `MISSING NBRenderEncoder -<selector>` + `uncaught exception` (a selector to add), `command buffer refused: renderCommandEncoder:
+... RenderPass(...)` (a pass feature the bridge does not carry), or a `GPUProcessProxy::didBecomeUnresponsive` line in the unified log
+(Safari kills the GPU process after a hang; `ps -A | grep WebKit.GPU` shows a new pid).
+
 ### Protocol conformance and uncaught exceptions (flame/0012, 2026-10-26)
 At device creation the frontend adopts the 20 public Metal protocols for its classes and logs `native-metal: Metal protocols
 adopted by 20 of 20 frontend classes`. MetalPerformanceShaders checks `conformsToProtocol:@protocol(MTLCommandBuffer)` and
@@ -210,7 +221,7 @@ The installed **XNUtils** app (`/Applications/XNUtils.app`) displays:
 
 ## 4. On-phone test plan (2026-10-26, audit follow-up; the phone ran Android when this was written)
 
-Inputs: Metal bundle `out/metal/stage` (NegroniMetal sha256 7473f41b99b41c4faca0ec957084b3bb1f9010cbd4fd72e55f2be4dfa35ed628, flame/0001-0013, dSYM
+Inputs: Metal bundle `out/metal/stage` (NegroniMetal sha256 4ce4478477faef64c265c5a3aa393f49d1bcc90fc7434d6e3a8dcd13512222fa with flame/0014-0015, 2026-10-27; before: 7473f41b99b41c4faca0ec957084b3bb1f9010cbd4fd72e55f2be4dfa35ed628, flame/0001-0013, dSYM
 `out/metal/NegroniMetal.dSYM`), GL stage `out/gpu/stage` (2026-10-26, `RedwoodWaitsForGPU` check), kernel image
 `out/ios16-gl2` (0289). Every step: start `make usblog` first (kernel log in `logs/usblog-*.txt`), and keep
 `scripts/net/phone-log.sh tail` running in a second tmux window for the crash reports. Mark each result in docs/notes.md

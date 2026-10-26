@@ -2348,3 +2348,31 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   `dead-man: strike cleared (first command buffer completed ...)`, pipelines 17 / 6 compiled, 0 failed; FB STAT
   shows gpu presents. GL apps gate `* -backboardd`. bluetoothd crashes ("Bluetooth fatal error", reason 1201) in a
   boot without negronibt: the root's bluetoothd job has no transport then (expected).
+
+## 31. Safari WebGL blank canvas fixed (2026-10-27, Metal agent; flame/0014 + flame/0015; full story docs/metal-webgl-2026-10-27.md)
+
+- [V] WebGL on 20H392 runs in `com.apple.WebKit.GPU` (ANGLE Metal back end, `libANGLE-shared.dylib` in WebCore.framework). WebContent
+  never asks for a Metal device. The GPU process gets our device (clients `*`), so the clients gate was not the cause.
+- [V] Cause 1: `angle::IsMetalRendererAvailable()` = `MTLCreateSystemDefaultDevice()` + `[device supportsFeatureSet:4]`
+  (MTLFeatureSet_iOS_GPUFamily3_v1), cached in a static per process. The frontend answered NO to every feature set -> no EGL display ->
+  `getContext('webgl')` gives an object whose every call answers null (context lost at creation). Fix flame/0014: `supportsFeatureSet:`
+  answered from `supportsFamily:` (iOS set 0..16 -> Apple family 1..5).
+- [V] Cause 2 (after 0014): ANGLE's passes use `resolveTexture` (MSAA default framebuffer, depth resolved in the pass; the frontend dropped
+  it -> `RenderPass(ResolveWithoutTexture(Depth))` refusal), late store actions (`MTLStoreActionUnknown` + `set*StoreAction:` at
+  endEncoding) and the LOD-clamp sampler selectors (`setFragmentSamplerState:lodMinClamp:lodMaxClamp:atIndex:` -> `MISSING` ->
+  NSInvalidArgumentException -> GPU process gone). Fix flame/0015: bridge (`NmbPassAttachment.resolve_*`, `nmb_render_set_*_store_action`)
+  + frontend selectors. The bridge struct grew: bridge and plugin rebuilt together (`build-bridge.sh` incremental 6 s).
+- [V] Result: WebGL 1 + 2 contexts, correct pixel read-back, three.js keyframes example runs (presents/s 4-11, 105 ANGLE pipelines,
+  GPU pid stable, no crash). Plugin sha256 `4ce44784…22fa` on the phone (pushed, no reboot). `host-plugin-test.sh`: 0 failed.
+- [V] Pipeline compiles on our device are slow: 0.1-1.2 s per ANGLE render pipeline (`pipelines.log` R lines, samples=4): a heavy page
+  spends its first seconds compiling. Shader cache warms the second load (probe page 60 frames: 6.5 s cold -> 1.5 s warm for WebGL 2).
+- [V] Symbolication recipe for libANGLE frames in metal.log backtraces: `ipsw dyld macho DSC libANGLE-shared.dylib --loads` gives the
+  __TEXT base (0x1ce2b5000 in the 20H392 cache), add the `+ offset` of the frame, `ipsw dyld a2s DSC ADDR`. `ipsw dyld extract` +
+  `--symbols` lists the objc_msgSend$selector stubs a dylib uses (which selectors a client sends our device).
+- [V] New tools: `scripts/net/phone-open-url.sh URL` (uiopen, opens Safari over SSH, no tap), `scripts/metal/webgl-test.sh` (probe page
+  served from the Mac over the USB link, results reported back), `scripts/metal/angleprobe.sh` (the ANGLE path as a root CLI).
+- [V] Upstream metal2vulkan: 688 commits after our pin 720ef1ce (master = development = f6a96b7d, 2026-10-26); heavy churn in every file
+  our m2v patches touch (render.rs 70, command_buffer 65, device 43). Not rebased: the blank canvas was ours; the runtime at the pin
+  already has late store actions and resolve attachments.
+- [I] Next WebGL items: frame rate on real pages (pipeline compile time; `samples=4` passes on every WebGL canvas with antialias),
+  WebGPU (`webgpu.github.io/webgpu-samples`) untested, `Safari` screen content not seen from the Mac (owner checks).

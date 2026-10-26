@@ -1,0 +1,53 @@
+<!doctype html>
+<!-- WebGL probe page for the phone (scripts/metal/webgl-test.sh serves it from the Mac over the USB link).
+     Makes a WebGL1 + WebGL2 context, reads RENDERER/VENDOR, draws one red triangle, reads the pixels back and
+     reports every result to the server as a GET /report?... line (no tap needed, no screen needed). -->
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>WebGL probe</title></head>
+<body style="background:#223;color:#eee;font:16px monospace">
+<canvas id="c" width="256" height="256" style="width:256px;height:256px;border:1px solid #fff"></canvas>
+<pre id="out"></pre>
+<script>
+var out = document.getElementById('out');
+function report(s) { out.textContent += s + "\n"; var i = new Image(); i.src = '/report?' + encodeURIComponent(s) + '&t=' + Date.now(); }
+window.onerror = function (m, u, l) { report('onerror ' + m + ' @' + l); };
+function probe(kind) {
+  var c = kind === 'webgl2' ? document.createElement('canvas') : document.getElementById('c');
+  c.width = 256; c.height = 256;
+  var gl = null, err = '';
+  c.addEventListener('webglcontextcreationerror', function (e) { err = e.statusMessage || 'creationerror'; });
+  c.addEventListener('webglcontextlost', function (e) { report(kind + ' EVENT webglcontextlost "' + e.statusMessage + '"'); });
+  try { gl = c.getContext(kind, {preserveDrawingBuffer: true}); } catch (e) { err = String(e); }
+  if (!gl) { report(kind + ' context=null ' + err); return; }
+  report(kind + ' lost=' + gl.isContextLost() + ' error=' + gl.getError() + ' attrs=' + JSON.stringify(gl.getContextAttributes()) + ' exts=' + (gl.getSupportedExtensions() || []).length + ' drawingBuffer=' + gl.drawingBufferWidth + 'x' + gl.drawingBufferHeight);
+  if (gl.isContextLost()) return;
+  var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+  var r = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  var v = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+  report(kind + ' context=ok renderer="' + r + '" vendor="' + v + '" version="' + gl.getParameter(gl.VERSION) + '" glsl="' + gl.getParameter(gl.SHADING_LANGUAGE_VERSION) + '"');
+  var vs = gl.createShader(gl.VERTEX_SHADER), fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(vs, 'attribute vec2 p; void main(){ gl_Position = vec4(p,0.0,1.0); }');
+  gl.shaderSource(fs, 'precision mediump float; void main(){ gl_FragColor = vec4(1.0,0.0,0.0,1.0); }');
+  gl.compileShader(vs); gl.compileShader(fs);
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) report(kind + ' vs compile FAIL ' + gl.getShaderInfoLog(vs));
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) report(kind + ' fs compile FAIL ' + gl.getShaderInfoLog(fs));
+  var pr = gl.createProgram(); gl.attachShader(pr, vs); gl.attachShader(pr, fs); gl.linkProgram(pr);
+  if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) { report(kind + ' link FAIL ' + gl.getProgramInfoLog(pr)); return; }
+  gl.useProgram(pr);
+  var b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, 0,1]), gl.STATIC_DRAW);
+  var loc = gl.getAttribLocation(pr, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  gl.clearColor(0, 0, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  var px = new Uint8Array(4), px2 = new Uint8Array(4);
+  gl.readPixels(128, 100, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);     // inside the triangle: red
+  gl.readPixels(2, 250, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px2);      // corner: blue clear
+  report(kind + ' draw center=' + Array.from(px).join(',') + ' corner=' + Array.from(px2).join(',') + ' glError=' + gl.getError() + ' lost=' + gl.isContextLost());
+  var frames = 0, t0 = performance.now();
+  function tick() { gl.clear(gl.COLOR_BUFFER_BIT); gl.drawArrays(gl.TRIANGLES, 0, 3); if (++frames < 60) requestAnimationFrame(tick); else report(kind + ' 60 frames in ' + Math.round(performance.now() - t0) + ' ms lost=' + gl.isContextLost()); }
+  requestAnimationFrame(tick);
+}
+report('ua=' + navigator.userAgent + ' dpr=' + devicePixelRatio);
+try { probe('webgl'); } catch (e) { report('webgl threw ' + e); }
+try { probe('webgl2'); } catch (e) { report('webgl2 threw ' + e); }
+setTimeout(function () { var g = document.getElementById('c').getContext('webgl'); report('after 3 s: lost=' + (g && g.isContextLost()) + ' renderer=' + (g && g.getParameter(g.RENDERER))); }, 3000);
+</script></body></html>

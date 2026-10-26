@@ -1,0 +1,35 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (on top of flame/0001-0013), applied by scripts/metal/fetch-sources.sh:
+supportsFeatureSet: answered from supportsFamily: instead of a flat NO. WebKit's ANGLE Metal back end (20H392
+libANGLE-shared.dylib, angle::IsMetalRendererAvailable, called by egl::Display::GetDisplayFromNativeDisplay before
+rx::CreateMetalDisplay) creates the system device and asks `[device supportsFeatureSet:4]` (MTLFeatureSet_iOS_GPUFamily3_v1)
+once per process; on NO it makes no EGL display, WebKit's GraphicsContextGL creation fails and every WebGL context in
+Safari is lost at creation (blank canvas; docs/metal-webgl-2026-10-27.md, found with scripts/metal/angleprobe.sh).
+Each iOS feature set (values 0..16 of MTLDevice.h) stands for one iOS GPU family (1..5); the answer is
+supportsFamily:MTLGPUFamilyApple<N>, so the legacy query says the same as the modern one (Apple1-3 YES with the journaled
+F-line waivers, Apple4/5 as the bridge answers). macOS (10000+) and tvOS (30000+) sets stay NO.
+
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index 3dd5185..5092753 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -1782,9 +1782,17 @@ - (BOOL)isLowPower {return NO;}
+ - (BOOL)isRemovable {return NO;}
+ - (BOOL)isHeadless {return NO;}
+ // supportsFamily: and the other queries the runtime answers are installed from it (installAnswers); supportsFamily: also answers the target
+-// hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). No legacy feature set is claimed: the
+-// base implementation reads Apple tables this device does not have.
+-- (BOOL)supportsFeatureSet:(MTLFeatureSet)set {(void)set;return NO;}
++// hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). The base implementation of the legacy
++// supportsFeatureSet: reads Apple tables this device does not have, so it is answered here from supportsFamily: (NegroniMetal flame/0014):
++// an iOS feature set stands for one iOS GPU family (MTLFeatureSet_iOS_GPUFamilyN_vM -> MTLGPUFamilyAppleN), and the answer is the family's.
++// WebKit's ANGLE (20H392 libANGLE-shared, angle::IsMetalRendererAvailable) asks supportsFeatureSet:4 (iOS_GPUFamily3_v1) once per process
++// and makes no EGL display on NO: every WebGL context in Safari was lost at creation (docs/metal-webgl-2026-10-27.md).
++// macOS (10000+) and tvOS (30000+) sets stay NO.
++- (BOOL)supportsFeatureSet:(MTLFeatureSet)set {
++ static const uint8_t iosFamily[17]={1,2,1,2,3,1,2,3,1,2,3,4,1,2,3,4,5};   // MTLFeatureSet_iOS_GPUFamily{1_v1..5_v1} = 0..16 (MTLDevice.h)
++ if((NSUInteger)set>16)return NO;
++ return [(id<MTLDevice>)self supportsFamily:(MTLGPUFamily)(1000+iosFamily[set])];   // MTLGPUFamilyApple1 = 1001 (the methods are copied onto the device class)
++}
+ // The original discovery (_MTLAddDevice) runs these four on every device it registers. The target's own versions fill the base class's limits
+ // and feature tables from a hardware profile (`featureProfile`, `indirectArgumentBufferCapabilities`, a table of Apple GPUs) that this device
+ // has not got: running them would claim an Apple GPU's capabilities. They are empty here, so a limit or feature the runtime measured is answered

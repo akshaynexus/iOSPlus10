@@ -1,0 +1,220 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (on top of flame/0001-0014), applied by scripts/metal/fetch-sources.sh:
+the render-pass pieces WebKit's ANGLE Metal back end (20H392 libANGLE-shared.dylib) uses for WebGL, missing before
+(docs/metal-webgl-2026-10-27.md; found with scripts/metal/angleprobe.sh and the Safari GPU process log):
+1. Bridge (NativeMetalObjects.h/.rs): NmbPassAttachment carries the multisample resolve target (resolve_texture/_level/_slice/
+   _depth_plane -> the runtime's resolve_* fields; before: dropped, so ANGLE's MSAA framebuffer pass was refused as
+   RenderPass(ResolveWithoutTexture(Depth))), and three late store-action calls nmb_render_set_{color,depth,stencil}_store_action
+   over the runtime's set_*_store_action (ANGLE begins every pass with MTLStoreActionUnknown and decides at endEncoding).
+   The struct grows at the end (repr(C) on both sides); bridge and plugin are built from the same tree.
+2. Frontend: the pass attachment lambda passes the resolve texture (retained with the pass, IOSurface resolve targets counted as
+   written); NBRenderEncoder gets setColorStoreAction:atIndex:, setDepthStoreAction:, setStencilStoreAction: (the *Options: forms
+   are no-ops), the ...SamplerStates:withRange: forms and the LOD-clamp forms ...SamplerState:lodMinClamp:lodMaxClamp:atIndex: /
+   ...SamplerStates:lodMinClamps:lodMaxClamps:withRange: on the render and compute encoders. ANGLE binds every sampler with the
+   LOD-clamp form (mtl::RenderCommandEncoder::endEncodingImpl replays it): the unimplemented selector was an
+   NSInvalidArgumentException that ended com.apple.WebKit.GPU (metal.log `MISSING NBRenderEncoder
+   -setFragmentSamplerState:lodMinClamp:lodMaxClamp:atIndex:`). The clamps are not in the bridge (the sampler's own lod_min/lod_max
+   are used); a narrowing clamp is logged once.
+
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index 5092753..8893810 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -718,6 +718,13 @@ - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)
+  if(texture && (texture.usage&MTLTextureUsageShaderWrite))[_commandBuffer wroteTexture:texture];   // NegroniMetal: may be written
+  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
+ }
++// NegroniMetal (flame/0015): the per-binding LOD clamps of the ...SamplerState:lodMinClamp:lodMaxClamp:atIndex: forms. WebKit's ANGLE
++// binds every sampler with them (mtl::RenderCommandEncoder replays them at endEncoding), normally 0 .. FLT_MAX. The runtime's sampler
++// carries its own lod_min/lod_max (NmbSamplerDescriptor) and the bridge has no per-binding clamp: a narrowing clamp is logged once.
++- (void)lodClampMin:(float)lo max:(float)hi {
++ static std::atomic<bool> logged{false};
++ if((lo>0 || hi<FLT_MAX) && !logged.exchange(true))NBLOG(@"native-metal: per-binding sampler LOD clamp %g..%g ignored (the sampler's own range is used)",lo,hi);
++}
+ - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
+  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
+@@ -806,6 +813,13 @@ - (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NS
+  for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:0];
+ }
+ - (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:0];}
++- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:0];
++}
++- (void)setSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {[self lodClampMin:lo max:hi];[self sampler:s index:i stage:0];}
++- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])lo lodMaxClamps:(const float [])hi withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++){[self lodClampMin:lo[k] max:hi[k]];[self sampler:s[k] index:r.location+k stage:0];}
++}
+ - (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i {
+  [self check:nmb_compute_set_threadgroup_memory(self.handle,(uint32_t)n,(uint32_t)i) what:"setThreadgroupMemoryLength"];
+ }
+@@ -875,6 +889,29 @@ - (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withR
+ }
+ - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:1];}
+ - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:2];}
++// NegroniMetal (flame/0015): the range and LOD-clamp forms (WebKit's ANGLE: setFragmentSamplerState:lodMinClamp:lodMaxClamp:atIndex: on
++// every sampler bind; an unimplemented one was an NSInvalidArgumentException that ended the GPU process) and the late store actions
++// (ANGLE begins every pass with MTLStoreActionUnknown and decides at endEncoding).
++- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:1];
++}
++- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:2];
++}
++- (void)setVertexSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {[self lodClampMin:lo max:hi];[self sampler:s index:i stage:1];}
++- (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i {[self lodClampMin:lo max:hi];[self sampler:s index:i stage:2];}
++- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])lo lodMaxClamps:(const float [])hi withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++){[self lodClampMin:lo[k] max:hi[k]];[self sampler:s[k] index:r.location+k stage:1];}
++}
++- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])lo lodMaxClamps:(const float [])hi withRange:(NSRange)r {
++ for(NSUInteger k=0;k<r.length;k++){[self lodClampMin:lo[k] max:hi[k]];[self sampler:s[k] index:r.location+k stage:2];}
++}
++- (void)setColorStoreAction:(MTLStoreAction)a atIndex:(NSUInteger)i {[self check:nmb_render_set_color_store_action(self.handle,a,(uint32_t)i) what:"setColorStoreAction"];}
++- (void)setDepthStoreAction:(MTLStoreAction)a {[self check:nmb_render_set_depth_store_action(self.handle,a) what:"setDepthStoreAction"];}
++- (void)setStencilStoreAction:(MTLStoreAction)a {[self check:nmb_render_set_stencil_store_action(self.handle,a) what:"setStencilStoreAction"];}
++- (void)setColorStoreActionOptions:(MTLStoreActionOptions)o atIndex:(NSUInteger)i {(void)o;(void)i;}   // custom sample positions: not carried
++- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)o {(void)o;}
++- (void)setStencilStoreActionOptions:(MTLStoreActionOptions)o {(void)o;}
+ - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
+  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
+  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
+@@ -1176,6 +1213,16 @@ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)
+   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface){[_surfaces addObject:texture];[_writtenSurfaces addObject:(__bridge id)texture.surface];}
+   [_resourceOwners addObject:texture];
+   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
++  // NegroniMetal (flame/0015): the multisample resolve target goes to the runtime with the attachment (before: dropped, and a resolving
++  // store action was then refused as ResolveWithoutTexture). WebKit's ANGLE resolves its MSAA WebGL framebuffer (color + depth) this way.
++  out.resolve_texture=nullptr;out.resolve_level=out.resolve_slice=out.resolve_depth_plane=0;
++  if(a.resolveTexture) {
++   if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
++   NBTexture *resolve=(NBTexture *)a.resolveTexture;
++   if(resolve.surface){[_surfaces addObject:resolve];[_writtenSurfaces addObject:(__bridge id)resolve.surface];}
++   [_resourceOwners addObject:resolve];
++   out.resolve_texture=resolve.handle;out.resolve_level=a.resolveLevel;out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
++  }
+   return true;
+  };
+  for(unsigned i=0;i<8;i++) {
+diff --git a/phone/metal2/bridge/NativeMetalObjects.h b/phone/metal2/bridge/NativeMetalObjects.h
+index 469b977..16bb95e 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.h
++++ b/phone/metal2/bridge/NativeMetalObjects.h
+@@ -207,6 +207,10 @@ struct NmbPassAttachment {
+     NmbTexture *texture;
+     uint64_t level, slice, depth_plane, load, store;
+     double clear[4]; /* color, or clear[0] depth / stencil */
++    /* NegroniMetal (flame/0015): the multisample resolve target (MTLRenderPassAttachmentDescriptor resolveTexture/-Level/-Slice/
++     * -DepthPlane), or null. WebKit's ANGLE resolves its MSAA default framebuffer (color and depth) in the pass. */
++    NmbTexture *resolve_texture;
++    uint64_t resolve_level, resolve_slice, resolve_depth_plane;
+ };
+ struct NmbRenderPassDescriptor {
+     struct NmbPassAttachment colors[8], depth, stencil;
+@@ -230,6 +234,11 @@ bool nmb_compute_dispatch(NmbEncoder *, const uint64_t size[3], const uint64_t p
+ 
+ bool nmb_render_set_pipeline(NmbEncoder *, NmbRenderPipeline *);
+ bool nmb_render_set_depth_stencil(NmbEncoder *, NmbDepthStencil *);
++/* NegroniMetal (flame/0015): the late store actions over a descriptor's MTLStoreActionUnknown (setColorStoreAction:atIndex:,
++ * setDepthStoreAction:, setStencilStoreAction:; WebKit's ANGLE decides every store action at endEncoding). action = MTLStoreAction. */
++bool nmb_render_set_color_store_action(NmbEncoder *, uint64_t action, uint32_t index);
++bool nmb_render_set_depth_store_action(NmbEncoder *, uint64_t action);
++bool nmb_render_set_stencil_store_action(NmbEncoder *, uint64_t action);
+ bool nmb_render_set_viewport(NmbEncoder *, const double viewport[6]);
+ bool nmb_render_set_scissor(NmbEncoder *, const uint64_t rect[4]);
+ bool nmb_render_set_raster(NmbEncoder *, uint64_t cull_mode, uint64_t winding, uint64_t fill_mode);
+diff --git a/phone/metal2/bridge/NativeMetalObjects.rs b/phone/metal2/bridge/NativeMetalObjects.rs
+index b8a801e..4b848af 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.rs
++++ b/phone/metal2/bridge/NativeMetalObjects.rs
+@@ -1647,6 +1647,11 @@ pub struct NmbPassAttachment {
+     pub load: u64,
+     pub store: u64,
+     pub clear: [f64; 4],
++    // NegroniMetal (flame/0015): the multisample resolve target, or null (NativeMetalObjects.h)
++    pub resolve_texture: *mut NmbTexture,
++    pub resolve_level: u64,
++    pub resolve_slice: u64,
++    pub resolve_depth_plane: u64,
+ }
+ 
+ #[repr(C)]
+@@ -1665,6 +1670,11 @@ fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
+     if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
+ }
+ 
++// NegroniMetal (flame/0015): the attachment's resolve target
++fn resolve_texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
++    if a.resolve_texture.is_null() { Ok(None) } else { Ok(Some(get(a.resolve_texture)?.0.clone())) }
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, descriptor: *const NmbRenderPassDescriptor)
+                                          -> *mut NmbEncoder {
+@@ -1679,6 +1689,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer,
+             slot.load_action = LoadAction::from_raw(a.load).map_err(e("load action"))?;
+             slot.store_action = StoreAction::from_raw(a.store).map_err(e("store action"))?;
+             slot.clear_color = ClearColor::new(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);
++            slot.resolve_texture = resolve_texture_of(a)?;
++            slot.resolve_level = a.resolve_level;
++            slot.resolve_slice = a.resolve_slice;
++            slot.resolve_depth_plane = a.resolve_depth_plane;
+         }
+         let depth = &mut pass.depth_attachment;
+         depth.texture = texture_of(&d.depth)?;
+@@ -1688,6 +1702,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer,
+         depth.load_action = LoadAction::from_raw(d.depth.load).map_err(e("load action"))?;
+         depth.store_action = StoreAction::from_raw(d.depth.store).map_err(e("store action"))?;
+         depth.clear_depth = d.depth.clear[0];
++        depth.resolve_texture = resolve_texture_of(&d.depth)?;
++        depth.resolve_level = d.depth.resolve_level;
++        depth.resolve_slice = d.depth.resolve_slice;
++        depth.resolve_depth_plane = d.depth.resolve_depth_plane;
+         let stencil = &mut pass.stencil_attachment;
+         stencil.texture = texture_of(&d.stencil)?;
+         stencil.level = d.stencil.level;
+@@ -1696,6 +1714,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer,
+         stencil.load_action = LoadAction::from_raw(d.stencil.load).map_err(e("load action"))?;
+         stencil.store_action = StoreAction::from_raw(d.stencil.store).map_err(e("store action"))?;
+         stencil.clear_stencil = d.stencil.clear[0] as u32;
++        stencil.resolve_texture = resolve_texture_of(&d.stencil)?;
++        stencil.resolve_level = d.stencil.resolve_level;
++        stencil.resolve_slice = d.stencil.resolve_slice;
++        stencil.resolve_depth_plane = d.stencil.resolve_depth_plane;
+         pass.render_target_width = d.width;
+         pass.render_target_height = d.height;
+         pass.render_target_array_length = d.array_length;
+@@ -1933,6 +1955,35 @@ pub extern "C" fn nmb_render_set_stencil_reference(encoder: *mut NmbEncoder, fro
+     })
+ }
+ 
++// NegroniMetal (flame/0015): the late store actions (`setColorStoreAction:atIndex:`, `setDepthStoreAction:`,
++// `setStencilStoreAction:`) over a descriptor's `MTLStoreActionUnknown`; the runtime refuses any other replacement.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_color_store_action(encoder: *mut NmbEncoder, action: u64, index: u32) -> bool {
++    guard(false, || {
++        let action = StoreAction::from_raw(action).map_err(e("store action"))?;
++        render(encoder)?.set_color_store_action(action, index).map_err(e("color store action"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_depth_store_action(encoder: *mut NmbEncoder, action: u64) -> bool {
++    guard(false, || {
++        let action = StoreAction::from_raw(action).map_err(e("store action"))?;
++        render(encoder)?.set_depth_store_action(action).map_err(e("depth store action"))?;
++        Ok(true)
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_render_set_stencil_store_action(encoder: *mut NmbEncoder, action: u64) -> bool {
++    guard(false, || {
++        let action = StoreAction::from_raw(action).map_err(e("store action"))?;
++        render(encoder)?.set_stencil_store_action(action).map_err(e("stencil store action"))?;
++        Ok(true)
++    })
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_set_depth_bias(encoder: *mut NmbEncoder, bias: f32, slope_scale: f32, clamp: f32) -> bool {
+     guard(false, || {
