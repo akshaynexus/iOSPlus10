@@ -18,7 +18,8 @@
      (14 crashes in logs/usblog-20261024-195455.txt, first NE2211 boot).
 2. ExtensionKit feature flag enforce_xpc_cache_code_signing = off, else installd rejects every
    app extension (sailfish feature_flags(), lines 138-143).
-3. Preferences: FBLaunchWatchdogScale 20 (frontboard, springboard), DMLastMigrationResults
+3. Preferences: FBLaunchWatchdogScale 3 (frontboard, springboard; was 20: a hung launch such as Camera
+   held the foreground slot ~400 s and no other app could launch, 2026-10-26), DMLastMigrationResults
    success (HackiOS userland/var/mobile/Library/Preferences).
 4. Migration: "skip" (default) keeps slop's LastSystemVersion (fast first boot, fewer app
    extensions registered); "once" uses sailfish's sentinel /private/var/datamigrator/migrate and
@@ -102,10 +103,12 @@ def main():
             'DMLastMigrationResults': {'buildVersion': '20H392', 'success': True}})
         print('migration: skip (LastSystemVersion kept, DMLastMigrationResults success)')
 
-    # HackiOS: a slow app launch on this CPU-rendered UI must not be killed by FrontBoard
+    # HackiOS used 20 for the CPU-rendered UI. With the GPU path apps launch in 1-2 s; a launch that never
+    # checks in (Camera: no capture service) must free the foreground slot fast, else no other app launches
+    # until the watchdog fires (20 x 20 s = 400 s seen 2026-10-26). 3 = about 60 s.
     for dom in ('com.apple.frontboard', 'com.apple.springboard'):
-        merge_pref(r, dom, {'FBLaunchWatchdogScale': 20})
-    print('FBLaunchWatchdogScale 20 (frontboard, springboard)')
+        merge_pref(r, dom, {'FBLaunchWatchdogScale': 3})
+    print('FBLaunchWatchdogScale 3 (frontboard, springboard)')
 
 if __name__ == '__main__':
     main()
