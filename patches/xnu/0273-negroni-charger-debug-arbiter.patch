@@ -1,0 +1,691 @@
+diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
+index 294bb70..a7c054d 100644
+--- a/bsd/dev/negroni_spmi.c
++++ b/bsd/dev/negroni_spmi.c
+@@ -43,6 +43,23 @@
+  * charger APID that another EE owns stays locked.
+  * A command that times out may complete late: its APID is not used again this
+  * boot. Callers: thread context (a mutex serializes the battery's accesses).
++ *
++ * Patch 0273: a second path for the charger blocks only (SID 3 0x10-0x16): the
++ * EE-independent PMIC arbiter DEBUG bus (Linux drivers/spmi/spmi-pmic-arb-debug.c,
++ * live DT qcom,spmi-debug@10b14000: core 0x10b14000 + 0x60, fuse word 0x221c8784,
++ * qcom,fuse-enable-bit = 18, clock = the AOSS QMP "qdss" clock). On OxygenOS the
++ * PM8350B charger belongs to the ADSP charger PD (DT qcom,pmic_glink, protection
++ * domain msm/adsp/charger_pd; oplus_battery_sm8450.c sets the ICL, charge enable and
++ * reads VBUS only through PMIC GLINK), and the HLOS arbiter channel (EE 0) does not
++ * read or write those blocks. negroni_spmi_chg_route() picks the path: normal (0272),
++ * debug, or auto (debug only when the normal path cannot read CHGR or cannot write).
++ * Opening the debug path: (1) the fuse word, bit 18 must be set (else Linux returns
++ * -ENODEV; the path stays closed), (2) the AOP QMP message
++ * "{class: clock, res: qdss, val: 1}" (Linux qcom_aoss.c qmp_qdss_clk_prepare; the
++ * link/channel handshake as patch 0240 step 4), (3) the core page, (4) a check read
++ * of a register that the normal path reads too (BCL 0x4704). The debug bus has no
++ * ownership check: the read allowlist and the same six charger write registers stay
++ * the only limits. A debug command that times out closes the debug path for the boot.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -50,10 +67,12 @@
+ #include <kern/clock.h>
+ #include <kern/locks.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ #include "negroni_spmi_keys.h"
+ #include "negroni_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void IOSleep(unsigned int milliseconds);
+ 
+ #define SP_CORE_PA        0x0c400000u
+ #define SP_CORE_SIZE      0x3000u         /* version, features, APID map 0x2000 + 4 * 1024 */
+@@ -81,6 +100,48 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SP_CHGR_PPID      0x310u          /* SID 3, PM8350B SMB5 CHGR 0x1000 (0272) */
+ #define SP_USBIN_PPID     0x313u          /* SID 3, PM8350B SMB5 USBIN 0x1300 (0272) */
+ 
++/* 0273: the debug arbiter (spmi-pmic-arb-debug.c register layout) and what it needs */
++#define SD_CORE_PA        0x10b14000u     /* reg "core" 0x10b14000 0x60 */
++#define SD_FUSE_PA        0x221c8000u     /* page of reg "fuse" 0x221c8784 */
++#define SD_FUSE_OFF       0x784u
++#define SD_FUSE_BIT       18u             /* qcom,fuse-enable-bit = <0x12> */
++#define SD_CMD0           0x00u           /* opcode << 1: starts the transaction */
++#define SD_CMD1           0x04u           /* byte count - 1 << 4 | SID */
++#define SD_CMD2           0x08u           /* peripheral */
++#define SD_CMD3           0x0cu           /* register offset */
++#define SD_STATUS         0x14u
++#define SD_WDATA0         0x18u
++#define SD_RDATA0         0x38u
++#define SD_OP_EXT_WRITEL  0u
++#define SD_OP_EXT_READL   1u
++#define SD_DONE           (1u << 0)
++#define SD_FAILURE        (1u << 1)
++#define SD_DENIED         (1u << 2)
++#define SD_DROPPED        (1u << 3)
++#define SD_POLLS          200u            /* x 1 us (Linux PMIC_ARB_TIMEOUT_US = 100) */
++#define SD_FAIL_LOG       8u              /* status-error lines logged per boot */
++#define SD_FAIL_CLOSE     32u             /* consecutive status errors that close the path */
++/* AOSS QMP (patch 0240 step 4, Linux qcom_aoss.c) and its IPCC doorbell (client 0 = AOP, signal 0) */
++#define QM_AOSS_PA        0x0c300000u
++#define QM_AOSS_SIZE      0x400u
++#define QM_IPCC_PA        0x0ed18000u
++#define QM_IPCC_SEND_ID   0x0cu
++#define QM_MAGIC          0x00u
++#define QM_MAGIC_VALUE    0x4d41494cu     /* "LIAM" */
++#define QM_VERSION        0x04u
++#define QM_UCORE_LINK     0x0cu
++#define QM_UCORE_LINK_ACK 0x10u
++#define QM_UCORE_CH       0x14u
++#define QM_UCORE_CH_ACK   0x18u
++#define QM_MCORE_LINK     0x24u
++#define QM_MCORE_LINK_ACK 0x28u
++#define QM_MCORE_CH       0x2cu
++#define QM_MCORE_CH_ACK   0x30u
++#define QM_MBOX_SIZE      0x34u
++#define QM_MBOX_OFFSET    0x38u
++#define QM_UP             0x0000ffffu
++#define QM_MSG_LEN        64u
++
+ static LCK_GRP_DECLARE(sp_grp, "negroni_spmi");
+ static LCK_MTX_DECLARE(sp_map_lock, &sp_grp);   /* the shared mapping */
+ static LCK_MTX_DECLARE(sp_lock, &sp_grp);       /* the battery's accesses */
+@@ -102,6 +163,11 @@ static bool sp_poisoned[SP_MAX_APIDS];
+ static vm_offset_t sp_chg_chn[2];
+ static uint16_t sp_chg_apid[2] = { SP_NO_APID, SP_NO_APID };
+ static bool sp_chg_unlocked;
++/* 0273: the charger route (0 normal, 1 debug) and the debug path's state */
++static int sp_chg_route;
++static int sd_state;                    /* 0 not tried, 1 open, -1 closed */
++static vm_offset_t sd_core;
++static unsigned sd_fail_logged, sd_fail_run;   /* status-error lines so far, consecutive status errors */
+ 
+ int
+ negroni_spmi_arbiter(struct sk_arbiter *arb, vm_offset_t *cnfg)
+@@ -244,6 +310,237 @@ negroni_spmi_vadc_unlock(void)
+ 	return ok;
+ }
+ 
++/* ---- 0273: the AOP QMP message for the QDSS clock (patch 0240 step 4, Linux qcom_aoss.c) ---- */
++
++static bool
++qm_wait(vm_offset_t aoss, unsigned off, uint32_t want, unsigned ms)
++{
++	for (unsigned i = 0; i < ms; i++) {
++		if (sp_rd(aoss, off) == want) {
++			return true;
++		}
++		IOSleep(1);
++	}
++	return sp_rd(aoss, off) == want;
++}
++
++/* Thread context, sleeps; not under sp_lock (QMP is not SPMI). 0 when the AOP took the message. */
++static int
++qm_send(const char *text, char *why, size_t len)
++{
++	static vm_offset_t aoss, ipcc;
++	uint32_t words[QM_MSG_LEN / 4] = { 0 }, box, boxsize;
++	size_t n = strlen(text);
++	if (n >= QM_MSG_LEN) {
++		snprintf(why, len, "message too long");
++		return -1;
++	}
++	if (!aoss) {
++		aoss = ml_io_map(QM_AOSS_PA, QM_AOSS_SIZE);
++	}
++	if (!ipcc) {
++		ipcc = ml_io_map(QM_IPCC_PA, 0x1000);
++	}
++	if (!aoss || !ipcc) {
++		snprintf(why, len, "AOSS/IPCC map failed");
++		return -1;
++	}
++	if (sp_rd(aoss, QM_MAGIC) != QM_MAGIC_VALUE || sp_rd(aoss, QM_VERSION) != 1) {
++		snprintf(why, len, "AOSS QMP magic %#x version %u", sp_rd(aoss, QM_MAGIC), sp_rd(aoss, QM_VERSION));
++		return -1;
++	}
++	box = sp_rd(aoss, QM_MBOX_OFFSET);
++	boxsize = sp_rd(aoss, QM_MBOX_SIZE);
++	if ((box & 3) || box < 0x3c || boxsize < QM_MSG_LEN + 4 || box + boxsize > QM_AOSS_SIZE) {
++		snprintf(why, len, "QMP mailbox at %#x size %#x does not fit", box, boxsize);
++		return -1;
++	}
++	if (!(sp_rd(aoss, QM_MCORE_LINK) == QM_UP && sp_rd(aoss, QM_MCORE_LINK_ACK) == QM_UP &&
++	    sp_rd(aoss, QM_MCORE_CH) == QM_UP && sp_rd(aoss, QM_UCORE_CH) == QM_UP && sp_rd(aoss, QM_MCORE_CH_ACK) == QM_UP)) {
++		printf("NEGRONI BATTERY: debug arbiter: opening the QMP link and channel to the AOP\n");
++		sp_wr(aoss, QM_UCORE_LINK_ACK, sp_rd(aoss, QM_UCORE_LINK));
++		sp_wr(aoss, QM_MCORE_LINK, QM_UP);
++		sp_wr(ipcc, QM_IPCC_SEND_ID, 0);
++		if (!qm_wait(aoss, QM_MCORE_LINK_ACK, QM_UP, 1000)) {
++			snprintf(why, len, "AOP does not ack our QMP link");
++			return -1;
++		}
++		sp_wr(aoss, QM_MCORE_CH, QM_UP);
++		sp_wr(ipcc, QM_IPCC_SEND_ID, 0);
++		if (!qm_wait(aoss, QM_UCORE_CH, QM_UP, 1000)) {
++			snprintf(why, len, "AOP does not open its QMP channel");
++			return -1;
++		}
++		sp_wr(aoss, QM_UCORE_CH_ACK, QM_UP);
++		sp_wr(ipcc, QM_IPCC_SEND_ID, 0);
++		if (!qm_wait(aoss, QM_MCORE_CH_ACK, QM_UP, 1000)) {
++			snprintf(why, len, "AOP does not ack our QMP channel");
++			return -1;
++		}
++	}
++	/* another sender (patch 0240) may be in the middle of a message: wait up to 1 s for an empty box */
++	if (!qm_wait(aoss, box, 0, 1000)) {
++		snprintf(why, len, "QMP mailbox still holds %u bytes", sp_rd(aoss, box));
++		return -1;
++	}
++	memcpy(words, text, n + 1);
++	for (unsigned i = 0; i < QM_MSG_LEN / 4; i++) {
++		sp_wr(aoss, box + 4 + 4 * i, words[i]);
++	}
++	sp_wr(aoss, box, QM_MSG_LEN);
++	sp_wr(ipcc, QM_IPCC_SEND_ID, 0);
++	if (!qm_wait(aoss, box, 0, 1000)) {
++		sp_wr(aoss, box, 0);
++		snprintf(why, len, "AOP does not take the QMP message");
++		return -1;
++	}
++	return 0;
++}
++
++/* ---- 0273: the debug arbiter ---- */
++
++static bool
++sp_chg_block(unsigned sid, unsigned addr)
++{
++	return sid == 3 && (addr >> 8) >= 0x10 && (addr >> 8) <= 0x16;
++}
++
++/* sp_lock held, sd_state > 0. One byte. 0 ok, 1 timeout (closes the debug path), 2 failure/denied/dropped. */
++static int
++sd_xfer(unsigned op, unsigned sid, unsigned addr, uint8_t *value)
++{
++	if (op == SD_OP_EXT_WRITEL) {
++		sp_wr(sd_core, SD_WDATA0, *value);
++	}
++	sp_wr(sd_core, SD_CMD3, addr & 0xffu);
++	sp_wr(sd_core, SD_CMD2, (addr >> 8) & 0xffu);
++	sp_wr(sd_core, SD_CMD1, (0u << 4) | (sid & 0xfu));          /* 1 byte */
++	sp_wr(sd_core, SD_CMD0, op << 1);
++	uint32_t st = 0;
++	for (unsigned i = 0; i < SD_POLLS; ++i) {
++		st = sp_rd(sd_core, SD_STATUS);
++		if (st & SD_DONE) {
++			if (st & (SD_FAILURE | SD_DENIED | SD_DROPPED)) {
++				if (sd_fail_logged < SD_FAIL_LOG) {
++					sd_fail_logged++;
++					printf("NEGRONI BATTERY: debug arbiter %s sid=%u addr=%#x: status %#x (%s)%s\n",
++					    op == SD_OP_EXT_WRITEL ? "write" : "read", sid, addr, st,
++					    (st & SD_DENIED) ? "denied" : (st & SD_DROPPED) ? "dropped" : "failed",
++					    sd_fail_logged == SD_FAIL_LOG ? " (last such line)" : "");
++				}
++				if (++sd_fail_run >= SD_FAIL_CLOSE) {
++					sd_state = -1;
++					printf("NEGRONI BATTERY: debug arbiter: debug path closed: %u failures\n", sd_fail_run);
++				}
++				return 2;
++			}
++			sd_fail_run = 0;
++			if (op == SD_OP_EXT_READL) {
++				*value = (uint8_t)sp_rd(sd_core, SD_RDATA0);
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	sd_state = -1;
++	printf("NEGRONI BATTERY: debug arbiter %s sid=%u addr=%#x: timeout (status %#x): debug path closed\n",
++	    op == SD_OP_EXT_WRITEL ? "write" : "read", sid, addr, st);
++	return 1;
++}
++
++/* Once per boot (thread context, sleeps). True when the debug path is open. */
++static bool
++sd_open(bool check_fuse, bool qdss)
++{
++	if (sd_state) {
++		return sd_state > 0;
++	}
++	sd_state = -1;
++	vm_offset_t fuse = ml_io_map(SD_FUSE_PA, 0x1000);
++	uint32_t f = 0;
++	if (fuse) {
++		/* also a first access (QFPROM): the line reaches the USB log before it */
++		printf("NEGRONI BATTERY: debug arbiter: reading fuse 0x221c8784\n");
++		IOSleep(200);
++		f = sp_rd(fuse, SD_FUSE_OFF);
++	}
++	bool enabled = (f >> SD_FUSE_BIT) & 1u;
++	printf("NEGRONI BATTERY: debug arbiter: fuse 0x221c8784 = %#x%s, bit 18 %s%s\n", f, fuse ? "" : " (map failed)",
++	    enabled ? "set: debug bus enabled" : "clear: debug bus disabled by fuse",
++	    check_fuse ? "" : " (negronichg_dbgfuse=0: ignored)");
++	if (!fuse || (check_fuse && !enabled)) {
++		return false;
++	}
++	unsigned adsp = 0;
++	(void)PE_parse_boot_argn("negroniadsp", &adsp, sizeof(adsp));
++	if (qdss && adsp) {
++		/* patch 0240 (negroniadsp) uses the same QMP mailbox with no shared lock: no vote, no debug path */
++		printf("NEGRONI BATTERY: debug arbiter: QDSS vote skipped: negroniadsp=%u shares the QMP mailbox; debug path "
++		    "closed (negronichg_qdss=0 opens it without the vote)\n", adsp);
++		return false;
++	}
++	if (qdss) {
++		char why[96] = "";
++		printf("NEGRONI BATTERY: debug arbiter: AOP QMP \"{class: clock, res: qdss, val: 1}\"\n");
++		if (qm_send("{class: clock, res: qdss, val: 1}", why, sizeof(why))) {
++			printf("NEGRONI BATTERY: debug arbiter: QDSS clock vote failed (%s): debug path closed "
++			    "(negronichg_qdss=0 skips the vote)\n", why);
++			return false;
++		}
++		printf("NEGRONI BATTERY: debug arbiter: the AOP took the QDSS clock vote\n");
++	}
++	sd_core = ml_io_map(SD_CORE_PA, 0x1000);
++	if (!sd_core) {
++		printf("NEGRONI BATTERY: debug arbiter: core map failed\n");
++		return false;
++	}
++	printf("NEGRONI BATTERY: debug arbiter: first access of 0x10b14000 (a hang here: the bus has no clock)\n");
++	IOSleep(500);                   /* the line reaches the USB log before the access */
++	uint8_t dbg = 0xff, nrm = 0xff;
++	int nrc = -1;
++	lck_mtx_lock(&sp_lock);
++	sd_state = 1;
++	int rc = sd_xfer(SD_OP_EXT_READL, 3, 0x4704, &dbg);   /* PM8350B BCL TYPE */
++	if (sp_bcl_apid != SP_NO_APID && !sp_poisoned[sp_bcl_apid]) {
++		nrc = sk_read8(&sp_arb, sp_bcl_apid, 0x04, &nrm);
++	}
++	if (rc != 0 || (nrc == 0 && dbg != nrm)) {
++		sd_state = -1;
++	}
++	lck_mtx_unlock(&sp_lock);
++	printf("NEGRONI BATTERY: debug arbiter: check read SID 3 0x4704 = %02x (rc %d), normal path %02x (rc %d): %s\n",
++	    dbg, rc, nrm, nrc, sd_state > 0 ? "debug path OPEN" : "debug path closed");
++	return sd_state > 0;
++}
++
++int
++negroni_spmi_chg_route(int arb, bool want_write, bool check_fuse, bool qdss)
++{
++	static const char *const arbName[] = { "auto", "normal", "debug" };
++	if (!sp_ready || arb < 0 || arb > 2) {
++		return -1;
++	}
++	uint8_t type = 0xff;
++	int nrc = negroni_spmi_read_rc(3, 0x1004, &type);      /* CHGR TYPE through the current route */
++	unsigned chgrOwner = 7, usbinOwner = 7;
++	int chgr = negroni_spmi_apid(3, 0x10, &chgrOwner), usbin = negroni_spmi_apid(3, 0x13, &usbinOwner);
++	bool normalReads = sp_chg_route == 0 && nrc == 0;
++	bool normalWrites = chgr >= 0 && usbin >= 0 && chgrOwner == SP_EE && usbinOwner == SP_EE;
++	bool debug = arb == 2 || (arb == 0 && (!normalReads || (want_write && !normalWrites)));
++	printf("NEGRONI BATTERY: charger route (negronichg_arb=%s): normal path read CHGR 0x1004 rc %d, CHGR APID %d EE %u, "
++	    "USBIN APID %d EE %u -> %s\n", arbName[arb], nrc, chgr, chgrOwner, usbin, usbinOwner,
++	    debug ? "try the debug arbiter" : "normal arbiter");
++	if (debug && sd_open(check_fuse, qdss)) {
++		lck_mtx_lock(&sp_lock);
++		if (sp_chg_route != 1) {
++			sp_chg_route = 1;
++			sp_chg_unlocked = false;        /* negroni_spmi_chg_unlock() decides again */
++		}
++		lck_mtx_unlock(&sp_lock);
++	}
++	return sp_chg_route;
++}
++
+ bool
+ negroni_spmi_chg_unlock(bool force)
+ {
+@@ -255,6 +552,11 @@ negroni_spmi_chg_unlock(bool force)
+ 		/* nothing to unlock */
+ 	} else if (sp_chg_unlocked) {
+ 		ok = true;
++	} else if (sp_chg_route == 1) {
++		/* 0273: the debug bus has no owner check; the six registers stay the only writable ones */
++		ok = sp_chg_unlocked = sd_state > 0;
++		printf("NEGRONI BATTERY: charger writes %s through the debug arbiter (0x1042 0x1340 0x1342 0x1365 0x1366 0x1370)\n",
++		    ok ? "unlocked" : "locked (debug path closed)");
+ 	} else {
+ 		ok = true;
+ 		for (unsigned i = 0; i < 2; ++i) {
+@@ -272,7 +574,9 @@ negroni_spmi_chg_unlock(bool force)
+ 				continue;
+ 			}
+ 			/* one 4 KiB channel window each, kept for the boot (never unmapped) */
+-			sp_chg_chn[i] = ml_io_map(SP_CHNLS_PA + SP_CHNL_STRIDE * sp_chg_apid[i], SP_CHNL_STRIDE);
++			if (!sp_chg_chn[i]) {
++				sp_chg_chn[i] = ml_io_map(SP_CHNLS_PA + SP_CHNL_STRIDE * sp_chg_apid[i], SP_CHNL_STRIDE);
++			}
+ 			printf("NEGRONI BATTERY: charger %s APID %u (EE %u): %s\n", name[i], sp_chg_apid[i], owner,
+ 			    sp_chg_chn[i] ? "writes unlocked" : "channel map failed");
+ 			if (!sp_chg_chn[i]) {
+@@ -306,6 +610,16 @@ negroni_spmi_read_rc(unsigned sid, unsigned addr, uint8_t *out)
+ 	}
+ 	unsigned ppid = (sid << 8) | (addr >> 8);
+ 	lck_mtx_lock(&sp_lock);
++	if (sp_chg_route == 1 && sp_chg_block(sid, addr)) {
++		/* 0273: the charger blocks through the debug arbiter; 6 = debug path closed */
++		uint8_t d = 0;
++		int drc = sd_state > 0 ? sd_xfer(SD_OP_EXT_READL, sid, addr, &d) : 6;
++		if (drc == 0) {
++			*out = d;
++		}
++		lck_mtx_unlock(&sp_lock);
++		return drc;
++	}
+ 	uint16_t apid = ppid == SP_BCL_PPID ? sp_bcl_apid : ppid == SP_VADC_PPID ? sp_vadc_apid :
+ 	    sp_find_apid(ppid, NULL);
+ 	if (apid == SP_NO_APID) {
+@@ -369,6 +683,17 @@ negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value)
+ 		return -1;
+ 	}
+ 	lck_mtx_lock(&sp_lock);
++	if (sp_chg_route == 1 && sp_chg_block(sid, addr)) {
++		/* 0273: debug arbiter; only the six charger registers, only after the charger unlock */
++		uint8_t v = value;
++		int drc = -1;
++		if (sp_chg_unlocked && sd_state > 0 && (addr == 0x1042 || addr == 0x1340 || addr == 0x1342 ||
++		    addr == 0x1365 || addr == 0x1366 || addr == 0x1370)) {
++			drc = sd_xfer(SD_OP_EXT_WRITEL, sid, addr, &v);
++		}
++		lck_mtx_unlock(&sp_lock);
++		return drc ? -1 : 0;
++	}
+ 	if (!sp_write_target(sid, addr, &chn, &apid) || sp_poisoned[apid]) {
+ 		lck_mtx_unlock(&sp_lock);
+ 		return -1;
+diff --git a/bsd/dev/negroni_spmi.h b/bsd/dev/negroni_spmi.h
+index 8ef0e14..647c513 100644
+--- a/bsd/dev/negroni_spmi.h
++++ b/bsd/dev/negroni_spmi.h
+@@ -17,7 +17,8 @@ int negroni_spmi_arbiter(struct sk_arbiter *arb, vm_offset_t *cnfg);   /* needs
+ int negroni_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. Allowlisted registers only. */
+ int negroni_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+-/* 0272: the same read with the reason: 0 ok, 1 timeout, 2 arbiter error, 3 not allowed, 4 no APID, 5 APID poisoned */
++/* 0272: the same read with the reason: 0 ok, 1 timeout, 2 arbiter error, 3 not allowed, 4 no APID, 5 APID poisoned,
++ * 6 debug path closed (0273) */
+ int negroni_spmi_read_rc(unsigned sid, unsigned addr, uint8_t *out);
+ /* APID of SID/peripheral (-1 = not in the APID map) and its owner EE (7 if not mapped). */
+ int negroni_spmi_apid(unsigned sid, unsigned peripheral, unsigned *owner);
+@@ -31,6 +32,14 @@ bool negroni_spmi_vadc_unlock(void);
+  * 0x1366, 0x1370). force: also when EE 0 does not own the CHGR/USBIN APIDs. True when unlocked.
+  */
+ bool negroni_spmi_chg_unlock(bool force);
++/*
++ * 0273: the path of the charger blocks (SID 3 0x10-0x16). arb 0 auto (the debug arbiter when the normal
++ * path cannot read CHGR 0x1004, or cannot write and want_write), 1 normal (0272), 2 debug. check_fuse:
++ * keep the path closed when fuse bit 18 is clear; qdss: send the AOP the QDSS clock vote first.
++ * Thread context, sleeps (QMP). Returns the route now in use: 0 normal, 1 debug; -1 before init.
++ * A switch to the debug route locks the charger writes again: call negroni_spmi_chg_unlock() after it.
++ */
++int negroni_spmi_chg_route(int arb, bool want_write, bool check_fuse, bool qdss);
+ /* PMK8350 VADC ADC7 request registers (SID 0 0x3140-0x3145, 0x3147) after the VADC unlock, the six
+  * charger registers after the charger unlock; everything else fails. */
+ int negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBattery.cpp
+index 9761e92..bb9ab57 100644
+--- a/iokit/Kernel/arm/NegroniBattery.cpp
++++ b/iokit/Kernel/arm/NegroniBattery.cpp
+@@ -46,6 +46,12 @@
+  *   3  static 100 %, on AC, not charging (the old NegroniBattery fallback; no PMIC access)
+  *   4  1 + PMK8350 VADC conversions (better voltage, VBUS, charge current, skin temperature)
+  *   5  4 + the diagnostics of 2
++ * Patch 0273, the charger path: negronichg_arb=auto (default) | normal | debug. At poll
++ * negronichg_route_poll (default 3, after the USB console is up) auto moves the charger blocks
++ * (SID 3 0x10-0x16) to the EE-independent debug arbiter (bsd/dev/negroni_spmi.c) when the HLOS
++ * arbiter cannot read CHGR or cannot write it (the ADSP charger PD owns the charger on OxygenOS).
++ * negronichg_dbgfuse=0 ignores the debug-bus fuse, negronichg_qdss=0 skips the AOP QDSS clock
++ * vote. With negroniadsp set, the debug path stays read only unless negronichg_force=1.
+  * Keys follow AppleSmartBattery as the reference ports learned them (bergamota 0130,
+  * HackiOS RedwoodBattery.cpp): CurrentCapacity is the percentage with MaxCapacity 100;
+  * mAh go to AppleRaw*Capacity / NominalChargeCapacity / DesignCapacity. 20H392 powerd
+@@ -75,6 +81,7 @@ int negroni_spmi_read_rc(unsigned sid, unsigned addr, uint8_t *out);
+ int negroni_spmi_apid(unsigned sid, unsigned peripheral, unsigned *owner);
+ bool negroni_spmi_vadc_unlock(void);
+ bool negroni_spmi_chg_unlock(bool force);
++int negroni_spmi_chg_route(int arb, bool want_write, bool check_fuse, bool qdss);
+ int negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ unsigned negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max);
+ }
+@@ -111,6 +118,10 @@ static const char *const kSrcName[] = { "static", "PM8350B BCL", "PMK8350 VADC"
+  * offsets). The PM8350B charger is owned by the ADSP charger PD on OxygenOS; without the ADSP its
+  * registers keep what XBL/ABL left. The step of the current registers is CHG_STEP_MA (50 mA on
+  * PM8150B; boot-arg negronichg_step changes it) [inference for PM8350B].
++ * 0273: ICL_STATUS, AICL_ICL_STATUS and POWER_PATH_STATUS are DCDC (0x1100) registers on SMB5
++ * (smb5-reg.h DCDC_BASE + 0x07/0x08/0x0b); 0272 had the SMB2 (PMI8998) MISC offsets 0x1607/0x1608/0x160b.
++ * The input limit uses the SMB5 HC mode of smblib_icl_override(SW_OVERRIDE_HC_MODE): USBIN_MODE_CHG = 1,
++ * CMD_ICL_OVERRIDE bit 0 = 0, ICL_OVERRIDE_AFTER_APSD = 1 (0272 set CMD_ICL_OVERRIDE = 1, the USB51 mode bit).
+  */
+ #define CHG_SID            3u
+ #define CHG_STATUS1        0x1006u  /* [2:0] 0 inhibit 1 trickle 2 pre 3 fast 4 taper 5 term 6 pause 7 disabled */
+@@ -129,9 +140,9 @@ static const char *const kSrcName[] = { "static", "PM8350B BCL", "PMK8350 VADC"
+ #define CHG_USBIN_AICL_OPT 0x1380u  /* [2] AICL enabled */
+ #define CHG_TYPEC_SNK_STS  0x1506u  /* detected source Rp */
+ #define CHG_TYPEC_MISC_STS 0x150bu  /* [0] CC attached */
+-#define CHG_ICL_STATUS     0x1607u  /* the limit in force, CHG_STEP_MA per LSB */
+-#define CHG_AICL_ICL_STS   0x1608u
+-#define CHG_POWER_PATH_STS 0x160bu  /* [6] USBIN suspended [4] using USBIN */
++#define CHG_ICL_STATUS     0x1107u  /* DCDC ICL_STATUS: the limit in force, CHG_STEP_MA per LSB (0273) */
++#define CHG_AICL_ICL_STS   0x1108u  /* DCDC AICL_ICL_STATUS (0273) */
++#define CHG_POWER_PATH_STS 0x110bu  /* DCDC POWER_PATH_STATUS: [6] USBIN suspended [4] using USBIN (0273) */
+ #define CHG_STEP_MA        50u
+ #define CHG_DEFAULT_MA     500u     /* DT qcom,input_current_usb_ma = 500 (SDP) */
+ #define CHG_TRIES          5
+@@ -202,7 +213,7 @@ struct nb_sample {
+ 	/* 0272: the charger registers (chgRead: all of them read) */
+ 	bool chgRead;
+ 	uint8_t st1, st2, chgEn, fcc, fv, apsdSt, apsdRes, usbRt, cmdIl, loadCfg, iclOpt, iclCfg, aiclOpt, typecSnk,
+-	    typecMisc, iclSts, aiclSts, powerPath;
++	    typecMisc, iclSts, aiclSts, powerPath, iclOverride;
+ };
+ 
+ #define NB_RT_MAX          128
+@@ -223,6 +234,9 @@ private:
+ 	uint32_t fChgKey;          /* the last logged charger state */
+ 	unsigned fPolls;           /* 0272: polls so far (the setup lines repeat in the first ones: the USB console comes late) */
+ 	unsigned fChgForce;
++	int fChgArb;               /* 0273: negronichg_arb 0 auto, 1 normal, 2 debug */
++	int fChgRoute;             /* 0273: 0 normal, 1 debug arbiter */
++	unsigned fChgRoutePoll, fChgDbgFuse, fChgQdss, fAdsp;
+ 	uint8_t fChgSt1, fChgIclSts, fChgPowerPath;
+ 	int fMode;
+ 	int32_t fSoc;              /* hundredths of a percent */
+@@ -453,10 +467,17 @@ NegroniBattery::publish(unsigned percent, unsigned mv, int ma, int centiC, bool
+ 
+ 	int flags = (external ? 1 : 0) | (charging ? 2 : 0) | (full ? 4 : 0) | (source << 3);
+ 	if ((int)percent != fLastPercent || flags != fLastFlags) {
+-		IOLog("NEGRONI BATTERY: %u%% %umV %dmA %d.%02dC external=%d charging=%d full=%d source=%s usbin=%umV "
++		/* 0273: usbin is a VADC value (negronibatt=4/5); without the VADC it is not measured ("-") */
++		char usb[16];
++		if (fVadc) {
++			snprintf(usb, sizeof(usb), "%umV", usbMv);
++		} else {
++			snprintf(usb, sizeof(usb), "-");
++		}
++		IOLog("NEGRONI BATTERY: %u%% %umV %dmA %d.%02dC external=%d charging=%d full=%d source=%s usbin=%s "
+ 		    "chg=%s icl=%umA pp=%02x\n",
+ 		    percent, mv, ma, centiC / 100, (centiC < 0 ? -centiC : centiC) % 100,
+-		    external, charging, full, kSrcName[source], usbMv,
++		    external, charging, full, kSrcName[source], usb,
+ 		    fChgSt1 == 0xff ? "?" : kChgState[fChgSt1 & 7], fChgIclSts == 0xff ? 0 : fChgIclSts * fChgStep, fChgPowerPath);
+ 		fLastPercent = (int)percent;
+ 		fLastFlags = flags;
+@@ -711,6 +732,7 @@ NegroniBattery::readCharger(nb_sample &s)
+ 		{ CHG_USBIN_ICL_OPT, &s.iclOpt }, { CHG_USBIN_ICL_CFG, &s.iclCfg }, { CHG_USBIN_AICL_OPT, &s.aiclOpt },
+ 		{ CHG_TYPEC_SNK_STS, &s.typecSnk }, { CHG_TYPEC_MISC_STS, &s.typecMisc }, { CHG_ICL_STATUS, &s.iclSts },
+ 		{ CHG_AICL_ICL_STS, &s.aiclSts }, { CHG_POWER_PATH_STS, &s.powerPath },
++		{ CHG_USBIN_CMD_ICL_OVERRIDE, &s.iclOverride },
+ 	};
+ 	unsigned ok = 0;
+ 	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
+@@ -722,11 +744,12 @@ NegroniBattery::readCharger(nb_sample &s)
+ 	if (!s.chgRead) {
+ 		/* Diagnostics every poll while the charger does not read (the boot-time lines are not on the USB
+ 		 * console): the APID and owner of each SMB5 block, the result code of 8 reads, the SID 3 PPID map. */
+-		static const char *const why[] = { "ok", "timeout", "arbiter-error", "not-allowed", "no-APID", "poisoned" };
++		static const char *const why[] = { "ok", "timeout", "arbiter-error", "not-allowed", "no-APID", "poisoned",
++			                           "debug-closed" };
+ 		char line[400];
+ 		size_t at = 0;
+-		at += snprintf(line + at, sizeof(line) - at, "charger diag (%u of %u read): APIDs", ok,
+-		    (unsigned)(sizeof(regs) / sizeof(regs[0])));
++		at += snprintf(line + at, sizeof(line) - at, "charger diag (%u of %u read, %s arbiter): APIDs", ok,
++		    (unsigned)(sizeof(regs) / sizeof(regs[0])), fChgRoute == 1 ? "debug" : "normal");
+ 		for (unsigned per = 0x10; per <= 0x16 && at < sizeof(line) - 24; per++) {
+ 			unsigned owner = 7;
+ 			int apid = negroni_spmi_apid(CHG_SID, per, &owner);
+@@ -741,7 +764,7 @@ NegroniBattery::readCharger(nb_sample &s)
+ 			if (rc == 0) {
+ 				at += snprintf(line + at, sizeof(line) - at, " %04x=%02x", probe[i], v);
+ 			} else {
+-				at += snprintf(line + at, sizeof(line) - at, " %04x:%s", probe[i], rc >= 0 && rc <= 5 ? why[rc] : "?");
++				at += snprintf(line + at, sizeof(line) - at, " %04x:%s", probe[i], rc >= 0 && rc <= 6 ? why[rc] : "?");
+ 			}
+ 		}
+ 		IOLog("NEGRONI BATTERY: %s\n", line);
+@@ -766,13 +789,14 @@ NegroniBattery::readCharger(nb_sample &s)
+ 	uint32_t key = (uint32_t)s.st1 | (uint32_t)s.usbRt << 8 | (uint32_t)s.cmdIl << 16 | (uint32_t)s.iclSts << 24;
+ 	if (key != fChgKey || fDiag) {
+ 		fChgKey = key;
+-		IOLog("NEGRONI BATTERY: charger %s%s%s: st1 %02x st2 %02x en %02x fcc %02x fv %02x apsd %02x/%02x usb_rt %02x "
+-		    "cmd_il %02x load %02x icl_opt %02x icl_cfg %02x (%u mA) aicl %02x typec %02x/%02x | icl_sts %02x (%u mA) "
+-		    "aicl_sts %02x power_path %02x\n",
++		IOLog("NEGRONI BATTERY: charger %s%s%s (%s arbiter): st1 %02x st2 %02x en %02x fcc %02x fv %02x apsd %02x/%02x "
++		    "usb_rt %02x cmd_il %02x icl_ovr %02x load %02x icl_opt %02x icl_cfg %02x (%u mA) aicl %02x typec %02x/%02x | "
++		    "icl_sts %02x (%u mA) aicl_sts %02x (%u mA) power_path %02x\n",
+ 		    kChgState[s.st1 & 7], (s.usbRt & 0x10) ? ", USBIN plugged" : ", USBIN unplugged",
+-		    ((s.cmdIl & 1) || (s.powerPath & 0x40)) ? ", USBIN SUSPENDED" : "",
+-		    s.st1, s.st2, s.chgEn, s.fcc, s.fv, s.apsdSt, s.apsdRes, s.usbRt, s.cmdIl, s.loadCfg, s.iclOpt, s.iclCfg,
+-		    s.iclCfg * fChgStep, s.aiclOpt, s.typecSnk, s.typecMisc, s.iclSts, s.iclSts * fChgStep, s.aiclSts, s.powerPath);
++		    ((s.cmdIl & 1) || (s.powerPath & 0x40)) ? ", USBIN SUSPENDED" : "", fChgRoute == 1 ? "debug" : "normal",
++		    s.st1, s.st2, s.chgEn, s.fcc, s.fv, s.apsdSt, s.apsdRes, s.usbRt, s.cmdIl, s.iclOverride, s.loadCfg, s.iclOpt,
++		    s.iclCfg, s.iclCfg * fChgStep, s.aiclOpt, s.typecSnk, s.typecMisc, s.iclSts, s.iclSts * fChgStep, s.aiclSts,
++		    s.aiclSts * fChgStep, s.powerPath);
+ 	}
+ }
+ 
+@@ -802,7 +826,7 @@ NegroniBattery::driveCharger(nb_sample &s)
+ 	}
+ 	bool suspended = (s.cmdIl & 1) || (s.powerPath & 0x40);
+ 	bool chgOff = !(s.chgEn & 1);
+-	bool limitWrong = s.iclCfg != wantRaw || !(s.iclOpt & 1) || !(s.loadCfg & 0x10);
++	bool limitWrong = s.iclCfg != wantRaw || !(s.iclOpt & 1) || !(s.loadCfg & 0x10) || (s.iclOverride & 1);
+ 	if (!suspended && !chgOff && !limitWrong) {
+ 		return;
+ 	}
+@@ -821,7 +845,10 @@ NegroniBattery::driveCharger(nb_sample &s)
+ 	if (!(s.loadCfg & 0x10)) {
+ 		chgWrite(CHG_USBIN_LOAD_CFG, s.loadCfg | 0x10, "USBIN_LOAD_CFG icl_override_after_apsd");
+ 	}
+-	chgWrite(CHG_USBIN_CMD_ICL_OVERRIDE, 1, "USBIN_CMD_ICL_OVERRIDE");
++	if (s.iclOverride & 1) {
++		/* 0273: HC mode = CMD_ICL_OVERRIDE bit 0 clear (smblib_icl_override SW_OVERRIDE_HC_MODE) */
++		chgWrite(CHG_USBIN_CMD_ICL_OVERRIDE, s.iclOverride & ~1u, "USBIN_CMD_ICL_OVERRIDE clear (HC mode)");
++	}
+ 	if (s.cmdIl & 1) {
+ 		chgWrite(CHG_USBIN_CMD_IL, s.cmdIl & ~1u, "USBIN_CMD_IL un-suspend");
+ 	}
+@@ -829,13 +856,15 @@ NegroniBattery::driveCharger(nb_sample &s)
+ 		chgWrite(CHG_ENABLE_CMD, s.chgEn | 1, "CHARGING_ENABLE_CMD");
+ 	}
+ 	IOSleep(50);
+-	uint8_t a = 0xff, b = 0xff, c = 0xff, d = 0xff;
++	uint8_t a = 0xff, b = 0xff, c = 0xff, d = 0xff, e = 0xff, f = 0xff;
+ 	(void)negroni_spmi_read(CHG_SID, CHG_USBIN_ICL_CFG, &a);
+ 	(void)negroni_spmi_read(CHG_SID, CHG_USBIN_CMD_IL, &b);
+ 	(void)negroni_spmi_read(CHG_SID, CHG_ICL_STATUS, &c);
+ 	(void)negroni_spmi_read(CHG_SID, CHG_POWER_PATH_STS, &d);
+-	IOLog("NEGRONI BATTERY: charger after set: icl_cfg %02x cmd_il %02x icl_sts %02x (%u mA) power_path %02x\n",
+-	    a, b, c, c == 0xff ? 0 : c * fChgStep, d);
++	(void)negroni_spmi_read(CHG_SID, CHG_AICL_ICL_STS, &e);
++	(void)negroni_spmi_read(CHG_SID, CHG_ENABLE_CMD, &f);
++	IOLog("NEGRONI BATTERY: charger after set: icl_cfg %02x cmd_il %02x en %02x icl_sts %02x (%u mA) aicl_sts %02x (%u mA) "
++	    "power_path %02x\n", a, b, f, c, c == 0xff ? 0 : c * fChgStep, e, e == 0xff ? 0 : e * fChgStep, d);
+ 	fChgKey = 0xffffffffu;     /* the next poll logs the new state */
+ }
+ 
+@@ -863,10 +892,49 @@ NegroniBattery::poll(void)
+ 		int chgrApid = negroni_spmi_apid(CHG_SID, 0x10, &chgrOwner);
+ 		int usbinApid = negroni_spmi_apid(CHG_SID, 0x13, &usbinOwner);
+ 		IOLog("NEGRONI BATTERY: setup (poll %u): mode %d, BCL APID %d EE %u, VADC APID %d EE %u (%s), charger CHGR APID %d "
+-		    "EE %u USBIN APID %d EE %u, control %s (negronichg_ma=%u step %u force=%u)\n", fPolls, fMode, bclApid, bclOwner,
++		    "EE %u USBIN APID %d EE %u, path %s (negronichg_arb=%s, route poll %u), control %s (negronichg_ma=%u step %u "
++		    "force=%u)\n", fPolls, fMode, bclApid, bclOwner,
+ 		    vadcApid, vadcOwner, fVadc ? "unlocked" : "locked", chgrApid, chgrOwner, usbinApid, usbinOwner,
++		    fChgRoute == 1 ? "debug" : "normal", fChgArb == 0 ? "auto" : fChgArb == 1 ? "normal" : "debug", fChgRoutePoll,
+ 		    fChgWrite ? "on" : (fChgMa ? "OFF: registers locked" : "off"), fChgMa, fChgStep, fChgForce);
+ 	}
++	if (fChgArb != 1 && fPolls == fChgRoutePoll) {
++		/* 0273: pick the charger path once the USB console is up (the debug path's first access is logged) */
++		int before = fChgRoute;
++		fChgRoute = negroni_spmi_chg_route(fChgArb, fChgMa > 0, fChgDbgFuse != 0, fChgQdss != 0);
++		if (fChgRoute < 0) {
++			fChgRoute = 0;
++		}
++		if (fChgRoute != before) {
++			fChgWrite = false;      /* a new route locks the writes again; the 5 tries start again */
++		}
++		bool dbgClosed = fChgArb == 2 && fChgRoute != 1;
++		if (dbgClosed) {
++			/* negronichg_arb=debug means debug: no fallback to the normal arbiter for writes */
++			fChgWrite = false;
++			IOLog("NEGRONI BATTERY: charger: debug path closed: control OFF (negronichg_arb=debug)\n");
++		}
++		uint8_t t[4] = { 0xff, 0xff, 0xff, 0xff };
++		int rc[4];
++		static const unsigned tAddr[4] = { 0x1004, 0x1005, 0x1304, 0x1305 };
++		for (unsigned i = 0; i < 4; i++) {
++			rc[i] = negroni_spmi_read_rc(CHG_SID, tAddr[i], &t[i]);
++		}
++		IOLog("NEGRONI BATTERY: charger blocks through the %s arbiter: CHGR type/subtype %02x/%02x (rc %d/%d) USBIN "
++		    "type/subtype %02x/%02x (rc %d/%d)\n", fChgRoute == 1 ? "debug" : "normal", t[0], t[1], rc[0], rc[1], t[2], t[3],
++		    rc[2], rc[3]);
++		if (fChgMa > 0 && !fChgWrite && !dbgClosed) {
++			if (fChgRoute == 1 && fAdsp && !fChgForce) {
++				IOLog("NEGRONI BATTERY: charger control OFF: negroniadsp=%u (the ADSP charger PD may own the charger; "
++				    "negronichg_force=1 writes anyway)\n", fAdsp);
++			} else {
++				fChgWrite = negroni_spmi_chg_unlock(fChgForce != 0);
++				fChgTries = 0;
++			}
++		}
++		IOLog("NEGRONI BATTERY: charger path %s arbiter, control %s\n", fChgRoute == 1 ? "debug" : "normal",
++		    fChgWrite ? "on" : (fChgMa ? "OFF: registers locked" : "off"));
++	}
+ 	nb_sample s = {};
+ 	s.centiC = 2500;
+ 	readBcl(s);
+@@ -1047,10 +1115,27 @@ NegroniBattery::start(IOService *provider)
+ 	fChgMa = chgMa > 3000 ? 3000 : chgMa;
+ 	fChgStep = (chgStep == 25 || chgStep == 50) ? chgStep : CHG_STEP_MA;
+ 	fChgForce = chgForce;
+-	fChgWrite = fReal && fChgMa > 0 && negroni_spmi_chg_unlock(chgForce != 0);
++	/* 0273: negronichg_arb=auto|normal|debug (or 0|1|2), negronichg_route_poll (default 3), negronichg_dbgfuse=0
++	 * (ignore the debug-bus fuse), negronichg_qdss=0 (no QDSS clock vote) */
++	char arb[16] = "auto";
++	unsigned routePoll = 3, dbgFuse = 1, qdss = 1, adsp = 0;
++	(void)PE_parse_boot_arg_str("negronichg_arb", arb, sizeof(arb));
++	(void)PE_parse_boot_argn("negronichg_route_poll", &routePoll, sizeof(routePoll));
++	(void)PE_parse_boot_argn("negronichg_dbgfuse", &dbgFuse, sizeof(dbgFuse));
++	(void)PE_parse_boot_argn("negronichg_qdss", &qdss, sizeof(qdss));
++	(void)PE_parse_boot_argn("negroniadsp", &adsp, sizeof(adsp));
++	fChgArb = (!strcmp(arb, "normal") || !strcmp(arb, "1")) ? 1 : (!strcmp(arb, "debug") || !strcmp(arb, "2")) ? 2 : 0;
++	fChgRoutePoll = routePoll ? routePoll : 1;
++	fChgDbgFuse = dbgFuse;
++	fChgQdss = qdss;
++	fAdsp = adsp;
++	fChgRoute = 0;
++	/* negronichg_arb=debug: no normal-path writes before the route poll either */
++	fChgWrite = fReal && fChgMa > 0 && fChgArb != 2 && negroni_spmi_chg_unlock(chgForce != 0);
+ 	if (fReal) {
+-		IOLog("NEGRONI BATTERY: charger control %s (negronichg_ma=%u, %u mA/LSB, force=%u)\n",
+-		    fChgWrite ? "on" : (fChgMa ? "OFF: registers locked" : "off"), fChgMa, fChgStep, chgForce);
++		IOLog("NEGRONI BATTERY: charger control %s (negronichg_ma=%u, %u mA/LSB, force=%u, negronichg_arb=%s: the path "
++		    "is chosen at poll %u)\n", fChgWrite ? "on" : (fChgMa ? "OFF: registers locked" : "off"), fChgMa, fChgStep,
++		    chgForce, arb, fChgRoutePoll);
+ 	}
+ 	if (fReal) {
+ 		unsigned owner = 7;

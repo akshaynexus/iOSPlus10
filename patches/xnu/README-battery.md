@@ -324,3 +324,114 @@ Verification:
 Risks: the SMB5 layout on PM8350B is inferred (the first `charger` line shows nonsense values if it is
 wrong: e.g. `st1` above 7 bits, `icl_cfg` 0xff); the step size is inferred; a wrong limit above what
 the Mac port gives makes the port drop (AICL stays on and backs off). Writes stop after 5 tries.
+
+## 8. Charger ownership and the debug arbiter path (0273, 2026-10-26)
+
+Finding: on this phone the ADSP owns the PM8350B charger. The HLOS (EE 0) is not designed to touch it.
+- [V] `out/live.dts:6637-6645`: `qcom,pmic_glink` (`qcom,pmic-glink-channel = "PMIC_RTR_ADSP_APPS"`,
+  `qcom,protection-domain = "tms/servreg", "msm/adsp/charger_pd"`) holds `qcom,battery_charger` with all the
+  OPLUS charge limits. The HLOS `qcom,pm8350b@3` (`out/live.dts:13056`) has no SMB5 charger node, and the
+  tree has no `qcom,qpnp-smb5` node (grep: 0 matches).
+- [V] OnePlus `oplus_battery_sm8450.c` (out/src/op-modules vendor/oplus/kernel/charger/charger_ic/) has no
+  regmap/SPMI access (grep: 0 matches). It sets the ICL through GLINK (`usb_psy_set_icl` :2548 ->
+  `write_property_id` :878 -> `battery_chg_write` :830 -> `pmic_glink_write` :850), enables charging through
+  GLINK (`smbchg_charging_enable` :8270, `BATT_CHG_EN` :8285), and reads VBUS through GLINK
+  (`qpnp_get_prop_charger_voltage_now` :9477, `read_property_id(USB VOLTAGE_NOW)`). Qualcomm
+  `qti_battery_charger.c` (out/src/op-kernel drivers/power/supply/) is the same "charger in the ADSP" design
+  (MSG_OWNER_BC 32778 :26, BC_USB_STATUS_SET 0x33 :37; 0 regmap/SPMI matches).
+- [V] Linux arbiter rules (out/src/op-kernel drivers/spmi/spmi-pmic-arb.c): an observer read works for any
+  PPID in the APID map, whatever the owner (`pmic_arb_offset_v5` :1124 OBS case); a write needs
+  `write_ee == ee` (:1128 "disallowed SPMI write"); a PPID that is not in the map gives -ENODEV
+  (`pmic_arb_ppid_to_apid_v5` :1066). So the 0272 reads (all 0xff) failed because the CHGR..MISC PPIDs are
+  not in the HLOS APID map, or because of an arbiter error. The 0272 diag line (committed in a0acdd0) says which [I until
+  the phone log].
+- [I] So the EE 0 path cannot write the charger. Without the ADSP charger PD, nobody sets the ICL: the
+  charger keeps the value XBL/ABL left (logs: at best +78 mA net into the pack while idle).
+
+Register map fix [V: out/src/op-kernel drivers/power/supply/qcom/smb5-reg.h, qpnp-smb5.c, smb5-lib.c]:
+- `ICL_STATUS` = DCDC 0x1107, `AICL_ICL_STATUS` = 0x1108, `POWER_PATH_STATUS` = 0x110b (DCDC_BASE 0x1100).
+  0272 used 0x1607/0x1608/0x160b (the SMB2/PMI8998 MISC offsets). 0273 reads the DCDC registers.
+- The HC input mode (`smblib_icl_override(SW_OVERRIDE_HC_MODE)` smb5-lib.c:165) is USBIN_ICL_OPTIONS bit 0 = 1,
+  CMD_ICL_OVERRIDE (0x1342) bit 0 = **0**, USBIN_LOAD_CFG bit 4 = 1. 0272 wrote 0x1342 = 1. 0273 reads 0x1342 and
+  clears bit 0 only when it is set. The step is 50 mA/LSB on PM8150B/PM7250B (`smb5_pm8150b_params.usb_icl`,
+  qpnp-smb5.c:126) [I for PM8350B].
+
+USBIN voltage [V]: `usbin` is the PMK8350 VADC channel 0x311 (`pm8350b_usb_in_v_div_16`, prescale 1/16,
+out/live.dts:12406; NegroniBattery `kUsbIn = {3, 0x11, .., 1, 16}`, the same). The value exists only in
+`negronibatt=4/5` (VADC conversions); in mode 1/2 the old line printed `usbin=0mV` for "not measured". 0273
+prints `usbin=-` when the VADC is off. The channel and register are correct; the phone logs were mode 1.
+
+The debug arbiter (`qcom,spmi-debug@10b14000`, out/live.dts:13393; driver spmi-pmic-arb-debug.c):
+- core 0x10b14000 + 0x60: CMD0 0x00 (opcode << 1 starts), CMD1 0x04 ((bytes-1) << 4 | SID), CMD2 0x08
+  (peripheral), CMD3 0x0c (offset), STATUS 0x14 (bit 0 done, 1 failure, 2 denied, 3 dropped), WDATA0 0x18,
+  RDATA0 0x38. Opcodes: 1 EXT_READL, 0 EXT_WRITEL. Linux waits 100 x 1 us. No EE, no ownership check.
+- Fuse: `reg "fuse" 0x221c8784`, `qcom,fuse-enable-bit = <0x12>` (an ENABLE bit, not `qcom,fuse-disable-bit`):
+  the bus works only when bit 18 is set; else Linux probe fails ("disabled by fuse") [V: driver probe].
+  Whether it is set on a retail NE2211 is unknown [I]: 0273 logs the word.
+- Clock: `clocks = <0x41>` = `power-controller@c300000` (qcom,waipio-aoss-qmp, out/live.dts:7236-7244), the
+  AOSS QMP "qdss" clock: the AOP message `{class: clock, res: qdss, val: 1}` (out/src/op-kernel drivers/soc/qcom/qcom_aoss.c:286-288).
+
+What 0273 does:
+- `negroni_spmi.c`: `negroni_spmi_chg_route(arb, want_write, check_fuse, qdss)`. auto: the debug arbiter when
+  the normal path cannot read CHGR 0x1004, or (with writes wanted) when EE 0 does not own the CHGR and USBIN
+  APIDs. Open sequence, once per boot: fuse word (bit 18), AOP QMP QDSS vote (link/channel handshake as 0240
+  step 4; waits up to 1 s for an empty mailbox), core page map, a log line, 500 ms sleep (the line reaches the
+  USB log), check read SID 3 0x4704 (BCL TYPE) through the debug bus, compared with the normal path. Any
+  failure or a mismatch keeps the path closed; a timeout closes it for the boot. On the debug route only the
+  charger blocks (SID 3 0x10-0x16) go through it; the BCL/VADC/RTC/keys stay on the normal arbiter. Reads keep
+  the read allowlist; writes keep the same six registers (0x1042 0x1340 0x1342 0x1365 0x1366 0x1370), only
+  after `negroni_spmi_chg_unlock()`. Read reason 6 = `debug-closed`.
+- `NegroniBattery.cpp`: the route is chosen at poll `negronichg_route_poll` (default 3, about 40 s after start,
+  when the USB console is up). Then it reads CHGR/USBIN TYPE/SUBTYPE, unlocks the writes, and the 0272 logic
+  runs (now with the DCDC status registers and the HC mode). Boot-args: `negronichg_arb=auto|normal|debug`
+  (or 0|1|2; default auto), `negronichg_dbgfuse=0` (ignore the fuse), `negronichg_qdss=0` (no QDSS vote),
+  `negronichg_ma` (default 500, 0 = read only; every write needs it > 0). With `negroniadsp` set, the debug
+  route stays read only unless `negronichg_force=1` (the ADSP charger PD could own the charger then).
+- Review fixes (2026-10-26, same patch): a debug-bus status error (failure/denied/dropped) is logged at most 8
+  times per boot; 32 errors in a row close the debug path (`debug path closed: 32 failures`). The fuse read is
+  announced (`reading fuse 0x221c8784`, 200 ms sleep) like the core access. With `negroniadsp` set and
+  `negronichg_qdss=1`, 0273 does not send the QDSS vote (0240 uses the same QMP mailbox with no shared lock) and
+  keeps the debug path closed (`QDSS vote skipped`). `negronichg_arb=debug` means debug only: no normal-path writes
+  before the route poll, and a closed debug path gives `charger: debug path closed: control OFF`.
+
+Expected log lines (phone):
+```
+NEGRONI BATTERY: charger route (negronichg_arb=auto): normal path read CHGR 0x1004 rc 4, CHGR APID -1 EE 7, USBIN APID -1 EE 7 -> try the debug arbiter
+NEGRONI BATTERY: debug arbiter: fuse 0x221c8784 = 0x..., bit 18 set: debug bus enabled
+NEGRONI BATTERY: debug arbiter: AOP QMP "{class: clock, res: qdss, val: 1}"
+NEGRONI BATTERY: debug arbiter: the AOP took the QDSS clock vote
+NEGRONI BATTERY: debug arbiter: first access of 0x10b14000 (a hang here: the bus has no clock)
+NEGRONI BATTERY: debug arbiter: check read SID 3 0x4704 = .. (rc 0), normal path .. (rc 0): debug path OPEN
+NEGRONI BATTERY: charger writes unlocked through the debug arbiter (0x1042 0x1340 0x1342 0x1365 0x1366 0x1370)
+NEGRONI BATTERY: charger blocks through the debug arbiter: CHGR type/subtype ../.. (rc 0/0) USBIN type/subtype ../.. (rc 0/0)
+NEGRONI BATTERY: charger path debug arbiter, control on
+NEGRONI BATTERY: charger fast, USBIN plugged (debug arbiter): st1 .. en .. usb_rt .. cmd_il .. icl_ovr .. icl_cfg .. | icl_sts .. aicl_sts .. power_path ..
+NEGRONI BATTERY: charger set (try 1): want 500 mA ...
+NEGRONI BATTERY: charger after set: icl_cfg 0a cmd_il .. en .. icl_sts .. aicl_sts .. power_path ..
+```
+Failure lines: `bit 18 clear: debug bus disabled by fuse` (then only the ADSP charger PD is left, section 6),
+`QDSS clock vote failed (...)`, `check read ... debug path closed`, `debug arbiter read ...: status 0x.. (denied)`.
+
+Risks:
+- The first access of 0x10b14000 without a working QDSS clock can stall the bus (a hang, not a panic). The
+  log line before it and the 500 ms sleep show it. Fallback boot-args: `negronichg_arb=normal`.
+- The fuse page read (QFPROM 0x221c8000) and the QMP handshake are new on this phone (0240 step 4 is not tested
+  on hardware either). 0240 and 0273 share the QMP mailbox without a lock: 0273 waits for an empty box first.
+- The debug bus has no ownership check. The code limits it to the read allowlist and six write registers:
+  0x1042 CHARGING_ENABLE_CMD bit 0 (set), 0x1340 USBIN_CMD_IL bit 0 (clear = un-suspend), 0x1342
+  CMD_ICL_OVERRIDE bit 0 (clear), 0x1365 bit 4 (set), 0x1366 bit 0 (set), 0x1370 = negronichg_ma / step (max
+  3000 mA -> 60 at 50 mA/LSB, 120 at 25 mA/LSB; default 500 mA -> 10). No float voltage, FCC, JEITA, Type-C or HVDCP
+  write. The 5 tries per plug start again at the route switch (poll 3), so up to 5 + 5 per boot. At most 5 tries
+  per plug.
+- The PM8350B SMB5 layout and the 50 mA step stay inferences: the TYPE/SUBTYPE line and the first `charger`
+  line validate them before the writes matter (`icl_sts`/`aicl_sts` half of the request = 25 mA step).
+- When the ADSP charger PD runs one day (0240 + GLINK), HLOS writes would fight it: 0273 then stays read only.
+
+Verification:
+- [V] 2026-10-26: `git apply --check` on the 0272 state; `compile-one.sh` OK for `negroni_spmi.c`; NegroniBattery.cpp
+  `-fsyntax-only` clean with the build's clang++ line.
+- [V] Full build `kernel-chg3` (with the review fixes): out/kernel/local-20261026-073259/kernel.development.negroni, sha256
+  461b94bcade6f42a6aa669f3b5afadb4e751c14005638c80d35d5d5a9dbd03f4; 0273 applied (patch-report), only the 4 usual dxb
+  skips; the strings `charger route (negronichg_arb=%s)` and `debug arbiter` are in the kernel.
+- [V] Image out/ios16-chg2 (boot-args + `negronibatt=5`): boot_a.img sha256
+  baa0528616fabb7a8cee606962f696f3cec94e2d5df3bb11e98d596b32b02f7e (out/ios16-chg2/SHA256SUMS). Not booted.
