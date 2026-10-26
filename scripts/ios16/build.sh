@@ -46,6 +46,12 @@ payload() {
     [ $keep = 1 ] && args="$args $a"
   done
   args="${args# } ${BOOTARGS_ADD:-}"; args="${args% }"
+  # Owner rule 2026-10-27 (keep USB reachable): every image except the safe boot_a reboots by itself after 60 s
+  # without a USB host once configured (patch 0371), so a test that drops USB falls back to boot_a without buttons.
+  # LOST_REBOOT=0 turns it off; LOST_REBOOT=S sets another period.
+  case "$O" in */ios16-safe) ;; *)
+    case " $args " in *" negroniusb_lost_reboot="*) ;; *)
+      [ "${LOST_REBOOT:-60}" = 0 ] || args="$args negroniusb_lost_reboot=${LOST_REBOOT:-60}" ;; esac ;; esac
   printf '%s\n' "$args" > "$O/cmdline.txt"
   # DarwinBoot passes at most 1023 bytes; kernels before patch 0363 read memSizeActual from inside a command line
   # longer than 620 bytes (docs/notes.md section 35)

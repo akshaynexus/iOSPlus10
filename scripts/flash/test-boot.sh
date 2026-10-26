@@ -8,6 +8,8 @@ set -eu
 T=${1:?usage: $0 TEST_OUT [SAFE_OUT]}
 SAFE=${2:-out/ios16-safe}
 [ -f "$T/boot_a.img" ] && [ -f "$SAFE/boot_a.img" ] || { echo "missing $T/boot_a.img or $SAFE/boot_a.img" >&2; exit 1; }
+# A RAM test must come back by itself if it drops USB (patch 0371; scripts/ios16/build.sh adds the arg)
+grep -q 'negroniusb_lost_reboot=[1-9]' "$T/cmdline.txt" 2>/dev/null || { echo "$T/cmdline.txt has no negroniusb_lost_reboot=S: rebuild it (scripts/ios16/build.sh payload boot)" >&2; exit 1; }
 until fastboot devices 2>/dev/null | grep -q fastboot; do sleep 2; done
 cur=$(fastboot getvar current-slot 2>&1 | sed -n 's/^current-slot: //p')
 [ "$cur" = a ] || { echo "current slot is '$cur', not a: stop" >&2; exit 1; }
