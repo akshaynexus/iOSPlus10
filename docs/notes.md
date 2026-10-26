@@ -3069,3 +3069,16 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Build [V]: out/kernel/local-20261026-230626/kernel.development.negroni sha256
   10e876ff3dd19ba6ca58c11379865fb4f225f2b7ba901f068ff799a731376720 (0344 applied, only the 4 dxb skips, no new
   warning class in the Wi-Fi files; link out/kernel/kernel.macho). Log: logs/wlanmsi-build.log. Not run on the phone.
+
+## 57. Wi-Fi boots with MSI on: MHI READY, firmware up, en0 for wifid (2026-10-27 04:42, RAM test t21, kernel local-20261026-231147)
+- Boot-args: `negroniwifi=10 negroniwlan=10 negroniwlan_smmu=3 negroniwlan_msi=1` (patch 0344), ADSP off.
+- [V] `MSI #1 data 0xa500 (vector 0) at BHI SBL after 66 ms`, then `MHISTATUS READY (0x101) after 2 ms, execution environment 1`.
+  Without MSI (t16-t18, 0342 levels 0/1/2) EE stayed 0 for 30 s. Cause: the WCN6855 SBL needs endpoint MSI enabled
+  (Linux/cnss2 enable it before MHI power-up). No GIC ITS needed: the MSI lands in a RAM mailbox through SMMU context 6.
+- [V] All steps then pass: BHIe full image, EE AMSS, QRTR HELLO node 7, WLFW IND_REGISTER/HOST_CAP/RESPOND_MEM/CAP/BDF/
+  M3_INFO, FW_INIT_DONE, WLAN_CFG, HTC READY (CE2, 2 credits, 5 endpoints), WMI SERVICE_READY (fw build 0x200104cd,
+  2 RF chains, 242 scan channels).
+- [V] iOS: en0 exists; wifid and configd query it (CARD_CAPABILITIES, POWER, HW_SUPPORTED_CHANNELS, CHANNELS_INFO
+  answered; RSSI_BOUNDS not built; SSID ENXIO before a join).
+- Default: `negroniwlan_smmu=3 negroniwlan_msi=1` are now in scripts/ios16/variants/everything.args.
+- Next: scan and join a network from Settings; RSSI_BOUNDS; 0342 swreset stays off (not needed).
