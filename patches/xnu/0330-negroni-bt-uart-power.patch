@@ -1,0 +1,957 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8f1fef4..c4abf80 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,6 +120,8 @@ bsd/dev/negroni_wlan_bhi.c		standard
+ bsd/dev/negroni_wlan_mhi.c		standard
+ bsd/dev/negroni_adsp.c			standard
+ bsd/dev/negroni_rpmh.c			standard
++bsd/dev/negroni_bt.c			standard
++bsd/dev/negroni_bt_hci.c		standard
+ bsd/dev/negroni_spmi.c			standard
+ bsd/dev/negroni_usb.c			standard
+ bsd/dev/negroni_gpu_blit.c		standard
+diff --git a/bsd/dev/negroni_bt.c b/bsd/dev/negroni_bt.c
+new file mode 100644
+index 0000000..cbd8ece
+--- /dev/null
++++ b/bsd/dev/negroni_bt.c
+@@ -0,0 +1,837 @@
++/*
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450): QCA6490 Bluetooth, stage A part 1 (patch 0330):
++ * power sequence + GENI high-speed UART on QUP wrapper 2 SE5 ("qupv3_se20_4uart").
++ *
++ * Hardware [V out/live.dts, iOSPlus10 docs/bluetooth-plan.md]:
++ *   UART  qcom,qup_uart@894000 "qcom,msm-geni-serial-hs", reg 0x894000 0x4000, wrapper
++ *         qcom,qupv3_2_geni_se@8c0000; clocks GCC 130 (QUPV3_WRAP2_S5), 138 (WRAP_2_M_AHB), 139 (WRAP_2_S_AHB);
++ *         pins CTS 76, RTS 77, TX 78, RX 79 (function qup20 = 1; pinctrl "active" state);
++ *         qcom,wakeup-byte 0xfd (in-band sleep WAKE_IND).
++ *   bt_qca6490: BT_EN GPIO81 (qcom,bt-reset-gpio), WLAN_EN GPIO80, SW_CTRL GPIO82, XO_CLK GPIO204;
++ *         vdd-aon/dig = pm8350_s11 (smpb11) 966 mV, rfa1 = pm8350c_s1 (smpc1) 1900 mV,
++ *         rfa2 = pm8350_s12 (smpb12) 1350 mV, asd = pmr735a_l7 (ldoe7) 2800 mV; qcom,vreg_ipa "s3e" (AOP, not voted here).
++ * Power sequence = OnePlus kernel drivers/bluetooth/btpower.c bt_configure_gpios (out/src/op-kernel):
++ *   rails on; BT_EN low, 50 ms; WLAN_EN low -> wait 100 ms (AON discharge); XO_CLK high, 100-200 us,
++ *   BT_EN high, XO_CLK low after 4-6 ms; 50 ms; SW_CTRL should read 1.
++ * UART programming = Linux qcom_geni_serial.c / qcom-geni-se.c (FIFO mode, polled, no IRQ, no DMA).
++ * The SE clock: the GCC RCG of SE5 (0x2e618) is DFS-capable; when the boot chain enabled DFS the SE picks a
++ * level with SE_GENI_CLK_SEL (Linux geni_serial_set_rate), else this file programs the RCG from the
++ * gcc-waipio.c frequency table. Oversampling 16 (QUP >= 2.5), 32 below.
++ *
++ * Boot-args (default: nothing runs, no register is touched):
++ *   negronibt=1          steps 1-8: map, pin census, rails, clocks, GENI check, UART 115200, BT_EN, RX idle bytes
++ *   negronibt=2          + the HCI stage (negroni_bt_hci.c, patch 0331)
++ *   negronibt_delay=S    seconds before step 1 (default 3)
++ *   negronibt_noflow=1   ignore CTS (no hardware flow control)
++ *   negronibt_rfropen=1  start RX with the vendor parameters (RFR open, skip frame-error/break chars)
++ *   negronibt_aon_ms=N   BT_EN wait when WLAN_EN is low (default 100; btpower.c uses 500 below TEMP_THRESHOLD 5000 = 5 C)
++ *   negronibt_off=1      BT_EN low again at the end
++ * Failure after step 7: BT_EN low again. Failure after step 4: the GCC vote word is restored when it changed.
++ * The four rails are never voted off (all shared; smpb12 is the UFS vccq parent).
++ * Log: "NEGRONI BT: step N NAME" before each step, then detail lines; "NEGRONI BT: stop: ..." on failure.
++ * Every wait is bounded. A failure stops the thread; it never blocks boot.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "negroni_bt.h"
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);
++extern void thread_deallocate(thread_t);
++extern void IOSleep(unsigned int milliseconds);
++extern int negroni_rpmh_bt_enable(const char *res, unsigned mv);
++void negroni_bt_init(void);
++
++#define BT_WIMG_IO              0x7u            /* VM_WIMG_IO, as negroni_wifi.c */
++#define BT_PAGE                 0x4000u
++
++/* GCC (Linux gcc-sm8450.c = vendor gcc-waipio.c offsets) */
++#define GCC_PHYS                0x00100000u
++#define GCC_QUP_WIN             0x2c000u        /* maps 0x2c000..0x33fff: RCG/CBCRs of wrap2 + core CBCRs */
++#define GCC_QUP_WIN_SIZE        0x8000u
++#define GCC_VOTE_WIN            0x60000u
++#define GCC_VOTE_QUP            0x62010u        /* APCS branch vote: bit 0 wrap2 core, 1 s_ahb, 2 m_ahb, 3 core_2x, 9 s5 */
++#define GCC_VOTE_BITS           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 3 | 1u << 9)
++#define GCC_M_AHB_CBCR          0x2e004u
++#define GCC_S_AHB_CBCR          0x2e008u
++#define GCC_S5_CBCR             0x2e610u
++#define GCC_S5_RCGR             0x2e618u
++#define GCC_CORE_CBCR           0x33280u
++#define GCC_CORE2X_CBCR         0x3328cu
++#define CBCR_OFF                (1u << 31)
++#define RCG_CMD_UPDATE          (1u << 0)
++#define RCG_CMD_ROOT_OFF        (1u << 31)
++#define RCG_CFG                 0x4u
++#define RCG_M                   0x8u
++#define RCG_N                   0xcu
++#define RCG_D                   0x10u
++#define RCG_DFSR                0x14u           /* bit 0 DFS enable */
++#define RCG_PERF_DFSR(l)        (0x1cu + 4u * (l))
++#define RCG_PERF_M_DFSR(l)      (0x5cu + 4u * (l))
++#define RCG_PERF_N_DFSR(l)      (0x9cu + 4u * (l))
++#define RCG_LEVELS              8u
++#define RCG_HID_MASK            0x1fu           /* hid_width 5 */
++#define RCG_MND_MASK            0xffffu         /* mnd_width 16 */
++
++/* TLMM */
++#define TLMM_PHYS               0x0f100000u
++#define TLMM_PIN(n)             ((uint32_t)(n) * 0x1000u)
++#define PIN_CTS                 76u
++#define PIN_RTS                 77u
++#define PIN_TX                  78u
++#define PIN_RX                  79u
++#define PIN_WLAN_EN             80u
++#define PIN_BT_EN               81u
++#define PIN_SW_CTRL             82u
++#define PIN_XO_CLK              204u
++#define TLMM_EGPIO_PRESENT      (1u << 11)
++#define TLMM_EGPIO_ENABLE       (1u << 12)
++#define TLMM_OE                 (1u << 9)
++#define QUP20_FUNC              1u              /* pinctrl-sm8450.c PINGROUP(76..79, qup20, ...) */
++
++/* QUP wrapper 2 and SE5 (Linux geni-se.h, qcom_geni_serial.c) */
++#define QUP2_PHYS               0x008c0000u
++#define QUP_HW_VER              0x4u
++#define SE_PHYS                 0x00894000u
++#define GENI_FORCE_DEFAULT      0x020u
++#define GENI_OUTPUT_CTRL        0x024u
++#define GENI_CGC_CTRL           0x028u
++#define GENI_STATUS             0x040u          /* bit 0 M active, bit 12 S active */
++#define GENI_SER_M_CLK_CFG      0x048u
++#define GENI_SER_S_CLK_CFG      0x04cu
++#define GENI_CLK_CTRL_RO        0x060u
++#define GENI_IF_DISABLE_RO      0x064u          /* bit 0 FIFO_IF_DISABLE */
++#define GENI_FW_REVISION_RO     0x068u          /* bits 15:8 protocol, 2 = UART */
++#define GENI_FW_S_REVISION_RO   0x06cu
++#define GENI_CLK_SEL            0x07cu
++#define UART_LOOPBACK_CFG       0x22cu
++#define GENI_BYTE_GRAN          0x254u
++#define GENI_DMA_MODE_EN        0x258u
++#define UART_TX_TRANS_CFG       0x25cu          /* bit 0 parity, bit 1 CTS mask (1 = ignore CTS) */
++#define GENI_TX_PACKING_CFG0    0x260u
++#define GENI_TX_PACKING_CFG1    0x264u
++#define UART_TX_WORD_LEN        0x268u
++#define UART_TX_STOP_BIT_LEN    0x26cu
++#define UART_TX_TRANS_LEN       0x270u
++#define UART_RX_TRANS_CFG       0x280u
++#define GENI_RX_PACKING_CFG0    0x284u
++#define GENI_RX_PACKING_CFG1    0x288u
++#define UART_RX_WORD_LEN        0x28cu
++#define UART_RX_STALE_CNT       0x294u
++#define UART_TX_PARITY_CFG      0x2a4u
++#define UART_RX_PARITY_CFG      0x2a8u
++#define UART_MANUAL_RFR         0x2acu          /* bit 31 manual, bit 1 not ready, bit 0 ready */
++#define GENI_M_CMD0             0x600u
++#define GENI_M_CMD_CTRL         0x604u          /* bit 1 abort, bit 2 cancel */
++#define GENI_M_IRQ_STATUS       0x610u
++#define GENI_M_IRQ_EN           0x614u
++#define GENI_M_IRQ_CLEAR        0x618u
++#define GENI_S_CMD0             0x630u
++#define GENI_S_CMD_CTRL         0x634u
++#define GENI_S_IRQ_STATUS       0x640u
++#define GENI_S_IRQ_EN           0x644u
++#define GENI_S_IRQ_CLEAR        0x648u
++#define GENI_TX_FIFO            0x700u
++#define GENI_RX_FIFO            0x780u
++#define GENI_TX_FIFO_STATUS     0x800u          /* bits 27:0 word count */
++#define GENI_RX_FIFO_STATUS     0x804u          /* bit 31 last, 30:28 last-word bytes, 24:0 word count */
++#define GENI_TX_WATERMARK       0x80cu
++#define GENI_RX_WATERMARK       0x810u
++#define GENI_RX_RFR_WATERMARK   0x814u
++#define GENI_IOS                0x908u          /* bit 1 CTS pin level, bit 0 RX pin level */
++#define DMA_TX_IRQ_CLR          0xc44u
++#define DMA_RX_IRQ_CLR          0xd44u
++#define SE_GSI_EVENT_EN         0xe18u
++#define SE_IRQ_EN               0xe1cu
++#define SE_HW_PARAM_0           0xe24u
++#define SE_HW_PARAM_1           0xe28u
++#define SE_DMA_GENERAL_CFG      0xe30u
++#define M_CMD_DONE              (1u << 0)
++#define M_CMD_CANCEL            (1u << 4)
++#define M_CMD_ABORT             (1u << 5)
++#define S_CMD_CANCEL            (1u << 4)
++#define S_CMD_ABORT             (1u << 5)
++#define CMD_CTRL_ABORT          (1u << 1)
++#define CMD_CTRL_CANCEL         (1u << 2)
++#define UART_START_TX           1u
++#define UART_START_READ         1u
++#define UART_PARAM_VENDOR       (1u << 5 | 1u << 6 | 1u << 7)   /* msm_geni_serial start_rx_sequencer */
++#define UART_CTS_MASK           (1u << 1)
++#define PROTO_UART              2u
++
++#define RX_RING                 4096u
++
++static struct {
++	uint32_t mode, noflow, rfropen, aon_ms, poweroff;
++	vm_offset_t gcc_qup, gcc_vote, tlmm_uart, tlmm_xo, se, qup;
++	uint32_t qup_ver, sampling, tx_depth, rx_depth, baud;
++	bool dfs, powered, voted;
++	uint32_t vote_before;
++	uint32_t levels;
++	uint64_t level_hz[RCG_LEVELS];
++	uint8_t ring[RX_RING];
++	uint32_t head, tail, dropped;
++} bt;
++
++#define SAY(...)        printf("NEGRONI BT: " __VA_ARGS__)
++#define STEP(n, name)   printf("NEGRONI BT: step %u %s\n", (unsigned)(n), name)
++
++static inline uint32_t
++rd(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++wr(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++uint64_t
++negroni_bt_us(void)
++{
++	uint64_t t, ns;
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns / 1000ull;
++}
++
++void
++negroni_bt_sleep_ms(uint32_t ms)
++{
++	IOSleep(ms);
++}
++
++uint32_t
++negroni_bt_arg(const char *name, uint32_t def)
++{
++	char key[48];
++	uint32_t v = def;
++	snprintf(key, sizeof(key), "negronibt_%s", name);
++	if (!PE_parse_boot_argn(key, &v, sizeof(v))) {
++		v = def;
++	}
++	return v;
++}
++
++uint32_t
++negroni_bt_uart_baud(void)
++{
++	return bt.baud;
++}
++
++static vm_offset_t
++map(uint32_t pa, uint32_t size)
++{
++	uint32_t base = pa & ~(BT_PAGE - 1u);
++	uint32_t len = (pa + size - base + BT_PAGE - 1u) & ~(BT_PAGE - 1u);
++	vm_offset_t va = ml_io_map_unmappable(base, len, BT_WIMG_IO);
++	return va ? va + (pa - base) : 0;
++}
++
++/* ---- pins ---- */
++
++static vm_offset_t
++pin(uint32_t n)
++{
++	if (n >= PIN_CTS && n <= PIN_SW_CTRL + 1u) {
++		return bt.tlmm_uart + TLMM_PIN(n - PIN_CTS);
++	}
++	return bt.tlmm_xo;                      /* PIN_XO_CLK only */
++}
++
++static void
++pin_cfg(uint32_t n, uint32_t cfg)
++{
++	if (rd(pin(n)) & TLMM_EGPIO_PRESENT) {
++		cfg |= TLMM_EGPIO_ENABLE;       /* eGPIO: bit 12 gives the pin to the TLMM (pinctrl-msm.c) */
++	}
++	wr(pin(n), cfg);
++}
++
++static void
++gpio_out(uint32_t n, bool high, uint32_t pull)
++{
++	wr(pin(n) + 4u, high ? 2u : 0u);
++	pin_cfg(n, TLMM_OE | pull);             /* function 0 (gpio), 2 mA */
++}
++
++static uint32_t
++gpio_in(uint32_t n)
++{
++	return rd(pin(n) + 4u) & 1u;
++}
++
++static void
++pin_line(const char *name, uint32_t n)
++{
++	uint32_t c = rd(pin(n)), io = rd(pin(n) + 4u);
++	SAY("2 GPIO%u %s: cfg %#x (func %u, drive %u mA, pull %u, %s) in %u out %u\n", n, name, c,
++	    (c >> 2) & 0xfu, ((c >> 6) & 7u) * 2u + 2u, c & 3u, (c & TLMM_OE) ? "output" : "input", io & 1u, (io >> 1) & 1u);
++}
++
++/* ---- rails ---- */
++
++static int
++rail(const char *res, unsigned mv)
++{
++	int e = EBUSY;
++	for (unsigned i = 0; i < 40 && e == EBUSY; i++) {       /* the RPMh voter is shared: retry while busy */
++		e = negroni_rpmh_bt_enable(res, mv);
++		if (e == EBUSY) {
++			IOSleep(50);
++		}
++	}
++	SAY("3 %s %u mV: errno %d\n", res, mv, e);
++	return e;
++}
++
++/* ---- clocks ---- */
++
++static uint64_t
++parent_hz(uint32_t src)
++{
++	switch (src) {
++	case 0: return 19200000ull;     /* bi_tcxo */
++	case 1: return 600000000ull;    /* gpll0 */
++	case 6: return 300000000ull;    /* gpll0_out_even */
++	default: return 0;
++	}
++}
++
++/* clk-rcg2.c calc_rate */
++static uint64_t
++rcg_rate(uint32_t cfg, uint32_t m, uint32_t notnm)
++{
++	uint64_t r = parent_hz((cfg >> 8) & 7u);
++	uint32_t hid = cfg & RCG_HID_MASK, mode = (cfg >> 12) & 3u;
++	if (hid) {
++		r = r * 2u / (hid + 1u);
++	}
++	if (mode) {
++		uint32_t mm = m & RCG_MND_MASK, n = ((~notnm) & RCG_MND_MASK) + mm;
++		if (n) {
++			r = r * mm / n;
++		}
++	}
++	return r;
++}
++
++static bool
++cbcr_on(uint32_t off, uint32_t us)
++{
++	for (uint32_t i = 0; i <= us; i += 10) {
++		if (!(rd(bt.gcc_qup + (off - GCC_QUP_WIN)) & CBCR_OFF)) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static bool
++step_clocks(void)
++{
++	vm_offset_t rcg = bt.gcc_qup + (GCC_S5_RCGR - GCC_QUP_WIN);
++	uint32_t vote = rd(bt.gcc_vote + (GCC_VOTE_QUP - GCC_VOTE_WIN));
++
++	SAY("4 GCC vote %#x before (want bits %#x)\n", vote, GCC_VOTE_BITS);
++	bt.vote_before = vote;
++	bt.voted = (vote | GCC_VOTE_BITS) != vote;
++	wr(bt.gcc_vote + (GCC_VOTE_QUP - GCC_VOTE_WIN), vote | GCC_VOTE_BITS);
++	bool core = cbcr_on(GCC_CORE_CBCR, 500), core2x = cbcr_on(GCC_CORE2X_CBCR, 500);
++	bool mahb = cbcr_on(GCC_M_AHB_CBCR, 500), sahb = cbcr_on(GCC_S_AHB_CBCR, 500), s5 = cbcr_on(GCC_S5_CBCR, 500);
++	SAY("4 branches: wrap2 core %s, core_2x %s, m_ahb %s, s_ahb %s, s5 %s (CBCR %#x %#x %#x %#x %#x)\n",
++	    core ? "on" : "OFF", core2x ? "on" : "OFF", mahb ? "on" : "OFF", sahb ? "on" : "OFF", s5 ? "on" : "OFF",
++	    rd(bt.gcc_qup + (GCC_CORE_CBCR - GCC_QUP_WIN)), rd(bt.gcc_qup + (GCC_CORE2X_CBCR - GCC_QUP_WIN)),
++	    rd(bt.gcc_qup + (GCC_M_AHB_CBCR - GCC_QUP_WIN)), rd(bt.gcc_qup + (GCC_S_AHB_CBCR - GCC_QUP_WIN)),
++	    rd(bt.gcc_qup + (GCC_S5_CBCR - GCC_QUP_WIN)));
++	uint32_t cmd = rd(rcg), cfg = rd(rcg + RCG_CFG), dfsr = rd(rcg + RCG_DFSR);
++	bt.dfs = (dfsr & 1u) != 0;
++	SAY("4 S5 RCG cmd %#x cfg %#x m %#x n %#x d %#x dfsr %#x: DFS %s, now %llu Hz\n", cmd, cfg, rd(rcg + RCG_M),
++	    rd(rcg + RCG_N), rd(rcg + RCG_D), dfsr, bt.dfs ? "on" : "off",
++	    rcg_rate(cfg, rd(rcg + RCG_M), rd(rcg + RCG_N)));
++	bt.levels = 0;
++	if (bt.dfs) {
++		for (uint32_t l = 0; l < RCG_LEVELS; l++) {
++			uint32_t c = rd(rcg + RCG_PERF_DFSR(l));
++			bt.level_hz[l] = rcg_rate(c, rd(rcg + RCG_PERF_M_DFSR(l)), rd(rcg + RCG_PERF_N_DFSR(l)));
++			SAY("4 DFS level %u: cfg %#x -> %llu Hz\n", l, c, bt.level_hz[l]);
++			bt.levels++;
++		}
++	}
++	if (!core || !mahb || !sahb) {
++		SAY("stop: the QUP2 core/AHB clocks do not run (BCM QUP2 not voted? see docs/bluetooth-plan.md)\n");
++		return false;
++	}
++	return true;
++}
++
++/* gcc-waipio.c ftbl_gcc_qupv3_wrap0_s0_clk_src: rate, src, pre_div, m, n (used when DFS is off) */
++static const struct { uint32_t hz, src, div, m, n; } ftbl[] = {
++	{ 7372800, 6, 1, 384, 15625 }, { 14745600, 6, 1, 768, 15625 }, { 19200000, 0, 1, 0, 0 },
++	{ 29491200, 6, 1, 1536, 15625 }, { 32000000, 6, 1, 8, 75 }, { 48000000, 6, 1, 4, 25 },
++	{ 64000000, 6, 1, 16, 75 }, { 75000000, 6, 4, 0, 0 }, { 80000000, 6, 1, 4, 15 },
++	{ 96000000, 6, 1, 8, 25 }, { 100000000, 1, 6, 0, 0 },
++};
++
++static bool
++rcg_program(uint32_t i)
++{
++	vm_offset_t rcg = bt.gcc_qup + (GCC_S5_RCGR - GCC_QUP_WIN);
++	uint32_t cfg = rd(rcg + RCG_CFG) & ~(RCG_HID_MASK | 7u << 8 | 3u << 12);
++	cfg |= ftbl[i].src << 8;
++	if (ftbl[i].div > 1) {
++		cfg |= (2u * ftbl[i].div - 1u) & RCG_HID_MASK;
++	}
++	if (ftbl[i].n) {
++		wr(rcg + RCG_M, ftbl[i].m);
++		wr(rcg + RCG_N, ~(ftbl[i].n - ftbl[i].m) & RCG_MND_MASK);
++		wr(rcg + RCG_D, ~ftbl[i].n & RCG_MND_MASK);
++		cfg |= 2u << 12;                /* dual edge */
++	}
++	wr(rcg + RCG_CFG, cfg);
++	wr(rcg, rd(rcg) | RCG_CMD_UPDATE);
++	for (uint32_t us = 0; us < 1000; us += 10) {
++		if (!(rd(rcg) & RCG_CMD_UPDATE)) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++/* geni_se_clk_freq_match (exact = false) over the DFS levels or the table, then the divider */
++int
++negroni_bt_uart_set_baud(uint32_t baud)
++{
++	uint64_t want = (uint64_t)baud * bt.sampling, best_delta = ~0ull, best_hz = 0;
++	uint32_t best = 0, n = bt.dfs ? bt.levels : (uint32_t)(sizeof(ftbl) / sizeof(ftbl[0]));
++
++	if (!baud || !bt.se) {
++		return EINVAL;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		uint64_t hz = bt.dfs ? bt.level_hz[i] : ftbl[i].hz;
++		if (!hz) {
++			continue;
++		}
++		uint64_t div = (hz + want - 1u) / want;
++		uint64_t got = hz / div, delta = want > got ? want - got : got - want;
++		if (div <= 0xfffu && delta < best_delta) {
++			best_delta = delta;
++			best = i;
++			best_hz = hz;
++		}
++	}
++	if (!best_hz || best_delta * 50u > want) {      /* more than 2 % off: refuse */
++		SAY("baud %u: no clock level within 2 %% (best %llu Hz)\n", baud, best_hz);
++		return ERANGE;
++	}
++	uint32_t div = (uint32_t)((best_hz + want - 1u) / want);
++	if (bt.dfs) {
++		wr(bt.se + GENI_CLK_SEL, best & 7u);
++	} else {
++		if (!rcg_program(best)) {
++			SAY("baud %u: the S5 RCG update did not complete\n", baud);
++			return ETIMEDOUT;
++		}
++		wr(bt.se + GENI_CLK_SEL, 0);
++	}
++	uint32_t ser = 1u | div << 4;           /* SER_CLK_EN | CLK_DIV */
++	wr(bt.se + GENI_SER_M_CLK_CFG, ser);
++	wr(bt.se + GENI_SER_S_CLK_CFG, ser);
++	bt.baud = baud;
++	SAY("baud %u: %s %u = %llu Hz / %u / %u (error %llu Hz)\n", baud, bt.dfs ? "DFS level" : "table entry", best,
++	    best_hz, div, bt.sampling, best_delta / bt.sampling);
++	return 0;
++}
++
++/* ---- GENI UART ---- */
++
++static bool
++wait_bits(vm_offset_t reg, uint32_t mask, bool set, uint32_t us)
++{
++	for (uint32_t t = 0; t <= us; t += 5) {
++		if (((rd(reg) & mask) != 0) == set) {
++			return true;
++		}
++		delay(5);
++	}
++	return false;
++}
++
++static void
++rx_drain(void)
++{
++	uint32_t st = rd(bt.se + GENI_RX_FIFO_STATUS), wc = st & 0x1ffffffu;
++	for (uint32_t i = 0; i < wc; i++) {
++		uint32_t w = rd(bt.se + GENI_RX_FIFO), nb = 4;
++		if (i == wc - 1u && (st & (1u << 31))) {
++			nb = (st >> 28) & 7u;
++			if (nb == 0 || nb > 4) {
++				nb = 4;
++			}
++		}
++		for (uint32_t b = 0; b < nb; b++) {
++			uint32_t next = (bt.head + 1u) % RX_RING;
++			if (next == bt.tail) {
++				bt.dropped++;
++			} else {
++				bt.ring[bt.head] = (uint8_t)(w >> (8u * b));
++				bt.head = next;
++			}
++		}
++	}
++	uint32_t s = rd(bt.se + GENI_S_IRQ_STATUS);
++	if (s) {
++		wr(bt.se + GENI_S_IRQ_CLEAR, s);
++	}
++	if (!(rd(bt.se + GENI_STATUS) & (1u << 12))) {  /* the read command ended (break, error): restart it */
++		wr(bt.se + GENI_S_CMD0, UART_START_READ << 27 | (bt.rfropen ? UART_PARAM_VENDOR : 0u));
++	}
++}
++
++uint32_t
++negroni_bt_uart_read(uint8_t *buf, uint32_t max)
++{
++	uint32_t n = 0;
++	rx_drain();
++	while (n < max && bt.tail != bt.head) {
++		buf[n++] = bt.ring[bt.tail];
++		bt.tail = (bt.tail + 1u) % RX_RING;
++	}
++	return n;
++}
++
++static void
++m_cancel(void)
++{
++	wr(bt.se + GENI_M_CMD_CTRL, CMD_CTRL_CANCEL);
++	if (!wait_bits(bt.se + GENI_M_IRQ_STATUS, M_CMD_CANCEL, true, 2000)) {
++		wr(bt.se + GENI_M_CMD_CTRL, CMD_CTRL_ABORT);
++		(void)wait_bits(bt.se + GENI_M_IRQ_STATUS, M_CMD_ABORT, true, 2000);
++	}
++	wr(bt.se + GENI_M_IRQ_CLEAR, 0xffffffffu);
++}
++
++int
++negroni_bt_uart_write(const uint8_t *buf, uint32_t len)
++{
++	/* time on the wire at 10 bits/char + 100 ms for CTS held by the controller */
++	uint64_t limit = (uint64_t)len * 10u * 1000000u / (bt.baud ? bt.baud : 115200u) + 100000u;
++	uint64_t t0 = negroni_bt_us();
++
++	if (!len) {
++		return 0;
++	}
++	if (rd(bt.se + GENI_STATUS) & 1u) {
++		m_cancel();
++	}
++	wr(bt.se + GENI_M_IRQ_CLEAR, M_CMD_DONE);
++	wr(bt.se + UART_TX_TRANS_LEN, len);
++	wr(bt.se + GENI_M_CMD0, UART_START_TX << 27);
++	for (uint32_t i = 0; i < len; i += 4) {
++		uint32_t w = 0;
++		for (uint32_t b = 0; b < 4 && i + b < len; b++) {
++			w |= (uint32_t)buf[i + b] << (8u * b);
++		}
++		while ((rd(bt.se + GENI_TX_FIFO_STATUS) & 0x0fffffffu) >= bt.tx_depth) {
++			rx_drain();             /* keep RX moving while TX waits for CTS */
++			if (negroni_bt_us() - t0 > limit) {
++				SAY("TX stalled at byte %u of %u (FIFO full, GENI_IOS %#x: CTS %u)\n", i, len,
++				    rd(bt.se + GENI_IOS), (rd(bt.se + GENI_IOS) >> 1) & 1u);
++				m_cancel();
++				return ETIMEDOUT;
++			}
++			delay(2);
++		}
++		wr(bt.se + GENI_TX_FIFO, w);
++	}
++	while (!(rd(bt.se + GENI_M_IRQ_STATUS) & M_CMD_DONE)) {
++		rx_drain();
++		if (negroni_bt_us() - t0 > limit) {
++			SAY("TX of %u bytes did not complete (GENI_IOS %#x, TX FIFO %#x)\n", len, rd(bt.se + GENI_IOS),
++			    rd(bt.se + GENI_TX_FIFO_STATUS));
++			m_cancel();
++			return ETIMEDOUT;
++		}
++		delay(2);
++	}
++	wr(bt.se + GENI_M_IRQ_CLEAR, M_CMD_DONE);
++	return 0;
++}
++
++void
++negroni_bt_uart_flow(bool on)
++{
++	uint32_t tx = rd(bt.se + UART_TX_TRANS_CFG);
++	if (on) {
++		wr(bt.se + UART_MANUAL_RFR, 0);                                 /* RFR follows the RX FIFO */
++		tx = bt.noflow ? (tx | UART_CTS_MASK) : (tx & ~UART_CTS_MASK);
++	} else {
++		wr(bt.se + UART_MANUAL_RFR, 1u << 31 | 1u << 1);                /* manual, NOT ready */
++		tx |= UART_CTS_MASK;
++	}
++	wr(bt.se + UART_TX_TRANS_CFG, tx);
++}
++
++static bool
++step_geni(void)
++{
++	uint32_t fw = rd(bt.se + GENI_FW_REVISION_RO), ifd = rd(bt.se + GENI_IF_DISABLE_RO);
++	uint32_t p0 = rd(bt.se + SE_HW_PARAM_0), p1 = rd(bt.se + SE_HW_PARAM_1);
++
++	bt.qup_ver = rd(bt.qup + QUP_HW_VER);
++	bool big = bt.qup_ver >= 0x30010000u;   /* QUP >= 3.10: depth in bits 23:16 */
++	bt.tx_depth = (p0 >> 16) & (big ? 0xffu : 0x3fu);
++	bt.rx_depth = (p1 >> 16) & (big ? 0xffu : 0x3fu);
++	bt.sampling = bt.qup_ver >= 0x20050000u ? 16u : 32u;
++	SAY("5 QUP2 HW version %#x (oversampling %u); SE5 FW revision %#x (protocol %u, version %#x), S revision %#x, "
++	    "IF_DISABLE %#x, status %#x, CLK_CTRL %#x\n", bt.qup_ver, bt.sampling, fw, (fw >> 8) & 0xffu, fw & 0xffu,
++	    rd(bt.se + GENI_FW_S_REVISION_RO), ifd, rd(bt.se + GENI_STATUS), rd(bt.se + GENI_CLK_CTRL_RO));
++	SAY("5 HW_PARAM_0 %#x (TX FIFO %u words of %u bits), HW_PARAM_1 %#x (RX FIFO %u words), DMA_MODE_EN %#x\n",
++	    p0, bt.tx_depth, (p0 >> 24) & 0x3fu, p1, bt.rx_depth, rd(bt.se + GENI_DMA_MODE_EN));
++	if (fw == 0xffffffffu || ((fw >> 8) & 0xffu) != PROTO_UART) {
++		SAY("stop: SE5 has no UART firmware (protocol %u; XBL loads it from qupfw; Linux would load it itself)\n",
++		    (fw >> 8) & 0xffu);
++		return false;
++	}
++	if (ifd & 1u) {
++		SAY("stop: SE5 FIFO interface disabled (GSI only, like QUP0 SE4 for touch)\n");
++		return false;
++	}
++	if (bt.tx_depth < 4 || bt.rx_depth < 4) {
++		SAY("stop: FIFO depth %u/%u words is not usable\n", bt.tx_depth, bt.rx_depth);
++		return false;
++	}
++	return true;
++}
++
++static bool
++step_uart(void)
++{
++	/* the pinctrl "active" state: CTS no pull, RTS pull-down, TX pull-up, RX no pull; 2 mA; function qup20 */
++	pin_cfg(PIN_CTS, QUP20_FUNC << 2 | 0u);
++	pin_cfg(PIN_RTS, QUP20_FUNC << 2 | 1u);
++	pin_cfg(PIN_TX, QUP20_FUNC << 2 | 3u);
++	pin_cfg(PIN_RX, QUP20_FUNC << 2 | 0u);
++	SAY("6 pins 76-79 -> qup20: cfg %#x %#x %#x %#x\n", rd(pin(PIN_CTS)), rd(pin(PIN_RTS)), rd(pin(PIN_TX)),
++	    rd(pin(PIN_RX)));
++	if (rd(bt.se + GENI_STATUS) & 1u) {
++		m_cancel();
++	}
++	if (rd(bt.se + GENI_STATUS) & (1u << 12)) {
++		wr(bt.se + GENI_S_CMD_CTRL, CMD_CTRL_CANCEL);
++		if (!wait_bits(bt.se + GENI_S_IRQ_STATUS, S_CMD_CANCEL, true, 2000)) {
++			wr(bt.se + GENI_S_CMD_CTRL, CMD_CTRL_ABORT);
++			(void)wait_bits(bt.se + GENI_S_IRQ_STATUS, S_CMD_ABORT, true, 2000);
++		}
++	}
++	/* geni_se_irq_clear, geni_se_io_init, geni_se_io_set_mode (FIFO) */
++	wr(bt.se + SE_GSI_EVENT_EN, 0);
++	wr(bt.se + GENI_M_IRQ_CLEAR, 0xffffffffu);
++	wr(bt.se + GENI_S_IRQ_CLEAR, 0xffffffffu);
++	wr(bt.se + DMA_TX_IRQ_CLR, 0xffffffffu);
++	wr(bt.se + DMA_RX_IRQ_CLR, 0xffffffffu);
++	wr(bt.se + SE_IRQ_EN, 0xffffffffu);
++	wr(bt.se + GENI_CGC_CTRL, rd(bt.se + GENI_CGC_CTRL) | 0x7fu);
++	wr(bt.se + SE_DMA_GENERAL_CFG, rd(bt.se + SE_DMA_GENERAL_CFG) | 0xfu);
++	wr(bt.se + GENI_OUTPUT_CTRL, 0x7fu);
++	wr(bt.se + GENI_FORCE_DEFAULT, 1u);
++	wr(bt.se + GENI_DMA_MODE_EN, rd(bt.se + GENI_DMA_MODE_EN) & ~1u);
++	wr(bt.se + GENI_M_IRQ_EN, 0);           /* polled: no interrupt sources */
++	wr(bt.se + GENI_S_IRQ_EN, 0);
++	wr(bt.se + GENI_RX_WATERMARK, 2u);
++	wr(bt.se + GENI_RX_RFR_WATERMARK, bt.rx_depth - 2u);
++	wr(bt.se + GENI_TX_WATERMARK, 0);
++	/* geni_se_config_packing(8 bits, 4 per word, LSB first): Linux values for UART */
++	wr(bt.se + GENI_TX_PACKING_CFG0, 0x4380eu);
++	wr(bt.se + GENI_TX_PACKING_CFG1, 0xc3e0eu);
++	wr(bt.se + GENI_RX_PACKING_CFG0, 0x4380eu);
++	wr(bt.se + GENI_RX_PACKING_CFG1, 0xc3e0eu);
++	wr(bt.se + GENI_BYTE_GRAN, 0);
++	/* set_termios: 8N1, no loopback, stale timeout 16 chars, flow control on */
++	wr(bt.se + UART_RX_STALE_CNT, 10u * 16u);
++	wr(bt.se + UART_LOOPBACK_CFG, 0);
++	wr(bt.se + UART_TX_TRANS_CFG, bt.noflow ? UART_CTS_MASK : 0u);
++	wr(bt.se + UART_RX_TRANS_CFG, 0);
++	wr(bt.se + UART_TX_PARITY_CFG, 0);
++	wr(bt.se + UART_RX_PARITY_CFG, 0);
++	wr(bt.se + UART_TX_WORD_LEN, 8u);
++	wr(bt.se + UART_RX_WORD_LEN, 8u);
++	wr(bt.se + UART_TX_STOP_BIT_LEN, 0);
++	wr(bt.se + UART_MANUAL_RFR, 0);
++	if (negroni_bt_uart_set_baud(115200u) != 0) {
++		SAY("stop: no SE clock for 115200 baud\n");
++		return false;
++	}
++	bt.head = bt.tail = bt.dropped = 0;
++	wr(bt.se + GENI_S_CMD0, UART_START_READ << 27 | (bt.rfropen ? UART_PARAM_VENDOR : 0u));
++	SAY("6 UART 115200 8N1, flow control %s, RX started (param %#x), status %#x, IOS %#x\n",
++	    bt.noflow ? "off (negronibt_noflow)" : "RTS/CTS", bt.rfropen ? UART_PARAM_VENDOR : 0u,
++	    rd(bt.se + GENI_STATUS), rd(bt.se + GENI_IOS));
++	return true;
++}
++
++/* btpower.c bt_configure_gpios(on) for a QCA6490 with WLAN_EN and XO_CLK GPIOs */
++static bool
++step_power_on(void)
++{
++	uint32_t wlan_on = gpio_in(PIN_WLAN_EN);       /* pin level, as btpower.c gpio_get_value */
++
++	/* SW_CTRL as input with the census pull (btpower.c gpio_direction_input before it reads it) */
++	pin_cfg(PIN_SW_CTRL, rd(pin(PIN_SW_CTRL)) & 3u);
++	SAY("7 BT_EN low, 50 ms (WLAN_EN %u, SW_CTRL %u)\n", wlan_on, gpio_in(PIN_SW_CTRL));
++	gpio_out(PIN_BT_EN, false, 1u);
++	IOSleep(50);
++	SAY("7 after BT_EN low: SW_CTRL %u\n", gpio_in(PIN_SW_CTRL));
++	if (!wlan_on) {
++		SAY("7 WLAN_EN is low: wait %u ms for the AON output to discharge\n", bt.aon_ms);
++		IOSleep(bt.aon_ms);
++	}
++	gpio_out(PIN_XO_CLK, true, 0);
++	delay(150);
++	gpio_out(PIN_BT_EN, true, 1u);
++	bt.powered = true;
++	delay(5000);
++	gpio_out(PIN_XO_CLK, false, 0);
++	IOSleep(50);
++	uint32_t sw = gpio_in(PIN_SW_CTRL);
++	SAY("7 BT_EN out %u (cfg %#x), XO_CLK pulsed (cfg %#x), SW_CTRL %u (%s)\n", (rd(pin(PIN_BT_EN) + 4u) >> 1) & 1u,
++	    rd(pin(PIN_BT_EN)), rd(pin(PIN_XO_CLK)), sw, sw ? "asserted: the chip's BT side is up" :
++	    "NOT asserted: no power or no clock to the BT side");
++	return true;            /* SW_CTRL is diagnostic only (btpower.c also continues) */
++}
++
++static void
++step_rx_idle(void)
++{
++	uint8_t b[32];
++	uint32_t n = 0, sum = 0;
++	char hex[3 * 32 + 1];
++
++	for (uint32_t ms = 0; ms < 200; ms += 10) {
++		IOSleep(10);
++		uint32_t got = negroni_bt_uart_read(b + n, sizeof(b) - n);
++		n += got;
++		sum += got;
++		if (n == sizeof(b)) {
++			break;
++		}
++	}
++	hex[0] = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		snprintf(hex + 3 * i, 4, " %02x", b[i]);
++	}
++	SAY("8 %u bytes from the controller after power-on (200 ms)%s%s, RX ring dropped %u, IOS %#x\n", sum,
++	    n ? ":" : "", hex, bt.dropped, rd(bt.se + GENI_IOS));
++}
++
++static void
++bt_thread(void *arg __unused, wait_result_t w __unused)
++{
++	bool ok = false;
++	uint32_t delay_s = negroni_bt_arg("delay", 3);
++	if (delay_s > 120) {
++		delay_s = 120;
++	}
++	IOSleep(delay_s * 1000u);
++	SAY("start (negronibt=%u; stage A: UART + BT_EN%s)\n", bt.mode, bt.mode >= 2 ? " + HCI" : "");
++
++	STEP(1, "map GCC, TLMM, QUP2, SE5");
++	bt.gcc_qup = map(GCC_PHYS + GCC_QUP_WIN, GCC_QUP_WIN_SIZE);
++	bt.gcc_vote = map(GCC_PHYS + GCC_VOTE_WIN, BT_PAGE);
++	bt.tlmm_uart = map(TLMM_PHYS + TLMM_PIN(PIN_CTS), TLMM_PIN(8));
++	bt.tlmm_xo = map(TLMM_PHYS + TLMM_PIN(PIN_XO_CLK), 0x1000u);
++	bt.qup = map(QUP2_PHYS, 0x2000u);
++	bt.se = map(SE_PHYS, 0x4000u);
++	if (!bt.gcc_qup || !bt.gcc_vote || !bt.tlmm_uart || !bt.tlmm_xo || !bt.qup || !bt.se) {
++		SAY("stop: a mapping failed\n");
++		goto out;
++	}
++
++	STEP(2, "pin census");
++	pin_line("CTS", PIN_CTS);
++	pin_line("RTS", PIN_RTS);
++	pin_line("TX", PIN_TX);
++	pin_line("RX", PIN_RX);
++	pin_line("WLAN_EN", PIN_WLAN_EN);
++	pin_line("BT_EN", PIN_BT_EN);
++	pin_line("SW_CTRL", PIN_SW_CTRL);
++	pin_line("XO_CLK", PIN_XO_CLK);
++
++	STEP(3, "rails (RPMh apps DRV2 votes, DT bt-vdd-*-config)");
++	if (rail("smpb11", 966) || rail("smpc1", 1900) || rail("smpb12", 1350) || rail("ldoe7", 2800)) {
++		SAY("stop: a rail vote failed; BT_EN stays low\n");
++		goto out;
++	}
++
++	STEP(4, "clocks (GCC QUP2 core, AHB, S5)");
++	if (!step_clocks()) {
++		goto out;
++	}
++
++	STEP(5, "GENI SE5 firmware and FIFO check");
++	if (!step_geni()) {
++		goto out;
++	}
++
++	STEP(6, "UART init (FIFO mode, 115200)");
++	if (!step_uart()) {
++		goto out;
++	}
++
++	STEP(7, "BT_EN power sequence (btpower.c)");
++	(void)step_power_on();
++
++	STEP(8, "RX idle bytes");
++	step_rx_idle();
++
++	if (bt.mode >= 2) {
++		negroni_bt_hci_run(bt.mode);
++	}
++	ok = true;
++	SAY("stage A done (RX ring dropped %u bytes)\n", bt.dropped);
++out:
++	if (bt.powered && (!ok || bt.poweroff)) {
++		gpio_out(PIN_BT_EN, false, 1u);
++		SAY("BT_EN low again (%s); rails stay on\n", ok ? "negronibt_off=1" : "failure");
++	}
++	if (!ok && bt.voted && bt.gcc_vote) {
++		wr(bt.gcc_vote + (GCC_VOTE_QUP - GCC_VOTE_WIN), bt.vote_before);
++		SAY("GCC vote restored to %#x\n", bt.vote_before);
++	}
++	(void)thread_terminate(current_thread());
++}
++
++void
++negroni_bt_init(void)
++{
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("negronibt", &bt.mode, sizeof(bt.mode));
++	if (bt.mode == 0) {
++		return;
++	}
++	bt.noflow = negroni_bt_arg("noflow", 0);
++	bt.rfropen = negroni_bt_arg("rfropen", 0);
++	bt.aon_ms = negroni_bt_arg("aon_ms", 100);
++	if (bt.aon_ms > 1000) {
++		bt.aon_ms = 1000;
++	}
++	bt.poweroff = negroni_bt_arg("off", 0);
++	if (kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_bt.h b/bsd/dev/negroni_bt.h
+new file mode 100644
+index 0000000..e8ca82b
+--- /dev/null
++++ b/bsd/dev/negroni_bt.h
+@@ -0,0 +1,26 @@
++/*
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450): Bluetooth of the QCA6490 combo chip (patches 0330-0349).
++ * The seam between the UART/power stage (negroni_bt.c, patch 0330) and the HCI stage
++ * (negroni_bt_hci.c, patch 0331). Plan and facts: iOSPlus10 docs/bluetooth-plan.md.
++ */
++#ifndef _NEGRONI_BT_H_
++#define _NEGRONI_BT_H_
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <stdint.h>
++#include <stdbool.h>
++
++/* UART stage, implemented in negroni_bt.c */
++int negroni_bt_uart_write(const uint8_t *buf, uint32_t len);    /* 0 or errno; waits until sent */
++uint32_t negroni_bt_uart_read(uint8_t *buf, uint32_t max);      /* bytes now in the RX ring, no wait */
++int negroni_bt_uart_set_baud(uint32_t baud);                    /* 0 or errno (no clock level fits) */
++void negroni_bt_uart_flow(bool on);     /* false: RFR not ready + CTS ignored (hci_qca baud switch) */
++uint32_t negroni_bt_uart_baud(void);
++uint64_t negroni_bt_us(void);
++void negroni_bt_sleep_ms(uint32_t ms);
++uint32_t negroni_bt_arg(const char *name, uint32_t def);        /* "negronibt_" + name boot-arg */
++
++/* HCI stage, implemented in negroni_bt_hci.c: runs on the BT thread after step 8 when negronibt >= 2 */
++void negroni_bt_hci_run(uint32_t mode);
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++#endif /* _NEGRONI_BT_H_ */
+diff --git a/bsd/dev/negroni_bt_hci.c b/bsd/dev/negroni_bt_hci.c
+new file mode 100644
+index 0000000..9350408
+--- /dev/null
++++ b/bsd/dev/negroni_bt_hci.c
+@@ -0,0 +1,14 @@
++/*
++ * NEGRONI QCA6490 Bluetooth HCI stage (patch 0331 replaces this file).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "negroni_bt.h"
++
++void
++negroni_bt_hci_run(uint32_t mode)
++{
++	printf("NEGRONI BT: negronibt=%u: the HCI stage is not in this kernel (patch 0331)\n", mode);
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_rpmh.c b/bsd/dev/negroni_rpmh.c
+index 27855c0..cfb3144 100644
+--- a/bsd/dev/negroni_rpmh.c
++++ b/bsd/dev/negroni_rpmh.c
+@@ -542,4 +542,24 @@ negroni_rpmh_lookup(const char *res, uint32_t *address)
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/*
++ * QCA6490 Bluetooth supplies (negroni_bt.c, patch 0330): live DT bt_qca6490 qcom,bt-vdd-*-supply and
++ * -config (min = max voltage): aon/dig pm8350_s11, rfa1 pm8350c_s1, rfa2 pm8350_s12, asd pmr735a_l7.
++ * Voltage + enable only (no mode), as the Wi-Fi SMPS votes. Never voted off (shared rails).
++ */
++int negroni_rpmh_bt_enable(const char *res, unsigned mv);
++
++int
++negroni_rpmh_bt_enable(const char *res, unsigned mv)
++{
++	static const struct { const char *name; unsigned mv; } rails[] = {
++		{ "smpb11", 966 }, { "smpc1", 1900 }, { "smpb12", 1350 }, { "ldoe7", 2800 },
++	};
++	for (unsigned i = 0; res && i < sizeof(rails) / sizeof(rails[0]); i++) {
++		if (!strcmp(res, rails[i].name) && mv == rails[i].mv) {
++			return rh_vreg_enable(res, mv, -1);
++		}
++	}
++	return EINVAL;
++}
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 8122f2e..748b564 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -60,6 +60,7 @@ extern void negroni_cam_init(void);      /* patch 0310: camera bring-up (negroni
+ extern void negroni_adreno_init(void);
+ extern void negroni_wifi_init(void);
+ extern void negroni_adsp_init(void);
++extern void negroni_bt_init(void);      /* patch 0330: QCA6490 Bluetooth (negronibt) */
+ extern void negroni_probe_menu(void);
+ extern void negroni_usb_probe(void);
+ 
+@@ -771,6 +772,7 @@ negroni_ufs_init(void)
+ 	negroni_adreno_init();
+ 	negroni_wifi_init();
+ 	negroni_adsp_init();            /* boot-arg negroniadsp=1 (default off): own thread */
++	negroni_bt_init();              /* patch 0330: negronibt=1|2 (default off): own thread */
+ 	negroni_keys_init();
+ 	negroni_touch_init();
+ 	negroni_usb_probe();
