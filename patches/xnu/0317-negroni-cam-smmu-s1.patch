@@ -1,4 +1,4 @@
-Camera DMA addressing (negronicam_smmu=3, the default from level 5): frame buffers (0315) and the ICP HFI block
+Camera DMA addressing (negronicam_smmu=3, opt-in; default 1 since 2026-10-27 after the 0249 SEA panic): frame buffers (0315) and the ICP HFI block
 (0316) anywhere in RAM (0315/0316 asked for < 4 GiB: impossible here), mapped through an apps-SMMU stage-1 context
 of ours (negroni_smmu_s1.c, 0249) for the IFE SMR 0x800/0x460 and, at level 6, the ICP SMRs 0x2000/0x2040/0x2100
 (mask 0x420) + 0x2080/0x400, at IOVAs in Android's windows (frames from 0x10c00000, HFI at fw_uncached 0x10400000
@@ -18,11 +18,11 @@ index 0cb7167..af77203 100644
 + *   negronicam_smmu=0|1|2|3  0 report only, 1 stop before DMA when a camera stream would fault or
   *      translate through a context this kernel did not set up, 2 add a bypass SMR/S2CR pair for the stream
 - *      group (as negroniwlan_smmu=2, patch 0263) and remove it again at power down.
-+ *      group (as negroniwlan_smmu=2, patch 0263) and remove it again at power down, 3 (0317; the default
-+ *      from level 5 on) an apps-SMMU stage-1 context of ours (negroni_smmu_s1.c, 0249) for the IFE stream
++ *      group (as negroniwlan_smmu=2, patch 0263) and remove it again at power down, 3 (0317; opt-in, not
++ *      the default since 2026-10-27) an apps-SMMU stage-1 context of ours (negroni_smmu_s1.c, 0249) for the IFE stream
 + *      0x800/0x460 (and, at level 6, the four ICP entries of live.dts:22629): frame and HFI buffers anywhere
 + *      in RAM, mapped at 32-bit IOVAs inside Android's windows (live.dts:22583-22672). Policy 1 is the
-+ *      default below level 5. Why 3: XNU RAM starts at 0x840000000, so no buffer has a 32-bit physical
++ *      default at every level (levels 5+ then stop at the buffer). Why 3: XNU RAM starts at 0x840000000, so no buffer has a 32-bit physical
 + *      address, and Gunyah turns S2CR bypass into fault (README-wifi.md "2026-10-26 panic fix").
   * Every step logs "NEGRONI CAM: step N NAME" and "... ok (T us)" or "... failed: reason". A failure
   * powers down, in the vendor order, everything this file turned on; every wait is bounded.
@@ -381,7 +381,7 @@ index 0cb7167..af77203 100644
  	(void)PE_parse_boot_argn("negronicam_pause", &pause_ms, sizeof(pause_ms));
 -	(void)PE_parse_boot_argn("negronicam_smmu", &smmu_policy, sizeof(smmu_policy));
 +	if (!PE_parse_boot_argn("negronicam_smmu", &smmu_policy, sizeof(smmu_policy))) {
-+		smmu_policy = level >= 5 ? 3u : 1u;     /* 0317: DMA levels need our own context (no 32-bit RAM) */
++		smmu_policy = 1u;       /* 2026-10-27: stage 1 is opt-in (negronicam_smmu=3) until the bank probe proves it */
 +	}
  	(void)PE_parse_boot_argn("negronicam_src", &src_mask, sizeof(src_mask));
  	(void)PE_parse_boot_argn("negronicam_drate", &drate_idx, sizeof(drate_idx));

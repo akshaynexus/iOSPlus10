@@ -158,7 +158,7 @@ New boot-args:
 |---|---|---|
 | `negroniwlan=N` | 0 (off) | survey 1..10, then driver levels 2..N (max 4 in 0264; 6 with 0265/0266) |
 | `negroniwlan_to=MS` | 10000 | time-out of every wait, 100..60000 |
-| `negroniwlan_smmu=P` | **3** since 0325 (was 1) | 3 = the 0324/0325 stage-1 context (see "0325"); 0 = step 6 only reports; 1 = stop before the first DMA when a clock vote bit is clear or the SMMU surely faults stream 0x1c01 (S2CR fault, a context we did not set up, or no SMR with USFCFG 1); **2 = WRITE a bypass SMR + S2CR for stream 0x1c01 into the apps SMMU** |
+| `negroniwlan_smmu=P` | **1** (3 was the default for a few hours of 2026-10-27; back to 1 after the 0249 SEA) | 3 = the 0324/0325 stage-1 context, opt-in (see "0325"); 0 = step 6 only reports; 1 = stop before the first DMA when a clock vote bit is clear or the SMMU surely faults stream 0x1c01 (S2CR fault, a context we did not set up, or no SMR with USFCFG 1); **2 = WRITE a bypass SMR + S2CR for stream 0x1c01 into the apps SMMU** |
 
 **Warning: `negroniwlan_smmu=2` writes the shared apps SMMU (Gunyah emulates its global space). Use it
 only with the owner's approval, and only after a boot with the default showed `unmatched streams FAULT`.**
@@ -405,12 +405,12 @@ values and sequences only, our own code. Design reference only (no license file)
 | `negroniwlan=7..10` | - | 7 WLAN_CFG/MODE, 8 CE + HTC READY, 9 HTC/WMI to READY, 10 vdev + passive scan |
 | `negroniwlan_keep=S` | 0 | keep-alive seconds after the last level (0 = until a chip error) |
 | `negroniwlan_hostcap=android` | off | Android HOST_CAP: DRV bit + WSA gpio entry |
-| `negroniwlan_smmu=3` | 3 (0325) | 0324 stage-1 context; the default since 0325 (owner-approved 2026-10-27); `=1` / `=0` give the old report-only path |
+| `negroniwlan_smmu=3` | 1 | 0324/0325 stage-1 context, opt-in until the bank probe of the SMMU agent proves which banks HLOS may write (see "0325") |
 
 Boot-args for the combined image (the main session composes them; no image is built by this stage):
 `negroniwifi=10 negroniwlan=10 negronipanic=30 negronipanicreason=2`. Lower `negroniwlan` to stop earlier
 (7 = after WLAN_MODE, 8 = HTC READY, 9 = WMI READY). Optional, each needs a reason from a log first:
-`negroniwlan_hostcap=android` (QMI refusal), `negroniwlan_smmu=1` (the old path without the SMMU context; 3 is the default since 0325),
+`negroniwlan_hostcap=android` (QMI refusal), `negroniwlan_smmu=3` (the stage-1 context; only after the bank probe),
 `negroniwlan_keep=600` (stop the poller after 10 minutes). Precondition: the WLAN firmware area on userdata.
 
 Host test: `scripts/wifi/wmi-host-test.sh TREE` (patches/xnu/tests/wlan-wmi-test.c): WLAN_CFG = 493 bytes with
@@ -451,7 +451,17 @@ Files: `bsd/dev/negroni_wlan_smmu.c` (rewritten), `negroni_wlan.c`, `negroni_wla
 `negroni_wlan_qmi.c`. Made in `out/kernel/tree-wlansmmu` (patched-tree.sh, full set; deleted after). No later patch
 touches these files. Build-only: not run on the phone. The owner approved the SMMU write path (2026-10-27).
 
-**`negroniwlan_smmu=3` is the default** whenever the driver runs (`negroniwlan>=2`). `negroniwlan_smmu=1` (old
+**Status (2026-10-27, main-session review): `negroniwlan_smmu=1` is the default again; `=3` is opt-in.** A boot with
+the camera/audio stage-1 helper (0249) took an SEA on a GR1 CBAR write to a "free" bank: Gunyah refuses writes to some
+banks. 0325 uses the same free-bank rule, so =3 waits for the bank probe (a separate agent: ml_expect_fault-based probe,
+Android/HakiOS bank evidence). 0325 changes after that review: (a) the claim lock `negroni_smmu_claim_lock` (exported by
+0249, shared with its helper: SMRs top-down, context banks bottom-up from NUMS2CB since 2026-10-27; 0325 claims bottom-up) is held from the SMR/CB scan to the last SMR write and in
+the teardown; the root table is allocated before the lock; the SMR is read again right before its write; (b) the
+teardown writes back only registers that setup wrote and read back as written (flags for SCTLR, CBA2R, CBAR, S2CR, SMR;
+CBA2R and CBAR now in separate steps); (c) an SMR that already matches 0x1c01 is reused only with mask <= 1 and S2CR
+fault/bypass or translate into a context that is off.
+
+The first version of this section said: **`negroniwlan_smmu=3` is the default** whenever the driver runs (`negroniwlan>=2`). `negroniwlan_smmu=1` (old
 report-only check, stop on a sure fault) and `=0` (report only) stay selectable. `=2` (bypass entry) stays, but the
 hypervisor turns S2CR BYPASS into FAULT (arm-smmu-qcom.c bypass quirk, U-Boot qcom-hyp-smmu.c), so it is dead.
 
@@ -568,6 +578,124 @@ Shortest path to an associated link and an IP [I, from ath11k mac.c/wmi.c/dp*.c 
    0174-0179 and external/ios-spes 0113 (design only). docs/references-2026-10-27.md does not exist yet; read it
    when it appears before this step.
 
+### 0325 and the 2026-10-27 SMMU panic (SMMU kernel agent; for the Wi-Fi owner)
+
+The first boot with 0249 (audio through the shared stage-1 helper) panicked with an SEA on the CBAR restore of
+context 74 (README-camera.md "2026-10-27: panic, every stage-1 writer default OFF"). 0325 has the same pattern
+[V source]: `smmu_pick_cb` scans from context 0 (also the stage-2-only banks below IDR1.NUMS2CB) and teardown writes
+`SW(GR1(SMMU_CBAR(g_cb)), g_old_cbar)` and the old CBA2R back; with a picked bank of CBAR type S2_TRANS that write
+is the one Gunyah refused [I]. Linux (arm_smmu_destroy_domain_context) and HakiOS never write CBAR back.
+Asked of 0325 (relayed by the main session; the Wi-Fi agent edits 0325):
+- default `negroniwlan_smmu` 1 (report-only, stop before DMA) instead of 3 until `negronismmu_probe=1` was read;
+- teardown: SCTLR 0 + TLB sync only, no CBAR/CBA2R write;
+- bank choice: from `MAX(NUMS2CB, 1)`, skip `negroni_smmu_cb_verdict[c]` READ_ABORT/CLAIM_REFUSED/OURS
+  (`negroni_smmu_s1.h`), claim writes (CBA2R, CBAR) through `negroni_mmio_try_wr32` (0297) and skip the bank on a
+  refusal, take `negroni_smmu_claim_lock`, TLB sync time-out 500 ms (Linux).
+
+## 0326-0329: API seam, join, HTT data path, WPA2-PSK (2026-10-27)
+
+Made in `out/kernel/tree-wlan11` (patched-tree.sh, one commit per patch, review fixes folded in; deleted after).
+Reference: Linux ath11k for WCN6855 hw2.x (mac.c, wmi.c, dp*.c, hal*.c, hw.c); WMI ids/tags computed from the
+ath11k enums. Build-only: nothing of it has run on the phone. Order of the files in `bsd/conf/files`: after
+`negroni_wlan_smmu.c`: `_sta.c`, `_join.c`, `_dp.c`, `_wpa.c`, `_wpa_crypto.c`.
+
+### 0326: the seam for the iOS side (`bsd/dev/negroni_wlan_api.h`)
+
+Plain C (IOKit includes it in `extern "C"`). `NWLAN_API_VERSION 1`; `negroni_wlan_api_caps()` returns
+`NWLAN_CAP_SCAN` (0326), `_JOIN_OPEN` (0327), `_DATA` (0328, when the data path came up), `_WPA2_PSK` (0329, needs
+DATA). Functions: `negroni_wlan_api_ready`, `negroni_wlan_register` (one client: `rx(ctx, 802.3 frame, len)`,
+`event(ctx, NWLAN_EV_STATE|SCAN_DONE|LINK_UP|LINK_DOWN|RSSI)`), `negroni_wlan_link` (state, MAC from WMI READY, BSSID,
+SSID, RSSI, freq, AID, security, last_error, 802.11 reason, counters), `negroni_wlan_scan` + `negroni_wlan_scan_results`
+(newest first, with raw RSN/WPA/WMM/HT/VHT/rates elements), `negroni_wlan_associate(ssid, len, psk|NULL, psk_len)`,
+`negroni_wlan_disassociate`, `negroni_wlan_tx` (802.3; ENOTCONN/ENOBUFS). Every call returns at once; the driver
+thread does the work in the keep-alive pass and answers with events. Callbacks run on the driver thread and must not
+block. Guarantees (review fixes): every associate ends with LINK_UP or LINK_DOWN (also a join that never reached
+JOINING: no BSS -> ENOENT, wrong security -> ENOTSUP); every accepted scan ends with SCAN_DONE (normal end,
+START_FAILED, 30 s time-out, or a join that takes over a not-yet-started scan). The API is usable after level 10
+(state IDLE). No SSID and no key material in the log (SSID length only; also the 0323 `BSS N` lines now).
+
+### 0327: join an open network
+
+Sequence (ath11k, WCN6855 `vdev_start_delay`): BSS from the list (a scan first if none in the last 60 s), PEER_CREATE,
+(0328) HTT peer map + DP peer setup, VDEV_START (20 MHz, channel mode HE20 like `ath11k_phymodes`), AUTH open (3 tries
+x 500 ms) and ASSOC REQ by WMI_MGMT_TX_SEND (frame in a DMA slot), PEER_ASSOC (legacy + HT rates/caps from the AP's
+elements, WMM -> QoS, `ath11k_peer_assoc_prepare` for 20 MHz), VDEV_UP, DTIM policy stick, powersave off, PEER
+AUTHORIZE -> CONNECTED. Down: request, deauth/disassoc from the AP, PEER_STA_KICKOUT, ROAM beacon miss, 10 s without
+a beacon -> DEAUTH (our request only), VDEV_DOWN, VDEV_STOP, PEER_DELETE, IDLE + LINK_DOWN.
+
+### 0328: HTT data path (Ethernet frames)
+
+`negroni_wlan_dp.c`, polled (a poller in the service pass, never sends WMI): common rings + 4096 link descriptors +
+REO hash routing/aging + DSCP maps after the CE rings (before HTC READY, as `ath11k_dp_alloc`); REO2SW1..4 before WMI
+INIT; HTT VERSION (must be 3.x) + LMAC rings (refill = host->fw rx buffers, 2 mac buf, 2 rxdma error, 2 monitor
+status) + 7 HTT SRING_SETUP + monitor status filter off after WMI READY and the hw mode; per peer: HTT PEER_MAP,
+PEER_SET_DEFAULT_ROUTING, 17 REO queues (WMI_PEER_REORDER_QUEUE_SETUP), vdev TX encap and RX decap Ethernet
+(`frame_mode=2`). TX: one TCL descriptor per 802.3 frame (search default, ADDRY, TID 0, encrypt by the peer's key);
+RX: REO2SW MSDUs (Ethernet decap; a native-Wi-Fi decap is converted; multi-buffer MSDUs are dropped), buffers
+re-posted; REO exception / rxdma error rings recycle their buffers and give the link descriptors back. CE4 (HTT
+host->target) added to the CE code. `negroniwlan_dp=0` skips all of it (0323 behaviour).
+[I] Risks: the firmware may want the DP rings before WMI INIT exactly as here (done) and the monitor status ring
+filled (done, filter off); REO PN check is not enabled (no replay check on RX); no A-MPDU RX reorder beyond window 2.
+
+### 0329: WPA2-PSK
+
+`negroni_wlan_wpa_crypto.{c,h}` = HakiOS `wifi/lx/src/lx_wpa.{c,h}` (MIT, notice kept, commit a52a4c9d; only the file
+names, the include and `|| defined(KERNEL)` changed). Host test of the port with HakiOS `tools/wpa-test` (reference.py
+access point, ASan/UBSan): **195 checks, 0 failed** [V]. `negroni_wlan_wpa.c`: passphrase 8..63 printable or 64 hex
+(PMK), nonce from `read_random`, our RSN element (group CCMP, pairwise CCMP, AKM PSK, capabilities 0 = no MFP),
+EAPOL queued by the poller and handled at the top level, message 4 sent and drained before WMI_VDEV_INSTALL_KEY
+pairwise (idx 0) + group (its idx, RSC), INSTALL_KEY_COMPLETE checked, then PEER AUTHORIZE -> CONNECTED + LINK_UP;
+group rekey answered; 10 s / bad MIC -> down with reason 15. Not supported: TKIP group, WPA1, SAE/WPA3, MFP-required
+networks, 802.1X.
+
+### Test boot (after the bank probe allows `negroniwlan_smmu=3`, or with the old DMA path)
+
+`negroniwifi=10 negroniwlan=10 negronipanic=30 negronipanicreason=2` (+ `negroniwlan_smmu=3` when allowed). The join
+needs a client (the iOS side) calling `negroni_wlan_associate`; this stage adds no boot-arg SSID/passphrase.
+
+New proof lines (all `NEGRONI WLAN:`), in order after the 0321 CE lines:
+1. `DP common rings up: 4095 link descriptors, TCL data 64, tx completion 256, REO exception 128, ring area .. bytes at device 0x..; TCL data base reads X (wrote X)`
+2. after SERVICE_READY: `DP REO2SW1..4 up (256 entries each)`
+3. after the hw mode: `HTT target version 3.N`, `DP pdev rings up: 511 rx buffers on the refill ring, 126 on the monitor status rings, 7 HTT SRING_SETUP sent, monitor status filter off`
+4. `API state 1 -> 2` (STARTING -> IDLE) after level 10
+5. on an associate: `JOIN 02:..:..:xx:xx:xx, F MHz, RSSI .., security ..`, `DP peer id N mapped, ...`, `JOIN vdev 0 started on F MHz`, `JOIN AUTH accepted (...)`, `JOIN ASSOC accepted (status 0, AID n, ...)`, `JOIN PEER_ASSOC: ...`, `JOIN associated (SSID of N bytes) AID n`
+6. WPA2: `WPA2: PMK ready in .. ms`, `WPA2: message 1 -> message 2`, `WPA2: message 3 (MIC good) -> message 4; installing the keys`, `WPA2: pairwise + group key K installed (CCMP)`, `API state 5 -> 6` (CONNECTED)
+7. keep-alive every 60 s: `DP tx N (fail ..), rx N (drops .., errors .., bad ..), ...`
+
+What to read if it fails: `TCL data ring base does not read back` = the UMAC registers are not reached through the
+window; no `HTT target version` = HTT on CE4/CE1 broken; `HTT PEER_MAP` time-out = peer not created or HTT RX lost;
+`VDEV_START status N` = channel/mode refused; `JOIN AUTH FAILED (status 0xffff, k sent, j completed, f failed)`:
+j = 0 means the mgmt TX DMA never completed (SMMU/IOVA: read the SMMU fault line); `WPA2 ... signature` = wrong
+passphrase; `INSTALL_KEY ... refused` = key format; RX counters stay 0 while TX completes = REO queues / routing.
+
+### What the Apple80211/en0 side needs from here (for the iOS-side agent)
+
+en0 MAC = `nwlan_link.mac`; scan results with raw elements for SCAN_RESULT; associate/disassociate/link events for
+ASSOCIATE/ASSOCIATE_RESULT/DISASSOCIATE and link up/down; RSSI events; 802.3 TX/RX. Not provided yet: active scan,
+hidden-SSID join by probe, roaming, power save, 40/80 MHz, statistics beyond the counters.
+
+## 0325 rework after the 0249 panic decode (2026-10-27, SMMU agent findings)
+
+The SMMU agent decoded the 0249 panic: FAR = GR1 CBAR(74); the helper had picked a stage-2 bank and Gunyah refused the
+CBAR write (SEA). 0249 now follows Linux sm8450 arm-smmu.c, and 0297 adds `negroni_mmio_try_rd32/wr32` (an SEA is
+caught through the expected-fault hook and returned as an error). 0325 now does the same:
+- banks from `MAX(IDR1.NUMS2CB, 1)` upward (stage-1 banks start after the stage-2 banks, Linux);
+- a bank whose `negroni_smmu_cb_verdict[c]` (0249 probe `negronismmu_probe=1`, or the helper) is READ_ABORT,
+  CLAIM_REFUSED or OURS is skipped; every read of a candidate (CBAR, CBA2R, SCTLR) is a try-read (an abort marks it
+  READ_ABORT);
+- the claim is the test: SCTLR 0, CBA2R VA64, CBAR 0x1f300 through `negroni_mmio_try_wr32`, each read back; a refused or
+  not-kept write marks the bank CLAIM_REFUSED and the scan goes to the next bank (at most 8 claims); a good claim marks
+  it OURS;
+- teardown: SCTLR 0 + TLB sync only; CBAR and CBA2R are never written back (the bank stays OURS); S2CR/SMR are restored
+  only when they were proven writable;
+- TLB sync time-out 500 ms (setup and map/unmap); `negroni_smmu_claim_lock` held from the scan to the last SMR write;
+- the default stays `negroniwlan_smmu=1`; `=3` after the probe shows usable banks.
+
+New lines: `SMMU contexts from N (NUMS2CB M): ..., K skipped (probe/helper verdict or read abort), R claims refused`,
+`SMMU context C: claim refused or not kept (CBAR was X, reads Y); left as it is, next bank`,
+`SMMU context C claimed: CBAR was X (type t, VMID v) CBA2R Y, now CBAR 0x1f300 CBA2R 0x1`,
+`SMMU context C off (SCTLR 0 1; S2CR s SMR m restored; CBAR/CBA2R left claimed)`.
+
 ## 0261-negroni-wlan-mhi-fw.patch
 
 Stage 1 of the driver: claim BAR0, choose the firmware, download it over MHI (BHI + BHIe), reach
@@ -680,6 +808,9 @@ Never commit the firmware files or the area image.
 - iOS interface reference: `external/ios-sailfish/xnu/patches/0174`, `0175`, `0178`, `0179`
   (no license file: design only).
 - Step 10 is new code; it uses only PCI-spec offsets.
+- 0329 `negroni_wlan_wpa_crypto.{c,h}` is copied code: HakiOS `wifi/lx/src/lx_wpa.{c,h}` under the MIT License
+  (Copyright (c) 2025-2026 the HakiOS authors); the full notice is at the top of both files. Everything else in
+  0325-0329 is our own code from the ath11k / U-Boot / pci-msm values and sequences.
 
 ## 0340-0341: iOS side (Settings, wifid, en0, Apple80211) (2026-10-27)
 

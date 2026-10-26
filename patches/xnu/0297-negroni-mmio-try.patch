@@ -1,0 +1,166 @@
+0297-negroni-mmio-try: negroni_mmio_try_rd32/wr32 (osfmk/arm64/sleh.c, declared in bsd/dev/negroni_mmio.h):
+one plain "ldr w"/"str w" like negroni_mmio.h, but a synchronous external abort at that instruction (the
+hypervisor refused the access) returns -1 instead of a panic. Uses the CONFIG_XNUPOST expected-fault hook
+(ml_expect_fault_begin); handle_kernel_abort now also offers an SEA (DFSC 0x10) to it (stock xnu offers only
+VM faults, so the 2026-10-27 CBAR-restore SEA in negroni_smmu_s1.c undo() was a "Kernel data abort" panic),
+and sleh_synchronous accepts an FnV abort for this one handler, which checks the PC. Without CONFIG_XNUPOST
+(RELEASE) both return -2 and touch nothing. Used by 0249 (apps-SMMU stage-1 helper + negronismmu_probe).
+diff --git a/bsd/dev/negroni_mmio.h b/bsd/dev/negroni_mmio.h
+index b59591f..da9aa9f 100644
+--- a/bsd/dev/negroni_mmio.h
++++ b/bsd/dev/negroni_mmio.h
+@@ -34,4 +34,13 @@ negroni_mmio_wr32(vm_offset_t a, uint32_t v)
+ 	__asm__ volatile ("str %w0, [%1]" : : "r" (v), "r" (a) : "memory");
+ }
+ 
++/*
++ * 0297 (osfmk/arm64/sleh.c): the same single ldr/str, but an access that the hypervisor refuses with a
++ * synchronous external abort returns -1 instead of a panic (CONFIG_XNUPOST kernels: DEVELOPMENT/DEBUG;
++ * -2 and no access otherwise). 0 = done. For probes and for writes that may be refused (apps-SMMU CBAR).
++ */
++extern int negroni_mmio_try_rd32(vm_offset_t a, uint32_t *v);
++extern int negroni_mmio_try_wr32(vm_offset_t a, uint32_t v);
++extern uint32_t negroni_mmio_try_faults;
++
+ #endif /* _NEGRONI_MMIO_H_ */
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index c0b3a5a..464a2b9 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -47,6 +47,9 @@
+ #include <kern/task.h>
+ extern bool negroni_cpuidle_bcast_irq(uint32_t intid);     /* osfmk/arm64/negroni_cpuidle.c (0288) */
+ #endif
++#if defined(NEGRONI) && defined(CONFIG_XNUPOST)
++static bool negroni_mmio_try_fault(arm_saved_state_t *state);  /* 0297, end of this file */
++#endif
+ #include <kern/zalloc_internal.h>
+ #include <mach/exception.h>
+ #include <mach/arm/traps.h>
+@@ -672,7 +675,13 @@ sleh_synchronous(arm_context_t *context, uint32_t esr, vm_offset_t far)
+ 		thread->machine.expected_fault_handler = NULL;
+ 		thread->machine.expected_fault_addr = 0;
+ 
+-		if (saved_expected_fault_addr == far) {
++		if (saved_expected_fault_addr == far
++#if defined(NEGRONI)
++		    /* 0297: an SEA may come with FnV (FAR not valid); negroni_mmio_try_fault checks the PC itself */
++		    || (saved_expected_fault_handler == negroni_mmio_try_fault && class == ESR_EC_DABORT_EL1 &&
++		    (ESR_ISS(esr) & (1u << 10)))
++#endif
++		    ) {
+ 			expected_fault_handler = saved_expected_fault_handler;
+ 		}
+ 	}
+@@ -1637,6 +1646,13 @@ handle_kernel_abort(arm_saved_state_t *state, uint32_t esr, vm_offset_t fault_ad
+ 		kprintf("Unclassified kernel abort (fault_code=0x%x)\n", fault_code);
+ 	}
+ 
++#if defined(NEGRONI) && defined(CONFIG_XNUPOST)
++	/* 0297: a synchronous external abort (the hypervisor refused an MMIO access) inside
++	 * negroni_mmio_try_rd32/wr32 returns an error to the caller instead of a panic */
++	if (fault_code == FSC_SYNC_EXT_ABORT && expected_fault_handler && expected_fault_handler(state)) {
++		return;
++	}
++#endif
+ 	panic_with_thread_kernel_state("Kernel data abort.", state);
+ }
+ 
+@@ -2260,3 +2276,97 @@ sleh_invalid_stack(arm_context_t *context, uint32_t esr __unused, vm_offset_t fa
+ 	panic_with_thread_kernel_state("Invalid kernel stack pointer (probable corruption).", &context->ss);
+ }
+ 
++
++#if defined(NEGRONI)
++/*
++ * 0297: MMIO accesses that may be refused. Under Gunyah a refused access to a trapped register
++ * space (the apps SMMU global space: a CBAR write, 2026-10-27 panic in negroni_smmu_s1.c undo())
++ * comes back as a synchronous external abort (ESR 0x96000010). These two accessors arm
++ * ml_expect_fault_begin (CONFIG_XNUPOST, DEVELOPMENT kernels) around one plain "ldr w"/"str w"
++ * (the form Gunyah emulates, negroni_mmio.h); handle_kernel_abort hands an SEA to
++ * negroni_mmio_try_fault, which accepts it only at the two instructions below, sets x0 = ~0 and
++ * skips the instruction. Thread context only (an abort on the interrupt stack still panics).
++ *   0   done (rd: *v set)
++ *   -1  the access aborted (refused by the hypervisor or the bus)
++ *   -2  this kernel cannot catch the abort (no CONFIG_XNUPOST): nothing was accessed
++ */
++int negroni_mmio_try_rd32(vm_offset_t a, uint32_t *v);
++int negroni_mmio_try_wr32(vm_offset_t a, uint32_t v);
++uint32_t negroni_mmio_try_faults;       /* aborts caught so far (for the logs) */
++#if defined(CONFIG_XNUPOST)
++extern char negroni_mmio_try_ld_insn[], negroni_mmio_try_st_insn[];
++uint64_t negroni_mmio_try_ld32_raw(vm_offset_t a);
++uint64_t negroni_mmio_try_st32_raw(vm_offset_t a, uint64_t v);
++__asm__ (
++	"	.text\n"
++	"	.align 2\n"
++	"	.globl _negroni_mmio_try_ld32_raw\n"
++	"_negroni_mmio_try_ld32_raw:\n"
++	"	mov	x1, x0\n"
++	"	mov	x0, #-1\n"
++	"	.globl _negroni_mmio_try_ld_insn\n"
++	"	.alt_entry _negroni_mmio_try_ld_insn\n"   /* stays inside its function (no atom split by -dead_strip) */
++	"_negroni_mmio_try_ld_insn:\n"
++	"	ldr	w0, [x1]\n"             /* zero-extends: a value < 2^32 on success */
++	"	ret\n"
++	"	.globl _negroni_mmio_try_st32_raw\n"
++	"_negroni_mmio_try_st32_raw:\n"
++	"	mov	x2, x0\n"
++	"	mov	x0, #0\n"
++	"	.globl _negroni_mmio_try_st_insn\n"
++	"	.alt_entry _negroni_mmio_try_st_insn\n"   /* stays inside its function (no atom split by -dead_strip) */
++	"_negroni_mmio_try_st_insn:\n"
++	"	str	w1, [x2]\n"             /* w1 is a register, never WZR */
++	"	dsb	sy\n"
++	"	ret\n"
++	);
++
++static bool
++negroni_mmio_try_fault(arm_saved_state_t *state)
++{
++	uintptr_t pc = (uintptr_t)get_saved_state_pc(state);
++
++	if (pc != (uintptr_t)negroni_mmio_try_ld_insn && pc != (uintptr_t)negroni_mmio_try_st_insn) {
++		return false;
++	}
++	set_saved_state_reg(state, 0, (register_t)~0ull);
++	add_saved_state_pc(state, 4);
++	os_atomic_inc(&negroni_mmio_try_faults, relaxed);
++	return true;
++}
++
++int
++negroni_mmio_try_rd32(vm_offset_t a, uint32_t *v)
++{
++	ml_expect_fault_begin(negroni_mmio_try_fault, a);
++	uint64_t r = negroni_mmio_try_ld32_raw(a);
++	ml_expect_fault_end();
++	if (r > 0xffffffffull) {
++		return -1;
++	}
++	*v = (uint32_t)r;
++	return 0;
++}
++
++int
++negroni_mmio_try_wr32(vm_offset_t a, uint32_t v)
++{
++	ml_expect_fault_begin(negroni_mmio_try_fault, a);
++	uint64_t r = negroni_mmio_try_st32_raw(a, v);
++	ml_expect_fault_end();
++	return r ? -1 : 0;
++}
++#else /* !CONFIG_XNUPOST */
++int
++negroni_mmio_try_rd32(vm_offset_t a __unused, uint32_t *v __unused)
++{
++	return -2;
++}
++
++int
++negroni_mmio_try_wr32(vm_offset_t a __unused, uint32_t v __unused)
++{
++	return -2;
++}
++#endif /* CONFIG_XNUPOST */
++#endif /* NEGRONI */

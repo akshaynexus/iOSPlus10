@@ -12,7 +12,7 @@ Marks: **[V]** seen in a source (file:line given), **[I]** inference. Nothing he
 | 0314 `negroni-cam-imx789-stream` | `negronicam=4` | IMX789 FTM table (116 writes, stream on), frame counter 0x0005, stream off on every path | `IMX789 frame counter 0x.. -> 0x.. -> 0x..: MOVES (sensor streams)` |
 | 0315 `negroni-cam-csid-ife-rdi` | `negronicam=5` | CSID0 + IFE0 RDI0 frame-based WM -> contiguous buffer < 4 GiB; TPG13 frame, then sensor frame; `/dev/negronicam-tpg`, `/dev/negronicam-sensor` | `FRAME DONE`, `TPG frame sanity: PASS`, `SENSOR frame sanity: PASS`, `level 5 OK` |
 | 0316 `negroni-cam-icp-pas-hfi` | `negronicam=6` | CAMERA_ICP from the ADSP area into camera_region, PAS 33, HFI init + SYS_INIT | `ICP READY: HFI init response SUCCESS`, `ICP message: ... HFI_MSG_SYS_INIT_DONE` |
-| 0317 `negroni-cam-smmu-s1` | `negronicam_smmu=3` (default from level 5) | frame + HFI buffers anywhere in RAM, mapped at 32-bit IOVAs through an apps-SMMU stage-1 context of ours (helper of 0249) | `SMMU context N ON`, `camera DMA through SMMU context N`, `device address 0x10c00000 (SMMU IOVA)` |
+| 0317 `negroni-cam-smmu-s1` | `negronicam_smmu=3` (opt-in since 2026-10-27) | frame + HFI buffers anywhere in RAM, mapped at 32-bit IOVAs through an apps-SMMU stage-1 context of ours (helper of 0249) | `SMMU context N ON`, `camera DMA through SMMU context N`, `device address 0x10c00000 (SMMU IOVA)` |
 | 0318 `negroni-cam-ios-stream` | `negronicam=7` | `/dev/negronicam`: frame stream for iOS (HakiOS `/dev/hakios-camera` ABI), session on first read | `level 7: /dev/negronicam for iOS`, `ios session: start`, `ios session: N frames in M ms` |
 
 Default (`negronicam` absent or 0): no camera register access, no thread. `negronicam_pause=N` waits N ms
@@ -243,7 +243,71 @@ A 32-bit DMA master (IFE, ICP, the ADSP's 32-bit buffer addresses) can reach our
 translation. Gunyah turns an S2CR BYPASS entry into FAULT (README-wifi.md "2026-10-26 panic fix"), so the only
 path is a stage-1 context bank of our own, as Android does with iommu-dma (IOVAs from the DT windows).
 
+### 2026-10-27: panic, every stage-1 writer default OFF, helper rework (0249 + new 0297)
+
+The panic [V] (photo of the panic screen, kernel `out/kernel/local-20261026-210400`, boot with 0249): `Kernel data
+abort`, ESR 0x96000010 (synchronous external abort, DFSC 0x10), FAR `0xfffffe3006c99128`, pc in the static `undo()`
+at `str w10, [x8]` right after the `tlb_sync` delay loop = the CBAR restore. FAR offset 0x128 in global page 1 =
+`CBAR(74)`: the old helper took bank 74 (top-down) and, after a failed setup, wrote its old CBAR back. Which step
+failed first is not in the photo [V: unknown].
+
+Evidence (sources, not hardware) [V source, I conclusion]:
+- Linux on this phone (OnePlus sm8450 `drivers/iommu/arm/arm-smmu/arm-smmu.c` at op-kernel e9da5922): stage-1 banks
+  are allocated from `num_s2_context_banks` (IDR1.NUMS2CB) upward (:1572-1574, `__arm_smmu_alloc_cb` :455-470), only
+  the display handoff SMR 0x2800/0x402 is pre-reserved (:3429-3527); CBAR for stage 1 = 0x1f300 (:1161-1238); domain
+  free (`arm_smmu_destroy_domain_context` :1779-1833 -> `arm_smmu_write_context_bank(cfg NULL)` :1168-1171) writes
+  SCTLR = 0 only: **Linux never writes CBAR back, and never a stage-2 (S2_TRANS) CBAR on this SMMU**. TLB sync of a
+  stage-1 context: CB TLBIASID + CB TLBSYNC/TLBSTATUS, timeout 500 ms (`TLB_LOOP_TIMEOUT`), no clock/GDSC vote before
+  it (apps-smmu has no regulators); the time-out handler reads IMPL_DEF5 + 0x5dc (TBU sync/inv ack) and GR0 + 0x2670.
+- HakiOS (SM7325, same hypervisor family; `out/src/hackios-next` 8851317, `hakios.wifi.c`/`sound.c`/`camera.c`/`mpss.c`):
+  lowest bank no S2CR points at (contexts 7 and 8 on hardware), CBAR 0x1f300 VMID 0, CB sync, and **CBAR/CBA2R never
+  restored**; all four ran on hardware.
+- [I] Gunyah refuses an HLOS write of CBAR type S2_TRANS (stage 2 is the hypervisor's); the old helper wrote exactly
+  that (the U-Boot rule picks banks whose CBAR type is S2_TRANS, and undo() wrote it back).
+- The stock xnu `handle_kernel_abort` offers only VM faults to the CONFIG_XNUPOST expected-fault hook; an SEA always
+  panicked. 0297 adds the SEA case for its own accessors.
+
+Changes:
+- Defaults OFF until the probe proves the banks: `negroniaudio_smmu` default 0 (step 14 then stops cleanly: ring not
+  below 4 GiB), `negronicam_smmu` default 1 at every level (levels 5+ stop at the buffer: `use negronicam_smmu=3`),
+  Wi-Fi `negroniwlan_smmu` default 1 (one-line change in 0325, owned by the Wi-Fi agent, relayed by the main session).
+- 0297 `negroni_mmio_try_rd32/wr32` (osfmk/arm64/sleh.c, declared in `negroni_mmio.h`): one plain `ldr w`/`str w`;
+  an SEA at that instruction returns -1 (no panic). Needs CONFIG_XNUPOST (DEVELOPMENT kernel); else -2, no access.
+- Helper (0249): every setup/teardown access refusable; no stage-1 context without 0297's hook; banks from the
+  bottom up from NUMS2CB; candidate = U-Boot rule (or a bank we released) + SCTLR.M 0 + no S2CR into it + TLBSTATUS
+  idle + not marked by the probe; the claim (SCTLR 0, CBA2R 1, CBAR 0x1f300, read back) is the test, a refused bank
+  is skipped with no restore write (8 tries); teardown = S2CR/SMR back, SCTLR 0, TLB sync, **no CBAR/CBA2R write**;
+  TLB sync up to 500 ms with TBU/TCU ack lines on a time-out.
+- Probe `negronismmu_probe=1|2` (default 0, at boot, STARTUP EARLY_BOOT): per bank CBAR, CBA2R, SCTLR, TLBSTATUS
+  read, then the CBAR value just read written back and read again; `=1` writes only dormant banks (SCTLR.M 0, no S2CR
+  into them), `=2` every bank. No value changes, no SMR/S2CR/SCTLR/TLB write.
+
+Expected probe log (values are examples):
+```
+NEGRONI SMMU PROBE: SMMU S1 setup: sCR0 ... IDR0 ... IDR1 ...: 113 SMRs, 78 contexts (NUMS2CB n), 128 pages of 0x1000
+NEGRONI SMMU PROBE: level 1: 113 SMRs, 78 contexts, NUMS2CB n, page 0x1000; IDR2 ... sGFSR 0 sTLBGSTATUS 0 TCU ... TBU-ack ...; N of 113 SMRs valid
+NEGRONI SMMU PROBE: cb  0 CBAR 0x01f300 (type 1 vmid 0) CBA2R 0x1 SCTLR 0x1027 TLBSTATUS 0 refs 1 (SMR 0x84022800): in use: write not tried (probe=2 tries)
+NEGRONI SMMU PROBE: cb 74 CBAR 0x000000 (type 0 vmid 0) CBA2R 0 SCTLR 0 TLBSTATUS 0 refs 0: same-value CBAR write REFUSED (SEA caught)
+NEGRONI SMMU PROBE: summary: 78 banks (stage-1 from n): rewrite OK a, REFUSED b, changed c, read-abort d, not tried e; f aborts caught
+NEGRONI SMMU PROBE: same-value CBAR write REFUSED (SEA caught): 70 71 ...
+NEGRONI SMMU PROBE: same-value CBAR write OK: 7 8 ...
+```
+The probe prints at EARLY_BOOT, before the USB console: `op10tool ctl log` (last 64 KiB) does not reach it and the
+phone has no dmesg [V, t4 RAM boot 03:01]. So the same text comes again 60 s after boot (`NEGRONI SMMU PROBE: again
+(level 1, from boot):` + the lines; `negronismmu_probe_again=N` seconds, 0 = off), and `sysctl kern.negroni_smmu_probe`
+(root only) returns it at any time.
+
+Review fixes (Opus, ACCEPT): `.alt_entry` on the two instruction labels of 0297; report/fsr and the ON lines through
+the refusable accessors; SCTLR written only after the CBAR claim and only when not 0; banks the probe marked
+REWRITE_REFUSED or CHANGED are skipped by negroni_s1_on.
+
+How to read it: type-0 banks REFUSED and type-1 banks OK = the S2_TRANS theory holds; read-abort banks are not
+HLOS's; a non-zero TLBSTATUS on an idle bank explains the old sync time-out.
+
 ### The helper (0249, `bsd/dev/negroni_smmu_s1.c`)
+
+(Text below is the first version; the 2026-10-27 rework above replaces the bank order, the CBAR restore and the
+TLB sync time-out.)
 
 - Generic copy of the 0324/0325 Wi-Fi sequence: `struct negroni_s1 { name, streams[] (SMR id/mask), ... }`,
   `negroni_s1_on`, `negroni_s1_map_kva(iova, kva, size)` (any physical layout, 4 KiB pages), `negroni_s1_report`,
@@ -284,8 +348,8 @@ the ADSP address `0x1_1000_0000`. `negroniaudio_smmu=0` keeps the 0243 physical 
 
 ### Camera DMA (0317)
 
-- `negronicam_smmu=3` is the default when `negronicam>=5` (absent boot-arg); `=1`/`=2`/`=0` keep the 0312 paths
-  (they fail at the buffer: `has no 32-bit address ... use negronicam_smmu=3`).
+- `negronicam_smmu=3` is opt-in (since 2026-10-27; it was the default at `negronicam>=5`); the default 1 and
+  `=2`/`=0` keep the 0312 paths (they fail at the buffer: `has no 32-bit address ... use negronicam_smmu=3`).
 - Streams (live.dts:22589, 22629): IFE one SMR 0x800/0x460 (exactly the 8 SIDs); level 6 adds the ICP SMRs
   0x2000/0x420, 0x2040/0x420, 0x2100/0x420, 0x2080/0x400 (exactly the 14 SIDs; the wider 0x2000/0x5e0 of the
   level-3 report would also catch the JPEG/CDM streams). One context bank for all.
@@ -324,11 +388,12 @@ the ADSP address `0x1_1000_0000`. `negroniaudio_smmu=0` keeps the 0243 physical 
 
 | Goal | Boot-args |
 |---|---|
-| frames into memory, IFE through our SMMU context (first test) | `negronicam=5 negronipanic=30 negronipanicreason=2` |
+| bank survey first (no camera, no audio) | `negronismmu_probe=1` |
+| frames into memory, IFE through our SMMU context (after the probe) | `negronicam=5 negronicam_smmu=3 negronipanic=30 negronipanicreason=2` |
 | TPG only (no sensor power) | `negronicam=5 negronicam_src=1 ...` |
 | ICP (needs the ADSP area with CAMERA_ICP) | `negronicam=6 ...` |
 | stream for iOS (after level 5 passes) | `negronicam=7 ...` (TPG stream: add `negronicam_src=1`) |
-| audio ring through the SMMU | the audio args as before (`negroniadsp_step=15 ...`); `negroniaudio_smmu=0` = old path |
+| audio ring through the SMMU | the audio args as before (`negroniadsp_step=15 ...`) + `negroniaudio_smmu=1` (opt-in since 2026-10-27) |
 
 Expected level-5 proof lines (new in 0317, then the 0315 lines):
 
