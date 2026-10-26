@@ -1,0 +1,925 @@
+diff --git a/bsd/dev/negroni_bt.c b/bsd/dev/negroni_bt.c
+index cbd8ece..31d5f2e 100644
+--- a/bsd/dev/negroni_bt.c
++++ b/bsd/dev/negroni_bt.c
+@@ -20,7 +20,8 @@
+  *
+  * Boot-args (default: nothing runs, no register is touched):
+  *   negronibt=1          steps 1-8: map, pin census, rails, clocks, GENI check, UART 115200, BT_EN, RX idle bytes
+- *   negronibt=2          + the HCI stage (negroni_bt_hci.c, patch 0331)
++ *   negronibt=2          + the HCI stage steps 9-11: reset, version, baud (negroni_bt_hci.c, patch 0331)
++ *   negronibt=3          + steps 12-19: rampatch + NVM from the WLAN firmware area, reset, BD address
+  *   negronibt_delay=S    seconds before step 1 (default 3)
+  *   negronibt_noflow=1   ignore CTS (no hardware flow control)
+  *   negronibt_rfropen=1  start RX with the vendor parameters (RFR open, skip frame-error/break chars)
+@@ -797,8 +798,9 @@ bt_thread(void *arg __unused, wait_result_t w __unused)
+ 	STEP(8, "RX idle bytes");
+ 	step_rx_idle();
+ 
+-	if (bt.mode >= 2) {
+-		negroni_bt_hci_run(bt.mode);
++	if (bt.mode >= 2 && negroni_bt_hci_run(bt.mode) != 0) {
++		SAY("stop: the HCI stage failed\n");
++		goto out;
+ 	}
+ 	ok = true;
+ 	SAY("stage A done (RX ring dropped %u bytes)\n", bt.dropped);
+diff --git a/bsd/dev/negroni_bt.h b/bsd/dev/negroni_bt.h
+index e8ca82b..9312e01 100644
+--- a/bsd/dev/negroni_bt.h
++++ b/bsd/dev/negroni_bt.h
+@@ -19,8 +19,9 @@ uint64_t negroni_bt_us(void);
+ void negroni_bt_sleep_ms(uint32_t ms);
+ uint32_t negroni_bt_arg(const char *name, uint32_t def);        /* "negronibt_" + name boot-arg */
+ 
+-/* HCI stage, implemented in negroni_bt_hci.c: runs on the BT thread after step 8 when negronibt >= 2 */
+-void negroni_bt_hci_run(uint32_t mode);
++/* HCI stage, implemented in negroni_bt_hci.c (patch 0331): runs on the BT thread after step 8 when negronibt >= 2.
++ * 0 or errno; an error makes negroni_bt.c drive BT_EN low (the stage A failure path). */
++int negroni_bt_hci_run(uint32_t mode);
+ 
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+ #endif /* _NEGRONI_BT_H_ */
+diff --git a/bsd/dev/negroni_bt_hci.c b/bsd/dev/negroni_bt_hci.c
+index 9350408..0b85d65 100644
+--- a/bsd/dev/negroni_bt_hci.c
++++ b/bsd/dev/negroni_bt_hci.c
+@@ -1,14 +1,875 @@
+ /*
+- * NEGRONI QCA6490 Bluetooth HCI stage (patch 0331 replaces this file).
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450): QCA6490 Bluetooth, stage A part 2 (patch 0331): the HCI stage over H4 on
++ * the GENI UART of patch 0330 (negroni_bt.c). Runs on the BT thread after step 8 when negronibt >= 2.
++ *
++ * The QCA6490 BT core is the "HSP" family (rampatch hpbtfwNN.tlv, NVM hpnvNN.bXX or hpnvNN.bin), which Linux drives as
++ * QCA_WCN6855 (soc_type >= QCA_WCN3991: EDL answers come in Command Complete events). Sequence and frame formats
++ * from Linux drivers/bluetooth/btqca.c and hci_qca.c (read for the protocol; this file is our own code):
++ *   negronibt=2   step 9  HCI_RESET (0x0c03) at 115200, wait for Command Complete
++ *                 step 10 EDL_PATCH_VER_REQ (0xfc00, sub 0x19): product / SoC / ROM / patch version (qca_read_soc_version)
++ *                 step 11 baud change (0xfc48 + QCA baud code; RFR not ready while the command goes out; 10 ms; host
++ *                         UART reprogrammed; RFR follows the FIFO again; qca_set_speed / qca_set_baudrate), then
++ *                         the version request again at the new rate (proof the link works there)
++ *   negronibt=3   + step 12 firmware pack from the WLAN firmware area ("negroni-bt.bin", scripts/bt/mkbtarea.sh)
++ *                 step 13 rampatch hpbtfwNN.tlv in 243-byte EDL_PATCH_TLV_REQ segments (0xfc00, sub 0x1e)
++ *                 step 14 board id (0xfc00, sub 0x23) -> NVM name (qca_get_nvm_name_by_board)
++ *                 step 15 NVM (TLV type 2; tag 17 baud byte = the current rate), every segment acked
++ *                 step 16 SoC logging off (0xfc17), step 17 HCI_RESET, step 18 firmware build label (0xfc00, sub 0x20)
++ *                 step 19 HCI_Read_BD_ADDR (0x1009), compared with the NVM tag 2 default (qca_check_bdaddr)
++ * Boot-args: negronibt_to=MS (every wait, default 2000, max 30000), negronibt_baud=B (default 3000000; 115200 =
++ *   no change), negronibt_ibs=1 (NVM: set the in-band sleep bit, tag 17 byte 0 bit 7, and the deep sleep bit,
++ *   tag 27 byte 0 bit 0, as Linux does; default: the file's bits stay; the host has no IBS state machine).
++ * Log: "NEGRONI BT: step N NAME", one line per HCI event ("evt ...", first 16 bytes), "stop: ..." on failure.
++ * A non-zero return makes negroni_bt.c drive BT_EN low (0330 failure path). Every wait is bounded; every RX
++ * length is checked before it is used.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <vm/vm_kern.h>
++#include <libkern/crypto/sha2.h>
+ #include "negroni_bt.h"
+ 
+-void
++extern int negroni_ufs_wlan_area_read(uint64_t at, void *dst, uint32_t count);
++
++#define SAY(...)        printf("NEGRONI BT: " __VA_ARGS__)
++#define STEP(n, name)   printf("NEGRONI BT: step %u %s\n", (unsigned)(n), name)
++
++/* H4 packet indicators (Bluetooth Core, Vol 4 Part A) and the QCA in-band sleep bytes (hci_qca.c:44-46) */
++#define H4_CMD          0x01u
++#define H4_ACL          0x02u
++#define H4_SCO          0x03u
++#define H4_EVT          0x04u
++#define IBS_SLEEP_IND   0xfeu
++#define IBS_WAKE_IND    0xfdu
++#define IBS_WAKE_ACK    0xfcu
++
++#define EV_CMD_COMPLETE 0x0eu
++#define EV_CMD_STATUS   0x0fu
++#define EV_HW_ERROR     0x10u
++#define EV_VENDOR       0xffu
++
++#define OP_RESET        0x0c03u
++#define OP_READ_BD_ADDR 0x1009u
++#define OP_EDL          0xfc00u         /* EDL_PATCH_CMD_OPCODE, btqca.h:8 */
++#define OP_SET_BAUD     0xfc48u         /* hci_qca.c:1347 */
++#define OP_LOGGING      0xfc17u         /* QCA_DISABLE_LOGGING, btqca.h:20 */
++#define EDL_VER_REQ     0x19u
++#define EDL_TLV_REQ     0x1eu
++#define EDL_BUILD_INFO  0x20u
++#define EDL_BID_REQ     0x23u
++#define EDL_APP_VER_RES 0x02u           /* VSE form of the version answer (older SoCs) */
++#define EDL_TLV_RES     0x04u           /* VSE form of the TLV ack */
++#define TLV_SEG         243u            /* MAX_SIZE_PER_TLV_SEGMENT, btqca.h:18 */
++#define TAG_BD_ADDR     2u
++#define TAG_HCI         17u
++#define TAG_DEEP_SLEEP  27u
++
++#define RX_BUF          1100u           /* largest H4 frame accepted: ACL 5 + 1021 */
++#define DUMP_MAX        16u
++
++/* WLAN firmware area header (scripts/wifi/mkwlanarea.py, negroni_wlan.c) and the BT pack inside it */
++#define AREA_HDR        0x8000u
++#define AREA_MAX        256u
++#define PACK_NAME       "negroni-bt.bin"
++#define PACK_HDR        0x4000u
++#define PACK_MAX        160u
++#define FW_CAP          (512u << 10)    /* hpbtfw20.tlv is 201560 B */
++
++struct fw_entry {
++	char name[48];
++	uint32_t offset;
++	uint32_t size;
++	uint8_t sha256[32];
++} __attribute__((packed));
++struct area_header {
++	char magic[8];
++	uint32_t version;
++	uint32_t count;
++	struct fw_entry e[AREA_MAX];
++} __attribute__((packed));
++struct pack_header {
++	char magic[8];                  /* "NEGRBTFW" */
++	uint32_t version;               /* 1 */
++	uint32_t count;
++	struct fw_entry e[PACK_MAX];
++} __attribute__((packed));
++_Static_assert(sizeof(struct fw_entry) == 88, "entry is 88 bytes (mkwlanarea.py, mkbtpack.py)");
++_Static_assert(sizeof(struct area_header) <= AREA_HDR, "area header larger than 32 KiB");
++_Static_assert(sizeof(struct pack_header) <= PACK_HDR, "pack header larger than 16 KiB");
++
++struct qca_ver {
++	uint32_t product, soc;
++	uint16_t patch, rom;
++};
++
++static struct {
++	uint32_t to_ms, ibs, quiet, garbage;
++	uint8_t rx[RX_BUF];
++	uint32_t rxn;
++	uint8_t type;                   /* H4 type of the last packet */
++	uint8_t pkt[RX_BUF];            /* last packet without the type byte */
++	uint32_t pktn;
++	struct qca_ver ver;
++	uint8_t rom;                    /* firmware file ROM number, e.g. 0x21 */
++	bool gf;
++	uint8_t nvm_bdaddr[6];
++	bool nvm_bdaddr_set;
++	struct pack_header *pack;
++	uint64_t pack_at;               /* byte offset of the pack inside the WLAN area */
++	uint32_t pack_size;
++	uint8_t *fw;
++} h;
++
++static inline uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++static inline uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* " xx xx ..." of the first DUMP_MAX bytes, " ..." when longer */
++static const char *
++hex(const uint8_t *b, uint32_t n)
++{
++	static char s[3 * DUMP_MAX + 8];
++	uint32_t i, m = MIN(n, DUMP_MAX);
++	s[0] = 0;
++	for (i = 0; i < m; i++) {
++		snprintf(s + 3 * i, 4, " %02x", b[i]);
++	}
++	if (n > m) {
++		strlcpy(s + 3 * m, " ...", 5);
++	}
++	return s;
++}
++
++static void
++consume(uint32_t n)
++{
++	if (n >= h.rxn) {
++		h.rxn = 0;
++		return;
++	}
++	memmove(h.rx, h.rx + n, h.rxn - n);
++	h.rxn -= n;
++}
++
++/* Next H4 packet from the UART into h.type / h.pkt, or ETIMEDOUT at `deadline` (us). */
++static int
++h4_next(uint64_t deadline)
++{
++	for (;;) {
++		while (h.rxn > 0) {
++			uint8_t t = h.rx[0];
++			uint32_t need;
++
++			if (t == IBS_WAKE_IND || t == IBS_SLEEP_IND || t == IBS_WAKE_ACK) {
++				SAY("IBS byte %#x from the controller%s\n", t, t == IBS_WAKE_IND ? " (WAKE_ACK sent)" : "");
++				if (t == IBS_WAKE_IND) {
++					uint8_t ack = IBS_WAKE_ACK;
++					(void)negroni_bt_uart_write(&ack, 1);
++				}
++				consume(1);
++				continue;
++			}
++			if (t == H4_EVT) {
++				if (h.rxn < 3) {
++					break;
++				}
++				need = 3u + h.rx[2];
++			} else if (t == H4_ACL) {
++				if (h.rxn < 5) {
++					break;
++				}
++				need = 5u + le16(h.rx + 3);
++			} else if (t == H4_SCO) {
++				if (h.rxn < 4) {
++					break;
++				}
++				need = 4u + h.rx[3];
++			} else {
++				if (h.garbage++ < 16) {
++					SAY("H4: byte %#x is no packet type, dropped\n", t);
++				}
++				consume(1);
++				continue;
++			}
++			if (need > RX_BUF) {
++				SAY("H4: type %#x length %u larger than %u, byte dropped\n", t, need, RX_BUF);
++				consume(1);
++				continue;
++			}
++			if (h.rxn < need) {
++				break;
++			}
++			h.type = t;
++			h.pktn = need - 1u;
++			memcpy(h.pkt, h.rx + 1, h.pktn);
++			consume(need);
++			return 0;
++		}
++		uint32_t got = negroni_bt_uart_read(h.rx + h.rxn, RX_BUF - h.rxn);
++		h.rxn += got;
++		if (negroni_bt_us() > deadline) {     /* every pass: a stream with no gap must not extend the wait */
++			return ETIMEDOUT;
++		}
++		if (got == 0) {
++			delay(20);
++		}
++	}
++}
++
++/* One log line per HCI event: code, length, decoded CC/CS fields, first 16 bytes of the event */
++static void
++log_event(void)
++{
++	const uint8_t *p = h.pkt + 2;
++	uint32_t plen = h.pkt[1];
++	char what[64];
++
++	what[0] = 0;
++	if (h.pkt[0] == EV_CMD_COMPLETE && plen >= 3) {
++		if (plen >= 4) {
++			snprintf(what, sizeof(what), " (Command Complete op %#06x status %#x)", le16(p + 1), p[3]);
++		} else {
++			snprintf(what, sizeof(what), " (Command Complete op %#06x)", le16(p + 1));
++		}
++	} else if (h.pkt[0] == EV_CMD_STATUS && plen >= 4) {
++		snprintf(what, sizeof(what), " (Command Status op %#06x status %#x)", le16(p + 2), p[0]);
++	} else if (h.pkt[0] == EV_HW_ERROR && plen >= 1) {
++		snprintf(what, sizeof(what), " (Hardware Error code %#x)", p[0]);
++	} else if (h.pkt[0] == EV_VENDOR) {
++		snprintf(what, sizeof(what), " (vendor event)");
++	}
++	SAY("evt %#04x plen %u%s:%s\n", h.pkt[0], plen, what, hex(h.pkt, h.pktn));
++}
++
++static int
++hci_cmd(uint16_t op, const uint8_t *par, uint8_t len, bool log)
++{
++	uint8_t b[4 + 255];
++	b[0] = H4_CMD;
++	b[1] = (uint8_t)op;
++	b[2] = (uint8_t)(op >> 8);
++	b[3] = len;
++	if (len) {
++		memcpy(b + 4, par, len);
++	}
++	if (log) {
++		SAY("cmd %#06x plen %u:%s\n", op, len, hex(b, 4u + len));
++	}
++	int error = negroni_bt_uart_write(b, 4u + len);
++	if (error) {
++		SAY("cmd %#06x: UART write error %d\n", op, error);
++	}
++	return error;
++}
++
++#define R_CC    1
++#define R_VSE   2
++
++/*
++ * Wait for the answer to `op`: its Command Complete (return parameters in *ret / *rlen) or a vendor event
++ * [00 vse ...] (vse = the EDL response type; VSE_ANY: any vendor event; VSE_NONE: none). Command Status with an
++ * error ends the wait (EIO). Other packets are logged and skipped. Returns R_CC, R_VSE or -errno.
++ */
++#define VSE_NONE        (-1)
++#define VSE_ANY         0x100
++
++static int
++wait_reply(uint16_t op, int vse, const uint8_t **ret, uint32_t *rlen)
++{
++	uint64_t deadline = negroni_bt_us() + (uint64_t)h.to_ms * 1000u;
++
++	for (;;) {
++		if (h4_next(deadline)) {
++			SAY("no answer to %#06x within %u ms (RX buffer %u bytes:%s)\n", op, h.to_ms, h.rxn, hex(h.rx, h.rxn));
++			return -ETIMEDOUT;
++		}
++		if (h.type != H4_EVT) {
++			SAY("H4 type %#x, %u bytes, skipped:%s\n", h.type, h.pktn, hex(h.pkt, h.pktn));
++			continue;
++		}
++		const uint8_t *p = h.pkt + 2;
++		uint32_t plen = h.pkt[1];
++		if (!h.quiet) {
++			log_event();
++		}
++		if (h.pkt[0] == EV_CMD_COMPLETE && plen >= 3 && le16(p + 1) == op) {
++			*ret = p + 3;
++			*rlen = plen - 3u;
++			return R_CC;
++		}
++		if (h.pkt[0] == EV_CMD_STATUS && plen >= 4 && le16(p + 2) == op && p[0] != 0) {
++			if (h.quiet) {
++				log_event();
++			}
++			return -EIO;
++		}
++		if (h.pkt[0] == EV_VENDOR && (vse == VSE_ANY || (vse >= 0 && plen >= 2 && p[0] == 0 && p[1] == vse))) {
++			*ret = p;
++			*rlen = plen;
++			return R_VSE;
++		}
++		if (h.pkt[0] == EV_HW_ERROR && h.quiet) {
++			log_event();
++		}
++	}
++}
++
++/* Command + its Command Complete with status 0 */
++static int
++cmd_cc(uint16_t op, const uint8_t *par, uint8_t len, const uint8_t **ret, uint32_t *rlen)
++{
++	int r = hci_cmd(op, par, len, true);
++	if (r) {
++		return r;
++	}
++	r = wait_reply(op, VSE_NONE, ret, rlen);
++	if (r < 0) {
++		return -r;
++	}
++	if (*rlen < 1 || (*ret)[0] != 0) {
++		SAY("%#06x: Command Complete status %#x (%u return bytes)\n", op, *rlen ? (*ret)[0] : 0xffu, *rlen);
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++step_reset(uint32_t n)
++{
++	const uint8_t *r;
++	uint32_t rl;
++	uint64_t t0 = negroni_bt_us();
++	int error = cmd_cc(OP_RESET, NULL, 0, &r, &rl);
++	if (!error) {
++		SAY("%u HCI_RESET: Command Complete status 0 after %llu ms at %u baud\n", n, (negroni_bt_us() - t0) / 1000u,
++		    negroni_bt_uart_baud());
++	}
++	return error;
++}
++
++/* btqca.c:16 qca_read_soc_version: CC form (soc_type >= WCN3991, 15 bytes) or VSE form (rtype 0x02) */
++static int
++read_version(uint32_t n)
++{
++	const uint8_t sub = EDL_VER_REQ;
++	const uint8_t *r, *v = NULL;
++	uint32_t rl;
++	int error = hci_cmd(OP_EDL, &sub, 1, true), k;
++
++	if (error) {
++		return error;
++	}
++	k = wait_reply(OP_EDL, EDL_APP_VER_RES, &r, &rl);
++	if (k < 0) {
++		return -k;
++	}
++	if (k == R_CC && rl >= 15 && r[0] == 0 && r[1] == EDL_VER_REQ) {
++		v = r + 3;
++	} else if (k == R_VSE && rl >= 14 && r[0] == 0 && r[1] == EDL_APP_VER_RES) {
++		v = r + 2;
++	}
++	if (!v) {
++		SAY("%u version answer not understood (%s, %u bytes)\n", n, k == R_CC ? "CC" : "VSE", rl);
++		return EILSEQ;
++	}
++	h.ver.product = le32(v);
++	h.ver.patch = le16(v + 4);
++	h.ver.rom = le16(v + 6);
++	h.ver.soc = le32(v + 8);
++	uint32_t soc_ver = h.ver.soc << 16 | h.ver.rom;         /* btqca.h:51 get_soc_ver */
++	h.rom = (uint8_t)(((soc_ver & 0xf00u) >> 4) | (soc_ver & 0xfu));     /* btqca.c:776 */
++	h.gf = (h.ver.soc & 0xff00u) == 0x1200u;                /* QCA_HSP_GF_SOC_ID / _MASK, btqca.h:54 */
++	SAY("%u QCA product %#010x, SoC %#010x, ROM %#06x, patch %#06x (%s): controller version %#010x, firmware "
++	    "ROM %02x%s\n", n, h.ver.product, h.ver.soc, h.ver.rom, h.ver.patch, k == R_CC ? "Command Complete" :
++	    "vendor event", soc_ver, h.rom, h.gf ? " GF (\"g\" NVM)" : "");
++	if (h.ver.soc == 0 || h.ver.rom == 0) {                 /* btqca.c:79 */
++		return EILSEQ;
++	}
++	return 0;
++}
++
++static int
++baud_code(uint32_t baud)
++{
++	switch (baud) {                                         /* hci_qca.c:1306 qca_get_baudrate_value */
++	case 115200: return 0x00;
++	case 230400: return 0x05;
++	case 460800: return 0x07;
++	case 921600: return 0x0a;
++	case 1000000: return 0x0b;
++	case 2000000: return 0x0d;
++	case 3000000: return 0x0e;
++	case 3200000: return 0x11;
++	default: return -1;
++	}
++}
++
++/* hci_qca.c:1487 qca_set_speed (WCN6855 branch) + :1342 qca_set_baudrate */
++static int
++step_baud(uint32_t baud)
++{
++	int code = baud_code(baud);
++	uint8_t c;
++	const uint8_t *r;
++	uint32_t rl;
++
++	if (code < 0) {
++		SAY("11 negronibt_baud=%u is not a QCA baud code; stop\n", baud);
++		return EINVAL;
++	}
++	c = (uint8_t)code;
++	negroni_bt_uart_flow(false);                            /* RFR not ready while the rate changes */
++	int error = hci_cmd(OP_SET_BAUD, &c, 1, true);
++	if (error) {
++		negroni_bt_uart_flow(true);
++		return error;
++	}
++	negroni_bt_sleep_ms(10);                                /* usleep_range(1000, 10000), hci_qca.c:1386 */
++	error = negroni_bt_uart_set_baud(baud);
++	negroni_bt_uart_flow(true);
++	if (error) {
++		SAY("11 the host UART cannot run at %u (error %d); the controller may already have switched\n", baud, error);
++		return error;
++	}
++	SAY("11 controller and host at %u baud (code %#x)\n", baud, c);
++	/* events for 0xfc48 (if any) arrive at the new rate: log them for 100 ms */
++	uint32_t saved = h.to_ms;
++	h.to_ms = 100;
++	int k = wait_reply(OP_SET_BAUD, VSE_ANY, &r, &rl);
++	h.to_ms = saved;
++	SAY("11 answer to 0xfc48 at the new rate: %s\n", k == R_CC ? "Command Complete" : k == R_VSE ? "vendor event" :
++	    "none within 100 ms (hci_qca.c does not wait for one)");
++	return read_version(11);
++}
++
++/* ---- firmware pack (scripts/bt/mkbtpack.py) inside the WLAN area (scripts/wifi/mkwlanarea.py) ---- */
++
++static int
++step_area(void)
++{
++	struct area_header *a = NULL;
++	int error = ENOENT;
++
++	if (kmem_alloc(kernel_map, (vm_offset_t *)&a, AREA_HDR, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, (vm_offset_t *)&h.pack, PACK_HDR, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, (vm_offset_t *)&h.fw, FW_CAP, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		SAY("12 no memory for the firmware buffers; stop\n");
++		error = ENOMEM;
++		goto out;
++	}
++	error = negroni_ufs_wlan_area_read(0, a, AREA_HDR);
++	if (error || memcmp(a->magic, "NEGRWLAN", 8) != 0 || a->version != 1 || a->count == 0 || a->count > AREA_MAX) {
++		SAY("12 no WLAN firmware area header (read error %d); write out/bt/wlan-bt-area.bin "
++		    "(README-bluetooth.md); stop\n", error);
++		error = error ? error : EINVAL;
++		goto out;
++	}
++	error = ENOENT;
++	for (uint32_t i = 0; i < a->count; i++) {
++		const struct fw_entry *e = &a->e[i];
++		if (strncmp(e->name, PACK_NAME, sizeof(e->name)) != 0) {
++			continue;
++		}
++		if (e->offset < AREA_HDR || e->size < PACK_HDR || e->size > (8u << 20)) {
++			SAY("12 %s offset %#x size %u out of range; stop\n", PACK_NAME, e->offset, e->size);
++			error = ERANGE;
++			goto out;
++		}
++		h.pack_at = e->offset;
++		h.pack_size = e->size;
++		error = 0;
++		break;
++	}
++	if (error) {
++		SAY("12 the WLAN area (%u files) has no %s: write out/bt/wlan-bt-area.bin (scripts/bt/mkbtarea.sh); "
++		    "stop\n", a->count, PACK_NAME);
++		goto out;
++	}
++	error = negroni_ufs_wlan_area_read(h.pack_at, h.pack, PACK_HDR);
++	if (error || memcmp(h.pack->magic, "NEGRBTFW", 8) != 0 || h.pack->version != 1 || h.pack->count == 0 ||
++	    h.pack->count > PACK_MAX) {
++		SAY("12 %s header bad (read error %d); stop\n", PACK_NAME, error);
++		error = error ? error : EINVAL;
++		goto out;
++	}
++	SAY("12 %s at area byte %#llx, %u bytes, %u files\n", PACK_NAME, h.pack_at, h.pack_size, h.pack->count);
++out:
++	if (a) {
++		kmem_free(kernel_map, (vm_offset_t)a, AREA_HDR);
++	}
++	return error;
++}
++
++/* Read one file of the pack into h.fw, check its SHA-256 */
++static int
++fw_load(const char *name, uint32_t *size)
++{
++	for (uint32_t i = 0; i < h.pack->count; i++) {
++		const struct fw_entry *e = &h.pack->e[i];
++		if (strncmp(e->name, name, sizeof(e->name)) != 0) {
++			continue;
++		}
++		if (e->size == 0 || e->size > FW_CAP || e->offset < PACK_HDR || e->offset > h.pack_size ||
++		    e->size > h.pack_size - e->offset) {
++			SAY("%s size %u / offset %#x out of range\n", name, e->size, e->offset);
++			return ERANGE;
++		}
++		int error = negroni_ufs_wlan_area_read(h.pack_at + e->offset, h.fw, e->size);
++		if (error) {
++			SAY("%s read error %d\n", name, error);
++			return error;
++		}
++		uint8_t d[32];
++		SHA256_CTX c;
++		SHA256_Init(&c);
++		SHA256_Update(&c, h.fw, e->size);
++		SHA256_Final(d, &c);
++		if (memcmp(d, e->sha256, 32) != 0) {
++			SAY("%s %u bytes, sha-256 MISMATCH\n", name, e->size);
++			return EBADMSG;
++		}
++		SAY("%s %u bytes loaded, sha-256 OK\n", name, e->size);
++		*size = e->size;
++		return 0;
++	}
++	SAY("%s not in %s\n", name, PACK_NAME);
++	return ENOENT;
++}
++
++/*
++ * btqca.c:553 qca_download_firmware + :460 qca_tlv_send_segment: the whole file in 243-byte EDL_PATCH_TLV_REQ
++ * commands. skip (download mode 1 or 3): only the last (or a short) segment is acked; else every segment.
++ * Ack = Command Complete [00 1e] (soc_type >= WCN3991) or vendor event [00 04 result].
++ * Events are logged for segments 0, 1 and the last one; the rest are counted.
++ */
++static int
++tlv_download(uint32_t n, const uint8_t *data, uint32_t size, bool skip)
++{
++	uint8_t cmd[2 + TLV_SEG];
++	uint32_t seg = 0, acks = 0;
++	uint64_t t0 = negroni_bt_us();
++	int error = 0;
++
++	for (uint32_t at = 0; at < size; seg++) {
++		uint32_t len = MIN(TLV_SEG, size - at);
++		bool last = at + len == size || len < TLV_SEG;
++		bool wait = !skip || last;
++		const uint8_t *r;
++		uint32_t rl;
++
++		cmd[0] = EDL_TLV_REQ;
++		cmd[1] = (uint8_t)len;
++		memcpy(cmd + 2, data + at, len);
++		h.quiet = !(seg < 2 || last);
++		error = hci_cmd(OP_EDL, cmd, (uint8_t)(len + 2u), !h.quiet);
++		if (error) {
++			break;
++		}
++		at += len;
++		if (!wait) {
++			continue;
++		}
++		int k = wait_reply(OP_EDL, EDL_TLV_RES, &r, &rl);
++		if (k < 0) {
++			SAY("%u segment %u (byte %u of %u): no ack\n", n, seg, at, size);
++			error = -k;
++			break;
++		}
++		if (k == R_CC && rl >= 2 && r[0] == 0 && r[1] == EDL_TLV_REQ) {
++			acks++;
++		} else if (k == R_VSE && rl >= 3 && r[0] == 0 && r[1] == EDL_TLV_RES) {
++			acks++;
++			if (r[2]) {
++				SAY("%u segment %u: TLV result %#x (btqca.c logs it, goes on)\n", n, seg, r[2]);
++			}
++		} else {
++			if (h.quiet) {
++				log_event();
++			}
++			SAY("%u segment %u: ack not understood (%s, %u bytes)\n", n, seg, k == R_CC ? "CC" : "VSE", rl);
++			error = EIO;
++			break;
++		}
++	}
++	h.quiet = 0;
++	SAY("%u %u segments of <= %u bytes sent, %u acks, %llu ms, at %u baud%s\n", n, seg, TLV_SEG, acks,
++	    (negroni_bt_us() - t0) / 1000u, negroni_bt_uart_baud(), error ? " (FAILED)" : "");
++	return error;
++}
++
++static int
++step_rampatch(void)
++{
++	char name[24];
++	uint32_t size;
++
++	snprintf(name, sizeof(name), "hpbtfw%02x.tlv", h.rom);           /* btqca.c:849 (WCN6855 fallback name) */
++	int error = fw_load(name, &size);
++	if (error) {
++		return error;
++	}
++	const uint8_t *f = h.fw;
++	if (size < 28 || (f[0] & 0xffu) != 1) {                         /* tlv_type_hdr + tlv_type_patch */
++		SAY("13 %s: no TLV type 1 header\n", name);
++		return EINVAL;
++	}
++	uint8_t mode = f[14];
++	uint16_t rom_build = le16(f + 18);
++	SAY("13 %s: TLV length %u, total %u, data %u, format %u, signature %u, download mode %u, product %#06x, "
++	    "ROM build %#06x, patch %#06x\n", name, le32(f) >> 8, le32(f + 4), le32(f + 8), f[12], f[13], mode,
++	    le16(f + 16), rom_build, le16(f + 20));
++	if (rom_build != h.ver.rom) {
++		SAY("13 note: ROM build %#06x != controller ROM %#06x\n", rom_build, h.ver.rom);
++	}
++	error = tlv_download(13, f, size, mode == 1 || mode == 3);      /* QCA_SKIP_EVT_VSE / _VSE_CC */
++	negroni_bt_sleep_ms(10);                                        /* btqca.c:860 */
++	return error;
++}
++
++/* btqca.c:193 qca_read_fw_board_id: CC [00 23 xx hi lo] */
++static uint16_t
++read_bid(void)
++{
++	const uint8_t sub = EDL_BID_REQ;
++	const uint8_t *r;
++	uint32_t rl;
++
++	if (cmd_cc(OP_EDL, &sub, 1, &r, &rl)) {
++		SAY("14 board id: no answer; the default NVM follows\n");
++		return 0;
++	}
++	if (rl < 5 || r[1] != EDL_BID_REQ) {
++		SAY("14 board id: answer not understood (%u bytes); the default NVM follows\n", rl);
++		return 0;
++	}
++	return (uint16_t)(r[3] << 8 | r[4]);
++}
++
++/* btqca.c:291 qca_tlv_check_data, TLV_TYPE_NVM: bounds, tag 2 (BD address), tag 17 baud, optional IBS bits */
++static int
++nvm_patch(uint8_t *f, uint32_t size, uint8_t code)
++{
++	uint32_t off = 4;
++	if (size < 4) {
++		return EINVAL;
++	}
++	uint32_t tl = le32(f), len = tl >> 8, type = tl & 0xffu;
++	if (type == 4) {
++		if (size < 8) {
++			return EINVAL;
++		}
++		tl = le32(f + 4);
++		len = tl >> 8;
++		type = tl & 0xffu;
++		off = 8;
++	}
++	if (type != 2 || len > size - off) {
++		SAY("15 NVM: TLV type %u length %u (file %u bytes) not usable\n", type, len, size);
++		return EINVAL;
++	}
++	uint32_t tags = 0;
++	for (uint32_t i = 0; i + 12u <= len; tags++) {
++		uint8_t *t = f + off + i;
++		uint16_t id = le16(t), tlen = le16(t + 2);
++		uint8_t *d = t + 12;
++		if (len < i + 12u + tlen) {
++			return EINVAL;
++		}
++		if (id == TAG_BD_ADDR) {
++			if (tlen != 6) {
++				return EINVAL;
++			}
++			memcpy(h.nvm_bdaddr, d, 6);
++			h.nvm_bdaddr_set = true;
++		} else if (id == TAG_HCI) {
++			if (tlen < 3) {
++				return EINVAL;
++			}
++			SAY("15 NVM tag 17 (HCI transport) before:%s\n", hex(d, tlen));
++			if (h.ibs) {
++				d[0] |= 0x80u;
++			}
++			d[1] = code;                                    /* soc_type >= WCN3991: byte 1 (btqca.c:429) */
++			SAY("15 NVM tag 17 after: byte 0 %#x, baud byte %#x\n", d[0], d[1]);
++		} else if (id == TAG_DEEP_SLEEP && h.ibs) {
++			if (tlen < 1) {
++				return EINVAL;
++			}
++			d[0] |= 0x01u;
++		}
++		i += 12u + tlen;
++	}
++	SAY("15 NVM: %u tags, BD address tag %s\n", tags, h.nvm_bdaddr_set ? "present" : "absent");
++	return 0;
++}
++
++static int
++step_nvm(void)
++{
++	char name[32];
++	uint32_t size;
++	uint16_t bid = read_bid();
++	const char *v = h.gf ? "g" : "";
++	int error;
++
++	if (bid == 0 || bid == 0xffffu) {                                /* btqca.c:715 qca_get_nvm_name_by_board */
++		snprintf(name, sizeof(name), "hpnv%02x%s.bin", h.rom, v);
++	} else {
++		snprintf(name, sizeof(name), "hpnv%02x%s.b%02x", h.rom, v, bid);
++	}
++	SAY("14 board id %#x -> %s\n", bid, name);
++	STEP(15, "NVM download");
++	error = fw_load(name, &size);
++	if (error == ENOENT && bid != 0 && bid != 0xffffu) {             /* btqca.c:570 qca_get_alt_nvm_file */
++		snprintf(name, sizeof(name), "hpnv%02x%s.bin", h.rom, v);
++		error = fw_load(name, &size);
++	}
++	if (error) {
++		return error;
++	}
++	int code = baud_code(negroni_bt_uart_baud());
++	error = nvm_patch(h.fw, size, (uint8_t)(code < 0 ? 0 : code));
++	if (error) {
++		SAY("15 %s: NVM TLV check failed (%d)\n", name, error);
++		return error;
++	}
++	return tlv_download(15, h.fw, size, false);
++}
++
++static void
++step_build_info(void)
++{
++	const uint8_t sub = EDL_BUILD_INFO;
++	const uint8_t *r;
++	uint32_t rl;
++	char label[80];
++
++	if (cmd_cc(OP_EDL, &sub, 1, &r, &rl) || rl < 3 || r[1] != EDL_BUILD_INFO) {
++		SAY("18 build info: no answer (btqca.c:91; not needed for the next steps)\n");
++		return;
++	}
++	uint32_t n = MIN((uint32_t)r[2], rl - 3u);
++	n = MIN(n, (uint32_t)sizeof(label) - 1u);
++	for (uint32_t i = 0; i < n; i++) {
++		label[i] = (r[3 + i] >= 0x20 && r[3 + i] < 0x7f) ? (char)r[3 + i] : '.';
++	}
++	label[n] = 0;
++	SAY("18 firmware build label \"%s\"\n", label);
++}
++
++static int
++step_bdaddr(void)
++{
++	const uint8_t *r;
++	uint32_t rl;
++	int error = cmd_cc(OP_READ_BD_ADDR, NULL, 0, &r, &rl);
++	if (error) {
++		return error;
++	}
++	if (rl != 7) {                                                  /* status + bdaddr (btqca.c:700) */
++		SAY("19 Read_BD_ADDR: %u return bytes, expected 7\n", rl);
++		return EIO;
++	}
++	const uint8_t *a = r + 1;                                       /* little endian on the wire */
++	bool dflt = h.nvm_bdaddr_set && memcmp(a, h.nvm_bdaddr, 6) == 0;
++	SAY("19 BD address %02x:%02x:%02x:%02x:%02x:%02x (%s)\n", a[5], a[4], a[3], a[2], a[1], a[0],
++	    dflt ? "= the NVM default: no unique address; the host must set one (0xfc14, btqca.c:1005)" :
++	    "not the NVM default");
++	return 0;
++}
++
++int
+ negroni_bt_hci_run(uint32_t mode)
+ {
+-	printf("NEGRONI BT: negronibt=%u: the HCI stage is not in this kernel (patch 0331)\n", mode);
++	uint32_t baud = negroni_bt_arg("baud", 3000000);
++	int error;
++
++	memset(&h, 0, sizeof(h));
++	h.to_ms = negroni_bt_arg("to", 2000);
++	h.to_ms = MAX(MIN(h.to_ms, 30000u), 50u);
++	h.ibs = negroni_bt_arg("ibs", 0);
++	SAY("HCI stage (patch 0331): negronibt=%u, wait %u ms, baud %u, IBS bits %s\n", mode, h.to_ms, baud,
++	    h.ibs ? "set" : "as in the file");
++
++	STEP(9, "HCI_RESET (ROM)");
++	if (step_reset(9)) {
++		SAY("9 no Command Complete for HCI_RESET; the version request decides\n");
++	}
++	STEP(10, "EDL version request (0xfc00 0x19)");
++	if ((error = read_version(10))) {
++		SAY("stop: step 10 version request failed (%d)\n", error);
++		goto out;
++	}
++	STEP(11, "baud change (0xfc48)");
++	if (baud != 115200 && (error = step_baud(baud))) {
++		SAY("stop: step 11 baud change to %u failed (%d)\n", baud, error);
++		goto out;
++	}
++	if (mode < 3) {
++		SAY("HCI stage done at step 11 (negronibt=2)\n");
++		goto out;
++	}
++	STEP(12, "firmware pack in the WLAN area");
++	if ((error = step_area())) {
++		goto out;
++	}
++	STEP(13, "rampatch download");
++	if ((error = step_rampatch())) {
++		SAY("stop: step 13 rampatch failed (%d)\n", error);
++		goto out;
++	}
++	STEP(14, "board id (0xfc00 0x23)");
++	if ((error = step_nvm())) {
++		SAY("stop: step 15 NVM failed (%d)\n", error);
++		goto out;
++	}
++	STEP(16, "SoC logging off (0xfc17)");
++	{
++		const uint8_t par[2] = { 0x14, 0x00 };                  /* QCA_DISABLE_LOGGING_SUB_OP */
++		const uint8_t *r;
++		uint32_t rl;
++		if (cmd_cc(OP_LOGGING, par, 2, &r, &rl)) {
++			SAY("16 no Command Complete (btqca.c:949 stops here; this stage goes on)\n");
++		}
++	}
++	STEP(17, "HCI_RESET (patched firmware)");
++	if ((error = step_reset(17))) {
++		SAY("stop: step 17 HCI_RESET after the download failed (%d)\n", error);
++		goto out;
++	}
++	STEP(18, "firmware build info (0xfc00 0x20)");
++	step_build_info();
++	STEP(19, "HCI_Read_BD_ADDR (0x1009)");
++	if ((error = step_bdaddr())) {
++		SAY("stop: step 19 failed (%d)\n", error);
++		goto out;
++	}
++	SAY("HCI stage done: firmware ROM %02x%s loaded, %u baud\n", h.rom, h.gf ? " GF" : "", negroni_bt_uart_baud());
++out:
++	if (h.fw) {
++		kmem_free(kernel_map, (vm_offset_t)h.fw, FW_CAP);
++	}
++	if (h.pack) {
++		kmem_free(kernel_map, (vm_offset_t)h.pack, PACK_HDR);
++	}
++	h.fw = NULL;
++	h.pack = NULL;
++	SAY("HCI stage end: %s (error %d, %u non-H4 bytes dropped)\n", error ? "FAILED" : "ok", error, h.garbage);
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */

@@ -42,11 +42,12 @@ Tags: **[V]** = checked in the named file; **[I]** = inference, not tested on th
 | Stage | What | Status |
 |---|---|---|
 | A1 (0330) | `negronibt=1`: map, pin census, 4 rail votes, GCC clocks, GENI firmware/FIFO check, UART 115200 FIFO mode, BT_EN power sequence, RX idle bytes | code + build done, not run on the phone |
-| A2 (0331) | `negronibt=2`: HCI stage over H4 (reset, version, firmware download from a firmware area, BD address) | **not done** (only the seam: `negroni_bt_hci.c` stub prints "not in this kernel") |
+| A2 (0331) | `negronibt=2`: H4, HCI_RESET, EDL version, 3 Mbaud. `negronibt=3`: + rampatch/NVM download from the BT pack in the WLAN area, reset, build label, BD address | code + build done (patches/xnu/README-bluetooth.md), not run on the phone |
 | B | iOS transport (section 4) | not started |
 
-Firmware for stage A2 (proposal): a 2 MiB "BT area" right before the WLAN area (userdata blocks N-19969 .. N-19458),
-same header format as the WLAN area. No reader or script is written yet.
+Firmware for stage A2 [V scripts]: one file `negroni-bt.bin` (pack: `NEGRBTFW` header + 105 hp* files) inside the
+WLAN firmware area (userdata blocks N-19457 .. N-11266, same format, 199 files); `scripts/bt/mkbtarea.sh` builds it.
+No new userdata area. Layout: patches/xnu/README-bluetooth.md section 0331.
 
 ## 4. iOS side (20H392)
 
@@ -65,5 +66,9 @@ same header format as the WLAN area. No reader or script is written yet.
 
 ## 5. Next steps
 
-1. Phone test of 0330 (`negronibt=1`): expect `step 5` protocol 2, `step 7 ... SW_CTRL 1`.
-2. Stage A2 (0331) in a new session.
+1. Owner approval, then write `out/firmware/wlan-area.bin` (with the BT pack) and boot `out/ios16-bt` (`negronibt=3`).
+   Expect `step 5` protocol 2, `step 7 ... SW_CTRL 1`, `9 HCI_RESET: Command Complete status 0`, `10 QCA product ...`,
+   `13 ... 1 acks`, `15 ... 27 acks`, `19 BD address ...`.
+2. If step 9/10 time out: check `8 N bytes` and the RX buffer dump in the "no answer" line; try `negronibt_noflow=1`,
+   `negronibt_rfropen=1`; `negronibt_baud=115200` isolates the baud change.
+3. Stage B (iOS transport, section 4).
