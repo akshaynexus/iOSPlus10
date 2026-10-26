@@ -1,0 +1,240 @@
+The legacy iOS "vibrator" IOService (registry name "vibrator", on IOResources): MediaExperience
+FigVibrator sets {hertz_millisecs, repeat} or a CFNumber 0 with IORegistryEntrySetCFProperties;
+the steps run on our work loop into negroni_haptic_play (patch 0300). Needs negronihap>=1.
+Details: docs/haptics-plan.md.
+
+diff --git a/iokit/Kernel/arm/NegroniVibrator.cpp b/iokit/Kernel/arm/NegroniVibrator.cpp
+new file mode 100644
+index 0000000..75e10e8
+--- /dev/null
++++ b/iokit/Kernel/arm/NegroniVibrator.cpp
+@@ -0,0 +1,201 @@
++/*
++ * NEGRONI: the legacy iOS "vibrator" IOService (patch 0301), routed into the PM8350B haptics
++ * direct play of patch 0300 (negroni_haptic_play, bsd/dev/negroni_haptic.c).
++ *
++ * iOS 16 20H392 userland (MediaExperience FigVibrator, docs/haptics-plan.md) [V shared cache]:
++ *   _FigVibratorInitialize 0x195a93b3c: when VibeSynthEngineHasHardwareSupport() is false,
++ *   IOServiceGetMatchingService(IOServiceNameMatching("vibrator")) (0x195a93d04), then
++ *   IORegistryEntrySetCFProperties(service, obj) (FVIOKit_*, 0x195a42410-0x195a43b34):
++ *     start:  { "hertz_millisecs" = ( {"intensity" = SInt32 16.16}, on_ms, false, off_ms ),
++ *               "repeat" = bool }                       FVIOKit_StartIOServiceVibration 0x195a42608
++ *     pattern: "hertz_millisecs" built from a VibePattern, "repeat" = false        0x195a427dc
++ *     stop:   a bare CFNumber 0                                   FVIOKit_StopVibrator 0x195a428b4
++ * No user client, no selectors. The entry must have the registry name "vibrator".
++ * [I] userland takes this path only when the closed-loop haptics MobileGestalt answer is false
++ * (D22 ADT /product/haptics closed-loop = 1 today): see docs/haptics-plan.md.
++ *
++ * Here: hertz_millisecs is read as pairs (state, ms): state = a dictionary with "intensity"
++ * (on, strength = intensity * 255 / 65536), true (on, full strength) or false (off). The steps run
++ * on our work loop with a timer; repeat loops them, for at most NV_REPEAT_MAX_MS.
++ * Boot-args: negronihap >= 1 (0300) and negronivib (default 1; 0 = do not publish).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOCommandGate.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <pexpert/pexpert.h>
++
++extern "C" int negroni_haptic_play(uint32_t ms, uint32_t strength);
++extern "C" bool negroni_haptic_ready(void);
++
++#define NV_MAX_STEPS        64u
++#define NV_MAX_STEP_MS      10000u
++#define NV_REPEAT_MAX_MS    (5u * 60u * 1000u)
++
++class NegroniVibrator : public IOService {
++	OSDeclareDefaultStructors(NegroniVibrator);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++private:
++	struct Step { uint32_t ms; uint32_t strength; };
++	IOWorkLoop *fLoop;
++	IOCommandGate *fGate;
++	IOTimerEventSource *fTimer;
++	Step fSteps[NV_MAX_STEPS];
++	uint32_t fCount, fNext, fElapsedMs, fCalls;
++	bool fRepeat, fRunning;
++	static IOReturn gatedSet(OSObject *owner, void *arg0, void *, void *, void *);
++	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++	IOReturn apply(OSObject *properties);
++	void runStep();
++	void stopAll();
++};
++
++OSDefineMetaClassAndStructors(NegroniVibrator, IOService);
++
++bool
++NegroniVibrator::start(IOService *provider)
++{
++	uint32_t hap = 0, vib = 1;
++	(void)PE_parse_boot_argn("negronihap", &hap, sizeof(hap));
++	(void)PE_parse_boot_argn("negronivib", &vib, sizeof(vib));
++	if (hap == 0 || vib == 0) {
++		return false;
++	}
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLoop = IOWorkLoop::workLoop();
++	fGate = fLoop ? IOCommandGate::commandGate(this, gatedSet) : NULL;
++	fTimer = fLoop ? IOTimerEventSource::timerEventSource(this, timerFired) : NULL;
++	if (!fGate || !fTimer || fLoop->addEventSource(fGate) != kIOReturnSuccess ||
++	    fLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++		IOLog("NEGRONI VIBRATOR: no work loop\n");
++		return false;
++	}
++	setName("vibrator");
++	setProperty("NegroniHaptics", "PM8350B HV haptics direct play (patch 0300)");
++	registerService();
++	IOLog("NEGRONI VIBRATOR: published \"vibrator\" (haptics %s)\n", negroni_haptic_ready() ? "ready" : "not ready yet");
++	return true;
++}
++
++IOReturn
++NegroniVibrator::setProperties(OSObject *properties)
++{
++	if (!fGate) {
++		return kIOReturnNotReady;
++	}
++	return fGate->runAction(gatedSet, properties);
++}
++
++IOReturn
++NegroniVibrator::gatedSet(OSObject *owner, void *arg0, void *, void *, void *)
++{
++	return static_cast<NegroniVibrator *>(owner)->apply(static_cast<OSObject *>(arg0));
++}
++
++void
++NegroniVibrator::stopAll()
++{
++	fTimer->cancelTimeout();
++	fRunning = false;
++	(void)negroni_haptic_play(0, 0);
++}
++
++IOReturn
++NegroniVibrator::apply(OSObject *properties)
++{
++	bool log = fCalls++ < 16;
++	if (OSDynamicCast(OSNumber, properties)) {
++		if (log) {
++			IOLog("NEGRONI VIBRATOR: stop\n");
++		}
++		stopAll();
++		return kIOReturnSuccess;
++	}
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	OSArray *a = d ? OSDynamicCast(OSArray, d->getObject("hertz_millisecs")) : NULL;
++	if (!a) {
++		if (log) {
++			IOLog("NEGRONI VIBRATOR: unknown request (%s)\n", properties ? properties->getMetaClass()->getClassName() : "null");
++		}
++		return kIOReturnBadArgument;
++	}
++	stopAll();
++	fCount = 0;
++	for (unsigned i = 0; i + 1 < a->getCount() && fCount < NV_MAX_STEPS; i += 2) {
++		OSObject *state = a->getObject(i);
++		OSNumber *ms = OSDynamicCast(OSNumber, a->getObject(i + 1));
++		if (!ms) {
++			continue;
++		}
++		uint32_t strength = 0;
++		if (OSDictionary *sd = OSDynamicCast(OSDictionary, state)) {
++			OSNumber *in = OSDynamicCast(OSNumber, sd->getObject("intensity"));
++			int64_t v = in ? (int64_t)in->unsigned64BitValue() : 65536;
++			if (in && in->numberOfBits() <= 32) {
++				v = (int32_t)in->unsigned32BitValue();
++			}
++			strength = v <= 0 ? 0 : v >= 65536 ? 255 : (uint32_t)((v * 255) >> 16);
++			if (v > 0 && strength == 0) {
++				strength = 1;
++			}
++		} else if (state == kOSBooleanTrue) {
++			strength = 255;
++		}
++		uint64_t t = ms->unsigned64BitValue();
++		fSteps[fCount].ms = t == 0 ? 1 : t > NV_MAX_STEP_MS ? NV_MAX_STEP_MS : (uint32_t)t;
++		fSteps[fCount].strength = strength;
++		fCount++;
++	}
++	OSBoolean *rep = OSDynamicCast(OSBoolean, d->getObject("repeat"));
++	fRepeat = rep == kOSBooleanTrue;
++	if (log) {
++		IOLog("NEGRONI VIBRATOR: start: %u steps (first %u ms strength %u), repeat %d\n", fCount,
++		    fCount ? fSteps[0].ms : 0, fCount ? fSteps[0].strength : 0, fRepeat);
++	}
++	if (fCount == 0) {
++		return kIOReturnBadArgument;
++	}
++	fNext = 0;
++	fElapsedMs = 0;
++	fRunning = true;
++	runStep();
++	return kIOReturnSuccess;
++}
++
++void
++NegroniVibrator::runStep()
++{
++	if (!fRunning) {
++		return;
++	}
++	if (fNext >= fCount) {
++		if (!fRepeat || fElapsedMs >= NV_REPEAT_MAX_MS) {
++			stopAll();
++			return;
++		}
++		fNext = 0;
++	}
++	const Step &s = fSteps[fNext++];
++	/* an on step plays a little longer than the step, so back-to-back on steps do not gap */
++	(void)negroni_haptic_play(s.strength ? s.ms + 20u : 0u, s.strength);
++	fElapsedMs += s.ms;
++	fTimer->setTimeoutMS(s.ms);
++}
++
++void
++NegroniVibrator::timerFired(OSObject *owner, IOTimerEventSource *)
++{
++	static_cast<NegroniVibrator *>(owner)->runStep();
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 64ce18b..4a9e54a 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -98,6 +98,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = NegroniBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = NegroniVibrator;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = NegroniVibrator;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index d028552..3cf0287 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -19,6 +19,7 @@ iokit/Kernel/arm/NegroniFramebuffer.cpp                            optional ioki
+ iokit/Kernel/arm/NegroniAccel.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/NegroniGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/NegroniBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/NegroniVibrator.cpp                               optional iokitcpp
+ iokit/Kernel/arm/hid/NegroniHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp

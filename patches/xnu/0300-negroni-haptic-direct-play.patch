@@ -1,0 +1,566 @@
+Vibration motor (negronihap=1): PM8350B HV haptics direct play over SPMI, a 300 ms buzz at boot as
+the proof, and the kernel API negroni_haptic_play(ms, strength) (bsd/dev/negroni_haptic.h).
+Details: docs/haptics-plan.md.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6c43d2f..e28a3c9 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/negroni_reboot.c		standard
+ bsd/dev/negroni_touch.c			standard
+ bsd/dev/negroni_cpufreq.c		standard
+ bsd/dev/negroni_thermal.c		standard
++bsd/dev/negroni_haptic.c		standard
+ bsd/dev/negroni_adreno.c		standard
+ bsd/dev/negroni_wifi.c			standard
+ bsd/dev/negroni_wlan.c			standard
+diff --git a/bsd/dev/negroni_haptic.c b/bsd/dev/negroni_haptic.c
+new file mode 100644
+index 0000000..2c38a69
+--- /dev/null
++++ b/bsd/dev/negroni_haptic.c
+@@ -0,0 +1,497 @@
++/*
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450): vibration motor, PM8350B "HV haptics" (patch 0300).
++ *
++ * Hardware [V live DT qcom,hv-haptics@f000 under qcom,pm8350b@3, status "ok"; no I2C LRA driver
++ * node (no awinic/aw869x/oplus,haptic)]: an LRA (qcom,vibrator-type 8151 = SLA0815 in the OnePlus
++ * driver) on the PM8350B haptics block, SPMI bus 0 SID 3:
++ *   HAP_CFG 0xf000, HAP_PTN 0xf100, HAP_BOOST 0xf200 (DT reg = <0xf000 0xf100 0xf200>)
++ *   hap_cfg SDAM: PMK8350 SID 0 sdam@9d00 (nvmem "hap_cfg_sdam", the hBoost PBS trigger)
++ *   DT: qcom,vmax-mv 1680, qcom,lra-period-us 5882 (170 Hz), qcom,drv-sig-shape 1 (sine)
++ * Direct-play sequence, as Linux drivers/input/misc/qcom-hv-haptics.c (OnePlus kernel source,
++ * out/src/op-kernel) does a constant effect:
++ *   haptics_load_constant_effect (2134): VMAX 0xf048 = mV / 50 (1271), DIRECT_PLAY 0xf126 =
++ *     amplitude (1349), auto-resonance 0xf063 bit 7 off (OPLUS build, 2194)
++ *   haptics_enable_play(true) (1597): FAULT_CLR 0xf066 = 0x07, open-loop config (1540: with no
++ *     hBoost kept on, VSET_CFG 0xf068 bit 0 FORCE_VREG_RDY = 0), SPMI_PLAY 0xf04c =
++ *     PLAY_EN 0x80 | src DIRECT_PLAY 1, then haptics_boost_vreg_enable (1366): SDAM 0x42 = 1 (on),
++ *     SDAM 0xe5 = 1 (PBS trigger)
++ *   haptics_enable_play(false): SPMI_PLAY = src only (PLAY_EN 0); 2 s later SDAM 0x42 = 2 (off),
++ *     0xe5 = 1 (hbst_off_timer, 6054)
++ *   module enable: HAP_CFG EN_CTL 0xf046 bit 7 (2008; Linux probe does not write it, resume does)
++ *   T_LRA open loop: 0xf05c/0xf05d = period / 5 us (2853), x 1024/1000 when CAL_EN 0xf072 bits 3:2 = 1
++ * This file does that sequence with no brake and no FIFO.
++ *
++ * Boot-args:
++ *   negronihap=0  (default) nothing: no PMIC access, negroni_haptic_play() returns -1
++ *   negronihap=1  census + owner log + a 300 ms buzz at boot (the proof), API on
++ *   negronihap=2  census + owner log, API on, no boot buzz
++ *   negronihap_force=1  write also when the owner table gives the haptics APIDs to another EE
++ *   negronihap_mv=N     drive VMAX in mV (default 1680 = DT qcom,vmax-mv, capped at 3600)
++ *   negronihap_pbs=0    never write the hap_cfg SDAM (no hBoost PBS trigger); default 1 when EE 0 owns it
++ * Reads use the shared arbiter mapping (negroni_spmi_arbiter, patch 0270) and sk_read8. Writes
++ * use our own channel windows (4 maps of 0x1000; each map takes one 16 KiB kernel page of io_submap,
++ * 64 KiB in total; made once, never unmapped).
++ * An APID that is not owned by EE 0 reads 0xff and refuses writes [I: battery census, 0272]:
++ * the owners are logged first.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/thread_call.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "negroni_spmi_keys.h"
++#include "negroni_spmi.h"
++#include "negroni_haptic.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);
++void negroni_haptic_init(void);
++
++#define NH_CHNLS_PA       0x0c500000u     /* arbiter v7 read/write channels, 0x1000 per APID */
++#define NH_CHNL_STRIDE    0x1000u
++#define NH_CMD            0x00u
++#define NH_STATUS         0x08u
++#define NH_WDATA0         0x10u
++#define NH_DONE           (1u << 0)
++#define NH_ERRORS         0x0eu
++#define NH_WRITE_POLLS    2000u           /* x 1 us */
++
++/* SID 3 PM8350B */
++#define NH_SID            3u
++#define NH_CFG            0xf000u
++#define NH_PTN            0xf100u
++#define NH_HBST           0xf200u
++#define CFG_REVISION2     0x01u
++#define CFG_FAULT_STATUS  0x0cu
++#define CFG_INT_RT_STS    0x10u
++#define CFG_EN_CTL        0x46u           /* bit 7 HAPTICS_EN */
++#define CFG_VMAX          0x48u           /* mV / 50 */
++#define CFG_DRV_WF_SEL    0x49u
++#define CFG_SPMI_PLAY     0x4cu           /* bit 7 PLAY_EN, bit 3 BRAKE_EN, bits 2:0 source */
++#define CFG_BRAKE_MODE    0x50u
++#define CFG_TLRA_OL_HIGH  0x5cu
++#define CFG_TLRA_OL_LOW   0x5du
++#define CFG_AUTORES_CFG   0x63u           /* bit 7 AUTORES_EN */
++#define CFG_FAULT_CLR     0x66u
++#define CFG_VSET_CFG      0x68u           /* bit 0 FORCE_VREG_RDY */
++#define CFG_CAL_EN        0x72u           /* bits 3:2 RC clock calibration, 1 = auto */
++#define PTN_REVISION2     0x01u
++#define PTN_DIRECT_PLAY   0x26u
++#define HBST_REVISION1    0x00u
++#define HBST_REVISION2    0x01u
++#define HBST_STATUS4      0x0bu
++#define HBST_HW_FOLLOW    0x41u
++#define HBST_VREG_EN      0x46u
++#define SRC_DIRECT_PLAY   0x01u
++#define PLAY_EN           0x80u
++/* SID 0 PMK8350 hap_cfg SDAM */
++#define NH_SDAM_SID       0u
++#define NH_SDAM           0x9d00u
++#define SDAM_PBS_ARG      0x42u           /* 1 hBoost on, 2 off */
++#define SDAM_PBS_TRIG     0xe5u           /* 1 = trigger */
++
++#define NH_DT_VMAX_MV     1680u           /* qcom,vmax-mv = <0x690> */
++#define NH_MAX_VMAX_MV    3600u           /* below the OnePlus factory AT test value 3700 */
++#define NH_DT_TLRA_US     5882u           /* qcom,lra-period-us = <0x16fa> */
++#define NH_MAX_MS         10000u
++#define NH_HBST_OFF_MS    2000u           /* Linux BOOST_VREG_OFF_DELAY_SECONDS */
++
++enum { NH_P_CFG, NH_P_PTN, NH_P_HBST, NH_P_SDAM, NH_P_N };
++static const uint16_t nh_ppid[NH_P_N] = { 0x3f0, 0x3f1, 0x3f2, 0x09d };
++static const char *const nh_pname[NH_P_N] = { "HAP_CFG 0xf000", "HAP_PTN 0xf100", "HAP_BOOST 0xf200", "SDAM 0x9d00 (SID 0)" };
++
++static LCK_GRP_DECLARE(nh_grp, "negroni_haptic");
++static LCK_MTX_DECLARE(nh_lock, &nh_grp);
++static struct sk_arbiter nh_arb;
++static vm_offset_t nh_cnfg;
++static int nh_apid[NH_P_N] = { -1, -1, -1, -1 };
++static unsigned nh_owner[NH_P_N] = { 7, 7, 7, 7 };
++static vm_offset_t nh_chn[NH_P_N];
++static bool nh_dead[NH_P_N];
++static bool nh_ready, nh_pbs, nh_playing, nh_hbst_on;
++static uint32_t nh_mode, nh_force, nh_vmax_mv = NH_DT_VMAX_MV, nh_pbs_arg = 1;
++static uint64_t nh_play_gen;      /* bumped by each play: a stale stop call does nothing */
++static uint32_t nh_plays, nh_refused;
++static thread_call_t nh_stop_call, nh_hbst_call;
++
++static uint32_t
++nh_rd32(vm_offset_t base, unsigned off)
++{
++	uint32_t value = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return value;
++}
++
++static void
++nh_wr32(vm_offset_t base, unsigned off, uint32_t value)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = value;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* As Linux picks an APID: the first mapping, replaced by one this EE (0) owns. */
++static int
++nh_find_apid(unsigned ppid, unsigned *owner)
++{
++	uint32_t n = nh_arb.core[SK_FEATURES / 4u] & SK_FEATURES_APIDS_MASK;
++	int found = -1;
++	unsigned fo = 7;
++	for (uint32_t i = 0; i < n && i < 1024u; ++i) {
++		uint32_t map = nh_arb.core[(SK_APID_MAP + 4u * i) / 4u];
++		if (!map || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		unsigned o = nh_rd32(nh_cnfg, 4u * i) & 7u;
++		if (found < 0 || o == 0) {
++			found = (int)i;
++			fo = o;
++		}
++	}
++	*owner = fo;
++	return found;
++}
++
++static int
++nh_part(unsigned sid, unsigned addr)
++{
++	unsigned ppid = (sid << 8) | (addr >> 8);
++	for (int p = 0; p < NH_P_N; ++p) {
++		if (nh_ppid[p] == ppid) {
++			return p;
++		}
++	}
++	return -1;
++}
++
++/* nh_lock held. 0 ok, -1 failed (*v = 0xee). */
++static int
++nh_read(unsigned sid, unsigned addr, uint8_t *v)
++{
++	int p = nh_part(sid, addr);
++	*v = 0xee;
++	if (p < 0 || nh_apid[p] < 0 || nh_dead[p]) {
++		return -1;
++	}
++	int rc = sk_read8(&nh_arb, nh_apid[p], (uint8_t)(addr & 0xffu), v);
++	if (rc == 1) {
++		nh_dead[p] = true;
++		printf("NEGRONI HAPTIC: read timeout sid %u %#x (APID %d): not used again\n", sid, addr, nh_apid[p]);
++	}
++	return rc ? -1 : 0;
++}
++
++/* nh_lock held. 0 ok, -1 refused/failed. */
++static int
++nh_write(unsigned sid, unsigned addr, uint8_t value)
++{
++	int p = nh_part(sid, addr);
++	if (p < 0 || !nh_chn[p] || nh_dead[p]) {
++		return -1;
++	}
++	vm_offset_t chn = nh_chn[p];
++	nh_wr32(chn, NH_WDATA0, value);
++	nh_wr32(chn, NH_CMD, (0u << 27) | ((addr & 0xffu) << 4));     /* WRITEL, 1 byte */
++	for (unsigned i = 0; i < NH_WRITE_POLLS; ++i) {
++		uint32_t s = nh_rd32(chn, NH_STATUS);
++		if (s & NH_DONE) {
++			if (s & NH_ERRORS) {
++				if (nh_refused++ < 16) {      /* bounded: negronihap_force=1 can refuse every write */
++					printf("NEGRONI HAPTIC: write sid %u %#x = %#x refused (status %#x)%s\n", sid, addr, value, s,
++					    nh_refused == 16 ? " (no more refusal lines)" : "");
++				}
++				return -1;
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	nh_dead[p] = true;
++	printf("NEGRONI HAPTIC: write timeout sid %u %#x (APID %d): not used again\n", sid, addr, nh_apid[p]);
++	return -1;
++}
++
++static int
++nh_update(unsigned sid, unsigned addr, uint8_t mask, uint8_t bits)
++{
++	uint8_t v;
++	if (nh_read(sid, addr, &v)) {
++		return -1;
++	}
++	return nh_write(sid, addr, (uint8_t)((v & ~mask) | (bits & mask)));
++}
++
++static void
++nh_hbst(bool on)
++{
++	if (!nh_pbs || nh_hbst_on == on) {
++		return;
++	}
++	if (nh_write(NH_SDAM_SID, NH_SDAM + SDAM_PBS_ARG, on ? 1 : 2) == 0 &&
++	    nh_write(NH_SDAM_SID, NH_SDAM + SDAM_PBS_TRIG, 1) == 0) {
++		nh_hbst_on = on;
++	}
++}
++
++static void
++nh_log_state(const char *when)
++{
++	uint8_t en, vmax, play, vset, fault, rt, dp, vreg, st4, follow, ar;
++	nh_read(NH_SID, NH_CFG + CFG_EN_CTL, &en);
++	nh_read(NH_SID, NH_CFG + CFG_VMAX, &vmax);
++	nh_read(NH_SID, NH_CFG + CFG_SPMI_PLAY, &play);
++	nh_read(NH_SID, NH_CFG + CFG_VSET_CFG, &vset);
++	nh_read(NH_SID, NH_CFG + CFG_FAULT_STATUS, &fault);
++	nh_read(NH_SID, NH_CFG + CFG_INT_RT_STS, &rt);
++	nh_read(NH_SID, NH_CFG + CFG_AUTORES_CFG, &ar);
++	nh_read(NH_SID, NH_PTN + PTN_DIRECT_PLAY, &dp);
++	nh_read(NH_SID, NH_HBST + HBST_VREG_EN, &vreg);
++	nh_read(NH_SID, NH_HBST + HBST_STATUS4, &st4);
++	nh_read(NH_SID, NH_HBST + HBST_HW_FOLLOW, &follow);
++	printf("NEGRONI HAPTIC: %s: EN_CTL %#04x VMAX %#04x SPMI_PLAY %#04x VSET %#04x AUTORES %#04x "
++	    "FAULT %#04x RT_STS %#04x DIRECT_PLAY %#04x | HBST VREG_EN %#04x STATUS4 %#04x HW_FOLLOW %#04x\n",
++	    when, en, vmax, play, vset, ar, fault, rt, dp, vreg, st4, follow);
++}
++
++/* Thread context, once. nh_lock held. */
++static bool
++nh_setup(void)
++{
++	if (negroni_spmi_arbiter(&nh_arb, &nh_cnfg) != 0 || !nh_arb.core || !nh_arb.obs || !nh_cnfg) {
++		printf("NEGRONI HAPTIC: no SPMI arbiter mapping\n");
++		return false;
++	}
++	uint32_t ver = nh_arb.core[0];
++	if (ver < SK_VERSION_V7_MIN || ver >= SK_VERSION_V8_MIN) {
++		printf("NEGRONI HAPTIC: SPMI arbiter %#x is not v7\n", ver);
++		return false;
++	}
++	bool owned = true;
++	for (int p = 0; p < NH_P_N; ++p) {
++		nh_apid[p] = nh_find_apid(nh_ppid[p], &nh_owner[p]);
++		printf("NEGRONI HAPTIC: %s PPID %#05x: APID %d, owner EE %u\n", nh_pname[p], nh_ppid[p], nh_apid[p], nh_owner[p]);
++		if (p != NH_P_SDAM && (nh_apid[p] < 0 || nh_owner[p] != 0)) {
++			owned = false;
++		}
++	}
++	uint8_t c1, c2, ct, cs, p2, b1, b2, cal, th, tl, wf, bm;
++	nh_read(NH_SID, NH_CFG + CFG_REVISION2, &c2);
++	nh_read(NH_SID, NH_CFG + 0x00, &c1);
++	nh_read(NH_SID, NH_CFG + 0x04, &ct);
++	nh_read(NH_SID, NH_CFG + 0x05, &cs);
++	nh_read(NH_SID, NH_PTN + PTN_REVISION2, &p2);
++	nh_read(NH_SID, NH_HBST + HBST_REVISION1, &b1);
++	nh_read(NH_SID, NH_HBST + HBST_REVISION2, &b2);
++	nh_read(NH_SID, NH_CFG + CFG_CAL_EN, &cal);
++	nh_read(NH_SID, NH_CFG + CFG_TLRA_OL_HIGH, &th);
++	nh_read(NH_SID, NH_CFG + CFG_TLRA_OL_LOW, &tl);
++	nh_read(NH_SID, NH_CFG + CFG_DRV_WF_SEL, &wf);
++	nh_read(NH_SID, NH_CFG + CFG_BRAKE_MODE, &bm);
++	printf("NEGRONI HAPTIC: HAP_CFG rev %#04x/%#04x type %#04x subtype %#04x, HAP_PTN rev2 %#04x, "
++	    "HAP_BOOST rev %#04x/%#04x; CAL_EN %#04x T_LRA_OL %#x (%u us) DRV_WF %#04x BRAKE %#04x\n",
++	    c1, c2, ct, cs, p2, b1, b2, cal, ((th & 0xfu) << 8) | tl, (((th & 0xfu) << 8) | tl) * 5u, wf, bm);
++	if (!owned && !nh_force) {
++		printf("NEGRONI HAPTIC: the haptics APIDs are not all owned by EE 0: writes stay off "
++		    "(negronihap_force=1 tries anyway)\n");
++		return false;
++	}
++	for (int p = 0; p < NH_P_N; ++p) {
++		if (nh_apid[p] < 0 || (p == NH_P_SDAM && (!nh_pbs_arg || (nh_owner[p] != 0 && !nh_force)))) {
++			continue;
++		}
++		/* one 4 KiB channel window each, kept for the boot (never unmapped: io_submap) */
++		nh_chn[p] = ml_io_map(NH_CHNLS_PA + NH_CHNL_STRIDE * (uint32_t)nh_apid[p], NH_CHNL_STRIDE);
++	}
++	if (!nh_chn[NH_P_CFG] || !nh_chn[NH_P_PTN]) {
++		printf("NEGRONI HAPTIC: channel map failed\n");
++		return false;
++	}
++	nh_pbs = nh_chn[NH_P_SDAM] != 0;
++	printf("NEGRONI HAPTIC: hBoost PBS trigger via SDAM %s\n", nh_pbs ? "on" : "off (not owned, or negronihap_pbs=0)");
++
++	/* T_LRA open loop: program the DT period only when the register is unset (0). */
++	if ((((th & 0xfu) << 8) | tl) == 0) {
++		uint32_t us = NH_DT_TLRA_US;
++		if (((cal >> 2) & 3u) == 1u) {
++			us = us * 1024u / 1000u;
++		}
++		uint32_t t = us / 5u;
++		nh_write(NH_SID, NH_CFG + CFG_TLRA_OL_HIGH, (uint8_t)((t >> 8) & 0xfu));
++		nh_write(NH_SID, NH_CFG + CFG_TLRA_OL_LOW, (uint8_t)(t & 0xffu));
++		printf("NEGRONI HAPTIC: T_LRA_OL was 0: set %#x (%u us)\n", t, NH_DT_TLRA_US);
++	}
++	/* drive waveform: sine (qcom,drv-sig-shape = 1), bits 1:0 of DRV_WF_SEL */
++	nh_update(NH_SID, NH_CFG + CFG_DRV_WF_SEL, 0x03, 0x01);
++	nh_log_state("init");
++	return true;
++}
++
++/* nh_lock held */
++static void
++nh_stop_locked(void)
++{
++	if (!nh_playing) {
++		return;
++	}
++	nh_write(NH_SID, NH_CFG + CFG_SPMI_PLAY, SRC_DIRECT_PLAY);      /* PLAY_EN 0 */
++	nh_playing = false;
++	if (nh_pbs) {
++		uint64_t deadline;
++		clock_interval_to_deadline(NH_HBST_OFF_MS, NSEC_PER_MSEC, &deadline);
++		thread_call_enter_delayed(nh_hbst_call, deadline);
++	}
++}
++
++static void
++nh_stop_fn(thread_call_param_t p0, thread_call_param_t gen)
++{
++	(void)p0;
++	lck_mtx_lock(&nh_lock);
++	if ((uint64_t)(uintptr_t)gen == nh_play_gen) {
++		nh_stop_locked();
++	}
++	lck_mtx_unlock(&nh_lock);
++}
++
++static void
++nh_hbst_fn(thread_call_param_t p0, thread_call_param_t p1)
++{
++	(void)p0; (void)p1;
++	lck_mtx_lock(&nh_lock);
++	if (!nh_playing) {
++		nh_hbst(false);
++	}
++	lck_mtx_unlock(&nh_lock);
++}
++
++int
++negroni_haptic_play(uint32_t ms, uint32_t strength)
++{
++	if (!nh_ready || ml_at_interrupt_context()) {
++		return -1;
++	}
++	if (ms > NH_MAX_MS) {
++		ms = NH_MAX_MS;
++	}
++	if (strength > 255) {
++		strength = 255;
++	}
++	lck_mtx_lock(&nh_lock);
++	if (ms == 0 || strength == 0) {
++		nh_play_gen++;
++		nh_stop_locked();
++		lck_mtx_unlock(&nh_lock);
++		return 0;
++	}
++	int rc = 0;
++	thread_call_cancel(nh_hbst_call);
++	if (!nh_playing) {
++		uint8_t en;
++		if (nh_read(NH_SID, NH_CFG + CFG_EN_CTL, &en) == 0 && !(en & 0x80)) {
++			rc |= nh_write(NH_SID, NH_CFG + CFG_EN_CTL, 0x80);       /* module enable */
++		}
++		rc |= nh_write(NH_SID, NH_CFG + CFG_VMAX, (uint8_t)(nh_vmax_mv / 50u));
++		rc |= nh_write(NH_SID, NH_PTN + PTN_DIRECT_PLAY, (uint8_t)strength);
++		rc |= nh_update(NH_SID, NH_CFG + CFG_AUTORES_CFG, 0x80, 0x00);  /* OPLUS: no auto-resonance */
++		rc |= nh_write(NH_SID, NH_CFG + CFG_FAULT_CLR, 0x07);
++		/* open-loop drive config (Linux 1540): FORCE_VREG_RDY only while hBoost is kept on */
++		rc |= nh_update(NH_SID, NH_CFG + CFG_VSET_CFG, 0x01, nh_hbst_on ? 0x01 : 0x00);
++		/*
++		 * PLAY_EN only when the whole setup chain succeeded; nh_playing follows the SPMI_PLAY
++		 * write alone, so the stop timer is armed whenever PLAY_EN may be set.
++		 */
++		if (rc == 0) {
++			if (nh_write(NH_SID, NH_CFG + CFG_SPMI_PLAY, PLAY_EN | SRC_DIRECT_PLAY) == 0) {
++				nh_playing = true;
++				nh_hbst(true);
++			} else {
++				rc = -1;
++				(void)nh_write(NH_SID, NH_CFG + CFG_SPMI_PLAY, SRC_DIRECT_PLAY);  /* make sure PLAY_EN is 0 */
++			}
++		}
++	} else {
++		rc |= nh_write(NH_SID, NH_PTN + PTN_DIRECT_PLAY, (uint8_t)strength);
++	}
++	uint64_t gen = ++nh_play_gen;
++	if (nh_playing) {
++		uint64_t deadline;
++		clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++		thread_call_enter1_delayed(nh_stop_call, (thread_call_param_t)(uintptr_t)gen, deadline);
++	}
++	if (nh_plays++ < 8) {
++		printf("NEGRONI HAPTIC: play %u ms strength %u: rc %d\n", ms, strength, rc);
++	}
++	lck_mtx_unlock(&nh_lock);
++	return rc ? -1 : 0;
++}
++
++bool
++negroni_haptic_ready(void)
++{
++	return nh_ready;
++}
++
++static void
++nh_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline((event_t)&nh_plays, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++nh_thread(void *arg, wait_result_t wr)
++{
++	(void)arg; (void)wr;
++	lck_mtx_lock(&nh_lock);
++	bool ok = nh_setup();
++	lck_mtx_unlock(&nh_lock);
++	nh_ready = ok;
++	printf("NEGRONI HAPTIC: %s (negronihap=%u, vmax %u mV)\n", ok ? "ready" : "not available", nh_mode, nh_vmax_mv);
++	if (ok && nh_mode == 1) {
++		printf("NEGRONI HAPTIC: proof: 300 ms direct-play buzz, strength 255\n");
++		negroni_haptic_play(300, 255);
++		nh_sleep_ms(100);
++		lck_mtx_lock(&nh_lock);
++		nh_log_state("playing +100 ms");
++		lck_mtx_unlock(&nh_lock);
++		nh_sleep_ms(400);
++		lck_mtx_lock(&nh_lock);
++		nh_log_state("stopped +500 ms");
++		lck_mtx_unlock(&nh_lock);
++		nh_sleep_ms(2200);
++		lck_mtx_lock(&nh_lock);
++		nh_log_state("hBoost off +2.7 s");
++		lck_mtx_unlock(&nh_lock);
++	}
++	(void)thread_terminate(current_thread());
++}
++
++void
++negroni_haptic_init(void)
++{
++	thread_t thread;
++	(void)PE_parse_boot_argn("negronihap", &nh_mode, sizeof(nh_mode));
++	if (nh_mode == 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("negronihap_force", &nh_force, sizeof(nh_force));
++	(void)PE_parse_boot_argn("negronihap_pbs", &nh_pbs_arg, sizeof(nh_pbs_arg));
++	(void)PE_parse_boot_argn("negronihap_mv", &nh_vmax_mv, sizeof(nh_vmax_mv));
++	if (nh_vmax_mv < 500u || nh_vmax_mv > NH_MAX_VMAX_MV) {
++		nh_vmax_mv = NH_DT_VMAX_MV;
++	}
++	nh_stop_call = thread_call_allocate_with_options(nh_stop_fn, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
++	nh_hbst_call = thread_call_allocate_with_options(nh_hbst_fn, NULL, THREAD_CALL_PRIORITY_LOW, 0);
++	if (kernel_thread_start(nh_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_haptic.h b/bsd/dev/negroni_haptic.h
+new file mode 100644
+index 0000000..dd6c8da
+--- /dev/null
++++ b/bsd/dev/negroni_haptic.h
+@@ -0,0 +1,21 @@
++/* Vibration motor API (bsd/dev/negroni_haptic.c, patch 0300). C and C++. */
++#ifndef NEGRONI_HAPTIC_H
++#define NEGRONI_HAPTIC_H
++#include <stdint.h>
++#include <stdbool.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/*
++ * Starts (or extends) a direct-play buzz: ms 1..10000, strength 0..255 (the DIRECT_PLAY
++ * amplitude); ms 0 or strength 0 stops. Returns at once: a thread call stops the motor after
++ * ms. Thread context only (it takes a mutex). 0 ok, -1 not available (negronihap=0, the
++ * haptics APIDs are not owned by EE 0, or an SPMI write failed).
++ */
++int negroni_haptic_play(uint32_t ms, uint32_t strength);
++/* True after the boot-time setup succeeded (negronihap=1 or 2). */
++bool negroni_haptic_ready(void);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 0b1a686..dc203a6 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -55,6 +55,7 @@ extern void negroni_keys_init(void);
+ extern void negroni_touch_init(void);
+ extern void negroni_cpufreq_init(void);
+ extern void negroni_thermal_init(void);
++extern void negroni_haptic_init(void);   /* patch 0300: vibration motor (negronihap) */
+ extern void negroni_adreno_init(void);
+ extern void negroni_wifi_init(void);
+ extern void negroni_adsp_init(void);
+@@ -763,6 +764,7 @@ negroni_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/NegroniHID.cpp). */
+ 	negroni_cpufreq_init();
+ 	negroni_thermal_init();         /* patch 0280: TSENS readings + thermal caps */
++	negroni_haptic_init();          /* patch 0300: negronihap=1 buzzes 300 ms */
+ 	negroni_probe_menu();
+ 	negroni_adreno_init();
+ 	negroni_wifi_init();
