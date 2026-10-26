@@ -1,0 +1,269 @@
+diff --git a/bsd/dev/negroni_chg_glink.c b/bsd/dev/negroni_chg_glink.c
+index 6b3bc18..366900b 100644
+--- a/bsd/dev/negroni_chg_glink.c
++++ b/bsd/dev/negroni_chg_glink.c
+@@ -125,6 +125,7 @@ static struct negroni_chg_glink_status st_pub;          /* under negroni_chg_loc
+ static struct negroni_chg_glink_status st;              /* the ADSP thread's copy */
+ static bool chg_wanted_parsed, chg_wanted;
+ static uint32_t chg_ma = CHG_DEFAULT_MA, poll_s = 20;
++static uint32_t icl_want;                               /* 0370: the input limit for this adapter type, mA */
+ static bool loop_on;                                    /* 0277 */
+ static uint32_t loop_s = 5;                             /* 0277: OPLUS_CHG_UPDATE_INTERVAL_SEC, oplus_charger.c:110 */
+ 
+@@ -142,6 +143,14 @@ static bool notify_usb;
+ 
+ /* 0369: VOOC (the block before idle()) */
+ static uint32_t vooc_mode;                      /* boot-arg negronichg_vooc: 0 = VOOC off (default), 1 = allowed */
++/* 0370 */
++static uint32_t wr_mask = 0x7f, wr_delay_s, wr_skip_logged;
++static bool wr_safety;                  /* review N3: VOOC safety writes (park, ENABLE=0, un-park) bypass the mask and delay */
++static bool force_off_proactive;        /* vooc_force_off(): its ENABLE=0 is the bisect target (class 0x10), not a safety write */
++static bool delay_end_done;
++static bool notify_sent;                /* review N3: BC_SET_NOTIFY_REQ sent (deferred while the write delay runs) */
++static uint64_t start_ns;
++static uint32_t icl_bytype = 1;         /* boot-arg negronichg_icl_bytype: ICL per adapter type as stock (default) */
+ static void vooc_note(uint32_t n);
+ static void vooc_events(void);
+ static bool vooc_policy(int32_t dc);
+@@ -180,6 +189,10 @@ negroni_chg_glink_wanted(void)
+ 		(void)PE_parse_boot_argn("negronichg_loop", &lp, sizeof(lp));
+ 		(void)PE_parse_boot_argn("negronichg_loop_s", &ls, sizeof(ls));
+ 		(void)PE_parse_boot_argn("negronichg_vooc", &vooc_mode, sizeof(vooc_mode));    /* 0369 */
++		(void)PE_parse_boot_argn("negronichg_wr", &wr_mask, sizeof(wr_mask));           /* 0370 */
++		(void)PE_parse_boot_argn("negronichg_wr_delay_s", &wr_delay_s, sizeof(wr_delay_s));
++		(void)PE_parse_boot_argn("negronichg_icl_bytype", &icl_bytype, sizeof(icl_bytype));
++		wr_delay_s = MIN(wr_delay_s, 3600u);
+ 		vooc_mode = vooc_mode ? 1u : 0u;
+ 		chg_wanted = on != 0 && adsp != 0;
+ 		chg_ma = MIN(ma, CHG_MAX_MA);
+@@ -429,6 +442,49 @@ get(uint32_t opcode, uint32_t prop, uint32_t *val)
+ }
+ 
+ /* 0277: log = false logs only a failure (bounded): the loop re-sends the same values every 5 s. */
++/*
++ * 0370: write classes for bisecting (boot-arg negronichg_wr, bit set = allowed; default 0x7f all) and a delay
++ * after the client start before any write (negronichg_wr_delay_s, default 0). Every write logs +ms since start.
++ */
++#define WR_ICL          0x01u   /* USB_INPUT_CURR_LIMIT (5) */
++#define WR_SUSPEND      0x02u   /* USB_SUSPEND_PMIC (26) */
++#define WR_CHG_EN       0x04u   /* BATT_CHG_EN (24) */
++#define WR_FV_FCC       0x08u   /* BATT_VOLT_MAX (8), BATT_CHG_CTRL_LIM (10) */
++#define WR_VOOC         0x10u   /* USB 13, 25; BATT 28, 29, 37 (0369) */
++#define WR_NOTIFY       0x20u   /* BC_SET_NOTIFY_REQ */
++#define WR_OTHER        0x40u
++
++static uint32_t
++wr_class(uint32_t opcode, uint32_t prop)
++{
++	if (opcode == BC_USB_SET) {
++		return prop == USB_INPUT_CURR_LIMIT ? WR_ICL : prop == USB_SUSPEND_PMIC ? WR_SUSPEND :
++		       (prop == 13u || prop == 25u) ? WR_VOOC : WR_OTHER;
++	}
++	if (opcode == BC_BATTERY_SET) {
++		return prop == BATT_CHG_EN ? WR_CHG_EN : (prop == BATT_VOLT_MAX || prop == BATT_CHG_CTRL_LIM) ? WR_FV_FCC :
++		       (prop == 28u || prop == 29u || prop == 37u) ? WR_VOOC : WR_OTHER;
++	}
++	return WR_OTHER;
++}
++
++/* false: this write class is off (negronichg_wr) or the start delay runs (logged once per class) */
++static bool
++wr_allowed(uint32_t cls, const char *what)
++{
++	bool delay = wr_delay_s && now_ns() - start_ns < (uint64_t)wr_delay_s * NSEC_PER_SEC;
++	if (wr_safety || ((wr_mask & cls) && !delay)) {
++		return true;
++	}
++	if (!(wr_skip_logged & cls) || delay) {
++		if (!(wr_skip_logged & cls)) {
++			LOG("write %s skipped: %s (class %#x)", what, delay ? "negronichg_wr_delay_s runs" : "off by negronichg_wr", cls);
++		}
++		wr_skip_logged |= cls;
++	}
++	return false;
++}
++
+ static bool
+ put_log(uint32_t opcode, uint32_t prop, uint32_t value, const char *what, bool log)
+ {
+@@ -438,9 +494,13 @@ put_log(uint32_t opcode, uint32_t prop, uint32_t value, const char *what, bool l
+ 	if (!st.ready) {
+ 		return false;                   /* never a write before the PD answered a read */
+ 	}
++	if (!wr_allowed(wr_class(opcode, prop), what)) {
++		return false;                   /* 0370 */
++	}
+ 	rc = prop_io(opcode, prop, value, &val, &ret);
+ 	if (log) {
+-		LOG("write %s = %u: %s (ret_code %#x)", what, value, rc ? "no answer" : ret ? "REFUSED" : "ok", rc ? 0 : ret);
++		LOG("write %s = %u: %s (ret_code %#x) +%llu ms", what, value, rc ? "no answer" : ret ? "REFUSED" : "ok", rc ? 0 : ret,
++		    (now_ns() - start_ns) / NSEC_PER_MSEC);
+ 	} else if (rc != 0 || ret != 0) {
+ 		LOG_ERR("write %s = %u: %s (ret_code %#x)", what, value, rc ? "no answer" : "REFUSED", rc ? 0 : ret);
+ 	}
+@@ -513,7 +573,7 @@ static uint32_t last_key = 0xffffffffu;
+ static void
+ icl_ramp(int32_t cell_mv)
+ {
+-	uint32_t aicl = cell_mv > 4100 ? 4550 : 4500, ma = MIN(ICL_STEP_MA, chg_ma), good = 0, v = 0;
++	uint32_t aicl = cell_mv > 4100 ? 4550 : 4500, ma = MIN(ICL_STEP_MA, icl_want), good = 0, v = 0;
+ 
+ 	for (;;) {
+ 		char what[48];
+@@ -531,10 +591,10 @@ icl_ramp(int32_t cell_mv)
+ 			break;
+ 		}
+ 		good = ma;
+-		if (ma >= chg_ma) {
++		if (ma >= icl_want) {
+ 			break;
+ 		}
+-		ma = MIN(ma + ICL_STEP_MA, chg_ma);
++		ma = MIN(ma + ICL_STEP_MA, icl_want);
+ 	}
+ 	st.icl_set = good != 0;
+ }
+@@ -664,15 +724,31 @@ cycle(void)
+ 		struct bc_notify_req n = { { BC_OWNER, BC_TYPE_NOTIFY, BC_SET_NOTIFY_REQ }, 0, 0, 0, 0 };
+ 		st.ready = true;
+ 		LOG("the charger PD answers (%u reads ok, %u refused, %u lost): READY", good_reads, bad_reads, lost_reads);
+-		LOG("subscribe to notifications (BC_SET_NOTIFY_REQ): %s",
+-		    transact(&n, sizeof(n), BC_SET_NOTIFY_REQ, -1) == 0 ? "acked" : "no ack");
++		if (wr_allowed(WR_NOTIFY, "BC_SET_NOTIFY_REQ")) {
++			notify_sent = true;
++			LOG("subscribe to notifications (BC_SET_NOTIFY_REQ): %s +%llu ms",
++			    transact(&n, sizeof(n), BC_SET_NOTIFY_REQ, -1) == 0 ? "acked" : "no ack", (now_ns() - start_ns) / NSEC_PER_MSEC);
++		}
+ 		dump_props_once();
+ 		vooc_force_off("READY");        /* 0369 review F6 */
+ 		/* review N1: after a lost-read reset the ADSP may still run VOOC: read its status before any PMIC write */
+ 		if (get(BC_USB_GET, 12u /* USB_VOOCPHY_STATUS */, &v) && (v & 0xff) == 2) {
+ 			vooc_status(v, "READY check");
+ 		}
+-	} else if (!any && st.ready && lost_reads > 0) {
++	}
++	/* review N3: when negronichg_wr_delay_s ends: the deferred subscribe and the VOOC-off write */
++	if (st.ready && wr_delay_s && !delay_end_done && now_ns() - start_ns >= (uint64_t)wr_delay_s * NSEC_PER_SEC) {
++		struct bc_notify_req n2 = { { BC_OWNER, BC_TYPE_NOTIFY, BC_SET_NOTIFY_REQ }, 0, 0, 0, 0 };
++		delay_end_done = true;
++		LOG("the write delay (%u s) ended +%llu ms", wr_delay_s, (now_ns() - start_ns) / NSEC_PER_MSEC);
++		if (!notify_sent && wr_allowed(WR_NOTIFY, "BC_SET_NOTIFY_REQ")) {
++			notify_sent = true;
++			LOG("subscribe to notifications (BC_SET_NOTIFY_REQ): %s +%llu ms",
++			    transact(&n2, sizeof(n2), BC_SET_NOTIFY_REQ, -1) == 0 ? "acked" : "no ack", (now_ns() - start_ns) / NSEC_PER_MSEC);
++		}
++		vooc_force_off("write delay ended");
++	}
++	if (!any && st.ready && lost_reads > 0) {
+ 		st.ready = false;               /* no writes again until a read works */
+ 		vooc_reset("the PD stopped answering");         /* 0369 review F7 */
+ 		LOG_ERR("no read answered in this cycle (%u lost): not ready, writes stop", lost_reads);
+@@ -704,11 +780,26 @@ cycle(void)
+ 	}
+ 	was_online = online;
+ 
+-	if (online && st.ready && chg_ma > 0 && !VOOC_OWNS()) {     /* 0369: not while VOOC owns the path */
+-		bool iclWrong = st.icl_ma < 0 || (uint32_t)(st.icl_ma + 100) < chg_ma || (uint32_t)st.icl_ma > chg_ma + 100;
++	/*
++	 * 0370: the input limit per adapter type as stock oplus_chg_set_input_current (oplus_charger.c:7031-7046, DT):
++	 * SDP 500 mA (qcom,input_current_usb_ma), CDP 1500 (input_current_cdp_ma), DCP/PD chg_ma (<= 2000);
++	 * unknown type: no write. negronichg_icl_bytype=0: chg_ma for every type (0274).
++	 */
++	icl_want = chg_ma;
++	if (icl_bytype) {
++		icl_want = st.usb_type == 1 ? MIN(chg_ma, 500u) : st.usb_type == 3 ? MIN(chg_ma, 1500u) :
++		    (st.usb_type == 2 || st.usb_type >= 5) ? chg_ma : 0;
++		/* review B3: unknown type (0, ACA 4, failed read -1) and the ICL near 0 (e.g. after a recovery): 500 mA floor */
++		if (icl_want == 0 && chg_ma > 0 && !VOOC_OWNS() && st.icl_ma >= 0 && st.icl_ma < 100) {
++			icl_want = MIN(chg_ma, 500u);
++		}
++	}
++	if (online && st.ready && icl_want > 0 && !VOOC_OWNS()) {   /* 0369: not while VOOC owns the path */
++		bool iclWrong = st.icl_ma < 0 || (uint32_t)(st.icl_ma + 100) < icl_want || (uint32_t)st.icl_ma > icl_want + 100;
+ 		if ((!st.icl_set || iclWrong) && tries < CHG_TRIES) {
+ 			tries++;
+-			LOG("set the input limit (try %u of %u): now %d mA, want %u mA", tries, CHG_TRIES, st.icl_ma, chg_ma);
++			LOG("set the input limit (try %u of %u): now %d mA, want %u mA (adapter type %d%s)", tries, CHG_TRIES, st.icl_ma,
++			    icl_want, st.usb_type, icl_bytype ? ", per type" : "");
+ 			icl_ramp(st.vbat_mv > 5000 ? st.vbat_mv / 2 : st.vbat_mv);
+ 			st.icl_ma = get(BC_USB_GET, USB_INPUT_CURR_LIMIT, &v) ? (int32_t)(v / 1000) : -1;
+ 			LOG("input limit read back: %d mA", st.icl_ma);
+@@ -978,8 +1069,11 @@ static bool vooc_set_enable(uint32_t want, const char *why);
+ static void
+ vooc_park(const char *why)
+ {
++	bool saved = wr_safety;
++	wr_safety = true;                       /* review N3: safety writes bypass negronichg_wr / _delay_s */
+ 	bool a = put(BC_BATTERY_SET, BATT_CHG_EN, 0, "BATT_CHG_EN (VOOC: PMIC charger off)");
+ 	bool b = put(BC_USB_SET, USB_INPUT_CURR_LIMIT, 0, "USB_INPUT_CURR_LIMIT 0 (VOOC: PMIC input parked)");
++	wr_safety = saved;
+ 	if (!VOOC_OWNS()) {
+ 		vc.park_ns = now_ns();          /* the 8.5 s recovery timer starts at the first try */
+ 		vc.ongoing = false;
+@@ -1010,12 +1104,18 @@ vooc_unpark(const char *why)
+ 	if (!was) {
+ 		return;
+ 	}
+-	/* review N2: never leave the ICL at the park's 0: our limit, else the ICL from before the park, else 500 mA */
+-	uint32_t ma = chg_ma > 0 ? chg_ma : vc.saved_icl_ma > 0 ? (uint32_t)vc.saved_icl_ma : 500u;
++	/*
++	 * review N2 + 0370 B3: never leave the ICL at the park's 0: the limit for this adapter type, else the ICL
++	 * from before the park, else 500 mA (unknown type, ACA, failed type read, negronichg_ma=0).
++	 */
++	uint32_t ma = icl_want > 0 ? icl_want : vc.saved_icl_ma > 0 ? (uint32_t)vc.saved_icl_ma : 500u;
++	bool saved = wr_safety;
++	wr_safety = true;                       /* review N3: the restore is a safety write */
+ 	st.icl_set = put(BC_USB_SET, USB_INPUT_CURR_LIMIT, ma * 1000u, "USB_INPUT_CURR_LIMIT (VOOC end)");
+ 	if (!st.chg_stopped) {
+ 		st.chg_en_set = put(BC_BATTERY_SET, BATT_CHG_EN, 1, "BATT_CHG_EN (VOOC end)");
+ 	}
++	wr_safety = saved;
+ 	tries = en_tries = susp_tries = 0;      /* review N2: a fresh write budget after each VOOC episode */
+ 	LOG("vooc: %s: PMIC charger back (ICL %u mA%s)", why, ma, st.chg_stopped ? ", charging stopped by the loop" : "");
+ }
+@@ -1025,10 +1125,15 @@ vooc_set_enable(uint32_t want, const char *why)
+ {
+ 	uint32_t v = 0;
+ 	bool ok = false;
++	bool saved = wr_safety;
++	if (want == 0 && !force_off_proactive) {
++		wr_safety = true;               /* review N3: a reactive VOOC-off is a safety write */
++	}
+ 	for (unsigned i = 0; i < 3 && !ok; i++) {       /* stock retries the 0 write up to 10 times */
+ 		ok = put_log(BC_USB_SET, USB_VOOCPHY_ENABLE, want, want ? "USB_VOOCPHY_ENABLE (VOOC allowed)" :
+ 		    "USB_VOOCPHY_ENABLE (VOOC off)", i == 0);
+ 	}
++	wr_safety = saved;
+ 	vc.enable = get(BC_USB_GET, USB_VOOCPHY_ENABLE, &v) ? (int32_t)v : -1;
+ 	LOG("vooc: enable %u (%s): read back %d", want, why, vc.enable);
+ 	return ok && vc.enable == (int32_t)want;
+@@ -1142,7 +1247,9 @@ vooc_events(void)
+ 		vc.recoveries++;
+ 		LOG("vooc: no ONGOING %llu ms after the handshake (recovery #%u): un-park, USB_VOOCPHY_RESET_AGAIN",
+ 		    VOOC_HS_TIMEOUT_NS / NSEC_PER_MSEC, vc.recoveries);
++		wr_safety = true;
+ 		(void)put(BC_USB_SET, USB_INPUT_CURR_LIMIT, 0, "USB_INPUT_CURR_LIMIT 0 (recovery)");
++		wr_safety = false;
+ 		vc.in_events = false;
+ 		IOSleep(1000);
+ 		vc.in_events = true;
+@@ -1243,7 +1350,9 @@ vooc_force_off(const char *why)
+ 	}
+ 	vc.enable = get(BC_USB_GET, USB_VOOCPHY_ENABLE, &v) ? (int32_t)v : -1;
+ 	if (vc.enable != 0) {
++		force_off_proactive = true;     /* review N3: this one obeys negronichg_wr / _delay_s (bisect class 0x10) */
+ 		(void)vooc_set_enable(0, why);
++		force_off_proactive = false;
+ 	} else {
+ 		LOG("vooc: USB_VOOCPHY_ENABLE reads 0 (%s, negronichg_vooc=0): plain charging", why);
+ 	}
+@@ -1325,6 +1434,9 @@ chg_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 	st.loop_on = loop_on;
+ 	publish();
++	start_ns = now_ns();                                    /* 0370 */
++	LOG("writes: class mask %#x (negronichg_wr: 1 ICL, 2 USB_SUSPEND_PMIC, 4 BATT_CHG_EN, 8 FV/FCC, 0x10 VOOC, 0x20 notify, "
++	    "0x40 other), delay %u s, ICL per adapter type %s", wr_mask, wr_delay_s, icl_bytype ? "on" : "off");
+ 	negroni_glink_set_rx(NEGRONI_GLINK_PMIC, chg_rx);    /* before the open: a notification can come at once */
+ 	LOG("start: channel PMIC_RTR_ADSP_APPS, input limit %u mA%s, poll %u s, charge loop %s (every %u s, FV <= %u mV/cell, "
+ 	    "FCC <= %u mA)", chg_ma, chg_ma ? "" : " (read only)", poll_s, loop_on ? "on" : "off", loop_s, FV_DT_MV, FCC_DT_MA);

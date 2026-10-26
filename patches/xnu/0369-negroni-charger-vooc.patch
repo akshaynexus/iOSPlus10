@@ -1,0 +1,543 @@
+diff --git a/bsd/dev/negroni_chg_glink.c b/bsd/dev/negroni_chg_glink.c
+index 375ca12..6b3bc18 100644
+--- a/bsd/dev/negroni_chg_glink.c
++++ b/bsd/dev/negroni_chg_glink.c
+@@ -140,6 +140,27 @@ static bool rx_have;
+ static uint32_t notify_count, notify_last, stray_count, err_lines;
+ static bool notify_usb;
+ 
++/* 0369: VOOC (the block before idle()) */
++static uint32_t vooc_mode;                      /* boot-arg negronichg_vooc: 0 = VOOC off (default), 1 = allowed */
++static void vooc_note(uint32_t n);
++static void vooc_events(void);
++static bool vooc_policy(int32_t dc);
++static void vooc_unplugged(void);
++static void vooc_force_off(const char *why);
++static void vooc_reset(const char *why);
++static void vooc_status(uint32_t v, const char *src);
++#define VOOC_OWNS()     (vc.parked || vc.park_pending)  /* the PMIC charger must stay off */
++static struct {
++	bool parked, ongoing, suspend_req, pd_svooc, in_events, off_done;
++	int32_t saved_icl_ma;           /* review N2: the ICL read before the park (mA), restored at the un-park; 0 = none */
++	bool park_pending;              /* review B2: a 0x52 came, the park writes are not acked yet (retried) */
++	uint64_t park_retry_ns;
++	int32_t enable;                 /* USB_VOOCPHY_ENABLE read back, -1 unknown */
++	uint64_t park_ns;
++	uint32_t code, adapter, sub, mw, statuses, recoveries, lines;
++} vc = { .enable = -1 };
++
++
+ #define LOG(fmt, ...) printf("NEGRONI BATTERY: glink: " fmt "\n", ##__VA_ARGS__)
+ #define LOG_ERR(fmt, ...) do { \
+ 	if (err_lines < LOG_ERR_MAX || err_lines % 100 == 0) { LOG(fmt, ##__VA_ARGS__); } \
+@@ -158,6 +179,8 @@ negroni_chg_glink_wanted(void)
+ 		(void)PE_parse_boot_argn("negronichg_glink_poll", &ps, sizeof(ps));
+ 		(void)PE_parse_boot_argn("negronichg_loop", &lp, sizeof(lp));
+ 		(void)PE_parse_boot_argn("negronichg_loop_s", &ls, sizeof(ls));
++		(void)PE_parse_boot_argn("negronichg_vooc", &vooc_mode, sizeof(vooc_mode));    /* 0369 */
++		vooc_mode = vooc_mode ? 1u : 0u;
+ 		chg_wanted = on != 0 && adsp != 0;
+ 		chg_ma = MIN(ma, CHG_MAX_MA);
+ 		poll_s = MIN(MAX(ps, 5u), 600u);
+@@ -295,6 +318,7 @@ chg_rx(const uint8_t *data, uint32_t len)
+ 		}
+ 		notify_count++;
+ 		notify_last = n;
++		vooc_note(n);                   /* 0369 */
+ 		if (n == BC_USB_GET) {
+ 			notify_usb = true;          /* a plug event: the next cycle comes early */
+ 		}
+@@ -643,8 +667,14 @@ cycle(void)
+ 		LOG("subscribe to notifications (BC_SET_NOTIFY_REQ): %s",
+ 		    transact(&n, sizeof(n), BC_SET_NOTIFY_REQ, -1) == 0 ? "acked" : "no ack");
+ 		dump_props_once();
++		vooc_force_off("READY");        /* 0369 review F6 */
++		/* review N1: after a lost-read reset the ADSP may still run VOOC: read its status before any PMIC write */
++		if (get(BC_USB_GET, 12u /* USB_VOOCPHY_STATUS */, &v) && (v & 0xff) == 2) {
++			vooc_status(v, "READY check");
++		}
+ 	} else if (!any && st.ready && lost_reads > 0) {
+ 		st.ready = false;               /* no writes again until a read works */
++		vooc_reset("the PD stopped answering");         /* 0369 review F7 */
+ 		LOG_ERR("no read answered in this cycle (%u lost): not ready, writes stop", lost_reads);
+ 	}
+ 	if (soc >= 0) {
+@@ -665,14 +695,16 @@ cycle(void)
+ 		st.icl_set = st.chg_en_set = false;
+ 		loop_reset();
+ 		LOG("USB in (online %d in_status %#x VBUS %d mV adapter type %u)", st.usb_online, insts, st.usb_mv, adap);
++		vooc_force_off("USB in");       /* 0369 review F6 */
+ 	} else if (!online && was_online) {
+ 		LOG("USB out");
+ 		st.icl_set = st.chg_en_set = false;
+ 		loop_reset();
++		vooc_unplugged();               /* 0369 */
+ 	}
+ 	was_online = online;
+ 
+-	if (online && st.ready && chg_ma > 0) {
++	if (online && st.ready && chg_ma > 0 && !VOOC_OWNS()) {     /* 0369: not while VOOC owns the path */
+ 		bool iclWrong = st.icl_ma < 0 || (uint32_t)(st.icl_ma + 100) < chg_ma || (uint32_t)st.icl_ma > chg_ma + 100;
+ 		if ((!st.icl_set || iclWrong) && tries < CHG_TRIES) {
+ 			tries++;
+@@ -736,6 +768,7 @@ charge_loop(void)
+ 		negroni_pwr_temp_set(NEGRONI_PWR_T_BATT, centi);
+ 	}
+ 	if (centi == INT32_MIN) {
++		(void)vooc_policy(INT32_MIN);   /* 0369: no temperature = no VOOC */
+ 		if (!notemp_logged) {
+ 			notemp_logged = true;
+ 			LOG("loop: no battery temperature (BATT_TEMP): FV/FCC stay as the PD has them");
+@@ -759,6 +792,11 @@ charge_loop(void)
+ 		    b->fv_mv, b->fcc_ma, b->fcc_ma ? "" : ": charging stops (BATT_CHG_EN = 0)");
+ 		st.band = (int8_t)nb;
+ 	}
++	/* 0369: VOOC policy (temperature to the ADSP, enable/disable); while VOOC feeds the battery, no PMIC writes */
++	if (vooc_policy(dc) && b->fv_mv != 0 && b->fcc_ma != 0) {
++		publish();
++		return;
++	}
+ 	/* 3. stop and restart */
+ 	if (b->fv_mv == 0 || b->fcc_ma == 0) {
+ 		bool first = !st.chg_stopped;
+@@ -838,6 +876,391 @@ charge_loop(void)
+ }
+ 
+ /* Wait `s` seconds; GLINK stays polled (notifications). A USB notification ends it after 2 s (true). */
++/*
++ * ---- 0369: VOOC / SuperVOOC with the ADSP VOOC PHY (README-battery.md section 15) ----
++ * live.dts qcom,voocphy_support = <1> (ADSP_VOOCPHY), qcom,vooc_project = <7> (DUAL_BATT_80W, 80000 mW).
++ * The ADSP runs the VOOC protocol and the charge pumps. The HLOS side (oplus_battery_sm8450.c,
++ * voocphy/oplus_adsp_voocphy.c, oplus_charger.c) only: keeps USB_VOOCPHY_ENABLE (usb id 13) at 1 for a DCP,
++ * sends the battery temperature (BATT_SET_MATCH_TEMP, battery id 29, 0.1 C) and a cool-down level
++ * (BATT_SET_COOL_DOWN 28, 0 = no limit), parks the PMIC charger when the ADSP starts the handshake
++ * (notify 0x52: BATT_CHG_EN 0 + USB_INPUT_CURR_LIMIT 0, :2181-2192, :1373-1383), decodes the status word
++ * (notify 0x48 -> USB_VOOCPHY_STATUS 12: code bits 0-7, adapter id bits 8-14, sub-reason bits 16-23),
++ * answers BC_CHG_STATUS_GET 0x59 with BATT_SEND_CHG_STATUS 37 (:8417-8444), and recovers after 8.5 s
++ * without ONGOING (:8513-8535: ICL 0, 1 s, un-park, USB_VOOCPHY_RESET_AGAIN 25 = 1).
++ * Ours is stricter: VOOC only with negronichg_vooc=1, an adapter type DCP, the battery between 12.0 and
++ * 43.0 C (stock: the ADSP decides up to its 45 C warm band), no thermal FCC level (0283) and charging not
++ * stopped by the 0277 loop; else USB_VOOCPHY_ENABLE = 0 and plain charging. Default negronichg_vooc=0
++ * writes USB_VOOCPHY_ENABLE = 0 (the stock "off" path, oplus_voocphy.c:8640) and only logs.
++ */
++#define USB_VOOCPHY_STATUS      12u
++#define USB_VOOCPHY_ENABLE      13u
++#define USB_VOOC_FAST_CHG_TYPE  23u
++#define USB_VOOCPHY_RESET_AGAIN 25u
++#define BATT_SET_COOL_DOWN      28u
++#define BATT_SET_MATCH_TEMP     29u
++#define BATT_SEND_CHG_STATUS    37u
++#define USB_TYPE_DCP            2u      /* POWER_SUPPLY_USB_TYPE_DCP */
++#define VOOC_MIN_DC             120     /* 12.0 C */
++#define VOOC_MAX_DC             430     /* 43.0 C (stock warm band starts at 45.0 C) */
++#define VOOC_HS_TIMEOUT_NS      (8500ull * NSEC_PER_MSEC)
++#define EV_VBUS_ADC             (1u << 0)       /* 0x52 BC_VOOC_VBUS_ADC_ENABLE: handshake starts */
++#define EV_STATUS               (1u << 1)       /* 0x48 BC_VOOC_STATUS_GET */
++#define EV_CHG_STATUS_GET       (1u << 2)       /* 0x59 */
++#define EV_CHG_STATUS_SET       (1u << 3)       /* 0x60 */
++#define EV_SUSPEND_REQ          (1u << 4)       /* 0x61 BC_ADSP_NOTIFY_AP_SUSPEND_CHG */
++#define EV_PD_SVOOC             (1u << 5)       /* 0x56 */
++#define EV_ABNORMAL             (1u << 6)       /* 0x67 BC_ABNORMAL_PD_SVOOC_ADAPTER */
++#define EV_PLUG                 (1u << 7)       /* 0x55/0x57/0x58 type-C / plug-in / APSD done */
++static volatile uint32_t vooc_ev;               /* under rx_mtx */
++
++static const char *const kVoocCode[] = { "unknown", "PRESENT", "ONGOING", "ABSENT", "FULL", "BAD_CONNECTED",
++	"BATT_TEMP_OVER", "BTB_TEMP_OVER", "DUMMY_START", "ADAPTER_COPYCAT", "ERR_COMMU", "SWITCH_TEMP_RANGE",
++	"COMMU_TIME_OUT", "COMMU_CLK_ERR", "COMMU_SEND_ERR", "HW_VBATT_HIGH", "HW_TBATT_HIGH" };
++
++/* oplus_vooc.c:134-176 adapter_id_table: id range -> SVOOC watts (or VOOC watts when 0); capped at the project's 80 W */
++static uint32_t
++vooc_adapter_mw(uint32_t id)
++{
++	static const struct { uint8_t lo, hi, vooc_w, svooc_w; } t[] = {
++		{ 0x01, 0x01, 20, 0 }, { 0x11, 0x12, 30, 50 }, { 0x13, 0x13, 20, 0 }, { 0x14, 0x14, 30, 65 },
++		{ 0x15, 0x16, 20, 0 }, { 0x17, 0x19, 30, 0 }, { 0x1a, 0x1b, 15, 33 }, { 0x1c, 0x1c, 22, 45 },
++		{ 0x1d, 0x1e, 22, 44 }, { 0x21, 0x21, 30, 50 }, { 0x22, 0x22, 22, 44 }, { 0x23, 0x23, 30, 50 },
++		{ 0x24, 0x27, 30, 55 }, { 0x28, 0x28, 30, 65 }, { 0x29, 0x29, 30, 0 }, { 0x2a, 0x2a, 30, 65 },
++		{ 0x2b, 0x2b, 30, 66 }, { 0x2c, 0x2e, 30, 67 }, { 0x31, 0x31, 30, 50 }, { 0x32, 0x32, 30, 120 },
++		{ 0x33, 0x33, 30, 50 }, { 0x34, 0x34, 20, 20 }, { 0x35, 0x35, 30, 65 }, { 0x36, 0x36, 30, 66 },
++		{ 0x37, 0x3a, 30, 88 }, { 0x3b, 0x3e, 30, 100 }, { 0x41, 0x44, 30, 0 }, { 0x45, 0x45, 20, 0 },
++		{ 0x46, 0x46, 30, 0 }, { 0x47, 0x48, 30, 120 }, { 0x49, 0x4a, 15, 33 }, { 0x4b, 0x4e, 30, 80 },
++		{ 0x51, 0x51, 30, 125 }, { 0x61, 0x61, 15, 33 }, { 0x62, 0x62, 30, 50 }, { 0x63, 0x63, 30, 65 },
++		{ 0x64, 0x64, 30, 66 }, { 0x65, 0x65, 30, 80 }, { 0x66, 0x66, 30, 65 }, { 0x67, 0x68, 30, 125 },
++		{ 0x69, 0x6a, 30, 100 }, { 0x6b, 0x6b, 30, 120 }, { 0x6c, 0x6d, 30, 67 }, { 0x6e, 0x6e, 30, 65 },
++	};
++	for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
++		if (id >= t[i].lo && id <= t[i].hi) {
++			uint32_t w = t[i].svooc_w ? t[i].svooc_w : t[i].vooc_w;
++			return MIN(w, 80u) * 1000u;     /* oplus_configfs.c:3114-3136: min(adapter, project power) */
++		}
++	}
++	return 0;
++}
++
++/* The notification ids that 0369 handles (chg_rx, under rx_mtx). */
++static void
++vooc_note(uint32_t n)
++{
++	switch (n) {
++	case 0x52: vooc_ev |= EV_VBUS_ADC; break;
++	case 0x48: vooc_ev |= EV_STATUS; break;
++	case 0x59: vooc_ev |= EV_CHG_STATUS_GET; break;
++	case 0x60: vooc_ev |= EV_CHG_STATUS_SET; break;
++	case 0x61: vooc_ev |= EV_SUSPEND_REQ; break;
++	case 0x56: vooc_ev |= EV_PD_SVOOC; break;
++	case 0x67: vooc_ev |= EV_ABNORMAL; break;
++	case 0x55: case 0x57: case 0x58: vooc_ev |= EV_PLUG; break;
++	default: break;
++	}
++}
++
++static void
++vooc_publish(void)
++{
++	st.vooc_mode = (uint8_t)vooc_mode;
++	st.vooc_enable = vooc_mode ? vc.enable : 0;
++	st.vooc_active = vc.ongoing;
++	st.vooc_code = (uint8_t)vc.code;
++	st.vooc_adapter = (uint8_t)vc.adapter;
++	st.vooc_mw = vc.mw;
++	publish();
++}
++
++static bool vooc_set_enable(uint32_t want, const char *why);
++
++/* PMIC charger off while the ADSP's VOOC path feeds the battery (stock order: BATT_CHG_EN 0, then ICL 0). */
++static void
++vooc_park(const char *why)
++{
++	bool a = put(BC_BATTERY_SET, BATT_CHG_EN, 0, "BATT_CHG_EN (VOOC: PMIC charger off)");
++	bool b = put(BC_USB_SET, USB_INPUT_CURR_LIMIT, 0, "USB_INPUT_CURR_LIMIT 0 (VOOC: PMIC input parked)");
++	if (!VOOC_OWNS()) {
++		vc.park_ns = now_ns();          /* the 8.5 s recovery timer starts at the first try */
++		vc.ongoing = false;
++		vc.saved_icl_ma = st.icl_ma >= 100 ? st.icl_ma : 0;     /* review N2 (st.icl_ma: this cycle's read) */
++	}
++	st.chg_en_set = st.icl_set = false;
++	vc.park_retry_ns = now_ns();
++	if (a && b) {
++		vc.parked = true;
++		vc.park_pending = false;
++	} else {
++		/* review B2: not parked until both writes are acked; meanwhile VOOC off, retried every 1 s (vooc_events) */
++		vc.park_pending = true;
++		vc.parked = false;
++		(void)vooc_set_enable(0, "the PMIC park writes failed");
++	}
++	LOG("vooc: %s: PMIC charger %s (%s/%s), %llu ms for ONGOING", why, vc.parked ? "parked" : "NOT parked yet (retry)",
++	    a ? "ok" : "FAILED", b ? "ok" : "FAILED", VOOC_HS_TIMEOUT_NS / NSEC_PER_MSEC);
++}
++
++/* Back to the PMIC charger (plain charging): our ICL (not stock's 0xFFFFFFFF), BATT_CHG_EN 1 unless 0277 stopped it. */
++static void
++vooc_unpark(const char *why)
++{
++	bool was = VOOC_OWNS();
++	vc.parked = vc.ongoing = vc.park_pending = false;
++	vc.park_ns = 0;
++	if (!was) {
++		return;
++	}
++	/* review N2: never leave the ICL at the park's 0: our limit, else the ICL from before the park, else 500 mA */
++	uint32_t ma = chg_ma > 0 ? chg_ma : vc.saved_icl_ma > 0 ? (uint32_t)vc.saved_icl_ma : 500u;
++	st.icl_set = put(BC_USB_SET, USB_INPUT_CURR_LIMIT, ma * 1000u, "USB_INPUT_CURR_LIMIT (VOOC end)");
++	if (!st.chg_stopped) {
++		st.chg_en_set = put(BC_BATTERY_SET, BATT_CHG_EN, 1, "BATT_CHG_EN (VOOC end)");
++	}
++	tries = en_tries = susp_tries = 0;      /* review N2: a fresh write budget after each VOOC episode */
++	LOG("vooc: %s: PMIC charger back (ICL %u mA%s)", why, ma, st.chg_stopped ? ", charging stopped by the loop" : "");
++}
++
++static bool
++vooc_set_enable(uint32_t want, const char *why)
++{
++	uint32_t v = 0;
++	bool ok = false;
++	for (unsigned i = 0; i < 3 && !ok; i++) {       /* stock retries the 0 write up to 10 times */
++		ok = put_log(BC_USB_SET, USB_VOOCPHY_ENABLE, want, want ? "USB_VOOCPHY_ENABLE (VOOC allowed)" :
++		    "USB_VOOCPHY_ENABLE (VOOC off)", i == 0);
++	}
++	vc.enable = get(BC_USB_GET, USB_VOOCPHY_ENABLE, &v) ? (int32_t)v : -1;
++	LOG("vooc: enable %u (%s): read back %d", want, why, vc.enable);
++	return ok && vc.enable == (int32_t)want;
++}
++
++/* One USB_VOOCPHY_STATUS word (from 0x48, the recovery check or the loop's check while ONGOING). */
++static void
++vooc_status(uint32_t v, const char *src)
++{
++	uint32_t code = v & 0xff, id = (v >> 8) & 0x7f, sub = (v >> 16) & 0xff;
++
++	vc.code = code;
++	vc.sub = sub;
++	if ((code == 1 || code == 8) && id != 0) {
++		vc.adapter = id;
++		vc.mw = vooc_adapter_mw(id);
++	}
++	if (code != 2 || !vc.ongoing || src[0] == '0') {
++		LOG("vooc: status %#x (%s): %s (code %u) adapter id %#x (%u W class) sub-reason %u", v, src,
++		    code < sizeof(kVoocCode) / sizeof(kVoocCode[0]) ? kVoocCode[code] : "?", code, vc.adapter, vc.mw / 1000, sub);
++	}
++	if (code == 1 || code == 2) {
++		if (code == 2) {
++			if (!VOOC_OWNS()) {
++				vooc_park("ONGOING without the 0x52 handshake");
++			}
++			vc.ongoing = true;
++			vc.park_ns = 0;                 /* the recovery timer ends here */
++			if (vc.adapter == 0 && get(BC_USB_GET, USB_VOOC_FAST_CHG_TYPE, &v)) {
++				vc.adapter = v & 0x7f;
++				vc.mw = vooc_adapter_mw(vc.adapter);
++			}
++		}
++		(void)put_log(BC_BATTERY_SET, BATT_SET_COOL_DOWN, 0, "BATT_SET_COOL_DOWN 0 (no limit)", src[0] == '0');
++		if (!vooc_mode) {
++			LOG("vooc: fast charge reported although negronichg_vooc=0: VOOC off again");
++			(void)vooc_set_enable(0, "negronichg_vooc=0");
++		}
++	} else {
++		vooc_unpark(code == 4 ? "full" : "fast charge ended or not possible");
++		if (code == 10 || code == 13) {
++			vc.adapter = 0;
++			vc.mw = 0;
++		}
++		notify_usb = true;
++	}
++}
++
++/* Notifications (thread context, from idle() every 50 ms). */
++static void
++vooc_events(void)
++{
++	uint32_t ev, v = 0;
++
++	if (vc.in_events || !st.ready) {
++		return;
++	}
++	lck_mtx_lock(&rx_mtx);
++	ev = vooc_ev;
++	vooc_ev = 0;
++	lck_mtx_unlock(&rx_mtx);
++	vc.in_events = true;
++	if (ev & EV_PD_SVOOC) {
++		vc.pd_svooc = true;
++		LOG("vooc: the ADSP reports a PD adapter that can do SVOOC (0x56)");
++	}
++	if (ev & EV_ABNORMAL) {
++		LOG("vooc: the ADSP reports an abnormal PD SVOOC adapter (0x67)");
++	}
++	if (ev & EV_SUSPEND_REQ) {
++		vc.suspend_req = true;
++		LOG("vooc: the ADSP asks the AP to suspend charging (0x61)");
++	}
++	if (ev & EV_PLUG) {
++		LOG("vooc: plug / type-C / APSD notification: the next cycle comes early");
++		notify_usb = true;
++	}
++	if (ev & EV_VBUS_ADC) {
++		/* always park, also with negronichg_vooc=0: if the ADSP starts VOOC, the PMIC must not feed in parallel */
++		vooc_park(vooc_mode ? "handshake starts (0x52)" : "handshake starts (0x52) although negronichg_vooc=0");
++		if (!vooc_mode) {
++			(void)vooc_set_enable(0, "negronichg_vooc=0");
++		}
++	}
++	if (ev & EV_STATUS) {
++		vc.statuses++;
++		if (!get(BC_USB_GET, USB_VOOCPHY_STATUS, &v)) {
++			LOG_ERR("vooc: status notification, USB_VOOCPHY_STATUS read failed");
++		} else {
++			vooc_status(v, "0x48");
++		}
++	}
++	if (ev & EV_CHG_STATUS_GET) {
++		uint32_t on = (!vc.suspend_req && !st.chg_stopped && !VOOC_OWNS()) ? 1u : 0u;
++		(void)put(BC_BATTERY_SET, BATT_SEND_CHG_STATUS, on, "BATT_SEND_CHG_STATUS (answer to 0x59)");
++		LOG("vooc: 0x59 answered: charging %s", on ? "enabled" : "disabled/suspended");
++	}
++	if (ev & EV_CHG_STATUS_SET) {
++		vooc_unpark("the ADSP asks to un-suspend (0x60)");
++	}
++	/* review B2: park writes not acked yet: try again every 1 s */
++	if (vc.park_pending && now_ns() - vc.park_retry_ns >= NSEC_PER_SEC) {
++		vooc_park("retry");
++	}
++	/* recovery: no ONGOING 8.5 s after the handshake (stock adsp_voocphy_err_work) */
++	if (VOOC_OWNS() && !vc.ongoing && vc.park_ns != 0 && now_ns() - vc.park_ns > VOOC_HS_TIMEOUT_NS &&
++	    get(BC_USB_GET, USB_VOOCPHY_STATUS, &v) && (v & 0xff) == 2) {
++		vooc_status(v, "recovery check");       /* review F5: it is ONGOING: no un-park */
++	}
++	if (VOOC_OWNS() && !vc.ongoing && vc.park_ns != 0 && now_ns() - vc.park_ns > VOOC_HS_TIMEOUT_NS) {
++		vc.recoveries++;
++		LOG("vooc: no ONGOING %llu ms after the handshake (recovery #%u): un-park, USB_VOOCPHY_RESET_AGAIN",
++		    VOOC_HS_TIMEOUT_NS / NSEC_PER_MSEC, vc.recoveries);
++		(void)put(BC_USB_SET, USB_INPUT_CURR_LIMIT, 0, "USB_INPUT_CURR_LIMIT 0 (recovery)");
++		vc.in_events = false;
++		IOSleep(1000);
++		vc.in_events = true;
++		vooc_unpark("recovery");
++		if (vooc_mode) {
++			(void)put(BC_USB_SET, USB_VOOCPHY_RESET_AGAIN, 1, "USB_VOOCPHY_RESET_AGAIN");
++		}
++	}
++	vc.in_events = false;
++	if (ev) {
++		vooc_publish();
++	}
++}
++
++/* USB out: forget the adapter and the requests (stock: unplug clears the state and the timer). */
++static void
++vooc_unplugged(void)
++{
++	vc.parked = vc.ongoing = vc.suspend_req = vc.pd_svooc = vc.off_done = vc.park_pending = false;
++	vc.park_ns = 0;
++	vc.enable = -1;
++	vc.code = vc.adapter = vc.sub = vc.mw = 0;
++	vooc_publish();
++}
++
++/*
++ * Policy, from charge_loop() every negronichg_loop_s with USB in and READY, after the temperature read
++ * (dc = 0.1 C; INT32_MIN = unknown). true: VOOC owns the battery path (charge_loop skips FV/FCC/CHG_EN).
++ */
++static bool
++vooc_policy(int32_t dc)
++{
++	uint32_t v = 0;
++
++	/* review F8: the temperature goes to the ADSP whenever its VOOC path runs (any mode) and with VOOC allowed */
++	if (dc != INT32_MIN && (vooc_mode || vc.ongoing)) {
++		(void)put_log(BC_BATTERY_SET, BATT_SET_MATCH_TEMP, (uint32_t)dc, "BATT_SET_MATCH_TEMP (0.1 C)", vc.lines < 3);
++	}
++	/* review F7: while ONGOING, check the status each loop (a missed 0x48 must not leave the PMIC parked) */
++	if (vc.ongoing && get(BC_USB_GET, USB_VOOCPHY_STATUS, &v)) {
++		vooc_status(v, "loop check");
++	}
++	if (vooc_mode == 0) {
++		/* the ENABLE = 0 write itself: vooc_force_off() at READY and USB in (review F6) */
++		vooc_publish();
++		return VOOC_OWNS();
++	}
++	const char *no = NULL;
++	if (dc == INT32_MIN) {
++		no = "no battery temperature";
++	} else if (dc < VOOC_MIN_DC || dc > VOOC_MAX_DC) {
++		no = "battery temperature outside 12.0-43.0 C";
++	} else if (st.chg_stopped) {
++		no = "the charge loop stopped charging";
++	} else if (st.therm_level != 0) {
++		no = "thermal FCC level in force";
++	} else if (vc.suspend_req) {
++		no = "the ADSP asked to suspend charging";
++	} else if (st.usb_type != (int32_t)USB_TYPE_DCP && !vc.parked) {
++		no = "adapter type is not DCP";
++	}
++	uint32_t want = no == NULL ? 1u : 0u;
++	if (vc.enable < 0 || (uint32_t)vc.enable != want) {
++		vc.enable = get(BC_USB_GET, USB_VOOCPHY_ENABLE, &v) ? (int32_t)v : -1;
++	}
++	if (vc.enable != (int32_t)want) {
++		(void)vooc_set_enable(want, no ? no : "DCP, battery 12-43 C, no thermal limit");
++	}
++	/* review B1: off while ONGOING: stay parked until a status that is not ONGOING (vooc_status un-parks) */
++	if (!want && VOOC_OWNS()) {
++		if (!vc.ongoing && vc.enable == 0) {
++			vooc_unpark(no);
++		} else if (vc.ongoing) {
++			LOG_ERR("vooc: VOOC off requested (%s) while ONGOING: PMIC stays parked until the ADSP reports the end", no);
++		}
++	}
++	if (vc.ongoing && (vc.lines++ % 6) == 0) {      /* every 30 s at 5 s */
++		uint32_t mv = 0, ma = 0, bmv = 0, bma = 0;
++		bool a = get(BC_USB_GET, USB_VOLT_NOW, &mv), b = get(BC_USB_GET, USB_CURR_NOW, &ma);
++		bool c = get(BC_BATTERY_GET, BATT_VOLT_NOW, &bmv), d = get(BC_BATTERY_GET, BATT_CURR_NOW, &bma);
++		int64_t mw = (a && b) ? (int64_t)(mv / 1000) * ((int32_t)ma / 1000) / 1000 : -1;
++		LOG("vooc: ONGOING adapter %#x (%u W class) | VBUS %d mV IBUS %d mA = %lld mW | battery %d mV %d mA | %d.%d C",
++		    vc.adapter, vc.mw / 1000, a ? (int32_t)(mv / 1000) : -1, b ? (int32_t)ma / 1000 : INT32_MIN, mw,
++		    c ? (int32_t)(bmv / 1000) : -1, d ? (int32_t)bma / 1000 : INT32_MIN, dc / 10, (dc < 0 ? -dc : dc) % 10);
++	}
++	vooc_publish();
++	return VOOC_OWNS();
++}
++
++/* review F6: negronichg_vooc=0: USB_VOOCPHY_ENABLE = 0 at READY and at each USB in (also with negronichg_loop=0). */
++static void
++vooc_force_off(const char *why)
++{
++	uint32_t v = 0;
++
++	if (vooc_mode != 0 || !st.ready) {
++		return;
++	}
++	vc.enable = get(BC_USB_GET, USB_VOOCPHY_ENABLE, &v) ? (int32_t)v : -1;
++	if (vc.enable != 0) {
++		(void)vooc_set_enable(0, why);
++	} else {
++		LOG("vooc: USB_VOOCPHY_ENABLE reads 0 (%s, negronichg_vooc=0): plain charging", why);
++	}
++	vooc_publish();
++}
++
++/* review F7: the ADSP restarted or stopped answering: its VOOC state is gone; ours too, and the PMIC writes run again. */
++static void
++vooc_reset(const char *why)
++{
++	if (VOOC_OWNS() || vc.adapter != 0) {
++		LOG("vooc: state reset (%s)", why);
++	}
++	vooc_unplugged();
++	st.icl_set = st.chg_en_set = false;
++}
++
+ static bool
+ idle(uint32_t s)
+ {
+@@ -845,6 +1268,7 @@ idle(uint32_t s)
+ 
+ 	for (uint32_t ms = 0; ms < s * 1000; ms += 50) {
+ 		negroni_glink_poll();
++		vooc_events();                  /* 0369 */
+ 		if (notify_usb && ms >= 2000) {
+ 			early = true;
+ 			break;
+@@ -916,6 +1340,7 @@ chg_thread(__unused void *arg, __unused wait_result_t wr)
+ 			if (st.up) {
+ 				LOG_ERR("the ADSP closed PMIC_RTR_ADSP_APPS");
+ 				st.up = st.ready = false;
++				vooc_reset("PMIC_RTR_ADSP_APPS closed");        /* 0369 review F7 */
+ 				publish();
+ 			}
+ 			opens++;
+diff --git a/bsd/dev/negroni_chg_glink.h b/bsd/dev/negroni_chg_glink.h
+index ba80ad8..dcf3c05 100644
+--- a/bsd/dev/negroni_chg_glink.h
++++ b/bsd/dev/negroni_chg_glink.h
+@@ -40,6 +40,13 @@ struct negroni_chg_glink_status {
+ 	int32_t usb_type;       /* USB_ADAP_TYPE (id 7; POWER_SUPPLY_PROP_USB_TYPE in oplus_battery_sm8450.c:231):
+ 	                         * Linux POWER_SUPPLY_USB_TYPE_* (1 SDP 2 DCP 3 CDP 4 ACA 5 C 6 PD 7 PD_DRP 8 PD_PPS
+ 	                         * 9 BrickID), 0x80.. QTI HVDCP; -1 = unknown */
++	/* 0369: VOOC / SuperVOOC (ADSP VOOC PHY) */
++	uint8_t vooc_mode;      /* negronichg_vooc: 0 off (default), 1 allowed */
++	int32_t vooc_enable;    /* USB_VOOCPHY_ENABLE read back; -1 unknown */
++	bool vooc_active;       /* status ONGOING: the ADSP's VOOC path charges, the PMIC charger is parked */
++	uint8_t vooc_code;      /* last USB_VOOCPHY_STATUS code (0 unknown, 1 PRESENT, 2 ONGOING, 3 ABSENT, 4 FULL, ...) */
++	uint8_t vooc_adapter;   /* adapter id (oplus_vooc.c adapter_id_table); 0 none */
++	uint32_t vooc_mw;       /* the adapter's power class, mW, capped at the project's 80000; 0 none */
+ };
+ 
+ #ifdef __cplusplus
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index c2e9088..32d96e4 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -1807,7 +1807,9 @@ hp_init_blocked(void)
+ 		return "5 PHY inits since the ADSP start already (log only now)";
+ 	}
+ 	if (negroni_chg_glink_get(&cs) && cs.ready) {
+-		/* 0369 adds: not while VOOC is active */
++		if (cs.vooc_active) {
++			return "VOOC is active (the ADSP owns D+/D-)";      /* 0369 */
++		}
+ 		if (cs.usb_type != 1 && cs.usb_type != 3) {
+ 			return "the adapter type is not a host port (SDP/CDP)";
+ 		}

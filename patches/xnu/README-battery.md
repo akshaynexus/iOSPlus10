@@ -12,6 +12,7 @@ Marks: **[V]** seen in source, DT, firmware, build or log. **[I]** inference.
 | `0276-negroni-battery-soc-source.patch` | `iokit/Kernel/arm/NegroniBattery.cpp` | the percentage: source order gauge (not reachable) > GLINK (0274) > OCV estimate with a rate limit; `soc src=` in the log (section 10) |
 | `0277-negroni-charger-loop.patch` | `bsd/dev/negroni_chg_glink.c`, `.h` | the Android HLOS charge loop over GLINK: float voltage + FCC per the DT JEITA bands every 5 s, the thermal FCC level, the power hub (section 11) |
 | `0278-negroni-battery-persist-temp.patch` | `bsd/dev/negroni_batt_store.c` (new), `bsd/conf/files`, `bsd/dev/negroni_spmi.c`, `.h`, `iokit/Kernel/arm/NegroniBattery.cpp` | the percentage kept across boots, the cell temperature in `Temperature`, skin/XO to the hub, BCL MONITOR_EN, the QDSS vote release (section 12) |
+| `0369-negroni-charger-vooc.patch` | `bsd/dev/negroni_chg_glink.c`, `.h` | VOOC/SuperVOOC with the ADSP VOOC PHY: enable policy, PMIC park/un-park, status decode, 0x59 answer, recovery, telemetry (section 15) |
 | `0365-negroni-battery-charging-ui.patch` | `iokit/Kernel/arm/NegroniBattery.cpp`, `bsd/dev/negroni_chg_glink.c`, `.h` | IsCharging/FullyCharged/AdapterDetails (Watts, FamilyCode)/Amperage/times for the iOS battery UI, with and without the charger PD (section 13) |
 
 ## 1. Why iOS showed a wrong battery level
@@ -782,3 +783,141 @@ the files; full build `hzbat-kernel` (lock held): out/kernel/local-20261026-2130
 127cae2a976695d78131e9116be18f99daa601010f80aa4520b8de9698ac9c7c (after the review fixes B1, C1-C3, C5), 257 patches applied incl. 0364/0365, only the 4
 usual dxb skips; strings `charge: %u%% external`, `BATT_CURR_NOW is %s`, `NegroniChargeInputMilliwatts` in the
 kernel. Patch sha256 3846e7a73bd24ecd8c636378bdbdf7c65710e6c568f76cc0a71dee3a6effe698. Not booted.
+
+## 14. The ADSP charger PD and the USB data lines; GLINK RX log (0368, 2026-10-27)
+
+- [V] With the ADSP up (0240 + `negronichg_glink=1`), the Mac lost the USB device 2-3 s after `THE ADSP IS UP`
+  (02:42 and 02:55, logs/usblog-20261026-233816.txt). [V] The ADSP image has HS PHY functions (reset, non-driving mode,
+  D+ toggling, the PHY ref clock `gcc_eusb3_0_clkref_en`) next to its BC1.2/APSD and VOOC code. [I] Its port detection
+  leaves our PHY unusable; HLOS has no known GLINK message to stop it. Fix and test: README-usb.md "0368" (PHY watch,
+  Linux PHY init + soft reconnect after the ADSP touched the PHY).
+- 0368 also logs every PMIC_RTR_ADSP_APPS message for 10 s after the first one, then notifications and the other owners
+  (UCSI 32779, USBC_PAN 32780) up to 200 lines: `NEGRONI BATTERY: glink: rx #n +T ms: owner .. type .. opcode 0x.. len ..:
+  <5 words>`. So the next ADSP boot shows which notifications (BC_USB_STATUS_GET 0x32, BC_APSD_DONE, BC_TYPEC_STATE_CHANGE,
+  VOOC ids, oplus_battery_sm8450.c:2130-2240) the charger PD sends after its start. The notifications come only after
+  BC_SET_NOTIFY_REQ (0274: after READY).
+
+## 15. VOOC / SuperVOOC with the ADSP VOOC PHY (0369, 2026-10-27)
+
+Status: compile-checked and built in the full set, **not booted**. Default OFF (`negronichg_vooc=0`).
+
+Facts [V, file:line in out/src/op-modules/vendor/oplus/kernel/charger; S = charger_ic/oplus_battery_sm8450.c,
+A = voocphy/oplus_adsp_voocphy.c]:
+- live.dts: `qcom,voocphy_support = <1>` (ADSP_VOOCPHY), `qcom,vooc_project = <7>` (DUAL_BATT_80W = 80000 mW,
+  oplus_charger.h:626-633). The `oplus,adsp-voocphy` DT node is empty: the SVOOC current/temperature tables are in
+  the ADSP firmware [I]; `vooc_charge_strategy_*` in the DT is only read by oplus_debug_info.c:1204-1257.
+- The ADSP runs the VOOC protocol. HLOS (Android): `USB_VOOCPHY_ENABLE` (usb id 13) = 1 for a DCP (S:1585-1602, every
+  5 s), `BATT_SET_MATCH_TEMP` (battery id 29, 0.1 C, every 5 s, oplus_charger.c:10651), `BATT_SET_COOL_DOWN` (28) on
+  PRESENT/ONGOING (S:2614-2636), PMIC park on notify 0x52 (`BATT_CHG_EN` 24 = 0, `USB_INPUT_CURR_LIMIT` 5 = 0,
+  S:2181-2192, 1373-1383), status on notify 0x48 = `USB_VOOCPHY_STATUS` (12): code bits 0-7, adapter id bits 8-14,
+  sub-reason 16-23 (A:141, 227-241; codes A:35-54), answer to 0x59 with `BATT_SEND_CHG_STATUS` (37, S:8417-8444),
+  0x60 = un-suspend, 0x61 = the ADSP asks the AP to suspend, recovery 8.5 s after 0x52 without ONGOING (S:8513-8535:
+  ICL 0, 1 s, un-park, `USB_VOOCPHY_RESET_AGAIN` 25 = 1). Off: `USB_VOOCPHY_ENABLE` = 0 (oplus_voocphy.c:8640-8670).
+- Ids [V, enums oplus_battery_sm8450.h:166-282, counted]: battery 24 CHG_EN, 28 COOL_DOWN, 29 MATCH_TEMP, 37
+  SEND_CHG_STATUS; usb 12 VOOCPHY_STATUS, 13 VOOCPHY_ENABLE, 23 VOOC_FAST_CHG_TYPE, 25 VOOCPHY_RESET_AGAIN, 26 SUSPEND_PMIC.
+  Notifications (oplus_battery_sm8450.h:69-90): 0x48 VOOC_STATUS_GET, 0x52 VOOC_VBUS_ADC_ENABLE, 0x55 TYPEC_STATE_CHANGE,
+  0x56 PD_SVOOC, 0x57 PLUGIN_IRQ, 0x58 APSD_DONE, 0x59 CHG_STATUS_GET, 0x60 CHG_STATUS_SET, 0x61 AP_SUSPEND_CHG, 0x67
+  ABNORMAL_PD_SVOOC_ADAPTER.
+
+What 0369 does (`negroni_chg_glink.c`):
+- `chg_rx` marks these notifications; the thread handles them every 50 ms (`vooc_events`, from `idle()`).
+- 0x52: always park the PMIC charger (also with VOOC off: if the ADSP starts VOOC, the PMIC must not feed in parallel
+  [I]); with `negronichg_vooc=0` also write USB_VOOCPHY_ENABLE = 0 again.
+- 0x48: read and decode the status; PRESENT/ONGOING: keep parked, cool-down 0, adapter id -> power class
+  (`adapter_id_table`, oplus_vooc.c:134-176, capped at 80 W as oplus_configfs.c:3114-3136); any other code: un-park
+  (our ICL `negronichg_ma`, not stock's 0xFFFFFFFF; BATT_CHG_EN 1 unless the 0277 loop stopped charging).
+- 0x59: `BATT_SEND_CHG_STATUS` = 1 only when not parked, not stopped, no 0x61. 0x60: un-park. 0x61: no VOOC until unplug.
+- Recovery after 8.5 s without ONGOING: as stock (RESET_AGAIN only with VOOC allowed).
+- Policy every `negronichg_loop_s` (5 s) with USB in: `negronichg_vooc=0` (default): once per plug, USB_VOOCPHY_ENABLE
+  read; when not 0, write 0 (plain charging; stock's own "off" path). `negronichg_vooc=1`: send MATCH_TEMP, then allow
+  VOOC (enable 1) only when: battery temperature known and 12.0-43.0 C (stock lets the ADSP go to its 45 C warm band),
+  the 0277 loop has not stopped charging, no 0283 thermal FCC level, no 0x61, adapter type DCP (SVOOC adapters show as
+  DCP). Else enable 0 and un-park. While parked, the 0277 loop and the 0274 ICL/un-suspend/CHG_EN writes stop (the
+  ADSP's VOOC path owns the battery); a stop band still disables VOOC first, then stops charging.
+- Telemetry: status struct `vooc_mode`, `vooc_enable`, `vooc_active`, `vooc_code`, `vooc_adapter`, `vooc_mw`. Log
+  every 30 s while ONGOING: `NEGRONI BATTERY: glink: vooc: ONGOING adapter 0x.. (80 W class) | VBUS .. mV IBUS .. mA =
+  .. mW | battery .. mV .. mA | .. C`. The 0365 `AdapterDetails` Watts already use USB_VOLT_NOW x USB_CURR_NOW, so the
+  UI shows the real power if the ADSP keeps those current during VOOC [I, not proven]. No Apple FamilyCode exists for
+  VOOC; FamilyCode stays from USB_ADAP_TYPE (DCP 0xe0004004).
+
+Review fixes (Opus; 0369 was REJECT until B1/B2):
+- B1: VOOC turned off while ONGOING: write ENABLE = 0 but stay parked; un-park only on a status that is not ONGOING
+  (0x48, or the loop's own status read); a direct un-park only when not ONGOING and ENABLE reads back 0.
+- B2: `vooc_park` sets "parked" only when BATT_CHG_EN = 0 and ICL = 0 were both acked; else "park pending": the PMIC
+  writes stay blocked, ENABLE = 0 is written, and the park writes are retried every 1 s.
+- F5: before the 8.5 s recovery un-park, USB_VOOCPHY_STATUS is read again; code 2 = ONGOING, no un-park.
+- F6: `negronichg_vooc=0`: ENABLE = 0 (when it does not read 0) at READY and at each USB in, in cycle() (also with
+  `negronichg_loop=0`). Note: stock writes usb 13 only for a DCP; this write is class 0x10 of 0370's `negronichg_wr`.
+- F7: the VOOC state and icl_set/chg_en_set are reset when the PD stops answering or PMIC_RTR_ADSP_APPS closes (ADSP
+  restart); while ONGOING, the loop reads the status every 5 s and un-parks when it is not 2.
+- F8: BATT_SET_MATCH_TEMP is sent whenever VOOC is ONGOING, in any mode.
+- 0368's PHY repair does not run while `vooc_active`.
+- Re-review N1: at READY (also after a lost-read reset), USB_VOOCPHY_STATUS is read before any PMIC write; ONGOING
+  parks the PMIC again (`vooc: status ... (READY check)`). N2: the park saves the ICL read before it; the un-park writes
+  the limit for this adapter type (0370), else the saved ICL, else 500 mA (never the park's 0, also with
+  `negronichg_ma=0`), and resets the ICL/CHG_EN/un-suspend write budget.
+
+Limits: no current table is sent (the ADSP has its own); the stock maximums (vooc-max-input 10000 mV / 6500 mA, 80 W)
+are the ADSP's. Our temperature window is narrower than stock. [I] Risk: the PMIC + VOOC parallel feed if a 0x52 is
+missed (we always park on it, and an ONGOING without 0x52 also parks).
+
+Test (only after the USB fix, README-usb.md "0368", works with the ADSP up):
+1. `negronichg_glink=1 negroniadsp=1 ...` (VOOC off): with the Mac cable expect `vooc: USB_VOOCPHY_ENABLE reads 0
+   (negronichg_vooc=0): plain charging` or `vooc: enable 0 (...): read back 0`. With the OnePlus SuperVOOC adapter:
+   no `vooc: status ... ONGOING`; plain 5 V charging (`charge:` line ~5 V).
+2. `negronichg_vooc=1` with the SuperVOOC adapter and cable, battery 12-43 C: expect `vooc: enable 1 (DCP, ...)`,
+   `glink: rx ... (BC_NOTIFY_IND)` with 0x52, `vooc: handshake starts (0x52): PMIC charger parked`, `vooc: status
+   0x..: PRESENT ... adapter id 0x4b..0x4e or 0x65 (80 W class)`, `ONGOING`, then the 30 s `ONGOING ... mW` lines
+   (expect 30-80 W at low SoC). Watch the battery temperature line; unplug at any doubt. A failed handshake shows
+   `no ONGOING 8500 ms after the handshake (recovery #1)` and plain charging continues.
+
+## 16. USB lost after the charger client starts: write list, stock comparison, bisect boot-args (0370, 2026-10-27)
+
+Phone [V, main session, t8 03:19-03:20, kernel local-20261026-214742, `negroniadsp=1 negronichg_glink=1`]: the PHY
+snapshots at the ADSP start and at ADSP up equal the baseline, no PHY change; `glink: start` at 03:20:26, the Mac loses
+the device at 03:20:28. So 0368's PHY repair did not trigger; the PHY registers did not change. [I] The trigger is near
+our first charger traffic.
+
+What the client sends in its first seconds (0274/0277/0365/0369 code order, USB in, Mac port):
+1. Reads (GET, no writes): battery 0 STATUS, OEM read buffer 0x10000, 4 CAPACITY, 7 VOLT_NOW, 9 CURR_NOW, 12 TEMP,
+   10 CHG_CTRL_LIM, 8 VOLT_MAX; usb 0 ONLINE, 1 VOLT_NOW, 3 CURR_NOW, 5 ICL, 7 ADAP_TYPE, 47 IN_STATUS, 26 SUSPEND_PMIC.
+2. READY: BC_SET_NOTIFY_REQ (0x04), then a dump: GET battery ids 0..24, usb ids 0..11.
+3. Plug edge: `USB_INPUT_CURR_LIMIT` (usb 5) = 500000, 1000000, 1500000 uA (100 ms apart, VBUS read in between).
+4. `USB_SUSPEND_PMIC` (usb 26) = 0 only if it read non-zero; `BATT_CHG_EN` (battery 24) = 1.
+5. 0369 (after review F6) with `negronichg_vooc=0`: at READY and at USB in, GET usb 13 and, if it is not 0, SET usb 13 = 0
+   (up to 3 tries). Charge loop: GET battery 12; then `BATT_VOLT_MAX` (8) = FV and `BATT_CHG_CTRL_LIM` (10) = FCC (band values, <= 4435 mV/cell,
+   <= 1100 mA).
+
+Stock at boot (oplus_battery_sm8450.c, oplus_charger.c) [V]: BC_SET_NOTIFY_REQ (probe :12740, subsys up :3402); ICL
+per adapter type `oplus_chg_set_input_current` (oplus_charger.c:7031-7046): **SDP = `qcom,input_current_usb_ma` =
+500 mA**, CDP 1500, DCP 2000, unknown type = no write; USB_VOOCPHY_ENABLE only for a DCP (:1585-1602); BATT_SET_MATCH_TEMP
+at probe (:12755); FV/FCC by oplus_chg. Differences in ours: **1500 mA on a host port** (3x stock) and the usb 13 write
+on any adapter type.
+[V] ADSP strings: `battmngr_plat_*_set_usb_icl::ICL for SDP/CDP set by HLOS is %d mA`, `...set_usb_icl::ERROR suspending
+USB` / `Unsuspending USB` (an ICL write can suspend/unsuspend the USB input), `battmngr_tech_schgp_chg_rerun_apsd`,
+`PmSchgUsb_SetRerunApsd`, "port_type[%d]:Enable BC1.2 Retry", "reset voocphy & fastchg rerun check". No string ties
+a HLOS property write to an APSD rerun directly.
+[I] Candidates: (a) 1.5 A from a Mac port: macOS cuts the port power on overcurrent ("USB accessories disabled"), which
+looks exactly like "no USB device at all"; check the Mac for that alert / `log show --last 10m | grep -i overcurrent`.
+(b) the usb 13 (VOOC PHY enable) write makes the ADSP reset its VOOC PHY and re-run detection on D+/D-.
+
+0370 (`negroni_chg_glink.c`):
+- ICL per adapter type (default `negronichg_icl_bytype=1`): SDP min(negronichg_ma, 500), CDP min(.., 1500),
+  DCP/PD/other known types (>= 5) negronichg_ma; unknown type 0, ACA 4 and a failed type read (-1): no ICL write
+  (stock maps ACA to the DCP 2000 mA; we write nothing), except (re-review B3) a 500 mA floor when the ICL reads
+  below 100 mA and VOOC does not own the path (e.g. after a VOOC recovery wrote 0). `negronichg_icl_bytype=0` = 0274
+  (negronichg_ma for all).
+- Re-review N3: the VOOC safety writes (park BATT_CHG_EN 0 + ICL 0, the recovery ICL 0, a reactive ENABLE = 0 on
+  0x52/ONGOING/turn-off, the un-park restore) ignore `negronichg_wr` and `negronichg_wr_delay_s`. The proactive
+  ENABLE = 0 at READY / USB in (class 0x10) obeys them; when the delay ends, the deferred BC_SET_NOTIFY_REQ is sent and
+  the proactive ENABLE = 0 runs (`glink: the write delay (N s) ended`).
+- The 0369 VOOC-off write of usb 13 (review F6: at READY and USB in, any adapter type) is class 0x10: `negronichg_wr=0x6f` skips it.
+- Bisect: `negronichg_wr=<mask>` (default 0x7f): 1 ICL, 2 USB_SUSPEND_PMIC, 4 BATT_CHG_EN, 8 FV/FCC, 0x10 VOOC
+  (usb 13/25, battery 28/29/37), 0x20 BC_SET_NOTIFY_REQ, 0x40 other. `negronichg_wr=0` = read only.
+  `negronichg_wr_delay_s=N`: no write for N s after the client start. Skipped classes log once:
+  `glink: write ... skipped: off by negronichg_wr (class 0x..)`. Every write line now ends with `+N ms` since the start;
+  the start line: `glink: writes: class mask 0x7f ..., delay 0 s, ICL per adapter type on`.
+- Bisect order (each a RAM boot with `negroniadsp=1 negronichg_glink=1`): `negronichg_wr=0` (reads only) -> if USB
+  holds: `negronichg_wr_delay_s=60` (then watch the time of the drop vs the `+N ms` write lines in the 0367 boot log)
+  -> single classes `negronichg_wr=1`, `=4`, `=8`, `=0x20`. The default build (per-type ICL = 500 mA on the Mac) is
+  itself the test of candidate (a).

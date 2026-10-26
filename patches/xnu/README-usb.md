@@ -3,7 +3,7 @@
 The base driver comes from slop (patches 0072-0077, 0081, 0119: DWC3 at 0x0a600000, ep0, VBUS override, CDC-ECM,
 live log). Our patches: 0210 (UDP command server), 0212 (settime), 0282 (bus reset drops the data endpoints),
 0360 (panic mode, README-panic.md), 0361 (throughput, this file), 0366 (reconnect after unplug or a Type-C
-re-attach, this file). Host side: docs/usb-network.md.
+re-attach, this file), 0368 (the HS PHY after the ADSP start, this file). Host side: docs/usb-network.md.
 
 ## 0361: throughput (RX ring, TX batches, short polls)
 
@@ -164,3 +164,92 @@ re-attach, this file). Host side: docs/usb-network.md.
    en10 back within ~5-7 s.
 4. If it still fails: the log after the replug (it arrives once the link is up again) shows which step stops:
    no event at all after the replug, events but no `connected`, or `connected` but no `configured`.
+
+## 0368: the HS PHY after the ADSP start
+
+### Problem
+
+- [V] logs/usblog-20261026-233816.txt 02:42:20 and 02:55:44: `NEGRONI ADSP: 8 THE ADSP IS UP`, GLINK up, our open of
+  PMIC_RTR_ADSP_APPS acked; 2-3 s later the Mac has no USB device from the phone at all (no failed enumeration either),
+  also with 0366 (02:55). The last gadget lines are normal (`event 0x0000c046`). Without the ADSP the link holds for hours.
+- [V] The ADSP image has its own USB PHY utility (`out/firmware/adsp/adsp.b14`, strings next to `usb_pmic_util_log.c`):
+  `usb_hs_phy_reset` ("%s, 0x%08X, 0x%08X"), `usb_hs_phy_set_nondrive_mode`, `usb_hs_phy_toggle_dp`,
+  `usb_hs_phy_dp_high`, `usb_hs_phy_dp_default_state`, `usb_is_eud_active`, `usb_hs_phy_enable_clkref`
+  ("clk_cnt %d, enable %d, failed %d"), `usb_hs_attach_usb_clock` with the clock `gcc_eusb3_0_clkref_en`.
+  Next to them: the charger code `battmngr_plat_irq_scpqchg2s_extfg_r1_apsd_done`, "port_type[%d]:Enable BC1.2 Retry",
+  `PmSchgUsb_GetQcApsdResult`, the OPLUS VOOC PHY code (`oplus_voocphy_reset_again`).
+- [V] `gcc_eusb3_0_clkref_en` is the reference clock of our HS PHY: live.dts `hsphy@88e3000` clocks
+  `<0x23 0x1f>` = GCC id 31 = `GCC_EUSB3_0_CLKREF_EN` (op-kernel `qcom,gcc-waipio.h`), register GCC + 0x9c00c bit 0
+  (gcc-waipio.c, gcc-sm8450.c). The PHY block reset is `GCC_QUSB2PHY_PRIM_BCR` (DT resets `<0x23 0x15>`, GCC + 0x22000).
+- [V] negroni_usb.c never sets the PHY up ("left as the firmware set it up"); 0366's soft reconnect resets only the
+  controller. [V] Android (dwc3-msm-core.c, oplus_battery_sm8450.c) starts the gadget after the ADSP, and the
+  PHY init (`usb_phy_init`) runs on each role change; OPLUS even keeps the PHY away from D+/D- during PD SVOOC
+  (`oplus_dwc3_need_set_usbphy_hz`, dwc3-msm-core.c:616, 4555).
+- [I] So: when the charger PD starts with the cable in, it runs its BC1.2/APSD (and HVDCP/VOOC) detection on D+/D-,
+  which uses the PHY functions above (reset, non-driving mode, ref clock vote). After that the PHY is reset, non-driving
+  or without its ref clock, and nothing sets it up again; the host sees no pull-up, so no device at all. No GLINK
+  message from HLOS is known that stops this (the detection is local to the ADSP; HLOS only gets BC_APSD_DONE /
+  BC_USB_STATUS_GET notifications afterwards, oplus_battery_sm8450.c:2135, 2212). Not proven: the next boot's log shows it.
+- [V] NOT CONFIRMED on the phone (t8, 2026-10-27 03:19-03:20, kernel local-20261026-214742, `negroniadsp=1
+  negronichg_glink=1`): the snapshots at the ADSP start and at ADSP up equal the baseline, no `PHY change` line, no repair;
+  the Mac lost the device at 03:20:28, 2 s after the charger client's `glink: start` (03:20:26). So the PHY registers
+  did not change; the drop follows our charger GLINK traffic. Next steps: README-battery.md section 16 (0370 bisect).
+
+### Change (bsd/dev/negroni_usb.c, hooks in negroni_adsp.c; logging in negroni_chg_glink.c)
+
+- At the gadget start (before our controller start): map the PHY (0x088e3000), the EUD enable register (0x088e2000),
+  GCC_QUSB2PHY_PRIM_BCR and GCC_EUSB3_0_CLKREF_EN; snapshot = baseline (a working link):
+  `NEGRONI USB: PHY baseline at the gadget start: utmi0 .. utmi1 .. utmi5 .. common0 .. common1 .. common2 .. ctrl1 ..
+  ctrl2 .. x0-3 .. cfg0 .. refclk .. | clkref_en 0x.. bcr 0x.. eud_en 0x..`.
+- negroni_adsp.c calls `negroni_usb_adsp_event()`: 0 before PAS auth-and-reset, 1 at `THE ADSP IS UP`, 2 on a fatal
+  stop. Each prints a snapshot (`PHY at the ADSP start`, `PHY at ADSP up`).
+- PHY watch in ud_thread: a sample every 10 ms from the ADSP start until 10 s after ADSP up (30 s at most), else every
+  100 ms. Every change: `NEGRONI USB: PHY change (ADSP start +N ms, up +M ms): cfg0 0->1 utmi0 ..->..` (all changes in
+  the window, else 64 lines then every 100th). State lines: `PHY differs from the reference` / `back at the reference`.
+- Repair (only after an ADSP start): when the sample differs from the reference (baseline, then the state after the
+  last repair) and has not changed for `negroniusb_phyfix_ms` (1500), at most every 3 s: soft reconnect (0366 path)
+  with a PHY init between the halt and the controller start: ref clock on (GCC 0x9c00c bit 0, wait for CLK_OFF to
+  clear), block reset (BCR bit 0, 150 us), then the Linux `qcom_snps_hsphy_init` sequence (phy-qcom-snps-femto-v2.c;
+  the same in ios-flame 0089): CMN override on, POR, FSEL (baseline), PLLBTUNE, REFCLK_SEL (baseline), VBUSVLDEXTSEL0,
+  VBUSVLDEXT0, overrides X0..X3 (baseline; DT `qcom,param-override-seq` has e7 0f 17 03, logged for comparison),
+  VREGBYPASS, SUSPEND_N(_SEL), SLEEPM, SIDDQ off, POR release, SUSPEND_N_SEL off, override enables as at the baseline.
+  Log: `PHY before the re-init`, `PHY after the re-init`, `PHY re-init #n: ref clock was OFF, now on|on, ...`.
+- Every 0366 soft reconnect after an ADSP start also runs this PHY init (a change that the watch cannot see, e.g. a
+  ref clock that is on again but the PHY PLL lost, is then fixed by the no-SOF rule after 5 s).
+- negroni_chg_glink.c: every message on PMIC_RTR_ADSP_APPS for 10 s after the first one, then notifications and other
+  owners (UCSI 32779, USBC_PAN 32780) up to 200 lines: `NEGRONI BATTERY: glink: rx #n +T ms: owner .. type .. opcode
+  0x.. len ..: <5 words> (BC_NOTIFY_IND | not battery_charger)`. Needs `negronichg_glink=1` (the channel is opened only then).
+
+### Review fixes (Opus, 0368 ACCEPT after these)
+
+- F1: no PHY init in a soft reconnect when the controller did not halt (a PHY block reset under a running DWC3 can leave
+  CSFTRST stuck and kill the only link): `PHY init skipped in this reconnect: the controller did not halt`.
+- F2: a PHY init (watch repair or reconnect) only when: the EUD does not own the PHY (`eud_en` bit 0 clear), ADSP up +
+  `negroniusb_phyfix_holdoff_s` (default 5 s; HVDCP holds D+ ~1.25 s without register changes) has passed, the port is
+  a host (the charger client's adapter type SDP 1 / CDP 3; without the client: a host seen = DSTS.SOFFN moved between
+  two watch samples, `PHY watch: a host is there (SOF number moves)`; re-review fix), and (0369) VOOC is
+  not active. Else `PHY repair waits: <reason>` (rate-limited).
+- F3: at most 5 PHY inits per ADSP start, then log only. F4: at most 200 change lines in the 10 ms window.
+- The re-init line also shows CFG0 bit 0 (UTMI datapath override) before -> after.
+
+### Boot-args
+
+- `negroniusb_phyfix_holdoff_s=N` (0-120, default 5): no PHY init before ADSP up + N s.
+- `negroniusb_phyfix=0`: log only (no repair, no PHY init in reconnects). `1` (default): repair. `2`: also a PHY init +
+  soft reconnect after each ADSP up (after the hold-off), even when no register changed.
+- `negroniusb_phyfix_ms=N` (100-60000, default 1500): how long the PHY must stay unchanged before a repair.
+
+### Test (RAM boot, `scripts/flash/test-boot.sh`)
+
+1. Boot-args as the 02:55 boot (`negroniadsp=1 negroniadsp_step=15 negroniaudio_amp=1 negroniaudio_tone=1
+   negronichg_glink=1 ...`), cable in a Mac port, `make usblog` running.
+2. Expect before the ADSP: `PHY baseline at the gadget start: ...`, `PHY watch on: repair on (negroniusb_phyfix=1) ...`;
+   then `PHY at the ADSP start`, `PHY at ADSP up`, the `PHY change (...)` lines (which registers the ADSP writes:
+   the evidence), `glink: rx #1 +0 ms ...` lines.
+3. If the link drops: within ~2 s after the last PHY change `soft reconnect #1 ...: the PHY differs from the reference`,
+   `PHY re-init #1: ...`, then `bus reset`, `connected, speed 0`, `configured (1)`, en10 back on the Mac (`ioreg -p IOUSB`
+   shows `Negroni iOS (USB Ethernet)`). The lines from the gap reach the Mac after the reconnect (ring), and the 0367
+   boot log keeps them in any case (`make bootlog` after the next boot).
+4. If the link drops but no PHY register changed: the 0366 rule (`no SOF for 3 s`, `soft reconnect ... no SOF`) now
+   also runs the PHY init (`PHY re-init #1`). If it still does not come back, try `negroniusb_phyfix=2`, and send the
+   boot log: the `PHY change` and `glink: rx` lines say what the ADSP did.
