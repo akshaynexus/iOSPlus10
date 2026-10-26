@@ -1,0 +1,929 @@
+0326-negroni-wlan-api: Wi-Fi, the seam for the iOS side (bsd/dev/negroni_wlan_api.h) and the scan list.
+New negroni_wlan_api.h (plain C: version, caps, register callbacks, link state, scan + scan results, associate,
+disassociate, 802.3 TX/RX), negroni_wlan_sta.{c,h} (API state under a mutex, the BSS list of every beacon / probe
+response with security (RSN AKM/cipher) and the elements a join needs, scan requests serviced on the driver thread),
+negroni_wlan_join.c (ENOTSUP placeholders until 0327-0329). negroni_wlan.c: state STARTING/IDLE/FAILED/OFF, the
+keep-alive loop runs the station service. negroni_wlan_wmi.c: every MGMT_RX frame goes to the station manager,
+negroni_wlan_wmi_scan_start for later scans. Details: patches/xnu/README-wifi.md "0326".
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7b1b78e..332bc21 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -126,6 +126,8 @@ bsd/dev/negroni_wlan_qmi.c		standard
+ bsd/dev/negroni_wlan_ce.c		standard
+ bsd/dev/negroni_wlan_wmi.c		standard
+ bsd/dev/negroni_wlan_smmu.c		standard
++bsd/dev/negroni_wlan_sta.c		standard
++bsd/dev/negroni_wlan_join.c		standard
+ bsd/dev/negroni_wlan_bhi.c		standard
+ bsd/dev/negroni_wlan_mhi.c		standard
+ bsd/dev/negroni_adsp.c			standard
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index 0f371f2..b1af0dd 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -32,6 +32,7 @@
+ #include "negroni_wlan_qrtr.h"
+ #include "negroni_wlan_ce.h"
+ #include "negroni_wlan_wmi.h"
++#include "negroni_wlan_sta.h"     /* 0326: API state */
+ #include "negroni_mmio.h"      /* 0325: PARF BDF-to-SID access before the step-6 include below */
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+@@ -333,6 +334,9 @@ wlan_keep_alive(void)
+ 		if (negroni_qrtr.attached) {
+ 			negroni_wlan_wlfw_idle();
+ 		}
++		if (g_level >= WLAN_LEVEL_SCAN) {
++			negroni_wlan_sta_service();     /* 0326: API requests (scan, join, data) at the top level */
++		}
+ 		uint64_t now = negroni_wlan_ms();
+ 		if (now >= next_log) {
+ 			next_log = now + 60000;
+@@ -342,6 +346,7 @@ wlan_keep_alive(void)
+ 		}
+ 		if (g_keep_s && now - start >= (uint64_t)g_keep_s * 1000) {
+ 			printf("NEGRONI WLAN: keep-alive ends after %u s (negroniwlan_keep); the chip keeps running\n", g_keep_s);
++			negroni_wlan_sta_lifecycle(NWLAN_STATE_OFF, 0);       /* 0326: nobody services the chip any more */
+ 			return 0;
+ 		}
+ 		negroni_wlan_nap(20);
+@@ -1108,6 +1113,9 @@ wlan_run(void)
+ 		if (g_level < WLAN_LEVEL_AMSS) {
+ 			return 0;       /* no channel runs yet: nothing to drain */
+ 		}
++		if (g_level >= WLAN_LEVEL_SCAN) {
++			negroni_wlan_sta_lifecycle(NWLAN_STATE_IDLE, 0);       /* 0326: the API is usable */
++		}
+ 		error = wlan_keep_alive();
+ 		if (!error) {
+ 			return 0;
+@@ -1117,6 +1125,7 @@ wlan_run(void)
+ 	if (!g_why_set) {
+ 		printf("NEGRONI WLAN: step %u %s failed: %s (error %d)\n", g_step, g_step_name, errno_text(error), error);
+ 	}
++	negroni_wlan_sta_lifecycle(NWLAN_STATE_FAILED, error);        /* 0326 */
+ 	snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WLAN STOP %u", g_step);
+ 	negroni_wifi_badge_color = 0x00c00000;
+ 	negroni_wlan_smmu_report();     /* 0324: a context fault explains a time-out */
+@@ -1155,6 +1164,7 @@ negroni_wlan_start(void)
+ 	}
+ 	printf("NEGRONI WLAN: start: levels %u..%u, time-out %u ms per wait, SMMU policy %u\n", WLAN_LEVEL_SBL,
+ 	    MIN(g_level, (uint32_t)WLAN_LEVEL_MAX), g_timeout_ms, g_smmu_policy);
++	negroni_wlan_sta_lifecycle(NWLAN_STATE_STARTING, 0);  /* 0326 */
+ 	if (kernel_thread_start(wlan_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+diff --git a/bsd/dev/negroni_wlan_api.h b/bsd/dev/negroni_wlan_api.h
+new file mode 100644
+index 0000000..cadeb6e
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_api.h
+@@ -0,0 +1,142 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: the seam between the kernel driver (bsd/dev/negroni_wlan*.c, patches 0261-0329) and the
++ * iOS side (the Apple80211 / IO80211 interface and en0). Patch 0326 defines it; 0327-0329 fill it in.
++ *
++ * Plain C, no IOKit types: an IOKit (C++) client includes it inside extern "C" { }. Every function may be called
++ * from any thread, after negroni_wlan_api_ready() returns true. None of them blocks on the chip: a request goes
++ * into the driver thread's mailbox and the result comes back as an event (callback) and in negroni_wlan_link().
++ *
++ * Threads: the driver owns the chip on its own kernel thread (the keep-alive poller, 20 ms). Callbacks run on that
++ * thread. A callback must not block, sleep or call back into this API except negroni_wlan_tx() and the getters;
++ * copy what you need and return. RX frames are only valid during the callback.
++ *
++ * Frames: 802.3 / Ethernet II, as en0 sees them: dst[6] src[6] ethertype[2] payload. The driver converts to and
++ * from 802.11 (data path, 0328). EAPOL (0x888e) never reaches the RX callback while the kernel's own WPA2 handshake
++ * runs (0329); it does after the link is up only if the AP starts a new group-key handshake (the driver answers it,
++ * the frame is not passed on).
++ *
++ * Status of each function: see the NWLAN_CAP_* bits returned by negroni_wlan_api_caps(). A function whose bit is not
++ * set returns ENOTSUP. The caller checks NWLAN_API_VERSION against negroni_wlan_api_version().
++ */
++#ifndef _NEGRONI_WLAN_API_H_
++#define _NEGRONI_WLAN_API_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define NWLAN_API_VERSION       1u
++
++#define NWLAN_SSID_MAX          32u
++#define NWLAN_IE_MAX            320u    /* RSN, WPA, HT/VHT capability elements of a BSS, as received */
++#define NWLAN_BSS_MAX           64u     /* the driver keeps the newest 64 BSS of the last scans */
++#define NWLAN_PSK_MIN           8u      /* passphrase 8..63 printable ASCII, or 64 hex digits (a raw PMK) */
++#define NWLAN_PSK_MAX           64u
++
++/* capability bits: which parts of this API the running kernel implements */
++#define NWLAN_CAP_SCAN          (1u << 0)       /* 0326: scan list + passive scan request */
++#define NWLAN_CAP_JOIN_OPEN     (1u << 1)       /* 0327: associate to an open network */
++#define NWLAN_CAP_DATA          (1u << 2)       /* 0328: negroni_wlan_tx and the RX callback carry frames */
++#define NWLAN_CAP_WPA2_PSK      (1u << 3)       /* 0329: associate with a passphrase (WPA2-PSK, CCMP) */
++
++/* security of a BSS (bits) */
++#define NWLAN_SEC_OPEN          0u
++#define NWLAN_SEC_WEP           (1u << 0)       /* privacy bit without RSN/WPA: not supported for joining */
++#define NWLAN_SEC_WPA           (1u << 1)       /* WPA1 element: not supported for joining */
++#define NWLAN_SEC_WPA2_PSK      (1u << 2)       /* RSN with AKM 00-0f-ac:2 and CCMP */
++#define NWLAN_SEC_WPA2_OTHER    (1u << 3)       /* RSN with another AKM (802.1X, SAE, ...): not supported */
++
++/* link state (struct nwlan_link.state) */
++enum nwlan_state {
++	NWLAN_STATE_OFF = 0,            /* driver not started, or stopped after a chip error */
++	NWLAN_STATE_STARTING,           /* firmware download .. WMI READY */
++	NWLAN_STATE_IDLE,               /* firmware up, no association */
++	NWLAN_STATE_SCANNING,
++	NWLAN_STATE_JOINING,            /* channel, authentication, association */
++	NWLAN_STATE_HANDSHAKE,          /* associated, WPA2 4-way handshake running */
++	NWLAN_STATE_CONNECTED,          /* data frames flow (open: after association; WPA2: after the keys) */
++	NWLAN_STATE_FAILED,             /* the chip stopped; see last_error */
++};
++
++/* events (struct nwlan_callbacks.event) */
++enum nwlan_event {
++	NWLAN_EV_STATE = 1,             /* the state changed: read negroni_wlan_link() */
++	NWLAN_EV_SCAN_DONE,             /* a scan ended: read negroni_wlan_scan_results() */
++	NWLAN_EV_LINK_UP,               /* CONNECTED reached (en0: link up, start DHCP) */
++	NWLAN_EV_LINK_DOWN,             /* the association ended (deauth, beacon loss, failure, request) */
++	NWLAN_EV_RSSI,                  /* a new RSSI value (at most once per second) */
++};
++
++struct nwlan_bss {
++	uint8_t bssid[6];
++	uint8_t ssid_len;               /* 0 = hidden */
++	uint8_t ssid[NWLAN_SSID_MAX];   /* raw bytes, not NUL terminated */
++	int8_t rssi;                    /* dBm */
++	uint8_t channel;
++	uint16_t freq;                  /* MHz */
++	uint16_t beacon_int;            /* TU */
++	uint16_t capab;                 /* 802.11 capability information */
++	uint32_t security;              /* NWLAN_SEC_* */
++	uint64_t seen_ms;               /* uptime of the last beacon / probe response */
++	uint16_t ie_len;
++	uint8_t ie[NWLAN_IE_MAX];       /* selected elements as received (id, len, data)...: RSN 48, WPA 221, HT 45, VHT 191 */
++};
++
++struct nwlan_link {
++	uint32_t state;                 /* enum nwlan_state */
++	uint8_t mac[6];                 /* the chip's MAC (WMI READY); en0's address */
++	uint8_t bssid[6];               /* valid in JOINING .. CONNECTED */
++	uint8_t ssid_len;
++	uint8_t ssid[NWLAN_SSID_MAX];
++	int8_t rssi;                    /* dBm, last value */
++	uint16_t freq;
++	uint16_t aid;
++	uint32_t security;              /* NWLAN_SEC_* of the joined BSS */
++	int32_t last_error;             /* errno of the last failure (0 = none) */
++	uint16_t reason;                /* 802.11 status (auth/assoc) or reason (deauth/disassoc) code of the last failure */
++	uint64_t tx_frames, rx_frames, tx_dropped, rx_dropped;
++};
++
++struct nwlan_callbacks {
++	void *ctx;
++	/* one 802.3 frame received (valid only during the call) */
++	void (*rx)(void *ctx, const uint8_t *frame, uint32_t len);
++	/* enum nwlan_event */
++	void (*event)(void *ctx, uint32_t event);
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++uint32_t negroni_wlan_api_version(void);        /* NWLAN_API_VERSION of the kernel */
++uint32_t negroni_wlan_api_caps(void);           /* NWLAN_CAP_* */
++bool negroni_wlan_api_ready(void);              /* the firmware is up (state >= IDLE) */
++
++/* one client (the en0 driver); NULL unregisters. Returns EBUSY if another client is registered. */
++int negroni_wlan_register(const struct nwlan_callbacks *cb);
++
++/* link state, counters, MAC (copy) */
++int negroni_wlan_link(struct nwlan_link *out);
++
++/* start a passive scan of all channels (about 6 s); NWLAN_EV_SCAN_DONE at the end. EBUSY while joining. */
++int negroni_wlan_scan(void);
++/* copy up to `max` BSS of the list (newest first); returns how many were copied */
++uint32_t negroni_wlan_scan_results(struct nwlan_bss *out, uint32_t max);
++
++/*
++ * Join `ssid` (the strongest BSS with that SSID from the list; a scan runs first if none is known).
++ * psk == NULL / psk_len == 0: open network. Else WPA2-PSK: a passphrase (8..63 bytes) or 64 hex digits.
++ * Returns at once (0, EINVAL, ENOTSUP, EBUSY); the result is NWLAN_EV_LINK_UP or NWLAN_EV_LINK_DOWN with
++ * last_error / reason in negroni_wlan_link(). The passphrase is copied, never logged, and wiped after use.
++ */
++int negroni_wlan_associate(const uint8_t *ssid, uint32_t ssid_len, const char *psk, uint32_t psk_len);
++int negroni_wlan_disassociate(void);
++
++/* send one 802.3 frame (copied). ENOTCONN when not CONNECTED, ENOBUFS when the TX queue is full (64 frames). */
++int negroni_wlan_tx(const uint8_t *frame, uint32_t len);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _NEGRONI_WLAN_API_H_ */
+diff --git a/bsd/dev/negroni_wlan_join.c b/bsd/dev/negroni_wlan_join.c
+new file mode 100644
+index 0000000..0191260
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_join.c
+@@ -0,0 +1,65 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: join, data path and WPA2 parts of the station manager.
++ * 0326: placeholders, so the API (negroni_wlan_api.h) links and answers ENOTSUP. 0327 replaces this file.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "negroni_wlan_sta.h"
++
++void
++negroni_wlan_sta_join_frame(const uint8_t *frame, uint32_t len)
++{
++	(void)frame;
++	(void)len;
++}
++
++void
++negroni_wlan_sta_beacon_seen(const uint8_t bssid[6])
++{
++	(void)bssid;
++}
++
++void
++negroni_wlan_sta_join_service(void)
++{
++}
++
++uint32_t
++negroni_wlan_sta_join_caps(void)
++{
++	return 0;
++}
++
++void
++negroni_wlan_sta_link_counters(struct nwlan_link *out)
++{
++	(void)out;
++}
++
++int
++negroni_wlan_associate(const uint8_t *ssid, uint32_t ssid_len, const char *psk, uint32_t psk_len)
++{
++	(void)ssid;
++	(void)ssid_len;
++	(void)psk;
++	(void)psk_len;
++	return ENOTSUP;
++}
++
++int
++negroni_wlan_disassociate(void)
++{
++	return ENOTSUP;
++}
++
++int
++negroni_wlan_tx(const uint8_t *frame, uint32_t len)
++{
++	(void)frame;
++	(void)len;
++	return ENOTSUP;
++}
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_sta.c b/bsd/dev/negroni_wlan_sta.c
+new file mode 100644
+index 0000000..7d7dd20
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_sta.c
+@@ -0,0 +1,510 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: the station manager and the API for the iOS side (negroni_wlan_api.h).
++ *
++ * 0326: API state, client registration, the BSS list (every beacon / probe response of WMI_MGMT_RX, with its
++ *       security and the elements a join needs), scan requests from the API.
++ * 0327+: join, data path and WPA2 add to the service pass.
++ *
++ * Threads: the API functions take g_mtx, copy, post a request flag and return. The driver thread (keep-alive loop,
++ * negroni_wlan_sta_service) does all chip work. Callbacks run on the driver thread with g_mtx not held.
++ * UNTESTED ON HARDWARE.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include "negroni_wlan.h"
++#include "negroni_wlan_mhi.h"
++#include "negroni_wlan_sta.h"
++
++static LCK_GRP_DECLARE(g_grp, "negroni_wlan_api");
++static LCK_MTX_DECLARE(g_mtx, &g_grp);
++
++static struct nwlan_link g_link;                /* under g_mtx */
++static struct nwlan_bss g_bss[NWLAN_BSS_MAX];   /* under g_mtx */
++static uint32_t g_nbss;
++static struct nwlan_callbacks g_cb;             /* under g_mtx */
++static bool g_cb_set;
++static uint32_t g_caps = NWLAN_CAP_SCAN;
++/* requests from the API (under g_mtx) */
++static bool g_req_scan;
++static bool g_scanning;                         /* driver thread only */
++static uint32_t g_scan_count;
++static uint64_t g_scan_start_ms;
++#define API_SCAN_TIMEOUT_MS     30000u
++
++/* ---- events: called on the driver thread without the lock ---- */
++static void
++emit(uint32_t ev)
++{
++	struct nwlan_callbacks cb;
++	bool set;
++
++	lck_mtx_lock(&g_mtx);
++	cb = g_cb;
++	set = g_cb_set;
++	lck_mtx_unlock(&g_mtx);
++	if (set && cb.event) {
++		cb.event(cb.ctx, ev);
++	}
++}
++
++static void
++set_state(uint32_t st, int error)
++{
++	uint32_t old;
++
++	lck_mtx_lock(&g_mtx);
++	old = g_link.state;
++	g_link.state = st;
++	if (error) {
++		g_link.last_error = error;
++	}
++	lck_mtx_unlock(&g_mtx);
++	if (old != st) {
++		printf("NEGRONI WLAN: API state %u -> %u%s\n", old, st, error ? " (error)" : "");
++		emit(NWLAN_EV_STATE);
++	}
++}
++
++void
++negroni_wlan_sta_lifecycle(uint32_t state, int error)
++{
++	if (state == NWLAN_STATE_IDLE) {
++		const uint8_t *mac = negroni_wlan_wmi_mac();
++		lck_mtx_lock(&g_mtx);
++		if (mac) {
++			memcpy(g_link.mac, mac, 6);
++		}
++		lck_mtx_unlock(&g_mtx);
++	}
++	set_state(state, error);
++}
++
++/* ---- the BSS of a beacon / probe response (pure: no kernel state; IEEE 802.11-2016 9.3.3.3, 9.4.2) ---- */
++static bool
++oui_is(const uint8_t *d, uint32_t a, uint32_t b, uint32_t c, uint32_t t)
++{
++	return d[0] == a && d[1] == b && d[2] == c && d[3] == t;
++}
++
++/* RSN element (9.4.2.25): WPA2-PSK = AKM 00-0f-ac:2 and CCMP (00-0f-ac:4) pairwise */
++static uint32_t
++rsn_security(const uint8_t *d, uint32_t n)
++{
++	uint32_t o = 2, cnt;
++	bool ccmp = false, psk = false, other = false;
++
++	if (n < 2 || (d[0] | d[1] << 8) != 1) {
++		return NWLAN_SEC_WPA2_OTHER;
++	}
++	if (n < o + 4) {
++		return NWLAN_SEC_WPA2_PSK;      /* defaults: CCMP + PSK (9.4.2.25.1) */
++	}
++	o += 4;                                 /* group cipher */
++	if (n < o + 2) {
++		return NWLAN_SEC_WPA2_PSK;
++	}
++	cnt = d[o] | d[o + 1] << 8;
++	o += 2;
++	if (cnt == 0 || n < o + 4 * cnt) {
++		return NWLAN_SEC_WPA2_OTHER;
++	}
++	for (uint32_t i = 0; i < cnt; i++, o += 4) {
++		ccmp = ccmp || oui_is(d + o, 0x00, 0x0f, 0xac, 4);
++	}
++	if (n < o + 2) {
++		return ccmp ? NWLAN_SEC_WPA2_PSK : NWLAN_SEC_WPA2_OTHER;
++	}
++	cnt = d[o] | d[o + 1] << 8;
++	o += 2;
++	if (cnt == 0 || n < o + 4 * cnt) {
++		return NWLAN_SEC_WPA2_OTHER;
++	}
++	for (uint32_t i = 0; i < cnt; i++, o += 4) {
++		if (oui_is(d + o, 0x00, 0x0f, 0xac, 2)) {
++			psk = true;
++		} else {
++			other = true;
++		}
++	}
++	return (psk && ccmp) ? NWLAN_SEC_WPA2_PSK : (other || !ccmp ? NWLAN_SEC_WPA2_OTHER : NWLAN_SEC_WPA2_PSK);
++}
++
++int
++negroni_wlan_sta_parse_bss(const uint8_t *f, uint32_t len, struct nwlan_bss *out)
++{
++	memset(out, 0, sizeof(*out));
++	if (!f || len < 24) {
++		return EBADMSG;
++	}
++	uint32_t fc = (uint32_t)f[0] | (uint32_t)f[1] << 8;
++	if (((fc >> 2) & 3) != 0 || (((fc >> 4) & 0xf) != 8 && ((fc >> 4) & 0xf) != 5)) {
++		return ENOENT;
++	}
++	if (len < 36) {
++		return EBADMSG;
++	}
++	memcpy(out->bssid, f + 16, 6);
++	out->beacon_int = (uint16_t)(f[32] | f[33] << 8);
++	out->capab = (uint16_t)(f[34] | f[35] << 8);
++	bool have_ssid = false, rsn = false, wpa = false;
++	for (uint32_t o = 36; o < len;) {
++		if (len - o < 2) {
++			return EBADMSG;
++		}
++		uint32_t id = f[o], el = f[o + 1];
++		const uint8_t *d = f + o + 2;
++		if (el > len - o - 2) {
++			return EBADMSG;
++		}
++		bool keep = false;
++		if (id == 0 && !have_ssid) {
++			if (el > NWLAN_SSID_MAX) {
++				return EBADMSG;
++			}
++			have_ssid = true;
++			out->ssid_len = (uint8_t)el;
++			memcpy(out->ssid, d, el);
++		} else if (id == 3 && el >= 1) {
++			out->channel = d[0];
++		} else if (id == 48 && !rsn) {
++			rsn = true;
++			out->security |= rsn_security(d, el);
++			keep = true;
++		} else if (id == 221 && el >= 4 && d[0] == 0x00 && d[1] == 0x50 && d[2] == 0xf2) {
++			wpa = wpa || d[3] == 1;
++			keep = d[3] == 1 || d[3] == 2;  /* WPA, WMM */
++		} else if (id == 1 || id == 50 || id == 45 || id == 61 || id == 191 || id == 192 || id == 127) {
++			keep = true;                    /* rates, ext rates, HT cap/op, VHT cap/op, ext cap */
++		}
++		if (keep && out->ie_len + 2 + el <= NWLAN_IE_MAX) {
++			memcpy(out->ie + out->ie_len, f + o, 2 + el);
++			out->ie_len = (uint16_t)(out->ie_len + 2 + el);
++		}
++		o += 2 + el;
++	}
++	if (!rsn) {
++		out->security |= wpa ? NWLAN_SEC_WPA : (out->capab & 0x10) ? NWLAN_SEC_WEP : NWLAN_SEC_OPEN;
++	}
++	return 0;
++}
++
++static uint8_t
++freq_channel(uint32_t f)
++{
++	if (f == 2484) {
++		return 14;
++	}
++	if (f >= 2412 && f < 2484) {
++		return (uint8_t)((f - 2407) / 5);
++	}
++	if (f >= 5000 && f < 5900) {
++		return (uint8_t)((f - 5000) / 5);
++	}
++	return 0;
++}
++
++/* MGMT_RX (inside the service pass): beacons and probe responses into the list; later patches add join frames */
++void
++negroni_wlan_sta_mgmt_rx(const uint8_t *frame, uint32_t len, int32_t rssi, uint32_t freq)
++{
++	static struct nwlan_bss b;      /* driver thread only */
++	uint64_t now = negroni_wlan_ms();
++	bool rssi_ev = false;
++
++	if (negroni_wlan_sta_parse_bss(frame, len, &b) != 0) {
++		negroni_wlan_sta_join_frame(frame, len);       /* 0327: auth / assoc / deauth */
++		return;
++	}
++	b.rssi = (int8_t)MAX(MIN(rssi, 0), -127);
++	b.freq = (uint16_t)freq;
++	if (!b.channel) {
++		b.channel = freq_channel(freq);
++	}
++	b.seen_ms = now;
++	lck_mtx_lock(&g_mtx);
++	uint32_t i, oldest = 0;
++	for (i = 0; i < g_nbss; i++) {
++		if (!memcmp(g_bss[i].bssid, b.bssid, 6)) {
++			break;
++		}
++		if (g_bss[i].seen_ms < g_bss[oldest].seen_ms) {
++			oldest = i;
++		}
++	}
++	if (i == g_nbss) {
++		i = g_nbss < NWLAN_BSS_MAX ? g_nbss++ : oldest;
++	}
++	if (b.ssid_len == 0 && g_bss[i].ssid_len && !memcmp(g_bss[i].bssid, b.bssid, 6)) {
++		/* a hidden beacon after a probe response: keep the name */
++		b.ssid_len = g_bss[i].ssid_len;
++		memcpy(b.ssid, g_bss[i].ssid, b.ssid_len);
++	}
++	g_bss[i] = b;
++	if (g_link.state >= NWLAN_STATE_JOINING && g_link.state <= NWLAN_STATE_CONNECTED &&
++	    !memcmp(g_link.bssid, b.bssid, 6)) {
++		static uint64_t last_rssi_ms;
++		g_link.rssi = b.rssi;
++		if (now - last_rssi_ms >= 1000) {
++			last_rssi_ms = now;
++			rssi_ev = true;
++		}
++	}
++	lck_mtx_unlock(&g_mtx);
++	negroni_wlan_sta_beacon_seen(b.bssid);         /* 0327: beacon-loss timer */
++	if (rssi_ev) {
++		emit(NWLAN_EV_RSSI);
++	}
++}
++
++void
++negroni_wlan_sta_scan_done(uint32_t reason)
++{
++	(void)reason;
++	if (!g_scanning && g_link.state != NWLAN_STATE_SCANNING) {
++		g_scan_count++;                 /* the level-10 scan or a join's own scan: no API scan to finish */
++		emit(NWLAN_EV_SCAN_DONE);
++		return;
++	}
++	g_scanning = false;
++	g_scan_count++;
++	printf("NEGRONI WLAN: API scan %u done: %u BSS in the list\n", g_scan_count, g_nbss);
++	if (g_link.state == NWLAN_STATE_SCANNING) {
++		set_state(NWLAN_STATE_IDLE, 0);
++	}
++	emit(NWLAN_EV_SCAN_DONE);
++}
++
++/* driver thread, top level (keep-alive loop) */
++void
++negroni_wlan_sta_service(void)
++{
++	bool scan;
++
++	lck_mtx_lock(&g_mtx);
++	scan = g_req_scan && !g_scanning && g_link.state == NWLAN_STATE_IDLE;
++	if (scan) {
++		g_req_scan = false;
++	}
++	lck_mtx_unlock(&g_mtx);
++	if (scan) {
++		int error = negroni_wlan_wmi_scan_start();
++		if (error) {
++			printf("NEGRONI WLAN: API scan not started (error %d)\n", error);
++			emit(NWLAN_EV_SCAN_DONE);
++		} else {
++			g_scanning = true;
++			g_scan_start_ms = negroni_wlan_ms();
++			set_state(NWLAN_STATE_SCANNING, 0);
++		}
++	}
++	if (g_scanning && negroni_wlan_ms() - g_scan_start_ms > API_SCAN_TIMEOUT_MS) {
++		printf("NEGRONI WLAN: API scan time-out after %u ms (no SCAN COMPLETED)\n", API_SCAN_TIMEOUT_MS);
++		negroni_wlan_sta_scan_done(~0u);
++	}
++	negroni_wlan_sta_join_service();               /* 0327 */
++}
++
++/* ================================ API ================================ */
++uint32_t
++negroni_wlan_api_version(void)
++{
++	return NWLAN_API_VERSION;
++}
++
++uint32_t
++negroni_wlan_api_caps(void)
++{
++	return g_caps | negroni_wlan_sta_join_caps();
++}
++
++bool
++negroni_wlan_api_ready(void)
++{
++	uint32_t st = g_link.state;
++	return st >= NWLAN_STATE_IDLE && st != NWLAN_STATE_FAILED;
++}
++
++int
++negroni_wlan_register(const struct nwlan_callbacks *cb)
++{
++	int error = 0;
++
++	lck_mtx_lock(&g_mtx);
++	if (!cb) {
++		memset(&g_cb, 0, sizeof(g_cb));
++		g_cb_set = false;
++	} else if (g_cb_set) {
++		error = EBUSY;
++	} else {
++		g_cb = *cb;
++		g_cb_set = true;
++	}
++	lck_mtx_unlock(&g_mtx);
++	return error;
++}
++
++int
++negroni_wlan_link(struct nwlan_link *out)
++{
++	if (!out) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&g_mtx);
++	*out = g_link;
++	lck_mtx_unlock(&g_mtx);
++	negroni_wlan_sta_link_counters(out);           /* 0328: data counters */
++	return 0;
++}
++
++int
++negroni_wlan_scan(void)
++{
++	int error = 0;
++
++	lck_mtx_lock(&g_mtx);
++	if (g_link.state != NWLAN_STATE_IDLE && g_link.state != NWLAN_STATE_SCANNING) {
++		error = (g_link.state < NWLAN_STATE_IDLE || g_link.state == NWLAN_STATE_FAILED) ? ENXIO : EBUSY;
++	} else {
++		g_req_scan = true;
++	}
++	lck_mtx_unlock(&g_mtx);
++	return error;
++}
++
++uint32_t
++negroni_wlan_scan_results(struct nwlan_bss *out, uint32_t max)
++{
++	uint32_t n = 0;
++	bool used[NWLAN_BSS_MAX] = { false };
++
++	if (!out) {
++		return 0;
++	}
++	lck_mtx_lock(&g_mtx);
++	while (n < max && n < g_nbss) {
++		uint32_t best = ~0u;
++		for (uint32_t i = 0; i < g_nbss; i++) {
++			if (!used[i] && (best == ~0u || g_bss[i].seen_ms > g_bss[best].seen_ms)) {
++				best = i;
++			}
++		}
++		used[best] = true;
++		out[n++] = g_bss[best];
++	}
++	lck_mtx_unlock(&g_mtx);
++	return n;
++}
++
++/* the strongest BSS named `ssid` seen in the last 60 s (copy); false if none */
++bool
++negroni_wlan_sta_find(const uint8_t *ssid, uint32_t ssid_len, struct nwlan_bss *out)
++{
++	uint64_t now = negroni_wlan_ms();
++	bool found = false;
++
++	lck_mtx_lock(&g_mtx);
++	for (uint32_t i = 0; i < g_nbss; i++) {
++		struct nwlan_bss *b = &g_bss[i];
++		if (b->ssid_len != ssid_len || memcmp(b->ssid, ssid, ssid_len) || now - b->seen_ms > 60000 || b->freq == 0) {
++			continue;
++		}
++		if (!found || b->rssi > out->rssi) {
++			*out = *b;
++			found = true;
++		}
++	}
++	lck_mtx_unlock(&g_mtx);
++	return found;
++}
++
++/* a scan runs (the join waits for its end) */
++bool
++negroni_wlan_sta_scanning(void)
++{
++	return g_scanning;
++}
++
++/* a join starts: a scan request not yet started ends now (SCAN_DONE with the current list) */
++void
++negroni_wlan_sta_scan_cancel(void)
++{
++	bool pending;
++
++	lck_mtx_lock(&g_mtx);
++	pending = g_req_scan;
++	g_req_scan = false;
++	lck_mtx_unlock(&g_mtx);
++	if (pending) {
++		emit(NWLAN_EV_SCAN_DONE);
++	}
++}
++
++/* a join that ends before JOINING (no BSS, wrong security, ...): state IDLE and always NWLAN_EV_LINK_DOWN */
++void
++negroni_wlan_sta_join_failed(const struct nwlan_bss *b, int error, uint16_t reason)
++{
++	negroni_wlan_sta_set_link(b, NWLAN_STATE_IDLE, error, reason, 0);
++	emit(NWLAN_EV_LINK_DOWN);
++}
++
++/* 0327+: helpers for the join / data parts */
++void
++negroni_wlan_sta_set_link(const struct nwlan_bss *b, uint32_t state, int error, uint16_t reason, uint16_t aid)
++{
++	uint32_t old;
++
++	lck_mtx_lock(&g_mtx);
++	old = g_link.state;
++	if (b) {
++		memcpy(g_link.bssid, b->bssid, 6);
++		g_link.ssid_len = b->ssid_len;
++		memcpy(g_link.ssid, b->ssid, b->ssid_len);
++		g_link.rssi = b->rssi;
++		g_link.freq = b->freq;
++		g_link.security = b->security;
++	}
++	g_link.state = state;
++	g_link.aid = aid;
++	if (error || reason) {
++		g_link.last_error = error;
++		g_link.reason = reason;
++	}
++	lck_mtx_unlock(&g_mtx);
++	if (old != state) {
++		printf("NEGRONI WLAN: API state %u -> %u (error %d, reason %u)\n", old, state, error, reason);
++		emit(NWLAN_EV_STATE);
++		if (state == NWLAN_STATE_CONNECTED) {
++			emit(NWLAN_EV_LINK_UP);
++		} else if (old >= NWLAN_STATE_JOINING && old <= NWLAN_STATE_CONNECTED &&
++		    (state < NWLAN_STATE_JOINING || state > NWLAN_STATE_CONNECTED)) {
++			emit(NWLAN_EV_LINK_DOWN);
++		}
++	}
++}
++
++uint32_t
++negroni_wlan_sta_state(void)
++{
++	return g_link.state;
++}
++
++/* deliver one 802.3 frame to the client (driver thread) */
++void
++negroni_wlan_sta_deliver(const uint8_t *frame, uint32_t len)
++{
++	struct nwlan_callbacks cb;
++	bool set;
++
++	lck_mtx_lock(&g_mtx);
++	cb = g_cb;
++	set = g_cb_set;
++	lck_mtx_unlock(&g_mtx);
++	if (set && cb.rx) {
++		cb.rx(cb.ctx, frame, len);
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_sta.h b/bsd/dev/negroni_wlan_sta.h
+new file mode 100644
+index 0000000..6208fb8
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_sta.h
+@@ -0,0 +1,51 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: driver-internal side of the station manager (negroni_wlan_sta.c, patch 0326+).
++ * The public seam for the iOS side is negroni_wlan_api.h.
++ */
++#ifndef _NEGRONI_WLAN_STA_H_
++#define _NEGRONI_WLAN_STA_H_
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++
++#include <stdint.h>
++#include <stdbool.h>
++#include "negroni_wlan_api.h"
++
++/* driver life cycle -> API state (negroni_wlan.c) */
++void negroni_wlan_sta_lifecycle(uint32_t state, int error);
++/* every management frame of WMI_MGMT_RX (inside the service pass: record only, never send) */
++void negroni_wlan_sta_mgmt_rx(const uint8_t *frame, uint32_t len, int32_t rssi, uint32_t freq);
++/* a scan ended (inside the service pass) */
++void negroni_wlan_sta_scan_done(uint32_t reason);
++/* one pass of the station state machine, from the keep-alive loop only (top level: may send WMI and wait) */
++void negroni_wlan_sta_service(void);
++/* the BSS of a frame, element walk; host-testable (no kernel state). 0, ENOENT (not a beacon/probe resp), EBADMSG */
++int negroni_wlan_sta_parse_bss(const uint8_t *f, uint32_t len, struct nwlan_bss *out);
++
++/* negroni_wlan_wmi.c (0326): a passive scan of all channels on vdev 0, without waiting */
++int negroni_wlan_wmi_scan_start(void);
++
++/* negroni_wlan_wmi.c */
++const uint8_t *negroni_wlan_wmi_mac(void);
++uint32_t negroni_wlan_wmi_pdev_id(void);
++uint32_t negroni_wlan_wmi_chains(void);
++int negroni_wlan_wmi_send(uint32_t cmd, const void *tlvs, uint32_t len);
++int negroni_wlan_wmi_wait(volatile bool *flag, uint32_t ms, const char *what);
++
++/* negroni_wlan_sta.c helpers for the join / data / WPA parts */
++bool negroni_wlan_sta_find(const uint8_t *ssid, uint32_t ssid_len, struct nwlan_bss *out);
++void negroni_wlan_sta_set_link(const struct nwlan_bss *b, uint32_t state, int error, uint16_t reason, uint16_t aid);
++uint32_t negroni_wlan_sta_state(void);
++bool negroni_wlan_sta_scanning(void);
++void negroni_wlan_sta_scan_cancel(void);
++void negroni_wlan_sta_join_failed(const struct nwlan_bss *b, int error, uint16_t reason);
++void negroni_wlan_sta_deliver(const uint8_t *frame, uint32_t len);
++
++/* negroni_wlan_join.c (0326 stubs; 0327 join, 0328 data path, 0329 WPA2 fill them in) */
++void negroni_wlan_sta_join_frame(const uint8_t *frame, uint32_t len);  /* a non-beacon management frame */
++void negroni_wlan_sta_beacon_seen(const uint8_t bssid[6]);
++void negroni_wlan_sta_join_service(void);
++uint32_t negroni_wlan_sta_join_caps(void);
++void negroni_wlan_sta_link_counters(struct nwlan_link *out);
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++#endif /* _NEGRONI_WLAN_STA_H_ */
+diff --git a/bsd/dev/negroni_wlan_wmi.c b/bsd/dev/negroni_wlan_wmi.c
+index d19deca..edabb84 100644
+--- a/bsd/dev/negroni_wlan_wmi.c
++++ b/bsd/dev/negroni_wlan_wmi.c
+@@ -27,6 +27,7 @@
+ #include "negroni_wlan_mhi.h"
+ #include "negroni_wlan_ce.h"
+ #include "negroni_wlan_wmi.h"
++#include "negroni_wlan_sta.h"     /* 0326 */
+ 
+ /* ==== pure parsers (host-tested: patches/xnu/tests/wlan-wmi-test.c) ==== */
+ static uint32_t
+@@ -913,6 +914,7 @@ scan_mgmt_rx(const uint8_t *p, uint32_t len)
+ 		S.bad++;
+ 		return;
+ 	}
++	negroni_wlan_sta_mgmt_rx(frame, buf_len, (int32_t)snr + WLAN_NOISE_FLOOR, freq);  /* 0326: the API's BSS list */
+ 	int r = negroni_wlan_beacon_parse(frame, buf_len, &b);
+ 	if (r == ENOENT) {
+ 		S.other_frames++;
+@@ -943,8 +945,9 @@ scan_mgmt_rx(const uint8_t *p, uint32_t len)
+ 	n->freq = freq;
+ 	n->frames = 1;
+ 	/* the BSSID's last 3 bytes are masked: the log may be shared */
+-	printf("NEGRONI WLAN: BSS %u: SSID \"%s\"%s, RSSI %d dBm, %u MHz (DS channel %u), BSSID %02x:%02x:%02x:xx:xx:xx, "
+-	    "%s, beacon interval %u\n", S.nbss, b.hidden ? "" : b.ssid, b.hidden ? " (hidden)" : "", rssi, freq, b.channel,
++	/* 0326: the SSID itself is not logged (privacy): its length only */
++	printf("NEGRONI WLAN: BSS %u: SSID of %u bytes%s, RSSI %d dBm, %u MHz (DS channel %u), BSSID %02x:%02x:%02x:xx:xx:xx, "
++	    "%s, beacon interval %u\n", S.nbss, b.ssid_len, b.hidden ? " (hidden)" : "", rssi, freq, b.channel,
+ 	    b.bssid[0], b.bssid[1], b.bssid[2], b.rsn ? "RSN" : b.wpa ? "WPA" : (b.capab & 0x10) ? "WEP" : "open",
+ 	    b.beacon_int);
+ }
+@@ -985,10 +988,12 @@ scan_cb(uint32_t id, const uint8_t *p, uint32_t len)
+ 		case WMI_SCAN_EV_DEQUEUED:
+ 			S.reason = reason;
+ 			S.completed = true;
++			negroni_wlan_sta_scan_done(reason);    /* 0326 */
+ 			break;
+ 		case WMI_SCAN_EV_START_FAILED:
+ 			S.reason = reason;
+ 			S.failed = true;
++			negroni_wlan_sta_scan_done(reason);    /* 0326: the API scan ends too */
+ 			break;
+ 		case WMI_SCAN_EV_FOREIGN_CHAN:
+ 			if (S.foreign++ < 3) {
+@@ -1139,6 +1144,14 @@ wmi_start_scan(void)
+ 	return negroni_wlan_wmi_send(WMI_START_SCAN_CMDID, m, (uint32_t)(p - m));
+ }
+ 
++/* 0326: another passive scan on vdev 0 (API request); the end comes as negroni_wlan_sta_scan_done */
++int
++negroni_wlan_wmi_scan_start(void)
++{
++	S.started = S.completed = S.failed = false;
++	return wmi_start_scan();
++}
++
+ int
+ negroni_wlan_scan_level(void)
+ {

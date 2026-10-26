@@ -1,0 +1,785 @@
+0341-negroni-apple80211: Wi-Fi, iOS side part 2: Apple80211 answered in the kernel. SIOCGA80211/SIOCSA80211 on en0
+(XNU passes unknown interface ioctls to the interface): gets 1 2 4 9 11 12 13 15 16 19 21 27 43 44 103 207 254, sets
+10 (scan) 19 (power) 20 (associate: passphrase, or a PMK as 64 hex digits) 22 (disassociate); events class 6
+(KEV_IEEE80211_CLASS) subclass 1: power changed, SSID/BSSID/link changed (32-byte link data), assoc done, scan done.
+Root only for every set and for gets 1, 9, 11, 103 (EPERM otherwise; wifid runs as root). Every request logged (who, type, value, length; never SSID or key) for the first negroniwlan_ios_log (400), a
+per-type summary 180 s after en0. Layouts as HakiOS read them from IO80211.framework 16.5 (static asserts kept).
+Derived from HakiOS hakios.apple80211.c (APSL 2.0, notice kept). Details: patches/xnu/README-wifi.md "0340-0341".
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9cbd27a..d6634c1 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -684,3 +684,4 @@ bsd/skywalk/packet/pbufpool.c			optional skywalk
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
+ bsd/dev/negroni_wlan_ios.c		standard
++bsd/dev/negroni_apple80211.c		standard
+diff --git a/bsd/dev/negroni_apple80211.c b/bsd/dev/negroni_apple80211.c
+new file mode 100644
+index 0000000..e892652
+--- /dev/null
++++ b/bsd/dev/negroni_apple80211.c
+@@ -0,0 +1,762 @@
++/*
++ * Copyright (c) 2026 iOSPlus10. Derived from HakiOS (oosexgang/hackios-xnu-kernel, xnu/files/bsd/dev/
++ * hakios.apple80211.c, Apple Public Source License 2.0): the request types, the 16.5 layouts and their checks,
++ * the event format; adapted to the NEGRONI backend (negroni_wlan_ios.h -> negroni_wlan_api.h).
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed software or any other software. Please obtain a
++ * copy of the License at http://www.opensource.apple.com/apsl/ and read it
++ * before using this file.
++ *
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ */
++/*
++ * NEGRONI Wi-Fi, iOS side (patch 0341): Apple80211 answered in the kernel.
++ *
++ * wifid (and through it Settings, Control Center and the status bar) talks to the driver with Apple80211
++ * requests. Our registry service has no user client (NegroniWLAN.cpp), so IO80211.framework logs "Falling back
++ * to IOCTL path" and sends every request as SIOCGA80211 / SIOCSA80211 on a socket: a struct apple80211req with the
++ * interface name, a type, a value, a length and a user buffer. XNU passes an interface ioctl it does not know to
++ * the interface (bsd/net/if.c ifioctl default -> ifnet_ioctl), so en0's ioctl (negroni_wlan_ios.c) calls this.
++ *
++ * Gets: card capabilities (12), power (19), op mode (15), channels (27, 254, 207), join result (21), scan result
++ * (11, one BSS per request, EIO after the last), state (13), SSID (1), BSSID (9), channel (4), RSSI (16), current
++ * network (103), auth type (2), driver/hardware names (43, 44). Sets: associate (20), disassociate (22), power
++ * (19), scan (10). Events: kernel events class 6 (KEV_IEEE80211_CLASS) subclass 1, code = Apple80211 event,
++ * data = the interface name in 16 bytes (+ the 32-byte link data for LINK_CHANGED).
++ *
++ * Root only: every set, and gets 1 SSID, 9 BSSID, 11 SCAN_RESULT, 103 CURRENT_NETWORK (EPERM otherwise; wifid runs
++ * as root).
++ *
++ * Layouts: as HakiOS read them out of IO80211.framework of iOS 16.5 (20F66) [I: the same in 16.7 20H392; the
++ * _Static_asserts keep them as HakiOS had them]. Each request is logged (process, get/set, type, value, length,
++ * never the SSID or key) for the first negroniwlan_ios_log requests, and a per-type summary 180 s after en0.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/kern_event.h>
++#include <sys/kauth.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <libkern/libkern.h>
++#include "negroni_wlan_ios.h"
++
++struct apple80211req {
++	char req_if_name[16];
++	int32_t req_type;
++	int32_t req_val;
++	uint32_t req_len;
++	user_addr_t req_data __attribute__((aligned(8)));
++};
++
++static const char *
++type_name(int32_t type)
++{
++	static const struct {
++		int32_t type;
++		const char *name;
++	} names[] = {
++		{ 1, "SSID" }, { 2, "AUTH_TYPE" }, { 3, "CIPHER_KEY" }, { 4, "CHANNEL" }, { 5, "POWERSAVE" }, { 6, "PROTMODE" },
++		{ 7, "TXPOWER" }, { 8, "RATE" }, { 9, "BSSID" }, { 10, "SCAN_REQ" }, { 11, "SCAN_RESULT" }, { 12, "CARD_CAPABILITIES" },
++		{ 13, "STATE" }, { 14, "PHY_MODE" }, { 15, "OP_MODE" }, { 16, "RSSI" }, { 17, "NOISE" }, { 18, "INT_MIT" }, { 19, "POWER" },
++		{ 20, "ASSOCIATE" }, { 21, "ASSOCIATE_RESULT" }, { 22, "DISASSOCIATE" }, { 23, "STATUS_DEV_NAME" }, { 24, "IBSS_MODE" },
++		{ 25, "HOST_AP_MODE" }, { 26, "AP_MODE" }, { 27, "SUPPORTED_CHANNELS" }, { 28, "LOCALE" }, { 29, "DEAUTH" },
++		{ 30, "COUNTERMEASURES" }, { 32, "RATE_SET" }, { 42, "STATION_LIST" }, { 43, "DRIVER_VERSION" },
++		{ 44, "HARDWARE_VERSION" }, { 46, "RSN_IE" }, { 47, "BACKGROUND_SCAN" }, { 48, "AP_IE_LIST" }, { 49, "STATS" },
++		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
++		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
++		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
++		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
++	};
++
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (names[i].type == type) {
++			return names[i].name;
++		}
++	}
++	return "?";
++}
++
++/* ---- the layouts (HakiOS, IO80211.framework 16.5) ---------------------------------------------------------- */
++
++#define CHANNEL_20MHZ           0x2u
++#define CHANNEL_2GHZ            0x8u
++#define CHANNEL_5GHZ            0x10u
++#define CHANNEL_ACTIVE          0x80u
++#define CHANNEL_DFS             0x100u
++
++struct apple80211_channel {
++	uint32_t version, channel, flags;
++};
++
++struct apple80211_channels {
++	uint32_t version, count;
++	struct apple80211_channel channels[401];
++	uint32_t unused;
++};
++
++struct apple80211_channels_info {
++	uint8_t unknown_0[12];
++	uint16_t count;
++	uint8_t unknown_1[800];
++	uint8_t number[400], indoor[400], dfs[400], passive[400], wide_40[400], wide_80[400];
++	uint8_t unknown_2[1602];
++	uint32_t flags[400];
++	uint8_t unknown_3[3600];
++} __attribute__((packed));
++
++struct apple80211_scan_request {
++	uint32_t version, bss_type;
++	uint8_t bssid[6], unused_0[2];
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint32_t scan_type;
++	uint32_t phy_mode;
++	uint16_t dwell_ms, unused_1;
++	uint32_t rest_ms;
++	uint32_t channel_count;
++	struct apple80211_channel channels[400];
++	uint64_t flags;
++	uint32_t unused_2;
++	uint32_t name_count;
++	uint8_t names[10][56];
++	uint32_t short_ssid, unused_3;
++};
++
++struct apple80211_scan_result {
++	uint32_t version;
++	struct apple80211_channel channel;
++	uint16_t noise_known;
++	int16_t noise, snr, rssi;
++	uint16_t beacon_interval, capability;
++	uint8_t bssid[6];
++	uint8_t rate_count, unused_0;
++	uint32_t rates[15];
++	uint8_t ssid_length, ssid[32], unused_1[3];
++	uint32_t age_ms;
++	uint8_t flags, unused_2;
++	uint16_t elements_length;
++	uint8_t elements[1024];
++};
++
++struct apple80211_assoc {
++	uint32_t version;
++	uint16_t mode, auth_lower, auth_upper, unused_0;
++	uint32_t ssid_length;
++	uint8_t ssid[32];
++	uint8_t bssid[6], unused_1[2];
++	uint32_t key_version, key_length, key_cipher;
++	uint16_t key_flags, key_index;
++	uint8_t key[64];
++	uint8_t rest[0x250 - 0x88];
++};
++
++#define CIPHER_PMK              6
++#define CIPHER_PASSPHRASE       10
++
++struct apple80211_link_changed {
++	uint8_t down, unused_0[3];
++	int32_t rssi;
++	uint16_t snr, noise;
++	uint8_t unused_1[4];
++	uint8_t involuntary, unused_2[3];
++	uint32_t reason, subreason;
++	uint8_t unused_3[4];
++};
++
++_Static_assert(sizeof(struct apple80211req) == 40, "struct apple80211req (SIOCGA80211 length 0x28)");
++_Static_assert(sizeof(struct apple80211_assoc) == 592 && offsetof(struct apple80211_assoc, key) == 0x48,
++    "the association request as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_link_changed) == 32 && offsetof(struct apple80211_link_changed, reason) == 0x14,
++    "the link event as iOS 16.5 reads it");
++_Static_assert(sizeof(struct apple80211_channels) == 4824, "the channel list as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_channels_info) == 10016 && offsetof(struct apple80211_channels_info, number) == 0x32e &&
++    offsetof(struct apple80211_channels_info, flags) == 0x12d0, "the channels' description as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_scan_request) == 5456 && offsetof(struct apple80211_scan_request, channels) == 0x48 &&
++    offsetof(struct apple80211_scan_request, flags) == 0x1308 && offsetof(struct apple80211_scan_request, names) == 0x1318,
++    "the scan request as iOS 16.5 has it");
++_Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct apple80211_scan_result, ssid_length) == 0x60 &&
++    offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements) == 0x8c,
++    "a scan's result as iOS 16.5 has it");
++
++/* Apple80211 events (APPLE80211_M_...) */
++enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
++       EVENT_SCAN_DONE = 10 };
++
++static const char interface_name[16] = NWIOS_IFNAME;
++
++static LCK_GRP_DECLARE(a80211_lock_group, "negroni-apple80211");
++static LCK_MTX_DECLARE(a80211_lock, &a80211_lock_group);
++static unsigned result_next;            /* which BSS of the last scan the next SCAN_RESULT gets */
++static uint32_t join_result;            /* of the last join: 0 while it runs, then Apple80211's result number */
++
++/* ---- channels: the regulatory set of the QCA6490 board file is not read; a world-safe list ------------------ */
++
++static const uint16_t channel_list[] = {
++	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700,
++	5720, 5745, 5765, 5785, 5805, 5825,
++};
++#define CHANNEL_COUNT   (sizeof(channel_list) / sizeof(channel_list[0]))
++
++static bool
++channel_radar(unsigned frequency)
++{
++	return frequency >= 5260 && frequency <= 5720;         /* UNII-2 / UNII-2e: DFS, listen only */
++}
++
++static unsigned
++channel_number(unsigned frequency)
++{
++	return frequency == 2484 ? 14 : frequency < 4000 ? (frequency - 2407) / 5 : (frequency - 5000) / 5;
++}
++
++static void
++channel_fill(struct apple80211_channel *channel, unsigned frequency)
++{
++	bool radar = channel_radar(frequency);
++
++	channel->version = 1;
++	channel->channel = channel_number(frequency);
++	channel->flags = CHANNEL_20MHZ | (frequency < 4000 ? CHANNEL_2GHZ : CHANNEL_5GHZ) | (radar ? CHANNEL_DFS : CHANNEL_ACTIVE);
++}
++
++/* ---- answers ---------------------------------------------------------------------------------------------- */
++
++static int
++give(const struct apple80211req *request, const void *data, size_t length)
++{
++	return request->req_data == USER_ADDR_NULL ? 0 : copyout(data, request->req_data, length < request->req_len ? length :
++	       request->req_len);
++}
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* one BSS in the scan-result layout; the caller says how much room for elements it has */
++static int
++give_network(const struct apple80211req *request, const struct nwlan_bss *bss)
++{
++	struct apple80211_scan_result *result = kalloc_data(sizeof(*result), Z_WAITOK | Z_ZERO);
++	unsigned room = sizeof(result->elements), have;
++	uint64_t now = now_ms();
++	int error;
++
++	if (result == NULL) {
++		return ENOMEM;
++	}
++	if (request->req_len >= sizeof(*result) && copyin(request->req_data, result, offsetof(struct apple80211_scan_result,
++	    elements)) == 0 && result->elements_length < room) {
++		room = result->elements_length;
++	}
++	bzero(result, sizeof(*result));
++	result->version = 1;
++	channel_fill(&result->channel, bss->freq);
++	result->rssi = bss->rssi;
++	result->noise = -95;
++	result->snr = (int16_t)(bss->rssi + 95);
++	result->beacon_interval = bss->beacon_int;
++	result->capability = bss->capab;
++	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
++	result->ssid_length = MIN(bss->ssid_len, (uint8_t)NWLAN_SSID_MAX);
++	memcpy(result->ssid, bss->ssid, result->ssid_length);
++	result->age_ms = bss->seen_ms != 0 && now > bss->seen_ms ? (uint32_t)MIN(now - bss->seen_ms, 0xffffffffull) : 0;
++	/* the elements as a beacon has them: SSID (0) first, then what the driver kept (rates, RSN, WPA, HT, VHT) */
++	have = 2u + result->ssid_length + MIN(bss->ie_len, (uint16_t)NWLAN_IE_MAX);
++	if (have <= room) {
++		result->elements[0] = 0;
++		result->elements[1] = result->ssid_length;
++		memcpy(result->elements + 2, bss->ssid, result->ssid_length);
++		memcpy(result->elements + 2 + result->ssid_length, bss->ie, MIN(bss->ie_len, (uint16_t)NWLAN_IE_MAX));
++		result->elements_length = (uint16_t)have;
++	}
++	/* rates (elements 1 and 50, units of 500 kbit/s) */
++	for (unsigned at = 0; at + 2 <= result->elements_length && at + 2 + result->elements[at + 1] <= result->elements_length;
++	    at += 2 + result->elements[at + 1]) {
++		for (unsigned i = 0; (result->elements[at] == 1 || result->elements[at] == 50) && i < result->elements[at + 1]; i++) {
++			unsigned rate = (result->elements[at + 2 + i] & 0x7f) / 2;
++
++			if (rate != 0 && rate <= 54 && result->rate_count < 15) {
++				result->rates[result->rate_count++] = rate;
++			}
++		}
++	}
++	error = give(request, result, sizeof(*result));
++	kfree_data(result, sizeof(*result));
++	return error;
++}
++
++/* the joined network as a struct nwlan_bss (for CURRENT_NETWORK) */
++static void
++joined_bss(const struct nwlan_link *link, struct nwlan_bss *bss)
++{
++	bzero(bss, sizeof(*bss));
++	/* the scan list has the elements of the joined BSS; take them when it is there */
++	for (uint32_t i = 0; nwios_result(i, bss); i++) {
++		if (memcmp(bss->bssid, link->bssid, 6) == 0) {
++			bss->rssi = link->rssi;
++			return;
++		}
++	}
++	bzero(bss, sizeof(*bss));
++	memcpy(bss->bssid, link->bssid, 6);
++	bss->ssid_len = MIN(link->ssid_len, (uint8_t)NWLAN_SSID_MAX);
++	memcpy(bss->ssid, link->ssid, bss->ssid_len);
++	bss->rssi = link->rssi;
++	bss->freq = link->freq;
++	bss->beacon_int = 100;
++	bss->capab = (uint16_t)(0x0001 | (link->security != NWLAN_SEC_OPEN ? 0x0010 : 0));
++	bss->security = link->security;
++}
++
++/* ---- get -------------------------------------------------------------------------------------------------- */
++
++static int
++get(struct apple80211req *request)
++{
++	struct nwlan_link *link;
++	int error = 0;
++
++	switch (request->req_type) {
++	case 43:
++	case 44: {                              /* driver and hardware name: text in 256 bytes */
++		static const char name[256] = "negroni: QCA6490 (WCN6855) over PCIe/MHI";
++
++		return give(request, name, sizeof(name));
++	}
++	case 12: {                              /* card capabilities (HakiOS bits: AES, AES-CCM, PM, short slot/preamble, WPA2, WME, SGI20) */
++		uint8_t bits[13] = { 0 };
++		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
++
++		for (unsigned i = 0; i < sizeof(has); i++) {
++			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
++		}
++		return give(request, bits, sizeof(bits));
++	}
++	case 19: {                              /* power: one radio; counts as on until en0 exists */
++		struct {
++			uint32_t version, radios, state[4];
++		} answer = { .version = 1, .radios = 1, .state = { !nwios_present() || nwios_powered() } };
++
++		return give(request, &answer, sizeof(answer));
++	}
++	case 15:                                /* op mode: station (APPLE80211_M_STA) */
++		request->req_val = 1;
++		return 0;
++	case 27:
++	case 254: {
++		struct apple80211_channels *answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO);
++
++		if (answer == NULL) {
++			return ENOMEM;
++		}
++		answer->version = 1;
++		answer->count = CHANNEL_COUNT;
++		for (unsigned i = 0; i < CHANNEL_COUNT; i++) {
++			channel_fill(&answer->channels[i], channel_list[i]);
++		}
++		error = give(request, answer, sizeof(*answer));
++		kfree_data(answer, sizeof(*answer));
++		return error;
++	}
++	case 207: {
++		struct apple80211_channels_info *answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO);
++
++		if (answer == NULL) {
++			return ENOMEM;
++		}
++		answer->count = CHANNEL_COUNT;
++		for (unsigned i = 0; i < CHANNEL_COUNT; i++) {
++			struct apple80211_channel channel;
++
++			channel_fill(&channel, channel_list[i]);
++			answer->number[i] = (uint8_t)channel.channel;
++			answer->dfs[i] = channel_radar(channel_list[i]);
++			answer->passive[i] = channel_radar(channel_list[i]);
++			answer->flags[i] = channel.flags;
++		}
++		error = give(request, answer, sizeof(*answer));
++		kfree_data(answer, sizeof(*answer));
++		return error;
++	}
++	case 21:
++		lck_mtx_lock(&a80211_lock);
++		request->req_val = (int32_t)join_result;
++		lck_mtx_unlock(&a80211_lock);
++		return 0;
++	case 11: {                              /* one BSS of the last scan per request; EIO: that was all */
++		struct nwlan_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
++		unsigned index;
++
++		if (bss == NULL) {
++			return ENOMEM;
++		}
++		lck_mtx_lock(&a80211_lock);
++		index = result_next++;
++		lck_mtx_unlock(&a80211_lock);
++		error = nwios_result(index, bss) ? give_network(request, bss) : EIO;
++		kfree_data(bss, sizeof(*bss));
++		return error;
++	}
++	default:
++		break;
++	}
++
++	if ((link = kalloc_data(sizeof(*link), Z_WAITOK | Z_ZERO)) == NULL) {
++		return ENOMEM;
++	}
++	nwios_link(link);
++	switch (request->req_type) {
++	case 13:                                /* APPLE80211_S_INIT 0, _SCAN 1, _AUTH 2, _ASSOC 3, _RUN 4 */
++		request->req_val = nwios_joined() ? 4 : link->state == NWLAN_STATE_HANDSHAKE ? 3 :
++		    link->state == NWLAN_STATE_JOINING ? 2 : link->state == NWLAN_STATE_SCANNING ? 1 : 0;
++		break;
++	case 1:
++		if (!nwios_joined()) {
++			error = ENXIO;
++		} else if ((error = give(request, link->ssid, MIN(link->ssid_len, (uint8_t)NWLAN_SSID_MAX))) == 0) {
++			request->req_len = MIN(link->ssid_len, (uint8_t)NWLAN_SSID_MAX);
++		}
++		break;
++	case 9:
++		error = !nwios_joined() ? ENXIO : give(request, link->bssid, 6);
++		break;
++	case 4: {
++		struct {
++			uint32_t version;
++			struct apple80211_channel channel;
++		} answer = { .version = 1 };
++
++		if (!nwios_joined()) {
++			error = ENXIO;
++		} else {
++			channel_fill(&answer.channel, link->freq);
++			error = give(request, &answer, sizeof(answer));
++		}
++		break;
++	}
++	case 16: {
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { link->rssi }, .all = link->rssi,
++			     .each_ext = { link->rssi }, .all_ext = link->rssi };
++
++		error = !nwios_joined() ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 103: {
++		struct nwlan_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
++
++		if (bss == NULL) {
++			error = ENOMEM;
++		} else {
++			if (!nwios_joined()) {
++				error = ENXIO;
++			} else {
++				joined_bss(link, bss);
++				error = give_network(request, bss);
++			}
++			kfree_data(bss, sizeof(*bss));
++		}
++		break;
++	}
++	case 2: {                               /* open system; upper 8 = WPA2-PSK, 0 = none */
++		struct {
++			uint32_t version, lower, upper, extended;
++		} answer = { .version = 1, .lower = 1, .upper = link->security & NWLAN_SEC_WPA2_PSK ? 8 : 0 };
++
++		error = !nwios_joined() ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	default:
++		error = EOPNOTSUPP;
++		break;
++	}
++	kfree_data(link, sizeof(*link));
++	return error;
++}
++
++/* ---- set -------------------------------------------------------------------------------------------------- */
++
++static int
++set_scan(const struct apple80211req *request, char *said, size_t said_size)
++{
++	struct apple80211_scan_request *asked;
++	int error;
++
++	if (request->req_len != sizeof(*asked)) {
++		return EINVAL;
++	}
++	if (!nwios_present()) {
++		return EBUSY;                   /* the radio is being brought up: the framework retries */
++	}
++	asked = kalloc_data(sizeof(*asked), Z_WAITOK);
++	if (asked == NULL) {
++		return ENOMEM;
++	}
++	error = copyin(request->req_data, asked, sizeof(*asked));
++	if (error == 0) {
++		/* the driver scans every channel passively (0326); the request's channels and names are only logged */
++		snprintf(said, said_size, " (a scan: type %u, %u channels, %u ms each, a name of %u bytes, %u more names)",
++		    asked->scan_type, asked->channel_count, asked->dwell_ms, asked->ssid_length, asked->name_count);
++		lck_mtx_lock(&a80211_lock);
++		result_next = 0;
++		lck_mtx_unlock(&a80211_lock);
++		error = nwios_scan();
++	}
++	kfree_data(asked, sizeof(*asked));
++	return error;
++}
++
++static int
++set_join(const struct apple80211req *request, char *said, size_t said_size)
++{
++	static const char hex[] = "0123456789abcdef";
++	struct apple80211_assoc *asked;
++	char *psk;
++	uint32_t psk_len = 0;
++	int error;
++
++	if (request->req_len < offsetof(struct apple80211_assoc, rest)) {
++		return EINVAL;
++	}
++	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
++	psk = kalloc_data(NWLAN_PSK_MAX + 1, Z_WAITOK | Z_ZERO);
++	if (asked == NULL || psk == NULL) {
++		error = ENOMEM;
++		goto out;
++	}
++	if ((error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
++		goto out;
++	}
++	snprintf(said, said_size, " (a join: a name of %u bytes, %s access point, authentication %#x/%#x, a key of %u bytes of kind %u)",
++	    asked->ssid_length, (asked->bssid[0] | asked->bssid[1] | asked->bssid[2] | asked->bssid[3] | asked->bssid[4] |
++	    asked->bssid[5]) ? "a given" : "any", asked->auth_lower, asked->auth_upper, asked->key_length, asked->key_cipher);
++	if (asked->ssid_length == 0 || asked->ssid_length > NWLAN_SSID_MAX) {
++		error = EINVAL;
++		goto out;
++	}
++	if (asked->key_length == 0) {
++		psk_len = 0;
++	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= NWLAN_PSK_MIN && asked->key_length <= 63) {
++		memcpy(psk, asked->key, asked->key_length);
++		psk_len = asked->key_length;
++	} else if (asked->key_cipher == CIPHER_PMK && asked->key_length == 32) {
++		for (unsigned i = 0; i < 32; i++) {     /* the seam takes a raw PMK as 64 hex digits */
++			psk[2 * i] = hex[asked->key[i] >> 4];
++			psk[2 * i + 1] = hex[asked->key[i] & 0xf];
++		}
++		psk_len = 64;
++	} else {
++		error = EINVAL;
++		goto out;
++	}
++	lck_mtx_lock(&a80211_lock);
++	join_result = 0;
++	lck_mtx_unlock(&a80211_lock);
++	error = nwios_associate(asked->ssid, asked->ssid_length, psk_len != 0 ? psk : NULL, psk_len);
++out:
++	if (asked != NULL) {
++		memset_s(asked, sizeof(*asked), 0, sizeof(*asked));
++		kfree_data(asked, sizeof(*asked));
++	}
++	if (psk != NULL) {
++		memset_s(psk, NWLAN_PSK_MAX + 1, 0, NWLAN_PSK_MAX + 1);
++		kfree_data(psk, NWLAN_PSK_MAX + 1);
++	}
++	return error;
++}
++
++static int
++set(const struct apple80211req *request, char *said, size_t said_size)
++{
++	switch (request->req_type) {
++	case 20:
++		return set_join(request, said, said_size);
++	case 22:
++		return nwios_disassociate();
++	case 19: {
++		struct {
++			uint32_t version, radios, state[4];
++		} asked;
++		int error;
++
++		if (request->req_len < sizeof(asked)) {
++			return EINVAL;
++		}
++		if ((error = copyin(request->req_data, &asked, sizeof(asked))) != 0) {
++			return error;
++		}
++		snprintf(said, said_size, " (power: %s)", asked.state[0] ? "on" : "off");
++		return nwios_set_power(asked.state[0] != 0);
++	}
++	case 10:
++		return set_scan(request, said, said_size);
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++/* ---- events ------------------------------------------------------------------------------------------------ */
++
++static void
++post(uint32_t code, const void *data, uint32_t length)
++{
++	struct kev_msg message = { .vendor_code = KEV_VENDOR_APPLE, .kev_class = KEV_IEEE80211_CLASS, .kev_subclass = 1,
++		                   .event_code = code };
++	char name[16];
++
++	memcpy(name, interface_name, sizeof(name));
++	message.dv[0].data_length = sizeof(name);
++	message.dv[0].data_ptr = name;
++	if (length != 0) {
++		message.dv[1].data_length = length;
++		message.dv[1].data_ptr = __DECONST(void *, data);
++	}
++	kev_post_msg(&message);
++}
++
++void
++negroni_apple80211_event(enum nwios_event event, int status)
++{
++	static unsigned said;
++
++	if (said < 200) {
++		said++;
++		printf("NEGRONI WLAN iOS: Apple80211 event: %s, %d\n", event == NWIOS_EV_POWER ? "power" : event == NWIOS_EV_SCAN_DONE ?
++		    "scan done" : event == NWIOS_EV_JOIN_DONE ? "join done" : "link", status);
++	}
++	switch (event) {
++	case NWIOS_EV_POWER:
++		post(EVENT_POWER_CHANGED, NULL, 0);
++		break;
++	case NWIOS_EV_SCAN_DONE:
++		lck_mtx_lock(&a80211_lock);
++		result_next = 0;
++		lck_mtx_unlock(&a80211_lock);
++		post(EVENT_SCAN_DONE, NULL, 0);
++		break;
++	case NWIOS_EV_JOIN_DONE:
++		/* 1 success, 21 invalid PMK (wrong passphrase), 9 time-out, 2 failure */
++		lck_mtx_lock(&a80211_lock);
++		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
++		lck_mtx_unlock(&a80211_lock);
++		post(EVENT_ASSOC_DONE, NULL, 0);
++		break;
++	case NWIOS_EV_LINK: {
++		struct apple80211_link_changed data = { .down = status != 1, .involuntary = status != 1 && status != 0,
++			                                .reason = status != 1 && status != 0 ? 4 : 0 };
++		struct nwlan_link link;
++
++		nwios_link(&link);
++		data.rssi = status == 1 ? link.rssi : 0;
++		post(EVENT_SSID_CHANGED, NULL, 0);
++		post(EVENT_BSSID_CHANGED, NULL, 0);
++		post(EVENT_LINK_CHANGED, &data, sizeof(data));
++		break;
++	}
++	}
++}
++
++/* ---- per-type counts (said once, 180 s after en0) ----------------------------------------------------------- */
++
++static struct {
++	int32_t type;
++	bool set;
++	unsigned times, answered;
++	int last_error;
++} kinds[96];
++static unsigned kind_count;
++
++static void
++note(const struct apple80211req *request, bool is_set, int error)
++{
++	unsigned i;
++
++	lck_mtx_lock(&a80211_lock);
++	for (i = 0; i < kind_count && !(kinds[i].type == request->req_type && kinds[i].set == is_set); i++) {
++	}
++	if (i < sizeof(kinds) / sizeof(kinds[0])) {
++		if (i == kind_count) {
++			kinds[kind_count].type = request->req_type;
++			kinds[kind_count].set = is_set;
++			kind_count++;
++		}
++		kinds[i].times++;
++		kinds[i].answered += error == 0;
++		kinds[i].last_error = error != 0 ? error : kinds[i].last_error;
++	}
++	lck_mtx_unlock(&a80211_lock);
++}
++
++void
++negroni_apple80211_summary(void)
++{
++	printf("NEGRONI WLAN iOS: Apple80211 summary: %u request kinds\n", kind_count);
++	for (unsigned i = 0; i < kind_count; i++) {
++		printf("NEGRONI WLAN iOS: Apple80211 %s %d (%s) %u times, answered %u, last refusal %d%s\n", kinds[i].set ? "set" : "get",
++		    kinds[i].type, type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error,
++		    kinds[i].last_error == EOPNOTSUPP ? " (not built)" : "");
++	}
++}
++
++/* ---- entry ------------------------------------------------------------------------------------------------- */
++
++int
++negroni_apple80211_ioctl(unsigned long command, void *data)
++{
++	static unsigned said;
++	struct apple80211req *request = data;
++	char who[32] = "?", what[200] = "";
++	bool is_set = command == SIOCSA80211_CMD;
++	int error;
++
++	if (command != SIOCSA80211_CMD && command != SIOCGA80211_CMD) {
++		return EOPNOTSUPP;
++	}
++	proc_selfname(who, sizeof(who));
++	/*
++	 * Root only (wifid runs as root: its launchd job has no UserName [V 20H392]): every set, and the gets that
++	 * reveal where the phone is (SSID 1, BSSID 9, scan results 11, current network 103).
++	 */
++	if ((is_set || request->req_type == 1 || request->req_type == 9 || request->req_type == 11 || request->req_type == 103) &&
++	    !kauth_cred_issuser(kauth_cred_get())) {
++		error = EPERM;
++	} else {
++		error = is_set ? set(request, what, sizeof(what)) : get(request);
++	}
++	note(request, is_set, error);
++	if (said < negroni_wlan_ios_log_max()) {
++		said++;
++		printf("NEGRONI WLAN iOS: %s %s %d (%s), value %d, %u bytes%s: %s%s\n", who, is_set ? "sets" : "gets", request->req_type,
++		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered" :
++		    error == EOPNOTSUPP ? "REFUSED (not built)" : "error ", error == 0 || error == EOPNOTSUPP ? "" :
++		    (error == ENXIO ? "ENXIO" : error == EIO ? "EIO (end of list)" : error == ENETDOWN ? "ENETDOWN" :
++		    error == EBUSY ? "EBUSY" : error == EINVAL ? "EINVAL" : error == EPERM ? "EPERM (not root)" : "other"));
++	}
++	return error;
++}

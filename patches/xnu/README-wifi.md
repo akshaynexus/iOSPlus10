@@ -158,7 +158,7 @@ New boot-args:
 |---|---|---|
 | `negroniwlan=N` | 0 (off) | survey 1..10, then driver levels 2..N (max 4 in 0264; 6 with 0265/0266) |
 | `negroniwlan_to=MS` | 10000 | time-out of every wait, 100..60000 |
-| `negroniwlan_smmu=P` | **1** | 0 = step 6 only reports; 1 = stop before the first DMA when a clock vote bit is clear or the SMMU surely faults stream 0x1c01 (S2CR fault, a context we did not set up, or no SMR with USFCFG 1); **2 = WRITE a bypass SMR + S2CR for stream 0x1c01 into the apps SMMU** |
+| `negroniwlan_smmu=P` | **3** since 0325 (was 1) | 3 = the 0324/0325 stage-1 context (see "0325"); 0 = step 6 only reports; 1 = stop before the first DMA when a clock vote bit is clear or the SMMU surely faults stream 0x1c01 (S2CR fault, a context we did not set up, or no SMR with USFCFG 1); **2 = WRITE a bypass SMR + S2CR for stream 0x1c01 into the apps SMMU** |
 
 **Warning: `negroniwlan_smmu=2` writes the shared apps SMMU (Gunyah emulates its global space). Use it
 only with the owner's approval, and only after a boot with the default showed `unmatched streams FAULT`.**
@@ -405,12 +405,12 @@ values and sequences only, our own code. Design reference only (no license file)
 | `negroniwlan=7..10` | - | 7 WLAN_CFG/MODE, 8 CE + HTC READY, 9 HTC/WMI to READY, 10 vdev + passive scan |
 | `negroniwlan_keep=S` | 0 | keep-alive seconds after the last level (0 = until a chip error) |
 | `negroniwlan_hostcap=android` | off | Android HOST_CAP: DRV bit + WSA gpio entry |
-| `negroniwlan_smmu=3` | 1 | 0324 stage-1 context (writes the apps SMMU; owner approval) |
+| `negroniwlan_smmu=3` | 3 (0325) | 0324 stage-1 context; the default since 0325 (owner-approved 2026-10-27); `=1` / `=0` give the old report-only path |
 
 Boot-args for the combined image (the main session composes them; no image is built by this stage):
 `negroniwifi=10 negroniwlan=10 negronipanic=30 negronipanicreason=2`. Lower `negroniwlan` to stop earlier
 (7 = after WLAN_MODE, 8 = HTC READY, 9 = WMI READY). Optional, each needs a reason from a log first:
-`negroniwlan_hostcap=android` (QMI refusal), `negroniwlan_smmu=3` (DMA above 4 GiB fails; owner approval),
+`negroniwlan_hostcap=android` (QMI refusal), `negroniwlan_smmu=1` (the old path without the SMMU context; 3 is the default since 0325),
 `negroniwlan_keep=600` (stop the poller after 10 minutes). Precondition: the WLAN firmware area on userdata.
 
 Host test: `scripts/wifi/wmi-host-test.sh TREE` (patches/xnu/tests/wlan-wmi-test.c): WLAN_CFG = 493 bytes with
@@ -444,6 +444,129 @@ trailer, WMI TLV walk, beacon parser, then 700 k random and mutated inputs under
    request set (log every request first).
 5. Recovery and power (RDDM restart, radio off, suspend): after scan + connect + IP. Total remaining
    [I, audit section 3]: about 7 000 lines after 0320-0324.
+
+## 0325-negroni-wlan-smmu3-default.patch (2026-10-27)
+
+Files: `bsd/dev/negroni_wlan_smmu.c` (rewritten), `negroni_wlan.c`, `negroni_wlan_mhi.{c,h}`, `negroni_wlan_bhi.c`,
+`negroni_wlan_qmi.c`. Made in `out/kernel/tree-wlansmmu` (patched-tree.sh, full set; deleted after). No later patch
+touches these files. Build-only: not run on the phone. The owner approved the SMMU write path (2026-10-27).
+
+**`negroniwlan_smmu=3` is the default** whenever the driver runs (`negroniwlan>=2`). `negroniwlan_smmu=1` (old
+report-only check, stop on a sure fault) and `=0` (report only) stay selectable. `=2` (bypass entry) stays, but the
+hypervisor turns S2CR BYPASS into FAULT (arm-smmu-qcom.c bypass quirk, U-Boot qcom-hyp-smmu.c), so it is dead.
+
+### What 0325 changes, with the source of each value
+
+| Item | 0324 | 0325 | Source |
+|---|---|---|---|
+| Context bank choice | first CB >= 1 with SCTLR.M 0 and no valid S2CR into it | CB >= 0 with CBAR type S2_TRANS, or S1_TRANS_S2_BYPASS with VMID 0xff, **and** SCTLR.M 0 **and** no valid S2CR translating into it; summary line of all contexts; `negroniwlan_smmu_cb=N` forces N (still needs SCTLR.M 0 and no S2CR) | U-Boot `qcom-hyp-smmu.c` alloc_cb (VMID_UNUSED 0xff); redwood_wifi.c radio_space_find |
+| CBAR | S1_TRANS_S2_BYPASS, BPSHCFG 3, MEMATTR 0xf, VMID 0 | same; read back: type must stay 1 | U-Boot, Linux arm-smmu.c |
+| CBA2R | VA64 | VA64, read back | same |
+| SCTLR | M TRE AFE CFRE ASIDPNE | M TRE AFE **HUPCF** ASIDPNE; **no CFRE** (no abort to the chip), no CFIE, CFCFG 0 (no stall) | live.dts `qcom,iommu-faults = "stall-disable", "HUPCF", "no-CFRE", "non-fatal"` |
+| TCR / TCR2 / MAIR0 | T0SZ 25, WBWA walk, inner shareable, EPD1 / PASIZE 36, AS16, SEP / 0xf404ff44 | same; must-bits read back (T0SZ+TG0, PASIZE, MAIR attr 0) | live.dts `qcom,iommu-pagetable = "coherent"`; Linux io-pgtable |
+| Page entries | NC (AttrIndx 0), outer shareable, AF, AP unprivileged, nG | same (the CPU uses NC views of every DMA buffer) | io-pgtable-arm.c |
+| Stream entry | SMR = 0x1c01 mask 0 | SMR = 0x1c00 **mask 1** (0x1c00 and 0x1c01) unless another valid SMR covers 0x1c00 (then 0x1c01 only); a valid SMR that already matches 0x1c01 is reused only when its mask is at most 1 and its S2CR is fault, bypass, or translate into a context with SCTLR.M 0; otherwise step 6 stops with EBUSY (`... translates through a live context (not ours)`) (main-session review) | live.dts pcie0 `iommu-map` RID 0 -> 0x1c00, RID 0x100 -> 0x1c01; redwood used mask 1 |
+| Write order | S2CR, then SMR | same (Linux arm_smmu_write_sme; U-Boot writes SMR first) | arm-smmu.c |
+| Read back | SMR, S2CR, SCTLR.M, TTBR0 lo | every register; hard stop on TTBR0, CBAR type, CBA2R VA64, SCTLR.M, S2CR type+CBNDX, SMR; other bit differences printed | redwood "all read back but two bits" |
+| Teardown | SMR cleared, SCTLR 0 | SMR/S2CR back to the saved values (order by case), SCTLR 0, TLBI, CBAR/CBA2R back to the saved values; only what was written | - |
+| Faults | FSR/FAR/FSYNR0/sGFSR on failure | one decoded line: FSR bit names, FAR 64-bit, FSYNR0 read/write + level + table-walk, FSYNR1, CBFRSYNRA SID, sGFSR names, sGFSYNR0/1(SID)/2; on the failure path, after **each level** (also "no fault"), at every 1 s BHI/BHIe heartbeat and in the 60 s keep-alive line when FSR or sGFSR changed (max 16 lines) | SMMUv2 spec, Linux arm-smmu.h |
+| Page tables | 192 4-KiB tables | same; enough for the whole window: 0xa0000000-0xafffffff sits in one level-1 entry = 1 root + 1 level-2 + 128 level-3 tables (130) | - |
+| Unmap | none | `negroni_wlan_smmu_unmap` (PTE cleared + TLBI); QMI firmware segments are unmapped before they are freed (the 0-segment retry frees them while the chip runs) | - |
+
+Chain changes (`negroni_wlan.c`, `_mhi.c`, `_bhi.c`, `_qmi.c`):
+- **PCIe BDF-to-SID table** [V source, I effect]: pci-msm.c `msm_pcie_config_sid` runs on every link enable: PARF
+  0x2c00 bit 0 (BYPASS) cleared, the 256 hash entries at PARF 0x2000 zeroed, then BDF 0x0100 -> SID offset 1 at
+  hash crc8(0x01 0x00, poly 0x07, MSB first) = 0x15, value 0x01000100. Our survey pulses the PCIe core reset (step 7),
+  so the table is at its reset state when the driver runs. Without it the chip's DMA may carry SID 0x1c00, not 0x1c01
+  [I: the reset value of the bypass bit and the SID in bypass are not documented here]. 0325 prints CFG + the entry in
+  every policy and programs it with policy 3. This also means the 0263 policy-1 check looked at a SID the chip may not
+  use.
+- ASPM: L0s/L1 control cleared on the endpoint (PCIe capability from the list) and on the root port (DBI 0x80) after
+  the BAR0 claim, with one log line (ath11k pci.c `ath11k_pci_aspm_disable`, "problems switching to AMSS state").
+- MHI CTRLBASE/DATABASE..LIMIT = the IOVA window 0xa0000000-0xafffffff when the context is on (cnss2 pci.c:5505-5507);
+  0 .. 2^36-1 otherwise (old).
+- `negroni_wlan_dma_map` with policy 3 never returns a physical address: no context = `WLAN_DMA_NONE` = the step stops.
+
+Chain review against Linux MHI / ath11k (no change needed) [V code read]: BHI (STATUS 0, IMGADDR high/low, IMGSIZE,
+IMGTXDB seq 29:0, status 31:30 = 2/3) = boot.c mhi_fw_load_bhi; BHIe (TXVECADDR 0x2c/0x30, SIZE 0x34, DB 0x3c, STATUS
+0x44, vector of {u64 addr, u64 size} over the whole image) = mhi_fw_load_bhie / mhi_firmware_copy; READY -> init_mmio
+(CCABAP/ECABAP/CRCBAP, NER 2 NHWER 0, wake db 0, window) -> event-ring doorbells -> M0 -> wake = pm.c order; EE SBL ->
+BHIe -> EE AMSS = pm.c:767-781; every ring/context/TRE/vector/m3/segment/CE address goes through negroni_wlan_dma_map
+(the pool IOVA is the base of every MHI address; event-ring pointers from the chip are compared in IOVA space); QMI
+m3_info and RESPOND_MEM carry IOVAs; WMI INIT sends no host memory chunks (ath11k never sets num_mem_chunks,
+wmi.c:4487). Every wait is bounded (negroniwlan_to, or MAX(to, 10 s)) and prints its state on time-out; the failure
+path prints the SMMU line before the quiesce.
+
+Not changed, open [I]: interrupts stay polled (no ITS); no SoC global reset before MHI (ath11k sw_reset); the camera
+code (0312, `negronicam_smmu=2` only) also takes the first free SMR without a shared lock: do not combine
+`negronicam_smmu=2` with a Wi-Fi boot.
+
+### Test boot (the main session builds the image)
+
+Boot-args: `negroniwifi=10 negroniwlan=10 negronipanic=30 negronipanicreason=2` (`negroniwlan_smmu=3` is the default;
+write it out if the image should say so). Precondition: the WLAN firmware area on userdata. Lower `negroniwlan` to stop
+earlier (4 = mission mode, 6 = FW_INIT_DONE). Fallback args if step 6 refuses: `negroniwlan_smmu_cb=N` (a context from
+the summary line), or `negroniwlan_smmu=1` (old path).
+
+Expected proof lines in order (all start `NEGRONI WLAN:`; IOVAs assume the pool is the first mapping):
+1. `start: levels 2..10, time-out 10000 ms per wait, SMMU policy 3`
+2. `step 2 BAR0 claim`, `BAR0 64-bit 0x200000 bytes at 0x60400000, MHI REGLEN ..`, `ASPM: endpoint LNKCTL .. -> ASPM 0, root port LNKCTL .. -> ASPM 0 ..`
+3. `SoC version .. -> firmware amss20.bin|amss.bin`, `DMA pool 6885376 bytes at 0x8........`, `amss*.bin .. sha-256 OK`, `m3.bin .. sha-256 OK`
+4. `step 6 DMA path (clocks, apps SMMU)`, `GCC ... vote 0x62000 = ..`,
+   `PCIe BDF-to-SID: CFG .. (BYPASS b), entry 0x15 = ..`, `PCIe BDF-to-SID programmed: CFG .., entry 0x15 = 0x1000100 (BDF 0x100 -> SID 0x1c00 + 1)`
+5. `SMMU S1 setup: sCR0 .., IDR0 .. IDR1 ..: 113 SMRs, 78 contexts, .. pages of 0x1000; sGFSR ..`
+6. `SMMU SMRk free (was .., S2CR ..): will match 0x1c00-0x1c01 (mask 1)` (or `SMRk .. already matches 0x1c01 .. reused`)
+7. `SMMU contexts: a S2_TRANS, b S1_TRANS_S2_BYPASS with VMID 0xff, c other (in use), d with SCTLR.M on, e targeted by an S2CR`
+8. `SMMU context N free: CBAR .. (type t, VMID v) CBA2R .., FSR ..`
+9. optional `SMMU NAME reads X after writing Y (bits .. not kept; not needed)`
+10. `SMMU SMRk = 0x80011c00, S2CRk = 0xN, CBN CBAR 0x1f300 CBA2R 0x1 SCTLR 0x1107 TCR 0x803519 TCR2 0x38011 TTBR0 0xN0000........ MAIR0 0xf404ff44 FSR 0 (root ..)`
+11. `stream 0x1c01 translates through context N; IOVA window 0xa0000000-0xafffffff (Android's)`
+12. `SMMU map 0x8........ (0x691000 bytes) -> IOVA 0xa0000000`
+13. `step 7 PBL check`, `BHI off .., execution environment 0, ..`; `step 8 BHI SBL download`, `BHI SBL 524288 bytes at 0xa0010000, session ..`
+14. `level 2 done (step 8)`, `SMMU report (no context fault): context N FSR 0 (none) ... sGFSR ..`
+15. `MHISTATUS READY ..`, `MHI ctx ch 0xa0000000 ev 0xa0001800 cmd 0xa0001900, chdboff .. erdboff .., window 0xa0000000-0xafffffff`, `MHI state M0, device wake asserted`, `execution environment SBL ..`, `level 3 done`, SMMU line
+16. `BHIe image 11 (or 12) segments (.. byte vector) at 0xa0690000, seq ..`, `execution environment AMSS (mission) ..`, `SMMU map .. (0x90000 bytes) -> IOVA 0xa06a0000`, `channel 20 started`, `channel 21 started`, `channel 21: 16 RX buffers of 32768 bytes at 0xa06a0000`, `stage 1 complete ..`, `level 4 done`, SMMU line
+17. levels 5-10 as in 0265-0323 (`QRTR HELLO`, `WLFW instance ..`, `segment i type T: .. bytes at 0x8.. (device 0xa.......)`, `firmware version ..`, `FW_INIT_DONE_IND`, `CE area .. (device 0xa.......)`, `HTC READY ..`, `WMI READY ..`, `BSS N: SSID ..`), one SMMU line after each level.
+
+What to read when a step fails:
+- `SMMU CBAR|CBA2R|CB TCR|CB TTBR0 ..|CB SCTLR reads X after writing Y (the hypervisor refused it?)`: the hypervisor
+  does not give us that context bank. Boot again with `negroniwlan_smmu_cb=M` for another free number from the
+  summary line (line 7 counts), or `negroniwlan_smmu=1`.
+- `S2CR|SMR reads X ..`: the hypervisor refuses the stream entry for this SID (it may keep 0x1c0x for itself); read
+  the `SMMU SMRk ..` lines of step 6.
+- `no free SMMU context bank (U-Boot rule ..)`: every context is in use or has another type; the summary says which.
+- BHI SBL / BHIe time-out with heartbeat lines and an `SMMU BHI SBL: context N FSR 0x2 (TF translation) FAR 0x...`:
+  the chip read an IOVA we did not map; compare FAR with the `SMMU map` lines (pool 0xa0000000-0xa0690fff). FSYNR0
+  says read/write, level and table walk (a walk fault = the root/table pages are not visible to the SMMU).
+- `sGFSR .. (USF unidentified stream) .. sGFSYNR1 .. (SID 0x....)`: the chip uses a SID our SMR does not match
+  (BDF-to-SID line: did it take?).
+- Time-out and FSR 0 and no new sGFSR: the SMMU is not the cause; read the BHI status/errcode (chip side) as before.
+- `PCIe BDF-to-SID .. DID NOT TAKE`: the mask-1 SMR still matches 0x1c00; go on and watch for USF.
+
+### Next level design: scan results -> WPA2 station -> IP (0326+)
+
+Shortest path to an associated link and an IP [I, from ath11k mac.c/wmi.c/dp*.c and the two reference ports]:
+1. **Join, open first**: VDEV_START on the BSS channel (WMI 0x5003 path of ath11k wmi.c vdev_start), PEER_CREATE (AP
+   MAC), AUTH (open) + ASSOC REQ built by us and sent with WMI_MGMT_TX_SEND (wmi.c mgmt_send), the AP's frames come in
+   MGMT_RX (0323 already parses them), PEER_ASSOC (rates/HT/VHT caps from the beacon), VDEV_UP (AID, BSSID). Proof
+   line: `JOIN: associated to "ssid" AID n`. ~700 lines; can be tested against an open AP without any data path.
+2. **HTT data path (mandatory before WPA2)**: EAPOL frames are data frames, and ath11k only sends/receives data
+   through HTT/DP rings: HTT version request, the SRNG setup for REO destination, rxdma refill, TCL data, WBM release
+   (the ring IDs are already in the 0320 shadow list), RX descriptor parse (WCN6855 layout), TX by TCL. Every ring
+   address through `negroni_wlan_dma_map` (IOVA). ~2000 lines (the largest block).
+3. **WPA2-PSK 4-way handshake in the kernel**: port `external/hackios-xnu-kernel/wifi/lx/src/lx_wpa.{c,h}` (MIT,
+   523 + 49 lines, own SHA-1/HMAC/PBKDF2/PRF/AES unwrap, host-tested against the standard vectors). It needs only
+   PMK(passphrase, SSID), the two MACs, the RSN IE of our ASSOC REQ and the EAPOL frames; it returns the TK and the
+   GTK. Then WMI_VDEV_INSTALL_KEY pairwise (CCMP) and group. This is shorter than a userland supplicant: iOS has no
+   wpa_supplicant, and a userland one would need the en0/BPF path first. The first test takes SSID + passphrase from
+   boot-args (`negroniwlan_ssid=`, `negroniwlan_psk=`; never logged).
+4. **IP**: an `en0` IOEthernetController that passes 802.3 frames to/from the DP path (802.11 <-> 802.3 by the
+   firmware's native-Wi-Fi/ethernet decap mode); configd/ipconfig then run DHCP. Before Settings works, a static test
+   is `ifconfig en0` + `ipconfig set en0 DHCP` over SSH.
+5. **Apple80211 glue (later)**: wifid/Settings need `SIOCGA80211`/`SIOCSA80211` on en0 + kernel events class 6 (scan,
+   associate, RSSI, state), the ADT `mac-address-wifi0` = the WMI READY MAC; reference external/ios-sailfish
+   0174-0179 and external/ios-spes 0113 (design only). docs/references-2026-10-27.md does not exist yet; read it
+   when it appears before this step.
 
 ## 0261-negroni-wlan-mhi-fw.patch
 
@@ -557,3 +680,133 @@ Never commit the firmware files or the area image.
 - iOS interface reference: `external/ios-sailfish/xnu/patches/0174`, `0175`, `0178`, `0179`
   (no license file: design only).
 - Step 10 is new code; it uses only PCI-spec offsets.
+
+## 0340-0341: iOS side (Settings, wifid, en0, Apple80211) (2026-10-27)
+
+Files: `bsd/dev/negroni_wlan_ios.{c,h}`, `iokit/Kernel/arm/NegroniWLAN.cpp` (0340), `bsd/dev/negroni_apple80211.c`
+(0341); hook: one call in `negroni_wifi_init()`; conf lines at the end of `bsd/conf/files` and `iokit/conf/files.arm64`.
+0340 alone does not link: apply both. Build-only: not run on the phone.
+
+### Why Settings greys out Wi-Fi (only Control Center "turns it on")
+
+- [V root `System/Library/xpc/launchd.plist` + `LaunchDaemons/com.apple.wifid.plist`] the wifid job has
+  `_LimitLoadToDeviceTree = ("wlan", "marconi-wifi")`.
+- [V `sbin/launchd` 20H392 disasm 0x10003d1f0] launchd checks the key with `host_get_special_port(IO main port)` and
+  MIG id 2887 = `io_device_tree_entry_exists_with_name` (device.defs), which is
+  `IODTFindMatchingEntries(root, kIODTRecursive, name)` (IOUserClient.cpp): an entry of that name anywhere in the
+  IODeviceTree plane.
+- [V ADT] `out/ios16/negroni.adt` has no `wlan` and no `marconi-wifi` node. So launchd never loads wifid.
+- [V phone logs `logs/phone-log-20261027-004129.txt`] `mDNSResponder (MobileWiFi) bootstrap_look_up of WiFiManager
+  server failed` (122x), `rapportd SysMon: ### WiFiManagerClientCopyDevices failed: NULL` (324x); no wifid process line.
+- [I] Settings shows the Wi-Fi switch disabled when WiFiManager has no device; Control Center only flips its own
+  state (no wifid answers), so it seems to "turn on" but nothing happens.
+- HakiOS met the same gate: `userland/mkjobs.py:271-273` deletes `_LimitLoadToDeviceTree` from the jobs it writes.
+  We make the entry in the kernel instead (no root change).
+
+### What iOS matches [V strings of the 20H392 cache / root]
+
+- IO80211.framework: `IO80211Controller` ("No Matches for IO80211Controller, trying dk matching"), `IOPropertyMatch`
+  `IO80211InterfaceRole` = `Infrastructure`, `IOInterfaceName`; `IOServiceOpen failed` -> `Falling back to IOCTL path`;
+  interfaces are skipped unless `SIOCGIFMEDIA` works.
+- wifid: `IO80211InterfaceRole`, `IOInterfaceName(Prefix)`, `IOPropertyMatch`, `Apple80211Open failed`, `service for
+  Class "wlan" NOT found` / `com.apple.wlan.init_failure` (log only [I]); registers `com.apple.wifi.manager`.
+- XNU [V bsd/net/if.c:3548-3564]: an unknown interface ioctl goes to `pru_control`, then on EOPNOTSUPP to
+  `ifnet_ioctl` -> the driver's `if_ioctl`. So SIOCGA80211/SIOCSA80211 reach en0 without any user client.
+- MobileGestalt: the Wi-Fi row exists already (D22 identity, `mac-address-wifi0` in `/chosen`); no change.
+
+### What 0340/0341 do (port of HakiOS `hakios.wlan.cpp`, `hakios.net.c`, `hakios.sta.c`, `hakios.apple80211.c`, APSL 2.0)
+
+1. Boot, from `negroni_wifi_init()` (UFS init, before launchd): an IODeviceTree entry `wlan` under `/arm-io`
+   (name/compatible `wlan-pcie,negroni`/device_type), only if no entry has that name. launchd then starts wifid.
+2. Thread `negroni-wlan-ios`: waits for `lo0`, then (negroniwlan_ios=1) for `negroni_wlan_api_ready()` (state IDLE,
+   up to `negroniwlan_ios_wait` s, default 600; it gives up on FAILED), checks `NWLAN_API_VERSION` 1, takes the MAC
+   from `negroni_wlan_link()` (WMI READY; fallback ADT `mac-address-wifi0`), attaches **en0** (IFNET_INIT_LEGACY |
+   NX_NOAUTO, Ethernet, subfamily Wi-Fi, IFT_ETHER, bpf), registers the seam callbacks, publishes
+   `NegroniWLANController` (class `IO80211Controller`, `IOMACAddress`, `IOBuiltin`) and below it `NegroniWLAN` (class
+   `IONetworkInterface`: `IOInterfaceName`/`BSD Name` en0, prefix, type 6, unit 0, `IOBuiltin`, `IOPrimaryInterface`,
+   `IO80211InterfaceRole` Infrastructure, `newUserClient` -> unsupported).
+3. en0 ioctls: SIOCGIFMEDIA = IEEE80211|AUTO, ACTIVE while the link is up; MTU, flags; everything else -> Apple80211.
+4. Apple80211 (0341): gets 1 SSID, 2 AUTH_TYPE, 4 CHANNEL, 9 BSSID, 11 SCAN_RESULT (one BSS per call, EIO at the end;
+   elements = SSID + the seam's RSN/WPA/HT/VHT/rates), 12 CARD_CAPABILITIES, 13 STATE, 15 OP_MODE, 16 RSSI, 19 POWER,
+   21 ASSOCIATE_RESULT, 27/254 channels, 207 CHANNELS_INFO, 43/44 names, 103 CURRENT_NETWORK; sets 10 SCAN, 19 POWER,
+   20 ASSOCIATE (passphrase cipher 10, or PMK cipher 6 -> 64 hex digits), 22 DISASSOCIATE. Layouts from HakiOS (16.5
+   20F66, static asserts kept) [I: same in 16.7].
+5. Events: class 6 (KEV_IEEE80211_CLASS) subclass 1, data = "en0" in 16 bytes: 1 POWER_CHANGED, 2/3 SSID/BSSID
+   changed, 4 LINK_CHANGED (+32 bytes), 9 ASSOC_DONE (result 1 ok, 21 wrong key, 9 time-out, 2 other), 10 SCAN_DONE.
+   en0: KEV_DL_LINK_ON/OFF (configd starts DHCP on ON).
+6. Soft radio switch (the seam has no power call): POWER off = disassociate, link down, scans/joins -> ENETDOWN; on =
+   allowed again. Control Center and Settings both send set 19, so both now go through the same path.
+7. Refusals become events: a scan the driver refuses (EBUSY while joining) still ends in SCAN_DONE with the last list;
+   a join the driver refuses (ENOTSUP before 0327-0329, EBUSY, EINVAL) ends in ASSOC_DONE result 2, so Settings says
+   "Unable to join" and does not hang. Link down with 802.11 code 15/23 (or 2 while joining) = wrong key (21).
+8. Review fixes (Opus review 2026-10-27, F1 F3-F6):
+   - F1/F3: each join has a sequence number under the lock (set on the ioctl thread, ended on the worker). One
+     `reconcile()` per 100 ms tick decides from `negroni_wlan_link().state`, not from the order of the event bits.
+     Success = CONNECTED to the asked SSID; failure = refusal, leave, radio off, driver FAILED/OFF, idle after a
+     LINK_DOWN with an error, or **40 s time-out** (ETIMEDOUT -> result 9, and the driver is told to disassociate).
+     A network switch (LINK_DOWN old + LINK_UP new in one mask) ends with en0 up on the new BSS (down + up, so configd
+     runs DHCP again) and the new join reported once.
+   - en0 is up exactly while the radio is on and the driver is CONNECTED; NWLAN_EV_STATE is handled, so CONNECTED ->
+     FAILED/OFF takes en0 down without a LINK_DOWN.
+   - F4: no SSID in the log (length only).
+   - F5: root only (`kauth_cred_issuser`) for every set and for gets 1 SSID, 9 BSSID, 11 SCAN_RESULT,
+     103 CURRENT_NETWORK; EPERM otherwise. [V] wifid runs as root (no `UserName` in its job, launchd cache 20H392).
+   - F6: RX uses one mbuf with a 2 KiB cluster (mbuf_gethdr + mbuf_mclget + memcpy + setlen), as ue0 does
+     (negroni_usb.c: `mbuf_allocpacket` + header strip panicked "Failed mbuf validity check: len -14").
+
+### The seam used (0326 `negroni_wlan_api.h`, version 1)
+
+`negroni_wlan_api_version/caps/ready`, `negroni_wlan_register` (rx: 802.3 frame; event: SCAN_DONE, LINK_UP,
+LINK_DOWN; callbacks only set bits + wake our thread, RX goes straight to `ifnet_input`), `negroni_wlan_link`,
+`negroni_wlan_scan` + `negroni_wlan_scan_results`, `negroni_wlan_associate(ssid, psk|NULL)`,
+`negroni_wlan_disassociate`, `negroni_wlan_tx`. Missing in the seam (wanted later): power on/off, a regulatory
+channel list (we send a world-safe list: 2.4 GHz 1-13, 5 GHz 36-165, 52-144 DFS/passive), noise, TX rate.
+
+### Boot-args
+
+| Arg | Default | Meaning |
+|---|---|---|
+| `negroniwlan_ios` | 1 | 0 off; 1 on when `negroniwlan` >= 10 (en0 when the driver is IDLE); 2 fake radio: no chip, en0 at once, networks `NEGRONI-FAKE-WPA2` (passphrase `negronifake`), `NEGRONI-FAKE-OPEN`, `NEGRONI-FAKE-5G`; joins without data |
+| `negroniwlan_ios_log` | 400 | Apple80211 request lines |
+| `negroniwlan_ios_wait` | 600 | seconds to wait for the driver API |
+
+Test 1 (UI only, no chip risk): add `negroniwlan_ios=2` (keep or drop `negroniwifi`/`negroniwlan`).
+Test 2 (real): `scripts/ios16/variants/everything.args` as it is (`negroniwifi=10 negroniwlan=10`; `negroniwlan_ios=1`
+is the default).
+
+### Expected kernel lines (all `NEGRONI WLAN iOS:`)
+
+1. `driver backend; IODeviceTree "wlan" made (launchd starts wifid)` (fake: `fake backend; ...`)
+2. real: `waiting up to 600 s for the driver API (state IDLE)`; on a driver failure: `no en0: the driver API is not
+   ready (state 7, error N); wifid runs without an interface`
+3. `en0 attached (driver backend, caps 0x1, MAC xx:xx:xx:..), link down; Apple80211 ioctls on`,
+   `IO80211Controller + IONetworkInterface (en0, IO80211InterfaceRole Infrastructure) registered`,
+   `Apple80211 event: power, 1`
+4. `user client type N asked of en0's service: none (ioctl path)` (proof that wifid/IO80211.framework found the service)
+5. `wifid gets 19 (POWER) ...: answered`, `wifid gets 12 (CARD_CAPABILITIES) ...`, `wifid sets 10 (SCAN_REQ) ... (a
+   scan: ...): answered`, `scan done, N networks for wifid`, `Apple80211 event: scan done, 0`, `wifid gets 11
+   (SCAN_RESULT) ...` N times then `error EIO (end of list)`
+6. a join: `wifid sets 20 (ASSOCIATE) ... (a join: a name of N bytes, any access point, ..., a key of M bytes of kind 10)`;
+   with 0326 only: `join K refused by the driver (error 45, caps 0x1)`, `Apple80211 event: join done, 45`; with the real
+   join: `connected: a network name of N bytes, F MHz, RSSI R`, `en0 link UP (KEV_DL_LINK_ON: configd starts DHCP)`,
+   `Apple80211 event: join done, 0`; a join with no answer: after 40 s `join K failed: error 60, ...` (ETIMEDOUT)
+7. 180 s after en0: `Apple80211 summary: K request kinds` + one line per type (which requests wifid needs and which
+   we refuse: the next work list).
+
+What the owner should see: Settings > Wi-Fi switch no longer greyed; on: "Searching", then the networks the driver
+heard (fake: the 3 NEGRONI-FAKE names) with lock icons for WPA2; off/on from Settings and Control Center both work.
+Joining a real network: "Unable to join" until the driver's join/data/WPA2 (0327-0329) set the caps bits; then the
+tick, DHCP on en0, and the status-bar Wi-Fi icon. Fake joins tick the network but carry no data (no IP).
+
+### Open [I]
+
+- The Apple80211 layouts are HakiOS's 16.5 reading; 16.7 may differ in a type wifid needs (the per-type summary shows
+  refusals and errors).
+- wifid may want more types than HakiOS answers (e.g. 8 RATE, 17 NOISE, 51 COUNTRY_CODE, 54 RADIO_INFO): read the
+  summary, add them.
+- en0 MAC (chip) and `/chosen mac-address-wifi0` (02:00:5e:77:ee:10) differ: MobileGestalt shows the ADT one.
+- The class names `IONetworkInterface` and `IO80211Controller` are the real families' names on purpose (iOS matches
+  them). They collide if IONetworkingFamily or IO80211Family is ever staged into this kernel (Sailfish 0175 style):
+  then drop these two classes and subclass the real ones.
+- Context: 0340/0341 append to the end of `bsd/conf/files`; the `negroni_wifi.c` hunk sits at the top of
+  `negroni_wifi_init()`.

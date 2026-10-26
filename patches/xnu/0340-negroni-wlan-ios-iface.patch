@@ -1,0 +1,1343 @@
+0340-negroni-wlan-ios-iface: Wi-Fi, iOS side part 1: the IODeviceTree "wlan" entry (wifid's launchd job needs it:
+_LimitLoadToDeviceTree "wlan"; without it wifid never runs and Settings greys out Wi-Fi), en0 (BSD interface KPI,
+Ethernet, subfamily Wi-Fi, MAC of WMI READY), the property-only IO80211Controller + IONetworkInterface services
+(IO80211InterfaceRole "Infrastructure", IOInterfaceName en0, no user client -> IO80211.framework ioctl path), the
+worker thread between the driver seam (0326 negroni_wlan_api.h) and Apple80211 (0341), link state +
+KEV_DL_LINK_ON/OFF (en0 up exactly while CONNECTED; FAILED/OFF take it down), joins with a sequence number
+and a 40 s time-out, RX in one 2 KiB cluster mbuf (ue0 pattern), a soft radio switch, and a fake radio (negroniwlan_ios=2) for UI tests without the chip.
+Needs 0341 (negroni_apple80211.c) to link. Derived from HakiOS hakios.wlan.cpp / hakios.net.c / hakios.sta.c
+(APSL 2.0, notices kept). Details: patches/xnu/README-wifi.md "0340-0341".
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 0dbe776..9cbd27a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -683,3 +683,4 @@ bsd/skywalk/packet/packet_kern.c		optional skywalk
+ bsd/skywalk/packet/pbufpool.c			optional skywalk
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
++bsd/dev/negroni_wlan_ios.c		standard
+diff --git a/bsd/dev/negroni_wifi.c b/bsd/dev/negroni_wifi.c
+index 1a27c79..7223ea5 100644
+--- a/bsd/dev/negroni_wifi.c
++++ b/bsd/dev/negroni_wifi.c
+@@ -709,6 +709,8 @@ negroni_wifi_pcie_handles(struct negroni_wlan_pcie *out)
+ 	return true;
+ }
+ 
++void negroni_wlan_ios_init(void);        /* 0340: bsd/dev/negroni_wlan_ios.c */
++
+ void
+ negroni_wifi_init(void)
+ {
+@@ -718,6 +720,7 @@ negroni_wifi_init(void)
+ 
+ 	(void)PE_parse_boot_argn("negroniwifi", &last, sizeof(last));
+ 	(void)PE_parse_boot_argn("negroniwlan", &wlan, sizeof(wlan));
++	negroni_wlan_ios_init();        /* 0340: IODeviceTree "wlan" (wifid) now; en0 + Apple80211 when the driver is ready */
+ 	if (wlan) {
+ 		last = (uint32_t)(sizeof(steps) / sizeof(steps[0]));   /* opt-in: power, link, ID, step 10 */
+ 	}
+diff --git a/bsd/dev/negroni_wlan_ios.c b/bsd/dev/negroni_wlan_ios.c
+new file mode 100644
+index 0000000..a4ff1d6
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_ios.c
+@@ -0,0 +1,953 @@
++/*
++ * Copyright (c) 2026 iOSPlus10. Parts derived from HakiOS (oosexgang/hackios-xnu-kernel, xnu/files,
++ * Apple Public Source License 2.0): bsd/dev/hakios.net.c (en0 by the interface KPI, media, link events),
++ * bsd/dev/hakios.sta.c (one thread does the requests, the caller hears the outcome as an event).
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed software or any other software. Please obtain a
++ * copy of the License at http://www.opensource.apple.com/apsl/ and read it
++ * before using this file.
++ *
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ */
++/*
++ * NEGRONI Wi-Fi, iOS side (patch 0340): en0 and the worker between iOS and the driver seam.
++ *
++ * Why Settings shows Wi-Fi greyed out without this (2026-10-27, [V]): the launchd job com.apple.wifid has
++ * _LimitLoadToDeviceTree = ("wlan", "marconi-wifi"); launchd 20H392 asks the kernel with the MIG call
++ * io_device_tree_entry_exists_with_name (id 2887), which is IODTFindMatchingEntries(root, recursive, name). Our
++ * ADT has no such node, so wifid never runs, nobody serves com.apple.wifi.manager, and every WiFiManager client
++ * fails ("bootstrap_look_up of WiFiManager server failed", "WiFiManagerClientCopyDevices failed: NULL").
++ *
++ * What this file does:
++ *   1. at boot, before launchd: an IODeviceTree entry named "wlan" (NegroniWLAN.cpp), so wifid is started;
++ *   2. when the driver API is ready (negroniwlan=10, state IDLE): en0, an Ethernet interface of subfamily Wi-Fi
++ *      with the chip's MAC, on the BSD interface KPI like ue0 (slop 0075) and HakiOS hakios.net.c;
++ *   3. the registry services wifid and configd match (NegroniWLAN.cpp: IO80211Controller + IONetworkInterface
++ *      with IO80211InterfaceRole "Infrastructure" and IOInterfaceName en0, no user client, so IO80211.framework
++ *      takes the ioctl path);
++ *   4. unknown en0 ioctls go to negroni_apple80211.c (SIOCGA80211 / SIOCSA80211);
++ *   5. one worker thread turns driver events (scan done, link up/down) into Apple80211 events, en0 link state
++ *      and KEV_DL_LINK_ON/OFF (configd starts DHCP on LINK_ON).
++ * A join ends exactly once (sequence number, decided from the driver state, 40 s time-out -> ETIMEDOUT); en0 is up
++ * exactly while the radio is on and the driver is CONNECTED (FAILED / OFF take it down; a new BSS = down + up).
++ * The radio switch (Apple80211 POWER) is a soft switch here: the seam has no power call; off = leave the network,
++ * refuse scans and joins.
++ *
++ * Boot-args: negroniwlan_ios=0|1|2 (see negroni_wlan_ios.h), negroniwlan_ios_log=N (Apple80211 request lines,
++ * default 400), negroniwlan_ios_wait=S (seconds to wait for the driver API, default 600).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/sockio.h>
++#include <sys/kern_event.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/if_media.h>
++#include <net/bpf.h>
++#include <net/dlil.h>
++#include "negroni_wlan_ios.h"
++
++#define NWIOS_FRAME_MAX         1514
++
++extern void thread_set_thread_name(thread_t thread, const char *name);
++
++enum {
++	P_SCAN_DONE     = 1u << 0,      /* the driver (or the fake radio) ended a scan */
++	P_LINK_UP       = 1u << 1,
++	P_LINK_DOWN     = 1u << 2,
++	P_JOIN_FAIL     = 1u << 3,      /* a join refused at once (join_sync_error) */
++	P_SCAN_SYNTH    = 1u << 4,      /* a scan refused at once (EBUSY): answer with the list we have */
++	P_POWER         = 1u << 5,      /* the soft switch changed */
++	P_STATE         = 1u << 6,      /* the driver state changed (FAILED / OFF take en0 down) */
++};
++
++#define JOIN_TIMEOUT_MS         40000   /* wifid never waits longer than this for ASSOC_DONE */
++
++static struct {
++	uint32_t mode;                  /* 1 driver, 2 fake */
++	uint32_t log_max;
++	lck_grp_t *grp;
++	lck_mtx_t *lock;                /* cache, flags below */
++	lck_mtx_t *tx_lock;
++	ifnet_t ifp;
++	bool present;                   /* en0 attached, backend answers */
++	bool powered;
++	bool up;                        /* en0 link up (associated, keys set); worker thread only */
++	uint8_t up_bssid[6];            /* the BSS en0 is up on (a change = another network: DHCP again) */
++	bool scanning;
++	/* the join wifid waits for, under `lock` (set on the ioctl thread, ended on the worker thread) */
++	uint32_t join_seq;              /* last join asked for */
++	uint32_t join_pending;          /* the seq that still needs ASSOC_DONE; 0: none */
++	uint64_t join_deadline;         /* ms */
++	uint8_t join_ssid[NWLAN_SSID_MAX], join_ssid_len;
++	int join_sync_error;            /* a refusal at request time for join_pending (0: none) */
++	bool join_down_seen;            /* a LINK_DOWN came after the request */
++	bool leave_asked;               /* the link was left on request (disassociate / power off) */
++	uint8_t mac[6];
++	uint32_t pending;               /* P_* (atomic) */
++	struct nwlan_bss *cache;        /* the list of the last finished scan */
++	uint32_t cache_count;
++	struct nwlan_bss *tmp;
++	uint8_t txbuf[NWIOS_FRAME_MAX];
++	uint64_t tx, tx_bytes, rx, rx_bytes, tx_drop, rx_drop;
++	unsigned ioctls_said;
++} wi;
++
++/* ---- small helpers ---------------------------------------------------------------------------------- */
++
++static uint64_t
++nwios_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static void
++nwios_kick(uint32_t bits)
++{
++	__atomic_fetch_or(&wi.pending, bits, __ATOMIC_SEQ_CST);
++	thread_wakeup((event_t)&wi.pending);
++}
++
++/* ---- the fake radio (negroniwlan_ios=2): Settings and wifid can be tested without the chip ------------ */
++
++#define FAKE_PASSPHRASE         "negronifake"
++#define FAKE_NETS               3
++
++static struct {
++	struct nwlan_bss bss[FAKE_NETS];
++	struct nwlan_link link;
++	uint64_t scan_due, join_due;    /* ms; 0: nothing scheduled */
++	int join_index;                 /* -1: unknown name */
++	bool join_ok;
++} fk;
++
++static void
++fake_bss(struct nwlan_bss *b, const char *ssid, uint8_t last, int8_t rssi, uint8_t channel, bool wpa2)
++{
++	/* rates (1), RSN (48) WPA2-PSK CCMP, as an AP sends them */
++	static const uint8_t rates[] = { 1, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
++	static const uint8_t rsn[] = { 48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0,
++		                       0x00, 0x0f, 0xac, 2, 0x0c, 0 };
++
++	bzero(b, sizeof(*b));
++	b->bssid[0] = 0x02;
++	b->bssid[1] = 0x4e;
++	b->bssid[2] = 0x47;
++	b->bssid[5] = last;
++	b->ssid_len = (uint8_t)strlen(ssid);
++	memcpy(b->ssid, ssid, b->ssid_len);
++	b->rssi = rssi;
++	b->channel = channel;
++	b->freq = (uint16_t)(channel <= 14 ? 2407 + 5 * channel : 5000 + 5 * channel);
++	b->beacon_int = 100;
++	b->capab = (uint16_t)(0x0001 | 0x0400 | (wpa2 ? 0x0010 : 0));  /* ESS, short slot, privacy */
++	b->security = wpa2 ? NWLAN_SEC_WPA2_PSK : NWLAN_SEC_OPEN;
++	memcpy(b->ie, rates, sizeof(rates));
++	b->ie_len = sizeof(rates);
++	if (wpa2) {
++		memcpy(b->ie + b->ie_len, rsn, sizeof(rsn));
++		b->ie_len += sizeof(rsn);
++	}
++}
++
++static void
++fake_init(void)
++{
++	fake_bss(&fk.bss[0], "NEGRONI-FAKE-WPA2", 1, -48, 6, true);
++	fake_bss(&fk.bss[1], "NEGRONI-FAKE-OPEN", 2, -61, 11, false);
++	fake_bss(&fk.bss[2], "NEGRONI-FAKE-5G", 3, -70, 36, true);
++	fk.link.state = NWLAN_STATE_IDLE;
++	memcpy(fk.link.mac, wi.mac, 6);
++}
++
++/* worker thread: fire what is due */
++static void
++fake_tick(void)
++{
++	uint64_t now = nwios_ms();
++	uint32_t kick = 0;
++
++	lck_mtx_lock(wi.lock);
++	if (fk.scan_due != 0 && now >= fk.scan_due) {
++		fk.scan_due = 0;
++		kick |= P_SCAN_DONE;
++	}
++	if (fk.join_due != 0 && now >= fk.join_due) {
++		fk.join_due = 0;
++		if (fk.join_ok) {
++			const struct nwlan_bss *b = &fk.bss[fk.join_index];
++
++			fk.link.state = NWLAN_STATE_CONNECTED;
++			memcpy(fk.link.bssid, b->bssid, 6);
++			fk.link.ssid_len = b->ssid_len;
++			memcpy(fk.link.ssid, b->ssid, b->ssid_len);
++			fk.link.rssi = b->rssi;
++			fk.link.freq = b->freq;
++			fk.link.aid = 1;
++			fk.link.security = b->security;
++			fk.link.last_error = 0;
++			fk.link.reason = 0;
++			kick |= P_LINK_UP;
++		} else {
++			fk.link.state = NWLAN_STATE_IDLE;
++			fk.link.last_error = fk.join_index < 0 ? ENOENT : EAUTH;
++			fk.link.reason = fk.join_index < 0 ? 0 : 15;    /* 4-way handshake time-out */
++			kick |= P_LINK_DOWN;
++		}
++	}
++	lck_mtx_unlock(wi.lock);
++	if (kick != 0) {
++		nwios_kick(kick);
++	}
++}
++
++/* ---- the backend: the driver seam or the fake radio ------------------------------------------------------ */
++
++const char *
++nwios_backend_name(void)
++{
++	return wi.mode == 2 ? "fake" : "driver";
++}
++
++uint32_t
++nwios_caps(void)
++{
++	if (wi.mode == 2) {
++		return NWLAN_CAP_SCAN | NWLAN_CAP_JOIN_OPEN | NWLAN_CAP_WPA2_PSK;
++	}
++	return negroni_wlan_api_caps();
++}
++
++bool
++nwios_present(void)
++{
++	return wi.present;
++}
++
++bool
++nwios_powered(void)
++{
++	return wi.present && wi.powered;
++}
++
++bool
++nwios_joined(void)
++{
++	return wi.up;
++}
++
++void
++nwios_link(struct nwlan_link *out)
++{
++	bzero(out, sizeof(*out));
++	if (!wi.present) {
++		return;
++	}
++	if (wi.mode == 2) {
++		lck_mtx_lock(wi.lock);
++		*out = fk.link;
++		lck_mtx_unlock(wi.lock);
++	} else {
++		(void)negroni_wlan_link(out);
++	}
++}
++
++int
++nwios_set_power(bool on)
++{
++	if (!wi.present) {
++		return ENXIO;
++	}
++	bool leave;
++
++	lck_mtx_lock(wi.lock);
++	wi.powered = on;
++	leave = !on && (wi.up || wi.join_pending != 0);
++	lck_mtx_unlock(wi.lock);
++	if (leave) {
++		(void)nwios_disassociate();
++	}
++	nwios_kick(P_POWER);
++	return 0;
++}
++
++int
++nwios_scan(void)
++{
++	int error;
++
++	if (!wi.present) {
++		return ENXIO;
++	}
++	if (!wi.powered) {
++		return ENETDOWN;
++	}
++	wi.scanning = true;
++	if (wi.mode == 2) {
++		fk.scan_due = nwios_ms() + 1500;
++		return 0;
++	}
++	error = negroni_wlan_scan();
++	if (error != 0) {
++		/* EBUSY (joining) or another refusal: wifid still waits for SCAN_DONE; give it the list we have */
++		printf("NEGRONI WLAN iOS: scan refused by the driver (error %d): answering with the last list\n", error);
++		nwios_kick(P_SCAN_SYNTH);
++	}
++	return 0;
++}
++
++bool
++nwios_result(uint32_t index, struct nwlan_bss *out)
++{
++	bool there;
++
++	lck_mtx_lock(wi.lock);
++	there = wi.cache != NULL && index < wi.cache_count;
++	if (there) {
++		*out = wi.cache[index];
++	}
++	lck_mtx_unlock(wi.lock);
++	return there;
++}
++
++int
++nwios_associate(const uint8_t *ssid, uint32_t ssid_len, const char *psk, uint32_t psk_len)
++{
++	int error = 0;
++	uint32_t seq;
++
++	if (!wi.present) {
++		return ENXIO;
++	}
++	if (!wi.powered) {
++		return ENETDOWN;
++	}
++	if (ssid_len == 0 || ssid_len > NWLAN_SSID_MAX) {
++		return EINVAL;
++	}
++	lck_mtx_lock(wi.lock);
++	seq = ++wi.join_seq;
++	if (seq == 0) {
++		seq = ++wi.join_seq;
++	}
++	wi.join_pending = seq;
++	wi.join_deadline = nwios_ms() + JOIN_TIMEOUT_MS;
++	memcpy(wi.join_ssid, ssid, ssid_len);
++	wi.join_ssid_len = (uint8_t)ssid_len;
++	wi.join_sync_error = 0;
++	wi.join_down_seen = false;
++	wi.leave_asked = false;
++	if (wi.mode == 2) {
++		fk.join_index = -1;
++		for (int i = 0; i < FAKE_NETS; i++) {
++			if (fk.bss[i].ssid_len == ssid_len && memcmp(fk.bss[i].ssid, ssid, ssid_len) == 0) {
++				fk.join_index = i;
++			}
++		}
++		fk.join_ok = fk.join_index >= 0 && (fk.bss[fk.join_index].security == NWLAN_SEC_OPEN ? psk_len == 0 :
++		    psk_len == strlen(FAKE_PASSPHRASE) && memcmp(psk, FAKE_PASSPHRASE, psk_len) == 0);
++		fk.link.state = NWLAN_STATE_JOINING;
++		fk.join_due = nwios_ms() + 1500;
++		lck_mtx_unlock(wi.lock);
++		return 0;
++	}
++	lck_mtx_unlock(wi.lock);
++	error = negroni_wlan_associate(ssid, ssid_len, psk_len != 0 ? psk : NULL, psk_len);
++	if (error != 0) {
++		/* ENOTSUP (no join / no WPA2 in this kernel yet), EBUSY, EINVAL: say "failed" the way a join ends */
++		printf("NEGRONI WLAN iOS: join %u refused by the driver (error %d, caps %#x)\n", seq, error, nwios_caps());
++		lck_mtx_lock(wi.lock);
++		if (wi.join_pending == seq) {
++			wi.join_sync_error = error;
++		}
++		lck_mtx_unlock(wi.lock);
++		nwios_kick(P_JOIN_FAIL);
++	}
++	return 0;
++}
++
++int
++nwios_disassociate(void)
++{
++	if (!wi.present) {
++		return ENXIO;
++	}
++	lck_mtx_lock(wi.lock);
++	wi.leave_asked = true;
++	if (wi.join_pending != 0 && wi.join_sync_error == 0) {
++		wi.join_sync_error = ECANCELED;         /* a join wifid waits for ends as "failed" */
++	}
++	if (wi.mode == 2) {
++		fk.join_due = 0;
++		if (fk.link.state == NWLAN_STATE_CONNECTED || fk.link.state == NWLAN_STATE_JOINING) {
++			fk.link.state = NWLAN_STATE_IDLE;
++			fk.link.last_error = 0;
++		}
++		lck_mtx_unlock(wi.lock);
++		nwios_kick(P_LINK_DOWN);
++		return 0;
++	}
++	lck_mtx_unlock(wi.lock);
++	nwios_kick(P_LINK_DOWN);
++	return negroni_wlan_disassociate();
++}
++
++/* ---- en0 --------------------------------------------------------------------------------------------- */
++
++static void
++nwios_link_event(uint32_t code)
++{
++	_Alignas(struct kern_event_msg) char message[sizeof(struct kern_event_msg) + sizeof(struct net_event_data)] = { 0 };
++	struct kern_event_msg *header = (struct kern_event_msg *)message;
++	struct net_event_data *about = (struct net_event_data *)(header + 1);
++
++	header->total_size = sizeof(message);
++	header->vendor_code = KEV_VENDOR_APPLE;
++	header->kev_class = KEV_NETWORK_CLASS;
++	header->kev_subclass = KEV_DL_SUBCLASS;
++	header->event_code = code;
++	about->if_family = ifnet_family(wi.ifp);
++	about->if_unit = ifnet_unit(wi.ifp);
++	strlcpy(about->if_name, ifnet_name(wi.ifp), IFNAMSIZ);
++	ifnet_event(wi.ifp, header);
++}
++
++static void
++nwios_set_link(bool up)
++{
++	if (wi.ifp == NULL || up == wi.up) {
++		return;
++	}
++	wi.up = up;
++	printf("NEGRONI WLAN iOS: en0 link %s\n", up ? "UP (KEV_DL_LINK_ON: configd starts DHCP)" : "down (KEV_DL_LINK_OFF)");
++	nwios_link_event(up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF);
++}
++
++static errno_t
++nwios_output(ifnet_t ifp, mbuf_t packet)
++{
++	size_t length = mbuf_pkthdr_len(packet);
++	int error = ENOTCONN;
++
++	if (wi.up && length >= ETHER_HDR_LEN && length <= NWIOS_FRAME_MAX) {
++		bpf_tap_out(ifp, DLT_EN10MB, packet, NULL, 0);
++		lck_mtx_lock(wi.tx_lock);
++		if (mbuf_copydata(packet, 0, length, wi.txbuf) == 0) {
++			error = wi.mode == 2 ? ENOTCONN : negroni_wlan_tx(wi.txbuf, (uint32_t)length);
++		}
++		lck_mtx_unlock(wi.tx_lock);
++	}
++	if (error == 0) {
++		wi.tx++;
++		wi.tx_bytes += length;
++		ifnet_stat_increment_out(ifp, 1, (uint32_t)length, 0);
++	} else {
++		wi.tx_drop++;
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++	}
++	mbuf_freem(packet);
++	return 0;
++}
++
++/*
++ * driver thread (RX callback): one 802.3 frame; copied, never blocks. One mbuf with a 2 KiB cluster, as ue0 does
++ * (negroni_usb.c: mbuf_allocpacket may return a first mbuf of length 0, and stripping the header from it panicked
++ * "Failed mbuf validity check: len -14" on this phone).
++ */
++static void
++nwios_input(const uint8_t *frame, uint32_t length)
++{
++	struct ifnet_stat_increment_param stats = { .packets_in = 1, .bytes_in = length };
++	mbuf_t m = NULL;
++	char *header;
++
++	if (wi.ifp == NULL || !wi.up || length < ETHER_HDR_LEN || length > NWIOS_FRAME_MAX) {
++		wi.rx_drop++;
++		return;
++	}
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < length) {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		wi.rx_drop++;
++		return;
++	}
++	memcpy(mbuf_data(m), frame, length);
++	mbuf_setlen(m, length);
++	mbuf_pkthdr_setlen(m, length);
++	header = mbuf_data(m);
++	mbuf_pkthdr_setrcvif(m, wi.ifp);
++	mbuf_pkthdr_setheader(m, header);
++	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++	(void)mbuf_setdata(m, header + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++	bpf_tap_in(wi.ifp, DLT_EN10MB, m, header, ETHER_HDR_LEN);
++	wi.rx++;
++	wi.rx_bytes += length;
++	ifnet_input(wi.ifp, m, &stats);
++}
++
++static errno_t
++nwios_ioctl(ifnet_t ifp, u_long command, void *data)
++{
++	const int media[] = { IFM_IEEE80211 | IFM_AUTO };      /* IO80211.framework lists interfaces with 802.11 media */
++	struct ifreq *request = data;
++	struct ifmediareq *media_request = data;
++	user_addr_t list;
++	errno_t error = 0;
++
++	if (command != SIOCSA80211_CMD && command != SIOCGA80211_CMD && wi.ioctls_said < 60) {
++		char who[32] = "?";
++
++		proc_selfname(who, sizeof(who));
++		if (strcmp(who, "configd") != 0) {
++			wi.ioctls_said++;
++			printf("NEGRONI WLAN iOS: en0 ioctl %#lx from %s\n", command, who);
++		}
++	}
++	switch (command) {
++	case SIOCSIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		break;
++	case SIOCSIFFLAGS:
++		ifnet_set_flags(ifp, (ifnet_flags(ifp) & IFF_UP) ? IFF_RUNNING : 0, IFF_RUNNING);
++		break;
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64:
++		list = command == SIOCGIFMEDIA64 ? ((struct ifmediareq64 *)media_request)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)media_request)->ifmu_ulist);
++		media_request->ifm_active = media_request->ifm_current = media[0];
++		media_request->ifm_mask = 0;
++		media_request->ifm_status = IFM_AVALID | (wi.up ? IFM_ACTIVE : 0);
++		if (list != USER_ADDR_NULL && media_request->ifm_count > 0) {
++			error = copyout(media, list, sizeof(media));
++		}
++		media_request->ifm_count = 1;
++		break;
++	case SIOCGIFDEVMTU:
++		request->ifr_devmtu.ifdm_current = ifnet_mtu(ifp);
++		request->ifr_devmtu.ifdm_max = ETHERMTU;
++		request->ifr_devmtu.ifdm_min = IF_MINMTU;
++		break;
++	case SIOCSIFMTU:
++		error = request->ifr_mtu > ETHERMTU || request->ifr_mtu < IF_MINMTU ? EINVAL : ifnet_set_mtu(ifp, request->ifr_mtu);
++		break;
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		break;
++	default:
++		error = negroni_apple80211_ioctl(command, data);
++		break;
++	}
++	return error;
++}
++
++static bool
++nwios_attach(void)
++{
++	struct ifnet_init_eparams init = {
++		.ver = IFNET_INIT_CURRENT_VERSION,
++		.len = sizeof(init),
++		.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO,
++		.uniqueid = "negroni-wlan-en0",
++		.uniqueid_len = sizeof("negroni-wlan-en0") - 1,
++		.name = "en",
++		.unit = 0,
++		.family = IFNET_FAMILY_ETHERNET,
++		.subfamily = IFNET_SUBFAMILY_WIFI,
++		.type = IFT_ETHER,
++		.output = nwios_output,
++		.demux = ether_demux,
++		.add_proto = ether_add_proto,
++		.del_proto = ether_del_proto,
++		.check_multi = ether_check_multi,
++		.framer_extended = ether_frameout_extended,
++		.ioctl = nwios_ioctl,
++		.broadcast_addr = etherbroadcastaddr,
++		.broadcast_len = ETHER_ADDR_LEN,
++	};
++	ifnet_t ifp = NULL;
++	errno_t error;
++
++	error = ifnet_allocate_extended(&init, &ifp);
++	if (error != 0) {
++		printf("NEGRONI WLAN iOS: en0 cannot be made: error %d\n", error);
++		return false;
++	}
++	ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
++	ifnet_set_baudrate(ifp, 100 * 1000 * 1000);
++	ifnet_set_mtu(ifp, ETHERMTU);
++	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
++	ifnet_set_hdrlen(ifp, ETHER_HDR_LEN);
++	ifnet_set_offload(ifp, 0);
++	error = ifnet_attach(ifp, NULL);
++	if (error != 0) {
++		printf("NEGRONI WLAN iOS: en0 cannot be attached: error %d\n", error);
++		ifnet_release(ifp);
++		return false;
++	}
++	ifnet_set_lladdr(ifp, wi.mac, ETHER_ADDR_LEN);
++	bpfattach(ifp, DLT_EN10MB, ETHER_HDR_LEN);
++	wi.ifp = ifp;
++	return true;
++}
++
++/* ---- the driver's callbacks (driver thread: never block) ------------------------------------------------ */
++
++static void
++cb_rx(void *ctx __unused, const uint8_t *frame, uint32_t len)
++{
++	nwios_input(frame, len);
++}
++
++static void
++cb_event(void *ctx __unused, uint32_t event)
++{
++	switch (event) {
++	case NWLAN_EV_SCAN_DONE:
++		nwios_kick(P_SCAN_DONE);
++		break;
++	case NWLAN_EV_LINK_UP:
++		nwios_kick(P_LINK_UP);
++		break;
++	case NWLAN_EV_LINK_DOWN:
++		nwios_kick(P_LINK_DOWN);
++		break;
++	case NWLAN_EV_STATE:
++		nwios_kick(P_STATE);    /* CONNECTED -> FAILED / OFF: en0 down without a LINK_DOWN */
++		break;
++	default:
++		break;                  /* RSSI: read on demand by the getters */
++	}
++}
++
++static const struct nwlan_callbacks nwios_callbacks = { .ctx = NULL, .rx = cb_rx, .event = cb_event };
++
++/* ---- the worker ----------------------------------------------------------------------------------------- */
++
++static void
++work_scan_done(void)
++{
++	uint32_t n = 0;
++
++	if (wi.mode == 2) {
++		n = FAKE_NETS;
++		memcpy(wi.tmp, fk.bss, sizeof(fk.bss));
++	} else {
++		n = negroni_wlan_scan_results(wi.tmp, NWLAN_BSS_MAX);
++	}
++	lck_mtx_lock(wi.lock);
++	memcpy(wi.cache, wi.tmp, n * sizeof(*wi.cache));
++	wi.cache_count = n;
++	wi.scanning = false;
++	lck_mtx_unlock(wi.lock);
++	printf("NEGRONI WLAN iOS: scan done, %u networks for wifid\n", n);
++	negroni_apple80211_event(NWIOS_EV_SCAN_DONE, 0);
++}
++
++/* 802.11 status/reason 15 (4-way handshake time-out), 23 (802.1X failed), 2 while joining: a wrong key */
++static int
++link_error(const struct nwlan_link *lk, bool joining)
++{
++	if (lk->reason == 15 || lk->reason == 23 || (joining && lk->reason == 2)) {
++		return EAUTH;
++	}
++	if (lk->state == NWLAN_STATE_FAILED || lk->state == NWLAN_STATE_OFF) {
++		return ENETDOWN;
++	}
++	return lk->last_error != 0 ? lk->last_error : ECONNRESET;
++}
++
++/*
++ * One decision from the driver's state, not from the order of the event bits: a network switch delivers
++ * LINK_DOWN (old) and LINK_UP (new) together, and the state then says CONNECTED to the new BSS.
++ *   - the join wifid waits for (join_pending) ends exactly once: success when CONNECTED to the asked SSID; failure
++ *     on a refusal, a request to leave, the radio off, the driver FAILED/OFF, an idle driver after a LINK_DOWN with
++ *     an error, or JOIN_TIMEOUT_MS;
++ *   - en0 is up exactly when the radio is on and the driver is CONNECTED; a new BSS takes en0 down and up again
++ *     (configd runs DHCP for the new network).
++ */
++static void
++reconcile(uint32_t bits)
++{
++	struct nwlan_link lk;
++	bool connected, finish = false, timeout = false;
++	uint32_t seq;
++	int error = 0;
++
++	nwios_link(&lk);
++	connected = wi.powered && lk.state == NWLAN_STATE_CONNECTED;
++
++	lck_mtx_lock(wi.lock);
++	if ((bits & P_LINK_DOWN) && wi.join_pending != 0) {
++		wi.join_down_seen = true;
++	}
++	seq = wi.join_pending;
++	if (seq != 0) {
++		bool same_ssid = lk.ssid_len == wi.join_ssid_len && memcmp(lk.ssid, wi.join_ssid, wi.join_ssid_len) == 0;
++		bool busy = lk.state == NWLAN_STATE_JOINING || lk.state == NWLAN_STATE_HANDSHAKE ||
++		    lk.state == NWLAN_STATE_SCANNING;
++
++		if (wi.join_sync_error != 0) {
++			finish = true;
++			error = wi.join_sync_error;
++		} else if (!wi.powered) {
++			finish = true;
++			error = ENETDOWN;
++		} else if (connected && same_ssid) {
++			finish = true;
++			error = 0;
++		} else if (lk.state == NWLAN_STATE_FAILED || lk.state == NWLAN_STATE_OFF) {
++			finish = true;
++			error = ENETDOWN;
++		} else if (wi.join_down_seen && !busy && !connected && lk.last_error != 0) {
++			finish = true;
++			error = link_error(&lk, true);
++		} else if (nwios_ms() >= wi.join_deadline) {
++			finish = true;
++			timeout = true;
++			error = ETIMEDOUT;
++		}
++		if (finish) {
++			wi.join_pending = 0;
++			wi.join_sync_error = 0;
++			wi.join_down_seen = false;
++		}
++	}
++	lck_mtx_unlock(wi.lock);
++
++	/* en0 first, so a success is reported with the link already up */
++	if (wi.up && (!connected || memcmp(wi.up_bssid, lk.bssid, 6) != 0)) {
++		/* asked: a leave, the radio off, or a join to another network (a switch is not "lost") */
++		bool asked = wi.leave_asked || seq != 0 || connected;
++
++		nwios_set_link(false);
++		negroni_apple80211_event(NWIOS_EV_LINK, asked ? 0 : link_error(&lk, false));
++	}
++	if (connected && !wi.up) {
++		memcpy(wi.up_bssid, lk.bssid, 6);
++		/* (the SSID is not logged: its length only) */
++		printf("NEGRONI WLAN iOS: connected: a network name of %u bytes, %u MHz, RSSI %d\n",
++		    (unsigned)MIN(lk.ssid_len, NWLAN_SSID_MAX), lk.freq, lk.rssi);
++		nwios_set_link(true);
++		negroni_apple80211_event(NWIOS_EV_LINK, 1);
++	}
++	if (!connected) {
++		lck_mtx_lock(wi.lock);
++		if (wi.join_pending == 0) {
++			wi.leave_asked = false;
++		}
++		lck_mtx_unlock(wi.lock);
++	}
++	if (finish) {
++		if (error != 0) {
++			printf("NEGRONI WLAN iOS: join %u failed: error %d, 802.11 code %u, driver state %u\n", seq, error, lk.reason,
++			    lk.state);
++		}
++		if (timeout && wi.mode == 1) {
++			(void)negroni_wlan_disassociate();     /* stop the driver's attempt */
++		}
++		negroni_apple80211_event(NWIOS_EV_JOIN_DONE, error);
++	}
++}
++
++static void
++work(uint32_t bits)
++{
++	if (bits & P_POWER) {
++		printf("NEGRONI WLAN iOS: radio switch %s\n", wi.powered ? "ON" : "OFF");
++	}
++	if (bits & (P_SCAN_DONE | P_SCAN_SYNTH)) {
++		work_scan_done();
++	}
++	reconcile(bits);                /* joins, en0 link (every tick: the join time-out, FAILED/OFF) */
++	if (bits & P_POWER) {
++		negroni_apple80211_event(NWIOS_EV_POWER, wi.powered);
++	}
++}
++
++/* lo0 exists: the network stack is up */
++static bool
++nwios_stack_up(void)
++{
++	ifnet_t lo = NULL;
++
++	if (ifnet_find_by_name("lo0", &lo) != 0 || lo == NULL) {
++		return false;
++	}
++	ifnet_release(lo);
++	return true;
++}
++
++static void
++nwios_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t wait_s = 600;
++	uint64_t start = nwios_ms(), summary_at, next_stats;
++	uint64_t said_total = 0;
++	struct nwlan_link lk;
++
++	(void)PE_parse_boot_argn("negroniwlan_ios_wait", &wait_s, sizeof(wait_s));
++	while (!nwios_stack_up()) {
++		delay_for_interval(100, NSEC_PER_MSEC);
++	}
++	if (wi.mode == 1) {
++		printf("NEGRONI WLAN iOS: waiting up to %u s for the driver API (state IDLE)\n", wait_s);
++		for (;;) {
++			if (negroni_wlan_api_ready()) {
++				break;
++			}
++			bzero(&lk, sizeof(lk));
++			(void)negroni_wlan_link(&lk);
++			if (lk.state == NWLAN_STATE_FAILED || nwios_ms() - start > (uint64_t)wait_s * 1000) {
++				printf("NEGRONI WLAN iOS: no en0: the driver API is not ready (state %u, error %d); "
++				    "wifid runs without an interface (Settings: Wi-Fi off/greyed)\n", lk.state, lk.last_error);
++				return;
++			}
++			delay_for_interval(250, NSEC_PER_MSEC);
++		}
++		if (negroni_wlan_api_version() != NWLAN_API_VERSION) {
++			printf("NEGRONI WLAN iOS: driver API version %u, this side knows %u: no en0\n",
++			    negroni_wlan_api_version(), NWLAN_API_VERSION);
++			return;
++		}
++		bzero(&lk, sizeof(lk));
++		(void)negroni_wlan_link(&lk);
++		memcpy(wi.mac, lk.mac, 6);
++	}
++	if ((wi.mac[0] | wi.mac[1] | wi.mac[2] | wi.mac[3] | wi.mac[4] | wi.mac[5]) == 0 && !negroni_wlan_ios_adt_mac(wi.mac)) {
++		static const uint8_t fallback[6] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x10 };
++
++		memcpy(wi.mac, fallback, 6);
++	}
++	if (wi.mode == 2) {
++		fake_init();
++	}
++	if (!nwios_attach()) {
++		return;
++	}
++	if (wi.mode == 1) {
++		int error = negroni_wlan_register(&nwios_callbacks);
++
++		if (error != 0) {
++			printf("NEGRONI WLAN iOS: negroni_wlan_register failed: error %d (scans and joins will not finish)\n", error);
++		}
++	}
++	wi.powered = true;
++	wi.present = true;
++	/* (the address is the phone's own: printed only as its first three bytes) */
++	printf("NEGRONI WLAN iOS: en0 attached (%s backend, caps %#x, MAC %02x:%02x:%02x:..), link down; Apple80211 ioctls on\n",
++	    nwios_backend_name(), nwios_caps(), wi.mac[0], wi.mac[1], wi.mac[2]);
++	negroni_wlan_ios_publish(NWIOS_IFNAME, wi.mac);
++	negroni_apple80211_event(NWIOS_EV_POWER, 1);
++	summary_at = nwios_ms() + 180 * 1000;
++	next_stats = nwios_ms() + 60 * 1000;
++
++	for (;;) {
++		uint32_t bits;
++
++		assert_wait_timeout((event_t)&wi.pending, THREAD_UNINT, 100, NSEC_PER_MSEC);
++		if (__atomic_load_n(&wi.pending, __ATOMIC_SEQ_CST) == 0) {
++			(void)thread_block(THREAD_CONTINUE_NULL);
++		} else {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		}
++		if (wi.mode == 2) {
++			fake_tick();
++		}
++		bits = __atomic_exchange_n(&wi.pending, 0, __ATOMIC_SEQ_CST);
++		work(bits);                     /* also with no bits: time-outs and the driver state are polled */
++		if (summary_at != 0 && nwios_ms() >= summary_at) {
++			summary_at = 0;
++			negroni_apple80211_summary();
++		}
++		if (nwios_ms() >= next_stats) {
++			uint64_t moved = wi.tx + wi.rx + wi.tx_drop + wi.rx_drop;
++
++			next_stats = nwios_ms() + 60 * 1000;
++			if (moved != said_total) {
++				said_total = moved;
++				printf("NEGRONI WLAN iOS: en0 %llu frames out (%llu bytes), %llu in (%llu bytes); dropped %llu out, %llu in\n",
++				    wi.tx, wi.tx_bytes, wi.rx, wi.rx_bytes, wi.tx_drop, wi.rx_drop);
++			}
++		}
++	}
++}
++
++void
++negroni_wlan_ios_init(void)
++{
++	uint32_t wlan = 0;
++	thread_t thread;
++
++	wi.mode = 1;
++	wi.log_max = 400;
++	(void)PE_parse_boot_argn("negroniwlan", &wlan, sizeof(wlan));
++	(void)PE_parse_boot_argn("negroniwlan_ios", &wi.mode, sizeof(wi.mode));
++	(void)PE_parse_boot_argn("negroniwlan_ios_log", &wi.log_max, sizeof(wi.log_max));
++	if (wi.mode == 0) {
++		return;
++	}
++	if (wi.mode == 1 && wlan < 10) {
++		printf("NEGRONI WLAN iOS: off (needs negroniwlan=10, now %u; or negroniwlan_ios=2 for the fake radio)\n", wlan);
++		return;
++	}
++	if (wi.mode > 2) {
++		wi.mode = 1;
++	}
++	wi.grp = lck_grp_alloc_init("negroni_wlan_ios", LCK_GRP_ATTR_NULL);
++	wi.lock = lck_mtx_alloc_init(wi.grp, LCK_ATTR_NULL);
++	wi.tx_lock = lck_mtx_alloc_init(wi.grp, LCK_ATTR_NULL);
++	wi.cache = kalloc_data(NWLAN_BSS_MAX * sizeof(struct nwlan_bss), Z_WAITOK | Z_ZERO);
++	wi.tmp = kalloc_data(NWLAN_BSS_MAX * sizeof(struct nwlan_bss), Z_WAITOK | Z_ZERO);
++	if (wi.cache == NULL || wi.tmp == NULL) {
++		printf("NEGRONI WLAN iOS: no memory for the scan list\n");
++		return;
++	}
++	/* before launchd reads its jobs: wifid's job asks for a device-tree entry "wlan" */
++	printf("NEGRONI WLAN iOS: %s backend; IODeviceTree \"wlan\" %s (launchd starts wifid)\n", nwios_backend_name(),
++	    negroni_wlan_ios_dt_entry() ? "made" : "already there");
++	if (kernel_thread_start(nwios_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "negroni-wlan-ios");
++		thread_deallocate(thread);
++	} else {
++		printf("NEGRONI WLAN iOS: no thread\n");
++	}
++}
++
++uint32_t
++negroni_wlan_ios_log_max(void)
++{
++	return wi.log_max;
++}
+diff --git a/bsd/dev/negroni_wlan_ios.h b/bsd/dev/negroni_wlan_ios.h
+new file mode 100644
+index 0000000..fbb9566
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_ios.h
+@@ -0,0 +1,92 @@
++/*
++ * Copyright (c) 2026 iOSPlus10. Parts derived from HakiOS (oosexgang/hackios-xnu-kernel, xnu/files,
++ * Apple Public Source License 2.0): iokit/Kernel/hakios.wlan.cpp, bsd/dev/hakios.net.c,
++ * bsd/dev/hakios.apple80211.c, bsd/dev/hakios.sta.c.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed software or any other software. Please obtain a
++ * copy of the License at http://www.opensource.apple.com/apsl/ and read it
++ * before using this file.
++ *
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ */
++/*
++ * NEGRONI Wi-Fi, iOS side (patches 0340, 0341): what the three parts know of each other.
++ *
++ *   bsd/dev/negroni_wlan_ios.c      en0 (BSD interface KPI), the worker thread, the backend (the driver seam
++ *                                   bsd/dev/negroni_wlan_api.h, or a fake radio for UI tests), link state.
++ *   bsd/dev/negroni_apple80211.c    the Apple80211 ioctls (SIOCGA80211 / SIOCSA80211) and the class-6 events.
++ *   iokit/Kernel/arm/NegroniWLAN.cpp the registry: IODeviceTree "wlan" (launchd starts wifid only if it exists),
++ *                                   IO80211Controller + IONetworkInterface property-only services (wifid, configd).
++ *
++ * Boot-arg negroniwlan_ios: 0 off; 1 (default) on when negroniwlan >= 10: en0 appears when the driver API is
++ * ready (state IDLE); 2 fake radio: no chip needed, en0 at once, 3 fake networks, joins without data.
++ */
++#ifndef _NEGRONI_WLAN_IOS_H_
++#define _NEGRONI_WLAN_IOS_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++#include "negroni_wlan_api.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define NWIOS_IFNAME            "en0"
++#define SIOCSA80211_CMD         0x802869c8ul    /* _IOW('i', 200, struct apple80211req) */
++#define SIOCGA80211_CMD         0xc02869c9ul    /* _IOWR('i', 201, struct apple80211req) */
++
++/* ---- backend (negroni_wlan_ios.c); every call returns at once, results come as events ---- */
++const char *nwios_backend_name(void);           /* "driver" or "fake" */
++uint32_t nwios_caps(void);                      /* NWLAN_CAP_* */
++bool nwios_present(void);                       /* en0 exists and the backend answers */
++bool nwios_powered(void);                       /* the soft radio switch (Settings / Control Center) */
++int nwios_set_power(bool on);                   /* off: leave the network; event NWIOS_EV_POWER */
++int nwios_scan(void);                           /* 0 / ENETDOWN / ENXIO; always ends in NWIOS_EV_SCAN_DONE */
++/* the BSS list of the last finished scan, copied at NWIOS_EV_SCAN_DONE; returns false past the end */
++bool nwios_result(uint32_t index, struct nwlan_bss *out);
++/* psk NULL: open; else a passphrase (8..63) or 64 hex digits; always ends in NWIOS_EV_JOIN_DONE */
++int nwios_associate(const uint8_t *ssid, uint32_t ssid_len, const char *psk, uint32_t psk_len);
++int nwios_disassociate(void);
++void nwios_link(struct nwlan_link *out);        /* state, bssid, ssid, rssi, freq of the backend */
++bool nwios_joined(void);                        /* en0's link is up */
++
++/* ---- Apple80211 (negroni_apple80211.c) ---- */
++enum nwios_event {
++	NWIOS_EV_POWER,                         /* status 1 on, 0 off */
++	NWIOS_EV_SCAN_DONE,                     /* status 0 or errno */
++	NWIOS_EV_JOIN_DONE,                     /* status 0 or errno (EAUTH: wrong passphrase, ETIMEDOUT) */
++	NWIOS_EV_LINK,                          /* status 1 joined, 0 left when asked, errno: lost */
++};
++int negroni_apple80211_ioctl(unsigned long command, void *data);
++void negroni_apple80211_event(enum nwios_event event, int status);     /* worker thread only */
++void negroni_apple80211_summary(void);
++
++/* ---- registry (NegroniWLAN.cpp) ---- */
++bool negroni_wlan_ios_dt_entry(void);          /* make IODeviceTree "wlan" if no entry has that name */
++bool negroni_wlan_ios_adt_mac(uint8_t mac[6]);  /* /chosen mac-address-wifi0 */
++void negroni_wlan_ios_publish(const char *ifname, const uint8_t mac[6]);
++
++void negroni_wlan_ios_init(void);               /* from negroni_wifi_init() */
++uint32_t negroni_wlan_ios_log_max(void);        /* negroniwlan_ios_log */
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _NEGRONI_WLAN_IOS_H_ */
+diff --git a/iokit/Kernel/arm/NegroniWLAN.cpp b/iokit/Kernel/arm/NegroniWLAN.cpp
+new file mode 100644
+index 0000000..8e3eef5
+--- /dev/null
++++ b/iokit/Kernel/arm/NegroniWLAN.cpp
+@@ -0,0 +1,231 @@
++/*
++ * Copyright (c) 2026 iOSPlus10. Derived from HakiOS (oosexgang/hackios-xnu-kernel, xnu/files/iokit/Kernel/
++ * hakios.wlan.cpp, Apple Public Source License 2.0).
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed software or any other software. Please obtain a
++ * copy of the License at http://www.opensource.apple.com/apsl/ and read it
++ * before using this file.
++ *
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ */
++/*
++ * NEGRONI Wi-Fi, iOS side (patch 0340): the registry entries iOS looks for.
++ *
++ * 1. IODeviceTree "wlan". The launchd job com.apple.wifid has _LimitLoadToDeviceTree ("wlan", "marconi-wifi");
++ *    launchd 20H392 asks io_device_tree_entry_exists_with_name (IOUserClient.cpp), which runs
++ *    IODTFindMatchingEntries(root, kIODTRecursive, name) over the IODeviceTree plane and compares entry names.
++ *    Our ADT has no such node, so wifid never ran and Settings had no Wi-Fi device (greyed switch). The entry is
++ *    made here at boot, before launchd reads its jobs, under /arm-io (or the root), with name/compatible data.
++ * 2. IO80211Controller + IONetworkInterface, property-only, as IO80211Family / IONetworkingFamily name theirs
++ *    (HakiOS hakios.wlan.cpp): IO80211.framework 20H392 matches IO80211Controller ("No Matches for
++ *    IO80211Controller, trying dk matching"), then the interface by IOPropertyMatch IO80211InterfaceRole =
++ *    "Infrastructure" and IOInterfaceName; SystemConfiguration lists IONetworkInterface objects and calls one Wi-Fi
++ *    when its parent is an IO80211Controller (IOMACAddress on the controller). No user client: the framework falls
++ *    back to the ioctl path (negroni_apple80211.c).
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++
++extern "C" {
++#include "../../../bsd/dev/negroni_wlan_ios.h"
++}
++
++class IO80211Controller : public IOService
++{
++	OSDeclareDefaultStructors(IO80211Controller);
++};
++
++OSDefineMetaClassAndStructors(IO80211Controller, IOService);
++
++class IONetworkInterface : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class NegroniWLANInterface : public IONetworkInterface
++{
++	OSDeclareDefaultStructors(NegroniWLANInterface);
++
++public:
++	virtual IOReturn newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++	    IOUserClient ** handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(NegroniWLANInterface, IONetworkInterface);
++
++/* none on purpose: IO80211.framework then uses the ioctls ("Falling back to IOCTL path") */
++IOReturn
++NegroniWLANInterface::newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++    IOUserClient ** handler)
++{
++	static unsigned said;
++
++	if (said++ < 8) {
++		IOLog("NEGRONI WLAN iOS: user client type %u asked of en0's service: none (ioctl path)\n", (unsigned) type);
++	}
++	return kIOReturnUnsupported;
++}
++
++static IOService *
++publish(IOService * service, IOService * provider, const char * name)
++{
++	if (service == NULL || !service->attach(provider)) {
++		OSSafeReleaseNULL(service);
++		return NULL;
++	}
++	service->setName(name);
++	if (!service->start(provider)) {
++		service->detach(provider);
++		service->release();
++		return NULL;
++	}
++	service->registerService();
++	return service;
++}
++
++static void
++set_data_string(IORegistryEntry * entry, const char * key, const char * value)
++{
++	OSData * data = OSData::withBytes(value, (unsigned) strlen(value) + 1);
++
++	if (data != NULL) {
++		entry->setProperty(key, data);
++		data->release();
++	}
++}
++
++/* IODeviceTree "wlan" when no entry has that name; true if one was made */
++extern "C" bool
++negroni_wlan_ios_dt_entry(void)
++{
++	OSCollectionIterator * found = IODTFindMatchingEntries(IORegistryEntry::getRegistryRoot(), kIODTRecursive, "wlan");
++	bool there = found != NULL && found->getNextObject() != NULL;
++	IORegistryEntry * parent;
++	IORegistryEntry * entry;
++
++	OSSafeReleaseNULL(found);
++	if (there) {
++		return false;
++	}
++	parent = IORegistryEntry::fromPath("/arm-io", gIODTPlane);
++	if (parent == NULL) {
++		parent = IORegistryEntry::fromPath("/", gIODTPlane);
++	}
++	entry = OSTypeAlloc(IORegistryEntry);
++	if (parent == NULL || entry == NULL || !entry->init()) {
++		OSSafeReleaseNULL(parent);
++		OSSafeReleaseNULL(entry);
++		IOLog("NEGRONI WLAN iOS: cannot make IODeviceTree \"wlan\"\n");
++		return false;
++	}
++	entry->setName("wlan", gIODTPlane);
++	entry->setName("wlan");
++	set_data_string(entry, "name", "wlan");
++	set_data_string(entry, "compatible", "wlan-pcie,negroni");
++	set_data_string(entry, "device_type", "wlan");
++	if (!entry->attachToParent(parent, gIODTPlane)) {
++		IOLog("NEGRONI WLAN iOS: cannot attach IODeviceTree \"wlan\"\n");
++		entry->release();
++		parent->release();
++		return false;
++	}
++	entry->release();
++	parent->release();
++	return true;
++}
++
++/* /chosen mac-address-wifi0 (config/negroni-ne2211.toml [adt.extra.chosen]) */
++extern "C" bool
++negroni_wlan_ios_adt_mac(uint8_t mac[6])
++{
++	IORegistryEntry * chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++	OSData * data;
++	bool ok = false;
++
++	if (chosen != NULL) {
++		data = OSDynamicCast(OSData, chosen->getProperty("mac-address-wifi0"));
++		if (data != NULL && data->getLength() >= 6) {
++			memcpy(mac, data->getBytesNoCopy(), 6);
++			ok = true;
++		}
++		chosen->release();
++	}
++	return ok;
++}
++
++/* once, after en0 is attached */
++extern "C" void
++negroni_wlan_ios_publish(const char * ifname, const uint8_t mac[6])
++{
++	IOService * platform = IOService::getPlatform();
++	IO80211Controller * controller = OSTypeAlloc(IO80211Controller);
++	NegroniWLANInterface * wlan = OSTypeAlloc(NegroniWLANInterface);
++	OSData * address;
++	OSNumber * number;
++
++	if (platform == NULL || controller == NULL || wlan == NULL || !controller->init() || !wlan->init()) {
++		OSSafeReleaseNULL(controller);
++		OSSafeReleaseNULL(wlan);
++		IOLog("NEGRONI WLAN iOS: cannot create the IO80211 services\n");
++		return;
++	}
++	if ((address = OSData::withBytes(mac, 6)) != NULL) {
++		controller->setProperty("IOMACAddress", address);
++		address->release();
++	}
++	controller->setProperty("IOBuiltin", true);
++	controller->setProperty("IOVendor", "Qualcomm");
++	controller->setProperty("IOModel", "QCA6490");
++	if ((controller = (IO80211Controller *) publish(controller, platform, "NegroniWLANController")) == NULL) {
++		wlan->release();
++		IOLog("NEGRONI WLAN iOS: the IO80211Controller did not start\n");
++		return;
++	}
++
++	wlan->setProperty("IOInterfaceName", ifname);
++	wlan->setProperty("BSD Name", ifname);
++	wlan->setProperty("IOInterfaceNamePrefix", "en");
++	if ((number = OSNumber::withNumber(6ULL, 32)) != NULL) {        /* IFT_ETHER */
++		wlan->setProperty("IOInterfaceType", number);
++		number->release();
++	}
++	if ((number = OSNumber::withNumber((unsigned long long) (ifname[2] - '0'), 32)) != NULL) {
++		wlan->setProperty("IOInterfaceUnit", number);
++		number->release();
++	}
++	wlan->setProperty("IOBuiltin", true);
++	wlan->setProperty("IOPrimaryInterface", true);
++	wlan->setProperty("IO80211InterfaceRole", "Infrastructure");
++	if (publish(wlan, controller, "NegroniWLAN") == NULL) {
++		IOLog("NEGRONI WLAN iOS: the en0 service did not start\n");
++	} else {
++		IOLog("NEGRONI WLAN iOS: IO80211Controller + IONetworkInterface (%s, IO80211InterfaceRole Infrastructure) registered\n",
++		    ifname);
++		wlan->release();
++	}
++	controller->release();
++}
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 3cf0287..a71527d 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -25,3 +25,4 @@ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
+ iokit/Kernel/arm/NegroniBacklight.cpp                              optional iokitcpp
++iokit/Kernel/arm/NegroniWLAN.cpp                                   optional iokitcpp

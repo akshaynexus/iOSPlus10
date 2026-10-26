@@ -1,0 +1,1342 @@
+0327-negroni-wlan-join-open: Wi-Fi, join a BSS as a station (open system) and the link life cycle.
+negroni_wlan_join.c: associate/disassociate from the API mailbox, run on the driver thread: the strongest BSS
+of the SSID (a scan first if needed), VDEV_START (20 MHz, HE20 channel mode), PEER_CREATE, AUTH and ASSOC REQ
+by WMI_MGMT_TX_SEND (frame in a DMA slot, IOVA), PEER_ASSOC from the AP's rates/HT/WMM (ath11k
+peer_assoc_prepare), VDEV_UP, DTIM policy, powersave off, PEER AUTHORIZE -> CONNECTED. Down on request,
+deauth/disassoc, PEER_STA_KICKOUT, ROAM beacon miss or 10 s without a beacon: VDEV_DOWN, PEER_DELETE,
+VDEV_STOP. Small DMA buffer helper. negroni_wlan_dp.c / negroni_wlan_wpa.c: placeholders for 0328 / 0329.
+negroni_wlan_wmi.c: join events routed to the join code. Details: patches/xnu/README-wifi.md "0327".
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 332bc21..695a0db 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -128,6 +128,8 @@ bsd/dev/negroni_wlan_wmi.c		standard
+ bsd/dev/negroni_wlan_smmu.c		standard
+ bsd/dev/negroni_wlan_sta.c		standard
+ bsd/dev/negroni_wlan_join.c		standard
++bsd/dev/negroni_wlan_dp.c		standard
++bsd/dev/negroni_wlan_wpa.c		standard
+ bsd/dev/negroni_wlan_bhi.c		standard
+ bsd/dev/negroni_wlan_mhi.c		standard
+ bsd/dev/negroni_adsp.c			standard
+diff --git a/bsd/dev/negroni_wlan_dp.c b/bsd/dev/negroni_wlan_dp.c
+new file mode 100644
+index 0000000..295fe45
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_dp.c
+@@ -0,0 +1,60 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: the HTT data path. 0327: placeholders (no data frames yet); 0328 replaces this file.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "negroni_wlan.h"
++#include "negroni_wlan_mhi.h"
++#include "negroni_wlan_sta.h"
++
++uint32_t
++negroni_wlan_dp_caps(void)
++{
++	return 0;
++}
++
++int
++negroni_wlan_dp_wait_peer(const uint8_t mac[6])
++{
++	(void)mac;
++	negroni_wlan_nap(50);   /* no HTT peer map without the data path: give the firmware a moment */
++	return 0;
++}
++
++void
++negroni_wlan_dp_link_up(const uint8_t bssid[6], uint16_t aid)
++{
++	(void)bssid;
++	(void)aid;
++}
++
++void
++negroni_wlan_dp_link_down(void)
++{
++}
++
++int
++negroni_wlan_dp_tx_eapol(const uint8_t *body, uint32_t len)
++{
++	(void)body;
++	(void)len;
++	return ENOTSUP;
++}
++
++void
++negroni_wlan_sta_link_counters(struct nwlan_link *out)
++{
++	(void)out;
++}
++
++int
++negroni_wlan_tx(const uint8_t *frame, uint32_t len)
++{
++	(void)frame;
++	(void)len;
++	return ENOTSUP;
++}
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_join.c b/bsd/dev/negroni_wlan_join.c
+index 0191260..e1e0875 100644
+--- a/bsd/dev/negroni_wlan_join.c
++++ b/bsd/dev/negroni_wlan_join.c
+@@ -1,65 +1,1063 @@
+ /*
+- * NEGRONI QCA6490 Wi-Fi: join, data path and WPA2 parts of the station manager.
+- * 0326: placeholders, so the API (negroni_wlan_api.h) links and answers ENOTSUP. 0327 replaces this file.
++ * NEGRONI QCA6490 Wi-Fi (patch 0327): join a BSS as a station (open system authentication), the link
++ * life cycle and the API's associate / disassociate.
++ *
++ * Sequence (ath11k mac.c: assign_vif_chanctx -> vdev start, sta_state NOTEXIST->NONE -> peer create, mac80211
++ * auth/assoc frames -> WMI mgmt tx, bss_info_changed(assoc) -> ath11k_bss_assoc: peer assoc + vdev up):
++ *   1. the strongest BSS with the SSID from the scan list (a passive scan first if none was seen in 60 s)
++ *   2. WMI_PEER_CREATE (the AP; WCN6855 vdev_start_delay: the peer before the vdev start), 0328: HTT peer map
++ *   3. WMI_VDEV_START on its channel, 20 MHz (channel mode HE20 as ath11k_phymodes), wait VDEV_START_RESP
++ *   4. AUTH (open, seq 1) by WMI_MGMT_TX_SEND, wait AUTH seq 2 status 0 (3 tries, 500 ms each)
++ *   5. ASSOC REQ (ESS, rates as the AP's, HT capabilities 20 MHz, WMM info if the AP has WMM, RSN from 0329),
++ *      wait ASSOC RESP status 0 + AID (3 tries)
++ *   6. WMI_PEER_ASSOC (legacy + HT rates and caps from the AP's elements, ath11k_peer_assoc_prepare), wait
++ *      PEER_ASSOC_CONF; WMI_VDEV_UP (AID, BSSID); VDEV_PARAM DTIM_POLICY stick; STA powersave off
++ *   7. open: PEER_SET_PARAM AUTHORIZE 1 -> CONNECTED. WPA2 (0329): HANDSHAKE, keys, then AUTHORIZE.
++ * Down (request, deauth/disassoc from the AP, PEER_STA_KICKOUT, ROAM BMISS, 10 s without a beacon): DEAUTH
++ * frame (our request only), VDEV_DOWN, VDEV_STOP, PEER_DELETE -> IDLE + NWLAN_EV_LINK_DOWN. A join that ends before
++ * JOINING (no BSS, wrong security) also sends NWLAN_EV_LINK_DOWN with last_error.
++ *
++ * Management frames go out by WMI with the frame in a DMA buffer (IOVA via negroni_wlan_dma_map) and its first
++ * 64 bytes inline (wmi.c ath11k_wmi_mgmt_send). UNTESTED ON HARDWARE.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include "negroni_wlan.h"
++#include "negroni_wlan_mhi.h"
++#include "negroni_wlan_wmi.h"
+ #include "negroni_wlan_sta.h"
+ 
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++/* WMI ids and tags (computed from ath11k wmi.h enums: WMI_TLV_CMD(grp) = grp << 12 | 1, enum wmi_tlv_tag) */
++#define WMI_VDEV_START_REQUEST_CMDID    0x5003u
++#define WMI_VDEV_UP_CMDID               0x5005u
++#define WMI_VDEV_STOP_CMDID             0x5006u
++#define WMI_VDEV_DOWN_CMDID             0x5007u
++#define WMI_VDEV_SET_PARAM_CMDID        0x5008u
++#define WMI_PEER_CREATE_CMDID           0x6001u
++#define WMI_PEER_DELETE_CMDID           0x6002u
++#define WMI_PEER_SET_PARAM_CMDID        0x6004u
++#define WMI_PEER_ASSOC_CMDID            0x6005u
++#define WMI_MGMT_TX_SEND_CMDID          0x7008u
++#define WMI_STA_POWERSAVE_MODE_CMDID    0x9001u
++#define WMI_VDEV_START_RESP_EVENTID     0x5001u
++#define WMI_VDEV_STOPPED_EVENTID        0x5002u
++#define WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID 0x5003u
++#define WMI_PEER_STA_KICKOUT_EVENTID    0x6001u
++#define WMI_PEER_ASSOC_CONF_EVENTID     0x6006u
++#define WMI_PEER_DELETE_RESP_EVENTID    0x6007u
++#define WMI_MGMT_TX_COMPLETION_EVENTID  0x7006u
++#define WMI_ROAM_EVENTID                0xb001u
++#define TAG_CHANNEL                     0x50u
++#define TAG_VDEV_START_REQUEST_CMD      0x58u
++#define TAG_VDEV_UP_CMD                 0x5cu
++#define TAG_VDEV_STOP_CMD               0x5du
++#define TAG_VDEV_DOWN_CMD               0x5eu
++#define TAG_VDEV_SET_PARAM_CMD          0x5fu
++#define TAG_PEER_CREATE_CMD             0x61u
++#define TAG_PEER_DELETE_CMD             0x62u
++#define TAG_PEER_SET_PARAM_CMD          0x64u
++#define TAG_PEER_ASSOC_COMPLETE_CMD     0x65u
++#define TAG_VHT_RATE_SET                0x66u
++#define TAG_STA_POWERSAVE_MODE_CMD      0x6cu
++#define TAG_MGMT_TX_SEND_CMD            0x1a6u
++#define TAG_VDEV_START_RESPONSE_EVENT   0x28u
++#define TAG_PEER_STA_KICKOUT_EVENT      0x2bu
++#define TAG_ROAM_EVENT                  0x30u
++#define TAG_MGMT_TX_COMPL_EVENT         0x1a7u
++#define TAG_PEER_ASSOC_CONF_EVENT       0x1b2u
++#define TAG_ARRAY_BYTE                  0x11u
++#define TAG_ARRAY_STRUCT                0x12u
++/* values (wmi.h, mac.h) */
++#define MODE_11A                        0u
++#define MODE_11G                        1u
++#define MODE_11B                        2u
++#define MODE_11NA_HT20                  4u
++#define MODE_11NG_HT20                  5u
++#define MODE_11AX_HE20                  16u
++#define MODE_11AX_HE20_2G               21u
++#define VDEV_START_LDPC_RX_ENABLED      (1u << 3)
++#define PEER_AUTH                       0x1u
++#define PEER_QOS                        0x2u
++#define PEER_NEED_PTK_4_WAY             0x4u
++#define PEER_HT                         0x1000u
++#define PEER_LDPC                       0x10000u
++#define RC_DS_FLAG                      0x01u
++#define RC_SGI_FLAG                     0x04u
++#define RC_HT_FLAG                      0x08u
++#define PEER_PARAM_AUTHORIZE            0x3u
++#define VDEV_PARAM_DTIM_POLICY          0x47u
++#define DTIM_POLICY_STICK               3u
++#define ROAM_REASON_BMISS               2u      /* WMI_ROAM_REASON_BEACON_MISS */
++#define MGMT_SEND_DOWNLD_LEN            64u
++
++#define JOIN_TRIES                      3u
++#define JOIN_FRAME_MS                   500u
++#define BEACON_LOSS_MS                  10000u
++#define MGMT_SLOTS                      4u
++#define MGMT_SLOT                       1024u
++
++/* ---- a small DMA buffer (contiguous, Normal NC view, device address through the SMMU) ---- */
++#define WLAN_WIMG_WCOMB                 0x6u
++int
++negroni_wlan_dma_alloc(uint32_t size, struct nwlan_dma *d)
++{
++	memset(d, 0, sizeof(*d));
++	d->size = (size + PAGE_MASK) & ~(uint32_t)PAGE_MASK;
++	if (kmem_alloc_contig(kernel_map, &d->kva, d->size, PAGE_MASK, (ppnum_t)(atop_64(MHI_DMA_MASK + 1) - 1), 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		d->kva = 0;
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)d->kva);
++	d->pa = ptoa_64(pn);
++	flush_dcache64((addr64_t)d->pa, d->size, TRUE);
++	d->nc = ml_io_map_unmappable((vm_offset_t)d->pa, d->size, WLAN_WIMG_WCOMB);
++	d->dva = d->nc ? negroni_wlan_dma_map(d->pa, d->size) : WLAN_DMA_NONE;
++	if (!pn || !d->nc || d->dva == WLAN_DMA_NONE) {
++		negroni_wlan_dma_free(d);
++		return ENOMEM;
++	}
++	return 0;
++}
++
++/* only after the chip can no longer use it (unmapped from the SMMU first) */
+ void
+-negroni_wlan_sta_join_frame(const uint8_t *frame, uint32_t len)
++negroni_wlan_dma_free(struct nwlan_dma *d)
++{
++	if (d->dva && d->dva != WLAN_DMA_NONE) {
++		negroni_wlan_dma_unmap(d->dva, d->size);
++	}
++	if (d->nc) {
++		ml_io_unmap(d->nc, d->size);
++	}
++	if (d->kva) {
++		flush_dcache64((addr64_t)d->pa, d->size, TRUE);
++		kmem_free(kernel_map, d->kva, d->size);
++	}
++	memset(d, 0, sizeof(*d));
++}
++
++/* ---- request mailbox (API threads) ---- */
++static LCK_GRP_DECLARE(j_grp, "negroni_wlan_join");
++static LCK_MTX_DECLARE(j_mtx, &j_grp);
++static struct {
++	bool assoc, disassoc;
++	uint8_t ssid[NWLAN_SSID_MAX];
++	uint32_t ssid_len;
++	char psk[NWLAN_PSK_MAX + 1];
++	uint32_t psk_len;
++} R;
++
++/* ---- driver-thread state ---- */
++static struct {
++	/* event flags (set in the service pass) */
++	volatile bool start_resp, assoc_conf, stopped, peer_deleted;
++	uint32_t start_status;
++	volatile bool auth_rx, assoc_rx;
++	uint16_t auth_status, assoc_status, assoc_aid, assoc_capab;
++	volatile bool lost;
++	uint16_t lost_reason;
++	const char *lost_why;
++	/* the BSS being joined / joined */
++	struct nwlan_bss bss;
++	bool active, vdev_started, peer, up;
++	uint64_t last_beacon_ms;
++	uint16_t seq;
++	/* management TX */
++	struct nwlan_dma mgmt;
++	bool mgmt_busy[MGMT_SLOTS];
++	uint32_t mgmt_sent, mgmt_done, mgmt_fail;
++} J;
++
++/* ---- WMI helpers ---- */
++static uint8_t *
++tlv(uint8_t *p, uint32_t tag, uint32_t len)
++{
++	uint32_t h = (tag << 16) | (len & 0xffff);
++	memcpy(p, &h, 4);
++	return p + 4;
++}
++
++static uint8_t *
++w32(uint8_t *p, uint32_t v)
+ {
+-	(void)frame;
+-	(void)len;
++	memcpy(p, &v, 4);
++	return p + 4;
++}
++
++static uint8_t *
++wmac(uint8_t *p, const uint8_t mac[6])
++{
++	memset(p, 0, 8);                /* wmi_mac_addr: 6 bytes + 2 pad */
++	memcpy(p, mac, 6);
++	return p + 8;
++}
++
++static uint32_t
++rd32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* the first TLV of an event with `tag` and at least `min` bytes */
++static const uint8_t *
++ev_tlv(const uint8_t *p, uint32_t len, uint32_t tag, uint32_t min)
++{
++	struct wmi_tlv_it it = { p, p + len };
++	const uint8_t *v;
++	uint32_t t, l;
++
++	while (negroni_wmi_tlv_next(&it, &t, &v, &l) == 1) {
++		if (t == tag && l >= min) {
++			return v;
++		}
++	}
++	return NULL;
++}
++
++/* WMI events of the join (inside the service pass: record only). True when handled. */
++bool
++negroni_wlan_join_wmi_event(uint32_t id, const uint8_t *p, uint32_t len)
++{
++	const uint8_t *v;
++
++	switch (id) {
++	case WMI_VDEV_START_RESP_EVENTID:
++		if ((v = ev_tlv(p, len, TAG_VDEV_START_RESPONSE_EVENT, 16))) {
++			J.start_status = rd32(v + 12);
++			J.start_resp = true;
++		}
++		return true;
++	case WMI_VDEV_STOPPED_EVENTID:
++		J.stopped = true;
++		return true;
++	case WMI_PEER_ASSOC_CONF_EVENTID:
++		J.assoc_conf = true;
++		return true;
++	case WMI_PEER_DELETE_RESP_EVENTID:
++		J.peer_deleted = true;
++		return true;
++	case WMI_MGMT_TX_COMPLETION_EVENTID:
++		if ((v = ev_tlv(p, len, TAG_MGMT_TX_COMPL_EVENT, 8))) {
++			uint32_t desc = rd32(v), status = rd32(v + 4);
++			if (desc < MGMT_SLOTS) {
++				J.mgmt_busy[desc] = false;
++			}
++			J.mgmt_done++;
++			if (status != 0) {
++				J.mgmt_fail++;
++			}
++		}
++		return true;
++	case WMI_PEER_STA_KICKOUT_EVENTID:
++		if ((v = ev_tlv(p, len, TAG_PEER_STA_KICKOUT_EVENT, 6)) && J.up && !memcmp(v, J.bss.bssid, 6)) {
++			J.lost = true;
++			J.lost_why = "PEER_STA_KICKOUT";
++		}
++		return true;
++	case WMI_ROAM_EVENTID:
++		if ((v = ev_tlv(p, len, TAG_ROAM_EVENT, 8)) && J.up && rd32(v + 4) == ROAM_REASON_BMISS) {
++			J.lost = true;
++			J.lost_why = "ROAM beacon miss";
++		}
++		return true;
++	case WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID:
++		negroni_wlan_wpa_key_event(p, len);    /* 0329 */
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* ---- 802.11 frames ---- */
++static uint32_t
++hdr80211(uint8_t *f, uint32_t fc, const uint8_t *da, const uint8_t *bssid)
++{
++	const uint8_t *mac = negroni_wlan_wmi_mac();
++
++	f[0] = (uint8_t)fc;
++	f[1] = (uint8_t)(fc >> 8);
++	f[2] = f[3] = 0;                /* duration: the firmware fills it */
++	memcpy(f + 4, da, 6);
++	memcpy(f + 10, mac, 6);
++	memcpy(f + 16, bssid, 6);
++	uint16_t sc = (uint16_t)(J.seq++ << 4);
++	f[22] = (uint8_t)sc;
++	f[23] = (uint8_t)(sc >> 8);
++	return 24;
++}
++
++/* an element of the BSS's saved elements (NULL if absent) */
++static const uint8_t *
++bss_ie(const struct nwlan_bss *b, uint32_t id, uint32_t *len)
++{
++	for (uint32_t o = 0; o + 2 <= b->ie_len;) {
++		uint32_t el = b->ie[o + 1];
++		if (o + 2 + el > b->ie_len) {
++			break;
++		}
++		if (b->ie[o] == id) {
++			*len = el;
++			return b->ie + o + 2;
++		}
++		o += 2 + el;
++	}
++	return NULL;
++}
++
++static bool
++bss_wmm(const struct nwlan_bss *b)
++{
++	for (uint32_t o = 0; o + 2 <= b->ie_len;) {
++		uint32_t el = b->ie[o + 1];
++		if (o + 2 + el > b->ie_len) {
++			break;
++		}
++		const uint8_t *d = b->ie + o + 2;
++		if (b->ie[o] == 221 && el >= 5 && d[0] == 0x00 && d[1] == 0x50 && d[2] == 0xf2 && d[3] == 2) {
++			return true;
++		}
++		o += 2 + el;
++	}
++	return false;
++}
++
++/* send one management frame by WMI (frame copied into a DMA slot) */
++static int
++mgmt_send(const uint8_t *frame, uint32_t len)
++{
++	uint8_t m[4 + 36 + 4 + MGMT_SEND_DOWNLD_LEN];
++	uint32_t slot = MGMT_SLOTS;
++
++	if (len > MGMT_SLOT || !J.mgmt.nc) {
++		return EMSGSIZE;
++	}
++	for (uint32_t i = 0; i < MGMT_SLOTS; i++) {
++		if (!J.mgmt_busy[i]) {
++			slot = i;
++			break;
++		}
++	}
++	if (slot == MGMT_SLOTS) {
++		return ENOBUFS;
++	}
++	memcpy((void *)(J.mgmt.nc + slot * MGMT_SLOT), frame, len);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint64_t a = J.mgmt.dva + (uint64_t)slot * MGMT_SLOT;
++	uint32_t dl = MIN(len, MGMT_SEND_DOWNLD_LEN);
++	memset(m, 0, sizeof(m));
++	uint8_t *p = tlv(m, TAG_MGMT_TX_SEND_CMD, 32);
++	p = w32(p, 0);                  /* vdev */
++	p = w32(p, slot);               /* desc_id */
++	p = w32(p, 0);                  /* chanfreq: the vdev's channel */
++	p = w32(p, (uint32_t)a);
++	p = w32(p, (uint32_t)(a >> 32));
++	p = w32(p, len);
++	p = w32(p, dl);
++	p = w32(p, 0);                  /* tx_params_valid */
++	p = tlv(p, TAG_ARRAY_BYTE, dl);
++	memcpy(p, frame, dl);
++	p += (dl + 3) & ~3u;
++	J.mgmt_busy[slot] = true;
++	J.mgmt_sent++;
++	int error = negroni_wlan_wmi_send(WMI_MGMT_TX_SEND_CMDID, m, (uint32_t)(p - m));
++	if (error) {
++		J.mgmt_busy[slot] = false;
++	}
++	return error;
++}
++
++/* non-beacon management frames from WMI MGMT_RX (service pass: record only) */
++void
++negroni_wlan_sta_join_frame(const uint8_t *f, uint32_t len)
++{
++	if (len < 24 || !J.active) {
++		return;
++	}
++	uint32_t fc = f[0] | f[1] << 8, type = (fc >> 2) & 3, sub = (fc >> 4) & 0xf;
++	const uint8_t *sa = f + 10, *body = f + 24;
++	uint32_t bl = len - 24;
++
++	if (type != 0 || memcmp(sa, J.bss.bssid, 6) || memcmp(f + 4, negroni_wlan_wmi_mac(), 6)) {
++		return;
++	}
++	switch (sub) {
++	case 11:        /* authentication */
++		if (bl >= 6 && (body[0] | body[1] << 8) == 0 && (body[2] | body[3] << 8) == 2) {
++			J.auth_status = (uint16_t)(body[4] | body[5] << 8);
++			J.auth_rx = true;
++		}
++		break;
++	case 1:         /* association response */
++	case 3:         /* reassociation response */
++		if (bl >= 6) {
++			J.assoc_capab = (uint16_t)(body[0] | body[1] << 8);
++			J.assoc_status = (uint16_t)(body[2] | body[3] << 8);
++			J.assoc_aid = (uint16_t)((body[4] | body[5] << 8) & 0x3fff);
++			J.assoc_rx = true;
++		}
++		break;
++	case 10:        /* disassociation */
++	case 12:        /* deauthentication */
++		if (J.up || J.peer) {
++			J.lost = true;
++			J.lost_reason = bl >= 2 ? (uint16_t)(body[0] | body[1] << 8) : 0;
++			J.lost_why = sub == 12 ? "deauthentication from the AP" : "disassociation from the AP";
++		}
++		break;
++	default:
++		break;
++	}
+ }
+ 
+ void
+ negroni_wlan_sta_beacon_seen(const uint8_t bssid[6])
+ {
+-	(void)bssid;
++	if (J.active && !memcmp(bssid, J.bss.bssid, 6)) {
++		J.last_beacon_ms = negroni_wlan_ms();
++	}
++}
++
++/* ---- WMI commands ---- */
++static bool
++is_2g(uint32_t f)
++{
++	return f < 3000;
++}
++
++static int
++vdev_start(const struct nwlan_bss *b)
++{
++	uint8_t m[4 + 104 + 4 + 24 + 4];
++	uint32_t chains = negroni_wlan_wmi_chains();
++	uint8_t *p;
++
++	memset(m, 0, sizeof(m));
++	/* wmi_vdev_start_request_cmd: 26 u32 after the header (wmi.h:2681) */
++	p = m + 4;
++	p = w32(p, 0);                          /* vdev_id */
++	p = w32(p, 0);                          /* requestor_id */
++	p = w32(p, b->beacon_int ? b->beacon_int : 100);
++	p = w32(p, 1);                          /* dtim_period (the TIM element updates it in the firmware) */
++	p = w32(p, VDEV_START_LDPC_RX_ENABLED); /* flags */
++	p += 36;                                /* wmi_ssid {len, 8 words}: empty for a STA */
++	p = w32(p, 0);                          /* bcn_tx_rate */
++	p = w32(p, 0);                          /* bcn_txpower */
++	p = w32(p, 0);                          /* num_noa_descriptors */
++	p = w32(p, 0);                          /* disable_hw_ack */
++	p = w32(p, chains);                     /* preferred_tx_streams */
++	p = w32(p, chains);                     /* preferred_rx_streams */
++	p = w32(p, 0);                          /* he_ops */
++	p = w32(p, 0);                          /* cac_duration_ms */
++	p = w32(p, 0);                          /* regdomain */
++	p = w32(p, 0);                          /* min_data_rate */
++	p = w32(p, 0);                          /* mbssid_flags */
++	p = w32(p, 0);                          /* mbssid_tx_vdev_id */
++	(void)tlv(m, TAG_VDEV_START_REQUEST_CMD, (uint32_t)(p - m) - 4);
++	p = tlv(p, TAG_CHANNEL, 24);
++	p = w32(p, b->freq);
++	p = w32(p, b->freq);                    /* band_center_freq1: 20 MHz */
++	p = w32(p, 0);
++	p = w32(p, is_2g(b->freq) ? MODE_11AX_HE20_2G : MODE_11AX_HE20);       /* ath11k_phymodes[band][20] */
++	p = w32(p, (20u << 8) | (20u << 16));   /* reg_info_1: max power, max reg power (dBm) */
++	p = w32(p, 20u << 8);                   /* reg_info_2: max tx power */
++	p = tlv(p, TAG_ARRAY_STRUCT, 0);        /* no NoA descriptors */
++	J.start_resp = false;
++	int error = negroni_wlan_wmi_send(WMI_VDEV_START_REQUEST_CMDID, m, (uint32_t)(p - m));
++	if (!error) {
++		error = negroni_wlan_wmi_wait(&J.start_resp, 3000, "VDEV_START_RESP");
++	}
++	if (!error && J.start_status != 0) {
++		error = negroni_wlan_failed(EIO, "VDEV_START status %u", J.start_status);
++	}
++	return error;
++}
++
++static int
++vdev_simple(uint32_t cmd, uint32_t tag, const char *what)
++{
++	uint8_t m[4 + 4];
++	(void)w32(tlv(m, tag, 4), 0);
++	int error = negroni_wlan_wmi_send(cmd, m, sizeof(m));
++	if (error) {
++		printf("NEGRONI WLAN: JOIN %s not sent (error %d)\n", what, error);
++	}
++	return error;
++}
++
++static int
++peer_cmd(uint32_t cmd, uint32_t tag, bool create)
++{
++	uint8_t m[4 + 4 + 8 + 4];
++	uint8_t *p = tlv(m, tag, create ? 16 : 12);
++	p = w32(p, 0);
++	p = wmac(p, J.bss.bssid);
++	if (create) {
++		p = w32(p, 0);                  /* WMI_PEER_TYPE_DEFAULT */
++	}
++	return negroni_wlan_wmi_send(cmd, m, (uint32_t)(p - m));
++}
++
++int
++negroni_wlan_peer_set_param(const uint8_t mac[6], uint32_t param, uint32_t value)
++{
++	uint8_t m[4 + 4 + 8 + 8];
++	uint8_t *p = tlv(m, TAG_PEER_SET_PARAM_CMD, 20);
++	p = w32(p, 0);
++	p = wmac(p, mac);
++	p = w32(p, param);
++	p = w32(p, value);
++	return negroni_wlan_wmi_send(WMI_PEER_SET_PARAM_CMDID, m, (uint32_t)(p - m));
++}
++
++static int
++vdev_set_param(uint32_t param, uint32_t value)
++{
++	uint8_t m[4 + 12];
++	uint8_t *p = tlv(m, TAG_VDEV_SET_PARAM_CMD, 12);
++	p = w32(p, 0);
++	p = w32(p, param);
++	p = w32(p, value);
++	return negroni_wlan_wmi_send(WMI_VDEV_SET_PARAM_CMDID, m, (uint32_t)(p - m));
++}
++
++static int
++sta_ps_off(void)
++{
++	uint8_t m[4 + 8];
++	uint8_t *p = tlv(m, TAG_STA_POWERSAVE_MODE_CMD, 8);
++	p = w32(p, 0);
++	p = w32(p, 0);                  /* WMI_STA_PS_MODE_DISABLED */
++	return negroni_wlan_wmi_send(WMI_STA_POWERSAVE_MODE_CMDID, m, (uint32_t)(p - m));
++}
++
++/* ath11k_parse_mpdudensity */
++static uint32_t
++mpdu_density(uint32_t d)
++{
++	static const uint8_t t[8] = { 0, 1, 1, 1, 2, 4, 8, 16 };
++	return t[d & 7];
++}
++
++/* the AP's rates in ath11k's form: 500 kb/s units, bit 7 for CCK (ath11k_mac_bitrate_to_rate) */
++static uint32_t
++legacy_rates(const struct nwlan_bss *b, uint8_t out[16])
++{
++	uint32_t n = 0, l;
++	const uint8_t *d;
++
++	for (uint32_t id = 1; id <= 50; id += 49) {     /* supported rates (1), extended (50) */
++		if (!(d = bss_ie(b, id, &l))) {
++			continue;
++		}
++		for (uint32_t i = 0; i < l && n < 16; i++) {
++			uint32_t r = d[i] & 0x7f;
++			if (r == 0x7f || r == 0) {
++				continue;               /* BSS membership selectors */
++			}
++			bool cck = r == 2 || r == 4 || r == 11 || r == 22;
++			if (cck && !is_2g(b->freq)) {
++				continue;
++			}
++			out[n++] = (uint8_t)(r | (cck ? 0x80 : 0));
++		}
++	}
++	return n;
++}
++
++/* WMI_PEER_ASSOC from the AP's elements (ath11k_peer_assoc_prepare for a 20 MHz HT or legacy peer) */
++static int
++peer_assoc(bool rsn)
++{
++	static uint8_t m[512];
++	uint8_t leg[16], ht[16];
++	uint32_t nleg = legacy_rates(&J.bss, leg), nht = 0, l = 0;
++	const uint8_t *htc = bss_ie(&J.bss, 45, &l);
++	bool has_ht = htc && l >= 19;
++	uint32_t chains = MAX(negroni_wlan_wmi_chains(), 1u), nss = 1;
++	uint32_t flags = PEER_AUTH, rate_caps = 0, ht_caps = 0, max_mpdu = 0, density = 0, phymode;
++	bool ofdm_only = true;
++
++	for (uint32_t i = 0; i < nleg; i++) {
++		ofdm_only = ofdm_only && !(leg[i] & 0x80);
++	}
++	if (has_ht) {
++		uint32_t cap = htc[0] | htc[1] << 8, ampdu = htc[2];
++		ht_caps = cap & ~(0x20u | 0x40u);       /* SGI bits cleared, RC_SGI instead (default GI) */
++		max_mpdu = (1u << (13 + (ampdu & 3))) - 1;
++		density = mpdu_density((ampdu >> 2) & 7);
++		rate_caps |= RC_HT_FLAG;
++		if (cap & 0x20) {
++			rate_caps |= RC_SGI_FLAG;
++		}
++		if (cap & 0x1) {
++			flags |= PEER_LDPC;
++		}
++		for (uint32_t i = 0; i < 8 * MIN(chains, 2u); i++) {
++			if (htc[3 + i / 8] & (1u << (i % 8))) {
++				ht[nht++] = (uint8_t)i;
++				nss = MAX(nss, i / 8 + 1);
++			}
++		}
++		if (htc[4] && chains >= 2) {
++			rate_caps |= RC_DS_FLAG;
++		}
++		if (nht == 0) {                         /* ath11k: MCS 0-7 are mandatory */
++			for (nht = 0; nht < 8; nht++) {
++				ht[nht] = (uint8_t)nht;
++			}
++		}
++		flags |= PEER_HT;
++	}
++	if (bss_wmm(&J.bss)) {
++		flags |= PEER_QOS;                      /* is_wme_set + qos_flag */
++	} else {
++		flags &= ~(PEER_HT | PEER_LDPC);        /* ath11k sets HT flags only with WME */
++	}
++	if (rsn) {
++		flags |= PEER_NEED_PTK_4_WAY;
++		flags &= ~PEER_AUTH;                    /* authorised at key installation (hw crypto) */
++	}
++	if (is_2g(J.bss.freq)) {
++		phymode = has_ht ? MODE_11NG_HT20 : ofdm_only ? MODE_11G : MODE_11B;
++	} else {
++		phymode = has_ht ? MODE_11NA_HT20 : MODE_11A;
++	}
++
++	uint32_t la = (nleg + 3) & ~3u, ha = (nht + 3) & ~3u;
++	uint8_t *p = m;
++	memset(m, 0, sizeof(m));
++	/* wmi_peer_assoc_complete_cmd: hdr, mac(8), then 17 u32 up to num_peer_ht_rates..., see wmi.h */
++	uint8_t *c = p + 4;
++	c = wmac(c, J.bss.bssid);
++	c = w32(c, 0);                          /* vdev_id */
++	c = w32(c, 1);                          /* peer_new_assoc */
++	c = w32(c, J.assoc_aid);                /* peer_associd */
++	c = w32(c, flags);
++	c = w32(c, J.assoc_capab);              /* peer_caps */
++	c = w32(c, 10);                         /* peer_listen_intval (our ASSOC REQ) */
++	c = w32(c, ht_caps);
++	c = w32(c, max_mpdu);
++	c = w32(c, density);
++	c = w32(c, rate_caps);
++	c = w32(c, nss);
++	c = w32(c, 0);                          /* peer_vht_caps */
++	c = w32(c, phymode);
++	c = w32(c, 0);                          /* peer_ht_info[0] */
++	c = w32(c, 0);                          /* peer_ht_info[1] */
++	c = w32(c, nleg);
++	c = w32(c, nht);
++	c = w32(c, 0);                          /* peer_bw_rxnss_override */
++	/* wmi_ppe_threshold: numss_m1, ru_count, ppet16_ppet8_ru3_ru0[8] */
++	for (int i = 0; i < 10; i++) {
++		c = w32(c, 0);
++	}
++	c = w32(c, 0);                          /* peer_he_cap_info */
++	c = w32(c, 0);                          /* peer_he_ops */
++	for (int i = 0; i < 3; i++) {
++		c = w32(c, 0);                  /* peer_he_cap_phy[3] */
++	}
++	c = w32(c, 0);                          /* peer_he_mcs */
++	c = w32(c, 0);                          /* peer_he_cap_info_ext */
++	c = w32(c, 0);                          /* peer_he_cap_info_internal */
++	c = w32(c, 0);                          /* min_data_rate */
++	c = w32(c, 0);                          /* peer_he_caps_6ghz */
++	(void)tlv(p, TAG_PEER_ASSOC_COMPLETE_CMD, (uint32_t)(c - p) - 4);
++	p = tlv(c, TAG_ARRAY_BYTE, la);
++	memcpy(p, leg, nleg);
++	p += la;
++	p = tlv(p, TAG_ARRAY_BYTE, ha);
++	memcpy(p, ht, nht);
++	p += ha;
++	p = tlv(p, TAG_VHT_RATE_SET, 20);       /* wmi_vht_rate_set: not VHT capable -> zeroes */
++	p += 20;
++	p = tlv(p, TAG_ARRAY_STRUCT, 0);        /* no HE rate sets */
++	J.assoc_conf = false;
++	int error = negroni_wlan_wmi_send(WMI_PEER_ASSOC_CMDID, m, (uint32_t)(p - m));
++	printf("NEGRONI WLAN: JOIN PEER_ASSOC: AID %u, phymode %u, %u legacy + %u HT rates, nss %u, flags %#x, rate caps %#x, "
++	    "ht caps %#x\n", J.assoc_aid, phymode, nleg, nht, nss, flags, rate_caps, ht_caps);
++	if (!error) {
++		error = negroni_wlan_wmi_wait(&J.assoc_conf, 1000, "PEER_ASSOC_CONF");
++	}
++	return error;
++}
++
++static int
++vdev_up(void)
++{
++	uint8_t m[4 + 8 + 16 + 8];
++	uint8_t *p = tlv(m, TAG_VDEV_UP_CMD, 32);
++	p = w32(p, 0);
++	p = w32(p, J.assoc_aid);
++	p = wmac(p, J.bss.bssid);
++	p = wmac(p, (const uint8_t[6]){ 0 });   /* tx_vdev_bssid */
++	p = w32(p, 0);
++	p = w32(p, 0);
++	return negroni_wlan_wmi_send(WMI_VDEV_UP_CMDID, m, (uint32_t)(p - m));
+ }
+ 
++/* wait for a received frame flag, servicing the chip; false on time-out */
++static bool
++wait_frame(volatile bool *flag, uint32_t ms)
++{
++	uint64_t deadline = negroni_wlan_ms() + ms;
++	while (!*flag) {
++		if (negroni_wlan_service() || negroni_wlan_ms() >= deadline) {
++			return false;
++		}
++		negroni_wlan_nap(2);
++	}
++	return true;
++}
++
++static int
++send_auth(void)
++{
++	uint8_t f[24 + 6];
++	uint32_t n = hdr80211(f, 0x00b0, J.bss.bssid, J.bss.bssid);
++	f[n++] = 0; f[n++] = 0;                 /* open system */
++	f[n++] = 1; f[n++] = 0;                 /* transaction 1 */
++	f[n++] = 0; f[n++] = 0;                 /* status */
++	return mgmt_send(f, n);
++}
++
++static int
++send_assoc(const uint8_t *rsn_ie, uint32_t rsn_len)
++{
++	uint8_t f[MGMT_SLOT];
++	uint32_t n = hdr80211(f, 0x0000, J.bss.bssid, J.bss.bssid), l;
++	uint16_t capab = 0x0001 | (J.bss.capab & (0x0020 | 0x0400)) | (rsn_len ? 0x0010 : 0);
++	const uint8_t *d;
++
++	f[n++] = (uint8_t)capab;
++	f[n++] = (uint8_t)(capab >> 8);
++	f[n++] = 10; f[n++] = 0;                /* listen interval */
++	f[n++] = 0;                             /* SSID */
++	f[n++] = J.bss.ssid_len;
++	memcpy(f + n, J.bss.ssid, J.bss.ssid_len);
++	n += J.bss.ssid_len;
++	for (uint32_t id = 1; id <= 50; id += 49) {     /* rates as the AP announces them */
++		if ((d = bss_ie(&J.bss, id, &l)) && l <= 255) {
++			f[n++] = (uint8_t)id;
++			f[n++] = (uint8_t)l;
++			memcpy(f + n, d, l);
++			n += l;
++		}
++	}
++	if (rsn_len && rsn_len + 2 <= 64) {
++		f[n++] = 48;
++		f[n++] = (uint8_t)rsn_len;
++		memcpy(f + n, rsn_ie, rsn_len);
++		n += rsn_len;
++	}
++	if (bss_ie(&J.bss, 45, &l) && bss_wmm(&J.bss)) {
++		/* HT capabilities (9.4.2.56): LDPC, SM PS disabled, SGI 20; A-MPDU 64 KiB; MCS 0-7 (0-15 with 2 chains) */
++		uint16_t cap = 0x0001 | 0x000c | 0x0020;
++		memset(f + n, 0, 28);
++		f[n] = 45;
++		f[n + 1] = 26;
++		f[n + 2] = (uint8_t)cap;
++		f[n + 3] = (uint8_t)(cap >> 8);
++		f[n + 4] = 0x03;                        /* max A-MPDU exponent 3, no density restriction */
++		f[n + 5] = 0xff;                        /* rx MCS bitmask: MCS 0-7 */
++		f[n + 6] = negroni_wlan_wmi_chains() >= 2 ? 0xff : 0x00;
++		f[n + 17] = 0x01;                       /* tx MCS set defined (byte 12 of the MCS set) */
++		n += 28;
++	}
++	if (bss_wmm(&J.bss)) {
++		static const uint8_t wmm[9] = { 221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0 };
++		memcpy(f + n, wmm, sizeof(wmm));
++		n += sizeof(wmm);
++	}
++	return mgmt_send(f, n);
++}
++
++static int
++send_deauth(uint16_t reason)
++{
++	uint8_t f[26];
++	uint32_t n = hdr80211(f, 0x00c0, J.bss.bssid, J.bss.bssid);
++	f[n++] = (uint8_t)reason;
++	f[n++] = (uint8_t)(reason >> 8);
++	return mgmt_send(f, n);
++}
++
++/* everything down, back to IDLE (ath11k bss_disassoc + peer delete + vdev stop) */
++static void
++join_down(int error, uint16_t reason, const char *why)
++{
++	negroni_wlan_wpa_reset();                       /* 0329: keys and handshake state */
++	negroni_wlan_dp_link_down();                   /* 0328 */
++	if (J.up) {
++		(void)vdev_simple(WMI_VDEV_DOWN_CMDID, TAG_VDEV_DOWN_CMD, "VDEV_DOWN");
++	}
++	/* ath11k station_remove with vdev_start_delay: stop the vdev early, then delete the peer */
++	if (J.vdev_started) {
++		J.stopped = false;
++		if (!vdev_simple(WMI_VDEV_STOP_CMDID, TAG_VDEV_STOP_CMD, "VDEV_STOP")) {
++			(void)negroni_wlan_wmi_wait(&J.stopped, 3000, "VDEV_STOPPED");
++		}
++	}
++	if (J.peer) {
++		J.peer_deleted = false;
++		if (!peer_cmd(WMI_PEER_DELETE_CMDID, TAG_PEER_DELETE_CMD, false)) {
++			(void)negroni_wlan_wmi_wait(&J.peer_deleted, 3000, "PEER_DELETE_RESP");
++		}
++	}
++	printf("NEGRONI WLAN: JOIN down: %s (error %d, 802.11 code %u)\n", why, error, reason);
++	J.up = J.peer = J.vdev_started = J.active = false;
++	negroni_wlan_sta_set_link(NULL, NWLAN_STATE_IDLE, error, reason, 0);
++}
++
++/* the whole join, on the driver thread (top level) */
++static void
++join_run(const uint8_t *ssid, uint32_t ssid_len, const char *psk, uint32_t psk_len)
++{
++	int error;
++	bool rsn = psk_len != 0;
++
++	if (!negroni_wlan_sta_find(ssid, ssid_len, &J.bss)) {
++		printf("NEGRONI WLAN: JOIN: SSID not in the list; scanning\n");
++		negroni_wlan_sta_set_link(NULL, NWLAN_STATE_SCANNING, 0, 0, 0);
++		if (negroni_wlan_wmi_scan_start() == 0) {
++			uint64_t deadline = negroni_wlan_ms() + 30000;
++			while (negroni_wlan_sta_state() == NWLAN_STATE_SCANNING && negroni_wlan_ms() < deadline) {
++				if (negroni_wlan_service()) {
++					break;
++				}
++				negroni_wlan_nap(5);
++			}
++		}
++		if (!negroni_wlan_sta_find(ssid, ssid_len, &J.bss)) {
++			negroni_wlan_sta_join_failed(NULL, ENOENT, 0);         /* LINK_DOWN with last_error */
++			printf("NEGRONI WLAN: JOIN: no BSS with that SSID\n");
++			return;
++		}
++	}
++	if ((J.bss.security & (NWLAN_SEC_WEP | NWLAN_SEC_WPA | NWLAN_SEC_WPA2_OTHER)) ||
++	    (rsn != !!(J.bss.security & NWLAN_SEC_WPA2_PSK))) {
++		printf("NEGRONI WLAN: JOIN: BSS security %#x does not match the request (%s)\n", J.bss.security,
++		    rsn ? "WPA2-PSK" : "open");
++		negroni_wlan_sta_join_failed(&J.bss, ENOTSUP, 0);
++		return;
++	}
++	J.active = true;
++	J.lost = false;
++	J.last_beacon_ms = negroni_wlan_ms();
++	negroni_wlan_sta_set_link(&J.bss, NWLAN_STATE_JOINING, 0, 0, 0);
++	printf("NEGRONI WLAN: JOIN %02x:%02x:%02x:xx:xx:xx, %u MHz, RSSI %d dBm, security %#x\n", J.bss.bssid[0],
++	    J.bss.bssid[1], J.bss.bssid[2], J.bss.freq, J.bss.rssi, J.bss.security);
++
++	if (!J.mgmt.nc && (error = negroni_wlan_dma_alloc(MGMT_SLOTS * MGMT_SLOT, &J.mgmt))) {
++		join_down(error, 0, "no DMA buffer for management frames");
++		return;
++	}
++	/* WCN6855 has vdev_start_delay: the BSS peer must exist before VDEV_START (ath11k mac.c assign_vif_chanctx) */
++	if ((error = peer_cmd(WMI_PEER_CREATE_CMDID, TAG_PEER_CREATE_CMD, true))) {
++		join_down(error, 0, "PEER_CREATE not sent");
++		return;
++	}
++	J.peer = true;
++	if ((error = negroni_wlan_dp_wait_peer(J.bss.bssid))) {        /* 0328: HTT peer map + dp peer setup */
++		join_down(error, 0, "peer map / data path peer setup");
++		return;
++	}
++	if ((error = vdev_start(&J.bss))) {
++		join_down(error, 0, "VDEV_START failed");
++		return;
++	}
++	J.vdev_started = true;
++	printf("NEGRONI WLAN: JOIN vdev 0 started on %u MHz\n", J.bss.freq);
++
++	bool ok = false;
++	for (uint32_t t = 0; t < JOIN_TRIES && !ok; t++) {
++		J.auth_rx = false;
++		if ((error = send_auth())) {
++			break;
++		}
++		ok = wait_frame(&J.auth_rx, JOIN_FRAME_MS) && J.auth_status == 0;
++		if (J.auth_rx && J.auth_status != 0) {
++			break;
++		}
++	}
++	printf("NEGRONI WLAN: JOIN AUTH %s (status %u, %u mgmt frames sent, %u completed, %u failed)\n",
++	    ok ? "accepted" : "FAILED", J.auth_rx ? J.auth_status : 0xffff, J.mgmt_sent, J.mgmt_done, J.mgmt_fail);
++	if (!ok) {
++		join_down(error ? error : ETIMEDOUT, J.auth_rx ? J.auth_status : 0, "authentication");
++		return;
++	}
++
++	uint8_t rsn_ie[32];
++	uint32_t rsn_len = rsn ? negroni_wlan_wpa_rsn_ie(rsn_ie, sizeof(rsn_ie)) : 0;   /* 0329 */
++	ok = false;
++	for (uint32_t t = 0; t < JOIN_TRIES && !ok; t++) {
++		J.assoc_rx = false;
++		if ((error = send_assoc(rsn_ie, rsn_len))) {
++			break;
++		}
++		ok = wait_frame(&J.assoc_rx, JOIN_FRAME_MS) && J.assoc_status == 0;
++		if (J.assoc_rx && J.assoc_status != 0) {
++			break;
++		}
++	}
++	printf("NEGRONI WLAN: JOIN ASSOC %s (status %u, AID %u, capability %#x)\n", ok ? "accepted" : "FAILED",
++	    J.assoc_rx ? J.assoc_status : 0xffff, J.assoc_aid, J.assoc_capab);
++	if (!ok) {
++		join_down(error ? error : ETIMEDOUT, J.assoc_rx ? J.assoc_status : 0, "association");
++		return;
++	}
++	if ((error = peer_assoc(rsn)) || (error = vdev_up())) {
++		join_down(error, 0, "PEER_ASSOC / VDEV_UP");
++		return;
++	}
++	J.up = true;
++	J.last_beacon_ms = negroni_wlan_ms();
++	(void)vdev_set_param(VDEV_PARAM_DTIM_POLICY, DTIM_POLICY_STICK);
++	(void)sta_ps_off();
++	negroni_wlan_dp_link_up(J.bss.bssid, J.assoc_aid);    /* 0328 */
++	printf("NEGRONI WLAN: JOIN associated (SSID of %u bytes) AID %u\n", J.bss.ssid_len, J.assoc_aid);   /* no SSID in the log */
++	if (rsn) {
++		negroni_wlan_sta_set_link(&J.bss, NWLAN_STATE_HANDSHAKE, 0, 0, J.assoc_aid);
++		negroni_wlan_wpa_start(J.bss.bssid, J.bss.ssid, J.bss.ssid_len, psk, psk_len, rsn_ie, rsn_len);
++		return;
++	}
++	if ((error = negroni_wlan_peer_set_param(J.bss.bssid, PEER_PARAM_AUTHORIZE, 1))) {
++		join_down(error, 0, "PEER AUTHORIZE");
++		return;
++	}
++	negroni_wlan_sta_set_link(&J.bss, NWLAN_STATE_CONNECTED, 0, 0, J.assoc_aid);
++}
++
++/* 0329 calls it when the 4-way handshake ended (keys installed: authorise; else down) */
+ void
+-negroni_wlan_sta_join_service(void)
++negroni_wlan_join_handshake_done(int error, uint16_t reason)
+ {
++	if (error) {
++		J.lost = true;
++		J.lost_reason = reason;
++		J.lost_why = "WPA2 handshake";
++		return;
++	}
++	if (negroni_wlan_peer_set_param(J.bss.bssid, PEER_PARAM_AUTHORIZE, 1) == 0) {
++		negroni_wlan_sta_set_link(&J.bss, NWLAN_STATE_CONNECTED, 0, 0, J.assoc_aid);
++	} else {
++		J.lost = true;
++		J.lost_why = "PEER AUTHORIZE";
++	}
+ }
+ 
+-uint32_t
+-negroni_wlan_sta_join_caps(void)
++const struct nwlan_bss *
++negroni_wlan_join_bss(void)
+ {
+-	return 0;
++	return J.active ? &J.bss : NULL;
+ }
+ 
++/* keep-alive pass (top level) */
+ void
+-negroni_wlan_sta_link_counters(struct nwlan_link *out)
++negroni_wlan_sta_join_service(void)
+ {
+-	(void)out;
++	bool assoc, disassoc;
++	uint8_t ssid[NWLAN_SSID_MAX];
++	uint32_t ssid_len = 0, psk_len = 0;
++	char psk[NWLAN_PSK_MAX + 1];
++
++	if (negroni_wlan_sta_scanning()) {
++		return;                 /* an API scan runs: requests wait for its end (or its 30 s time-out) */
++	}
++	lck_mtx_lock(&j_mtx);
++	assoc = R.assoc;
++	disassoc = R.disassoc;
++	R.assoc = R.disassoc = false;
++	if (assoc) {
++		ssid_len = R.ssid_len;
++		memcpy(ssid, R.ssid, ssid_len);
++		psk_len = R.psk_len;
++		memcpy(psk, R.psk, sizeof(psk));
++		negroni_wlan_wipe(R.psk, sizeof(R.psk));
++		R.psk_len = 0;
++	}
++	lck_mtx_unlock(&j_mtx);
++
++	if ((disassoc || assoc) && J.active) {
++		if (J.up) {
++			(void)send_deauth(3);           /* leaving */
++		}
++		join_down(0, 3, disassoc ? "disassociate request" : "new associate request");
++	}
++	if (assoc) {
++		negroni_wlan_sta_scan_cancel();        /* a scan request not yet started ends with SCAN_DONE */
++		join_run(ssid, ssid_len, psk_len ? psk : NULL, psk_len);
++		negroni_wlan_wipe(psk, sizeof(psk));
++		return;
++	}
++	if (!J.active) {
++		return;
++	}
++	if (J.up && !J.lost && negroni_wlan_ms() - J.last_beacon_ms > BEACON_LOSS_MS) {
++		J.lost = true;
++		J.lost_why = "no beacon for 10 s";
++	}
++	if (J.lost) {
++		join_down(ENOTCONN, J.lost_reason, J.lost_why ? J.lost_why : "link lost");
++		return;
++	}
++	negroni_wlan_wpa_service();                    /* 0329: handshake time-outs */
+ }
+ 
+-int
+-negroni_wlan_associate(const uint8_t *ssid, uint32_t ssid_len, const char *psk, uint32_t psk_len)
++uint32_t
++negroni_wlan_sta_join_caps(void)
+ {
+-	(void)ssid;
+-	(void)ssid_len;
+-	(void)psk;
+-	(void)psk_len;
+-	return ENOTSUP;
++	return NWLAN_CAP_JOIN_OPEN | negroni_wlan_dp_caps() | negroni_wlan_wpa_caps();
+ }
+ 
++/* ---- API ---- */
+ int
+-negroni_wlan_disassociate(void)
++negroni_wlan_associate(const uint8_t *ssid, uint32_t ssid_len, const char *psk, uint32_t psk_len)
+ {
+-	return ENOTSUP;
++	if (!ssid || ssid_len == 0 || ssid_len > NWLAN_SSID_MAX || (psk && psk_len && (psk_len < NWLAN_PSK_MIN ||
++	    psk_len > NWLAN_PSK_MAX))) {
++		return EINVAL;
++	}
++	if (psk && psk_len && !(negroni_wlan_wpa_caps() & NWLAN_CAP_WPA2_PSK)) {
++		return ENOTSUP;
++	}
++	uint32_t st = negroni_wlan_sta_state();
++	if (st < NWLAN_STATE_IDLE || st == NWLAN_STATE_FAILED) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&j_mtx);
++	R.assoc = true;
++	R.ssid_len = ssid_len;
++	memcpy(R.ssid, ssid, ssid_len);
++	negroni_wlan_wipe(R.psk, sizeof(R.psk));
++	R.psk_len = (psk && psk_len) ? psk_len : 0;
++	if (R.psk_len) {
++		memcpy(R.psk, psk, psk_len);
++	}
++	lck_mtx_unlock(&j_mtx);
++	return 0;
+ }
+ 
+ int
+-negroni_wlan_tx(const uint8_t *frame, uint32_t len)
++negroni_wlan_disassociate(void)
+ {
+-	(void)frame;
+-	(void)len;
+-	return ENOTSUP;
++	lck_mtx_lock(&j_mtx);
++	R.disassoc = true;
++	R.assoc = false;
++	negroni_wlan_wipe(R.psk, sizeof(R.psk));
++	lck_mtx_unlock(&j_mtx);
++	return 0;
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_sta.c b/bsd/dev/negroni_wlan_sta.c
+index 7d7dd20..078ea9f 100644
+--- a/bsd/dev/negroni_wlan_sta.c
++++ b/bsd/dev/negroni_wlan_sta.c
+@@ -307,6 +307,15 @@ negroni_wlan_sta_service(void)
+ 	negroni_wlan_sta_join_service();               /* 0327 */
+ }
+ 
++void
++negroni_wlan_wipe(void *p, size_t n)
++{
++	volatile uint8_t *v = p;
++	while (n--) {
++		*v++ = 0;
++	}
++}
++
+ /* ================================ API ================================ */
+ uint32_t
+ negroni_wlan_api_version(void)
+diff --git a/bsd/dev/negroni_wlan_sta.h b/bsd/dev/negroni_wlan_sta.h
+index 6208fb8..5cb7ed3 100644
+--- a/bsd/dev/negroni_wlan_sta.h
++++ b/bsd/dev/negroni_wlan_sta.h
+@@ -8,6 +8,8 @@
+ 
+ #include <stdint.h>
+ #include <stdbool.h>
++#include <mach/vm_types.h>
++#include <stddef.h>
+ #include "negroni_wlan_api.h"
+ 
+ /* driver life cycle -> API state (negroni_wlan.c) */
+@@ -40,7 +42,43 @@ void negroni_wlan_sta_scan_cancel(void);
+ void negroni_wlan_sta_join_failed(const struct nwlan_bss *b, int error, uint16_t reason);
+ void negroni_wlan_sta_deliver(const uint8_t *frame, uint32_t len);
+ 
+-/* negroni_wlan_join.c (0326 stubs; 0327 join, 0328 data path, 0329 WPA2 fill them in) */
++/* a small DMA buffer: contiguous, Normal NC CPU view, device address (IOVA) (negroni_wlan_join.c, 0327) */
++struct nwlan_dma {
++	vm_offset_t kva, nc;
++	uint64_t pa, dva;
++	uint32_t size;
++};
++int negroni_wlan_dma_alloc(uint32_t size, struct nwlan_dma *d);
++void negroni_wlan_dma_free(struct nwlan_dma *d);
++/* clear a secret (not optimised away) */
++void negroni_wlan_wipe(void *p, size_t n);
++
++/* negroni_wlan_join.c (0327) */
++bool negroni_wlan_join_wmi_event(uint32_t id, const uint8_t *p, uint32_t len);
++int negroni_wlan_peer_set_param(const uint8_t mac[6], uint32_t param, uint32_t value);
++void negroni_wlan_join_handshake_done(int error, uint16_t reason);
++const struct nwlan_bss *negroni_wlan_join_bss(void);
++
++/* negroni_wlan_dp.c (0327 placeholders, 0328 the HTT data path) */
++uint32_t negroni_wlan_dp_caps(void);
++int negroni_wlan_dp_wait_peer(const uint8_t mac[6]);
++void negroni_wlan_dp_link_up(const uint8_t bssid[6], uint16_t aid);
++void negroni_wlan_dp_link_down(void);
++/* 0329: send one EAPOL frame (802.3 payload after the ethertype) to the AP, unencrypted */
++int negroni_wlan_dp_tx_eapol(const uint8_t *body, uint32_t len);
++
++/* negroni_wlan_wpa.c (0327 placeholders, 0329 WPA2-PSK) */
++uint32_t negroni_wlan_wpa_caps(void);
++uint32_t negroni_wlan_wpa_rsn_ie(uint8_t *out, uint32_t cap);
++void negroni_wlan_wpa_start(const uint8_t bssid[6], const uint8_t *ssid, uint32_t ssid_len, const char *psk,
++    uint32_t psk_len, const uint8_t *rsn_ie, uint32_t rsn_len);
++void negroni_wlan_wpa_service(void);
++void negroni_wlan_wpa_reset(void);
++void negroni_wlan_wpa_key_event(const uint8_t *p, uint32_t len);
++/* 0329: an EAPOL frame (body after the ethertype) from the AP; true if consumed */
++bool negroni_wlan_wpa_rx_eapol(const uint8_t *body, uint32_t len);
++
++/* the join / data / WPA hooks of the station manager */
+ void negroni_wlan_sta_join_frame(const uint8_t *frame, uint32_t len);  /* a non-beacon management frame */
+ void negroni_wlan_sta_beacon_seen(const uint8_t bssid[6]);
+ void negroni_wlan_sta_join_service(void);
+diff --git a/bsd/dev/negroni_wlan_wmi.c b/bsd/dev/negroni_wlan_wmi.c
+index edabb84..9cee4d5 100644
+--- a/bsd/dev/negroni_wlan_wmi.c
++++ b/bsd/dev/negroni_wlan_wmi.c
+@@ -410,6 +410,9 @@ wmi_event(const uint8_t *p, uint32_t len)
+ 		M.diag++;
+ 		break;
+ 	default:
++		if (negroni_wlan_join_wmi_event(id, p, len)) {
++			break;                  /* 0327: vdev / peer / mgmt tx / kickout / roam events */
++		}
+ 		if (negroni_wlan_wmi_scan_cb && (id == WMI_SCAN_EVENTID || id == WMI_MGMT_RX_EVENTID ||
+ 		    id == WMI_CHAN_INFO_EVENTID || id == WMI_PDEV_SET_HW_MODE_RESP_EVENTID)) {
+ 			negroni_wlan_wmi_scan_cb(id, p, len);
+diff --git a/bsd/dev/negroni_wlan_wpa.c b/bsd/dev/negroni_wlan_wpa.c
+new file mode 100644
+index 0000000..cc09144
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_wpa.c
+@@ -0,0 +1,63 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: WPA2-PSK. 0327: placeholders (open networks only); 0329 replaces this file.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "negroni_wlan_sta.h"
++
++uint32_t
++negroni_wlan_wpa_caps(void)
++{
++	return 0;
++}
++
++uint32_t
++negroni_wlan_wpa_rsn_ie(uint8_t *out, uint32_t cap)
++{
++	(void)out;
++	(void)cap;
++	return 0;
++}
++
++void
++negroni_wlan_wpa_start(const uint8_t bssid[6], const uint8_t *ssid, uint32_t ssid_len, const char *psk,
++    uint32_t psk_len, const uint8_t *rsn_ie, uint32_t rsn_len)
++{
++	(void)bssid;
++	(void)ssid;
++	(void)ssid_len;
++	(void)psk;
++	(void)psk_len;
++	(void)rsn_ie;
++	(void)rsn_len;
++	negroni_wlan_join_handshake_done(ENOTSUP, 0);
++}
++
++void
++negroni_wlan_wpa_service(void)
++{
++}
++
++void
++negroni_wlan_wpa_reset(void)
++{
++}
++
++void
++negroni_wlan_wpa_key_event(const uint8_t *p, uint32_t len)
++{
++	(void)p;
++	(void)len;
++}
++
++bool
++negroni_wlan_wpa_rx_eapol(const uint8_t *body, uint32_t len)
++{
++	(void)body;
++	(void)len;
++	return false;
++}
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
