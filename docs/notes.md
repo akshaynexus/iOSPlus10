@@ -2276,3 +2276,60 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   `ldr w12, [x9]` + `add x9, x9, #0x4`, no writeback/pair/WZR/64-bit access on the SMMU mapping in wlan_dma_path,
   negroni_wlan_smmu_on/off/map/report or the camera scan (inlined in cam_thread). Gotcha: a new `#include` in 0263's
   include list broke 0265 (it anchors on that list); the include sits before `#define APPS_SMMU_PHYS` instead.
+
+## 29. Panic over USB, ctl after a panic, timed panic reset (2026-10-27, kernel agent; patch 0360, details: patches/xnu/README-panic.md)
+
+- [V, code] Why `negronipanic=30 negronipanicreason=2` never reset (section 27): the image has `debug=0xc`. DB_NMI (0x4)
+  sets `panicDebugging` on arm64 (`osfmk/kern/debug.c` debug_init). Then `debugger_collect_diagnostics()` sends
+  `PEHaltRestart(kPEPanicDiagnosticsDone)`, runs `panic_spin_shmcon()` (the "handshake structure not initialized" line)
+  and `panic_spin_forever()`; it never calls `kdp_machine_reboot_type(kPEPanicRestartCPU)`. So 0211's
+  `negroni_panic_restart()` never ran. [I] The old `delay(1000000)` loop also waited with WFE (machine_delay_until).
+- [V, code] Why the USB log had no panic text: the live log is a thread (`ud_log_thread`, every 100 ms, socket), and in
+  a panic all threads stop. The panic log body (registers, backtrace) goes through `paniclog_append_noflush` ->
+  `console_write_unbuffered`, which bypasses the console ring hook in `_cnputs`; only `negroni_log_panic()` (model_dep.c)
+  copies it into the ring, and only when the UFS partition log runs.
+- 0360: `kPEPanicDiagnosticsDone` (sent in every panic, also with panicDebugging) enters `negroni_panic_restart()`.
+  It busy-waits on `mach_absolute_time()` (no WFE, no timer), polls the DWC3 (events, ep0, ARP for 192.168.7.2, UDP
+  5141 commands), sends the console ring (with the full panic log) to 192.168.7.1:5140, and runs the timed reset.
+  Commands after a panic: `ping` -> `pong (panic)`, `log`, `reboot`, `bootloader`, `recovery`, `poweroff`. No lock,
+  no mbuf alloc/free, no sleep in panic mode. `negronipanic=0` (default) still stays on the screen, now with ctl.
+  New boot-arg `negronipanicusb=0` (off). op10tool: `ctl log` (new), `ctl ping` accepts `pong (panic)`.
+- [V] Kernel out/kernel/local-20261026-185209 (sha256 1dab7ee1...), 235 patches applied, only the 4 dxb skips;
+  `kernel.macho` now points to it. nm: `_negroni_usb_panic_begin`, `_negroni_usb_panic_service`,
+  `_negroni_panic_restart`, `ud_panic_*`; strings `pong (panic)`, `NEGRONI PANIC: ...`; objdump: the hook's switch
+  covers type 0xa (kPEPanicDiagnosticsDone) -> `bl _negroni_panic_restart`; the loop calls only
+  `negroni_usb_panic_service`, `mach_absolute_time`, `kdb_printf`, `negroni_reboot`, `negroni_power_off` (no `delay`, no WFE).
+- Not verified on the phone (no device): polled enumeration, ARP reply, ENDTRANSFER restart, reset from the loop.
+  Test: `make usblog`, panic (or `op10tool ctl panic`), look for `NEGRONI LOG: panic log follows` and
+  `NEGRONI PANIC:` in logs/usblog-*.txt, then `out/bin/op10tool ctl ping` / `ctl bootloader`.
+- Gotchas: a panic before NegroniPlatformExpert::start() (no hook yet) still stays for ever. Nested-panic "Stage 1/2
+  bailout" with panicDebugging still spins. The ring flush waits for any frame from 192.168.7.1 after the link is
+  (re)configured (usblog.sh's `settime`) or 10 s, so the text does not go out before the Mac has its address.
+
+## 30. Night of 2026-10-26/27: boots, bisection of the journal panic, Metal on (main session)
+
+- [V] Panic 2 and 3 (photos; fallback images ios16-nosmmu and ios16-noidle = every feature arg except the apps-SMMU
+  readers / except cpuidle): `Kernel data abort`, far 0, esr 0x96000045 (write, translation fault level 1), pc
+  `_memcpy+0x48`, lr `_end_transaction+0x620` (bsd/negroni_hfs/core/hfs_journal.c:3991): `memcpy(blkptr, ...)` with
+  `blkptr = &blhdrim->buffers[0]` and `blhdrim->buffers == NULL` (x8 = *(x20-8) = 0, x28 = tbuffer_offset = 0). The
+  buffer comes from `hfs_malloc_data(tbuffer_size - blhdr_size)` = IOMallocData(3 MiB - 96 KiB) at transaction start
+  (hfs_journal.c:2532). Right after `jnl: journal replay done` = the first write transaction of the root mount.
+  The root image's volume header and journal header are sane (journaled, 8 MiB journal, blhdr_size 0x18000 = what this
+  kernel computes, jhdr_size 0x200).
+- [V] Bisection (same kernel local-20261026-182859 with the SMMU accessor fix, same ADT/root; each image = config
+  args + the group + negronipanic/negronipanicreason): base args: boots to SpringBoard (frames presented). Power group
+  (adsp, adsp_step, audio_amp, audio_tone, batt, chg_glink, chg_ma, cpufreq_floor=lut): boots. Peripherals group
+  (bt=4, fp=4, fp_hl=2, hap, hap_ui, cam=2): boots to SpringBoard. Display+wifi group (fb_dbuf, dsidma, esd,
+  pwrprobe, sleep, te, teirq, vrr, wifi=10, wlan=1; kernel local-20261026-185209 with 0360): boots and runs. So no
+  single group panics; the panic needs a combination (next: power+peripherals = out/ios16-g12).
+- [I] IOMallocData(3 MiB) returning NULL = kernel data-heap VA exhausted (not physical pages: Z_WAITOK waits for
+  pages) or a corrupted pointer. The data range is a large share of the kernel map (vm_kern.c kmem_range_init), so a
+  sum of the features' buffers (< 20 MiB of KMA_DATA) is unlikely; a combination effect (a map/range change, or a
+  DMA engine writing into kernel memory) stays open.
+- [V] Phone USB link: in the base, g1 and g2a boots the host interface vanished 6-60 s after it came up
+  (`usblog: phone interface gone`), without a panic; in the g2b boot (0360 kernel) it stayed up. Not understood.
+- [V] Metal on (g2b boot, 00:27): `scripts/gpu/phone-accel.sh on` -> clients `*`, strikes cleared, backboardd
+  restarted; metal.log: backboardd and SpringBoard `device Turnip Adreno (TM) 730` opened (724 ms / 2034 ms),
+  `dead-man: strike cleared (first command buffer completed ...)`, pipelines 17 / 6 compiled, 0 failed; FB STAT
+  shows gpu presents. GL apps gate `* -backboardd`. bluetoothd crashes ("Bluetooth fatal error", reason 1201) in a
+  boot without negronibt: the root's bluetoothd job has no transport then (expected).
