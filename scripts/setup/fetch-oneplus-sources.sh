@@ -16,3 +16,12 @@ fi
 git -C "$M" sparse-checkout set --no-cone 'vendor/oplus/kernel/charger/*' 'vendor/oplus/kernel/charger/**' 'vendor/qcom/opensource/*thermal*/**' 'vendor/oplus/kernel/thermal/**' 'vendor/qcom/proprietary/devicetree-*/qcom/*waipio*' 'vendor/qcom/proprietary/devicetree-*/qcom/*pm8350*' 'vendor/qcom/proprietary/devicetree-*/qcom/*pmk8350*' 'vendor/oplus/kernel/*/devicetree/**' '**/oplus_chg*' '**/*negroni*' '**/*NE2211*' 'vendor/qcom/opensource/display-drivers/**' 2>/dev/null || true
 git -C "$M" checkout -q HEAD 2>&1 | tail -2 || true
 echo "op-modules:"; du -sh "$M"; find "$M" -maxdepth 4 -type d | head -30
+# Charger over GLINK (docs/charger-glink-plan.md): the OnePlus pmic_glink router and Linux mainline pmic_glink + battmgr.
+git -C "$K" sparse-checkout add 'drivers/soc/qcom/pmic_glink*' 'drivers/soc/qcom/altmode*' 'include/linux/soc/qcom/*'
+git -C "$K" checkout -q HEAD
+L=out/src/linux
+if [ -d "$L/.git" ]; then
+  git -C "$L" sparse-checkout add '/drivers/soc/qcom/pmic_glink*.c' '/drivers/power/supply/qcom_battmgr.c' '/include/linux/soc/qcom/pmic_glink.h'
+  git -C "$L" checkout -q HEAD
+  ls -l "$L/drivers/soc/qcom/"pmic_glink*.c "$L/drivers/power/supply/qcom_battmgr.c"
+fi

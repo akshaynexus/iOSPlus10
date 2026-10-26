@@ -1,0 +1,916 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index bc718a6..8b0b814 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -123,6 +123,7 @@ bsd/dev/negroni_spmi.c			standard
+ bsd/dev/negroni_usb.c			standard
+ bsd/dev/negroni_gpu_blit.c		standard
+ bsd/dev/negroni_audio.c			standard
++bsd/dev/negroni_chg_glink.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
+index c4b7083..d285c97 100644
+--- a/bsd/dev/negroni_adsp.c
++++ b/bsd/dev/negroni_adsp.c
+@@ -1048,6 +1048,7 @@ struct gl_channel {
+ static struct gl_channel gl_ch[NEGRONI_GLINK_CHANNELS] = {
+ 	{ .name = "IPCRTR", .lcid = 1 },        /* QRTR (stage (b): service discovery, servreg locator) */
+ 	{ .name = "adsp_apps", .lcid = 2 },     /* GPR (stage (b): APM, PRM) */
++	{ .name = "PMIC_RTR_ADSP_APPS", .lcid = 3 },    /* 0274: charger PD, answered only with negronichg_glink=1 */
+ };
+ static uint32_t gl_desc, gl_tx, gl_rx, gl_rx_len, gl_features = GL_FEATURE_INTENT_REUSE, gl_next_liid = 1;
+ static bool gl_version_ok, gl_dead, gl_notified;
+@@ -1360,7 +1361,7 @@ gl_poll(void)
+ 			gl_advance(need);
+ 			ch = NULL;
+ 			for (unsigned c = 0; c < NEGRONI_GLINK_CHANNELS; c++) {
+-				if (strcmp(gl_ch[c].name, name) == 0) {
++				if ((c != NEGRONI_GLINK_PMIC || negroni_chg_glink_wanted()) && strcmp(gl_ch[c].name, name) == 0) {
+ 					ch = &gl_ch[c];
+ 				}
+ 			}
+@@ -1598,6 +1599,67 @@ negroni_glink_send(unsigned c, const void *data, uint32_t len)
+ 	return error;
+ }
+ 
++/* 0274: open a channel after step 9 (the charger PD's PMIC_RTR_ADSP_APPS). gl_lock per poll. */
++int
++negroni_glink_open(unsigned c, unsigned intents, uint32_t wait_ms)
++{
++	struct gl_channel *ch;
++	int error = 0;
++
++	if (c >= NEGRONI_GLINK_CHANNELS) {
++		return EINVAL;
++	}
++	ch = &gl_ch[c];
++	gl_lock();
++	if (gl_dead || !gl_version_ok) {
++		error = ENOTCONN;
++	} else if (!ch->open_sent && gl_send_open(ch) != 0) {
++		error = EIO;
++	}
++	gl_unlock();
++	for (uint32_t ms = 0; error == 0 && ms < wait_ms; ms++) {
++		bool done;
++		gl_lock();
++		gl_poll();
++		done = gl_up(ch) || gl_dead;
++		gl_unlock();
++		if (done) {
++			break;
++		}
++		IOSleep(1);
++	}
++	if (error) {
++		return error;
++	}
++	gl_lock();
++	if (gl_dead) {
++		error = ENOTCONN;
++	} else if (!gl_up(ch)) {
++		error = ETIMEDOUT;
++	} else {
++		/*
++		 * A re-open after a remote CLOSE: the ADSP forgot our intents and we forget its intents.
++		 * Advertise all of ours again, clear theirs. [U] whether the ADSP takes the old lcid (we
++		 * never send CLOSE or a second OPEN).
++		 */
++		if (ch->nours > 0 && ch->intents_sent) {
++			bzero(ch->theirs, sizeof(ch->theirs));
++			for (unsigned i = 0; error == 0 && i < ch->nours; i++) {
++				ch->fill[i] = 0;
++				error = gl_advertise(ch, i) == 0 ? 0 : EIO;
++			}
++		}
++		while (error == 0 && ch->nours < MIN(intents, (unsigned)GL_OURS)) {
++			error = gl_add_intent(ch, GL_INTENT_SIZE) ? 0 : ENOMEM;
++		}
++		if (error == 0) {
++			ch->intents_sent = true;
++		}
++	}
++	gl_unlock();
++	return error;
++}
++
+ static bool
+ step_glink(void)
+ {
+@@ -1627,7 +1689,7 @@ step_glink(void)
+ 	for (ms = 0; ms < step_budget_ms && !gl_dead; ms++) {
+ 		negroni_glink_poll();
+ 		if (gl_version_ok) {
+-			for (unsigned c = 0; c < NEGRONI_GLINK_CHANNELS; c++) {
++			for (unsigned c = 0; c < NEGRONI_GLINK_STEP9; c++) {
+ 				if (!gl_ch[c].open_sent) {
+ 					say("GLINK: open %s (lcid %u)", gl_ch[c].name, gl_ch[c].lcid);
+ 					(void)gl_send_open(&gl_ch[c]);
+@@ -1645,7 +1707,7 @@ step_glink(void)
+ 		    gl_ch[1].remote_open, gl_ch[1].open_acked, gl_dead ? ", GLINK stopped" : "");
+ 		return false;
+ 	}
+-	for (unsigned c = 0; c < NEGRONI_GLINK_CHANNELS; c++) {
++	for (unsigned c = 0; c < NEGRONI_GLINK_STEP9; c++) {
+ 		for (unsigned i = 0; i < (c == 0 ? 4u : 8u); i++) {         /* leaves 4 slots for RX_INTENT_REQ */
+ 			if (!gl_add_intent(&gl_ch[c], GL_INTENT_SIZE)) {
+ 				FAIL("GLINK: %s: intent %u not given", gl_ch[c].name, i);
+diff --git a/bsd/dev/negroni_adsp.h b/bsd/dev/negroni_adsp.h
+index e6d6040..0a6b4dd 100644
+--- a/bsd/dev/negroni_adsp.h
++++ b/bsd/dev/negroni_adsp.h
+@@ -7,15 +7,22 @@
+ #ifndef _NEGRONI_ADSP_H_
+ #define _NEGRONI_ADSP_H_
+ 
+-#define NEGRONI_GLINK_CHANNELS  2
++#define NEGRONI_GLINK_CHANNELS  3       /* 0274: + PMIC_RTR_ADSP_APPS */
++#define NEGRONI_GLINK_STEP9     2       /* step 9 opens and waits for channels 0..1 only */
+ #define NEGRONI_GLINK_IPCRTR    0       /* QRTR */
+ #define NEGRONI_GLINK_GPR       1       /* "adsp_apps": GPR */
++#define NEGRONI_GLINK_PMIC      2       /* "PMIC_RTR_ADSP_APPS": charger PD (0274, only with negronichg_glink=1) */
+ 
+ /* GLINK (negroni_adsp.c) */
+ void negroni_glink_poll(void);
+ bool negroni_glink_up(unsigned channel);
+ void negroni_glink_set_rx(unsigned channel, void (*fn)(const uint8_t *data, uint32_t len));
+ int negroni_glink_send(unsigned channel, const void *data, uint32_t len);
++/* 0274: open a channel after step 9 (under gl_lock): our OPEN, wait up to wait_ms for both opens,
++ * then `intents` RX intents. 0 = up; ENOTCONN, ETIMEDOUT, ENOMEM, EIO, EINVAL. */
++int negroni_glink_open(unsigned channel, unsigned intents, uint32_t wait_ms);
++/* 0274 (negroni_chg_glink.c): boot-args negronichg_glink=1 and negroniadsp set */
++bool negroni_chg_glink_wanted(void);
+ 
+ /* stage (b) (negroni_audio.c): first and last step numbers it runs */
+ #define NEGRONI_AUDIO_FIRST_STEP        10
+diff --git a/bsd/dev/negroni_chg_glink.c b/bsd/dev/negroni_chg_glink.c
+new file mode 100644
+index 0000000..7a79ef8
+--- /dev/null
++++ b/bsd/dev/negroni_chg_glink.c
+@@ -0,0 +1,605 @@
++/*
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450) patch 0274: a client of the ADSP charger PD over GLINK
++ * channel PMIC_RTR_ADSP_APPS (live DT qcom,pmic_glink: qcom,pmic-glink-channel, subsys lpass,
++ * protection domain msm/adsp/charger_pd). iOSPlus10 docs/charger-glink-plan.md.
++ *
++ * Why: the HLOS cannot reach the PM8350B charger (no APID for EE 0, the SPMI debug arbiter is
++ * fused off: patch 0273). The ADSP charger PD owns it; OxygenOS sets the input limit and charging
++ * enable only through pmic_glink messages (OnePlus oplus_battery_sm8450.c write_property_id).
++ *
++ * Protocol (read from OnePlus oplus_battery_sm8450.[ch] and Linux qcom_battmgr.c / pmic_glink.c;
++ * our own code): every message starts with {u32 owner = 32778 (MSG_OWNER_BC), u32 type (1 request/
++ * response, 2 notify), u32 opcode}. Property get/set: opcode 0x30/0x31 battery, 0x32/0x33 USB,
++ * body {u32 battery_id 0, u32 property_id, u32 value} (24 bytes); answer {hdr, property_id, value,
++ * ret_code} (24 bytes, ret_code 0 = ok). OEM read buffer: opcode 0x10000 {hdr, u32 data_size 512}
++ * (16 bytes); answer {hdr, u32 data[128], u32 data_size} (528 bytes): data[0] temperature 0.1 C,
++ * [1] current uA, [2] voltage uV, [3] SoC in hundredths of a percent (the external gauge; OxygenOS
++ * uses it because qcom,voocphy_support = 1 = ADSP_VOOCPHY).
++ *
++ * "Ready": the downstream pmic_glink.c tells its clients STATE_UP once the GLINK channel is open
++ * (pmic_glink_init_work after the rpmsg probe), not from the PDR notifier. This client writes
++ * nothing until the channel is open AND a property read came back with ret_code 0.
++ *
++ * Boot-args: negronichg_glink=1 (default 0; needs negroniadsp=1 and step 9, GLINK), negronichg_ma
++ * (USB input current limit, default 1500, cap 2000, 0 = read only), negronichg_glink_poll (seconds,
++ * default 20). Runs on its own kernel thread (started by NegroniBattery::start); it waits up to 10 min
++ * for GLINK (ADSP step 9). GLINK has one recursive lock (0242): this thread, the audio writer and the
++ * ADSP thread may all send; after the ADSP steps this thread is the one that polls GLINK.
++ * Log prefix "NEGRONI BATTERY: glink:".
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include "negroni_adsp.h"
++#include "negroni_chg_glink.h"
++
++extern void IOSleep(unsigned int ms);
++extern kern_return_t thread_terminate(thread_t);
++
++#define BC_OWNER                32778u
++#define BC_TYPE_REQ             1u
++#define BC_TYPE_NOTIFY          2u
++#define BC_SET_NOTIFY_REQ       0x04u
++#define BC_NOTIFY_IND           0x07u
++#define BC_BATTERY_GET          0x30u
++#define BC_BATTERY_SET          0x31u
++#define BC_USB_GET              0x32u
++#define BC_USB_SET              0x33u
++#define BC_OEM_READ_BUFFER      0x10000u
++#define OEM_WORDS               128u
++
++/* battery_property_id (OnePlus enum: the Qualcomm ids 0..23, then the OPLUS ids) */
++#define BATT_STATUS             0u
++#define BATT_CAPACITY           4u
++#define BATT_VOLT_NOW           7u
++#define BATT_CURR_NOW           9u
++#define BATT_CHG_CTRL_LIM       10u     /* FCC, uA */
++#define BATT_TEMP               12u
++#define BATT_CHG_EN             24u     /* OPLUS: smbchg_charging_enable() */
++/* usb_property_id (OnePlus enum) */
++#define USB_ONLINE              0u
++#define USB_VOLT_NOW            1u
++#define USB_CURR_NOW            3u
++#define USB_INPUT_CURR_LIMIT    5u      /* uA (oplus_chg_set_input_current: current_ma * 1000) */
++#define USB_ADAP_TYPE           7u
++#define USB_SUSPEND_PMIC        26u     /* OPLUS */
++#define USB_IN_STATUS           47u     /* OPLUS: plug status, low byte */
++
++#define CHG_DEFAULT_MA          1500u
++#define CHG_MAX_MA              2000u   /* live.dts:6652-6654 input_current_charger/pd/qc_ma = 2000 */
++#define ICL_STEP_MA             500u
++#define CHG_TRIES               5u      /* ICL ramps per plug */
++#define REPLY_MS                1500u   /* OnePlus waits 2500 ms (BC_WAIT_TIME_MS) */
++#define OPEN_WAIT_MS            30000u  /* first wait for the charger PD's OPEN */
++#define LOG_ERR_MAX             40u
++
++struct bc_hdr {
++	uint32_t owner, type, opcode;
++};
++struct bc_req {
++	struct bc_hdr hdr;
++	uint32_t battery_id, property_id, value;
++};
++struct bc_resp {
++	struct bc_hdr hdr;
++	uint32_t property_id, value, ret_code;
++};
++struct bc_notify_req {
++	struct bc_hdr hdr;
++	uint32_t battery_id, power_state, low_capacity, high_capacity;
++};
++struct bc_oem_req {
++	struct bc_hdr hdr;
++	uint32_t data_size;
++};
++_Static_assert(sizeof(struct bc_req) == 24 && sizeof(struct bc_resp) == 24, "pmic_glink property messages");
++_Static_assert(sizeof(struct bc_notify_req) == 28 && sizeof(struct bc_oem_req) == 16, "pmic_glink messages");
++
++static LCK_GRP_DECLARE(negroni_chg_grp, "negroni_chg_glink");
++static LCK_MTX_DECLARE(negroni_chg_lock, &negroni_chg_grp);
++static struct negroni_chg_glink_status st_pub;          /* under negroni_chg_lock */
++static struct negroni_chg_glink_status st;              /* the ADSP thread's copy */
++static bool chg_wanted_parsed, chg_wanted;
++static uint32_t chg_ma = CHG_DEFAULT_MA, poll_s = 20;
++
++/*
++ * The last answer. chg_rx runs inside negroni_glink_poll() of any thread (under the GLINK lock), so
++ * rx_* are under rx_mtx; transact() moves an answer to ans_* (this client's thread only).
++ * Lock order: the GLINK lock, then rx_mtx; never the GLINK lock while rx_mtx is held.
++ */
++static LCK_MTX_DECLARE(rx_mtx, &negroni_chg_grp);
++static uint8_t rx_buf[OEM_WORDS * 4 + 32], ans_buf[OEM_WORDS * 4 + 32];
++static uint32_t rx_len, ans_len;
++static bool rx_have;
++static uint32_t notify_count, notify_last, stray_count, err_lines;
++static bool notify_usb;
++
++#define LOG(fmt, ...) printf("NEGRONI BATTERY: glink: " fmt "\n", ##__VA_ARGS__)
++#define LOG_ERR(fmt, ...) do { \
++	if (err_lines < LOG_ERR_MAX || err_lines % 100 == 0) { LOG(fmt, ##__VA_ARGS__); } \
++	err_lines++; \
++} while (0)
++
++bool
++negroni_chg_glink_wanted(void)
++{
++	if (!chg_wanted_parsed) {
++		uint32_t on = 0, adsp = 0, ma = CHG_DEFAULT_MA, ps = 20;
++		chg_wanted_parsed = true;
++		(void)PE_parse_boot_argn("negronichg_glink", &on, sizeof(on));
++		(void)PE_parse_boot_argn("negroniadsp", &adsp, sizeof(adsp));
++		(void)PE_parse_boot_argn("negronichg_ma", &ma, sizeof(ma));
++		(void)PE_parse_boot_argn("negronichg_glink_poll", &ps, sizeof(ps));
++		chg_wanted = on != 0 && adsp != 0;
++		chg_ma = MIN(ma, CHG_MAX_MA);
++		poll_s = MIN(MAX(ps, 5u), 600u);
++	}
++	return chg_wanted;
++}
++
++bool
++negroni_chg_glink_get(struct negroni_chg_glink_status *out)
++{
++	if (!negroni_chg_glink_wanted() || out == NULL) {
++		return false;
++	}
++	lck_mtx_lock(&negroni_chg_lock);
++	*out = st_pub;
++	lck_mtx_unlock(&negroni_chg_lock);
++	out->wanted = true;
++	return true;
++}
++
++static void
++publish(void)
++{
++	lck_mtx_lock(&negroni_chg_lock);
++	st_pub = st;
++	lck_mtx_unlock(&negroni_chg_lock);
++}
++
++static uint64_t
++now_ns(void)
++{
++	uint64_t t, ns;
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns;
++}
++
++static void
++chg_rx(const uint8_t *data, uint32_t len)
++{
++	struct bc_hdr h;
++
++	if (len < sizeof(h)) {
++		stray_count++;
++		return;
++	}
++	memcpy(&h, data, sizeof(h));
++	if (h.owner != BC_OWNER) {
++		stray_count++;
++		return;
++	}
++	lck_mtx_lock(&rx_mtx);
++	if (h.opcode == BC_NOTIFY_IND) {
++		uint32_t n = 0;
++		if (len >= sizeof(h) + 4) {
++			memcpy(&n, data + sizeof(h), 4);
++		}
++		notify_count++;
++		notify_last = n;
++		if (n == BC_USB_GET) {
++			notify_usb = true;          /* a plug event: the next cycle comes early */
++		}
++	} else {
++		if (rx_have) {
++			stray_count++;              /* an answer nobody took (a late one) */
++		}
++		rx_len = MIN(len, (uint32_t)sizeof(rx_buf));
++		memcpy(rx_buf, data, rx_len);
++		rx_have = true;
++	}
++	lck_mtx_unlock(&rx_mtx);
++}
++
++/* Take the answer that chg_rx stored, if any, into ans_buf. */
++static bool
++take_answer(void)
++{
++	bool have;
++
++	lck_mtx_lock(&rx_mtx);
++	have = rx_have;
++	if (have) {
++		ans_len = rx_len;
++		memcpy(ans_buf, rx_buf, rx_len);
++		rx_have = false;
++	}
++	lck_mtx_unlock(&rx_mtx);
++	return have;
++}
++
++/* Send one message and wait for the answer with this opcode (and property, for 24-byte answers). */
++static int
++transact(const void *msg, uint32_t len, uint32_t opcode, int64_t prop)
++{
++	int rc;
++
++	(void)take_answer();                    /* drop a late answer of an earlier request */
++	rc = negroni_glink_send(NEGRONI_GLINK_PMIC, msg, len);
++	if (rc != 0) {
++		return rc;
++	}
++	for (uint32_t ms = 0; ms < REPLY_MS; ms++) {
++		negroni_glink_poll();
++		if (take_answer()) {
++			struct bc_hdr h;
++			memcpy(&h, ans_buf, sizeof(h));
++			if (h.opcode == opcode) {
++				if (prop < 0 || ans_len != sizeof(struct bc_resp) ||
++				    ((const struct bc_resp *)(const void *)ans_buf)->property_id == (uint32_t)prop) {
++					return 0;
++				}
++			}
++			stray_count++;
++		}
++		if (!negroni_glink_up(NEGRONI_GLINK_PMIC)) {
++			return ENOTCONN;
++		}
++		IOSleep(1);
++	}
++	return ETIMEDOUT;
++}
++
++/* Property get/set. 0: answered (ret_code in *ret, value in *val); else a transport error. */
++static int
++prop_io(uint32_t opcode, uint32_t prop, uint32_t value, uint32_t *val, uint32_t *ret)
++{
++	struct bc_req r = { { BC_OWNER, BC_TYPE_REQ, opcode }, 0, prop, value };
++	int rc = transact(&r, sizeof(r), opcode, prop);
++
++	if (rc != 0) {
++		return rc;
++	}
++	if (ans_len != sizeof(struct bc_resp)) {
++		*ret = 0xffffffffu;
++		*val = 0;
++		return 0;
++	}
++	*val = ((const struct bc_resp *)(const void *)ans_buf)->value;
++	*ret = ((const struct bc_resp *)(const void *)ans_buf)->ret_code;
++	return 0;
++}
++
++/* A read for the poll: true when ret_code 0. Logs a transport error (bounded). */
++static unsigned good_reads, bad_reads, lost_reads;
++static bool
++get(uint32_t opcode, uint32_t prop, uint32_t *val)
++{
++	uint32_t ret = 0;
++	int rc;
++
++	if (lost_reads >= 3) {
++		return false;                   /* 3 lost in this cycle: the rest waits for the next cycle */
++	}
++	rc = prop_io(opcode, prop, 0, val, &ret);
++	if (rc != 0) {
++		lost_reads++;
++		LOG_ERR("read %s %u: no answer (%s)", opcode == BC_USB_GET ? "usb" : "battery", prop,
++		    rc == ETIMEDOUT ? "timeout" : rc == ENOTCONN ? "channel down" : rc == EAGAIN ? "no remote intent" : "send error");
++		return false;
++	}
++	if (ret != 0) {
++		bad_reads++;
++		return false;
++	}
++	good_reads++;
++	return true;
++}
++
++static bool
++put(uint32_t opcode, uint32_t prop, uint32_t value, const char *what)
++{
++	uint32_t val = 0, ret = 0;
++	int rc;
++
++	if (!st.ready) {
++		return false;                   /* never a write before the PD answered a read */
++	}
++	rc = prop_io(opcode, prop, value, &val, &ret);
++	LOG("write %s = %u: %s (ret_code %#x)", what, value, rc ? "no answer" : ret ? "REFUSED" : "ok", rc ? 0 : ret);
++	return rc == 0 && ret == 0;
++}
++
++static void
++dump_props_once(void)
++{
++	static bool done;
++	char line[300];
++	size_t at = 0;
++	uint32_t v, ret;
++
++	if (done) {
++		return;
++	}
++	done = true;
++	for (unsigned pass = 0; pass < 2; pass++) {
++		uint32_t opcode = pass ? BC_USB_GET : BC_BATTERY_GET;
++		unsigned n = pass ? 12 : 25;
++		at = 0;
++		at += snprintf(line + at, sizeof(line) - at, "%s properties (id=value/ret):", pass ? "usb" : "battery");
++		for (unsigned i = 0; i < n && at < sizeof(line) - 24; i++) {
++			if (prop_io(opcode, i, 0, &v, &ret) != 0) {
++				at += snprintf(line + at, sizeof(line) - at, " %u=?", i);
++			} else if (ret) {
++				at += snprintf(line + at, sizeof(line) - at, " %u=/%x", i, ret);
++			} else {
++				at += snprintf(line + at, sizeof(line) - at, " %u=%d", i, (int)v);
++			}
++		}
++		LOG("%s", line);
++	}
++}
++
++/* OEM read buffer: the external gauge numbers OxygenOS shows. true when it answered with data. */
++static bool
++read_oem(int32_t w[4])
++{
++	struct bc_oem_req r = { { BC_OWNER, BC_TYPE_REQ, BC_OEM_READ_BUFFER }, OEM_WORDS * 4 };
++	uint32_t size;
++
++	if (lost_reads >= 3) {
++		return false;
++	}
++	if (transact(&r, sizeof(r), BC_OEM_READ_BUFFER, -1) != 0 || ans_len < sizeof(struct bc_hdr) + OEM_WORDS * 4 + 4) {
++		return false;
++	}
++	memcpy(&size, ans_buf + sizeof(struct bc_hdr) + OEM_WORDS * 4, 4);
++	if (size < 16 || size > OEM_WORDS * 4) {
++		return false;
++	}
++	memcpy(w, ans_buf + sizeof(struct bc_hdr), 16);
++	return true;
++}
++
++static bool was_online;
++static unsigned tries, en_tries, susp_tries, cycles;
++static uint32_t last_key = 0xffffffffu;
++
++/* oplus_chg_set_input_current, simplified: 500 mA steps up to the target; back one step when VBUS
++ * falls under the AICL point (4500 mV, 4550 mV above 4100 mV per cell). */
++static void
++icl_ramp(int32_t cell_mv)
++{
++	uint32_t aicl = cell_mv > 4100 ? 4550 : 4500, ma = MIN(ICL_STEP_MA, chg_ma), good = 0, v = 0;
++
++	for (;;) {
++		char what[48];
++		snprintf(what, sizeof(what), "USB_INPUT_CURR_LIMIT %u mA (uA)", ma);
++		if (!put(BC_USB_SET, USB_INPUT_CURR_LIMIT, ma * 1000u, what)) {
++			break;
++		}
++		for (int i = 0; i < 100; i++) {         /* ~100 ms for VBUS to settle (OnePlus: 90 ms) */
++			negroni_glink_poll();
++			IOSleep(1);
++		}
++		if (get(BC_USB_GET, USB_VOLT_NOW, &v) && v / 1000 < aicl && good) {
++			LOG("ICL %u mA: VBUS %u mV under the AICL point %u mV: back to %u mA", ma, v / 1000, aicl, good);
++			(void)put(BC_USB_SET, USB_INPUT_CURR_LIMIT, good * 1000u, "USB_INPUT_CURR_LIMIT (back one step)");
++			break;
++		}
++		good = ma;
++		if (ma >= chg_ma) {
++			break;
++		}
++		ma = MIN(ma + ICL_STEP_MA, chg_ma);
++	}
++	st.icl_set = good != 0;
++}
++
++static void
++cycle(void)
++{
++	uint32_t v;
++	int32_t oem[4];
++	bool any = false;
++	uint64_t t = now_ns();
++
++	good_reads = bad_reads = lost_reads = 0;
++	cycles++;
++	/* battery */
++	st.bstatus = get(BC_BATTERY_GET, BATT_STATUS, &v) ? (int32_t)v : -1;
++	int32_t soc = -1;
++	uint8_t src = 0;
++	if (read_oem(oem) && oem[3] >= 0 && oem[3] <= 10000) {
++		soc = oem[3];
++		src = 1;
++	}
++	uint32_t cap = 0;
++	bool capOk = get(BC_BATTERY_GET, BATT_CAPACITY, &cap) && cap <= 10000;
++	if (soc < 0 && capOk) {
++		soc = (int32_t)cap;
++		src = 2;
++	}
++	st.vbat_mv = get(BC_BATTERY_GET, BATT_VOLT_NOW, &v) ? (int32_t)(v / 1000) : 0;
++	st.ibat_ma = get(BC_BATTERY_GET, BATT_CURR_NOW, &v) ? (int32_t)v / 1000 : INT32_MIN;
++	st.temp_centi = get(BC_BATTERY_GET, BATT_TEMP, &v) ? (int32_t)v : INT32_MIN;
++	uint32_t fcc = 0;
++	bool fccOk = get(BC_BATTERY_GET, BATT_CHG_CTRL_LIM, &fcc);
++	/* USB */
++	st.usb_online = get(BC_USB_GET, USB_ONLINE, &v) ? (int32_t)v : -1;
++	st.usb_mv = get(BC_USB_GET, USB_VOLT_NOW, &v) ? (int32_t)(v / 1000) : -1;
++	st.usb_ma = get(BC_USB_GET, USB_CURR_NOW, &v) ? (int32_t)v / 1000 : INT32_MIN;
++	st.icl_ma = get(BC_USB_GET, USB_INPUT_CURR_LIMIT, &v) ? (int32_t)(v / 1000) : -1;
++	uint32_t adap = 0, insts = 0, susp = 0;
++	bool adapOk = get(BC_USB_GET, USB_ADAP_TYPE, &adap);
++	bool instsOk = get(BC_USB_GET, USB_IN_STATUS, &insts);
++	bool suspOk = get(BC_USB_GET, USB_SUSPEND_PMIC, &susp);
++
++	any = good_reads > 0;
++	if (any && !st.ready) {
++		struct bc_notify_req n = { { BC_OWNER, BC_TYPE_NOTIFY, BC_SET_NOTIFY_REQ }, 0, 0, 0, 0 };
++		st.ready = true;
++		LOG("the charger PD answers (%u reads ok, %u refused, %u lost): READY", good_reads, bad_reads, lost_reads);
++		LOG("subscribe to notifications (BC_SET_NOTIFY_REQ): %s",
++		    transact(&n, sizeof(n), BC_SET_NOTIFY_REQ, -1) == 0 ? "acked" : "no ack");
++		dump_props_once();
++	} else if (!any && st.ready && lost_reads > 0) {
++		st.ready = false;               /* no writes again until a read works */
++		LOG_ERR("no read answered in this cycle (%u lost): not ready, writes stop", lost_reads);
++	}
++	if (soc >= 0) {
++		if (soc != st.soc_centi) {
++			st.soc_change_ns = t;
++		}
++		st.soc_centi = soc;
++		st.soc_src = src;
++		st.soc_ns = t;
++	}
++
++	/* plug: USB_ONLINE, the OPLUS USB_IN_STATUS, or VBUS */
++	/* the plug edge only when a USB read answered; a lost cycle keeps the last state */
++	bool usbKnown = st.usb_online >= 0 || instsOk || st.usb_mv >= 0;
++	bool online = usbKnown ? (st.usb_online == 1 || (instsOk && (insts & 0xff) != 0) || st.usb_mv >= 4000) : was_online;
++	if (online && !was_online) {
++		tries = en_tries = susp_tries = 0;
++		st.icl_set = st.chg_en_set = false;
++		LOG("USB in (online %d in_status %#x VBUS %d mV adapter type %u)", st.usb_online, insts, st.usb_mv, adap);
++	} else if (!online && was_online) {
++		LOG("USB out");
++		st.icl_set = st.chg_en_set = false;
++	}
++	was_online = online;
++
++	if (online && st.ready && chg_ma > 0) {
++		bool iclWrong = st.icl_ma < 0 || (uint32_t)(st.icl_ma + 100) < chg_ma || (uint32_t)st.icl_ma > chg_ma + 100;
++		if ((!st.icl_set || iclWrong) && tries < CHG_TRIES) {
++			tries++;
++			LOG("set the input limit (try %u of %u): now %d mA, want %u mA", tries, CHG_TRIES, st.icl_ma, chg_ma);
++			icl_ramp(st.vbat_mv > 5000 ? st.vbat_mv / 2 : st.vbat_mv);
++			st.icl_ma = get(BC_USB_GET, USB_INPUT_CURR_LIMIT, &v) ? (int32_t)(v / 1000) : -1;
++			LOG("input limit read back: %d mA", st.icl_ma);
++		}
++		if (suspOk && susp != 0 && susp_tries < CHG_TRIES) {
++			susp_tries++;
++			(void)put(BC_USB_SET, USB_SUSPEND_PMIC, 0, "USB_SUSPEND_PMIC (un-suspend)");
++		}
++		if (!st.chg_en_set && en_tries < CHG_TRIES) {
++			en_tries++;
++			st.chg_en_set = put(BC_BATTERY_SET, BATT_CHG_EN, 1, "BATT_CHG_EN");
++		}
++	}
++
++	st.gen++;
++	publish();
++
++	/* one line when a value moves, else every 15 cycles (5 min at 20 s) */
++	uint32_t key = (uint32_t)(st.soc_centi / 100) | (uint32_t)(st.bstatus & 0xf) << 8 | (uint32_t)online << 12 |
++	    (uint32_t)((st.icl_ma / 100) & 0xff) << 16 | (uint32_t)st.ready << 24;
++	if (key != last_key || cycles % 15 == 1) {
++		last_key = key;
++		LOG("soc %d.%02d%% (%s; capacity %s%u) vbat %d mV ibat %d mA temp %d status %d fcc %s%u uA | usb online %d "
++		    "in_status %s%#x vbus %d mV ibus %d mA icl %d mA type %s%u suspend %s%u | ready %d reads %u/%u/%u notify %u (last %#x) "
++		    "stray %u",
++		    st.soc_centi / 100, st.soc_centi < 0 ? 0 : st.soc_centi % 100, src == 1 ? "oem gauge" : src == 2 ? "capacity" : "none",
++		    capOk ? "" : "?", cap, st.vbat_mv, st.ibat_ma == INT32_MIN ? 0 : st.ibat_ma,
++		    st.temp_centi == INT32_MIN ? 0 : st.temp_centi, st.bstatus, fccOk ? "" : "?", fcc, st.usb_online,
++		    instsOk ? "" : "?", insts, st.usb_mv, st.usb_ma == INT32_MIN ? 0 : st.usb_ma, st.icl_ma, adapOk ? "" : "?", adap,
++		    suspOk ? "" : "?", susp, st.ready, good_reads, bad_reads, lost_reads, notify_count, notify_last, stray_count);
++	}
++}
++
++/* Wait `s` seconds; GLINK stays polled (notifications). A USB notification ends it after 2 s. */
++static void
++idle(uint32_t s)
++{
++	for (uint32_t ms = 0; ms < s * 1000; ms += 50) {
++		negroni_glink_poll();
++		if (notify_usb && ms >= 2000) {
++			break;
++		}
++		IOSleep(50);
++	}
++	notify_usb = false;
++}
++
++#define GLINK_WAIT_S            600u    /* ADSP steps 1..9 must end within this */
++
++static void
++chg_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	unsigned opens = 0, s;
++	int rc;
++
++	for (s = 0; s < GLINK_WAIT_S && !negroni_glink_up(NEGRONI_GLINK_IPCRTR); s++) {
++		IOSleep(1000);
++	}
++	if (!negroni_glink_up(NEGRONI_GLINK_IPCRTR)) {
++		LOG("off: GLINK is not up after %u s (ADSP step 9 did not run or failed)", GLINK_WAIT_S);
++		(void)thread_terminate(current_thread());
++		return;
++	}
++	LOG("GLINK is up after %u s", s);
++
++	st.wanted = true;
++	st.soc_centi = -1;
++	st.bstatus = st.usb_online = st.usb_mv = st.icl_ma = -1;
++	st.ibat_ma = st.usb_ma = st.temp_centi = INT32_MIN;
++	publish();
++	negroni_glink_set_rx(NEGRONI_GLINK_PMIC, chg_rx);    /* before the open: a notification can come at once */
++	LOG("start: channel PMIC_RTR_ADSP_APPS, input limit %u mA%s, poll %u s", chg_ma, chg_ma ? "" : " (read only)", poll_s);
++	for (;;) {
++		if (!negroni_glink_up(NEGRONI_GLINK_IPCRTR)) {
++			LOG("GLINK stopped: the charger client ends");
++			st.up = st.ready = false;
++			publish();
++			(void)thread_terminate(current_thread());
++			return;
++		}
++		if (!negroni_glink_up(NEGRONI_GLINK_PMIC)) {
++			if (st.up) {
++				LOG_ERR("the ADSP closed PMIC_RTR_ADSP_APPS");
++				st.up = st.ready = false;
++				publish();
++			}
++			opens++;
++			rc = negroni_glink_open(NEGRONI_GLINK_PMIC, 4, opens == 1 ? OPEN_WAIT_MS : 2000);
++			if (rc != 0) {
++				if (opens <= 5 || opens % 30 == 0) {
++					LOG("PMIC_RTR_ADSP_APPS not open (try %u: %s): the charger PD may not run", opens,
++					    rc == ETIMEDOUT ? "no OPEN from the ADSP" : rc == ENOMEM ? "no memory for intents" : "GLINK down");
++				}
++				idle(poll_s);
++				continue;
++			}
++			st.up = true;
++			LOG("PMIC_RTR_ADSP_APPS is open (try %u)", opens);
++		}
++		cycle();
++		idle(poll_s);
++	}
++}
++void
++negroni_chg_glink_start(void)
++{
++	static bool started;
++	thread_t thread;
++
++	if (!negroni_chg_glink_wanted() || started) {
++		return;
++	}
++	started = true;
++	if (kernel_thread_start(chg_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		LOG("kernel_thread_start failed: off");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_chg_glink.h b/bsd/dev/negroni_chg_glink.h
+new file mode 100644
+index 0000000..17cec3a
+--- /dev/null
++++ b/bsd/dev/negroni_chg_glink.h
+@@ -0,0 +1,42 @@
++/*
++ * NEGRONI (SM8450) patch 0274: what the ADSP charger PD reports over GLINK PMIC_RTR_ADSP_APPS
++ * (bsd/dev/negroni_chg_glink.c), read by iokit/Kernel/arm/NegroniBattery.cpp. C and C++.
++ * iOSPlus10 docs/charger-glink-plan.md.
++ */
++#ifndef _NEGRONI_CHG_GLINK_H_
++#define _NEGRONI_CHG_GLINK_H_
++#include <stdint.h>
++#include <stdbool.h>
++
++struct negroni_chg_glink_status {
++	uint32_t gen;           /* +1 for each completed poll cycle */
++	bool wanted;            /* negronichg_glink=1 and negroniadsp set */
++	bool up;                /* the channel is open both ways */
++	bool ready;             /* the PD answered a property read with ret_code 0 */
++	bool icl_set;           /* our ICL write was accepted for this plug */
++	bool chg_en_set;        /* our BATT_CHG_EN = 1 was accepted for this plug */
++	int32_t soc_centi;      /* hundredths of a percent; -1 = unknown */
++	uint8_t soc_src;        /* 1 = OEM read buffer (the external gauge), 2 = BATT_CAPACITY */
++	int32_t vbat_mv;        /* as the PD reports it (pack or cell: see the plan) ; 0 = unknown */
++	int32_t ibat_ma;        /* as the PD reports it; INT32_MIN = unknown */
++	int32_t temp_centi;     /* hundredths of a degree C; INT32_MIN = unknown */
++	int32_t bstatus;        /* BATT_STATUS: 1 charging 2 discharging 3 not charging 4 full; -1 = unknown */
++	int32_t usb_online;     /* USB_ONLINE; -1 = unknown */
++	int32_t usb_mv;         /* USB_VOLT_NOW in mV; -1 = unknown */
++	int32_t usb_ma;         /* USB_CURR_NOW in mA; INT32_MIN = unknown */
++	int32_t icl_ma;         /* USB_INPUT_CURR_LIMIT read back, mA; -1 = unknown */
++	uint64_t soc_ns;        /* uptime (ns) of the last good SoC read */
++	uint64_t soc_change_ns; /* uptime (ns) when the SoC value last changed */
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* A copy of the last status. false: no 0274 client (negronichg_glink=0 or no ADSP). */
++bool negroni_chg_glink_get(struct negroni_chg_glink_status *out);
++/* Start the client thread (once; nothing without negronichg_glink=1 and negroniadsp). */
++void negroni_chg_glink_start(void);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBattery.cpp
+index bb9ab57..2050593 100644
+--- a/iokit/Kernel/arm/NegroniBattery.cpp
++++ b/iokit/Kernel/arm/NegroniBattery.cpp
+@@ -60,6 +60,10 @@
+  * AppleRawExternalConnected, BatteryInstalled, Voltage, Amperage, InstantAmperage,
+  * Temperature, CycleCount, DesignCapacity, NominalChargeCapacity, TimeRemaining,
+  * AtCriticalLevel, AdapterDetails, BatteryData, PermanentFailureStatus (its strings).
++ * Patch 0274: with negroniadsp=1 negronichg_glink=1, bsd/dev/negroni_chg_glink.c talks to the ADSP
++ * charger PD over GLINK PMIC_RTR_ADSP_APPS (USB input limit negronichg_ma, default 1500, and charging
++ * enable). This service only shows its state: "chg=glink icl=NNNNmA" in the status line and the
++ * NegroniChargerGlink* properties (the PD's SoC is published as NegroniChargerGlinkSOC, not used here).
+  * Log prefix "NEGRONI BATTERY:".
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+@@ -72,6 +76,7 @@
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
++#include "../../../bsd/dev/negroni_chg_glink.h"   /* 0274 */
+ 
+ /* bsd/dev/negroni_spmi.c */
+ extern "C" {
+@@ -243,6 +248,9 @@ private:
+ 	uint64_t fLastNs;
+ 	unsigned fLowPolls, fFailPolls;
+ 	int fLastPercent, fLastFlags;
++	int fGlinkIcl;             /* 0274: the charger PD's input limit (mA) once it answers over GLINK, else -1 */
++	bool fGlinkWarned;
++	void glinkStatus(void);
+ 	unsigned fRtCount;
+ 	uint16_t fRtPpid[NB_RT_MAX];
+ 	uint8_t fRtLast[NB_RT_MAX];
+@@ -296,6 +304,8 @@ NegroniBattery::init(OSDictionary *dictionary)
+ 	fLowPolls = fFailPolls = 0;
+ 	fLastPercent = -1;
+ 	fLastFlags = -1;
++	fGlinkIcl = -1;
++	fGlinkWarned = false;
+ 	fRtCount = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+@@ -465,7 +475,7 @@ NegroniBattery::publish(unsigned percent, unsigned mv, int ma, int centiC, bool
+ 	}
+ 	updateStatus(); /* Flush PS properties and send kIOPMMessageBatteryStatusHasChanged on change. */
+ 
+-	int flags = (external ? 1 : 0) | (charging ? 2 : 0) | (full ? 4 : 0) | (source << 3);
++	int flags = (external ? 1 : 0) | (charging ? 2 : 0) | (full ? 4 : 0) | (source << 3) | ((fGlinkIcl >= 0) << 6);
+ 	if ((int)percent != fLastPercent || flags != fLastFlags) {
+ 		/* 0273: usbin is a VADC value (negronibatt=4/5); without the VADC it is not measured ("-") */
+ 		char usb[16];
+@@ -478,12 +488,41 @@ NegroniBattery::publish(unsigned percent, unsigned mv, int ma, int centiC, bool
+ 		    "chg=%s icl=%umA pp=%02x\n",
+ 		    percent, mv, ma, centiC / 100, (centiC < 0 ? -centiC : centiC) % 100,
+ 		    external, charging, full, kSrcName[source], usb,
+-		    fChgSt1 == 0xff ? "?" : kChgState[fChgSt1 & 7], fChgIclSts == 0xff ? 0 : fChgIclSts * fChgStep, fChgPowerPath);
++		    /* 0274: chg=glink icl=<the PD's USB_INPUT_CURR_LIMIT read back> once the PD answers */
++		    fGlinkIcl >= 0 ? "glink" : fChgSt1 == 0xff ? "?" : kChgState[fChgSt1 & 7],
++		    fGlinkIcl >= 0 ? (unsigned)fGlinkIcl : fChgIclSts == 0xff ? 0 : fChgIclSts * fChgStep, fChgPowerPath);
+ 		fLastPercent = (int)percent;
+ 		fLastFlags = flags;
+ 	}
+ }
+ 
++/* 0274: the charger PD state (bsd/dev/negroni_chg_glink.c) into fGlinkIcl and the registry. */
++void
++NegroniBattery::glinkStatus(void)
++{
++	negroni_chg_glink_status g;
++	if (!negroni_chg_glink_get(&g)) {
++		fGlinkIcl = -1;
++		if (!fGlinkWarned) {
++			unsigned want = 0;
++			(void)PE_parse_boot_argn("negronichg_glink", &want, sizeof(want));
++			if (want) {
++				IOLog("NEGRONI BATTERY: negronichg_glink=1 needs negroniadsp=1 (the ADSP runs the charger PD): off\n");
++			}
++			fGlinkWarned = true;
++		}
++		return;
++	}
++	bool ready = g.up && g.ready;
++	fGlinkIcl = (ready && g.icl_ma >= 0) ? g.icl_ma : -1;
++	putBool("NegroniChargerGlinkReady", ready);
++	putNumber("NegroniChargerGlinkIclMa", (UInt32)(g.icl_ma < 0 ? 0 : g.icl_ma));
++	putNumber("NegroniChargerGlinkSOC", (UInt32)(g.soc_centi < 0 ? 0xffffffffu : (UInt32)g.soc_centi));  /* 1/100 % */
++	putNumber("NegroniChargerGlinkStatus", (UInt32)g.bstatus);
++	putNumber("NegroniChargerGlinkVbusMv", (UInt32)(g.usb_mv < 0 ? 0 : g.usb_mv));
++	putBool("NegroniChargerGlinkChargeEnable", g.chg_en_set);
++}
++
+ /* One ADC7 conversion, as Linux adc7_configure + adc7_do_conversion. 0 = ok. Needs the VADC unlock. */
+ int
+ NegroniBattery::adcCode(const nb_chan &c, uint16_t *code)
+@@ -942,6 +981,7 @@ NegroniBattery::poll(void)
+ 		readVadc(s);
+ 	}
+ 	readCharger(s);
++	glinkStatus();
+ 	if (s.chgRead && fChgWrite) {
+ 		driveCharger(s);
+ 	}
+@@ -1152,6 +1192,7 @@ NegroniBattery::start(IOService *provider)
+ 	} else {
+ 		IOLog("NEGRONI BATTERY: negronibatt=%d, static 100%% (no PMIC access)\n", fMode);
+ 	}
++	negroni_chg_glink_start();      /* 0274: the charger PD client thread (only with negronichg_glink=1 negroniadsp=1) */
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {

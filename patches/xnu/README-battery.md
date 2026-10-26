@@ -9,6 +9,7 @@ Marks: **[V]** seen in source, DT, firmware, build or log. **[I]** inference.
 | `0270-negroni-battery-spmi-v7.patch` | `bsd/dev/negroni_spmi.c`, `.h`, `bsd/dev/negroni_rtc.c` | one shared SPMI arbiter v7 mapping (RTC of 0203 + battery), the battery's read allowlist (reads with `sk_read8` of `negroni_spmi_keys.h`), the opt-in VADC write path |
 | `0271-negroni-battery-service.patch` | `iokit/Kernel/arm/NegroniBattery.cpp`, `iokit/KernelConfigTables.cpp` | the IOPMPowerSource (AppleSmartBattery key set) and its personality on IOResources |
 | `0272-negroni-battery-charger-input.patch` | `bsd/dev/negroni_spmi.c`, `.h`, `iokit/Kernel/arm/NegroniBattery.cpp` | PM8350B SMB5 charger status in the log, USB input enabled at `negronichg_ma` (section 7) |
+| `0276-negroni-battery-soc-source.patch` | `iokit/Kernel/arm/NegroniBattery.cpp` | the percentage: source order gauge (not reachable) > GLINK (0274) > OCV estimate with a rate limit; `soc src=` in the log (section 10) |
 
 ## 1. Why iOS showed a wrong battery level
 
@@ -435,3 +436,152 @@ Verification:
   skips; the strings `charger route (negronichg_arb=%s)` and `debug arbiter` are in the kernel.
 - [V] Image out/ios16-chg2 (boot-args + `negronibatt=5`): boot_a.img sha256
   baa0528616fabb7a8cee606962f696f3cec94e2d5df3bb11e98d596b32b02f7e (out/ios16-chg2/SHA256SUMS). Not booted.
+
+## 9. Charger control over GLINK: the ADSP charger PD (0274, 2026-10-26)
+
+Plan and message formats: `docs/charger-glink-plan.md`.
+
+Why [V phone log 2026-10-26 13:17-13:22, `logs/usblog-20261026-131747.txt`]: no APID for the SMB5 blocks
+(`CHGR APID -1 EE 7`), the debug arbiter is fused off (`fuse 0x221c8784 = 0x4900000, bit 18 clear`), so 0272/0273
+cannot write the charger. With USB in: VBUS 4.87-4.94 V, `iin` 725-1000 mA (saturates near 1000 mA under load),
+battery current 0..+146 mA at idle and down to -1289 mA under load. [I] The charger runs at its ~1 A default input
+limit and the load takes it all: no net charge. The ADSP charger PD owns the charger (live.dts:6637-6645).
+
+What 0274 does (`bsd/dev/negroni_chg_glink.c`, new; hunks in `negroni_adsp.c/.h`, `NegroniBattery.cpp`,
+`bsd/conf/files`):
+- GLINK channel 2 `PMIC_RTR_ADSP_APPS` (lcid 3) on the 0242 transport (hunks in negroni_adsp.c/.h: table entry,
+  name-match gate, step 9 loops limited to channels 0..1, new `negroni_glink_open()` under the GLINK lock): its
+  remote OPEN is answered only with `negronichg_glink=1`; step 9 still waits for IPCRTR/adsp_apps only.
+- `NegroniBattery::start` starts the charger thread. It waits up to 600 s for GLINK (ADSP step 9), then up to 30 s
+  for the channel (then retries every poll), then every `negronichg_glink_poll` s (20): reads battery ids 0/4/7/9/10/12, the OEM read
+  buffer (opcode 0x10000, external-gauge SoC in word 3), USB ids 0/1/3/5/7/26/47. READY = the channel is open and
+  a read came back with ret_code 0 (the downstream pmic_glink.c rule). Only after READY: BC_SET_NOTIFY_REQ, a
+  one-time dump of battery ids 0..24 and USB ids 0..11, then per plug (max 5 tries each): USB_INPUT_CURR_LIMIT
+  (0x33 id 5, uA) in 500 mA steps up to `negronichg_ma` (default 1500, cap 2000; 0 = read only) with a step back
+  when VBUS < 4500/4550 mV (AICL point of `oplus_chg_set_input_current`), USB_SUSPEND_PMIC = 0 only when it reads
+  non-zero, BATT_CHG_EN = 1 (0x31 id 24). A cycle where no read is answered clears READY (no writes).
+- NegroniBattery: `chg=glink icl=NNNNmA` in the status line once READY; registry `NegroniChargerGlink*` (Ready,
+  IclMa, SOC in 1/100 %, Status, VbusMv, ChargeEnable). The percentage is not changed by 0274 (patch 0276).
+- No SPMI write. With `negroniadsp` set 0273 stays read only.
+- Review fixes (2026-10-26): ICL cap 2000 mA (live.dts:6652-6654 `qcom,input_current_charger_ma`/`pd_`/`qc_` = 2000;
+  `oplus_chg_set_input_current` clamps to pd_curr_max, oplus_battery_sm8450.c:7960-7962); the plug edge is taken only
+  from a cycle where a USB read answered (a lost cycle no longer reads as "USB out" and so cannot restart the 5+5
+  writes); after a remote CLOSE `negroni_glink_open` advertises all our RX intents again and clears the ADSP's
+  [U: whether the ADSP takes our old lcid without a new OPEN from us].
+
+Boot-args: `negroniadsp=1 negronichg_glink=1 negronichg_ma=1500` (negroniadsp=1 alone runs ADSP steps 1..9 since the
+regenerated 0242/0243). Expected log: `NEGRONI ADSP: 9 GLINK UP`, `NEGRONI BATTERY: glink: start`, `glink:
+PMIC_RTR_ADSP_APPS is open`, `glink: the charger PD answers ...: READY`, `glink: battery properties ...`,
+`glink: write USB_INPUT_CURR_LIMIT 1500 mA (uA) = 1500000: ok`, `glink: input limit read back: 1500 mA`,
+`glink: write BATT_CHG_EN = 1: ok`, `NEGRONI BATTERY: 12% ... chg=glink icl=1500mA`.
+
+Risks: `negroniadsp=1` boots the ADSP (0240/0241, SoC-reset risk, needs the ADSP firmware area on userdata). [U] the
+charger PD may need an HLOS servreg locator before it opens the channel (then try `negroniadsp_step=10`). [U] the PD
+may reset the ICL on plug events (the read-back each cycle catches it, 5 ramps per plug). [I] the PD runs its own
+charge policy (JEITA, VOOCPHY) without the OPLUS HLOS algorithm. [I] the OPLUS property ids (24, 26, 47) assume
+`OPLUS_FEATURE_CHG_BASIC` in the OnePlus build; the property dump checks them.
+
+Verification (2026-10-26, build only, not booted):
+- [V] compile-one OK for negroni_chg_glink.c and negroni_adsp.c; 0274 regenerated on a patched tree up to 0275 (the
+  regenerated 0242/0243 of 13:41); `git apply --check` of 0276, 0301, 0330 on top: OK.
+- [V] Full build: out/kernel/local-20261026-084835/kernel.development.negroni, sha256
+  6acdaacfd2c203985b03574aaac108db34736029e52dd2eb0a8ec68e3e705be8; patch-report applies 0274 and 0276; only the 4
+  usual dxb skips. Patch sha256 3512de92d111fe141deb355cb8d9a2b4dc66cfa3400bc67f9fec5f95909dc973.
+- [V] Image out/ios16-chg3 (config args + `negronibatt=5 negroniadsp=1 negronichg_glink=1 negronichg_ma=1500
+  negronipanic=30 negronipanicreason=2`): boot_a.img sha256 9286b5e3a6639e045d1a09e03a11e663ff90619b0b1609d1d92dacee5bed9ef5,
+  vendor_boot_a.img c29329eed53250d753caf8e1a8793c6f44238e2b6983adcda5c65cbdbe47fe5b (out/ios16-chg3/SHA256SUMS).
+
+## 10. The percentage: why 12 % became 9 %, and its source (0276, 2026-10-26)
+
+Owner report: "12 % when the USB-C cable went in, 9 % later". Log: `logs/usblog.log` (kernel local-20261026-074105,
+`negronibatt=5`, cable in the whole time).
+
+Findings:
+- [V] The phone rebooted at 13:32:30 (`NEGRONI RTC: time set`, launchd `boot-args =` at usblog.log 7585-7990 between
+  the two battery series). The 12 % series (13:17-13:31, `soc 1150`) and the 9 % series (13:32:43 on, `soc 913`) are
+  two boots. 0271 keeps nothing across boots: the first value is the first sample's table value.
+- [V] Boot 1 first sample: 3693 mV at +146 mA -> IR comp 80 mOhm -> 3681 mV -> 11.5 % (`kOcv` 3680 = 10 %, 3720 = 15 %).
+  Boot 2 first sample: 3549 mV at -1240 mA (the boot load) -> +99 mV -> 3648 mV -> 9.1 %. The difference is the load at
+  the first poll, not a 3 % discharge.
+- [V] Within a boot the value never moved: `soc 1150` for 42 polls while `vadc vbat` went 3504-3693 mV. 0271 says
+  "never down on a charger" (`external=1`) and the coulomb count is ~0 (ibat 0 or +78 mA at rest, -0.3..-1.3 A in bursts),
+  so a cable that only holds the phone froze the number.
+- [V] The true state: rest samples (ibat 0 mA, 8 of 8 zero) read `vadc vbat` 3669 mV (boot 1, 19 samples) and 3662 mV
+  (boot 2, 16 samples); `mid2s` equals `vbat` (the VBAT pin is on the 1S side). On the 0271 table 3669 mV = 9.3 %,
+  3662 mV = 8.8 %. Net coulombs: -68 mAh in 14 min (boot 1), -34 mAh in 8 min (boot 2): the pack loses about 1 %
+  per 10 min with the cable in (the input ~1 A at 5 V covers only the idle load; `iin` 580-1000 mA). So 9 % is right
+  to within the table's error and 12 % was the overestimate. [I] The table is a generic 4.45 V-class curve
+  (DT `qcom,temp_normal_vfloat_mv` = 0x1153 = 4435 mV): +-3 % near 10 %.
+- [V] What the raw `soc 1150` is: `fSoc` of NegroniBattery.cpp (hundredths of a percent, our estimate). It is not a
+  PMIC register. No QGauge exists here: `out/live.dts` has no `qpnp,qg`/`qg@`/`qbg@` node and no OCV table
+  (grep: 0 matches), and the OnePlus kernel's QG driver (`out/src/op-kernel drivers/power/supply/qcom/qpnp-qg.c`,
+  `qg-soc.c`, `qg-sdam.c`) is not probed on this board. The BCL `vbat`/`ibat` are voltage/current only.
+- [V] Where OxygenOS gets the percentage: the ADSP. `oplus_battery_sm8450.c:10727` `fg_bq27541_get_battery_soc()`:
+  with `ADSP_VOOCPHY` it is `read_buffer_dump.data_buffer[3] / 100` (the OEM read buffer from the charger PD,
+  `handle_oem_read_buffer` :311), else `BATT_CAPACITY` over GLINK (`read_property_id`); Qualcomm
+  `qti_battery_charger.c:760` reads the same `BATT_CAPACITY` (hundredths of a percent). The gauge IC itself (the
+  `oplus_bq27541.h` family: bq27541/bq27z561/bq28z610, :33) sits on a bus that only the ADSP has; the HLOS DT has no
+  I2C gauge node (`bq27`, `bq28`, `oplus,gauge`, `cw2217`, `sh366`, `nfg8011`: 0 matches), only
+  `qcom,external_gauge` (out/live.dts:6804) under `qcom,battery_charger`. Our tree has no GENI I2C driver
+  (`negroni_i2c`: 0 matches in patches/xnu). So source (a), the gauge over I2C, is not possible from the AP.
+
+What 0276 does (`iokit/Kernel/arm/NegroniBattery.cpp` only; applies after 0274):
+- Source order per poll: `glink` = 0274's `negroni_chg_glink_get()` `soc_centi` when the channel is up, the PD
+  answered and the value is at most 3 minutes old (`NB_GLINK_FRESH_NS`); the value is shown as it is (the real
+  gauge). Else `ocv`: the estimate below. `gauge` (I2C) is reserved, not implemented.
+- OCV estimate: terminal voltage minus I x 80 mOhm (clamped +-150 mV), one bad conversion rejected (a sample more
+  than 250 mV from the filtered value is ignored unless three in a row; seen: `vadc vbat 2742mV` once in a 3660 mV
+  series), filtered (1/4 at rest |I| <= 100 mA, 1/8 under load), then the `kOcv` table = `target`. The shown value
+  moves toward `target` at most 1 % per 30 s (`NB_SOC_RATE_S`); never down while the filtered current is >= +50 mA,
+  never up while it is <= -50 mA, both ways at rest (so a cable that only holds the phone no longer freezes it). The
+  first value is the first sample's table value (1-3 % low under the boot load; it stays until the pack reaches that value or the phone rests (|I| < 50 mA); under a discharge current the value cannot rise).
+- `ExternalConnected` in the full read: VBUS first (the same source as the plug tick), the SMB5 rt_sts bit only without a VBUS reading, else the current direction. Without any AP voltage (static fallback) a ready GLINK SoC is still published.
+- `charging` uses the filtered current (no flicker between the +78 mA and 0 mA polls) or, with the GLINK source, the
+  PD's `BATT_STATUS` (1 charging, 4 full). `full` the same way.
+- Registry: `CapacityEstimated`/`NegroniBatterySOCEstimated` are false with the GLINK source; new
+  `NegroniBatterySOCSource` ("ocv"/"glink"), `NegroniBatteryOCVMillivolts`, `NegroniBatterySOCTarget`.
+  The IOPMPowerSource keys are unchanged: `CurrentCapacity` = percent, `MaxCapacity` = 100, `IsCharging`,
+  `ExternalConnected`, `TimeRemaining` 0xffff, `Amperage` (+ = charging), `Voltage` (mean cell, mV): the set that
+  powerd/SpringBoard read (0271, checked against the `powerd` strings).
+- Nothing is kept across boots (next step: save `fSoc` with the RTC offset file, as `negroni_rtc.c` does).
+- Plug latency (owner report: "5 to 10 s to detect it is charging"; cause: one full read every 20 s): the timer
+  now ticks every `negronibatt_fast` ms (default 1000; 0 = off, 250 min). A tick runs `fastCheck()`: the plug
+  state only, VBUS through the VADC (modes 4/5, one ADC7 conversion of channel 0x311) or, without the VADC, the
+  BCL current direction (observer reads, +-50 mA hysteresis). On a change it logs
+  `NEGRONI BATTERY: external 0->1 (usbin 4919 mV) after 998 ms` (ms since the previous tick = the detection
+  delay bound), publishes `ExternalConnected`/`ExternalChargeCapable`/`AppleRawExternalConnected` (and
+  `IsCharging` = false on unplug) with `updateStatus()` at once, then runs the full read. The 20th tick is the
+  full read as before. [V] No plug interrupt is reachable: SMB5 `USBIN_INT_RT_STS` (0x1310 bit 4) has no APID in
+  the HLOS map (section 8); the census `rt_sts 327 (0x2700+0x10)` bit 6 toggles 0x80 <-> 0xc0 with the load
+  (0xc0 at -458..-1289 mA, 0x80 at -78..+78 mA, 14 toggles in logs/usblog.log 13:17-13:41 with the cable in the
+  whole time): a current/BCL-type status, not the cable; `rt_sts 306 (0x0600+0x10)` changed only at the first read.
+- 0274 coupling: 0276 touches no 0274 line (its hunks anchor on 0271-0273 code) and includes
+  `negroni_chg_glink.h` only `#if __has_include(...)`: it applies and compiles with and without 0274
+  (checked both ways, `git apply --check` + compile-one, 2026-10-26). Note: 0274 itself stopped applying at
+  13:41 when 0242/0243 (audio agent) changed `bsd/dev/negroni_adsp.c` (`error: patch failed: bsd/dev/negroni_adsp.c:1644`,
+  logs/tree-soc2.log, logs/kernel-soc.log); the 0274 agent rebased it before the 14:00 build (`kernel-soc2`: 0274 and 0276 both applied).
+
+Log lines to expect (`negronibatt=5`):
+```
+NEGRONI BATTERY: soc 9% src=ocv ocv=3665mV target=9.00% avg=-12mA vbat=3662mV cur=0
+NEGRONI BATTERY: external 0->1 (usbin 4919 mV) after 998 ms
+NEGRONI BATTERY: soc source glink (the charger PD's gauge value 9.40%; ocv estimate 9.10%)      (only with 0274 active)
+NEGRONI BATTERY: soc source ocv (the charger PD's value is stale; kept 9.40%, estimate 9.10%)
+```
+`raw ... soc NNNN` still prints `fSoc` of the previous poll. The main status line is unchanged (0274 owns its
+`chg=`/`icl=` fields); 0276 adds its own line on each change of percent, source or whole-percent target:
+`NEGRONI BATTERY: soc 9% src=ocv ocv=3665mV target=9.00% avg=-12mA vbat=3662mV cur=0`, and on a plug change
+`NEGRONI BATTERY: external 0->1 (usbin 4919 mV) after 998 ms`.
+
+Verification:
+- [V] `scripts/kernel/compile-one.sh out/kernel/tree-soc iokit/Kernel/arm/NegroniBattery.cpp` (the script now takes a
+  `.cpp` of iokit/ with the build's clang++ line; `COMPILE_LOG=logs/chg3.log` while a full build rewrites build.log):
+  no diagnostic in the file.
+- [V] Full build `kernel-soc3` (2026-10-26, review fixes in): out/kernel/local-20261026-084328/kernel.development.negroni, sha256
+  20026d62616b6dd932737f4cd26e7f73e439d123ed10f2f99d763956b3a236a0; patch-report: 0274 and 0276 applied, only the
+  4 usual dxb skips; the strings `soc %u%% src=%s` and `external %d->%d` are in the kernel. Image `out/ios16-soc`
+  (config args + `negronibatt=5 negronipanic=30 negronipanicreason=2`): boot_a.img sha256
+  400f1f95130907e17aaa2d982c162e0ba395a34a5434d2cd0d8f0d2721bbdaa6, esp.img 25b1d7cc..., negroni.adt e6d00e37...
+  (out/ios16-soc/SHA256SUMS). Not booted.
+- Phone: the first line's percent is within 3 % of the rest value; after 10 min at rest with the cable in, the
+  percent follows `target` (1 % per 30 s); with 0274 running, `soc src=glink`.

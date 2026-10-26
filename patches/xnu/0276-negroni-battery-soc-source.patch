@@ -1,0 +1,365 @@
+diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBattery.cpp
+index 2050593..2ab29d2 100644
+--- a/iokit/Kernel/arm/NegroniBattery.cpp
++++ b/iokit/Kernel/arm/NegroniBattery.cpp
+@@ -91,8 +91,31 @@ int negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ unsigned negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max);
+ }
+ 
++/*
++ * Patch 0276 (the percentage and the plug latency; README-battery.md section 10). CurrentCapacity comes
++ * from the best source in this order: the external gauge over I2C (not reachable: its bus belongs to
++ * the ADSP, no node in the HLOS DT), the charger PD's SoC over GLINK when patch 0274 is in the tree
++ * and fresh ("src=glink", shown as it is), else the OCV estimate ("src=ocv"): IR-compensated
++ * terminal voltage, one-conversion outliers rejected, filtered, then the table; the shown value moves
++ * at most 1 % per 30 s toward it, never down while the filtered current charges, never up while it
++ * discharges, both ways at rest. The first value is the first sample's table value (the boot load
++ * makes it read low by 1-3 %; it stays until the pack reaches that value or the phone rests
++ * (|I| < 50 mA); under a discharge current the value cannot rise). Nothing is kept across boots (a reboot
++ * restarts the estimate: the 12 % -> 9 % of 2026-10-26 was that). The timer now ticks every
++ * NB_FAST_MS (negronibatt_fast, default 1000 ms; 0 = off): a tick reads only the plug state (VBUS
++ * through the VADC in modes 4/5, else the BCL current direction) and on a change publishes
++ * ExternalConnected/IsCharging at once and runs the full read; the full read keeps its 20 s period.
++ */
++#if __has_include("../../../bsd/dev/negroni_chg_glink.h")
++#include "../../../bsd/dev/negroni_chg_glink.h"   /* 0274, when present */
++#define NB_HAVE_GLINK 1
++#else
++#define NB_HAVE_GLINK 0
++#endif
++
+ #define NB_DESIGN_MAH      5000    /* DT qcom,batt_capacity_mah = 0x1388 (1S equivalent of the 2S pack) */
+ #define NB_POLL_MS         20000
++#define NB_FAST_MS         1000    /* 0276: plug-state tick (negronibatt_fast) */
+ #define NB_R_MOHM          80      /* IR compensation (estimate) */
+ #define NB_IR_MAX_MV       150
+ #define NB_EXT_MV          4000    /* VBUS above this: charger present */
+@@ -104,6 +127,13 @@ unsigned negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max);
+ enum { NB_OFF = 0, NB_READONLY = 1, NB_RO_DIAG = 2, NB_STATIC = 3, NB_VADC = 4, NB_VADC_DIAG = 5 };
+ enum { NB_SRC_STATIC = 0, NB_SRC_BCL = 1, NB_SRC_VADC = 2 };
+ static const char *const kSrcName[] = { "static", "PM8350B BCL", "PMK8350 VADC" };
++/* 0276: where the percentage comes from */
++enum { NB_SOC_NONE = 0, NB_SOC_OCV = 1, NB_SOC_GLINK = 2, NB_SOC_GAUGE = 3 };
++static const char *const kSocSrcName[] = { "none", "ocv", "glink", "gauge" };
++#define NB_SOC_RATE_S      30      /* the shown value moves at most 1 % per this many seconds (OCV source) */
++#define NB_OCV_OUTLIER_MV  250     /* a conversion this far from the filtered voltage is one bad sample (seen: 2742 mV once) */
++#define NB_REST_MA         100     /* |current| below this: the sample is near the open-circuit voltage */
++#define NB_GLINK_FRESH_NS  180000000000ull /* the PD's SoC counts for 3 minutes after its last good read */
+ 
+ /* PM8350B BCL (SID 3 0x4700), downstream bcl_pmic5.c */
+ #define BCL_SID            3u
+@@ -254,6 +284,16 @@ private:
+ 	unsigned fRtCount;
+ 	uint16_t fRtPpid[NB_RT_MAX];
+ 	uint8_t fRtLast[NB_RT_MAX];
++	/* 0276: the percentage source, its filter, the plug tick */
++	int32_t fOcvMv;            /* filtered IR-compensated open-circuit voltage (mV); 0 = none yet */
++	int32_t fCurAvg;           /* filtered battery current (mA, + = charging) */
++	int32_t fSocTarget;        /* the table value of fOcvMv (1/100 %) */
++	int fSocSrc;               /* NB_SOC_* */
++	unsigned fOutliers;        /* conversions far from the filtered voltage, in a row */
++	int fSocLogKey;            /* the last logged percent/source/target */
++	unsigned fFastMs, fTicks;  /* plug tick period (0 = off) and ticks since the last full read */
++	uint64_t fFastNs;          /* uptime of the last plug tick */
++	void fastCheck(void);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void putObject(const char *key, OSObject *value);
+@@ -300,6 +340,20 @@ NegroniBattery::init(OSDictionary *dictionary)
+ 	fChgSt1 = fChgIclSts = fChgPowerPath = 0xff;
+ 	fMode = NB_READONLY;
+ 	fSoc = 0;
++	fOcvMv = fCurAvg = fSocTarget = 0;
++	fSocSrc = NB_SOC_NONE;
++	fOutliers = 0;
++	fSocLogKey = -1;
++	fFastMs = NB_FAST_MS;
++	(void)PE_parse_boot_argn("negronibatt_fast", &fFastMs, sizeof(fFastMs));
++	if (fFastMs && fFastMs < 250) {
++		fFastMs = 250;
++	}
++	if (fFastMs > NB_POLL_MS) {
++		fFastMs = NB_POLL_MS;
++	}
++	fTicks = 0;
++	fFastNs = 0;
+ 	fLastNs = 0;
+ 	fLowPolls = fFailPolls = 0;
+ 	fLastPercent = -1;
+@@ -414,9 +468,12 @@ NegroniBattery::publish(unsigned percent, unsigned mv, int ma, int centiC, bool
+ 	putNumber("InstantTimeToEmpty", 0xffff);
+ 	putNumber("PermanentFailureStatus", 0);
+ 	putNumber("BatteryCellDisconnectCount", 0);
+-	putBool("CapacityEstimated", true);
++	putBool("CapacityEstimated", fSocSrc != NB_SOC_GLINK && fSocSrc != NB_SOC_GAUGE);
+ 	putBool("NegroniBatteryHardwareSampleValid", measured);
+-	putBool("NegroniBatterySOCEstimated", true);
++	putBool("NegroniBatterySOCEstimated", fSocSrc != NB_SOC_GLINK && fSocSrc != NB_SOC_GAUGE);
++	putString("NegroniBatterySOCSource", kSocSrcName[fSocSrc]);
++	putNumber("NegroniBatteryOCVMillivolts", (UInt32)fOcvMv);
++	putNumber("NegroniBatterySOCTarget", (UInt32)fSocTarget);
+ 	putBool("NegroniBatteryFallback", !measured);
+ 	putString("NegroniBatterySource", kSrcName[source]);
+ 	putNumber("NegroniBatteryPercent", percent);
+@@ -1002,10 +1059,11 @@ NegroniBattery::poll(void)
+ 	}
+ 	/* Charger: the USBIN plug status of the charger (0272); else VBUS when the VADC measures it; else the
+ 	 * current direction with hysteresis (full on a charger: ~0 mA keeps the state). */
+-	if (s.chgRead) {
+-		fExternal = (s.usbRt & 0x10) != 0;
+-	} else if (s.usbOk) {
++	/* 0276: VBUS first (the plug tick uses it too; a disagreement would re-run the full read every tick) */
++	if (s.usbOk) {
+ 		fExternal = s.usbMv >= NB_EXT_MV;
++	} else if (s.chgRead) {
++		fExternal = (s.usbRt & 0x10) != 0;
+ 	} else if (curKnown) {
+ 		if (cur >= NB_CUR_MA) {
+ 			fExternal = true;
+@@ -1040,6 +1098,21 @@ NegroniBattery::poll(void)
+ 				    fVadc ? (s.adcVbatN ? "out of range" : "no conversion") : "off",
+ 				    fVadc ? "" : " (negronibatt=4 measures with the VADC)");
+ 			}
++#if NB_HAVE_GLINK
++			/* 0276: the charger PD's value serves even without an AP measurement */
++			negroni_chg_glink_status g;
++			if (negroni_chg_glink_get(&g) && g.up && g.ready && g.soc_centi >= 0 && g.soc_centi <= 10000) {
++				fSocSrc = NB_SOC_GLINK;
++				fSoc = g.soc_centi;
++				fHaveSoc = true;
++				int32_t mv = g.vbat_mv > 5000 ? g.vbat_mv / 2 : g.vbat_mv > 0 ? g.vbat_mv : 0;
++				IOLog("NEGRONI BATTERY: soc %d%% src=glink (no AP voltage; PD vbat %d mV status %d)\n",
++				    (fSoc + 50) / 100, g.vbat_mv, g.bstatus);
++				publish((unsigned)((fSoc + 50) / 100), (unsigned)mv, 0, 2500, g.usb_online > 0, g.bstatus == 1,
++				    g.bstatus == 4, NB_SRC_STATIC, s.usbMv, s.iinMa);
++				return;
++			}
++#endif
+ 			publish(100, 4200, 0, 2500, true, false, true, NB_SRC_STATIC, s.usbMv, s.iinMa);
+ 		}
+ 		return;
+@@ -1055,43 +1128,85 @@ NegroniBattery::poll(void)
+ 		dtS = NB_POLL_MS / 1000;
+ 	}
+ 
+-	/* Open-circuit voltage: the terminal voltage minus I x R (charging raises it, a load lowers it). */
+-	int32_t ocv = vbat;
++	/* 0276. Open-circuit voltage: the terminal voltage minus I x R (charging raises it, a load lowers it),
++	 * one bad conversion rejected, then filtered (a 50 mV BCL step is 5 % of the curve; the VADC jitters). */
++	int32_t ocvNow = vbat;
+ 	if (curKnown) {
+ 		int32_t drop = cur * NB_R_MOHM / 1000;
+ 		drop = drop > NB_IR_MAX_MV ? NB_IR_MAX_MV : drop < -NB_IR_MAX_MV ? -NB_IR_MAX_MV : drop;
+-		ocv -= drop;
++		ocvNow -= drop;
+ 	}
+-	int32_t target = socFromOcv(ocv);
+-	bool full = false;
+-	if (!fHaveSoc) {
+-		fSoc = target;
+-		fHaveSoc = true;
++	if (fOcvMv == 0) {
++		fOcvMv = ocvNow;
+ 	} else {
+-		/* Coulomb counting of the battery current, then a slow pull toward the voltage value. */
+-		int32_t cc = curKnown ? (int32_t)((int64_t)cur * dtS * 10000 / (3600 * NB_DESIGN_MAH)) : 0;
+-		int32_t next = fSoc + cc;
+-		next += (target - next) / (curKnown ? 32 : 8);
+-		if (external) {
+-			/* Taper at the float voltage: the cell is full. */
+-			if (curKnown && cur < NB_FULL_MA && vbat >= NB_TAPER_MV && next < fSoc + 100) {
+-				next = fSoc + 100;
+-			}
+-			if (next < fSoc) {
+-				next = fSoc;              /* never down on a charger */
++		int32_t diff = ocvNow - fOcvMv;
++		if (diff > NB_OCV_OUTLIER_MV || diff < -NB_OCV_OUTLIER_MV) {
++			if (++fOutliers < 3) {
++				ocvNow = fOcvMv;          /* one or two bad samples: keep the filter */
++			} else {
++				fOcvMv = ocvNow;          /* three in a row: the battery really moved */
++				fOutliers = 0;
+ 			}
+ 		} else {
+-			if (next > fSoc) {
+-				next = fSoc;              /* never up on battery */
+-			}
+-			/* At most 1 %/min below what the coulomb count explains (load sag). */
+-			int32_t cap = (int32_t)(dtS * 100 / 60) + (cc < 0 ? -cc : 0);
+-			if (cap < 1) {
+-				cap = 1;
+-			}
+-			if (fSoc - next > cap) {
+-				next = fSoc - cap;
+-			}
++			fOutliers = 0;
++		}
++		/* A sample near rest is trusted more than one under load (the IR constant is an estimate). */
++		const int32_t div = (curKnown && (cur > NB_REST_MA || cur < -NB_REST_MA)) ? 8 : 4;
++		fOcvMv += (ocvNow - fOcvMv) / div;
++	}
++	fCurAvg += ((curKnown ? cur : 0) - fCurAvg) / 4;
++	int32_t target = socFromOcv(fOcvMv);
++	fSocTarget = target;
++	/* The ADSP charger PD (patch 0274, when in the tree) reads the real gauge: its value is the truth. */
++	int32_t glinkSoc = -1, glinkBstatus = -1;
++#if NB_HAVE_GLINK
++	{
++		negroni_chg_glink_status g;
++		if (negroni_chg_glink_get(&g) && g.up && g.ready && g.soc_centi >= 0 && g.soc_centi <= 10000 &&
++		    ns >= g.soc_ns && ns - g.soc_ns < NB_GLINK_FRESH_NS) {
++			glinkSoc = g.soc_centi;
++			glinkBstatus = g.bstatus;
++		}
++	}
++#endif
++	bool full = false;
++	if (glinkSoc >= 0) {
++		if (fSocSrc != NB_SOC_GLINK) {
++			IOLog("NEGRONI BATTERY: soc source glink (the charger PD's gauge value %d.%02d%%; ocv estimate %d.%02d%%)\n",
++			    glinkSoc / 100, glinkSoc % 100, target / 100, target % 100);
++		}
++		fSocSrc = NB_SOC_GLINK;
++		fSoc = glinkSoc;
++		fHaveSoc = true;
++	} else if (!fHaveSoc || fSocSrc != NB_SOC_OCV) {
++		if (fSocSrc == NB_SOC_GLINK) {
++			IOLog("NEGRONI BATTERY: soc source ocv (the charger PD's value is stale; kept %d.%02d%%, estimate %d.%02d%%)\n",
++			    fSoc / 100, fSoc % 100, target / 100, target % 100);
++		} else {
++			fSoc = target;           /* first value: the first sample's table value */
++		}
++		fSocSrc = NB_SOC_OCV;
++		fHaveSoc = true;
++	} else {
++		/* Toward the table value, at most 1 % per NB_SOC_RATE_S, monotonic with the filtered current:
++		 * the pack cannot gain charge while the net current leaves it, nor lose charge while it enters.
++		 * At rest (|avg| < NB_CUR_MA) both directions are allowed, so a cable that only holds the
++		 * phone (net ~0 mA, seen 2026-10-26) no longer freezes the value. */
++		int32_t next = target;
++		if (fCurAvg >= NB_CUR_MA && next < fSoc) {
++			next = fSoc;
++		}
++		if (fCurAvg <= -NB_CUR_MA && next > fSoc) {
++			next = fSoc;
++		}
++		int32_t step = (int32_t)(dtS * 100 / NB_SOC_RATE_S);
++		if (step < 1) {
++			step = 1;
++		}
++		if (next > fSoc + step) {
++			next = fSoc + step;
++		} else if (next < fSoc - step) {
++			next = fSoc - step;
+ 		}
+ 		fSoc = next > 10000 ? 10000 : next < 0 ? 0 : next;
+ 	}
+@@ -1104,8 +1219,25 @@ NegroniBattery::poll(void)
+ 	if (percent > 100) {
+ 		percent = 100;
+ 	}
+-	full = external && fSoc >= 10000 && (!curKnown || cur < NB_FULL_MA);
+-	bool charging = external && !full && (curKnown ? cur > NB_CUR_MA : percent < 100);
++	/* Charging: the PD's status when it reports one; else the filtered current (no flicker between
++	 * the +78 mA and 0 mA polls of a cable that only holds the phone). */
++	bool charging;
++	if (glinkSoc >= 0 && glinkBstatus >= 1 && glinkBstatus <= 4) {
++		full = glinkBstatus == 4 || (fSoc >= 10000 && glinkBstatus != 1);
++		charging = glinkBstatus == 1 && !full;
++	} else {
++		full = external && fSoc >= 10000 && (!curKnown || fCurAvg < NB_FULL_MA);
++		charging = external && !full && (curKnown ? fCurAvg > NB_CUR_MA : percent < 100);
++	}
++	{
++		int key = (int)percent | (fSocSrc << 8) | ((target / 100) << 12);
++		if (key != fSocLogKey) {
++			fSocLogKey = key;
++			IOLog("NEGRONI BATTERY: soc %u%% src=%s ocv=%dmV target=%d.%02d%% avg=%dmA vbat=%dmV cur=%s%d\n",
++			    percent, kSocSrcName[fSocSrc], fOcvMv, target / 100, target % 100, fCurAvg, vbat,
++			    curKnown ? "" : "?", cur);
++		}
++	}
+ 	/* Skin temperature as the battery's (VADC only); clamped so an outlier cannot stop charging in iOS. */
+ 	int centiC = s.tempOk ? (s.centiC < 0 ? 0 : s.centiC > 4500 ? 4500 : s.centiC) : 2500;
+ 	putBool("NegroniBatteryTemperatureEstimated", true);
+@@ -1126,11 +1258,69 @@ NegroniBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	NegroniBattery *self = OSDynamicCast(NegroniBattery, owner);
+ 	if (self && self->fRunning) {
+-		self->poll();
+-		sender->setTimeoutMS(NB_POLL_MS);
++		/* 0276: a full read every NB_POLL_MS; between them the plug-state ticks (negronibatt_fast) */
++		if (!self->fFastMs || ++self->fTicks >= NB_POLL_MS / self->fFastMs) {
++			self->fTicks = 0;
++			self->poll();
++		} else {
++			self->fastCheck();
++		}
++		sender->setTimeoutMS(self->fFastMs ? self->fFastMs : NB_POLL_MS);
+ 	}
+ }
+ 
++/* 0276: the plug state only, between the full reads: VBUS through the VADC (modes 4/5; one ADC7
++ * conversion), else the BCL current direction (observer reads). On a change the keys the status bar
++ * reads first are published at once, then the full read runs. The charger's own USBIN plug bit
++ * (SMB5 USBIN_INT_RT_STS 0x1310 bit 4) has no APID in the HLOS map (0272/0273), and the SID 3 rt_sts
++ * bits the census watches (0x2710 bit 6) follow the load current, not the cable (logs 2026-10-26). */
++void
++NegroniBattery::fastCheck(void)
++{
++	bool known = false, ext = fExternal;
++	unsigned usbMv = 0;
++	uint64_t now, ns;
++	clock_get_uptime(&now);
++	absolutetime_to_nanoseconds(now, &ns);
++	if (fVadc) {
++		int64_t uv = 0;
++		if (adcMicro(kUsbIn, &uv)) {
++			usbMv = (unsigned)(uv / 1000);
++			ext = usbMv >= NB_EXT_MV;
++			known = true;
++		}
++	} else if (fReal && fIbatSeen) {
++		nb_sample s = {};
++		readBcl(s);
++		if (s.bclIbatOk && s.bclIbatNonzero) {
++			if (s.bclIbatMa >= NB_CUR_MA) {
++				ext = true;
++				known = true;
++			} else if (s.bclIbatMa <= -NB_CUR_MA) {
++				ext = false;
++				known = true;
++			}
++		}
++	}
++	uint64_t sinceMs = fFastNs && ns > fFastNs ? (ns - fFastNs) / 1000000ull : 0;
++	fFastNs = ns;
++	if (!known || ext == fExternal) {
++		return;
++	}
++	IOLog("NEGRONI BATTERY: external %d->%d (usbin %u mV) after %llu ms\n", fExternal, ext, usbMv,
++	    (unsigned long long)sinceMs);
++	fExternal = ext;
++	setExternalConnected(ext);
++	setExternalChargeCapable(ext);
++	if (!ext) {
++		setIsCharging(false);
++	}
++	putBool("AppleRawExternalConnected", ext);
++	updateStatus();
++	fTicks = 0;
++	poll();
++}
++
+ bool
+ NegroniBattery::start(IOService *provider)
+ {
+@@ -1201,7 +1391,7 @@ NegroniBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(NB_POLL_MS);
++			fTimer->setTimeoutMS(fFastMs ? fFastMs : NB_POLL_MS);
+ 		} else {
+ 			fReal = false;
+ 			poll();
