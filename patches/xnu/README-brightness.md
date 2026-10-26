@@ -105,7 +105,7 @@ Display sleep (0258, replaces the 0251 behaviour on 2026-10-26):
   SpringBoard does what it does on an iPhone: short press = lock, then backboardd sends
   `RequestPowerChange(0)`; a press while dark = wake, `RequestPowerChange(1)`; a long press = "slide to
   power off" (README-reboot.md 0211/0214: `reboot(RB_HALT)` -> `kPEHaltCPU` -> `negroni_power_off()`).
-- `RequestPowerChange(0)`: the framebuffer runs its fade (7 vsync ticks: 6 halvings, then black), then
+- `RequestPowerChange(0)`: the framebuffer writes black on the next vsync tick (0275), then
   calls `negroni_backlight_display_off(fade ms)` under its `fLock` (only if still off). The backlight work
   loop sets DBV 0 and, with `negronifb_sleep>=1`, sends the panel's own off-command from the live DT
   (`qcom,mdss-dsi-off-command = [05 00 00 00 15 00 02 28 00 05 00 00 00 65 00 02 10 00]`, LP mode):

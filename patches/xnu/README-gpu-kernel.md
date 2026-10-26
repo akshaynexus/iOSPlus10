@@ -850,3 +850,122 @@ NegroniBacklight.cpp (`negroni_dsi_dcs_set`, `negroni_backlight_panel_ready`, ND
   timing leaves the tearcheck vsync_count at the 120 Hz value [I, start_pos = init so the transfer starts
   at the TE either way]. Build: kernel local-20261026-075816 (a39f24e5...), image out/ios16-vrr (config args +
   `negronifb_te=1 negronifb_vrr=1`). Not booted.
+
+## 18. 120 Hz pipeline: vsync after the frame, clock shift inside the copy, GPU UI floor (0267, 0286)
+
+Owner report (2026-10-26 13:25, kernel local-20261026-074105, config args + `negronibatt=5 negronipanic=30
+negronipanicreason=2`): "not 120 Hz, still laggy; the top-left glitching still exists".
+
+### Measurements [V]
+
+- `logs/usblog.log` 13:18-13:31 (FB STAT, 365 seconds with presents > 20): swaps/s mean 49 (40-81), presents/s mean
+  43.5 (28-70, max 105), cpu 0-8, gpu 24-62, zc 0; copy avg 2.0-2.6 ms, max 6-8 ms; SwapWait busy answers mean
+  173/s (60-960); gpu-wait skips mean 22/s; late ticks 0 outside the screen-off seconds (those are the 0251 fade,
+  0265 by the wake agent).
+- GPU DCVS (0281) under that load: level 4-5 (350-421 MHz) most of the time, short steps to 6-9, `busy` 20-50 %,
+  thermal cap 12 -> 4 when the CPU reached 79 C.
+- Metal telemetry (backboardd, `/var/db/negronimetal/metal.log`): 9368 command buffers, commit-to-complete mean
+  15.6 ms, max 170 ms; scheduling wait total 2.3 s (0.25 ms per buffer). Last 3000 `K` rows: ctc mean 15.7 ms, 33 %
+  under 10 ms, 38 % over 16.7 ms; 7 render passes and ~6.2 M pixels (2.2 screens) per buffer.
+- The older log with the fixed 818 MHz vote (`logs/usblog-20261025-223827.txt`, 2036 seconds with presents > 20):
+  swaps/s 69, presents/s 57.7, gpu-wait skips 9/s. So the clock alone is worth about +30 % presents/s.
+
+### Where the 8.3 ms goes [V code, I = inferred]
+
+1. The tick order (0252-0256 code): `vsyncFired` sent the vsync notification first, then (if the frame's render
+   fence passed) queued the 2D copy, then `present()` waited for the copy's fence (2.4 ms avg, up to 8 ms: the
+   ring is in order, so the copy also waits for CA's next render) because `negronifb_clockshift` must shift after
+   the copy, and only then published the swap id (`fPresentedID`). CoreAnimation wakes on the notification and
+   calls SwapWait for that id: busy; it retries with usleep(100) for 1 ms, then skips the heartbeat [V QuartzCore
+   20H392 disassembly, section 12 "0254"]. [I] That is most of the 60-960 busy answers per second and the gap
+   between 120 and the swaps/s.
+2. The render: 10-24 ms commit-to-complete per CA frame at 350-492 MHz with the bandwidth vote tied to the GX
+   level (bw 3-5) [V telemetry + DCVS lines]; a frame not done at a tick waits for the next one (gpu-wait skips).
+   [I] The 0281 busy rule needs two 100 ms samples in a row with a fence pending; a 40-60 % duty cycle rarely gives
+   that, so the GPU stays near the floor exactly when the UI needs short frames.
+3. The copy: 2D copy of 1080x2412 (10.4 MB read + write) on the GPU, ~2 ms at 421 MHz [I from copy avg minus the
+   submit]; the CPU copy (cpu 2-8/s) takes 2.4 ms of a core.
+
+### Top-left glitch [V code + 0265's measurement, I for the visual]
+
+`negroni_shift_clock()` shifted the strip (120 rows x 540 px) in place with `memmove` in the panel memory. The
+panel memory is mapped write-combined (`negroni_surface_create_physical`, kIOMapWriteCombineCache): every read is
+an uncached bus read (0265 measured a full read-modify-write pass at ~1 s, i.e. ~10 MB/s), so the shift of 259 KB
+takes several ms. During that time, and between the copy's completion and the shift, the display engine (auto-
+refresh, one scan per TE, not synchronised with our tick) scans the strip unshifted or half-shifted. With 40-70
+frames per second the strip flickers between the shifted and the unshifted clock and shows torn rows: the "top-left
+glitching". The 0256 deferred path (`clock shift after fence N`, seen at 13:20:26 and 13:20:35) leaves the strip
+unshifted for one more tick. The single scanned buffer is the root; the in-place CPU read is what makes the window
+long.
+
+### 0267 (`0267-negroni-fb-vsync-after-frame-clock-copy.patch`; NegroniFramebuffer.cpp, NegroniGPU.cpp/.h)
+
+- `negronifb_notifylate=1` (default): with the display on, the tick queues its frame (GPU copy submitted or CPU copy
+  done), publishes the swap id, then sends the vsync notification. The CPU drawing over a GPU copy (`presentFinish`:
+  the 0256 shift when the copy did not shift, the badges) runs after the notification. With the display off the
+  order is the old one (0258/0265 untouched). `=0`: the old order. With notifylate the swap id counts as on screen
+  when the GPU copy is submitted, not when its fence is done (0254/0256 waited for the fence only through the clock
+  shift); the source surface stays held (keepBusy) until that fence. The ring is in order, so CoreAnimation's next
+  render into that surface runs after the copy has read it.
+- `negronifb_clockcopy=1` (default): a frame of one layer that covers the strip is copied with the strip already
+  shifted. GPU: `NegroniGPUPresentRects` puts 4 rectangles in one IB with one fence (rows below the strip; the
+  strip's left half to x + n; the n pixels pushed out at the middle to x 0..n; the strip's right half), 98 words
+  each (392 of the 4096-word IB page) [V host run of negroni_gpu_copy_ib]. CPU: 3 memcpys per strip row. The n
+  columns at the left edge now get the pixels from the middle of the canvas (logical x 462..562, the notch area:
+  no status bar item there) instead of the edge pixel of each row; zero-copy (0234) uses the same fill. No read of
+  the panel memory, no change of the strip after the copy, no fence wait on the tick. `=0`: the 0256 behaviour.
+  Frames with more than one layer keep the 0256 path.
+- Order: made on 0259 (13:25 version); 0275 (display off fast, wake agent) applies after it unchanged (the notify
+  loop keeps its text, only its condition gets `!notifyLate`) [V git apply chain 0267, 0286, 0274, 0275].
+- Host test: `patches/xnu/tests/fb-clock-copy-test.c` (rectangles and CPU rows against "copy, then rotate the left
+  half by n", n = 1, 100, 200, 539): PASS.
+- Log: `NEGRONI FB: 0267 vsync notification after the frame is queued (negronifb_notifylate=1), clock shift inside
+  the copy (negronifb_clockcopy=1)` at start; the first 4 frames `NEGRONI FB: clock shift inside the copy (GPU, 4
+  rectangles), N GPU + N CPU frames so far`; `RedwoodGPU: present N: ... 4 rect(s), 392 words`.
+
+### 0286 (`0286-negroni-gpu-dcvs-ui-floor.patch`; negroni_adreno.c, one line in NegroniFramebuffer.cpp swap())
+
+- Numbered 0286, not 0268: it changes the 0281/0285 DCVS code, which the build applies after 0268 (patches go in name
+  order). [V] a first build with the name 0268 skipped it (`patch failed: bsd/dev/negroni_adreno.c:3476`).
+
+- swap() counts SwapEnds (`negroni_gpu_ui_swaps`); the DCVS tick makes a rate over >= 100 ms. At
+  `negronigpu_uifps` (default 30) swaps/s or more, the level is at least `negronigpu_uifloor` (default 9 = 640 MHz,
+  bw level 8) for `negronigpu_uihold` ms (default 1000) after the last such window; one busy tick (100 ms) moves one
+  level up while the floor is on. The 0280 thermal cap still wins. `negronigpu_uifloor=0` or `negronigpu_uihold=0`:
+  floor off (0281 as before). There is no line per floor event; the per-second DCVS line shows `ui N swaps/s floor on`.
+- Log: `NEGRONI GPU DCVS: UI floor level 9 (640 MHz) at 30 swaps/s or more, held 1000 ms (0286)`; the per-second
+  line gets `, ui N swaps/s floor on (N boosts)`.
+
+### Expected [I, not booted] and proof lines
+
+- Scrolling (copy avg/max now includes presentFinish, i.e. the badge or 0256 fence wait; the numbers are for
+  badges off): `NEGRONI FB STAT: swaps/s 100-120 presents/s 100-120 (cpu 0-5 gpu ...) copy avg/max us <300/<1500
+  ... timeouts` well under 100, `gpu-wait skips` under 10; `NEGRONI GPU DCVS: level 4 -> 9 (640 MHz, ...) ... ui
+  110 swaps/s floor on`. If presents/s stays at 60-80 with `timeouts` low and `gpu-wait skips` high, the render
+  (ctc) is the limit: try `negronigpu_uifloor=12`; if `timeouts` stays high, CA waits for something else (report).
+- Top-left: the clock stays still while the screen moves; `negronifb_clockcopy=0` brings the 0256 path back for an
+  A/B, `out/ios16-perf-noshift` has no shift at all (the clock under the camera hole, nothing drawn by the kernel).
+
+### Build (2026-10-26 13:56)
+
+Job `perf-kernel` (`scripts/display/build-perf.sh`, lock out/kernel/.lock held across kernel + images): kernel
+`out/kernel/local-20261026-082629` (sha256 92f50f3ab2a29b4702f0c86d3ea890accf94866f83edfbb1e158c74e6bff2a20; all 64
+patches/xnu applied incl. 0267, 0275, 0285, 0286; the 4 usual dxb skips). Images (config args + `negronifb_notifylate=1
+negronifb_clockcopy=1 negronigpu_uifloor=9 negronibatt=5 negronipanic=30 negronipanicreason=2`):
+`out/ios16-perf` boot_a sha256 2583f0abb9b84288274ea9a7a010529fff71c09c78b04daf1a0a0014a2418894;
+`out/ios16-perf-noshift` (no `negronifb_clockshift`) boot_a 50d09e1b4e5e4f199be4695bdf085774622249f3b342f940bbff903cf4e4c967;
+vendor_boot_a c29329ee... (copied from out/ios16). Not flashed.
+
+### Not done here (next candidates, by expected gain)
+
+- Panel double buffer: a second panel-size buffer in the splash region (0xb89f0000, free when zero-copy is off) and
+  a DPU base flip (SSPP SRC0_ADDR + CTL_FLUSH, the 0234 `flip()`/`zeroCopyLatched()` code with the panel memory as
+  slot) once the copy's fence passed: no tearing, the copy no longer races the scan. Needs the 0234 DPU probe lines
+  from a boot (never captured: the USB log starts after them; `ioreg` exists on the phone, so a registry property
+  with the probe result would make them readable).
+- A CPU copy (cpu 2-8/s) can write the single panel buffer while an earlier GPU copy is still in flight; the double
+  buffer above fixes it.
+- The GPU path does not check sy + h against the source surface height (pre-existing, 0231).
+- Zero-copy (`negronifb_zerocopy=1`, 0234, never booted): no copy at all; try it as an image variant after this.
+- Present on render completion instead of the next tick (saves 0-8.3 ms latency per frame) with a TE-locked tick
+  (0259 `negronifb_te=1`).
