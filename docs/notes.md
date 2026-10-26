@@ -291,6 +291,13 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 
 ## 9. Where things are (outside git)
 
+- OnePlus 10 Pro Linux sources (reference only, git-ignored, scripts/setup/fetch-oneplus-sources.sh, 2026-10-26):
+  `out/src/op-kernel` (OnePlusOSS android_kernel_oneplus_sm8450 e9da592, sparse: pci/mhi/cnss2, qmi, smp2p/rpmsg/qrtr,
+  power/supply (SMB5 charger), power/reset (msm-poweroff), thermal/qcom (tsens), cpufreq/qcom-cpufreq-hw, spmi,
+  pmic-pon-log, qpnp-power-on, usb/dwc3, gpu/msm gen7 GMU/HFI/hwsched/rpmh, dt-bindings) and `out/src/op-modules`
+  (android_kernel_modules_and_devicetree_oneplus_sm8450: vendor/oplus/kernel/charger = oplus_chg, dfr,
+  display-drivers, the devicetree). The live DT dump is `out/live.dts`.
+
 - The 20H392 dyld shared cache (for scripts/metal/check-imports.py and `ipsw dyld` symbolication):
   `out/dsc/cache/dyld_shared_cache_arm64*` (3.5 GB copy, 2026-10-26). `~/op10-apple` holds only
   `ios16-root.simg` (the flashed root, fallback); the raw `ios16-root.img` and the `20H392/` IPSW extraction
