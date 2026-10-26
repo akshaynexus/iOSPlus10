@@ -294,6 +294,22 @@ What 0272 does:
   EE 0 does not own the charger APIDs; the arbiter answers a refusal in the status word, no hang [I]).
 - Nothing else changes: no float voltage, no FCC, no JEITA, no Type-C role, no HVDCP.
 
+Phone result 2026-10-26 03:31 (`out/ios16-chg`): `chg=? icl=0mA pp=ff` on every line = not one of the 18
+registers read (`fChgSt1` kept its 0xff init value); the boot-time `charger registers: 0 of 18 readable`
+and the unlock/owner lines came before the USB console [V: logs/usblog.log 83940+]. The DT confirms the
+bus and SID: `qcom,pm8350b@3` is under `qcom,spmi@c42d000` (bus 0, EE 0), and the HLOS node lists only
+temp-alarm, PBS, pinctrl, BCL 0x4700, haptics and AMOLED; the charger blocks are not in the HLOS DT. A
+second arbiter node `qcom,spmi@c432000` (bus 1, same core/chnls/obsrvr, cnfg 0xc432000) and a
+`qcom,spmi-debug@10b14000` (pmic-arb-debug: an EE-independent path, fuse at 0x221c8784) exist [V: live.dts].
+So the reads fail for one of: no APID for PPID 0x310-0x316 in the map (XBL maps only the HLOS
+peripherals), or an arbiter error (access denied for a non-owner EE). The amended 0272 prints, every poll
+until a read works: `charger diag (0 of 18 read): APIDs 10:-1/EE7 11:... | reads 1006:no-APID ...`
+(reason per register: timeout, arbiter-error, not-allowed, no-APID, poisoned) and every third poll
+`SID 3 PPIDs in the APID map (n total): 0a/EE0 19/EE0 47/EE0 ...`; and in the first 3 polls and every 15th
+a `setup (poll n): ... charger CHGR APID n EE u USBIN APID n EE u, control ...` line. If the PPIDs are not
+in the map, the HLOS arbiter cannot reach them at all: the next step is the debug arbiter at 0x10b14000
+(Linux `spmi-pmic-arb-debug.c`) or the ADSP charger PD (section 6).
+
 Verification:
 - [V] 2026-10-26: `git apply --check` on the full tree (all patches up to 0290), `compile-one.sh`
   OK for `negroni_spmi.c`, `NegroniBattery.cpp` clean with the build's clang++ line (`-fsyntax-only`).

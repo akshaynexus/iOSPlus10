@@ -569,6 +569,59 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
     AegirPoster crash-loops (sig 6, dead-manned; wallpaper tiles magenta; separate bug). Config default is now
     `negronigpu_level=12`.
 
+- Safari + WebGPU and MSL source (2026-10-26, Safari/efficiency agent; patches flame/0009, flame/0010; the phone went flat
+  before the new bundle was tested):
+  - [V] 20H392 WebGPU.framework strings (`out/metal/spi/WebGPU.strings.txt`): `newLibraryWithSource:options:error:`,
+    "#include <metal_stdlib>" (WGSL -> MSL text), `newArgumentEncoderWithArguments:`, `argumentBuffersSupport`,
+    `newTextureWithDescriptor:iosurface:plane:`, `nextDrawable`, `present`, `supportsFamily:`. `scripts/metal/selector-gap.py
+    --client WebGPU`: 6 protocol selectors missing (indirect draws/dispatch, `executeCommandsInBuffer:withRange:`,
+    `newIndirectCommandBufferWithDescriptor:...`, `copyFromBuffer:...:options:`); the device methods it names resolve on
+    `_MTLDevice` so the gap tool did not flag them.
+  - [V] The frontend had no `newLibraryWithSource:`; the message resolved to `-[_MTLDevice newLibraryWithSource:options:error:]`
+    = `MTLLibraryBuilder::newLibraryWithSource` (this = `_MTLDevice+0x178 _libraryBuilder`, made in `-[_MTLDevice init]`) ->
+    `newLibraryWithRequestDataAndHash` -> `initLibraryContainerWithRequestData` (MTLCompilerService XPC,
+    `getCompilerConnectionManager`) -> `[[_MTLLibrary alloc] initWithLibraryContainer:device:]` (disassembly in
+    `out/metal/spi/disass/`). An `_MTLLibrary` has `bitcodeData` (NSData) and `libraryDataContents` (dispatch_data).
+  - [V] On the phone that path faults: `metalprobe --compute --render` (system device, bundle of 23:51 and the 0009 bundle
+    of 03:33) = `Segmentation fault: 11` before any plugin log line. usblog: `CRASH metalprobe[364] sig 11 ... slide 0x40ea8000`,
+    `pc 0x2129a9df4 lr 0x1c2066fc4 far 0x10000001b`, `bt 0x1c2066a78 0x109a10a48 (NegroniMetal+0x18a48) ...`; second run
+    pid 394: `pc 0x2129a9fe4 lr 0x1c20670c0 far 0x7000000000000000 bt 0x1c2066f0c 0x1c2066a78 0x106410a48`. Unslid:
+    pc 0x1d1b01fe4, callers 0x1811bf0c0 0x1811bef0c 0x1811bea78 (below Metal's text 0x181a16078: another cache image; not
+    symbolicated, the root image is now `~/op10-apple/ios16-root.simg`, an Android sparse image, no mount). `exec
+    MTLCompilerServi` never appears in any usblog: the XPC service was never launched [V]; the fault is before or at the
+    connection [I].
+  - [I] Mechanism of the "black/white flash": Safari's GPU process compiles the page's WGSL shaders through this path, dies
+    (usblog 23:51:13 `CRASH com.apple.WebKit[300] sig 11 far 0x16bc9db70` = stack guard page, `map after far prot 0/7`, then
+    `exec com.apple.WebKit.GPU` the same second; 10 GPU-process launches in the night), and WebKit relaunches it: the page
+    area alternates between the last composited tiles and the empty layer. The GPU process's pipelines.log (303 rows) holds
+    only `com.apple.coreanimation` pipelines, no refusal (ok=0: 0), no MISSING line: WebGPU never reached a pipeline maker.
+    WebContent never loads the plugin (no `NMTL[... WebContent]` line in metal.log or usblog).
+  - Change (flame/0009): `newLibraryWithSource:options:error:` / `...completionHandler:` on the device. Default: a clean
+    refusal (nil + NSError, `native-metal: newLibraryWithSource: refused (...)` once per process, journal line `L source
+    refused`), so the caller gets a failed shader module and lives. `NEGRONIMETAL_MSL_FRONTEND=1` runs the base IMP (not
+    `[super]`: the methods are copied into the `_MTLDevice` subclass) and feeds `bitcodeData` to `nmb_library_new` (bare AIR
+    unless "MTLB"): the path to finish once the fault is found. `newArgumentEncoderWithArguments:` answers nil (logged once):
+    the base method only raises; WebGPU bind groups need argument buffers, which neither the frontend nor the bridge exposes
+    (`NBFunction newArgumentEncoderWithBufferIndex:` is nil too) [V]. So WebGPU content needs: (1) the MSL front end or an
+    own WGSL/MSL path, (2) argument buffers, (3) the 6 selectors above for indirect work. Not a quick fix.
+  - Idle load [V from logs/usblog.log, 2026-10-25 22:38 - 03:28]: of 8614 `FB STAT` seconds, 5712 have `presents/s 0`:
+    nothing is rendered at idle. GPU WATCH: `gxclk 817/818 MHz` in 2341 of 2428 samples (the rest at boot): the clock is
+    fixed by the kernel (`negronigpu_level=12`), RBBM idle (0x1) in 2332 of 3049 samples. The idle heat is the fixed clock,
+    not bridge work (kernel scope). While the UI moves: backboardd telemetry (03:30) `S c2078 ... R13774 D99661 F4426 B106`,
+    `G commit-to-complete mean=9965us`, K rows `rp9-10 dr114-124 kpx8131-8147` (8.1 Mpx per command buffer = 1.75 screens;
+    2.1 full-screen passes per command buffer), `J nocopy-dealloc ... hostinv n=2077 r=40067 kb=47609088` (22.9 MB of host
+    imports invalidated per command buffer, ~19 ranges: m2v/0001 invalidates every import used, read-only ones included),
+    `J surface cache n=0` (backboardd). The GPU process's CA pipelines have colour attachment 0 = pixel format 554
+    (`MTLPixelFormatBGR10_XR`) with 15 = write mask; the W row says `PrecisionNote::ExtendedRangeBlendSource` is in the fragment
+    functions: CA composites into XR10 attachments over 32-bit surfaces, with m2v's extended-range blend emulation per pixel
+    [I: a per-pixel cost candidate for the 10 ms; not measured].
+  - Change (flame/0010): `NEGRONIMETAL_SURFACE_FLUSH=0|1` for flushSurfaces (default unchanged). Plugin: `CA_FORCE_TRIPLE_BUFFERING`
+    removed (no such string in 20H392 QuartzCore [V]). `scripts/metal/idle-stats.sh` (kernel-log part works offline:
+    last 600 s of the log at 03:28 = 94 STAT seconds, 66 idle, GPU busy 13%). Next (not done): (1) count m2v host
+    invalidations only for imports the command buffer wrote (m2v patch: `invalidate_host_imports` over used_resources has no
+    read/write split), (2) A/B `NEGRONIMETAL_POLICY=compositor-srgb`, (3) why CA picks BGR10_XR attachments with
+    `supportsExtendedXR10Formats = 0` (another answer, e.g. `supportsBGR10A2`/display colour mode) and whether BGRA8 cuts ctc.
+
 ## CoreImage/PosterBoard crash (analysis 2026-10-25; addresses = unslid 20H392 cache, slide 0x1f750000 in logs/usblog-20261024-235438.txt)
 
 - [V] SpringBoard sig 11 pc 0 lr 0x194b3858c: `CI::GLContext::init` 0x194b384c0 calls `_GetMacroContext` -> `_wrapGetMacroContext` 0x194b32614, which bzero's a 0x2c8 dispatch table and leaves it zero when `-[EAGLContext getMacroContextPrivate]` returns NULL; init only logs (`ci_logger_render`) and then calls table+0xe8 with w1=0xb71 (glDisable(GL_DEPTH_TEST)) = NULL (ipsw disass).
@@ -649,6 +702,7 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - [I] So the PM8350B charger takes little or no USB input under our kernel: nobody configures it (the ADSP charger PD is off), XBL/ABL leave an SDP limit (DT `qcom,input_current_usb_ma` 500) or USBIN suspended, and the system draws more than that (CPU top rows + GPU 818 MHz, no idle). `usbin=0mV` in mode 1 means "not measured", not "no VBUS".
 - [V] Slop 0074 (USB VBUS override) sets only the DWC3 PHY's UTMI_OTG_VBUS_VALID/SW_SESSVLD_SEL bits (negroni_usb.c QSCRATCH); it cannot affect the PMIC charger.
 - [V] 2026-10-26 patch 0272 (`patches/xnu/0272-negroni-battery-charger-input.patch`, README-battery.md section 7): SID 3 0x10-0x16 (SMB5 CHGR..MISC) readable; `negroni_spmi_chg_unlock()` opens 0x1042/0x1340/0x1342/0x1365/0x1366/0x1370; `NegroniBattery` logs the charger registers (`charger <state>, USBIN plugged|unplugged[, USBIN SUSPENDED]: st1 .. icl_cfg .. icl_sts .. power_path ..`) and, with `negronichg_ma` (default 500, 0 = read only), writes the input limit, USBIN_MODE_CHG, ICL override, un-suspend and charging enable in the downstream order, at most 5 polls per plug. `ExternalConnected` = USBIN_INT_RT_STS bit 4. Boot-args `negronichg_step` (50|25), `negronichg_force`.
+- [V] 03:31 phone with `out/ios16-chg`: `chg=? icl=0mA pp=ff`: none of the SMB5 registers read; the boot-time reason lines are not on USB (console attaches at ADRENO step 21). DT: pm8350b@3 is on bus 0 (`qcom,spmi@c42d000`), HLOS node without the charger blocks; a bus-1 arbiter node (`qcom,spmi@c432000`) and `qcom,spmi-debug@10b14000` (pmic-arb-debug, EE-independent) exist. 0272 amended: per-poll `charger diag` (APID/owner per block 0x10-0x16, reason per read), `SID 3 PPIDs in the APID map` every 3rd poll, `setup (poll n)` in polls 1-3 and every 15th (README-battery.md section 7).
 - [I] The SMB5 register layout and the 50 mA/LSB step on PM8350B are inferred from PM8150B (`smb5-reg.h`) and bergamota's SMB2 notes; no public PM8350B HLOS charger driver exists. The first `charger` line on the phone validates it (values must decode; `icl_sts` half of the request = 25 mA step).
 
 ## 15. GL driver loading on iOS 16 (GL agent, 2026-10-25) [V: 20H392 shared cache, unslid addresses]
@@ -1290,3 +1344,14 @@ Patches (2026-10-25, regenerated with scripts/kernel/patched-tree.sh in out/kern
   shutdown (PON trigger `USB_CHARGER`) is a separate case; the PON log at the next boot shows which one it was.
 - [I] Fastboot-menu "Power off" is ABL code; 0214 does not cover it. With the cable in it is likely the same
   USB_CHARGER auto-boot.
+
+## 22. Thermal, GPU DCVS, USB reset (2026-10-26, power agent; patches 0280-0282, details: patches/xnu/README-thermal.md)
+
+- [V] SM8450 TSENS: two `qcom,tsens-v2` controllers, TM 0xc263000/0xc265000, SROT 0xc222000/0xc223000, 16 sensors each; zone map in live.dts (tsens0: aoss-0, cpuss-0..3, cpu-1-0..8, gpuss-0/1; tsens1: aoss-1, cpu-0-0..3, nspss-0..2, video, ddr, mdmss-0..3, camera-0/1). Layout: Sn_STATUS 0xa0+4n, bits 11:0 tenths of a degree, bit 21 valid (Linux tsens-v2.c).
+- [V] 0280 `negroni_thermal.c`: 1 s sampling, a line a minute `NEGRONI THERMAL: cpu N C gpu N C ddr N C max N C (name) | gpu cap L cpu cap M MHz`, policy every 10 s (>= 70 C: GPU cap -1 level to 4, CPU cap 3200->2400->1800->1400; < 60 C: back up). `negroni_cpufreq_cap()` added (EPSS row per domain at run time, never below ABL's row). Boot-args negronithermal=0, negronithermal_hot, negronithermal_cool.
+- [V] 0281 GPU DCVS on the watch thread (100 ms ticks): busy = RBBM_STATUS bit 23 or a pending fence; idle 500 ms -> level 4 (350 MHz); busy 200 ms -> +1 level up to negronigpu_level (12), lowered by the thermal cap; bw level 3..11 follows; votes only on change, quiet HFI; `NEGRONI GPU DCVS:` lines, WATCH line gains `dcvs L busy N% | <thermal>`. negronigpu_dcvs=0 = the fixed vote.
+- [V] USB drops in logs/usblog.log (01:17:28, 01:18:13, 01:20:39, 01:32:34, 02:03:07, 02:04:18, 02:04:35): "gone" then "en10 up" 3 s later, then no kernel line and `settime: no reply`; the first one right after `RedwoodGPU: com.apple.WebKit.GPU closes` and swaps 0. The kernel answered the enumeration (so it ran), but no frame moved.
+- [V] Cause in negroni_usb.c: the bus-reset event only cleared the address; `ud.configured` stayed true, so the next SET_CONFIGURATION did nothing (ud_configure early return): no RX TRB, tx_busy stuck. 0282 drops the data state on the reset (DALEPENA EP0 only, tx_busy false, link down) so SET_CONFIGURATION rebuilds it; `negroniusb_resetdrop=0` = old behaviour. Sweet upstream 0081 (link state) is already in slop as 0081-negroni-usb-link-state.
+- [I] Why the Mac resets the bus is unknown (the Mac's unified log had no USB-host lines for 01:16-01:23). 01:22:06 and 02:05:02 were real reboots/power loss (the kernel boot lines follow / the battery was flat).
+- [I] No temperature or clock measured before/after yet: the phone was flat. Expected effect of 0281: the GPU at 350 MHz between frames; 0280: the first numbers.
+- [V] Build: `kernel-pwr` job (all 41 patches/xnu incl. 0272 amended, 0280, 0281, 0282); image `out/ios16-pwr` with the config args; sha256 in logs/kernel-pwr.log and `out/ios16-pwr/SHA256SUMS`. Not flashed.

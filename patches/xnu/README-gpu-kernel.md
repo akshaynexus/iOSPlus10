@@ -632,3 +632,9 @@ The GMU takes the GX and CX frequencies of the HFI PERF_TABLE in kHz (Linux `a6x
 a sub-MHz clock: the 0236 probe measured `gxclk 5 MHz`, PLL0 L 13 at levels 1 and 12, a 2.5 Mpx blit in 32 ms.
 Proof after 0237 (`make usblog`): `20 gxclk N MHz with the CP running` near the voted level, `22 blit 2.5 Mpx in`
 about 1500 us at 220 MHz / 400 us at 818 MHz, and the clock dump's PLL0 L field (= MHz / 19.2).
+
+## 15. GPU DCVS (0281) and thermal caps (0280)
+
+See `README-thermal.md`. 0281 turns the fixed level-12 vote into a busy-based governor on the watch
+thread (idle 500 ms -> level 4, busy 200 ms -> one level up, max `negronigpu_level`, thermal cap from
+0280). `negronigpu_dcvs=0` restores the 0235 behaviour.

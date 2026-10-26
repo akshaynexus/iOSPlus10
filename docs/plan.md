@@ -73,6 +73,13 @@ Status date: 2026-10-25.
   first (PON GEN3 registers +0x52/+0x53; 0211 used +0x5a/+0x5b) and prints the PMIC PON log at boot. Built; phone
   test pending (battery empty, hold). Fastboot-menu power off is ABL: not covered (notes.md section 22).
 
+- Power (2026-10-26, patches 0280 thermal / 0281 GPU DCVS / 0282 USB reset, README-thermal.md): TSENS readings and a
+  70/60 C cap policy (GPU levels, CPU rows), a busy-based GPU governor (idle -> 350 MHz), and the CDC-ECM endpoints
+  rebuilt after a host bus reset (the "gone/up, then silence" drops). 0272 amended with per-poll charger diagnostics
+  (the phone read 0xff: the SMB5 blocks are not reachable from EE 0 or not in the APID map; the diag tells which).
+  All in the `kernel-pwr` build, image `out/ios16-pwr` (config args). Not flashed (phone flat). Next: boot it, read
+  `NEGRONI THERMAL`, `NEGRONI GPU DCVS`, `charger diag`; then IFPC/slumber between frames and the charger via the
+  debug arbiter or the ADSP charger PD.
 - Charger input (2026-10-26, patch 0272, README-battery.md section 7): the phone drained to 0 % on USB (16 % at 01:31,
   -458 mA, cable in). 0272 logs the PM8350B SMB5 charger registers with the battery line and sets the USB input limit
   to `negronichg_ma` (default 500 mA), un-suspends USBIN and enables charging. Kernel + image `out/ios16-chg` built

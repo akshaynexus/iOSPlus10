@@ -1,0 +1,199 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -1233,6 +1233,7 @@
+ 
+ static vm_offset_t cmd_db;
+ static uint32_t hfi_seq;
++static bool hfi_quiet;                  /* 0281: the DCVS votes do not log their send/ack lines */
+ static uint32_t cmd_db_raw_len;        /* patch 0236: the last entry's aux length before the cap */
+ /* patch 0236: the last 16 F2H messages hfi_send read (header, words 1-3), for the late report */
+ static uint32_t f2h_seen[16][4], f2h_count;
+@@ -1326,7 +1327,9 @@
+ 	to_memory((vm_offset_t)cmd, 4096);
+ 	q[0].write_index = index;
+ 	to_memory((vm_offset_t)q, 3 * sizeof(*q));
+-	printf("NEGRONI ADRENO: 17 HFI send %s (id %u, %u dwords, seq %u)\n", what, id, dwords, seq);
++	if (!hfi_quiet) {
++		printf("NEGRONI ADRENO: 17 HFI send %s (id %u, %u dwords, seq %u)\n", what, id, dwords, seq);
++	}
+ 	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1);
+ 	for (int tries = 0; tries < 3; tries++) {
+ 		if (!wait_for(gmu + GMU_REG(GMU_GMU2HOST_INTR_INFO), 1, 1, 1000)) {
+@@ -1356,7 +1359,9 @@
+ 			if (((words[1] >> 20) & 0xfff) != seq) {
+ 				continue;
+ 			}
+-			printf("NEGRONI ADRENO: 17 HFI %s ack, error %u\n", what, words[2]);
++			if (!hfi_quiet || words[2] != 0) {
++				printf("NEGRONI ADRENO: 17 HFI %s ack, error %u\n", what, words[2]);
++			}
+ 			return words[2] == 0;
+ 		}
+ 	}
+@@ -2951,8 +2956,103 @@
+ 		clock_measure("100 ms after the third vote");
+ 		if (clk_dump) {
+ 			clock_dump("after the third vote");
++		}
++	}
++}
++
++/*
++ * Patch 0281: a busy-based GPU DCVS governor instead of the one fixed vote. Runs on the watch
++ * thread (the only HFI sender once the GPU is kept), every DCVS_TICK_MS:
++ *   busy  = RBBM_STATUS GPU_BUSY_IGN_AHB (bit 23) or a submitted fence the core has not written
++ *   idle for DCVS_IDLE_MS            -> level DCVS_FLOOR (350 MHz)
++ *   busy in both of the last 2 ticks -> one level up per DCVS_UP_MS, up to the max
++ *   max = negronigpu_level (the start level; 0 = the table top), lowered by the thermal cap
++ *   (patch 0280 negroni_thermal_gpu_cap: one level per 10 s above 70 C, back below 60 C)
++ * The bw level follows the GX level (bw_level_num - 1 at the top, DCVS_BW_FLOOR at the floor).
++ * Boot-arg negronigpu_dcvs (default 1); 0 keeps the fixed vote of 0235. The WATCH line gets
++ * "dcvs L busy N%" and the thermal line; every vote change is logged (at most one line per second).
++ */
++#define DCVS_TICK_MS            100
++#define DCVS_IDLE_MS            500
++#define DCVS_UP_MS              200
++#define DCVS_FLOOR              4
++#define DCVS_BW_FLOOR           3
++#define REG_RBBM_STATUS_GPU_BUSY (1u << 23)
++extern uint32_t negroni_thermal_gpu_cap(void);
++extern void negroni_thermal_line(char *buf, size_t size);
++
++static uint32_t dcvs_on = 1, dcvs_level, dcvs_max, dcvs_busy_pct, dcvs_votes, dcvs_failed;
++
++static uint32_t
++dcvs_bw_for(uint32_t level, uint32_t top)
++{
++	uint32_t bw_top = 11;           /* bw_level_num - 1 (a730_build_bw_table) */
++	if (level >= top) {
++		return bw_top;
++	}
++	uint32_t bw = DCVS_BW_FLOOR + (bw_top - DCVS_BW_FLOOR) * (level - DCVS_FLOOR) / (top > DCVS_FLOOR ? top - DCVS_FLOOR : 1);
++	return bw < DCVS_BW_FLOOR ? DCVS_BW_FLOOR : bw > bw_top ? bw_top : bw;
++}
++
++/* One governor tick; returns true when it voted. */
++static bool
++dcvs_tick(bool gx, uint32_t rbbm, uint32_t *idle_ms, uint32_t *busy_ms, uint32_t *busy_ticks, uint32_t *ticks)
++{
++	uint32_t top = sizeof(gpu_khz) / sizeof(gpu_khz[0]) - 1;
++	bool busy = gx && ((rbbm & REG_RBBM_STATUS_GPU_BUSY) != 0 || negroni_gpu_completed() != gpu_fence);
++	uint32_t cap = negroni_thermal_gpu_cap(), max = dcvs_max;
++
++	if (cap >= DCVS_FLOOR && cap < max) {
++		max = cap;
++	}
++	(*ticks)++;
++	if (busy) {
++		(*busy_ticks)++;
++		*busy_ms += DCVS_TICK_MS;
++		*idle_ms = 0;
++	} else {
++		*idle_ms += DCVS_TICK_MS;
++		*busy_ms = 0;
++	}
++	if (*ticks >= 10) {
++		dcvs_busy_pct = *busy_ticks * 100 / *ticks;
++		*ticks = *busy_ticks = 0;
++	}
++	uint32_t want = dcvs_level;
++	if (*idle_ms >= DCVS_IDLE_MS) {
++		want = DCVS_FLOOR;
++	} else if (*busy_ms >= DCVS_UP_MS) {
++		want = dcvs_level + 1;
++		*busy_ms = 0;
++	}
++	if (want > max) {
++		want = max;
++	}
++	if (want < DCVS_FLOOR) {
++		want = DCVS_FLOOR;
++	}
++	if (want > top) {
++		want = top;
++	}
++	if (want == dcvs_level || !gx) {
++		return false;
++	}
++	uint32_t vote[4] = { 0, 1 /* blocking ack */, want, dcvs_bw_for(want, top) };
++	hfi_quiet = true;
++	bool ok = hfi_send("GX_BW_PERF_VOTE", 30, vote, sizeof(vote));
++	hfi_quiet = false;
++	dcvs_votes++;
++	if (!ok) {
++		dcvs_failed++;
++		if (dcvs_failed <= 3) {
++			printf("NEGRONI GPU DCVS: vote level %u FAILED (%u of %u)\n", want, dcvs_failed, dcvs_votes);
+ 		}
++		return false;
+ 	}
++	dcvs_level = want;
++	vote_level = want;
++	vote_bw = vote[3];
++	return true;
+ }
+ 
+ static void
+@@ -2962,14 +3062,43 @@
+ 	bool first = true;
+ 	uint64_t clk_cycles = 0, clk_ao = 0;    /* patch 0236: the last print's samples */
+ 	bool late_done = false;
++	uint32_t idle_ms = 0, busy_ms = 0, busy_ticks = 0, ticks = 0, changes = 0, from = 0;
++	uint32_t top = sizeof(gpu_khz) / sizeof(gpu_khz[0]) - 1;
+ 
++	(void)PE_parse_boot_argn("negronigpu_dcvs", &dcvs_on, sizeof(dcvs_on));
++	dcvs_max = vote_arg ? vote_arg : top;
++	dcvs_level = vote_level;
++	from = dcvs_level;
++	if (dcvs_on) {
++		printf("NEGRONI GPU DCVS: on: start level %u (%u MHz), max %u, floor %u, tick %u ms, idle %u ms, up %u ms\n",
++		    dcvs_level, gpu_khz[dcvs_level] / 1000, dcvs_max, DCVS_FLOOR, DCVS_TICK_MS, DCVS_IDLE_MS, DCVS_UP_MS);
++	}
+ 	for (uint32_t second = 1;; second++) {
+ 		uint32_t now[14];
+ 		struct hfi_queue_header *q = (struct hfi_queue_header *)(gmu_hfi.memory + sizeof(struct hfi_table_header));
+ 		bool gx;
+ 
+-		assert_wait_timeout((event_t)&gpu_kept, THREAD_UNINT, 1000, NSEC_PER_MSEC);
+-		thread_block(THREAD_CONTINUE_NULL);
++		if (dcvs_on) {
++			/* ten governor ticks per watch second */
++			for (unsigned i = 0; i < 1000 / DCVS_TICK_MS; i++) {
++				assert_wait_timeout((event_t)&gpu_kept, THREAD_UNINT, DCVS_TICK_MS, NSEC_PER_MSEC);
++				thread_block(THREAD_CONTINUE_NULL);
++				bool on = (rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON) != 0;
++				uint32_t rbbm = on ? rd(gpu_regs + GPU_WORD(REG_RBBM_STATUS)) : 0;
++				if (late_done && dcvs_tick(on, rbbm, &idle_ms, &busy_ms, &busy_ticks, &ticks)) {
++					changes++;
++				}
++			}
++			if (changes) {
++				printf("NEGRONI GPU DCVS: level %u -> %u (%u MHz, bw %u), %u changes this second, busy %u%%, cap %u\n",
++				    from, dcvs_level, gpu_khz[dcvs_level] / 1000, vote_bw, changes, dcvs_busy_pct, negroni_thermal_gpu_cap());
++				changes = 0;
++				from = dcvs_level;
++			}
++		} else {
++			assert_wait_timeout((event_t)&gpu_kept, THREAD_UNINT, 1000, NSEC_PER_MSEC);
++			thread_block(THREAD_CONTINUE_NULL);
++		}
+ 		if (!late_done && second >= 5) {
+ 			late_done = true;
+ 			clock_late_report();
+@@ -3004,10 +3133,13 @@
+ 			} else {
+ 				clk_ao = 0;
+ 			}
++			char tline[160];
++			negroni_thermal_line(tline, sizeof(tline));
+ 			printf("NEGRONI GPU WATCH %u s: AO %#x CX %#x GX %#x RSC %#x q1w %u log0 %#x | rptr %#x RBBM %#x "
+-			    "HW_FAULT %#x INT0 %#x | SGFSR %#x FSR core %#x gmu %#x | HFI %#x rptr-copy %#x | gxclk %u MHz\n", second,
++			    "HW_FAULT %#x INT0 %#x | SGFSR %#x FSR core %#x gmu %#x | HFI %#x rptr-copy %#x | gxclk %u MHz | "
++			    "dcvs %u busy %u%% | %s\n", second,
+ 			    rd(gmu + GMU_REG(GMU_AO_COUNTER_L)), now[0], now[1], now[2], now[3], now[4], now[5], now[6],
+-			    now[7], now[8], now[9], now[10], now[11], now[12], now[13], gxclk);
++			    now[7], now[8], now[9], now[10], now[11], now[12], now[13], gxclk, dcvs_level, dcvs_busy_pct, tline);
+ 			if (now[10] & SMMU_FSR_ALL) {
+ 				space_faulted(&core_space);
+ 			}

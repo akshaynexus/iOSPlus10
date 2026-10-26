@@ -1,7 +1,16 @@
 diff --git a/bsd/dev/negroni_spmi.h b/bsd/dev/negroni_spmi.h
 --- a/bsd/dev/negroni_spmi.h
 +++ b/bsd/dev/negroni_spmi.h
-@@ -24,7 +24,13 @@
+@@ -17,6 +17,8 @@
+ int negroni_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. Allowlisted registers only. */
+ int negroni_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* 0272: the same read with the reason: 0 ok, 1 timeout, 2 arbiter error, 3 not allowed, 4 no APID, 5 APID poisoned */
++int negroni_spmi_read_rc(unsigned sid, unsigned addr, uint8_t *out);
+ /* APID of SID/peripheral (-1 = not in the APID map) and its owner EE (7 if not mapped). */
+ int negroni_spmi_apid(unsigned sid, unsigned peripheral, unsigned *owner);
+ /*
+@@ -24,7 +26,13 @@
   * succeeds only if EE 0 owns the PMK8350 VADC APID. Only the opt-in VADC mode (negronibatt=4/5) calls it.
   */
  bool negroni_spmi_vadc_unlock(void);
@@ -108,7 +117,7 @@ diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
  	}
  	lck_mtx_unlock(&sp_lock);
  	return ok;
-@@ -237,6 +292,9 @@
+@@ -237,23 +292,30 @@
  	if ((sid == 3 && peripheral == 0x47) || (sid == 0 && peripheral == 0x31)) {
  		return true;
  	}
@@ -118,10 +127,45 @@ diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
  	return sid == 3 && (reg == 0x04 || reg == 0x05 || reg == 0x10);
  }
  
-@@ -266,32 +324,62 @@
- 	return rc ? -1 : 0;
+ int
+-negroni_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
++negroni_spmi_read_rc(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	if (!sp_ready || !out || sid > 0xf || addr > 0xffffu || !sp_read_allowed(sid, addr)) {
+-		return -1;
++		return 3;
+ 	}
+ 	unsigned ppid = (sid << 8) | (addr >> 8);
+ 	lck_mtx_lock(&sp_lock);
+ 	uint16_t apid = ppid == SP_BCL_PPID ? sp_bcl_apid : ppid == SP_VADC_PPID ? sp_vadc_apid :
+ 	    sp_find_apid(ppid, NULL);
+-	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++	if (apid == SP_NO_APID) {
+ 		lck_mtx_unlock(&sp_lock);
+-		return -1;
++		return 4;
+ 	}
++	if (sp_poisoned[apid]) {
++		lck_mtx_unlock(&sp_lock);
++		return 5;
++	}
+ 	uint8_t v = 0;
+ 	int rc = sk_read8(&sp_arb, apid, (uint8_t)(addr & 0xffu), &v);  /* 0 ok, 1 timeout, 2 arbiter error */
+ 	if (rc == 0) {
+@@ -263,35 +325,71 @@
+ 		printf("NEGRONI BATTERY: SPMI read timeout sid=%u addr=%#x APID=%u: APID not used again\n", sid, addr, apid);
+ 	}
+ 	lck_mtx_unlock(&sp_lock);
+-	return rc ? -1 : 0;
++	return rc;
  }
  
+ int
++negroni_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
++{
++	return negroni_spmi_read_rc(sid, addr, out) ? -1 : 0;
++}
++
 +/* The channel window of a writable register (sp_lock held): the VADC request registers after the
 + * VADC unlock, the six SMB5 charger registers after the charger unlock (0272). */
 +static bool
@@ -148,7 +192,7 @@ diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
 +	return false;
 +}
 +
- int
++int
  negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value)
  {
 -	/* ADC7 user registers of the PMK8350 VADC only; 0x3146 (EN_CTL1) is not written */
@@ -192,15 +236,18 @@ diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
 diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBattery.cpp
 --- a/iokit/Kernel/arm/NegroniBattery.cpp
 +++ b/iokit/Kernel/arm/NegroniBattery.cpp
-@@ -73,6 +73,7 @@
+@@ -71,8 +71,10 @@
+ extern "C" {
+ int negroni_spmi_init(void);
  int negroni_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++int negroni_spmi_read_rc(unsigned sid, unsigned addr, uint8_t *out);
  int negroni_spmi_apid(unsigned sid, unsigned peripheral, unsigned *owner);
  bool negroni_spmi_vadc_unlock(void);
 +bool negroni_spmi_chg_unlock(bool force);
  int negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value);
  unsigned negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max);
  }
-@@ -103,6 +104,38 @@
+@@ -103,6 +105,38 @@
  #define BCL_IBAT_UA        78127   /* BCL_IBAT_SCALING_UA x range factor 10 / (1000 x 10) */
  #define BCL_READS          8
  
@@ -239,7 +286,7 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
  /* One ADC7 channel: virtual channel = sid << 8 | channel (as in the DT). */
  struct nb_chan {
  	uint8_t sid, chan, ratiometric, settle;  /* settle: hw_settle_2 index */
-@@ -165,6 +198,10 @@
+@@ -165,6 +199,10 @@
  	unsigned usbMv;
  	int32_t ichgMa, iinMa;
  	int centiC;
@@ -250,18 +297,20 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
  };
  
  #define NB_RT_MAX          128
-@@ -180,6 +217,10 @@
+@@ -180,6 +218,12 @@
  	IOWorkLoop *fLoop;
  	IOTimerEventSource *fTimer;
  	bool fTimerAdded, fRunning, fReal, fVadc, fDiag, fHaveSoc, fCensusDone, fExternal, fIbatSeen, fNoDataLogged;
 +	bool fChgWrite;            /* 0272: the charger registers are unlocked */
 +	unsigned fChgMa, fChgStep, fChgTries;
 +	uint32_t fChgKey;          /* the last logged charger state */
++	unsigned fPolls;           /* 0272: polls so far (the setup lines repeat in the first ones: the USB console comes late) */
++	unsigned fChgForce;
 +	uint8_t fChgSt1, fChgIclSts, fChgPowerPath;
  	int fMode;
  	int32_t fSoc;              /* hundredths of a percent */
  	uint64_t fLastNs;
-@@ -199,6 +240,9 @@
+@@ -199,6 +243,9 @@
  	void rtChanges(void);
  	void readBcl(nb_sample &s);
  	void readVadc(nb_sample &s);
@@ -271,7 +320,7 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
  	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
  	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
  	static int adcCode(const nb_chan &c, uint16_t *code);
-@@ -221,6 +265,12 @@
+@@ -221,6 +268,14 @@
  	fTimer = NULL;
  	fTimerAdded = fRunning = fReal = fVadc = fDiag = fHaveSoc = fCensusDone = false;
  	fExternal = fIbatSeen = fNoDataLogged = false;
@@ -280,11 +329,13 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
 +	fChgStep = CHG_STEP_MA;
 +	fChgTries = 0;
 +	fChgKey = 0xffffffffu;
++	fPolls = 0;
++	fChgForce = 0;
 +	fChgSt1 = fChgIclSts = fChgPowerPath = 0xff;
  	fMode = NB_READONLY;
  	fSoc = 0;
  	fLastNs = 0;
-@@ -398,9 +448,11 @@
+@@ -398,9 +453,11 @@
  
  	int flags = (external ? 1 : 0) | (charging ? 2 : 0) | (full ? 4 : 0) | (source << 3);
  	if ((int)percent != fLastPercent || flags != fLastFlags) {
@@ -298,7 +349,7 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
  		fLastPercent = (int)percent;
  		fLastFlags = flags;
  	}
-@@ -640,7 +692,113 @@
+@@ -640,7 +697,146 @@
  		}
  		IOLog("NEGRONI BATTERY: rt_sts %03x (0x%04x+0x10): 0x%02x -> 0x%02x\n", fRtPpid[i], base, fRtLast[i], rt);
  		fRtLast[i] = rt;
@@ -325,10 +376,43 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
 +	}
 +	s.chgRead = ok == sizeof(regs) / sizeof(regs[0]);
 +	if (!s.chgRead) {
-+		if (fChgKey != 0xfffffffeu) {
-+			IOLog("NEGRONI BATTERY: charger registers: %u of %u readable (SID 3 0x1000-0x1600 not reachable)\n",
-+			    ok, (unsigned)(sizeof(regs) / sizeof(regs[0])));
-+			fChgKey = 0xfffffffeu;
++		/* Diagnostics every poll while the charger does not read (the boot-time lines are not on the USB
++		 * console): the APID and owner of each SMB5 block, the result code of 8 reads, the SID 3 PPID map. */
++		static const char *const why[] = { "ok", "timeout", "arbiter-error", "not-allowed", "no-APID", "poisoned" };
++		char line[400];
++		size_t at = 0;
++		at += snprintf(line + at, sizeof(line) - at, "charger diag (%u of %u read): APIDs", ok,
++		    (unsigned)(sizeof(regs) / sizeof(regs[0])));
++		for (unsigned per = 0x10; per <= 0x16 && at < sizeof(line) - 24; per++) {
++			unsigned owner = 7;
++			int apid = negroni_spmi_apid(CHG_SID, per, &owner);
++			at += snprintf(line + at, sizeof(line) - at, " %02x:%d/EE%u", per, apid, owner);
++		}
++		at += snprintf(line + at, sizeof(line) - at, " | reads");
++		static const unsigned probe[] = { CHG_STATUS1, CHG_ENABLE_CMD, 0x1004, 0x1005, CHG_USBIN_RT_STS,
++			                          CHG_USBIN_CMD_IL, CHG_USBIN_ICL_CFG, CHG_ICL_STATUS };
++		for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]) && at < sizeof(line) - 32; i++) {
++			uint8_t v = 0xff;
++			int rc = negroni_spmi_read_rc(CHG_SID, probe[i], &v);
++			if (rc == 0) {
++				at += snprintf(line + at, sizeof(line) - at, " %04x=%02x", probe[i], v);
++			} else {
++				at += snprintf(line + at, sizeof(line) - at, " %04x:%s", probe[i], rc >= 0 && rc <= 5 ? why[rc] : "?");
++			}
++		}
++		IOLog("NEGRONI BATTERY: %s\n", line);
++		if (fPolls % 3 == 1) {
++			uint16_t ppids[256];
++			uint8_t owners[256];
++			unsigned n = negroni_spmi_ppids(ppids, owners, 256);
++			at = 0;
++			at += snprintf(line + at, sizeof(line) - at, "SID 3 PPIDs in the APID map (%u total):", n);
++			for (unsigned i = 0; i < n && at < sizeof(line) - 12; i++) {
++				if ((ppids[i] >> 8) == CHG_SID) {
++					at += snprintf(line + at, sizeof(line) - at, " %02x/EE%u", ppids[i] & 0xff, owners[i]);
++				}
++			}
++			IOLog("NEGRONI BATTERY: %s\n", line);
 +		}
 +		return;
 +	}
@@ -412,7 +496,26 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
  }
  
  void
-@@ -664,6 +822,10 @@
+@@ -658,12 +854,29 @@
+ 			rtChanges();
+ 		}
+ 	}
++	fPolls++;
++	if (fPolls <= 3 || fPolls % 15 == 0) {
++		/* the setup facts again: the USB console attaches after the first poll */
++		unsigned bclOwner = 7, vadcOwner = 7, chgrOwner = 7, usbinOwner = 7;
++		int bclApid = negroni_spmi_apid(BCL_SID, BCL_BASE >> 8, &bclOwner);
++		int vadcApid = negroni_spmi_apid(0, ADC_BASE >> 8, &vadcOwner);
++		int chgrApid = negroni_spmi_apid(CHG_SID, 0x10, &chgrOwner);
++		int usbinApid = negroni_spmi_apid(CHG_SID, 0x13, &usbinOwner);
++		IOLog("NEGRONI BATTERY: setup (poll %u): mode %d, BCL APID %d EE %u, VADC APID %d EE %u (%s), charger CHGR APID %d "
++		    "EE %u USBIN APID %d EE %u, control %s (negronichg_ma=%u step %u force=%u)\n", fPolls, fMode, bclApid, bclOwner,
++		    vadcApid, vadcOwner, fVadc ? "unlocked" : "locked", chgrApid, chgrOwner, usbinApid, usbinOwner,
++		    fChgWrite ? "on" : (fChgMa ? "OFF: registers locked" : "off"), fChgMa, fChgStep, fChgForce);
++	}
+ 	nb_sample s = {};
+ 	s.centiC = 2500;
+ 	readBcl(s);
  	if (fVadc) {
  		readVadc(s);
  	}
@@ -423,7 +526,7 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
  	fIbatSeen = fIbatSeen || (s.bclIbatOk && s.bclIbatNonzero);
  
  	/* Voltage: the VADC if it measured, else the BCL. */
-@@ -679,8 +841,11 @@
+@@ -679,8 +892,11 @@
  		curKnown = true;
  		cur = s.ichgMa;
  	}
@@ -437,7 +540,7 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
  		fExternal = s.usbMv >= NB_EXT_MV;
  	} else if (curKnown) {
  		if (cur >= NB_CUR_MA) {
-@@ -789,6 +954,11 @@
+@@ -789,6 +1005,11 @@
  	putNumber("NegroniBatteryChargeCurrent", (UInt32)s.ichgMa);
  	putNumber("NegroniBatteryInputCurrent", (UInt32)s.iinMa);
  	putNumber("NegroniBatteryBCLMonitor", s.bclMon);
@@ -449,7 +552,7 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
  	publish(percent, (unsigned)vbat, curKnown ? cur : 0, centiC, external, charging, full, source, s.usbMv, s.iinMa);
  }
  
-@@ -818,7 +988,19 @@
+@@ -818,7 +1039,20 @@
  	fDiag = fMode == NB_RO_DIAG || fMode == NB_VADC_DIAG;
  	fReal = fMode != NB_STATIC && negroni_spmi_init() == 0;
  	fVadc = fReal && (fMode == NB_VADC || fMode == NB_VADC_DIAG) && negroni_spmi_vadc_unlock();
@@ -460,6 +563,7 @@ diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBatte
 +	(void)PE_parse_boot_argn("negronichg_force", &chgForce, sizeof(chgForce));
 +	fChgMa = chgMa > 3000 ? 3000 : chgMa;
 +	fChgStep = (chgStep == 25 || chgStep == 50) ? chgStep : CHG_STEP_MA;
++	fChgForce = chgForce;
 +	fChgWrite = fReal && fChgMa > 0 && negroni_spmi_chg_unlock(chgForce != 0);
  	if (fReal) {
 +		IOLog("NEGRONI BATTERY: charger control %s (negronichg_ma=%u, %u mA/LSB, force=%u)\n",

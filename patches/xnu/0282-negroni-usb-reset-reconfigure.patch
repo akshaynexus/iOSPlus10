@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -369,6 +369,7 @@
+ static void ud_rx_arm(void);
+ static void ud_tx_kick_locked(void);
+ static void ud_link_event(bool up);
++static int ud_reset_drop = 1;           /* 0282: boot-arg negroniusb_resetdrop (0 = the old behaviour) */
+ static bool ud_ctl_input(const uint8_t *frame, uint32_t len);
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+@@ -1007,7 +1008,26 @@
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+-			printf("NEGRONI USB: bus reset\n");
++			if (ud_reset_drop && ud.configured) {
++				/*
++				 * Patch 0282: a bus reset kills every endpoint but 0. Before, ud.configured stayed
++				 * true, so the host's next SET_CONFIGURATION(1) did nothing (ud_configure returned
++				 * early): the device enumerated again ("en10 up" 3 s after "gone") but no frame
++				 * ever moved (no RX TRB armed, tx_busy stuck). Drop the data state: the next
++				 * SET_CONFIGURATION sets the endpoints up again (DEPSTARTCFG 2 resets the
++				 * transfer resources, as Linux dwc3 does after a reset).
++				 */
++				dwc_wr(DALEPENA, 0x3);
++				lck_mtx_lock(ud.lock);
++				ud.tx_busy = false;
++				lck_mtx_unlock(ud.lock);
++				ud.configured = false;
++				ud.data_alt = 0;
++				ud_link_event(false);
++				printf("NEGRONI USB: bus reset: data endpoints dropped until SET_CONFIGURATION\n");
++			} else {
++				printf("NEGRONI USB: bus reset\n");
++			}
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -1232,6 +1252,7 @@
+ 	printf("NEGRONI USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
+ 	int ctl = 1;
+ 	PE_parse_boot_argn("negronictl", &ctl, sizeof(ctl));
++	PE_parse_boot_argn("negroniusb_resetdrop", &ud_reset_drop, sizeof(ud_reset_drop));
+ 	ud.ctl_enabled = ctl != 0 && ud.ifp != NULL;
+ 	printf("NEGRONI CTL: commands on udp 192.168.7.2:%u %s (boot-arg negronictl)\n", UD_CTL_PORT,
+ 	    ud.ctl_enabled ? "on" : "off");

@@ -1,0 +1,327 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/negroni_reboot.c		standard
+ bsd/dev/negroni_touch.c			standard
+ bsd/dev/negroni_cpufreq.c		standard
++bsd/dev/negroni_thermal.c		standard
+ bsd/dev/negroni_adreno.c		standard
+ bsd/dev/negroni_wifi.c			standard
+ bsd/dev/negroni_wlan.c			standard
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -54,6 +54,7 @@
+ extern void negroni_keys_init(void);
+ extern void negroni_touch_init(void);
+ extern void negroni_cpufreq_init(void);
++extern void negroni_thermal_init(void);
+ extern void negroni_adreno_init(void);
+ extern void negroni_wifi_init(void);
+ extern void negroni_adsp_init(void);
+@@ -761,6 +762,7 @@
+ 	negroni_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/NegroniHID.cpp). */
+ 	negroni_cpufreq_init();
++	negroni_thermal_init();         /* patch 0280: TSENS readings + thermal caps */
+ 	negroni_probe_menu();
+ 	negroni_adreno_init();
+ 	negroni_wifi_init();
+diff --git a/bsd/dev/negroni_cpufreq.c b/bsd/dev/negroni_cpufreq.c
+--- a/bsd/dev/negroni_cpufreq.c
++++ b/bsd/dev/negroni_cpufreq.c
+@@ -12,6 +12,8 @@
+  * caps each domain at the highest row not above N MHz (default 3200,
+  * above every row: the top of each table); a domain is never set below
+  * the row ABL left it at.
++ * Patch 0280: negroni_cpufreq_cap(mhz) changes the cap at run time (the thermal
++ * policy); the same rule: never below the row ABL left.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -22,6 +24,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void negroni_cpufreq_init(void);
++void negroni_cpufreq_cap(uint32_t mhz);
+ 
+ #define EPSS_PHYS               0x17d91000UL    /* domain 0: A510 0-3, 1: A710 4-6, 2: X2 7 */
+ #define EPSS_DOMAIN_SIZE        0x1000UL
+@@ -32,6 +35,10 @@
+ #define XO_KHZ                  19200
+ #define ALTERNATE_KHZ           300000          /* source 0: GPLL0 300 MHz */
+ 
++static vm_offset_t dom_base[EPSS_DOMAINS];
++static uint32_t dom_abl_row[EPSS_DOMAINS], dom_cores[EPSS_DOMAINS];
++static bool dom_known;
++
+ static uint32_t
+ domain_of(uint32_t phys_id)
+ {
+@@ -64,6 +71,9 @@
+ 		top_khz = khz;
+ 	}
+ 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
++	dom_base[domain] = base;
++	dom_abl_row[domain] = was;
++	dom_cores[domain] = cores;
+ 	if (was >= top) {
+ 		/* ABL already asked for as much or more: never slow a domain down */
+ 		printf("NEGRONI CPUFREQ: domain %u (%u cores): keeping row %u (cap row %u, %u MHz)\n",
+@@ -96,5 +106,42 @@
+ 			raise_domain(domain, cores[domain], cap_mhz * 1000);
+ 		}
+ 	}
++	dom_known = true;
+ }
++
++/* Patch 0280: a new cap for every domain (thermal policy). Not below the row ABL left. */
++void
++negroni_cpufreq_cap(uint32_t mhz)
++{
++	if (!dom_known) {
++		return;
++	}
++	for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
++		vm_offset_t base = dom_base[domain];
++		uint32_t top = 0, top_khz = 0, was;
++
++		if (!base) {
++			continue;
++		}
++		for (uint32_t row = 0; row < EPSS_TABLE_ROWS; row++) {
++			uint32_t entry = *(volatile uint32_t *)(base + EPSS_FREQ_TABLE + 4 * row);
++			uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
++
++			if ((row > 0 && khz <= top_khz) || khz > mhz * 1000) {
++				break;
++			}
++			top = row;
++			top_khz = khz;
++		}
++		if (top < dom_abl_row[domain]) {
++			top = dom_abl_row[domain];
++		}
++		was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
++		if (was == top) {
++			continue;
++		}
++		*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
++		printf("NEGRONI CPUFREQ: domain %u (%u cores): row %u -> %u (cap %u MHz)\n", domain, dom_cores[domain], was, top, mhz);
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_thermal.c b/bsd/dev/negroni_thermal.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/negroni_thermal.c
+@@ -0,0 +1,208 @@
++/*
++ * NEGRONI (SM8450) die temperatures and a simple thermal policy (patch 0280).
++ *
++ * Two TSENS v2 controllers (live DT thermal-sensor@c263000 "tsens0" and @c265000 "tsens1",
++ * compatible "qcom,tsens-v2", 16 sensors each; reg = TM 0x1ff, SROT 0x1ff). Read only: the
++ * sensors run since XBL (SROT CTRL bit 0). TM Sn_STATUS at 0xa0 + 4 * n: bits 11:0 the last
++ * temperature in tenths of a degree C (two's complement), bit 21 valid (Linux
++ * drivers/thermal/qcom/tsens-v2.c, tsens_hw_to_mC). Sensor names from the DT thermal zones.
++ *
++ * A thread samples every second. Once a minute (and on every policy step) it prints
++ *   NEGRONI THERMAL: cpu N C gpu N C ddr N C max N C (name) | gpu cap L cpu cap M MHz
++ * Policy, every 10 s: hottest sensor above negronithermal_hot (70 C): the GPU vote cap goes down
++ * one perf level (patch 0281 reads it, floor level 4 = 350 MHz) and the CPU cap one step
++ * (3200 -> 2400 -> 1800 -> 1400 MHz, negroni_cpufreq_cap, never below the row ABL left);
++ * below negronithermal_cool (60 C): one step back up each. Boot-arg negronithermal=0 turns the
++ * thread off (no readings, no caps).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <string.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void negroni_cpufreq_cap(uint32_t mhz);
++void negroni_thermal_init(void);
++uint32_t negroni_thermal_gpu_cap(void);
++int negroni_thermal_max_c(void);
++void negroni_thermal_line(char *buf, size_t size);
++
++#define TSENS_N                 2
++#define TSENS_SENSORS           16
++#define TSENS_TM_STATUS         0xa0
++#define TSENS_STATUS_VALID      (1u << 21)
++#define TSENS_SROT_CTRL         0x4
++#define GPU_LEVEL_TOP           12      /* perf-table index of 818 MHz (negroni_adreno.c gpu_khz) */
++#define GPU_LEVEL_FLOOR         4       /* 350 MHz */
++
++static const vm_offset_t tm_phys[TSENS_N] = { 0x0c263000, 0x0c265000 };
++static const vm_offset_t srot_phys[TSENS_N] = { 0x0c222000, 0x0c223000 };
++static const char *const sensor_name[TSENS_N][TSENS_SENSORS] = {
++	{ "aoss-0", "cpuss-0", "cpuss-1", "cpuss-2", "cpuss-3", "cpu-1-0", "cpu-1-1", "cpu-1-2", "cpu-1-3",
++	  "cpu-1-4", "cpu-1-5", "cpu-1-6", "cpu-1-7", "cpu-1-8", "gpuss-0", "gpuss-1" },
++	{ "aoss-1", "cpu-0-0", "cpu-0-1", "cpu-0-2", "cpu-0-3", "nspss-0", "nspss-1", "nspss-2", "video",
++	  "ddr", "mdmss-0", "mdmss-1", "mdmss-2", "mdmss-3", "camera-0", "camera-1" },
++};
++static const uint32_t cpu_steps_mhz[] = { 3200, 2400, 1800, 1400 };
++
++static vm_offset_t tm_base[TSENS_N];
++static uint32_t hot_c = 70, cool_c = 60;
++static volatile uint32_t gpu_cap = GPU_LEVEL_TOP;
++static volatile int max_c_now = -1000;
++static unsigned cpu_step;               /* index into cpu_steps_mhz */
++static char line[160];
++
++/* tenths of a degree C, or -10000 when the sensor has no valid value */
++static int
++read_sensor(unsigned t, unsigned n)
++{
++	uint32_t s = *(volatile uint32_t *)(tm_base[t] + TSENS_TM_STATUS + 4 * n);
++	if (!(s & TSENS_STATUS_VALID)) {
++		return -10000;
++	}
++	int v = (int)(s & 0xfff);
++	return v & 0x800 ? v - 0x1000 : v;
++}
++
++uint32_t
++negroni_thermal_gpu_cap(void)
++{
++	return gpu_cap;
++}
++
++int
++negroni_thermal_max_c(void)
++{
++	return max_c_now;
++}
++
++void
++negroni_thermal_line(char *buf, size_t size)
++{
++	strlcpy(buf, line, size);
++}
++
++__attribute__((noreturn)) static void
++thermal_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t tick = 0;
++
++	for (;;) {
++		assert_wait_timeout((event_t)&tick, THREAD_UNINT, 1000, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		tick++;
++		int cpu = -10000, gpu = -10000, ddr = -10000, max = -10000;
++		const char *max_name = "none";
++		unsigned valid = 0;
++		for (unsigned t = 0; t < TSENS_N; t++) {
++			for (unsigned n = 0; n < TSENS_SENSORS; n++) {
++				int v = read_sensor(t, n);
++				if (v == -10000) {
++					continue;
++				}
++				valid++;
++				const char *name = sensor_name[t][n];
++				if (strncmp(name, "cpu", 3) == 0 && v > cpu) {
++					cpu = v;
++				} else if (strncmp(name, "gpuss", 5) == 0 && v > gpu) {
++					gpu = v;
++				} else if (strcmp(name, "ddr") == 0) {
++					ddr = v;
++				}
++				if (v > max) {
++					max = v;
++					max_name = name;
++				}
++			}
++		}
++		max_c_now = max == -10000 ? -1000 : max / 10;
++		bool step = false;
++		if (tick % 10 == 0 && max != -10000) {
++			if (max >= (int)hot_c * 10) {
++				if (gpu_cap > GPU_LEVEL_FLOOR) {
++					gpu_cap--;
++					step = true;
++				}
++				if (cpu_step + 1 < sizeof(cpu_steps_mhz) / sizeof(cpu_steps_mhz[0])) {
++					cpu_step++;
++					negroni_cpufreq_cap(cpu_steps_mhz[cpu_step]);
++					step = true;
++				}
++			} else if (max < (int)cool_c * 10) {
++				if (gpu_cap < GPU_LEVEL_TOP) {
++					gpu_cap++;
++					step = true;
++				}
++				if (cpu_step > 0) {
++					cpu_step--;
++					negroni_cpufreq_cap(cpu_steps_mhz[cpu_step]);
++					step = true;
++				}
++			}
++		}
++		snprintf(line, sizeof(line), "cpu %d C gpu %d C ddr %d C max %d C (%s) | gpu cap %u cpu cap %u MHz",
++		    cpu / 10, gpu / 10, ddr / 10, max / 10, max_name, gpu_cap, cpu_steps_mhz[cpu_step]);
++		if (tick == 1 || tick % 60 == 0 || step) {
++			printf("NEGRONI THERMAL: %s%s (%u of 32 sensors valid)\n", line, step ? " [step]" : "", valid);
++		}
++		if (tick == 1) {
++			/* the full list once, for the record */
++			for (unsigned t = 0; t < TSENS_N; t++) {
++				char all[256];
++				size_t at = 0;
++				for (unsigned n = 0; n < TSENS_SENSORS && at < sizeof(all) - 16; n++) {
++					int v = read_sensor(t, n);
++					at += snprintf(all + at, sizeof(all) - at, " %s=%d", sensor_name[t][n], v == -10000 ? -999 : v / 10);
++				}
++				printf("NEGRONI THERMAL: tsens%u:%s\n", t, all);
++			}
++		}
++	}
++}
++
++void
++negroni_thermal_init(void)
++{
++	uint32_t enabled = 1;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("negronithermal", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("negronithermal_hot", &hot_c, sizeof(hot_c));
++	(void)PE_parse_boot_argn("negronithermal_cool", &cool_c, sizeof(cool_c));
++	if (!enabled) {
++		printf("NEGRONI THERMAL: off (negronithermal=0)\n");
++		return;
++	}
++	if (cool_c >= hot_c) {
++		cool_c = hot_c > 10 ? hot_c - 10 : 0;
++	}
++	for (unsigned t = 0; t < TSENS_N; t++) {
++		vm_offset_t srot = ml_io_map(srot_phys[t], 0x1000);
++		tm_base[t] = ml_io_map(tm_phys[t], 0x1000);
++		if (!tm_base[t] || !srot) {
++			printf("NEGRONI THERMAL: tsens%u not mapped\n", t);
++			tm_base[t] = 0;
++			continue;
++		}
++		uint32_t ver = *(volatile uint32_t *)srot, ctrl = *(volatile uint32_t *)(srot + TSENS_SROT_CTRL);
++		printf("NEGRONI THERMAL: tsens%u TM %#lx: SROT version %#x ctrl %#x (%s)\n", t, (unsigned long)tm_phys[t],
++		    ver, ctrl, (ctrl & 1) ? "enabled" : "DISABLED: no readings");
++		if (!(ctrl & 1)) {
++			tm_base[t] = 0;
++		}
++	}
++	if (!tm_base[0] && !tm_base[1]) {
++		return;
++	}
++	printf("NEGRONI THERMAL: policy hot %u C cool %u C, GPU cap levels %u..%u, CPU caps 3200/2400/1800/1400 MHz\n",
++	    hot_c, cool_c, GPU_LEVEL_FLOOR, GPU_LEVEL_TOP);
++	if (kernel_thread_start(thermal_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
