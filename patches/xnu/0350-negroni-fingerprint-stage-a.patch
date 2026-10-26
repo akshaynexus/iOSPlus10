@@ -1,0 +1,806 @@
+Under-display fingerprint sensor (Goodix optical G7), stage A (negronifp=1|2, default 0): QUP1 SE2 GENI
+SPI in FIFO mode with the GCC clock votes, ldoc11 3.0 V vote (+ the off vote negroni_rpmh_vreg_disable added
+to negroni_rpmh.c), reset, chip-ID frames, IRQ pin poll. Applies after 0310 (bsd/conf/files context), 0311
+(negroni_rpmh.c RH_MODE_OFF) and 0330 (negroni_ufs.c context).
+Details: docs/fingerprint-plan.md, patches/xnu/README-fingerprint.md.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ecfe0bd..6f53ed3 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/negroni_cpufreq.c		standard
+ bsd/dev/negroni_thermal.c		standard
+ bsd/dev/negroni_haptic.c		standard
+ bsd/dev/negroni_cam.c			standard
++bsd/dev/negroni_fp.c			standard
+ bsd/dev/negroni_adreno.c		standard
+ bsd/dev/negroni_wifi.c			standard
+ bsd/dev/negroni_wlan.c			standard
+diff --git a/bsd/dev/negroni_fp.c b/bsd/dev/negroni_fp.c
+new file mode 100644
+index 0000000..a537cf1
+--- /dev/null
++++ b/bsd/dev/negroni_fp.c
+@@ -0,0 +1,740 @@
++/*
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450): under-display optical fingerprint sensor, stage A
++ * (patch 0350): power, reset, a chip-ID read over GENI SPI, and the IRQ pin.
++ *
++ * Hardware [V out/live.dts]:
++ *   goodix_fp (36711): compatible "goodix,goodix_fp", ldo-supply pm8350c_l11 (phandle 0x347 =
++ *     RPMh "ldoc11", 11257), ldo-config <3000000 3000000 150000> = 3.0 V 150 mA,
++ *     goodix,gpio_irq = TLMM 40 (pull-down input, pinctrl 5563), goodix,gpio_reset = TLMM 41,
++ *     interrupts <40 0>. No SPI bus node: the sensor's SPI is driven by the TEE on Android.
++ *   oplus_fp_common (36695): fp id = TLMM 42 (pull-up input); goodix_optical_G7, fp-id 1.
++ *   SPI serial engine [I: the only QUP SE whose pins are not used by any HLOS node and that
++ *     sits next to the FP GPIOs]: QUP1 SE2 = spi@a88000 (14795, "disabled" in HLOS; clocks
++ *     <GCC 108 = GCC_QUPV3_WRAP1_S2_CLK, 136 M_AHB, 137 S_AHB>), pins qupv3_se10 TLMM 36 MISO,
++ *     37 MOSI, 38 CLK, 39 CS (live.dts 2314: function "qup10", 6 mA, no bias; mainline
++ *     pinctrl-sm8450.c 1460: qup10 = function 1).
++ *   GCC [V out/src/op-kernel/drivers/clk/qcom/gcc-waipio.c]: votes in APCS 0x62008:
++ *     bit 24 wrap1_s2_clk (halt 0x28274), bit 20 wrap_1_m_ahb (0x28004), bit 21 wrap_1_s_ahb
++ *     (0x28008), bit 19 wrap1_core (0x33140), bit 18 wrap1_core_2x (0x3314c);
++ *     RCG wrap1_s2_clk_src cmd_rcgr 0x2827c (parent map 0: XO = src 0; 19.2 MHz = div 1).
++ *   GENI registers: Linux include/linux/soc/qcom/geni-se.h and drivers/spi/spi-geni-qcom.c (v6.1).
++ *
++ * Boot-args:
++ *   negronifp=0        (default) nothing is touched
++ *   negronifp=1        steps 1-9: clocks, SE probe, LDO vote, reset, chip-ID frames over SPI
++ *   negronifp=2        = 1, then polls the IRQ pin (TLMM 40) for negronifp_poll s (default 60),
++ *                      logs each level change (the first 32)
++ *   negronifp_delay=S  start S s after boot (default 15: after the USB console)
++ *   negronifp_hz=N     SPI clock (default 4800000; the SE clock is 19.2 MHz, div = ceil)
++ *   negronifp_mode=N   SPI mode 0..3 (CPOL bit 1, CPHA bit 0; default 0)
++ *   negronifp_ldo=0    no RPMh vote for ldoc11 (default 1: 3000 mV; there is no "off" vote)
++ *   negronifp_keep=1   leave the sensor powered and the SE clocks on after the steps (default 0:
++ *                      reverse order power-down incl. the ldoc11 off vote when we voted it on)
++ * Log: "NEGRONI FP: step N NAME ...". The chip-ID frames [I]: Goodix's public SPI drivers
++ * (gf_spi.c, GF3xxx/GF5xxx) read a register with {0xF1, addr_hi, addr_lo} then the data bytes;
++ * the optical G7 protocol lives in the TEE application and is not in any kernel source we have.
++ * Both frames are sent and the raw bytes are logged; all-0x00 or all-0xFF means no answer.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "negroni_touch/tlmm.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);
++extern void IOSleep(unsigned int milliseconds);
++extern int negroni_rpmh_vreg_enable(const char *res, unsigned mv);
++extern int negroni_rpmh_vreg_disable(const char *res);                 /* 0350: added to negroni_rpmh.c */
++void negroni_fp_init(void);
++int negroni_fp_irq_level(void);
++
++/* physical bases */
++#define FP_QUP1_PA        0x00ac0000u     /* qcom,qupv3_1_geni_se@ac0000 */
++#define FP_QUP1_LEN       0x2000u
++#define FP_SE_PA          0x00a88000u     /* spi@a88000 = QUP1 SE2 */
++#define FP_SE_LEN         0x4000u
++#define FP_GCC_PA         0x00100000u
++#define FP_GCC_VOTE_PAGE  0x62000u        /* APCS_CLOCK_BRANCH_ENA_VOTE 0x62008 */
++#define FP_GCC_QUP_PAGE   0x28000u        /* wrap1 halt regs + s2 RCG */
++#define FP_GCC_CORE_PAGE  0x30000u        /* 16 KiB page holding 0x33140/0x3314c */
++#define FP_TLMM_PA        (TLMM_BASE + TLMM_CTL(36))
++#define FP_TLMM_LEN       0x8000u         /* TLMM 36..43 */
++#define FP_PIN(n)         ((uint32_t)((n) - 36) * 0x1000u)
++
++#define FP_PIN_MISO 36
++#define FP_PIN_MOSI 37
++#define FP_PIN_CLK  38
++#define FP_PIN_CS   39
++#define FP_PIN_IRQ  40
++#define FP_PIN_RST  41
++#define FP_PIN_ID   42
++#define FP_FUNC_QUP10 1
++
++/* GCC */
++#define GCC_VOTE          0x62008u
++#define GCC_VOTE_S2       (1u << 24)
++#define GCC_VOTE_M_AHB    (1u << 20)
++#define GCC_VOTE_S_AHB    (1u << 21)
++#define GCC_VOTE_CORE     (1u << 19)
++#define GCC_VOTE_CORE_2X  (1u << 18)
++#define GCC_HALT_S2       0x28274u
++#define GCC_HALT_M_AHB    0x28004u
++#define GCC_HALT_S_AHB    0x28008u
++#define GCC_HALT_CORE     0x33140u
++#define GCC_HALT_CORE_2X  0x3314cu
++#define GCC_S2_CMD_RCGR   0x2827cu
++#define CBCR_CLK_OFF      (1u << 31)
++#define RCG_CMD_UPDATE    (1u << 0)
++#define RCG_CMD_ROOT_EN   (1u << 1)
++#define RCG_CMD_ROOT_OFF  (1u << 31)
++
++/* GENI SE (geni-se.h) */
++#define QUP_HW_VER_REG          0x4u
++#define GENI_FORCE_DEFAULT_REG  0x20u
++#define GENI_OUTPUT_CTRL        0x24u
++#define GENI_CGC_CTRL           0x28u
++#define SE_GENI_STATUS          0x40u
++#define GENI_SER_M_CLK_CFG      0x48u
++#define GENI_IF_DISABLE_RO      0x64u
++#define GENI_FW_REVISION_RO     0x68u
++#define SE_GENI_CLK_SEL         0x7cu
++#define SE_SPI_CPHA             0x224u
++#define SE_SPI_LOOPBACK         0x22cu
++#define SE_SPI_CPOL             0x230u
++#define SE_SPI_DEMUX_OUTPUT_INV 0x24cu
++#define SE_SPI_DEMUX_SEL        0x250u
++#define SE_GENI_BYTE_GRAN       0x254u
++#define SE_GENI_DMA_MODE_EN     0x258u
++#define SE_SPI_TRANS_CFG        0x25cu
++#define SE_GENI_TX_PACKING_CFG0 0x260u
++#define SE_GENI_TX_PACKING_CFG1 0x264u
++#define SE_SPI_WORD_LEN         0x268u
++#define SE_SPI_TX_TRANS_LEN     0x26cu
++#define SE_SPI_RX_TRANS_LEN     0x270u
++#define SE_SPI_PRE_POST_CMD_DLY 0x274u
++#define SE_SPI_DELAY_COUNTERS   0x278u
++#define SE_GENI_RX_PACKING_CFG0 0x284u
++#define SE_GENI_RX_PACKING_CFG1 0x288u
++#define SE_GENI_M_CMD0          0x600u
++#define SE_GENI_M_CMD_CTRL_REG  0x604u
++#define SE_GENI_M_IRQ_STATUS    0x610u
++#define SE_GENI_M_IRQ_EN        0x614u
++#define SE_GENI_M_IRQ_CLEAR     0x618u
++#define SE_GENI_S_IRQ_EN        0x644u
++#define SE_GENI_S_IRQ_CLEAR     0x648u
++#define SE_GENI_TX_FIFOn        0x700u
++#define SE_GENI_RX_FIFOn        0x780u
++#define SE_GENI_TX_FIFO_STATUS  0x800u
++#define SE_GENI_RX_FIFO_STATUS  0x804u
++#define SE_GENI_TX_WATERMARK    0x80cu
++#define SE_GENI_RX_WATERMARK    0x810u
++#define SE_GENI_RX_RFR_WATERMARK 0x814u
++#define SE_GENI_IOS             0x908u
++#define SE_DMA_TX_IRQ_CLR       0xc44u
++#define SE_DMA_RX_IRQ_CLR       0xd44u
++#define SE_GSI_EVENT_EN         0xe18u
++#define SE_IRQ_EN               0xe1cu
++#define SE_HW_PARAM_0           0xe24u
++#define SE_HW_PARAM_1           0xe28u
++#define SE_DMA_GENERAL_CFG      0xe30u
++
++#define FW_REV_PROTOCOL(v)      (((v) >> 8) & 0xffu)
++#define GENI_SE_SPI             1u
++#define FIFO_IF_DISABLE         (1u << 0)
++#define DEFAULT_CGC_EN          0x7fu
++#define DEFAULT_IO_OUTPUT_CTRL  0x7fu
++#define DMA_GENERAL_CGC         0x0fu     /* AHB_SEC_SLV_CLK_CGC_ON | DMA_AHB_SLV_CFG_ON | TX/RX CGC */
++#define SE_IRQ_EN_ALL           0x0fu     /* DMA_RX | DMA_TX | GENI_M | GENI_S */
++#define M_CMD_DONE              (1u << 0)
++#define M_CMD_OVERRUN           (1u << 1)
++#define M_ILLEGAL_CMD           (1u << 2)
++#define M_CMD_FAILURE           (1u << 3)
++#define M_CMD_CANCEL            (1u << 4)
++#define M_CMD_ABORT             (1u << 5)
++#define M_RX_FIFO_WATERMARK     (1u << 26)
++#define M_RX_FIFO_LAST          (1u << 27)
++#define M_TX_FIFO_WATERMARK     (1u << 30)
++#define M_GENI_CMD_CANCEL       (1u << 2)
++#define M_GENI_CMD_ABORT        (1u << 1)
++#define M_GENI_CMD_ACTIVE       (1u << 0)
++#define RX_FIFO_WC_MSK          0x1ffffffu
++#define RX_LAST                 (1u << 31)
++#define RX_LAST_BYTE_VALID(s)   (((s) >> 28) & 7u)
++#define SPI_TX_ONLY             1u
++#define SPI_RX_ONLY             2u
++#define SPI_CS_ASSERT           8u
++#define SPI_CS_DEASSERT         9u
++#define FRAGMENTATION           (1u << 2)
++#define CS_TOGGLE               (1u << 0)
++#define CPOL                    (1u << 2)
++#define CPHA                    (1u << 0)
++#define SER_CLK_EN              (1u << 0)
++#define SE_CLK_HZ               19200000u
++#define FP_POLL_US              20000u    /* command wait, x 1 us */
++
++static struct {
++	int mode;                     /* negronifp */
++	int started;
++	vm_offset_t qup, se, gcc_vote, gcc_qup, gcc_core, tlmm;
++	uint32_t vote_before;
++	uint32_t fifo_depth, fifo_width;
++	bool se_clocked, pins_spi, powered, ldo_voted;
++	thread_t thread;
++} fp;
++
++static uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++step(unsigned n, const char *name)
++{
++	printf("NEGRONI FP: step %u %s\n", n, name);
++}
++
++/* true when (reg & mask) == want within us microseconds */
++static bool
++wait_for(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i < us; i++) {
++		if ((rd(base, off) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return (rd(base, off) & mask) == want;
++}
++
++int
++negroni_fp_irq_level(void)
++{
++	if (fp.tlmm == 0) {
++		return -1;
++	}
++	return (int)(rd(fp.tlmm, FP_PIN(FP_PIN_IRQ) + 4) & TLMM_IN);
++}
++
++static void
++pin_cfg(unsigned pin, uint32_t cfg)
++{
++	wr(fp.tlmm, FP_PIN(pin), cfg);
++}
++
++static void
++pin_out(unsigned pin, int high)
++{
++	wr(fp.tlmm, FP_PIN(pin) + 4, high ? TLMM_OUT : 0);
++}
++
++/* ---- GCC ---- */
++
++static bool
++gcc_branch_on(uint32_t vote_bit, vm_offset_t halt_base, uint32_t halt_off, const char *name)
++{
++	uint32_t v = rd(fp.gcc_vote, GCC_VOTE - FP_GCC_VOTE_PAGE);
++	if (!(v & vote_bit)) {
++		wr(fp.gcc_vote, GCC_VOTE - FP_GCC_VOTE_PAGE, v | vote_bit);
++	}
++	if (!wait_for(halt_base, halt_off, CBCR_CLK_OFF, 0, 1000)) {
++		printf("NEGRONI FP: clock %s does not come on (CBCR %#x)\n", name, rd(halt_base, halt_off));
++		return false;
++	}
++	return true;
++}
++
++static bool
++gcc_s2_rcg_xo(void)
++{
++	/* CFG: src 0 (bi_tcxo), div field 1 (= divide by 1), mode 0 (no M/N); then UPDATE */
++	uint32_t cmd = GCC_S2_CMD_RCGR - FP_GCC_QUP_PAGE;
++	uint32_t cfg = rd(fp.gcc_qup, cmd + 4);
++	printf("NEGRONI FP: s2 RCG before: CMD %#x CFG %#x\n", rd(fp.gcc_qup, cmd), cfg);
++	wr(fp.gcc_qup, cmd + 4, 0x1u);
++	wr(fp.gcc_qup, cmd, rd(fp.gcc_qup, cmd) | RCG_CMD_UPDATE | RCG_CMD_ROOT_EN);
++	if (!wait_for(fp.gcc_qup, cmd, RCG_CMD_UPDATE, 0, 1000)) {
++		printf("NEGRONI FP: s2 RCG update does not complete (CMD %#x)\n", rd(fp.gcc_qup, cmd));
++		return false;
++	}
++	return true;
++}
++
++static void
++gcc_restore(void)
++{
++	if (!fp.se_clocked) {
++		return;
++	}
++	/* only the bits we set go away; other EEs' votes are separate registers */
++	uint32_t v = rd(fp.gcc_vote, GCC_VOTE - FP_GCC_VOTE_PAGE);
++	uint32_t ours = (GCC_VOTE_S2 | GCC_VOTE_M_AHB | GCC_VOTE_S_AHB | GCC_VOTE_CORE | GCC_VOTE_CORE_2X) &
++	    ~fp.vote_before;
++	wr(fp.gcc_vote, GCC_VOTE - FP_GCC_VOTE_PAGE, v & ~ours);
++	fp.se_clocked = false;
++}
++
++/* ---- GENI SPI ---- */
++
++static void
++se_irq_clear(void)
++{
++	wr(fp.se, SE_GSI_EVENT_EN, 0);
++	wr(fp.se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	wr(fp.se, SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
++	wr(fp.se, SE_DMA_TX_IRQ_CLR, 0xffffffffu);
++	wr(fp.se, SE_DMA_RX_IRQ_CLR, 0xffffffffu);
++	wr(fp.se, SE_IRQ_EN, 0xffffffffu);
++}
++
++/* geni_se_init + geni_se_select_fifo_mode (qcom-geni-se.c) with the SPI driver's watermarks */
++static void
++se_init_fifo(void)
++{
++	se_irq_clear();
++	wr(fp.se, GENI_CGC_CTRL, rd(fp.se, GENI_CGC_CTRL) | DEFAULT_CGC_EN);
++	wr(fp.se, SE_DMA_GENERAL_CFG, rd(fp.se, SE_DMA_GENERAL_CFG) | DMA_GENERAL_CGC);
++	wr(fp.se, GENI_OUTPUT_CTRL, DEFAULT_IO_OUTPUT_CTRL);
++	wr(fp.se, GENI_FORCE_DEFAULT_REG, 1);
++	wr(fp.se, SE_IRQ_EN, rd(fp.se, SE_IRQ_EN) | SE_IRQ_EN_ALL);
++	wr(fp.se, SE_GENI_DMA_MODE_EN, rd(fp.se, SE_GENI_DMA_MODE_EN) & ~1u);
++	wr(fp.se, SE_GSI_EVENT_EN, 0);
++	wr(fp.se, SE_GENI_RX_WATERMARK, fp.fifo_depth - 3);
++	wr(fp.se, SE_GENI_RX_RFR_WATERMARK, fp.fifo_depth - 2);
++	/* no interrupt line is wired here: the enables only make the status bits latch */
++	wr(fp.se, SE_GENI_M_IRQ_EN, 0x7eu | M_CMD_DONE | M_TX_FIFO_WATERMARK | M_RX_FIFO_WATERMARK | M_RX_FIFO_LAST);
++	wr(fp.se, SE_GENI_S_IRQ_EN, 0x3eu | 1u);
++	wr(fp.se, SE_GENI_DMA_MODE_EN, rd(fp.se, SE_GENI_DMA_MODE_EN) & ~1u);
++}
++
++/* geni_se_config_packing(bpw 8, pack_words 4, msb first): 4 vectors of 10 bits */
++static void
++se_packing_8bit(void)
++{
++	uint32_t cfg[4], iter = fp.fifo_width / 8;
++	if (iter == 0 || iter > 4) {
++		iter = 4;
++	}
++	for (uint32_t i = 0; i < iter; i++) {
++		cfg[i] = ((7u + 8u * i) << 5) | (1u << 4) | (7u << 1);
++	}
++	cfg[iter - 1] |= 1u;
++	for (uint32_t i = iter; i < 4; i++) {
++		cfg[i] = 0;
++	}
++	uint32_t cfg0 = cfg[0] | (cfg[1] << 10), cfg1 = cfg[2] | (cfg[3] << 10);
++	wr(fp.se, SE_GENI_TX_PACKING_CFG0, cfg0);
++	wr(fp.se, SE_GENI_TX_PACKING_CFG1, cfg1);
++	wr(fp.se, SE_GENI_RX_PACKING_CFG0, cfg0);
++	wr(fp.se, SE_GENI_RX_PACKING_CFG1, cfg1);
++	wr(fp.se, SE_GENI_BYTE_GRAN, 0);
++	wr(fp.se, SE_SPI_WORD_LEN, 8u - 4u);
++}
++
++static void
++se_spi_setup(unsigned hz, unsigned mode)
++{
++	uint32_t div = (SE_CLK_HZ + hz - 1) / hz;
++	if (div == 0) {
++		div = 1;
++	}
++	if (div > 0xfff) {
++		div = 0xfff;
++	}
++	se_packing_8bit();
++	wr(fp.se, SE_SPI_LOOPBACK, 0);
++	wr(fp.se, SE_SPI_DEMUX_SEL, 0);
++	wr(fp.se, SE_SPI_CPHA, (mode & 1u) ? CPHA : 0);
++	wr(fp.se, SE_SPI_CPOL, (mode & 2u) ? CPOL : 0);
++	wr(fp.se, SE_SPI_DEMUX_OUTPUT_INV, 0);
++	wr(fp.se, SE_SPI_TRANS_CFG, rd(fp.se, SE_SPI_TRANS_CFG) & ~CS_TOGGLE);
++	wr(fp.se, SE_SPI_PRE_POST_CMD_DLY, 0);
++	wr(fp.se, SE_SPI_DELAY_COUNTERS, 0);
++	wr(fp.se, SE_GENI_CLK_SEL, 0);
++	wr(fp.se, GENI_SER_M_CLK_CFG, (div << 4) | SER_CLK_EN);
++	printf("NEGRONI FP: SPI %u Hz (div %u of 19.2 MHz), mode %u\n", SE_CLK_HZ / div, div, mode);
++}
++
++/* Cancel, then abort, a command that did not finish. */
++static void
++se_cancel(const char *what)
++{
++	printf("NEGRONI FP: %s did not finish (M_IRQ %#x STATUS %#x TXS %#x RXS %#x): cancel\n", what,
++	    rd(fp.se, SE_GENI_M_IRQ_STATUS), rd(fp.se, SE_GENI_STATUS),
++	    rd(fp.se, SE_GENI_TX_FIFO_STATUS), rd(fp.se, SE_GENI_RX_FIFO_STATUS));
++	wr(fp.se, SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_CANCEL);
++	if (!wait_for(fp.se, SE_GENI_M_IRQ_STATUS, M_CMD_CANCEL, M_CMD_CANCEL, 10000)) {
++		wr(fp.se, SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_ABORT);
++		(void)wait_for(fp.se, SE_GENI_M_IRQ_STATUS, M_CMD_ABORT, M_CMD_ABORT, 10000);
++	}
++	wr(fp.se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++}
++
++/* One sequencer command without data (CS assert/deassert). 0 ok. */
++static int
++se_cmd_simple(uint32_t opcode, const char *what)
++{
++	wr(fp.se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	wr(fp.se, SE_GENI_M_CMD0, (opcode << 27));
++	if (!wait_for(fp.se, SE_GENI_M_IRQ_STATUS, M_CMD_DONE, M_CMD_DONE, FP_POLL_US)) {
++		se_cancel(what);
++		return -1;
++	}
++	wr(fp.se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	return 0;
++}
++
++/* TX-only transfer of len bytes (<= one FIFO), CS kept asserted (FRAGMENTATION). 0 ok. */
++static int
++se_tx(const uint8_t *buf, uint32_t len)
++{
++	wr(fp.se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	wr(fp.se, SE_SPI_TX_TRANS_LEN, len);
++	wr(fp.se, SE_GENI_M_CMD0, (SPI_TX_ONLY << 27) | FRAGMENTATION);
++	for (uint32_t i = 0; i < len; i += 4) {
++		uint32_t w = 0;
++		for (uint32_t j = 0; j < 4 && i + j < len; j++) {
++			w |= (uint32_t)buf[i + j] << (8 * j);
++		}
++		wr(fp.se, SE_GENI_TX_FIFOn, w);
++	}
++	if (!wait_for(fp.se, SE_GENI_M_IRQ_STATUS, M_CMD_DONE, M_CMD_DONE, FP_POLL_US)) {
++		se_cancel("tx");
++		return -1;
++	}
++	wr(fp.se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	return 0;
++}
++
++/* RX-only transfer of len bytes (<= one FIFO). Returns the bytes read, -1 on timeout. */
++static int
++se_rx(uint8_t *buf, uint32_t len, bool last)
++{
++	uint32_t got = 0;
++	wr(fp.se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	wr(fp.se, SE_SPI_RX_TRANS_LEN, len);
++	wr(fp.se, SE_GENI_M_CMD0, (SPI_RX_ONLY << 27) | (last ? 0 : FRAGMENTATION));
++	bool done = wait_for(fp.se, SE_GENI_M_IRQ_STATUS, M_CMD_DONE, M_CMD_DONE, FP_POLL_US);
++	uint32_t st = rd(fp.se, SE_GENI_RX_FIFO_STATUS);
++	uint32_t words = st & RX_FIFO_WC_MSK, bytes = words * 4;
++	if ((st & RX_LAST) && RX_LAST_BYTE_VALID(st) && RX_LAST_BYTE_VALID(st) < 4) {
++		bytes -= 4 - RX_LAST_BYTE_VALID(st);
++	}
++	for (uint32_t i = 0; i < words && i < 64; i++) {
++		uint32_t w = rd(fp.se, SE_GENI_RX_FIFOn);
++		for (uint32_t j = 0; j < 4 && got < bytes && got < len; j++) {
++			buf[got++] = (uint8_t)(w >> (8 * j));
++		}
++	}
++	if (!done) {
++		se_cancel("rx");
++		return -1;
++	}
++	wr(fp.se, SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
++	return (int)got;
++}
++
++static void
++hexline(const char *tag, const uint8_t *b, int n)
++{
++	char s[3 * 16 + 1];
++	int k = 0;
++	for (int i = 0; i < n && i < 16; i++) {
++		s[k++] = "0123456789abcdef"[b[i] >> 4];
++		s[k++] = "0123456789abcdef"[b[i] & 15];
++		s[k++] = ' ';
++	}
++	s[k] = 0;
++	printf("NEGRONI FP: %s (%d bytes): %s\n", tag, n, s);
++}
++
++/* {cmd} out, n bytes in, under one chip select. */
++static int
++spi_cmd_read(const uint8_t *cmd, uint32_t clen, uint8_t *in, uint32_t n, const char *tag)
++{
++	int rc = se_cmd_simple(SPI_CS_ASSERT, "cs assert");
++	if (rc == 0) {
++		rc = se_tx(cmd, clen);
++	}
++	int got = -1;
++	if (rc == 0) {
++		got = se_rx(in, n, true);
++	}
++	(void)se_cmd_simple(SPI_CS_DEASSERT, "cs deassert");
++	if (got > 0) {
++		hexline(tag, in, got);
++	} else {
++		printf("NEGRONI FP: %s: no data (rc %d)\n", tag, got);
++	}
++	return got;
++}
++
++/* ---- power and pins ---- */
++
++static void
++pins_spi(bool on)
++{
++	if (on) {
++		pin_cfg(FP_PIN_MISO, TLMM_FUNC(FP_FUNC_QUP10) | TLMM_DRIVE_MA(6) | TLMM_PULL_NONE);
++		pin_cfg(FP_PIN_MOSI, TLMM_FUNC(FP_FUNC_QUP10) | TLMM_DRIVE_MA(6) | TLMM_PULL_NONE);
++		pin_cfg(FP_PIN_CLK, TLMM_FUNC(FP_FUNC_QUP10) | TLMM_DRIVE_MA(6) | TLMM_PULL_NONE);
++		pin_cfg(FP_PIN_CS, TLMM_FUNC(FP_FUNC_QUP10) | TLMM_DRIVE_MA(6) | TLMM_PULL_NONE);
++	} else {
++		/* live.dts qupv3_se10_spi_sleep: gpio, 6 mA, bias-disable, input */
++		pin_cfg(FP_PIN_MISO, TLMM_FUNC(0) | TLMM_DRIVE_MA(6) | TLMM_PULL_NONE);
++		pin_cfg(FP_PIN_MOSI, TLMM_FUNC(0) | TLMM_DRIVE_MA(6) | TLMM_PULL_NONE);
++		pin_cfg(FP_PIN_CLK, TLMM_FUNC(0) | TLMM_DRIVE_MA(6) | TLMM_PULL_NONE);
++		pin_cfg(FP_PIN_CS, TLMM_FUNC(0) | TLMM_DRIVE_MA(6) | TLMM_PULL_NONE);
++	}
++	fp.pins_spi = on;
++}
++
++static void
++power_down(const char *why)
++{
++	printf("NEGRONI FP: power down (%s): reset low, pins to gpio, SE clock votes back%s\n", why,
++	    fp.ldo_voted ? ", ldoc11 off" : "");
++	if (fp.powered) {
++		pin_out(FP_PIN_RST, 0);
++		fp.powered = false;
++	}
++	if (fp.pins_spi) {
++		pins_spi(false);
++	}
++	gcc_restore();
++	if (fp.ldo_voted) {
++		int rc = negroni_rpmh_vreg_disable("ldoc11");
++		printf("NEGRONI FP: ldoc11 off vote rc %d\n", rc);
++		fp.ldo_voted = false;
++	}
++}
++
++static void
++log_pins(const char *when)
++{
++	printf("NEGRONI FP: pins %s: irq40 ctl %#x in %u, rst41 ctl %#x out %u, id42 ctl %#x in %u, "
++	    "spi36-39 ctl %#x %#x %#x %#x\n", when,
++	    rd(fp.tlmm, FP_PIN(FP_PIN_IRQ)), rd(fp.tlmm, FP_PIN(FP_PIN_IRQ) + 4) & TLMM_IN,
++	    rd(fp.tlmm, FP_PIN(FP_PIN_RST)), (rd(fp.tlmm, FP_PIN(FP_PIN_RST) + 4) & TLMM_OUT) ? 1u : 0u,
++	    rd(fp.tlmm, FP_PIN(FP_PIN_ID)), rd(fp.tlmm, FP_PIN(FP_PIN_ID) + 4) & TLMM_IN,
++	    rd(fp.tlmm, FP_PIN(FP_PIN_MISO)), rd(fp.tlmm, FP_PIN(FP_PIN_MOSI)),
++	    rd(fp.tlmm, FP_PIN(FP_PIN_CLK)), rd(fp.tlmm, FP_PIN(FP_PIN_CS)));
++}
++
++static void
++fp_thread(void *arg __unused, wait_result_t wr_ __unused)
++{
++	int delay_s = 15, hz = 4800000, mode = 0, ldo = 1, keep = 0, poll_s = 60;
++	(void)PE_parse_boot_argn("negronifp_delay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("negronifp_hz", &hz, sizeof(hz));
++	(void)PE_parse_boot_argn("negronifp_mode", &mode, sizeof(mode));
++	(void)PE_parse_boot_argn("negronifp_ldo", &ldo, sizeof(ldo));
++	(void)PE_parse_boot_argn("negronifp_keep", &keep, sizeof(keep));
++	(void)PE_parse_boot_argn("negronifp_poll", &poll_s, sizeof(poll_s));
++	if (hz < 100000 || hz > 19200000) {
++		hz = 4800000;
++	}
++	if (delay_s < 0 || delay_s > 600) {
++		delay_s = 15;
++	}
++	if (poll_s < 1 || poll_s > 3600) {
++		poll_s = 60;
++	}
++	for (int i = 0; i < delay_s; i++) {
++		IOSleep(1000);
++	}
++	printf("NEGRONI FP: start (negronifp=%d, Goodix optical G7 [DT], QUP1 SE2 0xa88000, TLMM 36-42)\n", fp.mode);
++
++	step(1, "map (QUP1 wrapper, SE, GCC pages, TLMM 36-43)");
++	fp.qup = ml_io_map(FP_QUP1_PA, FP_QUP1_LEN);
++	fp.se = ml_io_map(FP_SE_PA, FP_SE_LEN);
++	fp.gcc_vote = ml_io_map(FP_GCC_PA + FP_GCC_VOTE_PAGE, 0x4000);
++	fp.gcc_qup = ml_io_map(FP_GCC_PA + FP_GCC_QUP_PAGE, 0x4000);
++	fp.gcc_core = ml_io_map(FP_GCC_PA + FP_GCC_CORE_PAGE, 0x4000);
++	fp.tlmm = ml_io_map(FP_TLMM_PA, FP_TLMM_LEN);
++	if (!fp.qup || !fp.se || !fp.gcc_vote || !fp.gcc_qup || !fp.gcc_core || !fp.tlmm) {
++		printf("NEGRONI FP: stop: a map failed\n");
++		goto out;
++	}
++	log_pins("at start");
++
++	step(2, "GCC: QUP1 AHB/core votes, s2 RCG to XO 19.2 MHz, s2 clock");
++	fp.vote_before = rd(fp.gcc_vote, GCC_VOTE - FP_GCC_VOTE_PAGE);
++	printf("NEGRONI FP: APCS vote %#x, CBCR m_ahb %#x s_ahb %#x core %#x core2x %#x s2 %#x\n", fp.vote_before,
++	    rd(fp.gcc_qup, GCC_HALT_M_AHB - FP_GCC_QUP_PAGE), rd(fp.gcc_qup, GCC_HALT_S_AHB - FP_GCC_QUP_PAGE),
++	    rd(fp.gcc_core, GCC_HALT_CORE - FP_GCC_CORE_PAGE), rd(fp.gcc_core, GCC_HALT_CORE_2X - FP_GCC_CORE_PAGE),
++	    rd(fp.gcc_qup, GCC_HALT_S2 - FP_GCC_QUP_PAGE));
++	fp.se_clocked = true;
++	if (!gcc_branch_on(GCC_VOTE_M_AHB, fp.gcc_qup, GCC_HALT_M_AHB - FP_GCC_QUP_PAGE, "wrap_1_m_ahb") ||
++	    !gcc_branch_on(GCC_VOTE_S_AHB, fp.gcc_qup, GCC_HALT_S_AHB - FP_GCC_QUP_PAGE, "wrap_1_s_ahb") ||
++	    !gcc_branch_on(GCC_VOTE_CORE_2X, fp.gcc_core, GCC_HALT_CORE_2X - FP_GCC_CORE_PAGE, "wrap1_core_2x") ||
++	    !gcc_branch_on(GCC_VOTE_CORE, fp.gcc_core, GCC_HALT_CORE - FP_GCC_CORE_PAGE, "wrap1_core") ||
++	    !gcc_s2_rcg_xo() ||
++	    !gcc_branch_on(GCC_VOTE_S2, fp.gcc_qup, GCC_HALT_S2 - FP_GCC_QUP_PAGE, "wrap1_s2")) {
++		power_down("clocks");
++		goto out;
++	}
++
++	step(3, "SE probe (first read of 0xac0004 / 0xa88000: may fault if the XPU/TEE owns the SE): QUP HW version, firmware protocol, FIFO");
++	{
++		uint32_t ver = rd(fp.qup, QUP_HW_VER_REG);
++		uint32_t fw = rd(fp.se, GENI_FW_REVISION_RO);
++		uint32_t dis = rd(fp.se, GENI_IF_DISABLE_RO);
++		uint32_t hp0 = rd(fp.se, SE_HW_PARAM_0), hp1 = rd(fp.se, SE_HW_PARAM_1);
++		uint32_t major = ver >> 28, minor = (ver >> 16) & 0xfff;
++		fp.fifo_width = (hp0 >> 24) & 0x3f;
++		fp.fifo_depth = (hp0 >> 16) & ((major > 3 || (major == 3 && minor >= 10)) ? 0xffu : 0x3fu);
++		printf("NEGRONI FP: QUP1 hw %u.%u.%u, SE fw rev %#x (protocol %u: %s), IF_DISABLE %#x, "
++		    "HW_PARAM0 %#x HW_PARAM1 %#x: tx fifo %u words x %u bits, STATUS %#x\n",
++		    major, minor, ver & 0xffff, fw, FW_REV_PROTOCOL(fw),
++		    FW_REV_PROTOCOL(fw) == GENI_SE_SPI ? "SPI" : FW_REV_PROTOCOL(fw) == 0 ? "none" : "other",
++		    dis, hp0, hp1, fp.fifo_depth, fp.fifo_width, rd(fp.se, SE_GENI_STATUS));
++		if (FW_REV_PROTOCOL(fw) != GENI_SE_SPI) {
++			printf("NEGRONI FP: stop: SE2 firmware is not SPI (qupfw loads it per the TZ/XBL config)\n");
++			power_down("protocol");
++			goto out;
++		}
++		if (dis & FIFO_IF_DISABLE) {
++			printf("NEGRONI FP: stop: FIFO interface disabled on this SE (GPI DMA only)\n");
++			power_down("fifo");
++			goto out;
++		}
++		if (fp.fifo_depth < 4 || fp.fifo_width != 32) {
++			printf("NEGRONI FP: stop: unexpected FIFO geometry\n");
++			power_down("fifo geometry");
++			goto out;
++		}
++	}
++
++	step(4, "SE init: FIFO mode, 8-bit packing, SPI mode and clock");
++	se_init_fifo();
++	se_spi_setup((unsigned)hz, (unsigned)mode & 3u);
++
++	step(5, "pins: reset low, irq input pull-down, id input pull-up, SPI pins to qup10");
++	pin_out(FP_PIN_RST, 0);
++	pin_cfg(FP_PIN_RST, TLMM_FUNC(0) | TLMM_DRIVE_MA(2) | TLMM_PULL_NONE | TLMM_OE);
++	pin_cfg(FP_PIN_IRQ, TLMM_FUNC(0) | TLMM_DRIVE_MA(2) | TLMM_PULL_DOWN);
++	pin_cfg(FP_PIN_ID, TLMM_FUNC(0) | TLMM_DRIVE_MA(2) | TLMM_PULL_UP);
++	pins_spi(true);
++	IOSleep(2);
++	printf("NEGRONI FP: fp id (TLMM 42, pull-up) = %u (DT goodix_optical_G7: fp-id 1)\n",
++	    rd(fp.tlmm, FP_PIN(FP_PIN_ID) + 4) & TLMM_IN);
++
++	step(6, "power: RPMh ldoc11 (pm8350c_l11) 3000 mV");
++	if (ldo) {
++		int rc = negroni_rpmh_vreg_enable("ldoc11", 3000);
++		fp.ldo_voted = (rc == 0);
++		printf("NEGRONI FP: ldoc11 vote rc %d%s\n", rc, rc == 0 ? "" : " (continuing: the rail may be on already)");
++	} else {
++		printf("NEGRONI FP: ldoc11 vote skipped (negronifp_ldo=0)\n");
++	}
++	IOSleep(10);
++
++	step(7, "reset: 41 low 5 ms, high, 20 ms");
++	{
++		int irq_before = negroni_fp_irq_level();
++		pin_out(FP_PIN_RST, 0);
++		IOSleep(5);
++		pin_out(FP_PIN_RST, 1);
++		fp.powered = true;
++		int irq_rise_ms = -1;
++		for (int ms = 0; ms < 20; ms++) {
++			IOSleep(1);
++			if (irq_rise_ms < 0 && negroni_fp_irq_level()) {
++				irq_rise_ms = ms + 1;
++			}
++		}
++		printf("NEGRONI FP: irq40 before reset %d, after reset %d%s\n", irq_before, negroni_fp_irq_level(),
++		    irq_rise_ms >= 0 ? " (rose within 20 ms: the chip answers the reset)" : "");
++		if (irq_rise_ms >= 0) {
++			printf("NEGRONI FP: irq rose %d ms after reset\n", irq_rise_ms);
++		}
++	}
++	log_pins("after reset");
++
++	step(8, "chip ID over SPI (frames [I]: Goodix F1 read of reg 0x0000; then 8 clocked bytes)");
++	{
++		uint8_t in[16];
++		static const uint8_t rd_reg0[3] = { 0xf1, 0x00, 0x00 };
++		static const uint8_t zero[1] = { 0x00 };
++		printf("NEGRONI FP: IOS %#x (bit 1 MISO level)\n", rd(fp.se, SE_GENI_IOS));
++		int a = spi_cmd_read(rd_reg0, 3, in, 8, "F1 00 00 ->");
++		int allsame = 1;
++		for (int i = 1; a > 0 && i < a; i++) {
++			allsame &= in[i] == in[0];
++		}
++		if (a > 0 && !(allsame && (in[0] == 0 || in[0] == 0xff))) {
++			printf("NEGRONI FP: chip answered (bytes differ from 00/ff): candidate chip id %02x%02x\n", in[0], in[1]);
++		} else if (a > 0) {
++			printf("NEGRONI FP: no answer on MISO (all %02x)\n", in[0]);
++		}
++		(void)spi_cmd_read(zero, 1, in, 8, "00 ->");
++		/* a second F1 read after the IRQ settles (some chips need a 'clear irq' first) */
++		IOSleep(10);
++		(void)spi_cmd_read(rd_reg0, 3, in, 8, "F1 00 00 again ->");
++	}
++
++	if (fp.mode >= 2) {
++		step(9, "IRQ poll (TLMM 40): touch the sensor area");
++		int last = negroni_fp_irq_level(), lines = 0;
++		uint64_t t0;
++		clock_get_uptime(&t0);
++		for (int i = 0; i < poll_s * 200; i++) {
++			IOSleep(5);
++			int now = negroni_fp_irq_level();
++			if (now != last) {
++				uint64_t t, ns;
++				clock_get_uptime(&t);
++				absolutetime_to_nanoseconds(t - t0, &ns);
++				if (lines++ < 32) {
++					printf("NEGRONI FP: irq %d -> %d at %llu ms\n", last, now, ns / 1000000ULL);
++				}
++				last = now;
++			}
++		}
++		printf("NEGRONI FP: irq poll done (%d changes)\n", lines);
++	}
++	if (keep) {
++		printf("NEGRONI FP: done, sensor left powered (negronifp_keep=1)\n");
++	} else {
++		power_down("done");
++	}
++out:
++	printf("NEGRONI FP: end\n");
++	fp.thread = THREAD_NULL;
++	thread_terminate(current_thread());
++}
++
++void
++negroni_fp_init(void)
++{
++	if (fp.started) {
++		return;
++	}
++	fp.started = 1;
++	(void)PE_parse_boot_argn("negronifp", &fp.mode, sizeof(fp.mode));
++	if (fp.mode <= 0) {
++		return;
++	}
++	if (kernel_thread_start(fp_thread, NULL, &fp.thread) == KERN_SUCCESS) {
++		thread_deallocate(fp.thread);
++	}
++}
++#endif /* NEGRONI */
+diff --git a/bsd/dev/negroni_rpmh.c b/bsd/dev/negroni_rpmh.c
+index 6d40a12..40b9c6b 100644
+--- a/bsd/dev/negroni_rpmh.c
++++ b/bsd/dev/negroni_rpmh.c
+@@ -385,6 +385,17 @@ negroni_rpmh_vreg_enable(const char *res, unsigned mv)
+ 	return rh_vreg_enable(res, mv, 7);
+ }
+ 
++/* 0350: the off vote for the same rail (one VRM command, enable = 0). */
++int negroni_rpmh_vreg_disable(const char *res);
++int
++negroni_rpmh_vreg_disable(const char *res)
++{
++	if (!res || strcmp(res, "ldoc11")) {
++		return EINVAL;
++	}
++	return rh_vreg_enable(res, 0, RH_MODE_OFF);
++}
++
+ int
+ negroni_rpmh_wifi_enable(const char *res, unsigned mv)
+ {
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 748b564..4d426e2 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -61,6 +61,7 @@ extern void negroni_adreno_init(void);
+ extern void negroni_wifi_init(void);
+ extern void negroni_adsp_init(void);
+ extern void negroni_bt_init(void);      /* patch 0330: QCA6490 Bluetooth (negronibt) */
++extern void negroni_fp_init(void);      /* patch 0350: fingerprint sensor stage A (negronifp) */
+ extern void negroni_probe_menu(void);
+ extern void negroni_usb_probe(void);
+ 
+@@ -773,6 +774,7 @@ negroni_ufs_init(void)
+ 	negroni_wifi_init();
+ 	negroni_adsp_init();            /* boot-arg negroniadsp=1 (default off): own thread */
+ 	negroni_bt_init();              /* patch 0330: negronibt=1|2 (default off): own thread */
++	negroni_fp_init();              /* patch 0350: negronifp=1|2 (default off): own thread */
+ 	negroni_keys_init();
+ 	negroni_touch_init();
+ 	negroni_usb_probe();

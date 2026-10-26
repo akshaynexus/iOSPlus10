@@ -1,0 +1,208 @@
+Fingerprint highlight (negronifp_hl=1|2, default 0): a white disc at the sensor position drawn into the
+panel memory after each copy (every GPU frame waits on its fence, as the badges do), and the panel HBM-on
+DCS set (live.dts 33140) once. Applies after 0267/0268.
+Details: docs/fingerprint-plan.md, patches/xnu/README-fingerprint.md.
+
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index a7df7a1..810b404 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -1890,6 +1890,172 @@ negroni_draw_badge(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t
+ 	negroni_draw_text_badge(pixels, rowBytes, width, height, negroni_wifi_badge, negroni_wifi_badge_color, 96 + 84);
+ }
+ 
++
++/*
++ * 0351: under-display fingerprint highlight (negronifp_hl, default 0).
++ * The optical sensor needs a bright, known picture above it while it captures: on Android
++ * the HWC draws a "pressed icon" (a filled disc) at the sensor position and the panel goes to
++ * HBM (oplus_onscreenfingerprint.c: fp_type 0x88 = optical new solution, no local HBM, so the
++ * whole panel's HBM is used: DCS 0x53 = 0xE0, 0x51 = 0x0EFF inside the F0 5A5A / A5A5 unlock,
++ * live.dts 33140 qcom,mdss-dsi-hbm-on-command of timing@fhd_sdc_120). The HAL waits for the
++ * frame with the icon to be on the panel ("ui ready", oplus_ofp_hbm_on_period = 2 TEs) before
++ * it captures.
++ *   negronifp_hl=1  draw the disc after every copy into the panel memory and send the HBM-on
++ *                   set once (thread call: DSI writes sleep); =2 draw only; =0 off
++ *   negronifp_hl_x=N negronifp_hl_y=N negronifp_hl_r=N  centre and radius in panel pixels
++ *                   (defaults 540, 2080, 95 [I]: no stock value found in the DT or images;
++ *                   the stock location is the runtime property
++ *                   persist.vendor.fingerprint.optical.sensorlocation read by libgf_hal_G7.so)
++ * Frames the display engine shows itself (zero-copy, 0234) are not touched.
++ */
++extern "C" int negroni_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp);  /* NegroniBacklight.cpp (0250) */
++extern "C" int negroni_fp_hbm(bool on);                                           /* for later stages */
++
++static int negroni_fp_hl = -1;
++static int negroni_fp_hl_x = 540, negroni_fp_hl_y = 2080, negroni_fp_hl_r = 95;
++static bool negroni_fp_hbm_sent, negroni_fp_hbm_state;
++static thread_call_t negroni_fp_hbm_call;
++static uint64_t negroni_fp_hl_frames;
++
++/* live.dts 33140/33139: {type, last, vc, ack, wait ms, len hi, len lo, payload...} per packet */
++static const uint8_t negroni_fp_hbm_on[] = {
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x00, 0x08, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x53, 0xe0,
++	0x39, 0x00, 0x00, 0x00, 0x08, 0x00, 0x03, 0x51, 0x0e, 0xff,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x01, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x02,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x02, 0xb9, 0x65,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x07, 0x65, 0x00, 0xac, 0x00, 0xac, 0x00, 0xac,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++};
++static const uint8_t negroni_fp_hbm_off[] = {
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x53, 0x28,
++	0x39, 0x00, 0x00, 0x00, 0x08, 0x00, 0x03, 0x51, 0x06, 0x9f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x01, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x02,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x02, 0xb9, 0x65,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x07, 0x65, 0x01, 0x5e, 0x01, 0x5e, 0x01, 0x5e,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++};
++
++/* Send a DT-format command set, each packet one DCS write in HS mode, the wait byte honoured. */
++static int
++negroni_fp_send_set(const uint8_t *set, uint32_t len, uint32_t *sent)
++{
++	uint32_t i = 0, n = 0;
++	int rc = 0;
++	while (i + 7 <= len && rc == 0) {
++		uint8_t type = set[i], wait = set[i + 4];
++		uint32_t plen = (uint32_t)set[i + 5] << 8 | set[i + 6];
++		if (plen == 0 || i + 7 + plen > len || (type != 0x05 && type != 0x15 && type != 0x39)) {
++			rc = -4;
++			break;
++		}
++		rc = negroni_dsi_dcs_write(set + i + 7, plen, false);
++		if (rc == 0) {
++			n++;
++			if (wait != 0) {
++				IOSleep(wait);
++			}
++		}
++		i += 7 + plen;
++	}
++	*sent = n;
++	return rc;
++}
++
++/* Thread context (0250: the DSI write sleeps on its lock). */
++extern "C" int
++negroni_fp_hbm(bool on)
++{
++	uint32_t sent = 0;
++	int rc = on ? negroni_fp_send_set(negroni_fp_hbm_on, sizeof(negroni_fp_hbm_on), &sent)
++	    : negroni_fp_send_set(negroni_fp_hbm_off, sizeof(negroni_fp_hbm_off), &sent);
++	if (rc == 0) {
++		negroni_fp_hbm_state = on;
++	}
++	IOLog("NEGRONI FP HL: panel HBM %s: %s (%u packets)\n", on ? "on" : "off", rc == 0 ? "ok" : "failed", sent);
++	return rc;
++}
++
++static void
++negroni_fp_hbm_callout(thread_call_param_t p0, thread_call_param_t p1)
++{
++	(void)p0;
++	(void)p1;
++	(void)negroni_fp_hbm(true);
++}
++
++static int
++negroni_fp_hl_mode(void)
++{
++	if (negroni_fp_hl < 0) {
++		negroni_fp_hl = 0;
++		PE_parse_boot_argn("negronifp_hl", &negroni_fp_hl, sizeof(negroni_fp_hl));
++		PE_parse_boot_argn("negronifp_hl_x", &negroni_fp_hl_x, sizeof(negroni_fp_hl_x));
++		PE_parse_boot_argn("negronifp_hl_y", &negroni_fp_hl_y, sizeof(negroni_fp_hl_y));
++		PE_parse_boot_argn("negronifp_hl_r", &negroni_fp_hl_r, sizeof(negroni_fp_hl_r));
++		if (negroni_fp_hl < 0 || negroni_fp_hl > 2 || negroni_fp_hl_r < 4 || negroni_fp_hl_r > 400) {
++			negroni_fp_hl = 0;
++		}
++		if (negroni_fp_hl) {
++			IOLog("NEGRONI FP HL: highlight on (mode %d): disc at %d,%d radius %d panel px%s\n", negroni_fp_hl,
++			    negroni_fp_hl_x, negroni_fp_hl_y, negroni_fp_hl_r, negroni_fp_hl == 1 ? ", panel HBM once" : "");
++		}
++	}
++	return negroni_fp_hl;
++}
++
++/* A filled white disc at the sensor position, drawn into the panel memory after a copy. */
++static void
++negroni_fp_draw_highlight(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
++{
++	int mode = negroni_fp_hl_mode();
++	if (mode == 0 || pixels == 0) {
++		return;
++	}
++	const int cx = negroni_fp_hl_x, cy = negroni_fp_hl_y, r = negroni_fp_hl_r;
++	for (int y = cy - r; y <= cy + r; y++) {
++		if (y < 0 || y >= (int)height) {
++			continue;
++		}
++		int dy = y - cy, dx = 0;
++		while (dx * dx + dy * dy <= r * r) {
++			dx++;
++		}
++		dx--;
++		int x0 = cx - dx, x1 = cx + dx;
++		if (x0 < 0) {
++			x0 = 0;
++		}
++		if (x1 >= (int)width) {
++			x1 = (int)width - 1;
++		}
++		uint32_t *row = (uint32_t *)(pixels + (uint64_t)y * rowBytes);
++		for (int x = x0; x <= x1; x++) {
++			row[x] = 0xffffffffu;
++		}
++	}
++	negroni_fp_hl_frames++;
++	if (mode == 1 && !negroni_fp_hbm_sent) {
++		negroni_fp_hbm_sent = true;
++		if (negroni_fp_hbm_call == NULL) {
++			negroni_fp_hbm_call = thread_call_allocate(&negroni_fp_hbm_callout, NULL);
++		}
++		if (negroni_fp_hbm_call != NULL) {
++			uint64_t deadline;
++			clock_interval_to_deadline(50, kMillisecondScale, &deadline);
++			thread_call_enter_delayed(negroni_fp_hbm_call, deadline);
++		}
++	}
++}
++
++
+ /*
+  * held: the frame's surfaces swap() holds for a GPU present (NULL entries: that layer, if any,
+  * goes the CPU way). fences: each layer's swap-time GPU fence (0254), done or given up when the
+@@ -2095,7 +2261,7 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 	}
+ 	fFinishTop = cpuShift;
+ 	fFinishFence = fence;
+-	fFinishPending = cpuShift || negroni_badges != 0;
++	fFinishPending = cpuShift || negroni_badges != 0 || negroni_fp_hl_mode() > 0;   /* 0351: disc on every frame */
+ 	if (fFinishPending && (!fNotifyLate || fence == 0 || fZCActive)) {
+ 		presentFinish();
+ 	}
+@@ -2115,7 +2281,7 @@ AppleCLCD::presentFinish(void)
+ 
+ 	fFinishPending = false;
+ 	bool copied = true;             /* the GPU's copy of this frame is in the panel memory */
+-	if (fence != 0 && (topRedrawn || negroni_badges > 0)) {
++	if (fence != 0 && (topRedrawn || negroni_badges > 0 || negroni_fp_hl_mode() > 0)) {
+ 		/* the CPU draws over the GPU's picture: after it */
+ 		copied = NegroniGPUFenceWait(fence, NEGRONI_FB_GPU_COPY_WAIT_MS);
+ 	}
+@@ -2132,6 +2298,7 @@ AppleCLCD::presentFinish(void)
+ 		}
+ 	}
+ 	negroni_draw_badge(fPixels, fRowBytes, fWidth, fHeight);
++	negroni_fp_draw_highlight(fPixels, fRowBytes, fWidth, fHeight);   /* 0351 */
+ }
+ 
+ /*
