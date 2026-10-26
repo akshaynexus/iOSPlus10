@@ -1,0 +1,683 @@
+0338-negroni-bt-le-legacy-to-extended: legacy LE scan/advertising/connect commands become extended ones on the QCA6490.
+
+Phone [V] 2026-10-27 04:06 (logs/usblog-20261026-233816.txt, kernel local-20261026-222425 with 0335-0337): every Apple
+VSC passes (0337 works), then "h4 tx cmd 0x200b plen 7: 01 0b 20 07 00 e0 01 30 00 01 00" -> "Command Complete op
+0x200b status 0xc" (Command Disallowed) -> "exit bluetoothd status 1", every ~10 s (launchd restart; 0335 powers the
+chip off/on each time). 0x2007 (also legacy) gets 0x0c at init as well. The host sent no extended LE command before:
+the controller firmware (BTFW.HSP.2.1.0-00394) takes only the extended LE command set [I strong]. bluetoothd uses the
+legacy set on this chip (its chipset table says extended scan/advertising disabled).
+This crash loop is also why Bluetooth cannot be turned off in Settings [I]: bluetoothd dies ~1 s after each start, so
+the switch request has no running daemon to act on. The power-off path itself [V disassembly of 20H392 bluetoothd]:
+"Beginning asynchronous power shutdown" -> StackManager halts the core stack -> applebt_transport_terminate ->
+applebt_hci_close (the control socket closes: 0335 drives BT_EN low 3 s later) -> "Powering off chipset" (BlueTool
+"deepsleep" script, negroni-bluetool answers 0).
+
+negroni_bt_shim.c (negronibt_lext=1 default, 0 = old pass-through):
+- 0x200b -> 0x2041, 0x200c -> 0x2042 (answers: op rewritten in place), 0x200d -> 0x2043 (Command Status op rewritten).
+- 0x2006/0x2008/0x2009/0x200a -> advertising set 0: 0x2036/0x2037/0x2038/0x2039, run as a chain (one command at a
+  time; the RX thread sends the next after the answer; then one legacy Command Complete). 0x2036 gets 0x2035 (set
+  random address) after it when the own address type is random; 0x2005 gets 0x2035 after it when set 0 exists. A
+  data/enable command before any 0x2006 creates set 0 with the legacy defaults first.
+- LE Extended Advertising Report -> one LE Advertising Report per legacy-PDU report (extended PDUs, anonymous and
+  > 31-byte reports dropped). LE Advertising Set Terminated / Scan Timeout dropped. 0x2001 gets bit 12.
+- 0337 review: table names fixed (0xfce2 sub 0x1c = SET_MIN_AFH_LE_CHANNELS; 0xfd48 = an address command [I]).
+negroni_bt_h4.c: negroni_bt_h4_send_cmd (TX path with IBS wake; from the RX thread without h4_tx; when the
+controller said SLEEP_IND, the power worker sends it after ibs_wake with h4_tx held).
+Opus review 2026-10-27 (ACCEPT with fixes), fixed here: F1 legacy report plen 12 + data (was 11: stream desync and a
+1-byte stack overflow at 31 data bytes); F2 set 0 exists only after 0x2036 status 0; F3 high-duty directed enable
+gets duration 0x0080 (1.28 s); F4 0x2008 on a directed set and non-empty 0x2009 on a non-scannable set get a local
+status 0 (legacy ignores that data, 0x2037/0x2038 would answer 0x12); F5 no RX-thread send to a sleeping controller;
+F6 a chain without an answer for 2 s is dropped at the next advertising command; F8 locking comment; F10 log fixes.
+Host test: scripts/kernel/test-bt-shim.sh TREE (tools/bt-shim-test, ASan + UBSan).
+
+diff --git a/bsd/dev/negroni_bt.h b/bsd/dev/negroni_bt.h
+index a0d6e10..1cffff3 100644
+--- a/bsd/dev/negroni_bt.h
++++ b/bsd/dev/negroni_bt.h
+@@ -28,6 +28,7 @@ void negroni_bt_h4_attach(void);                /* kernel control + /dev nodes;
+ void negroni_bt_h4_start(void);                 /* chip ready: RX thread, sends go to the UART */
+ void negroni_bt_h4_fail(const char *why);       /* chip not ready: sends fail with EIO */
+ void negroni_bt_h4_inject(const uint8_t *pkt, uint32_t len);    /* one H4 packet toward userland */
++int negroni_bt_h4_send_cmd(const uint8_t *pkt, uint32_t len, bool from_rx);   /* 0338: a shim command to the chip */
+ 
+ /* 0335: chip power for the transport (negroni_bt.c); the caller owns the UART (no RX thread read meanwhile) */
+ void negroni_bt_chip_off(void);                 /* BT_EN low; rails and clocks stay */
+diff --git a/bsd/dev/negroni_bt_h4.c b/bsd/dev/negroni_bt_h4.c
+index 4a777d0..b595fe6 100644
+--- a/bsd/dev/negroni_bt_h4.c
++++ b/bsd/dev/negroni_bt_h4.c
+@@ -131,6 +131,10 @@ static struct {
+ 	uint64_t gone_at;
+ 	uint64_t b_tx, b_rx, b_user;
+ 	char why[64];
++	/* 0338: a shim command deferred from the RX thread while the controller sleeps (h4_lock) */
++	bool shim_pend;
++	uint32_t shim_len, n_shim_defer;
++	uint8_t shim_pkt[64];
+ } t;
+ 
+ static uint8_t ctl_buf[CTL_CHUNK];              /* RX thread only */
+@@ -371,6 +375,54 @@ ibs_wake(void)
+ 	SAY("IBS: no WAKE_ACK after 3 x 100 ms; the packet goes out anyway\n");
+ }
+ 
++/*
++ * 0338: a command that the shim makes (legacy -> extended LE translation). from_rx = false: the TX path calls it with
++ * h4_tx held (IBS wake as for a host packet). from_rx = true: the RX thread sends the next command of a chain right
++ * after the controller's answer to the previous one. It does not take h4_tx (the TX path can wait in ibs_wake for
++ * a WAKE_ACK that only this thread reads) and does not wait for WAKE_ACK: the controller sent an event just now,
++ * so it is awake [I]. uart_send keeps each packet whole (h4_uart).
++ */
++int
++negroni_bt_h4_send_cmd(const uint8_t *p, uint32_t n, bool from_rx)
++{
++	if (n < 4 || n > PKT_MAX) {
++		return EINVAL;
++	}
++	if (t.log_tx > 0) {
++		t.log_tx--;
++		log_pkt(from_rx ? "tx(shim, rx thread)" : "tx(shim)", p, n);
++	}
++	t.n_tx++;
++	t.b_tx += n;
++	if (!from_rx) {
++		ibs_wake();
++	} else {
++		lck_mtx_lock(&h4_lock);
++		bool awake = t.ctrl_awake;
++		lck_mtx_unlock(&h4_lock);
++		if (!awake && n <= sizeof(t.shim_pkt)) {
++			/* review F5: the controller sleeps; the power worker sends it after ibs_wake (WAKE_ACK) with h4_tx */
++			lck_mtx_lock(&h4_lock);
++			memcpy(t.shim_pkt, p, n);
++			t.shim_len = n;
++			t.shim_pend = true;
++			t.n_shim_defer++;
++			lck_mtx_unlock(&h4_lock);
++			wakeup(&t.worker);
++			SAY("tx(shim): controller said SLEEP_IND; %#06x goes out from the power worker after WAKE_ACK (#%u)\n",
++			    le16(p + 1), t.n_shim_defer);
++			return 0;
++		}
++	}
++	int error = uart_send(p, n);
++	t.last_act = now_us();
++	kick();
++	if (error && t.n_tx_err++ < 16) {
++		SAY("tx(shim): UART write of %u bytes failed (%d)\n", n, error);
++	}
++	return error ? EIO : 0;
++}
++
+ /* one complete packet from the controller (RX thread) */
+ static void
+ rx_packet(uint8_t *p, uint32_t n)
+@@ -760,6 +812,7 @@ h4_power_thread(void *arg __unused, wait_result_t w __unused)
+ 			t.off = true;
+ 			t.powering = false;
+ 			t.rx_reset = true;
++			t.shim_pend = false;            /* 0338: no deferred shim command across a chip off */
+ 			t.n_off++;
+ 			q_flush();
+ 			lck_mtx_unlock(&h4_lock);
+@@ -794,8 +847,27 @@ h4_power_thread(void *arg __unused, wait_result_t w __unused)
+ 			continue;
+ 		}
+ 		lck_mtx_lock(&h4_lock);
++		bool sp = t.shim_pend && t.ready;
++		uint8_t pkt[sizeof(t.shim_pkt)];
++		uint32_t pn = t.shim_len;
++		if (sp) {
++			memcpy(pkt, t.shim_pkt, pn);
++			t.shim_pend = false;
++		}
++		lck_mtx_unlock(&h4_lock);
++		if (sp) {
++			/* 0338: a deferred shim command: wake the controller (IBS) as the TX path does, then send */
++			lck_mtx_lock(&h4_tx);
++			int e = negroni_bt_h4_send_cmd(pkt, pn, false);
++			lck_mtx_unlock(&h4_tx);
++			SAY("tx(shim): deferred %#06x sent by the power worker (error %d)\n", le16(pkt + 1), e);
++			continue;
++		}
++		lck_mtx_lock(&h4_lock);
+ 		struct timespec ts = { 0, 200 * 1000 * 1000 };
+-		(void)msleep(&t.worker, &h4_lock, PZERO, "nbth4pw", pending ? &ts : NULL);
++		if (!(t.shim_pend && t.ready)) {
++			(void)msleep(&t.worker, &h4_lock, PZERO, "nbth4pw", pending ? &ts : NULL);
++		}
+ 		lck_mtx_unlock(&h4_lock);
+ 	}
+ }
+diff --git a/bsd/dev/negroni_bt_shim.c b/bsd/dev/negroni_bt_shim.c
+index 855a211..99c5d42 100644
+--- a/bsd/dev/negroni_bt_shim.c
++++ b/bsd/dev/negroni_bt_shim.c
+@@ -70,13 +70,56 @@
+  * answered here carries return data: byte 0 = the first parameter byte (sub-opcode echo), then zeros
+  * (negronibt_vscdata, default 8 bytes, 2..32). The opcodes bluetoothd sent on the QCA6490 get status 0 (feature
+  * configuration; names from the error order in the log [I]). 0x2007 LE_Read_Advertising_Physical_Channel_Tx_Power:
+- * the chip answers 0x0c (Command Disallowed: extended advertising commands came first); rewritten to status 0, 0 dBm.
++ * the chip answers 0x0c (Command Disallowed); rewritten to status 0, 0 dBm.
++ * 0338 review of 0337 [V h4 logs usblog-t6 and usblog-20261026-233816 04:06]: 0xfce2 is a multiplex opcode (byte 0 =
++ * sub-opcode: 0x0b, 0x1c, 0x15, 0x26, 0x1e, 0x36 seen; the error order names 0x0b CHANGE_LE_SETTINGS, 0x1c
++ * SET_MIN_AFH_LE_CHANNELS, 0x15 ANTENNA_PREF_B [I]). 0xfd48 carries 01 + a 6-byte address (the same address goes in
++ * the next 0x2005 LE_Set_Random_Address): an address list VSC [I], not SET_MIN_AFH_LE_CHANNELS. With 0337 bluetoothd
++ * passed all VSCs (no "timedout waiting for controller") and stopped at 0x200b (below).
++ *
++ * 0338 (iOSPlus10): the QCA6490 firmware (BTFW.HSP.2.1.0-00394) rejects legacy LE advertising/scanning commands with
++ * 0x0c Command Disallowed although the host sent no extended LE command [V usblog-20261026-233816 04:06:33: 0x2007
++ * and 0x200b LE_Set_Scan_Parameters 00 e0 01 30 00 01 00 -> status 0x0c; bluetoothd exits with status 1 and launchd
++ * restarts it every ~10 s]. bluetoothd uses only legacy LE commands on this chip ("support for Extended Scanning is
++ * disabled": its chipset table, not the chip's LE features). So the shim translates (negronibt_lext=1, default; 0 =
++ * pass the legacy commands unchanged):
++ *   0x200b Set_Scan_Parameters  -> 0x2041 Set_Extended_Scan_Parameters (1M PHY), answer op rewritten
++ *   0x200c Set_Scan_Enable      -> 0x2042 Set_Extended_Scan_Enable (duration 0, period 0), answer op rewritten
++ *   0x200d Create_Connection    -> 0x2043 Extended_Create_Connection (1M PHY), Command Status op rewritten
++ *   0x2006 Set_Advertising_Parameters -> 0x2036 (set 0, legacy PDU properties) [+ 0x2035 set random address]
++ *   0x2008 / 0x2009 Set_Advertising_Data / Scan_Response_Data -> 0x2037 / 0x2038 (set 0, complete data)
++ *   0x200a Set_Advertising_Enable -> 0x2039 (set 0)
++ *   0x2005 Set_Random_Address: sent as is; when set 0 exists, 0x2035 for set 0 follows (status only logged)
++ *   events: LE Extended Advertising Report (0x3e sub 0x0d) -> one LE Advertising Report (sub 0x02) per legacy-PDU
++ *   report (extended PDUs dropped: a legacy scan does not see them); LE Advertising Set Terminated (sub 0x12) and
++ *   LE Scan Timeout (sub 0x11) dropped; LE event mask (0x2001) gets bit 12 (Extended Advertising Report).
++ * The advertising commands run as a chain: one command at a time, the next after the controller's answer (RX
++ * thread), then one legacy Command Complete with the first failing status (0x2035 failures are only logged).
+  */
+ #define OP_READ_SUPPORTED_COMMANDS 0x1002u
+ #define OP_READ_ERR_DATA  0x0c5au
+ #define OP_WRITE_ERR_DATA 0x0c5bu
+ #define OP_WRITE_LE_HOST  0x0c6du
+ #define OP_LE_READ_ADV_TX_POWER 0x2007u
++#define OP_RESET          0x0c03u
++#define OP_LE_EVENT_MASK  0x2001u
++#define OP_LE_RAND_ADDR   0x2005u
++#define OP_LE_ADV_PARAM   0x2006u
++#define OP_LE_ADV_DATA    0x2008u
++#define OP_LE_SCAN_RSP    0x2009u
++#define OP_LE_ADV_ENABLE  0x200au
++#define OP_LE_SCAN_PARAM  0x200bu
++#define OP_LE_SCAN_ENABLE 0x200cu
++#define OP_LE_CREATE_CONN 0x200du
++#define OP_LE_SET_RAND    0x2035u
++#define OP_LE_EXT_ADV_PARAM 0x2036u
++#define OP_LE_EXT_ADV_DATA  0x2037u
++#define OP_LE_EXT_SCAN_RSP  0x2038u
++#define OP_LE_EXT_ADV_EN    0x2039u
++#define OP_LE_EXT_SCAN_PARAM 0x2041u
++#define OP_LE_EXT_SCAN_EN   0x2042u
++#define OP_LE_EXT_CONN      0x2043u
++#define EV_LE_META        0x3eu
+ #define VSC_DATA_DEF      8u
+ #define CMDS_OCTET_ERR    18u
+ #define CMDS_ERR_BITS     0x0cu         /* bit 2 read, bit 3 write */
+@@ -109,8 +152,9 @@ static const struct shim_op shim_ops[] = {
+ 	/* 0337: Apple VSCs bluetoothd sends on this chip (opcode [V] h4 log; name [I] from the error order) */
+ 	{ 0xfd3c, 0x00, "Apple VSC 0xfd3c (after \"BCM_4357 supports the following VSCs\")" },
+ 	{ 0xfce9, 0x00, "Apple LE_META (BD_VSC_LE_META_ENA_FEATURES; sub-opcode in byte 0, _BCM_SubOpcodeChecker)" },
+-	{ 0xfce2, 0x00, "Apple OLYMPIC (sub 0x0b CHANGE_LE_SETTINGS, sub 0x15 ANTENNA_PREF_B; sub-opcode in byte 0)" },
+-	{ 0xfd48, 0x00, "Apple VSC 0xfd48 (BD_VSC_OLYMPIC_SET_MIN_AFH_LE_CHANNELS)" },
++	{ 0xfce2, 0x00, "Apple OLYMPIC (sub 0x0b CHANGE_LE_SETTINGS, 0x1c SET_MIN_AFH_LE_CHANNELS, 0x15 ANTENNA_PREF_B; "
++	  "sub-opcode in byte 0)" },
++	{ 0xfd48, 0x00, "Apple VSC 0xfd48 (01 + a 6-byte address; an address list command [I])" },
+ 	{ 0xfd47, 0x00, "Apple VSC 0xfd47 (BD_VSC_ENABLE_EXTENDED_DUPLICATE_FILTER)" },
+ };
+ 
+@@ -125,6 +169,22 @@ static struct {
+ 	bool lehost_logged, advtx_logged, lehost_rej_logged;
+ 	bool chip_err_rd, chip_err_wr, cmds_known;
+ 	uint8_t rej[SEEN_SLOTS];
++	/* 0338 legacy -> extended LE */
++	uint32_t lext;
++	bool adv_set, rnd_known;
++	uint8_t rnd[6];
++	uint32_t n_xlat, n_rep_in, n_rep_out, n_rep_drop, n_ev_drop, n_rep_logged, n_chain_stale;
++	uint8_t adv_type;               /* legacy Advertising_Type of the last accepted 0x2006 (0 = ADV_IND default) */
++	uint8_t pend_scan_p, pend_scan_e, pend_conn;
++	struct {
++		bool active;
++		uint16_t legacy;
++		uint8_t n, i, status, crit;     /* crit: bit i = a failure of step i is the legacy status */
++		uint8_t want_type;              /* 0x2006 chain: its legacy type, kept when 0x2036 succeeds */
++		uint64_t at_us;                 /* last step sent (stale chain check) */
++		uint8_t len[3];
++		uint8_t cmd[3][48];
++	} ch;
+ } s;
+ 
+ static inline uint16_t
+@@ -146,6 +206,10 @@ negroni_bt_shim_init(void)
+ 	SAY("0336/0337 init fixes %s: 0x0c6d Simultaneous_LE_Host -> 0x00; 0x0c5a/0x0c5b Erroneous Data Reporting bits "
+ 	    "set in the 0x1002 mask and answered here when the chip lacks them; 0x2007 0x0c -> status 0, 0 dBm; vendor "
+ 	    "answers carry %u data bytes (sub-opcode echo + zeros)\n", s.fix ? "on" : "off", s.vscdata);
++	s.lext = negroni_bt_arg("lext", 1);
++	SAY("0338 legacy LE -> extended LE translation %s (negronibt_lext): 0x200b/0x200c/0x200d/0x2006/0x2008/0x2009/"
++	    "0x200a -> 0x2041/0x2042/0x2043/0x2036/0x2037/0x2038/0x2039; extended reports -> legacy reports\n",
++	    s.lext ? "on" : "off");
+ 	SAY("policy %u (%s), manufacturer rewrite %s%#x; %zu Broadcom opcodes answered with success, other vendor "
+ 	    "commands with status 0x01\n", s.policy,
+ 	    s.policy == 0 ? "pass everything" : s.policy == 2 ? "all vendor commands succeed" : "vendor commands local",
+@@ -163,6 +227,10 @@ negroni_bt_shim_session(void)
+ 	bzero(s.rej, sizeof(s.rej));
+ 	s.cmds_known = s.chip_err_rd = s.chip_err_wr = false;
+ 	s.lehost_logged = s.advtx_logged = s.lehost_rej_logged = false;
++	s.adv_set = s.rnd_known = false;
++	s.adv_type = 0;
++	s.pend_scan_p = s.pend_scan_e = s.pend_conn = 0;
++	bzero(&s.ch, sizeof(s.ch));
+ }
+ 
+ static void
+@@ -191,6 +259,387 @@ answer_vsc(uint16_t op, uint8_t status, uint8_t sub)
+ 	negroni_bt_h4_inject(ev, 7u + n);
+ }
+ 
++/*
++ * ---- 0338: legacy -> extended LE ----
++ * Locking: the state below changes on the TX path (h4_tx held) and on the RX thread, without a lock. This is safe
++ * because the controller gives one command credit and bluetoothd sends the next LE command only after the answer
++ * to the previous one (review F8). Late answers after an HCI_Reset go to bluetoothd with the extended opcode.
++ */
++
++static uint8_t
++mkcmd(uint8_t *b, uint16_t op, const uint8_t *par, uint8_t plen)
++{
++	b[0] = H4_CMD;
++	b[1] = (uint8_t)op;
++	b[2] = (uint8_t)(op >> 8);
++	b[3] = plen;
++	memcpy(b + 4, par, plen);
++	return (uint8_t)(4u + plen);
++}
++
++/* 0x2036 for set 0 from the 15 legacy parameter bytes (NULL: legacy defaults, ADV_IND 1.28 s, public) */
++static uint8_t
++mk_ext_adv_param(uint8_t *b, const uint8_t *lp)
++{
++	static const uint8_t def[15] = { 0x00, 0x08, 0x00, 0x08, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00 };
++	const uint8_t *l = lp ? lp : def;
++	uint16_t props;
++	switch (l[4]) {
++	case 0x00: props = 0x0013; break;       /* ADV_IND: legacy, connectable, scannable */
++	case 0x01: props = 0x001d; break;       /* ADV_DIRECT_IND high duty */
++	case 0x02: props = 0x0012; break;       /* ADV_SCAN_IND */
++	case 0x03: props = 0x0010; break;       /* ADV_NONCONN_IND */
++	case 0x04: props = 0x0015; break;       /* ADV_DIRECT_IND low duty */
++	default:   props = 0x0013; break;
++	}
++	uint8_t p[25] = {
++		0x00, (uint8_t)props, (uint8_t)(props >> 8),
++		l[0], l[1], 0x00,                       /* primary interval min (3 bytes) */
++		l[2], l[3], 0x00,                       /* primary interval max */
++		l[13], l[5], l[6],                      /* channel map, own address type, peer address type */
++		l[7], l[8], l[9], l[10], l[11], l[12],  /* peer address */
++		l[14], 0x7f, 0x01, 0x00, 0x01, 0x00, 0x00 /* filter, TX power no preference, 1M, skip 0, 1M, SID 0, no notify */
++	};
++	return mkcmd(b, OP_LE_EXT_ADV_PARAM, p, sizeof(p));
++}
++
++static void
++chain_answer(uint8_t status)
++{
++	uint16_t op = s.ch.legacy;
++	s.ch.active = false;
++	if (status != 0 || s.n_xlat < 16) {
++		SAY("lext: legacy %#06x answered with status %#x after %u extended command(s)\n", op, status, s.ch.i + 1u);
++	}
++	answer(op, status);
++}
++
++/* send step s.ch.i; false = the UART send failed (the legacy command is answered with 0x03 Hardware Failure) */
++static bool
++chain_send(bool from_rx)
++{
++	s.ch.at_us = negroni_bt_us();
++	if (negroni_bt_h4_send_cmd(s.ch.cmd[s.ch.i], s.ch.len[s.ch.i], from_rx) != 0) {
++		chain_answer(0x03);
++		return false;
++	}
++	return true;
++}
++
++static int
++chain_start(uint16_t legacy, uint8_t crit)
++{
++	s.ch.active = true;
++	s.ch.legacy = legacy;
++	s.ch.i = 0;
++	s.ch.status = 0;
++	s.ch.crit = crit;
++	s.n_xlat++;
++	(void)chain_send(false);
++	return NEGRONI_BT_SHIM_DONE;
++}
++
++/* the controller answered a command; true = it was a chain step (the event is not delivered) */
++static bool
++chain_rx(uint16_t op, uint8_t status)
++{
++	if (!s.ch.active || s.ch.len[s.ch.i] < 4 || op != le16(s.ch.cmd[s.ch.i] + 1)) {
++		return false;
++	}
++	if (op == OP_LE_EXT_ADV_PARAM && status == 0) {
++		s.adv_set = true;               /* review F2: set 0 exists only after the controller took 0x2036 */
++		s.adv_type = s.ch.want_type;
++	}
++	if (status != 0) {
++		if (s.ch.crit & (1u << s.ch.i)) {
++			chain_answer(status);
++			return true;
++		}
++		SAY("lext: %#06x (step %u of legacy %#06x) status %#x: only logged\n", op, s.ch.i + 1u, s.ch.legacy, status);
++	}
++	if (s.ch.i + 1u < s.ch.n) {
++		s.ch.i++;
++		(void)chain_send(true);
++		return true;
++	}
++	chain_answer(0);
++	return true;
++}
++
++/* host command -> extended form; NEGRONI_BT_SHIM_PASS when the command is not translated */
++static int
++lext_tx(uint8_t *pkt, uint32_t len)
++{
++	uint16_t op = le16(pkt + 1);
++	uint8_t plen = pkt[3];
++	const uint8_t *l = pkt + 4;
++	if (len < 4u + plen) {
++		return NEGRONI_BT_SHIM_PASS;
++	}
++	if (op == OP_RESET) {
++		s.adv_set = s.rnd_known = false;
++		s.adv_type = 0;
++		s.pend_scan_p = s.pend_scan_e = s.pend_conn = 0;
++		bzero(&s.ch, sizeof(s.ch));
++		return NEGRONI_BT_SHIM_PASS;
++	}
++	if (op == OP_LE_EVENT_MASK && plen >= 8 && (pkt[5] & 0x10u) == 0) {
++		SAY("lext: LE event mask byte 1 %#x -> %#x (Extended Advertising Report on)\n", pkt[5], pkt[5] | 0x10u);
++		pkt[5] |= 0x10u;
++		return NEGRONI_BT_SHIM_PASS;
++	}
++	bool adv = op == OP_LE_ADV_PARAM || op == OP_LE_ADV_DATA || op == OP_LE_SCAN_RSP || op == OP_LE_ADV_ENABLE ||
++	    (op == OP_LE_RAND_ADDR && s.adv_set);
++	if (adv && s.ch.active && negroni_bt_us() - s.ch.at_us > 2000000u) {
++		/* review F6: a step answer never came (lost command); bluetoothd has its own timeout for the old one */
++		s.n_chain_stale++;
++		SAY("lext: chain of legacy %#06x had no answer for step %u in 2 s: dropped (#%u)\n", s.ch.legacy,
++		    s.ch.i + 1u, s.n_chain_stale);
++		s.ch.active = false;
++	}
++	if (adv && s.ch.active) {
++		SAY("lext: %#06x while legacy %#06x is still running: answered with 0x0c Command Disallowed\n", op,
++		    s.ch.legacy);
++		answer(op, 0x0c);
++		return NEGRONI_BT_SHIM_DONE;
++	}
++	uint8_t b[48];
++	switch (op) {
++	case OP_LE_SCAN_PARAM:
++		if (plen < 7) {
++			break;
++		} else {
++			/* own type, filter, PHYs 1M, [type, interval, window] */
++			const uint8_t p[8] = { l[5], l[6], 0x01, l[0], l[1], l[2], l[3], l[4] };
++			s.pend_scan_p++;
++			s.n_xlat++;
++			if (negroni_bt_h4_send_cmd(b, mkcmd(b, OP_LE_EXT_SCAN_PARAM, p, sizeof(p)), false) != 0) {
++				s.pend_scan_p--;
++				answer(op, 0x03);
++			}
++			return NEGRONI_BT_SHIM_DONE;
++		}
++	case OP_LE_SCAN_ENABLE:
++		if (plen < 2) {
++			break;
++		} else {
++			const uint8_t p[6] = { l[0], l[1], 0, 0, 0, 0 };
++			s.pend_scan_e++;
++			s.n_xlat++;
++			if (negroni_bt_h4_send_cmd(b, mkcmd(b, OP_LE_EXT_SCAN_EN, p, sizeof(p)), false) != 0) {
++				s.pend_scan_e--;
++				answer(op, 0x03);
++			}
++			return NEGRONI_BT_SHIM_DONE;
++		}
++	case OP_LE_CREATE_CONN:
++		if (plen < 25) {
++			break;
++		} else {
++			/* filter, own type, peer type, peer address, PHYs 1M, scan interval/window, conn interval min/max,
++			 * latency, supervision timeout, CE length min/max */
++			const uint8_t p[26] = { l[4], l[12], l[5], l[6], l[7], l[8], l[9], l[10], l[11], 0x01,
++				                l[0], l[1], l[2], l[3], l[13], l[14], l[15], l[16], l[17], l[18], l[19], l[20],
++				                l[21], l[22], l[23], l[24] };
++			s.pend_conn++;
++			s.n_xlat++;
++			if (negroni_bt_h4_send_cmd(b, mkcmd(b, OP_LE_EXT_CONN, p, sizeof(p)), false) != 0) {
++				s.pend_conn--;
++				const uint8_t st[7] = { H4_EVT, EV_CMD_STATUS, 4, 0x03, 1, (uint8_t)op, (uint8_t)(op >> 8) };
++				negroni_bt_h4_inject(st, sizeof(st));
++			}
++			return NEGRONI_BT_SHIM_DONE;
++		}
++	case OP_LE_ADV_PARAM:
++		if (plen < 15) {
++			break;
++		}
++		s.ch.n = 1;
++		s.ch.len[0] = mk_ext_adv_param(s.ch.cmd[0], l);
++		s.ch.want_type = l[4];
++		if ((l[5] == 0x01 || l[5] == 0x03) && s.rnd_known) {
++			const uint8_t p[7] = { 0x00, s.rnd[0], s.rnd[1], s.rnd[2], s.rnd[3], s.rnd[4], s.rnd[5] };
++			s.ch.len[1] = mkcmd(s.ch.cmd[1], OP_LE_SET_RAND, p, sizeof(p));
++			s.ch.n = 2;
++		}
++		return chain_start(op, 0x01);
++	case OP_LE_ADV_DATA:
++	case OP_LE_SCAN_RSP:
++		if (plen < 1) {
++			break;
++		} else if (s.adv_set && ((op == OP_LE_ADV_DATA && (s.adv_type == 0x01 || s.adv_type == 0x04)) ||
++		    (op == OP_LE_SCAN_RSP && l[0] != 0 && s.adv_type != 0x00 && s.adv_type != 0x02))) {
++			/* review F4: legacy takes and ignores data the PDU type cannot carry; 0x2037/0x2038 answer 0x12 */
++			if (s.n_xlat < 64) {
++				SAY("lext: %#06x for legacy type %u: the PDU carries no such data; local status 0\n", op,
++				    s.adv_type);
++			}
++			answer(op, 0);
++			return NEGRONI_BT_SHIM_DONE;
++		} else {
++			uint8_t dl = MIN(l[0], (uint8_t)31);
++			dl = (uint8_t)MIN((uint32_t)dl, (uint32_t)plen - 1u);
++			uint8_t p[4 + 31];
++			p[0] = 0x00;                    /* set 0 */
++			p[1] = 0x03;                    /* complete data */
++			p[2] = 0x01;                    /* no fragmentation preference */
++			p[3] = dl;
++			memcpy(p + 4, l + 1, dl);
++			uint8_t k = 0;
++			if (!s.adv_set) {
++				s.ch.len[k++] = mk_ext_adv_param(s.ch.cmd[0], NULL);
++				s.ch.want_type = 0x00;
++			}
++			s.ch.len[k] = mkcmd(s.ch.cmd[k], op == OP_LE_ADV_DATA ? OP_LE_EXT_ADV_DATA : OP_LE_EXT_SCAN_RSP, p,
++			    (uint8_t)(4u + dl));
++			s.ch.n = (uint8_t)(k + 1u);
++			return chain_start(op, 0x03);
++		}
++	case OP_LE_ADV_ENABLE:
++		if (plen < 1) {
++			break;
++		} else {
++			if (!s.adv_set && l[0] == 0) {
++				answer(op, 0);          /* nothing advertises: a legacy disable succeeds */
++				return NEGRONI_BT_SHIM_DONE;
++			}
++			/* review F3: high duty directed needs a duration (1.28 s = 0x0080 x 10 ms), as the legacy timeout */
++			bool hd = s.adv_set && s.adv_type == 0x01 && l[0] != 0;
++			const uint8_t p[6] = { l[0] ? 0x01 : 0x00, 0x01, 0x00, hd ? 0x80 : 0x00, 0x00, 0x00 };
++			uint8_t k = 0;
++			if (!s.adv_set) {
++				s.ch.len[k++] = mk_ext_adv_param(s.ch.cmd[0], NULL);
++				s.ch.want_type = 0x00;
++			}
++			s.ch.len[k] = mkcmd(s.ch.cmd[k], OP_LE_EXT_ADV_EN, p, sizeof(p));
++			s.ch.n = (uint8_t)(k + 1u);
++			return chain_start(op, 0x03);
++		}
++	case OP_LE_RAND_ADDR:
++		if (plen < 6) {
++			break;
++		}
++		memcpy(s.rnd, l, 6);
++		s.rnd_known = true;
++		if (!s.adv_set) {
++			return NEGRONI_BT_SHIM_PASS;
++		} else {
++			const uint8_t p[7] = { 0x00, l[0], l[1], l[2], l[3], l[4], l[5] };
++			s.ch.len[0] = mkcmd(s.ch.cmd[0], OP_LE_RAND_ADDR, l, 6);
++			s.ch.len[1] = mkcmd(s.ch.cmd[1], OP_LE_SET_RAND, p, sizeof(p));
++			s.ch.n = 2;
++			return chain_start(op, 0x01);
++		}
++	default:
++		break;
++	}
++	return NEGRONI_BT_SHIM_PASS;
++}
++
++/* LE Extended Advertising Report -> LE Advertising Report(s); always NEGRONI_BT_SHIM_DROP for the original */
++static int
++lext_report(const uint8_t *pkt, uint32_t len)
++{
++	uint32_t end = MIN(len, 3u + pkt[2]);
++	uint32_t at = 5;                        /* 04 3e plen 0d num */
++	uint8_t num = len > 4 ? pkt[4] : 0;
++	for (uint8_t r = 0; r < num && at + 24u <= end; r++) {
++		const uint8_t *e = pkt + at;
++		uint16_t et = le16(e);
++		uint8_t dl = e[23];
++		if (at + 24u + dl > end) {
++			break;
++		}
++		at += 24u + dl;
++		s.n_rep_in++;
++		if ((et & 0x10u) == 0 || dl > 31 || e[2] == 0xff) {
++			s.n_rep_drop++;         /* extended PDU (a legacy scan does not see it) or anonymous */
++			continue;
++		}
++		uint8_t lt;
++		if (et & 0x08u) {
++			lt = 0x04;              /* SCAN_RSP */
++		} else if (et & 0x04u) {
++			lt = 0x01;              /* ADV_DIRECT_IND */
++		} else if ((et & 0x03u) == 0x03u) {
++			lt = 0x00;              /* ADV_IND */
++		} else if (et & 0x02u) {
++			lt = 0x02;              /* ADV_SCAN_IND */
++		} else {
++			lt = 0x03;              /* ADV_NONCONN_IND */
++		}
++		uint8_t ev[3 + 12 + 31];        /* plen = sub, num, type, addr type, addr(6), len, data, RSSI = 12 + dl */
++		ev[0] = H4_EVT;
++		ev[1] = EV_LE_META;
++		ev[2] = (uint8_t)(12u + dl);
++		ev[3] = 0x02;
++		ev[4] = 1;
++		ev[5] = lt;
++		ev[6] = e[2];
++		memcpy(ev + 7, e + 3, 6);
++		ev[13] = dl;
++		memcpy(ev + 14, e + 24, dl);
++		ev[14 + dl] = e[13];            /* RSSI */
++		s.n_rep_out++;
++		negroni_bt_h4_inject(ev, 14u + dl + 1u);
++	}
++	if (s.n_rep_in > 0 && s.n_rep_in != s.n_rep_logged && (s.n_rep_logged == 0 || s.n_rep_in - s.n_rep_logged >= 1024u)) {
++		s.n_rep_logged = s.n_rep_in;
++		SAY("lext: extended advertising reports %u in, %u legacy reports out, %u dropped (extended PDU)\n",
++		    s.n_rep_in, s.n_rep_out, s.n_rep_drop);
++	}
++	return NEGRONI_BT_SHIM_DROP;
++}
++
++/* controller -> host in translation mode; NEGRONI_BT_SHIM_PASS = go on with the normal rx checks */
++static int
++lext_rx(uint8_t *pkt, uint32_t len)
++{
++	if (pkt[1] == EV_LE_META && len >= 4) {
++		if (pkt[3] == 0x0d) {
++			return lext_report(pkt, len);
++		}
++		if (pkt[3] == 0x12 || pkt[3] == 0x11) {
++			if (s.n_ev_drop++ < 8) {
++				SAY("lext: LE Meta sub %#x (%s) not delivered (bluetoothd runs legacy advertising/scanning)\n",
++				    pkt[3], pkt[3] == 0x12 ? "Advertising Set Terminated" : "Scan Timeout");
++			}
++			return NEGRONI_BT_SHIM_DROP;
++		}
++		return NEGRONI_BT_SHIM_PASS;
++	}
++	bool cc = pkt[1] == EV_CMD_COMPLETE && pkt[2] >= 4 && len >= 7;
++	bool cs = pkt[1] == EV_CMD_STATUS && pkt[2] >= 4 && len >= 7;
++	if (!cc && !cs) {
++		return NEGRONI_BT_SHIM_PASS;
++	}
++	uint8_t *opp = cc ? pkt + 4 : pkt + 5;
++	uint16_t op = le16(opp);
++	uint8_t st = cc ? pkt[6] : pkt[3];
++	if (chain_rx(op, st)) {
++		return NEGRONI_BT_SHIM_DROP;
++	}
++	uint16_t to = 0;
++	if (op == OP_LE_EXT_SCAN_PARAM && s.pend_scan_p) {
++		s.pend_scan_p--;
++		to = OP_LE_SCAN_PARAM;
++	} else if (op == OP_LE_EXT_SCAN_EN && s.pend_scan_e) {
++		s.pend_scan_e--;
++		to = OP_LE_SCAN_ENABLE;
++	} else if (op == OP_LE_EXT_CONN && s.pend_conn) {
++		s.pend_conn--;
++		to = OP_LE_CREATE_CONN;
++	}
++	if (to) {
++		opp[0] = (uint8_t)to;
++		opp[1] = (uint8_t)(to >> 8);
++		if (st != 0 || s.n_xlat < 16) {
++			SAY("lext: %#06x answer (status %#x) delivered as legacy %#06x\n", op, st, to);
++		}
++	}
++	return NEGRONI_BT_SHIM_PASS;
++}
++
+ int
+ negroni_bt_shim_tx(uint8_t *pkt, uint32_t len)
+ {
+@@ -198,6 +647,14 @@ negroni_bt_shim_tx(uint8_t *pkt, uint32_t len)
+ 		return NEGRONI_BT_SHIM_PASS;
+ 	}
+ 	uint16_t op = le16(pkt + 1);
++	if (s.lext && (op >> 10) == 0x08u) {
++		int r = lext_tx(pkt, len);
++		if (r != NEGRONI_BT_SHIM_PASS) {
++			return r;
++		}
++	} else if (s.lext && op == OP_RESET) {
++		(void)lext_tx(pkt, len);
++	}
+ 	if (s.fix && op == OP_WRITE_LE_HOST && len >= 6 && pkt[3] >= 2 && pkt[5] != 0) {
+ 		if (!s.lehost_logged) {
+ 			s.lehost_logged = true;
+@@ -261,6 +718,9 @@ negroni_bt_shim_rx(uint8_t *pkt, uint32_t len)
+ 		}
+ 		return NEGRONI_BT_SHIM_DROP;
+ 	}
++	if (s.lext && lext_rx(pkt, len) == NEGRONI_BT_SHIM_DROP) {
++		return NEGRONI_BT_SHIM_DROP;
++	}
+ 	/* 0336: the supported-commands mask (04 0e 44 01 02 10 00 <64 bytes>): log it, add the Erroneous Data bits */
+ 	if (pkt[1] == EV_CMD_COMPLETE && pkt[2] >= 68 && len >= 71 && le16(pkt + 4) == OP_READ_SUPPORTED_COMMANDS &&
+ 	    pkt[6] == 0) {

@@ -346,3 +346,158 @@ Expected lines for an on/off/on test (negronibt=4, kernel with 0334 + 0335):
 | switch off | [I] `h4 control unit N disconnected; power off follows ...`, then `power off: BT_EN low`, `h4 power off #1` | `Beginning asynchronous power shutdown`, `Powering off chipset`, negroni-bluetool `RunBuiltinScript "deepsleep"`, `Write default power state : 0` |
 | switch on | `h4 control ... connected ...; chip off: powering on`, `h4 power on #1: a client is back`, `power on: line to 115200 ...`, the HCI stage lines 9-20, `power on: chip ready after N ms`, `h4 power on #1: transport ready again` | `Booting chipset`, `Powering on chipset`, `Starting bluetooth core stack` |
 | dead chip | `h4 transport not usable: ... (commands get a local status 0x03 answer)`, `h4 dead chip: cmd 0x0c03 answered locally with status 0x03` | [I] a stack init error (`Stack_Init failed`) and the switch back to off, not a hang |
+
+### 0335 review fixes (Opus review 2026-10-27: REJECT, then fixed; the patch file is regenerated)
+
+- A1: the dead-chip answers sat in the queue, because only the RX thread moves the queue to the control socket. Now `negroni_bt_h4_fail` also starts the RX thread in dead mode. This thread does not read the UART while the chip is failed, off or powering on.
+- A2: power-on now runs only when `client && off && !failed && !powering`. A successful power-on clears `failed`. After a failed power-on the chip stays off and failed. The next connect clears `failed` and tries one more time.
+- A3: after each chip off/on, the RX thread drops a partial frame (`rx_reset`).
+- A4: in dead mode, the commands that get Command Status answer with `04 0f 04 03 01 <op>`. The list is in the patch header.
+
+## 0336-negroni-bt-init-fixes.patch (2026-10-27)
+
+Phone result [V logs/usblog-t2.txt, logs/phone-log-20261027-025222.txt, kernel with 0334/0335]:
+- Stage A and the HCI stage pass.
+- bluetoothd init sends these commands: `0c03 1001 1002 1009 1003 1004 2003 0c01 0c63 2001 0c56 0c6d 2060 202f 2031 2024 201c 200f 1005 204a 2074 0c33 0c31`. Only 0x0c6d gets an error: status 0x11, on every attempt.
+- After 0x0c31, bluetoothd logs `OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)` without a send. Its stack checks the Read_Local_Supported_Commands mask. The result is "HCI initialization failed", then a restart with reason 108 every ~10 s.
+
+Answered in the shim (`negronibt_shimfix=0` turns this off):
+
+| Opcode | Answer | When |
+|---|---|---|
+| 0x0c6d Write_LE_Host_Support | CC status 0 | always (the chip says 0x11) |
+| 0x0c5b Write_Default_Erroneous_Data_Reporting | CC status 0 | when the chip's mask lacks octet 18 bit 3 |
+| 0x0c5a Read_Default_Erroneous_Data_Reporting | CC status 0, value 0x00 | when the chip's mask lacks octet 18 bit 2 |
+| 0x1002 answer (rewrite) | octet 18 bits 2+3 set | when they are missing |
+
+New log lines:
+- `shim supported commands octets 0-31: ...` and `32-63: ...`: the chip's whole mask.
+- `shim supported commands: octet 18 0x.. -> 0x..`
+- `shim init fix: 0x0c6d ...` and `shim init fix: 0x0c5b ...`
+- `shim controller rejected 0xXXXX: Command Complete|Command Status status 0xNN`: any other chip error.
+
+Expected next [I]: after 0x0c31, bluetoothd sends `0x0c5b`, the shim answers it, and init goes on. If bluetoothd then stops at another `OI_HCICMD_<name> (status=628)`, that command is missing from the mask. Map the command name to its octet and bit (Core spec Vol 4 Part E 6.27) and look it up in the logged mask.
+
+### 0336 review notes (Opus review 2026-10-27: ACCEPT with fixes; the fixes are in 0337)
+
+- [V] bluetoothd logs the chip's mask itself (logs/phone-log-20261027-025222.txt line 1643, `command supported mask is: FF FF FF 03 CE ...`). Octet 18 = 0x83, so bits 2 and 3 are clear. Octet 24 = 0x61, so bit 6 is set: the chip lists 0x0c6d.
+- [V] Cause of the 0x0c6d error: bluetoothd sends `01 6d 0c 02 01 01`. Simultaneous_LE_Host = 0x01 is not allowed since Core 4.1, so the chip answers 0x11.
+- `negronibt_shimfix` has no effect with `negronibt_shim=0`, because then every packet passes unchanged.
+- `negronibt_dead=2` refuses each client and never retries the chip.
+
+## 0337-negroni-bt-vendor-answers.patch (2026-10-27)
+
+Phone [V] at 03:17 (logs/phone-log-20261027-031731.txt, bluetoothd[303]; kernel h4 log):
+- With 0336, init goes past the old failure.
+- Then bluetoothd sends these Apple VSCs: `fd3c`, `fce9` (01 27 10 10 00), `fce2` (0b ..), `fce2`, `fd48`, `2007`, `fce9`, `fd47`, `fce2` (15 00 00 00 ff 0f 02 ..).
+- The shim answers each vendor command locally: none went to the chip. Before 0337 the answer was status 0x01 with no data.
+- bluetoothd logs `... completed with status 701` (not fatal) and `Invalid data size 0`. 15 s later it logs `BD_VSC_OLYMPIC_ANTENNA_PREF_B timedout waiting for controller`, then a restart with reason 3602.
+
+Cause [V disassembly of 20H392 bluetoothd]:
+- `_BCM_ByteStreamEventParser` (0x100126134, `bcm_vsc.c`) calls the command's callback only when at least 2 bytes follow the status. With fewer bytes it logs `Invalid data size %d` and returns, so the command never completes.
+- `_BCM_SubOpcodeChecker` (0x100126390) matches a 0xfce9 answer by return byte 0 = the sub-opcode.
+- [I] 0xfce2 is a multiplex opcode as well: byte 0 = sub-opcode, 0x0b = CHANGE_LE_SETTINGS, 0x15 = ANTENNA_PREF_B.
+
+Local answers now:
+
+| Opcode | Answer |
+|---|---|
+| every OGF 0x3f command | Command Complete, status + `negronibt_vscdata` bytes (default 8): byte 0 = the first parameter byte, then zeros |
+| 0xfd3c, 0xfce9, 0xfce2, 0xfd48, 0xfd47 | status 0. Names [I] from the error order: supported-VSC query, LE_META_ENA_FEATURES, OLYMPIC (CHANGE_LE_SETTINGS / ANTENNA_PREF_B), SET_MIN_AFH_LE_CHANNELS, ENABLE_EXTENDED_DUPLICATE_FILTER |
+| other vendor opcodes | the 0333 table status (unknown: 0x01), now with data |
+| 0x2007 (chip answers 0x0c) | rewritten to status 0, TX power 0 dBm |
+| 0x0c6d | goes to the chip with Simultaneous_LE_Host = 0x00. A remaining chip error is rewritten to 0 |
+| 0x0c5a / 0x0c5b | local answers only after the 0x1002 mask was seen |
+
+Also in 0337: the dead-chip Command Status list is fixed (review F2: without 0x0408; 0x205e instead of 0x205d; adds 0x042a, 0x0810, 0x2044, 0x2064, 0x2068, 0x206b, 0x206d).
+
+Expected next lines:
+- `shim init fix: 0x0c6d ... -> 0x00, sent to the chip`, then `h4 rx ... op 0x0c6d status 0`.
+- `shim intercepted 0xfce2 ... status 0 + 8 data bytes`.
+- `shim init fix: 0x2007 ... -> status 0, 0 dBm`.
+- No `timedout waiting for controller`.
+
+If bluetoothd logs `Invalid data size N` with N > 0, raise `negronibt_vscdata`. If a callback rejects zero data, the next step is to find that VSC's real return layout.
+
+### 0337 review (2026-10-27, kernel agent)
+
+- [V] 0337 works on the phone: in the 04:06 boot (logs/usblog-20261026-233816.txt, kernel local-20261026-222425) bluetoothd passed every Apple VSC. No `timedout waiting for controller`.
+- [V disassembly] `_BCM_ByteStreamEventParser` calls the callback when at least 2 bytes follow the status, also when the status is not 0. So a status 0x01 answer with data is safe too.
+- [V] `_BCM_SubOpcodeChecker` checks only 0xfce9. With no data it returns true. With data, byte 0 must equal the sub-opcode. The echo of parameter byte 0 does this.
+- Name fixes (table text only): 0xfce2 is a multiplex opcode. Sub-opcodes seen: 0x0b, 0x1c, 0x15, 0x26, 0x1e, 0x36. [I] From the error order: 0x1c = SET_MIN_AFH_LE_CHANNELS. 0xfd48 carries `01` + a 6-byte address, the same address as the next 0x2005. [I] It is an address command, not SET_MIN_AFH_LE_CHANNELS.
+- Risk [I]: a status-0 answer with zero data can make bluetoothd think a feature is on in the controller (for example LE_META adv matching rules). The chip does not do that work, so a feature can fail with no error. 0xfd3c gets byte 0 = 0xff (the echo). bluetoothd's VSC list ("BCM_4357 supports the following VSCs") comes from its own chipset table, not from this answer.
+
+## 0338-negroni-bt-le-legacy-to-extended.patch (2026-10-27)
+
+Phone [V] at 04:06 (logs/usblog-20261026-233816.txt):
+- `h4 tx cmd 0x200b plen 7: 01 0b 20 07 00 e0 01 30 00 01 00` (LE_Set_Scan_Parameters, passive, own address random).
+- `Command Complete op 0x200b status 0xc` (Command Disallowed), then `exit bluetoothd ... status 1`. launchd starts bluetoothd again about every 10 s. 0335 powers the chip off and on each time.
+- 0x2007 (also a legacy LE command) gets 0x0c at init.
+- Before these commands, the host sent no extended LE command. The kernel HCI stage sends no LE command.
+- [I strong] The firmware (BTFW.HSP.2.1.0-00394) accepts only the extended LE command set. Linux uses only extended commands on this chip, so Linux never sees this.
+
+Settings cannot turn Bluetooth off [I]: bluetoothd dies about 1 s after each start. A switch request has no running daemon to act on, and the next start reads the old default power state.
+The power-off path itself [V disassembly of 20H392 bluetoothd]:
+1. `Beginning asynchronous power shutdown`.
+2. StackManager halts the core stack.
+3. `applebt_transport_terminate` calls `applebt_hci_close`. The control socket closes, and 0335 drives BT_EN low 3 s later.
+4. `Powering off chipset`: BlueTool gets the `deepsleep` script. negroni-bluetool answers 0.
+
+No IOKit power property is in this path. So no new kernel power code is necessary. 0335 already follows the transport close.
+
+Translation (`negronibt_lext=1` default; `negronibt_lext=0` = the old pass-through):
+
+| Legacy (from bluetoothd) | Sent to the chip | Answer to bluetoothd |
+|---|---|---|
+| 0x200b Set_Scan_Parameters | 0x2041 (1M PHY) | the chip's Command Complete, op set to 0x200b |
+| 0x200c Set_Scan_Enable | 0x2042 (duration 0, period 0) | the chip's Command Complete, op set to 0x200c |
+| 0x200d Create_Connection | 0x2043 (1M PHY) | the chip's Command Status, op set to 0x200d |
+| 0x2006 Set_Advertising_Parameters | 0x2036 set 0 (legacy PDU properties) + 0x2035 when own address is random | one Command Complete (status of 0x2036) |
+| 0x2008 / 0x2009 | 0x2037 / 0x2038 set 0, complete data (+ 0x2036 defaults first if no set yet) | one Command Complete |
+| 0x200a Set_Advertising_Enable | 0x2039 set 0 (+ 0x2036 defaults first if no set yet; disable with no set: local status 0) | one Command Complete |
+| 0x2005 Set_Random_Address | 0x2005, then 0x2035 set 0 when the set exists (0x2035 errors only logged) | one Command Complete (status of 0x2005) |
+| 0x2001 LE event mask | bit 12 (Extended Advertising Report) set | unchanged |
+| event 0x3e sub 0x0d Extended Advertising Report | - | one sub 0x02 LE Advertising Report per legacy-PDU report; extended PDUs dropped |
+| event 0x3e sub 0x12 / 0x11 | - | dropped (Advertising Set Terminated, Scan Timeout) |
+
+The advertising commands run as a chain: one command at a time. The RX thread sends the next command after the chip's answer. A new advertising command while a chain runs gets a local 0x0c (logged). 0x0c03 HCI_Reset and a new client clear the state.
+
+New log lines (`NEGRONI BT: shim ...` and `h4 tx(shim) ...`):
+- `0338 legacy LE -> extended LE translation on (negronibt_lext)` at boot.
+- `h4 tx(shim) cmd 0x2041 plen 8: ...`, then `h4 rx evt 0x0e ... op 0x2041 status 0`, then `lext: 0x2041 answer (status 0) delivered as legacy 0x200b`.
+- `lext: legacy 0x2006 answered with status 0 after 2 extended command(s)`.
+- `lext: extended advertising reports 1 in, 1 legacy reports out, 0 dropped (extended PDU)` (first report, then about every 1024th).
+- An error: `lext: ... status 0x..`.
+
+Test on the phone (main session builds the image): boot-args `negronibt=4 negronipanic=30 negronipanicreason=2` (+ `negronibt_h4log=600` for more lines).
+1. Kernel: `lext: 0x2041 answer (status 0) delivered as legacy 0x200b`. No `controller rejected 0x200b`. No `exit bluetoothd` after the init.
+2. Unified log (`scripts/bt/phone-bt.sh log`): `Stack: STACK_BUSY -> STACK_READY` and no `Bluetooth error - restarting`.
+3. Settings > Bluetooth: the switch is on. Nearby devices appear (the report line above counts them).
+4. Turn the switch off. Expected: unified log `Beginning asynchronous power shutdown`, `Powering off chipset`; kernel `h4 control unit 1 disconnected`, 3 s later `power off: BT_EN low`. The switch stays off, also after `killall bluetoothd`.
+5. Turn the switch on: kernel `chip off: powering on`, `power on: chip ready after N ms`, the init again.
+If the switch still does not go off, but bluetoothd runs (no `exit bluetoothd`), collect the unified log of the switch action: the next step is in bluetoothd, not the transport.
+If a translated command fails, `negronibt_lext=0` gives the old behavior for a comparison.
+
+### 0338 review fixes (Opus review 2026-10-27: ACCEPT with fixes; the patch file is regenerated)
+
+- F1 (blocker): the legacy LE Advertising Report had plen 11 + data. The correct value is 12 + data. The old value broke the H4 stream to bluetoothd at the first scan result, and it wrote 1 byte past a stack buffer at 31 data bytes.
+- F2: set 0 counts as present only after 0x2036 status 0.
+- F3: enable of a high-duty directed set sends duration 0x0080 (1.28 s, the legacy timeout). [I] The chip then sends LE Connection Complete 0x3C as with legacy advertising.
+- F4: 0x2008 on a directed set and non-empty 0x2009 on a non-scannable set get a local status 0. Legacy ignores that data, but 0x2037/0x2038 answer 0x12.
+- F5: the RX thread does not send to a sleeping controller (after IBS SLEEP_IND). The power worker sends that command after `ibs_wake` (WAKE_ACK). Log: `tx(shim): controller said SLEEP_IND; 0x.... goes out from the power worker after WAKE_ACK`.
+- F6: if a chain step gets no answer for 2 s, the next advertising command drops the chain (`lext: chain of legacy 0x.... had no answer ...`).
+- F7 (check on the phone): ext reports need bit 12 of the LE event mask. [V 04:06 log] bluetoothd sends 0x2001 with byte 1 = 0xfa, so bit 12 is already set. The shim sets it if it is missing.
+- F8: the shim state has no lock. It relies on one command credit (comment in the code).
+- Known differences [I]: a failed 0x2035 shows up at the 0x2039 enable (0x12), not at 0x2006. A directed report with an unresolved RPA comes as a type 0x01 report, not as sub 0x0b.
+
+Host test (macOS/Linux, seconds): `scripts/kernel/test-bt-shim.sh TREE` (TREE from `scripts/kernel/patched-tree.sh OUTDIR 0339`). It compiles the tree's `negroni_bt_shim.c` with stubs and ASan/UBSan and checks the bytes of every translation, the chains, the report conversion and the 0337 vendor answers. [V] 2026-10-27: `bt shim test: all ok`.
+
+### 0338 re-review (Opus, 2026-10-27): ACCEPT; open small items
+1. Late extended answers (0x2035-0x2039, 0x2041-0x2043) after HCI_Reset / a new client / a stale drop reach
+   bluetoothd unmapped. Fix later: drop + log them in `lext_rx` when no chain step or counter matches.
+2. 0x2036 can answer 0x12 where legacy 0x2006 succeeds (directed type after data was set). Watch
+   `lext: legacy 0x2006 answered with status 0x12`; fix: 0x2037 length 0 first, or 0x203c then defaults.
+3. 0x2005 while advertising: the set keeps the old address (0x2035 fails 0x0c, only logged). Optional: answer 0x2005
+   locally with 0x0c while advertising is on.
+4. A deferred (F5) command counts twice in n_tx/b_tx.
+Regression ideas for tools/bt-shim-test: 31-byte report (F1), multi-report events, malformed events.
