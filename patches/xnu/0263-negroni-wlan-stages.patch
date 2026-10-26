@@ -1,0 +1,773 @@
+0263-negroni-wlan-stages: Wi-Fi driver levels (boot-arg negroniwlan=N), step lines, DMA-path check.
+Level 2 = steps 1-8 (BAR0, firmware, pool, DMA path, PBL, BHI SBL), 3 = steps 9-12 (MHI READY, MMIO,
+M0, EE SBL), 4 = steps 13-15 (BHIe, EE AMSS, IPCR channels). "NEGRONI WLAN: step N NAME" before each
+step, "... failed: REASON" on an error, badge WLAN N / OK / STOP, BHI heartbeat each second, MHI window
+0..36-bit (cnss2 pci.c:5509), M1 -> device-wake toggle (pm.c:334-363), RDDM stop. Step 6 reports the GCC
+NoC/TBU branches (CLK_OFF is not trusted: BRANCH_HALT_SKIP + hwcg) and stops only on a clear vote bit
+(0x62000 bit 12/19); it reads the apps SMMU (stream 0x1c01) and skips the scan when EXIDS is set.
+negroniwlan_smmu=1 default (stop on a sure fault), 0 report only, 2 writes a bypass SMR/S2CR (owner
+approval needed). Review fixes 2026-10-26 applied. Details: patches/xnu/README-wifi.md "0263".
+
+diff --git a/bsd/dev/negroni_wifi.c b/bsd/dev/negroni_wifi.c
+index 1bdcbde..5a19c40 100644
+--- a/bsd/dev/negroni_wifi.c
++++ b/bsd/dev/negroni_wifi.c
+@@ -22,8 +22,10 @@
+  *  10  reads   bus 1 command/status, BAR0 type and the PCI capability list (MSI / MSI-X present?);
+  *              no config-space writes. negroniwlan=1 runs 1..10 (same as negroniwifi=10)
+  *
+- * negroniwlan=2: steps 1..10, then, if step 10 passed, stage 1 of the driver on its own thread
+- * (bsd/dev/negroni_wlan.c, patch 0261: BAR0, MHI, BHI/BHIe firmware download, polling).
++ * negroniwlan=N (N >= 2): steps 1..10, then, if step 10 passed, the driver on its own thread
++ * (bsd/dev/negroni_wlan.c, patches 0261 + 0263+). N is the driver level: 2 = BHI SBL download,
++ * 3 = MHI READY/M0/EE SBL, 4 = BHIe + mission mode + IPCR channels, higher = QRTR/QMI (see
++ * negroni_wlan_mhi.h WLAN_LEVEL_*).
+  *
+  * 0262: step 6 also muxes CLKREQ# (GPIO95), waits 100 ms if BT_EN is low and pulses XO_CLK (GPIO204)
+  * around WLAN_EN (cnss2); step 7 programs the DBI/iATU decode consistently (negroniwifi_dbi=0 vendor
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index cad2cb1..17ae758 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -26,6 +26,7 @@
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>
+ #include <libkern/crypto/sha2.h>
++#include <stdarg.h>
+ #include "negroni_wlan.h"
+ #include "negroni_wlan_mhi.h"
+ 
+@@ -35,6 +36,9 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern kern_return_t thread_terminate(thread_t);
++extern int vsnprintf(char *, size_t, const char *, va_list);
++extern char negroni_wifi_badge[24];             /* negroni_wifi.c, drawn by NegroniFramebuffer */
++extern uint32_t negroni_wifi_badge_color;
+ 
+ /*
+  * VM_WIMG_WCOMB (osfmk/arm/memory_types.h, not exported to bsd/): Normal non-cacheable. Used for
+@@ -109,6 +113,61 @@ static uint64_t g_pool_pa;
+ static struct mhi_host H;
+ static uint32_t g_timeout_ms = 10000;   /* cnss2 MHI time-out 10 s (ath11k 20 s) */
+ static uint32_t g_m3_size;              /* m3.bin bytes, at g_pool_pa + OFF_M3 (for stage 2) */
++static uint32_t g_level = WLAN_LEVEL_SBL;       /* boot-arg negroniwlan */
++static uint32_t g_smmu_policy = 1;      /* negroniwlan_smmu: 0 report only, 1 stop on a sure fault, 2 add a bypass entry */
++static struct negroni_wlan_pcie P;      /* the survey's handles */
++static uint32_t g_fw_size;
++static const char *g_fw;
++static bool g_master;                   /* bus master was turned on (BAR0 claimed) */
++
++/* ---- step lines (0263): "step N NAME" before, "step N NAME failed: REASON" on an error ---- */
++static uint32_t g_step;
++static const char *g_step_name = "start";
++static bool g_why_set;
++
++void
++negroni_wlan_step(uint32_t n, const char *name)
++{
++	g_step = n;
++	g_step_name = name;
++	g_why_set = false;
++	snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WLAN %u", n);
++	negroni_wifi_badge_color = 0x00d0a000;
++	printf("NEGRONI WLAN: step %u %s\n", n, name);
++}
++
++int
++negroni_wlan_failed(int error, const char *fmt, ...)
++{
++	char why[192];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(why, sizeof(why), fmt, ap);
++	va_end(ap);
++	if (!g_why_set) {       /* the first (innermost) reason of a step wins */
++		printf("NEGRONI WLAN: step %u %s failed: %s\n", g_step, g_step_name, why);
++		g_why_set = true;
++	}
++	return error;
++}
++
++static const char *
++errno_text(int e)
++{
++	switch (e) {
++	case ETIMEDOUT: return "time-out";
++	case EIO: return "I/O error (SYSERR, chip error or link down)";
++	case ENXIO: return "no device answer";
++	case ENOMEM: return "no memory";
++	case ERANGE: return "value out of range";
++	case ENOENT: return "file not found";
++	case EBADMSG: return "bad data (checksum or message format)";
++	case EINVAL: return "invalid answer";
++	case EPERM: return "refused by a safety check";
++	default: return "error";
++	}
++}
+ 
+ /* ---- shared register and timing helpers (negroni_wlan_mhi.h prototypes) ---- */
+ /* An offset outside the mapped BAR0 (a bad BHIOFF/CHDBOFF from the chip) never reaches the bus. */
+@@ -358,95 +417,227 @@ wlan_cleanup(void)
+ 	}
+ }
+ 
++/*
++ * Step 6 (0263, read only unless negroniwlan_smmu=2): can the chip's DMA reach RAM?
++ * PCIe0 DMA uses apps-SMMU stream 0x1c01 (out/live.dts iommu-map) through the PCIe TBU
++ * (clock gcc_ddrss_pcie_sf_tbu_clk) and the aggre NoC (gcc_aggre_noc_pcie_0_axi_clk). A stream
++ * the SMMU faults, or a gated TBU/NoC clock, can hang or fault the first BHI read [I]; the phone
++ * restarted during the first BHI SBL download (notes section 16, 2026-10-26).
++ */
++#define APPS_SMMU_PHYS          0x15000000u
++#define SMMU_SCR0               0x000
++#define SMMU_SCR0_CLIENTPD      (1u << 0)
++#define SMMU_SCR0_USFCFG        (1u << 10)
++#define SMMU_SCR0_EXIDENABLE    (1u << 3)
++#define SMMU_IDR0               0x020
++#define SMMU_IDR1               0x024
++#define SMMU_SGFSR              0x048
++#define SMMU_SMR(n)             (0x800u + 4u * (n))
++#define SMMU_S2CR(n)            (0xc00u + 4u * (n))
++#define SMMU_SMR_VALID          (1u << 31)
++#define PCIE0_SID               0x1c01u
++#define GCC_AGGRE_NOC_PCIE_0    0x7b08cu        /* gcc-sm8450.c gcc_aggre_noc_pcie_0_axi_clk halt reg */
++#define GCC_DDRSS_PCIE_SF_TBU   0x9d094u        /* gcc_ddrss_pcie_sf_tbu_clk halt reg */
++#define GCC_CLK_OFF             (1u << 31)
++#define GCC_VOTE_0              0x62000u        /* APCS clock branch enable vote */
++#define GCC_VOTE_NOC            (1u << 12)      /* gcc_aggre_noc_pcie_0_axi_clk */
++#define GCC_VOTE_TBU            (1u << 19)      /* gcc_ddrss_pcie_sf_tbu_clk */
++
+ static int
+-wlan_run(void)
++wlan_dma_path(void)
++{
++	uint32_t noc = MHI_ALL_ONES, tbu = MHI_ALL_ONES, vote = MHI_ALL_ONES;
++
++	if (P.gcc) {
++		noc = *(volatile uint32_t *)(P.gcc + GCC_AGGRE_NOC_PCIE_0);
++		tbu = *(volatile uint32_t *)(P.gcc + GCC_DDRSS_PCIE_SF_TBU);
++		vote = *(volatile uint32_t *)(P.gcc + GCC_VOTE_0);
++	}
++	/*
++	 * Both branches are BRANCH_HALT_SKIP with hardware clock gating (gcc-waipio.c:1756, :1971): CLK_OFF
++	 * (bit 31) reads 1 while the branch is idle, so it is only a report. The proof is the vote bit
++	 * in GCC 0x62000 (bit 12 NoC, bit 19 TBU; gcc-waipio.c:1761, :1976), set by survey step 5.
++	 */
++	printf("NEGRONI WLAN: GCC AGGRE_NOC_PCIE_0_AXI %#x (CLK_OFF %u), DDRSS_PCIE_SF_TBU %#x (CLK_OFF %u), vote %#x = %#x\n",
++	    noc, (noc & GCC_CLK_OFF) ? 1 : 0, tbu, (tbu & GCC_CLK_OFF) ? 1 : 0, GCC_VOTE_0, vote);
++	if (g_smmu_policy != 0 && P.gcc && (vote & (GCC_VOTE_NOC | GCC_VOTE_TBU)) != (GCC_VOTE_NOC | GCC_VOTE_TBU)) {
++		return negroni_wlan_failed(EPERM, "GCC vote %#x lacks the PCIe NoC (bit 12) or TBU (bit 19) clock: chip DMA would hang",
++		           vote);
++	}
++
++	vm_offset_t smmu = ml_io_map_unmappable(APPS_SMMU_PHYS, PAGE_SIZE, WLAN_WIMG_IO);
++	if (!smmu) {
++		printf("NEGRONI WLAN: apps SMMU map failed; DMA path not checked\n");
++		return 0;
++	}
++#define SRD(o) (*(volatile uint32_t *)(smmu + (o)))
++	uint32_t scr0 = SRD(SMMU_SCR0), idr0 = SRD(SMMU_IDR0), idr1 = SRD(SMMU_IDR1), gfsr = SRD(SMMU_SGFSR);
++	uint32_t nsmr = MIN(idr0 & 0xffu, 128u), hit = ~0u, free_smr = ~0u, s2cr = 0;
++	int error = 0;
++
++	printf("NEGRONI WLAN: apps SMMU sCR0 %#x (CLIENTPD %u, USFCFG %u, EXIDS %u), IDR0 %#x (%u SMRs), IDR1 %#x, sGFSR %#x\n",
++	    scr0, scr0 & SMMU_SCR0_CLIENTPD ? 1 : 0, scr0 & SMMU_SCR0_USFCFG ? 1 : 0,
++	    scr0 & SMMU_SCR0_EXIDENABLE ? 1 : 0, idr0, nsmr, idr1, gfsr);
++	if (scr0 == MHI_ALL_ONES || idr0 == MHI_ALL_ONES || nsmr == 0) {
++		printf("NEGRONI WLAN: apps SMMU global space does not answer; DMA path not checked\n");
++		goto out;
++	}
++	if (scr0 & SMMU_SCR0_EXIDENABLE) {
++		/* extended stream IDs: VALID moves to S2CR bit 10 and the SMR holds 16-bit IDs; no scan, no write */
++		printf("NEGRONI WLAN: apps SMMU EXIDS set; SMR format not handled, DMA path not checked\n");
++		goto out;
++	}
++	for (uint32_t i = 0; i < nsmr; i++) {
++		uint32_t smr = SRD(SMMU_SMR(i));
++		uint32_t id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
++
++		if (!(smr & SMMU_SMR_VALID)) {
++			if (free_smr == ~0u) {
++				free_smr = i;
++			}
++			continue;
++		}
++		if (((id ^ PCIE0_SID) & ~mask & 0x7fffu) == 0 && hit == ~0u) {
++			hit = i;
++		}
++	}
++	if (hit != ~0u) {
++		s2cr = SRD(SMMU_S2CR(hit));
++		uint32_t type = (s2cr >> 16) & 3u;
++		printf("NEGRONI WLAN: stream %#x matches SMR%u %#x, S2CR %#x (%s, context %u)\n", PCIE0_SID, hit,
++		    SRD(SMMU_SMR(hit)), s2cr, type == 0 ? "translate" : type == 1 ? "bypass" : "fault", s2cr & 0xffu);
++		if (type == 2 && g_smmu_policy != 0) {
++			error = negroni_wlan_failed(EPERM, "SMMU stream %#x is set to fault (S2CR%u %#x)", PCIE0_SID, hit, s2cr);
++		} else if (type == 0) {
++			/* a context we did not program: the chip's physical addresses would be translated */
++			printf("NEGRONI WLAN: stream %#x goes through context %u that this kernel did not set up [I]\n",
++			    PCIE0_SID, s2cr & 0xffu);
++			if (g_smmu_policy != 0) {
++				error = negroni_wlan_failed(EPERM, "SMMU stream %#x translates through context %u (not ours)",
++				           PCIE0_SID, s2cr & 0xffu);
++			}
++		}
++		goto out;
++	}
++	if (scr0 & SMMU_SCR0_CLIENTPD) {
++		printf("NEGRONI WLAN: stream %#x has no SMR; the SMMU is in client bypass (CLIENTPD)\n", PCIE0_SID);
++		goto out;
++	}
++	if (!(scr0 & SMMU_SCR0_USFCFG)) {
++		printf("NEGRONI WLAN: stream %#x has no SMR; unmatched streams bypass (USFCFG 0)\n", PCIE0_SID);
++		goto out;
++	}
++	printf("NEGRONI WLAN: stream %#x has no SMR and unmatched streams FAULT (USFCFG 1)\n", PCIE0_SID);
++	if (g_smmu_policy == 2 && free_smr != ~0u) {
++		/* opt-in write: S2CR bypass first, then the SMR (arm-smmu.c order: S2CR before SMR valid) */
++		SRD(SMMU_S2CR(free_smr)) = 1u << 16;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		SRD(SMMU_SMR(free_smr)) = SMMU_SMR_VALID | PCIE0_SID;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		uint32_t smr = SRD(SMMU_SMR(free_smr)), s2 = SRD(SMMU_S2CR(free_smr));
++		printf("NEGRONI WLAN: SMR%u = %#x, S2CR%u = %#x (bypass for stream %#x, negroniwlan_smmu=2)\n",
++		    free_smr, smr, free_smr, s2, PCIE0_SID);
++		if (smr != (SMMU_SMR_VALID | PCIE0_SID) || ((s2 >> 16) & 3u) != 1u) {
++			error = negroni_wlan_failed(EPERM, "the SMMU (or the hypervisor) did not take the bypass entry");
++		}
++	} else if (g_smmu_policy != 0) {
++		error = negroni_wlan_failed(EPERM, "SMMU stream %#x would fault; boot with negroniwlan_smmu=2 to add a "
++		           "bypass entry, or =0 to try anyway", PCIE0_SID);
++	}
++out:
++#undef SRD
++	ml_io_unmap(smmu, PAGE_SIZE);
++	return error;
++}
++
++/* ---- level 2: steps 1-8 (BAR0, firmware, pool, DMA path, PBL, BHI SBL) ---- */
++static int
++wlan_level_sbl(void)
+ {
+-	struct negroni_wlan_pcie p;
+ 	struct wlan_area_header *hdr = NULL;
+-	uint32_t fw_size = 0, ee, st, entries;
+-	const char *fw;
+-	bool master = false;
++	uint32_t ee, st;
+ 	int error;
+ 
+-	if (!negroni_wifi_pcie_handles(&p) || !p.linked) {
++	negroni_wlan_step(1, "PCIe link hand-over");
++	if (!negroni_wifi_pcie_handles(&P) || !P.linked) {
+ 		printf("NEGRONI WLAN: the PCIe survey did not hand over a live link; stop\n");
+-		return ENXIO;
++		return negroni_wlan_failed(ENXIO, "the survey did not hand over a live PCIe link");
+ 	}
+-	printf("NEGRONI WLAN: reusing survey PCIe handles, chip %04x:%04x\n", p.chip_id & 0xffff, p.chip_id >> 16);
++	printf("NEGRONI WLAN: reusing survey PCIe handles, chip %04x:%04x\n", P.chip_id & 0xffff, P.chip_id >> 16);
+ 
+-	error = wlan_bar0(&p);
++	negroni_wlan_step(2, "BAR0 claim");
++	error = wlan_bar0(&P);
+ 	if (error) {
+-		goto fail;      /* no DMA address was given yet; fail turns bus master off if BAR0 is mapped */
++		return error;   /* no DMA address was given yet */
+ 	}
+-	master = true;
++	g_master = true;
+ 	H.bar = g_bar0;
+ 	H.bar_len = g_bar_len;
+ 	H.timeout_ms = g_timeout_ms;
+ 
++	negroni_wlan_step(3, "SoC version");
+ 	uint32_t soc = negroni_wlan_rd(SOC_VERSION);
+ 	if (soc == MHI_ALL_ONES) {
+ 		printf("NEGRONI WLAN: SoC version reads 0xffffffff; stop\n");
+-		error = EIO;
+-		goto fail;
++		return negroni_wlan_failed(EIO, "SoC version (BAR0 + 0x224) reads 0xffffffff");
+ 	}
+ 	uint32_t major = (soc >> 8) & 0xff;
+-	fw = ((major & 0xf) == 2) ? "amss20.bin" : "amss.bin";  /* cnss2 pci.c: lower 4 bits, FW_V2_NUMBER */
+-	printf("NEGRONI WLAN: SoC version %#x (major %u) -> firmware %s\n", soc, major, fw);
++	g_fw = ((major & 0xf) == 2) ? "amss20.bin" : "amss.bin";  /* cnss2 pci.c: lower 4 bits, FW_V2_NUMBER */
++	printf("NEGRONI WLAN: SoC version %#x (major %u) -> firmware %s\n", soc, major, g_fw);
+ 
++	negroni_wlan_step(4, "DMA pool");
+ 	if (kmem_alloc_contig(kernel_map, &g_pool_kva, NEGRONI_WLAN_POOL_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("NEGRONI WLAN: no %u byte contiguous DMA pool\n", NEGRONI_WLAN_POOL_SIZE);
+ 		g_pool_kva = 0;
+-		error = ENOMEM;
+-		goto fail;
++		return negroni_wlan_failed(ENOMEM, "no %u byte contiguous DMA pool", NEGRONI_WLAN_POOL_SIZE);
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)g_pool_kva);
+ 	if (!pn) {
+-		printf("NEGRONI WLAN: DMA pool has no physical page\n");
+-		error = ENOMEM;
+-		goto fail;
++		return negroni_wlan_failed(ENOMEM, "the DMA pool has no physical page");
+ 	}
+ 	g_pool_pa = ptoa_64(pn);
+ 	if (g_pool_pa + NEGRONI_WLAN_POOL_SIZE - 1 > MHI_DMA_MASK) {
+-		printf("NEGRONI WLAN: DMA pool %#llx is above the chip's 36-bit DMA mask; stop\n", g_pool_pa);
+-		error = ERANGE;
+-		goto fail;
++		return negroni_wlan_failed(ERANGE, "DMA pool %#llx is above the chip's 36-bit DMA mask", g_pool_pa);
+ 	}
+ 	/* zeroes to RAM, no line left in the cacheable view (the chip and the NC view see RAM) */
+ 	flush_dcache64((addr64_t)g_pool_pa, NEGRONI_WLAN_POOL_SIZE, TRUE);
+ 	g_pool_nc = ml_io_map_unmappable((vm_offset_t)g_pool_pa, NEGRONI_WLAN_POOL_SIZE, WLAN_WIMG_WCOMB);
+ 	if (!g_pool_nc) {
+-		printf("NEGRONI WLAN: non-cacheable pool map failed\n");
+-		error = ENOMEM;
+-		goto fail;
++		return negroni_wlan_failed(ENOMEM, "the non-cacheable pool map failed");
+ 	}
+ 	printf("NEGRONI WLAN: DMA pool %u bytes at %#llx\n", NEGRONI_WLAN_POOL_SIZE, g_pool_pa);
+ 
++	negroni_wlan_step(5, "firmware area");
+ 	if (kmem_alloc(kernel_map, (vm_offset_t *)&hdr, WLAN_AREA_HDR, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+ 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		hdr = NULL;
+-		error = ENOMEM;
+-		goto fail;
++		return negroni_wlan_failed(ENOMEM, "no memory for the area header");
+ 	}
+ 	error = negroni_ufs_wlan_area_read(0, hdr, WLAN_AREA_HDR);
+ 	if (error || memcmp(hdr->magic, "NEGRWLAN", 8) != 0 || hdr->version != 1 ||
+ 	    hdr->count == 0 || hdr->count > WLAN_FW_MAX) {
+ 		printf("NEGRONI WLAN: no firmware area header (error %d)\n", error);
+-		error = error ? error : EINVAL;
+-		goto fail;
++		kmem_free(kernel_map, (vm_offset_t)hdr, WLAN_AREA_HDR);
++		return negroni_wlan_failed(error ? error : EINVAL, "no firmware area header (read error %d); write "
++		           "out/wlan-area.bin (README-wifi.md)", error);
+ 	}
+ 	printf("NEGRONI WLAN: firmware area has %u files\n", hdr->count);
+-
+-	error = wlan_load(hdr, fw, OFF_FW, FW_CAP, &fw_size);
++	error = wlan_load(hdr, g_fw, OFF_FW, FW_CAP, &g_fw_size);
+ 	if (!error) {
+ 		error = wlan_load(hdr, "m3.bin", OFF_M3, M3_CAP, &g_m3_size);
+ 	}
+ 	kmem_free(kernel_map, (vm_offset_t)hdr, WLAN_AREA_HDR);
+-	hdr = NULL;
+ 	if (error) {
+-		goto fail;
++		return negroni_wlan_failed(error, "loading %s / m3.bin from the area failed", g_fw);
++	}
++
++	negroni_wlan_step(6, "DMA path (clocks, apps SMMU)");
++	error = wlan_dma_path();
++	if (error) {
++		return error;
+ 	}
+ 
++	negroni_wlan_step(7, "PBL check");
+ 	wlan_rings();
+ 	H.bhi = negroni_wlan_rd(MHI_BHIOFF);
+ 	H.bhie = negroni_wlan_rd(MHI_BHIEOFF);
+@@ -454,62 +645,114 @@ wlan_run(void)
+ 	    H.bhie == 0 || (H.bhie & 3) || H.bhie >= g_bar_len || g_bar_len - H.bhie < BHIE_SPAN) {
+ 		printf("NEGRONI WLAN: BHI off %#x / BHIe off %#x outside BAR0 (%#x bytes); stop\n",
+ 		    H.bhi, H.bhie, g_bar_len);
+-		error = ERANGE;
+-		goto fail;
++		error = negroni_wlan_failed(ERANGE, "BHI off %#x / BHIe off %#x outside BAR0", H.bhi, H.bhie);
++		H.bhi = 0;      /* later status lines must not read through a bad offset */
++		return error;
+ 	}
+ 	ee = negroni_wlan_rd(H.bhi + BHI_EXECENV);
+ 	st = negroni_wlan_rd(MHI_STATUS);
+-	printf("NEGRONI WLAN: BHI off %#x, BHIe off %#x, execution environment %u, MHISTATUS %#x\n",
+-	    H.bhi, H.bhie, ee, st);
+-	/* stage 1 implements only the cold path: PBL -> BHI (pm.c: MHI_IN_PBL -> DEV_ST_TRANSITION_PBL) */
++	printf("NEGRONI WLAN: BHI off %#x, BHIe off %#x, execution environment %u, MHISTATUS %#x, serial %#x\n",
++	    H.bhi, H.bhie, ee, st, negroni_wlan_rd(H.bhi + BHI_SERIALNU));
++	/* only the cold path: PBL -> BHI (pm.c: MHI_IN_PBL -> DEV_ST_TRANSITION_PBL) */
+ 	if (ee != MHI_EE_PBL || st == MHI_ALL_ONES || (st & MHI_STATUS_SYSERR)) {
+ 		printf("NEGRONI WLAN: the chip is not in PBL (need execution environment 0, no SYSERR); stop\n");
+-		error = EIO;
+-		goto fail;
++		return negroni_wlan_failed(EIO, "the chip is not in PBL (EE %u, MHISTATUS %#x)", ee, st);
+ 	}
+ 
+-	/* 1. BHI: the SBL, the first 512 KiB of the image (boot.c mhi_fw_load_bhi, sbl_size) */
+-	error = negroni_wlan_bhi_sbl(&H, g_pool_pa + OFF_FW, MIN(fw_size, MHI_SEG));
+-	if (error) {
+-		goto fail;
+-	}
+-	/* 2. READY, MMIO contexts, event rings, M0 (pm.c mhi_ready_state_transition) */
++	/* BHI: the SBL, the first 512 KiB of the image (op-kernel boot.c:247 mhi_fw_load_bhi, :493 sbl_size) */
++	negroni_wlan_step(8, "BHI SBL download");
++	return negroni_wlan_bhi_sbl(&H, g_pool_pa + OFF_FW, MIN(g_fw_size, MHI_SEG));
++}
++
++/* ---- level 3: steps 9-12 (pm.c:193 mhi_ready_state_transition, called from boot.c:546) ---- */
++static int
++wlan_level_mhi(void)
++{
++	int error;
++
++	negroni_wlan_step(9, "MHI READY");
+ 	error = negroni_wlan_mhi_ready(&H);
+-	if (!error) {
+-		error = negroni_wlan_mhi_init(&H);
+-	}
+-	if (!error) {
+-		error = negroni_wlan_mhi_m0(&H);
++	if (error) {
++		return error;
+ 	}
+-	/* 3. the SBL runs (EE event SBL): BHIe gets the whole image (pm.c DEV_ST_TRANSITION_SBL) */
+-	if (!error) {
+-		error = negroni_wlan_mhi_wait_ee(&H, MHI_EE_SBL, "SBL");
++	negroni_wlan_step(10, "MHI MMIO contexts");
++	error = negroni_wlan_mhi_init(&H);
++	if (error) {
++		return error;
+ 	}
+-	if (!error) {
+-		entries = wlan_vector(fw_size);
+-		error = negroni_wlan_bhie_image(&H, g_pool_pa + OFF_VEC, entries);
++	negroni_wlan_step(11, "MHI M0");
++	error = negroni_wlan_mhi_m0(&H);
++	if (error) {
++		return error;
+ 	}
+-	/* 4. mission mode (EE AMSS), then the IPCR channels */
+-	if (!error) {
+-		error = negroni_wlan_mhi_wait_ee(&H, MHI_EE_AMSS, "AMSS (mission)");
++	/* the SBL runs: EE event SBL (pm.c:767 DEV_ST_TRANSITION_SBL) */
++	negroni_wlan_step(12, "EE SBL");
++	return negroni_wlan_mhi_wait_ee(&H, MHI_EE_SBL, "SBL");
++}
++
++/* ---- level 4: steps 13-15 (pm.c:780 mhi_download_amss_image -> boot.c:566, mission mode, channels) ---- */
++static int
++wlan_level_amss(void)
++{
++	int error;
++
++	negroni_wlan_step(13, "BHIe full image");
++	uint32_t entries = wlan_vector(g_fw_size);
++	error = negroni_wlan_bhie_image(&H, g_pool_pa + OFF_VEC, entries);
++	if (error) {
++		return error;
+ 	}
+-	if (!error) {
+-		error = negroni_wlan_mhi_start_ipcr(&H);
++	negroni_wlan_step(14, "EE AMSS (mission)");
++	error = negroni_wlan_mhi_wait_ee(&H, MHI_EE_AMSS, "AMSS (mission)");
++	if (error) {
++		return error;
+ 	}
++	negroni_wlan_step(15, "IPCR channels 20/21");
++	error = negroni_wlan_mhi_start_ipcr(&H);
+ 	if (error) {
+-		goto fail;
++		return error;
+ 	}
+-
+ 	printf("NEGRONI WLAN: stage 1 complete: mission mode, IPCR 20/21 up, m3 %u bytes ready at %#llx\n",
+ 	    g_m3_size, g_pool_pa + OFF_M3);
+ 	return 0;
++}
+ 
+-fail:
+-	if (hdr) {
+-		kmem_free(kernel_map, (vm_offset_t)hdr, WLAN_AREA_HDR);
++static int (*const wlan_levels[WLAN_LEVEL_MAX + 1])(void) = {
++	[WLAN_LEVEL_SBL] = wlan_level_sbl,
++	[WLAN_LEVEL_MHI] = wlan_level_mhi,
++	[WLAN_LEVEL_AMSS] = wlan_level_amss,
++};
++
++/*
++ * Run the levels 2..negroniwlan. A failure stops the chip's DMA (MHI reset + bus master off) and
++ * frees the memory. When the asked level is reached the chip keeps running and every buffer it
++ * was given stays allocated (it may still DMA into them).
++ */
++static int
++wlan_run(void)
++{
++	uint32_t lvl;
++	int error = 0;
++
++	for (lvl = WLAN_LEVEL_SBL; lvl <= g_level && lvl <= WLAN_LEVEL_MAX; lvl++) {
++		error = wlan_levels[lvl]();
++		if (error) {
++			break;
++		}
++		printf("NEGRONI WLAN: level %u done (step %u)\n", lvl, g_step);
+ 	}
+-	if (master || g_bar0) {
+-		wlan_quiesce(&p);       /* before the pool goes back to the VM: no DMA after this */
++	if (!error) {
++		snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WLAN OK %u", MIN(g_level, (uint32_t)WLAN_LEVEL_MAX));
++		negroni_wifi_badge_color = 0x000060c0;
++		return 0;
++	}
++	if (!g_why_set) {
++		printf("NEGRONI WLAN: step %u %s failed: %s (error %d)\n", g_step, g_step_name, errno_text(error), error);
++	}
++	snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WLAN STOP %u", g_step);
++	negroni_wifi_badge_color = 0x00c00000;
++	if (g_master || g_bar0) {
++		wlan_quiesce(&P);       /* before the pool goes back to the VM: no DMA after this */
+ 	}
+ 	wlan_cleanup();
+ 	return error;
+@@ -520,7 +763,8 @@ wlan_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	int error = wlan_run();
+ 
+-	printf("NEGRONI WLAN: stage 1 %s (error %d, events seen %u)\n", error ? "stopped" : "done", error, H.events);
++	printf("NEGRONI WLAN: %s at step %u (level %u asked, error %d, events seen %u)\n",
++	    error ? "stopped" : "done", g_step, g_level, error, H.events);
+ 	(void)thread_terminate(current_thread());
+ }
+ 
+@@ -529,9 +773,16 @@ negroni_wlan_start(void)
+ {
+ 	thread_t thread;
+ 
++	(void)PE_parse_boot_argn("negroniwlan", &g_level, sizeof(g_level));
+ 	(void)PE_parse_boot_argn("negroniwlan_to", &g_timeout_ms, sizeof(g_timeout_ms));
++	(void)PE_parse_boot_argn("negroniwlan_smmu", &g_smmu_policy, sizeof(g_smmu_policy));
+ 	g_timeout_ms = MIN(MAX(g_timeout_ms, 100u), 60000u);
+-	printf("NEGRONI WLAN: stage 1 start (MHI firmware download, time-out %u ms per wait)\n", g_timeout_ms);
++	g_level = MAX(g_level, (uint32_t)WLAN_LEVEL_SBL);
++	if (g_level > WLAN_LEVEL_MAX) {
++		printf("NEGRONI WLAN: negroniwlan=%u asked; this build stops at level %u\n", g_level, WLAN_LEVEL_MAX);
++	}
++	printf("NEGRONI WLAN: start: levels %u..%u, time-out %u ms per wait, SMMU policy %u\n", WLAN_LEVEL_SBL,
++	    MIN(g_level, (uint32_t)WLAN_LEVEL_MAX), g_timeout_ms, g_smmu_policy);
+ 	if (kernel_thread_start(wlan_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+diff --git a/bsd/dev/negroni_wlan_bhi.c b/bsd/dev/negroni_wlan_bhi.c
+index ac06c3c..f0bc930 100644
+--- a/bsd/dev/negroni_wlan_bhi.c
++++ b/bsd/dev/negroni_wlan_bhi.c
+@@ -25,7 +25,7 @@
+ static int
+ bhi_wait(struct mhi_host *h, uint32_t status_off, uint32_t bhi_err, const char *what)
+ {
+-	uint64_t deadline = negroni_wlan_ms() + h->timeout_ms;
++	uint64_t start = negroni_wlan_ms(), deadline = start + h->timeout_ms, beat = start + 1000;
+ 	uint32_t reg;
+ 
+ 	do {
+@@ -34,7 +34,14 @@ bhi_wait(struct mhi_host *h, uint32_t status_off, uint32_t bhi_err, const char *
+ 
+ 		if (reg == MHI_ALL_ONES) {
+ 			printf("NEGRONI WLAN: %s status reads 0xffffffff (PCIe link down?)\n", what);
+-			return EIO;
++			return negroni_wlan_failed(EIO, "%s status reads 0xffffffff (PCIe link down)", what);
++		}
++		/* heartbeat (0263): if the phone restarts during the chip's DMA, the log shows how long it ran */
++		if (negroni_wlan_ms() >= beat) {
++			printf("NEGRONI WLAN: %s waiting %llu ms, status %#x, EE %u, MHISTATUS %#x\n", what,
++			    negroni_wlan_ms() - start, reg, negroni_wlan_rd(h->bhi + BHI_EXECENV),
++			    negroni_wlan_rd(MHI_STATUS));
++			beat += 1000;
+ 		}
+ 		if (st == BHI_ST_DONE) {
+ 			return 0;
+@@ -47,12 +54,14 @@ bhi_wait(struct mhi_host *h, uint32_t status_off, uint32_t bhi_err, const char *
+ 			} else {
+ 				printf("NEGRONI WLAN: %s error, status %#x\n", what, reg);
+ 			}
+-			return EIO;
++			return negroni_wlan_failed(EIO, "%s: the chip reports an error, status %#x, errcode %#x", what, reg,
++			           negroni_wlan_rd(h->bhi + BHI_ERRCODE));
+ 		}
+ 		delay(1000);
+ 	} while (negroni_wlan_ms() < deadline);
+ 	printf("NEGRONI WLAN: %s timed out after %u ms, status %#x\n", what, h->timeout_ms, reg);
+-	return ETIMEDOUT;
++	return negroni_wlan_failed(ETIMEDOUT, "%s not done in %u ms, status %#x, EE %u, errcode %#x", what,
++	           h->timeout_ms, reg, negroni_wlan_rd(h->bhi + BHI_EXECENV), negroni_wlan_rd(h->bhi + BHI_ERRCODE));
+ }
+ 
+ /*
+diff --git a/bsd/dev/negroni_wlan_mhi.c b/bsd/dev/negroni_wlan_mhi.c
+index 780d8b3..e56660b 100644
+--- a/bsd/dev/negroni_wlan_mhi.c
++++ b/bsd/dev/negroni_wlan_mhi.c
+@@ -71,12 +71,16 @@ mhi_check_status(struct mhi_host *h, const char *during)
+ 
+ 	if (s == MHI_ALL_ONES) {
+ 		printf("NEGRONI WLAN: MHISTATUS reads 0xffffffff while %s (PCIe link down?)\n", during);
+-		return EIO;
++		return negroni_wlan_failed(EIO, "MHISTATUS reads 0xffffffff while %s (PCIe link down)", during);
+ 	}
+ 	if ((s & MHI_STATUS_SYSERR) || ((s >> MHISTATE_SHIFT) & MHISTATE_MASK) == MHI_ST_SYS_ERR || h->syserr) {
+ 		printf("NEGRONI WLAN: MHISTATUS SYSERR %#x while %s\n", s, during);
+ 		h->syserr = true;
+-		return EIO;
++		return negroni_wlan_failed(EIO, "the chip reports SYSERR (MHISTATUS %#x, EE %u) while %s", s,
++		           h->bhi ? negroni_wlan_rd(h->bhi + BHI_EXECENV) : MHI_ALL_ONES, during);
++	}
++	if (h->rddm_seen) {
++		return negroni_wlan_failed(EIO, "the firmware crashed (EE event RDDM) while %s", during);
+ 	}
+ 	return 0;
+ }
+@@ -100,7 +104,7 @@ negroni_wlan_mhi_ready(struct mhi_host *h)
+ 	} while (negroni_wlan_ms() < deadline);
+ 	if (c == MHI_ALL_ONES || (c & MHI_CTRL_RESET)) {
+ 		printf("NEGRONI WLAN: MHICTRL RESET never cleared (%#x)\n", c);
+-		return ETIMEDOUT;
++		return negroni_wlan_failed(ETIMEDOUT, "MHICTRL RESET did not clear in %u ms (MHICTRL %#x)", h->timeout_ms, c);
+ 	}
+ 
+ 	deadline = negroni_wlan_ms() + h->timeout_ms;
+@@ -117,7 +121,8 @@ negroni_wlan_mhi_ready(struct mhi_host *h)
+ 		delay(1000);
+ 	} while (negroni_wlan_ms() < deadline);
+ 	printf("NEGRONI WLAN: MHISTATUS never READY (%#x)\n", s);
+-	return ETIMEDOUT;
++	return negroni_wlan_failed(ETIMEDOUT, "MHISTATUS not READY in %u ms (%#x, EE %u)", h->timeout_ms, s,
++	           negroni_wlan_rd(h->bhi + BHI_EXECENV));
+ }
+ 
+ /*
+@@ -137,7 +142,7 @@ negroni_wlan_mhi_init(struct mhi_host *h)
+ 	    (h->erdb & 3) || h->erdb >= h->bar_len || h->bar_len - h->erdb < 8 * MHI_EV_RINGS) {
+ 		printf("NEGRONI WLAN: doorbell offsets out of range: chdboff %#x erdboff %#x (BAR0 %#x bytes)\n",
+ 		    h->chdb, h->erdb, h->bar_len);
+-		return ERANGE;
++		return negroni_wlan_failed(ERANGE, "doorbell offsets chdboff %#x erdboff %#x outside BAR0", h->chdb, h->erdb);
+ 	}
+ 
+ 	/* context array base addresses (ch_out.ctx sits at channel index 20 of the channel array). */
+@@ -182,13 +187,14 @@ negroni_wlan_mhi_init(struct mhi_host *h)
+ 	cfg = (cfg & ~MHICFG_NER_HWER_MASK) | (MHI_EV_RINGS << MHICFG_NER_SHIFT);   /* NER 2, NHWER 0 */
+ 	negroni_wlan_wr(MHI_CFG, cfg);
+ 	/*
+-	 * The device may DMA only inside CTRL/DATA base..limit. Stage 1 uses only the pool.
+-	 * [I] Stage 2 (QRTR buffers, QMI respond_mem) must widen this window.
++	 * The device may DMA only inside CTRL/DATA base..limit. cnss2 without an SMMU uses 0 .. the
++	 * 36-bit DMA mask (op-kernel cnss2/pci.c:5509-5510); patch 0263 does the same, because the
++	 * QRTR buffers and the QMI firmware memory (stages 4-6) are separate allocations.
+ 	 */
+-	mhi_write64(MHI_CTRLBASE, h->pool_pa);
+-	mhi_write64(MHI_DATABASE, h->pool_pa);
+-	mhi_write64(MHI_CTRLLIMIT, h->pool_pa + NEGRONI_WLAN_POOL_SIZE - 1);
+-	mhi_write64(MHI_DATALIMIT, h->pool_pa + NEGRONI_WLAN_POOL_SIZE - 1);
++	mhi_write64(MHI_CTRLBASE, 0);
++	mhi_write64(MHI_DATABASE, 0);
++	mhi_write64(MHI_CTRLLIMIT, MHI_DMA_MASK);
++	mhi_write64(MHI_DATALIMIT, MHI_DMA_MASK);
+ 	h->mmio_set = true;
+ 	printf("NEGRONI WLAN: MHI ctx ch %#llx ev %#llx cmd %#llx, chdboff %#x erdboff %#x\n",
+ 	    ch_ctx_pa, ev_ctx_pa, cmd_ctx_pa, h->chdb, h->erdb);
+@@ -237,6 +243,17 @@ negroni_wlan_mhi_poll(struct mhi_host *h)
+ 				h->state = code;
+ 				if (code == MHI_ST_SYS_ERR) {
+ 					h->syserr = true;
++				} else if (code == MHI_ST_M1 && h->mmio_set) {
++					/*
++					 * pm.c:334-363 mhi_pm_m1_transition: Linux never writes M0 on M1;
++					 * with device wake held it toggles DEVICE_WAKE (wake_get/put), so
++					 * the device goes back to M0 by itself.
++					 */
++					mhi_write64(h->wake_db, 0);
++					mhi_write64(h->wake_db, 1);
++					if (h->m1_seen++ == 0) {
++						printf("NEGRONI WLAN: device entered M1; host toggled device wake (0 then 1)\n");
++					}
+ 				}
+ 				break;
+ 			case MHI_PKT_EE_EVENT:
+@@ -245,6 +262,8 @@ negroni_wlan_mhi_poll(struct mhi_host *h)
+ 					h->sbl_seen = true;
+ 				} else if (code == MHI_EE_AMSS) {
+ 					h->amss_seen = true;
++				} else if (code == MHI_EE_RDDM) {
++					h->rddm_seen = true;
+ 				}
+ 				break;
+ 			case MHI_PKT_CMD_DONE:
+@@ -312,7 +331,7 @@ negroni_wlan_mhi_m0(struct mhi_host *h)
+ 		delay(1000);
+ 	} while (negroni_wlan_ms() < deadline);
+ 	printf("NEGRONI WLAN: MHI never reached M0 (MHISTATE %#x)\n", s);
+-	return ETIMEDOUT;
++	return negroni_wlan_failed(ETIMEDOUT, "MHISTATE %#x, not M0 after %u ms", s, h->timeout_ms);
+ }
+ 
+ /*
+@@ -342,7 +361,8 @@ negroni_wlan_mhi_wait_ee(struct mhi_host *h, uint32_t target, const char *name)
+ 		delay(1000);
+ 	} while (negroni_wlan_ms() < deadline);
+ 	printf("NEGRONI WLAN: never reached %s, execution environment stuck at %u\n", name, ee);
+-	return ETIMEDOUT;
++	return negroni_wlan_failed(ETIMEDOUT, "execution environment %u, not %s after %u ms (events %u)", ee, name,
++	           h->timeout_ms, h->events);
+ }
+ 
+ /* Enable one channel context and issue a START_CHAN command, then wait for its completion. */
+@@ -391,10 +411,10 @@ mhi_start_chan(struct mhi_host *h, uint32_t chid, struct mhi_ring *ch, uint32_t
+ 	if (mhi_last_cmd_cc == 0xff) {
+ 		printf("NEGRONI WLAN: channel %u start timed out after %u ms (no command completion)\n",
+ 		    chid, h->timeout_ms);
+-		return ETIMEDOUT;
++		return negroni_wlan_failed(ETIMEDOUT, "no START_CHAN %u completion in %u ms", chid, h->timeout_ms);
+ 	}
+ 	printf("NEGRONI WLAN: channel %u start failed, completion code %#x\n", chid, mhi_last_cmd_cc);
+-	return EIO;
++	return negroni_wlan_failed(EIO, "START_CHAN %u completion code %#x", chid, mhi_last_cmd_cc);
+ }
+ 
+ /* Start the IPCR channels (20 out, 21 in). QRTR/QMI buffers are stage 2. */
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index b9f5af8..b6e0e58 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -60,6 +60,9 @@
+ #define MHI_ST_RESET            0x0
+ #define MHI_ST_READY            0x1
+ #define MHI_ST_M0               0x2
++#define MHI_ST_M1               0x3
++#define MHI_ST_M2               0x4
++#define MHI_ST_M3               0x5
+ #define MHI_ST_SYS_ERR          0xff
+ #define MHI_EE_PBL              0
+ #define MHI_EE_SBL              1
+@@ -127,10 +130,26 @@ struct mhi_host {
+ 	struct mhi_ring ev[MHI_EV_RINGS], cmd, ch_out, ch_in;
+ 	uint32_t timeout_ms;
+ 	uint32_t ee, state;     /* last seen by event */
+-	bool sbl_seen, amss_seen, syserr, ch_started, mmio_set;
+-	uint32_t events;
++	bool sbl_seen, amss_seen, rddm_seen, syserr, ch_started, mmio_set;
++	uint32_t events, m1_seen;
+ };
+ 
++/*
++ * Stage levels (boot-arg negroniwlan=N runs every level up to N; patch 0263):
++ *   2  steps 1-8:   BAR0, firmware, DMA pool, SMMU/clock check, PBL, BHI SBL download
++ *   3  steps 9-12:  MHI READY, MMIO contexts, M0 + device wake, EE SBL
++ *   4  steps 13-15: BHIe full image, EE AMSS (mission), IPCR channels 20/21
++ * Each step prints "NEGRONI WLAN: step N NAME" before it starts and, on an error,
++ * "NEGRONI WLAN: step N NAME failed: REASON". Every wait has a time-out (negroniwlan_to).
++ */
++#define WLAN_LEVEL_SBL          2
++#define WLAN_LEVEL_MHI          3
++#define WLAN_LEVEL_AMSS         4
++#define WLAN_LEVEL_MAX          4       /* the highest level this build implements */
++
++void negroni_wlan_step(uint32_t n, const char *name);
++int negroni_wlan_failed(int error, const char *fmt, ...) __printflike(2, 3);
++
+ /* negroni_wlan.c (rd returns MHI_ALL_ONES and wr does nothing for an offset outside BAR0) */
+ uint32_t negroni_wlan_rd(uint32_t off);
+ void negroni_wlan_wr(uint32_t off, uint32_t v);

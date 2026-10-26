@@ -99,6 +99,78 @@ Boot-arg `negroniwifi=10`, image out/ios16-wifi10, USB log 00:00:35: `7 root por
 now carries its own XO_CLK pulse and the Linux slave-space writes; the rebased 0262 replaces both with the cnss2
 timing and the two recipes (notes.md section 16, 2026-10-26).
 
+## 0263-negroni-wlan-stages.patch and 0264-negroni-wlan-ipcr-rings.patch (2026-10-26)
+
+Files: `bsd/dev/negroni_wlan.c`, `negroni_wlan_mhi.{c,h}`, `negroni_wlan_bhi.c`, `negroni_wifi.c` (comment only).
+Made in `out/kernel/tree-wlan5` (full patch set, then one commit per patch). Not run on the phone.
+
+**`negroniwlan=N` is now a level.** It runs every level from 2 up to N. The meaning of `negroniwlan=2`
+changed: it stops after the BHI SBL download (0261 ran all of stage 1 with 2; that is now `negroniwlan=4`).
+When the asked level is reached, the chip keeps running and every buffer it got stays allocated. On a
+failure the driver resets MHI, turns bus master off and only then frees the memory.
+
+| Level | Step | Name (log `NEGRONI WLAN: step N NAME`) | Source |
+|---|---|---|---|
+| 2 | 1 | PCIe link hand-over | survey step 10 |
+| 2 | 2 | BAR0 claim | 0261 |
+| 2 | 3 | SoC version | BAR0 + 0x224 -> amss20.bin / amss.bin; cnss2 pci.c:5164-5215 |
+| 2 | 4 | DMA pool | 0261 |
+| 2 | 5 | firmware area | amss*.bin, m3.bin, SHA-256 check (0261) |
+| 2 | 6 | DMA path (clocks, apps SMMU) | new in 0263; gcc-sm8450.c / gcc-waipio.c, live.dts iommu-map |
+| 2 | 7 | PBL check | BHI/BHIe offsets, EE 0; pm.c MHI_IN_PBL |
+| 2 | 8 | BHI SBL download | 512 KiB; boot.c:247 mhi_fw_load_bhi, :493 |
+| 3 | 9 | MHI READY | pm.c:193 mhi_ready_state_transition |
+| 3 | 10 | MHI MMIO contexts | init.c:424 mhi_init_mmio |
+| 3 | 11 | MHI M0 | + device wake; pm.c mhi_setup_event_rings |
+| 3 | 12 | EE SBL | pm.c:767 DEV_ST_TRANSITION_SBL |
+| 4 | 13 | BHIe full image | boot.c:566 mhi_download_amss_image, :196 |
+| 4 | 14 | EE AMSS (mission) | pm.c:783 |
+| 4 | 15 | IPCR channels 20/21 | + 16 RX buffers (0264); cnss2 pci.c:147-176, main.c:598 |
+
+Order note: the task list said "AMSS download, then MHI init". Linux does MMIO + M0 before BHIe
+(boot.c:546 calls mhi_ready_state_transition right after the BHI SBL; BHIe starts on the EE SBL event,
+pm.c:767-781). The levels follow Linux.
+
+Log lines (all start `NEGRONI WLAN:`):
+- `start: levels 2..N, time-out T ms per wait, SMMU policy P`
+- `step N NAME` before each step; `step N NAME failed: REASON` on the first error of a step (if no
+  specific reason was recorded: `failed: time-out|I/O error|... (error E)`).
+- `level N done (step S)`; at the end `done|stopped at step S (level N asked, error E, events seen K)`.
+- `BHI SBL|BHIe image waiting T ms, status .., EE .., MHISTATUS ..` every second during a BHI wait
+  (if the phone restarts during the chip's first DMA, the last line shows how long it ran).
+- Step 6: `GCC AGGRE_NOC_PCIE_0_AXI 0x.. (CLK_OFF n), DDRSS_PCIE_SF_TBU 0x.. (CLK_OFF n), vote 0x62000 = 0x..`
+  (report only: both branches are BRANCH_HALT_SKIP with HW clock gating, gcc-waipio.c:1756/:1971, so CLK_OFF
+  reads 1 while idle; the step stops only when vote bit 12 or 19 of 0x62000 is clear, gcc-waipio.c:1761/:1976);
+  `apps SMMU ... EXIDS set; SMR format not handled, DMA path not checked` when sCR0.EXIDENABLE is set;
+  `apps SMMU sCR0 .. (CLIENTPD c, USFCFG u, EXIDS e), IDR0 .. (n SMRs), IDR1 .., sGFSR ..`;
+  then one of `stream 0x1c01 matches SMRi .. S2CR .. (translate|bypass|fault, context k)`,
+  `... has no SMR; the SMMU is in client bypass`, `... unmatched streams bypass (USFCFG 0)`,
+  `... has no SMR and unmatched streams FAULT (USFCFG 1)`.
+- `device entered M1; host toggled device wake (0 then 1)` (pm.c:334-363); SYSERR and EE RDDM stop the step.
+- 0264: `channel 21: 16 RX buffers of 32768 bytes at 0x..`; `channel N transfer event code .. ptr .. ignored`.
+- Badge (framebuffer, top right): `WLAN N` while step N runs, `WLAN OK N`, `WLAN STOP N`.
+
+New boot-args:
+
+| Boot-arg | Default | Meaning |
+|---|---|---|
+| `negroniwlan=N` | 0 (off) | survey 1..10, then driver levels 2..N (max 4 in this build) |
+| `negroniwlan_to=MS` | 10000 | time-out of every wait, 100..60000 |
+| `negroniwlan_smmu=P` | **1** | 0 = step 6 only reports; 1 = stop before the first DMA when a clock vote bit is clear or the SMMU surely faults stream 0x1c01 (S2CR fault, a context we did not set up, or no SMR with USFCFG 1); **2 = WRITE a bypass SMR + S2CR for stream 0x1c01 into the apps SMMU** |
+
+**Warning: `negroniwlan_smmu=2` writes the shared apps SMMU (Gunyah emulates its global space). Use it
+only with the owner's approval, and only after a boot with the default showed `unmatched streams FAULT`.**
+
+0264 data path: one 576 KiB contiguous allocation (Normal non-cacheable view): 16 RX buffers x 32 KiB
+on channel 21 (posted after START_CHAN, put back after each transfer event), 8 TX buffers x 8 KiB for
+channel 20 (`negroni_wlan_mhi_tx`, one EOT transfer per packet, waits for a free buffer). Transfer events
+EOT/EOB/OVERFLOW free or re-post the buffers up to the TRE the event points at; DB_MODE rings the
+doorbell again. At level 4 nobody reads the RX data yet (QRTR is level 5).
+
+[I] Open: the restart during the first BHI SBL download (2026-10-26) is not isolated (brownout at 16 %,
+SMMU fault, gated TBU/NoC clock, or a missing PCIe -> DDR interconnect vote). Step 6 and the heartbeat
+lines are there to tell these apart.
+
 ## 0261-negroni-wlan-mhi-fw.patch
 
 Stage 1 of the driver: claim BAR0, choose the firmware, download it over MHI (BHI + BHIe), reach

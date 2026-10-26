@@ -1,0 +1,311 @@
+0264-negroni-wlan-ipcr-rings: IPCR data path on MHI channels 20/21 (level 4).
+A 576 KiB contiguous transfer buffer: 16 RX x 32 KiB posted on channel 21 after START_CHAN (cnss2
+auto_queue, buf_len 0x8000), 8 TX x 8 KiB for channel 20 (negroni_wlan_mhi_tx, one EOT transfer per
+packet), transfer events (EOT/EOB/OVERFLOW/DB_MODE, op-kernel mhi main.c:598 parse_xfer_event).
+Details: patches/xnu/README-wifi.md "0264".
+
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index 17ae758..5442901 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -119,6 +119,7 @@ static struct negroni_wlan_pcie P;      /* the survey's handles */
+ static uint32_t g_fw_size;
+ static const char *g_fw;
+ static bool g_master;                   /* bus master was turned on (BAR0 claimed) */
++static vm_offset_t g_xfer_kva;          /* 0264: IPCR RX/TX buffers (cacheable view; H.xfer_nc is the NC one) */
+ 
+ /* ---- step lines (0263): "step N NAME" before, "step N NAME failed: REASON" on an error ---- */
+ static uint32_t g_step;
+@@ -398,6 +399,15 @@ wlan_vector(uint32_t fw_size)
+ static void
+ wlan_cleanup(void)
+ {
++	if (H.xfer_nc) {
++		ml_io_unmap(H.xfer_nc, WLAN_XFER_SIZE);
++		H.xfer_nc = 0;
++	}
++	if (g_xfer_kva) {
++		flush_dcache64((addr64_t)H.xfer_pa, WLAN_XFER_SIZE, TRUE);
++		kmem_free(kernel_map, g_xfer_kva, WLAN_XFER_SIZE);
++		g_xfer_kva = 0;
++	}
+ 	if (g_pool_nc) {
+ 		ml_io_unmap(g_pool_nc, WLAN_POOL_MAP);
+ 		g_pool_nc = 0;
+@@ -708,6 +718,22 @@ wlan_level_amss(void)
+ 		return error;
+ 	}
+ 	negroni_wlan_step(15, "IPCR channels 20/21");
++	/* 0264: RX/TX buffers for QRTR, a second contiguous allocation (inside the 0..36-bit MHI window) */
++	if (kmem_alloc_contig(kernel_map, &g_xfer_kva, WLAN_XFER_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		g_xfer_kva = 0;
++		return negroni_wlan_failed(ENOMEM, "no %u byte contiguous transfer buffer", WLAN_XFER_SIZE);
++	}
++	ppnum_t xpn = pmap_find_phys(kernel_pmap, (addr64_t)g_xfer_kva);
++	if (!xpn || ptoa_64(xpn) + WLAN_XFER_SIZE - 1 > MHI_DMA_MASK) {
++		return negroni_wlan_failed(ERANGE, "transfer buffer page %#x outside the DMA mask", xpn);
++	}
++	H.xfer_pa = ptoa_64(xpn);
++	flush_dcache64((addr64_t)H.xfer_pa, WLAN_XFER_SIZE, TRUE);
++	H.xfer_nc = ml_io_map_unmappable((vm_offset_t)H.xfer_pa, WLAN_XFER_SIZE, WLAN_WIMG_WCOMB);
++	if (!H.xfer_nc) {
++		return negroni_wlan_failed(ENOMEM, "the non-cacheable transfer buffer map failed");
++	}
+ 	error = negroni_wlan_mhi_start_ipcr(&H);
+ 	if (error) {
+ 		return error;
+diff --git a/bsd/dev/negroni_wlan_mhi.c b/bsd/dev/negroni_wlan_mhi.c
+index e56660b..d57cedb 100644
+--- a/bsd/dev/negroni_wlan_mhi.c
++++ b/bsd/dev/negroni_wlan_mhi.c
+@@ -214,6 +214,101 @@ ev_dev_idx(struct mhi_host *h, uint32_t i)
+ 	return (uint32_t)((rp - h->ev[i].pa) / sizeof(struct mhi_el));
+ }
+ 
++/* Ring channel `ch`'s doorbell with its current write index (main.c mhi_ring_chan_db). */
++static void
++mhi_ring_chan(struct mhi_ring *ch)
++{
++	uint64_t wp_pa = ch->pa + (uint64_t)ch->wp * sizeof(struct mhi_el);
++
++	ctx_set64(ch->ctx->wp, wp_pa);
++	mhi_wmb();
++	mhi_write64(ch->db, wp_pa);
++}
++
++/* Put RX buffer `buf` on channel 21 (inbound, EOT) at the write index; no doorbell. */
++static void
++mhi_rx_queue(struct mhi_host *h, uint32_t buf)
++{
++	struct mhi_ring *ch = &h->ch_in;
++	volatile struct mhi_el *el = &ch->va[ch->wp];
++
++	el->ptr = h->xfer_pa + (uint64_t)buf * WLAN_RX_LEN;
++	el->dw0 = WLAN_RX_LEN;
++	el->dw1 = MHI_TRE_DW1_EOT;
++	h->in_slot_buf[ch->wp] = (uint8_t)buf;
++	ch->wp = (ch->wp + 1) % ch->n;
++}
++
++/*
++ * A transfer event (main.c parse_xfer_event): `ptr` is the last TRE the device completed; every
++ * TRE from the local read index up to it is done. Inbound: hand the data to h->rx_cb, then put the
++ * buffer back (cnss2 auto_queue). Outbound: free the TX buffer.
++ */
++static void
++mhi_xfer_event(struct mhi_host *h, uint64_t ptr, uint32_t dw0, uint32_t dw1)
++{
++	uint32_t chid = (dw1 >> 24) & 0xff, code = (dw0 >> 24) & 0xff, len = dw0 & 0xffff;
++	struct mhi_ring *ch = chid == MHI_IPCR_IN ? &h->ch_in : chid == MHI_IPCR_OUT ? &h->ch_out : NULL;
++	uint64_t span;
++
++	if (!ch || !h->ch_started) {
++		h->xfer_errors++;
++		return;
++	}
++	if (code == MHI_EV_CC_DB_MODE) {        /* the device asks for a doorbell (DB mode) */
++		mhi_ring_chan(ch);
++		return;
++	}
++	span = (uint64_t)ch->n * sizeof(struct mhi_el);
++	if (ptr < ch->pa || ptr >= ch->pa + span || ((ptr - ch->pa) % sizeof(struct mhi_el)) ||
++	    (code != MHI_EV_CC_EOT && code != MHI_EV_CC_EOB && code != MHI_EV_CC_OVERFLOW)) {
++		if (h->xfer_errors++ < 4) {
++			printf("NEGRONI WLAN: channel %u transfer event code %#x ptr %#llx ignored\n", chid, code, ptr);
++		}
++		return;
++	}
++	uint32_t last = (uint32_t)((ptr - ch->pa) / sizeof(struct mhi_el));
++	uint32_t guard = ch->n;
++	bool requeued = false;
++
++	__asm__ volatile ("dmb ld" ::: "memory");       /* event before the data it describes */
++	while (guard--) {
++		uint32_t slot = ch->rp;
++		bool is_last = slot == last;
++
++		if (ch == &h->ch_in) {
++			uint32_t buf = h->in_slot_buf[slot];
++			uint32_t n = is_last ? MIN(len, WLAN_RX_LEN) : WLAN_RX_LEN;
++
++			if (code == MHI_EV_CC_OVERFLOW) {
++				h->rx_overflow++;
++			}
++			h->rx_packets++;
++			if (h->rx_cb && buf < WLAN_RX_N) {
++				h->rx_cb(h, (const void *)(h->xfer_nc + (vm_offset_t)buf * WLAN_RX_LEN), n);
++			}
++			if (buf < WLAN_RX_N) {
++				mhi_rx_queue(h, buf);
++				requeued = true;
++			}
++		} else {
++			uint32_t buf = h->out_slot_buf[slot];
++
++			if (buf < WLAN_TX_N) {
++				h->tx_busy[buf] = false;
++			}
++			h->tx_done++;
++		}
++		ch->rp = (slot + 1) % ch->n;
++		if (is_last) {
++			break;
++		}
++	}
++	if (requeued) {
++		mhi_ring_chan(ch);
++	}
++}
++
+ /*
+  * Drain both event rings. The device is the producer; the host consumes from its local read
+  * index up to the device write pointer (the context rp, updated by the device in host RAM).
+@@ -269,6 +364,9 @@ negroni_wlan_mhi_poll(struct mhi_host *h)
+ 			case MHI_PKT_CMD_DONE:
+ 				mhi_last_cmd_cc = code;
+ 				break;
++			case MHI_PKT_TX_EVENT:
++				mhi_xfer_event(h, el->ptr, el->dw0, el->dw1);
++				break;
+ 			default:
+ 				break;
+ 			}
+@@ -426,10 +524,77 @@ negroni_wlan_mhi_start_ipcr(struct mhi_host *h)
+ 	if (!error) {
+ 		error = mhi_start_chan(h, MHI_IPCR_IN, &h->ch_in, CHAN_TYPE_IN);
+ 	}
+-	if (!error) {
+-		h->ch_started = true;
++	if (error) {
++		return error;
++	}
++	h->ch_started = true;
++	/* 0264: inbound buffers after START_CHAN (main.c mhi_prepare_channel, auto_queue) */
++	if (h->xfer_nc) {
++		for (uint32_t i = 0; i < WLAN_TX_N; i++) {
++			h->tx_busy[i] = false;
++		}
++		for (uint32_t i = 0; i < WLAN_RX_N; i++) {
++			mhi_rx_queue(h, i);
++		}
++		mhi_ring_chan(&h->ch_in);
++		printf("NEGRONI WLAN: channel 21: %u RX buffers of %u bytes at %#llx\n", WLAN_RX_N, WLAN_RX_LEN,
++		    h->xfer_pa);
++	}
++	return 0;
++}
++
++/*
++ * Send one IPCR packet on channel 20 (qrtr mhi.c qcom_mhi_qrtr_send: one MHI_EOT transfer per
++ * QRTR packet). Waits (polling) for a free TX buffer. The data is copied; returns at once.
++ */
++int
++negroni_wlan_mhi_tx(struct mhi_host *h, const void *data, uint32_t len)
++{
++	struct mhi_ring *ch = &h->ch_out;
++	uint64_t deadline = negroni_wlan_ms() + h->timeout_ms;
++	uint32_t buf = ~0u;
++
++	if (!h->ch_started || !h->xfer_nc) {
++		return negroni_wlan_failed(ENXIO, "TX before the IPCR channels started");
+ 	}
+-	return error;
++	if (len == 0 || len > WLAN_TX_LEN) {
++		return negroni_wlan_failed(ERANGE, "TX packet of %u bytes (max %u)", len, WLAN_TX_LEN);
++	}
++	for (;;) {
++		for (uint32_t k = 0; k < WLAN_TX_N; k++) {
++			uint32_t i = (h->tx_next + k) % WLAN_TX_N;
++			if (!h->tx_busy[i]) {
++				buf = i;
++				break;
++			}
++		}
++		/* keep one ring slot empty: wp + 1 == rp means full */
++		if (buf != ~0u && (ch->wp + 1) % ch->n != ch->rp) {
++			break;
++		}
++		buf = ~0u;
++		(void)negroni_wlan_mhi_poll(h);
++		if (h->syserr || negroni_wlan_ms() >= deadline) {
++			return negroni_wlan_failed(ETIMEDOUT, "no free TX buffer on channel 20 in %u ms (sent %u, done %u)",
++			           h->timeout_ms, h->tx_packets, h->tx_done);
++		}
++		delay(1000);
++	}
++	vm_offset_t va = h->xfer_nc + (vm_offset_t)WLAN_RX_N * WLAN_RX_LEN + (vm_offset_t)buf * WLAN_TX_LEN;
++	uint64_t pa = h->xfer_pa + (uint64_t)WLAN_RX_N * WLAN_RX_LEN + (uint64_t)buf * WLAN_TX_LEN;
++	volatile struct mhi_el *el = &ch->va[ch->wp];
++
++	memcpy((void *)va, data, len);
++	h->tx_busy[buf] = true;
++	h->tx_next = (buf + 1) % WLAN_TX_N;
++	h->out_slot_buf[ch->wp] = (uint8_t)buf;
++	el->ptr = pa;
++	el->dw0 = len;
++	el->dw1 = MHI_TRE_DW1_EOT;
++	ch->wp = (ch->wp + 1) % ch->n;
++	h->tx_packets++;
++	mhi_ring_chan(ch);
++	return 0;
+ }
+ 
+ /* Failure path: drop device wake and set MHICTRL RESET (pm.c power-down), so the chip stops MHI. */
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index b6e0e58..b9c796d 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -80,6 +80,19 @@
+ #define MHI_PKT_TX_EVENT        0x22
+ #define MHI_PKT_EE_EVENT        0x40
+ #define MHI_EV_CC_SUCCESS       0x1
++#define MHI_EV_CC_EOT           0x2
++#define MHI_EV_CC_OVERFLOW      0x3
++#define MHI_EV_CC_EOB           0x4
++#define MHI_EV_CC_DB_MODE       0x6
++/* transfer ring element dword1 (internal.h MHI_TRE_DATA_DWORD1): type 2, IEOT bit 9 */
++#define MHI_TRE_DW1_EOT         ((MHI_PKT_TRANSFER << 16) | (1u << 9))
++
++/* 0264: the IPCR data path. RX buffers like cnss2 (buf_len 0x8000, pci.c:228), TX for QMI <= 6.2 KiB */
++#define WLAN_RX_N               16u
++#define WLAN_RX_LEN             0x8000u
++#define WLAN_TX_N               8u
++#define WLAN_TX_LEN             0x2000u
++#define WLAN_XFER_SIZE          (WLAN_RX_N * WLAN_RX_LEN + WLAN_TX_N * WLAN_TX_LEN)    /* 576 KiB */
+ 
+ /* configuration (Linux ath11k mhi.c ath11k_mhi_config_qca6390) */
+ #define MHI_MAX_CH              128
+@@ -132,6 +145,16 @@ struct mhi_host {
+ 	uint32_t ee, state;     /* last seen by event */
+ 	bool sbl_seen, amss_seen, rddm_seen, syserr, ch_started, mmio_set;
+ 	uint32_t events, m1_seen;
++	/* 0264: IPCR transfer buffers (one contiguous allocation, Normal non-cacheable view) */
++	vm_offset_t xfer_nc;
++	uint64_t xfer_pa;
++	uint8_t in_slot_buf[MHI_CH_ELEMENTS];   /* RX buffer index of each channel-21 ring slot */
++	uint8_t out_slot_buf[MHI_CH_ELEMENTS];  /* TX buffer index of each channel-20 ring slot */
++	bool tx_busy[WLAN_TX_N];
++	uint32_t tx_next;
++	uint32_t rx_packets, tx_packets, tx_done, rx_overflow, xfer_errors;
++	/* called from negroni_wlan_mhi_poll for each received IPCR transfer (data in NC memory) */
++	void (*rx_cb)(struct mhi_host *h, const void *data, uint32_t len);
+ };
+ 
+ /*
+@@ -146,6 +169,7 @@ struct mhi_host {
+ #define WLAN_LEVEL_MHI          3
+ #define WLAN_LEVEL_AMSS         4
+ #define WLAN_LEVEL_MAX          4       /* the highest level this build implements */
++/* level 4 (0264) also posts the RX buffers on channel 21 (cnss2 auto_queue, pci.c:181) */
+ 
+ void negroni_wlan_step(uint32_t n, const char *name);
+ int negroni_wlan_failed(int error, const char *fmt, ...) __printflike(2, 3);
+@@ -167,6 +191,7 @@ int negroni_wlan_mhi_m0(struct mhi_host *h);            /* event rings to the de
+ int negroni_wlan_mhi_wait_ee(struct mhi_host *h, uint32_t ee, const char *name);
+ int negroni_wlan_mhi_poll(struct mhi_host *h);
+ int negroni_wlan_mhi_start_ipcr(struct mhi_host *h);
++int negroni_wlan_mhi_tx(struct mhi_host *h, const void *data, uint32_t len);    /* channel 20, EOT */
+ void negroni_wlan_mhi_reset(struct mhi_host *h);        /* failure path: MHICTRL RESET */
+ 
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
