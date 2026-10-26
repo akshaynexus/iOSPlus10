@@ -2475,3 +2475,230 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Fix: patches/xnu/0363-negroni-boot-line-1024.patch (BOOT_LINE_LENGTH 1024 = DarwinBoot's layout). Guard:
   scripts/ios16/build.sh refuses boot-args of 1024 bytes or more. Variant list: scripts/ios16/variants/everything.args.
   The slop shim loader (external/slop/shim/loader.c, 608) is a different boot path (not used with UniXNU).
+
+## 37. Wi-Fi: negroniwlan_smmu=3 default, SMMU re-check, chain review (2026-10-27, kernel agent; patch 0325, details: patches/xnu/README-wifi.md "0325")
+
+- Owner approved the SMMU write path: `negroniwlan_smmu=3` (0324 stage-1 context, IOVA 0xa0000000 + 256 MiB) is the
+  default whenever `negroniwlan>=2`; `=1`/`=0` keep the old report-only path.
+- [V, live.dts pcie0] `iommu-map` RID 0 -> 0x1c00, RID 0x100 -> 0x1c01, `qcom,smmu-sid-base 0x1c00`; wlan iommu group:
+  `iommu-faults = stall-disable, HUPCF, no-CFRE, non-fatal`, `iommu-pagetable = coherent`, pcie0 `dma-coherent`.
+- [V, pci-msm.c msm_pcie_config_sid] Android programs the PCIe BDF-to-SID table (PARF 0x2c00 bit 0 BYPASS off, 256
+  hash entries at PARF 0x2000, BDF 0x100 -> SID offset 1 at crc8 hash 0x15) on every link enable. Our survey resets the
+  core at step 7, so the table is at reset. [I] Without it the chip may DMA as SID 0x1c00: the 0263/0324 SMR for 0x1c01
+  alone could miss it. 0325 programs the table (policy 3) and the SMR matches 0x1c00 mask 1.
+- [V, U-Boot qcom-hyp-smmu.c] free context bank = CBAR type S2_TRANS, or S1_TRANS_S2_BYPASS with VMID 0xff; it then
+  writes S1_TRANS_S2_BYPASS VMID 0 + CBA2R VA64. HakiOS redwood_wifi.c (SM7325, Gunyah) did the same SMMU stage-1
+  setup for WCN6750 (stream 0x1c00 mask 1, SMR 8 / context 7) and it worked on its phone (comment, 13 October).
+- [V] Kernel out/kernel/local-20261026-202932 (sha256 c8c3a9d5...d0eb) contains the first 0325 (without 0363 and without the
+  review fix of the SMR reuse rule; a later kernel of this agent carries both), 238 patches applied, only the 4 dxb skips;
+  kernel.macho points to it (build-local.sh relinks). objdump: every apps-SMMU access in negroni_wlan_smmu.c is a plain
+  `ldr w, [x]` / `str w, [x]` (50 / 18); the writeback stores there are page-table entries in RAM.
+- Not run on the phone. Test boot args: `negroniwifi=10 negroniwlan=10 negronipanic=30 negronipanicreason=2`.
+- Next (0326+): join (open) by WMI mgmt tx, then the HTT data path (needed for EAPOL), then WPA2 in the kernel by
+  porting HakiOS wifi/lx lx_wpa.c (MIT), then en0 + DHCP, then the Apple80211 glue.
+
+## 38. Camera + audio DMA addressing, iOS camera stream (2026-10-27, kernel agent; patches 0249, 0317, 0318; details: patches/xnu/README-camera.md "0317, 0318 and 0249", plan docs/camera-ios-2026-10-27.md)
+
+- [V] Bug: 0243 (audio ring), 0315 (frames) and 0316 (HFI) allocated with `kmem_alloc_contig(max_pnum = 4 GiB - 1)`,
+  but all XNU RAM is at 0x840000000+: the allocations always failed. Fixed: allocations anywhere + an apps-SMMU
+  stage-1 context of ours (new helper `bsd/dev/negroni_smmu_s1.c`, 0249, a generic copy of the Wi-Fi 0324/0325
+  sequence; TODO one shared negroni_smmu.c for both). No collision with Wi-Fi: top-down vs bottom-up, U-Boot CBAR
+  free rule (as 0325), SCTLR.M/S2CR checks, SMR re-read before each write, CBAR/CBA2R restored.
+- [V source] Audio: Android gives the ADSP `IOVA | (0x1801 & 0xf) << 32` from the msm-audio-ion context (pool
+  0x10000000 + 256 MiB, live.dts:24782-24791), not a physical/carveout address: out/src/op-modules
+  vendor/qcom/opensource/audio-kernel/dsp/msm_audio_ion.c:37 (MSM_AUDIO_SMMU_SID_OFFSET 32), :276-279 (IOVA |= SID
+  bits), :901-904 (SID from the iommus cell & qcom,smmu-sid-mask). 0249: ring at IOVA 0x10000000, ADSP
+  address 0x110000000. `negroniaudio_smmu=0` = old path.
+- Review fixes (Opus review ACCEPT + FIX, applied): the exported claim lock `negroni_smmu_claim_lock` (header
+  negroni_smmu_s1.h) is held from the free-entry scan to the last SMR/S2CR/CBAR write and over the teardown; the
+  CBAR is read again right before it is written; map checks the TLB sync. Wi-Fi 0324/0325 is outside the lock until
+  it takes it. Camera: HFI block freed only after the SMMU teardown and kept (leaked) when the ICP PAS shutdown
+  fails; >= 1 MiB unmapped IOVA after each buffer; /dev/negronicam root:mobile 0660.
+- Camera 0317: `negronicam_smmu=3` (default at level >= 5): IFE SMR 0x800/0x460, ICP (level 6) 0x2000/0x2040/0x2100
+  mask 0x420 + 0x2080/0x400; frames at IOVA 0x10c00000+, HFI in Android's fw_uncached (0x10400000) + shared
+  (0x800000) layout. ICP PAS SCM resume loop 2000000 (as 0240).
+- Camera 0318: `negronicam=7` publishes `/dev/negronicam` with the HakiOS `/dev/hakios-camera` ABI (120-byte header,
+  magic NCFRAME1); a read starts a session (bring-up, 3-place ring, SOF address rotation), last close / 1 s idle /
+  fault ends it. iOS side (not started): port HakiOS camera_device.c + camera_isp.c + the vendor hook
+  (20H392 `+[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor]` = 0x1a1f40c84, other addresses in the plan),
+  ADT `/arm-io/isp camera-rear=1`, `/product/camera`.
+- [V] Kernel out/kernel/local-20261026-210550 (sha256 87b572181039611225db8bb5d84357bf302b1bad352dc9ddccfeebe770ae7bc5, with the review fixes),
+  249 patches applied, only the 4 dxb skips; build-local.sh relinked out/kernel/kernel.macho to it. Not run on the phone.
+- Test boot: `negronicam=5 negronipanic=30 negronipanicreason=2` (TPG only: + `negronicam_src=1`), then `negronicam=7`.
+
+## 39. Bluetooth: stage A step 4 root cause, patch 0334 (2026-10-27, kernel agent; details patches/xnu/README-bluetooth.md "0334")
+
+- [V] The everything boot stopped at step 4 because `gcc_qupv3_wrap_2_s_ahb_clk` is a hardware-gated branch:
+  CBCR 0x80000002 = CLK_OFF + HW_CTL. Linux skips the halt check in that mode (clk-branch.c `clk_branch_wait`);
+  0330 waited for CLK_OFF = 0. The vote bits worked (core, core_2x, m_ahb, s5 on). 0350 (fingerprint) stops on the
+  same bit in the same boot (`wrap_1_s_ahb ... CBCR 0x80000002`): the same fix applies there (not changed).
+- 0334: on / hw-gated / OFF branch states; RPMh BCM `QUP2` vote (qup-core, 5000 kBps = CORE_2X_100_MHZ, bcm-voter
+  arithmetic, vote_scale 1) through new `negroni_rpmh_qup_bcm`; failure only logged; `negronibt_bcm=0`, `negronibt_bcm_kbps`.
+- [V] GENI SE firmware: the OnePlus kernel never loads it; upstream loads it only for protocol 0xff + `firmware-name`
+  (absent on SM8450) -> the boot chain loads it. [I strong] step 5 shows protocol 2.
+- [V] Userland is ready up to the transport (logs/phone-log-20261027-004129.txt): ADT `bluetooth` node, bluetoothd job,
+  negroni-bluetool boot/init result 0, keychain reads/writes result 0 (no bergamota keychain blocker). Reason 1201 =
+  transport init failed (CTLIOCGINFO on a kernel without 0332, or a chip-FAILED transport).
+- [V] The phone's WLAN area holds the BT pack (WLAN: `firmware area has 199 files`).
+- Build: out/kernel/local-20261026-204513/kernel.development.negroni sha256
+  f3c1e0d222eb3b8181c172cb82724ad826f4ee13c05b601055a5db28a4723de4 (all patches applied, only the 4 dxb skips).
+  Not run on the phone. Test boot-args: `negronibt=4 negronipanic=30 negronipanicreason=2` (+ `ADT_BT=1` image, BT root).
+- 0335 (owner bug "Bluetooth cannot be switched off"): with a failed chip, each host command gets a local Command
+  Complete with status 0x03, not EIO. [I] Before, bluetoothd hung in its power-on.
+  With a working chip, power follows the client: 3 s after the last close, BT_EN goes low; the next connect powers
+  the chip on again (BT_EN sequence + HCI stage).
+  [V] The 2-minute repeats in usblog-20261026-233816 are whole phone reboots.
+  [V] bluetoothd keeps the switch as `defaultPoweredState` through SCPreferences
+  /Library/Preferences/SystemConfiguration/com.apple.radios.plist (the file was empty, so the default was on). [I] The
+  key lives in that file.
+  Build: out/kernel/local-20261026-205555 sha256 7c3a4660b85f8061db979cc17bc9e151a21bf1517165b5512e833392a62f6281
+  (0334 + 0335 applied, only the 4 dxb skips). The table is in README-bluetooth.md "0335".
+
+## 40. Fingerprint overlay: lock screen + capture only; QUP1 hw-gated clocks (2026-10-27, kernel agent; patch 0354, details patches/xnu/README-fingerprint.md "0354")
+
+- [V] The white disc on the display came from `negronifp_hl=2` in the everything boot-args (0351 drew it on every
+  frame from boot and made every GPU frame wait on its copy fence in presentFinish). The main session dropped the
+  boot-arg; 0354 changes the semantics: `negronifp_hl=1|2` only ALLOWS the overlay, nothing is drawn by itself.
+- 0354 (NegroniFramebuffer.cpp): shown = 1 the lock-screen glyph (two thin rings, 25 % blend, no fill, no HBM) while
+  `kern.negroni_fp_ui=1`; 2 the capture disc only while 0353's capture window is open (2 s timeout) and a finger
+  is inside the circle (negroni_touch.c -> `negroni_fp_touch`); else nothing, no fence wait, no per-frame cost.
+  Drawn after each copy and at once on a state change (`negroni_fp_overlay_update`, pixels under it saved and
+  restored; not while zero-copy is active). `negronifp_hl=2` skips the HBM DCS set in the capture.
+- 0354 (negroni_fp.c): sysctl `kern.negroni_fp_ui` (root writes); step 11 waits `negronifp_fingerwait` (10 s) for
+  a finger before HBM + disc (no finger: no HBM, no disc, the protocol test runs); step 2: `wrap_1_m_ahb`/`s_ahb`
+  with HW_CTL (CBCR 0x80000002, where 0350 stopped on the phone) are not checked, as Linux clk_branch_wait and
+  0334 for QUP2; RPMh BCM `QUP1` vote first (0334's `negroni_rpmh_qup_bcm`, `negronifp_bcm=0` skips).
+- Userland: `userland/fp/negroni-fpd.c` (root launchd daemon, notify(3) `com.apple.springboard.lockstate` /
+  `hasBlankedScreen` -> `kern.negroni_fp_ui`), `userland/fp/build.sh` (built: out/fp/userland/negroni-fpd),
+  `FPD=1 scripts/fp/root-add-fpd.sh ROOT` (root-finish.sh hook, default off; tested on a fake root: job
+  `com.iosplus10.negroni-fpd` in the launchd cache). [I] the notification names/states are the public ones; not yet
+  seen on this port's SpringBoard. The glyph needs `negronifp_hl=1` + a `FPD=1` root; it also shows over Control
+  Center / Notification Center / the camera on the lock screen.
+- Opus review REJECT -> fixed and regenerated: F1 one IOLock around every drawing and state change, save buffer
+  and lock made once at the boot-arg parse (no IOFree/realloc race); F2 fingers tracked in every mode (the
+  default negronifp_hl=0 capture keeps its finger-gated HBM); F3 the glyph is a fixed dim grey 0x505050, not a
+  blend (idempotent over re-copies); F4 presents counted in present(); limits [I]: a stale 191x191 restore after a
+  present that did not rewrite the area, one frame without the glyph when a direct drawing held the lock.
+- Test boot-args: `negronifp=4 negronifp_hl=2 negronifb_te=1 negronipanic=30 negronipanicreason=2` + `FPD=1`
+  root. Expect `clock wrap_1_s_ahb hw-gated (CBCR 0x80000002 ...)` then step 3 (new), `capture: put a finger on the
+  sensor area (10 s)`, `NEGRONI FP HL: overlay capture disc (...)` while the finger is on the circle, and
+  `overlay lock-screen glyph (ui 1, ...)` at lock / `overlay off` at unlock with the daemon.
+- Build (after the review fixes): see the SHA256 line below (all patches applied incl. 0334, 0354, 0364; only the
+  4 dxb skips; link out/kernel/kernel.macho). Not run on the phone; no image built.
+
+## 41. 120 Hz display mode for UIKit, charging state for the battery UI (2026-10-27, kernel agent; patches 0364, 0365; details docs/display-refresh-plan.md section 9, patches/xnu/README-battery.md section 13)
+
+- [V disasm 20H392] `UIScreen.maximumFramesPerSecond` = round(current `CADisplayMode.refreshRate`); `CADisplayMode
+  refreshRate` = bits 29..53 of QuartzCore's packed mode / 65536 (the timing's `SyncRate`, 16.16). Modes come from
+  the IOMFB service properties `TimingElements`/`ColorElements` (`IOMobileFramebufferGetSupportedDigitalOutModes`),
+  the current mode from GetBlock (selector 79) block 0x40, 40 bytes, ids at +4/+8. No ProMotion/MobileGestalt gate;
+  60 only for old-SDK apps; third-party CADisplayLink keeps the `CADisableMinimumFrameDurationOnPhone` rule.
+- [V log] Before 0364: backboardd `sel 79 ... out 0/40` and `out 0/1580` answered with zeros; `FB STAT swaps/s` max 97,
+  most active seconds 52-66.
+- 0364: `TimingElements` 1125x2436 @ `negronifb_modehz` (default 120) + GetBlock 0x40 = (1, 1); `negronifb_modes=0`
+  = off. Port of HakiOS `MiniIOMobileFramebuffer.cpp` publishModes (APSL 2.0). VRR (0259) unchanged.
+- [V log] Without the ADSP the charger feeds 0.5-1 A at ~5 V (`iin` 495-999 mA) while BCL `ibat` reads 0 at rest and
+  -849 mA under load: 0271/0276 said `charging=0` (no bolt). 0365: `IsCharging` = VBUS + `iin` >= 100 mA (charger
+  active, Apple/Linux meaning), PD `BATT_STATUS` when the ADSP charger PD is up; `AdapterDetails` Watts/Current/
+  AdapterVoltage measured, `FamilyCode` from PD `USB_ADAP_TYPE` (id 7 on OPLUS; HakiOS uses id 6 `USB_TYPE` on its
+  Poco firmware); `Amperage` filtered, times to full/empty. New log line `NEGRONI BATTERY: charge: ...`.
+- Build: out/kernel/local-20261026-210122/kernel.development.negroni sha256
+  76421ecaf704b4b27f1da5ac0854f92f334ef4c4686c6f3e7a0f58fecb1bdfed (248 applied incl. 0363-0365, only the 4 dxb
+  skips). Not run on the phone; no image built. Test with `scripts/ios16/variants/everything.args` (needs
+  `negronibatt=5` for VBUS/iin); fallback `negronifb_modes=0`.
+
+## 42. Wi-Fi greyed out in Settings: wifid never starts; iOS side 0340/0341 (2026-10-27, kernel agent; details patches/xnu/README-wifi.md "0340-0341")
+
+- [V] ROOT CAUSE: the launchd job `com.apple.wifid` has `_LimitLoadToDeviceTree = ("wlan", "marconi-wifi")`. launchd
+  20H392 checks it with MIG 2887 `io_device_tree_entry_exists_with_name` = `IODTFindMatchingEntries(root, recursive,
+  name)`. Our ADT has neither node, so wifid never runs: `bootstrap_look_up of WiFiManager server failed`,
+  `WiFiManagerClientCopyDevices failed: NULL` (phone-log-20261027-004129). [I] Settings disables the switch without a
+  WiFiManager device; Control Center only changes its own state.
+- [V] HakiOS hit the same gate (`userland/mkjobs.py:271-273` drops the key). We make the DT entry in the kernel.
+- [V] IO80211.framework 20H392 matches `IO80211Controller`, then `IOPropertyMatch` `IO80211InterfaceRole` =
+  `Infrastructure` + `IOInterfaceName`, and without a user client "Falling back to IOCTL path". XNU passes unknown
+  interface ioctls to the driver (bsd/net/if.c:3548-3564), so SIOCGA80211/SIOCSA80211 reach en0.
+- 0340: DT entry `wlan` at boot (before launchd), en0 (KPI ifnet, subfamily Wi-Fi, chip MAC) when the 0326 seam is
+  IDLE, property-only IO80211Controller + IONetworkInterface, worker thread, KEV_DL_LINK_ON/OFF, soft radio switch,
+  fake radio `negroniwlan_ios=2`. 0341: Apple80211 gets/sets + class-6 events (HakiOS layouts, 16.5). Port of HakiOS
+  APSL 2.0 files, notices kept. Numbering 0340-0345 = Wi-Fi iOS side (main session).
+- Build: out/kernel/local-20261026-210736/kernel.development.negroni sha256
+  249afbcc6f2a06bf59e90c969d3d686e607b15f261d7a930f7ba9dfe9c1cc5b5 (251 applied incl. 0326, 0327, 0340, 0341; only the
+  4 dxb skips; link out/kernel/kernel.macho). Not run on the phone; no image built.
+- Test: first `negroniwlan_ios=2` (UI only: 3 fake networks, passphrase `negronifake`), then everything.args.
+  Expect `NEGRONI WLAN iOS: ... IODeviceTree "wlan" made`, `en0 attached`, `wifid gets/sets ...` lines, and the
+  180 s per-type summary (the list of requests still refused).
+- Scratch: out/src/hackios-next (HakiOS clone, shared with another agent) is still there; delete it when nobody needs it.
+- Build: out/kernel/local-20261026-211510/kernel.development.negroni sha256
+  32100110d7d51d500072de5a946cf929d674304354f9f979951b0e59dff8587c (252 patches applied incl. 0334, 0354, 0364;
+  only the 4 dxb skips; link out/kernel/kernel.macho). Not run on the phone; no image built.
+
+## 43. Camera.app: ADT nodes + NegroniCamera.driver (2026-10-27, userland agent; details userland/camera/README.md)
+
+- [V] Camera.app has SBAppTags/UIRequiredDeviceCapabilities `still-camera` (section 4). [I, from HakiOS
+  docs/ru/notes.md:1712-1722 + xnuloader/loader.c:3226-3234, not our disassembly] MobileGestalt answers
+  `still-camera`/`rear-facing-camera` from `/arm-io/isp` `camera-rear` = 1, which our ADT did not have.
+  Fix: `ADT_CAM=1` in `scripts/ios16/adt-extra.py` adds `/arm-io/isp` (only `camera-rear` = 1, no compatible) and
+  `/product/camera` (no `flash`); no `camera-front` (no IMX615 driver). Checked on a copy:
+  `out/camera/negroni-adtcam.adt`, `out/camera/adt-camera-dump.txt` (phandles 0x18, 0x19). Image ADT unchanged.
+- Ship-together rule: `scripts/camera/root-add-camera.sh` (CAMERA=1; root-finish.sh default on when the driver is
+  built) writes the stamp `out/camera/root-has-camera` (sha256 of the installed driver, date, root path).
+  `scripts/ios16/build.sh` sets `ADT_CAM=1` by default only when the stamp sha = the built driver's; otherwise it
+  warns and leaves the nodes out (`ADT_CAM=1/0` overrides). So build the root before the image.
+- [V] launchd: no job in the 20H392 root (/private/tmp/iosroot-ro, xpc/launchd.plist) has `_LimitLoadToDeviceTree`
+  `isp` or `camera`; the only ones are SepUpdateTimer (hilo), biometrickitd.pearl (pearl-sep), wifid (wlan,
+  marconi-wifi), iomfb_bics_daemon (hilo, twodbl). applecamerad/dietapplecamerad start on IOResources properties,
+  not on DT nodes. The new nodes start no Apple camera daemon. Nothing stripped.
+- [V] `userland/camera/`: HakiOS camera_device.c + camera_isp.c (MIT, 8851317) + the hook part of inject_media.c ->
+  `NegroniCamera.driver` (HAL plug-in, factory returns NULL, constructor in mediaserverd only, no hooks if the self
+  pin fails). 144 720 bytes, sha256 d5ab3cc95d784dca29d7d9a62a54457150817daf0daa968e87f257f592ac166d, arm64, minos
+  16.0, no weak imports, ad hoc, no entitlements. ISP self test (colour bars, 4 Bayer orders) PASS on the host.
+- [V] `scripts/camera/check-cache.sh` PASS: cache UUID 8F970452-C9E3-3E88-B114-FEB1864BC9E0, base 0x180000000; 8 hook
+  addresses + first words (portrait prewarm `+[BWCoreImageFilterRenderer
+  prewarmPortraitFilterVersion:semanticStyleFilters:]` = 0x1a2165b8c in 20H392); H10ISP vtable versions 1/3/1/2 as
+  HakiOS 16.5; all dlsym targets exported (kFigCapturePortType_* and the metadata keys in CMCaptureCore,
+  HEVCVideoEncoder_CreateInstance in VCPHEVC.videocodec).
+- Refusal, exactly: the device create function checks only `access(/dev/negronicam)` and `negronicam_failed`
+  and returns -12783 at once. EIO, a bad header, 5 failed reads or no memory are seen by the frame worker of an
+  existing device: it sets `negronicam_failed` and stops (that session: black preview, the shutter waits [I]);
+  the next stream start and device create are refused. [I] Camera.app's view of a refused create is not seen.
+- Gotcha: `ipsw dyld symaddr CACHE SYM --all` scans the whole cache for minutes; use `--image NAME` (0.5 s).
+- Next: image with `negronicam=7` (everything.args has `negronicam=6`, which does not publish /dev/negronicam:
+  0318 publishes at level == 7 only) + a CAMERA=1 root first, then the image (ADT_CAM default). Not verified: HAL with a
+  NULL factory, IFE latch event, IMX789 Bayer order, gain formula, black level 64, picture orientation.
+
+## 43. USB gadget does not come back after unplug or an ADSP Type-C re-attach; patch 0366 (2026-10-27, kernel agent; details patches/xnu/README-usb.md "0366")
+
+- [V] Unplug + replug (~02:30) and the first boot with a running ADSP (02:42:23, 3 s after `THE ADSP IS UP`): the Mac
+  lost the device and never saw it again. The phone kept running.
+- [V] The QSCRATCH VBUS override hides the detach: no disconnect event. DEVTEN 0x7 hid the L2 suspend too. A bus
+  reset did not ENDTRANSFER the always-active RX ring (0361), a stuck TX batch or a notification. Nothing retried.
+- [V] GUSB2PHYCFG 0x00102500 at boot: SUSPHY already 0, ENBLSLPM 1. sm8450.dtsi sets dis_u2_susphy + dis_enblslpm.
+- [I] Exact replug failure unknown (no log from that period). Fix covers both candidates.
+- [I] logs/usblog-20261026-233816.txt: the losses at 02:03:33 and 02:05:29 were reboots (log silent ~12 s before,
+  new boot ~64 s later); 02:06:40 has no silence before it (unplug or link loss).
+- 0366: ENDTRANSFER on reset/disconnect/SET_CONFIGURATION(0), ep0 back to setup phase, DEVTEN + wakeup/suspend/
+  erratic/link-change (all logged with DSTS), GUSB2PHYCFG SUSPHY+ENBLSLPM off, DSTS watchdog every 100 ms: no SOF
+  for 5 s, or a device event without SOF after 1 s -> soft disconnect + core soft reset + connect (Linux
+  dwc3_gadget_soft_disconnect/_soft_connect). Also in the panic loop. Fallbacks: negroniusb_reconnect=0,
+  negroniusb_resetend=0, negroniusb_events=0, negroniusb_phycfg=0.
+- [I] Not done: the ADSP may also want a UCSI client (pmic_glink owner 32779) on PMIC_RTR_ADSP_APPS. Linux
+  ucsi_glink answers it; we do not. If the re-attach repeats after the ADSP comes up, look there next.
+- Build: out/kernel/local-20261026-211915/kernel.development.negroni sha256
+  fc74bf13c70df36a89bb0cb042b390f536e0acb77627b58d5879dd8450aca411 (253 applied incl. 0366; only the 4 dxb
+  skips; link out/kernel/kernel.macho). Not run on the phone; no image built.
+- Test: unplug 10 s, replug: expect `no SOF for 3 s`, `soft reconnect #1`, then `bus reset`, `connected`,
+  `configured (1)`, `SOF again after N ms`; en10 back within 5 s of the replug (worst case ~7 s).
+
+## 44. Phone proofs 2026-10-27 02:40-02:51 (main session; boot_a = out/ios16-safe, tests RAM-booted)
+
+- [V] RAM test t1 (kernel local-20261026-210736, all SMMU writers off by boot-arg): `NEGRONI ADSP: 8 THE ADSP IS UP
+  after 35 ms`, GLINK step 9 ok (0240 SCM resume fix). 3 s later the Mac lost the USB gadget for good; the phone later
+  reset to the Apple logo without USB; a clean `fastboot reboot` into out/ios16-safe brought USB back (02:48:22).
+  [I] the ADSP firmware (Type-C/charger owner) re-attaches the port; the gadget does not recover (agent on 0366).
+- [V] RAM test t2 (kernel local-20261026-211707, negroniadsp=0, negroniwlan_ios=2): Bluetooth stage A passes step 4
+  (`s_ahb hw-gated`, BCM QUP2 vote errno 0), SE5 FW protocol 2 (UART), 115200 RTS/CTS, BT_EN sequence, HCI_RESET
+  ok, QCA product 0x13 SoC 0x400c0210 ROM 0x0201, 3 Mbaud, rampatch + NVM from the WLAN-area pack, then bluetoothd
+  drives the controller over com.apple.uart.bluetooth (LE commands 0x2060/0x202f/0x2031/0x2024/0x201c/0x200f/0x204a/
+  0x2074 all Command Complete status 0 at 02:50:07). Battery line `external=1 charging=1` (0365). backboardd
+  `GetBlock 0x40 ... current mode (colour 1, timing 1)` (0364). wifid/configd query en0 (0340/0341, fake radio mode).
