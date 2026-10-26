@@ -690,6 +690,7 @@ about 1500 us at 220 MHz / 400 us at 818 MHz, and the clock dump's PLL0 L field 
 See `README-thermal.md`. 0281 turns the fixed level-12 vote into a busy-based governor on the watch
 thread (idle 500 ms -> level 4, busy 200 ms -> one level up, max `negronigpu_level`, thermal cap from
 0280). `negronigpu_dcvs=0` restores the 0235 behaviour.
+
 ## 16. GPU power: IFPC and slumber (0285, `negronigpu_ifpc` / `negronigpu_slumber`)
 
 Symptom (owner, 2026-10-26): with Metal on, the GPU runs hot and drains the battery.
@@ -807,3 +808,45 @@ fence` lines and no `RedwoodGPU: ... no answer for 2 s`. Back: `negronigpu_ifpc=
 
 Build (2026-10-26): see docs/notes.md section 17 end.
 
+## 17. TE-locked vsync and idle refresh switching (0259, `negronifb_te` / `negronifb_vrr`, default off)
+
+Report: `docs/display-refresh-plan.md` (Android's TE/auto-refresh/ADFR path, the DCS sets with live.dts
+line numbers, the DPU registers). Files: NegroniFramebuffer.cpp (`teInit/teTick/teLog`, `vrrTick/
+vrrWakeLocked/vrrWork/vrrSetRate`, hooks in `vsyncFired`, `rearm`, `swap`, RequestPowerChange, `statTick`),
+NegroniBacklight.cpp (`negroni_dsi_dcs_set`, `negroni_backlight_panel_ready`, NDSI_MAX_PAYLOAD 60).
+
+- `negronifb_te=1`: INTF_1 (0x0AE36000, mapped through fMdss when 0234's probe mapped the DPU, else its own
+  page) INT_COUNT_VAL (0x298) = TE count << 16 | lines since the TE. Each tick: phase of the tick's deadline
+  after the TE = (line - VSYNC_INIT_VAL) x vsync_count / 19.2 MHz; error against the target
+  (`negronifb_te_off`, us after the TE, negative = before the next; default -800); the next deadline moves by
+  -error/2, at most a quarter period. TE period = frames per second from the count; the tick period follows it
+  when within 15 % of nominal. `=2` also sets INTF_VSYNC_TIMESTAMP_CTRL and logs the stamp.
+  Boot: `NEGRONI FB TE: INTF_1 tear_en 1 sync_cfg 0x... (te pin 1, counter 1, vsync_count 66 = 3437 ns/line)
+  height 65520 init 2412 start 2412 ... autorefresh 0x80000001 ...` (expected values), `NEGRONI FB TE: lock on,
+  target 800 us before the TE`. Per second (after the STAT line): `NEGRONI FB TE: te/s 120 period us 8333 tick
+  us 8333 phase us P target T err avg/max us A/M adj us D locked L/S ticks (no sample N) count 0x... autorefresh
+  0x...`. Locked = |err| <= 500 us; expect L/S near 120/120 after a few seconds. `no TE for 120 ticks` = the
+  counter does not move (display off or no TE pin): no lock.
+- `negronifb_vrr=1|2|3`, `negronifb_vrr_fps` (default 10), `negronifb_vrr_ms` (3000), `negronifb_vrr_hs=1`
+  (HS DCS). State machine under fLock (active, going idle, idle, waking); the DCS runs on a thread call
+  (`vrrWork`), never on the vsync work loop or backboardd's thread; `swap()` and RequestPowerChange call
+  `vrrWakeLocked` (modes 1/3 write AUTOREFRESH_CONFIG = 0x80000001 at once). Mode 1: `BD[0x14] = 120/fps - 1`
+  then divider = 120/fps; wake: divider 1 then `BD[0x14] = 0`. Mode 2: the 60 or 90 Hz set, then `vrrSetRate`
+  (tick period, vsync interval value, `IOMFBDisplayRefresh`); wake: the 120 Hz set. Mode 3: divider only.
+  Modes 1/3 refuse to start when AUTOREFRESH_CONFIG != 0x80000001. A failed switch logs
+  `idle switch failed (rc after N packets): VRR off` and the VRR stays off for the boot (a retry every idle
+  period would reach 0250's 3-failure DSI shutdown and kill the brightness and the 0258 sleep DCS); a
+  best-effort `F0 A5 A5` closes the Samsung key after a set that failed midway. The power-off fade (step 6)
+  waits while `fVrrBusy` (at most 60 ticks = 500 ms, then `display off ... VRR set still running`) so the 0258
+  sleep DCS never lands inside a set. DCS mode: HS for mode 2 (Android's dsi_hs_mode), LP for mode 1;
+  `negronifb_vrr_hs=1|0` overrides. The per-second TE/VRR lines come from statTick (`negronifb_stats != 0`,
+  default 1). The late-tick threshold (fStatLateAbs) follows the rate in mode 2.
+  Lines: `NEGRONI FB VRR: mode 1, idle 10 Hz (hold 0x0b, autorefresh 1/12) after 3000 ms without a swap, DCS LP`,
+  `NEGRONI FB VRR: idle 10 Hz (hold 0x0b, autorefresh 1/12, 5 DCS packets, N ms)`, `NEGRONI FB VRR: active
+  120 Hz after N ms idle (5 DCS packets, N ms)`, per second `NEGRONI FB VRR: active|idle (idle 10 Hz), N idle
+  periods, idle N ms in all, DCS errors N`.
+- Risks: a timing switch the panel rejects can blank it (`negronifb_vrr=0` recovers; the config args do not
+  carry the flag); the hold with frames still arriving every N+1 TEs is not what Android does [I]; the 60 Hz
+  timing leaves the tearcheck vsync_count at the 120 Hz value [I, start_pos = init so the transfer starts
+  at the TE either way]. Build: kernel local-20261026-075816 (a39f24e5...), image out/ios16-vrr (config args +
+  `negronifb_te=1 negronifb_vrr=1`). Not booted.

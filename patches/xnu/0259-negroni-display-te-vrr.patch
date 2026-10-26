@@ -1,0 +1,959 @@
+diff --git a/iokit/Kernel/arm/NegroniBacklight.cpp b/iokit/Kernel/arm/NegroniBacklight.cpp
+index 88b56b7..988fd5c 100644
+--- a/iokit/Kernel/arm/NegroniBacklight.cpp
++++ b/iokit/Kernel/arm/NegroniBacklight.cpp
+@@ -102,7 +102,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define NDSI_INT_ENABLE_BITS            0xaaaaaaaau
+ #define NDSI_TPG_FIFO_ON                (3u << 16 | 1u << 2 | 1u << 1)
+ #define NDSI_DMA_TRIGGER_SW             4u
+-#define NDSI_MAX_PAYLOAD                16      /* bytes; the TPG FIFO holds 64 */
++#define NDSI_MAX_PAYLOAD                60      /* bytes; the TPG FIFO holds 64 with the 4-byte header (0259: was 16) */
+ 
+ static volatile uint32_t *negroni_dsi;
+ static IOLock *negroni_dsi_lock;        /* every DSI command, see negroni_dsi_dcs_write */
+@@ -157,7 +157,7 @@ negroni_dsi_init(void)
+ extern "C" int
+ negroni_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp)
+ {
+-	uint32_t words[2 + NDSI_MAX_PAYLOAD / 4];
++	uint32_t words[2 + (NDSI_MAX_PAYLOAD + 3) / 4];
+ 	uint32_t n = 0;
+ 
+ 	if (negroni_dsi == NULL || len == 0 || len > NDSI_MAX_PAYLOAD) {
+@@ -268,6 +268,48 @@ out:
+ 	return rc;
+ }
+ 
++/*
++ * 0259: send a command set in the Qualcomm device-tree format (dsi_panel.c
++ * dsi_panel_create_cmd_packets: per packet a 7-byte header {type, last, vc,
++ * flags, wait ms, length hi, length lo} then the payload). Each packet goes
++ * out as one FIFO DMA (negroni_dsi_dcs_write: the type comes from the length,
++ * which is the same for 0x05/0x15/0x39; generic types are refused), behind the
++ * same MDP-not-busy wait; a wait byte is honoured after the packet. Thread
++ * context only. 0 when every packet went out, else the first error, and
++ * *sent gets the number of packets that did.
++ */
++extern "C" int
++negroni_dsi_dcs_set(const uint8_t *set, uint32_t len, bool lp, uint32_t *sent)
++{
++	uint32_t i = 0, n = 0;
++	int rc = 0;
++
++	while (i + 7 <= len && rc == 0) {
++		uint8_t type = set[i], wait = set[i + 4];
++		uint32_t plen = (uint32_t)set[i + 5] << 8 | set[i + 6];
++		if (plen == 0 || i + 7 + plen > len) {
++			rc = -4;
++			break;
++		}
++		if (type != 0x05 && type != 0x15 && type != 0x39) {
++			rc = -5;        /* generic packets are not expected in these sets */
++			break;
++		}
++		rc = negroni_dsi_dcs_write(set + i + 7, plen, lp);
++		if (rc == 0) {
++			n++;
++			if (wait != 0) {
++				IOSleep(wait);
++			}
++		}
++		i += 7 + plen;
++	}
++	if (sent != NULL) {
++		*sent = n;
++	}
++	return rc;
++}
++
+ /* ---------------------------------------------------------------------- */
+ /* AppleARMBacklight                                                       */
+ /* ---------------------------------------------------------------------- */
+@@ -321,6 +363,7 @@ public:
+ 	bool displayOff(uint32_t fadeMs);
+ 	bool displayOn(void);
+ 	void panicWake(void);
++	bool displayIsOn(void);         /* 0259 */
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+@@ -576,6 +619,16 @@ AppleARMBacklight::displayOn(void)
+ 	return negroni_dsi != NULL && !negroni_dsi_dead;
+ }
+ 
++/* 0259: the display state iOS asked for (RequestPowerChange), any thread. */
++bool
++AppleARMBacklight::displayIsOn(void)
++{
++	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
++	bool on = fDisplayOn;
++	IOSimpleLockUnlockEnableInterrupt(fState, is);
++	return on;
++}
++
+ /*
+  * 0258: panic (negroni_fb_panic, kPEPanicBegin): the panic text must be
+  * visible on a sleeping panel. Busy waits only; DCS without the lock.
+@@ -694,4 +747,20 @@ negroni_backlight_panic(void)
+ 	}
+ }
+ 
++/*
++ * NegroniFramebuffer.cpp (0259, VRR): true while iOS has the display on and the
++ * DSI takes commands; *lp = the DCS transmission mode this service uses.
++ */
++extern "C" bool
++negroni_backlight_panel_ready(bool *lp)
++{
++	if (negroni_bl == NULL || negroni_dsi == NULL || negroni_dsi_dead) {
++		return false;
++	}
++	if (lp != NULL) {
++		*lp = negroni_bl->fLP;
++	}
++	return negroni_bl->displayIsOn();
++}
++
+ #endif /* NEGRONI */
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index b6d0cf7..b89b02e 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -144,6 +144,7 @@ extern "C" void negroni_backlight_panic(void);
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <kern/thread_call.h>
+ 
+ /*
+  * The DPU registers (528 KiB) map from kernel_map, not io_submap: io_submap is 8 MiB for the whole
+@@ -226,6 +227,265 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ #define CTL_FLUSH_CTL                     (1u << 17)
+ #define CTL_INTF_DSI0                     (1u << 1)       /* INTF_1 (qcom,sde-intf-type "dp dsi dsi dp") */
+ 
++
++/*
++ * 0259: the TE and the panel refresh. INTF_1 drives DSI0 (live.dts qcom,mdss_mdp@ae00000:
++ * qcom,sde-intf-off <0x35000 0x36000 0x37000 0x38000>, qcom,sde-intf-type "dp dsi dsi dp",
++ * qcom,sde-intf-size 0x2c4, qcom,sde-intf-tear-irq-off <0 0x36800 0x37800 0>). Register offsets:
++ * display-drivers msm/sde/sde_hw_intf.c (INTF_TEAR_*), sde_hw_interrupts.c (MDP_INTF_TEAR_INTR_*).
++ * The UEFI panel XML (Mu Panel_samsung_amb670yf08_1440_3216_dsc_cmd.xml) set DSIEnableAutoRefresh
++ * True, DSIAutoRefreshFrameNumDiv 1, DSITECheckEnable True, DSITEUsingDedicatedTEPin True,
++ * DSITEvSyncStartPos 2412, DSITEvSyncInitVal 2412, DSITEvSyncSelect 1: the tearcheck counter
++ * restarts at 2412 on every TE pulse of the panel and counts lines of vsync_clk / vsync_count
++ * (sde_encoder_phys_cmd_tearcheck_config: vsync_count = 19.2 MHz / (vtotal * fps)), and the
++ * auto-refresh sends one frame per TE. INTF_TEAR_INT_COUNT_VAL = frame count << 16 | line.
++ */
++#define NEGRONI_INTF1_OFF                 0x36000UL
++#define NEGRONI_INTF1_PA                  (NEGRONI_MDSS_PA + NEGRONI_INTF1_OFF)
++#define NEGRONI_INTF1_LEN                 0x1000
++#define INTF_FRAME_COUNT                  0x0ac
++#define INTF_LINE_COUNT                   0x0b0
++#define INTF_VSYNC_TIMESTAMP_CTRL         0x210
++#define INTF_VSYNC_TIMESTAMP0             0x214
++#define INTF_VSYNC_TIMESTAMP1             0x218
++#define INTF_STATUS                       0x26c
++#define INTF_TEAR_MDP_VSYNC_SEL           0x280
++#define INTF_TEAR_TEAR_CHECK_EN           0x284
++#define INTF_TEAR_SYNC_CONFIG_VSYNC       0x288   /* bit 20 TE pin, bit 19 counter enable, [18:0] vsync_count */
++#define INTF_TEAR_SYNC_CONFIG_HEIGHT      0x28c
++#define INTF_TEAR_SYNC_WRCOUNT            0x290
++#define INTF_TEAR_VSYNC_INIT_VAL          0x294
++#define INTF_TEAR_INT_COUNT_VAL           0x298
++#define INTF_TEAR_SYNC_THRESH             0x29c
++#define INTF_TEAR_START_POS               0x2a0
++#define INTF_TEAR_RD_PTR_IRQ              0x2a4
++#define INTF_TEAR_WR_PTR_IRQ              0x2a8
++#define INTF_TEAR_LINE_COUNT              0x2b0
++#define INTF_TEAR_AUTOREFRESH_CONFIG      0x2b4   /* bit 31 enable, [15:0] frames per refresh */
++#define INTF_TEAR_INTR_STATUS             0x804   /* 0x36800 + MDP_INTF_TEAR_INTR_STATUS_OFF */
++#define NEGRONI_TE_VSYNC_CLK_HZ           19200000u
++#define NEGRONI_TE_TARGET_DEFAULT         (-800)  /* tick 800 us before the next TE */
++#define NEGRONI_TE_LOCK_US                500     /* |error| below this = locked */
++#define NEGRONI_VRR_FPS_DEFAULT           10
++#define NEGRONI_VRR_IDLE_MS_DEFAULT       3000
++#define NEGRONI_VRR_AR_ON_1               (1u << 31 | 1u)
++#define NEGRONI_VRR_OFF_WAIT_TICKS        60      /* display off waits this long for a running VRR set (500 ms) */
++enum { kNegroniVrrActive = 0, kNegroniVrrGoingIdle, kNegroniVrrIdle, kNegroniVrrWaking };
++
++/*
++ * The panel's own refresh-rate commands, from the device tree of the booted Android (out/live.dts,
++ * node qcom,mdss_dsi_panel_samsung_amb670yf08_fs_1440_3216_dsc_cmd, line 35551; FHD timings), in
++ * the dsi_panel.c packet format. The on-command (line 35658) ends in the 120 Hz state (60 00,
++ * B9[0x38]=B9[0x3a]=02, BD[0x14]=00); the UEFI init is the same panel XML.
++ * 120 vs 60: B9[0x3a] 02->05, B9[0x38] 02->05, 60 00->01, BD[0x14] 00->01; the rest is identical.
++ * Min fps (oplus_adfr.c dsi_panel_send_auto_minfps_dcs, the SDC "manual min fps" of the 120 Hz
++ * timing): BD[0x14] = frames the panel holds each picture, 120 / (N + 1) Hz; oplus
++ * OPLUS_ADFR_AUTO_MIN_FPS_*: 0 = 120, 1 = 60, 2 = 40, 3 = 30, 4 = 24, 5 = 20, 0x0b = 10, 0x77 = 1 Hz.
++ */
++/* out/live.dts line 35659: timing@fhd_sdc_120 qcom,mdss-dsi-timing-switch-command (721 bytes) */
++static const uint8_t negroni_vrr_switch_120[721] = {
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x05, 0x2a, 0x00, 0x00, 0x04, 0x37,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x05, 0x2b, 0x00, 0x00, 0x09, 0x6b,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xc3, 0x89,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x24, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x3a, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x50, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x61, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x17, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xc0, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x31, 0xc5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x22, 0xc5, 0x29, 0x14, 0x00, 0x00, 0x00, 0x11, 0x10, 0x50, 0x05, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xfc, 0x5a, 0x5a,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x02, 0x60,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x60, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf2, 0x00, 0x01,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xfc, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x22, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0xa1, 0xb1,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x3a, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x02,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x26, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0x00, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x24, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x21,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x38, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x02,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x2a, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0x00, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x21,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x16, 0xf2,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf2, 0x1b, 0x50,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x08, 0xcb,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xcb, 0x24,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x60, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x10, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x16, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x77,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x14, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x63, 0xcb,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xcb, 0x08,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xbd, 0x23, 0x02,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++};
++/* out/live.dts line 35834: timing@fhd_sdc_60 qcom,mdss-dsi-timing-switch-command (721 bytes) */
++static const uint8_t negroni_vrr_switch_60[721] = {
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x05, 0x2a, 0x00, 0x00, 0x04, 0x37,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x05, 0x2b, 0x00, 0x00, 0x09, 0x6b,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xc3, 0x89,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x24, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x3a, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x50, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x61, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x17, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xc0, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x31, 0xc5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x22, 0xc5, 0x29, 0x14, 0x00, 0x00, 0x00, 0x11, 0x10, 0x50, 0x05, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xfc, 0x5a, 0x5a,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x02, 0x60,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x60, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf2, 0x00, 0x01,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xfc, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x22, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0xa1, 0xb1,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x3a, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x05,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x26, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0x00, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x24, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x21,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x38, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x05,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x2a, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0x00, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x21,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x16, 0xf2,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf2, 0x1b, 0x50,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x08, 0xcb,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xcb, 0x24,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x60, 0x01,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x10, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x16, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x77,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x14, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x01,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x63, 0xcb,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xcb, 0x08,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xbd, 0x23, 0x02,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++};
++/* out/live.dts line 35788: timing@fhd_sdc_90 qcom,mdss-dsi-timing-switch-command (652 bytes, 55 packets) */
++static const uint8_t negroni_vrr_switch_90[652] = {
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x05, 0x2a, 0x00, 0x00, 0x04, 0x37,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x05, 0x2b, 0x00, 0x00, 0x09, 0x6b,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xc3, 0x89,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x24, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x3a, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x50, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x61, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x17, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xc0, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x31, 0xc5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x22, 0xc5, 0x29, 0x14, 0x00, 0x00, 0x00, 0x11, 0x10, 0x50, 0x05, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xfc, 0x5a, 0x5a,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x02, 0x60,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x60, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf2, 0x00, 0x01,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xfc, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x22, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0xa1, 0xb1,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x3a, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x03,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x26, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0x00, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x24, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x21,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x38, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x03,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x2a, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0x00, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x16, 0xf2,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf2, 0x1b, 0x50,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x08, 0xcb,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xcb, 0xa4,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xbd, 0x21, 0x82,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x60, 0x09,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x10, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++};
++
++/* oplus_adfr.c: qcom,mdss-dsi-qsync-min-fps-0-command of timing@fhd_sdc_120 (line 35655), the
++ * last byte of the BD write replaced by the hold count (SDC_MANUAL_MIN_FPS_CMD_OFFSET). */
++static const uint8_t negroni_vrr_minfps_set[] = {
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x14, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++};
++#define NEGRONI_VRR_MINFPS_EXT_OFF        29      /* the BD value byte above */
++
++extern "C" int negroni_dsi_dcs_set(const uint8_t *set, uint32_t len, bool lp, uint32_t *sent);   /* NegroniBacklight.cpp */
++extern "C" bool negroni_backlight_panel_ready(bool *lp);
++extern "C" int negroni_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp);
++
+ static const uint32_t negroni_sspp_off[NEGRONI_SSPPS] = {
+ 	0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000,
+ };
+@@ -339,6 +599,45 @@ public:
+ 	uint32_t      fGaveUpLogged[NEGRONI_FB_GIVEUP_LOGGED], fGaveUpLogN;
+ 	uint32_t      fStatSkips, fStatGaveUp;
+ 
++	/* 0259: TE-locked tick (negronifb_te) and idle refresh switching (negronifb_vrr); work loop unless noted */
++	vm_offset_t   fIntf;          /* INTF_1 registers (0: not mapped) */
++	uint32_t      fTeMode;        /* negronifb_te (0 off, 1 lock, 2 lock + vsync timestamps) */
++	uint32_t      fTeInit;        /* INTF_TEAR_VSYNC_INIT_VAL: the counter after a TE */
++	uint32_t      fTeLineNs;      /* one tearcheck line, ns (vsync_count / 19.2 MHz) */
++	int32_t       fTeTarget;      /* negronifb_te_off: wanted tick phase after the TE, us (< 0: before the next) */
++	bool          fTeSeen;
++	uint32_t      fTeLastFrame, fTeStopped, fTeFrames;
++	uint64_t      fTeFirstAbs;    /* period measurement window */
++	uint32_t      fTeFirstFrame, fTePeriodUs;
++	int32_t       fTePhaseUs, fTeErrUs, fTeAdjUs;
++	int64_t       fTeAdjAbs;      /* the next deadline moves by this (rearm) */
++	uint32_t      fTeLocked, fTeSamples, fTeNoSample;
++	int64_t       fTeErrSum;
++	int32_t       fTeErrMax;
++	uint64_t      fTeTs;          /* last INTF_VSYNC_TIMESTAMP (negronifb_te=2) */
++	uint64_t      fTickNominalAbs;    /* the tick period when the TE measurement is not used */
++	uint32_t      fVrrMode;       /* negronifb_vrr: 0 off, 1 min-fps + autorefresh divider, 2 60/90 Hz timing, 3 divider only */
++	uint32_t      fVrrFps, fVrrExt, fVrrDiv;      /* idle rate, BD[0x14] hold count, autorefresh frames */
++	bool          fVrrHS;         /* negronifb_vrr_hs: DCS in high-speed mode */
++	uint64_t      fVrrIdleAbs;    /* negronifb_vrr_ms without a swap */
++	uint32_t      fVrrState;      /* kNegroniVrr*, under fLock */
++	uint64_t      fLastSwapAbs;   /* under fLock */
++	thread_call_t fVrrCall;
++	uint64_t      fVrrIdleAt, fVrrIdleTotalAbs;
++	uint32_t      fVrrIdleCount, fVrrDcsErrors;
++	bool          fVrrApplied;    /* the panel is in the idle configuration (thread call only) */
++	bool          fVrrBusy;       /* thread call running (under fLock) */
++	bool          fVrrDisabled;   /* a switch failed: no more idle periods this boot (under fLock) */
++	uint32_t      fVrrOffWait;    /* display-off ticks spent waiting for a running VRR set */
++
++	void teInit(void);
++	void teTick(uint64_t now);
++	void teLog(void);
++	void vrrTick(uint64_t now);
++	void vrrWakeLocked(void);
++	void vrrWork(void);
++	void vrrSetRate(uint32_t fps);
++	static void vrrCall(thread_call_param_t p0, thread_call_param_t p1);
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void statTick(uint64_t now);
+ 	void rearm(IOTimerEventSource *sender);
+@@ -457,7 +756,9 @@ AppleCLCD::start(IOService *provider)
+ 	nanoseconds_to_absolutetime((uint64_t)NEGRONI_FB_GPU_STUCK_MS * 1000000ull, &fStuckAbs);
+ 	fDeadline = mach_absolute_time() + fTickAbs;
+ 	fVsync->wakeAtTime(fDeadline);
++	fTickNominalAbs = fTickAbs;
+ 	zeroCopyInit();
++	teInit();
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -500,6 +801,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fStats) {
+ 		fb->statTick(now);
+ 	}
++	if (fb->fTeMode != 0 && !fb->fPowerOff) {
++		fb->teTick(now);        /* 0259: where is the panel's TE relative to this tick */
++	}
+ 	fb->zeroCopyRetire(true);       /* the engine took the last flip: the frame before goes back */
+ 	fb->shiftTick();                /* 0256: a clock shift left over from a slow GPU copy */
+ 	uint64_t values[6] = {
+@@ -514,6 +818,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(NEGRONI_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++	fb->vrrTick(now);               /* 0259: idle long enough: lower the panel refresh */
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+@@ -544,8 +849,20 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			uint64_t ns;
+ 			absolutetime_to_nanoseconds(mach_absolute_time() - fb->fOffAt, &ns);
+ 			uint32_t ms = (uint32_t)(ns / NSEC_PER_MSEC);
+-			bool none = false;
++			bool none = false, vrrRunning;
+ 			IOLockLock(fb->fLock);
++			/*
++			 * 0259: a VRR command set (thread call) still on its way: the 0258 sleep DCS
++			 * must not land inside it. Wait at most NEGRONI_VRR_OFF_WAIT_TICKS ticks.
++			 */
++			vrrRunning = fb->fVrrBusy;
++			if (vrrRunning && fb->fVrrOffWait < NEGRONI_VRR_OFF_WAIT_TICKS) {
++				fb->fVrrOffWait++;
++				fb->fFadeStep = 6;      /* this step again next tick */
++				IOLockUnlock(fb->fLock);
++				fb->rearm(sender);
++				return;
++			}
+ 			if (fb->fPowerOff) {
+ 				none = !negroni_backlight_display_off(ms);
+ 			}
+@@ -553,6 +870,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			if (none) {
+ 				IOLog("NEGRONI FB: display off (fade %u ms, DCS sleep skipped: no backlight service)\n", ms);
+ 			}
++			if (vrrRunning) {
++				IOLog("NEGRONI FB: display off: VRR set still running after %u ticks\n", fb->fVrrOffWait);
++			}
+ 		} else if (step > 6) {
+ 			/* 0258: dark and idle: a slow tick (NEGRONI_FB_OFF_TICKS periods, 100 ms) until the wake */
+ 			fb->fDeadline += (NEGRONI_FB_OFF_TICKS - 1) * fb->fTickAbs;
+@@ -659,7 +979,10 @@ AppleCLCD::rearm(IOTimerEventSource *sender)
+ {
+ 	uint64_t now = mach_absolute_time();
+ 
+-	fDeadline += fTickAbs;
++	/* 0259: the TE lock moves the next deadline by at most a quarter period; the step after is a full one */
++	int64_t step = (int64_t)fTickAbs + fTeAdjAbs;
++	fTeAdjAbs = 0;
++	fDeadline += (uint64_t)step;
+ 	if (fDeadline <= now) {
+ 		uint64_t missed = (now - fDeadline) / fTickAbs + 1;
+ 		fDeadline += missed * fTickAbs;
+@@ -774,6 +1097,425 @@ AppleCLCD::statTick(uint64_t now)
+ 	fStatT0 = now;
+ 	fStatCPU = fStatGPU = fStatZC = fStatLate = fStatSkips = fStatGaveUp = 0;
+ 	fStatCopyAbs = fStatCopyMaxAbs = 0;
++	if (fTeMode != 0 || fVrrMode != 0) {
++		teLog();
++	}
++}
++
++/* ---------------------------------------------------------------------- */
++/* 0259: TE-locked vsync and idle refresh switching                        */
++/* ---------------------------------------------------------------------- */
++
++static uint64_t
++negroni_fb_us_abs(uint64_t us)
++{
++	uint64_t abs;
++
++	nanoseconds_to_absolutetime(us * 1000ull, &abs);
++	return abs;
++}
++
++/*
++ * Boot-args: negronifb_te=1 phase-locks the vsync tick to the panel's TE as the display
++ * engine's tearcheck counter reports it (=2 also enables and logs INTF_VSYNC_TIMESTAMP);
++ * negronifb_te_off=N: the tick N us after the TE (negative: before the next TE; default
++ * NEGRONI_TE_TARGET_DEFAULT). negronifb_vrr=1: after negronifb_vrr_ms without a swap the panel
++ * holds each picture for 120/negronifb_vrr_fps TEs (DCS BD[0x14]) and the auto-refresh sends one
++ * frame per that many TEs; =2: the panel's 60 Hz (or 90 Hz, negronifb_vrr_fps=90) timing-switch
++ * command set, back to the 120 Hz set on the next swap; =3: the auto-refresh divider only (no
++ * DCS). negronifb_vrr_hs=1|0 forces the DCS transmission mode (default: high-speed for mode 2 as
++ * Android's dsi_hs_mode, low-power for mode 1 like the brightness). All default off.
++ */
++void
++AppleCLCD::teInit(void)
++{
++	uint32_t te = 0, vrr = 0, fps = NEGRONI_VRR_FPS_DEFAULT, ms = NEGRONI_VRR_IDLE_MS_DEFAULT;
++	int32_t off = NEGRONI_TE_TARGET_DEFAULT, hs = -1;
++
++	PE_parse_boot_argn("negronifb_te", &te, sizeof(te));
++	PE_parse_boot_argn("negronifb_te_off", &off, sizeof(off));
++	PE_parse_boot_argn("negronifb_vrr", &vrr, sizeof(vrr));
++	PE_parse_boot_argn("negronifb_vrr_fps", &fps, sizeof(fps));
++	PE_parse_boot_argn("negronifb_vrr_ms", &ms, sizeof(ms));
++	PE_parse_boot_argn("negronifb_vrr_hs", &hs, sizeof(hs));
++	if (te == 0 && vrr == 0) {
++		return;
++	}
++	fIntf = fMdss != 0 ? fMdss + NEGRONI_INTF1_OFF :
++	    ml_io_map_unmappable(NEGRONI_INTF1_PA, NEGRONI_INTF1_LEN, NEGRONI_WIMG_IO);
++	if (fIntf == 0) {
++		IOLog("NEGRONI FB TE: no mapping of INTF_1 (0x%lx): negronifb_te/vrr off\n", NEGRONI_INTF1_PA);
++		return;
++	}
++	uint32_t cfg = negroni_dpu_rd(fIntf + INTF_TEAR_SYNC_CONFIG_VSYNC);
++	uint32_t count = negroni_dpu_rd(fIntf + INTF_TEAR_INT_COUNT_VAL);
++	uint32_t ar = negroni_dpu_rd(fIntf + INTF_TEAR_AUTOREFRESH_CONFIG);
++	uint32_t vsyncCount = cfg & 0x7ffffu;
++	fTeInit = negroni_dpu_rd(fIntf + INTF_TEAR_VSYNC_INIT_VAL) & 0xffffu;
++	fTeLineNs = vsyncCount != 0 ? (uint32_t)((uint64_t)vsyncCount * 1000000000ull / NEGRONI_TE_VSYNC_CLK_HZ) : 0;
++	IOLog("NEGRONI FB TE: INTF_1 tear_en %u sync_cfg 0x%08x (te pin %u, counter %u, vsync_count %u = %u ns/line) "
++	    "height %u init %u start %u thresh 0x%08x rd_ptr_irq %u wr_ptr_irq %u wrcount 0x%08x autorefresh 0x%08x "
++	    "count 0x%08x (frame %u line %u) tear_line %u vsync_sel %u intf_status 0x%x frame_count %u tear_irq 0x%08x\n",
++	    negroni_dpu_rd(fIntf + INTF_TEAR_TEAR_CHECK_EN), cfg, (cfg >> 20) & 1u, (cfg >> 19) & 1u, vsyncCount, fTeLineNs,
++	    negroni_dpu_rd(fIntf + INTF_TEAR_SYNC_CONFIG_HEIGHT) & 0xffffu, fTeInit,
++	    negroni_dpu_rd(fIntf + INTF_TEAR_START_POS) & 0xffffu, negroni_dpu_rd(fIntf + INTF_TEAR_SYNC_THRESH),
++	    negroni_dpu_rd(fIntf + INTF_TEAR_RD_PTR_IRQ) & 0xffffu, negroni_dpu_rd(fIntf + INTF_TEAR_WR_PTR_IRQ) & 0xffffu,
++	    negroni_dpu_rd(fIntf + INTF_TEAR_SYNC_WRCOUNT), ar, count, count >> 16, count & 0xffffu,
++	    negroni_dpu_rd(fIntf + INTF_TEAR_LINE_COUNT) & 0xffffu, negroni_dpu_rd(fIntf + INTF_TEAR_MDP_VSYNC_SEL),
++	    negroni_dpu_rd(fIntf + INTF_STATUS), negroni_dpu_rd(fIntf + INTF_FRAME_COUNT),
++	    negroni_dpu_rd(fIntf + INTF_TEAR_INTR_STATUS));
++	if (te != 0) {
++		if (fTeLineNs == 0) {
++			IOLog("NEGRONI FB TE: vsync_count 0: no line clock, negronifb_te off\n");
++		} else {
++			fTeMode = te;
++			fTeTarget = off;
++			if (te >= 2) {
++				negroni_dpu_wr(fIntf + INTF_VSYNC_TIMESTAMP_CTRL, 1);
++			}
++			IOLog("NEGRONI FB TE: lock on, target %d us %s the TE\n", off < 0 ? -off : off, off < 0 ? "before" : "after");
++		}
++	}
++	if (vrr != 0) {
++		if (vrr != 1 && vrr != 2 && vrr != 3) {
++			IOLog("NEGRONI FB VRR: negronifb_vrr=%u unknown: off\n", vrr);
++		} else if (vrr != 2 && ar != NEGRONI_VRR_AR_ON_1) {
++			IOLog("NEGRONI FB VRR: autorefresh 0x%08x is not on/1 as the UEFI leaves it: mode %u off\n", ar, vrr);
++		} else {
++			fVrrCall = thread_call_allocate(&AppleCLCD::vrrCall, this);
++			if (fVrrCall == NULL) {
++				IOLog("NEGRONI FB VRR: no thread call: off\n");
++				return;
++			}
++			fVrrMode = vrr;
++			/* Android sends the timing-switch sets in dsi_hs_mode, the brightness in LP (0250 default) */
++			fVrrHS = hs < 0 ? vrr == 2 : hs != 0;
++			fVrrIdleAbs = negroni_fb_us_abs((uint64_t)(ms < 200 ? 200 : ms) * 1000ull);
++			if (vrr == 2) {
++				fVrrFps = fps == 90 ? 90 : 60;
++				fVrrExt = 0;
++				fVrrDiv = 1;
++			} else {
++				fps = fps == 0 ? 1 : (fps > 120 ? 120 : fps);
++				fVrrExt = 120 / fps - 1;        /* 10 Hz -> 0x0b, 1 Hz -> 0x77 */
++				fVrrExt = fVrrExt > 0x77 ? 0x77 : fVrrExt;
++				fVrrDiv = fVrrExt + 1;
++				fVrrFps = 120 / fVrrDiv;
++			}
++			fLastSwapAbs = mach_absolute_time();
++			IOLog("NEGRONI FB VRR: mode %u, idle %u Hz (hold 0x%02x, autorefresh 1/%u) after %u ms without a swap, DCS %s\n",
++			    vrr, fVrrFps, fVrrExt, fVrrDiv, ms, fVrrHS ? "HS" : "LP");
++		}
++	}
++}
++
++/*
++ * One tick: the tearcheck counter restarts at fTeInit on each TE and counts lines, so
++ * (line - init) * line time = the time since the TE. The phase is taken at this tick's
++ * deadline (a late handler start is not a phase error), compared with the target, and half
++ * the error moves the next deadline (bounded to a quarter period). The TE period itself is
++ * frames per second from the counter's frame field, and the tick period follows it when it
++ * is within 15 % of the nominal one.
++ */
++void
++AppleCLCD::teTick(uint64_t now)
++{
++	uint32_t v = negroni_dpu_rd(fIntf + INTF_TEAR_INT_COUNT_VAL);
++	uint32_t frame = v >> 16, line = v & 0xffffu;
++	uint64_t nominalNs;
++
++	absolutetime_to_nanoseconds(fTickNominalAbs, &nominalNs);
++	uint32_t nominalUs = (uint32_t)(nominalNs / 1000);
++	if (!fTeSeen) {
++		fTeSeen = true;
++		fTeLastFrame = fTeFirstFrame = frame;
++		fTeFirstAbs = now;
++		return;
++	}
++	uint32_t df = (frame - fTeLastFrame) & 0xffffu;
++	fTeLastFrame = frame;
++	fTeFrames += df;
++	if (df == 0) {
++		if (++fTeStopped == 120) {
++			IOLog("NEGRONI FB TE: no TE for 120 ticks (count 0x%08x)\n", v);
++		}
++	} else {
++		if (fTeStopped >= 120) {
++			IOLog("NEGRONI FB TE: TE back after %u ticks\n", fTeStopped);
++			fTeFirstFrame = frame;
++			fTeFirstAbs = now;
++		}
++		fTeStopped = 0;
++	}
++	uint64_t window = now - fTeFirstAbs;
++	uint32_t frames = (frame - fTeFirstFrame) & 0xffffu;
++	if (window >= fStatSecAbs && frames != 0) {
++		fTePeriodUs = (uint32_t)(negroni_fb_abs_us(window) / frames);
++		fTeFirstFrame = frame;
++		fTeFirstAbs = now;
++		/* the tick period follows the measured TE period (bounded; the nominal one when unsure) */
++		uint32_t lo = nominalUs - nominalUs * 15 / 100, hi = nominalUs + nominalUs * 15 / 100;
++		fTickAbs = (fTePeriodUs >= lo && fTePeriodUs <= hi) ? negroni_fb_us_abs(fTePeriodUs) : fTickNominalAbs;
++	}
++	uint32_t periodUs = fTePeriodUs != 0 ? fTePeriodUs : nominalUs;
++	if (fTeStopped != 0 && df == 0 && fTeStopped > 2) {
++		fTeNoSample++;
++		return;                 /* no TE for several ticks: no phase to lock on */
++	}
++	if (line < fTeInit) {
++		fTeNoSample++;
++		return;
++	}
++	uint64_t sinceTeNs = (uint64_t)(line - fTeInit) * fTeLineNs;
++	if (sinceTeNs > 2ull * periodUs * 1000ull) {
++		fTeNoSample++;
++		return;                 /* the counter ran past a frame: no TE came */
++	}
++	int64_t lateNs = 0;
++	if (now > fDeadline) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(now - fDeadline, &ns);
++		lateNs = (int64_t)ns;
++	}
++	int32_t phase = (int32_t)(((int64_t)sinceTeNs - lateNs) / 1000);
++	while (phase < 0) {
++		phase += (int32_t)periodUs;
++	}
++	phase %= (int32_t)periodUs;
++	int32_t target = fTeTarget < 0 ? (int32_t)periodUs + fTeTarget : fTeTarget;
++	target = target < 0 ? 0 : (target >= (int32_t)periodUs ? (int32_t)periodUs - 1 : target);
++	int32_t err = phase - target;
++	if (err > (int32_t)periodUs / 2) {
++		err -= (int32_t)periodUs;
++	} else if (err < -(int32_t)periodUs / 2) {
++		err += (int32_t)periodUs;
++	}
++	/* err > 0: this tick came after the target: the next deadline comes sooner */
++	int32_t adj = -err / 2;
++	int32_t bound = (int32_t)periodUs / 4;
++	adj = adj > bound ? bound : (adj < -bound ? -bound : adj);
++	fTePhaseUs = phase;
++	fTeErrUs = err;
++	fTeAdjUs = adj;
++	fTeAdjAbs = adj >= 0 ? (int64_t)negroni_fb_us_abs((uint64_t)adj) : -(int64_t)negroni_fb_us_abs((uint64_t)(-adj));
++	fTeSamples++;
++	fTeErrSum += err < 0 ? -err : err;
++	if ((err < 0 ? -err : err) > fTeErrMax) {
++		fTeErrMax = err < 0 ? -err : err;
++	}
++	if ((err < 0 ? -err : err) <= NEGRONI_TE_LOCK_US) {
++		fTeLocked++;
++	}
++}
++
++/* One line per second after the STAT line (statTick). */
++void
++AppleCLCD::teLog(void)
++{
++	if (fTeMode != 0 && fIntf != 0) {
++		uint32_t frames = fTeFrames;
++		fTeFrames = 0;
++		char ts[48] = "";
++		if (fTeMode >= 2) {
++			uint64_t t = (uint64_t)negroni_dpu_rd(fIntf + INTF_VSYNC_TIMESTAMP1) << 32 |
++			    negroni_dpu_rd(fIntf + INTF_VSYNC_TIMESTAMP0);
++			snprintf(ts, sizeof(ts), " ts 0x%llx (+%llu)", t, t - fTeTs);
++			fTeTs = t;
++		}
++		IOLog("NEGRONI FB TE: te/s %u period us %u tick us %llu phase us %d target %d err avg/max us %lld/%d "
++		    "adj us %d locked %u/%u ticks (no sample %u) count 0x%08x autorefresh 0x%08x%s\n",
++		    frames, fTePeriodUs, negroni_fb_abs_us(fTickAbs), fTePhaseUs,
++		    fTeTarget < 0 ? (int32_t)(fTePeriodUs != 0 ? fTePeriodUs : 8333) + fTeTarget : fTeTarget,
++		    fTeSamples != 0 ? fTeErrSum / fTeSamples : 0, fTeErrMax, fTeAdjUs, fTeLocked, fTeSamples, fTeNoSample,
++		    negroni_dpu_rd(fIntf + INTF_TEAR_INT_COUNT_VAL), negroni_dpu_rd(fIntf + INTF_TEAR_AUTOREFRESH_CONFIG), ts);
++		fTeLocked = fTeSamples = fTeNoSample = 0;
++		fTeErrSum = 0;
++		fTeErrMax = 0;
++	}
++	if (fVrrMode != 0) {
++		IOLockLock(fLock);
++		uint32_t state = fVrrState;
++		uint64_t idleAbs = fVrrIdleTotalAbs + (state == kNegroniVrrIdle ? mach_absolute_time() - fVrrIdleAt : 0);
++		IOLockUnlock(fLock);
++		static const char *const names[] = { "active", "going idle", "idle", "waking" };
++		IOLog("NEGRONI FB VRR: %s (idle %u Hz)%s, %u idle periods, idle %llu ms in all, DCS errors %u\n",
++		    names[state & 3], fVrrFps, fVrrDisabled ? " OFF after a failed switch" : "", fVrrIdleCount,
++		    negroni_fb_abs_us(idleAbs) / 1000, fVrrDcsErrors);
++	}
++}
++
++/* Work loop, fLock held: no swap for negronifb_vrr_ms while the display is on: go idle. */
++void
++AppleCLCD::vrrTick(uint64_t now)
++{
++	if (fVrrMode == 0 || fVrrDisabled || fPowerOff || fVrrState != kNegroniVrrActive || fLastSwapAbs == 0 ||
++	    now - fLastSwapAbs < fVrrIdleAbs) {
++		return;
++	}
++	fVrrState = kNegroniVrrGoingIdle;
++	if (!fVrrBusy) {
++		fVrrBusy = true;
++		thread_call_enter(fVrrCall);
++	}
++}
++
++/*
++ * fLock held, any thread (swap: backboardd; RequestPowerChange; the tick). Back to the full
++ * rate: the auto-refresh divider goes back at once (one register write, the engine sends the
++ * next frame on the next TE), the DCS follows on the thread call.
++ */
++void
++AppleCLCD::vrrWakeLocked(void)
++{
++	if (fVrrMode == 0 || fVrrState == kNegroniVrrActive || fVrrState == kNegroniVrrWaking) {
++		return;
++	}
++	if (fVrrMode != 2 && fIntf != 0) {
++		negroni_dpu_wr(fIntf + INTF_TEAR_AUTOREFRESH_CONFIG, NEGRONI_VRR_AR_ON_1);
++	}
++	fVrrState = kNegroniVrrWaking;
++	if (!fVrrBusy) {
++		fVrrBusy = true;
++		thread_call_enter(fVrrCall);
++	}
++}
++
++void
++AppleCLCD::vrrCall(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	((AppleCLCD *)p0)->vrrWork();
++}
++
++/* Mode 2: the tick, CoreAnimation's interval and the refresh property follow the panel rate. */
++void
++AppleCLCD::vrrSetRate(uint32_t fps)
++{
++	uint64_t ticks = negroni_fb_us_abs(1000000ull / fps);
++
++	fTickNominalAbs = ticks;
++	fTickAbs = ticks;
++	fStatLateAbs = ticks / 2;
++	fTePeriodUs = 0;        /* measured again at the new rate */
++	if (fRefreshTicks != 0) {
++		fRefreshTicks = ticks;
++		OSDictionary *refresh = OSDictionary::withCapacity(2);
++		OSNumber *step = OSNumber::withNumber(ticks, 64);
++		OSNumber *min = OSNumber::withNumber(1ULL, 32);
++		if (refresh != NULL && step != NULL && min != NULL) {
++			refresh->setObject("displayRefreshStepMachTime", step);
++			refresh->setObject("displayMinRefreshInterval", min);
++			setProperty("IOMFBDisplayRefresh", refresh);
++		}
++		OSSafeReleaseNULL(refresh);
++		OSSafeReleaseNULL(step);
++		OSSafeReleaseNULL(min);
++	}
++}
++
++/*
++ * Thread call: bring the panel to the wanted state until it is stable. The DCS writes sleep on
++ * the DSI lock and wait for the MDP stream (NegroniBacklight.cpp), so they never run on the
++ * vsync work loop or on backboardd's thread.
++ */
++void
++AppleCLCD::vrrWork(void)
++{
++	for (;;) {
++		IOLockLock(fLock);
++		bool wantIdle = fVrrState == kNegroniVrrGoingIdle || fVrrState == kNegroniVrrIdle;
++		if (wantIdle == fVrrApplied) {
++			fVrrState = wantIdle ? kNegroniVrrIdle : kNegroniVrrActive;
++			fVrrBusy = false;
++			IOLockUnlock(fLock);
++			return;
++		}
++		IOLockUnlock(fLock);
++
++		bool lp = true;
++		bool ready = negroni_backlight_panel_ready(&lp);
++		lp = !fVrrHS && lp;
++		uint64_t t0 = mach_absolute_time();
++		int rc = 0;
++		uint32_t sent = 0;
++		if (wantIdle && !ready) {
++			/* the display is off or there is no DSI: stay at the full rate */
++			IOLockLock(fLock);
++			if (fVrrState == kNegroniVrrGoingIdle) {
++				fVrrState = kNegroniVrrActive;
++				fLastSwapAbs = mach_absolute_time();
++			}
++			IOLockUnlock(fLock);
++			continue;
++		}
++		if (fVrrMode == 2) {
++			if (wantIdle) {
++				rc = fVrrFps == 90 ?
++				    negroni_dsi_dcs_set(negroni_vrr_switch_90, sizeof(negroni_vrr_switch_90), lp, &sent) :
++				    negroni_dsi_dcs_set(negroni_vrr_switch_60, sizeof(negroni_vrr_switch_60), lp, &sent);
++				if (rc == 0) {
++					vrrSetRate(fVrrFps);
++				}
++			} else {
++				if (ready) {
++					rc = negroni_dsi_dcs_set(negroni_vrr_switch_120, sizeof(negroni_vrr_switch_120), lp, &sent);
++				}
++				vrrSetRate(120);
++			}
++		} else {
++			if (wantIdle) {
++				if (fVrrMode == 1) {
++					uint8_t set[sizeof(negroni_vrr_minfps_set)];
++					memcpy(set, negroni_vrr_minfps_set, sizeof(set));
++					set[NEGRONI_VRR_MINFPS_EXT_OFF] = (uint8_t)fVrrExt;
++					rc = negroni_dsi_dcs_set(set, sizeof(set), lp, &sent);
++				}
++				if (rc == 0) {
++					negroni_dpu_wr(fIntf + INTF_TEAR_AUTOREFRESH_CONFIG, 1u << 31 | fVrrDiv);
++				}
++			} else {
++				negroni_dpu_wr(fIntf + INTF_TEAR_AUTOREFRESH_CONFIG, NEGRONI_VRR_AR_ON_1);
++				if (fVrrMode == 1 && ready) {
++					rc = negroni_dsi_dcs_set(negroni_vrr_minfps_set, sizeof(negroni_vrr_minfps_set), lp, &sent);
++				}
++			}
++		}
++		uint64_t ms = negroni_fb_abs_us(mach_absolute_time() - t0) / 1000;
++		IOLockLock(fLock);
++		if (rc != 0) {
++			fVrrDcsErrors++;
++		}
++		if (wantIdle && rc == 0) {
++			fVrrApplied = true;
++			fVrrIdleAt = mach_absolute_time();
++			fVrrIdleCount++;
++			IOLockUnlock(fLock);
++			IOLog("NEGRONI FB VRR: idle %u Hz (hold 0x%02x, autorefresh 1/%u, %u DCS packets, %llu ms)\n",
++			    fVrrFps, fVrrExt, fVrrDiv, sent, ms);
++		} else if (wantIdle) {
++			/*
++			 * The switch failed: VRR off for this boot (a retry every idle period would reach
++			 * 0250's three-failure DSI shutdown and take the brightness and the 0258 sleep DCS
++			 * with it). The auto-refresh divider was not written. Close the Samsung key in
++			 * case the set stopped inside it (best effort).
++			 */
++			fVrrState = kNegroniVrrActive;
++			fVrrDisabled = true;
++			fLastSwapAbs = mach_absolute_time();
++			IOLockUnlock(fLock);
++			if (rc != -1 && rc != -2) {
++				static const uint8_t keyLock[3] = { 0xf0, 0xa5, 0xa5 };
++				(void)negroni_dsi_dcs_write(keyLock, sizeof(keyLock), lp);
++			}
++			IOLog("NEGRONI FB VRR: idle switch failed (%d after %u packets): VRR off\n", rc, sent);
++		} else {
++			uint64_t idle = fVrrApplied ? mach_absolute_time() - fVrrIdleAt : 0;
++			fVrrApplied = false;
++			fVrrIdleTotalAbs += idle;
++			IOLockUnlock(fLock);
++			IOLog("NEGRONI FB VRR: active 120 Hz after %llu ms idle (%u DCS packets, %llu ms%s)\n",
++			    negroni_fb_abs_us(idle) / 1000, sent, ms, rc != 0 ? ", DCS failed" : "");
++		}
++	}
+ }
+ 
+ /*
+@@ -950,6 +1692,8 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		fPresentedID = fEndedID;        /* nothing is shown while off: SwapWait must not wait */
+ 	}
+ 	fDirty = true;
++	fLastSwapAbs = mach_absolute_time();
++	vrrWakeLocked();                /* 0259: activity: back to the full rate */
+ 	IOLockUnlock(fLock);
+ 	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
+ 		if (dropped[layer] != NULL) {
+@@ -1807,7 +2551,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
++				fFB->fVrrOffWait = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
++				fFB->fLastSwapAbs = mach_absolute_time();
++				fFB->vrrWakeLocked();   /* 0259: the panel sleeps and wakes in its full-rate state */
+ 				if (off) {
+ 					fFB->fOffAt = mach_absolute_time();
+ 				} else {
