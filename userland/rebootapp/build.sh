@@ -1,10 +1,12 @@
 #!/bin/sh
-# Build PowerMenu.app and its root helper for iOS 16 arm64 (userland/rebootapp/README.md).
+# Build XNUtils.app (the owner's app, formerly PowerMenu.app) and its root helper for iOS 16 arm64
+# (userland/rebootapp/README.md). The app name comes from CFBundleExecutable in Info.plist.
 # macOS + Xcode only (iPhoneOS SDK, codesign); scripts/ios16/root-add-powermenu.sh then installs
 # the result on macOS or Linux.
 #   userland/rebootapp/build.sh            (a few seconds; scripts/bg.sh powermenu-build ... also works)
 # Output (out/powermenu/):
-#   PowerMenu.app/      main.m + Info.plist, arm64, minos 16.0, ad hoc signed with entitlements.plist
+#   XNUtils.app/        main.m + Info.plist (dev.iosplus10.xnutils), arm64, minos 16.0, ad hoc signed
+#                       with entitlements.plist
 #   powermenu-helper    setuid-root helper (restart/shutdown/bootloader), signed with helper.entitlements
 #   pmregister          LaunchServices register tool for a running phone, signed with pmregister.entitlements
 #   SHA256SUMS
@@ -21,22 +23,25 @@ MINOS=16.0
 SDK=$(xcrun -sdk iphoneos --show-sdk-path)
 ICC=$(xcrun -sdk iphoneos --find clang)
 T="-target arm64-apple-ios$MINOS -isysroot $SDK"
-rm -rf "$B" "$W/PowerMenu.app" "$W/powermenu-helper" "$W/pmregister" "$W/SHA256SUMS"
+APP=$(plutil -extract CFBundleExecutable raw "$HERE/Info.plist")   # XNUtils
+# PowerMenu.app: the old name of the app (before 2026-10-25 19:32); remove it so no hook installs it.
+rm -rf "$B" "$W/PowerMenu.app" "$W/$APP.app" "$W/powermenu-helper" "$W/pmregister" "$W/SHA256SUMS"
 mkdir -p "$B"
 
 # ---- compile + link (relative output names, see above) ----------------------------------------
-# The app: same flags as the owner's first hand build (no -O), which this script reproduces.
+# The app: same flags as the owner's hand builds (no -O; XNUtils adds -framework Metal), which this
+# script reproduces.
 (cd "$B" &&
- "$ICC" $T -fobjc-arc -framework UIKit -framework Foundation -framework QuartzCore "$HERE/main.m" -o PowerMenu &&
+ "$ICC" $T -fobjc-arc -framework UIKit -framework Foundation -framework QuartzCore -framework Metal "$HERE/main.m" -o "$APP" &&
  "$ICC" $T -O2 -Wall -Wno-deprecated-declarations "$HERE/powermenu-helper.c" -o powermenu-helper &&
  "$ICC" $T -O2 -Wall -fobjc-arc -framework Foundation "$HERE/pmregister.m" -o pmregister)
 
 # ---- bundle + signing -------------------------------------------------------------------------
-A=$W/PowerMenu.app
+A=$W/$APP.app
 mkdir -p "$A"
-cp "$B/PowerMenu" "$A/PowerMenu"
+cp "$B/$APP" "$A/$APP"
 cp "$HERE/Info.plist" "$A/Info.plist"
-chmod 755 "$A" "$A/PowerMenu"; chmod 644 "$A/Info.plist"
+chmod 755 "$A" "$A/$APP"; chmod 644 "$A/Info.plist"
 codesign --force -s - --entitlements "$HERE/entitlements.plist" "$A" 2>/dev/null
 for t in powermenu-helper pmregister; do
   cp "$B/$t" "$W/$t"; chmod 755 "$W/$t"
@@ -47,10 +52,10 @@ codesign --force -s - --entitlements "$HERE/pmregister.entitlements" "$W/pmregis
 # ---- checks -----------------------------------------------------------------------------------
 fail=0
 plutil -lint "$A/Info.plist" >/dev/null || { echo "Info.plist: not a valid plist" >&2; fail=1; }
-exe=$(plutil -extract CFBundleExecutable raw "$A/Info.plist")
-[ "$exe" = PowerMenu ] || { echo "CFBundleExecutable is $exe, not PowerMenu" >&2; fail=1; }
-codesign --verify --strict "$A" || { echo "PowerMenu.app: signature check failed" >&2; fail=1; }
-for b in "$A/PowerMenu" "$W/powermenu-helper" "$W/pmregister"; do
+bid=$(plutil -extract CFBundleIdentifier raw "$A/Info.plist")
+[ "$bid" = dev.iosplus10.xnutils ] || { echo "CFBundleIdentifier is $bid, not dev.iosplus10.xnutils" >&2; fail=1; }
+codesign --verify --strict "$A" || { echo "$APP.app: signature check failed" >&2; fail=1; }
+for b in "$A/$APP" "$W/powermenu-helper" "$W/pmregister"; do
   f=$(basename "$b")
   lipo -archs "$b" | grep -qx arm64 || { echo "$f: not arm64-only" >&2; fail=1; }
   minos=$(otool -l "$b" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
@@ -60,7 +65,7 @@ for b in "$A/PowerMenu" "$W/powermenu-helper" "$W/pmregister"; do
   [ -z "$weak" ] || { echo "$f: weak imports (symbols newer than iOS $MINOS?):" >&2; echo "$weak" >&2; fail=1; }
 done
 # The negroni AMFI stand-in reads the XML entitlements blob (DER-only signatures get none).
-python3 -I - "$A/PowerMenu" "$W/powermenu-helper" "$W/pmregister" <<'EOF' || fail=1
+python3 -I - "$A/$APP" "$W/powermenu-helper" "$W/pmregister" <<'EOF' || fail=1
 import struct, sys
 bad = 0
 for p in sys.argv[1:]:
@@ -79,7 +84,7 @@ sys.exit(bad)
 EOF
 [ $fail = 0 ] || { echo "checks failed" >&2; exit 1; }
 
-(cd "$W" && shasum -a 256 PowerMenu.app/PowerMenu PowerMenu.app/Info.plist PowerMenu.app/_CodeSignature/CodeResources \
+(cd "$W" && shasum -a 256 "$APP.app/$APP" "$APP.app/Info.plist" "$APP.app/_CodeSignature/CodeResources" \
    powermenu-helper pmregister > SHA256SUMS)
-echo "PowerMenu builds (arm64, minos $MINOS, ad hoc signed, XML entitlements present):"
+echo "$APP.app + helper + pmregister (arm64, minos $MINOS, ad hoc signed, XML entitlements present):"
 cat "$W/SHA256SUMS"

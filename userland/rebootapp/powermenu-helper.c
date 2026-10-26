@@ -1,5 +1,5 @@
 /*
- * powermenu-helper: the root part of PowerMenu.app (userland/rebootapp/README.md).
+ * powermenu-helper: the root part of XNUtils.app (formerly PowerMenu.app; userland/rebootapp/README.md).
  *
  *   powermenu-helper restart|shutdown|bootloader|check
  *
@@ -8,7 +8,7 @@
  * spawns it; reboot(2) and the reboot-mode sysctl need euid 0.
  *
  * Caller check: real uid 0 (an SSH root shell) is allowed. Real uid 501 is allowed only when the
- * parent process is /Applications/PowerMenu.app/PowerMenu. Every other caller gets exit code 4.
+ * parent process is /Applications/XNUtils.app/XNUtils. Every other caller gets exit code 4.
  * The tool accepts exactly one of the four words. It reads no environment variable, opens no
  * file and starts no other program.
  *
@@ -35,7 +35,7 @@
 #define RB_AUTOBOOT 0     /* <sys/reboot.h>, not in the iPhoneOS SDK */
 #define RB_HALT     0x08
 #define MOBILE_UID  501
-#define APP_PATH    "/Applications/PowerMenu.app/PowerMenu"
+#define APP_PATH    "/Applications/XNUtils.app/XNUtils"
 #define PATH_BUF    4096  /* PROC_PIDPATHINFO_MAXSIZE */
 
 int proc_pidpath(int pid, void *buffer, uint32_t buffersize); /* libproc, not in the SDK */

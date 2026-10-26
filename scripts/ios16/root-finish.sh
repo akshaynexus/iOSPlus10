@@ -20,8 +20,8 @@
 #     /var/db/negronimetal/clients get a device (default: the probes; METAL_CLIENTS="... backboardd SpringBoard")
 # 1i. Bluetooth: scripts/bt/root-add-bt.sh (BT=1; default off): bluetoothd job back with BT_HCI_TRANSPORT,
 #     BlueTool job -> /usr/libexec/negroni-bluetool, hcitest (docs/bluetooth-plan.md section 4)
-# 1h. PowerMenu.app (bootloader/restart/shut down) + setuid helper: scripts/ios16/root-add-powermenu.sh
-#     (POWERMENU=1; default on when out/powermenu/PowerMenu.app is built, POWERMENU=0 to leave it out)
+# 1h. XNUtils.app (was PowerMenu.app; bootloader/restart/shut down) + setuid helper: scripts/ios16/root-add-powermenu.sh
+#     (POWERMENU=1; default on when out/powermenu/XNUtils.app is built, POWERMENU=0 to leave it out)
 # 3. remove host metadata folders (macOS creates .fseventsd/.Spotlight-V100 on mount)
 set -euo pipefail
 R=$1
@@ -39,7 +39,7 @@ HAPTICS=${HAPTICS:-0} sh "$REPO/scripts/haptics/root-add-haptics.sh" "$R"   # UI
 NEGRONIGL=${NEGRONIGL:-0} sh "$REPO/scripts/gpu/root-add-negronigl.sh" "$R"   # GL driver plugin (docs/gpu-userland.md)
 if [ -z "${METAL:-}" ] && [ -d "$REPO/out/metal/stage/usr/local/bin" ]; then METAL=1; fi
 METAL=${METAL:-0} sh "$REPO/scripts/metal/root-add-metal.sh" "$R"   # Metal driver plugin (docs/metal-plan.md)
-if [ -z "${POWERMENU:-}" ] && [ -x "$REPO/out/powermenu/PowerMenu.app/PowerMenu" ]; then POWERMENU=1; fi
+if [ -z "${POWERMENU:-}" ] && [ -x "$REPO/out/powermenu/XNUtils.app/XNUtils" ]; then POWERMENU=1; fi
 POWERMENU=${POWERMENU:-0} sh "$REPO/scripts/ios16/root-add-powermenu.sh" "$R"   # power menu app (userland/rebootapp/README.md)
 BT=${BT:-0} sh "$REPO/scripts/bt/root-add-bt.sh" "$R"   # Bluetooth userland (docs/bluetooth-plan.md section 4)
 

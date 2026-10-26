@@ -230,6 +230,20 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
     `still-camera`. PowerMenu's Info.plist asks only arm64.
   - [I] On a running phone `LSApplicationWorkspace registerApplicationDictionary:` (ApplicationType System) registers
     an app in /Applications (bergamota NOTES 2026-10-20, Poco F1, sweetuicache; its iOS version then not checked); our tool: pmregister.
+  - **XNUtils rename (2026-10-27).** Owner report [V]: the phone shows the old PowerMenu app, not XNUtils. Cause [V]:
+    the owner renamed the sources to XNUtils (`dev.iosplus10.xnutils`, 2026-10-25 19:32), but `build.sh` still made
+    `out/powermenu/PowerMenu.app` and the root hook installed `/Applications/PowerMenu.app` (logs/root-update.log).
+    Fix: `build.sh` builds `out/powermenu/XNUtils.app` (name from CFBundleExecutable, adds `-framework Metal`, deletes
+    the old PowerMenu.app); `root-add-powermenu.sh` installs `/Applications/XNUtils.app` and deletes
+    `/Applications/PowerMenu.app`; root-finish.sh tests for `out/powermenu/XNUtils.app`; `phone-add-powermenu.sh`
+    unregisters + deletes PowerMenu.app and registers XNUtils.app; the helper's caller path is
+    `/Applications/XNUtils.app/XNUtils`. Hook names (`POWERMENU`, `powermenu`) and `out/powermenu` stay.
+    - [V] `build.sh` reproduces the owner's hand build byte for byte: unsigned `XNUtils` sha256 afaaebfa…1369,
+      `XNUtils.app/XNUtils` (94288 B) sha256 246c5325…8283, same Info.plist and CodeResources.
+    - [V] The XNUtils main.m does not use the helper: Restart/Shut Down call `reboot()` as mobile ([I] no effect,
+      `suser()`), Bootloader starts `/usr/local/bin/usbreboot -f bootloader` as mobile. Not changed (owner's UI).
+    - [I] A root that booted before keeps PowerMenu.app in its LaunchServices database: run
+      `scripts/net/phone-add-powermenu.sh --register-only` (or the full install) on the phone.
 
 ## 5. Kernel build facts
 
