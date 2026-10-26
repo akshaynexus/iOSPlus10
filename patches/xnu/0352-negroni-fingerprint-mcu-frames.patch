@@ -1,0 +1,375 @@
+Fingerprint stage C part 1 (negronifp=3): the Goodix MCU message layer over the stage-A GENI SPI
+(public protocol of the Goodix MCU sensors, goodix-fp-dump goodix.py: message pack A0 len16 sum8 +
+message protocol cmd len16 payload 0xAA-sum8; the 5120-SPI transport prefix CC F2 seq16 / BB F1 00 00
+as a second variant), bounded chunked RX, IRQ-pin watch after each frame, decode of the answer. Step 10
+sends query-MCU-state (AE 55), firmware version (A8 00 00), read OTP (A6 00 00), nop and
+read-sensor-register 0 and logs the raw bytes: "VALID message pack" = the G7 MCU speaks the public
+protocol; "MISO idle" = it does not (the real protocol is in the TEE application). Also fixes two 0350
+items from docs/audit/2026-10-26-peripherals.md: the ldoc11 vote retries EBUSY 40 x 50 ms (as 0330) and
+the thread stops when the vote fails. Boot-args negronifp_wrap, negronifp_irqwait. Applies after 0350.
+Details: docs/fingerprint-plan.md section 7, patches/xnu/README-fingerprint.md.
+
+diff --git a/bsd/dev/negroni_fp.c b/bsd/dev/negroni_fp.c
+index a537cf1..baaa561 100644
+--- a/bsd/dev/negroni_fp.c
++++ b/bsd/dev/negroni_fp.c
+@@ -30,6 +30,13 @@
+  *   negronifp_ldo=0    no RPMh vote for ldoc11 (default 1: 3000 mV; there is no "off" vote)
+  *   negronifp_keep=1   leave the sensor powered and the SE clocks on after the steps (default 0:
+  *                      reverse order power-down incl. the ldoc11 off vote when we voted it on)
++ *   negronifp=3        = 2, then (0352) step 10: the public Goodix MCU message frames (query MCU
++ *                      state, firmware version, OTP, sensor register 0) over plain SPI and with the
++ *                      5120-SPI transport wrapper; the raw answers are logged and decoded
++ *   negronifp_wrap=N   0352: 0 = plain frames only, 1 = CC F2 wrapper only, 2 = both (default 2)
++ *   negronifp_irqwait=MS  0352: how long to watch the IRQ pin after each frame (default 100 ms)
++ * 0352 also retries the ldoc11 vote while the RPMh voter is busy (EBUSY, 40 x 50 ms as 0330) and
++ * stops when the vote fails (the sensor would be unpowered).
+  * Log: "NEGRONI FP: step N NAME ...". The chip-ID frames [I]: Goodix's public SPI drivers
+  * (gf_spi.c, GF3xxx/GF5xxx) read a register with {0xF1, addr_hi, addr_lo} then the data bytes;
+  * the optical G7 protocol lives in the TEE application and is not in any kernel source we have.
+@@ -486,6 +493,286 @@ spi_cmd_read(const uint8_t *cmd, uint32_t clen, uint8_t *in, uint32_t n, const c
+ 	return got;
+ }
+ 
++/* ---- 0352: Goodix MCU message layer ----
++ *
++ * The G7 module has an MCU in front of the optical sensor (HAL strings "test reset and interrupt
++ * pin between mcu and sensor", "fw_app_version", "fw_bootcode_version", GF_ERROR_SPI_FW_DOWNLOAD_FAILED
++ * [V out/fp/lists/hal-strings.txt]). The public Goodix MCU protocol (goodix-fp-dump goodix.py:56-114
++ * [V out/fp/ref]) frames every command as
++ *   message pack:     A0, len16 LE, sum8(A0, len)            (flags 0xA0 = message protocol)
++ *   message protocol: cmd, (plen+1)16 LE, payload, 0xAA - sum8(cmd .. payload)   (0x88 = no checksum)
++ * The public SPI sensor (5120, protocol.py:159-185) prefixes a write with CC F2 seq16 and reads with
++ * BB F1 00 00 followed by the clocked answer bytes; the IRQ pin tells that an answer is ready.
++ * Whether the G7's MCU speaks this protocol over SPI is not known from any file we own [I]: the TEE
++ * application does the SPI on Android. Step 10 sends the frames and logs the raw answers.
++ */
++#define GX_FLAGS_MSG            0xa0u
++#define GX_CMD_NOP              0x00u
++#define GX_CMD_MCU_GET_IMAGE    0x20u
++#define GX_CMD_READ_SENSOR_REG  0x82u
++#define GX_CMD_READ_OTP         0xa6u
++#define GX_CMD_FW_VERSION       0xa8u
++#define GX_CMD_QUERY_MCU_STATE  0xaeu
++#define GX_CMD_ACK              0xb0u
++#define GX_MAX_FRAME            64u       /* one FIFO fill */
++#define GX_CHUNK                64u       /* 16 FIFO words */
++
++static uint16_t gx_seq;
++static int gx_irqwait_ms = 100;
++
++/* message pack + message protocol around payload; returns the frame length */
++static uint32_t
++gx_encode(uint8_t *out, uint8_t cmd, const uint8_t *pl, uint32_t plen, bool csum)
++{
++	uint32_t n = 0, mlen = plen + 4, s = 0;
++	if (plen + 8 > GX_MAX_FRAME) {
++		return 0;
++	}
++	out[n++] = GX_FLAGS_MSG;
++	out[n++] = (uint8_t)mlen;
++	out[n++] = (uint8_t)(mlen >> 8);
++	out[n++] = (uint8_t)(out[0] + out[1] + out[2]);
++	uint32_t p0 = n;
++	out[n++] = cmd;
++	out[n++] = (uint8_t)(plen + 1);
++	out[n++] = (uint8_t)((plen + 1) >> 8);
++	for (uint32_t i = 0; i < plen; i++) {
++		out[n++] = pl[i];
++	}
++	for (uint32_t i = p0; i < n; i++) {
++		s += out[i];
++	}
++	out[n++] = csum ? (uint8_t)(0xaa - s) : 0x88;
++	return n;
++}
++
++/*
++ * Looks for a message pack in in[0..n): the first A0/B0/B2 flags byte within the first 8 bytes whose
++ * pack checksum holds, then the protocol checksum. 2 = pack and protocol valid, 1 = pack header valid
++ * only, 0 = none. cmd and plen describe the protocol part.
++ */
++static int
++gx_decode(const uint8_t *in, uint32_t n, uint8_t *cmd, uint32_t *plen, uint32_t *at)
++{
++	for (uint32_t i = 0; i + 4 <= n && i < 8; i++) {
++		uint8_t f = in[i];
++		if (f != 0xa0 && f != 0xb0 && f != 0xb2) {
++			continue;
++		}
++		uint32_t len = in[i + 1] | ((uint32_t)in[i + 2] << 8);
++		if ((uint8_t)(in[i] + in[i + 1] + in[i + 2]) != in[i + 3] || len < 4) {
++			continue;
++		}
++		*at = i;
++		if (i + 4 + len > n) {
++			return 1;                               /* cut by our read size */
++		}
++		const uint8_t *m = in + i + 4;
++		uint32_t ml = m[1] | ((uint32_t)m[2] << 8), s = 0;
++		*cmd = m[0];
++		*plen = ml ? ml - 1 : 0;
++		if (ml + 3 > len) {
++			return 1;
++		}
++		for (uint32_t k = 0; k < ml + 2; k++) {
++			s += m[k];
++		}
++		if (m[ml + 2] == (uint8_t)(0xaa - s) || m[ml + 2] == 0x88) {
++			return 2;
++		}
++		return 1;
++	}
++	return 0;
++}
++
++/* TX of n bytes in FIFO-sized pieces, CS kept asserted. 0 ok. */
++static int
++se_tx_long(const uint8_t *buf, uint32_t n)
++{
++	for (uint32_t off = 0; off < n; off += GX_CHUNK) {
++		uint32_t c = n - off < GX_CHUNK ? n - off : GX_CHUNK;
++		if (se_tx(buf + off, c) != 0) {
++			return -1;
++		}
++	}
++	return 0;
++}
++
++/* RX of n bytes in FIFO-sized pieces (the last piece ends the transfer). Returns the bytes read. */
++static int
++se_rx_long(uint8_t *buf, uint32_t n)
++{
++	uint32_t got = 0;
++	while (got < n) {
++		uint32_t c = n - got < GX_CHUNK ? n - got : GX_CHUNK;
++		int r = se_rx(buf + got, c, got + c >= n);
++		if (r < 0) {
++			return got ? (int)got : -1;
++		}
++		got += (uint32_t)r;
++		if ((uint32_t)r < c) {
++			break;
++		}
++	}
++	return (int)got;
++}
++
++/* One frame out: plain, or with the 5120-SPI transport prefix (wrap). 0 ok. */
++static int
++gx_write(const uint8_t *frame, uint32_t n, int wrap)
++{
++	int rc = se_cmd_simple(SPI_CS_ASSERT, "cs assert");
++	if (rc == 0 && wrap) {
++		gx_seq++;
++		uint8_t h[4] = { 0xcc, 0xf2, (uint8_t)gx_seq, (uint8_t)(gx_seq >> 8) };
++		rc = se_tx(h, 4);
++	}
++	if (rc == 0) {
++		rc = se_tx_long(frame, n);
++	}
++	(void)se_cmd_simple(SPI_CS_DEASSERT, "cs deassert");
++	return rc;
++}
++
++/* n answer bytes in: plain clocked bytes, or after the BB F1 00 00 read header (wrap). */
++static int
++gx_read(uint8_t *buf, uint32_t n, int wrap)
++{
++	int rc = se_cmd_simple(SPI_CS_ASSERT, "cs assert");
++	int got = -1;
++	if (rc == 0 && wrap) {
++		static const uint8_t h[4] = { 0xbb, 0xf1, 0x00, 0x00 };
++		rc = se_tx(h, 4);
++	}
++	if (rc == 0) {
++		got = se_rx_long(buf, n);
++	}
++	(void)se_cmd_simple(SPI_CS_DEASSERT, "cs deassert");
++	return got;
++}
++
++/* Watches the IRQ pin for ms; returns the ms of the first level change, -1 when it stays. */
++static int
++irq_wait(int ms, int *level_out)
++{
++	int first = negroni_fp_irq_level(), change = -1;
++	for (int i = 0; i < ms; i++) {
++		IOSleep(1);
++		int now = negroni_fp_irq_level();
++		if (now != first) {
++			change = i + 1;
++			break;
++		}
++	}
++	*level_out = negroni_fp_irq_level();
++	return change;
++}
++
++static bool
++all_same(const uint8_t *b, uint32_t n)
++{
++	for (uint32_t i = 1; i < n; i++) {
++		if (b[i] != b[0]) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * Sends one command and reads rxn answer bytes. Returns 2 = a valid message pack came back (the
++ * proof that the MCU speaks the public protocol), 1 = bytes on MISO without a pack, 0 = MISO idle,
++ * -1 = SPI error.
++ */
++static int
++gx_probe(const char *name, uint8_t cmd, const uint8_t *pl, uint32_t plen, bool csum, uint32_t rxn, int wrap)
++{
++	uint8_t frame[GX_MAX_FRAME], in[128];
++	char tag[64];
++	uint32_t n = gx_encode(frame, cmd, pl, plen, csum);
++	if (n == 0 || rxn > sizeof(in)) {
++		return -1;
++	}
++	snprintf(tag, sizeof(tag), "%s %s tx", wrap ? "wrap" : "plain", name);
++	hexline(tag, frame, (int)n);
++	if (gx_write(frame, n, wrap) != 0) {
++		printf("NEGRONI FP: %s: tx failed\n", name);
++		return -1;
++	}
++	int level = 0, irq = irq_wait(gx_irqwait_ms, &level);
++	if (irq >= 0) {
++		printf("NEGRONI FP: irq40 changed %d ms after the frame (now %d): the MCU reacts\n", irq, level);
++	}
++	int got = gx_read(in, rxn, wrap);
++	if (got <= 0) {
++		printf("NEGRONI FP: %s: no data (rc %d)\n", name, got);
++		return -1;
++	}
++	snprintf(tag, sizeof(tag), "%s %s rx", wrap ? "wrap" : "plain", name);
++	hexline(tag, in, got > 16 ? 16 : got);
++	if (got > 16) {
++		snprintf(tag, sizeof(tag), "%s %s rx+16", wrap ? "wrap" : "plain", name);
++		hexline(tag, in + 16, got - 16 > 16 ? 16 : got - 16);
++	}
++	if (all_same(in, (uint32_t)got)) {
++		printf("NEGRONI FP: %s: MISO idle (all %02x)\n", name, in[0]);
++		return 0;
++	}
++	uint8_t rcmd = 0;
++	uint32_t rplen = 0, at = 0;
++	int d = gx_decode(in, (uint32_t)got, &rcmd, &rplen, &at);
++	if (d == 2) {
++		printf("NEGRONI FP: %s: VALID message pack at byte %u: cmd %02x payload %u bytes%s\n", name, at, rcmd, rplen,
++		    rcmd == GX_CMD_ACK ? " (ACK)" : "");
++		return 2;
++	}
++	if (d == 1) {
++		printf("NEGRONI FP: %s: pack header at byte %u (cmd %02x, len %u) but the checksum/length does not hold\n",
++		    name, at, rcmd, rplen);
++		return 1;
++	}
++	printf("NEGRONI FP: %s: bytes on MISO, no message pack header\n", name);
++	return 1;
++}
++
++static int gx_best_wrap = -1;   /* the transport that answered (step 10), -1 none */
++
++/* step 10: the public frames over both transports; sets gx_best_wrap */
++static void
++mcu_probe(int wrapsel)
++{
++	static const uint8_t p55[1] = { 0x55 };
++	static const uint8_t p00[2] = { 0x00, 0x00 };
++	static const uint8_t preg0[4] = { 0x00, 0x00, 0x00, 0x04 };   /* read_sensor_register(0, 4): 5110 chip id A2 04 25 00 */
++	static const uint8_t pnop[4] = { 0, 0, 0, 0 };
++	int best = 0;
++	for (int wrap = 0; wrap < 2; wrap++) {
++		if (wrapsel != 2 && wrap != wrapsel) {
++			continue;
++		}
++		int r = 0, t;
++		t = gx_probe("nop (00 x4, no checksum)", GX_CMD_NOP, pnop, 4, false, 16, wrap);
++		r = t > r ? t : r;
++		t = gx_probe("query mcu state (AE 55)", GX_CMD_QUERY_MCU_STATE, p55, 1, true, 32, wrap);
++		r = t > r ? t : r;
++		t = gx_probe("firmware version (A8 00 00)", GX_CMD_FW_VERSION, p00, 2, true, 64, wrap);
++		r = t > r ? t : r;
++		t = gx_probe("read otp (A6 00 00)", GX_CMD_READ_OTP, p00, 2, true, 80, wrap);
++		r = t > r ? t : r;
++		t = gx_probe("read sensor reg 0 (82 00 00 00 04)", GX_CMD_READ_SENSOR_REG, preg0, 4, true, 16, wrap);
++		r = t > r ? t : r;
++		if (r > best) {
++			best = r;
++			gx_best_wrap = wrap;
++		}
++	}
++	printf("NEGRONI FP: MCU probe result: %s%s\n",
++	    best == 2 ? "VALID message pack from the chip: the G7 MCU speaks the public Goodix MCU protocol" :
++	    best == 1 ? "bytes on MISO but no valid message pack: the chip answers, the framing differs" :
++	    "MISO idle: no answer to the public frames (wrong SE, mode, clock, or a different protocol)",
++	    best > 0 ? (gx_best_wrap ? " (CC F2 / BB F1 transport)" : " (plain SPI)") : "");
++}
++
+ /* ---- power and pins ---- */
+ 
+ static void
+@@ -541,13 +828,21 @@ log_pins(const char *when)
+ static void
+ fp_thread(void *arg __unused, wait_result_t wr_ __unused)
+ {
+-	int delay_s = 15, hz = 4800000, mode = 0, ldo = 1, keep = 0, poll_s = 60;
++	int delay_s = 15, hz = 4800000, mode = 0, ldo = 1, keep = 0, poll_s = 60, wrapsel = 2;
+ 	(void)PE_parse_boot_argn("negronifp_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("negronifp_hz", &hz, sizeof(hz));
+ 	(void)PE_parse_boot_argn("negronifp_mode", &mode, sizeof(mode));
+ 	(void)PE_parse_boot_argn("negronifp_ldo", &ldo, sizeof(ldo));
+ 	(void)PE_parse_boot_argn("negronifp_keep", &keep, sizeof(keep));
+ 	(void)PE_parse_boot_argn("negronifp_poll", &poll_s, sizeof(poll_s));
++	(void)PE_parse_boot_argn("negronifp_wrap", &wrapsel, sizeof(wrapsel));
++	(void)PE_parse_boot_argn("negronifp_irqwait", &gx_irqwait_ms, sizeof(gx_irqwait_ms));
++	if (wrapsel < 0 || wrapsel > 2) {
++		wrapsel = 2;
++	}
++	if (gx_irqwait_ms < 1 || gx_irqwait_ms > 5000) {
++		gx_irqwait_ms = 100;
++	}
+ 	if (hz < 100000 || hz > 19200000) {
+ 		hz = 4800000;
+ 	}
+@@ -639,9 +934,21 @@ fp_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 
+ 	step(6, "power: RPMh ldoc11 (pm8350c_l11) 3000 mV");
+ 	if (ldo) {
+-		int rc = negroni_rpmh_vreg_enable("ldoc11", 3000);
++		/* 0352: the RPMh voter is shared (Wi-Fi, BT, camera, ADSP): retry while it is busy, as 0330 */
++		int rc = EBUSY;
++		for (unsigned i = 0; i < 40 && rc == EBUSY; i++) {
++			rc = negroni_rpmh_vreg_enable("ldoc11", 3000);
++			if (rc == EBUSY) {
++				IOSleep(50);
++			}
++		}
+ 		fp.ldo_voted = (rc == 0);
+-		printf("NEGRONI FP: ldoc11 vote rc %d%s\n", rc, rc == 0 ? "" : " (continuing: the rail may be on already)");
++		printf("NEGRONI FP: ldoc11 vote rc %d\n", rc);
++		if (rc != 0) {
++			printf("NEGRONI FP: stop: the ldoc11 vote failed (errno %d): the sensor is unpowered\n", rc);
++			power_down("ldo vote");
++			goto out;
++		}
+ 	} else {
+ 		printf("NEGRONI FP: ldoc11 vote skipped (negronifp_ldo=0)\n");
+ 	}
+@@ -691,6 +998,11 @@ fp_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 		(void)spi_cmd_read(rd_reg0, 3, in, 8, "F1 00 00 again ->");
+ 	}
+ 
++	if (fp.mode >= 3) {
++		step(10, "MCU frames [I]: public Goodix MCU message pack (A0 len sum | cmd len payload 0xAA-sum), plain SPI and the 5120-SPI transport (CC F2 seq / BB F1 00 00)");
++		mcu_probe(wrapsel);
++	}
++
+ 	if (fp.mode >= 2) {
+ 		step(9, "IRQ poll (TLMM 40): touch the sensor area");
+ 		int last = negroni_fp_irq_level(), lines = 0;

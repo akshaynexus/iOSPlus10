@@ -1,0 +1,350 @@
+Fingerprint stage C part 2 (negronifp=4): one raw capture. Panel HBM on through 0351's negroni_fp_hbm,
+wait 2 TE frames with the new negroni_fb_te_wait (NegroniFramebuffer.cpp, tearcheck frame counter of
+0259; 17 ms timed wait when negronifb_te=0), the public MCU get-image frame (20 01 00) over the
+transport that answered in step 10, HBM off right after the frame and its IRQ wait (<= 100 ms: the
+exposure is at the frame, the readout needs no light; review fix), then a bounded chunked read into a
+kmem buffer (negronifp_img bytes, default 183456 = 364 x 252 x 2 = DELMAR_ORIGIN_BUFFER_LEN of the
+public HAL header; the BB F1 00 00 read header once under one CS), stats and a verdict line.
+/dev/negroni-fp (0600) returns a 32-byte header (magic NFPI, 364, 252, len, mode, wrap, proto) + the
+bytes; scripts/fp/raw-to-png.py converts a pulled dump. The G7 readout command is not known [I]: the
+capture proves or refutes the public command. Applies after 0352.
+Details: docs/fingerprint-plan.md section 7, patches/xnu/README-fingerprint.md.
+
+diff --git a/bsd/dev/negroni_fp.c b/bsd/dev/negroni_fp.c
+index baaa561..90b3694 100644
+--- a/bsd/dev/negroni_fp.c
++++ b/bsd/dev/negroni_fp.c
+@@ -35,6 +35,15 @@
+  *                      5120-SPI transport wrapper; the raw answers are logged and decoded
+  *   negronifp_wrap=N   0352: 0 = plain frames only, 1 = CC F2 wrapper only, 2 = both (default 2)
+  *   negronifp_irqwait=MS  0352: how long to watch the IRQ pin after each frame (default 100 ms)
++ *   negronifp=4        = 3, then (0353) step 11: one raw capture: panel HBM on (0351's DCS set), wait
++ *                      2 TE frames (oplus,ofp-hbm-on-period) or 17 ms, MCU get-image frame (20 01 00)
++ *                      over the transport that answered in step 10 (plain when none), HBM off right
++ *                      after the frame + IRQ wait (<= 100 ms), bounded read into a buffer.
++ *                      /dev/negroni-fp (0600) returns a 32-byte header + the bytes
++ *                      (scripts/fp/raw-to-png.py). The G7 readout command is NOT known [I]: this is
++ *                      the public MCU command; an answer of idle bytes means the protocol differs.
++ *   negronifp_img=N    0353: capture buffer size (default 183456 = 364 x 252 x 2, the Delmar origin
++ *                      frame of the public HAL header gf_delmar_types.h DELMAR_ORIGIN_BUFFER_LEN)
+  * 0352 also retries the ldoc11 vote while the RPMh voter is busy (EBUSY, 40 x 50 ms as 0330) and
+  * stops when the vote fails (the sensor would be unpowered).
+  * Log: "NEGRONI FP: step N NAME ...". The chip-ID frames [I]: Goodix's public SPI drivers
+@@ -51,6 +60,11 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <sys/conf.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <vm/vm_kern.h>
+ #include "negroni_touch/tlmm.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -61,6 +75,8 @@ extern int negroni_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern int negroni_rpmh_vreg_disable(const char *res);                 /* 0350: added to negroni_rpmh.c */
+ void negroni_fp_init(void);
+ int negroni_fp_irq_level(void);
++extern int negroni_fp_hbm(bool on);                              /* 0351: NegroniFramebuffer.cpp, panel HBM DCS set */
++extern int negroni_fb_te_wait(uint32_t frames, uint32_t timeout_ms);   /* 0353: NegroniFramebuffer.cpp, TE frame count */
+ 
+ /* physical bases */
+ #define FP_QUP1_PA        0x00ac0000u     /* qcom,qupv3_1_geni_se@ac0000 */
+@@ -773,6 +789,205 @@ mcu_probe(int wrapsel)
+ 	    best > 0 ? (gx_best_wrap ? " (CC F2 / BB F1 transport)" : " (plain SPI)") : "");
+ }
+ 
++/* ---- 0353: one raw capture into a buffer + /dev/negroni-fp ---- */
++
++#define FP_IMG_DEFAULT   183456u          /* 364 x 252 x 2: DELMAR_ORIGIN_BUFFER_LEN (public gf_delmar_types.h) */
++#define FP_IMG_MAX       (1u << 20)
++#define FP_IMG_W         364u
++#define FP_IMG_H         252u
++#define FP_HDR_MAGIC     0x4950464eu      /* 'NFPI' little endian */
++
++struct negroni_fp_hdr {
++	uint32_t magic, width, height, len;    /* len = bytes that follow the header */
++	uint32_t mode, wrap, proto, pad;       /* negronifp, transport used, 2/1/0 = step 10 result, 0 */
++};
++
++static struct {
++	vm_offset_t buf;
++	uint32_t cap, len;
++	bool ready;
++	int proto;
++} fp_img;
++
++/* step 11 */
++static void
++fp_capture(uint32_t cap)
++{
++	static const uint8_t p01[2] = { 0x01, 0x00 };   /* mcu_get_image payload of the public 51x0 driver */
++	uint8_t frame[GX_MAX_FRAME];
++	int wrap = gx_best_wrap > 0 ? 1 : 0;
++	bool hbm_on = false;
++
++	if (fp_img.buf == 0) {
++		if (kmem_alloc(kernel_map, &fp_img.buf, cap, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("NEGRONI FP: capture: no buffer of %u bytes\n", cap);
++			return;
++		}
++		fp_img.cap = cap;
++	}
++	int hb = negroni_fp_hbm(true);
++	hbm_on = (hb == 0);
++	printf("NEGRONI FP: capture: panel HBM on rc %d\n", hb);
++	int te = negroni_fb_te_wait(2, 100);
++	if (te < 0) {
++		IOSleep(17);            /* 2 frames at 120 Hz; the TE counter needs negronifb_te=1 */
++	}
++	printf("NEGRONI FP: capture: TE wait %d (%s)\n", te,
++	    te >= 0 ? "frames counted" : te == -1 ? "TE counter off (negronifb_te=0): 17 ms timed" : "no TE in 100 ms: timed");
++
++	uint32_t n = gx_encode(frame, GX_CMD_MCU_GET_IMAGE, p01, 2, true);
++	hexline(wrap ? "wrap get image tx" : "plain get image tx", frame, (int)n);
++	if (gx_write(frame, n, wrap) != 0) {
++		printf("NEGRONI FP: capture: tx failed\n");
++		goto done;
++	}
++	int level = 0, irq = irq_wait(gx_irqwait_ms < 100 ? gx_irqwait_ms : 100, &level);
++	printf("NEGRONI FP: capture: irq40 %s (level %d)\n", irq >= 0 ? "changed" : "unchanged", level);
++	/* the exposure is at the frame; the readout needs no light: HBM off before the (long) bulk read */
++	hb = negroni_fp_hbm(false);
++	hbm_on = false;
++	printf("NEGRONI FP: capture: panel HBM off rc %d\n", hb);
++
++	/* bounded read: FIFO pieces under one chip select; stop after 16 idle pieces when nothing looked like data */
++	{
++		uint8_t *b = (uint8_t *)fp_img.buf;
++		uint32_t got = 0, idle = 0;
++		bool data = false;
++		int rc = se_cmd_simple(SPI_CS_ASSERT, "cs assert");
++		if (rc == 0 && wrap) {
++			static const uint8_t h[4] = { 0xbb, 0xf1, 0x00, 0x00 };
++			rc = se_tx(h, 4);
++		}
++		while (rc == 0 && got < cap) {
++			uint32_t c = cap - got < GX_CHUNK ? cap - got : GX_CHUNK;
++			int r = se_rx(b + got, c, got + c >= cap);
++			if (r <= 0) {
++				break;
++			}
++			if (all_same(b + got, (uint32_t)r)) {
++				idle++;
++			} else {
++				data = true;
++				idle = 0;
++			}
++			got += (uint32_t)r;
++			if (!data && idle >= 16) {
++				break;
++			}
++		}
++		(void)se_cmd_simple(SPI_CS_DEASSERT, "cs deassert");
++		fp_img.len = got;
++		uint32_t z = 0, f = 0, distinct = 0;
++		uint8_t seen[32] = { 0 };
++		for (uint32_t i = 0; i < got; i++) {
++			z += b[i] == 0;
++			f += b[i] == 0xff;
++			seen[b[i] >> 3] |= (uint8_t)(1u << (b[i] & 7));
++		}
++		for (uint32_t i = 0; i < 256; i++) {
++			distinct += (seen[i >> 3] >> (i & 7)) & 1u;
++		}
++		hexline("capture rx", b, got > 16 ? 16 : (int)got);
++		uint8_t rcmd = 0;
++		uint32_t rplen = 0, at = 0;
++		int d = got ? gx_decode(b, got > 64 ? 64 : got, &rcmd, &rplen, &at) : 0;
++		printf("NEGRONI FP: capture: %u bytes read of %u (00: %u, ff: %u, %u distinct values)%s%s\n", got, cap, z, f, distinct,
++		    d == 2 ? ": message pack header, cmd " : d == 1 ? ": pack header without a valid checksum, cmd " : "",
++		    d ? "(see rx line)" : "");
++		if (d) {
++			printf("NEGRONI FP: capture: pack at byte %u cmd %02x payload %u bytes\n", at, rcmd, rplen);
++		}
++		printf("NEGRONI FP: capture: %s\n",
++		    distinct > 16 ? "VARIED DATA: pull /dev/negroni-fp and run scripts/fp/raw-to-png.py" :
++		    got == 0 ? "no bytes" : "idle bytes only: the public get-image frame is not the G7 readout command [I]");
++		fp_img.ready = true;
++	}
++done:
++	if (hbm_on) {                   /* the tx-failure path */
++		hb = negroni_fp_hbm(false);
++		printf("NEGRONI FP: capture: panel HBM off rc %d\n", hb);
++	}
++}
++
++/* /dev/negroni-fp: header + the captured bytes */
++static int
++fp_dev_open(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	(void)dev; (void)flags; (void)devtype; (void)p;
++	return 0;
++}
++
++static int
++fp_dev_close(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	(void)dev; (void)flags; (void)devtype; (void)p;
++	return 0;
++}
++
++static int
++fp_dev_read(dev_t dev, struct uio *uio, int ioflag)
++{
++	struct negroni_fp_hdr h = {
++		.magic = FP_HDR_MAGIC, .width = FP_IMG_W, .height = FP_IMG_H, .len = fp_img.ready ? fp_img.len : 0,
++		.mode = (uint32_t)fp.mode, .wrap = (uint32_t)(gx_best_wrap > 0), .proto = (uint32_t)fp_img.proto, .pad = 0,
++	};
++	(void)dev; (void)ioflag;
++	off_t off = uio_offset(uio);
++	uint64_t tot = sizeof(h) + h.len;
++	if (off < 0 || (uint64_t)off >= tot) {
++		return 0;
++	}
++	if (off < (off_t)sizeof(h)) {
++		uint32_t n = (uint32_t)(sizeof(h) - off);
++		if (n > uio_resid(uio)) {
++			n = (uint32_t)uio_resid(uio);
++		}
++		int e = uiomove((caddr_t)&h + off, (int)n, uio);
++		if (e) {
++			return e;
++		}
++		off = uio_offset(uio);
++	}
++	while (uio_resid(uio) > 0 && (uint64_t)off < tot) {
++		uint32_t n = (uint32_t)(tot - off);
++		if (n > uio_resid(uio)) {
++			n = (uint32_t)uio_resid(uio);
++		}
++		int e = uiomove((caddr_t)fp_img.buf + (off - sizeof(h)), (int)n, uio);
++		if (e) {
++			return e;
++		}
++		off = uio_offset(uio);
++	}
++	return 0;
++}
++
++static const struct cdevsw fp_cdevsw = {
++	.d_open = fp_dev_open,
++	.d_close = fp_dev_close,
++	.d_read = fp_dev_read,
++	.d_write = eno_rdwrt,
++	.d_ioctl = eno_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type = 0,
++};
++
++static void
++fp_dev_init(void)
++{
++	int major = cdevsw_add(-1, &fp_cdevsw);
++	if (major < 0) {
++		printf("NEGRONI FP: cdevsw_add failed\n");
++		return;
++	}
++	devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "negroni-fp");
++}
++
+ /* ---- power and pins ---- */
+ 
+ static void
+@@ -829,6 +1044,7 @@ static void
+ fp_thread(void *arg __unused, wait_result_t wr_ __unused)
+ {
+ 	int delay_s = 15, hz = 4800000, mode = 0, ldo = 1, keep = 0, poll_s = 60, wrapsel = 2;
++	uint32_t img = FP_IMG_DEFAULT;
+ 	(void)PE_parse_boot_argn("negronifp_delay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("negronifp_hz", &hz, sizeof(hz));
+ 	(void)PE_parse_boot_argn("negronifp_mode", &mode, sizeof(mode));
+@@ -843,6 +1059,10 @@ fp_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 	if (gx_irqwait_ms < 1 || gx_irqwait_ms > 5000) {
+ 		gx_irqwait_ms = 100;
+ 	}
++	(void)PE_parse_boot_argn("negronifp_img", &img, sizeof(img));
++	if (img < 64 || img > FP_IMG_MAX) {
++		img = FP_IMG_DEFAULT;
++	}
+ 	if (hz < 100000 || hz > 19200000) {
+ 		hz = 4800000;
+ 	}
+@@ -1001,6 +1221,12 @@ fp_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 	if (fp.mode >= 3) {
+ 		step(10, "MCU frames [I]: public Goodix MCU message pack (A0 len sum | cmd len payload 0xAA-sum), plain SPI and the 5120-SPI transport (CC F2 seq / BB F1 00 00)");
+ 		mcu_probe(wrapsel);
++		fp_img.proto = gx_best_wrap < 0 ? 0 : 2;
++	}
++
++	if (fp.mode >= 4) {
++		step(11, "capture [I]: panel HBM on, 2 TE frames, MCU get image (20 01 00), HBM off, bounded read into the buffer; /dev/negroni-fp");
++		fp_capture(img);
+ 	}
+ 
+ 	if (fp.mode >= 2) {
+@@ -1045,6 +1271,7 @@ negroni_fp_init(void)
+ 	if (fp.mode <= 0) {
+ 		return;
+ 	}
++	fp_dev_init();                  /* 0353: /dev/negroni-fp (header only until a capture) */
+ 	if (kernel_thread_start(fp_thread, NULL, &fp.thread) == KERN_SUCCESS) {
+ 		thread_deallocate(fp.thread);
+ 	}
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 7e1a9b2..ac723de 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -166,6 +166,8 @@ extern "C" void negroni_backlight_panic(void);
+ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ #define NEGRONI_WIMG_IO                   0x7u
+ extern "C" void negroni_fb_panic(void);
++extern "C" int negroni_fb_te_wait(uint32_t frames, uint32_t timeout_ms);   /* 0353: bsd/dev/negroni_fp.c */
++static vm_offset_t negroni_fb_te_intf;    /* 0353: INTF_1 once teInit mapped it (0 = TE counter off) */
+ 
+ enum {
+ 	kNegroniFBGetLayerDefaultSurface  = 3,
+@@ -1273,6 +1275,29 @@ negroni_fb_us_abs(uint64_t us)
+  * DCS). negronifb_vrr_hs=1|0 forces the DCS transmission mode (default: high-speed for mode 2 as
+  * Android's dsi_hs_mode, low-power for mode 1 like the brightness). All default off.
+  */
++/*
++ * 0353: wait until the tearcheck frame counter (INTF_TEAR_INT_COUNT_VAL bits 31:16, one count per
++ * TE) advanced by frames. Returns the frames seen, -1 when the counter is not mapped (negronifb_te
++ * and negronifb_vrr both 0), -2 on timeout. Sleeps 1 ms per poll; any thread.
++ */
++extern "C" int
++negroni_fb_te_wait(uint32_t frames, uint32_t timeout_ms)
++{
++	vm_offset_t intf = negroni_fb_te_intf;
++	if (intf == 0) {
++		return -1;
++	}
++	uint32_t f0 = negroni_dpu_rd(intf + INTF_TEAR_INT_COUNT_VAL) >> 16;
++	for (uint32_t ms = 0; ms < timeout_ms; ms++) {
++		IOSleep(1);
++		uint32_t d = ((negroni_dpu_rd(intf + INTF_TEAR_INT_COUNT_VAL) >> 16) - f0) & 0xffffu;
++		if (d >= frames) {
++			return (int)d;
++		}
++	}
++	return -2;
++}
++
+ void
+ AppleCLCD::teInit(void)
+ {
+@@ -1294,6 +1319,7 @@ AppleCLCD::teInit(void)
+ 		IOLog("NEGRONI FB TE: no mapping of INTF_1 (0x%lx): negronifb_te/vrr off\n", NEGRONI_INTF1_PA);
+ 		return;
+ 	}
++	negroni_fb_te_intf = fIntf;     /* 0353 */
+ 	uint32_t cfg = negroni_dpu_rd(fIntf + INTF_TEAR_SYNC_CONFIG_VSYNC);
+ 	uint32_t count = negroni_dpu_rd(fIntf + INTF_TEAR_INT_COUNT_VAL);
+ 	uint32_t ar = negroni_dpu_rd(fIntf + INTF_TEAR_AUTOREFRESH_CONFIG);

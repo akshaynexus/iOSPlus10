@@ -1,4 +1,4 @@
-# Fingerprint patches 0350-0351 (Goodix optical G7 under the display)
+# Fingerprint patches 0350-0353 (Goodix optical G7 under the display)
 
 Facts, plan and iOS design: `docs/fingerprint-plan.md`. All boot-args default off.
 
@@ -70,7 +70,67 @@ for later stages. With `negronifp_hl` > 0 every GPU frame waits on its copy fenc
 (like `negronibadge=1`), so the disc is on every frame. Frames the display engine shows directly
 (zero-copy) carry no disc.
 
+## 0352 stage C part 1: MCU frames (`negronifp=3`)
+
+| Boot-arg | Default | Meaning |
+|---|---|---|
+| `negronifp` | 0 | 3 = steps 1-8, 10 (MCU frames), 9 (IRQ poll) |
+| `negronifp_wrap` | 2 | 0 = plain SPI frames only, 1 = the 5120-SPI transport (`CC F2 seq` write, `BB F1 00 00` read) only, 2 = both |
+| `negronifp_irqwait` | 100 | ms to watch the IRQ pin after each frame |
+
+0352 also changes step 6: the ldoc11 vote retries `EBUSY` 40 x 50 ms (the RPMh voter is shared with Wi-Fi/BT/camera)
+and a failed vote stops the thread (`stop: the ldoc11 vote failed (errno N): the sensor is unpowered`).
+
+Expected log:
+
+```
+NEGRONI FP: step 10 MCU frames [I]: public Goodix MCU message pack (A0 len sum | cmd len payload 0xAA-sum), plain SPI and the 5120-SPI transport (CC F2 seq / BB F1 00 00)
+NEGRONI FP: plain nop (00 x4, no checksum) tx (12 bytes): a0 08 00 a8 00 05 00 00 00 00 00 88
+NEGRONI FP: plain nop ... rx (16 bytes): xx ...
+NEGRONI FP: plain query mcu state (AE 55) tx (9 bytes): a0 05 00 a5 ae 02 00 55 a5
+NEGRONI FP: irq40 changed 3 ms after the frame (now 1): the MCU reacts            <- proof 1
+NEGRONI FP: plain query mcu state (AE 55) rx (16 bytes): ...
+NEGRONI FP: plain query mcu state (AE 55): VALID message pack at byte 0: cmd b0 payload 2 bytes (ACK)   <- proof 2
+... firmware version (A8 00 00), read otp (A6 00 00), read sensor reg 0 (82 00 00 00 04), then the same with "wrap"
+NEGRONI FP: MCU probe result: VALID message pack from the chip: the G7 MCU speaks the public Goodix MCU protocol (plain SPI)
+```
+Other verdicts: `bytes on MISO but no valid message pack: the chip answers, the framing differs`,
+`MISO idle: no answer to the public frames (wrong SE, mode, clock, or a different protocol)`.
+Frame check (goodix.py): `AE 55` -> protocol `ae 02 00 55` + checksum `(0xaa - (0xae+0x02+0x00+0x55)) & 0xff = 0xa5`;
+pack `a0 05 00` + `0xa5`.
+
+## 0353 stage C part 2: one capture (`negronifp=4`)
+
+| Boot-arg | Default | Meaning |
+|---|---|---|
+| `negronifp` | 0 | 4 = 3 + step 11 (capture) |
+| `negronifp_img` | 183456 | capture buffer bytes (364 x 252 x 2), 64 .. 1 MiB |
+| `negronifb_te` | 0 | 1 makes `negroni_fb_te_wait` count real TE frames; 0 = 17 ms timed wait |
+
+Expected log:
+
+```
+NEGRONI FP: step 11 capture [I]: panel HBM on, 2 TE frames, MCU get image (20 01 00), HBM off, bounded read into the buffer; /dev/negroni-fp
+NEGRONI FP: capture: panel HBM on rc 0
+NEGRONI FP: capture: TE wait 2 (frames counted)              (or: -1 (TE counter off (negronifb_te=0): 17 ms timed))
+NEGRONI FP: plain get image tx (10 bytes): a0 06 00 a6 20 03 00 01 00 86
+NEGRONI FP: capture: irq40 changed (level 1)
+NEGRONI FP: capture: panel HBM off rc 0            (HBM is off right after the frame + IRQ wait (<= 100 ms): the exposure is at the frame, the readout needs no light)
+NEGRONI FP: capture rx (16 bytes): ...
+NEGRONI FP: capture: 183456 bytes read of 183456 (00: N, ff: N, 200 distinct values)
+NEGRONI FP: capture: VARIED DATA: pull /dev/negroni-fp and run scripts/fp/raw-to-png.py
+```
+`idle bytes only: the public get-image frame is not the G7 readout command [I]` is the negative result. The
+read stops early after 16 idle 64-byte pieces when no piece looked like data (1 KiB), so a negative run is fast.
+Pull: `scripts/net/ssh-phone.sh scp root@phone:/dev/negroni-fp out/fp/capture.bin` (or `cat /dev/negroni-fp >
+/tmp/c.bin` on the phone, as root: the node is 0600), then `scripts/fp/raw-to-png.py out/fp/capture.bin`
+(`--self-test` checks the converter). The node exists with `negronifp` >= 1 (header only, len 0, before a capture).
+The bulk read sends the `BB F1 00 00` read header once under one chip select; the public 5120 driver re-sends it per
+256-byte read (protocol.py:182) [difference noted, not tested].
+
 ## Test image
 
-`out/ios16-fp`: config args + `negronifp=2 negronifp_hl=1 negronipanic=30 negronipanicreason=2`.
+`out/ios16-fp`: config args + `negronifp=2 negronifp_hl=1 negronipanic=30 negronipanicreason=2` (stages A/B).
+`out/ios16-fp3`: config args + `negronifp=3 negronifp_hl=2 negronipanic=30 negronipanicreason=2` (stage C probe; the disc
+without HBM; `scripts/fp/build-test-image.sh fp3`). Capture image: `scripts/fp/build-test-image.sh fp4 "negronifp=4 negronifp_hl=2 negronifb_te=1 negronipanic=30 negronipanicreason=2"`.
 Flash with `IOS16_OUT=out/ios16-fp scripts/flash/ios16.sh boot --yes` (owner approval; boot_a only).
