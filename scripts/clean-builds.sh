@@ -35,7 +35,10 @@ done
 [ -d "$K/keep" ] && add "$K/keep"
 for d in "$OUT"/ios16-*; do
   [ -d "$d" ] || continue
-  case $(basename "$d") in ios16-debug|ios16-safe|ios16-everything) ;; *) add "$d" ;; esac   # safe = the known-good boot_a (test-boot.sh)
+  case $(basename "$d") in ios16-debug|ios16-safe|ios16-everything) continue ;; esac   # safe = the known-good boot_a (test-boot.sh)
+  # test images (out/ios16-tNN) changed in KEEP_HOURS hours stay: a queued RAM test or log read may still use them
+  [ -n "$(find "$d" -type f -mmin "-$((KEEP_HOURS * 60))" -print -quit 2>/dev/null)" ] && continue
+  add "$d"
 done
 for d in "$OUT"/backup-orphan-*; do
   [ -d "$d" ] && [ -n "$(find "$d" -maxdepth 0 -mtime +2)" ] && add "$d"
