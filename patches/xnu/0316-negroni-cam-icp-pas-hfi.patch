@@ -1,0 +1,592 @@
+Camera level 6 (negronicam=6): CAMERA_ICP.mdt/.bNN from the ADSP firmware area into camera_region
+0x9f500000, TrustZone PAS 33 (init image, mem setup, auth and reset), HFI init (queue table, INIT_REQUEST,
+INIT_RESPONSE) and HFI_CMD_SYS_INIT -> HFI_MSG_SYS_INIT_DONE; PAS shutdown at power down.
+
+diff --git a/bsd/dev/negroni_cam.c b/bsd/dev/negroni_cam.c
+index 5dac85f..bd5a585 100644
+--- a/bsd/dev/negroni_cam.c
++++ b/bsd/dev/negroni_cam.c
+@@ -1,5 +1,5 @@
+ /*
+- * NEGRONI (OnePlus 10 Pro 5G, SM8450 "waipio"): camera bring-up, levels 1-5 (patches 0310-0315).
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450 "waipio"): camera bring-up, levels 1-6 (patches 0310-0316).
+  *
+  * Boot-arg negronicam (default 0 = no camera register access at all):
+  *   1  level 1 (0310): GCC camera clocks, camcc titan top GDSC, camcc AHB/CAMNOC/CCI0 clocks from the
+@@ -20,6 +20,11 @@
+  *      mode, 4000x3008 RAW10). Proof: CSID BUF_DONE for RDI0 + the first bytes + a byte histogram.
+  *      The frames stay readable as /dev/negronicam-tpg and /dev/negronicam-sensor (64-byte header +
+  *      MIPI RAW10 bytes; scripts/camera/pull-frame.sh, scripts/camera/raw-to-png.py).
++ *   6  level 6 (0316): level 5 + the ICP (LX7) firmware CAMERA_ICP.mdt/.bNN from the ADSP firmware area
++ *      (scripts/audio/mkadsparea.py adds them; scripts/camera/extract-icp-fw.sh) into camera_region
++ *      0x9f500000 + 8 MiB, TrustZone PAS id 33 (init image, mem setup, auth and reset, lx7_core.c:619-663),
++ *      then the HFI handshake of hfi.c cam_hfi_init (queue table, INIT_REQUEST, INIT_RESPONSE) and
++ *      HFI_CMD_SYS_INIT -> HFI_MSG_SYS_INIT_DONE. PAS shutdown at power down.
+  *   negronicam_src=1|2|3  1 TPG only (no sensor power, all capture clocks at 19.2 MHz TCXO), 2 sensor only,
+  *      3 (default) both. negronicam_drate=N C-PHY data-rate table index (default 0, 0..11),
+  *      negronicam_settle=N settle count (default 52 = module file mode 1 settle, see l4_csiphy).
+@@ -54,6 +59,9 @@
+  *   vfe       Linux camss-vfe-680.c and camera-kernel vfe_hw/vfe17x/cam_vfe680.h (bus client 24 = RDI0),
+  *             vfe_bus/cam_vfe_bus_ver3.c (RDI MIPI RAW10 frame-based WM :856-870, start_wm :1398-1465)
+  *   tpg       camera-kernel cam_sensor_module/cam_tpg/tpg_hw/tpg_hw_v_1_3/tpg_hw_v_1_3.c (qcom,cam-tpg103)
++ *   icp       camera-kernel cam_icp/icp_hw/lx7_hw/lx7_core.c, lx7_reg.h, cam_icp/hfi.c (cam_hfi_init
++ *             :733-950, hfi_write_cmd, hfi_read_message), fw_inc/hfi_reg.h, fw_inc/hfi_sys_defs.h,
++ *             icp_hw_mgr/cam_icp_hw_mgr.c cam_icp_mgr_hfi_init (event mode 0 = INTR_MODE)
+  *   cpas      OnePlus camera-kernel drivers/cam_cpas/cpas_top/cam_cpastop_hw.c, cpastop_v680_110.h
+  *   smmu      live.dts:15350-15370 apps-smmu@15000000, 22583-22672 msm_cam_smmu_ife / _icp
+  *   ftm       OnePlus camera-kernel drivers/oplus/cam_sensor_module/cam_sensor/cam_sensor_settings.h:6017-6141
+@@ -88,12 +96,14 @@
+ #include <miscfs/devfs/devfs.h>
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>
++#include <libkern/crypto/sha2.h>
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+ extern uint64_t kvtophys(vm_offset_t va);
++extern int negroni_ufs_adsp_area_read(uint64_t at, void *dst, uint32_t count);
+ extern int negroni_rpmh_cam_rail(const char *res, unsigned mv, int mode, bool on);
+ void negroni_cam_init(void);
+ 
+@@ -176,7 +186,7 @@ void negroni_cam_init(void);
+ #define CCI_RD_THRESHOLD_VALUE  0x30u
+ #define CCI_TIMEOUT_US  100000u
+ #define CCI_MASTER      0u              /* slot 0 cci-master 0 (live.dts:22210) */
+-#define CAM_MAX_LEVEL   5u         /* cci-up CCI_TIMEOUT 100 ms (cci-dn uses 1500 ms) */
++#define CAM_MAX_LEVEL   6u         /* cci-up CCI_TIMEOUT 100 ms (cci-dn uses 1500 ms) */
+ /* cam_cci_dev.h:242-253 enum cci_i2c_cmd_type */
+ #define CCI_CMD_SET_PARAM       1u
+ #define CCI_CMD_LOCK            6u
+@@ -574,6 +584,99 @@ static int camdev_major = -1;
+ static void csiphy_status(const char *when);
+ #define FRAME_FILL      0xa5u           /* buffer fill before the DMA: untouched bytes keep it */
+ 
++/*
++ * Level 6 (0316): ICP. live.dts:23793-23820 qcom,lx7: reg lx7_csr 0xac01000, lx7_cirq 0xac01800, lx7_wd0
++ * 0xac04000; clocks icp_ahb_clk (camcc 0x2f = CAM_CC_ICP_AHB_CLK 0x13128), icp_clk_src (0x31, RCG 0x13108,
++ * 19.2 MHz TCXO entry camcc:1295), icp_clk (0x30, 0x13120); memory-region 0x26d = camera_region@9f500000
++ * (live.dts:184-188, no-map, 0x800000; inside the UEFI "PIL Reserved" 0x85200000 + 0x1c200000,
++ * Mu-Silicium negroniPkg MemoryMapLib.c:14, so XNU does not own it).
++ */
++#define ICP_CSR_PA      0x0ac01000UL
++#define ICP_CIRQ_OFF    0x800u          /* lx7_cirq 0xac01800, same page */
++#define ICP_GP(n)       (0x20u + 4u * (n))   /* LX7_GEN_PURPOSE_REG_OFFSET + hfi_reg.h GEN_PURPOSE_REG(n) */
++#define HFI_FW_VERSION  1
++#define HFI_INIT_REQ    2
++#define HFI_INIT_RESP   3
++#define HFI_SHMEM_PTR   4
++#define HFI_SHMEM_SIZE  5
++#define HFI_QTBL_PTR    6
++#define HFI_SECHEAP_PTR 7
++#define HFI_SECHEAP_SIZE 8
++#define HFI_SFR_PTR     10
++#define HFI_QDSS_IOVA   11
++#define HFI_QDSS_SIZE   12
++#define HFI_IO_IOVA     13
++#define HFI_IO_SIZE     14
++#define HFI_IO2_IOVA    15
++#define HFI_IO2_SIZE    16
++#define HFI_FWUNC_IOVA  17
++#define HFI_FWUNC_SIZE  18
++#define CIRQ_OB_MASK    0x000u
++#define CIRQ_OB_STATUS  0x00cu
++#define CIRQ_HOST2ICP   0x124u
++#define CIRQ_PFAULT     0x128u
++#define CAMERA_REGION_PA 0x9f500000UL
++#define CAMERA_REGION_SIZE 0x800000u
++#define PAS_CAMERA      33              /* lx7_core.h CAM_FW_PAS_ID */
++#define SCM_64          (1ull << 30)
++#define SCM_SIP         (2ull << 24)
++#define SCM_CALL(svc, cmd) ((uint64_t)(svc) << 8 | (cmd))
++#define SCM_PAS_INIT_IMAGE     SCM_CALL(2, 1)
++#define SCM_PAS_MEM_SETUP      SCM_CALL(2, 2)
++#define SCM_PAS_AUTH_AND_RESET SCM_CALL(2, 5)
++#define SCM_PAS_SHUTDOWN       SCM_CALL(2, 6)
++#define SCM_ONE_VALUE          1
++#define SCM_THREE_VALUES       3
++#define SCM_VALUE_AND_BUFFER   (2 | 2 << 6)
++#define SCM_INTERRUPTED        1
++/* ADSP firmware area (negroni_adsp.c / scripts/audio/mkadsparea.py layout) */
++#define AREA_MAGIC      "NEGRADSP"
++#define AREA_MAX        64
++#define AREA_HEADER     8192u
++#define AREA_SIZE       (32u << 20)
++#define AREA_CHUNK      (1u << 20)
++struct area_entry { char name[48]; uint32_t offset, size; uint8_t sha256[32]; };
++struct area_header { char magic[8]; uint32_t version, count; struct area_entry entry[AREA_MAX]; };
++#define MDT_TYPE(flags) (((flags) >> 24) & 7)
++#define MDT_TYPE_HASH   2
++#define MDT_RELOCATABLE (1u << 27)
++#define ICP_MAX_SEGS    32
++struct icp_seg { uint32_t type, offset, paddr, filesz, memsz, flags; };
++/* HFI memory (hfi_reg.h:30-40 sizes); one contiguous block below 4 GiB, used by physical address */
++#define HFI_Q_WORDS     239u            /* struct hfi_q_hdr: 14 fields + 15 x 15 dummy words (956 B) */
++#define QH_STATUS       15u             /* word index of each field inside struct hfi_q_hdr */
++#define QH_START        31u
++#define QH_TYPE         47u
++#define QH_QSIZE        63u
++#define QH_PKTSIZE      79u
++#define QH_DROP         95u
++#define QH_RX_WM        111u
++#define QH_TX_WM        127u
++#define QH_RX_REQ       143u
++#define QH_TX_REQ       159u
++#define QH_RX_IRQ       175u
++#define QH_TX_IRQ       191u
++#define QH_READ_IDX     207u
++#define QH_WRITE_IDX    223u
++#define HFI_OFF_QTBL    0x000000u
++#define HFI_OFF_CMDQ    0x001000u       /* ICP_CMD_Q_SIZE_IN_BYTES 4096 */
++#define HFI_OFF_MSGQ    0x002000u       /* ICP_MSG_Q_SIZE_IN_BYTES 4096 */
++#define HFI_OFF_SFR     0x003000u       /* sfr_buf: u32 size + 4096 bytes */
++#define HFI_OFF_DBGQ    0x005000u       /* ICP_DBG_Q_SIZE_IN_BYTES 102400 */
++#define HFI_OFF_SECHEAP 0x100000u
++#define HFI_SECHEAP_LEN 0x100000u
++#define HFI_OFF_SHMEM   0x200000u
++#define HFI_SHMEM_LEN   0x100000u       /* ICP_SHARED_MEM_IN_BYTES */
++#define HFI_OFF_FWUNC   0x300000u
++#define HFI_FWUNC_LEN   0x200000u       /* ICP_UNCACHED_HEAP_SIZE_IN_BYTES */
++#define HFI_BLOCK       0x500000u
++#define HFI_CMD_SYS_INIT      0x10001u  /* hfi_sys_defs.h:62-63 */
++#define HFI_MSG_SYS_INIT_DONE 0x20001u  /* :116-117 */
++static vm_offset_t icp_csr, hfi_kva, hfi_uc;
++static uint64_t hfi_pa;
++static bool pas_started;
++static uint32_t icp_branches_on;
++
+ /*
+  * Votes before the first camcc access (0312). DT: qcom,cam-cpas (live.dts:22712-22713) interconnects
+  * <0x9f 0x02 0xa0 0x204> "cam_ahb" = gem_noc (interconnect@19100000) apps master -> config_noc
+@@ -725,6 +828,36 @@ branch_set(const char *name, vm_offset_t reg, bool on, bool poll_halt)
+ 	return ok;
+ }
+ 
++/* SMC to TrustZone, SMCCC with the Qualcomm SCM conventions (same as negroni_adsp.c scm) */
++static int32_t
++icp_scm(const char *what, uint64_t function, uint64_t args, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *answer)
++{
++	uint64_t session = 0;
++
++	say("  SCM %s: smc %#llx (%#llx, %#llx, %#llx)", what, function, a0, a1, a2);
++	for (int i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
++		register uint64_t x1 __asm__("x1") = args;
++		register uint64_t x2 __asm__("x2") = a0;
++		register uint64_t x3 __asm__("x3") = a1;
++		register uint64_t x4 __asm__("x4") = a2;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
++		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		session = x6;
++		if (x0 != SCM_INTERRUPTED) {
++			say("  SCM %s -> %d, answer %#llx", what, (int32_t)x0, x1);
++			*answer = x1;
++			return (int32_t)x0;
++		}
++	}
++	say("  SCM %s keeps returning interrupted", what);
++	return -1;
++}
++
+ /* RCG to source src with divider field hid (level 4 path clocks) */
+ static bool
+ rcg_set(const char *name, uint32_t off, uint32_t src, uint32_t hid)
+@@ -1075,6 +1208,28 @@ static void
+ cam_down(void)
+ {
+ 	say("power down");
++	if (pas_started) {
++		uint64_t answer = ~0ull;
++		int32_t r = icp_scm("PAS shutdown (camera)", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_CAMERA, 0, 0,
++		    &answer);
++		say("  ICP PAS shutdown: %d, answer %#llx", r, answer);
++		pas_started = false;
++	}
++	if (hfi_uc) {
++		ml_io_unmap(hfi_uc, HFI_BLOCK);
++		hfi_uc = 0;
++	}
++	if (hfi_kva) {
++		kmem_free(kernel_map, hfi_kva, HFI_BLOCK);
++		hfi_kva = 0;
++	}
++	if (icp_branches_on & 2u) {
++		(void)branch_set("cam_cc_icp_clk", camcc + 0x13120, false, true);
++	}
++	if (icp_branches_on & 1u) {
++		(void)branch_set("cam_cc_icp_ahb_clk", camcc + 0x13128, false, true);
++	}
++	icp_branches_on = 0;
+ 	if (tpg_on) {
+ 		wr(tpg + TPG_CTRL, 0);                  /* tpg_hw_v_1_3_reset (:350-376) */
+ 		wr(tpg + TPG_TOP_IRQ_MASK, 0);
+@@ -2168,6 +2323,351 @@ l5_frames(void)
+ 	return ok;
+ }
+ 
++/* ---- level 6: ICP firmware through PAS 33 + HFI (0316) ---- */
++
++static struct area_header *icp_area;
++static uint8_t *icp_mdt;
++static uint32_t icp_mdt_size, icp_nseg, icp_min_pa, icp_max_pa;
++static struct icp_seg icp_segs[ICP_MAX_SEGS];
++static bool icp_reloc;
++
++static const struct area_entry *
++icp_area_file(const char *name)
++{
++	for (uint32_t i = 0; icp_area && i < icp_area->count; i++) {
++		if (strncmp(icp_area->entry[i].name, name, sizeof(icp_area->entry[i].name)) == 0) {
++			return &icp_area->entry[i];
++		}
++	}
++	return NULL;
++}
++
++static bool
++icp_area_check(const struct area_entry *e, uint8_t *buf)
++{
++	SHA256_CTX ctx;
++	uint8_t digest[32];
++	SHA256_Init(&ctx);
++	for (uint32_t at = 0; at < e->size; at += AREA_CHUNK) {
++		uint32_t n = MIN(AREA_CHUNK, e->size - at);
++		if (negroni_ufs_adsp_area_read(e->offset + at, buf, n) != 0) {
++			return false;
++		}
++		SHA256_Update(&ctx, buf, n);
++	}
++	SHA256_Final(digest, &ctx);
++	return memcmp(digest, e->sha256, 32) == 0;
++}
++
++/* the area header, CAMERA_ICP.mdt and its program headers (negroni_adsp.c step_firmware, mdt_loader.c) */
++static bool
++l6_firmware(vm_offset_t buf)
++{
++	step_begin("icp firmware (adsp area)");
++	vm_offset_t a = 0, m = 0;
++	if (kmem_alloc(kernel_map, &a, AREA_HEADER, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return step_fail("no memory");
++	}
++	icp_area = (struct area_header *)a;
++	if (negroni_ufs_adsp_area_read(0, icp_area, AREA_HEADER) != 0 || memcmp(icp_area->magic, AREA_MAGIC, 8) != 0 ||
++	    icp_area->version != 1 || icp_area->count == 0 || icp_area->count > AREA_MAX) {
++		return step_fail("no ADSP firmware area (scripts/fw/build-areas.sh + the userdata flash)");
++	}
++	for (uint32_t i = 0; i < icp_area->count; i++) {
++		struct area_entry *x = &icp_area->entry[i];
++		x->name[47] = 0;
++		if (x->offset < AREA_HEADER || x->offset > AREA_SIZE || x->size > AREA_SIZE - x->offset) {
++			return step_fail("area entry out of range");
++		}
++	}
++	const struct area_entry *e = icp_area_file("CAMERA_ICP.mdt");
++	if (e == NULL || e->size < 52 || e->size > PAGE_SIZE || !icp_area_check(e, (uint8_t *)buf)) {
++		return step_fail("CAMERA_ICP.mdt missing (scripts/camera/extract-icp-fw.sh), too big, or SHA-256 mismatch");
++	}
++	if (kmem_alloc(kernel_map, &m, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    negroni_ufs_adsp_area_read(e->offset, (void *)m, e->size) != 0) {
++		return step_fail("mdt read");
++	}
++	icp_mdt = (uint8_t *)m;
++	icp_mdt_size = e->size;
++	uint32_t phoff, phnum, bytes = 0;
++	memcpy(&phoff, icp_mdt + 28, 4);
++	phnum = (uint32_t)(icp_mdt[44] | icp_mdt[45] << 8);
++	if (memcmp(icp_mdt, "\177ELF\1\1", 6) != 0 || phnum == 0 || phnum > ICP_MAX_SEGS || phoff + 32 * phnum > icp_mdt_size) {
++		return step_fail("CAMERA_ICP.mdt is not an ELF32 LE header");
++	}
++	icp_nseg = phnum;
++	icp_min_pa = ~0u;
++	icp_max_pa = 0;
++	for (uint32_t i = 0; i < icp_nseg; i++) {
++		uint32_t ph[8];
++		memcpy(ph, icp_mdt + phoff + 32 * i, sizeof(ph));
++		icp_segs[i] = (struct icp_seg){ ph[0], ph[1], ph[3], ph[4], ph[5], ph[6] };
++		struct icp_seg *s = &icp_segs[i];
++		if (s->type != 1 || s->memsz == 0 || MDT_TYPE(s->flags) == MDT_TYPE_HASH) {
++			continue;
++		}
++		icp_reloc |= (s->flags & MDT_RELOCATABLE) != 0;
++		icp_min_pa = MIN(icp_min_pa, s->paddr);
++		icp_max_pa = MAX(icp_max_pa, s->paddr + s->memsz);
++		if (s->filesz == 0) {
++			continue;
++		}
++		char name[24];
++		snprintf(name, sizeof(name), "CAMERA_ICP.b%02u", i);
++		const struct area_entry *f = icp_area_file(name);
++		if (f == NULL || f->size != s->filesz || s->filesz > s->memsz || !icp_area_check(f, (uint8_t *)buf)) {
++			say("  %s missing, not %u bytes, or SHA-256 mismatch", name, s->filesz);
++			return step_fail("segment file");
++		}
++		bytes += f->size;
++	}
++	icp_max_pa = (icp_max_pa + 0xfffu) & ~0xfffu;
++	say("  CAMERA_ICP.mdt: %u program headers, load %#x..%#x (%u KiB), %u KiB of segments, %s", icp_nseg, icp_min_pa,
++	    icp_max_pa, (icp_max_pa - icp_min_pa) >> 10, bytes >> 10, icp_reloc ? "relocatable" : "fixed");
++	if (icp_min_pa == ~0u || icp_max_pa - icp_min_pa > CAMERA_REGION_SIZE || (!icp_reloc &&
++	    (icp_min_pa < CAMERA_REGION_PA || icp_max_pa > CAMERA_REGION_PA + CAMERA_REGION_SIZE))) {
++		return step_fail("the image does not fit camera_region");
++	}
++	return step_ok();
++}
++
++/* PAS init image + mem setup, segments into camera_region, auth and reset (lx7_core.c:528-663) */
++static bool
++l6_pas(vm_offset_t buf)
++{
++	step_begin("icp pas 33");
++	uint64_t answer = ~0ull;
++	uint32_t ehdr = icp_segs[0].filesz, hash = ~0u;
++	for (uint32_t i = 0; i < icp_nseg; i++) {
++		if (MDT_TYPE(icp_segs[i].flags) == MDT_TYPE_HASH) {
++			hash = i;
++			break;
++		}
++	}
++	if (icp_segs[0].type == 1 || hash == ~0u || ehdr == 0 || (uint64_t)ehdr + icp_segs[hash].filesz > PAGE_SIZE ||
++	    ehdr + icp_segs[hash].filesz != icp_mdt_size) {
++		return step_fail("no ELF-header + hash layout in CAMERA_ICP.mdt");
++	}
++	vm_offset_t meta = 0;
++	if (kmem_alloc(kernel_map, &meta, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return step_fail("no memory");
++	}
++	memcpy((void *)meta, icp_mdt, icp_mdt_size);           /* headers + hash, packed (qcom_mdt_read_metadata) */
++	clean_dcache(meta, PAGE_SIZE, FALSE);
++	if (icp_scm("PAS init image (camera)", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_CAMERA,
++	    kvtophys(meta), 0, &answer) != 0 || answer != 0) {
++		return step_fail("TrustZone refuses the CAMERA_ICP metadata");
++	}
++	say("  TrustZone accepts the CAMERA_ICP signature (PAS 33)");
++	pas_started = true;                     /* from here the power down sends PAS shutdown */
++	if (icp_reloc) {
++		answer = ~0ull;
++		if (icp_scm("PAS mem setup (camera)", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_CAMERA,
++		    CAMERA_REGION_PA, icp_max_pa - icp_min_pa, &answer) != 0 || answer != 0) {
++			return step_fail("TrustZone refuses camera_region");
++		}
++	}
++	volatile uint8_t *mem = (volatile uint8_t *)ml_io_map_unmappable(CAMERA_REGION_PA, CAMERA_REGION_SIZE, 0x6u);
++	if (mem == NULL) {
++		return step_fail("map camera_region");
++	}
++	for (uint32_t i = 0; i < CAMERA_REGION_SIZE; i++) {
++		mem[i] = 0;
++	}
++	bool ok = true;
++	for (uint32_t i = 0; i < icp_nseg && ok; i++) {
++		struct icp_seg *s = &icp_segs[i];
++		if (s->type != 1 || s->memsz == 0 || MDT_TYPE(s->flags) == MDT_TYPE_HASH || s->filesz == 0) {
++			continue;
++		}
++		char name[24];
++		snprintf(name, sizeof(name), "CAMERA_ICP.b%02u", i);
++		const struct area_entry *f = icp_area_file(name);
++		uint32_t base = (icp_reloc ? 0 : (uint32_t)(icp_min_pa - CAMERA_REGION_PA)) + (s->paddr - icp_min_pa);
++		for (uint32_t at = 0; f && at < f->size && ok; at += AREA_CHUNK) {
++			uint32_t n = MIN(AREA_CHUNK, f->size - at);
++			if (negroni_ufs_adsp_area_read(f->offset + at, (void *)buf, n) != 0) {
++				ok = false;
++				break;
++			}
++			for (uint32_t t = 0; t < n; t++) {
++				mem[base + at + t] = ((const uint8_t *)buf)[t];
++			}
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ml_io_unmap((vm_offset_t)mem, CAMERA_REGION_SIZE);
++	if (!ok) {
++		return step_fail("segment read");
++	}
++	say("  segments written into camera_region %#lx", CAMERA_REGION_PA);
++	answer = ~0ull;
++	if (icp_scm("PAS auth and reset (camera)", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_CAMERA, 0, 0,
++	    &answer) != 0 || answer != 0) {
++		return step_fail("PAS auth and reset (33) failed");
++	}
++	say("ICP: qcom_scm_pas_auth_and_reset(33) returned 0: TrustZone started the ICP");
++	return step_ok();
++}
++
++/* queue header word w of queue q, in the uncached view of the HFI block */
++#define QW(q, w)        (*(volatile uint32_t *)(hfi_uc + HFI_OFF_QTBL + 24u + 4u * (HFI_Q_WORDS * (q) + (w))))
++
++/*
++ * cam_hfi_init (hfi.c) with event mode 0 (INTR_MODE, cam_icp_mgr_hfi_init), then HFI_CMD_SYS_INIT
++ * (CAM_ICP_SEND_INIT, lx7_core.c:858-861) and a poll of the message queue for SYS_INIT_DONE.
++ * Addresses are physical: the ICP stream group must be in bypass (level 3) [I: the firmware may expect
++ * IOVAs inside the DT windows (live.dts:22646-22669); then the init response or the queue read fails].
++ */
++static bool
++l6_hfi(void)
++{
++	step_begin("icp hfi init");
++	if (kmem_alloc_contig(kernel_map, &hfi_kva, HFI_BLOCK, 0, (ppnum_t)(atop(0x100000000ull) - 1), 0, KMA_KOBJECT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		hfi_kva = 0;
++		return step_fail("no HFI memory below 4 GiB");
++	}
++	hfi_pa = kvtophys(hfi_kva);
++	bzero((void *)hfi_kva, HFI_BLOCK);
++	flush_dcache64((addr64_t)hfi_pa, HFI_BLOCK, TRUE);
++	/* from here only the non-cacheable view is used (no cached lines of the block are touched again) */
++	hfi_uc = ml_io_map_unmappable((vm_offset_t)hfi_pa, HFI_BLOCK, 0x6u);
++	icp_csr = icp_csr ? icp_csr : ml_io_map_unmappable(ICP_CSR_PA, 0x1000, CAM_WIMG_IO);
++	if (!hfi_uc || !icp_csr) {
++		return step_fail("map");
++	}
++	volatile uint32_t *qt = (volatile uint32_t *)(hfi_uc + HFI_OFF_QTBL);
++	qt[0] = 0xffffffffu;                            /* qtbl_version */
++	qt[1] = 24u + 4u * 4u * HFI_Q_WORDS;            /* sizeof(struct hfi_qtbl) */
++	qt[2] = 24u;                                    /* qhdr0 offset */
++	qt[3] = 4u * HFI_Q_WORDS;                       /* sizeof(struct hfi_q_hdr) */
++	qt[4] = 3;
++	qt[5] = 3;
++	static const uint32_t qoff[3] = { HFI_OFF_CMDQ, HFI_OFF_MSGQ, HFI_OFF_DBGQ };
++	static const uint32_t qsize[3] = { 4096u >> 2, 4096u >> 2, 102400u >> 2 };
++	for (uint32_t q = 0; q < 3; q++) {
++		QW(q, QH_STATUS) = 1;                   /* QHDR_ACTIVE */
++		QW(q, QH_START) = (uint32_t)hfi_pa + qoff[q];
++		QW(q, QH_QSIZE) = qsize[q];
++		QW(q, QH_PKTSIZE) = 0;
++		QW(q, QH_DROP) = 0;
++		QW(q, QH_READ_IDX) = 0;
++		QW(q, QH_WRITE_IDX) = 0;
++		QW(q, QH_TYPE) = q;                     /* INTR_MODE: Q_CMD / Q_MSG / Q_DBG */
++		QW(q, QH_RX_WM) = 1;
++		QW(q, QH_TX_WM) = q == 2 ? 1024u : 1u;  /* dbg: SET_WM */
++		QW(q, QH_RX_REQ) = q == 2 ? 0u : 1u;
++		QW(q, QH_TX_REQ) = 0;
++		QW(q, QH_RX_IRQ) = 0;
++		QW(q, QH_TX_IRQ) = 0;
++	}
++	*(volatile uint32_t *)(hfi_uc + HFI_OFF_SFR) = 4096;    /* sfr_buf.size */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	vm_offset_t gp = icp_csr;
++	wr(gp + ICP_GP(HFI_QTBL_PTR), (uint32_t)hfi_pa + HFI_OFF_QTBL);
++	wr(gp + ICP_GP(HFI_SFR_PTR), (uint32_t)hfi_pa + HFI_OFF_SFR);
++	wr(gp + ICP_GP(HFI_SHMEM_PTR), (uint32_t)hfi_pa + HFI_OFF_SHMEM);
++	wr(gp + ICP_GP(HFI_SHMEM_SIZE), HFI_SHMEM_LEN);
++	wr(gp + ICP_GP(HFI_SECHEAP_PTR), (uint32_t)hfi_pa + HFI_OFF_SECHEAP);
++	wr(gp + ICP_GP(HFI_SECHEAP_SIZE), HFI_SECHEAP_LEN);
++	wr(gp + ICP_GP(HFI_QDSS_IOVA), 0);
++	wr(gp + ICP_GP(HFI_QDSS_SIZE), 0);
++	wr(gp + ICP_GP(HFI_IO_IOVA), 0x80000000u);      /* [I] DRAM below 4 GiB as the IO window (bypass) */
++	wr(gp + ICP_GP(HFI_IO_SIZE), 0x7ff00000u);
++	wr(gp + ICP_GP(HFI_IO2_IOVA), 0);
++	wr(gp + ICP_GP(HFI_IO2_SIZE), 0);
++	wr(gp + ICP_GP(HFI_FWUNC_IOVA), (uint32_t)hfi_pa + HFI_OFF_FWUNC);
++	wr(gp + ICP_GP(HFI_FWUNC_SIZE), HFI_FWUNC_LEN);
++	wr(gp + ICP_GP(HFI_INIT_REQ), 1);               /* ICP_INIT_REQUEST_SET */
++	uint32_t got = 0;
++	/* HFI_POLL_TIMEOUT_US 1.5 s (hfi.c:37-38) */
++	bool ok = poll(gp + ICP_GP(HFI_INIT_RESP), 0xffffffffu, 1, 1500000, &got);
++	say("  HFI block phys %#llx; INIT_RESPONSE %#x (1 = success, 2 = failed), FW_VERSION %#x, CIRQ ob status %#x, "
++	    "pfault %#x", hfi_pa, got, rd(gp + ICP_GP(HFI_FW_VERSION)), rd(icp_csr + ICP_CIRQ_OFF + CIRQ_OB_STATUS),
++	    rd(icp_csr + ICP_CIRQ_OFF + CIRQ_PFAULT));
++	if (!ok) {
++		const char *sfr = (const char *)(hfi_uc + HFI_OFF_SFR + 4);
++		char text[96];
++		for (uint32_t i = 0; i < sizeof(text) - 1; i++) {
++			char c = sfr[i];
++			text[i] = (c >= 32 && c < 127) ? c : (c == 0 ? 0 : '.');
++			if (c == 0) {
++				break;
++			}
++		}
++		text[sizeof(text) - 1] = 0;
++		say("  ICP SFR (crash reason): \"%s\"", text);
++		return step_fail("no HFI init response");
++	}
++	say("ICP READY: HFI init response SUCCESS, firmware version %#x", rd(gp + ICP_GP(HFI_FW_VERSION)));
++	/* irq enable (cam_lx7_irq_enable): WDT bite 0 + ICP2HOST; the GIC line stays off, the queue is polled */
++	wr(icp_csr + ICP_CIRQ_OFF + CIRQ_OB_MASK, (1u << 4) | (1u << 2));
++	/* HFI_CMD_SYS_INIT: {size 8, pkt_type} into the command queue (hfi_write_cmd), then HOST2ICPINT */
++	volatile uint32_t *cmdq = (volatile uint32_t *)(hfi_uc + HFI_OFF_CMDQ);
++	uint32_t w = QW(0, QH_WRITE_IDX);
++	cmdq[w] = 8;
++	cmdq[w + 1] = HFI_CMD_SYS_INIT;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	QW(0, QH_WRITE_IDX) = w + 2;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr(icp_csr + ICP_CIRQ_OFF + CIRQ_HOST2ICP, 1);
++	/* wait for a message: cam_icp_mgr_send_fw_init waits 5 s */
++	uint32_t msg_w = 0;
++	for (uint32_t ms = 0; ms < 5000; ms++) {
++		msg_w = QW(1, QH_WRITE_IDX);
++		if (msg_w != QW(1, QH_READ_IDX)) {
++			break;
++		}
++		delay(1000);
++	}
++	volatile uint32_t *msgq = (volatile uint32_t *)(hfi_uc + HFI_OFF_MSGQ);
++	uint32_t r = QW(1, QH_READ_IDX);
++	if (msg_w == r) {
++		say("  no message from the ICP in 5 s (cmd queue read idx %u, write idx %u)", QW(0, QH_READ_IDX), QW(0, QH_WRITE_IDX));
++		return step_fail("no SYS_INIT_DONE");
++	}
++	uint32_t size = msgq[r % 1024u], type = msgq[(r + 1) % 1024u], err = msgq[(r + 2) % 1024u];
++	say("ICP message: size %u, type %#x (%s), err %#x, num_prop %u", size, type,
++	    type == HFI_MSG_SYS_INIT_DONE ? "HFI_MSG_SYS_INIT_DONE" : "other", err, msgq[(r + 3) % 1024u]);
++	QW(1, QH_READ_IDX) = msg_w;
++	if (type != HFI_MSG_SYS_INIT_DONE || err != 0) {
++		return step_fail("unexpected first message");
++	}
++	return step_ok();
++}
++
++static bool
++l6_icp(void)
++{
++	vm_offset_t buf = 0;
++	bool ok = false;
++	step_begin("icp clocks");
++	if (!rcg_to_xo("cam_cc_icp_clk_src", 0x13108)) {
++		return step_fail("RCG update");
++	}
++	icp_branches_on |= 1u;
++	if (!branch_set("cam_cc_icp_ahb_clk", camcc + 0x13128, true, true)) {
++		return step_fail("icp ahb clock");
++	}
++	icp_branches_on |= 2u;
++	if (!branch_set("cam_cc_icp_clk", camcc + 0x13120, true, true)) {
++		return step_fail("icp clock");
++	}
++	(void)step_ok();
++	if (!dma_ok[1] && smmu_policy != 0) {
++		step_begin("icp dma path");
++		return step_fail("ICP stream group has no bypass (level 3)");
++	}
++	if (kmem_alloc(kernel_map, &buf, AREA_CHUNK, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	ok = l6_firmware(buf) && l6_pas(buf) && l6_hfi();
++	kmem_free(kernel_map, buf, AREA_CHUNK);
++	return ok;
++}
++
+ /* CSIPHY 3-phase status after the sensor streams (status_regs_2_1_0: 24 words at 0x340 per trio) */
+ static void
+ csiphy_status(const char *when)
+@@ -2217,6 +2717,12 @@ cam_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 			say("level 5 OK: raw frame(s) in memory (%s%s)", (src_mask & 1u) ? "TPG " : "", (src_mask & 2u) ? "sensor" : "");
+ 		}
+ 	}
++	if (ok && level >= 6) {
++		ok = l6_icp();
++		if (ok) {
++			say("level 6 OK: ICP up (PAS 33 + HFI SYS_INIT_DONE)");
++		}
++	}
+ 	if (ok && level == 4 && (src_mask & 2u)) {
+ 		ok = l4_stream();
+ 		csiphy_status("streaming");

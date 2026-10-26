@@ -1,0 +1,577 @@
+Camera level 3 (negronicam=3, default off) + votes. Before the first camcc access (every level,
+negronicam_votes=1 default): RPMh mmcx.lvl NOM and the BCM votes of the camera NoC paths (CN0, MM1, MM0, SH0,
+MC0; negroni_rpmh.c: negroni_rpmh_cam_bcm, BCM cmd-db lookup, mmcx/mxc ARC whitelist). Level 3: CPAS top +
+CAMNOC (titan version, IFE_RDI_WR QoS from cpastop_v680_110.h, error logger, qchannel idle at power down) and
+the apps-SMMU state of the camera stream groups (IFE 0x800/0x460, ICP 0x2000/0x5e0); negronicam_smmu=0|1|2.
+Details: patches/xnu/README-camera.md.
+
+diff --git a/bsd/dev/negroni_cam.c b/bsd/dev/negroni_cam.c
+index 4209f07..d5cebd7 100644
+--- a/bsd/dev/negroni_cam.c
++++ b/bsd/dev/negroni_cam.c
+@@ -1,5 +1,5 @@
+ /*
+- * NEGRONI (OnePlus 10 Pro 5G, SM8450 "waipio"): camera bring-up, levels 1 and 2 (patches 0310, 0311).
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450 "waipio"): camera bring-up, levels 1-3 (patches 0310-0312).
+  *
+  * Boot-arg negronicam (default 0 = no camera register access at all):
+  *   1  level 1 (0310): GCC camera clocks, camcc titan top GDSC, camcc AHB/CAMNOC/CCI0 clocks from the
+@@ -7,7 +7,16 @@
+  *   2  level 2 (0311): level 1 + the rear main sensor (slot 0, Sony IMX789) power-up sequence, CCI0
+  *      master 0 pins, chip-ID read (7-bit 0x1a, register 0x0016, 2 bytes, expected 0x0789), then the
+  *      vendor power-down sequence and level 1 off. Nothing stays powered.
++ *   3  level 3 (0312): level 2 + CPAS top / CAMNOC (titan version, IFE_RDI_WR QoS from cpastop_v680_110.h,
++ *      error logger) + the apps-SMMU check of the camera streams (IFE, ICP): bypass, translate or fault.
+  *   negronicam_pause=N  ms between steps (default 0, max 2000), for a camera on the screen log.
++ *   negronicam_votes=0|1  (0312, default 1, every level) before the first camcc access: RPMh mmcx.lvl NOM
++ *      (the titan GDSC parent pm8350c_s2_mmcx_voter_level) and the BCM votes of the camera NoC paths:
++ *      CN0 (cam_ahb: apps -> qhs_camera_cfg), MM1 + MM0 + SH0 + MC0 (cam_hf_0: qnm_camnoc_hf -> qns_mem_noc_hf ->
++ *      qns_llcc -> ebi). The votes stay after the run (a lower vote from this DRV could replace a boot vote).
++ *   negronicam_smmu=0|1|2  0 report only, 1 (default) stop before DMA when a camera stream would fault or
++ *      translate through a context this kernel did not set up, 2 add a bypass SMR/S2CR pair for the stream
++ *      group (as negroniwlan_smmu=2, patch 0263) and remove it again at power down.
+  * Every step logs "NEGRONI CAM: step N NAME" and "... ok (T us)" or "... failed: reason". A failure
+  * powers down, in the vendor order, everything this file turned on; every wait is bounded.
+  * Runs in its own kernel thread: boot does not wait for it.
+@@ -22,6 +31,8 @@
+  *   cci-dn    OnePlus camera-kernel drivers/cam_sensor_module/cam_cci/ (out/src/op-modules):
+  *             cam_cci_hwreg.h, cam_cci_dev.h, cam_cci_soc.c, cam_cci_core.c
+  *   cci-up    Linux drivers/i2c/busses/i2c-qcom-cci.c (out/src/linux, torvalds 5b0764a)
++ *   cpas      OnePlus camera-kernel drivers/cam_cpas/cpas_top/cam_cpastop_hw.c, cpastop_v680_110.h
++ *   smmu      live.dts:15350-15370 apps-smmu@15000000, 22583-22672 msm_cam_smmu_ife / _icp
+  *   module    /odm/lib64/camera/com.qti.sensormodule.waipio.semco_imx789_MP.bin, decoded by
+  *             scripts/camera/cammodule.py into out/camera/modules.txt:43-50
+  *
+@@ -31,10 +42,12 @@
+  * Linux 19.2 MHz standard-mode (100 kHz) timing (cci-up:255-265), the table that Linux also selects
+  * for "qcom,sm8450-cci" (cci-up:871) when the CCI clock is 19.2 MHz. MCLK 19.2 MHz is the DT rate
+  * (live.dts:22206 clock-rates 0x124f800).
+- * No MMCX/MXA ARC vote [I]: the UEFI display keeps MMCX up, and a lower vote from this DRV would
+- * replace that vote and could stop the display. When the titan GDSC does not power on, the run stops.
+- * No interconnect (cam_ahb) vote [I]: the config NoC is up for the display and UFS. The CCI is polled;
+- * its GIC line (SPI 0x1cc, live.dts:22061) stays disabled.
++ * Votes (0312, negronicam_votes=1, the default): before the first camcc access this file votes RPMh
++ * mmcx.lvl NOM and the BCMs of the camera NoC paths (l0_votes). 0310/0311 had no votes and relied on the
++ * UEFI display keeping MMCX and the config NoC up [I]; a camcc/CCI access without the NoC path up hangs the
++ * bus without an error. A vote from this DRV replaces this DRV's earlier vote for the same resource, so
++ * the levels chosen are at or above what the display needs [I], and they are not dropped after the run.
++ * The CCI is polled; its GIC line (SPI 0x1cc, live.dts:22061) stays disabled.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -48,6 +61,7 @@
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern kern_return_t thread_terminate(thread_t);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+ extern int negroni_rpmh_cam_rail(const char *res, unsigned mv, int mode, bool on);
+ void negroni_cam_init(void);
+ 
+@@ -130,7 +144,7 @@ void negroni_cam_init(void);
+ #define CCI_RD_THRESHOLD_VALUE  0x30u
+ #define CCI_TIMEOUT_US  100000u
+ #define CCI_MASTER      0u              /* slot 0 cci-master 0 (live.dts:22210) */
+-#define CAM_MAX_LEVEL   2u         /* cci-up CCI_TIMEOUT 100 ms (cci-dn uses 1500 ms) */
++#define CAM_MAX_LEVEL   3u         /* cci-up CCI_TIMEOUT 100 ms (cci-dn uses 1500 ms) */
+ /* cam_cci_dev.h:242-253 enum cci_i2c_cmd_type */
+ #define CCI_CMD_SET_PARAM       1u
+ #define CCI_CMD_LOCK            6u
+@@ -217,6 +231,98 @@ static vm_offset_t tlmm;
+ static bool pins_sensor, pins_cci, reset_high, mclk_on;
+ static uint32_t rails_on;               /* bit per rails[] entry */
+ 
++/*
++ * Level 3: CPAS top + CAMNOC (live.dts:22701-22729 qcom,cam-cpas@ac13000: reg <0xac13000 0x1000 0xac19000
++ * 0x9000 0xbbf0000 0x1f00>, reg-names cam_cpas_top cam_camnoc cam_rpmh). Registers: cpas = cam_cpastop_hw.c
++ * cam_cpastop_get_hw_info (0x0 camera version, 0x4 cpas version, 0x8 capability) and cpastop_v680_110.h
++ * (v680_100.h has the same values).
++ */
++#define CPAS_TOP_PA     0x0ac13000UL
++#define CAMNOC_PA       0x0ac19000UL
++#define CAMNOC_SIZE     0x9000UL
++#define CAM_VERSION_680 0x00060800u     /* cam_cpas_api.h:74 CAM_CPAS_CAMERA_VERSION_680 */
++#define QCHANNEL_CTRL   0x5cu           /* cpastop_v680_110.h:1292-1293 qchannel_ctrl / qchannel_status */
++#define QCHANNEL_STATUS 0x60u
++#define SBM_FAULTINEN0  0x2240u         /* cpastop_v680_110.h:16-27 sbm_enable 0x2 | 0x4 | 0x8 | 0x10 | 0x20 */
++#define SBM_FAULTINSTAT 0x2248u
++#define SBM_FLAGOUTCLR0 0x2280u         /* sbm_clear value 0x1 */
++#define ERRLOG_MAINCTL  0x2008u         /* cpastop_v680_110.h:1256-1267 err logger */
++#define ERRLOG_ERRVLD   0x2010u
++#define ERRLOG_LOG0_LO  0x2020u
++#define ERRLOG_LOG0_HI  0x2024u
++/* IFE_RDI_WR port (cpastop_v680_110.h:299-375): the CAMNOC port of the IFE RDI write masters */
++static const struct { uint32_t off, value; const char *name; } camnoc_rdi_wr[] = {
++	{ 0x5230, 0x66665433, "IFE_RDI_WR_PRIORITYLUT_LOW" },
++	{ 0x5234, 0x66666666, "IFE_RDI_WR_PRIORITYLUT_HIGH" },
++	{ 0x5238, 0x00001e30, "IFE_RDI_WR_URGENCY_LOW" },
++	{ 0x5240, 0xffffff00, "IFE_RDI_WR_DANGERLUT_LOW" },
++	{ 0x5248, 0x0000000f, "IFE_RDI_WR_SAFELUT_LOW" },
++};
++#define CAMNOC_RDI_MAXWR 0x5220u        /* IFE_RDI_WR_MAXWR_LOW, read only (cpastop_v680_110.h:368-373) */
++
++/*
++ * apps SMMU (live.dts:15350-15361: qcom,qsmmu-v500 at 0x15000000, qcom,skip-init, 0x78 SMRs, 0x4e contexts).
++ * Camera stream groups (live.dts:22589 msm_cam_smmu_ife iommus, 22629 msm_cam_smmu_icp iommus):
++ *   IFE: SIDs 0x800 0x820 0xc00 0xc20 0x840 0x860 0xc40 0xc60, each with mask 0x460 -> one SMR 0x800/0x460
++ *   ICP: 0x2000..0x2520 with masks 0x420/0x400 -> one SMR 0x2000/0x5e0 covers all of them (it also covers
++ *        0x20a0/0x20c0/0x20e0 = cpas-cdm/jpeg camera streams, live.dts:22610, 22678)
++ * Global register space 0 (arm-smmu.h): sCR0 0x0 (CLIENTPD bit 0, USFCFG bit 10, EXIDENABLE bit 3), IDR0
++ * 0x20 (NUMSMRG bits 7:0), SMR(n) 0x800 + 4n (VALID bit 31, MASK 30:16, ID 14:0), S2CR(n) 0xc00 + 4n
++ * (TYPE bits 17:16: 0 translate, 1 bypass, 2 fault; CBNDX 7:0). Same layout as negroni_wlan.c wlan_dma_path.
++ */
++#define APPS_SMMU_PA    0x15000000UL
++#define SMMU_SCR0       0x000u
++#define SMMU_IDR0       0x020u
++#define SMMU_SGFSR      0x048u
++#define SMMU_SMR(n)     (0x800u + 4u * (n))
++#define SMMU_S2CR(n)    (0xc00u + 4u * (n))
++#define SMR_VALID       (1u << 31)
++struct cam_stream_group {
++	const char *name;
++	uint32_t sid, mask;             /* the one SMR that covers the group */
++	uint32_t nsids;
++	uint32_t sids[14];
++};
++static const struct cam_stream_group cam_groups[] = {
++	{ "IFE", 0x800, 0x460, 8, { 0x800, 0x820, 0xc00, 0xc20, 0x840, 0x860, 0xc40, 0xc60 } },
++	{ "ICP", 0x2000, 0x5e0, 14, { 0x2020, 0x2000, 0x2420, 0x2400, 0x2040, 0x2060, 0x2440, 0x2460, 0x2100,
++	    0x2500, 0x2080, 0x2480, 0x2120, 0x2520 } },
++};
++#define NCAMGROUPS         (sizeof(cam_groups) / sizeof(cam_groups[0]))
++static uint32_t smmu_policy = 1;
++static bool dma_ok[NCAMGROUPS];            /* true: the stream group reaches RAM untranslated (bypass) */
++static uint32_t smr_added[NCAMGROUPS];     /* SMR index + 1 that this file wrote, 0 = none */
++static vm_offset_t cpas, camnoc;
++static bool cpas_on;
++
++/*
++ * Votes before the first camcc access (0312). DT: qcom,cam-cpas (live.dts:22712-22713) interconnects
++ * <0x9f 0x02 0xa0 0x204> "cam_ahb" = gem_noc (interconnect@19100000) apps master -> config_noc
++ * (interconnect@1500000) camera cfg slave; camera-bus-nodes level3-rt0 (live.dts:22740-22748)
++ * <0x329 0x10 0x43 0x200> "cam_hf_0" = mmss_noc (interconnect@1740000) camnoc_hf -> mc_virt ebi; nrt0
++ * "cam_sf_0" the same path through camnoc_sf. BCMs of these nodes (Linux drivers/interconnect/qcom/sm8450.c,
++ * out/src/linux): qhs_camera_cfg in CN0 (:1289-1297, enable_mask 1); qnm_camnoc_hf/_sf in MM1 (:1345-1350,
++ * enable_mask 1); qns_mem_noc_hf in MM0 (:1338-1343, buswidth 32, 2 channels :1176-1177); qns_llcc in SH0
++ * (:1381-1386, buswidth 16, 4 channels :1110-1111); ebi in MC0 (:1331-1336, buswidth 4, 4 channels :1170-1171).
++ * Bandwidth: peak = the DT camnoc-axi-min-ib-bw 3e9 B/s = 3,000,000 kBps (live.dts:22724), average 1,000,000
++ * kBps [I: enough for one 4000x3008 RAW10 frame at 30 fps = 450 MB/s].
++ * MMCX: the titan GDSC parent-supply is pm8350c_s2_mmcx_voter_level (live.dts:1015-1024 -> 10766-10773,
++ * mmcx.lvl, min 0x30). NOM (256) [I: at or above any level the UEFI display needs, so the replaced vote of
++ * this DRV does not go down].
++ */
++struct cam_bcm { const char *name; uint32_t buswidth, channels; bool enable_mask; };
++static const struct cam_bcm cam_bcms[] = {
++	{ "CN0", 4, 1, true }, { "MM1", 32, 2, true }, { "MM0", 32, 2, false }, { "SH0", 16, 4, false },
++	{ "MC0", 4, 4, false },
++};
++#define CAM_BW_AVG_KBPS  1000000u
++#define CAM_BW_PEAK_KBPS 3000000u
++#define MMCX_LEVEL       256u
++extern int negroni_rpmh_cam_bcm(const char *res, uint32_t avg_kbps, uint32_t peak_kbps, uint32_t buswidth,
++    uint32_t channels, bool enable_mask, uint32_t *data_out);
++extern int negroni_rpmh_arc_vote(const char *res, unsigned level);
++static uint32_t votes_policy = 1;
++
+ static const struct {
+ 	const char *name;
+ 	uint32_t off;
+@@ -567,6 +673,27 @@ cam_down(void)
+ 	if (rails_on) {
+ 		say("WARNING: rails still voted on: mask %#x", rails_on);
+ 	}
++	for (unsigned g = 0; g < NCAMGROUPS; g++) {
++		if (smr_added[g]) {
++			vm_offset_t smmu = ml_io_map_unmappable(APPS_SMMU_PA, 0x4000, CAM_WIMG_IO);
++			if (smmu) {
++				wr(smmu + SMMU_SMR(smr_added[g] - 1), 0);       /* SMR invalid first, then S2CR */
++				wr(smmu + SMMU_S2CR(smr_added[g] - 1), 2u << 16);
++				say("  %s: our bypass SMR%u removed", cam_groups[g].name, smr_added[g] - 1);
++				ml_io_unmap(smmu, 0x4000);
++			}
++			smr_added[g] = 0;
++		}
++	}
++	if (cpas_on) {
++		/* cam_cpastop_qchannel_handshake(power_on = false): clear the request, wait QACCEPTN and QDENY = 0,
++		 * 50 x 200-250 us (cam_cpas_hw_intf.h:20-24) */
++		uint32_t got = 0;
++		wr(cpas + QCHANNEL_CTRL, 0);
++		bool ok = poll(cpas + QCHANNEL_STATUS, 0x3u, 0, 12500, &got);
++		say("  CAMNOC qchannel idle: status %#x%s", got, ok ? "" : " (not idle after 12.5 ms)");
++		cpas_on = false;
++	}
+ 	if (cci_irq_on) {
+ 		wr(cci + CCI_IRQ_MASK_0, 0);
+ 		wr(cci + CCI_IRQ_MASK_1, 0);
+@@ -597,6 +724,57 @@ cam_down(void)
+ 	say("power down done");
+ }
+ 
++/* ---- 0312: RPMh votes before the first camcc access ---- */
++
++static int
++vote_retry(int (*fn)(void *), void *arg)
++{
++	int error = EBUSY;
++	/* the RPMh try-lock is shared with other drivers: retry EBUSY for 1 s */
++	for (unsigned i = 0; i < 200 && error == EBUSY; i++) {
++		error = fn(arg);
++		if (error == EBUSY) {
++			delay(5000);
++		}
++	}
++	return error;
++}
++
++static int
++vote_mmcx(void *arg __unused)
++{
++	return negroni_rpmh_arc_vote("mmcx.lvl", MMCX_LEVEL);
++}
++
++static int
++vote_bcm(void *arg)
++{
++	const struct cam_bcm *b = arg;
++	uint32_t data = 0;
++	return negroni_rpmh_cam_bcm(b->name, CAM_BW_AVG_KBPS, CAM_BW_PEAK_KBPS, b->buswidth, b->channels, b->enable_mask,
++	           &data);
++}
++
++static bool
++l0_votes(void)
++{
++	step_begin("rpmh mmcx + camera noc votes");
++	int error = vote_retry(vote_mmcx, NULL);
++	say("  mmcx.lvl level %u: errno %d", MMCX_LEVEL, error);
++	if (error) {
++		return step_fail("MMCX vote");
++	}
++	for (unsigned i = 0; i < sizeof(cam_bcms) / sizeof(cam_bcms[0]); i++) {
++		error = vote_retry(vote_bcm, (void *)(uintptr_t)&cam_bcms[i]);
++		say("  BCM %s (%s): errno %d", cam_bcms[i].name, cam_bcms[i].enable_mask ? "on" : "avg 1 GB/s, peak 3 GB/s", error);
++		if (error) {
++			return step_fail("BCM vote");
++		}
++	}
++	say("  votes stay after the run (not dropped)");
++	return step_ok();
++}
++
+ /* ---- level 1 steps ---- */
+ 
+ static bool
+@@ -817,10 +995,145 @@ l2_chip_id(void)
+ 	return step_ok();
+ }
+ 
++/* ---- level 3: CPAS top + CAMNOC (0312) ---- */
++
++static bool
++l3_cpas(void)
++{
++	step_begin("cpas + camnoc");
++	cpas = ml_io_map_unmappable(CPAS_TOP_PA, 0x1000, CAM_WIMG_IO);
++	camnoc = ml_io_map_unmappable(CAMNOC_PA, CAMNOC_SIZE, CAM_WIMG_IO);
++	if (!cpas || !camnoc) {
++		return step_fail("map");
++	}
++	uint32_t camv = rd(cpas + 0x0), cpasv = rd(cpas + 0x4), cap = rd(cpas + 0x8);
++	/* cam_cpastop_get_hw_info: camera major 23:16, minor 15:8, incr 7:0; cpas major 31:28, minor 27:16, incr 15:0 */
++	say("  titan camera version %#x (%u.%u.%u), cpas version %#x (%u.%u.%u), capability %#x", camv,
++	    (camv >> 16) & 0xffu, (camv >> 8) & 0xffu, camv & 0xffu, cpasv, cpasv >> 28, (cpasv >> 16) & 0xfffu,
++	    cpasv & 0xffffu, cap);
++	if (camv == 0 || camv == 0xffffffffu) {
++		return step_fail("CPAS top does not answer");
++	}
++	if (camv != CAM_VERSION_680) {
++		say("  note: camera version is not 6.8.0 (cam_cpas_api.h:74); the v680 CAMNOC table may not fit");
++	}
++	cpas_on = true;
++	/* cam_cpastop_poweron: reset_irq (SBM clear, then SBM enable), then the QoS values of each port */
++	wr(camnoc + SBM_FLAGOUTCLR0, 0x1);
++	wr(camnoc + SBM_FAULTINEN0, 0x2 | 0x4 | 0x8 | 0x10 | 0x20);
++	for (unsigned i = 0; i < sizeof(camnoc_rdi_wr) / sizeof(camnoc_rdi_wr[0]); i++) {
++		uint32_t old = rd(camnoc + camnoc_rdi_wr[i].off);
++		wr(camnoc + camnoc_rdi_wr[i].off, camnoc_rdi_wr[i].value);
++		say("  %s %#x: %#x -> %#x", camnoc_rdi_wr[i].name, camnoc_rdi_wr[i].off, old, rd(camnoc + camnoc_rdi_wr[i].off));
++	}
++	say("  IFE_RDI_WR_MAXWR_LOW %#x, SBM fault status %#x, error logger mainctl %#x errvld %#x log0 %#x:%#x",
++	    rd(camnoc + CAMNOC_RDI_MAXWR), rd(camnoc + SBM_FAULTINSTAT), rd(camnoc + ERRLOG_MAINCTL),
++	    rd(camnoc + ERRLOG_ERRVLD), rd(camnoc + ERRLOG_LOG0_HI), rd(camnoc + ERRLOG_LOG0_LO));
++	return step_ok();
++}
++
++/* CAMNOC error logger after a DMA: errvld bit 0 = a logged error (cam_cpastop_handle_errlogger) */
++static void
++camnoc_report(const char *when)
++{
++	if (!cpas_on) {
++		return;
++	}
++	say("  CAMNOC %s: SBM fault status %#x, errvld %#x, errlog0 %#x:%#x", when, rd(camnoc + SBM_FAULTINSTAT),
++	    rd(camnoc + ERRLOG_ERRVLD), rd(camnoc + ERRLOG_LOG0_HI), rd(camnoc + ERRLOG_LOG0_LO));
++}
++
++/*
++ * The apps-SMMU state of each camera stream group: read only unless negronicam_smmu=2 (as the Wi-Fi
++ * wlan_dma_path, patch 0263). dma_ok[g] = the streams reach RAM by physical address.
++ */
++static bool
++l3_smmu(void)
++{
++	step_begin("apps smmu camera streams");
++	vm_offset_t smmu = ml_io_map_unmappable(APPS_SMMU_PA, 0x4000, CAM_WIMG_IO);
++	if (!smmu) {
++		return step_fail("map");
++	}
++	uint32_t scr0 = rd(smmu + SMMU_SCR0), idr0 = rd(smmu + SMMU_IDR0), nsmr = MIN(idr0 & 0xffu, 128u);
++	bool stop = false;
++	say("  sCR0 %#x (CLIENTPD %u, USFCFG %u, EXIDS %u), IDR0 %#x (%u SMRs), sGFSR %#x, policy negronicam_smmu=%u",
++	    scr0, scr0 & 1u, (scr0 >> 10) & 1u, (scr0 >> 3) & 1u, idr0, nsmr, rd(smmu + SMMU_SGFSR), smmu_policy);
++	if (scr0 == 0xffffffffu || nsmr == 0 || (scr0 & (1u << 3))) {
++		ml_io_unmap(smmu, 0x4000);
++		say("  global space does not answer or EXIDS is set: DMA path unknown");
++		return smmu_policy == 0 ? step_ok() : step_fail("SMMU state unknown");
++	}
++	for (unsigned g = 0; g < NCAMGROUPS; g++) {
++		const struct cam_stream_group *cg = &cam_groups[g];
++		unsigned bypass = 0, fault = 0, translate = 0, unmatched = 0;
++		uint32_t free_smr = ~0u;
++		for (uint32_t k = 0; k < cg->nsids; k++) {
++			uint32_t hit = ~0u;
++			for (uint32_t i = 0; i < nsmr; i++) {
++				uint32_t smr = rd(smmu + SMMU_SMR(i));
++				if (!(smr & SMR_VALID)) {
++					if (free_smr == ~0u) {
++						free_smr = i;
++					}
++					continue;
++				}
++				uint32_t id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
++				if (((id ^ cg->sids[k]) & ~mask & 0x7fffu) == 0) {
++					hit = i;
++					break;
++				}
++			}
++			if (hit == ~0u) {
++				unmatched++;
++				continue;
++			}
++			uint32_t s2cr = rd(smmu + SMMU_S2CR(hit)), type = (s2cr >> 16) & 3u;
++			say("  %s SID %#x: SMR%u %#x S2CR %#x (%s, context %u)", cg->name, cg->sids[k], hit,
++			    rd(smmu + SMMU_SMR(hit)), s2cr, type == 0 ? "translate" : type == 1 ? "bypass" : "fault", s2cr & 0xffu);
++			bypass += type == 1;
++			translate += type == 0;
++			fault += type >= 2;
++		}
++		/* unmatched streams follow sCR0: CLIENTPD = whole SMMU bypassed, else USFCFG 0 bypass / 1 fault */
++		bool unmatched_bypass = (scr0 & 1u) || !(scr0 & (1u << 10));
++		if (unmatched_bypass) {
++			bypass += unmatched;
++		} else {
++			fault += unmatched;
++		}
++		say("  %s group (SMR %#x mask %#x): %u bypass, %u translate, %u fault (%u SIDs without SMR, unmatched -> %s)",
++		    cg->name, cg->sid, cg->mask, bypass, translate, fault, unmatched, unmatched_bypass ? "bypass" : "fault");
++		dma_ok[g] = bypass == cg->nsids;
++		if (!dma_ok[g] && smmu_policy == 2 && translate == 0 && unmatched == cg->nsids && free_smr != ~0u) {
++			/* arm-smmu.c order: S2CR first, then the SMR valid bit */
++			wr(smmu + SMMU_S2CR(free_smr), 1u << 16);
++			wr(smmu + SMMU_SMR(free_smr), SMR_VALID | cg->mask << 16 | cg->sid);
++			uint32_t smr = rd(smmu + SMMU_SMR(free_smr)), s2 = rd(smmu + SMMU_S2CR(free_smr));
++			say("  %s: SMR%u = %#x, S2CR%u = %#x (bypass added, negronicam_smmu=2)", cg->name, free_smr, smr, free_smr, s2);
++			smr_added[g] = free_smr + 1;
++			dma_ok[g] = smr == (SMR_VALID | cg->mask << 16 | cg->sid) && ((s2 >> 16) & 3u) == 1u;
++			if (!dma_ok[g]) {
++				say("  %s: the SMMU (or the hypervisor) did not take the bypass entry", cg->name);
++			}
++		}
++		say("  %s DMA by physical address: %s", cg->name, dma_ok[g] ? "YES" : "NO");
++		if (!dma_ok[g] && smmu_policy == 1 && level >= (g == 0 ? 5u : 6u)) {     /* IFE DMA at level 5, ICP at 6 */
++			stop = true;
++		}
++	}
++	ml_io_unmap(smmu, 0x4000);
++	if (stop) {
++		return step_fail("a camera stream group would fault or translate (negronicam_smmu=2 adds a bypass entry, "
++		           "=0 tries anyway)");
++	}
++	return step_ok();
++}
++
+ static void
+ cam_thread(void *arg __unused, wait_result_t wr_ __unused)
+ {
+-	bool ok = l1_map() && l1_gcc() && l1_gdsc() && l1_clocks() && l1_cci();
++	bool ok = (votes_policy == 0 || l0_votes()) && l1_map() && l1_gcc() && l1_gdsc() && l1_clocks() && l1_cci();
+ 	if (ok) {
+ 		say("level 1 OK: camcc + CCI0 up");
+ 	}
+@@ -830,6 +1143,13 @@ cam_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 			say("level 2 OK: IMX789 answered on CCI0 M0");
+ 		}
+ 	}
++	if (ok && level >= 3) {
++		ok = l3_cpas() && l3_smmu();
++		if (ok) {
++			say("level 3 OK: CPAS/CAMNOC up, IFE DMA %s, ICP DMA %s", dma_ok[0] ? "bypass" : "NOT bypass",
++			    dma_ok[1] ? "bypass" : "NOT bypass");
++		}
++	}
+ 	if (gcc && camcc && cci) {
+ 		cam_down();
+ 	}
+@@ -847,9 +1167,12 @@ negroni_cam_init(void)
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("negronicam_pause", &pause_ms, sizeof(pause_ms));
++	(void)PE_parse_boot_argn("negronicam_smmu", &smmu_policy, sizeof(smmu_policy));
++	(void)PE_parse_boot_argn("negronicam_votes", &votes_policy, sizeof(votes_policy));
+ 	pause_ms = MIN(pause_ms, 2000u);
+ 	level = MIN(level, CAM_MAX_LEVEL);
+-	say("level %u (UNTESTED: camcc + CCI0%s)", level, level >= 2 ? " + IMX789 power + chip id" : "");
++	say("level %u (UNTESTED: camcc + CCI0%s%s)", level, level >= 2 ? " + IMX789 power + chip id" : "",
++	    level >= 3 ? " + CPAS/CAMNOC + SMMU check" : "");
+ 	if (kernel_thread_start(cam_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+diff --git a/bsd/dev/negroni_rpmh.c b/bsd/dev/negroni_rpmh.c
+index 160882f..f28d4a1 100644
+--- a/bsd/dev/negroni_rpmh.c
++++ b/bsd/dev/negroni_rpmh.c
+@@ -51,6 +51,8 @@ int negroni_rpmh_arc_vote(const char *res, unsigned level);
+ #define RH_ARC          3u
+ #define RH_MODE_ARC     (-2)    /* rh_send: one ARC command, data = level index (hlvl) */
+ #define RH_MODE_OFF     (-3)    /* rh_send: one VRM command, enable (+4) = 0 (0311 camera power-down) */
++#define RH_BCM          5u      /* cmd-db slave type BCM (Linux cmd-db.c CMD_DB_HW_BCM) */
++#define RH_MODE_BCM     (-4)    /* rh_send: one BCM command, data = the BCM_TCS_CMD word (0312 camera NoC votes) */
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_db;
+@@ -283,6 +285,8 @@ rh_send(uint32_t address, unsigned mv, int mode)
+ 	unsigned ncmd = 3;
+ 	if (mode == RH_MODE_ARC) {
+ 		ncmd = 1;               /* ARC (rpmhpd): +0 = level index */
++	} else if (mode == RH_MODE_BCM) {
++		ncmd = 1;               /* BCM: +0 = commit | valid | vote_x | vote_y (tcs.h BCM_TCS_CMD) */
+ 	} else if (mode == RH_MODE_OFF) {
+ 		offsets[0] = 4;         /* VRM enable = 0: drops only this DRV's enable vote */
+ 		values[0] = 0;
+@@ -504,11 +508,14 @@ rh_lookup_arc(const char *res, unsigned level, uint32_t *address, unsigned *hlvl
+ /*
+  * Level vote on an LPASS rail for the audio DSP start (negroni_adsp.c; Linux
+  * qcom_q6v5_pas proxy votes on the lcx/lmx power domains). level 0 drops the vote.
++ * 0312 (iOSPlus10, negroni_cam.c): also mmcx.lvl up to NOM (256) for the camcc titan GDSC (its parent
++ * pm8350c_s2_mmcx_voter_level, live DT) and mxc.lvl up to NOM (256) for the camcc PLL calibration.
+  */
+ int
+ negroni_rpmh_arc_vote(const char *res, unsigned level)
+ {
+-	if (!res || (strcmp(res, "lcx.lvl") && strcmp(res, "lmx.lvl")) || level > 416) {
++	if (!res || (strcmp(res, "lcx.lvl") && strcmp(res, "lmx.lvl") && strcmp(res, "mmcx.lvl") && strcmp(res, "mxc.lvl")) ||
++	    level > 416 || (strcmp(res, "mmcx.lvl") == 0 && level > 256) || (strcmp(res, "mxc.lvl") == 0 && level > 256)) {
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+@@ -537,6 +544,100 @@ out:
+ 	return error;
+ }
+ 
++/*
++ * 0312 (iOSPlus10): bus (BCM) votes of the camera paths, as Linux icc-rpmh/bcm-voter.c computes them for
++ * one node per BCM: vote_x = avg * width / (buswidth * channels) * 1000 / unit, vote_y = peak * width /
++ * buswidth * 1000 / unit (kBps; width and unit from the cmd-db aux data {u32 unit, u16 width, u8 vcd}),
++ * clamped to 14 bits; a BCM with an enable_mask (CN0, MM1) gets x = 0, y = 1 (:99-101). One AMC command, commit set.
++ * Only the five BCMs of the camera paths, at most 3,000,000 kBps (the DT camnoc-axi-min-ib-bw 3e9 B/s).
++ */
++int negroni_rpmh_cam_bcm(const char *res, uint32_t avg_kbps, uint32_t peak_kbps, uint32_t buswidth, uint32_t channels,
++    bool enable_mask, uint32_t *data_out);
++
++static int
++rh_lookup_bcm(const char *res, uint32_t *address, uint32_t *unit, uint32_t *width)
++{
++	uint32_t key[2] = {0, 0};
++	for (unsigned i = 0; i < 8 && res[i]; ++i) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; ++i) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = rh_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++		unsigned count = rh_db16(h + 6);
++		if (slave != RH_BCM || (entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++			continue;
++		}
++		for (unsigned j = 0; j < count; ++j) {
++			uint32_t e = entries + RH_DB_ENTRY * j;
++			if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = rh_read(rh_db, e + 16), data = aux + rh_db16(e + 22), len = rh_db16(e + 20);
++			if ((addr >> 16) != RH_BCM || (addr & 3u) || len < 8 || !rh_range(data, len)) {
++				printf("NEGRONI RPMH: invalid BCM entry for %s\n", res);
++				return EINVAL;
++			}
++			*address = addr;
++			*unit = rh_db16(data) | (uint32_t)rh_db16(data + 2) << 16;
++			*width = rh_db16(data + 4);
++			printf("NEGRONI RPMH: BCM %s addr=%#x unit=%u width=%u\n", res, addr, *unit, *width);
++			return (*unit == 0 || *width == 0) ? EINVAL : 0;
++		}
++	}
++	printf("NEGRONI RPMH: no BCM %s in cmd-db\n", res);
++	return ENODEV;
++}
++
++int
++negroni_rpmh_cam_bcm(const char *res, uint32_t avg_kbps, uint32_t peak_kbps, uint32_t buswidth, uint32_t channels,
++    bool enable_mask, uint32_t *data_out)
++{
++	if (!res || (strcmp(res, "CN0") && strcmp(res, "MM1") && strcmp(res, "MM0") && strcmp(res, "SH0") &&
++	    strcmp(res, "MC0")) || avg_kbps > 3000000u || peak_kbps > 3000000u || buswidth == 0 || channels == 0) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0, unit = 0, width = 0;
++	if (rh_poisoned) {
++		printf("NEGRONI RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_bcm(res, &address, &unit, &width);
++	}
++	if (!error) {
++		uint64_t x = 0, y = 1;
++		if (!enable_mask) {
++			x = (uint64_t)avg_kbps * width / ((uint64_t)buswidth * channels) * 1000u / unit;
++			y = (uint64_t)peak_kbps * width / buswidth * 1000u / unit;
++		}
++		x = MIN(x, 0x3fffull);
++		y = MIN(y, 0x3fffull);
++		uint32_t data = 1u << 30 | 1u << 29 | (uint32_t)x << 14 | (uint32_t)y;
++		printf("NEGRONI RPMH: BCM %s avg %u peak %u kBps -> x %llu y %llu, data %#x\n", res, avg_kbps, peak_kbps, x, y, data);
++		if (data_out) {
++			*data_out = data;
++		}
++		error = rh_send(address, data, RH_MODE_BCM);
++	}
++out:
++	if (error) {
++		printf("NEGRONI RPMH: BCM vote failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ /* Read-only cmd-db lookup of a VRM resource address (Wi-Fi survey, negroni_wifi.c). */
+ int negroni_rpmh_lookup(const char *res, uint32_t *address);
+ 

@@ -7,9 +7,20 @@ Marks: **[V]** seen in a source (file:line given), **[I]** inference. Nothing he
 |---|---|---|---|
 | 0310 `negroni-cam-camcc-cci` | `negronicam=1` | new `bsd/dev/negroni_cam.c` (own kernel thread): GCC camera clocks, camcc titan top GDSC, camcc AHB/CAMNOC/CCI0 clocks from the 19.2 MHz TCXO, CCI0 version + reset; then everything off | `NEGRONI CAM: level 1 OK: camcc + CCI0 up` |
 | 0311 `negroni-cam-imx789-chip-id` | `negronicam=2` | level 1 + rear main IMX789 (slot 0) power-up, CCI0 M0 chip-ID read, vendor power-down; `negroni_rpmh_cam_rail` in `negroni_rpmh.c` (whitelist + enable=0 off command) | `NEGRONI CAM: chip id 0x0789 (expected 0x0789, ...): MATCH` |
+| 0312 `negroni-cam-cpas-smmu-votes` | every level (`negronicam_votes=1`), `negronicam=3` | votes before the first camcc access: RPMh `mmcx.lvl` NOM + BCM CN0/MM1/MM0/SH0/MC0 (`negroni_rpmh_cam_bcm`); level 3: CPAS top + CAMNOC (version, IFE_RDI_WR QoS, error logger), apps-SMMU state of the IFE and ICP stream groups (`negronicam_smmu`) | `level 3 OK: CPAS/CAMNOC up, IFE DMA bypass, ICP DMA bypass` |
+| 0313 `negroni-cam-clocks-csiphy` | `negronicam=4` | `mxc.lvl` NOM (256), camcc PLL0 1200 MHz + PLL3 864 MHz, CPHY_RX/CSI1PHYTIMER/CSID 400 MHz, IFE0 432 MHz, IFE0 GDSC; CSIPHY1 C-PHY 3 trios (v2.1.0 tables) | `trio N status ... normal`, `level 4 OK: capture clocks + CSIPHY1 C-PHY configured` |
+| 0314 `negroni-cam-imx789-stream` | `negronicam=4` | IMX789 FTM table (116 writes, stream on), frame counter 0x0005, stream off on every path | `IMX789 frame counter 0x.. -> 0x.. -> 0x..: MOVES (sensor streams)` |
+| 0315 `negroni-cam-csid-ife-rdi` | `negronicam=5` | CSID0 + IFE0 RDI0 frame-based WM -> contiguous buffer < 4 GiB; TPG13 frame, then sensor frame; `/dev/negronicam-tpg`, `/dev/negronicam-sensor` | `FRAME DONE`, `TPG frame sanity: PASS`, `SENSOR frame sanity: PASS`, `level 5 OK` |
+| 0316 `negroni-cam-icp-pas-hfi` | `negronicam=6` | CAMERA_ICP from the ADSP area into camera_region, PAS 33, HFI init + SYS_INIT | `ICP READY: HFI init response SUCCESS`, `ICP message: ... HFI_MSG_SYS_INIT_DONE` |
 
 Default (`negronicam` absent or 0): no camera register access, no thread. `negronicam_pause=N` waits N ms
 (max 2000) after each step, for a phone camera on the screen log.
+
+More boot-args (0312-0316): `negronicam_votes=0|1` (default 1: RPMh MMCX + camera BCM votes before the first camcc
+access), `negronicam_smmu=0|1|2` (0 report only, 1 default: stop before DMA when a needed stream group would fault or
+translate, 2 add a bypass SMR/S2CR pair and remove it at power down), `negronicam_src=1|2|3` (1 TPG only: no sensor
+power, all capture clocks at TCXO; 2 sensor only; 3 default: TPG frame, then sensor frame), `negronicam_drate=0`
+(C-PHY data-rate entry; only 0 is carried), `negronicam_settle=N` (default 52).
 
 ## Build (macOS; done 2026-10-26)
 
@@ -106,3 +117,106 @@ How to read a failure [I]:
 - Bus hang on the first camcc/CCI access (no NoC vote) hangs one CPU or the phone; the run is opt-in and in its own
   thread. Use `negronipanic=30` so a panic reboots.
 - The camera is never left on: the power-down runs after success and after every failure.
+
+## Levels 3-6 (patches 0312-0316, 2026-10-26, build only)
+
+All [V] facts have file:line in the `negroni_cam.c` comments. Nothing ran on the phone.
+
+### Steps (continued from the table above)
+
+| Step | Name | Registers | Bounded wait | Failure reasons |
+|---|---|---|---|---|
+| 0 (first, all levels) | rpmh mmcx + camera noc votes | RPMh ARC `mmcx.lvl` 256; BCM CN0, MM1 (enable bit), MM0, SH0, MC0 (avg 1, peak 3 GB/s; x/y from the cmd-db unit/width as Linux bcm-voter.c) | 1 s EBUSY retry, 100 ms per vote | `MMCX vote` / `BCM vote` (missing cmd-db entry, RPMh timeout) |
+| 12 | cpas + camnoc | CPAS top 0xac13000 +0/+4/+8 versions; CAMNOC 0xac19000: SBM 0x2240/0x2280, IFE_RDI_WR 0x5230-0x5248; at power down QCHANNEL 0x5c/0x60 | 12.5 ms (qchannel) | `CPAS top does not answer` |
+| 13 | apps smmu camera streams | 0x15000000 sCR0, IDR0, SMR/S2CR; with `negronicam_smmu=2` one SMR + S2CR bypass per group | - | `a camera stream group would fault or translate` (IFE at level >= 5, ICP at level 6) |
+| 14 | capture clocks | `mxc.lvl` 256; PLL0 (camcc +0x0) / PLL3 (+0x3000) Lucid EVO configure + RUN + LOCK_DET; RCGs 0x1104c, 0x15104, 0x13174, 0x11018; IFE0 GDSC 0x11004; 7 branches | 200 us lock, 500 us RCG/branch/GDSC | `PLL did not lock`, `IFE0 GDSC did not power on`, `branch clock did not start` |
+| 15 | csiphy1 c-phy 3 trios | 0xace6000: reset 0x1000/0x1014, common 0x1018/0x101c/0x1084, data-rate regs, 37 regs x 3 trios, irq 0x102c-0x1054, release 0x1000 = 0x0e | 3048 us after release | `only data-rate entry 0` |
+| 16 (level 4) | imx789 ftm table + stream on | 116 CCI writes, then 3 reads of 0x0005 | 100 ms per CCI transaction | `CCI write`, `the sensor does not stream` |
+| 16-17 (level 5) | csid0 + ife0 map; tpg13 -> ... -> memory; imx789 -> ... -> memory | CSID 0xacb7000 (reset 0x0c/0x10, RX 0x200/0x204, RDI0 0x500-0x54c, RUP/AUP 0x18), CSID top 0xacb6000 +0 = 0x101, IFE0 WM RDI0 0xac62000 + 0x2600, TPG13 0xacf6000 | CSID reset 100 ms; frame 1 s (TPG) / 2 s (sensor) | `NO FRAME`, `frame sanity: FAIL` |
+| 18-21 (level 6) | icp clocks, icp firmware, icp pas 33, icp hfi init | camcc 0x13108/0x13128/0x13120; area via `negroni_ufs_adsp_area_read`; SCM PAS calls; LX7 CSR 0xac01000 + 0x20 + 4n | HFI init 1.5 s, SYS_INIT 5 s | `TrustZone refuses ...`, `no HFI init response`, `no SYS_INIT_DONE` |
+
+### Expected good level-5 log (abridged; values marked `..` depend on the hardware)
+
+```
+NEGRONI CAM: level 5 (UNTESTED: camcc + CCI0 + IMX789 power + chip id + CPAS/CAMNOC + SMMU check)
+NEGRONI CAM: step 1 rpmh mmcx + camera noc votes ... ok
+NEGRONI CAM: level 2 OK: IMX789 answered on CCI0 M0
+NEGRONI CAM:   titan camera version 0x60800 (6.8.0), cpas version 0x1..
+NEGRONI CAM:   IFE DMA by physical address: YES        (or NO: then negronicam_smmu=2, see below)
+NEGRONI CAM: level 3 OK: CPAS/CAMNOC up, IFE DMA bypass, ICP DMA ..
+NEGRONI CAM:   cam_cc_pll0 locked: mode 0x8...0007
+NEGRONI CAM:   trio 0 status 0x.. (low 5 bits 0x0: normal)
+NEGRONI CAM: level 4 OK: capture clocks + CSIPHY1 C-PHY configured
+NEGRONI CAM:   FRAME DONE: BUF_DONE status 0x4000 after N ms ...
+NEGRONI CAM: TPG frame first bytes: .. (colour bars)
+NEGRONI CAM: TPG frame sanity: PASS (non-constant data in most of the buffer)
+NEGRONI CAM: IMX789 frame counter 0x.. -> 0x.. -> 0x..: MOVES (sensor streams)
+NEGRONI CAM:   FRAME DONE: ...
+NEGRONI CAM: SENSOR frame sanity: PASS ...
+NEGRONI CAM: frames readable as /dev/negronicam-tpg and /dev/negronicam-sensor (scripts/camera/pull-frame.sh)
+NEGRONI CAM: level 5 OK: raw frame(s) in memory (TPG sensor)
+NEGRONI CAM: power down ... power down done
+```
+
+### How to read a failure [I]
+
+- `IFE DMA by physical address: NO` then `STOPPED at step 13`: the IFE streams have no bypass. Boot again with
+  `negronicam_smmu=2` (adds one SMR 0x800/0x460 with S2CR bypass; removed at power down). If the readback line says
+  the SMMU did not take it, the hypervisor owns the SMMU: a context bank of our own is the next work (redwood_sound.c
+  `space_on` pattern).
+- `PLL did not lock`: MXC too low or the PLL is owned elsewhere; try `negronicam_src=1` (TPG at TCXO, no PLL).
+- TPG `NO FRAME` with `RDI0 irq` SOF/EOF bits set: the CSID got the frame but the IFE write did not finish: look at
+  the IFE bus violation/overflow words and the CAMNOC errlog line. No SOF at all: the TPG mux or the CSID clock.
+- Sensor: trio status not `normal`, or `rx packets 0`: C-PHY settle/data-rate (`negronicam_settle=`), or the
+  FTM mode does not match the trio count; `CRC errors` > 0: wrong data-rate entry.
+- Frame counter `STUCK`: the sensor did not leave standby (table error) or MCLK stopped.
+- Level 6: `TrustZone refuses the CAMERA_ICP metadata` = TZ rejects this signature/PAS id on this boot chain;
+  `no HFI init response` with the SFR text = firmware crash (the SFR line has the reason); `no SYS_INIT_DONE` = the
+  queues are not reachable (physical addresses through the ICP SMMU context).
+
+### Firmware for level 6
+
+`scripts/camera/extract-icp-fw.sh` copies CAMERA_ICP.mdt + .b00-.b20 (from `out/camera/x/vendor-firmware`, made by
+`scripts/camera/inventory.sh`) into `out/firmware/adsp`; `scripts/audio/mkadsparea.py` now adds them (empty segment
+files skipped); `scripts/fw/build-areas.sh` makes the ADSP area (44 files; test build: 19728068 of 33554432 bytes,
+checkarea OK). The area reaches the phone only with the userdata flash (`AREAS=1 scripts/ios16/root-simg.sh`).
+
+### Frames
+
+`scripts/camera/pull-frame.sh` (SSH over the USB network) reads `/dev/negronicam-tpg` / `-sensor` into
+`out/camera/frames/`, and `scripts/camera/raw-to-png.py` writes a PNG (half-size RGB with gray-world white balance,
+`--full` gray, `--bayer gray|RGGB|BGGR|GRBG|GBRG`; the IMX789 Bayer order in this mode is not known [I]).
+Header: 64 bytes `NCAMRAW1`, u32 version, width, height, stride, bytes, data type, bits, packing, source, valid.
+
+### Build
+
+`scripts/bg.sh cam3-build scripts/camera/build-kernel.sh` (full kernel under `out/kernel/.lock`; no boot image: the
+main session builds one combined image). Results: notes.md section 13 and docs/plan.md.
+
+### Boot-args (for the combined image)
+
+| Goal | Boot-args |
+|---|---|
+| first phone test (recommended) | `negronicam=5` (votes, levels 1-5: TPG frame then sensor frame; stops before DMA when the IFE streams are not in bypass) |
+| if the log says `IFE DMA by physical address: NO` | `negronicam=5 negronicam_smmu=2` |
+| TPG only (no sensor power, no camcc PLL, all at 19.2 MHz) | `negronicam=5 negronicam_src=1` |
+| sensor streaming without CSID/IFE | `negronicam=4` |
+| ICP (needs the new ADSP area on userdata) | `negronicam=6` (+ `negronicam_smmu=2` if needed) |
+| film the screen log | add `negronicam_pause=500` |
+| tuning | `negronicam_settle=N` (C-PHY settle count, default 52), `negronicam_votes=0` (no RPMh votes: 0310/0311 behaviour) |
+
+Keep `negronipanic=30 negronipanicreason=2` as in the other test images.
+
+### Risks (levels 3-6)
+
+- Votes from this DRV replace this DRV's earlier votes: MMCX 256, MXC 256 (NOM: gpu_cc_pll0 shares vdd_mxc,
+  gpucc-waipio.c:98-110) and the BCM values are chosen at or above what
+  the display needs [I]; they stay after the run. A lower UEFI need is not a problem; a higher one (unlikely) would
+  be lowered.
+- `negronicam_smmu=2` writes the apps SMMU; under Gunyah the write can fault or be ignored (the readback tells).
+- The sensor streams only while the frame wait runs; the stream off runs on every path (also on a failed write after
+  the stream-on entry).
+- C-PHY settle count and data-rate entry are inferences; a wrong value gives CRC/ECC errors, not damage.
+- ICP: TrustZone loads and starts the firmware; a failed auth leaves the ICP in reset; PAS shutdown runs at power down
+  after any PAS step.
+- Memory: the frame buffers (0.75 MiB TPG, 30 MiB sensor, both below 4 GiB) stay allocated for the device nodes.

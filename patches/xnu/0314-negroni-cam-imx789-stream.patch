@@ -1,0 +1,243 @@
+Camera level 4b: the IMX789 factory-test (FTM) register table (cam_sensor_settings.h:6017, 116 writes, ends
+with stream on), CCI writes and 1-byte reads, frame-counter proof (0x0005), stream off on every path.
+
+diff --git a/bsd/dev/negroni_cam.c b/bsd/dev/negroni_cam.c
+index c179d0f..164739d 100644
+--- a/bsd/dev/negroni_cam.c
++++ b/bsd/dev/negroni_cam.c
+@@ -1,5 +1,5 @@
+ /*
+- * NEGRONI (OnePlus 10 Pro 5G, SM8450 "waipio"): camera bring-up, levels 1-4 (patches 0310-0313).
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450 "waipio"): camera bring-up, levels 1-4 (patches 0310-0314).
+  *
+  * Boot-arg negronicam (default 0 = no camera register access at all):
+  *   1  level 1 (0310): GCC camera clocks, camcc titan top GDSC, camcc AHB/CAMNOC/CCI0 clocks from the
+@@ -12,6 +12,8 @@
+  *   4  level 4 (0313): level 3 + the capture clocks (camcc PLL0 1200 MHz and PLL3 864 MHz under an RPMh
+  *      mxc.lvl NOM vote; CPHY_RX/CSI1PHYTIMER/CSID 400 MHz, IFE0 432 MHz; IFE0 GDSC) + CSIPHY1 in C-PHY
+  *      mode, 3 trios (lane assign 0x0210), the csiphy-v2.1.0 tables of cam_csiphy_2_1_0_hwreg.h.
++ *      0314: then the IMX789 factory-test (FTM) register table, which ends with stream on (0x0100 = 1):
++ *      4000x3008 RAW10 (2x2 binned), C-PHY 3 trios, 30 fps; proof = the sensor frame counter (0x0005) moves.
+  *   negronicam_src=1|2|3  1 TPG only (no sensor power, all capture clocks at 19.2 MHz TCXO), 2 sensor only,
+  *      3 (default) both. negronicam_drate=N C-PHY data-rate table index (default 0, 0..11),
+  *      negronicam_settle=N settle count (default 52 = module file mode 1 settle, see l4_csiphy).
+@@ -43,6 +45,9 @@
+  *             configure, :3059-3105 enable/disable), camcc-waipio.c:72-81 (PLL0) :321-329 (PLL3)
+  *   cpas      OnePlus camera-kernel drivers/cam_cpas/cpas_top/cam_cpastop_hw.c, cpastop_v680_110.h
+  *   smmu      live.dts:15350-15370 apps-smmu@15000000, 22583-22672 msm_cam_smmu_ife / _icp
++ *   ftm       OnePlus camera-kernel drivers/oplus/cam_sensor_module/cam_sensor/cam_sensor_settings.h:6017-6141
++ *             (.imx789_setting, 116 writes, word address, byte data), written by cam_ftm_power_up
++ *             (oplus_cam_sensor_core.c:239-289, :441-449) with nothing else after the power-up
+  *   module    /odm/lib64/camera/com.qti.sensormodule.waipio.semco_imx789_MP.bin, decoded by
+  *             scripts/camera/cammodule.py into out/camera/modules.txt:43-50
+  *
+@@ -407,6 +412,45 @@ static const struct phy_reg cphy_drate0[] = {
+ static vm_offset_t csiphy;
+ static bool csiphy_on;
+ 
++/*
++ * IMX789 FTM table (cam_sensor_settings.h:6017-6141, used for sensor_id 0x789 at oplus_cam_sensor_core.c:441).
++ * Decoded [I, SMIA/Sony register map]: 0x0136/7 EXCK 19.2 MHz; 0x0112/3 = 0x0a0a RAW10; 0x0114 = 2 (3 lanes/trios);
++ * 0x0340/1 frame length 3134 lines, 0x0342/3 line length 37344; 0x0900/1 = 1/0x22 2x2 binning; 0x034c/d x 4000,
++ * 0x034e/f y 3008; IVT/IOP PLL 0x0301..0x030f; 0x0202/3 coarse integration 0x0c0e; 0x0204/5 analog gain 0;
++ * last entry 0x0100 = 1 (MODE_SELECT streaming).
++ */
++static const struct { uint16_t reg; uint8_t val; } imx789_ftm[] = {
++	{ 0x0136, 0x13 }, { 0x0137, 0x33 }, { 0x33f0, 0x01 }, { 0x33f1, 0x01 }, { 0x0111, 0x03 }, { 0x30e8, 0x01 },
++	{ 0x3470, 0x10 }, { 0x3471, 0xff }, { 0x5c33, 0x14 }, { 0x5c3e, 0x14 }, { 0x5c48, 0x14 }, { 0x64a8, 0x09 },
++	{ 0x64aa, 0x09 }, { 0x64c0, 0x09 }, { 0x64c1, 0x09 }, { 0x9004, 0x05 }, { 0x9200, 0x7c }, { 0x9201, 0xe0 },
++	{ 0x9202, 0x30 }, { 0x9203, 0xe2 }, { 0x9204, 0x30 }, { 0x9205, 0xe3 }, { 0x9206, 0x30 }, { 0x9207, 0xe4 },
++	{ 0x9208, 0x30 }, { 0x9209, 0xe5 }, { 0xb010, 0x03 }, { 0xb194, 0x04 }, { 0xbcaf, 0x01 }, { 0x0112, 0x0a },
++	{ 0x0113, 0x0a }, { 0x0114, 0x02 }, { 0x0342, 0x91 }, { 0x0343, 0xe0 }, { 0x0340, 0x0c }, { 0x0341, 0x3e },
++	{ 0x0344, 0x01 }, { 0x0345, 0x60 }, { 0x0346, 0x00 }, { 0x0347, 0x00 }, { 0x0348, 0x20 }, { 0x0349, 0x9f },
++	{ 0x034a, 0x17 }, { 0x034b, 0x7f }, { 0x0220, 0x62 }, { 0x0221, 0x11 }, { 0x0222, 0x01 }, { 0x0900, 0x01 },
++	{ 0x0901, 0x22 }, { 0x0902, 0x08 }, { 0x3005, 0x03 }, { 0x3108, 0x0a }, { 0x3120, 0x04 }, { 0x3121, 0x01 },
++	{ 0x3200, 0x41 }, { 0x3201, 0x41 }, { 0x32d5, 0x00 }, { 0x350c, 0x00 }, { 0x350d, 0x00 }, { 0x3845, 0x01 },
++	{ 0x0408, 0x00 }, { 0x0409, 0x00 }, { 0x040a, 0x00 }, { 0x040b, 0x00 }, { 0x040c, 0x0f }, { 0x040d, 0xa0 },
++	{ 0x040e, 0x0b }, { 0x040f, 0xc0 }, { 0x034c, 0x0f }, { 0x034d, 0xa0 }, { 0x034e, 0x0b }, { 0x034f, 0xc0 },
++	{ 0x0301, 0x05 }, { 0x0303, 0x02 }, { 0x0305, 0x03 }, { 0x0306, 0x01 }, { 0x0307, 0x57 }, { 0x030b, 0x04 },
++	{ 0x030d, 0x02 }, { 0x030e, 0x01 }, { 0x030f, 0x57 }, { 0x319c, 0x01 }, { 0x3800, 0x00 }, { 0x3801, 0x07 },
++	{ 0x3802, 0xd0 }, { 0x3803, 0x02 }, { 0x3804, 0xf0 }, { 0x86d0, 0x03 }, { 0x86d1, 0xff }, { 0xb0f5, 0x01 },
++	{ 0xb0f9, 0x01 }, { 0xb0fa, 0x02 }, { 0x0202, 0x0c }, { 0x0203, 0x0e }, { 0x0224, 0x01 }, { 0x0225, 0xf4 },
++	{ 0x313a, 0x01 }, { 0x313b, 0xf4 }, { 0x0204, 0x00 }, { 0x0205, 0x00 }, { 0x020e, 0x01 }, { 0x020f, 0x00 },
++	{ 0x0216, 0x00 }, { 0x0217, 0x00 }, { 0x0218, 0x01 }, { 0x0219, 0x00 }, { 0x313c, 0x00 }, { 0x313d, 0x00 },
++	{ 0x313e, 0x01 }, { 0x313f, 0x00 }, { 0x30bc, 0x01 }, { 0x3078, 0x00 }, { 0x3079, 0x30 }, { 0x307a, 0x00 },
++	{ 0x307b, 0x30 }, { 0x0100, 0x01 },
++};
++#define NFTM            (sizeof(imx789_ftm) / sizeof(imx789_ftm[0]))
++#define FTM_WIDTH       4000u
++#define FTM_HEIGHT      3008u
++#define SENSOR_FRAME_CNT 0x0005u        /* SMIA FRAME_COUNT (8 bit) [I for this part] */
++#define SENSOR_MODE_SEL  0x0100u        /* streamoff table: 0x0100 = 0 (cam_sensor_settings.h:633-641) */
++#define CCI_CMD_WRITE   9u              /* cam_cci_dev.h:242-253 CCI_I2C_WRITE_CMD */
++#define CCI_CMD_REPORT  8u
++#define CCI_M0_Q1_REPORT 0x100u         /* cam_cci_hwreg.h:53 */
++static bool streaming;
++
+ /*
+  * Votes before the first camcc access (0312). DT: qcom,cam-cpas (live.dts:22712-22713) interconnects
+  * <0x9f 0x02 0xa0 0x204> "cam_ahb" = gem_noc (interconnect@19100000) apps master -> config_noc
+@@ -767,6 +811,95 @@ cci_read16(uint32_t m, uint32_t sid, uint32_t reg, uint32_t *value)
+ 	return 0;
+ }
+ 
++/*
++ * One register write, as cam_cci_data_queue (cam_cci_core.c:770-1000) for one i2c_cmd with a word
++ * address and a byte value: queue 1 gets SET_PARAM, LOCK, WRITE (3 bytes: address MSB, LSB, value in one
++ * word), UNLOCK, REPORT (:330: cmd 8 | 1 << 8 | 1 << 9); then QUEUE_START and the Q1 REPORT bit.
++ */
++/* one-byte read: cci_read16 with READ 1 (cam_cci_read num_byte 1); value = byte 1 of the FIFO word */
++static int
++cci_read8(uint32_t m, uint32_t sid, uint32_t reg, uint32_t *value)
++{
++	const uint32_t q = 1;
++	uint32_t got = 0, cnt = rd(cci + CCI_MQ_CUR_CNT(m, q));
++
++	if (cnt != 0) {
++		return EBUSY;
++	}
++	cci_irq_clear(CCI_IRQ_MASK_0_ALL);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_SET_PARAM | sid << 4);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_LOCK);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_WRITE_DISABLE_P | 2u << 4 | ((reg >> 8) & 0xffu) << 8 | (reg & 0xffu) << 16);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_READ | 1u << 4);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_UNLOCK);
++	cnt = rd(cci + CCI_MQ_CUR_CNT(m, q));
++	wr(cci + CCI_MQ_EXEC_CNT(m, q), cnt);
++	wr(cci + CCI_QUEUE_START, 1u << (m * 2 + q));
++	bool done = false;
++	for (uint32_t us = 0; us <= CCI_TIMEOUT_US; us++) {
++		got = rd(cci + CCI_IRQ_STATUS_0);
++		if (got & (CCI_RD_DONE(m) | CCI_ERROR(m))) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || (got & CCI_ERROR(m))) {
++		cci_irq_clear(got);
++		cci_recover(m);
++		return !done ? ETIMEDOUT : (got & CCI_NACK(m)) ? ENXIO : EIO;
++	}
++	uint32_t words = rd(cci + CCI_M_READ_LEVEL(m)), data = 0;
++	for (uint32_t i = 0; i < words && i < 64; i++) {
++		uint32_t w = rd(cci + CCI_M_READ_DATA(m));
++		if (i == 0) {
++			data = w;
++		}
++	}
++	cci_irq_clear(got);
++	*value = (data >> 8) & 0xffu;
++	return words >= 1 ? 0 : EIO;
++}
++
++static int
++cci_write8(uint32_t m, uint32_t sid, uint32_t reg, uint32_t val)
++{
++	const uint32_t q = 1;
++	uint32_t got = 0, cnt = rd(cci + CCI_MQ_CUR_CNT(m, q));
++
++	if (cnt != 0) {
++		return EBUSY;
++	}
++	cci_irq_clear(CCI_IRQ_MASK_0_ALL);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_SET_PARAM | sid << 4);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_LOCK);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_WRITE | 3u << 4 | ((reg >> 8) & 0xffu) << 8 | (reg & 0xffu) << 16 |
++	    (val & 0xffu) << 24);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_UNLOCK);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_REPORT | 1u << 8 | 1u << 9);
++	cnt = rd(cci + CCI_MQ_CUR_CNT(m, q));
++	wr(cci + CCI_MQ_EXEC_CNT(m, q), cnt);
++	wr(cci + CCI_QUEUE_START, 1u << (m * 2 + q));
++	bool done = false;
++	for (uint32_t us = 0; us <= CCI_TIMEOUT_US; us++) {
++		got = rd(cci + CCI_IRQ_STATUS_0);
++		if (got & (CCI_M0_Q1_REPORT | CCI_ERROR(m))) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || (got & CCI_ERROR(m))) {
++		say("  CCI0 M%u write sid %#x reg %#06x = %#04x: %s, irq status %#x", m, sid, reg, val,
++		    !done ? "timeout" : (got & CCI_NACK(m)) ? "NACK" : "error", got);
++		cci_irq_clear(got);
++		cci_recover(m);
++		return !done ? ETIMEDOUT : (got & CCI_NACK(m)) ? ENXIO : EIO;
++	}
++	cci_irq_clear(got);
++	return 0;
++}
++
+ /* ---- pins ---- */
+ 
+ static void
+@@ -861,6 +994,12 @@ cam_down(void)
+ 		/* kept: a lower vote from this DRV could replace a boot vote on MXC (the same rule as MMCX) [I] */
+ 		say("  RPMh mxc.lvl vote %u stays (not dropped)", MXC_PLL_LEVEL);
+ 	}
++	if (streaming) {
++		int e = cci_write8(CCI_MASTER, SENSOR_SID, SENSOR_MODE_SEL, 0);    /* streamoff (cam_ftm_power_down :215-232) */
++		say("  IMX789 stream off: errno %d", e);
++		streaming = false;
++		delay(40000);                   /* > 1 frame at 30 fps, so the CSIPHY sees the end of frame [I] */
++	}
+ 	if (pins_cci) {
+ 		tlmm_set(PIN_CCI0_SDA, TLMM_CFG(1u, PULL_DOWN, false), -1);      /* cci0_suspend */
+ 		tlmm_set(PIN_CCI0_SCL, TLMM_CFG(1u, PULL_DOWN, false), -1);
+@@ -1490,6 +1629,40 @@ l4_csiphy(void)
+ 	return step_ok();
+ }
+ 
++/* ---- 0314: IMX789 FTM table, stream on ---- */
++
++static bool
++l4_stream(void)
++{
++	step_begin("imx789 ftm table + stream on");
++	uint32_t fc0 = 0, fc1 = 0, fc2 = 0;
++	for (unsigned i = 0; i < NFTM; i++) {
++		if (imx789_ftm[i].reg == SENSOR_MODE_SEL) {
++			streaming = true;               /* the stream off runs on every path after this write */
++		}
++		int e = cci_write8(CCI_MASTER, SENSOR_SID, imx789_ftm[i].reg, imx789_ftm[i].val);
++		if (e) {
++			say("  write %u/%u (%#06x = %#04x) failed: errno %d", i + 1, (unsigned)NFTM, imx789_ftm[i].reg,
++			    imx789_ftm[i].val, e);
++			return step_fail("CCI write");
++		}
++	}
++	say("  %u writes done (last: %#06x = %#04x, stream on)", (unsigned)NFTM, imx789_ftm[NFTM - 1].reg,
++	    imx789_ftm[NFTM - 1].val);
++	/* frame counter: 3 reads 50 ms apart (30 fps = 33 ms per frame) */
++	if (cci_read8(CCI_MASTER, SENSOR_SID, SENSOR_FRAME_CNT, &fc0) || (delay(50000), 0) ||
++	    cci_read8(CCI_MASTER, SENSOR_SID, SENSOR_FRAME_CNT, &fc1) || (delay(50000), 0) ||
++	    cci_read8(CCI_MASTER, SENSOR_SID, SENSOR_FRAME_CNT, &fc2)) {
++		return step_fail("frame counter read");
++	}
++	say("IMX789 frame counter %#04x -> %#04x -> %#04x: %s", fc0, fc1, fc2,
++	    (fc0 != fc1 && fc1 != fc2) ? "MOVES (sensor streams)" : "STUCK (no stream)");
++	if (fc0 == fc1 && fc1 == fc2) {
++		return step_fail("the sensor does not stream");
++	}
++	return step_ok();
++}
++
+ /* CSIPHY 3-phase status after the sensor streams (status_regs_2_1_0: 24 words at 0x340 per trio) */
+ static void
+ csiphy_status(const char *when)
+@@ -1533,6 +1706,13 @@ cam_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 			say("level 4 OK: capture clocks%s", (src_mask & 2u) ? " + CSIPHY1 C-PHY configured" : " (TCXO, TPG only)");
+ 		}
+ 	}
++	if (ok && level == 4 && (src_mask & 2u)) {
++		ok = l4_stream();
++		csiphy_status("streaming");
++		if (ok) {
++			say("level 4 OK: IMX789 streams into CSIPHY1");
++		}
++	}
+ 	if (gcc && camcc && cci) {
+ 		cam_down();
+ 	}

@@ -1,0 +1,489 @@
+Camera level 4a (negronicam=4): capture clocks (camcc PLL0 1200 MHz + PLL3 864 MHz under an mxc.lvl NOM
+vote, CPHY_RX/CSI1PHYTIMER/CSID 400 MHz, IFE0 432 MHz, IFE0 GDSC; TCXO for negronicam_src=1) and CSIPHY1 in
+C-PHY mode, 3 trios, from cam_csiphy_2_1_0_hwreg.h (data-rate entry 0, settle count 52).
+
+diff --git a/bsd/dev/negroni_cam.c b/bsd/dev/negroni_cam.c
+index d5cebd7..c179d0f 100644
+--- a/bsd/dev/negroni_cam.c
++++ b/bsd/dev/negroni_cam.c
+@@ -1,5 +1,5 @@
+ /*
+- * NEGRONI (OnePlus 10 Pro 5G, SM8450 "waipio"): camera bring-up, levels 1-3 (patches 0310-0312).
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450 "waipio"): camera bring-up, levels 1-4 (patches 0310-0313).
+  *
+  * Boot-arg negronicam (default 0 = no camera register access at all):
+  *   1  level 1 (0310): GCC camera clocks, camcc titan top GDSC, camcc AHB/CAMNOC/CCI0 clocks from the
+@@ -9,6 +9,12 @@
+  *      vendor power-down sequence and level 1 off. Nothing stays powered.
+  *   3  level 3 (0312): level 2 + CPAS top / CAMNOC (titan version, IFE_RDI_WR QoS from cpastop_v680_110.h,
+  *      error logger) + the apps-SMMU check of the camera streams (IFE, ICP): bypass, translate or fault.
++ *   4  level 4 (0313): level 3 + the capture clocks (camcc PLL0 1200 MHz and PLL3 864 MHz under an RPMh
++ *      mxc.lvl NOM vote; CPHY_RX/CSI1PHYTIMER/CSID 400 MHz, IFE0 432 MHz; IFE0 GDSC) + CSIPHY1 in C-PHY
++ *      mode, 3 trios (lane assign 0x0210), the csiphy-v2.1.0 tables of cam_csiphy_2_1_0_hwreg.h.
++ *   negronicam_src=1|2|3  1 TPG only (no sensor power, all capture clocks at 19.2 MHz TCXO), 2 sensor only,
++ *      3 (default) both. negronicam_drate=N C-PHY data-rate table index (default 0, 0..11),
++ *      negronicam_settle=N settle count (default 52 = module file mode 1 settle, see l4_csiphy).
+  *   negronicam_pause=N  ms between steps (default 0, max 2000), for a camera on the screen log.
+  *   negronicam_votes=0|1  (0312, default 1, every level) before the first camcc access: RPMh mmcx.lvl NOM
+  *      (the titan GDSC parent pm8350c_s2_mmcx_voter_level) and the BCM votes of the camera NoC paths:
+@@ -31,6 +37,10 @@
+  *   cci-dn    OnePlus camera-kernel drivers/cam_sensor_module/cam_cci/ (out/src/op-modules):
+  *             cam_cci_hwreg.h, cam_cci_dev.h, cam_cci_soc.c, cam_cci_core.c
+  *   cci-up    Linux drivers/i2c/busses/i2c-qcom-cci.c (out/src/linux, torvalds 5b0764a)
++ *   csiphy    OnePlus camera-kernel drivers/cam_sensor_module/cam_csiphy/cam_csiphy_core.c (START_DEV order
++ *             :2379-2429), include/cam_csiphy_2_1_0_hwreg.h (tables), cam_csiphy_dev.h:63-70 (lane bits)
++ *   pll       OnePlus kernel drivers/clk/qcom/clk-alpha-pll.c (Lucid EVO: :200-213 offsets, :2969-3057
++ *             configure, :3059-3105 enable/disable), camcc-waipio.c:72-81 (PLL0) :321-329 (PLL3)
+  *   cpas      OnePlus camera-kernel drivers/cam_cpas/cpas_top/cam_cpastop_hw.c, cpastop_v680_110.h
+  *   smmu      live.dts:15350-15370 apps-smmu@15000000, 22583-22672 msm_cam_smmu_ife / _icp
+  *   module    /odm/lib64/camera/com.qti.sensormodule.waipio.semco_imx789_MP.bin, decoded by
+@@ -144,7 +154,7 @@ void negroni_cam_init(void);
+ #define CCI_RD_THRESHOLD_VALUE  0x30u
+ #define CCI_TIMEOUT_US  100000u
+ #define CCI_MASTER      0u              /* slot 0 cci-master 0 (live.dts:22210) */
+-#define CAM_MAX_LEVEL   3u         /* cci-up CCI_TIMEOUT 100 ms (cci-dn uses 1500 ms) */
++#define CAM_MAX_LEVEL   4u         /* cci-up CCI_TIMEOUT 100 ms (cci-dn uses 1500 ms) */
+ /* cam_cci_dev.h:242-253 enum cci_i2c_cmd_type */
+ #define CCI_CMD_SET_PARAM       1u
+ #define CCI_CMD_LOCK            6u
+@@ -295,6 +305,108 @@ static uint32_t smr_added[NCAMGROUPS];     /* SMR index + 1 that this file wrote
+ static vm_offset_t cpas, camnoc;
+ static bool cpas_on;
+ 
++/*
++ * Level 4 capture clocks (camcc-waipio.c; RCG cfg = (2 * div - 1) | src << 8, clk-rcg2.c F() macro).
++ * Sources: parent_map_0 (camcc:814-820) TCXO 0, PLL0 main 1, PLL0 even 2, PLL0 odd 3; parent_map_2 (:842-845)
++ * TCXO 0, PLL3 even 6. Rates from the freq tables: cphy_rx 400 MHz = PLL0 main / 3 (:1041-1045), csi1phytimer
++ * 400 MHz = PLL0 odd / 1 (:1074-1078), csid 400 MHz = PLL0 main / 3 (:1225-1229), ife_0 432 MHz = PLL3 even / 1
++ * (:1332). DT rates: csiphy1 clock-rates 400 MHz cphy_rx / csi1phytimer (live.dts:21912), csid0 400 MHz
++ * (live.dts:23491), ife0 lowsvs 432 MHz (live.dts:23517 0x19bfcc00).
++ * The TPG-only run (negronicam_src=1) keeps every source at TCXO (source 0), as level 1 does.
++ */
++struct cam_rcg { const char *name; uint32_t off, src, hid; };
++static const struct cam_rcg path_rcgs[] = {
++	{ "cam_cc_cphy_rx_clk_src", 0x1104c, 1, 5 },          /* camcc:1049 */
++	{ "cam_cc_csi1phytimer_clk_src", 0x15104, 3, 1 },     /* camcc:1105 */
++	{ "cam_cc_csid_clk_src", 0x13174, 1, 5 },             /* camcc:1231 */
++	{ "cam_cc_ife_0_clk_src", 0x11018, 6, 1 },            /* camcc:1347 */
++};
++#define NPATH_RCGS      (sizeof(path_rcgs) / sizeof(path_rcgs[0]))
++static const struct { const char *name; uint32_t off; } path_branches[] = {
++	{ "cam_cc_csiphy1_clk", 0x15120 },                    /* camcc:2482, csiphy1 clocks (live.dts:21915) */
++	{ "cam_cc_csi1phytimer_clk", 0x1511c },               /* camcc:2338 */
++	{ "cam_cc_csid_clk", 0x1318c },                       /* camcc:2428, csid0 clocks (live.dts:23492) */
++	{ "cam_cc_csid_csiphy_rx_clk", 0x15100 },             /* camcc:2446 */
++	{ "cam_cc_ife_0_fast_ahb_clk", 0x11048 },             /* camcc:2644, ife0 clocks (live.dts:23518) */
++	{ "cam_cc_ife_0_clk", 0x11030 },                      /* camcc:2608 */
++	{ "cam_cc_cpas_ife_0_clk", 0x11038 },                 /* camcc:2176 */
++};
++#define NPATH_BRANCHES  (sizeof(path_branches) / sizeof(path_branches[0]))
++#define CC_IFE0_GDSCR   0x11004u        /* cam_cc_ife_0_gdsc, live.dts:933-942 reg 0xadf1004, timeout 500 us */
++/* Lucid EVO PLL (clk-alpha-pll.c:200-213, :19-36, :260-280) */
++#define PLL_MODE        0x00u
++#define PLL_OPMODE      0x04u
++#define PLL_L_VAL       0x10u
++#define PLL_ALPHA_VAL   0x14u
++#define PLL_USER_CTL    0x18u
++#define PLL_USER_CTL_U  0x1cu
++#define PLL_CONFIG_CTL  0x20u
++#define PLL_CONFIG_CTL_U  0x24u
++#define PLL_CONFIG_CTL_U1 0x28u
++#define PLL_OUTCTRL     (1u << 0)
++#define PLL_RESET_N     (1u << 2)
++#define PLL_LOCK_DET    (1u << 31)
++#define PLL_OUT_MASK    0x7u
++#define PLL_VOTE_RUN    (1u << 25)      /* LUCID_EVO_ENABLE_VOTE_RUN */
++struct cam_pll {
++	const char *name;
++	uint32_t off, l, cal_l, alpha, cfg, cfg_u, cfg_u1, user, user_u;
++};
++static const struct cam_pll cam_plls[] = {
++	/* camcc:72-81: 19.2 MHz x (0x3e + 0x8000 / 65536) = 1200 MHz; user_ctl 0x8400: even /2 (600), odd /3 (400) */
++	{ "cam_cc_pll0", 0x0000, 0x3e, 0x44, 0x8000, 0x20485699, 0x00182261, 0x32aa299c, 0x00008400, 0x00000805 },
++	/* camcc:321-329: 19.2 MHz x 0x2d = 864 MHz; user_ctl 0x400: even /2 = 432 MHz */
++	{ "cam_cc_pll3", 0x3000, 0x2d, 0x44, 0x0, 0x20485699, 0x00182261, 0x32aa299c, 0x00000400, 0x00000805 },
++};
++#define NPLLS           (sizeof(cam_plls) / sizeof(cam_plls[0]))
++#define MXC_PLL_LEVEL   256u            /* RPMh NOM: the Lucid EVO PLL calibrates at ~1300 MHz (needs >= SVS_L1), and
++                                         * gpu_cc_pll0 shares vdd_mxc up to NOM (gpucc-waipio.c:98-110; clk-alpha-pll.c:3155-3160) */
++extern int negroni_rpmh_arc_vote(const char *res, unsigned level);
++static uint32_t src_mask = 3, drate_idx, settle_cnt = 52;
++static bool use_plls, ife_gdsc_ours, mxc_voted;
++static uint32_t plls_on, path_rcgs_set, path_branches_on;
++
++/*
++ * CSIPHY1 (live.dts:21909-21932: reg <0xace6000 0x2000>, qcom,csiphy-v2.1.0, cell-index 1). Its rails
++ * csi-vdd-0p9 = pm8350_l5 880 mV and csi-vdd-1p2 = pm8350_l6 1200 mV (live.dts:21923-21924, 10937, 10975)
++ * also feed the UFS PHY (live.dts:10429-10430): they are on while the phone runs from UFS. This file does
++ * not vote them (a vote from this DRV would replace the boot vote for the boot disk's PHY) [I].
++ */
++#define CSIPHY1_PA      0x0ace6000UL
++#define CSIPHY_SIZE     0x2000UL
++#define CPHY_LANE_ENABLE 0x2au          /* CPHY_LANE_0 | _1 | _2 (cam_csiphy_dev.h:64-68) for laneAssign 0x0210 */
++struct phy_reg { uint16_t addr; uint8_t data; uint16_t delay_us; uint8_t type; };
++#define PT_DEFAULT      0
++#define PT_SETTLE_LO    1
++#define PT_SETTLE_HI    2
++#define PT_LANE_ENABLE  3
++/* csiphy_3ph_v2_1_0_reg lane 0 (cam_csiphy_2_1_0_hwreg.h:333-371); lanes 1 and 2 are +0x400 / +0x800 */
++static const struct phy_reg cphy_lane[] = {
++	{ 0x268, 0xf1, 100, 0 }, { 0x294, 0x08, 0, 0 }, { 0x2f4, 0x00, 0, 0 }, { 0x2f8, 0x00, 0, 0 },
++	{ 0x2fc, 0x00, 0, 0 }, { 0x2f0, 0x00, 2, 0 }, { 0x2f0, 0xef, 100, 0 }, { 0x294, 0x09, 0, 0 },
++	{ 0x204, 0x00, 0, 0 }, { 0x20c, 0x10, 0, PT_SETTLE_LO }, { 0x208, 0x00, 0, PT_SETTLE_HI }, { 0x210, 0x00, 0, 0 },
++	{ 0x2e4, 0x00, 0, 0 }, { 0x2e8, 0x7f, 0, 0 }, { 0x2ec, 0x7f, 0, 0 }, { 0x218, 0x3e, 0, 0 },
++	{ 0x21c, 0x41, 0, 0 }, { 0x220, 0x41, 0, 0 }, { 0x224, 0x7f, 0, 0 }, { 0x228, 0x00, 0, 0 },
++	{ 0x22c, 0x00, 0, 0 }, { 0x264, 0x01, 0, 0 }, { 0x244, 0xb2, 0, 0 }, { 0x310, 0x35, 0, 0 },
++	{ 0x2bc, 0xd0, 0, 0 }, { 0x270, 0x00, 0, 0 }, { 0x230, 0x94, 0, 0 }, { 0x234, 0x31, 0, 0 },
++	{ 0x238, 0x60, 0, 0 }, { 0x23c, 0xa6, 0, 0 }, { 0x258, 0x10, 0, 0 }, { 0x254, 0x00, 0, 0 },
++	{ 0x25c, 0x04, 0, 0 }, { 0x248, 0x00, 0, 0 }, { 0x24c, 0x00, 0, 0 }, { 0x240, 0x00, 0, 0 },
++	{ 0x260, 0xa8, 0, 0 },          /* lane 2's last entry has a 100 us delay (:451), added in l4_csiphy */
++};
++#define NCPHY_LANE      (sizeof(cphy_lane) / sizeof(cphy_lane[0]))
++/*
++ * data_rate_delta_table_2_1_0 (:499-1076): 12 entries; each writes 7 registers per trio at the same
++ * offsets (+0x400 per trio), values per entry below, plus 0x108c for trio 2 (DNP for trios 0/1,
++ * auxiliary settings skipped as data_rate_aux_mask is 0). Only entry 0 (<= 1.2 GSps, :504-552) is
++ * carried here; the IMX789 FTM mode needs about 0.82 GSps per trio [I, see l4_csiphy].
++ */
++static const struct phy_reg cphy_drate0[] = {
++	{ 0x274, 0x07, 0, 0 }, { 0x278, 0x70, 0, 0 }, { 0x288, 0x00, 0, 0 }, { 0x28c, 0x11, 0, 0 },
++	{ 0x26c, 0x10, 0, 0 }, { 0x290, 0x03, 0, 0 }, { 0x214, 0x10, 0, 0 },
++};
++static vm_offset_t csiphy;
++static bool csiphy_on;
++
+ /*
+  * Votes before the first camcc access (0312). DT: qcom,cam-cpas (live.dts:22712-22713) interconnects
+  * <0x9f 0x02 0xa0 0x204> "cam_ahb" = gem_noc (interconnect@19100000) apps master -> config_noc
+@@ -446,6 +558,72 @@ branch_set(const char *name, vm_offset_t reg, bool on, bool poll_halt)
+ 	return ok;
+ }
+ 
++/* RCG to source src with divider field hid (level 4 path clocks) */
++static bool
++rcg_set(const char *name, uint32_t off, uint32_t src, uint32_t hid)
++{
++	vm_offset_t cmd = camcc + off;
++	uint32_t got = 0, cfg = rd(cmd + 4);
++
++	wr(cmd + 4, (cfg & ~RCG_CFG_MASK) | (hid & 0x1fu) | (src & 7u) << 8);
++	wr(cmd, rd(cmd) | RCG_CMD_ROOT_EN);
++	wr(cmd, rd(cmd) | RCG_CMD_UPDATE);
++	bool ok = poll(cmd, RCG_CMD_UPDATE, 0, 500, &got);
++	wr(cmd, rd(cmd) & ~RCG_CMD_ROOT_EN);
++	say("  %s: cfg %#x -> %#x (src %u div field %u), cmd %#x%s", name, cfg, rd(cmd + 4), src, hid, got,
++	    ok ? "" : " (UPDATE stuck)");
++	return ok;
++}
++
++/* clk_lucid_evo_pll_configure + alpha_pll_lucid_evo_enable (clk-alpha-pll.c:2969-3105) */
++static bool
++pll_enable(const struct cam_pll *p)
++{
++	vm_offset_t b = camcc + p->off;
++	uint32_t mode = rd(b + PLL_MODE), op = rd(b + PLL_OPMODE), user = rd(b + PLL_USER_CTL), got = 0;
++
++	say("  %s: mode %#x opmode %#x user_ctl %#x l %#x", p->name, mode, op, user, rd(b + PLL_L_VAL));
++	if (user & PLL_VOTE_RUN) {
++		say("  %s is in FSM vote mode: not ours, not touched", p->name);
++		return false;
++	}
++	if ((op & 1u) && (mode & PLL_OUTCTRL)) {
++		say("  %s already runs: not ours, used as is", p->name);
++		return true;
++	}
++	wr(b + PLL_L_VAL, (p->cal_l << 16) | p->l);
++	wr(b + PLL_ALPHA_VAL, p->alpha);
++	wr(b + PLL_CONFIG_CTL, p->cfg);
++	wr(b + PLL_CONFIG_CTL_U, p->cfg_u);
++	wr(b + PLL_CONFIG_CTL_U1, p->cfg_u1);
++	wr(b + PLL_USER_CTL, p->user);
++	wr(b + PLL_USER_CTL_U, p->user_u);
++	wr(b + PLL_MODE, rd(b + PLL_MODE) & ~PLL_OUTCTRL);
++	wr(b + PLL_OPMODE, 0);                  /* STANDBY */
++	wr(b + PLL_MODE, rd(b + PLL_MODE) | PLL_RESET_N);
++	wr(b + PLL_OPMODE, 1);                  /* RUN */
++	bool ok = poll(b + PLL_MODE, PLL_LOCK_DET, PLL_LOCK_DET, 200, &got);     /* Linux: 100 x 1 us */
++	if (!ok) {
++		say("  %s: no LOCK_DET (mode %#x)", p->name, got);
++		wr(b + PLL_OPMODE, 0);
++		return false;
++	}
++	wr(b + PLL_USER_CTL, rd(b + PLL_USER_CTL) | PLL_OUT_MASK);
++	wr(b + PLL_MODE, rd(b + PLL_MODE) | PLL_OUTCTRL);
++	say("  %s locked: mode %#x user_ctl %#x", p->name, rd(b + PLL_MODE), rd(b + PLL_USER_CTL));
++	return true;
++}
++
++static void
++pll_disable(const struct cam_pll *p)
++{
++	vm_offset_t b = camcc + p->off;
++	wr(b + PLL_MODE, rd(b + PLL_MODE) & ~PLL_OUTCTRL);
++	wr(b + PLL_USER_CTL, rd(b + PLL_USER_CTL) & ~PLL_OUT_MASK);
++	wr(b + PLL_OPMODE, 0);
++	say("  %s off: mode %#x", p->name, rd(b + PLL_MODE));
++}
++
+ /* ---- CCI ---- */
+ 
+ static void
+@@ -641,6 +819,48 @@ static void
+ cam_down(void)
+ {
+ 	say("power down");
++	if (csiphy_on) {
++		/* cam_csiphy_reset (reset enter: lanes off, PHY reset) + prgm_cmn_data(reset) + cphy_irq_disable */
++		wr(csiphy + 0x1014, 0);
++		wr(csiphy + 0x1000, 1);
++		wr(csiphy + 0x1084, 0);
++		wr(csiphy + 0x1018, 0);
++		wr(csiphy + 0x101c, 0);
++		for (uint32_t r = 0x102c; r <= 0x1054; r += 4) {
++			wr(csiphy + r, 0);
++		}
++		say("  CSIPHY1 in reset");
++		csiphy_on = false;
++	}
++	for (unsigned i = NPATH_BRANCHES; i-- > 0;) {
++		if (path_branches_on & (1u << i)) {
++			(void)branch_set(path_branches[i].name, camcc + path_branches[i].off, false, true);
++		}
++	}
++	path_branches_on = 0;
++	for (unsigned i = 0; i < NPATH_RCGS; i++) {
++		if (path_rcgs_set & (1u << i)) {
++			(void)rcg_set(path_rcgs[i].name, path_rcgs[i].off, 0, 0);      /* back to TCXO before the PLLs stop */
++		}
++	}
++	path_rcgs_set = 0;
++	for (unsigned i = NPLLS; i-- > 0;) {
++		if (plls_on & (1u << i)) {
++			pll_disable(&cam_plls[i]);
++		}
++	}
++	plls_on = 0;
++	if (ife_gdsc_ours) {
++		uint32_t got = 0;
++		wr(camcc + CC_IFE0_GDSCR, rd(camcc + CC_IFE0_GDSCR) | GDSC_SW_COLLAPSE);
++		bool ok = poll(camcc + CC_IFE0_GDSCR, GDSC_PWR_ON, 0, GDSC_TIMEOUT_US, &got);
++		say("  IFE0 GDSC collapse: %#x%s", got, ok ? "" : " (still on)");
++		ife_gdsc_ours = false;
++	}
++	if (mxc_voted) {
++		/* kept: a lower vote from this DRV could replace a boot vote on MXC (the same rule as MMCX) [I] */
++		say("  RPMh mxc.lvl vote %u stays (not dropped)", MXC_PLL_LEVEL);
++	}
+ 	if (pins_cci) {
+ 		tlmm_set(PIN_CCI0_SDA, TLMM_CFG(1u, PULL_DOWN, false), -1);      /* cci0_suspend */
+ 		tlmm_set(PIN_CCI0_SCL, TLMM_CFG(1u, PULL_DOWN, false), -1);
+@@ -1130,6 +1350,162 @@ l3_smmu(void)
+ 	return step_ok();
+ }
+ 
++/* ---- level 4: capture clocks + CSIPHY1 C-PHY (0313) ---- */
++
++static bool
++l4_clocks(void)
++{
++	step_begin("capture clocks");
++	use_plls = (src_mask & 2u) != 0;
++	if (use_plls) {
++		int error = EBUSY;
++		for (unsigned i = 0; i < 200 && error == EBUSY; i++) {
++			error = negroni_rpmh_arc_vote("mxc.lvl", MXC_PLL_LEVEL);
++			if (error == EBUSY) {
++				delay(5000);
++			}
++		}
++		say("  RPMh mxc.lvl level %u: errno %d", MXC_PLL_LEVEL, error);
++		if (error) {
++			return step_fail("MXC vote for the PLL calibration");
++		}
++		mxc_voted = true;
++		for (unsigned i = 0; i < NPLLS; i++) {
++			plls_on |= 1u << i;
++			if (!pll_enable(&cam_plls[i])) {
++				return step_fail("PLL did not lock");
++			}
++		}
++	}
++	for (unsigned i = 0; i < NPATH_RCGS; i++) {
++		path_rcgs_set |= 1u << i;
++		if (!rcg_set(path_rcgs[i].name, path_rcgs[i].off, use_plls ? path_rcgs[i].src : 0, use_plls ? path_rcgs[i].hid : 0)) {
++			return step_fail("RCG update");
++		}
++	}
++	/* IFE0 GDSC (ife0-supply, live.dts:23523), as l1_gdsc */
++	uint32_t v = rd(camcc + CC_IFE0_GDSCR), got = 0;
++	say("  IFE0 GDSCR %#x", v);
++	if (v & GDSC_HW_CONTROL) {
++		return step_fail("IFE0 GDSC under HW control");
++	}
++	if (!(v & GDSC_PWR_ON)) {
++		wr(camcc + CC_IFE0_GDSCR, v & ~GDSC_SW_COLLAPSE);
++		ife_gdsc_ours = true;
++		if (!poll(camcc + CC_IFE0_GDSCR, GDSC_PWR_ON, GDSC_PWR_ON, GDSC_TIMEOUT_US, &got)) {
++			say("  IFE0 GDSCR %#x after %u us", got, GDSC_TIMEOUT_US);
++			return step_fail("IFE0 GDSC did not power on");
++		}
++	}
++	wr(camcc + CC_IFE0_GDSCR, rd(camcc + CC_IFE0_GDSCR) | GDSC_RETAIN_FF);  /* qcom,retain-regs (live.dts:940) */
++	for (unsigned i = 0; i < NPATH_BRANCHES; i++) {
++		path_branches_on |= 1u << i;
++		if (!branch_set(path_branches[i].name, camcc + path_branches[i].off, true, true)) {
++			return step_fail("branch clock did not start");
++		}
++	}
++	return step_ok();
++}
++
++static void
++phy_write(const struct phy_reg *r, uint32_t lane_off, uint32_t delay_extra)
++{
++	uint32_t v = r->data;
++	if (r->type == PT_SETTLE_LO) {
++		v = settle_cnt & 0xffu;
++	} else if (r->type == PT_SETTLE_HI) {
++		v = (settle_cnt >> 8) & 0xffu;
++	}
++	wr(csiphy + r->addr + lane_off, v);
++	if (r->delay_us + delay_extra) {
++		delay(r->delay_us + delay_extra);
++	}
++}
++
++/*
++ * cam_csiphy_core.c CAM_START_DEV (:2379-2429) for one C-PHY device: clocks (l4_clocks), cam_csiphy_reset
++ * (reset enter :356-373), prgm_cmn_data(false) (:384-441, rgltr-enable-sync = 1 in the DT), config_dev
++ * (:1110-1321: common regs with the lane enable, data-rate regs, the 37 3-phase regs of each of the 3 trios,
++ * irq config), release from reset (3-phase: 0x1000 = 0x0e, then 3048 us), trio status (:2431-2451).
++ * Settle count: config_dev computes settle_time / 200000000 from the userland value; this file takes the
++ * count from the module file (mode 1, 4000x3008, settle 52, out/camera/modules.txt) as the count itself [I:
++ * the D-PHY modules give 26-40, which as a 300-400 MHz timer count is inside the MIPI THS-SETTLE window
++ * (85 ns + 6 UI .. 145 ns + 10 UI), so the module value is a count, not ns].
++ * Data rate [I]: IMX789 FTM PLL (cam_sensor_settings.h:6017-6141) IOP 19.2 / 2 (0x030d) x 343 (0x030e/f) =
++ * 3292.8 MHz, IOP_SYCK_DIV 4 (0x030b) -> 823 MSps per trio; 823e6 x 2.28 bit = 1.88e9 < 2.736e9 = entry 0.
++ */
++static bool
++l4_csiphy(void)
++{
++	step_begin("csiphy1 c-phy 3 trios");
++	if (drate_idx != 0) {
++		return step_fail("only data-rate entry 0 (<= 1.2 GSps) is carried in this file");
++	}
++	csiphy = ml_io_map_unmappable(CSIPHY1_PA, CSIPHY_SIZE, CAM_WIMG_IO);
++	if (!csiphy) {
++		return step_fail("map");
++	}
++	csiphy_on = true;
++	say("  rails csi-vdd-0p9 pm8350_l5 / csi-vdd-1p2 pm8350_l6: shared with the UFS PHY, on, not voted");
++	/* reset enter (:51-54) */
++	wr(csiphy + 0x1014, 0);
++	wr(csiphy + 0x1000, 1);
++	/* common data (:44-49): DEFAULT_PARAMS entries */
++	wr(csiphy + 0x1084, 0x00);
++	wr(csiphy + 0x1018, 0x01);
++	wr(csiphy + 0x101c, 0x7a);
++	/* config_dev: common regs, lane enable first */
++	wr(csiphy + 0x1014, CPHY_LANE_ENABLE);
++	wr(csiphy + 0x1084, 0x00);
++	wr(csiphy + 0x1018, 0x01);
++	wr(csiphy + 0x101c, 0x7a);
++	for (uint32_t t = 0; t < 3; t++) {
++		for (unsigned i = 0; i < sizeof(cphy_drate0) / sizeof(cphy_drate0[0]); i++) {
++			phy_write(&cphy_drate0[i], 0x400u * t, 0);
++		}
++	}
++	wr(csiphy + 0x108c, 0x0c);              /* entry 0, trio 2 (:548) */
++	for (uint32_t t = 0; t < 3; t++) {
++		for (unsigned i = 0; i < NCPHY_LANE; i++) {
++			phy_write(&cphy_lane[i], 0x400u * t, (t == 2 && i == NCPHY_LANE - 1) ? 100 : 0);
++		}
++	}
++	/* cam_csiphy_cphy_irq_config: csiphy_irq_reg_2_1_0 (:62-74) */
++	static const uint8_t irqv[11] = { 0xff, 0xff, 0xfb, 0xff, 0x7f, 0xff, 0xff, 0xef, 0xff, 0xff, 0xff };
++	for (uint32_t i = 0; i < 11; i++) {
++		wr(csiphy + 0x102c + 4 * i, irqv[i]);
++	}
++	delay(100);                             /* 0x1054 entry delay 0x64 */
++	/* release from reset, 3-phase (:56-60): 0x1000 = 0x0e, delay 0xbe8 us */
++	wr(csiphy + 0x1000, 0x0e);
++	delay(3048);
++	/* trio status (status_regs_2_1_0 :18-24 cphy_lane_status 0x358/0x758/0xb58, low 5 bits; 0 or 8 = normal) */
++	for (uint32_t t = 0; t < 3; t++) {
++		uint32_t s = rd(csiphy + 0x358 + 0x400 * t);
++		say("  trio %u status %#x (low 5 bits %#x: %s)", t, s, s & 0x1fu, ((s & 0x1fu) == 0 || (s & 0x1fu) == 8) ?
++		    "normal" : "unexpected");
++	}
++	say("  lane enable %#x, settle count %u, data-rate entry %u, irq status0 %#x", rd(csiphy + 0x1014), settle_cnt,
++	    drate_idx, rd(csiphy + 0x10b0));
++	return step_ok();
++}
++
++/* CSIPHY 3-phase status after the sensor streams (status_regs_2_1_0: 24 words at 0x340 per trio) */
++static void
++csiphy_status(const char *when)
++{
++	if (!csiphy_on) {
++		return;
++	}
++	for (uint32_t t = 0; t < 3; t++) {
++		vm_offset_t b = csiphy + 0x340 + 0x400 * t;
++		say("  CSIPHY1 trio %u %s: status0-7 %#x %#x %#x %#x %#x %#x %#x %#x", t, when, rd(b), rd(b + 4), rd(b + 8),
++		    rd(b + 12), rd(b + 16), rd(b + 20), rd(b + 24), rd(b + 28));
++	}
++	say("  CSIPHY1 irq status %#x %#x %#x %#x", rd(csiphy + 0x10b0), rd(csiphy + 0x10b4), rd(csiphy + 0x10b8),
++	    rd(csiphy + 0x10bc));
++}
++
+ static void
+ cam_thread(void *arg __unused, wait_result_t wr_ __unused)
+ {
+@@ -1137,7 +1513,7 @@ cam_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 	if (ok) {
+ 		say("level 1 OK: camcc + CCI0 up");
+ 	}
+-	if (ok && level >= 2) {
++	if (ok && level >= 2 && (src_mask & 2u)) {
+ 		ok = l2_pins() && l2_rails() && l2_reset() && l2_mclk() && l2_cci_pins() && l2_chip_id();
+ 		if (ok) {
+ 			say("level 2 OK: IMX789 answered on CCI0 M0");
+@@ -1150,6 +1526,13 @@ cam_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 			    dma_ok[1] ? "bypass" : "NOT bypass");
+ 		}
+ 	}
++	if (ok && level >= 4) {
++		ok = l4_clocks() && ((src_mask & 2u) == 0 || l4_csiphy());
++		if (ok) {
++			csiphy_status("before stream");
++			say("level 4 OK: capture clocks%s", (src_mask & 2u) ? " + CSIPHY1 C-PHY configured" : " (TCXO, TPG only)");
++		}
++	}
+ 	if (gcc && camcc && cci) {
+ 		cam_down();
+ 	}
+@@ -1168,11 +1551,23 @@ negroni_cam_init(void)
+ 	}
+ 	(void)PE_parse_boot_argn("negronicam_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("negronicam_smmu", &smmu_policy, sizeof(smmu_policy));
++	(void)PE_parse_boot_argn("negronicam_src", &src_mask, sizeof(src_mask));
++	(void)PE_parse_boot_argn("negronicam_drate", &drate_idx, sizeof(drate_idx));
++	(void)PE_parse_boot_argn("negronicam_settle", &settle_cnt, sizeof(settle_cnt));
++	src_mask &= 3u;
++	if (src_mask == 0) {
++		src_mask = 3;
++	}
++	settle_cnt = MIN(settle_cnt, 0xffffu);
+ 	(void)PE_parse_boot_argn("negronicam_votes", &votes_policy, sizeof(votes_policy));
+ 	pause_ms = MIN(pause_ms, 2000u);
+ 	level = MIN(level, CAM_MAX_LEVEL);
+ 	say("level %u (UNTESTED: camcc + CCI0%s%s)", level, level >= 2 ? " + IMX789 power + chip id" : "",
+ 	    level >= 3 ? " + CPAS/CAMNOC + SMMU check" : "");
++	if (level >= 4) {
++		say("level 4+: source %s, C-PHY data-rate entry %u, settle %u", src_mask == 1 ? "TPG" : src_mask == 2 ? "sensor" :
++		    "TPG then sensor", drate_idx, settle_cnt);
++	}
+ 	if (kernel_thread_start(cam_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
