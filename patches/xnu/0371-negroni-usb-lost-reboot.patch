@@ -1,0 +1,81 @@
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index 32d96e4..1848e15 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -305,6 +305,9 @@ static struct {
+ 	uint64_t    dev_event_at;   /* time of the last device event */
+ 	bool        nosof_logged;
+ 	bool        event_rule_done; /* the "device event without SOF" reconnect ran in this episode */
++	bool        ever_configured; /* 0371: SET_CONFIGURATION(1) happened in this boot */
++	bool        lost_reboot_done; /* 0371: the reboot is scheduled */
++	uint64_t    lost_since;     /* 0371: time of the last SOF before the current SOF-less stretch (0 = SOFs come) */
+ 	uint32_t    episode_reconnects;
+ 	uint64_t    reconnects;
+ 	uint32_t    devevents[16];  /* device events per type (rate-limited log) */
+@@ -496,6 +499,7 @@ static int ud_reset_end = 1;            /* 0366: boot-arg negroniusb_resetend: E
+ static int ud_reconnect_s = 5;          /* 0366: boot-arg negroniusb_reconnect: s without SOF before a soft reconnect */
+ static int ud_more_events = 1;          /* 0366: boot-arg negroniusb_events: 0 = DEVTEN 0x7 (the old mask), 1 = + wakeup/suspend/erratic (Linux set, default), 2 = + link state change */
+ static int ud_phycfg = 1;               /* 0366: boot-arg negroniusb_phycfg: clear GUSB2PHYCFG SUSPHY/ENBLSLPM */
++static int ud_lost_reboot_s = 0;        /* 0371: boot-arg negroniusb_lost_reboot: s without host before a reboot (0 = off) */
+ static void ud_drop_data(void);
+ static void ud_end_transfer(unsigned ep);
+ static bool ud_ctl_input(const uint8_t *frame, uint32_t len);
+@@ -536,6 +540,7 @@ ud_configure(void)
+ 	}
+ 	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
+ 	ud.configured = true;
++	ud.ever_configured = true;      /* 0371 */
+ 	ud_rx_arm();
+ 	printf("NEGRONI USB: ECM endpoints configured\n");
+ }
+@@ -1998,6 +2003,7 @@ ud_link_watch(void)
+ 		}
+ 		ud.last_soffn = sof;
+ 		ud.sof_seen = now;
++		ud.lost_since = 0;              /* 0371: the host is there */
+ 		ud.nosof_logged = false;
+ 		ud.event_rule_done = false;
+ 		ud.episode_reconnects = 0;
+@@ -2005,6 +2011,31 @@ ud_link_watch(void)
+ 	}
+ 	uint64_t quiet = now - ud.sof_seen;
+ 	uint64_t quiet_ms = quiet * 1000 / ud_abs_ms(1000);
++	/*
++	 * 0371: keep the phone reachable. Tests are RAM boots (fastboot boot) and
++	 * boot_a holds a known-good image, so a normal reboot always brings USB
++	 * back. With negroniusb_lost_reboot=S: when the device was configured at
++	 * least once in this boot and then had no SOF for S s in one stretch
++	 * (soft reconnects do not end the stretch, only a SOF does), end the boot
++	 * log and reset with reason 0 through the USB "reboot" command path
++	 * (ud_ctl_poll: negroni_bootlog_end 4 + negroni_reboot_reset, 500 ms
++	 * later so the line reaches the boot log). Never in panic mode: the panic
++	 * hold loop has its own timed reset.
++	 */
++	if (ud.lost_since == 0) {
++		ud.lost_since = ud.sof_seen;
++	}
++	if (ud_lost_reboot_s > 0 && ud.ever_configured && !ud_in_panic && !ud.lost_reboot_done &&
++	    ud.ctl_action == UD_CTL_NONE && now - ud.lost_since >= ud_abs_ms((uint64_t)ud_lost_reboot_s * 1000)) {
++		ud.lost_reboot_done = true;
++		bool set = negroni_reboot_set_reason(0) == 0;
++		printf("NEGRONI USB: host lost for %d s: rebooting (negroniusb_lost_reboot); DSTS 0x%08x link %u (%s), "
++		    "%llu soft reconnects, reason 0 %s\n", ud_lost_reboot_s, dsts, link, ud_link_name(link), ud.reconnects,
++		    set ? "set" : "NOT set (plain reset)");
++		snprintf(ud_ctl_why, sizeof(ud_ctl_why), "reset (USB host lost %d s)", ud_lost_reboot_s);
++		ud_ctl_schedule(UD_CTL_RESET);
++		return;
++	}
+ 	if (!ud.nosof_logged && quiet >= ud_abs_ms(3000)) {
+ 		ud.nosof_logged = true;
+ 		printf("NEGRONI USB: no SOF for 3 s (%sconfigured): DSTS 0x%08x link %u (%s), DCTL 0x%08x DEVTEN 0x%08x "
+@@ -2744,6 +2775,10 @@ negroni_usb_gadget_start(vm_offset_t dwc)
+ 	PE_parse_boot_argn("negroniusb_reconnect", &ud_reconnect_s, sizeof(ud_reconnect_s));
+ 	PE_parse_boot_argn("negroniusb_events", &ud_more_events, sizeof(ud_more_events));
+ 	PE_parse_boot_argn("negroniusb_phycfg", &ud_phycfg, sizeof(ud_phycfg));
++	PE_parse_boot_argn("negroniusb_lost_reboot", &ud_lost_reboot_s, sizeof(ud_lost_reboot_s));
++	if (ud_lost_reboot_s > 0) {
++		printf("NEGRONI USB: reboot after %d s without host once configured (negroniusb_lost_reboot)\n", ud_lost_reboot_s);
++	}
+ 	ud.qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	hp_setup();                     /* 0368: PHY baseline before our controller start */
+ 	if (!ud_hw_start(true)) {

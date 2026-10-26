@@ -3,7 +3,7 @@
 The base driver comes from slop (patches 0072-0077, 0081, 0119: DWC3 at 0x0a600000, ep0, VBUS override, CDC-ECM,
 live log). Our patches: 0210 (UDP command server), 0212 (settime), 0282 (bus reset drops the data endpoints),
 0360 (panic mode, README-panic.md), 0361 (throughput, this file), 0366 (reconnect after unplug or a Type-C
-re-attach, this file), 0368 (the HS PHY after the ADSP start, this file). Host side: docs/usb-network.md.
+re-attach, this file), 0368 (the HS PHY after the ADSP start, this file), 0371 (reboot when the host stays lost, this file). Host side: docs/usb-network.md.
 
 ## 0361: throughput (RX ring, TX batches, short polls)
 
@@ -253,3 +253,29 @@ re-attach, this file), 0368 (the HS PHY after the ADSP start, this file). Host s
 4. If the link drops but no PHY register changed: the 0366 rule (`no SOF for 3 s`, `soft reconnect ... no SOF`) now
    also runs the PHY init (`PHY re-init #1`). If it still does not come back, try `negroniusb_phyfix=2`, and send the
    boot log: the `PHY change` and `glink: rx` lines say what the ADSP did.
+
+## 0371: reboot when the host stays lost (`negroniusb_lost_reboot=S`)
+
+- Why [V]: with the ADSP on, the Mac lost the device for good ~2 s after our charger GLINK channel started (boots
+  03:20:28 and 03:51:02). The phone kept running and could not be reached. Tests are RAM boots (`fastboot boot`) and
+  boot_a holds a known-good image, so a normal reboot always brings USB back.
+- Boot-arg `negroniusb_lost_reboot=S` (default 0 = off). In `ud_link_watch` (ud_thread only, never in panic mode: the
+  panic hold loop has its own timed reset): when the device was configured at least once in this boot
+  (SET_CONFIGURATION(1)) and then had no SOF for S s in one stretch (DSTS.SOFFN does not move; the 0366 soft
+  reconnects do not end the stretch, only a SOF does), it:
+  1. logs `NEGRONI USB: host lost for S s: rebooting (negroniusb_lost_reboot); DSTS ... link N (...), K soft
+     reconnects, reason 0 set`,
+  2. sets reboot reason 0 (normal boot, not fastboot) and schedules the USB "reboot" command path: 500 ms later
+     `ud_ctl_poll` writes the boot log end mark `negroni_bootlog_end(4, "reset (USB host lost S s)")` (0367) and
+     calls `negroni_reboot_reset()` (PSCI SYSTEM_RESET).
+- Once per boot. Not before the first configuration (a boot with no cable never reboots by itself). A pending USB
+- The driver forces VBUS valid, so a Mac system sleep longer than S s or a deliberate unplug also reboots the phone into
+  boot_a (and ends a RAM-boot test). Use the arg on test images only (scripts/ios16/build.sh skips out/ios16-safe).
+- The reset is PSCI SYSTEM_RESET with no VFS sync (same as the `reboot` command): a userland write at that moment can
+  be lost, the same risk as a hard reset. Opus review 2026-10-27: ACCEPT.
+  command (reset, power off, panic) wins.
+- Boot line when on: `NEGRONI USB: reboot after S s without host once configured (negroniusb_lost_reboot)`.
+- Pick S above the 0366 periods: e.g. `negroniusb_lost_reboot=60` (the L2 case waits 30 s before its first soft
+  reconnect).
+- Test: boot with `negroniusb_lost_reboot=20`, wait for en10, unplug. ~20 s later the phone reboots into boot_a.
+  The 0367 boot log of that boot ends with "reset (USB host lost 20 s)" and has the "host lost" line.

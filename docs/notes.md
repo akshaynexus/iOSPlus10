@@ -2924,3 +2924,15 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - [V] t11: boot log on (`boot 1 reached SpringBoard ... 56.957 s`), ADSP up 03:51:00, PHY registers unchanged,
   `glink: start ... ICL per adapter type on` at 03:51:00, Mac lost the device at 03:51:02 (same as 03:20 with 1500 mA):
   the drop comes ~2 s after our charger GLINK client starts, before any input-limit write. Next: negronichg_wr=0.
+
+## 2027. USB: reboot when the host stays lost, boot-arg negroniusb_lost_reboot=S (2026-10-27, kernel agent; patch 0371, details patches/xnu/README-usb.md "0371")
+
+- [V] Why: with the ADSP on, the Mac lost the device for good ~2 s after the charger GLINK channel started (boots
+  03:20:28, 03:51:02); the phone kept running and could not be reached. boot_a holds a known-good image.
+- 0371: once configured in this boot, no SOF for S s in one stretch (soft reconnects do not end it) -> log
+  `NEGRONI USB: host lost for S s: rebooting (negroniusb_lost_reboot)`, reason 0, the USB "reboot" command path
+  (500 ms later: negroni_bootlog_end(4, "reset (USB host lost S s)") + negroni_reboot_reset). Default 0 = off. Never
+  in panic mode. Use S above the 0366 periods (e.g. 60).
+- Build: out/kernel/local-20261026-222425/kernel.development.negroni sha256
+  5ba022127aa9f50bdefb5ef0dadac4beb92fafb280376b3c8400ed4ce36a13ba (264 applied incl. 0371; only the 4 dxb skips;
+  link out/kernel/kernel.macho). Not run on the phone; no image built.
