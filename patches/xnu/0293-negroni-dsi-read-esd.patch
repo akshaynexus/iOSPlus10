@@ -1,0 +1,572 @@
+0293: DSI DCS reads, ESD status check (0x0a every 5 s) and the panel ID (bsd/dev/negroni_dsi.c;
+NegroniBacklight.cpp: the re-init; one hook in NegroniFramebuffer.cpp AppleCLCD::start)
+
+Port of dsi_message_rx / get_cmd_read_data (dsi_ctrl.c:1754-1965, dsi_ctrl_hw_cmn.c:1037-1119):
+max return packet size (0x37) + DCS read (0x06, BTA bit), RDBK_DATA_CTRL/RDBK_DATA0-3, multi-pass
+for more than 10 bytes. negronifb_esd=1: panel ID once (0xda/db/dc, 0x0a, 0x0e, 0xa1 x 11 = the
+oplus serial/date) and DCS 0x0a every 5 s while the display is on, expected 0x9d/0x9f (live.dts
+35594-35599); a wrong value twice in a row queues a re-init on the backlight work loop
+(negroni_backlight_reinit: off-command 0x28/0x10, then 0268's wake = full on-command + PPS, then the
+DBV; with negronifb_wake=0 only a log); at most 3 re-inits per boot, then the check stops; 3 failed
+reads in a row stop the check. A read holds 0268's set lock (negroni_dsi_set_enter/leave), so it never
+lands between the batches of a VRR set or the packets of the 0268 wake.
+negronifb_esd=2: the ID only. Default 0.
+
+diff --git a/bsd/dev/negroni_dsi.c b/bsd/dev/negroni_dsi.c
+index 8786873..e341a30 100644
+--- a/bsd/dev/negroni_dsi.c
++++ b/bsd/dev/negroni_dsi.c
+@@ -381,3 +381,417 @@ negroni_dsi_dma_write(const uint8_t *buf, uint32_t len, bool lp)
+ 	uint32_t sent = 0, resume = 0;
+ 	return ndsi_set(set, 7 + len, lp, &sent, &resume, false);   /* failed: NOT_USED, the caller sends it */   /* single writes are not logged (brightness fades) */
+ }
++
++/* ---------------------------------------------------------------------- */
++/* 0293: DCS reads, the ESD status check and the panel ID                  */
++/* ---------------------------------------------------------------------- */
++
++/*
++ * Android: dsi_ctrl.c:1754-1777 dsi_set_max_return_size (type 0x37, batched before the read),
++ * :1820-1965 dsi_message_rx (first pass up to 10 bytes, then +14 per pass, CRC removed, the
++ * response type at buff[header_offset]), dsi_ctrl_hw_cmn.c:1037-1043 clear_rdbk_reg,
++ * :1045-1119 get_cmd_read_data (RDBK_DATA_CTRL >> 16 = bytes received, RDBK_DATA3..0 = the last
++ * 16 bytes, big-endian words), dsi_ctrl.c:1279-1285 (embedded BTA bit 5 of the flags byte for a
++ * read). ESD (live.dts 35594-35599): qcom,mdss-dsi-panel-status-command 06 01 00 01 00 01 0a
++ * (DCS read 0x0a, 1 byte), -read-length 1, -value <0x9d 0x9f>, -command-state "dsi_lp_mode",
++ * -check-mode "reg_read"; every 5 s (sde_kms.h:143 STATUS_CHECK_INTERVAL_MS, sde_connector.c:794).
++ * Panel serial: oplus,dsi-serial-number-reg 0xa1, -read-count 11, -index 4 (live.dts 35558-35561,
++ * oplus_display_private_api.c:754-806: year/month at [4], day [5], hour [6], minute [7], second [8]).
++ *
++ * negronifb_esd (boot-arg, default 0): 1 = the panel ID once (0xda/0xdb/0xdc, 0x0a, 0x0e, 0xa1 x 11)
++ * and the 0x0a check every 5 s while the display is on; 2 = the panel ID only. A wrong value twice
++ * in a row calls the re-init NegroniBacklight.cpp registered (negroni_dsi_set_reinit: off-command,
++ * then 0268's wake with the full on-command and PPS; rc -1 and only a log with negronifb_wake=0);
++ * after 3 re-inits a third wrong pair stops the check for the boot. A read holds 0268's set lock,
++ * so it never lands inside a command set. Three failed reads in a row stop the check for the boot (a broken read
++ * path must never trigger a re-init).
++ */
++#define NDSI_RDBK_DATA0                 0x06c
++#define NDSI_RDBK_DATA_CTRL             0x1d4
++#define NDSI_TPG_CMD_DMA_INIT_VAL       0x17c
++#define NDSI_INT_BTA_DONE               (1u << 20)
++#define NDSI_ESD_PERIOD_MS              5000
++#define NDSI_READ_MAX                   24
++#define NDSI_ESD_REINIT_MAX             3       /* re-inits per boot, then the check stops */
++
++extern bool negroni_backlight_panel_ready(bool *lp);    /* NegroniBacklight.cpp (0259) */
++extern void negroni_dsi_set_enter(void);                /* NegroniBacklight.cpp: 0268's set lock */
++extern void negroni_dsi_set_leave(void);
++int negroni_dsi_dcs_read(uint8_t cmd, uint8_t *out, uint32_t rlen, bool lp);
++void negroni_dsi_set_reinit(int (*fn)(void));
++void negroni_dsi_esd_start(void);
++
++static int (*ndsi_reinit)(void);
++static thread_call_t ndsi_esd_call;
++static uint32_t ndsi_esd_mode;
++static bool ndsi_id_done, ndsi_esd_stopped;
++static uint32_t ndsi_esd_checks, ndsi_esd_ok, ndsi_esd_bad, ndsi_esd_rderr, ndsi_esd_badrow, ndsi_esd_errrow;
++static uint32_t ndsi_esd_reinits, ndsi_read_fifo, ndsi_read_dma;
++static uint8_t ndsi_esd_last;
++
++/* 0268 (full panel re-init) registers its entry here; the ESD check calls it from a thread call. */
++void
++negroni_dsi_set_reinit(int (*fn)(void))
++{
++	ndsi_reinit = fn;
++}
++
++/* Lock held: one FIFO DMA of n words (0250's register sequence), for the read packets. */
++static int
++ndsi_fifo_kick_locked(const uint32_t *words, uint32_t n, bool lp)
++{
++	volatile uint32_t *d = negroni_dsi_base();
++	uint32_t i;
++
++	for (i = 0; i < 250 && (ndsi_rd(d, NDSI_STATUS) & NDSI_STATUS_DMA_BUSY); i++) {
++		delay(20);
++	}
++	if (ndsi_rd(d, NDSI_STATUS) & NDSI_STATUS_DMA_BUSY) {
++		return -2;
++	}
++	uint32_t tpg = ndsi_rd(d, NDSI_TPG_CTRL);
++	uint32_t dma = ndsi_rd(d, NDSI_CMD_DMA_CTRL);
++	uint32_t trig = ndsi_rd(d, NDSI_TRIG_CTRL);
++	if ((trig & 0xfu) != NDSI_DMA_TRIGGER_SW) {
++		ndsi_wr(d, NDSI_TRIG_CTRL, (trig & ~0xfu) | NDSI_DMA_TRIGGER_SW);
++	}
++	ndsi_wr(d, NDSI_INT_CTRL, (ndsi_rd(d, NDSI_INT_CTRL) & NDSI_INT_ENABLE_BITS) | NDSI_INT_DMA_DONE);
++	ndsi_wr(d, NDSI_TPG_CTRL, 3u << 16 | 1u << 2 | 1u << 1);
++	for (i = 0; i < n; i++) {
++		ndsi_wr(d, NDSI_TPG_CMD_DMA_INIT_VAL, words[i]);
++	}
++	if (n & 1u) {
++		ndsi_wr(d, NDSI_TPG_CMD_DMA_INIT_VAL, 0);     /* an even number of words */
++	}
++	ndsi_wr(d, NDSI_CMD_DMA_CTRL, (dma & ~(1u << 31 | 1u << 30 | 1u << 26)) | 1u << 28 | (lp ? 1u << 26 : 0u));
++	ndsi_wr(d, NDSI_DMA_CMD_LENGTH, n * 4);
++	__builtin_arm_dsb(0xf);
++	ndsi_wr(d, NDSI_CMD_DMA_SW_TRIGGER, 1);
++	__builtin_arm_dsb(0xf);
++	bool done = false;
++	for (i = 0; i < 2500 && !done; i++) {
++		done = (ndsi_rd(d, NDSI_INT_CTRL) & NDSI_INT_DMA_DONE) != 0;
++		if (!done) {
++			delay(10);
++		}
++	}
++	ndsi_wr(d, NDSI_INT_CTRL, (ndsi_rd(d, NDSI_INT_CTRL) & NDSI_INT_ENABLE_BITS) | NDSI_INT_DMA_DONE);
++	ndsi_wr(d, NDSI_TPG_CTRL, 0);
++	ndsi_wr(d, NDSI_TPG_DMA_FIFO_RESET, 1);
++	__builtin_arm_dsb(0xf);
++	delay(1);
++	ndsi_wr(d, NDSI_TPG_DMA_FIFO_RESET, 0);
++	ndsi_wr(d, NDSI_TPG_CTRL, tpg);
++	ndsi_wr(d, NDSI_CMD_DMA_CTRL, dma);
++	if ((trig & 0xfu) != NDSI_DMA_TRIGGER_SW) {
++		ndsi_wr(d, NDSI_TRIG_CTRL, trig);
++	}
++	__builtin_arm_dsb(0xf);
++	return done ? 0 : -3;
++}
++
++/* get_cmd_read_data (dsi_ctrl_hw_cmn.c:1045-1119), ported as is. */
++static uint32_t
++ndsi_read_data(volatile uint32_t *d, uint8_t *rd_buf, uint32_t read_offset, uint32_t rx_byte, uint32_t pkt_size,
++    uint32_t *hw_read_cnt)
++{
++	uint8_t reg[16] = { 0 };
++	uint32_t cnt = (rx_byte + 3) >> 2, read_cnt, repeated = 0, i, j = 0;
++	bool ack_err;
++
++	cnt = cnt > 4 ? 4 : cnt;
++	read_cnt = ndsi_rd(d, NDSI_RDBK_DATA_CTRL) >> 16;
++	ack_err = rx_byte == 4 ? read_cnt == 8 : (read_cnt - 4) == (pkt_size + 6);
++	if (ack_err) {
++		read_cnt -= 4;
++	}
++	if (read_cnt == 0) {
++		return 0;
++	}
++	if (rx_byte == 4 && read_cnt > 4) {
++		read_cnt = rx_byte;
++	} else if (rx_byte == 16 && read_cnt > pkt_size + 6) {
++		read_cnt = pkt_size + 6;
++	}
++	if (read_cnt > 16) {
++		int bytes_shifted = (int)read_cnt - (int)rx_byte, data_lost = 0, rem_header = 0;
++		if (bytes_shifted >= 4) {
++			data_lost = bytes_shifted - 4;
++		} else {
++			rem_header = 4 - bytes_shifted;
++		}
++		repeated = (uint32_t)((int)(read_offset - 4) - data_lost + rem_header);
++	}
++	uint32_t off = NDSI_RDBK_DATA0 + (cnt - 1) * 4, k = 0;
++	for (i = 0; i < cnt; i++, off -= 4) {
++		uint32_t w = __builtin_bswap32(ndsi_rd(d, off));   /* ntohl */
++		uint8_t *dst = repeated ? reg + 4 * i : rd_buf + 4 * k++;
++		memcpy(dst, &w, 4);
++	}
++	if (repeated) {
++		for (i = repeated; i < 16; i++) {
++			rd_buf[j++] = reg[i];
++		}
++	}
++	*hw_read_cnt = read_cnt;
++	return rx_byte;
++}
++
++/*
++ * Lock held: one pass = max return packet size (0x37, batched) + the DCS read (0x06, last, BTA)
++ * through the memory DMA when it is on, else as two FIFO DMAs (Android forces "last" on FIFO
++ * packets). Then the BTA (INT_CTRL bit 20, at most 10 ms) brings the panel's answer to RDBK.
++ */
++static int
++ndsi_read_pass_locked(uint8_t cmd, uint32_t pkt, bool lp)
++{
++	volatile uint32_t *d = negroni_dsi_base();
++	uint8_t mrs[2] = { (uint8_t)pkt, (uint8_t)(pkt >> 8) }, rd[2] = { cmd, 0 };
++	int rc;
++
++	ndsi_wr(d, NDSI_RDBK_DATA_CTRL, 1);
++	__builtin_arm_dsb(0xf);
++	ndsi_wr(d, NDSI_RDBK_DATA_CTRL, 0);
++	__builtin_arm_dsb(0xf);
++	if (ndsi_dma_usable()) {
++		uint32_t pos = 0;
++		(void)negroni_dsi_dma_append_locked(&pos, 0x37, mrs, 2, false, false);
++		(void)negroni_dsi_dma_append_locked(&pos, 0x06, rd, 1, true, true);
++		rc = negroni_dsi_dma_kick_locked(pos, lp, false);
++		ndsi_read_dma++;
++	} else {
++		uint32_t w1 = 1u << 31 | 0x37u << 16 | (uint32_t)mrs[1] << 8 | mrs[0];
++		uint32_t w2 = 1u << 31 | 1u << 29 | 0x06u << 16 | cmd;
++		rc = ndsi_fifo_kick_locked(&w1, 1, lp);
++		if (rc == 0) {
++			rc = ndsi_fifo_kick_locked(&w2, 1, lp);
++		}
++		ndsi_read_fifo++;
++	}
++	if (rc != 0) {
++		return rc;
++	}
++	uint32_t i;
++	for (i = 0; i < 1000 && !(ndsi_rd(d, NDSI_INT_CTRL) & NDSI_INT_BTA_DONE); i++) {
++		delay(10);
++	}
++	ndsi_wr(d, NDSI_INT_CTRL, (ndsi_rd(d, NDSI_INT_CTRL) & NDSI_INT_ENABLE_BITS) | NDSI_INT_BTA_DONE);
++	return 0;
++}
++
++/*
++ * 0293: DCS read of rlen bytes (1..NDSI_READ_MAX) of register cmd. Returns the bytes read
++ * (0: the panel sent an ACK/error report or nothing), < 0: DSI error. Thread context.
++ */
++int
++negroni_dsi_dcs_read(uint8_t cmd, uint8_t *out, uint32_t rlen, bool lp)
++{
++	uint8_t buf[48] = { 0 };
++	uint32_t rd_pkt, total_read_len, current_read_len = 0, total_bytes = 0, hw_cnt = 0, rlenLeft = rlen;
++	bool shortResp = rlen <= 2, done = false;
++	uint8_t *buff = buf;
++	int rc = 0;
++
++	if (rlen == 0 || rlen > NDSI_READ_MAX || negroni_dsi_in_panic()) {
++		return -1;
++	}
++	if (negroni_dsi_dma_mode() != 0) {
++		(void)ndsi_dma_usable();        /* the buffer, outside the lock */
++	}
++	if (shortResp) {
++		rd_pkt = rlen;
++		total_read_len = 4;
++	} else {
++		current_read_len = 10;
++		rd_pkt = rlen < current_read_len ? rlen : current_read_len;
++		total_read_len = current_read_len + 6;
++	}
++	/* the set lock first: a read never lands between the batches of a 0259 VRR set or the 0268 wake */
++	negroni_dsi_set_enter();
++	if (!negroni_dsi_enter()) {
++		negroni_dsi_set_leave();
++		return -1;
++	}
++	volatile uint32_t *d = negroni_dsi_base();
++	while (!done) {
++		rc = ndsi_read_pass_locked(cmd, rd_pkt, lp);
++		if (rc != 0) {
++			break;
++		}
++		uint32_t dlen = ndsi_read_data(d, buff, total_bytes, total_read_len, rd_pkt, &hw_cnt);
++		if (dlen == 0) {
++			rc = 0;
++			break;
++		}
++		if (shortResp) {
++			rc = 1;
++			break;
++		}
++		uint32_t diff;
++		if (rlenLeft <= current_read_len) {
++			diff = current_read_len - rlenLeft;
++			done = true;
++		} else {
++			diff = 0;
++			rlenLeft -= current_read_len;
++		}
++		dlen -= 2 + diff;
++		buff += dlen;
++		total_bytes += dlen;
++		if (!done) {
++			current_read_len = 14;
++			rd_pkt += rlenLeft < current_read_len ? rlenLeft : current_read_len;
++		}
++		if (buff + 16 > buf + sizeof(buf)) {
++			rc = -4;
++			break;
++		}
++		rc = 1;
++	}
++	uint32_t ack = ndsi_rd(d, NDSI_ACK_ERR_STATUS);
++	negroni_dsi_leave();
++	negroni_dsi_set_leave();
++	if (rc <= 0) {
++		return rc;
++	}
++	uint32_t ho = (!shortResp && hw_cnt < 16) ? 16 - hw_cnt : 0;
++	uint8_t type = buf[ho];
++	switch (type) {
++	case 0x21: case 0x11:           /* DCS / generic short read response, 1 byte */
++		out[0] = buf[ho + 1];
++		return 1;
++	case 0x22: case 0x12:           /* 2 bytes */
++		out[0] = buf[ho + 1];
++		if (rlen > 1) {
++			out[1] = buf[ho + 2];
++		}
++		return rlen > 1 ? 2 : 1;
++	case 0x1c: case 0x1a:           /* DCS / generic long read response */
++		memcpy(out, buf + ho + 4, rlen);
++		return (int)rlen;
++	case 0x02:
++		printf("NEGRONI DSI: read 0x%02x: ACK/error report 0x%02x%02x (ack_err 0x%08x)\n", cmd, buf[ho + 2],
++		    buf[ho + 1], ack);
++		return 0;
++	default:
++		printf("NEGRONI DSI: read 0x%02x: unknown response 0x%02x (bytes %u, ack_err 0x%08x)\n", cmd, type, hw_cnt, ack);
++		return 0;
++	}
++}
++
++/* Once: the panel's identity (log only; the serial stays on the phone). */
++static void
++ndsi_read_id(void)
++{
++	static const uint8_t regs[] = { 0xda, 0xdb, 0xdc, 0x0a, 0x0e };
++	uint8_t v[sizeof(regs)] = { 0 }, sn[11] = { 0 };
++	int r[sizeof(regs)];
++
++	for (uint32_t i = 0; i < sizeof(regs); i++) {
++		r[i] = negroni_dsi_dcs_read(regs[i], &v[i], 1, true);
++	}
++	int rs = negroni_dsi_dcs_read(0xa1, sn, sizeof(sn), true);
++	printf("NEGRONI DSI: panel ID da/db/dc %02x %02x %02x (rc %d %d %d), power mode 0a %02x (rc %d), signal 0e %02x (rc %d), "
++	    "a1 x 11 rc %d: made %u-%02u-%02u %02u:%02u:%02u (reads via %s)\n",
++	    v[0], v[1], v[2], r[0], r[1], r[2], v[3], r[3], v[4], r[4], rs, 2011u + (sn[4] >> 4), sn[4] & 0x0f, sn[5] & 0x1f, sn[6] & 0x1f, sn[7] & 0x3f, sn[8] & 0x3f,
++	    ndsi_read_dma != 0 ? "memory DMA" : "FIFO");
++}
++
++static void
++ndsi_esd_work(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	bool lp = true;
++
++	if (!negroni_backlight_panel_ready(&lp)) {
++		goto again;             /* display off or no DSI: nothing to check */
++	}
++	if (!ndsi_id_done) {
++		ndsi_id_done = true;
++		ndsi_read_id();
++	}
++	if (ndsi_esd_mode != 1 || ndsi_esd_stopped) {
++		return;
++	}
++	uint8_t v = 0;
++	int rc = negroni_dsi_dcs_read(0x0a, &v, 1, true);  /* status-command-state "dsi_lp_mode" */
++	if (!negroni_backlight_panel_ready(NULL)) {
++		goto again;             /* went off meanwhile: the answer of a sleeping panel means nothing */
++	}
++	ndsi_esd_checks++;
++	if (rc != 1) {
++		ndsi_esd_rderr++;
++		if (++ndsi_esd_errrow >= 3) {
++			ndsi_esd_stopped = true;
++			printf("NEGRONI DSI ESD: 3 reads of 0x0a failed in a row (rc %d): ESD check off for this boot\n", rc);
++			return;
++		}
++	} else if (v == 0x9d || v == 0x9f) {
++		ndsi_esd_ok++;
++		ndsi_esd_errrow = 0;
++		ndsi_esd_badrow = 0;
++		ndsi_esd_last = v;
++		if (ndsi_esd_ok == 1) {
++			printf("NEGRONI DSI ESD: power mode 0x%02x ok (expect 0x9d/0x9f), check every %u ms\n", v, NDSI_ESD_PERIOD_MS);
++		}
++	} else {
++		ndsi_esd_bad++;
++		ndsi_esd_errrow = 0;
++		ndsi_esd_last = v;
++		ndsi_esd_badrow++;
++		if (ndsi_esd_bad <= 4 || (ndsi_esd_bad % 60) == 0) {
++			printf("NEGRONI DSI ESD: power mode 0x%02x, expected 0x9d/0x9f (%u in a row, %u in all)\n", v,
++			    ndsi_esd_badrow, ndsi_esd_bad);
++		}
++		if (ndsi_esd_badrow >= 2) {
++			ndsi_esd_badrow = 0;
++			if (ndsi_reinit != NULL && ndsi_esd_reinits >= NDSI_ESD_REINIT_MAX) {
++				/* a panel that stays wrong after 3 re-inits: no off + full wake every 10 s all boot */
++				ndsi_esd_stopped = true;
++				printf("NEGRONI DSI ESD: still 0x%02x after %u re-inits: ESD check off for this boot\n", v,
++				    ndsi_esd_reinits);
++				return;
++			}
++			if (ndsi_reinit != NULL) {
++				int r = ndsi_reinit();
++				ndsi_esd_reinits++;
++				printf("NEGRONI DSI ESD: panel re-init (off-command + 0268 wake) queued, rc %d (%u re-inits)\n", r,
++				    ndsi_esd_reinits);
++			} else if (ndsi_esd_bad <= 4) {
++				printf("NEGRONI DSI ESD: no panel re-init registered (0268 not in this kernel): logged only\n");
++			}
++		}
++	}
++	if ((ndsi_esd_checks % 60) == 0) {
++		printf("NEGRONI DSI ESD: %u checks, ok %u, wrong %u, read errors %u, re-inits %u, last 0x%02x\n",
++		    ndsi_esd_checks, ndsi_esd_ok, ndsi_esd_bad, ndsi_esd_rderr, ndsi_esd_reinits, ndsi_esd_last);
++	}
++again:
++	if (ndsi_esd_mode == 1 || !ndsi_id_done) {
++		uint64_t deadline;
++		clock_interval_to_deadline(NDSI_ESD_PERIOD_MS, NSEC_PER_MSEC, &deadline);
++		thread_call_enter_delayed(ndsi_esd_call, deadline);
++	}
++}
++
++/* NegroniFramebuffer.cpp AppleCLCD::start, after the backlight attached: negronifb_esd. */
++void
++negroni_dsi_esd_start(void)
++{
++	uint32_t m = 0;
++
++	PE_parse_boot_argn("negronifb_esd", &m, sizeof(m));
++	if (m == 0 || ndsi_esd_call != NULL || negroni_dsi_base() == NULL) {
++		return;
++	}
++	ndsi_esd_mode = m > 2 ? 2 : m;
++	ndsi_esd_call = thread_call_allocate_with_options(ndsi_esd_work, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
++	if (ndsi_esd_call == NULL) {
++		return;
++	}
++	printf("NEGRONI DSI ESD: negronifb_esd=%u: panel ID once%s; re-init %s\n", ndsi_esd_mode,
++	    ndsi_esd_mode == 1 ? ", DCS 0x0a every 5 s while the display is on" : "",
++	    ndsi_reinit != NULL ? "registered" : "not registered (log only)");
++	uint64_t deadline;
++	clock_interval_to_deadline(NDSI_ESD_PERIOD_MS, NSEC_PER_MSEC, &deadline);
++	thread_call_enter_delayed(ndsi_esd_call, deadline);
++}
+diff --git a/iokit/Kernel/arm/NegroniBacklight.cpp b/iokit/Kernel/arm/NegroniBacklight.cpp
+index 2b79f9b..f000034 100644
+--- a/iokit/Kernel/arm/NegroniBacklight.cpp
++++ b/iokit/Kernel/arm/NegroniBacklight.cpp
+@@ -718,10 +718,12 @@ class AppleARMBacklight : public IOService {
+ 	void publish(uint32_t level);
+ 	void kick(void);
+ 	const char *wakePanel(char *info, size_t size);     /* 0268 */
++	void reinitPanel(void);                             /* 0293 */
+ 
+ public:
+ 	uint32_t            fMax, fNits, fSleepMode;
+ 	uint32_t            fWakeMode;      /* 0268 negronifb_wake: 0 sleep-out, 1 on-command (FIFO packets), 2 + PPS */
++	volatile bool       fReinit;        /* 0293: the ESD check asked for a panel re-init */
+ 	bool                fCurve, fLP;
+ 
+ 	bool startBacklight(void);
+@@ -730,6 +732,7 @@ public:
+ 	bool displayOn(void);
+ 	void panicWake(void);
+ 	bool displayIsOn(void);         /* 0259 */
++	void kickPublic(void) { kick(); }       /* 0293 */
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+@@ -825,6 +828,12 @@ AppleARMBacklight::step(void)
+ 	uint64_t t = now - fFadeStart, period = fFadePeriod;
+ 	IOSimpleLockUnlockEnableInterrupt(fState, is);
+ 
++	if (fReinit) {
++		fReinit = false;
++		if (on && !edge) {
++			reinitPanel();          /* 0293: ESD: the panel answered a wrong power mode twice */
++		}
++	}
+ 	if (edge && !on) {
+ 		/* The framebuffer's fade is done: DBV 0, then the panel's off-command. */
+ 		apply(0, true);
+@@ -975,6 +984,32 @@ AppleARMBacklight::wakePanel(char *info, size_t size)
+ 	return wake;
+ }
+ 
++/*
++ * 0293: re-init after a failed ESD check (bsd/dev/negroni_dsi.c, DCS 0x0a not 0x9d/0x9f twice).
++ * Android: PANEL_DEAD -> dsi_display disable/enable (power off, reset, DSI_CMD_SET_ON). Here:
++ * the off-command (0x28, 21 ms, 0x10, 101 ms) and 0268's full wake (on-command + PPS), then
++ * the DBV again. Backlight work loop.
++ */
++void
++AppleARMBacklight::reinitPanel(void)
++{
++	char info[192];
++	uint8_t c = 0x28;
++
++	info[0] = 0;
++	(void)negroni_dsi_dcs_write(&c, 1, fLP);
++	IOSleep(NEGRONI_BL_OFF_WAIT_MS);
++	c = 0x10;
++	(void)negroni_dsi_dcs_write(&c, 1, fLP);
++	IOSleep(NEGRONI_BL_SLEEP_IN_WAIT_MS);
++	fPanelOn = false;
++	const char *wake = wakePanel(info, sizeof(info));
++	fKnown = false;                 /* the DBV goes out again */
++	uint32_t level = fLevel != 0 ? fLevel : fLastLit;
++	apply(level, true);
++	IOLog("NEGRONI BL: ESD re-init: %s (%s), panel DBV %u\n", wake, info, level);
++}
++
+ void
+ AppleARMBacklight::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -1119,6 +1154,36 @@ AppleARMBacklight::panicWake(void)
+ /* Hooks                                                                   */
+ /* ---------------------------------------------------------------------- */
+ 
++/* 0293: 0268's set lock for bsd/dev/negroni_dsi.c reads (not in the panic path). */
++extern "C" void
++negroni_dsi_set_enter(void)
++{
++	if (negroni_dsi_set_lock != NULL && !negroni_dsi_panic) {
++		IOLockLock(negroni_dsi_set_lock);
++	}
++}
++
++extern "C" void
++negroni_dsi_set_leave(void)
++{
++	if (negroni_dsi_set_lock != NULL && !negroni_dsi_panic) {
++		IOLockUnlock(negroni_dsi_set_lock);
++	}
++}
++
++/* 0293: bsd/dev/negroni_dsi.c ESD check: ask the work loop for a panel re-init (0268 wake mode >= 1). */
++extern "C" void negroni_dsi_set_reinit(int (*fn)(void));
++extern "C" int
++negroni_backlight_reinit(void)
++{
++	if (negroni_bl == NULL || negroni_bl->fWakeMode == 0) {
++		return -1;              /* negronifb_wake=0: no on-command to re-init with */
++	}
++	negroni_bl->fReinit = true;
++	negroni_bl->kickPublic();
++	return 0;
++}
++
+ /* NegroniFramebuffer.cpp AppleCLCD::start: publish the service under the framebuffer. */
+ void
+ negroni_backlight_attach(IOService *provider)
+@@ -1167,6 +1232,7 @@ negroni_backlight_attach(IOService *provider)
+ 		return;
+ 	}
+ 	negroni_bl = bl;        /* keeps the reference */
++	negroni_dsi_set_reinit(negroni_backlight_reinit);       /* 0293: the ESD check's re-init */
+ }
+ 
+ /*
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 60524b9..c3d2601 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -200,6 +200,7 @@ enum {
+ #define NEGRONI_FB_FORMAT_BGRA            0x42475241
+ 
+ void negroni_backlight_attach(IOService *provider);            /* NegroniBacklight.cpp */
++extern "C" void negroni_dsi_esd_start(void);                   /* bsd/dev/negroni_dsi.c (0293) */
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -866,6 +867,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	negroni_backlight_attach(this);
++	negroni_dsi_esd_start();        /* 0293: negronifb_esd (bsd/dev/negroni_dsi.c) */
+ 	IOLog("NEGRONI FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;

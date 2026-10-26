@@ -1,0 +1,566 @@
+0292: DSI command sets as Android sends them: memory-fetch DMA, batched to the "last" packet
+(new bsd/dev/negroni_dsi.c; hooks in NegroniBacklight.cpp after 0268; NegroniFramebuffer.cpp 0259 mode 1 HS)
+
+Android (display-drivers dsi_display.c:820-858, dsi_ctrl.c:1615-1752, dsi_ctrl_hw_cmn.c:870-918)
+fetches DCS commands from a 4 KiB uncached buffer (DSI_CTRL_CMD_FETCH_MEMORY) and sends every
+packet up to one without the batch flag (DT flags 0x40) in one DMA. 0250 sent one FIFO DMA per
+packet behind a 20 ms MDP-busy wait each (62 packets per 0259 timing switch).
+
+negronifb_dsidma=1: negroni_dsi_dcs_set_ex (0268; every set: 0259 VRR, 0268 on-command) goes
+through the memory DMA inside 0268's set lock, from 0268's command buffer (0xbaafc000, the end of the
+UEFI splash region, write-combined; the first 4 KiB): DMA_CMD_OFFSET/LENGTH, SW trigger,
+CMD_DMA_DONE poll, reset_cmd_fifo, the registers as found; one MDP-busy wait per set; a packet with
+a wait ends its batch. =2: single DCS writes too. Default 0 (0250/0268 per-packet path). A DMA that
+does not finish turns the memory DMA off for the boot (also 0268's long packets) and the rest of
+the set goes out packet by packet. Logs: "NEGRONI DSI: memory DMA (negronifb_dsidma=N): command sets from 0x...",
+"NEGRONI DSI: set of N bytes: N packets in N memory DMAs (N bytes), HS|LP, N us, rc 0".
+0259 mode 1 (min-fps set) now defaults to HS like the DT state (live.dts 35650); negronifb_vrr_hs=0
+restores LP.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 0f1592f..7d2aac5 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -104,6 +104,7 @@ bsd/dev/dtrace/fasttrap.c		optional config_dtrace
+ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
++bsd/dev/negroni_dsi.c			standard
+ bsd/dev/negroni_ufs.c			standard
+ bsd/dev/negroni_audio_guard.c		standard
+ bsd/dev/negroni_tfa.c			standard
+diff --git a/bsd/dev/negroni_dsi.c b/bsd/dev/negroni_dsi.c
+new file mode 100644
+index 0000000..8786873
+--- /dev/null
++++ b/bsd/dev/negroni_dsi.c
+@@ -0,0 +1,383 @@
++/*
++ * DSI0 command path of the NEGRONI panel (OnePlus 10 Pro, Samsung AMB670YF08 / S6E3HC3, DSI
++ * command mode), done the way Android's display driver does it (0292).
++ *
++ * Android (out/src/op-modules/vendor/qcom/opensource/display-drivers):
++ *   dsi_display.c:820-858  dsi_display_set_cmd_tx_ctrl_flags: default DSI_CTRL_CMD_FETCH_MEMORY;
++ *                          a packet without MIPI_DSI_MSG_BATCH_COMMAND (DT flags byte 0x40) gets
++ *                          DSI_CTRL_CMD_LAST_COMMAND; FIFO only in secure mode.
++ *   dsi_display.c:598-694  the command buffer: one 4 KiB MSM_BO_UNCACHED buffer (SZ_4K).
++ *   dsi_ctrl.c:1615-1752   dsi_message_tx: each packet is copied and padded into the buffer
++ *                          (dsi_ctrl_copy_and_pad_cmd :1245-1290: header bytes {data0, data1,
++ *                          DI, flags}, flags bit 7 last, bit 6 long, bit 5 BTA for reads, payload
++ *                          padded to 4 bytes with 0xff); without LAST the function returns and the
++ *                          next packet is appended; with LAST the whole buffer goes out in one DMA.
++ *   dsi_ctrl.c:1475-1578   dsi_kickoff_msg_tx, dsi_ctrl_hw_cmn.c:870-918 kickoff_command:
++ *                          COMMAND_MODE_DMA_CTRL (31 broadcast, 30 master cleared, 26 low power,
++ *                          28 embedded, 24 and 29 cleared), DMA_FIFO_CTRL |= bit 20 | bit 16,
++ *                          DMA_CMD_OFFSET = buffer IOVA, DMA_CMD_LENGTH, SW trigger; completion =
++ *                          CMD_DMA_DONE (INT_CTRL bit 0, dsi_ctrl.c:390 wait, 200 ms); then
++ *                          reset_cmd_fifo (dsi_ctrl_hw_cmn.c:990-997).
++ * Android does not wait for the MDP stream before a command (only dsi_display.c:8959, the
++ * dynamic-clock path); the controller queues the DMA behind the stream. 0250 waits for the MDP
++ * stream before every packet; this path waits once per set.
++ *
++ * negronifb_dsidma (boot-arg, default 0):
++ *   0  everything as 0250/0259 (one FIFO DMA per packet, MDP wait per packet).
++ *   1  negroni_dsi_dcs_set (the device-tree sets of 0259 and later) goes through the memory DMA:
++ *      the packets up to the next one without the batch flag (or with a wait) in one DMA.
++ *   2  1, and single DCS writes (brightness, sleep) too.
++ * The buffer: 0268's command buffer (the last 16 KiB of the UEFI splash region, 0xbaafc000,
++ * write-combined = Normal non-cacheable like MSM_BO_UNCACHED; the DSI DMA reads it by physical
++ * address through the display SMMU context like the pipes' fetch of the panel memory); the first
++ * 4 KiB are used (Android's SZ_4K). It is shared with 0268's long packets under the DSI lock.
++ * A DMA that does not finish turns the memory DMA off for the boot (this path and 0268's long
++ * packets) and the rest of the set goes through 0250/0268's per-packet path ("memory DMA off").
++ * The whole set runs inside 0268's set lock (negroni_dsi_dcs_set_ex), so sets never interleave.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <stdbool.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include <libkern/libkern.h>
++
++/* NegroniBacklight.cpp (0250 + 0292 accessors) */
++extern volatile uint32_t *negroni_dsi_base(void);
++extern bool negroni_dsi_enter(void);
++extern void negroni_dsi_leave(void);
++extern bool negroni_dsi_in_panic(void);
++extern volatile uint8_t *negroni_dsi_cmdbuf(uint64_t *pa);      /* 0268's buffer, NULL: none or failed */
++extern void negroni_dsi_cmdbuf_failed(void);
++extern void IOSleep(unsigned int milliseconds);
++
++#define NEGRONI_DSI_DMA_NOT_USED        (-100)  /* the caller uses the FIFO path */
++
++int negroni_dsi_dma_mode(void);
++bool negroni_dsi_dma_ready(void);
++int negroni_dsi_dma_kick_locked(uint32_t len, bool lp, bool mdpWait);
++bool negroni_dsi_dma_append_locked(uint32_t *pos, uint8_t type, const uint8_t *payload, uint32_t plen, bool last, bool bta);
++int negroni_dsi_dma_set(const uint8_t *set, uint32_t len, bool lp, uint32_t *sent, uint32_t *resume);
++int negroni_dsi_dma_write(const uint8_t *buf, uint32_t len, bool lp);
++
++/* DSI 2.x registers: display-drivers msm/dsi/dsi_ctrl_reg.h */
++#define NDSI_STATUS                     0x008   /* bit 1 CMD_DMA_BUSY, bit 2 CMD_MDP_BUSY */
++#define NDSI_CMD_DMA_CTRL               0x03c
++#define NDSI_DMA_CMD_OFFSET             0x048
++#define NDSI_DMA_CMD_LENGTH             0x04c
++#define NDSI_DMA_FIFO_CTRL              0x050
++#define NDSI_ACK_ERR_STATUS             0x068
++#define NDSI_TRIG_CTRL                  0x084
++#define NDSI_CMD_DMA_SW_TRIGGER         0x090
++#define NDSI_INT_CTRL                   0x110
++#define NDSI_TPG_CTRL                   0x15c
++#define NDSI_TPG_DMA_FIFO_RESET         0x1ec
++
++#define NDSI_STATUS_DMA_BUSY            (1u << 1)
++#define NDSI_STATUS_MDP_BUSY            (1u << 2)
++#define NDSI_INT_DMA_DONE               (1u << 0)
++#define NDSI_INT_ENABLE_BITS            0xaaaaaaaau
++#define NDSI_DMA_TRIGGER_SW             4u
++#define NDSI_BUF_MAX                    4096u   /* Android's SZ_4K command buffer */
++#define NDSI_DMA_DONE_US                50000u  /* Android: 200 ms (DSI_CTRL_TX_TO_MS) */
++
++static int ndsi_dma_mode = -1;          /* negronifb_dsidma */
++static bool ndsi_dma_off;               /* a DMA failed: FIFO for the rest of the boot */
++static volatile uint8_t *ndsi_buf;      /* 0268's command buffer (write-combined) */
++static uint64_t ndsi_buf_pa;
++static bool ndsi_buf_logged;
++static uint32_t ndsi_sets_logged, ndsi_mdp_waits_logged;
++uint64_t negroni_dsi_dma_kicks, negroni_dsi_dma_packets, negroni_dsi_dma_sets;      /* stats (0296 log) */
++
++static inline uint32_t
++ndsi_rd(volatile uint32_t *d, uint32_t off)
++{
++	return d[off / 4];
++}
++
++static inline void
++ndsi_wr(volatile uint32_t *d, uint32_t off, uint32_t v)
++{
++	d[off / 4] = v;
++}
++
++int
++negroni_dsi_dma_mode(void)
++{
++	if (ndsi_dma_mode < 0) {
++		uint32_t m = 0;
++		PE_parse_boot_argn("negronifb_dsidma", &m, sizeof(m));
++		ndsi_dma_mode = m > 2 ? 2 : (int)m;
++	}
++	return ndsi_dma_mode;
++}
++
++/* The command buffer (0268, NegroniBacklight.cpp); false when it is missing or failed. */
++static bool
++ndsi_buf_init(void)
++{
++	ndsi_buf = negroni_dsi_cmdbuf(&ndsi_buf_pa);
++	if (ndsi_buf == NULL || ndsi_buf_pa + NDSI_BUF_MAX > 0x100000000ull) {
++		ndsi_buf = NULL;
++		return false;
++	}
++	if (!ndsi_buf_logged) {
++		ndsi_buf_logged = true;
++		printf("NEGRONI DSI: memory DMA (negronifb_dsidma=%d): command sets from 0x%llx (0268's buffer), up to %u bytes per DMA\n",
++		    negroni_dsi_dma_mode(), ndsi_buf_pa, NDSI_BUF_MAX);
++	}
++	return true;
++}
++
++static bool
++ndsi_dma_usable(void)
++{
++	return negroni_dsi_dma_mode() != 0 && !ndsi_dma_off && !negroni_dsi_in_panic() &&
++	       negroni_dsi_base() != NULL && ndsi_buf_init();
++}
++
++/* The DMA path is on and usable (0293 uses it for reads). */
++bool
++negroni_dsi_dma_ready(void)
++{
++	return ndsi_dma_usable();
++}
++
++/*
++ * Lock held. Send len bytes of the command buffer (one or more packets, the last one with the
++ * last bit) in one memory DMA. mdpWait: wait up to 20 ms for the MDP stream first (once per set).
++ * 0 = CMD_DMA_DONE, -2 = an older DMA never finished (nothing touched), -3 = no CMD_DMA_DONE.
++ */
++int
++negroni_dsi_dma_kick_locked(uint32_t len, bool lp, bool mdpWait)
++{
++	volatile uint32_t *d = negroni_dsi_base();
++	uint32_t i;
++
++	for (i = 0; i < 250 && (ndsi_rd(d, NDSI_STATUS) & NDSI_STATUS_DMA_BUSY); i++) {
++		delay(20);
++	}
++	if (ndsi_rd(d, NDSI_STATUS) & NDSI_STATUS_DMA_BUSY) {
++		return -2;
++	}
++	if (mdpWait) {
++		for (i = 0; i < 1000 && (ndsi_rd(d, NDSI_STATUS) & NDSI_STATUS_MDP_BUSY); i++) {
++			delay(20);
++		}
++		if (i == 1000 && ndsi_mdp_waits_logged++ < 4) {
++			printf("NEGRONI DSI: MDP stream busy for 20 ms; sending the set anyway\n");
++		}
++	}
++	uint32_t tpg = ndsi_rd(d, NDSI_TPG_CTRL);
++	uint32_t dma = ndsi_rd(d, NDSI_CMD_DMA_CTRL);
++	uint32_t trig = ndsi_rd(d, NDSI_TRIG_CTRL);
++	uint32_t fifo = ndsi_rd(d, NDSI_DMA_FIFO_CTRL);
++	if ((trig & 0xfu) != NDSI_DMA_TRIGGER_SW) {
++		ndsi_wr(d, NDSI_TRIG_CTRL, (trig & ~0xfu) | NDSI_DMA_TRIGGER_SW);
++	}
++	if (tpg != 0) {
++		ndsi_wr(d, NDSI_TPG_CTRL, 0);   /* no TPG FIFO: the DMA reads memory */
++	}
++	ndsi_wr(d, NDSI_INT_CTRL, (ndsi_rd(d, NDSI_INT_CTRL) & NDSI_INT_ENABLE_BITS) | NDSI_INT_DMA_DONE);
++	/* kickoff_command: broadcast/master off, LPM, embedded mode, packet type and WC_SEL 0 */
++	uint32_t nd = dma & ~(1u << 31 | 1u << 30 | 1u << 29 | 1u << 26 | 1u << 24);
++	nd |= 1u << 28 | (lp ? 1u << 26 : 0u);
++	ndsi_wr(d, NDSI_CMD_DMA_CTRL, nd);
++	ndsi_wr(d, NDSI_DMA_FIFO_CTRL, fifo | 1u << 20 | 1u << 16);
++	ndsi_wr(d, NDSI_DMA_CMD_OFFSET, (uint32_t)ndsi_buf_pa);
++	ndsi_wr(d, NDSI_DMA_CMD_LENGTH, len & 0xffffffu);
++	__builtin_arm_dsb(0xf);         /* the buffer (non-cacheable) and the registers before the trigger */
++	ndsi_wr(d, NDSI_CMD_DMA_SW_TRIGGER, 1);
++	__builtin_arm_dsb(0xf);
++	bool done = false;
++	for (i = 0; i < NDSI_DMA_DONE_US / 10 && !done; i++) {
++		done = (ndsi_rd(d, NDSI_INT_CTRL) & NDSI_INT_DMA_DONE) != 0;
++		if (!done) {
++			delay(10);
++		}
++	}
++	ndsi_wr(d, NDSI_INT_CTRL, (ndsi_rd(d, NDSI_INT_CTRL) & NDSI_INT_ENABLE_BITS) | NDSI_INT_DMA_DONE);
++	/* reset_cmd_fifo (Android does it after every command), then the registers as found */
++	ndsi_wr(d, NDSI_TPG_CTRL, 0);
++	ndsi_wr(d, NDSI_TPG_DMA_FIFO_RESET, 1);
++	__builtin_arm_dsb(0xf);
++	delay(1);
++	ndsi_wr(d, NDSI_TPG_DMA_FIFO_RESET, 0);
++	ndsi_wr(d, NDSI_TPG_CTRL, tpg);
++	ndsi_wr(d, NDSI_CMD_DMA_CTRL, dma);
++	ndsi_wr(d, NDSI_DMA_FIFO_CTRL, fifo);
++	if ((trig & 0xfu) != NDSI_DMA_TRIGGER_SW) {
++		ndsi_wr(d, NDSI_TRIG_CTRL, trig);
++	}
++	__builtin_arm_dsb(0xf);
++	negroni_dsi_dma_kicks++;
++	return done ? 0 : -3;
++}
++
++/* Lock held. Append one packet (DT header fields) at *pos; false if it does not fit. */
++bool
++negroni_dsi_dma_append_locked(uint32_t *pos, uint8_t type, const uint8_t *payload, uint32_t plen, bool last, bool bta)
++{
++	uint32_t p = *pos;
++	bool lng = !(type == 0x05 || type == 0x15 || type == 0x03 || type == 0x13 || type == 0x23 ||
++	    type == 0x06 || type == 0x04 || type == 0x14 || type == 0x24 || type == 0x37);
++	uint32_t size = lng ? 4 + ((plen + 3) & ~3u) : 4;
++	if ((!lng && plen > 2) || plen > 0xffff || p + size > NDSI_BUF_MAX) {
++		return false;
++	}
++	/* dsi_ctrl_copy_and_pad_cmd: {data0 or WC lo, data1 or WC hi, DI, flags} */
++	ndsi_buf[p + 0] = lng ? (uint8_t)plen : (plen > 0 ? payload[0] : 0);
++	ndsi_buf[p + 1] = lng ? (uint8_t)(plen >> 8) : (plen > 1 ? payload[1] : 0);
++	ndsi_buf[p + 2] = type & 0x3f;  /* virtual channel 0 */
++	ndsi_buf[p + 3] = (uint8_t)((last ? 0x80 : 0) | (lng ? 0x40 : 0) | (bta ? 0x20 : 0));
++	if (lng) {
++		for (uint32_t i = 0; i < size - 4; i++) {
++			ndsi_buf[p + 4 + i] = i < plen ? payload[i] : 0xff;
++		}
++	}
++	*pos = p + size;
++	return true;
++}
++
++static bool
++ndsi_type_ok(uint8_t type)
++{
++	/* writes only: DCS short/long, generic short/long; reads go through 0293 */
++	return type == 0x05 || type == 0x15 || type == 0x39 || type == 0x03 || type == 0x13 || type == 0x23 ||
++	       type == 0x29 || type == 0x0a;
++}
++
++/*
++ * 0292: a command set in the device-tree format (7-byte header {type, last, vc, flags, wait ms,
++ * len hi, len lo}, payload) as Android sends it. NEGRONI_DSI_DMA_NOT_USED: the caller sends the
++ * packets from byte offset *resume on itself (0268's per-packet path; *sent packets went out
++ * before). Thread context only, inside 0268's set lock.
++ */
++static int
++ndsi_set(const uint8_t *set, uint32_t len, bool lp, uint32_t *sent, uint32_t *resume, bool log)
++{
++	uint32_t i, n = 0;
++
++	*sent = 0;
++	*resume = 0;
++
++	if (!ndsi_dma_usable()) {
++		return NEGRONI_DSI_DMA_NOT_USED;
++	}
++	for (i = 0; i + 7 <= len;) {
++		uint32_t plen = (uint32_t)set[i + 5] << 8 | set[i + 6];
++		if (!ndsi_type_ok(set[i]) || i + 7 + plen > len || plen + 8 > NDSI_BUF_MAX) {
++			return NEGRONI_DSI_DMA_NOT_USED;       /* the FIFO path reports it */
++		}
++		i += 7 + plen;
++	}
++	if (i != len) {
++		return NEGRONI_DSI_DMA_NOT_USED;
++	}
++	uint64_t t0 = mach_absolute_time();
++	uint32_t kicks = 0, bytes = 0;
++	bool first = true;
++	int rc = 0;
++	i = 0;
++	while (i < len && rc == 0) {
++		uint32_t start = i, pos = 0, inBatch = 0;
++		uint8_t wait = 0;
++		if (!negroni_dsi_enter()) {
++			rc = -1;
++			break;
++		}
++		/* fill: up to a packet without the batch flag (0x40), with a wait, or the buffer's end */
++		for (;;) {
++			uint8_t type = set[i], flags = set[i + 3];
++			uint32_t plen = (uint32_t)set[i + 5] << 8 | set[i + 6];
++			uint32_t next = i + 7 + plen;
++			wait = set[i + 4];
++			bool last = !(flags & 0x40) || wait != 0 || next >= len;
++			if (!last) {
++				/* the next packet must fit too, else this one ends the batch */
++				uint32_t nlen = (uint32_t)set[next + 5] << 8 | set[next + 6];
++				last = pos + 4 + ((plen + 3) & ~3u) + 4 + ((nlen + 3) & ~3u) > NDSI_BUF_MAX;
++			}
++			if (!negroni_dsi_dma_append_locked(&pos, type, set + i + 7, plen, last, false)) {
++				rc = -4;
++				break;
++			}
++			inBatch++;
++			i = next;
++			if (last) {
++				break;
++			}
++		}
++		if (rc == 0) {
++			rc = negroni_dsi_dma_kick_locked(pos, lp, first);
++		}
++		negroni_dsi_leave();
++		first = false;
++		if (rc == 0) {
++			n += inBatch;
++			kicks++;
++			bytes += pos;
++			if (wait != 0) {
++				IOSleep(wait);
++			}
++		} else if (rc == -3) {
++			volatile uint32_t *d = negroni_dsi_base();
++			ndsi_dma_off = true;
++			negroni_dsi_cmdbuf_failed();
++			printf("NEGRONI DSI: memory DMA of %u bytes (%u packets) not done in %u ms: status 0x%08x int 0x%08x "
++			    "ack_err 0x%08x; memory DMA off for this boot, the rest of the set goes packet by packet\n",
++			    pos, inBatch, NDSI_DMA_DONE_US / 1000, ndsi_rd(d, NDSI_STATUS), ndsi_rd(d, NDSI_INT_CTRL),
++			    ndsi_rd(d, NDSI_ACK_ERR_STATUS));
++			*resume = start;
++			*sent = n;
++			negroni_dsi_dma_packets += n;
++			return NEGRONI_DSI_DMA_NOT_USED;
++		}
++	}
++	negroni_dsi_dma_packets += n;
++	negroni_dsi_dma_sets++;
++	*sent = n;
++	if ((log && ndsi_sets_logged < 6) || rc != 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		ndsi_sets_logged += log;
++		printf("NEGRONI DSI: set of %u bytes: %u packets in %u memory DMAs (%u bytes), %s, %llu us, rc %d\n",
++		    len, n, kicks, bytes, lp ? "LP" : "HS", ns / 1000, rc);
++	}
++	return rc;
++}
++
++int
++negroni_dsi_dma_set(const uint8_t *set, uint32_t len, bool lp, uint32_t *sent, uint32_t *resume)
++{
++	*sent = 0;
++	*resume = 0;
++	return ndsi_set(set, len, lp, sent, resume, true);
++}
++
++/* 0292, negronifb_dsidma=2: one DCS write (0250 types: 0x05/0x15/0x39 by length) as a one-packet set. */
++int
++negroni_dsi_dma_write(const uint8_t *buf, uint32_t len, bool lp)
++{
++	uint8_t set[7 + 64];
++
++	if (negroni_dsi_dma_mode() < 2 || len == 0 || len > 64 || !ndsi_dma_usable()) {
++		return NEGRONI_DSI_DMA_NOT_USED;
++	}
++	set[0] = len == 1 ? 0x05 : (len == 2 ? 0x15 : 0x39);
++	set[1] = 1;
++	set[2] = 0;
++	set[3] = 0;
++	set[4] = 0;
++	set[5] = 0;
++	set[6] = (uint8_t)len;
++	memcpy(set + 7, buf, len);
++	uint32_t sent = 0, resume = 0;
++	return ndsi_set(set, 7 + len, lp, &sent, &resume, false);   /* failed: NOT_USED, the caller sends it */   /* single writes are not logged (brightness fades) */
++}
+diff --git a/iokit/Kernel/arm/NegroniBacklight.cpp b/iokit/Kernel/arm/NegroniBacklight.cpp
+index 026e2f0..2b79f9b 100644
+--- a/iokit/Kernel/arm/NegroniBacklight.cpp
++++ b/iokit/Kernel/arm/NegroniBacklight.cpp
+@@ -138,6 +138,10 @@ static uint32_t negroni_dsi_failures, negroni_dsi_mdp_waits;
+ static IOLock *negroni_dsi_set_lock;    /* 0268: a whole command set (negroni_dsi_dcs_set_ex) */
+ static volatile void *negroni_dsi_mem;  /* 0268: NDSI_MEM_PA, write-combined (NULL: no memory DMA) */
+ static bool negroni_dsi_mem_off;        /* 0268: a memory DMA failed: FIFO packets only from then on */
++/* 0292: bsd/dev/negroni_dsi.c, command sets in batched memory DMAs (negronifb_dsidma) */
++#define NEGRONI_DSI_DMA_NOT_USED        (-100)
++extern "C" int negroni_dsi_dma_set(const uint8_t *set, uint32_t len, bool lp, uint32_t *sent, uint32_t *resume);
++extern "C" int negroni_dsi_dma_write(const uint8_t *buf, uint32_t len, bool lp);
+ 
+ static inline uint32_t
+ ndsi_rd(uint32_t off)
+@@ -364,6 +368,13 @@ negroni_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp)
+ 	if (len == 0 || len > NDSI_MAX_PAYLOAD) {
+ 		return -1;
+ 	}
++	if (!negroni_dsi_panic) {
++		/* 0292: negronifb_dsidma=2 sends single writes through the memory DMA too */
++		int drc = negroni_dsi_dma_write(buf, len, lp);
++		if (drc != NEGRONI_DSI_DMA_NOT_USED) {
++			return drc;
++		}
++	}
+ 	return negroni_dsi_packet(len == 1 ? 0x05 : len == 2 ? 0x15 : 0x39, buf, len, lp);
+ }
+ 
+@@ -392,6 +403,33 @@ negroni_dsi_dcs_set_ex(const uint8_t *set, uint32_t len, bool lp, uint32_t flags
+ 	if (negroni_dsi_set_lock != NULL) {
+ 		IOLockLock(negroni_dsi_set_lock);
+ 	}
++	if (!(flags & NDSI_SET_SKIP_LONG)) {
++		/*
++		 * 0292: negronifb_dsidma>=1: the set as Android sends it (memory fetch, batched up to the
++		 * packet without the 0x40 batch flag). If the memory DMA fails midway, the packets from
++		 * byte offset `resume` on go out one by one below.
++		 */
++		uint32_t dsent = 0, resume = 0;
++		rc = negroni_dsi_dma_set(set, len, lp, &dsent, &resume);
++		if (rc != NEGRONI_DSI_DMA_NOT_USED) {
++			for (uint32_t k = 0, n = 0; k + 7 <= len && n < dsent; n++) {
++				uint32_t plen = (uint32_t)set[k + 5] << 8 | set[k + 6];
++				r.longSent += (set[k] == 0x39 || set[k] == 0x29 || set[k] == 0x0a) && plen > NDSI_MAX_PAYLOAD;
++				k += 7 + plen;
++			}
++			r.packets = r.sent = dsent;
++			if (negroni_dsi_set_lock != NULL) {
++				IOLockUnlock(negroni_dsi_set_lock);
++			}
++			if (res != NULL) {
++				*res = r;
++			}
++			return rc;
++		}
++		rc = 0;
++		i = resume;
++		r.packets = r.sent = dsent;
++	}
+ 	while (i + 7 <= len) {
+ 		uint8_t type = set[i], wait = set[i + 4];
+ 		uint32_t plen = (uint32_t)set[i + 5] << 8 | set[i + 6];
+@@ -458,6 +496,64 @@ negroni_dsi_long_packet(uint8_t dt, const uint8_t *buf, uint32_t len, bool lp)
+ 	return negroni_dsi_packet(dt, buf, len, lp);
+ }
+ 
++/* 0292: the DSI0 registers, the lock and the state for bsd/dev/negroni_dsi.c (batched DMA, reads). */
++extern "C" volatile uint32_t *
++negroni_dsi_base(void)
++{
++	return negroni_dsi;
++}
++
++/* Take the DSI lock (not in the panic path); false (lock not held) when the DSI is off or dead. */
++extern "C" bool
++negroni_dsi_enter(void)
++{
++	if (negroni_dsi == NULL) {
++		return false;
++	}
++	if (!negroni_dsi_panic) {
++		IOLockLock(negroni_dsi_lock);
++	}
++	if (negroni_dsi_dead) {
++		if (!negroni_dsi_panic) {
++			IOLockUnlock(negroni_dsi_lock);
++		}
++		return false;
++	}
++	return true;
++}
++
++extern "C" void
++negroni_dsi_leave(void)
++{
++	if (!negroni_dsi_panic) {
++		IOLockUnlock(negroni_dsi_lock);
++	}
++}
++
++extern "C" bool
++negroni_dsi_in_panic(void)
++{
++	return negroni_dsi_panic;
++}
++
++/* 0268's command buffer (NULL: not mapped or a memory DMA failed); *pa = its physical address. */
++extern "C" volatile uint8_t *
++negroni_dsi_cmdbuf(uint64_t *pa)
++{
++	if (negroni_dsi_mem == NULL || negroni_dsi_mem_off) {
++		return NULL;
++	}
++	*pa = NDSI_MEM_PA;
++	return (volatile uint8_t *)negroni_dsi_mem;
++}
++
++/* A memory DMA failed (negroni_dsi.c): 0268's long packets stop using it too. */
++extern "C" void
++negroni_dsi_cmdbuf_failed(void)
++{
++	negroni_dsi_mem_off = true;
++}
++
+ /* ---------------------------------------------------------------------- */
+ /* AppleARMBacklight                                                       */
+ /* ---------------------------------------------------------------------- */
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index c274fb1..60524b9 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -1328,8 +1328,11 @@ AppleCLCD::teInit(void)
+ 				return;
+ 			}
+ 			fVrrMode = vrr;
+-			/* Android sends the timing-switch sets in dsi_hs_mode, the brightness in LP (0250 default) */
+-			fVrrHS = hs < 0 ? vrr == 2 : hs != 0;
++			/*
++			 * Android sends the timing-switch sets and the min-fps set in dsi_hs_mode (live.dts
++			 * 35650-35651, 35693-35699), the brightness in LP (0250 default). 0292: HS for mode 1 too.
++			 */
++			fVrrHS = hs < 0 ? true : hs != 0;
+ 			fVrrIdleAbs = negroni_fb_us_abs((uint64_t)(ms < 200 ? 200 : ms) * 1000ull);
+ 			if (vrr == 2) {
+ 				fVrrFps = fps == 90 ? 90 : 60;

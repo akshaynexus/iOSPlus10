@@ -1,0 +1,363 @@
+0296: DPU/DSI power: probe of what the UEFI left on, and Android's no-transfer idle
+(negronifb_idle=2: auto-refresh off when idle, CTL_START per new frame) (bsd/dev/negroni_dpu.c)
+
+negronifb_pwrprobe=1 (read-only): GDSC mdss/mdss_int2, DISP_CC branch CBCRs and RCGs of the DT
+mdss/dsi0 clock lists, GCC disp_ahb/hf_axi/sf_axi/xo, DSI0 clock/lane state, INTF_1 auto-refresh.
+negronifb_idle=2 (default 0): after negronifb_idle_ms (58) without a swap Android's autorefresh
+disable sequence 1 (TE off, AUTOREFRESH_CONFIG bit 31 off, wait for no transfer, TE on); each new
+frame then gets one CTL_START at the next tick (after its GPU copy), the next one waits for that
+transfer (one TE + 200 lines + no wr_ptr line, at most 50 ms). Display off restores the
+auto-refresh. 3 kicks without an INTF frame-count step restore the auto-refresh for the boot.
+No clock is gated. Logs: "NEGRONI DPU PWR: ...", "NEGRONI DPU IDLE: ..." (per second).
+
+diff --git a/bsd/dev/negroni_dpu.c b/bsd/dev/negroni_dpu.c
+index 2920409..12e08e4 100644
+--- a/bsd/dev/negroni_dpu.c
++++ b/bsd/dev/negroni_dpu.c
+@@ -295,13 +295,334 @@ ndpu_teirq_tick(uint64_t now)
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------------- */
++/* 0296: DPU/DSI power: what the UEFI left on, and the no-transfer idle     */
++/* ---------------------------------------------------------------------- */
++
++/*
++ * Android (display-drivers): per frame sde_core_perf_crtc_update (sde_core_perf.c:984: core clock
++ * and bandwidth votes); per DSI command dsi_ctrl_transfer_prepare (dsi_ctrl.c:3560-3605: all DSI
++ * clocks on, command engine on); after IDLE_POWERCOLLAPSE_DURATION (66 - 8 = 58 ms,
++ * sde_encoder.h:55) without a commit _sde_encoder_rc_idle (sde_encoder.c:2207-2262): IRQs off,
++ * DSI clocks off, pm_runtime_put (MDSS GDSC), bandwidth released (sde_core_perf.c:786).
++ * Android has no auto-refresh in normal use: no commit = no transfer, the panel shows its RAM.
++ *
++ * Registers read by negronifb_pwrprobe=1 (read-only, mapped and unmapped again):
++ *   DISP_CC 0x0af00000 (live.dts clock-controller@af00000; offsets Linux dispcc-sm8450.c):
++ *   GDSC mdss 0x9000 (live.dts gdsc@af09000), mdss_int2 0xb000 (gdsc@af0b000): bit 31 PWR_ON,
++ *   bit 1 HW_CONTROL, bit 0 SW_COLLAPSE. Branch CBCRs (bit 31 CLK_OFF, bit 0 CLK_ENABLE):
++ *   the MDP clock list of live.dts mdss_mdp (gcc_iface/gcc_bus/gcc_nrt_bus, iface = ahb 0x80a4,
++ *   branch = mdp 0x800c, core = mdp_clk_src, vsync 0x8024, lut 0x801c, rot 0x8014), the DSI0
++ *   list of live.dts dsi_ctrl0 (byte0 0x8028, byte0_intf 0x802c, pclk0 0x8004, esc0 0x8038),
++ *   plus non_gdsc_ahb 0xc004, rscc_ahb 0xc00c, rscc_vsync 0xc008, mdp1 0xa004, ahb1 0xa020.
++ *   RCGs (CMD_RCGR bit 31 ROOT_OFF; CFG_RCGR = CMD + 4: [10:8] source, [4:0] 2 x divider - 1):
++ *   mdp 0x80ec, byte0 0x8134, pclk0 0x80bc, esc0 0x816c, vsync 0x811c.
++ *   GCC 0x00100000 (Linux gcc-sm8450.c / out op-kernel gcc-waipio.c): disp_ahb 0x37004,
++ *   disp_hf_axi 0x3700c, disp_sf_axi 0x37014, disp_xo 0x3701c.
++ *   The bandwidth votes (RPMh BCMs MM0/SH0 via the interconnects of live.dts mdss_mdp) are not
++ *   readable from here [I: XBL's display driver votes them and leaves them].
++ *
++ * negronifb_idle=2 (default 0): Android's no-transfer idle. After negronifb_idle_ms (default 58)
++ * without a swap, the auto-refresh goes off with Android's sequence 1
++ * (_sde_encoder_autorefresh_disable_seq1, sde_encoder_phys_cmd.c:2015-2046: TE disconnected
++ * (SYNC_CONFIG_VSYNC bit 20), AUTOREFRESH_CONFIG bit 31 cleared, poll until no transfer runs
++ * (_sde_encoder_phys_cmd_is_ongoing_pptx :798-830: INTF_TEAR_LINE_COUNT between 1 and vdisplay
++ * - 1), TE connected). From then on every new frame is sent once: at the tick after the frame
++ * is in the panel memory (and its GPU copy done) the CTL of INTF_1 gets CTL_START
++ * (sde_encoder_phys_cmd_trigger_start :2161-2182, sde_hw_ctl.c:327-334, CTL + 0x1c); the
++ * hardware starts the transfer at the next TE (tearcheck). The next kick waits until that
++ * transfer is over (the "pp_done" of Android, here: one TE passed, more than 200 lines past it,
++ * no transfer running; at most 50 ms). With no new frame nothing goes over the link and the DPU
++ * fetches nothing: the panel self-refreshes from its RAM. The display going off turns the
++ * auto-refresh back on (the 0275 black frame and the 0258 sleep need no kick); after the wake
++ * the idle delay starts again. Refused with negronifb_vrr=1 or 3 (they own AUTOREFRESH_CONFIG),
++ * with negronifb_dbuf (0269) or negronifb_zerocopy (0234) (their flips are taken by the next
++ * auto-refresh frame) and without the 0234 DPU mapping. 0268's wake pauses and resumes the
++ * auto-refresh itself; the display is in the auto-refresh state then (display off restored it). No clock is gated: see the probe lines and
++ * README-gpu-kernel.md section 26 for what may be dropped in this state.
++ */
++#define NDPU_DISPCC_PA                  0x0af00000ul
++#define NDPU_DISPCC_LEN                 0x10000ul
++#define NDPU_GCC_DISP_PA                0x00134000ul    /* 16 KiB page with GCC 0x137004..0x13701c */
++#define NDPU_GCC_DISP_LEN               0x4000ul
++#define NDPU_CTL_START                  0x01c
++#define NDPU_INTF_FRAME_COUNT           0x0ac   /* sde_hw_intf.c get_vsync_info: frames the INTF sent */
++#define NDPU_SYNC_TE_PIN                (1u << 20)
++#define NDPU_AR_ENABLE                  (1u << 31)
++#define NDPU_VDISPLAY                   2412u
++#define NDPU_KICK_TIMEOUT_MS            50
++#define NDPU_PPTX_POLL_US               200
++#define NDPU_PPTX_TIMEOUT_US            20000
++
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++
++enum { kNdpuAuto = 0, kNdpuKick };
++static uint32_t ndpu_idle_mode, ndpu_idle_state, ndpu_kicked_id, ndpu_kick_frame, ndpu_ar_saved;
++static bool ndpu_inflight, ndpu_fc_works;
++static uint32_t ndpu_kick_fc, ndpu_dead_kicks;
++static uint64_t ndpu_idle_abs, ndpu_kick_abs, ndpu_kick_timeout_abs, ndpu_idle_sec_t0;
++static uint32_t ndpu_kicks, ndpu_kick_busy, ndpu_kick_timeouts, ndpu_entries, ndpu_wakes;
++static uint64_t ndpu_kick_total;
++
++static void
++ndpu_power_probe(void)
++{
++	static const struct { const char *name; uint32_t off; } br[] = {
++		{ "ahb", 0x80a4 }, { "mdp", 0x800c }, { "vsync", 0x8024 }, { "lut", 0x801c }, { "rot", 0x8014 },
++		{ "byte0", 0x8028 }, { "byte0_intf", 0x802c }, { "pclk0", 0x8004 }, { "esc0", 0x8038 },
++		{ "non_gdsc_ahb", 0xc004 }, { "rscc_ahb", 0xc00c }, { "rscc_vsync", 0xc008 }, { "mdp1", 0xa004 },
++		{ "ahb1", 0xa020 }, { "byte1", 0x8030 }, { "pclk1", 0x8008 }, { "esc1", 0x803c },
++	};
++	static const struct { const char *name; uint32_t off; } rcg[] = {
++		{ "mdp", 0x80ec }, { "byte0", 0x8134 }, { "pclk0", 0x80bc }, { "esc0", 0x816c }, { "vsync", 0x811c },
++	};
++	static const struct { const char *name; uint32_t off; } gcc[] = {
++		{ "disp_ahb", 0x37004 }, { "disp_hf_axi", 0x3700c }, { "disp_sf_axi", 0x37014 }, { "disp_xo", 0x3701c },
++	};
++	char line[640];
++	int n;
++	vm_offset_t cc = ml_io_map_unmappable(NDPU_DISPCC_PA, NDPU_DISPCC_LEN, 0x7);
++	if (cc == 0) {
++		printf("NEGRONI DPU PWR: DISP_CC not mapped\n");
++		return;
++	}
++	uint32_t g0 = ndpu_rd(cc + 0x9000), g1 = ndpu_rd(cc + 0xb000);
++	printf("NEGRONI DPU PWR: GDSC mdss 0x%08x (%s, hw_ctrl %u, sw_collapse %u) mdss_int2 0x%08x (%s, hw_ctrl %u, sw_collapse %u)\n",
++	    g0, (g0 >> 31) ? "on" : "OFF", (g0 >> 1) & 1u, g0 & 1u, g1, (g1 >> 31) ? "on" : "OFF", (g1 >> 1) & 1u, g1 & 1u);
++	n = snprintf(line, sizeof(line), "NEGRONI DPU PWR: DISP_CC branches");
++	for (uint32_t i = 0; i < sizeof(br) / sizeof(br[0]) && n < (int)sizeof(line); i++) {
++		uint32_t v = ndpu_rd(cc + br[i].off);
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " %s 0x%08x %s", br[i].name, v, (v >> 31) ? "off" : "ON");
++	}
++	printf("%s\n", line);
++	n = snprintf(line, sizeof(line), "NEGRONI DPU PWR: DISP_CC RCGs (cmd/cfg)");
++	for (uint32_t i = 0; i < sizeof(rcg) / sizeof(rcg[0]) && n < (int)sizeof(line); i++) {
++		uint32_t c = ndpu_rd(cc + rcg[i].off), f = ndpu_rd(cc + rcg[i].off + 4);
++		n += snprintf(line + n, sizeof(line) - (size_t)n, " %s 0x%08x/0x%08x (%s src %u div %u.%u)", rcg[i].name, c, f,
++		    (c >> 31) ? "root off" : "on", (f >> 8) & 7u, ((f & 0x1fu) + 1) / 2, ((f & 0x1fu) + 1) % 2 ? 5 : 0);
++	}
++	printf("%s\n", line);
++	ml_io_unmap(cc, NDPU_DISPCC_LEN);
++	vm_offset_t g = ml_io_map_unmappable(NDPU_GCC_DISP_PA, NDPU_GCC_DISP_LEN, 0x7);
++	if (g != 0) {
++		n = snprintf(line, sizeof(line), "NEGRONI DPU PWR: GCC");
++		for (uint32_t i = 0; i < sizeof(gcc) / sizeof(gcc[0]); i++) {
++			uint32_t v = ndpu_rd(g + gcc[i].off - (NDPU_GCC_DISP_PA - 0x100000ul));
++			n += snprintf(line + n, sizeof(line) - (size_t)n, " %s 0x%08x %s", gcc[i].name, v, (v >> 31) ? "off" : "ON");
++		}
++		printf("%s\n", line);
++		ml_io_unmap(g, NDPU_GCC_DISP_LEN);
++	}
++	volatile uint32_t *dsi = negroni_dsi_base();
++	if (dsi != NULL) {
++		printf("NEGRONI DPU PWR: DSI0 ctrl 0x%08x status 0x%08x clk_ctrl 0x%08x clk_status 0x%08x lane_status 0x%08x "
++		    "lane_ctrl 0x%08x int_ctrl 0x%08x\n", dsi[0x004 / 4], dsi[0x008 / 4], dsi[0x11c / 4], dsi[0x120 / 4],
++		    dsi[0x0a8 / 4], dsi[0x0ac / 4], dsi[0x110 / 4]);
++	}
++	if (ndpu_mdss != 0) {
++		printf("NEGRONI DPU PWR: INTF_1 autorefresh 0x%08x sync_cfg 0x%08x, CTL 0x%x flush 0x%08x\n",
++		    ndpu_rd(ndpu_mdss + NDPU_INTF1 + NDPU_INTF_TEAR_AUTOREFRESH),
++		    ndpu_rd(ndpu_mdss + NDPU_INTF1 + NDPU_INTF_TEAR_SYNC_CONFIG_VSYNC), ndpu_ctl,
++		    ndpu_ctl != 0 ? ndpu_rd(ndpu_mdss + ndpu_ctl + 0x18) : 0);
++	}
++}
++
++static bool
++ndpu_pptx_ongoing(uintptr_t intf)
++{
++	uint32_t wr = ndpu_rd(intf + NDPU_INTF_TEAR_LINE_COUNT) & 0xffffu;
++	return wr > 0 && wr < NDPU_VDISPLAY;
++}
++
++static void
++ndpu_idle_init(void)
++{
++	uint32_t mode = 0, ms = 58, probe = 0, vrr = 0, dbuf = 0, zc = 0;
++
++	PE_parse_boot_argn("negronifb_idle", &mode, sizeof(mode));
++	PE_parse_boot_argn("negronifb_idle_ms", &ms, sizeof(ms));
++	PE_parse_boot_argn("negronifb_pwrprobe", &probe, sizeof(probe));
++	PE_parse_boot_argn("negronifb_vrr", &vrr, sizeof(vrr));
++	PE_parse_boot_argn("negronifb_dbuf", &dbuf, sizeof(dbuf));
++	PE_parse_boot_argn("negronifb_zerocopy", &zc, sizeof(zc));
++	if (probe != 0 || mode != 0) {
++		ndpu_power_probe();
++	}
++	if (mode == 0) {
++		return;
++	}
++	if (mode != 2) {
++		printf("NEGRONI DPU IDLE: negronifb_idle=%u unknown (2 = no-transfer idle): off\n", mode);
++		return;
++	}
++	if (ndpu_mdss == 0 || ndpu_ctl == 0) {
++		printf("NEGRONI DPU IDLE: no DPU mapping or CTL (0234 probe off): off\n");
++		return;
++	}
++	if (vrr == 1 || vrr == 3) {
++		printf("NEGRONI DPU IDLE: negronifb_vrr=%u owns the auto-refresh: off\n", vrr);
++		return;
++	}
++	if (dbuf != 0 || zc != 0) {
++		/* 0269 / 0234 flips wait for an auto-refresh frame to take their CTL_FLUSH */
++		printf("NEGRONI DPU IDLE: negronifb_dbuf=%u / negronifb_zerocopy=%u flip under the auto-refresh: off\n", dbuf, zc);
++		return;
++	}
++	uint32_t ar = ndpu_rd(ndpu_mdss + NDPU_INTF1 + NDPU_INTF_TEAR_AUTOREFRESH);
++	if (!(ar & NDPU_AR_ENABLE)) {
++		printf("NEGRONI DPU IDLE: auto-refresh 0x%08x is off already (not the UEFI state): off\n", ar);
++		return;
++	}
++	ndpu_ar_saved = ar;
++	/* does the INTF frame counter count the auto-refresh frames? then it proves each kick sent one */
++	uint32_t fc0 = ndpu_rd(ndpu_mdss + NDPU_INTF1 + NDPU_INTF_FRAME_COUNT);
++	delay(30000);
++	uint32_t fc1 = ndpu_rd(ndpu_mdss + NDPU_INTF1 + NDPU_INTF_FRAME_COUNT);
++	ndpu_fc_works = fc1 != fc0;
++	ms = ms < 20 ? 20 : ms;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &ndpu_idle_abs);
++	nanoseconds_to_absolutetime((uint64_t)NDPU_KICK_TIMEOUT_MS * NSEC_PER_MSEC, &ndpu_kick_timeout_abs);
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &ndpu_sec_abs);
++	ndpu_idle_mode = 2;
++	printf("NEGRONI DPU IDLE: mode 2: after %u ms without a swap the auto-refresh (0x%08x) goes off and each new frame "
++	    "gets one CTL_START (CTL 0x%x); display off = auto-refresh on; INTF frame count %u -> %u in 30 ms (%s)\n", ms, ar,
++	    ndpu_ctl, fc0, fc1, ndpu_fc_works ? "kicks are checked" : "no kick check");
++}
++
++/* Android's _sde_encoder_autorefresh_disable_seq1. */
++static void
++ndpu_idle_enter(uint32_t presentedID)
++{
++	uintptr_t intf = ndpu_mdss + NDPU_INTF1;
++	uint32_t cfg = ndpu_rd(intf + NDPU_INTF_TEAR_SYNC_CONFIG_VSYNC);
++	uint32_t ar = ndpu_rd(intf + NDPU_INTF_TEAR_AUTOREFRESH), us = 0;
++
++	ndpu_wr(intf + NDPU_INTF_TEAR_SYNC_CONFIG_VSYNC, cfg & ~NDPU_SYNC_TE_PIN);
++	ndpu_wr(intf + NDPU_INTF_TEAR_AUTOREFRESH, ar & ~NDPU_AR_ENABLE);
++	__builtin_arm_dsb(0xf);
++	do {
++		delay(NDPU_PPTX_POLL_US);
++		us += NDPU_PPTX_POLL_US;
++	} while (ndpu_pptx_ongoing(intf) && us < NDPU_PPTX_TIMEOUT_US);
++	ndpu_wr(intf + NDPU_INTF_TEAR_SYNC_CONFIG_VSYNC, cfg);
++	__builtin_arm_dsb(0xf);
++	ndpu_idle_state = kNdpuKick;
++	ndpu_kicked_id = presentedID;   /* the auto-refresh has sent it */
++	ndpu_inflight = false;
++	ndpu_entries++;
++	if (ndpu_entries <= 4 || us >= NDPU_PPTX_TIMEOUT_US) {
++		printf("NEGRONI DPU IDLE: auto-refresh off (0x%08x -> 0x%08x), transfer over after %u us%s (entry %u)\n", ar,
++		    ndpu_rd(intf + NDPU_INTF_TEAR_AUTOREFRESH), us, us >= NDPU_PPTX_TIMEOUT_US ? " (TIMEOUT)" : "", ndpu_entries);
++	}
++}
++
++static void
++ndpu_idle_tick(uint64_t now, uint64_t lastSwapAbs, uint32_t presentedID, bool frameDone, bool powerOff)
++{
++	uintptr_t intf = ndpu_mdss + NDPU_INTF1;
++
++	if (ndpu_idle_mode != 2) {
++		return;
++	}
++	if (powerOff) {
++		if (ndpu_idle_state == kNdpuKick) {
++			ndpu_wr(intf + NDPU_INTF_TEAR_AUTOREFRESH, ndpu_ar_saved);
++			__builtin_arm_dsb(0xf);
++			ndpu_idle_state = kNdpuAuto;
++			ndpu_wakes++;
++			if (ndpu_wakes <= 4) {
++				printf("NEGRONI DPU IDLE: display off: auto-refresh on again (0x%08x)\n", ndpu_ar_saved);
++			}
++		}
++		return;
++	}
++	if (ndpu_idle_state == kNdpuAuto) {
++		if (lastSwapAbs != 0 && now > lastSwapAbs && now - lastSwapAbs >= ndpu_idle_abs) {
++			ndpu_idle_enter(presentedID);
++		}
++		return;
++	}
++	if (ndpu_rd(intf + NDPU_INTF_TEAR_AUTOREFRESH) & NDPU_AR_ENABLE) {
++		/* someone turned the auto-refresh on again (0268's re-init wake): back to that state */
++		ndpu_idle_state = kNdpuAuto;
++		ndpu_inflight = false;
++		return;
++	}
++	uint32_t v = ndpu_rd(intf + NDPU_INTF_TEAR_INT_COUNT_VAL);
++	uint32_t frame = v >> 16, line = v & 0xffffu;
++	if (ndpu_inflight) {
++		bool teSince = frame != ndpu_kick_frame;
++		bool past = line >= ndpu_te_init + 200 || (ndpu_te_init == 0 && line > 200);
++		bool over = teSince && past && !ndpu_pptx_ongoing(intf);
++		if (over || now - ndpu_kick_abs > ndpu_kick_timeout_abs) {
++			ndpu_inflight = false;
++			ndpu_kick_timeouts += !over;
++			if (ndpu_fc_works && ndpu_rd(intf + NDPU_INTF_FRAME_COUNT) == ndpu_kick_fc) {
++				if (++ndpu_dead_kicks >= 3) {
++					/* CTL_START sent nothing three times: the screen would freeze; back to the UEFI state */
++					ndpu_wr(intf + NDPU_INTF_TEAR_AUTOREFRESH, ndpu_ar_saved);
++					__builtin_arm_dsb(0xf);
++					ndpu_idle_state = kNdpuAuto;
++					ndpu_idle_mode = 0;
++					printf("NEGRONI DPU IDLE: 3 kicks sent no frame (INTF frame count %u): auto-refresh on, idle mode off\n",
++					    ndpu_kick_fc);
++					return;
++				}
++			} else {
++				ndpu_dead_kicks = 0;
++			}
++		} else {
++			if (presentedID != ndpu_kicked_id) {
++				ndpu_kick_busy++;       /* a new frame waits for the transfer of the one before */
++			}
++			return;
++		}
++	}
++	if (presentedID != ndpu_kicked_id && frameDone) {
++		ndpu_kick_fc = ndpu_rd(intf + NDPU_INTF_FRAME_COUNT);
++		ndpu_wr(ndpu_mdss + ndpu_ctl + NDPU_CTL_START, 1);
++		__builtin_arm_dsb(0xf);
++		ndpu_kicked_id = presentedID;
++		ndpu_kick_frame = frame;
++		ndpu_kick_abs = now;
++		ndpu_inflight = true;
++		ndpu_kicks++;
++		ndpu_kick_total++;
++	}
++}
++
++static void
++ndpu_idle_log(uint64_t now)
++{
++	if (ndpu_idle_mode != 2) {
++		return;
++	}
++	if (ndpu_idle_sec_t0 == 0) {
++		ndpu_idle_sec_t0 = now;
++		return;
++	}
++	if (now - ndpu_idle_sec_t0 < ndpu_sec_abs) {
++		return;
++	}
++	ndpu_idle_sec_t0 = now;
++	printf("NEGRONI DPU IDLE: %s, kicks/s %u (busy %u, timeouts %u), %llu kicks, %u idle entries, auto-refresh 0x%08x\n",
++	    ndpu_idle_state == kNdpuKick ? "no auto-refresh (kick per frame)" : "auto-refresh", ndpu_kicks, ndpu_kick_busy,
++	    ndpu_kick_timeouts, ndpu_kick_total, ndpu_entries, ndpu_rd(ndpu_mdss + NDPU_INTF1 + NDPU_INTF_TEAR_AUTOREFRESH));
++	ndpu_kicks = ndpu_kick_busy = ndpu_kick_timeouts = 0;
++}
++
+ /* NegroniFramebuffer.cpp AppleCLCD::start: mdss = 0234's MDSS mapping (0: none), ctlOff = its CTL. */
+ void
+ negroni_dpu_start(uintptr_t mdss, uint32_t ctlOff)
+ {
+ 	ndpu_mdss = mdss;
+ 	ndpu_ctl = ctlOff;
++	if (ndpu_te_init == 0 && mdss != 0) {
++		ndpu_te_init = ndpu_rd(mdss + NDPU_INTF1 + NDPU_INTF_TEAR_VSYNC_INIT_VAL) & 0xffffu;
++	}
+ 	ndpu_teirq_init();
++	ndpu_idle_init();
+ }
+ 
+ /*
+@@ -310,8 +631,9 @@ negroni_dpu_start(uintptr_t mdss, uint32_t ctlOff)
+  * frameDone: that frame's GPU copy is done; powerOff: RequestPowerChange(0).
+  */
+ void
+-negroni_dpu_tick(uint64_t now, __unused uint64_t lastSwapAbs, __unused uint32_t presentedID, __unused bool frameDone,
+-    __unused bool powerOff)
++negroni_dpu_tick(uint64_t now, uint64_t lastSwapAbs, uint32_t presentedID, bool frameDone, bool powerOff)
+ {
+ 	ndpu_teirq_tick(now);
++	ndpu_idle_tick(now, lastSwapAbs, presentedID, frameDone, powerOff);
++	ndpu_idle_log(now);
+ }

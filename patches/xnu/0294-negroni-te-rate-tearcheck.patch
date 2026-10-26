@@ -1,0 +1,134 @@
+0294: tearcheck vsync_count follows the panel rate on a 0259 mode 2 switch (new bsd/dev/negroni_dpu.c;
+one hunk in NegroniFramebuffer.cpp vrrSetRate)
+
+sde_encoder_phys_cmd.c:1240-1259: vsync_count = 19.2 MHz / (vtotal 2424 x fps): 66 (120 Hz),
+88 (90 Hz), 132 (60 Hz). SYNC_CONFIG_VSYNC written with the counter off (bit 19), then on, as
+sde_hw_intf.c:646-658 (TE pin bit 20 kept); 0259's
+line time (fTeLineNs) follows. Only runs with negronifb_vrr=2; negronifb_tcfg=0 turns it off.
+Log: "NEGRONI DPU: tearcheck vsync_count 66 -> 132 for 60 Hz (sync_cfg 0x... -> 0x...)".
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7d2aac5..aa0ace9 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/negroni_dsi.c			standard
++bsd/dev/negroni_dpu.c			standard
+ bsd/dev/negroni_ufs.c			standard
+ bsd/dev/negroni_audio_guard.c		standard
+ bsd/dev/negroni_tfa.c			standard
+diff --git a/bsd/dev/negroni_dpu.c b/bsd/dev/negroni_dpu.c
+new file mode 100644
+index 0000000..56d1182
+--- /dev/null
++++ b/bsd/dev/negroni_dpu.c
+@@ -0,0 +1,82 @@
++/*
++ * NEGRONI display engine (SM8450 DPU / SDE 8.x, INTF_1 = DSI0) work that the UEFI's setup does
++ * not cover (0294-0296). Register layout: display-drivers msm/sde (sde_hw_intf.c, sde_hw_ctl.c,
++ * sde_hw_interrupts.c, sde_hwio.h); addresses: out/live.dts qcom,mdss_mdp@ae00000 (MDSS 0x0ae00000,
++ * qcom,sde-intf-off[1] 0x36000, qcom,sde-intf-tear-irq-off[1] 0x36800).
++ *
++ * 0294: the tearcheck vsync_count follows the panel rate (sde_encoder_phys_cmd.c:1240-1259:
++ * vsync_count = vsync_clk / (vtotal * vrefresh), vsync_clk 19.2 MHz, vtotal 2424 = 2412 + 2 + 8 + 2
++ * in every FHD timing, live.dts 35640/35729/35818): 120 Hz 66, 90 Hz 88, 60 Hz 132.
++ * sde_hw_intf.c:622-666 writes SYNC_CONFIG_VSYNC (bit 20 TE pin, bit 19 counter enable,
++ * [18:0] vsync_count) and the other tearcheck registers; only vsync_count changes here (written
++ * with the counter off, then the counter on, as :646-658), the other registers keep the UEFI's
++ * values (height 0xfff0, init = start = 2412).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <stdbool.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++#define NDPU_INTF_TEAR_SYNC_CONFIG_VSYNC        0x288
++#define NDPU_TE_VSYNC_CLK_HZ                    19200000u
++#define NDPU_VTOTAL                             2424u
++
++uint32_t negroni_dpu_te_rate(uintptr_t intf, uint32_t fps);
++
++static int ndpu_tcfg = -1;              /* negronifb_tcfg (default 1) */
++static uint32_t ndpu_boot_count;        /* vsync_count as the UEFI left it (120 Hz) */
++
++static inline uint32_t
++ndpu_rd(uintptr_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++ndpu_wr(uintptr_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++/*
++ * 0294, from 0259's vrrSetRate (mode 2 switch, work loop / thread call): program vsync_count for
++ * fps. Returns the new line time in ns (0: not changed). negronifb_tcfg=0 turns it off.
++ */
++uint32_t
++negroni_dpu_te_rate(uintptr_t intf, uint32_t fps)
++{
++	if (ndpu_tcfg < 0) {
++		uint32_t on = 1;
++		PE_parse_boot_argn("negronifb_tcfg", &on, sizeof(on));
++		ndpu_tcfg = on != 0;
++	}
++	if (!ndpu_tcfg || intf == 0 || fps == 0 || fps > 240) {
++		return 0;
++	}
++	uint32_t cfg = ndpu_rd(intf + NDPU_INTF_TEAR_SYNC_CONFIG_VSYNC);
++	if (ndpu_boot_count == 0) {
++		ndpu_boot_count = cfg & 0x7ffffu;
++	}
++	/* Android's formula when the UEFI value is the 120 Hz one of vtotal 2424, else scale it */
++	uint32_t count = ndpu_boot_count == NDPU_TE_VSYNC_CLK_HZ / (NDPU_VTOTAL * 120u) ?
++	    NDPU_TE_VSYNC_CLK_HZ / (NDPU_VTOTAL * fps) : ndpu_boot_count * 120u / fps;
++	if (count == 0 || count > 0x7ffffu) {
++		return 0;
++	}
++	if ((cfg & 0x7ffffu) != count) {
++		/*
++		 * sde_hw_intf_setup_te_config (sde_hw_intf.c:646-658): the new count with the vsync
++		 * counter off (bit 19), then the counter on again; the TE pin bit 20 stays as it is
++		 */
++		uint32_t nc = (cfg & ~0x7ffffu & ~(1u << 19)) | count;
++		ndpu_wr(intf + NDPU_INTF_TEAR_SYNC_CONFIG_VSYNC, nc);
++		__builtin_arm_dsb(0xf);
++		ndpu_wr(intf + NDPU_INTF_TEAR_SYNC_CONFIG_VSYNC, nc | (cfg & (1u << 19)));
++		__builtin_arm_dsb(0xf);
++		printf("NEGRONI DPU: tearcheck vsync_count %u -> %u for %u Hz (sync_cfg 0x%08x -> 0x%08x)\n",
++		    cfg & 0x7ffffu, count, fps, cfg, ndpu_rd(intf + NDPU_INTF_TEAR_SYNC_CONFIG_VSYNC));
++	}
++	return (uint32_t)((uint64_t)count * 1000000000ull / NDPU_TE_VSYNC_CLK_HZ);
++}
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index c3d2601..024333f 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -1531,6 +1531,8 @@ AppleCLCD::vrrCall(thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	((AppleCLCD *)p0)->vrrWork();
+ }
+ 
++extern "C" uint32_t negroni_dpu_te_rate(uintptr_t intf, uint32_t fps);    /* bsd/dev/negroni_dpu.c (0294) */
++
+ /* Mode 2: the tick, CoreAnimation's interval and the refresh property follow the panel rate. */
+ void
+ AppleCLCD::vrrSetRate(uint32_t fps)
+@@ -1541,6 +1543,11 @@ AppleCLCD::vrrSetRate(uint32_t fps)
+ 	fTickAbs = ticks;
+ 	fStatLateAbs = ticks / 2;
+ 	fTePeriodUs = 0;        /* measured again at the new rate */
++	/* 0294: the tearcheck vsync_count for the new rate, as Android re-runs tearcheck_config */
++	uint32_t lineNs = negroni_dpu_te_rate(fIntf, fps);
++	if (lineNs != 0) {
++		fTeLineNs = lineNs;
++	}
+ 	if (fRefreshTicks != 0) {
+ 		fRefreshTicks = ticks;
+ 		OSDictionary *refresh = OSDictionary::withCapacity(2);

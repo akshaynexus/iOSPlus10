@@ -1,0 +1,419 @@
+0295: the TE as an interrupt: INTF_1 tear rd_ptr on the MDSS line (GIC SPI 83 = INTID 115)
+(pexpert/arm/pe_fiq.c negroni_spi_register/dispatch, osfmk/arm64/sleh.c dispatch, bsd/dev/negroni_dpu.c,
+hooks in NegroniFramebuffer.cpp start, vsyncFired and teTick)
+
+negronifb_teirq=1 (default 0): the MDP top / INTF_1 interrupt enables are cleared like
+sde_core_irq_preinstall, RD_PTR_IRQ = VSYNC_INIT_VAL + 1 (Android), the tear EN gets RD_PTR, the SPI
+is routed to the calling CPU. Each rd_ptr interrupt stamps the TE (time minus the lines past init);
+0259's TE lock takes its phase from it. A non-tear source masks the SPI until the next tick; more
+than 1000 interrupts in a second turn it off. The 0254 timer remains the tick. Logs: "NEGRONI DPU TE
+IRQ: before: ...", "... on: INTID 115 ...", per second "NEGRONI DPU TE IRQ: irqs/s N rd_ptr N
+foreign N (masked N) TE-to-handler us avg/max N/N".
+
+diff --git a/bsd/dev/negroni_dpu.c b/bsd/dev/negroni_dpu.c
+index 56d1182..2920409 100644
+--- a/bsd/dev/negroni_dpu.c
++++ b/bsd/dev/negroni_dpu.c
+@@ -80,3 +80,238 @@ negroni_dpu_te_rate(uintptr_t intf, uint32_t fps)
+ 	}
+ 	return (uint32_t)((uint64_t)count * 1000000000ull / NDPU_TE_VSYNC_CLK_HZ);
+ }
++
++/* ---------------------------------------------------------------------- */
++/* 0295: the TE as an interrupt (INTF_1 tear rd_ptr)                       */
++/* ---------------------------------------------------------------------- */
++
++/*
++ * Android's vsync is the rd_ptr interrupt of the INTF tearcheck (sde_encoder_phys_cmd.c:313-424
++ * sde_encoder_phys_cmd_te_rd_ptr_irq, a ktime stamp per TE). Path: INTF_1 tear interrupt block
++ * (MDSS + 0x36800: EN +0x0, STATUS +0x4, CLEAR +0x8, sde_hw_interrupts.c:24-26; bits 0 autorefresh
++ * done, 1 wr_ptr, 2 rd_ptr, 3 TE detected, 4 tear detected, :184-188) -> the MDSS interrupt
++ * (HW_INTR_STATUS MDSS + 0x10, :20; bit 0 MDP, bit 4 DSI0 per live.dts dsi_ctrl0 interrupts <4>)
++ * -> GIC SPI 83 = INTID 115, level high (live.dts mdss_mdp interrupts <0 0x53 4>). The line
++ * fires at RD_PTR_IRQ (Android: vdisplay + 1 = VSYNC_INIT_VAL + 1, sde_encoder_phys_cmd.c:1268).
++ * Like Android's sde_core_irq_preinstall, the other MDP top / INTF_1 interrupt enables are cleared
++ * (nothing handles them). The DSI0 interrupt enables are not touched (0250 polls their status):
++ * when the line comes from a non-tear source the handler masks the SPI, and the next vsync tick
++ * unmasks it (at most one tick without the TE interrupt).
++ *
++ * negronifb_teirq=1 (default 0; needs the 0234 DPU mapping, negronifb_dpuprobe=1 default):
++ * each TE is stamped at the interrupt (the rd_ptr time minus the lines the counter is past
++ * VSYNC_INIT_VAL), and 0259's TE lock (negronifb_te) takes its phase from that stamp instead of
++ * the counter sample. The vsync tick itself stays the 0254 timer (a TE interrupt cannot touch an
++ * IOTimerEventSource); its deadline moves by the lock as before. negronifb_teirq_intid=N
++ * overrides 115. Per second (with the STAT lines): `NEGRONI DPU TE IRQ: ...`. A storm (more than
++ * 1000 interrupts in a second) turns it off for the boot.
++ */
++#define NDPU_MDSS_HW_INTR_STATUS        0x0010
++#define NDPU_MDP_INTR2_EN               0x1008
++#define NDPU_MDP_INTR_EN                0x1010
++#define NDPU_MDP_INTR_STATUS            0x1014
++#define NDPU_MDP_INTR_CLEAR             0x1018
++#define NDPU_MDP_INTR2_STATUS           0x100c
++#define NDPU_MDP_INTR2_CLEAR            0x102c
++#define NDPU_INTF1                      0x36000
++#define NDPU_INTF1_INTR_EN              (NDPU_INTF1 + 0x1c0)
++#define NDPU_INTF1_INTR_STATUS          (NDPU_INTF1 + 0x1c4)
++#define NDPU_INTF1_INTR_CLEAR           (NDPU_INTF1 + 0x1c8)
++#define NDPU_INTF_TEAR_VSYNC_INIT_VAL   0x294
++#define NDPU_INTF_TEAR_INT_COUNT_VAL    0x298
++#define NDPU_INTF_TEAR_RD_PTR_IRQ       0x2a4
++#define NDPU_INTF_TEAR_LINE_COUNT       0x2b0
++#define NDPU_INTF_TEAR_AUTOREFRESH      0x2b4
++#define NDPU_TEAR_INTR_EN               0x36800
++#define NDPU_TEAR_INTR_STATUS           0x36804
++#define NDPU_TEAR_INTR_CLEAR            0x36808
++#define NDPU_TEAR_RD_PTR                (1u << 2)
++#define NDPU_TEAR_ALL                   0x1fu
++#define NDPU_MDSS_INTID_DEFAULT         115     /* SPI 83 */
++#define NDPU_IRQ_STORM                  1000
++
++extern int negroni_spi_register(uint32_t intid, bool edge, void (*fn)(void *, uint32_t), void *arg);
++extern void negroni_spi_enable(uint32_t intid, bool on);
++extern volatile uint32_t *negroni_dsi_base(void);     /* NegroniBacklight.cpp (0292) */
++
++void negroni_dpu_start(uintptr_t mdss, uint32_t ctlOff);
++bool negroni_dpu_te_since(uint64_t now, uint64_t *sinceNs);
++void negroni_dpu_tick(uint64_t now, uint64_t lastSwapAbs, uint32_t presentedID, bool frameDone, bool powerOff);
++
++static uintptr_t ndpu_mdss;             /* 0234's MDSS mapping (0x84000) */
++static uint32_t ndpu_ctl;               /* CTL block offset driving INTF_1 (0234 probe) */
++static uint32_t ndpu_intid;
++static bool ndpu_irq_on, ndpu_irq_dead;
++static volatile bool ndpu_irq_masked;
++static uint32_t ndpu_te_init, ndpu_line_ns;
++static uint64_t ndpu_line_abs;          /* one tearcheck line in mach ticks x 1024 */
++static volatile uint64_t ndpu_te_abs;   /* the last TE, from the rd_ptr interrupt */
++static volatile uint32_t ndpu_irqs, ndpu_rdptr, ndpu_foreign, ndpu_masks;
++static uint32_t ndpu_irqs_sec;
++static uint64_t ndpu_sec_t0, ndpu_sec_abs, ndpu_stale_abs;
++static volatile uint64_t ndpu_lat_sum_abs, ndpu_lat_max_abs;
++
++/* Interrupt context (sleh_irq -> negroni_spi_dispatch). */
++static void
++ndpu_mdss_irq(__unused void *arg, uint32_t intid)
++{
++	uint64_t now = mach_absolute_time();
++	uint32_t st = ndpu_rd(ndpu_mdss + NDPU_TEAR_INTR_STATUS);
++
++	ndpu_irqs++;
++	if (st != 0) {
++		ndpu_wr(ndpu_mdss + NDPU_TEAR_INTR_CLEAR, st);
++		__builtin_arm_dsb(0xf);
++	}
++	if (st & NDPU_TEAR_RD_PTR) {
++		/* the TE was (line - init) lines before now */
++		uint32_t v = ndpu_rd(ndpu_mdss + NDPU_INTF1 + NDPU_INTF_TEAR_INT_COUNT_VAL);
++		uint32_t line = v & 0xffffu, lines = line >= ndpu_te_init ? line - ndpu_te_init : 0;
++		uint64_t back = (uint64_t)lines * ndpu_line_abs / 1024;
++		ndpu_te_abs = now - back;
++		ndpu_rdptr++;
++		ndpu_lat_sum_abs += back;
++		if (back > ndpu_lat_max_abs) {
++			ndpu_lat_max_abs = back;
++		}
++	} else {
++		/* not ours (DSI0 command done while 0250 polls, or another MDP source): mask until the next tick */
++		ndpu_foreign++;
++		ndpu_masks++;
++		ndpu_irq_masked = true;
++		negroni_spi_enable(intid, false);
++	}
++}
++
++/* 0259 teTick (work loop): the time since the last TE from the interrupt, if it is fresh. */
++bool
++negroni_dpu_te_since(uint64_t now, uint64_t *sinceNs)
++{
++	uint64_t te = ndpu_te_abs;
++
++	if (!ndpu_irq_on || te == 0 || now < te || now - te > ndpu_stale_abs) {
++		return false;
++	}
++	absolutetime_to_nanoseconds(now - te, sinceNs);
++	return true;
++}
++
++static void
++ndpu_teirq_init(void)
++{
++	uint32_t on = 0, intid = NDPU_MDSS_INTID_DEFAULT;
++
++	PE_parse_boot_argn("negronifb_teirq", &on, sizeof(on));
++	PE_parse_boot_argn("negronifb_teirq_intid", &intid, sizeof(intid));
++	if (!on) {
++		return;
++	}
++	if (ndpu_mdss == 0) {
++		printf("NEGRONI DPU TE IRQ: no DPU mapping (0234 probe off: negronifb_dpuprobe=0): off\n");
++		return;
++	}
++	uintptr_t intf = ndpu_mdss + NDPU_INTF1;
++	uint32_t cfg = ndpu_rd(intf + NDPU_INTF_TEAR_SYNC_CONFIG_VSYNC);
++	uint32_t count = cfg & 0x7ffffu;
++	ndpu_te_init = ndpu_rd(intf + NDPU_INTF_TEAR_VSYNC_INIT_VAL) & 0xffffu;
++	ndpu_line_ns = (uint32_t)((uint64_t)count * 1000000000ull / NDPU_TE_VSYNC_CLK_HZ);
++	uint64_t abs1000;
++	nanoseconds_to_absolutetime((uint64_t)ndpu_line_ns * 1024, &abs1000);
++	ndpu_line_abs = abs1000;
++	nanoseconds_to_absolutetime(25 * NSEC_PER_MSEC, &ndpu_stale_abs);   /* > 2 periods at 90 Hz */
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &ndpu_sec_abs);
++	volatile uint32_t *dsi = negroni_dsi_base();
++	uint32_t rdptr = ndpu_rd(intf + NDPU_INTF_TEAR_RD_PTR_IRQ) & 0xffffu;
++	printf("NEGRONI DPU TE IRQ: before: mdss intr 0x%08x, top en 0x%08x/0x%08x status 0x%08x/0x%08x, intf1 en 0x%08x "
++	    "status 0x%08x, tear en 0x%08x status 0x%08x, rd_ptr_irq %u init %u vsync_count %u, dsi0 int_ctrl 0x%08x\n",
++	    ndpu_rd(ndpu_mdss + NDPU_MDSS_HW_INTR_STATUS), ndpu_rd(ndpu_mdss + NDPU_MDP_INTR_EN),
++	    ndpu_rd(ndpu_mdss + NDPU_MDP_INTR2_EN), ndpu_rd(ndpu_mdss + NDPU_MDP_INTR_STATUS),
++	    ndpu_rd(ndpu_mdss + NDPU_MDP_INTR2_STATUS), ndpu_rd(ndpu_mdss + NDPU_INTF1_INTR_EN),
++	    ndpu_rd(ndpu_mdss + NDPU_INTF1_INTR_STATUS), ndpu_rd(ndpu_mdss + NDPU_TEAR_INTR_EN),
++	    ndpu_rd(ndpu_mdss + NDPU_TEAR_INTR_STATUS), rdptr, ndpu_te_init, count, dsi != NULL ? dsi[0x110 / 4] : 0);
++	if (count == 0 || ndpu_te_init == 0) {
++		printf("NEGRONI DPU TE IRQ: tearcheck not set up (vsync_count %u, init %u): off\n", count, ndpu_te_init);
++		return;
++	}
++	/* sde_core_irq_preinstall: everything off and cleared, then only the rd_ptr */
++	ndpu_wr(ndpu_mdss + NDPU_MDP_INTR_EN, 0);
++	ndpu_wr(ndpu_mdss + NDPU_MDP_INTR2_EN, 0);
++	ndpu_wr(ndpu_mdss + NDPU_INTF1_INTR_EN, 0);
++	ndpu_wr(ndpu_mdss + NDPU_MDP_INTR_CLEAR, 0xffffffffu);
++	ndpu_wr(ndpu_mdss + NDPU_MDP_INTR2_CLEAR, 0xffffffffu);
++	ndpu_wr(ndpu_mdss + NDPU_INTF1_INTR_CLEAR, 0xffffffffu);
++	ndpu_wr(ndpu_mdss + NDPU_TEAR_INTR_EN, 0);
++	ndpu_wr(ndpu_mdss + NDPU_TEAR_INTR_CLEAR, NDPU_TEAR_ALL);
++	if (rdptr != ndpu_te_init + 1) {
++		ndpu_wr(intf + NDPU_INTF_TEAR_RD_PTR_IRQ, ndpu_te_init + 1);     /* Android: vdisplay + 1 */
++	}
++	__builtin_arm_dsb(0xf);
++	ndpu_intid = intid;
++	if (negroni_spi_register(intid, false, ndpu_mdss_irq, NULL) != 0) {
++		printf("NEGRONI DPU TE IRQ: INTID %u not registered (no GIC distributor or no slot): off\n", intid);
++		return;
++	}
++	ndpu_irq_on = true;
++	ndpu_wr(ndpu_mdss + NDPU_TEAR_INTR_EN, NDPU_TEAR_RD_PTR);
++	__builtin_arm_dsb(0xf);
++	printf("NEGRONI DPU TE IRQ: on: INTID %u (SPI %u, level), INTF_1 tear rd_ptr at line %u (was %u), %u ns/line; "
++	    "0259's TE lock takes its phase from it\n", intid, intid - 32, ndpu_te_init + 1, rdptr, ndpu_line_ns);
++}
++
++/* Work loop, each tick: unmask after a foreign interrupt, the per-second line, the storm guard. */
++static void
++ndpu_teirq_tick(uint64_t now)
++{
++	if (!ndpu_irq_on) {
++		return;
++	}
++	if (ndpu_irq_masked) {
++		ndpu_irq_masked = false;
++		negroni_spi_enable(ndpu_intid, true);
++	}
++	if (ndpu_sec_t0 == 0) {
++		ndpu_sec_t0 = now;
++		return;
++	}
++	if (now - ndpu_sec_t0 < ndpu_sec_abs) {
++		return;
++	}
++	uint32_t irqs = ndpu_irqs - ndpu_irqs_sec, rd = ndpu_rdptr, fo = ndpu_foreign, ma = ndpu_masks;
++	ndpu_irqs_sec = ndpu_irqs;
++	ndpu_rdptr = ndpu_foreign = ndpu_masks = 0;
++	uint64_t lat = ndpu_lat_sum_abs, latMax = ndpu_lat_max_abs, ns, nsMax;
++	ndpu_lat_sum_abs = ndpu_lat_max_abs = 0;
++	absolutetime_to_nanoseconds(rd != 0 ? lat / rd : 0, &ns);
++	absolutetime_to_nanoseconds(latMax, &nsMax);
++	ndpu_sec_t0 = now;
++	printf("NEGRONI DPU TE IRQ: irqs/s %u rd_ptr %u foreign %u (masked %u) TE-to-handler us avg/max %llu/%llu\n",
++	    irqs, rd, fo, ma, ns / 1000, nsMax / 1000);
++	if (irqs > NDPU_IRQ_STORM) {
++		ndpu_irq_on = false;
++		ndpu_irq_dead = true;
++		negroni_spi_enable(ndpu_intid, false);
++		ndpu_wr(ndpu_mdss + NDPU_TEAR_INTR_EN, 0);
++		printf("NEGRONI DPU TE IRQ: %u interrupts in a second: off for this boot (the timer path stays)\n", irqs);
++	}
++}
++
++/* NegroniFramebuffer.cpp AppleCLCD::start: mdss = 0234's MDSS mapping (0: none), ctlOff = its CTL. */
++void
++negroni_dpu_start(uintptr_t mdss, uint32_t ctlOff)
++{
++	ndpu_mdss = mdss;
++	ndpu_ctl = ctlOff;
++	ndpu_teirq_init();
++}
++
++/*
++ * NegroniFramebuffer.cpp vsyncFired, each tick, before the frame is taken (no fLock).
++ * lastSwapAbs: the last SwapEnd; presentedID: the last swap id written to the panel memory;
++ * frameDone: that frame's GPU copy is done; powerOff: RequestPowerChange(0).
++ */
++void
++negroni_dpu_tick(uint64_t now, __unused uint64_t lastSwapAbs, __unused uint32_t presentedID, __unused bool frameDone,
++    __unused bool powerOff)
++{
++	ndpu_teirq_tick(now);
++}
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 024333f..3aabb9e 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -201,6 +201,9 @@ enum {
+ 
+ void negroni_backlight_attach(IOService *provider);            /* NegroniBacklight.cpp */
+ extern "C" void negroni_dsi_esd_start(void);                   /* bsd/dev/negroni_dsi.c (0293) */
++extern "C" void negroni_dpu_start(uintptr_t mdss, uint32_t ctlOff);       /* bsd/dev/negroni_dpu.c (0295) */
++extern "C" bool negroni_dpu_te_since(uint64_t now, uint64_t *sinceNs);
++extern "C" void negroni_dpu_tick(uint64_t now, uint64_t lastSwapAbs, uint32_t presentedID, bool frameDone, bool powerOff);
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -868,6 +871,7 @@ AppleCLCD::start(IOService *provider)
+ 	registerService();
+ 	negroni_backlight_attach(this);
+ 	negroni_dsi_esd_start();        /* 0293: negronifb_esd (bsd/dev/negroni_dsi.c) */
++	negroni_dpu_start(fMdss, fZCCtl);       /* 0295/0296: bsd/dev/negroni_dpu.c (TE interrupt, power) */
+ 	IOLog("NEGRONI FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+@@ -886,6 +890,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fTeMode != 0 && !fb->fPowerOff) {
+ 		fb->teTick(now);        /* 0259: where is the panel's TE relative to this tick */
+ 	}
++	/* 0295/0296 (bsd/dev/negroni_dpu.c): TE interrupt upkeep; negronifb_idle=2 kicks and idle entry */
++	negroni_dpu_tick(now, fb->fLastSwapAbs, fb->fPresentedID, NegroniGPUFenceDone(fb->fLastGPUFence), fb->fPowerOff);
+ 	fb->zeroCopyRetire(true);       /* the engine took the last flip: the frame before goes back */
+ 	fb->shiftTick();                /* 0256: a clock shift left over from a slow GPU copy */
+ 	fb->dbufTick(true);             /* 0269: a taken flip; the newest finished copy to the pipes */
+@@ -1412,6 +1418,7 @@ AppleCLCD::teTick(uint64_t now)
+ 		return;
+ 	}
+ 	uint64_t sinceTeNs = (uint64_t)(line - fTeInit) * fTeLineNs;
++	(void)negroni_dpu_te_since(now, &sinceTeNs);    /* 0295 negronifb_teirq=1: the rd_ptr interrupt's TE stamp */
+ 	if (sinceTeNs > 2ull * periodUs * 1000ull) {
+ 		fTeNoSample++;
+ 		return;                 /* the counter ran past a frame: no TE came */
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 356cca8..c0b3a5a 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1944,6 +1944,10 @@ negroni_dump_kernel_threads(void)
+ }
+ #endif /* NEGRONI */
+ 
++#if defined(NEGRONI)
++extern bool negroni_spi_dispatch(uint32_t intid);      /* pexpert/arm/pe_fiq.c (0295) */
++#endif
++
+ void
+ sleh_irq(arm_saved_state_t *state)
+ {
+@@ -2005,7 +2009,9 @@ sleh_irq(arm_saved_state_t *state)
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+-		if (cdp->interrupt_handler) {
++		if (negroni_spi_dispatch(intid)) {
++			/* 0295: a negroni driver's SPI (pexpert/arm/pe_fiq.c) */
++		} else if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+ 			    cdp->interrupt_nub,
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 41e1c65..4753012 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include <stdint.h>
++#include <stdbool.h>
+ #include <libkern/section_keywords.h>
+ #include <arm64/proc_reg.h>
+ #include <kern/clock.h>
+@@ -52,6 +53,86 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ #define gicr_write32(offset, data) (_gic_write32(gicr_pe_base + (offset), (data)))
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
+ 
++#if defined(NEGRONI)
++/*
++ * 0295: shared peripheral interrupts for negroni drivers. This port has no IOKit interrupt
++ * controller for the GIC (sleh_irq takes the timer and the IPI itself), so a driver registers
++ * a handler for its SPI here and sleh_irq calls it in interrupt context before the EOI. The
++ * handler must clear its device's level before it returns. GICv3 distributor (Arm IHI 0069):
++ * IGROUPR 0x080 (Group 1 NS; RAZ/WI from the non-secure side when the secure side owns the
++ * grouping, as GICR_IGROUPR0 above), ISENABLER 0x100, ICENABLER 0x180, ICPENDR 0x280,
++ * IPRIORITYR 0x400 (byte per INTID), ICFGR 0xc00 (2 bits per INTID, 0b10 edge),
++ * IROUTER 0x6000 (64 bits per INTID, affinity, mode 0 = this PE).
++ */
++#define NEGRONI_SPI_SLOTS       4
++typedef void (*negroni_spi_handler_t)(void *arg, uint32_t intid);
++static struct {
++	uint32_t                intid;
++	negroni_spi_handler_t   fn;
++	void                    *arg;
++} negroni_spi[NEGRONI_SPI_SLOTS];
++static uint32_t negroni_spi_used;
++
++int negroni_spi_register(uint32_t intid, bool edge, negroni_spi_handler_t fn, void *arg);
++void negroni_spi_enable(uint32_t intid, bool on);
++bool negroni_spi_dispatch(uint32_t intid);
++
++void
++negroni_spi_enable(uint32_t intid, bool on)
++{
++	if (gicd_base == 0 || intid < 32 || intid >= 1020) {
++		return;
++	}
++	gicd_write32((on ? 0x100 : 0x180) + 4 * (intid / 32), 1u << (intid % 32));
++	__builtin_arm_dsb(0xf);
++}
++
++/* Thread context. 0 = registered and enabled, routed to the calling CPU. */
++int
++negroni_spi_register(uint32_t intid, bool edge, negroni_spi_handler_t fn, void *arg)
++{
++	if (gicd_base == 0 || intid < 32 || intid >= 1020 || fn == NULL || negroni_spi_used >= NEGRONI_SPI_SLOTS) {
++		return -1;
++	}
++	uint32_t n = intid / 32, bit = 1u << (intid % 32);
++	gicd_write32(0x180 + 4 * n, bit);
++	gicd_write32(0x080 + 4 * n, gicd_read32(0x080 + 4 * n) | bit);
++	*(volatile uint8_t *)(gicd_base + 0x400 + intid) = 0xa0;
++	uint32_t c = gicd_read32(0xc00 + 4 * (intid / 16)), sh = 2 * (intid % 16);
++	c = (c & ~(3u << sh)) | (edge ? 2u << sh : 0u);
++	gicd_write32(0xc00 + 4 * (intid / 16), c);
++	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++	*(volatile uint64_t *)(gicd_base + 0x6000 + 8 * (vm_offset_t)intid) = (mpidr & 0xffffffull) | ((mpidr >> 32) & 0xffull) << 32;
++	gicd_write32(0x280 + 4 * n, bit);
++	uint32_t slot = negroni_spi_used;
++	negroni_spi[slot].intid = intid;
++	negroni_spi[slot].arg = arg;
++	__atomic_store_n(&negroni_spi[slot].fn, fn, __ATOMIC_RELEASE);
++	__atomic_store_n(&negroni_spi_used, slot + 1, __ATOMIC_RELEASE);
++	__builtin_arm_dsb(0xf);
++	gicd_write32(0x100 + 4 * n, bit);
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++	return 0;
++}
++
++/* sleh_irq, interrupt context: true when a registered handler took intid. */
++bool
++negroni_spi_dispatch(uint32_t intid)
++{
++	uint32_t used = __atomic_load_n(&negroni_spi_used, __ATOMIC_ACQUIRE);
++	for (uint32_t i = 0; i < used; i++) {
++		negroni_spi_handler_t fn = __atomic_load_n(&negroni_spi[i].fn, __ATOMIC_ACQUIRE);
++		if (negroni_spi[i].intid == intid && fn != NULL) {
++			fn(negroni_spi[i].arg, intid);
++			return true;
++		}
++	}
++	return false;
++}
++#endif /* NEGRONI */
++
+ static vm_offset_t
+ find_gicr_pe_base()
+ {
