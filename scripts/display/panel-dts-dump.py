@@ -6,6 +6,7 @@ arrays in patches/xnu/0259-negroni-display-te-vrr.patch.
 
   scripts/display/panel-dts-dump.py                 the whole node, one packet per line
   scripts/display/panel-dts-dump.py --sets          C arrays of the FHD timing-switch sets (0259)
+  scripts/display/panel-dts-dump.py --on            C arrays of the FHD 120 Hz on-command and the 0x0A PPS (0268)
   scripts/display/panel-dts-dump.py --dts FILE --panel NAME
 """
 import argparse
@@ -45,7 +46,7 @@ def to_bytes(val):
     return None
 
 
-def packets(b):
+def packets(b, strict=True):
     i = 0
     out = []
     while i + 7 <= len(b):
@@ -53,6 +54,8 @@ def packets(b):
         out.append(b[i:i + 7 + n])
         i += 7 + n
     if i != len(b):
+        if not strict:
+            return None
         raise SystemExit("packet framing error (%d of %d bytes)" % (i, len(b)))
     return out
 
@@ -78,18 +81,22 @@ def dump(lines, start, end):
             print("   %d %s = %s" % (ln + 1, k, v[:60]))
             continue
         print("   %d %s (%d bytes)" % (ln + 1, k, len(b)))
-        for p in packets(b):
+        pk = packets(b, strict=False)
+        if pk is None:
+            print("      (not in the packet format: %s)" % b.hex(" "))
+            continue
+        for p in pk:
             print("      %02x fl=%02x wait=%d: %s" % (p[0], p[3], p[4], p[7:].hex(" ")))
 
 
-def c_array(lines, start, end, timing, prop="qcom,mdss-dsi-timing-switch-command"):
+def c_array(lines, start, end, timing, prop="qcom,mdss-dsi-timing-switch-command", name=None):
     s, e = node_lines(lines[start:end + 1], timing)
     for ln in range(start + s, start + e + 1):
         l = lines[ln].strip()
         if l.startswith(prop + " ="):
             b = to_bytes(l.split("=", 1)[1])
             pk = packets(b)
-            name = "negroni_vrr_switch_" + timing.split("_")[-1]
+            name = name or "negroni_vrr_switch_" + timing.split("_")[-1]
             print("/* out/live.dts line %d: %s %s (%d bytes, %d packets) */" % (ln + 1, timing, prop, len(b), len(pk)))
             print("static const uint8_t %s[%d] = {" % (name, len(b)))
             for p in pk:
@@ -99,14 +106,41 @@ def c_array(lines, start, end, timing, prop="qcom,mdss-dsi-timing-switch-command
     raise SystemExit("no %s in %s" % (prop, timing))
 
 
+UEFI_XML = os.path.join(REPO, "external", "Mu-Silicium-negroni", "Binaries", "negroni", "RawFiles",
+                        "Panel_samsung_amb670yf08_1440_3216_dsc_cmd.xml")
+
+
+def pps_array(xml):
+    """The DSC PPS (128 bytes) as the UEFI sends it: the first DSIInitSequence line is 39 9E + PPS."""
+    seq = open(xml).read().split("<DSIInitSequence>")[1].strip().split("\n")[0].split()
+    if seq[:2] != ["39", "9E"]:
+        raise SystemExit("the first UEFI init packet is not 39 9E (PPS)")
+    b = bytes(int(t, 16) for t in seq[2:])
+    if len(b) != 128:
+        raise SystemExit("UEFI PPS is %d bytes, expected 128" % len(b))
+    print("/* %s DSIInitSequence line 1: 39 9E + the DSC 1.2 PPS (128 bytes, version 0x%02x); */" %
+          (os.path.relpath(xml, REPO), b[0]))
+    print("/* sent as the MIPI PPS packet (0x0A) after the on-command, as dsi_panel_update_pps does */")
+    print("static const uint8_t negroni_panel_pps[128] = {")
+    for i in range(0, 128, 16):
+        print("\t" + " ".join("0x%02x," % x for x in b[i:i + 16]))
+    print("};")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dts", default=os.path.join(REPO, "out", "live.dts"))
     ap.add_argument("--panel", default=PANEL)
     ap.add_argument("--sets", action="store_true", help="C arrays of the fhd_sdc_120/90/60 switch sets")
+    ap.add_argument("--on", action="store_true", help="C arrays of the fhd_sdc_120 on-command and the UEFI PPS")
+    ap.add_argument("--xml", default=UEFI_XML)
     a = ap.parse_args()
     lines = open(a.dts).read().split("\n")
     start, end = node_lines(lines, a.panel)
+    if a.on:
+        c_array(lines, start, end, "timing@fhd_sdc_120", "qcom,mdss-dsi-on-command", "negroni_panel_on_command")
+        pps_array(a.xml)
+        return
     if a.sets:
         for t in ("timing@fhd_sdc_120", "timing@fhd_sdc_90", "timing@fhd_sdc_60"):
             c_array(lines, start, end, t)

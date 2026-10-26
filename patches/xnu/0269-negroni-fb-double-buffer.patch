@@ -1,0 +1,628 @@
+From: iOSPlus10 display agent (dpu)
+Subject: [PATCH] negroni fb: panel double buffering with a DPU base flip (0269)
+
+The UEFI auto-refresh scans one buffer (the panel memory 0xb8000000) on every TE, and the
+GPU 2D copy (0231/0267) or the CPU copy writes that same buffer at a phase the scan does
+not know: tearing, and a CPU copy can race a GPU copy still in flight (README-gpu-kernel.md
+section 18; audit docs/audit/2026-10-26-display.md 2.1 and 3.1).
+
+negronifb_dbuf=1 (default 0): three panel buffers (negronifb_dbufn=2|3): the panel memory
+and two more after it in the splash region (0xb89f0000, 0xb93e0000, 0x9f0000 each). A
+one-layer full-panel frame goes into a free buffer; when its copy is done (GPU fence, or at
+once for the CPU) the pipes get its address: SSPP_SRC0_ADDR of the pipe(s) the 0234 probe
+found fetching the panel memory + CTL_FLUSH (pipe bits + CTL bit 17) of the CTL driving
+INTF_1 (sde_hw_sspp.c:925-948, sde_hw_ctl.c:685-711, sspp_tbl :78-79). The engine takes
+the flush at the next auto-refresh frame start, so a whole frame shows, never half a copy.
+The buffer shown before is free once CTL_FLUSH reads back clear. Other frames (several
+layers, part of the panel) wait until nothing is outstanding and are drawn into the shown
+buffer (single-buffer way). Two buffers would cap the GPU path at 60 frames/s (flip one
+tick after the copy, the old buffer free one tick after the flip).
+
+- vsyncFired: dbufTick at the tick start and end (latch, flip the newest finished copy;
+  not while presentFinish or a 0256 shift still draws into it), dbufTarget before a frame
+  is taken (no free buffer: the frame stays pending, "waits"), dbufQueued after present().
+- Display off: zeroCopyStop(true) parks (the 0275 black goes into the shown buffer, no
+  flip). Panic: the pipes go back to the panel memory (zeroCopyRestore) for the panic text.
+- A flip not taken in 1 s (not counted while the display is off or the 0268 wake has the
+  auto-refresh paused): double buffering off for the boot, pipes back on the panel memory.
+- NegroniGPU.cpp: one GPU mapping per panel buffer (4), kept; before, a new panelPhys
+  unmapped the old one while a copy into it could still be queued.
+- 0234's slots (zeroCopyInit slotSize) and its display-surface bound now end at NEGRONI_DB_END
+  (the splash end - 16 KiB): never into the 0268 DSI command buffer.
+- Off with zero-copy (0234 has the same splash space), without the 0234 probe
+  (negronifb_dpuprobe=0) or with an unexpected pipe layout.
+Logs: "NEGRONI FB: 0269 double buffering on: 3 panel buffers ...", the first 4 flips
+"NEGRONI FB: 0269 flip N: buffer B at 0x... (fence F), taken after N us", per second
+"NEGRONI FB DBUF: flips/s N waits N in-place N latch max us N (...)".
+
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 3803716..a9397d9 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -235,6 +235,16 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ #define CTL_FETCH_PIPE_ACTIVE             0xfc
+ #define CTL_FLUSH_CTL                     (1u << 17)
+ #define CTL_INTF_DSI0                     (1u << 1)       /* INTF_1 (qcom,sde-intf-type "dp dsi dsi dp") */
++/*
++ * 0269: panel double buffering. Up to NEGRONI_DB_MAX panel-size buffers in the splash region: the
++ * panel memory (ABL's, the console's) and the next ones after it, up to the 0268 DSI command
++ * buffer (the last 16 KiB). Not with zero-copy (0234 uses the same space for its slots; its slots
++ * and display surfaces also end at NEGRONI_DB_END now, whatever the page and row size).
++ */
++#define NEGRONI_DB_MAX                    3
++#define NEGRONI_DB_END                    (NEGRONI_SPLASH_END - 0x4000ULL)
++#define NEGRONI_DB_LATCH_TICKS            120     /* 1 s without the engine taking a flip: double buffering off */
++enum { kNegroniDbFree = 0, kNegroniDbPending, kNegroniDbFlipped, kNegroniDbShown };
+ 
+ 
+ /*
+@@ -542,7 +552,7 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+-	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
++	uintptr_t     fPixels;          /* kernel mapping of the panel memory (0269: of the buffer present() writes) */
+ 	IOMemoryMap  *fMap;
+ 	NegroniSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+@@ -590,6 +600,29 @@ public:
+ 	uint32_t      fZCNextID, fZCNextTicks;
+ 	uint32_t      fEndedID, fPresentedID;   /* swap ids: the last SwapEnd, the last one shown */
+ 	uint64_t      fZCFrames;
++	/*
++	 * 0269: panel double buffering (negronifb_dbuf). Work loop only; negroni_fb_panic reads fDbuf.
++	 * A buffer is free, pending (a copy into it queued: fence, 0 = the CPU's, done), flipped (its
++	 * address written to the pipes, the flush not taken yet) or shown. fPixels / fDrawPhys = the
++	 * buffer present() writes (fDbDraw).
++	 */
++	bool          fZCLayoutOk;    /* 0234's probe: one or two pipes fetch the panel memory as expected */
++	bool          fDbuf;
++	uint32_t      fDbN;
++	struct {
++		uint64_t        phys;
++		uintptr_t       pixels;
++		NegroniSurface *surface;
++		uint32_t        state, fence;
++		uint64_t        seq;
++	}             fDb[NEGRONI_DB_MAX];
++	int32_t       fDbShown, fDbFlipped, fDbTarget, fDbDraw;
++	uint64_t      fDbSeq, fDbFlipAt, fDbFlipsTotal;
++	uint32_t      fDbFlipTicks, fDbLogged;
++	uint64_t      fDrawPhys;
++	uint32_t      fStatDbFlips, fStatDbWaits, fStatDbInPlace;
++	uint64_t      fStatDbLatchMaxAbs;
++	bool          fArPaused;      /* 0268: the backlight's wake paused the auto-refresh (no frame start) */
+ 	/* per-second statistics (0252); counters written outside the work loop are atomic */
+ 	bool          fStats;
+ 	uint64_t      fStatLateAbs, fStatSecAbs;    /* 1.5 vsync periods, 1 s (absolute time) */
+@@ -680,6 +713,14 @@ public:
+ 	void zeroCopyRestore(void);
+ 	void zeroCopyStop(bool now);
+ 	void flip(NegroniSurface *s, uint32_t id);
++	void dbufInit(void);
++	bool dbufTarget(const uint8_t *rec);
++	void dbufQueued(uint32_t fence);
++	void dbufTick(bool tick);
++	void dbufFlip(int32_t i);
++	void dbufPark(void);
++	void dbufOff(const char *why);
++	bool dbufAnyPending(void);
+ 	IOReturn swapWait(uint32_t id);
+ };
+ 
+@@ -788,6 +829,7 @@ AppleCLCD::start(IOService *provider)
+ 	fVsync->wakeAtTime(fDeadline);
+ 	fTickNominalAbs = fTickAbs;
+ 	zeroCopyInit();
++	dbufInit();
+ 	teInit();
+ 	if (fIntf == 0 && fMdss == 0) {
+ 		/* 0268: the wake check reads the TE counter (negroni_fb_te_check) */
+@@ -841,6 +883,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	fb->zeroCopyRetire(true);       /* the engine took the last flip: the frame before goes back */
+ 	fb->shiftTick();                /* 0256: a clock shift left over from a slow GPU copy */
++	fb->dbufTick(true);             /* 0269: a taken flip; the newest finished copy to the pipes */
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -940,6 +983,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fStatSkips++;
+ 		}
+ 	}
++	if ((flush || older) && fb->fDbuf && !fb->dbufTarget(older ? fb->fOld : fb->fPending)) {
++		flush = older = false;          /* 0269: no panel buffer to write yet: the frame stays pending */
++	}
+ 	uint8_t *rec = NULL;
+ 	NegroniSurface *held[NEGRONI_FB_LAYERS] = {}, *gone[NEGRONI_FB_LAYERS] = {};
+ 	uint32_t fences[NEGRONI_FB_LAYERS] = {};
+@@ -984,6 +1030,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	} else if (rec != NULL) {
+ 		uint64_t t0 = mach_absolute_time();
+ 		uint32_t fence = fb->present(rec, held, fences);
++		fb->dbufQueued(fence);          /* 0269: that buffer flips when the copy is done */
+ 		uint64_t dt = mach_absolute_time() - t0;
+ 		fb->fStatCopyAbs += dt;
+ 		if (dt > fb->fStatCopyMaxAbs) {
+@@ -1024,6 +1071,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fStatCopyMaxAbs = dt;
+ 		}
+ 	}
++	fb->dbufTick(false);            /* 0269: a CPU copy (and its drawing) is done now: flip at once */
+ 	fb->rearm(sender);
+ }
+ 
+@@ -1165,6 +1213,13 @@ AppleCLCD::statTick(uint64_t now)
+ 	fStatT0 = now;
+ 	fStatCPU = fStatGPU = fStatZC = fStatLate = fStatSkips = fStatGaveUp = 0;
+ 	fStatCopyAbs = fStatCopyMaxAbs = 0;
++	if (fDbuf) {
++		IOLog("NEGRONI FB DBUF: flips/s %u waits %u in-place %u latch max us %llu (buffer %d shown, %d flipped, %llu flips)\n",
++		    fStatDbFlips, fStatDbWaits, fStatDbInPlace, negroni_fb_abs_us(fStatDbLatchMaxAbs), fDbShown, fDbFlipped,
++		    fDbFlipsTotal);
++		fStatDbFlips = fStatDbWaits = fStatDbInPlace = 0;
++		fStatDbLatchMaxAbs = 0;
++	}
+ 	if (fTeMode != 0 || fVrrMode != 0) {
+ 		teLog();
+ 	}
+@@ -2010,13 +2065,13 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 				if ((uint32_t)w > half) {
+ 					r[nr++] = { (uint32_t)sx + half, (uint32_t)sy, half, 0, (uint32_t)w - half, R };
+ 				}
+-				f = NegroniGPUPresentRects(s, fPhys, fRowBytes, fHeight, r, nr);
++				f = NegroniGPUPresentRects(s, fDrawPhys, fRowBytes, fHeight, r, nr);
+ 				if (f != 0) {
+ 					shiftedInCopy = true;
+ 					fClockCopyFrames++;
+ 				}
+ 			} else {
+-				f = NegroniGPUPresent(s, fPhys, fRowBytes, fHeight, (uint32_t)sx, (uint32_t)sy,
++				f = NegroniGPUPresent(s, fDrawPhys, fRowBytes, fHeight, (uint32_t)sx, (uint32_t)sy,
+ 				    (uint32_t)dx, (uint32_t)dy, (uint32_t)w, (uint32_t)h);
+ 			}
+ 			if (f != 0) {
+@@ -2221,8 +2276,9 @@ AppleCLCD::zeroCopyInit(void)
+ 		fZCFlush |= 1u << negroni_sspp_flush[fZCPipe[i]];
+ 	}
+ 	fZCFlush |= CTL_FLUSH_CTL;
++	fZCLayoutOk = why == NULL && fZCPipes != 0 && width == fWidth;     /* 0269 needs only this part */
+ 	uint64_t base = fPhys + round_page((uint64_t)fRowBytes * fHeight);
+-	uint64_t slotSize = trunc_page((NEGRONI_SPLASH_END - base) / NEGRONI_ZC_SLOTS);
++	uint64_t slotSize = trunc_page((NEGRONI_DB_END - base) / NEGRONI_ZC_SLOTS);    /* 0269: not into the 0268 DSI buffer */
+ 	if (why != NULL) {
+ 	} else if (fZCPipes == 0) {
+ 		why = "no pipe fetches the panel memory";
+@@ -2262,7 +2318,7 @@ AppleCLCD::zeroCopySurface(const uint8_t *rec)
+ 	}
+ 	NegroniSurface *s = negroni_surface_copy(get32(rec, 0x54));
+ 	if (s != NULL && (s->slot < 0 || s->width != fLogicalW || s->height != fLogicalH || s->phys == 0 ||
+-	    s->bytesPerRow > 0xffff || (s->bytesPerRow & 63) != 0 || s->phys + s->allocSize > NEGRONI_SPLASH_END)) {
++	    s->bytesPerRow > 0xffff || (s->bytesPerRow & 63) != 0 || s->phys + s->allocSize > NEGRONI_DB_END)) {
+ 		OSSafeReleaseNULL(s);
+ 	}
+ 	return s;
+@@ -2409,6 +2465,9 @@ AppleCLCD::zeroCopyStop(bool now)
+ 	NegroniSurface *shown = NULL, *next = NULL;
+ 	bool active = fZCActive;
+ 
++	if (now) {
++		dbufPark();     /* 0269: display off (0275 black, 0258 sleep): drawn into the shown buffer */
++	}
+ 	if (!active && fZCShown == NULL && fZCNext == NULL && !fZCNextValid) {
+ 		return;
+ 	}
+@@ -2506,6 +2565,306 @@ AppleCLCD::flip(NegroniSurface *s, uint32_t id)
+ 	}
+ }
+ 
++/* ---- panel double buffering (0269) ---- */
++
++/*
++ * negronifb_dbuf=1: present() writes a buffer the display engine does not fetch, and the pipes
++ * get that buffer's address once the copy is done, the way Android's commit does it
++ * (sde_hw_sspp_setup_sourceaddress sde_hw_sspp.c:925-948: SSPP_SRC0_ADDR; sde_hw_ctl_trigger_flush_v1
++ * sde_hw_ctl.c:685-711: CTL_FLUSH with the pipe's bit, sspp_tbl :78-79, and CTL bit 17; the engine
++ * takes the flushed registers at the next frame start). The UEFI's auto-refresh is the frame
++ * start here (no CTL_START: under auto-refresh Android does not kick either,
++ * sde_encoder_phys_cmd.c:2169-2175): a flip written before a TE is shown from that TE on, a whole
++ * frame, never half a copy. The buffers: the panel memory (ABL's, at the pipes' address) and
++ * negronifb_dbufn - 1 more (default 2: three in all) right after it in the splash region. Two
++ * buffers would let the GPU path reach 60 frames/s only: the copy into the back buffer ends some
++ * ms after the tick, the flip goes at the next tick, and the buffer that was shown is free only
++ * after that flip is taken, one tick later again. Pipes, CTL and flush bits come from 0234's probe
++ * (zeroCopyInit, read only). negronifb_dbuf=0 (default): one buffer, as before.
++ */
++void
++AppleCLCD::dbufInit(void)
++{
++	uint32_t on = 0, n = NEGRONI_DB_MAX;
++	const char *why = NULL;
++	uint64_t size = round_page((uint64_t)fRowBytes * fHeight);
++
++	fDrawPhys = fPhys;
++	fDbShown = 0;
++	fDbFlipped = fDbTarget = -1;
++	fDbDraw = 0;
++	fDb[0].phys = fPhys;
++	fDb[0].pixels = fPixels;
++	fDb[0].surface = fSurface;
++	fDb[0].state = kNegroniDbShown;
++	PE_parse_boot_argn("negronifb_dbuf", &on, sizeof(on));
++	PE_parse_boot_argn("negronifb_dbufn", &n, sizeof(n));
++	if (!on) {
++		IOLog("NEGRONI FB: 0269 double buffering off (negronifb_dbuf=0): one panel buffer\n");
++		return;
++	}
++	n = n < 2 ? 2 : (n > NEGRONI_DB_MAX ? NEGRONI_DB_MAX : n);
++	if (fMdss == 0 || !fZCLayoutOk) {
++		why = "the DPU probe found no pipe layout to flip (negronifb_dpuprobe=0, or see the NEGRONI FB: DPU lines)";
++	} else if (fZCReady) {
++		why = "zero-copy (negronifb_zerocopy=1) has the splash region";
++	} else if (fPhys + n * size > NEGRONI_DB_END) {
++		why = "no room in the splash region";
++	}
++	for (uint32_t i = 1; why == NULL && i < n; i++) {
++		fDb[i].phys = fPhys + i * size;
++		fDb[i].surface = negroni_surface_create_physical(fDb[i].phys, fWidth, fHeight, fRowBytes, NEGRONI_FB_FORMAT_BGRA);
++		fDb[i].pixels = fDb[i].surface != NULL ? fDb[i].surface->kernelAddress() : 0;
++		fDb[i].state = kNegroniDbFree;
++		if (fDb[i].pixels == 0) {
++			why = "a buffer cannot be mapped";
++		}
++	}
++	if (why != NULL) {
++		IOLog("NEGRONI FB: 0269 double buffering off: %s\n", why);
++		return;
++	}
++	fDbN = n;
++	fDbuf = true;
++	negroni_fb_zc = this;           /* the panic hook puts the pipes back on the panel memory */
++	IOLog("NEGRONI FB: 0269 double buffering on: %u panel buffers of 0x%llx at 0x%llx 0x%llx%s0x%llx, pipe(s) %s%s%s, "
++	    "CTL at +0x%x, flush bits 0x%x\n", n, size, fDb[0].phys, fDb[1].phys, n > 2 ? " " : "", n > 2 ? fDb[2].phys : 0ULL,
++	    negroni_sspp_name[fZCPipe[0]], fZCPipes > 1 ? "+" : "", fZCPipes > 1 ? negroni_sspp_name[fZCPipe[1]] : "",
++	    fZCCtl, fZCFlush);
++}
++
++bool
++AppleCLCD::dbufAnyPending(void)
++{
++	for (uint32_t i = 0; i < fDbN; i++) {
++		if (fDb[i].state == kNegroniDbPending) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * Which buffer this frame (rec) is written into; false: none yet, the frame stays pending (next
++ * tick). A frame of one layer that covers the whole panel goes into a free buffer; anything else
++ * (several layers, a part of the panel) is drawn over the picture on screen, so it waits until
++ * no copy and no flip is outstanding and then goes into the shown buffer (the old single-buffer
++ * way, rare: CoreAnimation sends full-canvas frames of one layer). A frame with the panel memory
++ * itself as a layer (GetLayerDefaultSurface) shows the panel memory. Work loop, fLock held.
++ */
++bool
++AppleCLCD::dbufTarget(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104), layers = 0;
++	int32_t last = -1;
++	bool panel = false, full = false;
++
++	fDbTarget = -1;
++	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		layers++;
++		last = (int32_t)layer;
++		panel = panel || (fSurface != NULL && id == fSurface->id);
++	}
++	if (!panel && layers == 1) {
++		/* present()'s mapping: logical -> panel coordinates, clipped at the left/top edge */
++		const uint8_t *a = rec + 0x64 + 16 * last, *b = rec + 0xc4 + 16 * last;
++		int32_t aw = (int32_t)get32(a, 8), ah = (int32_t)get32(a, 12);
++		int32_t dx = (int32_t)get32(b, 0) - fOffX, dy = (int32_t)get32(b, 4) - fOffY;
++		int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++		int32_t cx = dx < 0 ? -dx : 0, cy = dy < 0 ? -dy : 0;
++		full = (int32_t)get32(b, 0) >= 0 && (int32_t)get32(b, 4) >= 0 && w > 0 && h > 0 && dx <= 0 && dy <= 0 &&
++		    w - cx >= (int32_t)fWidth && h - cy >= (int32_t)fHeight &&
++		    aw - cx >= (int32_t)fWidth && ah - cy >= (int32_t)fHeight;
++	}
++	int32_t t = -1;
++	if (panel) {
++		t = fDbFlipped < 0 && !dbufAnyPending() ? 0 : -1;
++	} else if (full) {
++		for (uint32_t i = 0; i < fDbN && t < 0; i++) {
++			if (fDb[i].state == kNegroniDbFree) {
++				t = (int32_t)i;
++			}
++		}
++	} else if (fDbFlipped < 0 && !dbufAnyPending()) {
++		t = fDbShown;
++		fStatDbInPlace++;
++	}
++	if (t >= 0 && fShiftPending && t != fDbDraw) {
++		t = -1;                 /* 0256: the last frame's clock shift is still to do in its buffer */
++	}
++	if (t < 0) {
++		fStatDbWaits++;
++		return false;
++	}
++	fDbTarget = t;
++	fDbDraw = t;
++	fPixels = fDb[t].pixels;
++	fDrawPhys = fDb[t].phys;
++	return true;
++}
++
++/* present() queued the frame into fDbTarget (fence: its newest GPU copy, 0: all done by the CPU). */
++void
++AppleCLCD::dbufQueued(uint32_t fence)
++{
++	int32_t t = fDbTarget;
++
++	fDbTarget = -1;
++	if (!fDbuf || t < 0 || t == fDbShown || t == fDbFlipped) {
++		return;                 /* drawn in place */
++	}
++	fDb[t].state = kNegroniDbPending;
++	fDb[t].fence = fence;
++	fDb[t].seq = ++fDbSeq;
++}
++
++/* The pipes fetch buffer i from the next frame start on. */
++void
++AppleCLCD::dbufFlip(int32_t i)
++{
++	/* the CPU's stores to the write-combined buffer (copy, badges) reach memory before the engine reads it */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t p = 0; p < fZCPipes; p++) {
++		negroni_dpu_wr(fMdss + negroni_sspp_off[fZCPipe[p]] + SSPP_SRC0_ADDR, (uint32_t)fDb[i].phys);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	negroni_dpu_wr(fMdss + fZCCtl + CTL_FLUSH, fZCFlush);
++	fDb[i].state = kNegroniDbFlipped;
++	fDbFlipped = i;
++	fDbFlipTicks = 0;
++	fDbFlipAt = mach_absolute_time();
++	fStatDbFlips++;
++	fDbFlipsTotal++;
++	if (fDbLogged < 4) {
++		/* bring-up: how long the engine takes to apply a flip (expected: up to one 8.3 ms frame) */
++		uint32_t k;
++		uint64_t ns;
++		fDbLogged++;
++		for (k = 0; k < 80 && !zeroCopyLatched(); k++) {
++			delay_for_interval(250, kMicrosecondScale);
++		}
++		absolutetime_to_nanoseconds(mach_absolute_time() - fDbFlipAt, &ns);
++		IOLog("NEGRONI FB: 0269 flip %llu: buffer %d at 0x%llx (fence %u), %s after %llu us, CTL_FLUSH 0x%x\n",
++		    fDbFlipsTotal, i, fDb[i].phys, fDb[i].fence, zeroCopyLatched() ? "taken" : "NOT taken", ns / 1000,
++		    negroni_dpu_rd(fMdss + fZCCtl + CTL_FLUSH));
++	}
++}
++
++/*
++ * Every vsync tick (tick) and after the frame's copy (not tick): a taken flip makes its buffer the
++ * shown one and frees the one before; the newest pending buffer whose copy is done (and whose
++ * CPU drawing, presentFinish / the 0256 shift, is done) is flipped. Work loop.
++ */
++void
++AppleCLCD::dbufTick(bool tick)
++{
++	if (!fDbuf) {
++		return;
++	}
++	if (fDbFlipped >= 0) {
++		if (zeroCopyLatched()) {
++			uint64_t dt = mach_absolute_time() - fDbFlipAt;
++			if (dt > fStatDbLatchMaxAbs) {
++				fStatDbLatchMaxAbs = dt;
++			}
++			if (fDbShown >= 0 && fDbShown != fDbFlipped) {
++				fDb[fDbShown].state = kNegroniDbFree;
++			}
++			fDbShown = fDbFlipped;
++			fDb[fDbShown].state = kNegroniDbShown;
++			fDbFlipped = -1;
++		} else if (tick && !fPowerOff && !fArPaused && ++fDbFlipTicks > NEGRONI_DB_LATCH_TICKS) {
++			dbufOff("the display engine does not take flips");
++			return;
++		}
++	}
++	/* pending buffers older than the one on screen: free once the GPU is done with them */
++	for (uint32_t i = 0; i < fDbN; i++) {
++		if (fDb[i].state == kNegroniDbPending && fDb[i].seq < fDb[fDbShown].seq &&
++		    (fDb[i].fence == 0 || fenceGone(fDb[i].fence))) {
++			fDb[i].state = kNegroniDbFree;
++		}
++	}
++	if (fDbFlipped >= 0) {
++		return;                 /* one flip at a time: the buffer it replaces is still fetched */
++	}
++	int32_t best = -1;
++	for (uint32_t i = 0; i < fDbN; i++) {
++		if (fDb[i].state == kNegroniDbPending && fDb[i].seq > fDb[fDbShown].seq &&
++		    (best < 0 || fDb[i].seq > fDb[best].seq)) {
++			best = (int32_t)i;
++		}
++	}
++	if (best < 0 || (fDb[best].fence != 0 && !fenceGone(fDb[best].fence))) {
++		return;
++	}
++	if (best == fDbDraw && (fFinishPending || fShiftPending)) {
++		return;                 /* the CPU still draws into it (presentFinish, shiftTick) */
++	}
++	dbufFlip(best);
++}
++
++/*
++ * Display off (zeroCopyStop(true), 0275 tick 0): the black and the dark panel go into the buffer
++ * on screen; no flip. The GPU copies into the other buffers are done (0275 waited for the last
++ * one), so they become free. Work loop.
++ */
++void
++AppleCLCD::dbufPark(void)
++{
++	if (!fDbuf) {
++		return;
++	}
++	for (uint32_t i = 0; i < 80 && fDbFlipped >= 0 && !zeroCopyLatched(); i++) {
++		delay_for_interval(250, kMicrosecondScale);
++	}
++	if (fDbFlipped >= 0) {
++		if (!zeroCopyLatched()) {
++			dbufOff("a flip was not taken before the display went off");
++			return;
++		}
++		if (fDbShown != fDbFlipped) {
++			fDb[fDbShown].state = kNegroniDbFree;
++		}
++		fDbShown = fDbFlipped;  /* taken: no new flip here, the black goes into this one */
++		fDb[fDbShown].state = kNegroniDbShown;
++		fDbFlipped = -1;
++	}
++	for (uint32_t i = 0; i < fDbN; i++) {
++		if ((int32_t)i != fDbShown) {
++			fDb[i].state = kNegroniDbFree;
++		}
++	}
++	fDbDraw = fDbShown;
++	fPixels = fDb[fDbShown].pixels;
++	fDrawPhys = fDb[fDbShown].phys;
++}
++
++/* Back to one buffer for good: the pipes on the panel memory (ABL's values). Work loop. */
++void
++AppleCLCD::dbufOff(const char *why)
++{
++	IOLog("NEGRONI FB: 0269 double buffering off: %s (CTL_FLUSH 0x%x, %llu flips)\n", why,
++	    negroni_dpu_rd(fMdss + fZCCtl + CTL_FLUSH), fDbFlipsTotal);
++	NegroniGPUFenceWait(fLastGPUFence, NEGRONI_FB_GPU_COPY_WAIT_MS);
++	fDbuf = false;
++	zeroCopyRestore();
++	for (uint32_t i = 0; i < fDbN; i++) {
++		fDb[i].state = i == 0 ? kNegroniDbShown : kNegroniDbFree;
++	}
++	fDbShown = fDbDraw = 0;
++	fDbFlipped = fDbTarget = -1;
++	fPixels = fDb[0].pixels;
++	fDrawPhys = fPhys;
++	IOLockLock(fLock);
++	fDirty = true;                  /* the latest frame again, into the panel memory */
++	IOLockUnlock(fLock);
++}
++
+ /*
+  * SwapWait: 0 when swap id is on screen, else kIOReturnBusy at once (0254; before: a wait of at
+  * most NEGRONI_ZC_WAIT_MS in zero-copy mode only). CoreAnimation passes the swap that showed its
+@@ -2550,8 +2909,8 @@ negroni_fb_panic(void)
+ {
+ 	AppleCLCD *fb = negroni_fb_zc;
+ 
+-	if (fb != NULL && fb->fZCReady) {
+-		fb->zeroCopyRestore();
++	if (fb != NULL && (fb->fZCReady || fb->fDbuf)) {
++		fb->zeroCopyRestore();  /* 0269: the panic text goes to the panel memory, ABL's buffer */
+ 	}
+ 	negroni_backlight_panic();      /* 0258: a sleeping or dark panel shows the panic text */
+ }
+@@ -2593,6 +2952,7 @@ negroni_fb_autorefresh_pause(uint32_t *saved)
+ 	}
+ 	negroni_dpu_wr(intf + INTF_TEAR_AUTOREFRESH_CONFIG, ar & ~(1u << 31));
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	negroni_fb_main->fArPaused = true;     /* 0269: no flip is taken meanwhile */
+ 	return true;
+ }
+ 
+@@ -2604,6 +2964,7 @@ negroni_fb_autorefresh_resume(uint32_t saved)
+ 	if (intf == 0 || !(saved & (1u << 31))) {
+ 		return;
+ 	}
++	negroni_fb_main->fArPaused = false;
+ 	if (negroni_dpu_rd(intf + INTF_TEAR_AUTOREFRESH_CONFIG) & (1u << 31)) {
+ 		return;         /* 0259's VRR wake wrote it meanwhile */
+ 	}
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index d526859..d1832fb 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -1705,7 +1705,9 @@ static struct {
+ 	uint32_t                fence;          /* the last copy that read it */
+ } gPresentMaps[PRESENT_SURFACES];
+ static uint32_t gPresentNext;
+-static uint64_t gPanelPhys, gPanelAddress, gPanelBytes;
++/* 0269: the panel buffers (panel memory + the double-buffer ones), each mapped once, never unmapped */
++#define NEGRONI_GPU_PANEL_MAPS 4
++static uint64_t gPanelPhys[NEGRONI_GPU_PANEL_MAPS], gPanelAddress[NEGRONI_GPU_PANEL_MAPS], gPanelBytes[NEGRONI_GPU_PANEL_MAPS];
+ static IOBufferMemoryDescriptor * gPresentIB[2];
+ static uint64_t gPresentIBAddress[2];
+ static uint32_t gPresentIBFence[2], gPresentIBNext;
+@@ -1821,8 +1823,8 @@ uint32_t
+ NegroniGPUPresentRects(NegroniSurface * s, uint64_t panelPhys, uint32_t pitch, uint32_t rows,
+     const struct NegroniGPURect * rects, uint32_t n)
+ {
+-	uint32_t count = 0, fence = 0, slot = 0, ib;
+-	uint64_t source, panelBytes = ((uint64_t)pitch * rows + GPU_PAGE - 1) & ~(GPU_PAGE - 1);
++	uint32_t count = 0, fence = 0, slot = 0, ib, pm;
++	uint64_t source, panelAddress = 0, panelBytes = ((uint64_t)pitch * rows + GPU_PAGE - 1) & ~(GPU_PAGE - 1);
+ 	const char * why = NULL;
+ 	uint32_t sx = n ? rects[0].sx : 0, sy = n ? rects[0].sy : 0, dx = n ? rects[0].dx : 0, dy = n ? rects[0].dy : 0;
+ 	uint32_t w = n ? rects[0].w : 0, h = n ? rects[0].h : 0;
+@@ -1842,20 +1844,33 @@ NegroniGPUPresentRects(NegroniSurface * s, uint64_t panelPhys, uint32_t pitch, u
+ 	if (gGPUStopped) {
+ 		goto out;
+ 	}
+-	if (gPanelAddress == 0 || gPanelPhys != panelPhys || gPanelBytes != panelBytes) {
+-		if (gPanelAddress != 0) {
+-			presentUnmap(gPanelAddress, gPanelBytes);
+-			gPanelAddress = 0;
++	/*
++	 * 0269: one mapping per panel buffer, kept: a copy into one buffer can still be queued while
++	 * the next frame goes to another (before, a change of panelPhys unmapped the old one).
++	 */
++	for (pm = 0; pm < NEGRONI_GPU_PANEL_MAPS && panelAddress == 0; pm++) {
++		if (gPanelAddress[pm] != 0 && gPanelPhys[pm] == panelPhys && gPanelBytes[pm] == panelBytes) {
++			panelAddress = gPanelAddress[pm];
+ 		}
+-		gPanelAddress = presentMap(NULL, panelPhys, panelBytes, false);
+-		gPanelPhys = panelPhys;
+-		gPanelBytes = panelBytes;
+-		IOLog("RedwoodGPU: panel memory 0x%llx (%llu bytes) at GPU address 0x%llx\n", panelPhys, panelBytes, gPanelAddress);
+-		if (gPanelAddress == 0) {
+-			why = "the panel memory cannot be mapped";
+-			goto out;
++	}
++	for (pm = 0; pm < NEGRONI_GPU_PANEL_MAPS && panelAddress == 0; pm++) {
++		if (gPanelAddress[pm] == 0) {
++			panelAddress = presentMap(NULL, panelPhys, panelBytes, false);
++			IOLog("RedwoodGPU: panel memory 0x%llx (%llu bytes) at GPU address 0x%llx (map %u)\n", panelPhys, panelBytes,
++			    panelAddress, pm);
++			if (panelAddress == 0) {
++				why = "the panel memory cannot be mapped";
++				goto out;
++			}
++			gPanelAddress[pm] = panelAddress;
++			gPanelPhys[pm] = panelPhys;
++			gPanelBytes[pm] = panelBytes;
+ 		}
+ 	}
++	if (panelAddress == 0) {
++		why = "more panel buffers than GPU mappings";
++		goto out;
++	}
+ 	for (ib = 0; ib < 2; ib++) {
+ 		if (gPresentIB[ib] == NULL) {
+ 			IOBufferMemoryDescriptor * md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+@@ -1881,7 +1896,7 @@ NegroniGPUPresentRects(NegroniSurface * s, uint64_t panelPhys, uint32_t pitch, u
+ 	for (uint32_t i = 0; i < n; i++) {
+ 		struct negroni_gpu_copy copy = {
+ 			.src = source + s->offset, .src_pitch = s->bytesPerRow,
+-			.dst = gPanelAddress, .dst_pitch = pitch,
++			.dst = panelAddress, .dst_pitch = pitch,
+ 			.sx = rects[i].sx, .sy = rects[i].sy, .dx = rects[i].dx, .dy = rects[i].dy,
+ 			.w = rects[i].w, .h = rects[i].h,
+ 		};

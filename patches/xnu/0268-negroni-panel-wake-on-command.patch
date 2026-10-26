@@ -1,0 +1,858 @@
+From: iOSPlus10 display agent (dpu)
+Subject: [PATCH] negroni panel: wake with the full on-command + PPS, long DSI packets from memory (0268)
+
+Phone log 2026-10-26 13:24-13:30 (kernel local-20261026-074105, negronifb_sleep=1): every
+wake logged "display on (sleep-out 133 ms, DCS ok, panel DBV 356)", but the panel stayed
+black with a purple strip. 0258 woke the panel with 0x11 + 133 ms + 0x29 only and relied
+on the S6E3HC3 keeping its registers in sleep-in. Android never does that: it sends the
+whole DSI_CMD_SET_ON (dsi_panel_enable, dsi_panel.c:5708-5760) and then the DSC PPS
+(dsi_panel_update_pps, dsi_display.c:9165-9170) on every display on.
+
+NegroniBacklight.cpp:
+- negroni_dsi_packet(): one packet with its own data type (0x05/0x15 short, 0x39/0x29/0x0a
+  long). Up to 60 payload bytes from the TPG FIFO as before; longer packets from a command
+  buffer in memory (dsi_ctrl.c:1701-1731 copy and pad, dsi_ctrl_hw_cmn.c:870-919
+  kickoff_command: DMA_CTRL embedded, DMA_FIFO_CTRL watermarks off, DMA_CMD_OFFSET/LENGTH,
+  SW trigger). Buffer: the last 16 KiB of the UEFI splash region (0xbaafc000; the 0234
+  slots end there), read by the DSI DMA through the display SMMU context like the pipes'
+  fetch. A memory DMA that times out turns the memory path off for the boot. 0269 ends the
+  0234 display slots and surfaces at NEGRONI_DB_END (= the splash end - 16 KiB), so they never
+  reach this buffer, whatever the page and row size.
+- negroni_dsi_dcs_set_ex(): the set under a set lock (the 0259 VRR thread call and the wake
+  never interleave inside an F0 5A 5A key), each packet with the type of the set (before:
+  the type came from the length, "39 bd 21" went out as 0x15), flags to skip or go on after
+  the long packets. negroni_dsi_dcs_set() and negroni_dsi_dcs_write() keep their API.
+- Wake (negronifb_wake, default 2): auto-refresh paused (INTF_TEAR_AUTOREFRESH_CONFIG bit 31
+  off, as _sde_encoder_autorefresh_disable_seq1), the 120 Hz FHD on-command from live.dts
+  line 35658 (94 packets, LP: no on-command-state, dsi_panel.c:2678-2680), the 0x0A PPS
+  (128 bytes, the UEFI XML PPS = the DT 9E PPS with version 0x12), auto-refresh back on,
+  50 ms of TE/frame counters (re-arm once if TE but no frame), then the last DBV. The
+  on-command ends in the 120 Hz state (60 00, BD[0x14]=00), so a 0259 VRR idle state before
+  the sleep is undone by the panel itself; the 0259 exit set may come before or after it
+  (set lock). =1: the on-command without the two long packets (FIFO only); =0: 0258.
+  Log: "NEGRONI FB: display on (on-command 94 packets, PPS ok, TE on: N TE N frames tear 0x..
+  in 50 ms, autorefresh 0x80000001 paused+resumed; sleep-out N ms, DCS ok, panel DBV N)".
+
+NegroniFramebuffer.cpp: negroni_fb_autorefresh_pause/resume, negroni_fb_te_check (INTF_1
+through fIntf, fMdss or an own page). Panic wake unchanged (0x11/0x29, no lock, no memory DMA).
+Arrays: scripts/display/panel-dts-dump.py --on.
+
+diff --git a/iokit/Kernel/arm/NegroniBacklight.cpp b/iokit/Kernel/arm/NegroniBacklight.cpp
+index 988fd5c..026e2f0 100644
+--- a/iokit/Kernel/arm/NegroniBacklight.cpp
++++ b/iokit/Kernel/arm/NegroniBacklight.cpp
+@@ -43,10 +43,13 @@
+  * 101 ms, LP mode). In sleep the panel sends no TE, so the MDP
+  * auto-refresh (TE-triggered) stops by itself; the DCS path waits for
+  * MDP-not-busy, so the commands go between two frames.
+- * RequestPowerChange(1) calls negroni_backlight_display_on(): 0x11
+- * exit_sleep_mode, 133 ms (the on-command waits 12 ms after 0x11 and
+- * 121 ms later before 0x29), 0x29 set_display_on, then the last lit DBV
+- * (the panel keeps its registers in sleep: no reset, no on-command). The
++ * RequestPowerChange(1) calls negroni_backlight_display_on(): 0268 sends
++ * the panel's whole on-command (live.dts, 94 packets incl. the 9E PPS, 0x11,
++ * 35 00 TE on, 2A/2B, 0x29) and the 0x0A PPS, with the DPU auto-refresh
++ * paused, then re-arms it, checks TE and frames, and sets the last lit DBV
++ * (wakePanel). 0258 sent only 0x11, 133 ms, 0x29: on the phone (2026-10-26
++ * 13:24-13:30, "display on (sleep-out 133 ms, DCS ok ...)") the panel stayed
++ * black with a purple strip. negronifb_wake=0 brings the 0258 wake back. The
+  * framebuffer redraws at its next tick; the MDP scans it on the first TE.
+  * negronifb_sleep=0: DBV 0 + black pixels only (the panel stays scanning).
+  * =2: also the panel rails: vddio (pm8350c_l12, 1.8 V) and vci
+@@ -55,7 +58,8 @@
+  * on-command (incl. the DSC PPS), which this kernel does not have; so 2 = 1
+  * (logged at start).
+  *
+- * Boot-args: negronibl=0 (off: no service, no DSI access), negronibl_max=DBV
++ * Boot-args: negronifb_wake=0|1|2 (0268, default 2: on-command + PPS),
++ * negronibl=0 (off: no service, no DSI access), negronibl_max=DBV
+  * (default 2047, at most 4095), negronibl_curve=1 (square curve),
+  * negronibl_hs=1 (high-speed instead of low-power DCS), negronifb_sleep=0/1/2
+  * (default 1; the old name negronibl_sleep is accepted too),
+@@ -70,6 +74,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOMemoryDescriptor.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+@@ -88,7 +93,9 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define NDSI_CTRL                       0x004   /* bit0 ENABLE, bit2 CMD_MODE_EN */
+ #define NDSI_STATUS                     0x008   /* bit1 CMD_MODE_DMA_BUSY, bit2 CMD_MODE_MDP_BUSY */
+ #define NDSI_CMD_DMA_CTRL               0x03c   /* 31 BROADCAST_EN, 30 MASTER, 28 EMBEDDED, 26 LOW_POWER */
++#define NDSI_DMA_CMD_OFFSET             0x048   /* 0268: command buffer address (memory DMA) */
+ #define NDSI_DMA_CMD_LENGTH             0x04c
++#define NDSI_DMA_FIFO_CTRL              0x050   /* 0268: bit 20/16 write/read watermark off (memory DMA) */
+ #define NDSI_TRIG_CTRL                  0x084   /* bits 0-3 DMA trigger, 4 = software */
+ #define NDSI_CMD_DMA_SW_TRIGGER         0x090
+ #define NDSI_INT_CTRL                   0x110   /* even bits status (write 1 clears), odd bits enables */
+@@ -103,12 +110,34 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define NDSI_TPG_FIFO_ON                (3u << 16 | 1u << 2 | 1u << 1)
+ #define NDSI_DMA_TRIGGER_SW             4u
+ #define NDSI_MAX_PAYLOAD                60      /* bytes; the TPG FIFO holds 64 with the 4-byte header (0259: was 16) */
++/*
++ * 0268: packets longer than the FIFO go from memory: the last 16 KiB of the UEFI's splash region
++ * (cont_splash_region 0xb8000000 + 0x2b00000; the 0234 display slots end at 0xbaafc000, the 0269
++ * panel buffers well before it).
++ */
++#define NDSI_MEM_PA                     0xbaafc000ull
++#define NDSI_MEM_SIZE                   0x4000u
++#define NDSI_MEM_MAX_PAYLOAD            1024u
++#define NDSI_SET_SKIP_LONG              1u      /* negroni_dsi_dcs_set_ex flags */
++#define NDSI_SET_GO_ON                  2u
++
++struct negroni_dsi_set_result {
++	uint32_t packets;       /* packets of the set handled (sent, skipped or failed long) */
++	uint32_t sent;
++	uint32_t longSent, longFailed, skipped;
++};
++extern "C" int negroni_dsi_dcs_set_ex(const uint8_t *set, uint32_t len, bool lp, uint32_t flags,
++    struct negroni_dsi_set_result *res);
++extern "C" int negroni_dsi_long_packet(uint8_t dt, const uint8_t *buf, uint32_t len, bool lp);
+ 
+ static volatile uint32_t *negroni_dsi;
+ static IOLock *negroni_dsi_lock;        /* every DSI command, see negroni_dsi_dcs_write */
+ static bool negroni_dsi_dead;
+ static bool negroni_dsi_panic;         /* 0258: panic path, other CPUs stopped: no lock */
+ static uint32_t negroni_dsi_failures, negroni_dsi_mdp_waits;
++static IOLock *negroni_dsi_set_lock;    /* 0268: a whole command set (negroni_dsi_dcs_set_ex) */
++static volatile void *negroni_dsi_mem;  /* 0268: NDSI_MEM_PA, write-combined (NULL: no memory DMA) */
++static bool negroni_dsi_mem_off;        /* 0268: a memory DMA failed: FIFO packets only from then on */
+ 
+ static inline uint32_t
+ ndsi_rd(uint32_t off)
+@@ -144,31 +173,59 @@ negroni_dsi_init(void)
+ 		return false;
+ 	}
+ 	negroni_dsi = d;
++	negroni_dsi_set_lock = IOLockAlloc();
++	/* 0268: the command buffer for the packets the FIFO cannot hold (memory DMA) */
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(NDSI_MEM_PA, NDSI_MEM_SIZE, kIODirectionInOut);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);                  /* the map keeps it */
++	negroni_dsi_mem = map != NULL ? (volatile void *)map->getVirtualAddress() : NULL;
++	IOLog("NEGRONI BL: DSI0 command buffer for long packets %s at 0x%llx (fifo_ctrl 0x%08x dma_offset 0x%08x)\n",
++	    negroni_dsi_mem != NULL ? "mapped" : "NOT mapped", NDSI_MEM_PA, d[NDSI_DMA_FIFO_CTRL / 4], d[NDSI_DMA_CMD_OFFSET / 4]);
+ 	return true;
+ }
+ 
+ /*
+- * Send one DCS write (buf[0] = command, then its parameters) to the panel on
+- * virtual channel 0: short write without (0x05) or with one parameter (0x15),
+- * else a long write (0x39). lp = low-power transmission. 0 when the
+- * controller reported CMD_DMA_DONE. After 3 failures the DSI is left alone.
++ * Send one DSI packet (data type dt, payload buf/len) to the panel on virtual
++ * channel 0. Short types (0x05 DCS short, 0x15 DCS short + 1 parameter, 0x03/
++ * 0x13/0x23 generic short) carry at most 2 bytes in the header; long types
++ * (0x39 DCS long, 0x29 generic long, 0x0a PPS) carry a word count. A packet
++ * that fits the TPG FIFO (4-byte header + payload <= 64 bytes, dsi_ctrl.h:58
++ * DSI_CTRL_MAX_CMD_FIFO_STORE_SIZE) goes out in FIFO mode
++ * (dsi_ctrl_hw_cmn_kickoff_fifo_command); a longer one (0268: the 90-byte 9E
++ * PPS of the on-command, the 128-byte 0x0A PPS) from a buffer in memory, as
++ * Android always does (dsi_ctrl.c:1701-1731 copy + pad 0xff, dsi_ctrl_hw_cmn.c:870
++ * kickoff_command: DMA_CTRL embedded mode, DMA_FIFO_CTRL watermarks off,
++ * DMA_CMD_OFFSET/LENGTH, SW trigger). The buffer is the last 16 KiB of the
++ * UEFI's splash region (NDSI_MEM_PA): RAM XNU does not manage, read by the
++ * DSI DMA through the display's SMMU context like the pipes' fetch of the
++ * panel memory at the same physical addresses (the UEFI sent its 129-byte
++ * 9E PPS the same way). lp = low-power transmission. 0 when the controller
++ * reported CMD_DMA_DONE. After 3 failures in a row the DSI is left alone.
+  * Thread context only (sleeps on the lock, spins up to ~45 ms).
+  */
+-extern "C" int
+-negroni_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp)
++static int
++negroni_dsi_packet(uint8_t dt, const uint8_t *buf, uint32_t len, bool lp)
+ {
+ 	uint32_t words[2 + (NDSI_MAX_PAYLOAD + 3) / 4];
+-	uint32_t n = 0;
++	uint32_t n = 0, bytes;
++	bool isLong = dt == 0x39 || dt == 0x29 || dt == 0x0a;
++	bool mem = false;
+ 
+-	if (negroni_dsi == NULL || len == 0 || len > NDSI_MAX_PAYLOAD) {
++	if (negroni_dsi == NULL || len == 0 || (!isLong && len > 2) || len > NDSI_MEM_MAX_PAYLOAD) {
+ 		return -1;
+ 	}
++	if (isLong && len > NDSI_MAX_PAYLOAD) {
++		mem = true;
++		if (negroni_dsi_mem == NULL || negroni_dsi_mem_off || negroni_dsi_panic) {
++			return -6;      /* no command buffer in memory (or it failed before) */
++		}
++	}
+ 	/* Header in embedded mode: [7:0] data0/WC lo, [15:8] data1/WC hi, [21:16] DT, [23:22] VC, 30 long, 31 last */
+-	if (len <= 2) {
+-		uint32_t dt = len == 1 ? 0x05u : 0x15u;
+-		words[n++] = 1u << 31 | dt << 16 | (len == 2 ? (uint32_t)buf[1] << 8 : 0u) | buf[0];
+-	} else {
+-		words[n++] = 1u << 31 | 1u << 30 | 0x39u << 16 | len;
++	if (!isLong) {
++		words[n++] = 1u << 31 | (uint32_t)dt << 16 | (len == 2 ? (uint32_t)buf[1] << 8 : 0u) | buf[0];
++		bytes = 4;
++	} else if (!mem) {
++		words[n++] = 1u << 31 | 1u << 30 | (uint32_t)dt << 16 | len;
+ 		for (uint32_t i = 0; i < len; i += 4) {
+ 			uint32_t w = 0;
+ 			for (uint32_t b = 0; b < 4 && i + b < len; b++) {
+@@ -176,10 +233,12 @@ negroni_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp)
+ 			}
+ 			words[n++] = w;
+ 		}
+-	}
+-	uint32_t bytes = n * 4;
+-	if (n & 1u) {
+-		words[n++] = 0;         /* the FIFO takes an even number of words */
++		bytes = n * 4;
++		if (n & 1u) {
++			words[n++] = 0;         /* the FIFO takes an even number of words */
++		}
++	} else {
++		bytes = 4 + ((len + 3) & ~3u);
+ 	}
+ 
+ 	bool locked = !negroni_dsi_panic;       /* panic: no lock (a stopped holder must not hang it) */
+@@ -212,17 +271,37 @@ negroni_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp)
+ 		uint32_t tpg = ndsi_rd(NDSI_TPG_CTRL);
+ 		uint32_t dma = ndsi_rd(NDSI_CMD_DMA_CTRL);
+ 		uint32_t trig = ndsi_rd(NDSI_TRIG_CTRL);
++		uint32_t fifo = ndsi_rd(NDSI_DMA_FIFO_CTRL);
+ 		if ((trig & 0xfu) != NDSI_DMA_TRIGGER_SW) {
+ 			ndsi_wr(NDSI_TRIG_CTRL, (trig & ~0xfu) | NDSI_DMA_TRIGGER_SW);
+ 		}
+ 		ndsi_wr(NDSI_INT_CTRL, (ndsi_rd(NDSI_INT_CTRL) & NDSI_INT_ENABLE_BITS) | NDSI_INT_DMA_DONE);
+-		ndsi_wr(NDSI_TPG_CTRL, NDSI_TPG_FIFO_ON);
+-		for (uint32_t w = 0; w < n; w++) {
+-			ndsi_wr(NDSI_TPG_CMD_DMA_INIT_VAL, words[w]);
+-		}
+ 		uint32_t nd = (dma & ~(1u << 31 | 1u << 30 | 1u << 26)) | 1u << 28 | (lp ? 1u << 26 : 0u);
+-		ndsi_wr(NDSI_CMD_DMA_CTRL, nd);
+-		ndsi_wr(NDSI_DMA_CMD_LENGTH, bytes);
++		if (mem) {
++			/* dsi_ctrl_copy_and_pad_cmd: header (last command), payload, 0xff up to a word */
++			volatile uint8_t *m = (volatile uint8_t *)negroni_dsi_mem;
++			uint32_t h = 1u << 31 | 1u << 30 | (uint32_t)dt << 16 | len;
++			for (uint32_t b = 0; b < 4; b++) {
++				m[b] = (uint8_t)(h >> (8 * b));
++			}
++			for (uint32_t b = 0; b < bytes - 4; b++) {
++				m[4 + b] = b < len ? buf[b] : 0xff;
++			}
++			__builtin_arm_dsb(0xf);
++			ndsi_wr(NDSI_TPG_CTRL, 0);              /* DMA from memory, not from the TPG FIFO */
++			nd &= ~(1u << 24 | 1u << 29);           /* packet type, WC_SEL (kickoff_command) */
++			ndsi_wr(NDSI_CMD_DMA_CTRL, nd);
++			ndsi_wr(NDSI_DMA_FIFO_CTRL, fifo | 1u << 20 | 1u << 16);   /* watermarks off */
++			ndsi_wr(NDSI_DMA_CMD_OFFSET, (uint32_t)NDSI_MEM_PA);
++			ndsi_wr(NDSI_DMA_CMD_LENGTH, bytes & 0xffffffu);
++		} else {
++			ndsi_wr(NDSI_TPG_CTRL, NDSI_TPG_FIFO_ON);
++			for (uint32_t w = 0; w < n; w++) {
++				ndsi_wr(NDSI_TPG_CMD_DMA_INIT_VAL, words[w]);
++			}
++			ndsi_wr(NDSI_CMD_DMA_CTRL, nd);
++			ndsi_wr(NDSI_DMA_CMD_LENGTH, bytes);
++		}
+ 		__builtin_arm_dsb(0xf);
+ 		ndsi_wr(NDSI_CMD_DMA_SW_TRIGGER, 1);
+ 		__builtin_arm_dsb(0xf);
+@@ -242,19 +321,26 @@ negroni_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp)
+ 		ndsi_wr(NDSI_TPG_DMA_FIFO_RESET, 0);
+ 		ndsi_wr(NDSI_TPG_CTRL, tpg);
+ 		ndsi_wr(NDSI_CMD_DMA_CTRL, dma);
++		if (mem) {
++			ndsi_wr(NDSI_DMA_FIFO_CTRL, fifo);
++		}
+ 		if ((trig & 0xfu) != NDSI_DMA_TRIGGER_SW) {
+ 			ndsi_wr(NDSI_TRIG_CTRL, trig);
+ 		}
+ 		__builtin_arm_dsb(0xf);
+ 		if (!done) {
+ 			rc = -3;
++			if (mem) {
++				negroni_dsi_mem_off = true;     /* 0268: no second try from memory this boot */
++			}
+ 		}
+ 	}
+ out:
+ 	if (rc != 0) {
+ 		negroni_dsi_failures++;
+-		IOLog("NEGRONI BL: DCS 0x%02x (%u bytes) failed %d, status 0x%08x int 0x%08x (failure %u)\n",
+-		    buf[0], len, rc, ndsi_rd(NDSI_STATUS), ndsi_rd(NDSI_INT_CTRL), negroni_dsi_failures);
++		IOLog("NEGRONI BL: DSI packet 0x%02x cmd 0x%02x (%u bytes%s) failed %d, status 0x%08x int 0x%08x (failure %u)\n",
++		    dt, buf[0], len, mem ? ", from memory" : "", rc, ndsi_rd(NDSI_STATUS), ndsi_rd(NDSI_INT_CTRL),
++		    negroni_dsi_failures);
+ 		if (negroni_dsi_failures >= 3) {
+ 			negroni_dsi_dead = true;
+ 			IOLog("NEGRONI BL: DSI0 commands disabled after 3 failures\n");
+@@ -269,47 +355,109 @@ out:
+ }
+ 
+ /*
+- * 0259: send a command set in the Qualcomm device-tree format (dsi_panel.c
+- * dsi_panel_create_cmd_packets: per packet a 7-byte header {type, last, vc,
+- * flags, wait ms, length hi, length lo} then the payload). Each packet goes
+- * out as one FIFO DMA (negroni_dsi_dcs_write: the type comes from the length,
+- * which is the same for 0x05/0x15/0x39; generic types are refused), behind the
+- * same MDP-not-busy wait; a wait byte is honoured after the packet. Thread
+- * context only. 0 when every packet went out, else the first error, and
+- * *sent gets the number of packets that did.
++ * Send one DCS write (buf[0] = command, then its parameters): short write
++ * without (0x05) or with one parameter (0x15), else a long write (0x39).
+  */
+ extern "C" int
+-negroni_dsi_dcs_set(const uint8_t *set, uint32_t len, bool lp, uint32_t *sent)
++negroni_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp)
+ {
+-	uint32_t i = 0, n = 0;
+-	int rc = 0;
++	if (len == 0 || len > NDSI_MAX_PAYLOAD) {
++		return -1;
++	}
++	return negroni_dsi_packet(len == 1 ? 0x05 : len == 2 ? 0x15 : 0x39, buf, len, lp);
++}
++
++/*
++ * 0259/0268: send a command set in the Qualcomm device-tree format
++ * (dsi_panel.c dsi_panel_create_cmd_packets: per packet a 7-byte header
++ * {type, last, vc, flags, wait ms, length hi, length lo} then the payload).
++ * Each packet goes out as its own DMA with its own data type (0268: before,
++ * the type came from the length, so "39 bd 21" went out as a 0x15 short write;
++ * dsi_panel.c sends what the set says), behind the same MDP-not-busy wait; a
++ * wait byte is honoured after the packet. The whole set holds
++ * negroni_dsi_set_lock, so two sets (0259 VRR thread call, 0268 wake on the
++ * backlight work loop) never interleave inside a Samsung F0 5A 5A key.
++ * flags: NDSI_SET_SKIP_LONG skips the packets that need a memory DMA,
++ * NDSI_SET_GO_ON goes on after a failed long packet (the rest of an
++ * on-command is still worth sending). Thread context only. 0 when every
++ * packet that was tried went out, else the first error.
++ */
++extern "C" int
++negroni_dsi_dcs_set_ex(const uint8_t *set, uint32_t len, bool lp, uint32_t flags, struct negroni_dsi_set_result *res)
++{
++	struct negroni_dsi_set_result r = {};
++	uint32_t i = 0;
++	int rc = 0, first = 0;
+ 
+-	while (i + 7 <= len && rc == 0) {
++	if (negroni_dsi_set_lock != NULL) {
++		IOLockLock(negroni_dsi_set_lock);
++	}
++	while (i + 7 <= len) {
+ 		uint8_t type = set[i], wait = set[i + 4];
+ 		uint32_t plen = (uint32_t)set[i + 5] << 8 | set[i + 6];
+ 		if (plen == 0 || i + 7 + plen > len) {
+ 			rc = -4;
+ 			break;
+ 		}
+-		if (type != 0x05 && type != 0x15 && type != 0x39) {
+-			rc = -5;        /* generic packets are not expected in these sets */
++		if (type != 0x05 && type != 0x15 && type != 0x39 && type != 0x29 && type != 0x0a) {
++			rc = -5;        /* generic short and read packets are not expected in these sets */
+ 			break;
+ 		}
+-		rc = negroni_dsi_dcs_write(set + i + 7, plen, lp);
+-		if (rc == 0) {
+-			n++;
+-			if (wait != 0) {
+-				IOSleep(wait);
++		bool isLong = type == 0x39 || type == 0x29 || type == 0x0a;
++		if (isLong && plen > NDSI_MAX_PAYLOAD && (flags & NDSI_SET_SKIP_LONG)) {
++			r.skipped++;
++		} else {
++			rc = negroni_dsi_packet(type, set + i + 7, plen, lp);
++			if (rc == 0) {
++				r.sent++;
++				if (isLong && plen > NDSI_MAX_PAYLOAD) {
++					r.longSent++;
++				}
++				if (wait != 0) {
++					IOSleep(wait);
++				}
++			} else if (isLong && plen > NDSI_MAX_PAYLOAD && (flags & NDSI_SET_GO_ON) && !negroni_dsi_dead) {
++				r.longFailed++;
++				first = first != 0 ? first : rc;
++				rc = 0;
++			} else {
++				break;
+ 			}
+ 		}
++		r.packets++;
+ 		i += 7 + plen;
+ 	}
++	if (negroni_dsi_set_lock != NULL) {
++		IOLockUnlock(negroni_dsi_set_lock);
++	}
++	if (res != NULL) {
++		*res = r;
++	}
++	return rc != 0 ? rc : first;
++}
++
++/* 0259: the set alone; *sent = the packets that went out. */
++extern "C" int
++negroni_dsi_dcs_set(const uint8_t *set, uint32_t len, bool lp, uint32_t *sent)
++{
++	struct negroni_dsi_set_result r;
++	int rc = negroni_dsi_dcs_set_ex(set, len, lp, 0, &r);
+ 	if (sent != NULL) {
+-		*sent = n;
++		*sent = r.sent;
+ 	}
+ 	return rc;
+ }
+ 
++/* 0268: one long packet of any data type (the 0x0A PPS after the on-command). */
++extern "C" int
++negroni_dsi_long_packet(uint8_t dt, const uint8_t *buf, uint32_t len, bool lp)
++{
++	if (dt != 0x39 && dt != 0x29 && dt != 0x0a) {
++		return -5;
++	}
++	return negroni_dsi_packet(dt, buf, len, lp);
++}
++
+ /* ---------------------------------------------------------------------- */
+ /* AppleARMBacklight                                                       */
+ /* ---------------------------------------------------------------------- */
+@@ -323,6 +471,126 @@ negroni_dsi_dcs_set(const uint8_t *set, uint32_t len, bool lp, uint32_t *sent)
+ #define NEGRONI_BL_SLEEP_IN_WAIT_MS     101     /* after 0x10 (off-command 0x65) */
+ #define NEGRONI_BL_SLEEP_OUT_WAIT_MS    133     /* 0x11 to 0x29 (on-command 0x0c + 0x79) */
+ 
++/*
++ * 0268: the panel's on-command of the 120 Hz FHD timing and the DSC PPS
++ * (scripts/display/panel-dts-dump.py --on writes both).
++ */
++/* out/live.dts line 35658: timing@fhd_sdc_120 qcom,mdss-dsi-on-command (1121 bytes, 94 packets) */
++static const uint8_t negroni_panel_on_command[1121] = {
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5a, 0x9e, 0x11, 0x00, 0x00, 0xab, 0x30, 0x80, 0x09, 0x6c, 0x04, 0x38, 0x00, 0x24, 0x02, 0x1c, 0x02, 0x1c, 0x02, 0x00, 0x02, 0x3b, 0x00, 0x20, 0x03, 0x35, 0x00, 0x07, 0x00, 0x0e, 0x03, 0x34, 0x02, 0xd4, 0x18, 0x00, 0x10, 0xf0, 0x07, 0x10, 0x20, 0x00, 0x06, 0x0f, 0x0f, 0x33, 0x0e, 0x1c, 0x2a, 0x38, 0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7b, 0x7d, 0x7e, 0x02, 0x02, 0x22, 0x00, 0x2a, 0x40, 0x2a, 0xbe, 0x3a, 0xfc, 0x3a, 0xfa, 0x3a, 0xf8, 0x3b, 0x38, 0x3b, 0x78, 0x3b, 0xb6, 0x4b, 0xb6, 0x4b, 0xf4, 0x4b, 0xf4, 0x6c, 0x34, 0x84, 0x74, 0x00,
++	0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x9d, 0x01,
++	0x05, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x01, 0x11,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x31, 0xc5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x22, 0xc5, 0x29, 0x14, 0x00, 0x00, 0x00, 0x11, 0x10, 0x50, 0x05, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x22, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0xa1, 0xb1,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x3a, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x02,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x26, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0x00, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x24, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x21,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x38, 0xb9,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x02,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x2a, 0xb9,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xb9, 0x00, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x00, 0x79, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x21,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x16, 0xf2,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf2, 0x1b, 0x50,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x08, 0xcb,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xcb, 0x24,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x60, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x10, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x16, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x77,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x14, 0xbd,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xbd, 0x00,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x63, 0xcb,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xcb, 0x08,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xbd, 0x23, 0x02,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf2, 0x00, 0x01,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x35, 0x00,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb9, 0x00,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x2a, 0x00, 0x00, 0x04, 0x37,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x2b, 0x00, 0x00, 0x09, 0x6b,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xc3, 0x89,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x24, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x3a, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x50, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x12, 0xc3, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x61, 0xc3,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x17, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xc0, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x2b, 0xf6,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xf6, 0x60, 0x63, 0x69,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x46, 0xf4,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xf4, 0x08,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x18, 0xb1,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0xb1, 0x05,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x0d, 0x63,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x63, 0x01,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x0c, 0x63,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x63, 0x20,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x53, 0x28,
++	0x15, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xf7, 0x0f,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x55, 0x00,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x52, 0x1f,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x1f, 0x02,
++	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x04, 0xb0, 0x00, 0x54, 0x1f,
++	0x15, 0x00, 0x00, 0x40, 0x00, 0x00, 0x02, 0x1f, 0x00,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5,
++	0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x29,
++};
++/* external/Mu-Silicium-negroni/Binaries/negroni/RawFiles/Panel_samsung_amb670yf08_1440_3216_dsc_cmd.xml DSIInitSequence line 1: 39 9E + the DSC 1.2 PPS (128 bytes, version 0x12); */
++/* sent as the MIPI PPS packet (0x0A) after the on-command, as dsi_panel_update_pps does */
++static const uint8_t negroni_panel_pps[128] = {
++	0x12, 0x00, 0x00, 0xab, 0x30, 0x80, 0x09, 0x6c, 0x04, 0x38, 0x00, 0x24, 0x02, 0x1c, 0x02, 0x1c,
++	0x02, 0x00, 0x02, 0x3b, 0x00, 0x20, 0x03, 0x35, 0x00, 0x07, 0x00, 0x0e, 0x03, 0x34, 0x02, 0xd4,
++	0x18, 0x00, 0x10, 0xf0, 0x07, 0x10, 0x20, 0x00, 0x06, 0x0f, 0x0f, 0x33, 0x0e, 0x1c, 0x2a, 0x38,
++	0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7b, 0x7d, 0x7e, 0x02, 0x02, 0x22, 0x00, 0x2a, 0x40,
++	0x2a, 0xbe, 0x3a, 0xfc, 0x3a, 0xfa, 0x3a, 0xf8, 0x3b, 0x38, 0x3b, 0x78, 0x3b, 0xb6, 0x4b, 0xb6,
++	0x4b, 0xf4, 0x4b, 0xf4, 0x6c, 0x34, 0x84, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++#define NEGRONI_PANEL_ON_PACKETS        94
++
++/* NegroniFramebuffer.cpp (0268): the DPU auto-refresh and the TE/frame counters of INTF_1 */
++extern "C" bool negroni_fb_autorefresh_pause(uint32_t *saved);
++extern "C" void negroni_fb_autorefresh_resume(uint32_t saved);
++extern "C" bool negroni_fb_te_check(uint32_t *te, uint32_t *frames, uint32_t *tear, bool *rearmed);
++
+ class AppleARMBacklight : public IOService {
+ 	OSDeclareDefaultStructors(AppleARMBacklight);
+ 
+@@ -353,9 +621,11 @@ class AppleARMBacklight : public IOService {
+ 	void apply(uint32_t level, bool final);
+ 	void publish(uint32_t level);
+ 	void kick(void);
++	const char *wakePanel(char *info, size_t size);     /* 0268 */
+ 
+ public:
+ 	uint32_t            fMax, fNits, fSleepMode;
++	uint32_t            fWakeMode;      /* 0268 negronifb_wake: 0 sleep-out, 1 on-command (FIFO packets), 2 + PPS */
+ 	bool                fCurve, fLP;
+ 
+ 	bool startBacklight(void);
+@@ -406,8 +676,12 @@ AppleARMBacklight::startBacklight(void)
+ 	IOLog("NEGRONI BL: AppleARMBacklight up, DBV 0..%u, %s DCS, curve %s, sleep mode %u (%s)\n",
+ 	    fMax, fLP ? "low-power" : "high-speed", fCurve ? "square" : "linear", fSleepMode,
+ 	    fSleepMode == 0 ? "DBV 0 only" :
+-	    fSleepMode == 1 ? "DCS 0x28/0x10 off, 0x11/0x29 on" :
+-	    "DCS sleep; panel rails pm8350c_l12/l13 stay on (no panel re-init after a rail cycle): same as 1");
++	    fSleepMode == 1 ? "DCS 0x28/0x10 off" :
++	    "DCS sleep; panel rails pm8350c_l12/l13 stay on: same as 1");
++	IOLog("NEGRONI BL: wake mode %u (%s)\n", fWakeMode,
++	    fWakeMode == 0 ? "0x11/0x29 only, negronifb_wake=0" :
++	    fWakeMode == 1 ? "the 94-packet on-command without the long PPS packets, negronifb_wake=1" :
++	    "the 94-packet on-command incl. the 9E PPS + the 0x0A PPS from memory, negronifb_wake=2");
+ 	return true;
+ }
+ 
+@@ -475,21 +749,12 @@ AppleARMBacklight::step(void)
+ 		return;
+ 	}
+ 	const char *wake = NULL;
++	char wakeInfo[192];
++	wakeInfo[0] = 0;
+ 	if (edge) {
+ 		wake = "skipped";
+ 		if (!fPanelOn) {
+-			uint8_t c = 0x11;               /* exit_sleep_mode (mdss-dsi-on-command: 12 + 121 ms to 0x29) */
+-			int rc = negroni_dsi_dcs_write(&c, 1, fLP);
+-			if (rc != 0 || negroni_dsi_dead) {
+-				/* no sleep-out: the wait and 0x29 are useless, restore DBV now; the next wake retries */
+-				wake = "failed";
+-			} else {
+-				IOSleep(NEGRONI_BL_SLEEP_OUT_WAIT_MS);
+-				c = 0x29;               /* set_display_on */
+-				int rc2 = negroni_dsi_dcs_write(&c, 1, fLP);
+-				fPanelOn = true;
+-				wake = rc2 == 0 ? "ok" : "failed";
+-			}
++			wake = wakePanel(wakeInfo, sizeof(wakeInfo));
+ 		}
+ 	}
+ 	uint32_t level = to;
+@@ -513,14 +778,107 @@ AppleARMBacklight::step(void)
+ 	if (wake != NULL) {
+ 		uint64_t ns;
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - onAt, &ns);
+-		IOLog("NEGRONI FB: display on (sleep-out %u ms, DCS %s, panel DBV %u)\n",
+-		    (uint32_t)(ns / NSEC_PER_MSEC), wake, level);
++		IOLog("NEGRONI FB: display on (%s%ssleep-out %u ms, DCS %s, panel DBV %u)\n", wakeInfo,
++		    wakeInfo[0] != 0 ? "; " : "", (uint32_t)(ns / NSEC_PER_MSEC), wake, level);
+ 	}
+ 	if (more) {
+ 		fTimer->setTimeoutMS(NEGRONI_BL_STEP_MS);
+ 	}
+ }
+ 
++/*
++ * 0268: the panel wake as Android does it (dsi_display_enable -> dsi_panel_enable
++ * dsi_panel.c:5708-5760 sends DSI_CMD_SET_ON, then dsi_display.c:9165-9170
++ * dsi_panel_update_pps sends DSI_CMD_SET_PPS, both LP: live.dts has no
++ * on-command-state, dsi_panel.c:2678-2680 defaults to dsi_lp_mode, and the PPS set
++ * is LP at dsi_panel.c:2721). Android always powers the panel down and resets it
++ * before (dsi_panel_power_off/on); we keep the rails and the reset line and wake
++ * it from sleep-in (0258 off-command 0x28/0x10), so the full on-command re-writes
++ * every register the 0x11/0x29 wake left to the panel's memory: the 9E PPS
++ * (Samsung's own PPS write, 90 bytes: from memory), 9D 01 compression on, 0x11 +
++ * 12 ms, the C5/B9 blocks, 121 ms, the 120 Hz timing (60 00, BD[0x14]=00), 35 00
++ * TE on, 2A/2B the 1080x2412 window, the C3/F6/F4/B1/63 blocks, 53 28, 55 00,
++ * 0x29 (94 packets, live.dts line 35658). Then the MIPI PPS packet (0x0A, 128
++ * bytes, the PPS the UEFI programmed with the DPU's DSC encoders).
++ * During the set the DPU auto-refresh is paused (INTF_TEAR_AUTOREFRESH_CONFIG bit
++ * 31 off, as _sde_encoder_autorefresh_disable_seq1 sde_encoder_phys_cmd.c:2015 does
++ * before a commit): no frame transfer between the packets once 0x11 restarts the
++ * TE. After it the auto-refresh is re-armed (0x80000001) and the TE and frame
++ * counters are sampled for 50 ms (negroni_fb_te_check). The DSI controller
++ * itself is not touched by the panel's sleep (its clocks and command engine stay
++ * as the UEFI left them; Android re-inits it only after its own clock/power-off:
++ * dsi_display.c dsi_display_enable with continuous splash skips it too), so there
++ * is no controller re-init. negronifb_wake=1: the on-command without the
++ * packets that need the memory DMA (9E PPS, 0x0A PPS); =0: the 0258 sleep-out
++ * (0x11, 133 ms, 0x29). Backlight work loop.
++ */
++const char *
++AppleARMBacklight::wakePanel(char *info, size_t size)
++{
++	const char *wake;
++	uint32_t ar = 0;
++
++	if (negroni_dsi == NULL || negroni_dsi_dead) {
++		return "failed";
++	}
++	if (fWakeMode == 0) {
++		uint8_t c = 0x11;               /* exit_sleep_mode (mdss-dsi-on-command: 12 + 121 ms to 0x29) */
++		int rc = negroni_dsi_dcs_write(&c, 1, fLP);
++		if (rc != 0 || negroni_dsi_dead) {
++			/* no sleep-out: the wait and 0x29 are useless, restore DBV now; the next wake retries */
++			return "failed";
++		}
++		IOSleep(NEGRONI_BL_SLEEP_OUT_WAIT_MS);
++		c = 0x29;                       /* set_display_on */
++		int rc2 = negroni_dsi_dcs_write(&c, 1, fLP);
++		fPanelOn = true;
++		snprintf(info, size, "sleep-out 0x11/0x29 (negronifb_wake=0)");
++		return rc2 == 0 ? "ok" : "failed";
++	}
++	bool paused = negroni_fb_autorefresh_pause(&ar);
++	if (paused) {
++		/* _sde_encoder_autorefresh_disable_seq1: a frame still on its way ends first */
++		for (uint32_t i = 0; i < 1000 && (ndsi_rd(NDSI_STATUS) & NDSI_STATUS_MDP_BUSY); i++) {
++			IODelay(20);
++		}
++	}
++	struct negroni_dsi_set_result r;
++	int rc = negroni_dsi_dcs_set_ex(negroni_panel_on_command, sizeof(negroni_panel_on_command), fLP,
++	    NDSI_SET_GO_ON | (fWakeMode < 2 ? NDSI_SET_SKIP_LONG : 0), &r);
++	bool complete = r.packets == NEGRONI_PANEL_ON_PACKETS && (rc == 0 || r.longFailed != 0);
++	const char *pps = "PPS skipped (negronifb_wake=1)";
++	int prc = 0;
++	if (fWakeMode >= 2) {
++		if (complete && !negroni_dsi_dead) {
++			prc = negroni_dsi_long_packet(0x0a, negroni_panel_pps, sizeof(negroni_panel_pps), fLP);
++		}
++		pps = !complete ? "PPS not sent (set incomplete)" :
++		    r.longSent == 1 && prc == 0 ? "PPS ok" :
++		    r.longSent == 1 ? "PPS 9E ok, 0x0A failed" : "PPS failed";
++	}
++	bool rearmed = false;
++	if (paused) {
++		negroni_fb_autorefresh_resume(ar);
++	}
++	uint32_t te = 0, frames = 0, tear = 0;
++	bool sampled = negroni_fb_te_check(&te, &frames, &tear, &rearmed);
++	/* a set that broke off before its end: the next wake sends it again */
++	fPanelOn = complete || (r.sent != 0 && negroni_dsi_dead);
++	if (sampled) {
++		snprintf(info, size, "on-command %u packets%s, %s, TE %s: %u TE %u frames tear 0x%x in 50 ms%s, autorefresh 0x%08x%s",
++		    r.sent, r.skipped ? " (long ones skipped)" : "", pps, te != 0 ? "on" : "MISSING", te, frames, tear,
++		    rearmed ? " (re-armed)" : "", ar, paused ? " paused+resumed" : "");
++	} else {
++		snprintf(info, size, "on-command %u packets%s, %s, TE not sampled (no INTF_1 mapping)", r.sent,
++		    r.skipped ? " (long ones skipped)" : "", pps);
++	}
++	wake = complete ? (rc == 0 && prc == 0 ? "ok" : "ok except PPS") : "failed";
++	if (!complete) {
++		IOLog("NEGRONI BL: on-command stopped at packet %u of %u (rc %d)\n", r.packets, NEGRONI_PANEL_ON_PACKETS, rc);
++	}
++	return wake;
++}
++
+ void
+ AppleARMBacklight::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -693,9 +1051,12 @@ negroni_backlight_attach(IOService *provider)
+ 	PE_parse_boot_argn("negronifb_sleep", &sleep, sizeof(sleep));       /* 0258 */
+ 	PE_parse_boot_argn("negronibl_curve", &curve, sizeof(curve));
+ 	PE_parse_boot_argn("negronibl_hs", &hs, sizeof(hs));
++	uint32_t wakeMode = 2;
++	PE_parse_boot_argn("negronifb_wake", &wakeMode, sizeof(wakeMode));     /* 0268 */
+ 	bl->fMax = max < 16 ? 16 : MIN(max, (uint32_t)NEGRONI_BL_HW_MAX);
+ 	bl->fNits = nits == 0 ? 500 : nits;
+ 	bl->fSleepMode = MIN(sleep, 2u);
++	bl->fWakeMode = MIN(wakeMode, 2u);
+ 	bl->fCurve = curve != 0;
+ 	bl->fLP = hs == 0;      /* qcom,bl-dsc-cmd-state = "dsi_lp_mode" */
+ 	if (!bl->attach(provider)) {
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 34073cc..3803716 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -272,6 +272,7 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ #define INTF_TEAR_LINE_COUNT              0x2b0
+ #define INTF_TEAR_AUTOREFRESH_CONFIG      0x2b4   /* bit 31 enable, [15:0] frames per refresh */
+ #define INTF_TEAR_INTR_STATUS             0x804   /* 0x36800 + MDP_INTF_TEAR_INTR_STATUS_OFF */
++#define INTF_TEAR_INTR_CLEAR              0x808   /* 0268: bits 0 AUTOREFRESH_DONE 1 WR_PTR 2 RD_PTR 3 TE 4 TEAR */
+ #define NEGRONI_TE_VSYNC_CLK_HZ           19200000u
+ #define NEGRONI_TE_TARGET_DEFAULT         (-800)  /* tick 800 us before the next TE */
+ #define NEGRONI_TE_LOCK_US                500     /* |error| below this = locked */
+@@ -646,6 +647,7 @@ public:
+ 	bool          fVrrBusy;       /* thread call running (under fLock) */
+ 	bool          fVrrDisabled;   /* a switch failed: no more idle periods this boot (under fLock) */
+ 	uint32_t      fVrrOffWait;    /* display-off ticks spent waiting for a running VRR set */
++	vm_offset_t   fIntfWake;      /* 0268: INTF_1 for the wake check when neither fIntf nor fMdss is mapped */
+ 
+ 	void teInit(void);
+ 	void teTick(uint64_t now);
+@@ -682,6 +684,7 @@ public:
+ };
+ 
+ static AppleCLCD *negroni_fb_zc;          /* for the panic hook (negroni_fb_panic) */
++static AppleCLCD *negroni_fb_main;        /* 0268: for the backlight's wake (negroni_fb_te_check) */
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+@@ -786,6 +789,11 @@ AppleCLCD::start(IOService *provider)
+ 	fTickNominalAbs = fTickAbs;
+ 	zeroCopyInit();
+ 	teInit();
++	if (fIntf == 0 && fMdss == 0) {
++		/* 0268: the wake check reads the TE counter (negroni_fb_te_check) */
++		fIntfWake = ml_io_map_unmappable(NEGRONI_INTF1_PA, NEGRONI_INTF1_LEN, NEGRONI_WIMG_IO);
++	}
++	negroni_fb_main = this;
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -2548,6 +2556,98 @@ negroni_fb_panic(void)
+ 	negroni_backlight_panic();      /* 0258: a sleeping or dark panel shows the panic text */
+ }
+ 
++/*
++ * 0268: INTF_1 of the DSI display for the backlight's panel wake (NegroniBacklight.cpp
++ * wakePanel): pause the auto-refresh during the on-command, re-arm it after, and sample the
++ * TE and frame counters. Registers: sde_hw_intf.c:80-95 (INTF_TEAR_AUTOREFRESH_CONFIG 0x2B4,
++ * bit 31 enable, [15:0] frames per refresh; sde_hw_intf_setup_autorefresh_config :668-686),
++ * INTF_FRAME_COUNT 0xAC, the tear interrupt block +0x800 (sde_hw_interrupts.c:24-26).
++ */
++extern "C" bool negroni_fb_autorefresh_pause(uint32_t *saved);
++extern "C" void negroni_fb_autorefresh_resume(uint32_t saved);
++extern "C" bool negroni_fb_te_check(uint32_t *te, uint32_t *frames, uint32_t *tear, bool *rearmed);
++
++static vm_offset_t
++negroni_fb_intf(void)
++{
++	AppleCLCD *fb = negroni_fb_main;
++
++	if (fb == NULL) {
++		return 0;
++	}
++	return fb->fIntf != 0 ? fb->fIntf : fb->fMdss != 0 ? fb->fMdss + NEGRONI_INTF1_OFF : fb->fIntfWake;
++}
++
++extern "C" bool
++negroni_fb_autorefresh_pause(uint32_t *saved)
++{
++	vm_offset_t intf = negroni_fb_intf();
++
++	if (intf == 0) {
++		return false;
++	}
++	uint32_t ar = negroni_dpu_rd(intf + INTF_TEAR_AUTOREFRESH_CONFIG);
++	*saved = ar;
++	if (!(ar & (1u << 31))) {
++		return false;
++	}
++	negroni_dpu_wr(intf + INTF_TEAR_AUTOREFRESH_CONFIG, ar & ~(1u << 31));
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return true;
++}
++
++extern "C" void
++negroni_fb_autorefresh_resume(uint32_t saved)
++{
++	vm_offset_t intf = negroni_fb_intf();
++
++	if (intf == 0 || !(saved & (1u << 31))) {
++		return;
++	}
++	if (negroni_dpu_rd(intf + INTF_TEAR_AUTOREFRESH_CONFIG) & (1u << 31)) {
++		return;         /* 0259's VRR wake wrote it meanwhile */
++	}
++	negroni_dpu_wr(intf + INTF_TEAR_AUTOREFRESH_CONFIG, saved);
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * 50 ms of TE pulses (INT_COUNT_VAL frame field), INTF frames and the latched tear interrupt
++ * bits. TE pulses but no frame sign (no INTF frame, no AUTOREFRESH_DONE/WR_PTR bit): the
++ * auto-refresh is switched off and on once (re-arm) and measured again. Thread context.
++ */
++extern "C" bool
++negroni_fb_te_check(uint32_t *te, uint32_t *frames, uint32_t *tear, bool *rearmed)
++{
++	vm_offset_t intf = negroni_fb_intf();
++
++	*rearmed = false;
++	if (intf == 0) {
++		return false;
++	}
++	for (uint32_t pass = 0; pass < 2; pass++) {
++		negroni_dpu_wr(intf + INTF_TEAR_INTR_CLEAR, 0x1f);
++		uint32_t c0 = negroni_dpu_rd(intf + INTF_TEAR_INT_COUNT_VAL) >> 16, f0 = negroni_dpu_rd(intf + INTF_FRAME_COUNT);
++		IOSleep(50);
++		uint32_t c1 = negroni_dpu_rd(intf + INTF_TEAR_INT_COUNT_VAL) >> 16, f1 = negroni_dpu_rd(intf + INTF_FRAME_COUNT);
++		*te = (c1 - c0) & 0xffffu;
++		*frames = f1 - f0;
++		*tear = negroni_dpu_rd(intf + INTF_TEAR_INTR_STATUS) & 0x1fu;
++		bool sent = *frames != 0 || (*tear & 0x3u) != 0;
++		uint32_t ar = negroni_dpu_rd(intf + INTF_TEAR_AUTOREFRESH_CONFIG);
++		if (pass == 1 || *te == 0 || sent || !(ar & (1u << 31))) {
++			break;
++		}
++		negroni_dpu_wr(intf + INTF_TEAR_AUTOREFRESH_CONFIG, ar & ~(1u << 31));
++		__asm__ volatile ("dsb sy" ::: "memory");
++		IODelay(100);
++		negroni_dpu_wr(intf + INTF_TEAR_AUTOREFRESH_CONFIG, ar);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		*rearmed = true;
++	}
++	return true;
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {

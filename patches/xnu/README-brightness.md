@@ -12,6 +12,7 @@ Both patches apply on `base` together with all other `patches/xnu/0*.patch` (che
 | `0250-negroni-panel-brightness.patch` | New `iokit/Kernel/arm/NegroniBacklight.cpp`: DSI0 DCS writes (command DMA, FIFO mode) and an `AppleARMBacklight` service for CoreBrightness. Hook in `AppleCLCD::start`. |
 | `0251-negroni-display-sleep.patch` | Display off/on (RequestPowerChange) goes to the backlight (`negroni_backlight_display_power`). Since 2026-10-26 it has no `negroni_keys.c` hook any more (the power-key fast-off is gone); 0258 replaces its framebuffer hunk. |
 | `0258-negroni-display-sleep-sequence.patch` | Normal iOS display sleep: no kernel action on the power key; RequestPowerChange(0) = fade, then DBV 0 + DCS 0x28/0x10 (panel sleep); RequestPowerChange(1) = DCS 0x11, 133 ms, 0x29, last DBV, redraw. Boot-arg `negronifb_sleep`. Panic wakes the panel. |
+| `0268-negroni-panel-wake-on-command.patch` | The wake as Android does it: the panel's whole on-command (94 packets) + the 0x0A PPS, long packets by memory DMA, auto-refresh paused during the set, TE check after. Boot-arg `negronifb_wake` (2 default, 1 no long packets, 0 = 0258). See "0268" below. |
 
 0251 needs 0250, 0258 needs 0251 and 0252-0257 (framebuffer context). 0250 works alone (brightness slider; display sleep stays as in base).
 
@@ -121,7 +122,8 @@ Display sleep (0258, replaces the 0251 behaviour on 2026-10-26):
   133 ms wait and 0x29 are skipped, the DBV comes back at once, the line says `DCS failed`, and the next
   wake tries 0x11 again. The framebuffer redraws the latest frame at its next
   tick (<= 100 ms); the MDP sends it on the first TE. No panel reset and no full on-command: the panel
-  keeps its registers (DSC PPS, 0x53, 0x35 TE) in sleep [I until tested].
+  keeps its registers (DSC PPS, 0x53, 0x35 TE) in sleep [I until tested]. **Wrong [V phone 2026-10-26 13:24-13:30]:
+  black + a purple strip after every such wake. Replaced by 0268 (below).**
 - `negronifb_sleep=0`: DBV 0 + black pixels only (panel scans, as 0251 before). `=1` (default): DCS sleep.
   `=2`: also the panel rails if possible. The DT gives `vddio` = pm8350c_l12 (1.8 V) and `vci` =
   pm8350c_l13 (3.0 V), RPMh LDOs (`qcom,dsi-display-primary`, supply node
@@ -222,3 +224,28 @@ before. The visible fade is the backlight's DBV step. No boot-arg.
 Expected log on a screen-off (in this order, within ~30 ms): `display off: black in N us`, `display off (fade
 N ms, DCS sleep ok)`; the FB STAT lines around it keep `late ticks 0`. On the wake: `display on (sleep-out 133 ms,
 DCS ok, panel DBV N)` as with 0258.
+
+## 0268: wake with the full on-command and the PPS (2026-10-26, display agent)
+
+[V] Phone log 13:24-13:30 (kernel 074105, `negronifb_sleep=1`): `display on (sleep-out 133 ms, DCS ok, panel DBV 356)`
+after each wake, panel black with a purple strip; the owner then ran `negronifb_sleep=0` (0275 black only, works).
+Android sends the whole `qcom,mdss-dsi-on-command` and then the DSC PPS on every display on (dsi_panel.c:5708-5760,
+dsi_display.c:9165-9170), after a power-on reset; it never wakes from sleep-in with 0x11/0x29 alone.
+
+- `negronifb_wake=2` (default): DPU auto-refresh paused; the 120 Hz FHD on-command of live.dts line 35658 verbatim
+  (94 packets, LP, each with its own DT type, the post-waits 12 ms and 121 ms): `9E` PPS (90 bytes), `9D 01`, `11`,
+  C5/B9 blocks, `BD/F2/CB/60` 120 Hz state, `F2 00 01`, `35 00` TE on, `B9 00`, `2A 0000 0437`, `2B 0000 096B`, C3/F6/F4/B1/63
+  blocks, `53 28`, `55 00`, 1F block, `29`; then the MIPI PPS packet (0x0A, the UEFI's 128-byte PPS, version 0x12);
+  auto-refresh back on; 50 ms TE/frame check; the last DBV. `=1`: without the two long packets (they need the memory
+  DMA); `=0`: the 0258 sleep-out.
+- New DSI path: packets longer than the 64-byte FIFO go from a 16 KiB buffer at 0xbaafc000 (end of the splash region)
+  by memory DMA (DMA_CMD_OFFSET 0x048, DMA_FIFO_CTRL 0x050 bits 20/16, DMA_CTRL embedded, length, SW trigger;
+  dsi_ctrl_hw_cmn.c:870-919). A set holds a set lock (the 0259 VRR sets and the wake never interleave inside a Samsung
+  key).
+- Line: `NEGRONI FB: display on (on-command 94 packets, PPS ok, TE on: N TE N frames tear 0x.. in 50 ms, autorefresh
+  0x80000001 paused+resumed; sleep-out N ms, DCS ok, panel DBV N)`. Expected sleep-out ~0.2-0.5 s (133 ms of waits + 95
+  DMAs) [I].
+- Default `negronifb_sleep=1` stays in the code (it was 1); the images with the 0268 kernel carry `negronifb_sleep=1`
+  again. Fallbacks: `negronifb_wake=1`, `negronifb_wake=0`, `negronifb_sleep=0`.
+- Not done: the panel reset GPIO and the rails (Android's power-on), so `negronifb_sleep=2` is still 1; the panic wake
+  stays 0x11/0x29; DSI reads (no check of the panel's power mode 0x0A after the wake).

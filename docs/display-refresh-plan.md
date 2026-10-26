@@ -29,8 +29,9 @@ Decoded command sets: `scripts/display/panel-dts-dump.py` (this report's generat
 - The UEFI drives the FHD 120 Hz mode: panel XML lines 34-43 `DSIRefreshRate 0x780000` (120),
   `DSIEnableAutoRefresh True`, `DSIAutoRefreshFrameNumDiv 1`, `DSITECheckEnable True`,
   `DSITEUsingDedicatedTEPin True`, `DSITEvSyncStartPos 2412`, `DSITEvSyncInitVal 2412`, `DSITEvSyncSelect 1`.
-  The XML has an empty `DSIInitSequence`: the UEFI panel driver uses the on-command of the DTS (the
-  on-command ends in the 120 Hz state, see section 3).
+  The XML `DSIInitSequence` (lines 55-171) is the DTS on-command with `2C/00` fake frames in the 121 ms wait and the
+  PPS as `39 9E` + 128 bytes (version 0x12); it ends in the 120 Hz state (see section 3). (Corrected 2026-10-26: an
+  earlier version of this report said the sequence is empty.)
 
 ## 2. How Android does 120 Hz in command mode [V display-drivers]
 
@@ -191,3 +192,19 @@ gives CA its 120 Hz quantum.
    of each stage; pick the default.
 4. Later: a real rd_ptr interrupt (MDSS IRQ) instead of sampling; software kicks without auto-refresh (0234
    CTL path) to reach Android's no-frame idle; qsync auto mode.
+
+## 8. Follow-up patches 0292-0296 (2026-10-26, DSI/DPU agent; build-only)
+
+Details and log lines: patches/xnu/README-gpu-kernel.md sections 22-26. All default off.
+
+- Section 6 "Mode 2 sends 62 packets each way, each behind the MDP wait: ~100-300 ms per switch": 0292
+  `negronifb_dsidma=1` sends a set as Android does (memory DMA, batched up to the packet without the 0x40 flag, one
+  MDP wait per set). Mode 1 now sends the min-fps set in HS by default (DT state `dsi_hs_mode`, live.dts 35650).
+- Section 4 (e) "the 60/90 Hz switch with a re-programmed tearcheck": 0294 writes vsync_count 66/88/132 on each
+  mode 2 switch (sde_encoder_phys_cmd.c:1240-1259).
+- Section 4 (a) / section 7 item 4 "a real rd_ptr interrupt": 0295 `negronifb_teirq=1` (INTID 115, INTF_1 tear
+  rd_ptr at line init + 1) gives 0259's TE lock an interrupt stamp instead of the counter sample.
+- Section 4 (e) "Android-style no-autorefresh operation (software CTL_START per frame)": 0296 `negronifb_idle=2`.
+  With it, the min-fps hold of mode 1 would be the Android case (no frames while idle); combining both is not done
+  (0296 refuses `negronifb_vrr=1|3`, which own AUTOREFRESH_CONFIG).
+- ESD and panel reads: 0293 `negronifb_esd=1` (DCS 0x0a every 5 s, re-init through 0268's wake on a bad value).
