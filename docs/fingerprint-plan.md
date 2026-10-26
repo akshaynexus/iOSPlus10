@@ -426,3 +426,11 @@ register-mapped SPI device, not an MCU with the public message-pack protocol**. 
 public frames are a negative control (expected: MISO idle); the register frame (`gf_bus_dc_secspi_read_word`) lives
 in the TA code. Next decision for the owner: analyse the TA binary further (we own the file, it is not encrypted),
 or get the frame from a bus capture on a second device.
+
+## 8. Overlay rule since 0354 (2026-10-27)
+
+The overlay is never drawn from boot. `negronifp_hl=1|2` only allows it. The lock-screen glyph (dim grey rings,
+no fill, no HBM) needs `negronifp_hl=1` in the boot-args AND a root built with `FPD=1` (negroni-fpd writes
+`kern.negroni_fp_ui` from the SpringBoard lock state); it shows whenever the phone is locked with the screen on,
+so also over Control Center, Notification Center and the camera opened from the lock screen. The white disc (+ HBM
+in mode 1) shows only during 0353's capture while a finger is inside the circle. Details: patches/xnu/README-fingerprint.md "0354".

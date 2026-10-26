@@ -1,0 +1,651 @@
+Fingerprint 0354: the overlay only on the lock screen and in a capture; QUP1 hw-gated AHB clocks + BCM QUP1 vote.
+Owner (2026-10-27): "what is this fingerprint-reader overlay on the display while it is not connected to the
+fingerprint at all" / "fingerprint should only show on the lockscreen and not always, and the overlay has to be
+subtle, not a white thing". 0351 drew the white disc on every frame from boot (negronifp_hl=2 in the everything
+boot-args) and made every GPU frame wait on its copy fence.
+
+NegroniFramebuffer.cpp: negronifp_hl=1|2 (default 0) now only ALLOWS the overlay. What is shown
+(negroni_fp_hl_show): 0 nothing; 1 the lock-screen glyph (two thin 2 px rings at r and 0.55 r in a fixed dim grey
+0x505050, no blend, no fill, no HBM) while kern.negroni_fp_ui = 1; 2 the white disc of 0351 only while 0353's capture
+window is open (negroni_fp_capture_window, 2 s safety timeout) AND a finger is inside the circle (negroni_touch.c
+reports every finger to negroni_fp_touch). Drawn at each present (after the copy, as the badges) and at once on a
+state change (negroni_fp_overlay_update: the lock screen presents no frame; the pixels under the direct drawing
+are saved and put back when the overlay goes away, unless a present came in between; not while zero-copy is
+active). One IOLock around every drawing and state change (sysctl, touch thread, fp_thread, work loop); the save
+buffer and the lock are made once at the boot-arg parse. Fingers are tracked in every mode (the capture needs
+them with negronifp_hl=0 too); only the drawing is gated. Presents are counted in present(). No fence wait in
+presentFinish and no drawing when nothing is shown. Review fixes (Opus, 2026-10-27): F1 lock + one-time buffer,
+F2 fingers in every mode, F3 fixed colour, F4 present counter + limits listed in the code comment. The HBM DCS set goes with 0353's
+capture, not with the drawing; negronifp_hl=2 skips it (disc only). The boot-time "HBM once" callout of 0351 is gone.
+negroni_fp.c: sysctl kern.negroni_fp_ui (0/1, root writes; userland/fp/negroni-fpd sets it from the SpringBoard
+lock state); step 2: wrap_1 m_ahb/s_ahb in hardware clock gating mode (CBCR HW_CTL, CLK_OFF reads 1 while idle:
+0x80000002 on the phone) are not checked, as Linux clk_branch_wait and 0334 for QUP2; RPMh BCM "QUP1" vote
+(negroni_rpmh_qup_bcm of 0334, 5000 kBps, EBUSY retries; negronifp_bcm=0 skips, negronifp_bcm_kbps=N); step 11
+waits negronifp_fingerwait s (default 10) for a finger inside the circle before HBM + disc (no finger: no HBM, no
+disc, the protocol test runs anyway). Applies after 0334 and 0353.
+Details: patches/xnu/README-fingerprint.md "0354", docs/notes.md.
+
+diff --git a/bsd/dev/negroni_fp.c b/bsd/dev/negroni_fp.c
+index 90b3694..b103990 100644
+--- a/bsd/dev/negroni_fp.c
++++ b/bsd/dev/negroni_fp.c
+@@ -65,6 +65,7 @@
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <vm/vm_kern.h>
++#include <sys/sysctl.h>
+ #include "negroni_touch/tlmm.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -77,6 +78,10 @@ void negroni_fp_init(void);
+ int negroni_fp_irq_level(void);
+ extern int negroni_fp_hbm(bool on);                              /* 0351: NegroniFramebuffer.cpp, panel HBM DCS set */
+ extern int negroni_fb_te_wait(uint32_t frames, uint32_t timeout_ms);   /* 0353: NegroniFramebuffer.cpp, TE frame count */
++extern int negroni_rpmh_qup_bcm(const char *res, uint32_t avg_kbps, uint32_t peak_kbps, uint32_t *data_out);   /* 0334 */
++extern void negroni_fp_ui_set(int v);                           /* 0354: NegroniFramebuffer.cpp, lock-screen glyph */
++extern void negroni_fp_capture_window(bool on);                 /* 0354: the disc may show while open */
++extern int negroni_fp_finger_down(void);                        /* 0354: a finger inside the sensor circle */
+ 
+ /* physical bases */
+ #define FP_QUP1_PA        0x00ac0000u     /* qcom,qupv3_1_geni_se@ac0000 */
+@@ -114,6 +119,8 @@ extern int negroni_fb_te_wait(uint32_t frames, uint32_t timeout_ms);   /* 0353:
+ #define GCC_HALT_CORE_2X  0x3314cu
+ #define GCC_S2_CMD_RCGR   0x2827cu
+ #define CBCR_CLK_OFF      (1u << 31)
++#define CBCR_HW_CTL       (1u << 1)       /* 0354: hwcg_bit 1, the branch gates itself when idle (m_ahb, s_ahb) */
++#define QUP_CORE2X_100MHZ_KBPS 5000u      /* 0334: qcom-geni-se.h CORE_2X_100_MHZ, the qup-core icc vote */
+ #define RCG_CMD_UPDATE    (1u << 0)
+ #define RCG_CMD_ROOT_EN   (1u << 1)
+ #define RCG_CMD_ROOT_OFF  (1u << 31)
+@@ -277,11 +284,51 @@ gcc_branch_on(uint32_t vote_bit, vm_offset_t halt_base, uint32_t halt_off, const
+ 	if (!(v & vote_bit)) {
+ 		wr(fp.gcc_vote, GCC_VOTE - FP_GCC_VOTE_PAGE, v | vote_bit);
+ 	}
+-	if (!wait_for(halt_base, halt_off, CBCR_CLK_OFF, 0, 1000)) {
+-		printf("NEGRONI FP: clock %s does not come on (CBCR %#x)\n", name, rd(halt_base, halt_off));
+-		return false;
++	/*
++	 * 0354: a branch in hardware clock gating mode (CBCR HW_CTL set) is not checked: CLK_OFF reads 1
++	 * while the AHB is idle (Linux clk-branch.c clk_branch_wait; gcc-sm8450.c: wrap_1_m_ahb and
++	 * wrap_1_s_ahb have hwcg_bit 1). The phone read s_ahb CBCR 0x80000002 and 0350 stopped there
++	 * (logs/usblog-everything-0363.txt); 0334 made the same fix for QUP2.
++	 */
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t c = rd(halt_base, halt_off);
++		if (!(c & CBCR_CLK_OFF)) {
++			printf("NEGRONI FP: clock %s on (CBCR %#x)\n", name, c);
++			return true;
++		}
++		if (c & CBCR_HW_CTL) {
++			printf("NEGRONI FP: clock %s hw-gated (CBCR %#x: HW_CTL, not checked, as Linux)\n", name, c);
++			return true;
++		}
++		delay(1);
+ 	}
+-	return true;
++	printf("NEGRONI FP: clock %s does not come on (CBCR %#x)\n", name, rd(halt_base, halt_off));
++	return false;
++}
++
++/* 0354: RPMh BCM QUP1 vote (Linux geni_icc_enable, path "qup-core"), as 0334 for QUP2; failure is logged, not fatal */
++static void
++gcc_bcm_vote(void)
++{
++	int on = 1, kbps = (int)QUP_CORE2X_100MHZ_KBPS, e = EBUSY;
++	uint32_t data = 0;
++	(void)PE_parse_boot_argn("negronifp_bcm", &on, sizeof(on));
++	(void)PE_parse_boot_argn("negronifp_bcm_kbps", &kbps, sizeof(kbps));
++	if (!on) {
++		printf("NEGRONI FP: BCM QUP1 vote skipped (negronifp_bcm=0)\n");
++		return;
++	}
++	if (kbps <= 0 || kbps > 100000) {
++		kbps = (int)QUP_CORE2X_100MHZ_KBPS;
++	}
++	for (unsigned i = 0; i < 40 && e == EBUSY; i++) {       /* the RPMh voter is shared: retry while busy */
++		e = negroni_rpmh_qup_bcm("QUP1", (uint32_t)kbps, (uint32_t)kbps, &data);
++		if (e == EBUSY) {
++			IOSleep(50);
++		}
++	}
++	printf("NEGRONI FP: BCM QUP1 (qup1_core_master -> qup1_core_slave) avg = peak %d kBps: data %#x, errno %d%s\n", kbps, data, e,
++	    e ? " (not fatal: the core clocks may run on the boot chain's vote)" : "");
+ }
+ 
+ static bool
+@@ -535,6 +582,7 @@ spi_cmd_read(const uint8_t *cmd, uint32_t clen, uint8_t *in, uint32_t n, const c
+ 
+ static uint16_t gx_seq;
+ static int gx_irqwait_ms = 100;
++static int gx_fingerwait_s = 10;   /* 0354: negronifp_fingerwait */
+ 
+ /* message pack + message protocol around payload; returns the frame length */
+ static uint32_t
+@@ -825,9 +873,29 @@ fp_capture(uint32_t cap)
+ 		}
+ 		fp_img.cap = cap;
+ 	}
+-	int hb = negroni_fp_hbm(true);
+-	hbm_on = (hb == 0);
+-	printf("NEGRONI FP: capture: panel HBM on rc %d\n", hb);
++	/* 0354: the disc and HBM only with a finger on the sensor area (touch driver); wait negronifp_fingerwait s */
++	negroni_fp_capture_window(true);
++	bool finger = negroni_fp_finger_down() != 0;
++	for (int i = 0; i < gx_fingerwait_s * 10 && !finger; i++) {
++		if (i == 0) {
++			printf("NEGRONI FP: capture: put a finger on the sensor area (%d s)\n", gx_fingerwait_s);
++		}
++		IOSleep(100);
++		finger = negroni_fp_finger_down() != 0;
++		if (!finger && (i % 10) == 9) {
++			negroni_fp_capture_window(true);        /* re-arm the 2 s window every 1 s while waiting */
++		}
++	}
++	int hb = 0;
++	if (finger) {
++		negroni_fp_capture_window(true);        /* fresh 2 s window: the disc is drawn now */
++		hb = negroni_fp_hbm(true);
++		hbm_on = (hb == 0);
++		printf("NEGRONI FP: capture: finger on the sensor: panel HBM on rc %d\n", hb);
++	} else {
++		printf("NEGRONI FP: capture: no finger on the sensor area in %d s: no HBM, no disc (the protocol test runs anyway)\n",
++		    gx_fingerwait_s);
++	}
+ 	int te = negroni_fb_te_wait(2, 100);
+ 	if (te < 0) {
+ 		IOSleep(17);            /* 2 frames at 120 Hz; the TE counter needs negronifb_te=1 */
+@@ -844,9 +912,12 @@ fp_capture(uint32_t cap)
+ 	int level = 0, irq = irq_wait(gx_irqwait_ms < 100 ? gx_irqwait_ms : 100, &level);
+ 	printf("NEGRONI FP: capture: irq40 %s (level %d)\n", irq >= 0 ? "changed" : "unchanged", level);
+ 	/* the exposure is at the frame; the readout needs no light: HBM off before the (long) bulk read */
+-	hb = negroni_fp_hbm(false);
++	negroni_fp_capture_window(false);       /* 0354: the disc goes away with the exposure */
++	if (hbm_on) {
++		hb = negroni_fp_hbm(false);
++		printf("NEGRONI FP: capture: panel HBM off rc %d\n", hb);
++	}
+ 	hbm_on = false;
+-	printf("NEGRONI FP: capture: panel HBM off rc %d\n", hb);
+ 
+ 	/* bounded read: FIFO pieces under one chip select; stop after 16 idle pieces when nothing looked like data */
+ 	{
+@@ -903,6 +974,7 @@ fp_capture(uint32_t cap)
+ 		fp_img.ready = true;
+ 	}
+ done:
++	negroni_fp_capture_window(false);
+ 	if (hbm_on) {                   /* the tx-failure path */
+ 		hb = negroni_fp_hbm(false);
+ 		printf("NEGRONI FP: capture: panel HBM off rc %d\n", hb);
+@@ -988,6 +1060,35 @@ fp_dev_init(void)
+ 	devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0600, "negroni-fp");
+ }
+ 
++/*
++ * 0354: kern.negroni_fp_ui: 0 = nothing, 1 = the lock-screen glyph (NegroniFramebuffer.cpp). Written by
++ * userland/fp/negroni-fpd from the SpringBoard notifications com.apple.springboard.lockstate and
++ * com.apple.springboard.hasBlankedScreen (root). Readable by all.
++ */
++static int fp_ui_state;
++
++static int
++sysctl_fp_ui(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int v = fp_ui_state, changed = 0, error;
++
++	error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (req->p != NULL && proc_suser(req->p) != 0) {
++		return EPERM;
++	}
++	if (v != 0 && v != 1) {
++		return EINVAL;
++	}
++	fp_ui_state = v;
++	negroni_fp_ui_set(v);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, negroni_fp_ui, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY,
++    NULL, 0, sysctl_fp_ui, "I", "NEGRONI fingerprint overlay: 0 hidden, 1 lock-screen glyph (root writes)");
++
+ /* ---- power and pins ---- */
+ 
+ static void
+@@ -1060,6 +1161,10 @@ fp_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 		gx_irqwait_ms = 100;
+ 	}
+ 	(void)PE_parse_boot_argn("negronifp_img", &img, sizeof(img));
++	(void)PE_parse_boot_argn("negronifp_fingerwait", &gx_fingerwait_s, sizeof(gx_fingerwait_s));
++	if (gx_fingerwait_s < 0 || gx_fingerwait_s > 600) {
++		gx_fingerwait_s = 10;
++	}
+ 	if (img < 64 || img > FP_IMG_MAX) {
+ 		img = FP_IMG_DEFAULT;
+ 	}
+@@ -1090,7 +1195,8 @@ fp_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 	}
+ 	log_pins("at start");
+ 
+-	step(2, "GCC: QUP1 AHB/core votes, s2 RCG to XO 19.2 MHz, s2 clock");
++	step(2, "GCC: BCM QUP1 vote, QUP1 AHB/core votes (hw-gated AHB branches not checked), s2 RCG to XO 19.2 MHz, s2 clock");
++	gcc_bcm_vote();
+ 	fp.vote_before = rd(fp.gcc_vote, GCC_VOTE - FP_GCC_VOTE_PAGE);
+ 	printf("NEGRONI FP: APCS vote %#x, CBCR m_ahb %#x s_ahb %#x core %#x core2x %#x s2 %#x\n", fp.vote_before,
+ 	    rd(fp.gcc_qup, GCC_HALT_M_AHB - FP_GCC_QUP_PAGE), rd(fp.gcc_qup, GCC_HALT_S_AHB - FP_GCC_QUP_PAGE),
+diff --git a/bsd/dev/negroni_touch.c b/bsd/dev/negroni_touch.c
+index f2d8d24..f313b50 100644
+--- a/bsd/dev/negroni_touch.c
++++ b/bsd/dev/negroni_touch.c
+@@ -24,6 +24,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void IOSleep(unsigned int milliseconds);
+ extern void negroni_hid_touch(int finger, int down, int x, int y);
++extern void negroni_fp_touch(int finger, int down, int x, int y);   /* 0354: NegroniFramebuffer.cpp, fingerprint overlay */
+ void negroni_touch_init(void);
+ 
+ /* TLMM pages of GPIO16..23: SDA 16, SCL 17, reset 20, ATTN 21 */
+@@ -93,6 +94,7 @@ touch_report(void)
+ 		mask |= bit;
+ 		if (!(st.active & bit) || x != st.x[id] || y != st.y[id]) {
+ 			negroni_hid_touch((int)id, 1, x, y);
++			negroni_fp_touch((int)id, 1, x, y);
+ 			if (st.log && !(st.active & bit)) {
+ 				printf("NEGRONI TOUCH: finger %u down %d,%d\n", id, x, y);
+ 			}
+@@ -104,6 +106,7 @@ touch_report(void)
+ 		uint32_t bit = 1u << id;
+ 		if ((st.active & bit) && !(mask & bit)) {
+ 			negroni_hid_touch((int)id, 0, st.x[id], st.y[id]);
++			negroni_fp_touch((int)id, 0, st.x[id], st.y[id]);
+ 		}
+ 	}
+ 	st.active = mask;
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 5f93636..b34939c 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -2021,10 +2021,50 @@ extern "C" int negroni_fp_hbm(bool on);
+ 
+ static int negroni_fp_hl = -1;
+ static int negroni_fp_hl_x = 540, negroni_fp_hl_y = 2080, negroni_fp_hl_r = 95;
+-static bool negroni_fp_hbm_sent, negroni_fp_hbm_state;
+-static thread_call_t negroni_fp_hbm_call;
++static bool negroni_fp_hbm_state;
+ static uint64_t negroni_fp_hl_frames;
+ 
++/*
++ * 0354: the highlight is no longer drawn from boot. What is shown (negroni_fp_hl_show):
++ *   0  nothing (default: the phone unlocked, or no negronifp_hl, or no capture)
++ *   1  the lock-screen glyph: two thin rings at the sensor position in a fixed dim grey (0x505050; a
++ *      fixed colour, not a blend, so a re-copy or a re-draw of the same frame changes nothing), no
++ *      fill, no HBM. Shown while kern.negroni_fp_ui = 1 (userland/fp/negroni-fpd sets it from the
++ *      SpringBoard lock state: locked and the screen on).
++ *   2  the capture disc: the filled white disc of 0351, only while 0353's capture window is open
++ *      (negroni_fp_capture_window(true) .. (false), 2 s safety timeout) AND a finger is down inside
++ *      the circle (negroni_touch.c reports every finger to negroni_fp_touch). The HBM DCS set goes
++ *      with the capture (negroni_fp.c), not with the drawing.
++ * The drawing happens at each present (after the GPU copy, as the badges) and at once when the state
++ * changes (negroni_fp_overlay_update: the lock screen is static, so a present may not come). The
++ * pixels under the direct drawing are saved and put back when the overlay goes away, unless a
++ * present came in between (then the next frame simply carries no overlay). All drawing and all
++ * state changes run under negroni_fp_lock (the sysctl, the touch thread, fp_thread and the work
++ * loop's presentFinish call in). No per-frame cost when nothing is shown: present() does not wait
++ * on the copy fence for the highlight.
++ * Known limits [I]: (a) the restore uses the present counter: a present that did not rewrite the
++ * area (a partial copy, a dbuf flip of an older frame) makes the restore put back a stale
++ * (2r+1)^2 patch for one frame; (b) a frame copied while a direct drawing holds the lock gets its
++ * overlay only at the next state change or present (one frame without the glyph); (c) no direct
++ * drawing on the frame the engine shows under zero-copy.
++ */
++static int negroni_fp_ui;                 /* kern.negroni_fp_ui: 0 hidden, 1 glyph */
++static bool negroni_fp_cap_open;          /* 0353 capture window */
++static uint64_t negroni_fp_cap_deadline;  /* mach time; the window closes itself after 2 s */
++static uint32_t negroni_fp_fingers;       /* touch ids inside the circle */
++static int negroni_fp_shown;              /* what the panel memory holds now (0/1/2) */
++static uint64_t negroni_fp_shown_frame;   /* negroni_fp_hl_frames when it was drawn directly */
++static uint32_t *negroni_fp_save;         /* pixels under a direct drawing, (2r+1)^2; allocated once with the lock */
++static IOLock *negroni_fp_lock;           /* one lock around every drawing and every state change */
++static int negroni_fp_init_state;         /* 0 not yet, 1 in progress, 2 done */
++static uint32_t negroni_fp_direct, negroni_fp_restores;
++#define NEGRONI_FP_GLYPH_PX 0xff505050u   /* the glyph colour: a fixed dim grey (idempotent over re-copies) */
++extern "C" void negroni_fp_overlay_update(void);
++extern "C" int negroni_fp_finger_down(void);
++extern "C" void negroni_fp_ui_set(int v);
++extern "C" void negroni_fp_capture_window(bool on);
++extern "C" void negroni_fp_touch(int finger, int down, int x, int y);
++
+ /* live.dts 33140/33139: {type, last, vc, ack, wait ms, len hi, len lo, payload...} per packet */
+ static const uint8_t negroni_fp_hbm_on[] = {
+ 	0x39, 0x00, 0x00, 0x40, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a,
+@@ -2077,11 +2117,17 @@ negroni_fp_send_set(const uint8_t *set, uint32_t len, uint32_t *sent)
+ 	return rc;
+ }
+ 
+-/* Thread context (0250: the DSI write sleeps on its lock). */
++static int negroni_fp_hl_mode(void);
++
++/* Thread context (0250: the DSI write sleeps on its lock). 0354: mode 2 = disc without HBM: no DCS. */
+ extern "C" int
+ negroni_fp_hbm(bool on)
+ {
+ 	uint32_t sent = 0;
++	if (negroni_fp_hl_mode() == 2) {
++		IOLog("NEGRONI FP HL: panel HBM %s skipped (negronifp_hl=2: disc only)\n", on ? "on" : "off");
++		return 0;
++	}
+ 	int rc = on ? negroni_fp_send_set(negroni_fp_hbm_on, sizeof(negroni_fp_hbm_on), &sent)
+ 	    : negroni_fp_send_set(negroni_fp_hbm_off, sizeof(negroni_fp_hbm_off), &sent);
+ 	if (rc == 0) {
+@@ -2091,18 +2137,20 @@ negroni_fp_hbm(bool on)
+ 	return rc;
+ }
+ 
+-static void
+-negroni_fp_hbm_callout(thread_call_param_t p0, thread_call_param_t p1)
+-{
+-	(void)p0;
+-	(void)p1;
+-	(void)negroni_fp_hbm(true);
+-}
+-
+ static int
+ negroni_fp_hl_mode(void)
+ {
+-	if (negroni_fp_hl < 0) {
++	int st = __atomic_load_n(&negroni_fp_init_state, __ATOMIC_ACQUIRE);
++	if (st == 2) {
++		return negroni_fp_hl;
++	}
++	if (st == 1 || !__atomic_compare_exchange_n(&negroni_fp_init_state, &st, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++		while (__atomic_load_n(&negroni_fp_init_state, __ATOMIC_ACQUIRE) != 2) {
++			delay(10);              /* another thread parses the boot-args and makes the lock */
++		}
++		return negroni_fp_hl;
++	}
++	{
+ 		negroni_fp_hl = 0;
+ 		PE_parse_boot_argn("negronifp_hl", &negroni_fp_hl, sizeof(negroni_fp_hl));
+ 		PE_parse_boot_argn("negronifp_hl_x", &negroni_fp_hl_x, sizeof(negroni_fp_hl_x));
+@@ -2111,58 +2159,221 @@ negroni_fp_hl_mode(void)
+ 		if (negroni_fp_hl < 0 || negroni_fp_hl > 2 || negroni_fp_hl_r < 4 || negroni_fp_hl_r > 400) {
+ 			negroni_fp_hl = 0;
+ 		}
++		negroni_fp_lock = IOLockAlloc();
++		if (negroni_fp_lock == NULL) {
++			negroni_fp_hl = 0;
++		}
+ 		if (negroni_fp_hl) {
+-			IOLog("NEGRONI FP HL: highlight on (mode %d): disc at %d,%d radius %d panel px%s\n", negroni_fp_hl,
+-			    negroni_fp_hl_x, negroni_fp_hl_y, negroni_fp_hl_r, negroni_fp_hl == 1 ? ", panel HBM once" : "");
++			const size_t n = (size_t)(2 * negroni_fp_hl_r + 1) * (2 * negroni_fp_hl_r + 1) * 4;
++			negroni_fp_save = (uint32_t *)IOMalloc(n);      /* once: r is fixed from here on */
++		}
++		if (negroni_fp_hl) {
++			IOLog("NEGRONI FP HL: highlight allowed (mode %d): disc at %d,%d radius %d panel px; "
++			    "glyph while kern.negroni_fp_ui=1, disc while a capture has a finger%s\n", negroni_fp_hl,
++			    negroni_fp_hl_x, negroni_fp_hl_y, negroni_fp_hl_r, negroni_fp_hl == 1 ? ", panel HBM in the capture" : "");
+ 		}
+ 	}
++	__atomic_store_n(&negroni_fp_init_state, 2, __ATOMIC_RELEASE);
+ 	return negroni_fp_hl;
+ }
+ 
+-/* A filled white disc at the sensor position, drawn into the panel memory after a copy. */
+-static void
+-negroni_fp_draw_highlight(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
++/* What the overlay shows now: 0 nothing, 1 glyph, 2 capture disc. */
++static int
++negroni_fp_hl_show(void)
+ {
+-	int mode = negroni_fp_hl_mode();
+-	if (mode == 0 || pixels == 0) {
+-		return;
++	if (negroni_fp_hl_mode() == 0) {
++		return 0;
++	}
++	if (negroni_fp_cap_open) {
++		if (mach_absolute_time() > negroni_fp_cap_deadline) {
++			negroni_fp_cap_open = false;
++			IOLog("NEGRONI FP HL: capture window timed out (2 s)\n");
++		} else if (negroni_fp_fingers != 0) {
++			return 2;
++		}
+ 	}
++	return negroni_fp_ui == 1 ? 1 : 0;
++}
++
++/*
++ * what == 2: a filled white disc; what == 1: two thin rings (2 px) at r and at 0.55 r in the fixed dim grey.
++ * save != NULL: the pixels before the drawing go there ((2r+1)^2, row-major from cx-r, cy-r).
++ */
++static void
++negroni_fp_paint(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height, int what, uint32_t *save)
++{
+ 	const int cx = negroni_fp_hl_x, cy = negroni_fp_hl_y, r = negroni_fp_hl_r;
++	const int r2 = r * r, ri = (r - 2) * (r - 2);
++	const int rb = (r * 55) / 100, rb2 = rb * rb, rbi = (rb - 2) * (rb - 2);
+ 	for (int y = cy - r; y <= cy + r; y++) {
+ 		if (y < 0 || y >= (int)height) {
+ 			continue;
+ 		}
+-		int dy = y - cy, dx = 0;
+-		while (dx * dx + dy * dy <= r * r) {
+-			dx++;
+-		}
+-		dx--;
+-		int x0 = cx - dx, x1 = cx + dx;
+-		if (x0 < 0) {
+-			x0 = 0;
+-		}
+-		if (x1 >= (int)width) {
+-			x1 = (int)width - 1;
+-		}
+ 		uint32_t *row = (uint32_t *)(pixels + (uint64_t)y * rowBytes);
+-		for (int x = x0; x <= x1; x++) {
+-			row[x] = 0xffffffffu;
++		const int dy = y - cy;
++		for (int x = cx - r; x <= cx + r; x++) {
++			if (x < 0 || x >= (int)width) {
++				continue;
++			}
++			const int dx = x - cx, d2 = dx * dx + dy * dy;
++			if (save != NULL) {
++				save[(y - (cy - r)) * (2 * r + 1) + (x - (cx - r))] = row[x];
++			}
++			if (what == 2) {
++				if (d2 <= r2) {
++					row[x] = 0xffffffffu;
++				}
++			} else if ((d2 <= r2 && d2 >= ri) || (d2 <= rb2 && d2 >= rbi)) {
++				row[x] = NEGRONI_FP_GLYPH_PX;
++			}
+ 		}
+ 	}
++}
++
++/* at each present, after the copy: the panel memory holds a fresh frame, nothing to save */
++static void
++negroni_fp_draw_highlight(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
++{
++	if (negroni_fp_hl_mode() == 0) {
++		return;
++	}
++	IOLockLock(negroni_fp_lock);
++	int what = negroni_fp_hl_show();
++	if (what == 0 || pixels == 0) {
++		negroni_fp_shown = 0;
++	} else {
++		negroni_fp_paint(pixels, rowBytes, width, height, what, NULL);
++		negroni_fp_shown = what;
++	}
++	IOLockUnlock(negroni_fp_lock);
++}
++
++/* present(): one count per frame on the panel memory path (the restore's "no present since" test) */
++static inline void
++negroni_fp_present_tick(void)
++{
+ 	negroni_fp_hl_frames++;
+-	if (mode == 1 && !negroni_fp_hbm_sent) {
+-		negroni_fp_hbm_sent = true;
+-		if (negroni_fp_hbm_call == NULL) {
+-			negroni_fp_hbm_call = thread_call_allocate(&negroni_fp_hbm_callout, NULL);
+-		}
+-		if (negroni_fp_hbm_call != NULL) {
+-			uint64_t deadline;
+-			clock_interval_to_deadline(50, kMillisecondScale, &deadline);
+-			thread_call_enter_delayed(negroni_fp_hbm_call, deadline);
++}
++
++/*
++ * Direct drawing on a state change (any thread; the lock screen may present no frame). Not while
++ * the pipes fetch a framebuffer (zero-copy; that frame is not in the panel memory): the next copy
++ * draws it. The previous direct drawing is restored first when no present came after it.
++ */
++extern "C" void
++negroni_fp_overlay_update(void)
++{
++	AppleCLCD *fb = negroni_fb_main;
++	if (fb == NULL || fb->fPixels == 0 || negroni_fp_hl_mode() == 0) {
++		return;
++	}
++	IOLockLock(negroni_fp_lock);
++	int what = negroni_fp_hl_show();
++	if (what == negroni_fp_shown) {
++		IOLockUnlock(negroni_fp_lock);
++		return;
++	}
++	const int r = negroni_fp_hl_r;
++	if (fb->fZCActive) {
++		negroni_fp_shown = 0;           /* that picture is not ours to touch; the next copy draws */
++		IOLockUnlock(negroni_fp_lock);
++		return;
++	}
++	uintptr_t px = fb->fPixels;
++	uint32_t rb = fb->fRowBytes, w = fb->fWidth, h = fb->fHeight;
++	/* put the saved pixels back when they are still the picture under the drawing */
++	if (negroni_fp_shown != 0 && negroni_fp_save != NULL && negroni_fp_shown_frame == negroni_fp_hl_frames) {
++		const int cx = negroni_fp_hl_x, cy = negroni_fp_hl_y;
++		for (int y = cy - r; y <= cy + r; y++) {
++			if (y < 0 || y >= (int)h) {
++				continue;
++			}
++			uint32_t *row = (uint32_t *)(px + (uint64_t)y * rb);
++			for (int x = cx - r; x <= cx + r; x++) {
++				if (x >= 0 && x < (int)w) {
++					row[x] = negroni_fp_save[(y - (cy - r)) * (2 * r + 1) + (x - (cx - r))];
++				}
++			}
+ 		}
++		negroni_fp_restores++;
++	}
++	negroni_fp_shown = 0;
++	if (what != 0) {
++		negroni_fp_paint(px, rb, w, h, what, negroni_fp_save);
++		negroni_fp_shown = what;
++		negroni_fp_shown_frame = negroni_fp_hl_frames;
++		negroni_fp_direct++;
++	}
++	uint32_t fingers = negroni_fp_fingers, direct = negroni_fp_direct, restores = negroni_fp_restores;
++	bool open = negroni_fp_cap_open;
++	int ui = negroni_fp_ui;
++	IOLockUnlock(negroni_fp_lock);
++	IOLog("NEGRONI FP HL: overlay %s (ui %d, capture %s, fingers %#x; direct %u, restores %u, frames %llu)\n",
++	    what == 2 ? "capture disc" : what == 1 ? "lock-screen glyph" : "off", ui, open ? "open" : "closed",
++	    fingers, direct, restores, negroni_fp_hl_frames);
++}
++
++/* kern.negroni_fp_ui (negroni_fp.c sysctl; negroni-fpd writes it from the SpringBoard lock state) */
++extern "C" void
++negroni_fp_ui_set(int v)
++{
++	if (negroni_fp_hl_mode() == 0) {
++		return;
++	}
++	IOLockLock(negroni_fp_lock);
++	negroni_fp_ui = v ? 1 : 0;
++	IOLockUnlock(negroni_fp_lock);
++	negroni_fp_overlay_update();
++}
++
++/* 0353's capture: the window in which a finger on the sensor shows the disc */
++extern "C" void
++negroni_fp_capture_window(bool on)
++{
++	if (negroni_fp_hl_mode() == 0) {
++		return;
++	}
++	IOLockLock(negroni_fp_lock);
++	if (on) {
++		clock_interval_to_deadline(2000, kMillisecondScale, &negroni_fp_cap_deadline);
++	}
++	negroni_fp_cap_open = on;
++	IOLockUnlock(negroni_fp_lock);
++	negroni_fp_overlay_update();
++}
++
++/*
++ * negroni_touch.c: every finger report (down = 1 on down and move, 0 on up), panel pixels. The
++ * fingers are tracked in every mode (0353's capture needs the finger with negronifp_hl=0 too);
++ * only the drawing is gated by negronifp_hl.
++ */
++extern "C" void
++negroni_fp_touch(int finger, int down, int x, int y)
++{
++	if (finger < 0 || finger > 31) {
++		return;
++	}
++	(void)negroni_fp_hl_mode();     /* parses x, y, r and makes the lock */
++	const int dx = x - negroni_fp_hl_x, dy = y - negroni_fp_hl_y, r = negroni_fp_hl_r;
++	uint32_t bit = 1u << finger, now = (down && dx * dx + dy * dy <= r * r) ? bit : 0;
++	bool changed, open;
++	IOLockLock(negroni_fp_lock);
++	uint32_t before = negroni_fp_fingers;
++	negroni_fp_fingers = (before & ~bit) | now;
++	changed = negroni_fp_fingers != before;
++	open = negroni_fp_cap_open;
++	IOLockUnlock(negroni_fp_lock);
++	if (changed && open) {
++		negroni_fp_overlay_update();
+ 	}
+ }
+ 
++extern "C" int
++negroni_fp_finger_down(void)
++{
++	return __atomic_load_n(&negroni_fp_fingers, __ATOMIC_ACQUIRE) != 0;
++}
++
+ 
+ /*
+  * held: the frame's surfaces swap() holds for a GPU present (NULL entries: that layer, if any,
+@@ -2369,7 +2580,8 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 	}
+ 	fFinishTop = cpuShift;
+ 	fFinishFence = fence;
+-	fFinishPending = cpuShift || negroni_badges != 0 || negroni_fp_hl_mode() > 0;   /* 0351: disc on every frame */
++	negroni_fp_present_tick();      /* 0354: a frame on the panel memory path */
++	fFinishPending = cpuShift || negroni_badges != 0 || negroni_fp_hl_show() > 0;   /* 0351/0354: only while shown */
+ 	if (fFinishPending && (!fNotifyLate || fence == 0 || fZCActive)) {
+ 		presentFinish();
+ 	}
+@@ -2389,7 +2601,7 @@ AppleCLCD::presentFinish(void)
+ 
+ 	fFinishPending = false;
+ 	bool copied = true;             /* the GPU's copy of this frame is in the panel memory */
+-	if (fence != 0 && (topRedrawn || negroni_badges > 0 || negroni_fp_hl_mode() > 0)) {
++	if (fence != 0 && (topRedrawn || negroni_badges > 0 || negroni_fp_hl_show() > 0)) {
+ 		/* the CPU draws over the GPU's picture: after it */
+ 		copied = NegroniGPUFenceWait(fence, NEGRONI_FB_GPU_COPY_WAIT_MS);
+ 	}
+@@ -2406,7 +2618,7 @@ AppleCLCD::presentFinish(void)
+ 		}
+ 	}
+ 	negroni_draw_badge(fPixels, fRowBytes, fWidth, fHeight);
+-	negroni_fp_draw_highlight(fPixels, fRowBytes, fWidth, fHeight);   /* 0351 */
++	negroni_fp_draw_highlight(fPixels, fRowBytes, fWidth, fHeight);   /* 0351/0354 */
+ }
+ 
+ /*

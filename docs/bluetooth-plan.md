@@ -46,6 +46,7 @@ Tags: **[V]** = checked in the named file; **[I]** = inference, not tested on th
 | B1 (0332) | `negronibt=4`: step 20 (ADT BD address -> 0xfc14), kernel control `com.apple.uart.bluetooth`, `/dev/uart.bluetooth`, `/dev/cu.bluetooth`, `/dev/btwake`, RX thread with IBS | code + full kernel build (README-bluetooth.md stage B), not run on the phone |
 | B2 (0333) | HCI shim: every host OGF 0x3f command answered in the kernel (Broadcom write commands status 0, others 0x01), QCA vendor events dropped | code + build, not run |
 | B3 (userland) | `negroni-bluetool` (BlueTool stand-in), `hcitest`; `BT=1` root (scripts/bt/root-add-bt.sh) or `scripts/bt/phone-bt.sh on`; ADT node with `ADT_BT=1` | built (out/bt/userland), not run |
+| A1 fix (0334) | step 4: hardware-gated AHB branches (CBCR HW_CTL) count as running, as Linux clk_branch_wait; RPMh BCM QUP2 vote (qup-core). Root cause of the everything-boot stop (s_ahb CBCR 0x80000002) | code + build 2026-10-27, not run |
 
 Firmware for stage A2 [V scripts]: one file `negroni-bt.bin` (pack: `NEGRBTFW` header + 105 hp* files) inside the
 WLAN firmware area (userdata blocks N-19457 .. N-11266, same format, 199 files); `scripts/bt/mkbtarea.sh` builds it.
@@ -81,6 +82,12 @@ No new userdata area. Layout: patches/xnu/README-bluetooth.md section 0331.
 - Kernel boot-args: `negronibt=4 negronipanic=30 negronipanicreason=2` (README-bluetooth.md "Boot-args for stage B").
 
 ## 5. Next steps
+
+0. (2026-10-27) [V] The everything boot (logs/usblog-everything-0363.txt) stopped at step 4 because s_ahb is a
+   hardware-gated branch (CBCR 0x80000002); 0334 fixes the check. [V] The WLAN area on the phone holds the BT pack
+   (199 files); the ADT `bluetooth` node, the bluetoothd job, negroni-bluetool and the keychain work
+   (logs/phone-log-20261027-004129.txt). Next boot: a kernel with 0334, `negronibt=4`; the proof table is in
+   patches/xnu/README-bluetooth.md "0334".
 
 1. Owner approval, then write `out/firmware/wlan-area.bin` (with the BT pack) and boot `out/ios16-bt` (`negronibt=3`).
    Expect `step 5` protocol 2, `step 7 ... SW_CTRL 1`, `9 HCI_RESET: Command Complete status 0`, `10 QCA product ...`,

@@ -8,6 +8,8 @@
 #   Stage A/B image: scripts/fp/build-test-image.sh fp "negronifp=2 negronifp_hl=1 negronipanic=30 negronipanicreason=2"
 #   KERNEL_ONLY=1 scripts/fp/build-test-image.sh      kernel build only (proof build, no image)
 #   Capture image:   scripts/fp/build-test-image.sh fp4 "negronifp=4 negronifp_hl=2 negronifb_te=1 negronipanic=30 negronipanicreason=2"
+#   (0354: negronifp_hl only allows the overlay: the disc shows in the capture with a finger on the sensor, the
+#    lock-screen glyph with FPD=1 root-finish; nothing from boot)
 # Output: out/kernel/local-<time>/kernel.development.negroni (link out/kernel/kernel.macho), out/ios16-NAME/.
 set -eu
 . "$(dirname "$0")/../lib/env.sh"

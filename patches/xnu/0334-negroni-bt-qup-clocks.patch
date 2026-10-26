@@ -1,0 +1,217 @@
+0334-negroni-bt-qup-clocks: Bluetooth stage A step 4 (QUP2 clocks) as Linux checks them, plus the RPMh BCM QUP2 vote.
+
+Root cause of the stop at step 4 on the phone (logs/usblog-everything-0363.txt, 02:02:43): s_ahb CBCR read
+0x80000002 = HW_CTL (bit 1) set + CLK_OFF (bit 31) set. gcc_qupv3_wrap_2_s_ahb_clk and _m_ahb_clk have
+hwcg_bit 1 (Linux gcc-sm8450.c); clk-branch.c clk_branch_wait skips the halt check for a branch in hardware
+gating mode, because CLK_OFF reads 1 while the AHB is idle. 0330 waited for CLK_OFF = 0 and stopped.
+The same pattern stops 0350 (fingerprint, wrap_1_s_ahb CBCR 0x80000002) in the same boot.
+
+negroni_bt.c: cbcr_state() = on / hw-gated / OFF; only OFF stops. Step 4 first votes BCM "QUP2" (Linux
+geni_icc_enable "qup-core": qup2_core_master -> qup2_core_slave, bcm_qup2 keepalive, vote_scale 1) with
+5000 kBps (qcom-geni-se.h CORE_2X_100_MHZ); failure only logged. Boot-args negronibt_bcm=0 (skip),
+negronibt_bcm_kbps=N. negroni_rpmh.c: negroni_rpmh_qup_bcm() (QUP0/1/2 only, bcm-voter.c arithmetic,
+never voted off).
+
+diff --git a/bsd/dev/negroni_bt.c b/bsd/dev/negroni_bt.c
+index d94045f..df608eb 100644
+--- a/bsd/dev/negroni_bt.c
++++ b/bsd/dev/negroni_bt.c
+@@ -50,6 +50,7 @@ extern kern_return_t thread_terminate(thread_t);
+ extern void thread_deallocate(thread_t);
+ extern void IOSleep(unsigned int milliseconds);
+ extern int negroni_rpmh_bt_enable(const char *res, unsigned mv);
++extern int negroni_rpmh_qup_bcm(const char *res, uint32_t avg_kbps, uint32_t peak_kbps, uint32_t *data_out);
+ void negroni_bt_init(void);
+ 
+ #define BT_WIMG_IO              0x7u            /* VM_WIMG_IO, as negroni_wifi.c */
+@@ -69,6 +70,8 @@ void negroni_bt_init(void);
+ #define GCC_CORE_CBCR           0x33280u
+ #define GCC_CORE2X_CBCR         0x3328cu
+ #define CBCR_OFF                (1u << 31)
++#define CBCR_HW_CTL             (1u << 1)       /* hwcg_bit 1: the branch gates itself when idle (m_ahb, s_ahb) */
++#define QUP_CORE2X_100MHZ_KBPS  5000u           /* qcom-geni-se.h CORE_2X_100_MHZ, the qup-core icc vote */
+ #define RCG_CMD_UPDATE          (1u << 0)
+ #define RCG_CMD_ROOT_OFF        (1u << 31)
+ #define RCG_CFG                 0x4u
+@@ -329,16 +332,58 @@ rcg_rate(uint32_t cfg, uint32_t m, uint32_t notnm)
+ 	return r;
+ }
+ 
+-static bool
+-cbcr_on(uint32_t off, uint32_t us)
++/*
++ * clk-branch.c clk_branch_wait: a branch in hardware clock gating mode (CBCR HW_CTL set) is not
++ * checked (the CLK_OFF bit reads 1 while the bus is idle); m_ahb and s_ahb of the wrapper have hwcg_bit 1
++ * (gcc-sm8450.c gcc_qupv3_wrap_2_m_ahb_clk/s_ahb_clk, halt_check BRANCH_HALT_VOTED, hwcg_reg = halt_reg).
++ * 0330 read s_ahb CBCR 0x80000002 (HW_CTL 1, CLK_OFF 1) on the phone and stopped here: that was this case.
++ */
++enum { BR_OFF, BR_ON, BR_HWCG };
++
++static int
++cbcr_state(uint32_t off, uint32_t us)
+ {
+ 	for (uint32_t i = 0; i <= us; i += 10) {
+-		if (!(rd(bt.gcc_qup + (off - GCC_QUP_WIN)) & CBCR_OFF)) {
+-			return true;
++		uint32_t v = rd(bt.gcc_qup + (off - GCC_QUP_WIN));
++		if (!(v & CBCR_OFF)) {
++			return BR_ON;
++		}
++		if (v & CBCR_HW_CTL) {
++			return BR_HWCG;
+ 		}
+ 		delay(10);
+ 	}
+-	return false;
++	return BR_OFF;
++}
++
++static const char *
++br_name(int st)
++{
++	return st == BR_ON ? "on" : st == BR_HWCG ? "hw-gated (HW_CTL, not checked, as Linux)" : "OFF";
++}
++
++/* RPMh BCM QUP2 vote (Linux geni_icc_enable, path "qup-core"); failure is logged, not fatal */
++static void
++bcm_vote(void)
++{
++	uint32_t kbps = negroni_bt_arg("bcm_kbps", QUP_CORE2X_100MHZ_KBPS), data = 0;
++	int e = EBUSY;
++
++	if (!negroni_bt_arg("bcm", 1)) {
++		SAY("4 BCM QUP2 vote skipped (negronibt_bcm=0)\n");
++		return;
++	}
++	if (kbps == 0 || kbps > 100000u) {
++		kbps = QUP_CORE2X_100MHZ_KBPS;
++	}
++	for (unsigned i = 0; i < 40 && e == EBUSY; i++) {       /* the RPMh voter is shared: retry while busy */
++		e = negroni_rpmh_qup_bcm("QUP2", kbps, kbps, &data);
++		if (e == EBUSY) {
++			IOSleep(50);
++		}
++	}
++	SAY("4 BCM QUP2 (qup2_core_master -> qup2_core_slave) avg = peak %u kBps: data %#x, errno %d%s\n", kbps, data, e,
++	    e ? " (not fatal: the core clocks may run on the boot chain's vote)" : "");
+ }
+ 
+ static bool
+@@ -347,17 +392,18 @@ step_clocks(void)
+ 	vm_offset_t rcg = bt.gcc_qup + (GCC_S5_RCGR - GCC_QUP_WIN);
+ 	uint32_t vote = rd(bt.gcc_vote + (GCC_VOTE_QUP - GCC_VOTE_WIN));
+ 
++	bcm_vote();
+ 	SAY("4 GCC vote %#x before (want bits %#x)\n", vote, GCC_VOTE_BITS);
+ 	bt.vote_before = vote;
+ 	bt.voted = (vote | GCC_VOTE_BITS) != vote;
+ 	wr(bt.gcc_vote + (GCC_VOTE_QUP - GCC_VOTE_WIN), vote | GCC_VOTE_BITS);
+-	bool core = cbcr_on(GCC_CORE_CBCR, 500), core2x = cbcr_on(GCC_CORE2X_CBCR, 500);
+-	bool mahb = cbcr_on(GCC_M_AHB_CBCR, 500), sahb = cbcr_on(GCC_S_AHB_CBCR, 500), s5 = cbcr_on(GCC_S5_CBCR, 500);
+-	SAY("4 branches: wrap2 core %s, core_2x %s, m_ahb %s, s_ahb %s, s5 %s (CBCR %#x %#x %#x %#x %#x)\n",
+-	    core ? "on" : "OFF", core2x ? "on" : "OFF", mahb ? "on" : "OFF", sahb ? "on" : "OFF", s5 ? "on" : "OFF",
++	int core = cbcr_state(GCC_CORE_CBCR, 500), core2x = cbcr_state(GCC_CORE2X_CBCR, 500);
++	int mahb = cbcr_state(GCC_M_AHB_CBCR, 500), sahb = cbcr_state(GCC_S_AHB_CBCR, 500), s5 = cbcr_state(GCC_S5_CBCR, 500);
++	SAY("4 branches: wrap2 core %s, core_2x %s, m_ahb %s, s_ahb %s, s5 %s (CBCR %#x %#x %#x %#x %#x, vote now %#x)\n",
++	    br_name(core), br_name(core2x), br_name(mahb), br_name(sahb), br_name(s5),
+ 	    rd(bt.gcc_qup + (GCC_CORE_CBCR - GCC_QUP_WIN)), rd(bt.gcc_qup + (GCC_CORE2X_CBCR - GCC_QUP_WIN)),
+ 	    rd(bt.gcc_qup + (GCC_M_AHB_CBCR - GCC_QUP_WIN)), rd(bt.gcc_qup + (GCC_S_AHB_CBCR - GCC_QUP_WIN)),
+-	    rd(bt.gcc_qup + (GCC_S5_CBCR - GCC_QUP_WIN)));
++	    rd(bt.gcc_qup + (GCC_S5_CBCR - GCC_QUP_WIN)), rd(bt.gcc_vote + (GCC_VOTE_QUP - GCC_VOTE_WIN)));
+ 	uint32_t cmd = rd(rcg), cfg = rd(rcg + RCG_CFG), dfsr = rd(rcg + RCG_DFSR);
+ 	bt.dfs = (dfsr & 1u) != 0;
+ 	SAY("4 S5 RCG cmd %#x cfg %#x m %#x n %#x d %#x dfsr %#x: DFS %s, now %llu Hz\n", cmd, cfg, rd(rcg + RCG_M),
+@@ -372,10 +418,13 @@ step_clocks(void)
+ 			bt.levels++;
+ 		}
+ 	}
+-	if (!core || !mahb || !sahb) {
+-		SAY("stop: the QUP2 core/AHB clocks do not run (BCM QUP2 not voted? see docs/bluetooth-plan.md)\n");
++	if (core == BR_OFF || mahb == BR_OFF || sahb == BR_OFF) {
++		SAY("stop: the QUP2 core/AHB clocks do not run (a branch without HW_CTL reads CLK_OFF)\n");
+ 		return false;
+ 	}
++	if (s5 == BR_OFF) {
++		SAY("4 note: the S5 branch reads CLK_OFF before its RCG is set (step 6 sets the rate)\n");
++	}
+ 	return true;
+ }
+ 
+diff --git a/bsd/dev/negroni_rpmh.c b/bsd/dev/negroni_rpmh.c
+index bfa7678..c6502ec 100644
+--- a/bsd/dev/negroni_rpmh.c
++++ b/bsd/dev/negroni_rpmh.c
+@@ -674,4 +674,73 @@ negroni_rpmh_bt_enable(const char *res, unsigned mv)
+ 	}
+ 	return EINVAL;
+ }
++
++/*
++ * 0334 (iOSPlus10): the QUP core BCM vote of a GENI serial engine (negroni_bt.c step 4). Linux: the SE's
++ * "qup-core" icc path qupN_core_master -> qupN_core_slave (drivers/interconnect/qcom/sm8450.c: clk_virt,
++ * bcm_qupN "QUPN", keepalive, vote_scale 1, slave buswidth 4, 1 channel), set by geni_icc_enable. Vote as
++ * bcm-voter.c bcm_aggregate: x = div(avg * width, buswidth * channels) * vote_scale / unit, y = div(peak *
++ * width, buswidth) * vote_scale / unit, a non-zero value below 1 rounds up to 1 (bcm_div), 14-bit clamp;
++ * keepalive: never 0. Width and unit come from the cmd-db aux data. One AMC command, commit set.
++ * The AMC vote of this DRV only adds to the other voters (the BCM takes the max), so it never lowers the
++ * QUP clock. Never voted off.
++ */
++int negroni_rpmh_qup_bcm(const char *res, uint32_t avg_kbps, uint32_t peak_kbps, uint32_t *data_out);
++
++static uint64_t
++rh_bcm_div(uint64_t num, uint64_t base)
++{
++	if (!num) {
++		return 0;
++	}
++	if (num < base) {
++		return 1;
++	}
++	return num / base;
++}
++
++int
++negroni_rpmh_qup_bcm(const char *res, uint32_t avg_kbps, uint32_t peak_kbps, uint32_t *data_out)
++{
++	if (!res || (strcmp(res, "QUP0") && strcmp(res, "QUP1") && strcmp(res, "QUP2")) || avg_kbps > 100000u ||
++	    peak_kbps > 100000u) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0, unit = 0, width = 0;
++	if (rh_poisoned) {
++		printf("NEGRONI RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_bcm(res, &address, &unit, &width);
++	}
++	if (!error) {
++		const uint64_t buswidth = 4, channels = 1, vote_scale = 1;
++		uint64_t x = rh_bcm_div(rh_bcm_div((uint64_t)avg_kbps * width, buswidth * channels) * vote_scale, unit);
++		uint64_t y = rh_bcm_div(rh_bcm_div((uint64_t)peak_kbps * width, buswidth) * vote_scale, unit);
++		if (x == 0 && y == 0) {
++			x = y = 1;      /* keepalive */
++		}
++		x = MIN(x, 0x3fffull);
++		y = MIN(y, 0x3fffull);
++		uint32_t data = 1u << 30 | 1u << 29 | (uint32_t)x << 14 | (uint32_t)y;
++		printf("NEGRONI RPMH: BCM %s avg %u peak %u kBps (unit %u width %u) -> x %llu y %llu, data %#x\n", res,
++		    avg_kbps, peak_kbps, unit, width, x, y, data);
++		if (data_out) {
++			*data_out = data;
++		}
++		error = rh_send(address, data, RH_MODE_BCM);
++	}
++out:
++	if (error) {
++		printf("NEGRONI RPMH: BCM %s vote failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
