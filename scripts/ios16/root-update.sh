@@ -2,7 +2,8 @@
 # Update an existing iOS 16 root image without a full rebuild (macOS): APFS-clone IN to OUT (no extra
 # space; IN stays as the fallback), mount OUT read-write with owners, run the named root hooks, clean up.
 #   sudo scripts/ios16/root-update.sh IN.img OUT.img HOOK...
-#   HOOK: metal | powermenu | negronigl | audio | ssh       (the same scripts that root-finish.sh runs)
+#   HOOK: metal | powermenu | negronigl | audio | ssh | haptics | bt | tweaks   (the same scripts that
+#   root-finish.sh runs; tweaks = root-tweaks-extra.py, e.g. the FBLaunchWatchdogScale change)
 #   e.g. sudo scripts/ios16/root-update.sh ~/op10-apple/ios16-root-new.img ~/op10-apple/ios16-root.img metal powermenu
 # Environment for the hooks passes through (METAL_CLIENTS=..., SSH_PUBKEY=...). Then: scripts/ios16/root-simg.sh.
 set -euo pipefail
@@ -14,7 +15,7 @@ REPO=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$IN" ] || { echo "missing $IN" >&2; exit 1; }
 [ ! -e "$OUT" ] || { echo "refusing to overwrite $OUT" >&2; exit 1; }
 for h in "$@"; do
-  case $h in metal|powermenu|negronigl|audio|ssh) ;; *) echo "unknown hook $h" >&2; exit 1 ;; esac
+  case $h in metal|powermenu|negronigl|audio|ssh|haptics|bt|tweaks) ;; *) echo "unknown hook $h" >&2; exit 1 ;; esac
 done
 
 cp -c "$IN" "$OUT"                    # APFS clone: shares blocks with IN until written
@@ -46,6 +47,9 @@ for h in "$@"; do
     negronigl) NEGRONIGL=1 sh "$REPO/scripts/gpu/root-add-negronigl.sh" "$R" ;;
     audio)     AUDIO=1 sh "$REPO/scripts/audio/root-add-audio.sh" "$R" ;;
     ssh)       SSH=1 sh "$REPO/scripts/net/root-add-ssh.sh" "$R" ;;
+    haptics)   HAPTICS=1 sh "$REPO/scripts/haptics/root-add-haptics.sh" "$R" ;;
+    bt)        BT=1 sh "$REPO/scripts/bt/root-add-bt.sh" "$R" ;;
+    tweaks)    python3 "$REPO/scripts/ios16/root-tweaks-extra.py" "$R" --migration "${MIGRATION:-skip}" ;;
   esac
 done
 [ -L "$R/var" ] || { echo "a hook replaced the /var symlink: stop (OUT is not usable)" >&2; exit 1; }
