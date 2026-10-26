@@ -1,0 +1,487 @@
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index 8cbe71c..8b7ccba 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -225,7 +225,27 @@ negroni_usb_probe(void)
+ #define UD_RX           0x2000          /* one received frame */
+ #define UD_TX           0x2800          /* one frame to send */
+ #define UD_FRAME_MAX    0x800
+-#define UD_SIZE         0x4000
++/*
++ * Patch 0361: an RX ring and TX batches. Before, one TRB per direction was
++ * in flight and ud_thread re-armed it only on its next 1 ms poll: at most one
++ * frame per poll and direction (measured 1.1-1.2 MB/s both ways at high
++ * speed). Now UD_RXN receive TRBs form a ring (link TRB at the end) that the
++ * controller fills without us, and up to UD_TXB queued frames go out in one
++ * transfer (one TRB per frame, LST + IOC on the last). DMA is not cache
++ * coherent: an RX TRB is armed again only when all 4 TRBs of its 64-byte
++ * cache line are done, so a cache clean never overwrites a TRB the controller
++ * is writing back. Boot-arg negroniusb_ring=0: the old one-TRB paths.
++ */
++#define UD_RING_TRBS    0x4000          /* RX ring: UD_RXN TRBs + link TRB */
++#define UD_TXB_TRBS     0x4400          /* TX batch: UD_TXB TRBs */
++#define UD_RXN          32
++#define UD_TXB          32
++#define UD_RXBUF        0x8000          /* UD_RXN x UD_FRAME_MAX */
++#define UD_TXBUF        0x18000         /* UD_TXB x UD_FRAME_MAX */
++#define UD_SIZE         0x28000
++#define TRB_CSP         (1u << 3)
++#define TRBCTL_LINK     (8u << 4)
++#define DEPCMD_UPDATETRANSFER 7
+ 
+ /* Physical endpoints: 2n = OUT, 2n+1 = IN */
+ #define EP_RX           2               /* 0x01 bulk OUT */
+@@ -233,7 +253,7 @@ negroni_usb_probe(void)
+ #define EP_INT          5               /* 0x82 interrupt IN */
+ #define TRBCTL_NORMAL   (1u << 4)
+ 
+-#define UD_TXQ          32
++#define UD_TXQ          128             /* 0361: was 32 (a full queue drops frames: TCP backs off) */
+ 
+ static struct {
+ 	vm_offset_t dwc;
+@@ -253,6 +273,14 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	/* 0361: RX ring, TX batch, counters */
++	unsigned    rx_idx;         /* next RX ring TRB to look at */
++	uint32_t    rx_rsc;         /* RX transfer resource index (UPDATETRANSFER) */
++	bool        rx_started;
++	bool        tx_batch;       /* the transfer on the IN endpoint is a batch (not UD_TRB_TX) */
++	uint64_t    rx_bytes, tx_bytes, tx_drops;
++	uint32_t    rx_max_poll, tx_max_batch;
++	uint64_t    last_active;    /* mach_absolute_time of the last frame or event */
+ 	/* command server (UDP 5141), used by ud_thread only */
+ 	bool        ctl_enabled;
+ 	int         ctl_action;
+@@ -260,6 +288,8 @@ static struct {
+ 	uint16_t    ctl_ip_id;
+ } ud;
+ static int  ud_panic_enabled = 1;       /* 0360: boot-arg negronipanicusb */
++static int  ud_ring = 1;                /* 0361: boot-arg negroniusb_ring (0 = one TRB per direction) */
++static int  ud_poll_us = 200;           /* 0361: boot-arg negroniusb_pollus: poll period while frames move */
+ static bool ud_running;                 /* 0360: gadget set up (event buffer, ep0) */
+ 
+ static inline void
+@@ -281,6 +311,17 @@ ud_sync(uint32_t off, uint32_t len)
+ 	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
+ }
+ 
++/* 0361: short sleeps with no timer coalescing (the default leeway can stretch them to ms). */
++static void
++ud_sleep_us(unsigned us)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	(void)assert_wait_deadline_with_leeway(&ud.sleep_chan, THREAD_UNINT,
++	    TIMEOUT_URGENCY_SYS_CRITICAL | TIMEOUT_URGENCY_LEEWAY, deadline, 0);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ ud_sleep_ms(unsigned ms)
+ {
+@@ -532,30 +573,35 @@ ud_setup(void)
+ 
+ /* ---- network interface (ue0) ---- */
+ 
++static void ud_rx_ring_start(void);
++
+ static void
+ ud_rx_arm(void)
+ {
++	if (ud_ring) {
++		ud_rx_ring_start();
++		return;
++	}
+ 	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
+ }
+ 
++/*
++ * One received frame at buf. Frames for the stack are copied into an mbuf
++ * and appended to the chain head/tail (one ifnet_input per poll, 0361).
++ */
+ static void
+-ud_rx_done(void)
++ud_rx_frame(const uint8_t *buf, uint32_t len, mbuf_t *head, mbuf_t *tail, struct ifnet_stat_increment_param *stats)
+ {
+-	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+-	ud_sync(UD_TRB_RX, 16);
+-	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+-	ud_sync(UD_RX, UD_FRAME_MAX);
+ 	if (ud_in_panic) {
+ 		/* 0360: no network stack in panic mode; only ARP and the command server */
+ 		if (len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 			ud.rx_frames++;
+-			ud_panic_rx((const uint8_t *)(ud.dma + UD_RX), len);
++			ud_panic_rx(buf, len);
+ 		}
+-		ud_rx_arm();
+ 		return;
+ 	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN &&
+-	    ud_ctl_input((const uint8_t *)(ud.dma + UD_RX), len)) {
++	    ud_ctl_input(buf, len)) {
+ 		ud.rx_frames++;         /* a command: taken before the stack */
+ 	} else if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+@@ -567,8 +613,7 @@ ud_rx_done(void)
+ 		if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+ 		    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
+ 		    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
+-			struct ifnet_stat_increment_param stats = {};
+-			memcpy(mbuf_data(m), (const void *)(ud.dma + UD_RX), len);
++			memcpy(mbuf_data(m), buf, len);
+ 			mbuf_setlen(m, len);
+ 			mbuf_pkthdr_setlen(m, len);
+ 			void *frame_header = mbuf_data(m);
+@@ -576,22 +621,153 @@ ud_rx_done(void)
+ 			mbuf_pkthdr_setheader(m, frame_header);
+ 			mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
+ 			(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
+-			stats.packets_in = 1;
+-			stats.bytes_in = len;
++			stats->packets_in++;
++			stats->bytes_in += len;
+ 			ud.rx_frames++;
+-			ifnet_input(ud.ifp, m, &stats);
++			ud.rx_bytes += len;
++			if (*tail != NULL) {
++				mbuf_setnextpkt(*tail, m);
++			} else {
++				*head = m;
++			}
++			*tail = m;
+ 		} else if (m != NULL) {
+ 			mbuf_freem(m);
+ 		}
+ 	}
++}
++
++static void
++ud_rx_input(mbuf_t head, struct ifnet_stat_increment_param *stats)
++{
++	if (head != NULL) {
++		ifnet_input(ud.ifp, head, stats);
++	}
++}
++
++static void
++ud_rx_done(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++	struct ifnet_stat_increment_param stats = {};
++	mbuf_t head = NULL, tail = NULL;
++
++	ud_sync(UD_TRB_RX, 16);
++	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
++	ud_sync(UD_RX, UD_FRAME_MAX);
++	ud_rx_frame((const uint8_t *)(ud.dma + UD_RX), len, &head, &tail, &stats);
++	ud_rx_input(head, &stats);
+ 	ud_rx_arm();
+ }
+ 
+-/* Start the next queued frame if the IN endpoint is idle. ud.lock held. */
++/* ---- 0361: RX ring ---- */
++
++static void
++ud_rx_ring_set(unsigned i)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_RING_TRBS + 16 * i);
++	uint64_t bpa = ud.dma_pa + UD_RXBUF + (uint64_t)i * UD_FRAME_MAX;
++
++	t[0] = (uint32_t)bpa;
++	t[1] = (uint32_t)(bpa >> 32);
++	t[2] = UD_FRAME_MAX;
++	/* CSP: a short packet (the end of a frame) completes this TRB and the controller goes on with the next */
++	t[3] = TRBCTL_NORMAL | TRB_CSP | TRB_HWO;
++}
++
++static void
++ud_rx_ring_start(void)
++{
++	volatile uint32_t *link = (volatile uint32_t *)(ud.dma + UD_RING_TRBS + 16 * UD_RXN);
++	uint64_t rpa = ud.dma_pa + UD_RING_TRBS;
++
++	for (unsigned i = 0; i < UD_RXN; i++) {
++		ud_rx_ring_set(i);
++	}
++	link[0] = (uint32_t)rpa;
++	link[1] = (uint32_t)(rpa >> 32);
++	link[2] = 0;
++	link[3] = TRBCTL_LINK | TRB_HWO;
++	ud_sync(UD_RING_TRBS, 16 * (UD_RXN + 1));
++	ud_sync(UD_RXBUF, UD_RXN * UD_FRAME_MAX);
++	ud.rx_idx = 0;
++	ud.rx_started = false;
++	if (ud_epcmd(EP_RX, DEPCMD_STARTTRANSFER, (uint32_t)(rpa >> 32), (uint32_t)rpa, 0) == 0) {
++		ud.rx_rsc = (dwc_rd(DEPCMD(EP_RX)) >> 16) & 0x7f;
++		ud.rx_started = true;
++	}
++}
++
++/*
++ * Every frame the controller has written since the last call (in ring
++ * order), from ud_thread or the panic loop. A TRB is armed again only
++ * when its whole cache line (4 TRBs) is done; then one UPDATETRANSFER.
++ */
++static void
++ud_rx_ring_poll(void)
++{
++	struct ifnet_stat_increment_param stats = {};
++	mbuf_t head = NULL, tail = NULL;
++	uint32_t frames = 0;
++	bool rearmed = false;
++
++	if (!ud_ring || !ud.rx_started || !ud.configured) {
++		return;
++	}
++	for (;;) {
++		unsigned i = ud.rx_idx;
++		volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_RING_TRBS + 16 * i);
++		ud_sync(UD_RING_TRBS + 16 * i, 16);
++		if (t[3] & TRB_HWO) {
++			break;
++		}
++		uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
++		ud_sync(UD_RXBUF + i * UD_FRAME_MAX, UD_FRAME_MAX);
++		ud_rx_frame((const uint8_t *)(ud.dma + UD_RXBUF + i * UD_FRAME_MAX), len, &head, &tail, &stats);
++		frames++;
++		/* the controller must not see this TRB again before it is armed: HWO stays 0 until the line is done */
++		if ((i & 3) == 3) {
++			for (unsigned j = i - 3; j <= i; j++) {
++				ud_rx_ring_set(j);
++			}
++			ud_sync(UD_RXBUF + (i - 3) * UD_FRAME_MAX, 4 * UD_FRAME_MAX);
++			ud_sync(UD_RING_TRBS + 16 * (i - 3), 64);
++			rearmed = true;
++		}
++		ud.rx_idx = (i + 1) % UD_RXN;
++		if (frames >= UD_RXN) {
++			break;
++		}
++	}
++	if (rearmed) {
++		(void)ud_epcmd(EP_RX, DEPCMD_UPDATETRANSFER | (ud.rx_rsc << 16), 0, 0, 0);
++	}
++	if (frames) {
++		if (frames > ud.rx_max_poll) {
++			ud.rx_max_poll = frames;
++		}
++		ud.last_active = mach_absolute_time();
++	}
++	if (!ud_in_panic) {
++		ud_rx_input(head, &stats);
++	}
++}
++
++/*
++ * Start the queued frames if the IN endpoint is idle. ud.lock held. 0361:
++ * up to UD_TXB frames in one transfer, one TRB each (not chained: each
++ * frame ends with its own short packet); negroniusb_ring=0: one frame.
++ */
+ static void
+ ud_tx_kick_locked(void)
+ {
+-	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
++	unsigned n = 0, max = ud_ring ? UD_TXB : 1;
++	volatile uint32_t *t = NULL;
++
++	if (ud.tx_busy || !ud.configured) {
++		return;
++	}
++	while (n < max && ud.txq_count > 0) {
+ 		mbuf_t m = ud.txq[ud.txq_head];
+ 		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
+ 		ud.txq_count--;
+@@ -600,17 +776,44 @@ ud_tx_kick_locked(void)
+ 			mbuf_freem(m);
+ 			continue;
+ 		}
+-		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
++		uint32_t boff = ud_ring ? UD_TXBUF + n * UD_FRAME_MAX : UD_TX;
++		mbuf_copydata(m, 0, len, (void *)(ud.dma + boff));
+ 		mbuf_freem(m);
+ 		/* A frame of a multiple of 512 bytes would need a zero-length
+ 		 * packet to end it; one pad byte does the same (IP ignores it). */
+ 		if ((len % 512) == 0) {
+-			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
++			((uint8_t *)(ud.dma + boff))[len++] = 0;
+ 		}
+-		ud.tx_busy = true;
+ 		ud.tx_frames++;
+-		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
++		ud.tx_bytes += len;
++		if (!ud_ring) {
++			ud.tx_busy = true;
++			ud.tx_batch = false;
++			ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
++			return;
++		}
++		uint64_t bpa = ud.dma_pa + boff;
++		t = (volatile uint32_t *)(ud.dma + UD_TXB_TRBS + 16 * n);
++		t[0] = (uint32_t)bpa;
++		t[1] = (uint32_t)(bpa >> 32);
++		t[2] = (uint32_t)len;
++		t[3] = TRBCTL_NORMAL | TRB_HWO;
++		ud_sync(boff, (uint32_t)len);
++		n++;
++	}
++	if (n == 0) {
++		return;
++	}
++	t[3] |= TRB_LST | TRB_IOC;
++	ud_sync(UD_TXB_TRBS, 16 * n);
++	if (n > ud.tx_max_batch) {
++		ud.tx_max_batch = n;
+ 	}
++	ud.tx_busy = true;
++	ud.tx_batch = true;
++	ud.last_active = mach_absolute_time();
++	uint64_t tpa = ud.dma_pa + UD_TXB_TRBS;
++	ud_epcmd(EP_TX, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
+ }
+ 
+ static errno_t
+@@ -618,6 +821,7 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ {
+ 	lck_mtx_lock(ud.lock);
+ 	if (ud.txq_count == UD_TXQ || !ud.configured) {
++		ud.tx_drops++;
+ 		lck_mtx_unlock(ud.lock);
+ 		mbuf_freem(m);
+ 		ifnet_stat_increment_out(ifp, 0, 0, 1);
+@@ -893,6 +1097,16 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		ud_ctl_reply(f, treply);
+ 		return true;
+ 	}
++	if (strcmp(cmd, "usbstats") == 0) {
++		/* 0361: the gadget's own counters (no reset, no state change) */
++		char sreply[200];
++		snprintf(sreply, sizeof(sreply), "usb rx %llu frames %llu bytes, tx %llu frames %llu bytes, "
++		    "tx drops %llu, rx max %u/poll, tx max %u/batch, ring %d, poll %d us",
++		    ud.rx_frames, ud.rx_bytes, ud.tx_frames, ud.tx_bytes, ud.tx_drops, ud.rx_max_poll,
++		    ud.tx_max_batch, ud_ring, ud_poll_us);
++		ud_ctl_reply(f, sreply);
++		return true;
++	}
+ 	if (strcmp(cmd, "log") == 0) {
+ 		ud_log_rewind = true;   /* 0360: ud_log_thread sends the last 64 KiB of the console again */
+ 		ud_ctl_reply(f, "ok log");
+@@ -1099,6 +1313,7 @@ ud_event(uint32_t ev)
+ 				 * transfer resources, as Linux dwc3 does after a reset).
+ 				 */
+ 				dwc_wr(DALEPENA, 0x3);
++				ud.rx_started = false;  /* 0361: SET_CONFIGURATION starts the ring again */
+ 				if (!ud_in_panic) {
+ 					lck_mtx_lock(ud.lock);
+ 				}
+@@ -1130,8 +1345,12 @@ ud_event(uint32_t ev)
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
+-	if (ep == EP_RX && type == 1) {
+-		ud_rx_done();
++	if (ep == EP_RX) {
++		if (ud_ring) {
++			ud_rx_ring_poll();      /* 0361: the ring does not complete; ud_thread polls it too */
++		} else if (type == 1) {
++			ud_rx_done();
++		}
+ 		return;
+ 	}
+ 	if (ep == EP_TX && type == 1) {
+@@ -1183,7 +1402,11 @@ ud_event(uint32_t ev)
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	uint32_t ticks = 0;
++	uint64_t next_report = 0, period, idle_after, now;
++	uint64_t rep_rx = 0, rep_tx = 0, rep_rxb = 0, rep_txb = 0;
++
++	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &period);
++	nanoseconds_to_absolutetime(20 * NSEC_PER_MSEC, &idle_after);
+ 	for (;;) {
+ 		if (ud_in_panic) {              /* 0360: the panic CPU owns the controller now */
+ 			ud_sleep_ms(1000);
+@@ -1206,12 +1429,32 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 				}
+ 				ud_event(ev);
+ 			}
++			ud.last_active = mach_absolute_time();
+ 		}
++		ud_rx_ring_poll();
+ 		ud_ctl_poll();
+-		if ((++ticks % 30000) == 0) {
+-			printf("NEGRONI USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
++		now = mach_absolute_time();
++		if (now >= next_report) {
++			/*
++			 * 0361: every 10 s with traffic (more than the live log's own ~10 frames/s):
++			 * frames and bytes per second of the gadget itself.
++			 */
++			if (next_report != 0 && (ud.rx_frames - rep_rx >= 100 || ud.tx_frames - rep_tx >= 500)) {
++				printf("NEGRONI USB: ue0 rx %llu tx %llu frames; last 10 s: rx %llu KiB/s %llu frames/s, "
++				    "tx %llu KiB/s %llu frames/s, tx drops %llu, rx max %u/poll, tx max %u/batch\n",
++				    ud.rx_frames, ud.tx_frames, (ud.rx_bytes - rep_rxb) / 10240, (ud.rx_frames - rep_rx) / 10,
++				    (ud.tx_bytes - rep_txb) / 10240, (ud.tx_frames - rep_tx) / 10, ud.tx_drops,
++				    ud.rx_max_poll, ud.tx_max_batch);
++			}
++			rep_rx = ud.rx_frames; rep_tx = ud.tx_frames; rep_rxb = ud.rx_bytes; rep_txb = ud.tx_bytes;
++			next_report = now + period;
++		}
++		/* 0361: poll every negroniusb_pollus while frames move (20 ms after the last), else every 1 ms */
++		if (ud_poll_us > 0 && ud_poll_us < 1000 && (now - ud.last_active < idle_after)) {   /* review 2026-10-27: tx_busy alone no longer keeps the fast poll (a hung batch would spin 5000/s) */
++			ud_sleep_us((unsigned)ud_poll_us);
++		} else {
++			ud_sleep_ms(1);
+ 		}
+-		ud_sleep_ms(1);
+ 	}
+ }
+ 
+@@ -1449,6 +1692,7 @@ ud_panic_tx_start(uint32_t len)
+ 	}
+ 	ud_panic_tx_len = len;
+ 	ud.tx_busy = true;
++	ud.tx_batch = false;
+ 	ud.tx_frames++;
+ 	ud_panic_tx_at = mach_absolute_time();
+ 	ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, len, TRBCTL_NORMAL);
+@@ -1561,7 +1805,7 @@ negroni_usb_panic_begin(void)
+ 		volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
+ 		ud_sync(UD_TRB_TX, 16);
+ 		uint32_t len = t[2] & 0xffffff;
+-		ud_panic_tx_len = (len > 0 && len < UD_FRAME_MAX) ? len : 0;
++		ud_panic_tx_len = (!ud.tx_batch && len > 0 && len < UD_FRAME_MAX) ? len : 0; /* 0361: a batch is not sent again */
+ 		ud_panic_tx_rsc = (dwc_rd(DEPCMD(EP_TX)) >> 16) & 0x7f;
+ 		ud_panic_tx_at = mach_absolute_time();
+ 	}
+@@ -1597,6 +1841,7 @@ negroni_usb_panic_service(bool busy)
+ 			ud_event(ev);
+ 		}
+ 	}
++	ud_rx_ring_poll();                      /* 0361 */
+ 	if (ud.configured != ud_panic_was_configured) {
+ 		ud_panic_was_configured = ud.configured;
+ 		if (ud.configured) {            /* (re)enumerated in panic mode: wait for the host's address */
+@@ -1640,6 +1885,10 @@ negroni_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
++	/* 0361: read before ud_if_create (the stack may send at once); ring 0 = the old one-TRB paths */
++	PE_parse_boot_argn("negroniusb_ring", &ud_ring, sizeof(ud_ring));
++	printf("NEGRONI USB: RX ring %u TRBs, TX batch %u, queue %u (negroniusb_ring=%d)\n",
++	    ud_ring ? UD_RXN : 1, ud_ring ? UD_TXB : 1, UD_TXQ, ud_ring);
+ 	ud_if_create();
+ 
+ 	/* Port in device mode (Linux dwc3_set_prtcap: GCTL PRTCAPDIR = 2); the firmware may have left it a host. */
+@@ -1700,6 +1949,7 @@ negroni_usb_gadget_start(vm_offset_t dwc)
+ 	int ctl = 1;
+ 	PE_parse_boot_argn("negronictl", &ctl, sizeof(ctl));
+ 	PE_parse_boot_argn("negroniusb_resetdrop", &ud_reset_drop, sizeof(ud_reset_drop));
++	PE_parse_boot_argn("negroniusb_pollus", &ud_poll_us, sizeof(ud_poll_us));
+ 	ud.ctl_enabled = ctl != 0 && ud.ifp != NULL;
+ 	PE_parse_boot_argn("negronipanicusb", &ud_panic_enabled, sizeof(ud_panic_enabled));
+ 	ud_running = true;              /* 0360: event buffer and ep0 are set up */

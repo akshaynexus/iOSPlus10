@@ -38,12 +38,15 @@ pub enum Command {
     Time,
     /// Send the last 64 KiB of the console to the live log again (also after a panic, patch 0360)
     Log,
+    /// The USB gadget's counters: frames, bytes, TX drops, RX frames per poll, TX batch size (patch 0361)
+    Usbstats,
 }
 
 impl Command {
     fn word(self) -> String {
         match self {
             Command::Ping => "ping".into(),
+            Command::Usbstats => "usbstats".into(),
             Command::Reboot => "reboot".into(),
             Command::Bootloader => "bootloader".into(),
             Command::Recovery => "recovery".into(),
@@ -114,7 +117,7 @@ pub fn run(cmd: Command, host: &str) -> Result<()> {
             }
             bail!("no pong from {phone} in 2 s")
         }
-        Command::Settime | Command::Time | Command::Log => {
+        Command::Settime | Command::Time | Command::Log | Command::Usbstats => {
             // No reset: resend every 500 ms like ping (each settime carries the host's time at sending).
             let deadline = start + Duration::from_secs(2);
             while Instant::now() < deadline {

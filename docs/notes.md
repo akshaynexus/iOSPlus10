@@ -2376,3 +2376,17 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   already has late store actions and resolve attachments.
 - [I] Next WebGL items: frame rate on real pages (pipeline compile time; `samples=4` passes on every WebGL canvas with antialias),
   WebGPU (`webgpu.github.io/webgpu-samples`) untested, `Safari` screen content not seen from the Mac (owner checks).
+
+## 32. USB Ethernet throughput (2026-10-27, kernel agent; patch 0361, details: patches/xnu/README-usb.md)
+
+- [V] Before: 1.0-1.2 MB/s both ways, with SSH and with raw netcat (16 MiB in 13.6-15 s), ping 1.4 ms.
+- [V] The link is high speed: kernel log `NEGRONI USB: connected, speed 0` (DSTS CONNECTSPD 0 = HS), macOS ioreg
+  `USBSpeed` 3. The `DSTS 0x00820001` of the "running" line is read before the host connects: ignore its speed bits.
+  No HS PHY / eUSB2 work is needed.
+- [I] Cause: one TRB per direction, armed again only on the next 1 ms poll of ud_thread = one frame per poll
+  (1514 B / ~1.2 ms = the measured rate). Also a TX queue of 32 that dropped frames.
+- Fix 0361: RX ring of 32 TRBs (CSP, link TRB, re-armed per 64-byte cache line + UPDATETRANSFER, because the DMA is
+  not coherent), TX batches of up to 32 frames per transfer, TX queue 128, one ifnet_input per poll, 200 us polls
+  while busy. Counters: a log line every 10 s with traffic and `op10tool ctl usbstats` (new ctl command).
+  Fallback: `negroniusb_ring=0` (old one-TRB paths), `negroniusb_pollus=0` (old 1 ms poll).
+- Not tested on the phone yet (build only). Check the boot line `RX ring 32 TRBs, TX batch 32, queue 128`.

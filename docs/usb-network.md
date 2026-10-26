@@ -271,3 +271,9 @@ IPMonitor accepts the published state on this kernel (no IOKit network-interface
 bergamota's 0110), the route fallback, `share-internet.sh start/stop` (needs sudo; not run), `usbreboot` and
 `oslogstream` on the phone (the private LoggingSupport classes and the diagnosticd entitlements
 are untested on this port).
+
+## Speed
+
+The link runs at USB high speed. Before patch 0361 the gadget moved one frame per 1 ms poll (1.0-1.2 MB/s);
+patch 0361 adds an RX ring and TX batches (patches/xnu/README-usb.md). Counters: `op10tool ctl usbstats`.
+Fallback boot-arg: `negroniusb_ring=0`.
