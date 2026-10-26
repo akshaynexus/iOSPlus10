@@ -129,6 +129,33 @@ The policy is in the shader-cache key, so the first frames after a change compil
 load addresses for crash symbolication: `atos -o out/gpu/turnip/libvulkan_freedreno.dylib -l TURNIP_BASE PC`,
 `atos -o NegroniMetal.dSYM -l BASE PC`.
 
+### MSL source compile (`NEGRONIMETAL_MSL_FRONTEND`, flame/0009)
+WebGPU in Safari (WebGPU.framework, the GPU process `com.apple.WebKit.GPU`) and other clients that compile Metal Shading
+Language text call `newLibraryWithSource:options:error:`. On this device the Metal front end behind that call faults
+(`metalprobe --compute` = SIGSEGV, 2026-10-26), so a process that compiled from source died and was relaunched: a
+WebGPU page flashed black/white while Safari's GPU process restarted. Default now: the device **refuses** source
+libraries cleanly (nil + error, one log line `native-metal: newLibraryWithSource: refused (...)` per process); the page
+shows no WebGPU content, Safari stays up. `NEGRONIMETAL_MSL_FRONTEND=1` in `/var/db/negronimetal/env` tries the Metal
+front end again (diagnosis only: expect the crash, send the `CRASH` lines of `logs/usblog.log`).
+
+```sh
+scripts/net/ssh-phone.sh "echo NEGRONIMETAL_MSL_FRONTEND=1 >> /private/var/db/negronimetal/env"   # diagnosis only
+scripts/net/ssh-phone.sh "/usr/local/bin/metalprobe --compute --render"                               # the same path, no Safari
+```
+
+### Idle load knobs and measurement (flame/0010, scripts/metal/idle-stats.sh)
+* `NEGRONIMETAL_SURFACE_FLUSH=0|1` (env file): the per-command-buffer CPU cache invalidate (`dc civac`) over every
+  IOSurface a command buffer rendered into, run on the completion thread in every process but backboardd. `0` = off
+  everywhere, `1` = on everywhere, unset = unchanged (on except backboardd). m2v/0001 already invalidates every host import
+  a command buffer used, so this is a second pass over the same bytes; the telemetry row `J surface cache n= bytes= us=`
+  measures it. Correctness risk when off: a CPU reader of a GPU-written IOSurface (snapshots) can see stale lines [I].
+* `CA_FORCE_TRIPLE_BUFFERING=1` is no longer set by the plugin: the 20H392 QuartzCore has no such string (only
+  `CA_LOG_TRIPLE_BUFFERING`), so it never did anything.
+* `scripts/metal/idle-stats.sh [-s SECONDS]`: from `logs/usblog.log`, seconds with `presents/s 0` versus seconds with
+  presents, mean swaps/presents per second, and the share of `GPU WATCH` samples with RBBM busy; `idle-stats.sh telemetry
+  [SECONDS]` pulls backboardd's telemetry twice and prints command buffers, passes, full-screen passes and blits per second
+  and the flushSurfaces cost. Needs `touch /var/db/negronimetal/telemetry`.
+
 ### On-Device XNUtils App
 The installed **XNUtils** app (`/Applications/XNUtils.app`) displays:
 * Active Metal Device Name (`Turnip Adreno (TM) 730` or `Software Renderer`)

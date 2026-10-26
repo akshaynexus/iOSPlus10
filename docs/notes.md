@@ -896,6 +896,17 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
     `negronigl: IOSurface wrap of client memory refused (id 0, no state page: ...), N so far`.
     [I] CA then uploads the image another way (texture upload); not seen yet. [I] The real fix is in the kernel:
     sel 6/7 must fail (kIOReturnUnsupported) or be implemented like ios-spes/bergamota 0120.
+  - 2026-10-26 (kernel 0257, build only, phone off): selectors 6 and 7 are implemented
+    (`patches/xnu/0257-negroni-iosurface-wrap-client-memory.patch`, README-gpu-kernel.md section 12 "0257"):
+    the caller's page-aligned range is wired (`withAddressRange` + `prepare`, like the 0232 host import) and
+    published as a cached NegroniSurface with the input's geometry; the answer is the normal lock result (state
+    page, id, seed). Input layouts [V, IOSurface.s]: sel 6 struct in 0x20 (`+0 u64 address, +8 width, +0xc height,
+    +0x10 format, +0x14 bytes per element, +0x18 bytes per row, +0x1c u32`), sel 7 scalars `address, size`; both
+    answer 0xa68 bytes. Bad input returns kIOReturnUnsupported (never a zeroed success). Log once per selector
+    `NEGRONI SURF: wrap client memory sel N: WxH bpr B fmt F -> id I`, once per failure kind `... refused: WHY`.
+    The eagl.c guard stays as the fallback. Kernel + image `out/ios16-0257` (sha256 in `logs/kernel-0257.log` and
+    `out/ios16-0257/SHA256SUMS`). Test when the phone is on: `scripts/gpu/phone-gl.sh backboardd`, `on`, `restart`;
+    pass = a `wrap client memory sel 6` line, no `IOSurface wrap of client memory refused` line, no far 0x30 crash.
   - [V] `gl-build` exit 0: stripped negronigl.dylib 14,214,624 bytes, sha256 e527b636...; backboardd unchanged
     (39cb14d1...); check-imports PASS (0 missing). Not run on the phone yet.
 - Poster extensions with Metal for all processes (2026-10-25, Metal agent):

@@ -6,7 +6,7 @@ pass over the same bytes; the telemetry row `J surface cache n= bytes= us=` meas
 
 --- a/phone/metal2/NativeBridgeMetalFrontend.mm
 +++ b/phone/metal2/NativeBridgeMetalFrontend.mm
-@@ -346,9 +346,15 @@
+@@ -346,9 +347,15 @@
  // owners keep the mapping live through this phase. Maintain each exact CPU
  // range once; no address identity or decision is carried into another phase
  // or command, and distinct/partially overlapping ranges retain their calls.

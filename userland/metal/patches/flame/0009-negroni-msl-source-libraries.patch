@@ -4,10 +4,14 @@ MSL source libraries and the argument-encoder answer, for WebGPU (Safari's GPU p
   WGSL as MSL text and calls newLibraryWithSource:options:error: (out/metal/spi/WebGPU.strings.txt). The frontend had no such
   method, so the message reached -[_MTLDevice newLibraryWithSource:options:error:] (MTLLibraryBuilder::newLibraryWithSource ->
   MTLCompilerService), which answers Metal's own _MTLLibrary; its functions are _MTLFunctionInternal and the pipeline makers
-  here refuse them ("foreign function"): every WebGPU pipeline failed, the drawables were presented unwritten (black/white flash).
-  The new method runs the base class's compile by its IMP (the on-device MSL front end gives AIR), takes -[_MTLLibrary bitcodeData]
-  (or libraryDataContents) and makes the library with nmb_library_new (metallib when the bytes start with "MTLB", else bare AIR).
-  Log lines: "native-metal: newLibraryWithSource #N: ... in N ms", "... MSL front end refused ...", "... refused by the runtime ...".
+  here refuse them ("foreign function"): see below.
+  On this device that path faults (metalprobe --compute, 2026-10-26: SIGSEGV in the shared cache under the base method), so a
+  process that compiles from source dies and is relaunched (Safari's GPU process: the WebGPU page area flashes between old and
+  empty contents). Default now: a clean refusal (nil + NSError, logged once), so the caller gets a failed shader module and lives.
+  NEGRONIMETAL_MSL_FRONTEND=1 runs the base class's compile by its IMP and, when it answers, feeds -[_MTLLibrary bitcodeData]
+  (or libraryDataContents) to nmb_library_new (metallib when the bytes start with "MTLB", else bare AIR): the path to finish
+  once the fault is understood. Log lines: "native-metal: newLibraryWithSource: refused (...)", "... trying the Metal front
+  end ...", "... #N: ... in N ms", "... MSL front end refused ...", "... refused by the runtime ...".
 - newArgumentEncoderWithArguments: answers nil once-logged (argument buffers are not bridged; the base class only raises).
 
 --- a/phone/metal2/NativeBridgeMetalFrontend.mm
@@ -20,26 +24,39 @@ MSL source libraries and the argument-encoder answer, for WebGPU (Safari's GPU p
  #include <algorithm>
  #include <atomic>
  #include <mutex>
-@@ -1752,6 +1759,70 @@
+@@ -1752,6 +1759,83 @@
   return [(id<MTLDevice>)self newLibraryWithURL:url error:error];
  }
  - (id<MTLLibrary>)newDefaultLibrary {return [(id<MTLDevice>)self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:nil];}
 +// NegroniMetal (flame/0009): MSL source. WebGPU.framework (20H392, Safari's GPU process com.apple.WebKit.GPU) builds every shader from
-+// WGSL as MSL text ("#include <metal_stdlib>") and calls newLibraryWithSource:options:error:. This class had no such method, so the message
-+// reached -[_MTLDevice newLibraryWithSource:options:error:] (MTLLibraryBuilder::newLibraryWithSource -> MTLCompilerService), which answers
-+// Metal's own _MTLLibrary: its functions are _MTLFunctionInternal, and the pipeline makers here refuse them ("foreign function"). Every
-+// WebGPU pipeline failed and the CAMetalLayer drawables were presented unwritten (the page area flashed between the pool's old contents).
-+// The base class's compile is kept (the on-device MSL front end, libGPUCompiler, gives AIR 2.5 like the QuartzCore metallibs) and its
-+// bitcode (-[_MTLLibrary bitcodeData]; a metallib when it starts with "MTLB", else bare AIR) goes through nmb_library_new like a file's.
-+// The base implementation is called by its IMP: [super ...] here would name NSObject (these methods are copied into the _MTLDevice subclass).
++// WGSL as MSL text ("#include <metal_stdlib>") and calls newLibraryWithSource:options:error: (out/metal/spi/WebGPU.strings.txt). This class
++// had no such method, so the message reached -[_MTLDevice newLibraryWithSource:options:error:] (MTLLibraryBuilder::newLibraryWithSource ->
++// MTLCompilerService). On this device that path does not answer: it faults (metalprobe --compute, 2026-10-26 03:33 and 03:35: SIGSEGV,
++// far 0x10000001b / 0x7000000000000000, pc in the shared cache, caller chain 0x1811bf0c0 0x1811bef0c 0x1811bea78 unslid, then this
++// method), and a process that compiles from source dies and is relaunched: Safari's GPU process restarted after each attempt (usblog
++// "CRASH com.apple.WebKit[300]" + "exec com.apple.WebKit.GPU"), the page area flashing between the old and the empty contents.
++// Default here: a clean refusal (nil + NSError, logged once per process) so the caller gets a failed shader module instead of a crash.
++// NEGRONIMETAL_MSL_FRONTEND=1 (NMTL_DIR/env) runs the base class's compile by its IMP ([super ...] here would name NSObject: these
++// methods are copied into the _MTLDevice subclass) and, when it answers, feeds its bitcode (-[_MTLLibrary bitcodeData]; a metallib when
++// it starts with "MTLB", else bare AIR) to nmb_library_new like a file's: the path to finish once the fault is understood.
 +static std::atomic<uint64_t> gSourceLibraries,gSourceLibraryFailures;
 +- (id<MTLLibrary>)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options error:(NSError **)error {
 + if(!source.length){if(error)*error=nbError(@"newLibraryWithSource: empty source");return nil;}
++ static int frontEnd=-1;
++ if(frontEnd<0){const char *e=getenv("NEGRONIMETAL_MSL_FRONTEND");frontEnd=e && e[0]=='1';}
++ if(!frontEnd){
++  const uint64_t n=++gSourceLibraryFailures;
++  if(n==1)NBLOG(@"native-metal: newLibraryWithSource: refused (%lu chars; MSL source is not compiled on this device: the Metal front end faults here; NEGRONIMETAL_MSL_FRONTEND=1 tries it)",(unsigned long)source.length);
++  journal(std::string("L source refused (no MSL front end)"));
++  if(error)*error=nbError(@"newLibraryWithSource: MSL source is not compiled on this device (NegroniMetal)");
++  return nil;
++ }
 + const uint64_t began=nowUs();
 + id apple=nil;NSError *appleError=nil;
 + Class base=objc_getClass("_MTLDevice");
 + Method m=base?class_getInstanceMethod(base,@selector(newLibraryWithSource:options:error:)):nullptr;
 + if(!m){if(error)*error=nbError(@"newLibraryWithSource: no MSL front end (_MTLDevice lacks the method)");return nil;}
++ NBLOG(@"native-metal: newLibraryWithSource: trying the Metal front end (%lu chars; NEGRONIMETAL_MSL_FRONTEND=1)",(unsigned long)source.length);
 + @try{apple=((id(*)(id,SEL,NSString *,MTLCompileOptions *,NSError **))method_getImplementation(m))(self,@selector(newLibraryWithSource:options:error:),source,options,&appleError);}
 + @catch(NSException *ex){apple=nil;appleError=nbError([NSString stringWithFormat:@"MSL front end raised %@: %@",ex.name,ex.reason]);}
 + if(!apple){
