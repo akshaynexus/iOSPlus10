@@ -3052,3 +3052,20 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   9c76386625f09c190511e599b4b9ecdaef318f9bede09bdb45c85a805052cd12 (0330-0338 applied, only the 4 dxb skips; link
   out/kernel/kernel.macho). Not run on the phone; no image.
 - Next test: boot-args `negronibt=4 negronipanic=30 negronipanicreason=2`. Expect `lext: 0x2041 answer (status 0) delivered as legacy 0x200b`, no `exit bluetoothd`, `Stack: STACK_BUSY -> STACK_READY`, then the switch off: `h4 control unit 1 disconnected`, `power off: BT_EN low`.
+
+## 56. Wi-Fi: MSI into a RAM mailbox, boot-arg negroniwlan_msi (2026-10-27, Wi-Fi kernel agent; patch 0344, details patches/xnu/README-wifi.md "0344")
+
+- [V phone] 0342 level 1 and 2 did not help: BHI SBL DONE (0xbe92258b), then EE 0, MHISTATUS 0, READY time-out 30 s,
+  no SMMU fault. Level 2 resets (0xff04 SYS_ERR, then MHICTRL RESET clears it). TCSR_PBL_LOGGING 0xef150600 ->
+  0xef0e0200 once, then nothing. No SBL log pointer.
+- [V phone] Endpoint MSI capability 0x50 = 0x10a7005: MSI off, 32 vectors, per-vector mask, 32-bit address only.
+- [V source] ath11k and cnss2 enable MSI before the MHI power-up. We never did (no ITS).
+- 0344 `negroniwlan_msi` (default 0): bit 0 = MSI address = pool IOVA + 0x8000 (free page, static assert), data 0xa500,
+  32 vectors unmasked, enable; polls print `MSI #n data .. (vector ..) at <when> after N ms`. Needs
+  `negroniwlan_smmu=3` (pool PA above 4 GiB). Bit 1 = PCIE_SOC_WAKE = 1 before BHI. Every failure path masks and
+  disables MSI first (`wlan_quiesce`).
+- [I] Guess under test: the SBL needs MSI enabled. A `vector 0` line at `BHI SBL` proves the MSI path works.
+- Test: `negroniwifi=10 negroniwlan=10 negroniwlan_smmu=3 negroniwlan_msi=1`, then `=3`.
+- Build [V]: out/kernel/local-20261026-230626/kernel.development.negroni sha256
+  10e876ff3dd19ba6ca58c11379865fb4f225f2b7ba901f068ff799a731376720 (0344 applied, only the 4 dxb skips, no new
+  warning class in the Wi-Fi files; link out/kernel/kernel.macho). Log: logs/wlanmsi-build.log. Not run on the phone.

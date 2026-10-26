@@ -1,0 +1,403 @@
+0344-negroni-wlan-msi-mailbox: Wi-Fi, the chip's MSI into a RAM mailbox (boot-arg negroniwlan_msi, default 0 = no
+change). Bit 0: at step 7 (after the PBL check, before BHI) the endpoint MSI capability (ID 5, bounded walk) gets the
+IOVA of one word in our DMA pool (OFF_MSI 0x8000, its own 4 KiB page between the IPCR rings and the firmware) through
+the negroniwlan_smmu=3 context, data base 0xa500, all vectors unmasked, MME = MMC, MSI enable. The word holds
+0xffffffff; the BHI wait, every BOOT dump, the READY wait and the service pass print each change ("MSI #n data ..
+(vector v) at <when> after N ms", at most 64 lines) and write the sentinel again. With MSI on, the event ring contexts
+get msivec 1 and 2 (ath11k MHI irqs). No SMMU context, a mailbox outside the SMMU window or a 32-bit-only capability
+with a high address: MSI stays off (one line, no stop). wlan_quiesce (every failure path) masks all vectors, clears
+the enable bit, MME, address and data before the MHI reset, the frees and the SMMU teardown. Bit 1: PCIE_SOC_WAKE
+(BAR0 0x3004) = 1 before BHI, 5 ms, readback logged (bisect only). The start line gets ", MSI N".
+
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index 39bc9eb..34d5bcd 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -72,6 +72,7 @@ extern uint32_t negroni_wifi_badge_color;
+ #define OFF_CMD         0x4000u         /* command ring: 128 elements */
+ #define OFF_CH20        0x5000u         /* IPCR out ring: 64 elements */
+ #define OFF_CH21        0x6000u         /* IPCR in ring: 64 elements */
++#define OFF_MSI         0x8000u         /* 0344: MSI mailbox word (negroniwlan_msi bit 0), one 4 KiB page alone */
+ #define OFF_FW          0x10000u        /* firmware image */
+ #define FW_CAP          0x600000u       /* 6 MiB (amss.bin is 5609392 B) */
+ #define OFF_M3          0x610000u       /* m3.bin, kept for the stage 2 QMI m3_info */
+@@ -86,6 +87,8 @@ _Static_assert(OFF_VEC + (FW_CAP / MHI_SEG) * 16 <= NEGRONI_WLAN_POOL_SIZE, "vec
+ #define EV1_N           256u
+ #define CMD_N           128u
+ #define CH_N            64u
++_Static_assert(OFF_CH21 + CH_N * 16u <= OFF_MSI && OFF_MSI + 0x1000u <= OFF_FW && !(OFF_MSI & 0xfffu),
++    "0344: the MSI mailbox page overlaps a ring or the firmware");
+ 
+ #define SOC_VERSION     0x224u          /* BAR0 + 0x224: family[31:28] device[27:16] major[15:8] minor[7:0] */
+ #define BAR0_MAP        0x200000u       /* map at most 2 MiB of BAR0 (MHI MMIO + doorbell arrays) */
+@@ -142,6 +145,12 @@ static vm_offset_t g_xfer_kva;          /* 0264: IPCR RX/TX buffers (cacheable v
+  */
+ static uint32_t g_swreset;
+ static uint64_t g_bar_pa;               /* 0342: BAR0 bus address, to check the BAR after a SoC reset */
++/*
++ * 0344: boot-arg negroniwlan_msi (default 0 = the 0261-0343 flow, no MSI). Bit 0: the endpoint MSI capability is
++ * enabled before BHI with the address of a mailbox word in our DMA pool (OFF_MSI, through the SMMU context), so each
++ * MSI the chip sends lands in RAM and the polls print it. Bit 1: PCIE_SOC_WAKE = 1 before BHI (bisect only).
++ */
++static uint32_t g_msi_mode;
+ 
+ /* ---- step lines (0263): "step N NAME" before, "step N NAME failed: REASON" on an error ---- */
+ static uint32_t g_step;
+@@ -301,6 +310,7 @@ negroni_wlan_service(void)
+ {
+ 	int error;
+ 
++	negroni_wlan_msi_poll("service");       /* 0344 */
+ 	if (negroni_qrtr.attached) {
+ 		error = negroni_wlan_qrtr_pump(&H);
+ 	} else {
+@@ -563,6 +573,7 @@ negroni_wlan_boot_dump(struct mhi_host *h, const char *when)
+ 	if (!g_bar0) {
+ 		return;
+ 	}
++	negroni_wlan_msi_poll(when);    /* 0344 */
+ 	printf("NEGRONI WLAN: BOOT %s: MHI REGLEN %#x VER %#x CFG %#x CTRL %#x STATUS %#x BHIOFF %#x BHIEOFF %#x\n", when,
+ 	    negroni_wlan_rd(MHI_REGLEN), negroni_wlan_rd(MHI_VER), negroni_wlan_rd(MHI_CFG), negroni_wlan_rd(MHI_CTRL),
+ 	    negroni_wlan_rd(MHI_STATUS), negroni_wlan_rd(MHI_BHIOFF), negroni_wlan_rd(MHI_BHIEOFF));
+@@ -779,16 +790,16 @@ wlan_sw_reset(void)
+ #define QCA_WLAON_POWERCTRL_PMU         0x01f806b4u
+ #define QCA_WLAON_PCIE_PWR_CTRL         0x01f806bcu
+ 
+-/* the PCIe capability (ID 0x10) of a config space, 0 if none (bounded walk) */
++/* the capability ID `id` of a config space, 0 if none (bounded walk; 0344: any ID) */
+ static uint32_t
+-wlan_pcie_cap(volatile uint32_t *cfg)
++wlan_cfg_cap(volatile uint32_t *cfg, uint32_t id)
+ {
+ 	for (uint32_t ptr = cfg[0x34 / 4] & 0xfcu, guard = 48; ptr >= 0x40 && guard--; ) {
+ 		uint32_t h = cfg[ptr / 4];
+ 		if (h == MHI_ALL_ONES) {
+ 			return 0;
+ 		}
+-		if ((h & 0xffu) == 0x10u) {
++		if ((h & 0xffu) == id) {
+ 			return ptr;
+ 		}
+ 		ptr = (h >> 8) & 0xfcu;
+@@ -796,6 +807,13 @@ wlan_pcie_cap(volatile uint32_t *cfg)
+ 	return 0;
+ }
+ 
++/* the PCIe capability (ID 0x10) of a config space, 0 if none */
++static uint32_t
++wlan_pcie_cap(volatile uint32_t *cfg)
++{
++	return wlan_cfg_cap(cfg, 0x10u);
++}
++
+ static void
+ wlan_boot_dump_pcie(const char *when)
+ {
+@@ -847,12 +865,224 @@ wlan_boot_dump_pcie(const char *when)
+ 	    (!(ia && ia != MHI_ALL_ONES) && !(warm && warm != MHI_ALL_ONES) && !dma_err && !rp_err) ? " no PCIe/WLAON error bit" : "");
+ }
+ 
++/*
++ * 0344: the chip's MSI into a RAM mailbox (boot-arg negroniwlan_msi bit 0). Phone 2026-10-27: BHI SBL DONE, then EE 0,
++ * MHISTATUS 0, no SBL log pointer for 30 s; the endpoint MSI capability (0x50) reads 0x10a7005 = MSI off, 32 vectors,
++ * per-vector mask, 32-bit address only. Linux (ath11k_pci_alloc_msi, cnss2 cnss_pci_enable_msi) always enables MSI
++ * before the MHI power-up; on Android the PCIe0 MSIs go to the GIC ITS, which this port does not set up. Here the MSI
++ * address is the IOVA of one word in our DMA pool (OFF_MSI, its own 4 KiB page between the IPCR rings and the
++ * firmware), mapped through our SMMU context (negroniwlan_smmu=3), so each MSI the chip sends is a 32-bit memory write
++ * of "data base | vector" into that word. Data base 0xa500 (32-aligned: the chip puts the vector in bits 4:0).
++ * The word holds the sentinel 0xffffffff; every poll (the boot dumps, the BHI wait, the READY wait, the service pass)
++ * prints a change and writes the sentinel again. Two MSIs between two polls show as one (the last one wins).
++ * Without an SMMU context the pool is above 4 GiB (RAM starts at 0x840000000) and the 32-bit-only capability cannot
++ * take its address: then MSI stays off. On every failure path (wlan_quiesce) MSI is masked and turned off before the
++ * pool and the SMMU context go away. With MSI off the chip sends no MSI write (PCI 3.0 6.8.1.3: MSI Enable 0 =
++ * the function must not use MSI); masked vectors only set pending bits.
++ */
++#define MSI_CAP_ID              0x05u
++#define MSI_CTL_ENABLE          0x0001u
++#define MSI_CTL_MMC(c)          (((c) >> 1) & 7u)
++#define MSI_CTL_MME(c)          (((c) >> 4) & 7u)
++#define MSI_CTL_MME_MASK        0x0070u
++#define MSI_CTL_64BIT           0x0080u
++#define MSI_CTL_PVM             0x0100u
++#define MSI_DATA_BASE           0xa500u
++#define MSI_SENTINEL            0xffffffffu
++#define MSI_LINES_MAX           64u
++_Static_assert((MSI_DATA_BASE & 31u) == 0, "MSI data base must leave the low 5 bits for 32 vectors");
++
++static uint32_t g_msi_cap;              /* config offset of the capability we programmed (0 = not touched) */
++static bool g_msi_on;
++static uint32_t g_msi_vectors;
++static uint32_t g_msi_count, g_msi_lines;
++static uint64_t g_msi_t0;
++
++bool
++negroni_wlan_msi_on(void)
++{
++	return g_msi_on;
++}
++
++/* register offsets inside the MSI capability (PCI 3.0 6.8.1): 32-bit layout or 64-bit layout */
++static void
++msi_offsets(uint32_t cap, uint32_t ctl, uint32_t *data, uint32_t *mask)
++{
++	bool is64 = (ctl & MSI_CTL_64BIT) != 0;
++
++	*data = cap + (is64 ? 0x0cu : 0x08u);
++	*mask = (ctl & MSI_CTL_PVM) ? cap + (is64 ? 0x10u : 0x0cu) : 0;
++}
++
++void
++negroni_wlan_msi_poll(const char *when)
++{
++	if (!g_msi_on || !g_pool_nc) {
++		return;
++	}
++	volatile uint32_t *box = (volatile uint32_t *)(g_pool_nc + OFF_MSI);
++	uint32_t v = *box;
++	if (v == MSI_SENTINEL) {
++		return;
++	}
++	*box = MSI_SENTINEL;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	g_msi_count++;
++	if (g_msi_lines >= MSI_LINES_MAX) {
++		return;
++	}
++	g_msi_lines++;
++	uint32_t vmask = g_msi_vectors ? g_msi_vectors - 1 : 0;
++	char vec[24];
++	if ((v & ~vmask) == MSI_DATA_BASE) {
++		snprintf(vec, sizeof(vec), "vector %u", v & vmask);
++	} else {
++		snprintf(vec, sizeof(vec), "not our data base");
++	}
++	printf("NEGRONI WLAN: MSI #%u data %#x (%s) at %s after %llu ms%s\n", g_msi_count, v, vec, when,
++	    negroni_wlan_ms() - g_msi_t0, g_msi_lines == MSI_LINES_MAX ? " (last MSI line; later MSIs are only counted)" : "");
++}
++
++/* step 7, after the PBL check, before BHI: bit 1 SOC_WAKE, bit 0 the MSI mailbox. A refusal leaves MSI off (no stop). */
++static void
++wlan_msi_setup(void)
++{
++	volatile uint32_t *cfg = (volatile uint32_t *)P.cfg_bus1;
++
++	if (g_msi_mode & 2u) {
++		uint32_t w0 = negroni_wlan_rd(QCA_PCIE_SOC_WAKE);
++		negroni_wlan_wr(QCA_PCIE_SOC_WAKE, 1);
++		negroni_wlan_nap(5);
++		printf("NEGRONI WLAN: SOC_WAKE %#x -> wrote 1 -> %#x after 5 ms (negroniwlan_msi bit 1)\n", w0,
++		    negroni_wlan_rd(QCA_PCIE_SOC_WAKE));
++	}
++	if (!(g_msi_mode & 1u)) {
++		return;
++	}
++	if (!cfg) {
++		printf("NEGRONI WLAN: MSI: no endpoint config space; MSI stays off\n");
++		return;
++	}
++	uint32_t cap = wlan_cfg_cap(cfg, MSI_CAP_ID);
++	if (!cap) {
++		printf("NEGRONI WLAN: MSI: no MSI capability in the endpoint list; MSI stays off\n");
++		return;
++	}
++	uint32_t hdr = cfg[cap / 4], ctl = hdr >> 16, data_off, mask_off;
++	msi_offsets(cap, ctl, &data_off, &mask_off);
++
++	/* the chip's address for the mailbox: inside the pool's device mapping, inside the SMMU window, 32-bit if need be */
++	uint64_t base = 0, limit = 0, addr = g_pool_dva + OFF_MSI;
++	const char *why = NULL;
++	if (g_pool_dva == WLAN_DMA_NONE || !g_pool_nc) {
++		why = "the DMA pool has no device address";
++	} else if (g_smmu_policy != 3 || !negroni_wlan_smmu_window(&base, &limit)) {
++		why = "no SMMU context (negroniwlan_smmu=3 needed: the pool's physical address is above 4 GiB)";
++	} else if (g_pool_dva < base || g_pool_dva + NEGRONI_WLAN_POOL_SIZE - 1 > limit || addr + 3 > limit) {
++		why = "the mailbox IOVA is outside the SMMU window";
++	} else if (!(ctl & MSI_CTL_64BIT) && addr > 0xfffffffcull) {
++		why = "the capability takes a 32-bit address only";
++	} else if (ctl & MSI_CTL_ENABLE) {
++		why = "MSI is already enabled (not by us)";
++	}
++	/*
++	 * the root port's iMSI-RX (DWC PCIE_MSI_ADDR_LO/HI, DBI 0x820/0x824) ends an inbound write to its address in the
++	 * port and never sends it to the SMMU. Linux (dw_pcie_msi_init) programs it; our survey does not: log what the
++	 * UEFI left, and refuse a mailbox in the same 4 KiB page.
++	 */
++	if (!why && P.dbi) {
++		volatile uint32_t *dbi = (volatile uint32_t *)P.dbi;
++		uint32_t imsi_lo = dbi[0x820 / 4], imsi_hi = dbi[0x824 / 4], imsi_en = dbi[0x828 / 4];
++		printf("NEGRONI WLAN: MSI: root port iMSI-RX address %#x:%08x, vector enable %#x (DBI 0x820/0x824/0x828)\n",
++		    imsi_hi, imsi_lo, imsi_en);
++		if (imsi_hi == (uint32_t)(addr >> 32) && (imsi_lo & ~0xfffu) == ((uint32_t)addr & ~0xfffu)) {
++			why = "the root port iMSI-RX address is in the mailbox page (the write would stop in the port)";
++		}
++	}
++	if (why) {
++		printf("NEGRONI WLAN: MSI: capability %#x control %#x, mailbox %#llx: %s; MSI stays off\n", cap, ctl, addr, why);
++		return;
++	}
++
++	volatile uint32_t *box = (volatile uint32_t *)(g_pool_nc + OFF_MSI);
++	*box = MSI_SENTINEL;
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	g_msi_cap = cap;                /* from here on wlan_msi_off undoes it */
++	cfg[(cap + 0x04) / 4] = (uint32_t)addr;
++	if (ctl & MSI_CTL_64BIT) {
++		cfg[(cap + 0x08) / 4] = (uint32_t)(addr >> 32);
++	}
++	cfg[data_off / 4] = MSI_DATA_BASE;      /* the upper 16 bits (extended data) stay 0 */
++	if (mask_off) {
++		cfg[mask_off / 4] = 0;          /* all vectors unmasked */
++	}
++	uint32_t mmc = MSI_CTL_MMC(ctl);
++	uint32_t nctl = (ctl & ~(uint32_t)MSI_CTL_MME_MASK) | (mmc << 4) | MSI_CTL_ENABLE;
++	cfg[cap / 4] = (nctl << 16) | (hdr & 0xffffu);   /* ID and next pointer are read only */
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	uint32_t rctl = cfg[cap / 4] >> 16, raddr = cfg[(cap + 0x04) / 4], rdata = cfg[data_off / 4] & 0xffffu;
++	uint32_t rmask = mask_off ? cfg[mask_off / 4] : 0;
++	g_msi_vectors = 1u << MSI_CTL_MME(rctl);
++	g_msi_count = g_msi_lines = 0;
++	g_msi_t0 = negroni_wlan_ms();
++	g_msi_on = (rctl & MSI_CTL_ENABLE) && raddr == (uint32_t)addr && rdata == MSI_DATA_BASE;
++	printf("NEGRONI WLAN: MSI %s: capability %#x control %#x -> %#x (%u of %u vectors, %s address, per-vector mask %s), "
++	    "address %#x (pool + %#x, SMMU window %#llx-%#llx), data %#x, mask %#x, mailbox %#x\n",
++	    g_msi_on ? "on" : "DID NOT TAKE", cap, ctl, rctl, g_msi_vectors, 1u << mmc, (ctl & MSI_CTL_64BIT) ? "64-bit" : "32-bit",
++	    mask_off ? "yes" : "no", raddr, OFF_MSI, base, limit, rdata, rmask, *box);
++	if (!g_msi_on) {
++		cfg[cap / 4] = ((rctl & ~(uint32_t)(MSI_CTL_ENABLE | MSI_CTL_MME_MASK)) << 16) | (hdr & 0xffffu);
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++}
++
++/* every failure path (wlan_quiesce), before the pool and the SMMU context go: no MSI write to a stale address later */
++static void
++wlan_msi_off(const char *why)
++{
++	volatile uint32_t *cfg = (volatile uint32_t *)P.cfg_bus1;
++	uint32_t cap = g_msi_cap;
++
++	if (!cap || !cfg) {
++		return;
++	}
++	negroni_wlan_msi_poll(why);     /* the last MSI before the stop */
++	uint32_t hdr = cfg[cap / 4], ctl = hdr >> 16, data_off, mask_off;
++	g_msi_on = false;
++	if (hdr == MHI_ALL_ONES) {
++		/* link down: the chip cannot send anything upstream; the SMMU context still goes away after the quiesce */
++		g_msi_cap = 0;
++		printf("NEGRONI WLAN: MSI off (%s): config space reads 0xffffffff (link down); not written, %u MSIs seen\n", why,
++		    g_msi_count);
++		return;
++	}
++	msi_offsets(cap, ctl, &data_off, &mask_off);
++	if (mask_off) {
++		cfg[mask_off / 4] = 0xffffffffu;        /* mask first: no new message */
++	}
++	cfg[cap / 4] = ((ctl & ~(uint32_t)(MSI_CTL_ENABLE | MSI_CTL_MME_MASK)) << 16) | (hdr & 0xffffu);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	cfg[(cap + 0x04) / 4] = 0;
++	if (ctl & MSI_CTL_64BIT) {
++		cfg[(cap + 0x08) / 4] = 0;
++	}
++	cfg[data_off / 4] = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	g_msi_on = false;
++	g_msi_cap = 0;
++	printf("NEGRONI WLAN: MSI off (%s): control %#x, address %#x, %u MSIs seen\n", why, cfg[cap / 4] >> 16,
++	    cfg[(cap + 0x04) / 4], g_msi_count);
++}
++
+ /* Turn off bus mastering: from here on the chip cannot read or write host memory (PCIe BME). */
+ static void
+ wlan_quiesce(struct negroni_wlan_pcie *p)
+ {
+ 	volatile uint32_t *cfg = (volatile uint32_t *)p->cfg_bus1;
+ 
++	wlan_msi_off("stop");          /* 0344: before the MHI reset and the frees */
+ 	negroni_wlan_mhi_reset(&H);
+ 	cfg[0x04 / 4] = (cfg[0x04 / 4] & 0xffff) & ~(1u << 2);
+ 	(void)cfg[0x04 / 4];                            /* non-posted read: the write has landed */
+@@ -1295,6 +1525,7 @@ wlan_level_sbl(void)
+ 		printf("NEGRONI WLAN: the chip is not in PBL (need execution environment 0, no SYSERR); stop\n");
+ 		return negroni_wlan_failed(EIO, "the chip is not in PBL (EE %u, MHISTATUS %#x)", ee, st);
+ 	}
++	wlan_msi_setup();               /* 0344: negroniwlan_msi (default 0: nothing) */
+ 
+ 	/*
+ 	 * 0339: the image as the chip will read it (through the Normal non-cacheable view = RAM after the clean to PoC):
+@@ -1528,14 +1759,16 @@ negroni_wlan_start(void)
+ 	(void)PE_parse_boot_argn("negroniwlan_keep", &g_keep_s, sizeof(g_keep_s));
+ 	(void)PE_parse_boot_argn("negroniwlan_swreset", &g_swreset, sizeof(g_swreset));     /* 0342 */
+ 	(void)PE_parse_boot_argn("negroniwlan_bootdbg", &g_bootdbg, sizeof(g_bootdbg));     /* 0343 */
++	(void)PE_parse_boot_argn("negroniwlan_msi", &g_msi_mode, sizeof(g_msi_mode));       /* 0344 */
++	g_msi_mode &= 3u;
+ 	g_swreset = MIN(g_swreset, 2u);
+ 	g_timeout_ms = MIN(MAX(g_timeout_ms, 100u), 60000u);
+ 	g_level = MAX(g_level, (uint32_t)WLAN_LEVEL_SBL);
+ 	if (g_level > WLAN_LEVEL_MAX) {
+ 		printf("NEGRONI WLAN: negroniwlan=%u asked; this build stops at level %u\n", g_level, WLAN_LEVEL_MAX);
+ 	}
+-	printf("NEGRONI WLAN: start: levels %u..%u, time-out %u ms per wait, SMMU policy %u, SW reset %u\n", WLAN_LEVEL_SBL,
+-	    MIN(g_level, (uint32_t)WLAN_LEVEL_MAX), g_timeout_ms, g_smmu_policy, g_swreset);
++	printf("NEGRONI WLAN: start: levels %u..%u, time-out %u ms per wait, SMMU policy %u, SW reset %u, MSI %u\n",
++	    WLAN_LEVEL_SBL, MIN(g_level, (uint32_t)WLAN_LEVEL_MAX), g_timeout_ms, g_smmu_policy, g_swreset, g_msi_mode);
+ 	negroni_wlan_sta_lifecycle(NWLAN_STATE_STARTING, 0);  /* 0326 */
+ 	if (kernel_thread_start(wlan_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+diff --git a/bsd/dev/negroni_wlan_bhi.c b/bsd/dev/negroni_wlan_bhi.c
+index ac2724f..2c5d30c 100644
+--- a/bsd/dev/negroni_wlan_bhi.c
++++ b/bsd/dev/negroni_wlan_bhi.c
+@@ -29,6 +29,7 @@ bhi_wait(struct mhi_host *h, uint32_t status_off, uint32_t bhi_err, const char *
+ 	uint32_t reg;
+ 
+ 	do {
++		negroni_wlan_msi_poll(what);    /* 0344: Linux gets an MSI on vector 0 (BHI_INTVEC) at the end */
+ 		reg = negroni_wlan_rd(status_off);
+ 		uint32_t st = (reg >> 30) & 0x3;
+ 
+@@ -78,7 +79,7 @@ negroni_wlan_bhi_sbl(struct mhi_host *h, uint64_t pa, uint32_t size)
+ {
+ 	uint32_t seq = negroni_wlan_seq();
+ 
+-	negroni_wlan_wr(h->bhi + BHI_INTVEC, 0);        /* BHI MSI vector 0 (pm.c power-up); no MSI is enabled */
++	negroni_wlan_wr(h->bhi + BHI_INTVEC, 0);        /* BHI MSI vector 0 (pm.c power-up); MSI only with negroniwlan_msi=1 (0344) */
+ 	negroni_wlan_wr(h->bhi + BHI_STATUS, 0);
+ 	negroni_wlan_wr(h->bhi + BHI_IMGADDR_HIGH, (uint32_t)(pa >> 32));
+ 	negroni_wlan_wr(h->bhi + BHI_IMGADDR_LOW, (uint32_t)pa);
+diff --git a/bsd/dev/negroni_wlan_mhi.c b/bsd/dev/negroni_wlan_mhi.c
+index 6857ead..9aa8643 100644
+--- a/bsd/dev/negroni_wlan_mhi.c
++++ b/bsd/dev/negroni_wlan_mhi.c
+@@ -115,6 +115,7 @@ negroni_wlan_mhi_ready(struct mhi_host *h)
+ 	uint32_t wait_ms = MAX(h->timeout_ms, 30000u), last_ee = ~0u;
+ 	deadline = t0 + wait_ms;
+ 	do {
++		negroni_wlan_msi_poll("READY wait");   /* 0344 */
+ 		if (mhi_check_status(h, "waiting for READY")) {
+ 			negroni_wlan_boot_dump(h, "SYSERR while waiting for READY");
+ 			return EIO;
+@@ -172,7 +173,7 @@ negroni_wlan_mhi_init(struct mhi_host *h)
+ 
+ 		c->w0 = 0;                      /* intmod: no moderation (polling) */
+ 		c->w1 = ER_TYPE_VALID;
+-		c->w2 = 0;                      /* msivec: unused without MSI */
++		c->w2 = negroni_wlan_msi_on() ? i + 1 : 0;      /* msivec; 0344: ath11k MHI irq 1, 2 when MSI is on */
+ 		ctx_set64(c->rbase, h->ev[i].pa);
+ 		ctx_set64(c->rlen, (uint64_t)h->ev[i].n * sizeof(struct mhi_el));
+ 		ctx_set64(c->rp, h->ev[i].pa);
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index 2dffc3f..5c72617 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -229,6 +229,9 @@ void negroni_wlan_wlfw_idle(void);                      /* 0320: keep-alive, lat
+ /* 0339: the MHI/BHI/PBL/SBL state in a few lines (cnss2 cnss_boot_debug_timeout_hdlr: mhi regs, scratch regs,
+  * cnss_pci_dump_bl_sram_mem), for the boot of the chip's SBL */
+ void negroni_wlan_boot_dump(struct mhi_host *h, const char *when);
++/* 0344: negroniwlan_msi bit 0: print an MSI the chip wrote into the RAM mailbox (nothing when MSI is off) */
++void negroni_wlan_msi_poll(const char *when);
++bool negroni_wlan_msi_on(void);
+ 
+ /* negroni_wlan_bhi.c */
+ int negroni_wlan_bhi_sbl(struct mhi_host *h, uint64_t pa, uint32_t size);

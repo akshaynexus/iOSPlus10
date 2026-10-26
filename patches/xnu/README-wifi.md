@@ -1070,3 +1070,85 @@ How to read it [I]:
   (`wlan_quiesce`) writes endpoint config space on a dead link (not checked). BAR0 check/restore use the low dword only.
 - 0343 verdict wording: INT_ALL_STATUS 0x2000/0x2400 are probably bit 13 LINK_UP and bit 10 MMIO_WRITE (pcie-qcom-ep
   layout, a guess for WCN6855), normal events; ath11k names only bit 1 (SMLH_REQ_RST_LINK_DOWN). Level 1 clears them anyway.
+
+## 0344: MSI into a RAM mailbox (boot-arg `negroniwlan_msi`, default 0) (2026-10-27)
+
+### Why [V phone, I cause]
+
+- [V] With 0342 level 1 and level 2: BHI SBL DONE (status 0xbe92258b = DONE + session id), then EE 0, MHISTATUS 0,
+  READY time-out after 30 s, no SMMU fault. Level 2 works as a reset (MHISTATUS 0xff04 SYS_ERR right after it, MHICTRL
+  RESET clears it), but the SBL still does not come up. TCSR_PBL_LOGGING changes once (0xef150600 -> 0xef0e0200),
+  then nothing. The SBL never writes its log pointer (PCIE_BHI_ERRDBG2 stays 0).
+- [V] The endpoint MSI capability at 0x50 reads 0x10a7005: MSI off, 32 vectors (MMC 5), per-vector mask, 32-bit
+  address only.
+- [V source] ath11k (`ath11k_pci_alloc_msi`) and cnss2 (`cnss_pci_enable_msi`) always enable MSI before the MHI
+  power-up. On Android the PCIe0 MSIs go to the GIC ITS. This port has no ITS setup, so the MSI stayed off.
+- [I] Guess: the SBL (or the PBL hand-off) may wait for, or depend on, a working MSI configuration. 0344 tests this
+  without an interrupt controller: the MSI target is RAM.
+
+### What it does
+
+At step 7, after the PBL check and before the `before BHI` dump (`wlan_msi_setup`):
+- Bit 1 (`negroniwlan_msi=2` or `=3`): PCIE_SOC_WAKE (BAR0 0x3004) = 1, 5 ms, the readback is logged. Bisect only. The
+  value stays 1.
+- Bit 0 (`=1` or `=3`): a bounded walk of the endpoint list finds the MSI capability (ID 5). The address is the IOVA
+  of the pool word at `OFF_MSI` 0x8000. That page is free: the IPCR in ring ends at 0x6400 (0x6000 + 64 x 16 B) and the
+  firmware starts at 0x10000 (a `_Static_assert` checks it). The pool is one SMMU mapping (`negroni_wlan_dma_map` of
+  the whole pool at step 6), so the word is mapped read/write in our context. Data base 0xa500 (32-aligned: the chip
+  puts the vector number in bits 4:0). All 32 vectors unmasked, MME = MMC, then MSI enable. The mailbox holds
+  0xffffffff before the enable.
+- Checks before the enable (each one gives one line and leaves MSI off, no stop): pool device address present;
+  `negroniwlan_smmu=3` with an active context (the pool's physical address is above 4 GiB, so the identity path
+  cannot work); the whole pool and the mailbox inside the SMMU window 0xa0000000-0xafffffff; a 32-bit address when the
+  capability has no 64-bit address; MSI not already enabled.
+- Root port iMSI-RX (review 2026-10-27): one line prints DBI 0x820/0x824/0x828 (DWC PCIE_MSI_ADDR_LO/HI, vector
+  enable) as the UEFI left them. The DWC port ends an inbound write to that address in the port (it never reaches the
+  SMMU). Our survey does not program it (Linux `dw_pcie_msi_init` does). If it points into the mailbox page, MSI stays
+  off. Expected: reset value 0, no match.
+- With MSI on, `negroni_wlan_mhi_init` gives the event ring contexts msivec 1 and 2 (ath11k MHI irq layout: vector 0
+  = BHI/state, 1-2 = event rings). BHI_INTVEC stays 0 (already written before the BHI doorbell, as Linux).
+- Polls: in the BHI wait loop (`BHI SBL`), at every BOOT dump (`before BHI`, `BHI SBL`, `waiting for READY`, `READY
+  time-out`, `SYSERR while waiting for READY`), every pass of the READY loop (`READY wait`, 1 s) and every
+  `negroni_wlan_service` pass (`service`). A change prints one line and the sentinel goes back. At most 64 lines,
+  then the MSIs are only counted. Two MSIs between two polls show as one (the last one).
+- Stop: `wlan_quiesce` (every failure path after the BAR0 claim) calls `wlan_msi_off` first: one last poll, all
+  vectors masked, enable and MME cleared, address and data 0, then the MHI reset, bus master off, the frees and the
+  SMMU teardown. With a dead link (config reads 0xffffffff) nothing is written. When a level succeeds and the chip
+  keeps running, MSI stays on: the pool and the SMMU context stay too.
+- Stray writes: with MSI enable 0 the function must not send MSI (PCI 3.0 6.8.1.3). Masked vectors only set pending
+  bits. MSI enable is set only after the address, the data and the mask are in place.
+
+### Lines (`NEGRONI WLAN: `)
+
+- `start: ... SW reset N, MSI M`
+- bit 1: `SOC_WAKE 0x.. -> wrote 1 -> 0x.. after 5 ms (negroniwlan_msi bit 1)`
+- bit 0: `MSI on: capability 0x50 control 0x10a -> 0x15b (32 of 32 vectors, 32-bit address, per-vector mask yes),
+  address 0xa0008000 (pool + 0x8000, SMMU window 0xa0000000-0xafffffff), data 0xa500, mask 0, mailbox 0xffffffff`
+  (expected values if the pool is the first SMMU mapping at 0xa0000000; the real address is the pool IOVA + 0x8000).
+  `MSI DID NOT TAKE: ...` = the readback differs; MSI goes off again.
+- refusal: `MSI: capability .. control .., mailbox ..: <reason>; MSI stays off`
+- each MSI: `MSI #n data 0xa5vv (vector vv) at <when> after N ms` (`not our data base` = some other value landed in
+  the word)
+- stop: `MSI off (stop): control 0x10a, address 0, N MSIs seen`
+
+### Test (main session; one boot each)
+
+1. `negroniwifi=10 negroniwlan=10 negroniwlan_smmu=3 negroniwlan_msi=1`
+2. `negroniwifi=10 negroniwlan=10 negroniwlan_smmu=3 negroniwlan_msi=3` (+ SOC_WAKE)
+
+How to read it [I]:
+- `MSI #1 data 0xa500 (vector 0) at BHI SBL ...`: the chip sends the BHI-done MSI (Linux gets it on BHI_INTVEC 0). The
+  MSI path (endpoint -> root port -> SMMU context -> RAM) works.
+- `MHISTATUS READY ... after N ms` with MSI on, never without: the SBL needs MSI enabled. Next: make `negroniwlan_msi=1`
+  the default and keep polling (no ITS needed).
+- MSI lines but still no READY and EE 0: MSI is not the blocker. Next suspects (guesses, README 0342-0343): the XO
+  clock latch at WLAN_EN, the rail modes (antenna switch, rfa).
+- No MSI line at all, SMMU fault line with an address near the mailbox: the MSI write reaches the SMMU but the
+  mapping is wrong. No MSI line and no fault: the chip sent nothing (or the root port takes the write).
+- `MSI DID NOT TAKE` or a refusal line: read the reason; nothing else changed in the boot.
+- `=3` differs from `=1` only by SOC_WAKE: a READY only with `=3` points at the SoC wake vote.
+
+### Not checked
+
+- [I] The DWC root port has an iMSI-RX block that catches upstream writes to its own MSI address. The survey does not
+  program it (no `PCIE_MSI_ADDR` write in negroni_wifi.c), so a write to 0xa0008000 should go upstream. Not read back.
