@@ -1,7 +1,8 @@
 //! Raw image <-> Android sparse image, with the `android-sparse` crate for the file format.
 //!
 //! img2simg keeps its own block classification, like AOSP img2simg:
-//! - file holes (SEEK_DATA/SEEK_HOLE) -> Skip (DONT_CARE);
+//! - file holes (SEEK_DATA/SEEK_HOLE) -> Skip (DONT_CARE), except holes in blocks that the HFS+ allocation bitmap
+//!   marks as in use -> Fill(0) (see `hfs_allocated`);
 //! - data blocks that repeat one 32-bit word, zeros included -> Fill;
 //! - other blocks -> Raw.
 //! The crate's own Encoder turns every zero block into Skip. That is not safe for a filesystem image:
@@ -36,11 +37,47 @@ fn data_ranges(f: &File, size: u64) -> Vec<(u64, u64)> {
     out
 }
 
+/// HFS+ allocation bitmap (bit per 4096-byte block, MSB first), or None when the image has no HFS+ volume header
+/// with 4096-byte blocks. A file hole in an allocated block is zero file data (or metadata) that macOS stored
+/// sparsely in the raw image: as DONT_CARE the flash left the old userdata bytes there. 2026-10-27: 79 MiB in 20296
+/// such blocks; SleepWidgetExtension's zero __DATA page (file 0x8000-0xc000) read back as old bytes on the phone,
+/// cs_invalid_page + sig 11 at a pointer from that page (docs/metal-widgets-2026-10-27.md section 3).
+fn hfs_allocated(f: &mut File) -> Result<Option<(Vec<u8>, u64)>> {
+    let mut h = [0u8; 512];
+    f.seek(SeekFrom::Start(1024))?;
+    if f.read_exact(&mut h).is_err() || !(&h[0..2] == b"HX" || &h[0..2] == b"H+") { return Ok(None); }
+    let be32 = |o: usize| u32::from_be_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]) as u64;
+    let (bs, tb) = (be32(0x28), be32(0x2c));
+    if bs != B { return Ok(None); }
+    // allocationFile HFSPlusForkData at 0x70: logicalSize u64, clumpSize u32, totalBlocks u32, extents[8] at 0x80
+    let fork_blocks = be32(0x7c);
+    let mut bm = Vec::new();
+    let mut got = 0u64;
+    for i in 0..8 {
+        let (start, count) = (be32(0x80 + 8 * i), be32(0x84 + 8 * i));
+        if count == 0 { break; }
+        let mut part = vec![0u8; (count * bs) as usize];
+        f.seek(SeekFrom::Start(start * bs))?;
+        f.read_exact(&mut part)?;
+        bm.extend_from_slice(&part);
+        got += count;
+    }
+    ensure!(got == fork_blocks, "HFS+ allocation file has extents beyond the volume header ({got} of {fork_blocks} blocks)");
+    ensure!(bm.len() as u64 * 8 >= tb, "HFS+ allocation bitmap is shorter than the volume");
+    Ok(Some((bm, tb)))
+}
+
 pub fn img2simg(input: &Path, output: &Path) -> Result<()> {
     let mut f = File::open(input).with_context(|| format!("open {}", input.display()))?;
     let size = f.metadata()?.len();
     ensure!(size % B == 0, "image size must be a multiple of {B}");
     let total = size / B;
+    let alloc = hfs_allocated(&mut f)?;
+    let used = |k: u64| match &alloc {
+        Some((bm, tb)) => k < *tb && bm[(k / 8) as usize] & (0x80 >> (k % 8)) != 0,
+        None => false,
+    };
+    let mut zfill = 0u64;
     let mut w = Writer::new(BufWriter::with_capacity(1 << 22, File::create(output)?))?;
     let (mut raw, mut fill, mut skip) = (0u64, 0u64, 0u64);
     let mut blk = 0u64;
@@ -48,7 +85,10 @@ pub fn img2simg(input: &Path, output: &Path) -> Result<()> {
     let mut buf = vec![0u8; (B * BATCH) as usize];
     for (s, e) in data_ranges(&f, size) {
         let (s, e) = (s / B, e.div_ceil(B));
-        for _ in blk..s { w.write_block(&Block::Skip)?; skip += 1; }
+        for k in blk..s {
+            if used(k) { w.write_block(&Block::Fill([0; 4]))?; fill += 1; zfill += 1; }
+            else { w.write_block(&Block::Skip)?; skip += 1; }
+        }
         f.seek(SeekFrom::Start(s * B))?;
         let mut k = s;
         while k < e {
@@ -70,9 +110,15 @@ pub fn img2simg(input: &Path, output: &Path) -> Result<()> {
         }
         blk = e;
     }
-    for _ in blk..total { w.write_block(&Block::Skip)?; skip += 1; }
+    for k in blk..total {
+        if used(k) { w.write_block(&Block::Fill([0; 4]))?; fill += 1; zfill += 1; }
+        else { w.write_block(&Block::Skip)?; skip += 1; }
+    }
     w.close()?;
     println!("{}: {total} blocks ({} MiB raw, {fill} fill, {skip} don't-care)", output.display(), raw * B >> 20);
+    if alloc.is_some() {
+        println!("HFS+ volume: {zfill} hole blocks in allocated HFS+ blocks written as zero FILL (not DONT_CARE)");
+    }
     Ok(())
 }
 

@@ -32,8 +32,14 @@
    before the IOMFBDisplayRefresh property and the 1/60 s default (docs/notes.md section 15). The job
    lives in System/Library/xpc/launchd.plist (launchd reads only that cache, docs/usb-network.md).
    Phone-side test without a new root: scripts/metal/phone-heartbeat.sh.
+6. WidgetKit extension jetsam limit (env WIDGET_JETSAM_MB, default 64, empty = off): iOS 16 limits every
+   com.apple.widgetkit-extension to 30 MiB (com.apple.jetsamproperties.<model>.plist, read by runningboardd); our
+   Metal device needs ~15-20 MiB more, FitnessWidget was jetsam-killed (docs/metal-widgets-2026-10-27.md).
+   scripts/ios16/jetsam_widgets.py patches every jetsamproperties plist. Live phone: scripts/metal/phone-widget-jetsam.sh.
 """
-import argparse, os, plistlib
+import argparse, glob, os, plistlib, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import jetsam_widgets
 
 BACKBOARDD = '/System/Library/LaunchDaemons/com.apple.backboardd.plist'
 
@@ -112,6 +118,13 @@ def main():
     for dom in ('com.apple.frontboard', 'com.apple.springboard'):
         merge_pref(r, dom, {'FBLaunchWatchdogScale': 3})
     print('FBLaunchWatchdogScale 3 (frontboard, springboard)')
+
+    wmb = os.environ.get('WIDGET_JETSAM_MB', '64')
+    if wmb:
+        for path in sorted(glob.glob(os.path.join(r, 'System/Library/LaunchDaemons/com.apple.jetsamproperties.*.plist'))):
+            print('jetsam:', jetsam_widgets.patch(path, int(wmb)))
+    else:
+        print('jetsam: WIDGET_JETSAM_MB empty, widget limits left as is')
 
 if __name__ == '__main__':
     main()

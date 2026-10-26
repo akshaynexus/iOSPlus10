@@ -336,25 +336,23 @@ static const char *extension_point(void)
 /* Memory rule (2026-10-27, docs/metal-widgets-2026-10-27.md): a process with a small jetsam limit gets no device. The
  * plugin and Turnip need about 20 MiB on top of the process (chronod: 31 MiB with the device), and WidgetKit extensions
  * are limited to 30 MiB: FitnessWidget was killed (sig 9, per-process limit) three times at every boot, 1-8 s after the
- * device opened, and chronod then gave the widget up. The rule: limit known and below NEGRONIMETAL_MIN_LIMIT_MB (default
- * 40), or a com.apple.widgetkit-extension (its limit is 30 MiB whether or not the kernel reports it): no device.
- * NEGRONIMETAL_MIN_LIMIT_MB=0 in NMTL_DIR/env turns the rule off. Returns the reason, or NULL when the device may open. */
+ * device opened, and chronod then gave the widget up. The root (scripts/ios16/jetsam_widgets.py, root-tweaks-extra.py;
+ * live: scripts/metal/phone-widget-jetsam.sh) now raises the widget limit to 64 MiB, and the widgets need a device
+ * (FitnessWidget traps without one), so there is no special case for widgets any more. The rule: the limit read at
+ * runtime is known and below NEGRONIMETAL_MIN_LIMIT_MB (default 40): no device. NEGRONIMETAL_MIN_LIMIT_MB=0 in
+ * NMTL_DIR/env turns the rule off. Returns the reason, or NULL when the device may open. */
 static const char *memory_rule(char *why, size_t size)
 {
 	long footprint = 0;
 	long limit = memory_limit_mb(&footprint);
 	const char *point = extension_point();
-	const long min_mb = env_num("NEGRONIMETAL_MIN_LIMIT_MB", 40); /* 40: chronod (inactive 45 MiB) keeps its device; widgets (30) do not */
+	const long min_mb = env_num("NEGRONIMETAL_MIN_LIMIT_MB", 40); /* 40: chronod (inactive 45 MiB) and widgets (64 with our root) keep the device; stock 30 MiB widgets do not */
 	nlog("memory: footprint %ld MiB, jetsam limit %ld MiB (0 = none/unknown), extension point %s, rule %ld MiB",
 	     footprint, limit, *point ? point : "-", min_mb);
 	if (min_mb <= 0)
 		return NULL;
 	if (limit > 0 && limit < min_mb) {
 		snprintf(why, size, "jetsam limit %ld MiB is below %ld MiB (NEGRONIMETAL_MIN_LIMIT_MB): no Metal device", limit, min_mb);
-		return why;
-	}
-	if (!strcmp(point, "com.apple.widgetkit-extension")) {
-		snprintf(why, size, "WidgetKit extension (30 MiB jetsam limit; reported %ld MiB): no Metal device", limit);
 		return why;
 	}
 	return NULL;

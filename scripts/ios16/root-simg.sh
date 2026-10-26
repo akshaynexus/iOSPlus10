@@ -9,7 +9,7 @@
 #     The boot log area (kernel 0367, N-28673 .. N-19458, 36 MiB) is reserved: the root must end below it;
 #     its superblock (`op10tool bootlog --mkarea`) is written at N-28673, the slots stay DONT_CARE (the kernel
 #     ignores slot headers without a valid CRC).
-# Uses `op10tool img2simg` (holes -> DONT_CARE via SEEK_DATA/SEEK_HOLE, uniform blocks -> FILL); its output
+# Uses `op10tool img2simg` (holes -> DONT_CARE via SEEK_DATA/SEEK_HOLE, uniform blocks -> FILL); its output  (2026-10-27: a hole in an HFS+-allocated block -> FILL 0, see op10tool img2simg)
 # decodes byte-identical with AOSP simg2img (tools/op10tool/tests).
 set -eu
 . "$(dirname "$0")/../lib/env.sh"

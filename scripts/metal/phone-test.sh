@@ -45,7 +45,8 @@ push)
        tar -xzpf /private/var/tmp/metal.tgz -C / && rm /private/var/tmp/metal.tgz;
        [ -f /var/tmp/clients.keep ] && mv /var/tmp/clients.keep /var/db/negronimetal/clients;
        mkdir -p /var/db/negronimetal/cache /var/db/negronimetal/strikes && chmod 1777 /var/db/negronimetal/cache /var/db/negronimetal/strikes;
-       touch /var/db/negronimetal/metal.log && chmod 666 /var/db/negronimetal/metal.log; ls -la '"$B"' /usr/local/bin'
+       touch /var/db/negronimetal/metal.log && chmod 666 /var/db/negronimetal/metal.log;
+       sync; ls -la '"$B"' /usr/local/bin'   # sync: a reset 10 s after an unsynced push lost it (2026-10-27 03:15)
   ;;
 0)
   run "/usr/local/bin/vkprobe --icd $B/libvulkan_freedreno.dylib"
