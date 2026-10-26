@@ -51,6 +51,8 @@ for h in $hooks; do
     ssh)       SSH=1 sh "$REPO/scripts/net/root-add-ssh.sh" "$R" ;;
     haptics)   HAPTICS=1 sh "$REPO/scripts/haptics/root-add-haptics.sh" "$R" ;;
     bt)        BT=1 sh "$REPO/scripts/bt/root-add-bt.sh" "$R" ;;
+    camera)    CAMERA=1 sh "$REPO/scripts/camera/root-add-camera.sh" "$R" ;;
+    fpd)       FPD=1 sh "$REPO/scripts/fp/root-add-fpd.sh" "$R" ;;
     tweaks)    python3 "$REPO/scripts/ios16/root-tweaks-extra.py" "$R" --migration "${MIGRATION:-skip}" ;;
   esac
 done

@@ -15,7 +15,7 @@ set -eu
 APPLE=${APPLE:-$HOME/op10-apple}
 S=$APPLE/ios16-root.simg; RAW=$APPLE/ios16-root.img; NEW=$APPLE/ios16-root-new.img
 [ -f "$S" ] || { echo "missing $S" >&2; exit 1; }
-HOOKS=${*:-"tweaks metal powermenu negronigl audio ssh haptics bt"}
+HOOKS=${*:-"tweaks metal powermenu negronigl audio ssh haptics bt camera fpd"}
 for a in gpu adsp wlan; do [ -f "$OUT/firmware/$a-area.bin" ] || { echo "missing out/firmware/$a-area.bin (scripts/fw/build-areas.sh)" >&2; exit 1; }; done
 rm -f "$RAW" "$NEW" "${NEW%.img}.simg"
 "$OUT/bin/op10tool" simg2img "$S" "$RAW"

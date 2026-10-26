@@ -6,7 +6,7 @@
 # links to; every kernel tree (out/kernel/tree-*, wt-*) with a file changed in the last KEEP_HOURS hours
 # (default 3: an agent may still use it); out/kernel/local (the build tree), buildtree, the default
 # boot image dir out/ios16. Removes: older local-* builds, idle trees, out/kernel/keep, old boot-image
-# variants out/ios16-* (not ios16-debug), out/backup-orphan-* older than 2 days.
+# variants out/ios16-* (not ios16-debug, ios16-safe, ios16-everything), out/backup-orphan-* older than 2 days.
 # Never touches ~/op10-apple, ~/op10-backup, firmware, or anything outside out/.
 set -eu
 . "$(dirname "$0")/lib/env.sh"
@@ -35,7 +35,7 @@ done
 [ -d "$K/keep" ] && add "$K/keep"
 for d in "$OUT"/ios16-*; do
   [ -d "$d" ] || continue
-  case $(basename "$d") in ios16-debug) ;; *) add "$d" ;; esac
+  case $(basename "$d") in ios16-debug|ios16-safe|ios16-everything) ;; *) add "$d" ;; esac   # safe = the known-good boot_a (test-boot.sh)
 done
 for d in "$OUT"/backup-orphan-*; do
   [ -d "$d" ] && [ -n "$(find "$d" -maxdepth 0 -mtime +2)" ] && add "$d"
