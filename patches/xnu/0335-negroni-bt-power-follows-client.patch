@@ -1,0 +1,425 @@
+0335-negroni-bt-power-follows-client: Bluetooth on/off from Settings (owner bug 2026-10-27: "if I turn on Bluetooth
+I can't turn it off").
+
+Observed [V logs/usblog-20261026-233816.txt, kernel without 0334]: stage A stops at step 4, the transport says
+"not usable (sends fail with EIO)", bluetoothd connects with "chip FAILED" and then logs nothing more in the kernel
+log and does not crash: its power-on never ends, so the switch cannot go off. (The ~2 min repeats 02:02:43, 02:04:39,
+02:06:35 are whole phone reboots: "phone interface gone" lines, launchd pid 1 boot-args again, bluetoothd pid 85.)
+
+1. Dead chip (stage A or HCI stage failed): every host command gets a local Command Complete, status 0x03
+   (Hardware Failure), instead of EIO; other packets are dropped. negronibt_dead=0 = EIO as before,
+   negronibt_dead=2 = refuse the client (ECONNREFUSED / ENXIO).
+2. Working chip: power follows the client. The last client closing starts a timer (negronibt_off_ms, 3000);
+   then a power worker drives BT_EN low (negroni_bt_chip_off; rails and QUP2 clocks stay). The next client powers
+   the chip on: line to 115200, BT_EN sequence, step 8, the whole HCI stage (negroni_bt_chip_on); its sends wait
+   (negronibt_wait_ms). A failed power-on switches to the dead-chip answers. negronibt_pwrfollow=0 = always on.
+   The RX thread does not read the UART while the chip is off or being powered.
+
+Review fixes (Opus review 2026-10-27, REJECT -> fixed):
+- A1: the RX thread (the only path from the queue to the kernel control socket, deliver_ctl) now also starts in
+  negroni_bt_h4_fail() for the dead-chip mode; it does not read the UART while the chip is failed, off or powering.
+- A2: want_on = client && off && !failed && !powering; a success clears failed; a failed runtime power-on keeps
+  off and failed, and the next connect clears failed and tries once more (no back-to-back retries).
+- A3: the partial RX frame (t.rxn) is dropped after each chip off/on (rx_reset flag, read by the RX thread).
+- A4: dead-chip answers use a Command Status event (04 0f 04 03 01 <op>) for the commands that get Command Status
+  (0x0401 Inquiry, 0x0405, 0x0406, 0x0408, 0x0409, 0x040a, 0x040f, 0x0411, 0x0413, 0x0415, 0x0417, 0x0419,
+  0x041b-0x041d, 0x041f, 0x0428, 0x0429, 0x043d, 0x043e, 0x0801, 0x0803, 0x0804, 0x0807, 0x080b, 0x200d, 0x2013,
+  0x2016, 0x2019, 0x2025, 0x2026, 0x2032, 0x2043, 0x205d), Command Complete for all others.
+
+diff --git a/bsd/dev/negroni_bt.c b/bsd/dev/negroni_bt.c
+index df608eb..fe90d7d 100644
+--- a/bsd/dev/negroni_bt.c
++++ b/bsd/dev/negroni_bt.c
+@@ -797,6 +797,47 @@ step_rx_idle(void)
+ 	    n ? ":" : "", hex, bt.dropped, rd(bt.se + GENI_IOS));
+ }
+ 
++/*
++ * 0335: power cycle for the H4 transport (negroni_bt_h4.c power worker). Off = BT_EN low (btpower.c power off
++ * drives only the enable GPIO; the rails are shared and stay, the QUP2 clocks stay voted). On = the line back to
++ * 115200 (the ROM rate after BT_EN), the step 7 sequence, step 8, then the whole HCI stage (version, 3 Mbaud,
++ * rampatch, NVM, reset, BD address), as at boot.
++ */
++void
++negroni_bt_chip_off(void)
++{
++	if (!bt.powered) {
++		return;
++	}
++	gpio_out(PIN_BT_EN, false, 1u);
++	bt.powered = false;
++	SAY("power off: BT_EN low (SW_CTRL %u); rails and QUP2 clocks stay\n", gpio_in(PIN_SW_CTRL));
++}
++
++int
++negroni_bt_chip_on(void)
++{
++	uint64_t t0 = negroni_bt_us();
++	int error;
++
++	SAY("power on: line to 115200, BT_EN sequence, HCI stage\n");
++	negroni_bt_uart_flow(true);
++	if ((error = negroni_bt_uart_set_baud(115200u)) != 0) {
++		SAY("power on: no SE clock for 115200 (%d)\n", error);
++		return error;
++	}
++	bt.head = bt.tail = 0;
++	(void)step_power_on();
++	step_rx_idle();
++	error = negroni_bt_hci_run(bt.mode);
++	if (error) {
++		negroni_bt_chip_off();
++	}
++	SAY("power on: %s after %llu ms (error %d)\n", error ? "FAILED" : "chip ready", (negroni_bt_us() - t0) / 1000u,
++	    error);
++	return error;
++}
++
+ static void
+ bt_thread(void *arg __unused, wait_result_t w __unused)
+ {
+diff --git a/bsd/dev/negroni_bt.h b/bsd/dev/negroni_bt.h
+index 8cbd779..c6dbc9a 100644
+--- a/bsd/dev/negroni_bt.h
++++ b/bsd/dev/negroni_bt.h
+@@ -29,6 +29,10 @@ void negroni_bt_h4_start(void);                 /* chip ready: RX thread, sends
+ void negroni_bt_h4_fail(const char *why);       /* chip not ready: sends fail with EIO */
+ void negroni_bt_h4_inject(const uint8_t *pkt, uint32_t len);    /* one H4 packet toward userland */
+ 
++/* 0335: chip power for the transport (negroni_bt.c); the caller owns the UART (no RX thread read meanwhile) */
++void negroni_bt_chip_off(void);                 /* BT_EN low; rails and clocks stay */
++int negroni_bt_chip_on(void);                   /* BT_EN sequence + HCI stage again; 0 or errno (BT_EN low on error) */
++
+ /* HCI shim, implemented in negroni_bt_shim.c (patch 0333 replaces the 0332 pass-through) */
+ #define NEGRONI_BT_SHIM_PASS    0               /* send / deliver the packet unchanged (or as rewritten) */
+ #define NEGRONI_BT_SHIM_DONE    1               /* host command answered in the kernel: not sent */
+diff --git a/bsd/dev/negroni_bt_h4.c b/bsd/dev/negroni_bt_h4.c
+index 6263296..f04dd9c 100644
+--- a/bsd/dev/negroni_bt_h4.c
++++ b/bsd/dev/negroni_bt_h4.c
+@@ -38,6 +38,15 @@
+  * after a stage A/HCI failure it fails with EIO. Every wait is bounded.
+  * Boot-args: negronibt_h4log=N (log the first N packets per direction, default 300; HW errors, IBS and the shim are
+  *   always logged), negronibt_wait_ms=MS.
++ * 0335 (power follows the client, dead-chip answers):
++ *   - With a working chip, the last client closing starts a timer (negronibt_off_ms, default 3000); when no client
++ *     came back, a power worker drives BT_EN low (negroni_bt_chip_off). The next client (bluetoothd after a toggle
++ *     on, or its restart) powers the chip on again: BT_EN sequence + the whole HCI stage (negroni_bt_chip_on); its
++ *     sends wait for that (negronibt_wait_ms). negronibt_pwrfollow=0 keeps the chip on.
++ *   - With a failed chip (stage A or HCI stage failed), every host command gets a local Command Complete with status
++ *     0x03 (Hardware Failure) instead of a send error (EIO), so bluetoothd's stack init ends with an HCI error and
++ *     not a hung power-on (owner bug 2026-10-27: the Bluetooth switch stayed on). negronibt_dead=0: EIO as before;
++ *     negronibt_dead=2: the connect is refused (bluetoothd then stops with "Transport layer initialization failed").
+  * Log lines start "NEGRONI BT: h4 ". Proof of a working path: "h4 control ... connected", "h4 tx cmd 0x0c03",
+  * "h4 rx evt 0x0e ... op 0x0c03 status 0".
+  */
+@@ -116,6 +125,10 @@ static struct {
+ 	/* counters */
+ 	uint32_t n_tx, n_rx, n_local, n_drop_noowner, n_drop_full, n_drop_shim, n_garbage_rx, n_garbage_tx;
+ 	uint32_t n_ibs_rx, n_ibs_wake, n_ibs_timeout, n_tx_err, n_wake_open;
++	/* 0335 power worker (h4_lock) */
++	bool off, powering, worker, rx_running, rx_reset;
++	uint32_t dead_mode, pwr_follow, off_ms, n_dead, n_off, n_on, n_on_fail;
++	uint64_t gone_at;
+ 	uint64_t b_tx, b_rx, b_user;
+ 	char why[64];
+ } t;
+@@ -498,8 +511,13 @@ h4_rx_thread(void *arg __unused, wait_result_t w __unused)
+ 	for (;;) {
+ 		uint32_t n = 0;
+ 		lck_mtx_lock(&h4_lock);
+-		bool room = RXQ_SIZE - t.qn >= RXQ_ROOM;
++		bool room = RXQ_SIZE - t.qn >= RXQ_ROOM && !t.off && !t.powering && !t.failed;
++		bool reset = t.rx_reset;
++		t.rx_reset = false;
+ 		lck_mtx_unlock(&h4_lock);
++		if (reset) {
++			t.rxn = 0;       /* 0335: no partial frame across a chip off/on */
++		}
+ 		if (room) {
+ 			lck_mtx_lock(&h4_uart);
+ 			n = negroni_bt_uart_read(buf, sizeof(buf));
+@@ -557,6 +575,26 @@ wait_ready(void)
+ 	return error;
+ }
+ 
++/*
++ * 0335: commands whose controller answer is a Command Status event (Core spec Vol 4 Part E 7.x "Command Status
++ * event shall be generated"), so the dead-chip answer has the event type the host waits for.
++ */
++static bool
++uses_cmd_status(uint16_t op)
++{
++	static const uint16_t ops[] = {
++		0x0401, 0x0405, 0x0406, 0x0408, 0x0409, 0x040a, 0x040f, 0x0411, 0x0413, 0x0415, 0x0417, 0x0419,
++		0x041b, 0x041c, 0x041d, 0x041f, 0x0428, 0x0429, 0x043d, 0x043e, 0x0801, 0x0803, 0x0804, 0x0807,
++		0x080b, 0x200d, 0x2013, 0x2016, 0x2019, 0x2025, 0x2026, 0x2032, 0x2043, 0x205d,
++	};
++	for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
++		if (ops[i] == op) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ /* one complete host packet (h4_tx held) */
+ static int
+ tx_packet(const uint8_t *p, uint32_t n)
+@@ -567,6 +605,20 @@ tx_packet(const uint8_t *p, uint32_t n)
+ 		t.log_tx--;
+ 		log_pkt("tx", p, n);
+ 	}
++	if (t.failed) {
++		/* 0335: dead chip: a local Command Complete, status 0x03 Hardware Failure; other packets dropped */
++		if (p[0] == H4_CMD && n >= 4) {
++			bool cs = uses_cmd_status(le16(p + 1));
++			uint8_t cc[7] = { H4_EVT, 0x0e, 4, 1, p[1], p[2], 0x03 };
++			uint8_t st[7] = { H4_EVT, 0x0f, 4, 0x03, 1, p[1], p[2] };      /* Command Status: status, ncmd, op */
++			if (t.n_dead++ < 16) {
++				SAY("dead chip: cmd %#06x answered locally with %s status 0x03 (Hardware Failure)\n", le16(p + 1),
++				    cs ? "Command Status" : "Command Complete");
++			}
++			negroni_bt_h4_inject(cs ? st : cc, 7);
++		}
++		return 0;
++	}
+ 	if (negroni_bt_shim_tx(p, n) == NEGRONI_BT_SHIM_DONE) {
+ 		return 0;
+ 	}
+@@ -617,6 +669,9 @@ static int
+ send_user(const uint8_t *b, uint32_t n)
+ {
+ 	int error = wait_ready();
++	if (error == EIO && t.failed && t.dead_mode == 1) {
++		error = 0;                      /* 0335: tx_packet answers each command locally */
++	}
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -660,6 +715,88 @@ session_reset(void)         /* h4_lock held */
+ 	tio_default();
+ }
+ 
++/* ---- 0335: power follows the client ---- */
++
++/* a client came or went (h4_lock held); the worker decides */
++static void
++power_client_changed(bool came)
++{
++	if (!came) {
++		t.gone_at = now_us();
++	} else if (t.off && t.failed) {
++		t.failed = false;       /* a runtime power-on failed before: this connect tries once more */
++	}
++	t.kick = true;
++	wakeup(&t.worker);
++}
++
++static void
++h4_power_thread(void *arg __unused, wait_result_t w __unused)
++{
++	SAY("power worker running (off %u ms after the last client, power follows the client %s)\n", t.off_ms,
++	    t.pwr_follow ? "on" : "off");
++	for (;;) {
++		lck_mtx_lock(&h4_lock);
++		bool client = t.owner != OWNER_NONE;
++		bool want_on = client && t.off && !t.failed && !t.powering;
++		bool want_off = !client && t.ready && t.pwr_follow && now_us() - t.gone_at >= (uint64_t)t.off_ms * 1000u;
++		bool pending = !client && t.ready && t.pwr_follow;
++		if (want_on || want_off) {
++			t.powering = true;
++			t.ready = false;        /* sends wait (power on) or find no client (power off) */
++		}
++		lck_mtx_unlock(&h4_lock);
++
++		if (want_off) {
++			lck_mtx_lock(&h4_tx);
++			lck_mtx_lock(&h4_uart);
++			negroni_bt_chip_off();
++			lck_mtx_unlock(&h4_uart);
++			lck_mtx_unlock(&h4_tx);
++			lck_mtx_lock(&h4_lock);
++			t.off = true;
++			t.powering = false;
++			t.rx_reset = true;
++			t.n_off++;
++			q_flush();
++			lck_mtx_unlock(&h4_lock);
++			SAY("power off #%u: no client for %u ms; the next client powers the chip on\n", t.n_off, t.off_ms);
++			continue;
++		}
++		if (want_on) {
++			SAY("power on #%u: a client is back\n", t.n_on + 1u);
++			lck_mtx_lock(&h4_uart);
++			int e = negroni_bt_chip_on();
++			lck_mtx_unlock(&h4_uart);
++			lck_mtx_lock(&h4_lock);
++			t.powering = false;
++			t.n_on++;
++			t.rx_reset = true;
++			if (e == 0) {
++				t.off = false;
++				t.failed = false;
++				t.ready = true;
++				t.ctrl_awake = true;
++				q_flush();      /* nothing from the power-on reaches the client */
++			} else {
++				t.n_on_fail++;
++				t.failed = true;        /* t.off stays: the next connect retries once (power_client_changed) */
++				snprintf(t.why, sizeof(t.why), "power on failed (%d)", e);
++			}
++			t.last_act = now_us();
++			lck_mtx_unlock(&h4_lock);
++			wakeup(&t.ready);
++			kick();
++			SAY("power on #%u: %s\n", t.n_on, e ? "FAILED: dead-chip answers from now on" : "transport ready again");
++			continue;
++		}
++		lck_mtx_lock(&h4_lock);
++		struct timespec ts = { 0, 200 * 1000 * 1000 };
++		(void)msleep(&t.worker, &h4_lock, PZERO, "nbth4pw", pending ? &ts : NULL);
++		lck_mtx_unlock(&h4_lock);
++	}
++}
++
+ /* ---- kernel control ---- */
+ 
+ static errno_t
+@@ -675,10 +812,16 @@ ctl_connect_cb(kern_ctl_ref ref __unused, struct sockaddr_ctl *sac, void **uniti
+ 		    o == OWNER_CTL ? "control" : "/dev");
+ 		return EBUSY;
+ 	}
++	if (t.failed && t.dead_mode == 2) {
++		lck_mtx_unlock(&h4_lock);
++		SAY("control connect from %s[%d] refused: chip FAILED (negronibt_dead=2)\n", name, proc_selfpid());
++		return ECONNREFUSED;
++	}
+ 	t.owner = OWNER_CTL;
+ 	t.unit = sac->sc_unit;
+ 	session_reset();
+-	bool ready = t.ready, failed = t.failed;
++	power_client_changed(true);
++	bool ready = t.ready, failed = t.failed, off = t.off;
+ 	lck_mtx_unlock(&h4_lock);
+ 	lck_mtx_lock(&h4_tx);
+ 	t.txn = 0;
+@@ -686,7 +829,8 @@ ctl_connect_cb(kern_ctl_ref ref __unused, struct sockaddr_ctl *sac, void **uniti
+ 	negroni_bt_shim_session();
+ 	*unitinfo = NULL;
+ 	SAY("control %s connected (unit %u) by %s[%d]; chip %s\n", H4_CTL_NAME, sac->sc_unit, name, proc_selfpid(),
+-	    ready ? "ready" : failed ? "FAILED" : "not ready yet");
++	    ready ? "ready" : failed ? (t.dead_mode == 1 ? "FAILED (commands answered with status 0x03)" : "FAILED") :
++	    off ? "off: powering on" : "not ready yet");
+ 	return 0;
+ }
+ 
+@@ -698,10 +842,11 @@ ctl_disconnect_cb(kern_ctl_ref ref __unused, u_int32_t unit, void *unitinfo __un
+ 	if (mine) {
+ 		t.owner = OWNER_NONE;
+ 		q_flush();
++		power_client_changed(false);
+ 	}
+ 	lck_mtx_unlock(&h4_lock);
+ 	if (mine) {
+-		SAY("control unit %u disconnected\n", unit);
++		SAY("control unit %u disconnected%s\n", unit, t.ready && t.pwr_follow ? "; power off follows if no client comes back" : "");
+ 		stats(true);
+ 	}
+ 	return 0;
+@@ -799,8 +944,14 @@ h4_open(dev_t dev, int flags __unused, int devtype __unused, struct proc *p __un
+ 		SAY("/dev open by %s[%d] refused: busy\n", name, proc_selfpid());
+ 		return EBUSY;
+ 	}
++	if (t.failed && t.dead_mode == 2) {
++		lck_mtx_unlock(&h4_lock);
++		SAY("/dev open by %s[%d] refused: chip FAILED (negronibt_dead=2)\n", name, proc_selfpid());
++		return ENXIO;
++	}
+ 	t.owner = OWNER_DEV;
+ 	session_reset();
++	power_client_changed(true);
+ 	lck_mtx_unlock(&h4_lock);
+ 	lck_mtx_lock(&h4_tx);
+ 	t.txn = 0;
+@@ -822,6 +973,7 @@ h4_close(dev_t dev, int flags __unused, int devtype __unused, struct proc *p __u
+ 	if (mine) {
+ 		t.owner = OWNER_NONE;
+ 		q_flush();
++		power_client_changed(false);
+ 	}
+ 	lck_mtx_unlock(&h4_lock);
+ 	wakeup(&t.q);                   /* a reader blocked in h4_read sees the closed client (EIO) */
+@@ -976,6 +1128,9 @@ negroni_bt_h4_attach(void)
+ 	}
+ 	t.attached = true;
+ 	t.wait_ms = MIN(negroni_bt_arg("wait_ms", 30000), 120000u);
++	t.dead_mode = MIN(negroni_bt_arg("dead", 1), 2u);
++	t.pwr_follow = negroni_bt_arg("pwrfollow", 1) != 0;
++	t.off_ms = MIN(MAX(negroni_bt_arg("off_ms", 3000), 100u), 600000u);
+ 	t.ctrl_awake = true;
+ 	lck_mtx_lock(&h4_lock);
+ 	session_reset();
+@@ -1008,6 +1163,23 @@ negroni_bt_h4_attach(void)
+ 	    a ? "ok" : "FAILED", b ? "ok" : "FAILED", c ? "ok" : "FAILED", t.major, t.wait_ms);
+ }
+ 
++/* the RX thread also delivers local answers to the kernel control client (deliver_ctl), so a dead chip needs it too */
++static bool
++rx_thread_start(void)
++{
++	thread_t thread;
++
++	if (t.rx_running) {
++		return true;
++	}
++	if (kernel_thread_start(h4_rx_thread, NULL, &thread) != KERN_SUCCESS) {
++		return false;
++	}
++	t.rx_running = true;
++	thread_deallocate(thread);
++	return true;
++}
++
+ void
+ negroni_bt_h4_start(void)
+ {
+@@ -1020,16 +1192,24 @@ negroni_bt_h4_start(void)
+ 	tio_default();
+ 	lck_mtx_unlock(&h4_lock);
+ 	t.last_act = now_us();
+-	if (kernel_thread_start(h4_rx_thread, NULL, &thread) != KERN_SUCCESS) {
++	if (!rx_thread_start()) {
+ 		negroni_bt_h4_fail("no RX thread");
+ 		return;
+ 	}
+-	thread_deallocate(thread);
+ 	lck_mtx_lock(&h4_lock);
+ 	t.ready = true;
+ 	lck_mtx_unlock(&h4_lock);
+ 	wakeup(&t.ready);
+ 	SAY("transport ready at %u baud: the UART belongs to the transport now\n", negroni_bt_uart_baud());
++	if (!t.worker && kernel_thread_start(h4_power_thread, NULL, &thread) == KERN_SUCCESS) {
++		t.worker = true;
++		thread_deallocate(thread);
++	}
++	lck_mtx_lock(&h4_lock);
++	if (t.owner == OWNER_NONE) {
++		t.gone_at = now_us();   /* no client yet: the off timer starts now */
++	}
++	lck_mtx_unlock(&h4_lock);
+ }
+ 
+ void
+@@ -1040,6 +1220,10 @@ negroni_bt_h4_fail(const char *why)
+ 	strlcpy(t.why, why, sizeof(t.why));
+ 	lck_mtx_unlock(&h4_lock);
+ 	wakeup(&t.ready);
+-	SAY("transport not usable: %s (sends fail with EIO)\n", why);
++	if (t.attached && t.dead_mode == 1 && !rx_thread_start()) {
++		SAY("transport not usable: no RX thread for the local answers\n");
++	}
++	SAY("transport not usable: %s (%s)\n", why, t.dead_mode == 1 ? "commands get a local status 0x03 answer" :
++	    t.dead_mode == 2 ? "clients are refused" : "sends fail with EIO");
+ }
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */

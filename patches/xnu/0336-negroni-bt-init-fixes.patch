@@ -1,0 +1,139 @@
+0336-negroni-bt-init-fixes: bluetoothd's HCI init on the QCA6490 (phone 2026-10-27 02:49, kernel with 0334/0335:
+stage A + HCI stage ok, then "OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)", "HCI initialization
+failed", restart reason 108 every ~10 s).
+
+[V] h4 log (logs/usblog-t2.txt): the init sequence is 0c03 1001 1002 1009 1003 1004 2003 0c01 0c63 2001 0c56 0c6d
+2060 202f 2031 2024 201c 200f 1005 204a 2074 0c33 0c31, then the client closes. The only chip error is 0x0c6d
+(status 0x11). 0x0c5b is never sent: bluetoothd's stack checks the Read_Local_Supported_Commands mask and fails
+locally.
+
+Answered in the kernel (negroni_bt_shim.c), negronibt_shimfix=0 turns this off:
+- 0x0c6d Write_LE_Host_Support: always, Command Complete status 0.
+- 0x0c5b Write_Default_Erroneous_Data_Reporting: Command Complete status 0, when the chip's mask lacks octet 18 bit 3.
+- 0x0c5a Read_Default_Erroneous_Data_Reporting: Command Complete status 0 + 0x00 (disabled), when the mask lacks
+  octet 18 bit 2.
+- The 0x1002 answer gets octet 18 bits 2+3 set; the full 64-byte mask is logged once per client.
+- Every other standard command the chip rejects is logged: "shim controller rejected 0xXXXX: ... status 0xNN".
+
+diff --git a/bsd/dev/negroni_bt_shim.c b/bsd/dev/negroni_bt_shim.c
+index e3c60ae..9d1cbab 100644
+--- a/bsd/dev/negroni_bt_shim.c
++++ b/bsd/dev/negroni_bt_shim.c
+@@ -45,6 +45,26 @@
+ #define EV_VENDOR       0xffu
+ #define OGF_VENDOR      0x3fu
+ #define OP_READ_LOCAL_VERSION 0x1001u
++#define EV_CMD_STATUS   0x0fu
++/*
++ * 0336 (iOSPlus10): standard commands of bluetoothd's HCI init that the QCA6490 does not take [V, phone 2026-10-27,
++ * logs/usblog-t2.txt and phone-log-20261027-025222.txt]:
++ *   0x0c6d Write_LE_Host_Support: the chip answers status 0x11 (Unsupported Feature or Parameter Value) on every init
++ *          (LE host support is implied on a 5.x controller; the command is deprecated) -> local status 0.
++ *   0x0c5b Write_Default_Erroneous_Data_Reporting / 0x0c5a Read_...: bluetoothd never sends them; its stack checks the
++ *          Read_Local_Supported_Commands mask (octet 18 bit 3 / bit 2, as Linux hci_sync.c commands[18] & 0x08 / 0x04),
++ *          fails locally ("OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)", "HCI initialization failed",
++ *          restart reason 108). So the 0x1002 answer gets both bits, and when the chip did not have them the commands
++ *          are answered here (write: status 0; read: status 0, reporting 0x00 disabled).
++ * Every other non-zero status from the chip is logged ("controller rejected ...") for the next round.
++ * negronibt_shimfix=0 turns 0336 off.
++ */
++#define OP_READ_SUPPORTED_COMMANDS 0x1002u
++#define OP_READ_ERR_DATA  0x0c5au
++#define OP_WRITE_ERR_DATA 0x0c5bu
++#define OP_WRITE_LE_HOST  0x0c6du
++#define CMDS_OCTET_ERR    18u
++#define CMDS_ERR_BITS     0x0cu         /* bit 2 read, bit 3 write */
+ 
+ struct shim_op {
+ 	uint16_t op;
+@@ -80,6 +100,9 @@ static struct {
+ 	bool version_logged;
+ 	uint16_t seen[SEEN_SLOTS];
+ 	uint32_t n_local, n_vse;
++	uint32_t fix;
++	bool chip_err_rd, chip_err_wr, cmds_known;
++	uint8_t rej[SEEN_SLOTS];
+ } s;
+ 
+ static inline uint16_t
+@@ -93,6 +116,9 @@ negroni_bt_shim_init(void)
+ {
+ 	s.policy = negroni_bt_arg("shim", 1);
+ 	s.mfr = negroni_bt_arg("mfr", 0);
++	s.fix = negroni_bt_arg("shimfix", 1);
++	SAY("0336 init fixes %s: 0x0c6d Write_LE_Host_Support local status 0; 0x0c5a/0x0c5b Erroneous Data Reporting "
++	    "bits set in the 0x1002 mask and answered here when the chip lacks them\n", s.fix ? "on" : "off");
+ 	SAY("policy %u (%s), manufacturer rewrite %s%#x; %zu Broadcom opcodes answered with success, other vendor "
+ 	    "commands with status 0x01\n", s.policy,
+ 	    s.policy == 0 ? "pass everything" : s.policy == 2 ? "all vendor commands succeed" : "vendor commands local",
+@@ -107,6 +133,8 @@ negroni_bt_shim_session(void)
+ {
+ 	s.version_logged = false;
+ 	bzero(s.seen, sizeof(s.seen));
++	bzero(s.rej, sizeof(s.rej));
++	s.cmds_known = s.chip_err_rd = s.chip_err_wr = false;
+ }
+ 
+ static void
+@@ -124,6 +152,22 @@ negroni_bt_shim_tx(const uint8_t *pkt, uint32_t len)
+ 		return NEGRONI_BT_SHIM_PASS;
+ 	}
+ 	uint16_t op = le16(pkt + 1);
++	if (s.fix && (op == OP_WRITE_LE_HOST || (op == OP_WRITE_ERR_DATA && !s.chip_err_wr) ||
++	    (op == OP_READ_ERR_DATA && !s.chip_err_rd))) {
++		uint16_t k = s.seen[op & (SEEN_SLOTS - 1u)]++;
++		s.n_local++;
++		if (k < 4 || (k % 64u) == 0) {
++			SAY("init fix: %#06x plen %u (#%u) answered locally with status 0 (%s)\n", op, pkt[3], k + 1u,
++			    op == OP_WRITE_LE_HOST ? "the QCA6490 answers 0x11" : "not in the chip's supported-commands mask");
++		}
++		if (op == OP_READ_ERR_DATA) {
++			const uint8_t ev[8] = { H4_EVT, EV_CMD_COMPLETE, 5, 1, (uint8_t)op, (uint8_t)(op >> 8), 0, 0 };
++			negroni_bt_h4_inject(ev, sizeof(ev));
++		} else {
++			answer(op, 0);
++		}
++		return NEGRONI_BT_SHIM_DONE;
++	}
+ 	if ((op >> 10) != OGF_VENDOR) {
+ 		return NEGRONI_BT_SHIM_PASS;
+ 	}
+@@ -162,6 +206,38 @@ negroni_bt_shim_rx(uint8_t *pkt, uint32_t len)
+ 		}
+ 		return NEGRONI_BT_SHIM_DROP;
+ 	}
++	/* 0336: the supported-commands mask (04 0e 44 01 02 10 00 <64 bytes>): log it, add the Erroneous Data bits */
++	if (pkt[1] == EV_CMD_COMPLETE && pkt[2] >= 68 && len >= 71 && le16(pkt + 4) == OP_READ_SUPPORTED_COMMANDS &&
++	    pkt[6] == 0) {
++		uint8_t *m = pkt + 7;
++		if (!s.cmds_known) {
++			char hx[3 * 32 + 1];
++			for (unsigned half = 0; half < 2; half++) {
++				for (unsigned i = 0; i < 32; i++) {
++					snprintf(hx + 3 * i, 4, " %02x", m[32 * half + i]);
++				}
++				SAY("supported commands octets %u-%u:%s\n", 32 * half, 32 * half + 31, hx);
++			}
++		}
++		s.cmds_known = true;
++		s.chip_err_rd = (m[CMDS_OCTET_ERR] & 0x04u) != 0;
++		s.chip_err_wr = (m[CMDS_OCTET_ERR] & 0x08u) != 0;
++		if (s.fix && (m[CMDS_OCTET_ERR] & CMDS_ERR_BITS) != CMDS_ERR_BITS) {
++			SAY("supported commands: octet 18 %#x -> %#x (Read/Write_Default_Erroneous_Data_Reporting answered here)\n",
++			    m[CMDS_OCTET_ERR], m[CMDS_OCTET_ERR] | CMDS_ERR_BITS);
++			m[CMDS_OCTET_ERR] |= CMDS_ERR_BITS;
++		}
++	}
++	/* 0336: log every standard command the chip rejects (Command Complete or Command Status with status != 0) */
++	if ((pkt[1] == EV_CMD_COMPLETE && pkt[2] >= 4 && len >= 7 && pkt[6] != 0) ||
++	    (pkt[1] == EV_CMD_STATUS && pkt[2] >= 4 && len >= 7 && pkt[3] != 0)) {
++		bool cc = pkt[1] == EV_CMD_COMPLETE;
++		uint16_t op = cc ? le16(pkt + 4) : le16(pkt + 5);
++		uint8_t st = cc ? pkt[6] : pkt[3];
++		if ((op >> 10) != OGF_VENDOR && s.rej[op & (SEEN_SLOTS - 1u)]++ < 4) {
++			SAY("controller rejected %#06x: %s status %#x\n", op, cc ? "Command Complete" : "Command Status", st);
++		}
++	}
+ 	/* 04 0e plen ncmd op(2) status hci_ver hci_rev(2) lmp_ver mfr(2) lmp_subver(2): plen 12, len 15 */
+ 	if (pkt[1] == EV_CMD_COMPLETE && pkt[2] >= 12 && len >= 15 && le16(pkt + 4) == OP_READ_LOCAL_VERSION &&
+ 	    pkt[6] == 0) {

@@ -1,0 +1,247 @@
+0337-negroni-bt-vendor-answers: bluetoothd's Apple/Broadcom vendor commands on the QCA6490 + the 0336 review fixes.
+
+Phone [V] 2026-10-27 03:17 (logs/phone-log-20261027-031731.txt, bluetoothd[303]; kernel h4 log): after 0336 the
+init goes on; then "BD_VSC_OLYMPIC_ANTENNA_PREF_B timedout waiting for controller", "Notifying BT Firmware
+Crashed", restart reason 3602, every ~16 s. Cause [V disassembly of 20H392 bluetoothd]: _BCM_ByteStreamEventParser
+(0x100126134) calls the command callback only when >= 2 bytes follow the status ("Invalid data size 0" logged just
+before the timeout); our vendor answers had none. Every vendor command was already answered locally (none went to
+the chip).
+
+negroni_bt_shim.c:
+- every vendor (OGF 0x3f) answer: status + negronibt_vscdata bytes (default 8): byte 0 = the first parameter byte
+  (sub-opcode echo; _BCM_SubOpcodeChecker 0x100126390 checks it for 0xfce9), then zeros.
+- status 0 for 0xfd3c, 0xfce9 (LE_META), 0xfce2 (OLYMPIC multiplex: sub 0x0b, 0x15), 0xfd48, 0xfd47
+  (opcodes [V], names [I] from the error order); other vendor opcodes keep the 0333 table status.
+- 0x2007 LE_Read_Advertising_Physical_Channel_Tx_Power: chip status 0x0c -> 0, TX power 0 dBm.
+- review F1: 0x0c6d goes to the chip with Simultaneous_LE_Host rewritten to 0x00 (the chip lists the command, mask
+  octet 24 bit 6; it rejected the 0x01 parameter); a remaining chip error is rewritten to status 0.
+- review N1: 0x0c5a/0x0c5b are answered locally only after the 0x1002 mask was seen (s.cmds_known).
+negroni_bt_shim_tx takes a writable packet (negroni_bt.h, negroni_bt_h4.c tx_packet).
+negroni_bt_h4.c review F2: Command Status list without 0x0408, 0x205d -> 0x205e, + 0x042a, 0x0810, 0x2044, 0x2064,
+0x2068, 0x206b, 0x206d.
+negronibt_shimfix=0 turns the 0336/0337 fixes off (no effect with negronibt_shim=0).
+
+diff --git a/bsd/dev/negroni_bt.h b/bsd/dev/negroni_bt.h
+index c6dbc9a..a0d6e10 100644
+--- a/bsd/dev/negroni_bt.h
++++ b/bsd/dev/negroni_bt.h
+@@ -38,7 +38,7 @@ int negroni_bt_chip_on(void);                   /* BT_EN sequence + HCI stage ag
+ #define NEGRONI_BT_SHIM_DONE    1               /* host command answered in the kernel: not sent */
+ #define NEGRONI_BT_SHIM_DROP    2               /* controller packet not delivered to userland */
+ void negroni_bt_shim_init(void);
+-int negroni_bt_shim_tx(const uint8_t *pkt, uint32_t len);      /* host -> controller, pkt[0] = H4 type */
++int negroni_bt_shim_tx(uint8_t *pkt, uint32_t len);            /* host -> controller, pkt[0] = H4 type; may rewrite in place (0337) */
+ int negroni_bt_shim_rx(uint8_t *pkt, uint32_t len);            /* controller -> host, may rewrite in place */
+ void negroni_bt_shim_session(void);                             /* a new userland client: reset per-client state */
+ 
+diff --git a/bsd/dev/negroni_bt_h4.c b/bsd/dev/negroni_bt_h4.c
+index f04dd9c..4a777d0 100644
+--- a/bsd/dev/negroni_bt_h4.c
++++ b/bsd/dev/negroni_bt_h4.c
+@@ -583,9 +583,12 @@ static bool
+ uses_cmd_status(uint16_t op)
+ {
+ 	static const uint16_t ops[] = {
+-		0x0401, 0x0405, 0x0406, 0x0408, 0x0409, 0x040a, 0x040f, 0x0411, 0x0413, 0x0415, 0x0417, 0x0419,
+-		0x041b, 0x041c, 0x041d, 0x041f, 0x0428, 0x0429, 0x043d, 0x043e, 0x0801, 0x0803, 0x0804, 0x0807,
+-		0x080b, 0x200d, 0x2013, 0x2016, 0x2019, 0x2025, 0x2026, 0x2032, 0x2043, 0x205d,
++		/* 0337 review F2: 0x0408 (Create_Connection_Cancel) answers with Command Complete; 0x205e, 0x042a,
++		 * 0x0810, 0x2044, 0x2064, 0x2068, 0x206b, 0x206d added */
++		0x0401, 0x0405, 0x0406, 0x0409, 0x040a, 0x040f, 0x0411, 0x0413, 0x0415, 0x0417, 0x0419, 0x041b,
++		0x041c, 0x041d, 0x041f, 0x0428, 0x0429, 0x042a, 0x043d, 0x043e, 0x0801, 0x0803, 0x0804, 0x0807,
++		0x080b, 0x0810, 0x200d, 0x2013, 0x2016, 0x2019, 0x2025, 0x2026, 0x2032, 0x2043, 0x2044, 0x205e,
++		0x2064, 0x2068, 0x206b, 0x206d,
+ 	};
+ 	for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); i++) {
+ 		if (ops[i] == op) {
+@@ -597,7 +600,7 @@ uses_cmd_status(uint16_t op)
+ 
+ /* one complete host packet (h4_tx held) */
+ static int
+-tx_packet(const uint8_t *p, uint32_t n)
++tx_packet(uint8_t *p, uint32_t n)
+ {
+ 	t.n_tx++;
+ 	t.b_tx += n;
+diff --git a/bsd/dev/negroni_bt_shim.c b/bsd/dev/negroni_bt_shim.c
+index 9d1cbab..855a211 100644
+--- a/bsd/dev/negroni_bt_shim.c
++++ b/bsd/dev/negroni_bt_shim.c
+@@ -49,20 +49,35 @@
+ /*
+  * 0336 (iOSPlus10): standard commands of bluetoothd's HCI init that the QCA6490 does not take [V, phone 2026-10-27,
+  * logs/usblog-t2.txt and phone-log-20261027-025222.txt]:
+- *   0x0c6d Write_LE_Host_Support: the chip answers status 0x11 (Unsupported Feature or Parameter Value) on every init
+- *          (LE host support is implied on a 5.x controller; the command is deprecated) -> local status 0.
++ *   0x0c6d Write_LE_Host_Support: bluetoothd sends 01 6d 0c 02 01 01; the chip lists the command (mask octet 24
++ *          bit 6) but answers 0x11 (Unsupported Feature or Parameter Value) because Simultaneous_LE_Host must be 0x00
++ *          since Core 4.1. 0337: the parameter is rewritten to 0x00 and the command goes to the chip; only if the
++ *          chip still rejects it, its status is rewritten to 0 (0336 answered it locally).
+  *   0x0c5b Write_Default_Erroneous_Data_Reporting / 0x0c5a Read_...: bluetoothd never sends them; its stack checks the
+  *          Read_Local_Supported_Commands mask (octet 18 bit 3 / bit 2, as Linux hci_sync.c commands[18] & 0x08 / 0x04),
+  *          fails locally ("OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)", "HCI initialization failed",
+  *          restart reason 108). So the 0x1002 answer gets both bits, and when the chip did not have them the commands
+  *          are answered here (write: status 0; read: status 0, reporting 0x00 disabled).
+  * Every other non-zero status from the chip is logged ("controller rejected ...") for the next round.
+- * negronibt_shimfix=0 turns 0336 off.
++ * negronibt_shimfix=0 turns 0336/0337 off (no effect with negronibt_shim=0: then every packet passes unchanged).
++ *
++ * 0337 (iOSPlus10): Apple/Broadcom vendor commands [V phone 2026-10-27 03:17, logs/phone-log-20261027-031731.txt and
++ * the kernel h4 log]: bluetoothd's BCM VSC completion parser _BCM_ByteStreamEventParser (bluetoothd 0x100126134,
++ * bcm_vsc.c) calls the waiting command's callback only when at least 2 bytes follow the status; with fewer it logs
++ * "Invalid data size %d" and returns, so the command never completes: "BD_VSC_OLYMPIC_ANTENNA_PREF_B timedout waiting
++ * for controller" after 15 s, "Notifying BT Firmware Crashed", restart reason 3602. _BCM_SubOpcodeChecker
++ * (0x100126390) matches 0xfce9 answers by the first return byte = the command's sub-opcode. So every vendor command
++ * answered here carries return data: byte 0 = the first parameter byte (sub-opcode echo), then zeros
++ * (negronibt_vscdata, default 8 bytes, 2..32). The opcodes bluetoothd sent on the QCA6490 get status 0 (feature
++ * configuration; names from the error order in the log [I]). 0x2007 LE_Read_Advertising_Physical_Channel_Tx_Power:
++ * the chip answers 0x0c (Command Disallowed: extended advertising commands came first); rewritten to status 0, 0 dBm.
+  */
+ #define OP_READ_SUPPORTED_COMMANDS 0x1002u
+ #define OP_READ_ERR_DATA  0x0c5au
+ #define OP_WRITE_ERR_DATA 0x0c5bu
+ #define OP_WRITE_LE_HOST  0x0c6du
++#define OP_LE_READ_ADV_TX_POWER 0x2007u
++#define VSC_DATA_DEF      8u
+ #define CMDS_OCTET_ERR    18u
+ #define CMDS_ERR_BITS     0x0cu         /* bit 2 read, bit 3 write */
+ 
+@@ -91,6 +106,12 @@ static const struct shim_op shim_ops[] = {
+ 	{ 0xfc5a, 0x01, "BCM Read_USB_Product (btbcm.c:379)" },
+ 	{ 0xfc6e, 0x01, "BCM Read_Controller_Features (btbcm.c:359)" },
+ 	{ 0xfc79, 0x01, "BCM Read_Verbose_Config_Version_Info (btbcm.c:339)" },
++	/* 0337: Apple VSCs bluetoothd sends on this chip (opcode [V] h4 log; name [I] from the error order) */
++	{ 0xfd3c, 0x00, "Apple VSC 0xfd3c (after \"BCM_4357 supports the following VSCs\")" },
++	{ 0xfce9, 0x00, "Apple LE_META (BD_VSC_LE_META_ENA_FEATURES; sub-opcode in byte 0, _BCM_SubOpcodeChecker)" },
++	{ 0xfce2, 0x00, "Apple OLYMPIC (sub 0x0b CHANGE_LE_SETTINGS, sub 0x15 ANTENNA_PREF_B; sub-opcode in byte 0)" },
++	{ 0xfd48, 0x00, "Apple VSC 0xfd48 (BD_VSC_OLYMPIC_SET_MIN_AFH_LE_CHANNELS)" },
++	{ 0xfd47, 0x00, "Apple VSC 0xfd47 (BD_VSC_ENABLE_EXTENDED_DUPLICATE_FILTER)" },
+ };
+ 
+ #define SEEN_SLOTS      1024u           /* OCF 0..0x3ff */
+@@ -100,7 +121,8 @@ static struct {
+ 	bool version_logged;
+ 	uint16_t seen[SEEN_SLOTS];
+ 	uint32_t n_local, n_vse;
+-	uint32_t fix;
++	uint32_t fix, vscdata;
++	bool lehost_logged, advtx_logged, lehost_rej_logged;
+ 	bool chip_err_rd, chip_err_wr, cmds_known;
+ 	uint8_t rej[SEEN_SLOTS];
+ } s;
+@@ -117,8 +139,13 @@ negroni_bt_shim_init(void)
+ 	s.policy = negroni_bt_arg("shim", 1);
+ 	s.mfr = negroni_bt_arg("mfr", 0);
+ 	s.fix = negroni_bt_arg("shimfix", 1);
+-	SAY("0336 init fixes %s: 0x0c6d Write_LE_Host_Support local status 0; 0x0c5a/0x0c5b Erroneous Data Reporting "
+-	    "bits set in the 0x1002 mask and answered here when the chip lacks them\n", s.fix ? "on" : "off");
++	s.vscdata = negroni_bt_arg("vscdata", VSC_DATA_DEF);
++	if (s.vscdata < 2 || s.vscdata > 32) {
++		s.vscdata = VSC_DATA_DEF;
++	}
++	SAY("0336/0337 init fixes %s: 0x0c6d Simultaneous_LE_Host -> 0x00; 0x0c5a/0x0c5b Erroneous Data Reporting bits "
++	    "set in the 0x1002 mask and answered here when the chip lacks them; 0x2007 0x0c -> status 0, 0 dBm; vendor "
++	    "answers carry %u data bytes (sub-opcode echo + zeros)\n", s.fix ? "on" : "off", s.vscdata);
+ 	SAY("policy %u (%s), manufacturer rewrite %s%#x; %zu Broadcom opcodes answered with success, other vendor "
+ 	    "commands with status 0x01\n", s.policy,
+ 	    s.policy == 0 ? "pass everything" : s.policy == 2 ? "all vendor commands succeed" : "vendor commands local",
+@@ -135,6 +162,7 @@ negroni_bt_shim_session(void)
+ 	bzero(s.seen, sizeof(s.seen));
+ 	bzero(s.rej, sizeof(s.rej));
+ 	s.cmds_known = s.chip_err_rd = s.chip_err_wr = false;
++	s.lehost_logged = s.advtx_logged = s.lehost_rej_logged = false;
+ }
+ 
+ static void
+@@ -145,20 +173,47 @@ answer(uint16_t op, uint8_t status)
+ 	negroni_bt_h4_inject(ev, sizeof(ev));
+ }
+ 
++/* 0337: a vendor command answer with return data (BCM parser needs >= 2 bytes after the status) */
++static void
++answer_vsc(uint16_t op, uint8_t status, uint8_t sub)
++{
++	uint8_t ev[7 + 32];
++	uint32_t n = s.vscdata;
++	bzero(ev, sizeof(ev));
++	ev[0] = H4_EVT;
++	ev[1] = EV_CMD_COMPLETE;
++	ev[2] = (uint8_t)(4u + n);
++	ev[3] = 1;
++	ev[4] = (uint8_t)op;
++	ev[5] = (uint8_t)(op >> 8);
++	ev[6] = status;
++	ev[7] = sub;
++	negroni_bt_h4_inject(ev, 7u + n);
++}
++
+ int
+-negroni_bt_shim_tx(const uint8_t *pkt, uint32_t len)
++negroni_bt_shim_tx(uint8_t *pkt, uint32_t len)
+ {
+ 	if (s.policy == 0 || len < 4 || pkt[0] != H4_CMD) {
+ 		return NEGRONI_BT_SHIM_PASS;
+ 	}
+ 	uint16_t op = le16(pkt + 1);
+-	if (s.fix && (op == OP_WRITE_LE_HOST || (op == OP_WRITE_ERR_DATA && !s.chip_err_wr) ||
++	if (s.fix && op == OP_WRITE_LE_HOST && len >= 6 && pkt[3] >= 2 && pkt[5] != 0) {
++		if (!s.lehost_logged) {
++			s.lehost_logged = true;
++			SAY("init fix: 0x0c6d Write_LE_Host_Support LE %#x Simultaneous_LE_Host %#x -> 0x00 (Core 4.1+), sent to "
++			    "the chip\n", pkt[4], pkt[5]);
++		}
++		pkt[5] = 0;
++		return NEGRONI_BT_SHIM_PASS;
++	}
++	if (s.fix && s.cmds_known && ((op == OP_WRITE_ERR_DATA && !s.chip_err_wr) ||
+ 	    (op == OP_READ_ERR_DATA && !s.chip_err_rd))) {
+ 		uint16_t k = s.seen[op & (SEEN_SLOTS - 1u)]++;
+ 		s.n_local++;
+ 		if (k < 4 || (k % 64u) == 0) {
+-			SAY("init fix: %#06x plen %u (#%u) answered locally with status 0 (%s)\n", op, pkt[3], k + 1u,
+-			    op == OP_WRITE_LE_HOST ? "the QCA6490 answers 0x11" : "not in the chip's supported-commands mask");
++			SAY("init fix: %#06x plen %u (#%u) answered locally with status 0 (not in the chip's supported-commands "
++			    "mask)\n", op, pkt[3], k + 1u);
+ 		}
+ 		if (op == OP_READ_ERR_DATA) {
+ 			const uint8_t ev[8] = { H4_EVT, EV_CMD_COMPLETE, 5, 1, (uint8_t)op, (uint8_t)(op >> 8), 0, 0 };
+@@ -186,10 +241,10 @@ negroni_bt_shim_tx(const uint8_t *pkt, uint32_t len)
+ 	uint16_t k = s.seen[op & (SEEN_SLOTS - 1u)]++;
+ 	s.n_local++;
+ 	if (k < 4 || (k % 64u) == 0) {
+-		SAY("intercepted %#06x plen %u (#%u) -> local Command Complete status %#x: %s\n", op, pkt[3], k + 1u,
+-		    status, name);
++		SAY("intercepted %#06x plen %u (#%u) -> local Command Complete status %#x + %u data bytes: %s\n", op, pkt[3],
++		    k + 1u, status, s.vscdata, name);
+ 	}
+-	answer(op, status);
++	answer_vsc(op, status, pkt[3] > 0 && len >= 5 ? pkt[4] : 0);
+ 	return NEGRONI_BT_SHIM_DONE;
+ }
+ 
+@@ -228,6 +283,25 @@ negroni_bt_shim_rx(uint8_t *pkt, uint32_t len)
+ 			m[CMDS_OCTET_ERR] |= CMDS_ERR_BITS;
+ 		}
+ 	}
++	/* 0337: chip answers that bluetoothd treats as fatal or that block its init */
++	if (s.fix && pkt[1] == EV_CMD_COMPLETE && pkt[2] >= 4 && len >= 7 && pkt[6] != 0) {
++		uint16_t op = le16(pkt + 4);
++		if (op == OP_WRITE_LE_HOST) {
++			if (!s.lehost_rej_logged) {
++				s.lehost_rej_logged = true;
++				SAY("init fix: the chip still rejects 0x0c6d (status %#x) -> status 0\n", pkt[6]);
++			}
++			pkt[6] = 0;
++		} else if (op == OP_LE_READ_ADV_TX_POWER && pkt[6] == 0x0c && pkt[2] >= 5 && len >= 8) {
++			if (!s.advtx_logged) {
++				s.advtx_logged = true;
++				SAY("init fix: 0x2007 LE_Read_Advertising_Physical_Channel_Tx_Power status 0xc (Command Disallowed) "
++				    "-> status 0, 0 dBm\n");
++			}
++			pkt[6] = 0;
++			pkt[7] = 0;
++		}
++	}
+ 	/* 0336: log every standard command the chip rejects (Command Complete or Command Status with status != 0) */
+ 	if ((pkt[1] == EV_CMD_COMPLETE && pkt[2] >= 4 && len >= 7 && pkt[6] != 0) ||
+ 	    (pkt[1] == EV_CMD_STATUS && pkt[2] >= 4 && len >= 7 && pkt[3] != 0)) {
