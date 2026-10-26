@@ -44,6 +44,16 @@ fastboot -w            # only if userdata holds an iOS root; erases userdata
 fastboot reboot
 ```
 
+## Root refresh (add-ons + firmware areas, no full rebuild)
+
+`make root-refresh SUDO_PASS=...` (= `scripts/ios16/root-refresh.sh`): `op10tool simg2img` (holes, not zeros) the
+sparse root to a raw image, `root-update.sh` with every hook (tweaks first, then metal, powermenu, negronigl, audio,
+ssh, haptics, bt), `op10tool hfs-size --trim` (the raw is partition-sized), `AREAS=1 root-simg.sh` with the three
+firmware areas from `scripts/fw/build-areas.sh`, then the new file becomes `ios16-root.simg` and the old one
+`ios16-root-prev.simg`. Disk: ~15 GB raw + ~12 GB simg while it runs. 2026-10-26: `ios16-root.simg` sha256
+7829dc8f... carries Metal 7473f41b, haptics, bluetoothd + negroni-bluetool, FBLaunchWatchdogScale 3, areas
+gpu 4d0b5bd8 / adsp de6a545f (TFA container + CAMERA_ICP) / wlan f8e96b65 (BT pack).
+
 ## Rules
 
 - Do not lock the bootloader again after a partition change.

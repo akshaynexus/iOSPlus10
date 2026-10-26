@@ -82,6 +82,9 @@ root:
 	@echo "type the sudo password: tmux attach -t root  (detach: Ctrl-b d)"
 simg:
 	$(BG) simg scripts/ios16/root-simg.sh
+# refresh the root with the current add-ons + firmware areas from the sparse root alone (SUDO_PASS=... for tmux)
+root-refresh:
+	$(BG) root-refresh env SUDO_PASS=$(SUDO_PASS) scripts/ios16/root-refresh.sh
 
 # all iOS 16 build steps after the Mu UEFI, in order, in one tmux job (root asks for sudo once)
 ios16:

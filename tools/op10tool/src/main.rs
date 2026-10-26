@@ -25,6 +25,9 @@ enum Cmd {
     Img2simg { input: PathBuf, output: PathBuf },
     /// Android sparse image -> raw image (for checks)
     Simg2img { input: PathBuf, output: PathBuf },
+    /// Print the HFS+ volume size in bytes of a raw root image (block size x total blocks from the volume header);
+    /// with --trim, truncate the file to that size (a simg2img output is partition-sized)
+    HfsSize { input: PathBuf, #[arg(long)] trim: bool },
     /// Download members of a remote ZIP (IPSW) with parallel range requests; CRC-32 checked
     IpswGet {
         url: String,
@@ -71,6 +74,7 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Img2simg { input, output } => img2simg::img2simg(&input, &output),
         Cmd::Simg2img { input, output } => img2simg::simg2img(&input, &output),
+        Cmd::HfsSize { input, trim } => img2simg::hfs_size(&input, trim),
         Cmd::IpswGet { url, outdir, names, jobs, chunk_mib } => ipsw::run(&url, &outdir, &names, jobs, chunk_mib << 20),
         Cmd::UefiUnpack { image, outdir } => uefi::run(&image, &outdir),
         Cmd::UefiPortpatch { orig, patched, target, out, skip, byte } => {

@@ -101,3 +101,26 @@ pub fn simg2img(input: &Path, output: &Path) -> Result<()> {
     println!("{} -> {} ({} MiB logical, {} data blocks, {} hole blocks)", input.display(), output.display(), pos >> 20, data, holes);
     Ok(())
 }
+
+/// HFS+ (HX) volume size from the volume header at byte 1024: blockSize (u32 BE at +0x28) x totalBlocks
+/// (u32 BE at +0x2c). With `trim`, truncate the file to that size: `simg2img` gives a partition-sized
+/// file (DONT_CARE to the end), and scripts/ios16/root-simg.sh needs the image below the firmware areas.
+pub fn hfs_size(input: &Path, trim: bool) -> Result<()> {
+    let mut f = std::fs::OpenOptions::new().read(true).write(trim).open(input)
+        .with_context(|| format!("open {}", input.display()))?;
+    let mut h = [0u8; 512];
+    f.seek(SeekFrom::Start(1024))?;
+    f.read_exact(&mut h)?;
+    ensure!(&h[0..2] == b"HX" || &h[0..2] == b"H+", "{}: no HFS+ volume header at 1024", input.display());
+    let bs = u32::from_be_bytes([h[0x28], h[0x29], h[0x2a], h[0x2b]]) as u64;
+    let tb = u32::from_be_bytes([h[0x2c], h[0x2d], h[0x2e], h[0x2f]]) as u64;
+    let size = bs * tb;
+    let cur = f.metadata()?.len();
+    println!("{}: HFS+ {} x {} = {} bytes ({} MiB), file {} bytes", input.display(), bs, tb, size, size >> 20, cur);
+    if trim {
+        ensure!(cur >= size, "file is shorter than the volume");
+        f.set_len(size)?;
+        println!("truncated to {size}");
+    }
+    Ok(())
+}

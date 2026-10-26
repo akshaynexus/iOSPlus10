@@ -17,6 +17,11 @@ SRC=$IN
 if [ "${AREAS:-0}" = 1 ]; then
   N=${USERDATA_BLOCKS:-58672399}
   sz=$(stat -f %z "$IN" 2>/dev/null || stat -c %s "$IN")
+  if [ $((sz / 4096)) -gt $((N - 19457)) ]; then
+    # a simg2img output is partition-sized (DONT_CARE to the end): cut it at the HFS+ volume size
+    "$OUT/bin/op10tool" hfs-size --trim "$IN"
+    sz=$(stat -f %z "$IN" 2>/dev/null || stat -c %s "$IN")
+  fi
   [ $((sz / 4096)) -le $((N - 19457)) ] || { echo "$IN reaches the area blocks: stop" >&2; exit 1; }
   for a in gpu adsp wlan; do
     [ -f "$OUT/firmware/$a-area.bin" ] || { echo "missing out/firmware/$a-area.bin (scripts/fw/build-areas.sh)" >&2; exit 1; }
