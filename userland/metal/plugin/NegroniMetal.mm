@@ -114,12 +114,12 @@ __attribute__((constructor)) static void nmtl_error_mode(void)
 	 * - CA_USE_CGTEXTUREDATA=0: QuartzCore reads past mapped file for Apple GPU tiled layout in asset catalogs.
 	 * - CI_USE_MTL_DAG_FOR_CIKL_SRC=0: CoreImage crashes in +[CIKernel kernelsWithString:] / SBRendererService with empty argument list.
 	 * - CA_DISABLE_FRAMEBUFFER_COMPRESSION=1: Adreno 730 does not support Apple's GPU framebuffer compression.
-	 * - CA_FORCE_TRIPLE_BUFFERING=1: allows CoreAnimation to pipeline frame N+1 while N is rendering and N-1 is presenting.
+	 * (CA_FORCE_TRIPLE_BUFFERING was set here too: the 20H392 QuartzCore has no such string, only CA_LOG_TRIPLE_BUFFERING
+	 * [V out/metal/spi/QuartzCore.strings.txt], so it did nothing and is gone.)
 	 */
 	setenv("CA_USE_CGTEXTUREDATA", "0", 0);
 	setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
 	setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
-	setenv("CA_FORCE_TRIPLE_BUFFERING", "1", 1);
 	CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 	CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 	CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
@@ -947,6 +947,32 @@ static void watchdog_start(void)
 					    }),
 					    "B16@0:8");
 			nlog("supportsExtendedXR10Formats = 0 (NegroniMetal A730 answer: 8-bit BGRA display chain, every process)");
+			/*
+			 * MetalPerformanceShaders (MPSCore, 20H392 selector references [V ipsw dyld macho --objc-refs]) asks the device these
+			 * feature flags; the frontend has no answer for them, and an unanswered selector is an NSInvalidArgumentException in the
+			 * caller. Each is an Apple-GPU feature the runtime does not claim: NO (MPS takes its plain kernels). Installed only when
+			 * the device class does not respond already, logged once.
+			 */
+			static const char *const mps_no[] = { "supportsArrayOfTextures", "supportsCommandBufferJump", "supportsFloat16BCubicFiltering",
+							      "supportsNorm16BCubicFiltering", "supportsQuadShufflesAndBroadcast",
+							      "supportsReadWriteTextureArgumentsTier2", "supportsSIMDReduction",
+							      "supportsSIMDShuffleAndFill", "supportsSIMDShufflesAndBroadcast", NULL };
+			char added[512] = "";
+			for (const char *const *n = mps_no; *n; n++) {
+				SEL sel = sel_registerName(*n);
+				if (class_respondsToSelector(object_getClass(device), sel))
+					continue;
+				class_addMethod(object_getClass(device), sel,
+						imp_implementationWithBlock(^BOOL(id me) {
+							(void)me;
+							return NO;
+						}),
+						"B16@0:8");
+				strlcat(added, " ", sizeof(added));
+				strlcat(added, *n, sizeof(added));
+			}
+			if (added[0])
+				nlog("MPS feature flags = NO (NegroniMetal A730 answer):%s", added);
 		}
 		Dl_info self_info = { 0 };
 		dladdr((void *)sm2_logs, &self_info);

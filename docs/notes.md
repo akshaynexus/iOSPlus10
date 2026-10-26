@@ -873,6 +873,39 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
     /var/db/negronimetal/cache/<name>. [I] Not run on the phone yet. A SIGKILL after the open but before the first
     completed command buffer still adds a strike (the limit 4 covers the PosterBoard relaunches).
 
+- Refusal logging, buffer retry, MPS answers (2026-10-26, Metal agent; bundle sha256 f5e4690a…bf9ec4a, check-imports PASS):
+  - [V] AegirPoster: the 615 `sig 6` aborts (`-[__NSArrayM insertObject:atIndex:]: object cannot be nil` in
+    `getOrCreateUniformBufferforFrameBufferIndex:`) came after the dead-man refused the device (strikes 4/4): `_device` is nil,
+    not a refused buffer. The strikes came from 16 launchd kills (`reason ns 7 code 0x3: extension check-in timeout`) during cold
+    opens (device open 1.9-5.2 s plus compiles). metal.log had no `buffer refused` line for AegirPoster. The old refusals in
+    `cache/AegirPoster/pipelines.log` (ExtendedRangeBlend) are from before the XR10=NO change (lines 57/59 of 183, file time 12:55).
+  - [V] FitnessWidget: the `sig 9` kills are `reason ns 1 code 0x7` = JETSAM_REASON_MEMORY_PERPROCESSLIMIT
+    (out/kernel/xnu/bsd/sys/kern_memorystatus.h:290), not a check-in timeout; 29 more are `sig 5` (Swift trap at the same shared-cache
+    offset …5a4). Its pipelines.log has 0 refused pipelines and `pipelines 0 compiled`, yet it logs `nil render pipeline`: the
+    pipeline it sets was never made through newRenderPipelineStateWithDescriptor (a refused library or function; flame/0008 now
+    logs which). The claim "newDefaultLibraryWithBundle compiles the whole metallib" is false: `nmb_library_new` ->
+    `Device::new_library_with_data` -> `Library::from_metallib` parses container tags only (metal2vulkan
+    crates/metal2vulkan/src/library/function.rs:150, "no bitcode is decoded"); functions compile at pipeline creation. No m2v/0004.
+  - [V] chronod: 1399 pipeline lines, 0 refused; `pipelines 2 compiled in 3 ms`; strike cleared at the first frame. WeatherWidget and
+    CalendarWidgetExtension have no NMTL lines at all (they never load Metal). Nothing to fix in the plugin for them.
+  - [V] PridePosterExtension: pipelines.log 421 lines, 0 refused; 4 strikes. MPSCore (20H392, `ipsw dyld macho --objc-refs`,
+    out/metal/spi/mps/) sends the device: supportsFamily:, maxThreadsPerThreadgroup, supports32BitFloatFiltering,
+    supportsTextureWriteRoundingMode: (answered) and supportsArrayOfTextures, supportsCommandBufferJump,
+    supportsFloat16BCubicFiltering, supportsNorm16BCubicFiltering, supportsQuadShufflesAndBroadcast,
+    supportsReadWriteTextureArgumentsTier2, supportsSIMDReduction, supportsSIMDShuffleAndFill, supportsSIMDShufflesAndBroadcast
+    (the frontend had no answer). The plugin now adds each missing one as NO (line `MPS feature flags = NO (NegroniMetal A730
+    answer): ...`). [I] Whether this is the `MPSAutoCache+156` far 0x18 crash is unverified: the unified log stream
+    (logs/phonelog.log) caught no MPS line before the battery died.
+  - [V] (b) `MTLCreateSystemDefaultDevice` during the open: `-initWithAcceleratorPort:` runs the open inside `dispatch_once`, and
+    Metal's `_MTLRegisterDevices` is itself a once-block, so a second thread blocks until the open ends. No change needed.
+  - Changes: flame/0008 (noteRefused: one log line per (what, reason) for refused buffers/textures/libraries/pipelines with
+    length/options/descriptor; `failWith` used to count without a line; `newBufferWithLength:`/`newBufferWithBytes:` retry < 1 MiB
+    buffers without the CPU cache mode, then with options 0, logged once). NegroniMetal.mm: the MPS NO answers.
+  - [V] After push + `rm strikes/*` + kill backboardd (phone time 15:02:17): 4.5 min of kernel log to the battery death at
+    03:36:40 host time show no AegirPoster, PridePosterExtension or FitnessWidget CRASH line (usblog lines after 86898; the
+    metalprobe/assetsd/Maps/dasd crashes there are other agents' runs). The new `refused (logged once per reason)` lines and the
+    MPS line are not read back yet (phone off).
+
 ## 16. Wi-Fi facts (Wi-Fi agent, 2026-10-25; OnePlus kernel source e9da592 in out/src/op-kernel)
 
 - [V] SoC version register: BAR0 + 0x224 (family [31:28], device [27:16], major [15:8], minor [7:0])

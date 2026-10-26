@@ -1,0 +1,142 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (on top of flame/0001-0007), applied by scripts/metal/fetch-sources.sh:
+- noteRefused(): every refused buffer, texture, library, render/compute pipeline (and binary archive, through failWith) is logged to the
+  plugin log once per (what, reason) text, with what was asked for: buffer length and options, texture type/format/size/levels/usage/options,
+  pipeline label, function names, attachment formats, library path and size. failWith() used to count the problem without a log line, so a
+  refused pipeline showed only as "nil render pipeline" (flame/0002) and in pipelines.log.
+- newBufferWithLength:options: and newBufferWithBytes:length:options: retry a refused buffer under 1 MiB: first without the CPU cache mode
+  (MTLResourceCPUCacheModeWriteCombined -> default), then with plain shared options (0); a retry that works is logged once with both option
+  words. nil only when every form is refused (the runtime is dead or out of memory). AegirPoster's -[NUNIAegirRenderer
+  getOrCreateUniformBufferforFrameBufferIndex:] inserts the buffer into an NSMutableArray without a nil check (sig 6).
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -96,6 +96,39 @@
+  return [NSError errorWithDomain:@"org.blu-sharky.native-metal" code:-1 userInfo:@{NSLocalizedDescriptionKey:why?:@"refused"}];
+ }
+ static NSString *lastError() {return [NSString stringWithUTF8String:nmb_last_error()];}
++// NegroniMetal (flame/0008): every refused buffer, texture, library or pipeline is logged once per (what, reason) text with what was
++// asked for (length, options, descriptor), so the plugin log names the refusal; the counters go on. At most 128 texts.
++static std::mutex gRefuseLock;static NSMutableSet *gRefuseSeen;
++static void noteRefused(NSString *what,NSString *reason) {
++ NSString *text=[NSString stringWithFormat:@"%@: %@",what,reason?:@"?"];
++ {std::lock_guard<std::mutex> lock(gRefuseLock);
++  if(!gRefuseSeen)gRefuseSeen=[NSMutableSet set];
++  if(gRefuseSeen.count>=128 || [gRefuseSeen containsObject:text]){noteProblem(text);return;}
++  [gRefuseSeen addObject:text];}
++ NBLOG(@"native-metal: refused (logged once per reason): %@",text);
++}
++// The options to try after a refused buffer: first without the CPU cache mode (write-combined -> default), then plain shared (0).
++// UINT64_MAX: nothing left to try.
++static uint64_t bufferRetryOptions(uint64_t options,unsigned step) {
++ const uint64_t noCache=options&~(uint64_t)MTLResourceCPUCacheModeMask;
++ if(step==0)return noCache!=options?noCache:(options?0:UINT64_MAX);
++ if(step==1)return noCache!=0?0:UINT64_MAX;
++ return UINT64_MAX;
++}
++// nmb_buffer_new with the retries: a small buffer (< 1 MiB) is made with the next options when the asked ones are refused, each refusal
++// logged once; nil only when every form is refused (the runtime is dead or out of memory).
++static NmbBuffer *bufferWithRetries(NSString *what,uint64_t length,MTLResourceOptions *options,const void *bytes) {
++ NmbBuffer *handle=nmb_buffer_new(gDevice,length,*options,bytes);
++ if(handle)return handle;
++ NSString *first=lastError();const uint64_t asked=*options;
++ for(unsigned step=0;!handle && length<(1u<<20);step++) {
++  const uint64_t next=bufferRetryOptions(asked,step);if(next==UINT64_MAX)break;
++  handle=nmb_buffer_new(gDevice,length,next,bytes);
++  if(handle){noteRefused([NSString stringWithFormat:@"%@ length %llu options 0x%llx (made again with options 0x%llx)",what,(unsigned long long)length,(unsigned long long)asked,(unsigned long long)next],first);*options=(MTLResourceOptions)next;}
++ }
++ if(!handle)noteRefused([NSString stringWithFormat:@"%@ length %llu options 0x%llx",what,(unsigned long long)length,(unsigned long long)asked],first);
++ return handle;
++}
+ // The render pipeline journal: one line per render pipeline creation (when, on which thread, how long, the outcome, both functions with
+ // every constant value, the attachments, blending and vertex descriptor) appended to pipelines.log in the runtime's cache directory, which
+ // the board log exports with the caches (CacheExport.h): every pipeline a boot made, or was refused, can be made again on the host.
+@@ -1253,7 +1286,7 @@
+ 
+ // ---- the device ----
+ template <typename T> static T failWith(NSError **error,NSString *what,T value) {
+- noteProblem([NSString stringWithFormat:@"%@: %@",what,lastError()]);
++ noteRefused(what,lastError());   // NegroniMetal (flame/0008): one log line per (what, reason); noteProblem counts every one
+  if(error)*error=nbError([NSString stringWithFormat:@"%@: %@",what,lastError()]);
+  return value;
+ }
+@@ -1659,19 +1692,19 @@
+ }
+ - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {(void)count;return [(id<MTLDevice>)self newCommandQueue];}
+ - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+- NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
+- if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
++ NmbBuffer *handle=bufferWithRetries(@"buffer",length,&options,nullptr);
++ if(!handle)return nil;
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
+  if(!bytes)return nil;
+- NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
+- if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
++ NmbBuffer *handle=bufferWithRetries(@"buffer with bytes",length,&options,bytes);
++ if(!handle)return nil;
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
+  NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,pointer,length,options);
+- if(!handle){NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;}
++ if(!handle){noteRefused([NSString stringWithFormat:@"no-copy buffer %p length %llu options 0x%llx",pointer,(unsigned long long)length,(unsigned long long)options],lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
+  buffer.wrapped=pointer;buffer.deallocator=deallocator;
+  return (id<MTLBuffer>)buffer;
+@@ -1679,7 +1712,9 @@
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+- if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
++ if(!handle){noteRefused([NSString stringWithFormat:@"texture type %lu fmt %lu %lux%lux%lu levels %lu samples %lu array %lu usage 0x%lx options 0x%lx",
++   (unsigned long)d.textureType,(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.depth,(unsigned long)d.mipmapLevelCount,
++   (unsigned long)d.sampleCount,(unsigned long)d.arrayLength,(unsigned long)d.usage,(unsigned long)d.resourceOptions],lastError());return nil;}
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
+ }
+ // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
+@@ -1697,14 +1732,14 @@
+  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
+  const uint64_t libraryBegan=nowUs();
+  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
+- if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
++ if(!handle)return failWith<id<MTLLibrary>>(error,[NSString stringWithFormat:@"library (data, %zu bytes)",size],nil);
+  NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ }
+ - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
+  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
+  const uint64_t libraryBegan=nowUs();
+  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
+- if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
++ if(!handle)return failWith<id<MTLLibrary>>(error,[NSString stringWithFormat:@"library %@ (%lu bytes)",path,(unsigned long)bytes.length],nil);
+  NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ }
+ - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
+@@ -1727,7 +1762,7 @@
+  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
+  const uint64_t pipelineBegan=nowUs();
+  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);gTimePipeline.add(pipelineBegan);
+- if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
++ if(!handle)return failWith<id<MTLComputePipelineState>>(error,[NSString stringWithFormat:@"compute pipeline (%@)",[(id<MTLFunction>)function name]?:@"-"],nil);
+  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+ }
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
+@@ -1739,7 +1774,7 @@
+  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+  const uint64_t pipelineBegan=nowUs();
+  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
+- if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
++ if(!handle)return failWith<id<MTLComputePipelineState>>(error,[NSString stringWithFormat:@"compute pipeline '%@' (%@)",d.label?:@"",d.computeFunction.name?:@"-"],nil);
+  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
+  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
+ }
+@@ -1757,7 +1792,8 @@
+  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
+  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+- if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
++ if(!handle)return failWith<id<MTLRenderPipelineState>>(error,[NSString stringWithFormat:@"render pipeline '%@' (%@ / %@, color0 fmt %lu, depth fmt %lu, samples %lu)",
++   d.label?:@"",d.vertexFunction.name?:@"-",d.fragmentFunction.name?:@"-",(unsigned long)d.colorAttachments[0].pixelFormat,(unsigned long)d.depthAttachmentPixelFormat,(unsigned long)d.rasterSampleCount],nil);
+  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+ }
+ - (id<MTLBinaryArchive>)newBinaryArchiveWithDescriptor:(MTLBinaryArchiveDescriptor *)d error:(NSError **)error {

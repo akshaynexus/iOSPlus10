@@ -86,6 +86,14 @@ scripts/net/ssh-phone.sh "echo NEGRONIMETAL_STRIKE_LIMIT=3 >> /private/var/db/ne
 
 ## 3. Logs & Diagnostics
 
+### Refusal lines (flame/0008)
+Every refused buffer, texture, library, render or compute pipeline is logged once per (what, reason) text:
+`native-metal: refused (logged once per reason): buffer length 432 options 0x1: <runtime reason>`,
+`... texture type 2 fmt 80 1170x2532x1 levels 1 ... options 0x0: ...`, `... render pipeline 'label' (vs / fs, color0 fmt 80, ...): ...`,
+`... library /path (N bytes): ...`. A small buffer (< 1 MiB) refused with a CPU cache mode is made again without it, then with
+options 0: `buffer length N options 0x1 (made again with options 0x0): <first reason>`. The plugin's MPS line
+`MPS feature flags = NO (NegroniMetal A730 answer): ...` lists the MetalPerformanceShaders feature selectors answered NO.
+
 ### Real-Time Driver Log
 Inspect live driver initialization, frame presentation, and device answers:
 

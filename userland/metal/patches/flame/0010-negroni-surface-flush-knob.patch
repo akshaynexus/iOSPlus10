@@ -1,0 +1,26 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (on top of flame/0001-0009), applied by scripts/metal/fetch-sources.sh:
+NEGRONIMETAL_SURFACE_FLUSH knob for flushSurfaces (the per-command-buffer `dc civac` over every IOSurface the command buffer
+rendered into, on the completion thread, in every process but backboardd). 0 = off everywhere, 1 = on everywhere, unset =
+unchanged (on except backboardd). m2v/0001 already invalidates every host import a command buffer used, so this is a second
+pass over the same bytes; the telemetry row `J surface cache n= bytes= us=` measures it (docs/metal-management.md).
+
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -346,9 +346,15 @@
+ // owners keep the mapping live through this phase. Maintain each exact CPU
+ // range once; no address identity or decision is carried into another phase
+ // or command, and distinct/partially overlapping ranges retain their calls.
++// NegroniMetal (flame/0010): NEGRONIMETAL_SURFACE_FLUSH=0 turns this CPU-side invalidate off in every process (1 forces it on, also in
++// backboardd). Default unchanged: on except backboardd. Each command buffer that rendered into IOSurfaces runs `dc civac` over the whole
++// surface (a full-screen BGRA8 layer is ~18 MiB, ~290k lines) on the completion thread; m2v/0001 already invalidates every host import a
++// command buffer used (through the kernel's CPU_PREP since turnip 0002), so this is a second pass over the same bytes. The telemetry row
++// `J surface cache n= bytes= us=` measures it; the A/B is the owner's (docs/metal-management.md).
+ static void flushSurfaces(NSMutableSet *surfaces) {
+- static bool isBackboardd = (strcmp(getprogname(), "backboardd") == 0);
+- if(isBackboardd)return; // Compositor writes directly to GPU framebuffers; skip redundant CPU cache flushes
++ static int mode=-1;
++ if(mode<0){const char *e=getenv("NEGRONIMETAL_SURFACE_FLUSH");mode=e?(e[0]!='0'):(strcmp(getprogname(),"backboardd")!=0);}
++ if(!mode)return; // backboardd (default): the compositor's framebuffers are GPU-only, the CPU never reads them
+  if(!surfaces.count)return;
+  std::vector<std::pair<uintptr_t,size_t>> ranges;
+  ranges.reserve(surfaces.count);
