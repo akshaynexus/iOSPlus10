@@ -55,6 +55,10 @@ The `flashlight_code` caller ranges (`inject_media.c:94-95`) are 20F66 values; t
 
 ## 4. Work items (shortest path to a live preview)
 
+Status 2026-10-27 (userland agent): items 2-4 done, build-only: `userland/camera/` (NegroniCamera.driver, way a),
+`scripts/camera/{check-cache,root-add-camera,phone-camera}.sh`, `ADT_CAM=1` in `scripts/ios16/adt-extra.py`. The
+portrait prewarm in 20H392 is 0x1a2165b8c. Details and test steps: `userland/camera/README.md`, notes section 43.
+
 1. **Kernel test first (build done, not run):** boot `negronicam=5` and get `TPG frame sanity: PASS` and
    `SENSOR frame sanity: PASS` with the new SMMU lines (README-camera.md "Boot-args for the camera test boot").
    Then `negronicam=7` (`negronicam_src=1` for colour bars), and on the phone over SSH:
@@ -82,8 +86,9 @@ The `flashlight_code` caller ranges (`inject_media.c:94-95`) are 20F66 values; t
      installs the hooks (`getprogname()` == mediaserverd, `_dyld_register_func_for_add_image`) needs no launchd change.
      Or add the hooks to `NegroniAudio.driver` itself (one bundle).
    - b) HakiOS's way (launchd plist `EnvironmentVariables` + their AMFI stand-in): only if a) fails.
-   Installer: `scripts/camera/root-add-camera.sh` modelled on `scripts/gpu/root-add-negronigl.sh` (off unless
-   `NEGRONICAM=1`; called from `scripts/ios16/root-finish.sh`).
+   Installer (done): `scripts/camera/root-add-camera.sh` (`CAMERA=1`; root-finish.sh sets it by default when the
+   driver is built; it writes the stamp `out/camera/root-has-camera` that `scripts/ios16/build.sh` needs for its
+   `ADT_CAM=1` default).
 4. **ADT** (`config/negroni-ne2211.toml` + `scripts/ios16/adt-extra.py`, like `ADT_BT=1`): node `/arm-io/isp` with
    `camera-rear` = 1 (4 bytes LE) and no `compatible`; node `/product/camera` (no `flash`). [V] NegroniPlatformExpert
    publishes every `/arm-io` child as a nub (slop 0046, `adt-extra.py:16-17`), but a node without `compatible`

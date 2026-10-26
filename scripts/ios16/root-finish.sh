@@ -20,6 +20,12 @@
 #     /var/db/negronimetal/clients get a device (default: the probes; METAL_CLIENTS="... backboardd SpringBoard")
 # 1i. Bluetooth: scripts/bt/root-add-bt.sh (BT=1; default off): bluetoothd job back with BT_HCI_TRANSPORT,
 #     BlueTool job -> /usr/libexec/negroni-bluetool, hcitest (docs/bluetooth-plan.md section 4)
+# 1j. fingerprint glyph daemon negroni-fpd: scripts/fp/root-add-fpd.sh (FPD=1; default off): kern.negroni_fp_ui from
+#     the SpringBoard lock state (patches/xnu/README-fingerprint.md "0354")
+# 1k. Camera: NegroniCamera.driver (capture plug-in for the stock Camera.app) + MobileGestalt cache cleared:
+#     scripts/camera/root-add-camera.sh (CAMERA=1; default on when out/camera/ios/NegroniCamera.driver is built,
+#     CAMERA=0 to leave it out); it writes out/camera/root-has-camera, which scripts/ios16/build.sh needs for its
+#     ADT_CAM=1 default
 # 1h. XNUtils.app (was PowerMenu.app; bootloader/restart/shut down) + setuid helper: scripts/ios16/root-add-powermenu.sh
 #     (POWERMENU=1; default on when out/powermenu/XNUtils.app is built, POWERMENU=0 to leave it out)
 # 3. remove host metadata folders (macOS creates .fseventsd/.Spotlight-V100 on mount)
@@ -42,6 +48,9 @@ METAL=${METAL:-0} sh "$REPO/scripts/metal/root-add-metal.sh" "$R"   # Metal driv
 if [ -z "${POWERMENU:-}" ] && [ -x "$REPO/out/powermenu/XNUtils.app/XNUtils" ]; then POWERMENU=1; fi
 POWERMENU=${POWERMENU:-0} sh "$REPO/scripts/ios16/root-add-powermenu.sh" "$R"   # power menu app (userland/rebootapp/README.md)
 BT=${BT:-0} sh "$REPO/scripts/bt/root-add-bt.sh" "$R"   # Bluetooth userland (docs/bluetooth-plan.md section 4)
+if [ -z "${CAMERA:-}" ] && [ -f "$REPO/out/camera/ios/NegroniCamera.driver/NegroniCamera" ]; then CAMERA=1; fi
+CAMERA=${CAMERA:-0} sh "$REPO/scripts/camera/root-add-camera.sh" "$R"   # Camera.app capture plug-in (userland/camera/README.md)
+FPD=${FPD:-0} sh "$REPO/scripts/fp/root-add-fpd.sh" "$R"   # fingerprint lock-screen glyph daemon (patch 0354)
 
 n=0
 for app in "$R"/private/var/staged_system_apps/*.app; do

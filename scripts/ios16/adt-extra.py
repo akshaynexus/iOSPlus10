@@ -16,6 +16,14 @@ local-mac-address (main 0x1000269b4; the BT_DEVICE_ADDRESS env value is discarde
 transport-encoding / transport-speed from it (0x1000e75c8, 0x1000e74e4). NegroniPlatformExpert publishes every
 /arm-io child except gic as a nub (slop patch 0046), so the node becomes that registry entry. Without ADT_BT the
 ADT is unchanged.
+
+ADT_CAM=1 adds the camera nodes (userland/camera/README.md, as HakiOS xnuloader/loader.c:3125-3145,3226-3234):
+/arm-io/isp with only camera-rear = 1 (no compatible, no device_type: no driver matches it; MobileGestalt answers
+still-camera and rear-facing-camera, so SpringBoard shows Camera.app), and /product/camera with no properties
+(MobileGestalt video-camera; no "flash" until a torch driver exists). No camera-front: the front IMX615 has no
+kernel driver. scripts/ios16/build.sh sets ADT_CAM=1 by default when out/camera/ios/NegroniCamera.driver is built
+(the same rule that makes scripts/ios16/root-finish.sh install it with CAMERA=1): the Camera icon and the capture
+plug-in ship together.
 """
 import os, sys, tomllib
 from pathlib import Path
@@ -41,11 +49,7 @@ def main():
             val = bytes.fromhex(hexval.replace(':', ''))
             n.props = [p for p in n.props if p[0] != name] + [(name, 0, val)]
             print(f'/{npath.strip("/")} {name} = {val.hex(":")}')
-    if os.environ.get('ADT_BT') == '1':
-        bt = tomllib.loads((REPO / 'config/negroni-ne2211.toml').read_text())['adt']['bluetooth']
-        armio = find(root, 'arm-io')
-        armio.children = [c for c in armio.children if c.name != 'bluetooth']
-        n = adt.Node()
+    def new_phandle():
         used = []
         def walk(x):
             for k, f, v in x.props:
@@ -54,7 +58,25 @@ def main():
             for c in x.children:
                 walk(c)
         walk(root)
-        n.props = [('name', 0, b'bluetooth\0'), ('AAPL,phandle', 0, (max(used + [0]) + 1).to_bytes(4, 'little'))]
+        return (max(used + [0]) + 1).to_bytes(4, 'little')
+    def add_node(parent_path, name, props):
+        parent = find(root, parent_path)
+        parent.children = [c for c in parent.children if c.name != name]
+        n = adt.Node()
+        n.props = [('name', 0, name.encode() + b'\0'), ('AAPL,phandle', 0, new_phandle())] + props
+        n.children = []
+        parent.children.append(n)
+        print(f'/{parent_path}/{name}:', ', '.join(f'{k}={v.hex(":")}' for k, _, v in n.props))
+        return n
+    if os.environ.get('ADT_CAM') == '1':
+        add_node('arm-io', 'isp', [('camera-rear', 0, (1).to_bytes(4, 'little'))])
+        add_node('product', 'camera', [])
+    if os.environ.get('ADT_BT') == '1':
+        bt = tomllib.loads((REPO / 'config/negroni-ne2211.toml').read_text())['adt']['bluetooth']
+        armio = find(root, 'arm-io')
+        armio.children = [c for c in armio.children if c.name != 'bluetooth']
+        n = adt.Node()
+        n.props = [('name', 0, b'bluetooth\0'), ('AAPL,phandle', 0, new_phandle())]
         for name, val in bt.items():
             if isinstance(val, str) and val.startswith('str:'):
                 b = val[4:].encode() + b'\0'

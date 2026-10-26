@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.iosplus10.camera</string>
+	<key>CFBundleName</key>
+	<string>NegroniCamera</string>
+	<key>CFBundleExecutable</key>
+	<string>NegroniCamera</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>MinimumOSVersion</key>
+	<string>16.0</string>
+	<!-- AudioServerPlugIn type -> our factory (media_hooks.c NegroniCamera_Create, returns NULL: no audio
+	     driver). The HAL in mediaserverd loads the code to call it; the constructor installs the camera hooks. -->
+	<key>CFPlugInTypes</key>
+	<dict>
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>278D395E-6A43-49D1-AA38-98A7A42795F7</string>
+		</array>
+	</dict>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>278D395E-6A43-49D1-AA38-98A7A42795F7</key>
+		<string>NegroniCamera_Create</string>
+	</dict>
+</dict>
+</plist>

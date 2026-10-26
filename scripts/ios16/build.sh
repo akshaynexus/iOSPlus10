@@ -22,7 +22,19 @@ FD=$OUT/mu/SILICIUM_UEFI-DEBUG.fd
 adt() {
   # shellcheck disable=SC2046
   python3 "$REPO/$($C adt.tool)" "$O/negroni.adt" $($C adt.args)
-  python3 "$REPO/scripts/ios16/adt-extra.py" "$O/negroni.adt"
+  # Camera nodes (/arm-io/isp camera-rear, /product/camera; userland/camera/README.md): on by default only when
+  # a root got the built NegroniCamera.driver (stamp out/camera/root-has-camera from scripts/camera/root-add-camera.sh,
+  # same sha256), so the Camera icon never comes without the capture plug-in. ADT_CAM=1/0 overrides.
+  cam=$OUT/camera/ios/NegroniCamera.driver/NegroniCamera
+  if [ -z "${ADT_CAM:-}" ] && [ -f "$cam" ]; then
+    if [ -f "$OUT/camera/root-has-camera" ] && [ "$(cut -d' ' -f1 "$OUT/camera/root-has-camera")" = "$(shasum -a 256 "$cam" | cut -d' ' -f1)" ]; then
+      ADT_CAM=1
+    else
+      echo "adt: WARNING: NegroniCamera.driver is built but no root has it (out/camera/root-has-camera missing or older):" >&2
+      echo "     no camera ADT nodes. Build the root with CAMERA=1 first, or set ADT_CAM=1 by hand." >&2
+    fi
+  fi
+  ADT_CAM=${ADT_CAM:-0} python3 "$REPO/scripts/ios16/adt-extra.py" "$O/negroni.adt"
 }
 
 payload() {
