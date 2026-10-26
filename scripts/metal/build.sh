@@ -4,7 +4,7 @@
 #   stage/System/Library/Extensions/NegroniMetal.bundle/clients   (the test tools; every process can read the bundle)
 #   stage/usr/local/bin/{vkprobe,metalprobe,mslprobe,m2vtest,carenderprobe,layerprobe,metallib-sweep.sh}
 #   stage/usr/local/share/negronimetal/{layerprobe.metallib,metallibs.txt}   (stage 4a / 3b inputs)
-#   stage/var/db/negronimetal/clients           (default: the probes only)
+#   stage/var/db/negronimetal/clients           (default: "*" = every process; owner 2026-10-27)
 #
 #   scripts/metal/build.sh            probes always; the plugin when the bridge is built (build-bridge.sh)
 #   scripts/metal/build.sh --probes   probes only
@@ -60,9 +60,9 @@ fi
 
 cat > "$STAGE/var/db/negronimetal/clients" <<'EOF'
 # Processes that get the NegroniMetal Metal device (userland/metal/plugin/NegroniMetal.mm).
-# Names separated by blanks, "*" = all, "-NAME" = never NAME. Default: only the test tools.
-# The Metal stages (docs/metal-plan.md) add backboardd and SpringBoard here (stage 4).
-metalprobe m2vtest
+# Names separated by blanks, "*" = all, "-NAME" = never NAME. Default (owner, 2026-10-27): every process.
+# "metalprobe m2vtest" = the test tools only (XNUtils "Probes only", scripts/metal/phone-metal.sh probes).
+*
 EOF
 
 if [ -f "$BUILD/NegroniMetal" ]; then
