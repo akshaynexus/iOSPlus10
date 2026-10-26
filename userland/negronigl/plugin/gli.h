@@ -22,7 +22,6 @@ struct ngl_gli;         /* negronigl.h */
 /* gli_context.c, called by gli_table.c's gliCreateContext */
 int gliCreateContextWithShared(void **out, void *pf, void *shared, void *disp1, void *disp2, uint32_t flags);
 
-/* gli_view.c, called by gli_context.c's gliDestroyContext */
-void ngl_gli_view_unbind(struct ngl_gli *g);
+/* drawables: ngl_view_bind / ngl_view_unbind / ngl_view_present (../view.c, negronigl.h) */
 
 #endif

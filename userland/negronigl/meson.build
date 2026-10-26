@@ -15,7 +15,7 @@ ngl_gli_c = custom_target(
              '@INPUT2@', '@OUTPUT@'],
 )
 
-ngl_core_src = files('negronigl.c', 'eagl.c', 'surface.c', 'shaders.c', 'sw_winsys.c', 'log.c',
+ngl_core_src = files('negronigl.c', 'eagl.c', 'view.c', 'surface.c', 'shaders.c', 'sw_winsys.c', 'log.c',
                      'drm/negroni_drm.c')
 # GLI plugin entries (NegroniGL.bundle only): the 18 _gli_plugin slots EAGL binds on Mesa. The dylib
 # uses the Obj-C EAGL shim in eagl.c instead, so these are not part of ngl_core_src.
@@ -75,6 +75,9 @@ negronigl_bundle = shared_module(
   link_args : [
     '-Wl,-exported_symbols_list,' + ngl_gld[1].full_path(),
     '-Wl,-dead_strip',
+    # a bundle (MH_BUNDLE) links with LC_DYLD_INFO and lazy stubs by default; those import
+    # dyld_stub_binder, which the 20H392 cache does not export (check-imports). Chained fixups as the dylib.
+    '-Wl,-fixup_chains',
     '-framework', 'IOKit', '-framework', 'IOSurface', '-framework', 'CoreFoundation',
     '-lobjc', '-lc++',
   ],

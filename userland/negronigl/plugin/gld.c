@@ -17,6 +17,8 @@
  * Rule: no call may crash or block the caller. What is not ready fails with a CGL error code.
  */
 #include <dlfcn.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +26,7 @@
 #include <unistd.h>
 
 #include "gld.h"
-#include "negroni_drm.h"
+#include "negronigl.h"
 
 /* Apple's defaults (AppleMetalGLRenderer GLRPixelFormat::preflight, 20H392 0x209fd28d0/0x209fd28e0) */
 struct ngl_pixel_format ngl_pf = {
@@ -59,6 +61,125 @@ pin_self(void)
 	}
 }
 
+/*
+ * The app gate, decided once per process (docs/gpu-userland.md "GL driver for apps"). Control files
+ * live in the bundle too (the NegroniMetal design): every process that loads the bundle can read it,
+ * a sandboxed app cannot read /var/db, and an unreadable kill switch must not fail open.
+ *   1. NEGRONIGL_APPS=1|0 in the environment wins (test tools).
+ *   2. Off: BUNDLE/off exists, or cannot be checked (stat fails with anything but ENOENT): closed.
+ *      /var/db/negronigl/off exists: closed (a sandbox EPERM/EACCES there leaves it to BUNDLE/off).
+ *   3. Lists BUNDLE/apps (staged by gl-build.sh), BUNDLE/apps.local (the owner's, phone-gl.sh apps on)
+ *      and /var/db/negronigl/apps: "*" = all, "-NAME" = never NAME; a "-NAME" in any file wins.
+ *   4. The GPU: ngl_init() with freedreno (softpipe only with NEGRONIGL_ALLOW_SW=1 or
+ *      NEGRONIGL_DRIVER=softpipe).
+ * Closed = ngl_gli_register is not called: eagl_init binds GLEngine's table, GLEngine asks our
+ * gldChoosePixelFormat, which refuses, and EAGLContexts are nil, as without the bundle.
+ */
+static bool
+bundle_dir(char *out, size_t size)
+{
+	Dl_info info;
+	if (!dladdr((const void *)&bundle_dir, &info) || info.dli_fname == NULL) {
+		return false;
+	}
+	snprintf(out, size, "%s", info.dli_fname);
+	char *slash = strrchr(out, '/');
+	if (slash == NULL) {
+		return false;
+	}
+	*slash = 0;
+	return true;
+}
+
+/* 1 = exists, 0 = ENOENT, -1 = cannot check (errno in *err) */
+static int
+exists(const char *path, int *err)
+{
+	struct stat sb;
+	if (stat(path, &sb) == 0) {
+		return 1;
+	}
+	*err = errno;
+	return errno == ENOENT ? 0 : -1;
+}
+
+static const char *
+apps_closed(const char *prog, char *why, size_t size)
+{
+	char dir[512], path[600];
+	int err = 0;
+	if (!bundle_dir(dir, sizeof(dir))) {
+		return "bundle path unknown (dladdr): fail closed";
+	}
+	snprintf(path, sizeof(path), "%s/off", dir);
+	switch (exists(path, &err)) {
+	case 1:
+		snprintf(why, size, "%s exists", path);
+		return why;
+	case -1:
+		snprintf(why, size, "cannot check %s (%s): fail closed", path, strerror(err));
+		return why;
+	}
+	err = 0;
+	if (exists(NGL_GATE_DIR "/off", &err) == 1) {
+		return NGL_GATE_DIR "/off exists";
+	}
+	const char *lists[3] = {"apps", "apps.local", NULL};
+	int any = 0;
+	for (int i = 0; i < 3; i++) {
+		if (lists[i] != NULL) {
+			snprintf(path, sizeof(path), "%s/%s", dir, lists[i]);
+		} else {
+			snprintf(path, sizeof(path), "%s", NGL_GATE_DIR "/apps");
+		}
+		int c = ngl_gate_list(path, prog);
+		if (c < 0) {
+			snprintf(why, size, "listed as -%s in %s", prog, path);
+			return why;
+		}
+		any |= c == 1;
+	}
+	if (!any) {
+		snprintf(why, size, "not in %s/apps, %s/apps.local or " NGL_GATE_DIR "/apps", dir, dir);
+		return why;
+	}
+	return NULL;
+}
+
+static bool
+apps_gate(const char *prog)
+{
+	static int decided = -1;
+	if (decided >= 0) {
+		return decided == 1;
+	}
+	char buf[700];
+	const char *why = NULL;
+	const char *e = getenv("NEGRONIGL_APPS");
+	if (e != NULL && e[0] != 0) {
+		why = ngl_env_on("NEGRONIGL_APPS", false) ? NULL : "NEGRONIGL_APPS=0";
+	} else {
+		why = apps_closed(prog, buf, sizeof(buf));
+	}
+	if (why == NULL && !ngl_init()) {
+		why = "no GL screen (RedwoodGPU did not open and softpipe failed)";
+	}
+	if (why == NULL && ngl_soft()) {
+		const char *d = getenv("NEGRONIGL_DRIVER");
+		bool wanted = d != NULL && (strcmp(d, "softpipe") == 0 || strcmp(d, "sw") == 0);
+		if (!wanted && !ngl_env_on("NEGRONIGL_ALLOW_SW", false)) {
+			why = "screen is softpipe, not the GPU (NEGRONIGL_ALLOW_SW=1 allows it)";
+		}
+	}
+	decided = why == NULL ? 1 : 0;
+	if (why == NULL) {
+		ngl_log("negronigl: NegroniGL app gate open for %s (%s)", prog, ngl_soft() ? "softpipe" : "freedreno");
+	} else {
+		ngl_log("negronigl: NegroniGL app gate closed for %s: %s; EAGLContexts stay nil", prog, why);
+	}
+	return why == NULL;
+}
+
 NGL_GLD void
 gldInitializeLibrary(const uint32_t *services, void *io_data, uint32_t mask, void *get_surface_props,
     void *get_new_surface, uint32_t flags)
@@ -78,7 +199,10 @@ gldInitializeLibrary(const uint32_t *services, void *io_data, uint32_t mask, voi
 	}
 	/* eagl_init is inside GLEngine's gliInitializeLibrary now: hand OpenGLES our GLI table. Every
 	 * load (also after gliTerminateLibrary let libGFXShared unload us); it is idempotent. */
-	ngl_gli_register();
+	const char *prog = getprogname();
+	if (apps_gate(prog ? prog : "?")) {
+		ngl_gli_register();
+	}
 }
 
 NGL_GLD void

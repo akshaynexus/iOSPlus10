@@ -47,6 +47,10 @@ NGL_API bool ngl_selftest(void);                        /* FBO triangle, read ba
 NGL_API bool ngl_surface_selftest(void);                /* clear an imported IOSurface, read on the CPU */
 NGL_API bool ngl_gpu_info(struct ngl_gpu_info *info);
 NGL_API const char *ngl_version(void);
+/* CAEAGLLayer round trip through the real EAGLContext methods (shim installed here if needed):
+ * renderbufferStorage:fromDrawable:, clear, presentRenderbuffer: twice. 1 PASS, 0 FAIL, -1 no
+ * drawable (the layer got no size: no CA context in this process). The dylib only. */
+NGL_API int ngl_layer_selftest(int w, int h);
 
 /* ---- internal ---- */
 struct pipe_screen;
@@ -59,6 +63,12 @@ void ngl_image_hooks(struct pipe_frontend_screen *fscreen);
 void ngl_log_image_base(void);
 void ngl_eagl_install(void);
 bool ngl_env_on(const char *name, bool dflt);
+/* gate files (negronigl.c): 1 = prog listed (or "*"), 0 = not listed or no file, -1 = listed as
+ * "-prog". NGL_GATE_DIR/clients: backboardd EAGL shim; NGL_GATE_DIR/apps and BUNDLE/apps(.local):
+ * NegroniGL.bundle (plugin/gld.c) */
+#define NGL_GATE_DIR "/var/db/negronigl"
+int ngl_gate_list(const char *path, const char *prog);
+bool ngl_gate_off(void);                /* NGL_GATE_DIR/off exists: GL path off everywhere */
 
 /* GLI: CA calls disp[slot](rctx, gl arguments...) on the table from -getMacroContextPrivate */
 #define NGL_SLOTS 1036
@@ -153,6 +163,12 @@ char *ngl_shader_rewrite(struct ngl_state *st, GLuint shader, char *src);   /* t
 void ngl_program_linked(struct ngl_state *st, GLuint program);
 void ngl_shader_deleted(struct ngl_state *st, GLuint shader);
 const char *ngl_extensions(const char *mesa);
+
+/* view.c: CAEAGLLayer drawables (EAGL shim and GLI plugin share it) */
+void ngl_flush(void);                   /* glFlush (kernel fence), or glFinish with NEGRONIGL_FINISH=1 */
+bool ngl_view_bind(struct ngl_gli *g, void *native_window, unsigned colorformat, unsigned retained);
+void ngl_view_unbind(struct ngl_gli *g);        /* no GL calls */
+bool ngl_view_present(struct ngl_gli *g, unsigned after_minimum, double t);
 
 /* surface.c */
 bool ngl_bind_surface(IOSurfaceRef s, GLenum target, GLenum format, GLenum type, uint32_t plane,

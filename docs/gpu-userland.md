@@ -80,7 +80,7 @@ surface/GEM path and wrapped with Mesa `resource_from_handle`. The current path 
 plane and formats mapped by `surface.c`. Multi-plane YUV surfaces and the copy fallback for layouts
 that freedreno cannot address are unsupported. `renderbufferStorage:fromDrawable:` is now served through
 the GLI plugin (`plugin/gli_view.c` gliBindViewES: the drawable IOSurface becomes GL_RENDERBUFFER
-storage via `surface.c`); CoreAnimation's private `attachImage:toCoreSurface:invertedRender:` and
+storage via `surface.c`; since 2026-10-26 the code is `view.c`, shared with the dylib's shim); CoreAnimation's private `attachImage:toCoreSurface:invertedRender:` and
 `texImageIOSurface:` paths use the imported texture resource. Not run on the phone.
 
 **No phone test has been run.** The kernel GPU service, its IOSurface import behavior, cache
@@ -124,7 +124,7 @@ What spes does (compact):
 | EAGL bridge = HackiOS `userland/src/eagl.c` (ObjC method replacement on EAGLContext) + `gl_osmesa.c` over `libOSMesa.8.dylib` (Mesa 25.0.7, freedreno msm, redwood-drm) | `tools/build-spes-eagl-macos.sh`, `tools/build-spes-mesa-macos.sh` | `userland/negronigl/eagl.c` + `negronigl.c` (one dylib with Mesa linked in, our `drm/negroni_drm.c`); built by `scripts/gpu/build.sh` |
 | preflight before any method is replaced: boot-arg `spesgpu=1`, wait 30 s for `RedwoodGPU`, ES 3.0 context, renderer must say FD610, green triangle on blue read back; else "keeping Apple methods" | `xnu/graphics/spes_gl_preflight.c` | `ngl_preflight()` in `negronigl.c`: gate file instead of the boot-arg, wait `NEGRONIGL_WAIT` s (30), renderer must say `FD730`, `ngl_selftest()` (red triangle, FBO) and `ngl_surface_selftest()` (BGRA IOSurface) must PASS |
 | attachImage fills the mirrored target by a GPU blit instead of a CPU hash+upload; BGRA refills by `glTexSubImage2D` | `tools/eagl-attach-gpu.patch` | not needed: our `surface.c` binds the IOSurface itself as the GL resource (import by IOSurface ID, selector 0x7e), there is no mirror copy |
-| `glFlush` = finish, because the display swaps without waiting for the GPU; `RedwoodWaitsForGPU` property lets the bridge skip it | HackiOS eagl.c `display_waits()`, spes 0102 | `ngl_h_Flush` does `glFinish()`; the property is not read yet (kernel plan, README-gpu-kernel.md section 13) |
+| `glFlush` = finish, because the display swaps without waiting for the GPU; `RedwoodWaitsForGPU` property lets the bridge skip it | HackiOS eagl.c `display_waits()`, spes 0102 | `ngl_h_Flush` = `ngl_flush()` (view.c): `glFlush`; the kernel marks the IOSurfaces of the submission with its fence and the display waits on the fence recorded at SwapEnd (0254). `glFinish` with `NEGRONIGL_FINISH=1` or the file `finish` ("Flush and fences" below) |
 | bank layout: `highest_bank_bit = 14` for chip 0x06010001 | `build-spes-mesa-macos.sh` PYBANK | A730 (0x07030001) keeps Mesa's 16 (notes 16); `FD_MESA_DEBUG=sysmem` (spes: `sysmem,noubwc`) |
 
 Differences for the A730: chip id 0x07030001 (FD730, a7xx gen1), our msm-style ABI in `negroni_drm.c`
@@ -146,6 +146,12 @@ scripts/bg.sh -s gl-build
 bytes, `ngl_test` 50,336 bytes, staged `backboardd` 1,159,536 bytes (original 1,184,848; the ad hoc
 signature is smaller), `otool -L` shows `/usr/lib/negronigl.dylib ... weak`; `check-imports.py` against the
 20H392 cache: PASS (0 missing; 264 imports in 7 libraries).
+
+Build 2026-10-26 (`gl-build`, exit 0, no root attached: backboardd from the earlier `out/gpu/backboardd-gl`, cache
+`out/dsc/cache`): the stage also has `System/Library/Extensions/NegroniGL.bundle/{NegroniGL,Info.plist,apps}`.
+Stripped sizes and sha256: `negronigl.dylib` 14,233,120 (2b7dd515...), `ngl_test` 50,496 (8f7d3778...),
+`NegroniGL` 13,777,024 (bf4c7bde...), backboardd unchanged 1,159,536 (39cb14d1...). check-imports PASS (0 missing)
+for all three binaries; NegroniGL 129/129 GLD + 18/18 GLI names. Full list: `out/gpu/stage.SHA256SUMS`.
 
 ### The switch
 
@@ -198,5 +204,112 @@ selftest PASS, surface selftest PASS
 Unverified [I]: the backboardd steps (staged backboardd, gate, preflight in backboardd) did not run yet. Open points: ad hoc re-signed backboardd under our
 AMFI (slop 0025/0035/0036 + 0221 accept ad hoc platform binaries for the Metal bundle, but a main
 executable with entitlements was not tried); the 30 s synchronous preflight delays backboardd's start by
-the GPU's readiness; CA's `renderbufferStorage:fromDrawable:` returns NO on Mesa contexts (not used by
-the render server); `glFinish` per flush costs frames until the kernel fence waits (section 13 plan).
+the GPU's readiness. (2026-10-26: `renderbufferStorage:fromDrawable:` and `presentRenderbuffer:` work on Mesa
+contexts, and flush no longer finishes: next section.)
+
+### Flush and fences (2026-10-26)
+
+[V code] Why `glFlush` is enough with kernel 0254:
+- CA's frame ends in `glFlush` (GLI slot `Flush`) and then an IOMobileFramebuffer swap. `ngl_flush()` (view.c)
+  calls `glFlush`: Mesa freedreno flushes the batch and submits at once. Submit merging (`should_defer`,
+  `freedreno_ringbuffer_sp.c`) never defers a submit that lists a shared bo, and an imported IOSurface is a shared
+  bo (`fd_bo_from_dmabuf` sets `FD_BO_SHARED`). The msm backend has no submit thread (only virtio has one), so the
+  submit ioctl is done when `glFlush` returns.
+- `negroni_drm.c s_gem_submit` copies every bo handle of the submit into the kernel's list (`hdr->nr_bos`). The
+  kernel (0230) sets `gpuFence` of each imported surface in that list to the submission's fence. 0254 records that
+  fence at SwapEnd and shows the frame only when it is done (docs/gpu-abi.md section 8).
+- A later reader on the GPU (backboardd sampling an app's surface) is behind the render on the same ring.
+- Not covered [I]: a CPU reader of a GPU-written surface (`IOSurfaceLock` + read): the kernel's lock does not wait for
+  `gpuFence` yet. CA's own frames do not need it; the kernel item is in the report below (notes.md 15a).
+- `glFinish` comes back with `NEGRONIGL_FINISH=1` (environment), the file `/var/db/negronigl/finish`, or
+  `NegroniGL.bundle/finish` (readable by sandboxed apps); `NEGRONIGL_FINISH=0` wins over the files.
+  `scripts/gpu/phone-gl.sh finish on|off` writes both files. Use it with a kernel older than 0254. Read once per
+  process; the log says `negronigl: flush = glFlush + kernel fence (default)` or `= glFinish (WHY)`.
+- `glFinish` stays in `FinishObjectAPPLE`, `TestObjectAPPLE`, `FinishFenceAPPLE` (CA asks for a real wait there).
+
+### CAEAGLLayer drawables (2026-10-26, view.c)
+
+Sources: out/gpu/re/OpenGLES.s and QuartzCore.s (20H392 cache, unslid, `ipsw dyld disass`). Each fact names the
+instruction that shows it.
+- [V] `-[EAGLContext renderbufferStorage:fromDrawable:]` 0x1d3f518f4: target GL_RENDERBUFFER (`cmp x2, x8` with
+  x8 = 0x8d41, 0x1d3f51918/0x1d3f5191c); `respondsToSelector:` + `performSelector:` `nativeWindow` (0x1d3f51930..
+  0x1d3f5194c) and `drawableProperties` (0x1d3f5195c..0x1d3f51978); key strings `"EAGLDrawablePropertyRetained"`
+  (0x1d3f51988, `eagl_dict_read_bool`), `"EAGLDrawablePropertyColorFormat"` (0x1d3f5199c, `objectForKey:`).
+  Colour format by pointer compare (`cmp x0, x8`): `EAGLColorFormat8888` (0x1d3f519ac) or nil -> 0x8058,
+  `EAGLColorFormat565` (0x1d3f519c4) -> 0x8d62 (0x1d3f51afc), `EAGLColorFormatS8888` (0x1d3f519d4) -> 0x8c43
+  (0x1d3f51b04), `EAGLColorFormatSRGB_XR10` (0x1d3f519e4) -> 0x93f2, `EAGLColorFormatRGBA_XR10_64BPP` (0x1d3f519f4)
+  -> 0x8a76, `EAGLColorFormatSRGBA_XR10_64BPP` (0x1d3f51a04) -> 0x8a77, `EAGLColorFormatSRGB_XR10_A8_2P`
+  (0x1d3f51a14) -> 0x93f9 (0x1d3f51a24). Then `_gli_plugin+0x88` twice: (ctx, 0, 0, 0) at 0x1d3f51ab0, (ctx, nw,
+  retained, format) at 0x1d3f51ad0; YES when the second returns nonzero. Our shim compares the strings by value.
+- [V] `presentRenderbuffer:` 0x1d3f51b48 (`mov w1, #0`, `fmov d0, xzr`, `blr` at 0x1d3f51b90), `:atTime:`
+  (`mov w1, #0` 0x1d3f51be8), `:afterMinimumDuration:` (`mov w1, #0x1` 0x1d3f51c44): `gliPresentViewES(ctx, 0|0|1, d0)`.
+- [V] Native window table, `-[CAEAGLLayer nativeWindow]` 0x188468d68: `calloc(1, 0x108)` (0x188468e90/0x188468e94),
+  `str w9, [x0]` with w9 = 5 (0x188468ecc/0x188468ed8), `stp x8, x9, [x0, #0x8]` attach/detach (0x188468eac),
+  `stp x10, x8, [x0, #0x18]` begin_iosurface/swap (0x188468eec), `stp x9, x11, [x0, #0x28]` collect/begin_properties
+  (0x188468ef0), `str x8, [x0, #0x38]` with x8 = native_window_estimated_size (0x188468ef8/0x188468efc).
+- [V] `native_window_begin_iosurface` 0x188469a30 returns NULL (`mov x0, #0` 0x188469a94) when bit 1 of +0x84 is
+  clear (`tbz w8, #0x1` 0x188469a80: not attached) or when +0xc0 is set (`ldr x8, [x20, #0xc0]` 0x188469a84,
+  `cbz x8` 0x188469a88 is the only way to the allocation). [I] +0xc0 is the drawable that is out (it is stored
+  at 0x188469b10 after the new buffer is made; we did not trace where swap clears it), so one surface per swap.
+- [V] begin_iosurface passes `ldp w1, w2, [x20, #0xd0]` (0x188469ae8) as arguments 2 and 3 of
+  `get_preflight_buffer(nw, unsigned, unsigned, unsigned, unsigned)`. [I] They are the drawable width and height
+  that CA sets from the layer bounds x scale (the store was not found).
+- [V] `native_window_begin_properties` also calls `get_preflight_buffer` (0x18846a204).
+
+`view.c` does it once for both routes: the dylib's shim (eagl.c `m_rb_storage`, `m_present`, `m_present_at`,
+`m_present_after`, dealloc detaches) and the bundle's `gliBindViewES`/`gliPresentViewES` (plugin/gli_view.c is now
+a wrapper). Bind: detach the old window, attach(nw, 'BGRA', {ctx, create -> 1, destroy, preflight NULL}),
+begin_properties, begin_iosurface, the surface becomes the bound renderbuffer's storage (surface.c,
+`_mesa_EGLImageTargetRenderbufferStorageOES`). Present: `ngl_flush()`, swap(nw, mode, t) (mode 1, or 3/5 with a
+time on version >= 5, as GLEngine 0x1f6f57e94), then the next `begin_iosurface` surface becomes the storage of the
+same renderbuffer (the app's FBO keeps it attached). No next drawable (NULL): `view_surface` is cleared (logged once)
+and the next present gets one before its swap; if it still gets none, that present returns NO without a swap.
+[I] The frame drawn in between lands in the old storage, which CA now owns. All colour formats draw as BGRA 8-bit.
+
+Test: `ngl_test --layer [WxH]` (`scripts/gpu/phone-gl.sh test --layer`) installs the shim in ngl_test, makes a
+CAEAGLLayer (bounds WxH, scale 1, opaque, RGBA8, not retained), puts it into `+[CAContext localContext]`, commits,
+makes an API 3 EAGLContext, `renderbufferStorage:fromDrawable:`, clears green, reads it back with `glReadPixels` and
+from the drawable IOSurface on the CPU (after `glFinish`), presents, clears blue into the next drawable, presents
+again. Lines: `negronigl: layer selftest: renderbuffer N = drawable IOSurface ID, WxH, framebuffer 0x8cd5`,
+`negronigl: layer selftest frame 1 green: GL 00ff00ff, IOSurface ID BGRA word ff00ff00 (want ff00ff00): ok`,
+`negronigl: layer selftest WxH: present 1 1, drawables IOSurface A then B: PASS`. Exit 3 = no drawable surface
+[I: a shell process may give the layer no size; then the test says `NO DRAWABLE`, not FAIL]. Not run yet.
+
+## GL driver for apps (NegroniGL.bundle, 2026-10-26)
+
+The normal iOS driver route, for every app and framework that makes an EAGLContext (CoreImage, GLKit, games):
+`-[EAGLSharegroup initWithAPI:]` -> `eagl_init` -> GLEngine `gliInitializeLibrary` -> libGFXShared
+`gfxInitializeLibrary` reads `IOGLESBundleName` of the `IOAcceleratorES` service, dlopens
+`/System/Library/Extensions/NegroniGL.bundle/NegroniGL`, calls `gldInitializeLibrary`; there the bundle replaces
+`_gli_plugin[0]` with its own handle (`ngl_gli_register`, gli_table.c), so eagl_init binds the bundle's 18 `gli*`
+entries and every `glFoo()` of OpenGLES.framework goes to Mesa (notes.md 15, 15a).
+
+| Piece | State |
+|---|---|
+| Kernel `IOGLESBundleName = "NegroniGL"` on `IOAcceleratorES` | [V patch] 0205 (`negronigl=1` default; `negronigl=0` removes it). In every kernel built since 2026-10-24. No `IOGLESMetalBundleName`, so the CFPreferences `UseMetal` choice never applies |
+| 129 GLD names + gldInitialize/TerminateLibrary, 18 GLI + gliTerminateLibrary | [V build] `scripts/gpu/build.sh` checks them |
+| Chained fixups | [V build] 2026-10-26: the bundle was linked with LC_DYLD_INFO + lazy stubs and imported `dyld_stub_binder`, which the 20H392 cache does not export (check-imports MISSING); now `-Wl,-fixup_chains` (meson.build), check-imports PASS for the bundle too |
+| The app gate | `plugin/gld.c apps_gate`, once per process, below |
+| Drawables, present, fences | `view.c` (sections above) |
+
+App gate (the NegroniMetal design: a sandboxed app can read its bundle, not /var/db):
+1. `NEGRONIGL_APPS=1|0` in the environment wins.
+2. `BUNDLE/off` exists, or cannot be checked (not ENOENT): closed. `/var/db/negronigl/off` exists: closed.
+3. `BUNDLE/apps` (staged, lists nobody), `BUNDLE/apps.local` (the owner's), `/var/db/negronigl/apps`: `*` = all,
+   `-NAME` = never; a `-NAME` in any file wins. Not listed: closed.
+4. `ngl_init()` must give freedreno (softpipe only with `NEGRONIGL_ALLOW_SW=1` or `NEGRONIGL_DRIVER=softpipe`).
+Closed = no `ngl_gli_register`: GLEngine's table, our `gldChoosePixelFormat` refuses, EAGLContexts are nil, as
+without the bundle. Log: `negronigl: NegroniGL app gate open for NAME (freedreno)` or `... closed for NAME: WHY`.
+The backboardd shim gate (`/var/db/negronigl/clients`) is separate, so `phone-gl.sh on|off` and `apps on|off` are
+two independent switches.
+
+Phone (SSH up):
+```sh
+scripts/gpu/phone-gl.sh apps on             # bundle to /System/Library/Extensions (if it differs), apps.local = "* -backboardd"
+scripts/gpu/phone-gl.sh apps on MyGame      # only these process names
+scripts/gpu/phone-gl.sh apps status
+scripts/gpu/phone-gl.sh apps off            # BUNDLE/off + empty apps.local: nil contexts again for apps started later
+```
+`root-add-negronigl.sh` (root image, `NEGRONIGL=1`) installs the bundle without a list: it stays closed until
+`apps on`.
+

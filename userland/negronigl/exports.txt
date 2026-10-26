@@ -7,3 +7,4 @@ _ngl_surface_selftest
 _ngl_gpu_info
 _ngl_version
 _ngl_soft
+_ngl_layer_selftest

@@ -141,7 +141,7 @@ gliDestroyContext(void *rctx)
 	if (g == NULL) {
 		return 0;
 	}
-	ngl_gli_view_unbind(g);         /* detach the drawable (no GL calls) */
+	ngl_view_unbind(g);             /* detach the drawable (view.c, no GL calls) */
 	if (ngl_cur == g) {
 		ngl_bind(NULL);         /* Mesa leaves g on this thread */
 	}

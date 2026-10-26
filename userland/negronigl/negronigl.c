@@ -452,15 +452,20 @@ selftest_thread(void *arg)
 	return NULL;
 }
 
-/* ---- the gate: /var/db/negronigl/{clients,off} (same form as the Metal path's /var/db/negronimetal) ---- */
+/* ---- the gates: /var/db/negronigl/{clients,apps,off} (same form as the Metal path's /var/db/negronimetal) ----
+ *   clients  processes whose EAGLContext the dylib's shim takes (backboardd: CoreAnimation)
+ *   apps     processes in which NegroniGL.bundle installs its GLI table (apps and frameworks); the
+ *            bundle also reads BUNDLE/{off,apps,apps.local}, as a sandboxed app cannot read /var/db
+ *            (plugin/gld.c apps_gate)
+ *   off      the GL path off everywhere (both lists ignored)
+ * Two lists so that the backboardd A/B (phone-gl.sh on|off) and the app driver (phone-gl.sh apps
+ * on|off) switch independently: "*" in apps must not put backboardd on the shim. */
 
-#define NGL_GATE_DIR "/var/db/negronigl"
-
-/* name listed in /var/db/negronigl/clients: 1 yes, 0 no / no file, -1 listed as "-name" */
-static int
-gate_clients(const char *prog)
+/* name listed in the file at path: 1 yes, 0 no / no file, -1 listed as "-name" */
+int
+ngl_gate_list(const char *path, const char *prog)
 {
-	FILE *f = fopen(NGL_GATE_DIR "/clients", "r");
+	FILE *f = fopen(path, "r");
 	if (f == NULL) {
 		return 0;
 	}
@@ -488,6 +493,12 @@ gate_clients(const char *prog)
 	return r;
 }
 
+bool
+ngl_gate_off(void)
+{
+	return access(NGL_GATE_DIR "/off", F_OK) == 0;
+}
+
 static bool
 gate_open(const char *prog)
 {
@@ -495,11 +506,11 @@ gate_open(const char *prog)
 	if (e != NULL && e[0] != 0) {
 		return ngl_env_on("NEGRONIGL_EAGL", false);
 	}
-	if (access(NGL_GATE_DIR "/off", F_OK) == 0) {
+	if (ngl_gate_off()) {
 		ngl_log("negronigl: %s off: EAGL shim not installed in %s", NGL_GATE_DIR "/off", prog);
 		return false;
 	}
-	int c = gate_clients(prog);
+	int c = ngl_gate_list(NGL_GATE_DIR "/clients", prog);
 	if (c != 1) {
 		ngl_log("negronigl: %s is not in %s/clients (%s): EAGL shim not installed", prog, NGL_GATE_DIR,
 		    c < 0 ? "listed as -" : "no entry or no file");

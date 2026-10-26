@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mach/mach_time.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 #include "negronigl.h"
 
@@ -32,7 +33,7 @@ int ngl_check_errors;
 static struct ngl_gli *ctxs[MAX_CTX];
 static pthread_mutex_t ctx_lock = PTHREAD_MUTEX_INITIALIZER;
 static IMP orig_init, orig_dealloc, orig_api, orig_set_param, orig_macro, orig_tex_iosurface, orig_tex_iosurface9,
-    orig_attach, orig_set_current, orig_current, orig_rb_storage, orig_present;
+    orig_attach, orig_set_current, orig_current, orig_rb_storage, orig_present, orig_present_at, orig_present_after;
 
 static struct ngl_gli *
 lookup(id eagl)
@@ -294,14 +295,17 @@ ngl_h_FramebufferTexture2D(void *rctx, GLenum target, GLenum attachment, GLenum 
 }
 
 /*
- * flush = finish: CA hands rendered IOSurfaces to the display (IOMobileFramebuffer swap) without
- * waiting for the GPU (ios-sailfish found the same). Per-surface fences would let the GPU run ahead.
+ * glFlush (view.c ngl_flush): the flush submits the batch at once (an imported IOSurface is a
+ * shared bo, so freedreno does not defer the submit), the kernel marks every IOSurface listed in it
+ * with the submission's fence, and the display waits on the fence recorded at SwapEnd (patch 0254,
+ * docs/gpu-abi.md section 8). NEGRONIGL_FINISH=1 puts back glFinish on every flush (the ios-spes
+ * default; needed with a kernel older than 0254).
  */
 void
 ngl_h_Flush(void *rctx)
 {
 	NGL_CUR(rctx);
-	glFinish();
+	ngl_flush();
 }
 
 void
@@ -524,6 +528,7 @@ m_dealloc(id self, SEL cmd)
 		}
 	}
 	pthread_mutex_unlock(&ctx_lock);
+	ngl_view_unbind(g);             /* detach the CAEAGLLayer drawable, if any (no GL calls) */
 	if (ngl_cur == g) {
 		ngl_bind(NULL);
 	}
@@ -598,17 +603,76 @@ m_attach(id self, SEL cmd, NSUInteger target, IOSurfaceRef s, BOOL inverted)
 	return ngl_bind_surface(s, NGL_TGT((GLenum)target), 0, 0, 0, "attachImage");
 }
 
-/* CAEAGLLayer storage: CA's render server does not use it (it draws into IOSurfaces) */
+/*
+ * -renderbufferStorage:fromDrawable: on a Mesa context, as Apple's [V 20H392 0x1d3f518f4]: target must
+ * be GL_RENDERBUFFER, the drawable must answer -nativeWindow (CAEAGLLayer: the _CAEAGLNativeWindow
+ * table) and -drawableProperties (kEAGLDrawablePropertyRetainedBacking, ...ColorFormat). Apple then
+ * calls gliBindViewES(ctx, NULL) and gliBindViewES(ctx, nativeWindow, retained, colorformat); view.c
+ * ngl_view_bind does both steps. A nil drawable only detaches (Apple: YES).
+ */
+#define NGL_GL_RENDERBUFFER 0x8D41
+
+static unsigned
+color_format(id props, unsigned *retained)
+{
+	*retained = 0;
+	unsigned fmt = 0x8058;                  /* GL_RGBA8_OES: EAGLColorFormatRGBA8 and nil */
+	if (props == nil) {
+		return fmt;
+	}
+	id key = (id)CFSTR("EAGLDrawablePropertyRetained");
+	id v = ((id (*)(id, SEL, id))objc_msgSend)(props, sel_registerName("objectForKey:"), key);
+	if (v != nil) {
+		*retained = ((BOOL (*)(id, SEL))objc_msgSend)(v, sel_registerName("boolValue")) ? 1 : 0;
+	}
+	id c = ((id (*)(id, SEL, id))objc_msgSend)(props, sel_registerName("objectForKey:"),
+	    (id)CFSTR("EAGLDrawablePropertyColorFormat"));
+	if (c != nil && CFGetTypeID((CFTypeRef)c) == CFStringGetTypeID()) {
+		if (CFStringCompare((CFStringRef)c, CFSTR("EAGLColorFormat565"), 0) == kCFCompareEqualTo) {
+			fmt = 0x8D62;           /* GL_RGB565: drawn as BGRA, CA composites it the same */
+		} else if (CFStringCompare((CFStringRef)c, CFSTR("EAGLColorFormatS8888"), 0) == kCFCompareEqualTo) {
+			fmt = 0x8C43;           /* GL_SRGB8_ALPHA8: drawn as BGRA unorm (no sRGB encode) */
+		} else if (CFStringCompare((CFStringRef)c, CFSTR("EAGLColorFormat8888"), 0) != kCFCompareEqualTo) {
+			fmt = 0x93F2;           /* the XR10 forms: drawn as BGRA (8-bit display chain) */
+		}
+	}
+	return fmt;
+}
+
 static BOOL
 m_rb_storage(id self, SEL cmd, NSUInteger target, id drawable)
 {
-	if (lookup(self) == NULL) {
+	struct ngl_gli *g = lookup(self);
+	if (g == NULL) {
 		return ((BOOL (*)(id, SEL, NSUInteger, id))orig_rb_storage)(self, cmd, target, drawable);
 	}
-	ngl_log("negronigl: renderbufferStorage:fromDrawable: on a Mesa context: not supported");
-	return NO;
+	if (target != NGL_GL_RENDERBUFFER) {
+		return NO;
+	}
+	if (drawable == nil) {
+		return ngl_view_bind(g, NULL, 0, 0) ? YES : NO;
+	}
+	SEL nws = sel_registerName("nativeWindow");
+	if (!class_respondsToSelector(object_getClass(drawable), nws)) {
+		ngl_log("negronigl: renderbufferStorage:fromDrawable: %s has no -nativeWindow (not a CAEAGLLayer)",
+		    object_getClassName(drawable));
+		return NO;
+	}
+	void *nw = ((void *(*)(id, SEL))objc_msgSend)(drawable, nws);
+	if (nw == NULL) {
+		ngl_log("negronigl: renderbufferStorage:fromDrawable: invalid drawable (no native window)");
+		return NO;
+	}
+	id props = nil;
+	SEL dps = sel_registerName("drawableProperties");
+	if (class_respondsToSelector(object_getClass(drawable), dps)) {
+		props = ((id (*)(id, SEL))objc_msgSend)(drawable, dps);
+	}
+	unsigned retained = 0, fmt = color_format(props, &retained);
+	return ngl_view_bind(g, nw, fmt, retained) ? YES : NO;
 }
 
+/* -presentRenderbuffer: / :atTime: / :afterMinimumDuration: (Apple: gliPresentViewES(ctx, 0|0|1, t)) */
 static BOOL
 m_present(id self, SEL cmd, NSUInteger target)
 {
@@ -616,9 +680,27 @@ m_present(id self, SEL cmd, NSUInteger target)
 	if (g == NULL) {
 		return ((BOOL (*)(id, SEL, NSUInteger))orig_present)(self, cmd, target);
 	}
-	NGL_CUR(g);
-	glFinish();
-	return YES;
+	return ngl_view_present(g, 0, 0.0) ? YES : NO;
+}
+
+static BOOL
+m_present_at(id self, SEL cmd, NSUInteger target, double t)
+{
+	struct ngl_gli *g = lookup(self);
+	if (g == NULL) {
+		return ((BOOL (*)(id, SEL, NSUInteger, double))orig_present_at)(self, cmd, target, t);
+	}
+	return ngl_view_present(g, 0, t) ? YES : NO;
+}
+
+static BOOL
+m_present_after(id self, SEL cmd, NSUInteger target, double t)
+{
+	struct ngl_gli *g = lookup(self);
+	if (g == NULL) {
+		return ((BOOL (*)(id, SEL, NSUInteger, double))orig_present_after)(self, cmd, target, t);
+	}
+	return ngl_view_present(g, 1, t) ? YES : NO;
 }
 
 static __thread id current_eagl;
@@ -706,6 +788,10 @@ swap(Class cls, const char *sel, void *imp)
 void
 ngl_eagl_install(void)
 {
+	static int installed;
+	if (__atomic_exchange_n(&installed, 1, __ATOMIC_ACQ_REL)) {
+		return;                 /* once per process (ngl_load, ngl_layer_selftest) */
+	}
 	ngl_check_errors = ngl_env_on("NEGRONIGL_GLERR", false);
 	Class cls = objc_getClass("EAGLContext");
 	if (cls == Nil) {
@@ -729,8 +815,164 @@ ngl_eagl_install(void)
 	orig_attach = swap(cls, "attachImage:toCoreSurface:invertedRender:", m_attach);
 	orig_rb_storage = swap(cls, "renderbufferStorage:fromDrawable:", m_rb_storage);
 	orig_present = swap(cls, "presentRenderbuffer:", m_present);
+	orig_present_at = swap(cls, "presentRenderbuffer:atTime:", m_present_at);
+	orig_present_after = swap(cls, "presentRenderbuffer:afterMinimumDuration:", m_present_after);
 	orig_set_current = swap(meta, "setCurrentContext:", m_set_current);
 	orig_current = swap(meta, "currentContext", m_current);
 	surface_wrap_install();
 	ngl_log("negronigl: EAGL shim installed%s", ngl_check_errors ? " (GL error checks on)" : "");
 }
+
+#ifndef NGL_PLUGIN
+/*
+ * ngl_test --layer: a CAEAGLLayer drawable through the real EAGLContext methods of this process
+ * (the shim is installed here first): -initWithAPI:3, +setCurrentContext:, a renderbuffer from
+ * -renderbufferStorage:fromDrawable:, green clear read back by GL and from the drawable IOSurface
+ * on the CPU, -presentRenderbuffer:, then a blue frame into the next drawable and a second present.
+ * The layer gets its size from CoreAnimation; a shell process has no window server context, so the
+ * layer is put into +[CAContext localContext] and committed [I: untested on the phone].
+ * Returns 1 PASS, 0 FAIL, -1 no drawable surface (the layer has no size in this process).
+ */
+struct ngl_cgrect { double x, y, w, h; };
+void *objc_autoreleasePoolPush(void);
+void objc_autoreleasePoolPop(void *pool);
+
+static id
+msg0(id o, const char *sel)
+{
+	return o ? ((id (*)(id, SEL))objc_msgSend)(o, sel_registerName(sel)) : nil;
+}
+
+static bool
+responds(id o, const char *sel)
+{
+	return o != nil && class_respondsToSelector(object_getClass(o), sel_registerName(sel));
+}
+
+/* BGRA pixel (x, y) of the surface, after the GPU is done (caller did glFinish) */
+static uint32_t
+surface_pixel(IOSurfaceRef s, size_t x, size_t y)
+{
+	uint32_t v = 0;
+	if (s != NULL && IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL) == 0) {
+		const uint8_t *b = IOSurfaceGetBaseAddress(s);
+		if (b != NULL && x < IOSurfaceGetWidth(s) && y < IOSurfaceGetHeight(s)) {
+			memcpy(&v, b + y * IOSurfaceGetBytesPerRow(s) + x * 4, 4);
+		}
+		IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+	}
+	return v;
+}
+
+/* clear to (r, g, b), read the middle back with GL (RGBA) and from the drawable (BGRA in memory) */
+static bool
+layer_frame(struct ngl_gli *g, int w, int h, float r, float gr, float b, uint32_t want_bgra, const char *what)
+{
+	glViewport(0, 0, w, h);
+	glClearColor(r, gr, b, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+	uint8_t px[4] = {0};
+	glReadPixels(w / 2, h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+	glFinish();
+	uint32_t mem = surface_pixel(g->view_surface, (size_t)w / 2, (size_t)h / 2);
+	bool gl_ok = px[0] == (uint8_t)(r * 255) && px[1] == (uint8_t)(gr * 255) && px[2] == (uint8_t)(b * 255);
+	bool mem_ok = mem == want_bgra;
+	ngl_log("negronigl: layer selftest %s: GL %02x%02x%02x%02x, IOSurface %u BGRA word %08x (want %08x): %s", what,
+	    px[0], px[1], px[2], px[3], g->view_surface ? IOSurfaceGetID(g->view_surface) : 0, mem, want_bgra,
+	    gl_ok && mem_ok ? "ok" : "WRONG");
+	return gl_ok && mem_ok;
+}
+
+int
+ngl_layer_selftest(int w, int h)
+{
+	if (w <= 0 || h <= 0 || !ngl_init()) {
+		return 0;
+	}
+	dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_LAZY | RTLD_GLOBAL);
+	dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_LAZY | RTLD_GLOBAL);
+	ngl_eagl_install();
+	Class lc = objc_getClass("CAEAGLLayer"), ec = objc_getClass("EAGLContext"), tc = objc_getClass("CATransaction");
+	if (lc == Nil || ec == Nil || orig_init == NULL) {
+		ngl_log("negronigl: layer selftest: no CAEAGLLayer/EAGLContext or the shim is not installed");
+		return 0;
+	}
+	void *pool = objc_autoreleasePoolPush();
+	int result = 0;
+	id layer = msg0(msg0((id)lc, "alloc"), "init");
+	((void (*)(id, SEL, struct ngl_cgrect))objc_msgSend)(layer, sel_registerName("setBounds:"),
+	    (struct ngl_cgrect){0, 0, w, h});
+	((void (*)(id, SEL, double))objc_msgSend)(layer, sel_registerName("setContentsScale:"), 1.0);
+	((void (*)(id, SEL, BOOL))objc_msgSend)(layer, sel_registerName("setOpaque:"), YES);
+	const void *keys[] = {CFSTR("EAGLDrawablePropertyRetained"), CFSTR("EAGLDrawablePropertyColorFormat")};
+	const void *vals[] = {kCFBooleanFalse, CFSTR("EAGLColorFormat8888")};
+	CFDictionaryRef props = CFDictionaryCreate(NULL, keys, vals, 2, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setDrawableProperties:"), (id)props);
+	CFRelease(props);
+	id cactx = nil;
+	Class cc = objc_getClass("CAContext");
+	if (cc != Nil && responds((id)cc, "localContext")) {
+		cactx = msg0((id)cc, "localContext");
+		if (responds(cactx, "setLayer:")) {
+			((void (*)(id, SEL, id))objc_msgSend)(cactx, sel_registerName("setLayer:"), layer);
+		}
+	}
+	msg0((id)tc, "flush");
+	id ctx = ((id (*)(id, SEL, NSUInteger, id))objc_msgSend)(msg0((id)ec, "alloc"),
+	    sel_registerName("initWithAPI:properties:"), 3, nil);
+	struct ngl_gli *g = lookup(ctx);
+	if (g == NULL) {
+		ngl_log("negronigl: layer selftest: EAGLContext API 3 is not a Mesa context");
+		msg0(ctx, "release");
+		goto out;
+	}
+	((BOOL (*)(id, SEL, id))objc_msgSend)((id)ec, sel_registerName("setCurrentContext:"), ctx);
+	GLuint fb = 0, rb = 0;
+	glGenFramebuffers(1, &fb);
+	glBindFramebuffer(GL_FRAMEBUFFER, fb);
+	glGenRenderbuffers(1, &rb);
+	glBindRenderbuffer(GL_RENDERBUFFER, rb);
+	SEL st = sel_registerName("renderbufferStorage:fromDrawable:");
+	BOOL stored = ((BOOL (*)(id, SEL, NSUInteger, id))objc_msgSend)(ctx, st, GL_RENDERBUFFER, layer);
+	if (!stored) {
+		ngl_log("negronigl: layer selftest: renderbufferStorage:fromDrawable: NO (%s)",
+		    g->view != NULL ? "drawable attached, no IOSurface" : "no drawable: the layer has no size here");
+		result = -1;
+		goto done;
+	}
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
+	GLint rw = 0, rh = 0;
+	glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &rw);
+	glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &rh);
+	GLenum fbs = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	uint32_t first = g->view_surface ? IOSurfaceGetID(g->view_surface) : 0;
+	ngl_log("negronigl: layer selftest: renderbuffer %u = drawable IOSurface %u, %dx%d, framebuffer %#x", rb, first,
+	    rw, rh, fbs);
+	bool ok = fbs == GL_FRAMEBUFFER_COMPLETE && rw == w && rh == h;
+	ok = layer_frame(g, rw, rh, 0.0f, 1.0f, 0.0f, 0xff00ff00u, "frame 1 green") && ok;
+	SEL pr = sel_registerName("presentRenderbuffer:");
+	BOOL p1 = ((BOOL (*)(id, SEL, NSUInteger))objc_msgSend)(ctx, pr, GL_RENDERBUFFER);
+	uint32_t second = g->view_surface ? IOSurfaceGetID(g->view_surface) : 0;
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rb);
+	ok = layer_frame(g, rw, rh, 0.0f, 0.0f, 1.0f, 0xff0000ffu, "frame 2 blue") && ok;
+	BOOL p2 = ((BOOL (*)(id, SEL, NSUInteger))objc_msgSend)(ctx, pr, GL_RENDERBUFFER);
+	ok = ok && p1 && p2;
+	ngl_log("negronigl: layer selftest %dx%d: present %d %d, drawables IOSurface %u then %u%s: %s", w, h, p1, p2,
+	    first, second, first == second ? " (one buffer)" : "", ok ? "PASS" : "FAIL");
+	result = ok ? 1 : 0;
+done:
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glDeleteFramebuffers(1, &fb);
+	glDeleteRenderbuffers(1, &rb);
+	((BOOL (*)(id, SEL, id))objc_msgSend)((id)ec, sel_registerName("setCurrentContext:"), nil);
+	msg0(ctx, "release");
+out:
+	if (cactx != nil && responds(cactx, "setLayer:")) {
+		((void (*)(id, SEL, id))objc_msgSend)(cactx, sel_registerName("setLayer:"), nil);
+	}
+	msg0(layer, "release");
+	objc_autoreleasePoolPop(pool);
+	return result;
+}
+#endif
