@@ -204,3 +204,21 @@ If the slider does nothing and no `sets ... keys` line appears, CoreBrightness d
   `negronifb_sleep=0` again.
 - The lock delay of ~10 s (iOS sends RequestPowerChange late when CPU rendering lags) comes back with
   the fast-off gone: that is iOS's own timing, not a kernel delay.
+
+## 0275: display off in two ticks (2026-10-26)
+
+[V] On the phone (kernel 0231..0259) every screen-off froze the UI for 7 s: `display off (fade 7055 ms, DCS
+sleep ok)`, and for each of those seconds the FB STAT line showed `late ticks 136` and `swaps/s 0`. The 0251 fade
+halved every pixel of the panel memory once per vsync tick, 7 ticks. The panel memory is mapped write-combined
+(NegroniSurface::kernelAddress): a read is an uncached bus read, so one pass over 1080x2412 pixels took ~1 s on
+the vsync work loop (no vsync notification, no present, CA spinning in SwapWait). A power-key press inside the
+fade reversed it (RequestPowerChange(1) resets fFadeStep) without a `display off` line.
+
+0275: tick 0 waits for the GPU copy, releases the surfaces, stops zero-copy and writes black with 8-byte stores
+(`NEGRONI FB: display off: black in N us`, expected a few thousand); tick 1 calls the backlight (0258: DBV 0,
+DCS 0x28/0x10, `display off (fade N ms, DCS sleep ok)`, N expected <= 25 ms); then the 100 ms slow tick as
+before. The visible fade is the backlight's DBV step. No boot-arg.
+
+Expected log on a screen-off (in this order, within ~30 ms): `display off: black in N us`, `display off (fade
+N ms, DCS sleep ok)`; the FB STAT lines around it keep `late ticks 0`. On the wake: `display on (sleep-out 133 ms,
+DCS ok, panel DBV N)` as with 0258.

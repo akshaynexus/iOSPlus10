@@ -1,0 +1,124 @@
+0275: display off in two vsync ticks (NegroniFramebuffer.cpp; after 0259)
+
+The panel memory is mapped write-combined (NegroniSurface::kernelAddress,
+kIOMapWriteCombineCache): a read of it is an uncached bus read. The 0251 fade
+(7 ticks, each a read-modify-write pass over 1080x2412 pixels) took about 1 s
+per tick on the vsync work loop: log 2026-10-26 "display off (fade 7055 ms)",
+"late ticks 136" + "swaps/s 0" every second of it, backboardd spinning in
+SwapWait (3861 calls/s), the UI frozen for 7 s on every screen-off, and a
+wake during the fade landing in the middle of it.
+
+Now tick 0 waits for the GPU copy, releases the surfaces, stops zero-copy and
+writes black with 8-byte stores (logs "display off: black in N us"); tick 1
+calls the backlight (DBV 0 + DCS sleep, 0258, logs "display off (fade N ms,
+DCS sleep ok)" with N expected <= 25 ms); then the 100 ms slow tick as before.
+A RequestPowerChange(1) in between resets fFadeStep and the next tick redraws.
+Boot-args unchanged.
+
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 0465a02..dbd9869 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -17,9 +17,11 @@
+  *      +0x104 enabled layer mask
+  *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
+  *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
+- *      button / auto-lock), else on. Off fades the panel out over a few
+- *      vsyncs (halving each pixel) and keeps it black until on again;
+- *      the panel itself stays powered (AMOLED black pixels are off).
++ *      button / auto-lock), else on. Off writes the panel memory black on
++ *      the next vsync tick (0275: stores only, ~3 ms; before: 7 read-modify-
++ *      write passes over the write-combined memory, ~1 s each, the work loop
++ *      blocked for 7 s), then the backlight sets DBV 0 and puts the panel to
++ *      sleep (0258) and the tick runs slowly until on again.
+  *   18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+@@ -543,7 +545,7 @@ public:
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+-	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	uint32_t      fFadeStep;      /* off ticks done: 0 black, 1 backlight off, then slow ticks (0275) */
+ 	uint64_t      fOffAt;         /* RequestPowerChange(0) time (0258: fade length in the log) */
+ 	/* GPU present (0231) */
+ 	NegroniSurface *fPendHold[NEGRONI_FB_LAYERS];   /* held surfaces of fPending */
+@@ -820,27 +822,41 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	fb->vrrTick(now);               /* 0259: idle long enough: lower the panel refresh */
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
++		/*
++		 * 0275: off in two ticks. The panel memory is mapped write-combined
++		 * (NegroniSurface::kernelAddress, kIOMapWriteCombineCache): every read of it
++		 * is an uncached bus read, so the 0251 fade (7 ticks, each a read-modify-write
++		 * pass over 2.6 M pixels) took about 1 s per tick with the work loop blocked
++		 * ("fade 7055 ms", "late ticks 136" and "swaps/s 0" each second, backboardd
++		 * spinning in SwapWait, log of 2026-10-26). Now tick 0 lets the GPU's copy
++		 * land, releases the surfaces, stops the zero-copy flip and writes black
++		 * (stores only); tick 1 hands over to the backlight (DBV 0, DCS sleep, 0258).
++		 * The visible fade is the backlight's DBV step. A RequestPowerChange(1) in
++		 * between resets fFadeStep (fDirty: the next tick redraws the frame).
++		 */
+ 		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
++		if (step <= 1) {
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step == 0) {
+-			/* a GPU copy still on its way would paint over the fade */
++			/* a GPU copy still on its way would paint over the black */
+ 			NegroniGPUFenceWait(fb->fLastGPUFence, NEGRONI_FB_GPU_WAIT_MS);
+ 			fb->releaseBusy(false);
+ 		}
+-		fb->zeroCopyStop(true);         /* the fade and the dark panel are in the panel memory */
+-		if (step <= 6) {
++		fb->zeroCopyStop(true);         /* the dark panel is the panel memory */
++		if (step == 0) {
++			uint64_t t0 = mach_absolute_time(), ns;
++			uint32_t words = fb->fWidth / 2;        /* 8-byte stores, even width (1080) */
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++				volatile uint64_t *row = (volatile uint64_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
++				for (uint32_t x = 0; x < words; x++) {
++					row[x] = 0;
+ 				}
+ 			}
+-		}
+-		if (step == 6) {
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			IOLog("NEGRONI FB: display off: black in %u us\n", (uint32_t)(ns / NSEC_PER_USEC));
++		} else if (step == 1) {
+ 			/*
+ 			 * 0258: the panel is black; now DBV 0 and the DCS sleep (backlight work
+ 			 * loop). Under fLock: a RequestPowerChange(1) after the unlock above must
+@@ -858,7 +874,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			vrrRunning = fb->fVrrBusy;
+ 			if (vrrRunning && fb->fVrrOffWait < NEGRONI_VRR_OFF_WAIT_TICKS) {
+ 				fb->fVrrOffWait++;
+-				fb->fFadeStep = 6;      /* this step again next tick */
++				fb->fFadeStep = 1;      /* this step again next tick */
+ 				IOLockUnlock(fb->fLock);
+ 				fb->rearm(sender);
+ 				return;
+@@ -873,7 +889,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			if (vrrRunning) {
+ 				IOLog("NEGRONI FB: display off: VRR set still running after %u ticks\n", fb->fVrrOffWait);
+ 			}
+-		} else if (step > 6) {
++		} else {
+ 			/* 0258: dark and idle: a slow tick (NEGRONI_FB_OFF_TICKS periods, 100 ms) until the wake */
+ 			fb->fDeadline += (NEGRONI_FB_OFF_TICKS - 1) * fb->fTickAbs;
+ 		}
+@@ -2542,7 +2558,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			bool off = args->scalarInput[0] == 0;
+ 			/*
+ 			 * 0258: backboardd's request is the only path to the panel. Off:
+-			 * the vsync fade (7 ticks) runs first, then the backlight sets
++			 * the next tick writes black (0275), the one after has the backlight set
+ 			 * DBV 0 and puts the panel to sleep (negronifb_sleep). On: the
+ 			 * backlight wakes the panel at once and the next tick redraws.
+ 			 */
