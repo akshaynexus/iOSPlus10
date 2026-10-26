@@ -1,7 +1,8 @@
 # Camera support: hardware facts and plan
 
-Status (2026-10-25): offline inventory done (stage 0). No camera hardware has been powered or
-probed from iOS. Target: iOS 16.7.16 (20H392, D22AP identity) on NE2211 / SM8450.
+Status (2026-10-26): levels 1-2 (camcc + CCI0, IMX789 power + chip ID) are code in patches 0310/0311,
+built, not run on the phone (battery flat). Before that: offline inventory (stage 0). Target: iOS 16.7.16
+(20H392, D22AP identity) on NE2211 / SM8450.
 Marks: **[V]** seen (source given), **[I]** inference. Reviewed 2026-10-25
 (`docs/reviews/codex-2026-10-25.md`, section 2a).
 
@@ -130,18 +131,98 @@ Other blocks [V `out/live.dts`, `out/camera/dt-table.txt`]:
 - [I] iOS has no third-party camera plug-in interface (CoreMediaIO DAL / camera extensions are
   macOS only). A custom device node plus our own app can show frames without AppleH10CamIn.
 
-## Staged plan
+## Staged plan (levels, 2026-10-26)
 
-| Stage | Work and exit condition | Estimate [I] | Assessment |
-|---|---|---:|---|
-| 0. Offline inventory | **Done** (this file, `scripts/camera/`). | - | |
-| 1. Sensor power + CCI | Guarded XNU diagnostic (opt-in boot-arg, owner approval) for one fixed-focus sensor: slot 1 (S5KJN1, CCI0 M1) or slot 2 (IMX615, CCI1 M1). Needs: TLMM pin setup, camcc MCLK + CCI clocks and the titan GDSC (new code), RPMh LDO votes (existing code), the CCI controller (new). Read the chip ID only, then power down in reverse order. Exit: repeatable ID read. | 2-4 weeks | Realistic; camcc + CCI are new drivers |
-| 2. CSI-2 receive | First the TPG (`cam-tpg103`) -> CSID -> IFE RDI into memory; then the sensor (4-lane D-PHY, RAW10 = data type 0x2b) through CSIPHY. The camera SMMU context banks (`qcom,cam_smmu`) need IOMMU code. No ICP for RDI [I]. | 4-10 weeks | Research-grade: CSIPHY/CSID/IFE programming, SMMU |
-| 3. Image conversion | Bayer -> RGB on CPU at low resolution; GPU later (depends on the Adreno work). | 1-2 weeks CPU | CPU preview realistic at small sizes |
-| 4. iOS integration | First our own app on a device node. Then an AppleH10CamIn-like service for H10ISP.mediacapture (reverse the D22 kernelcache kext and the plug-in). | 2-4 months+ | Research-grade; no public interface |
-| 5. Still/video, AF/OIS/flash | Exposure/gain (formulas in `com.qti.sensor.*.so`), AF (AK7377), OIS (LC898124/128; `camera.ko` has LC898128 flash-write routines), flash LED (PM8350C), front/rear switch. | 1-3 months after 4 | |
+Each level has one proof point: a log line that only the real hardware can give. Each level is a
+boot-arg value of `negronicam` (default 0: no camera register access). Levels 1-2 are code
+(patches 0310, 0311; `patches/xnu/README-camera.md`); levels 3-5 are a plan. The target is the
+rear main sensor (slot 0, IMX789), as the owner asked. Line references: `out/live.dts` unless named.
 
-Start with one sensor. Defer IMX789 (C-PHY, OIS, five regulators) until a D-PHY sensor streams.
+| Level | Work | Proof point (exit condition) | Status |
+|---|---|---|---|
+| 0 | Offline inventory (`scripts/camera/`) | the table above | done |
+| 1 | GCC camera clocks, camcc titan top GDSC, camcc AHB/CAMNOC/CCI0 clocks at 19.2 MHz TCXO, CCI0 reset | `NEGRONI CAM: level 1 OK: camcc + CCI0 up` after `CCI0 hw version 0x...` (not 0, not all ones) and `CCI0 reset done ack after N us` | code 0310, built, not run |
+| 2 | Slot 0 power-up (5 RPMh rails, reset gpio120, MCLK0 19.2 MHz) in the module-file order, CCI0 M0 pins, chip-ID read, vendor power-down | `NEGRONI CAM: chip id 0x0789 (expected 0x0789, ...): MATCH` then `level 2 OK` | code 0311, built, not run |
+| 3 | CSIPHY1 (C-PHY, 3 trios) + CSID + IFE RDI: one raw frame to memory, no ICP | a RAW10 buffer with a non-constant histogram; CSID packet counter > 0 | plan |
+| 4 | ICP (LX7) firmware through TZ PAS id 33 | `qcom_scm_pas_auth_and_reset(33)` returns 0 and the ICP answers the HFI init | plan |
+| 5 | iOS side: a camera service that applecamerad / CMCapture accept, or our own app | a frame visible in an app | plan |
+
+### Level 1: CAMCC clocks + CCI0 (patch 0310) [V sources, I hardware result]
+
+- [V] Clocks: every camcc source used has a 19.2 MHz TCXO entry (`camcc-waipio.c:955, 988, 1257, 1587, 1926`),
+  so no camcc PLL is needed. The DT asks 37.5 MHz for the CCI (`out/live.dts:22056`, PLL0 even / 16,
+  `camcc-waipio.c:989`); at 19.2 MHz the Linux 19.2 MHz standard-mode timing applies (`i2c-qcom-cci.c:255-265`).
+  Linux selects that table for `qcom,sm8450-cci` (`i2c-qcom-cci.c:871`) when the clock is 19.2 MHz.
+- [V] Order (camera-kernel `cam_cci_init` -> `cam_cpas_start` -> clocks): GCC `gcc_camera_ahb/xo` (critical,
+  `gcc-waipio.c:1859-1915`), `hf_axi`/`sf_axi`; `cam_cc_gdsc_clk` (`camcc-waipio.c:3789`); titan top GDSC
+  (0xadf31dc, `out/live.dts:1015-1024`, timeout 500 us, retain-regs; `gdsc-regulator.c:208-350`); RCGs to TCXO;
+  CPAS branches in DT order (`out/live.dts:22720-22721`), then `cam_cc_cci_0_clk`; CCI version, reset
+  (`CCI_RESET_CMD_RMSK` then 1, `cam_cci_soc.c`), IRQ masks, RD threshold 0x30 (not on v1.2.9), M0 timing.
+- [I] No MMCX vote: the UEFI display keeps MMCX on; a vote from our DRV replaces the UEFI vote for the same DRV.
+  If the GDSC does not turn on, step 3 stops with `GDSC did not power on (MMCX off?)`.
+- [I] No `cam_ahb` interconnect vote: the config NoC is up for the display and UFS. A hang at step 3 or 4
+  (first camcc or CCI access) means a missing NoC/clock vote.
+
+### Level 2: rear main sensor power + chip ID (patch 0311) [V sources, I hardware result]
+
+- [V] Rails, from the sensor node `qcom,cam-sensor0` (`out/live.dts:22204-22238`): `rgltr-min-voltage` =
+  `rgltr-max-voltage` (22221-22222) = cam_vio 1800000, cam_vana 2800000, cam_v_custom1 1800000, cam_vdig 1104000,
+  cam_vaf 2800000 uV; loads (22220) 600 mA, 600, 600, 1200, 600. RPMh nodes: ldoi3 2800000-2904000 (11708-11715),
+  ldoi1 1104000 (11672-11681, HPM above 30 mA), ldoc2 1800000 (11083-11092, HPM above 10 mA), ldoi7
+  2800000-2960000 (11771-11778), ldoi5 1800000 (11738-11747, HPM above 10 mA). ldoi3/ldoi7 have no
+  `qcom,supported-modes`: no mode command. The code refuses a voltage that is not one fixed DT value inside the
+  node range; `negroni_rpmh_cam_rail` accepts only these five resources with these values.
+- [V] Order (module file, `out/camera/modules.txt:49-50`): up VANA, VDIG, VIO, VAF, CUSTOM_REG1 (+0 ms each),
+  RESET high +1 ms, MCLK 19.2 MHz +1 ms; down MCLK off +1 ms, RESET low +1 ms, VAF, CUSTOM_REG1, VIO, VDIG, VANA.
+  The kernel takes this order from the module file (no in-kernel IMX789 table; `oplus_cam_sensor_core.c` only
+  tests `sensor_id == 0x789` at :201).
+- [V] Pins: reset gpio120 requested output-low (`gpio-req-tbl-flags` 0, 22212), MCLK0 gpio100 function 1
+  `cam_mclk` (`pinctrl-waipio.h:1735`), CCI0 gpio110/111 function 1 `cci_i2c` (:1747-1748), pull-up / 2 mA
+  (`out/live.dts:4995-5008`); suspend states 5010-5023, 5945-5957, 6006-6018. As Android
+  (`camera_io_init` after the power-up), the CCI pins turn active only after the rails.
+- [V] Read (`cam_cci_core.c` `cam_cci_read`): queue 1: SET_PARAM (sid 0x1a), LOCK, WRITE_DISABLE_P 0x00 0x16,
+  READ 2, UNLOCK; RD_DONE; FIFO word byte 0 is not data. Expected `chip id 0x0789`.
+- [I] Failure path: every step marks what it turned on before the write; `cam_down` undoes only those, sensor in
+  the vendor power-down order, then CCI IRQs, camcc branches (reverse), GDSC (only when it was off before),
+  GCC AXI. All waits are bounded (GDSC 500 us, branch/RCG 500 us, CCI 100 ms, RPMh 100 ms per vote).
+
+### Level 3: raw frame (plan) [I unless marked]
+
+- [V] Blocks: CSIPHY1 at 0xace6000 (`qcom,csiphy-v2.1.0`, 21909-21932), CSID0-2 `qcom,csid680` (23485-23601),
+  IFE `qcom,vfe680` (23530...), CPAS top 0xac13000 + CAMNOC 0xac19000 (22701-22729). Register sources: camera-kernel
+  `cam_ife_csid680.h`, `cpastop_v680_*.h`, `cam_csiphy` 2.1.0 tables; mainline Linux drives CSID 680 / VFE 680 for
+  x1e80100 (`camss.c:4309-4505`) and is a cleaner reference.
+- [V] IMX789 is **C-PHY**, 3 trios (laneAssign 0x0210, `modules.txt:45`); mainline CAMSS csiphy-3ph code was not
+  checked for C-PHY. A D-PHY sensor (slot 1 S5KJN1 4 lanes CSIPHY2, or slot 3 OV08A10 2 lanes CSIPHY0) is the
+  easier first stream; the level-2 code takes a slot table, so another slot is a data change plus its DT lines.
+- First the test pattern generator (`qcom,cam-tpg103`) -> CSID -> IFE RDI write master, which needs no sensor.
+- DMA: IFE writes go through the apps SMMU (0x15000000, `out/live.dts:15350`), streams 0x800/0x820/0xc00/... mask
+  0x460 (`msm_cam_smmu_ife`, 22583). Reuse the Wi-Fi 0263 `wlan_dma_path` pattern: read SMR/S2CR for the stream;
+  bypass = physical addresses work; fault/translate = needs an SMMU context we own (Gunyah may own the SMMU).
+- Sensor start: the IMX789 init + mode register tables are in `cam_sensor_settings.h:6017` (OnePlus kernel) and the
+  module file; streaming on = register 0x0100 = 1 (Sony convention, [I] for this part).
+
+### Level 4: ICP PAS (plan)
+
+- [V] `lx7_core.c` loads `CAMERA_ICP.mdt` with `qcom_mdt_load` into `camera_region@9f500000` (0x800000,
+  `out/live.dts:184`) and calls `qcom_scm_pas_auth_and_reset(33)` (`lx7_core.h` CAM_FW_PAS_ID).
+- [V] On this phone under UEFI + Gunyah, PAS calls from EL1 are reachable: the GPU zap PAS auth-and-reset returns
+  0 (`docs/notes.md:1259-1260`), and `PAS is supported (adsp)` returns answer 0 for id 1 (notes:1254-1257), which
+  Linux never asks.
+- [I] PAS 33 is not tested. TZ may require the carve-out to be assigned (`qcom_scm_assign_mem`) or protected by
+  the hypervisor; plan: same 0240 steps (mdt + segments into the carve-out, init_image, mem_setup, auth_and_reset)
+  under a separate boot-arg. Only IPE/BPS need the ICP; level 3 raw capture does not.
+
+### Level 5: iOS side (plan) [I]
+
+- Stock path: CMCapture `BWFigCaptureDeviceVendor` looks up the camera driver service by class name
+  (`AppleH10CamIn` / `AppleH13CamIn` strings), and `applecamerad` starts on the IOResources property
+  `applecamerad` and loads ISP firmware. A fake `AppleH10CamIn` IOService must answer the user-client selectors of
+  the D22 kernelcache kext (not reversed yet) with ISP-firmware semantics (frame metadata, buffers, controls).
+  That is the large reverse-engineering part.
+- First realistic target: our own IOService ("NegroniCamera") with a user client that returns one raw/RGB frame
+  (level 3 output, CPU debayer) and a small app that shows it; then decide between the AppleH10CamIn emulation and
+  an app-only camera.
 
 ## Main risks
 
@@ -152,7 +233,10 @@ Start with one sensor. Defer IMX789 (C-PHY, OIS, five regulators) until a D-PHY 
 - AppleH10CamIn emulation may need Apple ISP firmware semantics that do not map to Qualcomm IFE
   output [I].
 - A wrong rail order or voltage can damage a module: use only the rails, values and order in the
-  table above, and power down on every error path.
+  table above, and power down on every error path. 0311 encodes them twice (negroni_cam.c table with DT
+  lines, negroni_rpmh.c whitelist) and refuses any other value.
+- An RPMh timeout poisons the RPMh path for the boot (negroni_rpmh.c): the power-down votes are then refused and
+  rails can stay on until reboot (`WARNING: rails still voted on`). Reboot the phone after such a log.
 
 ## Sources
 

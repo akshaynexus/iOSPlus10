@@ -1,0 +1,472 @@
+Camera level 2 (negronicam=2, default off): rear main IMX789 (slot 0) power-up in the module-file order
+(rails over RPMh with the live-DT voltages, reset gpio120, MCLK0 19.2 MHz), CCI0 M0 chip-ID read of
+register 0x0016 (expected 0x0789), vendor power-down order. negroni_rpmh.c: negroni_rpmh_cam_rail
+(whitelisted rails, enable=0 off command). Details: patches/xnu/README-camera.md.
+
+diff --git a/bsd/dev/negroni_cam.c b/bsd/dev/negroni_cam.c
+index 3766664..4209f07 100644
+--- a/bsd/dev/negroni_cam.c
++++ b/bsd/dev/negroni_cam.c
+@@ -48,6 +48,7 @@
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern kern_return_t thread_terminate(thread_t);
++extern int negroni_rpmh_cam_rail(const char *res, unsigned mv, int mode, bool on);
+ void negroni_cam_init(void);
+ 
+ #define say(fmt, ...)   printf("NEGRONI CAM: " fmt "\n", ##__VA_ARGS__)
+@@ -74,6 +75,8 @@ void negroni_cam_init(void);
+ #define CC_CPAS_FAST_AHB_CBCR 0x1316cu  /* camcc:2159 */
+ #define CC_CAMNOC_AXI_CBCR    0x131acu  /* camcc:2033 */
+ #define CC_CCI0_CBCR          0x13144u  /* camcc:2069 */
++#define CC_MCLK0        0x15000u        /* RCG (camcc:1594), parent_map_1 source 0 = TCXO (camcc:830) */
++#define CC_MCLK0_CBCR   0x15018u        /* BRANCH_HALT (camcc:2951) */
+ 
+ /* RCG2 (rcg:27-43) and branch (branch:47) bits */
+ #define RCG_CMD_UPDATE  (1u << 0)
+@@ -127,7 +130,7 @@ void negroni_cam_init(void);
+ #define CCI_RD_THRESHOLD_VALUE  0x30u
+ #define CCI_TIMEOUT_US  100000u
+ #define CCI_MASTER      0u              /* slot 0 cci-master 0 (live.dts:22210) */
+-#define CAM_MAX_LEVEL   1u
++#define CAM_MAX_LEVEL   2u         /* cci-up CCI_TIMEOUT 100 ms (cci-dn uses 1500 ms) */
+ /* cam_cci_dev.h:242-253 enum cci_i2c_cmd_type */
+ #define CCI_CMD_SET_PARAM       1u
+ #define CCI_CMD_LOCK            6u
+@@ -140,6 +143,68 @@ static const struct {
+ 	uint16_t thigh, tlow, tsu_sto, tsu_sta, thd_dat, thd_sta, tbuf, trdhld, tsp;
+ } cci_t = { 78, 114, 28, 28, 10, 77, 118, 6, 1 };
+ 
++/* TLMM (live.dts:1530 reg 0xf000000; pinctrl-waipio.h:13-14 REG_BASE 0x100000, REG_SIZE 0x1000) */
++#define TLMM_PA         0x0f100000UL
++#define TLMM_FIRST      100u            /* one map for gpio100..gpio120 */
++#define TLMM_LAST       120u
++#define TLMM_CFG(func, pull, out)  ((func) << 2 | (pull) | ((out) ? 1u << 9 : 0))   /* drive 2 mA = 0 */
++#define PULL_NONE       0u
++#define PULL_DOWN       1u
++#define PULL_UP         3u              /* pinctrl-msm.c:330-333 MSM_PULL_DOWN 1, MSM_PULL_UP 3 */
++#define TLMM_EGPIO_PRESENT (1u << 11)
++#define TLMM_EGPIO_ENABLE  (1u << 12)
++
++/*
++ * Slot 0 = rear main, Sony IMX789 (live.dts:22204-22238 qcom,cam-sensor0, cell-index 0).
++ * cci-master 0 (live.dts:22210), CCI0 pins gpio110/gpio111 function cci_i2c (pinctrl-waipio.h:1747-1748
++ * f1), active: pull-up, 2 mA; suspend: pull-down (live.dts:4995-5023 cci0_active/cci0_suspend).
++ * MCLK0 gpio100 function cam_mclk (pinctrl-waipio.h:1735 f1), active: no pull, suspend: pull-down
++ * (live.dts:5991-6018); camcc id 0x4c = CAM_CC_MCLK0_CLK (live.dts:22209).
++ * Reset gpio120 (live.dts:22215 gpios <tlmm 0x78>), requested output-low (gpio-req-tbl-flags 0,
++ * live.dts:22212), active: gpio, no pull; suspend: output-low, pull-down (live.dts:5930-5957).
++ * Sensor: 8-bit 0x34 = 7-bit 0x1a, chip ID 0x0789 at 0x0016, 2-byte address and data (module:44);
++ * the OnePlus kernel tests sensor_id == 0x789 (oplus_cam_sensor_core.c:201).
++ */
++#define PIN_MCLK0       100u
++#define PIN_CCI0_SDA    110u
++#define PIN_CCI0_SCL    111u
++#define PIN_RESET0      120u
++#define SENSOR_SID      0x1au
++#define SENSOR_ID_REG   0x0016u
++#define SENSOR_ID       0x0789u
++#define CCI_READ_TRIES  3u              /* cam_cci_dev.h CCI_I2C_READ_MAX_RETRIES */
++
++/*
++ * Sensor rails in the power-up order of the module file (module:49:
++ * VANA, VDIG, VIO, VAF, CUSTOM_REG1, all "+0 ms"). Sensor values (live.dts:22220-22224, index =
++ * regulator-names order cam_vio, cam_vana, cam_v_custom1, cam_vdig, cam_clk, cam_vaf):
++ *   rgltr-min-voltage = rgltr-max-voltage = 1800000 2800000 1800000 1104000 0 2800000 (22221, 22222)
++ *   rgltr-load-current = 600000 600000 600000 1200000 0 600000 uA (22220)
++ * Supplies (live.dts:22225-22230) and the RPMh regulator nodes (resource, min/max, modes):
++ *   cam_vana  0x610 pm8010i_l3 "ldoi3" 11708, 2800000-2904000 11714-11715, no qcom,supported-modes
++ *   cam_vdig  0x60e pm8010i_l1 "ldoi1" 11672, 1104000-1104000 11680-11681, HPM above 30000 uA 11675
++ *   cam_vio   0x33e pm8350c_l2 "ldoc2" 11083, 1800000-1800000 11091-11092, HPM above 10000 uA 11086
++ *   cam_vaf   0x614 pm8010i_l7 "ldoi7" 11771, 2800000-2960000 11777-11778, no qcom,supported-modes
++ *   cam_v_custom1 0x612 pm8010i_l5 "ldoi5" 11738, 1800000-1800000 11746-11747, HPM above 10000 uA 11741
++ * mode: -1 = no mode command (no supported modes in the DT); 7 = PMIC5 LDO HPM
++ * (rpmh-regulator.c:287), chosen because the load is above the threshold (qcom,supported-modes
++ * <LPM HPM>, include/dt-bindings/regulator/qcom,rpmh-regulator-levels.h:69-71).
++ * pm8350c_l2 (cam_vio) has only camera consumers in the live DT (12 cam_vio-supply references).
++ */
++struct cam_rail {
++	const char *name, *res;
++	uint32_t uv, rail_min, rail_max, load_ua, hpm_ua;       /* hpm_ua 0 = no modes */
++};
++static const struct cam_rail rails[] = {
++	{ "cam_vana", "ldoi3", 2800000, 2800000, 2904000, 600000, 0 },
++	{ "cam_vdig", "ldoi1", 1104000, 1104000, 1104000, 1200000, 30000 },
++	{ "cam_vio", "ldoc2", 1800000, 1800000, 1800000, 600000, 10000 },
++	{ "cam_vaf", "ldoi7", 2800000, 2800000, 2960000, 600000, 0 },
++	{ "cam_v_custom1", "ldoi5", 1800000, 1800000, 1800000, 600000, 10000 },
++};
++#define NRAILS          (sizeof(rails) / sizeof(rails[0]))
++/* power-down order (module:50): MCLK, RESET, VAF, CUSTOM_REG1, VIO, VDIG, VANA (rails[] indices) */
++static const unsigned rails_down[NRAILS] = { 3, 4, 2, 1, 0 };
+ 
+ static uint32_t level, pause_ms, step;
+ static const char *step_name = "";
+@@ -148,6 +213,9 @@ static vm_offset_t gcc, camcc, cci;
+ /* what this file turned on (the power-down path undoes only these) */
+ static bool hf_ours, sf_ours, gdsc_ours, cci_irq_on;
+ static uint32_t branches_on;            /* bit per cc_branches[] entry */
++static vm_offset_t tlmm;
++static bool pins_sensor, pins_cci, reset_high, mclk_on;
++static uint32_t rails_on;               /* bit per rails[] entry */
+ 
+ static const struct {
+ 	const char *name;
+@@ -346,6 +414,120 @@ cci_init(uint32_t m)
+ 	return true;
+ }
+ 
++/* halt + reset of one master after an error or a timeout (cam_cci_core.c flush / ISR halt-ack path) */
++static void
++cci_recover(uint32_t m)
++{
++	uint32_t got = 0;
++	wr(cci + CCI_HALT_REQ, 1u << m);
++	bool ok = poll(cci + CCI_IRQ_STATUS_0, CCI_HALT_ACK(m), CCI_HALT_ACK(m), CCI_TIMEOUT_US, &got);
++	say("  CCI0 M%u halt %s (irq status %#x)", m, ok ? "acked" : "NOT acked", got);
++	cci_irq_clear(got);
++	(void)cci_reset(m ? CCI_RESET_M1 : CCI_RESET_M0, NULL);
++	cci_timing(m);
++}
++
++/*
++ * One register read, as cam_cci_read (cam_cci_core.c): queue 1 gets SET_PARAM (sid), LOCK,
++ * WRITE_DISABLE_P (register, MSB first, no STOP), READ n, UNLOCK; then EXEC_WORD_CNT, QUEUE_START and
++ * RD_DONE. The first byte of READ_DATA is not data. Returns 0, ENXIO (NACK), EIO, ETIMEDOUT, EBUSY.
++ */
++static int
++cci_read16(uint32_t m, uint32_t sid, uint32_t reg, uint32_t *value)
++{
++	const uint32_t q = 1;
++	uint32_t got = 0, cnt = rd(cci + CCI_MQ_CUR_CNT(m, q));
++
++	if (cnt != 0) {
++		say("  CCI0 M%u Q%u not empty (%u words)", m, q, cnt);
++		return EBUSY;
++	}
++	cci_irq_clear(CCI_IRQ_MASK_0_ALL);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_SET_PARAM | sid << 4);      /* retries 0, id_map 0 */
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_LOCK);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_WRITE_DISABLE_P | 2u << 4 | ((reg >> 8) & 0xffu) << 8 | (reg & 0xffu) << 16);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_READ | 2u << 4);
++	wr(cci + CCI_MQ_LOAD(m, q), CCI_CMD_UNLOCK);
++	cnt = rd(cci + CCI_MQ_CUR_CNT(m, q));
++	wr(cci + CCI_MQ_EXEC_CNT(m, q), cnt);
++	wr(cci + CCI_QUEUE_START, 1u << (m * 2 + q));
++	bool done = false;
++	for (uint32_t us = 0; us <= CCI_TIMEOUT_US; us++) {
++		got = rd(cci + CCI_IRQ_STATUS_0);
++		if (got & (CCI_RD_DONE(m) | CCI_ERROR(m))) {
++			done = true;
++			break;
++		}
++		delay(1);
++	}
++	if (!done || (got & CCI_ERROR(m))) {
++		say("  CCI0 M%u read sid %#x reg %#06x: %s, irq status %#x, %u words queued", m, sid, reg,
++		    !done ? "timeout" : (got & CCI_NACK(m)) ? "NACK" : "error", got, cnt);
++		cci_irq_clear(got);
++		cci_recover(m);
++		return !done ? ETIMEDOUT : (got & CCI_NACK(m)) ? ENXIO : EIO;
++	}
++	uint32_t words = rd(cci + CCI_M_READ_LEVEL(m));
++	if (words != 1) {               /* num_byte / 4 + 1 */
++		say("  CCI0 M%u read: %u words in the FIFO, 1 expected", m, words);
++		for (uint32_t i = 0; i < words && i < 64; i++) {
++			(void)rd(cci + CCI_M_READ_DATA(m));
++		}
++		cci_irq_clear(got);
++		return EIO;
++	}
++	uint32_t data = rd(cci + CCI_M_READ_DATA(m));
++	cci_irq_clear(got);
++	*value = ((data >> 8) & 0xffu) << 8 | ((data >> 16) & 0xffu);
++	say("  CCI0 M%u read sid %#x reg %#06x: data word %#010x -> %#06x", m, sid, reg, data, *value);
++	return 0;
++}
++
++/* ---- pins ---- */
++
++static void
++tlmm_set(uint32_t pin, uint32_t cfg, int out)
++{
++	vm_offset_t p = tlmm + (vm_offset_t)(pin - TLMM_FIRST) * 0x1000u;
++	if (out >= 0) {
++		wr(p + 4, out ? 2u : 0u);       /* io: out bit 1 (pinctrl-waipio.h out_bit) */
++	}
++	if (rd(p) & TLMM_EGPIO_PRESENT) {
++		cfg |= TLMM_EGPIO_ENABLE;       /* as negroni_wifi.c tlmm_cfg */
++	}
++	wr(p, cfg);
++	say("  gpio%u cfg %#x io %#x", pin, rd(p), rd(p + 4));
++}
++
++/* ---- rails ---- */
++
++static int
++rail_vote(const struct cam_rail *r, bool on)
++{
++	int mode = -1;
++	if (on) {
++		/* refuse anything that is not one fixed DT voltage inside the regulator node range */
++		if (r->uv == 0 || r->uv < r->rail_min || r->uv > r->rail_max || r->uv % 1000u) {
++			say("  %s (%s): REFUSED: %u uV is not a DT value inside %u-%u uV", r->name, r->res, r->uv,
++			    r->rail_min, r->rail_max);
++			return EINVAL;
++		}
++		if (r->hpm_ua) {
++			mode = r->load_ua >= r->hpm_ua ? 7 : 4;  /* PMIC5 LDO HPM / LPM (rpmh-regulator.c:286-287) */
++		}
++	}
++	int error = EBUSY;
++	/* the RPMh try-lock is shared with touch/Wi-Fi/ADSP votes: retry EBUSY up to 1 s (as 0240 rail_vote) */
++	for (unsigned i = 0; i < 100 && error == EBUSY; i++) {
++		error = negroni_rpmh_cam_rail(r->res, r->uv / 1000u, mode, on);
++		if (error == EBUSY) {
++			delay(10000);
++		}
++	}
++	say("  %s (%s) %s %u mV mode %d: %s (errno %d)", r->name, r->res, on ? "on" : "off", r->uv / 1000u, mode,
++	    error ? "FAILED" : "ok", error);
++	return error;
++}
+ 
+ /* ---- power down: the reverse of what is on, sensor in the vendor order (module:50) ---- */
+ 
+@@ -353,6 +535,38 @@ static void
+ cam_down(void)
+ {
+ 	say("power down");
++	if (pins_cci) {
++		tlmm_set(PIN_CCI0_SDA, TLMM_CFG(1u, PULL_DOWN, false), -1);      /* cci0_suspend */
++		tlmm_set(PIN_CCI0_SCL, TLMM_CFG(1u, PULL_DOWN, false), -1);
++		pins_cci = false;
++	}
++	if (mclk_on) {
++		(void)branch_set("cam_cc_mclk0_clk", camcc + CC_MCLK0_CBCR, false, true);
++		mclk_on = false;
++		delay(1000);                    /* MCLK=0Hz+1ms */
++	}
++	if (pins_sensor) {
++		tlmm_set(PIN_MCLK0, TLMM_CFG(1u, PULL_DOWN, false), -1);         /* mclk0_suspend */
++	}
++	if (reset_high || pins_sensor) {
++		tlmm_set(PIN_RESET0, TLMM_CFG(0u, PULL_DOWN, true), 0);          /* reset_suspend: output-low */
++		if (reset_high) {
++			delay(1000);            /* RESET=0+1ms */
++		}
++		reset_high = false;
++		pins_sensor = false;
++	}
++	for (unsigned k = 0; k < NRAILS; k++) {
++		unsigned i = rails_down[k];
++		if (rails_on & (1u << i)) {
++			if (rail_vote(&rails[i], false) == 0) {
++				rails_on &= ~(1u << i);
++			}
++		}
++	}
++	if (rails_on) {
++		say("WARNING: rails still voted on: mask %#x", rails_on);
++	}
+ 	if (cci_irq_on) {
+ 		wr(cci + CCI_IRQ_MASK_0, 0);
+ 		wr(cci + CCI_IRQ_MASK_1, 0);
+@@ -392,6 +606,13 @@ l1_map(void)
+ 	gcc = ml_io_map_unmappable(GCC_CAM_PA, 0x1000, CAM_WIMG_IO);
+ 	camcc = ml_io_map_unmappable(CAMCC_PA, CAMCC_SIZE, CAM_WIMG_IO);
+ 	cci = ml_io_map_unmappable(CCI0_PA, 0x1000, CAM_WIMG_IO);
++	if (level >= 2) {
++		tlmm = ml_io_map_unmappable(TLMM_PA + TLMM_FIRST * 0x1000u, (TLMM_LAST - TLMM_FIRST + 1) * 0x1000u,
++		    CAM_WIMG_IO);
++		if (!tlmm) {
++			return step_fail("TLMM map");
++		}
++	}
+ 	if (!gcc || !camcc || !cci) {
+ 		return step_fail("ml_io_map_unmappable returned 0");
+ 	}
+@@ -504,6 +725,97 @@ l1_cci(void)
+ 	return step_ok();
+ }
+ 
++/* ---- level 2 steps (sensor slot 0) ---- */
++
++static bool
++l2_pins(void)
++{
++	step_begin("sensor pins");
++	/* gpio request: reset output-low (flags 0); pinctrl cam_default: reset gpio no pull, MCLK cam_mclk */
++	pins_sensor = true;
++	tlmm_set(PIN_RESET0, TLMM_CFG(0u, PULL_NONE, true), 0);
++	tlmm_set(PIN_MCLK0, TLMM_CFG(1u, PULL_NONE, false), -1);
++	return step_ok();
++}
++
++static bool
++l2_rails(void)
++{
++	step_begin("sensor rails");
++	for (unsigned i = 0; i < NRAILS; i++) {
++		rails_on |= 1u << i;    /* an uncertain vote is undone too */
++		if (rail_vote(&rails[i], true)) {
++			return step_fail(rails[i].name);
++		}
++		/* module:49: every rail "+0 ms" (the RPMh vote waits for the AOP ack) */
++	}
++	return step_ok();
++}
++
++static bool
++l2_reset(void)
++{
++	step_begin("sensor reset high");
++	reset_high = true;
++	tlmm_set(PIN_RESET0, TLMM_CFG(0u, PULL_NONE, true), 1);
++	delay(1000);                            /* RESET=1+1ms */
++	return step_ok();
++}
++
++static bool
++l2_mclk(void)
++{
++	step_begin("mclk0 19.2 MHz");
++	if (!rcg_to_xo("cam_cc_mclk0_clk_src", CC_MCLK0)) {
++		return step_fail("RCG update");
++	}
++	mclk_on = true;
++	if (!branch_set("cam_cc_mclk0_clk", camcc + CC_MCLK0_CBCR, true, true)) {
++		return step_fail("MCLK branch did not start");
++	}
++	delay(1000);                            /* MCLK=19200000Hz+1ms */
++	return step_ok();
++}
++
++static bool
++l2_cci_pins(void)
++{
++	step_begin("cci0 m0 pins + reset");
++	/* camera_io_init after the power-up (cam_sensor_core.c): pinctrl m0_active, then the master reset */
++	pins_cci = true;
++	tlmm_set(PIN_CCI0_SDA, TLMM_CFG(1u, PULL_UP, false), -1);
++	tlmm_set(PIN_CCI0_SCL, TLMM_CFG(1u, PULL_UP, false), -1);
++	if (!cci_reset(CCI_RESET_M0, NULL)) {
++		return step_fail("no master reset ack");
++	}
++	cci_timing(CCI_MASTER);
++	return step_ok();
++}
++
++static bool
++l2_chip_id(void)
++{
++	step_begin("chip id");
++	uint32_t id = 0;
++	int error = EIO;
++	for (unsigned t = 1; t <= CCI_READ_TRIES; t++) {
++		error = cci_read16(CCI_MASTER, SENSOR_SID, SENSOR_ID_REG, &id);
++		if (!error) {
++			break;
++		}
++		say("  try %u/%u: errno %d", t, CCI_READ_TRIES, error);
++		delay(1000);
++	}
++	if (error) {
++		return step_fail(error == ENXIO ? "sensor NACK" : "CCI read");
++	}
++	say("chip id %#06x (expected %#06x, IMX789 slot 0 CCI0 M0 sid %#x reg %#06x): %s", id, SENSOR_ID,
++	    SENSOR_SID, SENSOR_ID_REG, id == SENSOR_ID ? "MATCH" : "MISMATCH");
++	if (id != SENSOR_ID) {
++		return step_fail("wrong chip id");
++	}
++	return step_ok();
++}
+ 
+ static void
+ cam_thread(void *arg __unused, wait_result_t wr_ __unused)
+@@ -512,6 +824,12 @@ cam_thread(void *arg __unused, wait_result_t wr_ __unused)
+ 	if (ok) {
+ 		say("level 1 OK: camcc + CCI0 up");
+ 	}
++	if (ok && level >= 2) {
++		ok = l2_pins() && l2_rails() && l2_reset() && l2_mclk() && l2_cci_pins() && l2_chip_id();
++		if (ok) {
++			say("level 2 OK: IMX789 answered on CCI0 M0");
++		}
++	}
+ 	if (gcc && camcc && cci) {
+ 		cam_down();
+ 	}
+diff --git a/bsd/dev/negroni_rpmh.c b/bsd/dev/negroni_rpmh.c
+index 34d7fe3..d1bb06c 100644
+--- a/bsd/dev/negroni_rpmh.c
++++ b/bsd/dev/negroni_rpmh.c
+@@ -50,6 +50,7 @@ int negroni_rpmh_arc_vote(const char *res, unsigned level);
+ #define RH_VRM          4u
+ #define RH_ARC          3u
+ #define RH_MODE_ARC     (-2)    /* rh_send: one ARC command, data = level index (hlvl) */
++#define RH_MODE_OFF     (-3)    /* rh_send: one VRM command, enable (+4) = 0 (0311 camera power-down) */
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_db;
+@@ -282,13 +283,18 @@ rh_send(uint32_t address, unsigned mv, int mode)
+ 	unsigned ncmd = 3;
+ 	if (mode == RH_MODE_ARC) {
+ 		ncmd = 1;               /* ARC (rpmhpd): +0 = level index */
++	} else if (mode == RH_MODE_OFF) {
++		offsets[0] = 4;         /* VRM enable = 0: drops only this DRV's enable vote */
++		values[0] = 0;
++		ncmd = 1;
+ 	} else if (mode < 0) {
+ 		offsets[1] = 4;
+ 		values[1] = 1;
+ 		ncmd = 2;
+ 	}
+ 	uint32_t cmdmask = (1u << ncmd) - 1u;
+-	printf("NEGRONI RPMH: TCS%u ACTIVE %u mV mode=%d enable=1 irq-enable=%#x\n", t, mv, mode, irq_en);
++	printf("NEGRONI RPMH: TCS%u ACTIVE %u mV mode=%d enable=%u irq-enable=%#x\n", t, mv, mode,
++	    mode == RH_MODE_OFF ? 0u : 1u, irq_en);
+ 	for (unsigned c = 0; c < ncmd; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+@@ -396,6 +402,40 @@ negroni_rpmh_wifi_enable(const char *res, unsigned mv)
+ 	return EINVAL;
+ }
+ 
++/*
++ * 0311 (iOSPlus10): camera sensor rails of slot 0 (IMX789; bsd/dev/negroni_cam.c has the live DT lines).
++ * Only these resources, each with its one DT voltage and mode, are accepted: on = voltage (+ mode) +
++ * enable; off = enable 0 only (any voltage/mode argument is ignored).
++ */
++int negroni_rpmh_cam_rail(const char *res, unsigned mv, int mode, bool on);
++
++int
++negroni_rpmh_cam_rail(const char *res, unsigned mv, int mode, bool on)
++{
++	static const struct { const char *name; unsigned mv; int mode; } rails[] = {
++		{ "ldoi3", 2800, -1 },  /* cam_vana pm8010i_l3, no modes */
++		{ "ldoi1", 1104, 7 },   /* cam_vdig pm8010i_l1, HPM */
++		{ "ldoc2", 1800, 7 },   /* cam_vio pm8350c_l2, HPM */
++		{ "ldoi7", 2800, -1 },  /* cam_vaf pm8010i_l7, no modes */
++		{ "ldoi5", 1800, 7 },   /* cam_v_custom1 pm8010i_l5, HPM */
++	};
++	for (unsigned i = 0; res && i < sizeof(rails) / sizeof(rails[0]); i++) {
++		if (strcmp(res, rails[i].name)) {
++			continue;
++		}
++		if (!on) {
++			return rh_vreg_enable(res, 0, RH_MODE_OFF);
++		}
++		if (mv == rails[i].mv && mode == rails[i].mode) {
++			return rh_vreg_enable(res, mv, mode);
++		}
++		printf("NEGRONI RPMH: camera rail %s: %u mV mode %d refused (allowed %u mV mode %d)\n", res, mv, mode,
++		    rails[i].mv, rails[i].mode);
++		return EINVAL;
++	}
++	return EINVAL;
++}
++
+ /*
+  * ARC (rpmhpd) resource: address and the level index (hlvl) of the first cmd-db
+  * level >= `level` (Linux rpmhpd_update_level_mapping / rpmhpd_aggregate_corner).

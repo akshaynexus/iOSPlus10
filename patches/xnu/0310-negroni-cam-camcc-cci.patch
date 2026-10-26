@@ -1,0 +1,583 @@
+Camera level 1 (negronicam=1, default off): GCC camera clocks, camcc titan top GDSC, camcc AHB/CAMNOC/CCI0
+clocks from the 19.2 MHz TCXO and a CCI0 reset; proof = CCI hw version + reset-done ack; then all off.
+New bsd/dev/negroni_cam.c (own thread). Details: patches/xnu/README-camera.md, docs/camera-plan.md.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 669f967..dd330e2 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/negroni_touch.c			standard
+ bsd/dev/negroni_cpufreq.c		standard
+ bsd/dev/negroni_thermal.c		standard
+ bsd/dev/negroni_haptic.c		standard
++bsd/dev/negroni_cam.c			standard
+ bsd/dev/negroni_adreno.c		standard
+ bsd/dev/negroni_wifi.c			standard
+ bsd/dev/negroni_wlan.c			standard
+diff --git a/bsd/dev/negroni_cam.c b/bsd/dev/negroni_cam.c
+new file mode 100644
+index 0000000..3766664
+--- /dev/null
++++ b/bsd/dev/negroni_cam.c
+@@ -0,0 +1,541 @@
++/*
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450 "waipio"): camera bring-up, levels 1 and 2 (patches 0310, 0311).
++ *
++ * Boot-arg negronicam (default 0 = no camera register access at all):
++ *   1  level 1 (0310): GCC camera clocks, camcc titan top GDSC, camcc AHB/CAMNOC/CCI0 clocks from the
++ *      19.2 MHz TCXO, CCI0 controller reset. Proof: CCI hardware version + reset-done ack. Then all off.
++ *   2  level 2 (0311): level 1 + the rear main sensor (slot 0, Sony IMX789) power-up sequence, CCI0
++ *      master 0 pins, chip-ID read (7-bit 0x1a, register 0x0016, 2 bytes, expected 0x0789), then the
++ *      vendor power-down sequence and level 1 off. Nothing stays powered.
++ *   negronicam_pause=N  ms between steps (default 0, max 2000), for a camera on the screen log.
++ * Every step logs "NEGRONI CAM: step N NAME" and "... ok (T us)" or "... failed: reason". A failure
++ * powers down, in the vendor order, everything this file turned on; every wait is bounded.
++ * Runs in its own kernel thread: boot does not wait for it.
++ *
++ * Sources ([V], file:line):
++ *   live.dts  out/live.dts (dtc of ~/op10-backup/device/live.dtb, the phone's running DT)
++ *   camcc     OnePlus kernel drivers/clk/qcom/camcc-waipio.c (out/src/op-kernel, e9da592)
++ *   gcc       OnePlus kernel drivers/clk/qcom/gcc-waipio.c
++ *   gdsc      OnePlus kernel drivers/clk/qcom/gdsc-regulator.c
++ *   branch    OnePlus kernel drivers/clk/qcom/clk-branch.c, rcg = clk-rcg2.c
++ *   pinctrl   OnePlus kernel drivers/pinctrl/qcom/pinctrl-waipio.h, pinctrl-msm.c
++ *   cci-dn    OnePlus camera-kernel drivers/cam_sensor_module/cam_cci/ (out/src/op-modules):
++ *             cam_cci_hwreg.h, cam_cci_dev.h, cam_cci_soc.c, cam_cci_core.c
++ *   cci-up    Linux drivers/i2c/busses/i2c-qcom-cci.c (out/src/linux, torvalds 5b0764a)
++ *   module    /odm/lib64/camera/com.qti.sensormodule.waipio.semco_imx789_MP.bin, decoded by
++ *             scripts/camera/cammodule.py into out/camera/modules.txt:43-50
++ *
++ * Clock choice: every camcc source used here has a 19.2 MHz TCXO entry F(19200000, P_BI_TCXO, 1, 0, 0)
++ * (camcc:955 camnoc_axi, 988 cci, 1257 fast_ahb, 1587 mclk, 1926 slow_ahb), so no camcc PLL is
++ * programmed. The DT asks 37.5 MHz (PLL0) for the CCI (live.dts:22056); at 19.2 MHz this file uses the
++ * Linux 19.2 MHz standard-mode (100 kHz) timing (cci-up:255-265), the table that Linux also selects
++ * for "qcom,sm8450-cci" (cci-up:871) when the CCI clock is 19.2 MHz. MCLK 19.2 MHz is the DT rate
++ * (live.dts:22206 clock-rates 0x124f800).
++ * No MMCX/MXA ARC vote [I]: the UEFI display keeps MMCX up, and a lower vote from this DRV would
++ * replace that vote and could stop the display. When the titan GDSC does not power on, the run stops.
++ * No interconnect (cam_ahb) vote [I]: the config NoC is up for the display and UFS. The CCI is polled;
++ * its GIC line (SPI 0x1cc, live.dts:22061) stays disabled.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);
++void negroni_cam_init(void);
++
++#define say(fmt, ...)   printf("NEGRONI CAM: " fmt "\n", ##__VA_ARGS__)
++#define CAM_WIMG_IO     0x7u            /* VM_WIMG_IO; kernel_map VA, not io_submap (patch 0290) */
++
++/* GCC camera branches (gcc:1859-1915); the GCC is at 0x100000 */
++#define GCC_CAM_PA      0x00136000UL
++#define GCC_CAMERA_AHB  0x004u          /* 0x36004, CLK_IS_CRITICAL, BRANCH_HALT_DELAY (gcc:1860) */
++#define GCC_CAMERA_HF   0x010u          /* 0x36010, BRANCH_HALT_SKIP (gcc:1876) */
++#define GCC_CAMERA_SF   0x018u          /* 0x36018, BRANCH_HALT_SKIP (gcc:1891) */
++#define GCC_CAMERA_XO   0x020u          /* 0x36020, CLK_IS_CRITICAL, BRANCH_HALT_DELAY (gcc:1906) */
++
++/* camcc (live.dts:831-833 clock-controller@ade0000, reg <0xade0000 0x20000>) */
++#define CAMCC_PA        0x0ade0000UL
++#define CAMCC_SIZE      0x20000UL
++#define CC_GDSC_CLK     0x1320cu        /* cam_cc_gdsc_clk, kept on by the camcc probe (camcc:3789) */
++#define CC_TITAN_GDSCR  0x131dcu        /* cam_cc_titan_top_gdsc, live.dts:1018-1019 reg 0xadf31dc */
++#define CC_SLOW_AHB     0x10034u        /* RCG cmd_rcgr (camcc:1932) */
++#define CC_FAST_AHB     0x10018u        /* camcc:1266 */
++#define CC_CAMNOC_AXI   0x13194u        /* camcc:962 */
++#define CC_CCI0         0x1312cu        /* camcc:994 */
++#define CC_CPAS_AHB_CBCR      0x13164u  /* BRANCH_HALT (camcc:2123) */
++#define CC_CORE_AHB_CBCR      0x131f0u  /* BRANCH_HALT_DELAY (camcc:2105) */
++#define CC_CPAS_FAST_AHB_CBCR 0x1316cu  /* camcc:2159 */
++#define CC_CAMNOC_AXI_CBCR    0x131acu  /* camcc:2033 */
++#define CC_CCI0_CBCR          0x13144u  /* camcc:2069 */
++
++/* RCG2 (rcg:27-43) and branch (branch:47) bits */
++#define RCG_CMD_UPDATE  (1u << 0)
++#define RCG_CMD_ROOT_EN (1u << 1)
++#define RCG_CFG_MASK    (0x1fu | 0x7u << 8 | 0x3u << 12)        /* divider, source, MND mode */
++#define CBCR_ENABLE     (1u << 0)
++#define CBCR_OFF        (1u << 31)
++#define CBCR_HWCG       (1u << 1)       /* HWCG_EN (clk-branch.c clk_branch_in_hwcg_mode) */
++
++/* GDSC (gdsc:30-36, 49); live.dts:1021 qcom,gds-timeout 0x1f4 = 500 us, 1023 qcom,retain-regs */
++#define GDSC_SW_COLLAPSE (1u << 0)
++#define GDSC_HW_CONTROL  (1u << 1)
++#define GDSC_RETAIN_FF   (1u << 11)
++#define GDSC_PWR_ON      (1u << 31)
++#define GDSC_TIMEOUT_US  500u
++
++/* CCI0 (live.dts:22044-22067: reg <0xac15000 0x1000>, cell-index 0); registers cci-dn cam_cci_hwreg.h */
++#define CCI0_PA         0x0ac15000UL
++#define CCI_HW_VERSION  0x000u
++#define CCI_RESET_CMD   0x004u
++#define CCI_RESET_ALL   0x0f73f3f7u     /* CCI_RESET_CMD_RMSK */
++#define CCI_RESET_M0    0x3f1u
++#define CCI_RESET_M1    0x3f001u
++#define CCI_QUEUE_START 0x008u
++#define CCI_HALT_REQ    0x034u
++#define CCI_M_SCL_CTL(m)        (0x100u + 0x100u * (m))
++#define CCI_M_SDA_CTL_0(m)      (0x104u + 0x100u * (m))
++#define CCI_M_SDA_CTL_1(m)      (0x108u + 0x100u * (m))
++#define CCI_M_SDA_CTL_2(m)      (0x10cu + 0x100u * (m))
++#define CCI_M_MISC_CTL(m)       (0x110u + 0x100u * (m))
++#define CCI_M_READ_DATA(m)      (0x118u + 0x100u * (m))
++#define CCI_M_READ_LEVEL(m)     (0x11cu + 0x100u * (m))
++#define CCI_M_RD_THRESHOLD(m)   (0x120u + 0x100u * (m))
++#define CCI_MQ_EXEC_CNT(m, q)   (0x300u + 0x200u * (m) + 0x100u * (q))
++#define CCI_MQ_CUR_CNT(m, q)    (0x304u + 0x200u * (m) + 0x100u * (q))
++#define CCI_MQ_LOAD(m, q)       (0x310u + 0x200u * (m) + 0x100u * (q))
++#define CCI_IRQ_GLOBAL_CLEAR    0xc00u
++#define CCI_IRQ_MASK_0          0xc04u
++#define CCI_IRQ_CLEAR_0         0xc08u
++#define CCI_IRQ_STATUS_0        0xc0cu
++#define CCI_IRQ_MASK_1          0xc10u
++#define CCI_IRQ_CLEAR_1         0xc14u
++#define CCI_IRQ_MASK_0_ALL      0x7fff7ff7u
++#define CCI_IRQ_MASK_1_ALL      0x00110000u
++#define CCI_RST_DONE    (1u << 24)
++#define CCI_HALT_ACK(m) (1u << (25 + (m)))
++#define CCI_RD_DONE(m)  ((m) ? 0x1000u : 0x1u)
++#define CCI_ERROR(m)    ((m) ? 0x60ee6000u : 0x18000ee6u)
++#define CCI_NACK(m)     ((m) ? 0x60000000u : 0x18000000u)
++#define CCI_VERSION_1_2_9       0x10020009u     /* cam_cci_dev.h:75 */
++#define CCI_RD_THRESHOLD_VALUE  0x30u
++#define CCI_TIMEOUT_US  100000u
++#define CCI_MASTER      0u              /* slot 0 cci-master 0 (live.dts:22210) */
++#define CAM_MAX_LEVEL   1u
++/* cam_cci_dev.h:242-253 enum cci_i2c_cmd_type */
++#define CCI_CMD_SET_PARAM       1u
++#define CCI_CMD_LOCK            6u
++#define CCI_CMD_UNLOCK          7u
++#define CCI_CMD_READ            10u
++#define CCI_CMD_WRITE_DISABLE_P 11u
++
++/* 19.2 MHz standard mode (100 kHz), cci-up:255-265 */
++static const struct {
++	uint16_t thigh, tlow, tsu_sto, tsu_sta, thd_dat, thd_sta, tbuf, trdhld, tsp;
++} cci_t = { 78, 114, 28, 28, 10, 77, 118, 6, 1 };
++
++
++static uint32_t level, pause_ms, step;
++static const char *step_name = "";
++static uint64_t step_t0;
++static vm_offset_t gcc, camcc, cci;
++/* what this file turned on (the power-down path undoes only these) */
++static bool hf_ours, sf_ours, gdsc_ours, cci_irq_on;
++static uint32_t branches_on;            /* bit per cc_branches[] entry */
++
++static const struct {
++	const char *name;
++	uint32_t off;
++	bool poll;                      /* false: BRANCH_HALT_DELAY, 10 us (branch:84) */
++} cc_branches[] = {
++	/* CPAS clock order of the DT (live.dts:22720-22721 clocks/clock-names) */
++	{ "cam_cc_cpas_ahb_clk", CC_CPAS_AHB_CBCR, true },
++	{ "cam_cc_core_ahb_clk", CC_CORE_AHB_CBCR, false },
++	{ "cam_cc_cpas_fast_ahb_clk", CC_CPAS_FAST_AHB_CBCR, true },
++	{ "cam_cc_camnoc_axi_clk", CC_CAMNOC_AXI_CBCR, true },
++	/* CCI0 (live.dts:22056-22058 clocks <camcc 0x08 camcc 0x07> = cci_0_clk_src, cci_0_clk) */
++	{ "cam_cc_cci_0_clk", CC_CCI0_CBCR, true },
++};
++#define NBRANCHES       (sizeof(cc_branches) / sizeof(cc_branches[0]))
++
++static uint32_t __attribute__((noinline))
++rd(vm_offset_t a)
++{
++	uint32_t v;
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (v) : "r" (a) : "memory");
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void __attribute__((noinline))
++wr(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	__asm__ volatile ("str %w0, [%1]" : : "r" (v), "r" (a) : "memory");
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* bounded poll: true when (reg & mask) == want within us microseconds */
++static bool
++poll(vm_offset_t a, uint32_t mask, uint32_t want, uint32_t us, uint32_t *last)
++{
++	uint32_t v = 0;
++	for (uint32_t i = 0; i <= us; i++) {
++		v = rd(a);
++		if ((v & mask) == want) {
++			break;
++		}
++		if (i == us) {
++			if (last) {
++				*last = v;
++			}
++			return false;
++		}
++		delay(1);
++	}
++	if (last) {
++		*last = v;
++	}
++	return true;
++}
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static void
++step_begin(const char *name)
++{
++	step++;
++	step_name = name;
++	step_t0 = now_us();
++	say("step %u %s", step, name);
++}
++
++static bool
++step_ok(void)
++{
++	say("step %u %s ok (%llu us)", step, step_name, now_us() - step_t0);
++	if (pause_ms) {
++		delay(pause_ms * 1000);
++	}
++	return true;
++}
++
++static bool
++step_fail(const char *why)
++{
++	say("step %u %s failed: %s (%llu us)", step, step_name, why, now_us() - step_t0);
++	return false;
++}
++
++/* ---- clocks ---- */
++
++static bool
++rcg_to_xo(const char *name, uint32_t off)
++{
++	vm_offset_t cmd = camcc + off;
++	uint32_t got = 0, cfg = rd(cmd + 4);
++
++	wr(cmd + 4, cfg & ~RCG_CFG_MASK);       /* source 0 = P_BI_TCXO (camcc:814, 830), no divider, no MND */
++	wr(cmd, rd(cmd) | RCG_CMD_ROOT_EN);     /* as clk_rcg2_shared_enable: force on, update, release */
++	wr(cmd, rd(cmd) | RCG_CMD_UPDATE);
++	bool ok = poll(cmd, RCG_CMD_UPDATE, 0, 500, &got);
++	wr(cmd, rd(cmd) & ~RCG_CMD_ROOT_EN);
++	say("  %s: cfg %#x -> %#x, cmd %#x%s", name, cfg, rd(cmd + 4), got, ok ? "" : " (UPDATE stuck)");
++	return ok;
++}
++
++static bool
++branch_set(const char *name, vm_offset_t reg, bool on, bool poll_halt)
++{
++	uint32_t got = 0;
++	wr(reg, on ? (rd(reg) | CBCR_ENABLE) : (rd(reg) & ~CBCR_ENABLE));
++	if (!poll_halt) {
++		delay(10);
++		got = rd(reg);
++		say("  %s %s: cbcr %#x", name, on ? "on" : "off", got);
++		return true;
++	}
++	bool ok = poll(reg, CBCR_OFF, on ? 0 : CBCR_OFF, 500, &got);
++	say("  %s %s: cbcr %#x%s", name, on ? "on" : "off", got, ok ? "" : " (halt bit stuck)");
++	return ok;
++}
++
++/* ---- CCI ---- */
++
++static void
++cci_irq_clear(uint32_t bits)
++{
++	wr(cci + CCI_IRQ_CLEAR_0, bits);
++	wr(cci + CCI_IRQ_GLOBAL_CLEAR, 1);
++}
++
++/* reset (whole controller when all, else one master) and wait for RST_DONE_ACK (cam_cci_soc.c init_master) */
++static bool
++cci_reset(uint32_t what, uint32_t *took_us)
++{
++	uint32_t got = 0;
++	uint64_t t0 = now_us();
++	cci_irq_clear(CCI_IRQ_MASK_0_ALL);
++	wr(cci + CCI_RESET_CMD, what);
++	if (what == CCI_RESET_ALL) {
++		wr(cci + CCI_RESET_CMD, 0x1);   /* cam_cci_soc.c: RMSK, then 0x1, when ref_count == 1 */
++	}
++	bool ok = poll(cci + CCI_IRQ_STATUS_0, CCI_RST_DONE, CCI_RST_DONE, CCI_TIMEOUT_US, &got);
++	cci_irq_clear(got);
++	if (took_us) {
++		*took_us = (uint32_t)(now_us() - t0);
++	}
++	if (!ok) {
++		say("  CCI reset %#x: no RST_DONE_ACK in %u us (irq status %#x)", what, CCI_TIMEOUT_US, got);
++	}
++	return ok;
++}
++
++static void
++cci_timing(uint32_t m)
++{
++	wr(cci + CCI_M_SCL_CTL(m), (uint32_t)cci_t.thigh << 16 | cci_t.tlow);
++	wr(cci + CCI_M_SDA_CTL_0(m), (uint32_t)cci_t.tsu_sto << 16 | cci_t.tsu_sta);
++	wr(cci + CCI_M_SDA_CTL_1(m), (uint32_t)cci_t.thd_dat << 16 | cci_t.thd_sta);
++	wr(cci + CCI_M_SDA_CTL_2(m), cci_t.tbuf);
++	/* scl stretch: live.dts hw-scl-stretch-en 1 and cci-up CCI_I2C_MISC_CTL_SCL_STRETCH_EN */
++	wr(cci + CCI_M_MISC_CTL(m), 1u << 8 | (uint32_t)cci_t.trdhld << 4 | cci_t.tsp);
++}
++
++/* the cam_cci_init order after the clocks: version, reset, IRQ masks, RD threshold, timing of master m */
++static bool
++cci_init(uint32_t m)
++{
++	uint32_t ver = rd(cci + CCI_HW_VERSION), took = 0;
++	say("  CCI0 hw version %#x", ver);
++	if (ver == 0 || ver == 0xffffffffu) {
++		return false;
++	}
++	/* masks first: this file polls IRQ_STATUS_0 for RST_DONE_ACK (no interrupt handler) */
++	wr(cci + CCI_IRQ_MASK_0, CCI_IRQ_MASK_0_ALL);
++	cci_irq_on = true;
++	if (!cci_reset(CCI_RESET_ALL, &took)) {
++		return false;
++	}
++	say("  CCI0 reset done ack after %u us", took);
++	wr(cci + CCI_IRQ_MASK_0, CCI_IRQ_MASK_0_ALL);
++	wr(cci + CCI_IRQ_CLEAR_0, CCI_IRQ_MASK_0_ALL);
++	wr(cci + CCI_IRQ_MASK_1, CCI_IRQ_MASK_1_ALL);
++	wr(cci + CCI_IRQ_CLEAR_1, CCI_IRQ_MASK_1_ALL);
++	wr(cci + CCI_IRQ_GLOBAL_CLEAR, 1);
++	if (ver != CCI_VERSION_1_2_9) {
++		wr(cci + CCI_M_RD_THRESHOLD(0), CCI_RD_THRESHOLD_VALUE);
++		wr(cci + CCI_M_RD_THRESHOLD(1), CCI_RD_THRESHOLD_VALUE);
++	}
++	cci_timing(m);
++	say("  CCI0 M%u timing 19.2 MHz standard: scl %#x sda0 %#x sda1 %#x sda2 %#x misc %#x", m,
++	    rd(cci + CCI_M_SCL_CTL(m)), rd(cci + CCI_M_SDA_CTL_0(m)), rd(cci + CCI_M_SDA_CTL_1(m)),
++	    rd(cci + CCI_M_SDA_CTL_2(m)), rd(cci + CCI_M_MISC_CTL(m)));
++	return true;
++}
++
++
++/* ---- power down: the reverse of what is on, sensor in the vendor order (module:50) ---- */
++
++static void
++cam_down(void)
++{
++	say("power down");
++	if (cci_irq_on) {
++		wr(cci + CCI_IRQ_MASK_0, 0);
++		wr(cci + CCI_IRQ_MASK_1, 0);
++		cci_irq_clear(CCI_IRQ_MASK_0_ALL);
++		cci_irq_on = false;
++	}
++	for (unsigned i = NBRANCHES; i-- > 0;) {
++		if (branches_on & (1u << i)) {
++			(void)branch_set(cc_branches[i].name, camcc + cc_branches[i].off, false, cc_branches[i].poll);
++			branches_on &= ~(1u << i);
++		}
++	}
++	if (gdsc_ours) {
++		uint32_t got = 0;
++		wr(camcc + CC_TITAN_GDSCR, rd(camcc + CC_TITAN_GDSCR) | GDSC_SW_COLLAPSE);
++		bool ok = poll(camcc + CC_TITAN_GDSCR, GDSC_PWR_ON, 0, GDSC_TIMEOUT_US, &got);
++		say("  titan top GDSC collapse: %#x%s", got, ok ? "" : " (still on)");
++		gdsc_ours = false;
++	}
++	if (sf_ours) {
++		wr(gcc + GCC_CAMERA_SF, rd(gcc + GCC_CAMERA_SF) & ~CBCR_ENABLE);
++		sf_ours = false;
++	}
++	if (hf_ours) {
++		wr(gcc + GCC_CAMERA_HF, rd(gcc + GCC_CAMERA_HF) & ~CBCR_ENABLE);
++		hf_ours = false;
++	}
++	say("power down done");
++}
++
++/* ---- level 1 steps ---- */
++
++static bool
++l1_map(void)
++{
++	step_begin("map");
++	gcc = ml_io_map_unmappable(GCC_CAM_PA, 0x1000, CAM_WIMG_IO);
++	camcc = ml_io_map_unmappable(CAMCC_PA, CAMCC_SIZE, CAM_WIMG_IO);
++	cci = ml_io_map_unmappable(CCI0_PA, 0x1000, CAM_WIMG_IO);
++	if (!gcc || !camcc || !cci) {
++		return step_fail("ml_io_map_unmappable returned 0");
++	}
++	return step_ok();
++}
++
++static bool
++l1_gcc(void)
++{
++	step_begin("gcc camera clocks");
++	/* AHB and XO are CLK_IS_CRITICAL (gcc:1859-1915): Linux keeps them on; turn on only if off */
++	static const struct { const char *name; uint32_t off; } crit[] = {
++		{ "gcc_camera_ahb_clk", GCC_CAMERA_AHB }, { "gcc_camera_xo_clk", GCC_CAMERA_XO },
++	};
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t v = rd(gcc + crit[i].off);
++		if (!(v & CBCR_ENABLE)) {
++			wr(gcc + crit[i].off, v | CBCR_ENABLE);
++			delay(10);              /* BRANCH_HALT_DELAY */
++		}
++		uint32_t now = rd(gcc + crit[i].off);
++		say("  %s: %#x -> %#x%s", crit[i].name, v, now, (now & CBCR_HWCG) ? " (hw clock gating: CLK_OFF not checked)" : "");
++		/*
++		 * gcc_camera_ahb_clk has hwcg (gcc:1862-1863): with HWCG_EN (bit 1) set, CLK_OFF (bit 31) can read 1
++		 * while the clock runs, and Linux skips the halt check (branch:21, :80). Then only the enable bit counts.
++		 */
++		if (!(now & CBCR_ENABLE) || (!(now & CBCR_HWCG) && (now & CBCR_OFF))) {
++			return step_fail("a critical GCC camera clock stays off");
++		}
++	}
++	/* CPAS clocks gcc_axi_hf_clk, gcc_axi_sf_clk (live.dts:22720 clocks <gcc 0x10 gcc 0x11>) */
++	uint32_t v = rd(gcc + GCC_CAMERA_HF);
++	if (!(v & CBCR_ENABLE)) {
++		wr(gcc + GCC_CAMERA_HF, v | CBCR_ENABLE);
++		hf_ours = true;
++	}
++	uint32_t w = rd(gcc + GCC_CAMERA_SF);
++	if (!(w & CBCR_ENABLE)) {
++		wr(gcc + GCC_CAMERA_SF, w | CBCR_ENABLE);
++		sf_ours = true;
++	}
++	say("  gcc_camera_hf_axi_clk %#x -> %#x, gcc_camera_sf_axi_clk %#x -> %#x (halt skip)", v,
++	    rd(gcc + GCC_CAMERA_HF), w, rd(gcc + GCC_CAMERA_SF));
++	return step_ok();
++}
++
++static bool
++l1_gdsc(void)
++{
++	step_begin("titan top gdsc");
++	uint32_t g = rd(camcc + CC_GDSC_CLK);
++	if (!(g & CBCR_ENABLE)) {
++		wr(camcc + CC_GDSC_CLK, g | CBCR_ENABLE);
++	}
++	say("  cam_cc_gdsc_clk %#x -> %#x", g, rd(camcc + CC_GDSC_CLK));
++	uint32_t v = rd(camcc + CC_TITAN_GDSCR), got = 0;
++	say("  titan top GDSCR %#x", v);
++	if (v == 0xffffffffu) {
++		return step_fail("camcc reads all ones (no access)");
++	}
++	if (v & GDSC_HW_CONTROL) {
++		return step_fail("GDSC under HW control");
++	}
++	if (!(v & GDSC_PWR_ON)) {
++		/* gdsc_enable (gdsc:208-350): clear SW_COLLAPSE, 1 us, poll PWR_ON */
++		wr(camcc + CC_TITAN_GDSCR, v & ~GDSC_SW_COLLAPSE);
++		(void)rd(camcc + CC_TITAN_GDSCR);
++		delay(1);
++		gdsc_ours = true;
++		if (!poll(camcc + CC_TITAN_GDSCR, GDSC_PWR_ON, GDSC_PWR_ON, GDSC_TIMEOUT_US, &got)) {
++			say("  GDSCR %#x after %u us", got, GDSC_TIMEOUT_US);
++			return step_fail("GDSC did not power on (MMCX off?)");
++		}
++	} else {
++		say("  titan top GDSC already on: not ours, stays on");
++	}
++	v = rd(camcc + CC_TITAN_GDSCR);
++	if (!(v & GDSC_RETAIN_FF)) {
++		wr(camcc + CC_TITAN_GDSCR, v | GDSC_RETAIN_FF);  /* qcom,retain-regs (gdsc:347-350) */
++	}
++	say("  titan top GDSCR now %#x", rd(camcc + CC_TITAN_GDSCR));
++	return step_ok();
++}
++
++static bool
++l1_clocks(void)
++{
++	step_begin("camcc clocks");
++	/* sources first (cam_cc_slow_ahb/fast_ahb/camnoc_axi/cci_0 at 19.2 MHz TCXO) */
++	if (!rcg_to_xo("cam_cc_slow_ahb_clk_src", CC_SLOW_AHB) || !rcg_to_xo("cam_cc_fast_ahb_clk_src", CC_FAST_AHB) ||
++	    !rcg_to_xo("cam_cc_camnoc_axi_clk_src", CC_CAMNOC_AXI) || !rcg_to_xo("cam_cc_cci_0_clk_src", CC_CCI0)) {
++		return step_fail("RCG update");
++	}
++	for (unsigned i = 0; i < NBRANCHES; i++) {
++		branches_on |= 1u << i;
++		if (!branch_set(cc_branches[i].name, camcc + cc_branches[i].off, true, cc_branches[i].poll)) {
++			return step_fail("branch clock did not start");
++		}
++	}
++	return step_ok();
++}
++
++static bool
++l1_cci(void)
++{
++	step_begin("cci0 controller");
++	if (!cci_init(CCI_MASTER)) {
++		return step_fail("no version or no reset ack");
++	}
++	return step_ok();
++}
++
++
++static void
++cam_thread(void *arg __unused, wait_result_t wr_ __unused)
++{
++	bool ok = l1_map() && l1_gcc() && l1_gdsc() && l1_clocks() && l1_cci();
++	if (ok) {
++		say("level 1 OK: camcc + CCI0 up");
++	}
++	if (gcc && camcc && cci) {
++		cam_down();
++	}
++	say("done (asked level %u, %s at step %u %s)", level, ok ? "complete" : "STOPPED", step, step_name);
++	(void)thread_terminate(current_thread());
++}
++
++void
++negroni_cam_init(void)
++{
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("negronicam", &level, sizeof(level));
++	if (level == 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("negronicam_pause", &pause_ms, sizeof(pause_ms));
++	pause_ms = MIN(pause_ms, 2000u);
++	level = MIN(level, CAM_MAX_LEVEL);
++	say("level %u (UNTESTED: camcc + CCI0%s)", level, level >= 2 ? " + IMX789 power + chip id" : "");
++	if (kernel_thread_start(cam_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		say("kernel_thread_start failed");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index dc203a6..8122f2e 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -56,6 +56,7 @@ extern void negroni_touch_init(void);
+ extern void negroni_cpufreq_init(void);
+ extern void negroni_thermal_init(void);
+ extern void negroni_haptic_init(void);   /* patch 0300: vibration motor (negronihap) */
++extern void negroni_cam_init(void);      /* patch 0310: camera bring-up (negronicam) */
+ extern void negroni_adreno_init(void);
+ extern void negroni_wifi_init(void);
+ extern void negroni_adsp_init(void);
+@@ -765,6 +766,7 @@ negroni_ufs_init(void)
+ 	negroni_cpufreq_init();
+ 	negroni_thermal_init();         /* patch 0280: TSENS readings + thermal caps */
+ 	negroni_haptic_init();          /* patch 0300: negronihap=1 buzzes 300 ms */
++	negroni_cam_init();             /* patch 0310/0311: negronicam=1|2, own thread, default off */
+ 	negroni_probe_menu();
+ 	negroni_adreno_init();
+ 	negroni_wifi_init();
