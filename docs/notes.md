@@ -2408,3 +2408,70 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   for the kernel data range in progress (agent).
 - New: scripts/debug/panic-symbolize.sh [LOG [KERNEL]] | -a ADDR...: the last panic in the USB log ->
   esr/far decoded, pc/lr/caller as symbol+offset, disassembly around pc; saved to logs/panic-<time>.txt.
+
+## 34. Journal panic: kernel VA and memory numbers, diagnostic patch 0362 (2026-10-27, kernel agent)
+
+- [V, build.log + code] The kernel is built with `-DARM_LARGE_MEMORY=1` and `XNU_PLATFORM_MacOSX` (dxb uses the
+  macOS SDK): VM_MIN_KERNEL_ADDRESS 0xfffffe0000000000, VM_MAX_KERNEL_ADDRESS 0xfffffe8fffffffff (576 GiB), the
+  physmap sits below VM_MIN (arm_vm_init.c:1901), kernel_map = [dynamic_memory_begin, VM_MAX] (pmap.c:2222),
+  zone map VA 128 GiB (zalloc.c:164, MacOSX values). [V] panic pc 0xfffffe0007... matches this layout.
+- [I, code arithmetic] kmem_add_extra_claims (vm_kern.c:3524): L = largest free hole after the static claims
+  (zones 128 GiB, IOKit pageable 4 x 512 MiB, io_submap 8 MiB, compressor, ipc, mb, bufs) = about 440 GiB;
+  3 ptr ranges of L/8 (about 55 GiB), sprayqtn = min(L/8, sane_size/2) = 1.5 GiB, **data range about 270 GiB**.
+  So the data VA range is NOT the limit: all feature buffers together use less than 120 MiB of it.
+- [V, code] The other way kalloc_large(Z_WAITOK) returns NULL: vm_page_alloc_list (vm_resident.c:6790). When
+  vm_page_grab() finds no page and wired + free_target pages > max_mem - request, it returns
+  KERN_RESOURCE_SHORTAGE (6) at once (no wait). XNU has only 3 GiB (ADT `--dram 840000000:C0000000`).
+  KERN_NO_SPACE (3) = no VA hole. Known feature buffers wire less than 30 MiB [I].
+- [V] The g12 panic log (logs/usblog-20261026-233816.txt 01:32:41) has the context: `RedwoodGPU: write-combined
+  pool ... (512 MiB)`, ADSP step 1 done, `NEGRONI ADSP: 2 firmware area: 44 files` (ADSP step 2 runs at the same
+  time as the root mount), then `jnl: ... journal replay done.` and the data abort. x20 0xfffffe200085df08.
+- 0362 `negroni-kmem-report` (diagnostic, no boot-arg): one line after kmem_range_init (`NEGRONI KMEM:
+  kernel_map ..., data range ..., ptr ranges N x M MiB, sprayqtn ...`), one line before the root mount
+  (`NEGRONI KMEM: before root mount: ... data range used/free/largest hole; pages free/wired/free_target/reserved,
+  max_mem`), on each kalloc_large failure (first 16, then every 256th) `NEGRONI KMEM: kalloc_large(N) failed: KR
+  (heap ..)` + the report line, and in journal_allocate_transaction `NEGRONI KMEM: hfs journal transaction buffer
+  of N bytes is NULL` + the report line. Reading of the next g12 boot: kr 3 = VA (unexpected), kr 6 = physical
+  pages / wired memory (check `wired` vs `max_mem`), no NULL line before the abort = the pointer was overwritten
+  after the allocation (corruption, for example a DMA engine), not an allocation failure.
+- [V] Kernel out/kernel/local-20261026-201152 (sha256 c2ed65f9...), 237 patches applied, only the 4 dxb skips.
+- [I] Side note: 0243 (audio ring), 0315 (camera frames) and 0316 (HFI) call kmem_alloc_contig with max_pnum
+  atop(4 GiB) - 1, but all XNU RAM is at 0x840000000 and higher: these calls can never succeed on this port.
+
+## 35. Widgets black / crashing (2026-10-27, Metal agent; full story docs/metal-widgets-2026-10-27.md)
+
+- [V] FitnessWidget `sig 9 reason ns 1 code 0x7` (jetsam per-process limit) x3 per boot, 1-8 s after our device opened,
+  inside `VFXCore.Renderer.init` -> `newDefaultLibraryWithBundle:` (VFX.framework default.metallib 3.17 MB) ->
+  `metal2vulkan Library::from_metallib` (`bytes.into()` copy, memmove). Every WidgetKit extension has a 30 MiB fatal
+  limit (new tool `scripts/metal/memlimit.sh` = userland/metal/tools/memlimit.c, root: `memorystatus_control` +
+  `proc_pid_rusage`); chronod runs at 31 MiB with the device, widgets at 4-13 MiB without it.
+- [V] MusicWidgets (strlen(NULL) in `-[MPMediaLibrary _MediaLibrary_coreLibrary]`), SleepWidgetExtension and
+  SafariLinkExtension (sig 11 at the Swift extension entry right after `cs_invalid_page` on their own __TEXT page) never
+  load Metal and crashed the same way at 00:04/00:26, before the gate was `*`. Not Metal.
+- Fix: plugin rule `memory_rule` in NegroniMetal.mm (jetsam limit < NEGRONIMETAL_MIN_LIMIT_MB=48 from task_info +
+  syscall 534 `memorystatus_available_memory`, or NSExtensionPointIdentifier com.apple.widgetkit-extension -> no device;
+  0 = off). Every process now logs `memory: footprint .. jetsam limit .. extension point ..` at the gate.
+- [I] "All black": chronod renders every widget snapshot on our device since the gate is `*` (465x465 2-plane
+  surfaces, 2 pipelines, 0 refused). No screenshot path; the test is `-chronod` in /var/db/negronimetal/clients +
+  `kill -9 chronod` (doc, section 4). Side note [V]: com.apple.WebKit.GPU footprint 396 MiB against a 300 MiB fatal
+  limit (memlimit.txt) - watch for jetsam of the GPU process under WebGL.
+- No crash report files: ReportCrash is removed (root-tweaks-extra.py); the kernel CRASH lines are the only record.
+
+## 35. ROOT CAUSE of the root-mount panic: boot_args command-line length mismatch (2026-10-27 02:00, main session)
+
+- [V] Diagnostic boots with 0362 (+ two extra prints): `NEGRONI KMEM: size_up_tbuffer: hw.memsize
+  7450482243115248993 -> def_tbuffer_size -1006239744`. 7450482243115248993 = 0x67656e20323d6d61 = the bytes
+  "am=2 neg" = part of our boot-args ("negronic**am=2 neg**ronipanic=..."). The kernel data range was healthy (255 GiB
+  free, 190520 free pages): not a memory problem.
+- [V] Mechanism: DarwinBoot (external/UniXNU/drivers/DarwinBoot/DarwinBootPkg/Driver/BootArgs.h) writes the macOS
+  arm64 boot_args: CommandLine[1024] at 0x6c, BootFlags at 0x470, MemorySizeActual at 0x478. Our iOS 16 xnu had
+  BOOT_LINE_LENGTH 608 (pexpert/pexpert/arm64/boot.h), so it read bootFlags/memSizeActual at 0x2d0/0x2d8 = command
+  line bytes 612..627. Any command line longer than about 620 bytes became max_mem_actual (hw.memsize). The HFS+
+  journal computes `def_tbuffer_size = 128 KiB * (memsize / 256 MiB)` as an int -> negative -> IOMallocData(negative)
+  = NULL -> end_transaction memcpy to NULL. Image command lines: base 431, g2b 585, g12 661, everything 835 bytes: the
+  two that panicked are the two over 620. The bisection "any two groups together" was only the length.
+- Also explains: boot-args after byte 607 were never seen by the kernel (cut off), so features at the end of a long
+  list were silently off in earlier boots.
+- Fix: patches/xnu/0363-negroni-boot-line-1024.patch (BOOT_LINE_LENGTH 1024 = DarwinBoot's layout). Guard:
+  scripts/ios16/build.sh refuses boot-args of 1024 bytes or more. Variant list: scripts/ios16/variants/everything.args.
+  The slop shim loader (external/slop/shim/loader.c, 608) is a different boot path (not used with UniXNU).

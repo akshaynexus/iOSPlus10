@@ -1,0 +1,173 @@
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index b06ac38..02ff285 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -3731,9 +3731,78 @@ kmem_range_init(void)
+ 		    mach_vm_size_unit(range_size));
+ 	}
+ #endif
++	/* patch 0362: the VA split in one line (always, also in RELEASE) */
++	printf("NEGRONI KMEM: kernel_map 0x%llx-0x%llx (%llu MiB), data range 0x%llx-0x%llx (%llu MiB), "
++	    "large data from 0x%llx, ptr ranges %u x %llu MiB, sprayqtn %llu MiB, sane_size %llu MiB, max_mem %llu MiB\n",
++	    (unsigned long long)vm_map_min(kernel_map), (unsigned long long)vm_map_max(kernel_map),
++	    (unsigned long long)((vm_map_max(kernel_map) - vm_map_min(kernel_map)) >> 20),
++	    (unsigned long long)kmem_ranges[KMEM_RANGE_ID_DATA].min_address,
++	    (unsigned long long)kmem_ranges[KMEM_RANGE_ID_DATA].max_address,
++	    (unsigned long long)(mach_vm_range_size(&kmem_ranges[KMEM_RANGE_ID_DATA]) >> 20),
++	    (unsigned long long)kmem_large_ranges[KMEM_RANGE_ID_DATA].min_address,
++	    kmem_ptr_ranges, (unsigned long long)(ptr_range_size >> 20),
++	    (unsigned long long)(sprayqtn_range_size >> 20),
++	    (unsigned long long)(sane_size >> 20), (unsigned long long)(max_mem >> 20));
+ }
+ STARTUP(KMEM, STARTUP_RANK_THIRD, kmem_range_init);
+ 
++/*
++ * Patch 0362 (negroni-kmem-report): one line with the state of the kernel
++ * data VA range (KMEM_RANGE_ID_DATA: kalloc_large of KHEAP_DATA_BUFFERS,
++ * kmem_alloc(KMA_DATA), ml_io_map_unmappable) and of the physical pages.
++ * kmem_alloc_guard fails with KERN_NO_SPACE (3) when the range has no hole
++ * and with KERN_RESOURCE_SHORTAGE (6) when vm_page_grab() finds no free page
++ * and wired + free_target pages leave no room (vm_page_alloc_list).
++ * Callers: kalloc_large failures, bsd_init before the root mount, the HFS
++ * journal when its transaction buffer is NULL. Takes the kernel_map read
++ * lock: not for a panic path or a caller that holds a map lock.
++ */
++void negroni_kmem_report(const char *why, vm_size_t req, int kr);
++
++void
++negroni_kmem_report(const char *why, vm_size_t req, int kr)
++{
++	const struct mach_vm_range *r = &kmem_ranges[KMEM_RANGE_ID_DATA];
++	vm_map_offset_t prev = r->min_address;
++	vm_map_size_t used = 0, hole = 0;
++	vm_map_entry_t e;
++	uint32_t n = 0;
++
++	if (startup_phase < STARTUP_SUB_KMEM || r->max_address == 0) {
++		printf("NEGRONI KMEM: %s: req %lu kr %d (no kmem ranges yet)\n", why, (unsigned long)req, kr);
++		return;
++	}
++	vm_map_lock_read(kernel_map);
++	for (e = vm_map_first_entry(kernel_map); e != vm_map_to_entry(kernel_map); e = e->vme_next) {
++		vm_map_offset_t s = MAX(e->vme_start, r->min_address);
++		vm_map_offset_t t = MIN(e->vme_end, r->max_address);
++
++		if (t <= s) {
++			continue;
++		}
++		used += t - s;
++		n++;
++		if (s > prev && s - prev > hole) {
++			hole = s - prev;
++		}
++		if (t > prev) {
++			prev = t;
++		}
++	}
++	vm_map_unlock_read(kernel_map);
++	if (r->max_address > prev && r->max_address - prev > hole) {
++		hole = r->max_address - prev;
++	}
++	printf("NEGRONI KMEM: %s: req %lu kr %d; data range used %llu MiB in %u entries, free %llu MiB, "
++	    "largest hole %llu MiB; pages free %u wired %u free_target %u reserved %u (16 KiB), max_mem %llu MiB\n",
++	    why, (unsigned long)req, kr,
++	    (unsigned long long)(used >> 20), n,
++	    (unsigned long long)((mach_vm_range_size(r) - used) >> 20),
++	    (unsigned long long)(hole >> 20),
++	    vm_page_free_count, vm_page_wire_count, vm_page_free_target, vm_page_free_reserved,
++	    (unsigned long long)(max_mem >> 20));
++}
++
+ #if DEBUG || DEVELOPMENT
+ __startup_func
+ static void
+diff --git a/osfmk/kern/kalloc.c b/osfmk/kern/kalloc.c
+index 06fc2a2..63ba69d 100644
+--- a/osfmk/kern/kalloc.c
++++ b/osfmk/kern/kalloc.c
+@@ -85,6 +85,8 @@
+ #include <libkern/section_keywords.h>
+ #include <libkern/prelink.h>
+ 
++extern void negroni_kmem_report(const char *why, vm_size_t req, int kr);  /* patch 0362, vm_kern.c */
++
+ SCALABLE_COUNTER_DEFINE(kalloc_large_count);
+ SCALABLE_COUNTER_DEFINE(kalloc_large_total);
+ 
+@@ -2289,8 +2291,20 @@ kalloc_large(
+ 		req_size = round_page(size);
+ 	}
+ 
+-	addr = kmem_alloc_guard(kernel_map, req_size, 0,
+-	    kma_flags, kalloc_guard(tag, kt_hash, owner)).kmr_address;
++	kmem_return_t kmr = kmem_alloc_guard(kernel_map, req_size, 0,
++	    kma_flags, kalloc_guard(tag, kt_hash, owner));
++	addr = kmr.kmr_address;
++
++	if (addr == 0) {
++		/* patch 0362: every failure up to 16, then every 256th */
++		static uint32_t negroni_kl_fails;
++		uint32_t nf = os_atomic_inc(&negroni_kl_fails, relaxed);
++		if (nf <= 16 || (nf & 255) == 0) {
++			printf("NEGRONI KMEM: kalloc_large(%zu) failed: %d (heap %s, kma 0x%x, failure %u)\n",
++			    (size_t)req_size, kmr.kmr_return, kheap->kh_name, (unsigned)kma_flags, nf);
++			negroni_kmem_report("kalloc_large", req_size, kmr.kmr_return);
++		}
++	}
+ 
+ 	if (addr != 0) {
+ 		counter_inc(&kalloc_large_count);
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 884fb7a..80937ef 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -401,6 +401,7 @@ LCK_MTX_DECLARE_ATTR(proc_list_mlock, &proc_mlock_grp, &proc_lck_attr);
+ #if XNU_TARGET_OS_OSX
+ /* hook called after root is mounted XXX temporary hack */
+ void (*mountroot_post_hook)(void);
++extern void negroni_kmem_report(const char *why, vm_size_t req, int kr);  /* patch 0362, osfmk/vm/vm_kern.c */
+ void (*unmountroot_pre_hook)(void);
+ #endif
+ void set_rootvnode(vnode_t);
+@@ -879,6 +880,7 @@ bsd_init(void)
+ #endif
+ 
+ 		bsd_init_kprintf("vfs_mountroot\n");
++		negroni_kmem_report("before root mount", 0, 0);        /* patch 0362 */
+ 		if (0 == (err = vfs_mountroot())) {
+ 			break;
+ 		}
+diff --git a/bsd/negroni_hfs/core/hfs_journal.c b/bsd/negroni_hfs/core/hfs_journal.c
+index 20dc624..63d1a71 100644
+--- a/bsd/negroni_hfs/core/hfs_journal.c
++++ b/bsd/negroni_hfs/core/hfs_journal.c
+@@ -1562,6 +1562,7 @@ size_up_tbuffer(journal *jnl, int tbuffer_size, int phys_blksz)
+ 			def_tbuffer_size = DEFAULT_TRANSACTION_BUFFER_SIZE * 3;
+ 		} else {
+ 			def_tbuffer_size = DEFAULT_TRANSACTION_BUFFER_SIZE * (memsize / (256*1024*1024));
+ 		}
++		printf("NEGRONI KMEM: size_up_tbuffer: hw.memsize %llu -> def_tbuffer_size %d (at %p)\n", memsize, def_tbuffer_size, &def_tbuffer_size);  /* patch 0362 */
+ 	}
+ 
+@@ -2507,6 +2507,8 @@ check_free_space(journal *jnl, int desired_size, boolean_t *delayed_header_write
+ /*
+  * Allocate a new active transaction.
+  */
++extern void negroni_kmem_report(const char *why, vm_size_t req, int kr);  /* patch 0362, osfmk/vm/vm_kern.c */
++extern uint64_t kvtophys(vm_offset_t va);
+ static errno_t
+ journal_allocate_transaction(journal *jnl)
+ {
+@@ -2530,6 +2532,12 @@ journal_allocate_transaction(journal *jnl)
+ 
+ 	block_list_header_in_memory* blhdrim = hfs_new_with_hdr(block_list_header_in_memory, block_info, journal_max_blocks(jnl));
+ 	blhdrim->buffers = hfs_malloc_data(tr->tbuffer_size - jnl->jhdr->blhdr_size);
++	if (blhdrim->buffers == NULL) {
++		/* patch 0362: end_transaction() memcpy()s into this buffer without a check */
++		printf("NEGRONI KMEM: hfs journal transaction buffer of %d bytes is NULL: tr %d jnl->tbuffer_size %d at %p (pa 0x%llx) def %d at %p (pa 0x%llx) jhdr %p (pa 0x%llx) blhdr_size %d size %lld jhdr_size %d\n",
++		    tr->tbuffer_size - jnl->jhdr->blhdr_size, tr->tbuffer_size, jnl->tbuffer_size, &jnl->tbuffer_size, (unsigned long long)kvtophys((vm_offset_t)&jnl->tbuffer_size), def_tbuffer_size, &def_tbuffer_size, (unsigned long long)kvtophys((vm_offset_t)&def_tbuffer_size), jnl->jhdr, (unsigned long long)kvtophys((vm_offset_t)jnl->jhdr), jnl->jhdr->blhdr_size, (long long)jnl->jhdr->size, jnl->jhdr->jhdr_size);
++		negroni_kmem_report("hfs journal", (vm_size_t)(tr->tbuffer_size - jnl->jhdr->blhdr_size), 0);
++	}
+ 	tr->tbuffer = (char*)&blhdrim->blhdr;
+ 
+ 	if (vfs_isswapmount(jnl->fsmount) && (was_vm_privileged == FALSE))

@@ -1,0 +1,25 @@
+0363-negroni-boot-line-1024: the arm64 boot_args command line is 1024 bytes, as DarwinBoot (UniXNU) writes it.
+
+Root cause of the root-mount panic of 2026-10-26/27 (docs/notes.md section 35): DarwinBoot's DARWIN_BOOT_ARGS
+(external/UniXNU/drivers/DarwinBoot/DarwinBootPkg/Driver/BootArgs.h) has CommandLine[1024], BootFlags at 0x470 and
+MemorySizeActual at 0x478 (the macOS arm64 layout). This iOS 16 xnu had BOOT_LINE_LENGTH 608, so it read bootFlags
+at 0x2d0 and memSizeActual at 0x2d8 = bytes 612..627 of the command line. A command line longer than 620 bytes put
+boot-arg text into max_mem_actual (seen: hw.memsize 7450482243115248993 = "am=2 neg"); the HFS+ journal sized its
+transaction buffer from hw.memsize as an int, got -1006239744 bytes, the allocation returned NULL and end_transaction()
+wrote through it. With 1024 the kernel reads the fields where DarwinBoot writes them, and boot-args past 607 bytes are
+no longer cut off. The other users (kern.bootargs, IONVRAM size check, stackshot) only size buffers with it.
+
+diff --git a/pexpert/pexpert/arm64/boot.h b/pexpert/pexpert/arm64/boot.h
+--- a/pexpert/pexpert/arm64/boot.h
++++ b/pexpert/pexpert/arm64/boot.h
+@@ -23,7 +23,9 @@
+  * This value matches iBoot's IBOOT_MAX_ENV_VAR_DATA_SIZE.
+  * There are no iBoot headers so have to duplicate it here for now.
+  */
+-#define BOOT_LINE_LENGTH        608
++/* negroni 0363: DarwinBoot (UniXNU) writes the macOS arm64 layout, CommandLine[1024]; with 608 the
++ * kernel read memSizeActual from inside a long command line (docs/notes.md section 35). */
++#define BOOT_LINE_LENGTH        1024
+ 
+ /*
+  * Video information..

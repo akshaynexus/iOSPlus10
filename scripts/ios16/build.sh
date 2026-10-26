@@ -35,6 +35,10 @@ payload() {
   done
   args="${args# } ${BOOTARGS_ADD:-}"; args="${args% }"
   printf '%s\n' "$args" > "$O/cmdline.txt"
+  # DarwinBoot passes at most 1023 bytes; kernels before patch 0363 read memSizeActual from inside a command line
+  # longer than 620 bytes (docs/notes.md section 35)
+  n=$(printf '%s' "$args" | wc -c | tr -d ' ')
+  [ "$n" -lt 1024 ] || { echo "boot-args are $n bytes; DarwinBoot passes at most 1023" >&2; exit 1; }
   "$REPO/scripts/lib/native-env.sh" python3 "$REPO/$($C payload.tool)" "$(cd "$OUT/kernel" && pwd -P)/$(readlink "$OUT/kernel/kernel.macho")" \
     "$O/negroni.adt" "$O/esp.img" --cmdline "$args" \
     --size-mib "$($C payload.size_mib)" --timeout "$($C payload.timeout)"
