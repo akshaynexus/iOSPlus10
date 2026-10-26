@@ -2255,3 +2255,10 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Fallback image `out/ios16-nosmmu` (same ADT/vendor_boot/kernel; boot-args of everything with `negroniwlan=1`
   (survey only), `negronicam=2`): boot_a 6380e314..., esp 5dc6dc20.... Waiter `flash-nosmmu` flashes boot_a when the
   phone appears in fastboot.
+- Fix (2026-10-27, kernel agent): new patch 0255 `bsd/dev/negroni_mmio.h` (`negroni_mmio_rd32`/`wr32`, one inline-asm
+  `ldr w,[x]` / `str w,[x]`, "r" operands); 0263 (`SRD`/`SWR`) and 0324 (`SR`/`SW`, + limits 0x4e contexts / 0x78 SMRs)
+  use it for every apps-SMMU access; 0312 already used the asm `rd()`/`wr()` of 0310. [V] Kernel
+  out/kernel/local-20261026-182859 (sha256 9bee3bfe...), 234 patches applied, only the 4 dxb skips; objdump: the scan is
+  `ldr w12, [x9]` + `add x9, x9, #0x4`, no writeback/pair/WZR/64-bit access on the SMMU mapping in wlan_dma_path,
+  negroni_wlan_smmu_on/off/map/report or the camera scan (inlined in cam_thread). Gotcha: a new `#include` in 0263's
+  include list broke 0265 (it anchors on that list); the include sits before `#define APPS_SMMU_PHYS` instead.

@@ -163,6 +163,23 @@ New boot-args:
 **Warning: `negroniwlan_smmu=2` writes the shared apps SMMU (Gunyah emulates its global space). Use it
 only with the owner's approval, and only after a boot with the default showed `unmatched streams FAULT`.**
 
+### 2026-10-26 panic fix (0255, 0263, 0324)
+
+- [V] The first boot of out/ios16-everything panicked in step 6: `Kernel data abort` at `_wlan_dma_path+0x170`
+  = `ldr w12, [x9], #0x4` (the SMR scan), far = SMMU mapping + 0x800 (SMR0), ESR 0x96000010 (synchronous
+  external abort). The plain reads of sCR0/IDR0/IDR1/sGFSR just before it worked (docs/notes.md section 27).
+- [I] Cause: Gunyah traps and emulates the apps SMMU global space (0x15000000, pages 0 and 1). It emulates only
+  single-register 32-bit loads/stores with ESR ISV=1. The compiler made the scan a post-index load (no ISV), so
+  the hypervisor injected an SEA. A pair, a 64-bit access or a store from WZR gets the same (the OnePlus sm8450
+  arm-smmu.c:62-67 comment on WZR stores; Linux readl/writel are `ldr %w0,[%1]` / `str %w0,[%1]`).
+- Fix: new `bsd/dev/negroni_mmio.h` (patch 0255): `negroni_mmio_rd32` / `negroni_mmio_wr32`, one inline-asm
+  `ldr w, [x]` / `str w, [x]`, value operand `"r"` (never WZR). 0263 (`SRD`/`SWR`) and 0324 (`SR`/`SW`) use them
+  for every apps-SMMU access; the dsb barriers stay. 0324 also limits the scan to `qcom,num-context-banks-override`
+  0x4e contexts and `qcom,num-smr-override` 0x78 SMRs (live.dts apps-smmu).
+- [I] `negroniwlan_smmu=2` is expected to fail: the Android driver (arm-smmu-qcom.c:2288, mainline `bypass_quirk`)
+  says this hypervisor treats S2CR TYPE bypass as blocked, so a bypass entry reads back as FAULT. The path for
+  DMA through this SMMU is the stage-1 context, `negroniwlan_smmu=3` (0324).
+
 0264 data path: one 576 KiB contiguous allocation (Normal non-cacheable view): 16 RX buffers x 32 KiB
 on channel 21 (posted after START_CHAN, put back after each transfer event), 8 TX buffers x 8 KiB for
 channel 20 (`negroni_wlan_mhi_tx`, one EOT transfer per packet, waits for a free buffer). Transfer events

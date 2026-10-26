@@ -1,0 +1,50 @@
+0255-negroni-mmio-accessors: bsd/dev/negroni_mmio.h, negroni_mmio_rd32/negroni_mmio_wr32: one plain
+"ldr w, [x]" / "str w, [x]" per access (inline asm, "r" operands: no writeback, no pair, no 64-bit access,
+no WZR store). The Gunyah hypervisor emulates the apps SMMU global space only for single-register accesses
+with ESR ISV=1; anything else gets a synchronous external abort (first boot of ios16-everything, panic at
+_wlan_dma_path+0x170 "ldr w12, [x9], #0x4", docs/notes.md section 27). Used by 0263 and 0324. Numbered
+before 0263 so that a patched-tree.sh tree cut at any later patch has the header.
+
+diff --git a/bsd/dev/negroni_mmio.h b/bsd/dev/negroni_mmio.h
+new file mode 100644
+index 0000000..b59591f
+--- /dev/null
++++ b/bsd/dev/negroni_mmio.h
+@@ -0,0 +1,37 @@
++/*
++ * NEGRONI (SM8450): 32-bit MMIO accessors for register spaces that the hypervisor traps (patch 0255).
++ *
++ * The apps SMMU global space (0x15000000, global pages 0 and 1) is trapped and emulated by the Gunyah
++ * hypervisor (QHEE). Gunyah emulates only accesses that the CPU reports with a valid syndrome (ESR ISV=1):
++ * one 32-bit register, a plain load or store, no base-register writeback. A post-index or pre-index load
++ * ("ldr w, [x], #4"), a pair (ldp/stp), a 64-bit access or a store of WZR gets a synchronous external
++ * abort (ESR 0x96000010) injected. Proof: the first boot of out/ios16-everything (docs/notes.md section 27)
++ * panicked at "ldr w12, [x9], #0x4" in the SMR scan of wlan_dma_path, after plain reads of sCR0/IDR0/IDR1
++ * worked. Linux uses readl/writel ("ldr %w0, [%1]" / "str %w0, [%1]"); the OnePlus sm8450 arm-smmu.c
++ * (lines 62-67) notes the WZR store problem.
++ *
++ * So the access is one inline-asm instruction with a plain base register: the compiler cannot merge two
++ * accesses into a pair, add writeback, or widen it. The value operand is "r", not "rZ": a zero is moved
++ * into a register first and is never stored from WZR. Barriers stay with the caller.
++ */
++#ifndef _NEGRONI_MMIO_H_
++#define _NEGRONI_MMIO_H_
++
++#include <stdint.h>
++#include <mach/vm_types.h>
++
++static inline uint32_t
++negroni_mmio_rd32(vm_offset_t a)
++{
++	uint32_t v;
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (v) : "r" (a) : "memory");
++	return v;
++}
++
++static inline void
++negroni_mmio_wr32(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r" (v), "r" (a) : "memory");
++}
++
++#endif /* _NEGRONI_MMIO_H_ */

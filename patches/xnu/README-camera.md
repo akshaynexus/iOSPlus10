@@ -214,6 +214,14 @@ Keep `negronipanic=30 negronipanicreason=2` as in the other test images.
   the display needs [I]; they stay after the run. A lower UEFI need is not a problem; a higher one (unlikely) would
   be lowered.
 - `negronicam_smmu=2` writes the apps SMMU; under Gunyah the write can fault or be ignored (the readback tells).
+- 2026-10-26 panic fix: the Wi-Fi SMR scan (0263) panicked with ESR 0x96000010 (SEA) because Gunyah emulates the
+  apps SMMU global space only for single 32-bit `ldr w, [x]` / `str w, [x]` accesses (ESR ISV=1); a writeback,
+  pair, 64-bit or WZR access gets an SEA injected (docs/notes.md section 27). [V] The camera code (0312 `l3_smmu`)
+  already uses the 0310 `rd()`/`wr()`: noinline functions with one inline-asm `ldr %w0, [%1]` / `str %w0, [%1]` and
+  `"r"` operands, so no change was needed (0255 `negroni_mmio.h` has the same accessors for the Wi-Fi code).
+- [I] `negronicam_smmu=2` is expected to read back as FAULT: the Android driver (arm-smmu-qcom.c:2288, mainline
+  `bypass_quirk`) says this hypervisor treats S2CR TYPE bypass as blocked. DMA through this SMMU needs a stage-1
+  context (as the Wi-Fi `negroniwlan_smmu=3`, 0324); the camera has no such path yet.
 - The sensor streams only while the frame wait runs; the stream off runs on every path (also on a failed write after
   the stream-on entry).
 - C-PHY settle count and data-rate entry are inferences; a wrong value gives CRC/ECC errors, not damage.
