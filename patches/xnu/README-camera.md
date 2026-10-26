@@ -364,6 +364,47 @@ the ADSP address `0x1_1000_0000`. `negroniaudio_smmu=0` keeps the 0243 physical 
 - Fault lines: `SMMU context N after the frame|after NO FRAME|after the HFI init: FSR ... stream ...`.
 - 0317 also: the ICP PAS SCM loop resumes up to 2000000 times and logs the count (as 0240, main session request).
 
+### 0379: readback of the stage-1 registers = the fields we own (2026-10-27, build only)
+
+Phone, 2026-10-27 (`negronicam=7 negronicam_smmu=3`, kernel local-20261026-222425) [V log]: steps 1-13 pass; step 14
+stops in the helper: context 7 claim accepted (`SMMU context 7 free: CBAR 0 CBA2R 0; claiming it`, SMR112 -> context
+7), then `SMMU context 7 TCR2 reads 0x38071 after writing 0x38011` and `SMMU S1 context not set up (errno 1)`.
+
+- [V log] Every bank reads TCR2 0x38071 after 0x38011: Wi-Fi context 6 (t6, `bits 0x60 not kept; not needed`, the
+  0325 rule accepted it and DMA worked), Adreno contexts 13 and 19 (usblogs of 2026-10-25/26). The Adreno banks' own
+  TCR2 values (0x1c060, 0x40020070) have bits 5/6 set too.
+- [V spec] SMMUv2 `SMMU_CBn_TCR2` (AArch64 format) is the top half of `TCR_EL1`: PASIZE [2:0], AS [4], TBI0 [5],
+  TBI1 [6], SEP [17:15]. Linux `arm-smmu.h` defines only SEP, AS and PASIZE (GENMASK(3,0)) and never compares a
+  readback. So bits 5/6 are TBI0/TBI1 (top byte ignore).
+- [I] Who sets them: the MMU-500 or Gunyah's SMMU emulation forces them to 1 (writes of 0 are not kept on any bank).
+  Effect: none for us; our IOVAs (< 2^39) have a zero top byte. HakiOS `redwood_camera.c` writes TCR2 with check
+  mask 0 for the same reason [I].
+- [V log] Wi-Fi bank 6 also reads SCTLR 0x107 after 0x1107: ASIDPNE (bit 12) is not kept. TCR 0x803519, TTBR0,
+  MAIR0 0xf404ff44, S2CR, SMR read back exactly.
+- Fix (0379, `bsd/dev/negroni_smmu_s1.c`): the 0325 rule. A write fails only when a field we own does not read back:
+  TCR2 0x3801f (PASIZE + reserved bit 3, AS, SEP), TCR 0xc0ffbf (T0SZ, EPD0, IRGN0, ORGN0, SH0, TG0, A1, EPD1), TTBR0
+  all bits (ASID = bank), MAIR0 0xff (attribute 0, the only index our PTEs use), SCTLR bit 0 (M), S2CR 0x300ff (TYPE,
+  CBNDX), SMR all bits, CBA2R bit 0, CBAR 0x300ff (unchanged). Any other difference is printed and accepted:
+  `SMMU context N TCR2 reads 0x38071 after writing 0x38011: bits 0x60 differ outside the fields we own 0x3801f; accepted`.
+- The claim path did not need a change: 0249 and 0325 claim the same way (try-accessors, CBA2R VA64, CBAR 0x1f300,
+  each read back, SCTLR 0 only when not 0), and the camera claim of context 7 was accepted. The Wi-Fi file
+  (0324/0325) is not edited: its masks (TCR2 7, TCR 0xc03f, MAIR0 0xff, SCTLR 1) are subsets of the ones above,
+  and its t6 readbacks pass the new masks too.
+- Next phone test (`negronicam=7 negronicam_smmu=3`), expected lines:
+
+```
+NEGRONI CAM: SMMU context 7 free: CBAR 0 CBA2R 0; claiming it
+NEGRONI CAM: SMMU stream 0x800 mask 0x460: SMR112 (free, was 0 / S2CR 0x20000) -> context 7
+NEGRONI CAM: SMMU context 7 TCR2 reads 0x38071 after writing 0x38011: bits 0x60 differ outside the fields we own 0x3801f; accepted
+NEGRONI CAM: SMMU context 7 SCTLR reads 0x27 after writing 0x1027: bits 0x1000 differ outside the fields we own 0x1; accepted   [I: as Wi-Fi bank 6]
+NEGRONI CAM: SMMU SMR112 = 0x84600800, S2CR112 = 0x7
+NEGRONI CAM: SMMU context 7 ON: SCTLR 0x27 TTBR0 0x7....:0x........ (root 0x8........), 1 stream entry translate through it
+```
+
+  A failure now reads `... reads X after writing Y (bits Z of the fields we own W not kept)` and is a real refusal.
+  The prefix `NEGRONI CAM:` is the camera's `struct negroni_s1` name (0317 `cam_s1`). Audio (0249,
+  `negroniaudio_smmu=1`) uses the same helper and gets the same fix.
+
 ### Stream for iOS (0318, `negronicam=7`)
 
 - Nothing runs at boot; `/dev/negronicam` (root:mobile 0660: the reader is mediaserverd, which runs as mobile,

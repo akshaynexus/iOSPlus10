@@ -1,0 +1,114 @@
+0379: apps-SMMU stage-1 helper (0249, negroni_smmu_s1.c): readback compares only the fields we own, as the Wi-Fi
+0325 sr_put does. Phone 2026-10-27 (negronicam=7 negronicam_smmu=3): context 7 TCR2 reads 0x38071 after 0x38011;
+bits 5/6 = TBI0/TBI1 read as 1 on every bank (Wi-Fi 6, Adreno 13/19 too). TCR2 owns PASIZE/AS/SEP, TCR the TTBR0
+walk fields + A1/EPD1, MAIR0 attribute 0, SCTLR M, S2CR TYPE/CBNDX; TTBR0, SMR, CBA2R, CBAR unchanged. Any other
+difference is printed ("bits X differ outside the fields we own Y; accepted").
+
+diff --git a/bsd/dev/negroni_smmu_s1.c b/bsd/dev/negroni_smmu_s1.c
+index ba17d38..c39da0b 100644
+--- a/bsd/dev/negroni_smmu_s1.c
++++ b/bsd/dev/negroni_smmu_s1.c
+@@ -8,6 +8,7 @@
+  * TTBR0 (+ ASID = context index), MAIR0, fault status clear, TLB invalidate + sync, SCTLR on; then per
+  * stream S2CR (translate, context index) and only then the SMR valid bit. Every global write is read
+  * back; a refused write stops before any DMA; stream entries are put back, CBAR/CBA2R never (see below).
++ * 0379: "read back" = the fields we own (TCR2_OWN etc., the 0325 rule); other bits are printed and accepted.
+  * Hardware: live.dts:15350-15370 apps-smmu@15000000 (qcom,qsmmu-v500, qcom,skip-init,
+  * qcom,num-smr-override 0x78, qcom,num-context-banks-override 0x4e). The first version panicked on hardware
+  * (2026-10-27, below); this version is not yet run on hardware.
+@@ -98,6 +99,18 @@ extern vm_map_address_t phystokv(uint64_t pa);
+ #define SCTLR_ON                (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)
+ #define TCR_39                  (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
+ #define TCR2_36                 (1u | 1u << 4 | 7u << 15)
++/*
++ * Readback rule (0379, the 0325 Wi-Fi sr_put rule): a write must read back in the fields we own; other bits may
++ * differ, the difference is printed and kept. Phone 2026-10-27: every bank (Wi-Fi 6, camera 7, Adreno 13/19) reads
++ * TCR2 0x38071 after 0x38011: bits 5/6 = TBI0/TBI1 (SMMUv2 TCR2 = TCR_EL1[63:32]: PASIZE 2:0, AS 4, TBI0 5, TBI1 6,
++ * SEP 17:15) are set by the SMMU or by Gunyah, not by us; our IOVAs have a zero top byte, so TBI changes nothing.
++ * Wi-Fi bank 6 also reads SCTLR 0x107 after 0x1107 (ASIDPNE not kept). TCR, TTBR0, MAIR0, S2CR, SMR read back exactly.
++ */
++#define TCR2_OWN                (0xfu | 1u << 4 | 7u << 15)     /* PASIZE (+ reserved bit 3), AS, SEP; not TBI0/TBI1 */
++#define TCR_OWN                 (0x3fu | 1u << 7 | 0xffu << 8 | 1u << 22 | 1u << 23)   /* T0SZ EPD0 IRGN0 ORGN0 SH0 TG0 A1 EPD1 */
++#define MAIR0_OWN               0xffu           /* attribute 0: the only index our PTEs use */
++#define SCTLR_OWN               1u              /* M */
++#define S2CR_OWN                0x300ffu        /* TYPE, CBNDX (0325) */
+ #define MAIR0                   0xf404ff44u     /* index 0 = Normal non-cacheable; the CPU cleans/invalidates */
+ #define FSR_ALL                 0xc00001feu
+ #define PTE_VALID               3ull
+@@ -184,11 +197,15 @@ g_put(struct negroni_s1 *s, const char *what, uint32_t off, uint32_t v, uint32_t
+ 		printf("%s: SMMU %s reads %#x after writing %#x (the hypervisor did not keep it)\n", s->name, what, got, v);
+ 		return EPERM;
+ 	}
++	if (got != v) {
++		printf("%s: SMMU %s reads %#x after writing %#x: bits %#x differ outside the fields we own %#x; accepted\n",
++		    s->name, what, got, v, got ^ v, mask);
++	}
+ 	return 0;
+ }
+ 
+ static int
+-cb_put(struct negroni_s1 *s, const char *what, uint32_t off, uint32_t v)
++cb_put(struct negroni_s1 *s, const char *what, uint32_t off, uint32_t v, uint32_t own)
+ {
+ 	uint32_t got = 0;
+ 
+@@ -198,10 +215,15 @@ cb_put(struct negroni_s1 *s, const char *what, uint32_t off, uint32_t v)
+ 		printf("%s: SMMU context %u %s write %#x aborted (caught)\n", s->name, s->cb, what, v);
+ 		return EPERM;
+ 	}
+-	if (got != v) {
+-		printf("%s: SMMU context %u %s reads %#x after writing %#x\n", s->name, s->cb, what, got, v);
++	if ((got ^ v) & own) {
++		printf("%s: SMMU context %u %s reads %#x after writing %#x (bits %#x of the fields we own %#x not kept)\n",
++		    s->name, s->cb, what, got, v, (got ^ v) & own, own);
+ 		return EPERM;
+ 	}
++	if (got != v) {
++		printf("%s: SMMU context %u %s reads %#x after writing %#x: bits %#x differ outside the fields we own %#x; "
++		    "accepted\n", s->name, s->cb, what, got, v, got ^ v, own);
++	}
+ 	return 0;
+ }
+ 
+@@ -653,11 +675,11 @@ s1_on_locked(struct negroni_s1 *s)
+ 		return ENOMEM;
+ 	}
+ 	uint64_t ttbr = s->root_pa | ((uint64_t)s->cb << 48);
+-	if ((error = cb_put(s, "TCR2", CB_TCR2, TCR2_36)) ||
+-	    (error = cb_put(s, "TCR", CB_TCR, TCR_39)) ||
+-	    (error = cb_put(s, "TTBR0 lo", CB_TTBR0, (uint32_t)ttbr)) ||
+-	    (error = cb_put(s, "TTBR0 hi", CB_TTBR0 + 4, (uint32_t)(ttbr >> 32))) ||
+-	    (error = cb_put(s, "MAIR0", CB_MAIR0, MAIR0))) {
++	if ((error = cb_put(s, "TCR2", CB_TCR2, TCR2_36, TCR2_OWN)) ||
++	    (error = cb_put(s, "TCR", CB_TCR, TCR_39, TCR_OWN)) ||
++	    (error = cb_put(s, "TTBR0 lo", CB_TTBR0, (uint32_t)ttbr, ~0u)) ||
++	    (error = cb_put(s, "TTBR0 hi", CB_TTBR0 + 4, (uint32_t)(ttbr >> 32), ~0u)) ||    /* ASID = bank */
++	    (error = cb_put(s, "MAIR0", CB_MAIR0, MAIR0, MAIR0_OWN))) {
+ 		return error;
+ 	}
+ 	if (cwr(s, s->cb, CB_TTBR1, 0) || cwr(s, s->cb, CB_TTBR1 + 4, 0) || cwr(s, s->cb, CB_MAIR1, 0) ||
+@@ -671,10 +693,14 @@ s1_on_locked(struct negroni_s1 *s)
+ 	sctlr = 0;
+ 	int bad = cwr(s, s->cb, CB_SCTLR, SCTLR_ON);
+ 	dsb();
+-	if (bad || crd(s, s->cb, CB_SCTLR, &sctlr) || !(sctlr & 1)) {
++	if (bad || crd(s, s->cb, CB_SCTLR, &sctlr) || !(sctlr & SCTLR_OWN)) {
+ 		printf("%s: SMMU context %u SCTLR does not take M (%#x)\n", s->name, s->cb, sctlr);
+ 		return EPERM;
+ 	}
++	if (sctlr != SCTLR_ON) {
++		printf("%s: SMMU context %u SCTLR reads %#x after writing %#x: bits %#x differ outside the fields we own %#x; "
++		    "accepted\n", s->name, s->cb, sctlr, SCTLR_ON, sctlr ^ SCTLR_ON, SCTLR_OWN);
++	}
+ 	/* the streams: S2CR (translate, context) first, then the SMR; each SMR read again right before */
+ 	for (uint32_t k = 0; k < s->nstreams; k++) {
+ 		uint32_t n = s->smr[k], want = SMMU_SMR_VALID | (uint32_t)s->streams[k].mask << 16 | s->streams[k].id, now = ~0u;
+@@ -683,7 +709,7 @@ s1_on_locked(struct negroni_s1 *s)
+ 			return EBUSY;
+ 		}
+ 		s->written[k] = true;
+-		if ((error = g_put(s, "S2CR", SMMU_S2CR(n), s->cb, ~0u))) {     /* type 0 = translate */
++		if ((error = g_put(s, "S2CR", SMMU_S2CR(n), s->cb, S2CR_OWN))) {        /* type 0 = translate */
+ 			return error;
+ 		}
+ 		if (!s->reused[k] && (error = g_put(s, "SMR", SMMU_SMR(n), want, ~0u))) {
