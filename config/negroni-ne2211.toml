@@ -26,6 +26,19 @@ args = ["--board", "negroni", "--ufs", "--dram", "840000000:C0000000", "--darwin
 "mac-address-bluetooth0" = "02:00:5e:77:ee:11"
 "mac-address-ethernet0" = "02:00:5e:77:ee:12"
 
+# /arm-io/bluetooth, only with ADT_BT=1 (scripts/ios16/adt-extra.py; Bluetooth stage B, patch 0332, negronibt=4).
+# Values as the D22AP node /arm-io/uart1/bluetooth (external/bergamota/docs/BT_IOS_TRANSPORT.md 1.1) except the
+# address (= mac-address-bluetooth0; the kernel writes it into the controller, HCI step 20) and compatible.
+# Strings: "str:...", u32: integers, raw bytes: hex.
+[adt.bluetooth]
+"device_type" = "str:bluetooth"
+"compatible" = "str:bluetooth,qca6490"
+"local-mac-address" = "02:00:5e:77:ee:11"
+"transport-encoding" = 3          # H4BC (bluetoothd 0x100156160); BT_HCI_TRANSPORT in the job overrides it
+"transport-speed" = 3000000       # the rate stage A leaves the controller at (negronibt_baud)
+"vendor-id" = 0x05ac
+"product-id" = 0x12a0
+
 [payload]
 tool = "external/slop/negroni-ios/tools/mkdarwinboot.py"
 volume = "NEGRONIESP"

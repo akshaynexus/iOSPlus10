@@ -13,7 +13,10 @@
    - com.apple.aggregated(.addaily): sailfish removes them (note: Settings > Battery waits on its
      power log, UniXNU-pong mkjobs.py:216-224).
    - com.apple.bluetoothd: no transport / no device-tree node -> relaunched every 10 s
-     (slop commit b4766ca, HackiOS, UniXNU-zeta lite list).
+     (slop commit b4766ca, HackiOS, UniXNU-zeta lite list). [V 2026-10-26] The launchd cache of our root has no
+     bluetoothd job (only BlueTool, bluetoothuiservice, bluetoothuserd), so this entry removes nothing today.
+     BT=1 roots add the job from /System/Library/LaunchDaemons/com.apple.bluetoothd.plist (scripts/bt/root-add-bt.sh,
+     run later by root-finish.sh, with BT_HCI_TRANSPORT and the BlueTool stand-in); the default root is unchanged.
    - com.apple.activityawardsd: Fitness awards; aborts (sig 6) at launch, relaunched every 10 s
      (14 crashes in logs/usblog-20261024-195455.txt, first NE2211 boot).
 2. ExtensionKit feature flag enforce_xpc_cache_code_signing = off, else installd rejects every

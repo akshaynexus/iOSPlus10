@@ -43,7 +43,9 @@ Tags: **[V]** = checked in the named file; **[I]** = inference, not tested on th
 |---|---|---|
 | A1 (0330) | `negronibt=1`: map, pin census, 4 rail votes, GCC clocks, GENI firmware/FIFO check, UART 115200 FIFO mode, BT_EN power sequence, RX idle bytes | code + build done, not run on the phone |
 | A2 (0331) | `negronibt=2`: H4, HCI_RESET, EDL version, 3 Mbaud. `negronibt=3`: + rampatch/NVM download from the BT pack in the WLAN area, reset, build label, BD address | code + build done (patches/xnu/README-bluetooth.md), not run on the phone |
-| B | iOS transport (section 4) | not started |
+| B1 (0332) | `negronibt=4`: step 20 (ADT BD address -> 0xfc14), kernel control `com.apple.uart.bluetooth`, `/dev/uart.bluetooth`, `/dev/cu.bluetooth`, `/dev/btwake`, RX thread with IBS | code + full kernel build (README-bluetooth.md stage B), not run on the phone |
+| B2 (0333) | HCI shim: every host OGF 0x3f command answered in the kernel (Broadcom write commands status 0, others 0x01), QCA vendor events dropped | code + build, not run |
+| B3 (userland) | `negroni-bluetool` (BlueTool stand-in), `hcitest`; `BT=1` root (scripts/bt/root-add-bt.sh) or `scripts/bt/phone-bt.sh on`; ADT node with `ADT_BT=1` | built (out/bt/userland), not run |
 
 Firmware for stage A2 [V scripts]: one file `negroni-bt.bin` (pack: `NEGRBTFW` header + 105 hp* files) inside the
 WLAN firmware area (userdata blocks N-19457 .. N-11266, same format, 199 files); `scripts/bt/mkbtarea.sh` builds it.
@@ -64,6 +66,20 @@ No new userdata area. Layout: patches/xnu/README-bluetooth.md section 0331.
   a BlueTool stub. Risk: bluetoothd's Apple/Broadcom vendor commands on a Qualcomm controller (manufacturer 0x001d).
   Nobody has shown stock bluetoothd working on a Qualcomm chip.
 
+### 4.1 Stage B design (2026-10-26, verified in the 20H392 binaries; addresses in README-bluetooth.md stage B)
+
+- [V] bluetoothd = H4 over a kernel control (POSIX driver 0x100066bdc). The plain name `com.apple.uart.bluetooth` is chosen with
+  the job env `BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000`; the default `.sk.` name needs Skywalk.
+- [V] It starts only with a registry entry `bluetooth` that has a non-zero `local-mac-address` (env address discarded at
+  0x1000268f4) -> ADT node `/arm-io/bluetooth` (`ADT_BT=1`, values in config `[adt.bluetooth]`).
+- [V] Chip boot is BlueTool's job (XPC `RunBuiltinScript`); BlueTool knows Broadcom only and its override scripts need
+  ReleaseType Vendor/Internal -> `negroni-bluetool` answers `result 0` (the kernel booted the chip).
+- [V] Stack init keeps no manufacturer (0x10010bcd4-0x10010bd10): no Broadcom-manufacturer check found on that path.
+  [I] The chipset id (virtual setters 0x10025a8e8 / 0x100285134) has an unknown source; it may matter later (LE features).
+- [V] OGF 0x3f overlaps: Broadcom/Apple VSC numbers mean other things on the QCA (0xfc48 baud) -> the 0333 shim answers all
+  of them in the kernel. [I] A status 0x01 for some VSC may still stop bluetoothd: the log names each opcode.
+- Kernel boot-args: `negronibt=4 negronipanic=30 negronipanicreason=2` (README-bluetooth.md "Boot-args for stage B").
+
 ## 5. Next steps
 
 1. Owner approval, then write `out/firmware/wlan-area.bin` (with the BT pack) and boot `out/ios16-bt` (`negronibt=3`).
@@ -71,4 +87,7 @@ No new userdata area. Layout: patches/xnu/README-bluetooth.md section 0331.
    `13 ... 1 acks`, `15 ... 27 acks`, `19 BD address ...`.
 2. If step 9/10 time out: check `8 N bytes` and the RX buffer dump in the "no answer" line; try `negronibt_noflow=1`,
    `negronibt_rfropen=1`; `negronibt_baud=115200` isolates the baud change.
-3. Stage B (iOS transport, section 4).
+3. Stage B (owner approval, combined image with `negronibt=4`, `ADT_BT=1`, a `BT=1` root or `scripts/bt/phone-bt.sh on`):
+   first `scripts/bt/phone-bt.sh test` (hcitest: HCI_Reset CC status 0, Read_Local_Version, Read_BD_ADDR = 02:00:5e:77:ee:11
+   reversed, 0xfc79 answered by the shim), then bluetoothd (`h4 control ... connected by bluetoothd`, `phone-bt.sh log`),
+   then Settings > Bluetooth (toggle, scan). Audio (BTAudioHALPlugin back: BTAUDIO=1) later.

@@ -1,0 +1,192 @@
+diff --git a/bsd/dev/negroni_bt_shim.c b/bsd/dev/negroni_bt_shim.c
+index 61d1ddb..e3c60ae 100644
+--- a/bsd/dev/negroni_bt_shim.c
++++ b/bsd/dev/negroni_bt_shim.c
+@@ -1,31 +1,182 @@
+ /*
+- * NEGRONI QCA6490 Bluetooth HCI shim (patch 0333 replaces this pass-through of patch 0332).
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450): QCA6490 Bluetooth, stage B part 2 (patch 0333): the HCI shim between iOS
++ * (bluetoothd / BlueTool, which expect a Broadcom controller) and the Qualcomm controller. Called by the H4
++ * transport (negroni_bt_h4.c, patch 0332) for every complete packet. negronibt=4 only.
++ *
++ * Why [V, 20H392 usr/sbin/bluetoothd and usr/sbin/BlueTool, iPhone10,3]:
++ *   - bluetoothd does not boot the chip: it asks BlueTool over XPC (RunBuiltinScript "boot"/"init", reply handler
++ *     0x10027249c reads "result" 0x100272580, "firmware" 0x10027261c, "manufacturer" 0x100272630; result 10 or 13 =
++ *     "Couldn't find a platform / chipset / firmware combination" 0x10062ccb8 -> power state 2 = "Unknown
++ *     platform/chipset/manufacturer combination, restarting" 0x1003a619c). BlueTool's built-in scripts are
++ *     Broadcom only (.hcd patchram: 0xfc2e download minidriver, 0xfc4c write RAM, 0xfc4e launch RAM; 0xfc18 baud,
++ *     0xfc01 BD address, 0xfc27 sleep mode; opcodes as in Linux btbcm.c:155-379, hci_bcm.c:195-399). The
++ *     /etc/bluetool override scripts are read only when MobileGestalt ReleaseType is Vendor or Internal
++ *     (BlueTool 0x100016054-0x100016280). Userland answer: a BlueTool stand-in (userland/bluetooth).
++ *   - bluetoothd's own stack init (initCmd*CB) is standard HCI. Read Local Version (initCmdReadLocalVersionCB
++ *     0x10010bc6c) keeps HCI version, HCI revision, LMP version and LMP subversion (0x10010bcd4-0x10010bd10) and
++ *     NOT the manufacturer: no manufacturer check there, so 0x001d (Qualcomm) passes unchanged by default.
++ *   - bluetoothd has 220 Broadcom/Apple vendor commands (name table 0x100804a20: BD_VSC_*, OLYMPIC, LE_META ...).
++ *     On the QCA6490 the OGF 0x3f space is Qualcomm's: 0xfc00 EDL patch, 0xfc0b, 0xfc14 BD address, 0xfc17 logging,
++ *     0xfc48 baud rate (btqca.h, hci_qca.c). A Broadcom opcode that is a different QCA command can change the
++ *     controller state (the baud rate!). So by default NO host vendor command reaches the controller: each one is
++ *     answered here with a Command Complete. Status 0 (success, no return parameters) for the Broadcom "write"
++ *     commands that return only a status (table below), status 0x01 (Unknown HCI Command) for all others: a
++ *     controller without the command answers the same way, and a status != 0 makes bluetoothd skip the return
++ *     parameter parser ("Unsupported command %!, ignoring error").
++ *   - Controller vendor events (code 0xff, QCA debug/log) are not delivered: bluetoothd would read them as Broadcom
++ *     or Apple vendor events.
++ * Policy boot-arg negronibt_shim: 1 (default) as above; 0 = everything passes (raw controller); 2 = every vendor
++ * command gets status 0 (experiment: may make bluetoothd parse missing return parameters).
++ * negronibt_mfr=N: rewrite the manufacturer of the Read Local Version Command Complete to N (e.g. 15 = Broadcom);
++ * default 0 = unchanged (see above).
++ * Log ("NEGRONI BT: shim ..."): every intercepted opcode (first 4 times per opcode, then every 64th), every rewrite,
++ * the controller's Read Local Version once per client, dropped vendor events (first 16).
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include "negroni_bt.h"
+ 
++#define SAY(...)        printf("NEGRONI BT: shim " __VA_ARGS__)
++
++#define H4_CMD          0x01u
++#define H4_EVT          0x04u
++#define EV_CMD_COMPLETE 0x0eu
++#define EV_VENDOR       0xffu
++#define OGF_VENDOR      0x3fu
++#define OP_READ_LOCAL_VERSION 0x1001u
++
++struct shim_op {
++	uint16_t op;
++	uint8_t status;         /* Command Complete status */
++	const char *name;
++};
++
++/*
++ * Broadcom vendor commands with a status-only Command Complete, answered "success" (so BlueTool.orig scripts and
++ * bluetoothd's sleep/PCM setup go on). Everything else in OGF 0x3f: status 0x01.
++ */
++static const struct shim_op shim_ops[] = {
++	{ 0xfc01, 0x00, "BCM Write_BD_ADDR (btbcm.c:155; the kernel set the ADT address, step 20)" },
++	{ 0xfc18, 0x00, "BCM Update_UART_Baud_Rate (hci_bcm.c:214; the line stays, see h4 termios)" },
++	{ 0xfc1c, 0x00, "BCM Write_SCO_PCM_Int_Param (btbcm.c:201)" },
++	{ 0xfc1e, 0x00, "BCM Write_PCM_Data_Format_Param" },
++	{ 0xfc27, 0x00, "BCM Write_Sleep_Mode_Param (hci_bcm.c:399; BD_VSC_WRITE_SLEEPMODE_PARAM)" },
++	{ 0xfc2e, 0x00, "BCM Download_Minidriver (btbcm.c:223)" },
++	{ 0xfc45, 0x00, "BCM Write_UART_Clock_Setting (hci_bcm.c:195)" },
++	{ 0xfc4c, 0x00, "BCM Write_RAM (.hcd patchram record)" },
++	{ 0xfc4e, 0x00, "BCM Launch_RAM (.hcd patchram end)" },
++	{ 0xfc6d, 0x00, "BCM Write_I2SPCM_Interface_Param" },
++	{ 0xfc1d, 0x01, "BCM Read_SCO_PCM_Int_Param (btbcm.c:173)" },
++	{ 0xfc5a, 0x01, "BCM Read_USB_Product (btbcm.c:379)" },
++	{ 0xfc6e, 0x01, "BCM Read_Controller_Features (btbcm.c:359)" },
++	{ 0xfc79, 0x01, "BCM Read_Verbose_Config_Version_Info (btbcm.c:339)" },
++};
++
++#define SEEN_SLOTS      1024u           /* OCF 0..0x3ff */
++
++static struct {
++	uint32_t policy, mfr;
++	bool version_logged;
++	uint16_t seen[SEEN_SLOTS];
++	uint32_t n_local, n_vse;
++} s;
++
++static inline uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
+ void
+ negroni_bt_shim_init(void)
+ {
+-	printf("NEGRONI BT: shim: pass-through (patch 0333 is not in this kernel)\n");
++	s.policy = negroni_bt_arg("shim", 1);
++	s.mfr = negroni_bt_arg("mfr", 0);
++	SAY("policy %u (%s), manufacturer rewrite %s%#x; %zu Broadcom opcodes answered with success, other vendor "
++	    "commands with status 0x01\n", s.policy,
++	    s.policy == 0 ? "pass everything" : s.policy == 2 ? "all vendor commands succeed" : "vendor commands local",
++	    s.mfr ? "to " : "off ", s.mfr, sizeof(shim_ops) / sizeof(shim_ops[0]));
++	for (size_t i = 0; i < sizeof(shim_ops) / sizeof(shim_ops[0]); i++) {
++		SAY("table %#06x -> status %#x: %s\n", shim_ops[i].op, shim_ops[i].status, shim_ops[i].name);
++	}
+ }
+ 
+ void
+ negroni_bt_shim_session(void)
+ {
++	s.version_logged = false;
++	bzero(s.seen, sizeof(s.seen));
++}
++
++static void
++answer(uint16_t op, uint8_t status)
++{
++	/* H4 event: 04 0e 04 <Num_HCI_Command_Packets 1> <op lo> <op hi> <status> */
++	const uint8_t ev[7] = { H4_EVT, EV_CMD_COMPLETE, 4, 1, (uint8_t)op, (uint8_t)(op >> 8), status };
++	negroni_bt_h4_inject(ev, sizeof(ev));
+ }
+ 
+ int
+-negroni_bt_shim_tx(const uint8_t *pkt __unused, uint32_t len __unused)
++negroni_bt_shim_tx(const uint8_t *pkt, uint32_t len)
+ {
+-	return NEGRONI_BT_SHIM_PASS;
++	if (s.policy == 0 || len < 4 || pkt[0] != H4_CMD) {
++		return NEGRONI_BT_SHIM_PASS;
++	}
++	uint16_t op = le16(pkt + 1);
++	if ((op >> 10) != OGF_VENDOR) {
++		return NEGRONI_BT_SHIM_PASS;
++	}
++	uint8_t status = 0x01;
++	const char *name = "not in the table (Broadcom/Apple VSC; the QCA opcode space differs)";
++	for (size_t i = 0; i < sizeof(shim_ops) / sizeof(shim_ops[0]); i++) {
++		if (shim_ops[i].op == op) {
++			status = shim_ops[i].status;
++			name = shim_ops[i].name;
++			break;
++		}
++	}
++	if (s.policy == 2) {
++		status = 0x00;
++	}
++	uint16_t k = s.seen[op & (SEEN_SLOTS - 1u)]++;
++	s.n_local++;
++	if (k < 4 || (k % 64u) == 0) {
++		SAY("intercepted %#06x plen %u (#%u) -> local Command Complete status %#x: %s\n", op, pkt[3], k + 1u,
++		    status, name);
++	}
++	answer(op, status);
++	return NEGRONI_BT_SHIM_DONE;
+ }
+ 
+ int
+-negroni_bt_shim_rx(uint8_t *pkt __unused, uint32_t len __unused)
++negroni_bt_shim_rx(uint8_t *pkt, uint32_t len)
+ {
++	if (s.policy == 0 || len < 3 || pkt[0] != H4_EVT) {
++		return NEGRONI_BT_SHIM_PASS;
++	}
++	if (pkt[1] == EV_VENDOR) {
++		if (s.n_vse++ < 16) {
++			SAY("controller vendor event (plen %u) not delivered (QCA debug/log; iOS reads 0xff as its own)\n",
++			    pkt[2]);
++		}
++		return NEGRONI_BT_SHIM_DROP;
++	}
++	/* 04 0e plen ncmd op(2) status hci_ver hci_rev(2) lmp_ver mfr(2) lmp_subver(2): plen 12, len 15 */
++	if (pkt[1] == EV_CMD_COMPLETE && pkt[2] >= 12 && len >= 15 && le16(pkt + 4) == OP_READ_LOCAL_VERSION &&
++	    pkt[6] == 0) {
++		uint16_t mfr = le16(pkt + 11);
++		if (!s.version_logged) {
++			s.version_logged = true;
++			SAY("Read_Local_Version: HCI %u rev %#06x, LMP %u subversion %#06x, manufacturer %#06x%s\n", pkt[7],
++			    le16(pkt + 8), pkt[10], le16(pkt + 13), mfr, mfr == 0x1d ? " (Qualcomm)" : "");
++		}
++		if (s.mfr && s.mfr != mfr) {
++			pkt[11] = (uint8_t)s.mfr;
++			pkt[12] = (uint8_t)(s.mfr >> 8);
++			SAY("Read_Local_Version: manufacturer %#06x rewritten to %#06x (negronibt_mfr)\n", mfr, s.mfr & 0xffffu);
++		}
++	}
+ 	return NEGRONI_BT_SHIM_PASS;
+ }
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */

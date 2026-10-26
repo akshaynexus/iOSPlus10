@@ -1,0 +1,1307 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 25f8d27..51821e1 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -131,6 +131,8 @@ bsd/dev/negroni_adsp.c			standard
+ bsd/dev/negroni_rpmh.c			standard
+ bsd/dev/negroni_bt.c			standard
+ bsd/dev/negroni_bt_hci.c		standard
++bsd/dev/negroni_bt_h4.c			standard
++bsd/dev/negroni_bt_shim.c		standard
+ bsd/dev/negroni_spmi.c			standard
+ bsd/dev/negroni_usb.c			standard
+ bsd/dev/negroni_gpu_blit.c		standard
+diff --git a/bsd/dev/negroni_bt.c b/bsd/dev/negroni_bt.c
+index 31d5f2e..d94045f 100644
+--- a/bsd/dev/negroni_bt.c
++++ b/bsd/dev/negroni_bt.c
+@@ -22,11 +22,13 @@
+  *   negronibt=1          steps 1-8: map, pin census, rails, clocks, GENI check, UART 115200, BT_EN, RX idle bytes
+  *   negronibt=2          + the HCI stage steps 9-11: reset, version, baud (negroni_bt_hci.c, patch 0331)
+  *   negronibt=3          + steps 12-19: rampatch + NVM from the WLAN firmware area, reset, BD address
++ *   negronibt=4          + step 20 (BD address from the ADT) + the iOS H4 transport (negroni_bt_h4.c, patch 0332):
++ *                        kernel control com.apple.uart.bluetooth, /dev/uart.bluetooth, /dev/cu.bluetooth, /dev/btwake
+  *   negronibt_delay=S    seconds before step 1 (default 3)
+  *   negronibt_noflow=1   ignore CTS (no hardware flow control)
+  *   negronibt_rfropen=1  start RX with the vendor parameters (RFR open, skip frame-error/break chars)
+  *   negronibt_aon_ms=N   BT_EN wait when WLAN_EN is low (default 100; btpower.c uses 500 below TEMP_THRESHOLD 5000 = 5 C)
+- *   negronibt_off=1      BT_EN low again at the end
++ *   negronibt_off=1      BT_EN low again at the end (negronibt=4: the transport then reports a failure)
+  * Failure after step 7: BT_EN low again. Failure after step 4: the GCC vote word is restored when it changed.
+  * The four rails are never voted off (all shared; smpb12 is the UFS vccq parent).
+  * Log: "NEGRONI BT: step N NAME" before each step, then detail lines; "NEGRONI BT: stop: ..." on failure.
+@@ -476,6 +478,14 @@ rx_drain(void)
+ {
+ 	uint32_t st = rd(bt.se + GENI_RX_FIFO_STATUS), wc = st & 0x1ffffffu;
+ 	for (uint32_t i = 0; i < wc; i++) {
++		/*
++		 * Patch 0332: read a FIFO word only when the ring has room for all 4 bytes. Else the word stays in the
++		 * FIFO, the FIFO fills, RFR (it follows the FIFO) stops the controller: no byte is lost. This matters
++		 * when negroni_bt_uart_write drains RX during a long send while the H4 RX thread waits for the UART.
++		 */
++		if ((bt.tail + RX_RING - bt.head - 1u) % RX_RING < 4u) {
++			break;
++		}
+ 		uint32_t w = rd(bt.se + GENI_RX_FIFO), nb = 4;
+ 		if (i == wc - 1u && (st & (1u << 31))) {
+ 			nb = (st >> 28) & 7u;
+@@ -747,7 +757,11 @@ bt_thread(void *arg __unused, wait_result_t w __unused)
+ 		delay_s = 120;
+ 	}
+ 	IOSleep(delay_s * 1000u);
+-	SAY("start (negronibt=%u; stage A: UART + BT_EN%s)\n", bt.mode, bt.mode >= 2 ? " + HCI" : "");
++	SAY("start (negronibt=%u; stage A: UART + BT_EN%s%s)\n", bt.mode, bt.mode >= 2 ? " + HCI" : "",
++	    bt.mode >= 4 ? " + iOS transport" : "");
++	if (bt.mode >= 4) {
++		negroni_bt_h4_attach();         /* userland can open the transport now; sends wait for the chip */
++	}
+ 
+ 	STEP(1, "map GCC, TLMM, QUP2, SE5");
+ 	bt.gcc_qup = map(GCC_PHYS + GCC_QUP_WIN, GCC_QUP_WIN_SIZE);
+@@ -804,7 +818,17 @@ bt_thread(void *arg __unused, wait_result_t w __unused)
+ 	}
+ 	ok = true;
+ 	SAY("stage A done (RX ring dropped %u bytes)\n", bt.dropped);
++	if (bt.mode >= 4) {
++		if (bt.poweroff) {
++			negroni_bt_h4_fail("negronibt_off=1");
++		} else {
++			negroni_bt_h4_start();          /* the transport owns the UART from here */
++		}
++	}
+ out:
++	if (!ok && bt.mode >= 4) {
++		negroni_bt_h4_fail("stage A or the HCI stage failed");
++	}
+ 	if (bt.powered && (!ok || bt.poweroff)) {
+ 		gpio_out(PIN_BT_EN, false, 1u);
+ 		SAY("BT_EN low again (%s); rails stay on\n", ok ? "negronibt_off=1" : "failure");
+diff --git a/bsd/dev/negroni_bt.h b/bsd/dev/negroni_bt.h
+index 9312e01..8cbd779 100644
+--- a/bsd/dev/negroni_bt.h
++++ b/bsd/dev/negroni_bt.h
+@@ -23,5 +23,20 @@ uint32_t negroni_bt_arg(const char *name, uint32_t def);        /* "negronibt_"
+  * 0 or errno; an error makes negroni_bt.c drive BT_EN low (the stage A failure path). */
+ int negroni_bt_hci_run(uint32_t mode);
+ 
++/* iOS H4 transport, implemented in negroni_bt_h4.c (patch 0332), negronibt >= 4. */
++void negroni_bt_h4_attach(void);                /* kernel control + /dev nodes; sends wait for the chip */
++void negroni_bt_h4_start(void);                 /* chip ready: RX thread, sends go to the UART */
++void negroni_bt_h4_fail(const char *why);       /* chip not ready: sends fail with EIO */
++void negroni_bt_h4_inject(const uint8_t *pkt, uint32_t len);    /* one H4 packet toward userland */
++
++/* HCI shim, implemented in negroni_bt_shim.c (patch 0333 replaces the 0332 pass-through) */
++#define NEGRONI_BT_SHIM_PASS    0               /* send / deliver the packet unchanged (or as rewritten) */
++#define NEGRONI_BT_SHIM_DONE    1               /* host command answered in the kernel: not sent */
++#define NEGRONI_BT_SHIM_DROP    2               /* controller packet not delivered to userland */
++void negroni_bt_shim_init(void);
++int negroni_bt_shim_tx(const uint8_t *pkt, uint32_t len);      /* host -> controller, pkt[0] = H4 type */
++int negroni_bt_shim_rx(uint8_t *pkt, uint32_t len);            /* controller -> host, may rewrite in place */
++void negroni_bt_shim_session(void);                             /* a new userland client: reset per-client state */
++
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+ #endif /* _NEGRONI_BT_H_ */
+diff --git a/bsd/dev/negroni_bt_h4.c b/bsd/dev/negroni_bt_h4.c
+new file mode 100644
+index 0000000..6263296
+--- /dev/null
++++ b/bsd/dev/negroni_bt_h4.c
+@@ -0,0 +1,1045 @@
++/*
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450): QCA6490 Bluetooth, stage B (patch 0332): the H4 transport that iOS
++ * bluetoothd and BlueTool open, on top of the GENI UART of patch 0330 after the firmware download of patch 0331.
++ * negronibt=4 only. Plan: iOSPlus10 docs/bluetooth-plan.md section 4; README-bluetooth.md section 0332.
++ *
++ * What iOS 16 (20H392, iPhone10,3 userland) opens [V, addresses in usr/sbin/bluetoothd]:
++ *   - main 0x100026af4..0x100026b68: access("/dev/cu.bluetooth"), access("/dev/uart.bluetooth"), else an
++ *     IORegistry service named "marconi-bt" or "bluetooth"; none: "No bluetooth on this device", exit 0.
++ *   - transport choice 0x100156160: env BT_HCI_TRANSPORT ("H4BC:POSIX:com.apple.uart.bluetooth,3000000"), else
++ *     the ADT u32 transport-encoding (3 = H4BC).
++ *   - POSIX open 0x100066bdc: socket(PF_SYSTEM, SOCK_STREAM, SYSPROTO_CONTROL), CTLIOCGINFO on the control name
++ *     (default "com.apple.uart.sk.bluetooth" = Skywalk, not made here), connect; for a plain name:
++ *     getsockopt(SYSPROTO_CONTROL, TIOCGETA 0x40487413, 72 bytes), cfmakeraw + cfsetspeed (ADT transport-speed,
++ *     default 2400000), c_cflag 0x38b00 (CS8 CREAD HUPCL CLOCAL CRTSCTS), setsockopt(TIOCSETA 0x80487414) whose
++ *     return value is not checked (0x1000671c8). Then plain read/write of H4 bytes.
++ *   - H4BC opens /dev/btwake (0x100066b24); a failure is only logged.
++ * So this file makes:
++ *   1. the kernel control "com.apple.uart.bluetooth" (SOCK_STREAM, not privileged: bluetoothd and BlueTool run as
++ *      mobile), TIOCGETA/TIOCSETA as socket options;
++ *   2. /dev/uart.bluetooth and /dev/cu.bluetooth (one char device: read/write raw H4 bytes, select/poll/kqueue,
++ *      TIOCGETA/TIOCSETA/FIONREAD) and /dev/btwake (open/close do nothing: the kernel owns BT_EN);
++ *   3. one client at a time (control or device), EBUSY for a second one. A client change empties the queues.
++ * Data path:
++ *   RX: a kernel thread polls the UART (0330 helpers; the GENI SE has no interrupt line wired here). Poll period 1 ms
++ *       for 200 ms after traffic, 5 ms up to 5 s, then 20 ms; RFR follows the RX FIFO, so the controller waits while
++ *       the host does not read (no loss, no busy loop). H4 framing (type 04 event, 02 ACL, 03 SCO, 05 ISO), the QCA
++ *       in-band sleep bytes (hci_qca.c: 0xfe SLEEP_IND, 0xfd WAKE_IND -> answer 0xfc WAKE_ACK, 0xfc WAKE_ACK) are
++ *       handled here and never reach userland. Whole packets go to a 64 KiB queue; the UART is not read while the
++ *       queue has less than one maximal packet + one read of room (flow control by RFR).
++ *   TX: userland bytes are framed into H4 packets; each packet goes through the HCI shim (negroni_bt_shim.c,
++ *       patch 0333) and then to the UART. When the controller sent SLEEP_IND, a WAKE_IND goes first and the send
++ *       waits up to 100 ms per try for WAKE_ACK (3 tries, IBS_WAKE_RETRANS_TIMEOUT_MS of hci_qca.c).
++ *   Termios from userland is stored and logged; the line stays at the rate stage A set (the controller would not
++ *   follow a host-only change) with RTS/CTS on.
++ * Limits: a send is a bounded busy-wait in the 0330 helper (delay(2) polls of the TX FIFO: wire time + 100 ms for CTS);
++ * RX throughput is bounded by the GENI RX FIFO depth per poll period (the controller waits on RFR in between).
++ * Before the chip is ready (stage A + HCI stage still running), a send waits up to negronibt_wait_ms (default 30000);
++ * after a stage A/HCI failure it fails with EIO. Every wait is bounded.
++ * Boot-args: negronibt_h4log=N (log the first N packets per direction, default 300; HW errors, IBS and the shim are
++ *   always logged), negronibt_wait_ms=MS.
++ * Log lines start "NEGRONI BT: h4 ". Proof of a working path: "h4 control ... connected", "h4 tx cmd 0x0c03",
++ * "h4 rx evt 0x0e ... op 0x0c03 status 0".
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/select.h>
++#include <sys/termios.h>
++#include <sys/ttycom.h>
++#include <sys/filio.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/vnode.h>                  /* IO_NDELAY */
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include "negroni_bt.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++
++#define SAY(...)        printf("NEGRONI BT: h4 " __VA_ARGS__)
++
++#define H4_CTL_NAME     "com.apple.uart.bluetooth"
++#define H4_CMD          0x01u
++#define H4_ACL          0x02u
++#define H4_SCO          0x03u
++#define H4_EVT          0x04u
++#define H4_ISO          0x05u
++#define IBS_SLEEP_IND   0xfeu
++#define IBS_WAKE_IND    0xfdu
++#define IBS_WAKE_ACK    0xfcu
++#define PKT_MAX         4104u           /* largest H4 frame accepted in each direction (ACL 5 + 4095 + slack) */
++#define RXQ_SIZE        (64u << 10)
++#define RD_CHUNK        512u            /* UART bytes per poll */
++#define RXQ_ROOM        (PKT_MAX + RD_CHUNK + 64u)
++#define CTL_CHUNK       2048u
++#define DUMP_MAX        16u
++
++#define OWNER_NONE      0u
++#define OWNER_CTL       1u
++#define OWNER_DEV       2u
++
++#define MINOR_UART      0
++#define MINOR_CU        1
++#define MINOR_WAKE      2
++
++static LCK_GRP_DECLARE(h4_grp, "negroni_bt_h4");
++static LCK_MTX_DECLARE(h4_lock, &h4_grp);       /* state, queues, owner */
++static LCK_MTX_DECLARE(h4_uart, &h4_grp);       /* the 0330 UART helpers (not reentrant) */
++static LCK_MTX_DECLARE(h4_tx, &h4_grp);         /* TX framing + packet order */
++
++static struct {
++	bool attached, ready, failed, kick, ctl_full, ctrl_awake, ibs_seen, ackd;
++	uint32_t owner, unit, log_tx, log_rx, wait_ms;
++	kern_ctl_ref ref;
++	int major;
++	uint64_t last_act, last_stats;
++	/* RX (thread only) */
++	uint8_t rx[PKT_MAX];
++	uint32_t rxn;
++	/* RX queue toward userland (h4_lock) */
++	uint8_t q[RXQ_SIZE];
++	uint32_t qh, qt, qn;
++	struct selinfo rsel;
++	/* TX framing (h4_tx) */
++	uint8_t tx[PKT_MAX];
++	uint32_t txn;
++	struct termios tio;
++	/* counters */
++	uint32_t n_tx, n_rx, n_local, n_drop_noowner, n_drop_full, n_drop_shim, n_garbage_rx, n_garbage_tx;
++	uint32_t n_ibs_rx, n_ibs_wake, n_ibs_timeout, n_tx_err, n_wake_open;
++	uint64_t b_tx, b_rx, b_user;
++	char why[64];
++} t;
++
++static uint8_t ctl_buf[CTL_CHUNK];              /* RX thread only */
++
++static inline uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++static uint64_t
++now_us(void)
++{
++	return negroni_bt_us();
++}
++
++/* " xx xx ..." of the first DUMP_MAX bytes into s (caller's buffer: TX and RX run on different threads) */
++static const char *
++hexs(char *s, size_t sz, const uint8_t *b, uint32_t n)
++{
++	uint32_t i, m = MIN(n, DUMP_MAX);
++	s[0] = 0;
++	for (i = 0; i < m && 3 * i + 4 <= sz; i++) {
++		snprintf(s + 3 * i, 4, " %02x", b[i]);
++	}
++	if (n > m && 3 * i + 5 <= sz) {
++		strlcpy(s + 3 * i, " ...", 5);
++	}
++	return s;
++}
++
++static const char *
++type_name(uint8_t ty)
++{
++	switch (ty) {
++	case H4_CMD: return "cmd";
++	case H4_ACL: return "acl";
++	case H4_SCO: return "sco";
++	case H4_EVT: return "evt";
++	case H4_ISO: return "iso";
++	default: return "?";
++	}
++}
++
++/*
++ * Bytes of the H4 frame that starts at p (n bytes there): 0 = not known yet (need more bytes), else the frame
++ * length. dir_tx: host -> controller (command header 3 bytes), else controller -> host (event header 2 bytes).
++ * Unknown type: returns UINT32_MAX.
++ */
++static uint32_t
++frame_len(const uint8_t *p, uint32_t n, bool dir_tx)
++{
++	switch (p[0]) {
++	case H4_CMD:
++		if (!dir_tx) {
++			return UINT32_MAX;
++		}
++		return n < 4 ? 0 : 4u + p[3];
++	case H4_EVT:
++		if (dir_tx) {
++			return UINT32_MAX;
++		}
++		return n < 3 ? 0 : 3u + p[2];
++	case H4_ACL:
++		return n < 5 ? 0 : 5u + le16(p + 3);
++	case H4_SCO:
++		return n < 4 ? 0 : 4u + p[3];
++	case H4_ISO:
++		return n < 5 ? 0 : 5u + (le16(p + 3) & 0x3fffu);
++	default:
++		return UINT32_MAX;
++	}
++}
++
++static void
++log_pkt(const char *dir, const uint8_t *p, uint32_t n)
++{
++	char hx[3 * DUMP_MAX + 8], what[64];
++	what[0] = 0;
++	if (p[0] == H4_CMD && n >= 4) {
++		snprintf(what, sizeof(what), " %#06x plen %u", le16(p + 1), p[3]);
++	} else if (p[0] == H4_EVT && n >= 3) {
++		const uint8_t *e = p + 3;
++		uint32_t pl = p[2];
++		if (p[1] == 0x0e && pl >= 4) {
++			snprintf(what, sizeof(what), " 0x0e plen %u (Command Complete op %#06x status %#x)", pl, le16(e + 1), e[3]);
++		} else if (p[1] == 0x0e && pl >= 3) {
++			snprintf(what, sizeof(what), " 0x0e plen %u (Command Complete op %#06x)", pl, le16(e + 1));
++		} else if (p[1] == 0x0f && pl >= 4) {
++			snprintf(what, sizeof(what), " 0x0f plen %u (Command Status op %#06x status %#x)", pl, le16(e + 2), e[0]);
++		} else if (p[1] == 0x10 && pl >= 1) {
++			snprintf(what, sizeof(what), " 0x10 plen %u (Hardware Error code %#x)", pl, e[0]);
++		} else if (p[1] == 0x3e && pl >= 1) {
++			snprintf(what, sizeof(what), " 0x3e plen %u (LE Meta sub %#x)", pl, e[0]);
++		} else {
++			snprintf(what, sizeof(what), " %#04x plen %u", p[1], pl);
++		}
++	} else if ((p[0] == H4_ACL || p[0] == H4_ISO) && n >= 5) {
++		snprintf(what, sizeof(what), " handle %#x len %u", le16(p + 1) & 0x0fffu, le16(p + 3));
++	} else if (p[0] == H4_SCO && n >= 4) {
++		snprintf(what, sizeof(what), " handle %#x len %u", le16(p + 1) & 0x0fffu, p[3]);
++	}
++	SAY("%s %s%s:%s\n", dir, type_name(p[0]), what, hexs(hx, sizeof(hx), p, n));
++}
++
++/* ---- RX queue (h4_lock held) ---- */
++
++static void
++q_put(const uint8_t *p, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		t.q[t.qh] = p[i];
++		t.qh = (t.qh + 1u) % RXQ_SIZE;
++	}
++	t.qn += n;
++}
++
++static uint32_t
++q_peek(uint8_t *p, uint32_t max)
++{
++	uint32_t n = MIN(max, t.qn), at = t.qt;
++	for (uint32_t i = 0; i < n; i++) {
++		p[i] = t.q[at];
++		at = (at + 1u) % RXQ_SIZE;
++	}
++	return n;
++}
++
++static void
++q_drop(uint32_t n)
++{
++	n = MIN(n, t.qn);
++	t.qt = (t.qt + n) % RXQ_SIZE;
++	t.qn -= n;
++}
++
++static void
++q_flush(void)
++{
++	t.qh = t.qt = t.qn = 0;
++	t.ctl_full = false;
++}
++
++/* wake the RX thread (fast poll, ctl delivery) */
++static void
++kick(void)
++{
++	lck_mtx_lock(&h4_lock);
++	t.kick = true;
++	lck_mtx_unlock(&h4_lock);
++	wakeup(&t.kick);
++}
++
++/* one whole packet toward the current client (any thread) */
++static void
++deliver(const uint8_t *p, uint32_t n, bool local)
++{
++	bool owner_dev = false, ok = false;
++
++	lck_mtx_lock(&h4_lock);
++	if (t.owner == OWNER_NONE) {
++		t.n_drop_noowner++;
++	} else if (RXQ_SIZE - t.qn < n) {
++		t.n_drop_full++;
++	} else {
++		q_put(p, n);
++		ok = true;
++		owner_dev = t.owner == OWNER_DEV;
++		if (local) {
++			t.n_local++;
++		}
++	}
++	t.kick = true;
++	lck_mtx_unlock(&h4_lock);
++	if (ok && owner_dev) {
++		selwakeup(&t.rsel);
++		wakeup(&t.q);
++	}
++	wakeup(&t.kick);
++}
++
++void
++negroni_bt_h4_inject(const uint8_t *pkt, uint32_t len)
++{
++	if (len == 0 || len > PKT_MAX) {
++		return;
++	}
++	if (t.log_rx > 0) {
++		log_pkt("rx(local)", pkt, len);
++	}
++	deliver(pkt, len, true);
++}
++
++/* ---- UART side ---- */
++
++static int
++uart_send(const uint8_t *p, uint32_t n)
++{
++	lck_mtx_lock(&h4_uart);
++	int error = negroni_bt_uart_write(p, n);
++	lck_mtx_unlock(&h4_uart);
++	return error;
++}
++
++/* TX side of in-band sleep: wake the controller first when it said SLEEP_IND (h4_tx held, not h4_lock) */
++static void
++ibs_wake(void)
++{
++	lck_mtx_lock(&h4_lock);
++	bool awake = t.ctrl_awake;
++	lck_mtx_unlock(&h4_lock);
++	if (awake) {
++		return;
++	}
++	for (uint32_t try = 0; try < 3; try++) {
++		uint8_t b = IBS_WAKE_IND;
++		lck_mtx_lock(&h4_lock);
++		t.ackd = false;
++		lck_mtx_unlock(&h4_lock);
++		(void)uart_send(&b, 1);
++		kick();
++		lck_mtx_lock(&h4_lock);
++		if (!t.ackd) {
++			struct timespec ts = { 0, 100 * 1000 * 1000 };  /* IBS_WAKE_RETRANS_TIMEOUT_MS, hci_qca.c:49 */
++			(void)msleep(&t.ackd, &h4_lock, PZERO, "nbtibs", &ts);
++		}
++		bool ok = t.ackd;
++		t.n_ibs_wake++;
++		lck_mtx_unlock(&h4_lock);
++		if (ok) {
++			return;
++		}
++	}
++	lck_mtx_lock(&h4_lock);
++	t.n_ibs_timeout++;
++	t.ctrl_awake = true;            /* send anyway; the next SLEEP_IND sets it again */
++	lck_mtx_unlock(&h4_lock);
++	SAY("IBS: no WAKE_ACK after 3 x 100 ms; the packet goes out anyway\n");
++}
++
++/* one complete packet from the controller (RX thread) */
++static void
++rx_packet(uint8_t *p, uint32_t n)
++{
++	t.n_rx++;
++	t.b_rx += n;
++	bool hw_err = p[0] == H4_EVT && n >= 3 && p[1] == 0x10;
++	if (t.log_rx > 0 || hw_err) {
++		if (t.log_rx > 0) {
++			t.log_rx--;
++		}
++		log_pkt("rx", p, n);
++	}
++	if (negroni_bt_shim_rx(p, n) == NEGRONI_BT_SHIM_DROP) {
++		t.n_drop_shim++;
++		return;
++	}
++	deliver(p, n, false);
++}
++
++static void
++rx_bytes(const uint8_t *b, uint32_t n)
++{
++	while (n > 0) {
++		uint32_t m = MIN(n, PKT_MAX - t.rxn);
++		memcpy(t.rx + t.rxn, b, m);
++		t.rxn += m;
++		b += m;
++		n -= m;
++		while (t.rxn > 0) {
++			uint8_t c = t.rx[0];
++			uint32_t need;
++			if (c == IBS_SLEEP_IND || c == IBS_WAKE_IND || c == IBS_WAKE_ACK) {
++				lck_mtx_lock(&h4_lock);
++				t.ibs_seen = true;
++				t.ctrl_awake = c != IBS_SLEEP_IND;
++				if (c == IBS_WAKE_ACK) {
++					t.ackd = true;
++				}
++				uint32_t k = t.n_ibs_rx++;
++				lck_mtx_unlock(&h4_lock);
++				if (c == IBS_WAKE_ACK) {
++					wakeup(&t.ackd);
++				}
++				if (c == IBS_WAKE_IND) {
++					uint8_t ack = IBS_WAKE_ACK;
++					(void)uart_send(&ack, 1);
++				}
++				if (k < 32) {
++					SAY("IBS %s from the controller%s\n", c == IBS_SLEEP_IND ? "SLEEP_IND" :
++					    c == IBS_WAKE_IND ? "WAKE_IND" : "WAKE_ACK", c == IBS_WAKE_IND ? " (WAKE_ACK sent)" : "");
++				}
++				memmove(t.rx, t.rx + 1, --t.rxn);
++				continue;
++			}
++			need = frame_len(t.rx, t.rxn, false);
++			if (need == UINT32_MAX || need > PKT_MAX) {
++				if (t.n_garbage_rx++ < 32) {
++					SAY("rx: byte %#x is no packet start (or the frame is too long), dropped\n", c);
++				}
++				memmove(t.rx, t.rx + 1, --t.rxn);
++				continue;
++			}
++			if (need == 0 || t.rxn < need) {
++				break;
++			}
++			rx_packet(t.rx, need);
++			t.rxn -= need;
++			memmove(t.rx, t.rx + need, t.rxn);
++		}
++	}
++}
++
++/* queued bytes -> the kernel control client (RX thread only; no lock held around ctl_*) */
++static void
++deliver_ctl(void)
++{
++	for (;;) {
++		lck_mtx_lock(&h4_lock);
++		if (t.owner != OWNER_CTL || t.qn == 0 || t.ctl_full) {
++			lck_mtx_unlock(&h4_lock);
++			return;
++		}
++		uint32_t unit = t.unit;
++		uint32_t n = q_peek(ctl_buf, CTL_CHUNK);
++		kern_ctl_ref ref = t.ref;
++		lck_mtx_unlock(&h4_lock);
++
++		size_t space = 0;
++		errno_t e = ctl_getenqueuespace(ref, unit, &space);
++		if (e == 0 && space == 0) {
++			e = ENOBUFS;
++		}
++		if (e == 0) {
++			n = (uint32_t)MIN((size_t)n, space);
++			e = ctl_enqueuedata(ref, unit, ctl_buf, n, 0);
++		}
++		lck_mtx_lock(&h4_lock);
++		if (e == 0) {
++			if (t.owner == OWNER_CTL && t.unit == unit) {
++				q_drop(n);
++			}
++			t.b_user += n;
++		} else if (e == ENOBUFS) {
++			t.ctl_full = true;      /* ctl_rcvd clears it */
++		}
++		lck_mtx_unlock(&h4_lock);
++		if (e) {
++			if (e != ENOBUFS) {
++				SAY("control unit %u: enqueue error %d\n", unit, e);
++			}
++			return;
++		}
++	}
++}
++
++static void
++stats(bool force)
++{
++	uint64_t now = now_us();
++	if (!force && now - t.last_stats < 60ull * 1000000u) {
++		return;
++	}
++	t.last_stats = now;
++	SAY("stats: tx %u pkts %llu B, rx %u pkts %llu B, to user %llu B, local answers %u, dropped (no client %u, "
++	    "queue full %u, shim %u), garbage rx %u tx %u, IBS rx %u wake %u timeouts %u, tx errors %u\n",
++	    t.n_tx, t.b_tx, t.n_rx, t.b_rx, t.b_user, t.n_local, t.n_drop_noowner, t.n_drop_full, t.n_drop_shim,
++	    t.n_garbage_rx, t.n_garbage_tx, t.n_ibs_rx, t.n_ibs_wake, t.n_ibs_timeout, t.n_tx_err);
++}
++
++static void
++h4_rx_thread(void *arg __unused, wait_result_t w __unused)
++{
++	uint8_t buf[RD_CHUNK];
++	uint32_t last_counts = 0;
++
++	SAY("RX thread running (poll 1/5/20 ms, queue %u KiB)\n", RXQ_SIZE >> 10);
++	for (;;) {
++		uint32_t n = 0;
++		lck_mtx_lock(&h4_lock);
++		bool room = RXQ_SIZE - t.qn >= RXQ_ROOM;
++		lck_mtx_unlock(&h4_lock);
++		if (room) {
++			lck_mtx_lock(&h4_uart);
++			n = negroni_bt_uart_read(buf, sizeof(buf));
++			lck_mtx_unlock(&h4_uart);
++		}
++		if (n) {
++			t.last_act = now_us();
++			rx_bytes(buf, n);
++		}
++		deliver_ctl();
++		if (t.n_tx + t.n_rx != last_counts) {
++			last_counts = t.n_tx + t.n_rx;
++			stats(false);
++		}
++		if (n == sizeof(buf)) {
++			continue;               /* more bytes are waiting in the FIFO */
++		}
++		uint64_t idle = now_us() - t.last_act;
++		uint32_t ms = idle < 200000u ? 1u : idle < 5000000u ? 5u : 20u;
++		lck_mtx_lock(&h4_lock);
++		if (!t.kick) {
++			struct timespec ts = { 0, (long)ms * 1000 * 1000 };
++			(void)msleep(&t.kick, &h4_lock, PZERO, "nbth4rx", &ts);
++		}
++		t.kick = false;
++		lck_mtx_unlock(&h4_lock);
++	}
++}
++
++/* ---- TX side (userland -> controller) ---- */
++
++static int
++wait_ready(void)
++{
++	uint64_t end = now_us() + (uint64_t)t.wait_ms * 1000u;
++	int error = 0;
++
++	lck_mtx_lock(&h4_lock);
++	while (!t.ready && !t.failed) {
++		if (now_us() >= end) {
++			error = ETIMEDOUT;
++			break;
++		}
++		struct timespec ts = { 1, 0 };
++		int r = msleep(&t.ready, &h4_lock, PZERO | PCATCH, "nbth4up", &ts);
++		if (r == EINTR || r == ERESTART) {
++			error = r;
++			break;
++		}
++	}
++	if (!error && !t.ready) {
++		error = EIO;
++	}
++	lck_mtx_unlock(&h4_lock);
++	return error;
++}
++
++/* one complete host packet (h4_tx held) */
++static int
++tx_packet(const uint8_t *p, uint32_t n)
++{
++	t.n_tx++;
++	t.b_tx += n;
++	if (t.log_tx > 0) {
++		t.log_tx--;
++		log_pkt("tx", p, n);
++	}
++	if (negroni_bt_shim_tx(p, n) == NEGRONI_BT_SHIM_DONE) {
++		return 0;
++	}
++	ibs_wake();
++	int error = uart_send(p, n);
++	t.last_act = now_us();
++	kick();                         /* the answer comes soon: fast poll */
++	if (error) {
++		if (t.n_tx_err++ < 16) {
++			SAY("tx: UART write of %u bytes failed (%d)\n", n, error);
++		}
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++tx_bytes(const uint8_t *b, uint32_t n)
++{
++	int error = 0;
++	while (n > 0 && !error) {
++		uint32_t m = MIN(n, PKT_MAX - t.txn);
++		memcpy(t.tx + t.txn, b, m);
++		t.txn += m;
++		b += m;
++		n -= m;
++		while (t.txn > 0 && !error) {
++			uint32_t need = frame_len(t.tx, t.txn, true);
++			if (need == UINT32_MAX || need > PKT_MAX) {
++				if (t.n_garbage_tx++ < 32) {
++					SAY("tx: byte %#x is no host packet start (or the frame is too long), dropped\n", t.tx[0]);
++				}
++				memmove(t.tx, t.tx + 1, --t.txn);
++				continue;
++			}
++			if (need == 0 || t.txn < need) {
++				break;
++			}
++			error = tx_packet(t.tx, need);
++			t.txn -= need;
++			memmove(t.tx, t.tx + need, t.txn);
++		}
++	}
++	return error;
++}
++
++static int
++send_user(const uint8_t *b, uint32_t n)
++{
++	int error = wait_ready();
++	if (error) {
++		return error;
++	}
++	lck_mtx_lock(&h4_tx);
++	error = tx_bytes(b, n);
++	lck_mtx_unlock(&h4_tx);
++	return error;
++}
++
++/* ---- termios (socket option and ioctl) ---- */
++
++static void
++tio_default(void)
++{
++	bzero(&t.tio, sizeof(t.tio));
++	t.tio.c_cflag = CS8 | CREAD | CLOCAL | CRTSCTS;
++	t.tio.c_ispeed = t.tio.c_ospeed = negroni_bt_uart_baud() ? negroni_bt_uart_baud() : 3000000u;
++}
++
++static void
++tio_set(const struct termios *n, const char *via)
++{
++	uint32_t line = negroni_bt_uart_baud();
++	SAY("%s: termios speed %lu, c_cflag %#lx (%s flow control), c_iflag %#lx; the line stays at %u baud, RTS/CTS on\n",
++	    via, (unsigned long)n->c_ospeed, (unsigned long)n->c_cflag,
++	    (n->c_cflag & CRTSCTS) == CRTSCTS ? "RTS/CTS" : "no", (unsigned long)n->c_iflag, line);
++	if (n->c_ospeed && n->c_ospeed != line) {
++		SAY("%s: speed %lu asked, %u kept (the controller was set to %u in stage A)\n", via,
++		    (unsigned long)n->c_ospeed, line, line);
++	}
++	t.tio = *n;
++}
++
++/* ---- session (one client) ---- */
++
++static void
++session_reset(void)         /* h4_lock held */
++{
++	q_flush();
++	t.log_tx = t.log_rx = negroni_bt_arg("h4log", 300);
++	tio_default();
++}
++
++/* ---- kernel control ---- */
++
++static errno_t
++ctl_connect_cb(kern_ctl_ref ref __unused, struct sockaddr_ctl *sac, void **unitinfo)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	lck_mtx_lock(&h4_lock);
++	if (t.owner != OWNER_NONE) {
++		uint32_t o = t.owner;
++		lck_mtx_unlock(&h4_lock);
++		SAY("control connect from %s[%d] refused: busy (%s client)\n", name, proc_selfpid(),
++		    o == OWNER_CTL ? "control" : "/dev");
++		return EBUSY;
++	}
++	t.owner = OWNER_CTL;
++	t.unit = sac->sc_unit;
++	session_reset();
++	bool ready = t.ready, failed = t.failed;
++	lck_mtx_unlock(&h4_lock);
++	lck_mtx_lock(&h4_tx);
++	t.txn = 0;
++	lck_mtx_unlock(&h4_tx);
++	negroni_bt_shim_session();
++	*unitinfo = NULL;
++	SAY("control %s connected (unit %u) by %s[%d]; chip %s\n", H4_CTL_NAME, sac->sc_unit, name, proc_selfpid(),
++	    ready ? "ready" : failed ? "FAILED" : "not ready yet");
++	return 0;
++}
++
++static errno_t
++ctl_disconnect_cb(kern_ctl_ref ref __unused, u_int32_t unit, void *unitinfo __unused)
++{
++	lck_mtx_lock(&h4_lock);
++	bool mine = t.owner == OWNER_CTL && t.unit == unit;
++	if (mine) {
++		t.owner = OWNER_NONE;
++		q_flush();
++	}
++	lck_mtx_unlock(&h4_lock);
++	if (mine) {
++		SAY("control unit %u disconnected\n", unit);
++		stats(true);
++	}
++	return 0;
++}
++
++static errno_t
++ctl_send_cb(kern_ctl_ref ref __unused, u_int32_t unit, void *unitinfo __unused, mbuf_t m, int flags __unused)
++{
++	errno_t error = 0;
++
++	lck_mtx_lock(&h4_lock);
++	bool mine = t.owner == OWNER_CTL && t.unit == unit;
++	lck_mtx_unlock(&h4_lock);
++	if (!mine) {
++		mbuf_freem(m);
++		return ENOTCONN;
++	}
++	for (mbuf_t n = m; n != NULL && !error; n = mbuf_next(n)) {
++		if (mbuf_len(n) > 0) {
++			error = send_user((const uint8_t *)mbuf_data(n), (uint32_t)mbuf_len(n));
++		}
++	}
++	mbuf_freem(m);
++	return error;
++}
++
++static errno_t
++ctl_setopt_cb(kern_ctl_ref ref __unused, u_int32_t unit __unused, void *unitinfo __unused, int opt, void *data,
++    size_t len)
++{
++	if ((unsigned)opt == (unsigned)TIOCSETA || (unsigned)opt == (unsigned)TIOCSETAW ||
++	    (unsigned)opt == (unsigned)TIOCSETAF) {
++		if (data == NULL || len < sizeof(struct termios)) {
++			return EINVAL;
++		}
++		tio_set((const struct termios *)data, "setsockopt");
++		return 0;
++	}
++	SAY("setsockopt %#x (%zu bytes) ignored\n", (unsigned)opt, len);
++	return 0;
++}
++
++static errno_t
++ctl_getopt_cb(kern_ctl_ref ref __unused, u_int32_t unit __unused, void *unitinfo __unused, int opt, void *data,
++    size_t *len)
++{
++	if ((unsigned)opt == (unsigned)TIOCGETA) {
++		if (data == NULL) {
++			*len = sizeof(struct termios);
++			return 0;
++		}
++		if (*len < sizeof(struct termios)) {
++			return EINVAL;
++		}
++		memcpy(data, &t.tio, sizeof(struct termios));
++		*len = sizeof(struct termios);
++		return 0;
++	}
++	SAY("getsockopt %#x (%zu bytes): not supported\n", (unsigned)opt, *len);
++	return ENOTSUP;
++}
++
++static void
++ctl_rcvd_cb(kern_ctl_ref ref __unused, u_int32_t unit, void *unitinfo __unused, int flags __unused)
++{
++	lck_mtx_lock(&h4_lock);
++	if (t.owner == OWNER_CTL && t.unit == unit) {
++		t.ctl_full = false;
++		t.kick = true;
++	}
++	lck_mtx_unlock(&h4_lock);
++	wakeup(&t.kick);
++}
++
++/* ---- /dev/uart.bluetooth, /dev/cu.bluetooth, /dev/btwake ---- */
++
++static int
++h4_open(dev_t dev, int flags __unused, int devtype __unused, struct proc *p __unused)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	if (minor(dev) == MINOR_WAKE) {
++		if (t.n_wake_open++ < 8) {
++			SAY("/dev/btwake opened by %s[%d] (BT_WAKE: nothing to do, BT_EN is the kernel's)\n", name,
++			    proc_selfpid());
++		}
++		return 0;
++	}
++	if (minor(dev) > MINOR_CU) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&h4_lock);
++	if (t.owner != OWNER_NONE) {
++		lck_mtx_unlock(&h4_lock);
++		SAY("/dev open by %s[%d] refused: busy\n", name, proc_selfpid());
++		return EBUSY;
++	}
++	t.owner = OWNER_DEV;
++	session_reset();
++	lck_mtx_unlock(&h4_lock);
++	lck_mtx_lock(&h4_tx);
++	t.txn = 0;
++	lck_mtx_unlock(&h4_tx);
++	negroni_bt_shim_session();
++	SAY("/dev/%s opened by %s[%d]\n", minor(dev) == MINOR_UART ? "uart.bluetooth" : "cu.bluetooth", name,
++	    proc_selfpid());
++	return 0;
++}
++
++static int
++h4_close(dev_t dev, int flags __unused, int devtype __unused, struct proc *p __unused)
++{
++	if (minor(dev) == MINOR_WAKE) {
++		return 0;
++	}
++	lck_mtx_lock(&h4_lock);
++	bool mine = t.owner == OWNER_DEV;
++	if (mine) {
++		t.owner = OWNER_NONE;
++		q_flush();
++	}
++	lck_mtx_unlock(&h4_lock);
++	wakeup(&t.q);                   /* a reader blocked in h4_read sees the closed client (EIO) */
++	selwakeup(&t.rsel);
++	if (mine) {
++		SAY("/dev client closed\n");
++		stats(true);
++	}
++	return 0;
++}
++
++static int
++h4_read(dev_t dev, struct uio *uio, int ioflag)
++{
++	uint8_t b[1024];
++	int error = 0;
++
++	if (minor(dev) > MINOR_CU) {
++		return ENODEV;
++	}
++	lck_mtx_lock(&h4_lock);
++	while (t.qn == 0) {
++		if (t.owner != OWNER_DEV) {
++			error = EIO;
++			break;
++		}
++		if (ioflag & IO_NDELAY) {
++			error = EWOULDBLOCK;
++			break;
++		}
++		error = msleep(&t.q, &h4_lock, PZERO | PCATCH, "nbth4rd", NULL);
++		if (error) {
++			break;
++		}
++	}
++	uint32_t n = 0;
++	if (!error) {
++		n = q_peek(b, (uint32_t)MIN((user_ssize_t)sizeof(b), uio_resid(uio)));
++		q_drop(n);
++		t.b_user += n;
++		t.kick = true;
++	}
++	lck_mtx_unlock(&h4_lock);
++	wakeup(&t.kick);
++	if (!error && n) {
++		error = uiomove((const char *)b, (int)n, uio);
++	}
++	return error;
++}
++
++static int
++h4_write(dev_t dev, struct uio *uio, int ioflag __unused)
++{
++	uint8_t b[1024];
++	int error = 0;
++
++	if (minor(dev) > MINOR_CU) {
++		return ENODEV;
++	}
++	while (uio_resid(uio) > 0 && !error) {
++		int n = (int)MIN((user_ssize_t)sizeof(b), uio_resid(uio));
++		error = uiomove((char *)b, n, uio);
++		if (!error) {
++			error = send_user(b, (uint32_t)n);
++		}
++	}
++	return error;
++}
++
++static int
++h4_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag __unused, struct proc *p __unused)
++{
++	if (minor(dev) > MINOR_CU) {
++		return ENOTTY;
++	}
++	switch (cmd) {
++	case TIOCGETA:
++		memcpy(data, &t.tio, sizeof(struct termios));
++		return 0;
++	case TIOCSETA:
++	case TIOCSETAW:
++	case TIOCSETAF:
++		tio_set((const struct termios *)data, "ioctl");
++		return 0;
++	case FIONREAD:
++		lck_mtx_lock(&h4_lock);
++		*(int *)data = (int)t.qn;
++		lck_mtx_unlock(&h4_lock);
++		return 0;
++	case FIONBIO:
++	case FIOASYNC:
++	case TIOCEXCL:
++	case TIOCNXCL:
++		return 0;
++	case TIOCFLUSH:
++		if (*(int *)data == 0 || (*(int *)data & FREAD)) {
++			lck_mtx_lock(&h4_lock);
++			q_flush();
++			lck_mtx_unlock(&h4_lock);
++		}
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++h4_select(dev_t dev, int which, void *wql, struct proc *p)
++{
++	int ready = 0;
++	if (minor(dev) > MINOR_CU) {
++		return 0;
++	}
++	lck_mtx_lock(&h4_lock);
++	if (which == FREAD) {
++		ready = t.qn > 0 || t.owner != OWNER_DEV;
++		if (!ready) {
++			selrecord(p, &t.rsel, wql);
++		}
++	} else if (which == FWRITE) {
++		ready = 1;
++	}
++	lck_mtx_unlock(&h4_lock);
++	return ready;
++}
++
++static const struct cdevsw h4_cdevsw = {
++	.d_open = h4_open,
++	.d_close = h4_close,
++	.d_read = h4_read,
++	.d_write = h4_write,
++	.d_ioctl = h4_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = h4_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type = 0,
++};
++
++/* ---- stage hooks (negroni_bt.c) ---- */
++
++void
++negroni_bt_h4_attach(void)
++{
++	struct kern_ctl_reg reg;
++	errno_t e;
++
++	if (t.attached) {
++		return;
++	}
++	t.attached = true;
++	t.wait_ms = MIN(negroni_bt_arg("wait_ms", 30000), 120000u);
++	t.ctrl_awake = true;
++	lck_mtx_lock(&h4_lock);
++	session_reset();
++	lck_mtx_unlock(&h4_lock);
++	negroni_bt_shim_init();
++
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, H4_CTL_NAME, sizeof(reg.ctl_name));
++	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM | CTL_FLAG_REG_EXTENDED;       /* not CTL_FLAG_PRIVILEGED */
++	reg.ctl_sendsize = 64u << 10;
++	reg.ctl_recvsize = 128u << 10;
++	reg.ctl_connect = ctl_connect_cb;
++	reg.ctl_disconnect = ctl_disconnect_cb;
++	reg.ctl_send = ctl_send_cb;
++	reg.ctl_setopt = ctl_setopt_cb;
++	reg.ctl_getopt = ctl_getopt_cb;
++	reg.ctl_rcvd = ctl_rcvd_cb;
++	e = ctl_register(&reg, &t.ref);
++	SAY("kernel control %s: %s (error %d)\n", H4_CTL_NAME, e ? "NOT registered" : "registered", e);
++
++	t.major = cdevsw_add(-1, &h4_cdevsw);
++	if (t.major < 0) {
++		SAY("cdevsw_add failed: no /dev nodes\n");
++		return;
++	}
++	void *a = devfs_make_node(makedev(t.major, MINOR_UART), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.bluetooth");
++	void *b = devfs_make_node(makedev(t.major, MINOR_CU), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "cu.bluetooth");
++	void *c = devfs_make_node(makedev(t.major, MINOR_WAKE), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "btwake");
++	SAY("/dev/uart.bluetooth %s, /dev/cu.bluetooth %s, /dev/btwake %s (major %d); sends wait up to %u ms for the chip\n",
++	    a ? "ok" : "FAILED", b ? "ok" : "FAILED", c ? "ok" : "FAILED", t.major, t.wait_ms);
++}
++
++void
++negroni_bt_h4_start(void)
++{
++	thread_t thread;
++
++	if (!t.attached) {
++		negroni_bt_h4_attach();
++	}
++	lck_mtx_lock(&h4_lock);
++	tio_default();
++	lck_mtx_unlock(&h4_lock);
++	t.last_act = now_us();
++	if (kernel_thread_start(h4_rx_thread, NULL, &thread) != KERN_SUCCESS) {
++		negroni_bt_h4_fail("no RX thread");
++		return;
++	}
++	thread_deallocate(thread);
++	lck_mtx_lock(&h4_lock);
++	t.ready = true;
++	lck_mtx_unlock(&h4_lock);
++	wakeup(&t.ready);
++	SAY("transport ready at %u baud: the UART belongs to the transport now\n", negroni_bt_uart_baud());
++}
++
++void
++negroni_bt_h4_fail(const char *why)
++{
++	lck_mtx_lock(&h4_lock);
++	t.failed = true;
++	strlcpy(t.why, why, sizeof(t.why));
++	lck_mtx_unlock(&h4_lock);
++	wakeup(&t.ready);
++	SAY("transport not usable: %s (sends fail with EIO)\n", why);
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_bt_hci.c b/bsd/dev/negroni_bt_hci.c
+index 4db030e..32ab471 100644
+--- a/bsd/dev/negroni_bt_hci.c
++++ b/bsd/dev/negroni_bt_hci.c
+@@ -16,6 +16,10 @@
+  *                 step 15 NVM (TLV type 2; tag 17 baud byte = the current rate), every segment acked
+  *                 step 16 SoC logging off (0xfc17), step 17 HCI_RESET, step 18 firmware build label (0xfc00, sub 0x20)
+  *                 step 19 HCI_Read_BD_ADDR (0x1009), compared with the NVM tag 2 default (qca_check_bdaddr)
++ *   negronibt=4   + step 20 (patch 0332) the BD address from the ADT (/arm-io/bluetooth local-mac-address, the
++ *                 address bluetoothd reads) with EDL_WRITE_BD_ADDR (0xfc14, qca_set_bdaddr btqca.c:1005: the
++ *                 address goes out in display order), then HCI_Read_BD_ADDR again; then negroni_bt.c hands the
++ *                 UART to the iOS transport (negroni_bt_h4.c)
+  * Boot-args: negronibt_to=MS (every wait, default 2000, max 30000), negronibt_baud=B (default 3000000; 115200 =
+  *   no change), negronibt_ibs=1 (NVM: set the in-band sleep bit, tag 17 byte 0 bit 7, and the deep sleep bit,
+  *   tag 27 byte 0 bit 0, as Linux does; default: the file's bits stay; the host has no IBS state machine).
+@@ -31,6 +35,7 @@
+ #include <machine/machine_routines.h>
+ #include <vm/vm_kern.h>
+ #include <libkern/crypto/sha2.h>
++#include <pexpert/device_tree.h>
+ #include "negroni_bt.h"
+ 
+ extern int negroni_ufs_wlan_area_read(uint64_t at, void *dst, uint32_t count);
+@@ -57,6 +62,7 @@ extern int negroni_ufs_wlan_area_read(uint64_t at, void *dst, uint32_t count);
+ #define OP_EDL          0xfc00u         /* EDL_PATCH_CMD_OPCODE, btqca.h:8 */
+ #define OP_SET_BAUD     0xfc48u         /* hci_qca.c:1347 */
+ #define OP_LOGGING      0xfc17u         /* QCA_DISABLE_LOGGING, btqca.h:20 */
++#define OP_WRITE_BDADDR 0xfc14u         /* EDL_WRITE_BD_ADDR_OPCODE, btqca.h; qca_set_bdaddr btqca.c:1005 (patch 0332) */
+ #define EDL_VER_REQ     0x19u
+ #define EDL_TLV_REQ     0x1eu
+ #define EDL_BUILD_INFO  0x20u
+@@ -773,7 +779,7 @@ step_build_info(void)
+ }
+ 
+ static int
+-step_bdaddr(void)
++step_bdaddr(uint32_t n, uint8_t out[6])
+ {
+ 	const uint8_t *r;
+ 	uint32_t rl;
+@@ -782,17 +788,57 @@ step_bdaddr(void)
+ 		return error;
+ 	}
+ 	if (rl != 7) {                                                  /* status + bdaddr (btqca.c:700) */
+-		SAY("19 Read_BD_ADDR: %u return bytes, expected 7\n", rl);
++		SAY("%u Read_BD_ADDR: %u return bytes, expected 7\n", n, rl);
+ 		return EIO;
+ 	}
+ 	const uint8_t *a = r + 1;                                       /* little endian on the wire */
+ 	bool dflt = h.nvm_bdaddr_set && memcmp(a, h.nvm_bdaddr, 6) == 0;
+-	SAY("19 BD address %02x:%02x:%02x:%02x:%02x:%02x (%s)\n", a[5], a[4], a[3], a[2], a[1], a[0],
++	SAY("%u BD address %02x:%02x:%02x:%02x:%02x:%02x (%s)\n", n, a[5], a[4], a[3], a[2], a[1], a[0],
+ 	    dflt ? "= the NVM default: no unique address; the host must set one (0xfc14, btqca.c:1005)" :
+ 	    "not the NVM default");
++	if (out) {
++		memcpy(out, a, 6);
++	}
+ 	return 0;
+ }
+ 
++/*
++ * Step 20 (negronibt=4, patch 0332): give the controller the address bluetoothd uses. bluetoothd 20H392 reads
++ * local-mac-address of the registry entry "bluetooth" (main 0x1000269b4 -> 0x100027920) and discards the
++ * BT_DEVICE_ADDRESS env value (0x1000268f4/0x1000268f8 store zero after the sscanf). The ADT bytes are in display
++ * order (02:00:5e:...), which is the order 0xfc14 wants (btqca.c:1011 swaps the little-endian bdaddr_t).
++ * A failure is logged only: the controller then keeps the NVM default and bluetoothd still runs.
++ */
++static void
++step_set_bdaddr(void)
++{
++	DTEntry node;
++	void const *prop = NULL;
++	unsigned int size = 0;
++	const uint8_t *r;
++	uint32_t rl;
++	uint8_t now[6];
++
++	if (SecureDTLookupEntry(NULL, "/arm-io/bluetooth", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "local-mac-address", &prop, &size) != kSuccess || size < 6) {
++		SAY("20 no /arm-io/bluetooth local-mac-address in the ADT: the controller keeps its address\n");
++		return;
++	}
++	const uint8_t *a = prop;
++	if (cmd_cc(OP_WRITE_BDADDR, a, 6, &r, &rl)) {
++		SAY("20 0xfc14 failed: the controller keeps its address\n");
++		return;
++	}
++	if (step_bdaddr(20, now) == 0) {
++		bool same = true;
++		for (uint32_t i = 0; i < 6; i++) {
++			same = same && now[i] == a[5 - i];
++		}
++		SAY("20 ADT address %02x:%02x:%02x:%02x:%02x:%02x %s\n", a[0], a[1], a[2], a[3], a[4], a[5],
++		    same ? "is the controller address now" : "NOT taken by the controller");
++	}
++}
++
+ int
+ negroni_bt_hci_run(uint32_t mode)
+ {
+@@ -855,10 +901,14 @@ negroni_bt_hci_run(uint32_t mode)
+ 	STEP(18, "firmware build info (0xfc00 0x20)");
+ 	step_build_info();
+ 	STEP(19, "HCI_Read_BD_ADDR (0x1009)");
+-	if ((error = step_bdaddr())) {
++	if ((error = step_bdaddr(19, NULL))) {
+ 		SAY("stop: step 19 failed (%d)\n", error);
+ 		goto out;
+ 	}
++	if (mode >= 4) {
++		STEP(20, "BD address from the ADT (0xfc14)");
++		step_set_bdaddr();
++	}
+ 	SAY("HCI stage done: firmware ROM %02x%s loaded, %u baud\n", h.rom, h.gf ? " GF" : "", negroni_bt_uart_baud());
+ out:
+ 	if (h.fw) {
+diff --git a/bsd/dev/negroni_bt_shim.c b/bsd/dev/negroni_bt_shim.c
+new file mode 100644
+index 0000000..61d1ddb
+--- /dev/null
++++ b/bsd/dev/negroni_bt_shim.c
+@@ -0,0 +1,31 @@
++/*
++ * NEGRONI QCA6490 Bluetooth HCI shim (patch 0333 replaces this pass-through of patch 0332).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "negroni_bt.h"
++
++void
++negroni_bt_shim_init(void)
++{
++	printf("NEGRONI BT: shim: pass-through (patch 0333 is not in this kernel)\n");
++}
++
++void
++negroni_bt_shim_session(void)
++{
++}
++
++int
++negroni_bt_shim_tx(const uint8_t *pkt __unused, uint32_t len __unused)
++{
++	return NEGRONI_BT_SHIM_PASS;
++}
++
++int
++negroni_bt_shim_rx(uint8_t *pkt __unused, uint32_t len __unused)
++{
++	return NEGRONI_BT_SHIM_PASS;
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
