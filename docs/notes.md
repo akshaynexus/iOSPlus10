@@ -384,6 +384,28 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
     charger-glink, not camera); image out/ios16-cam (config args + `negronicam=2 negronipanic=30 negronipanicreason=2`; boot_a
     280e12237a9084b6...). Not flashed. Proof line to look for: `NEGRONI CAM: chip id 0x0789 (expected 0x0789, ...): MATCH`.
 
+- 2026-10-26 evening (camera agent 3; patches 0312-0316; build only). Details: `patches/xnu/README-camera.md` "Levels 3-6",
+  `docs/camera-plan.md` (levels 3-6 + the iOS capture service design).
+  - [V] Votes now come first (0312, `negronicam_votes=1` default, every level): RPMh `mmcx.lvl` NOM (titan GDSC parent
+    pm8350c_s2_mmcx_voter_level, live.dts:10766) and BCM CN0/MM1 (x = 0, y = 1) + MM0/SH0/MC0 for `cam_ahb` and `cam_hf_0`
+    (live.dts:22712-22748; BCM membership from Linux sm8450.c). negroni_rpmh.c has a BCM cmd-db lookup (slave type 5,
+    aux {u32 unit, u16 width}) and `negroni_rpmh_cam_bcm` (whitelist, bcm-voter.c math). [I] Votes are not dropped.
+  - [V] IMX789 has a full self-contained register table in the OnePlus kernel: the FTM table
+    `cam_sensor_settings.h:6017-6141` (116 writes, 4000x3008 RAW10 binned, 3 trios, ends with stream on), used by
+    `cam_ftm_power_up` after the plain power-up. The init table `cam_sensor_initsettings.h:1` (184 writes) is for the
+    CAMX path. The module file has the per-mode tables too (`regSetting`, 40-byte entries; layout not decoded).
+  - [V] Module file `resolutionData` words [10]/[11]/[14] = line length / frame length / output pixel clock
+    (mode 1: 18880, 3144, 750.45 MHz). [I] module "settle" values are settle counts.
+  - [V] CSIPHY rails pm8350_l5/l6 are the UFS PHY rails (live.dts:10429-10430): never vote them from the camera.
+  - [V] `qcom,cam_smmu` has no `expanded_memory`: IFE WM addresses are 32-bit (buffers below 4 GiB).
+  - [V] camera_region 0x9f500000 lies inside the UEFI "PIL Reserved" map entry (Mu negroniPkg MemoryMapLib.c:14).
+  - [V] CAMERA_ICP.mdt: 21 phdrs, seg 0 headers 0x2d4 + seg 20 hash 0x10b8 packed = the 5004-byte mdt; load span
+    0..0x700000 relocatable. Empty .bNN files exist (b10-b16, b19): mkadsparea.py now skips empty files.
+  - [V] iOS: AppleH10CamInUserClient has 94 selectors (table 0xfffffff006f3c768 in the 20H392 iPhone10,3 kernelcache);
+    H10ISP.mediacapture opens type 42; sel 10 = ISP firmware command packets (573 call sites); `FirmwareLoaded`
+    property + IOResources `applecamerad` start the stack. `scripts/camera/ios-re.sh` reproduces it into out/camera/ios-re.
+  - [V] Build: full kernel out/kernel/local-20261026-173833/kernel.development.negroni, sha256 4e4d155111db6c7329e1b542111c5bc48f9c42afcbeb278eb0ceb378d79a158b (after the review fixes: HFI_Q_WORDS 239, BCM enable x = 0 / y = 1, MXC NOM; all patches applied incl. 0310-0316; skipped only the 4 usual dxb patches). No image (owner rule: the main session builds one combined image). compile-one of negroni_cam.c at each stage 0312-0316 and of negroni_rpmh.c: OK. Not run on the phone.
+
 ## 14. Bold Text (2026-10-24, reviewed 2026-10-25)
 
 - [V] Root cause: SpringBoard NULL call in `CI::GLContext::init` via `+[CUIShapeEffectStack sharedCIContext]` (section 4 and "CoreImage/PosterBoard crash"); details: [boldtext-crash.md](boldtext-crash.md).
@@ -559,6 +581,45 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
   swaps/s, held `negronigpu_uihold` 1000 ms; thermal cap still wins). Images `out/ios16-perf`, `out/ios16-perf-noshift`
   (scripts/display/build-perf.sh): kernel local-20261026-082629 (sha256 92f50f3a...), boot_a 2583f0ab... /
   50d09e1b... 0268 became 0286 (it changes 0281/0285 code; name order). [I] Not booted. Next: panel double buffer (DPU base flip, 0234 code) or zero-copy.
+
+- Panel wake and double buffering (2026-10-26, display agent; patches 0268, 0269, README-gpu-kernel.md sections 19/20,
+  README-brightness.md "0268"). [V log 13:24-13:30] the 0258 wake (0x11, 133 ms, 0x29) gave `DCS ok` but a black panel
+  with a purple strip. [V display-drivers] Android sends the whole on-command and then the 0x0A PPS on every display on
+  (dsi_panel.c:5708-5760, dsi_display.c:9165-9170), LP (no on-command-state: default LP, dsi_panel.c:2678-2680), long
+  packets by memory DMA (dsi_ctrl_hw_cmn.c:870). [V] The UEFI XML `DSIInitSequence` is not empty (display-refresh-plan.md
+  said so: wrong): 116 lines, the same sequence + `2C/00` fake frames in the 121 ms wait; its `39 9E` PPS = the DT 9E
+  PPS with version 0x12 and 128 bytes (only byte 1 differs). 0268: `negronifb_wake=2` (default) = auto-refresh paused,
+  the 94-packet on-command, the 0x0A PPS, auto-refresh back, 50 ms TE/frame check, DBV; packets > 60 bytes from a
+  16 KiB buffer at 0xbaafc000 (end of the splash region) by memory DMA [I: works under XNU's SMMU state; the UEFI used it];
+  a set lock against the 0259 VRR sets. 0269 `negronifb_dbuf=1` (default 0): 3 panel buffers (0xb8000000, 0xb89f0000,
+  0xb93e0000), full-panel one-layer frames into a free buffer, SSPP_SRC0_ADDR + CTL_FLUSH (0234 probe's pipe/CTL) after
+  the copy's fence, flip taken = CTL_FLUSH bits clear; display off parks on the shown buffer; panic = the panel memory.
+  2 buffers would cap the GPU path at 60/s. GPU: one mapping per panel buffer. Build: kernel local-20261026-125636
+  (sha256 dc55e5fd...), image `out/ios16-dpu` (boot_a fa73ea88...; config args + `negronifb_sleep=1 negronifb_dbuf=1
+  negronipanic=30 negronipanicreason=2`). [I] Not booted.
+
+- DSI/DPU follow-up of the display audit (2026-10-26, DSI agent; patches 0292-0296, README-gpu-kernel.md sections 22-26,
+  docs/display-refresh-plan.md section 8; all default off; build-only). [V source]
+  - 0292 `negronifb_dsidma=1|2`: command sets (0259 VRR, 0268 on-command) as Android sends them: batches up to the packet
+    without the DT 0x40 flag in one memory DMA from 0268's buffer 0xbaafc000, inside 0268's set lock, one MDP-busy wait per
+    set. A failed DMA = memory DMA off for the boot, rest packet by packet. 0259 mode 1 now HS by default (DT state).
+  - 0293 `negronifb_esd=1|2`: DCS reads (port of dsi_message_rx/get_cmd_read_data: 0x37 + 0x06 with BTA, RDBK_DATA_CTRL
+    0x1d4, RDBK_DATA 0x6c-0x78); panel ID once (da/db/dc, 0a, 0e, a1 x 11 = oplus date); 0x0a every 5 s, expect 0x9d/0x9f;
+    wrong twice = off-command + 0268 wake (`negroni_backlight_reinit`); 3 read errors in a row = check off.
+  - 0294: tearcheck vsync_count 66/88/132 on 0259 mode 2 switches (`negronifb_tcfg=0` = off).
+  - 0295 `negronifb_teirq=1`: first SPI support of the port (pe_fiq.c `negroni_spi_register`, sleh.c dispatch); MDSS line
+    INTID 115 (SPI 83, live.dts mdss_mdp), INTF_1 tear RD_PTR (0x36800 block) at line init + 1; the stamp feeds 0259's
+    TE lock (needs `negronifb_te=1`). The tick stays the 0254 timer.
+  - 0296 `negronifb_pwrprobe=1` (read-only DISP_CC/GCC/DSI clock and GDSC dump) and `negronifb_idle=2` (Android's
+    no-transfer idle: after 58 ms without a swap the auto-refresh goes off with sequence 1, then one CTL_START per new
+    frame; display off restores it). No clock gating yet: with the auto-refresh on, no display clock may drop (table in
+    README section 26). Refused with `negronifb_vrr=1|3`, `negronifb_dbuf=1`, `negronifb_zerocopy=1`.
+  - Rebase lesson: 0268 (written at the same time) already had a memory-DMA path for long packets and a set lock; 0292
+    reuses its buffer and lock instead of a second buffer. 0288 also changes sleh.c/pe_fiq.c (CPU idle); 0295 sits after it.
+  - Build: kernel only (owner rule 2026-10-26: no boot image); see the plan (Display DSI/DPU status). Suggested first
+    test args: config args + `negronifb_dsidma=1 negronifb_esd=1 negronifb_pwrprobe=1`.
+  - Full builds failed twice on other agents' work in progress (0324 negroni_wlan_smmu.c `pmap_paddr_t`/`delay`; 0332
+    negroni_bt_h4.c `IO_NDELAY`), not on 0292-0296: the full-tree build must wait for every patch on disk to compile.
 
 ## 16. Metal (2026-10-25, Metal agent)
 
@@ -938,6 +999,9 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - [V] 0276 plug latency: the owner saw 5-10 s before "charging" (one full read per 20 s). The timer now ticks every `negronibatt_fast` ms (1000): VBUS over the VADC (or the BCL current sign without the VADC); a change publishes ExternalConnected at once (`external 0->1 (usbin N mV) after N ms`) and runs the full read. No plug interrupt from EE 0: SMB5 USBIN rt_sts has no APID; census `rt_sts 327` (0x2710) bit 6 follows the load current (0xc0 above ~300 mA discharge), not the cable (14 toggles with the cable in).
 - [V] 0276 applies with and without 0274 (hunks anchor on 0271-0273 lines; `#if __has_include("negroni_chg_glink.h")`). 0274 stopped applying at 13:41 (0242/0243 changed negroni_adsp.c:1644; rebased by its agent before 14:00). Build `kernel-soc3` (review fixes): out/kernel/local-20261026-084328 (sha256 20026d62...), 0274 + 0276 applied, 4 usual dxb skips; image out/ios16-soc (boot_a sha256 400f1f95..., `negronibatt=5 negronipanic=30 negronipanicreason=2`). Not booted.
 - Lesson: a bg build job that ends with `rm -rf` of its tree deletes it even when the build "succeeded" with our patch SKIPPED; check the patch-report before trusting a kernel. The 13:43 kernel-soc build (local-20261026-081636, out/ios16-soc first version) had 0274 and 0276 skipped and was rebuilt.
+- [V code] 0277 charge loop (README-battery.md s.11): after the 0274 READY, USB in, every 5 s (oplus_charger.c:110; `oplus_chg_update_work` :14580 -> `oplus_chg_protection_check` :10583 -> `oplus_chg_check_tbatt_is_good` :7950, FV+FCC on a band change :8028-8029; :7556-7558 is the FFC path, not the loop): BATT_TEMP -> JEITA band of live.dts:6681-6718 (removed/low/hot = BATT_CHG_EN 0; cold 4435 mV/600 mA; little_cold..normal 4435/1100; warm 4130/500) -> FV `BATT_VOLT_MAX` id 8 (mV, x2 pack as oplus_charger.c:7252, unit taken from the PD's own value, else no FV write) -> FCC `BATT_CHG_CTRL_LIM` id 10 (uA) = min(band, thermal level 3000/1500/1000/500 mA :6647); read back; logs on change only. Every value <= 4435 mV/cell and 1100 mA (bands_ok + per write). `negronichg_loop=0` = 0274 only.
+- [V code] 0278 (README-battery.md s.12): fSoc kept in /private/var/db/negroni_batt (negroni_batt_store.c, the RTC-file way of 0203), used only within 15 % of the OCV estimate; `Temperature` = the PD's BATT_TEMP when fresh (60 s), estimated flag false then; skin + XO (VADC 0x44) to the 0277 hub; BCL MONITOR_EN 0x80 written only when it reads off (bcl_pmic5.c:779; the phone reads `mon 80` today); the 0273 QDSS vote released with `val: 0` (qcom_aoss.c:294-296) when the debug path ends.
+- [I] Risk: the saved-percentage file lands where /private/var/db is at that time (the RTC file works there, usblog.log:318/7584).
 
 ## 15. GL driver loading on iOS 16 (GL agent, 2026-10-25) [V: 20H392 shared cache, unslid addresses]
 
@@ -1408,6 +1472,35 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   node N`, `step 17 WLFW service at node N port P`, `firmware version ... build "..."`; then step 25+ (WLAN_CFG +
   WLAN_MODE, CE/HTC/WMI: README-wifi.md "What step 25+ needs").
 
+### 2026-10-26 Wi-Fi levels 7-10 + SMMU stage 1 (patches 0320-0324; details: patches/xnu/README-wifi.md "0320"; build-only)
+
+- [V source] PCI 17cb:1103 is WCN6855 in ath11k (pci.c:32); the hw params "wcn6855 hw2.0/2.1" (core.c:397-577) are the
+  reference: 9 CEs, target CE table + service map of qca6390 (hw.c:1623/:1720), shadow registers on, credit flow on,
+  single_pdev_only, 2 rxdma per pdev, num_vdevs 4, coldboot_cal false.
+- [V source] WMI goes host->target on CE3 and target->host on CE2; HTC control: CE0 out, CE2 in; HTT: CE4 out, CE1 in.
+  (The task text said CE0 h->t, CE1/CE2 t->h: CE0 carries only HTC control.)
+- [V source] CE ring registers are at 0x1b80000 (src) / 0x1b81000 (dst), stride 0x2000, beyond the 2 MiB BAR: they go
+  through the window (BAR0 0x310c = 0x40000000 | off[24:19], data at BAR0 0x80000 + off[18:0]). Shadow registers at
+  BAR0 0x8fc + 4 i need no window. ath11k's shadow list for wcn6855 has 30 entries (20 non-CE, then 10 CE).
+- [V source] Shadow-register chips: ath11k forces the HTC credit total to 1 (htc.c:567-571): one WMI command in flight.
+- [V source] ath11k never gives WMI host memory chunks (num_mem_chunks stays 0) and sends no hw-mode TLV in WMI_INIT for
+  single_pdev_only chips; host_abi_vers is left 0.
+- [I] ath11k has no non-MSI path; ours polls the pointer area the HAL writes (TP_ADDR/HP_ADDR) instead of a CE interrupt.
+- [I] Scan without the HTT rx rings: ath11k always sets them up before a scan; if SCAN events come but no MGMT_RX, the
+  rxdma refill ring is the first suspect.
+- [V] Host tests: `scripts/wifi/wmi-host-test.sh out/kernel/tree-wmi` ALL PASS (WLAN_CFG 493 bytes, WLAN_MODE /
+  HOST_CAP gpios bytes, HTC/WMI/beacon parsers, 700 k fuzz inputs, ASan/UBSan); `qmi-host-test.sh` still ALL PASS.
+- [V] The five patches apply before 0330/0331/0350-0353 (checked with git apply on the tree at 0311).
+- [V] Full build: kernel out/kernel/local-20261026-131532/kernel.development.negroni sha256 1cb619f2040a968f...; patch-report:
+  0320-0324 applied, skips = only the 4 usual dxb ones. A first build failed on negroni_wlan_smmu.c (`pmap_paddr_t`
+  and `delay` undeclared: bsd/ needs `extern vm_map_address_t phystokv(uint64_t)` as negroni_adreno.c and
+  `<kern/clock.h>`); fixed. No boot image (owner rule 2026-10-26: the main session builds one combined image).
+- [V] Review fixes in 0324 (SMMU writes read back with EPERM on a mismatch; page entries SH = outer shareable): kernel
+  out/kernel/local-20261026-173712 (sha256 in docs/plan.md).
+- Next: owner-approved boot of out/ios16-wlan10 after levels 2-6 are proven; read `step 25`..`step 35`, the
+  `WMI READY: ... MAC` line and the `BSS N: SSID "..."` lines. If step 8 or RESPOND_MEM fails: `negroniwlan_smmu=3`
+  (owner approval: it writes the apps SMMU). If HOST_CAP is refused: `negroniwlan_hostcap=android`.
+
 ## 17. Audio (audio agent, 2026-10-25; details: docs/audio-plan.md)
 
 - [V] 20H392 HAL plug-in paths: /System/Library/Audio/Plug-Ins/HAL, /Library/Audio/Plug-Ins/HAL, /Library/Apple/Audio/Plug-Ins/HAL (shared cache strings). Apple drivers there are plain arm64 bundles, CFPlugInTypes 443ABAB8-...; BasebandVoice.driver's table = NULL + 22 function pointers (same as the macOS SDK AudioServerPlugInDriverInterface).
@@ -1417,7 +1510,7 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - [V] GPR: header 24 bytes (word 0 = 0x1860 for header only), domains APPS 3 / ADSP 2, ADSP ports APM 1, PRM 2, AMDB 3; DT ports 3/7/0x17 are APPS-side. SPF ready = APM_CMD_GET_SPF_STATE 0x01001021 -> 0x02001007 status 1. PRM clock 0x104 (TER MI2S IBIT) via PARAM_ID_RSC_AUDIO_HW_CLK 0x0800102C.
 - [V] Phone ACDB (odm/etc/acdbdata/acdb_cal.acdb) speaker device graph: SAL -> NXP TFA RX 0x1700B911 (dynamic CAPI, libtfadsp_rx.so) -> SPLITTER -> LOG -> I2S_SINK 0x0700100A; no graph uses TDM_SINK 0x0700100E.
 - [V] TFA9874 has no on-chip DSP; the stock kernel driver never talks to the ADSP; register writes alone start it. Reset GPIO is active-high (1, 5 ms, 0, 5 ms). Container odm/firmware/tfa98xx.cnt: 0x34 slot 0, 0x35 slot 1, profiles receiver/speaker/calibrate.cal. Never write MTP (0xF0..).
-- [I] Without the NXP module only the on-chip protections stay: keep the gain low (TDMSPKG <= 3 for the first test).
+- [I] Without the NXP module only the on-chip protections stay: keep the gain low. CORRECTION 2026-10-26: TDMSPKG is an attenuation (gain = 21 dB - TDMSPKG), so low gain = HIGH TDMSPKG (0244 floor 9).
 - [V] 0240 review vs Linux (smem, smp2p, qcom_aoss, mdt_loader, PAS SCM): layouts and order match. Fix: RPMh votes retry EBUSY up to 1 s (rail_vote), since touch/Wi-Fi share the RPMh try-lock. Full build OK: out/kernel/local-20261025-102834 (kernel sha256 58fffc0c..., all 19 patches/xnu applied).
 - [V] Root image 16 GiB (root-macos.sh SIZE=16g): the firmware areas at the end of userdata do not overlap HFS+.
 
@@ -1489,6 +1582,39 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
 - Next: on a charged phone with the ADSP up (steps 1..8 pass first), `negroniadsp=1 negroniadsp_step=15
   negronipanic=30 negronipanicreason=2`; read `NEGRONI ADSP`/`NEGRONI AUDIO` over `make usblog`; step by step with
   `negroniadsp_step=10..14` first. Stage (c) (TFA9874 amps) is still only planned.
+
+### 2026-10-26 evening: amps, guard, tone, earpiece, graph, crash watch (audio agent; patches 0244-0248; build-only)
+
+- [V] Paths: speaker = 2x TFA9874 (I2C SE13 0x34/0x35) on TERT MI2S, profile "speaker" (`mixer_paths.xml:2011`);
+  earpiece = the same port, 0x34 only, profile "receiver" (`mixer_paths.xml:2161`, `resourcemanager.xml:576`); WSA macro
+  and both wsa883x disabled, `wsa-max-devs 0` (`live.dts:27474, 27503, 27517, 27637`); headphones = RX macro + WCD938x
+  (`resourcemanager.xml:623`); main mics = TX-macro DMIC3/DMIC4 with WCD938x mic bias (`mixer_paths.xml:2166`).
+- [V] 0243 TLMM bug (also in the audit): GPIO registers are at 0x0f100000 + 0x1000 * n; 0243 wrote 0x0f000000 + ...
+  and mapped 840 KiB of io_submap. 0244 fixes both (32 KiB).
+- [V] TFA9874 cold start = vendor `tfa_dev_start` path for a probus chip: I2CR, RST (reg 0x90 bit 0, generic TFA2 field),
+  keys (0x0F=0x5A6B, 0xA0 = 0xFB ^ 0x5A, 0xA1 = 0x5A, 0x0F = 0), revision table (0x0a74/0x0b74/0x0c74), container device
+  items, profile items up to "default", MANSCONF 1, PWDN 0, wait CLKS (0x11 bit 7, the 9874 field; the generic TFA2 CLKS
+  0x1050 differs), RST 0, SWPROFIL/SWVSTEP, AMPE 1. The container patch is `9874_dummy.patch` (no writes). The vendor's
+  XMEM write through regs 0x90-0x92 is left out (no such registers in the 9874 field map) [I].
+- [V] Register access: 8-bit address, 16-bit big-endian value (regmap 8/16), reads with a repeated start; reset GPIO
+  active-high, 5 ms + 5 ms.
+- [V] Host test `scripts/audio/test-guard.sh` found a guard bug before any build: `o > ceiling` compared int64 with uint64,
+  so every negative sample became +ceiling. Fixed in 0244. After the fix: full-scale 1 kHz -> -20.00 dBFS peak / -23.02
+  rms; 50 Hz -> -44 dBFS; square 8 s held to -25.7 rms; mute, volume (-40), earpiece mix, cap floor (10 dB): PASS.
+- [V] (review) TDMSPKG is an ATTENUATION: gain = 21 dB - TDMSPKG, 1 dB per code (TFA9874B/TFA9875 data sheet). The first
+  0244 treated it as gain (cap 3 = 18 dB, louder than the vendor's 14/16 dB): REJECTED and fixed. Now a floor: speaker
+  TDMSPKG >= 9 (12 dB, 2/4 dB under the vendor), receiver >= 15 (6 dB); never below the container value; logged as 21 - TDMSPKG dB.
+- [V] Build 2026-10-26 (`scripts/audio/build-audio-kernel.sh`, kernel only by the owner rule; lock out/kernel/.lock held):
+  `out/kernel/local-20261026-174012/kernel.development.negroni` sha256
+  daf42c442b7cd2a94e7a82d214d1461ab76f2f28292b6ba0e26369d831765af7 (after the TDMSPKG-floor fix); patch-report: 0242-0248 applied, all patches/xnu
+  applied, only the 4 usual dxb skips; strings `NEGRONI TFA`, `TONE done`, `negroniaudio_amp`, `ADSP FATAL AFTER START`,
+  `negroni_audio_route` are in the kernel. Patch sha256: 0244 00a3de42..., 0245 f2cb2217..., 0246 d636a7e6..., 0247
+  d2ddaa44..., 0248 7d851d26.... Not booted.
+- Lesson: agents' patches change under you; cut a patch on `patched-tree.sh OUT 02NN` (the state at its number), not on a
+  full tree, and anchor a `bsd/conf/files` line where no later patch has context (0244 uses negroni_ufs/negroni_sample).
+- Next: owner writes the new ADSP area (with tfa-init.bin) and boots the combined image with `negroniadsp=1
+  negroniadsp_step=15 negroniaudio_amp=1 negroniaudio_tone=1`; then mic (weeks), headset, the HAL
+  receiver route (iOS side unknown).
 
 ## 17. GPU kernel round 2 (2026-10-25; patches 0232-0234, details: patches/xnu/README-gpu-kernel.md sections 8-11)
 
@@ -1568,6 +1694,40 @@ Plan: [metal-plan.md](metal-plan.md). Design + interfaces: [metal-design.md](met
   `out/ios16-ifpc` (config args; boot_a sha256 22d76f2f21f7e947ae4347ba5df21b0d0809fe442de19c097ee997894fe2d0a1, esp
   d2cb7c7f...). esp.img holds this kernel [V byte compare]. Review fixes: renumbered 0283 -> 0285 (after 0284), the
   WATCH power part is its own `| pm ... |` field (pline 112 bytes), list size 588 bytes. Not flashed (phone off).
+
+- GPU hang recovery (2026-10-26, patch 0287, GPU-recovery agent; README-gpu-kernel.md section 21). [V KGSL] the phone's A730 is
+  gen7_0_1 (adreno-gpulist.h:2079-2110), non-hwsched dispatcher, reset = `gen7_gmu_reset` (adreno_gen7_gmu.c:3127-3146:
+  `gen7_gmu_pwrctrl_suspend` 1354-1410 = fence ALLOW, CM3 reset, GBIF GX/CX halt, RBBM SW reset, GX GDSC off; then `gen7_boot`);
+  fault handling `dispatcher_do_fault` (adreno_dispatch.c:1964-2148, timeout 2000 ms :50, throttle 3/3 s :34-35). [V] 0287:
+  detection by RedwoodGPU's 2 s rule, a full ring / lost WPTR, and the watch (2 s fence stall, core SMMU fault, CP_HW_FAULT,
+  new GMU watchdog bite / FW_INIT_RESULT bits 9-11); log `NEGRONI GPU RECOVERY: N: ...` (RBBM/CP/IB1/IB2, SMMU FSR/FAR,
+  GMU AO status, GMU log head); reset = CM3 reset + GBIF halts + RBBM SW reset (+ GX GDSC collapse with
+  `negronigpu_recover=2`) + RSC sleep + FSR clear, then the 0285 warm boot (now `gpu_warm_boot`); in-flight fences read done
+  and count as failed (client waits kIOReturnError, `MSM_PARAM_FAULTS` += recoveries = Turnip device lost, per-queue faults
+  only for the client's own work); max `negronigpu_recover_max` (3) per 60 s, then gGPUStopped as before. [I] not booted;
+  the warm boot after a CM3 reset never ran on the phone.
+- [V] Build 2026-10-26 18:21 (job `gpur-kernel`, `scripts/gpu/build-gpur.sh`, lock over kernel + image, patches up to 0291,
+  0287 + 0288 applied, the 4 usual dxb skips): kernel `out/kernel/local-20261026-125146` (sha256
+  8f1af35996a7ca6347fbd582630db17369831de58b1af736265884b527c0e9b2), image `out/ios16-gpur` (config args + `negronigpu_recover=1
+  negronicpuidle=1 negronipanic=30 negronipanicreason=2`; boot_a 02718ef216f7607d1f84ecd1b1d3bc4009b9428b5f8247e99bc7fae09e485323).
+  Not flashed. Replaced by the 0298 build below (same image directory).
+- KGSL parity (2026-10-26, patch 0298, GPU-recovery agent; README-gpu-kernel.md section 27; source docs/audit/2026-10-26-gpu.md
+  section 3): HWCG (53 regs + RBBM_CLOCK_CNTL + 3 GMU AO CGC), slumber from IFPC mode after 2000 ms idle (+ GBIF halt), TLB flush
+  + FSR clear at every warm boot, IFPC asked again after every rewake, DCVS busy from the GMU busy counter (XOCLK_0 / AO),
+  CP_PROTECT (45 ranges), CHICKEN_DBG x3, ME_INIT BIT(11), rptr shadow (RB_CNTL BIT(27) off), HFI timeout 100 ms after the
+  ladder, a guard page after kernel-placed buffers, DDR votes computed from cmd-db BCM aux data + DT bus-table-ddr, the CNOC CN0
+  vote, DCVS bw = DT bus-freq. Each has a boot-arg (section 21 table). Left out: ACD (needs the AOP QMP mailbox), preemption.
+- [V] Build 2026-10-26 18:47 (job `gpur2-kernel`, lock over kernel + image; patches up to 0298 incl. 0292-0296, the 4 usual dxb
+  skips; compile-one 0 errors for the 7 changed files): kernel `out/kernel/local-20261026-131716` (sha256
+  7804fca89c4e08e9a1a75f9bc3ba70e3be9171442c6e09d50072afa5ce80332a), image `out/ios16-gpur` rebuilt with it (boot_a
+  526eba93e7e6b7a20e56ba767ea26fc2c011fde4e7cd22a46a4d28b491b3d066, esp b710a470664d1deaaa9549e6a57556c388c5c00500a3f684bbd46bbf8557ce9b;
+  same args as above). Owner rule from then on: no more images for this work, one kernel build + compile-one is the proof.
+  Not flashed, not booted.
+- [V] Review fixes (2026-10-26 23:14, job `gpur3-kernel`, kernel only, no image): F1 PSCI_FEATURES(CPU_SUSPEND) bits (bit 1 =
+  extended StateID, bit 0 = OSI; the first build read them swapped, so `out/ios16-gpur` would answer "original StateID: WFI only"),
+  F3 `dc cvac` of the core's idle record before CPU_SUSPEND and DDR votes never below the Linux constants. Kernel
+  `out/kernel/local-20261026-174403` (sha256 dfa9a8a550ecc79d89b7478f1c3217850b55efb9c8cacd124893cf26346e887e), patches up to 0298,
+  the 4 usual dxb skips. `out/ios16-gpur` still holds the 131716 kernel (without these fixes).
 
 ## 18. Firmware areas at the end of userdata (2026-10-25; scripts/fw/)
 
@@ -1779,6 +1939,21 @@ Patches (2026-10-25, regenerated with scripts/kernel/patched-tree.sh in out/kern
 - [V] Policy: busy > 70 % -> +1 row per 100 ms up to the cap (min of negronicpufreq_mhz and the 0280 thermal cap); busy < 30 % for 300 ms -> -1 row down to the floor. Floor = the ABL row of every domain (0098); `negronicpufreq_floor_mhz=N` only raises it. A row below the ABL row is blocked three times: the floor, the cap (never below the ABL row), and `wr_perf_state()` (the one PERF_STATE writer after boot clamps to `dom_abl_row`). A mutex serialises the governor and the thermal thread. Boot-args `negronicpufreq_gov` (default 1; 0 = old one-shot), `negronicpufreq_floor_mhz`, `negronicpufreq_hi/_lo`. Lines: `dN table (R rows, MHz): ...; ABL row A`, `governor on (d0 rows a..b (MHz), ...)`, `d0 N MHz busy N% lmh L | d1 .. | d2 ..` on change and once a minute; the GPU WATCH line ends with `cpu N/N/N MHz`.
 - [I] Consequence: with the boot 0097 ABL rows (d0 12, d1 17 = top, d2 20 = top) only d0 moves (rows 12..14); d1/d2 stay at the top, the same as the 0280 cap. The governor cannot cool the big cores under the 0098 rule. Boot 0097 ran d1 row 15 / d2 row 14 without a fault [V]: evidence for a later change that drops the rule, not a test of it.
 - [V] Build: `kernel-cpugov5` job (all patches/xnu incl. 0284 with the review fixes: change line max 1/s, rows[128], cfg_floor_row kept through thermal caps, hi/lo clamps, GOV_MAX_CPUS rename; exit 0, no 02xx patch skipped): kernel out/kernel/local-20261026-071600 sha256 482e858484b982718501c17371644d812e50a5310982ab68e1de5a7616344a13; image `out/ios16-cpugov` (config args + `negronicpufreq_gov=1`) boot_a.img fefc02ddfc27d0b7311ed4bff05943a1315cea4b4f60522ff4da428b1f0dd812. Not flashed.
+- [V code] 0283 (README-thermal.md "0283"): per-zone DT trips every 1 s: cpu-110C (cpu4-emerg0/cpu0-emerg, live.dts:8042/:8509) -> deepest CPU row; gpu-95C (tj_cfg :8404) -> GPU cap -1/s; ipa-53C (:10275, skin 0x146 proxy [I]) and ddr-90C (:8812) -> one CPU step per 10 s; xo-78/80C (:10087/:10094) -> deepest CPU + GPU level 5; bcl-lvl0/1/2 (status 0x4708 bits 0-2, bcl_pmic5.c:27,41-43) -> GPU 10/8/5, CPU 2400/1800/1800. kgsl state k = our level 12-k. Charger FCC level 3 at skin 45 C, 4 at ipa-53C/xo-78C [I design]. Line ends `| trip <names>`. `negronithermal=2` = 0280 rule, 0 = off. Fixed: `cpu` = core sensors only; unmapped TSENS skipped.
+- [V] 0283 + abl: With the default `negronicpufreq_floor=abl` every CPU cap of 0280/0283 is a no-op for d1 (A710) and d2 (X2): their ABL rows (17, 20) are their top rows and no cap goes below the ABL row [V negroni_cpufreq.c `negroni_cpufreq_cap`, README-cpufreq.md]. Until `lut` only the d0 caps and the GPU caps act (LMh still throttles in hardware).
+- [V code] 0291 (README-cpufreq.md "0291"): `negronicpufreq_floor=abl|lut` (default abl); lut: d1/d2 floor = LUT row 0 (d0 keeps ABL row 12); evidence boot 0097 (d1 row 15, d2 row 14, no fault). LUT rows still unknown (0284 prints them at boot).
+- [V] Power set build (0277/0278/0283/0291): Build `pwr-build` (scripts/battery/build-pwr-image.sh, lock out/kernel/.lock held over kernel + image): kernel out/kernel/local-20261026-124827/kernel.development.negroni sha256 01363704dab977e2259aecbe1fb81141133ba5458ec97a59a6b6abf86b981fa3; patch-report applies every patches/xnu patch 0270-0291 incl. 0277/0278/0283/0291 (and the other agent's 0287/0288), only the 4 usual dxb skips; strings `loop: battery`, `store: soc restored`, `trip %s %s (value`, `negronicpufreq_floor`, `QDSS clock vote released` in the kernel. Image out/ios16-pwr was built in that same locked job from that kernel (local-20261026-124827, sha256 01363704...; [V] three 64 KiB pieces of it found byte-equal in out/ios16-pwr/esp.img; the image SHA256SUMS lists only the image files). It is BEFORE review fix 1 (0277 BATT_CHG_EN restart log bound); per the owner the fix gets a kernel-only proof build, the main session builds the combined image. Review fixes 1-4 (2026-10-26 18:5x): kernel-only proof build `pwr-kernel` (IMAGE=0, lock held): out/kernel/local-20261026-132431/kernel.development.negroni sha256 4786905de90c56b9150153d01f33f69ed87bc7769611e494dd111a1c32974b34, 0277/0278/0283/0291 applied, only the 4 usual dxb skips, string `further failures are not logged` (fix 1) in the kernel. 0277 sha256 now in the report. Image (config args + `negronibatt=5 negroniadsp=1 negronichg_glink=1 negronichg_ma=1500 negronifb_sleep=0 negronipanic=30 negronipanicreason=2`): boot_a.img 72ee45050d399b14a1805b55c65c7cd927a90ed45d6b3c8d5596b6582afc9394, vendor_boot_a.img c29329ee..., esp.img 01f9330f..., negroni.adt 12b7654d... (out/ios16-pwr/SHA256SUMS). Not booted. Patch sha256: 0277 cd22073c..., 0278 047a4652..., 0283 564c7390..., 0291 fa95dcd5...
+
+- CPU idle (2026-10-26, patch 0288, GPU-recovery agent; patches/xnu/README-cpuidle.md). [V code] before 0288 an idle core
+  ran WFI only (cpu_idle, no PSCI CPU_SUSPEND anywhere). [V out/live.dts:733-775] silver/gold "rail-pc" param 0x40000004
+  (exit 750/1550 us, residency 4090/4791 us, local-timer-stop), cluster l3-off 0x41000044 (>= 5309 us), llcc-off 0x4100c344
+  (>= 13959 us); psci-1.0 smc with cpu-pd/cluster-pd (1217-1272); timer@17420000 frame 0 SPI 8 = INTID 40 (1344-1357).
+  [V Linux] PC mode by default (psci.c:578-592), OSI only for the hierarchical domains. 0288: `negronicpuidle` (kernel default 0
+  = WFI only; 1 = core rail-pc when the next deadline is >= the residency; 2 = + cluster params in PC mode), PSCI probe
+  (extended StateID needed), resume through XNU's resume_idle_cpu -> arm_init_idle_cpu -> cpu_idle_exit(TRUE) + PE_init_cpu +
+  setPop, the frame-0 timer as broadcast wake (IPI), short-sleep guard; log `NEGRONI CPUIDLE: cpuN state S param 0x... entered N
+  times ...` every 60 s. [I] Gunyah traps PSCI (its vtimer/SPI behaviour unknown); a wrong param hangs a core with wdt off: the
+  test image has `negronicpuidle=1`, the kernel default stays 0. Measure: 0284 busy %, `down %` per core, ibat at idle 0 vs 1 vs 2.
 
 ## 23. Vibration / haptics (2026-10-26, haptics agent; patches 0300-0301, details: docs/haptics-plan.md)
 
@@ -1803,6 +1978,28 @@ Patches (2026-10-25, regenerated with scripts/kernel/patched-tree.sh in out/kern
   99a1123a... Not run on the phone.
 - [I] Expected: system-sound/ringtone vibration works with 0301; keyboard/UI taps (CoreHaptics) stay silent until
   an Actuator HAL device exists.
+- [V] 2026-10-26 evening (0302-0303, build-only; docs/haptics-plan.md section 8): UIKit feedback level 2 (impact,
+  keyboard: `requiredSupportLevel` 0x1890dd1e4 = 2) needs `+[AVHapticPlayer supportsHaptics]` 0x1af58e924 =
+  MobileGestalt DeviceSupportsClosedLoopHaptics (`gqDnklGQnpv5ilgh5uHckw`, handler 0x19c564a9c) =
+  `IODeviceTree:/product/haptics` `closed-loop`. MG key = base64(md5("MGCopyAnswer"+name))[:22]; property names are
+  obfuscated the same way. Haptic server = AVHapticServer in mediaserverd (`com.apple.audio.hapticd`) ->
+  VirtualAudioDevice_Actuator (VirtualAudio.plugin) -> HAL UID "Actuator" (NegroniAudio). D22 haptic waveforms are
+  48 kHz mono; Keyboard-Key.wav peak 0.10 FS, 3.2 ms.
+- [V] 0302: `negronihap_ui=1` publishes /product/haptics {closed-loop 1, supports-3rd-party-haptics 1} from
+  NegroniVibrator::start and makes `/dev/negroni-haptic` (S16LE mono 48 kHz -> 2 ms block peaks -> 8 ms envelope ->
+  direct-play strength floor 160..255, tap >= 20 ms, cut 5 s); CAL_EN toggle on forced VREG_RDY. 0303: CL brake
+  (0x50 = 0x41, PTN 0x70 = ff 3f 1f, SPMI_PLAY 0x89/0x09; `negronihap_brake=0` off) + hBoost-ready wait (20 ms max).
+  NegroniAudio: Actuator -> SPSC ring -> haptic writer thread -> the node (host test PASS).
+- [V] Build: kernel out/kernel/local-20261026-125419 sha256 6c35b3f5d3ee5bbcc14839cda2ad4ac4cbdcb962b653f025a2518b2f48cdbe23
+  (all of patches/xnu; 0292-0296 of another agent skipped); out/ios16-hap2 boot_a sha256
+  e479ff370e06c34fd85e57cbcd8ec9d3244d2fad76447ffc5efbca1208262c2a (+ negronihap=1 negronihap_ui=1 negronipanic=30
+  negronipanicreason=2); NegroniAudio b43b0304... Not run.
+- [I] With closed-loop on, ringtone/alert vibration also goes through the Actuator (unified vibe engine), so 0301 is
+  unused; if the Actuator chain fails, all vibration is lost: boot without negronihap_ui and clear the MG cache.
+- Lesson: the MobileGestalt cache (`/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/
+  Library/Caches/com.apple.MobileGestalt.plist`) may keep old answers: scripts/haptics/*.sh remove it.
+- Lesson: scripts/audio/hfs-extract.py now follows HFS+ file hard links (iNode<n> in the private-data dir); before,
+  hard-linked files (e.g. the D22 tunings) came out empty.
 
 
 ## 24. Bluetooth QCA6490 (2026-10-26, BT agent; patch 0330, details: docs/bluetooth-plan.md, patches/xnu/README-bluetooth.md)
@@ -1818,7 +2015,42 @@ Patches (2026-10-25, regenerated with scripts/kernel/patched-tree.sh in out/kern
   transport-encoding/-speed; chipset tables are Broadcom only. Prior art: external/bergamota/docs/BT_IOS_TRANSPORT.md
   (WCN3990 on SDM845; design reference, no license).
 - [V] Build: 0330 compiles (compile-one.sh clean); full kernel + out/ios16-bt: see docs/plan.md. [I] Not run on the phone.
-- Open: stage A2 (HCI + firmware download, patch 0331) not written; BT firmware area not defined in negroni_ufs.c.
+- [V code] 0331 HCI stage (`negroni_bt_hci.c`, README-bluetooth.md section 0331): `negronibt=2` = steps 9-11 (HCI_RESET,
+  EDL version 0xfc00/0x19, baud 0xfc48 code 0x0e + host 3 Mbaud + version again); `negronibt=3` = + steps 12-19
+  (BT pack, rampatch, board id 0x23, NVM, logging off 0xfc17, reset, build label 0x20, Read_BD_ADDR 0x1009).
+  `negronibt_to` (2000 ms), `negronibt_baud`, `negronibt_ibs`. An HCI error -> 0330 failure path (BT_EN low).
+- [V btqca.c/hci_qca.c] hp* names = the HSP family = Linux `QCA_WCN6855` (soc_type >= WCN3991): EDL answers are
+  Command Complete (`00 19 ..` 15 bytes; TLV ack `00 1e`), not VSE. TLV segment = 243 bytes (MAX_SIZE_PER_TLV_SEGMENT,
+  btqca.h:18), not 240. BD address = standard HCI_Read_BD_ADDR 0x1009 (btqca.c:692), not a vendor command.
+  Baud: RFR off, 0xfc48, 1-10 ms, host rate, RFR on; Linux waits for no answer (hci_qca.c:1342-1394, 1487-1579).
+  Linux sends no HCI_RESET before the version for WCN6855 (we do; a timeout there is not fatal).
+- [V files] hpbtfw20/21.tlv: download mode 3 (only the last segment is acked), product 0x13, ROM build 0x0200/0x0201.
+  Stock NVM tag 17 = `15 11 22 00 2e 00`: IBS bit (byte 0 bit 7) clear, baud byte 0x11 = 3.2 Mbaud (no clock level at
+  16x; we write 0x0e = 3 M). Tag 2 = `ad 5a 00 00 00 00` (default 00:00:00:00:5a:ad). Tag 27 byte 0 = 0x01.
+- [V] Firmware path: one file `negroni-bt.bin` (`NEGRBTFW` pack, 105 hp* files, 1011646 B) inside the WLAN area
+  (199 files; out/firmware/wlan-area.bin sha256 f8e96b65..., was 76b0c6aa... without the pack). `scripts/bt/mkbtarea.sh`.
+  No new userdata area; the WLAN reader is unchanged (it looks files up by name).
+- [V] Build 2026-10-26: kernel `out/kernel/local-20261026-123344` sha256 `2c5d53ca...` (0330 + 0331 with the review fix applied, only the
+  4 usual dxb skips); `out/ios16-bt` boot_a sha256 `d01f3d6d...` (config args + `negronibt=3 negronipanic=30
+  negronipanicreason=2`; `scripts/bt/build-test-image.sh`). [I] Not run on the phone; the BT pack is not on the phone.
+- [V disasm, 20H392 bluetoothd = bergamota's binary] Stage B (patches 0332-0333, userland/bluetooth; README-bluetooth.md
+  "Stage B"): bluetoothd talks H4 over the kernel control socket (POSIX driver 0x100066bdc), not over /dev nodes; the
+  /dev/uart.bluetooth / cu.bluetooth names are only access() checks (0x100026af4). Default control name
+  com.apple.uart.sk.bluetooth = Skywalk -> job env BT_HCI_TRANSPORT=H4BC:POSIX:com.apple.uart.bluetooth,3000000.
+- [V] bluetoothd discards BT_DEVICE_ADDRESS (zeroed after sscanf, 0x1000268f4) and needs a registry entry "bluetooth"
+  with local-mac-address -> ADT node /arm-io/bluetooth (ADT_BT=1 adt-extra.py, config [adt.bluetooth]). Kernel step 20
+  writes the same address into the QCA (0xfc14, display byte order).
+- [V] BlueTool: Broadcom .hcd only; /etc/bluetool overrides gated on ReleaseType Vendor/Internal (0x100016054-0x100016280);
+  the root has no /etc/bluetool and no /usr/share/firmware/bluetooth. bluetoothd's BlueTool reply: result (0 ok, 10/13 =
+  "no platform/chipset") -> stand-in userland/bluetooth/negroni-bluetool answers result 0.
+- [V] bluetoothd stack init does not keep the manufacturer (0x10010bcd4-0x10010bd10). OGF 0x3f clashes (0xfc48 = QCA baud)
+  -> 0333 answers every host vendor command in the kernel. [I] chipset id source unknown (setters 0x10025a8e8/0x100285134).
+- [V] iOS SDK marks xpc_connection_create_mach_service unavailable: negroni-bluetool binds it by asm label. The SDK has no
+  sys/kern_control.h: hcitest defines ctl_info/sockaddr_ctl itself.
+- [V] Build 2026-10-26 (stage B): kernel out/kernel/local-20261026-174538 sha256 cfd8af00a5145843b011737cdf8a08a157d14f3ced415dd4a0aa944763bc904d (after the review fixes F1-F2; before: local-20261026-132747 a94e8f3c...)
+  (0330-0333 applied, 4 dxb skips). First build failed: IO_NDELAY needs <sys/vnode.h>. [I] Not run on the phone.
+- Tool: `xcrun llvm-objdump -d --macho` disassembles bluetoothd in 3 s with string annotations; `ipsw macho disass -x
+  __TEXT.__text` did not finish in 10 min. scripts/audio/hfs-extract.py needs the parent folders of a file target made first.
 
 ## 25. Fingerprint sensor, Goodix optical G7 (2026-10-26, fingerprint agent; patches 0350-0351, details: docs/fingerprint-plan.md, patches/xnu/README-fingerprint.md)
 
@@ -1857,6 +2089,121 @@ Patches (2026-10-25, regenerated with scripts/kernel/patched-tree.sh in out/kern
   `negronifp=2 negronifp_hl=1 negronipanic=30 negronipanicreason=2`). The first build (081439) skipped 0350/0351
   (bsd/conf/files and present() context moved by 0310/0267): regenerated on a tree with all patches; 0350's
   conf line now follows negroni_cam.c and its init call follows negroni_bt_init().
+
+
+## 26. Metal/GL audit follow-up (2026-10-26 evening, audit follow-up agent; patch 0289, flame/0013; build only, phone on Android)
+
+Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items that need no phone.
+- [V] Kernel 0289 (`patches/xnu/0289-negroni-iosurface-lock-gpu-wait.patch`, README-gpu-kernel.md "0289"): the IOSurface
+  lock trap (trap 2) waits for the surface's `gpuFence` (the 0230 import fence = the fence 0254 reads at swap time) up to
+  `negronisurf_gpuwait` ms (default 50 = `NEGRONI_FB_GPU_WAIT_MS`, cap 2000, 0 = off) through `NegroniGPUFenceWait`
+  (gives up at once on `gGPUStopped`), then `NegroniGPUSurfaceForCPU` over the whole surface when its user mapping is
+  cached (`mapCache != kIOMapWriteCombineCache`: slots, wrapped, physical; created surfaces are write-combined), once per
+  fence value (`cpuSeenFence`). Give-up log 8 times: `NEGRONI SURF: <proc> lock of surface N: the GPU (fence F) is not
+  done after 50 ms: answered anyway`. `RedwoodGPU::start` sets the IORegistry property `RedwoodWaitsForGPU` (true unless
+  the boot-arg is 0) and logs `RedwoodGPU: registered (the IOSurface lock waits up to 50 ms for the GPU)`.
+  compile-one OK for NegroniSurface.cpp, NegroniGPU.cpp, NegroniFramebuffer.cpp. Full build 12:31 (`gl2-build`,
+  `scripts/gpu/build-test-image.sh`, lock held across kernel + image): 197 patches applied (0289 among them), the 4
+  usual dxb skips; kernel `out/kernel/local-20261026-123128` sha256 151428d3...; image `out/ios16-gl2` boot_a
+  78c23259..., esp 851a6735..., vendor_boot c29329ee... (config args + `negronipanic=30 negronipanicreason=2`). Not booted.
+  [I] Cost: the lock trap now takes gGPULock once per lock of a GPU-written surface (a fence compare when the fence
+  was seen); a page walk only for cached mappings and only on a new fence.
+- [V] GL library: `ngl_drm_kernel_waits_for_gpu()` (drm/negroni_drm.c, reads `RedwoodWaitsForGPU` once) and view.c
+  `want_finish`: without the property the flush is `glFinish` (log `flush = glFinish (the kernel has no
+  RedwoodWaitsForGPU (older than 0289): ...)`), with it `glFlush + kernel fence (default: RedwoodWaitsForGPU)`. Env and
+  the `finish` files still win. [I] On today's kernels (no 0289) the new dylib therefore finishes every frame (safe,
+  slower) until out/ios16-gl2 boots.
+- [V] GL build housekeeping: `userland/negronigl/mesa-patches/0002-turnip-darwin.patch` deleted (an old Turnip copy the
+  GL tree never compiled); `scripts/gpu/mesa-fetch.sh` applies `userland/turnip/mesa-patches/0001-turnip-darwin.patch`
+  (`TURNIP_DARWIN_PATCH` in scripts/gpu/env.sh) after the negronigl patches, and `scripts/gpu/build.sh` refetches when
+  any of those patch hashes changed (the stamp lists them). The Turnip patch applied cleanly on the GL base. `gl-build`
+  exit 0 (12:4x): stripped negronigl.dylib 14,233,360 (38af4413...), NegroniGL 13,777,152 (90fc522a...), ngl_test
+  50,496 (8f7d3778..., unchanged), backboardd unchanged (39cb14d1...); check-imports PASS (0 missing); 129/129 GLD +
+  18/18 GLI exports.
+- [V] flame/0013 (`userland/metal/patches/flame/0013-negroni-sync-switch-nmtl-dir.patch`): the NEGRONIMETAL_SYNC file
+  switch reads `NMTL_DIR "/sync"` (was the hard-coded `/private/var/db/negronimetal/sync`); no phone behaviour change,
+  the host test's `sync` file is now under its work directory. Base copy for the next patch: `out/metal/patchbase/flame13`
+  (= flame 0001-0012 applied). Plugin comment at NegroniMetal.mm (the `CI_USE_MTL_DAG_FOR_CIKL_SRC` paragraph) now says
+  the variable IS set (3 places) and does nothing on 20H392; metal-plan.md says the same.
+- [V] Metal bundle rebuilt (`metal-build`, scripts/metal/build.sh + host-plugin-test.sh): check-imports PASS (0 missing);
+  host test 12/12 PASS (unlisted, off, bundleoff, blocked, nogpu, timeout x2, deadman, device, msl, mps, watchdog, lost).
+  Staged NegroniMetal 22,027,136 bytes sha256 7473f41b99b41c4faca0ec957084b3bb1f9010cbd4fd72e55f2be4dfa35ed628, Turnip
+  7cb29818... (unchanged), dSYM `out/metal/NegroniMetal.dSYM`. Not pushed.
+- Decision: indirect command buffers stay a clean refusal. m2v's runtime has them (`indirect_command_buffer.rs`), the
+  ios-flame bridge (`bridge/NativeMetalBridge.{h,rs}`) has no ICB entry point (grep `indirect` = none), so the frontend
+  has nothing to call; a bridge + frontend job of about 15 `nmb_*` calls, to start when a WebGPU/game test logs
+  `executeCommandsInBuffer` skipped lines (metal-management.md section 3).
+- [V] Docs drift fixed (audit section 5): metal-plan.md status line, ICB/heaps/argument-buffer row, watchdog 60/30 s,
+  Chlorophyll "ran on the phone" split, probes "never run", CI_USE text; metal-design.md OPEN_MS 20000; gpu-userland.md
+  patch row, phone status, flush section. On-phone test plan: metal-management.md section 4 (8 numbered steps with
+  commands and the log lines to read).
+- Next (phone): metal-management.md section 4 in order; step 1 boots `out/ios16-gl2` with the 7473f41b bundle.
+- **Stage C (evening, fingerprint agent 2; patches 0352/0353, docs/fingerprint-plan.md section 7).**
+- [V] Public source of the same HAL exists: `techyminati/android_vendor_oplus_secure`
+  `biometrics/fingerprints/bsp/vendor/fingerprint/goodix_optical/goodix_G7` (`scripts/fp/get-references.sh` ->
+  `out/fp/ref/oplus-secure`, commit 006d08f) and the OPLUS kernel shim `OnePlusOSS/android_kernel_oneplus_sm8475`
+  `drivers/input/oplus_fp_driver/goodix_optical_fp` (`out/fp/ref/op-sm8475`, 7278ce9). Neither has an SPI frame:
+  the HAL sends `gf_cmd_header_t` commands to the TA (`GF_CMD_DELMAR_SENSOR_READ_IMAGE = 101`,
+  `gf_delmar_types.h:221-226`; `DelmarSensor::readImage` `DelmarSensor.cpp:333-363`), the shim does ioctls
+  (`GF_IOC_*` 0..23, magic 'g'), reset = 5 ms low + 10 ms (`gf_platform.c:443-456`), `GF_IOC_ENABLE_SPI_CLK` only
+  clocks the QUP for the TEE.
+- [V] The module is MCU + sensor die: HAL strings `test reset and interrupt pin between mcu and sensor`,
+  `fw_app_version`, `fw_bootcode_version`, `GF_ERROR_SPI_FW_DOWNLOAD_FAILED`; public header
+  `DELMAR_C_CHIP_TYPE_GW183/GW183D_ECO1/2`, sensor types `SINGLE_T_SE1..SE5`, `SINGLE_CS_SE1..3`, `GM182`
+  (`gf_delmar_config.h:176-189`); the stock HAL names `GF_CHIP_DELMAR_T_SE1`. Origin frame
+  `DELMAR_ORIGIN_BUFFER_LEN 183456 = 364*252*2`, raw/bmp 182*132, OTP 64 bytes, chip id 32 bytes
+  (`gf_delmar_types.h:52-66`).
+- [V] Public Goodix MCU protocol (`out/fp/ref/goodix-fp-dump`, cc43bb3; `goodix.py:56-114`): pack `A0 len16 sum8`,
+  protocol `cmd (plen+1)16 payload (0xAA-sum8 | 0x88)`; commands NOP 00, MCU_GET_IMAGE 20, READ/WRITE_SENSOR_REG
+  82/80, UPLOAD_CONFIG 90, RESET A2, READ_OTP A6, FIRMWARE_VERSION A8, QUERY_MCU_STATE AE, ACK B0 (full list in the
+  plan 7.1); image reply 12-bit packed 6 bytes -> 4 px (`tool.py:36-46`); SPI transport of the 5120
+  (`protocol.py:147-185`): write `CC F2 seq16` + pack, read `BB F1 00 00` + clocked bytes, IRQ = answer ready.
+  [I] Whether the G7 MCU speaks it over SPI is the open question; 0352 tests it.
+- [V] 0352 (`negronifp=3`, `negronifp_wrap`, `negronifp_irqwait`): `gx_encode/gx_decode`, `se_tx_long/se_rx_long`
+  (64-byte FIFO pieces), `gx_write/gx_read` (plain or wrapped), `irq_wait`, `gx_probe`, `mcu_probe` = step 10
+  (nop, AE 55, A8 00 00, A6 00 00, 82 00 00 00 04 on both transports), verdict line `MCU probe result`. Audit
+  fixes: ldoc11 vote EBUSY retry 40 x 50 ms + stop on failure. Frame check: `AE 55` = `a0 05 00 a5 ae 02 00 55 a5`.
+- [V] 0353 (`negronifp=4`, `negronifp_img`): step 11 = `negroni_fp_hbm(true)`, `negroni_fb_te_wait(2, 100)` (new in
+  NegroniFramebuffer.cpp: 0259's INTF_TEAR_INT_COUNT_VAL frame counter, -1 when `negronifb_te=0` -> 17 ms timed),
+  `20 01 00` = `a0 06 00 a6 20 03 00 01 00 86`, HBM off right after the frame + IRQ wait (<= 100 ms; review fix), bounded read into a kmem buffer under
+  one CS (early stop after 16 idle pieces; `BB F1 00 00` once, the public driver per 256 bytes), stats + verdict. `/dev/negroni-fp` (0600): 32-byte header `NFPI, 364, 252, len, mode,
+  wrap, proto, 0` + bytes; `scripts/fp/raw-to-png.py` (self-test with a synthetic dump OK: u16le/u12/u8 PNGs).
+- [V] compile-one.sh clean for negroni_fp.c and NegroniFramebuffer.cpp (tree out/kernel/tree-fp2, deleted).
+  Build 2026-10-26 12:37 UTC: kernel `out/kernel/local-20261026-123703` sha256 `f193e9ef...` (200 patches
+  applied, 0350-0353 among them, the 4 usual dxb skips), image `out/ios16-fp3` boot_a sha256 `e4ee60fa...`
+  (config args + `negronifp=3 negronifp_hl=2 negronipanic=30 negronipanicreason=2`). Disk: 11 GiB free (98 %).
+- [V] TA search (`scripts/fp/find-ta.sh`, string scan of the partition dump, ASCII + UTF-16 FAT names): the only
+  hits for goodix/delmar/gf_ta are the device-tree node names in `dtbo_a`; `modem_a` (= /vendor/firmware_mnt),
+  `oplus_sec_a`, `tz_a` have none; `oplusreserve2/3/5` (log/backup partitions) carry logcat text with the TA path
+  **`/odm/vendor/vendor/firmware/goodixfp.mdt`** (`out/fp/lists/ta-scan.txt`: `goodixfp` x42, `DelmarProductTestUtils` x114,
+  `oplus.optical.goodix.fp`), a path the HAL searches; the first extraction listed only odm `/firmware`, not
+  `/vendor/vendor/firmware`. A second pass with `gdx|fpta|finger|optical` on
+  modem/tz/oplus_sec/tzsc/keymaster/qupfw (`ta-scan2.txt`): modem = Qualcomm's own ultrasonic `qfp_*`/`QFP_*` strings
+  (not Goodix), keymaster `get_fpta_name`, `GDX`/`G8DX` are unrelated modem tokens. `scripts/fp/extract-ta.sh` pulls
+  `goodixfp.*` from odm.img `/vendor/vendor/firmware` into `out/fp/ta` and string-dumps it. Result [V]: the TA is at odm.img `/vendor/firmware/goodixfp.{mdt,b00-b07}`
+  (= `/odm/vendor/firmware`; b01 8.0 MB, b03 4.1 MB, b06 276 KB; `out/fp/SHA256SUMS`), a 64-bit aarch64 ELF whose
+  strings are in the clear (10124 unique strings >= 6 chars in `out/fp/lists/ta-all-strings.txt`; log tags
+  `[gf_delmar_mcu]`, `[gf_hw_dc]`, `[gf_hw_spi]`, `[gf_delmar_t...]`). Function names show **two sensor paths**:
+  `gf_bus_mcu_*` (write_cmd, poll_int_sts, checksum16, write_img_cmd, flash/otp, `soft reset mcu`, an embedded MCU
+  firmware `__firmware_malibu_bin`, "It is not GM182! It's normal if single chip") and `gf_bus_dc_*` /
+  `gf_delmar_t_*` (DC = direct sensor: `secspi_read_byte/word`, `secspi_write_bytes`, `get_trim`, `get_hr_image`,
+  `delmar_dc_wakeup`, `gf_delmar_t_read_chip_id`, `gf_delmar_t_read_sub_version`). The stock HAL's
+  `GF_CHIP_DELMAR_T_SE1` is the **Delmar-T direct path**: the AP's SPI talks to the sensor die registers, not to
+  an MCU [I from the names]. So the public MCU message-pack frames of 0352 are expected to get MISO idle; the
+  register-level frame format is in the TA's code (`gf_bus_dc_secspi_read_word`), which this session did not
+  disassemble: whether to analyse the TA binary further is the owner's decision. A QSEE TA on a production device is encrypted
+  (segments) and signed; the file would give ELF header strings only. Not needed for stage C/D.
+- [V] Stage D decisions (plan 4.3): SourceAFIS Apache-2.0 (Java/C#/Rust ports), libAFIS C BSD-3 (`Simprints/libAFIS`),
+  NBIS mindtct/bozorth3 public domain (inside libfprint, LGPL-2.1): pick the SourceAFIS Rust port, NBIS as the A/B
+  extractor; unlock = passcode injection (a) when a passcode is set, SBLockScreenManager hook (b) only without a
+  passcode; templates in `/var/db/negronifp/` encrypted with a device-derived key, no SEP, no liveness check.
+- [V] Review fixes (0353 regenerated, 350 lines; 0352 untouched): HBM off right after the get-image frame + IRQ wait
+  (capped 100 ms), `hbm_on` guard on the tx-failure path, `/dev/negroni-fp` 0600, `raw-to-png.py --self-test`,
+  `BB F1 00 00` once-per-CS note. Proof build 2026-10-26 13:18 UTC (`KERNEL_ONLY=1 scripts/fp/build-test-image.sh`,
+  no image): kernel `out/kernel/local-20261026-131837` sha256 `328dd126...`, 233 patches applied incl. 0352/0353
+  (other agents' patches of the same hour included), the 4 usual dxb skips. No new warnings in negroni_fp.c.
+- Lessons: `scripts/bg.sh` does not pass environment variables to the tmux command (use `env VAR=... cmd`); a
+  patched-tree build of all 201 patches takes ~4 min; the full kernel + image build ~10 min with a warm dxb tree.
 
 
 ## 2026-10-26 handoff (main session, afternoon)

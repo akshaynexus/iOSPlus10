@@ -46,5 +46,13 @@ struct negroni_audio_stats {
 
 #define NEGRONI_AUDIO_SET_VOLUME        _IOW('n', 1, struct negroni_audio_volume)
 #define NEGRONI_AUDIO_GET_STATS         _IOR('n', 2, struct negroni_audio_stats)
+/*
+ * 0246: the output route of the Speaker stream. SPEAKER: both TFA9874 amps (stereo); RECEIVER: the
+ * top amp only in its "receiver" profile (the earpiece; the kernel plays (L + R) / 2). A change
+ * stops the amps; the next non-silent write starts the new route. Also: sysctl kern.negroni_audio_route.
+ */
+#define NEGRONI_AUDIO_ROUTE_SPEAKER     1u
+#define NEGRONI_AUDIO_ROUTE_RECEIVER    2u
+#define NEGRONI_AUDIO_SET_ROUTE         _IOW('n', 3, uint32_t)
 
 #endif

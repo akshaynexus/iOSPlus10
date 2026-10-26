@@ -247,6 +247,62 @@ main(int argc, char **argv)
 		CHECK(0, "no NegroniAudio_TestStats: build with -DNEGRONI_AUDIO_HOST_TEST");
 	}
 
+	/*
+	 * The Actuator (haptics, patch 0302): silence is not sent; sound + 20 ms after it goes to the
+	 * node (a FIFO here) in order; without the node it is dropped and nothing blocks.
+	 */
+	void (*hstats)(UInt64 *) = (void (*)(UInt64 *))dlsym(h, "NegroniAudio_TestHapticStats");
+	if (fifo != NULL && hstats != NULL) {
+		char hfifo[1024];
+		UInt64 hs[4];
+		static int16_t mono[480];
+		int hfd;
+
+		snprintf(hfifo, sizeof(hfifo), "%s.haptic", fifo);
+		(void)unlink(hfifo);
+		CHECK(mkfifo(hfifo, 0600) == 0 && (hfd = open(hfifo, O_RDONLY | O_NONBLOCK)) >= 0, "haptic FIFO");
+		setenv("NEGRONI_HAPTIC_TEST_PATH", hfifo, 1);
+		(*drv)->Initialize(drv, &host_if);
+		n = get(ids[2], 'stm#', 'outp', 0, NULL, words, sizeof(words));
+		CHECK(n == 4, "Actuator output stream");
+		AudioObjectID act = words[0];
+		CHECK(get(act, 'sfmt', 'glob', 0, NULL, &f, sizeof(f)) == sizeof(f) && f.mSampleRate == 48000 && f.mChannelsPerFrame == 1 &&
+		    f.mBitsPerChannel == 16, "Actuator format S16 mono 48 kHz");
+		CHECK((*drv)->StartIO(drv, ids[2], 1) == 0, "Actuator StartIO");
+		memset(mono, 0, sizeof(mono));
+		for (int i = 0; i < 50; i++) {          /* 500 ms of silence: none of it is sent */
+			CHECK((*drv)->DoIOOperation(drv, ids[2], act, 1, 'rite', 480, NULL, mono, NULL) == 0, "Actuator silence");
+		}
+		for (int i = 0; i < 480; i++) {         /* one 10 ms tap: a 200 Hz sine, peak 20000 */
+			mono[i] = (int16_t)(20000.0 * __builtin_sin(2 * 3.141592653589793 * 200.0 * i / 48000.0));
+		}
+		CHECK((*drv)->DoIOOperation(drv, ids[2], act, 1, 'rite', 480, NULL, mono, NULL) == 0, "Actuator tap");
+		memset(mono, 0, sizeof(mono));
+		for (int i = 0; i < 10; i++) {          /* 100 ms of silence: the first 20 ms (960 frames) go too */
+			CHECK((*drv)->DoIOOperation(drv, ids[2], act, 1, 'rite', 480, NULL, mono, NULL) == 0, "Actuator silence 2");
+		}
+		usleep(60000);
+		UInt64 got = 0, loud = 0;
+		static int16_t rb[8192];
+		ssize_t r;
+		while ((r = read(hfd, rb, sizeof(rb))) > 0) {
+			for (ssize_t i = 0; i < r / 2; i++) {
+				loud += rb[i] > 256 || rb[i] < -256;
+			}
+			got += (UInt64)r / 2;
+		}
+		CHECK((*drv)->StopIO(drv, ids[2], 1) == 0, "Actuator StopIO");
+		hstats(hs);
+		CHECK(hs[0] == 61 * 480 && hs[1] == 480 + 960 && hs[2] == 0 && hs[3] == 50 * 480 + 8 * 480,
+		    "Actuator: %llu in, %llu sent, %llu dropped, %llu skipped", hs[0], hs[1], hs[2], hs[3]);
+		CHECK(got == 480 + 960 && loud > 300, "haptic FIFO got %llu frames (%llu loud)", got, loud);
+		printf("actuator: %llu frames in, %llu to the node (%llu loud), %llu silent not sent\n", hs[0], got, loud, hs[3]);
+		close(hfd);
+		unlink(hfifo);
+	} else if (fifo != NULL) {
+		CHECK(0, "no NegroniAudio_TestHapticStats: build with -DNEGRONI_AUDIO_HOST_TEST");
+	}
+
 	printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
 	return failures != 0;
 }
