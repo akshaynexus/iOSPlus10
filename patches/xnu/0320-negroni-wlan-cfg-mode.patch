@@ -1,0 +1,805 @@
+0320-negroni-wlan-cfg-mode: Wi-Fi level 7 (negroniwlan=7), QMI WLAN_CFG + WLAN_MODE mission, steps 25-26.
+WLAN_CFG (ath11k qmi.c:2695): host "WIN", the 9 target CE pipes and 14 service routes of ath11k
+qca6390/wcn6855 (hw.c:1623/:1720), 30 shadow registers v2 in the ath11k order (ce.c:840; table in the new
+bsd/dev/negroni_wlan_ce.h); WLAN_MODE mission (qmi.c:2640). New QMI field tables in negroni_wlfw_tables.h.
+Also: the DMA-address seam negroni_wlan_dma_map (every chip address goes through it; identity here),
+a keep-alive poller after the last level (IOSleep 20 ms, MHI + QRTR + later pollers, negroniwlan_keep=S),
+negroniwlan_hostcap=android (HOST_CAP feature_list 0x7 + gpios {0x38242f00}, cnss2 qmi.c:258-331),
+M1 -> MHISTATE M2 + wake 1 (pm.c:341-359). Details: patches/xnu/README-wifi.md "0320".
+
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index de0838d..d8f4f70 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -38,6 +38,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int vsnprintf(char *, size_t, const char *, va_list);
++extern void IOSleep(unsigned int ms);
+ extern char negroni_wifi_badge[24];             /* negroni_wifi.c, drawn by NegroniFramebuffer */
+ extern uint32_t negroni_wifi_badge_color;
+ 
+@@ -111,6 +112,10 @@ static uint32_t g_bar_len;              /* mapped BAR0 bytes */
+ static vm_offset_t g_pool_kva;          /* cacheable view (firmware fill) */
+ static vm_offset_t g_pool_nc;           /* Normal non-cacheable view (contexts, rings, vector) */
+ static uint64_t g_pool_pa;
++static uint64_t g_pool_dva;             /* 0320: the pool as the chip sees it (negroni_wlan_dma_map) */
++static uint64_t g_xfer_pa;              /* 0320: physical IPCR buffers (H.xfer_pa is the chip's address) */
++static uint32_t g_keep_s;               /* 0320: negroniwlan_keep, keep-alive seconds (0 = until a chip error) */
++static void (*g_pollers[WLAN_POLLERS])(void);
+ static struct mhi_host H;
+ static uint32_t g_timeout_ms = 10000;   /* cnss2 MHI time-out 10 s (ath11k 20 s) */
+ static uint32_t g_m3_size;              /* m3.bin bytes, at g_pool_pa + OFF_M3 (for stage 2) */
+@@ -220,6 +225,102 @@ negroni_wlan_seq(void)
+ 	return r ? r : 1;
+ }
+ 
++/*
++ * 0320: the chip's address for host memory. Identity (bypass, the 0261-0266 assumption) here; patch 0324
++ * adds the SMMU stage-1 path (negroniwlan_smmu=3). Every address handed to the chip goes through it.
++ */
++uint64_t
++negroni_wlan_dma_map(uint64_t pa, uint32_t size)
++{
++	if (size == 0 || pa + size - 1 > MHI_DMA_MASK) {
++		return WLAN_DMA_NONE;
++	}
++	return pa;
++}
++
++/* 0320: sleep, so a poller does not hold a core (delay() spins in this XNU) */
++void
++negroni_wlan_nap(uint32_t ms)
++{
++	IOSleep(ms ? ms : 1);
++}
++
++void
++negroni_wlan_add_poller(void (*fn)(void))
++{
++	for (uint32_t i = 0; i < WLAN_POLLERS; i++) {
++		if (g_pollers[i] == fn) {
++			return;
++		}
++		if (!g_pollers[i]) {
++			g_pollers[i] = fn;
++			return;
++		}
++	}
++	printf("NEGRONI WLAN: no poller slot left\n");
++}
++
++/* 0320: MHI events + QRTR (QMI) + later pollers; EIO when the chip stopped (SYSERR, RDDM, dead link) */
++int
++negroni_wlan_service(void)
++{
++	int error;
++
++	if (negroni_qrtr.attached) {
++		error = negroni_wlan_qrtr_pump(&H);
++	} else {
++		(void)negroni_wlan_mhi_poll(&H);
++		uint32_t st = negroni_wlan_rd(MHI_STATUS);
++		error = (H.syserr || H.rddm_seen || st == MHI_ALL_ONES || (st & MHI_STATUS_SYSERR)) ? EIO : 0;
++	}
++	if (error) {
++		return error;
++	}
++	for (uint32_t i = 0; i < WLAN_POLLERS && g_pollers[i]; i++) {
++		g_pollers[i]();
++	}
++	return 0;
++}
++
++/*
++ * 0320 keep-alive (audit 2026-10-26 section 2.4): after the last asked level the thread stays and drains the
++ * event rings every 20 ms (sleeping, not spinning), so the chip never stalls on a full IPCR ring, M1 gets its
++ * answer and late QMI indications are seen. negroniwlan_keep=S stops it after S seconds (0 = until the chip
++ * stops). A chip error here takes the normal failure path (MHI reset, bus master off, then free).
++ */
++static int
++wlan_keep_alive(void)
++{
++	uint64_t start = negroni_wlan_ms(), next_log = start + 60000;
++	uint32_t ev0 = H.events, rx0 = H.rx_packets;
++	int error;
++
++	printf("NEGRONI WLAN: keep-alive poller on (20 ms, %s)\n", g_keep_s ? "negroniwlan_keep seconds" :
++	    "until a chip error");
++	for (;;) {
++		error = negroni_wlan_service();
++		if (error) {
++			printf("NEGRONI WLAN: keep-alive: the chip stopped after %llu s (MHISTATUS %#x, EE %u)\n",
++			    (negroni_wlan_ms() - start) / 1000, negroni_wlan_rd(MHI_STATUS), H.ee);
++			return error;
++		}
++		if (negroni_qrtr.attached) {
++			negroni_wlan_wlfw_idle();
++		}
++		uint64_t now = negroni_wlan_ms();
++		if (now >= next_log) {
++			next_log = now + 60000;
++			printf("NEGRONI WLAN: keep-alive %llu s: %u MHI events, %u IPCR packets, %u M1 seen\n",
++			    (now - start) / 1000, H.events - ev0, H.rx_packets - rx0, H.m1_seen);
++		}
++		if (g_keep_s && now - start >= (uint64_t)g_keep_s * 1000) {
++			printf("NEGRONI WLAN: keep-alive ends after %u s (negroniwlan_keep); the chip keeps running\n", g_keep_s);
++			return 0;
++		}
++		negroni_wlan_nap(20);
++	}
++}
++
+ /*
+  * Size BAR0 (all-ones probe with decode off), place it at the first size-aligned address of the
+  * iATU memory window (Linux: 0x60400000 for a 2 MiB BAR above 0x60300000), check the read-back,
+@@ -384,28 +485,28 @@ wlan_rings(void)
+ 	vm_offset_t nc = g_pool_nc;     /* integer base: offset math, then cast (no cast-align) */
+ 
+ 	H.pool = g_pool_nc;
+-	H.pool_pa = g_pool_pa;
++	H.pool_pa = g_pool_dva;         /* 0320: every ring address below is the chip's view */
+ 
+ 	H.ev[0].va = (volatile struct mhi_el *)(nc + OFF_EV0);
+-	H.ev[0].pa = g_pool_pa + OFF_EV0;
++	H.ev[0].pa = g_pool_dva + OFF_EV0;
+ 	H.ev[0].n = EV0_N;
+ 	H.ev[0].ctx = (volatile struct mhi_ctx *)(nc + OFF_EVCTX);
+ 	H.ev[1].va = (volatile struct mhi_el *)(nc + OFF_EV1);
+-	H.ev[1].pa = g_pool_pa + OFF_EV1;
++	H.ev[1].pa = g_pool_dva + OFF_EV1;
+ 	H.ev[1].n = EV1_N;
+ 	H.ev[1].ctx = (volatile struct mhi_ctx *)(nc + OFF_EVCTX + sizeof(struct mhi_ctx));
+ 
+ 	H.cmd.va = (volatile struct mhi_el *)(nc + OFF_CMD);
+-	H.cmd.pa = g_pool_pa + OFF_CMD;
++	H.cmd.pa = g_pool_dva + OFF_CMD;
+ 	H.cmd.n = CMD_N;
+ 	H.cmd.ctx = (volatile struct mhi_ctx *)(nc + OFF_CMDCTX);
+ 
+ 	H.ch_out.va = (volatile struct mhi_el *)(nc + OFF_CH20);
+-	H.ch_out.pa = g_pool_pa + OFF_CH20;
++	H.ch_out.pa = g_pool_dva + OFF_CH20;
+ 	H.ch_out.n = CH_N;
+ 	H.ch_out.ctx = (volatile struct mhi_ctx *)(nc + OFF_CHCTX + MHI_IPCR_OUT * sizeof(struct mhi_ctx));
+ 	H.ch_in.va = (volatile struct mhi_el *)(nc + OFF_CH21);
+-	H.ch_in.pa = g_pool_pa + OFF_CH21;
++	H.ch_in.pa = g_pool_dva + OFF_CH21;
+ 	H.ch_in.n = CH_N;
+ 	H.ch_in.ctx = (volatile struct mhi_ctx *)(nc + OFF_CHCTX + MHI_IPCR_IN * sizeof(struct mhi_ctx));
+ }
+@@ -423,7 +524,7 @@ wlan_vector(uint32_t fw_size)
+ 	for (uint32_t i = 0; i < entries; i++) {
+ 		uint32_t seg = (i + 1 == entries) ? (fw_size - i * MHI_SEG) : MHI_SEG;
+ 
+-		vec[i * 2] = g_pool_pa + OFF_FW + (uint64_t)i * MHI_SEG;
++		vec[i * 2] = g_pool_dva + OFF_FW + (uint64_t)i * MHI_SEG;
+ 		vec[i * 2 + 1] = seg;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+@@ -439,7 +540,7 @@ wlan_cleanup(void)
+ 		H.xfer_nc = 0;
+ 	}
+ 	if (g_xfer_kva) {
+-		flush_dcache64((addr64_t)H.xfer_pa, WLAN_XFER_SIZE, TRUE);
++		flush_dcache64((addr64_t)g_xfer_pa, WLAN_XFER_SIZE, TRUE);
+ 		kmem_free(kernel_map, g_xfer_kva, WLAN_XFER_SIZE);
+ 		g_xfer_kva = 0;
+ 	}
+@@ -652,6 +753,7 @@ wlan_level_sbl(void)
+ 		return negroni_wlan_failed(ENOMEM, "the non-cacheable pool map failed");
+ 	}
+ 	printf("NEGRONI WLAN: DMA pool %u bytes at %#llx\n", NEGRONI_WLAN_POOL_SIZE, g_pool_pa);
++	g_pool_dva = g_pool_pa;         /* 0320: step 6 replaces it when an SMMU context translates (0324) */
+ 
+ 	negroni_wlan_step(5, "firmware area");
+ 	if (kmem_alloc(kernel_map, (vm_offset_t *)&hdr, WLAN_AREA_HDR, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+@@ -706,7 +808,7 @@ wlan_level_sbl(void)
+ 
+ 	/* BHI: the SBL, the first 512 KiB of the image (op-kernel boot.c:247 mhi_fw_load_bhi, :493 sbl_size) */
+ 	negroni_wlan_step(8, "BHI SBL download");
+-	return negroni_wlan_bhi_sbl(&H, g_pool_pa + OFF_FW, MIN(g_fw_size, MHI_SEG));
++	return negroni_wlan_bhi_sbl(&H, g_pool_dva + OFF_FW, MIN(g_fw_size, MHI_SEG));
+ }
+ 
+ /* ---- level 3: steps 9-12 (pm.c:193 mhi_ready_state_transition, called from boot.c:546) ---- */
+@@ -743,7 +845,7 @@ wlan_level_amss(void)
+ 
+ 	negroni_wlan_step(13, "BHIe full image");
+ 	uint32_t entries = wlan_vector(g_fw_size);
+-	error = negroni_wlan_bhie_image(&H, g_pool_pa + OFF_VEC, entries);
++	error = negroni_wlan_bhie_image(&H, g_pool_dva + OFF_VEC, entries);
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -763,9 +865,13 @@ wlan_level_amss(void)
+ 	if (!xpn || ptoa_64(xpn) + WLAN_XFER_SIZE - 1 > MHI_DMA_MASK) {
+ 		return negroni_wlan_failed(ERANGE, "transfer buffer page %#x outside the DMA mask", xpn);
+ 	}
+-	H.xfer_pa = ptoa_64(xpn);
+-	flush_dcache64((addr64_t)H.xfer_pa, WLAN_XFER_SIZE, TRUE);
+-	H.xfer_nc = ml_io_map_unmappable((vm_offset_t)H.xfer_pa, WLAN_XFER_SIZE, WLAN_WIMG_WCOMB);
++	g_xfer_pa = ptoa_64(xpn);
++	flush_dcache64((addr64_t)g_xfer_pa, WLAN_XFER_SIZE, TRUE);
++	H.xfer_nc = ml_io_map_unmappable((vm_offset_t)g_xfer_pa, WLAN_XFER_SIZE, WLAN_WIMG_WCOMB);
++	H.xfer_pa = negroni_wlan_dma_map(g_xfer_pa, WLAN_XFER_SIZE);    /* 0320: the TREs carry the chip's view */
++	if (H.xfer_pa == WLAN_DMA_NONE) {
++		return negroni_wlan_failed(ENOMEM, "no device address for the transfer buffers");
++	}
+ 	if (!H.xfer_nc) {
+ 		return negroni_wlan_failed(ENOMEM, "the non-cacheable transfer buffer map failed");
+ 	}
+@@ -774,7 +880,7 @@ wlan_level_amss(void)
+ 		return error;
+ 	}
+ 	printf("NEGRONI WLAN: stage 1 complete: mission mode, IPCR 20/21 up, m3 %u bytes ready at %#llx\n",
+-	    g_m3_size, g_pool_pa + OFF_M3);
++	    g_m3_size, g_pool_dva + OFF_M3);
+ 	return 0;
+ }
+ 
+@@ -797,7 +903,14 @@ wlan_level_qrtr(void)
+ static int
+ wlan_level_wlfw(void)
+ {
+-	return negroni_wlan_wlfw_run(&H, g_m3_size ? g_pool_pa + OFF_M3 : 0, g_m3_size);
++	return negroni_wlan_wlfw_run(&H, g_m3_size ? g_pool_dva + OFF_M3 : 0, g_m3_size);
++}
++
++/* ---- level 7: steps 25-26 (0320: QMI WLAN_CFG + WLAN_MODE mission, negroni_wlan_qmi.c) ---- */
++static int
++wlan_level_cfg(void)
++{
++	return negroni_wlan_wlfw_start(&H);
+ }
+ 
+ static int (*const wlan_levels[WLAN_LEVEL_MAX + 1])(void) = {
+@@ -806,6 +919,7 @@ static int (*const wlan_levels[WLAN_LEVEL_MAX + 1])(void) = {
+ 	[WLAN_LEVEL_AMSS] = wlan_level_amss,
+ 	[WLAN_LEVEL_QRTR] = wlan_level_qrtr,
+ 	[WLAN_LEVEL_WLFW] = wlan_level_wlfw,
++	[WLAN_LEVEL_CFG] = wlan_level_cfg,
+ };
+ 
+ /*
+@@ -829,7 +943,14 @@ wlan_run(void)
+ 	if (!error) {
+ 		snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WLAN OK %u", MIN(g_level, (uint32_t)WLAN_LEVEL_MAX));
+ 		negroni_wifi_badge_color = 0x000060c0;
+-		return 0;
++		if (g_level < WLAN_LEVEL_AMSS) {
++			return 0;       /* no channel runs yet: nothing to drain */
++		}
++		error = wlan_keep_alive();
++		if (!error) {
++			return 0;
++		}
++		g_why_set = true;       /* the keep-alive printed the reason */
+ 	}
+ 	if (!g_why_set) {
+ 		printf("NEGRONI WLAN: step %u %s failed: %s (error %d)\n", g_step, g_step_name, errno_text(error), error);
+@@ -862,6 +983,7 @@ negroni_wlan_start(void)
+ 	(void)PE_parse_boot_argn("negroniwlan", &g_level, sizeof(g_level));
+ 	(void)PE_parse_boot_argn("negroniwlan_to", &g_timeout_ms, sizeof(g_timeout_ms));
+ 	(void)PE_parse_boot_argn("negroniwlan_smmu", &g_smmu_policy, sizeof(g_smmu_policy));
++	(void)PE_parse_boot_argn("negroniwlan_keep", &g_keep_s, sizeof(g_keep_s));
+ 	g_timeout_ms = MIN(MAX(g_timeout_ms, 100u), 60000u);
+ 	g_level = MAX(g_level, (uint32_t)WLAN_LEVEL_SBL);
+ 	if (g_level > WLAN_LEVEL_MAX) {
+diff --git a/bsd/dev/negroni_wlan_ce.h b/bsd/dev/negroni_wlan_ce.h
+new file mode 100644
+index 0000000..f0ba60a
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_ce.h
+@@ -0,0 +1,139 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: copy engine (CE) layout shared by the QMI WLAN_CFG message (patch 0320)
++ * and the CE/HAL SRNG code (patch 0321).
++ *
++ * Values only (no code) from Linux ath11k (BSD-3-Clause-Clear): hw.c
++ * ath11k_target_ce_config_wlan_qca6390 / ath11k_target_service_to_ce_map_wlan_qca6390 (used by the
++ * wcn6855 hw2.0/2.1 hw_params, core.c:412-577; PCI id 17cb:1103 = WCN6855, pci.c:32), hw.c
++ * wcn6855_regs, hal.h, hal.c ath11k_hal_srng_create_config / hw_srng_config_template, ce.c
++ * ath11k_ce_get_shadow_config (non-CE rings first, then the CE rings of the host CE table).
++ */
++#ifndef _NEGRONI_WLAN_CE_H_
++#define _NEGRONI_WLAN_CE_H_
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++
++#include <stdint.h>
++#include <stdbool.h>
++
++/* ---- register window (pcic.h:17-21, pci.c:75-128): BAR0 offsets >= 0x80000 go through it ---- */
++#define WLAN_WINDOW_REG         0x310cu         /* window select register in BAR0 */
++#define WLAN_WINDOW_ENABLE      0x40000000u
++#define WLAN_WINDOW_START       0x80000u        /* the 512 KiB window in BAR0 */
++#define WLAN_WINDOW_RANGE       0x7ffffu        /* offset bits 18:0 */
++#define WLAN_WINDOW_SHIFT       19u             /* window value = offset bits 24:19 */
++#define WLAN_WINDOW_VALUE       0x3fu
++
++/* ---- pipe directions (ce.h:42-46) and service ids (htc.h:158-195, SVC(g, i) = g << 8 | i) ---- */
++#define WLAN_PIPEDIR_NONE       0u
++#define WLAN_PIPEDIR_IN         1u      /* target -> host */
++#define WLAN_PIPEDIR_OUT        2u      /* host -> target */
++#define WLAN_PIPEDIR_INOUT      3u
++#define WLAN_PIPEDIR_INOUT_H2H  4u
++#define WLAN_CE_ATTR_DIS_INTR   8u      /* ce.h:16 (CE_ATTR_FLAGS = 0 on little endian, ce.h:22) */
++
++#define HTC_SVC_RSVD_CTRL       0x0001u
++#define HTC_SVC_WMI_CONTROL     0x0100u
++#define HTC_SVC_WMI_DATA_BE     0x0101u
++#define HTC_SVC_WMI_DATA_BK     0x0102u
++#define HTC_SVC_WMI_DATA_VI     0x0103u
++#define HTC_SVC_WMI_DATA_VO     0x0104u
++#define HTC_SVC_HTT_DATA        0x0300u
++
++/* target CE configuration (WLAN_CFG tgt_cfg), hw.c:1623-1714 */
++struct wlan_ce_tgt {
++	uint32_t pipe, dir, nentries, nbytes_max, flags;
++};
++#define WLAN_CE_TGT_N           9u
++static const struct wlan_ce_tgt wlan_ce_tgt_cfg[WLAN_CE_TGT_N] = {
++	{ 0, WLAN_PIPEDIR_OUT, 32, 2048, 0 },                           /* host->target HTC control */
++	{ 1, WLAN_PIPEDIR_IN, 32, 2048, 0 },                            /* target->host HTT + HTC control */
++	{ 2, WLAN_PIPEDIR_IN, 32, 2048, 0 },                            /* target->host WMI */
++	{ 3, WLAN_PIPEDIR_OUT, 32, 2048, 0 },                           /* host->target WMI */
++	{ 4, WLAN_PIPEDIR_OUT, 256, 256, WLAN_CE_ATTR_DIS_INTR },       /* host->target HTT */
++	{ 5, WLAN_PIPEDIR_IN, 32, 2048, 0 },                            /* target->host pktlog */
++	{ 6, WLAN_PIPEDIR_INOUT, 32, 16384, 0 },                        /* target autonomous hif_memcpy */
++	{ 7, WLAN_PIPEDIR_INOUT_H2H, 0, 0, WLAN_CE_ATTR_DIS_INTR },     /* host only */
++	{ 8, WLAN_PIPEDIR_INOUT, 32, 16384, 0 },                        /* IPA */
++};
++
++/* service -> pipe map (WLAN_CFG svc_cfg), hw.c:1720-1800 (14 entries, no terminator) */
++struct wlan_ce_svc {
++	uint32_t service, dir, pipe;
++};
++#define WLAN_CE_SVC_N           14u
++static const struct wlan_ce_svc wlan_ce_svc_map[WLAN_CE_SVC_N] = {
++	{ HTC_SVC_WMI_DATA_VO, WLAN_PIPEDIR_OUT, 3 }, { HTC_SVC_WMI_DATA_VO, WLAN_PIPEDIR_IN, 2 },
++	{ HTC_SVC_WMI_DATA_BK, WLAN_PIPEDIR_OUT, 3 }, { HTC_SVC_WMI_DATA_BK, WLAN_PIPEDIR_IN, 2 },
++	{ HTC_SVC_WMI_DATA_BE, WLAN_PIPEDIR_OUT, 3 }, { HTC_SVC_WMI_DATA_BE, WLAN_PIPEDIR_IN, 2 },
++	{ HTC_SVC_WMI_DATA_VI, WLAN_PIPEDIR_OUT, 3 }, { HTC_SVC_WMI_DATA_VI, WLAN_PIPEDIR_IN, 2 },
++	{ HTC_SVC_WMI_CONTROL, WLAN_PIPEDIR_OUT, 3 }, { HTC_SVC_WMI_CONTROL, WLAN_PIPEDIR_IN, 2 },
++	{ HTC_SVC_RSVD_CTRL, WLAN_PIPEDIR_OUT, 0 }, { HTC_SVC_RSVD_CTRL, WLAN_PIPEDIR_IN, 2 },
++	{ HTC_SVC_HTT_DATA, WLAN_PIPEDIR_OUT, 4 }, { HTC_SVC_HTT_DATA, WLAN_PIPEDIR_IN, 1 },
++};
++
++/* ---- HAL SRNG register map of the CE rings (wcn6855_regs, hal.h:43-60, :198-204) ---- */
++#define HAL_CE0_SRC_R0          0x01b80000u     /* hal_seq_wcss_umac_ce0_src_reg */
++#define HAL_CE0_DST_R0          0x01b81000u     /* hal_seq_wcss_umac_ce0_dst_reg */
++#define HAL_CE_STRIDE           0x2000u         /* ce1_src_reg - ce0_src_reg */
++#define HAL_CE_DST_STATUS_R0    0x58u           /* HAL_CE_DST_STATUS_RING_BASE_LSB */
++#define HAL_CE_DST_RING_CTRL    0xb0u           /* MAX_LEN in bits 15:0 */
++#define HAL_CE_RING_HP          0x400u          /* HAL_CE_DST_RING_HP (R2 group) */
++#define HAL_CE_STATUS_RING_HP   0x408u          /* HAL_CE_DST_STATUS_RING_HP */
++#define HAL_HP_TO_TP            4u              /* HAL_OFFSET_FROM_HP_TO_TP */
++#define HAL_SHADOW_BASE         0x8fcu          /* wcn6855 hal_shadow_base_addr */
++#define HAL_SHADOW_REG(i)       (HAL_SHADOW_BASE + 4u * (i))
++#define HAL_SHADOW_MAX          36u             /* HAL_SHADOW_NUM_REGS = QMI v01 shadow_reg_v2 max */
++
++/* ring ids (hal.h:333-398): the slot of a ring's HW-written pointer in the read-pointer area */
++#define HAL_RING_ID_CE_SRC(n)   (32u + (n))
++#define HAL_RING_ID_CE_DST(n)   (56u + (n))
++#define HAL_RING_ID_CE_STS(n)   (80u + (n))
++#define HAL_RING_ID_MAX         128u
++
++/*
++ * Shadow register v2 list as ath11k builds it for wcn6855 (ce.c:840-862): first every non-CE,
++ * non-LMAC ring of hw_srng_config_template in type order (hal.c:13-192; for a source ring the HP
++ * register, for a destination ring HP + 4 = TP), then for each host CE with src entries its
++ * CE_SRC HP and with dst entries its CE_DST HP and CE_DST_STATUS TP (ce.c:821-838, host CE table
++ * ce.c:118-189: src on CE 0/3/4/7, dst on CE 1/2/5). Index i of this list is the host's shadow
++ * register HAL_SHADOW_REG(i); the firmware copies a write there to the target register.
++ */
++#define WLAN_SHADOW_N           30u
++static const uint32_t wlan_shadow_v2[WLAN_SHADOW_N] = {
++	/* REO_DST x4 (REO 0xa38000 + reo1_ring_hp 0x3030, stride 8, + TP) */
++	0x00a3b034u, 0x00a3b03cu, 0x00a3b044u, 0x00a3b04cu,
++	0x00a3b064u,    /* REO_EXCEPTION (reo_tcl_ring_hp 0x3060 + TP) */
++	0x00a3b028u,    /* REO_REINJECT (sw2reo_ring_hp 0x3028) */
++	0x00a3b020u,    /* REO_CMD (reo_cmd_ring_hp 0x3020) */
++	0x00a3b07cu,    /* REO_STATUS (reo_status_hp 0x3078 + TP) */
++	/* TCL_DATA x3 (TCL 0xa44000 + 0x2000, stride 8) */
++	0x00a46000u, 0x00a46008u, 0x00a46010u,
++	0x00a46018u,    /* TCL_CMD (0x2018) */
++	0x00a46034u,    /* TCL_STATUS (0x2030 + TP) */
++	0x00a370b0u,    /* WBM_IDLE_LINK (WBM 0xa34000 + 0x30b0) */
++	0x00a37018u,    /* SW2WBM_RELEASE (0x3018) */
++	/* WBM2SW_RELEASE x5 (0x30c0, stride 8, + TP) */
++	0x00a370c4u, 0x00a370ccu, 0x00a370d4u, 0x00a370dcu, 0x00a370e4u,
++	/* CE rings, host CE order */
++	0x01b80400u,    /* 20: CE0 SRC HP */
++	0x01b83400u,    /* 21: CE1 DST HP */
++	0x01b8340cu,    /* 22: CE1 DST_STATUS TP */
++	0x01b85400u,    /* 23: CE2 DST HP */
++	0x01b8540cu,    /* 24: CE2 DST_STATUS TP */
++	0x01b86400u,    /* 25: CE3 SRC HP */
++	0x01b88400u,    /* 26: CE4 SRC HP */
++	0x01b8b400u,    /* 27: CE5 DST HP */
++	0x01b8b40cu,    /* 28: CE5 DST_STATUS TP */
++	0x01b8e400u,    /* 29: CE7 SRC HP */
++};
++_Static_assert(WLAN_SHADOW_N <= HAL_SHADOW_MAX, "shadow list longer than the v01 maximum");
++/* shadow indexes of the CE rings this driver runs (0321) */
++#define WLAN_SHADOW_CE0_SRC     20u
++#define WLAN_SHADOW_CE1_DST     21u
++#define WLAN_SHADOW_CE1_STS     22u
++#define WLAN_SHADOW_CE2_DST     23u
++#define WLAN_SHADOW_CE2_STS     24u
++#define WLAN_SHADOW_CE3_SRC     25u
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++#endif /* _NEGRONI_WLAN_CE_H_ */
+diff --git a/bsd/dev/negroni_wlan_mhi.c b/bsd/dev/negroni_wlan_mhi.c
+index d57cedb..1109630 100644
+--- a/bsd/dev/negroni_wlan_mhi.c
++++ b/bsd/dev/negroni_wlan_mhi.c
+@@ -340,14 +340,16 @@ negroni_wlan_mhi_poll(struct mhi_host *h)
+ 					h->syserr = true;
+ 				} else if (code == MHI_ST_M1 && h->mmio_set) {
+ 					/*
+-					 * pm.c:334-363 mhi_pm_m1_transition: Linux never writes M0 on M1;
+-					 * with device wake held it toggles DEVICE_WAKE (wake_get/put), so
+-					 * the device goes back to M0 by itself.
++					 * pm.c:334-363 mhi_pm_m1_transition (0320 fix): write MHISTATE M2, then,
++					 * because device wake is held, wake_get(force) + wake_put: the wake
++					 * doorbell is written 1 again and never 0 (the count stays above 0).
+ 					 */
+-					mhi_write64(h->wake_db, 0);
++					uint32_t ctrl = negroni_wlan_rd(MHI_CTRL);
++					ctrl = (ctrl & ~(MHISTATE_MASK << MHISTATE_SHIFT)) | (MHI_ST_M2 << MHISTATE_SHIFT);
++					negroni_wlan_wr(MHI_CTRL, ctrl);
+ 					mhi_write64(h->wake_db, 1);
+ 					if (h->m1_seen++ == 0) {
+-						printf("NEGRONI WLAN: device entered M1; host toggled device wake (0 then 1)\n");
++						printf("NEGRONI WLAN: device entered M1; host wrote M2 and device wake 1 (pm.c:341-359)\n");
+ 					}
+ 				}
+ 				break;
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index 3b46494..56174c7 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -164,6 +164,7 @@ struct mhi_host {
+  *   4  steps 13-15: BHIe full image, EE AMSS (mission), IPCR channels 20/21
+  *   5  steps 16-17: QRTR HELLO, WLFW service lookup (0265, negroni_wlan_qrtr.c)
+  *   6  steps 18-24: QMI WLFW IND_REGISTER .. FW_INIT_DONE (0266, negroni_wlan_qmi.c)
++ *   7  steps 25-26: QMI WLFW WLAN_CFG (CE pipes, service map, shadow registers) + WLAN_MODE mission (0320)
+  * Each step prints "NEGRONI WLAN: step N NAME" before it starts and, on an error,
+  * "NEGRONI WLAN: step N NAME failed: REASON". Every wait has a time-out (negroniwlan_to).
+  */
+@@ -172,7 +173,8 @@ struct mhi_host {
+ #define WLAN_LEVEL_AMSS         4
+ #define WLAN_LEVEL_QRTR         5       /* 0265 */
+ #define WLAN_LEVEL_WLFW         6       /* 0266 */
+-#define WLAN_LEVEL_MAX          6       /* the highest level this build implements */
++#define WLAN_LEVEL_CFG          7       /* 0320 */
++#define WLAN_LEVEL_MAX          7       /* the highest level this build implements */
+ /* level 4 (0264) also posts the RX buffers on channel 21 (cnss2 auto_queue, pci.c:181) */
+ 
+ void negroni_wlan_step(uint32_t n, const char *name);
+@@ -186,9 +188,25 @@ uint32_t negroni_wlan_seq(void);
+ /* 0266: one file of the firmware area into dst (SHA-256 checked); ENOENT if it is not there */
+ int negroni_wlan_fw_file(const char *name, void *dst, uint32_t cap, uint32_t *size);
+ 
++/*
++ * 0320: the address the chip gets for host memory at physical `pa` (`size` bytes, contiguous). The identity
++ * unless an SMMU translation context is on (0324, negroniwlan_smmu=3); WLAN_DMA_NONE when it cannot map.
++ */
++#define WLAN_DMA_NONE           (~0ull)
++uint64_t negroni_wlan_dma_map(uint64_t pa, uint32_t size);
++/* 0320: sleep (not spin) for `ms` milliseconds; for the keep-alive poller and the later levels */
++void negroni_wlan_nap(uint32_t ms);
++/* 0320: one service pass: MHI events, QRTR packets (QMI indications) and the registered pollers */
++int negroni_wlan_service(void);
++/* 0320: pollers of later levels (CE rings 0321, WMI events 0322); at most WLAN_POLLERS */
++#define WLAN_POLLERS            4u
++void negroni_wlan_add_poller(void (*fn)(void));
++
+ /* negroni_wlan_qmi.c (0266): level 6; free only after the chip lost bus mastering */
+ int negroni_wlan_wlfw_run(struct mhi_host *h, uint64_t m3_pa, uint32_t m3_size);
+ void negroni_wlan_wlfw_free(void);
++int negroni_wlan_wlfw_start(struct mhi_host *h);       /* 0320: level 7, WLAN_CFG + WLAN_MODE */
++void negroni_wlan_wlfw_idle(void);                      /* 0320: keep-alive, late QMI indications */
+ 
+ /* negroni_wlan_bhi.c */
+ int negroni_wlan_bhi_sbl(struct mhi_host *h, uint64_t pa, uint32_t size);
+diff --git a/bsd/dev/negroni_wlan_qmi.c b/bsd/dev/negroni_wlan_qmi.c
+index d8e5555..72e75fe 100644
+--- a/bsd/dev/negroni_wlan_qmi.c
++++ b/bsd/dev/negroni_wlan_qmi.c
+@@ -24,6 +24,7 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>
+@@ -32,6 +33,7 @@
+ #include "negroni_wlan_qrtr.h"
+ #include "negroni_wlan_qmi.h"
+ #include "negroni_wlfw_tables.h"
++#include "negroni_wlan_ce.h"
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+@@ -412,6 +414,7 @@ negroni_qmi_decode(const struct qmi_msg_desc *d, const uint8_t *buf, uint32_t le
+ struct wlfw_seg {
+ 	vm_offset_t kva;
+ 	uint64_t pa;
++	uint64_t dva;           /* 0320: the address the chip gets (negroni_wlan_dma_map) */
+ 	uint32_t size, alloc, type;
+ };
+ 
+@@ -632,7 +635,12 @@ wlfw_alloc(const struct wlfw_request_mem_ind *m)
+ 			return negroni_wlan_failed(ERANGE, "segment %u at %#llx outside the 36-bit DMA window", i, g->pa);
+ 		}
+ 		flush_dcache64((addr64_t)g->pa, alloc, TRUE);  /* zeroes in RAM, no line left in the cache */
+-		printf("NEGRONI WLAN: segment %u type %u: %#x bytes at %#llx\n", i, g->type, g->size, g->pa);
++		g->dva = negroni_wlan_dma_map(g->pa, alloc);
++		if (g->dva == WLAN_DMA_NONE) {
++			return negroni_wlan_failed(ENOMEM, "segment %u: no device address (SMMU table full)", i);
++		}
++		printf("NEGRONI WLAN: segment %u type %u: %#x bytes at %#llx (device %#llx)\n", i, g->type, g->size,
++		    g->pa, g->dva);
+ 	}
+ 	return 0;
+ }
+@@ -645,7 +653,7 @@ wlfw_respond_mem(uint32_t nseg)
+ 	memset(&g_resp_mem, 0, sizeof(g_resp_mem));
+ 	g_resp_mem.mem_seg_len = nseg;
+ 	for (uint32_t i = 0; i < nseg; i++) {
+-		g_resp_mem.mem_seg[i].addr = W.seg[i].pa;
++		g_resp_mem.mem_seg[i].addr = W.seg[i].dva;
+ 		g_resp_mem.mem_seg[i].size = W.seg[i].size;
+ 		g_resp_mem.mem_seg[i].type = W.seg[i].type;
+ 	}
+@@ -768,6 +776,19 @@ wlfw_bdf_name(char *name, size_t len)
+ 	}
+ }
+ 
++/* boot-arg negroniwlan_hostcap=android (or =1): HOST_CAP with the phone's Android fields (0320) */
++static bool
++wlfw_hostcap_android(void)
++{
++	char v[16] = { 0 };
++
++	if (!PE_parse_boot_argn("negroniwlan_hostcap", v, sizeof(v))) {
++		return false;
++	}
++	/* PE_parse_boot_argn stores a number as an int, a word as a string */
++	return strncmp(v, "android", sizeof(v)) == 0 || (v[0] == 1 && v[1] == 0);
++}
++
+ int
+ negroni_wlan_wlfw_run(struct mhi_host *h, uint64_t m3_pa, uint32_t m3_size)
+ {
+@@ -820,6 +841,15 @@ negroni_wlan_wlfw_run(struct mhi_host *h, uint64_t m3_pa, uint32_t m3_size)
+ 		q.host_build_type = WLFW_HOST_BUILD_SECONDARY;
+ 		q.feature_list_valid = 1;
+ 		q.feature_list = WLFW_FEATURE_LIST;
++		if (wlfw_hostcap_android()) {
++			/* 0320: the Android HOST_CAP (DRV bit + the WSA gpio entry of project 20847) */
++			q.feature_list = WLFW_FEATURE_LIST_ANDROID;
++			q.gpios_valid = 1;
++			q.gpios_len = 1;
++			q.gpios[0] = WLFW_GPIO_WSA_20847;
++			printf("NEGRONI WLAN: HOST_CAP as Android (negroniwlan_hostcap=android): feature_list %#llx, gpios {%#x}\n",
++			    q.feature_list, q.gpios[0]);
++		}
+ 		/* not sent: wake_msi (no MSI), ddr_range (no SMMU stage 1: bypass), mlo_* (KIWI/MANGO only) */
+ 		error = wlfw_txn(&wlfw_host_cap_req_d, &q, &wlfw_host_cap_resp_d, &r, false, false);
+ 		if (error) {
+@@ -904,4 +934,86 @@ negroni_wlan_wlfw_run(struct mhi_host *h, uint64_t m3_pa, uint32_t m3_size)
+ 	return 0;
+ }
+ 
++/*
++ * Level 7 (0320): steps 25-26, ath11k qmi.c:2841-2869 ath11k_qmi_firmware_start (core.c:2242-2256 builds the
++ * shadow list first). WLAN_CFG carries the target CE pipes, the service -> pipe map and the shadow register v2
++ * list (negroni_wlan_ce.h); WLAN_MODE MISSION starts the WLAN firmware. ath11k sends WLAN_INI (enablefwlog)
++ * first for wcn6855 (fw_wmi_diag_event); we do not: the cnss2 v01 table has no WLAN_INI message and its only
++ * effect is firmware log events over WMI.
++ */
++static struct wlfw_wlan_cfg_req g_cfg;
++
++int
++negroni_wlan_wlfw_start(struct mhi_host *h)
++{
++	struct wlfw_resp_only r;
++	int error;
++
++	W.h = h;
++	negroni_qrtr.data_cb = wlfw_data;
++
++	negroni_wlan_step(25, "WLFW WLAN_CFG");
++	memset(&g_cfg, 0, sizeof(g_cfg));
++	g_cfg.host_version_valid = 1;
++	strlcpy(g_cfg.host_version, WLFW_HOST_VERSION, sizeof(g_cfg.host_version));
++	g_cfg.tgt_cfg_valid = 1;
++	g_cfg.tgt_cfg_len = WLAN_CE_TGT_N;
++	for (uint32_t i = 0; i < WLAN_CE_TGT_N; i++) {
++		g_cfg.tgt_cfg[i].pipe_num = wlan_ce_tgt_cfg[i].pipe;
++		g_cfg.tgt_cfg[i].pipe_dir = wlan_ce_tgt_cfg[i].dir;
++		g_cfg.tgt_cfg[i].nentries = wlan_ce_tgt_cfg[i].nentries;
++		g_cfg.tgt_cfg[i].nbytes_max = wlan_ce_tgt_cfg[i].nbytes_max;
++		g_cfg.tgt_cfg[i].flags = wlan_ce_tgt_cfg[i].flags;
++	}
++	g_cfg.svc_cfg_valid = 1;
++	g_cfg.svc_cfg_len = WLAN_CE_SVC_N;
++	for (uint32_t i = 0; i < WLAN_CE_SVC_N; i++) {
++		g_cfg.svc_cfg[i].service_id = wlan_ce_svc_map[i].service;
++		g_cfg.svc_cfg[i].pipe_dir = wlan_ce_svc_map[i].dir;
++		g_cfg.svc_cfg[i].pipe_num = wlan_ce_svc_map[i].pipe;
++	}
++	g_cfg.shadow_reg_v2_valid = 1;
++	g_cfg.shadow_reg_v2_len = WLAN_SHADOW_N;
++	memcpy(g_cfg.shadow_reg_v2, wlan_shadow_v2, sizeof(wlan_shadow_v2));
++	printf("NEGRONI WLAN: WLAN_CFG host \"%s\", %u CE pipes, %u service routes, %u shadow registers v2 "
++	    "(CE0 src -> shadow %u at BAR0 %#x)\n", g_cfg.host_version, WLAN_CE_TGT_N, WLAN_CE_SVC_N, WLAN_SHADOW_N,
++	    WLAN_SHADOW_CE0_SRC, HAL_SHADOW_REG(WLAN_SHADOW_CE0_SRC));
++	error = wlfw_txn(&wlfw_wlan_cfg_req_d, &g_cfg, &wlfw_wlan_cfg_resp_d, &r, false, false);
++	if (error) {
++		return error;
++	}
++
++	negroni_wlan_step(26, "WLFW WLAN_MODE mission");
++	{
++		struct wlfw_wlan_mode_req q = { .mode = WLFW_MODE_MISSION, .hw_debug_valid = 1, .hw_debug = 0 };
++
++		error = wlfw_txn(&wlfw_wlan_mode_req_d, &q, &wlfw_wlan_mode_resp_d, &r, false, false);
++		if (error) {
++			return error;
++		}
++	}
++	printf("NEGRONI WLAN: WLAN firmware in mission mode (ath11k: copy engines next)\n");
++	return 0;
++}
++
++/* keep-alive (0320): QMI indications that arrive after level 6 are logged once each */
++void
++negroni_wlan_wlfw_idle(void)
++{
++	static bool cal_logged, ready_logged;
++
++	if (W.cal_done && !cal_logged) {
++		cal_logged = true;
++		printf("NEGRONI WLAN: QMI CAL_DONE_IND seen\n");
++	}
++	if (W.fw_ready && !ready_logged) {
++		ready_logged = true;
++		printf("NEGRONI WLAN: QMI FW_READY_IND seen\n");
++	}
++	if (W.req_mem) {
++		W.req_mem = false;
++		printf("NEGRONI WLAN: QMI REQUEST_MEM_IND after level 6 (%u segments); not answered\n", W.mem.mem_seg_len);
++	}
++}
++
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlfw_tables.h b/bsd/dev/negroni_wlfw_tables.h
+index fb910fa..0158176 100644
+--- a/bsd/dev/negroni_wlfw_tables.h
++++ b/bsd/dev/negroni_wlfw_tables.h
+@@ -26,6 +26,8 @@
+ #define WLFW_FW_INIT_DONE_IND   0x0038u /* v01.h:94 */
+ #define WLFW_M3_INFO            0x003cu /* v01.h:39 */
+ #define WLFW_CAL_DONE_IND       0x003eu /* v01.h:91 */
++#define WLFW_WLAN_MODE          0x0022u /* v01.h:46 (0320) */
++#define WLFW_WLAN_CFG           0x0023u /* v01.h:60 (0320) */
+ 
+ #define WLFW_MAX_NUM_MEM_SEG    52u     /* v01.h:121 QMI_WLFW_MAX_NUM_MEM_SEG_V01 */
+ #define WLFW_MAX_NUM_MEM_CFG    2u      /* v01.h:119 */
+@@ -44,6 +46,12 @@
+  * power.c:798) | CNSS_WLAN_EN_SUPPORT (bit 2: wlan_en pinctrl states, power.c:780); no
+  * CNSS_DRV_SUPPORT (bit 1: no qcom,drv-supported in out/live.dts:13840) */
+ #define WLFW_FEATURE_LIST       0x5ull
++/* 0320, negroniwlan_hostcap=android: what the phone's Android sends. CNSS_DRV_SUPPORT (bit 1): cnss2 reads
++ * qcom,drv-supported from the PCIe controller node (pci_qcom.c:157-168), out/live.dts:20821 has it. The WSA
++ * gpio entry for project 20847 (cnss2 qmi.c:258-331): GPIO 56, output low. */
++#define WLFW_FEATURE_LIST_ANDROID 0x7ull
++#define WLFW_GPIO_WSA_20847     0x38242f00u
++#define WLFW_MAX_NUM_GPIO       32u     /* v01.h:134 */
+ 
+ #define QOFF(S, f)      ((uint16_t)__builtin_offsetof(S, f))
+ #define QVAL(S, f)      ((int16_t)__builtin_offsetof(S, f##_valid))
+@@ -105,9 +113,16 @@ struct wlfw_host_cap_req {
+ 	uint32_t host_build_type;
+ 	uint8_t feature_list_valid;
+ 	uint64_t feature_list;
++	uint8_t gpios_valid;            /* 0320 */
++	uint32_t gpios_len;
++	uint32_t gpios[WLFW_MAX_NUM_GPIO];
+ };
+ static const struct qmi_field wlfw_host_cap_req_f[] = {
+ 	F_OPT(0x10, QF_U32, struct wlfw_host_cap_req, num_clients),             /* v01.c:3295 */
++	{ .tlv = 0x12, .kind = QF_VARRAY, .lensz = 1, .ekind = QF_U32,
++	  .off = QOFF(struct wlfw_host_cap_req, gpios), .valid = QVAL(struct wlfw_host_cap_req, gpios),
++	  .count = QOFF(struct wlfw_host_cap_req, gpios_len), .max = WLFW_MAX_NUM_GPIO,
++	  .esize = 4 },                                                         /* host_cap 0x12: u8 len, u32[32] */
+ 	F_OPT(0x14, QF_U8, struct wlfw_host_cap_req, bdf_support),              /* v01.c:3385 */
+ 	F_OPT(0x16, QF_U8, struct wlfw_host_cap_req, m3_support),               /* v01.c:3425 */
+ 	F_OPT(0x17, QF_U8, struct wlfw_host_cap_req, m3_cache_support),         /* v01.c:3445 */
+@@ -331,6 +346,69 @@ static const struct qmi_field wlfw_cal_done_ind_f[] = {
+ 	F_OPT(0x10, QF_U64, struct wlfw_cal_done_ind, cal_file_upload_size),    /* v01.c:4379 */
+ };
+ 
++/* ---- WLAN_MODE 0x22 (v01.h:518, v01.c:1306; ath11k qmi.c:1427) ---- */
++#define WLFW_MODE_MISSION       0u      /* v01.h:139 QMI_WLFW_MISSION_V01 */
++#define WLFW_MODE_OFF           4u      /* v01.h:143 */
++struct wlfw_wlan_mode_req {
++	uint32_t mode;                  /* s32 enum */
++	uint8_t hw_debug_valid, hw_debug;
++};
++static const struct qmi_field wlfw_wlan_mode_req_f[] = {
++	F_MAN(0x01, QF_U32, struct wlfw_wlan_mode_req, mode),
++	F_OPT(0x10, QF_U8, struct wlfw_wlan_mode_req, hw_debug),
++};
++
++/* ---- WLAN_CFG 0x23 (v01.h:540-563, v01.c:1405; ath11k qmi.c:1480-1640, same TLVs 0x10-0x14) ---- */
++#define WLFW_MAX_NUM_CE         12u     /* v01.h:125 */
++#define WLFW_MAX_NUM_SVC        24u     /* v01.h:115 */
++#define WLFW_MAX_NUM_SHADOW_V2  36u     /* v01.h:131 */
++#define WLFW_HOST_VERSION       "WIN"   /* ath11k qmi.h:13 ATH11K_HOST_VERSION_STRING */
++struct wlfw_ce_tgt_pipe {
++	uint32_t pipe_num, pipe_dir, nentries, nbytes_max, flags;
++};
++static const struct qmi_field wlfw_ce_tgt_pipe_f[] = {
++	F_MEM(QF_U32, struct wlfw_ce_tgt_pipe, pipe_num),                       /* v01.c:12 */
++	F_MEM(QF_U32, struct wlfw_ce_tgt_pipe, pipe_dir),                       /* s32 enum */
++	F_MEM(QF_U32, struct wlfw_ce_tgt_pipe, nentries),
++	F_MEM(QF_U32, struct wlfw_ce_tgt_pipe, nbytes_max),
++	F_MEM(QF_U32, struct wlfw_ce_tgt_pipe, flags),
++};
++struct wlfw_ce_svc_pipe {
++	uint32_t service_id, pipe_dir, pipe_num;
++};
++static const struct qmi_field wlfw_ce_svc_pipe_f[] = {
++	F_MEM(QF_U32, struct wlfw_ce_svc_pipe, service_id),
++	F_MEM(QF_U32, struct wlfw_ce_svc_pipe, pipe_dir),                       /* s32 enum */
++	F_MEM(QF_U32, struct wlfw_ce_svc_pipe, pipe_num),
++};
++struct wlfw_wlan_cfg_req {
++	uint8_t host_version_valid;
++	char host_version[WLFW_MAX_STR_LEN + 1];
++	uint8_t tgt_cfg_valid;
++	uint32_t tgt_cfg_len;
++	struct wlfw_ce_tgt_pipe tgt_cfg[WLFW_MAX_NUM_CE];
++	uint8_t svc_cfg_valid;
++	uint32_t svc_cfg_len;
++	struct wlfw_ce_svc_pipe svc_cfg[WLFW_MAX_NUM_SVC];
++	uint8_t shadow_reg_v2_valid;
++	uint32_t shadow_reg_v2_len;
++	uint32_t shadow_reg_v2[WLFW_MAX_NUM_SHADOW_V2];  /* struct { u32 addr } on the wire */
++};
++static const struct qmi_field wlfw_wlan_cfg_req_f[] = {
++	F_STR(0x10, struct wlfw_wlan_cfg_req, host_version, WLFW_MAX_STR_LEN),  /* top level: no prefix */
++	{ .tlv = 0x11, .kind = QF_VARRAY, .lensz = 1, .ekind = QF_STRUCT, .off = QOFF(struct wlfw_wlan_cfg_req, tgt_cfg),
++	  .valid = QVAL(struct wlfw_wlan_cfg_req, tgt_cfg), .count = QOFF(struct wlfw_wlan_cfg_req, tgt_cfg_len),
++	  .max = WLFW_MAX_NUM_CE, .esize = sizeof(struct wlfw_ce_tgt_pipe), .sub = wlfw_ce_tgt_pipe_f, .nsub = 5 },
++	{ .tlv = 0x12, .kind = QF_VARRAY, .lensz = 1, .ekind = QF_STRUCT, .off = QOFF(struct wlfw_wlan_cfg_req, svc_cfg),
++	  .valid = QVAL(struct wlfw_wlan_cfg_req, svc_cfg), .count = QOFF(struct wlfw_wlan_cfg_req, svc_cfg_len),
++	  .max = WLFW_MAX_NUM_SVC, .esize = sizeof(struct wlfw_ce_svc_pipe), .sub = wlfw_ce_svc_pipe_f, .nsub = 3 },
++	/* 0x13 shadow_reg (v1) not sent: ath11k sets shadow_reg_valid = 0 (qmi.c:2736) */
++	{ .tlv = 0x14, .kind = QF_VARRAY, .lensz = 1, .ekind = QF_U32, .off = QOFF(struct wlfw_wlan_cfg_req, shadow_reg_v2),
++	  .valid = QVAL(struct wlfw_wlan_cfg_req, shadow_reg_v2), .count = QOFF(struct wlfw_wlan_cfg_req, shadow_reg_v2_len),
++	  .max = WLFW_MAX_NUM_SHADOW_V2, .esize = 4 },
++	/* 0x15 rri_over_ddr, 0x16 msi_cfg, 0x17 shadow_reg_v3: cnss2-only; not sent (no MSI, v2 shadows) */
++};
++
+ #define WLFW_MSG(id_, name_, tab, S)    { .id = (id_), .name = (name_), .f = (tab), .n = QN(tab), .csize = sizeof(S) }
+ #define WLFW_EMPTY(id_, name_)          { .id = (id_), .name = (name_), .f = NULL, .n = 0, .csize = sizeof(struct wlfw_empty) }
+ 
+@@ -348,6 +426,10 @@ static const struct qmi_msg_desc wlfw_bdf_download_resp_d = WLFW_MSG(WLFW_BDF_DO
+ static const struct qmi_msg_desc wlfw_m3_info_req_d = WLFW_MSG(WLFW_M3_INFO, "M3_INFO", wlfw_m3_info_req_f, struct wlfw_m3_info_req);
+ static const struct qmi_msg_desc wlfw_m3_info_resp_d = WLFW_MSG(WLFW_M3_INFO, "M3_INFO", wlfw_resp_only_f, struct wlfw_resp_only);
+ static const struct qmi_msg_desc wlfw_fw_init_done_ind_d = WLFW_MSG(WLFW_FW_INIT_DONE_IND, "FW_INIT_DONE_IND", wlfw_fw_init_done_ind_f, struct wlfw_fw_init_done_ind);
++static const struct qmi_msg_desc wlfw_wlan_mode_req_d = WLFW_MSG(WLFW_WLAN_MODE, "WLAN_MODE", wlfw_wlan_mode_req_f, struct wlfw_wlan_mode_req);
++static const struct qmi_msg_desc wlfw_wlan_mode_resp_d = WLFW_MSG(WLFW_WLAN_MODE, "WLAN_MODE", wlfw_resp_only_f, struct wlfw_resp_only);
++static const struct qmi_msg_desc wlfw_wlan_cfg_req_d = WLFW_MSG(WLFW_WLAN_CFG, "WLAN_CFG", wlfw_wlan_cfg_req_f, struct wlfw_wlan_cfg_req);
++static const struct qmi_msg_desc wlfw_wlan_cfg_resp_d = WLFW_MSG(WLFW_WLAN_CFG, "WLAN_CFG", wlfw_resp_only_f, struct wlfw_resp_only);
+ static const struct qmi_msg_desc wlfw_cal_done_ind_d = WLFW_MSG(WLFW_CAL_DONE_IND, "CAL_DONE_IND", wlfw_cal_done_ind_f, struct wlfw_cal_done_ind);
+ 
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */

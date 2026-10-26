@@ -1,0 +1,721 @@
+0321-negroni-wlan-ce: Wi-Fi level 8 (negroniwlan=8), copy engines on HAL SRNG, polled, steps 27-28.
+New bsd/dev/negroni_wlan_ce.c: one 304 KiB DMA area (pointer area, CE0/CE3 source rings, CE1/CE2
+destination + status rings, 2048-byte buffers, NC alias), ring registers through the BAR0 window (0x310c,
+ath11k pci.c:75-128), SRNG hw init without MSI (hal.c:268/:347), host pointers through the shadow registers,
+RX post / poll / TX send / reap (ce.c), read-back proof of the CE0 base; step 28 waits for HTC READY.
+Details: patches/xnu/README-wifi.md "0321".
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6f53ed3..97ab2aa 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@ bsd/dev/negroni_wifi.c			standard
+ bsd/dev/negroni_wlan.c			standard
+ bsd/dev/negroni_wlan_qrtr.c		standard
+ bsd/dev/negroni_wlan_qmi.c		standard
++bsd/dev/negroni_wlan_ce.c		standard
+ bsd/dev/negroni_wlan_bhi.c		standard
+ bsd/dev/negroni_wlan_mhi.c		standard
+ bsd/dev/negroni_adsp.c			standard
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index d8f4f70..dfa85b0 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -30,6 +30,7 @@
+ #include "negroni_wlan.h"
+ #include "negroni_wlan_mhi.h"
+ #include "negroni_wlan_qrtr.h"
++#include "negroni_wlan_ce.h"
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+@@ -203,6 +204,12 @@ negroni_wlan_wr(uint32_t off, uint32_t v)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++uint32_t
++negroni_wlan_timeout(void)
++{
++	return g_timeout_ms;
++}
++
+ uint64_t
+ negroni_wlan_ms(void)
+ {
+@@ -535,6 +542,7 @@ static void
+ wlan_cleanup(void)
+ {
+ 	negroni_wlan_wlfw_free();       /* 0266: firmware memory segments (after wlan_quiesce) */
++	negroni_wlan_ce_free();         /* 0321: CE rings and buffers */
+ 	if (H.xfer_nc) {
+ 		ml_io_unmap(H.xfer_nc, WLAN_XFER_SIZE);
+ 		H.xfer_nc = 0;
+@@ -913,6 +921,31 @@ wlan_level_cfg(void)
+ 	return negroni_wlan_wlfw_start(&H);
+ }
+ 
++/* ---- level 8: steps 27-28 (0321: copy engines + HAL SRNG, the first HTC message) ---- */
++struct negroni_wlan_htc_ready negroni_wlan_ready;
++
++static int
++wlan_level_ce(void)
++{
++	int error;
++
++	negroni_wlan_step(27, "CE rings");
++	error = negroni_wlan_ce_start();
++	if (error) {
++		return error;
++	}
++	negroni_wlan_step(28, "HTC READY");
++	error = negroni_wlan_ce_wait_ready(&negroni_wlan_ready);
++	if (error) {
++		return negroni_wlan_failed(error, "the first CE message is not a valid HTC READY");
++	}
++	printf("NEGRONI WLAN: HTC READY on CE%u: %u credits of %u bytes, %u endpoints%s (version %u, bundle %u)\n",
++	    negroni_wlan_ready.pipe, negroni_wlan_ready.credits, negroni_wlan_ready.credit_size,
++	    negroni_wlan_ready.max_endpoints, negroni_wlan_ready.extended ? ", extended" : "",
++	    negroni_wlan_ready.version, negroni_wlan_ready.max_bundle);
++	return 0;
++}
++
+ static int (*const wlan_levels[WLAN_LEVEL_MAX + 1])(void) = {
+ 	[WLAN_LEVEL_SBL] = wlan_level_sbl,
+ 	[WLAN_LEVEL_MHI] = wlan_level_mhi,
+@@ -920,6 +953,7 @@ static int (*const wlan_levels[WLAN_LEVEL_MAX + 1])(void) = {
+ 	[WLAN_LEVEL_QRTR] = wlan_level_qrtr,
+ 	[WLAN_LEVEL_WLFW] = wlan_level_wlfw,
+ 	[WLAN_LEVEL_CFG] = wlan_level_cfg,
++	[WLAN_LEVEL_CE] = wlan_level_ce,
+ };
+ 
+ /*
+diff --git a/bsd/dev/negroni_wlan_ce.c b/bsd/dev/negroni_wlan_ce.c
+new file mode 100644
+index 0000000..194fd0c
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_ce.c
+@@ -0,0 +1,547 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi, level 8 (patch 0321): the copy engines (CE) the host uses for HTC/WMI, on HAL
++ * SRNG rings in host memory, driven by polling (no MSI: this XNU has no GICv3 ITS).
++ *
++ *   step 27  CE rings      one contiguous DMA area: read-pointer area, CE0/CE3 source rings (host -> target),
++ *                          CE1/CE2 destination + status rings (target -> host), 2048-byte buffers; the ring
++ *                          registers (R0 config, R2 head/tail) through the BAR0 register window; the RX
++ *                          buffers posted; every host head/tail update through its shadow register
++ *   step 28  HTC READY     the first message on a CE: HTC endpoint 0, HTC_MSG_READY (credits, credit size)
++ *
++ * Sequence and register meaning: Linux ath11k (BSD-3-Clause-Clear) ce.c ath11k_ce_init_pipes /
++ * ath11k_ce_rx_post_pipe / ath11k_ce_send / ath11k_ce_completed_recv_next, hal.c ath11k_hal_srng_setup /
++ * _src_hw_init / _dst_hw_init / ath11k_hal_ce_dst_setup / _access_end, hal_desc.h CE descriptors,
++ * pci.c ath11k_pci_window_write32; values in negroni_wlan_ce.h. Our own code, written from those
++ * descriptions; not copied. Design reference: external/ios-spes 0099 (WCN6750 CE, polled; no license file,
++ * read only). UNTESTED ON HARDWARE.
++ *
++ * Polling without MSI: the HAL writes a source ring's tail pointer and a destination ring's head pointer
++ * into the read-pointer area in host memory (TP_ADDR / HP_ADDR registers) whether or not MSI is set up
++ * (hal.c:331-341, :437-445); the ring interrupt thresholds stay 0 and no MSI address is given. ath11k
++ * itself needs MSI (pcic.c, one vector at least); this is the "legacy" path ath11k does not have, so the
++ * polled read of the read-pointer area replaces the CE interrupt (ce.c ath11k_ce_per_engine_service).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include "negroni_wlan.h"
++#include "negroni_wlan_mhi.h"
++#include "negroni_wlan_ce.h"
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++#define WLAN_WIMG_WCOMB         0x6u            /* Normal non-cacheable (negroni_wlan.c) */
++
++/* ---- DMA area layout (all ring bases 8-byte aligned, ce.h CE_DESC_RING_ALIGN) ---- */
++#define CE_BUF                  2048u           /* src_sz_max of CE0-3 (ce.c:118-160) */
++#define CE0_N                   16u             /* host CE0 src_nentries (ce.c:121) */
++#define CE3_N                   32u             /* host CE3 src_nentries (ce.c:144) */
++#define CE1_N                   32u             /* host CE1 dst: ath11k posts 512, 32 is enough for HTC */
++#define CE2_N                   64u             /* host CE2 dst (WMI events) */
++#define CE_SRC_DESC             16u             /* hal_ce_srng_src_desc: 4 dwords */
++#define CE_DST_DESC             8u              /* hal_ce_srng_dest_desc: 2 dwords */
++#define CE_STS_DESC             16u             /* hal_ce_srng_dst_status_desc: 4 dwords */
++
++#define OFF_RDP                 0x0000u         /* u32 per ring id (HAL_RING_ID_MAX = 128) */
++#define OFF_CE0_SRC             0x1000u
++#define OFF_CE3_SRC             (OFF_CE0_SRC + CE0_N * CE_SRC_DESC)
++#define OFF_CE1_DST             (OFF_CE3_SRC + CE3_N * CE_SRC_DESC)
++#define OFF_CE1_STS             (OFF_CE1_DST + CE1_N * CE_DST_DESC)
++#define OFF_CE2_DST             (OFF_CE1_STS + CE1_N * CE_STS_DESC)
++#define OFF_CE2_STS             (OFF_CE2_DST + CE2_N * CE_DST_DESC)
++#define OFF_BUF                 0x4000u
++#define OFF_CE0_BUF             OFF_BUF
++#define OFF_CE3_BUF             (OFF_CE0_BUF + CE0_N * CE_BUF)
++#define OFF_CE1_BUF             (OFF_CE3_BUF + CE3_N * CE_BUF)
++#define OFF_CE2_BUF             (OFF_CE1_BUF + CE1_N * CE_BUF)
++#define CE_AREA                 (OFF_CE2_BUF + CE2_N * CE_BUF)          /* 0x4c000 = 304 KiB */
++_Static_assert(HAL_RING_ID_MAX * 4 <= OFF_CE0_SRC, "read-pointer area overlaps the rings");
++_Static_assert(OFF_CE2_STS + CE2_N * CE_STS_DESC <= OFF_BUF, "rings overlap the buffers");
++_Static_assert((CE_AREA & 0x3fffu) == 0, "the CE area is a multiple of 16 KiB pages");
++
++/* ---- SRNG register offsets inside a ring's R0 group (wcn6855_regs, relative to ring base LSB) ---- */
++#define SRC_BASE_MSB            0x04u   /* tcl1 base_msb - base_lsb */
++#define SRC_ID                  0x08u
++#define SRC_MISC                0x10u
++#define SRC_TP_ADDR_LSB         0x1cu
++#define SRC_TP_ADDR_MSB         0x20u
++#define SRC_CONSR_INT_IX0       0x30u
++#define SRC_CONSR_INT_IX1       0x34u
++#define DST_BASE_MSB            0x04u   /* reo1 base_msb - base_lsb */
++#define DST_ID                  0x08u
++#define DST_MISC                0x10u
++#define DST_HP_ADDR_LSB         0x14u
++#define DST_HP_ADDR_MSB         0x18u
++#define DST_PRODUCER_INT        0x24u
++#define MISC_MSI_LOOPCNT_OFF    (1u << 1)       /* HAL_TCL1_RING_MISC_MSI_LOOPCNT_DISABLE */
++#define MISC_SRNG_ENABLE        (1u << 6)
++#define BASE_MSB_SIZE_SHIFT     8u              /* RING_SIZE (27:8), in dwords; ADDR_MSB (7:0) */
++
++/* one SRNG ring as the host sees it; hp/tp in dwords like the hardware */
++struct ce_ring {
++	const char *name;
++	uint32_t ring_id;
++	uint32_t n, esz;                /* entries, entry size in dwords */
++	uint32_t r0, r2;                /* register group bases (BAR0 / window offsets) */
++	uint32_t shadow;                /* BAR0 offset of the shadow register for our pointer */
++	bool src;                       /* the host produces (CE_SRC, CE_DST) or consumes (CE_DST_STATUS) */
++	uint32_t off;                   /* area offset of the ring */
++	uint32_t hp, tp;                /* host producer head / host consumer tail, dwords */
++};
++
++struct ce_pipe {
++	uint32_t num;
++	struct ce_ring src;             /* tx pipes */
++	struct ce_ring dst, sts;        /* rx pipes */
++	uint32_t buf_off, nbuf;
++	uint32_t sw;                    /* rx: next slot to complete; tx: next slot to reap */
++	uint32_t pending;               /* tx: sent, not completed */
++};
++
++static vm_offset_t g_area_kva, g_area_nc;
++static uint64_t g_area_pa, g_area_dva;
++static uint32_t g_window = ~0u;
++static struct ce_pipe g_ce[4];
++static bool g_ce_on;
++static uint8_t g_rx_copy[CE_BUF];
++
++struct negroni_wlan_ce_stats negroni_wlan_ce_stats;
++void (*negroni_wlan_ce_rx_cb)(uint32_t pipe, const uint8_t *data, uint32_t len);
++
++/* step 28 default receiver (0322 installs the HTC one): keep the first endpoint-0 message */
++static uint8_t g_first[256];
++static uint32_t g_first_len, g_first_pipe;
++
++/* ---- register access: below 0x80000 direct, above through the window (pci.c:75-128) ---- */
++static void
++ce_select(uint32_t off)
++{
++	uint32_t w = (off >> WLAN_WINDOW_SHIFT) & WLAN_WINDOW_VALUE;
++
++	if (w != g_window) {
++		negroni_wlan_wr(WLAN_WINDOW_REG, WLAN_WINDOW_ENABLE | w);
++		(void)negroni_wlan_rd(WLAN_WINDOW_REG);         /* the select lands before the access */
++		g_window = w;
++	}
++}
++
++static void
++ce_wr(uint32_t off, uint32_t v)
++{
++	if (off < WLAN_WINDOW_START) {
++		negroni_wlan_wr(off, v);
++		return;
++	}
++	ce_select(off);
++	negroni_wlan_wr(WLAN_WINDOW_START + (off & WLAN_WINDOW_RANGE), v);
++}
++
++static uint32_t
++ce_rd(uint32_t off)
++{
++	if (off < WLAN_WINDOW_START) {
++		return negroni_wlan_rd(off);
++	}
++	ce_select(off);
++	return negroni_wlan_rd(WLAN_WINDOW_START + (off & WLAN_WINDOW_RANGE));
++}
++
++static inline volatile uint32_t *
++area32(uint32_t off)
++{
++	return (volatile uint32_t *)(g_area_nc + off);
++}
++
++/* the hardware-written pointer of a ring (TP of a source ring, HP of a destination ring), checked */
++static bool
++ce_hw_ptr(const struct ce_ring *r, uint32_t *v)
++{
++	uint32_t x = *area32(OFF_RDP + 4 * r->ring_id);
++	uint32_t size = r->n * r->esz;
++
++	__asm__ volatile ("dmb ld" ::: "memory");       /* pointer before the descriptors it covers */
++	if (x >= size || (x % r->esz)) {
++		negroni_wlan_ce_stats.bad_ptr++;
++		return false;
++	}
++	*v = x;
++	return true;
++}
++
++static void
++ce_ring_def(struct ce_ring *r, const char *name, uint32_t ring_id, uint32_t n, uint32_t desc, uint32_t r0,
++    uint32_t r2, uint32_t shadow_idx, bool src, uint32_t off)
++{
++	memset(r, 0, sizeof(*r));
++	r->name = name;
++	r->ring_id = ring_id;
++	r->n = n;
++	r->esz = desc / 4;
++	r->r0 = r0;
++	r->r2 = r2;
++	r->shadow = HAL_SHADOW_REG(shadow_idx);
++	r->src = src;
++	r->off = off;
++}
++
++/*
++ * HAL SRNG hardware init (hal.c ath11k_hal_srng_src_hw_init / _dst_hw_init), no MSI, no interrupt
++ * thresholds. The pointer area slot of the ring gets the hardware's pointer copies.
++ */
++static void
++ce_ring_hw_init(const struct ce_ring *r)
++{
++	uint64_t base = g_area_dva + r->off;
++	uint64_t ptr = g_area_dva + OFF_RDP + 4ull * r->ring_id;
++	uint32_t size = r->n * r->esz;
++
++	memset((void *)(g_area_nc + r->off), 0, (size_t)size * 4);
++	*area32(OFF_RDP + 4 * r->ring_id) = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ce_wr(r->r0, (uint32_t)base);
++	ce_wr(r->r0 + (r->src ? SRC_BASE_MSB : DST_BASE_MSB),
++	    (uint32_t)((base >> 32) & 0xff) | (size << BASE_MSB_SIZE_SHIFT));
++	if (r->src) {
++		ce_wr(r->r0 + SRC_ID, r->esz);                  /* entry size only (hal.c:384) */
++		ce_wr(r->r0 + SRC_CONSR_INT_IX0, 0);
++		ce_wr(r->r0 + SRC_CONSR_INT_IX1, 0);
++		ce_wr(r->r0 + SRC_TP_ADDR_LSB, (uint32_t)ptr);
++		ce_wr(r->r0 + SRC_TP_ADDR_MSB, (uint32_t)(ptr >> 32));
++	} else {
++		ce_wr(r->r0 + DST_ID, (r->ring_id << 8) | r->esz);
++		ce_wr(r->r0 + DST_PRODUCER_INT, 0);
++		ce_wr(r->r0 + DST_HP_ADDR_LSB, (uint32_t)ptr);
++		ce_wr(r->r0 + DST_HP_ADDR_MSB, (uint32_t)(ptr >> 32));
++	}
++	ce_wr(r->r2, 0);                                        /* HP */
++	ce_wr(r->r2 + HAL_HP_TO_TP, 0);                         /* TP */
++	ce_wr(r->r0 + (r->src ? SRC_MISC : DST_MISC), (r->src ? MISC_MSI_LOOPCNT_OFF : 0) | MISC_SRNG_ENABLE);
++}
++
++/* host pointer update through the shadow register (hal.c ath11k_hal_srng_access_end, shadow path) */
++static void
++ce_ring_commit(const struct ce_ring *r)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");               /* descriptors before the pointer */
++	ce_wr(r->shadow, r->src ? r->hp : r->tp);
++}
++
++static void
++ce_pipe_tx(struct ce_pipe *p, uint32_t num, uint32_t n, uint32_t ring_off, uint32_t buf_off, uint32_t shadow)
++{
++	memset(p, 0, sizeof(*p));
++	p->num = num;
++	ce_ring_def(&p->src, "src", HAL_RING_ID_CE_SRC(num), n, CE_SRC_DESC, HAL_CE0_SRC_R0 + num * HAL_CE_STRIDE,
++	    HAL_CE0_SRC_R0 + num * HAL_CE_STRIDE + HAL_CE_RING_HP, shadow, true, ring_off);
++	p->buf_off = buf_off;
++	p->nbuf = n;
++}
++
++static void
++ce_pipe_rx(struct ce_pipe *p, uint32_t num, uint32_t n, uint32_t dst_off, uint32_t sts_off, uint32_t buf_off,
++    uint32_t sh_dst, uint32_t sh_sts)
++{
++	uint32_t base = HAL_CE0_DST_R0 + num * HAL_CE_STRIDE;
++
++	memset(p, 0, sizeof(*p));
++	p->num = num;
++	/* CE_DST is a source ring for the HAL (the host produces buffer pointers, hal.c:94-101) */
++	ce_ring_def(&p->dst, "dst", HAL_RING_ID_CE_DST(num), n, CE_DST_DESC, base, base + HAL_CE_RING_HP, sh_dst,
++	    true, dst_off);
++	ce_ring_def(&p->sts, "status", HAL_RING_ID_CE_STS(num), n, CE_STS_DESC, base + HAL_CE_DST_STATUS_R0,
++	    base + HAL_CE_STATUS_RING_HP, sh_sts, false, sts_off);
++	p->buf_off = buf_off;
++	p->nbuf = n;
++}
++
++/* post the buffer of slot dst.hp (slot k always owns buffer k): hal_ce_dst_set_desc */
++static void
++ce_rx_post_one(struct ce_pipe *p)
++{
++	struct ce_ring *d = &p->dst;
++	uint32_t slot = d->hp / d->esz;
++	uint64_t a = g_area_dva + p->buf_off + (uint64_t)slot * CE_BUF;
++	volatile uint32_t *desc = area32(d->off + d->hp * 4);
++
++	desc[0] = (uint32_t)a;
++	desc[1] = (uint32_t)((a >> 32) & 0xff);         /* addr bits 39:32 (HAL_CE_DEST_DESC_ADDR_INFO_ADDR_HI) */
++	d->hp = (d->hp + d->esz) % (d->n * d->esz);
++}
++
++static void
++ce_rx_init(struct ce_pipe *p)
++{
++	ce_ring_hw_init(&p->dst);
++	ce_ring_hw_init(&p->sts);
++	/* ath11k_hal_ce_dst_setup: the largest buffer the CE may write into a destination slot */
++	uint32_t ctrl = ce_rd(p->dst.r0 + HAL_CE_DST_RING_CTRL);
++	ce_wr(p->dst.r0 + HAL_CE_DST_RING_CTRL, (ctrl & ~0xffffu) | CE_BUF);
++	for (uint32_t i = 0; i + 1 < p->nbuf; i++) {     /* a ring holds n - 1 entries */
++		ce_rx_post_one(p);
++	}
++	ce_ring_commit(&p->dst);
++}
++
++/* drain one rx pipe: every status entry the hardware wrote, then re-post (ce.c:363-447) */
++static void
++ce_rx_poll(struct ce_pipe *p)
++{
++	struct ce_ring *s = &p->sts;
++	uint32_t hw, size = s->n * s->esz, guard = s->n;
++	bool moved = false;
++
++	if (!ce_hw_ptr(s, &hw)) {
++		return;
++	}
++	while (s->tp != hw && guard--) {
++		volatile uint32_t *st = area32(s->off + s->tp * 4);
++		uint32_t len = st[0] >> 16;                     /* HAL_CE_DST_STATUS_DESC_FLAGS_LEN */
++		uint32_t slot = p->sw;
++
++		if (len == 0 || len > CE_BUF) {
++			negroni_wlan_ce_stats.bad_len++;
++		} else {
++			memcpy(g_rx_copy, (const void *)(g_area_nc + p->buf_off + slot * CE_BUF), len);
++			negroni_wlan_ce_stats.rx[p->num & 3]++;
++			if (negroni_wlan_ce_rx_cb) {
++				negroni_wlan_ce_rx_cb(p->num, g_rx_copy, len);
++			}
++		}
++		st[0] = 0;
++		p->sw = (p->sw + 1) % p->nbuf;
++		s->tp = (s->tp + s->esz) % size;
++		ce_rx_post_one(p);
++		moved = true;
++	}
++	if (moved) {
++		ce_ring_commit(s);              /* status TP: the slots may be reused */
++		ce_ring_commit(&p->dst);        /* new buffers */
++	}
++}
++
++/* reap completed tx descriptors (the hardware TP passed them) */
++static void
++ce_tx_reap(struct ce_pipe *p)
++{
++	struct ce_ring *r = &p->src;
++	uint32_t hw;
++
++	if (!ce_hw_ptr(r, &hw)) {
++		return;
++	}
++	while (r->tp != hw && p->pending) {
++		r->tp = (r->tp + r->esz) % (r->n * r->esz);
++		p->pending--;
++		negroni_wlan_ce_stats.tx_done++;
++	}
++}
++
++static struct ce_pipe *
++ce_pipe_get(uint32_t num)
++{
++	return (g_ce_on && num < 4) ? &g_ce[num] : NULL;
++}
++
++/* ath11k_ce_send: one buffer, one descriptor; ENOBUFS when the ring is full */
++int
++negroni_wlan_ce_send(uint32_t pipe, const void *data, uint32_t len, uint32_t transfer_id)
++{
++	struct ce_pipe *p = ce_pipe_get(pipe);
++	struct ce_ring *r;
++
++	if (!p || (pipe != 0 && pipe != 3) || len == 0 || len > CE_BUF) {
++		return EINVAL;
++	}
++	r = &p->src;
++	ce_tx_reap(p);
++	uint32_t size = r->n * r->esz, next = (r->hp + r->esz) % size;
++	if (next == r->tp) {
++		negroni_wlan_ce_stats.tx_full++;
++		return ENOBUFS;
++	}
++	uint32_t slot = r->hp / r->esz;
++	uint64_t a = g_area_dva + p->buf_off + (uint64_t)slot * CE_BUF;
++	volatile uint32_t *desc = area32(r->off + r->hp * 4);
++
++	memcpy((void *)(g_area_nc + p->buf_off + slot * CE_BUF), data, len);
++	desc[0] = (uint32_t)a;
++	desc[1] = (uint32_t)((a >> 32) & 0xff) | (len << 16);  /* ADDR_HI, no swap, no gather, LEN 31:16 */
++	desc[2] = transfer_id & 0xffff;                         /* META_INFO: the HTC endpoint */
++	desc[3] = 0;
++	r->hp = next;
++	p->pending++;
++	ce_ring_commit(r);
++	negroni_wlan_ce_stats.tx[pipe & 3]++;
++	return 0;
++}
++
++/* tx slots free on a pipe (after a reap) */
++uint32_t
++negroni_wlan_ce_tx_free(uint32_t pipe)
++{
++	struct ce_pipe *p = ce_pipe_get(pipe);
++
++	if (!p || (pipe != 0 && pipe != 3)) {
++		return 0;
++	}
++	ce_tx_reap(p);
++	return p->src.n - 1 - p->pending;
++}
++
++void
++negroni_wlan_ce_poll(void)
++{
++	if (!g_ce_on) {
++		return;
++	}
++	ce_rx_poll(&g_ce[1]);
++	ce_rx_poll(&g_ce[2]);
++	ce_tx_reap(&g_ce[0]);
++	ce_tx_reap(&g_ce[3]);
++}
++
++/* free after the chip lost bus mastering (negroni_wlan.c failure path) */
++void
++negroni_wlan_ce_free(void)
++{
++	g_ce_on = false;
++	negroni_wlan_ce_rx_cb = NULL;
++	if (g_area_nc) {
++		ml_io_unmap(g_area_nc, CE_AREA);
++		g_area_nc = 0;
++	}
++	if (g_area_kva) {
++		flush_dcache64((addr64_t)g_area_pa, CE_AREA, TRUE);
++		kmem_free(kernel_map, g_area_kva, CE_AREA);
++		g_area_kva = 0;
++	}
++}
++
++static void
++ce_first_rx(uint32_t pipe, const uint8_t *data, uint32_t len)
++{
++	if (g_first_len == 0) {
++		g_first_len = MIN(len, (uint32_t)sizeof(g_first));
++		g_first_pipe = pipe;
++		memcpy(g_first, data, g_first_len);
++	}
++}
++
++/* step 27 */
++int
++negroni_wlan_ce_start(void)
++{
++	if (kmem_alloc_contig(kernel_map, &g_area_kva, CE_AREA, PAGE_MASK, (ppnum_t)(atop_64(MHI_DMA_MASK + 1) - 1), 0,
++	    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		g_area_kva = 0;
++		return negroni_wlan_failed(ENOMEM, "no %u contiguous bytes for the CE rings", CE_AREA);
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)g_area_kva);
++	g_area_pa = ptoa_64(pn);
++	if (!pn || g_area_pa + CE_AREA - 1 > MHI_DMA_MASK) {
++		return negroni_wlan_failed(ERANGE, "CE area page %#x outside the DMA mask", pn);
++	}
++	flush_dcache64((addr64_t)g_area_pa, CE_AREA, TRUE);
++	g_area_nc = ml_io_map_unmappable((vm_offset_t)g_area_pa, CE_AREA, WLAN_WIMG_WCOMB);
++	if (!g_area_nc) {
++		return negroni_wlan_failed(ENOMEM, "the non-cacheable CE area map failed");
++	}
++	g_area_dva = negroni_wlan_dma_map(g_area_pa, CE_AREA);
++	if (g_area_dva == WLAN_DMA_NONE) {
++		return negroni_wlan_failed(ENOMEM, "no device address for the CE area");
++	}
++	printf("NEGRONI WLAN: CE area %u bytes at %#llx (device %#llx)\n", CE_AREA, g_area_pa, g_area_dva);
++
++	uint32_t w0 = negroni_wlan_rd(WLAN_WINDOW_REG);
++	ce_pipe_tx(&g_ce[0], 0, CE0_N, OFF_CE0_SRC, OFF_CE0_BUF, WLAN_SHADOW_CE0_SRC);
++	ce_pipe_rx(&g_ce[1], 1, CE1_N, OFF_CE1_DST, OFF_CE1_STS, OFF_CE1_BUF, WLAN_SHADOW_CE1_DST, WLAN_SHADOW_CE1_STS);
++	ce_pipe_rx(&g_ce[2], 2, CE2_N, OFF_CE2_DST, OFF_CE2_STS, OFF_CE2_BUF, WLAN_SHADOW_CE2_DST, WLAN_SHADOW_CE2_STS);
++	ce_pipe_tx(&g_ce[3], 3, CE3_N, OFF_CE3_SRC, OFF_CE3_BUF, WLAN_SHADOW_CE3_SRC);
++	ce_ring_hw_init(&g_ce[0].src);
++	ce_ring_hw_init(&g_ce[3].src);
++
++	/* proof that the window reaches the CE registers: the base we wrote reads back */
++	uint32_t want = (uint32_t)(g_area_dva + OFF_CE0_SRC), got = ce_rd(g_ce[0].src.r0);
++	printf("NEGRONI WLAN: window register %#x -> %#x; CE0 SRC base reads %#x (wrote %#x), MISC %#x\n", w0,
++	    negroni_wlan_rd(WLAN_WINDOW_REG), got, want, ce_rd(g_ce[0].src.r0 + SRC_MISC));
++	if (got != want) {
++		return negroni_wlan_failed(EIO, "CE0 SRC base reads %#x, wrote %#x: the register window does not reach "
++		           "the CE block", got, want);
++	}
++	negroni_wlan_ce_rx_cb = ce_first_rx;
++	ce_rx_init(&g_ce[1]);
++	ce_rx_init(&g_ce[2]);
++	g_ce_on = true;
++	negroni_wlan_add_poller(negroni_wlan_ce_poll);
++	printf("NEGRONI WLAN: CE0 src %u, CE1 dst %u (+status), CE2 dst %u (+status), CE3 src %u; %u + %u RX buffers "
++	    "of %u bytes posted\n", CE0_N, CE1_N, CE2_N, CE3_N, CE1_N - 1, CE2_N - 1, CE_BUF);
++	return 0;
++}
++
++/* ==== pure HTC READY parser (host-tested, patches/xnu/tests/wlan-wmi-test.c) ==== */
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++int
++negroni_wlan_htc_parse_ready(const uint8_t *b, uint32_t len, uint32_t pipe, struct negroni_wlan_htc_ready *out)
++{
++	memset(out, 0, sizeof(*out));
++	out->pipe = pipe;
++	if (!b || len < HTC_HDR_LEN + 8) {
++		return EBADMSG;
++	}
++	uint32_t info = le32(b), eid = info & 0xff, plen = info >> 16;
++	if (eid != 0 || plen < 8 || plen > len - HTC_HDR_LEN) {
++		return EBADMSG;
++	}
++	uint32_t w0 = le32(b + 8), w1 = le32(b + 12);
++	if ((w0 & 0xffff) != HTC_MSG_READY) {
++		return EBADMSG;
++	}
++	out->credits = w0 >> 16;
++	out->credit_size = w1 & 0xffff;
++	out->max_endpoints = (w1 >> 16) & 0xff;
++	if (plen >= 12) {
++		uint32_t w2 = le32(b + 16);
++		out->extended = true;
++		out->version = w2 & 0xff;
++		out->max_bundle = (w2 >> 8) & 0xff;
++	}
++	return (out->credits && out->credit_size) ? 0 : EBADMSG;
++}
++/* ==== end of the pure parser ==== */
++
++/* step 28: the first message is HTC_MSG_READY on endpoint 0 (htc.c ath11k_htc_wait_target) */
++int
++negroni_wlan_ce_wait_ready(struct negroni_wlan_htc_ready *out)
++{
++	uint64_t deadline = negroni_wlan_ms() + MAX(negroni_wlan_timeout(), 10000u);
++	int error;
++
++	while (g_first_len == 0) {
++		error = negroni_wlan_service();
++		if (error) {
++			return negroni_wlan_failed(error, "the chip stopped while waiting for HTC READY");
++		}
++		if (negroni_wlan_ms() >= deadline) {
++			return negroni_wlan_failed(ETIMEDOUT, "no CE message in %u ms (CE1 rx %u, CE2 rx %u, bad ptr %u, "
++			           "status HP CE1 %#x CE2 %#x)", MAX(negroni_wlan_timeout(), 10000u),
++			           negroni_wlan_ce_stats.rx[1], negroni_wlan_ce_stats.rx[2], negroni_wlan_ce_stats.bad_ptr,
++			           *area32(OFF_RDP + 4 * HAL_RING_ID_CE_STS(1)), *area32(OFF_RDP + 4 * HAL_RING_ID_CE_STS(2)));
++		}
++		negroni_wlan_nap(5);
++	}
++	return negroni_wlan_htc_parse_ready(g_first, g_first_len, g_first_pipe, out);
++}
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_ce.h b/bsd/dev/negroni_wlan_ce.h
+index f0ba60a..e50cb7f 100644
+--- a/bsd/dev/negroni_wlan_ce.h
++++ b/bsd/dev/negroni_wlan_ce.h
+@@ -135,5 +135,41 @@ _Static_assert(WLAN_SHADOW_N <= HAL_SHADOW_MAX, "shadow list longer than the v01
+ #define WLAN_SHADOW_CE2_STS     24u
+ #define WLAN_SHADOW_CE3_SRC     25u
+ 
++/* ---- 0321: the CE driver (negroni_wlan_ce.c) ---- */
++/* HTC header (htc.h:12-30): htc_info = eid 7:0 | flags 15:8 | payload length 31:16; ctrl_info = trailer
++ * length 7:0 (ControlBytes0) | sequence 15:8 */
++#define HTC_HDR_LEN             8u
++#define HTC_FLAG_NEED_CREDIT    0x01u
++#define HTC_FLAG_TRAILER        0x02u
++#define HTC_MSG_READY           1u
++#define HTC_MSG_CONNECT         2u
++#define HTC_MSG_CONNECT_RESP    3u
++#define HTC_MSG_SETUP_COMPLETE_EX 5u
++#define HTC_MAX_LEN             4096u   /* ATH11K_HTC_MAX_LEN */
++
++struct negroni_wlan_htc_ready {
++	uint32_t pipe;                  /* the CE it came on */
++	uint32_t credits, credit_size, max_endpoints;
++	uint32_t version, max_bundle;   /* the extended part, when present */
++	bool extended;
++};
++
++struct negroni_wlan_ce_stats {
++	uint32_t rx[4], tx[4], tx_done, tx_full, bad_len, bad_ptr;
++};
++extern struct negroni_wlan_ce_stats negroni_wlan_ce_stats;
++/* every received CE buffer (a private copy, valid during the call); 0322 installs the HTC receiver */
++extern void (*negroni_wlan_ce_rx_cb)(uint32_t pipe, const uint8_t *data, uint32_t len);
++
++extern struct negroni_wlan_htc_ready negroni_wlan_ready;  /* negroni_wlan.c, step 28 */
++int negroni_wlan_ce_start(void);                        /* step 27 */
++int negroni_wlan_ce_wait_ready(struct negroni_wlan_htc_ready *out);     /* step 28 */
++int negroni_wlan_ce_send(uint32_t pipe, const void *data, uint32_t len, uint32_t transfer_id);
++uint32_t negroni_wlan_ce_tx_free(uint32_t pipe);
++void negroni_wlan_ce_poll(void);
++void negroni_wlan_ce_free(void);
++/* pure parser of an HTC READY buffer (header included); 0 or EBADMSG (host-tested) */
++int negroni_wlan_htc_parse_ready(const uint8_t *b, uint32_t len, uint32_t pipe, struct negroni_wlan_htc_ready *out);
++
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+ #endif /* _NEGRONI_WLAN_CE_H_ */
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index 56174c7..9b98475 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -165,6 +165,7 @@ struct mhi_host {
+  *   5  steps 16-17: QRTR HELLO, WLFW service lookup (0265, negroni_wlan_qrtr.c)
+  *   6  steps 18-24: QMI WLFW IND_REGISTER .. FW_INIT_DONE (0266, negroni_wlan_qmi.c)
+  *   7  steps 25-26: QMI WLFW WLAN_CFG (CE pipes, service map, shadow registers) + WLAN_MODE mission (0320)
++ *   8  steps 27-28: CE rings (HAL SRNG, register window, shadow registers), HTC READY (0321)
+  * Each step prints "NEGRONI WLAN: step N NAME" before it starts and, on an error,
+  * "NEGRONI WLAN: step N NAME failed: REASON". Every wait has a time-out (negroniwlan_to).
+  */
+@@ -174,7 +175,8 @@ struct mhi_host {
+ #define WLAN_LEVEL_QRTR         5       /* 0265 */
+ #define WLAN_LEVEL_WLFW         6       /* 0266 */
+ #define WLAN_LEVEL_CFG          7       /* 0320 */
+-#define WLAN_LEVEL_MAX          7       /* the highest level this build implements */
++#define WLAN_LEVEL_CE           8       /* 0321 */
++#define WLAN_LEVEL_MAX          8       /* the highest level this build implements */
+ /* level 4 (0264) also posts the RX buffers on channel 21 (cnss2 auto_queue, pci.c:181) */
+ 
+ void negroni_wlan_step(uint32_t n, const char *name);
+@@ -184,6 +186,7 @@ int negroni_wlan_failed(int error, const char *fmt, ...) __printflike(2, 3);
+ uint32_t negroni_wlan_rd(uint32_t off);
+ void negroni_wlan_wr(uint32_t off, uint32_t v);
+ uint64_t negroni_wlan_ms(void);
++uint32_t negroni_wlan_timeout(void);    /* 0321: negroniwlan_to in ms */
+ uint32_t negroni_wlan_seq(void);
+ /* 0266: one file of the firmware area into dst (SHA-256 checked); ENOENT if it is not there */
+ int negroni_wlan_fw_file(const char *name, void *dst, uint32_t cap, uint32_t *size);

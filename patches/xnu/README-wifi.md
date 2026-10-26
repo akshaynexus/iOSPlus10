@@ -1,4 +1,4 @@
-# Wi-Fi kernel changes (0260-0269)
+# Wi-Fi kernel changes (0260-0269, 0320-0329)
 
 Plan, hardware facts and stages: [docs/wifi-plan.md](../../docs/wifi-plan.md).
 
@@ -147,6 +147,8 @@ Log lines (all start `NEGRONI WLAN:`):
   `... has no SMR; the SMMU is in client bypass`, `... unmatched streams bypass (USFCFG 0)`,
   `... has no SMR and unmatched streams FAULT (USFCFG 1)`.
 - `device entered M1; host toggled device wake (0 then 1)` (pm.c:334-363); SYSERR and EE RDDM stop the step.
+  0320 corrects this: Linux writes MHISTATE M2, then (device wake held) wake_get + wake_put; the line is now
+  `device entered M1; host wrote M2 and device wake 1 (pm.c:341-359)`.
 - 0264: `channel 21: 16 RX buffers of 32768 bytes at 0x..`; `channel N transfer event code .. ptr .. ignored`.
 - Badge (framebuffer, top right): `WLAN N` while step N runs, `WLAN OK N`, `WLAN STOP N`.
 
@@ -254,7 +256,7 @@ CAL_DONE, power cycle) before mission mode; level 6 stops at FW_INIT_DONE and do
 New boot-arg values: `negroniwlan=5` (QRTR), `negroniwlan=6` (QMI WLFW). Image: `out/ios16-wlan6` (config args
 with `negroniwifi=10 negroniwlan=6 negronipanic=30 negronipanicreason=2`).
 
-### What step 25+ needs (not written)
+### What step 25+ needs (written 2026-10-26: 0320-0324 below)
 
 1. WLAN_CFG (0x23: CE target pipe config, service-to-pipe map, shadow registers v2/v3) and WLAN_MODE MISSION (0x22),
    ath11k qmi.c ath11k_qmi_wlanfw_wlan_cfg_send / mode_send, core.c:2278 order (cfg + mode before the CE setup);
@@ -265,6 +267,166 @@ with `negroniwifi=10 negroniwlan=6 negronipanic=30 negronipanicreason=2`).
 3. HTT/DP rings (dp.c, dp_rx.c, dp_tx.c) for data, then the iOS side: an IO80211 / IONetworkingFamily `en0`
    interface (design reference external/ios-sailfish patches 0174-0179), scan + WPA (wpa_supplicant-style key
    handling in user space or in the kernel).
+
+## 0320-0324: WLAN_CFG/MODE, copy engines, HTC/WMI, passive scan, SMMU stage 1 (2026-10-26)
+
+Files: `bsd/dev/negroni_wlan_ce.{c,h}` (0320 header, 0321 code), `negroni_wlan_wmi.{c,h}` (0322, 0323),
+`negroni_wlan_smmu.c` (0324), `negroni_wlan_qmi.c` + `negroni_wlfw_tables.h` (0320), `negroni_wlan.c`,
+`negroni_wlan_mhi.{c,h}`, `bsd/conf/files` (new lines right after `negroni_wlan_qmi.c`). Made in
+`out/kernel/tree-wmi` (patched-tree.sh, then one commit per patch; deleted after). Build-only: not run on the phone.
+Reference: Linux ath11k (BSD-3-Clause-Clear) for WCN6855 hw2.x (PCI 17cb:1103 = WCN6855, ath11k pci.c:32):
+values and sequences only, our own code. Design reference only (no license file): external/ios-spes 0099
+(WCN6750 CE/HTC/WMI scan), external/ios-sailfish 0169-0179 (QCA6174 + the iOS side).
+
+`negroniwlan=N` now goes to 10 (`WLAN_LEVEL_MAX`). After the last asked level (>= 4) a keep-alive poller runs.
+
+| Level | Step | Name (`NEGRONI WLAN: step N NAME`) | What | Source |
+|---|---|---|---|---|
+| 7 | 25 | WLFW WLAN_CFG | host "WIN", 9 target CE pipes, 14 service routes, 30 shadow registers v2 (493-byte message) | ath11k qmi.c:2695, hw.c:1623/:1720, ce.c:840 |
+| 7 | 26 | WLFW WLAN_MODE mission | mode 0, hw_debug 0 | ath11k qmi.c:2640, :2841-2869 |
+| 8 | 27 | CE rings | one 304 KiB DMA area: pointer area, CE0 src 16, CE3 src 32, CE1 dst 32 + status, CE2 dst 64 + status, 2048-byte buffers; ring registers through the BAR0 window (0x310c); read-back check of the CE0 base | ce.c:914, hal.c:998/:268/:347, pci.c:75-128 |
+| 8 | 28 | HTC READY | the first CE message: HTC endpoint 0 READY, credits and credit size | htc.c:521 |
+| 9 | 29 | HTC connect | HTT data (no credit flow), WMI control (1 credit), SETUP_COMPLETE_EX | htc.c:593, :763, wmi.c:9072 |
+| 9 | 30 | WMI SERVICE_READY | SERVICE_READY (+ SERVICE_AVAILABLE) + SERVICE_READY_EXT (+ EXT2 with service 220) | wmi.c:576, :5037, :5177, :8155 |
+| 9 | 31 | WMI INIT | resource config of ath11k_init_wmi_config_qca6390 (72 words), no host memory chunks, no hw mode TLV | hw.c:58, wmi.c:4188, :4258, :4469 |
+| 9 | 32 | WMI READY | status, MAC; compared with ADT `/chosen mac-address-wifi0` | wmi.c:7346 |
+| 10 | 33 | WMI channel list | PDEV_SET_HW_MODE DBS (answer optional), SCAN_CHAN_LIST 38 channels, all passive, split by the WMI max message | core.c:2203, wmi.c:2590 |
+| 10 | 34 | WMI VDEV_CREATE STA | vdev 0, type STA, chip MAC, pdev id of SERVICE_READY_EXT, streams = RF chains | wmi.c:726 |
+| 10 | 35 | WMI passive scan | START_SCAN (ath11k timings, passive), SCAN events, MGMT_RX beacons: one line per new BSS | wmi.c:2264, :7630, :7799 |
+
+### 0320: WLAN_CFG + WLAN_MODE, keep-alive, DMA-address seam, HOST_CAP option, M1 fix
+
+- WLAN_CFG tables (`negroni_wlan_ce.h`): target CE config and service map exactly as
+  `ath11k_target_ce_config_wlan_qca6390` / `..._service_to_ce_map_...` (CE0 host->target HTC control, CE1
+  target->host HTT + HTC control, CE2 target->host WMI, CE3 host->target WMI, CE4 host->target HTT, CE5 pktlog,
+  CE6/CE8 target memcpy/IPA, CE7 host-only). Note: WMI goes out on **CE3**, not CE0; HTC control replies come on
+  CE2. Shadow list = the ath11k order: the 20 non-CE, non-LMAC rings of `hw_srng_config_template`, then the CE
+  rings of the host CE table (CE0 src, CE1 dst + status, CE2 dst + status, CE3 src, CE4 src, CE5 dst + status, CE7
+  src). The host writes ring pointers at BAR0 0x8fc + 4 x index; the firmware copies them to the ring registers.
+- Not sent (deviations, with reason): WLAN_INI (ath11k only, firmware log over WMI; cnss2's v01 has no such
+  message), shadow v1 (ath11k sends none), msi_cfg TLV 0x16 (cnss2 only; no MSI), shadow v3 (KIWI only).
+- Cold-boot calibration: not done; not required on the ath11k path (wcn6855 hw2.x `coldboot_cal_mm/ftm` false,
+  audit section 0).
+- DMA-address seam: every address the chip gets now goes through `negroni_wlan_dma_map(pa, size)` (pool,
+  BHI/BHIe, ring contexts, IPCR TREs, firmware segments, m3, CE area). Identity unless `negroniwlan_smmu=3`.
+- Keep-alive (audit 2.4): after the last level the thread drains MHI, QRTR and the CE rings every 20 ms with
+  `IOSleep` (not a spinning `delay`), logs late QMI indications, prints `keep-alive N s: ...` every 60 s, and
+  takes the normal failure path on SYSERR/RDDM. `negroniwlan_keep=S` stops it after S seconds (default 0 = until
+  a chip error).
+- `negroniwlan_hostcap=android` (or `=1`): HOST_CAP with feature_list 0x7 (+ DRV: cnss2 reads
+  `qcom,drv-supported` from the PCIe controller node, `pci_qcom.c:157-168`, live.dts:20821; correction of the
+  0266 text, which looked in the wlan node) and gpios {0x38242f00} (WSA GPIO 56 low, project 20847,
+  cnss2 qmi.c:258-331). For a HOST_CAP refusal or a missing FW_INIT_DONE.
+- M1: write MHISTATE M2, then device wake 1 (pm.c:341-359), instead of wake 0/1.
+
+### 0321: copy engines on HAL SRNG, polled
+
+- Register window: offsets >= 0x80000 go through BAR0 + 0x80000 + (off & 0x7ffff) after writing
+  `0x40000000 | off[24:19]` to BAR0 0x310c (wcn6855 has no static window map). CE0 SRC R0 is 0x1b80000 (window
+  0x37). Proof line: `window register A -> B; CE0 SRC base reads X (wrote X)`; a mismatch stops step 27.
+- Ring setup (hal.c src/dst hw init): base LSB, base MSB (addr 39:32 | size in dwords << 8), ID, TP/HP address =
+  the ring's slot in the pointer area (4 x ring id: CE src 32+n, CE dst 56+n, CE status 80+n), R2 head/tail 0,
+  MISC = SRNG_ENABLE (+ LOOPCNT_DISABLE for source rings). No MSI address, interrupt thresholds 0. CE dst MAX_LEN
+  (R0 + 0xb0) = 2048. Descriptors: src {addr lo, addr 39:32 | len << 16, meta = HTC endpoint, 0}; dst {addr lo,
+  addr 39:32}; status {len in 31:16, ...}.
+- Non-MSI mapping (asked): ath11k has no legacy/INTx path for PCI; it needs at least one MSI vector
+  (`pcic.c` one-MSI mode). Our path: the HAL writes the source rings' tail and the destination rings' head into
+  host memory whether or not MSI is set (the TP_ADDR/HP_ADDR registers), so polling that area replaces the CE
+  interrupt; the CE "copy complete" interrupt is never enabled.
+- RX: slot k of a destination ring always owns buffer k; n - 1 buffers posted; a completed status entry is
+  copied out (length 1..2048 checked), handed to `negroni_wlan_ce_rx_cb`, and the slot at the head re-posted.
+- Cache: the CE area has a Normal non-cacheable alias (as 0264); the cacheable view is flushed once at
+  allocation and on free.
+
+### 0322: HTC + WMI init
+
+- HTC: header {eid | flags << 8 | payload length << 16, trailer length | seq << 8}; trailer records checked
+  (credit records: eid + credits). Endpoint 0 = pseudo control service (CE0 out / CE2 in). HTT data connected
+  without credit flow (no HTT message is sent yet). WMI control: credit flow with 1 credit (ath11k forces the
+  total to 1 on shadow-register chips, htc.c:567-571); every WMI command waits for a credit report.
+- WMI: command = u32 id + TLVs; events walked TLV by TLV (`negroni_wmi_tlv_next`, every length checked).
+  Service bitmap: 4 services per word in SERVICE_READY (ath11k's layout), 128..383 from SERVICE_AVAILABLE.
+- Proof lines: `WMI SERVICE_READY: fw build ..., abi ..., phy caps ..., N RF chains, ...`,
+  `WMI SERVICE_READY_EXT: N hw modes, ..., pdev id P ..., chain masks ...`, `WMI INIT: 4 vdevs, 16 peers, ...`,
+  `WMI READY: fw abi ..., status S, MAC xx:..., N peers, ...; N RF chains, 4 vdevs`, then
+  `ADT mac-address-wifi0 02:00:5e:77:ee:10: DIFFERS from|matches the chip's MAC`.
+- Unknown WMI events: one line per new id (`WMI event 0x... (N bytes) not handled`, at most 12); debug/diag
+  events counted only.
+
+### 0323: one STA vdev and a passive scan
+
+- PDEV_SET_HW_MODE DBS (ath11k does it after READY for single_pdev_only + 2 rxdma), SCAN_CHAN_LIST (2.4 GHz 1-13,
+  5 GHz 36-165; DFS flag 5260-5720; every channel passive, so nothing is transmitted), VDEV_CREATE (vdev 0 STA,
+  the chip's MAC), START_SCAN (scan id 0xa001, dwell passive 150 ms, max 20 s, PASSIVE | CHAN_STAT_EVENT,
+  broadcast BSSID).
+- MGMT_RX: header (snr, buf_len <= the frame TLV, status 0), then the frame; beacon / probe response parser
+  checks every element. RSSI = snr - 95 dBm (ath11k core.h:605).
+- Proof lines (what the owner sees): `BSS N: SSID "name", RSSI -NN dBm, F MHz (DS channel C), BSSID
+  aa:bb:cc:xx:xx:xx, RSN|WPA|WEP|open, beacon interval I`; at the end `SCAN done (reason R): N BSS seen, ...`
+  and one `SCAN result` line per BSS. The keep-alive keeps logging new BSSes (late beacons).
+- [I] Risk: ath11k always sets up the HTT rx rings (rxdma refill, REO) before a scan. If SCAN events arrive but
+  no MGMT_RX, the missing rxdma rings are the first suspect (0325+). The log says so.
+
+### 0324: SMMU stage 1 for stream 0x1c01 (`negroniwlan_smmu=3`)
+
+- Audit 2.1: every chip address is above 4 GiB under XNU; Android gives IOVAs 0xa0000000 + 256 MiB. With
+  `negroniwlan_smmu=3`, step 6 takes a free apps-SMMU context bank and a stream-match entry (or the one that
+  already matches 0x1c01, restored on the failure path), builds 3-level 4 KiB tables (39-bit IOVA, 36-bit PA,
+  Normal NC, AP unprivileged), programs CBA2R/CBAR/TCR2/TCR/TTBR0/MAIR0 + TLB sync, SCTLR on, then S2CR + SMR,
+  and reads every value back (`SMMU NAME reads X after writing Y` or `the SMMU (or the hypervisor) did not take the context` otherwise; page entries outer shareable, as io-pgtable-arm for non-cacheable memory). Every buffer
+  is then mapped at the next IOVA from 0xa0000000 (64 KiB guard between buffers), one line each:
+  `SMMU map PA (N bytes) -> IOVA I`.
+- Failure path: `SMMU context C: FSR .. FAR .. FSYNR0 ..` before the quiesce, then context off and tables freed.
+- Values from the 0233 GPU SMMU code (negroni_adreno.c) on this SoC. **Writes the shared apps SMMU: ask the
+  owner before the first boot with it.** Use it when step 8 (BHI SBL) times out or SYSERR follows RESPOND_MEM
+  with the default (bypass) path.
+
+### Boot-args (new)
+
+| Boot-arg | Default | Meaning |
+|---|---|---|
+| `negroniwlan=7..10` | - | 7 WLAN_CFG/MODE, 8 CE + HTC READY, 9 HTC/WMI to READY, 10 vdev + passive scan |
+| `negroniwlan_keep=S` | 0 | keep-alive seconds after the last level (0 = until a chip error) |
+| `negroniwlan_hostcap=android` | off | Android HOST_CAP: DRV bit + WSA gpio entry |
+| `negroniwlan_smmu=3` | 1 | 0324 stage-1 context (writes the apps SMMU; owner approval) |
+
+Boot-args for the combined image (the main session composes them; no image is built by this stage):
+`negroniwifi=10 negroniwlan=10 negronipanic=30 negronipanicreason=2`. Lower `negroniwlan` to stop earlier
+(7 = after WLAN_MODE, 8 = HTC READY, 9 = WMI READY). Optional, each needs a reason from a log first:
+`negroniwlan_hostcap=android` (QMI refusal), `negroniwlan_smmu=3` (DMA above 4 GiB fails; owner approval),
+`negroniwlan_keep=600` (stop the poller after 10 minutes). Precondition: the WLAN firmware area on userdata.
+
+Host test: `scripts/wifi/wmi-host-test.sh TREE` (patches/xnu/tests/wlan-wmi-test.c): WLAN_CFG = 493 bytes with
+the shadow entries at the right places, WLAN_MODE and HOST_CAP(gpios) exact bytes, HTC READY / header /
+trailer, WMI TLV walk, beacon parser, then 700 k random and mutated inputs under ASan/UBSan. The 0266 test
+(`qmi-host-test.sh`) still passes on the new tables.
+
+### Final stage design (0325+): connect, data path, iOS
+
+1. **Join (WMI)**: VDEV_START on the BSS channel, PEER_CREATE (the AP), open-system AUTH + ASSOC request
+   frames sent by WMI MGMT_TX (or the firmware's own connect if the service bit allows; ath11k uses host
+   frames), PEER_ASSOC with the rates/HT caps, VDEV_UP with the AID. Source: ath11k mac.c sta_state, wmi.c
+   vdev_start/peer_create/peer_assoc/vdev_up/mgmt_send.
+2. **Keys**: ath11k leaves EAPOL to mac80211 + wpa_supplicant. iOS has no wpa_supplicant and XNU no mac80211,
+   so the kernel needs a tiny WPA2-PSK supplicant (as Sailfish 0173: PBKDF2-SHA1 PMK from the passphrase given
+   by wifid, 4-way handshake PTK = PRF-384, MIC = HMAC-SHA1, GTK unwrap = AES key wrap, then two
+   WMI_VDEV_INSTALL_KEY (pairwise CCMP, group)). EAPOL frames go through the data path (step 3). ~1 500 lines.
+3. **HTT data path**: HTT version request, SRNG setup messages for the rxdma refill ring and the REO/WBM/TCL
+   rings the 0320 shadow list already names, RX descriptor parse (wcn6855 layout), TX by TCL. The largest part
+   (~2 000 lines; ath10k-class Sailfish had none of it). Polled at first; MSI needs a GICv3 ITS (not in this XNU).
+4. **iOS side - decision: an IOEthernetController `en0` with Apple80211 ioctls, driven by the stock wifid and
+   Settings.** Justification: Sailfish shows it works on iOS 16 (Settings lists, joins WPA2, DHCP, Safari) with
+   exactly this shape: IONetworkingFamily staged into the kernel (`0175-stage-ionetworking.sh`, configd names
+   only IONetworkInterfaces), `SailfishWLAN : IOEthernetController` (0175), Apple80211 requests as
+   `SIOCGA80211`/`SIOCSA80211` ioctls on the interface plus kernel events (class 6) for wifid (0179; request
+   layouts read out of IO80211.framework 16.5 by spes 0113). A full IO80211Family port is not realistic (closed,
+   large). A private daemon with its own UI would work without reverse engineering but loses Settings, the
+   status bar and every app's network reachability path; a fake IO80211 family is the same reverse
+   engineering as the ioctls with more surface. So: ioctls on en0, Settings via the real wifid. The ADT
+   `mac-address-wifi0` must become the chip's MAC (from step 32). ~2 300 lines, reverse engineering of the
+   request set (log every request first).
+5. Recovery and power (RDDM restart, radio off, suspend): after scan + connect + IP. Total remaining
+   [I, audit section 3]: about 7 000 lines after 0320-0324.
 
 ## 0261-negroni-wlan-mhi-fw.patch
 

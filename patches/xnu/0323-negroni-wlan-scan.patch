@@ -1,0 +1,464 @@
+0323-negroni-wlan-scan: Wi-Fi level 10 (negroniwlan=10), STA vdev + passive scan, steps 33-35.
+PDEV_SET_HW_MODE DBS, SCAN_CHAN_LIST (38 channels, all passive), VDEV_CREATE STA, START_SCAN (ath11k
+timings), SCAN events and MGMT_RX beacons/probe responses: one line per new BSS with SSID and RSSI
+(BSSID half masked). Bounded 802.11 element parser. Details: patches/xnu/README-wifi.md "0323".
+
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index 0a0b0d9..9f452d6 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -956,6 +956,7 @@ static int (*const wlan_levels[WLAN_LEVEL_MAX + 1])(void) = {
+ 	[WLAN_LEVEL_CFG] = wlan_level_cfg,
+ 	[WLAN_LEVEL_CE] = wlan_level_ce,
+ 	[WLAN_LEVEL_WMI] = negroni_wlan_wmi_level,      /* 0322: steps 29-32, negroni_wlan_wmi.c */
++	[WLAN_LEVEL_SCAN] = negroni_wlan_scan_level,    /* 0323: steps 33-35 */
+ };
+ 
+ /*
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index f2469dd..1bdedd1 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -167,6 +167,7 @@ struct mhi_host {
+  *   7  steps 25-26: QMI WLFW WLAN_CFG (CE pipes, service map, shadow registers) + WLAN_MODE mission (0320)
+  *   8  steps 27-28: CE rings (HAL SRNG, register window, shadow registers), HTC READY (0321)
+  *   9  steps 29-32: HTC connect (HTT, WMI), WMI SERVICE_READY(+EXT), WMI INIT, WMI READY + MAC (0322)
++ *  10  steps 33-35: WMI channel list, VDEV_CREATE STA, passive scan: SSID + RSSI of every BSS (0323)
+  * Each step prints "NEGRONI WLAN: step N NAME" before it starts and, on an error,
+  * "NEGRONI WLAN: step N NAME failed: REASON". Every wait has a time-out (negroniwlan_to).
+  */
+@@ -178,7 +179,8 @@ struct mhi_host {
+ #define WLAN_LEVEL_CFG          7       /* 0320 */
+ #define WLAN_LEVEL_CE           8       /* 0321 */
+ #define WLAN_LEVEL_WMI          9       /* 0322 */
+-#define WLAN_LEVEL_MAX          9       /* the highest level this build implements */
++#define WLAN_LEVEL_SCAN         10      /* 0323 */
++#define WLAN_LEVEL_MAX          10      /* the highest level this build implements */
+ /* level 4 (0264) also posts the RX buffers on channel 21 (cnss2 auto_queue, pci.c:181) */
+ 
+ void negroni_wlan_step(uint32_t n, const char *name);
+diff --git a/bsd/dev/negroni_wlan_wmi.c b/bsd/dev/negroni_wlan_wmi.c
+index de3068a..d19deca 100644
+--- a/bsd/dev/negroni_wlan_wmi.c
++++ b/bsd/dev/negroni_wlan_wmi.c
+@@ -112,6 +112,63 @@ negroni_wmi_tlv_next(struct wmi_tlv_it *it, uint32_t *tag, const uint8_t **v, ui
+ 	it->p += 4 + l;
+ 	return 1;
+ }
++/* 802.11 beacon / probe response (IEEE 802.11-2016 9.3.3.3, 9.4.2): header 24, timestamp 8, beacon
++ * interval 2, capability 2, then elements {id, len, data}; every element checked against the frame (0323) */
++int
++negroni_wlan_beacon_parse(const uint8_t *f, uint32_t len, struct wlan_bss *out)
++{
++	memset(out, 0, sizeof(*out));
++	if (!f || len < 24) {
++		return EBADMSG;
++	}
++	uint32_t fc = (uint32_t)f[0] | (uint32_t)f[1] << 8;
++	uint32_t type = (fc >> 2) & 3, subtype = (fc >> 4) & 0xf;
++	if (type != 0 || (subtype != 8 && subtype != 5)) {
++		return ENOENT;
++	}
++	if (len < 36) {
++		return EBADMSG;
++	}
++	memcpy(out->bssid, f + 16, 6);
++	out->beacon_int = (uint16_t)(f[32] | f[33] << 8);
++	out->capab = (uint16_t)(f[34] | f[35] << 8);
++	bool have_ssid = false;
++	for (uint32_t o = 36; o < len;) {
++		if (len - o < 2) {
++			return EBADMSG;
++		}
++		uint32_t id = f[o], el = f[o + 1];
++		const uint8_t *d = f + o + 2;
++		if (el > len - o - 2) {
++			return EBADMSG;
++		}
++		if (id == 0 && !have_ssid) {
++			if (el > 32) {
++				return EBADMSG;
++			}
++			have_ssid = true;
++			out->ssid_len = el;
++			bool zero = true;
++			for (uint32_t i = 0; i < el; i++) {
++				out->ssid[i] = (d[i] >= 0x20 && d[i] < 0x7f) ? (char)d[i] : '?';
++				zero = zero && d[i] == 0;
++			}
++			out->ssid[el] = 0;
++			out->hidden = el == 0 || zero;
++		} else if (id == 3 && el >= 1) {
++			out->channel = d[0];
++		} else if (id == 48 && el >= 2) {
++			out->rsn = true;
++		} else if (id == 221 && el >= 4 && d[0] == 0x00 && d[1] == 0x50 && d[2] == 0xf2 && d[3] == 1) {
++			out->wpa = true;
++		}
++		o += 2 + el;
++	}
++	if (!have_ssid) {
++		out->hidden = true;
++	}
++	return 0;
++}
+ /* ==== end of the pure parsers ==== */
+ 
+ /* ---- HTC state ---- */
+@@ -777,4 +834,356 @@ negroni_wlan_wmi_chains(void)
+ 	return M.rf_chains ? M.rf_chains : 2;
+ }
+ 
++/*
++ * ---- level 10 (patch 0323): steps 33-35, one STA vdev and a passive scan ----
++ *   step 33  WMI channel list   WMI_PDEV_SET_HW_MODE DBS (ath11k core.c:2203-2210 for single_pdev_only with 2
++ *                               rxdma) and WMI_SCAN_CHAN_LIST: 2.4 GHz 1-13 and 5 GHz 36-165, every channel
++ *                               passive (nothing is transmitted)
++ *   step 34  WMI VDEV_CREATE    vdev 0, type STA, the chip's MAC, the pdev id of SERVICE_READY_EXT, tx/rx
++ *                               streams per band = the RF chains (wmi.c:726-800)
++ *   step 35  WMI passive scan   WMI_START_SCAN (wmi.c:2264, ath11k_wmi_start_scan_init timings, passive flag),
++ *                               the SCAN events, and every beacon / probe response in WMI_MGMT_RX: one line per
++ *                               new BSS with its SSID and RSSI (rssi = snr - 95, core.h:605)
++ * Without the HTT/REO data path (0324+) the firmware still sends management frames as WMI MGMT_RX events
++ * (ath11k wmi.c ath11k_mgmt_rx_event) [I: ath11k always sets the HTT rings up before a scan, so an empty scan
++ * result here points at the missing rxdma rings first].
++ */
++#define WMI_SCAN_FLAG_PASSIVE           0x1u
++#define WMI_SCAN_CHAN_STAT_EVENT        0x10u
++#define WMI_SCAN_EV_STARTED             0x1u
++#define WMI_SCAN_EV_COMPLETED           0x2u
++#define WMI_SCAN_EV_BSS_CHANNEL         0x4u
++#define WMI_SCAN_EV_FOREIGN_CHAN        0x8u
++#define WMI_SCAN_EV_DEQUEUED            0x10u
++#define WMI_SCAN_EV_START_FAILED        0x40u
++#define WMI_CHAN_MODE_11A               0u
++#define WMI_CHAN_MODE_11G               1u
++#define WMI_CHAN_PASSIVE                (1u << 7)
++#define WMI_CHAN_DFS                    (1u << 10)
++#define WMI_CHAN_ALLOW_HT               (1u << 11)
++#define WMI_VDEV_TYPE_STA               2u
++#define WLAN_NOISE_FLOOR                (-95)
++#define WLAN_SCAN_ID                    0xa001u
++#define WLAN_BSS_MAX                    64u
++
++static const uint16_t g_freqs[] = {
++	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320,
++	5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720,
++	5745, 5765, 5785, 5805, 5825,
++};
++#define NFREQ   ((uint32_t)(sizeof(g_freqs) / sizeof(g_freqs[0])))
++
++struct bss_seen {
++	uint8_t bssid[6];
++	int32_t rssi;
++	uint32_t freq, frames;
++};
++static struct {
++	volatile bool started, completed, failed, hw_mode_resp;
++	uint32_t events, reason, foreign, frames, beacons, other_frames, bad, nbss, dropped;
++	struct bss_seen bss[WLAN_BSS_MAX];
++} S;
++
++static void
++scan_mgmt_rx(const uint8_t *p, uint32_t len)
++{
++	struct wmi_tlv_it it = { p, p + len };
++	const uint8_t *v, *hdr = NULL, *frame = NULL;
++	uint32_t tag, l, hl = 0, fl = 0;
++	struct wlan_bss b;
++
++	while (negroni_wmi_tlv_next(&it, &tag, &v, &l) == 1) {
++		if (tag == WMI_TAG_MGMT_RX_HDR && !hdr) {
++			hdr = v;
++			hl = l;
++		} else if (tag == WMI_TAG_ARRAY_BYTE && !frame) {
++			frame = v;
++			fl = l;
++		}
++	}
++	if (!hdr || hl < 6 * 4 || !frame) {
++		S.bad++;
++		return;
++	}
++	uint32_t snr = rd32(hdr + 4), buf_len = rd32(hdr + 16), status = rd32(hdr + 20);
++	uint32_t freq = hl >= 17 * 4 ? rd32(hdr + 64) : 0;
++	S.frames++;
++	if (status != 0 || buf_len > fl) {      /* rx error bits, or a length beyond the TLV */
++		S.bad++;
++		return;
++	}
++	int r = negroni_wlan_beacon_parse(frame, buf_len, &b);
++	if (r == ENOENT) {
++		S.other_frames++;
++		return;
++	}
++	if (r) {
++		S.bad++;
++		return;
++	}
++	S.beacons++;
++	int32_t rssi = (int32_t)snr + WLAN_NOISE_FLOOR;
++	for (uint32_t i = 0; i < S.nbss; i++) {
++		if (!memcmp(S.bss[i].bssid, b.bssid, 6)) {
++			S.bss[i].frames++;
++			if (rssi > S.bss[i].rssi) {
++				S.bss[i].rssi = rssi;
++			}
++			return;
++		}
++	}
++	if (S.nbss >= WLAN_BSS_MAX) {
++		S.dropped++;
++		return;
++	}
++	struct bss_seen *n = &S.bss[S.nbss++];
++	memcpy(n->bssid, b.bssid, 6);
++	n->rssi = rssi;
++	n->freq = freq;
++	n->frames = 1;
++	/* the BSSID's last 3 bytes are masked: the log may be shared */
++	printf("NEGRONI WLAN: BSS %u: SSID \"%s\"%s, RSSI %d dBm, %u MHz (DS channel %u), BSSID %02x:%02x:%02x:xx:xx:xx, "
++	    "%s, beacon interval %u\n", S.nbss, b.hidden ? "" : b.ssid, b.hidden ? " (hidden)" : "", rssi, freq, b.channel,
++	    b.bssid[0], b.bssid[1], b.bssid[2], b.rsn ? "RSN" : b.wpa ? "WPA" : (b.capab & 0x10) ? "WEP" : "open",
++	    b.beacon_int);
++}
++
++static void
++scan_cb(uint32_t id, const uint8_t *p, uint32_t len)
++{
++	struct wmi_tlv_it it = { p, p + len };
++	const uint8_t *v;
++	uint32_t tag, l;
++
++	if (id == WMI_MGMT_RX_EVENTID) {
++		scan_mgmt_rx(p, len);
++		return;
++	}
++	if (id == WMI_PDEV_SET_HW_MODE_RESP_EVENTID) {
++		S.hw_mode_resp = true;
++		return;
++	}
++	if (id != WMI_SCAN_EVENTID) {
++		return;                 /* CHAN_INFO: counted with the scan events below */
++	}
++	while (negroni_wmi_tlv_next(&it, &tag, &v, &l) == 1) {
++		if (tag != WMI_TAG_SCAN_EVENT || l < 6 * 4) {
++			continue;
++		}
++		uint32_t ev = rd32(v), reason = rd32(v + 4), freq = rd32(v + 8), scan_id = rd32(v + 16);
++		S.events++;
++		if (scan_id != WLAN_SCAN_ID) {
++			continue;
++		}
++		switch (ev) {
++		case WMI_SCAN_EV_STARTED:
++			S.started = true;
++			printf("NEGRONI WLAN: SCAN event STARTED\n");
++			break;
++		case WMI_SCAN_EV_COMPLETED:
++		case WMI_SCAN_EV_DEQUEUED:
++			S.reason = reason;
++			S.completed = true;
++			break;
++		case WMI_SCAN_EV_START_FAILED:
++			S.reason = reason;
++			S.failed = true;
++			break;
++		case WMI_SCAN_EV_FOREIGN_CHAN:
++			if (S.foreign++ < 3) {
++				printf("NEGRONI WLAN: SCAN on %u MHz\n", freq);
++			}
++			break;
++		default:
++			break;
++		}
++	}
++}
++
++static int
++wmi_chan_list(void)
++{
++	static uint8_t m[4 + 12 + 4 + NFREQ * 28];
++	uint8_t *p = m, *c;
++	int error;
++
++	/* WMI_PDEV_SET_HW_MODE DBS (pdev id SOC = 0), as ath11k after READY; the response is optional */
++	{
++		uint8_t h[4 + 12];
++		c = put_tlv(h, WMI_TAG_PDEV_SET_HW_MODE_CMD, 12);
++		c = put32(c, 0);
++		c = put32(c, 1);        /* WMI_HOST_HW_MODE_DBS */
++		(void)put32(c, 0);
++		error = negroni_wlan_wmi_send(WMI_PDEV_SET_HW_MODE_CMDID, h, sizeof(h));
++		if (error) {
++			return error;
++		}
++		(void)negroni_wlan_wmi_wait(&S.hw_mode_resp, 2000, "WMI PDEV_SET_HW_MODE_RESP");
++		printf("NEGRONI WLAN: WMI PDEV_SET_HW_MODE DBS %s\n", S.hw_mode_resp ? "answered" : "sent (no answer in 2 s; "
++		    "going on)");
++	}
++	/* in pieces that fit the WMI endpoint's max message, the later ones with APPEND (wmi.c:2590-2660) */
++	uint32_t room = g_ep[g_wmi_eid].max_msg > 4 + 16 + 4 ? (g_ep[g_wmi_eid].max_msg - 4 - 16 - 4) / 28 : 0;
++	uint32_t per = MIN(room, NFREQ), sent = 0, sends = 0;
++	if (per == 0) {
++		return negroni_wlan_failed(EMSGSIZE, "WMI max message %u bytes: no room for a channel", g_ep[g_wmi_eid].max_msg);
++	}
++	while (sent < NFREQ) {
++		uint32_t nch = MIN(per, NFREQ - sent);
++		memset(m, 0, sizeof(m));
++		p = m;
++		c = put_tlv(p, WMI_TAG_SCAN_CHAN_LIST_CMD, 12);
++		c = put32(c, nch);
++		c = put32(c, sends ? 1u : 0u);  /* WMI_APPEND_TO_EXISTING_CHAN_LIST_FLAG */
++		p = put32(c, negroni_wlan_wmi_pdev_id());
++		p = put_tlv(p, WMI_TAG_ARRAY_STRUCT, nch * 28);
++		for (uint32_t i = sent; i < sent + nch; i++) {
++			uint32_t f = g_freqs[i];
++			uint32_t info = (f < 4000 ? WMI_CHAN_MODE_11G : WMI_CHAN_MODE_11A) | WMI_CHAN_PASSIVE | WMI_CHAN_ALLOW_HT;
++			if (f >= 5260 && f <= 5720) {
++				info |= WMI_CHAN_DFS;
++			}
++			c = put_tlv(p, WMI_TAG_CHANNEL, 24);
++			c = put32(c, f);                        /* mhz */
++			c = put32(c, f);                        /* band_center_freq1 */
++			c = put32(c, 0);                        /* band_center_freq2 */
++			c = put32(c, info);
++			c = put32(c, (40u << 8) | (40u << 16)); /* reg_info_1: max power, max reg power (0.5 dB units) */
++			p = put32(c, 40u << 8);                 /* reg_info_2: max tx power */
++		}
++		error = negroni_wlan_wmi_send(WMI_SCAN_CHAN_LIST_CMDID, m, (uint32_t)(p - m));
++		if (error) {
++			return error;
++		}
++		sent += nch;
++		sends++;
++	}
++	printf("NEGRONI WLAN: WMI SCAN_CHAN_LIST: %u channels (2.4 GHz 1-13, 5 GHz 36-165) in %u commands, all passive, "
++	    "pdev %u\n", NFREQ, sends, negroni_wlan_wmi_pdev_id());
++	return 0;
++}
++
++static int
++wmi_vdev_create(void)
++{
++	uint8_t m[4 + 36 + 4 + 2 * 16];
++	const uint8_t *mac = negroni_wlan_wmi_mac();
++	uint32_t ch = negroni_wlan_wmi_chains(), mac_lo, mac_hi = 0;
++	uint8_t *p, *c;
++
++	memset(m, 0, sizeof(m));
++	memcpy(&mac_lo, mac, 4);
++	memcpy(&mac_hi, mac + 4, 2);
++	c = put_tlv(m, WMI_TAG_VDEV_CREATE_CMD, 36);
++	c = put32(c, 0);                        /* vdev_id */
++	c = put32(c, WMI_VDEV_TYPE_STA);
++	c = put32(c, 0);                        /* subtype none */
++	c = put32(c, mac_lo);                   /* wmi_mac_addr: 6 bytes + 2 pad */
++	c = put32(c, mac_hi);
++	c = put32(c, 2);                        /* num_cfg_txrx_streams */
++	c = put32(c, negroni_wlan_wmi_pdev_id());
++	c = put32(c, 0);                        /* mbssid_flags */
++	p = put32(c, 0);                        /* mbssid_tx_vdev_id */
++	p = put_tlv(p, WMI_TAG_ARRAY_STRUCT, 2 * 16);
++	for (uint32_t band = 0; band < 2; band++) {     /* WMI_TPC_CHAINMASK_CONFIG_BAND_2G / _5G */
++		c = put_tlv(p, WMI_TAG_VDEV_TXRX_STREAMS, 12);
++		c = put32(c, band);
++		c = put32(c, ch);
++		p = put32(c, ch);
++	}
++	int error = negroni_wlan_wmi_send(WMI_VDEV_CREATE_CMDID, m, (uint32_t)(p - m));
++	if (!error) {
++		printf("NEGRONI WLAN: WMI VDEV_CREATE: vdev 0 STA, MAC %02x:%02x:%02x:%02x:%02x:%02x, pdev %u, %u streams\n",
++		    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], negroni_wlan_wmi_pdev_id(), ch);
++	}
++	return error;
++}
++
++static int
++wmi_start_scan(void)
++{
++	static uint8_t m[4 + 39 * 4 + 4 + NFREQ * 4 + 4 + 4 + 8 + 4];
++	uint8_t *p, *c;
++
++	memset(m, 0, sizeof(m));
++	c = put_tlv(m, WMI_TAG_START_SCAN_CMD, 39 * 4);
++	uint32_t w[39] = { 0 };
++	w[0] = WLAN_SCAN_ID;                    /* scan_id */
++	w[1] = 1;                               /* scan_req_id */
++	w[2] = 0;                               /* vdev */
++	w[3] = 1;                               /* priority LOW */
++	w[4] = WMI_SCAN_EV_STARTED | WMI_SCAN_EV_COMPLETED | WMI_SCAN_EV_BSS_CHANNEL | WMI_SCAN_EV_FOREIGN_CHAN |
++	    WMI_SCAN_EV_DEQUEUED;
++	w[5] = 50;                              /* dwell active */
++	w[6] = 150;                             /* dwell passive */
++	w[7] = 50;                              /* min rest */
++	w[8] = 500;                             /* max rest */
++	w[12] = 20000;                          /* max scan time */
++	w[13] = 5;                              /* probe delay */
++	w[14] = WMI_SCAN_FLAG_PASSIVE | WMI_SCAN_CHAN_STAT_EVENT;
++	w[16] = NFREQ;                          /* num_chan */
++	w[17] = 1;                              /* num_bssid */
++	w[36] = 40;                             /* dwell_time_active_6g */
++	w[37] = 30;                             /* dwell_time_passive_6g */
++	memcpy(c, w, sizeof(w));
++	p = c + sizeof(w);
++	c = put_tlv(p, WMI_TAG_ARRAY_UINT32, NFREQ * 4);
++	for (uint32_t i = 0; i < NFREQ; i++) {
++		c = put32(c, g_freqs[i]);
++	}
++	p = put_tlv(c, WMI_TAG_ARRAY_FIXED_STRUCT, 0);         /* ssids: none (passive) */
++	c = put_tlv(p, WMI_TAG_ARRAY_FIXED_STRUCT, 8);         /* bssid: broadcast */
++	memset(c, 0xff, 6);
++	p = put_tlv(c + 8, WMI_TAG_ARRAY_BYTE, 0);             /* extra IEs: none */
++	return negroni_wlan_wmi_send(WMI_START_SCAN_CMDID, m, (uint32_t)(p - m));
++}
++
++int
++negroni_wlan_scan_level(void)
++{
++	int error;
++
++	memset(&S, 0, sizeof(S));
++	negroni_wlan_wmi_scan_cb = scan_cb;
++
++	negroni_wlan_step(33, "WMI channel list");
++	error = wmi_chan_list();
++	if (error) {
++		return error;
++	}
++	negroni_wlan_step(34, "WMI VDEV_CREATE STA");
++	error = wmi_vdev_create();
++	if (error) {
++		return error;
++	}
++	negroni_wlan_step(35, "WMI passive scan");
++	error = wmi_start_scan();
++	if (error) {
++		return error;
++	}
++	error = negroni_wlan_wmi_wait(&S.started, MAX(negroni_wlan_timeout(), 5000u), "SCAN STARTED");
++	if (!error && S.failed) {
++		error = negroni_wlan_failed(EIO, "SCAN START_FAILED (reason %u)", S.reason);
++	}
++	if (error) {
++		return error;
++	}
++	error = negroni_wlan_wmi_wait(&S.completed, 30000, "SCAN COMPLETED");
++	if (error) {
++		return error;
++	}
++	printf("NEGRONI WLAN: SCAN done (reason %u): %u BSS seen, %u beacons/probe responses, %u other frames, %u "
++	    "refused, %u scan events, %u over the table\n", S.reason, S.nbss, S.beacons, S.other_frames, S.bad, S.events,
++	    S.dropped);
++	for (uint32_t i = 0; i < S.nbss; i++) {
++		printf("NEGRONI WLAN: SCAN result %u: BSSID %02x:%02x:%02x:xx:xx:xx, best RSSI %d dBm, %u MHz, %u frames\n", i + 1,
++		    S.bss[i].bssid[0], S.bss[i].bssid[1], S.bss[i].bssid[2], S.bss[i].rssi, S.bss[i].freq, S.bss[i].frames);
++	}
++	if (S.nbss == 0) {
++		printf("NEGRONI WLAN: no beacon reached the host; next suspect: the HTT rx rings (0324+) [I]\n");
++	}
++	return 0;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */

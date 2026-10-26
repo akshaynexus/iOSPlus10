@@ -1,0 +1,960 @@
+0322-negroni-wlan-htc-wmi: Wi-Fi level 9 (negroniwlan=9), HTC + WMI init, steps 29-32.
+New bsd/dev/negroni_wlan_wmi.{c,h}: HTC header/trailer parser with credit records, connect HTT data and WMI
+control (1 credit, ath11k htc.c:567), SETUP_COMPLETE_EX; WMI TLV walk; SERVICE_READY/AVAILABLE/EXT/EXT2;
+WMI_INIT with the ath11k qca6390 resource config (hw.c:58); READY with the MAC, compared with the ADT
+/chosen mac-address-wifi0. Details: patches/xnu/README-wifi.md "0322".
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 97ab2aa..910da71 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,6 +120,7 @@ bsd/dev/negroni_wlan.c			standard
+ bsd/dev/negroni_wlan_qrtr.c		standard
+ bsd/dev/negroni_wlan_qmi.c		standard
+ bsd/dev/negroni_wlan_ce.c		standard
++bsd/dev/negroni_wlan_wmi.c		standard
+ bsd/dev/negroni_wlan_bhi.c		standard
+ bsd/dev/negroni_wlan_mhi.c		standard
+ bsd/dev/negroni_adsp.c			standard
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index dfa85b0..0a0b0d9 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -31,6 +31,7 @@
+ #include "negroni_wlan_mhi.h"
+ #include "negroni_wlan_qrtr.h"
+ #include "negroni_wlan_ce.h"
++#include "negroni_wlan_wmi.h"
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+@@ -954,6 +955,7 @@ static int (*const wlan_levels[WLAN_LEVEL_MAX + 1])(void) = {
+ 	[WLAN_LEVEL_WLFW] = wlan_level_wlfw,
+ 	[WLAN_LEVEL_CFG] = wlan_level_cfg,
+ 	[WLAN_LEVEL_CE] = wlan_level_ce,
++	[WLAN_LEVEL_WMI] = negroni_wlan_wmi_level,      /* 0322: steps 29-32, negroni_wlan_wmi.c */
+ };
+ 
+ /*
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index 9b98475..f2469dd 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -166,6 +166,7 @@ struct mhi_host {
+  *   6  steps 18-24: QMI WLFW IND_REGISTER .. FW_INIT_DONE (0266, negroni_wlan_qmi.c)
+  *   7  steps 25-26: QMI WLFW WLAN_CFG (CE pipes, service map, shadow registers) + WLAN_MODE mission (0320)
+  *   8  steps 27-28: CE rings (HAL SRNG, register window, shadow registers), HTC READY (0321)
++ *   9  steps 29-32: HTC connect (HTT, WMI), WMI SERVICE_READY(+EXT), WMI INIT, WMI READY + MAC (0322)
+  * Each step prints "NEGRONI WLAN: step N NAME" before it starts and, on an error,
+  * "NEGRONI WLAN: step N NAME failed: REASON". Every wait has a time-out (negroniwlan_to).
+  */
+@@ -176,7 +177,8 @@ struct mhi_host {
+ #define WLAN_LEVEL_WLFW         6       /* 0266 */
+ #define WLAN_LEVEL_CFG          7       /* 0320 */
+ #define WLAN_LEVEL_CE           8       /* 0321 */
+-#define WLAN_LEVEL_MAX          8       /* the highest level this build implements */
++#define WLAN_LEVEL_WMI          9       /* 0322 */
++#define WLAN_LEVEL_MAX          9       /* the highest level this build implements */
+ /* level 4 (0264) also posts the RX buffers on channel 21 (cnss2 auto_queue, pci.c:181) */
+ 
+ void negroni_wlan_step(uint32_t n, const char *name);
+diff --git a/bsd/dev/negroni_wlan_wmi.c b/bsd/dev/negroni_wlan_wmi.c
+new file mode 100644
+index 0000000..de3068a
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_wmi.c
+@@ -0,0 +1,780 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi, level 9 (patch 0322): HTC service connection and WMI initialisation.
++ *
++ *   step 29  HTC connect       pseudo control service (endpoint 0), HTT data, WMI control (credit flow),
++ *                              SETUP_COMPLETE_EX (htc.c ath11k_htc_init / _connect_service / _start)
++ *   step 30  WMI SERVICE_READY SERVICE_READY (+ SERVICE_AVAILABLE) + SERVICE_READY_EXT (+ EXT2 when the
++ *                              firmware has service 220): capabilities, PHY, pdev id, chain masks
++ *   step 31  WMI INIT          WMI_INIT_CMD with the qca6390/wcn6855 resource configuration
++ *                              (hw.c ath11k_init_wmi_config_qca6390, wmi.c ath11k_wmi_copy_resource_config),
++ *                              no host memory chunks and no hw-mode TLV (single_pdev_only, wmi.c:4469-4490)
++ *   step 32  WMI READY         the READY event: status, the chip's MAC address (compared with the ADT
++ *                              /chosen mac-address-wifi0)
++ *
++ * Order: ath11k core.c:2132-2220 ath11k_core_start. Credit flow: WCN6855 has credit_flow = true and, because
++ * it uses shadow registers, ath11k forces the HTC credit total to 1 (htc.c:567-571): one WMI command in flight,
++ * the next waits for a credit report in a received trailer. Every length the chip sends is checked before use.
++ * Our own code from the ath11k wire formats; design reference external/ios-spes 0099 (read only, no license
++ * file). UNTESTED ON HARDWARE.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "negroni_wlan.h"
++#include "negroni_wlan_mhi.h"
++#include "negroni_wlan_ce.h"
++#include "negroni_wlan_wmi.h"
++
++/* ==== pure parsers (host-tested: patches/xnu/tests/wlan-wmi-test.c) ==== */
++static uint32_t
++rd32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++int
++negroni_htc_parse(const uint8_t *b, uint32_t len, struct htc_frame *f)
++{
++	memset(f, 0, sizeof(*f));
++	if (!b || len < HTC_HDR_LEN) {
++		return EBADMSG;
++	}
++	uint32_t info = rd32(b), ctrl = rd32(b + 4);
++	uint32_t plen = info >> 16;
++
++	f->eid = info & 0xff;
++	f->flags = (info >> 8) & 0xff;
++	f->seq = (ctrl >> 8) & 0xff;
++	if (f->eid >= HTC_EP_COUNT || plen > len - HTC_HDR_LEN || plen + HTC_HDR_LEN > HTC_MAX_LEN) {
++		return EBADMSG;
++	}
++	if (f->flags & HTC_FLAG_TRAILER) {
++		uint32_t tl = ctrl & 0xff;
++		if (tl < 4 || tl > plen) {              /* htc.c:325-333 */
++			return EBADMSG;
++		}
++		f->trailer = b + HTC_HDR_LEN + plen - tl;
++		f->trailer_len = tl;
++		plen -= tl;
++	}
++	f->payload = b + HTC_HDR_LEN;
++	f->payload_len = plen;
++	return 0;
++}
++
++int
++negroni_htc_trailer_credits(const uint8_t *t, uint32_t len, uint32_t credits[HTC_EP_COUNT])
++{
++	while (len > 0) {
++		if (len < 4) {
++			return EBADMSG;
++		}
++		uint32_t id = t[0], rl = t[1];
++		if (rl > len - 4) {                     /* htc.c:212-218, with the header counted */
++			return EBADMSG;
++		}
++		if (id == HTC_RECORD_CREDITS) {
++			if (rl % 4) {
++				return EBADMSG;
++			}
++			for (uint32_t i = 0; i < rl; i += 4) {
++				uint32_t eid = t[4 + i], c = t[4 + i + 1];
++				if (eid < HTC_EP_COUNT) {
++					credits[eid] += c;
++				}
++			}
++		}
++		t += 4 + rl;
++		len -= 4 + rl;
++	}
++	return 0;
++}
++
++int
++negroni_wmi_tlv_next(struct wmi_tlv_it *it, uint32_t *tag, const uint8_t **v, uint32_t *len)
++{
++	if (it->p >= it->end) {
++		return 0;
++	}
++	if ((size_t)(it->end - it->p) < 4) {
++		return -1;
++	}
++	uint32_t h = rd32(it->p), l = h & 0xffff;
++	if ((size_t)(it->end - it->p) - 4 < l) {
++		return -1;
++	}
++	*tag = h >> 16;
++	*len = l;
++	*v = it->p + 4;
++	it->p += 4 + l;
++	return 1;
++}
++/* ==== end of the pure parsers ==== */
++
++/* ---- HTC state ---- */
++struct htc_ep {
++	uint32_t service, ul_pipe, dl_pipe, max_msg;
++	uint32_t credits;
++	bool credit_flow, up;
++	uint8_t seq;
++};
++static struct htc_ep g_ep[HTC_EP_COUNT];
++static uint32_t g_credit_size;
++static uint8_t g_ctl[256];
++static uint32_t g_ctl_len;
++static volatile bool g_ctl_new;
++static uint32_t g_wmi_eid = HTC_EP_COUNT, g_htt_eid = HTC_EP_COUNT;
++static uint32_t g_htc_bad, g_htc_htt, g_htc_other;
++static uint8_t g_tx[2048];
++
++/* ---- WMI state ---- */
++struct wmi_state {
++	bool svc_ready, svc_ext, svc_ext2, svc_avail, ready;
++	uint32_t svc_map[WMI_MAX_EXT2_SERVICE / 32];
++	uint32_t fw_build, abi0, abi1, phy_caps, rf_chains, ht_caps, vht_caps, sys_caps, max_scan_ch, mem_reqs;
++	uint32_t fw_build_ext, num_hw_modes, pdev_id, phy_id, bands, tx_mask_2g, rx_mask_2g, tx_mask_5g, rx_mask_5g;
++	uint32_t pdevs;
++	uint32_t ready_status, total_peers, extra_macs;
++	uint8_t mac[6];
++	char alpha2[4];
++	bool reg_seen;
++	uint32_t events, unknown_ids[12], n_unknown, diag, bad;
++};
++static struct wmi_state M;
++
++/* 0323 hooks: scan / mgmt rx events */
++void (*negroni_wlan_wmi_scan_cb)(uint32_t id, const uint8_t *tlvs, uint32_t len);
++
++static bool
++svc_has(uint32_t bit)
++{
++	return bit < WMI_MAX_EXT2_SERVICE && (M.svc_map[bit / 32] >> (bit % 32)) & 1;
++}
++
++static void
++svc_set(uint32_t bit)
++{
++	if (bit < WMI_MAX_EXT2_SERVICE) {
++		M.svc_map[bit / 32] |= 1u << (bit % 32);
++	}
++}
++
++/* SERVICE_READY: the fixed part, then the first u32 array = service bitmap (4 services per word, wmi.c:560) */
++static void
++wmi_svc_ready(const uint8_t *p, uint32_t len)
++{
++	struct wmi_tlv_it it = { p, p + len };
++	const uint8_t *v;
++	uint32_t tag, l;
++	bool bitmap = false;
++	int r;
++
++	while ((r = negroni_wmi_tlv_next(&it, &tag, &v, &l)) == 1) {
++		if (tag == WMI_TAG_SERVICE_READY_EVENT && l >= 20 * 4) {
++			M.fw_build = rd32(v);
++			M.abi0 = rd32(v + 4);
++			M.abi1 = rd32(v + 8);
++			M.phy_caps = rd32(v + 7 * 4);
++			M.rf_chains = rd32(v + 9 * 4);
++			M.ht_caps = rd32(v + 10 * 4);
++			M.vht_caps = rd32(v + 11 * 4);
++			M.sys_caps = rd32(v + 15 * 4);
++			M.mem_reqs = rd32(v + 18 * 4);
++			M.max_scan_ch = rd32(v + 19 * 4);
++		} else if (tag == WMI_TAG_ARRAY_UINT32 && !bitmap) {
++			bitmap = true;
++			for (uint32_t w = 0; w < WMI_MAX_SERVICE / 4 && (w + 1) * 4 <= l; w++) {
++				uint32_t x = rd32(v + 4 * w);
++				for (uint32_t b = 0; b < 4; b++) {
++					if (x & (1u << b)) {
++						svc_set(w * 4 + b);
++					}
++				}
++			}
++		}
++	}
++	if (r < 0 || !M.fw_build) {
++		M.bad++;
++		printf("NEGRONI WLAN: WMI SERVICE_READY of %u bytes does not parse (fixed part %s)\n", len,
++		    M.fw_build ? "ok" : "missing");
++		return;
++	}
++	M.svc_ready = true;
++}
++
++/* SERVICE_AVAILABLE: services 128..255 in a 4-word bitmap, 256..383 in a u32 array (wmi.c:8155-8202) */
++static void
++wmi_svc_avail(const uint8_t *p, uint32_t len)
++{
++	struct wmi_tlv_it it = { p, p + len };
++	const uint8_t *v;
++	uint32_t tag, l;
++
++	while (negroni_wmi_tlv_next(&it, &tag, &v, &l) == 1) {
++		if (tag == WMI_TAG_SERVICE_AVAILABLE_EVENT && l >= 20) {
++			for (uint32_t w = 0; w < 4; w++) {
++				M.svc_map[(128 / 32) + w] |= rd32(v + 4 + 4 * w);
++			}
++		} else if (tag == WMI_TAG_ARRAY_UINT32) {
++			for (uint32_t w = 0; w < 4 && (w + 1) * 4 <= l; w++) {
++				M.svc_map[(256 / 32) + w] |= rd32(v + 4 * w);
++			}
++		}
++	}
++	M.svc_avail = true;
++}
++
++/* SERVICE_READY_EXT: fixed part, hw mode caps, then arrays: hw modes, MAC/PHY caps, ... (wmi.c:5037-5113) */
++static void
++wmi_svc_ext(const uint8_t *p, uint32_t len)
++{
++	struct wmi_tlv_it it = { p, p + len };
++	const uint8_t *v;
++	uint32_t tag, l, arrays = 0;
++	int r;
++
++	while ((r = negroni_wmi_tlv_next(&it, &tag, &v, &l)) == 1) {
++		if (tag == WMI_TAG_SERVICE_READY_EXT_EVENT && l >= 16 * 4) {
++			M.fw_build_ext = rd32(v + 15 * 4);
++		} else if (tag == WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS && l >= 8) {
++			M.num_hw_modes = rd32(v);
++		} else if (tag == WMI_TAG_ARRAY_STRUCT && ++arrays == 2) {
++			/* the MAC/PHY capabilities: TLVs of tag 0x210, one per (hw mode, pdev) */
++			struct wmi_tlv_it in = { v, v + l };
++			const uint8_t *c;
++			uint32_t t2, l2;
++			while (negroni_wmi_tlv_next(&in, &t2, &c, &l2) == 1) {
++				if (t2 != WMI_TAG_MAC_PHY_CAPABILITIES || l2 < 22 * 4) {
++					continue;
++				}
++				if (M.pdevs++ == 0) {
++					M.pdev_id = rd32(c + 4);
++					M.phy_id = rd32(c + 8);
++					M.bands = rd32(c + 16);
++					M.tx_mask_2g = rd32(c + 12 * 4);
++					M.rx_mask_2g = rd32(c + 13 * 4);
++					M.tx_mask_5g = rd32(c + 20 * 4);
++					M.rx_mask_5g = rd32(c + 21 * 4);
++				}
++			}
++		}
++	}
++	if (r < 0) {
++		M.bad++;
++		printf("NEGRONI WLAN: WMI SERVICE_READY_EXT of %u bytes does not parse\n", len);
++	}
++	M.svc_ext = true;
++}
++
++/* READY: wmi_ready_event_min = abi (24 bytes), mac addr (8), status, dscp tables, extra MACs, peers */
++static void
++wmi_ready(const uint8_t *p, uint32_t len)
++{
++	struct wmi_tlv_it it = { p, p + len };
++	const uint8_t *v;
++	uint32_t tag, l;
++
++	while (negroni_wmi_tlv_next(&it, &tag, &v, &l) == 1) {
++		if (tag == WMI_TAG_READY_EVENT && l >= 12 * 4) {
++			M.abi0 = rd32(v);
++			memcpy(M.mac, v + 24, 6);
++			M.ready_status = rd32(v + 32);
++			M.extra_macs = rd32(v + 40);
++			M.total_peers = rd32(v + 44);
++			M.ready = true;
++		}
++	}
++	if (!M.ready) {
++		M.bad++;
++		printf("NEGRONI WLAN: WMI READY of %u bytes without the fixed part\n", len);
++	}
++}
++
++/* REG_CHAN_LIST_CC(_EXT): status, phy id, alpha2 (3 chars in a u32) (wmi.h:4532-4566) */
++static void
++wmi_reg(const uint8_t *p, uint32_t len)
++{
++	struct wmi_tlv_it it = { p, p + len };
++	const uint8_t *v;
++	uint32_t tag, l;
++
++	while (negroni_wmi_tlv_next(&it, &tag, &v, &l) == 1) {
++		if ((tag == WMI_TAG_REG_CHAN_LIST_CC_EVENT || tag == WMI_TAG_REG_CHAN_LIST_CC_EXT_EVENT) && l >= 12) {
++			for (uint32_t i = 0; i < 3; i++) {
++				char c = (char)v[8 + i];
++				M.alpha2[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
++			}
++			M.alpha2[3] = 0;
++			if (!M.reg_seen) {
++				printf("NEGRONI WLAN: WMI regulatory event: status %u, country \"%s\"\n", rd32(v), M.alpha2);
++			}
++			M.reg_seen = true;
++		}
++	}
++}
++
++static void
++wmi_event(const uint8_t *p, uint32_t len)
++{
++	if (len < 4) {
++		M.bad++;
++		return;
++	}
++	uint32_t id = rd32(p) & 0xffffff;
++	p += 4;
++	len -= 4;
++	M.events++;
++	switch (id) {
++	case WMI_SERVICE_READY_EVENTID:
++		wmi_svc_ready(p, len);
++		break;
++	case WMI_SERVICE_AVAILABLE_EVENTID:
++		wmi_svc_avail(p, len);
++		break;
++	case WMI_SERVICE_READY_EXT_EVENTID:
++		wmi_svc_ext(p, len);
++		break;
++	case WMI_SERVICE_READY_EXT2_EVENTID:
++		M.svc_ext2 = true;
++		break;
++	case WMI_READY_EVENTID:
++		wmi_ready(p, len);
++		break;
++	case WMI_REG_CHAN_LIST_CC_EVENTID:
++	case WMI_REG_CHAN_LIST_CC_EXT_EVENTID:
++		wmi_reg(p, len);
++		break;
++	case WMI_DEBUG_MESG_EVENTID:
++	case WMI_DIAG_EVENTID:
++		M.diag++;
++		break;
++	default:
++		if (negroni_wlan_wmi_scan_cb && (id == WMI_SCAN_EVENTID || id == WMI_MGMT_RX_EVENTID ||
++		    id == WMI_CHAN_INFO_EVENTID || id == WMI_PDEV_SET_HW_MODE_RESP_EVENTID)) {
++			negroni_wlan_wmi_scan_cb(id, p, len);
++			break;
++		}
++		for (uint32_t i = 0; i < M.n_unknown; i++) {
++			if (M.unknown_ids[i] == id) {
++				return;
++			}
++		}
++		if (M.n_unknown < 12) {
++			M.unknown_ids[M.n_unknown++] = id;
++			printf("NEGRONI WLAN: WMI event %#x (%u bytes) not handled\n", id, len);
++		}
++		break;
++	}
++}
++
++/* every CE buffer: HTC header, trailer credits, then endpoint 0 (control), WMI or HTT */
++static void
++htc_rx(uint32_t pipe, const uint8_t *b, uint32_t len)
++{
++	struct htc_frame f;
++	uint32_t add[HTC_EP_COUNT] = { 0 };
++
++	(void)pipe;
++	if (negroni_htc_parse(b, len, &f) || (f.trailer && negroni_htc_trailer_credits(f.trailer, f.trailer_len, add))) {
++		if (g_htc_bad++ < 4) {
++			printf("NEGRONI WLAN: HTC frame of %u bytes on CE%u refused (header %#x %#x)\n", len, pipe,
++			    len >= 4 ? rd32(b) : 0, len >= 8 ? rd32(b + 4) : 0);
++		}
++		return;
++	}
++	for (uint32_t i = 0; i < HTC_EP_COUNT; i++) {
++		g_ep[i].credits += add[i];
++	}
++	if (f.payload_len == 0) {
++		return;                 /* a credit-only frame */
++	}
++	if (f.eid == 0) {
++		g_ctl_len = MIN(f.payload_len, (uint32_t)sizeof(g_ctl));
++		memcpy(g_ctl, f.payload, g_ctl_len);
++		g_ctl_new = true;
++	} else if (f.eid == g_wmi_eid) {
++		wmi_event(f.payload, f.payload_len);
++	} else if (f.eid == g_htt_eid) {
++		g_htc_htt++;            /* HTT target -> host: not used before the data path (0324+) */
++	} else {
++		g_htc_other++;
++	}
++}
++
++/* send one HTC frame; waits (servicing the chip) for a credit when the endpoint uses credit flow */
++static int
++htc_send(uint32_t eid, const void *payload, uint32_t plen)
++{
++	struct htc_ep *e = &g_ep[eid];
++	uint64_t deadline = negroni_wlan_ms() + negroni_wlan_timeout();
++	uint32_t need;
++	int error;
++
++	if (eid >= HTC_EP_COUNT || !e->up || plen + HTC_HDR_LEN > sizeof(g_tx)) {
++		return EINVAL;
++	}
++	need = e->credit_flow ? (plen + HTC_HDR_LEN + g_credit_size - 1) / g_credit_size : 0;
++	while (e->credits < need || negroni_wlan_ce_tx_free(e->ul_pipe) == 0) {
++		error = negroni_wlan_service();
++		if (error) {
++			return error;
++		}
++		if (negroni_wlan_ms() >= deadline) {
++			return negroni_wlan_failed(ETIMEDOUT, "endpoint %u: %u credits, %u needed, %u free CE%u slots after %u ms",
++			           eid, e->credits, need, negroni_wlan_ce_tx_free(e->ul_pipe), e->ul_pipe, negroni_wlan_timeout());
++		}
++		negroni_wlan_nap(1);
++	}
++	uint32_t info = eid | ((e->credit_flow ? HTC_FLAG_NEED_CREDIT : 0u) << 8) | (plen << 16);
++	uint32_t ctrl = (uint32_t)e->seq++ << 8;
++	memcpy(g_tx, &info, 4);
++	memcpy(g_tx + 4, &ctrl, 4);
++	memcpy(g_tx + HTC_HDR_LEN, payload, plen);
++	error = negroni_wlan_ce_send(e->ul_pipe, g_tx, plen + HTC_HDR_LEN, eid);
++	if (!error) {
++		e->credits -= need;
++	}
++	return error;
++}
++
++static int
++htc_wait_ctl(uint32_t msg_id, const char *what)
++{
++	uint64_t deadline = negroni_wlan_ms() + negroni_wlan_timeout();
++	int error;
++
++	for (;;) {
++		error = negroni_wlan_service();
++		if (error) {
++			return error;
++		}
++		if (g_ctl_new) {
++			g_ctl_new = false;
++			if (g_ctl_len >= 4 && (rd32(g_ctl) & 0xffff) == msg_id) {
++				return 0;
++			}
++			printf("NEGRONI WLAN: HTC control message %#x (%u bytes) while waiting for %s\n",
++			    g_ctl_len >= 4 ? rd32(g_ctl) & 0xffff : 0, g_ctl_len, what);
++		}
++		if (negroni_wlan_ms() >= deadline) {
++			return negroni_wlan_failed(ETIMEDOUT, "no %s in %u ms", what, negroni_wlan_timeout());
++		}
++		negroni_wlan_nap(1);
++	}
++}
++
++/* the service's pipes from the WLAN_CFG service map (ath11k_pcic_map_service_to_pipe) */
++static bool
++htc_pipes(uint32_t service, uint32_t *ul, uint32_t *dl)
++{
++	bool u = false, d = false;
++
++	for (uint32_t i = 0; i < WLAN_CE_SVC_N; i++) {
++		if (wlan_ce_svc_map[i].service != service) {
++			continue;
++		}
++		if (wlan_ce_svc_map[i].dir == WLAN_PIPEDIR_OUT) {
++			*ul = wlan_ce_svc_map[i].pipe;
++			u = true;
++		} else if (wlan_ce_svc_map[i].dir == WLAN_PIPEDIR_IN) {
++			*dl = wlan_ce_svc_map[i].pipe;
++			d = true;
++		}
++	}
++	return u && d;
++}
++
++/* htc.c ath11k_htc_connect_service; returns the endpoint */
++static int
++htc_connect(uint32_t service, const char *name, uint32_t credit_alloc, uint32_t *eid_out)
++{
++	uint32_t msg[2], flags = credit_alloc << 8;
++	bool flow = service == HTC_SVC_WMI_CONTROL;
++	int error;
++
++	if (!flow) {
++		flags |= HTC_CONN_DISABLE_CREDIT;
++	}
++	msg[0] = HTC_MSG_CONNECT | (service << 16);
++	msg[1] = flags;
++	error = htc_send(0, msg, sizeof(msg));
++	if (error) {
++		return negroni_wlan_failed(error, "HTC CONNECT %s not sent (error %d)", name, error);
++	}
++	error = htc_wait_ctl(HTC_MSG_CONNECT_RESP, "the HTC CONNECT response");
++	if (error) {
++		return error;
++	}
++	if (g_ctl_len < 12) {
++		return negroni_wlan_failed(EBADMSG, "HTC CONNECT response of %u bytes", g_ctl_len);
++	}
++	uint32_t w0 = rd32(g_ctl), w1 = rd32(g_ctl + 4);
++	uint32_t svc = w0 >> 16, status = w1 & 0xff, eid = (w1 >> 8) & 0xff, maxmsg = w1 >> 16;
++	printf("NEGRONI WLAN: HTC %s (service %#x): status %u, endpoint %u, max message %u bytes\n", name, svc, status, eid,
++	    maxmsg);
++	if (svc != service || status != 0 || eid == 0 || eid >= HTC_EP_COUNT || maxmsg == 0 || g_ep[eid].up) {
++		return negroni_wlan_failed(EPROTO, "HTC CONNECT %s refused or invalid (service %#x status %u endpoint %u "
++		           "max %u)", name, svc, status, eid, maxmsg);
++	}
++	struct htc_ep *e = &g_ep[eid];
++	if (!htc_pipes(service, &e->ul_pipe, &e->dl_pipe)) {
++		return negroni_wlan_failed(EINVAL, "service %#x has no pipe pair", service);
++	}
++	e->service = service;
++	e->max_msg = maxmsg;
++	e->credits = credit_alloc;
++	e->credit_flow = flow;
++	e->up = true;
++	*eid_out = eid;
++	return 0;
++}
++
++/* WMI command = u32 command id (23:0) + TLVs (wmi.c ath11k_wmi_cmd_send_nowait) */
++int negroni_wlan_wmi_send(uint32_t cmd, const void *tlvs, uint32_t len);
++int
++negroni_wlan_wmi_send(uint32_t cmd, const void *tlvs, uint32_t len)
++{
++	static uint8_t m[2048 - HTC_HDR_LEN];
++
++	if (g_wmi_eid >= HTC_EP_COUNT || len + 4 > sizeof(m) || len + 4 > g_ep[g_wmi_eid].max_msg) {
++		return negroni_wlan_failed(EMSGSIZE, "WMI command %#x of %u bytes does not fit", cmd, len);
++	}
++	uint32_t h = cmd & 0xffffff;
++	memcpy(m, &h, 4);
++	memcpy(m + 4, tlvs, len);
++	return htc_send(g_wmi_eid, m, len + 4);
++}
++
++/* wait until *flag, servicing the chip */
++int negroni_wlan_wmi_wait(volatile bool *flag, uint32_t ms, const char *what);
++int
++negroni_wlan_wmi_wait(volatile bool *flag, uint32_t ms, const char *what)
++{
++	uint64_t deadline = negroni_wlan_ms() + ms;
++	int error;
++
++	while (!*flag) {
++		error = negroni_wlan_service();
++		if (error) {
++			return negroni_wlan_failed(error, "the chip stopped while waiting for %s", what);
++		}
++		if (negroni_wlan_ms() >= deadline) {
++			return negroni_wlan_failed(ETIMEDOUT, "no %s in %u ms (%u WMI events, %u HTC errors)", what, ms, M.events,
++			           g_htc_bad);
++		}
++		negroni_wlan_nap(2);
++	}
++	return 0;
++}
++
++static uint8_t *
++put_tlv(uint8_t *p, uint32_t tag, uint32_t len)
++{
++	uint32_t h = (tag << 16) | (len & 0xffff);
++	memcpy(p, &h, 4);
++	return p + 4;
++}
++
++static uint8_t *
++put32(uint8_t *p, uint32_t v)
++{
++	memcpy(p, &v, 4);
++	return p + 4;
++}
++
++/* the resource configuration of ath11k_init_wmi_config_qca6390 (hw.c:58-103), wire order wmi.h:2361-2432 */
++#define RC_WORDS        72u
++static void
++wmi_resource_config(uint32_t rc[RC_WORDS])
++{
++	uint32_t chains = M.rf_chains ? M.rf_chains : 2;
++	uint32_t mask = chains >= 8 ? 0xffu : (1u << chains) - 1;
++
++	memset(rc, 0, RC_WORDS * 4);
++	rc[0] = 4;              /* num_vdevs: wcn6855 hw_params.num_vdevs (core.c:538) */
++	rc[1] = 16;             /* num_peers */
++	rc[2] = 3;              /* num_offload_peers */
++	rc[3] = 3;              /* num_offload_reorder_buffs */
++	rc[4] = 2;              /* num_peer_keys (TARGET_NUM_PEER_KEYS) */
++	rc[5] = 32;             /* num_tids */
++	rc[6] = 16;             /* ast_skid_limit */
++	rc[7] = mask;           /* tx_chain_mask = (1 << num_rf_chains) - 1 */
++	rc[8] = mask;           /* rx_chain_mask */
++	rc[9] = 100;            /* rx_timeout_pri[0..2] = TARGET_RX_TIMEOUT_LO_PRI */
++	rc[10] = 100;
++	rc[11] = 100;
++	rc[12] = 40;            /* rx_timeout_pri[3] = TARGET_RX_TIMEOUT_HI_PRI */
++	rc[13] = 1;             /* rx_decap_mode: native wifi */
++	rc[14] = 4;             /* scan_max_pending_req */
++	rc[15] = 3;             /* bmiss_offload_max_vdev */
++	rc[16] = 3;             /* roam_offload_max_vdev */
++	rc[17] = 8;             /* roam_offload_max_ap_profiles */
++	rc[21] = 1024;          /* tx_dbg_log_size */
++	rc[27] = 2;             /* gtk_offload_max_vdev */
++	rc[28] = 0x400;         /* num_msdu_desc */
++	rc[29] = 0xa;           /* max_frag_entries */
++	rc[30] = 1;             /* num_tdls_vdevs */
++	rc[31] = 8;             /* num_tdls_conn_table_entries */
++	rc[32] = 2;             /* beacon_tx_offload_max_vdev */
++	rc[33] = 0x20;          /* num_multicast_filter_entries */
++	rc[34] = 0x16;          /* num_wow_filters */
++	rc[43] = 1u << 5;       /* flag1: WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64 */
++	rc[53] = 1;             /* use_pdev_id */
++	rc[67] = 1u << 9;       /* flags2: CALC_NEXT_DTIM_COUNT_SET */
++	if (svc_has(WMI_SERVICE_REG_CC_EXT_EVENT)) {
++		rc[68] = 1u << 4;       /* host_service_flags: REG_CC_EXT (wmi.c:4249-4252, :4481) */
++	}
++}
++
++static int
++wmi_send_init(void)
++{
++	static uint8_t m[4 + 28 + 4 + RC_WORDS * 4 + 4];
++	uint32_t rc[RC_WORDS];
++	uint8_t *p = m;
++
++	memset(m, 0, sizeof(m));
++	p = put_tlv(p, WMI_TAG_INIT_CMD, 28);
++	p += 24;                        /* host_abi_vers: ath11k leaves it 0 (wmi.c:4258-4350) */
++	p = put32(p, 0);                /* num_host_mem_chunks */
++	wmi_resource_config(rc);
++	p = put_tlv(p, WMI_TAG_RESOURCE_CONFIG, RC_WORDS * 4);
++	memcpy(p, rc, sizeof(rc));
++	p += sizeof(rc);
++	p = put_tlv(p, WMI_TAG_ARRAY_STRUCT, 0);        /* no host memory chunks */
++	printf("NEGRONI WLAN: WMI INIT: %u vdevs, %u peers, chain mask %#x, decap native wifi, %u bytes%s\n", rc[0], rc[1],
++	    rc[7], (uint32_t)(p - m), rc[68] ? ", REG_CC_EXT" : "");
++	return negroni_wlan_wmi_send(WMI_INIT_CMDID, m, (uint32_t)(p - m));
++}
++
++/* the ADT MAC (/chosen mac-address-wifi0, config/negroni-ne2211.toml) for the comparison line */
++static bool
++adt_mac(uint8_t out[6])
++{
++	DTEntry chosen;
++	void const *prop = NULL;
++	unsigned int size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
++	    SecureDTGetProperty(chosen, "mac-address-wifi0", &prop, &size) != kSuccess || size < 6) {
++		return false;
++	}
++	memcpy(out, prop, 6);
++	return true;
++}
++
++/* level 9 */
++int
++negroni_wlan_wmi_level(void)
++{
++	int error;
++
++	memset(&M, 0, sizeof(M));
++	memset(g_ep, 0, sizeof(g_ep));
++	g_credit_size = negroni_wlan_ready.credit_size;
++	negroni_wlan_ce_rx_cb = htc_rx;
++
++	negroni_wlan_step(29, "HTC connect");
++	/* the pseudo control service: endpoint 0, no credit flow (htc.c:600-606) */
++	g_ep[0].service = HTC_SVC_RSVD_CTRL;
++	g_ep[0].up = htc_pipes(HTC_SVC_RSVD_CTRL, &g_ep[0].ul_pipe, &g_ep[0].dl_pipe);
++	g_ep[0].max_msg = 256;
++	/* shadow-register chips: the credit total is forced to 1, all of it to the one WMI endpoint
++	 * (htc.c:567-571 and :400-421 with wmi_ep_count 1: single_pdev_only + 2 rxdma, wmi.c:9309-9313) */
++	uint32_t wmi_alloc = 1;
++	printf("NEGRONI WLAN: HTC target credits %u of %u bytes; the host uses %u (shadow registers, ath11k)\n",
++	    negroni_wlan_ready.credits, g_credit_size, wmi_alloc);
++	error = htc_connect(HTC_SVC_HTT_DATA, "HTT data", 0, &g_htt_eid);
++	if (!error) {
++		error = htc_connect(HTC_SVC_WMI_CONTROL, "WMI control", wmi_alloc, &g_wmi_eid);
++	}
++	if (error) {
++		return error;
++	}
++	{
++		uint32_t setup[3] = { HTC_MSG_SETUP_COMPLETE_EX, 0, 0 };   /* credit flow on: flags 0 */
++		error = htc_send(0, setup, sizeof(setup));
++		if (error) {
++			return negroni_wlan_failed(error, "HTC SETUP_COMPLETE_EX not sent");
++		}
++		printf("NEGRONI WLAN: HTC SETUP_COMPLETE_EX sent (WMI endpoint %u on CE%u/CE%u, HTT endpoint %u)\n", g_wmi_eid,
++		    g_ep[g_wmi_eid].ul_pipe, g_ep[g_wmi_eid].dl_pipe, g_htt_eid);
++	}
++
++	negroni_wlan_step(30, "WMI SERVICE_READY");
++	error = negroni_wlan_wmi_wait(&M.svc_ready, MAX(negroni_wlan_timeout(), 10000u), "WMI SERVICE_READY");
++	if (error) {
++		return error;
++	}
++	error = negroni_wlan_wmi_wait(&M.svc_ext, negroni_wlan_timeout(), "WMI SERVICE_READY_EXT");
++	if (error) {
++		return error;
++	}
++	if (svc_has(WMI_SERVICE_EXT2_MSG)) {
++		error = negroni_wlan_wmi_wait(&M.svc_ext2, negroni_wlan_timeout(), "WMI SERVICE_READY_EXT2");
++		if (error) {
++			return error;
++		}
++	}
++	printf("NEGRONI WLAN: WMI SERVICE_READY: fw build %#x (ext %#x), abi %#x.%#x, phy caps %#x, %u RF chains, "
++	    "HT caps %#x, VHT caps %#x, sys caps %#x, %u scan channels max, %u host memory requests%s\n", M.fw_build,
++	    M.fw_build_ext, M.abi0, M.abi1, M.phy_caps, M.rf_chains, M.ht_caps, M.vht_caps, M.sys_caps, M.max_scan_ch,
++	    M.mem_reqs, M.mem_reqs ? " (not given: ath11k gives none either)" : "");
++	printf("NEGRONI WLAN: WMI SERVICE_READY_EXT: %u hw modes, %u MAC/PHY entries, pdev id %u phy %u, bands %#x, "
++	    "chain masks 2G %#x/%#x 5G %#x/%#x, EXT2 %s, services 0..383 avail %s\n", M.num_hw_modes, M.pdevs, M.pdev_id,
++	    M.phy_id, M.bands, M.tx_mask_2g, M.rx_mask_2g, M.tx_mask_5g, M.rx_mask_5g,
++	    svc_has(WMI_SERVICE_EXT2_MSG) ? "yes" : "no", M.svc_avail ? "yes" : "no");
++
++	negroni_wlan_step(31, "WMI INIT");
++	error = wmi_send_init();
++	if (error) {
++		return error;
++	}
++
++	negroni_wlan_step(32, "WMI READY");
++	error = negroni_wlan_wmi_wait(&M.ready, MAX(negroni_wlan_timeout(), 10000u), "WMI READY");
++	if (error) {
++		return error;
++	}
++	{
++		uint8_t adt[6];
++		bool have = adt_mac(adt);
++		printf("NEGRONI WLAN: WMI READY: fw abi %#x, status %u, MAC %02x:%02x:%02x:%02x:%02x:%02x, %u peers, "
++		    "%u extra MACs; %u RF chains, %u vdevs\n", M.abi0, M.ready_status, M.mac[0], M.mac[1], M.mac[2],
++		    M.mac[3], M.mac[4], M.mac[5], M.total_peers, M.extra_macs, M.rf_chains, 4u);
++		if (have) {
++			printf("NEGRONI WLAN: ADT mac-address-wifi0 %02x:%02x:%02x:%02x:%02x:%02x: %s the chip's MAC\n", adt[0],
++			    adt[1], adt[2], adt[3], adt[4], adt[5], memcmp(adt, M.mac, 6) ? "DIFFERS from" : "matches");
++		} else {
++			printf("NEGRONI WLAN: no ADT /chosen mac-address-wifi0 to compare\n");
++		}
++	}
++	return 0;
++}
++
++/* accessors for 0323 */
++uint32_t negroni_wlan_wmi_pdev_id(void);
++uint32_t
++negroni_wlan_wmi_pdev_id(void)
++{
++	return M.pdev_id;
++}
++
++const uint8_t *negroni_wlan_wmi_mac(void);
++const uint8_t *
++negroni_wlan_wmi_mac(void)
++{
++	return M.mac;
++}
++
++uint32_t negroni_wlan_wmi_chains(void);
++uint32_t
++negroni_wlan_wmi_chains(void)
++{
++	return M.rf_chains ? M.rf_chains : 2;
++}
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_wlan_wmi.h b/bsd/dev/negroni_wlan_wmi.h
+new file mode 100644
+index 0000000..e8dbb95
+--- /dev/null
++++ b/bsd/dev/negroni_wlan_wmi.h
+@@ -0,0 +1,108 @@
++/*
++ * NEGRONI QCA6490 Wi-Fi: HTC and WMI (patch 0322) and the passive scan (patch 0323).
++ *
++ * Wire formats from Linux ath11k (BSD-3-Clause-Clear) htc.h / htc.c and wmi.h / wmi.c (values and layouts
++ * only; the code in negroni_wlan_wmi.c is our own). Message ids and TLV tags were computed from the ath11k
++ * enums (WMI_TLV_CMD(grp) = grp << 12 | 1, enum wmi_tlv_tag) and are listed with their names.
++ */
++#ifndef _NEGRONI_WLAN_WMI_H_
++#define _NEGRONI_WLAN_WMI_H_
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define HTC_EP_COUNT            9u      /* ATH11K_HTC_EP_COUNT */
++#define HTC_CONN_DISABLE_CREDIT 0x8u    /* ATH11K_HTC_CONN_FLAGS_DISABLE_CREDIT_FLOW_CTRL */
++#define HTC_RECORD_CREDITS      1u      /* ATH11K_HTC_RECORD_CREDITS */
++
++/* WMI command ids (wmi.h:222-610) */
++#define WMI_INIT_CMDID                  0x00001u
++#define WMI_START_SCAN_CMDID            0x03001u
++#define WMI_STOP_SCAN_CMDID             0x03002u
++#define WMI_SCAN_CHAN_LIST_CMDID        0x03003u
++#define WMI_PDEV_SET_HW_MODE_CMDID      0x0401eu
++#define WMI_VDEV_CREATE_CMDID           0x05001u
++#define WMI_VDEV_DELETE_CMDID           0x05002u
++/* WMI event ids (wmi.h:630-827) */
++#define WMI_SERVICE_READY_EVENTID       0x00001u
++#define WMI_READY_EVENTID               0x00002u
++#define WMI_SERVICE_AVAILABLE_EVENTID   0x00003u
++#define WMI_SCAN_EVENTID                0x03001u
++#define WMI_CHAN_INFO_EVENTID           0x04002u
++#define WMI_SERVICE_READY_EXT_EVENTID   0x04009u
++#define WMI_PDEV_SET_HW_MODE_RESP_EVENTID 0x04010u
++#define WMI_SERVICE_READY_EXT2_EVENTID  0x04022u
++#define WMI_MGMT_RX_EVENTID             0x07001u
++#define WMI_DEBUG_MESG_EVENTID          0x1d003u
++#define WMI_DIAG_EVENTID                0x1d011u
++#define WMI_REG_CHAN_LIST_CC_EVENTID    0x3a001u
++#define WMI_REG_CHAN_LIST_CC_EXT_EVENTID 0x3a003u
++/* TLV tags (enum wmi_tlv_tag) */
++#define WMI_TAG_ARRAY_UINT32            0x10u
++#define WMI_TAG_ARRAY_BYTE              0x11u
++#define WMI_TAG_ARRAY_STRUCT            0x12u
++#define WMI_TAG_ARRAY_FIXED_STRUCT      0x13u
++#define WMI_TAG_SERVICE_READY_EVENT     0x20u
++#define WMI_TAG_READY_EVENT             0x23u
++#define WMI_TAG_SCAN_EVENT              0x24u
++#define WMI_TAG_MGMT_RX_HDR             0x2cu
++#define WMI_TAG_INIT_CMD                0x4au
++#define WMI_TAG_RESOURCE_CONFIG         0x4bu
++#define WMI_TAG_START_SCAN_CMD          0x4du
++#define WMI_TAG_SCAN_CHAN_LIST_CMD      0x4fu
++#define WMI_TAG_CHANNEL                 0x50u
++#define WMI_TAG_VDEV_CREATE_CMD         0x56u
++#define WMI_TAG_VDEV_TXRX_STREAMS       0x19bu
++#define WMI_TAG_SERVICE_READY_EXT_EVENT 0x1acu
++#define WMI_TAG_PDEV_SET_HW_MODE_CMD    0x203u
++#define WMI_TAG_MAC_PHY_CAPABILITIES    0x210u
++#define WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS 0x212u
++#define WMI_TAG_SERVICE_AVAILABLE_EVENT 0x22fu
++#define WMI_TAG_REG_CHAN_LIST_CC_EVENT  0x261u
++#define WMI_TAG_REG_CHAN_LIST_CC_EXT_EVENT 0x3aau
++
++/* services (wmi.h:2041-2145) */
++#define WMI_SERVICE_EXT2_MSG            220u
++#define WMI_SERVICE_REG_CC_EXT_EVENT    281u
++#define WMI_MAX_SERVICE                 128u
++#define WMI_MAX_EXT2_SERVICE            384u
++
++/* ---- pure parsers (no kernel state; host-tested by patches/xnu/tests/wlan-wmi-test.c) ---- */
++struct htc_frame {
++	uint32_t eid, flags, seq;
++	const uint8_t *payload;         /* without the trailer */
++	uint32_t payload_len;
++	const uint8_t *trailer;
++	uint32_t trailer_len;
++};
++/* the HTC header and trailer bounds of one CE buffer; 0 or EBADMSG */
++int negroni_htc_parse(const uint8_t *b, uint32_t len, struct htc_frame *f);
++/* the credit records of a trailer, added per endpoint into credits[HTC_EP_COUNT]; 0 or EBADMSG */
++int negroni_htc_trailer_credits(const uint8_t *t, uint32_t len, uint32_t credits[HTC_EP_COUNT]);
++
++/* WMI TLV walk: { u32 header (len 15:0, tag 31:16); value[len] }, every length checked */
++struct wmi_tlv_it {
++	const uint8_t *p, *end;
++};
++/* 1 and the next TLV, 0 at the clean end, -1 on a TLV that runs past the end */
++int negroni_wmi_tlv_next(struct wmi_tlv_it *it, uint32_t *tag, const uint8_t **v, uint32_t *len);
++
++/* one BSS from a beacon / probe response (0323) */
++struct wlan_bss {
++	uint8_t bssid[6];
++	char ssid[33];                  /* printable copy; non-printable bytes as '?' */
++	uint32_t ssid_len;
++	uint16_t beacon_int, capab;
++	uint8_t channel;                /* DS parameter set, 0 if absent */
++	bool rsn, wpa, hidden;
++};
++/* parse an 802.11 beacon or probe response frame; 0, ENOENT (another frame type) or EBADMSG */
++int negroni_wlan_beacon_parse(const uint8_t *f, uint32_t len, struct wlan_bss *out);
++
++/* ---- driver (negroni_wlan_wmi.c) ---- */
++int negroni_wlan_wmi_level(void);       /* level 9: steps 29-32 (0322) */
++int negroni_wlan_scan_level(void);      /* level 10: steps 33-35 (0323) */
++
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++#endif /* _NEGRONI_WLAN_WMI_H_ */
