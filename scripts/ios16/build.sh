@@ -53,6 +53,13 @@ payload() {
     case " $args " in *" negroniusb_lost_reboot="*) ;; *)
       [ "${LOST_REBOOT:-60}" = 0 ] || args="$args negroniusb_lost_reboot=${LOST_REBOOT:-60}" ;; esac ;; esac
   printf '%s\n' "$args" > "$O/cmdline.txt"
+  # iOS 16 userland reads kern.bootargs into 608 bytes (patch 0378 truncates there): the keys it needs must end
+  # before byte 607
+  for k in wdt_test= wdt= launchd_unsecure_cache= unentitled_ios_sim_launch= ignition_level= rd= -noprogress negronimetal= negronigl_sw=; do
+    a=" $args"; pre=${a%%" $k"*}; [ "$pre" = "$a" ] && continue
+    rest=${a#"$pre "}; tok=${rest%% *}
+    [ $(( ${#pre} + ${#tok} )) -le 607 ] || { echo "boot-arg $tok ends after byte 607: userland cannot see it (move it to the front)" >&2; exit 1; }
+  done
   # DarwinBoot passes at most 1023 bytes; kernels before patch 0363 read memSizeActual from inside a command line
   # longer than 620 bytes (docs/notes.md section 35)
   n=$(printf '%s' "$args" | wc -c | tr -d ' ')
