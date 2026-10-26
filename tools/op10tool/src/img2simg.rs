@@ -7,7 +7,7 @@
 //! The crate's own Encoder turns every zero block into Skip. That is not safe for a filesystem image:
 //! zero-filled file data (e.g. in the dyld shared cache) would keep whatever was on the partition.
 
-use android_sparse::{Block, Decoder, Reader, Writer};
+use android_sparse::{Block, Reader, Writer};
 use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
 use std::fs::File;
@@ -76,12 +76,28 @@ pub fn img2simg(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Sparse -> raw (for checks). DONT_CARE regions come out as zeros.
+/// Sparse -> raw. DONT_CARE and zero-fill regions become file holes (a seek, no bytes written), so a
+/// userdata-sized image (hundreds of GB of DONT_CARE at the end) costs only its data on an APFS/ext4
+/// volume. The crate's Decoder writes zeros instead and filled the Mac disk (2026-10-26).
 pub fn simg2img(input: &Path, output: &Path) -> Result<()> {
     let r = Reader::new(BufReader::with_capacity(1 << 22, File::open(input)?))?;
-    let mut d = Decoder::new(File::create(output)?)?;
-    for b in r { d.write_block(&b?)?; }
-    d.close()?;
-    println!("{} -> {}", input.display(), output.display());
+    let mut w = BufWriter::with_capacity(1 << 22, File::create(output)?);
+    let (mut pos, mut data, mut holes) = (0u64, 0u64, 0u64);
+    for b in r {
+        match b? {
+            Block::Raw(buf) => { std::io::Write::write_all(&mut w, &buf[..])?; pos += B; data += 1; }
+            Block::Fill(v) if v == [0, 0, 0, 0] => { w.seek(SeekFrom::Start(pos + B))?; pos += B; holes += 1; }
+            Block::Fill(v) => {
+                let mut blk = [0u8; Block::SIZE as usize];
+                for c in blk.chunks_exact_mut(4) { c.copy_from_slice(&v); }
+                std::io::Write::write_all(&mut w, &blk)?; pos += B; data += 1;
+            }
+            Block::Skip => { w.seek(SeekFrom::Start(pos + B))?; pos += B; holes += 1; }
+            Block::Crc32(_) => {}
+        }
+    }
+    std::io::Write::flush(&mut w)?;
+    w.get_ref().set_len(pos)?;
+    println!("{} -> {} ({} MiB logical, {} data blocks, {} hole blocks)", input.display(), output.display(), pos >> 20, data, holes);
     Ok(())
 }
