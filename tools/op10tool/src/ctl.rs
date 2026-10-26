@@ -5,6 +5,9 @@
 //! panic (which follows 500 ms later), "error: ..." otherwise.
 //! Calendar (patch 0212, bsd/dev/negroni_rtc.c from 0203): `settime` sends "settime <unix s>.<us>" with this
 //! host's clock (reply "ok settime ..."), `time` asks "time" (reply "time <s> rtc <counter> offset <n> source ...").
+//! Panic mode (patch 0360, patches/xnu/README-panic.md): after a panic the kernel still answers ping
+//! ("pong (panic)"), log, reboot, bootloader, recovery and poweroff (replies end in "(panic)").
+//! `log` makes the kernel send the last 64 KiB of its console to the live log (UDP 5140) again.
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -33,6 +36,8 @@ pub enum Command {
     Settime,
     /// Show the phone's calendar, RTC counter and offset (no change)
     Time,
+    /// Send the last 64 KiB of the console to the live log again (also after a panic, patch 0360)
+    Log,
 }
 
 impl Command {
@@ -49,6 +54,7 @@ impl Command {
                 format!("settime {}.{:06}", now.as_secs(), now.subsec_micros())
             }
             Command::Time => "time".into(),
+            Command::Log => "log".into(),
         }
     }
 }
@@ -98,16 +104,17 @@ pub fn run(cmd: Command, host: &str) -> Result<()> {
                 send()?;
                 let slot = (Instant::now() + Duration::from_millis(500)).min(deadline);
                 if let Some(reply) = recv(&sock, phone, slot)? {
-                    if reply != "pong" {
+                    // "pong", or "pong (panic)" from the panic hold loop (patch 0360)
+                    if !reply.starts_with("pong") {
                         bail!("{phone}: unexpected reply {reply:?}");
                     }
-                    println!("pong from {phone} in {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
+                    println!("{reply} from {phone} in {:.1} ms", start.elapsed().as_secs_f64() * 1e3);
                     return Ok(());
                 }
             }
             bail!("no pong from {phone} in 2 s")
         }
-        Command::Settime | Command::Time => {
+        Command::Settime | Command::Time | Command::Log => {
             // No reset: resend every 500 ms like ping (each settime carries the host's time at sending).
             let deadline = start + Duration::from_secs(2);
             while Instant::now() < deadline {

@@ -1,0 +1,849 @@
+diff --git a/bsd/dev/negroni_reboot.c b/bsd/dev/negroni_reboot.c
+index 3ceb0ba..12dbc27 100644
+--- a/bsd/dev/negroni_reboot.c
++++ b/bsd/dev/negroni_reboot.c
+@@ -86,6 +86,30 @@ void negroni_power_off(void);
+ void negroni_panic_restart(void);
+ void negroni_reboot_settle(unsigned ms);
+ 
++/*
++ * Panic hold (patch 0360, README-panic.md). In negroni_panic_restart()
++ * interrupts are off and the other CPUs are halted: printf becomes
++ * kdb_printf (console only, no os_log), delays spin on the counter (no
++ * WFE, no thread block).
++ */
++extern int kdb_printf(const char *format, ...) __printflike(1, 2);
++extern bool negroni_usb_panic_begin(void);
++extern int negroni_usb_panic_service(bool busy);
++#define NEGRONI_PANIC_ACT_POWEROFF 0x100        /* as in negroni_usb.c */
++static volatile bool nr_in_panic;
++#define printf(...) (nr_in_panic ? kdb_printf(__VA_ARGS__) : printf(__VA_ARGS__))
++
++/* Busy wait on the counter: works with interrupts off and needs no timer event (WFE). */
++static void
++nr_udelay(uint32_t us)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &abs);
++	uint64_t end = mach_absolute_time() + abs;
++	while (mach_absolute_time() < end) {
++	}
++}
++
+ #define NR_CORE_PA              0x0c400000u
+ #define NR_CORE_SIZE            0x3000u
+ #define NR_CHNLS_PA             0x0c500000u
+@@ -196,7 +220,7 @@ nr_wait(vm_offset_t ch)
+ 		if (s & NR_STATUS_DONE) {
+ 			return (s & NR_STATUS_ERRORS) ? 2 : 0;
+ 		}
+-		delay(1);
++		nr_udelay(1);                   /* 0360: was delay(1) (WFE wait) */
+ 	}
+ 	return 1;
+ }
+@@ -433,7 +457,11 @@ nr_pon_set_type(uint8_t type)
+ 	if (nr_update(&nr_pon, ctl2, NR_PON_RESET_EN, 0) != 0) {
+ 		return -1;
+ 	}
+-	delay(500);
++	if (nr_in_panic) {
++		nr_udelay(500);
++	} else {
++		delay(500);
++	}
+ 	int rc = nr_update(&nr_pon, ctl, NR_PON_TYPE_MASK, type);
+ 	/* Enable again also after a failed type write: the reset must still work. */
+ 	if (nr_update(&nr_pon, ctl2, NR_PON_RESET_EN, NR_PON_RESET_EN) != 0 || rc != 0) {
+@@ -699,25 +727,71 @@ negroni_power_off(void)
+ }
+ 
+ /*
+- * Panic: the panic text stays on the screen for negronipanic seconds
+- * (default 0 = stay, the owner's choice), then reset with reason negronipanicreason (default 0).
+- * negronipanic=0: stay on the panic screen (never returns).
++ * Panic hold (0211, rewritten by 0360). Entered from the platform expert's
++ * halt/restart hook at kPEPanicDiagnosticsDone (the panic log is complete;
++ * with debug=0x4 (DB_NMI) xnu never sends kPEPanicRestartCPU, it spins in
++ * panic_spin_forever()), or at kPEPanicRestartCPU. Never returns.
++ *   - The panic text stays on the screen. negronipanic=N > 0: after N s
++ *     (busy wait on mach_absolute_time, no timer, no WFE) reset with reason
++ *     negronipanicreason. negronipanic=0 (default): no timed reset.
++ *   - USB (negroni_usb.c): the console ring with the panic log goes to
++ *     the host (UDP 5140) and the command server answers on UDP 5141:
++ *     ping, log, reboot, bootloader, recovery, poweroff. A command runs
++ *     500 ms after it arrived, so its reply and the last lines go out.
++ * A nested entry (a panic inside this loop or the USB code) skips USB and
++ * keeps only the timed reset.
+  */
+ void
+ negroni_panic_restart(void)
+ {
++	static int entries;
++	bool first = entries++ == 0;
++	uint64_t sec, half, now, reset_at = UINT64_MAX, act_at = 0;
++	int pending = -1;
++
++	nr_in_panic = true;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec);
++	nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &half);
++	now = mach_absolute_time();
+ 	if (nr_panic_secs > 0) {
+-		printf("NEGRONI REBOOT: panic: reset in %d s (boot-arg negronipanic), reason %d\n",
+-		    nr_panic_secs, nr_panic_reason);
+-		for (int i = 0; i < nr_panic_secs; i++) {
+-			delay(1000000);
+-		}
+-		negroni_reboot((unsigned)nr_panic_reason);
++		reset_at = now + (uint64_t)nr_panic_secs * sec;
++	}
++	bool usb = first && negroni_usb_panic_begin();
++	if (nr_panic_secs > 0) {
++		kdb_printf("NEGRONI PANIC: reset in %d s (boot-arg negronipanic), reason %d%s\n",
++		    nr_panic_secs, nr_panic_reason, first ? "" : " (nested panic: no USB)");
+ 	} else {
+-		printf("NEGRONI REBOOT: panic: staying on the panic screen (negronipanic=0)\n");
++		kdb_printf("NEGRONI PANIC: staying on the panic screen (negronipanic=0)%s\n",
++		    usb ? "; reset with: op10tool ctl bootloader" : (first ? "" : " (nested panic: no USB)"));
+ 	}
+ 	for (;;) {
+-		__builtin_arm_wfe();
++		now = mach_absolute_time();
++		if (usb) {
++			int a = negroni_usb_panic_service(pending >= 0);
++			if (a >= 0 && pending < 0) {
++				pending = a;
++				act_at = now + half;
++			}
++		}
++		if (pending >= 0 && now >= act_at) {
++			int a = pending;
++			pending = -1;
++			if (a == NEGRONI_PANIC_ACT_POWEROFF) {
++				kdb_printf("NEGRONI PANIC: power off (USB command)\n");
++				negroni_power_off();
++				kdb_printf("NEGRONI PANIC: power off failed\n");
++			} else {
++				kdb_printf("NEGRONI PANIC: reset, reason %d (USB command)\n", a);
++				negroni_reboot((unsigned)a);
++				kdb_printf("NEGRONI PANIC: reset failed\n");
++			}
++		}
++		if (now >= reset_at) {
++			reset_at = UINT64_MAX;
++			kdb_printf("NEGRONI PANIC: %d s over: reset, reason %d\n", nr_panic_secs, nr_panic_reason);
++			negroni_reboot((unsigned)nr_panic_reason);
++			kdb_printf("NEGRONI PANIC: reset failed\n");
++		}
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 4d426e2..c408b7b 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -1129,16 +1129,23 @@ negroni_log_panic(const char *text, size_t length)
+ {
+ 	static bool done;
+ 
+-	if (done || !negroni_log_running) {
++	if (done) {
+ 		return;
+ 	}
+ 	done = true;
++	/*
++	 * 0360: the ring copy is made also without the partition log: the USB
++	 * panic flush (negroni_usb.c, negroni_usb_panic_service()) sends the
++	 * ring, and the register dump and backtrace are only in this text.
++	 */
+ 	negroni_log_append("\nNEGRONI LOG: panic log follows\n", 32);
+ 	for (size_t i = 0; i < length; i += 512) {
+ 		negroni_log_append(text + i, (int)MIN((size_t)512, length - i));
+ 	}
+ 	negroni_log_append("\nNEGRONI LOG: end of panic log\n", 31);
+-	(void)negroni_log_write(negroni_log_flushed, os_atomic_load(&negroni_log_total, relaxed), ++negroni_log_seq);
++	if (negroni_log_running) {
++		(void)negroni_log_write(negroni_log_flushed, os_atomic_load(&negroni_log_total, relaxed), ++negroni_log_seq);
++	}
+ }
+ 
+ static void
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index 0f2ce2c..8cbe71c 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -42,6 +42,39 @@ void negroni_usb_probe(void);
+ static void negroni_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
++/*
++ * Panic mode (patch 0360, README-panic.md). negroni_usb_panic_begin(),
++ * called by negroni_panic_restart() (negroni_reboot.c), sets ud_in_panic.
++ * From then on this file runs on the panicking CPU only, with interrupts
++ * off and the other CPUs halted: no locks (the panicking CPU may hold
++ * ud.lock), no mbuf allocation or free, no sleep, no WFE delay, no
++ * os_log. printf then writes to the console ring only (sent over USB, not
++ * drawn: the panic text stays on the screen).
++ */
++extern int kdb_printf(const char *format, ...) __printflike(1, 2);
++extern void negroni_log_append(const char *c, int size);
++static volatile bool ud_in_panic;
++static volatile bool ud_log_rewind;     /* "log" command: ud_log_thread sends the last 64 KiB again */
++static volatile uint64_t ud_log_sent;   /* console ring position that ud_log_thread has sent up to */
++
++static int ud_panic_log(const char *fmt, ...) __printflike(1, 2);
++static int
++ud_panic_log(const char *fmt, ...)
++{
++	char buf[160];
++	va_list ap;
++
++	va_start(ap, fmt);
++	int n = vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	if (n > (int)sizeof(buf) - 1) {
++		n = (int)sizeof(buf) - 1;
++	}
++	negroni_log_append(buf, n);
++	return n;
++}
++#define printf(...) (ud_in_panic ? ud_panic_log(__VA_ARGS__) : printf(__VA_ARGS__))
++
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+ #define GCC_USB30_PRIM_GDSCR    0x49004         /* bit 31: power on (Linux gcc-sm8450.c) */
+@@ -226,6 +259,8 @@ static struct {
+ 	uint64_t    ctl_deadline;
+ 	uint16_t    ctl_ip_id;
+ } ud;
++static int  ud_panic_enabled = 1;       /* 0360: boot-arg negronipanicusb */
++static bool ud_running;                 /* 0360: gadget set up (event buffer, ep0) */
+ 
+ static inline void
+ dwc_wr(uint32_t off, uint32_t v)
+@@ -255,6 +290,21 @@ ud_sleep_ms(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* delay() waits with WFE (or blocks the thread); in panic mode spin on the counter instead. */
++static void
++ud_udelay(uint32_t us)
++{
++	if (!ud_in_panic) {
++		delay(us);
++		return;
++	}
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &abs);
++	uint64_t end = mach_absolute_time() + abs;
++	while (mach_absolute_time() < end) {
++	}
++}
++
+ static int
+ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ {
+@@ -272,7 +322,7 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 			}
+ 			return 0;
+ 		}
+-		delay(1);
++		ud_udelay(1);
+ 	}
+ 	printf("NEGRONI USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
+ 	return -1;
+@@ -371,6 +421,7 @@ static void ud_tx_kick_locked(void);
+ static void ud_link_event(bool up);
+ static int ud_reset_drop = 1;           /* 0282: boot-arg negroniusb_resetdrop (0 = the old behaviour) */
+ static bool ud_ctl_input(const uint8_t *frame, uint32_t len);
++static void ud_panic_rx(const uint8_t *frame, uint32_t len);
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+@@ -494,6 +545,15 @@ ud_rx_done(void)
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
++	if (ud_in_panic) {
++		/* 0360: no network stack in panic mode; only ARP and the command server */
++		if (len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
++			ud.rx_frames++;
++			ud_panic_rx((const uint8_t *)(ud.dma + UD_RX), len);
++		}
++		ud_rx_arm();
++		return;
++	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN &&
+ 	    ud_ctl_input((const uint8_t *)(ud.dma + UD_RX), len)) {
+ 		ud.rx_frames++;         /* a command: taken before the stack */
+@@ -663,27 +723,17 @@ ud_sum_fold(uint32_t sum)
+ }
+ 
+ /*
+- * One UDP datagram from 192.168.7.2:sport, built here and put on the TX
+- * ring (no socket, no ARP, no route: works while ue0 is down). Does not
+- * print (the log thread uses it). false = no mbuf.
++ * Ethernet + IPv4 + UDP frame from 192.168.7.2:sport into f; returns the
++ * frame length. data may already be at f + 42 (the panic path builds in
++ * the TX buffer): then it is not copied.
+  */
+-static bool
+-ud_udp_send(const uint8_t *dst_mac, const uint8_t *dst_ip, uint16_t sport, uint16_t dport,
++static uint32_t
++ud_udp_build(uint8_t *f, const uint8_t *dst_mac, const uint8_t *dst_ip, uint16_t sport, uint16_t dport,
+     const void *data, uint32_t n)
+ {
+ 	uint32_t len = ETHER_HDR_LEN + 20 + 8 + n;
+-	mbuf_t m = NULL;
+ 
+-	if (ud.ifp == NULL || mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
+-	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
+-	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < len) {
+-		if (m != NULL) {
+-			mbuf_freem(m);
+-		}
+-		return false;
+-	}
+-	uint8_t *f = mbuf_data(m);
+-	bzero(f, len);
++	bzero(f, ETHER_HDR_LEN + 20 + 8);
+ 	memcpy(f, dst_mac, ETHER_ADDR_LEN);
+ 	memcpy(f + ETHER_ADDR_LEN, ud_phone_mac, ETHER_ADDR_LEN);
+ 	ud_put16(f + 12, ETHERTYPE_IP);
+@@ -701,11 +751,37 @@ ud_udp_send(const uint8_t *dst_mac, const uint8_t *dst_ip, uint16_t sport, uint1
+ 	ud_put16(udp, sport);
+ 	ud_put16(udp + 2, dport);
+ 	ud_put16(udp + 4, (uint16_t)(8 + n));
+-	memcpy(udp + 8, data, n);
++	if (data != udp + 8) {
++		memcpy(udp + 8, data, n);
++	}
+ 	/* UDP checksum over the pseudo header (addresses, protocol, length) and the datagram */
+ 	uint32_t sum = ud_sum_add(0, ip + 12, 8) + IPPROTO_UDP + 8 + n;
+ 	uint16_t csum = ud_sum_fold(ud_sum_add(sum, udp, 8 + n));
+ 	ud_put16(udp + 6, csum ? csum : 0xffff);
++	return len;
++}
++
++/*
++ * One UDP datagram from 192.168.7.2:sport, built here and put on the TX
++ * ring (no socket, no ARP, no route: works while ue0 is down). Does not
++ * print (the log thread uses it). false = no mbuf.
++ */
++static bool
++ud_udp_send(const uint8_t *dst_mac, const uint8_t *dst_ip, uint16_t sport, uint16_t dport,
++    const void *data, uint32_t n)
++{
++	uint32_t len = ETHER_HDR_LEN + 20 + 8 + n;
++	mbuf_t m = NULL;
++
++	if (ud.ifp == NULL || mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 ||
++	    !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < len) {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		return false;
++	}
++	(void)ud_udp_build(mbuf_data(m), dst_mac, dst_ip, sport, dport, data, n);
+ 	mbuf_setlen(m, len);
+ 	mbuf_pkthdr_setlen(m, len);
+ 	(void)ud_if_output(ud.ifp, m);
+@@ -817,6 +893,11 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		ud_ctl_reply(f, treply);
+ 		return true;
+ 	}
++	if (strcmp(cmd, "log") == 0) {
++		ud_log_rewind = true;   /* 0360: ud_log_thread sends the last 64 KiB of the console again */
++		ud_ctl_reply(f, "ok log");
++		return true;
++	}
+ 	if (ud.ctl_action != UD_CTL_NONE) {
+ 		printf("NEGRONI CTL: busy (a reset or panic is pending)\n");
+ 		ud_ctl_reply(f, "error: busy");
+@@ -881,7 +962,7 @@ ud_ctl_poll(void)
+ static void
+ ud_link_event(bool up)
+ {
+-	if (ud.ifp != NULL) {
++	if (ud.ifp != NULL && !ud_in_panic) {   /* 0360: dlil_post_msg allocates and locks */
+ 		dlil_post_msg(ud.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
+ 	}
+ }
+@@ -1018,9 +1099,13 @@ ud_event(uint32_t ev)
+ 				 * transfer resources, as Linux dwc3 does after a reset).
+ 				 */
+ 				dwc_wr(DALEPENA, 0x3);
+-				lck_mtx_lock(ud.lock);
++				if (!ud_in_panic) {
++					lck_mtx_lock(ud.lock);
++				}
+ 				ud.tx_busy = false;
+-				lck_mtx_unlock(ud.lock);
++				if (!ud_in_panic) {
++					lck_mtx_unlock(ud.lock);
++				}
+ 				ud.configured = false;
+ 				ud.data_alt = 0;
+ 				ud_link_event(false);
+@@ -1050,6 +1135,10 @@ ud_event(uint32_t ev)
+ 		return;
+ 	}
+ 	if (ep == EP_TX && type == 1) {
++		if (ud_in_panic) {
++			ud.tx_busy = false;     /* 0360: negroni_usb_panic_service() sends the next frame */
++			return;
++		}
+ 		lck_mtx_lock(ud.lock);
+ 		ud.tx_busy = false;
+ 		ud_tx_kick_locked();
+@@ -1096,18 +1185,27 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t ticks = 0;
+ 	for (;;) {
++		if (ud_in_panic) {              /* 0360: the panic CPU owns the controller now */
++			ud_sleep_ms(1000);
++			continue;
++		}
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+ 		if (count) {
+ 			ud_sync(UD_EVT, UD_EVT_SIZE);
+ 			for (uint32_t done = 0; done < count; done += 4) {
+ 				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+ 				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++				/*
++				 * 0360: ack each event before it is handled, so a panic
++				 * inside ud_event() leaves GEVNTCOUNT and evt_pos in step
++				 * for the panic mode event loop.
++				 */
++				dwc_wr(GEVNTCOUNT, 4);
+ 				if (ud.events++ < 200) {
+ 					printf("NEGRONI USB: event 0x%08x\n", ev);
+ 				}
+ 				ud_event(ev);
+ 			}
+-			dwc_wr(GEVNTCOUNT, count);
+ 		}
+ 		ud_ctl_poll();
+ 		if ((++ticks % 30000) == 0) {
+@@ -1137,6 +1235,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	static const uint8_t host_ip[4] = { 192, 168, 7, 1 };
+ 
+ 	pos = pos > 65536 ? pos - 65536 : 0;
++	ud_log_sent = pos;
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+@@ -1144,9 +1243,14 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
+ 		ud_sleep_ms(100);
+-		if (!ud.configured) {
++		if (!ud.configured || ud_in_panic) {
+ 			continue;
+ 		}
++		if (ud_log_rewind) {            /* 0360: "log" command */
++			ud_log_rewind = false;
++			uint64_t end = negroni_log_position();
++			pos = end > 65536 ? end - 65536 : 0;
++		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
+ 			continue;
+@@ -1173,8 +1277,351 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 					break;
+ 				}
+ 			}
++			ud_log_sent = pos;      /* 0360: the panic flush starts here */
++		}
++	}
++}
++
++/*
++ * ---- panic mode (patch 0360, README-panic.md) ----
++ *
++ * negroni_panic_restart() (negroni_reboot.c) holds a panic on the panic
++ * screen. It calls negroni_usb_panic_begin() once and then
++ * negroni_usb_panic_service() in a busy loop. Each call:
++ *   - handles the DWC3 events (polled; ep0 enumeration works, so a host that
++ *     connects after the panic still gets the link),
++ *   - answers ARP for 192.168.7.2 (the stack is dead; the host must still
++ *     resolve the phone's MAC to send a command),
++ *   - takes commands on UDP 5141 (ping, log, reboot, bootloader, recovery,
++ *     poweroff) and returns the requested action to the caller,
++ *   - sends one frame when the IN endpoint is free, in this order: the
++ *     command replies, the log frames that were still on the TX ring
++ *     (copied; mbufs are not freed), then the console ring (panic text,
++ *     register dump, backtrace) from where ud_log_thread stopped, as
++ *     UDP 192.168.7.2:5140 -> 192.168.7.1:5140 like the live log.
++ * Nothing waits for the host: a frame that the host does not take in 2 s is
++ * ended (ENDTRANSFER) and sent again, so no text is lost while the cable or
++ * the host is away. Boot-arg negronipanicusb=0 disables all of this.
++ */
++#define UD_PANIC_REPLIES        4
++#define UD_PANIC_RING_MAX       (1u << 20)      /* at most the last 1 MiB of console text */
++#define UD_PANIC_CHUNK          1400
++#define DEPCMD_ENDTRANSFER      8
++#define DEPCMD_FORCERM          (1u << 11)
++#define NEGRONI_PANIC_ACT_POWEROFF 0x100        /* also in negroni_reboot.c */
++
++bool negroni_usb_panic_begin(void);
++int negroni_usb_panic_service(bool busy);
++
++enum { UD_PREPLY_UDP = 1, UD_PREPLY_ARP = 2 };
++static struct {
++	uint8_t     kind;
++	uint8_t     mac[ETHER_ADDR_LEN];
++	uint8_t     ip[4];
++	uint16_t    port;
++	char        text[64];
++} ud_preply[UD_PANIC_REPLIES];
++static unsigned ud_preply_head, ud_preply_count;
++static bool     ud_panic_ok, ud_panic_busy;
++static int      ud_panic_action = -1;
++static uint64_t ud_panic_pos;           /* next console ring byte to send */
++static uint64_t ud_panic_tx_at;         /* start time of the frame on the IN endpoint */
++static uint64_t ud_panic_tx_timeout;    /* 2 s in absolute time units */
++static uint32_t ud_panic_tx_len;        /* its length (sent again after a timeout) */
++static uint32_t ud_panic_tx_rsc;        /* its transfer resource index (for ENDTRANSFER) */
++static unsigned ud_panic_txq_left;      /* frames of ud.txq not looked at yet */
++static uint32_t ud_panic_timeouts;
++static bool     ud_panic_host_seen;     /* a frame from 192.168.7.1 came since the last configuration */
++static bool     ud_panic_was_configured;
++static uint64_t ud_panic_conf_at;       /* time of that configuration */
++static uint64_t ud_panic_host_wait;     /* 10 s: then the ring is sent without a sign of the host */
++static uint64_t ud_panic_gap, ud_panic_last;    /* log frames at most one per 1 ms (1.4 MB/s) */
++static const uint8_t ud_host_ip[4] = { 192, 168, 7, 1 };
++
++static void
++ud_panic_queue(int kind, const uint8_t *mac, const uint8_t *ip, uint16_t port, const char *text)
++{
++	if (ud_preply_count == UD_PANIC_REPLIES) {
++		return;                         /* full: the host asks again */
++	}
++	unsigned i = (ud_preply_head + ud_preply_count) % UD_PANIC_REPLIES;
++	ud_preply[i].kind = (uint8_t)kind;
++	memcpy(ud_preply[i].mac, mac, ETHER_ADDR_LEN);
++	memcpy(ud_preply[i].ip, ip, 4);
++	ud_preply[i].port = port;
++	strlcpy(ud_preply[i].text, text != NULL ? text : "", sizeof(ud_preply[i].text));
++	ud_preply_count++;
++}
++
++/* One received frame in panic mode: ARP for 192.168.7.2, or a command on UDP 5141. */
++static void
++ud_panic_rx(const uint8_t *f, uint32_t len)
++{
++	uint16_t type = ud_be16(f + 12);
++
++	/*
++	 * Any ARP or IPv4 frame from 192.168.7.1 shows that the host has its
++	 * address (usblog.sh sends "settime" when the link comes up): only then
++	 * the console ring is sent, so the panic text does not go out before
++	 * the host can receive it.
++	 */
++	if ((type == ETHERTYPE_ARP && len >= ETHER_HDR_LEN + 28 && ud_be32(f + ETHER_HDR_LEN + 14) == UD_IP_HOST) ||
++	    (type == ETHERTYPE_IP && len >= ETHER_HDR_LEN + 20 && ud_be32(f + ETHER_HDR_LEN + 12) == UD_IP_HOST)) {
++		ud_panic_host_seen = true;
++	}
++	if (type == ETHERTYPE_ARP) {
++		const uint8_t *a = f + ETHER_HDR_LEN;
++		if (len >= ETHER_HDR_LEN + 28 && ud_be16(a) == 1 && ud_be16(a + 2) == ETHERTYPE_IP &&
++		    a[4] == ETHER_ADDR_LEN && a[5] == 4 && ud_be16(a + 6) == 1 && ud_be32(a + 24) == UD_IP_PHONE) {
++			ud_panic_queue(UD_PREPLY_ARP, a + 8, a + 14, 0, NULL);  /* sender MAC and IP */
++		}
++		return;
++	}
++	if (!ud.ctl_enabled || type != ETHERTYPE_IP || len < ETHER_HDR_LEN + 20 + 8) {
++		return;
++	}
++	const uint8_t *ip = f + ETHER_HDR_LEN;
++	uint32_t ihl = (ip[0] & 0xfu) * 4, tot = ud_be16(ip + 2);
++	if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != IPPROTO_UDP || tot < ihl + 8 ||
++	    ETHER_HDR_LEN + tot > len || (ud_be16(ip + 6) & 0x3fff) != 0) {
++		return;
++	}
++	const uint8_t *udp = ip + ihl;
++	uint32_t ulen = ud_be16(udp + 4);
++	if (ud_be32(ip + 16) != UD_IP_PHONE || ud_be16(udp + 2) != UD_CTL_PORT || ud_be32(ip + 12) != UD_IP_HOST ||
++	    ud_sum_fold(ud_sum_add(0, ip, ihl)) != 0 || ulen < 8 || ulen > tot - ihl) {
++		return;
++	}
++	char cmd[32];
++	uint32_t n = ulen - 8;
++	const uint8_t *p = udp + 8;
++	while (n > 0 && (p[n - 1] == '\n' || p[n - 1] == '\r' || p[n - 1] == ' ' ||
++	    p[n - 1] == '\t' || p[n - 1] == 0)) {
++		n--;
++	}
++	if (n >= sizeof(cmd)) {
++		n = sizeof(cmd) - 1;            /* too long: no command matches */
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		cmd[i] = (p[i] >= 0x20 && p[i] < 0x7f) ? (char)p[i] : '?';
++	}
++	cmd[n] = 0;
++
++	const char *reply;
++	char text[64];
++	int action = -1;
++	if (strcmp(cmd, "ping") == 0) {
++		reply = "pong (panic)";
++	} else if (strcmp(cmd, "log") == 0) {
++		uint64_t end = negroni_log_position();
++		ud_panic_pos = end > 65536 ? end - 65536 : 0;
++		reply = "ok log (panic)";
++	} else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "recovery") == 0 ||
++	    strcmp(cmd, "bootloader") == 0 || strcmp(cmd, "poweroff") == 0) {
++		if (ud_panic_busy || ud_panic_action >= 0) {
++			reply = "error: busy";
++		} else {
++			action = cmd[0] == 'r' ? (cmd[2] == 'b' ? 0 : 1) :
++			    cmd[0] == 'b' ? 2 : NEGRONI_PANIC_ACT_POWEROFF;
++			snprintf(text, sizeof(text), "ok %s (panic)", cmd);
++			reply = text;
++		}
++	} else if (strcmp(cmd, "panic") == 0) {
++		reply = "error: already in panic";
++	} else {
++		reply = "error: panic mode: ping log reboot bootloader recovery poweroff";
++	}
++	printf("NEGRONI PANIC CTL: \"%s\" -> %s\n", cmd, reply);
++	ud_panic_queue(UD_PREPLY_UDP, f + ETHER_ADDR_LEN, ip + 12, ud_be16(udp), reply);
++	if (action >= 0) {
++		ud_panic_action = action;
++	}
++}
++
++/* The frame in the TX buffer (len bytes) goes out on the IN endpoint. */
++static void
++ud_panic_tx_start(uint32_t len)
++{
++	uint8_t *buf = (uint8_t *)(ud.dma + UD_TX);
++
++	if ((len % 512) == 0) {
++		buf[len++] = 0;                 /* as ud_tx_kick_locked: no zero-length packet needed */
++	}
++	ud_panic_tx_len = len;
++	ud.tx_busy = true;
++	ud.tx_frames++;
++	ud_panic_tx_at = mach_absolute_time();
++	ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, len, TRBCTL_NORMAL);
++	ud_panic_tx_rsc = (dwc_rd(DEPCMD(EP_TX)) >> 16) & 0x7f;
++}
++
++/* A log frame from before the panic (UDP to 5140, or a 5141 reply): worth sending. */
++static bool
++ud_panic_is_log_frame(const uint8_t *f, uint32_t len)
++{
++	const uint8_t *ip = f + ETHER_HDR_LEN;
++	if (len < ETHER_HDR_LEN + 20 + 8 || ud_be16(f + 12) != ETHERTYPE_IP || ip[9] != IPPROTO_UDP) {
++		return false;
++	}
++	uint32_t ihl = (ip[0] & 0xfu) * 4;
++	if (ihl < 20 || ETHER_HDR_LEN + ihl + 8 > len) {
++		return false;
++	}
++	const uint8_t *udp = ip + ihl;
++	return ud_be16(udp + 2) == 5140 || ud_be16(udp) == UD_CTL_PORT;
++}
++
++static void
++ud_panic_tx_next(void)
++{
++	uint8_t *f = (uint8_t *)(ud.dma + UD_TX);
++
++	if (ud_preply_count > 0) {
++		unsigned i = ud_preply_head;
++		ud_preply_head = (ud_preply_head + 1) % UD_PANIC_REPLIES;
++		ud_preply_count--;
++		if (ud_preply[i].kind == UD_PREPLY_ARP) {
++			/* ARP reply: 192.168.7.2 is at 02:00:5e:77:ee:02 */
++			bzero(f, ETHER_HDR_LEN + 28);
++			memcpy(f, ud_preply[i].mac, ETHER_ADDR_LEN);
++			memcpy(f + ETHER_ADDR_LEN, ud_phone_mac, ETHER_ADDR_LEN);
++			ud_put16(f + 12, ETHERTYPE_ARP);
++			uint8_t *a = f + ETHER_HDR_LEN;
++			ud_put16(a, 1);
++			ud_put16(a + 2, ETHERTYPE_IP);
++			a[4] = ETHER_ADDR_LEN;
++			a[5] = 4;
++			ud_put16(a + 6, 2);
++			memcpy(a + 8, ud_phone_mac, ETHER_ADDR_LEN);
++			ud_put32(a + 14, UD_IP_PHONE);
++			memcpy(a + 18, ud_preply[i].mac, ETHER_ADDR_LEN);
++			memcpy(a + 24, ud_preply[i].ip, 4);
++			ud_panic_tx_start(ETHER_HDR_LEN + 28);
++		} else {
++			ud_panic_tx_start(ud_udp_build(f, ud_preply[i].mac, ud_preply[i].ip, UD_CTL_PORT,
++			    ud_preply[i].port, ud_preply[i].text, (uint32_t)strlen(ud_preply[i].text)));
++		}
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	if (!ud_panic_host_seen && now - ud_panic_conf_at < ud_panic_host_wait) {
++		return;                         /* the host may not have 192.168.7.1 yet */
++	}
++	if (now - ud_panic_last < ud_panic_gap) {
++		return;                         /* pace: the host's UDP receive buffer is not unlimited */
++	}
++	ud_panic_last = now;
++	while (ud_panic_txq_left > 0 && ud.txq_count > 0) {
++		mbuf_t m = ud.txq[ud.txq_head];
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++		ud_panic_txq_left--;
++		/* not freed: no allocator calls in panic context */
++		size_t len = mbuf_pkthdr_len(m);
++		if (len > ETHER_MAX_LEN - ETHER_CRC_LEN || mbuf_copydata(m, 0, len, f) != 0 ||
++		    !ud_panic_is_log_frame(f, (uint32_t)len)) {
++			continue;
+ 		}
++		ud_panic_tx_start((uint32_t)len);
++		return;
++	}
++	uint32_t n = negroni_log_copy(&ud_panic_pos, (char *)f + ETHER_HDR_LEN + 20 + 8, UD_PANIC_CHUNK);
++	if (n > 0) {
++		ud_panic_tx_start(ud_udp_build(f, ud_host_mac, ud_host_ip, 5140, 5140,
++		    f + ETHER_HDR_LEN + 20 + 8, n));
++	}
++}
++
++/* Once, from negroni_panic_restart(). false: no USB in this panic (not started, or negronipanicusb=0). */
++bool
++negroni_usb_panic_begin(void)
++{
++	if (ud_in_panic) {
++		return ud_panic_ok;
++	}
++	if (!ud_panic_enabled || !ud_running || ud.dwc == 0 || ud.dma == 0) {
++		return false;
++	}
++	ud_in_panic = true;
++	nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &ud_panic_tx_timeout);
++	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &ud_panic_host_wait);
++	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &ud_panic_gap);
++	/* the live log reached the host before the panic: no need to wait for it */
++	ud_panic_host_seen = ud.configured && ud.rx_frames > 0;
++	ud_panic_was_configured = ud.configured;
++	ud_panic_conf_at = mach_absolute_time();
++	uint64_t end = negroni_log_position(), from = ud_log_sent;
++	if (from > end || end - from > UD_PANIC_RING_MAX) {
++		from = end > UD_PANIC_RING_MAX ? end - UD_PANIC_RING_MAX : 0;
++	}
++	ud_panic_pos = from;
++	ud_panic_txq_left = ud.txq_count;
++	if (ud.tx_busy) {
++		/* a frame of the normal path is on the endpoint: give it the same 2 s */
++		volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
++		ud_sync(UD_TRB_TX, 16);
++		uint32_t len = t[2] & 0xffffff;
++		ud_panic_tx_len = (len > 0 && len < UD_FRAME_MAX) ? len : 0;
++		ud_panic_tx_rsc = (dwc_rd(DEPCMD(EP_TX)) >> 16) & 0x7f;
++		ud_panic_tx_at = mach_absolute_time();
++	}
++	ud_panic_ok = true;
++	kdb_printf("NEGRONI PANIC: USB %s: console ring %llu bytes to send, %u frames queued; "
++	    "commands on udp 192.168.7.2:%u %s\n", ud.configured ? "configured" : "not configured (waiting for the host)",
++	    end - from, ud.txq_count, UD_CTL_PORT, ud.ctl_enabled ? "on" : "off");
++	return true;
++}
++
++/*
++ * One step of the panic loop. busy: the caller still has an action to run
++ * (new reset commands get "error: busy"). Returns -1, a reboot reason
++ * (0 normal, 1 recovery, 2 bootloader) or NEGRONI_PANIC_ACT_POWEROFF.
++ */
++int
++negroni_usb_panic_service(bool busy)
++{
++	if (!ud_panic_ok) {
++		return -1;
++	}
++	ud_panic_busy = busy;
++	uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++	if (count > UD_EVT_SIZE) {
++		count = UD_EVT_SIZE;
++	}
++	if (count) {
++		ud_sync(UD_EVT, UD_EVT_SIZE);
++		for (uint32_t done = 0; done + 4 <= count; done += 4) {
++			uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++			ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++			dwc_wr(GEVNTCOUNT, 4);
++			ud_event(ev);
++		}
++	}
++	if (ud.configured != ud_panic_was_configured) {
++		ud_panic_was_configured = ud.configured;
++		if (ud.configured) {            /* (re)enumerated in panic mode: wait for the host's address */
++			ud_panic_host_seen = false;
++			ud_panic_conf_at = mach_absolute_time();
++		}
++	}
++	if (ud.tx_busy && mach_absolute_time() - ud_panic_tx_at > ud_panic_tx_timeout) {
++		/* The host did not take the frame in 2 s: end the transfer and start it again. */
++		(void)ud_epcmd(EP_TX, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | (ud_panic_tx_rsc << 16), 0, 0, 0);
++		ud_udelay(100);
++		ud.tx_busy = false;
++		ud_panic_timeouts++;
++		if (ud.configured && ud_panic_tx_len > 0) {
++			uint32_t len = ud_panic_tx_len;
++			ud.tx_frames--;
++			ud_panic_tx_start(len);
++		}
++	}
++	if (ud.configured && !ud.tx_busy) {
++		ud_panic_tx_next();
+ 	}
++	int action = ud_panic_action;
++	ud_panic_action = -1;
++	return action;
+ }
+ 
+ static void
+@@ -1254,6 +1701,8 @@ negroni_usb_gadget_start(vm_offset_t dwc)
+ 	PE_parse_boot_argn("negronictl", &ctl, sizeof(ctl));
+ 	PE_parse_boot_argn("negroniusb_resetdrop", &ud_reset_drop, sizeof(ud_reset_drop));
+ 	ud.ctl_enabled = ctl != 0 && ud.ifp != NULL;
++	PE_parse_boot_argn("negronipanicusb", &ud_panic_enabled, sizeof(ud_panic_enabled));
++	ud_running = true;              /* 0360: event buffer and ep0 are set up */
+ 	printf("NEGRONI CTL: commands on udp 192.168.7.2:%u %s (boot-arg negronictl)\n", UD_CTL_PORT,
+ 	    ud.ctl_enabled ? "on" : "off");
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+diff --git a/iokit/Kernel/arm/NegroniPlatformExpert.cpp b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+index 82f482f..917da69 100644
+--- a/iokit/Kernel/arm/NegroniPlatformExpert.cpp
++++ b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+@@ -35,7 +35,9 @@ OSDefineMetaClassAndStructors(NegroniPlatformExpert, IODTPlatformExpert);
+  *   kPERestartCPU       reboot reason of kern.negroni_reboot_mode (0213;
+  *                       default normal), PSCI SYSTEM_RESET
+  *   kPEPanicRestartCPU  panic text kept on the screen for negronipanic
+- *                       seconds (default 30), then reset
++ *                       seconds (default 0 = for ever), then reset
++ *   kPEPanicDiagnosticsDone  the same hold (0360): reached also when
++ *                       panicDebugging (debug=0x4) skips the restart
+  * kPEPanicBegin marks the panic; other types (panic callouts) do nothing.
+  */
+ extern "C" {
+@@ -81,6 +83,20 @@ negroni_halt_restart(unsigned int type)
+ 	case kPEPanicRestartCPU:
+ 		negroni_panic_restart();                /* does not return */
+ 		return -1;
++	case kPEPanicDiagnosticsDone:
++		/*
++		 * 0360: the panic log is complete (paniclog, backtraces, the
++		 * console ring copy). Hold the panic here: with debug=0x4
++		 * (DB_NMI) xnu sets panicDebugging, never sends
++		 * kPEPanicRestartCPU and spins in panic_spin_forever(), so
++		 * negronipanic=N never reset (the 2026-10-26 panics). The hold
++		 * loop sends the log over USB, takes ctl commands and runs the
++		 * timed reset.
++		 */
++		if (negroni_in_panic) {
++			negroni_panic_restart();        /* does not return */
++		}
++		return 0;
+ 	default:
+ 		return 0;
+ 	}

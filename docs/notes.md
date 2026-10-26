@@ -240,8 +240,23 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
     `/Applications/XNUtils.app/XNUtils`. Hook names (`POWERMENU`, `powermenu`) and `out/powermenu` stay.
     - [V] `build.sh` reproduces the owner's hand build byte for byte: unsigned `XNUtils` sha256 afaaebfa…1369,
       `XNUtils.app/XNUtils` (94288 B) sha256 246c5325…8283, same Info.plist and CodeResources.
-    - [V] The XNUtils main.m does not use the helper: Restart/Shut Down call `reboot()` as mobile ([I] no effect,
-      `suser()`), Bootloader starts `/usr/local/bin/usbreboot -f bootloader` as mobile. Not changed (owner's UI).
+    - [V] The owner's first XNUtils main.m did not use the helper: Restart/Shut Down called `reboot()` as mobile ([I] no
+      effect, `suser()`), Bootloader started `/usr/local/bin/usbreboot -f bootloader` as mobile (usbreboot.c:51 refuses
+      non-root). Fixed 2026-10-27 (owner: "make sure xnu utils has proper reboot power off"): main.m spawns
+      `/usr/local/libexec/powermenu-helper restart|shutdown|bootloader` (`run_helper()`, pipe for the output, alert on
+      exit != 0; exit 3 = no 0213 sysctl). [V by code] no `reboot()` / `usbreboot` left in main.m. Not run on the phone.
+    - **Hot toggles (2026-10-27, owner: "a hot toggle to enable and disable metal and other things").** Section
+      "GPU SWITCHES" in XNUtils: Metal all / probes / off (segmented), GL for backboardd, GL for apps, glFinish
+      (switches), Clear Metal strikes, Restart backboardd (apply). New helper verbs `metal all|probes|off`, `gl on|off`,
+      `glapps on|off`, `glfinish on|off`, `strikes-clear`, `restart-ui`, `status` (KEY=VALUE lines the app parses at
+      launch and after each change). Same files/owners/modes as `phone-metal.sh` / `phone-gl.sh`; atomic writes
+      (tmp + rename in the same dir, root:wheel 644; dirs 755, strikes/cache 1777); constant paths only; strict verbs.
+      The app shows the file state only (the UI says so): the plugins read the files at process start.
+      [V] `gl off` on a `*` gate: the old `phone-gl.sh off` (grep -vw backboardd) left `*` and so left GL on; the helper
+      and the updated `phone-gl.sh off` write the `-backboardd` never line, `on` removes it (tested locally with a
+      scratch file). [V] build.sh exit 0, codesign --verify ok, no weak imports. Install on the live phone:
+      `scripts/net/phone-add-powermenu.sh`. `root-add-powermenu.sh` now also installs `/usr/local/bin/pmregister`
+      (review FIX a). Not verified: the app on the phone (helper caller check as mobile, `restart-ui` kill, layout).
     - [I] A root that booted before keeps PowerMenu.app in its LaunchServices database: run
       `scripts/net/phone-add-powermenu.sh --register-only` (or the full install) on the phone.
 

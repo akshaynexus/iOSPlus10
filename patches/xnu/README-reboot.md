@@ -351,6 +351,11 @@ SoC drop PS_HOLD with PSCI `SYSTEM_RESET`. The PMIC then powers off instead of a
 
 A panic stays on the screen for ever, as before 0211 (owner's choice). `negronipanic=30` resets after 30 s.
 
+0360 (README-panic.md): with `debug=0x4` (DB_NMI) xnu never sent `kPEPanicRestartCPU`, so before
+0360 `negronipanic=N` did not reset at all (2026-10-26). 0360 enters the hold loop at
+`kPEPanicDiagnosticsDone`, busy-waits on `mach_absolute_time()`, sends the panic log over USB and
+keeps the command server (`ping`, `log`, `reboot`, `bootloader`, `recovery`, `poweroff`) working.
+
 ### Log lines (0211)
 
 ```
