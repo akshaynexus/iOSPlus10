@@ -1,0 +1,963 @@
+0325-negroni-wlan-smmu3-default: Wi-Fi, negroniwlan_smmu=3 (the 0324 stage-1 context) is the default when negroniwlan>=2.
+SMMU (negroni_wlan_smmu.c rewritten): context bank by the U-Boot qcom-hyp-smmu.c rule (CBAR S2_TRANS, or
+S1_TRANS_S2_BYPASS with VMID 0xff) + SCTLR.M off + no valid S2CR into it; CBAR S1_TRANS_S2_BYPASS VMID 0, CBA2R
+VA64, TCR/TCR2/MAIR, SCTLR with Android's fault attributes (HUPCF, no CFRE, no stall); S2CR then SMR; every write
+read back; SMR 0x1c00 mask 1 (or reuse of an SMR that matches 0x1c01); old CBAR/CBA2R/SMR/S2CR restored on the
+failure path; fault line with FSR/FAR/FSYNR0/FSYNR1/CBFRSYNRA + sGFSR/sGFSYNR0-2 decoded (heartbeats, each level,
+failure); unmap. Chain (negroni_wlan.c, _mhi.c, _bhi.c, _qmi.c): PCIe BDF-to-SID table programmed like pci-msm.c
+(BDF 0x100 -> SID 0x1c01), ASPM off on both ends for the download (ath11k), MHI CTRL/DATA window = the IOVA window
+(cnss2), no physical address with policy 3, firmware segments unmapped before free. Writes the apps SMMU and the
+PCIe PARF SID table: owner-approved. Details: patches/xnu/README-wifi.md "0325".
+
+diff --git a/bsd/dev/negroni_wlan.c b/bsd/dev/negroni_wlan.c
+index 3c4394e..0f371f2 100644
+--- a/bsd/dev/negroni_wlan.c
++++ b/bsd/dev/negroni_wlan.c
+@@ -32,6 +32,7 @@
+ #include "negroni_wlan_qrtr.h"
+ #include "negroni_wlan_ce.h"
+ #include "negroni_wlan_wmi.h"
++#include "negroni_mmio.h"      /* 0325: PARF BDF-to-SID access before the step-6 include below */
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+@@ -122,8 +123,11 @@ static struct mhi_host H;
+ static uint32_t g_timeout_ms = 10000;   /* cnss2 MHI time-out 10 s (ath11k 20 s) */
+ static uint32_t g_m3_size;              /* m3.bin bytes, at g_pool_pa + OFF_M3 (for stage 2) */
+ static uint32_t g_level = WLAN_LEVEL_SBL;       /* boot-arg negroniwlan */
+-static uint32_t g_smmu_policy = 1;      /* negroniwlan_smmu: 0 report only, 1 stop on a sure fault, 2 add a bypass entry,
+-                                         * 3 (0324) a stage-1 context with Android's IOVA window */
++/*
++ * negroniwlan_smmu: 0 report only, 1 stop on a sure fault, 2 add a bypass entry (the hypervisor turns it into FAULT),
++ * 3 (0324; the default since 0325) a stage-1 context with Android's IOVA window, every chip address an IOVA
++ */
++static uint32_t g_smmu_policy = 3;
+ static struct negroni_wlan_pcie P;      /* the survey's handles */
+ static uint32_t g_fw_size;
+ static const char *g_fw;
+@@ -244,12 +248,22 @@ negroni_wlan_dma_map(uint64_t pa, uint32_t size)
+ 	if (size == 0 || pa + size - 1 > MHI_DMA_MASK) {
+ 		return WLAN_DMA_NONE;
+ 	}
+-	if (g_smmu_policy == 3 && negroni_wlan_smmu_active()) {
+-		return negroni_wlan_smmu_map(pa, size);         /* 0324 */
++	if (g_smmu_policy == 3) {
++		/* 0325: never a physical address while the policy is 3 (no context = no address) */
++		return negroni_wlan_smmu_active() ? negroni_wlan_smmu_map(pa, size) : WLAN_DMA_NONE;
+ 	}
+ 	return pa;
+ }
+ 
++/* 0325: a buffer the chip had an address for goes away (identity mappings need nothing) */
++void
++negroni_wlan_dma_unmap(uint64_t dva, uint32_t size)
++{
++	if (g_smmu_policy == 3 && dva != WLAN_DMA_NONE) {
++		negroni_wlan_smmu_unmap(dva, size);
++	}
++}
++
+ /* 0320: sleep, so a poller does not hold a core (delay() spins in this XNU) */
+ void
+ negroni_wlan_nap(uint32_t ms)
+@@ -324,6 +338,7 @@ wlan_keep_alive(void)
+ 			next_log = now + 60000;
+ 			printf("NEGRONI WLAN: keep-alive %llu s: %u MHI events, %u IPCR packets, %u M1 seen\n",
+ 			    (now - start) / 1000, H.events - ev0, H.rx_packets - rx0, H.m1_seen);
++			(void)negroni_wlan_smmu_check("keep-alive");    /* 0325: a line only when a fault appeared */
+ 		}
+ 		if (g_keep_s && now - start >= (uint64_t)g_keep_s * 1000) {
+ 			printf("NEGRONI WLAN: keep-alive ends after %u s (negroniwlan_keep); the chip keeps running\n", g_keep_s);
+@@ -406,6 +421,98 @@ wlan_bar0(struct negroni_wlan_pcie *p)
+ 	return 0;
+ }
+ 
++/*
++ * 0325: ASPM off on both link ends during the firmware download (ath11k pci.c:828-831 ath11k_pci_aspm_disable:
++ * "problems switching to AMSS state"). LNKCTL bits 1:0 = ASPM L0s/L1 control. Only the low 16 bits are written
++ * (LNKSTA above them has RW1C bits). Endpoint: the PCIe capability (ID 0x10) from the list at 0x34; root port:
++ * DBI 0x70 + 0x10 (negroni_wifi.c DBI_LNKCTL2 comment).
++ */
++static void
++wlan_aspm_off(struct negroni_wlan_pcie *p)
++{
++	volatile uint32_t *cfg = (volatile uint32_t *)p->cfg_bus1;
++	uint32_t ep = MHI_ALL_ONES, rp = MHI_ALL_ONES, cap = 0;
++
++	for (uint32_t ptr = cfg[0x34 / 4] & 0xfcu, guard = 48; ptr >= 0x40 && guard--; ) {
++		uint32_t h = cfg[ptr / 4];
++		if ((h & 0xffu) == 0x10u) {
++			cap = ptr;
++			break;
++		}
++		ptr = (h >> 8) & 0xfcu;
++	}
++	if (cap) {
++		ep = cfg[(cap + 0x10) / 4];
++		if (ep != MHI_ALL_ONES && (ep & 3u)) {
++			cfg[(cap + 0x10) / 4] = ep & 0xfffcu;
++		}
++	}
++	if (p->dbi) {
++		volatile uint32_t *lc = (volatile uint32_t *)(p->dbi + 0x80);
++		rp = *lc;
++		if (rp != MHI_ALL_ONES && (rp & 3u)) {
++			*lc = rp & 0xfffcu;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("NEGRONI WLAN: ASPM: endpoint LNKCTL %#x (cap %#x) -> ASPM %u, root port LNKCTL %#x -> ASPM %u (off for the "
++	    "download, ath11k)\n", ep & 0xffffu, cap, cap ? cfg[(cap + 0x10) / 4] & 3u : 9u, rp & 0xffffu,
++	    p->dbi ? *(volatile uint32_t *)(p->dbi + 0x80) & 3u : 9u);
++}
++
++/*
++ * 0325: the PCIe controller's BDF-to-SID table (pci-msm.c msm_pcie_config_sid, called on every link enable):
++ * the survey's core reset (step 7) puts it back to reset state, BYPASS on. Android writes BYPASS off, zeroes the
++ * 256 hash entries and puts BDF 0x0100 -> SID offset 1 (iommu-map 0x100 -> 0x1c01, smmu-sid-base 0x1c00) at
++ * crc8(BDF big endian, poly 0x07, MSB first). RID 0 -> offset 0 is the value 0 = an empty entry. Only with
++ * negroniwlan_smmu=3 (the SMR then matches 0x1c00/0x1c01 anyway, see negroni_wlan_smmu.c).
++ */
++#define PARF_BDF_TO_SID_TABLE   0x2000u
++#define PARF_BDF_TO_SID_CFG     0x2c00u         /* bit 0: BYPASS */
++#define WLAN_EP_BDF             0x0100u
++
++static uint8_t
++crc8_msb07(const uint8_t *b, uint32_t n)
++{
++	uint8_t c = 0;
++
++	while (n--) {
++		c ^= *b++;
++		for (int i = 0; i < 8; i++) {
++			c = (uint8_t)((c & 0x80) ? (c << 1) ^ 0x07 : c << 1);
++		}
++	}
++	return c;
++}
++
++static void
++wlan_pcie_sid(bool program)
++{
++	if (!P.parf) {
++		printf("NEGRONI WLAN: no PARF handle; BDF-to-SID table not checked\n");
++		return;
++	}
++	uint32_t cfg = negroni_mmio_rd32(P.parf + PARF_BDF_TO_SID_CFG);
++	uint8_t be[2] = { WLAN_EP_BDF >> 8, WLAN_EP_BDF & 0xff };
++	uint32_t hash = crc8_msb07(be, 2), val = WLAN_EP_BDF << 16 | 1u << 8;
++
++	printf("NEGRONI WLAN: PCIe BDF-to-SID: CFG %#x (BYPASS %u), entry %#x = %#x\n", cfg, cfg & 1u, hash,
++	    negroni_mmio_rd32(P.parf + PARF_BDF_TO_SID_TABLE + 4 * hash));
++	if (!program) {
++		return;
++	}
++	negroni_mmio_wr32(P.parf + PARF_BDF_TO_SID_CFG, cfg & ~1u);
++	for (uint32_t i = 0; i < 256; i++) {
++		negroni_mmio_wr32(P.parf + PARF_BDF_TO_SID_TABLE + 4 * i, 0);
++	}
++	negroni_mmio_wr32(P.parf + PARF_BDF_TO_SID_TABLE + 4 * hash, val);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t got = negroni_mmio_rd32(P.parf + PARF_BDF_TO_SID_TABLE + 4 * hash);
++	cfg = negroni_mmio_rd32(P.parf + PARF_BDF_TO_SID_CFG);
++	printf("NEGRONI WLAN: PCIe BDF-to-SID programmed: CFG %#x, entry %#x = %#x (BDF %#x -> SID 0x1c00 + 1)%s\n", cfg,
++	    hash, got, WLAN_EP_BDF, (got == val && !(cfg & 1u)) ? "" : " - DID NOT TAKE, the chip may use SID 0x1c00");
++}
++
+ /* Turn off bus mastering: from here on the chip cannot read or write host memory (PCIe BME). */
+ static void
+ wlan_quiesce(struct negroni_wlan_pcie *p)
+@@ -625,6 +732,7 @@ wlan_dma_path(void)
+ 		           vote);
+ 	}
+ 
++	wlan_pcie_sid(g_smmu_policy == 3);     /* 0325: which SID the chip's DMA carries */
+ 	if (g_smmu_policy == 3) {
+ 		return negroni_wlan_smmu_on();  /* 0324: our own translation context, no bypass entry */
+ 	}
+@@ -737,6 +845,7 @@ wlan_level_sbl(void)
+ 		return error;   /* no DMA address was given yet */
+ 	}
+ 	g_master = true;
++	wlan_aspm_off(&P);      /* 0325 */
+ 	H.bar = g_bar0;
+ 	H.bar_len = g_bar_len;
+ 	H.timeout_ms = g_timeout_ms;
+@@ -991,6 +1100,7 @@ wlan_run(void)
+ 			break;
+ 		}
+ 		printf("NEGRONI WLAN: level %u done (step %u)\n", lvl, g_step);
++		negroni_wlan_smmu_report();     /* 0325: one SMMU line per level (also "no fault") */
+ 	}
+ 	if (!error) {
+ 		snprintf(negroni_wifi_badge, sizeof(negroni_wifi_badge), "WLAN OK %u", MIN(g_level, (uint32_t)WLAN_LEVEL_MAX));
+diff --git a/bsd/dev/negroni_wlan_bhi.c b/bsd/dev/negroni_wlan_bhi.c
+index f0bc930..ce7a5e3 100644
+--- a/bsd/dev/negroni_wlan_bhi.c
++++ b/bsd/dev/negroni_wlan_bhi.c
+@@ -41,6 +41,7 @@ bhi_wait(struct mhi_host *h, uint32_t status_off, uint32_t bhi_err, const char *
+ 			printf("NEGRONI WLAN: %s waiting %llu ms, status %#x, EE %u, MHISTATUS %#x\n", what,
+ 			    negroni_wlan_ms() - start, reg, negroni_wlan_rd(h->bhi + BHI_EXECENV),
+ 			    negroni_wlan_rd(MHI_STATUS));
++			(void)negroni_wlan_smmu_check(what);    /* 0325: a context fault explains a stuck transfer */
+ 			beat += 1000;
+ 		}
+ 		if (st == BHI_ST_DONE) {
+diff --git a/bsd/dev/negroni_wlan_mhi.c b/bsd/dev/negroni_wlan_mhi.c
+index 1109630..4c1e2cd 100644
+--- a/bsd/dev/negroni_wlan_mhi.c
++++ b/bsd/dev/negroni_wlan_mhi.c
+@@ -191,13 +191,15 @@ negroni_wlan_mhi_init(struct mhi_host *h)
+ 	 * 36-bit DMA mask (op-kernel cnss2/pci.c:5509-5510); patch 0263 does the same, because the
+ 	 * QRTR buffers and the QMI firmware memory (stages 4-6) are separate allocations.
+ 	 */
+-	mhi_write64(MHI_CTRLBASE, 0);
+-	mhi_write64(MHI_DATABASE, 0);
+-	mhi_write64(MHI_CTRLLIMIT, MHI_DMA_MASK);
+-	mhi_write64(MHI_DATALIMIT, MHI_DMA_MASK);
++	uint64_t wbase = 0, wlimit = MHI_DMA_MASK;
++	(void)negroni_wlan_smmu_window(&wbase, &wlimit);       /* 0325: with the SMMU, the IOVA window (cnss2 pci.c:5505) */
++	mhi_write64(MHI_CTRLBASE, wbase);
++	mhi_write64(MHI_DATABASE, wbase);
++	mhi_write64(MHI_CTRLLIMIT, wlimit);
++	mhi_write64(MHI_DATALIMIT, wlimit);
+ 	h->mmio_set = true;
+-	printf("NEGRONI WLAN: MHI ctx ch %#llx ev %#llx cmd %#llx, chdboff %#x erdboff %#x\n",
+-	    ch_ctx_pa, ev_ctx_pa, cmd_ctx_pa, h->chdb, h->erdb);
++	printf("NEGRONI WLAN: MHI ctx ch %#llx ev %#llx cmd %#llx, chdboff %#x erdboff %#x, window %#llx-%#llx\n",
++	    ch_ctx_pa, ev_ctx_pa, cmd_ctx_pa, h->chdb, h->erdb, wbase, wlimit);
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/negroni_wlan_mhi.h b/bsd/dev/negroni_wlan_mhi.h
+index 00f857d..b14e7e3 100644
+--- a/bsd/dev/negroni_wlan_mhi.h
++++ b/bsd/dev/negroni_wlan_mhi.h
+@@ -207,6 +207,11 @@ bool negroni_wlan_smmu_active(void);
+ uint64_t negroni_wlan_smmu_map(uint64_t pa, uint32_t size);
+ void negroni_wlan_smmu_report(void);
+ void negroni_wlan_smmu_off(void);
++/* 0325: negroniwlan_smmu=3 is the default; unmap, the MHI window, a fault check for heartbeats */
++void negroni_wlan_dma_unmap(uint64_t dva, uint32_t size);
++void negroni_wlan_smmu_unmap(uint64_t iova, uint32_t size);
++bool negroni_wlan_smmu_window(uint64_t *base, uint64_t *limit);
++bool negroni_wlan_smmu_check(const char *where);
+ /* 0320: sleep (not spin) for `ms` milliseconds; for the keep-alive poller and the later levels */
+ void negroni_wlan_nap(uint32_t ms);
+ /* 0320: one service pass: MHI events, QRTR packets (QMI indications) and the registered pollers */
+diff --git a/bsd/dev/negroni_wlan_qmi.c b/bsd/dev/negroni_wlan_qmi.c
+index 72e75fe..cd7110f 100644
+--- a/bsd/dev/negroni_wlan_qmi.c
++++ b/bsd/dev/negroni_wlan_qmi.c
+@@ -586,6 +586,7 @@ negroni_wlan_wlfw_free(void)
+ {
+ 	for (uint32_t i = 0; i < W.nseg; i++) {
+ 		if (W.seg[i].kva) {
++			negroni_wlan_dma_unmap(W.seg[i].dva, W.seg[i].alloc);  /* 0325: no IOVA left on freed pages */
+ 			flush_dcache64((addr64_t)W.seg[i].pa, W.seg[i].alloc, TRUE);
+ 			kmem_free(kernel_map, W.seg[i].kva, W.seg[i].alloc);
+ 		}
+diff --git a/bsd/dev/negroni_wlan_smmu.c b/bsd/dev/negroni_wlan_smmu.c
+index 1d19200..91fe272 100644
+--- a/bsd/dev/negroni_wlan_smmu.c
++++ b/bsd/dev/negroni_wlan_smmu.c
+@@ -1,20 +1,29 @@
+ /*
+- * NEGRONI QCA6490 Wi-Fi (patch 0324): an apps-SMMU stage-1 context for the WLAN PCIe stream 0x1c01, opt-in
+- * with boot-arg negroniwlan_smmu=3.
++ * NEGRONI QCA6490 Wi-Fi (patches 0324, 0325): an apps-SMMU stage-1 context for the WLAN PCIe stream.
++ * Default with negroniwlan>=2 since 0325 (negroniwlan_smmu=3); negroniwlan_smmu=0/1 keep the old report-only path.
+  *
+  * Why: XNU's RAM starts at 0x840000000, so every buffer the 0261-0323 code gives the chip is above 4 GiB.
+- * Android gives this chip IOVAs from 0xa0000000 + 256 MiB (out/live.dts:20856 qcom,iommu-dma-addr-pool, SMMU
+- * S1 "fastmap"), Linux ath11k a 32-bit coherent mask (pci.c:24); nobody has shown the QCA6490 firmware uses
+- * address bits 32-35 (docs/audit/2026-10-26-wifi.md section 2.1). With negroniwlan_smmu=3 the chip sees the
+- * same window as on Android: each host buffer is mapped page by page at the next free IOVA from 0xa0000000,
+- * and the stream goes through a translation context we own. Without the boot-arg nothing here runs.
++ * Android gives this chip IOVAs from 0xa0000000 + 256 MiB (out/live.dts cnss_pci_iommu_group:
++ * qcom,iommu-dma-addr-pool, qcom,iommu-dma = "fastmap", qcom,iommu-pagetable = "coherent", qcom,iommu-faults =
++ * "stall-disable", "HUPCF", "no-CFRE", "non-fatal"). The hypervisor (Gunyah) turns an S2CR BYPASS into FAULT
++ * (Linux arm-smmu-qcom.c bypass quirk, U-Boot qcom-hyp-smmu.c), so the only way for the chip to reach RAM is a
++ * translation context. Each host buffer is mapped page by page at the next free IOVA from 0xa0000000.
+  *
+- * How (Linux arm-smmu.c / io-pgtable-arm.c order, as the GPU code of patch 0233 in negroni_adreno.c does it
+- * on the adreno SMMU of this SoC): a context bank nobody uses (SCTLR.M = 0, no S2CR translates into it), its
+- * own 3-level 4 KiB page tables (39-bit input, 36-bit output), MAIR/TCR/TTBR0, TLB invalidate + sync, SCTLR
+- * on, then S2CR -> the context and the SMR for stream 0x1c01 (an SMR that already matches the stream is
+- * reused and restored on the failure path). Every write is read back: the hypervisor (Gunyah) emulates the
+- * global space and may refuse it; then the step stops before any DMA. UNTESTED ON HARDWARE.
++ * Stream: PCIe0 has qcom,smmu-sid-base 0x1c00 and iommu-map RID 0x100 -> 0x1c01 (RID 0 -> 0x1c00). The PCIe
++ * controller makes the SID from its BDF-to-SID table (pci-msm.c msm_pcie_config_sid), which the survey's core
++ * reset clears; negroni_wlan.c programs it again (0325). The SMR covers 0x1c00 and 0x1c01 (mask 1) when no
++ * other SMR covers either, so a table that did not take still matches.
++ *
++ * Context bank choice (U-Boot qcom-hyp-smmu.c alloc_cb + Linux arm-smmu.c): CBAR type S2_TRANS, or
++ * S1_TRANS_S2_BYPASS with VMID 0xff (unused); and SCTLR.M = 0; and no valid SMR whose S2CR translates into it.
++ * Programming (Linux arm_smmu_write_context_bank order): SCTLR 0, CBA2R VA64, CBAR S1_TRANS_S2_BYPASS VMID 0,
++ * TCR2, TCR, TTBR0/1, MAIR0/1, FSR clear, TLBIASID + sync, SCTLR on (M TRE AFE HUPCF ASIDPNE; no CFRE, no CFIE,
++ * CFCFG 0 = no stall: Android's fault attributes), then S2CR -> context, then SMR (arm_smmu_write_sme order).
++ * Every write is read back. Faults: context FSR/FAR/FSYNR0/FSYNR1/CBFRSYNRA and global sGFSR/sGFSYNR0-2
++ * are decoded at every heartbeat, at the end of each level and on the failure path.
++ *
++ * Every access is one plain 32-bit ldr/str (negroni_mmio.h, 0255): Gunyah emulates the global space and
++ * injects a synchronous external abort on a writeback, pair, 64-bit or WZR access. UNTESTED ON HARDWARE.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -22,6 +31,7 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include "negroni_mmio.h"
+@@ -34,22 +44,38 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern vm_map_address_t phystokv(uint64_t pa);  /* osfmk/arm/pmap/pmap.h */
+ 
+ #define APPS_SMMU_PHYS          0x15000000u
+-#define APPS_SMMU_SIZE          0x100000u       /* live.dts:15352 */
++#define APPS_SMMU_SIZE          0x100000u       /* live.dts apps-smmu reg */
+ #define WLAN_WIMG_IO            0x7u
+-#define WLAN_SID                0x1c01u
+-#define IOVA_BASE               0xa0000000ull   /* live.dts:20856, as Android */
++#define WLAN_SID_EP             0x1c01u         /* RID 0x100 (bus 1, the QCA6490) */
++#define WLAN_SID_RC             0x1c00u         /* RID 0 (root port) */
++#define IOVA_BASE               0xa0000000ull   /* live.dts qcom,iommu-dma-addr-pool, as Android */
+ #define IOVA_SIZE               0x10000000ull
+ 
++/* global space 0 */
+ #define SMMU_SCR0               0x000
+ #define SMMU_SCR0_EXIDENABLE    (1u << 3)
+ #define SMMU_IDR0               0x020
+ #define SMMU_IDR1               0x024
+ #define SMMU_SGFSR              0x048
++#define SMMU_SGFSYNR0           0x050
++#define SMMU_SGFSYNR1           0x054
++#define SMMU_SGFSYNR2           0x058
+ #define SMMU_SMR(n)             (0x800u + 4u * (n))
+ #define SMMU_S2CR(n)            (0xc00u + 4u * (n))
+ #define SMMU_SMR_VALID          (1u << 31)
+-#define SMMU_CBAR(n)            (4u * (n))              /* in global page 1 */
+-#define SMMU_CBA2R(n)           (0x800u + 4u * (n))     /* in global page 1 */
++/* global space 1 (one page after space 0) */
++#define SMMU_CBAR(n)            (4u * (n))
++#define SMMU_CBFRSYNRA(n)       (0x400u + 4u * (n))
++#define SMMU_CBA2R(n)           (0x800u + 4u * (n))
++#define CBAR_TYPE(v)            (((v) >> 16) & 3u)
++#define CBAR_VMID(v)            ((v) & 0xffu)
++#define CBAR_TYPE_S2_TRANS      0u
++#define CBAR_TYPE_S1_S2_BYPASS  1u
++#define VMID_UNUSED             0xffu           /* U-Boot qcom-hyp-smmu.c */
++/* S1_TRANS_S2_BYPASS (type 1), BPSHCFG 3 (non-shareable), MEMATTR 0xf (WB), VMID 0 (U-Boot, Linux arm-smmu) */
++#define CBAR_S1                 (1u << 16 | 0xfu << 12 | 3u << 8)
++#define CBA2R_VA64              1u
++/* context bank page */
+ #define CB_SCTLR                0x00
+ #define CB_TCR2                 0x10
+ #define CB_TTBR0                0x20
+@@ -60,26 +86,38 @@ extern vm_map_address_t phystokv(uint64_t pa);  /* osfmk/arm/pmap/pmap.h */
+ #define CB_FSR                  0x58
+ #define CB_FAR                  0x60
+ #define CB_FSYNR0               0x68
++#define CB_FSYNR1               0x6c
+ #define CB_TLBIASID             0x610
+ #define CB_TLBSYNC              0x7f0
+ #define CB_TLBSTATUS            0x7f4
+-/* the values of negroni_adreno.c (0233), which program an MMU-500 context on this SoC */
+-#define CBAR_S1                 (1u << 16 | 3u << 8 | 0xfu << 12)
+-#define SCTLR_ON                (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 12)
++/*
++ * SCTLR: M (0), TRE (1), AFE (2), HUPCF (8, "HUPCF"), ASIDPNE (12). Not set: CFRE (5, Android "no-CFRE": a
++ * faulting access completes as read-zero / write-ignored instead of an abort to the chip), CFIE (6, nobody takes
++ * the interrupt), CFCFG (7, "stall-disable": terminate, never stall).
++ */
++#define SCTLR_ON                (1u << 0 | 1u << 1 | 1u << 2 | 1u << 8 | 1u << 12)
++/* TCR: T0SZ 25 (39-bit IOVA), IRGN0/ORGN0 WBWA, SH0 inner shareable ("coherent" walk), TG0 4 KiB, EPD1 */
+ #define TCR_39                  (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
++/* TCR2: PASIZE 36 bit, AS (16-bit ASID), SEP upstream */
+ #define TCR2_36                 (1u | 1u << 4 | 7u << 15)
+-#define MAIR0                   0xf404ff44u     /* index 0 = Normal non-cacheable (our CPU view is NC too) */
++#define MAIR0                   0xf404ff44u     /* Linux io-pgtable: 0 Normal NC, 1 WBWA, 2 Device nGnRE */
+ #define FSR_ALL                 0xc00001feu
+-/* page entry (io-pgtable-arm.c): page | AF | outer shareable | AP unprivileged (device DMA) | nG */
++/* page entry (io-pgtable-arm.c, non-cacheable buffer): page | AttrIndx 0 (NC) | AP unprivileged | SH outer | AF | nG */
+ #define PTE_VALID               3ull
+-#define PTE_ATTR                ((1ull << 10) | (2ull << 8) | (1ull << 6) | (1ull << 11))   /* SH outer (io-pgtable-arm NC) */
++#define PTE_ATTR                ((1ull << 6) | (2ull << 8) | (1ull << 10) | (1ull << 11))
+ #define PTE_ADDR                0x0000fffffffff000ull
+-#define TABLE_PAGES             48u             /* 16 KiB kernel pages, 4 tables each: 192 tables */
++/*
++ * 16 KiB kernel pages, 4 tables each: 192 tables. The whole IOVA window 0xa0000000-0xafffffff lies in one level-1
++ * entry, so mapping all of it takes 1 root + 1 level-2 + 128 level-3 tables = 130 (each level-3 table maps 2 MiB):
++ * HTT rings, CE and RX buffers can never run out of tables before the 256 MiB window itself is full.
++ */
++#define TABLE_PAGES             48u
+ 
+ static vm_offset_t g_smmu;
+ static uint32_t g_page, g_pages, g_ctx_n, g_smr_n;
+-static uint32_t g_cb = ~0u, g_smr = ~0u, g_old_smr, g_old_s2cr;
+-static bool g_on, g_smr_reused;
++static uint32_t g_cb = ~0u, g_smr = ~0u, g_smr_val, g_old_smr, g_old_s2cr, g_old_cbar, g_old_cba2r;
++static bool g_on, g_smr_reused, g_cb_written, g_sme_written;
++static uint32_t g_gfsr0, g_last_fsr, g_last_gfsr, g_fault_lines;
+ static uint64_t g_next = IOVA_BASE;
+ static vm_offset_t g_tpage[TABLE_PAGES];
+ static uint32_t g_tpages, g_tleft;
+@@ -87,26 +125,41 @@ static uint64_t *g_root;
+ static uint64_t g_root_pa;
+ static uint32_t g_mapped_pages;
+ 
+-/*
+- * Every access to the apps SMMU is one plain 32-bit ldr/str (negroni_mmio.h, 0255): Gunyah emulates the
+- * global space and injects a synchronous external abort on a writeback, pair, 64-bit or WZR access.
+- */
+ #define SR(o)           negroni_mmio_rd32(g_smmu + (o))
+ #define SW(o, v)        negroni_mmio_wr32(g_smmu + (o), (v))
++#define GR1(o)          (g_page + (o))
++#define CB(o)           ((g_pages + g_cb) * g_page + (o))
+ 
+-/* write, read back, compare (as slop 0105 put()): a refused write stops the step before any DMA */
++/*
++ * Write, read back, compare (as slop 0105 put()). Bits in `must` that do not read back stop the step before
++ * any DMA; other differences are printed and kept (redwood: "everything read back as written but two bits").
++ */
+ static int
+-sr_put(const char *name, uint32_t off, uint32_t v)
++sr_put(const char *name, uint32_t off, uint32_t v, uint32_t must)
+ {
+ 	SW(off, v);
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	uint32_t got = SR(off);
+-	if (got != v) {
++	if ((got ^ v) & must) {
+ 		return negroni_wlan_failed(EPERM, "SMMU %s reads %#x after writing %#x (the hypervisor refused it?)", name, got, v);
+ 	}
++	if (got != v) {
++		printf("NEGRONI WLAN: SMMU %s reads %#x after writing %#x (bits %#x not kept; not needed)\n", name, got, v,
++		    got ^ v);
++	}
+ 	return 0;
+ }
+ 
++static void
++smmu_tlb_sync(uint32_t us_max)
++{
++	SW(CB(CB_TLBIASID), g_cb);
++	SW(CB(CB_TLBSYNC), 1);
++	for (uint32_t i = 0; i < us_max && (SR(CB(CB_TLBSTATUS)) & 1); i++) {
++		delay(1);
++	}
++}
++
+ static void
+ tbl_flush(const void *p, size_t n)
+ {
+@@ -134,13 +187,16 @@ tbl_new(uint64_t *pa_out)
+ }
+ 
+ static uint64_t *
+-tbl_next(uint64_t *entry)
++tbl_next(uint64_t *entry, bool make)
+ {
+ 	uint64_t pa;
+ 
+ 	if (*entry & 1) {
+ 		return (uint64_t *)phystokv(*entry & PTE_ADDR);
+ 	}
++	if (!make) {
++		return NULL;
++	}
+ 	uint64_t *t = tbl_new(&pa);
+ 	if (t) {
+ 		*entry = pa | PTE_VALID;
+@@ -149,19 +205,13 @@ tbl_next(uint64_t *entry)
+ 	return t;
+ }
+ 
+-static bool
+-map_page(uint64_t iova, uint64_t pa)
++static uint64_t *
++pte_of(uint64_t iova, bool make)
+ {
+-	uint64_t *l2 = tbl_next(&g_root[(iova >> 30) & 0x1ff]);
+-	uint64_t *l3 = l2 ? tbl_next(&l2[(iova >> 21) & 0x1ff]) : NULL;
++	uint64_t *l2 = tbl_next(&g_root[(iova >> 30) & 0x1ff], make);
++	uint64_t *l3 = l2 ? tbl_next(&l2[(iova >> 21) & 0x1ff], make) : NULL;
+ 
+-	if (!l3) {
+-		return false;
+-	}
+-	uint64_t *e = &l3[(iova >> 12) & 0x1ff];
+-	*e = (pa & PTE_ADDR) | PTE_ATTR | PTE_VALID;
+-	tbl_flush(e, sizeof(*e));
+-	return true;
++	return l3 ? &l3[(iova >> 12) & 0x1ff] : NULL;
+ }
+ 
+ /* the chip's IOVA for `size` contiguous bytes at `pa` (negroni_wlan_dma_map with negroniwlan_smmu=3) */
+@@ -171,61 +221,183 @@ negroni_wlan_smmu_map(uint64_t pa, uint32_t size)
+ 	uint64_t span = ((pa & 0xfff) + size + 0xfff) & ~0xfffull, iova = g_next;
+ 
+ 	if (!g_on || size == 0 || iova + span > IOVA_BASE + IOVA_SIZE) {
++		printf("NEGRONI WLAN: SMMU map of %#x bytes at %#llx refused (%s)\n", size, pa,
++		    !g_on ? "no context" : "IOVA window full");
+ 		return WLAN_DMA_NONE;
+ 	}
+ 	for (uint64_t o = 0; o < span; o += 4096) {
+-		if (!map_page(iova + o, (pa & ~0xfffull) + o)) {
++		uint64_t *e = pte_of(iova + o, true);
++		if (!e) {
++			printf("NEGRONI WLAN: SMMU map: no page-table page left (%u pages mapped)\n", g_mapped_pages);
+ 			return WLAN_DMA_NONE;
+ 		}
++		*e = (((pa & ~0xfffull) + o) & PTE_ADDR) | PTE_ATTR | PTE_VALID;
++		tbl_flush(e, sizeof(*e));
+ 	}
+ 	g_next = (iova + span + 0xffff) & ~0xffffull;   /* 64 KiB apart: a stray access past a buffer faults */
+ 	g_mapped_pages += (uint32_t)(span / 4096);
+-	/* the context has no stale entry for a fresh IOVA, but invalidate anyway (cheap, once per buffer) */
+-	uint32_t cb = (g_pages + g_cb) * g_page;
+-	SW(cb + CB_TLBIASID, g_cb);
+-	SW(cb + CB_TLBSYNC, 1);
+-	for (int i = 0; i < 1000 && (SR(cb + CB_TLBSTATUS) & 1); i++) {
+-		delay(1);
+-	}
++	smmu_tlb_sync(1000);    /* fresh IOVAs have no stale entry; cheap, once per buffer */
+ 	printf("NEGRONI WLAN: SMMU map %#llx (%#x bytes) -> IOVA %#llx\n", pa, size, iova + (pa & 0xfff));
+ 	return iova + (pa & 0xfff);
+ }
+ 
++/* 0325: take a mapping away (a buffer freed while the chip runs); the IOVA is not handed out again */
++void
++negroni_wlan_smmu_unmap(uint64_t iova, uint32_t size)
++{
++	if (!g_on || iova < IOVA_BASE || iova >= IOVA_BASE + IOVA_SIZE || size == 0) {
++		return;
++	}
++	uint64_t start = iova & ~0xfffull, end = (iova + size + 0xfff) & ~0xfffull;
++	for (uint64_t a = start; a < end; a += 4096) {
++		uint64_t *e = pte_of(a, false);
++		if (e && (*e & 1)) {
++			*e = 0;
++			tbl_flush(e, sizeof(*e));
++			g_mapped_pages--;
++		}
++	}
++	smmu_tlb_sync(1000);
++	printf("NEGRONI WLAN: SMMU unmap IOVA %#llx (%#x bytes)\n", iova, size);
++}
++
+ bool
+ negroni_wlan_smmu_active(void)
+ {
+ 	return g_on;
+ }
+ 
+-/* print a context fault, if any (failure path, before the quiesce) */
++/* 0325: the MHI CTRL/DATA window = the IOVA window (cnss2 pci.c:5505-5507 with an SMMU) */
++bool
++negroni_wlan_smmu_window(uint64_t *base, uint64_t *limit)
++{
++	if (!g_on) {
++		return false;
++	}
++	*base = IOVA_BASE;
++	*limit = IOVA_BASE + IOVA_SIZE - 1;
++	return true;
++}
++
++static void
++fsr_text(char *b, size_t n, uint32_t fsr)
++{
++	static const struct { uint32_t bit; const char *name; } k[] = {
++		{ 1u << 1, "TF translation" }, { 1u << 2, "AFF access flag" }, { 1u << 3, "PF permission" },
++		{ 1u << 4, "EF external" }, { 1u << 5, "TLBMCF" }, { 1u << 6, "TLBLKF" }, { 1u << 7, "ASF" },
++		{ 1u << 8, "UUT" }, { 1u << 30, "SS stalled" }, { 1u << 31, "MULTI" },
++	};
++	b[0] = 0;
++	for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
++		if (fsr & k[i].bit) {
++			strlcat(b, b[0] ? ", " : "", n);
++			strlcat(b, k[i].name, n);
++		}
++	}
++	if (!b[0]) {
++		strlcpy(b, "none", n);
++	}
++}
++
++static void
++gfsr_text(char *b, size_t n, uint32_t g)
++{
++	static const struct { uint32_t bit; const char *name; } k[] = {
++		{ 1u << 0, "ICF invalid context" }, { 1u << 1, "USF unidentified stream" }, { 1u << 2, "SMCF stream match conflict" },
++		{ 1u << 3, "UCBF" }, { 1u << 4, "UCIF" }, { 1u << 5, "CAF" }, { 1u << 6, "EF" }, { 1u << 7, "PF" },
++		{ 1u << 8, "UUT" }, { 1u << 31, "MULTI" },
++	};
++	b[0] = 0;
++	for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
++		if (g & k[i].bit) {
++			strlcat(b, b[0] ? ", " : "", n);
++			strlcat(b, k[i].name, n);
++		}
++	}
++	if (!b[0]) {
++		strlcpy(b, "none", n);
++	}
++}
++
++/* one full fault line: context (FSR decoded, FAR, FSYNR0 W/R + level, the faulting SID) and global */
++static void
++smmu_fault_line(const char *where, uint32_t fsr, uint32_t gfsr)
++{
++	char ft[96], gt[96];
++	uint32_t fsynr0 = SR(CB(CB_FSYNR0));
++
++	fsr_text(ft, sizeof(ft), fsr);
++	gfsr_text(gt, sizeof(gt), gfsr);
++	printf("NEGRONI WLAN: SMMU %s: context %u FSR %#x (%s) FAR %#x%08x FSYNR0 %#x (%s, level %u%s) FSYNR1 %#x "
++	    "SID %#x; global sGFSR %#x (%s) sGFSYNR0 %#x sGFSYNR1 %#x (SID %#x) sGFSYNR2 %#x; %u pages mapped\n", where,
++	    g_cb, fsr, ft, SR(CB(CB_FAR + 4)), SR(CB(CB_FAR)), fsynr0, (fsynr0 & (1u << 4)) ? "write" : "read",
++	    fsynr0 & 3u, (fsynr0 & (1u << 10)) ? ", table walk" : "", SR(CB(CB_FSYNR1)),
++	    SR(GR1(SMMU_CBFRSYNRA(g_cb))) & 0xffffu, gfsr, gt, SR(SMMU_SGFSYNR0), SR(SMMU_SGFSYNR1),
++	    SR(SMMU_SGFSYNR1) & 0xffffu, SR(SMMU_SGFSYNR2), g_mapped_pages);
++}
++
++/*
++ * 0325: cheap check for heartbeats and waits: prints a full fault line only when the context FSR or the
++ * global sGFSR changed since the last check (at most 16 lines per boot). True when a context fault is recorded.
++ */
++bool
++negroni_wlan_smmu_check(const char *where)
++{
++	if (!g_on) {
++		return false;
++	}
++	uint32_t fsr = SR(CB(CB_FSR)) & FSR_ALL, gfsr = SR(SMMU_SGFSR);
++	if ((fsr != g_last_fsr || gfsr != g_last_gfsr) && g_fault_lines < 16) {
++		g_fault_lines++;
++		smmu_fault_line(where, fsr, gfsr);
++	}
++	g_last_fsr = fsr;
++	g_last_gfsr = gfsr;
++	return fsr != 0;
++}
++
++/* always one line (also "no fault"): failure path before the quiesce, and after each level */
+ void
+ negroni_wlan_smmu_report(void)
+ {
+ 	if (!g_on) {
+ 		return;
+ 	}
+-	uint32_t cb = (g_pages + g_cb) * g_page, fsr = SR(cb + CB_FSR);
+-	printf("NEGRONI WLAN: SMMU context %u: FSR %#x FAR %#x:%#x FSYNR0 %#x, sGFSR %#x, %u pages mapped\n", g_cb, fsr,
+-	    SR(cb + CB_FAR + 4), SR(cb + CB_FAR), SR(cb + CB_FSYNR0), SR(SMMU_SGFSR), g_mapped_pages);
++	uint32_t fsr = SR(CB(CB_FSR)) & FSR_ALL, gfsr = SR(SMMU_SGFSR);
++	smmu_fault_line(fsr ? "FAULT" : "report (no context fault)", fsr, gfsr);
++	if (gfsr != g_gfsr0) {
++		printf("NEGRONI WLAN: SMMU global sGFSR changed since setup: %#x -> %#x (USF = a stream without an SMR, "
++		    "e.g. the chip on another SID than %#x)\n", g_gfsr0, gfsr, WLAN_SID_EP);
++	}
++	g_last_fsr = fsr;
++	g_last_gfsr = gfsr;
+ }
+ 
+ /* after the chip lost bus mastering: the stream back as it was, the context off, the tables freed */
+ void
+ negroni_wlan_smmu_off(void)
+ {
+-	if (g_smmu && g_cb != ~0u && g_smr != ~0u) {
+-		uint32_t cb = (g_pages + g_cb) * g_page;
++	if (g_smmu && g_sme_written) {
+ 		if (g_smr_reused) {
+-			SW(SMMU_S2CR(g_smr), g_old_s2cr);
++			SW(SMMU_S2CR(g_smr), g_old_s2cr);       /* the SMR still matches: its old S2CR first */
++			__asm__ volatile ("dsb sy" ::: "memory");
+ 			SW(SMMU_SMR(g_smr), g_old_smr);
+ 		} else {
+-			SW(SMMU_SMR(g_smr), 0);
++			SW(SMMU_SMR(g_smr), g_old_smr);         /* invalid first, then the S2CR */
++			__asm__ volatile ("dsb sy" ::: "memory");
++			SW(SMMU_S2CR(g_smr), g_old_s2cr);
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+-		SW(cb + CB_SCTLR, 0);
+-		SW(cb + CB_TLBIASID, g_cb);
+-		SW(cb + CB_TLBSYNC, 1);
+-		printf("NEGRONI WLAN: SMMU context %u off, SMR%u %s\n", g_cb, g_smr, g_smr_reused ? "restored" : "cleared");
++	}
++	if (g_smmu && g_cb_written) {
++		SW(CB(CB_SCTLR), 0);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		smmu_tlb_sync(1000);
++		SW(GR1(SMMU_CBAR(g_cb)), g_old_cbar);
++		SW(GR1(SMMU_CBA2R(g_cb)), g_old_cba2r);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("NEGRONI WLAN: SMMU context %u off (CBAR %#x back), SMR%u %s (%#x / S2CR %#x)\n", g_cb, SR(GR1(SMMU_CBAR(g_cb))),
++		    g_smr, g_smr_reused ? "restored" : "cleared", SR(SMMU_SMR(g_smr)), SR(SMMU_S2CR(g_smr)));
+ 	}
+ 	for (uint32_t i = 0; i < g_tpages; i++) {
+ 		kmem_free(kernel_map, g_tpage[i], PAGE_SIZE);
+@@ -236,15 +408,121 @@ negroni_wlan_smmu_off(void)
+ 		ml_io_unmap(g_smmu, APPS_SMMU_SIZE);
+ 		g_smmu = 0;
+ 	}
+-	g_on = false;
++	g_on = g_cb_written = g_sme_written = false;
+ 	g_cb = g_smr = ~0u;
+ 	g_next = IOVA_BASE;
++	g_mapped_pages = 0;
++}
++
++/* (i1, m1) and (i2, m2) match a common stream ID (arm-smmu.c arm_smmu_find_sme overlap test) */
++static inline bool
++smr_overlap(uint32_t i1, uint32_t m1, uint32_t i2, uint32_t m2)
++{
++	return ((i1 ^ i2) & ~(m1 | m2) & 0x7fffu) == 0;
++}
++
++/* the stream-match entry: one that already matches 0x1c01 (reused), else a free one with our ID/mask */
++static int
++smmu_pick_smr(void)
++{
++	bool rc_taken = false;
++
++	for (uint32_t i = 0; i < g_smr_n; i++) {
++		uint32_t smr = SR(SMMU_SMR(i)), id = smr & 0x7fffu, mask = (smr >> 16) & 0x7fffu;
++		if (!(smr & SMMU_SMR_VALID)) {
++			continue;
++		}
++		if (g_smr == ~0u && smr_overlap(id, mask, WLAN_SID_EP, 0)) {
++			/*
++			 * Reuse only an entry nobody translates through: mask at most 1 (no other device's stream) and
++			 * S2CR fault / bypass, or translate into a context that is off (SCTLR.M 0). Else it is somebody's.
++			 */
++			uint32_t s2 = SR(SMMU_S2CR(i)), type = (s2 >> 16) & 3u, cb = s2 & 0xffu;
++			bool cb_off = type == 0 && cb < g_ctx_n && !(SR((g_pages + cb) * g_page + CB_SCTLR) & 1);
++			if ((mask & ~1u) != 0 || !(type == 1 || type == 2 || cb_off)) {
++				return negroni_wlan_failed(EBUSY, "SMMU SMR%u %#x (mask %#x) matches %#x and S2CR %#x %s (not ours)", i,
++				           smr, mask, WLAN_SID_EP, s2, (mask & ~1u) ? "covers other streams" : "translates through a live context");
++			}
++			g_smr = i;
++			g_smr_reused = true;
++			g_old_smr = smr;
++			g_smr_val = smr;
++			g_old_s2cr = s2;
++			printf("NEGRONI WLAN: SMMU SMR%u %#x (id %#x mask %#x) already matches %#x, S2CR %#x (%s): reused\n", i, smr, id,
++			    mask, WLAN_SID_EP, s2, type == 2 ? "fault" : type == 1 ? "bypass" : "context off");
++		} else if (smr_overlap(id, mask, WLAN_SID_RC, 0)) {
++			rc_taken = true;
++			printf("NEGRONI WLAN: SMMU SMR%u %#x matches the root-port stream %#x (S2CR %#x)\n", i, smr, WLAN_SID_RC,
++			    SR(SMMU_S2CR(i)));
++		}
++	}
++	if (g_smr != ~0u) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < g_smr_n; i++) {
++		uint32_t smr = SR(SMMU_SMR(i));
++		if (!(smr & SMMU_SMR_VALID)) {
++			g_smr = i;
++			g_old_smr = smr;
++			g_old_s2cr = SR(SMMU_S2CR(i));
++			break;
++		}
++	}
++	if (g_smr == ~0u) {
++		return negroni_wlan_failed(EBUSY, "no free SMMU stream-match entry (%u in use)", g_smr_n);
++	}
++	/* 0x1c00/mask 1: also matches if the controller's BDF-to-SID table did not take (bypass -> base SID [I]) */
++	g_smr_val = SMMU_SMR_VALID | (rc_taken ? WLAN_SID_EP : (WLAN_SID_RC | 1u << 16));
++	printf("NEGRONI WLAN: SMMU SMR%u free (was %#x, S2CR %#x): will match %s\n", g_smr, g_old_smr, g_old_s2cr,
++	    rc_taken ? "0x1c01 only (0x1c00 has its own SMR)" : "0x1c00-0x1c01 (mask 1)");
++	return 0;
++}
++
++/* U-Boot qcom-hyp-smmu.c alloc_cb rule + SCTLR.M off + no valid S2CR translating into it */
++static int
++smmu_pick_cb(void)
++{
++	uint32_t n_s2 = 0, n_free_s1 = 0, n_other = 0, n_on = 0, n_ptr = 0, force = ~0u;
++
++	(void)PE_parse_boot_argn("negroniwlan_smmu_cb", &force, sizeof(force));
++	for (uint32_t c = 0; c < g_ctx_n; c++) {
++		uint32_t cbar = SR(GR1(SMMU_CBAR(c))), type = CBAR_TYPE(cbar), vmid = CBAR_VMID(cbar);
++		bool by_cbar = type == CBAR_TYPE_S2_TRANS || (type == CBAR_TYPE_S1_S2_BYPASS && vmid == VMID_UNUSED);
++		bool on = (SR((g_pages + c) * g_page + CB_SCTLR) & 1) != 0, pointed = false;
++
++		for (uint32_t m = 0; !pointed && m < g_smr_n; m++) {
++			uint32_t s2 = SR(SMMU_S2CR(m));
++			pointed = (SR(SMMU_SMR(m)) & SMMU_SMR_VALID) && ((s2 >> 16) & 3u) == 0 && (s2 & 0xffu) == c &&
++			    !(g_smr_reused && m == g_smr);  /* our reused SMR is rewritten anyway */
++		}
++		n_s2 += type == CBAR_TYPE_S2_TRANS;
++		n_free_s1 += type == CBAR_TYPE_S1_S2_BYPASS && vmid == VMID_UNUSED;
++		n_other += !by_cbar;
++		n_on += on;
++		n_ptr += pointed;
++		if (g_cb == ~0u && !on && !pointed && (by_cbar || c == force)) {
++			g_cb = c;
++			g_old_cbar = cbar;
++			g_old_cba2r = SR(GR1(SMMU_CBA2R(c)));
++		}
++	}
++	printf("NEGRONI WLAN: SMMU contexts: %u S2_TRANS, %u S1_TRANS_S2_BYPASS with VMID 0xff, %u other (in use), "
++	    "%u with SCTLR.M on, %u targeted by an S2CR\n", n_s2, n_free_s1, n_other, n_on, n_ptr);
++	if (g_cb == ~0u) {
++		return negroni_wlan_failed(EBUSY, "no free SMMU context bank (U-Boot rule; negroniwlan_smmu_cb=N forces one)");
++	}
++	printf("NEGRONI WLAN: SMMU context %u free: CBAR %#x (type %u, VMID %#x) CBA2R %#x, FSR %#x%s\n", g_cb, g_old_cbar,
++	    CBAR_TYPE(g_old_cbar), CBAR_VMID(g_old_cbar), g_old_cba2r, SR(CB(CB_FSR)),
++	    g_cb == force ? " (negroniwlan_smmu_cb)" : "");
++	return 0;
+ }
+ 
+-/* step 6 with negroniwlan_smmu=3 */
++/* step 6 with negroniwlan_smmu=3 (the default since 0325) */
+ int
+ negroni_wlan_smmu_on(void)
+ {
++	int error;
++
+ 	g_smmu = ml_io_map_unmappable(APPS_SMMU_PHYS, APPS_SMMU_SIZE, WLAN_WIMG_IO);
+ 	if (!g_smmu) {
+ 		return negroni_wlan_failed(ENOMEM, "apps SMMU map failed");
+@@ -254,93 +532,67 @@ negroni_wlan_smmu_on(void)
+ 	g_pages = 2u << ((idr1 >> 28) & 7);
+ 	g_ctx_n = MIN(idr1 & 0xff, 0x4eu);            /* live.dts qcom,num-context-banks-override 0x4e */
+ 	g_smr_n = MIN(MIN(idr0 & 0xff, 0x78u), 128u); /* live.dts qcom,num-smr-override 0x78 */
+-	printf("NEGRONI WLAN: SMMU S1 setup: sCR0 %#x, %u SMRs, %u contexts, %u pages of %#x\n", scr0, g_smr_n, g_ctx_n,
+-	    g_pages, g_page);
++	g_gfsr0 = g_last_gfsr = SR(SMMU_SGFSR);
++	printf("NEGRONI WLAN: SMMU S1 setup: sCR0 %#x, IDR0 %#x IDR1 %#x: %u SMRs, %u contexts, %u pages of %#x; sGFSR %#x\n",
++	    scr0, idr0, idr1, g_smr_n, g_ctx_n, g_pages, g_page, g_gfsr0);
+ 	if (scr0 == ~0u || g_smr_n == 0 || g_ctx_n == 0 || 2ull * g_pages * g_page > APPS_SMMU_SIZE) {
+ 		return negroni_wlan_failed(ENXIO, "the apps SMMU layout does not fit (IDR0 %#x IDR1 %#x)", idr0, idr1);
+ 	}
+ 	if (scr0 & SMMU_SCR0_EXIDENABLE) {
+ 		return negroni_wlan_failed(ENOTSUP, "apps SMMU uses extended stream IDs; SMR format not handled");
+ 	}
+-	/* an SMR that already matches the stream (UEFI hand-off), else a free one */
+-	for (uint32_t i = 0; i < g_smr_n; i++) {
+-		uint32_t smr = SR(SMMU_SMR(i)), id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
+-		if ((smr & SMMU_SMR_VALID) && ((id ^ WLAN_SID) & ~mask & 0x7fff) == 0) {
+-			g_smr = i;
+-			g_smr_reused = true;
+-			g_old_smr = smr;
+-			g_old_s2cr = SR(SMMU_S2CR(i));
+-			break;
+-		}
+-	}
+-	for (uint32_t i = 0; g_smr == ~0u && i < g_smr_n; i++) {
+-		if (!(SR(SMMU_SMR(i)) & SMMU_SMR_VALID)) {
+-			g_smr = i;
+-		}
+-	}
+-	/* a context bank: SCTLR.M off and no valid S2CR translating into it */
+-	for (uint32_t c = 1; g_cb == ~0u && c < g_ctx_n; c++) {
+-		bool used = (SR((g_pages + c) * g_page + CB_SCTLR) & 1) != 0;
+-		for (uint32_t m = 0; !used && m < g_smr_n; m++) {
+-			uint32_t s2 = SR(SMMU_S2CR(m));
+-			used = (SR(SMMU_SMR(m)) & SMMU_SMR_VALID) && ((s2 >> 16) & 3) == 0 && (s2 & 0xff) == c;
+-		}
+-		if (!used) {
+-			g_cb = c;
+-		}
+-	}
+-	if (g_smr == ~0u || g_cb == ~0u) {
+-		return negroni_wlan_failed(EBUSY, "no free SMMU context (%d) or stream-match entry (%d)", (int)g_cb, (int)g_smr);
++	if ((error = smmu_pick_smr()) || (error = smmu_pick_cb())) {
++		return error;
+ 	}
+-	printf("NEGRONI WLAN: SMMU stream %#x: SMR%u (%s, was %#x / S2CR %#x), context %u\n", WLAN_SID, g_smr,
+-	    g_smr_reused ? "reused" : "free", g_old_smr, g_old_s2cr, g_cb);
+ 
+ 	g_root = tbl_new(&g_root_pa);
+ 	if (!g_root) {
+ 		return negroni_wlan_failed(ENOMEM, "no page for the SMMU root table");
+ 	}
+-	uint32_t cb = (g_pages + g_cb) * g_page;
+-	uint64_t ttbr = g_root_pa | ((uint64_t)g_cb << 48);
+-	int error;
++	uint64_t ttbr = g_root_pa | ((uint64_t)g_cb << 48);    /* ASID = context number */
+ 
+-	SW(cb + CB_SCTLR, 0);
+-	if ((error = sr_put("CBA2R", g_page + SMMU_CBA2R(g_cb), 1)) ||          /* VA64 */
+-	    (error = sr_put("CBAR", g_page + SMMU_CBAR(g_cb), CBAR_S1)) ||
+-	    (error = sr_put("CB TCR2", cb + CB_TCR2, TCR2_36)) ||
+-	    (error = sr_put("CB TCR", cb + CB_TCR, TCR_39)) ||
+-	    (error = sr_put("CB TTBR0 lo", cb + CB_TTBR0, (uint32_t)ttbr)) ||
+-	    (error = sr_put("CB TTBR0 hi", cb + CB_TTBR0 + 4, (uint32_t)(ttbr >> 32))) ||
+-	    (error = sr_put("CB MAIR0", cb + CB_MAIR0, MAIR0))) {
++	/* context bank (Linux arm_smmu_write_context_bank order), SCTLR last */
++	g_cb_written = true;    /* from here negroni_wlan_smmu_off puts CBAR/CBA2R back */
++	SW(CB(CB_SCTLR), 0);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if ((error = sr_put("CBA2R", GR1(SMMU_CBA2R(g_cb)), CBA2R_VA64, CBA2R_VA64)) ||
++	    (error = sr_put("CBAR", GR1(SMMU_CBAR(g_cb)), CBAR_S1, 3u << 16)) ||     /* type S1_TRANS_S2_BYPASS, VMID 0 */
++	    (error = sr_put("CB TCR2", CB(CB_TCR2), TCR2_36, 7u)) ||                          /* PASIZE */
++	    (error = sr_put("CB TCR", CB(CB_TCR), TCR_39, 0x3fu | 3u << 14)) ||               /* T0SZ, TG0 */
++	    (error = sr_put("CB TTBR0 lo", CB(CB_TTBR0), (uint32_t)ttbr, ~0u)) ||
++	    (error = sr_put("CB TTBR0 hi", CB(CB_TTBR0 + 4), (uint32_t)(ttbr >> 32), ~0u)) ||
++	    (error = sr_put("CB TTBR1 lo", CB(CB_TTBR1), 0, 0)) ||
++	    (error = sr_put("CB TTBR1 hi", CB(CB_TTBR1 + 4), 0, 0)) ||
++	    (error = sr_put("CB MAIR0", CB(CB_MAIR0), MAIR0, 0xffu)) ||                       /* attr 0 (NC) */
++	    (error = sr_put("CB MAIR1", CB(CB_MAIR1), 0, 0))) {
+ 		return error;
+ 	}
+-	SW(cb + CB_TTBR1, 0);
+-	SW(cb + CB_TTBR1 + 4, 0);
+-	SW(cb + CB_MAIR1, 0);
+-	SW(cb + CB_FSR, FSR_ALL);
+-	SW(cb + CB_TLBIASID, g_cb);
+-	SW(cb + CB_TLBSYNC, 1);
+-	for (int i = 0; i < 1000 && (SR(cb + CB_TLBSTATUS) & 1); i++) {
++	SW(CB(CB_FSR), FSR_ALL);        /* write 1 to clear */
++	SW(CB(CB_TLBIASID), g_cb);
++	SW(CB(CB_TLBSYNC), 1);
++	for (int i = 0; i < 1000 && (SR(CB(CB_TLBSTATUS)) & 1); i++) {
+ 		delay(10);
+ 	}
+-	if (SR(cb + CB_TLBSTATUS) & 1) {
+-		return negroni_wlan_failed(ETIMEDOUT, "SMMU TLB sync does not finish (%#x)", SR(cb + CB_TLBSTATUS));
++	if (SR(CB(CB_TLBSTATUS)) & 1) {
++		return negroni_wlan_failed(ETIMEDOUT, "SMMU TLB sync does not finish (%#x)", SR(CB(CB_TLBSTATUS)));
+ 	}
+-	SW(cb + CB_SCTLR, SCTLR_ON);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	SW(SMMU_S2CR(g_smr), g_cb);                    /* type translate (0), context index */
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	SW(SMMU_SMR(g_smr), SMMU_SMR_VALID | WLAN_SID);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	uint32_t smr = SR(SMMU_SMR(g_smr)), s2 = SR(SMMU_S2CR(g_smr)), sctlr = SR(cb + CB_SCTLR);
+-	uint32_t t0 = SR(cb + CB_TTBR0);
+-	printf("NEGRONI WLAN: SMMU SMR%u = %#x, S2CR%u = %#x, CB%u SCTLR %#x TTBR0 %#x (root %#llx)\n", g_smr, smr, g_smr, s2,
+-	    g_cb, sctlr, t0, g_root_pa);
+-	g_on = true;            /* from here negroni_wlan_smmu_off undoes it */
+-	if (smr != (SMMU_SMR_VALID | WLAN_SID) || (s2 & 0x300ffu) != g_cb || !(sctlr & 1) || t0 != (uint32_t)ttbr) {
+-		return negroni_wlan_failed(EPERM, "the SMMU (or the hypervisor) did not take the context for stream %#x",
+-		           WLAN_SID);
+-	}
+-	printf("NEGRONI WLAN: stream %#x translates through context %u; IOVA window %#llx-%#llx (Android's)\n", WLAN_SID,
++	if ((error = sr_put("CB SCTLR", CB(CB_SCTLR), SCTLR_ON, 1u))) {
++		return error;
++	}
++
++	/* stream: S2CR translate -> context first, then the SMR valid (arm_smmu_write_sme order) */
++	g_sme_written = true;
++	if ((error = sr_put("S2CR", SMMU_S2CR(g_smr), g_cb, 0x300ffu)) ||        /* type 0 (translate), CBNDX */
++	    (error = sr_put("SMR", SMMU_SMR(g_smr), g_smr_val, ~0u))) {
++		return error;
++	}
++	g_on = true;
++	g_last_fsr = SR(CB(CB_FSR)) & FSR_ALL;
++	printf("NEGRONI WLAN: SMMU SMR%u = %#x, S2CR%u = %#x, CB%u CBAR %#x CBA2R %#x SCTLR %#x TCR %#x TCR2 %#x TTBR0 %#x%08x "
++	    "MAIR0 %#x FSR %#x (root %#llx)\n", g_smr, SR(SMMU_SMR(g_smr)), g_smr, SR(SMMU_S2CR(g_smr)), g_cb,
++	    SR(GR1(SMMU_CBAR(g_cb))), SR(GR1(SMMU_CBA2R(g_cb))), SR(CB(CB_SCTLR)), SR(CB(CB_TCR)), SR(CB(CB_TCR2)),
++	    SR(CB(CB_TTBR0 + 4)), SR(CB(CB_TTBR0)), SR(CB(CB_MAIR0)), SR(CB(CB_FSR)), g_root_pa);
++	printf("NEGRONI WLAN: stream %#x translates through context %u; IOVA window %#llx-%#llx (Android's)\n", WLAN_SID_EP,
+ 	    g_cb, IOVA_BASE, IOVA_BASE + IOVA_SIZE - 1);
+ 	return 0;
+ }
