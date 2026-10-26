@@ -1,0 +1,629 @@
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index 013c7de..9360797 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -194,6 +194,19 @@ negroni_usb_probe(void)
+ #define DCTL_RUN_STOP   (1u << 31)
+ #define DCTL_CSFTRST    (1u << 30)
+ #define DSTS_DEVCTRLHLT (1u << 22)
++/* 0366: reconnect after unplug (Linux dwc3 core.h) */
++#define GUSB2PHYCFG     0xc200
++#define   GUSB2PHYCFG_SUSPHY    (1u << 6)       /* the core may suspend the UTMI PHY */
++#define   GUSB2PHYCFG_ENBLSLPM  (1u << 8)       /* utmi_sleep_n / l1_suspend_n */
++#define DSTS_SOFFN(d)   (((d) >> 3) & 0x3fff)   /* (micro)frame number of the last SOF */
++#define DSTS_LINK(d)    (((d) >> 18) & 0xf)     /* USBLNKST */
++#define DEVTEN_BASE     0x7u                    /* disconnect, USB reset, connect done (the old mask) */
++/* + wakeup, U3/L2-L1 suspend, erratic error: as Linux dwc3_gadget_enable_irq for a DWC_usb31 (no link state change) */
++#define DEVTEN_MORE     ((1u << 4) | (1u << 6) | (1u << 9))
++#define DEVTEN_ULSTCNG  (1u << 3)               /* link state change (negroniusb_events=2) */
++#define DEPCMD_ENDTRANSFER      8
++#define DEPCMD_FORCERM          (1u << 11)
++#define DEPCMD_CMDIOC           (1u << 8)
+ 
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+@@ -281,6 +294,19 @@ static struct {
+ 	uint64_t    rx_bytes, tx_bytes, tx_drops;
+ 	uint32_t    rx_max_poll, tx_max_batch;
+ 	uint64_t    last_active;    /* mach_absolute_time of the last frame or event */
++	/* 0366: transfers per physical endpoint, link watchdog */
++	bool        ep_busy[6];     /* STARTTRANSFER issued, no XferComplete or ENDTRANSFER since */
++	uint32_t    ep_rsc[6];      /* its transfer resource index (for ENDTRANSFER) */
++	vm_offset_t qs;             /* QSCRATCH (VBUS override) */
++	uint64_t    next_watch;     /* next DSTS sample */
++	uint32_t    last_soffn, last_link;
++	uint64_t    sof_seen;       /* time DSTS.SOFFN last changed (the host sends SOFs every 125 us) */
++	uint64_t    dev_event_at;   /* time of the last device event */
++	bool        nosof_logged;
++	bool        event_rule_done; /* the "device event without SOF" reconnect ran in this episode */
++	uint32_t    episode_reconnects;
++	uint64_t    reconnects;
++	uint32_t    devevents[16];  /* device events per type (rate-limited log) */
+ 	/* command server (UDP 5141), used by ud_thread only */
+ 	bool        ctl_enabled;
+ 	int         ctl_action;
+@@ -361,6 +387,10 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 				printf("NEGRONI USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
+ 				return -1;
+ 			}
++			if (ep < 6 && (cmd & 0xf) == DEPCMD_STARTTRANSFER) {
++				ud.ep_rsc[ep] = (v >> 16) & 0x7f;       /* 0366 */
++				ud.ep_busy[ep] = true;
++			}
+ 			return 0;
+ 		}
+ 		ud_udelay(1);
+@@ -461,6 +491,12 @@ static void ud_rx_arm(void);
+ static void ud_tx_kick_locked(void);
+ static void ud_link_event(bool up);
+ static int ud_reset_drop = 1;           /* 0282: boot-arg negroniusb_resetdrop (0 = the old behaviour) */
++static int ud_reset_end = 1;            /* 0366: boot-arg negroniusb_resetend: ENDTRANSFER on reset/disconnect */
++static int ud_reconnect_s = 5;          /* 0366: boot-arg negroniusb_reconnect: s without SOF before a soft reconnect */
++static int ud_more_events = 1;          /* 0366: boot-arg negroniusb_events: 0 = DEVTEN 0x7 (the old mask), 1 = + wakeup/suspend/erratic (Linux set, default), 2 = + link state change */
++static int ud_phycfg = 1;               /* 0366: boot-arg negroniusb_phycfg: clear GUSB2PHYCFG SUSPHY/ENBLSLPM */
++static void ud_drop_data(void);
++static void ud_end_transfer(unsigned ep);
+ static bool ud_ctl_input(const uint8_t *frame, uint32_t len);
+ static void ud_panic_rx(const uint8_t *frame, uint32_t len);
+ 
+@@ -473,6 +509,9 @@ ud_notify_connected(void)
+ 	n[2] = 1; n[3] = 0;             /* connected */
+ 	n[4] = 0; n[5] = 0;             /* interface 0 */
+ 	n[6] = 0; n[7] = 0;
++	if (ud_reset_end) {
++		ud_end_transfer(EP_INT);        /* 0366: an old notification the host never read */
++	}
+ 	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
+ }
+ 
+@@ -532,6 +571,8 @@ ud_setup(void)
+ 	} else if (req == 9) {          /* SET_CONFIGURATION */
+ 		if (value == 1) {
+ 			ud_configure();
++		} else if (value == 0 && ud.configured && ud_reset_end) {
++			ud_drop_data();         /* 0366: the host deconfigured the device */
+ 		}
+ 		printf("NEGRONI USB: configured (%u)\n", value);
+ 	} else if (req == 8) {          /* GET_CONFIGURATION */
+@@ -1296,13 +1337,347 @@ ud_if_create(void)
+ 	printf("NEGRONI USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+ }
+ 
++/*
++ * ---- 0366: reconnect after unplug ----
++ *
++ * The driver forces VBUS valid in QSCRATCH (no charger driver tells it about
++ * the cable), so the controller never sees the cable go: no disconnect
++ * event. It only sees the bus go idle (USB 2.0 suspend, L2), and with the
++ * old DEVTEN 0x7 not even that. Before this patch a bus reset only cleared
++ * DALEPENA: the RX ring (0361, always active), a TX batch and a CDC
++ * notification stayed active in the controller, and nothing ever retried
++ * when the host did not come back. Now, as Linux dwc3 gadget.c:
++ *   - bus reset, disconnect, SET_CONFIGURATION(0): ENDTRANSFER (FORCERM) on
++ *     every active data transfer, ep0 back to the setup phase
++ *     (dwc3_gadget_reset_interrupt, dwc3_stop_active_transfers,
++ *     dwc3_ep0_reset_state); SET_CONFIGURATION(1) sets everything up again;
++ *   - more device events (wakeup, U3/L2 suspend, erratic error), each type
++ *     logged (rate-limited);
++ *   - GUSB2PHYCFG SUSPHY and ENBLSLPM cleared (sm8450.dtsi
++ *     snps,dis_u2_susphy_quirk + snps,dis_enblslpm_quirk);
++ *   - a watchdog (ud_link_watch, every 100 ms from ud_thread and the panic
++ *     loop) reads DSTS: no SOF for negroniusb_reconnect s (default 5), or a
++ *     device event that brought no SOF within 1 s (once per episode), means the host is gone or
++ *     did not get the device: soft disconnect + soft connect
++ *     (dwc3_gadget_soft_disconnect / _soft_connect: ENDTRANSFER, RUN_STOP 0,
++ *     wait for the halt, pull-up off 100 ms, core soft reset, event buffer,
++ *     ep0, RUN_STOP 1). The host sees a fresh attach. Then again every
++ *     negroniusb_reconnect s (6x as long after 12 tries in one episode, or
++ *     at once while configured in L2: a sleeping host) until SOFs come.
++ */
++static uint64_t
++ud_abs_ms(uint64_t ms)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime(ms * NSEC_PER_MSEC, &abs);
++	return abs;
++}
++
++static const char *
++ud_link_name(uint32_t l)
++{
++	switch (l) {
++	case 0: return "on";
++	case 2: return "sleep L1";
++	case 3: return "suspend L2";
++	case 4: return "disconnected";
++	case 5: return "early suspend";
++	case 14: return "reset";
++	case 15: return "resume";
++	default: return "?";
++	}
++}
++
++/* Device event type t happened: true = log it (the first 8 of each type, then every 100th). */
++static bool
++ud_devevent_note(unsigned t)
++{
++	uint32_t n = ++ud.devevents[t & 15];
++	return n <= 8 || (n % 100) == 0;
++}
++
++/*
++ * ENDTRANSFER on physical endpoint ep if a transfer is active. Data
++ * endpoints: FORCERM (Linux dwc3_stop_active_transfer); ep0/ep1: CMDIOC
++ * without FORCERM (Linux dwc3_ep0_end_control_data; the completion event is
++ * not used). Then 1 ms before the next command on that endpoint: Linux
++ * mdelay(1) for a DWC_usb31 without GUCTL2[14] (the end may still be in
++ * progress when the command bit clears).
++ */
++static void
++ud_end_transfer(unsigned ep)
++{
++	if (ep >= 6 || !ud.ep_busy[ep]) {
++		return;
++	}
++	ud.ep_busy[ep] = false;
++	uint32_t flags = ep <= 1 ? DEPCMD_CMDIOC : DEPCMD_FORCERM;
++	(void)ud_epcmd(ep, DEPCMD_ENDTRANSFER | flags | (ud.ep_rsc[ep] << 16), 0, 0, 0);
++	ud_udelay(1000);
++}
++
++/*
++ * Bus reset, disconnect, SET_CONFIGURATION(0), soft reconnect: every data
++ * transfer ended, the data endpoints off, "not configured". Also from the
++ * panic loop (no lock there).
++ */
++static void
++ud_drop_data(void)
++{
++	bool was = ud.configured;
++
++	if (!ud_in_panic) {
++		lck_mtx_lock(ud.lock);
++	}
++	ud.configured = false;          /* ud_if_output and ud_tx_kick_locked stop here */
++	if (ud_reset_end) {
++		ud_end_transfer(EP_TX);
++	}
++	ud.tx_busy = false;
++	ud.tx_batch = false;
++	if (!ud_in_panic) {
++		lck_mtx_unlock(ud.lock);
++	}
++	if (ud_reset_end) {
++		ud_end_transfer(EP_RX);
++		ud_end_transfer(EP_INT);
++	}
++	dwc_wr(DALEPENA, 0x3);
++	ud.rx_started = false;          /* 0361: SET_CONFIGURATION starts the ring again */
++	ud.data_alt = 0;
++	if (was) {
++		ud_link_event(false);
++	}
++}
++
++/* ep0 back to the setup phase (Linux dwc3_ep0_reset_state: end the control transfer, stall, restart). */
++static void
++ud_ep0_reset(void)
++{
++	if (ud.state == EP0_SETUP || !ud_reset_end) {
++		return;
++	}
++	printf("NEGRONI USB: ep0 was in state %d: control transfer ended, setup phase again\n", (int)ud.state);
++	ud_end_transfer(0);
++	ud_end_transfer(1);
++	ud_stall();
++}
++
++/*
++ * Device controller start: from negroni_usb_gadget_start() and after a soft
++ * disconnect (Linux dwc3_gadget_soft_connect: core soft reset, event
++ * buffer, __dwc3_gadget_start, run). The PHY and the global setup stay as
++ * the firmware left them (but GUSB2PHYCFG, see 0366 above).
++ */
++static bool
++ud_hw_start(bool loud)
++{
++	int i;
++
++	/* Port in device mode (Linux dwc3_set_prtcap: GCTL PRTCAPDIR = 2); the firmware may have left it a host. */
++	dwc_wr(GCTL, (dwc_rd(GCTL) & ~(3u << 12)) | (2u << 12));
++	/* Device controller soft reset (PHY and global setup stay as the firmware left them). */
++	dwc_wr(DCTL, DCTL_CSFTRST);
++	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++		ud_udelay(1000);
++	}
++	if (loud || (dwc_rd(DCTL) & DCTL_CSFTRST)) {
++		printf("NEGRONI USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
++		    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
++	}
++	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++		return false;
++	}
++	/* 0366: Linux dwc3_core_soft_reset waits 50 ms after the reset for a DWC_usb31 <= 1.80a (ours: 1.10a) before PHY-domain writes */
++	ud_udelay(50 * 1000);
++	if (ud_phycfg) {
++		/* 0366: Linux snps,dis_u2_susphy_quirk + snps,dis_enblslpm_quirk (sm8450.dtsi) */
++		uint32_t p = dwc_rd(GUSB2PHYCFG), q = p & ~(GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM);
++		if (q != p) {
++			dwc_wr(GUSB2PHYCFG, q);
++		}
++		if (loud) {
++			printf("NEGRONI USB: GUSB2PHYCFG 0x%08x -> 0x%08x (SUSPHY, ENBLSLPM off; negroniusb_phycfg=0 keeps it)\n",
++			    p, dwc_rd(GUSB2PHYCFG));
++		}
++	}
++
++	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
++	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
++	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
++	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
++	ud.evt_pos = 0;
++
++	/* High speed, address 0 */
++	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
++	dwc_wr(DCFG, dcfg | 0);
++	/* Events: disconnect, USB reset, connect done (+ 0366: wakeup, U3/L2 suspend, erratic error) */
++	dwc_wr(DEVTEN, DEVTEN_BASE | (ud_more_events >= 1 ? DEVTEN_MORE : 0) | (ud_more_events >= 2 ? DEVTEN_ULSTCNG : 0));
++	for (i = 0; i < 6; i++) {
++		ud.ep_busy[i] = false;  /* the soft reset ended every transfer */
++	}
++
++	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
++	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
++	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
++	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("NEGRONI USB: endpoint 0 setup failed\n");
++		return false;
++	}
++	dwc_wr(DALEPENA, 0x3);
++	ud_start_setup();
++
++	if (ud.qs != 0) {
++		uint32_t hs = usb_rd(ud.qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(ud.qs, QSCRATCH_SS_PHY_CTRL);
++		if (loud) {
++			printf("NEGRONI USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
++			    hs, ss, usb_rd(ud.qs, 0x08));
++		}
++		*(volatile uint32_t *)(ud.qs + QSCRATCH_HS_PHY_CTRL) = hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
++		*(volatile uint32_t *)(ud.qs + QSCRATCH_SS_PHY_CTRL) = ss | LANE0_PWR_PRESENT;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (loud) {
++			printf("NEGRONI USB: VBUS override on: HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
++			    usb_rd(ud.qs, QSCRATCH_HS_PHY_CTRL), usb_rd(ud.qs, QSCRATCH_SS_PHY_CTRL));
++		}
++	}
++
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		ud_udelay(1000);
++	}
++	if (loud) {
++		printf("NEGRONI USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	}
++	return true;
++}
++
++/* Soft disconnect + soft connect: the host sees the device go and come back (a fresh attach). */
++static void
++ud_soft_reconnect(const char *why, uint32_t dsts, uint64_t quiet_ms)
++{
++	uint32_t dropped = 0;
++	int i;
++
++	ud.reconnects++;
++	ud.episode_reconnects++;
++	bool loud = ud.episode_reconnects <= 3 || (ud.reconnects % 10) == 0;
++	if (loud) {
++		printf("NEGRONI USB: soft reconnect #%llu (%u in this episode): %s; no SOF for %llu ms, DSTS 0x%08x "
++		    "link %u (%s), %sconfigured, rx %llu tx %llu frames\n", ud.reconnects, ud.episode_reconnects, why,
++		    quiet_ms, dsts, DSTS_LINK(dsts), ud_link_name(DSTS_LINK(dsts)), ud.configured ? "" : "not ",
++		    ud.rx_frames, ud.tx_frames);
++	}
++	/* Linux dwc3_gadget_soft_disconnect: end the active transfers, ep0 to setup, RUN_STOP 0, wait for the halt */
++	ud_drop_data();
++	ud_end_transfer(0);
++	ud_end_transfer(1);
++	ud.state = EP0_SETUP;
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	for (i = 0; i < 500 && !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		/* the controller halts only when the event buffer is empty: ack what comes (not handled) */
++		uint32_t c = dwc_rd(GEVNTCOUNT) & 0xffff;
++		if (c) {
++			ud.evt_pos = (ud.evt_pos + c) % UD_EVT_SIZE;
++			dwc_wr(GEVNTCOUNT, c);
++			dropped += c / 4;
++		}
++		ud_udelay(1000);
++	}
++	bool halted = (dwc_rd(DSTS) & DSTS_DEVCTRLHLT) != 0;
++	/* pull-up off long enough for any host to see a disconnect */
++	if (ud_in_panic) {
++		ud_udelay(100 * 1000);
++	} else {
++		ud_sleep_ms(100);
++	}
++	bool ok = ud_hw_start(false);
++	if (ud.events > 140) {
++		ud.events = 140;        /* print the next enumeration's events again */
++	}
++	if (loud || !ok || !halted) {
++		printf("NEGRONI USB: soft reconnect #%llu: %s after %d ms (%u events dropped), restart %s, DSTS 0x%08x\n",
++		    ud.reconnects, halted ? "halted" : "NOT halted", i, dropped, ok ? "ok" : "FAILED", dwc_rd(DSTS));
++	}
++}
++
++/*
++ * Every 100 ms (ud_thread, panic loop): DSTS link state and SOF number.
++ * No SOF for negroniusb_reconnect s: soft reconnect.
++ */
++static void
++ud_link_watch(void)
++{
++	uint64_t now = mach_absolute_time();
++
++	if (now < ud.next_watch) {
++		return;
++	}
++	ud.next_watch = now + ud_abs_ms(100);
++	uint32_t dsts = dwc_rd(DSTS);
++	uint32_t sof = DSTS_SOFFN(dsts), link = DSTS_LINK(dsts);
++	if (link != ud.last_link) {
++		if (ud_devevent_note(13)) {     /* type 13 is unused by the controller: our DSTS poll */
++			printf("NEGRONI USB: link %u (%s) -> %u (%s), DSTS 0x%08x\n", ud.last_link,
++			    ud_link_name(ud.last_link), link, ud_link_name(link), dsts);
++		}
++		ud.last_link = link;
++	}
++	if (ud.sof_seen == 0 || sof != ud.last_soffn) {
++		if (ud.nosof_logged) {
++			printf("NEGRONI USB: SOF again after %llu ms (link %u, %sconfigured, %u reconnects)\n",
++			    ud.sof_seen ? (now - ud.sof_seen) * 1000 / ud_abs_ms(1000) : 0, link,
++			    ud.configured ? "" : "not ", ud.episode_reconnects);
++		}
++		ud.last_soffn = sof;
++		ud.sof_seen = now;
++		ud.nosof_logged = false;
++		ud.event_rule_done = false;
++		ud.episode_reconnects = 0;
++		return;
++	}
++	uint64_t quiet = now - ud.sof_seen;
++	uint64_t quiet_ms = quiet * 1000 / ud_abs_ms(1000);
++	if (!ud.nosof_logged && quiet >= ud_abs_ms(3000)) {
++		ud.nosof_logged = true;
++		printf("NEGRONI USB: no SOF for 3 s (%sconfigured): DSTS 0x%08x link %u (%s), DCTL 0x%08x DEVTEN 0x%08x "
++		    "GUSB2PHYCFG 0x%08x, tx busy %d, rx %llu tx %llu frames (cable out, host asleep, or link lost)\n",
++		    ud.configured ? "" : "not ", dsts, link, ud_link_name(link), dwc_rd(DCTL), dwc_rd(DEVTEN),
++		    dwc_rd(GUSB2PHYCFG), ud.tx_busy, ud.rx_frames, ud.tx_frames);
++	}
++	if (ud_reconnect_s <= 0) {
++		return;
++	}
++	/* the long period at once while configured and in L2: most likely a sleeping host (review N2) */
++	bool slow = ud.episode_reconnects >= 12 || (link == 3 && ud.configured);
++	uint64_t wait = ud_abs_ms((uint64_t)ud_reconnect_s * (slow ? 6000 : 1000));
++	if (quiet >= wait) {
++		ud_soft_reconnect(slow ? "no SOF (long period)" : "no SOF", dsts, quiet_ms);
++	} else if (!ud.event_rule_done && ud.dev_event_at > ud.sof_seen + ud_abs_ms(500) &&
++	    now - ud.dev_event_at >= ud_abs_ms(1000)) {
++		/* a device event (wakeup, reset, ...) long after the last SOF and still no SOF 1 s later: the replug did not take (once per episode) */
++		ud.event_rule_done = true;
++		ud_soft_reconnect("device event without SOF", dsts, quiet_ms);
++	} else {
++		return;
++	}
++	ud.dev_event_at = 0;
++	ud.last_soffn = DSTS_SOFFN(dwc_rd(DSTS));
++	ud.sof_seen = mach_absolute_time();     /* the next try one period later */
++	ud.next_watch = ud.sof_seen + ud_abs_ms(100);
++}
++
+ static void
+ ud_event(uint32_t ev)
+ {
+ 	if (ev & 1) {                   /* device event */
+ 		uint32_t type = (ev >> 8) & 0xf;
++		ud.dev_event_at = mach_absolute_time();
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			ud_ep0_reset();         /* 0366 */
+ 			if (ud_reset_drop && ud.configured) {
+ 				/*
+ 				 * Patch 0282: a bus reset kills every endpoint but 0. Before, ud.configured stayed
+@@ -1310,23 +1685,18 @@ ud_event(uint32_t ev)
+ 				 * early): the device enumerated again ("en10 up" 3 s after "gone") but no frame
+ 				 * ever moved (no RX TRB armed, tx_busy stuck). Drop the data state: the next
+ 				 * SET_CONFIGURATION sets the endpoints up again (DEPSTARTCFG 2 resets the
+-				 * transfer resources, as Linux dwc3 does after a reset).
++				 * transfer resources, as Linux dwc3 does after a reset). 0366: ud_drop_data()
++				 * also ends the active transfers (ENDTRANSFER), as the databook asks.
+ 				 */
+-				dwc_wr(DALEPENA, 0x3);
+-				ud.rx_started = false;  /* 0361: SET_CONFIGURATION starts the ring again */
+-				if (!ud_in_panic) {
+-					lck_mtx_lock(ud.lock);
+-				}
+-				ud.tx_busy = false;
+-				if (!ud_in_panic) {
+-					lck_mtx_unlock(ud.lock);
+-				}
+-				ud.configured = false;
+-				ud.data_alt = 0;
+-				ud_link_event(false);
+-				printf("NEGRONI USB: bus reset: data endpoints dropped until SET_CONFIGURATION\n");
++				ud_drop_data();
++				printf("NEGRONI USB: bus reset: data endpoints dropped until SET_CONFIGURATION (#%u, DSTS 0x%08x)\n",
++				    ++ud.devevents[1], dwc_rd(DSTS));
+ 			} else {
+-				printf("NEGRONI USB: bus reset\n");
++				/* negroniusb_resetdrop=0 with a configuration: the old path, nothing ended (ud_configure would not restart it) */
++				if (ud_reset_end && !ud.configured) {
++					ud_end_transfer(EP_INT);        /* not configured: no data transfer is active, at most a notification */
++				}
++				printf("NEGRONI USB: bus reset (#%u, DSTS 0x%08x)\n", ++ud.devevents[1], dwc_rd(DSTS));
+ 			}
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+@@ -1335,9 +1705,26 @@ ud_event(uint32_t ev)
+ 			    (1u << 8) | (1u << 10) | (0u << 25), 0);
+ 			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+-			printf("NEGRONI USB: connected, speed %u\n", speed);
++			printf("NEGRONI USB: connected, speed %u (#%u, DSTS 0x%08x)\n", speed, ++ud.devevents[2], dwc_rd(DSTS));
+ 		} else if (type == 0) {
+-			printf("NEGRONI USB: disconnect\n");
++			/* 0366: Linux dwc3_gadget_disconnect_interrupt (only seen without the VBUS override) */
++			printf("NEGRONI USB: disconnect (#%u, DSTS 0x%08x link %u)\n", ++ud.devevents[0], dwc_rd(DSTS),
++			    DSTS_LINK(dwc_rd(DSTS)));
++			ud_ep0_reset();
++			if (ud_reset_end) {
++				ud_drop_data();
++			}
++		} else if (ud_devevent_note(type)) {
++			/* 0366: 3 link state change, 4 wakeup, 6 U3/L2 suspend, 9 erratic error, ...: logged only */
++			static const char *const names[16] = {
++				[3] = "link state change", [4] = "wakeup (resume)", [5] = "hibernation request",
++				[6] = "suspend (U3/L2)", [7] = "SOF", [8] = "L1 suspend", [9] = "erratic error",
++				[10] = "command complete", [11] = "event overflow", [12] = "vendor test LMP", [14] = "L1 wakeup",
++			};
++			uint32_t info = (ev >> 16) & 0xf, dsts = dwc_rd(DSTS);
++			printf("NEGRONI USB: device event %u %s (#%u), info %u (%s), DSTS 0x%08x link %u (%s), %sconfigured\n",
++			    type, names[type] ? names[type] : "?", ud.devevents[type], info, ud_link_name(info), dsts,
++			    DSTS_LINK(dsts), ud_link_name(DSTS_LINK(dsts)), ud.configured ? "" : "not ");
+ 		}
+ 		return;
+ 	}
+@@ -1345,6 +1732,10 @@ ud_event(uint32_t ev)
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (type == 1 && ep < 6 && ep != EP_TX && (ep != EP_RX || !ud_ring)) {
++		ud.ep_busy[ep] = false;         /* 0366: ep0, notification, one-TRB RX; EP_TX below under the lock */
++	}
++
+ 	if (ep == EP_RX) {
+ 		if (ud_ring) {
+ 			ud_rx_ring_poll();      /* 0361: the ring does not complete; ud_thread polls it too */
+@@ -1355,10 +1746,12 @@ ud_event(uint32_t ev)
+ 	}
+ 	if (ep == EP_TX && type == 1) {
+ 		if (ud_in_panic) {
++			ud.ep_busy[EP_TX] = false;
+ 			ud.tx_busy = false;     /* 0360: negroni_usb_panic_service() sends the next frame */
+ 			return;
+ 		}
+ 		lck_mtx_lock(ud.lock);
++		ud.ep_busy[EP_TX] = false;
+ 		ud.tx_busy = false;
+ 		ud_tx_kick_locked();
+ 		lck_mtx_unlock(ud.lock);
+@@ -1433,6 +1826,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		ud_rx_ring_poll();
+ 		ud_ctl_poll();
++		ud_link_watch();                /* 0366 */
+ 		now = mach_absolute_time();
+ 		if (now >= next_report) {
+ 			/*
+@@ -1549,8 +1943,6 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ #define UD_PANIC_REPLIES        4
+ #define UD_PANIC_RING_MAX       (1u << 20)      /* at most the last 1 MiB of console text */
+ #define UD_PANIC_CHUNK          1400
+-#define DEPCMD_ENDTRANSFER      8
+-#define DEPCMD_FORCERM          (1u << 11)
+ #define NEGRONI_PANIC_ACT_POWEROFF 0x100        /* also in negroni_reboot.c */
+ 
+ bool negroni_usb_panic_begin(void);
+@@ -1842,6 +2234,7 @@ negroni_usb_panic_service(bool busy)
+ 		}
+ 	}
+ 	ud_rx_ring_poll();                      /* 0361 */
++	ud_link_watch();                        /* 0366: replug during a panic */
+ 	if (ud.configured != ud_panic_was_configured) {
+ 		ud_panic_was_configured = ud.configured;
+ 		if (ud.configured) {            /* (re)enumerated in panic mode: wait for the host's address */
+@@ -1852,7 +2245,8 @@ negroni_usb_panic_service(bool busy)
+ 	if (ud.tx_busy && mach_absolute_time() - ud_panic_tx_at > ud_panic_tx_timeout) {
+ 		/* The host did not take the frame in 2 s: end the transfer and start it again. */
+ 		(void)ud_epcmd(EP_TX, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | (ud_panic_tx_rsc << 16), 0, 0, 0);
+-		ud_udelay(100);
++		ud_udelay(1000);                /* 0366: 1 ms before the next STARTTRANSFER (Linux, DWC_usb31) */
++		ud.ep_busy[EP_TX] = false;      /* 0366 */
+ 		ud.tx_busy = false;
+ 		ud_panic_timeouts++;
+ 		if (ud.configured && ud_panic_tx_len > 0) {
+@@ -1891,61 +2285,18 @@ negroni_usb_gadget_start(vm_offset_t dwc)
+ 	    ud_ring ? UD_RXN : 1, ud_ring ? UD_TXB : 1, UD_TXQ, ud_ring);
+ 	ud_if_create();
+ 
+-	/* Port in device mode (Linux dwc3_set_prtcap: GCTL PRTCAPDIR = 2); the firmware may have left it a host. */
+-	dwc_wr(GCTL, (dwc_rd(GCTL) & ~(3u << 12)) | (2u << 12));
+-	/* Device controller soft reset (PHY and global setup stay as the firmware left them). */
+-	dwc_wr(DCTL, DCTL_CSFTRST);
+-	int i;
+-	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+-		delay(1000);
+-	}
+-	printf("NEGRONI USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+-	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+-	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++	/* 0366: boot-args for the reconnect handling (README-usb.md) */
++	PE_parse_boot_argn("negroniusb_resetend", &ud_reset_end, sizeof(ud_reset_end));
++	PE_parse_boot_argn("negroniusb_reconnect", &ud_reconnect_s, sizeof(ud_reconnect_s));
++	PE_parse_boot_argn("negroniusb_events", &ud_more_events, sizeof(ud_more_events));
++	PE_parse_boot_argn("negroniusb_phycfg", &ud_phycfg, sizeof(ud_phycfg));
++	ud.qs = ml_io_map(QSCRATCH_PA, 0x100);
++	if (!ud_hw_start(true)) {
+ 		return;
+ 	}
+-
+-	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+-	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+-	dwc_wr(GEVNTSIZ, (1u << 31) | UD_EVT_SIZE);     /* interrupt masked: polled */
+-	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+-	ud.evt_pos = 0;
+-
+-	/* High speed, address 0 */
+-	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+-	dwc_wr(DCFG, dcfg | 0);
+-	/* Events: disconnect, USB reset, connect done */
+-	dwc_wr(DEVTEN, 0x7);
+-
+-	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+-	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+-	    ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (0u << 25), 0) ||
+-	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+-	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		printf("NEGRONI USB: endpoint 0 setup failed\n");
+-		return;
+-	}
+-	dwc_wr(DALEPENA, 0x3);
+-	ud_start_setup();
+-
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+-	if (qs != 0) {
+-		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+-		printf("NEGRONI USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+-		    hs, ss, usb_rd(qs, 0x08));
+-		*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
+-		*(volatile uint32_t *)(qs + QSCRATCH_SS_PHY_CTRL) = ss | LANE0_PWR_PRESENT;
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		printf("NEGRONI USB: VBUS override on: HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
+-		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+-	}
+-
+-	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+-	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+-		delay(1000);
+-	}
+-	printf("NEGRONI USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	printf("NEGRONI USB: reconnect handling: ENDTRANSFER on reset %s, soft reconnect after %d s without SOF%s, "
++	    "DEVTEN 0x%08x (negroniusb_resetend/_reconnect/_events/_phycfg)\n", ud_reset_end ? "on" : "off",
++	    ud_reconnect_s, ud_reconnect_s > 0 ? "" : " (off)", dwc_rd(DEVTEN));
+ 	int ctl = 1;
+ 	PE_parse_boot_argn("negronictl", &ctl, sizeof(ctl));
+ 	PE_parse_boot_argn("negroniusb_resetdrop", &ud_reset_drop, sizeof(ud_reset_drop));
