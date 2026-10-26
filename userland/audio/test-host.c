@@ -3,9 +3,17 @@
  * Loads the bundle executable, calls the factory, and checks what VirtualAudio needs
  * (docs/audio-plan.md stage 0): four devices by UID, stream formats, the volume control, the
  * clock, and I/O without /dev/negroni-audio (the samples are dropped, nothing blocks).
- *   out/audio/host/test-host out/audio/host/NegroniAudio      (userland/audio/build.sh runs it)
+ * Stage 1: with a FIFO as the device node (NEGRONI_AUDIO_TEST_PATH, host build only): the ring
+ * overflows and counts the dropped frames while nobody reads; then a reader thread gets every
+ * frame in order (ring wrap, partial writes of the FIFO) and frames in = out + dropped.
+ *   out/audio/host/test-host out/audio/host/NegroniAudio [FIFO] (userland/audio/build.sh runs it)
  */
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
 #include <string.h>
@@ -42,9 +50,63 @@ get(AudioObjectID o, UInt32 sel, UInt32 scope, UInt32 qsize, const void *q, void
 	return size;
 }
 
+/* The FIFO reader: checks each frame (left = n, right = ~n, n counts up with gaps from drops). */
+static int fifo_fd = -1, reader_stop;
+static UInt64 got_frames, bad_frames;
+static UInt32 last_n;
+
+static void *
+reader(void *arg)
+{
+	static uint8_t buf[8192], part[4];
+	unsigned have = 0;
+
+	(void)arg;
+	while (!__atomic_load_n(&reader_stop, __ATOMIC_ACQUIRE)) {
+		ssize_t n = read(fifo_fd, buf, sizeof(buf));
+		if (n <= 0) {
+			usleep(1000);
+			continue;
+		}
+		for (ssize_t i = 0; i < n; i++) {
+			part[have++] = buf[i];
+			if (have == 4) {
+				uint16_t l = (uint16_t)(part[0] | part[1] << 8), r = (uint16_t)(part[2] | part[3] << 8);
+				if ((uint16_t)~l != r) {
+					bad_frames++;
+				}
+				last_n = l;
+				got_frames++;
+				have = 0;
+			}
+		}
+	}
+	return NULL;
+}
+
+static void
+fill(int16_t *buf, UInt32 frames, UInt32 *counter)
+{
+	for (UInt32 i = 0; i < frames; i++, (*counter)++) {
+		buf[2 * i] = (int16_t)(uint16_t)*counter;
+		buf[2 * i + 1] = (int16_t)(uint16_t)~(uint16_t)*counter;
+	}
+}
+
 int
 main(int argc, char **argv)
 {
+	const char *fifo = argc > 2 ? argv[2] : NULL;
+
+	if (fifo != NULL) {
+		(void)unlink(fifo);
+		if (mkfifo(fifo, 0600) != 0 || (fifo_fd = open(fifo, O_RDONLY | O_NONBLOCK)) < 0) {
+			printf("FAIL: no FIFO %s: %s\n", fifo, strerror(errno));
+			return 1;
+		}
+		/* phase 1 (no node) runs before the path is given: open a path that does not exist */
+		setenv("NEGRONI_AUDIO_TEST_PATH", "/nonexistent/negroni-audio", 1);
+	}
 	void *h = dlopen(argc > 1 ? argv[1] : "NegroniAudio", RTLD_NOW);
 	void *(*create)(CFAllocatorRef, CFUUIDRef);
 	UInt32 words[8], n;
@@ -127,6 +189,63 @@ main(int argc, char **argv)
 	CHECK((*drv)->DoIOOperation(drv, ids[1], ids[1] + 1, 1, 'read', 256, NULL, buf, NULL) == 0 && buf[0] == 0 && buf[255] == 0 &&
 	    buf[256] == 0x5555, "Hawking input is 256 mono frames of silence");
 	CHECK((*drv)->StopIO(drv, ids[0], 1) == 0, "StopIO");
+
+	void (*stats)(UInt64 *) = (void (*)(UInt64 *))dlsym(h, "NegroniAudio_TestStats");
+	if (fifo != NULL && stats != NULL) {
+		UInt64 st4[4];
+		UInt32 counter = 0;
+		pthread_t rt;
+
+		stats(st4);
+		CHECK(st4[0] == 512000 && st4[1] == 512000 && st4[2] == 0, "no node: %llu in, %llu dropped, %llu bytes out", st4[0],
+		    st4[1], st4[2]);
+		/* phase 2: the FIFO as the node, nobody reads: the FIFO fills, then the ring; the rest is dropped */
+		setenv("NEGRONI_AUDIO_TEST_PATH", fifo, 1);
+		(*drv)->Initialize(drv, &host_if);      /* takes the new path (host build only) */
+		CHECK((*drv)->StartIO(drv, ids[0], 1) == 0, "StartIO 2");
+		t0 = mach_absolute_time();
+		for (int i = 0; i < 200; i++) {         /* 102400 frames, > FIFO + ring (16384 frames) */
+			fill(buf, 512, &counter);
+			CHECK((*drv)->DoIOOperation(drv, ids[0], out, 1, 'rite', 512, NULL, buf, NULL) == 0, "DoIO write 2");
+			if (i % 20 == 0) {
+				usleep(6000);           /* let the writer run */
+			}
+		}
+		us = (mach_absolute_time() - t0) * tb.numer / tb.denom / 1000;
+		usleep(30000);
+		stats(st4);
+		CHECK(st4[0] == 102400 && st4[1] > 0 && st4[3] > 0 && st4[0] == st4[2] / 4 + st4[1] + st4[3] / 4,
+		    "overflow: %llu in, %llu dropped, %llu frames out, %llu waiting", st4[0], st4[1], st4[2] / 4, st4[3] / 4);
+		printf("overflow: %llu frames in, %llu dropped, %llu to the FIFO, %llu waiting in the ring\n", st4[0], st4[1],
+		    st4[2] / 4, st4[3] / 4);
+		/* phase 3: a reader: everything waiting arrives, then 300 paced periods arrive without a drop */
+		pthread_create(&rt, NULL, reader, NULL);
+		usleep(100000);
+		stats(st4);
+		CHECK(st4[3] == 0, "ring not drained: %llu bytes", st4[3]);
+		UInt64 dropped_before = st4[1];
+		for (int i = 0; i < 300; i++) {         /* 300 x 512 frames = 9.4 ring wraps */
+			fill(buf, 512, &counter);
+			CHECK((*drv)->DoIOOperation(drv, ids[0], out, 1, 'rite', 512, NULL, buf, NULL) == 0, "DoIO write 3");
+			usleep(2000);
+		}
+		usleep(100000);
+		CHECK((*drv)->StopIO(drv, ids[0], 1) == 0, "StopIO 2");
+		usleep(20000);
+		__atomic_store_n(&reader_stop, 1, __ATOMIC_RELEASE);
+		pthread_join(rt, NULL);
+		stats(st4);
+		CHECK(st4[1] == dropped_before, "drops with a reader: %llu -> %llu", dropped_before, st4[1]);
+		CHECK(got_frames == st4[2] / 4 && got_frames == st4[0] - st4[1], "FIFO got %llu frames, plug-in says %llu out, %llu in - %llu dropped",
+		    got_frames, st4[2] / 4, st4[0], st4[1]);
+		CHECK(bad_frames == 0 && last_n == (uint16_t)(counter - 1), "%llu torn frames, last %u of %u", bad_frames, last_n,
+		    (unsigned)(uint16_t)(counter - 1));
+		printf("ring: %llu frames through the FIFO, %llu dropped (all in the overflow phase), 0 torn\n", got_frames, st4[1]);
+		close(fifo_fd);
+		unlink(fifo);
+	} else if (fifo != NULL) {
+		CHECK(0, "no NegroniAudio_TestStats: build with -DNEGRONI_AUDIO_HOST_TEST");
+	}
 
 	printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
 	return failures != 0;

@@ -17,11 +17,11 @@ is off by default.
 
 | Stage | What | State | Effort |
 |---|---|---|---|
-| 0 | mediaserverd stops aborting: HAL plug-in `NegroniAudio.driver` with "Speaker"/"Hawking"/"Actuator"/"Codec", samples dropped | **built, host-tested, not on the phone** (`userland/audio/`, root hook `AUDIO=1`) | phone test |
-| a | ADSP firmware load + start (PAS id 1), SMP2P ready | **code done, builds, untested** (patch 0240, `negroniadsp=1`) | 1-3 days of tests |
-| b | GLINK + QRTR + GPR, AudioReach graph for the speaker (PRM clock, **TERT MI2S I2S sink**) | planned (facts below) | 2-3 weeks, highest risk |
+| 0 | mediaserverd stops aborting: HAL plug-in `NegroniAudio.driver` with "Speaker"/"Hawking"/"Actuator"/"Codec", samples dropped. **XPC-misuse crash fix**: BTAudioHALPlugin moved to `HAL.disabled` (its factory sent XPC to absent bluetoothd) | **built, host-tested, on the live root; XPC fix added** (`userland/audio/`, root hook `AUDIO=1`; `scripts/audio/phone-audio.sh`) | phone test |
+| a | ADSP firmware load + start (PAS id 1), SMP2P ready, **GLINK up (step 9)** | **code done, builds, untested** (patches 0240/0242, `negroniadsp=1`) | 1-3 days of tests |
+| b | GLINK + QRTR + GPR, AudioReach graph for the speaker (PRM clock, **TERT MI2S I2S sink**), shared memory | **code done, builds, untested** (patch 0243, `negroniadsp_step=10..15`) | 2-3 weeks of tests, highest risk |
 | c | 2x TFA9874 init over I2C (register writes only), I2S slave | planned (facts below) | 4-7 days |
-| d | kernel `/dev/negroni-audio` + the stage 0 plug-in writes to it | planned (ABI in `userland/audio/negroni_audio.h`) | 2-4 days |
+| d | kernel `/dev/negroni-audio` + the stage 0 plug-in writes to it | **code done in stage (b) step 15 (patch 0243); the plug-in stage 1 (ring + writer thread) is built** (ABI in `userland/audio/negroni_audio.h`) | 2-4 days |
 
 The model is HackiOS (`external/hackios-xnu-kernel`, `external/hackios-xnu-userland`). HackiOS plays
 iOS 16.5 sound through the speakers of an SM7325 phone with an iPhone X identity (the same identity
@@ -218,7 +218,83 @@ Risks of stage a:
   enables them [I: harmless].
 - The AOP QMP open can race with another QMP user. No other XNU code uses QMP now [V].
 
-## Stage b: GLINK, QRTR, GPR and the AudioReach speaker graph (planned)
+## Implemented 2026-10-26 (patches 0242, 0243; build-only, untested on the phone)
+
+**Patch 0242 (ADSP step 9, GLINK over SMEM).** `bsd/dev/negroni_adsp.c` gains `step_glink`. It makes
+SMEM items 478 (descriptors, 4 words) and 479 (our 16 KiB TX FIFO), waits for the ADSP's FIFO 480,
+runs the GLINK version-1 handshake, opens channels `IPCRTR` (lcid 1) and `adsp_apps` (lcid 2), gives
+each channel RX intents (8 x 4 KiB on adsp_apps, 4 x 4 KiB on IPCRTR; an ADSP RX_INTENT_REQ is
+granted up to 0x4400 bytes, the largest live-DT intent; our own TX messages stay <= 4096 bytes), and
+offers the stable API `negroni_glink_poll`/`_up`/`_set_rx`/`_send` to stage (b) and the charger client
+(0274). One recursive mutex inside the API serializes the ADSP thread, the /dev/negroni-audio writer
+and the charger client. RX_DONE_W_REUSE only when both sides agree on INTENT_REUSE, else RX_DONE and
+the buffer is given again. Repeated GLINK complaints are capped at 8 lines. Also in 0242: every ADSP step now runs under a time limit
+(`negroniadsp_steptimeout=MS`, default 15000) and a failed step prints
+`NEGRONI ADSP: step N (name) failed: reason`. `smem_alloc_ours` became a general `smem_alloc(item, bytes)`.
+New header `bsd/dev/negroni_adsp.h` (the GLINK + stage-b interface). file:line anchors:
+`step_glink` in `negroni_adsp.c`; the step table and the fail line in `adsp_thread`.
+
+**Patch 0243 (stage (b) + (d)).** New `bsd/dev/negroni_audio.c` + `bsd/dev/negroni_audio_abi.h` (a kernel
+copy of `userland/audio/negroni_audio.h`). `negroni_adsp.c` steps 10..15 call `negroni_audio_step(n, ...)`:
+
+| Step | Action | Pass log |
+|---|---|---|
+| 10 | QRTR: HELLO on IPCRTR (20-byte control body), record the ADSP's NEW_SERVER list; no servreg locator yet | `QRTR: HELLO from node N` |
+| 11 | GPR: `APM_CMD_GET_SPF_STATE` 0x01001021 (+ zeroed 16-byte cmd header, 40 bytes) -> 0x02001007 status 1 | `SPF READY` |
+| 12 | PRM: `PRM_CMD_REQUEST_HW_RSC` TER MI2S IBIT clock 0x104 at 3.072 MHz; I2S pins 121..124 to func 1 | `PRM clock up, I2S pins 121..124` |
+| 13 | `APM_CMD_GRAPH_OPEN` (WR_SH_MEM_EP -> PCM_CNV -> MFC -> I2S_SINK), SET_CFG each module, PREPARE | `GRAPH SET_CFG and PREPARE ok` |
+| 14 | `SHARED_MEM_MAP_REGIONS` of our ring (contiguous, < 4 GiB, given as phys \| (SID 0x1801 & 0xf) << 32), WR EP media format, START | `GRAPH STARTED` |
+| 15 | make `/dev/negroni-audio`; `write()` of S16LE stereo converts to S24 and sends periods to the WR EP | `THE SPEAKER SINK IS LIVE` |
+
+Design notes [V in code, I/U for behaviour]:
+- The graph has two sub-graphs (stream 0x04000001, device 0x04000002), two containers, four built-in
+  modules (WR_SH_MEM_EP 0x07001000, PCM_CNV 0x07001003, MFC 0x07001015, I2S_SINK 0x0700100A), three
+  connections. The NXP TFA module is left out (it is a dynamic FastRPC module; stage (c) drives the
+  amps by register writes). The I2S sink is TERTIARY (intf 2), SD1, internal WS; MFC/WR EP = 48 kHz,
+  S24-in-32-bit, stereo. Module instance ids 0x6001..0x6004; APM iid 1, PRM iid 2.
+- Review fixes 2026-10-26 (coordinator review, all applied): BASIC_RSP matched on the echoed command
+  opcode; PRM status = payload word 1; GET_SPF_STATE carries the cmd header; QRTR control bodies start
+  with the cmd word; the ring is cleaned before each send; default last step 9; the GLINK mutex; the
+  unanswered locator announcement removed; TLMM cfg = FUNC 1 | 8 mA (3 << 6).
+- SMMU [I]: step 14 assumes the boot chain passes SID 0x1801 untranslated and gives the ADSP the
+  physical ring address with the SID bit (like redwood_sound.c's "passed" path). It needs a physically
+  contiguous ring and fails cleanly (audio off, no SoC reset) if the ring is not one piece. A full SMMU
+  context (redwood_sound.c `space_on`) is NOT ported yet: if the boot chain translates SID 0x1801, step
+  14 stops.
+- The /dev/negroni-audio write path (step 15) fills the current period frame by frame (the HAL writes
+  ~240-frame chunks, not whole 960-frame periods), cleans a full period to PoC (LPASS is not coherent)
+  and sends `DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER` 0x04001000 to the WR EP iid. The writer polls GLINK for
+  the DONE events (0x05001000); with 7 of 8 periods in flight the new period is dropped, so a period the
+  ADSP still reads is never overwritten. write() can block the plug-in's writer thread (not the HAL
+  real-time thread) for up to ~1.2 s inside negroni_glink_send. SET_VOLUME: mute is applied,
+  `below` is stored only. GET_STATS works. The node exists only after step 15 runs.
+- Re-review fixes [V]: adsp_apps gets 8 intents at open (4 slots stay free for RX_INTENT_REQ); the writer
+  re-bases its in-flight count (logged once) after 2 x PERIODS busy drops in a row or a DONE count above
+  the sent count, so a lost or extra DONE cannot stop it. `negroniaudio_v2=1` sends
+  DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2 0x0400100A (11 words, DONE 0x05001004, as Linux q6apm.c and GSL);
+  the default is V1 0x04001000 / 0x05001000. If step 15 shows no DONE, try V2 first [I].
+- Gating and SoC-reset risk: `negroniadsp=1` alone stops at step 9 (ADSP + GLINK, no audio); stage (b)
+  runs only with `negroniadsp_step=10..15`. Each step has a time limit; a stage-(b) failure calls `negroni_audio_stop` (GRAPH_STOP/CLOSE,
+  mem unmap) and leaves the ADSP up — it does not re-reset or shut down the DSP, so a graph error does
+  not reset the SoC. Only an ADSP firmware fault (steps 1..8) can reset the SoC, and those are gated as
+  before.
+
+**Userland (stage 0 + stage 1).** `scripts/audio/hfs-extract.py` (read-only, reads the HFS+ catalog in
+`~/op10-apple/ios16-root.simg` with no raw copy) pulled the 20H392 HAL plug-ins to `out/audio/hal-plugins/`.
+The mediaserverd `__xpc_api_misuse` SIGTRAP (logs/symb-ms.log, symb-ms2.log, main image + 0x42ee674 /
++0x437a674) is `BTAudioHALPlugin.driver`: its factory `_AudioServerPlugIn_Create` (Info.plist) opens an
+XPC connection to `com.apple.BTAudioHALPlugin.xpc` (bluetoothd, absent here) and sends on it [V, offsets
+0x32670/0x356f8/0x3576c matched]. Fix [V]: `scripts/audio/root-add-audio.sh` (step 2b) and
+`scripts/audio/phone-audio.sh` move `BTAudioHALPlugin.driver` to `HAL.disabled/` by default (`BTAUDIO=1`
+keeps it); `phone-audio.sh revert` restores it. The std::terminate SIGABRT is not decided [U]: it also
+happened on 2026-10-24 before NegroniAudio existed, so it is not our plug-in [I]. `NegroniAudio.c` stage
+1 [V]: the real-time I/O thread copies the Speaker S16LE frames into a lock-free SPSC ring (16384 frames,
+341 ms); a writer pthread (StartIO..StopIO) drains it to `/dev/negroni-audio` every 5 ms, keeps bytes the
+kernel did not take, drops on a full ring, reopens on ENODEV every 2 s. `build.sh` PASS (layout 23/23,
+host test 0 failures, arm64 minos 16.0, iOS 16 imports only). Driver sha256
+`7770ccb43a527c236db723280778cdee3371a9a1e55d9376a64eba4f288b6a0b`. ABI `negroni_audio.h`: no change.
+
+## Stage b: GLINK, QRTR, GPR and the AudioReach speaker graph (implemented 2026-10-26, patch 0243; the facts below are the design)
 
 Kernel files (names from the draft `out/kernel/tree-audio/bsd/dev/negroni_audio_internal.h`, not a
 patch yet): `negroni_glink.c` (GLINK, QRTR, GPR transport), `negroni_gpr.c` (APM/PRM, the graph),

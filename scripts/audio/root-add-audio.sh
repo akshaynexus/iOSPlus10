@@ -9,10 +9,17 @@
 #  2. VirtualAudio.plugin back to /Library/Audio/Plug-Ins/HAL/ if the slop tweaks moved it to
 #     HAL.disabled/ (VirtualAudio needs our "Speaker" + "Hawking" devices; without them it
 #     crashed in ApplyBeamFormerPreference, slop NOTES)
+#  2b. BTAudioHALPlugin.driver to /System/Library/Audio/Plug-Ins/HAL.disabled/ (default; BTAUDIO=1
+#     keeps it). Its factory AudioServerPlugIn_Create (0x356f8) builds an object whose init
+#     (0x32508) calls xpc_connection_create_mach_service("com.apple.BTAudioHALPlugin.xpc") and
+#     xpc_connection_send_message (bl at 0x32670): that trapped twice in mediaserverd
+#     (__xpc_api_misuse / _os_object_retain, logs/symb-ms.log, symb-ms2.log; the crash offsets
+#     match this bundle only, scripts/audio/hfs-extract.py). The phone has no Bluetooth driver.
 #  3. StartRecorderServer = false in every MediaToolbox SubServerConfiguration.plist (the
 #     portrait prewarm calls a NULL GL function without a GPU)
 #  4. checks: the D22 tunings and the UI sounds are in the root
-# Undo: AUDIO=0 does nothing; to remove, delete the driver and run the slop tweaks again.
+# Undo: AUDIO=0 does nothing; to remove, delete the driver and run the slop tweaks again;
+# BTAUDIO=1 moves BTAudioHALPlugin.driver back from HAL.disabled (or keeps it in place).
 set -eu
 R=${1:?usage: AUDIO=1 $0 MOUNTED_ROOT}
 if [ "${AUDIO:-0}" != 1 ]; then echo "audio: skipped (AUDIO=1 adds NegroniAudio.driver + VirtualAudio)"; exit 0; fi
@@ -46,6 +53,20 @@ elif [ -d "$VA" ]; then
   echo "audio: VirtualAudio.plugin is in place"
 else
   echo "audio: WARNING: no VirtualAudio.plugin in the root (no speaker route without it)" >&2
+fi
+
+# 2b. BTAudioHALPlugin off (its factory XPC call trapped in mediaserverd; no Bluetooth here)
+BT=$HAL/BTAudioHALPlugin.driver
+BTOFF=$R/System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver
+if [ "${BTAUDIO:-0}" = 1 ]; then
+  if [ -d "$BTOFF" ] && [ ! -e "$BT" ]; then mv "$BTOFF" "$BT"; echo "audio: BTAudioHALPlugin.driver restored (BTAUDIO=1)"; fi
+elif [ -d "$BT" ]; then
+  mkdir -p "$(dirname "$BTOFF")"
+  rm -rf "$BTOFF"
+  mv "$BT" "$BTOFF"
+  echo "audio: BTAudioHALPlugin.driver moved to /System/Library/Audio/Plug-Ins/HAL.disabled"
+else
+  echo "audio: BTAudioHALPlugin.driver is not in HAL (already disabled or missing)"
 fi
 
 # 3. StartRecorderServer off (slop does this too; check it)

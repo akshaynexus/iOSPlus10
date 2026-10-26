@@ -25,7 +25,7 @@
 #define NEGRONI_AUDIO_FRAME     4       /* bytes per frame */
 
 struct negroni_audio_volume {
-	uint32_t below;                 /* 1/8 dB below the kernel maximum */
+	uint32_t below;                 /* 1/8 dB below the kernel maximum (0243: stored, not applied yet) */
 	uint32_t muted;                 /* 1: iOS volume 0 */
 };
 

@@ -1,0 +1,1362 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 8de128a..bdbe8ef 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -117,6 +117,7 @@ bsd/dev/negroni_rpmh.c			standard
+ bsd/dev/negroni_spmi.c			standard
+ bsd/dev/negroni_usb.c			standard
+ bsd/dev/negroni_gpu_blit.c		standard
++bsd/dev/negroni_audio.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
+index d55c783..c4b7083 100644
+--- a/bsd/dev/negroni_adsp.c
++++ b/bsd/dev/negroni_adsp.c
+@@ -67,7 +67,7 @@ extern int negroni_ufs_adsp_area_read(uint64_t at, void *dst, uint32_t count);
+ extern int negroni_rpmh_arc_vote(const char *res, unsigned level);
+ void negroni_adsp_init(void);
+ 
+-#define STEPS                   9
++#define STEPS                   15      /* 1..8 ADSP start, 9 GLINK, 10..15 stage (b): negroni_audio.c */
+ 
+ /*
+  * Mappings. ml_io_map and ml_io_map_wcomb take their VA from io_submap: 8 MiB for the whole
+@@ -183,7 +183,7 @@ struct seg {
+ 	uint32_t type, offset, paddr, filesz, memsz, flags;
+ };
+ 
+-static uint32_t step, last_step = STEPS, pause_ms, wait_s = 10, unvote = 1;
++static uint32_t step, last_step = 9 /* GLINK up, no audio: steps 10..15 only when asked */, pause_ms, wait_s = 10, unvote = 1;
+ static vm_offset_t smem, ipcc, aoss, tcsr;
+ static struct area_header *area;                /* kmem, AREA_HEADER bytes */
+ static uint8_t *mdt;                            /* kmem copy of adsp.mdt */
+@@ -196,6 +196,7 @@ static char fail_why[192];                           /* reason of the failed ste
+ static const char *const step_names[] = {
+ 	"SMEM survey", "firmware area", "rails", "AOP QMP", "PAS init", "load", "SMP2P", "start", "GLINK",
+ };
++static char stage_b_why[192];
+ 
+ #define say(fmt, ...) printf("NEGRONI ADSP: %u " fmt "\n", step, ##__VA_ARGS__)
+ /* the reason of a failed step: kept for the "step N failed" line, and logged at once */
+@@ -1659,10 +1660,29 @@ step_glink(void)
+ 	return true;
+ }
+ 
++
++/* steps 10..15 are stage (b) (negroni_audio.c): one bridge per step keeps the timing/fail line. */
++static bool
++step_audio(uint32_t n)
++{
++	if (negroni_audio_step(n, step_budget_ms, stage_b_why, sizeof(stage_b_why))) {
++		return true;
++	}
++	strlcpy(fail_why, stage_b_why, sizeof(fail_why));
++	return false;
++}
++static bool step_audio10(void) { return step_audio(10); }
++static bool step_audio11(void) { return step_audio(11); }
++static bool step_audio12(void) { return step_audio(12); }
++static bool step_audio13(void) { return step_audio(13); }
++static bool step_audio14(void) { return step_audio(14); }
++static bool step_audio15(void) { return step_audio(15); }
++
+ static bool (*const steps[STEPS])(void) = {
+ 	step_survey, step_firmware, step_rails, step_aop, step_pas_init, step_load, step_smp2p, step_start, step_glink,
++	step_audio10, step_audio11, step_audio12, step_audio13, step_audio14, step_audio15,
+ };
+-_Static_assert(sizeof(step_names) / sizeof(step_names[0]) == STEPS, "one name per step");
++_Static_assert(sizeof(step_names) / sizeof(step_names[0]) == 9, "one name per ADSP step 1..9");
+ 
+ static void
+ adsp_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -1677,14 +1697,19 @@ adsp_thread(__unused void *arg, __unused wait_result_t wr)
+ 		ok = steps[step - 1]();
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+ 		if (!ok) {
+-			printf("NEGRONI ADSP: step %u (%s) failed: %s (after %llu ms)\n", step, step_names[step - 1],
++			printf("NEGRONI ADSP: step %u (%s) failed: %s (after %llu ms)\n", step,
++			    step <= 9 ? step_names[step - 1] : negroni_audio_step_name(step),
+ 			    fail_why[0] ? fail_why : "no reason logged", ns / 1000000);
+ 			failed = true;
+ 			break;
+ 		}
+-		printf("NEGRONI ADSP: step %u (%s) ok in %llu ms%s\n", step, step_names[step - 1], ns / 1000000,
++		printf("NEGRONI ADSP: step %u (%s) ok in %llu ms%s\n", step,
++		    step <= 9 ? step_names[step - 1] : negroni_audio_step_name(step), ns / 1000000,
+ 		    ns / 1000000 > step_budget_ms ? " (OVER the step time limit)" : "");
+ 	}
++	if (failed && step >= 10) {
++		negroni_audio_stop("a stage (b) step failed");       /* graph/clock down; keeps the ADSP up */
++	}
+ 	if (failed && step >= 5 && step < 8) {
+ 		pas_shutdown("a step after PAS init failed");
+ 	}
+diff --git a/bsd/dev/negroni_adsp.h b/bsd/dev/negroni_adsp.h
+index dc4d57b..e6d6040 100644
+--- a/bsd/dev/negroni_adsp.h
++++ b/bsd/dev/negroni_adsp.h
+@@ -1,6 +1,8 @@
+ /*
+  * NEGRONI (SM8450) audio DSP: the interface between negroni_adsp.c (stage (a): ADSP start, step 9
+- * GLINK) and stage (b) (patch 0243). iOSPlus10 docs/audio-plan.md. One recursive mutex (gl_lock) inside the public GLINK API serializes its callers.
++ * GLINK) and negroni_audio.c (stage (b): QRTR, GPR, the speaker graph, /dev/negroni-audio).
++ * iOSPlus10 docs/audio-plan.md. One recursive mutex (gl_lock) inside the public GLINK API
++ * serializes its callers (the ADSP thread, the audio writer, the charger client).
+  */
+ #ifndef _NEGRONI_ADSP_H_
+ #define _NEGRONI_ADSP_H_
+@@ -15,4 +17,14 @@ bool negroni_glink_up(unsigned channel);
+ void negroni_glink_set_rx(unsigned channel, void (*fn)(const uint8_t *data, uint32_t len));
+ int negroni_glink_send(unsigned channel, const void *data, uint32_t len);
+ 
++/* stage (b) (negroni_audio.c): first and last step numbers it runs */
++#define NEGRONI_AUDIO_FIRST_STEP        10
++#define NEGRONI_AUDIO_LAST_STEP         15
++/* Run step n (10..15). false: failed, the reason is in why. budget_ms: time limit of the step. */
++bool negroni_audio_step(uint32_t n, uint32_t budget_ms, char *why, size_t whylen);
++const char *negroni_audio_step_name(uint32_t n);
++/* After a failed or a final step: graph down, clock released, sink off (safe to call twice). */
++void negroni_audio_stop(const char *reason);
++void negroni_audio_init(void);          /* /dev/negroni-audio (ENODEV until step 15 runs) */
++
+ #endif
+diff --git a/bsd/dev/negroni_audio.c b/bsd/dev/negroni_audio.c
+new file mode 100644
+index 0000000..69539b7
+--- /dev/null
++++ b/bsd/dev/negroni_audio.c
+@@ -0,0 +1,1177 @@
++/*
++ * NEGRONI (SM8450) audio stage (b) + (d): QRTR service discovery, GPR, the
++ * PRM clock, the AudioReach speaker graph, the shared-memory ring to the ADSP, and the
++ * /dev/negroni-audio char device that the stage-0 HAL plug-in writes (userland/audio). iOSPlus10
++ * docs/audio-plan.md stage (b). UNTESTED ON HARDWARE. Off by default.
++ *
++ * It runs after the ADSP is up (negroni_adsp.c steps 8, 9). Only negroniadsp_step=10..15 runs these
++ * steps (the default stops at 9: the ADSP up with GLINK, no audio).
++ * (patch 0243 extends the ADSP step table). Each step has a time limit and prints
++ * "NEGRONI AUDIO: step N (name) failed: reason" on a failure. Log prefix "NEGRONI AUDIO:".
++ *
++ *  10  QRTR   HELLO on IPCRTR; records the ADSP's NEW_SERVER list (no servreg locator yet)
++ *  11  GPR    APM_CMD_GET_SPF_STATE on adsp_apps -> ready (0x02001007 status 1)
++ *  12  PRM    PRM_CMD_REQUEST_HW_RSC: TER MI2S IBIT clock (0x104) at 3.072 MHz; the I2S pins
++ *             (GPIO121..124) to function 1 in TLMM
++ *  13  graph  APM_CMD_GRAPH_OPEN (WR_SH_MEM_EP -> PCM_CNV -> MFC -> I2S_SINK), SET_CFG, PREPARE
++ *  14  shmem  SHARED_MEM_MAP_REGIONS of our ring: physically contiguous, below 4 GiB, given to the
++ *             ADSP as phys | (SID 0x1801 & 0xf) << 32 (assumes the boot chain lets SID 0x1801 through
++ *             untranslated; no SMMU programming here), the WR EP media format, GRAPH_START
++ *  15  sink   enable /dev/negroni-audio; the write() path hands S16->S24 frames to the WR EP
++ *
++ * Addresses: live DT (apps-smmu@15000000, pinctrl@f000000, remoteproc-adsp). Protocol from Linux
++ * (qcom_glink_native.c, af_qrtr.c, ns.c, qcom_pd_mapper.c, apr.c, q6apm.c, q6prm.c, audioreach.c,
++ * audioreach.h) and the AudioReach SPF api, read for the wire format only; our own code. The SMMU
++ * context setup follows hackios-xnu-kernel redwood_sound.c (APSL 2.0).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <sys/ioccom.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <machine/atomic.h>
++#include <pexpert/pexpert.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include <libkern/libkern.h>
++#include "negroni_adsp.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern uint64_t kvtophys(vm_offset_t va);
++extern void IOSleep(unsigned int ms);
++
++/* ==== numbers from docs/audio-plan.md ==== */
++#define TLMM_PHYS               0x0f000000UL     /* pinctrl@f000000 */
++#define TLMM_PIN(n)             ((vm_offset_t)(n) * 0x1000)
++#define TLMM_SIZE               (TLMM_PIN(210))
++#define APPS_SMMU_PHYS          0x15000000UL
++#define APPS_SMMU_SIZE          0x100000u
++#define AUDIO_SID               0x1801u          /* <&apps_smmu 0x1801 0> */
++#define AUDIO_IOVA              0x10000000ull     /* qcom,iommu-dma-addr-pool */
++#define AUDIO_SID_MSW           1u                /* addr_msw = SID & 0xf */
++
++/* I2S: TERTIARY, SD1 out (GPIO124), internal WS; 48 kHz S24 in 32-bit slots -> BCLK 3.072 MHz */
++#define CLOCK_ID_TER_MI2S_IBIT  0x104u
++#define MI2S_BCLK_HZ            3072000u
++#define CLOCK_ATTR_COUPLE_NO    1u
++#define I2S_SD1                 2u
++#define I2S_INTF_TERTIARY       2u
++#define I2S_WS_SRC_INTERNAL     1u
++
++/* ring: the HAL writes S16 stereo 48 kHz; we convert to S24 and give the ADSP PERIODS periods */
++#define PERIODS                 8u
++#define PERIOD_FRAMES           960u             /* 20 ms */
++#define OUT_FRAME_BYTES         8u               /* S24-in-32-bit, 2 ch */
++#define PERIOD_BYTES            (PERIOD_FRAMES * OUT_FRAME_BYTES)
++#define RING_BYTES              ((PERIODS * PERIOD_BYTES + 0xfff) & ~0xfffu)
++
++/* GPR header (apr.h struct gpr_hdr, 24 bytes) */
++#define GPR_VER                 0u
++#define GPR_HDR_WORDS           6u
++#define GPR_DOMAIN_ADSP         2u
++#define GPR_DOMAIN_APPS         3u
++#define GPR_APM_IID             1u
++#define GPR_PRM_IID             2u
++#define GPR_PORT_APM            1u               /* ADSP APM port */
++#define GPR_PORT_PRM            2u               /* ADSP PRM port */
++#define GPR_SRC_PORT            0x10000001u      /* our dynamic port */
++
++/* AudioReach opcodes (audioreach.h) */
++#define APM_CMD_GRAPH_OPEN      0x01001000u
++#define APM_CMD_GRAPH_PREPARE   0x01001001u
++#define APM_CMD_GRAPH_START     0x01001002u
++#define APM_CMD_GRAPH_STOP      0x01001003u
++#define APM_CMD_GRAPH_CLOSE     0x01001004u
++#define APM_CMD_SET_CFG         0x01001006u
++#define APM_CMD_SHARED_MEM_MAP  0x0100100Cu
++#define APM_CMD_SHARED_MEM_UNMAP 0x0100100Du
++#define APM_CMD_GET_SPF_STATE   0x01001021u
++#define APM_RSP_GET_SPF_STATE   0x02001007u
++#define APM_RSP_SHARED_MEM_MAP  0x02001001u
++#define GPR_BASIC_RSP_RESULT    0x02001005u
++#define GPR_BASIC_EVT_ACCEPTED  0x02001006u
++#define PRM_CMD_REQUEST_HW_RSC  0x0100100Fu
++#define PRM_CMD_RELEASE_HW_RSC  0x01001010u
++#define PRM_RSP_REQUEST_HW_RSC  0x02001002u
++#define PRM_RSP_RELEASE_HW_RSC  0x02001003u
++#define DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER 0x04001000u
++#define DATA_CMD_WR_SH_MEM_EP_MEDIA_FORMAT 0x04001001u
++#define DATA_RSP_WR_SH_MEM_EP_DONE 0x05001000u
++#define DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2 0x0400100Au  /* + md addr/handle/size: 11 words (Linux q6apm.c) */
++#define DATA_RSP_WR_SH_MEM_EP_DONE_V2 0x05001004u
++
++#define PARAM_ID_RSC_AUDIO_HW_CLK 0x0800102Cu
++#define APM_PARAM_ID_SUB_GRAPH_CONFIG 0x08001001u
++#define APM_PARAM_ID_CONTAINER_CONFIG 0x08001000u
++#define APM_PARAM_ID_MODULE_LIST 0x08001002u
++#define APM_PARAM_ID_MODULE_PROP 0x08001003u
++#define APM_PARAM_ID_MODULE_CONN 0x08001004u
++#define APM_PARAM_ID_SUB_GRAPH_LIST 0x08001005u
++#define APM_SG_PROP_ID_PERF_MODE 0x0800100Eu
++#define APM_SG_PROP_ID_DIRECTION 0x0800100Fu
++#define APM_SG_PROP_ID_SCENARIO_ID 0x08001010u
++#define APM_CONT_PROP_ID_CAPABILITY_LIST 0x08001011u
++#define APM_CONT_PROP_ID_GRAPH_POS 0x08001012u
++#define APM_CONT_PROP_ID_STACK_SIZE 0x08001013u
++#define APM_CONT_PROP_ID_PROC_DOMAIN 0x08001014u
++#define PARAM_ID_I2S_INTF_CFG   0x08001019u
++#define PARAM_ID_HW_EP_MF_CFG   0x08001017u
++#define PARAM_ID_HW_EP_FRAME_SIZE_FACTOR 0x08001018u
++#define PARAM_ID_PCM_OUTPUT_FORMAT_CFG 0x08001008u
++#define PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT 0x08001024u
++#define PARAM_ID_MEDIA_FORMAT   0x0800100Cu
++
++#define MODULE_ID_WR_SH_MEM_EP  0x07001000u
++#define MODULE_ID_PCM_CNV       0x07001003u
++#define MODULE_ID_MFC           0x07001015u
++#define MODULE_ID_I2S_SINK      0x0700100Au
++
++#define PORT_WR_EP_OUT          1u
++#define PORT_PCM_IN             2u
++#define PORT_PCM_OUT            1u
++#define PORT_MFC_IN             2u
++#define PORT_MFC_OUT            1u
++#define PORT_I2S_IN             2u               /* I2S_SINK data input port */
++
++/* our instance ids (ranges from audioreach.h) */
++#define SG_STREAM               0x04000001u
++#define SG_DEVICE               0x04000002u
++#define CONT_STREAM             0x05000001u
++#define CONT_DEVICE             0x05000002u
++#define IID_WR_EP               0x00006001u
++#define IID_PCM                 0x00006002u
++#define IID_MFC                 0x00006003u
++#define IID_I2S                 0x00006004u
++
++#define MEM_POOL_SHMEM8_4K      3u
++#define APM_MODULE_INSTANCE_ID  1u
++#define DATA_FORMAT_FIXED_POINT 1u
++#define MEDIA_FMT_ID_PCM        0x09001000u
++#define PCM_LSB_ALIGNED         1u
++#define PCM_LITTLE_ENDIAN       1u
++#define PCM_CHANNEL_L           1u
++#define PCM_CHANNEL_R           2u
++#define APM_SG_PERF_LOW_LATENCY 2u
++#define APM_SG_DIR_RX           2u
++#define APM_SG_SID_PLAYBACK     1u
++#define APM_CONT_CAP_PP         1u
++#define APM_CONT_CAP_EP         3u
++#define APM_CONT_GRAPH_POS_STREAM 1u
++#define APM_CONT_GRAPH_POS_STR_DEV 3u
++#define APM_PROC_DOMAIN_ADSP    2u
++
++/* ==== state ==== */
++static uint32_t step;
++static uint32_t budget_ms = 15000;
++static char fail_why[192];
++static vm_offset_t tlmm;
++static uint32_t spf_ready;
++static uint32_t mem_map_handle;
++static vm_offset_t ring;                        /* RING_BYTES of ours, the periods */
++static uint64_t ring_iova;                      /* the ADSP's view of ring */
++static uint32_t gpr_reply_status;
++static volatile uint32_t gpr_wait_op;           /* command opcode we wait for (its BASIC_RSP echoes it), 0 = none */
++static uint32_t gpr_wait_rsp;                   /* a specific response opcode that also answers it, or 0 */
++static uint64_t write_done_count;               /* DATA buffer DONE events seen (atomic: gpr_rx) */
++static bool graph_opened, graph_started, clock_on, sink_on, smmu_on;
++
++static LCK_GRP_DECLARE(negroni_smmu_grp, "negroni_smmu");
++static LCK_MTX_DECLARE(negroni_smmu_lock, &negroni_smmu_grp);
++
++#define say(fmt, ...) printf("NEGRONI AUDIO: %u " fmt "\n", step, ##__VA_ARGS__)
++#define FAIL(fmt, ...) do { snprintf(fail_why, sizeof(fail_why), fmt, ##__VA_ARGS__); say("stop: %s", fail_why); } while (0)
++static void announce_note(const char *what);
++
++static void
++wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb osh" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* ==== GPR ==== */
++
++struct gpr_hdr {
++	uint32_t w0;                    /* ver(4) | hdr_words(4) | pkt_size(24) */
++	uint8_t dst_domain, src_domain;
++	uint16_t reserved;
++	uint32_t src_port, dst_port, token, opcode;
++} __attribute__((packed));
++
++static void
++gpr_build_hdr(struct gpr_hdr *h, uint32_t pkt_size, uint32_t dst_port, uint32_t src_port, uint32_t opcode)
++{
++	h->w0 = GPR_VER | GPR_HDR_WORDS << 4 | pkt_size << 8;
++	h->dst_domain = GPR_DOMAIN_ADSP;
++	h->src_domain = GPR_DOMAIN_APPS;
++	h->reserved = 0;
++	h->src_port = src_port;
++	h->dst_port = dst_port;
++	h->token = 0;
++	h->opcode = opcode;
++}
++
++/* the GPR rx (one GLINK packet = one GPR packet); records a BASIC_RSP or GET_SPF_STATE reply */
++static void
++gpr_rx(const uint8_t *data, uint32_t len)
++{
++	const struct gpr_hdr *h = (const void *)data;
++	const uint32_t *pl = (const uint32_t *)(data + sizeof(*h));
++	uint32_t plwords;
++
++	if (len < sizeof(*h)) {
++		return;
++	}
++	plwords = (len - sizeof(*h)) / 4;
++	switch (h->opcode) {
++	case APM_RSP_GET_SPF_STATE:
++		if (plwords >= 1) {
++			spf_ready = pl[0];
++		}
++		break;
++	case GPR_BASIC_RSP_RESULT:              /* {opcode of the command, status} */
++		if (plwords >= 2 && gpr_wait_op && pl[0] == gpr_wait_op) {
++			gpr_reply_status = pl[1];
++			gpr_wait_op = 0;
++		}
++		break;
++	case PRM_RSP_REQUEST_HW_RSC:            /* gpr_ibasic_rsp_result_t {opcode, status} (q6prm.c prm_callback) */
++	case PRM_RSP_RELEASE_HW_RSC:
++		if (plwords >= 2 && gpr_wait_op && gpr_wait_rsp == h->opcode) {
++			gpr_reply_status = pl[1];
++			gpr_wait_op = 0;
++		}
++		break;
++	case APM_RSP_SHARED_MEM_MAP:            /* {mem_map_handle} */
++		if (plwords >= 1) {
++			mem_map_handle = pl[0];
++			if (gpr_wait_op && gpr_wait_rsp == APM_RSP_SHARED_MEM_MAP) {
++				gpr_reply_status = 0;
++				gpr_wait_op = 0;
++			}
++		}
++		break;
++	case DATA_RSP_WR_SH_MEM_EP_DONE:
++	case DATA_RSP_WR_SH_MEM_EP_DONE_V2:
++		os_atomic_inc(&write_done_count, relaxed);
++		break;
++	default:
++		break;
++	}
++}
++
++/*
++ * Send a GPR packet and poll GLINK for its answer: a BASIC_RSP_RESULT that echoes the packet's own
++ * opcode, or (rsp != 0) that specific response opcode. *status = the answer's status (0 = ok).
++ */
++static int
++gpr_send_wait(const void *pkt, uint32_t len, uint32_t rsp, uint32_t *status)
++{
++	struct gpr_hdr h;
++	int rc;
++
++	memcpy(&h, pkt, sizeof(h));
++	gpr_wait_rsp = rsp;
++	gpr_wait_op = h.opcode;
++	gpr_reply_status = ~0u;
++	rc = negroni_glink_send(NEGRONI_GLINK_GPR, pkt, len);
++	if (rc) {
++		gpr_wait_op = 0;
++		return rc;
++	}
++	for (uint32_t ms = 0; ms < budget_ms && gpr_wait_op; ms++) {
++		negroni_glink_poll();
++		if (gpr_wait_op) {
++			IOSleep(1);
++		}
++	}
++	if (gpr_wait_op) {
++		gpr_wait_op = 0;
++		return ETIMEDOUT;
++	}
++	if (status) {
++		*status = gpr_reply_status;
++	}
++	return 0;
++}
++
++/* ==== step 10: QRTR (HELLO, the ADSP's server list) ==== */
++
++struct qrtr_hdr {
++	uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port;
++} __attribute__((packed));
++/* control packet body (uapi qrtr.h struct qrtr_ctrl_pkt): cmd, then server {service, instance, node, port} */
++#define QRTR_CTRL_BYTES 20u                     /* a receiver drops control packets shorter than this (af_qrtr.c) */
++#define QRTR_VER        1u
++#define QRTR_TYPE_HELLO 2u
++#define QRTR_TYPE_NEW_SERVER 4u
++#define QRTR_PORT_CTRL  0xfffffffeu
++#define QRTR_NODE_BCAST 0xffffffffu
++#define QRTR_LOCAL_NODE 1u
++
++static uint32_t adsp_node = ~0u;         /* learned from the ADSP's HELLO/NEW_SERVER */
++static uint32_t adsp_servers;            /* NEW_SERVER packets seen */
++
++/* One QRTR control packet: header + the 20-byte body {cmd, a, b, c, d}. */
++static void
++qrtr_send_ctrl(uint32_t cmd, const uint32_t args[4], uint32_t dst_node)
++{
++	uint32_t pkt[(sizeof(struct qrtr_hdr) + QRTR_CTRL_BYTES) / 4];
++	struct qrtr_hdr h = {
++		.version = QRTR_VER, .type = cmd, .src_node = QRTR_LOCAL_NODE, .src_port = QRTR_PORT_CTRL,
++		.confirm_rx = 0, .size = QRTR_CTRL_BYTES, .dst_node = dst_node, .dst_port = QRTR_PORT_CTRL,
++	};
++
++	bzero(pkt, sizeof(pkt));
++	memcpy(pkt, &h, sizeof(h));
++	pkt[sizeof(h) / 4] = cmd;
++	if (args) {
++		memcpy(&pkt[sizeof(h) / 4 + 1], args, 16);
++	}
++	(void)negroni_glink_send(NEGRONI_GLINK_IPCRTR, pkt, sizeof(pkt));
++}
++
++static void
++qrtr_rx(const uint8_t *data, uint32_t len)
++{
++	struct qrtr_hdr h;
++	uint32_t b[5];
++
++	if (len < sizeof(h)) {
++		return;
++	}
++	memcpy(&h, data, sizeof(h));
++	bzero(b, sizeof(b));
++	memcpy(b, data + sizeof(h), MIN(len - (uint32_t)sizeof(h), (uint32_t)sizeof(b)));
++	if (h.type == QRTR_TYPE_HELLO) {
++		adsp_node = h.src_node;
++		say("QRTR: HELLO from node %u", h.src_node);
++		qrtr_send_ctrl(QRTR_TYPE_HELLO, NULL, h.src_node);     /* answer, as the Linux core does */
++	} else if (h.type == QRTR_TYPE_NEW_SERVER && len >= sizeof(h) + QRTR_CTRL_BYTES) {
++		adsp_node = h.src_node;
++		adsp_servers++;
++		/* b[0] = cmd, b[1] service, b[2] instance (version | instance << 8), b[3] node, b[4] port */
++		say("QRTR: NEW_SERVER service %u instance %#x node %u port %#x", b[1], b[2], b[3], b[4]);
++	}
++}
++
++/*
++ * No servreg locator (QMI service 0x40) is offered yet: nothing here answers GET_DOMAIN_LIST,
++ * so announcing one would only make the ADSP wait for replies. Step 11 polls GET_SPF_STATE
++ * directly; if it never gets ready, a locator (qcom_pd_mapper.c style) is the next thing to add.
++ */
++static bool
++step_qrtr(void)
++{
++	announce_note("QRTR: say HELLO on IPCRTR, record the ADSP's servers");
++	if (!negroni_glink_up(NEGRONI_GLINK_IPCRTR)) {
++		FAIL("GLINK channel IPCRTR is not up");
++		return false;
++	}
++	negroni_glink_set_rx(NEGRONI_GLINK_IPCRTR, qrtr_rx);
++	qrtr_send_ctrl(QRTR_TYPE_HELLO, NULL, QRTR_NODE_BCAST);
++	for (uint32_t ms = 0; ms < MIN(budget_ms, 3000u); ms++) {
++		negroni_glink_poll();
++		IOSleep(1);
++	}
++	say("QRTR: ADSP node %s, %u NEW_SERVER packets", adsp_node == ~0u ? "unknown (no HELLO)" : "known", adsp_servers);
++	return true;
++}
++
++/* ==== step 11: SPF ready ==== */
++
++struct apm_param {
++	uint32_t miid, pid, size, err;
++} __attribute__((packed));
++struct apm_cmd_hdr {
++	uint32_t addr_lsw, addr_msw, handle, size;
++} __attribute__((packed));
++
++static bool
++step_spf(void)
++{
++	/* GPR header + a zeroed 16-byte apm_cmd_header (q6apm_get_apm_state: 40 bytes) */
++	struct {
++		struct gpr_hdr hdr;
++		struct apm_cmd_hdr cmd;
++	} __attribute__((packed)) pkt;
++
++	announce_note("GPR: APM_CMD_GET_SPF_STATE on adsp_apps");
++	if (!negroni_glink_up(NEGRONI_GLINK_GPR)) {
++		FAIL("GLINK channel adsp_apps is not up");
++		return false;
++	}
++	negroni_glink_set_rx(NEGRONI_GLINK_GPR, gpr_rx);
++	for (uint32_t tenth = 0; tenth < budget_ms / 100; tenth++) {
++		spf_ready = 0;
++		bzero(&pkt, sizeof(pkt));
++		gpr_build_hdr(&pkt.hdr, sizeof(pkt), GPR_PORT_APM, GPR_APM_IID, APM_CMD_GET_SPF_STATE);
++		if (negroni_glink_send(NEGRONI_GLINK_GPR, &pkt, sizeof(pkt)) != 0) {
++			FAIL("GET_SPF_STATE does not go out");
++			return false;
++		}
++		for (uint32_t ms = 0; ms < 100 && !spf_ready; ms++) {
++			negroni_glink_poll();
++			IOSleep(1);
++		}
++		if (spf_ready == 1) {
++			say("SPF READY");
++			return true;
++		}
++	}
++	FAIL("no SPF ready (last state %u)", spf_ready);
++	return false;
++}
++
++/* ==== step 12: PRM clock + I2S pins ==== */
++
++
++static bool
++step_prm(void)
++{
++	struct {
++		struct gpr_hdr hdr;
++		struct apm_cmd_hdr cmd;
++		struct apm_param p;
++		uint32_t num_clk;
++		uint32_t clock_id, clock_freq, clock_attri, clock_root;
++	} __attribute__((packed)) pkt;
++	uint32_t status = ~0u;
++
++	bzero(&pkt, sizeof(pkt));
++	gpr_build_hdr(&pkt.hdr, sizeof(pkt), GPR_PORT_PRM, GPR_SRC_PORT, PRM_CMD_REQUEST_HW_RSC);
++	pkt.cmd.size = sizeof(pkt) - sizeof(pkt.hdr) - sizeof(pkt.cmd);
++	pkt.p.miid = GPR_PRM_IID;
++	pkt.p.pid = PARAM_ID_RSC_AUDIO_HW_CLK;
++	pkt.p.size = sizeof(pkt) - sizeof(pkt.hdr) - sizeof(pkt.cmd) - sizeof(pkt.p);
++	pkt.num_clk = 1;
++	pkt.clock_id = CLOCK_ID_TER_MI2S_IBIT;
++	pkt.clock_freq = MI2S_BCLK_HZ;
++	pkt.clock_attri = CLOCK_ATTR_COUPLE_NO;
++	pkt.clock_root = 0;
++
++	announce_note("PRM: request TER MI2S IBIT clock 3.072 MHz");
++	if (gpr_send_wait(&pkt, sizeof(pkt), PRM_RSP_REQUEST_HW_RSC, &status) != 0 || status != 0) {
++		FAIL("PRM clock request failed (status %#x)", status);
++		return false;
++	}
++	clock_on = true;
++	/* I2S pins 121..124 to function 1, 8 mA, no pull (output for the sink data on 124) */
++	if (tlmm == 0) {
++		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
++	}
++	if (tlmm == 0) {
++		FAIL("no TLMM mapping");
++		return false;
++	}
++	for (unsigned p = 121; p <= 124; p++) {
++		wr32(tlmm, (uint32_t)TLMM_PIN(p), 1u << 2 | 3u << 6);     /* FUNC_SEL 1 (mi2s2), DRV 8 mA, no pull */
++	}
++	say("PRM clock up, I2S pins 121..124 to function 1");
++	return true;
++}
++
++/* ==== step 13: graph open/prepare ==== */
++
++/* One sub-graph config block (apm_sub_graph_data in audioreach.c): 3 props. */
++struct sg_block {
++	uint32_t sub_graph_id, num_prop;
++	uint32_t perf_pid, perf_size, perf_mode;
++	uint32_t dir_pid, dir_size, dir;
++	uint32_t sid_pid, sid_size, sid;
++} __attribute__((packed));
++
++struct prop_hdr { uint32_t pid, size; } __attribute__((packed));
++
++static void
++fill_sg(struct sg_block *b, uint32_t id, uint32_t dir)
++{
++	b->sub_graph_id = id;
++	b->num_prop = 3;
++	b->perf_pid = APM_SG_PROP_ID_PERF_MODE;
++	b->perf_size = 4;
++	b->perf_mode = APM_SG_PERF_LOW_LATENCY;
++	b->dir_pid = APM_SG_PROP_ID_DIRECTION;
++	b->dir_size = 4;
++	b->dir = dir;
++	b->sid_pid = APM_SG_PROP_ID_SCENARIO_ID;
++	b->sid_size = 4;
++	b->sid = APM_SG_SID_PLAYBACK;
++}
++
++struct cont_block {
++	uint32_t container_id, num_prop;
++	uint32_t cap_pid, cap_size, num_cap, cap;
++	uint32_t pos_pid, pos_size, pos;
++	uint32_t stack_pid, stack_size, stack;
++	uint32_t dom_pid, dom_size, dom;
++} __attribute__((packed));
++
++static void
++fill_cont(struct cont_block *c, uint32_t id, uint32_t cap, uint32_t pos)
++{
++	c->container_id = id;
++	c->num_prop = 4;
++	c->cap_pid = APM_CONT_PROP_ID_CAPABILITY_LIST;
++	c->cap_size = 8;
++	c->num_cap = 1;
++	c->cap = cap;
++	c->pos_pid = APM_CONT_PROP_ID_GRAPH_POS;
++	c->pos_size = 4;
++	c->pos = pos;
++	c->stack_pid = APM_CONT_PROP_ID_STACK_SIZE;
++	c->stack_size = 4;
++	c->stack = 4096;
++	c->dom_pid = APM_CONT_PROP_ID_PROC_DOMAIN;
++	c->dom_size = 4;
++	c->dom = APM_PROC_DOMAIN_ADSP;
++}
++
++struct mod_obj { uint32_t module_id, instance_id; } __attribute__((packed));
++struct conn_obj { uint32_t src_iid, src_op, dst_iid, dst_ip; } __attribute__((packed));
++struct mprop_obj {
++	uint32_t instance_id, num_props;
++	uint32_t pid, size, max_ip, max_op;
++} __attribute__((packed));
++
++/*
++ * GRAPH_OPEN: one apm_cmd_hdr, then 5 params (SUB_GRAPH_CONFIG, CONTAINER_CONFIG, MODULE_LIST,
++ * MODULE_PROP, MODULE_CONN), each an apm_param + its body (each param body 8-aligned). Two
++ * sub-graphs (stream, device), two containers, four modules, three connections.
++ */
++static uint8_t graph_pkt[1024] __attribute__((aligned(8)));
++
++static uint8_t *
++put32(uint8_t *p, uint32_t v)
++{
++	memcpy(p, &v, 4);
++	return p + 4;
++}
++static uint8_t *
++putobj(uint8_t *p, const void *o, uint32_t n)
++{
++	memcpy(p, o, n);
++	return p + n;
++}
++
++static uint32_t
++build_graph_open(void)
++{
++	uint8_t *p = graph_pkt, *start;
++	struct gpr_hdr hdr;
++	struct apm_cmd_hdr cmd;
++	struct apm_param pr;
++	uint32_t off;
++
++	bzero(graph_pkt, sizeof(graph_pkt));
++	p += sizeof(struct gpr_hdr) + sizeof(struct apm_cmd_hdr);
++
++	/* 1. SUB_GRAPH_CONFIG: num + 2 sg blocks */
++	{
++		struct sg_block sg;
++		uint32_t bodysz = 4 + 2 * sizeof(sg);
++		bzero(&pr, sizeof(pr));
++		pr.miid = APM_MODULE_INSTANCE_ID; pr.pid = APM_PARAM_ID_SUB_GRAPH_CONFIG; pr.size = (bodysz + 7) & ~7u;
++		p = putobj(p, &pr, sizeof(pr));
++		p = put32(p, 2);
++		fill_sg(&sg, SG_STREAM, APM_SG_DIR_RX); p = putobj(p, &sg, sizeof(sg));
++		fill_sg(&sg, SG_DEVICE, APM_SG_DIR_RX); p = putobj(p, &sg, sizeof(sg));
++		p = graph_pkt + ((p - graph_pkt + 7) & ~7u);
++	}
++	/* 2. CONTAINER_CONFIG: num + 2 containers */
++	{
++		struct cont_block c;
++		uint32_t bodysz = 4 + 2 * sizeof(c);
++		bzero(&pr, sizeof(pr));
++		pr.miid = APM_MODULE_INSTANCE_ID; pr.pid = APM_PARAM_ID_CONTAINER_CONFIG; pr.size = (bodysz + 7) & ~7u;
++		p = putobj(p, &pr, sizeof(pr));
++		p = put32(p, 2);
++		fill_cont(&c, CONT_STREAM, APM_CONT_CAP_PP, APM_CONT_GRAPH_POS_STREAM); p = putobj(p, &c, sizeof(c));
++		fill_cont(&c, CONT_DEVICE, APM_CONT_CAP_EP, APM_CONT_GRAPH_POS_STR_DEV); p = putobj(p, &c, sizeof(c));
++		p = graph_pkt + ((p - graph_pkt + 7) & ~7u);
++	}
++	/* 3. MODULE_LIST: num lists; list = {sg, cont, nmod} + mod_obj[] */
++	{
++		struct mod_obj mo;
++		start = p;
++		bzero(&pr, sizeof(pr));
++		pr.miid = APM_MODULE_INSTANCE_ID; pr.pid = APM_PARAM_ID_MODULE_LIST; pr.size = 0;   /* patched below */
++		p = putobj(p, &pr, sizeof(pr));
++		p = put32(p, 2);                                /* num lists */
++		p = put32(p, SG_STREAM); p = put32(p, CONT_STREAM); p = put32(p, 2);
++		mo.module_id = MODULE_ID_WR_SH_MEM_EP; mo.instance_id = IID_WR_EP; p = putobj(p, &mo, sizeof(mo));
++		mo.module_id = MODULE_ID_PCM_CNV; mo.instance_id = IID_PCM; p = putobj(p, &mo, sizeof(mo));
++		p = put32(p, SG_DEVICE); p = put32(p, CONT_DEVICE); p = put32(p, 2);
++		mo.module_id = MODULE_ID_MFC; mo.instance_id = IID_MFC; p = putobj(p, &mo, sizeof(mo));
++		mo.module_id = MODULE_ID_I2S_SINK; mo.instance_id = IID_I2S; p = putobj(p, &mo, sizeof(mo));
++		p = graph_pkt + ((p - graph_pkt + 7) & ~7u);
++		pr.size = (uint32_t)(p - start - sizeof(pr));
++		memcpy(start, &pr, sizeof(pr));
++	}
++	/* 4. MODULE_PROP: num + 4 mprop objs */
++	{
++		static const uint32_t ids[4] = { IID_WR_EP, IID_PCM, IID_MFC, IID_I2S };
++		static const uint32_t ipo[4][2] = { {0,1}, {1,1}, {1,1}, {1,0} };
++		struct mprop_obj m;
++		uint32_t bodysz = 4 + 4 * sizeof(m);
++		bzero(&pr, sizeof(pr));
++		pr.miid = APM_MODULE_INSTANCE_ID; pr.pid = APM_PARAM_ID_MODULE_PROP; pr.size = (bodysz + 7) & ~7u;
++		p = putobj(p, &pr, sizeof(pr));
++		p = put32(p, 4);
++		for (unsigned i = 0; i < 4; i++) {
++			bzero(&m, sizeof(m));
++			m.instance_id = ids[i]; m.num_props = 1; m.pid = 0x08001015u; m.size = 8;
++			m.max_ip = ipo[i][0]; m.max_op = ipo[i][1];
++			p = putobj(p, &m, sizeof(m));
++		}
++		p = graph_pkt + ((p - graph_pkt + 7) & ~7u);
++	}
++	/* 5. MODULE_CONN: num + 3 conns */
++	{
++		struct conn_obj c;
++		uint32_t bodysz = 4 + 3 * sizeof(c);
++		bzero(&pr, sizeof(pr));
++		pr.miid = APM_MODULE_INSTANCE_ID; pr.pid = APM_PARAM_ID_MODULE_CONN; pr.size = (bodysz + 7) & ~7u;
++		p = putobj(p, &pr, sizeof(pr));
++		p = put32(p, 3);
++		c.src_iid = IID_WR_EP; c.src_op = PORT_WR_EP_OUT; c.dst_iid = IID_PCM; c.dst_ip = PORT_PCM_IN; p = putobj(p, &c, sizeof(c));
++		c.src_iid = IID_PCM; c.src_op = PORT_PCM_OUT; c.dst_iid = IID_MFC; c.dst_ip = PORT_MFC_IN; p = putobj(p, &c, sizeof(c));
++		c.src_iid = IID_MFC; c.src_op = PORT_MFC_OUT; c.dst_iid = IID_I2S; c.dst_ip = PORT_I2S_IN; p = putobj(p, &c, sizeof(c));
++		p = graph_pkt + ((p - graph_pkt + 7) & ~7u);
++	}
++	off = (uint32_t)(p - graph_pkt);
++	gpr_build_hdr(&hdr, off, GPR_PORT_APM, GPR_APM_IID, APM_CMD_GRAPH_OPEN);
++	memcpy(graph_pkt, &hdr, sizeof(hdr));
++	bzero(&cmd, sizeof(cmd));
++	cmd.size = off - sizeof(struct gpr_hdr) - sizeof(struct apm_cmd_hdr);
++	memcpy(graph_pkt + sizeof(struct gpr_hdr), &cmd, sizeof(cmd));
++	return off;
++}
++
++/* one SET_CFG param packet to a module instance; body copied from `body`, bodysz bytes. */
++static int
++set_cfg(uint32_t iid, uint32_t pid, const void *body, uint32_t bodysz)
++{
++	uint8_t pkt[256] __attribute__((aligned(8)));
++	struct gpr_hdr *hdr = (void *)pkt;
++	struct apm_cmd_hdr *cmd = (void *)(pkt + sizeof(*hdr));
++	struct apm_param *pr = (void *)(pkt + sizeof(*hdr) + sizeof(*cmd));
++	uint32_t plen = sizeof(*hdr) + sizeof(*cmd) + sizeof(*pr) + ((bodysz + 7) & ~7u);
++	uint32_t status = ~0u;
++
++	if (plen > sizeof(pkt)) {
++		return EINVAL;
++	}
++	bzero(pkt, plen);
++	gpr_build_hdr(hdr, plen, GPR_PORT_APM, GPR_APM_IID, APM_CMD_SET_CFG);
++	cmd->size = plen - sizeof(*hdr) - sizeof(*cmd);
++	pr->miid = iid;
++	pr->pid = pid;
++	pr->size = (bodysz + 7) & ~7u;
++	memcpy(pkt + sizeof(*hdr) + sizeof(*cmd) + sizeof(*pr), body, bodysz);
++	if (gpr_send_wait(pkt, plen, 0, &status) != 0 || status != 0) {
++		FAIL("SET_CFG iid %#x pid %#x failed (status %#x)", iid, pid, status);
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++graph_mgmt(uint32_t opcode)
++{
++	struct {
++		struct gpr_hdr hdr;
++		struct apm_cmd_hdr cmd;
++		struct apm_param p;
++		uint32_t num_sg;
++		uint32_t sg[2];
++	} __attribute__((packed)) pkt;
++	uint32_t status = ~0u;
++
++	bzero(&pkt, sizeof(pkt));
++	gpr_build_hdr(&pkt.hdr, sizeof(pkt), GPR_PORT_APM, GPR_APM_IID, opcode);
++	pkt.cmd.size = sizeof(pkt) - sizeof(pkt.hdr) - sizeof(pkt.cmd);
++	pkt.p.miid = APM_MODULE_INSTANCE_ID;
++	pkt.p.pid = APM_PARAM_ID_SUB_GRAPH_LIST;
++	pkt.p.size = sizeof(pkt.num_sg) + sizeof(pkt.sg);
++	pkt.num_sg = 2;
++	pkt.sg[0] = SG_STREAM;
++	pkt.sg[1] = SG_DEVICE;
++	if (gpr_send_wait(&pkt, sizeof(pkt), 0, &status) != 0 || status != 0) {
++		FAIL("graph mgmt %#x failed (status %#x)", opcode, status);
++		return EIO;
++	}
++	return 0;
++}
++
++static bool
++step_graph(void)
++{
++	uint32_t len, status = ~0u;
++
++	announce_note("APM: GRAPH_OPEN (WR_SH_MEM_EP -> PCM_CNV -> MFC -> I2S_SINK)");
++	len = build_graph_open();
++	if (gpr_send_wait(graph_pkt, len, 0, &status) != 0 || status != 0) {
++		FAIL("GRAPH_OPEN failed (status %#x, %u bytes)", status, len);
++		return false;
++	}
++	graph_opened = true;
++	say("GRAPH_OPEN ok (%u bytes)", len);
++
++	/* PCM_CNV output: 24-bit S24, stereo, L R */
++	{
++		struct { uint32_t data_format, fmt_id, payload_size;
++			uint16_t bit_width, alignment, bits_per_sample, q_factor, endianness, interleaved, reserved, num_channels;
++			uint8_t ch[2]; } __attribute__((packed)) o = { 0 };
++		o.data_format = DATA_FORMAT_FIXED_POINT;
++		o.fmt_id = MEDIA_FMT_ID_PCM;
++		o.payload_size = sizeof(o) - 12;
++		o.bit_width = 24; o.alignment = PCM_LSB_ALIGNED; o.bits_per_sample = 32; o.q_factor = 23;
++		o.endianness = PCM_LITTLE_ENDIAN; o.interleaved = 1; o.num_channels = 2;
++		o.ch[0] = PCM_CHANNEL_L; o.ch[1] = PCM_CHANNEL_R;
++		if (set_cfg(IID_PCM, PARAM_ID_PCM_OUTPUT_FORMAT_CFG, &o, sizeof(o))) {
++			return false;
++		}
++	}
++	/* MFC output: 48 kHz, 24-bit, 2 ch */
++	{
++		struct { uint32_t sample_rate; uint16_t bit_width, num_channels, ch[2]; } __attribute__((packed)) m = { 0 };
++		m.sample_rate = 48000; m.bit_width = 24; m.num_channels = 2;
++		m.ch[0] = PCM_CHANNEL_L; m.ch[1] = PCM_CHANNEL_R;
++		if (set_cfg(IID_MFC, PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT, &m, sizeof(m))) {
++			return false;
++		}
++	}
++	/* I2S sink: TERTIARY, SD1, internal WS */
++	{
++		struct { uint32_t lpaif_type, intf_idx; uint16_t sd_line_idx, ws_src; } __attribute__((packed)) i = { 0 };
++		i.lpaif_type = 0; i.intf_idx = I2S_INTF_TERTIARY; i.sd_line_idx = I2S_SD1; i.ws_src = I2S_WS_SRC_INTERNAL;
++		if (set_cfg(IID_I2S, PARAM_ID_I2S_INTF_CFG, &i, sizeof(i))) {
++			return false;
++		}
++		struct { uint32_t sample_rate; uint16_t bit_width, num_channels; uint32_t data_format; } __attribute__((packed)) hw = { 0 };
++		hw.sample_rate = 48000; hw.bit_width = 24; hw.num_channels = 2; hw.data_format = DATA_FORMAT_FIXED_POINT;
++		if (set_cfg(IID_I2S, PARAM_ID_HW_EP_MF_CFG, &hw, sizeof(hw))) {
++			return false;
++		}
++		uint32_t fsf = 1;
++		if (set_cfg(IID_I2S, PARAM_ID_HW_EP_FRAME_SIZE_FACTOR, &fsf, sizeof(fsf))) {
++			return false;
++		}
++	}
++	if (graph_mgmt(APM_CMD_GRAPH_PREPARE)) {
++		return false;
++	}
++	say("GRAPH SET_CFG and PREPARE ok");
++	return true;
++}
++
++/* ==== step 14: shared memory + WR EP media format + START ==== */
++
++/* Program apps-SMMU SID 0x1801 -> our ring at AUDIO_IOVA (hackios redwood_sound.c). 0243 owns the
++ * SMMU helpers; here we assume the boot chain passes SID 0x1801 untranslated and give the ADSP the
++ * physical address with the SID bit, like redwood_sound's "passed" path. If the SMMU translates,
++ * step 14 fails cleanly and audio stays off (no SoC reset). */
++static bool
++smmu_setup(void)
++{
++	bzero((void *)ring, round_page(RING_BYTES));
++	clean_dcache(ring, round_page(RING_BYTES), FALSE);
++	/* a single-piece physical buffer so an untranslated SID sees it as one region */
++	if (kvtophys(ring) + RING_BYTES > 0x100000000ull) {
++		FAIL("ring at phys %#llx is not below 4 GiB (the SID bits go in addr_msw)", kvtophys(ring));
++		return false;
++	}
++	for (uint32_t off = 0x1000; off < RING_BYTES; off += 0x1000) {
++		if (kvtophys(ring + off) != kvtophys(ring) + off) {
++			FAIL("ring is not physically contiguous: the SMMU would have to translate (not implemented here)");
++			return false;
++		}
++	}
++	ring_iova = kvtophys(ring) | ((uint64_t)(AUDIO_SID & 0xf) << 32);
++	smmu_on = true;                         /* nothing programmed: untranslated path */
++	return true;
++}
++
++static int
++shmem_map(void)
++{
++	struct {
++		struct gpr_hdr hdr;
++		uint16_t pool, nregions;
++		uint32_t flags;
++		uint32_t addr_lsw, addr_msw, size;
++	} __attribute__((packed)) pkt;
++	uint32_t status = ~0u;
++
++	bzero(&pkt, sizeof(pkt));
++	gpr_build_hdr(&pkt.hdr, sizeof(pkt), GPR_PORT_APM, GPR_APM_IID, APM_CMD_SHARED_MEM_MAP);
++	pkt.pool = MEM_POOL_SHMEM8_4K;
++	pkt.nregions = 1;
++	pkt.flags = 0;
++	pkt.addr_lsw = (uint32_t)ring_iova;
++	pkt.addr_msw = (uint32_t)(ring_iova >> 32);
++	pkt.size = RING_BYTES;
++	mem_map_handle = 0;
++	if (gpr_send_wait(&pkt, sizeof(pkt), APM_RSP_SHARED_MEM_MAP, &status) != 0 || mem_map_handle == 0) {
++		FAIL("SHARED_MEM_MAP_REGIONS gave no handle");
++		return EIO;
++	}
++	say("shared memory mapped: handle %#x, ring IOVA %#llx, %u bytes", mem_map_handle, ring_iova, RING_BYTES);
++	return 0;
++}
++
++static bool
++step_shmem(void)
++{
++	announce_note("APM: map our ring, set the WR EP media format, START");
++	if (ring == 0) {
++		/* one physical piece below 4 GiB: the ADSP gets phys | SID bits << 32 */
++		if (kmem_alloc_contig(kernel_map, &ring, round_page(RING_BYTES), 0, (ppnum_t)(atop(0x100000000ull) - 1), 0,
++		    KMA_KOBJECT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			ring = 0;
++			FAIL("no memory for the ring");
++			return false;
++		}
++	}
++	lck_mtx_lock(&negroni_smmu_lock);
++	bool ok = smmu_setup();
++	lck_mtx_unlock(&negroni_smmu_lock);
++	if (!ok) {
++		return false;
++	}
++	if (shmem_map()) {
++		return false;
++	}
++	/* WR EP media format: S24 in 32-bit, 48 kHz, stereo */
++	{
++		struct { uint32_t data_format, fmt_id, payload_size, sample_rate;
++			uint16_t bit_width, alignment, bits_per_sample, q_factor, endianness, num_channels;
++			uint8_t ch[2]; } __attribute__((packed)) f = { 0 };
++		f.data_format = DATA_FORMAT_FIXED_POINT;
++		f.fmt_id = MEDIA_FMT_ID_PCM;
++		f.payload_size = sizeof(f) - 12;
++		f.sample_rate = 48000; f.bit_width = 24; f.alignment = PCM_LSB_ALIGNED;
++		f.bits_per_sample = 32; f.q_factor = 23; f.endianness = PCM_LITTLE_ENDIAN; f.num_channels = 2;
++		f.ch[0] = PCM_CHANNEL_L; f.ch[1] = PCM_CHANNEL_R;
++		if (set_cfg(IID_WR_EP, PARAM_ID_MEDIA_FORMAT, &f, sizeof(f))) {
++			return false;
++		}
++	}
++	if (graph_mgmt(APM_CMD_GRAPH_START)) {
++		return false;
++	}
++	graph_started = true;
++	say("GRAPH STARTED");
++	return true;
++}
++
++/* ==== step 15: /dev/negroni-audio ==== */
++
++#include "negroni_audio_abi.h"
++
++static uint8_t *ring_bytes(void) { return (uint8_t *)ring; }
++static uint32_t ring_head;                      /* period being filled (0..PERIODS-1) */
++static uint32_t fill_frames;                    /* frames already in the period at ring_head */
++static uint64_t periods_sent;                   /* DATA buffers given to the WR EP (under audio_lock) */
++static uint32_t busy_drops;                     /* consecutive periods dropped as "all in flight" */
++static bool rebase_logged;
++static uint64_t frames_in, frames_dropped, frames_played;       /* under audio_lock */
++/*
++ * SET_VOLUME: `muted` is applied (zero samples). `volume_below` is stored but NOT applied yet: iOS
++ * keeps the D22 speaker in software volume, so the samples come scaled already (stage d note).
++ */
++static uint32_t volume_below, muted;
++static lck_mtx_t *audio_lock;
++static lck_grp_t *audio_grp;
++
++/* send one period (PERIOD_BYTES at period index) to the WR EP as a DATA buffer */
++/*
++ * negroniaudio_v2=1: DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2 0x0400100A (11 words, metadata fields 0;
++ * DONE 0x05001004), as current Linux q6apm.c and the phone's GSL send. Default 0: V1 0x04001000
++ * (7 words, DONE 0x05001000). If step 15 shows no DONE, try V2 first.
++ */
++static uint32_t data_v2;
++
++static int
++send_period(uint32_t idx)
++{
++	struct {
++		struct gpr_hdr hdr;
++		uint32_t addr_lsw, addr_msw, handle, size, ts_lsw, ts_msw, flags;
++		uint32_t md_addr_lsw, md_addr_msw, md_handle, md_size;          /* V2 only */
++	} __attribute__((packed)) pkt;
++	uint64_t pa = ring_iova + (uint64_t)idx * PERIOD_BYTES;
++	uint32_t len = data_v2 ? sizeof(pkt) : sizeof(pkt) - 16;
++
++	bzero(&pkt, sizeof(pkt));
++	/* from our dynamic port to the WR EP module instance (q6apm_write_async: dst = shm iid) */
++	gpr_build_hdr(&pkt.hdr, len, IID_WR_EP, GPR_SRC_PORT,
++	    data_v2 ? DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2 : DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER);
++	pkt.hdr.token = idx;
++	pkt.addr_lsw = (uint32_t)pa;
++	pkt.addr_msw = (uint32_t)(pa >> 32);
++	pkt.handle = mem_map_handle;
++	pkt.size = PERIOD_BYTES;
++	return negroni_glink_send(NEGRONI_GLINK_GPR, &pkt, len);
++}
++
++/*
++ * write(): whole S16LE stereo frames (the HAL writer sends ~240 frames every ~5 ms, not whole
++ * periods). Each frame goes as S24-in-32-bit into the period at ring_head; a full period is
++ * cleaned to the point of coherency (LPASS does not snoop our cache) and sent to the WR EP.
++ * In-flight periods = periods_sent - DONE events (write_done_count, counted by gpr_rx when
++ * negroni_glink_poll() runs here); with PERIODS - 1 in flight the new period is dropped and its
++ * slot reused, so a period the ADSP still reads is never overwritten.
++ * This call can block the writer thread for up to ~1.2 s inside negroni_glink_send (an intent
++ * request or a full GLINK FIFO); it never blocks the HAL real-time thread (the plug-in's writer
++ * thread calls it). audio_lock serializes writers; it is not held across GLINK calls (gpr_rx runs
++ * under the GLINK lock).
++ */
++static int
++audio_write(dev_t dev, struct uio *uio, int ioflag)
++{
++	(void)dev; (void)ioflag;
++	int err = 0;
++
++	if (!sink_on || !graph_started) {
++		return ENODEV;
++	}
++	while (uio_resid(uio) >= (user_ssize_t)4) {
++		int16_t fr[2];                          /* one stereo S16 frame */
++		int32_t *out;
++		uint32_t idx;
++		bool full, busy;
++
++		err = uiomove((caddr_t)fr, 4, uio);
++		if (err) {
++			break;
++		}
++		lck_mtx_lock(audio_lock);
++		idx = ring_head;
++		out = (int32_t *)(void *)(ring_bytes() + (uint64_t)idx * PERIOD_BYTES);
++		out[fill_frames * 2 + 0] = muted ? 0 : (int32_t)fr[0] << 8;      /* S16 -> S24 in 32-bit, Q23 */
++		out[fill_frames * 2 + 1] = muted ? 0 : (int32_t)fr[1] << 8;
++		fill_frames++;
++		frames_in++;
++		full = fill_frames == PERIOD_FRAMES;
++		lck_mtx_unlock(audio_lock);
++		if (!full) {
++			continue;
++		}
++		negroni_glink_poll();                   /* take the DONE events (and RX_DONEs for our TX intents) */
++		lck_mtx_lock(audio_lock);
++		fill_frames = 0;
++		{
++			uint64_t done = os_atomic_load(&write_done_count, relaxed);
++			/*
++			 * A spurious extra DONE (done > sent) or lost DONEs (busy for 2 * PERIODS periods in
++			 * a row: 0.32 s of no progress) would stop the writer for good: re-base the count.
++			 */
++			if (done > periods_sent || busy_drops >= 2 * PERIODS) {
++				if (!rebase_logged) {
++					rebase_logged = true;
++					say("sink: DONE count re-based (sent %llu, done %llu, %u busy drops); logged once",
++					    periods_sent, done, busy_drops);
++				}
++				periods_sent = done;
++				busy_drops = 0;
++			}
++			busy = periods_sent - done >= PERIODS - 1;
++		}
++		if (busy) {
++			busy_drops++;
++			frames_dropped += PERIOD_FRAMES;        /* keep ring_head: the slot is filled again */
++			lck_mtx_unlock(audio_lock);
++			continue;
++		}
++		busy_drops = 0;
++		clean_dcache((vm_offset_t)out, PERIOD_BYTES, FALSE);
++		ring_head = (ring_head + 1) % PERIODS;
++		periods_sent++;
++		lck_mtx_unlock(audio_lock);
++		int sent = send_period(idx);
++		lck_mtx_lock(audio_lock);
++		if (sent == 0) {
++			frames_played += PERIOD_FRAMES;
++		} else {
++			frames_dropped += PERIOD_FRAMES;
++			periods_sent--;                 /* no DONE will come for it */
++		}
++		lck_mtx_unlock(audio_lock);
++	}
++	return err;
++}
++
++static int
++audio_open(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	(void)dev; (void)flags; (void)devtype; (void)p;
++	return sink_on ? 0 : ENODEV;
++}
++static int
++audio_close(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	(void)dev; (void)flags; (void)devtype; (void)p;
++	return 0;
++}
++static int
++audio_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	(void)dev; (void)flag; (void)p;
++	switch (cmd) {
++	case NEGRONI_AUDIO_SET_VOLUME: {
++		struct negroni_audio_volume *v = (void *)data;
++		volume_below = v->below;
++		muted = v->muted;
++		return 0;
++	}
++	case NEGRONI_AUDIO_GET_STATS: {
++		struct negroni_audio_stats *st = (void *)data;
++		bzero(st, sizeof(*st));
++		lck_mtx_lock(audio_lock);
++		st->frames_in = frames_in;
++		st->frames_dropped = frames_dropped;
++		st->frames_played = frames_played;
++		st->state = !sink_on ? NEGRONI_AUDIO_STATE_NOSINK : graph_started ? NEGRONI_AUDIO_STATE_RUNNING :
++		    NEGRONI_AUDIO_STATE_IDLE;
++		st->limiter_gain_q15 = 32768;
++		lck_mtx_unlock(audio_lock);
++		return 0;
++	}
++	default:
++		return ENOTTY;
++	}
++}
++
++static const struct cdevsw audio_cdevsw = {
++	.d_open = audio_open,
++	.d_close = audio_close,
++	.d_read = eno_rdwrt,
++	.d_write = audio_write,
++	.d_ioctl = audio_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type = 0,
++};
++static int audio_major = -1;
++
++void
++negroni_audio_init(void)
++{
++	if (audio_major >= 0) {
++		return;
++	}
++	audio_grp = lck_grp_alloc_init("negroni_audio", LCK_GRP_ATTR_NULL);
++	audio_lock = lck_mtx_alloc_init(audio_grp, LCK_ATTR_NULL);
++	audio_major = cdevsw_add(-1, &audio_cdevsw);
++	if (audio_major < 0) {
++		printf("NEGRONI AUDIO: cdevsw_add failed\n");
++		return;
++	}
++	devfs_make_node(makedev(audio_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "negroni-audio");  /* NEGRONI_AUDIO_DEVICE without the /dev/ */
++}
++
++static bool
++step_sink(void)
++{
++	announce_note("enable /dev/negroni-audio");
++	if (!graph_started) {
++		FAIL("the graph is not started");
++		return false;
++	}
++	negroni_audio_init();
++	if (audio_major < 0) {
++		FAIL("the /dev/negroni-audio node was not made");
++		return false;
++	}
++	(void)PE_parse_boot_argn("negroniaudio_v2", &data_v2, sizeof(data_v2));
++	busy_drops = 0;
++	fill_frames = ring_head = 0;
++	periods_sent = os_atomic_load(&write_done_count, relaxed);
++	sink_on = true;
++	say("data buffers: %s", data_v2 ? "V2 0x0400100A (negroniaudio_v2=1)" : "V1 0x04001000");
++	say("THE SPEAKER SINK IS LIVE: write S16LE stereo 48 kHz to /dev/negroni-audio");
++	return true;
++}
++
++/* ==== step dispatch (called by negroni_adsp.c steps 10..15) ==== */
++
++static void announce_note(const char *what) { say("about to: %s", what); }
++
++bool
++negroni_audio_step(uint32_t n, uint32_t step_budget, char *why_out, size_t whylen)
++{
++	bool ok;
++
++	step = n;
++	budget_ms = MIN(MAX(step_budget, 1000u), 120000u);
++	fail_why[0] = 0;
++	switch (n) {
++	case 10: ok = step_qrtr(); break;
++	case 11: ok = step_spf(); break;
++	case 12: ok = step_prm(); break;
++	case 13: ok = step_graph(); break;
++	case 14: ok = step_shmem(); break;
++	case 15: ok = step_sink(); break;
++	default: ok = false; snprintf(fail_why, sizeof(fail_why), "no such audio step %u", n); break;
++	}
++	if (!ok && why_out) {
++		strlcpy(why_out, fail_why[0] ? fail_why : "no reason logged", whylen);
++	}
++	return ok;
++}
++
++const char *
++negroni_audio_step_name(uint32_t n)
++{
++	switch (n) {
++	case 10: return "QRTR";
++	case 11: return "SPF ready";
++	case 12: return "PRM clock";
++	case 13: return "graph open";
++	case 14: return "shmem + start";
++	case 15: return "sink";
++	default: return "?";
++	}
++}
++
++void
++negroni_audio_stop(const char *reason)
++{
++	step = 0;
++	say("audio stop: %s", reason ? reason : "");
++	sink_on = false;
++	if (graph_started) {
++		(void)graph_mgmt(APM_CMD_GRAPH_STOP);
++		graph_started = false;
++	}
++	if (graph_opened) {
++		(void)graph_mgmt(APM_CMD_GRAPH_CLOSE);
++		graph_opened = false;
++	}
++	if (mem_map_handle) {
++		struct { struct gpr_hdr hdr; uint32_t handle; } __attribute__((packed)) pkt;
++		uint32_t status;
++		bzero(&pkt, sizeof(pkt));
++		gpr_build_hdr(&pkt.hdr, sizeof(pkt), GPR_PORT_APM, GPR_APM_IID, APM_CMD_SHARED_MEM_UNMAP);
++		pkt.handle = mem_map_handle;
++		(void)gpr_send_wait(&pkt, sizeof(pkt), 0, &status);
++		mem_map_handle = 0;
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_audio_abi.h b/bsd/dev/negroni_audio_abi.h
+new file mode 100644
+index 0000000..165a5b4
+--- /dev/null
++++ b/bsd/dev/negroni_audio_abi.h
+@@ -0,0 +1,49 @@
++/*
++ * /dev/negroni-audio: the user/kernel ABI between NegroniAudio.driver (the CoreAudio HAL
++ * plug-in in mediaserverd) and the kernel sink (bsd/dev/negroni_audio.c, patches/xnu/0241+).
++ * The kernel keeps its own copy of these numbers (it has no userland headers): change both.
++ *
++ * Model: HackiOS sys/redwood_audio.h (external/hackios-xnu-userland, MIT).
++ *
++ *   write()  whole frames, S16LE, 2 channels (left, right), 48000 frames/s. Never blocks (the
++ *            writer is the HAL real-time I/O thread). The return value is the number of bytes
++ *            the kernel took; the rest is dropped. ENODEV: no sink is running (no ADSP graph):
++ *            the plug-in counts the frames as dropped and goes on.
++ *   ioctl    NEGRONI_AUDIO_SET_VOLUME: the HAL volume control, in 1/8 dB below the kernel's
++ *            maximum (the kernel maximum is a safe, low level: see the kernel limiter).
++ *            NEGRONI_AUDIO_GET_STATS: counters for scripts/audio/phone-test.sh.
++ */
++#ifndef NEGRONI_AUDIO_H
++#define NEGRONI_AUDIO_H
++
++#include <sys/ioccom.h>
++
++#define NEGRONI_AUDIO_DEVICE    "/dev/negroni-audio"
++#define NEGRONI_AUDIO_RATE      48000
++#define NEGRONI_AUDIO_CHANNELS  2
++#define NEGRONI_AUDIO_FRAME     4       /* bytes per frame */
++
++struct negroni_audio_volume {
++	uint32_t below;                 /* 1/8 dB below the kernel maximum (0243: stored, not applied yet) */
++	uint32_t muted;                 /* 1: iOS volume 0 */
++};
++
++struct negroni_audio_stats {
++	uint64_t frames_in;             /* frames written by user space */
++	uint64_t frames_dropped;        /* frames the sink did not take */
++	uint64_t frames_played;         /* frames the sink gave to the DSP */
++	uint32_t state;                 /* NEGRONI_AUDIO_STATE_* */
++	uint32_t peak_in;               /* peak |sample| written since the last GET_STATS */
++	uint32_t peak_out;              /* peak |sample| after the limiter since the last GET_STATS */
++	uint32_t limiter_gain_q15;      /* limiter gain now, 32768 = 0 dB */
++};
++
++#define NEGRONI_AUDIO_STATE_NOSINK      0       /* the device exists, no sink: samples are dropped */
++#define NEGRONI_AUDIO_STATE_IDLE        1       /* a sink exists, not running */
++#define NEGRONI_AUDIO_STATE_RUNNING     2       /* the graph runs, samples go to the DSP */
++#define NEGRONI_AUDIO_STATE_FAILED      3       /* the sink stopped after an error */
++
++#define NEGRONI_AUDIO_SET_VOLUME        _IOW('n', 1, struct negroni_audio_volume)
++#define NEGRONI_AUDIO_GET_STATS         _IOR('n', 2, struct negroni_audio_stats)
++
++#endif

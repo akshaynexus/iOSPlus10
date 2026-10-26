@@ -4,9 +4,13 @@
 #   scripts/audio/phone-audio.sh push      install out/audio/ios/NegroniAudio.driver into
 #                                          /System/Library/Audio/Plug-Ins/HAL, move VirtualAudio.plugin
 #                                          from /Library/Audio/Plug-Ins/HAL.disabled back to HAL,
+#                                          move BTAudioHALPlugin.driver to /System/Library/Audio/
+#                                          Plug-Ins/HAL.disabled (its factory XPC call trapped
+#                                          mediaserverd; BTAUDIO=1 keeps it, see root-add-audio.sh 2b),
 #                                          then restart mediaserverd (kill; launchd restarts it)
 #   scripts/audio/phone-audio.sh status    mediaserverd pid + start time, the plug-in dirs
 #   scripts/audio/phone-audio.sh revert    remove the driver, VirtualAudio back to HAL.disabled,
+#                                          BTAudioHALPlugin.driver back to HAL,
 #                                          restart mediaserverd (the state of the slop root tweaks)
 # The root is mounted writable (rootrw=1). The phone has no killall/launchctl: kill by pid.
 # Needs: userland/audio/build.sh output (out/audio/ios/NegroniAudio.driver), scripts/net/ssh-phone.sh.
@@ -17,6 +21,8 @@ SRC=$REPO/out/audio/ios/NegroniAudio.driver
 HAL=/System/Library/Audio/Plug-Ins/HAL
 VA=/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin
 OFF=/Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin
+BT=$HAL/BTAudioHALPlugin.driver
+BTOFF=/System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver
 ph() { "$SSH" "$*"; }
 
 restart_ms() {
@@ -34,11 +40,15 @@ push)
   (cd "$(dirname "$SRC")" && COPYFILE_DISABLE=1 tar cf - --exclude '._*' NegroniAudio.driver) | "$SSH" "rm -rf $HAL/NegroniAudio.driver && cd $HAL && tar xf - && chown -R 0:0 NegroniAudio.driver && chmod -R u=rwX,go=rX NegroniAudio.driver"
   ph "ls -la $HAL/NegroniAudio.driver"
   ph "if [ -d $OFF ] && [ ! -e $VA ]; then mkdir -p $(dirname $VA) && mv $OFF $VA && echo 'VirtualAudio restored'; else echo 'VirtualAudio: already in place or missing'; fi; ls /Library/Audio/Plug-Ins/HAL"
+  if [ "${BTAUDIO:-0}" != 1 ]; then
+    ph "if [ -d $BT ]; then mkdir -p $(dirname $BTOFF) && rm -rf $BTOFF && mv $BT $BTOFF && echo 'BTAudioHALPlugin disabled'; else echo 'BTAudioHALPlugin: already disabled or missing'; fi"
+  fi
   restart_ms ;;
 status)
-  ph "ps ax -o pid,start,time,command | grep '[m]ediaserverd'; ls $HAL /Library/Audio/Plug-Ins/HAL /Library/Audio/Plug-Ins/HAL.disabled 2>&1" ;;
+  ph "ps ax -o pid,start,time,command | grep '[m]ediaserverd'; ls $HAL $(dirname $BTOFF) /Library/Audio/Plug-Ins/HAL /Library/Audio/Plug-Ins/HAL.disabled 2>&1" ;;
 revert)
   ph "rm -rf $HAL/NegroniAudio.driver; if [ -d $VA ]; then mkdir -p $(dirname $OFF) && mv $VA $OFF && echo 'VirtualAudio disabled'; fi; ls /Library/Audio/Plug-Ins/HAL.disabled"
+  ph "if [ -d $BTOFF ] && [ ! -e $BT ]; then mv $BTOFF $BT && echo 'BTAudioHALPlugin restored'; fi"
   restart_ms ;;
 *) echo "usage: $0 push|status|revert" >&2; exit 2 ;;
 esac

@@ -1,0 +1,1108 @@
+diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
+index da0c990..d55c783 100644
+--- a/bsd/dev/negroni_adsp.c
++++ b/bsd/dev/negroni_adsp.c
+@@ -3,7 +3,7 @@
+  * audio plan (docs/audio-plan.md). UNTESTED ON HARDWARE.
+  *
+  * Off by default. Boot-arg negroniadsp=1 runs the steps on a kernel thread of its own;
+- * negroniadsp_step=N stops after step N (default 8, all). Every line starts "NEGRONI ADSP:".
++ * negroniadsp_step=N stops after step N (default 9: the ADSP up with GLINK). Every line starts "NEGRONI ADSP:".
+  *
+  *   1  reads   SMEM (0x80900000, 2 MiB): $TOC, the apps<->ADSP partition (hosts 0 and 2), its
+  *              items; the ADSP's SMP2P item 443 (if present the ADSP has run since the reset:
+@@ -28,7 +28,12 @@
+  *              ready (bit 1), handover (bit 2), fatal (bit 0) for negroniadsp_wait seconds
+  *              (default 10). Handover: the rail votes are dropped (as Linux does). No ready or
+  *              fatal: last words, PAS shutdown. Ready: the ADSP stays up; the GLINK SMEM items
+- *              (478/479/480) are reported (GLINK itself is stage (b)).
++ *              (478/479/480) are reported.
++ *   9  writes  SMEM: GLINK items 478 (descriptors) and 479 (our TX FIFO); waits for the ADSP's
++ *              FIFO 480, version 1, opens IPCRTR and adsp_apps, gives RX intents (patch 0242)
++ *
++ * Patch 0242: every step runs under a time limit (negroniadsp_steptimeout=MS, default 15000)
++ * and a failed step ends with one line "NEGRONI ADSP: step N (name) failed: reason".
+  *
+  * More boot-args: negroniadsp_pause=MS before each write step (default 0; >0 helps to see the
+  * last line in the USB log before a hang), negroniadsp_unvote=0 keeps the rail votes after
+@@ -50,6 +55,7 @@
+ #include <vm/vm_kern.h>
+ #include <arm/caches_internal.h>
+ #include <libkern/crypto/sha2.h>
++#include "negroni_adsp.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+@@ -61,7 +67,7 @@ extern int negroni_ufs_adsp_area_read(uint64_t at, void *dst, uint32_t count);
+ extern int negroni_rpmh_arc_vote(const char *res, unsigned level);
+ void negroni_adsp_init(void);
+ 
+-#define STEPS                   8
++#define STEPS                   9
+ 
+ /*
+  * Mappings. ml_io_map and ml_io_map_wcomb take their VA from io_submap: 8 MiB for the whole
+@@ -185,8 +191,15 @@ static uint32_t mdt_size, nseg, min_pa, max_pa;
+ static struct seg segs[MAX_SEGMENTS];
+ static bool relocatable, rails_on;
+ static uint32_t our_item;
++static uint32_t step_budget_ms = 15000;         /* negroniadsp_steptimeout */
++static char fail_why[192];                           /* reason of the failed step */
++static const char *const step_names[] = {
++	"SMEM survey", "firmware area", "rails", "AOP QMP", "PAS init", "load", "SMP2P", "start", "GLINK",
++};
+ 
+ #define say(fmt, ...) printf("NEGRONI ADSP: %u " fmt "\n", step, ##__VA_ARGS__)
++/* the reason of a failed step: kept for the "step N failed" line, and logged at once */
++#define FAIL(fmt, ...) do { snprintf(fail_why, sizeof(fail_why), fmt, ##__VA_ARGS__); say("stop: %s", fail_why); } while (0)
+ 
+ static void
+ announce(const char *what)
+@@ -380,12 +393,12 @@ step_survey(void)
+ 		smem = ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, ADSP_WIMG_WCOMB);
+ 	}
+ 	if (smem == 0) {
+-		say("stop: no mapping of SMEM %#lx + %#x", SMEM_PHYS, SMEM_SIZE);
++		FAIL("no mapping of SMEM %#lx + %#x", SMEM_PHYS, SMEM_SIZE);
+ 		return false;
+ 	}
+ 	p = smem_partition(SMEM_APPS, SMEM_ADSP, &psize, &cacheline);
+ 	if (p == 0) {
+-		say("stop: no SMEM partition for hosts 0/2 ($TOC %#x)", rd32(smem, SMEM_SIZE - 0x1000));
++		FAIL("no SMEM partition for hosts 0/2 ($TOC %#x)", rd32(smem, SMEM_SIZE - 0x1000));
+ 		return false;
+ 	}
+ 	say("SMEM partition 0/2 at %#lx, %#x bytes, cacheline %u, free uncached %#x cached %#x", SMEM_PHYS + p, psize,
+@@ -393,7 +406,7 @@ step_survey(void)
+ 	at = smem_item(ITEM_SMP2P_THEIRS, &size);
+ 	if (at != 0) {
+ 		bool have = smp2p_value(at, "slave-kernel", &value);
+-		say("stop: ADSP SMP2P item %u is there (slave-kernel %s %#x): the ADSP has run since the reset; "
++		FAIL("ADSP SMP2P item %u is there (slave-kernel %s %#x): the ADSP has run since the reset; "
+ 		    "not started twice", ITEM_SMP2P_THEIRS, have ? "=" : "missing", value);
+ 		last_words();
+ 		return false;
+@@ -456,27 +469,27 @@ step_firmware(void)
+ 
+ 	if (kmem_alloc(kernel_map, &a, AREA_HEADER, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
+ 	    kmem_alloc(kernel_map, &b, CHUNK, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		say("stop: no memory");
++		FAIL("no memory");
+ 		goto out;
+ 	}
+ 	area = (struct area_header *)a;
+ 	if (negroni_ufs_adsp_area_read(0, area, AREA_HEADER) != 0 || memcmp(area->magic, AREA_MAGIC, 8) != 0 ||
+ 	    area->version != 1 || area->count == 0 || area->count > AREA_MAX) {
+-		say("stop: no ADSP firmware area (scripts/audio/mkadsparea.py + dd; magic %.8s)", area->magic);
++		FAIL("no ADSP firmware area (scripts/audio/mkadsparea.py + dd; magic %.8s)", area->magic);
+ 		goto out;
+ 	}
+ 	for (uint32_t i = 0; i < area->count; i++) {
+ 		struct area_entry *x = &area->entry[i];
+ 		x->name[47] = 0;
+ 		if (x->offset < AREA_HEADER || x->offset > AREA_SIZE || x->size > AREA_SIZE - x->offset) {
+-			say("stop: area entry %u (%s) out of range", i, x->name);
++			FAIL("area entry %u (%s) out of range", i, x->name);
+ 			goto out;
+ 		}
+ 	}
+ 	say("firmware area: %u files", area->count);
+ 	e = area_file("adsp.mdt");
+ 	if (e == NULL || e->size < 52 || e->size > PAGE_SIZE || !area_check(e, (uint8_t *)b)) {
+-		say("stop: adsp.mdt missing, too big for one page, or SHA-256 mismatch");
++		FAIL("adsp.mdt missing, too big for one page, or SHA-256 mismatch");
+ 		goto out;
+ 	}
+ 	if (kmem_alloc(kernel_map, &m, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
+@@ -488,7 +501,7 @@ step_firmware(void)
+ 	memcpy(&phoff, mdt + 28, 4);
+ 	phnum = (uint32_t)(mdt[44] | mdt[45] << 8);
+ 	if (memcmp(mdt, "\177ELF\1\1", 6) != 0 || phnum == 0 || phnum > MAX_SEGMENTS || phoff + 32 * phnum > mdt_size) {
+-		say("stop: adsp.mdt is not an ELF32 LE header with <= %u program headers", MAX_SEGMENTS);
++		FAIL("adsp.mdt is not an ELF32 LE header with <= %u program headers", MAX_SEGMENTS);
+ 		goto out;
+ 	}
+ 	nseg = phnum;
+@@ -511,11 +524,11 @@ step_firmware(void)
+ 		snprintf(name, sizeof(name), "adsp.b%02u", i);
+ 		const struct area_entry *f = area_file(name);
+ 		if (f == NULL || f->size != segs[i].filesz || segs[i].filesz > segs[i].memsz) {
+-			say("stop: %s missing or not %u bytes", name, segs[i].filesz);
++			FAIL("%s missing or not %u bytes", name, segs[i].filesz);
+ 			goto out;
+ 		}
+ 		if (!area_check(f, (uint8_t *)b)) {
+-			say("stop: %s SHA-256 mismatch", name);
++			FAIL("%s SHA-256 mismatch", name);
+ 			goto out;
+ 		}
+ 		bytes += f->size;
+@@ -525,7 +538,7 @@ step_firmware(void)
+ 	    (max_pa - min_pa) >> 10, bytes >> 10, relocatable ? "relocatable" : "fixed");
+ 	if (min_pa == ~0u || max_pa - min_pa > ADSP_MEM_SIZE || (!relocatable && (min_pa < ADSP_MEM_PHYS ||
+ 	    max_pa > ADSP_MEM_PHYS + ADSP_MEM_SIZE))) {
+-		say("stop: the image does not fit the carveout %#lx + %#x", ADSP_MEM_PHYS, ADSP_MEM_SIZE);
++		FAIL("the image does not fit the carveout %#lx + %#x", ADSP_MEM_PHYS, ADSP_MEM_SIZE);
+ 		goto out;
+ 	}
+ 	ok = true;
+@@ -565,7 +578,7 @@ step_rails(void)
+ {
+ 	announce("vote RPMh lcx.lvl and lmx.lvl to level 384 (ADSP proxy votes)");
+ 	if (rail_vote("lcx.lvl", 384) != 0 || rail_vote("lmx.lvl", 384) != 0) {
+-		say("stop: rail vote failed");
++		FAIL("rail vote failed");
+ 		return false;
+ 	}
+ 	rails_on = true;
+@@ -603,13 +616,13 @@ step_aop(void)
+ 		aoss = ml_io_map(AOSS_PHYS, AOSS_SIZE);
+ 	}
+ 	if (rd32(aoss, QMP_MAGIC) != QMP_MAGIC_VALUE || rd32(aoss, QMP_VERSION) != 1) {
+-		say("stop: AOSS QMP magic %#x version %u", rd32(aoss, QMP_MAGIC), rd32(aoss, QMP_VERSION));
++		FAIL("AOSS QMP magic %#x version %u", rd32(aoss, QMP_MAGIC), rd32(aoss, QMP_VERSION));
+ 		return false;
+ 	}
+ 	box = rd32(aoss, QMP_MCORE_MBOX_OFFSET);
+ 	boxsize = rd32(aoss, QMP_MCORE_MBOX_SIZE);
+ 	if ((box & 3) || box < 0x3c || boxsize < QMP_MSG_LEN + 4 || box + boxsize > AOSS_SIZE) {
+-		say("stop: QMP mailbox at %#x size %#x does not fit", box, boxsize);
++		FAIL("QMP mailbox at %#x size %#x does not fit", box, boxsize);
+ 		return false;
+ 	}
+ 	if (rd32(aoss, QMP_MCORE_LINK) == QMP_UP && rd32(aoss, QMP_MCORE_LINK_ACK) == QMP_UP &&
+@@ -621,25 +634,25 @@ step_aop(void)
+ 		wr32(aoss, QMP_MCORE_LINK, QMP_UP);
+ 		kick(IPCC_CLIENT_AOP, 0);
+ 		if (!qmp_wait(QMP_MCORE_LINK_ACK, QMP_UP, 1000)) {
+-			say("stop: AOP does not ack our QMP link");
++			FAIL("AOP does not ack our QMP link");
+ 			return false;
+ 		}
+ 		wr32(aoss, QMP_MCORE_CH, QMP_UP);
+ 		kick(IPCC_CLIENT_AOP, 0);
+ 		if (!qmp_wait(QMP_UCORE_CH, QMP_UP, 1000)) {
+-			say("stop: AOP does not open its QMP channel");
++			FAIL("AOP does not open its QMP channel");
+ 			return false;
+ 		}
+ 		wr32(aoss, QMP_UCORE_CH_ACK, QMP_UP);
+ 		kick(IPCC_CLIENT_AOP, 0);
+ 		if (!qmp_wait(QMP_MCORE_CH_ACK, QMP_UP, 1000)) {
+-			say("stop: AOP does not ack our QMP channel");
++			FAIL("AOP does not ack our QMP channel");
+ 			return false;
+ 		}
+ 		say("QMP OPEN");
+ 	}
+ 	if (rd32(aoss, box) != 0) {
+-		say("stop: QMP mailbox still holds %u bytes", rd32(aoss, box));
++		FAIL("QMP mailbox still holds %u bytes", rd32(aoss, box));
+ 		return false;
+ 	}
+ 	memcpy(words, text, sizeof(text));
+@@ -651,7 +664,7 @@ step_aop(void)
+ 	kick(IPCC_CLIENT_AOP, 0);
+ 	if (!qmp_wait(box, 0, 1000)) {
+ 		wr32(aoss, box, 0);
+-		say("stop: AOP does not take the QMP message");
++		FAIL("AOP does not take the QMP message");
+ 		return false;
+ 	}
+ 	say("AOP took \"%s\"", text);
+@@ -675,7 +688,7 @@ step_pas_init(void)
+ 	}
+ 	if (segs[0].type == PT_LOAD || hash == ~0u || ehdr == 0 || ehdr > mdt_size ||
+ 	    (uint64_t)ehdr + segs[hash].filesz > PAGE_SIZE) {
+-		say("stop: no usable ELF-header/hash segments (hash segment %u)", hash);
++		FAIL("no usable ELF-header/hash segments (hash segment %u)", hash);
+ 		return false;
+ 	}
+ 	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+@@ -693,7 +706,7 @@ step_pas_init(void)
+ 		const struct area_entry *f = area_file(name);
+ 		if (f == NULL || f->size != segs[hash].filesz ||
+ 		    negroni_ufs_adsp_area_read(f->offset, (void *)(page + ehdr), f->size) != 0) {
+-			say("stop: hash segment %s not readable", name);
++			FAIL("hash segment %s not readable", name);
+ 			return false;
+ 		}
+ 	}
+@@ -702,7 +715,7 @@ step_pas_init(void)
+ 	announce("hand the ADSP metadata to TrustZone (PAS init image, id 1)");
+ 	if (scm("PAS init image (adsp)", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_ADSP,
+ 	    kvtophys(page), 0, &answer) != 0 || answer != 0) {
+-		say("stop: TrustZone refuses the ADSP metadata (%#llx)", answer);
++		FAIL("TrustZone refuses the ADSP metadata (%#llx)", answer);
+ 		return false;
+ 	}
+ 	say("TRUSTZONE ACCEPTS THE ADSP SIGNATURE");
+@@ -710,7 +723,7 @@ step_pas_init(void)
+ 		answer = ~0ull;
+ 		if (scm("PAS mem setup (adsp)", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_ADSP, ADSP_MEM_PHYS,
+ 		    max_pa - min_pa, &answer) != 0 || answer != 0) {
+-			say("stop: TrustZone refuses the carveout (%#llx)", answer);
++			FAIL("TrustZone refuses the carveout (%#llx)", answer);
+ 			return false;
+ 		}
+ 		say("TrustZone takes the carveout %#lx + %#x", ADSP_MEM_PHYS, max_pa - min_pa);
+@@ -741,7 +754,7 @@ step_load(void)
+ 	/* kernel_map VA (not io_submap): ml_io_unmap at "out" removes it; ADSP_MEM_SIZE is 16 KiB aligned */
+ 	mem = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEM_PHYS, ADSP_MEM_SIZE, ADSP_WIMG_WCOMB);
+ 	if (mem == NULL) {
+-		say("stop: no mapping of the carveout %#lx + %#x", ADSP_MEM_PHYS, ADSP_MEM_SIZE);
++		FAIL("no mapping of the carveout %#lx + %#x", ADSP_MEM_PHYS, ADSP_MEM_SIZE);
+ 		kmem_free(kernel_map, buf, CHUNK);
+ 		return false;
+ 	}
+@@ -761,13 +774,13 @@ step_load(void)
+ 		uint8_t digest[32];
+ 
+ 		if (f == NULL || (base & 7)) {
+-			say("stop: %s missing or not 8-byte aligned (+%#x)", name, base);
++			FAIL("%s missing or not 8-byte aligned (+%#x)", name, base);
+ 			goto out;
+ 		}
+ 		for (uint32_t at = 0; at < f->size; at += CHUNK) {
+ 			uint32_t n = MIN(CHUNK, f->size - at);
+ 			if (negroni_ufs_adsp_area_read(f->offset + at, (void *)buf, n) != 0) {
+-				say("stop: read error in %s", name);
++				FAIL("read error in %s", name);
+ 				goto out;
+ 			}
+ 			uint32_t words = n / 8;
+@@ -790,7 +803,7 @@ step_load(void)
+ 		}
+ 		SHA256_Final(digest, &ctx);
+ 		if (memcmp(digest, f->sha256, 32) != 0) {
+-			say("stop: %s does not read back from the carveout (+%#x)", name, base);
++			FAIL("%s does not read back from the carveout (+%#x)", name, base);
+ 			goto out;
+ 		}
+ 	}
+@@ -805,16 +818,26 @@ out:
+ 
+ /* ---- our SMP2P item ---- */
+ 
++/*
++ * Allocate item `item` of `bytes` in the apps<->ADSP partition, under TCSR mutex 3 (Linux
++ * qcom_smem_alloc_private: uncached list, size rounded to 8, padding_data = the rounding).
++ * An item that is already there counts as allocated.
++ */
+ static bool
+-smem_alloc_ours(void)
++smem_alloc(uint32_t item, uint32_t bytes)
+ {
+ 	uint32_t psize = 0, cacheline = 0, p = smem_partition(SMEM_APPS, SMEM_ADSP, &psize, &cacheline);
+-	uint32_t size = (SMP2P_ITEM_SIZE + 7) & ~7u, owner = ~0u, at;
++	uint32_t size = (bytes + 7) & ~7u, owner = ~0u, at, have = 0;
+ 	bool made = false;
+ 
+ 	if (p == 0) {
++		FAIL("no SMEM partition 0/2 for item %u", item);
+ 		return false;
+ 	}
++	if (smem_item(item, &have) != 0) {
++		say("SMEM item %u is there already (%u bytes)", item, have);
++		return true;
++	}
+ 	if (tcsr == 0) {
+ 		tcsr = ml_io_map(TCSR_MUTEX_PHYS, 0x1000);
+ 	}
+@@ -827,27 +850,28 @@ smem_alloc_ours(void)
+ 		IOSleep(1);
+ 	}
+ 	if (owner != 1) {
+-		say("stop: SMEM hwlock 3 held by %u", owner);
++		FAIL("SMEM hwlock 3 held by %u (item %u)", owner, item);
+ 		return false;
+ 	}
+ 	uint32_t free_uncached = rd32(smem, p + 12), free_cached = rd32(smem, p + 16);
+ 	for (at = 32; at < free_uncached;) {
+ 		uint32_t w0 = rd32(smem, p + at), sz = rd32(smem, p + at + 4), pad = rd32(smem, p + at + 8);
+-		if ((w0 & 0xffff) != SMEM_CANARY || (w0 >> 16) == ITEM_SMP2P_OURS || sz > psize) {
++		if ((w0 & 0xffff) != SMEM_CANARY || (w0 >> 16) == item || sz > psize) {
+ 			break;
+ 		}
+ 		at += 16 + (pad >> 16) + sz;
+ 	}
+ 	if (at != free_uncached || free_uncached > free_cached || at + 16 + size > free_cached) {
+-		say("stop: SMEM partition walk ends at +%#x, free uncached +%#x cached +%#x: nothing written", at,
++		FAIL("SMEM partition walk for item %u ends at +%#x, free uncached +%#x cached +%#x: nothing written", item, at,
+ 		    free_uncached, free_cached);
+ 		goto out;
+ 	}
+-	wr32(smem, p + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
++	wr32(smem, p + at, SMEM_CANARY | item << 16);
+ 	wr32(smem, p + at + 4, size);
+-	wr32(smem, p + at + 8, size - SMP2P_ITEM_SIZE);         /* padding_data, padding_hdr 0 */
++	wr32(smem, p + at + 8, size - bytes);                   /* padding_data, padding_hdr 0 */
+ 	wr32(smem, p + at + 12, 0);
+ 	wr32(smem, p + 12, at + 16 + size);
++	say("SMEM item %u: %u bytes at %#lx", item, bytes, SMEM_PHYS + p + at + 16);
+ 	made = true;
+ out:
+ 	wr32(tcsr, 0, 0);
+@@ -863,13 +887,13 @@ step_smp2p(void)
+ 	announce("create/fill our SMP2P item 429 in SMEM (TCSR mutex 3) and ring the ADSP (IPCC 3/2)");
+ 	our_item = smem_item(ITEM_SMP2P_OURS, &size);
+ 	if (our_item == 0) {
+-		if (!smem_alloc_ours()) {
++		if (!smem_alloc(ITEM_SMP2P_OURS, SMP2P_ITEM_SIZE)) {
+ 			return false;
+ 		}
+ 		our_item = smem_item(ITEM_SMP2P_OURS, &size);
+ 	}
+ 	if (our_item == 0 || size < SMP2P_ITEM_SIZE) {
+-		say("stop: our item %u not found after allocation", ITEM_SMP2P_OURS);
++		FAIL("our item %u not found after allocation", ITEM_SMP2P_OURS);
+ 		return false;
+ 	}
+ 	for (uint32_t at = 0; at < SMP2P_ITEM_SIZE; at += 4) {
+@@ -902,7 +926,7 @@ step_start(void)
+ 	announce("ask TrustZone to authenticate and start the ADSP (PAS auth and reset, id 1)");
+ 	if (scm("PAS auth and reset (adsp)", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_ADSP, 0, 0,
+ 	    &answer) != 0 || answer != 0) {
+-		say("stop: TrustZone does not start the ADSP (%#llx)", answer);
++		FAIL("TrustZone does not start the ADSP (%#llx)", answer);
+ 		pas_shutdown("auth and reset failed");
+ 		return false;
+ 	}
+@@ -964,9 +988,681 @@ step_start(void)
+ 	return true;
+ }
+ 
++/* ---- GLINK over SMEM (step 9; Linux qcom_glink_smem.c + qcom_glink_native.c, read for the protocol) ---- */
++
++/*
++ * Transport: item 478 = 4 words {our TX tail, our TX head, our RX tail, our RX head} (32 bytes),
++ * item 479 = our TX FIFO (16 KiB, we allocate), item 480 = our RX FIFO (the ADSP allocates it).
++ * Every message is padded to 8 bytes; the heads and tails stay 8-byte aligned, so the 32-bit
++ * copies below never cross the FIFO end inside a word. IPCC client 3 signal 0 is the doorbell
++ * (live DT glink-edge "lpass": mboxes <&ipcc 3 0>). No interrupt: negroni_glink_poll() is called
++ * by any client (the ADSP thread, the /dev/negroni-audio writer, the charger client); gl_lock, a
++ * recursive mutex inside the public API, serializes them.
++ */
++#define GLINK_FIFO_SIZE         0x4000u
++#define GLINK_RESERVE           16u             /* FIFO_FULL_RESERVE + TX_BLOCKED_CMD_RESERVE */
++#define IPCC_SIGNAL_GLINK       0u
++#define GL_VERSION              0
++#define GL_VERSION_ACK          1
++#define GL_OPEN                 2
++#define GL_CLOSE                3
++#define GL_OPEN_ACK             4
++#define GL_INTENT               5
++#define GL_RX_DONE              6
++#define GL_RX_INTENT_REQ        7
++#define GL_RX_INTENT_REQ_ACK    8
++#define GL_TX_DATA              9
++#define GL_CLOSE_ACK            11
++#define GL_TX_DATA_CONT         12
++#define GL_READ_NOTIF           13
++#define GL_RX_DONE_W_REUSE      14
++#define GL_SIGNALS              15
++#define GL_FEATURE_INTENT_REUSE 1u
++#define GL_OURS                 12              /* local (RX) intents per channel (8 given at open, 4 for RX_INTENT_REQ) */
++#define GL_THEIRS               32              /* remote (TX) intents per channel */
++#define GL_INTENT_SIZE          4096u           /* our default RX intents and our largest TX message */
++#define GL_INTENT_MAX           0x4400u         /* largest RX intent we grant (live DT IPCRTR intents: 5 x 0x800, 3 x 0x2000, 2 x 0x4400) */
++#define GL_MSG_MAX              (GL_INTENT_MAX + 16)
++#define GL_LOG_MAX              8               /* lines per kind of repeated GLINK complaint */
++
++struct gl_intent {
++	uint32_t id, size;
++	bool used;
++};
++
++struct gl_channel {
++	const char *name;
++	uint16_t lcid, rcid;
++	bool open_sent, remote_open, open_acked, ack_sent, intents_sent;
++	int32_t req_result;                     /* RX_INTENT_REQ answer: -1 none yet */
++	struct gl_intent ours[GL_OURS];
++	uint8_t *buf[GL_OURS];
++	uint32_t fill[GL_OURS];                 /* bytes of a fragmented message so far */
++	uint32_t nours;
++	struct gl_intent theirs[GL_THEIRS];
++	void (*rx)(const uint8_t *data, uint32_t len);
++	uint64_t rx_count, tx_count;
++};
++
++static struct gl_channel gl_ch[NEGRONI_GLINK_CHANNELS] = {
++	{ .name = "IPCRTR", .lcid = 1 },        /* QRTR (stage (b): service discovery, servreg locator) */
++	{ .name = "adsp_apps", .lcid = 2 },     /* GPR (stage (b): APM, PRM) */
++};
++static uint32_t gl_desc, gl_tx, gl_rx, gl_rx_len, gl_features = GL_FEATURE_INTENT_REUSE, gl_next_liid = 1;
++static bool gl_version_ok, gl_dead, gl_notified;
++static uint8_t gl_msg[GL_MSG_MAX];
++static uint32_t gl_complaints;                  /* repeated-error lines printed so far (capped at GL_LOG_MAX) */
++#define gl_complain(fmt, ...) do { if (gl_complaints < GL_LOG_MAX) { gl_complaints++; say(fmt, ##__VA_ARGS__); } } while (0)
++
++/*
++ * One lock over the GLINK state (FIFO heads/tails, intents, the static TX buffer): the ADSP thread,
++ * the /dev/negroni-audio writer (0243) and the charger client (0274) all send. Recursive for the
++ * owning thread, because an RX callback inside negroni_glink_poll() may call negroni_glink_send().
++ */
++static LCK_GRP_DECLARE(gl_grp, "negroni_glink");
++static LCK_MTX_DECLARE(gl_mtx, &gl_grp);
++static thread_t gl_owner;
++static uint32_t gl_depth;
++
++static void
++gl_lock(void)
++{
++	if (gl_owner == current_thread()) {
++		gl_depth++;
++		return;
++	}
++	lck_mtx_lock(&gl_mtx);
++	gl_owner = current_thread();
++	gl_depth = 1;
++}
++
++static void
++gl_unlock(void)
++{
++	if (--gl_depth == 0) {
++		gl_owner = NULL;
++		lck_mtx_unlock(&gl_mtx);
++	}
++}
++
++static uint32_t
++gl_mod(uint32_t v, uint32_t len)
++{
++	return v >= len ? v - len : v;
++}
++
++static uint32_t
++gl_tx_avail(void)
++{
++	uint32_t tail = rd32(smem, gl_desc + 0), head = rd32(smem, gl_desc + 4);
++	uint32_t avail = tail <= head ? GLINK_FIFO_SIZE - head + tail : tail - head;
++
++	return avail < GLINK_RESERVE ? 0 : avail - GLINK_RESERVE;
++}
++
++/* One message (len a multiple of 8) into our TX FIFO, then the doorbell. ETIMEDOUT after 200 ms full. */
++static int
++gl_write(const void *msg, uint32_t len)
++{
++	const uint32_t *w = msg;
++	uint32_t head;
++
++	if (gl_dead || (len & 7) || len >= GLINK_FIFO_SIZE - GLINK_RESERVE) {
++		return EINVAL;
++	}
++	for (uint32_t ms = 0; gl_tx_avail() < len; ms++) {
++		if (ms == 200) {
++			gl_complain("GLINK: our TX FIFO stays full (tail %#x head %#x)", rd32(smem, gl_desc), rd32(smem, gl_desc + 4));
++			return ETIMEDOUT;
++		}
++		if (!gl_notified) {
++			uint32_t note[2] = { GL_READ_NOTIF, 0 };
++			gl_notified = true;
++			head = rd32(smem, gl_desc + 4);
++			uint32_t tl = rd32(smem, gl_desc + 0);
++			uint32_t raw = tl <= head ? GLINK_FIFO_SIZE - head + tl : tl - head;
++			if (raw > 8) {                  /* raw space: gl_tx_avail() already keeps the reserve back */
++				wr32(smem, gl_tx + head, note[0]);
++				wr32(smem, gl_tx + head + 4, note[1]);
++				wr32(smem, gl_desc + 4, gl_mod(head + 8, GLINK_FIFO_SIZE));
++				kick(IPCC_CLIENT_LPASS, IPCC_SIGNAL_GLINK);
++			}
++		}
++		IOSleep(1);
++	}
++	gl_notified = false;
++	head = rd32(smem, gl_desc + 4);
++	for (uint32_t i = 0; i < len / 4; i++) {
++		wr32(smem, gl_tx + head, w[i]);
++		head = gl_mod(head + 4, GLINK_FIFO_SIZE);
++	}
++	wr32(smem, gl_desc + 4, head);          /* wr32 orders the FIFO stores before the head */
++	kick(IPCC_CLIENT_LPASS, IPCC_SIGNAL_GLINK);
++	return 0;
++}
++
++static int
++gl_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint32_t m[2] = { cmd | (uint32_t)p1 << 16, p2 };
++	return gl_write(m, sizeof(m));
++}
++
++static uint32_t
++gl_rx_avail(void)
++{
++	uint32_t size = 0;
++
++	if (gl_rx == 0) {
++		gl_rx = smem_item(ITEM_GLINK_FIFO1, &size);
++		if (gl_rx == 0) {
++			return 0;
++		}
++		gl_rx_len = size & ~7u;
++		say("GLINK: the ADSP's FIFO (item %u) is there: %#x bytes", ITEM_GLINK_FIFO1, size);
++		if (gl_rx_len < 64 || gl_rx_len > 0x100000) {
++			say("GLINK: FIFO size %#x is not usable", size);
++			gl_dead = true;
++			gl_rx = 0;
++			return 0;
++		}
++	}
++	uint32_t tail = rd32(smem, gl_desc + 8), head = rd32(smem, gl_desc + 12);
++	if (head >= gl_rx_len || tail >= gl_rx_len) {
++		say("GLINK: RX head %#x / tail %#x outside the FIFO (%#x): GLINK stopped", head, tail, gl_rx_len);
++		gl_dead = true;
++		return 0;
++	}
++	return head >= tail ? head - tail : gl_rx_len - tail + head;
++}
++
++/* Copy `len` bytes (rounded up to 4) at `off` past our RX tail. */
++static void
++gl_peek(uint32_t off, void *dst, uint32_t len)
++{
++	uint32_t *w = dst, at = gl_mod(rd32(smem, gl_desc + 8) + off, gl_rx_len);
++
++	for (uint32_t i = 0; i < (len + 3) / 4; i++) {
++		w[i] = rd32(smem, gl_rx + at);
++		at = gl_mod(at + 4, gl_rx_len);
++	}
++}
++
++static void
++gl_advance(uint32_t len)
++{
++	wr32(smem, gl_desc + 8, gl_mod(rd32(smem, gl_desc + 8) + ((len + 7) & ~7u), gl_rx_len));
++}
++
++static struct gl_channel *
++gl_by_rcid(uint32_t rcid)
++{
++	for (unsigned c = 0; c < NEGRONI_GLINK_CHANNELS; c++) {
++		if (gl_ch[c].remote_open && gl_ch[c].rcid == rcid) {
++			return &gl_ch[c];
++		}
++	}
++	return NULL;
++}
++
++static bool
++gl_up(const struct gl_channel *ch)
++{
++	return ch->remote_open && ch->open_acked;
++}
++
++static int
++gl_send_open(struct gl_channel *ch)
++{
++	uint32_t m[2 + 8] = { 0 }, n = (uint32_t)strlen(ch->name) + 1;
++
++	m[0] = GL_OPEN | (uint32_t)ch->lcid << 16;
++	m[1] = n;
++	memcpy(&m[2], ch->name, n);
++	ch->open_sent = true;
++	return gl_write(m, (8 + n + 7) & ~7u);
++}
++
++static int
++gl_advertise(struct gl_channel *ch, unsigned i)
++{
++	uint32_t m[4];
++
++	m[0] = GL_INTENT | (uint32_t)ch->lcid << 16;
++	m[1] = 1;
++	m[2] = ch->ours[i].size;
++	m[3] = ch->ours[i].id;
++	return gl_write(m, sizeof(m));
++}
++
++/* Advertise one local intent of `size` bytes (GL_INTENT_SIZE..GL_INTENT_MAX, kmem). */
++static bool
++gl_add_intent(struct gl_channel *ch, uint32_t size)
++{
++	vm_offset_t b = 0;
++	uint32_t bytes = MAX(size, GL_INTENT_SIZE);
++
++	if (ch->nours >= GL_OURS || size > GL_INTENT_MAX ||
++	    kmem_alloc(kernel_map, &b, round_page(bytes), KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	unsigned i = ch->nours++;
++	ch->buf[i] = (uint8_t *)b;
++	ch->ours[i] = (struct gl_intent){ gl_next_liid++, bytes, false };
++	ch->fill[i] = 0;
++	return gl_advertise(ch, i) == 0;
++}
++
++static void
++gl_rx_data(struct gl_channel *ch, uint32_t liid, const uint8_t *data, uint32_t chunk, uint32_t left)
++{
++	unsigned i;
++
++	for (i = 0; i < ch->nours && ch->ours[i].id != liid; i++) {
++	}
++	if (i == ch->nours) {
++		gl_complain("GLINK: %s: data for an intent %u we never gave", ch->name, liid);
++		return;
++	}
++	if (ch->fill[i] + chunk > ch->ours[i].size) {
++		gl_complain("GLINK: %s: %u + %u bytes do not fit intent %u: dropped", ch->name, ch->fill[i], chunk, liid);
++		ch->fill[i] = 0;
++		return;
++	}
++	memcpy(ch->buf[i] + ch->fill[i], data, chunk);
++	ch->fill[i] += chunk;
++	if (left) {
++		return;
++	}
++	uint32_t whole = ch->fill[i];
++	ch->fill[i] = 0;
++	ch->rx_count++;
++	if (ch->rx) {
++		ch->rx(ch->buf[i], whole);
++	}
++	/*
++	 * RX_DONE_W_REUSE {cmd, our lcid, liid} keeps the intent when both sides agreed on
++	 * INTENT_REUSE (feature bit 0); otherwise RX_DONE ends it and we give the same buffer again.
++	 */
++	if (gl_features & GL_FEATURE_INTENT_REUSE) {
++		(void)gl_cmd(GL_RX_DONE_W_REUSE, ch->lcid, liid);
++	} else {
++		(void)gl_cmd(GL_RX_DONE, ch->lcid, liid);
++		ch->ours[i].id = gl_next_liid++;
++		(void)gl_advertise(ch, i);
++	}
++}
++
++/* Handle every complete message in our RX FIFO (with gl_lock held). */
++static void
++gl_poll(void)
++{
++	for (int n = 0; n < 256 && !gl_dead; n++) {
++		uint32_t avail = gl_rx_avail(), hdr[4], cmd, p1, p2, need = 8;
++		struct gl_channel *ch;
++
++		if (avail < 8) {
++			return;
++		}
++		gl_peek(0, hdr, 8);
++		cmd = hdr[0] & 0xffff;
++		p1 = hdr[0] >> 16;
++		p2 = hdr[1];
++		switch (cmd) {
++		case GL_VERSION:
++			if (p1 == 1) {
++				gl_features &= p2;
++			}
++			gl_advance(8);
++			if (p1 != 0) {
++				/* any version != 0 is acked with version 1, as Linux's default case does */
++				(void)gl_cmd(GL_VERSION_ACK, 1, gl_features);
++				if (!gl_version_ok) {
++					say("GLINK: the ADSP offers version %u features %#x: version 1 ok (features %#x)", p1, p2, gl_features);
++				}
++				gl_version_ok = true;
++			}
++			break;
++		case GL_VERSION_ACK:
++			gl_advance(8);
++			if (p1 == 0) {
++				say("GLINK: the ADSP refuses version 1");
++				gl_dead = true;
++			} else if (p1 == 1 && p2 != gl_features) {
++				gl_features &= p2;
++				(void)gl_cmd(GL_VERSION, 1, gl_features);
++			} else {
++				if (!gl_version_ok) {
++					say("GLINK: version 1 ok (features %#x)", gl_features);
++				}
++				gl_version_ok = true;
++			}
++			break;
++		case GL_OPEN: {
++			char name[33];
++			uint32_t len = p2 & 0xffff;
++
++			need = 8 + len;
++			if (avail < need) {
++				return;
++			}
++			bzero(name, sizeof(name));
++			if (len > 32) {
++				len = 32;
++			}
++			{
++				uint32_t w[10];
++				gl_peek(0, w, 8 + len);
++				memcpy(name, (uint8_t *)w + 8, len);
++			}
++			name[32] = 0;
++			gl_advance(need);
++			ch = NULL;
++			for (unsigned c = 0; c < NEGRONI_GLINK_CHANNELS; c++) {
++				if (strcmp(gl_ch[c].name, name) == 0) {
++					ch = &gl_ch[c];
++				}
++			}
++			if (ch == NULL) {
++				say("GLINK: the ADSP opens \"%s\" (rcid %u): not ours, left unanswered", name, p1);
++				break;
++			}
++			ch->rcid = (uint16_t)p1;
++			ch->remote_open = true;
++			say("GLINK: the ADSP opens %s (rcid %u)", ch->name, p1);
++			(void)gl_cmd(GL_OPEN_ACK, ch->rcid, 0);
++			ch->ack_sent = true;
++			if (!ch->open_sent) {
++				(void)gl_send_open(ch);
++			}
++			break;
++		}
++		case GL_CLOSE:
++			gl_advance(8);
++			ch = gl_by_rcid(p1);
++			say("GLINK: the ADSP closes rcid %u (%s)", p1, ch ? ch->name : "?");
++			(void)gl_cmd(GL_CLOSE_ACK, (uint16_t)p1, 0);
++			if (ch) {
++				ch->remote_open = false;
++			}
++			break;
++		case GL_CLOSE_ACK:
++			gl_advance(8);
++			break;
++		case GL_OPEN_ACK:
++			gl_advance(8);
++			for (unsigned c = 0; c < NEGRONI_GLINK_CHANNELS; c++) {
++				if (gl_ch[c].lcid == p1) {
++					gl_ch[c].open_acked = true;
++					say("GLINK: the ADSP acks our open of %s", gl_ch[c].name);
++				}
++			}
++			break;
++		case GL_INTENT: {
++			uint32_t pair[2];
++
++			need = 8 + 8 * p2;
++			if (p2 > 64) {
++				say("GLINK: INTENT with %u entries: GLINK stopped", p2);
++				gl_dead = true;
++				return;
++			}
++			if (avail < need) {
++				return;
++			}
++			ch = gl_by_rcid(p1);
++			for (uint32_t i = 0; ch && i < p2; i++) {
++				gl_peek(8 + 8 * i, pair, 8);
++				for (unsigned k = 0; k < GL_THEIRS; k++) {
++					if (ch->theirs[k].size == 0) {
++						ch->theirs[k] = (struct gl_intent){ pair[1], pair[0], false };
++						break;
++					}
++				}
++			}
++			gl_advance(need);
++			break;
++		}
++		case GL_RX_DONE:
++		case GL_RX_DONE_W_REUSE:
++			gl_advance(8);
++			ch = gl_by_rcid(p1);
++			for (unsigned k = 0; ch && k < GL_THEIRS; k++) {
++				if (ch->theirs[k].size && ch->theirs[k].id == p2) {
++					if (cmd == GL_RX_DONE) {
++						ch->theirs[k].size = 0;
++					}
++					ch->theirs[k].used = false;
++				}
++			}
++			break;
++		case GL_RX_INTENT_REQ:
++			gl_advance(8);
++			ch = gl_by_rcid(p1);
++			if (ch) {
++				bool granted = gl_add_intent(ch, p2);
++				(void)gl_cmd(GL_RX_INTENT_REQ_ACK, ch->lcid, granted);
++				if (!granted) {
++					gl_complain("GLINK: %s: the ADSP asks for an intent of %u bytes: refused", ch->name, p2);
++				}
++			}
++			break;
++		case GL_RX_INTENT_REQ_ACK:
++			gl_advance(8);
++			ch = gl_by_rcid(p1);
++			if (ch) {
++				ch->req_result = (int32_t)p2;
++			}
++			break;
++		case GL_TX_DATA:
++		case GL_TX_DATA_CONT: {
++			uint32_t chunk, left;
++
++			if (avail < 16) {
++				return;
++			}
++			gl_peek(0, hdr, 16);
++			chunk = hdr[2];
++			left = hdr[3];
++			need = 16 + chunk;
++			if (chunk > GL_INTENT_MAX) {
++				say("GLINK: a %u-byte chunk is bigger than any intent of ours: GLINK stopped", chunk);
++				gl_dead = true;
++				return;
++			}
++			if (avail < need) {
++				return;
++			}
++			gl_peek(16, gl_msg, chunk);
++			gl_advance(need);
++			ch = gl_by_rcid(p1);
++			if (ch) {
++				gl_rx_data(ch, p2, gl_msg, chunk, left);
++			}
++			break;
++		}
++		case GL_READ_NOTIF:
++			gl_advance(8);
++			kick(IPCC_CLIENT_LPASS, IPCC_SIGNAL_GLINK);
++			break;
++		case GL_SIGNALS:
++			gl_advance(8);
++			break;
++		default:
++			say("GLINK: unknown command %u (%#x %#x): GLINK stopped", cmd, hdr[0], hdr[1]);
++			gl_dead = true;
++			return;
++		}
++	}
++}
++
++bool
++negroni_glink_up(unsigned c)
++{
++	return c < NEGRONI_GLINK_CHANNELS && !gl_dead && gl_up(&gl_ch[c]);
++}
++
++void
++negroni_glink_set_rx(unsigned c, void (*fn)(const uint8_t *data, uint32_t len))
++{
++	if (c < NEGRONI_GLINK_CHANNELS) {
++		gl_ch[c].rx = fn;
++	}
++}
++
++/*
++ * One message to the ADSP on channel c: needs a remote intent of >= len bytes (asks for one with
++ * RX_INTENT_REQ and waits up to 1 s). One chunk: len <= GL_INTENT_SIZE. With gl_lock held.
++ */
++static int
++gl_send(unsigned c, const void *data, uint32_t len)
++{
++	struct gl_channel *ch;
++	struct gl_intent *best = NULL;
++
++	if (c >= NEGRONI_GLINK_CHANNELS || len == 0 || len > GL_INTENT_SIZE) {
++		return EINVAL;
++	}
++	ch = &gl_ch[c];
++	if (gl_dead || !gl_up(ch)) {
++		return ENOTCONN;
++	}
++	for (int round = 0; round < 2 && best == NULL; round++) {
++		for (unsigned k = 0; k < GL_THEIRS; k++) {
++			struct gl_intent *t = &ch->theirs[k];
++			if (t->size >= len && !t->used && (best == NULL || t->size < best->size)) {
++				best = t;
++			}
++		}
++		if (best == NULL && round == 0) {
++			ch->req_result = -1;
++			if (gl_cmd(GL_RX_INTENT_REQ, ch->lcid, len) != 0) {
++				return EIO;
++			}
++			for (uint32_t ms = 0; ms < 1000 && ch->req_result < 0; ms++) {
++				gl_poll();
++				if (ch->req_result < 0) {
++					IOSleep(1);
++				}
++			}
++			gl_poll();           /* the INTENT may follow the ack */
++			if (ch->req_result <= 0) {
++				gl_complain("GLINK: %s: the ADSP gives no intent for %u bytes (answer %d)", ch->name, len, ch->req_result);
++				return EAGAIN;
++			}
++		}
++	}
++	if (best == NULL) {
++		return EAGAIN;
++	}
++	best->used = true;
++	{
++		static uint32_t m[(16 + GL_INTENT_SIZE + 7) / 4];     /* under gl_lock: no 4 KiB stack copy */
++		m[0] = GL_TX_DATA | (uint32_t)ch->lcid << 16;
++		m[1] = best->id;
++		m[2] = len;
++		m[3] = 0;
++		memcpy(&m[4], data, len);
++		bzero((uint8_t *)&m[4] + len, ((len + 7) & ~7u) - len);
++		if (gl_write(m, 16 + ((len + 7) & ~7u)) != 0) {
++			best->used = false;
++			return EIO;
++		}
++	}
++	ch->tx_count++;
++	return 0;
++}
++
++/* Public API (stable for 0243 and the charger client 0274): each call takes gl_lock. */
++void
++negroni_glink_poll(void)
++{
++	gl_lock();
++	gl_poll();
++	gl_unlock();
++}
++
++/*
++ * Send one message (len <= 4096) on channel c. Blocks the caller for up to ~1.2 s (an intent
++ * request, a full TX FIFO); returns 0, EINVAL, ENOTCONN, EAGAIN (no remote intent) or EIO.
++ */
++int
++negroni_glink_send(unsigned c, const void *data, uint32_t len)
++{
++	int error;
++
++	gl_lock();
++	error = gl_send(c, data, len);
++	gl_unlock();
++	return error;
++}
++
++static bool
++step_glink(void)
++{
++	uint32_t size = 0, ms;
++
++	announce("GLINK: allocate SMEM items 478 (descriptors) and 479 (our TX FIFO), say version 1");
++	if (!smem_alloc(ITEM_GLINK_DESC, 32) || !smem_alloc(ITEM_GLINK_FIFO0, GLINK_FIFO_SIZE)) {
++		return false;
++	}
++	gl_desc = smem_item(ITEM_GLINK_DESC, &size);
++	if (gl_desc == 0 || size != 32) {
++		FAIL("GLINK descriptor item %u: %s (%u bytes)", ITEM_GLINK_DESC, gl_desc ? "wrong size" : "absent", size);
++		return false;
++	}
++	gl_tx = smem_item(ITEM_GLINK_FIFO0, &size);
++	if (gl_tx == 0 || size < GLINK_FIFO_SIZE) {
++		FAIL("GLINK TX FIFO item %u: %s (%u bytes)", ITEM_GLINK_FIFO0, gl_tx ? "too small" : "absent", size);
++		return false;
++	}
++	wr32(smem, gl_desc + 8, 0);             /* our RX tail */
++	wr32(smem, gl_desc + 4, 0);             /* our TX head */
++	say("GLINK: descriptors at %#lx, TX FIFO at %#lx (%#x bytes)", SMEM_PHYS + gl_desc, SMEM_PHYS + gl_tx, size);
++	if (gl_cmd(GL_VERSION, 1, gl_features) != 0) {
++		FAIL("GLINK: VERSION does not go out");
++		return false;
++	}
++	for (ms = 0; ms < step_budget_ms && !gl_dead; ms++) {
++		negroni_glink_poll();
++		if (gl_version_ok) {
++			for (unsigned c = 0; c < NEGRONI_GLINK_CHANNELS; c++) {
++				if (!gl_ch[c].open_sent) {
++					say("GLINK: open %s (lcid %u)", gl_ch[c].name, gl_ch[c].lcid);
++					(void)gl_send_open(&gl_ch[c]);
++				}
++			}
++		}
++		if (gl_up(&gl_ch[0]) && gl_up(&gl_ch[1])) {
++			break;
++		}
++		IOSleep(1);
++	}
++	if (gl_dead || !gl_up(&gl_ch[0]) || !gl_up(&gl_ch[1])) {
++		FAIL("GLINK not up after %u ms: FIFO 480 %s, version %s, IPCRTR remote %u ack %u, adsp_apps remote %u ack %u%s", ms,
++		    gl_rx ? "there" : "missing", gl_version_ok ? "ok" : "no answer", gl_ch[0].remote_open, gl_ch[0].open_acked,
++		    gl_ch[1].remote_open, gl_ch[1].open_acked, gl_dead ? ", GLINK stopped" : "");
++		return false;
++	}
++	for (unsigned c = 0; c < NEGRONI_GLINK_CHANNELS; c++) {
++		for (unsigned i = 0; i < (c == 0 ? 4u : 8u); i++) {         /* leaves 4 slots for RX_INTENT_REQ */
++			if (!gl_add_intent(&gl_ch[c], GL_INTENT_SIZE)) {
++				FAIL("GLINK: %s: intent %u not given", gl_ch[c].name, i);
++				return false;
++			}
++		}
++		say("GLINK: channel %s open (lcid %u rcid %u), %u intents of %u bytes given", gl_ch[c].name, gl_ch[c].lcid,
++		    gl_ch[c].rcid, gl_ch[c].nours, GL_INTENT_SIZE);
++	}
++	negroni_glink_poll();
++	say("GLINK UP after %u ms", ms);
++	return true;
++}
++
+ static bool (*const steps[STEPS])(void) = {
+-	step_survey, step_firmware, step_rails, step_aop, step_pas_init, step_load, step_smp2p, step_start,
++	step_survey, step_firmware, step_rails, step_aop, step_pas_init, step_load, step_smp2p, step_start, step_glink,
+ };
++_Static_assert(sizeof(step_names) / sizeof(step_names[0]) == STEPS, "one name per step");
+ 
+ static void
+ adsp_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -974,10 +1670,20 @@ adsp_thread(__unused void *arg, __unused wait_result_t wr)
+ 	bool failed = false;
+ 
+ 	for (step = 1; step <= last_step; step++) {
+-		if (!steps[step - 1]()) {
++		uint64_t t0 = mach_absolute_time(), ns = 0;
++		bool ok;
++
++		fail_why[0] = 0;
++		ok = steps[step - 1]();
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		if (!ok) {
++			printf("NEGRONI ADSP: step %u (%s) failed: %s (after %llu ms)\n", step, step_names[step - 1],
++			    fail_why[0] ? fail_why : "no reason logged", ns / 1000000);
+ 			failed = true;
+ 			break;
+ 		}
++		printf("NEGRONI ADSP: step %u (%s) ok in %llu ms%s\n", step, step_names[step - 1], ns / 1000000,
++		    ns / 1000000 > step_budget_ms ? " (OVER the step time limit)" : "");
+ 	}
+ 	if (failed && step >= 5 && step < 8) {
+ 		pas_shutdown("a step after PAS init failed");
+@@ -1005,6 +1711,8 @@ negroni_adsp_init(void)
+ 	(void)PE_parse_boot_argn("negroniadsp_pause", &pause_ms, sizeof(pause_ms));
+ 	(void)PE_parse_boot_argn("negroniadsp_wait", &wait_s, sizeof(wait_s));
+ 	(void)PE_parse_boot_argn("negroniadsp_unvote", &unvote, sizeof(unvote));
++	(void)PE_parse_boot_argn("negroniadsp_steptimeout", &step_budget_ms, sizeof(step_budget_ms));
++	step_budget_ms = MIN(MAX(step_budget_ms, 1000u), 120000u);
+ 	last_step = MIN(MAX(last_step, 1u), (uint32_t)STEPS);
+ 	printf("NEGRONI ADSP: steps 1..%u (UNTESTED stage (a): PAS id 1, carveout %#lx)\n", last_step, ADSP_MEM_PHYS);
+ 	if (kernel_thread_start(adsp_thread, NULL, &thread) == KERN_SUCCESS) {
+diff --git a/bsd/dev/negroni_adsp.h b/bsd/dev/negroni_adsp.h
+new file mode 100644
+index 0000000..dc4d57b
+--- /dev/null
++++ b/bsd/dev/negroni_adsp.h
+@@ -0,0 +1,18 @@
++/*
++ * NEGRONI (SM8450) audio DSP: the interface between negroni_adsp.c (stage (a): ADSP start, step 9
++ * GLINK) and stage (b) (patch 0243). iOSPlus10 docs/audio-plan.md. One recursive mutex (gl_lock) inside the public GLINK API serializes its callers.
++ */
++#ifndef _NEGRONI_ADSP_H_
++#define _NEGRONI_ADSP_H_
++
++#define NEGRONI_GLINK_CHANNELS  2
++#define NEGRONI_GLINK_IPCRTR    0       /* QRTR */
++#define NEGRONI_GLINK_GPR       1       /* "adsp_apps": GPR */
++
++/* GLINK (negroni_adsp.c) */
++void negroni_glink_poll(void);
++bool negroni_glink_up(unsigned channel);
++void negroni_glink_set_rx(unsigned channel, void (*fn)(const uint8_t *data, uint32_t len));
++int negroni_glink_send(unsigned channel, const void *data, uint32_t len);
++
++#endif

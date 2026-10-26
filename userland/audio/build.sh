@@ -55,9 +55,10 @@ fi
 echo "AudioServerPlugIn.h: $(wc -l < "$W/host/layout-ours.txt" | tr -d ' ') sizes/offsets/values match the macOS SDK"
 
 # host test: the same source for macOS, loaded by a small HAL stand-in
-clang $CFLAGS -bundle -framework CoreFoundation "$HERE/NegroniAudio.c" -o "$W/host/NegroniAudio"
+# NEGRONI_AUDIO_HOST_TEST: the device path from $NEGRONI_AUDIO_TEST_PATH (a FIFO) + a stats hook; never in the iOS build
+clang $CFLAGS -DNEGRONI_AUDIO_HOST_TEST -bundle -framework CoreFoundation "$HERE/NegroniAudio.c" -o "$W/host/NegroniAudio"
 clang -O1 -Wall -framework CoreFoundation "$HERE/test-host.c" -o "$W/host/test-host"
-"$W/host/test-host" "$W/host/NegroniAudio"
+"$W/host/test-host" "$W/host/NegroniAudio" "$W/host/sink.fifo"
 
 echo "built $B (arm64, minos $MINOS, ad hoc signed):"
 cat "$W/ios/SHA256SUMS"

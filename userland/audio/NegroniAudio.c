@@ -44,6 +44,15 @@
  * observation: VirtualAudio sets it once to 0 dB and keeps the D22 speaker in software volume
  * mode, so iOS scales the samples itself.
  *
+ * Stage 1 (I/O path): the HAL real-time I/O thread never makes a system call. WriteMix copies
+ * the Speaker frames into a lock-free single-producer/single-consumer ring (RING_BYTES, 341 ms).
+ * A writer thread (made at the Speaker's first StartIO, joined at its last StopIO) drains the
+ * ring into /dev/negroni-audio every WRITER_NS. The kernel copies write() data into the APM
+ * shared-memory ring of the ADSP graph (patches/xnu 0243+). Bytes the kernel does not take stay
+ * in the ring for the next round. A full ring drops the new frames (counted). ENODEV (no sink):
+ * the waiting frames are dropped (counted), the node stays open. Other write errors close the
+ * node; the writer opens it again at most every 2 s.
+ *
  * Log lines start "NegroniAudio:" (stderr, as HackiOS does).
  */
 #include <errno.h>
@@ -54,6 +63,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -102,11 +112,30 @@ static struct device devices[] = {
 
 static AudioServerPlugInHostRef host;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static int sink = -1;                   /* /dev/negroni-audio, -1 = not open */
+static pthread_mutex_t io_lock = PTHREAD_MUTEX_INITIALIZER;     /* StartIO/StopIO (writer start and join); the writer never takes it */
+static int sink = -1;                   /* /dev/negroni-audio, -1 = not open; changed by the writer only, under lock */
 static UInt64 sink_tried;               /* mach_absolute_time() of the last open() */
+static int sink_last_errno = -1;        /* errno of the last failed open(), -1 = none yet; writer thread only */
+static const char *sink_path = NEGRONI_AUDIO_DEVICE;
+
+/*
+ * The Speaker ring: bytes of S16LE stereo frames. head: bytes put in by the I/O thread (the only
+ * producer), tail: bytes taken out by the writer thread (the only consumer). Both only grow; the
+ * index in ring[] is the count modulo RING_BYTES. The producer reads tail with acquire and writes
+ * head with release after the copy; the consumer does the opposite.
+ */
+#define RING_FRAMES             16384u  /* 341 ms at 48 kHz, a power of two */
+#define RING_BYTES              (RING_FRAMES * NEGRONI_AUDIO_FRAME)
+#define WRITER_NS               5000000ull      /* the writer drains the ring every 5 ms */
+_Static_assert((RING_BYTES & (RING_BYTES - 1)) == 0, "the ring size must be a power of two");
+static uint8_t ring[RING_BYTES];
+static UInt64 ring_head, ring_tail;     /* atomics */
+static UInt64 frames_in, frames_dropped, bytes_out;     /* atomics: since the Speaker started */
+static pthread_t writer;
+static bool writer_on;                  /* under lock: a writer thread exists */
+static int writer_stop;                 /* atomic: 1 = the writer must end */
 static Float64 ticks_per_frame;
 static UInt64 ns_numer = 1, ns_denom = 1;
-static UInt64 written, refused;         /* frames since the Speaker started */
 static Boolean inactive[OBJECT_LAST + 1];
 static Float32 volume = 1.0f;
 
@@ -161,9 +190,9 @@ volume_to_kernel(void)
 }
 
 /*
- * Open /dev/negroni-audio if it is not open. The node exists only with the kernel boot-arg
- * negroniaudio=1; without it the samples are dropped (stage 0). With the lock held; not
- * called from the I/O thread (StartIO only), so open() may take its time.
+ * Open /dev/negroni-audio if it is not open. The node exists only with the kernel audio stage;
+ * without it the samples are dropped (stage 0). With the lock held; called from the writer
+ * thread only (never the I/O thread), so open() may take its time.
  */
 static void
 sink_open(void)
@@ -174,14 +203,135 @@ sink_open(void)
 		return;
 	}
 	sink_tried = now;
-	sink = open(NEGRONI_AUDIO_DEVICE, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	sink = open(sink_path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
 	if (sink >= 0) {
-		say("%s open: the Speaker output goes to the kernel", NEGRONI_AUDIO_DEVICE);
+		say("%s open: the Speaker output goes to the kernel", sink_path);
+		sink_last_errno = 0;
 		volume_to_kernel();
-	} else {
-		say("%s: %s: the Speaker output is dropped", NEGRONI_AUDIO_DEVICE, strerror(errno));
+	} else if (errno != sink_last_errno) {
+		/* log the first miss and each change only: the retry runs every 2 s (~43k lines a day) */
+		sink_last_errno = errno;
+		say("%s: %s: the Speaker output is dropped (retry every 2 s, logged again on a change)", sink_path,
+		    strerror(errno));
 	}
 }
+
+/* With the lock held. */
+static void
+sink_close(int error)
+{
+	if (sink >= 0) {
+		say("%s: write error %s: closed, opened again in 2 s", sink_path, strerror(error));
+		(void)close(sink);
+		sink = -1;
+		sink_tried = mach_absolute_time();
+	}
+}
+
+/* Drop every byte that waits in the ring (consumer side), counting the frames. */
+static void
+ring_drop_all(void)
+{
+	UInt64 head = __atomic_load_n(&ring_head, __ATOMIC_ACQUIRE), tail = ring_tail;
+
+	if (head != tail) {
+		__atomic_fetch_add(&frames_dropped, (head - tail) / NEGRONI_AUDIO_FRAME, __ATOMIC_RELAXED);
+		__atomic_store_n(&ring_tail, head - (head - tail) % NEGRONI_AUDIO_FRAME, __ATOMIC_RELEASE);
+	}
+}
+
+/* One round of the writer: write what waits in the ring (at most two pieces: the ring wraps). */
+static void
+writer_round(void)
+{
+	int fd;
+
+	pthread_mutex_lock(&lock);
+	sink_open();
+	fd = sink;
+	pthread_mutex_unlock(&lock);
+	if (fd < 0) {
+		ring_drop_all();
+		return;
+	}
+	for (int piece = 0; piece < 2; piece++) {
+		UInt64 head = __atomic_load_n(&ring_head, __ATOMIC_ACQUIRE), tail = ring_tail;
+		UInt32 at = (UInt32)(tail % RING_BYTES), n = (UInt32)(head - tail);
+		ssize_t took;
+
+		if (n == 0) {
+			return;
+		}
+		if (n > RING_BYTES - at) {
+			n = RING_BYTES - at;
+		}
+		took = write(fd, ring + at, n);
+		if (took < 0) {
+			int error = errno;
+			if (error == EAGAIN || error == EINTR) {
+				return;         /* the kernel ring is full: the bytes stay here for the next round */
+			}
+			ring_drop_all();
+			if (error != ENODEV) {  /* ENODEV: the node is there, no sink runs */
+				pthread_mutex_lock(&lock);
+				if (sink == fd) {
+					sink_close(error);
+				}
+				pthread_mutex_unlock(&lock);
+			}
+			return;
+		}
+		__atomic_fetch_add(&bytes_out, (UInt64)took, __ATOMIC_RELAXED);
+		__atomic_store_n(&ring_tail, tail + (UInt64)took, __ATOMIC_RELEASE);
+		if ((UInt32)took < n) {
+			return;                 /* a partial write: the rest goes in the next round */
+		}
+	}
+}
+
+static void *
+writer_main(__unused void *arg)
+{
+	struct timespec pause = { 0, (long)WRITER_NS };
+
+	(void)pthread_setname_np("NegroniAudio writer");
+	while (!__atomic_load_n(&writer_stop, __ATOMIC_ACQUIRE)) {
+		writer_round();
+		(void)nanosleep(&pause, NULL);
+	}
+	writer_round();                 /* what the last cycles put in */
+	return NULL;
+}
+
+/* The I/O thread (the only producer): no lock, no system call. */
+static void
+ring_put(const void *frames, UInt32 count)
+{
+	UInt64 head = ring_head, tail = __atomic_load_n(&ring_tail, __ATOMIC_ACQUIRE);
+	UInt32 room = (UInt32)((RING_BYTES - (head - tail)) / NEGRONI_AUDIO_FRAME), n = count < room ? count : room;
+	UInt32 bytes = n * NEGRONI_AUDIO_FRAME, at = (UInt32)(head % RING_BYTES), first = bytes < RING_BYTES - at ? bytes : RING_BYTES - at;
+
+	__atomic_fetch_add(&frames_in, count, __ATOMIC_RELAXED);
+	if (n < count) {
+		__atomic_fetch_add(&frames_dropped, count - n, __ATOMIC_RELAXED);
+	}
+	memcpy(ring + at, frames, first);
+	memcpy(ring, (const uint8_t *)frames + first, bytes - first);
+	__atomic_store_n(&ring_head, head + bytes, __ATOMIC_RELEASE);
+}
+
+#ifdef NEGRONI_AUDIO_HOST_TEST
+/* test-host.c only (not in the iOS build): the ring counters. */
+__attribute__((visibility("default"))) void NegroniAudio_TestStats(UInt64 out[4]);
+void
+NegroniAudio_TestStats(UInt64 out[4])
+{
+	out[0] = __atomic_load_n(&frames_in, __ATOMIC_ACQUIRE);
+	out[1] = __atomic_load_n(&frames_dropped, __ATOMIC_ACQUIRE);
+	out[2] = __atomic_load_n(&bytes_out, __ATOMIC_ACQUIRE);
+	out[3] = __atomic_load_n(&ring_head, __ATOMIC_ACQUIRE) - __atomic_load_n(&ring_tail, __ATOMIC_ACQUIRE);
+}
+#endif
 
 static struct device *
 device_of(AudioObjectID object)
@@ -246,9 +396,12 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 	ns_numer = timebase.numer;
 	ns_denom = timebase.denom ? timebase.denom : 1;
 	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / NEGRONI_AUDIO_RATE;
-	pthread_mutex_lock(&lock);
-	sink_open();
-	pthread_mutex_unlock(&lock);
+#ifdef NEGRONI_AUDIO_HOST_TEST
+	if (getenv("NEGRONI_AUDIO_TEST_PATH") != NULL) {
+		sink_path = getenv("NEGRONI_AUDIO_TEST_PATH");
+		sink_tried = 0;         /* a new path: no 2 s wait */
+	}
+#endif
 	say("initialized: Speaker, Hawking, Actuator, Codec (timebase %u/%u)", timebase.numer, timebase.denom);
 	return 0;
 }
@@ -731,16 +884,23 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 	if (d == NULL || object != d->object) {
 		return kAudioHardwareBadObjectError;
 	}
+	pthread_mutex_lock(&io_lock);
 	pthread_mutex_lock(&lock);
 	if (d->running++ == 0) {
 		__atomic_store_n(&d->anchor, mach_absolute_time(), __ATOMIC_RELEASE);
-		if (d->object == OBJECT_SPEAKER) {
-			written = refused = 0;
-			sink_open();
-			say("Speaker starts (%s)", sink >= 0 ? "to the kernel" : "dropped");
+		if (d->object == OBJECT_SPEAKER && !writer_on) {
+			/* no writer runs: nobody else touches the ring or the counters now */
+			ring_head = ring_tail = 0;
+			__atomic_store_n(&frames_in, 0, __ATOMIC_RELAXED);
+			__atomic_store_n(&frames_dropped, 0, __ATOMIC_RELAXED);
+			__atomic_store_n(&bytes_out, 0, __ATOMIC_RELAXED);
+			__atomic_store_n(&writer_stop, 0, __ATOMIC_RELEASE);
+			writer_on = pthread_create(&writer, NULL, writer_main, NULL) == 0;
+			say("Speaker starts (writer thread %s)", writer_on ? "runs" : "failed: the output is dropped");
 		}
 	}
 	pthread_mutex_unlock(&lock);
+	pthread_mutex_unlock(&io_lock);
 	return 0;
 }
 
@@ -752,12 +912,27 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 	if (d == NULL || object != d->object) {
 		return kAudioHardwareBadObjectError;
 	}
+	bool join = false;
+	pthread_t thread;
+
+	pthread_mutex_lock(&io_lock);
 	pthread_mutex_lock(&lock);
-	if (d->running != 0 && --d->running == 0 && d->object == OBJECT_SPEAKER) {
-		say("Speaker stops after %llu.%02llu s (%llu frames not taken)", written / NEGRONI_AUDIO_RATE,
-		    written % NEGRONI_AUDIO_RATE * 100 / NEGRONI_AUDIO_RATE, refused);
+	if (d->running != 0 && --d->running == 0 && d->object == OBJECT_SPEAKER && writer_on) {
+		__atomic_store_n(&writer_stop, 1, __ATOMIC_RELEASE);
+		thread = writer;
+		writer_on = false;
+		join = true;
 	}
 	pthread_mutex_unlock(&lock);
+	if (join) {
+		/* outside the lock: the writer takes it to open the node */
+		(void)pthread_join(thread, NULL);
+		UInt64 in = __atomic_load_n(&frames_in, __ATOMIC_ACQUIRE);
+		say("Speaker stops: %llu.%02llu s of frames in, %llu frames to the kernel, %llu dropped", in / NEGRONI_AUDIO_RATE,
+		    in % NEGRONI_AUDIO_RATE * 100 / NEGRONI_AUDIO_RATE, __atomic_load_n(&bytes_out, __ATOMIC_ACQUIRE) / NEGRONI_AUDIO_FRAME,
+		    __atomic_load_n(&frames_dropped, __ATOMIC_ACQUIRE));
+	}
+	pthread_mutex_unlock(&io_lock);
 	return 0;
 }
 
@@ -808,7 +983,7 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
 	return 0;
 }
 
-/* The HAL I/O thread: no locks, no waits. */
+/* The HAL I/O thread: no locks, no waits, no system calls. */
 static OSStatus
 do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
     __unused UInt32 client, UInt32 operation, UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
@@ -823,12 +998,7 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		/* every input is silent: Speaker sense, Hawking, Codec (no microphone driver) */
 		memset(buffer, 0, (size_t)frames * 2 * (stream == d->input ? d->input_channels : 1));
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_SPEAKER_OUTPUT) {
-		int fd = sink;
-		ssize_t n = fd >= 0 ? write(fd, buffer, (size_t)frames * NEGRONI_AUDIO_FRAME) : -1;
-		UInt32 took = n > 0 ? (UInt32)n / NEGRONI_AUDIO_FRAME : 0;
-
-		refused += frames - (took < frames ? took : frames);
-		written += frames;
+		ring_put(buffer, frames);       /* the writer thread gives it to the kernel */
 	}
 	/* the Actuator output (haptics) is dropped: no motor driver yet */
 	return 0;
