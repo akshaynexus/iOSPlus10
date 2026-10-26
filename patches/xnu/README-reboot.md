@@ -570,3 +570,37 @@ power off is a reset as before), `NEGRONI PON LOG: ... read failed` / `not decod
 - The patch applies to the fully patched tree (`git apply --check`, 2026-10-26).
 - Full local build 2026-10-26: `out/kernel/local-20261025-215453` (sha256 8b0c01a3...), 0214 applied; image
   `out/ios16-0214` (config boot-args). Only `-Wdeclaration-after-statement` warnings, as the 0211 code.
+
+## 0258: the power key, the lock and "slide to power off" (2026-10-26)
+
+0258 (README-brightness.md) removes the kernel power-key "fast-off" of 0250/0251. The power key goes to
+iOS only, as the HID consumer key 0x30 (down and up edges, `negroni_keys.c` 20 ms poll ->
+`negroni_hid_key(0, down)` -> `NegroniHIDButtons`). No kernel code acts on the key itself any more.
+
+Code check of the long-press path [V: kernel source of the patched tree; I: the userland part]:
+
+1. SpringBoard shows "slide to power off" after a long press; the slide asks launchd to shut down,
+   launchd calls `reboot(RB_HALT)` [I: userland not disassembled].
+2. `reboot()` (`bsd/kern/kern_xxx.c`): `suser`, `mac_system_check_reboot` (no negroni hook),
+   `reboot_kernel()` -> `howto & RB_HALT` -> `host_reboot(HOST_REBOOT_HALT)` (`kern_shutdown.c`).
+3. `osfmk/kern/machine.c`: `halt_all_cpus(!(options & HOST_REBOOT_HALT))` = `halt_all_cpus(FALSE)` ->
+   `CPU halted`, `PEHaltRestart(kPEHaltCPU)`.
+4. `PEHaltRestartInternal`: shutdown notifications with the 30 s `halt_restart_timeout` timer, then
+   `PE_halt_restart` = `negroni_halt_restart` (0211): `kPEHaltCPU` -> `NEGRONI: power off`, 300 ms,
+   `negroni_power_off()` (0214: PS_HOLD type SHUTDOWN, PSCI SYSTEM_OFF, SYSTEM_RESET if it returns).
+   Not `negroni_restart()`: that is only `kPERestartCPU` (`reboot` without RB_HALT).
+5. A panic before this point (`kPEPanicBegin`) turns a later `kPEHaltCPU` into `negroni_panic_restart()`;
+   with `negronipanic=0` (default) the panic screen stays. 0258 wakes a sleeping panel for it.
+
+Interference check [V code]:
+
+- `wdt=-1` (config boot-args): the kernel's watchdog stays off; it is not in this path.
+- `watchdogd`: the slop `IOWatchdog` service (slop 0040/0045) accepts every call and has no reset path;
+  launchd stops watchdogd during the shutdown [I]. Nothing in the kernel resets the phone in the shutdown path.
+- `negronipanic`: only for panics (`kPEPanicBegin` / `kPEPanicRestartCPU`), not for a normal halt.
+- No change needed: no patch 0215.
+
+Owner test: short press = lock (fade, then the panel sleeps); press again = lock screen; long press ~2 s
+= "slide to power off" -> slide -> `CPU halted`, `NEGRONI: power off`, `PS_HOLD reset type = SHUTDOWN`,
+`PSCI SYSTEM_OFF`. Unplugged, the phone must stay off (plugged in, a `USB_CHARGER` auto-boot is possible,
+see 0214).

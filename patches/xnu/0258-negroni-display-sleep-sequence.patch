@@ -1,0 +1,525 @@
+diff --git a/iokit/Kernel/arm/NegroniBacklight.cpp b/iokit/Kernel/arm/NegroniBacklight.cpp
+index 3b06bea..88b56b7 100644
+--- a/iokit/Kernel/arm/NegroniBacklight.cpp
++++ b/iokit/Kernel/arm/NegroniBacklight.cpp
+@@ -32,20 +32,34 @@
+  * service's own work loop (fades in 16 ms steps), so backboardd never waits
+  * for the DSI.
+  *
+- * Display sleep (AppleCLCD RequestPowerChange, NegroniFramebuffer.cpp):
+- * off sets DBV 0 at once (the framebuffer then clears the pixels in one
+- * pass), on restores the last lit level. negronibl_sleep=1 also sends DCS
+- * 0x28/0x29 (display off/on), =2 also 0x10/0x11 (sleep in/out, 120 ms).
+- * negronibl_fastoff=N: a short power-key press while the display is on
+- * darkens the panel at once (DBV 0) instead of waiting for iOS (seconds with
+- * CPU rendering); it is undone after N seconds if iOS does not turn the
+- * display off, or by the next power-key press.
++ * Display sleep (0258; AppleCLCD RequestPowerChange, NegroniFramebuffer.cpp):
++ * backboardd's RequestPowerChange(0) is the only path that darkens the
++ * panel (the power key only reaches iOS as a HID key; the 0251 kernel
++ * fast-off on a short press is gone). The framebuffer runs its fade to
++ * black first (7 vsync ticks), then calls negroni_backlight_display_off():
++ * DBV 0, and with negronifb_sleep >= 1 the panel's own off-command
++ * (live.dts qcom,mdss-dsi-off-command of the AMB670YF08 panel: DCS 0x28
++ * set_display_off, wait 0x15 = 21 ms, 0x10 enter_sleep_mode, wait 0x65 =
++ * 101 ms, LP mode). In sleep the panel sends no TE, so the MDP
++ * auto-refresh (TE-triggered) stops by itself; the DCS path waits for
++ * MDP-not-busy, so the commands go between two frames.
++ * RequestPowerChange(1) calls negroni_backlight_display_on(): 0x11
++ * exit_sleep_mode, 133 ms (the on-command waits 12 ms after 0x11 and
++ * 121 ms later before 0x29), 0x29 set_display_on, then the last lit DBV
++ * (the panel keeps its registers in sleep: no reset, no on-command). The
++ * framebuffer redraws at its next tick; the MDP scans it on the first TE.
++ * negronifb_sleep=0: DBV 0 + black pixels only (the panel stays scanning).
++ * =2: also the panel rails: vddio (pm8350c_l12, 1.8 V) and vci
++ * (pm8350c_l13, 3.0 V) are RPMh LDOs. negroni_rpmh.c only votes rails on,
++ * and after a rail cycle the panel needs the reset sequence and the whole
++ * on-command (incl. the DSC PPS), which this kernel does not have; so 2 = 1
++ * (logged at start).
+  *
+  * Boot-args: negronibl=0 (off: no service, no DSI access), negronibl_max=DBV
+  * (default 2047, at most 4095), negronibl_curve=1 (square curve),
+- * negronibl_hs=1 (high-speed instead of low-power DCS), negronibl_sleep=0/1/2,
+- * negronibl_fastoff=seconds (default 20, 0 = off), negronibl_nits=N (nits at
+- * full DBV for brightness-nits, default 500).
++ * negronibl_hs=1 (high-speed instead of low-power DCS), negronifb_sleep=0/1/2
++ * (default 1; the old name negronibl_sleep is accepted too),
++ * negronibl_nits=N (nits at full DBV for brightness-nits, default 500).
+  * See patches/xnu/README-brightness.md in the iOSPlus10 repo.
+  */
+ #include <pexpert/arm64/board_config.h>
+@@ -93,6 +107,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ static volatile uint32_t *negroni_dsi;
+ static IOLock *negroni_dsi_lock;        /* every DSI command, see negroni_dsi_dcs_write */
+ static bool negroni_dsi_dead;
++static bool negroni_dsi_panic;         /* 0258: panic path, other CPUs stopped: no lock */
+ static uint32_t negroni_dsi_failures, negroni_dsi_mdp_waits;
+ 
+ static inline uint32_t
+@@ -167,9 +182,14 @@ negroni_dsi_dcs_write(const uint8_t *buf, uint32_t len, bool lp)
+ 		words[n++] = 0;         /* the FIFO takes an even number of words */
+ 	}
+ 
+-	IOLockLock(negroni_dsi_lock);
++	bool locked = !negroni_dsi_panic;       /* panic: no lock (a stopped holder must not hang it) */
++	if (locked) {
++		IOLockLock(negroni_dsi_lock);
++	}
+ 	if (negroni_dsi_dead) {
+-		IOLockUnlock(negroni_dsi_lock);
++		if (locked) {
++			IOLockUnlock(negroni_dsi_lock);
++		}
+ 		return -1;
+ 	}
+ 	int rc = 0;
+@@ -242,7 +262,9 @@ out:
+ 	} else {
+ 		negroni_dsi_failures = 0;
+ 	}
+-	IOLockUnlock(negroni_dsi_lock);
++	if (locked) {
++		IOLockUnlock(negroni_dsi_lock);
++	}
+ 	return rc;
+ }
+ 
+@@ -254,7 +276,10 @@ out:
+ #define NEGRONI_BL_HW_MAX               0xfff   /* qcom,mdss-dsi-bl-max-level (HBM above 0x7ff) */
+ #define NEGRONI_BL_STEP_MS              16
+ #define NEGRONI_BL_FADE_MAX_MS          5000
+-#define NEGRONI_BL_SHORT_PRESS_MS       700
++#define NEGRONI_BL_SLEEP_DEFAULT        1       /* negronifb_sleep */
++#define NEGRONI_BL_OFF_WAIT_MS          21      /* after 0x28 (off-command 0x15) */
++#define NEGRONI_BL_SLEEP_IN_WAIT_MS     101     /* after 0x10 (off-command 0x65) */
++#define NEGRONI_BL_SLEEP_OUT_WAIT_MS    133     /* 0x11 to 0x29 (on-command 0x0c + 0x79) */
+ 
+ class AppleARMBacklight : public IOService {
+ 	OSDeclareDefaultStructors(AppleARMBacklight);
+@@ -270,8 +295,8 @@ class AppleARMBacklight : public IOService {
+ 	uint32_t            fLastLit;       /* last non-zero target while the display was on */
+ 	bool                fDisplayOn;
+ 	bool                fPowerEdge;     /* fDisplayOn changed, panel not updated yet */
+-	bool                fDark;          /* fast-off: dark until fDarkUntil */
+-	uint64_t            fDarkUntil, fKeyDownAt;
++	uint32_t            fOffFadeMs;     /* the framebuffer's fade length (log) */
++	uint64_t            fOnAt;          /* RequestPowerChange(1) time (log) */
+ 	uint32_t            fSetCount;
+ 
+ 	/* Work loop only */
+@@ -288,13 +313,14 @@ class AppleARMBacklight : public IOService {
+ 	void kick(void);
+ 
+ public:
+-	uint32_t            fMax, fNits, fSleepMode, fFastOffS;
++	uint32_t            fMax, fNits, fSleepMode;
+ 	bool                fCurve, fLP;
+ 
+ 	bool startBacklight(void);
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+-	bool displayPower(bool on);
+-	void powerKey(bool down);
++	bool displayOff(uint32_t fadeMs);
++	bool displayOn(void);
++	void panicWake(void);
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+@@ -334,8 +360,11 @@ AppleARMBacklight::startBacklight(void)
+ 	setProperty("backlight-control", true);
+ 	publish(fTarget);
+ 	registerService();
+-	IOLog("NEGRONI BL: AppleARMBacklight up, DBV 0..%u, %s DCS, curve %s, sleep mode %u, fast-off %u s\n",
+-	    fMax, fLP ? "low-power" : "high-speed", fCurve ? "square" : "linear", fSleepMode, fFastOffS);
++	IOLog("NEGRONI BL: AppleARMBacklight up, DBV 0..%u, %s DCS, curve %s, sleep mode %u (%s)\n",
++	    fMax, fLP ? "low-power" : "high-speed", fCurve ? "square" : "linear", fSleepMode,
++	    fSleepMode == 0 ? "DBV 0 only" :
++	    fSleepMode == 1 ? "DCS 0x28/0x10 off, 0x11/0x29 on" :
++	    "DCS sleep; panel rails pm8350c_l12/l13 stay on (no panel re-init after a rail cycle): same as 1");
+ 	return true;
+ }
+ 
+@@ -377,48 +406,48 @@ AppleARMBacklight::step(void)
+ 	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
+ 	bool on = fDisplayOn, edge = fPowerEdge;
+ 	fPowerEdge = false;
+-	bool expired = fDark && now >= fDarkUntil;
+-	if (expired) {
+-		fDark = false;
+-	}
+-	bool dark = fDark;
+-	uint64_t darkUntil = fDarkUntil;
++	uint32_t fadeMs = fOffFadeMs;
++	uint64_t onAt = fOnAt;
+ 	uint32_t to = fTarget, from = fFadeFrom, lit = fLastLit;
+ 	uint64_t t = now - fFadeStart, period = fFadePeriod;
+ 	IOSimpleLockUnlockEnableInterrupt(fState, is);
+ 
+-	if (expired) {
+-		IOLog("NEGRONI BL: fast-off: iOS did not turn the display off in %u s; panel restored\n", fFastOffS);
+-	}
+ 	if (edge && !on) {
++		/* The framebuffer's fade is done: DBV 0, then the panel's off-command. */
+ 		apply(0, true);
+-		if (fSleepMode >= 1 && fPanelOn) {
+-			uint8_t c = 0x28;               /* set_display_off */
+-			negroni_dsi_dcs_write(&c, 1, fLP);
+-			if (fSleepMode >= 2) {
+-				IOSleep(20);
+-				c = 0x10;               /* enter_sleep_mode (panel off-command: 101 ms after) */
+-				negroni_dsi_dcs_write(&c, 1, fLP);
+-				IOSleep(120);
+-			}
+-			fPanelOn = false;
++		const char *dcs = "skipped";
++		if (fSleepMode >= 1 && fPanelOn && negroni_dsi != NULL && !negroni_dsi_dead) {
++			uint8_t c = 0x28;               /* set_display_off (mdss-dsi-off-command: wait 0x15 = 21 ms) */
++			int rc = negroni_dsi_dcs_write(&c, 1, fLP);
++			IOSleep(NEGRONI_BL_OFF_WAIT_MS);
++			c = 0x10;                       /* enter_sleep_mode (wait 0x65 = 101 ms; the panel stops TE) */
++			int rc2 = negroni_dsi_dcs_write(&c, 1, fLP);
++			IOSleep(NEGRONI_BL_SLEEP_IN_WAIT_MS);
++			fPanelOn = false;               /* wake always sends 0x11 + 0x29 (harmless if awake) */
++			dcs = rc == 0 && rc2 == 0 ? "ok" : "failed";
+ 		}
+-		IOLog("NEGRONI BL: display off: panel DBV 0%s\n",
+-		    fSleepMode >= 2 ? ", display off + sleep in" : fSleepMode ? ", display off" : "");
++		IOLog("NEGRONI FB: display off (fade %u ms, DCS sleep %s)\n", fadeMs, dcs);
+ 	}
+ 	if (!on) {
+ 		return;
+ 	}
+-	if (edge && !fPanelOn) {
+-		uint8_t c;
+-		if (fSleepMode >= 2) {
+-			c = 0x11;                       /* exit_sleep_mode */
+-			negroni_dsi_dcs_write(&c, 1, fLP);
+-			IOSleep(120);
++	const char *wake = NULL;
++	if (edge) {
++		wake = "skipped";
++		if (!fPanelOn) {
++			uint8_t c = 0x11;               /* exit_sleep_mode (mdss-dsi-on-command: 12 + 121 ms to 0x29) */
++			int rc = negroni_dsi_dcs_write(&c, 1, fLP);
++			if (rc != 0 || negroni_dsi_dead) {
++				/* no sleep-out: the wait and 0x29 are useless, restore DBV now; the next wake retries */
++				wake = "failed";
++			} else {
++				IOSleep(NEGRONI_BL_SLEEP_OUT_WAIT_MS);
++				c = 0x29;               /* set_display_on */
++				int rc2 = negroni_dsi_dcs_write(&c, 1, fLP);
++				fPanelOn = true;
++				wake = rc2 == 0 ? "ok" : "failed";
++			}
+ 		}
+-		c = 0x29;                               /* set_display_on */
+-		negroni_dsi_dcs_write(&c, 1, fLP);
+-		fPanelOn = true;
+ 	}
+ 	uint32_t level = to;
+ 	bool more = false;
+@@ -430,23 +459,22 @@ AppleARMBacklight::step(void)
+ 		/* Wake: the level from before the display went off, until iOS sets a new one. */
+ 		level = to != 0 ? to : lit;
+ 		more = false;
+-		IOLog("NEGRONI BL: display on: panel DBV %u\n", level);
+ 	}
+-	if (dark) {
+-		level = 0;
+-	} else if (level != 0 && fCurve) {
++	if (level != 0 && fCurve) {
+ 		level = (uint32_t)((uint64_t)level * level / fMax);
+ 		if (level == 0) {
+ 			level = 1;
+ 		}
+ 	}
+ 	apply(level, !more);
++	if (wake != NULL) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - onAt, &ns);
++		IOLog("NEGRONI FB: display on (sleep-out %u ms, DCS %s, panel DBV %u)\n",
++		    (uint32_t)(ns / NSEC_PER_MSEC), wake, level);
++	}
+ 	if (more) {
+ 		fTimer->setTimeoutMS(NEGRONI_BL_STEP_MS);
+-	} else if (dark) {
+-		uint64_t ns;
+-		absolutetime_to_nanoseconds(darkUntil > now ? darkUntil - now : 0, &ns);
+-		fTimer->setTimeoutUS((uint32_t)(ns / NSEC_PER_USEC) + 1);
+ 	}
+ }
+ 
+@@ -516,57 +544,68 @@ AppleARMBacklight::setProperties(OSObject *properties)
+ 	return kIOReturnSuccess;
+ }
+ 
++/* NegroniFramebuffer.cpp, vsync tick, after the fade: does not block. */
+ bool
+-AppleARMBacklight::displayPower(bool on)
++AppleARMBacklight::displayOff(uint32_t fadeMs)
+ {
+ 	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
+-	bool changed = fDisplayOn != on || fDark;
+-	if (fDisplayOn != on) {
+-		fDisplayOn = on;
+-		fPowerEdge = true;
++	bool changed = fDisplayOn;
++	fDisplayOn = false;
++	fPowerEdge = changed;
++	fOffFadeMs = fadeMs;
++	IOSimpleLockUnlockEnableInterrupt(fState, is);
++	if (changed) {
++		kick();
+ 	}
+-	fDark = false;
++	return negroni_dsi != NULL && !negroni_dsi_dead;
++}
++
++/* NegroniFramebuffer.cpp RequestPowerChange(1): does not block. */
++bool
++AppleARMBacklight::displayOn(void)
++{
++	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
++	bool changed = !fDisplayOn;
++	fDisplayOn = true;
++	fPowerEdge = changed;
++	fOnAt = mach_absolute_time();
+ 	IOSimpleLockUnlockEnableInterrupt(fState, is);
+ 	if (changed) {
+-		kick();         /* nothing is written before iOS asks for a change */
++		kick();
+ 	}
+ 	return negroni_dsi != NULL && !negroni_dsi_dead;
+ }
+ 
++/*
++ * 0258: panic (negroni_fb_panic, kPEPanicBegin): the panic text must be
++ * visible on a sleeping panel. Busy waits only; DCS without the lock.
++ */
+ void
+-AppleARMBacklight::powerKey(bool down)
++AppleARMBacklight::panicWake(void)
+ {
+-	if (fFastOffS == 0 || negroni_dsi == NULL || negroni_dsi_dead) {
++	if (negroni_dsi == NULL || negroni_dsi_dead) {
+ 		return;
+ 	}
+-	uint64_t now = mach_absolute_time(), lim;
+-	nanoseconds_to_absolutetime((uint64_t)NEGRONI_BL_SHORT_PRESS_MS * NSEC_PER_MSEC, &lim);
+-	bool changed = false, darkNow = false;
+-
+-	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
+-	if (!fDisplayOn) {
+-		fKeyDownAt = 0;                         /* a wake press: iOS turns the display on */
+-	} else if (down) {
+-		if (fDark) {
+-			fDark = false;                  /* pressed again while dark: light up */
+-			changed = true;
++	negroni_dsi_panic = true;
++	if (!fPanelOn) {
++		uint8_t c = 0x11;
++		if (negroni_dsi_dcs_write(&c, 1, fLP) == -2) {
++			/* DMA busy: the panic came during a work-loop DCS write; let it end, then once more */
++			for (uint32_t i = 0; i < 30 && (ndsi_rd(NDSI_STATUS) & NDSI_STATUS_DMA_BUSY); i++) {
++				IODelay(1000);
++			}
++			(void)negroni_dsi_dcs_write(&c, 1, fLP);
+ 		}
+-		fKeyDownAt = changed ? 0 : now;
+-	} else if (fKeyDownAt != 0 && now - fKeyDownAt < lim) {
+-		uint64_t wait;
+-		nanoseconds_to_absolutetime((uint64_t)fFastOffS * NSEC_PER_SEC, &wait);
+-		fDark = true;
+-		fDarkUntil = now + wait;
+-		fKeyDownAt = 0;
+-		changed = darkNow = true;
+-	} else {
+-		fKeyDownAt = 0;
+-	}
+-	IOSimpleLockUnlockEnableInterrupt(fState, is);
+-	if (changed) {
+-		IOLog("NEGRONI BL: fast-off: power key, panel %s\n", darkNow ? "dark until iOS turns the display off" : "restored");
+-		kick();
++		for (uint32_t i = 0; i < NEGRONI_BL_SLEEP_OUT_WAIT_MS; i++) {
++			IODelay(1000);
++		}
++		c = 0x29;
++		(void)negroni_dsi_dcs_write(&c, 1, fLP);
++		fPanelOn = true;
+ 	}
++	uint32_t level = fLastLit != 0 ? fLastLit : fMax * 45 / 100;
++	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };
++	(void)negroni_dsi_dcs_write(cmd, 3, fLP);
+ }
+ 
+ /* ---------------------------------------------------------------------- */
+@@ -593,18 +632,17 @@ negroni_backlight_attach(IOService *provider)
+ 		OSSafeReleaseNULL(bl);
+ 		return;
+ 	}
+-	uint32_t max = NEGRONI_BL_DEFAULT_MAX, nits = 500, sleep = 0, fastoff = 20;
++	uint32_t max = NEGRONI_BL_DEFAULT_MAX, nits = 500, sleep = NEGRONI_BL_SLEEP_DEFAULT;
+ 	int curve = 0, hs = 0;
+ 	PE_parse_boot_argn("negronibl_max", &max, sizeof(max));
+ 	PE_parse_boot_argn("negronibl_nits", &nits, sizeof(nits));
+-	PE_parse_boot_argn("negronibl_sleep", &sleep, sizeof(sleep));
+-	PE_parse_boot_argn("negronibl_fastoff", &fastoff, sizeof(fastoff));
++	PE_parse_boot_argn("negronibl_sleep", &sleep, sizeof(sleep));       /* old name (0250) */
++	PE_parse_boot_argn("negronifb_sleep", &sleep, sizeof(sleep));       /* 0258 */
+ 	PE_parse_boot_argn("negronibl_curve", &curve, sizeof(curve));
+ 	PE_parse_boot_argn("negronibl_hs", &hs, sizeof(hs));
+ 	bl->fMax = max < 16 ? 16 : MIN(max, (uint32_t)NEGRONI_BL_HW_MAX);
+ 	bl->fNits = nits == 0 ? 500 : nits;
+ 	bl->fSleepMode = MIN(sleep, 2u);
+-	bl->fFastOffS = MIN(fastoff, 600u);
+ 	bl->fCurve = curve != 0;
+ 	bl->fLP = hs == 0;      /* qcom,bl-dsc-cmd-state = "dsi_lp_mode" */
+ 	if (!bl->attach(provider)) {
+@@ -622,22 +660,37 @@ negroni_backlight_attach(IOService *provider)
+ }
+ 
+ /*
+- * NegroniFramebuffer.cpp RequestPowerChange: does not block. True when the
+- * panel is darkened through DCS right away (the framebuffer can then skip
+- * its pixel fade).
++ * NegroniFramebuffer.cpp (0258). Off: called from the vsync tick when the
++ * fade to black is done; on: from RequestPowerChange(1). Neither blocks
++ * (the framebuffer calls them under its fLock). False = no backlight
++ * service (negronibl=0 or no DSI0): the caller logs instead.
+  */
+ extern "C" bool
+-negroni_backlight_display_power(bool on)
++negroni_backlight_display_off(uint32_t fade_ms)
++{
++	if (negroni_bl == NULL) {
++		return false;
++	}
++	(void)negroni_bl->displayOff(fade_ms);  /* the work loop logs the result */
++	return true;
++}
++
++extern "C" bool
++negroni_backlight_display_on(void)
+ {
+-	return negroni_bl != NULL && negroni_bl->displayPower(on);
++	if (negroni_bl == NULL) {
++		return false;
++	}
++	(void)negroni_bl->displayOn();
++	return true;
+ }
+ 
+-/* bsd/dev/negroni_keys.c: key 0 = power. Does not block. */
++/* NegroniFramebuffer.cpp negroni_fb_panic (0258): wake the panel for the panic text. */
+ extern "C" void
+-negroni_backlight_key(int key, int down)
++negroni_backlight_panic(void)
+ {
+-	if (key == 0 && negroni_bl != NULL) {
+-		negroni_bl->powerKey(down != 0);
++	if (negroni_bl != NULL) {
++		negroni_bl->panicWake();
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index dd0a321..b6d0cf7 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -128,7 +128,9 @@ extern "C" uint32_t negroni_gpu_badge_color;
+ extern "C" char negroni_wifi_badge[24];   /* bsd/dev/negroni_wifi.c */
+ extern "C" uint32_t negroni_wifi_badge_color;
+ extern "C" unsigned char iso_font[256 * 16];
+-extern "C" bool negroni_backlight_display_power(bool on);      /* NegroniBacklight.cpp */
++extern "C" bool negroni_backlight_display_off(uint32_t fade_ms);  /* NegroniBacklight.cpp (0258) */
++extern "C" bool negroni_backlight_display_on(void);
++extern "C" void negroni_backlight_panic(void);
+ 
+ #if defined(NEGRONI)
+ #include <IOKit/IOService.h>
+@@ -170,6 +172,7 @@ enum {
+ #define NEGRONI_FB_NOTIFY_TYPES           8
+ #define NEGRONI_FB_NOTIFY_VSYNC           5
+ #define NEGRONI_FB_VSYNC_US               8333    /* 120 Hz, the panel's native rate */
++#define NEGRONI_FB_OFF_TICKS              12      /* 0258: vsync periods per tick while the display is off (100 ms) */
+ #define NEGRONI_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -281,6 +284,7 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	uint64_t      fOffAt;         /* RequestPowerChange(0) time (0258: fade length in the log) */
+ 	/* GPU present (0231) */
+ 	NegroniSurface *fPendHold[NEGRONI_FB_LAYERS];   /* held surfaces of fPending */
+ 	bool          fPendGPU;       /* fPending is all GPU-rendered layers */
+@@ -531,6 +535,28 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
++		if (step == 6) {
++			/*
++			 * 0258: the panel is black; now DBV 0 and the DCS sleep (backlight work
++			 * loop). Under fLock: a RequestPowerChange(1) after the unlock above must
++			 * not be followed by a late "off" (it calls display_on under fLock too).
++			 */
++			uint64_t ns;
++			absolutetime_to_nanoseconds(mach_absolute_time() - fb->fOffAt, &ns);
++			uint32_t ms = (uint32_t)(ns / NSEC_PER_MSEC);
++			bool none = false;
++			IOLockLock(fb->fLock);
++			if (fb->fPowerOff) {
++				none = !negroni_backlight_display_off(ms);
++			}
++			IOLockUnlock(fb->fLock);
++			if (none) {
++				IOLog("NEGRONI FB: display off (fade %u ms, DCS sleep skipped: no backlight service)\n", ms);
++			}
++		} else if (step > 6) {
++			/* 0258: dark and idle: a slow tick (NEGRONI_FB_OFF_TICKS periods, 100 ms) until the wake */
++			fb->fDeadline += (NEGRONI_FB_OFF_TICKS - 1) * fb->fTickAbs;
++		}
+ 		fb->rearm(sender);
+ 		return;
+ 	}
+@@ -1633,6 +1659,7 @@ negroni_fb_panic(void)
+ 	if (fb != NULL && fb->fZCReady) {
+ 		fb->zeroCopyRestore();
+ 	}
++	negroni_backlight_panic();      /* 0258: a sleeping or dark panel shows the panic text */
+ }
+ 
+ bool
+@@ -1769,16 +1796,28 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	case kNegroniFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+-			/* Panel dark through DCS at once: one clear pass instead of the fade. */
+-			bool dark = negroni_backlight_display_power(!off) && off;
++			/*
++			 * 0258: backboardd's request is the only path to the panel. Off:
++			 * the vsync fade (7 ticks) runs first, then the backlight sets
++			 * DBV 0 and puts the panel to sleep (negronifb_sleep). On: the
++			 * backlight wakes the panel at once and the next tick redraws.
++			 */
++			bool none = false;
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+-				fFB->fFadeStep = dark ? 6 : 0;
++				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
++				if (off) {
++					fFB->fOffAt = mach_absolute_time();
++				} else {
++					none = !negroni_backlight_display_on();   /* does not block */
++				}
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+-			IOLog("NEGRONI FB: display %s\n", off ? "off" : "on");
++			if (none) {
++				IOLog("NEGRONI FB: display on (sleep-out 0 ms, no backlight service)\n");
++			}
+ 		}
+ 		break;
+ 	case kNegroniFBSwapWait:

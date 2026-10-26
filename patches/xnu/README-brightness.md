@@ -1,15 +1,19 @@
-# Panel brightness and display sleep (patches 0250, 0251)
+# Panel brightness and display sleep (patches 0250, 0251, 0258)
 
 Status: written and syntax-checked against `out/kernel/buildtree` (clang `-fsyntax-only`, 0 errors,
 no new warnings). **Not built and not tested on the phone yet.**
 Both patches apply on `base` together with all other `patches/xnu/0*.patch` (checked 2026-10-24).
+0258 (2026-10-26, with the review fixes): full local build OK (`out/kernel/local-20261026-072629`, sha256
+220a82def367af1d8b7857d5e977e865a2808a76ab6d109a49049468e175238d, 0251 and 0258 applied), image
+`out/ios16-power`. Not tested on the phone.
 
 | Patch | Content |
 |---|---|
 | `0250-negroni-panel-brightness.patch` | New `iokit/Kernel/arm/NegroniBacklight.cpp`: DSI0 DCS writes (command DMA, FIFO mode) and an `AppleARMBacklight` service for CoreBrightness. Hook in `AppleCLCD::start`. |
-| `0251-negroni-display-sleep.patch` | Display off/on (RequestPowerChange) goes to the backlight: DBV 0 at once, the framebuffer clears the pixels in one pass instead of its 7-step fade. Power-key "fast-off". |
+| `0251-negroni-display-sleep.patch` | Display off/on (RequestPowerChange) goes to the backlight (`negroni_backlight_display_power`). Since 2026-10-26 it has no `negroni_keys.c` hook any more (the power-key fast-off is gone); 0258 replaces its framebuffer hunk. |
+| `0258-negroni-display-sleep-sequence.patch` | Normal iOS display sleep: no kernel action on the power key; RequestPowerChange(0) = fade, then DBV 0 + DCS 0x28/0x10 (panel sleep); RequestPowerChange(1) = DCS 0x11, 133 ms, 0x29, last DBV, redraw. Boot-arg `negronifb_sleep`. Panic wakes the panel. |
 
-0251 needs 0250. 0250 works alone (brightness slider; display sleep stays as in base).
+0251 needs 0250, 0258 needs 0251 and 0252-0257 (framebuffer context). 0250 works alone (brightness slider; display sleep stays as in base).
 
 ## Facts and sources
 
@@ -89,29 +93,51 @@ disassembled with `otool`; not committed) [V]:
 - Logs: one line per setProperties for the first 24 calls (process, keys); panel DBV at most once per
   second during a fade, the end of a fade at most every 250 ms.
 
-Display sleep (0251):
+Display sleep (0258, replaces the 0251 behaviour on 2026-10-26):
 
-- `RequestPowerChange(0)` (backboardd, power key / auto-lock) calls
-  `negroni_backlight_display_power(false)`: it does not block, the work loop sends DBV 0 within
-  milliseconds. If the DSI is usable, the framebuffer skips its fade (6 read-modify-write passes over
-  10 MB of write-combined memory) and clears the pixels in one write pass on the next vsync tick.
-  Pending CPU frames are not waited for (the vsync tick does not present while off, as before).
-- `RequestPowerChange(1)`: restores the last level iOS set while the display was on (or the newest
-  one); the framebuffer redraws the latest frame as before.
-- Default is blank only: the panel stays powered, the link and auto-refresh keep running.
-  `negronibl_sleep=1` adds DCS 0x28 / 0x29 (display off / on, as the panel's own lp1/nolp
-  sequences do). `negronibl_sleep=2` adds 0x10 / 0x11 (sleep in / out, 120 ms waits): in sleep the
-  panel stops TE, so auto-refresh stalls until 0x11; untested, use only to measure power.
-- Fast-off (`negronibl_fastoff=N`, default 20 s): the measured lock delay is ~10 s (iOS sends
-  RequestPowerChange late because CPU rendering lags). A short press of the power key (< 700 ms)
-  while the display is on sets DBV 0 at once. iOS's display-off then takes over. If iOS does not turn
-  the display off within N seconds (the press was not a lock, e.g. a call or the power-off slider),
-  the level comes back; the next power-key press also brings it back. The key still goes to iOS
-  unchanged. `negronibl_fastoff=0` turns it off.
+- Old 0251 [V: `git show 4e274d8:patches/xnu/0251-negroni-display-sleep.patch` and 0250]: `negroni_keys.c`
+  called `negroni_backlight_key()` on every key edge. A power-key press shorter than 700 ms
+  (`NEGRONI_BL_SHORT_PRESS_MS`) with the display on set DBV 0 at once ("fast-off", `negronibl_fastoff`,
+  default 20 s, undone after 20 s or by the next press); and `RequestPowerChange(0)` skipped the fade
+  (`fFadeStep = 6`). Owner report: "the power button forces the screen black instantly instead of
+  behaving normally". Both are removed.
+- Now the power key only reaches iOS as the HID consumer key 0x30 (down and up, `negroni_hid_key`).
+  SpringBoard does what it does on an iPhone: short press = lock, then backboardd sends
+  `RequestPowerChange(0)`; a press while dark = wake, `RequestPowerChange(1)`; a long press = "slide to
+  power off" (README-reboot.md 0211/0214: `reboot(RB_HALT)` -> `kPEHaltCPU` -> `negroni_power_off()`).
+- `RequestPowerChange(0)`: the framebuffer runs its fade (7 vsync ticks: 6 halvings, then black), then
+  calls `negroni_backlight_display_off(fade ms)` under its `fLock` (only if still off). The backlight work
+  loop sets DBV 0 and, with `negronifb_sleep>=1`, sends the panel's own off-command from the live DT
+  (`qcom,mdss-dsi-off-command = [05 00 00 00 15 00 02 28 00 05 00 00 00 65 00 02 10 00]`, LP mode):
+  0x28 set_display_off, 21 ms, 0x10 enter_sleep_mode, 101 ms. In sleep the panel sends no TE, so the
+  TE-triggered MDP auto-refresh stops by itself; the DCS path waits for MDP-not-busy first, so nothing
+  has to stop the auto-refresh. After the fade the vsync timer ticks every 100 ms (12 periods) instead of
+  8.3 ms until the wake (no present while off, as before).
+  [I] So while the display is off the vsync notify to the clients runs at 10 Hz (the slow tick). If a wake
+  shows a CoreAnimation stall, the fix is to notify only on the 8.3 ms grid.
+- `RequestPowerChange(1)`: `negroni_backlight_display_on()` at once (under `fLock`); the work loop sends
+  0x11 exit_sleep_mode, waits 133 ms (the DT on-command has 12 ms after 0x11 and 121 ms later before
+  0x29), 0x29 set_display_on, then the last lit DBV. If the 0x11 write fails (or the DSI is dead), the
+  133 ms wait and 0x29 are skipped, the DBV comes back at once, the line says `DCS failed`, and the next
+  wake tries 0x11 again. The framebuffer redraws the latest frame at its next
+  tick (<= 100 ms); the MDP sends it on the first TE. No panel reset and no full on-command: the panel
+  keeps its registers (DSC PPS, 0x53, 0x35 TE) in sleep [I until tested].
+- `negronifb_sleep=0`: DBV 0 + black pixels only (panel scans, as 0251 before). `=1` (default): DCS sleep.
+  `=2`: also the panel rails if possible. The DT gives `vddio` = pm8350c_l12 (1.8 V) and `vci` =
+  pm8350c_l13 (3.0 V), RPMh LDOs (`qcom,dsi-display-primary`, supply node
+  `dsi_panel_oplus_optimization_pwr_supply`). After a rail cycle the panel needs the reset sequence and
+  the whole on-command (incl. DSC PPS), which this kernel does not have; so `2` = `1` (the start line says
+  so). The old name `negronibl_sleep` is still read (before `negronifb_sleep`).
+- Panic: `negroni_fb_panic()` (kPEPanicBegin) calls `negroni_backlight_panic()`: 0x11, 133 ms busy wait,
+  0x29 if the panel sleeps, then DBV = last lit level, without the DSI lock (other CPUs are stopped). If
+  0x11 returns -2 (DMA busy: the panic came during a work-loop DCS write), it waits up to 30 ms for the
+  DMA and sends 0x11 once more. So a
+  panic while the screen is locked is visible.
 
 Boot-args: `negronibl=0` (no service, no DSI access, base behaviour), `negronibl_max` (DBV, default
 2047, at most 4095 = HBM range, not recommended), `negronibl_curve=1`, `negronibl_hs=1` (HS instead of
-LP transmission), `negronibl_sleep=0/1/2`, `negronibl_fastoff=seconds`, `negronibl_nits` (default 500).
+LP transmission), `negronifb_sleep=0/1/2` (default 1), `negronibl_nits` (default 500).
+`negronibl_fastoff` is gone (ignored).
 
 Serialization with frame kicks: there is no kick in the kernel today (auto-refresh). If 0230/0231 add
 MDP flips (SSPP address + CTL_FLUSH), they do not touch the DSI and need no lock. If a later patch
@@ -126,11 +152,12 @@ path (`negroni_dsi_dcs_write`) or the same lock, and it should not trigger a fra
 | `iokit/Kernel/arm/NegroniBacklight.cpp` | new | 0250 |
 | `iokit/conf/files.arm64` | one line appended at the end (after `IOHIDEventServiceUserClient.cpp`) | 0250 |
 | `iokit/Kernel/arm/NegroniFramebuffer.cpp` | declaration `void negroni_backlight_attach(IOService *)` before `class IOMobileFramebuffer`; `AppleCLCD::start`: `negroni_backlight_attach(this);` after `registerService()` | 0250 |
-| `iokit/Kernel/arm/NegroniFramebuffer.cpp` | `extern "C" bool negroni_backlight_display_power(bool)` after `iso_font`; `IOMobileFramebufferUserClient::externalMethod`, case `kNegroniFBRequestPowerChange`: call it before `IOLockLock`, `fFadeStep = dark ? 6 : 0` | 0251 |
-| `bsd/dev/negroni_keys.c` | `extern void negroni_backlight_key(int, int)`; `keys_thread`: `negroni_backlight_key(k, now);` before `negroni_hid_key(k, now);` | 0251 |
+| `iokit/Kernel/arm/NegroniFramebuffer.cpp` | `extern "C" bool negroni_backlight_display_power(bool)` after `iso_font`; `IOMobileFramebufferUserClient::externalMethod`, case `kNegroniFBRequestPowerChange`: call it before `IOLockLock`, `fFadeStep = dark ? 6 : 0` | 0251 (replaced by 0258) |
+| `iokit/Kernel/arm/NegroniBacklight.cpp` | fast-off and `negroni_backlight_key` removed; `displayOff(fadeMs)` / `displayOn()` / `panicWake()`; DCS sleep sequence in `step()`; `negroni_dsi_panic` (no lock); C entries `negroni_backlight_display_off/on/panic` | 0258 |
+| `iokit/Kernel/arm/NegroniFramebuffer.cpp` | `fOffAt`; `vsyncFired` power-off branch: at fade step 6 `negroni_backlight_display_off()` under `fLock`, then a 100 ms tick (`NEGRONI_FB_OFF_TICKS`); `RequestPowerChange`: normal fade, `negroni_backlight_display_on()` under `fLock`; `negroni_fb_panic`: `negroni_backlight_panic()` | 0258 |
 
-If the GPU agent rewrites `vsyncFired`'s power-off branch: keep the meaning of `fFadeStep = 6`
-("write black once, no reads") or drop the fade when `negroni_backlight_display_power()` returned true.
+If a later patch rewrites `vsyncFired`'s power-off branch: keep the call at the end of the fade (step 6)
+and the `fPowerOff` re-check under `fLock`.
 
 ## Test
 
@@ -138,16 +165,20 @@ Build with the patches (`make` kernel CI), boot with `negroniusb=2` for the USB 
 
 1. Boot: expect
    `NEGRONI BL: DSI0 version 0x2006.... ctrl 0x....` (bits 0 and 2 set) and
-   `NEGRONI BL: AppleARMBacklight up, DBV 0..2047, low-power DCS, curve linear, sleep mode 0, fast-off 20 s`.
+   `NEGRONI BL: AppleARMBacklight up, DBV 0..2047, low-power DCS, curve linear, sleep mode 1 (DCS 0x28/0x10 off, 0x11/0x29 on)`.
    Record the printed DSI register values in `docs/notes.md` (they are the first real readout).
 2. After SpringBoard: `NEGRONI BL: backboardd sets N keys: brightness ... FadePeriod ...` (which keys
    arrive decides whether the legacy path is in use), then `NEGRONI BL: panel DBV ...`.
 3. Move the Control Center slider: the panel must follow, lines `panel DBV x (n writes since last line)`.
    No `FAILED` / `failed` lines.
-4. Power key: `fast-off: power key, panel dark ...` at once, then (seconds later) `NEGRONI FB: display
-   off` and `NEGRONI BL: display off: panel DBV 0`. Press again: `display on: panel DBV x`.
-5. Auto-lock (Settings, 30 s): `display off` without the fast-off line.
-6. Optional: `negronibl_sleep=1`, repeat 4 and 5; then `negronibl_curve=1` if the low end is too bright.
+4. Power key, short press: SpringBoard locks, the screen fades (no instant black), then
+   `NEGRONI FB: display off (fade N ms, DCS sleep ok)`. The panel must be fully dark (no grey glow).
+   Press again: `NEGRONI FB: display on (sleep-out N ms, DCS ok, panel DBV x)` and the lock screen.
+5. Auto-lock (Settings, 30 s): the same `display off` line.
+6. Long press (~2 s): "slide to power off" appears; slide: `CPU halted`, `NEGRONI: power off`,
+   `NEGRONI REBOOT: PMIC power off: PS_HOLD reset type SHUTDOWN`, `PSCI SYSTEM_OFF`; the phone stays off
+   when no cable is in (with a cable, a USB_CHARGER auto-boot is possible: README-reboot.md 0214).
+7. Optional: `negronifb_sleep=0` (DBV 0 only) to compare; `negronibl_curve=1` if the low end is too bright.
 
 Failure signatures: `DSI0 not a running command-mode DSI 2.x controller` (wrong address or the display
 is not as the UEFI left it: no DCS, nothing else changes), `DCS 0x51 (3 bytes) failed -3` (no
@@ -166,6 +197,10 @@ If the slider does nothing and no `sets ... keys` line appears, CoreBrightness d
 - LP transmission during the HS frame stream is what Android does for this panel; if it fails,
   `negronibl_hs=1`.
 - DBV above 0x7ff without the HBM sequence: blocked (`negronibl_max` clamps to 4095; keep 2047).
-- `negronibl_sleep=2` stops TE; auto-refresh stalls until wake (untested).
-- Fast-off can leave the panel dark for up to N seconds after a press that iOS does not treat as lock.
-- A panic while the display is off draws the panic text into a dark panel (DBV 0).
+- DCS sleep (default) stops TE; the auto-refresh stalls until 0x11/0x29. If the MDP does not start
+  again on the first TE after the wake, the screen stays black after a wake: boot with
+  `negronifb_sleep=0` and report the `display on` line [I: not tested].
+- If the panel loses registers in sleep (not expected for the S6E3HC3), the wake picture is wrong:
+  `negronifb_sleep=0` again.
+- The lock delay of ~10 s (iOS sends RequestPowerChange late when CPU rendering lags) comes back with
+  the fast-off gone: that is iOS's own timing, not a kernel delay.

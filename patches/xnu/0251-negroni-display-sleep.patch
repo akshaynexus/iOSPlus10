@@ -1,23 +1,3 @@
-diff --git a/bsd/dev/negroni_keys.c b/bsd/dev/negroni_keys.c
-index 74251af..c358bcb 100644
---- a/bsd/dev/negroni_keys.c
-+++ b/bsd/dev/negroni_keys.c
-@@ -19,6 +19,7 @@
- 
- extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
- extern void negroni_hid_key(int key, int down);
-+extern void negroni_backlight_key(int key, int down);  /* iokit/Kernel/arm/NegroniBacklight.cpp */
- void negroni_keys_init(void);
- 
- #define KEYS_CORE_PA     0x0c400000u     /* arbiter core (APID map at +0x2000) */
-@@ -68,6 +69,7 @@ keys_thread(void *arg, wait_result_t result)
- 					if (keys_log) {
- 						printf("NEGRONI KEYS: key=%d down=%d\n", k, now);
- 					}
-+					negroni_backlight_key(k, now);
- 					negroni_hid_key(k, now);
- 				}
- 			}
 diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
 index 47c86eb..4b9517f 100644
 --- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
