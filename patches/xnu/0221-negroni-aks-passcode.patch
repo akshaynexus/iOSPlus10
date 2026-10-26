@@ -1,0 +1,1526 @@
+diff --git a/iokit/Kernel/arm/NegroniKeyStore.cpp b/iokit/Kernel/arm/NegroniKeyStore.cpp
+index 7073fbf..4c30e77 100644
+--- a/iokit/Kernel/arm/NegroniKeyStore.cpp
++++ b/iokit/Kernel/arm/NegroniKeyStore.cpp
+@@ -15,9 +15,43 @@
+  * console; unknown ones fail with kIOReturnUnsupported. Boot-arg
+  * negroniaks_log=1 logs every call.
+  *
+- * Boot-arg negroniaks (bit mask, default 3):
++ * Boot-arg negroniaks (bit mask, default 7):
+  *   bit 0  "no passcode": lock state 0x6 and device state sls 3 (else 0x4 / 0)
++ *          while no passcode is set
+  *   bit 1  key wrap/unwrap (selectors 10/11, else kIOReturnUnsupported)
++ *   bit 2  passcode support: a software keybag (below). Clear: the 0220
++ *          behaviour (never a passcode, change secret unsupported).
++ * Boot-arg negroniaks_reset=1: forget the stored passcode for this boot
++ * (the loaded bag counts as "no passcode"; recovery, see README-aks-amfi.md).
++ *
++ * Passcode (0221): a software keybag, no SEP. The kernel keeps a salted,
++ * iterated hash of the passcode (PBKDF2-HMAC-SHA256, NegroniKeyStoreCore.h),
++ * never the passcode. keybagd owns the file: it saves the blob that
++ * aks_save_bag (3) returns into /private/var/keybags/systembag.kb. At boot
++ * the kernel reads that file itself (at keybagd's first aks_get_system, 14)
++ * and always answers 14 with a handle, as 0220 did: keybagd's own load path
++ * (14 = kIOReturnNotFound -> read the file -> 6 -> 5) reboots the phone
++ * ("FATAL KEYBAG ERROR") on any failure. A file without a blob of ours
++ * (slop's "SWEET") gives a bag without a passcode. This is a lock-screen
++ * gate only: class keys (wrap /
++ * unwrap 10 / 11) do not depend on the passcode, so it is not hardware data
++ * protection.
++ *
++ * Selector map for a passcode change (keybagd KBChangeSystemSecret, non-SE
++ * "two phase" path, 20H392 keybagd and AppleKeyStore.framework):
++ *   14 get_system -> handle 0; 7 lock state (bit 13 SE, bit 22 xART: clear)
++ *   15 change_secret: 11 scalars {handle, flags (4 = new bag), 0xff, old ptr,
++ *      old len, new ptr, new len, 0, 0, 0, 0}; out 1 scalar, the new handle
++ *   3  save_bag {handle} -> blob (out of line, 32 KiB buffer)
++ *   5  set_system {new handle, 0, new ptr, new len}
++ *   105 change_secret_epilogue {handle, new ptr, new len}; 4 unload_bag {new}
++ *   87 invalidate_bag (old blob, inband)
++ * Unlock: 9 unlock_device {handle, ptr, len} (SpringBoard, MKBUnlockDevice);
++ * 12 unlock_bag (same shape); 42 verify_password {handle} + packed data
++ * (u32 count, then u32 len + bytes padded to 4 per item). Lock: 8 (with
++ * grace period) / 32 (now) {handle}, 13 lock_bag. 30 set_configuration
++ * {handle, DER ptr, DER len} ("gp" grace period). Wrong passcode:
++ * kIOReturnNotPermitted (keybagd and MobileKeyBag map it to "bad passcode").
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -28,8 +62,23 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <libkern/c++/OSString.h>
++#include <IOKit/IOLocks.h>
++#include <kern/clock.h>
++#include <libkern/crypto/sha2.h>
++#include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/proc.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++
++extern "C" {
++void read_random(void *buffer, u_int numBytes);
++}
++
++#include "NegroniKeyStoreCore.h"
+ 
+ /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
+ enum {
+@@ -47,19 +96,24 @@ enum {
+ 	kAKSUnlockBag        = 12,
+ 	kAKSLockBag          = 13,
+ 	kAKSGetSystem        = 14,
++	kAKSChangeSecret     = 15,      /* aks_change_secret(_se) */
+ 	kAKSGetDeviceState   = 17,
+ 	kAKSGetBagUUID       = 23,      /* out: 16 bytes */
+ 	kAKSAssertHold       = 26,
+ 	kAKSAssertDrop       = 27,
++	kAKSSetConfiguration = 30,      /* in: handle, DER ptr, DER len */
+ 	kAKSGetConfiguration = 31,      /* out: DER */
+ 	kAKSLockDeviceNow    = 32,
+ 	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
+ 	kAKSGeneration       = 40,
++	kAKSVerifyPassword   = 42,      /* in: handle; packed data */
+ 	kAKSUnloadSessionBags = 55,
++	kAKSInvalidateBag    = 87,      /* aks_invalidate_bag(old blob) */
+ 	kAKSAssertPromote    = 100,
+ 	kAKSAssertConsume    = 101,     /* aks_assert_consume */
+ 	kAKSNotifyStateSet   = 102,
+ 	kAKSNotifyStateIsSet = 103,
++	kAKSChangeSecretEpilogue = 105, /* in: handle, new ptr, new len */
+ 	kAKSPrewarm          = 115,
+ };
+ 
+@@ -85,16 +139,108 @@ enum {
+ 
+ #define NEGRONI_AKS_OPT_NOPASSCODE         0x1
+ #define NEGRONI_AKS_OPT_WRAP               0x2
++#define NEGRONI_AKS_OPT_PASSCODE           0x4
+ 
+-static uint32_t negroni_aks_options = NEGRONI_AKS_OPT_NOPASSCODE | NEGRONI_AKS_OPT_WRAP;
++static uint32_t negroni_aks_options = NEGRONI_AKS_OPT_NOPASSCODE | NEGRONI_AKS_OPT_WRAP |
++    NEGRONI_AKS_OPT_PASSCODE;
+ static uint32_t negroni_aks_log_all;
++static uint32_t negroni_aks_reset;      /* negroniaks_reset=1: ignore the stored passcode */
+ static bool negroni_aks_notify_state;  /* first-unlock notification posted (selector 102) */
+ 
++/*
++ * Software keybag state. Handle 0 is the system bag. aks_load_bag,
++ * aks_create_bag and aks_change_secret (flag 4) make temporary bags with
++ * handles until aks_unload_bag; aks_set_system copies one into the system
++ * bag. A temporary handle is 0x1000 + generation * 16 + slot (generation
++ * 0-255), so a stale handle of a reused slot does not match; a handle in
++ * 0x1000-0x1fff that matches no bag is refused. Every other handle (0, the
++ * device handle -3, ...) is the system bag.
++ */
++#define NEGRONI_AKS_TEMP_BASE    0x1000
++#define NEGRONI_AKS_TEMP_END     0x2000
++#define NEGRONI_AKS_TEMP_COUNT   16
++#define NEGRONI_AKS_FLAG_NEW_BAG 0x4    /* change_secret: make a new bag ("two phase") */
++#define NEGRONI_AKS_BAD_PASSCODE kIOReturnNotPermitted
++#define NEGRONI_AKS_BAG_FILE     "/private/var/keybags/systembag.kb"
++#define NEGRONI_AKS_BAG_FILE_TMP NEGRONI_AKS_BAG_FILE ".writing"  /* keybagd's fallback */
++#define NEGRONI_AKS_BAG_FILE_MAX (64 * 1024)
++/*
++ * "mua" (max unlock attempts, selector 31). SpringBoard marks the device
++ * permanently blocked, or asks for a wipe ("Erase Data"), when the failed
++ * count "sfa" reaches it. The device state never reports more than
++ * mua - 1 failures, so wrong passcodes never block or erase the phone.
++ */
++#define NEGRONI_AKS_MAX_UNLOCK_ATTEMPTS 10
++
++static IOLock *negroni_aks_mtx;
++static struct nks_bag negroni_aks_system;
++static struct nks_bag negroni_aks_temp[NEGRONI_AKS_TEMP_COUNT];
++static bool negroni_aks_temp_used[NEGRONI_AKS_TEMP_COUNT];
++static uint64_t negroni_aks_temp_handle[NEGRONI_AKS_TEMP_COUNT];
++static uint32_t negroni_aks_temp_gen;
++static bool negroni_aks_system_set;     /* keybagd loaded (or chose) the system bag */
++static bool negroni_aks_locked;         /* passcode set and the device is locked */
++static bool negroni_aks_unlocked_once = true;   /* unlocked since boot */
++static uint64_t negroni_aks_lock_deadline;      /* mach_continuous_time; 0 = no lock pending */
++static uint32_t negroni_aks_failed;     /* wrong passcodes since the last unlock */
++
++/*
++ * Interest messages on the AppleKeyStore service (IOGeneralInterest). The
++ * UserEventAgent plugin MobileKeyBagLockState.plugin listens: 0xe3ffd00d
++ * -> notify_post("com.apple.mobile.keybagd.lock_status"); 0xe3ffd00f ->
++ * post "com.apple.mobile.keybagd.first_unlock" once (MKBNotifyStateIsSet /
++ * MKBNotifyStateSet, selectors 103 / 102); 0xe3ffd00c passcode threshold.
++ * Without a passcode the plugin posts first_unlock at its start (lock state
++ * bit 2); with one, the kernel must tell it about the first unlock.
++ */
++#define NEGRONI_AKS_MSG_LOCK_STATUS  0xe3ffd00d
++#define NEGRONI_AKS_MSG_FIRST_UNLOCK 0xe3ffd00f
++#define NEGRONI_AKS_POST_LOCK_STATUS 0x1
++#define NEGRONI_AKS_POST_FIRST_UNLOCK 0x2
++static IOService *negroni_aks_service;
++static uint32_t negroni_aks_post;       /* messages to send after the lock is dropped */
++
++static bool
++negroni_aks_has_passcode(void)
++{
++	return (negroni_aks_options & NEGRONI_AKS_OPT_PASSCODE) && negroni_aks_system.has_secret;
++}
++
++/* A lock with a grace period (selector 8) takes effect at the deadline. */
++static void
++negroni_aks_update_lock(void)
++{
++	if (negroni_aks_lock_deadline != 0 && mach_continuous_time() >= negroni_aks_lock_deadline) {
++		negroni_aks_lock_deadline = 0;
++		if (negroni_aks_has_passcode() && !negroni_aks_locked) {
++			negroni_aks_locked = true;
++			negroni_aks_post |= NEGRONI_AKS_POST_LOCK_STATUS;
++		}
++	}
++}
++
++/* aks lock state: bit 0 locked, bit 1 no passcode, bit 2 unlocked since boot. */
+ static uint8_t
+ negroni_aks_lock_state(void)
+ {
+-	return (negroni_aks_options & NEGRONI_AKS_OPT_NOPASSCODE) ?
+-	       NEGRONI_AKS_LOCK_STATE_NOPASSCODE : NEGRONI_AKS_LOCK_STATE_UNLOCKED;
++	if (!negroni_aks_has_passcode()) {
++		return (negroni_aks_options & NEGRONI_AKS_OPT_NOPASSCODE) ?
++		       NEGRONI_AKS_LOCK_STATE_NOPASSCODE : NEGRONI_AKS_LOCK_STATE_UNLOCKED;
++	}
++	negroni_aks_update_lock();
++	return (uint8_t)((negroni_aks_locked ? 0x1 : 0) | (negroni_aks_unlocked_once ? 0x4 : 0));
++}
++
++/* Device state "sls" (MKBGetDeviceLockState): 0 unlocked, 1 locked, 3 disabled. */
++static uint8_t
++negroni_aks_sls(void)
++{
++	if (!negroni_aks_has_passcode()) {
++		return (negroni_aks_options & NEGRONI_AKS_OPT_NOPASSCODE) ?
++		       NEGRONI_AKS_SLS_NOPASSCODE : NEGRONI_AKS_SLS_UNLOCKED;
++	}
++	negroni_aks_update_lock();
++	return negroni_aks_locked ? 1 : 0;
+ }
+ 
+ class AppleKeyStore : public IOService {
+@@ -114,10 +260,19 @@ AppleKeyStore::start(IOService *provider)
+ 	}
+ 	(void)PE_parse_boot_argn("negroniaks", &negroni_aks_options, sizeof(negroni_aks_options));
+ 	(void)PE_parse_boot_argn("negroniaks_log", &negroni_aks_log_all, sizeof(negroni_aks_log_all));
++	(void)PE_parse_boot_argn("negroniaks_reset", &negroni_aks_reset, sizeof(negroni_aks_reset));
++	negroni_aks_mtx = IOLockAlloc();
++	if (negroni_aks_mtx == NULL) {
++		return false;
++	}
++	negroni_aks_service = this;
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 	registerService();
+-	IOLog("NEGRONI AKS: AppleKeyStore registered (unlocked, lock state 0x%x, key wrap %s)\n",
+-	    negroni_aks_lock_state(), (negroni_aks_options & NEGRONI_AKS_OPT_WRAP) ? "on" : "off");
++	IOLog("NEGRONI AKS: AppleKeyStore registered (unlocked, lock state 0x%x, key wrap %s, "
++	    "passcode %s%s)\n", negroni_aks_lock_state(),
++	    (negroni_aks_options & NEGRONI_AKS_OPT_WRAP) ? "on" : "off",
++	    (negroni_aks_options & NEGRONI_AKS_OPT_PASSCODE) ? "on" : "off",
++	    negroni_aks_reset ? ", negroniaks_reset: the stored passcode is ignored" : "");
+ 	return true;
+ }
+ 
+@@ -173,46 +328,32 @@ negroni_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Append SEQUENCE { UTF8String key, INTEGER value } (short forms only). */
+-static uint32_t
+-negroni_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
+-{
+-	uint32_t klen = (uint32_t)strlen(key);
+-	uint32_t n = 0;
+-	p[n++] = 0x30;
+-	p[n++] = (uint8_t)(2 + klen + 3);
+-	p[n++] = 0x0c;
+-	p[n++] = (uint8_t)klen;
+-	memcpy(p + n, key, klen);
+-	n += klen;
+-	p[n++] = 0x02;
+-	p[n++] = 0x01;
+-	p[n++] = value;
+-	return n;
+-}
+-
+ /*
+  * Device state (selector 17): a DER SET of key/INTEGER pairs that libaks
+  * decode_extended_state reads: ss state, sls lock state (MKBGetDeviceLockState:
+- * 0 unlocked, 3 disabled = no passcode), sb backoff, sfa failed attempts,
+- * sgs generation, sas assertions, sgpe grace period, srcd recovery countdown.
++ * 0 unlocked, 1 locked, 3 disabled = no passcode), sb backoff, sfa failed
++ * attempts, sgs generation, sas assertions, sgpe grace period, srcd recovery
++ * countdown. Backoff stays 0: the kernel never delays a passcode entry.
+  */
+ static IOReturn
+ negroni_aks_device_state(IOExternalMethodArguments *args)
+ {
+-	bool nopasscode = (negroni_aks_options & NEGRONI_AKS_OPT_NOPASSCODE) != 0;
+ 	const struct {
+ 		const char *key;
+-		uint8_t value;
++		uint32_t value;
+ 	} fields[] = {
+ 		{ "ss", negroni_aks_lock_state() },
+-		{ "sls", (uint8_t)(nopasscode ? NEGRONI_AKS_SLS_NOPASSCODE : NEGRONI_AKS_SLS_UNLOCKED) },
+-		{ "sb", 0 }, { "sfa", 0 }, { "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
++		{ "sls", negroni_aks_sls() },
++		{ "sb", 0 },
++		{ "sfa", !negroni_aks_has_passcode() ? 0 :
++		  negroni_aks_failed < NEGRONI_AKS_MAX_UNLOCK_ATTEMPTS - 1 ? negroni_aks_failed :
++		  NEGRONI_AKS_MAX_UNLOCK_ATTEMPTS - 1 },
++		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+-	uint8_t buf[128];
++	uint8_t buf[160];
+ 	uint32_t n = 2;
+ 	for (unsigned int i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+-		n += negroni_aks_der_pair(buf + n, fields[i].key, fields[i].value);
++		n += (uint32_t)nks_der_pair(buf + n, fields[i].key, fields[i].value);
+ 	}
+ 	buf[0] = 0x31;
+ 	buf[1] = (uint8_t)(n - 2);
+@@ -225,9 +366,9 @@ negroni_aks_configuration(IOExternalMethodArguments *args)
+ {
+ 	uint8_t buf[64];
+ 	uint32_t n = 2;
+-	n += negroni_aks_der_pair(buf + n, "bd", 0);
+-	n += negroni_aks_der_pair(buf + n, "gp", 0);
+-	n += negroni_aks_der_pair(buf + n, "mua", 10);
++	n += (uint32_t)nks_der_pair(buf + n, "bd", 0);
++	n += (uint32_t)nks_der_pair(buf + n, "gp", negroni_aks_system.grace);
++	n += (uint32_t)nks_der_pair(buf + n, "mua", NEGRONI_AKS_MAX_UNLOCK_ATTEMPTS);
+ 	buf[0] = 0x31;
+ 	buf[1] = (uint8_t)(n - 2);
+ 	return negroni_aks_struct_out(args, buf, n);
+@@ -307,6 +448,600 @@ negroni_aks_unwrap(IOExternalMethodArguments *args)
+ 	return ret;
+ }
+ 
++/*
++ * ---- Software keybag (0221) ----
++ * All functions below run with negroni_aks_mtx held (externalMethod).
++ */
++
++static bool
++negroni_aks_caller_is(const char *name)
++{
++	char self[32];
++	proc_selfname(self, sizeof(self));
++	return strcmp(self, name) == 0;
++}
++
++/*
++ * Read up to cap bytes of a regular file (no symlinks). 0 or an errno.
++ * Root userland can put any node at the path, and the AKS lock is held
++ * here: look the node up first and open only a regular file, so a FIFO
++ * or a device is never opened (a FIFO open for reading blocks until a
++ * writer comes, a device open has side effects). O_NONBLOCK covers a node
++ * swapped in between the lookup and the open; the type is checked again.
++ */
++static int
++negroni_aks_read_file(const char *path, uint8_t *buf, size_t cap, size_t *outlen)
++{
++	vfs_context_t ctx = vfs_context_current();
++	vnode_t vp = NULLVP;
++	int resid = 0, err;
++	bool reg;
++
++	*outlen = 0;
++	err = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (err != 0) {
++		return err;
++	}
++	reg = vnode_isreg(vp);
++	vnode_put(vp);
++	vp = NULLVP;
++	if (!reg) {
++		return EFTYPE;
++	}
++	err = vnode_open(path, FREAD | O_NOFOLLOW | O_NONBLOCK, 0, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (err != 0) {
++		return err;
++	}
++	if (!vnode_isreg(vp)) {
++		err = EFTYPE;
++	} else {
++		err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)cap, 0, UIO_SYSSPACE, 0,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	}
++	(void)vnode_close(vp, FREAD, ctx);
++	if (err == 0 && resid >= 0 && (size_t)resid <= cap) {
++		*outlen = cap - (size_t)resid;
++	}
++	return err;
++}
++
++/*
++ * The system bag from keybagd's file, at keybagd's first aks_get_system.
++ * Never fails: no file, a read error, no blob of ours or negroniaks_reset=1
++ * give a bag without a passcode. Sets the boot lock state.
++ */
++static void
++negroni_aks_load_system_file(void)
++{
++	struct nks_bag bag;
++	const char *file = NEGRONI_AKS_BAG_FILE, *what;
++	size_t len = 0;
++	int err = ENOMEM;
++	uint8_t *buf = (uint8_t *)IOMallocData(NEGRONI_AKS_BAG_FILE_MAX);
++
++	bzero(&bag, sizeof(bag));
++	if (buf != NULL) {
++		err = negroni_aks_read_file(file, buf, NEGRONI_AKS_BAG_FILE_MAX, &len);
++		if (err != 0 || len == 0) {
++			/* keybagd reads systembag.kb.writing when systembag.kb fails */
++			file = NEGRONI_AKS_BAG_FILE_TMP;
++			err = negroni_aks_read_file(file, buf, NEGRONI_AKS_BAG_FILE_MAX, &len);
++		}
++	}
++	if (err != 0 || len == 0) {
++		what = "no file or unreadable: no passcode";
++		file = NEGRONI_AKS_BAG_FILE;
++	} else if (!nks_find_blob(buf, len, &bag)) {
++		bzero(&bag, sizeof(bag));
++		what = "no NEGRONI bag in it: no passcode";
++	} else if (negroni_aks_reset && bag.has_secret) {
++		nks_bag_set_secret(&bag, NULL, 0, NULL, 0);
++		what = "negroniaks_reset=1: stored passcode ignored";
++	} else {
++		what = bag.has_secret ? "passcode set" : "no passcode";
++	}
++	if (buf != NULL) {
++		nks_memzero(buf, len);
++		IOFreeData(buf, NEGRONI_AKS_BAG_FILE_MAX);
++	}
++	negroni_aks_system = bag;
++	nks_memzero(&bag, sizeof(bag));
++	negroni_aks_system_set = true;
++	negroni_aks_lock_deadline = 0;
++	negroni_aks_failed = 0;
++	/* before the first unlock: locked when a passcode is set */
++	negroni_aks_locked = negroni_aks_has_passcode();
++	negroni_aks_unlocked_once = !negroni_aks_locked;
++	if (negroni_aks_locked) {
++		negroni_aks_post |= NEGRONI_AKS_POST_LOCK_STATUS;
++	}
++	IOLog("NEGRONI AKS: keybagd: system bag from %s (%lu bytes, error %d): %s, lock state 0x%x\n",
++	    file, (unsigned long)len, err, what, negroni_aks_lock_state());
++}
++
++/* The bag of a handle; NULL for a temporary handle that matches no bag. */
++static struct nks_bag *
++negroni_aks_bag(uint64_t handle, bool *is_temp)
++{
++	bool temp = handle >= NEGRONI_AKS_TEMP_BASE && handle < NEGRONI_AKS_TEMP_END;
++	if (is_temp != NULL) {
++		*is_temp = temp;
++	}
++	if (!temp) {
++		return &negroni_aks_system;
++	}
++	uint64_t i = (handle - NEGRONI_AKS_TEMP_BASE) % NEGRONI_AKS_TEMP_COUNT;
++	if (negroni_aks_temp_used[i] && negroni_aks_temp_handle[i] == handle) {
++		return &negroni_aks_temp[i];
++	}
++	return NULL;
++}
++
++static void
++negroni_aks_temp_free(uint64_t handle)
++{
++	bool is_temp;
++	struct nks_bag *bag = negroni_aks_bag(handle, &is_temp);
++	if (is_temp && bag != NULL) {
++		uint64_t i = (handle - NEGRONI_AKS_TEMP_BASE) % NEGRONI_AKS_TEMP_COUNT;
++		negroni_aks_temp_used[i] = false;
++		nks_memzero(bag, sizeof(*bag));
++	}
++}
++
++static void
++negroni_aks_new_uuid(struct nks_bag *bag)
++{
++	static const uint8_t zero[NKS_UUID_LEN] = { 0 };
++	if (memcmp(bag->uuid, zero, sizeof(zero)) == 0) {
++		read_random(bag->uuid, sizeof(bag->uuid));
++	}
++}
++
++/*
++ * A temporary bag; 0 when all slots are in use. reuse: take slot 0 then
++ * (only load_bag, which must not fail at boot).
++ */
++static uint64_t
++negroni_aks_temp_alloc(const struct nks_bag *from, bool reuse)
++{
++	unsigned int i;
++	for (i = 0; i < NEGRONI_AKS_TEMP_COUNT && negroni_aks_temp_used[i]; i++) {
++	}
++	if (i == NEGRONI_AKS_TEMP_COUNT) {
++		if (!reuse) {
++			IOLog("NEGRONI AKS: all %u temporary bags in use\n", NEGRONI_AKS_TEMP_COUNT);
++			return 0;
++		}
++		IOLog("NEGRONI AKS: all %u temporary bags in use, reusing slot 0\n", NEGRONI_AKS_TEMP_COUNT);
++		i = 0;
++	}
++	negroni_aks_temp_gen = (negroni_aks_temp_gen + 1) & 0xff;
++	negroni_aks_temp[i] = *from;
++	negroni_aks_temp_used[i] = true;
++	negroni_aks_temp_handle[i] = NEGRONI_AKS_TEMP_BASE + negroni_aks_temp_gen * NEGRONI_AKS_TEMP_COUNT + i;
++	return negroni_aks_temp_handle[i];
++}
++
++/* Copy a passcode (user pointer + length from the scalars) into buf. */
++static IOReturn
++negroni_aks_copyin_secret(uint64_t uaddr, uint64_t len, uint8_t buf[NKS_PASSCODE_MAX], size_t *outlen)
++{
++	*outlen = 0;
++	if (uaddr == 0 || len == 0) {
++		return kIOReturnSuccess;
++	}
++	if (len > NKS_PASSCODE_MAX) {
++		return kIOReturnBadArgument;
++	}
++	if (copyin((user_addr_t)uaddr, buf, (size_t)len) != 0) {
++		return kIOReturnVMError;
++	}
++	*outlen = (size_t)len;
++	return kIOReturnSuccess;
++}
++
++/*
++ * Inband or out-of-line structure input, up to cap bytes. prefix: a longer
++ * input gives its first cap bytes, else kIOReturnNoSpace.
++ */
++static IOReturn
++negroni_aks_struct_in(IOExternalMethodArguments *args, uint8_t *buf, uint32_t cap, uint32_t *len,
++    bool prefix)
++{
++	*len = 0;
++	if (args->structureInputDescriptor != NULL) {
++		IOMemoryDescriptor *md = args->structureInputDescriptor;
++		IOByteCount n = md->getLength();
++		if (n > cap) {
++			if (!prefix) {
++				return kIOReturnNoSpace;
++			}
++			n = cap;
++		}
++		IOReturn ret = md->prepare();
++		if (ret != kIOReturnSuccess) {
++			return ret;
++		}
++		IOByteCount done = md->readBytes(0, buf, n);
++		md->complete();
++		if (done != n) {
++			return kIOReturnVMError;
++		}
++		*len = (uint32_t)n;
++		return kIOReturnSuccess;
++	}
++	uint32_t n = args->structureInputSize;
++	if (n > cap) {
++		if (!prefix) {
++			return kIOReturnNoSpace;
++		}
++		n = cap;
++	}
++	if (n > 0) {
++		if (args->structureInput == NULL) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(buf, args->structureInput, n);
++	}
++	*len = n;
++	return kIOReturnSuccess;
++}
++
++static void
++negroni_aks_unlocked(void)
++{
++	if (negroni_aks_locked) {
++		negroni_aks_post |= NEGRONI_AKS_POST_LOCK_STATUS;
++	}
++	if (!negroni_aks_unlocked_once) {
++		negroni_aks_post |= NEGRONI_AKS_POST_LOCK_STATUS | NEGRONI_AKS_POST_FIRST_UNLOCK;
++	}
++	negroni_aks_locked = false;
++	negroni_aks_unlocked_once = true;
++	negroni_aks_lock_deadline = 0;
++	negroni_aks_failed = 0;
++}
++
++/*
++ * Selector 14: always handle 0 (as 0220), never kIOReturnNotFound. That
++ * answer sends keybagd --init into its own file load, and keybagd reboots
++ * the phone ("FATAL KEYBAG ERROR") on any failure there. Instead the kernel
++ * reads the file at keybagd's first call, once per boot.
++ */
++static IOReturn
++negroni_aks_get_system(IOExternalMethodArguments *args)
++{
++	if (args->scalarOutputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	if ((negroni_aks_options & NEGRONI_AKS_OPT_PASSCODE) && !negroni_aks_system_set &&
++	    negroni_aks_caller_is("keybagd")) {
++		negroni_aks_load_system_file();
++	}
++	args->scalarOutput[0] = NEGRONI_AKS_SYSTEM_HANDLE;
++	args->scalarOutputCount = 1;
++	return kIOReturnSuccess;
++}
++
++/* Selector 6: blob in, handle out. Never fails on content (keybagd reboots then). */
++static IOReturn
++negroni_aks_load_bag(IOExternalMethodArguments *args)
++{
++	uint8_t blob[512];
++	uint32_t len = 0;
++	struct nks_bag bag;
++	const char *what;
++
++	if (args->scalarOutputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	bzero(&bag, sizeof(bag));
++	if (negroni_aks_struct_in(args, blob, sizeof(blob), &len, false) != kIOReturnSuccess) {
++		len = 0;
++		what = "unreadable or large blob: no passcode";
++	} else if (!nks_bag_parse(blob, len, &bag)) {
++		bzero(&bag, sizeof(bag));
++		what = "not a NEGRONI bag: no passcode";
++	} else if (negroni_aks_reset && bag.has_secret) {
++		nks_bag_set_secret(&bag, NULL, 0, NULL, 0);
++		what = "negroniaks_reset=1: stored passcode ignored";
++	} else {
++		what = bag.has_secret ? "passcode set" : "no passcode";
++	}
++	uint64_t h = negroni_aks_temp_alloc(&bag, true);
++	IOLog("NEGRONI AKS: load bag (%u bytes): %s, handle 0x%llx\n", len, what, h);
++	args->scalarOutput[0] = h;
++	args->scalarOutputCount = 1;
++	return kIOReturnSuccess;
++}
++
++/* Selector 5: {handle, system handle, passcode ptr, len}. */
++static IOReturn
++negroni_aks_set_system(IOExternalMethodArguments *args)
++{
++	bool is_temp;
++	struct nks_bag *bag = negroni_aks_bag(args->scalarInputCount > 0 ? args->scalarInput[0] : 0, &is_temp);
++	bool boot = !negroni_aks_system_set;
++
++	args->scalarOutputCount = 0;
++	if (bag == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!is_temp) {
++		return kIOReturnSuccess;        /* already the system bag */
++	}
++	negroni_aks_system = *bag;
++	negroni_aks_system_set = true;
++	negroni_aks_lock_deadline = 0;
++	if (boot) {
++		/* before the first unlock: locked when a passcode is set */
++		negroni_aks_locked = negroni_aks_has_passcode();
++		negroni_aks_unlocked_once = !negroni_aks_locked;
++		negroni_aks_failed = 0;
++	} else if (!negroni_aks_has_passcode()) {
++		negroni_aks_unlocked();
++	}
++	negroni_aks_post |= NEGRONI_AKS_POST_LOCK_STATUS;
++	IOLog("NEGRONI AKS: system bag set (%s, %s, lock state 0x%x)\n",
++	    negroni_aks_system.has_secret ? "passcode set" : "no passcode",
++	    boot ? "boot" : "change", negroni_aks_lock_state());
++	return kIOReturnSuccess;
++}
++
++/* Selector 3: {handle} -> blob. */
++static IOReturn
++negroni_aks_save_bag(IOExternalMethodArguments *args)
++{
++	uint8_t blob[NKS_BLOB_LEN];
++	struct nks_bag *bag = negroni_aks_bag(args->scalarInputCount > 0 ? args->scalarInput[0] : 0, NULL);
++
++	args->scalarOutputCount = 0;
++	if (bag == NULL) {
++		return kIOReturnBadArgument;
++	}
++	nks_bag_serialize(bag, blob);
++	return negroni_aks_struct_out(args, blob, sizeof(blob));
++}
++
++/* Selector 2: {type, generation, passcode ptr, len, 0, 0} -> handle. */
++static IOReturn
++negroni_aks_create_bag(IOExternalMethodArguments *args)
++{
++	uint8_t pc[NKS_PASSCODE_MAX], salt[NKS_SALT_LEN];
++	size_t pclen;
++	struct nks_bag bag;
++	IOReturn ret;
++
++	if (args->scalarInputCount < 4 || args->scalarOutputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	ret = negroni_aks_copyin_secret(args->scalarInput[2], args->scalarInput[3], pc, &pclen);
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	bzero(&bag, sizeof(bag));
++	read_random(salt, sizeof(salt));
++	nks_bag_set_secret(&bag, pc, pclen, salt, NKS_ITERATIONS);
++	nks_memzero(pc, sizeof(pc));
++	negroni_aks_new_uuid(&bag);
++	args->scalarOutput[0] = negroni_aks_temp_alloc(&bag, false);
++	nks_memzero(&bag, sizeof(bag));
++	if (args->scalarOutput[0] == 0) {
++		args->scalarOutputCount = 0;
++		return kIOReturnNoResources;
++	}
++	args->scalarOutputCount = 1;
++	IOLog("NEGRONI AKS: create bag (%s), handle 0x%llx\n", pclen ? "passcode" : "no passcode",
++	    args->scalarOutput[0]);
++	return kIOReturnSuccess;
++}
++
++/*
++ * Selector 15: {handle, flags, 0xff, old ptr, old len, new ptr, new len, ...}
++ * -> handle. Flag 4: the result goes into a new bag (keybagd then saves it,
++ * makes it the system bag and unloads it); else the bag changes in place.
++ * An empty new passcode turns the passcode off.
++ */
++static IOReturn
++negroni_aks_change_secret(IOExternalMethodArguments *args)
++{
++	uint8_t oldpc[NKS_PASSCODE_MAX], newpc[NKS_PASSCODE_MAX], salt[NKS_SALT_LEN];
++	size_t oldlen, newlen;
++	bool is_temp;
++	struct nks_bag *bag, nb;
++	uint64_t handle, flags, h;
++	IOReturn ret;
++
++	if (args->scalarInputCount < 7 || args->scalarOutputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	handle = args->scalarInput[0];
++	flags = args->scalarInput[1];
++	bag = negroni_aks_bag(handle, &is_temp);
++	if (bag == NULL) {
++		return kIOReturnBadArgument;
++	}
++	ret = negroni_aks_copyin_secret(args->scalarInput[3], args->scalarInput[4], oldpc, &oldlen);
++	if (ret == kIOReturnSuccess) {
++		ret = negroni_aks_copyin_secret(args->scalarInput[5], args->scalarInput[6], newpc, &newlen);
++	}
++	if (ret != kIOReturnSuccess) {
++		nks_memzero(oldpc, sizeof(oldpc));
++		nks_memzero(newpc, sizeof(newpc));
++		return ret;
++	}
++	if (!nks_bag_verify(bag, oldpc, oldlen)) {
++		nks_memzero(oldpc, sizeof(oldpc));
++		nks_memzero(newpc, sizeof(newpc));
++		IOLog("NEGRONI AKS: change secret: old passcode wrong (handle 0x%llx)\n", handle);
++		return NEGRONI_AKS_BAD_PASSCODE;
++	}
++	nb = *bag;
++	read_random(salt, sizeof(salt));
++	nks_bag_set_secret(&nb, newpc, newlen, salt, NKS_ITERATIONS);
++	negroni_aks_new_uuid(&nb);
++	nks_memzero(oldpc, sizeof(oldpc));
++	nks_memzero(newpc, sizeof(newpc));
++	if (flags & NEGRONI_AKS_FLAG_NEW_BAG) {
++		h = negroni_aks_temp_alloc(&nb, false);
++		if (h == 0) {
++			nks_memzero(&nb, sizeof(nb));
++			return kIOReturnNoResources;
++		}
++	} else {
++		*bag = nb;
++		h = handle;
++		if (!is_temp) {
++			negroni_aks_unlocked();
++			negroni_aks_system_set = true;
++			negroni_aks_post |= NEGRONI_AKS_POST_LOCK_STATUS;
++		}
++	}
++	args->scalarOutput[0] = h;
++	args->scalarOutputCount = 1;
++	IOLog("NEGRONI AKS: change secret: passcode %s (handle 0x%llx flags 0x%llx -> 0x%llx)\n",
++	    nb.has_secret ? "set" : "removed", handle, flags, h);
++	return kIOReturnSuccess;
++}
++
++/*
++ * Selectors 9 / 12: {handle, passcode ptr, len}. Unlocks the device for the
++ * system bag; for a temporary bag it only checks the passcode.
++ */
++static IOReturn
++negroni_aks_unlock(IOExternalMethodArguments *args)
++{
++	uint8_t pc[NKS_PASSCODE_MAX];
++	size_t pclen;
++	bool is_temp, ok;
++	struct nks_bag *bag;
++	IOReturn ret;
++
++	args->scalarOutputCount = 0;
++	if (args->scalarInputCount < 3) {
++		return kIOReturnBadArgument;
++	}
++	bag = negroni_aks_bag(args->scalarInput[0], &is_temp);
++	if (bag == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!is_temp && !negroni_aks_has_passcode()) {
++		return kIOReturnSuccess;
++	}
++	ret = negroni_aks_copyin_secret(args->scalarInput[1], args->scalarInput[2], pc, &pclen);
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	ok = nks_bag_verify(bag, pc, pclen);
++	nks_memzero(pc, sizeof(pc));
++	if (is_temp) {
++		return ok ? kIOReturnSuccess : NEGRONI_AKS_BAD_PASSCODE;
++	}
++	if (!ok) {
++		negroni_aks_failed++;
++		IOLog("NEGRONI AKS: unlock: wrong passcode (%u since the last unlock)\n", negroni_aks_failed);
++		return NEGRONI_AKS_BAD_PASSCODE;
++	}
++	if (negroni_aks_locked || !negroni_aks_unlocked_once) {
++		IOLog("NEGRONI AKS: unlocked%s\n", negroni_aks_unlocked_once ? "" : " (first unlock since boot)");
++	}
++	negroni_aks_unlocked();
++	return kIOReturnSuccess;
++}
++
++/* Selector 42: {handle} + packed {u32 count; u32 len, bytes, pad to 4; ...}. */
++static IOReturn
++negroni_aks_verify_password(IOExternalMethodArguments *args)
++{
++	uint8_t buf[4 + 4 + NKS_PASSCODE_MAX];
++	uint32_t len = 0, count, plen;
++	struct nks_bag *bag;
++	bool is_temp, ok;
++	IOReturn ret;
++
++	args->scalarOutputCount = 0;
++	bag = negroni_aks_bag(args->scalarInputCount > 0 ? args->scalarInput[0] : 0, &is_temp);
++	if (bag == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!is_temp && !negroni_aks_has_passcode()) {
++		return kIOReturnSuccess;
++	}
++	/* only the first item (the passcode) is used: read a prefix */
++	ret = negroni_aks_struct_in(args, buf, sizeof(buf), &len, true);
++	if (ret != kIOReturnSuccess) {
++		return ret;
++	}
++	if (len < 8) {
++		nks_memzero(buf, sizeof(buf));
++		return kIOReturnBadArgument;
++	}
++	count = nks_get32(buf);
++	plen = nks_get32(buf + 4);
++	if (count < 1 || plen > NKS_PASSCODE_MAX || plen > len - 8) {
++		nks_memzero(buf, sizeof(buf));
++		return kIOReturnBadArgument;
++	}
++	ok = nks_bag_verify(bag, buf + 8, plen);
++	nks_memzero(buf, sizeof(buf));
++	return ok ? kIOReturnSuccess : NEGRONI_AKS_BAD_PASSCODE;
++}
++
++/* Selectors 8 (lock after the grace period), 32 (lock now), 13 (lock bag). */
++static IOReturn
++negroni_aks_lock(uint32_t selector, IOExternalMethodArguments *args)
++{
++	bool is_temp;
++
++	args->scalarOutputCount = 0;
++	(void)negroni_aks_bag(args->scalarInputCount > 0 ? args->scalarInput[0] : 0, &is_temp);
++	if (is_temp || !negroni_aks_has_passcode() || negroni_aks_locked) {
++		return kIOReturnSuccess;        /* no passcode: the device never locks */
++	}
++	if (selector == kAKSLockDevice && negroni_aks_system.grace > 0) {
++		if (negroni_aks_lock_deadline == 0) {
++			uint64_t delta;
++			nanoseconds_to_absolutetime((uint64_t)negroni_aks_system.grace * NSEC_PER_SEC, &delta);
++			negroni_aks_lock_deadline = mach_continuous_time() + delta;
++		}
++		return kIOReturnSuccess;
++	}
++	negroni_aks_locked = true;
++	negroni_aks_lock_deadline = 0;
++	negroni_aks_post |= NEGRONI_AKS_POST_LOCK_STATUS;
++	return kIOReturnSuccess;
++}
++
++/* Selector 30: {handle, DER ptr, DER len}; keeps "gp" (grace period, seconds). */
++static IOReturn
++negroni_aks_set_configuration(IOExternalMethodArguments *args)
++{
++	uint8_t der[1024];
++	uint32_t gp;
++	uint64_t len;
++
++	args->scalarOutputCount = 0;
++	if (args->scalarInputCount < 3) {
++		return kIOReturnBadArgument;
++	}
++	len = args->scalarInput[2];
++	if (args->scalarInput[1] == 0 || len == 0 || len > sizeof(der)) {
++		return kIOReturnBadArgument;
++	}
++	if (copyin((user_addr_t)args->scalarInput[1], der, (size_t)len) != 0) {
++		return kIOReturnVMError;
++	}
++	if (nks_der_find_int(der, (size_t)len, "gp", &gp)) {
++		if (gp != negroni_aks_system.grace) {
++			IOLog("NEGRONI AKS: grace period %u s\n", gp);
++		}
++		negroni_aks_system.grace = gp;
++	}
++	nks_memzero(der, sizeof(der));         /* may hold the passcode ("pc") */
++	return kIOReturnSuccess;
++}
++
+ static uint32_t
+ negroni_aks_struct_out_size(IOExternalMethodArguments *args)
+ {
+@@ -327,6 +1062,80 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	uint32_t out_struct = negroni_aks_struct_out_size(args);
+ 	uint64_t arg0 = in_scalars > 0 ? args->scalarInput[0] : 0;
+ 
++	bool passcode = (negroni_aks_options & NEGRONI_AKS_OPT_PASSCODE) != 0;
++	IOLockLock(negroni_aks_mtx);
++	/*
++	 * Bags change only through keybagd (stock AppleKeyStore checks
++	 * entitlements): another process must not set a passcode the owner does
++	 * not know. Unlock / lock / verify / configuration stay open (SpringBoard,
++	 * Settings).
++	 */
++	bool keybagd_only = selector == kAKSCreateBag || selector == kAKSSaveBag ||
++	    selector == kAKSSetSystem || selector == kAKSLoadBag || selector == kAKSChangeSecret ||
++	    selector == kAKSInvalidateBag || selector == kAKSChangeSecretEpilogue;
++	if (passcode && keybagd_only && !negroni_aks_caller_is("keybagd")) {
++		/* the 0220 answer below (set_system: success, no change; others unsupported) */
++		static uint8_t logged_gate;
++		if (logged_gate < 10) {
++			char who[32];
++			logged_gate++;
++			proc_selfname(who, sizeof(who));
++			IOLog("NEGRONI AKS: %s may not use selector %u (keybagd only): 0220 answer\n", who,
++			    selector);
++		}
++		passcode = false;
++	}
++	switch (passcode ? selector : ~0u) {
++	case kAKSGetSystem:
++		ret = negroni_aks_get_system(args);
++		break;
++	case kAKSLoadBag:
++		ret = negroni_aks_load_bag(args);
++		break;
++	case kAKSSetSystem:
++		ret = negroni_aks_set_system(args);
++		break;
++	case kAKSSaveBag:
++		ret = negroni_aks_save_bag(args);
++		break;
++	case kAKSCreateBag:
++		ret = negroni_aks_create_bag(args);
++		break;
++	case kAKSUnloadBag:
++		negroni_aks_temp_free(arg0);
++		args->scalarOutputCount = 0;
++		break;
++	case kAKSChangeSecret:
++		ret = negroni_aks_change_secret(args);
++		break;
++	case kAKSChangeSecretEpilogue:
++	case kAKSInvalidateBag:
++		args->scalarOutputCount = 0;
++		break;
++	case kAKSUnlockDevice:
++	case kAKSUnlockBag:
++		ret = negroni_aks_unlock(args);
++		break;
++	case kAKSVerifyPassword:
++		ret = negroni_aks_verify_password(args);
++		break;
++	case kAKSLockDevice:
++	case kAKSLockDeviceNow:
++	case kAKSLockBag:
++		ret = negroni_aks_lock(selector, args);
++		break;
++	case kAKSSetConfiguration:
++		ret = negroni_aks_set_configuration(args);
++		break;
++	default:
++		ret = kIOReturnInvalid;         /* not a passcode selector: the 0220 table */
++		break;
++	}
++	if (ret != kIOReturnInvalid) {
++		goto done;
++	}
++	ret = kIOReturnSuccess;
++
+ 	switch (selector) {
+ 	case kAKSOpen:
+ 	case kAKSUnloadBag:
+@@ -414,6 +1223,18 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		ret = kIOReturnUnsupported;
+ 		break;
+ 	}
++done:
++	uint32_t post = negroni_aks_post;
++	negroni_aks_post = 0;
++	IOLockUnlock(negroni_aks_mtx);
++	if (post != 0 && negroni_aks_service != NULL) {
++		if (post & NEGRONI_AKS_POST_LOCK_STATUS) {
++			negroni_aks_service->messageClients(NEGRONI_AKS_MSG_LOCK_STATUS);
++		}
++		if (post & NEGRONI_AKS_POST_FIRST_UNLOCK) {
++			negroni_aks_service->messageClients(NEGRONI_AKS_MSG_FIRST_UNLOCK);
++		}
++	}
+ 
+ 	/*
+ 	 * A few lines per selector (sailfish 0180): the device state is asked
+diff --git a/iokit/Kernel/arm/NegroniKeyStoreCore.h b/iokit/Kernel/arm/NegroniKeyStoreCore.h
+new file mode 100644
+index 0000000..a4cfe17
+--- /dev/null
++++ b/iokit/Kernel/arm/NegroniKeyStoreCore.h
+@@ -0,0 +1,515 @@
++/*
++ * NEGRONI software keybag core: passcode hash, compare and the bag blob.
++ *
++ * Plain C with no kernel dependencies other than a SHA-256 with the
++ * SHA256_CTX / SHA256_Init / SHA256_Update / SHA256_Final interface
++ * (libkern/crypto/sha2.h in the kernel). The host unit test
++ * (tools/aks-core-test, scripts/kernel/test-aks-core.sh) compiles this same
++ * file against CommonCrypto and checks PBKDF2 against CCKeyDerivationPBKDF.
++ *
++ * The passcode is never stored. The bag keeps a random 16-byte salt and
++ * PBKDF2-HMAC-SHA256(passcode, salt, iterations, 32 bytes).
++ *
++ * Blob (NKS_BLOB_LEN bytes, little endian), what aks_save_bag returns and
++ * aks_load_bag accepts; keybagd keeps it in /private/var/keybags/systembag.kb
++ * (key KeyBagKeys):
++ *    0  "NAKS"
++ *    4  u16 version (1)
++ *    6  u16 flags (bit 0: a passcode is set)
++ *    8  u32 PBKDF2 iterations
++ *   12  u32 grace period (seconds, aks_set_configuration "gp")
++ *   16  salt[16]
++ *   32  hash[32]
++ *   64  bag UUID[16]
++ *   80  reserved[16] (0)
++ *   96  SHA-256 of bytes 0..95 (detects a damaged file; not a secret)
++ */
++#ifndef NEGRONI_KEYSTORE_CORE_H
++#define NEGRONI_KEYSTORE_CORE_H
++
++/* every helper is static; some are used only by the host test */
++#define NKS_STATIC          static __attribute__((unused))
++
++#define NKS_SALT_LEN        16
++#define NKS_HASH_LEN        32
++#define NKS_UUID_LEN        16
++#define NKS_BLOB_LEN        128
++#define NKS_BLOB_VERSION    1
++#define NKS_ITERATIONS      20000       /* about 40k SHA-256 blocks per check */
++#define NKS_ITERATIONS_MAX  1000000
++#define NKS_PASSCODE_MAX    128         /* bytes; libaks passcodes are short */
++#define NKS_FLAG_SECRET     0x1
++
++struct nks_bag {
++	uint8_t  has_secret;
++	uint32_t iterations;
++	uint32_t grace;                         /* seconds */
++	uint8_t  salt[NKS_SALT_LEN];
++	uint8_t  hash[NKS_HASH_LEN];
++	uint8_t  uuid[NKS_UUID_LEN];
++};
++
++NKS_STATIC void
++nks_memzero(void *p, size_t n)
++{
++	volatile uint8_t *v = (volatile uint8_t *)p;
++	while (n--) {
++		*v++ = 0;
++	}
++}
++
++/* HMAC-SHA256 key schedule: the inner and outer contexts after the pads. */
++struct nks_hmac {
++	SHA256_CTX inner;
++	SHA256_CTX outer;
++};
++
++NKS_STATIC void
++nks_hmac_init(struct nks_hmac *h, const uint8_t *key, size_t klen)
++{
++	uint8_t k[64], pad[64];
++	size_t i;
++
++	nks_memzero(k, sizeof(k));
++	if (klen > sizeof(k)) {
++		SHA256_CTX c;
++		SHA256_Init(&c);
++		SHA256_Update(&c, key, klen);
++		SHA256_Final(k, &c);
++	} else if (klen > 0) {
++		memcpy(k, key, klen);
++	}
++	for (i = 0; i < 64; i++) {
++		pad[i] = k[i] ^ 0x36;
++	}
++	SHA256_Init(&h->inner);
++	SHA256_Update(&h->inner, pad, 64);
++	for (i = 0; i < 64; i++) {
++		pad[i] = k[i] ^ 0x5c;
++	}
++	SHA256_Init(&h->outer);
++	SHA256_Update(&h->outer, pad, 64);
++	nks_memzero(k, sizeof(k));
++	nks_memzero(pad, sizeof(pad));
++}
++
++/* out = HMAC(key, m1 || m2), from a prepared key schedule. */
++NKS_STATIC void
++nks_hmac_run(const struct nks_hmac *h, const uint8_t *m1, size_t l1,
++    const uint8_t *m2, size_t l2, uint8_t out[NKS_HASH_LEN])
++{
++	SHA256_CTX c = h->inner;
++	uint8_t inner[NKS_HASH_LEN];
++
++	SHA256_Update(&c, m1, l1);
++	if (l2 > 0) {
++		SHA256_Update(&c, m2, l2);
++	}
++	SHA256_Final(inner, &c);
++	c = h->outer;
++	SHA256_Update(&c, inner, sizeof(inner));
++	SHA256_Final(out, &c);
++	nks_memzero(inner, sizeof(inner));
++	nks_memzero(&c, sizeof(c));
++}
++
++NKS_STATIC void
++nks_hmac_sha256(const uint8_t *key, size_t klen, const uint8_t *msg, size_t mlen,
++    uint8_t out[NKS_HASH_LEN])
++{
++	struct nks_hmac h;
++	nks_hmac_init(&h, key, klen);
++	nks_hmac_run(&h, msg, mlen, NULL, 0, out);
++	nks_memzero(&h, sizeof(h));
++}
++
++/* PBKDF2-HMAC-SHA256 (RFC 8018), any output length. */
++NKS_STATIC void
++nks_pbkdf2_sha256(const uint8_t *pw, size_t pwlen, const uint8_t *salt, size_t saltlen,
++    uint32_t iterations, uint8_t *out, size_t outlen)
++{
++	struct nks_hmac h;
++	uint8_t u[NKS_HASH_LEN], t[NKS_HASH_LEN], ctr[4];
++	uint32_t block = 1;
++
++	nks_hmac_init(&h, pw, pwlen);
++	while (outlen > 0) {
++		size_t n = outlen < NKS_HASH_LEN ? outlen : NKS_HASH_LEN;
++		ctr[0] = (uint8_t)(block >> 24);
++		ctr[1] = (uint8_t)(block >> 16);
++		ctr[2] = (uint8_t)(block >> 8);
++		ctr[3] = (uint8_t)block;
++		nks_hmac_run(&h, salt, saltlen, ctr, 4, u);
++		memcpy(t, u, sizeof(t));
++		for (uint32_t i = 1; i < iterations; i++) {
++			nks_hmac_run(&h, u, sizeof(u), NULL, 0, u);
++			for (size_t j = 0; j < sizeof(t); j++) {
++				t[j] ^= u[j];
++			}
++		}
++		memcpy(out, t, n);
++		out += n;
++		outlen -= n;
++		block++;
++	}
++	nks_memzero(&h, sizeof(h));
++	nks_memzero(u, sizeof(u));
++	nks_memzero(t, sizeof(t));
++}
++
++/* Constant-time compare (no early exit on the first different byte). */
++NKS_STATIC int
++nks_equal(const uint8_t *a, const uint8_t *b, size_t n)
++{
++	uint8_t d = 0;
++	for (size_t i = 0; i < n; i++) {
++		d |= a[i] ^ b[i];
++	}
++	return d == 0;
++}
++
++/*
++ * Set (pwlen > 0) or clear (pwlen == 0) the passcode. salt: NKS_SALT_LEN
++ * random bytes from the caller. The grace period and UUID do not change.
++ */
++NKS_STATIC void
++nks_bag_set_secret(struct nks_bag *bag, const uint8_t *pw, size_t pwlen,
++    const uint8_t salt[NKS_SALT_LEN], uint32_t iterations)
++{
++	if (pwlen == 0) {
++		bag->has_secret = 0;
++		bag->iterations = 0;
++		nks_memzero(bag->salt, sizeof(bag->salt));
++		nks_memzero(bag->hash, sizeof(bag->hash));
++		return;
++	}
++	bag->has_secret = 1;
++	bag->iterations = iterations;
++	memcpy(bag->salt, salt, NKS_SALT_LEN);
++	nks_pbkdf2_sha256(pw, pwlen, bag->salt, NKS_SALT_LEN, iterations, bag->hash, NKS_HASH_LEN);
++}
++
++/* 1 when pw opens the bag. A bag without a passcode accepts any input. */
++NKS_STATIC int
++nks_bag_verify(const struct nks_bag *bag, const uint8_t *pw, size_t pwlen)
++{
++	uint8_t h[NKS_HASH_LEN];
++	int ok;
++
++	if (!bag->has_secret) {
++		return 1;
++	}
++	if (pwlen == 0) {
++		return 0;
++	}
++	nks_pbkdf2_sha256(pw, pwlen, bag->salt, NKS_SALT_LEN, bag->iterations, h, sizeof(h));
++	ok = nks_equal(h, bag->hash, sizeof(h));
++	nks_memzero(h, sizeof(h));
++	return ok;
++}
++
++NKS_STATIC void
++nks_put16(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++}
++
++NKS_STATIC void
++nks_put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++NKS_STATIC uint32_t
++nks_get16(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++NKS_STATIC uint32_t
++nks_get32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* Write the blob; returns NKS_BLOB_LEN. */
++NKS_STATIC size_t
++nks_bag_serialize(const struct nks_bag *bag, uint8_t out[NKS_BLOB_LEN])
++{
++	SHA256_CTX c;
++
++	nks_memzero(out, NKS_BLOB_LEN);
++	memcpy(out, "NAKS", 4);
++	nks_put16(out + 4, NKS_BLOB_VERSION);
++	nks_put16(out + 6, bag->has_secret ? NKS_FLAG_SECRET : 0);
++	nks_put32(out + 8, bag->has_secret ? bag->iterations : 0);
++	nks_put32(out + 12, bag->grace);
++	if (bag->has_secret) {
++		memcpy(out + 16, bag->salt, NKS_SALT_LEN);
++		memcpy(out + 32, bag->hash, NKS_HASH_LEN);
++	}
++	memcpy(out + 64, bag->uuid, NKS_UUID_LEN);
++	SHA256_Init(&c);
++	SHA256_Update(&c, out, 96);
++	SHA256_Final(out + 96, &c);
++	return NKS_BLOB_LEN;
++}
++
++/*
++ * Read a blob. Returns 1 and fills bag for a valid blob of ours, 0 for
++ * anything else (another format, a damaged file); bag is then untouched.
++ */
++NKS_STATIC int
++nks_bag_parse(const uint8_t *in, size_t len, struct nks_bag *bag)
++{
++	uint8_t sum[NKS_HASH_LEN];
++	SHA256_CTX c;
++	uint32_t flags, iterations;
++
++	if (in == NULL || len != NKS_BLOB_LEN || memcmp(in, "NAKS", 4) != 0 ||
++	    nks_get16(in + 4) != NKS_BLOB_VERSION) {
++		return 0;
++	}
++	SHA256_Init(&c);
++	SHA256_Update(&c, in, 96);
++	SHA256_Final(sum, &c);
++	if (!nks_equal(sum, in + 96, sizeof(sum))) {
++		return 0;
++	}
++	flags = nks_get16(in + 6);
++	iterations = nks_get32(in + 8);
++	if ((flags & ~(uint32_t)NKS_FLAG_SECRET) != 0 ||
++	    ((flags & NKS_FLAG_SECRET) && (iterations == 0 || iterations > NKS_ITERATIONS_MAX))) {
++		return 0;
++	}
++	bag->has_secret = (flags & NKS_FLAG_SECRET) ? 1 : 0;
++	bag->iterations = bag->has_secret ? iterations : 0;
++	bag->grace = nks_get32(in + 12);
++	memcpy(bag->salt, in + 16, NKS_SALT_LEN);
++	memcpy(bag->hash, in + 32, NKS_HASH_LEN);
++	memcpy(bag->uuid, in + 64, NKS_UUID_LEN);
++	return 1;
++}
++
++/* Value of a base64 character; -1 for any other character. */
++NKS_STATIC int
++nks_b64val(uint8_t c)
++{
++	if (c >= 'A' && c <= 'Z') {
++		return c - 'A';
++	}
++	if (c >= 'a' && c <= 'z') {
++		return c - 'a' + 26;
++	}
++	if (c >= '0' && c <= '9') {
++		return c - '0' + 52;
++	}
++	if (c == '+') {
++		return 62;
++	}
++	if (c == '/') {
++		return 63;
++	}
++	return -1;
++}
++
++/*
++ * Find a valid blob of ours in a keybag file (keybagd's systembag.kb, a
++ * property list with KeyBagKeys = blob). A binary plist (what keybagd
++ * writes, CFPropertyListWrite format 200) keeps the bytes as they are; an
++ * XML plist keeps them as base64 in <data>...</data>. Returns 1 and fills
++ * bag for the first valid blob; 0 (bag untouched) when there is none, e.g.
++ * slop's "SWEET" placeholder or a damaged file.
++ */
++NKS_STATIC int
++nks_find_blob(const uint8_t *buf, size_t len, struct nks_bag *bag)
++{
++	uint8_t out[NKS_BLOB_LEN];
++	size_t i, j, n;
++	uint32_t acc;
++	int bits, bad, v;
++
++	if (buf == NULL) {
++		return 0;
++	}
++	for (i = 0; len >= NKS_BLOB_LEN && i <= len - NKS_BLOB_LEN; i++) {
++		if (buf[i] == 'N' && nks_bag_parse(buf + i, NKS_BLOB_LEN, bag)) {
++			return 1;
++		}
++	}
++	for (i = 0; len >= 6 && i <= len - 6; i++) {
++		if (memcmp(buf + i, "<data>", 6) != 0) {
++			continue;
++		}
++		n = 0;
++		acc = 0;
++		bits = 0;
++		bad = 0;
++		for (j = i + 6; j < len && buf[j] != '<'; j++) {
++			v = nks_b64val(buf[j]);
++			if (v < 0) {
++				if (buf[j] == '=' || buf[j] == ' ' || buf[j] == '\t' || buf[j] == '\n' || buf[j] == '\r') {
++					continue;
++				}
++				bad = 1;
++				break;
++			}
++			acc = ((acc << 6) | (uint32_t)v) & 0xffff;
++			bits += 6;
++			if (bits >= 8) {
++				bits -= 8;
++				if (n == sizeof(out)) {
++					bad = 1;        /* longer than a blob of ours */
++					break;
++				}
++				out[n++] = (uint8_t)(acc >> bits);
++			}
++		}
++		if (!bad && n == NKS_BLOB_LEN && nks_bag_parse(out, n, bag)) {
++			nks_memzero(out, sizeof(out));
++			return 1;
++		}
++		i = j > i ? j - 1 : i;  /* continue after this element */
++	}
++	nks_memzero(out, sizeof(out));
++	return 0;
++}
++
++/*
++ * DER length at p (short or long form up to 4 bytes). Returns the header
++ * size (bytes of the length field) or 0 when it does not fit in end.
++ */
++NKS_STATIC size_t
++nks_der_len(const uint8_t *p, const uint8_t *end, size_t *len)
++{
++	size_t n, i;
++
++	if (p >= end) {
++		return 0;
++	}
++	if (p[0] < 0x80) {
++		*len = p[0];
++		return 1;
++	}
++	n = p[0] & 0x7f;
++	if (n == 0 || n > 4 || (size_t)(end - p) < 1 + n) {
++		return 0;
++	}
++	*len = 0;
++	for (i = 0; i < n; i++) {
++		*len = (*len << 8) | p[1 + i];
++	}
++	return 1 + n;
++}
++
++/*
++ * Find SEQUENCE { UTF8String key, INTEGER v } in a DER SET/SEQUENCE of
++ * such pairs (the libaks configuration and state dictionaries). Returns 1
++ * and v (non-negative values up to 32 bits) when found.
++ */
++NKS_STATIC int
++nks_der_find_int(const uint8_t *buf, size_t len, const char *key, uint32_t *v)
++{
++	const uint8_t *p = buf, *end = buf + len;
++	size_t klen = strlen(key), l, h;
++
++	if (len < 2 || (p[0] != 0x31 && p[0] != 0x30)) {
++		return 0;
++	}
++	h = nks_der_len(p + 1, end, &l);
++	if (h == 0 || l > (size_t)(end - (p + 1 + h))) {
++		return 0;
++	}
++	p += 1 + h;
++	end = p + l;
++	while (p < end) {
++		const uint8_t *item, *iend;
++		if (p[0] != 0x30) {
++			return 0;
++		}
++		h = nks_der_len(p + 1, end, &l);
++		if (h == 0 || l > (size_t)(end - (p + 1 + h))) {
++			return 0;
++		}
++		item = p + 1 + h;
++		iend = item + l;
++		p = iend;
++		/* key */
++		if (item >= iend || item[0] != 0x0c) {
++			continue;
++		}
++		h = nks_der_len(item + 1, iend, &l);
++		if (h == 0 || l > (size_t)(iend - (item + 1 + h))) {
++			continue;
++		}
++		if (l != klen || memcmp(item + 1 + h, key, klen) != 0) {
++			continue;
++		}
++		item += 1 + h + l;
++		/* value */
++		if (item >= iend || item[0] != 0x02) {
++			return 0;
++		}
++		h = nks_der_len(item + 1, iend, &l);
++		if (h == 0 || l == 0 || l > 5 || l > (size_t)(iend - (item + 1 + h))) {
++			return 0;
++		}
++		item += 1 + h;
++		if (item[0] & 0x80) {
++			return 0;               /* negative */
++		}
++		if (l == 5 && item[0] != 0) {
++			return 0;
++		}
++		uint64_t x = 0;
++		for (size_t i = 0; i < l; i++) {
++			x = (x << 8) | item[i];
++		}
++		*v = (uint32_t)x;
++		return 1;
++	}
++	return 0;
++}
++
++/* Append SEQUENCE { UTF8String key, INTEGER value } (key below 100 bytes). */
++NKS_STATIC size_t
++nks_der_pair(uint8_t *p, const char *key, uint32_t value)
++{
++	size_t klen = strlen(key), n = 0, ilen = 1;
++	uint8_t ib[5];
++
++	/* minimal two's complement, positive */
++	ib[0] = 0;
++	ib[1] = (uint8_t)(value >> 24);
++	ib[2] = (uint8_t)(value >> 16);
++	ib[3] = (uint8_t)(value >> 8);
++	ib[4] = (uint8_t)value;
++	{
++		size_t s = 1;
++		while (s < 4 && ib[s] == 0) {
++			s++;          /* drop leading zero bytes, keep the last one */
++		}
++		if (ib[s] & 0x80) {
++			s--;          /* a leading 0 keeps the value positive */
++		}
++		ilen = 5 - s;
++		memmove(ib, ib + s, ilen);
++	}
++	p[n++] = 0x30;
++	p[n++] = (uint8_t)(2 + klen + 2 + ilen);
++	p[n++] = 0x0c;
++	p[n++] = (uint8_t)klen;
++	memcpy(p + n, key, klen);
++	n += klen;
++	p[n++] = 0x02;
++	p[n++] = (uint8_t)ilen;
++	memcpy(p + n, ib, ilen);
++	n += ilen;
++	return n;
++}
++
++#endif /* NEGRONI_KEYSTORE_CORE_H */

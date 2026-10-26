@@ -1,4 +1,4 @@
-# AKS, AMFI and Sandbox patches (0220-0223)
+# AKS, AMFI and Sandbox patches (0220-0223, 0221-aks-passcode)
 
 These patches change the in-kernel stand-ins for AppleKeyStore, AMFI and Sandbox on negroni
 (OnePlus 10 Pro, NE2211, iOS 16.7.16 20H392). All code is for the NEGRONI machine config only
@@ -10,6 +10,7 @@ Base: branch `base` of `out/kernel/xnu` (xnu-8796.141.3 + dxb + slop negroni pat
 | Patch | Changes | Boot-arg to undo |
 |---|---|---|
 | `0220-negroni-aks-no-passcode.patch` | AKS answers "no passcode", key wrap/unwrap, quieter log | `negroniaks=` (bits), `negroniaks_log=1` |
+| `0221-negroni-aks-passcode.patch` | AKS software keybag: set / change / remove a passcode, lock screen, survives reboots (section "0221 passcode" below) | `negroniaks=3` (bit 2 off), `negroniaks_reset=1` (forget the passcode for one boot) |
 | `0221-negroni-amfi-policy.patch` | MAC policy named `AMFI` (ops 0x5a, 0x60), `AppleMobileFileIntegrity` IOService | `negroniamfi=` (bits), `negroniamfi=0` = all off |
 | `0222-negroni-sandbox-privileges.patch` | Sandbox grants privileges 1002, 1007, 12000 to system code | `negronisandbox=0` |
 | `0223-negroni-sandbox-appex-container.patch` | Sandbox op 4 gives app extensions a container path | `negroniappex=0` |
@@ -224,3 +225,206 @@ Reference: ios-sailfish `xnu/patches/0110-sailfish-sandbox-container-path-appex.
   `/private/var/mobile/Library/Caches/com.apple.LaunchServices-*` (needs a root change; ask first).
 - `docs/boot-speed.md` rows "AKS lock state..." and "AMFI policy named AMFI..." can move to
   "patch ready, needs a kernel build" after these are committed.
+
+## 0221 passcode: software keybag (`0221-negroni-aks-passcode.patch`)
+
+Files: `iokit/Kernel/arm/NegroniKeyStore.cpp`, new `iokit/Kernel/arm/NegroniKeyStoreCore.h` (plain C: hash, compare,
+blob, DER integers). The file name sorts before `0221-negroni-amfi-policy.patch`, so it applies directly on 0220.
+Owner report (2026-10-27): "passcodes can't be turned on at all". Settings > Passcode > Turn Passcode On failed.
+
+### Why it failed [V]
+
+- keybagd changes the passcode with `aks_change_secret` = selector 15. 0220 answered `kIOReturnUnsupported` for 15
+  (and for 3, 5 with a real handle, 6, 30, 42, 87, 105). No boot log has a `sel 15` line [V: grep of all
+  logs/usblog-*.txt], so the owner's try probably stopped earlier or in a boot without a log [I]; in any case keybagd
+  could not succeed without selector 15.
+- 0220 always answered "no passcode" (lock state 0x6, sls 3). `MCPasscodeManager isPasscodeSet` is
+  `MKBGetDeviceLockState() != 3` [V: ManagedConfiguration 20H392, `-[MCPasscodeManager isPasscodeSet]`], so even a
+  successful change would show "off".
+
+### Call chain and selector map [V: disassembly of the 20H392 dyld cache and keybagd]
+
+Tools: `ipsw dyld disass out/dsc/cache/dyld_shared_cache_arm64 --image AppleKeyStore|MobileKeyBag|ManagedConfiguration`,
+`ipsw macho disass` of `/usr/libexec/keybagd`, `/usr/libexec/profiled` and
+`/System/Library/UserEventPlugins/MobileKeyBagLockState.plugin` from `~/op10-apple/ios16-root.img` (attached read-only).
+The output is in `out/aks/` (git-ignored).
+
+Settings -> `MCProfileConnection changePasscodeFrom:to:outError:` -> XPC `changePasscode:oldPasscode:completion:` to
+profiled -> `MCPasscodeManagerWriter changePasscodeFrom:to:outError:` (restriction check, `isDeviceUnlocked` = sls 0
+or 3, passcode history, then) `MKBKeyBagChangeSystemSecret(old, new, opaque)` -> XPC to keybagd
+`-[KBXPCService changeSystemSecretfromOldSecret:...]` (entitlement `com.apple.keystore.device`) ->
+`KBChangeSystemSecret` (keybagd 0x100003c88) -> `KBChangeSystemNonSeSecret` (0x1000059f0). libaks is linked
+statically into keybagd. Every libaks call is `IOConnectCallMethod` on `AppleKeyStore`:
+
+| Sel | libaks function | In | Out | Caller / use |
+|---|---|---|---|---|
+| 2 | `aks_create_bag` | 6 scalars {type, -1, pass ptr, pass len, 0, 0} | 1 scalar handle | user bags (not on our path) |
+| 3 | `aks_save_bag` | 1 scalar {handle} | struct, 32 KiB buffer (out of line) | keybagd `KBSaveSystemBagHandle` |
+| 4 | `aks_unload_bag` | 1 scalar {handle} | - | after set_system |
+| 5 | `aks_set_system(_with_passcode)` | 4 scalars {handle, system handle, pass ptr, pass len} | - | boot load, passcode change |
+| 6 | `aks_load_bag` | struct = blob | 1 scalar handle | keybagd `load_devicebag` |
+| 7 | `aks_get_lock_state` | 1 scalar {handle} | 1 scalar | everybody |
+| 8 / 32 | `aks_lock_device(handle, now)` | 1 scalar | - | SpringBoard `lockSkippingGracePeriod:` (32 = "LockDeviceNow") |
+| 9 | `aks_unlock_device` | 3 scalars {handle, pass ptr, pass len} | - | SpringBoard `MKBUnlockDevice` |
+| 12 | `aks_unlock_bag` | 3 scalars {handle, pass ptr, pass len} | - | - |
+| 13 | `aks_lock_bag` | 1 scalar | - | - |
+| 14 | `aks_get_system` | 0 or 1 scalar | 1 scalar handle; `kIOReturnNotFound` = load the file (0221 never answers it) | keybagd |
+| 15 | `aks_change_secret(_se)` | 11 scalars {handle, flags, 0xff, old ptr, old len, new ptr, new len, 0, 0, 0, 0} | 1 scalar handle | keybagd |
+| 17 / 35 | `aks_get_(extended_)device_state` | 1 scalar | DER, 4 KiB buffer | `MKBGetDeviceLockState` = "sls" |
+| 30 | `aks_set_configuration` | 3 scalars {handle, DER ptr, DER len} | - | `MKBDeviceSetGracePeriod` ("gp") |
+| 31 | `aks_get_configuration` | 1 scalar | DER, 32 KiB buffer | profiled, SpringBoard ("mua") |
+| 42 | `aks_verify_password` | 1 scalar + struct {u32 count; per item u32 len, bytes padded to 4} | - | `MKBVerifyPasswordWithContext` |
+| 87 | `aks_invalidate_bag` | struct = old blob | - | after a change (failure only logged) |
+| 105 | `aks_change_secret_epilogue` | 3 scalars {handle, new ptr, new len} | - | after set_system |
+
+Passcode pointers are user addresses in the calling process (keybagd, SpringBoard); the kernel reads them with
+`copyin`. Other selectors that keybagd links (stash 0x21-0x25, SE 0x45-0x5f, personas 0x60-0x62, backup 0x14-0x16,
+0x6e-0x71) are not on the passcode path and stay unsupported.
+
+`KBChangeSystemSecret` with system handle 0: reads systembag.kb (old blob), asks the lock state; bit 13 (SE bound)
+clear -> non-SE path; `KBisxARTBasedKeyBag` = lock state bit 22, clear -> "two phase":
+`change_secret(0, old, new, flags 4)` -> new handle T; `KBSaveSystemBagHandle(T)` = `save_bag(T)` and write
+`/private/var/keybags/systembag.kb` = plist {KeyBagKeys = blob, KeyBagVersion}; plain plist because the ADT has
+`/defaults no-effaceable-storage` (slop mkadt.py); `set_system(T, 0, new)`; `change_secret_epilogue(0, new)`;
+`unload_bag(T)`; `invalidate_bag(old blob)`. keybagd maps 0xe00002e2 and 0xe00002ce to "-3 wrong passcode".
+
+Boot: keybagd `load_devicebag`: `get_system` -> if 0xe00002f0 (NotFound): read systembag.kb, `load_bag(KeyBagKeys)`
+-> h, `set_system(h, 0, NULL, 0)`, `unload_bag(h)`, `get_system` again. Any failure there calls
+`FATAL KEYBAG ERROR` -> NVRAM `auto-boot=false` + `reboot()` [V: keybagd 0x100012228].
+
+Lock events: `MobileKeyBagLockState.plugin` (UserEventAgent) registers `IOGeneralInterest` on AppleKeyStore.
+Message 0xe3ffd00d -> `notify_post("com.apple.mobile.keybagd.lock_status")`; 0xe3ffd00f -> post
+`com.apple.mobile.keybagd.first_unlock` once (selectors 103 / 102); 0xe3ffd00c -> passcode threshold. At its
+start it posts first_unlock only when lock state bit 2 (unlocked since boot) is set.
+
+### What 0221 does
+
+- Software keybag: system bag (handle 0; every handle outside 0x1000-0x1fff, e.g. the device handle -3) + 16
+  temporary bags (handle 0x1000 + generation * 16 + slot; a stale or unknown temporary handle is refused). A bag holds: passcode set yes/no,
+  PBKDF2 iterations (20000), random 16-byte salt (`read_random`), 32-byte PBKDF2-HMAC-SHA256 hash, grace period,
+  UUID. The passcode itself is never stored or logged; buffers are zeroed after use; compare is constant time.
+- Blob for keybagd (128 bytes, `NegroniKeyStoreCore.h`): "NAKS", version 1, flags, iterations, grace, salt, hash,
+  UUID, SHA-256 checksum. `load_bag` (6) never fails: a foreign blob (slop's "SWEET"), a damaged blob or
+  `negroniaks_reset=1` gives a bag without a passcode, and the log says which.
+- Boot load: `get_system` (14) always answers handle 0, as 0220 did. It never answers kIOReturnNotFound, so keybagd
+  never takes its own file-load path (`load_devicebag`), where any failure is `FATAL KEYBAG ERROR` + reboot. At
+  keybagd's first selector 14 (once per boot) the kernel reads `/private/var/keybags/systembag.kb` itself
+  (`vnode_lookup` first: only a regular file is opened, never a FIFO or a device; then `vnode_open` with
+  `O_NOFOLLOW | O_NONBLOCK` + `vn_rdwr` in keybagd's thread and credentials, type checked again, no symlink, max 64 KiB; `systembag.kb.writing` when the file is
+  missing or empty, as keybagd does) and searches it for a valid blob of ours (`nks_find_blob`: raw bytes = binary
+  plist, which keybagd writes with `CFPropertyListWrite` format 200; base64 in `<data>` = XML plist). No file, a
+  read error, slop's "SWEET", a damaged blob or `negroniaks_reset=1` = a bag without a passcode. So with no passcode
+  the boot path is exactly the 0220 one.
+- Lock state: no passcode -> 0x6 / sls 3 as in 0220. Passcode set: bit 0 locked, bit 2 unlocked since boot;
+  sls 0 unlocked, 1 locked. After a boot with a passcode: 0x1 / sls 1 until the first unlock.
+- `change_secret` (15) checks the old passcode (no passcode: anything), hashes the new one with a new salt; empty
+  new passcode = passcode off. Flag 4 puts the result in a new temporary bag, else in place.
+- `unlock_device` (9) / `unlock_bag` (12) / `verify_password` (42): wrong passcode -> 0xe00002e2
+  (kIOReturnNotPermitted). Wrong passcodes at 9 / 12 count (since the last unlock; a reboot clears the count).
+  Device state "sfa" reports at most 9 = "mua" - 1: SpringBoard
+  (`-[SBFUserAuthenticationModelSEP _refreshStateForMkbState:notify:]`) marks the device permanently blocked
+  ("connect to iTunes"), or asks for a wipe with "Erase Data" on, when sfa >= mua (10) [V: SBF disassembly]. So
+  wrong passcodes never block or erase the phone. Backoff "sb" stays 0: no kernel delays, no "try again in N
+  minutes" (a lock-screen gate only, see Security). `verify_password` reads only the first packed item (the
+  passcode), so a large second item does not fail the call.
+- `lock_device` 32 and `lock_bag` lock now; 8 locks after the grace period from `set_configuration` "gp"
+  (0 = now; the deadline uses `mach_continuous_time`, checked when somebody asks the state).
+- Only keybagd may use the selectors that change or export bags (2, 3, 5, 6, 15, 87, 105); others get the 0220
+  answer (5: success without a change; the others kIOReturnUnsupported) and a log line
+  `<proc> may not use selector N (keybagd only): 0220 answer` (first 10). Unlock, lock, verify and configuration
+  stay open (SpringBoard, Settings).
+- Interest messages 0xe3ffd00d on every lock state change and 0xe3ffd00f at the first unlock after boot, sent
+  after the AKS lock is dropped.
+- Log lines (always): `keybagd: system bag from /private/var/keybags/systembag.kb (N bytes, error E): ...,
+  lock state 0x..`, `system bag set (passcode set|no passcode, change, lock state 0x..)`,
+  `change secret: passcode set|removed`,
+  `change secret: old passcode wrong`, `unlock: wrong passcode (n since the last unlock)`, `unlocked (first unlock
+  since boot)`, `grace period N s`.
+- Boot-args: `negroniaks` bit 2 (default on; default mask is now 7): clear = 0220 behaviour (no passcode,
+  selector 14 always a handle, passcode selectors unsupported). `negroniaks_reset=1`: the loaded bag counts as
+  "no passcode" for this boot.
+
+**Security.** This is a lock-screen gate, not data protection. There is no SEP and no hardware key: class keys
+(wrap/unwrap 10/11, 0220) do not depend on the passcode, files are not encrypted (HFS+ without cprotect), and
+the salt + hash are in a plain plist in /private/var/keybags. With root (SSH) a 6-digit passcode can be found by a
+brute force of 10^6 PBKDF2 runs. Do not enable "Erase Data" (keybagd/SpringBoard wipe logic is not tested here).
+
+Review 2 (Opus, 2026-10-27): defects fixed. D1: the keybagd file-load path (14 = NotFound) ran on every boot
+because the root has slop's systembag.kb ("SWEET"), so 0221 changed the boot with no passcode, and any keybagd
+failure there = FATAL KEYBAG reboot loop; now the kernel reads the file (above). D2: "sfa" could reach "mua" ->
+SpringBoard permanent block or wipe request; now capped at 9. D3: `verify_password` refused a packed input over
+648 bytes; now reads a prefix. D4: other processes got kIOReturnNotPrivileged where 0220 answered; now the 0220
+answer. Host test extended: blob search in binary/XML plists (python3 plistlib), damaged/SWEET/3000 random files,
+built with ASan + UBSan.
+
+Review (Fable, low effort): ACCEPT WITH FIXES. Applied: stale/unknown temporary handles refused + generation in
+the handle (F1), keybagd-only gate (F2), zeroing on a copyin error (F3). Not changed: the grace-period lock is
+noticed at the next state query (F4; SpringBoard asks often); selector 23 keeps the fixed UUID (F5; securityd may
+cache it); "Erase Data" note above (F6: device state reports the failed count, "mua" is 10).
+
+Host test: `scripts/kernel/test-aks-core.sh` takes `NegroniKeyStoreCore.h` out of the patch and runs
+`tools/aks-core-test/aks_core_test.c`: HMAC (RFC 4231 + 200 random cases vs CommonCrypto/OpenSSL), PBKDF2 (RFC 7914
++ 6 cases vs `CCKeyDerivationPBKDF`/`PKCS5_PBKDF2_HMAC`), set/verify (right, wrong, empty, prefix, longer), blob
+round trip, 128 one-bit corruptions refused, "SWEET" refused, DER integers 0..0xffffffff, blob search in a
+keybag file (binary + XML plist from python3 plistlib found; damaged, truncated, SWEET, 3000 random files refused).
+Built with AddressSanitizer + UBSan when the compiler has them.
+
+### Test steps for the owner
+
+1. Boot the image with this kernel. Log (make usblog / grep -a 'NEGRONI AKS'): `AppleKeyStore registered (...
+   passcode on)`, `keybagd: system bag from /private/var/keybags/systembag.kb (N bytes, error 0): no NEGRONI bag
+   in it: no passcode, lock state 0x6` (slop's "SWEET"). No `sel 6` line at boot. The phone boots as before, no
+   lock screen passcode.
+2. Settings > Passcode (Face ID & Passcode / Touch ID & Passcode) > Turn Passcode On, enter a passcode twice.
+   Expect `change secret: passcode set (handle 0x0 flags 0x4 -> 0x10..)`, `sel 3` (save), `system bag set (passcode
+   set, change, lock state 0x4)`. Settings shows "Turn Passcode Off" / "Change Passcode".
+3. Lock with the side button, wake: the lock screen asks for the passcode. A wrong one: `unlock: wrong passcode`.
+   The right one opens.
+   Check the file: `scripts/net/ssh-phone.sh 'ls -l /private/var/keybags/'` (systembag.kb changed now).
+4. Reboot (`scripts/net/ssh-phone.sh reboot`). Expect `keybagd: system bag from ... (N bytes, error 0): passcode
+   set, lock state 0x1`. The lock screen asks before the first unlock; after it:
+   `unlocked (first unlock since boot)`. Wrong passcodes 10+ times: still asks, never "disabled".
+5. Settings > Passcode > Turn Passcode Off, enter the passcode: `change secret: passcode removed`, lock state 0x6.
+   Reboot: `keybagd: system bag from ...: no passcode, lock state 0x6`.
+If step 2 still fails: send the log lines with `NEGRONI AKS` and `/var/logs/keybagd.log` if it exists
+(`scripts/net/ssh-phone.sh pull /var/logs/keybagd.log logs/`).
+
+### Recovery (never locked out)
+
+- Forget the passcode for one boot: add `negroniaks_reset=1` to the boot-args (fastboot boot). The lock screen does
+  not ask. To make it permanent: Settings > Turn Passcode On with a new passcode, then Turn Passcode Off (keybagd
+  writes a bag without a passcode), or keep the new passcode.
+- Turn all of 0221 off: `negroniaks=3` (the 0220 behaviour: no passcode; keybagd does not load the file).
+- Over SSH (dropbear runs as root and does not wait for an unlock [I]): `scripts/net/ssh-phone.sh 'rm -f
+  /private/var/keybags/systembag.kb /private/var/keybags/systembag.kb.writing'`, then reboot. Without the file the
+  kernel uses a bag without a passcode; keybagd still gets handle 0 (it never reads the file at boot).
+- A forgotten passcode or a lock screen that does not accept it: reboot (the failure count is in RAM only), or boot
+  once with `negroniaks_reset=1` / `negroniaks=3`.
+
+### Risks
+
+- [I] The kernel reads the file at keybagd's first selector 14 (keybagd --init, `load_devicebag`). If /private/var
+  is not mounted then, the read fails and the passcode is off for that boot (fail-open, logged with the error).
+- [I] The XPC handle for the change is 0 or -3 (`keybagd 0x1000123d0`, persona check). With -3 keybagd saves to the
+  user bag path, not systembag.kb: the passcode would work until the next reboot and then be gone (fail-open).
+- [V] keybagd uses `LockoutState.plist` only in `MKBDeviceLockModelEducationalMode` (shared iPad), not here. The
+  SpringBoard lock model reads sfa / sb / mua from AKS: with sfa capped at 9 and sb 0 it never blocks.
+- [I] Daemons that wait for the first unlock (class C keychain items, `first_unlock` notification) now wait after a
+  reboot with a passcode until the owner unlocks. That is the iOS behaviour; SSH (dropbear, root) does not wait.
+- Not verified on the phone: everything in this section is from disassembly and a host test.
+
+### wifid "device hasn't been unlocked since boot" (2026-10-27 phone log, kernel with 0220)
+
+[V] wifid (`/usr/sbin/wifid`, 20H392) keeps `manager->unlockedSinceBoot` (manager + 0x528). `WiFiManagerCreate`
+sets it from a global that is not from AKS (false), so the first `WiFiManagerSetPowerExt` always logs "hasn't been
+unlocked since boot. Overriding power state to OFF". `WiFiManagerScheduleWithQueue` then calls
+`MKBUserUnlockedSinceBoot(0)` = `aks_get_lock_state(0)` (selector 7) bit 2, and on true logs "First unlock since
+launch" and turns Wi-Fi on; the `com.apple.mobile.keybagd.lock_status` handler does the same later. With 0220
+(0x6) the answer is already true: logs/phone-log-20261027-025305.txt has "First unlock since launch",
+"Turning WiFiManager ON" and "unlockedSinceBoot TRUE" at 14:24:26. The 50 s gap (14:23:36.43 -> 14:24:26.18) is a
+stall inside `WiFiManagerScheduleWithQueue` before its first log line, not the AKS answer [I: the last wifid line
+before it is "The connection to ACDAccountStore was invalidated" at 14:24:21].
+With 0221: no passcode = 0x6 from boot (bit 2 set); with a passcode bit 2 is set at the first unlock, and the kernel
+sends 0xe3ffd00d (-> lock_status, wifid re-checks) and 0xe3ffd00f (-> first_unlock). bluetoothd, locationd and apsd
+use the `com.apple.mobile.keybagd.first_unlock` notification (locationd also lock_status) [V: strings]; the
+UserEventAgent plugin posts it at its start when bit 2 is set, else on 0xe3ffd00f. No code change was needed.

@@ -2765,6 +2765,21 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Build: out/kernel/local-20261026-212112/kernel.development.negroni sha256
   32093879e909256fb806aa2310a97044b79207af3d3f275766639a7e5d80f964 (254 applied; only the 4 dxb skips; link
   out/kernel/kernel.macho). Not run on the phone; no image built. Owner test and recovery steps: README.
+- Review 2 (Opus, 2026-10-27), fixes in the patch: [V] the root has slop's systembag.kb ("SWEET", root-macos.sh), so
+  the old 0221 sent keybagd into its untested file-load path (14 = NotFound) on every boot, also with no passcode;
+  any keybagd failure there = FATAL KEYBAG reboot loop. Now 14 always answers handle 0 (as 0220) and the kernel reads
+  systembag.kb itself at keybagd's first 14 (`nks_find_blob`: binary plist raw bytes, keybagd writes format 200
+  [V: keybagd 0x10000c664]; XML base64). [V] SpringBoard blocks permanently / asks for a wipe when sfa >= mua
+  (`SBFUserAuthenticationModelSEP _refreshStateForMkbState:`): sfa now capped at 9. verify_password reads a prefix;
+  non-keybagd callers of bag selectors get the 0220 answer. [V] LockoutState.plist is educational mode only.
+- Review 3 (Opus, 2026-10-27): [V xnu source] `fifo_open` sleeps until a writer comes when FREAD is set without
+  O_NONBLOCK; the kernel holds the AKS lock during the file read, so a FIFO at systembag.kb (root userland) hung
+  keybagd and every AKS caller. Fix: `vnode_lookup` NOFOLLOW first, open only a regular file, `O_NONBLOCK` on the
+  open, type checked again. Parser (`nks_find_blob`: no offset table is read, raw scan + bounded base64), DER
+  reader, lock order (no vnode path calls AKS; no cprotect wraps registered) and the no-passcode boot answers
+  (14, 7, 17, 31 the same bytes as 0220) checked: no other defect.
+  Build: out/kernel/local-20261026-225642/kernel.development.negroni sha256 da5a7e794df427d2028e7b4a5e43d3df5bd05e4a08b4e22c45a6ab376f8fe9ac
+  (only the 4 dxb skips; link out/kernel/kernel.macho). Host test pass. Not run on the phone.
 
 ## 45. apps-SMMU stage-1: SEA panic on the CBAR restore; writers default OFF; refusable accesses + bank probe (2026-10-27, SMMU kernel agent; patches 0249, 0297, 0317; details patches/xnu/README-camera.md "2026-10-27: panic ...")
 
@@ -2925,7 +2940,7 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   `glink: start ... ICL per adapter type on` at 03:51:00, Mac lost the device at 03:51:02 (same as 03:20 with 1500 mA):
   the drop comes ~2 s after our charger GLINK client starts, before any input-limit write. Next: negronichg_wr=0.
 
-## 2027. USB: reboot when the host stays lost, boot-arg negroniusb_lost_reboot=S (2026-10-27, kernel agent; patch 0371, details patches/xnu/README-usb.md "0371")
+## 54. USB: reboot when the host stays lost, boot-arg negroniusb_lost_reboot=S (2026-10-27, kernel agent; patch 0371, details patches/xnu/README-usb.md "0371")
 
 - [V] Why: with the ADSP on, the Mac lost the device for good ~2 s after the charger GLINK channel started (boots
   03:20:28, 03:51:02); the phone kept running and could not be reached. boot_a holds a known-good image.
@@ -2936,3 +2951,104 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Build: out/kernel/local-20261026-222425/kernel.development.negroni sha256
   5ba022127aa9f50bdefb5ef0dadac4beb92fafb280376b3c8400ed4ce36a13ba (264 applied incl. 0371; only the 4 dxb skips;
   link out/kernel/kernel.macho). Not run on the phone; no image built.
+
+## 51. watchdogd SIGTRAP every ~10 s = kern.bootargs ENOMEM after 0363 (2026-10-27, kernel agent; patch 0378)
+
+- [V log] With long boot-args (t1/t2/t4/t6, everything-0363: 798-876 bytes), each watchdogd start crashes at once:
+  `CRASH watchdogd sig 5 code 0x600000001` (EXC_BREAKPOINT), pc = mh + 0xb620, bt mh+0x792c, libdispatch
+  `_dispatch_client_callout` / `_dispatch_once_callout`, mh+0x78c4, mh+0xa730, mh+0x7490, dyld `start`. No
+  `NEGRONI WDT: watchdogd sel 0` line in these boots: it dies before IOServiceOpen. With 444-byte boot-args (pre-0363
+  kernel, usblog-20261026-131747) there is no crash: `sel 0 ... -> ok`, then one more exec 10 s later.
+- [V disasm] watchdogd (20H392, from the root image, 152816 bytes, sha256 7951d706d73f906b5e0a139b09c05982385469b46e872d75da5da53c1fc4b1e1):
+  the dispatch_once block at 0x1000078c8 calls `sysctlbyname("kern.bootargs", buf, &len = 0x260, NULL, 0)`. On
+  error it calls 0x10000b5e8: log "could not retrieve device boot-args, failed with error: %s", then
+  `_os_crash("could not retrieve device boot-args")` + `brk #1` at 0x10000b620 = the crash pc.
+- [V code] xnu `sysctl_sysctl_bootargs` uses `sysctl_io_string(..., trunc 0)`: a buffer smaller than strlen+1 gives
+  ENOMEM. 0363 set BOOT_LINE_LENGTH 1024, so a command line of 608 bytes or more no longer fits the 608-byte buffer
+  that iOS 16 user space uses. Before 0363 the kernel cut the line at 607 bytes, so it always fitted.
+- Not the IOWatchdog service: slop 0040/0045 (`NegroniWatchdog.cpp`) answers every selector and arms nothing.
+- [V disasm] watchdogd then checks `wdt_test=no_user_checkin` with strnstr ("watchdogd detected testing boot-args to
+  not run, exiting"); this boot-arg is at byte ~150, so the 607-byte prefix keeps it.
+- Fix 0378 (`patches/xnu/0378-negroni-bootargs-truncate.patch`): kern.bootargs uses trunc 1: a too-small buffer gets
+  the first oldlen-1 bytes + NUL (the same bytes the 608-byte kernels gave); a size query still gets the full length.
+  The first 8 truncations log `NEGRONI: kern.bootargs truncated to N of M bytes for <proc>`. No hardware access.
+  Other daemons with 608-byte buffers get the same fix [I].
+- How the binary was found (no DMGs on the Mac): scan the raw chunks of `~/op10-apple/ios16-root.simg` for
+  "IOServiceOpen failed with error", take the Mach-O header (0xfeedfacf) before it at a 4 KiB boundary, length from
+  LC_SEGMENT_64/LC_CODE_SIGNATURE (the file is contiguous in the HFS+ image).
+- Phone test: RAM-boot an image with this kernel and long boot-args (>= 608 bytes, e.g. the everything variant). Expect
+  `NEGRONI: kern.bootargs truncated to 607 of N bytes for watchdogd`, no `CRASH watchdogd`, and the
+  `NEGRONI WDT: watchdogd sel 0` line (or a clean exit by no_user_checkin) as in the short-args boots.
+- Build [V]: out/kernel/local-20261026-224120/kernel.development.negroni sha256
+  81f4378235d08c0332fcefe89220a17d9bf5ddd52f05a9b85c8392e6dc150698 (265 applied incl. 0378; only the 4 dxb skips; link
+  out/kernel/kernel.macho; the tree also had the uncommitted 0221-aks-passcode and 0335-0337 BT patches). Not booted; no image.
+
+## 52. Camera step 14: TCR2 readback 0x38071 = TBI0/TBI1; helper readback = owned fields (2026-10-27, SMMU kernel agent; patch 0379, details patches/xnu/README-camera.md "0379")
+
+- [V log] negronicam=7 negronicam_smmu=3 (kernel local-20261026-222425): claim of context 7 accepted, SMR112 -> 7, then
+  `SMMU context 7 TCR2 reads 0x38071 after writing 0x38011` -> errno 1 (EPERM), stream entries put back.
+- [V log] The same 0x38071 readback on Wi-Fi bank 6 (t6, accepted by the 0325 mask rule, DMA worked) and on Adreno
+  banks 13/19 (2026-10-25/26 usblogs). Wi-Fi bank 6 SCTLR reads 0x107 after 0x1107 (ASIDPNE not kept).
+- [V spec] SMMUv2 TCR2 = TCR_EL1[63:32]: PASIZE 2:0, AS 4, TBI0 5, TBI1 6, SEP 17:15. Bits 5/6 = top byte ignore.
+- [I] The MMU-500 or Gunyah forces TBI0/TBI1 to 1. No effect: our IOVAs have a zero top byte.
+- Fix 0379 (negroni_smmu_s1.c, used by camera 0317 and audio 0249): compare only owned fields (TCR2 0x3801f, TCR
+  0xc0ffbf, TTBR0 all, MAIR0 0xff, SCTLR M, S2CR 0x300ff, SMR all, CBA2R bit 0, CBAR 0x300ff); print other
+  differences as `bits X differ outside the fields we own Y; accepted`. Claim code unchanged (same as 0325, accepted).
+  Wi-Fi file not edited. compile-one OK; full build: logs/kbuild-camtcr2.log.
+- Next test expects: `SMMU context 7 TCR2 reads 0x38071 after writing 0x38011: bits 0x60 differ outside the fields
+  we own 0x3801f; accepted`, [I] `SCTLR reads 0x27 after writing 0x1027: bits 0x1000 ...; accepted`, then
+  `SMMU SMR112 = 0x84600800, S2CR112 = 0x7` and `SMMU context 7 ON`.
+
+## 53. Wi-Fi SBL never reaches MHI READY: ath11k power-up reset + PCIe/WLAON boot dump (2026-10-27, Wi-Fi kernel agent; patches 0342, 0343, details patches/xnu/README-wifi.md "0342-0343")
+
+- [V] t6 and the 0339 boot: BHI SBL DONE at IOVA 0xa0010000, no SMMU fault, then EE 0 and MHISTATUS 0 for 30 s;
+  `no SBL log (start 0 size 0x30 ...)` = PCIE_BHI_ERRDBG2 is 0. The full 0339 dump of that boot is not in the repo.
+- [V source] Image (first 512 KiB of amss20.bin, fbc), file name (major 2 -> amss20.bin), BHI register order, the
+  32-bit IOVA and the SBL-log read all match cnss2/MHI. The one Linux step we skip: ath11k_pci_sw_reset(ab, true)
+  (LTSSM, PCIE_INT_ALL_CLEAR, QFPROM, BHIe vectors, WLAON_WARM_SW_ENTRY = 0, reset cause, SOC_GLOBAL_RESET, MHICTRL
+  RESET). cnss2 skips it but power-cycles all rails; we never cycle the aon rail.
+- [I] Best guess: a latched PCIe hot-reset/link-down interrupt (ath11k: "SBL will open Interrupt ... and crash
+  immediately") or a stale WLAON warm-boot entry (ath11k: "warm path ... dead loop").
+- 0342 `negroniwlan_swreset=0|1|2` (default 0): 1 = the clears, 2 = + SoC global reset + MHICTRL RESET. 0343
+  `negroniwlan_bootdbg` (default 1, read only): PCIe/WLAON/host-PCIe lines + a verdict in every BOOT dump.
+- Test order: (1) 0343 only, (2) `negroniwlan_swreset=1`, (3) `=2`; all with `negroniwifi=10 negroniwlan=10
+  negroniwlan_smmu=3`. Build log: logs/wlansbl-kbuild.log.
+
+## 55. USB lost ~3 s after ADSP up: the ADSP votes the USB PHY rails, APPS has no vote; charger PD log (2026-10-27, kernel agent; patches 0372, 0373, details patches/xnu/README-usb.md "0372", "0373")
+
+- [V] t12 (`negronichg_wr=0`) and t13 (`negronichg_glink=0`, 03:58:26 up, 03:58:29 gone) drop like t11: the ADSP
+  causes the drop alone, not our charger client. t13: no line after the drop reached the Mac; the 0371 reboot brought
+  the phone back (new boot at 04:00:21). So the 0366 soft reconnects and the 0368 PHY re-inits did not help.
+- [V] t11: the ADSP acked our PMIC_RTR open at 03:51:00, its own OPEN (= charger PD start) had not come before the drop.
+- [V] adsp.b14 strings: PMIC rail resources `/pm/ldob2|ldob5|ldob6|ldoc1` (`/en`, `/mode`, `/mV`). live.dts: HS PHY
+  vdd = ldob5 (0.88 V), vdda18 = ldoc1 (1.8 V), vdda33 = ldob2 (3.072 V); SS PHY core = ldob6 (1.2 V). The DT rails have
+  `qcom,set = 3`, init-voltage, init-mode HPM: Linux votes them from APPS at probe. XNU sends no vote for them.
+- [V] adsp.b14 also: `charger_detection_inital_detection: adsp rerun status`, `rerun_apsd`, `TypecModeAsSink`,
+  `oplus_set_otg_switch_status::set typec_mode = drp|sink_only`, `Sent Hard Reset Signal`, `Data Role Changed`.
+- [I] Cause candidate 1 (best fit): the charger PD releases its rail votes after its detection; with no APPS vote RPMh
+  turns the PHY's analog rails off/LPM. Registers still read (0368 saw nothing), soft reconnect cannot help, only a
+  reboot restores them. Candidates 2/3: PD Hard Reset / Type-C role change, or the APSD rerun with our pull-up on.
+- 0372: `negroniusb_rails` 0 off, 1 (default) log the 4 LDOs' PMIC registers (SPMI observer reads, new allowlist
+  entries SID 1 0x41/0x44/0x45, SID 2 0x40, offsets 0x08/0x40/0x41/0x45/0x46) at ADSP start/up and every 50 ms to up + 30 s,
+  2 = also APPS RPMh votes (ldob5 880, ldoc1 1800, ldob2 3072, ldob6 1200 mV, HPM) before PAS auth-and-reset.
+- 0373: `negronichg_ulog=1` (default 0): GLINK channel PMIC_LOGS_ADSP_APPS (4th channel), Linux pmic_pdcharger_ulog
+  protocol (owner 32778, opcode 0x18, 8192 bytes), every line as `NEGRONI ULOG: ...` (boot log keeps them).
+- Build [V]: out/kernel/local-20261026-225104/kernel.development.negroni sha256
+  201a9ae54fc9ce02c9062e8e16de90adacffbd23272a12f6eee7f5c3621eaf07 (271 applied incl. 0372, 0373; only the 4 dxb skips;
+  link out/kernel/kernel.macho at build time). Only the old warning kinds. Not booted; no image.
+- Next: RAM boot t13 args + `negroniusb_rails=1 negronichg_ulog=1` (evidence, then read the 0367 boot log), then
+  `negroniusb_rails=2` (the fix). Expected lines: README-usb.md "0372" Boot lines.
+
+## 53. Bluetooth: 0337 review, 0338 legacy LE -> extended LE, why the switch does not go off (2026-10-27, BT kernel agent; patch 0338, details patches/xnu/README-bluetooth.md "0337 review" and "0338")
+
+- [V] 0337 works: in the 04:06 boot (logs/usblog-20261026-233816.txt, kernel local-20261026-222425) bluetoothd passed every Apple VSC. No `timedout waiting for controller`.
+- [V disassembly] `_BCM_ByteStreamEventParser` (0x100126134) calls the callback when at least 2 bytes follow the status, for any status. `_BCM_SubOpcodeChecker` checks only 0xfce9 (byte 0 = sub-opcode; no data = match).
+- [V] Name fixes: 0xfce2 is a multiplex opcode (sub-opcodes 0x0b, 0x1c, 0x15, 0x26, 0x1e, 0x36 seen). 0xfd48 carries `01` + a 6-byte address (the next 0x2005 address). [I] 0xfce2 sub 0x1c = SET_MIN_AFH_LE_CHANNELS.
+- [V] The new stop: `0x200b` LE_Set_Scan_Parameters -> status 0x0c Command Disallowed -> `exit bluetoothd status 1`, every ~10 s. 0x2007 also gets 0x0c at init. The host sent no extended LE command before. [I strong] The QCA6490 firmware BTFW.HSP.2.1.0-00394 accepts only the extended LE command set.
+- [I] Settings cannot turn Bluetooth off because bluetoothd dies ~1 s after each start (crash loop). [V disassembly] The off path: `Beginning asynchronous power shutdown` -> core stack halt -> `applebt_transport_terminate` / `applebt_hci_close` (the control socket closes; 0335 drives BT_EN low 3 s later) -> `Powering off chipset` (BlueTool `deepsleep`). No IOKit power property. No new power code was necessary.
+- 0338: the shim translates 0x200b/0x200c/0x200d/0x2006/0x2008/0x2009/0x200a to 0x2041/0x2042/0x2043/0x2036/0x2037/0x2038/0x2039 (advertising set 0, 0x2035 for a random own address). Extended reports go back as legacy reports. `negronibt_lext=0` = the old pass-through. Opus review: ACCEPT with fixes, F1-F6/F8/F10 fixed (F1 was a report length error that broke the H4 stream).
+- Host test: `scripts/kernel/test-bt-shim.sh TREE` (tools/bt-shim-test, ASan/UBSan). [V] all ok.
+- Build [V]: out/kernel/local-20261026-225500/kernel.development.negroni sha256
+  9c76386625f09c190511e599b4b9ecdaef318f9bede09bdb45c85a805052cd12 (0330-0338 applied, only the 4 dxb skips; link
+  out/kernel/kernel.macho). Not run on the phone; no image.
+- Next test: boot-args `negronibt=4 negronipanic=30 negronipanicreason=2`. Expect `lext: 0x2041 answer (status 0) delivered as legacy 0x200b`, no `exit bluetoothd`, `Stack: STACK_BUSY -> STACK_READY`, then the switch off: `h4 control unit 1 disconnected`, `power off: BT_EN low`.
