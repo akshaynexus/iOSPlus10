@@ -8,6 +8,7 @@
 //! Panic mode (patch 0360, patches/xnu/README-panic.md): after a panic the kernel still answers ping
 //! ("pong (panic)"), log, reboot, bootloader, recovery and poweroff (replies end in "(panic)").
 //! `log` makes the kernel send the last 64 KiB of its console to the live log (UDP 5140) again.
+//! `bootlog` (patch 0367) prints the boot log area and this boot's slot; `op10tool bootlog` fetches the logs.
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -40,6 +41,8 @@ pub enum Command {
     Log,
     /// The USB gadget's counters: frames, bytes, TX drops, RX frames per poll, TX batch size (patch 0361)
     Usbstats,
+    /// The boot log area and this boot's slot (patch 0367); the logs themselves: `op10tool bootlog [N]`
+    Bootlog,
 }
 
 impl Command {
@@ -47,6 +50,7 @@ impl Command {
         match self {
             Command::Ping => "ping".into(),
             Command::Usbstats => "usbstats".into(),
+            Command::Bootlog => "bootlog".into(),
             Command::Reboot => "reboot".into(),
             Command::Bootloader => "bootloader".into(),
             Command::Recovery => "recovery".into(),
@@ -81,10 +85,11 @@ fn recv(sock: &UdpSocket, phone: SocketAddr, deadline: Instant) -> Result<Option
     }
 }
 
-pub fn run(cmd: Command, host: &str) -> Result<()> {
+/// A UDP socket connected to the phone's command server. On the USB link it sends from 192.168.7.1 (the only
+/// source the kernel accepts). Also used by `op10tool bootlog` (bootlog.rs).
+pub fn socket(host: &str) -> Result<(UdpSocket, SocketAddr)> {
     let ip: IpAddr = host.parse().with_context(|| format!("--host {host}: not an IP address"))?;
     let phone = SocketAddr::new(ip, PORT);
-    // The kernel accepts only 192.168.7.1 as the source: on the USB link, send from exactly that address.
     let sock = if matches!(ip, IpAddr::V4(v4) if v4.octets()[..3] == [192, 168, 7]) {
         UdpSocket::bind((HOST_IP, 0)).with_context(|| {
             format!("{HOST_IP} is not set on this host: start the USB link first (make usblog, scripts/debug/usblog.sh)")
@@ -93,6 +98,11 @@ pub fn run(cmd: Command, host: &str) -> Result<()> {
         UdpSocket::bind(("0.0.0.0", 0)).context("bind a UDP socket")?
     };
     sock.connect(phone).with_context(|| format!("no route to {phone} (see scripts/debug/usblog.sh)"))?;
+    Ok((sock, phone))
+}
+
+pub fn run(cmd: Command, host: &str) -> Result<()> {
+    let (sock, phone) = socket(host)?;
     let send = || {
         sock.send(cmd.word().as_bytes()).with_context(|| {
             format!("send to {phone} (is the phone's USB Ethernet up and 192.168.7.1/24 set on the host? see scripts/debug/usblog.sh)")
@@ -117,7 +127,7 @@ pub fn run(cmd: Command, host: &str) -> Result<()> {
             }
             bail!("no pong from {phone} in 2 s")
         }
-        Command::Settime | Command::Time | Command::Log | Command::Usbstats => {
+        Command::Settime | Command::Time | Command::Log | Command::Usbstats | Command::Bootlog => {
             // No reset: resend every 500 ms like ping (each settime carries the host's time at sending).
             let deadline = start + Duration::from_secs(2);
             while Instant::now() < deadline {

@@ -6,6 +6,9 @@
 #     their blocks at the end of userdata, so one flash writes root + areas (`fastboot flash userdata`
 #     erases the areas otherwise). The image then covers all N blocks of userdata (NE2211: 58672399,
 #     getvar partition-size:userdata 0x37F450F000), with holes as DONT_CARE.
+#     The boot log area (kernel 0367, N-28673 .. N-19458, 36 MiB) is reserved: the root must end below it;
+#     its superblock (`op10tool bootlog --mkarea`) is written at N-28673, the slots stay DONT_CARE (the kernel
+#     ignores slot headers without a valid CRC).
 # Uses `op10tool img2simg` (holes -> DONT_CARE via SEEK_DATA/SEEK_HOLE, uniform blocks -> FILL); its output
 # decodes byte-identical with AOSP simg2img (tools/op10tool/tests).
 set -eu
@@ -17,12 +20,13 @@ SRC=$IN
 if [ "${AREAS:-0}" = 1 ]; then
   N=${USERDATA_BLOCKS:-58672399}
   sz=$(stat -f %z "$IN" 2>/dev/null || stat -c %s "$IN")
-  if [ $((sz / 4096)) -gt $((N - 19457)) ]; then
+  LOW=$((N - 28673))     # lowest reserved block: the boot log area (kernel 0367), then the firmware areas
+  if [ $((sz / 4096)) -gt $LOW ]; then
     # a simg2img output is partition-sized (DONT_CARE to the end): cut it at the HFS+ volume size
     "$OUT/bin/op10tool" hfs-size --trim "$IN"
     sz=$(stat -f %z "$IN" 2>/dev/null || stat -c %s "$IN")
   fi
-  [ $((sz / 4096)) -le $((N - 19457)) ] || { echo "$IN reaches the area blocks: stop" >&2; exit 1; }
+  [ $(((sz + 4095) / 4096)) -le $LOW ] || { echo "$IN reaches the area blocks (boot log area at block $LOW): stop" >&2; exit 1; }
   for a in gpu adsp wlan; do
     [ -f "$OUT/firmware/$a-area.bin" ] || { echo "missing out/firmware/$a-area.bin (scripts/fw/build-areas.sh)" >&2; exit 1; }
   done
@@ -39,6 +43,12 @@ if [ "${AREAS:-0}" = 1 ]; then
     [ "$got" = "$want" ] || { echo "area $1: read-back differs" >&2; exit 1; }
     echo "area $1 at block $2 ($3 blocks): sha256 ${got%"${got#????????????????}"}... OK"
   done
+  # boot log area: the superblock only (the kernel writes it too when it is missing)
+  "$OUT/bin/op10tool" bootlog --mkarea "$SRC.bootlog-super"
+  dd if="$SRC.bootlog-super" of="$SRC" bs=4096 seek="$LOW" count=1 conv=notrunc 2>/dev/null
+  [ "$(dd if="$SRC" bs=4096 skip="$LOW" count=1 2>/dev/null | head -c 8)" = NEGRBLOG ] || { echo "boot log superblock: read-back differs" >&2; exit 1; }
+  rm -f "$SRC.bootlog-super"
+  echo "boot log area at block $LOW (9216 blocks): superblock NEGRBLOG OK"
 fi
 "$OUT/bin/op10tool" img2simg "$SRC" "$OUTS"
 [ "$SRC" = "$IN" ] || rm -f "$SRC"

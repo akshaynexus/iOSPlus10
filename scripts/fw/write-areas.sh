@@ -11,10 +11,11 @@
 #
 # Layout (4096-byte blocks of userdata, block 0 = partition start, N = partition size in blocks;
 # kernel bsd/dev/negroni_ufs.c, negroni_fw_load and negroni_ufs_{adsp,wlan}_area_read):
-#   persistent log   N-1025  .. N-1       (never written here)
+#   old console log  N-1025  .. N-1       (never written here; "SWEETLOG", not written since kernel 0367)
 #   GPU fw area      N-3073  .. N-1026    gpu-area.bin   2048 blocks
 #   ADSP fw area     N-11265 .. N-3074    adsp-area.bin  8192 blocks
 #   WLAN fw area     N-19457 .. N-11266   wlan-area.bin  8192 blocks
+#   boot log area    N-28673 .. N-19458   (kernel 0367, never written here; superblock "NEGRBLOG")
 # NE2211 (getvar partition-size:userdata 0x37F450F000): N = 58672399.
 #
 # Device: /dev/rufsroot0 (character node of the kernel's ufsroot0 = the whole GPT partition
@@ -23,8 +24,8 @@
 #
 # Steps with CONFIRM=yes:
 #  1. N from the device: binary search for the first block that cannot be read (read-only dd);
-#     it must equal N from getvar (58672399). Block N-1025 must start with "SWEETLOG" (the
-#     kernel's console log header; LOG_CHECK=0 skips this).
+#     it must equal N from getvar (58672399). Block N-1025 must start with "SWEETLOG" (the old
+#     console log header) or block N-28673 with "NEGRBLOG" (the 0367 boot log); LOG_CHECK=0 skips this.
 #  2. HFS+ end from `df -k /`: every write must be at or above it and at or above N-19457, and
 #     end at or below N-1026. Else stop.
 #  3. Push the images to /private/var/tmp/fwareas and compare sha256 on the phone.
@@ -101,8 +102,13 @@ case $PN in ''|*[!0-9]*) die "N probe failed: $PN" ;; esac
 echo "phone: $DEV has $PN blocks (= getvar)"
 if [ "${LOG_CHECK:-1}" != 0 ]; then
   m=$(ph "dd if=$DEV bs=4096 skip=$((N - LOG_BLOCKS)) count=1 2>/dev/null | head -c 8")
-  [ "$m" = SWEETLOG ] || die "block $((N - LOG_BLOCKS)) does not start with SWEETLOG ('$m'); LOG_CHECK=0 to skip"
-  echo "phone: log header SWEETLOG at block $((N - LOG_BLOCKS))"
+  if [ "$m" = SWEETLOG ]; then
+    echo "phone: log header SWEETLOG at block $((N - LOG_BLOCKS))"
+  else
+    m2=$(ph "dd if=$DEV bs=4096 skip=$((N - 28673)) count=1 2>/dev/null | head -c 8")
+    [ "$m2" = NEGRBLOG ] || die "no SWEETLOG at block $((N - LOG_BLOCKS)) ('$m') and no NEGRBLOG at $((N - 28673)) ('$m2'); LOG_CHECK=0 to skip"
+    echo "phone: boot log superblock NEGRBLOG at block $((N - 28673))"
+  fi
 fi
 
 # 2. HFS+ end.
@@ -110,6 +116,8 @@ kib=$(ph "df -k /" | awk '$1 == "/dev/ufsroot0" {print $2}')
 case $kib in ''|*[!0-9]*) die "cannot read the HFS+ size (df -k /)" ;; esac
 HFS=$((kib / 4))
 [ "$HFS" -le "$LOW" ] || die "HFS+ root ends at block $HFS, above $LOW: stop"
+# the boot log area (kernel 0367) lies below the firmware areas: the root must end below it too
+[ "$HFS" -le $((N - 28673)) ] || die "HFS+ root ends at block $HFS, above the boot log area at $((N - 28673)): stop"
 echo "phone: HFS+ root $HFS blocks, ends below $LOW"
 
 # 3. Push and compare.

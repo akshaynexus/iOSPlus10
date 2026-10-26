@@ -1,0 +1,1278 @@
+diff --git a/bsd/dev/negroni_bootlog_core.h b/bsd/dev/negroni_bootlog_core.h
+new file mode 100644
+index 0000000..ca5209b
+--- /dev/null
++++ b/bsd/dev/negroni_bootlog_core.h
+@@ -0,0 +1,101 @@
++/*
++ * NEGRONI boot log (patch 0367): the pure checks, shared by the kernel
++ * (bsd/dev/negroni_ufs.c, bsd/dev/negroni_usb.c) and the host unit test
++ * (tools/bootlog-core-test, scripts/kernel/test-bootlog-core.sh takes this
++ * file from the patch). No includes: the includer gives uint8_t, uint32_t,
++ * uint64_t, bool and size_t.
++ */
++#ifndef NEGRONI_BOOTLOG_CORE_H
++#define NEGRONI_BOOTLOG_CORE_H
++
++#define NBL_CORE_BLOCK          4096u
++#define NBL_CORE_AREA_BLOCKS    9216u           /* 36 MiB */
++#define NBL_CORE_FROM_END       28673u          /* area start = partition end - 28673 (op10tool, root-simg.sh) */
++#define NBL_CORE_MIN_REL        16u             /* the area start must leave the partition start alone */
++
++/* [lba, lba + count) inside the partition [first, first + nblocks), count 1..max_count, 32-bit LBA. */
++static inline bool
++nbl_core_in_partition(uint64_t first, uint64_t nblocks, uint64_t lba, uint32_t count, uint32_t max_count)
++{
++	return nblocks != 0 && count != 0 && count <= max_count && lba >= first && lba - first < nblocks &&
++	       count <= nblocks - (lba - first) && lba + count - 1 <= 0xffffffffull;
++}
++
++/* [lba, lba + count) inside the open log window [lo, hi); hi == 0 = closed. */
++static inline bool
++nbl_core_in_window(uint64_t lo, uint64_t hi, uint64_t lba, uint32_t count)
++{
++	return hi != 0 && hi > lo && count != 0 && lba >= lo && count <= hi - lo && lba <= hi - count;
++}
++
++/*
++ * HFS+ / HFSX volume end in 4096-byte device blocks from the partition
++ * start. vh = the volume header (partition byte 1024): signature at 0
++ * ("H+" 0x482b / "HX" 0x4858), block size at 40, total blocks at 44, big
++ * endian. 0 = ok, -1 = not an HFS+ header.
++ */
++static inline int
++nbl_core_hfs_end(const uint8_t *vh, uint64_t *end)
++{
++	uint32_t sig = (uint32_t)vh[0] << 8 | vh[1];
++	uint32_t bsize = (uint32_t)vh[40] << 24 | (uint32_t)vh[41] << 16 | (uint32_t)vh[42] << 8 | vh[43];
++	uint32_t nblk = (uint32_t)vh[44] << 24 | (uint32_t)vh[45] << 16 | (uint32_t)vh[46] << 8 | vh[47];
++	if ((sig != 0x482b && sig != 0x4858) || bsize < 512 || (bsize & (bsize - 1)) != 0 || nblk == 0) {
++		return -1;
++	}
++	*end = ((uint64_t)bsize * nblk + NBL_CORE_BLOCK - 1) / NBL_CORE_BLOCK;
++	return 0;
++}
++
++/*
++ * The area start (blocks from the partition start) for a partition of
++ * nblocks and an HFS+ volume of hfs_end blocks. 0 = ok, -1 = partition too
++ * small, -2 = the volume reaches the area.
++ */
++static inline int
++nbl_core_area_rel(uint64_t nblocks, uint64_t hfs_end, uint64_t *rel)
++{
++	if (nblocks < (uint64_t)NBL_CORE_FROM_END + NBL_CORE_MIN_REL) {
++		return -1;
++	}
++	*rel = nblocks - NBL_CORE_FROM_END;
++	return hfs_end > *rel ? -2 : 0;
++}
++
++/* Decimal number at *q (advanced past it); *ok = false if there is no digit or more than 9 digits. */
++static inline uint32_t
++nbl_core_parse_u32(const char **q, bool *ok)
++{
++	uint32_t v = 0;
++	const char *p = *q;
++	unsigned n = 0;
++	if (*p < '0' || *p > '9') {
++		*ok = false;
++	}
++	while (*p >= '0' && *p <= '9') {
++		if (++n > 9) {
++			*ok = false;
++			break;
++		}
++		v = v * 10 + (uint32_t)(*p++ - '0');
++	}
++	*q = p;
++	return v;
++}
++
++/* CRC-32 (IEEE 802.3, the zlib / crc32fast value). */
++static inline uint32_t
++nbl_core_crc32(const void *buf, size_t n)
++{
++	const uint8_t *b = (const uint8_t *)buf;
++	uint32_t c = 0xffffffffu;
++	while (n--) {
++		c ^= *b++;
++		for (int k = 0; k < 8; k++) {
++			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
++		}
++	}
++	return ~c;
++}
++
++#endif /* NEGRONI_BOOTLOG_CORE_H */
+diff --git a/bsd/dev/negroni_reboot.c b/bsd/dev/negroni_reboot.c
+index 12dbc27..1f17778 100644
+--- a/bsd/dev/negroni_reboot.c
++++ b/bsd/dev/negroni_reboot.c
+@@ -85,6 +85,8 @@ void negroni_restart(void);
+ void negroni_power_off(void);
+ void negroni_panic_restart(void);
+ void negroni_reboot_settle(unsigned ms);
++/* 0367: boot log end mark (negroni_ufs.c): kind 3 halt, 4 restart; | 0x10 = from the panic hold loop */
++extern void negroni_bootlog_end(unsigned kind, const char *why);
+ 
+ /*
+  * Panic hold (patch 0360, README-panic.md). In negroni_panic_restart()
+@@ -525,6 +527,25 @@ nr_pon_log_trigger_name(uint8_t event, uint16_t code)
+ 	}
+ }
+ 
++/*
++ * 0367: one line for the boot log header (negroni_ufs.c): the last PON
++ * trigger, reset trigger, reset type, warm reset count and fault reasons of
++ * the PON log. They tell why this power-on happened, so why the previous
++ * boot ended: RESET_TRIGGER PS_HOLD = the SoC dropped PS_HOLD (PSCI reset,
++ * TZ after an APSS watchdog bite), PMIC_WATCHDOG_S2 = PMIC watchdog,
++ * KPDPWR_N_S2 = power key held; PON_TRIGGER KPDPWR_N alone = power on by key
++ * after a power off. Empty until negroni_reboot_prepare() ran.
++ */
++static char nr_pon_summary[200];
++
++const char *negroni_reboot_pon_summary(void);
++
++const char *
++negroni_reboot_pon_summary(void)
++{
++	return nr_pon_summary;
++}
++
+ /*
+  * The PMIC PON log (SDAM 0x7400, downstream pmic-pon-log.c), oldest entry
+  * first. Only the first SDAM of the FIFO is decoded (the NE2211 DT lists
+@@ -559,6 +580,13 @@ nr_pon_log_dump(void)
+ 		}
+ 	}
+ 	const unsigned entries = NR_PONLOG_FIFO_SIZE / 4;
++	/*
++	 * 0367: for nr_pon_summary, the reset entries logged before the LAST
++	 * PON trigger (w_*: since the previous PON trigger; copied to last_* at
++	 * each PON trigger, so a reset of an older cycle is not reported).
++	 */
++	int last_pon = -1, last_rst = -1, last_type = -1, last_warm = -1, last_f12 = -1, last_f3 = -1;
++	int w_rst = -1, w_type = -1, w_warm = -1, w_f12 = -1, w_f3 = -1;
+ 	int start = (int)(ptr - NR_PONLOG_FIFO_START) - (int)(entries * 4);
+ 	if (start < 0) {
+ 		start += NR_PONLOG_FIFO_SIZE;
+@@ -579,7 +607,59 @@ nr_pon_log_dump(void)
+ 		}
+ 		printf("NEGRONI PON LOG: %-10s %-20s data %#06x%s%s\n", states[state & 7],
+ 		    nr_pon_log_event_name(event), data, extra ? " " : "", extra ? extra : "");
++		switch (event) {
++		case 0x01:
++			last_pon = data;
++			last_rst = w_rst; last_type = w_type; last_warm = w_warm; last_f12 = w_f12; last_f3 = w_f3;
++			w_rst = w_type = w_warm = w_f12 = w_f3 = -1;
++			break;
++		case 0x06: w_rst = data; break;
++		case 0x07: w_type = data0; break;
++		case 0x08: w_warm = data; break;
++		case 0x09: w_f12 = data; break;
++		case 0x0a: w_f3 = data; break;
++		default: break;
++		}
++	}
++	/* 0367: the summary line ("pon=PS_HOLD reset=PS_HOLD type=HARD_RESET warm=0x0001 ...") */
++	char *o = nr_pon_summary;
++	size_t left = sizeof(nr_pon_summary);
++	int w;
++	const char *nm;
++#define NR_SUM(...) do { w = snprintf(o, left, __VA_ARGS__); if (w > 0 && (size_t)w < left) { o += w; left -= (size_t)w; } } while (0)
++	if (last_pon >= 0) {
++		nm = nr_pon_log_trigger_name(0x01, (uint16_t)last_pon);
++		if (nm) {
++			NR_SUM("pon=%s ", nm);
++		} else {
++			NR_SUM("pon=%#06x ", last_pon);
++		}
++	}
++	if (last_rst >= 0) {
++		nm = nr_pon_log_trigger_name(0x06, (uint16_t)last_rst);
++		if (nm) {
++			NR_SUM("reset=%s ", nm);
++		} else {
++			NR_SUM("reset=%#06x ", last_rst);
++		}
++	}
++	if (last_type >= 0) {
++		NR_SUM("type=%s ", nr_pon_type_name((uint8_t)last_type));
++	}
++	if (last_warm >= 0) {
++		NR_SUM("warm=%#06x ", last_warm);
++	}
++	if (last_f12 > 0) {
++		NR_SUM("fault12=%#06x ", last_f12);
++	}
++	if (last_f3 > 0) {
++		NR_SUM("fault3=%#06x ", last_f3);
++	}
++#undef NR_SUM
++	if (o > nr_pon_summary && o[-1] == ' ') {
++		o[-1] = 0;
+ 	}
++	printf("NEGRONI PON LOG: summary: %s\n", nr_pon_summary[0] ? nr_pon_summary : "(no entries)");
+ }
+ 
+ /* Boot-args and the SPMI mappings, once, in thread context (before any panic needs them). */
+@@ -778,10 +858,13 @@ negroni_panic_restart(void)
+ 			pending = -1;
+ 			if (a == NEGRONI_PANIC_ACT_POWEROFF) {
+ 				kdb_printf("NEGRONI PANIC: power off (USB command)\n");
++				negroni_bootlog_end(0x10 | 3, "power off (USB command in panic mode)");
+ 				negroni_power_off();
+ 				kdb_printf("NEGRONI PANIC: power off failed\n");
+ 			} else {
+ 				kdb_printf("NEGRONI PANIC: reset, reason %d (USB command)\n", a);
++				negroni_bootlog_end(0x10 | 4, a == 2 ? "reset to fastboot (USB command in panic mode)" :
++				    "reset (USB command in panic mode)");
+ 				negroni_reboot((unsigned)a);
+ 				kdb_printf("NEGRONI PANIC: reset failed\n");
+ 			}
+@@ -789,6 +872,7 @@ negroni_panic_restart(void)
+ 		if (now >= reset_at) {
+ 			reset_at = UINT64_MAX;
+ 			kdb_printf("NEGRONI PANIC: %d s over: reset, reason %d\n", nr_panic_secs, nr_panic_reason);
++			negroni_bootlog_end(0x10 | 4, "timed reset (negronipanic)");
+ 			negroni_reboot((unsigned)nr_panic_reason);
+ 			kdb_printf("NEGRONI PANIC: reset failed\n");
+ 		}
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index c408b7b..a650ce7 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -26,6 +26,7 @@
+ #include <sys/disk.h>
+ #include <sys/errno.h>
+ #include <sys/proc.h>
++#include <sys/proc_internal.h>          /* 0367: proc_iterate (SpringBoard mark) */
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+@@ -40,6 +41,7 @@
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
+ #include <libkern/crypto/sha2.h>
++#include "negroni_bootlog_core.h"            /* 0367: the gate / HFS+ / CRC checks (host-tested) */
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+@@ -160,6 +162,23 @@ dma_clean(uint32_t off, uint32_t len)
+ /* Sense key of the last failed command (0xff: no sense data). */
+ static uint8_t ufs_last_sense;
+ 
++/*
++ * 0367: set by the panic path of the boot log (negroni_log_panic): commands
++ * spin on the counter (no delay(): it waits with WFE in panic context, see
++ * README-panic.md) and print nothing (printf may take locks).
++ */
++static volatile bool ufs_polled_only;
++
++static void
++ufs_spin_us(uint32_t us)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &abs);
++	uint64_t end = mach_absolute_time() + abs;
++	while (mach_absolute_time() < end) {
++	}
++}
++
+ static int
+ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+@@ -221,7 +240,8 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+-	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	/* 0367: 1 s in the panic path (a dead host must not hold the panic USB mode back for long) */
++	nanoseconds_to_absolutetime(ufs_polled_only ? NSEC_PER_SEC : CMD_TIMEOUT_NS, &deadline);
+ 	deadline += mach_absolute_time();
+ 	bool sleepable = su.wait && su.ready && ml_get_interrupts_enabled() &&
+ 	    !ml_at_interrupt_context() && get_preemption_level() == 0;
+@@ -235,7 +255,9 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("NEGRONI UFS: command 0x%02x timed out\n", cdb[0]);
++			if (!ufs_polled_only) {
++				printf("NEGRONI UFS: command 0x%02x timed out\n", cdb[0]);
++			}
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -245,6 +267,8 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 			    TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING) {
+ 				thread_block(THREAD_CONTINUE_NULL);
+ 			}
++		} else if (ufs_polled_only) {
++			ufs_spin_us(1);
+ 		} else {
+ 			delay(1);
+ 		}
+@@ -267,6 +291,9 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		/* Response UPIU: sense length at 32, fixed-format sense data from 34. */
+ 		const uint8_t *sense = &ucd->resp[34];
+ 		ufs_last_sense = (ucd->resp[33] || ucd->resp[32]) ? sense[2] & 0x0f : 0xff;
++		if (ufs_polled_only) {
++			return EIO;
++		}
+ 		printf("NEGRONI UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x"
+ 		    " sense len %u key 0x%x asc 0x%02x ascq 0x%02x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7],
+@@ -295,13 +322,21 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+  * WRITE(10) of count device blocks from the bounce buffer to lba. The range
+  * must lie inside the partition: this is the only place data goes out.
+  */
++/*
++ * 0367: the boot log area [ufs_log_lo, ufs_log_hi) (absolute device blocks;
++ * 0 = none). It is set only after the HFS+ volume end was checked to lie
++ * below it (nbl_setup). The log writes there with ufs_log_write_blocks(),
++ * also without ufsrw=1; nothing else uses this exception.
++ */
++static uint64_t ufs_log_lo, ufs_log_hi;
++
+ static int
+-ufs_write_blocks(uint64_t lba, uint32_t count)
++ufs_write_checked(uint64_t lba, uint32_t count, bool allowed)
+ {
+-	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+-	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+-	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
+-		printf("NEGRONI UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
++	if (!allowed || !nbl_core_in_partition(su.first_block, su.nblocks, lba, count, BOUNCE_SIZE / UFS_BLOCK)) {
++		if (!ufs_polled_only) {
++			printf("NEGRONI UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
++		}
+ 		return EPERM;
+ 	}
+ 	uint8_t cdb[10] = {
+@@ -312,6 +347,19 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
+ }
+ 
++static int
++ufs_write_blocks(uint64_t lba, uint32_t count)
++{
++	return ufs_write_checked(lba, count, su.writable);
++}
++
++/* 0367: a write of the boot log: only inside its area, whatever ufsrw says. */
++static int
++ufs_log_write_blocks(uint64_t lba, uint32_t count)
++{
++	return ufs_write_checked(lba, count, nbl_core_in_window(ufs_log_lo, ufs_log_hi, lba, count));
++}
++
+ static int
+ ufs_sync_cache(void)
+ {
+@@ -785,18 +833,15 @@ negroni_ufs_init(void)
+  * Persistent console log ("negronilog"). Filming the phone screen is the only
+  * other way to see the console, so every character that reaches the
+  * console (kernel printf and /dev/console writes of daemons, both through
+- * _cnputs) is also kept in a 4 MiB ring, and once the partition is known
+- * and writable a thread copies new ring blocks to the LAST 4 MiB + 4 KiB of
+- * the partition every ufslogsecs seconds (default 10), far behind the HFS
+- * image at its start. Device block 0 of that area is a header:
+- *   "NEGRONILOG" | u32 version 1 | u32 ring size | u64 total bytes written
+- *   | u64 flush sequence
+- * ring offset of byte n = n % ring size. Read it from a recovery with
+- * tools/negroni-log-pull.sh. Disabled with boot-arg negronilog=0.
++ * _cnputs) is also kept in a 4 MiB ring. Since 0367 the ring goes into one
++ * slot of the boot log area per boot (see "Boot log" below) every
++ * ufslogsecs seconds (default 1); the old single area (the last 4 MiB +
++ * 4 KiB of the partition, header "SWEETLOG") is no longer written.
++ * Disabled with boot-arg negronilog=0.
+  */
+ #define NEGRONI_LOG_SIZE          (4u << 20)
+ #define NEGRONI_LOG_BLOCKS        (1 + NEGRONI_LOG_SIZE / UFS_BLOCK)
+-#define NEGRONI_LOG_SECS          10u
++#define NEGRONI_LOG_SECS          1u            /* 0367: was 10 */
+ 
+ static char negroni_log_ring[NEGRONI_LOG_SIZE];
+ static uint64_t _Atomic negroni_log_total;
+@@ -1049,17 +1094,154 @@ negroni_ufs_wlan_area_read(uint64_t at, void *dst, uint32_t count)
+ 	return 0;
+ }
+ 
+-struct negroni_log_header {
+-	char magic[8];
+-	uint32_t version, size;
+-	uint64_t total, seq;
+-};
++/*
++ * Boot log (patch 0367, patches/xnu/README-bootlog.md). The console ring of
++ * each boot goes into one slot of a reserved area of the partition, so a
++ * boot that loses the USB link, hangs or resets can be read on the next good
++ * boot. Always on (boot-arg negronilog=0 turns it off); it does not need
++ * ufsrw=1: ufs_log_write_blocks() writes only inside the area.
++ *
++ * Area: NBL_AREA_BLOCKS device blocks right below the WLAN firmware area
++ * (relative to the partition end N: blocks N-28673 .. N-19458; NE2211
++ * userdata N = 58672399). Before any write the HFS+ volume header (byte 1024
++ * of the partition) is read: the volume must end at or below the area.
++ *   area block 0                      superblock (struct nbl_super, "NEGRBLOG")
++ *   area block 1 + i*NBL_SLOT_BLOCKS  slot i: header block (struct nbl_slot,
++ *                                     "NEGRBOOT"), then the 4 MiB console ring
++ *                                     (byte n of the boot at ring offset n % 4 MiB)
++ * The rest of the area (1015 blocks) is reserved. The slot of a boot is the
++ * one after the slot with the highest boot counter. Header fields: boot
++ * counter, state (running / panic / halt / restart), flags (SpringBoard seen,
++ * panic log written), bytes written, flush count, calendar and uptime of
++ * the start, the last flush, SpringBoard and the end, kernel UUID and
++ * version, boot-args, the PMIC PON log summary of this power-on (why the
++ * previous boot ended) and the end text (panic first line / halt / restart).
++ * CRC-32 (IEEE) over the header without the crc field.
++ *
++ * Flushes: every ufslogsecs seconds (default 1) when the console has new
++ * text, else a header heartbeat every NBL_HEARTBEAT_SECS; each with
++ * SYNCHRONIZE CACHE. The panic path (negroni_log_panic) writes once more
++ * without the lock, polled; halt and restart write the end state.
++ * Read back: /dev/negronibootlog (root, read-only: the area as a file) and
++ * the USB command server ("bootlog", "bootlog read A C": negroni_usb.c);
++ * host: op10tool bootlog.
++ */
++#define NBL_AREA_BLOCKS     9216u                       /* 36 MiB */
++#define NBL_FROM_END        (NEGRONI_LOG_BLOCKS + NEGRONI_FW_BLOCKS + NEGRONI_ADSP_AREA_BLOCKS + \
++	                     NEGRONI_WLAN_AREA_BLOCKS + NBL_AREA_BLOCKS)   /* 28673 */
++#define NBL_SLOTS           8u
++#define NBL_SLOT_BLOCKS     NEGRONI_LOG_BLOCKS          /* 1 header + 1024 ring blocks */
++#define NBL_VERSION         1u
++#define NBL_HEARTBEAT_SECS  30u     /* header only, when the console is quiet (review F1: was 5) */
++#define NBL_EARLY_SECS      300u    /* flush every ufslogsecs (1 s) only in the first 5 min of uptime ... */
++#define NBL_LATE_SECS       5u      /* ... then at most every 5 s */
++#define NBL_BUDGET_BYTES    (256u << 10)    /* more than this flushed in NBL_BUDGET_SECS: */
++#define NBL_BUDGET_SECS     10u
++#define NBL_SLOW_SECS       10u     /* flush every 10 s until a quiet window */
++
++enum { NBL_RUNNING = 1, NBL_PANIC = 2, NBL_HALT = 3, NBL_RESTART = 4 };
++#define NBL_F_SPRINGBOARD   0x1u
++#define NBL_F_PANICLOG      0x2u
++
++struct nbl_super {
++	char magic[8];                  /* "NEGRBLOG" */
++	uint32_t version;               /* 1 */
++	uint32_t slots;                 /* 8 */
++	uint32_t slot_blocks;           /* 1025 */
++	uint32_t area_blocks;           /* 9216 */
++	uint32_t ring_size;             /* 4 MiB */
++	uint32_t from_end;              /* 28673: area start = partition end - from_end */
++	uint32_t crc;                   /* CRC-32 of the bytes before it */
++} __attribute__((packed));
++
++struct nbl_slot {
++	char magic[8];                  /*    0 "NEGRBOOT" */
++	uint32_t version;               /*    8 1 */
++	uint32_t hdr_size;              /*   12 sizeof(struct nbl_slot) */
++	uint64_t boot;                  /*   16 boot counter (1, 2, ...) */
++	uint32_t state;                 /*   24 NBL_RUNNING ... */
++	uint32_t flags;                 /*   28 NBL_F_* */
++	uint32_t ring_size;             /*   32 */
++	uint32_t flush_secs;            /*   36 */
++	uint64_t total;                 /*   40 console bytes of this boot */
++	uint64_t seq;                   /*   48 flush count */
++	uint64_t start_cal;             /*   56 calendar seconds at the slot start (may be the RTC's wrong time) */
++	uint64_t last_cal;              /*   64 calendar seconds at the last flush (not updated in a panic) */
++	uint64_t last_up_ms;            /*   72 uptime at the last flush */
++	uint64_t sb_up_ms;              /*   80 uptime when SpringBoard ran (0: never) */
++	uint64_t end_up_ms;             /*   88 uptime of the end (panic/halt/restart) */
++	char uuid[40];                  /*   96 kernel UUID */
++	char kversion[256];             /*  136 kernel version string */
++	char bootargs[1024];            /*  392 */
++	char pon[256];                  /* 1416 PMIC PON log at this power-on (negroni_reboot.c) */
++	char end[256];                  /* 1672 end text */
++	uint32_t crc;                   /* 1928 CRC-32 of bytes 0..1927 */
++} __attribute__((packed));
++_Static_assert(sizeof(struct nbl_slot) == 1932, "nbl_slot layout (op10tool bootlog)");
++_Static_assert(sizeof(struct nbl_super) == 36, "nbl_super layout (op10tool bootlog)");
++/* F4: op10tool bootlog, root-simg.sh, write-areas.sh and bootlog-ssh.sh hard-code 28673 / 9216 / 8201 */
++_Static_assert(NBL_FROM_END == 28673 && NBL_FROM_END == NBL_CORE_FROM_END, "boot log area start (host tools)");
++_Static_assert(NBL_AREA_BLOCKS == NBL_CORE_AREA_BLOCKS, "boot log area size (host tools)");
++_Static_assert(1 + NBL_SLOTS * NBL_SLOT_BLOCKS == 8201 && 1 + NBL_SLOTS * NBL_SLOT_BLOCKS <= NBL_AREA_BLOCKS,
++    "boot log slots (bootlog-ssh.sh reads 8201 blocks)");
++
++static struct {
++	bool ok;                        /* area checked, slot chosen: the log runs */
++	volatile bool panic;            /* the panic path owns the host now */
++	uint64_t lo;                    /* absolute device block of area block 0 */
++	uint64_t hfs_end;               /* HFS+ volume end, device blocks from the partition start */
++	uint32_t slot;
++	uint64_t last_write;            /* mach time of the last flush */
++	struct nbl_slot hdr;            /* this boot's header (under negroni_ufs_lock) */
++} nbl;
++
++extern char kernel_uuid_string[];
++extern const char *negroni_reboot_pon_summary(void);   /* negroni_reboot.c (0367) */
++extern int kdb_printf(const char *format, ...) __printflike(1, 2);
++
++#define nbl_crc32 nbl_core_crc32
++
++static uint64_t
++nbl_uptime_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
+ 
+-/* The ring from `flushed` to `total` onto the partition, and the header. With the lock held (or in a panic). */
++static uint64_t
++nbl_slot_base(uint32_t slot)
++{
++	return nbl.lo + 1 + (uint64_t)slot * NBL_SLOT_BLOCKS;
++}
++
++static bool
++nbl_slot_valid(const struct nbl_slot *h)
++{
++	return memcmp(h->magic, "NEGRBOOT", 8) == 0 && h->version == NBL_VERSION &&
++	       h->hdr_size == sizeof(*h) && h->crc == nbl_crc32(h, offsetof(struct nbl_slot, crc));
++}
++
++static const char *
++nbl_state_name(uint32_t state)
++{
++	switch (state) {
++	case NBL_RUNNING: return "running";
++	case NBL_PANIC:   return "panic";
++	case NBL_HALT:    return "halt";
++	case NBL_RESTART: return "restart";
++	default:          return "?";
++	}
++}
++
++/*
++ * The ring from `flushed` to `total`, then this boot's header, then
++ * SYNCHRONIZE CACHE. With negroni_ufs_lock held, or in the panic path.
++ */
+ static int
+-negroni_log_write(uint64_t flushed, uint64_t total, uint64_t seq)
++negroni_log_write(uint64_t flushed, uint64_t total)
+ {
+-	uint64_t base = su.first_block + su.nblocks - NEGRONI_LOG_BLOCKS;
++	uint64_t base = nbl_slot_base(nbl.slot);
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 	uint64_t pos = total - flushed >= NEGRONI_LOG_SIZE ? total - NEGRONI_LOG_SIZE : flushed;
+ 	int error = 0;
+@@ -1071,56 +1253,195 @@ negroni_log_write(uint64_t flushed, uint64_t total, uint64_t seq)
+ 		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(NEGRONI_LOG_SIZE / UFS_BLOCK - blk)),
+ 		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+ 		memcpy(bounce, negroni_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-		error = ufs_write_blocks(base + 1 + blk, n);
++		error = ufs_log_write_blocks(base + 1 + blk, n);
+ 		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+ 	}
+ 	if (!error) {
+-		struct negroni_log_header h = {
+-			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+-			.version = 1, .size = NEGRONI_LOG_SIZE, .total = total, .seq = seq,
+-		};
++		nbl.hdr.total = total;
++		nbl.hdr.seq++;
++		nbl.hdr.last_up_ms = nbl_uptime_ms();
++		if (!nbl.panic) {
++			clock_sec_t s;
++			clock_usec_t us;
++			clock_get_calendar_microtime(&s, &us);
++			nbl.hdr.last_cal = (uint64_t)s;
++		}
++		if (nbl.hdr.pon[0] == 0 && negroni_reboot_pon_summary() != NULL) {
++			strlcpy(nbl.hdr.pon, negroni_reboot_pon_summary(), sizeof(nbl.hdr.pon));
++		}
++		nbl.hdr.crc = nbl_crc32(&nbl.hdr, offsetof(struct nbl_slot, crc));
+ 		bzero(bounce, UFS_BLOCK);
+-		memcpy(bounce, &h, sizeof(h));
+-		error = ufs_write_blocks(base, 1);
++		memcpy(bounce, &nbl.hdr, sizeof(nbl.hdr));
++		error = ufs_log_write_blocks(base, 1);
+ 	}
+ 	if (!error) {
+ 		error = ufs_sync_cache();
+ 	}
++	nbl.last_write = mach_absolute_time();
+ 	return error;
+ }
+ 
+ static bool negroni_log_running;
+-static uint64_t negroni_log_flushed, negroni_log_seq;
++static uint64_t negroni_log_flushed;
++
++/* SpringBoard marker: proc_iterate callback (the same name lookup as negroni_sample.c). */
++static int
++nbl_find_springboard(proc_t p, void *arg)
++{
++	char name[MAXCOMLEN + 1];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, "SpringBoard") == 0) {
++		*(int *)arg = proc_pid(p);
++		return PROC_RETURNED_DONE;
++	}
++	return PROC_RETURNED;
++}
+ 
+ static void
+ negroni_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	printf("NEGRONI LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+-	    NEGRONI_LOG_BLOCKS * UFS_BLOCK >> 10, su.first_block + su.nblocks - NEGRONI_LOG_BLOCKS);
++	uint64_t heartbeat, sec, win_start = 0, win_bytes = 0, slow_until = 0;
++	bool first = true;
++
++	nanoseconds_to_absolutetime((uint64_t)NBL_HEARTBEAT_SECS * NSEC_PER_SEC, &heartbeat);
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec);
+ 	negroni_log_running = true;
+ 	for (;;) {
+ 		(void)tsleep(&negroni_log_chan, PZERO, "negronilog", hz * (int)negroni_log_secs);
++		if (!(nbl.hdr.flags & NBL_F_SPRINGBOARD)) {
++			int pid = 0;
++			proc_iterate(PROC_ALLPROCLIST, nbl_find_springboard, &pid, NULL, NULL);
++			if (pid > 0) {
++				uint64_t ms = nbl_uptime_ms();
++				lck_mtx_lock(&negroni_ufs_lock);
++				nbl.hdr.flags |= NBL_F_SPRINGBOARD;
++				nbl.hdr.sb_up_ms = ms;
++				lck_mtx_unlock(&negroni_ufs_lock);
++				printf("NEGRONI BOOTLOG: boot %llu reached SpringBoard (pid %d) %llu.%03llu s after start\n",
++				    nbl.hdr.boot, pid, ms / 1000, ms % 1000);
++			}
++		}
++		/*
++		 * Wear budget (review F1): new text is flushed every ufslogsecs (1 s) in the
++		 * first NBL_EARLY_SECS of uptime, then at most every NBL_LATE_SECS; after a
++		 * flush window with more than NBL_BUDGET_BYTES in NBL_BUDGET_SECS, every
++		 * NBL_SLOW_SECS for the next 2 windows. A quiet console: header only, every
++		 * NBL_HEARTBEAT_SECS. The first flush (the backlog since kernel start) does not count.
++		 */
++		uint64_t now = mach_absolute_time();
+ 		uint64_t total = os_atomic_load(&negroni_log_total, relaxed);
+-		if (total == negroni_log_flushed) {
++		uint32_t every = negroni_log_secs;
++		if (nbl_uptime_ms() >= (uint64_t)NBL_EARLY_SECS * 1000 && every < NBL_LATE_SECS) {
++			every = NBL_LATE_SECS;
++		}
++		if (now < slow_until && every < NBL_SLOW_SECS) {
++			every = NBL_SLOW_SECS;
++		}
++		uint64_t since = now - nbl.last_write;
++		if (total == negroni_log_flushed ? since < heartbeat : since < (uint64_t)every * sec) {
+ 			continue;
+ 		}
+ 		lck_mtx_lock(&negroni_ufs_lock);
+-		int error = negroni_log_write(negroni_log_flushed, total, ++negroni_log_seq);
++		uint64_t before = negroni_log_flushed;
++		int error = nbl.panic ? EBUSY : negroni_log_write(negroni_log_flushed, total);
++		if (!error) {
++			negroni_log_flushed = total;
++		}
+ 		lck_mtx_unlock(&negroni_ufs_lock);
++		if (!error && !first) {
++			if (now - win_start >= (uint64_t)NBL_BUDGET_SECS * sec) {
++				win_start = now;
++				win_bytes = 0;
++			}
++			win_bytes += total - before;
++			if (win_bytes > NBL_BUDGET_BYTES) {
++				if (now >= slow_until) {
++					printf("NEGRONI BOOTLOG: %llu KiB in %u s: flushes every %u s for a while\n",
++					    win_bytes >> 10, NBL_BUDGET_SECS, NBL_SLOW_SECS);
++				}
++				slow_until = now + 2ull * NBL_BUDGET_SECS * sec;
++				win_bytes = 0;
++				win_start = now;
++			}
++		}
++		first = false;
+ 		if (error) {
+-			printf("NEGRONI LOG: write failed (%d), stopping\n", error);
++			printf("NEGRONI BOOTLOG: write failed (%d), flush thread stops\n", error);
+ 			negroni_log_running = false;
+ 			return;
+ 		}
+-		negroni_log_flushed = total;
+ 	}
+ }
+ 
++/* First line of the panic text (skips leading blank lines) into dst. */
++static void
++nbl_first_line(char *dst, size_t size, const char *text, size_t length)
++{
++	size_t i = 0, n = 0;
++	while (i < length && (text[i] == '\n' || text[i] == '\r' || text[i] == ' ')) {
++		i++;
++	}
++	while (i < length && text[i] != '\n' && text[i] != 0 && n + 1 < size) {
++		dst[n++] = (text[i] >= 0x20 && text[i] < 0x7f) ? text[i] : '?';
++		i++;
++	}
++	dst[n] = 0;
++}
++
++/*
++ * The panic path: wait (polled, at most 200 ms) for a command that the
++ * flush thread or the block device had in slot 0 when the other CPUs were
++ * stopped; clear the slot if it never completes. The halted thread never
++ * touches the bounce buffer again.
++ */
++static void
++nbl_panic_take_host(void)
++{
++	uint64_t limit;
++	nanoseconds_to_absolutetime(200 * NSEC_PER_MSEC, &limit);
++	uint64_t end = mach_absolute_time() + limit;
++	while ((ufs_rd(REG_UTRLDBR) & 1) && mach_absolute_time() < end) {
++	}
++	if (ufs_rd(REG_UTRLDBR) & 1) {
++		ufs_wr(REG_UTRLCLR, ~1u);
++		ufs_spin_us(1000);
++	}
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++}
++
++/*
++ * Review F5: the panic path uses the host only if negroni_ufs_lock is free
++ * (tried once; it stays taken, the system does not run on), or if it is
++ * held while root writes are off (no ufsrw=1: the holder only reads or is
++ * our own flush). A holder on a CPU that was not stopped could be in the
++ * middle of a root write with the shared bounce buffer, UTRD and UCD: then
++ * no panic write (the USB panic mode still sends the log). false = skip.
++ */
++static bool
++nbl_panic_enter(void)
++{
++	static int result = -1;
++
++	if (result >= 0) {
++		return result == 1;
++	}
++	if (!lck_mtx_try_lock(&negroni_ufs_lock) && su.writable) {
++		kdb_printf("NEGRONI BOOTLOG: UFS busy at the panic (ufsrw=1): no panic write to the disk\n");
++		result = 0;
++		return false;
++	}
++	nbl.panic = true;
++	ufs_polled_only = true;
++	nbl_panic_take_host();
++	result = 1;
++	return true;
++}
++
+ /*
+  * From the panic path (osfmk/arm/model_dep.c, after the backtraces): the panic log (XNU writes it
+- * to its panic buffer, not the console) into the ring, and the ring onto the partition once more.
+- * Interrupts are off, so ufs_command() spins. The UFS lock is not taken: if the flush thread was in
+- * the middle of a write, this one may meet a busy slot and time out, which costs only this write.
++ * to its panic buffer, not the console) into the ring, and (0367) the ring plus a panic header into
++ * this boot's slot: interrupts are off and the other CPUs are stopped, so no lock is taken and the
++ * commands spin on the counter (ufs_polled_only).
+  */
+ void negroni_log_panic(const char *text, size_t length);
+ 
+@@ -1143,9 +1464,315 @@ negroni_log_panic(const char *text, size_t length)
+ 		negroni_log_append(text + i, (int)MIN((size_t)512, length - i));
+ 	}
+ 	negroni_log_append("\nNEGRONI LOG: end of panic log\n", 31);
+-	if (negroni_log_running) {
+-		(void)negroni_log_write(negroni_log_flushed, os_atomic_load(&negroni_log_total, relaxed), ++negroni_log_seq);
++	if (!nbl.ok || !su.ready || !nbl_panic_enter()) {
++		return;
+ 	}
++	nbl.hdr.state = NBL_PANIC;
++	nbl.hdr.flags |= NBL_F_PANICLOG;
++	nbl.hdr.end_up_ms = nbl_uptime_ms();
++	nbl_first_line(nbl.hdr.end, sizeof(nbl.hdr.end), text, length);
++	int error = negroni_log_write(negroni_log_flushed, os_atomic_load(&negroni_log_total, relaxed));
++	kdb_printf("NEGRONI BOOTLOG: panic log of boot %llu written to slot %u: %s\n", nbl.hdr.boot, nbl.slot,
++	    error ? "FAILED" : "ok");
++}
++
++/*
++ * The end of this boot (0367): kind NBL_HALT or NBL_RESTART, why = a short
++ * text. Called from the halt/restart hook (NegroniPlatformExpert.cpp), the
++ * USB command server (reset/power off commands) and the panic hold loop
++ * (after a panic the state stays "panic"; the text gets " / then: why").
++ * Blocks only where it may; otherwise the lock is tried for 200 ms, and in
++ * the panic path no lock is used.
++ */
++void negroni_bootlog_end(unsigned kind, const char *why);
++
++#define NBL_END_IN_PANIC    0x10u       /* kind flag: called from the panic hold loop (negroni_reboot.c) */
++
++void
++negroni_bootlog_end(unsigned kind, const char *why)
++{
++	bool locked = false;
++
++	if (!nbl.ok || !su.ready) {
++		return;
++	}
++	if ((kind & NBL_END_IN_PANIC) && !nbl.panic) {
++		/* a panic that did not pass negroni_log_panic(): take the host here (F5 rule), polled */
++		if (!nbl_panic_enter()) {
++			return;
++		}
++		nbl.hdr.state = NBL_PANIC;
++		nbl.hdr.end_up_ms = nbl_uptime_ms();
++		strlcpy(nbl.hdr.end, "panic (no panic log from model_dep.c)", sizeof(nbl.hdr.end));
++	}
++	kind &= ~NBL_END_IN_PANIC;
++	if (!nbl.panic && ml_at_interrupt_context()) {
++		return;                 /* no caller does this; never wait for the lock from an interrupt */
++	}
++	if (!nbl.panic) {
++		/*
++		 * Callers: kPEHaltCPU/kPERestartCPU (thread context, preemption on: the
++		 * lock path) and ud_ctl_poll (ud_thread, preemption on). The try-lock
++		 * loop is only a guard for a caller with preemption or interrupts off.
++		 */
++		if (preemption_enabled() && ml_get_interrupts_enabled()) {
++			lck_mtx_lock(&negroni_ufs_lock);
++			locked = true;
++		} else {
++			uint64_t limit;
++			nanoseconds_to_absolutetime(200 * NSEC_PER_MSEC, &limit);
++			uint64_t end = mach_absolute_time() + limit;
++			while (!(locked = lck_mtx_try_lock(&negroni_ufs_lock)) && mach_absolute_time() < end) {
++			}
++			if (!locked) {
++				return;
++			}
++		}
++	}
++	if (nbl.hdr.state == NBL_PANIC) {
++		strlcat(nbl.hdr.end, " / then: ", sizeof(nbl.hdr.end));
++		strlcat(nbl.hdr.end, why, sizeof(nbl.hdr.end));
++	} else {
++		nbl.hdr.state = kind == NBL_HALT ? NBL_HALT : NBL_RESTART;
++		strlcpy(nbl.hdr.end, why, sizeof(nbl.hdr.end));
++		nbl.hdr.end_up_ms = nbl_uptime_ms();
++		if (!nbl.panic) {
++			printf("NEGRONI BOOTLOG: boot %llu ends: %s (%s)\n", nbl.hdr.boot, nbl_state_name(nbl.hdr.state), why);
++		}
++	}
++	uint64_t total = os_atomic_load(&negroni_log_total, relaxed);
++	if (negroni_log_write(negroni_log_flushed, total) == 0) {
++		negroni_log_flushed = total;
++	}
++	if (locked) {
++		lck_mtx_unlock(&negroni_ufs_lock);
++	}
++}
++
++/* Area blocks [blk, blk + count) into dst (count <= 4). 0 or an errno. Thread context. */
++int negroni_bootlog_read(uint32_t blk, uint32_t count, void *dst);
++
++int
++negroni_bootlog_read(uint32_t blk, uint32_t count, void *dst)
++{
++	if (!nbl.ok || count == 0 || count > 4 || blk >= NBL_AREA_BLOCKS || count > NBL_AREA_BLOCKS - blk) {
++		return EINVAL;
++	}
++	if (nbl.panic) {
++		return EBUSY;
++	}
++	lck_mtx_lock(&negroni_ufs_lock);
++	int error = ufs_read_blocks(nbl.lo + blk, count);
++	if (!error) {
++		memcpy(dst, (const void *)(su.dma + DMA_BOUNCE), count * UFS_BLOCK);
++	}
++	lck_mtx_unlock(&negroni_ufs_lock);
++	return error;
++}
++
++/* One line for the "bootlog" command: the area and this boot. */
++void negroni_bootlog_info(char *buf, size_t size);
++
++void
++negroni_bootlog_info(char *buf, size_t size)
++{
++	if (!nbl.ok) {
++		snprintf(buf, size, "error: no boot log on this boot (see NEGRONI BOOTLOG lines)");
++		return;
++	}
++	snprintf(buf, size, "bootlog v%u area %llu blocks %u slots %u slotblocks %u boot %llu slot %u state %s "
++	    "secs %u hfsend %llu running %d",
++	    NBL_VERSION, nbl.lo - su.first_block, NBL_AREA_BLOCKS, NBL_SLOTS, NBL_SLOT_BLOCKS, nbl.hdr.boot,
++	    nbl.slot, nbl_state_name(nbl.hdr.state), negroni_log_secs, nbl.hfs_end, negroni_log_running ? 1 : 0);
++}
++
++/* /dev/negronibootlog: the area as a read-only file (root only), for dd over SSH. */
++static int
++nbl_dev_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (flags & FWRITE) {
++		return EPERM;
++	}
++	return nbl.ok ? 0 : ENXIO;
++}
++
++static int
++nbl_dev_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++nbl_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint8_t *buf = kalloc_data(UFS_BLOCK, Z_WAITOK);
++	int error = 0;
++
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	while (uio_resid(uio) > 0 && !error) {
++		off_t off = uio_offset(uio);
++		if (off < 0) {
++			error = EINVAL;
++			break;
++		}
++		if (off >= (off_t)NBL_AREA_BLOCKS * UFS_BLOCK) {
++			break;
++		}
++		uint32_t in = (uint32_t)(off % UFS_BLOCK);
++		error = negroni_bootlog_read((uint32_t)(off / UFS_BLOCK), 1, buf);
++		if (!error) {
++			error = uiomove((const char *)buf + in, (int)MIN((user_ssize_t)(UFS_BLOCK - in), uio_resid(uio)), uio);
++		}
++	}
++	kfree_data(buf, UFS_BLOCK);
++	return error;
++}
++
++static const struct cdevsw nbl_cdevsw = {
++	.d_open = nbl_dev_open, .d_close = nbl_dev_close, .d_read = nbl_dev_read,
++	.d_write = eno_rdwrt, .d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset,
++	.d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++/*
++ * Checks the area and picks this boot's slot (with negroni_ufs_lock held).
++ * The write gate (ufs_log_lo/hi) opens only after all checks:
++ *  1. HFS+ volume header (partition byte 1024): the volume ends at or below
++ *     the area start (nbl_core_hfs_end / nbl_core_area_rel).
++ *  2. Layout anchor (review F2): the block right after the area (N-19457) is
++ *     the WLAN firmware area header "NEGRWLAN", or the area already holds our
++ *     superblock (written by an earlier boot that passed this check, or by
++ *     AREAS=1 root-simg.sh at N-28673). So N and the area layout are the ones
++ *     the firmware areas were written with.
++ * The caller closes the gate again on any error (review F3).
++ */
++static int
++nbl_setup_locked(void)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	static struct nbl_slot prev[NBL_SLOTS];
++	bool valid[NBL_SLOTS] = { false };
++	uint64_t rel = 0;
++	int error;
++
++	if ((error = ufs_read_blocks(su.first_block, 1)) != 0) {
++		return error;
++	}
++	if (nbl_core_hfs_end(b + 1024, &nbl.hfs_end) != 0) {
++		printf("NEGRONI BOOTLOG: no HFS+ volume header at the partition start (sig %#x): off\n",
++		    (unsigned)(b[1024] << 8 | b[1025]));
++		return ENOENT;
++	}
++	switch (nbl_core_area_rel(su.nblocks, nbl.hfs_end, &rel)) {
++	case 0:
++		break;
++	case -1:
++		printf("NEGRONI BOOTLOG: partition too small (%llu blocks): off\n", su.nblocks);
++		return ENOSPC;
++	default:
++		printf("NEGRONI BOOTLOG: HFS+ volume ends at block %llu, past the area at block %llu: off\n",
++		    nbl.hfs_end, rel);
++		return EEXIST;
++	}
++	nbl.lo = su.first_block + rel;
++
++	struct nbl_super sb = {
++		.magic = { 'N', 'E', 'G', 'R', 'B', 'L', 'O', 'G' }, .version = NBL_VERSION, .slots = NBL_SLOTS,
++		.slot_blocks = NBL_SLOT_BLOCKS, .area_blocks = NBL_AREA_BLOCKS, .ring_size = NEGRONI_LOG_SIZE,
++		.from_end = NBL_FROM_END,
++	};
++	sb.crc = nbl_crc32(&sb, offsetof(struct nbl_super, crc));
++	if ((error = ufs_read_blocks(nbl.lo, 1)) != 0) {
++		return error;
++	}
++	bool fresh = memcmp(b, &sb, sizeof(sb)) != 0;
++	if ((error = ufs_read_blocks(nbl.lo + NBL_AREA_BLOCKS, 1)) != 0) {
++		return error;
++	}
++	bool wlan = memcmp(b, "NEGRWLAN", 8) == 0;
++	if (fresh && !wlan) {
++		printf("NEGRONI BOOTLOG: no WLAN area header (NEGRWLAN) at block %llu and no boot log superblock at %llu: "
++		    "layout not proven, off (write the firmware areas: AREAS=1 root-simg.sh)\n",
++		    rel + NBL_AREA_BLOCKS, rel);
++		return ENOENT;
++	}
++
++	/* every check passed: open the write gate for the area only */
++	ufs_log_lo = nbl.lo;
++	ufs_log_hi = nbl.lo + NBL_AREA_BLOCKS;
++
++	if (fresh) {
++		/* new superblock, and all 8 slot headers zeroed (no stale header from an older layout) */
++		bzero((void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++		for (uint32_t i = 0; i < NBL_SLOTS && !error; i++) {
++			error = ufs_log_write_blocks(nbl_slot_base(i), 1);
++		}
++		if (!error) {
++			memcpy((void *)(su.dma + DMA_BOUNCE), &sb, sizeof(sb));
++			error = ufs_log_write_blocks(nbl.lo, 1);
++		}
++		if (error) {
++			return error;
++		}
++	}
++
++	/* slot headers; the next slot after the highest boot counter */
++	uint64_t max_boot = 0;
++	uint32_t max_slot = NBL_SLOTS - 1;
++	for (uint32_t i = 0; i < NBL_SLOTS && !fresh; i++) {
++		if ((error = ufs_read_blocks(nbl_slot_base(i), 1)) != 0) {
++			return error;
++		}
++		memcpy(&prev[i], b, sizeof(prev[i]));
++		valid[i] = nbl_slot_valid(&prev[i]);
++		/* review F7: the strings come from the disk; terminate them before any printf */
++		prev[i].uuid[sizeof(prev[i].uuid) - 1] = 0;
++		prev[i].kversion[sizeof(prev[i].kversion) - 1] = 0;
++		prev[i].bootargs[sizeof(prev[i].bootargs) - 1] = 0;
++		prev[i].pon[sizeof(prev[i].pon) - 1] = 0;
++		prev[i].end[sizeof(prev[i].end) - 1] = 0;
++		if (valid[i] && prev[i].boot > max_boot) {
++			max_boot = prev[i].boot;
++			max_slot = i;
++		}
++	}
++	nbl.slot = (max_slot + 1) % NBL_SLOTS;
++
++	bzero(&nbl.hdr, sizeof(nbl.hdr));
++	memcpy(nbl.hdr.magic, "NEGRBOOT", 8);
++	nbl.hdr.version = NBL_VERSION;
++	nbl.hdr.hdr_size = sizeof(nbl.hdr);
++	nbl.hdr.boot = max_boot + 1;
++	nbl.hdr.state = NBL_RUNNING;
++	nbl.hdr.ring_size = NEGRONI_LOG_SIZE;
++	nbl.hdr.flush_secs = negroni_log_secs;
++	clock_sec_t s;
++	clock_usec_t us;
++	clock_get_calendar_microtime(&s, &us);
++	nbl.hdr.start_cal = nbl.hdr.last_cal = (uint64_t)s;
++	strlcpy(nbl.hdr.uuid, kernel_uuid_string, sizeof(nbl.hdr.uuid));
++	strlcpy(nbl.hdr.kversion, version, sizeof(nbl.hdr.kversion));
++	strlcpy(nbl.hdr.bootargs, PE_boot_args(), sizeof(nbl.hdr.bootargs));
++	nbl.ok = true;
++
++	printf("NEGRONI BOOTLOG: area at block %llu (%u blocks, HFS+ ends at %llu, anchor %s)%s; boot %llu -> slot %u\n",
++	    rel, NBL_AREA_BLOCKS, nbl.hfs_end, wlan ? "NEGRWLAN" : "superblock", fresh ? ", new superblock" : "",
++	    nbl.hdr.boot, nbl.slot);
++	for (uint32_t k = 1; k <= NBL_SLOTS && !fresh; k++) {
++		uint32_t i = (max_slot + NBL_SLOTS + 1 - k) % NBL_SLOTS;  /* newest first */
++		if (!valid[i] || k > 3) {
++			continue;
++		}
++		const struct nbl_slot *h = &prev[i];
++		printf("NEGRONI BOOTLOG: earlier boot %llu (slot %u): %s, last flush %llu s, %llu bytes, SpringBoard %s; %s\n",
++		    h->boot, i, h->state == NBL_RUNNING ? "no end mark (reset, hang or power loss)" : nbl_state_name(h->state),
++		    h->last_up_ms / 1000, h->total,
++		    (h->flags & NBL_F_SPRINGBOARD) ? "yes" : "no", h->end[0] ? h->end : "-");
++	}
++	return negroni_log_write(0, 0);
+ }
+ 
+ static void
+@@ -1155,15 +1782,35 @@ negroni_log_start(void)
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("negronilog", &on, sizeof(on));
+-	if (!on || !su.writable || su.nblocks < 2 * NEGRONI_LOG_BLOCKS) {
++	if (!on) {
++		printf("NEGRONI BOOTLOG: off (negronilog=0)\n");
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("ufslogsecs", &negroni_log_secs, sizeof(negroni_log_secs));
+ 	if (negroni_log_secs == 0 || negroni_log_secs > 60) {
+ 		negroni_log_secs = NEGRONI_LOG_SECS;
+ 	}
++	lck_mtx_lock(&negroni_ufs_lock);
++	int error = nbl_setup_locked();
++	if (error || !nbl.ok) {
++		/* review F3: every failed setup closes the write gate */
++		ufs_log_lo = ufs_log_hi = 0;
++		nbl.ok = false;
++	}
++	lck_mtx_unlock(&negroni_ufs_lock);
++	if (error || !nbl.ok) {
++		printf("NEGRONI BOOTLOG: not started (%d)\n", error);
++		return;
++	}
++	int major = cdevsw_add(-1, &nbl_cdevsw);
++	if (major >= 0) {
++		devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0400, "negronibootlog");
++	}
+ 	if (kernel_thread_start(negroni_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
++	} else {
++		printf("NEGRONI BOOTLOG: no thread: only the panic and end writes\n");
++		negroni_log_running = false;
+ 	}
+ }
+ 
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index 9360797..55c3370 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -912,6 +912,11 @@ extern void negroni_reboot_reset(void);
+ extern void negroni_power_off(void);
+ extern int negroni_calendar_settime(uint64_t secs, uint32_t usecs, char *reply, size_t size);
+ extern void negroni_calendar_describe(char *reply, size_t size);
++/* 0367: boot log (negroni_ufs.c) */
++extern void negroni_bootlog_info(char *buf, size_t size);
++extern int negroni_bootlog_read(uint32_t blk, uint32_t count, void *dst);
++extern void negroni_bootlog_end(unsigned kind, const char *why);
++static char ud_ctl_why[48];             /* 0367: end text of the pending reset/power off */
+ 
+ static const struct {
+ 	const char *name;
+@@ -1053,6 +1058,65 @@ ud_ctl_schedule(int action)
+ 	ud.ctl_action = action;
+ }
+ 
++/*
++ * 0367: boot log commands (negroni_ufs.c, README-bootlog.md).
++ *   bootlog          one text line: area, slots, this boot (negroni_bootlog_info)
++ *   bootlog read A C area blocks A .. A+C-1 (C 1..4): 4 datagrams per block,
++ *                    each a 16-byte header "NBLD" | u32 block | u32 byte offset
++ *                    in the block | u32 length (little endian) and 1024 data bytes
++ * The read runs here in ud_thread (UFS lock, one READ command); datagrams the
++ * TX queue drops are asked for again by the host (op10tool bootlog).
++ */
++#define UD_BOOTLOG_CHUNK 1024u
++
++#include "negroni_bootlog_core.h"            /* nbl_core_parse_u32 (host-tested: tools/bootlog-core-test) */
++
++static void
++ud_ctl_bootlog(const uint8_t *f, const char *cmd)
++{
++	static uint8_t blocks[4 * 4096];
++	static uint8_t dgram[16 + UD_BOOTLOG_CHUNK];
++	char reply[256];
++
++	if (cmd[7] == 0) {
++		negroni_bootlog_info(reply, sizeof(reply));
++		ud_ctl_reply(f, reply);
++		return;
++	}
++	const char *q = cmd + 13;
++	bool ok = true;
++	uint32_t blk = nbl_core_parse_u32(&q, &ok);
++	if (*q == ' ') {
++		q++;
++	} else {
++		ok = false;
++	}
++	uint32_t count = nbl_core_parse_u32(&q, &ok);
++	if (!ok || *q != 0 || count == 0 || count > 4) {
++		ud_ctl_reply(f, "error: bootlog read <area block> <count 1..4>");
++		return;
++	}
++	int error = negroni_bootlog_read(blk, count, blocks);
++	if (error) {
++		snprintf(reply, sizeof(reply), "error: bootlog read %u %u: %d", blk, count, error);
++		ud_ctl_reply(f, reply);
++		return;
++	}
++	const uint8_t *rip = f + ETHER_HDR_LEN;
++	const uint8_t *rudp = rip + (rip[0] & 0xfu) * 4;
++	for (uint32_t i = 0; i < count; i++) {
++		for (uint32_t off = 0; off < 4096; off += UD_BOOTLOG_CHUNK) {
++			uint32_t b = blk + i, n = UD_BOOTLOG_CHUNK;
++			memcpy(dgram, "NBLD", 4);
++			memcpy(dgram + 4, &b, 4);
++			memcpy(dgram + 8, &off, 4);
++			memcpy(dgram + 12, &n, 4);
++			memcpy(dgram + 16, blocks + i * 4096 + off, n);
++			(void)ud_udp_send(f + ETHER_ADDR_LEN, rip + 12, UD_CTL_PORT, ud_be16(rudp), dgram, 16 + n);
++		}
++	}
++}
++
+ /* One received frame (Ethernet header first). true = it was for the command server. */
+ static bool
+ ud_ctl_input(const uint8_t *f, uint32_t len)
+@@ -1153,6 +1217,10 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		ud_ctl_reply(f, "ok log");
+ 		return true;
+ 	}
++	if (strcmp(cmd, "bootlog") == 0 || strncmp(cmd, "bootlog read ", 13) == 0) {
++		ud_ctl_bootlog(f, cmd);
++		return true;
++	}
+ 	if (ud.ctl_action != UD_CTL_NONE) {
+ 		printf("NEGRONI CTL: busy (a reset or panic is pending)\n");
+ 		ud_ctl_reply(f, "error: busy");
+@@ -1165,6 +1233,7 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		return true;
+ 	}
+ 	if (strcmp(cmd, "poweroff") == 0) {
++		strlcpy(ud_ctl_why, "power off (USB command)", sizeof(ud_ctl_why));
+ 		printf("NEGRONI CTL: power off in %u ms\n", UD_CTL_DELAY_MS);
+ 		ud_ctl_reply(f, "ok poweroff");
+ 		ud_ctl_schedule(UD_CTL_POWEROFF);
+@@ -1181,6 +1250,7 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		printf("NEGRONI CTL: %s: reason %u %s, reset in %u ms\n", cmd, reason,
+ 		    set ? "set" : "NOT set", UD_CTL_DELAY_MS);
+ 		ud_ctl_reply(f, reply);
++		snprintf(ud_ctl_why, sizeof(ud_ctl_why), "reset (USB command %s)", cmd);
+ 		ud_ctl_schedule(UD_CTL_RESET);
+ 		return true;
+ 	}
+@@ -1202,9 +1272,11 @@ ud_ctl_poll(void)
+ 		panic("requested over USB");
+ 	}
+ 	if (action == UD_CTL_POWEROFF) {
++		negroni_bootlog_end(3, ud_ctl_why);     /* 0367 */
+ 		negroni_power_off();    /* returns only if every method failed (logged there) */
+ 		return;
+ 	}
++	negroni_bootlog_end(4, ud_ctl_why);             /* 0367 */
+ 	printf("NEGRONI CTL: PSCI SYSTEM_RESET\n");
+ 	negroni_reboot_reset();         /* returns only if PSCI refused (logged there) */
+ }
+diff --git a/iokit/Kernel/arm/NegroniPlatformExpert.cpp b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+index 917da69..fb91679 100644
+--- a/iokit/Kernel/arm/NegroniPlatformExpert.cpp
++++ b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+@@ -49,6 +49,7 @@ void negroni_panic_restart(void);
+ void negroni_reboot_settle(unsigned ms);
+ void negroni_fb_panic(void);            /* NegroniFramebuffer.cpp: zero-copy pipes back on the panel memory */
+ void negroni_tfa_panic(void);           /* negroni_tfa.c (0244): speaker amps off, reset pins held */
++void negroni_bootlog_end(unsigned kind, const char *why);  /* negroni_ufs.c (0367): 3 halt, 4 restart */
+ }
+ 
+ static bool negroni_in_panic;
+@@ -67,6 +68,7 @@ negroni_halt_restart(unsigned int type)
+ 			negroni_panic_restart();        /* does not return */
+ 		}
+ 		IOLog("NEGRONI: power off\n");
++		negroni_bootlog_end(3, "halt (power off)");     /* clean end mark in the boot log (0367) */
+ 		negroni_tfa_panic();                    /* amps off before the rails go (0244) */
+ 		negroni_reboot_settle(300);             /* the USB log thread sends the last lines */
+ 		negroni_power_off();
+@@ -76,6 +78,7 @@ negroni_halt_restart(unsigned int type)
+ 			negroni_panic_restart();        /* does not return */
+ 		}
+ 		IOLog("NEGRONI: restart\n");
++		negroni_bootlog_end(4, "restart (reboot)");     /* clean end mark in the boot log (0367) */
+ 		negroni_tfa_panic();                    /* amps off (0244) */
+ 		negroni_reboot_settle(300);
+ 		negroni_restart();                      /* kern.negroni_reboot_mode (0213) */

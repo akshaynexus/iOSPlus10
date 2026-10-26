@@ -1,6 +1,7 @@
 //! op10tool: the binary-heavy tools of iOSPlus10 in one cross-platform CLI (macOS, Linux).
 //! Simple glue stays in shell/Python under scripts/.
 
+mod bootlog;
 mod ctl;
 mod im4p;
 mod img2simg;
@@ -63,6 +64,28 @@ enum Cmd {
         #[arg(long, default_value = "192.168.7.2")]
         host: String,
     },
+    /// Boot log of the last boots (kernel patch 0367): writes OUT/bootlog-<boot>.txt per boot and prints one
+    /// summary line per boot (end: panic / reset without panic / clean / still running) and its last 5 lines.
+    /// Source: the USB command server (UDP 5141) or --file (dump of /dev/negronibootlog or of the area)
+    Bootlog {
+        /// only the newest COUNT boots (default: every valid slot, at most 8)
+        count: Option<usize>,
+        /// the phone's address
+        #[arg(long, default_value = "192.168.7.2")]
+        host: String,
+        /// read an area dump instead of the phone (scripts/debug/bootlog-ssh.sh makes one over SSH)
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// directory for bootlog-<boot>.txt
+        #[arg(long, default_value = "logs")]
+        out: PathBuf,
+        /// where to look for kernel builds by UUID (out/kernel/*/kernel.*)
+        #[arg(long, default_value = "out/kernel")]
+        kernels: PathBuf,
+        /// only write the area superblock (one 4096-byte block) to this file (scripts/ios16/root-simg.sh)
+        #[arg(long)]
+        mkarea: Option<PathBuf>,
+    },
 }
 
 fn parse_int(s: &str) -> Result<usize, String> {
@@ -83,5 +106,8 @@ fn main() -> Result<()> {
         }
         Cmd::Im4p { input, output } => im4p::run(&input, &output),
         Cmd::Ctl { command, host } => ctl::run(command, &host),
+        Cmd::Bootlog { count, host, file, out, kernels, mkarea } => {
+            bootlog::run(bootlog::Args { count, host, file, out, kernels, mkarea })
+        }
     }
 }

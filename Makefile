@@ -6,7 +6,7 @@ BG := scripts/bg.sh
 OS := $(shell uname -s)
 
 .PHONY: help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
-        kernel kernel-local kernel-ci xcode15 ssh devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog
+        kernel kernel-local kernel-ci xcode15 ssh devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog bootlog
 
 help:
 	@echo "setup:   make tools | op10tool | colima (macOS) | image"
@@ -18,6 +18,7 @@ help:
 	@echo "ios16:   make kernel | devicetree | dmgs | boot | root (sudo) | simg"
 	@echo "build:   make ios16  (kernel devicetree dmgs boot root simg, in order)"
 	@echo "flash:   make flash CONFIRM=yes | flash-boot CONFIRM=yes (no userdata) | flash-restore CONFIRM=yes"
+	@echo "debug:   make usblog | bootlog (boot log of the last 8 boots, patch 0367)"
 	@echo "status:  make status"
 
 status:
@@ -106,5 +107,9 @@ flash-boot-debug:
 usblog:
 	$(BG) usblog sudo scripts/debug/usblog.sh
 	@echo "sudo password: tmux attach -t usblog  (detach: Ctrl-b d); log: logs/usblog-*.txt"
+# boot log of the last boots (kernel 0367) over the USB command server: logs/bootlog-<boot>.txt + summary in
+# logs/bootlog.log (needs the USB link: make usblog). Over SSH instead: scripts/debug/bootlog-ssh.sh
+bootlog:
+	$(BG) bootlog out/bin/op10tool bootlog
 flash-restore:
 	$(BG) flash-restore env CONFIRM=$(CONFIRM) scripts/flash/restore.sh
