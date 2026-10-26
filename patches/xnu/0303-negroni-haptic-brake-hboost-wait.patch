@@ -1,0 +1,124 @@
+PM8350B haptics, the three Linux steps 0300 left out (docs/audit/2026-10-26-peripherals.md part B):
+closed-loop brake from the DT (BRAKE_MODE_CFG 0x50 = CL mode 1, sine gain X1, sine; HAP_PTN BRAKE_AMP
+0x70 = ff 3f 1f 00 00 00 00 00; BRAKE_EN in SPMI_PLAY on play and stop; negronihap_brake=0 = off), and the
+hBoost-ready wait before a play with hBoost off (100 x 200 us, Linux haptics_wait_hboost_ready). The CAL_EN
+toggle is in 0302. Details: docs/haptics-plan.md section 8.
+
+diff --git a/bsd/dev/negroni_haptic.c b/bsd/dev/negroni_haptic.c
+index bb6b1a2..e5196b1 100644
+--- a/bsd/dev/negroni_haptic.c
++++ b/bsd/dev/negroni_haptic.c
+@@ -84,6 +84,11 @@ void negroni_haptic_ui_init(uint32_t hap_mode);  /* negroni_haptic_ui.c, patch 0
+ #define CFG_CAL_EN        0x72u           /* bits 3:2 RC clock calibration, 1 = auto */
+ #define PTN_REVISION2     0x01u
+ #define PTN_DIRECT_PLAY   0x26u
++#define PTN_BRAKE_AMP     0x70u           /* 8 brake samples (patch 0303) */
++#define BRAKE_EN          0x08u           /* SPMI_PLAY bit 3 */
++#define HBST_STATUS4_BUSY 0x01u           /* BOOST_DTEST1_STATUS */
++#define HBST_FOLLOW_HW_EN 0x80u
++#define HBST_VREG_EN_BIT  0x80u
+ #define HBST_REVISION1    0x00u
+ #define HBST_REVISION2    0x01u
+ #define HBST_STATUS4      0x0bu
+@@ -117,6 +122,17 @@ static vm_offset_t nh_chn[NH_P_N];
+ static bool nh_dead[NH_P_N];
+ static bool nh_ready, nh_pbs, nh_playing, nh_hbst_on;
+ static uint32_t nh_mode, nh_force, nh_vmax_mv = NH_DT_VMAX_MV, nh_pbs_arg = 1;
++/*
++ * Patch 0303 (docs/audit/2026-10-26-peripherals.md part B): the closed-loop brake of the DT
++ * (qcom,brake-mode 1 = CL_BRAKE, qcom,brake-pattern [ff 3f 1f], qcom,brake-sig-shape 1 = sine,
++ * brake-sine-gain default X1 = 0: live.dts:13110-13113), written as Linux haptics_hw_init (2904)
++ * and haptics_set_brake (1651) do; BRAKE_EN in SPMI_PLAY on play and stop (1622). negronihap_brake=0
++ * leaves it out (the 0300 behaviour).
++ */
++static uint32_t nh_brake_arg = 1;
++static uint8_t nh_brake_en;               /* BRAKE_EN when the brake was written, else 0 */
++static const uint8_t nh_brake_samples[8] = { 0xff, 0x3f, 0x1f, 0, 0, 0, 0, 0 };
++static uint32_t nh_hbst_waits, nh_hbst_timeouts;
+ static uint64_t nh_play_gen;      /* bumped by each play: a stale stop call does nothing */
+ static uint32_t nh_plays, nh_refused;
+ static thread_call_t nh_stop_call, nh_hbst_call;
+@@ -329,6 +345,15 @@ nh_setup(void)
+ 	}
+ 	/* drive waveform: sine (qcom,drv-sig-shape = 1), bits 1:0 of DRV_WF_SEL */
+ 	nh_update(NH_SID, NH_CFG + CFG_DRV_WF_SEL, 0x03, 0x01);
++	/* patch 0303: closed-loop brake: BRAKE_MODE_CFG mode 1 <<6 | sine gain X1 (0) <<2 | sine wf 1 */
++	if (nh_brake_arg) {
++		int brc = nh_update(NH_SID, NH_CFG + CFG_BRAKE_MODE, 0xcf, (uint8_t)((1u << 6) | (0u << 2) | 1u));
++		for (unsigned i = 0; i < sizeof(nh_brake_samples) && brc == 0; i++) {
++			brc = nh_write(NH_SID, NH_PTN + PTN_BRAKE_AMP + i, nh_brake_samples[i]);
++		}
++		nh_brake_en = brc == 0 ? BRAKE_EN : 0;
++		printf("NEGRONI HAPTIC: closed-loop brake (pattern ff 3f 1f): %s\n", brc == 0 ? "on" : "write failed, off");
++	}
+ 	nh_log_state("init");
+ 	return true;
+ }
+@@ -340,7 +365,7 @@ nh_stop_locked(void)
+ 	if (!nh_playing) {
+ 		return;
+ 	}
+-	nh_write(NH_SID, NH_CFG + CFG_SPMI_PLAY, SRC_DIRECT_PLAY);      /* PLAY_EN 0 */
++	nh_write(NH_SID, NH_CFG + CFG_SPMI_PLAY, (uint8_t)(nh_brake_en | SRC_DIRECT_PLAY));      /* PLAY_EN 0 (+ brake) */
+ 	nh_playing = false;
+ 	if (nh_pbs) {
+ 		uint64_t deadline;
+@@ -392,6 +417,32 @@ negroni_haptic_play(uint32_t ms, uint32_t strength)
+ 	}
+ 	int rc = 0;
+ 	thread_call_cancel(nh_hbst_call);
++	if (!nh_playing && !nh_hbst_on) {
++		/*
++		 * patch 0303: Linux haptics_wait_hboost_ready (1436-1490): with hBoost not kept on, wait
++		 * up to 100 x 200 us while it is busy (VREG_EN set, or STATUS4 bit 0 set); ready at once
++		 * in open loop (HW_FOLLOW bit 7 clear and VREG_EN set). Linux goes on after the timeout.
++		 */
++		unsigned i;
++		for (i = 0; i < 100u; i++) {
++			uint8_t fol, vreg, st4;
++			if (nh_read(NH_SID, NH_HBST + HBST_HW_FOLLOW, &fol) == 0 && !(fol & HBST_FOLLOW_HW_EN) &&
++			    nh_read(NH_SID, NH_HBST + HBST_VREG_EN, &vreg) == 0 && (vreg & HBST_VREG_EN_BIT)) {
++				break;          /* open loop: always ready */
++			}
++			if (nh_read(NH_SID, NH_HBST + HBST_VREG_EN, &vreg) == 0 && !(vreg & HBST_VREG_EN_BIT) &&
++			    nh_read(NH_SID, NH_HBST + HBST_STATUS4, &st4) == 0 && !(st4 & HBST_STATUS4_BUSY)) {
++				break;          /* standby: ready */
++			}
++			delay(200);
++		}
++		if (i > 0) {
++			nh_hbst_waits++;
++		}
++		if (i == 100u && nh_hbst_timeouts++ < 4) {
++			printf("NEGRONI HAPTIC: hBoost not ready after 20 ms: plays anyway (as Linux)\n");
++		}
++	}
+ 	if (!nh_playing) {
+ 		uint8_t en;
+ 		if (nh_read(NH_SID, NH_CFG + CFG_EN_CTL, &en) == 0 && !(en & 0x80)) {
+@@ -420,7 +471,7 @@ negroni_haptic_play(uint32_t ms, uint32_t strength)
+ 		 * write alone, so the stop timer is armed whenever PLAY_EN may be set.
+ 		 */
+ 		if (rc == 0) {
+-			if (nh_write(NH_SID, NH_CFG + CFG_SPMI_PLAY, PLAY_EN | SRC_DIRECT_PLAY) == 0) {
++			if (nh_write(NH_SID, NH_CFG + CFG_SPMI_PLAY, (uint8_t)(PLAY_EN | nh_brake_en | SRC_DIRECT_PLAY)) == 0) {
+ 				nh_playing = true;
+ 				nh_hbst(true);
+ 			} else {
+@@ -438,7 +489,7 @@ negroni_haptic_play(uint32_t ms, uint32_t strength)
+ 		thread_call_enter1_delayed(nh_stop_call, (thread_call_param_t)(uintptr_t)gen, deadline);
+ 	}
+ 	if (nh_plays++ < 8) {
+-		printf("NEGRONI HAPTIC: play %u ms strength %u: rc %d\n", ms, strength, rc);
++		printf("NEGRONI HAPTIC: play %u ms strength %u: rc %d (hBoost waits %u)\n", ms, strength, rc, nh_hbst_waits);
+ 	}
+ 	lck_mtx_unlock(&nh_lock);
+ 	return rc ? -1 : 0;
+@@ -498,6 +549,7 @@ negroni_haptic_init(void)
+ 	(void)PE_parse_boot_argn("negronihap_force", &nh_force, sizeof(nh_force));
+ 	(void)PE_parse_boot_argn("negronihap_pbs", &nh_pbs_arg, sizeof(nh_pbs_arg));
+ 	(void)PE_parse_boot_argn("negronihap_mv", &nh_vmax_mv, sizeof(nh_vmax_mv));
++	(void)PE_parse_boot_argn("negronihap_brake", &nh_brake_arg, sizeof(nh_brake_arg));
+ 	if (nh_vmax_mv < 500u || nh_vmax_mv > NH_MAX_VMAX_MV) {
+ 		nh_vmax_mv = NH_DT_VMAX_MV;
+ 	}

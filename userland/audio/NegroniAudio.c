@@ -33,7 +33,8 @@
  *   "Speaker"   stereo output -> /dev/negroni-audio (dropped while the node does not exist),
  *               plus a silent stereo input (on an iPhone: the amplifier sense data)
  *   "Hawking"   one silent input: the 'vhaw' companion of the default virtual device
- *   "Actuator"  one mono output (Taptic Engine haptics): dropped, no motor driver yet
+ *   "Actuator"  one mono output (Taptic Engine haptics) -> /dev/negroni-haptic (patch 0302; the
+ *               motor path of the kernel, see haptic_put()); dropped while the node does not exist
  *   "Codec"     one mono input (built-in mic, data source 'imic'): silence
  *
  * Clock: the system clock. The device says it plays NEGRONI_AUDIO_RATE frames per second of
@@ -69,6 +70,7 @@
 #include <unistd.h>
 
 #include "negroni_audio.h"
+#include "negroni_haptic.h"
 
 #include "AudioServerPlugIn.h"
 
@@ -289,14 +291,36 @@ writer_round(void)
 	}
 }
 
+/*
+ * Every 30 s while the Speaker runs: the kernel's counters and its guard (patch 0244: the peaks before
+ * and after the guard since the last call, the least guard gain). Writer thread only (it owns `sink`).
+ */
+static void
+kernel_stats(void)
+{
+	struct negroni_audio_stats st;
+
+	if (sink < 0 || ioctl(sink, NEGRONI_AUDIO_GET_STATS, &st) < 0) {
+		return;
+	}
+	say("kernel: state %u, frames in %llu played %llu dropped %llu; guard peak in %u out %u (of 32768), "
+	    "least gain %.1f dB", st.state, (unsigned long long)st.frames_in, (unsigned long long)st.frames_played,
+	    (unsigned long long)st.frames_dropped, st.peak_in, st.peak_out,
+	    st.limiter_gain_q15 ? 20.0 * log10(st.limiter_gain_q15 / 32768.0) : -120.0);
+}
+
 static void *
 writer_main(__unused void *arg)
 {
 	struct timespec pause = { 0, (long)WRITER_NS };
+	unsigned rounds = 0;
 
 	(void)pthread_setname_np("NegroniAudio writer");
 	while (!__atomic_load_n(&writer_stop, __ATOMIC_ACQUIRE)) {
 		writer_round();
+		if (++rounds % (unsigned)(30000000000ull / WRITER_NS) == 0) {
+			kernel_stats();
+		}
 		(void)nanosleep(&pause, NULL);
 	}
 	writer_round();                 /* what the last cycles put in */
@@ -320,6 +344,167 @@ ring_put(const void *frames, UInt32 count)
 	__atomic_store_n(&ring_head, head + bytes, __ATOMIC_RELEASE);
 }
 
+/*
+ * The Actuator (haptics, docs/haptics-plan.md section 8): what iOS plays on it goes to
+ * /dev/negroni-haptic (patches/xnu 0302), where the kernel turns it into the PM8350B motor's
+ * amplitude. The same model as the Speaker: the I/O thread copies into a lock-free SPSC ring
+ * (no system call), a haptic writer thread (made at the Actuator's first StartIO, joined at its
+ * last StopIO) writes the ring to the node. Only sound and the HRING_TAIL frames after it are
+ * copied: long silences cost nothing, and the kernel takes no data as silence. The writer polls
+ * every HWRITER_FAST_NS while sound came in the last HWRITER_IDLE_AFTER_NS, else every
+ * HWRITER_SLOW_NS (the first tap after a pause waits at most that long).
+ */
+#define HRING_FRAMES            16384u  /* 341 ms of S16 mono, a power of two */
+#define HRING_TAIL              (NEGRONI_HAPTIC_RATE / 50)      /* 20 ms of silence after sound */
+#define HWRITER_FAST_NS         2000000ull
+#define HWRITER_SLOW_NS         8000000ull
+#define HWRITER_IDLE_AFTER_NS   500000000ull
+#define HAPTIC_SAID_MAX         12
+_Static_assert((HRING_FRAMES & (HRING_FRAMES - 1)) == 0, "the haptic ring size must be a power of two");
+static int16_t hring[HRING_FRAMES];
+static UInt64 hring_head, hring_tail;   /* atomics, in frames */
+static UInt64 hframes_in, hframes_sent, hframes_dropped, hframes_skipped;      /* atomics */
+static UInt32 htail_left;               /* I/O thread only: silent frames still to copy */
+static int haptic_fd = -1;              /* the haptic writer only */
+static UInt64 haptic_tried;
+static int haptic_last_errno = -1;
+static unsigned haptic_said;
+static const char *haptic_path = NEGRONI_HAPTIC_DEVICE;
+static pthread_t hwriter;
+static bool hwriter_on;                 /* under lock */
+static int hwriter_stop;                /* atomic */
+
+/* The I/O thread (the only producer): no lock, no system call. */
+static void
+haptic_put(const int16_t *s, UInt32 count)
+{
+	UInt32 peak = 0;
+
+	for (UInt32 i = 0; i < count; i++) {
+		UInt32 v = s[i] < 0 ? (UInt32)(-(int32_t)s[i]) : (UInt32)s[i];
+		peak = v > peak ? v : peak;
+	}
+	__atomic_fetch_add(&hframes_in, count, __ATOMIC_RELAXED);
+	if (peak > NEGRONI_HAPTIC_SILENT) {
+		htail_left = HRING_TAIL;
+	} else if (htail_left == 0) {
+		__atomic_fetch_add(&hframes_skipped, count, __ATOMIC_RELAXED);
+		return;
+	} else {
+		htail_left = htail_left > count ? htail_left - count : 0;
+	}
+	UInt64 head = hring_head, tail = __atomic_load_n(&hring_tail, __ATOMIC_ACQUIRE);
+	UInt32 room = (UInt32)(HRING_FRAMES - (head - tail)), n = count < room ? count : room;
+	UInt32 at = (UInt32)(head % HRING_FRAMES), first = n < HRING_FRAMES - at ? n : HRING_FRAMES - at;
+
+	if (n < count) {
+		__atomic_fetch_add(&hframes_dropped, count - n, __ATOMIC_RELAXED);
+	}
+	memcpy(hring + at, s, (size_t)first * 2);
+	memcpy(hring, s + first, (size_t)(n - first) * 2);
+	__atomic_store_n(&hring_head, head + n, __ATOMIC_RELEASE);
+}
+
+/* The haptic writer thread only. */
+static void
+haptic_open(void)
+{
+	UInt64 now = mach_absolute_time();
+
+	if (haptic_fd >= 0 || (haptic_tried != 0 && (now - haptic_tried) * ns_numer / ns_denom < REOPEN_NS)) {
+		return;
+	}
+	haptic_tried = now;
+	haptic_fd = open(haptic_path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	if (haptic_fd >= 0) {
+		haptic_last_errno = 0;
+		say("%s open: the Actuator (haptics) goes to the motor", haptic_path);
+	} else if (errno != haptic_last_errno) {
+		haptic_last_errno = errno;
+		say("%s: %s: the Actuator output is dropped (boot-args negronihap=1 negronihap_ui=1 make the node; "
+		    "retry every 2 s, logged again on a change)", haptic_path, strerror(errno));
+	}
+}
+
+/* One round: write what waits (at most two pieces: the ring wraps). Returns true if frames went. */
+static bool
+haptic_round(void)
+{
+	bool sent = false;
+
+	haptic_open();
+	for (int piece = 0; piece < 2; piece++) {
+		UInt64 head = __atomic_load_n(&hring_head, __ATOMIC_ACQUIRE), tail = hring_tail;
+		UInt32 at = (UInt32)(tail % HRING_FRAMES), n = (UInt32)(head - tail);
+
+		if (n == 0) {
+			break;
+		}
+		if (n > HRING_FRAMES - at) {
+			n = HRING_FRAMES - at;
+		}
+		if (haptic_fd < 0) {
+			__atomic_fetch_add(&hframes_dropped, n, __ATOMIC_RELAXED);
+			__atomic_store_n(&hring_tail, tail + n, __ATOMIC_RELEASE);
+			continue;
+		}
+		ssize_t took = write(haptic_fd, hring + at, (size_t)n * 2);
+		if (took < 0) {
+			if (errno == EAGAIN || errno == EINTR) {
+				break;
+			}
+			say("%s: write error %s: closed, opened again in 2 s", haptic_path, strerror(errno));
+			(void)close(haptic_fd);
+			haptic_fd = -1;
+			haptic_tried = mach_absolute_time();
+			continue;               /* the next piece is dropped */
+		}
+		UInt32 frames = (UInt32)took / 2;
+		if (haptic_said < HAPTIC_SAID_MAX) {
+			UInt32 peak = 0;
+			for (UInt32 i = 0; i < frames; i++) {
+				UInt32 v = hring[at + i] < 0 ? (UInt32)(-(int32_t)hring[at + i]) : (UInt32)hring[at + i];
+				peak = v > peak ? v : peak;
+			}
+			if (peak > NEGRONI_HAPTIC_SILENT) {
+				haptic_said++;
+				say("the Actuator plays: %u frames to the motor, peak %u of 32768%s", frames, peak,
+				    haptic_said == HAPTIC_SAID_MAX ? " (no more of these lines)" : "");
+			}
+		}
+		__atomic_fetch_add(&hframes_sent, frames, __ATOMIC_RELAXED);
+		__atomic_store_n(&hring_tail, tail + frames, __ATOMIC_RELEASE);
+		sent = frames != 0;
+		if (frames < n) {
+			break;
+		}
+	}
+	return sent;
+}
+
+static void *
+hwriter_main(__unused void *arg)
+{
+	UInt64 last_sent = 0;
+
+	(void)pthread_setname_np("NegroniAudio haptic writer");
+	while (!__atomic_load_n(&hwriter_stop, __ATOMIC_ACQUIRE)) {
+		UInt64 now = mach_absolute_time();
+		if (haptic_round()) {
+			last_sent = now;
+		}
+		bool fast = last_sent != 0 && (now - last_sent) * ns_numer / ns_denom < HWRITER_IDLE_AFTER_NS;
+		struct timespec pause = { 0, (long)(fast ? HWRITER_FAST_NS : HWRITER_SLOW_NS) };
+		(void)nanosleep(&pause, NULL);
+	}
+	(void)haptic_round();
+	if (haptic_fd >= 0) {
+		(void)close(haptic_fd);
+		haptic_fd = -1;
+	}
+	return NULL;
+}
+
 #ifdef NEGRONI_AUDIO_HOST_TEST
 /* test-host.c only (not in the iOS build): the ring counters. */
 __attribute__((visibility("default"))) void NegroniAudio_TestStats(UInt64 out[4]);
@@ -330,6 +515,17 @@ NegroniAudio_TestStats(UInt64 out[4])
 	out[1] = __atomic_load_n(&frames_dropped, __ATOMIC_ACQUIRE);
 	out[2] = __atomic_load_n(&bytes_out, __ATOMIC_ACQUIRE);
 	out[3] = __atomic_load_n(&ring_head, __ATOMIC_ACQUIRE) - __atomic_load_n(&ring_tail, __ATOMIC_ACQUIRE);
+}
+
+/* test-host.c only: the Actuator counters (in, sent, dropped, skipped as silence). */
+__attribute__((visibility("default"))) void NegroniAudio_TestHapticStats(UInt64 out[4]);
+void
+NegroniAudio_TestHapticStats(UInt64 out[4])
+{
+	out[0] = __atomic_load_n(&hframes_in, __ATOMIC_ACQUIRE);
+	out[1] = __atomic_load_n(&hframes_sent, __ATOMIC_ACQUIRE);
+	out[2] = __atomic_load_n(&hframes_dropped, __ATOMIC_ACQUIRE);
+	out[3] = __atomic_load_n(&hframes_skipped, __ATOMIC_ACQUIRE);
 }
 #endif
 
@@ -400,6 +596,10 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 	if (getenv("NEGRONI_AUDIO_TEST_PATH") != NULL) {
 		sink_path = getenv("NEGRONI_AUDIO_TEST_PATH");
 		sink_tried = 0;         /* a new path: no 2 s wait */
+	}
+	if (getenv("NEGRONI_HAPTIC_TEST_PATH") != NULL) {
+		haptic_path = getenv("NEGRONI_HAPTIC_TEST_PATH");
+		haptic_tried = 0;
 	}
 #endif
 	say("initialized: Speaker, Hawking, Actuator, Codec (timebase %u/%u)", timebase.numer, timebase.denom);
@@ -898,6 +1098,14 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 			writer_on = pthread_create(&writer, NULL, writer_main, NULL) == 0;
 			say("Speaker starts (writer thread %s)", writer_on ? "runs" : "failed: the output is dropped");
 		}
+		if (d->object == OBJECT_ACTUATOR && !hwriter_on) {
+			/* no haptic writer runs: nobody else touches its ring now */
+			hring_head = hring_tail = 0;
+			htail_left = 0;
+			__atomic_store_n(&hwriter_stop, 0, __ATOMIC_RELEASE);
+			hwriter_on = pthread_create(&hwriter, NULL, hwriter_main, NULL) == 0;
+			say("Actuator starts (haptic writer thread %s)", hwriter_on ? "runs" : "failed: haptics are dropped");
+		}
 	}
 	pthread_mutex_unlock(&lock);
 	pthread_mutex_unlock(&io_lock);
@@ -917,13 +1125,26 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 
 	pthread_mutex_lock(&io_lock);
 	pthread_mutex_lock(&lock);
+	bool hjoin = false;
+	pthread_t hthread;
 	if (d->running != 0 && --d->running == 0 && d->object == OBJECT_SPEAKER && writer_on) {
 		__atomic_store_n(&writer_stop, 1, __ATOMIC_RELEASE);
 		thread = writer;
 		writer_on = false;
 		join = true;
+	} else if (d->running == 0 && d->object == OBJECT_ACTUATOR && hwriter_on) {
+		__atomic_store_n(&hwriter_stop, 1, __ATOMIC_RELEASE);
+		hthread = hwriter;
+		hwriter_on = false;
+		hjoin = true;
 	}
 	pthread_mutex_unlock(&lock);
+	if (hjoin) {
+		(void)pthread_join(hthread, NULL);
+		say("Actuator stops: %llu frames in, %llu to the motor, %llu dropped, %llu silent (not sent)",
+		    __atomic_load_n(&hframes_in, __ATOMIC_ACQUIRE), __atomic_load_n(&hframes_sent, __ATOMIC_ACQUIRE),
+		    __atomic_load_n(&hframes_dropped, __ATOMIC_ACQUIRE), __atomic_load_n(&hframes_skipped, __ATOMIC_ACQUIRE));
+	}
 	if (join) {
 		/* outside the lock: the writer takes it to open the node */
 		(void)pthread_join(thread, NULL);
@@ -999,8 +1220,9 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		memset(buffer, 0, (size_t)frames * 2 * (stream == d->input ? d->input_channels : 1));
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_SPEAKER_OUTPUT) {
 		ring_put(buffer, frames);       /* the writer thread gives it to the kernel */
+	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
+		haptic_put(buffer, frames);     /* the haptic writer gives it to /dev/negroni-haptic */
 	}
-	/* the Actuator output (haptics) is dropped: no motor driver yet */
 	return 0;
 }
 

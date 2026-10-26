@@ -15,8 +15,9 @@ Unicode name ordering is needed), the extents overflow file, decmpfs compression
 and 7/8, 11/12 (LZVN, LZFSE: decoded with macOS libcompression when it is there). Files go to
 OUTDIR (keep it git-ignored: Apple binaries never go into git).
 
-Not supported: HFS+ hard links (their catalog entry points into the hidden private-data
-directory) come out as empty files; symlinks are not followed.
+HFS+ file hard links are followed (the catalog entry is a 'hlnk'/'hfs+' file whose BSD special
+field names iNode<n> in the hidden "\0\0\0\0HFS+ Private Data" directory). Not supported:
+directory hard links; symlinks are not followed.
 """
 import ctypes
 import ctypes.util
@@ -312,7 +313,14 @@ def copy(hfs, cnid, rtype, body, dest, log):
         for name, t, b in list(hfs.children(cnid)):
             copy(hfs, struct.unpack_from(">I", b, 8)[0], t, b, os.path.join(dest, name.replace("/", ":")), log)
         return
-    mode = struct.unpack_from(">H", body, 0x2A + 0)[0] if False else struct.unpack_from(">H", body, 0x2A)[0]
+    if body[0x30:0x38] == b"hlnkhfs+":     # a hard link: the file is iNode<special> in the private-data dir
+        inode = struct.unpack_from(">I", body, 0x2C)[0]
+        r = hfs.lookup("/\0\0\0\0HFS+ Private Data/iNode%d" % inode)
+        if r is None:
+            log.append("%s: hard link to iNode%d, not found" % (dest, inode))
+            return
+        cnid, rtype, body = r
+    mode = struct.unpack_from(">H", body, 0x2A)[0]
     data, how = hfs.file_data(cnid, body)
     if (mode & 0o170000) == 0o120000:   # symbolic link: target in the data fork
         try:

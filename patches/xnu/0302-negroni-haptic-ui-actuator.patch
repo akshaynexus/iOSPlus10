@@ -1,0 +1,463 @@
+iOS UI haptics (CoreHaptics, UIFeedbackGenerator, keyboard taps, the unified vibe engine) on the
+PM8350B LRA. negronihap_ui=1 (needs negronihap=1|2): NegroniVibrator publishes
+IODeviceTree:/product/haptics closed-loop = 1 (D22 values; MobileGestalt
+DeviceSupportsClosedLoopHaptics), and bsd/dev/negroni_haptic_ui.c makes /dev/negroni-haptic: the
+samples iOS plays on the HAL "Actuator" device (NegroniAudio.driver) become the direct-play
+amplitude of patch 0300 (2 ms block peaks, 8 ms hold, HackiOS strength curve, tap >= 20 ms). Also the Linux
+CAL_EN RC-clock toggle when a play forces VREG_RDY (hBoost kept on).
+Details: docs/haptics-plan.md section 8.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6f53ed3..71c9d38 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -391,6 +391,7 @@ bsd/pthread/negroni_pthread_init.c	standard
+ bsd/pthread/negroni_pthread_support.c	standard
+ bsd/pthread/negroni_pthread_synch.c	standard
+ bsd/dev/negroni_rtc.c			standard
++bsd/dev/negroni_haptic_ui.c		standard
+ bsd/pthread/pthread_priority.c		standard
+ bsd/pthread/pthread_workqueue.c		standard
+ 
+diff --git a/bsd/dev/negroni_haptic.c b/bsd/dev/negroni_haptic.c
+index 2c38a69..bb6b1a2 100644
+--- a/bsd/dev/negroni_haptic.c
++++ b/bsd/dev/negroni_haptic.c
+@@ -52,6 +52,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern kern_return_t thread_terminate(thread_t);
+ void negroni_haptic_init(void);
++void negroni_haptic_ui_init(uint32_t hap_mode);  /* negroni_haptic_ui.c, patch 0302 */
+ 
+ #define NH_CHNLS_PA       0x0c500000u     /* arbiter v7 read/write channels, 0x1000 per APID */
+ #define NH_CHNL_STRIDE    0x1000u
+@@ -402,6 +403,18 @@ negroni_haptic_play(uint32_t ms, uint32_t strength)
+ 		rc |= nh_write(NH_SID, NH_CFG + CFG_FAULT_CLR, 0x07);
+ 		/* open-loop drive config (Linux 1540): FORCE_VREG_RDY only while hBoost is kept on */
+ 		rc |= nh_update(NH_SID, NH_CFG + CFG_VSET_CFG, 0x01, nh_hbst_on ? 0x01 : 0x00);
++		if (nh_hbst_on) {
++			/*
++			 * patch 0302: Linux 1555-1575 toggles the RC clock calibration (CAL_EN bits 3:2,
++			 * auto 1 -> disabled 0 -> auto 1) when it forces VREG_RDY. UI haptics play many
++			 * short taps within the 2 s hBoost hold, so this path is now the common one.
++			 */
++			uint8_t cal;
++			if (nh_read(NH_SID, NH_CFG + CFG_CAL_EN, &cal) == 0 && ((cal >> 2) & 3u) == 1u) {
++				rc |= nh_write(NH_SID, NH_CFG + CFG_CAL_EN, (uint8_t)(cal & ~0x0cu));
++				rc |= nh_write(NH_SID, NH_CFG + CFG_CAL_EN, cal);
++			}
++		}
+ 		/*
+ 		 * PLAY_EN only when the whole setup chain succeeded; nh_playing follows the SPMI_PLAY
+ 		 * write alone, so the stop timer is armed whenever PLAY_EN may be set.
+@@ -493,5 +506,6 @@ negroni_haptic_init(void)
+ 	if (kernel_thread_start(nh_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	negroni_haptic_ui_init(nh_mode);        /* patch 0302: negronihap_ui=1, /dev/negroni-haptic */
+ }
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_haptic_ui.c b/bsd/dev/negroni_haptic_ui.c
+new file mode 100644
+index 0000000..3e17866
+--- /dev/null
++++ b/bsd/dev/negroni_haptic_ui.c
+@@ -0,0 +1,321 @@
++/*
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450): iOS UI haptics on the PM8350B LRA (patch 0302).
++ *
++ * Why [V 20H392 shared cache, unslid addresses; docs/haptics-plan.md section 8]:
++ *   UIKit -[UIDevice _feedbackSupportLevel] block 0x189255318: level 2 when
++ *   +[CHHapticEngine supports1stPartyHaptics] (0x1af54fd4c) -> +[AVHapticPlayer supportsHaptics]
++ *   (0x1af58e924) -> PlatformUtilities_iOS::ProductSupportsClosedLoopHaptics (0x1af56cbb0) =
++ *   MGGetBoolAnswer("gqDnklGQnpv5ilgh5uHckw" = DeviceSupportsClosedLoopHaptics). libMobileGestalt
++ *   answers that key (handler 0x19c564a9c) from "IODeviceTree:/product/haptics" property
++ *   "closed-loop". Impact/selection/notification feedback (keyboard taps) needs level 2
++ *   (-[_UIImpactFeedbackGeneratorConfiguration requiredSupportLevel] 0x1890dd1e4 returns 2).
++ *   Level 2 plays through CoreHaptics -> mediaserverd AVHapticServer ("com.apple.audio.hapticd")
++ *   -> the HAL device VirtualAudioDevice_Actuator (VirtualAudio.plugin) -> the physical HAL
++ *   device "Actuator" (NegroniAudio.driver). With closed-loop, FigVibrator also takes the unified
++ *   haptic engine (VibeSynthEngineHasHardwareSupport, haptics-plan section 4): ringtone and
++ *   alert vibration go the same way.
++ *
++ * So with negronihap_ui=1 (needs negronihap=1|2, patch 0300):
++ *   1. NegroniVibrator.cpp (0301 + this patch) adds IODeviceTree:/product/haptics with
++ *      closed-loop = 1 and supports-3rd-party-haptics = 1, the values of the D22 ADT.
++ *   2. This file makes /dev/negroni-haptic. NegroniAudio.driver writes there what iOS plays on
++ *      its "Actuator" output: S16LE mono, NH_UI_RATE frames/s (userland/audio/negroni_haptic.h,
++ *      the same numbers). write() never blocks and never fails on data.
++ *   3. A kernel thread turns the samples into the direct-play amplitude of patch 0300: the
++ *      peak of each NH_UI_BLOCK_MS block, held over NH_UI_WINDOW blocks (one LRA period: a sine
++ *      at the Taptic resonance crosses zero inside a block), mapped to a strength
++ *      (floor .. 255, HackiOS gain_for(): proportional strengths were not felt), played in real
++ *      time from the moment the samples arrive. An onset plays at least negronihap_tapms
++ *      (default 20 ms, about 3 LRA periods at 170 Hz). A continuous play stops after
++ *      NH_UI_MAX_MS and rests NH_UI_REST_MS.
++ *   Model: HackiOS bsd/dev/redwood_haptic.c (external/hackios-xnu-kernel, MIT, Copyright (c)
++ *   2026 OOSEX GANG): /dev/redwood-haptic fed by the same HAL "Actuator" device; there a tap
++ *   peak was 1000..33000 of 32768 and a vibration about 17000 [V their source comment].
++ *   Not FIFO mode: direct play only (docs/haptics-plan.md section 8, "Why not FIFO").
++ *
++ * Boot-args (all need negronihap >= 1):
++ *   negronihap_ui=1        this path (default 0: no /dev node, no DT node)
++ *   negronihap_tapms=N     shortest play of an onset, 5..200 ms (default 20)
++ *   negronihap_uifloor=N   strength of the softest audible sample, 1..255 (default 160)
++ *   negronihap_uilog=N     log the first N plays (default 24)
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "negroni_haptic.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++
++/* userland/audio/negroni_haptic.h has the same numbers */
++#define NH_UI_RATE        48000u          /* frames/s, S16LE mono */
++#define NH_UI_NODE        "negroni-haptic"
++
++#define NH_UI_BLOCK_MS    2u
++#define NH_UI_BLOCK       (NH_UI_RATE / 1000u * NH_UI_BLOCK_MS)  /* 96 frames */
++#define NH_UI_WINDOW      4u              /* blocks: 8 ms, more than one 170-230 Hz period */
++#define NH_UI_QUEUE       256u            /* blocks (512 ms), power of two */
++#define NH_UI_LAG         48u             /* blocks: more queued than 96 ms and the oldest go */
++#define NH_UI_STARVE      6u              /* blocks with no data while playing (12 ms) count as silence */
++#define NH_UI_SILENT      256u            /* of 32768: smaller peaks are silence (HackiOS SILENT_BELOW) */
++#define NH_UI_FULL        (32767u / 3u)   /* from a third of full scale up: strength 255 */
++#define NH_UI_REFRESH_MS  16u             /* a play is renewed at least this often ... */
++#define NH_UI_GUARD_MS    40u             /* ... for this long: a stalled thread stops the motor */
++#define NH_UI_MAX_MS      5000u           /* a continuous play is cut here ... */
++#define NH_UI_REST_MS     1000u           /* ... and the motor rests this long */
++#define NH_UI_STEP_DELTA  8u              /* a smaller strength change is not written */
++_Static_assert((NH_UI_QUEUE & (NH_UI_QUEUE - 1u)) == 0, "queue size must be a power of two");
++
++static LCK_GRP_DECLARE(nhu_grp, "negroni_haptic_ui");
++static LCK_MTX_DECLARE(nhu_lock, &nhu_grp);
++static uint16_t nhu_q[NH_UI_QUEUE];       /* block peaks; nhu_lock */
++static uint32_t nhu_head, nhu_tail;       /* nhu_lock; both only grow */
++static uint32_t nhu_part_frames, nhu_part_peak;   /* the block being filled; nhu_lock */
++static uint64_t nhu_frames_in, nhu_blocks_dropped, nhu_writes;
++static uint32_t nhu_tap_ms = 20, nhu_floor = 160, nhu_log = 24;
++static int nhu_major = -1;
++static bool nhu_on;
++
++static void
++nhu_push_locked(uint32_t peak)
++{
++	if (nhu_head - nhu_tail >= NH_UI_LAG) {
++		nhu_tail = nhu_head - (NH_UI_LAG - 1u);   /* keep the newest: latency stays bounded */
++		nhu_blocks_dropped++;
++	}
++	nhu_q[nhu_head % NH_UI_QUEUE] = (uint16_t)(peak > 32768u ? 32768u : peak);
++	nhu_head++;
++}
++
++/* The writer is NegroniAudio.driver's haptic thread (not the HAL I/O thread): a mutex is fine. */
++static int
++nhu_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t s[256];
++	int error = 0;
++	bool loud = false;
++
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t n = uio_resid(uio);
++		if (n > (user_ssize_t)sizeof(s)) {
++			n = sizeof(s);
++		}
++		n &= ~(user_ssize_t)1;
++		if ((error = uiomove((caddr_t)s, (int)n, uio)) != 0) {
++			break;
++		}
++		lck_mtx_lock(&nhu_lock);
++		for (unsigned i = 0; i < (unsigned)n / 2u; i++) {
++			uint32_t v = s[i] < 0 ? (uint32_t)(-(int32_t)s[i]) : (uint32_t)s[i];
++			if (v > nhu_part_peak) {
++				nhu_part_peak = v;
++			}
++			if (++nhu_part_frames == NH_UI_BLOCK) {
++				loud |= nhu_part_peak > NH_UI_SILENT;
++				nhu_push_locked(nhu_part_peak);
++				nhu_part_frames = 0;
++				nhu_part_peak = 0;
++			}
++		}
++		nhu_frames_in += (uint64_t)n / 2u;
++		lck_mtx_unlock(&nhu_lock);
++	}
++	nhu_writes++;
++	if (loud) {
++		thread_wakeup((event_t)&nhu_head);
++	}
++	return error;
++}
++
++static int
++nhu_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static const struct cdevsw nhu_cdevsw = {
++	.d_open = nhu_open,
++	.d_close = nhu_open,
++	.d_read = eno_rdwrt,
++	.d_write = nhu_write,
++	.d_ioctl = eno_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type = 0,
++};
++
++/* HackiOS gain_for(), on the 0..255 direct-play scale: the floor for the softest, 255 from a third up */
++static uint32_t
++nhu_strength(uint32_t peak)
++{
++	if (peak <= NH_UI_SILENT) {
++		return 0;
++	}
++	if (peak >= NH_UI_FULL) {
++		return 255;
++	}
++	return nhu_floor + (255u - nhu_floor) * (peak - NH_UI_SILENT) / (NH_UI_FULL - NH_UI_SILENT);
++}
++
++static uint64_t
++nhu_ms_to_abs(uint32_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &t);
++	return t;
++}
++
++__attribute__((noreturn)) static void
++nhu_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	const uint64_t step = nhu_ms_to_abs(NH_UI_BLOCK_MS);
++	uint16_t win[NH_UI_WINDOW] = { 0 };
++	unsigned wi = 0, starve = 0;
++	bool playing = false;
++	uint32_t strength = 0, written = 0, peak_max = 0, plays = 0;
++	uint64_t next = 0, onset = 0, refreshed = 0, rest_until = 0;
++
++	printf("NEGRONI HAPTIC UI: /dev/%s ready: S16LE mono %u Hz, %u ms blocks, tap >= %u ms, floor %u, "
++	    "cut at %u ms\n", NH_UI_NODE, NH_UI_RATE, NH_UI_BLOCK_MS, nhu_tap_ms, nhu_floor, NH_UI_MAX_MS);
++	for (;;) {
++		uint32_t peak = 0;
++		bool have = false;
++
++		lck_mtx_lock(&nhu_lock);
++		if (nhu_head != nhu_tail) {
++			peak = nhu_q[nhu_tail % NH_UI_QUEUE];
++			nhu_tail++;
++			have = true;
++		}
++		lck_mtx_unlock(&nhu_lock);
++
++		uint64_t now = mach_absolute_time();
++		if (!playing && !have) {
++			/* idle: sleep until a write brings a block that is not silence */
++			for (unsigned i = 0; i < NH_UI_WINDOW; i++) {
++				win[i] = 0;
++			}
++			starve = 0;
++			assert_wait((event_t)&nhu_head, THREAD_UNINT);
++			lck_mtx_lock(&nhu_lock);
++			bool more = nhu_head != nhu_tail;
++			lck_mtx_unlock(&nhu_lock);
++			if (more) {
++				clear_wait(current_thread(), THREAD_AWAKENED);
++			} else {
++				(void)thread_block(THREAD_CONTINUE_NULL);
++			}
++			next = mach_absolute_time();
++			continue;
++		}
++		if (have) {
++			starve = 0;
++		} else if (++starve <= NH_UI_STARVE) {
++			peak = win[(wi + NH_UI_WINDOW - 1u) % NH_UI_WINDOW];      /* a late write: hold */
++		}
++		win[wi] = (uint16_t)peak;
++		wi = (wi + 1u) % NH_UI_WINDOW;
++		uint32_t env = 0;
++		for (unsigned i = 0; i < NH_UI_WINDOW; i++) {
++			env = win[i] > env ? win[i] : env;
++		}
++		uint32_t want = rest_until > now ? 0 : nhu_strength(env);
++
++		if (want && !playing) {
++			playing = true;
++			onset = refreshed = next = now;
++			strength = want;
++			written = want;
++			peak_max = env;
++			(void)negroni_haptic_play(NH_UI_GUARD_MS, want);
++		} else if (playing) {
++			bool tap_held = now - onset < nhu_ms_to_abs(nhu_tap_ms);
++			bool cut = now - onset >= nhu_ms_to_abs(NH_UI_MAX_MS);
++			if (want == 0 && tap_held && !cut) {
++				want = written;         /* the shortest play of an onset */
++			}
++			peak_max = env > peak_max ? env : peak_max;
++			if (want == 0 || cut) {
++				(void)negroni_haptic_play(0, 0);
++				playing = false;
++				plays++;
++				if (cut) {
++					rest_until = now + nhu_ms_to_abs(NH_UI_REST_MS);
++				}
++				if (plays <= nhu_log) {
++					uint64_t ns;
++					absolutetime_to_nanoseconds(now - onset, &ns);
++					printf("NEGRONI HAPTIC UI: play %u: %llu ms, peak %u of 32768, strength %u (last %u)%s; "
++					    "%llu frames in, %llu blocks dropped\n", plays, ns / NSEC_PER_MSEC, peak_max, strength, written,
++					    cut ? " (CUT: rests 1 s)" : "", nhu_frames_in, nhu_blocks_dropped);
++				}
++			} else if (want + NH_UI_STEP_DELTA <= written || want >= written + NH_UI_STEP_DELTA ||
++			    now - refreshed >= nhu_ms_to_abs(NH_UI_REFRESH_MS)) {
++				(void)negroni_haptic_play(NH_UI_GUARD_MS, want);
++				written = want;
++				refreshed = now;
++			}
++		}
++		if (!playing) {
++			continue;               /* silent blocks drain at once; then the idle wait */
++		}
++		/* real time: one block per NH_UI_BLOCK_MS from the last wake, resync after a stall */
++		next += step;
++		if (next + 10u * step < mach_absolute_time()) {
++			next = mach_absolute_time() + step;
++		}
++		assert_wait_deadline((event_t)&nhu_tap_ms, THREAD_UNINT, next);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++void negroni_haptic_ui_init(uint32_t hap_mode);
++
++/* From negroni_haptic_init (patch 0300), after its own boot-args; hap_mode = negronihap. */
++void
++negroni_haptic_ui_init(uint32_t hap_mode)
++{
++	uint32_t ui = 0;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("negronihap_ui", &ui, sizeof(ui));
++	if (hap_mode == 0 || ui == 0 || nhu_on) {
++		return;
++	}
++	(void)PE_parse_boot_argn("negronihap_tapms", &nhu_tap_ms, sizeof(nhu_tap_ms));
++	(void)PE_parse_boot_argn("negronihap_uifloor", &nhu_floor, sizeof(nhu_floor));
++	(void)PE_parse_boot_argn("negronihap_uilog", &nhu_log, sizeof(nhu_log));
++	if (nhu_tap_ms < 5u || nhu_tap_ms > 200u) {
++		nhu_tap_ms = 20;
++	}
++	if (nhu_floor < 1u || nhu_floor > 255u) {
++		nhu_floor = 160;
++	}
++	nhu_major = cdevsw_add(-1, &nhu_cdevsw);
++	if (nhu_major < 0) {
++		printf("NEGRONI HAPTIC UI: cdevsw_add failed\n");
++		return;
++	}
++	if (devfs_make_node(makedev(nhu_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, NH_UI_NODE) == NULL) {
++		printf("NEGRONI HAPTIC UI: /dev/%s cannot be made\n", NH_UI_NODE);
++		return;
++	}
++	nhu_on = true;
++	if (kernel_thread_start(nhu_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/iokit/Kernel/arm/NegroniVibrator.cpp b/iokit/Kernel/arm/NegroniVibrator.cpp
+index 75e10e8..4240dc4 100644
+--- a/iokit/Kernel/arm/NegroniVibrator.cpp
++++ b/iokit/Kernel/arm/NegroniVibrator.cpp
+@@ -27,6 +27,9 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSData.h>
++#include <IOKit/IORegistryEntry.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSString.h>
+@@ -61,9 +64,62 @@ private:
+ 
+ OSDefineMetaClassAndStructors(NegroniVibrator, IOService);
+ 
++/*
++ * Patch 0302 (negronihap_ui=1): IODeviceTree:/product/haptics as in the D22 ADT
++ * (external/slop/research/ipsw-x/d22ap.adt: closed-loop = 1, supports-3rd-party-haptics = 1).
++ * libMobileGestalt [V 20H392]: DeviceSupportsClosedLoopHaptics (gqDnklGQnpv5ilgh5uHckw, handler
++ * 0x19c564a9c) = "IODeviceTree:/product/haptics" "closed-loop"; DeviceSupportsHaptics
++ * (cBy4BcYs5YWtFHbBpt4C6A, 0x19c576454) looks at "IODeviceTree:/product" for "haptics".
++ * With them UIKit's feedback level is 2 and CoreHaptics, UIFeedbackGenerator and the vibe engine
++ * play on VirtualAudioDevice_Actuator -> NegroniAudio "Actuator" -> /dev/negroni-haptic
++ * (bsd/dev/negroni_haptic_ui.c). Called before the "vibrator" checks: it does not need negronivib.
++ */
++static void
++negroni_publish_haptics_node(void)
++{
++	uint32_t hap = 0, ui = 0;
++	(void)PE_parse_boot_argn("negronihap", &hap, sizeof(hap));
++	(void)PE_parse_boot_argn("negronihap_ui", &ui, sizeof(ui));
++	if (hap == 0 || ui == 0) {
++		return;
++	}
++	IORegistryEntry *product = IORegistryEntry::fromPath("/product", gIODTPlane);
++	if (product == NULL) {
++		IOLog("NEGRONI HAPTIC UI: no IODeviceTree:/product: closed-loop not published\n");
++		return;
++	}
++	IORegistryEntry *old = product->childFromPath("haptics", gIODTPlane);
++	if (old != NULL) {
++		IOLog("NEGRONI HAPTIC UI: IODeviceTree:/product/haptics exists already (ADT): kept\n");
++		old->release();
++		product->release();
++		return;
++	}
++	static const uint32_t one = 1;
++	static const char name[] = "haptics";
++	IORegistryEntry *node = new IORegistryEntry;
++	OSData *n = OSData::withBytes(name, sizeof(name));
++	OSData *cl = OSData::withBytes(&one, sizeof(one));
++	OSData *third = OSData::withBytes(&one, sizeof(one));
++	bool ok = node && n && cl && third && node->init(NULL);
++	if (ok) {
++		node->setName(name);
++		ok = node->setProperty("name", n) && node->setProperty("closed-loop", cl) &&
++		    node->setProperty("supports-3rd-party-haptics", third) && node->attachToParent(product, gIODTPlane);
++	}
++	IOLog("NEGRONI HAPTIC UI: IODeviceTree:/product/haptics closed-loop = 1, supports-3rd-party-haptics = 1: %s\n",
++	    ok ? "published (UI haptics -> VirtualAudioDevice_Actuator -> /dev/negroni-haptic)" : "FAILED");
++	OSSafeReleaseNULL(n);
++	OSSafeReleaseNULL(cl);
++	OSSafeReleaseNULL(third);
++	OSSafeReleaseNULL(node);        /* the parent link keeps it */
++	product->release();
++}
++
+ bool
+ NegroniVibrator::start(IOService *provider)
+ {
++	negroni_publish_haptics_node();         /* patch 0302: negronihap_ui=1 */
+ 	uint32_t hap = 0, vib = 1;
+ 	(void)PE_parse_boot_argn("negronihap", &hap, sizeof(hap));
+ 	(void)PE_parse_boot_argn("negronivib", &vib, sizeof(vib));

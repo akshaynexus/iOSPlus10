@@ -4,13 +4,16 @@ Marks: **[V]** seen in source, DT, ADT, shared cache or build log. **[I]** infer
 
 Status: 0300 (direct play + boot proof) and 0301 (iOS "vibrator" IOService) built, **not run on the
 phone** (phone off). Image `out/ios16-hap` = config boot-args + `negronihap=1`.
+Update (evening): 0302 (UI haptics: closed-loop node + `/dev/negroni-haptic` from the NegroniAudio "Actuator"
+device) and 0303 (closed-loop brake + hBoost-ready wait) built into `out/ios16-hap2`: section 8.
 
 ## 1. Hardware
 
 - [V] `out/live.dts`: `qcom,hv-haptics@f000` under `qcom,pm8350b@3` (SPMI bus 0, SID 3),
   `status = "ok"`, `reg = <0xf000 0xf100 0xf200>` (HAP_CFG, HAP_PTN, HAP_BOOST), irq "fifo-empty".
   Properties: `qcom,vmax-mv` 1680, `qcom,lra-period-us` 5882 (170 Hz LRA), `qcom,drv-sig-shape` 1
-  (sine), `qcom,brake-mode` 1, `qcom,fifo-vmax-mv` 8700, `qcom,vibrator-type` 8151 (= `VIBRATOR_TYPE_SLA0815`
+  (sine), `qcom,brake-mode` 1 (CL_BRAKE), **`qcom,brake-pattern = [ff 3f 1f]`** and `qcom,brake-sig-shape` 1
+  (live.dts:13110-13113; the first version of this file left the pattern out), `qcom,fifo-vmax-mv` 8700, `qcom,vibrator-type` 8151 (= `VIBRATOR_TYPE_SLA0815`
   in the OnePlus driver), `nvmem = <hap_cfg_sdam>` = PMK8350 `sdam@9d00` (SID 0),
   `nvmem-cells = <hap_cl_brake>` = sdam@7100 offset 0x7c, `qcom,pbs-client` = PM8350B `pbs@1900`.
 - [V] `swr_haptics@f0170220` (`qcom,pm8350b-swr-haptics`) under the LPASS SoundWire RX master: the same
@@ -51,7 +54,7 @@ Constant effect = DIRECT_PLAY (`haptics_load_constant_effect` 2134, `haptics_pla
 - Review fixes (2026-10-26): PLAY_EN is written only when the whole setup chain succeeded; `nh_playing`
   follows the SPMI_PLAY write alone, so the stop timer is armed whenever PLAY_EN may be set (a failed PLAY_EN
   write is followed by SPMI_PLAY = 0x01). Refused-write log lines are capped at 16.
-- Known gaps versus Linux qcom-hv-haptics.c [I: effect not measured]:
+- Known gaps versus Linux qcom-hv-haptics.c [I: effect not measured] (all three closed by 0302/0303, section 8):
   - no BRAKE_EN in SPMI_PLAY and no brake pattern: the LRA rings down by itself after stop (a soft tail);
   - no `haptics_wait_hboost_ready` poll (Linux 1436: up to 100 x 200 us = 20 ms for HBST VREG_EN / STATUS4):
     the first ms of a play can run before hBoost is up;
@@ -142,3 +145,82 @@ Addresses are unslid shared-cache vaddrs (out/dsc/cache/dyld_shared_cache_arm64,
 - [V] Image `out/ios16-hap` (config boot-args + `negronihap=1`): boot_a.img sha256
   `99a1123a3119214b39a6af64961aa73ab081cb59df9e9442e46c3c8cc9b7997c`, vendor_boot_a.img `c29329ee...`,
   negroni.adt `fd837f16...` (`out/ios16-hap/SHA256SUMS`). Not flashed, not booted.
+
+## 8. UI haptics: patches 0302-0303 + NegroniAudio Actuator (2026-10-26 evening, build-only)
+
+### 8.1 How iOS 16 turns a feedback into hardware [V 20H392 cache, unslid addresses]
+
+| Step | Where | Fact |
+|---|---|---|
+| UIKit level | `-[UIDevice(_UIFeedbackEngineSupport) _feedbackSupportLevel]` 0x1890dc6d8, block 0x189255318 | 2 if `+[CHHapticEngine supports1stPartyHaptics]`, else `MGGetBoolAnswer("cBy4BcYs5YWtFHbBpt4C6A")` (DeviceSupportsHaptics: 0 or 1). Internal pref `DisableLevel2Feedback` |
+| Level needed | `-[_UIImpactFeedbackGeneratorConfiguration requiredSupportLevel]` 0x1890dd1e4 | `mov w0, #2`: impact (and the keyboard) need level 2. Level 1 = `_UIFeedbackSystemSoundEngine` (system sounds 1519-1521), not enough |
+| CoreHaptics | `+[CHHapticEngine supports1stPartyHaptics]` 0x1af54fd4c -> `supportsHapticServer` 0x1af588880 -> `+[AVHapticPlayer supportsHaptics]` 0x1af58e924, block 0x1af58e964 | `PlatformUtilities_iOS::ProductSupportsClosedLoopHaptics()` 0x1af56cbb0 = `MGGetBoolAnswer("gqDnklGQnpv5ilgh5uHckw")` |
+| MobileGestalt | libMobileGestalt key table (extracted dylib, entries {key, handler}): `gqDnklGQnpv5ilgh5uHckw` -> 0x19c564a9c, `cBy4BcYs5YWtFHbBpt4C6A` -> 0x19c576454 | the key = base64(md5("MGCopyAnswer" + name))[:22]: **DeviceSupportsClosedLoopHaptics** = `IODeviceTree:/product/haptics` property `closed-loop` (obfuscated name `XKpK5v7PGzbe7igjloNBpQ` = md5 of "closed-loop"); **DeviceSupportsHaptics** = `IODeviceTree:/product` + `haptics` (`6S9CvPHPtzHQqKudHSfsag`), the child node [I: the D22 /product has no "haptics" property, only the child] |
+| D22 ADT | external/slop/research/ipsw-x/d22ap.adt `/product/haptics` | `closed-loop` = 01000000, `supports-3rd-party-haptics` = 01000000. Our negroni.adt `/product` has no children [V] |
+| Haptic server | launchd plist com.apple.mediaserverd.plist: MachService `com.apple.audio.hapticd` | AVHapticServer (AudioToolbox, `AVHapticServer.mm`) runs in **mediaserverd** |
+| HAL device | `VirtualAudioDevice_Actuator` (AudioToolbox 0x1a0aa9c6c, MediaExperience, libVibeSynthEngine) | made by VirtualAudio.plugin (`Device_Actuator_Aspen.cpp`, `VAD_Actuator`, `Creating Actuator Port`, `Could not find actuator port after 8 seconds`) on top of the physical HAL device with UID **"Actuator"**: NegroniAudio.driver has it (HackiOS design) |
+| Waveforms | root `/Library/Audio/Tunings/D22/Haptics/*.wav` (read with the hard-link fix of scripts/audio/hfs-extract.py) | 48 kHz mono S16 taps: MicroTap 3.6-10.8 ms, MiniTap 4.7-16.9 ms, FullTap 7.5-28.6 ms active, peak 1.0 FS; Keyboard-Key/Delete/Modifier.wav 44.1 kHz, **peak 0.10 FS, 3.2-6.8 ms active**; hapticengineconfig.plist `BaseSineFrequency` 145 |
+| Keyboard | UIKitCore `CHHapticPatternLibraryKeyKeyboardInputText`, `...Deletion`, `...Other` | the keyboard plays CoreHaptics library patterns: same server, same Actuator. iOS 16 setting: Settings > Sounds & Haptics > Keyboard Feedback > Haptic [I: off by default] |
+| Ringtone/alerts | `VibeSynthEngineHasHardwareSupport` (section 4) | with closed-loop true: "New Unified Haptic/Vibe Engine" (HapticServerManager_VibeEngine*): vibration patterns also go to the Actuator, not to 0301 |
+
+HackiOS (external/hackios-xnu-kernel bsd/dev/redwood_haptic.c, hackios-xnu-userland audio_plugin.c, MIT) used the
+same chain on the POCO X5 (D22 identity, iOS 16.5): mkidentity.py copies `/product/haptics`; the plug-in writes the
+Actuator samples to `/dev/redwood-haptic`. Their source comment [V text, I result]: tap peaks 1000..33000 of 32768,
+vibration ~17000; strength proportional to the peak was not felt, so a floor of 5/8 and full from 1/3 scale.
+
+### 8.2 What was built
+
+- **0302** (`bsd/dev/negroni_haptic_ui.c`, new; `NegroniVibrator.cpp`; `negroni_haptic.c`; conf line anchored after
+  `negroni_rtc.c`, no collision with 0310/0330/0350). `negronihap_ui=1` (needs `negronihap=1|2`):
+  - `NegroniVibrator::start` adds `IODeviceTree:/product/haptics` {`name`, `closed-loop` = 1,
+    `supports-3rd-party-haptics` = 1} (attachToParent in gIODTPlane), before its own negronivib check. If the ADT has the
+    node it is kept.
+  - `/dev/negroni-haptic` (0666): write S16LE mono 48 kHz. 2 ms blocks (96 frames) -> block peak -> queue (latency cap
+    96 ms). A kernel thread plays the queue in real time: envelope = max of the last 4 blocks (8 ms, longer than one
+    145-300 Hz period), strength = 0 below 256, `negronihap_uifloor` (160) .. 255 linear up to 1/3 FS, then 255;
+    `negroni_haptic_play(40 ms, s)` on a change of >= 8 or every 16 ms (a stalled thread stops the motor in 40 ms);
+    an onset plays at least `negronihap_tapms` (20 ms = 3.4 LRA periods; Keyboard-Key.wav is only 3.2 ms); a late
+    write holds the level 12 ms; a play is cut at 5 s and the motor rests 1 s. Idle: the thread sleeps on an event.
+  - The Linux CAL_EN RC-clock toggle (1555-1575) when a play sets FORCE_VREG_RDY (hBoost kept on: the common case
+    when typing).
+- **0303** (`negroni_haptic.c`): closed-loop brake (BRAKE_MODE_CFG 0x50 = 0x41 under mask 0xcf; HAP_PTN 0x70..0x77 =
+  ff 3f 1f 00 00 00 00 00; SPMI_PLAY play 0x89, stop 0x09; `negronihap_brake=0` = the 0300 behaviour), and the
+  hBoost-ready wait (100 x 200 us while VREG_EN or STATUS4 bit 0 says busy; open loop = ready; skipped when hBoost
+  is kept on, as Linux). Not done: the CL-brake SDAM store (Linux `haptics_store_cl_brake_settings`); the PMIC keeps
+  Android's CL brake registers 0x51-0x53 over an AP reboot [I].
+- **NegroniAudio.driver** (`userland/audio/NegroniAudio.c`, ABI `userland/audio/negroni_haptic.h`): Actuator WriteMix
+  -> lock-free SPSC ring (16384 frames) -> "haptic writer" thread (started at the Actuator's first StartIO, joined at
+  the last StopIO) -> `/dev/negroni-haptic`. The I/O thread makes no system call. Only sound and the 20 ms after it
+  are copied; silence costs nothing. The writer polls every 2 ms for 500 ms after sound, else every 8 ms. Open
+  failure: dropped, retry every 2 s, logged once per change. Host test (`userland/audio/build.sh`): 29280 frames in,
+  1440 sent (480 tap + 960 tail), 27840 silent not sent, FIFO got the same 1440 frames: PASS.
+- **Why not FIFO mode**: the FIFO path (Linux `haptics_set_fifo`, the fifo-empty IRQ, refill from a thread at the
+  play rate, the per-revision FIFO sizes) is several hundred lines and needs the IRQ or a fast poll; the direct-play
+  path is not run on the phone yet. The envelope gives the felt result of a tap (an LRA at 170 Hz cannot follow a
+  145-300 Hz carrier anyway). FIFO stays the next step if taps feel too uniform.
+
+### 8.3 Proof lines (usblog) and test
+
+```
+NEGRONI HAPTIC: closed-loop brake (pattern ff 3f 1f): on
+NEGRONI HAPTIC UI: /dev/negroni-haptic ready: S16LE mono 48000 Hz, 2 ms blocks, tap >= 20 ms, floor 160, cut at 5000 ms
+NEGRONI HAPTIC UI: IODeviceTree:/product/haptics closed-loop = 1, supports-3rd-party-haptics = 1: published (...)
+NegroniAudio: Actuator starts (haptic writer thread runs)            (mediaserverd stderr, if it reaches the log)
+NegroniAudio: /dev/negroni-haptic open: the Actuator (haptics) goes to the motor
+NegroniAudio: the Actuator plays: N frames to the motor, peak P of 32768
+NEGRONI HAPTIC UI: play 1: 20 ms, peak P of 32768, strength S (last S); F frames in, 0 blocks dropped
+```
+
+1. Root: `userland/audio/build.sh`, then `scripts/haptics/phone-haptics.sh push` on the running phone (or a root build
+   with `HAPTICS=1`). It removes the MobileGestalt cache (it may hold closed-loop = false).
+2. Boot `out/ios16-hap2` (owner approval for `boot_a`).
+3. Feel: Settings switches, long press on an icon, pull-to-refresh, Control Center; keyboard after turning on
+   Settings > Sounds & Haptics > Keyboard Feedback > Haptic; ringtone preview in Settings > Sounds & Haptics.
+4. If nothing: no `Actuator starts` line = VirtualAudio did not make VirtualAudioDevice_Actuator (look for `Could not
+   find actuator port`), or MobileGestalt still answers false (cache). `peak` lines but no feel: `negronihap_mv=2500`,
+   `negronihap_uifloor=220`, `negronihap_tapms=30`; `negronihap_uilog=N` = log the first N plays (default 24).
+
+Risks [I]: VirtualAudio may want an "ActuatorIV" (current/voltage sense) input for closed loop (HackiOS ran without it);
+with closed-loop on and no working Actuator chain, ringtone vibration is lost too (0301 is no longer used): boot without
+`negronihap_ui` and clear the MobileGestalt cache to go back; hBoost stays on 2 s after each tap (battery while typing).
+
