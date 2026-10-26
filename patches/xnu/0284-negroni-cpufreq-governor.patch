@@ -1,0 +1,537 @@
+diff --git a/bsd/dev/negroni_cpufreq.c b/bsd/dev/negroni_cpufreq.c
+--- a/bsd/dev/negroni_cpufreq.c
++++ b/bsd/dev/negroni_cpufreq.c
+@@ -14,17 +14,54 @@
+  * the row ABL left it at.
+  * Patch 0280: negroni_cpufreq_cap(mhz) changes the cap at run time (the thermal
+  * policy); the same rule: never below the row ABL left.
++ *
++ * Patch 0284: a governor. A kernel thread wakes every 100 ms, reads the
++ * per-CPU tick counters of the running kernel (processor_cpu_load_info() in
++ * osfmk/kern/processor.c: user/system/idle ticks of hz_tick_interval = 10 ms
++ * from processor->pr_recount, the numbers host_statistics(HOST_CPU_LOAD_INFO)
++ * returns as cpu_ticks[]) and steps the EPSS PERF_STATE row of each domain.
++ * busy % = (user + system + nice ticks) * 100 / all ticks over the last
++ * 300 ms (3 samples: a 10 ms tick is coarse against a 100 ms window);
++ * a domain's busy is its busiest core.
++ *   busy > negronicpufreq_hi (70 %)                 -> +1 row (per 100 ms tick) up to the cap
++ *   busy < negronicpufreq_lo (30 %) for 3 ticks     -> -1 row down to the floor
++ * The cap is the smaller of negronicpufreq_mhz and the thermal cap (0280).
++ * The floor of every domain is the row ABL left (0098 rule: never below it).
++ * negronicpufreq_floor_mhz=N raises the floor to the highest row not above
++ * N MHz; it never puts the floor below the ABL row. Three checks keep the row
++ * at or above the ABL row: the floor (gov_start), the cap (raise_domain and
++ * negroni_cpufreq_cap never go below the ABL row), and wr_perf_state(), the one
++ * place that writes PERF_STATE after boot, which raises a lower row to the ABL row.
++ * negronicpufreq_gov=0 keeps the one-shot raise of 0096/0098 (no thread).
++ * The log line also shows the LMh limit of each domain (DOMAIN_STATE [7:0] * 19.2
++ * MHz, qcom-cpufreq-hw.c line 143: the hardware throttle when the die is hot).
++ * Register check against the OnePlus kernel (out/src/op-kernel/drivers/cpufreq/
++ * qcom-cpufreq-hw.c, cpufreq_qcom_epss_std_offsets lines 104-110): FREQ_LUT 0x100,
++ * VOLT_LUT 0x200, PERF_STATE 0x320, CYCLE_CNTR 0x3c4, DOMAIN_STATE 0x020; row decode
++ * lines 495-506: src = [31:30], lval = [7:0], src ? xo * lval : alternate / 2;
++ * the table ends at the first repeated frequency (line 516). Domain bases and
++ * qcom,lut-row-size = 4: out/live.dts qcom,cpufreq-hw (reg 0x17d91000/92000/93000).
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <string.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/processor.h>
++#include <mach/machine.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* osfmk/kern/processor.c (MACH_KERNEL_PRIVATE in the header): the HOST_CPU_LOAD_INFO counters of one CPU */
++extern void processor_cpu_load_info(processor_t processor, natural_t ticks[CPU_STATE_MAX]);
+ void negroni_cpufreq_init(void);
+ void negroni_cpufreq_cap(uint32_t mhz);
++void negroni_cpufreq_line(char *buf, size_t size);
++void negroni_cpufreq_mhz_line(char *buf, size_t size);
+ 
+ #define EPSS_PHYS               0x17d91000UL    /* domain 0: A510 0-3, 1: A710 4-6, 2: X2 7 */
+ #define EPSS_DOMAIN_SIZE        0x1000UL
+@@ -32,13 +69,40 @@ void negroni_cpufreq_cap(uint32_t mhz);
+ #define EPSS_FREQ_TABLE         0x100           /* a word per row: [31:30] source, [7:0] multiple of 19.2 MHz */
+ #define EPSS_TABLE_ROWS         40
+ #define EPSS_PERF_STATE         0x320           /* the wanted row */
++#define EPSS_DOMAIN_STATE       0x020           /* [7:0]: the LMh limit, a multiple of 19.2 MHz */
+ #define XO_KHZ                  19200
+ #define ALTERNATE_KHZ           300000          /* source 0: GPLL0 300 MHz */
+ 
++#define GOV_TICK_MS             100
++#define GOV_LOW_TICKS           3               /* 300 ms below the low mark before -1 row */
++#define GOV_WINDOW              3               /* busy % over the last 3 samples (300 ms) */
++#define GOV_LOG_TICKS           600             /* a line a minute */
++#define GOV_CHANGE_TICKS        10              /* at most one change line a second */
++#define GOV_MAX_CPUS            16
++
+ static vm_offset_t dom_base[EPSS_DOMAINS];
+ static uint32_t dom_abl_row[EPSS_DOMAINS], dom_cores[EPSS_DOMAINS];
+ static bool dom_known;
+ 
++/* 0284: the table of each domain (rows that go up; the EPSS table ends by repeating a row) */
++static uint32_t dom_khz[EPSS_DOMAINS][EPSS_TABLE_ROWS];
++static uint32_t dom_rows[EPSS_DOMAINS];         /* rows in use: 0..dom_rows-1 */
++static uint32_t dom_cap_row[EPSS_DOMAINS];      /* upper bound: negronicpufreq_mhz and the thermal cap */
++static uint32_t dom_floor_row[EPSS_DOMAINS];    /* lower bound now: min(cfg_floor_row, dom_cap_row) */
++static uint32_t cfg_floor_row[EPSS_DOMAINS];    /* the configured floor (ABL row or negronicpufreq_floor_mhz) */
++static uint32_t dom_row[EPSS_DOMAINS];          /* the row we asked for last */
++static uint32_t dom_busy[EPSS_DOMAINS];         /* busiest core of the domain, %, last tick */
++static uint32_t dom_low_ticks[EPSS_DOMAINS];
++static uint32_t gov_on = 1, gov_hi = 70, gov_lo = 30, cap_mhz_now = 3200;
++static uint32_t cpu_busy_last[GOV_MAX_CPUS], cpu_all_last[GOV_MAX_CPUS];
++static uint32_t cpu_busy_d[GOV_MAX_CPUS][GOV_WINDOW], cpu_all_d[GOV_MAX_CPUS][GOV_WINDOW];
++static uint32_t win_at;
++static bool sampled;                            /* the first sample only sets the base */
++static char gov_line[128];
++/* the governor thread and the thermal thread (0280) both move the rows */
++static LCK_GRP_DECLARE(cpufreq_grp, "negroni_cpufreq");
++static LCK_MTX_DECLARE(cpufreq_lock, &cpufreq_grp);
++
+ static uint32_t
+ domain_of(uint32_t phys_id)
+ {
+@@ -47,33 +111,82 @@ domain_of(uint32_t phys_id)
+ 	return core < 4 ? 0 : core < 7 ? 1 : 2;
+ }
+ 
+-static void
+-raise_domain(uint32_t domain, uint32_t cores, uint32_t cap_khz)
++static inline uint32_t
++rd_perf_state(uint32_t domain)
+ {
+-	uint32_t top = 0, top_khz = 0, was;
+-	vm_offset_t base = ml_io_map(EPSS_PHYS + domain * EPSS_DOMAIN_SIZE, EPSS_DOMAIN_SIZE);
++	return *(volatile uint32_t *)(dom_base[domain] + EPSS_PERF_STATE);
++}
+ 
+-	if (!base) {
+-		printf("NEGRONI CPUFREQ: domain %u not mapped\n", domain);
+-		return;
++/* The one writer of PERF_STATE after boot. Never below the row ABL left (0098). */
++static inline void
++wr_perf_state(uint32_t domain, uint32_t row)
++{
++	if (row < dom_abl_row[domain]) {
++		row = dom_abl_row[domain];
+ 	}
++	*(volatile uint32_t *)(dom_base[domain] + EPSS_PERF_STATE) = row;
++	dom_row[domain] = row;
++}
++
++/* Read the table of a domain once: rows that go up, until the table repeats itself. */
++static void
++read_table(uint32_t domain, vm_offset_t base)
++{
++	uint32_t n = 0, last = 0;
++
+ 	for (uint32_t row = 0; row < EPSS_TABLE_ROWS; row++) {
+ 		uint32_t entry = *(volatile uint32_t *)(base + EPSS_FREQ_TABLE + 4 * row);
+ 		uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
+ 
+-		if (row > 0 && khz <= top_khz) {
+-			break;          /* the table ends by repeating its last row */
++		if (row > 0 && khz <= last) {
++			break;
+ 		}
+-		if (khz > cap_khz) {
++		dom_khz[domain][n++] = khz;
++		last = khz;
++	}
++	dom_rows[domain] = n;
++}
++
++/* The highest row of the domain whose clock is not above khz (row 0 when every row is above). */
++static uint32_t
++row_for_khz(uint32_t domain, uint32_t khz)
++{
++	uint32_t top = 0;
++
++	for (uint32_t row = 0; row < dom_rows[domain]; row++) {
++		if (dom_khz[domain][row] > khz) {
+ 			break;
+ 		}
+ 		top = row;
+-		top_khz = khz;
+ 	}
++	return top;
++}
++
++static inline uint32_t
++row_mhz(uint32_t domain, uint32_t row)
++{
++	return row < dom_rows[domain] ? dom_khz[domain][row] / 1000 : 0;
++}
++
++static void
++raise_domain(uint32_t domain, uint32_t cores, uint32_t cap_khz)
++{
++	uint32_t top, top_khz, was;
++	vm_offset_t base = ml_io_map(EPSS_PHYS + domain * EPSS_DOMAIN_SIZE, EPSS_DOMAIN_SIZE);
++
++	if (!base) {
++		printf("NEGRONI CPUFREQ: domain %u not mapped\n", domain);
++		return;
++	}
++	read_table(domain, base);
++	top = row_for_khz(domain, cap_khz);
++	top_khz = dom_khz[domain][top];
+ 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
+ 	dom_base[domain] = base;
+ 	dom_abl_row[domain] = was;
+ 	dom_cores[domain] = cores;
++	dom_cap_row[domain] = top > was ? top : was;   /* the cap is never below the ABL row */
++	dom_row[domain] = was;
+ 	if (was >= top) {
+ 		/* ABL already asked for as much or more: never slow a domain down */
+ 		printf("NEGRONI CPUFREQ: domain %u (%u cores): keeping row %u (cap row %u, %u MHz)\n",
+@@ -81,11 +194,235 @@ raise_domain(uint32_t domain, uint32_t cores, uint32_t cap_khz)
+ 		return;
+ 	}
+ 	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
++	dom_row[domain] = top;
+ 	delay(20000);
+ 	printf("NEGRONI CPUFREQ: domain %u (%u cores): row %u -> %u, %u MHz\n",
+ 	    domain, cores, was, top, top_khz / 1000);
+ }
+ 
++/*
++ * The busy share of every CPU over the last GOV_WINDOW ticks, from the kernel's
++ * own counters: processor_cpu_load_info() (osfmk/kern/processor.c) adds the
++ * user/system/idle ticks of the CPU (processor->pr_recount through
++ * recount_processor_usage(), divided by hz_tick_interval = 10 ms) into ticks[].
++ * The same function fills HOST_CPU_LOAD_INFO cpu_ticks[]. Per domain: the busiest core.
++ */
++static void
++sample_busy(void)
++{
++	const ml_topology_info_t *topology = ml_get_topology_info();
++
++	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
++		dom_busy[d] = 0;
++	}
++	for (unsigned int i = 0; i < topology->num_cpus && i < GOV_MAX_CPUS; i++) {
++		uint32_t d = domain_of(topology->cpus[i].phys_id);
++		processor_t p = cpu_to_processor((int)topology->cpus[i].cpu_id);
++		natural_t ticks[CPU_STATE_MAX] = { 0 };
++		uint32_t busy, all, busy_w = 0, all_w = 0, pct;
++
++		if (p == PROCESSOR_NULL) {
++			continue;
++		}
++		processor_cpu_load_info(p, ticks);
++		busy = ticks[CPU_STATE_USER] + ticks[CPU_STATE_SYSTEM] + ticks[CPU_STATE_NICE];
++		all = busy + ticks[CPU_STATE_IDLE];
++		/* the counters count from boot: the first sample is only the base of the deltas */
++		cpu_busy_d[i][win_at] = sampled ? busy - cpu_busy_last[i] : 0;
++		cpu_all_d[i][win_at] = sampled ? all - cpu_all_last[i] : 0;
++		cpu_busy_last[i] = busy;
++		cpu_all_last[i] = all;
++		for (uint32_t w = 0; w < GOV_WINDOW; w++) {
++			busy_w += cpu_busy_d[i][w];
++			all_w += cpu_all_d[i][w];
++		}
++		pct = all_w ? busy_w * 100 / all_w : 0;
++		if (pct > 100) {
++			pct = 100;
++		}
++		if (pct > dom_busy[d]) {
++			dom_busy[d] = pct;
++		}
++	}
++	win_at = (win_at + 1) % GOV_WINDOW;
++	sampled = true;
++}
++
++static inline uint32_t
++lmh_mhz(uint32_t domain)
++{
++	return (*(volatile uint32_t *)(dom_base[domain] + EPSS_DOMAIN_STATE) & 0xff) * XO_KHZ / 1000;
++}
++
++static void
++format_line(void)
++{
++	size_t at = 0;
++
++	gov_line[0] = 0;
++	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
++		if (!dom_base[d]) {
++			continue;
++		}
++		at += snprintf(gov_line + at, sizeof(gov_line) - at, "%sd%u %u MHz busy %u%% lmh %u",
++		    at ? " | " : "", d, row_mhz(d, dom_row[d]), dom_busy[d], lmh_mhz(d));
++		if (at >= sizeof(gov_line)) {
++			break;
++		}
++	}
++}
++
++/* 0284: one tick of the policy. Returns true when a row changed. */
++static bool
++gov_step(void)
++{
++	bool changed = false;
++
++	lck_mtx_lock(&cpufreq_lock);
++	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
++		uint32_t row, want;
++
++		if (!dom_base[d]) {
++			continue;
++		}
++		row = want = dom_row[d];
++		if (dom_busy[d] > gov_hi) {
++			dom_low_ticks[d] = 0;
++			if (want < dom_cap_row[d]) {
++				want++;
++			}
++		} else if (dom_busy[d] < gov_lo) {
++			if (++dom_low_ticks[d] >= GOV_LOW_TICKS) {
++				dom_low_ticks[d] = 0;
++				if (want > dom_floor_row[d]) {
++					want--;
++				}
++			}
++		} else {
++			dom_low_ticks[d] = 0;
++		}
++		/* the bounds hold whatever happened above (a cap that moved under us) */
++		if (want > dom_cap_row[d]) {
++			want = dom_cap_row[d];
++		}
++		if (want < dom_floor_row[d]) {
++			want = dom_floor_row[d];
++		}
++		if (want != row) {
++			wr_perf_state(d, want);
++			changed = true;
++		}
++	}
++	lck_mtx_unlock(&cpufreq_lock);
++	return changed;
++}
++
++__attribute__((noreturn)) static void
++gov_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t tick = 0, printed = 0;
++	bool pending = false;   /* a row changed since the last line */
++
++	sample_busy();          /* the first delta starts here */
++	for (;;) {
++		assert_wait_timeout((event_t)&tick, THREAD_UNINT, GOV_TICK_MS, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		tick++;
++		sample_busy();
++		if (gov_step()) {
++			pending = true;
++		}
++		format_line();
++		/* change lines: at most one a second (the state then, not each step); the minute line always */
++		if ((pending && tick - printed >= GOV_CHANGE_TICKS) || tick % GOV_LOG_TICKS == 0) {
++			printf("NEGRONI CPUFREQ: %s\n", gov_line);
++			printed = tick;
++			pending = false;
++		}
++	}
++}
++
++/* 0284: the state for another log line (the GPU WATCH line can append it). */
++void
++negroni_cpufreq_line(char *buf, size_t size)
++{
++	strlcpy(buf, gov_line, size);
++}
++
++/* 0284: "cpu 1785/2496/2995 MHz", the rows asked for now, for the GPU WATCH line. */
++void
++negroni_cpufreq_mhz_line(char *buf, size_t size)
++{
++	if (!dom_known) {
++		snprintf(buf, size, "cpu off");
++		return;
++	}
++	snprintf(buf, size, "cpu %u/%u/%u MHz", dom_base[0] ? row_mhz(0, dom_row[0]) : 0,
++	    dom_base[1] ? row_mhz(1, dom_row[1]) : 0, dom_base[2] ? row_mhz(2, dom_row[2]) : 0);
++}
++
++static void
++gov_start(void)
++{
++	uint32_t floor_mhz = 0;
++	thread_t thread;
++	char rows[128];
++	size_t at = 0;
++
++	(void)PE_parse_boot_argn("negronicpufreq_floor_mhz", &floor_mhz, sizeof(floor_mhz));
++	(void)PE_parse_boot_argn("negronicpufreq_hi", &gov_hi, sizeof(gov_hi));
++	(void)PE_parse_boot_argn("negronicpufreq_lo", &gov_lo, sizeof(gov_lo));
++	if (gov_hi > 100) {
++		gov_hi = 100;
++	}
++	if (gov_hi == 0) {
++		gov_hi = 1;
++	}
++	if (gov_lo > gov_hi - 1) {
++		gov_lo = gov_hi - 1;
++	}
++	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
++		if (!dom_base[d]) {
++			continue;
++		}
++		/* the table, once, for the record: the rows the policy can use */
++		char tab[200];
++		size_t t = 0;
++		for (uint32_t r = 0; r < dom_rows[d] && t < sizeof(tab) - 8; r++) {
++			t += snprintf(tab + t, sizeof(tab) - t, "%s%u", r ? "," : "", dom_khz[d][r] / 1000);
++		}
++		printf("NEGRONI CPUFREQ: d%u table (%u rows, MHz): %s; ABL row %u\n", d, dom_rows[d], tab, dom_abl_row[d]);
++		/* the floor: the ABL row (0098); negronicpufreq_floor_mhz can only raise it */
++		dom_floor_row[d] = dom_abl_row[d];
++		if (floor_mhz) {
++			uint32_t want = row_for_khz(d, floor_mhz * 1000);
++
++			if (want > dom_floor_row[d]) {
++				dom_floor_row[d] = want;
++			} else if (want < dom_abl_row[d]) {
++				printf("NEGRONI CPUFREQ: d%u negronicpufreq_floor_mhz=%u is row %u, below the ABL row %u: floor stays %u\n",
++				    d, floor_mhz, want, dom_abl_row[d], dom_abl_row[d]);
++			}
++		}
++		cfg_floor_row[d] = dom_floor_row[d];
++		if (dom_floor_row[d] > dom_cap_row[d]) {
++			dom_floor_row[d] = dom_cap_row[d];     /* the cap is never below the ABL row */
++		}
++		if (dom_row[d] != rd_perf_state(d)) {
++			dom_row[d] = rd_perf_state(d);
++		}
++		at += snprintf(rows + at, sizeof(rows) - at, "%sd%u rows %u..%u (%u..%u MHz)", at ? ", " : "",
++		    d, dom_floor_row[d], dom_cap_row[d], row_mhz(d, dom_floor_row[d]), row_mhz(d, dom_cap_row[d]));
++	}
++	printf("NEGRONI CPUFREQ: governor on (%s; up > %u%%, down < %u%% for %u ms, tick %u ms)\n",
++	    rows, gov_hi, gov_lo, GOV_LOW_TICKS * GOV_TICK_MS, GOV_TICK_MS);
++	if (kernel_thread_start(gov_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("NEGRONI CPUFREQ: governor thread did not start\n");
++	}
++}
++
+ void
+ negroni_cpufreq_init(void)
+ {
+@@ -94,10 +431,12 @@ negroni_cpufreq_init(void)
+ 
+ 	(void)PE_parse_boot_argn("negronicpufreq", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("negronicpufreq_mhz", &cap_mhz, sizeof(cap_mhz));
++	(void)PE_parse_boot_argn("negronicpufreq_gov", &gov_on, sizeof(gov_on));
+ 	if (!enabled) {
+ 		printf("NEGRONI CPUFREQ: disabled (negronicpufreq=0)\n");
+ 		return;
+ 	}
++	cap_mhz_now = cap_mhz;
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		cores[domain_of(topology->cpus[i].phys_id)]++;
+ 	}
+@@ -107,41 +446,50 @@ negroni_cpufreq_init(void)
+ 		}
+ 	}
+ 	dom_known = true;
++	if (gov_on) {
++		gov_start();
++	} else {
++		printf("NEGRONI CPUFREQ: governor off (negronicpufreq_gov=0): the rows stay\n");
++	}
+ }
+ 
+-/* Patch 0280: a new cap for every domain (thermal policy). Not below the row ABL left. */
++/*
++ * Patch 0280: a new cap for every domain (thermal policy). Not below the row ABL left.
++ * 0284: with the governor the cap is the upper bound of the policy (negronicpufreq_mhz
++ * stays a bound too); a row above the new cap is lowered at once.
++ */
+ void
+ negroni_cpufreq_cap(uint32_t mhz)
+ {
+ 	if (!dom_known) {
+ 		return;
+ 	}
++	if (mhz > cap_mhz_now) {
++		mhz = cap_mhz_now;
++	}
++	lck_mtx_lock(&cpufreq_lock);
+ 	for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
+-		vm_offset_t base = dom_base[domain];
+-		uint32_t top = 0, top_khz = 0, was;
++		uint32_t top, was;
+ 
+-		if (!base) {
++		if (!dom_base[domain]) {
+ 			continue;
+ 		}
+-		for (uint32_t row = 0; row < EPSS_TABLE_ROWS; row++) {
+-			uint32_t entry = *(volatile uint32_t *)(base + EPSS_FREQ_TABLE + 4 * row);
+-			uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
+-
+-			if ((row > 0 && khz <= top_khz) || khz > mhz * 1000) {
+-				break;
+-			}
+-			top = row;
+-			top_khz = khz;
+-		}
++		top = row_for_khz(domain, mhz * 1000);
+ 		if (top < dom_abl_row[domain]) {
+ 			top = dom_abl_row[domain];
+ 		}
+-		was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
+-		if (was == top) {
++		dom_cap_row[domain] = top;
++		if (gov_on) {
++			/* the configured floor comes back when the cap goes up again */
++			dom_floor_row[domain] = cfg_floor_row[domain] < top ? cfg_floor_row[domain] : top;
++		}
++		was = rd_perf_state(domain);
++		if (gov_on ? was <= top : was == top) {
+ 			continue;
+ 		}
+-		*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
++		wr_perf_state(domain, top);
+ 		printf("NEGRONI CPUFREQ: domain %u (%u cores): row %u -> %u (cap %u MHz)\n", domain, dom_cores[domain], was, top, mhz);
+ 	}
++	lck_mtx_unlock(&cpufreq_lock);
+ }
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -2980,6 +2980,7 @@ clock_late_report(void)
+ #define REG_RBBM_STATUS_GPU_BUSY (1u << 23)
+ extern uint32_t negroni_thermal_gpu_cap(void);
+ extern void negroni_thermal_line(char *buf, size_t size);
++extern void negroni_cpufreq_mhz_line(char *buf, size_t size);    /* 0284 */
+ 
+ static uint32_t dcvs_on = 1, dcvs_level, dcvs_max, dcvs_busy_pct, dcvs_votes, dcvs_failed;
+ 
+@@ -3135,11 +3136,13 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 			}
+ 			char tline[160];
+ 			negroni_thermal_line(tline, sizeof(tline));
++			char cline[40];
++			negroni_cpufreq_mhz_line(cline, sizeof(cline));
+ 			printf("NEGRONI GPU WATCH %u s: AO %#x CX %#x GX %#x RSC %#x q1w %u log0 %#x | rptr %#x RBBM %#x "
+ 			    "HW_FAULT %#x INT0 %#x | SGFSR %#x FSR core %#x gmu %#x | HFI %#x rptr-copy %#x | gxclk %u MHz | "
+-			    "dcvs %u busy %u%% | %s\n", second,
++			    "dcvs %u busy %u%% | %s | %s\n", second,
+ 			    rd(gmu + GMU_REG(GMU_AO_COUNTER_L)), now[0], now[1], now[2], now[3], now[4], now[5], now[6],
+-			    now[7], now[8], now[9], now[10], now[11], now[12], now[13], gxclk, dcvs_level, dcvs_busy_pct, tline);
++			    now[7], now[8], now[9], now[10], now[11], now[12], now[13], gxclk, dcvs_level, dcvs_busy_pct, tline, cline);
+ 			if (now[10] & SMMU_FSR_ALL) {
+ 				space_faulted(&core_space);
+ 			}

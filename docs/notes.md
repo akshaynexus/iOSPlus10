@@ -392,8 +392,9 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 - CoreBrightness (20H392) finds `AppleARMBacklight` with `backlight-control=true`; without
   `new-backlight-architecture` it uses the legacy path (`brightness`, `FadePeriod`, `backlight-level`
   in IODisplayParameters) [V disassembly]. Details: patches/xnu/README-brightness.md.
-- The ~10 s power-button-to-dark delay is iOS sending RequestPowerChange late; 0251 adds a kernel
-  fast-off on a short power-key press (< 700 ms) [I until tested].
+- The ~10 s power-button-to-dark delay is iOS sending RequestPowerChange late; 0251 added a kernel
+  fast-off on a short power-key press (< 700 ms). Removed by 0258 (2026-10-26, owner: the screen went
+  black at once instead of the normal lock); see the end of this section.
 - Vsync 120 Hz (2026-10-25): slop patches 0046/0056/0061 set `NEGRONI_FB_VSYNC_US` to 8333 (was
   16667 = 60 Hz) and derive `fFlushTicks` from it, so `negronifb_hz` keeps its meaning. The panel
   scans at 120 Hz, the vsync timer was the 60 Hz limit [V: `scripts/kernel/prepare-src.sh` -> 129
@@ -456,6 +457,22 @@ Measured facts: [device-facts.md](device-facts.md) (CPUs, PAC/BTI, RAM banks, UF
 - No userland lever for the ear [V grep]: `scripts/ios16/root-tweaks-extra.py` and docs have no status-bar /
   notch / safe-area tweak; the only ways to move the status bar's clock are the kernel shift (`negronifb_clockshift`)
   or the whole-picture shift (`negronifb_shift=N`, cuts the bottom rows).
+- Display sleep, normal power key (2026-10-26, display-sleep agent; patch 0258, README-brightness.md
+  "Display sleep (0258)", README-reboot.md "0258"). [V code] Old 0251 + 0250: `negroni_keys.c` called
+  `negroni_backlight_key()`; a power-key press < 700 ms with the display on set DBV 0 at once
+  (`negronibl_fastoff`, 20 s), and RequestPowerChange(0) skipped the fade (`fFadeStep = 6`). Now: 0251 keeps
+  only its framebuffer hunk (0258 replaces it), 0258 removes the fast-off; the key goes to iOS only (HID
+  consumer 0x30). RequestPowerChange(0): 7-tick fade, then (under `fLock`, only if still off) DBV 0 + DCS
+  0x28, 21 ms, 0x10, 101 ms (live.dts `qcom,mdss-dsi-off-command = [05 00 00 00 15 00 02 28 00 05 00 00 00
+  65 00 02 10 00]`), then a 100 ms vsync tick. RequestPowerChange(1): 0x11, 133 ms (on-command: 12 ms after
+  0x11, 121 ms before 0x29), 0x29, last DBV, redraw. `negronifb_sleep=0|1|2` (default 1; 2 = 1: the rails
+  vddio pm8350c_l12 1.8 V / vci pm8350c_l13 3.0 V are RPMh LDOs, a rail cycle needs the reset + whole
+  on-command incl. DSC PPS). Panic wakes the panel (`negroni_backlight_panic`, no DSI lock). Lines:
+  `NEGRONI FB: display off (fade N ms, DCS sleep ok|failed|skipped)`, `NEGRONI FB: display on (sleep-out N
+  ms, DCS ok|failed|skipped, panel DBV x)`. [V code] The slide-to-power-off path ends in
+  `negroni_power_off()` (RB_HALT -> HOST_REBOOT_HALT -> halt_all_cpus(FALSE) -> kPEHaltCPU); `wdt=-1`,
+  the no-op slop IOWatchdog and `negronipanic` are not in it; no 0215. [I] The MDP auto-refresh restarts
+  on the first TE after 0x29 and the panel keeps its registers in sleep: not tested.
 
 ## 16. Metal (2026-10-25, Metal agent)
 
@@ -1373,3 +1390,8 @@ Patches (2026-10-25, regenerated with scripts/kernel/patched-tree.sh in out/kern
 - [I] Why the Mac resets the bus is unknown (the Mac's unified log had no USB-host lines for 01:16-01:23). 01:22:06 and 02:05:02 were real reboots/power loss (the kernel boot lines follow / the battery was flat).
 - [I] No temperature or clock measured before/after yet: the phone was flat. Expected effect of 0281: the GPU at 350 MHz between frames; 0280: the first numbers.
 - [V] Build: `kernel-pwr` job (all 41 patches/xnu incl. 0272 amended, 0280, 0281, 0282); image `out/ios16-pwr` with the config args; sha256 in logs/kernel-pwr.log and `out/ios16-pwr/SHA256SUMS`. Not flashed.
+- [V] 0284 CPU governor (cpufreq agent; details: patches/xnu/README-cpufreq.md): `negroni_cpufreq.c` gets a 100 ms kernel thread. Counter: `processor_cpu_load_info(p, ticks)` (osfmk/kern/processor.c:652), the HOST_CPU_LOAD_INFO `cpu_ticks[]` source: user/system/idle time of `processor->pr_recount` via `recount_processor_usage()` (osfmk/kern/recount.c:972) in `hz_tick_interval` (10 ms) units; `struct processor` is opaque in bsd, so the prototype is declared in the file; the processor comes from `cpu_to_processor(cpu_id)` (osfmk/arm/cpu_common.c:706). busy % = busy ticks * 100 / all ticks over the last 300 ms (3 samples); per domain the busiest core; the first sample is only the base.
+- [V] EPSS offsets cross-checked with out/src/op-kernel/drivers/cpufreq/qcom-cpufreq-hw.c lines 104-110 (LUT 0x100, PERF_STATE 0x320, CYCLE_CNTR 0x3c4, DOMAIN_STATE 0x20) and the row decode lines 495-516 (src [31:30], lval [7:0], 19.2 MHz * lval, end at a repeated row); bases and lut-row-size 4 in out/live.dts `qcom,cpufreq-hw`. DOMAIN_STATE [7:0] * 19.2 MHz = the LMh limit (line 143); 0284 logs it as `lmh N`. The LUT values are only in the hardware: no source on disk lists them; known rows [V] from boot 0097/0100: d0 row 14 = 1785, d1 row 15 = 2342, row 17 = 2496, d2 row 14 = 2400, row 20 = 2995 MHz. 0284 prints each table at boot.
+- [V] Policy: busy > 70 % -> +1 row per 100 ms up to the cap (min of negronicpufreq_mhz and the 0280 thermal cap); busy < 30 % for 300 ms -> -1 row down to the floor. Floor = the ABL row of every domain (0098); `negronicpufreq_floor_mhz=N` only raises it. A row below the ABL row is blocked three times: the floor, the cap (never below the ABL row), and `wr_perf_state()` (the one PERF_STATE writer after boot clamps to `dom_abl_row`). A mutex serialises the governor and the thermal thread. Boot-args `negronicpufreq_gov` (default 1; 0 = old one-shot), `negronicpufreq_floor_mhz`, `negronicpufreq_hi/_lo`. Lines: `dN table (R rows, MHz): ...; ABL row A`, `governor on (d0 rows a..b (MHz), ...)`, `d0 N MHz busy N% lmh L | d1 .. | d2 ..` on change and once a minute; the GPU WATCH line ends with `cpu N/N/N MHz`.
+- [I] Consequence: with the boot 0097 ABL rows (d0 12, d1 17 = top, d2 20 = top) only d0 moves (rows 12..14); d1/d2 stay at the top, the same as the 0280 cap. The governor cannot cool the big cores under the 0098 rule. Boot 0097 ran d1 row 15 / d2 row 14 without a fault [V]: evidence for a later change that drops the rule, not a test of it.
+- [V] Build: `kernel-cpugov3` job (all 44 patches/xnu incl. 0284, exit 0, no 02xx patch skipped): kernel out/kernel/local-20261026-070512 sha256 f42a1abb28b5c1954ca5bd72a051da204f039a226121e2530e2b55499d513d33; image `out/ios16-cpugov` (config args + `negronicpufreq_gov=1`) boot_a.img d6916b4f0c5ed0402e76edc0abacfc7434afec9945277e86a4e9a77eb2d2be1c. `kernel-cpugov5` (queued on the lock) rebuilds with the review fixes (change line max 1/s, rows[128], cfg_floor_row kept through thermal caps, hi/lo clamps, GOV_MAX_CPUS rename); its sha replaces these. Not flashed.

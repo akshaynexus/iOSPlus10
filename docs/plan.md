@@ -86,6 +86,13 @@ Status date: 2026-10-25.
   All in the `kernel-pwr` build, image `out/ios16-pwr` (config args). Not flashed (phone flat). Next: boot it, read
   `NEGRONI THERMAL`, `NEGRONI GPU DCVS`, `charger diag`; then IFPC/slumber between frames and the charger via the
   debug arbiter or the ADSP charger PD.
+- CPU governor (2026-10-26, patch 0284, README-cpufreq.md): a 100 ms thread moves each cluster's EPSS row from
+  the kernel's per-CPU busy time (`processor_cpu_load_info`, recount): > 70 % -> +1 row to the cap (0280 thermal cap
+  stays the bound), < 30 % for 300 ms -> -1 row to the floor = the ABL row (0098, never lower; floor_mhz only raises
+  it). With the ABL rows of boot 0097 only d0 moves (rows 12..14); d1/d2 stay at the top. Logs the LMh limit (`lmh`)
+  and `cpu N/N/N MHz` on the GPU WATCH line. Built: `kernel-cpugov3` (fixes: `kernel-cpugov5`, queued), image `out/ios16-cpugov`. Not flashed.
+  Next: boot it, read `dN table`/`governor on`/minute lines and `lmh`, compare THERMAL cpu C and battery mA with
+  `ios16-pwr`; then decide (owner) whether d1/d2 may go below the ABL row (boot 0097 ran d1 15 / d2 14).
 - Charger input (2026-10-26, patch 0272, README-battery.md section 7): the phone drained to 0 % on USB (16 % at 01:31,
   -458 mA, cable in). 0272 logs the PM8350B SMB5 charger registers with the battery line and sets the USB input limit
   to `negronichg_ma` (default 500 mA), un-suspends USBIN and enables charging. Kernel + image `out/ios16-chg` built
