@@ -1,0 +1,256 @@
+diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
+index 50a60f3..75fdbe9 100644
+--- a/bsd/dev/negroni_adsp.c
++++ b/bsd/dev/negroni_adsp.c
+@@ -1079,6 +1079,7 @@ static struct gl_channel gl_ch[NEGRONI_GLINK_CHANNELS] = {
+ 	{ .name = "IPCRTR", .lcid = 1 },        /* QRTR (stage (b): service discovery, servreg locator) */
+ 	{ .name = "adsp_apps", .lcid = 2 },     /* GPR (stage (b): APM, PRM) */
+ 	{ .name = "PMIC_RTR_ADSP_APPS", .lcid = 3 },    /* 0274: charger PD, answered only with negronichg_glink=1 */
++	{ .name = "PMIC_LOGS_ADSP_APPS", .lcid = 4 },   /* 0373: charger PD log (ulog), answered only with negronichg_ulog=1 */
+ };
+ static uint32_t gl_desc, gl_tx, gl_rx, gl_rx_len, gl_features = GL_FEATURE_INTENT_REUSE, gl_next_liid = 1;
+ static bool gl_version_ok, gl_dead, gl_notified;
+@@ -1391,7 +1392,8 @@ gl_poll(void)
+ 			gl_advance(need);
+ 			ch = NULL;
+ 			for (unsigned c = 0; c < NEGRONI_GLINK_CHANNELS; c++) {
+-				if ((c != NEGRONI_GLINK_PMIC || negroni_chg_glink_wanted()) && strcmp(gl_ch[c].name, name) == 0) {
++				if ((c != NEGRONI_GLINK_PMIC || negroni_chg_glink_wanted()) &&
++				    (c != NEGRONI_GLINK_ULOG || negroni_chg_ulog_wanted()) && strcmp(gl_ch[c].name, name) == 0) {
+ 					ch = &gl_ch[c];
+ 				}
+ 			}
+diff --git a/bsd/dev/negroni_adsp.h b/bsd/dev/negroni_adsp.h
+index ac6d8e4..016d8b2 100644
+--- a/bsd/dev/negroni_adsp.h
++++ b/bsd/dev/negroni_adsp.h
+@@ -7,11 +7,12 @@
+ #ifndef _NEGRONI_ADSP_H_
+ #define _NEGRONI_ADSP_H_
+ 
+-#define NEGRONI_GLINK_CHANNELS  3       /* 0274: + PMIC_RTR_ADSP_APPS */
++#define NEGRONI_GLINK_CHANNELS  4       /* 0274: + PMIC_RTR_ADSP_APPS; 0373: + PMIC_LOGS_ADSP_APPS */
+ #define NEGRONI_GLINK_STEP9     2       /* step 9 opens and waits for channels 0..1 only */
+ #define NEGRONI_GLINK_IPCRTR    0       /* QRTR */
+ #define NEGRONI_GLINK_GPR       1       /* "adsp_apps": GPR */
+ #define NEGRONI_GLINK_PMIC      2       /* "PMIC_RTR_ADSP_APPS": charger PD (0274, only with negronichg_glink=1) */
++#define NEGRONI_GLINK_ULOG      3       /* "PMIC_LOGS_ADSP_APPS": charger PD log (0373, only with negronichg_ulog=1) */
+ 
+ /* GLINK (negroni_adsp.c) */
+ void negroni_glink_poll(void);
+@@ -23,6 +24,8 @@ int negroni_glink_send(unsigned channel, const void *data, uint32_t len);
+ int negroni_glink_open(unsigned channel, unsigned intents, uint32_t wait_ms);
+ /* 0274 (negroni_chg_glink.c): boot-args negronichg_glink=1 and negroniadsp set */
+ bool negroni_chg_glink_wanted(void);
++/* 0373 (negroni_chg_glink.c): boot-args negronichg_ulog=1 and negroniadsp set */
++bool negroni_chg_ulog_wanted(void);
+ 
+ /* stage (b) (negroni_audio.c): first and last step numbers it runs */
+ #define NEGRONI_AUDIO_FIRST_STEP        10
+diff --git a/bsd/dev/negroni_chg_glink.c b/bsd/dev/negroni_chg_glink.c
+index 366900b..f9af56c 100644
+--- a/bsd/dev/negroni_chg_glink.c
++++ b/bsd/dev/negroni_chg_glink.c
+@@ -1473,12 +1473,202 @@ chg_thread(__unused void *arg, __unused wait_result_t wr)
+ 		idle_loop(poll_s);
+ 	}
+ }
++/*
++ * Patch 0373: the charger PD's own log (ulog) over GLINK channel PMIC_LOGS_ADSP_APPS (live.dts
++ * qcom,pmic_glink_log, qcom,charger_ulog_glink). Protocol: Linux drivers/soc/qcom/pmic_pdcharger_ulog.c
++ * (v6.12): request {u32 owner 32778, u32 type 1, u32 opcode 0x18 GET_CHG_ULOG_REQ, u32 log_size 8192}
++ * (16 bytes); answer {same header, u8 buf[8192]} (8204 bytes; the ADSP asks for an intent of that
++ * size, 0274 grants up to 0x4400). Linux asks again 1 s after each answer and prints every non-empty
++ * line. Here: the same every negronichg_ulog_ms (default 1000) for 120 s after the channel opens, then
++ * every 5 s; each line as "NEGRONI ULOG: <text>" (kernel log, live USB log and the 0367 boot log), at
++ * most negronichg_ulog_lines (default 3000) lines per boot, then the thread ends.
++ * Why (README-usb.md "0373"): the ADSP's port detection (APSD rerun, Type-C/PD state, its PHY and rail
++ * votes) runs when the USB link to the Mac dies; its log is the direct record of what it does.
++ * Read only: the request asks for log text, nothing else. Default off (negronichg_ulog=0).
++ */
++#define ULOG_OPCODE             0x18u
++#define ULOG_SIZE               8192u
++static bool ulog_parsed, ulog_on;
++static uint32_t ulog_ms = 1000, ulog_max_lines = 3000;
++static char ulog_buf[ULOG_SIZE + 1];
++static volatile uint32_t ulog_len;              /* > 0: an answer waits in ulog_buf (written by rx, cleared by the thread) */
++static volatile uint32_t ulog_answers, ulog_dropped, ulog_bad;
++
++bool
++negroni_chg_ulog_wanted(void)
++{
++	if (!ulog_parsed) {
++		uint32_t on = 0, adsp = 0;
++		(void)PE_parse_boot_argn("negronichg_ulog", &on, sizeof(on));
++		(void)PE_parse_boot_argn("negroniadsp", &adsp, sizeof(adsp));
++		(void)PE_parse_boot_argn("negronichg_ulog_ms", &ulog_ms, sizeof(ulog_ms));
++		(void)PE_parse_boot_argn("negronichg_ulog_lines", &ulog_max_lines, sizeof(ulog_max_lines));
++		ulog_ms = MIN(MAX(ulog_ms, 200u), 60000u);
++		ulog_max_lines = MIN(MAX(ulog_max_lines, 10u), 100000u);
++		ulog_on = on != 0 && adsp != 0;
++		__atomic_store_n(&ulog_parsed, true, __ATOMIC_RELEASE);  /* after ulog_on: a racing gl_poll never sees a false "off" */
++	}
++	return ulog_on;
++}
++
++/* Inside negroni_glink_poll() of any thread (GLINK lock held): copy only; the ulog thread prints. */
++static void
++ulog_rx(const uint8_t *data, uint32_t len)
++{
++	uint32_t hdr[3];
++
++	if (len < 12) {
++		ulog_bad++;
++		return;
++	}
++	memcpy(hdr, data, sizeof(hdr));
++	if (hdr[0] != BC_OWNER || hdr[2] != ULOG_OPCODE) {
++		ulog_bad++;
++		return;
++	}
++	if (__atomic_load_n(&ulog_len, __ATOMIC_ACQUIRE) != 0) {
++		ulog_dropped++;
++		return;
++	}
++	uint32_t n = MIN(len - 12, ULOG_SIZE);
++	memcpy(ulog_buf, data + 12, n);
++	ulog_buf[n] = 0;
++	ulog_answers++;
++	__atomic_store_n(&ulog_len, n ? n : 1, __ATOMIC_RELEASE);
++}
++
++/* Print the waiting answer line by line; returns the lines printed. */
++static uint32_t
++ulog_print(uint32_t room)
++{
++	uint32_t n = __atomic_load_n(&ulog_len, __ATOMIC_ACQUIRE), lines = 0;
++	char *p = ulog_buf, *end;
++
++	if (n == 0) {
++		return 0;
++	}
++	ulog_buf[MIN(n, ULOG_SIZE)] = 0;
++	while (*p && lines < room) {
++		end = strchr(p, '\n');
++		if (end) {
++			*end = 0;
++		}
++		size_t l = strlen(p);
++		while (l > 0 && (p[l - 1] == '\r' || p[l - 1] == ' ')) {
++			p[--l] = 0;
++		}
++		if (l > 0) {
++			printf("NEGRONI ULOG: %s\n", p);
++			lines++;
++		}
++		if (!end) {
++			break;
++		}
++		p = end + 1;
++	}
++	__atomic_store_n(&ulog_len, 0, __ATOMIC_RELEASE);
++	return lines;
++}
++
++static void
++ulog_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	const uint32_t req[4] = { BC_OWNER, BC_TYPE_REQ, ULOG_OPCODE, ULOG_SIZE };
++	uint32_t s, lines = 0, opens = 0, sent = 0, fails = 0;
++	uint64_t open_ns = 0;
++
++	for (s = 0; s < GLINK_WAIT_S && !negroni_glink_up(NEGRONI_GLINK_IPCRTR); s++) {
++		IOSleep(1000);
++	}
++	if (!negroni_glink_up(NEGRONI_GLINK_IPCRTR)) {
++		printf("NEGRONI ULOG: off: GLINK is not up after %u s\n", GLINK_WAIT_S);
++		(void)thread_terminate(current_thread());
++		return;
++	}
++	negroni_glink_set_rx(NEGRONI_GLINK_ULOG, ulog_rx);
++	printf("NEGRONI ULOG: start: channel PMIC_LOGS_ADSP_APPS, request every %u ms for 120 s after the open, then every 5 s, "
++	    "at most %u lines (negronichg_ulog_ms, negronichg_ulog_lines)\n", ulog_ms, ulog_max_lines);
++	while (lines < ulog_max_lines) {
++		if (!negroni_glink_up(NEGRONI_GLINK_IPCRTR)) {
++			printf("NEGRONI ULOG: GLINK stopped after %u lines: end\n", lines);
++			break;
++		}
++		if (!negroni_glink_up(NEGRONI_GLINK_ULOG)) {
++			opens++;
++			int rc = negroni_glink_open(NEGRONI_GLINK_ULOG, 2, opens == 1 ? OPEN_WAIT_MS : 5000);
++			if (rc != 0) {
++				if (opens <= 5 || opens % 30 == 0) {
++					printf("NEGRONI ULOG: PMIC_LOGS_ADSP_APPS not open (try %u, rc %d)\n", opens, rc);
++				}
++				if (opens >= 40) {
++					printf("NEGRONI ULOG: PMIC_LOGS_ADSP_APPS did not open in %u tries: end\n", opens);
++					break;
++				}
++				/*
++				 * EIO/ENOMEM/ENOTCONN return at once; ETIMEDOUT has polled GLINK every 1 ms for 5 s.
++				 * Rest between tries (no 1 kHz poll for the whole boot): an OPEN of the ADSP that comes
++				 * meanwhile waits in the RX FIFO (or another poller answers it); the next try sees it.
++				 */
++				IOSleep(rc == ETIMEDOUT ? 25000 : 5000);
++				continue;
++			}
++			open_ns = now_ns();
++			printf("NEGRONI ULOG: PMIC_LOGS_ADSP_APPS is open (try %u)\n", opens);
++		}
++		int rc = negroni_glink_send(NEGRONI_GLINK_ULOG, req, sizeof(req));
++		sent++;
++		if (rc != 0) {
++			if (++fails <= 5 || fails % 50 == 0) {
++				printf("NEGRONI ULOG: request #%u failed (rc %d)\n", sent, rc);
++			}
++		} else {
++			for (uint32_t ms = 0; ms < 1500 && __atomic_load_n(&ulog_len, __ATOMIC_ACQUIRE) == 0; ms += 5) {
++				negroni_glink_poll();
++				IOSleep(5);
++			}
++			if (__atomic_load_n(&ulog_len, __ATOMIC_ACQUIRE) == 0) {
++				if (++fails <= 5 || fails % 50 == 0) {
++					printf("NEGRONI ULOG: no answer to request #%u in 1.5 s\n", sent);
++				}
++			}
++		}
++		lines += ulog_print(ulog_max_lines - lines);
++		bool fast = open_ns != 0 && now_ns() - open_ns < 120ull * NSEC_PER_SEC;
++		for (uint32_t ms = 0; ms < (fast ? ulog_ms : 5000u); ms += 20) {
++			negroni_glink_poll();
++			lines += ulog_print(ulog_max_lines - lines);
++			IOSleep(20);
++		}
++	}
++	printf("NEGRONI ULOG: end: %u lines, %u requests, %u answers, %u dropped, %u foreign/short, %u failures\n", lines, sent,
++	    ulog_answers, ulog_dropped, ulog_bad, fails);
++	(void)thread_terminate(current_thread());
++}
++
++static void
++negroni_chg_ulog_start(void)
++{
++	static bool started;
++	thread_t thread;
++
++	if (!negroni_chg_ulog_wanted() || started) {
++		return;
++	}
++	started = true;
++	if (kernel_thread_start(ulog_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("NEGRONI ULOG: kernel_thread_start failed: off\n");
++	}
++}
++
+ void
+ negroni_chg_glink_start(void)
+ {
+ 	static bool started;
+ 	thread_t thread;
+ 
++	negroni_chg_ulog_start();       /* 0373: independent of negronichg_glink */
+ 	if (!negroni_chg_glink_wanted() || started) {
+ 		return;
+ 	}

@@ -1,0 +1,251 @@
+diff --git a/bsd/dev/negroni_rpmh.c b/bsd/dev/negroni_rpmh.c
+index c6502ec..50a7c2f 100644
+--- a/bsd/dev/negroni_rpmh.c
++++ b/bsd/dev/negroni_rpmh.c
+@@ -400,6 +400,45 @@ negroni_rpmh_vreg_disable(const char *res)
+ 	return rh_vreg_enable(res, 0, RH_MODE_OFF);
+ }
+ 
++/*
++ * 0372: APPS (DRV 2) ACTIVE votes for the USB PHY supply rails, as Linux does: the rpmh-regulator
++ * probe sends qcom,init-voltage / qcom,init-mode (HPM) for every rail with qcom,set = 3, and the
++ * HS PHY driver enables vdd / vdda18 / vdda33 (live.dts hsphy@88e3000: vdd-supply = pm8350_l5,
++ * vdda18-supply = pm8350c_l1, vdda33-supply = pm8350_l2; ssphy core-supply = pm8350_l6). The
++ * ADSP votes the same four rails from its own DRV (adsp.b14 "/pm/ldob2/en", "/pm/ldob5/mode", ...)
++ * for its BC1.2/APSD detection; with no APPS vote the aggregate is the ADSP's vote alone.
++ * Values from live.dts (init-voltage). Mode 7 = PMIC5 LDO HPM (the ldoc11 vote above uses it too).
++ * Returns a mask of the rails whose vote failed (bit i = rail i), 0 = all four voted.
++ */
++int negroni_rpmh_usb_rails(void);
++int
++negroni_rpmh_usb_rails(void)
++{
++	static const struct { const char *res; unsigned mv; } rails[] = {
++		{ "ldob5", 880 },       /* pm8350_l5: hsphy vdd */
++		{ "ldoc1", 1800 },      /* pm8350c_l1: hsphy vdda18 */
++		{ "ldob2", 3072 },      /* pm8350_l2: hsphy vdda33 */
++		{ "ldob6", 1200 },      /* pm8350_l6: ssphy core */
++	};
++	int failed = 0;
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); ++i) {
++		int error = EBUSY;
++		/* rh_lock is a try-lock: another rail user (camera, Wi-Fi, fingerprint) may hold it briefly */
++		for (unsigned t = 0; t < 20 && error == EBUSY; ++t) {
++			error = rh_vreg_enable(rails[i].res, rails[i].mv, 7);
++			if (error == EBUSY) {
++				delay(2000);
++			}
++		}
++		printf("NEGRONI RPMH: 0372 USB PHY rail %s %u mV HPM on: %s (errno %d)\n", rails[i].res, rails[i].mv,
++		    error ? "FAILED" : "voted", error);
++		if (error) {
++			failed |= 1 << i;
++		}
++	}
++	return failed;
++}
++
+ int
+ negroni_rpmh_wifi_enable(const char *res, unsigned mv)
+ {
+diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
+index 6851c6b..787d4ec 100644
+--- a/bsd/dev/negroni_spmi.c
++++ b/bsd/dev/negroni_spmi.c
+@@ -30,6 +30,8 @@
+  *          (census and plug-event discovery, negronibatt=2/5)
+  *   SID 3 peripherals 0x10-0x16  PM8350B SMB5 charger (CHGR, DCDC, BATIF, USBIN,
+  *          DCIN, TYPEC, MISC): status and config, any register (patch 0272)
++ *   SID 1 peripherals 0x41/0x44/0x45 and SID 2 peripheral 0x40 (PM8350 L2/L5/L6,
++ *          PM8350C L1: the USB PHY rails), offsets 0x08/0x40/0x41/0x45/0x46 only (patch 0372)
+  * Writes are locked. negroni_spmi_vadc_unlock() (opt-in negronibatt=4/5 only)
+  * opens the ADC7 request registers SID 0 0x3140-0x3145 and 0x3147 (APP_SID,
+  * DIG_PARAM, FAST_AVG, CH_SEL, DELAY, CONV_REQ, as Linux adc7_configure), and
+@@ -643,6 +645,10 @@ sp_read_allowed(unsigned sid, unsigned addr)
+ 	if (sid == 3 && peripheral >= 0x10 && peripheral <= 0x16) {
+ 		return true;            /* 0272: SMB5 charger blocks */
+ 	}
++	if (((sid == 1 && (peripheral == 0x41 || peripheral == 0x44 || peripheral == 0x45)) || (sid == 2 && peripheral == 0x40)) &&
++	    (reg == 0x08 || reg == 0x40 || reg == 0x41 || reg == 0x45 || reg == 0x46)) {
++		return true;            /* 0372: USB PHY LDOs (PM8350 L2/L5/L6, PM8350C L1): STATUS1, VSET, MODE, EN_CTL */
++	}
+ 	return sid == 3 && (reg == 0x04 || reg == 0x05 || reg == 0x10);
+ }
+ 
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index 1848e15..bb2580e 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -1890,12 +1890,172 @@ hp_init(void)
+  * 0368: called by negroni_adsp.c: 0 = the ADSP is about to start (PAS auth and reset), 1 = it is
+  * up (READY), 2 = it stopped or failed. Only timestamps and one snapshot line (no writes).
+  */
++/*
++ * 0372: the USB PHY supply rails and the ADSP (README-usb.md "0372").
++ * [V] t11-t13 (2026-10-27): the Mac loses the device ~2-3 s after ADSP up, also without any
++ * charger GLINK client; the PHY registers read unchanged and soft reconnects + PHY re-inits
++ * (0366/0368) bring nothing back until a reboot. [V] The ADSP image votes the PMIC rails
++ * "/pm/ldob2", "/pm/ldob5", "/pm/ldob6", "/pm/ldoc1" (en, mode, mV; adsp.b14 strings): exactly
++ * the HS PHY supplies (live.dts hsphy@88e3000: vdd = pm8350_l5 0.88 V, vdda18 = pm8350c_l1 1.8 V,
++ * vdda33 = pm8350_l2 3.072 V) and the SS PHY core (pm8350_l6 1.2 V). [V] Linux/Android always hold
++ * an APPS vote for them (rpmh-regulator init-voltage/init-mode HPM with qcom,set = 3; the PHY
++ * driver enables them); XNU holds none. [I] So when the charger PD releases its own votes after
++ * its port detection, RPMh turns the PHY's analog rails off (or to LPM): the pull-up and the HS
++ * transceiver die, the digital registers still read. A soft reconnect cannot fix that.
++ * negroniusb_rails: 0 = off; 1 (default) = log only: the four LDOs' PMIC registers (SPMI observer
++ * reads: STATUS1 0x08, VSET 0x40/0x41, MODE 0x45, EN_CTL 0x46) at the ADSP start / up and every
++ * 50 ms from the start to up + 30 s; 2 = also APPS RPMh votes (HPM, DT voltages) before the ADSP
++ * starts (negroni_rpmh_usb_rails), so the ADSP's release cannot turn them off.
++ */
++extern int negroni_spmi_read_rc(unsigned sid, unsigned addr, uint8_t *out);
++extern int negroni_rpmh_usb_rails(void);
++extern kern_return_t thread_terminate(thread_t);
++#define UR_N            4
++#define UR_REGS         5
++#define UR_ERR          0x8000u         /* + negroni_spmi_read_rc code */
++#define UR_MAX_LINES    100
++static const struct { const char *name; unsigned sid, base; } ur_rail[UR_N] = {
++	{ "L5B vdd", 1, 0x4400 }, { "L1C vdda18", 2, 0x4000 }, { "L2B vdda33", 1, 0x4100 }, { "L6B ss", 1, 0x4500 },
++};
++static const uint8_t ur_off[UR_REGS] = { 0x08, 0x40, 0x41, 0x45, 0x46 };
++static int ur_mode = -1;                        /* boot-arg negroniusb_rails */
++static volatile bool ur_watch_running;
++static volatile uint64_t ur_start_at, ur_up_at;
++static int ur_vote_failed = -1;                 /* -1 = no vote sent */
++
++static void
++ur_snap(uint16_t v[UR_N][UR_REGS])
++{
++	for (unsigned r = 0; r < UR_N; r++) {
++		for (unsigned i = 0; i < UR_REGS; i++) {
++			uint8_t b = 0;
++			int rc = negroni_spmi_read_rc(ur_rail[r].sid, ur_rail[r].base + ur_off[i], &b);
++			v[r][i] = rc ? (uint16_t)(UR_ERR | (unsigned)rc) : b;
++		}
++	}
++}
++
++static void
++ur_text(char *buf, size_t size, uint16_t v[UR_N][UR_REGS])
++{
++	size_t n = 0;
++	buf[0] = 0;
++	for (unsigned r = 0; r < UR_N && n < size; r++) {
++		unsigned bad = UR_REGS;
++		for (unsigned i = 0; i < UR_REGS && bad == UR_REGS; i++) {
++			if (v[r][i] & UR_ERR) {
++				bad = i;        /* any failed read: no half-valid line */
++			}
++		}
++		if (bad < UR_REGS) {
++			n += snprintf(buf + n, size - n, "%s%s: read %#x rc %u", r ? " | " : "", ur_rail[r].name,
++			    ur_rail[r].base + ur_off[bad], v[r][bad] & 0xffu);
++			continue;
++		}
++		/* [I] PMIC5 LDO: STATUS1 bit 7 VREG_READY, VSET in mV (LSB 0x40, MSB 0x41), MODE 7 HPM / 5 LPM / 3 RET, EN_CTL bit 7 */
++		n += snprintf(buf + n, size - n, "%s%s: st %02x %u mV mode %02x en %02x", r ? " | " : "", ur_rail[r].name,
++		    v[r][0] & 0xffu, ((v[r][2] & 0xffu) << 8) | (v[r][1] & 0xffu), v[r][3] & 0xffu, v[r][4] & 0xffu);
++	}
++}
++
++static void
++ur_dump(const char *when)
++{
++	uint16_t v[UR_N][UR_REGS];
++	char text[400];
++	ur_snap(v);
++	ur_text(text, sizeof(text), v);
++	printf("NEGRONI USB: PHY rails %s: %s\n", when, text);
++}
++
++static int64_t
++ur_ms(uint64_t t, uint64_t now)
++{
++	return t == 0 ? -1 : (int64_t)((now - t) * 1000 / ud_abs_ms(1000));
++}
++
++/* 50 ms samples from the ADSP start until ADSP up + 30 s (60 s at most without up); one line per change. */
++static void
++ur_watch_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint16_t last[UR_N][UR_REGS], v[UR_N][UR_REGS];
++	char text[400];
++	unsigned changes = 0;
++
++	ur_snap(last);
++	for (;;) {
++		ud_sleep_ms(50);
++		uint64_t now = mach_absolute_time(), up = ur_up_at;
++		if ((up != 0 && now - up > ud_abs_ms(30000)) || now - ur_start_at > ud_abs_ms(60000)) {
++			break;
++		}
++		ur_snap(v);
++		if (memcmp(v, last, sizeof(v)) != 0) {
++			changes++;
++			if (changes <= UR_MAX_LINES) {
++				ur_text(text, sizeof(text), v);
++				printf("NEGRONI USB: PHY rails change #%u (ADSP start +%lld ms, up +%lld ms): %s\n", changes,
++				    ur_ms(ur_start_at, now), ur_ms(up, now), text);
++			}
++			memcpy(last, v, sizeof(v));
++		}
++	}
++	ur_text(text, sizeof(text), last);
++	printf("NEGRONI USB: PHY rails watch end: %u changes%s; now %s\n", changes,
++	    ur_vote_failed == 0 ? " (APPS votes held)" : ur_vote_failed > 0 ? " (APPS vote FAILED for some)" : " (no APPS vote)",
++	    text);
++	ur_watch_running = false;
++	(void)thread_terminate(current_thread());
++}
++
++/* Called from negroni_usb_adsp_event (the ADSP thread): 0 before PAS auth-and-reset, 1 at ADSP up, 2 stop. */
++static void
++ur_event(int what)
++{
++	if (ur_mode < 0) {
++		ur_mode = 1;
++		PE_parse_boot_argn("negroniusb_rails", &ur_mode, sizeof(ur_mode));
++		printf("NEGRONI USB: PHY rails (negroniusb_rails=%d): %s\n", ur_mode,
++		    ur_mode >= 2 ? "log + APPS RPMh votes before the ADSP start" : ur_mode == 1 ? "log only" : "off");
++	}
++	if (ur_mode <= 0) {
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	if (what == 0) {
++		ur_start_at = now;
++		ur_up_at = 0;
++		ur_dump("at the ADSP start");
++		if (ur_mode >= 2 && ur_vote_failed != 0) {
++			ur_vote_failed = negroni_rpmh_usb_rails();
++			printf("NEGRONI USB: PHY rails: APPS votes ldob5 880, ldoc1 1800, ldob2 3072, ldob6 1200 mV HPM: %s (fail mask %#x)\n",
++			    ur_vote_failed ? "NOT all voted" : "all voted", ur_vote_failed);
++			ur_dump("after our votes");
++		}
++		thread_t t;
++		if (!ur_watch_running) {
++			ur_watch_running = true;
++			if (kernel_thread_start(ur_watch_thread, NULL, &t) == KERN_SUCCESS) {
++				thread_deallocate(t);
++			} else {
++				ur_watch_running = false;
++			}
++		}
++	} else if (what == 1) {
++		ur_up_at = now;
++		ur_dump("at ADSP up");
++	} else {
++		ur_dump("at the ADSP stop");
++	}
++}
++
+ void negroni_usb_adsp_event(int what);
+ void
+ negroni_usb_adsp_event(int what)
+ {
+ 	uint32_t v[HP_SLOTS];
+ 
++	ur_event(what);                 /* 0372: the PHY supply rails (independent of the PHY watch) */
+ 	if (!hp.ok) {
+ 		return;
+ 	}

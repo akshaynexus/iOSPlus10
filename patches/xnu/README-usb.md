@@ -3,7 +3,8 @@
 The base driver comes from slop (patches 0072-0077, 0081, 0119: DWC3 at 0x0a600000, ep0, VBUS override, CDC-ECM,
 live log). Our patches: 0210 (UDP command server), 0212 (settime), 0282 (bus reset drops the data endpoints),
 0360 (panic mode, README-panic.md), 0361 (throughput, this file), 0366 (reconnect after unplug or a Type-C
-re-attach, this file), 0368 (the HS PHY after the ADSP start, this file), 0371 (reboot when the host stays lost, this file). Host side: docs/usb-network.md.
+re-attach, this file), 0368 (the HS PHY after the ADSP start, this file), 0371 (reboot when the host stays lost, this file), 0372 (the PHY supply rails and the ADSP, this file), 0373 (the
+charger PD log over GLINK, this file). Host side: docs/usb-network.md.
 
 ## 0361: throughput (RX ring, TX batches, short polls)
 
@@ -279,3 +280,110 @@ re-attach, this file), 0368 (the HS PHY after the ADSP start, this file), 0371 (
   reconnect).
 - Test: boot with `negroniusb_lost_reboot=20`, wait for en10, unplug. ~20 s later the phone reboots into boot_a.
   The 0367 boot log of that boot ends with "reset (USB host lost 20 s)" and has the "host lost" line.
+
+## 0372: the USB PHY supply rails and the ADSP (`negroniusb_rails`)
+
+### Observations [V]
+
+- t11 (03:51, charger GLINK client on), t12 (03:53, `negronichg_wr=0`: no charger writes), t13 (03:58,
+  `negronichg_glink=0`: no charger client at all): the Mac loses the device 2-3 s after `THE ADSP IS UP`
+  (t13: up 03:58:26, gone 03:58:29). So our GLINK traffic is not the cause. The ADSP starts the drop alone.
+- The 0368 PHY watch: the PHY registers, GCC BCR, ref clock and EUD read the same at the ADSP start and at ADSP up.
+- t13: the soft reconnects (0366) and PHY re-inits (0368) brought nothing back. The phone kept running: the 0371
+  reboot (60 s) put it into boot_a, and the Mac saw it again at 04:00:21 (a new boot, `load_init_program`).
+- In t11 the ADSP acked our open of PMIC_RTR_ADSP_APPS at 03:51:00, but its own OPEN (the charger PD start) did not
+  arrive before the drop at 03:51:02. So the drop comes at about the time the charger PD starts.
+- The ADSP image (`out/firmware/adsp/adsp.b14` strings) holds PMIC rail resources `/pm/ldob2`, `/pm/ldob5`,
+  `/pm/ldob6`, `/pm/ldoc1` (each with `/en`, `/mode`, `/mV`), next to `/pm/ldoc10`, `/pm/ldoh2`.
+- live.dts `hsphy@88e3000`: `vdd-supply` = pm8350_l5 (ldob5, 0.88 V), `vdda18-supply` = pm8350c_l1 (ldoc1, 1.8 V),
+  `vdda33-supply` = pm8350_l2 (ldob2, 3.072 V). `ssphy@88e8000` `core-supply` = pm8350_l6 (ldob6, 1.2 V). So the
+  ADSP votes exactly the four USB PHY rails.
+- live.dts rpmh-regulator nodes for these rails: `qcom,set = 3`, `qcom,init-voltage` and `qcom,init-mode = 4` (HPM).
+  The Linux rpmh-regulator driver sends these votes from APPS at probe, and the PHY driver enables the rails.
+  Our XNU kernel sends no RPMh vote for them (negroni_rpmh.c votes only ldoc11, camera and Wi-Fi/BT rails).
+- Other ADSP strings: `charger_detection_inital_detection: adsp rerun status`, `battmngr_tech_schgp_chg_rerun_apsd`,
+  `PmicTccPlatform_..._TypecModeAsSink`, `oplus_set_otg_switch_status::set typec_mode = drp|sink_only`,
+  `Sent Hard Reset Signal Successful`, `Data Role Changed`. The charger PD reruns APSD at its start and runs a USB PD
+  stack.
+
+### Cause [I, not proven]
+
+When the charger PD starts, it votes the PHY rails on for its BC1.2/APSD detection, then lowers or drops its votes.
+RPMh sets each rail to the highest vote of all masters. APPS has no vote, so the rail follows the ADSP alone and
+goes off (or to LPM). The analog side of the HS PHY (vdda33: pull-up and HS transceiver) loses power. The digital
+registers still read (that is why 0368 saw no change), and a soft reconnect or PHY init cannot help. This explains
+all three tests and why only a reboot (XBL powers the rails again) brings the link back.
+Other candidates are not excluded: a PD Hard Reset or Type-C role change from the charger PD, or the APSD rerun
+with our pull-up on. 0373 (the charger PD log) and the 0372 rail log tell which one is true.
+
+### Change
+
+- `negroni_usb.c` (`ur_event`, called from `negroni_usb_adsp_event`, the ADSP thread): boot-arg `negroniusb_rails`:
+  - `0`: off.
+  - `1` (default): log only. SPMI observer reads of the four LDOs (STATUS1 0x08, VSET 0x40/0x41 in mV, MODE 0x45,
+    EN_CTL 0x46): at the ADSP start, at ADSP up, at a stop, and every 50 ms on a separate thread from the ADSP start
+    until ADSP up + 30 s (60 s at most). One line per change (at most 100), one end line.
+  - `2`: as 1, plus APPS RPMh ACTIVE votes before PAS auth-and-reset: ldob5 880 mV, ldoc1 1800 mV, ldob2 3072 mV,
+    ldob6 1200 mV, all HPM (mode 7) and enabled (`negroni_rpmh_usb_rails`, negroni_rpmh.c). The vote is sent once per
+    boot (again only if it failed). RPMh takes the highest vote, so a lower ADSP vote can no longer turn them off.
+- `negroni_spmi.c`: read allowlist + SID 1 peripherals 0x41/0x44/0x45 (PM8350 L2/L5/L6) and SID 2 peripheral 0x40
+  (PM8350C L1), offsets 0x08/0x40/0x41/0x45/0x46 only. No write.
+- The PMIC5 LDO register meaning (VREG_READY = STATUS1 bit 7, VSET mV, MODE 7 HPM / 5 LPM / 3 RET, EN_CTL bit 7) is
+  [I] from Linux qcom_spmi-regulator.c; the log shows raw values. If the LDO peripherals have no APID for EE 0, the
+  line shows `read 0x<addr> rc 4` (any failed register read prints the rail as an error, never a half-valid line;
+  then only the vote test can answer).
+- Safety: the votes use the DT voltages (min = max for ldoc1/ldob2/ldob6; ldob5 880 mV is the DT minimum, RPMh keeps a
+  higher vote of another master). HPM only raises the current limit. These are the votes Android holds all the time.
+
+### Boot lines
+
+```
+NEGRONI USB: PHY rails (negroniusb_rails=2): log + APPS RPMh votes before the ADSP start
+NEGRONI USB: PHY rails at the ADSP start: L5B vdd: st .. 880 mV mode .. en .. | L1C vdda18: ... | L2B vdda33: ... | L6B ss: ...
+NEGRONI RPMH: 0372 USB PHY rail ldob5 880 mV HPM on: voted (errno 0)     (x4: ldob5, ldoc1, ldob2, ldob6)
+NEGRONI USB: PHY rails: APPS votes ldob5 880, ldoc1 1800, ldob2 3072, ldob6 1200 mV HPM: all voted (fail mask 0)
+NEGRONI USB: PHY rails after our votes: ...
+NEGRONI USB: PHY rails at ADSP up: ...
+NEGRONI USB: PHY rails change #n (ADSP start +N ms, up +M ms): ...          (only when a register moves)
+NEGRONI USB: PHY rails watch end: N changes (APPS votes held); now ...
+```
+
+### Test
+
+1. Evidence boot (no behaviour change): t13 boot-args + `negroniusb_rails=1 negronichg_ulog=1 negroniusb_lost_reboot=60`.
+   Read the boot log of that boot after the 0371 reboot (`make bootlog` with an image that has the 0367 command).
+   A `PHY rails change` line 2-3 s after ADSP up with L2B `en 00` (or mode 05/03) proves the cause.
+2. Fix boot: the same with `negroniusb_rails=2`. Expected: the four `voted` lines before `PAS auth and reset`,
+   no `PHY rails change` with `en 00`, and the Mac keeps en10 after `THE ADSP IS UP` (no `usblog: phone interface gone`).
+3. If 2 still drops: the rails are not the cause. The `NEGRONI ULOG:` lines (0373) of the same boot say what the
+   charger PD did (APSD rerun, Type-C mode, Hard Reset, data role).
+
+### Verification
+
+- [V] compile-one OK for negroni_usb.c, negroni_rpmh.c, negroni_spmi.c, negroni_chg_glink.c, negroni_adsp.c (only old
+  warning kinds). Full build: out/kernel/local-20261026-225104/kernel.development.negroni sha256
+  201a9ae54fc9ce02c9062e8e16de90adacffbd23272a12f6eee7f5c3621eaf07 (271 applied incl. 0372 + 0373, 4 dxb skips).
+- [ ] Phone: not booted.
+
+## 0373: the charger PD log over GLINK (`negronichg_ulog=1`)
+
+- The live DT has a second pmic_glink device: `qcom,pmic_glink_log` on channel `PMIC_LOGS_ADSP_APPS` with
+  `qcom,charger_ulog_glink`. Protocol [V: Linux v6.12 drivers/soc/qcom/pmic_pdcharger_ulog.c]: request
+  {owner 32778, type 1, opcode 0x18 GET_CHG_ULOG_REQ, u32 log_size 8192}; answer {header, 8192 bytes of text}. Linux
+  asks again 1 s after each answer and prints each non-empty line.
+- 0373: a 4th GLINK channel in negroni_adsp.c (`NEGRONI_GLINK_ULOG`, lcid 4); the ADSP's OPEN of
+  `PMIC_LOGS_ADSP_APPS` is answered only with `negronichg_ulog=1` (else "not ours, left unanswered" as before).
+  A thread in negroni_chg_glink.c (started from `negroni_chg_glink_start`, independent of `negronichg_glink`)
+  opens the channel (first wait 30 s, then 5 s per try with a 25 s rest between tries, at most 40 tries, then the
+  thread ends: no 1 kHz GLINK poll for the whole boot when the charger PD never opens it), sends the request every `negronichg_ulog_ms` (default 1000,
+  200-60000) for 120 s after the open, then every 5 s, and prints every line as `NEGRONI ULOG: <text>` until
+  `negronichg_ulog_lines` (default 3000) lines. The RX callback only copies (it runs under the GLINK lock).
+  The 8204-byte answer needs an RX intent of that size: the ADSP asks with RX_INTENT_REQ, 0274 grants up to 0x4400.
+- Read only: the request asks for log text. Default off (`negronichg_ulog=0`): no change.
+- The lines go to the kernel log, so the 0367 boot log keeps them when the USB link is gone.
+- Boot lines: `NEGRONI ULOG: start: channel PMIC_LOGS_ADSP_APPS, ...`, `NEGRONI ULOG: PMIC_LOGS_ADSP_APPS is open (try 1)`,
+  then the ADSP's own lines, for example `NEGRONI ULOG: ... charger_detection_inital_detection: adsp rerun status=0x..`,
+  `... TypeC StateMachine = .., CCStatus= ..`, `... PE: PDContractState=.., DataRole=.., PowerRole=..`. End line:
+  `NEGRONI ULOG: end: N lines, N requests, N answers, ...`.
+- Failure lines: `PMIC_LOGS_ADSP_APPS not open (try n, rc 60)` (the charger PD never opens it), `no answer to request #n
+  in 1.5 s`, `GLINK: PMIC_LOGS_ADSP_APPS: the ADSP asks for an intent of N bytes: refused` (answer too big).
