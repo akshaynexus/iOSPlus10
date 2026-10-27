@@ -1436,3 +1436,133 @@ Review fix F3 (a computed DDR vote below the Linux constant keeps the constant, 
 Proof build after the review fixes (kernel only, no image: owner rule): `out/kernel/local-20261026-131404` (sha256
 3bae1cc92b09479557481b9115b92b7e460c00fb21bf8c0da76265d9ca930b83). `out/ios16-dpu` still holds the first kernel
 (dc55e5fd...); the fixes change only a log text and a bound that today's geometry already met.
+
+## 28. GPU governor, fence interrupt, slumber fix (0384, `0384-negroni-gpu-governor-irq.patch`)
+
+Owner (2026-10-27): "GPU acceleration is iffy", the phone runs hot. Files: negroni_adreno.c, NegroniGPU.cpp (1 call),
+NegroniFramebuffer.cpp (2 calls). Config: `negronigpu_level=12` removed from config/negroni-ne2211.toml.
+
+### What the logs show (before 0384)
+- [V] IFPC is accepted and turned on at boot (bootlog-13.txt:578 `FEATURE_CTRL IFPC ACCEPTED`, :784 `IFPC on: OOB GPU_SET
+  released`). About 1 s later the 0298 IFPC-mode slumber tries 3 times and fails: `17 HFI PREPARE_SLUMBER ack, error 1002`,
+  `PREPARE_SLUMBER not acked (1..3); GX held again`, `slumber off for this boot` (bootlog-13.txt:1693-1758; the same in
+  bootlog-3/6/11 and usblog-20261027-060101.txt:732-797, usblog-20261027-121304.txt:3255-3306).
+- [V code] The third failure sets `pm_mode = PM_OFF` with OOB GPU_SET held. From then on the GMU never collapses GX: every
+  WATCH line says `pm off` and `GX 0xf8222800` (GDSC bit 31 PWR_ON = 1): bootlog-12.txt 3819 of 3819 WATCH lines over a
+  7.1 h boot; usblog-20261027-121304.txt all 400. This is the main idle cost: GX powered for the whole boot.
+- [V] The 0285 build without 0298 (usblog-20261026-131747.txt) ran IFPC: `GX collapsed 100%` (:1030), 40-75 % while in use,
+  WPTR writes `dropped 9..13 times (GX collapsed), taken after 262..326 us` (:1436-1508).
+- [V] The level follows the vote: `gxclk 349 MHz` at level 4 (100 lines), `639 MHz` at level 9 (86 lines),
+  usblog-20261027-121304.txt. With `negronigpu_level=12` the 0281 DCVS used 12 as its max, not as a fixed level.
+- [V] The 0286 UI floor holds level 9 (640 MHz) and the DT bus vote 10 while the UI swaps 30/s or more: bootlog-12.txt has
+  level 9 in 3482 of 3819 WATCH lines, and the GMU busy share was 0 % in 3768 of them (the DCVS `busy` value).
+- [V] Frames wait for the GPU even at 640 MHz: usblog-20261027-121304.txt, 445 STAT seconds: swaps 6510, presents 6218,
+  `gpu-wait skips` 3112 (a vsync tick where the frame's fence was not written yet: the frame waits one more tick), swapwait
+  `timeouts` 4013 (CA's non-blocking check found the frame not on screen yet), `gave up on fence` once (:11315), swaps/s
+  max 59 (no 120 Hz content). [I] At busy 0 % the cause is the fence latency of the polled path and the submit time in the
+  frame, not the clock.
+- [V] No `GPU RECOVERY`, no `no answer for 2 s`, no `RedwoodGPU ... stops` in any 2026-10-27 log: no hangs.
+- [V] Metal client crashes are userland: AegirPoster starts 74 times in usblog-20261027-121304.txt; the first run ends with
+  `NMTL[298 AegirPoster]: uncaught exception CAMetalLayerInvalid: unsupported extended range format` (:111) and SIGABRT; after
+  4 strikes the dead-man gives it no Metal device and it still aborts (`CRASH AegirPoster ... sig 6`, 73 times). Also
+  MusicWidgets SIGSEGV (6), assetsd SIGABRT (9). Not in this patch (external/metal2vulkan; CAMetalLayer pixel format).
+- [I] Screen off: no log has a long display-off period (usblog-20261027-121304.txt:5423 brightness 0 for 1 s only). With
+  `pm off` GX stays on with the screen off too, by the code.
+
+### KGSL facts used [V code, out/src/op-kernel/drivers/gpu/msm]
+- `gen7_gmu_notify_slumber` (adreno_gen7_gmu.c:1424-1450): GMU power counter OFF first ("so that the GMU is not busy"), then
+  PREPARE_SLUMBER `{freq = gpu_level_num - default_pwrlevel - 1, bw = bus-freq of default_pwrlevel}`; fence to ALLOW.
+  DT `qcom,initial-pwrlevel = <0x0a>` (285 MHz, bus-freq 2) -> freq index 2, bw 2. 0298 sent `{0, 0}` with the counter on.
+- `gen7_gmu_power_off` (:2513-2560) waits for the lowest idle level first (`gen7_gmu_wait_for_lowest_idle` :696-760: power state
+  3 = IFPC and the GX clock or GDSC off, 100 ms); `gen7_power_off` (:2795-2833) masks interrupts and clears OOB first.
+- Fence interrupt: ring end `CP_EVENT_WRITE CACHE_CLEAN | BIT(31) | BIT(27)` (adreno_gen7_ringbuffer.c:372-379);
+  `GEN7_INT_MASK` includes RB_DONE_TS (17) and CACHE_CLEAN_TS (20) (adreno_gen7.h:193-206, gen7_reg.h:24-25);
+  RBBM_INT_0_MASK 0x38 / CLEAR_CMD 0x37 (gen7_reg.h:607-608), written once per GPU boot (adreno_gen7_gmu.c:2578);
+  `gen7_irq_handler` (adreno_gen7.c:1194-1222): PWR_COL_KEEPALIVE (0x1f8c3) 1, AHB fence ALLOW poll (100 x 1 us,
+  `gen7_irq_poll_fence` :1153-1190), read INT_0_STATUS, write CLEAR_CMD, keepalive 0. DT: `interrupts = <0 0x12c 4>`
+  `kgsl_3d0_irq` (out/live.dts:21063) = SPI 300 = INTID 332, level.
+- DT OPPs (out/live.dts:21087-21210): 12 levels 818..220 MHz with `qcom,bus-freq` 11, 11, 10, 10, 8, 8, 6, 6, 3, 2, 2, 2
+  (our perf levels 12..1; 0298 `dcvs_bw_for` already maps them).
+
+### What 0384 does
+1. Slumber fix (default on). IFPC mode never goes to `PM_OFF` on a slumber failure: after 3 failures only the IFPC-mode
+   slumber stops (`IFPC-mode slumber off for this boot; IFPC stays on`) and OOB GPU_SET goes back to the GMU, so IFPC
+   collapses GX again. `pm_sleep` follows KGSL: IRQ off, OOB clear, wait for the lowest idle (IFPC: power state 3 and
+   GFX_PWR_CLK_STATUS bit 0 or 1; else no slumber now, after 3 such misses it sends anyway), GMU power counter off,
+   PREPARE_SLUMBER `{bw 2, freq 2}`. A failure turns the counter on again and logs the ack word.
+2. Slumber only with the display off (`negronigpu_dispoff_slumber=1`, default): the FB's power request (backboardd, 0258)
+   calls `negroni_gpu_display()`. The IFPC-mode slumber runs after `negronigpu_ifpc_slumber` ms (2000) of no work while
+   the display is off. Display on: IFPC only (GX collapses 300 us after each submission; no warm boot per frame).
+3. Slumber wake retry: a failed warm boot gets the 0287 reset (CM3 reset, GBIF halts, RSC sleep) and one more warm boot
+   (up to 8 per boot) before `pm_dead`.
+4. Governor (`negronigpu_gov=1`, default): Linux simple_ondemand (governor_simpleondemand.c) on the GMU busy counter of each
+   watch tick (100 ms while busy, 250 ms idle): busy > up (90 %) -> the top allowed level; > up - down (85 %) -> stay; else
+   the lowest DT level >= cur MHz x busy / (up - down/2). Levels 1..12 (220..818 MHz), bus vote = the level's DT bus-freq.
+   No work -> busy 0 -> level 1 (220 MHz, bus 2). Display off -> level 1 at once. A frame the display held for the GPU
+   (FB `gpu-wait skips`) in a tick with busy >= 10 % -> one level up. Thermal cap (0280) still wins. No UI floor unless
+   `negronigpu_uifloor=N` is given. Without the busy counter, a tick with work queued is 100 % (the fence rule). A tick with
+   the counter on but no sample (the first after a wake or a recovery) keeps the level (review fix: no jump to 818 MHz).
+   `negronigpu_level=N` is now a fixed level: the governor is off (`NEGRONI GPU DCVS: off: fixed level N`).
+5. Fence interrupt (`negronigpu_irq=1`, default): GIC SPI 300 through `negroni_spi_register` (0295's slot table; the DPU TE
+   IRQ uses one of 4 slots); RBBM_INT_0_MASK = bits 17 and 20, written at `pm_start` and at the end of every warm boot (GX
+   held); the last fence write of each submission has the IRQ bit. The handler is KGSL's (keepalive, fence poll, status,
+   clear) and wakes all fence waiters. RedwoodGPU's `gpuWait` (every client wait, the present, the FB waits) sleeps on the
+   event instead of `delay_for_interval(200 us)`; with the interrupt live it still looks every `negronigpu_irq_poll_us`
+   (1000 us) as the polled fallback. Not armed while GX is in a transition: disarmed (and masked at the GIC) in
+   `pm_sleep`, `rec_reset` and `gpu_warm_boot`, armed at their end; the handler masks the line when GX is off or the AHB
+   fence holds, and the watch unmasks it each second. More than 20000 interrupts in a second: off for the boot.
+
+### Boot-args (0384)
+| Boot-arg | Default | Meaning |
+|---|---|---|
+| `negronigpu_gov` | 1 | 1 = simple_ondemand; 0 = the 0281/0286 step rule (floor 4, UI floor 9) |
+| `negronigpu_up` / `negronigpu_down` | 90 / 5 | simple_ondemand upthreshold / downdifferential (%) |
+| `negronigpu_minlevel` / `negronigpu_maxlevel` | 1 / 12 | governor range (220..818 MHz) |
+| `negronigpu_late_pct` | 10 | late-frame step at this busy share or more; 0 = off |
+| `negronigpu_uifloor` | 0 with gov 1 | 0286 UI floor level (old default 9) |
+| `negronigpu_level` | unset | N = fixed level, governor off |
+| `negronigpu_irq` | 1 | 0 = polled fences only (200 us) |
+| `negronigpu_irq_poll_us` | 1000 | fallback look of a waiter while the interrupt is live (100..20000) |
+| `negronigpu_irq_intid` | 332 | GIC INTID of kgsl_3d0_irq |
+| `negronigpu_dispoff_slumber` | 1 | 0 = IFPC-mode slumber also with the display on (0298 behaviour) |
+
+### Expected lines [I, not booted]
+- `NEGRONI GPU IRQ: on: INTID 332 (SPI 300, level), RBBM_INT_0_MASK 0x120000 ...` after `IFPC mode slumbers after 2000 ms idle
+  with the display off ...` and `IFPC on: OOB GPU_SET released ...`.
+- `NEGRONI GPU DCVS: on (0384 simple_ondemand): start level 1 (220 MHz), levels 1..12 (220..818 MHz), up 90% down 5% ...`.
+- Per second with changes: `NEGRONI GPU DCVS: level A -> B (M MHz, bw W), N changes this second, busy P% (GMU counter, last
+  tick Q%), cap 12, display on, late frames L (S steps), top jumps T, ui U swaps/s`.
+- WATCH: `... | dcvs L busy N% gov P% | pm ifpc GX collapsed N% gmu N% pwr 0x3 ... slumbers N wakes N busy N% | ...` (not
+  `pm off`), then `NEGRONI GPU IRQ: irq live N/s fence N/s woke N missed N | all ... gx-off ... held ... unarmed ... bits 0x...`.
+- Display off for > 2 s: `NEGRONI GPU PM: slumber N in N us: GMU idle, GX off ...`; display on: `first wake: steps 14-21 again`,
+  `wake N in N us (asleep N ms)`. A refused slumber: `PREPARE_SLUMBER not acked (n; lowest idle reached, ack word 2 = E)`, at 3:
+  `IFPC-mode slumber off for this boot; IFPC stays on` (WATCH keeps `pm ifpc`).
+
+### Phone test plan (in this order)
+1. Boot the image. Proof: the lines above; WATCH `pm ifpc` (never `pm off`); `GX collapsed` > 50 % with the UI still.
+2. UI still for 10 s: DCVS goes to level 1 (`-> 1 (220 MHz, bw 2)`), `gov 0..5%`. Scroll a list for 10 s: the level rises
+   (busy > 85 % -> 12), and falls again 1-2 s after; FB STAT `gpu-wait skips` per second at or below the old 0-40.
+3. IRQ: `NEGRONI GPU IRQ: irq live` with `fence N/s` near the submissions, `woke` high, `missed` near 0. `irq armed` with
+   `fence 0/s` while the UI moves = no interrupt arrives (check `bits`, `gx-off`, `held`); waiters then poll (no harm).
+4. Screen off (power key) for 30 s, then on: `display off` in the DCVS line and level 1; `slumber 1 in N us`; WATCH
+   `ifpc (asleep)`; on screen-on `first wake: steps 14-21 again` then `wake 1 in N us`, the UI draws. Repeat 5 times.
+5. Compare THERMAL `gpu` and battery current with the 0298 image under the same use (expected lower).
+Back-out: `negronigpu_irq=0` (polled), `negronigpu_dispoff_slumber=1 negronigpu_ifpc_slumber=0` (IFPC only, no slumber),
+`negronigpu_gov=0` (old step rule), `negronigpu_level=12` (fixed 818 MHz;
+not as before: the 0281 DCVS used 12 as its max; a fixed level has no DCVS, so the 0280 thermal cap does not act).
+
+### Risks [I]
+- The wake from slumber never ran on the phone. A failed wake + failed retry = `pm_dead`: the GPU stays off, the UI goes on
+  with CPU copies (0254 give-up). Back-out: `negronigpu_ifpc_slumber=0`.
+- PREPARE_SLUMBER may still be refused (error 1002 has no name in KGSL). Then the slumber stops after 3 tries and IFPC stays:
+  the idle cost is still far below `pm off`.
+- The interrupt line may not assert (wrong INTID, or the GIC group setting): then `irq armed`, `fence 0/s`, waiters poll every
+  200 us as before. A level storm: off after 1 s (> 20000).
+- simple_ondemand jumps to 818 MHz at busy > 90 %: short bursts at the top level. `negronigpu_maxlevel` limits it.
+- 220 MHz at low load: frames that are short but late (submitted near the tick) may wait one more tick; the late-frame step
+  lifts the level only when busy >= 10 %.
+
+### Build
+2026-10-27 16:38, job `gpudcvs-kernel` (scripts/kernel/build-local.sh, all patches/xnu up to 0384, the 4 usual dxb skips, 0 compile
+errors, no new warnings in the 3 files against the unpatched tree): kernel `out/kernel/local-20261027-110800`
+(sha256 cee20b34f7e6e935d98021c656795df5a09b7d6e50a74f798a31829bf3825dbc). No image (owner rule: one image at the end). Not booted.

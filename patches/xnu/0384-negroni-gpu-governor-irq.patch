@@ -1,0 +1,672 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index 5fe72e0..f1bd67e 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -201,6 +201,25 @@ static uint32_t k_hwcg = 1, k_protect = 1, k_chicken = 1, k_dms_off = 1, k_rptr_
+ static uint32_t k_ifpc_slumber_ms = 2000, k_hfi_ms = 100, k_bwcalc = 1, k_cnoc = 1, k_bwdt = 1;
+ static bool k_args_read, hfi_runtime;
+ 
++/*
++ * Patch 0384 (README-gpu-kernel.md section 28): governor, fence interrupt, slumber fixes. 1 = on (default) unless noted.
++ *   negronigpu_gov           1 = the Linux simple_ondemand governor on the GMU busy counter; 0 = the 0281/0286 step rule
++ *   negronigpu_up            simple_ondemand upthreshold in % (default 90): above it, the top allowed level
++ *   negronigpu_down          simple_ondemand downdifferential in % (default 5): between up-down and up, the level stays
++ *   negronigpu_minlevel      lowest level of the governor (default 1 = 220 MHz, the DT's lowest OPP)
++ *   negronigpu_maxlevel      highest level of the governor (default 12 = 818 MHz); the 0280 thermal cap still wins
++ *   negronigpu_late_pct      a frame the display had to hold for the GPU (FB STAT "gpu-wait skips") lifts the level one
++ *                            step when the busy share of that tick is at least this % (default 10; 0 = off)
++ *   negronigpu_irq           1 = the fence interrupt (CACHE_CLEAN_TS on GIC SPI 300) wakes the fence waiters; 0 = poll only
++ *   negronigpu_irq_poll_us   with the interrupt live, a waiter still looks every N us (default 1000; the fallback)
++ *   negronigpu_irq_intid     GIC INTID of kgsl_3d0_irq (default 332 = SPI 300, out/live.dts kgsl-3d0 "interrupts")
++ *   negronigpu_dispoff_slumber  1 = IFPC mode slumbers only while the display is off; 0 = after negronigpu_ifpc_slumber ms
++ *                            idle with the display on too (0298)
++ * negronigpu_level=N (0235) is now a fixed level: the governor is off when it is set.
++ */
++static uint32_t k_gov = 1, k_up = 90, k_down = 5, k_minlevel = 1, k_maxlevel = 12, k_late_pct = 10;
++static uint32_t k_irq = 1, k_irq_poll_us = 1000, k_irq_intid = 332, k_dispoff_slumber = 1;
++
+ static void
+ k_args(void)
+ {
+@@ -208,6 +227,21 @@ k_args(void)
+ 		return;
+ 	}
+ 	k_args_read = true;
++	(void)PE_parse_boot_argn("negronigpu_gov", &k_gov, sizeof(k_gov));
++	(void)PE_parse_boot_argn("negronigpu_up", &k_up, sizeof(k_up));
++	(void)PE_parse_boot_argn("negronigpu_down", &k_down, sizeof(k_down));
++	(void)PE_parse_boot_argn("negronigpu_minlevel", &k_minlevel, sizeof(k_minlevel));
++	(void)PE_parse_boot_argn("negronigpu_maxlevel", &k_maxlevel, sizeof(k_maxlevel));
++	(void)PE_parse_boot_argn("negronigpu_late_pct", &k_late_pct, sizeof(k_late_pct));
++	(void)PE_parse_boot_argn("negronigpu_irq", &k_irq, sizeof(k_irq));
++	(void)PE_parse_boot_argn("negronigpu_irq_poll_us", &k_irq_poll_us, sizeof(k_irq_poll_us));
++	(void)PE_parse_boot_argn("negronigpu_irq_intid", &k_irq_intid, sizeof(k_irq_intid));
++	(void)PE_parse_boot_argn("negronigpu_dispoff_slumber", &k_dispoff_slumber, sizeof(k_dispoff_slumber));
++	k_up = k_up < 10 ? 10 : k_up > 100 ? 100 : k_up;
++	k_down = k_down >= k_up ? k_up / 2 : k_down;
++	k_maxlevel = k_maxlevel < 1 ? 1 : k_maxlevel > 12 ? 12 : k_maxlevel;
++	k_minlevel = k_minlevel < 1 ? 1 : k_minlevel > k_maxlevel ? k_maxlevel : k_minlevel;
++	k_irq_poll_us = k_irq_poll_us < 100 ? 100 : k_irq_poll_us > 20000 ? 20000 : k_irq_poll_us;
+ 	(void)PE_parse_boot_argn("negronigpu_hwcg", &k_hwcg, sizeof(k_hwcg));
+ 	(void)PE_parse_boot_argn("negronigpu_protect", &k_protect, sizeof(k_protect));
+ 	(void)PE_parse_boot_argn("negronigpu_chicken", &k_chicken, sizeof(k_chicken));
+@@ -2786,7 +2820,10 @@ static uint32_t pm_sleeps, pm_wakes, pm_wake_us, pm_wake_max_us, pm_sleep_failed
+ static uint32_t pm_fence_waits, pm_fence_max_us, pm_fence_fails;
+ static uint32_t pm_samples, pm_collapsed, pm_gmu_off;  /* watch samples since the last WATCH line */
+ #define K_GBIF_HALT_ACK         0x3c46          /* 0298: GEN7_GBIF_HALT_ACK */
+-static uint32_t pm_gbif_logged, pm_ifpc_sleeps, pm_ifpc_skips;
++static uint32_t pm_gbif_logged, pm_ifpc_sleeps, pm_ifpc_skips, pm_lowest_missed;   /* 0384: + lowest-idle misses */
++static uint32_t pm_wake_retries;                /* 0384: failed slumber wakes that got a reset + retry (max 8 a boot) */
++static void rec_reset(uint32_t n, bool collapse);
++bool negroni_gpu_done(uint32_t fence);
+ static uint64_t busy_last_xo, busy_last_ao, busy_acc_xo, busy_acc_ao;   /* 0298: GMU busy counter */
+ static bool busy_counter_ok = true;
+ static uint32_t busy_zero_ticks;
+@@ -2860,6 +2897,225 @@ pm_gpu_clear(void)
+ 	wr(gmu + GMU_REG(GMU_HOST2GMU_INTR_SET), 1u << OOB_GPU_SET_ACK);       /* gen7_gmu_oob_clear: BIT(31 - 2 * 0) */
+ }
+ 
++/*
++ * ---- patch 0384: the fence interrupt ----
++ * KGSL (out/src/op-kernel/drivers/gpu/msm): the ring's last CP_EVENT_WRITE is CACHE_CLEAN | BIT(31) (IRQ) | BIT(27)
++ * (adreno_gen7_ringbuffer.c:372-379); RBBM_INT_0_MASK (0x38) holds GEN7_INT_MASK with RB_DONE_TS 17 and
++ * CACHE_CLEAN_TS 20 (adreno_gen7.h:193-206, gen7_reg.h:24-25, 607-608), written once per GPU boot
++ * (adreno_gen7_gmu.c:2578; not in the IFPC lists); gen7_irq_handler (adreno_gen7.c:1194-1222): GMU
++ * PWR_COL_KEEPALIVE (0x1f8c3) = 1, AHB fence must read ALLOW (gen7_irq_poll_fence: 100 x 1 us), RBBM_INT_0_STATUS
++ * read, RBBM_INT_CLEAR_CMD (0x37) = status, keepalive 0; bit 20 -> gen7_cp_callback (retire). The line is
++ * kgsl_3d0_irq, GIC SPI 0x12c level (out/live.dts:21063). Here the handler wakes every fence waiter
++ * (negroni_gpu_fence_sleep); the waiters keep a timed look (negronigpu_irq_poll_us) as the polled fallback.
++ * Armed only while GX is reachable: disarmed (and masked at the GIC) before a slumber, a recovery reset and a
++ * warm boot; armed again with GX held at their end. A storm (> GPU_IRQ_STORM a second) turns it off for the boot.
++ */
++#define REG_RBBM_INT_CLEAR_CMD  0x0037
++#define REG_RBBM_INT_0_MASK     0x0038
++#define GPU_INT_RB_DONE_TS      (1u << 17)
++#define GPU_INT_CACHE_CLEAN_TS  (1u << 20)
++#define GMU_PWR_COL_KEEPALIVE   0x1f8c3
++#define EVENT_WRITE_IRQ         (1u << 31)
++#define GPU_IRQ_STORM           20000
++
++extern int negroni_spi_register(uint32_t intid, bool edge, void (*fn)(void *, uint32_t), void *arg);
++extern void negroni_spi_enable(uint32_t intid, bool on);
++
++static bool gpu_irq_registered, gpu_irq_off;
++static bool gpu_irq_armed, gpu_irq_live, gpu_irq_masked;       /* atomics */
++static uint32_t gpu_irq_busy;                                   /* atomic: handlers running now */
++static uint32_t gpu_irq_count, gpu_irq_fences, gpu_irq_other, gpu_irq_unarmed, gpu_irq_gx_off, gpu_irq_fence_held;
++static uint32_t gpu_irq_status_or, gpu_irq_woken, gpu_irq_missed, gpu_irq_polled;
++static uint32_t gpu_fence_event;                                /* the waiters sleep on its address */
++
++/* GIC SPI handler, interrupt context, one CPU (the SPI is routed to the CPU that registered it) */
++static void
++gpu_irq(void *arg __unused, uint32_t intid)
++{
++	__atomic_fetch_add(&gpu_irq_busy, 1, __ATOMIC_SEQ_CST);
++	__atomic_fetch_add(&gpu_irq_count, 1, __ATOMIC_RELAXED);
++	if (!__atomic_load_n(&gpu_irq_armed, __ATOMIC_SEQ_CST)) {
++		/* a level line we must not clear now (GX in a transition): masked until the watch arms it again */
++		negroni_spi_enable(intid, false);
++		__atomic_store_n(&gpu_irq_masked, true, __ATOMIC_SEQ_CST);
++		gpu_irq_unarmed++;
++	} else {
++		wr(gmu + GMU_REG(GMU_PWR_COL_KEEPALIVE), 1);
++		__asm__ volatile ("dsb sy");
++		uint32_t i;
++		for (i = 0; i < 100 && rd(gmu + GMU_REG(GMU_AO_AHB_FENCE_CTRL)) != 0; i++) {
++			delay(1);
++		}
++		if (i == 100) {
++			/* gen7_irq_poll_fence: the status and clear registers are not reachable; the watch unmasks */
++			negroni_spi_enable(intid, false);
++			__atomic_store_n(&gpu_irq_masked, true, __ATOMIC_SEQ_CST);
++			gpu_irq_fence_held++;
++		} else if (!(rd(gpucc + GPUCC_GX_GDSCR) & GDSC_PWR_ON)) {
++			/* GX already collapsed: no RBBM register to read (the level went with GX) */
++			negroni_spi_enable(intid, false);
++			__atomic_store_n(&gpu_irq_masked, true, __ATOMIC_SEQ_CST);
++			gpu_irq_gx_off++;
++		} else {
++			uint32_t status = rd(gpu_regs + GPU_WORD(REG_RBBM_INT_0_STATUS));
++			wr(gpu_regs + GPU_WORD(REG_RBBM_INT_CLEAR_CMD), status);
++			__asm__ volatile ("dsb sy");
++			gpu_irq_status_or |= status;
++			if (status & (GPU_INT_CACHE_CLEAN_TS | GPU_INT_RB_DONE_TS)) {
++				gpu_irq_fences++;
++				__atomic_store_n(&gpu_irq_live, true, __ATOMIC_RELAXED);
++			} else {
++				gpu_irq_other++;
++			}
++		}
++		wr(gmu + GMU_REG(GMU_PWR_COL_KEEPALIVE), 0);
++	}
++	__atomic_fetch_sub(&gpu_irq_busy, 1, __ATOMIC_SEQ_CST);
++	thread_wakeup((event_t)&gpu_fence_event);
++}
++
++/* Before GX goes away (slumber, recovery reset, warm boot): no handler reads GX after this returns. */
++static void
++gpu_irq_disarm(void)
++{
++	if (!gpu_irq_registered) {
++		return;
++	}
++	__atomic_store_n(&gpu_irq_armed, false, __ATOMIC_SEQ_CST);
++	negroni_spi_enable(k_irq_intid, false);
++	__atomic_store_n(&gpu_irq_masked, true, __ATOMIC_SEQ_CST);
++	while (__atomic_load_n(&gpu_irq_busy, __ATOMIC_SEQ_CST) != 0) {
++		;
++	}
++}
++
++/* GX held (OOB GPU_SET or PM off): KGSL adreno_irqctrl(1) after each GPU boot, then the line on. */
++static void
++gpu_irq_arm(void)
++{
++	if (!gpu_irq_registered || gpu_irq_off) {
++		return;
++	}
++	wr(gpu_regs + GPU_WORD(REG_RBBM_INT_CLEAR_CMD), ~0u);
++	wr(gpu_regs + GPU_WORD(REG_RBBM_INT_0_MASK), GPU_INT_CACHE_CLEAN_TS | GPU_INT_RB_DONE_TS);
++	__asm__ volatile ("dsb sy");
++	__atomic_store_n(&gpu_irq_armed, true, __ATOMIC_SEQ_CST);
++	__atomic_store_n(&gpu_irq_masked, false, __ATOMIC_SEQ_CST);
++	negroni_spi_enable(k_irq_intid, true);
++	thread_wakeup((event_t)&gpu_fence_event);       /* waiters of fences the reset or the wake made done */
++}
++
++/* pm_start, GX held: register the SPI (thread context) and arm it */
++static void
++gpu_irq_start(void)
++{
++	if (!k_irq) {
++		printf("NEGRONI GPU IRQ: off (negronigpu_irq=0): fence waiters poll every 200 us\n");
++		return;
++	}
++	if (negroni_spi_register(k_irq_intid, false, gpu_irq, NULL) != 0) {
++		printf("NEGRONI GPU IRQ: INTID %u not registered (no GIC distributor or no free slot): fence waiters poll\n", k_irq_intid);
++		return;
++	}
++	gpu_irq_registered = true;
++	gpu_irq_arm();
++	printf("NEGRONI GPU IRQ: on: INTID %u (SPI %u, level), RBBM_INT_0_MASK %#x (CACHE_CLEAN_TS, RB_DONE_TS), the last fence "
++	    "of each submission raises it; waiters look again every %u us as the fallback\n", k_irq_intid, k_irq_intid - 32,
++	    GPU_INT_CACHE_CLEAN_TS | GPU_INT_RB_DONE_TS, k_irq_poll_us);
++}
++
++/*
++ * RedwoodGPU's wait between two looks at a fence (it holds no lock here): until the fence interrupt or the poll
++ * time. poll_us: the caller's polled interval (200 us); with the interrupt live, negronigpu_irq_poll_us.
++ */
++void negroni_gpu_fence_sleep(uint32_t fence, uint32_t poll_us);
++void
++negroni_gpu_fence_sleep(uint32_t fence, uint32_t poll_us)
++{
++	bool irq = __atomic_load_n(&gpu_irq_live, __ATOMIC_RELAXED) && __atomic_load_n(&gpu_irq_armed, __ATOMIC_RELAXED) &&
++	    !__atomic_load_n(&gpu_irq_masked, __ATOMIC_RELAXED);
++	uint32_t us = irq ? MAX(poll_us, k_irq_poll_us) : poll_us;
++
++	wait_result_t w = assert_wait_timeout((event_t)&gpu_fence_event, THREAD_UNINT, us, NSEC_PER_USEC);
++	if (w != THREAD_WAITING) {
++		return;
++	}
++	if (negroni_gpu_done(fence)) {
++		clear_wait(current_thread(), THREAD_AWAKENED);
++		return;
++	}
++	w = thread_block(THREAD_CONTINUE_NULL);
++	if (!irq) {
++		__atomic_fetch_add(&gpu_irq_polled, 1, __ATOMIC_RELAXED);
++	} else if (w == THREAD_AWAKENED) {
++		__atomic_fetch_add(&gpu_irq_woken, 1, __ATOMIC_RELAXED);
++	} else if (negroni_gpu_done(fence)) {
++		__atomic_fetch_add(&gpu_irq_missed, 1, __ATOMIC_RELAXED);      /* done, but no interrupt woke us */
++	}
++}
++
++/*
++ * The watch, once a second: unmask a line the handler masked (GX was off or the fence held), the storm guard, and
++ * the WATCH line's irq part. A second with many misses and no fence interrupt drops "live": the waiters poll at
++ * 200 us again until the next fence interrupt.
++ */
++static uint32_t gpu_irq_sec_count, gpu_irq_sec_fences, gpu_irq_sec_woken, gpu_irq_sec_missed;
++static void
++gpu_irq_second(char *buf, size_t size)
++{
++	uint32_t c = gpu_irq_count, f = gpu_irq_fences, wk = gpu_irq_woken, ms = gpu_irq_missed;
++	uint32_t dc = c - gpu_irq_sec_count, df = f - gpu_irq_sec_fences, dw = wk - gpu_irq_sec_woken, dm = ms - gpu_irq_sec_missed;
++
++	gpu_irq_sec_count = c;
++	gpu_irq_sec_fences = f;
++	gpu_irq_sec_woken = wk;
++	gpu_irq_sec_missed = ms;
++	if (!gpu_irq_registered) {
++		snprintf(buf, size, "irq off (polled %u)", gpu_irq_polled);
++		return;
++	}
++	if (!gpu_irq_off && dc > GPU_IRQ_STORM) {
++		gpu_irq_off = true;
++		gpu_irq_disarm();
++		__atomic_store_n(&gpu_irq_live, false, __ATOMIC_RELAXED);
++		printf("NEGRONI GPU IRQ: %u interrupts in a second (status bits %#x): off for this boot, fence waiters poll\n", dc,
++		    gpu_irq_status_or);
++	}
++	if (!gpu_irq_off && df == 0 && dm > 50) {
++		__atomic_store_n(&gpu_irq_live, false, __ATOMIC_RELAXED);
++	}
++	/*
++	 * gpu_pm_lock held: a slumber attempt that stopped early (lowest idle not reached, PREPARE_SLUMBER refused, GX not
++	 * back) can leave the line disarmed with the GPU awake. RBBM_INT_0_MASK lives on over IFPC (KGSL writes it once per
++	 * GPU boot), so arming needs no register write here.
++	 */
++	if (!gpu_irq_off && !__atomic_load_n(&gpu_irq_armed, __ATOMIC_SEQ_CST) && !pm_asleep && !pm_dead && !pm_rewaking &&
++	    !rec_active && gpu_kept) {
++		__atomic_store_n(&gpu_irq_armed, true, __ATOMIC_SEQ_CST);
++		__atomic_store_n(&gpu_irq_masked, true, __ATOMIC_SEQ_CST);     /* the next lines unmask it */
++	}
++	if (!gpu_irq_off && __atomic_load_n(&gpu_irq_armed, __ATOMIC_SEQ_CST) && __atomic_load_n(&gpu_irq_masked, __ATOMIC_SEQ_CST)) {
++		__atomic_store_n(&gpu_irq_masked, false, __ATOMIC_SEQ_CST);
++		negroni_spi_enable(k_irq_intid, true);
++	}
++	snprintf(buf, size, "irq %s %u/s fence %u/s woke %u missed %u | all %u fence %u gx-off %u held %u unarmed %u other %u bits %#x",
++	    gpu_irq_off ? "OFF" : __atomic_load_n(&gpu_irq_live, __ATOMIC_RELAXED) ? "live" : "armed", dc, df, dw, dm, c, f,
++	    gpu_irq_gx_off, gpu_irq_fence_held, gpu_irq_unarmed, gpu_irq_other, gpu_irq_status_or);
++}
++
++/* NegroniFramebuffer: backboardd's display power request (0258); 0384: governor min level, slumber with it off */
++static bool gpu_display_off;
++void negroni_gpu_display(bool on);
++void
++negroni_gpu_display(bool on)
++{
++	__atomic_store_n(&gpu_display_off, !on, __ATOMIC_RELAXED);
++	if (!on) {
++		thread_wakeup((event_t)&gpu_kept);      /* the watch drops the level now, not at its next tick */
++	}
++}
++uint32_t negroni_gpu_late_frames;               /* NegroniFramebuffer.cpp: one per "gpu-wait skip" (atomic) */
++
+ /* PM_IFPC: where the CP has read the ring to at least, from the newest fence it wrote (no GX read) */
+ static uint32_t
+ pm_rptr_estimate(void)
+@@ -2942,17 +3198,64 @@ pm_sleep(void)
+ 	if (negroni_gpu_completed() != gpu_fence || rptr != ring_at || (status & ~1u)) {
+ 		return false;
+ 	}
++	/*
++	 * 0384: KGSL's order (gen7_power_off -> gen7_gmu_power_off -> gen7_gmu_notify_slumber, adreno_gen7_gmu.c:2795-2833,
++	 * 2513-2535, 1424-1450): interrupts off, OOB GPU_SET clear, wait for the lowest idle level (IFPC: power state 3 and
++	 * the GX clock off, gen7_gmu_wait_for_lowest_idle :696-760, 100 ms), the GMU power counter OFF ("so that the GMU is
++	 * not busy"; 0298 turned it on, and every 0298 boot got "PREPARE_SLUMBER ack, error 1002"), then PREPARE_SLUMBER
++	 * {bw, freq} of the DT's initial-pwrlevel 10 (285 MHz: perf index 13 - 10 - 1 = 2, bus-freq 2), not {0, 0}.
++	 */
++	gpu_irq_disarm();
+ 	pm_gpu_clear();
+-	uint32_t slumber[3] = { 0, 0 /* bw */, 0 /* freq */ };      /* hfi_prep_slumber_cmd, as gpu_stop sends it */
++	bool lowest = true;
++	if (pm_mode == PM_IFPC) {
++		lowest = false;
++		for (uint32_t i = 0; i < 1000 && !lowest; i++) {
++			lowest = rd(gmu + GMU_REG(GMU_RPMH_POWER_STATE)) == 3 && (rd(gmu + GMU_REG(GMU_GFX_PWR_CLK_STATUS)) & 3) != 0;
++			if (!lowest) {
++				delay(100);
++			}
++		}
++		if (!lowest && ++pm_lowest_missed <= 3) {
++			/* KGSL: gen7_gmu_power_off stops here (no slumber now); after 3 misses we send it anyway */
++			uint32_t ps = rd(gmu + GMU_REG(GMU_RPMH_POWER_STATE)), clk = rd(gmu + GMU_REG(GMU_GFX_PWR_CLK_STATUS));
++			bool back = pm_gpu_set();
++			if (back) {
++				gpu_irq_arm();
++			}
++			printf("NEGRONI GPU PM: no slumber now: lowest idle not reached in 100 ms (power state %#x, GFX_PWR_CLK_STATUS %#x, "
++			    "miss %u of 3); GX %s\n", ps, clk, pm_lowest_missed, back ? "held again" : "NOT BACK");
++			return false;
++		}
++	}
++	wr(gmu + GMU_REG(K_POWER_COUNTER_ENABLE), 0);
++	uint32_t slumber[3] = { 0, 2 /* bw: bus-freq of pwrlevel 10 */, 2 /* freq: perf index of 285 MHz */ };
+ 	hfi_quiet = true;
+ 	bool ok = hfi_send("PREPARE_SLUMBER", 33, slumber, sizeof(slumber));
+ 	hfi_quiet = false;
+ 	wr(gmu + GMU_REG(GMU_AO_AHB_FENCE_CTRL), 0);                    /* gen7_gmu_notify_slumber: fence to allow */
+ 	if (!ok) {
+ 		bool back = pm_gpu_set();
++		if (k_busy_pct) {
++			wr(gmu + GMU_REG(K_POWER_COUNTER_ENABLE), 1);
++		}
++		if (back) {
++			gpu_irq_arm();
++		}
+ 		pm_sleep_failed++;
+-		printf("NEGRONI GPU PM: PREPARE_SLUMBER not acked (%u); GX %s\n", pm_sleep_failed, back ? "held again" : "NOT BACK");
+-		if (pm_sleep_failed >= 3 || !back) {
++		printf("NEGRONI GPU PM: PREPARE_SLUMBER not acked (%u; lowest idle %s, ack word 2 = %u); GX %s\n", pm_sleep_failed,
++		    lowest ? "reached" : "NOT reached", hfi_ack[2], back ? "held again" : "NOT BACK");
++		if (pm_mode == PM_IFPC) {
++			/*
++			 * 0384: before, the third failure set PM_OFF with OOB GPU_SET held: GX never collapsed again for the boot
++			 * (every 0298 boot: "slumber off for this boot", then "pm off" in every WATCH line). Now only the IFPC-mode
++			 * slumber stops; IFPC goes on (pm_tick gives OOB GPU_SET back to the GMU).
++			 */
++			if (pm_sleep_failed >= 3) {
++				k_ifpc_slumber_ms = 0;
++				printf("NEGRONI GPU PM: IFPC-mode slumber off for this boot; IFPC stays on\n");
++			}
++		} else if (pm_sleep_failed >= 3 || !back) {
+ 			pm_mode = PM_OFF;
+ 			printf("NEGRONI GPU PM: slumber off for this boot\n");
+ 		}
+@@ -3001,6 +3304,7 @@ gpu_warm_boot(bool loud, bool *rsc_awake)
+ 	}
+ 	pause_ms = 0;
+ 	pm_rewaking = true;
++	gpu_irq_disarm();               /* 0384: no handler reads GX while the GMU and the core start again */
+ 	/*
+ 	 * 0298: KGSL gen7_gmu_boot flushes the SMMU TLB before each boot because CX may not have gone down
+ 	 * (adreno_gen7_gmu.c:1887-1892; here CX never goes down), and a fault recorded while asleep must not
+@@ -3030,6 +3334,9 @@ gpu_warm_boot(bool loud, bool *rsc_awake)
+ 		ring(0);
+ 		ok = ring_run("leave secure mode (wake)");
+ 	}
++	if (ok) {
++		gpu_irq_arm();          /* 0384: KGSL adreno_irqctrl(1) at the end of each GPU boot; OOB GPU_SET is held here */
++	}
+ 	pm_rewaking = false;
+ 	pause_ms = pause;
+ 	adreno_quiet_thread = NULL;
+@@ -3049,6 +3356,19 @@ pm_wake(void)
+ 		printf("NEGRONI GPU PM: first wake: steps 14-21 again with their lines (later wakes are quiet)\n");
+ 	}
+ 	bool ok = gpu_warm_boot(loud, &rsc);
++	if (!ok && pm_wake_retries < 8) {
++		/*
++		 * 0384: the slumber wake ran on the phone never before (0298 slumber always failed). One more try from the 0287
++		 * reset state (CM3 in reset, GBIF halts, RSC asleep), as KGSL's gen7_gmu_reset does before gen7_boot, before
++		 * the GPU is given up (pm_dead) for the boot.
++		 */
++		pm_wake_retries++;
++		printf("NEGRONI GPU PM: wake %u FAILED after %u us (RSC %s, GX GDSC %#x, FW_INIT_RESULT %#x): reset and one more try\n",
++		    pm_wakes + 1, pm_us_since(t0), rsc ? "awake" : "NOT AWAKE", rd(gpucc + GPUCC_GX_GDSCR),
++		    rd(gmu + GMU_REG(GMU_CM3_FW_INIT_RESULT)));
++		rec_reset(0, false);
++		ok = gpu_warm_boot(true, &rsc);
++	}
+ 	uint32_t us = pm_us_since(t0);
+ 	if (!ok) {
+ 		pm_dead = true;
+@@ -3089,9 +3409,13 @@ pm_start(void)
+ 	pm_last_submit = mach_absolute_time();
+ 	k_args();
+ 	hfi_runtime = true;             /* 0298: KGSL's HFI timeout from now on */
++	lck_mtx_lock(&gpu_pm_lock);
++	gpu_irq_start();                /* 0384: OOB GPU_SET is still held from step 18: RBBM_INT_0_MASK can be written */
++	lck_mtx_unlock(&gpu_pm_lock);
+ 	if (pm_ifpc_ok) {
+-		printf("NEGRONI GPU PM: IFPC mode slumbers after %u ms idle (negronigpu_ifpc_slumber; 0 = never); HFI timeout %u ms\n",
+-		    k_ifpc_slumber_ms, k_hfi_ms);
++		printf("NEGRONI GPU PM: IFPC mode slumbers after %u ms idle%s (negronigpu_ifpc_slumber; 0 = never); HFI timeout %u ms\n",
++		    k_ifpc_slumber_ms, k_dispoff_slumber ? " with the display off (0384, negronigpu_dispoff_slumber=0: also on)" : "",
++		    k_hfi_ms);
+ 		lck_mtx_lock(&gpu_pm_lock);
+ 		pm_mode = PM_IFPC;
+ 		pm_gpu_clear();         /* KGSL gen7_gpu_boot: oob_clear(oob_gpu) once the GPU runs */
+@@ -3136,7 +3460,8 @@ pm_tick(uint32_t idle_for_ms, bool gx, bool late_done)
+ 		 * gen7_gmu_power_off, adreno_gen7_gmu.c:2870-2913, 2795-2868, 2513-2560): OOB GPU_SET, then the
+ 		 * slumber sequence of pm_sleep (it checks the ring is idle, PREPARE_SLUMBER, RSC sleep, GBIF halt).
+ 		 */
+-		if (pm_mode == PM_IFPC && k_ifpc_slumber_ms && !pm_asleep && late_done && idle_for_ms >= k_ifpc_slumber_ms) {
++		if (pm_mode == PM_IFPC && k_ifpc_slumber_ms && !pm_asleep && late_done && idle_for_ms >= k_ifpc_slumber_ms &&
++		    (!k_dispoff_slumber || __atomic_load_n(&gpu_display_off, __ATOMIC_RELAXED))) {
+ 			if (!pm_gpu_set()) {
+ 				pm_gpu_clear();
+ 				if (pm_ifpc_skips++ < 4) {
+@@ -3615,7 +3940,8 @@ static void
+ ring_fence(uint32_t event, uint32_t at, uint32_t fence)
+ {
+ 	ring_command(CP_EVENT_WRITE7, 4);
+-	ring(event | EVENT_WRITE_ENABLED);
++	/* 0384: the last fence of a submission raises CACHE_CLEAN_TS (KGSL: CACHE_CLEAN | BIT(31) | BIT(27)) */
++	ring(event | EVENT_WRITE_ENABLED | (at == GPU_FENCE_AT && gpu_irq_registered ? EVENT_WRITE_IRQ : 0));
+ 	ring(CORE_SCRATCH_ADDRESS + at);
+ 	ring(0);
+ 	ring(fence);
+@@ -3881,6 +4207,7 @@ rec_reset(uint32_t n, bool collapse)
+ {
+ 	uint64_t t0 = mach_absolute_time();
+ 
++	gpu_irq_disarm();               /* 0384: no handler reads GX from here to the end of the warm boot */
+ 	wr(gmu + GMU_REG(GMU_INTR_MASK), ~0u);
+ 	wr(gmu + GMU_REG(GMU_AO_HOST_INTERRUPT_CLR), ~0u);
+ 	wr(gmu + GMU_REG(GMU_AHB_FENCE_STATUS_CLR), 7);
+@@ -4158,8 +4485,41 @@ busy_counter_pct(bool pending)
+ }
+ 
+ /* One governor tick; returns true when it voted. */
++/*
++ * 0384: Linux's simple_ondemand (drivers/devfreq/governor_simpleondemand.c) over the DT OPP table (out/live.dts:21087-21210,
++ * our perf levels 1..12 = 220..818 MHz, each with its DT bus-freq: dcvs_bw_for): busy share (GMU busy counter, KGSL
++ * gen7_power_stats) over the tick > upthreshold -> the top allowed level; > upthreshold - downdifferential -> stay;
++ * else the lowest level >= cur_freq * busy / (upthreshold - downdifferential / 2). No work queued -> busy 0 -> the
++ * lowest level (and its bus vote). Display off -> the lowest level. A frame the display held for the GPU
++ * (negroni_gpu_late_frames) with busy >= negronigpu_late_pct -> one level up.
++ */
++static uint32_t gov_pct_acc, gov_pct_ms, gov_pct_last, gov_late_boosts, gov_late_seen, gov_tops;
++static uint32_t
++gov_want(uint32_t cur, uint32_t pct, uint32_t min, uint32_t max)
++{
++	uint32_t want;
++
++	if (pct > k_up) {
++		want = max;
++		gov_tops++;
++	} else if (pct > k_up - k_down) {
++		want = cur;
++	} else {
++		uint64_t target = (uint64_t)gpu_khz[cur] * pct / (k_up - k_down / 2);
++		for (want = min; want < max && gpu_khz[want] < target; want++) {
++		}
++	}
++	uint32_t late = __atomic_exchange_n(&negroni_gpu_late_frames, 0, __ATOMIC_RELAXED);
++	gov_late_seen += late;
++	if (late && k_late_pct && pct >= k_late_pct && want <= cur && cur < max) {
++		want = cur + 1;
++		gov_late_boosts++;
++	}
++	return want;
++}
++
+ static bool
+-dcvs_tick(bool gx, bool busy, uint32_t ms, uint32_t *idle_ms, uint32_t *busy_ms, uint32_t *busy_ticks, uint32_t *ticks)
++dcvs_tick(bool gx, bool busy, uint32_t cpct, uint32_t ms, uint32_t *idle_ms, uint32_t *busy_ms, uint32_t *busy_ticks, uint32_t *ticks)
+ {
+ 	uint32_t top = sizeof(gpu_khz) / sizeof(gpu_khz[0]) - 1;
+ 	uint32_t cap = negroni_thermal_gpu_cap(), max = dcvs_max;
+@@ -4198,20 +4558,43 @@ dcvs_tick(bool gx, bool busy, uint32_t ms, uint32_t *idle_ms, uint32_t *busy_ms,
+ 	}
+ 	bool ui = dcvs_ui_left != 0;
+ 	uint32_t want = dcvs_level;
+-	if (*idle_ms >= DCVS_IDLE_MS) {
++	uint32_t floor = k_gov ? k_minlevel : DCVS_FLOOR;
++	if (floor > max) {
++		floor = max;            /* the thermal cap (or negronigpu_maxlevel) wins over the floor */
++	}
++	bool dark = __atomic_load_n(&gpu_display_off, __ATOMIC_RELAXED);
++	if (k_gov) {
++		/*
++		 * 0384: the counter's share; without the counter (off, or given up), a tick with work queued counts as 100 %
++		 * (the fence rule). With the counter on, a tick without a sample (its first one after a wake or a recovery)
++		 * keeps the level: no jump to the top level.
++		 */
++		uint32_t pct = cpct != ~0u ? cpct : busy ? 100 : 0;
++		if (cpct == ~0u && k_busy_pct && busy_counter_ok) {
++			want = dcvs_level;
++		} else {
++			gov_pct_acc += pct * ms;
++			gov_pct_ms += ms;
++			gov_pct_last = pct;
++			want = gov_want(dcvs_level, pct, floor, max < top ? max : top);
++		}
++		if (dark) {
++			want = floor;
++		}
++	} else if (*idle_ms >= DCVS_IDLE_MS) {
+ 		want = DCVS_FLOOR;
+ 	} else if (*busy_ms >= (ui ? DCVS_TICK_MS : DCVS_UP_MS)) {
+ 		want = dcvs_level + 1;
+ 		*busy_ms = 0;
+ 	}
+-	if (ui && want < dcvs_ui_floor) {
++	if (ui && !dark && want < dcvs_ui_floor) {
+ 		want = dcvs_ui_floor;
+ 	}
+ 	if (want > max) {
+ 		want = max;
+ 	}
+-	if (want < DCVS_FLOOR) {
+-		want = DCVS_FLOOR;
++	if (want < floor) {
++		want = floor;
+ 	}
+ 	if (want > top) {
+ 		want = top;
+@@ -4251,6 +4634,12 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 	uint32_t rec_ao_base = ~0u, rec_init_base = ~0u, rec_count_seen = 0;
+ 
+ 	(void)PE_parse_boot_argn("negronigpu_dcvs", &dcvs_on, sizeof(dcvs_on));
++	k_args();
++	/* 0384: the governor has no UI floor unless negronigpu_uifloor asks for one (KGSL has none; at level 9 the
++	 * 0286 floor held 640 MHz and its DT bus vote 10 for hours with the busy counter at 0 %) */
++	if (k_gov) {
++		dcvs_ui_floor = 0;
++	}
+ 	(void)PE_parse_boot_argn("negronigpu_uifloor", &dcvs_ui_floor, sizeof(dcvs_ui_floor));
+ 	(void)PE_parse_boot_argn("negronigpu_uifps", &dcvs_ui_fps, sizeof(dcvs_ui_fps));
+ 	(void)PE_parse_boot_argn("negronigpu_uihold", &dcvs_ui_hold, sizeof(dcvs_ui_hold));
+@@ -4260,10 +4649,21 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 	if (dcvs_ui_fps == 0) {
+ 		dcvs_ui_fps = 1;
+ 	}
+-	dcvs_max = vote_arg ? vote_arg : top;
++	dcvs_max = k_gov ? MIN(k_maxlevel, top) : vote_arg ? vote_arg : top;
+ 	dcvs_level = vote_level;
+ 	from = dcvs_level;
+-	if (dcvs_on) {
++	if (vote_arg && dcvs_on) {
++		/* 0384: negronigpu_level=N is a fixed level (the step-17 vote); the governor runs only without it */
++		dcvs_on = 0;
++		printf("NEGRONI GPU DCVS: off: fixed level %u (%u MHz, bw %u) from negronigpu_level\n", vote_level,
++		    gpu_khz[vote_level] / 1000, vote_bw);
++	}
++	if (dcvs_on && k_gov) {
++		printf("NEGRONI GPU DCVS: on (0384 simple_ondemand): start level %u (%u MHz), levels %u..%u (%u..%u MHz), up %u%% "
++		    "down %u%%, busy from the GMU counter (fence rule without it), bus vote = DT bus-freq of the level, lowest level "
++		    "with the display off, late-frame step at busy >= %u%%, tick %u ms\n", dcvs_level, gpu_khz[dcvs_level] / 1000,
++		    k_minlevel, dcvs_max, gpu_khz[k_minlevel] / 1000, gpu_khz[dcvs_max] / 1000, k_up, k_down, k_late_pct, DCVS_TICK_MS);
++	} else if (dcvs_on) {
+ 		printf("NEGRONI GPU DCVS: on: start level %u (%u MHz), max %u, floor %u, tick %u ms, idle %u ms, up %u ms\n",
+ 		    dcvs_level, gpu_khz[dcvs_level] / 1000, dcvs_max, DCVS_FLOOR, DCVS_TICK_MS, DCVS_IDLE_MS, DCVS_UP_MS);
+ 		if (dcvs_ui_floor != 0) {
+@@ -4313,7 +4713,7 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 					busy = cpct >= k_busy_pct;
+ 				}
+ 				bool may_vote = !pm_asleep && (pm_mode != PM_OFF || on);   /* 0298: never to a sleeping GMU */
+-				if (dcvs_tick(may_vote, busy, ms, &idle_ms, &busy_ms, &busy_ticks, &ticks)) {
++				if (dcvs_tick(may_vote, busy, cpct, ms, &idle_ms, &busy_ms, &busy_ticks, &ticks)) {
+ 					changes++;
+ 				}
+ 			}
+@@ -4321,14 +4721,28 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 			lck_mtx_unlock(&gpu_pm_lock);
+ 		}
+ 		pm_watch_idle = false;
+-		if (changes) {
++		if (changes && k_gov) {
++			/* 0384: busy = the time-weighted counter share of the second (what the governor saw) */
++			printf("NEGRONI GPU DCVS: level %u -> %u (%u MHz, bw %u), %u changes this second, busy %u%% (%s, last tick %u%%), "
++			    "cap %u, display %s, late frames %u (%u steps), top jumps %u, ui %u swaps/s%s\n", from, dcvs_level,
++			    gpu_khz[dcvs_level] / 1000, vote_bw, changes, gov_pct_ms ? gov_pct_acc / gov_pct_ms : 0,
++			    busy_counter_ok && k_busy_pct ? "GMU counter" : "fence rule", gov_pct_last, negroni_thermal_gpu_cap(),
++			    __atomic_load_n(&gpu_display_off, __ATOMIC_RELAXED) ? "off" : "on", gov_late_seen, gov_late_boosts, gov_tops,
++			    dcvs_ui_rate, dcvs_ui_left != 0 ? " floor on" : "");
++		} else if (changes) {
+ 			printf("NEGRONI GPU DCVS: level %u -> %u (%u MHz, bw %u), %u changes this second, busy %u%%, cap %u, ui %u swaps/s%s (%u boosts)\n",
+ 			    from, dcvs_level, gpu_khz[dcvs_level] / 1000, vote_bw, changes, dcvs_busy_pct, negroni_thermal_gpu_cap(),
+ 			    dcvs_ui_rate, dcvs_ui_left != 0 ? " floor on" : "", dcvs_ui_boosts);
++		}
++		if (changes) {
+ 			changes = 0;
+ 			from = dcvs_level;
+ 		}
++		uint32_t gov_avg = gov_pct_ms ? gov_pct_acc / gov_pct_ms : 0;   /* 0384: for the WATCH line */
++		gov_pct_acc = gov_pct_ms = 0;
++		char iline[200];
+ 		lck_mtx_lock(&gpu_pm_lock);
++		gpu_irq_second(iline, sizeof(iline));                          /* 0384: re-arm, unmask, storm guard, counts */
+ 		if (!late_done && second >= 5) {
+ 			late_done = true;
+ 			bool held = gx_hold();
+@@ -4397,10 +4811,11 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 			negroni_cpufreq_mhz_line(cline, sizeof(cline));
+ 			printf("NEGRONI GPU WATCH %u s: AO %#x CX %#x GX %#x RSC %#x q1w %u log0 %#x | rptr %#x RBBM %#x "
+ 			    "HW_FAULT %#x INT0 %#x | SGFSR %#x FSR core %#x gmu %#x | HFI %#x rptr-copy %#x | gxclk %u MHz | "
+-			    "dcvs %u busy %u%% | %s | %s | %s\n", second,
++			    "dcvs %u busy %u%% gov %u%% | %s | %s | %s\n", second,
+ 			    rd(gmu + GMU_REG(GMU_AO_COUNTER_L)), now[0], now[1], now[2], now[3], now[4], now[5], now[6],
+-			    now[7], now[8], now[9], now[10], now[11], now[12], now[13], gxclk, dcvs_level, dcvs_busy_pct, pline, tline,
+-			    cline);
++			    now[7], now[8], now[9], now[10], now[11], now[12], now[13], gxclk, dcvs_level, dcvs_busy_pct, gov_avg, pline,
++			    tline, cline);
++			printf("NEGRONI GPU IRQ: %s\n", iline);         /* 0384: own line (the WATCH line is near the USB line limit) */
+ 			if (now[10] & SMMU_FSR_ALL) {
+ 				space_faulted(&core_space);
+ 			}
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 23f04bb..e60478b 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -152,6 +152,8 @@ extern "C" int negroni_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" char negroni_gpu_badge[24];   /* bsd/dev/negroni_adreno.c */
+ extern "C" uint32_t negroni_gpu_badge_color;
+ extern "C" uint32_t negroni_gpu_ui_swaps;       /* bsd/dev/negroni_adreno.c (0286): the GPU DCVS UI floor */
++extern "C" uint32_t negroni_gpu_late_frames;    /* 0384: frames held for the GPU, the governor's late-frame step */
++extern "C" void negroni_gpu_display(bool on);   /* 0384: display power for the GPU governor and slumber */
+ extern "C" char negroni_wifi_badge[24];   /* bsd/dev/negroni_wifi.c */
+ extern "C" uint32_t negroni_wifi_badge_color;
+ extern "C" unsigned char iso_font[256 * 16];
+@@ -1026,6 +1028,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		older = fb->fOldValid && fb->fencePassed(fb->fOldFence, fb->fOldFenceSurface, &gaveUp);
+ 		if (!older) {
+ 			fb->fStatSkips++;
++			__atomic_fetch_add(&negroni_gpu_late_frames, 1, __ATOMIC_RELAXED);    /* 0384 */
+ 		}
+ 	}
+ 	if ((flush || older) && fb->fDbuf && !fb->dbufTarget(older ? fb->fOld : fb->fPending)) {
+@@ -3722,6 +3725,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
++				negroni_gpu_display(!off);      /* 0384: GPU lowest level and slumber while off; does not block */
+ 				fFB->fFadeStep = 0;
+ 				fFB->fVrrOffWait = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index f3477a6..a8ad66a 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -83,6 +83,7 @@ void negroni_gpu_mapped(void);
+ void negroni_gpu_unmap(uint64_t address, uint64_t size);
+ void negroni_gpu_to_memory(void * start, uint64_t size);
+ bool negroni_gpu_done(uint32_t fence);
++void negroni_gpu_fence_sleep(uint32_t fence, uint32_t poll_us);        /* 0384: fence IRQ or poll_us */
+ uint32_t negroni_gpu_last(void);
+ uint32_t negroni_gpu_completed(void);
+ bool negroni_gpu_fence_valid(uint32_t fence);
+@@ -338,7 +339,7 @@ gpuWait(uint32_t fence, uint64_t ms)
+ 
+ 	for (;;) {
+ 		IOLockUnlock(gGPULock);
+-		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
++		negroni_gpu_fence_sleep(fence, GPU_ASK_AGAIN_US);       /* 0384: woken by the fence interrupt, else polled */
+ 		IOLockLock(gGPULock);
+ 		if (negroni_gpu_done(fence)) {
+ 			return kIOReturnSuccess;

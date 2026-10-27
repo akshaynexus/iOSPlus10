@@ -11,8 +11,9 @@
 #   scripts/metal/idle-stats.sh telemetry [SECONDS]           pull metal.log now and again after SECONDS (default 20), print the rates
 #
 # Read it while the phone is idle (screen on, nothing moving) and again while scrolling, to compare. Keep the GPU answers in mind:
-# the clock is fixed by the kernel (negronigpu_level=12 = 818 MHz), so an idle GPU still burns the clock's static power; this script
-# shows whether the bridge adds work on top (presents/s > 0 or RBBM busy while nothing moves).
+# since 0384 the kernel governor picks the clock (lowest level 220 MHz when idle; negronigpu_level=N fixes it), and IFPC
+# collapses GX between frames; this script shows whether the bridge adds work on top (presents/s > 0 or RBBM busy while
+# nothing moves), which keeps the governor and GX up.
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SECS=120

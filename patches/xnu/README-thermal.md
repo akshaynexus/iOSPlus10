@@ -50,7 +50,7 @@ slumbers between frames, and nothing reads a temperature [V: docs/notes.md 15-17
   (GPU_BUSY_IGN_AHB, mesa a6xx.xml) or a submitted fence the core has not written yet
   (`negroni_gpu_completed() != gpu_fence`).
 - Rules: idle 500 ms -> level 4 (350 MHz); busy in two ticks in a row (200 ms) -> one level up; max =
-  `negronigpu_level` (12 in the config; 0 = the table top), lowered by the thermal cap of 0280. The bw
+  `negronigpu_level` (unset since 0384 = the governor runs; N = a fixed level, no DCVS), lowered by the thermal cap of 0280. The bw
   level follows the GX level (3 at the floor, 11 at the top). A vote happens only when the level changes
   (`GX_BW_PERF_VOTE`, blocking ack, quiet: no send/ack lines).
 - Starts after the 0236 late report (watch second 5), from the 0235 vote level.

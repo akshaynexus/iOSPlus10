@@ -69,7 +69,8 @@ kernel_args = [
   "negroniadreno=22",
   "negroniadreno_keep=1",
   "negronigpu_pool=512",
-  "negronigpu_level=12",   # fixed 818 MHz GX vote (patches 0235/0237); a DCVS governor comes later
+  # no negronigpu_level: the 0384 governor (simple_ondemand on the GMU busy counter, 220-818 MHz) picks the level;
+  # negronigpu_level=N (BOOTARGS_ADD) is a fixed-level override that turns the governor off
 ]
 
 [bootimg]
