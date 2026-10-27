@@ -8,6 +8,8 @@ NegroniMetal change to ios-flame 745c434 phone/metal2 (after flame/0015), for me
   with 4+1 bytes a texel is passed as 'b3a8' (the same layout). A refusal is logged once per reason
   (noteRefused); the first plane texture of a process logs one line. -iosurfacePlane answers the asked plane.
 - metal2vulkan f6a96b7d API: SharedEventListener::new() cannot fail.
+- A plane with bytesPerRow 0 (plane 0, or plane 1 of a two-plane surface) is refused with one log line: before kernel patch
+  0390 IOSurface answered 0 for every plane and metal2vulkan read YCbCr planes with rows 0 apart (camera preview colours).
 
 diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
 index 05f1c11..da3d606 100644
@@ -38,7 +40,7 @@ index 05f1c11..da3d606 100644
   return (id<MTLTexture>)view;
  }
  - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
-@@ -1726,14 +1728,54 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
+@@ -1726,14 +1728,58 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
  }
  // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
  // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
@@ -64,6 +66,10 @@ index 05f1c11..da3d606 100644
 + const uint64_t offset=at-base,row=IOSurfaceGetBytesPerRowOfPlane(surface,plane);
 + uint64_t offset1=0,row1=0;
 + if(planes>1){const uintptr_t one=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);if(one>=base){offset1=one-base;row1=IOSurfaceGetBytesPerRowOfPlane(surface,1);}}
++ // A plane's bytesPerRow of 0 (the kernel's IOSurface before patch 0390 put it where IOSurface.framework does not read it):
++ // rows 0 apart would read every row from the first. Refused, logged once.
++ if(!row || (planes>1 && !row1)){noteRefused([NSString stringWithFormat:@"texture over plane %lu of %zu",(unsigned long)plane,planes],
++   [NSString stringWithFormat:@"plane bytesPerRow %llu/%llu (kernel IOSurface plane layout, patch 0390)",(unsigned long long)row,(unsigned long long)row1]);return nil;}
 + const uint32_t type=surfaceOSType(surface);
 + NmbTexture *handle=nmb_texture_new_on_surface_plane(buffer.handle,&descriptor,offset,row,true,type,plane,IOSurfaceGetWidth(surface),
 +                                                       IOSurfaceGetHeight(surface),offset1,row1);

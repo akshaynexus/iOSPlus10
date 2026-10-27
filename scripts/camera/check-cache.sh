@@ -9,6 +9,7 @@
 #     leaves a method alone on a mismatch)
 #  3. the H10ISP vtable versions (base 1, device 3, stream 2) = the layout camera_device.c builds
 #  4. every symbol camera_device.c / media_hooks.c finds with dlsym() is exported by some image
+#  5. the display-alignment seed: FigGetAlignmentForIOSurfaceOutputToDisplayService's code words and statics
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 C=${1:-$REPO/out/dsc/cache/dyld_shared_cache_arm64}
@@ -65,6 +66,17 @@ syms=$(cat "$SRC/camera_device.c" "$SRC/media_hooks.c" | grep -o 'dlsym([^,]*, "
 mdk=$(sed -n '/md_names\[MD_KEYS\] = {/,/};/p' "$SRC/camera_device.c" | grep -o '"kFig[A-Za-z0-9_]*"' | tr -d '"' | sort -u)
 for s in $syms $mdk; do
   if grep -q "(regular) _$s\$" "$T/exp.txt"; then log "OK   export $s"; else log "BAD  export $s not found"; fail=1; fi
+done
+# 5. the display-alignment seed (media_hooks.c seed_display_alignment): code words and the two statics' names
+dw() { ipsw dyld dump "$C" "$1" --size 4 2>/dev/null | awk '/^0000/{printf "0x%s%s%s%s", $5, $4, $3, $2}'; }
+def() { sed -n "s/^#define $1 *\(0x[0-9a-fA-F]*\)[uU]*L*.*/\1/p" "$SRC/media_hooks.c" | sed 's/[uUL]*$//'; }
+for pair in DISPLAY_ALIGN_FUNCTION:DISPLAY_ALIGN_FIRST DISPLAY_ALIGN_LDRB:DISPLAY_ALIGN_LDRB_WORD; do
+  a=$(def "${pair%%:*}"); w=$(def "${pair#*:}"); got=$(dw "$a")
+  if [ "$got" = "$w" ]; then log "OK   ${pair%%:*} $a word $got"; else log "BAD  ${pair%%:*} $a word ${got:-?}, expected $w"; fail=1; fi
+done
+for pair in DISPLAY_ALIGN_CHECKED:_planeBaseRequirement.checked DISPLAY_ALIGN_VALUE:_planeBaseRequirement.requirement; do
+  a=$(def "${pair%%:*}"); got=$(ipsw dyld a2s "$C" "$a" 2>/dev/null | tail -1)
+  case "$got" in *"${pair#*:}"*) log "OK   ${pair%%:*} $a = ${pair#*:}" ;; *) log "BAD  ${pair%%:*} $a is '$got'"; fail=1 ;; esac
 done
 log "result: $([ $fail = 0 ] && echo PASS || echo FAIL) ($(date '+%Y-%m-%d %H:%M'), $C)"
 exit $fail

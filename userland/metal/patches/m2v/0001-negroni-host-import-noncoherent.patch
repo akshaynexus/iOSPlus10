@@ -1,16 +1,23 @@
 NegroniMetal change to metal2vulkan f6a96b7d (+ userland/metal/patches/m2v-flame), applied by scripts/metal/fetch-sources.sh:
 no-copy buffers (newBufferWithBytesNoCopy:, IOSurface textures) on a device whose host-pointer imports allow only
 host-visible types without HOST_COHERENT (Turnip on Darwin/RedwoodGPU: HOST_CACHED, docs/gpu-abi.md section 6).
-- memory.rs: Memory::import_host falls back to such types (cached first) where no coherent type is allowed; before
+- memory.rs: Memory::import_host takes its types from Memory::import_types, which falls back to such types (cached first) where no coherent type is allowed; before
   this the import was refused as Unsupported { HostMemory, NotRepresentable } (no memory type of the class).
 - command_buffer/mod.rs: as a command buffer completes, before its status and its completed handlers, it calls
   vkInvalidateMappedMemoryRanges over each such import its commands used (no-copy buffers, buffers under textures,
-  no-copy heaps). Turnip does dc civac by the caller's pointer. The CPU-to-GPU direction is the kernel's: it cleans
-  CPU-written pages of 0x49 and 0x7e imports at each submission that lists them (gpu-abi.md section 6 rule 1).
+  no-copy heaps). Turnip (userland/turnip/mesa-patches/0002) passes each to the kernel's CPU_PREP by GEM handle
+  (MSM_PREP_NOSYNC), which drops the CPU's lines by physical address; EBUSY (a later submission still lists the buffer)
+  is skipped, so a command buffer pipelined after this one on the same import can leave stale lines for a CPU read in
+  this one's completed handler. The CPU-to-GPU direction is the kernel's: it cleans CPU-written pages of 0x49 and 0x7e
+  imports at each submission that lists them (gpu-abi.md section 6 rule 1).
 - buffer.rs: HostPages::import_range (memory, offset, size of the import) for that call.
+- tests/negroni_host_import.rs: the type choice for a Turnip-like pointer (cached, not coherent), both the pure
+  functions and Memory::import_types of a Memory (fails on a port that puts the fallback outside the import's type choice).
+- 2026-10-27 fix for f6a96b7d: the fallback is in Memory::import_host (upstream moved the host import there; the
+  first port put it in import_dma_buf, so every no-copy import was refused as HostMemory NotRepresentable).
 
 diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
-index acd71162..044273a2 100644
+index acd7116..044273a 100644
 --- a/crates/metal2vulkan-runtime/src/buffer.rs
 +++ b/crates/metal2vulkan-runtime/src/buffer.rs
 @@ -710,6 +710,16 @@ impl HostPages {
@@ -31,10 +38,10 @@ index acd71162..044273a2 100644
      pub(super) fn over_dma_buf(&self) -> bool {
          self.import.shape.over_dma_buf
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-index 5000d90b..ec1d81e2 100644
+index 5000d90..3686e39 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-@@ -1743,6 +1743,55 @@ fn write_fields(upload: &Upload, table: u64, set: u64, count: u64) -> Result<(),
+@@ -1743,6 +1743,58 @@ fn write_fields(upload: &Upload, table: u64, set: u64, count: u64) -> Result<(),
      Ok(())
  }
  
@@ -42,8 +49,11 @@ index 5000d90b..ec1d81e2 100644
 +    /// NegroniMetal: drop the CPU's cache lines over every host import its commands used whose
 +    /// memory type is host-visible but not host-coherent (`memory::incoherent_host_candidates`):
 +    /// `vkInvalidateMappedMemoryRanges` over each whole import, once, as it completes. Turnip
-+    /// cleans and invalidates them by the caller's pointer (`dc civac`), so the GPU's writes
-+    /// become the CPU's (docs/gpu-abi.md section 6 rule 2). The resources come from its ended
++    /// (userland/turnip/mesa-patches/0002) passes each to the kernel's CPU_PREP by GEM handle
++    /// (MSM_PREP_NOSYNC), which drops the CPU's lines by physical address, so the GPU's writes
++    /// become the CPU's (docs/gpu-abi.md section 6 rule 2). EBUSY (a later submission still lists
++    /// the buffer) is skipped: a command buffer pipelined after this one on the same import can
++    /// leave stale lines for a CPU read in this one's completed handler. The resources come from its ended
 +    /// encoders (`used_resources`): a no-copy buffer, a texture over one (an IOSurface's), and a
 +    /// heap over host pages. Imports of coherent types, dma-buf imports and released imports are
 +    /// left alone.
@@ -90,7 +100,7 @@ index 5000d90b..ec1d81e2 100644
  impl CommandBuffer {
      /// A new command buffer of `queue`, holding `slot` of it.
      pub(super) fn new(queue: &CommandQueue, slot: Slot) -> CommandBuffer {
-@@ -4205,6 +4254,9 @@ impl CommandBufferShared {
+@@ -4205,6 +4257,9 @@ impl CommandBufferShared {
      /// waiters once the transition's [`Hold`] (and every other) is gone, and they wait for the
      /// trails below the mark. Waits from inside these steps answer as [`own`] says.
      fn complete(self: &Arc<Self>, result: Result<(), CommandBufferError>) {
@@ -101,7 +111,7 @@ index 5000d90b..ec1d81e2 100644
          // every tile, announced once the lock is let go (below).
          let mut unmeasured_reach = false;
 diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
-index b805ac82..03937f02 100644
+index b805ac8..181d041 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
 +++ b/crates/metal2vulkan-runtime/src/memory.rs
 @@ -203,6 +203,44 @@ pub(super) fn host_incoherent(types: &[vk::MemoryType]) -> u32 {
@@ -149,16 +159,123 @@ index b805ac82..03937f02 100644
  /// The memory class an image of `class` with host-transfer usage takes in memory the host caches,
  /// and its memory types among `allowed`, as bits: the host-cached types ([`host_cached`]) of
  /// `class` where it has one among them; else, on a device with unified memory (`unified`), those
-@@ -1598,7 +1636,11 @@ impl Memory {
-     ) -> Result<(vk::DeviceMemory, u32), ImportFailure> {
-         use std::os::fd::{AsRawFd, IntoRawFd};
-         let mut failure = ImportFailure::NoMemoryType;
--        for type_index in candidates(&self.types, allowed, class, self.unified) {
-+        let mut order = candidates(&self.types, allowed, class, self.unified);
-+        if order.is_empty() {
-+            order = incoherent_host_candidates(&self.types, allowed, class);
+@@ -1510,6 +1548,21 @@ impl Memory {
+         reached
+     }
+ 
++    /// NegroniMetal (m2v/0001): the memory types a host-pointer import of `class` tries, best
++    /// first, among the types the pointer allows (`allowed`): the class's own (`candidates`); where
++    /// none of them is allowed, the host-visible types that are not host-coherent
++    /// (`incoherent_host_candidates`). Turnip on Darwin imports host pages only as HOST_CACHED
++    /// without HOST_COHERENT; the command buffer invalidates them as it completes
++    /// (`CommandBuffer::invalidate_host_imports`).
++    pub(super) fn import_types(&self, allowed: u32, class: MemoryClass) -> Vec<u32> {
++        let types = candidates(&self.types, allowed, class, self.unified);
++        if types.is_empty() {
++            incoherent_host_candidates(&self.types, allowed, class)
++        } else {
++            types
 +        }
-+        for type_index in order {
-             // The descriptor the driver takes, which it owns once the import succeeds and may
-             // close even when it fails (the doc above): never `fd`, and never closed here.
-             let handed = match fd.try_clone() {
++    }
++
+     /// Import the caller's host memory, `size` bytes at `pointer` (both multiples of the device's
+     /// import alignment), as a dedicated block of the best memory type of `class` among
+     /// `allowed` (the types both the pointer and the resource take): its placement at offset 0,
+@@ -1531,7 +1584,9 @@ impl Memory {
+         allowed: u32,
+         class: MemoryClass,
+     ) -> Result<Placement, ImportFailure> {
+-        let types = candidates(&self.types, allowed, class, self.unified);
++        // NegroniMetal (m2v/0001): the coherent types, else the host-cached incoherent ones
++        // (`import_types`).
++        let types = self.import_types(allowed, class);
+         let imported = view.as_ref().map_or(pointer, ReadOnlyView::pointer);
+         // SAFETY: the caller's contract; the view stays mapped while the block holds it.
+         let (memory, type_index) =
+diff --git a/crates/metal2vulkan-runtime/src/tests/mod.rs b/crates/metal2vulkan-runtime/src/tests/mod.rs
+index 0846bbd..153ceaf 100644
+--- a/crates/metal2vulkan-runtime/src/tests/mod.rs
++++ b/crates/metal2vulkan-runtime/src/tests/mod.rs
+@@ -156,6 +156,7 @@ mod making;
+ mod managed;
+ mod memo;
+ mod memory;
++mod negroni_host_import;
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+ mod memory_frees;
+ mod memory_reads;
+diff --git a/crates/metal2vulkan-runtime/src/tests/negroni_host_import.rs b/crates/metal2vulkan-runtime/src/tests/negroni_host_import.rs
+new file mode 100644
+index 0000000..e3917ca
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/tests/negroni_host_import.rs
+@@ -0,0 +1,69 @@
++//! NegroniMetal (m2v/0001): a host-pointer import on Turnip/RedwoodGPU, whose pointer allows only a
++//! host-visible, host-cached type without HOST_COHERENT, takes that type (`Memory::import_host`
++//! through `Memory::import_types`).
++use crate::memory::{candidates, incoherent_host_candidates, Memory, MemoryClass};
++use ash::vk;
++
++fn ty(flags: vk::MemoryPropertyFlags) -> vk::MemoryType {
++    vk::MemoryType {
++        property_flags: flags,
++        heap_index: 0,
++    }
++}
++
++const TYPES: [vk::MemoryPropertyFlags; 4] = [
++    vk::MemoryPropertyFlags::DEVICE_LOCAL,
++    vk::MemoryPropertyFlags::from_raw(
++        vk::MemoryPropertyFlags::DEVICE_LOCAL.as_raw()
++            | vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
++            | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw(),
++    ),
++    vk::MemoryPropertyFlags::from_raw(
++        vk::MemoryPropertyFlags::DEVICE_LOCAL.as_raw()
++            | vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw()
++            | vk::MemoryPropertyFlags::HOST_CACHED.as_raw(),
++    ),
++    vk::MemoryPropertyFlags::HOST_VISIBLE,
++];
++
++#[test]
++fn a_cached_incoherent_pointer_type_serves_host_classes() {
++    let types = TYPES.map(ty);
++    // vkGetMemoryHostPointerPropertiesEXT allows types 2 and 3 only (no coherent type).
++    let allowed = 0b1100;
++    for class in [MemoryClass::Shared, MemoryClass::Managed, MemoryClass::WriteCombined] {
++        for unified in [false, true] {
++            assert!(candidates(&types, allowed, class, unified).is_empty(), "{class:?}");
++        }
++        assert_eq!(incoherent_host_candidates(&types, allowed, class), vec![2, 3], "{class:?}");
++    }
++    assert!(incoherent_host_candidates(&types, allowed, MemoryClass::Private).is_empty());
++    assert!(incoherent_host_candidates(&types, allowed, MemoryClass::Memoryless).is_empty());
++    // A coherent type allowed: `candidates` serves it; the fallback is never asked.
++    assert_eq!(candidates(&types, 0b0110, MemoryClass::Shared, false), vec![1]);
++}
++
++/// The list `Memory::import_host` hands the driver: this fails on a port that puts the fallback
++/// anywhere but the import's own type choice.
++#[test]
++fn the_host_import_tries_the_incoherent_types_where_no_coherent_one_is_allowed() {
++    let mut properties = vk::PhysicalDeviceMemoryProperties::default();
++    properties.memory_type_count = TYPES.len() as u32;
++    properties.memory_heap_count = 1;
++    properties.memory_heaps[0] = vk::MemoryHeap {
++        size: 1 << 32,
++        flags: vk::MemoryHeapFlags::DEVICE_LOCAL,
++    };
++    for (slot, &flags) in properties.memory_types.iter_mut().zip(&TYPES) {
++        *slot = ty(flags);
++    }
++    let memory = Memory::new(&properties, 1 << 32, true, false, vec![0], None, None);
++    assert_eq!(memory.import_types(0b1100, MemoryClass::Shared), vec![2, 3]);
++    assert_eq!(memory.import_types(0b0110, MemoryClass::Shared), vec![1]);
++    // A device-local class takes its own types (here the cached device-local type 2), never the
++    // host-visible-only fallback type 3.
++    let types = TYPES.map(ty);
++    let private = memory.import_types(0b1100, MemoryClass::Private);
++    assert_eq!(private, candidates(&types, 0b1100, MemoryClass::Private, false));
++    assert!(!private.contains(&3));
++}

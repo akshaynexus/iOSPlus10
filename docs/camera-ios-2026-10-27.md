@@ -326,3 +326,197 @@ device-vendor call, no `/dev/negronicam` open. Our hooks worked (all 8 replaced)
 3. Kernel log once per boot: `NEGRONI Sandbox: tccd op 5` (first use).
 4. If something else fails after that, the next blocker is in the graph build (formats/preset): grep mediaserverd for
    `captureSession_buildGraph`, `-[BWFigCaptureDevice`, `FigCaptureStream`.
+
+## 10. t27 18:25: mediaserverd aborts after the first pictures (uncaught Objective-C exception); diagnosis build
+
+### Observations [V]
+
+- t27 (0386 + 0385, plug-in of 18:11): tccd talks to the stand-in, Camera.app opens, the kernel starts `ios session:
+  start (IMX789)` at once. Then mediaserverd ends with sig 6 after about 2 frames, on each new session (18:25:25, :45,
+  :48 ...). No mediaserverd `.ips` is written (`Failed to send exception EXC_CORPSE_NOTIFY`).
+- Kernel backtrace (`logs/usblog-20261027-171256.txt` line 114339+; cache slide 0x45f4c000 = pc - `__pthread_kill`+8):
+  `pthread_kill` <- `abort` <- `demangling_terminate_handler` <- `_objc_terminate` <- `std::__terminate` <-
+  `std::terminate` <- `_dispatch_client_callout` <- `_dispatch_lane_serial_drain` <- `_dispatch_lane_invoke` <-
+  `_dispatch_root_queue_drain`. So an Objective-C exception escaped a block on a serial dispatch queue. The frames of
+  the thrower are not in the kernel backtrace (unwound before terminate).
+- The boot prewarm session (no client) read 84 frames and gave 0 pictures without a crash; so the throw comes after our
+  first pictures reach the graph [I].
+
+### Change (diagnosis; no fix of the cause yet)
+
+- `media_hooks.c`: an uncaught-exception handler (`objc_setUncaughtExceptionHandler`, then the previous handler) says
+  `negroni: camera hooks: UNCAUGHT EXCEPTION <name>: <reason>` and 16 return addresses of the throw, unslid for the
+  shared cache (`ipsw dyld a2s out/dsc/cache/dyld_shared_cache_arm64 ADDR`).
+- `camera_device.c` + `media_hooks.c`: every `negroni: camera` line also goes to `/dev/console`, so the USB kernel log
+  has them (the way NegroniMetal's NMTL lines get there).
+- Build 18:28: 145 264 bytes, sha256 2557791af79d45e8033c9c6b16d65a686fb0ab1f99fe94dff41a046c6c8bde92; on top of the
+  reviewed all-or-nothing servers code (c26ce1c). check-cache PASS.
+
+### Test
+
+1. `scripts/camera/phone-camera.sh push` (restarts mediaserverd; it is in a crash loop only while a session runs).
+2. Owner opens Camera.app once. USB log: `grep -a 'negroni: camera' logs/usblog.log` -> the UNCAUGHT EXCEPTION line
+   and `#N cache 0x...` lines. Symbolicate: `for a in ...; do ipsw dyld a2s out/dsc/cache/dyld_shared_cache_arm64 $a
+   --cache out/dsc/20H392.a2s; done`.
+3. Stop the loop: `phone-camera.sh servers off` (Camera.app then waits, mediaserverd and audio stay up).
+
+## 11. t27 18:29: the exception is the display's plane alignment property (number, not dictionary); fix
+
+### Observations [V]
+
+- Diagnosis build: `UNCAUGHT EXCEPTION NSInvalidArgumentException: -[__NSCFNumber objectForKey:]: unrecognized selector`
+  at each session start (`logs/camera-exception-1829.txt`, `logs/camlog7-full.txt`). Throw stack (unslid):
+  `FigGetAlignmentForIOSurfaceOutputToDisplayService`+124 (VideoToolbox) <- `-[BWImageQueueSinkNode
+  _updateInputRequirements]` <- `-[BWImageQueueSinkNode initWith...]` <- `-[FigCapturePreviewSinkPipeline
+  _buildImageQueuePreviewSinkPipeline...]` <- `_buildVideoPreviewSinkPipeline` <- `captureSession_buildGraphWithConfiguration`
+  <- `captureSession_startRunningInternal`. Not our frames or metadata: the graph build of the preview sink.
+- The function (0x194f3b410) reads the AppleCLCD property `DisplayPipePlaneBaseAlignment` with
+  `IORegistryEntrySearchCFProperty` and calls `CFDictionaryGetValue(it, "PlaneBaseAlignmentLinear")`. The phone's
+  `ioreg`: `"DisplayPipePlaneBaseAlignment" = 64` (a number; set by slop 0046/0061, kept in our 0250/0253).
+  `DisplayPipeStrideRequirements` (dictionary with `StrideLinearHorizontal`) is not published: NULL, no exception.
+- The answer is cached in VideoToolbox statics `_planeBaseRequirement.requirement` (__DATA 0x1dd2bd42c) and
+  `_planeBaseRequirement.checked` (__bss 0x1dd2bd853).
+- The `#N cache` lines of the diagnosis build reached the unified log but not the USB log (16 console writes in a row);
+  they are now one `throw stack:` line.
+
+### Fix (userland/camera; build 18:31)
+
+- `media_hooks.c` `seed_display_alignment()` (constructor, mediaserverd, 20H392 cache only): checks the function's first
+  word (0xd10183ff) and the `ldrb` of `checked` (0x39614f28), then stores 64 in `requirement` and 1 in `checked`, so
+  VideoToolbox never reads the registry property. Log: `display plane base alignment seeded (64 bytes; ...)`.
+  `scripts/camera/check-cache.sh` step 5 checks the words and the statics' names (PASS).
+- The exception logger stays (self-check). Build: 145 264 bytes, sha256
+  c5f161941636d5e4a67a9977531e9e182a48a6350e054469c3472c68aff82f86.
+- [I] Kernel alternative: publish `DisplayPipePlaneBaseAlignment` as `{PlaneBaseAlignmentLinear: 64}` as real AppleCLCD
+  does. Not done: other readers of the number (QuartzCore, our own code) are not checked.
+
+### Test
+
+1. `scripts/camera/phone-camera.sh push`.
+2. USB log: `negroni: camera hooks: display plane base alignment seeded (64 bytes ...)`, `capture servers started`.
+3. Open Camera.app: no UNCAUGHT EXCEPTION; `negroni: camera: ... the first picture given (2016x1512 ...)`; the preview.
+4. If a new exception comes: the `UNCAUGHT EXCEPTION` + `throw stack:` lines in the USB log; `ipsw dyld a2s` each `c` address.
+
+## 12. t27 18:36-18:40: sig 5 at graph stop, sig 10 in H264SW (YouTube), blank preview
+
+### sig 5 (18:36:29, 18:37:01, 18:38:56) [V]
+
+- pc 0x1a1f6fde0 (unslid) = `-[BWGraph stop:]`+828, a `brk #1` after `"<<<< BWGraph >>>> %s: <%p> Not all sink nodes
+  became idle after waiting 10s."`, `_logActiveNodesAfterGraphStopTimeout`, `_logActiveSinkNodesAfterGraphStopTimeout`
+  and `WriteStackshotReport`. Caller `captureSession_stopGraph` <- `captureSession_stopRunningInternal`. Our stream had
+  stopped 11 s before (`stream: stop (66 frames, 45 pictures given)` 18:36:18). So one sink node did not finish.
+- [I] Candidates: the preview image-queue sink (backboardd does not consume '420f' surfaces: Metal refused planar
+  IOSurfaces, `IOK backboardd: matching AppleM2ScalerCSCDriver -> none` at 18:36:18), or a node with GPU work: mediaserverd
+  had `native-metal: refused ... render pipeline (colorCubeVertex / colorCubeFragment2D, color0 fmt 540)` and many `heap
+  texture refused: OutOfMemory(Heap)` at 18:36:16.
+- Change (diagnosis): hook 9 `-[BWGraph _logActiveSinkNodesAfterGraphStopTimeout]` (0x1a218a970, first word 0xa9ba6ffc,
+  check-cache OK): after the stock log, says each sink `ACTIVE|idle name (class)` and the count to the USB log. The trap
+  stays. Build 18:39: 145 552 bytes, sha256 e09795da64e8d07f2c4cbcd4b296a0664e91f10906205af86001819fea624bd4.
+
+### sig 10 (18:39:03 ... 18:40:07, YouTube playback, not the camera) [V]
+
+- pc unslid 0x1f0f4c914 in `/System/Library/VideoCodecs/H264SW.videocodec` (a 3-row 16-byte copy loop, `str q0,[x10,x3]`),
+  whole stack in H264SW worker threads (`_pthread_start`). The write address is inside the dyld shared region (r-x,
+  tag 35; unslid it is library text, e.g. 0x1c55b8040), each time a different one, always ending in 0x040. The kernel
+  logs `mediaserverd[N] triggered unnest of range ... of DYLD shared region` just before each crash.
+- So the software H.264 decoder writes a decoded picture to a destination base that points into the shared cache
+  [I: the destination CVPixelBuffer/IOSurface base address is wrong; an IOSurface/VideoToolbox-output problem, not the
+  camera code]. None of the 8/9 hooks are on the decode path; the HEVC encoder registration adds an encoder only.
+- [I] The one plug-in change that VideoToolbox decode can see: the seeded plane base alignment (64, the same value as
+  the stock default when the property is absent). Before the seed, any VideoToolbox caller of
+  `FigGetAlignmentForIOSurfaceOutputToDisplayService` threw the `-[__NSCFNumber objectForKey:]` exception (section 11).
+
+### Test to separate the plug-in from the decode crash (main session with the owner)
+
+1. `scripts/camera/phone-camera.sh off` (no hooks, no seed, no capture servers; restarts mediaserverd).
+2. Play the same YouTube video. Watch the USB log for `CRASH mediaserverd`, `triggered unnest`, and `NMTL[... mediaserverd]`
+   / CoreFoundation exception lines.
+   - SIGBUS in H264SW again: not the plug-in (IOSurface / VideoToolbox decode output; kernel or Metal side).
+   - An abort with `-[__NSCFNumber objectForKey:]` instead: the AppleCLCD property breaks playback too; the kernel
+     dictionary fix is needed (the seed only covers mediaserverd while the plug-in is on).
+   - No crash: the plug-in is involved; report and I bisect (seed only / hooks only).
+3. `scripts/camera/phone-camera.sh on` afterwards.
+
+## 13. 18:44 SpringBoard crash loop ("NSMotionUsageDescription"): not 0386 (analysis)
+
+### Observations [V]
+
+- `logs/usblog-20261027-171256.txt` 18:44:28-18:46: SpringBoard sig 6 every ~5 s, reason "attempted to access
+  privacy-sensitive data without a usage description ... NSMotionUsageDescription". Unslid bt: `TCCAccessRequest` <-
+  CoreMotion `-tccServiceMotionAccessWithBlock:` helper (func 0x191c8ad4c, the only TCCAccessRequest caller there) ->
+  `tccd_send_message` -> reply block -> `__TCC_CRASHING_DUE_TO_PRIVACY_VIOLATION__`. The TCC client crashes this way
+  when tccd's reply says `require_purpose` (TCC strings: `require_purpose`, `Missing Usage String`).
+- SpringBoard (20H392) has no `kTCCServiceMotion` in `com.apple.private.tcc.allow` (11 services: AddressBook ... BluetoothAlways)
+  and no `NSMotionUsageDescription` in its Info.plist. So no entitlement is "lost"; this request never had one.
+- No Motion request in any earlier log (camlog2-7, phone-full 17:43). TCC.db has no SpringBoard rows.
+- From 18:44:28, every backboardd and SpringBoard start logs `CODE SIGNING: cs_invalid_page(...): p=N[SpringBoard] final
+  status 0x22000000, allowing (remove VALID) page`. Before 18:44 only `launchd_cache_lo` had this line, never SpringBoard.
+- The Metal bundle on the phone (`/System/Library/Extensions/NegroniMetal.bundle/NegroniMetal`, `libvulkan_freedreno.dylib`)
+  was changed at phone 06:14 = 18:44 host time (the phone clock is 12 h 30 min behind), just before the respring at
+  18:44:28. Copied off, the bundle is "valid on disk" (codesign).
+- 0386 was active at 18:24 and 18:41 and SpringBoard started normally both times.
+
+### Cause [I, strong]
+
+The Metal push of 18:44 put new signed Mach-Os on the root; every process that mapped them (backboardd, SpringBoard) hit
+a code page whose hash did not match and lost CS_VALID (status 0x22000000 = SIGNED | DYLD_PLATFORM, no VALID). [I] The
+likely way: a file written over the old inode keeps the old code signature on the cached vnode. With CS_VALID gone,
+tccd no longer treats SpringBoard as verified platform code. For a Motion request it then asks for a purpose string, and
+SpringBoard has none, so it crashes. Before, the same request (if made) got a quiet answer. 0386 (ops 5/6) is not in
+this chain; with 0386 off (t28) it can still happen while the cs_invalid_page condition lasts. A reboot clears it.
+
+### Fix
+
+- `scripts/metal/phone-test.sh push`: unlinks every file of the archive before `tar -x`, so each new file is a new
+  inode (toybox tar 0.8.15 on the phone; whether it unlinks by itself is not checked [I]).
+- No change to 0386, no TCC.db or tccd change: TCC behaved as designed for a process without CS_VALID.
+
+### Test (RAM boot)
+
+1. t28 (`negronisbext=0`) boots: SpringBoard up, no `cs_invalid_page` for SpringBoard (fresh vnodes).
+2. Next RAM boot with 0386 on (no `negronisbext=0`), no Metal push before it: expect SpringBoard stable, no
+   `cs_invalid_page`, `NEGRONI Sandbox: tccd op 5`, Camera.app authorized (no `-11852`).
+3. Then a Metal push with the new `phone-test.sh push` + respring: grep the USB log for `cs_invalid_page` and `CRASH
+   SpringBoard`. Expected: neither.
+
+## 14. 19:10 preview "flashes various colours of RGB" after the f6a96b7d Metal push: plane bytesPerRow 0 (root cause + fix)
+
+### Observations [V]
+
+- `logs/usblog-20261027-171256.txt`: 19:08:40 `PrimaryScaler: the first picture given (1504x1128 420f)`; 19:08:41
+  `NMTL[577 backboardd]: native-metal: first texture over a surface with planes: fmt 500, plane 0 of 2, OSType 0x34323066`
+  (YCBCR8_420_2P over the preview's '420f' planes); 19:08:41 mediaserverd `texture fmt 53 usage 0x2 over plane 0 of 2 of a
+  '420f' surface: ... RowPitch { bytes_per_row: 0, row_bytes: 1128 }`; 19:08:42 mediaserverd `command buffer refused:
+  renderCommandEncoder: ... Unsupported ... MTLPixelFormatYCBCR8_420_2P`. backboardd 'b3a8': `RowPitch { bytes_per_row: 0, ... }`.
+- flame/0016 passes `IOSurfaceGetBytesPerRowOfPlane(surface, plane)` and plane 1's to metal2vulkan: both 0.
+- IOSurface.framework 20H392: `IOSurfaceClientGetBytesPerRowOfPlane` reads IOSurfaceClient + 0xe0 + plane*0x80 (lock result
+  0x78 + plane*0x80 = plane record +0x10); width +0x00, height +0x04, offset +0x0c, size +0x14, bpe +0x18 match 0046. 0046
+  wrote bytesPerRow at +0x08. `CVPixelBufferBacking::getBytesPerRowOfPlane` calls `IOSurfaceGetBytesPerRowOfPlane`.
+- `camera_device.c` `render_piece` -> `isp_render_nv12(..., CVPixelBufferGetBytesPerRowOfPlane(pb, 0) = 0, ..., (pb, 1) = 0)`:
+  `y + row * 0`: every row on row 0, 8 threads at once. The rest of each pool buffer is whatever the memory held.
+
+### Cause
+
+The kernel's IOSurface lock result has each plane's bytesPerRow at the wrong offset, so every planar surface reports
+bytesPerRow 0. The camera plug-in writes each frame into the first row only; backboardd now samples the rest of the
+pool buffers (old memory) through metal2vulkan's YCbCr path (with luma/chroma rows 0 apart): flashing colours. Not the
+non-coherent import (m2v/0001) and not a missing IOSurface lock: the bytes were never written.
+
+### Fix
+
+- Kernel patch `patches/xnu/0390-negroni-iosurface-plane-bpr.patch`: bytesPerRow at plane +0x10; boot line `NEGRONI SURF:
+  plane bytesPerRow at +0x10 of each plane record (IOSurface 20H392 layout)`; kill switch `negronisurf_planebpr=0`.
+  Compile-check: `scripts/kernel/compile-one.sh out/kernel/tree-surfbpr iokit/Kernel/arm/NegroniSurface.cpp` exit 0;
+  applies after 0389.
+- `camera_device.c` `deliver()`: a 420f/420v buffer whose plane bytesPerRow is under the width is not rendered or given;
+  one line `<output>: off: WxH 420f buffer planes have bytesPerRow A/B, under the width (... patch 0390)`. Build 19:23
+  sha256 18df5fbc... (isp selftest PASS). Not pushed.
+- flame/0016: a plane texture with bytesPerRow 0 (plane 0, or plane 1 of a 2-plane surface) is refused with one line.
+
+### Test (needs a RAM boot with 0390; not done here)
+
+1. Boot log: `NEGRONI SURF: plane bytesPerRow at +0x10 ...`.
+2. Camera.app: no `RowPitch { bytes_per_row: 0` and no `MTLPixelFormatYCBCR8_420_2P` refusal from mediaserverd; no `off:`
+   line from the plug-in; live preview. If mediaserverd still refuses a YCbCr render, the next item is that pass
+   (metal2vulkan render shadow: `ycbcr_render_shadow`).
+3. YouTube: check whether the H264SW sig 10 is gone (same cause [I]).
