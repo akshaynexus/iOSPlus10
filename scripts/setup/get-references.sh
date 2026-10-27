@@ -24,6 +24,8 @@ ios-apollo         https://github.com/aTechGeekDev/ios-apollo.git     1c1a199c4f
 ios-s9             https://github.com/syncmodz/ios-s9.git             7b72f7c0db34fc396498d71bb7e1af90d6f899f3
 Chlorophyll        https://github.com/ry-diffusion/Chlorophyll.git    787338fc7c297f54e2000bca02f4fa36f1154c5a
 ios-spes           https://github.com/AdyaGMD/ios-spes.git            2cd45c4fb30c9edd3ebc45321d41fce24ad8e0ab spes
+owl                https://github.com/seemoo-lab/owl.git              0ee3263f944ea721c355f826aa90d636d012a512 master
+opendrop           https://github.com/seemoo-lab/opendrop.git         11fe7ba7861093b302bc0637e8cb10adf2d29337 master
 '
 
 rows() { printf '%s\n' "$TABLE" | sed '/^[[:space:]]*$/d'; }
