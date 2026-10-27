@@ -69,6 +69,7 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 
 #define CACHE_BASE 0x180000000UL                /* where the cache was built to be, before the slide (ipsw dyld info) */
+#define NEGRONICAM_OFF_FILE "/var/db/negronicam/off"     /* present: the constructor does nothing */
 #define NEGRONICAM_CACHE_UUID "8F970452-C9E3-3E88-B114-FEB1864BC9E0"   /* iOS 16.7.x 20H392 dyld_shared_cache_arm64 */
 
 static uintptr_t slide;
@@ -438,6 +439,11 @@ negroni_camera_init(void)
 	uuid_string_t text = "?";
 
 	if (name == NULL || strcmp(name, "mediaserverd") != 0) {
+		return;
+	}
+	/* hot off switch (scripts/camera/phone-camera.sh off|on): no hooks, mediaserverd as without the bundle */
+	if (access(NEGRONICAM_OFF_FILE, F_OK) == 0) {
+		say("negroni: camera hooks: %s exists: off, nothing replaced\n", NEGRONICAM_OFF_FILE);
 		return;
 	}
 	if (_dyld_get_shared_cache_uuid(uuid)) {

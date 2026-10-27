@@ -12,8 +12,8 @@
 #  3. remove the MobileGestalt cache: it may hold still-camera = false from a boot without the ADT node
 #     /arm-io/isp; MobileGestalt makes it again at the next boot (from the device tree [I])
 #  4. the stamp out/camera/root-has-camera (sha256 of the installed NegroniCamera + date + root path):
-#     scripts/ios16/build.sh sets ADT_CAM=1 by default only when this stamp matches the built driver, so the
-#     Camera icon comes only with an image whose root got the plug-in
+#     scripts/ios16/build.sh sets ADT_CAM=1 by default when this stamp exists (any sha; a newer local build gives a
+#     note), so the Camera icon comes only with an image whose root got the plug-in
 # The kernel side is the boot-arg negronicam=7 (patch 0318, /dev/negronicam). Without it the plug-in gives the
 # capture stack a vendor whose device is refused at once (Camera.app: no camera), not a hang.
 # Undo: CAMERA=0 does nothing; remove System/Library/Audio/Plug-Ins/HAL/NegroniCamera.driver and clear the cache.

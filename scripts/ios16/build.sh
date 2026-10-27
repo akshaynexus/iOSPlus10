@@ -19,26 +19,46 @@ mkdir -p "$O"
 DTB=$REPO/$($C bootimg.dtb)
 FD=$OUT/mu/SILICIUM_UEFI-DEBUG.fd
 
+# Camera nodes (/arm-io/isp camera-rear, /product/camera; userland/camera/README.md): on by default only when
+# a root got a NegroniCamera.driver (stamp out/camera/root-has-camera from scripts/camera/root-add-camera.sh
+# or scripts/camera/phone-camera.sh push), so the Camera icon never comes without the capture plug-in.
+# ADT_CAM=1/0 overrides. Prints 1 or 0.
+adt_cam() {
+  cam=$OUT/camera/ios/NegroniCamera.driver/NegroniCamera
+  if [ -n "${ADT_CAM:-}" ]; then echo "$ADT_CAM"; return; fi
+  # Any NegroniCamera build on the root is enough for the nodes (each one gives a vendor; without /dev/negronicam
+  # its device is refused at once). A newer local build only gets a note: phone-camera.sh push installs it.
+  # The stamp alone decides: a root with the plug-in gets the nodes also when out/camera/ios is not built (any more).
+  if [ -f "$OUT/camera/root-has-camera" ]; then
+    if [ -f "$cam" ] && [ "$(cut -d' ' -f1 "$OUT/camera/root-has-camera")" != "$(shasum -a 256 "$cam" | cut -d' ' -f1)" ]; then
+      echo "adt: note: the root has an older NegroniCamera.driver than out/camera/ios (scripts/camera/phone-camera.sh push)" >&2
+    fi
+    echo 1; return
+  fi
+  if [ -f "$cam" ]; then
+    echo "adt: WARNING: NegroniCamera.driver is built but no root has it (out/camera/root-has-camera missing):" >&2
+    echo "     no camera ADT nodes. Build the root with CAMERA=1 first, or set ADT_CAM=1 by hand." >&2
+  fi
+  echo 0
+}
+
 adt() {
   # shellcheck disable=SC2046
   python3 "$REPO/$($C adt.tool)" "$O/negroni.adt" $($C adt.args)
-  # Camera nodes (/arm-io/isp camera-rear, /product/camera; userland/camera/README.md): on by default only when
-  # a root got the built NegroniCamera.driver (stamp out/camera/root-has-camera from scripts/camera/root-add-camera.sh,
-  # same sha256), so the Camera icon never comes without the capture plug-in. ADT_CAM=1/0 overrides.
-  cam=$OUT/camera/ios/NegroniCamera.driver/NegroniCamera
-  if [ -z "${ADT_CAM:-}" ] && [ -f "$cam" ]; then
-    if [ -f "$OUT/camera/root-has-camera" ] && [ "$(cut -d' ' -f1 "$OUT/camera/root-has-camera")" = "$(shasum -a 256 "$cam" | cut -d' ' -f1)" ]; then
-      ADT_CAM=1
-    else
-      echo "adt: WARNING: NegroniCamera.driver is built but no root has it (out/camera/root-has-camera missing or older):" >&2
-      echo "     no camera ADT nodes. Build the root with CAMERA=1 first, or set ADT_CAM=1 by hand." >&2
-    fi
-  fi
-  ADT_CAM=${ADT_CAM:-0} python3 "$REPO/scripts/ios16/adt-extra.py" "$O/negroni.adt"
+  ADT_CAM=$(adt_cam) python3 "$REPO/scripts/ios16/adt-extra.py" "$O/negroni.adt"
 }
 
 payload() {
   [ -f "$OUT/kernel/kernel.macho" ] || { echo "missing out/kernel/kernel.macho (scripts/ios16/fetch-kernel.sh)" >&2; exit 1; }
+  # Test images (IOS16_OUT=out/ios16-tNN ... payload + boot) reuse a copied negroni.adt and skip the adt step. A copy
+  # made before the camera root had no camera nodes (t20-t23 of 2026-10-27: ADT sha 24948e87, no camera-rear), so
+  # Camera.app had no rear camera in MobileGestalt. Add the nodes here when adt_cam says 1 and they are missing.
+  # out/ios16-safe (the known-good boot_a) keeps its ADT unless ADT_CAM=1 is set by hand.
+  case "$O" in */ios16-safe) cam_auto=${ADT_CAM:-0} ;; *) cam_auto=$(adt_cam) ;; esac
+  if [ -f "$O/negroni.adt" ] && [ "$cam_auto" = 1 ] && ! grep -q -a camera-rear "$O/negroni.adt"; then
+    echo "payload: $O/negroni.adt has no camera nodes: adding them (ADT_CAM=1; ADT_CAM=0 keeps the ADT as it is)"
+    ADT_CAM=1 ADT_BT= python3 "$REPO/scripts/ios16/adt-extra.py" "$O/negroni.adt"
+  fi
   args=""
   for a in $($C payload.kernel_args); do
     keep=1

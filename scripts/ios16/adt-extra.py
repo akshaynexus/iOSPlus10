@@ -61,9 +61,12 @@ def main():
         return (max(used + [0]) + 1).to_bytes(4, 'little')
     def add_node(parent_path, name, props):
         parent = find(root, parent_path)
+        # a rerun replaces the node and keeps its phandle: the same input gives the same bytes
+        old = next((c for c in parent.children if c.name == name), None)
+        ph = next((v for k, _, v in old.props if k == 'AAPL,phandle'), None) if old else None
         parent.children = [c for c in parent.children if c.name != name]
         n = adt.Node()
-        n.props = [('name', 0, name.encode() + b'\0'), ('AAPL,phandle', 0, new_phandle())] + props
+        n.props = [('name', 0, name.encode() + b'\0'), ('AAPL,phandle', 0, ph or new_phandle())] + props
         n.children = []
         parent.children.append(n)
         print(f'/{parent_path}/{name}:', ', '.join(f'{k}={v.hex(":")}' for k, _, v in n.props))

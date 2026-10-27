@@ -23,8 +23,10 @@ a source, [I] inference.
   pearl-sep, wlan/marconi-wifi, twodbl). applecamerad and dietapplecamerad start on IOResources properties. The new
   nodes start no Apple camera daemon.
 - Ship together: `scripts/camera/root-add-camera.sh` writes `out/camera/root-has-camera` (sha256 of the installed
-  driver). `scripts/ios16/build.sh` sets `ADT_CAM=1` by default only when that sha = the built driver's, else it
-  warns and adds no camera nodes. Build the root first, then the image (or set `ADT_CAM=1` by hand).
+  driver; `scripts/camera/phone-camera.sh push` writes it too, `revert` removes it). `scripts/ios16/build.sh` sets
+  `ADT_CAM=1` by default when the stamp exists (a sha other than the built driver's gives only a note); without the
+  stamp it adds no camera nodes (a warning when the driver is built). Build the root first, then the image (or set
+  `ADT_CAM=1` by hand). The `payload` step adds the nodes to a copied ADT without them, except in `out/ios16-safe`.
 
 ## Files
 
@@ -41,7 +43,11 @@ a source, [I] inference.
 
 Scripts: `scripts/camera/check-cache.sh` (the cache against the hook table), `scripts/camera/root-add-camera.sh`
 (root image, `CAMERA=1`), `scripts/camera/phone-camera.sh` (live phone over SSH: `push`, `status`, `frame`,
-`revert`).
+`restart`, `off`, `on`, `log`, `revert [prev]`). Live test steps and rollback: `docs/camera-ios-2026-10-27.md`
+section 7.
+
+Hot off switch (builds of 2026-10-27 05:55 and later): a file `/var/db/negronicam/off` makes the constructor log
+`negroni: camera hooks: /var/db/negronicam/off exists: off, nothing replaced` and do nothing (`phone-camera.sh off`).
 
 ## Build and check
 
@@ -110,7 +116,7 @@ Also checked [V]: the H10ISP vtable versions in 20H392 are base 1, device 3, str
 ## Test (after the next image + root, owner approval for the flash)
 
 1. Image: kernel with 0317/0318, boot-arg `negronicam=7` (`negronicam_src=1` for colour bars without the sensor
-   first), `ADT_CAM=1` (default when the stamp of a CAMERA=1 root matches). Root: `CAMERA=1` (default when the
+   first), `ADT_CAM=1` (default when the stamp of a CAMERA=1 root exists). Root: `CAMERA=1` (default when the
    bundle is built); build the root before the image. For a live
    test without a new root: `scripts/camera/phone-camera.sh push`, then a reboot (MobileGestalt re-reads the ADT).
 2. Home screen: the Camera icon is there (top right of page 1 on the iPhone X layout).

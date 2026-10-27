@@ -3129,3 +3129,15 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   (old script has no keepalive) before a test with the arg, or the phone reboots ~90 s after boot.
 - Build [V]: out/kernel/local-20261026-235425/kernel.development.negroni sha256
   26d079d28ab223ad7d2444ac9e5ec36b3117d089ed51cc231828be592ab31384 (274 applied; 4 dxb skips). Not booted.
+
+## 60. Camera.app black: the test images had no camera ADT nodes; payload adds them now (2026-10-27 05:55, camera userland agent 2; details docs/camera-ios-2026-10-27.md section 7)
+
+- [V] `out/ios16-t20..t23/negroni.adt` (sha256 24948e87..., the ios16-everything ADT of 10-26 23:19) have no
+  `camera-rear`: test images run `build.sh payload` + `boot` on a copied ADT, and only the `adt` step adds the camera
+  nodes. The CAMERA=1 root (driver d5ab3cc9...) was on userdata from 03:50 (`logs/reflash.log`).
+- [V] Stock `sharedCaptureDeviceVendor` 20H392 does not cache nil (tries again under its lock), so a late hook works.
+- [V] No `|mediaserverd|` line in any USB/boot log: the plug-in logs to os_log only; use `phone-camera.sh log`.
+- Fix: `build.sh payload` adds the nodes to a copied ADT without them (`adt_cam()`; any NegroniCamera stamp is
+  enough; `ADT_CAM=0` overrides). Plug-in: hot off switch `/var/db/negronicam/off`; build sha256 ea16947e...
+  `phone-camera.sh`: restart / off / on / log / revert prev; push keeps `.prev` and writes the stamp.
+- [I] Main cause = no `rear-facing-camera` in MobileGestalt. Not verified on the phone.

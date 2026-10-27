@@ -58,6 +58,8 @@ The `flashlight_code` caller ranges (`inject_media.c:94-95`) are 20F66 values; t
 Status 2026-10-27 (userland agent): items 2-4 done, build-only: `userland/camera/` (NegroniCamera.driver, way a),
 `scripts/camera/{check-cache,root-add-camera,phone-camera}.sh`, `ADT_CAM=1` in `scripts/ios16/adt-extra.py`. The
 portrait prewarm in 20H392 is 0x1a2165b8c. Details and test steps: `userland/camera/README.md`, notes section 43.
+Status 05:55 (camera userland agent 2): the userland was complete but never ran with the ADT nodes; fix, hot off switch
+and the live test procedure in section 7.
 
 1. **Kernel test first (build done, not run):** boot `negronicam=5` and get `TPG frame sanity: PASS` and
    `SENSOR frame sanity: PASS` with the new SMMU lines (README-camera.md "Boot-args for the camera test boot").
@@ -113,3 +115,84 @@ portrait prewarm in 20H392 is 0x1a2165b8c. Details and test steps: `userland/cam
 - [I] CPU ISP speed at 12 MP: HakiOS scales; use a 2x2 binned preview path in `camera_isp.c` if the preview is slow.
 - [I] Exposure: Sony analog gain code formula and the group hold are inferences; AE can run with digital gain only.
 - The SMMU stage-1 context has not run on this SoC yet (Wi-Fi 0324/0325 and camera 0317 are both build-only).
+
+## 7. 2026-10-27 05:55: why Camera.app stayed black, the fix, the live test
+
+### Observations [V]
+
+- The bundle was on the phone: the root of 03:31 (`logs/root-refresh.log` hook camera, driver sha256 d5ab3cc9...)
+  went to userdata by `reflash-root.sh` at 03:44-03:50 (`logs/reflash.log`).
+- No test image of tonight had the camera ADT nodes: `grep -c -a camera-rear` = 0 for `out/ios16-t20..t23`
+  (all ADT sha256 24948e87..., the `out/ios16-everything` ADT of 2026-10-26 23:19, made before the camera root).
+  Cause: the test images run `scripts/ios16/build.sh payload` + `boot` only on a copied `negroni.adt`; the camera nodes
+  come from the `adt` step. So MobileGestalt had no `camera-rear` source for `rear-facing-camera` / `still-camera`.
+- The kernel stream works from user space: `dd` with toybox read 3 frames (t15); `bootlog-5.txt`: `ios session:
+  start (IMX789)` ... `end (closed) after 6 frames`, SMMU context 7 FSR 0x400 (no fault) at teardown.
+- No boot log or USB log has a `|mediaserverd|` line or `exec Camera` after 03:50; the plug-in's own lines go only
+  to the unified log (os_log) and stderr. So there is no evidence yet that the hooks were installed or not.
+- Stock `+[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor]` (20H392 0x1a1f40c84, `ipsw dyld disass`) does not
+  cache a nil vendor: under its lock it tries `initWithDeviceCreateFunction:FigCaptureGetCaptureDeviceCreateFunction()`
+  again while the static is nil. So a hook installed after an early call still works.
+- HAL plug-ins load in mediaserverd: the BTAudioHALPlugin factory ran there (`CFPlugInInstanceCreate <-
+  HALS_PlugInManager::CreatePlugIn`, notes section 17). iOS 16 has no cameracaptured; the capture server is in
+  mediaserverd (notes section 13). Our XNU has no Sandbox kext (`docs/camera-plan.md`), and `/dev/negronicam` is
+  root:mobile 0660, so mediaserverd (uid 501) can open it.
+
+### Guesses [I]
+
+- Main cause of the black/not-opening Camera: no `rear-facing-camera` in MobileGestalt (no ADT node), so CameraUI has
+  no back camera to start. Second candidate: the hooks did not install (check the log lines below).
+
+### Changes (build only, nothing on the phone)
+
+- `scripts/ios16/build.sh`: new `adt_cam()`; `payload` now adds the two camera nodes to a copied `negroni.adt` that has
+  none (`ADT_CAM=1 adt-extra.py`, other nodes kept; `ADT_CAM=0` keeps the ADT as it is). The stamp rule is "a root got a
+  NegroniCamera build" (any sha; a newer local build gives a note). Checked on a copy of the t23 ADT: new nodes
+  `/arm-io/isp` (camera-rear 1, phandle 0x18) and `/product/camera` (0x19), no node lost.
+  Review fixes: the stamp alone decides (also when `out/camera/ios` is not built); `payload` does not change the ADT of
+  `out/ios16-safe` (only with `ADT_CAM=1` by hand); `adt-extra.py` keeps the phandle of a node it replaces, so a second
+  run gives the same bytes (checked); `phone-camera.sh revert` (without `prev`) removes the stamp.
+- `userland/camera/media_hooks.c`: hot off switch: `/var/db/negronicam/off` present -> the constructor logs
+  `... exists: off, nothing replaced` and does nothing.
+- `scripts/camera/phone-camera.sh`: `restart` (kills Camera.app + mediaserverd), `off` / `on`, `log`, `revert prev`;
+  `push` keeps the old bundle in `/var/db/negronicam/NegroniCamera.driver.prev`, kills Camera.app, and writes the stamp.
+- Build: `scripts/bg.sh cambuild userland/camera/build.sh` -> `out/camera/ios/NegroniCamera.driver`, 144 720 bytes,
+  sha256 ea16947ef687534f807c3df0769e75457357fb59ad4509373b91c57a8bc84dae, arm64, minos 16.0, ad hoc, no entitlements,
+  ISP self test PASS. Hook table unchanged (`scripts/camera/check-cache.sh` PASS of 02:34 still applies).
+
+### Live test (main session; the phone on iOS with SSH)
+
+1. Image: the next test image needs the camera nodes. `IOS16_OUT=out/ios16-tNN ... scripts/ios16/build.sh payload`
+   now adds them (look for `payload: ... has no camera nodes: adding them`), or run the `adt` step. Boot-args:
+   `negronicam=7 negronicam_smmu=3` (t23 has them; `negronicam_src=1` for colour bars). RAM boot as usual.
+2. Plug-in without a new root: `scripts/camera/phone-camera.sh push` (installs the 05:55 build, keeps the old one,
+   clears the MobileGestalt cache, kills Camera.app and mediaserverd; launchd restarts mediaserverd).
+   MobileGestalt reads the ADT nodes only after a boot: if step 1 needs a reboot, push first, then boot.
+3. Log: `scripts/bg.sh camlog scripts/camera/phone-camera.sh log` (unified log of mediaserverd + Camera, lines
+   `negroni: camera`). Kernel: `make usblog`, lines `NEGRONI CAM:`. After the mediaserverd restart, expect:
+   - `negroni: camera hooks: in mediaserverd (pid N), cache 20H392, slide 0x..., /dev/negronicam there`
+   - `negroni: camera hooks: the software HEVC encoder of VCPHEVC.videocodec registered for 'hvc1' (0)`
+   - `negroni: camera hooks: HAL factory called: no audio driver in this bundle (...)`
+   - up to 8 lines `negroni: camera hooks: ... replaced (k of 8)` (each when its class loads; CMCapture loads late);
+     a `left alone` line means a wrong address: report it.
+4. Open Camera.app. Expect `the camera's device vendor made (camera_device.c) (/dev/negronicam there)`,
+   `negroni: camera: the device made: one stream, the back camera (IMX789, /dev/negronicam)`, `device: streams asked
+   for (1)`, `stream: the graph starts the stream`, `stream: frames begin`, `frames of 4000x3008 from the kernel`,
+   `PrimaryScaler: the first picture given (2016x1512 ...)`. Kernel: `NEGRONI CAM: ios session: start (IMX789)`,
+   then `ios session: 30 frames in N ms`.
+5. Wrong colours: `scripts/camera/phone-camera.sh frame` (4 PPMs, one per Bayer order), then `negronicam_bayer=N`.
+   Upside down: `touch /var/db/negronicam/turned` on the phone, then `phone-camera.sh restart`.
+6. Fault lines: `no device: /dev/negronicam ... is not there` (no `negronicam=7`), `the kernel's camera has had a
+   fault (EIO)` (reboot needed), `5 reads in a row failed`; no `in mediaserverd` line at all = the HAL did not load
+   the bundle (`phone-camera.sh status`).
+
+Rollback, fastest first: `scripts/camera/phone-camera.sh off` (switch file + restart; the 05:55 build and later),
+`phone-camera.sh revert prev` (the bundle of before the push), `phone-camera.sh revert` (no camera plug-in at all).
+None writes a partition. A hung Camera.app launch is limited by the root tweak `FBLaunchWatchdogScale` 3.
+
+### Risks [I]
+
+- MobileGestalt may keep a cached `rear-facing-camera` = false: push removes both cache files; a boot rebuilds them.
+- A crash in the plug-in kills mediaserverd (audio too); launchd restarts it, and the next start crashes again.
+  Then `phone-camera.sh off` (works before the hooks install) or `revert`.
+- The section 6 risks stay (IFE latch event, Bayer order, gain formula, CPU ISP speed at 12 MP).
