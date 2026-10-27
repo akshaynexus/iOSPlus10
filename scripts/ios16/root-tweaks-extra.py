@@ -131,6 +131,14 @@ def main():
             print('jetsam:', jetsam_widgets.patch(path, int(wmb)))
     else:
         print('jetsam: WIDGET_JETSAM_MB empty, widget limits left as is')
+    # 7b. lsd jetsam limit (env LSD_JETSAM_MB, default 64, empty = off): lsd is killed at 16 MiB while it rebuilds
+    # the LaunchServices database on a fresh root, so no app opens (jetsam_widgets.py --daemon, 2026-10-27 t26)
+    lmb = os.environ.get('LSD_JETSAM_MB', '64')
+    if lmb:
+        for path in sorted(glob.glob(os.path.join(r, 'System/Library/LaunchDaemons/com.apple.jetsamproperties.*.plist'))):
+            print('jetsam:', jetsam_widgets.patch_daemon(path, 'com.apple.lsd', int(lmb)))
+    else:
+        print('jetsam: LSD_JETSAM_MB empty, lsd limits left as is')
 
     if os.environ.get('LOCATION_SWITCH', '0') == '1':
         merge_pref(r, 'com.apple.locationd', {'LocationServicesEnabledIn8.0': True})
