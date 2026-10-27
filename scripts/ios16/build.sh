@@ -51,7 +51,12 @@ payload() {
   # LOST_REBOOT=0 turns it off; LOST_REBOOT=S sets another period.
   case "$O" in */ios16-safe) ;; *)
     case " $args " in *" negroniusb_lost_reboot="*) ;; *)
-      [ "${LOST_REBOOT:-60}" = 0 ] || args="$args negroniusb_lost_reboot=${LOST_REBOOT:-60}" ;; esac ;; esac
+      [ "${LOST_REBOOT:-60}" = 0 ] || args="$args negroniusb_lost_reboot=${LOST_REBOOT:-60}" ;; esac
+    # Patch 0375: also reboot after 90 s without a bulk OUT frame from the host (or with a stuck IN transfer) once the
+    # host sent data: the gadget can enumerate while its data path is dead. The host must send something at least every
+    # 90 s: scripts/debug/usblog.sh sends a broadcast every 10 s (USBLOG_KEEPALIVE). IDLE_REBOOT=0 turns it off.
+    case " $args " in *" negroniusb_idle_reboot="*) ;; *)
+      [ "${IDLE_REBOOT:-90}" = 0 ] || args="$args negroniusb_idle_reboot=${IDLE_REBOOT:-90}" ;; esac ;; esac
   printf '%s\n' "$args" > "$O/cmdline.txt"
   # iOS 16 userland reads kern.bootargs into 608 bytes (patch 0378 truncates there): the keys it needs must end
   # before byte 607

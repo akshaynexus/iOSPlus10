@@ -9,6 +9,10 @@
 # USBLOG_SETTIME=1 (default): each time the interface comes up, also send this host's clock to the
 # kernel command server ("settime <unix s>.<us>" to 192.168.7.2:5141, patch 0212; retried for 30 s
 # until the kernel replies). USBLOG_SETTIME=0 turns it off.
+# USBLOG_KEEPALIVE=N (default 10, 0 = off): every N s one UDP broadcast datagram ("keepalive") to
+# 192.168.7.255:5142 over the phone's interface. It needs no ARP and no answer (the phone's stack drops it),
+# but it is a bulk OUT frame: the kernel's data-path watchdog (patch 0375, negroniusb_idle_reboot=S) reboots
+# the phone when no OUT frame comes for S s, so a test image needs this sender (or other host traffic).
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 MAC=02:00:5e:77:ee:01
@@ -31,7 +35,7 @@ set_addr() {
   case "$(uname -s)" in
   Darwin) ifconfig "$1" inet 192.168.7.1 netmask 255.255.255.0 up ;;
   Linux)  nmcli dev set "$1" managed no 2>/dev/null || true
-          ip addr replace 192.168.7.1/24 dev "$1"; ip link set "$1" up ;;
+          ip addr replace 192.168.7.1/24 brd + dev "$1"; ip link set "$1" up ;;
   esac
 }
 # One "settime" to the phone (patch 0212), retried once a second for 30 s until a reply comes
@@ -71,9 +75,32 @@ watch_if() {
     last=$IF; sleep 1
   done
 }
+# 0375: a bulk OUT frame at least every USBLOG_KEEPALIVE s while the interface has our address
+keepalive() {
+  # exec: the background PID is python itself, so the EXIT trap stops it (no orphan sender keeps a dead phone "alive")
+  exec python3 - "${USBLOG_KEEPALIVE:-10}" <<'PY'
+import socket, sys, time
+period = float(sys.argv[1])
+s = None
+while True:
+    try:
+        if s is None:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.bind(('192.168.7.1', 0))      # fails until the interface has the address
+        s.sendto(b'keepalive', ('192.168.7.255', 5142))
+    except OSError:
+        if s is not None:
+            s.close()
+        s = None
+    time.sleep(period)
+PY
+}
 echo "waiting for the phone's USB Ethernet ($MAC); log -> $LOG"
 watch_if &
-trap 'kill $! 2>/dev/null' EXIT INT TERM
+PIDS=$!
+if [ "${USBLOG_KEEPALIVE:-10}" != 0 ]; then keepalive & PIDS="$PIDS $!"; fi
+trap 'kill $PIDS 2>/dev/null' EXIT INT TERM
 chown "${SUDO_UID:-0}:${SUDO_GID:-0}" "$REPO/logs" 2>/dev/null || true
 python3 -u - "$LOG" <<'EOF'
 import socket, sys, time, os

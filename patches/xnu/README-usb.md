@@ -499,3 +499,124 @@ out/kernel/kernel.macho). compile-one of negroni_chg_glink.c and negroni_adsp.c:
 only the old warning kind (-Wdeclaration-after-statement). Patch sha256 1bc62225ec4ab341d659bb3052e6fb12a4d9a31bc304173ba1c0943ecb853f3c. Not booted; no image.
 Review (Opus): read-back fix + notification budget, patch sha256 dd5cd5734530aa606f72ef631795c72b3184c8fc81eee599f719f264f5862560;
 compile-one of negroni_chg_glink.c: no diagnostic. The kernel above does not have the fix: rebuild.
+
+## 0375: data-path watchdog (`negroniusb_idle_reboot=S`) and why 0371 did not fire in t22
+
+### Observations [V: logs/usblog-20261026-233816.txt, logs/usbkick.*, t22 with `negroniadsp=1 negronichg_typec=3`]
+
+- 05:05:19 the phone's log stream stops; `phone interface gone`. 05:05:25 `en10 up` (the Mac enumerated the phone
+  again, high speed). `settime: no reply in 30 s`. Ping, ARP and the ctl channel got no answer. The live log did not
+  come back.
+- 05:10:02 `en10 up` after `usb-host-kick reenum` (IOKit USBDeviceReEnumerate): a new enumeration, still no reply.
+- 05:12:41-05:14:01 `usb-host-kick suspend 80` (`suspend: 0x0`, `held 80 s`): no reboot, and the Mac log has NO new
+  `en10 up` / `interface gone` line in these 80 s. The phone needed a button reset.
+- The enumerations prove that ud_thread handled ep0 at 05:05:25 and 05:10:02 (descriptors and SET_CONFIGURATION need
+  it; the host-side MAC comes from our string descriptor).
+- Mac side: `scripts/debug/usblog.sh` sends `settime` only when the interface comes up (retried 30 s); it sent
+  nothing periodic. macOS's own traffic on en10 (IPv6, mDNS, ARP) has no fixed period.
+
+### Why 0371 did not fire (code reading)
+
+- The `configured once` latch (`ud.ever_configured`) is set in ud_configure and never cleared: a re-enumeration does
+  not reset it [V code].
+- The 0371 stretch ends only when DSTS.SOFFN changes. In L2 (host suspend) the SOFFN does not move [V:
+  bootlog-9/-10, `link 3 (suspend L2)` with a fixed DSTS]. With SOFs stopped and ud_thread running, 0366 makes a
+  soft reconnect 30 s into the stretch (configured + L2 = the long period, 6 x 5 s). The pull-up goes off for 100 ms;
+  the Mac sees a disconnect and enumerates the device again (a new `en10 up` without our address). The Mac log has
+  no such line in the 80 s. So one of these is true [I, the log cannot tell which]:
+  1. SOFs kept coming: macOS did not really suspend the port (USBDeviceSuspend returns 0x0 but IOUSBHost keeps the
+     port active while the ECM driver has open pipes [I]). Then 0371 cannot fire by design: the host is there.
+  2. ud_thread did not run `ud_link_watch` (stuck in some step after the enumeration, for example in a call into
+     the network stack: `dlil_post_msg` at SET_INTERFACE, `ifnet_input`, or `ud.lock`). 0371 and 0366 run only in
+     ud_thread, so neither can act.
+- Also by design: a held host suspend can only reach 0371 when 0366 is off or slower than S. With
+  `negroniusb_reconnect=5` (30 s in L2) and S = 60, our own reconnect wakes the host first. So `usb-host-kick
+  suspend` is not a way to trigger 0371 while 0366 runs.
+- Hardening (small): one SOFFN change alone (for example the frame number of a restarted controller) ended the
+  0371 stretch. Now the stretch ends only when SOFFN changed in two 100 ms samples in a row (`ud.sof_moved`). The
+  0366 rules are unchanged.
+
+### Change (bsd/dev/negroni_usb.c)
+
+- Boot-arg `negroniusb_idle_reboot=S` (default 0 = off). With S > 0 a separate kernel thread `ud_idle_thread`
+  starts (not ud_thread, not the endpoint queues). It samples every 250 ms.
+- Arm condition: the device was configured once in this boot (`ud.ever_configured`) AND at least one host frame
+  reached the bulk OUT path (`ud.out_at` != 0: any frame of valid length in `ud_rx_frame`, for the command server or
+  the stack). A boot with no cable or no host traffic never reboots.
+- Fire condition (either):
+  - no bulk OUT frame for S s (also the case when ud_thread is stuck: then nobody reads the RX ring), or
+  - one IN transfer active for S s without XferComplete (`ud.tx_busy` since `ud.tx_start_at`): the phone's TX path
+    is dead (the log stream and the ctl replies stop) while the host may still send.
+- Then: one line `NEGRONI USB: no USB data for S s: rebooting (negroniusb_idle_reboot); <why>; last OUT frame ... ms
+  ago (N OUT frames), IN transfer active|idle ... ms, last IN done ... ms ago, txq N, tx drops N, rx N tx N frames;
+  SOF ... ms ago, DSTS 0x... link N (...), [not ]configured, N soft reconnects; ud_thread ... ms ago in step <step>,
+  last event 0x...`, then `idle reboot: reason 0 set`, 500 ms wait, `negroni_bootlog_end(4, "reset (USB data idle S
+  s)")` (0367), `idle reboot: PSCI SYSTEM_RESET`, `negroni_reboot_reset()`. The watchdog thread does this itself
+  (ud_ctl_poll runs in ud_thread, which may be the stuck part). A thread_call resets 5 s later if the end mark
+  blocks (UFS lock).
+- Once per boot. Never in panic mode (the panic hold loop has its own timed reset). A pending USB command (reset,
+  power off, panic) wins: the line `idle reboot waits: a USB command is pending (N)`. Only when that command is still
+  not run 5 s after its time (ud_thread stuck), the watchdog resets; the command's reason stays.
+  `ud.ctl_action = UD_CTL_WATCHDOG` (compare-and-swap from NONE) blocks new commands (`error: busy`) and 0371.
+- Diagnostics (same thread, also without a reboot): `ud_thread has not run for N ms: in step <step>, last event
+  0x..., DSTS ..., SOF N ms ago (0375 watch)` when ud_thread has not started a loop pass for 5 s (at most 8 per
+  boot), and `ud_thread runs again (0375 watch)`. Steps: events, rx poll, ctl poll, link watch, PHY watch, sleep,
+  `dlil_post_msg (link event)`, `ifnet_input`, `ud.lock (TX complete)`, `ud.lock (drop data)`, `soft reconnect`. The
+  watchdog keeps its own DSTS.SOFFN sample, so "SOF N ms ago" answers question 1/2 above next time.
+- Boot line: `NEGRONI USB: reboot after S s without USB data once configured and host data came
+  (negroniusb_idle_reboot)`.
+
+### Host side
+
+- The host must send a bulk OUT frame at least every S s. `scripts/debug/usblog.sh` now sends a UDP broadcast
+  `keepalive` to 192.168.7.255:5142 every 10 s (`USBLOG_KEEPALIVE=N`, 0 = off). A broadcast needs no ARP (in t22
+  ARP got no answer, so a unicast would not leave the Mac) and no reply; the phone's stack drops it silently. An
+  old usblog.sh (started before this change) does NOT send it: restart the usblog tmux job before a test image
+  with this arg.
+- `scripts/ios16/build.sh` adds `negroniusb_idle_reboot=90` to every image except out/ios16-safe (`IDLE_REBOOT=S`,
+  `IDLE_REBOOT=0` = off), next to `negroniusb_lost_reboot=60`.
+- A Mac sleep longer than S s, or a test without usblog.sh, reboots the phone into boot_a (as 0371).
+- `scripts/debug/usb-host-kick.sh reenum|suspend [S]|resume` (tools/usb-host-kick, IOKit, sudo): host-side
+  re-enumeration / port suspend. In t22 `reenum` re-enumerated the gadget, but the data path stayed dead; `suspend
+  80` did not trigger 0371 (see above). With 0375 the way to recover a dead data path is to wait S s (or stop the
+  sender), not the suspend.
+
+### Test (RAM boot, `negroniusb_idle_reboot=30` for a short test)
+
+1. Boot, start `scripts/debug/usblog.sh` (new version), wait for `en10 up` and the boot line.
+2. Safe trigger: stop only the keepalive and every other sender for S s. Simplest: stop the usblog job and
+   `sudo ifconfig en10 down` for S + 10 s (no OUT frames; the phone cannot be reached in this time anyway), then
+   `ifconfig en10 up`. Or run usblog with `USBLOG_KEEPALIVE=0` and wait (macOS traffic may still keep it alive).
+3. Expect: `no USB data for 30 s: rebooting (negroniusb_idle_reboot); no OUT frame` (or `no OUT frame and IN
+   stuck`), `idle reboot: reason 0 set`, `NEGRONI BOOTLOG: boot N ends: restart (reset (USB data idle 30 s))`,
+   `idle reboot: PSCI SYSTEM_RESET`, then boot_a boots. `op10tool bootlog` of that boot ends with "reset (USB data
+   idle 30 s)".
+4. Negative test: with the keepalive on, no reboot for several minutes; `usbstats` works.
+
+### Build [V]
+
+out/kernel/local-20261026-235425/kernel.development.negroni sha256
+26d079d28ab223ad7d2444ac9e5ec36b3117d089ed51cc231828be592ab31384 (274 applied incl. 0375; only the 4 dxb skips; link
+out/kernel/kernel.macho). compile-one of negroni_usb.c and the full build: only the old warning kinds. Patch sha256
+1e39eaeca3a0aa16a0c2615a17e835cd626772cd4b454c627b3b16e7a71f50f0. Not booted; no image. Not reviewed yet.
+
+### Review (Opus, 2026-10-27): ACCEPT after 4 fixes [V: compile-one OK, only the old warning kinds; not built, not booted]
+
+- IN-stuck rule race: the watchdog read `tx_start_at` before `tx_busy`, with no barrier. A new transfer that started
+  between the two reads (after 90 s with no TX) paired busy=1 with the old start time: a false reboot. Now
+  `ud_tx_kick_locked` stores `tx_start_at` first and `tx_busy` with release; the watchdog loads `tx_busy` (acquire)
+  first.
+- `ctl_action`: one compare-and-swap for both cases (also the take-over from a pending command; the plain store
+  after the CAS is gone). `ud_ctl_poll` takes its action with a CAS (no double reset / double end mark when ud_thread
+  wakes during a take-over). `ud_ctl_schedule` (USB commands, 0371) sets the action only from NONE (it no longer
+  overwrites UD_CTL_WATCHDOG after the caller's check). The watchdog reads `ctl_action` with acquire before
+  `ctl_deadline` (no stale deadline makes an early take-over).
+- If PSCI refuses the reset, the watchdog thread sets `ctl_action` back to NONE before it returns (else every USB
+  command answers `error: busy` for the rest of the boot).
+- usblog.sh: `exec python3` in keepalive (the EXIT trap now stops the sender; before, an orphan python kept sending
+  after usblog stopped). Linux: `ip addr replace ... brd +` (without a broadcast address 192.168.7.255 is a unicast
+  that needs ARP).
+- Checked, no change: idle IN endpoints do not count (only EP_TX `tx_busy`; EP_INT notifications are not in the rule);
+  macOS keeps a bulk IN read pending while the ECM interface is up; 64-bit aligned loads/stores are single-copy atomic
+  on arm64; the 0371 two-sample rule still fires on an unplug (no SOFFN change -> `sof_moved` false, `lost_since` stays).
+- Patch sha256 after the fixes: 831dfaa03a014b1e125e64ec8ed3c163e54b6687175a433a8e63a3bad3ef0aa4. The kernel above is from the old patch: rebuild.

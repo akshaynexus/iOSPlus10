@@ -1,0 +1,427 @@
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index bb2580e..5674a9b 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -16,6 +16,7 @@
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
++#include <kern/thread_call.h>               /* 0375 */
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+@@ -308,6 +309,15 @@ static struct {
+ 	bool        ever_configured; /* 0371: SET_CONFIGURATION(1) happened in this boot */
+ 	bool        lost_reboot_done; /* 0371: the reboot is scheduled */
+ 	uint64_t    lost_since;     /* 0371: time of the last SOF before the current SOF-less stretch (0 = SOFs come) */
++	bool        sof_moved;      /* 0375: SOFFN changed in the last 100 ms sample (0371 needs two in a row) */
++	/* 0375: data-path watchdog (negroniusb_idle_reboot), read by ud_idle_thread */
++	uint64_t    out_at;         /* last bulk OUT frame from the host (0 = none in this boot) */
++	uint64_t    out_frames;     /* bulk OUT frames (command server + stack), not in panic mode */
++	uint64_t    tx_start_at;    /* last STARTTRANSFER on the IN endpoint */
++	uint64_t    tx_done_at;     /* last XferComplete on the IN endpoint */
++	uint64_t    beat;           /* ud_thread: start of its last loop pass */
++	volatile uint32_t where;    /* ud_thread: the step it is in (UD_AT_*) */
++	uint32_t    last_ev;        /* ud_thread: the last event it took */
+ 	uint32_t    episode_reconnects;
+ 	uint64_t    reconnects;
+ 	uint32_t    devevents[16];  /* device events per type (rate-limited log) */
+@@ -500,6 +510,14 @@ static int ud_reconnect_s = 5;          /* 0366: boot-arg negroniusb_reconnect:
+ static int ud_more_events = 1;          /* 0366: boot-arg negroniusb_events: 0 = DEVTEN 0x7 (the old mask), 1 = + wakeup/suspend/erratic (Linux set, default), 2 = + link state change */
+ static int ud_phycfg = 1;               /* 0366: boot-arg negroniusb_phycfg: clear GUSB2PHYCFG SUSPHY/ENBLSLPM */
+ static int ud_lost_reboot_s = 0;        /* 0371: boot-arg negroniusb_lost_reboot: s without host before a reboot (0 = off) */
++static int ud_idle_reboot_s = 0;        /* 0375: boot-arg negroniusb_idle_reboot: s without USB data before a reboot (0 = off) */
++/* 0375: ud_thread steps for the stall line of ud_idle_thread */
++enum { UD_AT_START, UD_AT_EVENTS, UD_AT_RXPOLL, UD_AT_CTLPOLL, UD_AT_LINKWATCH, UD_AT_HPWATCH, UD_AT_SLEEP,
++       UD_AT_LINKEVENT, UD_AT_IFINPUT, UD_AT_TXLOCK, UD_AT_DROPLOCK, UD_AT_RECONNECT, UD_AT_N };
++static const char *const ud_at_names[UD_AT_N] = {
++	"start", "events", "rx poll", "ctl poll", "link watch", "PHY watch", "sleep",
++	"dlil_post_msg (link event)", "ifnet_input", "ud.lock (TX complete)", "ud.lock (drop data)", "soft reconnect",
++};
+ static void ud_drop_data(void);
+ static void ud_end_transfer(unsigned ep);
+ static bool ud_ctl_input(const uint8_t *frame, uint32_t len);
+@@ -647,6 +665,10 @@ ud_rx_frame(const uint8_t *buf, uint32_t len, mbuf_t *head, mbuf_t *tail, struct
+ 		}
+ 		return;
+ 	}
++	if (len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
++		ud.out_at = mach_absolute_time();       /* 0375: a host frame reached the OUT path */
++		ud.out_frames++;
++	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN &&
+ 	    ud_ctl_input(buf, len)) {
+ 		ud.rx_frames++;         /* a command: taken before the stack */
+@@ -688,7 +710,10 @@ static void
+ ud_rx_input(mbuf_t head, struct ifnet_stat_increment_param *stats)
+ {
+ 	if (head != NULL) {
++		uint32_t was = ud.where;
++		ud.where = UD_AT_IFINPUT;       /* 0375 */
+ 		ifnet_input(ud.ifp, head, stats);
++		ud.where = was;
+ 	}
+ }
+ 
+@@ -834,7 +859,8 @@ ud_tx_kick_locked(void)
+ 		ud.tx_frames++;
+ 		ud.tx_bytes += len;
+ 		if (!ud_ring) {
+-			ud.tx_busy = true;
++			ud.tx_start_at = mach_absolute_time();  /* 0375: before tx_busy (ud_idle_thread reads tx_busy first) */
++			__atomic_store_n(&ud.tx_busy, true, __ATOMIC_RELEASE);
+ 			ud.tx_batch = false;
+ 			ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
+ 			return;
+@@ -856,9 +882,10 @@ ud_tx_kick_locked(void)
+ 	if (n > ud.tx_max_batch) {
+ 		ud.tx_max_batch = n;
+ 	}
+-	ud.tx_busy = true;
+-	ud.tx_batch = true;
+ 	ud.last_active = mach_absolute_time();
++	ud.tx_start_at = ud.last_active;        /* 0375: before tx_busy (ud_idle_thread reads tx_busy first) */
++	__atomic_store_n(&ud.tx_busy, true, __ATOMIC_RELEASE);
++	ud.tx_batch = true;
+ 	uint64_t tpa = ud.dma_pa + UD_TXB_TRBS;
+ 	ud_epcmd(EP_TX, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
+ }
+@@ -911,7 +938,7 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ #define UD_IP_HOST      0xc0a80701u     /* 192.168.7.1 */
+ #define UD_CTL_DELAY_MS 500
+ 
+-enum { UD_CTL_NONE, UD_CTL_RESET, UD_CTL_POWEROFF, UD_CTL_PANIC };
++enum { UD_CTL_NONE, UD_CTL_RESET, UD_CTL_POWEROFF, UD_CTL_PANIC, UD_CTL_WATCHDOG /* 0375: ud_idle_thread resets */ };
+ 
+ extern int negroni_reboot_set_reason(unsigned reason);
+ extern void negroni_reboot_reset(void);
+@@ -1060,8 +1087,12 @@ ud_ctl_reply(const uint8_t *req, const char *text)
+ static void
+ ud_ctl_schedule(int action)
+ {
++	int none = UD_CTL_NONE;
++
+ 	clock_interval_to_deadline(UD_CTL_DELAY_MS, NSEC_PER_MSEC, &ud.ctl_deadline);
+-	ud.ctl_action = action;
++	if (!__atomic_compare_exchange_n(&ud.ctl_action, &none, action, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
++		printf("NEGRONI CTL: action %d not scheduled: the 0375 idle watchdog resets now\n", action);
++	}
+ }
+ 
+ /*
+@@ -1269,11 +1300,13 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ static void
+ ud_ctl_poll(void)
+ {
+-	if (ud.ctl_action == UD_CTL_NONE || mach_absolute_time() < ud.ctl_deadline) {
+-		return;
++	if (ud.ctl_action == UD_CTL_NONE || ud.ctl_action == UD_CTL_WATCHDOG || mach_absolute_time() < ud.ctl_deadline) {
++		return;                 /* 0375: UD_CTL_WATCHDOG = ud_idle_thread does the reset itself */
+ 	}
+ 	int action = ud.ctl_action;
+-	ud.ctl_action = UD_CTL_NONE;
++	if (!__atomic_compare_exchange_n(&ud.ctl_action, &action, UD_CTL_NONE, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
++		return;                 /* 0375: ud_idle_thread took over just now */
++	}
+ 	if (action == UD_CTL_PANIC) {
+ 		panic("requested over USB");
+ 	}
+@@ -1296,7 +1329,10 @@ static void
+ ud_link_event(bool up)
+ {
+ 	if (ud.ifp != NULL && !ud_in_panic) {   /* 0360: dlil_post_msg allocates and locks */
++		uint32_t was = ud.where;
++		ud.where = UD_AT_LINKEVENT;     /* 0375 */
+ 		dlil_post_msg(ud.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++		ud.where = was;
+ 	}
+ }
+ 
+@@ -1504,8 +1540,11 @@ ud_drop_data(void)
+ {
+ 	bool was = ud.configured;
+ 
++	uint32_t was_at = ud.where;
+ 	if (!ud_in_panic) {
++		ud.where = UD_AT_DROPLOCK;      /* 0375 */
+ 		lck_mtx_lock(ud.lock);
++		ud.where = was_at;
+ 	}
+ 	ud.configured = false;          /* ud_if_output and ud_tx_kick_locked stop here */
+ 	if (ud_reset_end) {
+@@ -2080,6 +2119,8 @@ ud_soft_reconnect(const char *why, uint32_t dsts, uint64_t quiet_ms)
+ 	uint32_t dropped = 0;
+ 	int i;
+ 
++	uint32_t was_at = ud.where;
++	ud.where = UD_AT_RECONNECT;     /* 0375 */
+ 	ud.reconnects++;
+ 	ud.episode_reconnects++;
+ 	bool loud = ud.episode_reconnects <= 3 || (ud.reconnects % 10) == 0;
+@@ -2131,6 +2172,7 @@ ud_soft_reconnect(const char *why, uint32_t dsts, uint64_t quiet_ms)
+ 		printf("NEGRONI USB: soft reconnect #%llu: %s after %d ms (%u events dropped), restart %s, DSTS 0x%08x\n",
+ 		    ud.reconnects, halted ? "halted" : "NOT halted", i, dropped, ok ? "ok" : "FAILED", dwc_rd(DSTS));
+ 	}
++	ud.where = was_at;
+ }
+ 
+ /*
+@@ -2163,7 +2205,16 @@ ud_link_watch(void)
+ 		}
+ 		ud.last_soffn = sof;
+ 		ud.sof_seen = now;
+-		ud.lost_since = 0;              /* 0371: the host is there */
++		/*
++		 * 0371: the host is there. 0375: only when SOFFN also moved in the
++		 * sample before (100 ms earlier): one change alone (for example
++		 * the frame number of a restarted controller) does not end the
++		 * stretch.
++		 */
++		if (ud.sof_moved) {
++			ud.lost_since = 0;
++		}
++		ud.sof_moved = true;
+ 		ud.nosof_logged = false;
+ 		ud.event_rule_done = false;
+ 		ud.episode_reconnects = 0;
+@@ -2182,6 +2233,7 @@ ud_link_watch(void)
+ 	 * later so the line reaches the boot log). Never in panic mode: the panic
+ 	 * hold loop has its own timed reset.
+ 	 */
++	ud.sof_moved = false;           /* 0375 */
+ 	if (ud.lost_since == 0) {
+ 		ud.lost_since = ud.sof_seen;
+ 	}
+@@ -2221,6 +2273,7 @@ ud_link_watch(void)
+ 	}
+ 	ud.dev_event_at = 0;
+ 	ud.last_soffn = DSTS_SOFFN(dwc_rd(DSTS));
++	ud.sof_moved = false;                   /* 0375 */
+ 	ud.sof_seen = mach_absolute_time();     /* the next try one period later */
+ 	ud.next_watch = ud.sof_seen + ud_abs_ms(100);
+ }
+@@ -2308,6 +2361,7 @@ hp_watch(void)
+ 	    ud.sof_seen ? (now - ud.sof_seen) * 1000 / ud_abs_ms(1000) : 0);
+ 	ud.dev_event_at = 0;
+ 	ud.last_soffn = DSTS_SOFFN(dwc_rd(DSTS));
++	ud.sof_moved = false;                   /* 0375 */
+ 	ud.sof_seen = mach_absolute_time();     /* the no-SOF rule counts from here */
+ 	ud.next_watch = ud.sof_seen + ud_abs_ms(100);
+ 	hp.last_repair = mach_absolute_time();
+@@ -2394,9 +2448,13 @@ ud_event(uint32_t ev)
+ 			ud.tx_busy = false;     /* 0360: negroni_usb_panic_service() sends the next frame */
+ 			return;
+ 		}
++		uint32_t was = ud.where;
++		ud.where = UD_AT_TXLOCK;        /* 0375 */
+ 		lck_mtx_lock(ud.lock);
++		ud.where = was;
+ 		ud.ep_busy[EP_TX] = false;
+ 		ud.tx_busy = false;
++		ud.tx_done_at = mach_absolute_time();   /* 0375 */
+ 		ud_tx_kick_locked();
+ 		lck_mtx_unlock(ud.lock);
+ 		return;
+@@ -2449,6 +2507,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			ud_sleep_ms(1000);
+ 			continue;
+ 		}
++		ud.beat = mach_absolute_time();         /* 0375 */
++		ud.where = UD_AT_EVENTS;
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+ 		if (count) {
+ 			ud_sync(UD_EVT, UD_EVT_SIZE);
+@@ -2464,14 +2524,20 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 				if (ud.events++ < 200) {
+ 					printf("NEGRONI USB: event 0x%08x\n", ev);
+ 				}
++				ud.last_ev = ev;        /* 0375 */
+ 				ud_event(ev);
+ 			}
+ 			ud.last_active = mach_absolute_time();
+ 		}
++		ud.where = UD_AT_RXPOLL;        /* 0375: the steps for the stall line */
+ 		ud_rx_ring_poll();
++		ud.where = UD_AT_CTLPOLL;
+ 		ud_ctl_poll();
++		ud.where = UD_AT_LINKWATCH;
+ 		ud_link_watch();                /* 0366 */
++		ud.where = UD_AT_HPWATCH;
+ 		hp_watch();                     /* 0368 */
++		ud.where = UD_AT_SLEEP;
+ 		now = mach_absolute_time();
+ 		if (now >= next_report) {
+ 			/*
+@@ -2497,6 +2563,147 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++/*
++ * 0375: data-path watchdog (boot-arg negroniusb_idle_reboot=S, default 0 =
++ * off). Its own kernel thread, so it runs when ud_thread, the network stack
++ * or the endpoint queues are stuck. Every 250 ms. Once the device was
++ * configured AND a host frame reached the bulk OUT path in this boot: when
++ * no OUT frame came for S s, or one IN transfer has been active for S s
++ * without XferComplete, it logs one line, sets reboot reason 0 and resets
++ * like the "reboot" command (0367 boot log end mark, PSCI SYSTEM_RESET).
++ * It does the reset itself (ud_ctl_poll runs in ud_thread, which may be the
++ * stuck part); a thread_call resets 5 s later if the end mark blocks (UFS
++ * lock). Once per boot. Never in panic mode. A pending USB command (reset,
++ * power off, panic) wins; only when it is still not run 5 s after its time
++ * (ud_thread stuck) the watchdog resets (the command's reason stays).
++ * It also logs when ud_thread has not started a loop pass for 5 s (step,
++ * last event) and keeps its own DSTS.SOFFN sample (SOF age in the line).
++ * Host side: something must reach the phone at least every S s; the
++ * usblog script sends a UDP broadcast every 10 s (USBLOG_KEEPALIVE).
++ */
++static int ud_idle_chan;
++static thread_call_t ud_idle_fallback;
++
++static void
++ud_idle_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ud_idle_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++ud_idle_fallback_reset(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	if (ud_in_panic) {
++		return;
++	}
++	printf("NEGRONI USB: idle reboot: the end mark did not finish in 5 s: PSCI SYSTEM_RESET now\n");
++	negroni_reboot_reset();
++}
++
++static uint64_t
++ud_ms_since(uint64_t t, uint64_t now)
++{
++	return t == 0 || now < t ? 0 : (now - t) * 1000 / ud_abs_ms(1000);
++}
++
++static void
++ud_idle_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint64_t limit = ud_abs_ms((uint64_t)ud_idle_reboot_s * 1000), stall = ud_abs_ms(5000);
++	uint64_t sof_at = 0;
++	uint32_t last_sof = 0, stalls = 0;
++	bool stall_open = false, wait_logged = false;
++
++	for (;;) {
++		ud_idle_sleep_ms(250);
++		if (ud_in_panic) {
++			continue;               /* the panic hold loop owns the controller and has its own timed reset */
++		}
++		uint64_t now = mach_absolute_time();
++		uint32_t dsts = dwc_rd(DSTS), sof = DSTS_SOFFN(dsts);
++		if (sof_at == 0 || sof != last_sof) {
++			last_sof = sof;
++			sof_at = now;
++		}
++		uint64_t beat = ud.beat;
++		uint32_t at = ud.where;
++		if (beat != 0 && now > beat && now - beat >= stall) {
++			if (!stall_open && stalls < 8) {
++				stalls++;
++				printf("NEGRONI USB: ud_thread has not run for %llu ms: in step %s, last event 0x%08x, "
++				    "DSTS 0x%08x link %u (%s), SOF %llu ms ago (0375 watch)\n", ud_ms_since(beat, now),
++				    at < UD_AT_N ? ud_at_names[at] : "?", ud.last_ev, dsts, DSTS_LINK(dsts),
++				    ud_link_name(DSTS_LINK(dsts)), ud_ms_since(sof_at, now));
++			}
++			stall_open = true;
++		} else if (stall_open && now - beat < stall) {
++			stall_open = false;
++			printf("NEGRONI USB: ud_thread runs again (0375 watch)\n");
++		}
++		if (!ud.ever_configured || ud.out_at == 0) {
++			continue;               /* no host data in this boot yet: a boot with no cable never reboots */
++		}
++		/* tx_busy first: ud_tx_kick_locked stores tx_start_at before it (release), so a busy flag never pairs with an older start */
++		bool busy = __atomic_load_n(&ud.tx_busy, __ATOMIC_ACQUIRE);
++		uint64_t out_at = ud.out_at, tx_at = __atomic_load_n(&ud.tx_start_at, __ATOMIC_RELAXED);
++		bool out_idle = now > out_at && now - out_at >= limit;
++		bool tx_stuck = busy && tx_at != 0 && now > tx_at && now - tx_at >= limit;
++		if (!out_idle && !tx_stuck) {
++			wait_logged = false;
++			continue;
++		}
++		int action = __atomic_load_n(&ud.ctl_action, __ATOMIC_ACQUIRE);   /* then ctl_deadline: ud_ctl_schedule stores it first */
++		bool takeover = false;
++		if (action == UD_CTL_WATCHDOG) {
++			continue;
++		}
++		if (action != UD_CTL_NONE) {
++			if (now < ud.ctl_deadline + stall) {
++				if (!wait_logged) {
++					wait_logged = true;
++					printf("NEGRONI USB: idle reboot waits: a USB command is pending (%d)\n", action);
++				}
++				continue;       /* the pending command wins */
++			}
++			takeover = true;        /* still pending 5 s after its time: ud_thread does not run it */
++		}
++		if (!__atomic_compare_exchange_n(&ud.ctl_action, &action, UD_CTL_WATCHDOG, false,
++		    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
++			continue;               /* ud_ctl_poll took the command, or a command came in just now: it wins */
++		}
++		if (ud_idle_fallback != NULL) {
++			thread_call_enter_delayed(ud_idle_fallback, now + stall);
++		}
++		printf("NEGRONI USB: no USB data for %d s: rebooting (negroniusb_idle_reboot); %s; last OUT frame %llu ms "
++		    "ago (%llu OUT frames), IN transfer %s %llu ms, last IN done %llu ms ago, txq %u, tx drops %llu, "
++		    "rx %llu tx %llu frames; SOF %llu ms ago, DSTS 0x%08x link %u (%s), %sconfigured, %llu soft reconnects; "
++		    "ud_thread %llu ms ago in step %s, last event 0x%08x%s\n", ud_idle_reboot_s,
++		    out_idle && tx_stuck ? "no OUT frame and IN stuck" : out_idle ? "no OUT frame" : "IN transfer stuck",
++		    ud_ms_since(out_at, now), ud.out_frames, ud.tx_busy ? "active" : "idle", ud.tx_busy ? ud_ms_since(tx_at, now) : 0,
++		    ud_ms_since(ud.tx_done_at, now), ud.txq_count, ud.tx_drops, ud.rx_frames, ud.tx_frames,
++		    ud_ms_since(sof_at, now), dsts, DSTS_LINK(dsts), ud_link_name(DSTS_LINK(dsts)),
++		    ud.configured ? "" : "not ", ud.reconnects, ud_ms_since(beat, now), at < UD_AT_N ? ud_at_names[at] : "?",
++		    ud.last_ev, takeover ? "; a pending USB command was not run: reset now (its reason stays)" : "");
++		if (!takeover || action != UD_CTL_RESET) {
++			bool set = negroni_reboot_set_reason(0) == 0;
++			printf("NEGRONI USB: idle reboot: reason 0 %s\n", set ? "set" : "NOT set (plain reset)");
++			snprintf(ud_ctl_why, sizeof(ud_ctl_why), "reset (USB data idle %d s)", ud_idle_reboot_s);
++		}
++		ud_idle_sleep_ms(UD_CTL_DELAY_MS);      /* the live log may still carry the line */
++		if (ud_in_panic) {
++			continue;
++		}
++		negroni_bootlog_end(4, ud_ctl_why);     /* 0367 */
++		printf("NEGRONI USB: idle reboot: PSCI SYSTEM_RESET\n");
++		negroni_reboot_reset();         /* returns only if PSCI refused (logged there) */
++		__atomic_store_n(&ud.ctl_action, UD_CTL_NONE, __ATOMIC_SEQ_CST);  /* USB commands (poweroff, panic) work again */
++		return;
++	}
++}
++
+ /*
+  * Live console log over USB Ethernet: every 100 ms the new bytes of the
+  * console ring (bsd/dev/negroni_ufs.c) go as UDP datagrams to
+@@ -2939,6 +3146,7 @@ negroni_usb_gadget_start(vm_offset_t dwc)
+ 	if (ud_lost_reboot_s > 0) {
+ 		printf("NEGRONI USB: reboot after %d s without host once configured (negroniusb_lost_reboot)\n", ud_lost_reboot_s);
+ 	}
++	PE_parse_boot_argn("negroniusb_idle_reboot", &ud_idle_reboot_s, sizeof(ud_idle_reboot_s));
+ 	ud.qs = ml_io_map(QSCRATCH_PA, 0x100);
+ 	hp_setup();                     /* 0368: PHY baseline before our controller start */
+ 	if (!ud_hw_start(true)) {
+@@ -2959,6 +3167,16 @@ negroni_usb_gadget_start(vm_offset_t dwc)
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
++	if (ud_idle_reboot_s > 0) {
++		/* 0375: the data-path watchdog, independent of ud_thread */
++		ud_idle_fallback = thread_call_allocate(ud_idle_fallback_reset, NULL);
++		bool started = kernel_thread_start(ud_idle_thread, NULL, &thread) == KERN_SUCCESS;
++		if (started) {
++			thread_deallocate(thread);
++		}
++		printf("NEGRONI USB: reboot after %d s without USB data once configured and host data came "
++		    "(negroniusb_idle_reboot)%s\n", ud_idle_reboot_s, started ? "" : ": thread NOT started");
++	}
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("negroniusblog", &livelog, sizeof(livelog));
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {

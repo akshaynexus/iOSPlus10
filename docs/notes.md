@@ -3104,3 +3104,28 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   out/kernel/kernel.macho). Only the old warning kind. Not booted; no image.
 - Next: RAM boot with t19 args + `negronichg_typec=3` (`negronichg_glink=0`, `negronichg_ulog=1`): expect the typec
   write lines, PD `set typec_mode[1]`, no `OTG_ENABLE_REQ`, `bPlugIn[1]`, the Mac sees the device again.
+
+## 59. USB enumerates but the data path is dead (t22); 0375 data-path watchdog (2026-10-27, kernel agent; patch 0375, details patches/xnu/README-usb.md "0375")
+
+- [V] t22 (`negroniadsp=1 negronichg_typec=3`): 05:05:19 link drop at the ADSP charger start; 05:05:25 the Mac
+  enumerated the phone again (en10 up), but ping, ARP, ctl (`settime: no reply`) and the live log were dead.
+  05:10:02 `usb-host-kick reenum`: en10 up again, still dead. 05:12:41 `usb-host-kick suspend 80`: no reboot and no
+  new enumeration on the Mac in 80 s. Button reset needed.
+- [V code] 0371's latch `ever_configured` is never cleared (not by a re-enumeration). In L2 SOFFN does not move.
+  With SOFs stopped and ud_thread alive, 0366 reconnects after 30 s (configured + L2) and the Mac would enumerate
+  again; that is not in the log. So [I] either the Mac kept sending SOFs (port not really suspended), or ud_thread
+  did not run ud_link_watch. 0371 and 0366 run only in ud_thread. A held suspend cannot reach 0371 anyway while
+  0366 (30 s) is faster than S (60 s).
+- [V code] usblog.sh sent `settime` only at interface up, nothing periodic.
+- 0375: boot-arg `negroniusb_idle_reboot=S` (default 0). Own kernel thread (250 ms). Armed after the first
+  configuration and the first host OUT frame. Fires on no OUT frame for S s, or an IN transfer active S s without
+  completion: one line, reason 0, end mark "reset (USB data idle S s)", PSCI reset, done by the watchdog thread
+  itself (thread_call fallback 5 s). Once per boot, not in panic, a pending command wins (takeover only when it is
+  not run 5 s after its time). Also logs `ud_thread has not run for N ms: in step ...` (stall detector, own SOFFN
+  sample) to tell the two t22 cases apart next time. 0371 hardening: the stretch ends only on two SOFFN changes in a
+  row.
+- Host: usblog.sh sends a UDP broadcast `keepalive` to 192.168.7.255:5142 every 10 s (`USBLOG_KEEPALIVE`; no ARP
+  needed). build.sh adds `negroniusb_idle_reboot=90` to test images (`IDLE_REBOOT`). Restart the usblog tmux job
+  (old script has no keepalive) before a test with the arg, or the phone reboots ~90 s after boot.
+- Build [V]: out/kernel/local-20261026-235425/kernel.development.negroni sha256
+  26d079d28ab223ad7d2444ac9e5ec36b3117d089ed51cc231828be592ab31384 (274 applied; 4 dxb skips). Not booted.
