@@ -3380,3 +3380,18 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Fix (default off): `WaitStackTimeout` in `InterfaceNamer.bundle/Info.plist`. Root: `IFNAMER_WAIT_S=10`
   (`scripts/ios16/root-tweaks-extra.py` item 8). Live: `scripts/wifi/phone-ifnamer-timeout.sh on 10`, reboot.
   Not tested on the phone. Kernel option (IONetworkStack stub with a user client) is in the README, not done.
+
+## iOS 26 kernel: same series as iOS 16 + 12377 rules (2026-10-27, iOS 26 agent; branch ios26-prep, details docs/ios26-port-status.md, patches/xnu-12377/README.md)
+
+- [V] `scripts/ios26/apply-series.py` applies slop + `patches/xnu/*.patch` unchanged on the 12377 base 0001-0005;
+  12377 differences are data rules (`scripts/ios26/patch-rules.py`) + `patches/xnu-12377/skip.txt`. Result:
+  154 applied, 96 applied+rules, 0 replaced, 39 skipped, 0 errors. Stage 1 kernel links (22,547,872 bytes,
+  SHA-256 `bdfa185f...61aa`). A new iOS 16 patch that breaks on 12377 stops `scripts/ios26/build-kernel.sh`.
+- Gotcha: `git apply --recount` reads the next plain-diff header `--- a/...` as a removed line; slop patches are
+  plain diffs. The tool recounts hunk headers itself instead.
+- Gotcha: `git apply --reject` creates no file at all when one file of the patch is missing ("No such file").
+- Gotcha: the build-list "glue" rule (add `+` lines next to their context anywhere in the file) is only safe for
+  `*/conf/files*`; on a Makefile.template it dropped an `endif` ("missing `endif'").
+- 12377 API facts: `kmem_alloc`/`KMA_*` in `vm/vm_kern_xnu.h`; `struct vm_shared_region` in
+  `vm/vm_shared_region_xnu.h`; no `vm_map_lock_read`/`vm_map_lookup_entry` (VM map range locks); `pid_hibernate`
+  in `kern_proc.c`; `pset->primary_map` only with `CONFIG_SCHED_SMT`; the realtime CPU choice is in `sched_rt.c`.

@@ -1,6 +1,6 @@
 # iOS 26 port status (kernel xnu-12377.121.6, donor userland iOS 26.5.2 23F84 iPhone12,3)
 
-Date: 2026-10-27. Branch `ios26-prep` (local only). No phone access in this work: every result here is a host
+Date: 2026-10-27. Branch `ios26-prep` (draft PR #1). No phone access in this work: every result here is a host
 result. Background and donor choice: [future-ios26.md](future-ios26.md). Boot test order for later:
 [ios26-boot-plan.md](ios26-boot-plan.md).
 
@@ -12,47 +12,47 @@ Marks: **[V]** verified here (command output, file, build log). **[I]** inferenc
   iOS 16 pin `663906528d1c` with `MACOS_VERSION=26.5` (xnu tag from `distribution-macOS/macos-265`). No new Xcode and
   no full KDK download.
 - **KDK** [V]: xnu-12377 needs CoreEntitlements V2 / TrustCache / CodeSignature / TrustedExecutionMonitor headers
-  that are only in a Kernel Debug Kit. The installed SDKs have none of them (only `libCoreEntitlements*.tbd` in the
-  other platforms). `scripts/ios26/kdk-headers.py` attaches the KDK 26.5.2 (25F84) disk image **over HTTP**
-  (`hdiutil attach https://...`, range reads) and takes the 28 headers of the 140 KB `KDK_SDK.pkg` payload. The last
-  header, `KernelSupport/CoreEntitlements/V2/Kernel.h` (`CEKernelAPI_t`), is inside the 1.1 GB `KDK.pkg` payload; the
-  script writes our own version from the V2 prototypes (43 members, `__typeof__` of each CE* function). That is
-  enough because only our AMFI stand-in will fill the table (never Apple's AMFI kext).
-- **Our series `patches/xnu-12377/`** [V]: 7 patches (0001-0007), applied by dxb after its own 26.0 patches.
-- **Build** [V]: the stage-1 NEGRONI kernel with 0001-0007 (machine layer, platform expert, console, all 48 bsd/dev
-  SoC drivers, all IOKit drivers) builds from a clean tree in about 2 minutes: `kernel.development.negroni`, Mach-O
-  arm64, 22,446,144 bytes, SHA-256 `9aae85531c00a9a17465db70df31e9e790b002b2c425ea33bb76b7914c387ca6`,
-  "Darwin Kernel Version 25.5.0". The stage-2 **arm64e** kernel (0001-0005, `ARCH_STRING=arm64e`) also links:
-  22,274,768 bytes, SHA-256 `ff1de42c0789906980f496965ca982d9824fbf89412a8b5a465eefab90c78869`, with the native
-  key writes (`msr APIAKeyLo_EL1` ... `APGAKeyHi_EL1`) and 31,319 `pacibsp`. Never run on the phone.
-- **iOS 16 stack on 12377** [V]: `scripts/ios26/patch-check.sh` puts all 281 iOS 16 kernel patches + 3 stage
-  scripts (slop 0001-0126, ours 0200-0385) on 12377 in the iOS 16 order: 1 upstream, 240 apply as text, 33 partial,
-  4 fail, 3 stage scripts. Port state per patch (section 6): 192 driver-only patches carried as is by 0006/0007 and
-  compiled [V]; 23 ported and 7 reworked in 0001-0005; 13 have their driver part in 0006/0007 but core hooks open;
-  27 touch only core hooks (AMFI, crypto, pthread, HFS/mockfs, exec/exit/exception logging, sysctl identity) and
-  are not started; 10 not started; 4 blocked (crypto 0013/0014, pthread 0019); 3 obsolete; 1 replaced (PAC).
+  that are only in a Kernel Debug Kit. `scripts/ios26/kdk-headers.py` attaches the KDK 26.5.2 (25F84) disk image
+  **over HTTP** and takes the 28 headers of the 140 KB `KDK_SDK.pkg` payload, plus our own
+  `KernelSupport/CoreEntitlements/V2/Kernel.h` (`CEKernelAPI_t`, 43 members from the V2 prototypes).
+- **Same series as iOS 16** [V]: the iOS 26 kernel applies the slop patches and `patches/xnu/*.patch` unchanged, in
+  the iOS 16 order, on a small 12377 base (`patches/xnu-12377/0001-0005`). The 12377 differences are data rules in
+  `scripts/ios26/patch-rules.py` and one skip list. A driver fix lands once in `patches/xnu/`; both kernels get it.
+  Rule and layout: [../patches/xnu-12377/README.md](../patches/xnu-12377/README.md). The old 0006/0007 snapshots of
+  the iOS 16 tree (3.6 MB) are gone.
+- **Series result** [V] (`series-report.txt` of the last build): 154 applied as is, 96 applied with rules, 0 replaced,
+  39 skipped (24 in the 12377 base, 1 upstream, 4 not needed, 10 open), 0 errors; slop stage script 0020 (BearSSL)
+  runs. Rules used: 57 build-list (glue), 29 `vm_kern_xnu.h` include, 21 base-owned file drops, 10 `sub`, 1 each of
+  `rename_file`, `drop_file`, `insert_after`, and 1 port part (0395 scheduler).
+- **Build** [V]: stage 1 (plain arm64) NEGRONI DEVELOPMENT links from a clean tree with the whole series, including
+  the new main patches 0347, 0387-0391, 0395, 0396: `kernel.development.negroni`, Mach-O arm64, 22,547,872 bytes,
+  SHA-256 `bdfa185fb3fde380a7e007fefe962b5c711865a151164ea782ccc2bb122461aa`, "Darwin Kernel Version 25.5.0".
+  Compile and link only: never run on the phone.
+- **Stage 2 (arm64e)** [V, earlier]: with base 0001-0005 only, `ARCH_STRING=arm64e` linked (22,274,768 bytes,
+  SHA-256 `ff1de42c0789906980f496965ca982d9824fbf89412a8b5a465eefab90c78869`). Not rebuilt with the full series yet.
 - **PAC** [I]: patch 0005 makes an arm64e kernel with natively written keys (one global key set); off by default.
 
-## 2. Scripts (all new, `scripts/ios26/`)
+## 2. Scripts (`scripts/ios26/`)
 
 | Script | What it does | State |
 |---|---|---|
-| `build-kernel.sh` | dxb build of xnu-12377.121.6 NEGRONI DEVELOPMENT with Xcode 27.1, own tree `out/kernel/local-ios26/`, our series copied as `zz-*`; `STAGE=prepare` stops after patching; `ARCH_STRING=arm64e` = stage 2 | [V] runs |
+| `build-kernel.sh` | dxb build of xnu-12377.121.6 NEGRONI DEVELOPMENT with Xcode 27.1, own tree `out/kernel/local-ios26/`; a hook in dxb's `patches()` runs `apply-series.py` after dxb's 26.0 patches and stops the build on any unexpected result; `STAGE=prepare` stops after patching; `ARCH_STRING=arm64e` = stage 2 | [V] runs |
+| `apply-series.py` | applies base + slop stage scripts + the series (slop + `patches/xnu`) with the 12377 rules; one result line per patch | [V] 0 errors |
+| `patch-rules.py` | the 12377 rules (data): `RULES`, `BASE_OWNED`, `GLUE_FILES`; reads `patches/xnu-12377/skip.txt` | [V] |
+| `series-tree.sh` | developer tree `out/kernel/local-ios26/work` (12377 + dxb 26.0 + series, one git commit per step); `--dev` applies a failing patch with `--reject` and names the rejected files | [V] |
 | `kernel-make.sh` | developer loop: copy changed files from the work tree, `make -k` in the dxb tree, error list | [V] runs |
-| `kdk-headers.py` | headers-only KDKROOT from the remote KDK 26.5.2 (HTTP disk image), own `Kernel.h` | [V] 28 + 1 headers. The HTTP mount hung twice when a stale `diskimages-helper` was left over from a killed run, and once inside tmux; a clean foreground run worked |
-| `ios16-ref-tree.sh` | xnu-8796 pristine + negroni-only tree (slop stage scripts + slop patches + patches/xnu; no dxb patches) | [V] 278 applied, 0 skipped |
-| `port-file.sh` | carries one file's iOS 16 change (8796 pristine -> negroni) to the 12377 work tree; copies new files | [V] |
-| `patch-check.sh` | text check of the whole iOS 16 stack on 12377 (cumulative, best effort), `patch-check.tsv` | [V] |
-| `port-table.py` | section 6 table from `patch-check.tsv` + the hand-kept state map | [V] |
+| `port-table.py` | section 6 table from `series-report.txt` | [V] |
+| `kdk-headers.py` | headers-only KDKROOT from the remote KDK 26.5.2 (HTTP disk image), own `Kernel.h` | [V] 28 + 1 headers |
+| `ios16-ref-tree.sh`, `port-file.sh` | xnu-8796 reference trees; carry one file's iOS 16 change to a 12377 tree (for base patch work) | [V] |
 | `fetch-os.sh` | OS (7.4 GB AEA), SystemOS (2.0 GB AEA), AppOS cryptex + trust caches + root hashes, AEA decrypt | written, not run (needs 30 GiB free) |
 | `root-macos.sh` | iOS 26 HFS+ root in the iOS 16 layout (cryptexes under `/private/preboot/Cryptexes`) | stub, refuses to run without `IOS26_ROOT_STUB_OK=1` |
 | `root-tweaks.py` | iOS 16 root tweaks with their iOS 26 state (`--report`) | stub |
 | `fetch-donor.sh`, `fetch-sysos.sh`, `ipsw-ls.py` | (from the research step) donor kernelcache/ADT, SystemOS cryptex, remote IPSW list | [V] earlier |
 
-Work flow for a new patch: `scripts/ios26/ios16-ref-tree.sh` (once), make the change in the git work tree
-`out/kernel/local-ios26/work` (one commit per patch, `scripts/ios26/port-file.sh` for iOS 16 files), export the diff
-to `patches/xnu-12377/NNNN-name.patch`, test with `scripts/ios26/kernel-make.sh FILE...`, then a clean
-`scripts/bg.sh ios26-kernel scripts/ios26/build-kernel.sh`.
+Work flow for an iOS 16 patch that fails on 12377: `scripts/ios26/series-tree.sh --dev`, read its result line and
+the reject, write the smallest rule in `patch-rules.py` (or a skip line with a reason), run `series-tree.sh` until
+`0 errors`, then `scripts/ios26/kernel-make.sh` (incremental) or a clean
+`scripts/bg.sh ios26-kernel scripts/ios26/build-kernel.sh`. Details: `patches/xnu-12377/README.md`.
 
 ## 3. Kernel build
 
@@ -61,29 +61,24 @@ Command: `scripts/bg.sh ios26-kernel scripts/ios26/build-kernel.sh` (then `scrip
 | Step | Result |
 |---|---|
 | dxb helpers with Xcode 27.1 (bootstrap_cmds/mig, dtrace ctf tools, AvailabilityVersions, Libsystem + libsyscall headers, libplatform, libfirehose_kernel x86_64/arm64e/arm64) | [V] all built |
-| dxb 26.0 patches on 12377.121.6 | [V] all apply except `link_kdk.patch` (our 0001 replaces it) and `remove_applefeatures_include.patch` (not needed: no error from `vm_resident.c`) |
-| xnu headers, MIG, `MASTER.arm64.negroni` doconf | [V] |
-| compile errors met and fixed | `CPMU_PMC_COUNT` (Apple CPU counters: `CPU_COUNTERS_BASE = [ ]` in our master config), `fbcon_probe` inside `#ifdef PL011_UART` in 12377's `pe_serial.c` layout (moved), `sysreg_restore` gone in 12377 (clean removed from the PSCI path) |
-| link / kernel.development.negroni | see section 3.1 |
+| dxb 26.0 patches on 12377.121.6 | [V] all apply except `link_kdk.patch` (our 0001 replaces it) and `remove_applefeatures_include.patch` (not needed) |
+| negroni series (`apply-series.py`) | [V] 0 errors (section 6) |
+| compile errors met and fixed by rules | `vm_shared_region_xnu.h` / `vm_map_internal.h` in exception.c (0043); 0066 skipped (12377 VM map range locks) |
+| link / kernel.development.negroni | see 3.1 |
 
-### 3.1 Last build result (2026-10-27 19:38, clean tree, 0001-0007)
+### 3.1 Last build result (2026-10-27 21:13, clean tree, base 0001-0005 + full series)
 
 | Item | Value |
 |---|---|
-| Output | `out/kernel/local-ios26-20261027-140852/kernel.development.negroni`, link `out/kernel/kernel-ios26.macho` |
-| File | Mach-O 64-bit executable arm64, 22,446,144 bytes |
-| SHA-256 | `9aae85531c00a9a17465db70df31e9e790b002b2c425ea33bb76b7914c387ca6` |
-| Layout | `__TEXT` at `0xfffffe0007004000`, 19 `LC_SEGMENT_64`, same shape as the iOS 16 kernel (`out/kernel/kernel.macho`); new flags `WEAK_DEFINES BINDS_TO_WEAK` (our weak hook defaults) [V]. DarwinBoot acceptance [U] |
-| Patch report | dxb 26.0: all except `link_kdk.patch`, `remove_applefeatures_include.patch`; ours `zz-0001` ... `zz-0007` all applied |
-| Stage 2 (arm64e, 0001-0005, incremental) | `out/kernel/local-ios26-arm64e-20261027/kernel.development.negroni`, Mach-O arm64e, 22,274,768 bytes, SHA-256 `ff1de42c0789906980f496965ca982d9824fbf89412a8b5a465eefab90c78869` |
-| Time | about 2 minutes for the kernel on this Mac (dxb helpers kept between builds) |
+| Output | `out/kernel/local-ios26-20261027-154351/kernel.development.negroni`, link `out/kernel/kernel-ios26.macho` |
+| File | Mach-O 64-bit executable arm64, 22,547,872 bytes |
+| SHA-256 | `bdfa185fb3fde380a7e007fefe962b5c711865a151164ea782ccc2bb122461aa` |
+| Version | `Darwin Kernel Version 25.5.0 ... xnu-12377.121.6` |
+| New main patches in it | 0347 AWDL (glue), 0387 flash/torch (glue, base 0004 for NegroniPlatformExpert), 0388-0391 as is, 0395 CPU perf (glue + scheduler port part), 0396 as is [V] (`series-report.txt`; symbols `negroni_sched_placement`, `negroni_cpuperf*`, `negroni_awdl*`) |
+| Reports | `patch-report.txt` (dxb), `series-report.txt` (ours) next to the kernel |
+| DarwinBoot acceptance | [U] |
 
-Fixes the 12377 compile/link needed (all folded into the series): `CPU_COUNTERS_BASE = [ ]` (no Apple CPMU),
-`fbcon` code outside `#ifdef PL011_UART`, no `sysreg_restore`, `ml_interrupt_masked_debug_start/end` (renamed),
-recount `ru_metrics[]` (renamed), no second `_nohid` label, `pmap_pending_preemption` (slop 0008 again), 48 Apple
-SoC-only KPI exports dropped (slop 0009 again), `kmem_alloc`/`KMA_*` from `<vm/vm_kern_xnu.h>` in 18 drivers.
-
-## 4. The iOS 26 series `patches/xnu-12377/`
+## 4. The 12377 base `patches/xnu-12377/` and the rules
 
 | Patch | Contents | Source |
 |---|---|---|
@@ -92,323 +87,335 @@ SoC-only KPI exports dropped (slop 0009 again), `kmem_alloc`/`KMA_*` from `<vm/v
 | `0003-negroni-machine-layer` | GICv3 Group 1 IRQs, SPI dispatch, start.s (PSCI entry, early marks), SMP/cluster ids, no CNTP write, PoC cleans for secondaries, CPU idle, MMIO try accessors | slop 0004/0010/0017/0065/0078/0082-0086, ours 0288/0295/0297/0382/0383 |
 | `0004-negroni-platform-console` | NegroniPlatformExpert, NegroniCPU, framebuffer console, console tee/mute, panic hooks, no IORTC wait, no kernelmanagerd hold, NEGRONI TOP, weak default driver hooks | slop 0003/0016/0018/0043/0047/0067/0088, ours 0200/0360/0367/0382 |
 | `0005-negroni-native-pac` | stage 2: arm64e kernel, `HAS_NATIVE_ARM_PAC` key writes in `PAC_INIT_KEY_STATE`, one global key set | new (replaces slop 0005) |
-| `0006-negroni-soc-drivers` | the 48 `bsd/dev/negroni_*.c` drivers + headers as they are, `vm_kern_xnu.h` include, weak defaults for 25 IOKit/exception.c hooks | iOS 16 reference tree (slop + ours) |
-| `0007-negroni-iokit-drivers` | Framebuffer, Surface, Accel/GPU, Backlight, Battery, Vibrator, WLAN, Watchdog, KeyStore, AMFI, Entitlements, HID event services; 13 personalities | iOS 16 reference tree; compile level only |
+| `skip.txt` | 39 lines, one reason each | |
+| `parts/0395-negroni-cpuperf.patch` | 12377 scheduler port of 0395 (`choose_processor` idle choice from `idle_map`, hint check, realtime choice in `sched_rt.c`) | port of patches/xnu/0395 |
 
-New design point for 12377: `osfmk/arm64/negroni_weak_hooks.c` gives weak default definitions of every driver hook
-that the machine layer, console and platform expert call. The drivers keep their strong definitions. So the series
-links at each step, and the drivers can come one family at a time.
+The base owns the files it ports (`BASE_OWNED` in `patch-rules.py`, 35 files: machine layer, console,
+NegroniPlatformExpert/NegroniCPU, master config). A series patch that changes one of them and is not listed there
+is an error, so a new iOS 16 change to those files cannot be lost silently: it must be ported into the base patch.
 
 ## 5. Port state per family
 
-Text results come from `patch-check.tsv` (section 6). Effort marks are [I].
+Compile level only [V]; nothing ran on the phone. Effort marks are [I].
 
-| Family | Text on 12377 | iOS 26 state | Next work |
-|---|---|---|---|
-| Build glue (`bsd/conf/files`, `iokit/conf/files.arm64`, `KernelConfigTables.cpp`) | mostly applies | rework per driver (each driver patch adds its own lines) | mechanical |
-| Machine layer (board, GIC, timer, SMP/PSCI, start.s, sleh.c, pe_fiq.c, CPU idle) | 0004 partial 5/14, 0065 partial 3/14, rest applies | **ported** (0002-0004), compile-tested | boot test T1 |
-| Console / framebuffer console / panic hooks | 0003 partial, 0047/0067 partial | **ported** (0004) | USB live log (`negroni_usb.c`) |
-| PAC | n/a | **new** (0005), stage 2 | first arm64e compile; Gunyah key-register access test |
-| Crypto / RNG (slop 0013, 0014, 0020, 0023, 0027, 0032, 0033) | 0013 fail, 0014 partial 7/9 | blocked on design | port UniXNU source corecrypto (`build-corecrypto-14.py --xnu-12377`, `native-source-crypto.patch`) instead of the BearSSL/HMAC-PRNG patches |
-| pthread (slop 0019 + stage) | stage script pins libpthread-514 (8796 pair) | blocked on ABI | UniXNU `build-pthread-12377.py` + libpthread-539.100.4 |
-| Storage / root (UFS 0028-0034, mockfs 0021-0024, HFS 0026 + stage, 0204) | UFS applies; 0041 fail, 0204 partial 5/6 | not started | HFS tag that matches 12377 (`hfs` in macos-265 release.json), then UFS driver as is |
-| AMFI / code signing / trust cache (0015, 0025, 0035, 0036, 0221) | 0221 partial | not started; **largest core rework** | 12377 `kern_codesigning.c` + CoreEntitlements V2: our AMFI must register a `CEKernelAPI_t` (amfi_core_entitlements_register); `ubc_subr.c` and the PPL `pmap.c` call through it |
-| Sandbox (0050, 0222, 0223) | applies as text | not started | op numbers and privileges of the iOS 26 libsystem_sandbox must be re-traced |
-| AKS emulation (0038, 0055, 0220, 0221) | 0038 partial | not started | AppleKeyStore selector set of iOS 26 userland |
-| IOSurface / IOMFB / HID (0046, 0056, 0058, 0068, 0230-0237, 0250-0259, 0289, 0364) | mostly applies (0046, 0058 partial) | **compile level (0007)** [V] | user-client ABI of IOSurface 393.5.7 / IOMobileGraphicsFamily 343.0.0 |
-| SoC drivers (UFS, keys, touch, USB/ECM, ADSP/audio, Wi-Fi, BT, battery/charger, thermal, cpufreq, camera, haptics, fingerprint, DSI/DPU, Adreno) | almost all apply as text | **ported as is (0006)**, compile + link [V] | phone runs; the core hooks some of them need (exec/exit logging, sysctl) |
-| Identity (0059, 0061, 0088, 0363, 0378) | 0363 fail (obsolete) | 0363 obsolete | D421AP identity (`hw.machine iPhone12,3`), report a cpufamily without AMX |
+| Family | iOS 26 state | Next work |
+|---|---|---|
+| Build glue (`*/conf/files*`, `KernelConfigTables.cpp`) | applied by the glue rule / as text | none |
+| Machine layer, console, PAC | base 0001-0005 | boot test T1 |
+| SoC drivers (UFS, keys, touch, USB/ECM, ADSP/audio, Wi-Fi, BT, battery/charger, thermal, cpufreq, camera, haptics, fingerprint, DSI/DPU, Adreno, flash, AWDL) | iOS 16 patches as is (+ `vm_kern_xnu.h`), compile + link [V] | phone runs |
+| IOKit drivers (Framebuffer, Surface, GPU, HID, Battery, Vibrator, WLAN, Watchdog, KeyStore) | iOS 16 patches as is, compile + link [V] | user-client ABIs of the iOS 26 userland (IOSurface 393.5.7, IOMobileGraphicsFamily 343.0.0, AKS) |
+| Core hooks (exec/exit/crash logging, sysctl identity, sandbox, AMFI, trust cache, mockfs, UFS root) | applied (some with context rules), compile + link [V] | AMFI needs a CoreEntitlements V2 table for 12377 `ubc_subr.c`; behaviour untested |
+| Crypto (BearSSL 0020/0023/0027/0032/0033) | applied + BearSSL stage, compile [V] | 0013/0014 open (12377 corecrypto KPI v14; UniXNU source corecrypto) |
+| pthread (0019 + stage) | open | UniXNU `build-pthread-12377.py` + libpthread-539 |
+| HFS (0026 + stage, 0041, 0204; HFS hunks of 0031/0362) | open | stage the HFS tag of macOS 26.5 |
+| Scheduler (0395) | port part [V compile] | placement test on the phone |
+| Diagnostics 0066 (crash fault region), 0362 (KMEM report) | open | rewrite for 12377 VM range locks / kmem ranges |
 
-## 6. Per-patch table (iOS 16 stack on xnu-12377.121.6)
+## 6. Per-patch table (negroni series on xnu-12377.121.6)
 
-Regenerate: `scripts/ios26/patch-check.sh` then `scripts/ios26/port-table.py out/kernel/local-ios26/patch-check.tsv`.
-"Text" = `patch -F3` on the cumulative 12377 tree (Apple patch 2.0): upstream = already in 12377, clean = all hunks
-apply (with or without offset), partial n/m = n of m hunks fail, fail = no hunk applies, stage = slop stage script
-(downloads a pinned source tree). Text results are not compile results.
+Regenerate: `scripts/ios26/port-table.py out/kernel/local-ios26-<UTC>/series-report.txt`. `applied+rules(N)` lists the
+rule kinds: `glue` (build lists), `vm_kern_xnu.h`, `base 000N` (hunks for a base-owned file dropped), `sub`,
+`rename_file`, `drop_file`, `insert_after`, `port`.
 
-| Patch | Text on 12377 | Family | iOS 26 series state |
-|---|---|---|---|
-| `0001-new-clang-drop-removed-auto-var-init-flag.patch` | upstream | other | obsolete: flag removed upstream |
-| `0002-new-clang-backport-UIO_STACKBUF.patch` | partial 1/37 failed | other | not started (dxb 26.0 + Xcode 27.1 build without it: [V] compile reached all of bsd/osfmk) |
-| `0003-negroni-framebuffer-serial-console.patch` | partial 2/3 failed | display | reworked (0004: fbcon_probe before the 12377 phandle lookup, outside PL011_UART) |
-| `0004-negroni-machine-config.patch` | partial 5/14 failed | machine | reworked (0002 config, 0003 GIC/IRQ/start.s) |
-| `0005-non-pac-build-fixes.patch` | clean | other | replaced (0005 native PAC, stage 2) |
-| `0006-negroni-master-config-open-source-asm-pmap.patch` | clean | machine | reworked (0002: 12377 MacOSX master + nos_arm_asm/nos_arm_pmap, no CPU counters) |
-| `0007-negroni-stub-apple-internal-headers.patch` | partial 1/6 failed | other | not needed so far (12377 + UniXNU base, 0001) |
-| `0008-negroni-fill-closed-lib-gaps-kpc-stub.patch` | partial 1/14 failed | other | reworked (0001 machine_routines_nos.c; 12377 has kpc.c; amcc via apple_amcc option) |
-| `0009-negroni-drop-apple-soc-only-exports.patch` | partial 1/2 failed | other | reworked (0002: 12377 export lists, 48 names + IOUnifiedAddressTranslator) |
-| `0010-negroni-early-framebuffer-debug.patch` | partial 1/16 failed | display | ported (0003 start.s band, negroni_early.c) |
-| `0011-negroni-physmap-alignment-padding.patch` | clean | machine | not started |
-| `0012-negroni-keep-debug-console-after-ttbr0.patch` | clean | debug/USB | not started |
-| `0013-negroni-kmem-rng-without-corecrypto.patch` | fail 2/2 | crypto/pthread | blocked: 12377 crypto init differs (corecrypto KPI v14); port UniXNU source corecrypto instead |
-| `0014-negroni-kernel-hmac-prng.patch` | partial 7/9 failed | crypto/pthread | blocked: same as 0013 |
-| `0015-negroni-unavailable-trust-cache-runtime.patch` | clean | codesign/sandbox | not started (UniXNU native-trust-cache-runtime is the 12377 model) |
-| `0016-negroni-device-tree-platform-expert.patch` | clean | other | ported (0004 NegroniPlatformExpert) |
-| `0017-negroni-device-tree-virtual-timer-irq.patch` | clean | machine | ported (0003 pe_fiq.c vtimer INTID from ADT) |
-| `0018-negroni-boot-cpu-driver.patch` | partial 1/3 failed | machine | ported (0004 NegroniCPU) |
-| `0019-negroni-builtin-pthread.patch` | clean | crypto/pthread | blocked: 12377 pthread callback ABI (UniXNU build-pthread-12377.py, libpthread-539) |
-| `0019-stage-libpthread.sh` | stage | crypto/pthread | blocked: 12377 pthread callback ABI (UniXNU build-pthread-12377.py, libpthread-539) |
-| `0020-negroni-portable-aes-cbc.patch` | clean | crypto/pthread | core hooks not started: libkern/conf/Makefile.template, libkern/conf/files, libkern/crypto/corecrypto_aes.c, libkern/crypto/negroni_aes.c ... |
-| `0020-stage-bearssl.sh` | stage | crypto/pthread | not started (BearSSL stage, crypto family) |
-| `0021-negroni-mockfs-ramdisk-root.patch` | clean | storage/root | core hooks not started: bsd/miscfs/mockfs/mockfs_fsnode.c |
-| `0022-negroni-ramdisk-root-without-iomedia.patch` | clean | storage/root | ported (0004 IOService.cpp, file-level carry); mockfs itself not started |
-| `0023-negroni-builtin-sha256-for-libkern.patch` | clean | crypto/pthread | core hooks not started: libkern/crypto/corecrypto_sha2.c |
-| `0024-negroni-mockfs-virtual-ramdisk-io.patch` | clean | storage/root | core hooks not started: bsd/miscfs/mockfs/mockfs_fsnode.c, bsd/miscfs/mockfs/mockfs_vfsops.c |
-| `0025-negroni-builtin-amfi-no-entitlements.patch` | clean | codesign/sandbox | driver part in 0006/0007; core hooks not started: bsd/kern/negroni_amfi.c |
-| `0026-negroni-builtin-hfs.patch` | clean | storage/root | driver part in 0006/0007; core hooks not started: bsd/conf/Makefile.template, bsd/kern/bsd_init.c, bsd/miscfs/mockfs/mockfs_vfsops.c, bsd/negroni_hfs/negroni_hfs_compat.h ... |
-| `0026-stage-hfs.sh` | stage | storage/root | not started (hfs-? tag that matches 12377 must be picked) |
-| `0027-negroni-bearssl-md5.patch` | clean | crypto/pthread | core hooks not started: libkern/conf/Makefile.template, libkern/conf/files, libkern/crypto/corecrypto_md5.c, libkern/crypto/negroni_dec32le.c ... |
-| `0028-negroni-ufs-root-device.patch` | clean | storage/root | driver part in 0006/0007; core hooks not started: iokit/bsddev/IOKitBSDInit.cpp |
-| `0029-negroni-unsealed-root-volume.patch` | clean | storage/root | core hooks not started: bsd/kern/bsd_init.c |
-| `0030-negroni-ufs-writes.patch` | clean | storage/root | ported as is (0006), compiles [V] |
-| `0031-negroni-read-write-root.patch` | partial 1/2 failed | display | core hooks not started: bsd/negroni_hfs/core/hfs_vfsutils.c, bsd/vfs/vfs_subr.c |
-| `0032-negroni-bearssl-sha1.patch` | clean | crypto/pthread | core hooks not started: libkern/conf/Makefile.template, libkern/conf/files, libkern/crypto/corecrypto_sha1.c, libkern/crypto/negroni_dec32be.c ... |
-| `0033-negroni-bearssl-sha384-sha512.patch` | clean | crypto/pthread | core hooks not started: libkern/conf/Makefile.template, libkern/conf/files, libkern/crypto/corecrypto_sha2.c, libkern/crypto/negroni_dec64be.c ... |
-| `0034-negroni-ufs-dma-above-4g.patch` | clean | storage/root | ported as is (0006), compiles [V] |
-| `0035-negroni-amfi-entitlements-platform-binaries.patch` | clean | codesign/sandbox | driver part in 0006/0007; core hooks not started: bsd/kern/bsd_init.c, bsd/kern/negroni_amfi.c |
-| `0036-negroni-amfi-cs-signed.patch` | clean | codesign/sandbox | core hooks not started: bsd/kern/negroni_amfi.c |
-| `0037-negroni-config-bindfs.patch` | clean | storage/root | not started (bindfs line in MASTER.arm64.negroni, with the root family) |
-| `0038-negroni-applekeystore.patch` | partial 1/3 failed | AKS | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0039-negroni-coredump-default-off.patch` | clean | other | core hooks not started: bsd/kern/kern_core.c |
-| `0040-negroni-iowatchdog.patch` | partial 1/3 failed | power/thermal | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0041-negroni-hfs-link-notes.patch` | fail 3/3 | storage/root | core hooks not started: bsd/negroni_hfs/core/hfs_catalog.c |
-| `0042-negroni-short-exec-log.patch` | clean | debug/USB | core hooks not started: bsd/kern/kern_exec.c |
-| `0043-negroni-console-crash-log.patch` | clean | debug/USB | driver part in 0006/0007; core hooks not started: bsd/kern/kern_exit.c, osfmk/kern/exception.c |
-| `0044-negroni-crash-log-reason.patch` | clean | debug/USB | core hooks not started: bsd/kern/kern_exit.c |
-| `0045-negroni-iowatchdog-pmu-primary.patch` | clean | power/thermal | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0046-negroni-iosurface-iomfb.patch` | partial 1/6 failed | GPU/IOSurface | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0047-negroni-persistent-console-log.patch` | partial 1/3 failed | debug/USB | ported (0004 serial_console.c tee, 0006 negroni_ufs.c log) |
-| `0048-negroni-devnull-tee.patch` | clean | other | core hooks not started: bsd/dev/mem.c |
-| `0049-negroni-iokit-trace.patch` | clean | debug/USB | core hooks not started: iokit/Kernel/IOUserClient.cpp |
-| `0050-negroni-sandbox-policy.patch` | clean | codesign/sandbox | core hooks not started: bsd/kern/negroni_amfi.c |
-| `0051-negroni-crash-heap-strings.patch` | clean | debug/USB | core hooks not started: osfmk/kern/exception.c |
-| `0052-negroni-hfs-rename-swap.patch` | clean | storage/root | core hooks not started: bsd/vfs/kpi_vfs.c |
-| `0053-negroni-crash-scan-springboard.patch` | clean | debug/USB | core hooks not started: osfmk/kern/exception.c |
-| `0054-negroni-process-sampler.patch` | clean | debug/USB | driver part in 0006/0007; core hooks not started: iokit/Kernel/IOUserClient.cpp, osfmk/kern/exception.c |
-| `0055-negroni-aks-ext-state-sampler-depth.patch` | clean | display | driver part in 0006/0007; core hooks not started: osfmk/kern/exception.c |
-| `0056-negroni-fb-throttled-present.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0057-negroni-no-ext-resolver.patch` | clean | other | not started (config_ext_resolver off in MASTER.arm64.negroni, with the root family) |
-| `0058-negroni-hid-event-services.patch` | partial 1/33 failed | input/haptics | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0059-negroni-iphone-identity.patch` | clean | other | driver part in 0006/0007; core hooks not started: bsd/kern/kern_mib.c |
-| `0060-negroni-keys-touch-drivers.patch` | clean | input/haptics | ported as is (0006), compiles [V] |
-| `0061-negroni-iphone-x-display-size.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0062-negroni-touch-power-battery.patch` | partial 1/11 failed | power/thermal | ported as is (0006 + 0007), compiles [V] |
-| `0063-negroni-goodix-geni-packing.patch` | clean | other | ported as is (0006), compiles [V] |
-| `0064-negroni-priv-work-interval.patch` | clean | other | core hooks not started: bsd/kern/negroni_amfi.c |
-| `0065-negroni-smp-psci.patch` | partial 3/14 failed | machine | ported (0003 start.s PSCI entry, 0004 NegroniCPU) |
-| `0066-negroni-crash-fault-region.patch` | clean | debug/USB | core hooks not started: osfmk/kern/exception.c |
-| `0067-negroni-console-mute.patch` | partial 2/4 failed | debug/USB | ported (0004 console mute) |
-| `0068-negroni-surface-lookup-cached.patch` | clean | GPU/IOSurface | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0069-negroni-ufs-faster.patch` | clean | storage/root | ported as is (0006), compiles [V] |
-| `0070-negroni-pid-hibernate.patch` | partial 2/3 failed | other | core hooks not started: bsd/kern/syscalls.master, bsd/vm/vm_unix.c |
-| `0071-negroni-touch-edge.patch` | clean | input/haptics | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0072-negroni-usb-probe.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0073-negroni-usb-device-ep0.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0074-negroni-usb-vbus-override.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0075-negroni-usb-ecm.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0076-negroni-usb-rx-mbuf.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0077-negroni-usb-live-log.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0078-negroni-smp-8-cores.patch` | clean | machine | ported (0003 8 cores) |
-| `0079-negroni-display-power.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0080-negroni-net-trace.patch` | partial 1/2 failed | debug/USB | core hooks not started: bsd/net/rtsock.c, bsd/netinet/in.c |
-| `0081-negroni-usb-link-state.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0082-negroni-gicr-stride-from-adt.patch` | clean | machine | ported (0003 redistributor stride) |
-| `0083-negroni-no-physical-timer-write.patch` | clean | machine | ported (0003 no CNTP_CTL write) |
-| `0084-negroni-irq-trace.patch` | clean | machine | ported (0003 IRQ trace) |
-| `0085-negroni-kernel-thread-backtraces.patch` | clean | debug/USB | ported (0003 kernel thread backtraces) |
-| `0086-negroni-bt-short-lines.patch` | clean | Bluetooth | ported (0003) |
-| `0087-negroni-sm8450-keys.patch` | clean | input/haptics | ported as is (0006), compiles [V] |
-| `0088-negroni-framebuffer-1080x2412.patch` | clean | display | ported (0003 start.s/arm_vm_init.c/negroni_early.c, 0007 framebuffer/HID) |
-| `0089-negroni-ufs-power-no-battery.patch` | clean | storage/root | ported as is (0006 + 0007), compiles [V] |
-| `0090-negroni-ufs-sense-start-unit.patch` | clean | storage/root | ported as is (0006), compiles [V] |
-| `0091-negroni-quiet-keys-cpu-probe.patch` | clean | input/haptics | ported as is (0006 + 0007), compiles [V] |
-| `0092-negroni-ufs-wlun-active.patch` | clean | storage/root | ported as is (0006), compiles [V] |
-| `0093-negroni-s3908-touch-gpio-i2c.patch` | clean | input/haptics | ported as is (0006 + 0007), compiles [V] |
-| `0094-negroni-trace-boot-arg.patch` | clean | debug/USB | ported (0003 sleh.c negronitrace) |
-| `0095-negroni-hid-touch-log-boot-arg.patch` | clean | debug/USB | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0096-negroni-cpufreq-epss.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0097-negroni-adreno-ladder-read.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0098-negroni-cpufreq-never-lower.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0099-negroni-adreno-cx-power-clocks.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0100-negroni-gpu-status-badge.patch` | clean | GPU/IOSurface | ported as is (0006 + 0007), compiles [V] |
-| `0101-negroni-adreno-rscc-smmu-read.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0102-negroni-adreno-gmu-memory-trustzone.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0103-negroni-firmware-area.patch` | clean | other | ported as is (0006), compiles [V] |
-| `0104-negroni-adreno-zap-signature.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0105-negroni-adreno-gmu-space-firmware.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0106-negroni-wifi-survey.patch` | clean | Wi-Fi | ported as is (0006 + 0007), compiles [V] |
-| `0107-negroni-fb-shift-probe-menu.patch` | clean | display | ported as is (0006 + 0007), compiles [V] |
-| `0108-negroni-adreno-gmu-start-hfi.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0109-negroni-wifi-cmd-db-direct.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0110-negroni-adreno-hfi-messages.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0111-negroni-adreno-to-first-frame.patch` | clean | GPU/IOSurface | driver part in 0006/0007; core hooks not started: bsd/kern/kern_exec.c, bsd/kern/kern_exit.c |
-| `0112-negroni-fb-clock-shift.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0113-negroni-adreno-initial-perf-vote.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0114-negroni-fb-clock-shift-fill.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0115-negroni-adreno-zap-segments.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0116-negroni-badge-opt-in.patch` | clean | other | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0117-negroni-adreno-stop.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0118-negroni-gpu-service.patch` | partial 1/5 failed | GPU/IOSurface | ported as is (0006 + 0007), compiles [V] |
-| `0119-negroni-usb-sm8450.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0120-negroni-wifi-pcie-link.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0121-negroni-gpu-watch-panic-log.patch` | clean | debug/USB | not started |
-| `0122-negroni-gpu-service-optional.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0122-negroni-wifi-supply-votes.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0123-negroni-gpu-service-trace.patch` | clean | debug/USB | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0124-negroni-gpu-service-personality.patch` | clean | GPU/IOSurface | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0125-negroni-wifi-rails-xo-slave.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0126-negroni-pmap-sync-page-64bit.patch` | clean | machine | ported (0001, from UniXNU zzx-pmap-sync-64bit-pa) |
-| `0200-negroni-no-rtc-wait.patch` | fail 1/1 | power/thermal | reworked (0004 IOStartIOKit) |
-| `0201-negroni-empty-ioacceleratores.patch` | partial 1/3 failed | GPU/IOSurface | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0202-negroni-iokit-quiet.patch` | clean | other | not started |
-| `0203-negroni-calendar.patch` | partial 1/6 failed | power/thermal | driver part in 0006/0007; core hooks not started: bsd/kern/bsd_init.c |
-| `0204-negroni-hfs-clonefile.patch` | partial 5/6 failed | storage/root | driver part in 0006/0007; core hooks not started: bsd/negroni_hfs/core/hfs_readwrite.c |
-| `0205-negroni-accel-plugins.patch` | clean | GPU/IOSurface | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0210-negroni-usb-command-server.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0211-negroni-power-off.patch` | clean | power/thermal | ported as is (0006 + 0007), compiles [V] |
-| `0212-negroni-usb-settime.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0213-negroni-reboot-mode.patch` | clean | power/thermal | ported as is (0006 + 0007), compiles [V] |
-| `0214-negroni-pon-ps-hold-type.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0220-negroni-aks-no-passcode.patch` | clean | AKS | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0221-negroni-aks-passcode.patch` | clean | AKS | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0221-negroni-amfi-policy.patch` | partial 1/5 failed | codesign/sandbox | driver part in 0006/0007; core hooks not started: bsd/kern/negroni_amfi.c |
-| `0222-negroni-sandbox-privileges.patch` | clean | codesign/sandbox | core hooks not started: bsd/kern/negroni_amfi.c |
-| `0223-negroni-sandbox-appex-container.patch` | clean | codesign/sandbox | core hooks not started: bsd/kern/negroni_amfi.c |
-| `0230-negroni-gpu-surface-import.patch` | clean | GPU/IOSurface | ported as is (0006 + 0007), compiles [V] |
-| `0231-negroni-gpu-present.patch` | clean | GPU/IOSurface | ported as is (0006 + 0007), compiles [V] |
-| `0232-negroni-gpu-host-import.patch` | clean | GPU/IOSurface | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0233-negroni-gpu-per-client-va.patch` | clean | GPU/IOSurface | ported as is (0006 + 0007), compiles [V] |
-| `0234-negroni-fb-zero-copy.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0235-negroni-gpu-level.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0236-negroni-gpu-clock-probe.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0237-negroni-gpu-perf-table-khz.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0240-negroni-adsp-boot.patch` | clean | audio/DSP | ported as is (0006), compiles [V] |
-| `0241-negroni-adsp-pas-supported-note.patch` | clean | audio/DSP | ported as is (0006), compiles [V] |
-| `0242-negroni-adsp-glink.patch` | clean | audio/DSP | ported as is (0006), compiles [V] |
-| `0243-negroni-audio-stage-b.patch` | clean | audio/DSP | ported as is (0006), compiles [V] |
-| `0244-negroni-audio-amp-tfa9874.patch` | clean | audio/DSP | ported as is (0006 + 0007), compiles [V] |
-| `0245-negroni-audio-test-tone.patch` | clean | audio/DSP | ported as is (0006), compiles [V] |
-| `0246-negroni-audio-earpiece-route.patch` | clean | audio/DSP | ported as is (0006), compiles [V] |
-| `0247-negroni-audio-graph-mainline.patch` | clean | audio/DSP | ported as is (0006), compiles [V] |
-| `0248-negroni-adsp-crash-watch.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0249-negroni-audio-smmu-s1.patch` | partial 1/7 failed | audio/DSP | ported as is (0006), compiles [V] |
-| `0250-negroni-panel-brightness.patch` | partial 1/4 failed | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0251-negroni-display-sleep.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0252-negroni-fb-stats.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0253-negroni-fb-display-refresh.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0254-negroni-fb-present-thread.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0255-negroni-mmio-accessors.patch` | clean | machine | ported as is (0006), compiles [V] |
-| `0256-negroni-fb-clock-shift-after-gpu.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0257-negroni-iosurface-wrap-client-memory.patch` | clean | GPU/IOSurface | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0258-negroni-display-sleep-sequence.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0259-negroni-display-te-vrr.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0260-negroni-wlan-pcie-inventory.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0261-negroni-wlan-mhi-fw.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0262-negroni-wlan-power-up.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0263-negroni-wlan-stages.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0264-negroni-wlan-ipcr-rings.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0265-negroni-wlan-qrtr.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0266-negroni-wlan-qmi-wlfw.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0267-negroni-fb-vsync-after-frame-clock-copy.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0268-negroni-panel-wake-on-command.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0269-negroni-fb-double-buffer.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0270-negroni-battery-spmi-v7.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0271-negroni-battery-service.patch` | clean | power/thermal | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0272-negroni-battery-charger-input.patch` | clean | power/thermal | ported as is (0006 + 0007), compiles [V] |
-| `0273-negroni-charger-debug-arbiter.patch` | clean | power/thermal | ported as is (0006 + 0007), compiles [V] |
-| `0274-negroni-charger-glink.patch` | clean | power/thermal | ported as is (0006 + 0007), compiles [V] |
-| `0275-negroni-display-off-fast.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0276-negroni-battery-soc-source.patch` | clean | power/thermal | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0277-negroni-charger-loop.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0278-negroni-battery-persist-temp.patch` | clean | power/thermal | ported as is (0006 + 0007), compiles [V] |
-| `0280-negroni-thermal-tsens.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0281-negroni-gpu-dcvs.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0282-negroni-usb-reset-reconfigure.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0283-negroni-thermal-trips.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0284-negroni-cpufreq-governor.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0285-negroni-gpu-power-collapse.patch` | clean | GPU/IOSurface | ported as is (0006), compiles [V] |
-| `0286-negroni-gpu-dcvs-ui-floor.patch` | clean | GPU/IOSurface | ported as is (0006 + 0007), compiles [V] |
-| `0287-negroni-gpu-hang-recovery.patch` | clean | GPU/IOSurface | ported as is (0006 + 0007), compiles [V] |
-| `0288-negroni-cpu-idle-psci.patch` | clean | machine | ported (0003 negroni_cpuidle.c; RPMh hooks weak in 0004) |
-| `0289-negroni-iosurface-lock-gpu-wait.patch` | clean | GPU/IOSurface | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0290-negroni-io-submap.patch` | clean | machine | ported as is (0006), compiles [V] |
-| `0291-negroni-cpufreq-floor-lut.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0292-negroni-dsi-cmd-dma-batch.patch` | clean | display | ported as is (0006 + 0007), compiles [V] |
-| `0293-negroni-dsi-read-esd.patch` | clean | display | ported as is (0006 + 0007), compiles [V] |
-| `0294-negroni-te-rate-tearcheck.patch` | clean | display | ported as is (0006 + 0007), compiles [V] |
-| `0295-negroni-te-irq.patch` | clean | display | ported (0003 SPI dispatch) |
-| `0296-negroni-dpu-idle-power.patch` | clean | display | ported as is (0006), compiles [V] |
-| `0297-negroni-mmio-try.patch` | partial 2/5 failed | machine | reworked (0003: SEA FnV case next to the 12377 expected-fault PC match) |
-| `0298-negroni-gpu-kgsl-parity.patch` | clean | GPU/IOSurface | ported as is (0006 + 0007), compiles [V] |
-| `0300-negroni-haptic-direct-play.patch` | clean | input/haptics | ported as is (0006), compiles [V] |
-| `0301-negroni-vibrator-service.patch` | partial 1/3 failed | input/haptics | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0302-negroni-haptic-ui-actuator.patch` | clean | input/haptics | ported as is (0006 + 0007), compiles [V] |
-| `0303-negroni-haptic-brake-hboost-wait.patch` | clean | input/haptics | ported as is (0006), compiles [V] |
-| `0310-negroni-cam-camcc-cci.patch` | clean | camera | ported as is (0006), compiles [V] |
-| `0311-negroni-cam-imx789-chip-id.patch` | clean | camera | ported as is (0006), compiles [V] |
-| `0312-negroni-cam-cpas-smmu-votes.patch` | clean | camera | ported as is (0006), compiles [V] |
-| `0313-negroni-cam-clocks-csiphy.patch` | clean | camera | ported as is (0006), compiles [V] |
-| `0314-negroni-cam-imx789-stream.patch` | clean | camera | ported as is (0006), compiles [V] |
-| `0315-negroni-cam-csid-ife-rdi.patch` | clean | camera | ported as is (0006), compiles [V] |
-| `0316-negroni-cam-icp-pas-hfi.patch` | clean | camera | ported as is (0006), compiles [V] |
-| `0317-negroni-cam-smmu-s1.patch` | clean | camera | ported as is (0006), compiles [V] |
-| `0318-negroni-cam-ios-stream.patch` | clean | camera | ported as is (0006), compiles [V] |
-| `0320-negroni-wlan-cfg-mode.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0321-negroni-wlan-ce.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0322-negroni-wlan-htc-wmi.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0323-negroni-wlan-scan.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0324-negroni-wlan-smmu.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0325-negroni-wlan-smmu3-default.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0326-negroni-wlan-api.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0327-negroni-wlan-join-open.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0328-negroni-wlan-htt-dp.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0329-negroni-wlan-wpa2-psk.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0330-negroni-bt-uart-power.patch` | clean | Bluetooth | ported as is (0006), compiles [V] |
-| `0331-negroni-bt-hci.patch` | clean | Bluetooth | ported as is (0006), compiles [V] |
-| `0332-negroni-bt-h4-transport.patch` | clean | Bluetooth | ported as is (0006), compiles [V] |
-| `0333-negroni-bt-hci-shim.patch` | clean | Bluetooth | ported as is (0006), compiles [V] |
-| `0334-negroni-bt-qup-clocks.patch` | clean | Bluetooth | ported as is (0006), compiles [V] |
-| `0335-negroni-bt-power-follows-client.patch` | clean | Bluetooth | ported as is (0006), compiles [V] |
-| `0336-negroni-bt-init-fixes.patch` | clean | Bluetooth | ported as is (0006), compiles [V] |
-| `0337-negroni-bt-vendor-answers.patch` | clean | Bluetooth | ported as is (0006), compiles [V] |
-| `0338-negroni-bt-le-legacy-to-extended.patch` | clean | Bluetooth | ported as is (0006), compiles [V] |
-| `0339-negroni-wlan-sbl-boot-dump.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0340-negroni-wlan-ios-iface.patch` | partial 2/7 failed | Wi-Fi | ported as is (0006 + 0007), compiles [V] |
-| `0341-negroni-apple80211.patch` | partial 1/2 failed | Wi-Fi | ported as is (0006), compiles [V] |
-| `0342-negroni-wlan-ath11k-sw-reset.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0343-negroni-wlan-boot-dump-pcie.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0344-negroni-wlan-msi-mailbox.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0345-negroni-apple80211-scan-join.patch` | clean | Wi-Fi | ported as is (0006), compiles [V] |
-| `0350-negroni-fingerprint-stage-a.patch` | clean | input/haptics | ported as is (0006), compiles [V] |
-| `0351-negroni-fingerprint-highlight.patch` | clean | input/haptics | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0352-negroni-fingerprint-mcu-frames.patch` | clean | input/haptics | ported as is (0006), compiles [V] |
-| `0353-negroni-fingerprint-capture.patch` | clean | input/haptics | ported as is (0006 + 0007), compiles [V] |
-| `0354-negroni-fp-qup-clocks-highlight.patch` | clean | input/haptics | ported as is (0006 + 0007), compiles [V] |
-| `0360-negroni-panic-usb.patch` | clean | debug/USB | ported (0004 debug.c) |
-| `0361-negroni-usb-throughput.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0362-negroni-kmem-report.patch` | partial 3/8 failed | debug/USB | core hooks not started: bsd/kern/bsd_init.c, bsd/negroni_hfs/core/hfs_journal.c, osfmk/kern/kalloc.c, osfmk/vm/vm_kern.c |
-| `0363-negroni-boot-line-1024.patch` | fail 1/1 | other | obsolete: 12377 BOOT_LINE_LENGTH is 1024 |
-| `0364-negroni-fb-timing-modes.patch` | clean | display | ported as is (0007), compile level [V]; user-client ABI not re-traced |
-| `0365-negroni-battery-charging-ui.patch` | clean | power/thermal | ported as is (0006 + 0007), compiles [V] |
-| `0366-negroni-usb-reconnect.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0367-negroni-bootlog.patch` | clean | debug/USB | ported (0004 debug.c hook; bootlog in negroni_ufs.c not yet) |
-| `0368-negroni-usb-adsp-phy.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0369-negroni-charger-vooc.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0370-negroni-charger-write-bisect.patch` | clean | display | ported as is (0006), compiles [V] |
-| `0371-negroni-usb-lost-reboot.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0372-negroni-usb-phy-rails.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0373-negroni-charger-ulog.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0374-negroni-typec-sink.patch` | clean | power/thermal | ported as is (0006), compiles [V] |
-| `0375-negroni-usb-idle-reboot.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0376-negroni-slpi-start.patch` | clean | audio/DSP | ported as is (0006), compiles [V] |
-| `0377-negroni-charge-mode.patch` | partial 1/17 failed | power/thermal | driver part in 0006/0007; core hooks not started: bsd/kern/kern_exec.c |
-| `0378-negroni-bootargs-truncate.patch` | clean | other | obsolete with 0363 [I] (check the truncation code) |
-| `0379-negroni-smmu-s1-readback-fields.patch` | clean | other | ported as is (0006), compiles [V] |
-| `0381-negroni-usb-datafix.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
-| `0382-negroni-power-idle.patch` | clean | power/thermal | ported (0004 negroni_top.c, 0003 cpuidle) |
-| `0383-negroni-cpuidle-cluster-rpmh-sleep.patch` | clean | machine | ported (0003 cpuidle part); negroni_rpmh.c not started |
-| `0384-negroni-gpu-governor-irq.patch` | clean | machine | ported as is (0006 + 0007), compiles [V] |
-| `0385-negroni-usb-phy-gate.patch` | clean | debug/USB | ported as is (0006), compiles [V] |
+Result: series: 154 applied, 96 applied+rules, 0 replaced, 39 skipped, 0 errors
+
+| Patch | 12377 result | Rules / reason |
+|---|---|---|
+| `0001-non-apple-soc-base.patch` | base |  |
+| `0002-negroni-machine-config.patch` | base |  |
+| `0003-negroni-machine-layer.patch` | base |  |
+| `0004-negroni-platform-console.patch` | base |  |
+| `0005-negroni-native-pac.patch` | base |  |
+| `0019-stage-libpthread.sh` | skipped | open: libpthread-514 is the xnu-8796 pair; 12377 needs libpthread-539 and its callback ABI |
+| `0020-stage-bearssl.sh` | ran |  |
+| `0026-stage-hfs.sh` | skipped | open: hfs-627 is the xnu-8796 pair; the hfs tag of macos-265 must be staged |
+| `0001-new-clang-drop-removed-auto-var-init-flag.patch` | skipped | upstream: 12377 makedefs no longer pass the removed auto-var-init flag |
+| `0002-new-clang-backport-UIO_STACKBUF.patch` | skipped | not needed: 12377 + dxb 26.0 build with Xcode 27.1 without it |
+| `0003-negroni-framebuffer-serial-console.patch` | skipped | in 12377 base 0003/0004 (pe_serial.c fbcon outside PL011_UART, protos.h) |
+| `0004-negroni-machine-config.patch` | skipped | in 12377 base 0002/0003 (machine config, GIC, start.s, sleh.c, pe_fiq.c) |
+| `0005-non-pac-build-fixes.patch` | skipped | not needed: 12377 base 0005 builds PAC natively (stage 2) or plain arm64 (stage 1) |
+| `0006-negroni-master-config-open-source-asm-pmap.patch` | skipped | in 12377 base 0002 (MASTER.arm64.negroni from the 12377 MacOSX master) |
+| `0007-negroni-stub-apple-internal-headers.patch` | skipped | not needed: 12377 + base 0001 (UniXNU) build without the stub headers; 12377 task.c has no t_kpc |
+| `0008-negroni-fill-closed-lib-gaps-kpc-stub.patch` | skipped | in 12377 base 0001 (machine_routines_nos.c; 12377 has kpc.c, amcc via apple_amcc) |
+| `0009-negroni-drop-apple-soc-only-exports.patch` | skipped | in 12377 base 0002 (12377 export lists) |
+| `0010-negroni-early-framebuffer-debug.patch` | skipped | in 12377 base 0003 (start.s band, negroni_early.c, arm_vm_init.c) |
+| `0011-negroni-physmap-alignment-padding.patch` | skipped | in 12377 base 0003 (arm_vm_init.c) |
+| `0012-negroni-keep-debug-console-after-ttbr0.patch` | skipped | in 12377 base 0003/0004 (negroni_early.c, pe_serial.c) |
+| `0013-negroni-kmem-rng-without-corecrypto.patch` | skipped | open: 12377 crypto init differs (corecrypto KPI v14); port UniXNU source corecrypto instead |
+| `0014-negroni-kernel-hmac-prng.patch` | skipped | open: same as 0013 (12377 entropy.c/prng_random.c) |
+| `0015-negroni-unavailable-trust-cache-runtime.patch` | applied+rules(1) | sub |
+| `0016-negroni-device-tree-platform-expert.patch` | skipped | in 12377 base 0004 (NegroniPlatformExpert) |
+| `0017-negroni-device-tree-virtual-timer-irq.patch` | skipped | in 12377 base 0003 (pe_fiq.c vtimer INTID from the ADT) |
+| `0018-negroni-boot-cpu-driver.patch` | skipped | in 12377 base 0004 (NegroniCPU) |
+| `0019-negroni-builtin-pthread.patch` | skipped | open: needs the 12377 pthread stage (see 0019-stage-libpthread.sh) |
+| `0020-negroni-portable-aes-cbc.patch` | applied+rules(1) | glue |
+| `0021-negroni-mockfs-ramdisk-root.patch` | applied+rules(1) | base 0004 |
+| `0022-negroni-ramdisk-root-without-iomedia.patch` | skipped | in 12377 base 0004 (IOService.cpp) |
+| `0023-negroni-builtin-sha256-for-libkern.patch` | applied |  |
+| `0024-negroni-mockfs-virtual-ramdisk-io.patch` | applied |  |
+| `0025-negroni-builtin-amfi-no-entitlements.patch` | applied+rules(1) | glue |
+| `0026-negroni-builtin-hfs.patch` | skipped | open: needs the 12377 HFS stage (see 0026-stage-hfs.sh) |
+| `0027-negroni-bearssl-md5.patch` | applied+rules(1) | glue |
+| `0028-negroni-ufs-root-device.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0029-negroni-unsealed-root-volume.patch` | applied |  |
+| `0030-negroni-ufs-writes.patch` | applied |  |
+| `0031-negroni-read-write-root.patch` | applied+rules(1) | drop_file |
+| `0032-negroni-bearssl-sha1.patch` | applied+rules(1) | glue |
+| `0033-negroni-bearssl-sha384-sha512.patch` | applied+rules(1) | glue |
+| `0034-negroni-ufs-dma-above-4g.patch` | applied |  |
+| `0035-negroni-amfi-entitlements-platform-binaries.patch` | applied+rules(2) | glue, sub |
+| `0036-negroni-amfi-cs-signed.patch` | applied |  |
+| `0037-negroni-config-bindfs.patch` | applied+rules(1) | sub |
+| `0038-negroni-applekeystore.patch` | applied+rules(1) | glue |
+| `0039-negroni-coredump-default-off.patch` | applied+rules(1) | sub |
+| `0040-negroni-iowatchdog.patch` | applied+rules(1) | glue |
+| `0041-negroni-hfs-link-notes.patch` | skipped | open: HFS only (bsd/negroni_hfs); waits for the 12377 HFS stage |
+| `0042-negroni-short-exec-log.patch` | applied |  |
+| `0043-negroni-console-crash-log.patch` | applied+rules(3) | insert_after, sub |
+| `0044-negroni-crash-log-reason.patch` | applied |  |
+| `0045-negroni-iowatchdog-pmu-primary.patch` | applied |  |
+| `0046-negroni-iosurface-iomfb.patch` | applied+rules(2) | base 0004, glue |
+| `0047-negroni-persistent-console-log.patch` | applied+rules(1) | base 0004 |
+| `0048-negroni-devnull-tee.patch` | applied |  |
+| `0049-negroni-iokit-trace.patch` | applied |  |
+| `0050-negroni-sandbox-policy.patch` | applied |  |
+| `0051-negroni-crash-heap-strings.patch` | applied |  |
+| `0052-negroni-hfs-rename-swap.patch` | applied |  |
+| `0053-negroni-crash-scan-springboard.patch` | applied |  |
+| `0054-negroni-process-sampler.patch` | applied+rules(1) | glue |
+| `0055-negroni-aks-ext-state-sampler-depth.patch` | applied |  |
+| `0056-negroni-fb-throttled-present.patch` | applied |  |
+| `0057-negroni-no-ext-resolver.patch` | applied+rules(1) | sub |
+| `0058-negroni-hid-event-services.patch` | applied+rules(1) | glue |
+| `0059-negroni-iphone-identity.patch` | applied+rules(1) | base 0004 |
+| `0060-negroni-keys-touch-drivers.patch` | applied+rules(1) | glue |
+| `0061-negroni-iphone-x-display-size.patch` | applied |  |
+| `0062-negroni-touch-power-battery.patch` | applied+rules(1) | glue |
+| `0063-negroni-goodix-geni-packing.patch` | applied |  |
+| `0064-negroni-priv-work-interval.patch` | applied |  |
+| `0065-negroni-smp-psci.patch` | skipped | in 12377 base 0003/0004 (start.s PSCI entry, NegroniCPU) |
+| `0066-negroni-crash-fault-region.patch` | skipped | open: 12377 VM map uses range locks (no vm_map_lock_read/vm_map_lookup_entry); the fault-region crash line needs a rewrite |
+| `0067-negroni-console-mute.patch` | applied+rules(1) | base 0004 |
+| `0068-negroni-surface-lookup-cached.patch` | applied |  |
+| `0069-negroni-ufs-faster.patch` | applied |  |
+| `0070-negroni-pid-hibernate.patch` | applied+rules(2) | rename_file, sub |
+| `0071-negroni-touch-edge.patch` | applied |  |
+| `0072-negroni-usb-probe.patch` | applied+rules(1) | glue |
+| `0073-negroni-usb-device-ep0.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0074-negroni-usb-vbus-override.patch` | applied |  |
+| `0075-negroni-usb-ecm.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0076-negroni-usb-rx-mbuf.patch` | applied |  |
+| `0077-negroni-usb-live-log.patch` | applied |  |
+| `0078-negroni-smp-8-cores.patch` | skipped | in 12377 base 0003/0004 (8 cores) |
+| `0079-negroni-display-power.patch` | applied |  |
+| `0080-negroni-net-trace.patch` | applied+rules(1) | sub |
+| `0081-negroni-usb-link-state.patch` | applied |  |
+| `0082-negroni-gicr-stride-from-adt.patch` | skipped | in 12377 base 0003 (pe_fiq.c) |
+| `0083-negroni-no-physical-timer-write.patch` | skipped | in 12377 base 0003 (machine_routines.c) |
+| `0084-negroni-irq-trace.patch` | skipped | in 12377 base 0003 (sleh.c) |
+| `0085-negroni-kernel-thread-backtraces.patch` | skipped | in 12377 base 0003 (sleh.c) |
+| `0086-negroni-bt-short-lines.patch` | skipped | in 12377 base 0003 (sleh.c) |
+| `0087-negroni-sm8450-keys.patch` | applied |  |
+| `0088-negroni-framebuffer-1080x2412.patch` | applied+rules(3) | base 0003 |
+| `0089-negroni-ufs-power-no-battery.patch` | applied |  |
+| `0090-negroni-ufs-sense-start-unit.patch` | applied |  |
+| `0091-negroni-quiet-keys-cpu-probe.patch` | applied+rules(1) | base 0004 |
+| `0092-negroni-ufs-wlun-active.patch` | applied |  |
+| `0093-negroni-s3908-touch-gpio-i2c.patch` | applied |  |
+| `0094-negroni-trace-boot-arg.patch` | skipped | in 12377 base 0003 (sleh.c) |
+| `0095-negroni-hid-touch-log-boot-arg.patch` | applied |  |
+| `0096-negroni-cpufreq-epss.patch` | applied+rules(1) | glue |
+| `0097-negroni-adreno-ladder-read.patch` | applied+rules(1) | glue |
+| `0098-negroni-cpufreq-never-lower.patch` | applied |  |
+| `0099-negroni-adreno-cx-power-clocks.patch` | applied |  |
+| `0100-negroni-gpu-status-badge.patch` | applied |  |
+| `0101-negroni-adreno-rscc-smmu-read.patch` | applied |  |
+| `0102-negroni-adreno-gmu-memory-trustzone.patch` | applied |  |
+| `0103-negroni-firmware-area.patch` | applied |  |
+| `0104-negroni-adreno-zap-signature.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0105-negroni-adreno-gmu-space-firmware.patch` | applied |  |
+| `0106-negroni-wifi-survey.patch` | applied+rules(1) | glue |
+| `0107-negroni-fb-shift-probe-menu.patch` | applied |  |
+| `0108-negroni-adreno-gmu-start-hfi.patch` | applied |  |
+| `0109-negroni-wifi-cmd-db-direct.patch` | applied |  |
+| `0110-negroni-adreno-hfi-messages.patch` | applied |  |
+| `0111-negroni-adreno-to-first-frame.patch` | applied+rules(1) | sub |
+| `0112-negroni-fb-clock-shift.patch` | applied |  |
+| `0113-negroni-adreno-initial-perf-vote.patch` | applied |  |
+| `0114-negroni-fb-clock-shift-fill.patch` | applied |  |
+| `0115-negroni-adreno-zap-segments.patch` | applied |  |
+| `0116-negroni-badge-opt-in.patch` | applied |  |
+| `0117-negroni-adreno-stop.patch` | applied |  |
+| `0118-negroni-gpu-service.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0119-negroni-usb-sm8450.patch` | applied |  |
+| `0120-negroni-wifi-pcie-link.patch` | applied |  |
+| `0121-negroni-gpu-watch-panic-log.patch` | applied+rules(2) | base 0003, vm_kern_xnu.h |
+| `0122-negroni-gpu-service-optional.patch` | applied |  |
+| `0122-negroni-wifi-supply-votes.patch` | applied |  |
+| `0123-negroni-gpu-service-trace.patch` | applied |  |
+| `0124-negroni-gpu-service-personality.patch` | applied |  |
+| `0125-negroni-wifi-rails-xo-slave.patch` | applied |  |
+| `0126-negroni-pmap-sync-page-64bit.patch` | skipped | in 12377 base 0001 (UniXNU pmap sync 64-bit PA) |
+| `0200-negroni-no-rtc-wait.patch` | skipped | in 12377 base 0004 (IOStartIOKit.cpp) |
+| `0201-negroni-empty-ioacceleratores.patch` | applied+rules(1) | glue |
+| `0202-negroni-iokit-quiet.patch` | skipped | in 12377 base 0004 (IOService.cpp, IOStartIOKit.cpp) |
+| `0203-negroni-calendar.patch` | applied+rules(3) | base 0004, glue |
+| `0204-negroni-hfs-clonefile.patch` | skipped | open: HFS only (bsd/negroni_hfs); waits for the 12377 HFS stage |
+| `0205-negroni-accel-plugins.patch` | applied |  |
+| `0210-negroni-usb-command-server.patch` | applied+rules(1) | glue |
+| `0211-negroni-power-off.patch` | applied+rules(1) | base 0004 |
+| `0212-negroni-usb-settime.patch` | applied |  |
+| `0213-negroni-reboot-mode.patch` | applied+rules(1) | base 0004 |
+| `0214-negroni-pon-ps-hold-type.patch` | applied |  |
+| `0220-negroni-aks-no-passcode.patch` | applied |  |
+| `0221-negroni-aks-passcode.patch` | applied |  |
+| `0221-negroni-amfi-policy.patch` | applied+rules(1) | glue |
+| `0222-negroni-sandbox-privileges.patch` | applied |  |
+| `0223-negroni-sandbox-appex-container.patch` | applied |  |
+| `0230-negroni-gpu-surface-import.patch` | applied |  |
+| `0231-negroni-gpu-present.patch` | applied+rules(1) | glue |
+| `0232-negroni-gpu-host-import.patch` | applied |  |
+| `0233-negroni-gpu-per-client-va.patch` | applied |  |
+| `0234-negroni-fb-zero-copy.patch` | applied+rules(1) | base 0004 |
+| `0235-negroni-gpu-level.patch` | applied |  |
+| `0236-negroni-gpu-clock-probe.patch` | applied |  |
+| `0237-negroni-gpu-perf-table-khz.patch` | applied |  |
+| `0240-negroni-adsp-boot.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0241-negroni-adsp-pas-supported-note.patch` | applied |  |
+| `0242-negroni-adsp-glink.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0243-negroni-audio-stage-b.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0244-negroni-audio-amp-tfa9874.patch` | applied+rules(3) | base 0004, glue, vm_kern_xnu.h |
+| `0245-negroni-audio-test-tone.patch` | applied |  |
+| `0246-negroni-audio-earpiece-route.patch` | applied |  |
+| `0247-negroni-audio-graph-mainline.patch` | applied |  |
+| `0248-negroni-adsp-crash-watch.patch` | applied |  |
+| `0249-negroni-audio-smmu-s1.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0250-negroni-panel-brightness.patch` | applied+rules(1) | glue |
+| `0251-negroni-display-sleep.patch` | applied |  |
+| `0252-negroni-fb-stats.patch` | applied |  |
+| `0253-negroni-fb-display-refresh.patch` | applied |  |
+| `0254-negroni-fb-present-thread.patch` | applied |  |
+| `0255-negroni-mmio-accessors.patch` | applied |  |
+| `0256-negroni-fb-clock-shift-after-gpu.patch` | applied |  |
+| `0257-negroni-iosurface-wrap-client-memory.patch` | applied |  |
+| `0258-negroni-display-sleep-sequence.patch` | applied |  |
+| `0259-negroni-display-te-vrr.patch` | applied |  |
+| `0260-negroni-wlan-pcie-inventory.patch` | applied |  |
+| `0261-negroni-wlan-mhi-fw.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0262-negroni-wlan-power-up.patch` | applied |  |
+| `0263-negroni-wlan-stages.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0264-negroni-wlan-ipcr-rings.patch` | applied |  |
+| `0265-negroni-wlan-qrtr.patch` | applied+rules(1) | glue |
+| `0266-negroni-wlan-qmi-wlfw.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0267-negroni-fb-vsync-after-frame-clock-copy.patch` | applied |  |
+| `0268-negroni-panel-wake-on-command.patch` | applied |  |
+| `0269-negroni-fb-double-buffer.patch` | applied |  |
+| `0270-negroni-battery-spmi-v7.patch` | applied |  |
+| `0271-negroni-battery-service.patch` | applied |  |
+| `0272-negroni-battery-charger-input.patch` | applied |  |
+| `0273-negroni-charger-debug-arbiter.patch` | applied |  |
+| `0274-negroni-charger-glink.patch` | applied+rules(1) | glue |
+| `0275-negroni-display-off-fast.patch` | applied |  |
+| `0276-negroni-battery-soc-source.patch` | applied |  |
+| `0277-negroni-charger-loop.patch` | applied |  |
+| `0278-negroni-battery-persist-temp.patch` | applied+rules(1) | glue |
+| `0280-negroni-thermal-tsens.patch` | applied+rules(1) | glue |
+| `0281-negroni-gpu-dcvs.patch` | applied |  |
+| `0282-negroni-usb-reset-reconfigure.patch` | applied |  |
+| `0283-negroni-thermal-trips.patch` | applied |  |
+| `0284-negroni-cpufreq-governor.patch` | applied |  |
+| `0285-negroni-gpu-power-collapse.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0286-negroni-gpu-dcvs-ui-floor.patch` | applied |  |
+| `0287-negroni-gpu-hang-recovery.patch` | applied |  |
+| `0288-negroni-cpu-idle-psci.patch` | skipped | in 12377 base 0003 (negroni_cpuidle.c, cpu.c, sleh.c, pe_fiq.c) |
+| `0289-negroni-iosurface-lock-gpu-wait.patch` | applied |  |
+| `0290-negroni-io-submap.patch` | applied |  |
+| `0291-negroni-cpufreq-floor-lut.patch` | applied |  |
+| `0292-negroni-dsi-cmd-dma-batch.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0293-negroni-dsi-read-esd.patch` | applied |  |
+| `0294-negroni-te-rate-tearcheck.patch` | applied+rules(1) | glue |
+| `0295-negroni-te-irq.patch` | applied+rules(2) | base 0003 |
+| `0296-negroni-dpu-idle-power.patch` | applied |  |
+| `0297-negroni-mmio-try.patch` | applied+rules(1) | base 0003 |
+| `0298-negroni-gpu-kgsl-parity.patch` | applied |  |
+| `0300-negroni-haptic-direct-play.patch` | applied+rules(1) | glue |
+| `0301-negroni-vibrator-service.patch` | applied+rules(1) | glue |
+| `0302-negroni-haptic-ui-actuator.patch` | applied+rules(1) | glue |
+| `0303-negroni-haptic-brake-hboost-wait.patch` | applied |  |
+| `0310-negroni-cam-camcc-cci.patch` | applied+rules(1) | glue |
+| `0311-negroni-cam-imx789-chip-id.patch` | applied |  |
+| `0312-negroni-cam-cpas-smmu-votes.patch` | applied |  |
+| `0313-negroni-cam-clocks-csiphy.patch` | applied |  |
+| `0314-negroni-cam-imx789-stream.patch` | applied |  |
+| `0315-negroni-cam-csid-ife-rdi.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0316-negroni-cam-icp-pas-hfi.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0317-negroni-cam-smmu-s1.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0318-negroni-cam-ios-stream.patch` | applied |  |
+| `0320-negroni-wlan-cfg-mode.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0321-negroni-wlan-ce.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0322-negroni-wlan-htc-wmi.patch` | applied+rules(1) | glue |
+| `0323-negroni-wlan-scan.patch` | applied |  |
+| `0324-negroni-wlan-smmu.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0325-negroni-wlan-smmu3-default.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0326-negroni-wlan-api.patch` | applied+rules(1) | glue |
+| `0327-negroni-wlan-join-open.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0328-negroni-wlan-htt-dp.patch` | applied |  |
+| `0329-negroni-wlan-wpa2-psk.patch` | applied+rules(1) | glue |
+| `0330-negroni-bt-uart-power.patch` | applied+rules(1) | glue |
+| `0331-negroni-bt-hci.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0332-negroni-bt-h4-transport.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0333-negroni-bt-hci-shim.patch` | applied |  |
+| `0334-negroni-bt-qup-clocks.patch` | applied |  |
+| `0335-negroni-bt-power-follows-client.patch` | applied |  |
+| `0336-negroni-bt-init-fixes.patch` | applied |  |
+| `0337-negroni-bt-vendor-answers.patch` | applied |  |
+| `0338-negroni-bt-le-legacy-to-extended.patch` | applied |  |
+| `0339-negroni-wlan-sbl-boot-dump.patch` | applied |  |
+| `0340-negroni-wlan-ios-iface.patch` | applied+rules(1) | glue |
+| `0341-negroni-apple80211.patch` | applied+rules(1) | glue |
+| `0342-negroni-wlan-ath11k-sw-reset.patch` | applied |  |
+| `0343-negroni-wlan-boot-dump-pcie.patch` | applied |  |
+| `0344-negroni-wlan-msi-mailbox.patch` | applied |  |
+| `0345-negroni-apple80211-scan-join.patch` | applied |  |
+| `0347-negroni-awdl.patch` | applied+rules(1) | glue |
+| `0350-negroni-fingerprint-stage-a.patch` | applied+rules(1) | glue |
+| `0351-negroni-fingerprint-highlight.patch` | applied |  |
+| `0352-negroni-fingerprint-mcu-frames.patch` | applied |  |
+| `0353-negroni-fingerprint-capture.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0354-negroni-fp-qup-clocks-highlight.patch` | applied+rules(1) | vm_kern_xnu.h |
+| `0360-negroni-panic-usb.patch` | applied+rules(1) | base 0004 |
+| `0361-negroni-usb-throughput.patch` | applied |  |
+| `0362-negroni-kmem-report.patch` | skipped | open: 12377 kmem ranges differ (no kmem_large_ranges/sprayqtn split; kalloc_large reworked); the KMEM report needs a rewrite |
+| `0363-negroni-boot-line-1024.patch` | skipped | not needed: 12377 BOOT_LINE_LENGTH is already 1024 |
+| `0364-negroni-fb-timing-modes.patch` | applied |  |
+| `0365-negroni-battery-charging-ui.patch` | applied |  |
+| `0366-negroni-usb-reconnect.patch` | applied |  |
+| `0367-negroni-bootlog.patch` | applied+rules(1) | base 0004 |
+| `0368-negroni-usb-adsp-phy.patch` | applied |  |
+| `0369-negroni-charger-vooc.patch` | applied |  |
+| `0370-negroni-charger-write-bisect.patch` | applied |  |
+| `0371-negroni-usb-lost-reboot.patch` | applied |  |
+| `0372-negroni-usb-phy-rails.patch` | applied |  |
+| `0373-negroni-charger-ulog.patch` | applied |  |
+| `0374-negroni-typec-sink.patch` | applied |  |
+| `0375-negroni-usb-idle-reboot.patch` | applied |  |
+| `0376-negroni-slpi-start.patch` | applied+rules(2) | glue, vm_kern_xnu.h |
+| `0377-negroni-charge-mode.patch` | applied+rules(2) | glue, sub |
+| `0378-negroni-bootargs-truncate.patch` | applied |  |
+| `0379-negroni-smmu-s1-readback-fields.patch` | applied |  |
+| `0381-negroni-usb-datafix.patch` | applied |  |
+| `0382-negroni-power-idle.patch` | applied+rules(3) | base 0003, base 0004 |
+| `0383-negroni-cpuidle-cluster-rpmh-sleep.patch` | applied+rules(1) | base 0003 |
+| `0384-negroni-gpu-governor-irq.patch` | applied |  |
+| `0385-negroni-usb-phy-gate.patch` | applied |  |
+| `0386-negroni-sandbox-extensions.patch` | applied |  |
+| `0387-negroni-flash-torch.patch` | applied+rules(2) | base 0004, glue |
+| `0388-negroni-fb-display-pipe-dicts.patch` | applied |  |
+| `0389-negroni-gpu-frame-pace.patch` | applied |  |
+| `0390-negroni-iosurface-plane-bpr.patch` | applied |  |
+| `0391-negroni-fb-clock-band.patch` | applied |  |
+| `0395-negroni-cpuperf.patch` | applied+rules(2) | glue, port |
+| `0396-negroni-wlan-scan-joined.patch` | applied |  |
 
 ## 7. PAC / arm64e plan
 
@@ -458,12 +465,12 @@ iOS 16 root stays on userdata (section "Boot plan").
 ## 10. Next steps
 
 1. Boot-image wrapper (`KERNEL=` override for `scripts/ios16/build.sh` into `out/ios26-t1`) for test T1.
-2. USB live log is in 0006 already (negroni_usb.c); check its 12377 net KPIs at T2 (`negroni_usb.c` family, slop 0072-0077, 0119, ours 0282, 0361, 0366, 0368, 0371-0375, 0381, 0385) so
-   the first phone test (T1, RAM boot) gives a log.
-3. Stage 2 compile (`ARCH_STRING=arm64e scripts/ios26/build-kernel.sh`).
-4. Crypto + pthread from UniXNU-ios26; UFS + HFS (with the HFS tag of macOS 26.5).
+2. First phone test (T1, RAM boot) with the USB live log (`negroni_usb.c`, now from the series as on iOS 16).
+3. Stage 2 compile with the full series (`ARCH_STRING=arm64e scripts/ios26/build-kernel.sh`).
+4. The 10 open skips: crypto 0013/0014 and pthread 0019 from UniXNU-ios26; HFS with the HFS tag of macOS 26.5;
+   0066/0362 diagnostics for the 12377 VM.
 5. AMFI with a CoreEntitlements V2 table.
-6. Drivers family by family (ports as is), then the user-client ABI families with the 23F84 shared cache.
+6. User-client ABI families against the 23F84 shared cache.
 
 ## Licenses
 
