@@ -1136,23 +1136,16 @@ index 0000000..f84734a
 +}
 +#endif /* NEGRONI */
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index 032d9e0..9c263dc 100644
+index 032d9e0..a902c3b 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -26,6 +26,7 @@
+@@ -26,8 +26,151 @@
  #include <pexpert/arm/consistent_debug.h>
  #include <pexpert/arm64/board_config.h>
  #include <arm64/proc_reg.h>
 +#include <arm64/negroni_early.h>
  #include <pexpert/arm/protos.h>
  #include <kern/sched_prim.h>
- #ifdef PL011_UART
-@@ -697,6 +698,150 @@ pl011_uart_init(void)
- 	pl011_registers->uartcr.raw = uartcr.raw;
- }
- 
-+/*****************************************************************************/
-+
 +/*
 + * negroni: framebuffer "serial" for boards with no usable UART (the OnePlus
 + * 10 Pro's debug UART engine runs in SPI mode). kprintf output is drawn onto
@@ -1295,10 +1288,20 @@ index 032d9e0..9c263dc 100644
 +	}
 +}
 +
+ #ifdef PL011_UART
+ #include <pexpert/arm/pl011.h>
+ #endif /* PL011_UART */
+@@ -697,6 +840,9 @@ pl011_uart_init(void)
+ 	pl011_registers->uartcr.raw = uartcr.raw;
+ }
+ 
++/*****************************************************************************/
++
++
  SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) pl011_uart_serial_functions =
  {
  	.init = pl011_uart_init,
-@@ -908,6 +1053,9 @@ serial_init(void)
+@@ -908,6 +1054,9 @@ serial_init(void)
  
  	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
  

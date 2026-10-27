@@ -1,0 +1,113 @@
+From: iOSPlus10 ios26 port
+Subject: [PATCH 0005] NEGRONI stage 2: arm64e kernel with natively written PAC keys (off by default)
+
+Replaces slop 0005 (non-pac-build-fixes) for the iOS 26 port. Active only with NEGRONI_ARM64E=1
+(scripts/ios26/build-kernel.sh ARCH_STRING=arm64e); the default stage-1 kernel is plain arm64 and does not
+compile any of this.
+- NEGRONI.h: CPU_HAS_APPLE_PAC + HAS_NATIVE_ARM_PAC; HAS_APPLE_PAC when compiled as arm64e (the same rule as
+  apple_arm64_common.h), so cpuid reports CPU_ARCH_ARMv8E, cpu_subtype = CPU_SUBTYPE_ARM64E, ml_grade_binary
+  accepts arm64e binaries, SCTLR_EL1_DEFAULT sets EnIA/EnIB/EnDA/EnDB.
+- pac_asm.h PAC_INIT_KEY_STATE: HAS_NATIVE_ARM_PAC writes APIA/APIB/APDA/APDB/APGA Key{Lo,Hi}_EL1 directly
+  (VMAPPLE uses hvc). One global key set for EL0 and EL1 (SET_JOP/ROP_KEY_REGISTERS stay empty, as on every
+  non-paravirtual open-source config). Seed: CNTVCT_EL0 of the boot CPU, stored with the MMU off in
+  negroni_pac_seed; secondaries load the same keys.
+Open points (docs/ios26-port-status.md, PAC section): Gunyah must not trap the key registers (Android shows
+paca/pacg, so EL1 access works [I]); per-process B keys; the shared-region slide of auth rebases (slide info v5).
+
+diff --git a/osfmk/arm64/negroni_weak_hooks.c b/osfmk/arm64/negroni_weak_hooks.c
+index a806c58..5cc03ea 100644
+--- a/osfmk/arm64/negroni_weak_hooks.c
++++ b/osfmk/arm64/negroni_weak_hooks.c
+@@ -30,3 +30,8 @@ NEGRONI_WEAK int negroni_display_asleep;
+ /* bsd/dev/negroni_rtc.c: no RTC = the epoch */
+ NEGRONI_WEAK void negroni_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs) { *secs = 0; *nsecs = 0; }
+ NEGRONI_WEAK void negroni_rtc_set(clock_sec_t secs __unused, clock_nsec_t nsecs __unused) {}
++
++#if defined(NEGRONI_ARM64E) && NEGRONI_ARM64E
++/* PAC key seed (osfmk/arm64/pac_asm.h PAC_INIT_KEY_STATE): written by the boot CPU before its MMU is on. */
++__attribute__((aligned(64))) uint64_t negroni_pac_seed;
++#endif
+diff --git a/osfmk/arm64/pac_asm.h b/osfmk/arm64/pac_asm.h
+index d211433..e2f87bf 100644
+--- a/osfmk/arm64/pac_asm.h
++++ b/osfmk/arm64/pac_asm.h
+@@ -158,6 +158,56 @@
+ 	mov		x0, #VMAPPLE_PAC_SET_INITIAL_STATE
+ 	hvc		#0
+ 	cbnz		x0, .
++#elif HAS_NATIVE_ARM_PAC
++	/*
++	 * negroni (iOS 26 port, stage 2): architected FEAT_PAuth, keys written here at EL1 (no Apple key
++	 * MSRs, no hypervisor call). One global key set for EL1 and EL0 (SET_JOP/ROP_KEY_REGISTERS stay
++	 * empty): every CPU must load the same keys, because user and kernel pointers are signed on one CPU
++	 * and checked on another. The boot CPU makes a seed from CNTVCT_EL0 and stores it in
++	 * negroni_pac_seed with the MMU and the D-cache off (this is the physical address here); the
++	 * secondaries, also before their MMU is on, read it back. Clobbers x0-x3 like the VMAPPLE path.
++	 */
++	adrp	x2, EXT(negroni_pac_seed)@page
++	add		x2, x2, EXT(negroni_pac_seed)@pageoff
++	dc		ivac, x2
++	dsb		sy
++	ldr		x3, [x2]
++	cbnz	x3, 1f
++	mrs		x3, CNTVCT_EL0
++	MOV64	x0, 0x9e3779b97f4a7c15
++	eor		x3, x3, x0
++	orr		x3, x3, #1
++	str		x3, [x2]
++	dc		cvac, x2
++	dsb		sy
++1:
++	/* key n = seed * odd constant n (+ seed rotated): distinct 128-bit keys from one seed */
++	MOV64	x0, 0xbf58476d1ce4e5b9
++	mul		x1, x3, x0
++	msr		APIAKeyLo_EL1, x1
++	ror		x1, x1, #17
++	msr		APIAKeyHi_EL1, x1
++	MOV64	x0, 0x94d049bb133111eb
++	mul		x1, x3, x0
++	msr		APIBKeyLo_EL1, x1
++	ror		x1, x1, #23
++	msr		APIBKeyHi_EL1, x1
++	MOV64	x0, 0xd6e8feb86659fd93
++	mul		x1, x3, x0
++	msr		APDAKeyLo_EL1, x1
++	ror		x1, x1, #29
++	msr		APDAKeyHi_EL1, x1
++	MOV64	x0, 0xa0761d6478bd642f
++	mul		x1, x3, x0
++	msr		APDBKeyLo_EL1, x1
++	ror		x1, x1, #31
++	msr		APDBKeyHi_EL1, x1
++	MOV64	x0, 0xe7037ed1a0b428db
++	mul		x1, x3, x0
++	msr		APGAKeyLo_EL1, x1
++	ror		x1, x1, #37
++	msr		APGAKeyHi_EL1, x1
++	isb		sy
+ #endif /* HAS_PARAVIRTUALIZED_PAC */
+ .endmacro
+ 
+diff --git a/pexpert/pexpert/arm64/NEGRONI.h b/pexpert/pexpert/arm64/NEGRONI.h
+index 5842a2c..075556d 100644
+--- a/pexpert/pexpert/arm64/NEGRONI.h
++++ b/pexpert/pexpert/arm64/NEGRONI.h
+@@ -38,9 +38,17 @@
+ #define HAS_GIC_V3                1
+ 
+ #if defined(NEGRONI_ARM64E) && NEGRONI_ARM64E
+-/* Architected PAC (FEAT_PAuth) with natively written keys; not the Apple PAC MSRs of A12+. */
++/*
++ * Architected PAC (FEAT_PAuth) with natively written keys (osfmk/arm64/pac_asm.h PAC_INIT_KEY_STATE),
++ * not the Apple key MSRs of A12+ (those live in Apple's closed KernelSupport archives, not in xnu
++ * source). HAS_APPLE_PAC turns on the arm64e kernel paths (ptrauth ABI, CPU_SUBTYPE_ARM64E, SCTLR
++ * EnIA/EnIB/EnDA/EnDB) exactly as apple_arm64_common.h does for Apple boards.
++ */
+ #define CPU_HAS_APPLE_PAC         1
+ #define HAS_NATIVE_ARM_PAC        1
++#if defined(__arm64e__)
++#define HAS_APPLE_PAC             1
++#endif
+ #endif
+ 
+ #ifndef ASSEMBLER

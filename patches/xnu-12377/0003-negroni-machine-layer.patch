@@ -297,7 +297,7 @@ index 58a91a8..d43274e 100644
   *	void FlushPoC_Dcache(void)
   *
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
-index 53f9ce5..bff95b4 100644
+index 53f9ce5..71c5a24 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
 @@ -82,6 +82,10 @@ void sleep_token_buffer_init(void);
@@ -342,7 +342,7 @@ index 53f9ce5..bff95b4 100644
 +		CleanPoC_DcacheRegion_Force((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t));
 +		CleanPoC_DcacheRegion_Force((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData));
 +		CleanPoC_DcacheRegion_Force((vm_offset_t)BootArgs, sizeof(*BootArgs));
-+		CleanPoC_DcacheRegion_Force((vm_offset_t)&sysreg_restore, sizeof(sysreg_restore));
++		/* 12377 has no sysreg_restore (the reset path no longer reloads TCR_EL1 from memory) */
 +		CleanPoC_DcacheRegion_Force((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
 +		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
 +		__builtin_arm_dsb(DSB_SY);
