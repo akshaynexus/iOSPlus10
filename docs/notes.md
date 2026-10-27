@@ -3208,3 +3208,33 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - [U] The real PON trigger code of a cable power-on on this phone. Test order: dry run on a normal boot, RAM boot with
   `BOOTARGS_ADD="negronicharge_force=1"` (screen, 10 s off, short press, `op10tool ctl reboot`, hold 2 s, unplug 3 s),
   then `negronicharge=1` on boot_a (owner's go) and a real cable power-on.
+
+## 64. t22 dead data path: bootlog-12 does not hold the drop; 0381 negroniusb_datafix (2026-10-27, USB kernel agent; details patches/xnu/README-usb.md "0381")
+
+- [V] logs/bootlog-12.txt = t22 (boot-args line 6). The 4 MiB ring wrapped (line 9: 17831467 of 22025771 bytes lost):
+  the file covers uptime 21208-25560 s only. The ADSP start and the drop (~57-59 s) are not in it. In the tail: no
+  `NEGRONI USB`, `CTL`, `ULOG`, `typec` or `NET` line. The Mac gave VBUS all the time (76 charge lines, `external=1`;
+  one `usbin 0mV` sample at line 22509 has `iin 1417mA`: [I] an ADC glitch). The end is an iOS power-menu restart
+  (lines 26062-26155), not a button reset.
+- [V] Live log (usblog-20261026-233816.txt 206573-207096): ADSP up 05:05:17, typec-only client start and our
+  PMIC_RTR open acked at 05:05:17, NO `PMIC_RTR_ADSP_APPS is open` / `typec:` line before the drop at 05:05:19.
+  bootlog-9 (t19): PD PHY writes + `clkref_en 1->80000000` (2953/2962) before the ADSP's OPEN (2967); ULOG
+  `pmic_glink_open` (3431), sink attach lost 10 ms later (3443-3445). [I strong] The first drop comes with the TCPM start
+  and cannot be stopped by a GLINK write (the channel opens with it). The SNK write fixed the role afterwards.
+- [V] `event 0x0000c046` = endpoint event, physical ep 3 (0x81 bulk IN), XferComplete, status IOC|LST: a normal log TX
+  batch end. Not a flood: only the first 200 events per boot print (196 in this boot, 83 of them c046; the last ~1 s
+  before the drop).
+- [V code] ue0 is never re-plumbed after a reset (only KEV_DL_LINK_OFF/ON, address set once at boot); TX queue and log
+  socket survive resets. Nothing writes GCTL/QSCRATCH except our ud_hw_start (device mode at every soft reconnect).
+- [U] Root cause. Candidates that fit all t22 facts: (a) full-speed link (PD PHY override) with our 512-byte bulk
+  packets; (b) IN path dead (tx_busy stuck); (c) stack lost 192.168.7.2 / ARP. The usblog file ends at 05:10:13, so the
+  0375 claim "no new en10 up during the 80 s suspend" is not proven.
+- 0381 `negroniusb_datafix` (default 0): bit 1 re-init when the host sends SOFs but no frame N s after its link up or
+  an IN transfer hangs N s (state lines, soft reconnect + PHY init past the cap, TX queue drop, ue0 up + address again,
+  new log socket; 3 per episode); bit 2 raw live log + kernel ARP answer; bit 4 watch only; bit 8 64-byte bulk at full
+  speed. `negroniusb_datafix_s` (default 10).
+- Test: t22 args + `negroniusb_idle_reboot=90 negroniusb_datafix=0xb`. Read the `data path dead ... state:` lines (speed,
+  IN active, ARP count, `GONE from ue0`, PHY DIFFERS) to pick (a)/(b)/(c).
+- Build [V]: out/kernel/local-20261027-100646/kernel.development.negroni sha256
+  f5af17707f1294d0c1eebb5d137aeaaa8329b17d050e35f15841c4ac8d5504bf (278 applied incl. 0381; 4 dxb skips). Only old
+  warning kinds. Not booted, not reviewed, no image.

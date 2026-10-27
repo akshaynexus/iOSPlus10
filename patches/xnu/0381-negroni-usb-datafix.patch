@@ -1,0 +1,627 @@
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index 5674a9b..c5ccb93 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -58,6 +58,7 @@ extern void negroni_log_append(const char *c, int size);
+ static volatile bool ud_in_panic;
+ static volatile bool ud_log_rewind;     /* "log" command: ud_log_thread sends the last 64 KiB again */
+ static volatile uint64_t ud_log_sent;   /* console ring position that ud_log_thread has sent up to */
++static volatile bool ud_log_resock;     /* 0381: a data path re-init: ud_log_thread makes a new socket */
+ 
+ static int ud_panic_log(const char *fmt, ...) __printflike(1, 2);
+ static int
+@@ -318,6 +319,10 @@ static struct {
+ 	uint64_t    beat;           /* ud_thread: start of its last loop pass */
+ 	volatile uint32_t where;    /* ud_thread: the step it is in (UD_AT_*) */
+ 	uint32_t    last_ev;        /* ud_thread: the last event it took */
++	/* 0381: the data path after a re-enumeration (negroniusb_datafix) */
++	uint64_t    alt1_at;        /* SET_INTERFACE(data, alt 1) while configured: the host's link up (0 = none since the last re-init) */
++	uint32_t    speed;          /* DSTS.CONNECTSPD at the last connect done: 0 high, 1 or 3 full, 2 low, 4 super */
++	uint64_t    arp_req;        /* ARP requests for 192.168.7.2 on the OUT path (counted while negroniusb_datafix != 0) */
+ 	uint32_t    episode_reconnects;
+ 	uint64_t    reconnects;
+ 	uint32_t    devevents[16];  /* device events per type (rate-limited log) */
+@@ -511,17 +516,46 @@ static int ud_more_events = 1;          /* 0366: boot-arg negroniusb_events: 0 =
+ static int ud_phycfg = 1;               /* 0366: boot-arg negroniusb_phycfg: clear GUSB2PHYCFG SUSPHY/ENBLSLPM */
+ static int ud_lost_reboot_s = 0;        /* 0371: boot-arg negroniusb_lost_reboot: s without host before a reboot (0 = off) */
+ static int ud_idle_reboot_s = 0;        /* 0375: boot-arg negroniusb_idle_reboot: s without USB data before a reboot (0 = off) */
++/*
++ * 0381: boot-arg negroniusb_datafix (README-usb.md "0381"), default 0 = off. Bits:
++ *   1 re-init: when the host enumerated the device (SET_INTERFACE alt 1) and sends SOFs, but no frame
++ *     comes from it for negroniusb_datafix_s s, or an IN transfer stays active that long: two state
++ *     lines, then soft reconnect with a PHY init (also past the 5 per ADSP start), TX queue dropped,
++ *     ue0 up again (192.168.7.2 added again if it is gone), new log socket. At most 3 per episode.
++ *   2 raw link: the live log goes as raw UDP frames to the host MAC (no socket, no route, no ARP), and
++ *     ud_thread answers ARP requests for 192.168.7.2 itself (the frame still goes to the stack).
++ *   4 watch only: the state lines of bit 1, no re-init (bit 1 is then ignored).
++ *   8 full speed: a link that comes up at full speed gets 64-byte bulk packets (descriptor and
++ *     endpoints); before, 512 (a high-speed-only value) in both.
++ */
++#define UD_DF_REINIT    1
++#define UD_DF_RAW       2
++#define UD_DF_WATCH     4
++#define UD_DF_FS        8
++#define UD_DF_TRIES     3
++static int ud_datafix = 0;              /* 0381: boot-arg negroniusb_datafix */
++static int ud_datafix_s = 10;           /* 0381: boot-arg negroniusb_datafix_s (3..120) */
++
++/* 0381: bulk max packet of the current link: 64 at full speed with bit 8, else 512 */
++static uint32_t
++ud_bulk_mps(void)
++{
++	return (ud_datafix & UD_DF_FS) && (ud.speed == 1 || ud.speed == 3) ? 64 : 512;
++}
++
+ /* 0375: ud_thread steps for the stall line of ud_idle_thread */
+ enum { UD_AT_START, UD_AT_EVENTS, UD_AT_RXPOLL, UD_AT_CTLPOLL, UD_AT_LINKWATCH, UD_AT_HPWATCH, UD_AT_SLEEP,
+-       UD_AT_LINKEVENT, UD_AT_IFINPUT, UD_AT_TXLOCK, UD_AT_DROPLOCK, UD_AT_RECONNECT, UD_AT_N };
++       UD_AT_LINKEVENT, UD_AT_IFINPUT, UD_AT_TXLOCK, UD_AT_DROPLOCK, UD_AT_RECONNECT, UD_AT_DATAWATCH, UD_AT_N };
+ static const char *const ud_at_names[UD_AT_N] = {
+ 	"start", "events", "rx poll", "ctl poll", "link watch", "PHY watch", "sleep",
+ 	"dlil_post_msg (link event)", "ifnet_input", "ud.lock (TX complete)", "ud.lock (drop data)", "soft reconnect",
++	"data watch (0381)",
+ };
+ static void ud_drop_data(void);
+ static void ud_end_transfer(unsigned ep);
+ static bool ud_ctl_input(const uint8_t *frame, uint32_t len);
+ static void ud_panic_rx(const uint8_t *frame, uint32_t len);
++static void ud_arp_answer(const uint8_t *frame, uint32_t len);      /* 0381 */
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+@@ -545,10 +579,11 @@ ud_configure(void)
+ 	if (ud.configured) {
+ 		return;
+ 	}
++	uint32_t mps = ud_bulk_mps();   /* 0381: 512, or 64 on a full-speed link with negroniusb_datafix bit 8 */
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
+-	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (mps << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
+ 	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+-	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (mps << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
+ 	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+ 	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
+ 	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
+@@ -584,7 +619,15 @@ ud_setup(void)
+ 	} else if (req == 6) {          /* GET_DESCRIPTOR */
+ 		switch (value >> 8) {
+ 		case 1: memcpy(data, ud_dev_desc, sizeof(ud_dev_desc)); n = sizeof(ud_dev_desc); break;
+-		case 2: memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc)); n = sizeof(ud_cfg_desc); break;
++		case 2:
++			memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc));
++			n = sizeof(ud_cfg_desc);
++			if (ud_bulk_mps() == 64) {
++				/* 0381: full speed: wMaxPacketSize 64 of ep 0x81 (bytes 70-71) and ep 0x01 (77-78) */
++				data[70] = 64; data[71] = 0;
++				data[77] = 64; data[78] = 0;
++			}
++			break;
+ 		case 3: n = ud_string(value & 0xff, data); ok = n != 0; break;
+ 		default: ok = false; break;
+ 		}
+@@ -607,6 +650,7 @@ ud_setup(void)
+ 		if (index == 1) {
+ 			ud.data_alt = (uint8_t)value;
+ 			if (value == 1 && ud.configured) {
++				ud.alt1_at = mach_absolute_time();      /* 0381: the host's link up */
+ 				ud_notify_connected();
+ 				ud_link_event(true);
+ 			}
+@@ -668,6 +712,9 @@ ud_rx_frame(const uint8_t *buf, uint32_t len, mbuf_t *head, mbuf_t *tail, struct
+ 	if (len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		ud.out_at = mach_absolute_time();       /* 0375: a host frame reached the OUT path */
+ 		ud.out_frames++;
++		if (ud_datafix != 0) {
++			ud_arp_answer(buf, len);        /* 0381: counts ARP for 192.168.7.2; answers it with bit 2 */
++		}
+ 	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN &&
+ 	    ud_ctl_input(buf, len)) {
+@@ -851,9 +898,10 @@ ud_tx_kick_locked(void)
+ 		uint32_t boff = ud_ring ? UD_TXBUF + n * UD_FRAME_MAX : UD_TX;
+ 		mbuf_copydata(m, 0, len, (void *)(ud.dma + boff));
+ 		mbuf_freem(m);
+-		/* A frame of a multiple of 512 bytes would need a zero-length
+-		 * packet to end it; one pad byte does the same (IP ignores it). */
+-		if ((len % 512) == 0) {
++		/* A frame of a multiple of the max packet (512, 0381: 64 at full
++		 * speed) would need a zero-length packet to end it; one pad byte
++		 * does the same (IP ignores it). */
++		if ((len % ud_bulk_mps()) == 0) {
+ 			((uint8_t *)(ud.dma + boff))[len++] = 0;
+ 		}
+ 		ud.tx_frames++;
+@@ -1071,6 +1119,55 @@ ud_udp_send(const uint8_t *dst_mac, const uint8_t *dst_ip, uint16_t sport, uint1
+ 	return true;
+ }
+ 
++/*
++ * 0381: an ARP request for 192.168.7.2 on the OUT path (normal mode; the panic mode has its own
++ * answer in ud_panic_rx). Counted while negroniusb_datafix != 0; with bit 2 answered here as a raw
++ * frame (192.168.7.2 is at 02:00:5e:77:ee:02), so the host reaches the command server also when
++ * the stack does not answer (no address on ue0, stack stuck). The frame still goes to the stack:
++ * a second answer from it does no harm.
++ */
++static void
++ud_arp_answer(const uint8_t *f, uint32_t len)
++{
++	const uint8_t *a = f + ETHER_HDR_LEN;
++	uint32_t flen = ETHER_HDR_LEN + 28;
++	mbuf_t m = NULL;
++
++	if (len < flen || ud_be16(f + 12) != ETHERTYPE_ARP || ud_be16(a) != 1 || ud_be16(a + 2) != ETHERTYPE_IP ||
++	    a[4] != ETHER_ADDR_LEN || a[5] != 4 || ud_be16(a + 6) != 1 || ud_be32(a + 24) != UD_IP_PHONE ||
++	    (a[8] & 1) != 0) {          /* review: no answer to a group (multicast/broadcast) sender MAC */
++		return;
++	}
++	ud.arp_req++;
++	if (!(ud_datafix & UD_DF_RAW) || ud.ifp == NULL) {
++		return;
++	}
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || mbuf_maxlen(m) < flen) {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		return;
++	}
++	uint8_t *r = mbuf_data(m);
++	bzero(r, flen);
++	memcpy(r, a + 8, ETHER_ADDR_LEN);               /* to the sender's MAC */
++	memcpy(r + ETHER_ADDR_LEN, ud_phone_mac, ETHER_ADDR_LEN);
++	ud_put16(r + 12, ETHERTYPE_ARP);
++	uint8_t *ra = r + ETHER_HDR_LEN;
++	ud_put16(ra, 1);
++	ud_put16(ra + 2, ETHERTYPE_IP);
++	ra[4] = ETHER_ADDR_LEN;
++	ra[5] = 4;
++	ud_put16(ra + 6, 2);                            /* reply */
++	memcpy(ra + 8, ud_phone_mac, ETHER_ADDR_LEN);
++	ud_put32(ra + 14, UD_IP_PHONE);
++	memcpy(ra + 18, a + 8, ETHER_ADDR_LEN);         /* target: the sender's MAC and IP */
++	memcpy(ra + 24, a + 14, 4);
++	mbuf_setlen(m, flen);
++	mbuf_pkthdr_setlen(m, flen);
++	(void)ud_if_output(ud.ifp, m);
++}
++
+ /* UDP datagram from 192.168.7.2:5141 back to the sender of req (a frame ud_ctl_input accepted). */
+ static void
+ ud_ctl_reply(const uint8_t *req, const char *text)
+@@ -1376,6 +1473,63 @@ ud_if_detach(ifnet_t ifp __unused)
+ {
+ }
+ 
++/* 192.168.7.2/24 on ue0 (SIOCAIFADDR); 0381: also after a data path re-init when the address is gone. */
++static errno_t
++ud_if_addr_add(void)
++{
++	socket_t so = NULL;
++	errno_t err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	if (err == 0) {
++		struct ifaliasreq ifra;
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ue0");
++		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2 */
++		a = (struct sockaddr_in *)&ifra.ifra_mask;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xffffff00);
++		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a807ff);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	return err;
++}
++
++/* 0381: 1 = ue0 has 192.168.7.2, 0 = it has not (configd or someone removed it), -1 = unknown */
++static int
++ud_if_has_addr(void)
++{
++	ifaddr_t *list = NULL;
++	int found = 0;
++
++	if (ud.ifp == NULL) {
++		return -1;
++	}
++	errno_t err = ifnet_get_address_list_family(ud.ifp, &list, AF_INET);
++	if (err == ENXIO) {
++		return 0;               /* no IPv4 address at all */
++	}
++	if (err != 0 || list == NULL) {
++		return -1;
++	}
++	for (int i = 0; list[i] != NULL; i++) {
++		struct sockaddr_in sin;
++		bzero(&sin, sizeof(sin));
++		if (ifaddr_address(list[i], (struct sockaddr *)&sin, sizeof(sin)) == 0 && sin.sin_family == AF_INET &&
++		    sin.sin_addr.s_addr == htonl(UD_IP_PHONE)) {
++			found = 1;
++		}
++	}
++	ifnet_free_address_list(list);
++	return found;
++}
++
+ /* ue0, 192.168.7.2/24 (the host side is 192.168.7.1). */
+ static void
+ ud_if_create(void)
+@@ -1424,28 +1578,8 @@ ud_if_create(void)
+ 	ifnet_set_lladdr(ud.ifp, ud_phone_mac, ETHER_ADDR_LEN);
+ 
+ 	errno_t err = proto_plumb(PF_INET, ud.ifp);
+-	socket_t so = NULL;
+-	if (err == 0) {
+-		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
+-	}
+ 	if (err == 0) {
+-		struct ifaliasreq ifra;
+-		bzero(&ifra, sizeof(ifra));
+-		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ue0");
+-		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
+-		a->sin_len = sizeof(*a);
+-		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2 */
+-		a = (struct sockaddr_in *)&ifra.ifra_mask;
+-		a->sin_len = sizeof(*a);
+-		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xffffff00);
+-		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
+-		a->sin_len = sizeof(*a);
+-		a->sin_family = AF_INET;
+-		a->sin_addr.s_addr = htonl(0xc0a807ff);
+-		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
+-		sock_close(so);
++		err = ud_if_addr_add();         /* 0381: the same code as before, now a function */
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	printf("NEGRONI USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
+@@ -1740,6 +1874,7 @@ static struct {
+ 	uint32_t    last_sof;
+ 	uint32_t    start_inits;        /* PHY inits since the last ADSP start (review F3: at most HP_MAX_INITS) */
+ 	uint32_t    window_lines;       /* change lines in the 10 ms window (review F4: at most HP_MAX_WINDOW_LINES) */
++	bool        cap_bypass;         /* 0381: a data path re-init may run one PHY init past HP_MAX_INITS */
+ } hp;
+ 
+ /* the slots a repair looks at: the PHY registers, clkref enable (bit 0) + CLK_OFF (bit 31), BCR (bit 0); not EUD */
+@@ -1847,7 +1982,7 @@ hp_init_blocked(void)
+ 	if (hp.adsp_start_at != 0 && (up == 0 || now < up + ud_abs_ms((uint64_t)ud_phyfix_holdoff_s * 1000))) {
+ 		return "ADSP hold-off (up + negroniusb_phyfix_holdoff_s not reached)";
+ 	}
+-	if (hp.start_inits >= HP_MAX_INITS) {
++	if (hp.start_inits >= HP_MAX_INITS && !hp.cap_bypass) {
+ 		return "5 PHY inits since the ADSP start already (log only now)";
+ 	}
+ 	if (negroni_chg_glink_get(&cs) && cs.ready) {
+@@ -2367,6 +2502,240 @@ hp_watch(void)
+ 	hp.last_repair = mach_absolute_time();
+ }
+ 
++/*
++ * ---- 0381: the data path after a re-enumeration (negroniusb_datafix, README-usb.md "0381") ----
++ *
++ * t22 (logs/usblog-20261026-233816.txt, logs/bootlog-12.txt): after the charger PD's Type-C restart
++ * the Mac enumerated the gadget again (05:05:25, again at 05:10:02 after a host re-enumeration), so
++ * ud_thread and ep0 worked, but no frame moved in either direction (no log, no ARP, no ctl answer)
++ * for 7 h, and no USB line reached the boot log. The boot log ring had lost that time. These
++ * functions find that state (configured, data alt 1, SOFs move, but no host frame since the link up
++ * or one IN transfer hangs), print what the next test needs to tell the causes apart (speed, the
++ * endpoints, the TRBs, the PHY against the gadget start, ue0 and its address), and with bit 1 set
++ * the whole data path up again.
++ */
++static struct {
++	uint64_t    next;           /* next check (100 ms) */
++	uint64_t    last_line;      /* last state line (re-inits used up / watch only: every 300 s) */
++	uint32_t    tries;          /* re-inits in this episode (an episode ends when host frames come) */
++	uint32_t    lines;          /* periodic state lines in this episode (at most 24) */
++	bool        logged;         /* the first state line of this episode is out */
++} df;
++
++static uint64_t
++ud_df_ms(uint64_t t, uint64_t now)
++{
++	return t == 0 || now < t ? 0 : (now - t) * 1000 / ud_abs_ms(1000);
++}
++
++static const char *
++ud_speed_name(uint32_t s)
++{
++	switch (s) {
++	case 0: return "high";
++	case 1: return "full";
++	case 2: return "low";
++	case 3: return "full 48 MHz";
++	case 4: return "super";
++	default: return "?";
++	}
++}
++
++/* Two lines: the counters of the data path, then the controller, TRB, PHY and ue0 state. */
++static void
++ud_data_state(const char *head, const char *why)
++{
++	uint64_t now = mach_absolute_time();
++	bool busy = __atomic_load_n(&ud.tx_busy, __ATOMIC_ACQUIRE);
++
++	printf("NEGRONI USB: %s: %s; speed %u (%s), %sconfigured, data alt %u, link up %llu ms ago, OUT frames %llu (last %llu ms "
++	    "ago, ARP for 192.168.7.2 %llu), IN %s %llu ms, last IN done %llu ms ago, txq %u, tx drops %llu, rx %llu tx %llu frames\n",
++	    head, why, ud.speed, ud_speed_name(ud.speed), ud.configured ? "" : "not ", ud.data_alt, ud_df_ms(ud.alt1_at, now),
++	    ud.out_frames, ud_df_ms(ud.out_at, now), ud.arp_req, busy ? "active" : "idle", busy ? ud_df_ms(ud.tx_start_at, now) : 0,
++	    ud_df_ms(ud.tx_done_at, now), ud.txq_count, ud.tx_drops, ud.rx_frames, ud.tx_frames);
++
++	uint32_t dsts = dwc_rd(DSTS);
++	ud_sync(UD_TXB_TRBS, 16);
++	uint32_t trb0 = *(volatile uint32_t *)(ud.dma + UD_TXB_TRBS + 12);
++	unsigned armed = 0;
++	ud_sync(UD_RING_TRBS, 16 * UD_RXN);
++	for (unsigned i = 0; i < UD_RXN; i++) {
++		if (*(volatile uint32_t *)(ud.dma + UD_RING_TRBS + 16 * i + 12) & TRB_HWO) {
++			armed++;
++		}
++	}
++	uint32_t v[HP_SLOTS];
++	bool phy_same = true;
++	if (hp.ok) {
++		hp_snap(v);
++		phy_same = hp_same(v, hp.base);
++	} else {
++		bzero(v, sizeof(v));
++	}
++	/* ifnet_flags() only reads if_flags (no lock); the address list is read by ud_df_stack (review: not in ud_thread) */
++	printf("NEGRONI USB: %s state: DSTS 0x%08x link %u (%s), SOF %llu ms ago, DCFG 0x%08x DCTL 0x%08x DALEPENA 0x%08x GCTL 0x%08x "
++	    "GUSB2PHYCFG 0x%08x QSCRATCH HS 0x%08x, ep busy rx %d tx %d int %d, TX TRB0 ctl 0x%08x, RX ring %u of %u armed, "
++	    "PHY %s (clkref_en 0x%08x cfg0 %x utmi0 %x utmi1 %x), ue0 flags 0x%x, %llu soft reconnects\n",
++	    head, dsts, DSTS_LINK(dsts), ud_link_name(DSTS_LINK(dsts)), ud_df_ms(ud.sof_seen, now), dwc_rd(DCFG), dwc_rd(DCTL),
++	    dwc_rd(DALEPENA), dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG), ud.qs ? usb_rd(ud.qs, QSCRATCH_HS_PHY_CTRL) : 0,
++	    ud.ep_busy[EP_RX], ud.ep_busy[EP_TX], ud.ep_busy[EP_INT], trb0, armed, UD_RXN,
++	    !hp.ok ? "not watched" : phy_same ? "as at the gadget start" : "DIFFERS from the gadget start",
++	    v[HP_CLKREF], v[12], v[0], v[1], ud.ifp ? (unsigned)ifnet_flags(ud.ifp) : 0u, ud.reconnects);
++	if (hp.ok && !phy_same) {
++		hp_dump("now (0381)", v);
++	}
++}
++
++/*
++ * Review of 0381: the network stack part (the ue0 address list, ifnet_set_flags, SIOCAIFADDR) runs
++ * in this thread call, never in ud_thread. ud_thread serves ep0 and the command server ("reboot"
++ * must work while the stack hangs, cause (c)), so it must not wait for a stack lock. p1: 1 = report
++ * the address only (state lines), 2 = re-init (ue0 IFF_UP|IFF_RUNNING, the address again if gone).
++ */
++static thread_call_t ud_df_call;
++
++static void
++ud_df_stack(thread_call_param_t p0 __unused, thread_call_param_t p1)
++{
++	bool fix = (uintptr_t)p1 == 2;
++	int has = ud_if_has_addr();
++	errno_t err = 0;
++
++	if (fix && ud.ifp != NULL) {
++		ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++		if (has == 0) {
++			err = ud_if_addr_add();
++		}
++	}
++	printf("NEGRONI USB: data path %s: ue0 flags 0x%x, 192.168.7.2 %s\n", fix ? "re-init, stack part" : "state, stack part",
++	    ud.ifp ? (unsigned)ifnet_flags(ud.ifp) : 0u,
++	    has > 0 ? "on ue0" : has < 0 ? "unknown (address list failed)" : !fix ? "GONE from ue0" :
++	    err ? "was GONE, add FAILED" : "was GONE, added again");
++	if (err != 0) {
++		printf("NEGRONI USB: data path re-init: SIOCAIFADDR 192.168.7.2 on ue0 failed: %d\n", err);
++	}
++}
++
++static void
++ud_df_stack_enter(uintptr_t what)
++{
++	if (ud_df_call != NULL) {
++		(void)thread_call_enter1(ud_df_call, (thread_call_param_t)what);    /* a pending call takes the new p1 */
++	}
++}
++
++/* TX queue empty (the frames of the dead link are old). */
++static unsigned
++ud_txq_flush(void)
++{
++	unsigned n = 0;
++	uint32_t was = ud.where;
++
++	ud.where = UD_AT_DROPLOCK;
++	lck_mtx_lock(ud.lock);
++	ud.where = was;
++	while (ud.txq_count > 0) {
++		mbuf_t m = ud.txq[ud.txq_head];
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++		mbuf_freem(m);
++		n++;
++	}
++	lck_mtx_unlock(ud.lock);
++	return n;
++}
++
++/*
++ * The whole data path again: soft reconnect with a PHY init (0368 hp_init, one past the 5 per ADSP
++ * start; the EUD, hold-off and VOOC rules stay), TX queue dropped, ue0 IFF_UP|IFF_RUNNING, the
++ * address again if it is gone, a new log socket. The host sees a detach + attach and enumerates
++ * again; SET_CONFIGURATION starts the endpoints and the RX ring as at boot.
++ */
++static void
++ud_data_reinit(void)
++{
++	uint64_t now = mach_absolute_time();
++	uint32_t repairs = hp.repairs;
++
++	if (hp.ok && ud_phyfix >= 1) {  /* review: negroniusb_phyfix=0 means no PHY writes (and no stale reinit_next) */
++		hp.reinit_next = true;
++		hp.cap_bypass = true;
++	}
++	ud_soft_reconnect("data path dead (negroniusb_datafix)", dwc_rd(DSTS), ud_df_ms(ud.sof_seen, now));
++	hp.cap_bypass = false;
++	/* as hp_watch after its reconnect: the 0366/0371 rules count from here */
++	ud.dev_event_at = 0;
++	ud.last_soffn = DSTS_SOFFN(dwc_rd(DSTS));
++	ud.sof_moved = false;
++	ud.sof_seen = mach_absolute_time();
++	ud.next_watch = ud.sof_seen + ud_abs_ms(100);
++	ud.alt1_at = 0;
++	unsigned flushed = ud_txq_flush();
++	ud_df_stack_enter(2);           /* ue0 up + the address: in the thread call (review: not in ud_thread) */
++	ud_log_resock = true;
++	printf("NEGRONI USB: data path re-init done: PHY init %s, %u queued frames dropped, ue0 + 192.168.7.2 in a thread call, "
++	    "new log socket; the host enumerates again\n",
++	    hp.repairs != repairs ? "done" : ud_phyfix < 1 ? "off (negroniusb_phyfix=0)" : "NOT done (see the reconnect lines)",
++	    flushed);
++}
++
++/* Every 100 ms from ud_thread. */
++static void
++ud_data_watch(void)
++{
++	char why[112];
++
++	if (!(ud_datafix & (UD_DF_REINIT | UD_DF_WATCH)) || ud_in_panic) {
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	if (now < df.next) {
++		return;
++	}
++	df.next = now + ud_abs_ms(100);
++	if (!ud.configured || ud.data_alt != 1 || ud.alt1_at == 0) {
++		return;                 /* no host link: 0366 (no SOF) and 0371 handle that */
++	}
++	uint64_t lim = ud_abs_ms((uint64_t)ud_datafix_s * 1000);
++	bool host = ud.sof_seen != 0 && now - ud.sof_seen < ud_abs_ms(1000);   /* SOFFN moved in the last second */
++	bool got_out = ud.out_at >= ud.alt1_at;
++	bool busy = __atomic_load_n(&ud.tx_busy, __ATOMIC_ACQUIRE);
++	uint64_t tx_at = __atomic_load_n(&ud.tx_start_at, __ATOMIC_RELAXED);
++	why[0] = 0;
++	if (host && !got_out && now - ud.alt1_at >= lim) {
++		snprintf(why, sizeof(why), "no frame from the host %d s after its link up (SET_INTERFACE alt 1)", ud_datafix_s);
++	} else if (host && busy && tx_at != 0 && now > tx_at && now - tx_at >= lim) {
++		snprintf(why, sizeof(why), "IN transfer active %d s while the host sends SOFs", ud_datafix_s);
++	}
++	if (why[0] == 0) {
++		if (got_out && (df.tries != 0 || df.logged)) {
++			printf("NEGRONI USB: data path works: %llu OUT frames, host frames since the link up, after %u re-inits "
++			    "(negroniusb_datafix)\n", ud.out_frames, df.tries);
++			df.tries = 0;
++			df.lines = 0;
++			df.logged = false;
++		}
++		return;
++	}
++	if ((ud_datafix & UD_DF_WATCH) || df.tries >= UD_DF_TRIES) {
++		/* watch only, or the re-inits are used up: the state lines once, then every 300 s (at most 24) */
++		if (!df.logged || (now - df.last_line >= ud_abs_ms(300000) && df.lines < 24)) {
++			df.logged = true;
++			df.lines++;
++			df.last_line = now;
++			ud_data_state((ud_datafix & UD_DF_WATCH) ? "data path dead (watch only)" :
++			    "data path still dead (3 re-inits done; 0371/0375 decide)", why);
++			ud_df_stack_enter(1);
++		}
++		return;
++	}
++	df.tries++;
++	char head[64];
++	snprintf(head, sizeof(head), "data path dead (re-init %u of %u)", df.tries, UD_DF_TRIES);
++	ud_data_state(head, why);
++	ud_data_reinit();
++}
++
+ static void
+ ud_event(uint32_t ev)
+ {
+@@ -2398,12 +2767,18 @@ ud_event(uint32_t ev)
+ 			}
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
++			ud.speed = speed;       /* 0381 */
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+ 			ud_epcmd(0, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
+ 			    (1u << 8) | (1u << 10) | (0u << 25), 0);
+ 			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
+ 			    (1u << 8) | (1u << 10) | (1u << 25), 0);
+ 			printf("NEGRONI USB: connected, speed %u (#%u, DSTS 0x%08x)\n", speed, ++ud.devevents[2], dwc_rd(DSTS));
++			if (ud_datafix != 0 && speed != 0) {
++				printf("NEGRONI USB: the link is not high speed (speed %u, %s)%s\n", speed, ud_speed_name(speed),
++				    ud_bulk_mps() == 64 ? ": 64-byte bulk packets, full-speed descriptor (negroniusb_datafix bit 8)" :
++				    ": the bulk endpoints stay at 512 bytes (negroniusb_datafix bit 8 off)");
++			}
+ 		} else if (type == 0) {
+ 			/* 0366: Linux dwc3_gadget_disconnect_interrupt (only seen without the VBUS override) */
+ 			printf("NEGRONI USB: disconnect (#%u, DSTS 0x%08x link %u)\n", ++ud.devevents[0], dwc_rd(DSTS),
+@@ -2535,6 +2910,8 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 		ud_ctl_poll();
+ 		ud.where = UD_AT_LINKWATCH;
+ 		ud_link_watch();                /* 0366 */
++		ud.where = UD_AT_DATAWATCH;
++		ud_data_watch();                /* 0381 */
+ 		ud.where = UD_AT_HPWATCH;
+ 		hp_watch();                     /* 0368 */
+ 		ud.where = UD_AT_SLEEP;
+@@ -2740,7 +3117,15 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			uint64_t end = negroni_log_position();
+ 			pos = end > 65536 ? end - 65536 : 0;
+ 		}
+-		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
++		if (ud_log_resock) {            /* 0381: data path re-init: no cached route or ARP state of the old link */
++			ud_log_resock = false;
++			if (so != NULL) {
++				sock_close(so);
++				so = NULL;
++			}
++		}
++		bool raw = (ud_datafix & UD_DF_RAW) != 0;      /* 0381: raw frames only (no socket, route or ARP) */
++		if (!raw && so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
+ 			continue;
+ 		}
+@@ -2752,7 +3137,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 				.msg_iov = &iov, .msg_iovlen = 1,
+ 			};
+ 			size_t sent = 0;
+-			if (sock_send(so, &msg, 0, &sent) != 0) {
++			if (raw || sock_send(so, &msg, 0, &sent) != 0) {
+ 				/*
+ 				 * No route, or ue0 down (if_down_all() in the
+ 				 * shutdown path): the same datagram as a raw frame
+@@ -2931,7 +3316,7 @@ ud_panic_tx_start(uint32_t len)
+ {
+ 	uint8_t *buf = (uint8_t *)(ud.dma + UD_TX);
+ 
+-	if ((len % 512) == 0) {
++	if ((len % ud_bulk_mps()) == 0) {
+ 		buf[len++] = 0;                 /* as ud_tx_kick_locked: no zero-length packet needed */
+ 	}
+ 	ud_panic_tx_len = len;
+@@ -3133,6 +3518,21 @@ negroni_usb_gadget_start(vm_offset_t dwc)
+ 	ud.dma_pa = ptoa_64(pn);
+ 	/* 0361: read before ud_if_create (the stack may send at once); ring 0 = the old one-TRB paths */
+ 	PE_parse_boot_argn("negroniusb_ring", &ud_ring, sizeof(ud_ring));
++	/* 0381: before ud_if_create and the log thread (both read it) */
++	PE_parse_boot_argn("negroniusb_datafix", &ud_datafix, sizeof(ud_datafix));
++	PE_parse_boot_argn("negroniusb_datafix_s", &ud_datafix_s, sizeof(ud_datafix_s));
++	if (ud_datafix_s < 3 || ud_datafix_s > 120) {
++		ud_datafix_s = 10;
++	}
++	if (ud_datafix != 0) {
++		printf("NEGRONI USB: data path (negroniusb_datafix=0x%x): %s%s%s, check after %d s (negroniusb_datafix_s)\n", ud_datafix,
++		    (ud_datafix & UD_DF_WATCH) ? "state lines only (watch)" : (ud_datafix & UD_DF_REINIT) ? "re-init when dead (3 per episode)" : "no watch",
++		    (ud_datafix & UD_DF_RAW) ? ", raw live log + kernel ARP answer" : "",
++		    (ud_datafix & UD_DF_FS) ? ", 64-byte bulk at full speed" : "", ud_datafix_s);
++		if (ud_datafix & (UD_DF_REINIT | UD_DF_WATCH)) {
++			ud_df_call = thread_call_allocate(ud_df_stack, NULL);  /* review: the stack part out of ud_thread */
++		}
++	}
+ 	printf("NEGRONI USB: RX ring %u TRBs, TX batch %u, queue %u (negroniusb_ring=%d)\n",
+ 	    ud_ring ? UD_RXN : 1, ud_ring ? UD_TXB : 1, UD_TXQ, ud_ring);
+ 	ud_if_create();

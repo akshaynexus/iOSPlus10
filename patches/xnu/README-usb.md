@@ -620,3 +620,134 @@ out/kernel/kernel.macho). compile-one of negroni_usb.c and the full build: only 
   macOS keeps a bulk IN read pending while the ECM interface is up; 64-bit aligned loads/stores are single-copy atomic
   on arm64; the 0371 two-sample rule still fires on an unplug (no SOFFN change -> `sof_moved` false, `lost_since` stays).
 - Patch sha256 after the fixes: 831dfaa03a014b1e125e64ec8ed3c163e54b6687175a433a8e63a3bad3ef0aa4. The kernel above is from the old patch: rebuild.
+
+## 0381: the data path after a re-enumeration (`negroniusb_datafix`) and what bootlog-12 shows about t22
+
+### What the logs contain [V]
+
+- `logs/bootlog-12.txt` is boot 12 = t22 (line 6: `negroniadsp=1 ... negronichg_glink=0 ... negroniusb_rails=1
+  negronichg_ulog=1 negronichg_typec=3 negroniusb_lost_reboot=60`, no `negroniusb_idle_reboot`). Line 9: `console bytes
+  22025771 (the first 17831467 bytes were overwritten in the 4 MiB ring)`. The file starts at uptime 21208 s (line 14,
+  GPU WATCH) and ends at 25560 s (line 3). The boot started at 05:04:20 (Mac `interface gone` at
+  usblog-20261026-233816.txt:205411), so the ADSP start and the link drop (uptime ~57-59 s) are NOT in it.
+- In the 26155 lines: 0 `NEGRONI USB`, 0 `NEGRONI CTL`, 0 `NEGRONI ULOG`, 0 `typec`, 0 `NEGRONI NET` lines.
+- 76 `BATTERY: charge:` lines, from line 76 (`external=1 ... adapter 5004mV 896mA`) to line 25641 (`external=1 ... 4951mV
+  1615mA`): the Mac gave VBUS for the whole tail; the phone was the sink. One sample (lines 22509-22510, uptime ~24710 s)
+  reads `usbin 0mV`, `external=0`, but the same raw line has `iin 1417mA`; the next sample (22521) is 4875 mV
+  [I: an ADC read glitch, not an unplug].
+- The end (lines 26062-26155): `exec powermenu-helper`, launchd shutdown, `MACH Reboot`, `boot 12 ends: restart (restart
+  (reboot))`. The owner restarted iOS from the power menu at 12:10:20; it was not a button hard reset.
+- The live log of the drop is in usblog-20261026-233816.txt: 206573 `THE ADSP IS UP` (05:05:17), 206750 `glink: start
+  (typec only ... negronichg_typec 0x3)`, 206752 `the ADSP acks our open of PMIC_RTR_ADSP_APPS`, 206976 the last raw
+  `event 0x0000c046` (05:05:18), 207096 `phone interface gone` (05:05:19). No `PMIC_RTR_ADSP_APPS is open`, no `typec:`
+  line before the drop.
+- The usblog file has no line after 05:10:13 (file time 05:10). So nothing shows whether usblog.sh still ran during the
+  05:12:41 `usb-host-kick suspend 80` (the 0375 text "no new en10 up in these 80 s" has no proof).
+
+### Findings
+
+1. Order of the typec writes and the drop [V t19 + t22]. The typec client writes only after the ADSP opens its side of
+   PMIC_RTR_ADSP_APPS (`negroni_glink_open` waits for the ADSP's OPEN, negroni_chg_glink.c "no OPEN from the ADSP").
+   In t19 (bootlog-9) the PD's PHY writes (2953, 2962: `clkref_en 1->80000000`) come BEFORE the ADSP's OPEN (2967), and
+   the ULOG shows `pmic_glink_open` (3431), `PmicTccPlatform_Init` (3434) and the lost sink attach 10 ms later (3443-3445).
+   In t22 the drop (05:05:19 = ADSP up + 2 s, the same time as the PHY ref clock off in bootlog-3/-9) came before any typec
+   line. So the first drop cannot be stopped by a GLINK write: the channel opens with the TCPM start. An earlier write
+   "at the first GLINK open" is not possible (our open is acked at once, but the PD answers no request before its own
+   OPEN) [I strong]. The SNK write worked afterwards: the Mac was the source for 7 h (battery lines) and the host 6 s
+   after the drop.
+2. Event 0x0000c046 [V decode, DWC3 databook / Linux core.h]: bit 0 = 0 (endpoint event), bits 5:1 = 3 (physical
+   endpoint 3 = ep 0x81, bulk IN, EP_TX), bits 9:6 = 1 (XferComplete), bits 15:12 = 0xc (IOC | LST): a TX batch of the
+   live log ended normally. It is not a flood: ud_thread prints only the first 200 events of a boot (60 again after a
+   soft reconnect). In the t22 boot: 196 raw event lines, 83 of them c046 (usblog 205411-207096); the last one is ~1 s
+   before the drop. So TX worked until the drop.
+3. Gadget reconnect handling [V code]: a bus reset runs `ud_drop_data` (ENDTRANSFER on EP_TX/EP_RX/EP_INT, DALEPENA 3,
+   not configured, KEV_DL_LINK_OFF); SET_CONFIGURATION(1) sets the endpoints again (DEPSTARTCFG 2, SETEPCONFIG, RX
+   ring); SET_INTERFACE alt 1 sends NETWORK_CONNECTION and KEV_DL_LINK_ON. ue0 is never detached or re-plumbed: only the
+   link events and SIOCGIFMEDIA change; its address is set once at boot. The TX queue keeps old frames over a reset.
+   The live log socket is kept for the whole boot.
+4. ud_thread [V]: it ran at 05:05:25 and at 05:10:02 (both enumerations need ep0 answers, and only ud_thread polls the
+   events). After 05:10 nothing tells [U].
+5. Why 0371 did not fire for 7 h [V code + V empty tail]: with ud_thread running, a SOF-less stretch of 60 s reboots,
+   and 0366 prints `soft reconnect #N` (every 10th) and `no SOF for 3 s`. None of these lines is in the 70-min tail. So
+   in that time either SOFFN kept moving (the Mac kept the port active: host present) or ud_thread did not run [I: the
+   first one is more likely; the stats line `ue0 rx ... tx ...` prints only above 100 rx / 500 tx frames per 10 s, so
+   its absence proves nothing].
+6. Role vs controller mode [V code, I hardware]: nothing in the ADSP path writes the DWC3 (GCTL PRTCAPDIR) or QSCRATCH;
+   the PD writes the HS PHY (UTMI overrides, cfg0, ref clock: 0368) and the PMIC Type-C block. `ud_hw_start` sets
+   PRTCAPDIR = device at every soft reconnect. The enumerations prove device mode at 05:05:25 and 05:10:02.
+7. Root cause of the dead data path: NOT in the logs [U]. The candidates that match all observations (enumeration works,
+   no frame either way, no USB line, no 0371): (a) the link came up at full speed (the PD's PHY override TERMSEL/XCVRSEL =
+   full speed, cfg0 = 3, seen in bootlog-3/-9) while the gadget keeps 512-byte bulk packets, a high-speed-only value: ep0 works
+   (64), bulk does not; the "high speed" of the 0375 text has no log line behind it; (b) a dead IN path (an IN transfer that
+   the host never reads, so tx_busy stays: no log, no ARP answer, no ctl answer); (c) the stack lost 192.168.7.2 or its
+   ARP state (no ARP answer; the log socket holds its datagrams for an ARP entry that never resolves). 0381 tells them
+   apart on the next test and repairs (a) and (b) without a reboot.
+
+### Change (bsd/dev/negroni_usb.c), boot-arg `negroniusb_datafix` (default 0 = off), `negroniusb_datafix_s` (default 10, 3..120)
+
+- Bit 1 (re-init): ud_thread checks every 100 ms. Dead = configured, data alt 1, SOFFN moved in the last 1 s, and either
+  no host frame `negroniusb_datafix_s` s after SET_INTERFACE alt 1, or one IN transfer active that long. Then two state
+  lines and a full re-init: soft reconnect with a PHY init (0368 `hp_init`, one init past the 5 per ADSP start; EUD,
+  hold-off and VOOC rules stay; no PHY write with `negroniusb_phyfix=0`), TX queue dropped, ue0 IFF_UP|IFF_RUNNING,
+  192.168.7.2 added again when it is gone (`ifnet_get_address_list_family`), a new live-log socket. The ue0 part runs in
+  a thread call (`ud_df_stack`), never in ud_thread: ud_thread serves ep0 and the command server and must not wait for
+  a stack lock (review). ue0 is not re-plumbed (PF_INET stays attached from boot). The host enumerates again. At most 3 re-inits per episode
+  (an episode ends with the first host frame after a link up: `data path works`); then the state lines every 300 s
+  (at most 24) and 0371/0375 decide.
+- Bit 2 (raw link): the live log goes only as raw UDP frames to the host MAC (the old fallback path: no socket, no
+  route, no ARP), and ud_thread answers ARP requests for 192.168.7.2 itself (only well-formed Ethernet/IPv4 requests, opcode 1, with a
+  unicast sender MAC; one 42-byte reply to the sender's MAC; the frame still goes to the stack). The
+  command server already answers raw. So log, ping and settime do not depend on the stack.
+- Bit 4 (watch only): the state lines of bit 1, no re-init.
+- Bit 8 (full speed): when connect done reports full speed (DSTS.CONNECTSPD 1 or 3), the configuration descriptor gives
+  64 for ep 0x81 and ep 0x01, SETEPCONFIG uses 64, and the TX pad rule (no ZLP) uses 64. High speed is unchanged (512).
+- Any non-zero value: ARP requests for 192.168.7.2 are counted; `the link is not high speed` line at connect done.
+- Not changed: 0366, 0368 (except the one-shot cap bypass), 0371, 0375, the panic mode (only the pad rule reads the
+  max packet).
+- Cost [I]: bit 1 needs a sender on the Mac (usblog.sh: settime at link up, keepalive every 10 s; macOS's own IPv6/mDNS
+  frames at link up). An enumeration with no host frame at all (en10 not up on the Mac) gives 3 re-inits, then only
+  the state lines.
+
+### Boot-args (test)
+
+t22 args + `negroniusb_idle_reboot=90 negroniusb_datafix=0xb` (1 + 2 + 8; datafix_s 10). Order of the guards: 3 re-inits
+(~45 s) before 0375 (90 s without a host frame). First a normal boot (ADSP off) with `negroniusb_datafix=0xb`: no
+`data path dead` line, log and `op10tool ctl ping` work (raw log path, kernel ARP answer).
+
+### Expected lines
+
+- Boot: `NEGRONI USB: data path (negroniusb_datafix=0xb): re-init when dead (3 per episode), raw live log + kernel ARP answer, 64-byte bulk at full speed, check after 10 s (negroniusb_datafix_s)`
+- After the ADSP drop and the new enumeration, if the data path is dead:
+  `NEGRONI USB: data path dead (re-init 1 of 3): no frame from the host 10 s after its link up (SET_INTERFACE alt 1); speed S (...), configured, data alt 1, ... OUT frames N (... ARP for 192.168.7.2 N), IN active|idle ...`
+  `NEGRONI USB: data path dead (re-init 1 of 3) state: DSTS ... DALEPENA ... ep busy rx R tx T int I, TX TRB0 ctl 0x..., RX ring N of 32 armed, PHY as at the gadget start|DIFFERS ..., ue0 flags 0x..., N soft reconnects`
+  (+ `PHY now (0381): ...` when the PHY differs), `soft reconnect #N ...: data path dead (negroniusb_datafix)`, `PHY re-init #N`,
+  `data path re-init done: PHY init done, N queued frames dropped, ue0 + 192.168.7.2 in a thread call, new log socket`,
+  `data path re-init, stack part: ue0 flags 0x..., 192.168.7.2 on ue0|was GONE, added again` (watch only / used up:
+  `data path state, stack part: ... 192.168.7.2 on ue0|GONE from ue0`),
+  then `bus reset`, `connected, speed S`, `configured (1)` and `data path works: N OUT frames ... after 1 re-inits`.
+- How to read it: speed 1/3 = cause (a), bit 8 fixes it; `IN active` + `ARP for 192.168.7.2` > 0 = cause (b); `GONE from
+  ue0` or the log arrives (raw) but the stack does not answer = cause (c).
+- These lines also land in the boot log; read it with `make bootlog` even when USB stays dead.
+
+### Build [V]
+
+out/kernel/local-20261027-100646/kernel.development.negroni sha256
+f5af17707f1294d0c1eebb5d137aeaaa8329b17d050e35f15841c4ac8d5504bf (278 applied incl. 0381; only the 4 usual dxb skips;
+link out/kernel/kernel.macho). Patch sha256 0a154acb984893a42dc83040d01009a26d86c9912747bd3facf2101293a31c45 (before the review).
+Compile-one of negroni_usb.c: the same 6 warnings as before the patch (old kinds); the full build shows only the old
+kinds for this file. Not booted; no image.
+
+### Review (Opus, 2026-10-27)
+
+Fixed in the patch (sha256 c706cfd146c6a80d42d746c78f86346124ec099bff6b6acd9fccc28a3965e254, compile-one: the same 6
+old warnings; no full build yet): (1) the ue0 address list, ifnet_set_flags and SIOCAIFADDR ran in ud_thread; a stuck
+stack would block ep0 and the "reboot" command; now a thread call. (2) No ARP answer to a group sender MAC. (3) With
+`negroniusb_phyfix=0` the re-init set `hp.reinit_next` that nothing cleared, and its line said "see the reconnect
+lines"; now no PHY flags and "off (negroniusb_phyfix=0)".
+Checked, no change: default 0 is the old behaviour (512 everywhere, no watch, no ARP code, same log path, same ue0
+setup code); descriptor offsets 70-71 / 77-78 are wMaxPacketSize of ep 0x81 / 0x01; SETEPCONFIG and the pad rule use the
+same value; high speed keeps 512; the state lines read only (PHY reads as hp_watch does every 100 ms). 0371 counts from the
+re-init like after an hp_watch reconnect; 0375 runs in its own thread and its OUT timer is not reset by a re-init.
+Open [I]: the trigger counts from SET_INTERFACE alt 1; with usblog.sh the first host frames (settime + ARP) come ~1-3 s
+after en10 appears, so 10 s is enough; a quiet host (no usblog, en10 inactive) gives 3 re-enumerations, then lines
+only. The 3 tries come back only after a working frame (not after an unplug).
