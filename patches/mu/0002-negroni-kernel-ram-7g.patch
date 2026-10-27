@@ -1,0 +1,21 @@
+Mu "Kernel RAM" 0x841000000 + 0x1DF000000 (to 0xA20000000) instead of + 0x13F000000 (to 0x980000000), for the
+7 GiB XNU window of kernel patch 0401 (docs/notes.md section 90). DarwinBoot allocates the window
+(ADT darwinboot-memory-size) inside this conventional region at 0x841004000 (first fit from the region start); UEFI's
+own allocations go top-down from 0xA20000000, about 496 MiB above the window end 0xA01004000. 0xA20000000-0xA80000000
+(the GPU region of config/negroni-ne2211.toml [ram], 1.5 GiB) stays out of the UEFI map, as 0x980000000 was before.
+The NE2211 has System RAM 0x840000000-0xA7FFFFFFF (docs/device-facts.md); the 8 GB NE2213 has only 0x840000000 + 5 GiB:
+this map is for the NE2211. The submodule commit 81f18229 already holds the old patch 0001 (0x841000000 base, 16K kernel).
+diff --git a/Platforms/OnePlus/negroniPkg/Library/MemoryMapLib/MemoryMapLib.c b/Platforms/OnePlus/negroniPkg/Library/MemoryMapLib/MemoryMapLib.c
+--- a/Platforms/OnePlus/negroniPkg/Library/MemoryMapLib/MemoryMapLib.c
++++ b/Platforms/OnePlus/negroniPkg/Library/MemoryMapLib/MemoryMapLib.c
+@@ -34,7 +34,9 @@ gMemoryDescriptor[] = {
+   {"QTEE",              0xE9B00000, 0x00500000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+   {"TZApps Reserved",   0xEA000000, 0x07400000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+ 
+-  {"Kernel RAM",        0x841000000,0x13F000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
++  // NE2211 System RAM 0x840000000-0xA7FFFFFFF: XNU window (iOSPlus10 0401) + UEFI below 0xA20000000; GPU region above it
++  // (iOSPlus10 config [ram]) is not in this map
++  {"Kernel RAM",        0x841000000,0x1DF000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
+   {"HYP Reserved",      0x830000000,0x10000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
+ 
+   {"IMEM Base",         0x14680000, 0x0002A000, NoHob,  MMAP_IO, INITIALIZED, Conv,   NS_DEVICE},

@@ -33,7 +33,8 @@ settings without change:
 - Mu `MemoryMapLib` "Kernel RAM" 0x840000000 + 0x140000000 (5 GiB) is inside the 9 GiB range.
 - `mkadt.py --dram 840000000:C0000000` (3 GiB) is inside it too.
 
-Option for later: give XNU more RAM (up to 0x840000000 + 9 GiB).
+Since kernel patch 0401 (2026-10-27): XNU window 7 GiB at 0x841004000, Mu "Kernel RAM" 0x841000000-0xA20000000
+(patches/mu/0002), GPU pool region 0xA20000000-0xA80000000 (1.5 GiB; config `[ram]`, docs/notes.md section 90).
 
 ## Firmware
 

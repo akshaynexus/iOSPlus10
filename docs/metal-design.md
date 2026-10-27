@@ -130,6 +130,7 @@ the selector table:
    stale reads). Flame fixed it with a GPU pool of RAM XNU never manages [V flame HANDOFF 03:40]. Our ADT gives
    XNU 3 GiB (`--dram 840000000:C0000000`) of the 9 GiB contiguous RAM at 0x840000000, so 0x900000000-0xA80000000
    is outside XNU [V notes.md section 2]; a GPU pool there is the obvious fix [I: check Gunyah/UEFI reservations].
+   Since patch 0401 (notes section 90): XNU 7 GiB (0x841004000..0xA01004000), GPU pool region 0xA20000000-0xA80000000.
 4. **Submit with N IBs, fence by CACHE_FLUSH_TS, CCU invalidate at the start** (Turnip assumes msm's
    `a6xx_submit` wrapper; flame's first submits failed without it, METAL-NEXT section 4).
 5. **Fence wait with a ns timeout and 0 = poll**; a busy answer when the ring is full.

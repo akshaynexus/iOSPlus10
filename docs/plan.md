@@ -6,6 +6,12 @@ Status date: 2026-10-27 (12:15).
 1. GPU acceleration working (Metal; 0389/0395/0398/0399 in test).
 2. Video playback working (0390 plane layout + 0399 wired-memory guard; t29/t29b froze from wired-memory exhaustion).
 3. Audio working (never worked: the ADSP start drops USB; audio agent on it).
+RAM for GPU (2026-10-27, RAM agent; compile/host checks only, not booted, not committed): kernel patch 0401 +
+patches/mu/0002 + config `[ram]` give XNU 7 GiB (was 3 GiB) at 0x841004000..0xA01004000; the GPU pool (1536 MiB) moves to
+0xA20000000 (`negronigpu_poolbase`, added by build.sh to every image). Self-check in the kernel (bank, ADT sizes, GPU region/pool) and
+in adt-extra.py (Mu FD "Kernel RAM"); fallback 3 GiB; kill switches `negroniram=0` / `XNU_RAM=0`. Next: rebuild Mu
+(scripts/uefi/prepare.sh + build.sh), one combined image, `fastboot boot`, read `NEGRONI RAM:` and `hw.memsize`.
+Details: docs/notes.md section 90.
 TODO later (owner): cellular. 0397 boots the modem for GNSS only (never ONLINE). 4G/5G data and SIM detection need the
 modem ONLINE, IPA, QMI DMS/NAS/WDS/UIM and the iOS CommCenter side.
 
@@ -285,7 +291,8 @@ watchdogs 0371=60 s / 0375=30 s). Details: docs/notes.md sections 57-63, patches
   notes say that setup hangs right after the green bar). The 16K iOS 16 kernel needs
   0x841000000+0x13F000000, so DarwinBoot's window (0x841004000) keeps a 32 MiB-aligned VA-PA delta
   (slop NOTES 2026-10-20). Fixed in `patches/mu/0001-negroni-kernel-ram-16k.patch` (applied by
-  `scripts/uefi/prepare.sh`); Mu and both boot images rebuilt.
+  `scripts/uefi/prepare.sh`); Mu and both boot images rebuilt. (2026-10-27: 0001 is in the Mu submodule commit and
+  deleted; patches/mu/0002 makes the region 0x1DF000000 for the 7 GiB window of 0401, docs/notes.md section 90.)
 
 ## iOS 16 boots on the NE2211 (2026-10-24, 20:10)
 

@@ -45,7 +45,11 @@ adt_cam() {
 adt() {
   # shellcheck disable=SC2046
   python3 "$REPO/$($C adt.tool)" "$O/negroni.adt" $($C adt.args)
-  ADT_CAM=$(adt_cam) python3 "$REPO/scripts/ios16/adt-extra.py" "$O/negroni.adt"
+  # MU_FD: the Mu FD that the boot step packs; adt-extra.py checks that the [ram] window fits its "Kernel RAM" (else 3 GiB).
+  # The known-good boot_a (out/ios16-safe) keeps the 3 GiB window: its kernel can be older than 0401 (no self-check);
+  # XNU_RAM=1 by hand overrides.
+  xnu_ram=${XNU_RAM:-}; case "$O" in */ios16-safe) xnu_ram=${XNU_RAM:-0} ;; esac
+  MU_FD=$FD XNU_RAM=$xnu_ram ADT_CAM=$(adt_cam) python3 "$REPO/scripts/ios16/adt-extra.py" "$O/negroni.adt"
 }
 
 payload() {
@@ -66,6 +70,12 @@ payload() {
     [ $keep = 1 ] && args="$args $a"
   done
   args="${args# } ${BOOTARGS_ADD:-}"; args="${args% }"
+  # Patch 0401 layout (config [ram], docs/notes.md section 90): the GPU write-combined pool starts at the [ram] gpu
+  # base, above the XNU window and above the Mu "Kernel RAM" region (patches/mu/0002), for every image: also for
+  # ios16-safe, whose kernel's default base 0x980000000 is now inside the UEFI region (UEFI allocates top-down from
+  # 0xA20000000) and, for a 7 GiB ADT, inside the XNU window. Every pool kernel since 0230 reads negronigpu_poolbase.
+  case " $args " in *" negronigpu_poolbase="*) ;; *)
+    args="$args negronigpu_poolbase=0x$($C ram.gpu | cut -d: -f1 | tr 'A-F' 'a-f')" ;; esac
   # Owner rule 2026-10-27 (keep USB reachable): every image except the safe boot_a reboots by itself after 60 s
   # without a USB host once configured (patch 0371), so a test that drops USB falls back to boot_a without buttons.
   # LOST_REBOOT=0 turns it off; LOST_REBOOT=S sets another period.
@@ -97,6 +107,8 @@ payload() {
 boot() {
   [ -f "$FD" ] || { echo "missing $FD (scripts/uefi/build.sh)" >&2; exit 1; }
   [ -f "$O/esp.img" ] || { echo "missing $O/esp.img (payload step)" >&2; exit 1; }
+  # Patch 0401: an ADT window that does not fit the Mu FD's "Kernel RAM" stops DarwinBoot ("NO WINDOW")
+  MU_FD=$FD python3 "$REPO/scripts/ios16/adt-extra.py" --check-ram "$O/negroni.adt" || exit 1
   # Shim (BOARD=negroni) as the kernel. Ramdisk = Mu FD padded to 1 MiB, then the payload FAT
   # (NegroniBootMemoryDxe finds it at that boundary). Same layout as slop uefi/negroni/shim-mu.sh.
   "$REPO/scripts/lib/native-env.sh" sh -c "

@@ -1,0 +1,222 @@
+NEGRONI RAM (0401): XNU manages the whole DarwinBoot window (7 GiB from config/negroni-ne2211.toml [adt] --dram)
+only after a self-check before arm_vm_init: window inside /chosen negroni-ram-bank, ADT dram-size/darwinboot-memory-size
+= boot_args memSize, no overlap with /chosen negroni-ram-reserved (the GPU region) or with the GPU pool of the
+boot-args (negronigpu_pool at negronigpu_poolbase). On a failure, or with the kill switch negroniram=0, XNU keeps
+3072 MiB (the maxmem path), as before. One "NEGRONI RAM: on: ..." / "NEGRONI RAM: off: <reason> ..." line at EARLY_BOOT.
+Host side: scripts/ios16/adt-extra.py (bank/reserved properties, Mu FD check, 3 GiB ADT fallback), patches/mu/0002,
+docs/notes.md section 90.
+
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index eb89b3c..862e70b 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -57,6 +57,9 @@
+ #include <pexpert/device_tree.h>
+ #include <arm64/proc_reg.h>
+ #include <arm64/negroni_early.h>
++#if defined(NEGRONI)
++extern uint64_t negroni_ram_limit(const boot_args *args, uint64_t memory_size);     /* osfmk/arm64/negroni_ram.c (0401) */
++#endif
+ #include <arm/pmap.h>
+ #include <arm/caches_internal.h>
+ #include <arm/cpu_internal.h>
+@@ -483,6 +486,10 @@ arm_init(
+ 	} else {
+ 		xmaxmem = 0;
+ 	}
++#if defined(NEGRONI)
++	/* 0401: XNU manages the whole boot window only when it passes the checks of negroni_ram.c */
++	xmaxmem = negroni_ram_limit(args, xmaxmem);
++#endif
+ 
+ #if SCHED_HYGIENE_DEBUG
+ 	{
+diff --git a/osfmk/arm64/negroni_ram.c b/osfmk/arm64/negroni_ram.c
+new file mode 100644
+index 0000000..bab378a
+--- /dev/null
++++ b/osfmk/arm64/negroni_ram.c
+@@ -0,0 +1,171 @@
++/*
++ * NEGRONI RAM (patch 0401): XNU gets more of the 12 GB phone's RAM, with a self-check and a 3 GiB fallback.
++ *
++ * The NE2211 has 9 GiB of contiguous System RAM at 0x840000000-0xA7FFFFFFF (docs/device-facts.md, ABL
++ * /memory banks 0x840000000 + 3 GiB and 0x900000000 + 6 GiB). DarwinBoot allocates XNU's window in the Mu
++ * "Kernel RAM" region (UEFI conventional memory) with the size of the ADT property /chosen
++ * darwinboot-memory-size and passes it as boot_args physBase/memSize. Until this patch the ADT asked for
++ * 3 GiB (0x841004000..0x901004000). With patch 0401 the build asks for 7 GiB (config/negroni-ne2211.toml
++ * [adt] --dram; layout in [ram]): window 0x841004000..0xa01004000, UEFI's own allocations above it up to the
++ * Mu "Kernel RAM" end 0xa20000000 (patches/mu/0002), then the GPU write-combined pool 0xa20000000..0xa80000000
++ * (negronigpu_poolbase/negronigpu_pool=1536, scripts/ios16/build.sh gives it the [ram] gpu region base).
++ *
++ * The physical aperture maps the managed RAM cacheable (arm_vm_init: physmap to real_avail_end =
++ * physBase + mem_size), so a write-combined view of any page in it is a mismatched alias. Before
++ * arm_vm_init this file checks the window, and only when every check passes XNU manages all of it:
++ *   1. /chosen negroni-ram-bank (u64 base, u64 size; scripts/ios16/adt-extra.py from [ram] bank) exists
++ *      and the window [physBase, physBase + memSize) is inside that bank;
++ *   2. /chosen dram-size and darwinboot-memory-size (when present) are memSize: the ADT that DarwinBoot
++ *      read is the ADT the build checked;
++ *   3. the window overlaps no range of /chosen negroni-ram-reserved (u64 base/size pairs: the GPU region);
++ *   4. the GPU pool that the boot-args ask for (negronigpu_pool MiB at negronigpu_poolbase, default
++ *      0x980000000 as NegroniGPU.cpp GPU_POOL_BASE) is outside the window.
++ * When a check fails (or with the kill switch negroniram=0) XNU manages only the first 3072 MiB of the
++ * window, as before this patch (the maxmem path of arm_vm_init: mem_size, max_mem and hw.memsize =
++ * 3072 MiB; the physical aperture also ends there, so the rest of the window has no cacheable mapping
++ * and nothing uses it). The ADT dram-size still names the whole window. A GPU pool inside the first
++ * 3072 MiB is refused by NegroniGPU (pmap_valid_page). A window of 3072 MiB or less (an older ADT) is left
++ * as it is.
++ *
++ * One line at EARLY_BOOT (the console is up then):
++ *   "NEGRONI RAM: on: 7168 MiB at 0x841004000..0xa01004000 (bank 0x840000000..0xa80000000; GPU pool
++ *    0xa20000000 + 1536 MiB outside)"
++ *   "NEGRONI RAM: off: <reason>; XNU keeps 3072 MiB of the 7168 MiB window at 0x841004000"
++ */
++
++#include <pexpert/arm64/board_config.h>
++
++#if defined(NEGRONI)
++
++#include <stdint.h>
++#include <string.h>
++#include <kern/misc_protos.h>
++#include <kern/startup.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/boot.h>
++#include <pexpert/device_tree.h>
++
++uint64_t negroni_ram_limit(const boot_args *args, uint64_t memory_size);
++
++#define NEGRONI_RAM_FALLBACK            (3ULL << 30)    /* what XNU managed before 0401 */
++#define NEGRONI_RAM_GPU_POOL_BASE       0x980000000ULL  /* NegroniGPU.cpp GPU_POOL_BASE (pool default) */
++#define NEGRONI_RAM_GPU_POOL_MAX_MIB    2048u           /* NegroniGPU.cpp GPU_POOL_MAX_MIB */
++#define NEGRONI_RAM_RESERVED_MAX        8u
++
++static char negroni_ram_line[256];
++
++static bool
++negroni_ram_overlap(uint64_t a0, uint64_t a1, uint64_t b0, uint64_t b1)
++{
++	return a0 < b1 && b0 < a1;
++}
++
++/* One u64 of an ADT property (any alignment); false when the property is missing or too short. */
++static bool
++negroni_ram_dt_u64(DTEntry chosen, const char *name, unsigned int index, uint64_t *out)
++{
++	void const *prop = NULL;
++	unsigned int len = 0;
++
++	if (SecureDTGetProperty(chosen, name, &prop, &len) != kSuccess || len < (index + 1) * 8) {
++		return false;
++	}
++	memcpy(out, (const uint8_t *)prop + index * 8, sizeof(*out));
++	return true;
++}
++
++/*
++ * Called by arm_init with the maxmem/hw.memsize limit (0: none) before arm_vm_init; returns the limit
++ * arm_vm_init applies. Runs before the console: the result is printed by negroni_ram_report.
++ */
++uint64_t
++negroni_ram_limit(const boot_args *args, uint64_t memory_size)
++{
++	const uint64_t base = args->physBase, size = args->memSize, end = base + size;
++	uint64_t bank = 0, bank_size = 0, v = 0, pool_base = NEGRONI_RAM_GPU_POOL_BASE;
++	uint32_t on = 1, pool_mib = 0;
++	char why[128];
++	DTEntry chosen = NULL;
++	void const *prop = NULL;
++	unsigned int len = 0;
++
++	why[0] = '\0';
++	if (size <= NEGRONI_RAM_FALLBACK) {
++		snprintf(negroni_ram_line, sizeof(negroni_ram_line),
++		    "NEGRONI RAM: off: the boot window is %llu MiB at 0x%llx (not above %llu MiB; ADT from before 0401)",
++		    size >> 20, base, NEGRONI_RAM_FALLBACK >> 20);
++		return memory_size;
++	}
++	PE_parse_boot_argn("negroniram", &on, sizeof(on));
++	PE_parse_boot_argn("negronigpu_pool", &pool_mib, sizeof(pool_mib));
++	PE_parse_boot_argn("negronigpu_poolbase", &pool_base, sizeof(pool_base));
++	if (pool_mib > NEGRONI_RAM_GPU_POOL_MAX_MIB) {
++		pool_mib = NEGRONI_RAM_GPU_POOL_MAX_MIB;
++	}
++
++	if (on == 0) {
++		snprintf(why, sizeof(why), "kill switch negroniram=0");
++	} else if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess) {
++		snprintf(why, sizeof(why), "no /chosen in the ADT");
++	} else if (!negroni_ram_dt_u64(chosen, "negroni-ram-bank", 0, &bank) ||
++	    !negroni_ram_dt_u64(chosen, "negroni-ram-bank", 1, &bank_size)) {
++		snprintf(why, sizeof(why), "no /chosen negroni-ram-bank in the ADT");
++	} else if (base < bank || bank_size > UINT64_MAX - bank || end > bank + bank_size || end < base) {
++		snprintf(why, sizeof(why), "window 0x%llx..0x%llx is outside the RAM bank 0x%llx..0x%llx",
++		    base, end, bank, bank + bank_size);
++	} else if (!negroni_ram_dt_u64(chosen, "dram-size", 0, &v) || v != size) {
++		snprintf(why, sizeof(why), "ADT dram-size 0x%llx is not the boot window size 0x%llx", v, size);
++	} else if (negroni_ram_dt_u64(chosen, "darwinboot-memory-size", 0, &v) && v != size) {
++		snprintf(why, sizeof(why), "ADT darwinboot-memory-size 0x%llx is not the boot window size 0x%llx", v, size);
++	} else if (pool_mib != 0 && negroni_ram_overlap(base, end, pool_base, pool_base + ((uint64_t)pool_mib << 20))) {
++		snprintf(why, sizeof(why), "GPU pool 0x%llx + %u MiB is inside the window 0x%llx..0x%llx",
++		    pool_base, pool_mib, base, end);
++	} else if (SecureDTGetProperty(chosen, "negroni-ram-reserved", &prop, &len) == kSuccess) {
++		if (len % 16 != 0 || len / 16 > NEGRONI_RAM_RESERVED_MAX) {
++			snprintf(why, sizeof(why), "/chosen negroni-ram-reserved has %u bytes (pairs of u64)", len);
++		}
++		for (unsigned int i = 0; why[0] == '\0' && i < len / 16; i++) {
++			uint64_t rb = 0, rs = 0;
++			negroni_ram_dt_u64(chosen, "negroni-ram-reserved", 2 * i, &rb);
++			negroni_ram_dt_u64(chosen, "negroni-ram-reserved", 2 * i + 1, &rs);
++			if (negroni_ram_overlap(base, end, rb, rb + rs)) {
++				snprintf(why, sizeof(why), "window 0x%llx..0x%llx overlaps the reserved range 0x%llx..0x%llx",
++				    base, end, rb, rb + rs);
++			}
++		}
++	}
++
++	if (why[0] != '\0') {
++		uint64_t limit = NEGRONI_RAM_FALLBACK;
++
++		if (memory_size != 0 && memory_size < limit) {
++			limit = memory_size;
++		}
++		snprintf(negroni_ram_line, sizeof(negroni_ram_line),
++		    "NEGRONI RAM: off: %s; XNU keeps %llu MiB of the %llu MiB window at 0x%llx", why, limit >> 20, size >> 20, base);
++		return limit;
++	}
++	if (pool_mib != 0) {
++		snprintf(negroni_ram_line, sizeof(negroni_ram_line),
++		    "NEGRONI RAM: on: %llu MiB at 0x%llx..0x%llx (bank 0x%llx..0x%llx; GPU pool 0x%llx + %u MiB outside)%s",
++		    size >> 20, base, end, bank, bank + bank_size, pool_base, pool_mib,
++		    (memory_size != 0 && memory_size < size) ? "; maxmem limits it" : "");
++	} else {
++		snprintf(negroni_ram_line, sizeof(negroni_ram_line),
++		    "NEGRONI RAM: on: %llu MiB at 0x%llx..0x%llx (bank 0x%llx..0x%llx; no GPU pool)%s",
++		    size >> 20, base, end, bank, bank + bank_size,
++		    (memory_size != 0 && memory_size < size) ? "; maxmem limits it" : "");
++	}
++	return memory_size;
++}
++
++static void
++negroni_ram_report(void)
++{
++	if (negroni_ram_line[0] != '\0') {
++		printf("%s\n", negroni_ram_line);
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, negroni_ram_report);
++
++#endif /* NEGRONI */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index 83ea9f0..940c00d 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -42,6 +42,7 @@ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/negroni_early.c	standard
+ osfmk/arm64/negroni_cpuidle.c	standard
++osfmk/arm64/negroni_ram.c	standard
+ osfmk/kern/negroni_top.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard

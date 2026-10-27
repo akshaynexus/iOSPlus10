@@ -16,8 +16,23 @@ run = "40007883255"                 # newest green run on 2026-10-24 (kernel 012
 
 [adt]
 tool = "external/slop/negroni-ios/tools/mkadt.py"
-# 3 GiB of kernel RAM at 0x840000000. Measured NE2211 (docs/device-facts.md): 9 GiB contiguous there.
-args = ["--board", "negroni", "--ufs", "--dram", "840000000:C0000000", "--darwinboot"]
+# --dram BASE:SIZE: SIZE = the XNU window DarwinBoot allocates (ADT darwinboot-memory-size), 7 GiB since kernel
+# patch 0401 (was C0000000 = 3 GiB): 0x841004000..0xA01004000. Layout and checks: [ram] below, docs/notes.md section 90.
+args = ["--board", "negroni", "--ufs", "--dram", "840000000:1C0000000", "--darwinboot"]
+
+# Physical RAM layout of the 9 GiB System RAM bank (docs/notes.md section 90). scripts/ios16/adt-extra.py:
+#  - writes /chosen negroni-ram-bank (bank) and negroni-ram-reserved (gpu) for the kernel self-check (patch 0401);
+#  - checks the window (adt --dram SIZE at Mu "Kernel RAM" base + 16 KiB) against the bank, the gpu region and the
+#    Mu FD's "Kernel RAM" region (read from out/mu/SILICIUM_UEFI-DEBUG.fd, with uefi_headroom left for UEFI);
+#    on a failure, or with XNU_RAM=0, it writes fallback into dram-size/darwinboot-memory-size and prints
+#    "NEGRONI RAM: off: <reason>".
+# scripts/ios16/build.sh gives the GPU pool its base: negronigpu_poolbase=<gpu base> (unless kernel_args has one).
+# Kernel kill switch: negroniram=0 (XNU keeps 3 GiB of the window).
+[ram]
+bank = "840000000:240000000"      # ABL /memory 0x840000000 + 3 GiB and 0x900000000 + 6 GiB, contiguous [V]
+gpu = "A20000000:60000000"        # outside XNU and UEFI: GPU write-combined pool, 1.5 GiB to the bank end (negronigpu_pool=1536)
+fallback = "C0000000"             # 3 GiB: the window before 0401
+uefi_headroom = "10000000"        # at least 256 MiB of the Mu region above the window for UEFI (0002 leaves 496 MiB)
 
 # Extra ADT properties (scripts/ios16/adt-extra.py). Locally administered MACs (02:...):
 # MobileGestalt needs them, else lsd/installd stall per app bundle (15+ min first boot).
@@ -69,7 +84,7 @@ kernel_args = [
   "negroniwifi=4",
   "negroniadreno=22",
   "negroniadreno_keep=1",
-  "negronigpu_pool=512",
+  "negronigpu_pool=1536",         # the whole [ram] gpu region at its base (build.sh adds negronigpu_poolbase); 0402: 512 was full 40 s after boot
   # no negronigpu_level: the 0384 governor (simple_ondemand on the GMU busy counter, 220-818 MHz) picks the level;
   # negronigpu_level=N (BOOTARGS_ADD) is a fixed-level override that turns the governor off
 ]

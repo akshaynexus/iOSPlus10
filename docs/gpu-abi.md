@@ -250,7 +250,7 @@ Rules for user space:
    a Vulkan application that reads GPU results through a mapping without
    `vkInvalidateMappedMemoryRanges` can see stale data. Turnip's own `MSM_BO_CACHED` memory
    (`HOST_CACHED`, not coherent) is handled by Turnip itself (`dc civac` from EL0: XNU sets
-   `SCTLR_EL1.UCI`). **Boot with `negronigpu_pool=512` (or more) for Turnip.**
+   `SCTLR_EL1.UCI`). **Boot with `negronigpu_pool=512` (or more) for Turnip; the config uses 2048 since 0402.**
 4. Why not write-combined own buffers: a write-combined view of memory XNU manages is a
    mismatched alias of its cacheable physical aperture (ios-sailfish froze, boot 0150a;
    ios-flame lost data). The slop 0118 GEM_NEW did exactly that (`kIOMapWriteCombineCache`

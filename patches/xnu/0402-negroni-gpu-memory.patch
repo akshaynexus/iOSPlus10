@@ -1,0 +1,377 @@
+NEGRONI GPU memory (0402): who holds the wired IOKit memory, and the write-combined pool sized to the [ram] gpu region.
+RedwoodGPU counts per client and in total: buffers of their own in wired kernel RAM, pool use, host imports (and
+buffers left to a GPU that did not finish). The NEGRONI WIRED near/refused lines (0399) carry
+"GPU RAM <MiB>, pool <used>/<size> MiB (full <n> times), host <MiB>; top (RAM+pool+host MiB) <3 clients>", each
+client's close line its RAM/pool/host and its most. "RedwoodGPU: pool full ..." (first 4, then every 256th) when a
+write-combined buffer falls back to wired kernel RAM. Pool: first fit from the lowest free page (in-use count, no
+scan of the full start), never past the end of the RAM bank 0xa80000000; config negronigpu_pool=2048 (was 512).
+Details: patches/xnu/README-gpu-kernel.md section 32, docs/notes.md section 91.
+
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index 74266bf..f347345 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -274,7 +274,9 @@ struct scalar_ib {
+ #define GPU_ASK_AGAIN_US        200
+ #define GPU_VA_WINDOW           (4ull << 30)            /* MSM_PARAM_VA_SIZE */
+ #define GPU_POOL_BASE           0x980000000ull
+-#define GPU_POOL_MAX_MIB        2048u
++#define GPU_POOL_MAX_MIB        2048u                   /* = the config [ram] gpu region (0401 negroni_ram.c) */
++#define GPU_POOL_RAM_END        0xa80000000ull          /* 0402: NE2211 System RAM 0x840000000-0xa7fffffff */
++#define GPU_CLIENTS_LISTED      64u                     /* 0402: clients the memory line sees */
+ 
+ enum { kBufferFree = 0, kBufferOwn, kBufferPool, kBufferImport, kBufferHost };
+ 
+@@ -429,7 +431,31 @@ cacheIfWritten(uint64_t pa)
+ static uint64_t gPoolBase;
+ static uint32_t gPoolPages;                     /* PAGE_SIZE pages */
+ static uint8_t * gPoolUsed;                     /* a byte per page */
++static uint32_t gPoolInUse;                     /* 0402: pages handed out (gGPULock) */
++static uint32_t gPoolLow;                       /* 0402: no free page below it (gGPULock) */
++static uint32_t gPoolFull;                      /* 0402: write-combined buffers the pool had no room for */
+ 
++/*
++ * 0402: the memory the clients hold, for NegroniGPUMemoryLine (the NEGRONI WIRED lines) and each
++ * client's close line. RAM = buffers of their own (wired kernel RAM), host = host imports (the
++ * client's pages, wired). gClientsLock is a leaf lock: nothing else is taken under it.
++ */
++static uint64_t gGPURamBytes;                   /* atomic */
++static uint64_t gGPUHostBytes;                  /* atomic */
++static uint64_t gGPULeftBytes;                  /* atomic: buffers the GPU did not finish with (they stay) */
++static IOLock * gClientsLock;
++class RedwoodGPUUserClient;
++static RedwoodGPUUserClient * gClients[GPU_CLIENTS_LISTED];
++
++/*
++ * Patch 0402: the config's pool is the whole [ram] gpu region (negronigpu_pool=2048 at 0xa00000000).
++ * The 512 MiB pool was full ~40 s after boot (2026-10-27 21:13: 49 metal2vulkan blocks of 8 MiB in
++ * 10 Metal processes, 16 of them already in wired kernel RAM), and every write-combined buffer after
++ * that was wired kernel RAM (makeBuffer's fallback): ~1 GiB of IOKit wired memory that was not
++ * surfaces, then the 0399 refusals and a low-swap kill of mediaserverd. The pool never goes past the
++ * end of the RAM bank (GPU_POOL_RAM_END); "pool full" lines and the memory line (NegroniGPUMemoryLine)
++ * count it.
++ */
+ static void
+ poolInit(void)
+ {
+@@ -439,9 +465,19 @@ poolInit(void)
+ 	PE_parse_boot_argn("negronigpu_pool", &mib, sizeof(mib));
+ 	PE_parse_boot_argn("negronigpu_poolbase", &base, sizeof(base));
+ 	if (mib == 0) {
++		IOLog("RedwoodGPU: pool off: no negronigpu_pool (every GPU buffer is wired kernel RAM)\n");
+ 		return;
+ 	}
+ 	uint64_t size = (uint64_t)MIN(mib, GPU_POOL_MAX_MIB) << 20;
++	if (base >= GPU_POOL_RAM_END) {
++		IOLog("RedwoodGPU: pool off: base 0x%llx is past the end of RAM 0x%llx\n", base, GPU_POOL_RAM_END);
++		return;
++	}
++	if (base + size > GPU_POOL_RAM_END) {
++		IOLog("RedwoodGPU: pool 0x%llx + %u MiB cut to %llu MiB at the end of RAM 0x%llx\n", base, mib,
++		    (GPU_POOL_RAM_END - base) >> 20, GPU_POOL_RAM_END);
++		size = GPU_POOL_RAM_END - base;
++	}
+ 	if ((base & PAGE_MASK) || pmap_valid_page((ppnum_t)(base >> PAGE_SHIFT)) ||
+ 	    pmap_valid_page((ppnum_t)((base + size - 1) >> PAGE_SHIFT))) {
+ 		IOLog("RedwoodGPU: pool 0x%llx + %u MiB refused: not page aligned or memory XNU manages\n", base, mib);
+@@ -461,11 +497,19 @@ poolAlloc(uint64_t size)
+ {
+ 	uint32_t want = (uint32_t)(size / PAGE_SIZE), run = 0;
+ 
+-	for (uint32_t i = 0; i < gPoolPages; i++) {
++	if (want == 0 || want > gPoolPages - gPoolInUse) {
++		return 0;
++	}
++	/* 0402: first fit from the lowest page that may be free (the same pick, without the scan of the full start) */
++	for (uint32_t i = gPoolLow; i < gPoolPages; i++) {
+ 		run = gPoolUsed[i] ? 0 : run + 1;
+ 		if (run == want) {
+ 			uint32_t first = i + 1 - want;
+ 			memset(gPoolUsed + first, 1, want);
++			gPoolInUse += want;
++			if (first == gPoolLow) {
++				gPoolLow = i + 1;
++			}
+ 			return gPoolBase + (uint64_t)first * PAGE_SIZE;
+ 		}
+ 	}
+@@ -476,7 +520,13 @@ poolAlloc(uint64_t size)
+ static void
+ poolFree(uint64_t pa, uint64_t size)
+ {
+-	memset(gPoolUsed + (pa - gPoolBase) / PAGE_SIZE, 0, (size_t)(size / PAGE_SIZE));
++	uint32_t first = (uint32_t)((pa - gPoolBase) / PAGE_SIZE), n = (uint32_t)(size / PAGE_SIZE);
++
++	memset(gPoolUsed + first, 0, n);
++	gPoolInUse -= n;
++	if (first < gPoolLow) {
++		gPoolLow = first;
++	}
+ }
+ 
+ /* ---- the service ---- */
+@@ -512,6 +562,10 @@ RedwoodGPU::start(IOService * provider)
+ 			return false;
+ 		}
+ 		poolInit();
++		IOLock * clients = IOLockAlloc();       /* 0402 */
++		if (clients != NULL && !OSCompareAndSwapPtr(NULL, clients, &gClientsLock)) {
++			IOLockFree(clients);
++		}
+ 	}
+ 	if (!IOService::start(provider)) {
+ 		return false;
+@@ -602,6 +656,10 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	uint32_t                fCap;
+ 	uint64_t                fOwnBytes;
+ 	uint64_t                fHostBytes;             /* host imports (0x49) */
++	uint64_t                fRamBytes;              /* 0402: of fOwnBytes, wired kernel RAM (the rest is pool) */
++	uint64_t                fPeakBytes;             /* 0402: the most fOwnBytes + fHostBytes it held */
++	int                     fListed;                /* 0402: index in gClients, or -1 */
++	friend void NegroniGPUMemoryLine(char *buf, size_t len);
+ 	uint64_t                fWindow;                /* MSM_PARAM_VA_START (0: none asked for) */
+ 	uint64_t                fWindowSize;
+ 	struct negroni_gpu_vm * fVM;                    /* own tables (negronigpu_pt=1), else NULL: the shared ones */
+@@ -660,10 +718,96 @@ RedwoodGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32
+ 	}
+ 	fTask = owningTask;
+ 	proc_selfname(fName, sizeof(fName));
++	fListed = -1;
+ 	fLock = IOLockAlloc();
+ 	return fLock != NULL;
+ }
+ 
++/* 0402: the client in gClients (for the memory line), while there is room. */
++static void
++listClient(RedwoodGPUUserClient * c, int * slot)
++{
++	if (gClientsLock == NULL) {
++		return;
++	}
++	IOLockLock(gClientsLock);
++	for (uint32_t i = 0; i < GPU_CLIENTS_LISTED && *slot < 0; i++) {
++		if (gClients[i] == NULL) {
++			gClients[i] = c;
++			*slot = (int)i;
++		}
++	}
++	IOLockUnlock(gClientsLock);
++}
++
++static void
++unlistClient(RedwoodGPUUserClient * c, int * slot)
++{
++	if (gClientsLock == NULL || *slot < 0) {
++		return;
++	}
++	IOLockLock(gClientsLock);
++	if (gClients[*slot] == c) {
++		gClients[*slot] = NULL;
++	}
++	*slot = -1;
++	IOLockUnlock(gClientsLock);
++}
++
++void
++NegroniGPUMemoryLine(char *buf, size_t len)
++{
++	struct {
++		uint64_t ram, pool, host;
++		char name[24];
++	} top[3];
++	int n;
++
++	if (len == 0) {
++		return;
++	}
++	buf[0] = 0;
++	if (gGPULock == NULL || gClientsLock == NULL) {
++		return;
++	}
++	bzero(top, sizeof(top));
++	IOLockLock(gClientsLock);
++	for (uint32_t i = 0; i < GPU_CLIENTS_LISTED; i++) {
++		RedwoodGPUUserClient * c = gClients[i];
++		if (c == NULL) {
++			continue;
++		}
++		/* without the client's lock: a log line, aligned 64-bit reads */
++		uint64_t ram = __atomic_load_n(&c->fRamBytes, __ATOMIC_RELAXED);
++		uint64_t own = __atomic_load_n(&c->fOwnBytes, __ATOMIC_RELAXED);
++		uint64_t host = __atomic_load_n(&c->fHostBytes, __ATOMIC_RELAXED);
++		uint64_t pool = own > ram ? own - ram : 0;
++		for (uint32_t t = 0; t < 3; t++) {
++			if (ram + pool + host > top[t].ram + top[t].pool + top[t].host) {
++				memmove(&top[t + 1], &top[t], (2 - t) * sizeof(top[0]));
++				top[t].ram = ram;
++				top[t].pool = pool;
++				top[t].host = host;
++				strlcpy(top[t].name, c->fName, sizeof(top[t].name));
++				break;
++			}
++		}
++	}
++	IOLockUnlock(gClientsLock);
++	n = snprintf(buf, len, "GPU RAM %llu MiB, pool %llu/%llu MiB (full %u times), host %llu MiB",
++	    __atomic_load_n(&gGPURamBytes, __ATOMIC_RELAXED) >> 20,
++	    ((uint64_t)__atomic_load_n(&gPoolInUse, __ATOMIC_RELAXED) * PAGE_SIZE) >> 20,
++	    ((uint64_t)gPoolPages * PAGE_SIZE) >> 20, __atomic_load_n(&gPoolFull, __ATOMIC_RELAXED),
++	    __atomic_load_n(&gGPUHostBytes, __ATOMIC_RELAXED) >> 20);
++	if (__atomic_load_n(&gGPULeftBytes, __ATOMIC_RELAXED) != 0 && n > 0 && (size_t)n < len) {
++		n += snprintf(buf + n, len - n, ", left to the GPU %llu MiB", __atomic_load_n(&gGPULeftBytes, __ATOMIC_RELAXED) >> 20);
++	}
++	for (uint32_t t = 0; t < 3 && top[t].name[0] != 0 && n > 0 && (size_t)n < len; t++) {
++		n += snprintf(buf + n, len - n, "%s%s %llu+%llu+%llu", t == 0 ? "; top (RAM+pool+host MiB) " : ", ",
++		    top[t].name, top[t].ram >> 20, top[t].pool >> 20, top[t].host >> 20);
++	}
++}
++
+ bool
+ RedwoodGPUUserClient::start(IOService * provider)
+ {
+@@ -680,7 +824,11 @@ RedwoodGPUUserClient::start(IOService * provider)
+ 			return false;
+ 		}
+ 	}
+-	return IOUserClient::start(provider);
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	listClient(this, &fListed);     /* 0402 */
++	return true;
+ }
+ 
+ /* fLock held. */
+@@ -849,11 +997,20 @@ RedwoodGPUUserClient::freeBuffer(struct gpu_buffer * b)
+ 		IOLockUnlock(gGPULock);
+ 	}
+ 	if (b->kind == kBufferOwn || b->kind == kBufferPool) {
++		if (b->kind == kBufferOwn) {
++			fRamBytes -= b->size;   /* 0402: before fOwnBytes (lock-free readers: RAM <= own) */
++			OSAddAtomic64(-(SInt64)b->size, (volatile SInt64 *)&gGPURamBytes);
++		}
+ 		fOwnBytes -= b->size;
+ 	} else if (b->kind == kBufferHost) {
+ 		fHostBytes -= b->size;
++		OSAddAtomic64(-(SInt64)b->size, (volatile SInt64 *)&gGPUHostBytes);     /* 0402 */
+ 	}
+ 	if (done != kIOReturnSuccess) {
++		if (b->kind == kBufferOwn || b->kind == kBufferHost) {
++			/* 0402: wired pages no other counter shows (pool and surface imports keep their counts) */
++			OSAddAtomic64((SInt64)b->size, (volatile SInt64 *)&gGPULeftBytes);
++		}
+ 		IOLog("RedwoodGPU: the GPU is not done with a buffer of %llu bytes: it stays its own\n", b->size);
+ 		fLeaked = true;
+ 		OSSafeReleaseNULL(b->umap);     /* the program's view goes; the pages and the GPU's stay */
+@@ -905,7 +1062,12 @@ RedwoodGPUUserClient::freeAll(void)
+ IOReturn
+ RedwoodGPUUserClient::clientClose(void)
+ {
+-	IOLog("RedwoodGPU: %s closes\n", fName);
++	/* 0402: what it held at the end (freeAll gives it back now) and its most; fLock: a consistent set */
++	IOLockLock(fLock);
++	uint64_t ram = fRamBytes, pool = fOwnBytes - fRamBytes, host = fHostBytes, most = fPeakBytes;
++	IOLockUnlock(fLock);
++	IOLog("RedwoodGPU: %s closes (RAM %llu MiB, pool %llu MiB, host %llu MiB; most %llu MiB)\n", fName,
++	    ram >> 20, pool >> 20, host >> 20, most >> 20);
+ 	OSIncrementAtomic((volatile SInt32 *)&gGPUCloses);
+ 	freeAll();
+ 	if (!isInactive()) {
+@@ -917,6 +1079,7 @@ RedwoodGPUUserClient::clientClose(void)
+ void
+ RedwoodGPUUserClient::free(void)
+ {
++	unlistClient(this, &fListed);   /* 0402: before anything of it goes */
+ 	if (fLock != NULL) {
+ 		if (gGPULock != NULL) {
+ 			freeAll();              /* clientClose did it, unless the client never got that far */
+@@ -960,7 +1123,17 @@ RedwoodGPUUserClient::makeBuffer(uint64_t size, uint32_t flags, bool scalar, uin
+ 		uint64_t pa;
+ 		IOLockLock(gGPULock);
+ 		pa = poolAlloc(size);
++		uint64_t inUse = (uint64_t)gPoolInUse * PAGE_SIZE;
+ 		IOLockUnlock(gGPULock);
++		if (pa == 0) {
++			/* 0402: it goes to wired kernel RAM (0399 guard) */
++			uint32_t full = OSIncrementAtomic((volatile SInt32 *)&gPoolFull) + 1;
++			if (full <= 4 || (full & 255) == 0) {
++				IOLog("RedwoodGPU: pool full (%llu of %llu MiB in use): a write-combined buffer of %llu KiB for %s "
++				    "is wired kernel RAM (time %u)\n", inUse >> 20, ((uint64_t)gPoolPages * PAGE_SIZE) >> 20,
++				    size >> 10, fName, full);
++			}
++		}
+ 		if (pa != 0) {
+ 			b->memory = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
+ 			if (b->memory == NULL) {
+@@ -1002,6 +1175,11 @@ RedwoodGPUUserClient::makeBuffer(uint64_t size, uint32_t flags, bool scalar, uin
+ 		goto fail;
+ 	}
+ 	fOwnBytes += size;
++	if (b->kind == kBufferOwn) {
++		fRamBytes += size;      /* 0402 */
++		OSAddAtomic64((SInt64)size, (volatile SInt64 *)&gGPURamBytes);
++	}
++	fPeakBytes = MAX(fPeakBytes, fOwnBytes + fHostBytes);
+ 	if (scalar) {
+ 		/* the scalar ABI hands out the program's mapping (cached: see the top of this file) */
+ 		b->umap = b->memory->createMappingInTask(fTask, 0, kIOMapAnywhere);
+@@ -1141,6 +1319,8 @@ RedwoodGPUUserClient::importHost(uint64_t pointer, uint64_t size, uint32_t flags
+ 		return kIOReturnNoMemory;
+ 	}
+ 	fHostBytes += size;
++	OSAddAtomic64((SInt64)size, (volatile SInt64 *)&gGPUHostBytes);         /* 0402 */
++	fPeakBytes = MAX(fPeakBytes, fOwnBytes + fHostBytes);
+ 	return kIOReturnSuccess;
+ }
+ 
+diff --git a/iokit/Kernel/arm/NegroniGPU.h b/iokit/Kernel/arm/NegroniGPU.h
+index 01dce51..b9fba75 100644
+--- a/iokit/Kernel/arm/NegroniGPU.h
++++ b/iokit/Kernel/arm/NegroniGPU.h
+@@ -80,5 +80,13 @@ uint32_t NegroniGPUSurfaceWaitMS(void);
+ #define NEGRONI_WIRED_GUARD_UI_PERCENT 65       /* backboardd and SpringBoard (who): a reserve above the limit */
+ bool NegroniWiredAllow(uint64_t bytes, const char *who, const char *what);
+ 
++/*
++ * 0402 (NegroniGPU.cpp): RedwoodGPU's memory for the NEGRONI WIRED lines, written into buf:
++ * "GPU RAM <MiB>, pool <used>/<size> MiB, host <MiB>, top <name> <ram>+<pool>+<host> ..." (wired
++ * kernel RAM of buffers of their own, the write-combined pool outside the kernel's RAM, host
++ * imports; the 3 clients with the most). Empty before RedwoodGPU started.
++ */
++void NegroniGPUMemoryLine(char *buf, size_t len);
++
+ #endif /* NEGRONI */
+ #endif /* _NEGRONI_GPU_H */
+diff --git a/iokit/Kernel/arm/NegroniSurface.cpp b/iokit/Kernel/arm/NegroniSurface.cpp
+index 1c16031..363f330 100644
+--- a/iokit/Kernel/arm/NegroniSurface.cpp
++++ b/iokit/Kernel/arm/NegroniSurface.cpp
+@@ -156,18 +156,24 @@ NegroniWiredAllow(uint64_t bytes, const char *who, const char *what)
+ 	uint64_t wired = (uint64_t)vm_page_wire_count * PAGE_SIZE;
+ 	if (wired + bytes <= limit) {
+ 		if (wired + bytes > limit / 10 * 9 && !__atomic_exchange_n(&negroni_wired_near, true, __ATOMIC_RELAXED)) {
++			char gpu[256];
++
++			NegroniGPUMemoryLine(gpu, sizeof(gpu));         /* 0402 */
+ 			IOLog("NEGRONI WIRED: near the limit: %s of %llu KiB for %s: %llu MiB wired, limit %llu MiB, "
+-			    "surfaces %llu MiB (once per boot)\n", what, bytes >> 10, who != NULL ? who : "?", wired >> 20,
+-			    limit >> 20, __atomic_load_n(&negroni_surface_wired, __ATOMIC_RELAXED) >> 20);
++			    "surfaces %llu MiB; %s (once per boot)\n", what, bytes >> 10, who != NULL ? who : "?", wired >> 20,
++			    limit >> 20, __atomic_load_n(&negroni_surface_wired, __ATOMIC_RELAXED) >> 20, gpu);
+ 		}
+ 		return true;
+ 	}
+ 	uint32_t n = OSIncrementAtomic((volatile SInt32 *)&negroni_wired_refusals) + 1;
+ 	if (n <= 8 || (n & 255) == 0) {
++		char gpu[256];
++
++		NegroniGPUMemoryLine(gpu, sizeof(gpu));         /* 0402: who holds the GPU memory */
+ 		IOLog("NEGRONI WIRED: refused %s of %llu KiB for %s: %llu MiB wired, limit %llu MiB, %llu MiB free, "
+-		    "surfaces %llu MiB (refusal %u)\n", what, bytes >> 10, who != NULL ? who : "?", wired >> 20,
++		    "surfaces %llu MiB; %s (refusal %u)\n", what, bytes >> 10, who != NULL ? who : "?", wired >> 20,
+ 		    limit >> 20, ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20,
+-		    __atomic_load_n(&negroni_surface_wired, __ATOMIC_RELAXED) >> 20, n);
++		    __atomic_load_n(&negroni_surface_wired, __ATOMIC_RELAXED) >> 20, gpu, n);
+ 	}
+ 	return false;
+ }

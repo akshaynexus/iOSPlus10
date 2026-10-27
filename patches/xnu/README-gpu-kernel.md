@@ -1856,3 +1856,62 @@ it is lost between backboardd's display path and the panel.
   before 0399: OK. Not booted.
 - Phone: Safari video for 10 min. Expect the start line, then either no `refused` line or `refused` lines for
   WebKit only, and no freeze. If backboardd or SpringBoard shows in a `refused` line, raise the UI percent.
+
+## 32. Who wires the IOKit memory: GPU memory accounting and the full-size pool (0402, `0402-negroni-gpu-memory.patch`)
+
+### Measurement (image t30a, kernel local-20261027-152942, 2026-10-27 21:13-21:20, no new code)
+- [V] Boot 21:13:06. 21:13:53 `NEGRONI WIRED: near the limit: ... 1511 MiB wired, surfaces 190 MiB`. 21:14:01 refusals
+  for mediaserverd (Camera): GPU buffer 6816 KiB, surface 1504x1128 420f 2576 KiB, at 1687 MiB wired, 27-38 MiB free,
+  surfaces 250-253 MiB. 21:14:12 `low swap: killing largest compressed process with pid 28 (mediaserverd)`.
+- [V] 21:15 (Camera closed): `zprint` VM_KERN_MEMORY_IOKIT 806592K now, peak 1640112K; `vm_stat` wired 64135 pages
+  (1002 MiB). `ioreg` IOKitDiagnostics: "IOMalloc allocation" 705986527 (673 MiB: IOMallocAligned, so the kernel
+  IOBufferMemoryDescriptors of surfaces and GPU buffers), 258 IOBufferMemoryDescriptor, 39 NegroniSurface, 11
+  RedwoodGPUUserClient. Boot baseline 86 MiB.
+- [V] `footprint -v -w -a` (deduplicated by VM object): 2056 IOKit objects mapped into processes, 980 MiB of VA.
+  482 MiB of it has no dirty page: RAM XNU does not manage (the GPU pool, the display slots). 497 MiB is dirty =
+  wired kernel RAM.
+- [V] 49 objects of exactly 8192 KiB, each mapped by one Metal process only: metal2vulkan pooled blocks
+  (`m2v-flame/0100`, BLOCK_BYTES 8 MiB): backboardd 11, chronod 10, CollectionsPoster 7, SpringBoard 4,
+  WeatherPoster 4, MapKit snapshot 4, PridePosterExtension 3, Maps/PosterBoard/AegirPoster 2 each (392 MiB). 33 are
+  clean (pool), 16 dirty (128 MiB of wired kernel RAM). metal2vulkan asks for write-combined memory for these
+  blocks (Shared/Private classes need HOST_COHERENT, Turnip's WC type), so a dirty block means that the pool
+  was full when it was made. 64 more dirty 256 KiB objects (16 MiB) in backboardd/others.
+- [V] `t30a/cmdline.txt` has `negronigpu_pool=512`: pool 0x980000000 + 512 MiB.
+- [I] Conclusion: the 512 MiB pool was full about 40 s after boot (10 Metal processes, each holds blocks:
+  metal2vulkan keeps 2 empty blocks a pool, recycles up to 128 MiB of images and 64 MiB of buffers a process for
+  1 s, and frees them only at its next call). Every write-combined GPU buffer after that is
+  `kBufferOwn` = wired kernel RAM (makeBuffer's fallback). That is most of the ~1 GiB of IOKit wired memory that is
+  not surfaces (surfaces: 190-253 MiB). Not measured: the split between own buffers and host imports (0x49, fresh
+  pages of metal2vulkan for buffers longer than 4 MiB: user pages, wired by prepare(), IOKit tag). Camera ring
+  (negroni_cam, NRING 3) and other drivers are small and freed at session end.
+- Comparison: a 3 GB iPhone wires a few hundred MiB of IOKit memory; its IOSurfaces and AGX memory are mostly pageable
+  or purgeable and charged to the owner task.
+
+### What 0402 does
+- Accounting (RedwoodGPU): per client `fRamBytes` (own buffers in wired kernel RAM), pool bytes, `fHostBytes`, and the
+  most it held; totals `gGPURamBytes`, `gGPUHostBytes`, pool pages in use, "pool full" count, bytes of own (RAM) and
+  host buffers left to a GPU that did not finish (pool and surface imports stay in their own counts). Live clients in a 64-entry table under a leaf lock (`gClientsLock`).
+- `NegroniGPUMemoryLine()` (NegroniGPU.h) goes into the NEGRONI WIRED `near the limit` and `refused` lines:
+  `GPU RAM <MiB>, pool <used>/<size> MiB (full <n> times), host <MiB>; top (RAM+pool+host MiB) <name> a+b+c, ...`.
+- `RedwoodGPU: <name> closes (RAM .. MiB, pool .. MiB, host .. MiB; most .. MiB)`.
+- `RedwoodGPU: pool full (<used> of <size> MiB in use): a write-combined buffer of <KiB> for <name> is wired kernel RAM
+  (time <n>)`: first 4, then every 256th.
+- `RedwoodGPU: pool off: no negronigpu_pool ...` when the boot-arg is not there (was silent).
+- Pool: never past the end of the RAM bank (`GPU_POOL_RAM_END` 0xa80000000: cut with one line). First fit starts at
+  the lowest page that may be free and stops at once when fewer pages are free than asked (same pick as before).
+  `GPU_POOL_MAX_MIB` stays 2048 (= the `[ram] gpu` region of 0401).
+- Config: `negronigpu_pool=2048` (was 512): the whole `[ram] gpu` region 0xA00000000-0xA7FFFFFFF (0401 layout). With
+  the old 3 GiB layout (ios16-safe, base 0x980000000) the pool is 0x980000000-0x9FFFFFFFF, also outside XNU.
+  Update (0401 review, notes section 90): the final layout is XNU 7 GiB and `[ram] gpu` 0xA20000000-0xA7FFFFFFF, so the
+  config is `negronigpu_pool=1536`, and build.sh passes `negronigpu_poolbase=0xa20000000` to every image (also ios16-safe).
+
+### Verification
+- Compile: STAGE=0 scratch tree with all patches/xnu through 0400, `scripts/kernel/compile-one.sh`: NegroniGPU.cpp,
+  NegroniSurface.cpp OK, no new warning. `git apply --check` on that tree: OK. 0402 touches no file of 0401. Not booted.
+- Phone test (next image): expect `RedwoodGPU: write-combined pool 0xa20000000..0xa7fffffff (1536 MiB)`. Open the
+  Camera and Safari video. Expect no `pool full` line, IOKit wired (`zprint` VM_KERN_MEMORY_IOKIT) = surfaces + host
+  imports + small driver buffers (a few hundred MiB), and no NEGRONI WIRED refusal. Any `near`/`refused` line now names
+  the GPU totals and the top 3 clients.
+- Open (not in 0402): metal2vulkan's per-process retention (2 kept empty blocks a pool, 128 + 64 MiB recycle bounds,
+  freed only at the next call of the process) is sized for a desktop. If the pool fills again, lower these bounds
+  in a flame patch (`m2v-flame`).
