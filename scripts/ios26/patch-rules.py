@@ -14,6 +14,7 @@ list of file names or number prefixes, "*" = every patch) and one line "why". Ki
                12377 port of those files, for a change that the other kinds cannot express (listed in README)
 
 A rule for named patches that changes nothing is an ERROR (stale rule). "*" rules may match nothing.
+"tag" (optional) names the rule in the result line (default: its kind).
 Skips (patches that 12377 does not need, or that are in the 12377 base) are in patches/xnu-12377/skip.txt.
 """
 from pathlib import Path
@@ -36,7 +37,7 @@ SKIP = _read_skip()
 
 RULES = [
     dict(patches="*", kind="sub", file="bsd/dev/negroni_*.c", old="#include <vm/vm_kern.h>",
-         new="#include <vm/vm_kern_xnu.h>",
+         new="#include <vm/vm_kern_xnu.h>", tag="vm_kern_xnu.h",
          why="12377: kmem_alloc/kmem_free/KMA_* moved from vm_kern.h to vm_kern_xnu.h"),
     dict(patches=["0015"], kind="sub", multiline=True, regex=True, file="bsd/kern/kern_trustcache.c",
          old=r"^ #if   PMAP_CS_PPL_MONITOR\n \tret = ppl_(\w+)\((.*)\);\n",
@@ -124,5 +125,5 @@ BASE_OWNED = {
 # in 12377 (apply_glue), instead of a text hunk. 8796 and 12377 differ around our lines; the order is free.
 GLUE_FILES = [
     "bsd/conf/files", "bsd/conf/files.arm64", "iokit/conf/files", "iokit/conf/files.arm64",
-    "libkern/conf/files", "osfmk/conf/files", "osfmk/conf/files.arm64", "*/conf/Makefile.template",
+    "libkern/conf/files", "osfmk/conf/files", "osfmk/conf/files.arm64",
 ]

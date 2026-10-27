@@ -343,7 +343,7 @@ def main():
             continue
         text = p.read_text(encoding="latin-1")
         mine = [(i, r) for i, r in enumerate(rules) if matches(r, name)]
-        nrules, stale = 0, []
+        tags, stale = [], []
         if mine:
             pre, secs = parse(text)
             for i, r in mine:
@@ -352,11 +352,11 @@ def main():
                 c = apply_text_rule(r, secs)
                 rule_hits[i] += c
                 if r["patches"] != "*":
-                    nrules += 1
+                    tags.append(r.get("tag", r["kind"]))
                     if c == 0:
                         stale.append(r["why"])
                 elif c:
-                    nrules += 1
+                    tags.append(r.get("tag", r["kind"]))
             text = render(pre, secs)
         # files owned by the 12377 base: their iOS 16 hunks are in base 000N (ported); a patch not listed
         # for that file is an ERROR (port its change into the base patch, then list it)
@@ -369,7 +369,7 @@ def main():
             if own is None or listed(own[2] if len(own) > 2 else ""):
                 keep.append(s)
             elif listed(own[1]):
-                nrules += 1
+                tags.append("base " + own[0])
             else:
                 owned_err.append(f"{s.path} (owned by base {own[0]})")
         if owned_err:
@@ -382,7 +382,7 @@ def main():
                 and not any(l.startswith(("--- /dev/null", "new file")) for l in s.header)]
         keep = [s for s in keep if s not in glue]
         if glue:
-            nrules += 1
+            tags.append("glue")
         text = render(pre, keep)
         if stale:
             res(name, "ERROR: rule did not match (stale): " + "; ".join(stale))
@@ -413,12 +413,12 @@ def main():
             if r["kind"] == "post_sub":
                 c = apply_tree_rule(r, xnu)
                 rule_hits[i] += c
-                nrules += 1
+                tags.append("post_sub")
                 if c == 0 and r["patches"] != "*":
                     res(name, "ERROR: post rule did not match (stale): " + r["why"])
-        if nrules:
+        if tags:
             count["applied+rules"] += 1
-            res(name, f"applied+rules({nrules})")
+            res(name, f"applied+rules({len(tags)}): " + ", ".join(sorted(set(tags))))
         else:
             count["applied"] += 1
             res(name, "applied")
