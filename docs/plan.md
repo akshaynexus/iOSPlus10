@@ -2,6 +2,13 @@
 
 Status date: 2026-10-27 (12:15).
 
+## Priorities (2026-10-27 20:55, owner)
+1. GPU acceleration working (Metal; 0389/0395/0398/0399 in test).
+2. Video playback working (0390 plane layout + 0399 wired-memory guard; t29/t29b froze from wired-memory exhaustion).
+3. Audio working (never worked: the ADSP start drops USB; audio agent on it).
+TODO later (owner): cellular. 0397 boots the modem for GNSS only (never ONLINE). 4G/5G data and SIM detection need the
+modem ONLINE, IPA, QMI DMS/NAS/WDS/UIM and the iOS CommCenter side.
+
 ## TODO (2026-10-27, end of the night session; owner: "bluetooth works, wifi doesn't")
 State 2026-10-27 14:50: the phone runs stock Android + Magisk again (restore.sh --magisk, userdata formatted: no iOS root on
 the phone). An iOS test session starts with a full iOS flash (scripts/flash/ios16.sh order) and ends with restore.sh --magisk.
