@@ -1,0 +1,165 @@
+NegroniMetal change to ios-flame 745c434 phone/metal2 (after flame/0015), for metal2vulkan f6a96b7d:
+- Textures over IOSurfaces with planes (newTextureWithDescriptor:iosurface:plane:). Before, every surface with plane info
+  returned nil without a log line: RenderBox's widget drawables in chronod (OSType '_RB4', RGB10A8_2P_XR10) and the
+  same surfaces in backboardd ("Failed to allocate MTLTexture from IOSurface 0x..."), CA's 'b3a8' framebuffers, the
+  posters' '420f' surfaces. Now the buffer stands for the whole surface and the texture lies at the plane's offset and
+  bytesPerRow, with the surface's facts (OSType, plane, size, plane 1 offset and bytesPerRow) given to metal2vulkan
+  (bridge nmb_texture_new_on_surface_plane -> Buffer::new_texture_with_iosurface_plane + IoSurfaceYCbCr). '_RB4'
+  with 4+1 bytes a texel is passed as 'b3a8' (the same layout). A refusal is logged once per reason
+  (noteRefused); the first plane texture of a process logs one line. -iosurfacePlane answers the asked plane.
+- metal2vulkan f6a96b7d API: SharedEventListener::new() cannot fail.
+
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index 05f1c11..da3d606 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -186,6 +186,7 @@ @interface NBTexture : NBObject
+ @property(nonatomic) NmbTextureDescriptor descriptor;
+ @property(nonatomic,strong) NBBuffer *buffer;
+ @property(nonatomic) IOSurfaceRef surface;
++@property(nonatomic) NSUInteger surfacePlane; // NegroniMetal (flame/0016): the plane newTextureWithDescriptor:iosurface:plane: asked
+ @property(nonatomic) NSUInteger offset,rowBytes;
+ @property(nonatomic) NSUInteger parentLevel,parentSlice;   // NegroniMetal: a view's first level and slice in its parent
+ @property(nonatomic,strong) id<MTLTexture> parent;
+@@ -273,7 +274,7 @@ - (MTLStorageMode)storageMode {return (MTLStorageMode)((_descriptor.options&MTLR
+ - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
+ - (BOOL)isFramebufferOnly {return NO;}
+ - (IOSurfaceRef)iosurface {return _surface;}
+-- (NSUInteger)iosurfacePlane {return 0;}
++- (NSUInteger)iosurfacePlane {return _surfacePlane;}
+ - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
+ - (NSUInteger)bufferOffset {return _offset;}
+ - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
+@@ -294,6 +295,7 @@ - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
+  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
+  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
+  if(_surface)view.surface=(IOSurfaceRef)CFRetain(_surface);
++ view.surfacePlane=_surfacePlane;
+  return (id<MTLTexture>)view;
+ }
+ - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
+@@ -1726,14 +1728,54 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
+ }
+ // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
+ // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
++// NegroniMetal (flame/0016): surfaces with planes too. Before, every surface with plane info was nil without a log line: RenderBox's
++// widget drawables in chronod (465x465, OSType '_RB4' = RGB10A8_2P_XR10: plane 0 the 10-bit colour words, plane 1 the alpha bytes)
++// and the same surfaces in backboardd ("Failed to allocate MTLTexture from IOSurface 0x..."), CA's 'b3a8' framebuffers and the
++// posters' '420f' camera/photo surfaces. metal2vulkan (f6a96b7d) makes these over the surface's planes
++// (Buffer::new_texture_with_iosurface_plane with the surface's facts: texture/surface_two_planes.rs, ycbcr.rs).
++static uint32_t surfaceOSType(IOSurfaceRef surface) {
++ const uint32_t type=(uint32_t)IOSurfaceGetPixelFormat(surface);
++ // RenderBox names its own two-plane extended-range surface '_RB4' (RB::create_iosurface, 20H392: plane 0 4 bytes a texel, plane 1
++ // 1 byte a texel); CoreVideo's OSType of that layout is 'b3a8', the one metal2vulkan's two-plane XR10 texture is measured over.
++ if(type=='_RB4' && IOSurfaceGetPlaneCount(surface)==2 && IOSurfaceGetBytesPerElementOfPlane(surface,0)==4 &&
++    IOSurfaceGetBytesPerElementOfPlane(surface,1)==1 &&
++    IOSurfaceGetWidthOfPlane(surface,1)==IOSurfaceGetWidthOfPlane(surface,0) && IOSurfaceGetHeightOfPlane(surface,1)==IOSurfaceGetHeightOfPlane(surface,0))return 'b3a8';
++ return type;
++}
++static NBTexture *textureOnSurfacePlane(NBBuffer *buffer,MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane) {
++ NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
++ const size_t planes=IOSurfaceGetPlaneCount(surface);
++ const uintptr_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),at=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane);
++ if(at<base)return nil;
++ const uint64_t offset=at-base,row=IOSurfaceGetBytesPerRowOfPlane(surface,plane);
++ uint64_t offset1=0,row1=0;
++ if(planes>1){const uintptr_t one=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);if(one>=base){offset1=one-base;row1=IOSurfaceGetBytesPerRowOfPlane(surface,1);}}
++ const uint32_t type=surfaceOSType(surface);
++ NmbTexture *handle=nmb_texture_new_on_surface_plane(buffer.handle,&descriptor,offset,row,true,type,plane,IOSurfaceGetWidth(surface),
++                                                       IOSurfaceGetHeight(surface),offset1,row1);
++ if(!handle){
++  const uint32_t raw=(uint32_t)IOSurfaceGetPixelFormat(surface);
++  noteRefused([NSString stringWithFormat:@"texture fmt %lu usage 0x%lx over plane %lu of %zu of a '%c%c%c%c' surface",(unsigned long)d.pixelFormat,
++    (unsigned long)d.usage,(unsigned long)plane,planes,(char)(raw>>24),(char)(raw>>16),(char)(raw>>8),(char)raw],lastError());
++  return nil;
++ }
++ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
++ texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
++}
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane {
+- if(!surface || !d || plane || IOSurfaceGetPlaneCount(surface))return nil;
++ if(!surface || !d)return nil;
++ const size_t planes=IOSurfaceGetPlaneCount(surface);
++ if(plane && plane>=planes)return nil;
+  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
+  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
+  const size_t bytes=(allocation+page-1)&~(page-1);
+  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer)return nil;
+- NBTexture *texture=textureOnBuffer(buffer,d,0,IOSurfaceGetBytesPerRow(surface),true);if(!texture)return nil;
+- texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
++ NBTexture *texture=planes?textureOnSurfacePlane(buffer,d,surface,plane):textureOnBuffer(buffer,d,0,IOSurfaceGetBytesPerRow(surface),true);
++ if(!texture)return nil;
++ static std::atomic<bool> told{false};
++ if(planes && !told.exchange(true))NBLOG(@"native-metal: first texture over a surface with planes: fmt %lu, plane %lu of %zu, OSType 0x%08x (flame/0016)",
++   (unsigned long)d.pixelFormat,(unsigned long)plane,planes,(unsigned)IOSurfaceGetPixelFormat(surface));
++ texture.surface=(IOSurfaceRef)CFRetain(surface);texture.surfacePlane=plane;return (id<MTLTexture>)texture;
+ }
+ - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
+  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
+diff --git a/phone/metal2/bridge/NativeMetalObjects.h b/phone/metal2/bridge/NativeMetalObjects.h
+index fc7865f..b15c14f 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.h
++++ b/phone/metal2/bridge/NativeMetalObjects.h
+@@ -86,6 +86,11 @@ NmbTexture *nmb_texture_new(NmbDevice *, const struct NmbTextureDescriptor *);
+ /* A linear texture over a buffer's bytes; iosurface marks the buffer as standing for a surface without planes (Metal's IOSurface rules). */
+ NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool iosurface);
+ NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
++/* NegroniMetal (flame/0016): a texture over one plane of a surface with planes; the buffer stands for the whole surface. The surface's
++ * OSType, the asked plane, its size and plane 1's offset and bytesPerRow are the facts a two-plane YCbCr or RGB10A8_2P_XR10 texture reads. */
++NmbTexture *nmb_texture_new_on_surface_plane(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool planar,
++                                             uint32_t fourcc, uint64_t plane, uint64_t width, uint64_t height, uint64_t plane1_offset,
++                                             uint64_t plane1_bytes_per_row);
+ /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
+ NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
+ /* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. */
+diff --git a/phone/metal2/bridge/NativeMetalObjects.rs b/phone/metal2/bridge/NativeMetalObjects.rs
+index 1789ce0..dd0d2b0 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.rs
++++ b/phone/metal2/bridge/NativeMetalObjects.rs
+@@ -18,7 +18,7 @@ use metal2vulkan::pipeline::{
+ };
+ use metal2vulkan_runtime::{
+     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
+-    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
++    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
+     MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
+     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+ };
+@@ -750,6 +750,27 @@ pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor:
+     })
+ }
+ 
++/// NegroniMetal (flame/0016): `newTextureWithDescriptor:iosurface:plane:` over a surface with planes. `buffer` stands for the whole
++/// surface (its base address, every plane); the texture lies at `offset` (the plane's base less the surface's) with rows
++/// `bytes_per_row` apart. `planar`: the surface has plane info. The surface's facts (`fourcc`, the asked `plane`, its `width` and
++/// `height`, plane 1's offset and `bytesPerRow`) go to the runtime as `IoSurfaceYCbCr`: a two-plane YCbCr texture reads its
++/// chroma there and a two-plane extended-range one (`RGB10A8_2P_XR10`) its alpha plane; other formats ignore them.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_texture_new_on_surface_plane(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
++                                                   bytes_per_row: u64, planar: bool, fourcc: u32, plane: u64, width: u64,
++                                                   height: u64, plane1_offset: u64, plane1_bytes_per_row: u64) -> *mut NmbTexture {
++    guard(std::ptr::null_mut(), || {
++        let descriptor = texture_descriptor(descriptor)?;
++        let buffer = &get(buffer)?.0;
++        let mut at = IoSurfacePlane::new(offset, bytes_per_row, planar);
++        if planar {
++            at = at.with_ycbcr(IoSurfaceYCbCr::new(fourcc, plane, [width, height], plane1_offset, plane1_bytes_per_row));
++        }
++        let texture = buffer.new_texture_with_iosurface_plane(&descriptor, at);
++        Ok(boxed(NmbTexture(texture.map_err(e("texture over surface plane"))?)))
++    })
++}
++
+ /// `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` (Apple SPI).
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_texture_new_linear(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64, bytes_per_row: u64,
+@@ -1512,7 +1533,8 @@ fn shared<'a>(event: *const NmbEvent) -> Result<&'a SharedEvent, String> {
+ /// forwards to it).
+ fn listener() -> Result<&'static SharedEventListener, String> {
+     static LISTENER: std::sync::OnceLock<Result<SharedEventListener, String>> = std::sync::OnceLock::new();
+-    LISTENER.get_or_init(|| SharedEventListener::new().map_err(e("listener"))).as_ref().map_err(|why| why.clone())
++    // metal2vulkan f6a96b7d: SharedEventListener::new() cannot fail any more (NegroniMetal flame/0016).
++    LISTENER.get_or_init(|| Ok(SharedEventListener::new())).as_ref().map_err(|why: &String| why.clone())
+ }
+ 
+ #[unsafe(no_mangle)]

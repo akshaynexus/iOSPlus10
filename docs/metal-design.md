@@ -15,7 +15,7 @@ app / QuartzCore (backboardd, SpringBoard, ...)
     NativeBridgeMetalFrontend.mm   (UniXNU NativeMetal, MIT; iOS 16 fixes by ios-flame 745c434, MIT)
       a runtime subclass of _MTLDevice + own NSObject classes for queue, command buffer, encoders, textures, ...
     libnative_metal_bridge.a       (UniXNU bridge, MIT, C ABI nmb_*)
-      metal2vulkan-runtime + metal2vulkan (Rust, GPL-2.0-or-later OR LGPL-3.0-or-later, 720ef1ce + 7 patches)
+      metal2vulkan-runtime + metal2vulkan (Rust, GPL-2.0-or-later OR LGPL-3.0-or-later, f6a96b7d + 6 rebased flame patches + 3 ours)
         AIR (metallib LLVM bitcode) -> SPIR-V; Metal object model on Vulkan 1.2+
     libvulkan_freedreno.dylib      (Turnip, Mesa; from the GPU user-space build)
       SPIR-V -> NIR -> ir3 -> A730 code; command streams; KMD backend
@@ -175,7 +175,7 @@ Linux: the same scripts with an iPhoneOS SDK copied from a Mac in `SDK=`, clang/
 
 | Component | Pin | License |
 |---|---|---|
-| metal2vulkan | 720ef1ce (UniXNU's and flame's pin) + UniXNU 0001-0005 + flame 0100, 0101 | GPL-2.0-or-later OR LGPL-3.0-or-later |
+| metal2vulkan | f6a96b7d (master, 2026-10-26; UniXNU and flame use 720ef1ce) + `userland/metal/patches/m2v-flame` (UniXNU 0001-0004 and flame 0100, 0101 rebased; 0005 is upstream) + `userland/metal/patches/m2v` 0001-0003 | GPL-2.0-or-later OR LGPL-3.0-or-later |
 | frontend + bridge | ios-flame 745c434 `phone/metal2` (UniXNU NativeMetal ff0c70d, patched for iOS 16) | MIT |
 | Rust | 1.98.0 | - |
 | Turnip | from the GPU user-space build (Mesa 25.0.7 today; flame/UniXNU use 85fda3b3 + UniXNU patches) | MIT |

@@ -1,4 +1,4 @@
-NegroniMetal change to metal2vulkan 720ef1ce, on top of m2v/0002 (applied by scripts/metal/fetch-sources.sh):
+NegroniMetal change to metal2vulkan f6a96b7d, on top of m2v/0002 (applied by scripts/metal/fetch-sources.sh):
 a compositor policy for the per-pixel emulations a UI compositor does not need.
 - DevicePolicy::color_writes (ColorWritesPolicy: Exact = default, DeviceUnorm8, DeviceUnorm8Srgb), carried in
   ProfileFields (so in the fingerprint). Under DeviceUnorm8 each 8-bit unorm channel of a replace/opaque attachment
@@ -13,22 +13,22 @@ a compositor policy for the per-pixel emulations a UI compositor does not need.
 The bridge chooses the policy from env NEGRONIMETAL_POLICY (flame/0007).
 
 diff --git a/crates/metal2vulkan/src/device/derive.rs b/crates/metal2vulkan/src/device/derive.rs
-index 33108bc3..b18d8a6b 100644
+index 14955ab9..39db51a6 100644
 --- a/crates/metal2vulkan/src/device/derive.rs
 +++ b/crates/metal2vulkan/src/device/derive.rs
-@@ -329,6 +329,7 @@ fn derive_fields(
+@@ -341,6 +341,7 @@ fn derive_fields(
+         handle_domain: policy.handle_domain,
          containment,
          isolation: policy.isolation,
-         framebuffer_fetch: policy.framebuffer_fetch,
 +        color_writes: policy.color_writes,
          texel_conversion: policy.texel_conversion,
+         vertex_normalized: policy.vertex_normalized,
          half_blend: policy.half_blend,
-         // Metal's where a form is measured to be Metal's or the policy asks for Metal's rounding;
 diff --git a/crates/metal2vulkan/src/device/driver_facts.rs b/crates/metal2vulkan/src/device/driver_facts.rs
-index 7ab05114..3e8ea02a 100644
+index 1b74b684..81ff9126 100644
 --- a/crates/metal2vulkan/src/device/driver_facts.rs
 +++ b/crates/metal2vulkan/src/device/driver_facts.rs
-@@ -670,6 +670,16 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
+@@ -792,6 +792,16 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
          DriverId::INTEL_OPEN_SOURCE_MESA,
          (INTEL_VENDOR_ID, INTEL_UHD_770_RPL_S),
      ),
@@ -45,34 +45,34 @@ index 7ab05114..3e8ea02a 100644
      Measured {
          fact: DriverDeviation::Unorm8LinearFilter,
          driver: DriverId::MESA_LLVMPIPE,
-@@ -680,6 +690,9 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
-     },
- ];
+@@ -856,6 +866,9 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
+ /// NVIDIA's `vendorID`.
+ const NVIDIA_VENDOR_ID: u32 = 0x10de;
  
 +/// Qualcomm's `vendorID` (Adreno; NegroniMetal's Turnip row).
 +const QUALCOMM_VENDOR_ID: u32 = 0x5143;
 +
- /// NVIDIA's `vendorID`.
- const NVIDIA_VENDOR_ID: u32 = 0x10de;
+ /// The `deviceID` of the GeForce RTX 3090.
+ pub(crate) const NVIDIA_RTX_3090: u32 = 0x2204;
  
 diff --git a/crates/metal2vulkan/src/device/mod.rs b/crates/metal2vulkan/src/device/mod.rs
-index d61b5dc2..6000f943 100644
+index 62a51c58..f2d2362e 100644
 --- a/crates/metal2vulkan/src/device/mod.rs
 +++ b/crates/metal2vulkan/src/device/mod.rs
 @@ -66,7 +66,7 @@ pub use enables::{EnableSet, Exposure};
  pub(crate) use mechanism::mechanism;
  pub use metal::{MetalDeviceProperties, SimdSupport, StageSimd};
  pub use policy::{
--    ContainmentPolicy, DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy,
-+    ColorWritesPolicy, ContainmentPolicy, DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy,
-     NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
-     Unorm8LinearFilterPolicy,
- };
+-    BatchOrderPolicy, CompletionPolicy, ContainmentPolicy, DecodedTexelsPolicy, DevicePolicy,
++    BatchOrderPolicy, ColorWritesPolicy, CompletionPolicy, ContainmentPolicy, DecodedTexelsPolicy, DevicePolicy,
+     FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, HalfTexelBitsPolicy,
+     HeapCompressionPolicy, MultisampleDepthTwinPolicy, NanMinMaxPolicy, RenderLoweringPolicy,
+     ResolvePolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
 diff --git a/crates/metal2vulkan/src/device/policy.rs b/crates/metal2vulkan/src/device/policy.rs
-index 29b06675..d0e422ed 100644
+index 011a9608..dd651b9a 100644
 --- a/crates/metal2vulkan/src/device/policy.rs
 +++ b/crates/metal2vulkan/src/device/policy.rs
-@@ -25,6 +25,10 @@ pub struct DevicePolicy {
+@@ -27,6 +27,10 @@ pub struct DevicePolicy {
      /// filter on a device measured within one code of Metal; by default it is Metal's filter,
      /// emulated exactly.
      pub unorm8_linear_filter: Unorm8LinearFilterPolicy,
@@ -83,15 +83,15 @@ index 29b06675..d0e422ed 100644
      /// Whether a device that does not sample through Metal's own sampler samples natively (the
      /// default) or emulates Metal's sampler exactly.
      pub sampling: SamplingPolicy,
-@@ -76,6 +80,7 @@ impl DevicePolicy {
+@@ -127,6 +131,7 @@ impl DevicePolicy {
+         containment: ContainmentPolicy::Contained,
          isolation: GuestIsolation::On,
-         framebuffer_fetch: FramebufferFetchPolicy::RequireOrdered,
          unorm8_linear_filter: Unorm8LinearFilterPolicy::Exact,
 +        color_writes: ColorWritesPolicy::Exact,
          sampling: SamplingPolicy::NativeDevice,
+         ycbcr_filter: YCbCrFilterPolicy::Device,
          float_maths: FloatMathsPolicy::Native,
-         texel_conversion: TexelConversionPolicy::Device,
-@@ -149,6 +154,24 @@ pub enum Unorm8LinearFilterPolicy {
+@@ -230,6 +235,24 @@ pub enum Unorm8LinearFilterPolicy {
      DeviceWithinOneCode,
  }
  
@@ -117,23 +117,24 @@ index 29b06675..d0e422ed 100644
  /// `DriverDeviation::MetalSampler`) answers a module's samples, gathers and comparisons: natively,
  /// its own sampler's answer (the default: the owner's ruling of 2026-10-11, making time before
 diff --git a/crates/metal2vulkan/src/device/profile.rs b/crates/metal2vulkan/src/device/profile.rs
-index 2684ba6b..4bb5c1df 100644
+index 53911a94..92645773 100644
 --- a/crates/metal2vulkan/src/device/profile.rs
 +++ b/crates/metal2vulkan/src/device/profile.rs
-@@ -394,6 +394,8 @@ pub struct ProfileFields {
+@@ -511,6 +511,9 @@ pub struct ProfileFields {
+     pub handle_domain: HandleDomain,
      pub containment: Containment,
      pub isolation: GuestIsolation,
-     pub framebuffer_fetch: FramebufferFetchPolicy,
-+    /// Whether an 8-bit color write rounds in the shader or is the device's (the policy's).
++    /// Whether an 8-bit color write rounds in the shader or is the device's (the policy's;
++    /// NegroniMetal).
 +    pub color_writes: crate::device::policy::ColorWritesPolicy,
      /// Whether a texel's value is the device's conversion or Metal's (the policy's).
      pub texel_conversion: crate::device::policy::TexelConversionPolicy,
-     /// Whether a `half4` output of a module without fast math blends into a 16-bit float
+     /// Whether a normalized vertex attribute is converted by fixed-function vertex input or
 diff --git a/crates/metal2vulkan/src/pipeline/color_writes.rs b/crates/metal2vulkan/src/pipeline/color_writes.rs
-index 86f6acba..beffa2c1 100644
+index b161f838..cb7fefff 100644
 --- a/crates/metal2vulkan/src/pipeline/color_writes.rs
 +++ b/crates/metal2vulkan/src/pipeline/color_writes.rs
-@@ -105,7 +105,7 @@ pub(crate) fn exact_writes(
+@@ -116,7 +116,7 @@ pub(crate) fn exact_writes(
          let coverage_alpha = attachment == 0 && alpha_to_coverage;
          let write = match metal {
              true => metal_stored(&c),
@@ -142,8 +143,8 @@ index 86f6acba..beffa2c1 100644
          };
          let write = match rounding {
              TextureWriteRoundingMode::NearestEven => {
-@@ -778,6 +778,28 @@ fn attachment_write(
-     Some(rules)
+@@ -1007,6 +1007,28 @@ fn writes_hold(
+     })
  }
  
 +/// `rules` with each 8-bit unorm (and, under `DeviceUnorm8Srgb`, 8-bit sRGB) channel left to the
@@ -168,35 +169,35 @@ index 86f6acba..beffa2c1 100644
 +    rules
 +}
 +
- /// Whether the pipeline's attachment `c` blends the fragment function's output: its blend is
- /// enabled and it writes some channel. Where it does not, a `half` output of a module without
- /// fast math stores Metal's value (`StageIo::half_blend_colors`). Factors one and zero, added,
+ /// How attachment `c` takes each channel of a float output; `coverage_alpha` where
+ /// alpha-to-coverage reads its alpha. `None` where it stores the value as written or nothing at
+ /// all.
 diff --git a/crates/metal2vulkan/src/tests/fast_paths.rs b/crates/metal2vulkan/src/tests/fast_paths.rs
-index 63966c5b..1db1675f 100644
+index 059dd60e..96e26a7e 100644
 --- a/crates/metal2vulkan/src/tests/fast_paths.rs
 +++ b/crates/metal2vulkan/src/tests/fast_paths.rs
-@@ -9,7 +9,7 @@
+@@ -7,7 +7,7 @@
+ //! classed, and so reaches the ledger.
+ 
  use crate::device::{
-     DevicePolicy, FloatMathsPolicy, FramebufferFetchPolicy, HalfBlendPolicy, HalfRoundingPolicy,
-     NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
--    Unorm8LinearFilterPolicy,
-+    Unorm8LinearFilterPolicy, ColorWritesPolicy,
- };
- use crate::pipeline::PrecisionNote;
- use std::collections::BTreeSet;
-@@ -61,6 +61,7 @@ fn choices() -> Vec<Choice> {
+-    BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy, FloatMathsPolicy,
++    BatchOrderPolicy, ColorWritesPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy, FloatMathsPolicy,
+     HalfBlendPolicy, HalfRoundingPolicy, HalfTexelBitsPolicy, HeapCompressionPolicy,
+     MultisampleDepthTwinPolicy, NanMinMaxPolicy, RenderLoweringPolicy, ResolvePolicy,
+     RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
+@@ -62,6 +62,7 @@ fn choices() -> Vec<Choice> {
+         isolation: _,
          // The accuracy choices, below.
-         framebuffer_fetch: _,
          unorm8_linear_filter: _,
 +        color_writes: _,
          sampling: _,
+         ycbcr_filter: _,
          float_maths: _,
-         texel_conversion: _,
-@@ -74,6 +75,7 @@ fn choices() -> Vec<Choice> {
+@@ -88,6 +89,7 @@ fn choices() -> Vec<Choice> {
+     } = p;
      vec![
-         choice!(p.framebuffer_fetch: FramebufferFetchPolicy { RequireOrdered, AcceptUnordered }),
          choice!(p.unorm8_linear_filter: Unorm8LinearFilterPolicy { Exact, DeviceWithinOneCode }),
 +        choice!(p.color_writes: ColorWritesPolicy { Exact, DeviceUnorm8, DeviceUnorm8Srgb }),
          choice!(p.sampling: SamplingPolicy { NativeDevice, Exact }),
+         choice!(p.ycbcr_filter: YCbCrFilterPolicy { Device, Exact }),
          choice!(p.float_maths: FloatMathsPolicy { Native, Exact }),
-         choice!(p.texel_conversion: TexelConversionPolicy { Device, Exact }),

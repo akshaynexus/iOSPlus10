@@ -1,10 +1,12 @@
-NegroniMetal change to metal2vulkan 720ef1ce, on top of m2v/0001 (applied by scripts/metal/fetch-sources.sh):
+NegroniMetal change to metal2vulkan f6a96b7d, on top of m2v/0001 (applied by scripts/metal/fetch-sources.sh):
 counters for CommandBuffer::invalidate_host_imports (calls with ranges, ranges, bytes), read by the frontend's
 telemetry through the C symbol m2v_negroni_host_invalidate_stat (flame/0006), with no bridge ABI change.
 
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index ec1d81e2..e55715a4 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-@@ -1281,6 +1281,10 @@
+@@ -1783,6 +1783,10 @@ impl CommandBuffer {
              }
          }
          if !ranges.is_empty() {
@@ -15,11 +17,10 @@ telemetry through the C symbol m2v_negroni_host_invalidate_stat (flame/0006), wi
              // SAFETY: each range is a live import of this device (the command buffer holds its
              // buffer), host-visible, mapped at the caller's pointer for its whole size.
              let _ = unsafe { shared.vk().invalidate_mapped_memory_ranges(&ranges) };
-@@ -2944,4 +2948,18 @@
-         Error::OutOfMemory(_) => CommandBufferError::OutOfMemory,
-         _ => CommandBufferError::Internal(super::error::VkResultCode(error.as_raw())),
+@@ -4790,3 +4794,17 @@ fn life(kernel: &KernelTimes, times: &Times) -> Life {
+         completed: times.completed,
      }
-+}
+ }
 +
 +/// NegroniMetal: `CommandBuffer::invalidate_host_imports` calls that had ranges, the ranges and
 +/// their bytes, since the process started (the frontend's telemetry, `native_bridge_metal_telemetry`).
@@ -33,4 +34,4 @@ telemetry through the C symbol m2v_negroni_host_invalidate_stat (flame/0006), wi
 +pub extern "C" fn m2v_negroni_host_invalidate_stat(which: u32) -> u64 {
 +    let count = HOST_INVALIDATE.get(which as usize);
 +    count.map_or(0, |count| count.load(std::sync::atomic::Ordering::Relaxed))
- }
++}

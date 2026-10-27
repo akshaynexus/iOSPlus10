@@ -1,0 +1,149 @@
+NegroniMetal change to metal2vulkan 720ef1ce (+ the ios-flame bridge patches), applied by scripts/metal/fetch-sources.sh:
+no-copy buffers (newBufferWithBytesNoCopy:, IOSurface textures) on a device whose host-pointer imports allow only
+host-visible types without HOST_COHERENT (Turnip on Darwin/RedwoodGPU: HOST_CACHED, docs/gpu-abi.md section 6).
+- memory.rs: Memory::import_host falls back to such types (cached first) where no coherent type is allowed; before
+  this the import was refused as Unsupported { HostMemory, NotRepresentable } (no memory type of the class).
+- command_buffer/mod.rs: as a command buffer completes, before its status and its completed handlers, it calls
+  vkInvalidateMappedMemoryRanges over each such import its commands used (no-copy buffers, buffers under textures,
+  no-copy heaps). Turnip does dc civac by the caller's pointer. The CPU-to-GPU direction is the kernel's: it cleans
+  CPU-written pages of 0x49 and 0x7e imports at each submission that lists them (gpu-abi.md section 6 rule 1).
+- buffer.rs: HostPages::import_range (memory, offset, size of the import) for that call.
+
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -507,6 +507,14 @@
+     /// The index of their memory's type.
+     pub(super) fn type_index(&self) -> u32 {
+         self.import.pages.memory.placement.type_index()
++    }
++
++    /// NegroniMetal: the whole import their bytes lie in, as a mapped range of its memory (the
++    /// memory, the placement's offset and size in it), for the cache upkeep of an import of a
++    /// type that is not host-coherent (`CommandBuffer::invalidate_host_imports`).
++    pub(super) fn import_range(&self) -> (vk::DeviceMemory, u64, u64) {
++        let placement = &self.import.pages.memory.placement;
++        (placement.memory, placement.offset, placement.size())
+     }
+ 
+     /// Whether they were imported as dma-bufs (`dma_buf.rs`), not by their pointer.
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -1247,6 +1247,48 @@
+         lock(&self.0.state)
+     }
+ 
++    /// NegroniMetal: drop the CPU's cache lines over every host import its commands used whose
++    /// memory type is host-visible but not host-coherent (`memory::incoherent_host_candidates`):
++    /// `vkInvalidateMappedMemoryRanges` over each whole import, once, as it completes. Turnip
++    /// cleans and invalidates them by the caller's pointer (`dc civac`), so the GPU's writes
++    /// become the CPU's (docs/gpu-abi.md section 6 rule 2). The resources come from its ended
++    /// encoders (`used_resources`), which it holds until after its completed handlers: a no-copy
++    /// buffer, a texture over one (an IOSurface's), and a heap over host pages. Imports of
++    /// coherent types and dma-buf imports are left alone.
++    fn invalidate_host_imports(&self) {
++        use vk::MemoryPropertyFlags as P;
++        let used = self.used_resources();
++        let shared = self.device().shared();
++        let mut ranges: Vec<vk::MappedMemoryRange<'_>> = Vec::new();
++        {
++            let memory = lock(&shared.memory);
++            let heaps = used.heaps.iter().filter_map(|heap| heap.bytes());
++            for buffer in used.buffers.iter().chain(heaps) {
++                let Some(pages) = buffer.host_pages() else {
++                    continue;
++                };
++                if pages.over_dma_buf() {
++                    continue;
++                }
++                let incoherent = memory.type_flags(pages.type_index()).is_some_and(|flags| {
++                    flags.contains(P::HOST_VISIBLE) && !flags.contains(P::HOST_COHERENT)
++                });
++                let (raw, offset, size) = pages.import_range();
++                if !incoherent || size == 0 || ranges.iter().any(|range| range.memory == raw) {
++                    continue;
++                }
++                ranges.push(vk::MappedMemoryRange::default().memory(raw).offset(offset).size(size));
++            }
++        }
++        if !ranges.is_empty() {
++            // SAFETY: each range is a live import of this device (the command buffer holds its
++            // buffer), host-visible, mapped at the caller's pointer for its whole size.
++            let _ = unsafe { shared.vk().invalidate_mapped_memory_ranges(&ranges) };
++        }
++        // Released after the call: what it holds may be a resource's last handle.
++        drop(used);
++    }
++
+     /// The residency a new compute or render (`render`) encoder starts with
+     /// (`Residency::shadows`): the shadowed textures its ended encoders made resident, those in
+     /// the heaps they used made since included.
+@@ -2621,6 +2663,9 @@
+     /// transition's [`Hold`] (and every other) is gone. Waits from inside these steps answer as
+     /// [`own`] says.
+     fn complete(self: &Arc<Self>, result: Result<(), CommandBufferError>) {
++        // NegroniMetal: the GPU's writes to host imports that are not host-coherent become the
++        // CPU's before the status and the handlers tell anyone (`memory::incoherent_host_candidates`).
++        CommandBuffer(Arc::clone(self)).invalidate_host_imports();
+         // A capture replay found a primitive whose reach was not measured: its pass rewrote
+         // every tile, announced once the lock is let go (below).
+         let mut unmeasured_reach = false;
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -159,6 +159,44 @@
+                 && !ty.property_flags.contains(P::HOST_COHERENT)
+         })
+         .fold(0, |bits, (index, _)| bits | 1 << index)
++}
++
++/// NegroniMetal: the host-visible types among `allowed` that are not host-coherent, for an import
++/// of the caller's host pages of a host-visible `class` (`Shared`, `Managed`, `WriteCombined`)
++/// where the pointer allows no coherent type (`Memory::import_host`), best first: host-cached
++/// ones, then device-local ones. Turnip on Darwin (RedwoodGPU, docs/gpu-abi.md section 6) imports
++/// host pages only as `HOST_CACHED` without `HOST_COHERENT`: the CPU keeps its cached mapping and
++/// the GPU's view is non-cacheable. The kernel cleans the CPU-written pages at each submission
++/// that lists the import, and the command buffer invalidates the CPU's lines over every such
++/// import its commands used when it completes, before its status and handlers say so
++/// (`CommandBuffer::invalidate_host_imports`, `command_buffer/mod.rs`). Empty for any other class
++/// and where a coherent type is allowed (`candidates` serves that).
++pub(super) fn incoherent_host_candidates(
++    types: &[vk::MemoryType],
++    allowed: u32,
++    class: MemoryClass,
++) -> Vec<u32> {
++    use vk::MemoryPropertyFlags as P;
++    if matches!(class, MemoryClass::Private | MemoryClass::Memoryless) {
++        return Vec::new();
++    }
++    let mut ranked: Vec<((u8, u8), u32)> = (types.iter().enumerate())
++        .filter(|&(index, ty)| {
++            let flags = ty.property_flags;
++            allowed & (1 << index) != 0
++                && allocatable(flags)
++                && flags.contains(P::HOST_VISIBLE)
++                && !flags.contains(P::HOST_COHERENT)
++                && !flags.contains(P::LAZILY_ALLOCATED)
++        })
++        .map(|(index, ty)| {
++            let flags = ty.property_flags;
++            let lacks = |wanted: P| u8::from(!flags.contains(wanted));
++            ((lacks(P::HOST_CACHED), lacks(P::DEVICE_LOCAL)), index as u32)
++        })
++        .collect();
++    ranked.sort_by_key(|&(rank, _)| rank);
++    ranked.into_iter().map(|(_, index)| index).collect()
+ }
+ 
+ /// The memory class an image of `class` with host-transfer usage takes in memory the host caches,
+@@ -983,7 +1021,11 @@
+         export_metal: bool,
+     ) -> Result<Placement, ImportFailure> {
+         let mut failure = ImportFailure::NoMemoryType;
+-        for type_index in candidates(&self.types, allowed, class, self.unified) {
++        let mut order = candidates(&self.types, allowed, class, self.unified);
++        if order.is_empty() {
++            order = incoherent_host_candidates(&self.types, allowed, class);
++        }
++        for type_index in order {
+             let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+                 .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+                 .host_pointer(pointer.as_ptr().cast());
