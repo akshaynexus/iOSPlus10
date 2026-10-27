@@ -72,7 +72,8 @@ xcodebuild -version
 if [ "$STAGE" = prepare ]; then
   # only dxb's patch step: source the functions without main
   cd "$W/dxb"
-  bash -c 'set -euo pipefail; source <(sed "s/^main \"\$@\"$//" build.sh); setup_xcode_toolchain; choose_xnu; get_xnu; patches' 2>&1 | tee "$W/prepare.log"
+  sed 's/^main "\$@"$//' build.sh > .build-functions.sh     # bash 3.2: no "source <(...)"
+  bash -c 'set -euo pipefail; . ./.build-functions.sh; setup_xcode_toolchain; choose_xnu; get_xnu; patches' 2>&1 | tee "$W/prepare.log"
   grep -E "Applying patch|Skipping patch" "$W/prepare.log" | sed -E 's#.*(Applying|Skipping) patch:? .*/patches/26.0/#\1 #' > "$W/patch-report.txt" || true
   echo "prepared $W/dxb/xnu"; grep "^Skipping" "$W/patch-report.txt" || echo "skipped: none"
   exit 0

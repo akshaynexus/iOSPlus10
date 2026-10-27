@@ -1,0 +1,338 @@
+From: iOSPlus10 ios26 port
+Subject: [PATCH 0002] NEGRONI machine config for xnu-12377
+
+Port of slop 0004 (negroni-machine-config) and 0006 (master config with open-source asm/pmap) to
+xnu-12377.121.6:
+- makedefs: NEGRONI in SUPPORTED_ARM64_MACHINE_CONFIGS; stage 1 = plain arm64 at -march=armv8.2-a+crypto,
+  NEGRONI_ARM64E=1 = arm64e (stage 2, native PAC; see NEGRONI.h)
+- config/MASTER.arm64.negroni: 12377 MASTER.arm64.MacOSX with ARM_EXTRAS_BASE = config_pmap_ppl nos_arm_asm
+  nos_arm_pmap (never SPTM or exclaves)
+- pexpert/pexpert/arm64/NEGRONI.h (SM8450, GICv3 two security states, Qualcomm vtimer PPI 19), board_config.h,
+  proc_reg.h cache lines
+The GIC/IRQ code (sleh.c, pe_fiq.c) and start.s parts of slop 0004 are in 0003/0004.
+
+diff --git a/config/MASTER.arm64.negroni b/config/MASTER.arm64.negroni
+new file mode 100644
+index 0000000..82adbcb
+--- /dev/null
++++ b/config/MASTER.arm64.negroni
+@@ -0,0 +1,131 @@
++#
++# negroni (OnePlus 10 Pro 5G, SM8450) for xnu-12377 (iOS 26 port): MASTER.arm64.MacOSX of this release,
++# as for the iOS 16 port (xnu-8796), with the open-source arm64 assembly and PPL-era pmap
++# (nos_arm_asm, nos_arm_pmap). Apple SoC configs link those from the KDK lib<SOC>.os.<CONFIG>.a.
++# Never SPTM, never exclaves (no Apple monitor firmware on this phone).
++#
++# Mach Operating System
++# Copyright (c) 1986 Carnegie-Mellon University
++# Copyright 2001-2024 Apple Inc.
++#
++# All rights reserved.  The CMU software License Agreement
++# specifies the terms and conditions for use and redistribution.
++######################################################################
++#
++#  Master Apple configuration file (see the master machine independent
++#  configuration file for a description of the file format).
++#
++######################################################################
++#  Standard Apple OS Configurations:
++#  -------- ----- -- ---------------
++#
++#  ARM_EXTRAS_BASE = [ config_pmap_ppl nos_arm_asm nos_arm_pmap ]
++#  KERNEL_BASE =    [ arm64 medium msgb_large config_requires_u32_munging config_delay_idle_sleep config_proc_udata_storage config_uexc config_darkboot ARM_EXTRAS_BASE ]
++#  KERNEL_RELEASE = [ KERNEL_BASE release ]
++#  KERNEL_DEV =     [ KERNEL_BASE development mach_assert config_xnupost proc_ref_debug config_proc_resource_limits config_ext_paniclog ]
++#  KERNEL_DEBUG =   [ KERNEL_BASE debug mach_assert config_xnupost config_waitq_stats config_workloop_debug config_proc_resource_limits config_ext_paniclog ]
++#  BSD_BASE =       [ mach_bsd sysv_sem sysv_msg sysv_shm config_netboot config_imageboot psynch config_proc_uuid_policy config_coredump config_ucoredump pgo config_personas ]
++#  BSD_RELEASE =    [ BSD_BASE ]
++#  BSD_DEV =        [ BSD_BASE config_vnguard ]
++#  BSD_DEBUG =      [ BSD_BASE config_vnguard ]
++#  FILESYS_BASE =   [ devfs fdesc fifo fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_ext_resolver config_searchfs config_volfs config_appledouble nullfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
++#  FILESYS_RELEASE= [ FILESYS_BASE ]
++#  FILESYS_DEV =    [ FILESYS_BASE config_iocount_trace ]
++#  FILESYS_DEBUG =  [ FILESYS_BASE config_iocount_trace ]
++#  NFS =            [ nfsserver ]
++#  SKYWALK_BASE =   [ skywalk config_nexus_user_pipe config_nexus_kernel_pipe config_nexus_flowswitch config_nexus_netif ]
++#  SKYWALK_RELEASE = [ SKYWALK_BASE ]
++#  SKYWALK_DEV =    [ SKYWALK_BASE ]
++#  SKYWALK_DEBUG =  [ SKYWALK_BASE ]
++#  NETWORKING =     [ inet bpfilter dummynet traffic_mgt sendfile ah_all_crypto bond vlan gif stf ifnet_input_chk if_bridge MULTIPATH if_fake if_redirect remote_vif ]
++#  NETWORKING_RELEASE = [ NETWORKING ]
++#  NETWORKING_DEV = [ NETWORKING_RELEASE packet_mangler if_headless kctl_test ]
++#  NETWORKING_DEBUG = [ NETWORKING_DEV ]
++#  VPN =            [ ipsec flow_divert necp content_filter ]
++#  PF =             [ pf pflog ]
++#  MULTIPATH =      [ multipath mptcp ]
++#if SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED
++#  HIBERNATION =    [ ]
++#else /*!(SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED)*/
++#  HIBERNATION =    [ ]
++#endif /*SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED*/
++#  IOKIT_BASE =     [ iokit iokitcpp no_kernel_hid config_sleep iokitstats HIBERNATION ]
++#  IOKIT_RELEASE =  [ IOKIT_BASE ]
++#  IOKIT_DEV =      [ IOKIT_BASE iotracking ]
++#  IOKIT_DEBUG =    [ IOKIT_BASE iotracking ]
++#  LIBKERN_BASE =   [ libkerncpp config_blocks config_kec_fips crypto_sha2 config_img4 ]
++#  LIBKERN_RELEASE =[ LIBKERN_BASE zlib ]
++#  LIBKERN_DEV =    [ LIBKERN_BASE zlib iotracking ]
++#  LIBKERN_DEBUG =  [ LIBKERN_BASE zlib iotracking ]
++#if SOC_IS_VIRTUALIZED
++#  CPU_COUNTERS_BASE = [ ]
++#else /*!SOC_IS_VIRTUALIZED*/
++#  CPU_COUNTERS_BASE = [ config_cpu_counters config_pervasive_cpi config_pervasive_energy ]
++#endif /*SOC_IS_VIRTUALIZED*/
++#  PERF_DBG_BASE =  [ config_dtrace mach_kdp config_serial_kdp kdp_interactive_debugging config_kdp_coredump_encryption CPU_COUNTERS_BASE kperf ]
++#  PERF_DBG_RELEASE=[ PERF_DBG_BASE ist_kdebug ]
++#  PERF_DBG_DEV =   [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace config_memory_microstackshot ]
++#  PERF_DBG_DEBUG = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace config_memory_microstackshot ]
++#  PERF_DBG_KASAN = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger config_debug_syscall_rejection config_iotrace config_memory_microstackshot ]
++#if SOC_IS_VIRTUALIZED
++#  PARAVIRT_BASE =  [ config_pv_ticket ]
++#else
++#  PARAVIRT_BASE =  [ ]
++#endif /*SOC_IS_VIRTUALIZED*/
++#  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_arm_pfz config_user_notification phys_write_acct config_service_port_info config_voucher_deprecated PARAVIRT_BASE ]
++#  MACH_RELEASE =   [ MACH_BASE ]
++#  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace config_task_suspend_stats ]
++#  MACH_DEBUG =     [ MACH_BASE config_io_accounting importance_trace importance_debug config_task_suspend_stats ]
++#  SCHED_BASE =     [ config_sched_timeshare_core config_sched_deferred_ast config_clutch config_sched_sfi config_sched_auto_join config_preadopt_tg ]
++#  SCHED_RELEASE =  [ SCHED_BASE ]
++#  SCHED_DEV =      [ SCHED_BASE ]
++#  SCHED_DEBUG =    [ SCHED_BASE ]
++#if MASTER_CONFIG_ENABLE_KERNEL_TAG && MASTER_CONFIG_ENABLE_SPTM
++#  VM_EXTRA =       [ kernel_tagging ]
++#  VM_EXTRA_DEV =   [ ]
++#elif MASTER_CONFIG_ENABLE_SPTM
++#  VM_EXTRA =       [ ]
++#  VM_EXTRA_DEV =   [ ]
++#else
++#  VM_EXTRA =       [ ]
++#  VM_EXTRA_DEV =   [ ]
++#endif /* MASTER_CONFIG_ENABLE_KERNEL_TAG && MASTER_CONFIG_ENABLE_SPTM */
++#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim VM_EXTRA ]
++#  VM_RELEASE =     [ VM_BASE ]
++#  VM_DEV =         [ VM_BASE dynamic_codesigning VM_EXTRA_DEV ]
++#  VM_DEBUG =       [ VM_BASE dynamic_codesigning VM_EXTRA_DEV ]
++#  VM_KASAN =       [ VM_BASE dynamic_codesigning config_kasan config_ubsan config_kcov config_ksancov kernel_tagging kernel_tbi ]
++#  SECURITY_BASE  =   [ config_macf config_audit kernel_integrity config_csr config_csr_from_dt config_setuid config_kas_info config_secure_bsd_root config_arcade config_supplemental_signatures second_static_trust_cache reslide_shared_cache ]
++#  SECURITY_RELEASE = [ SECURITY_BASE ]
++#  SECURITY_DEV   =   [ SECURITY_BASE ]
++#  SECURITY_DEBUG =   [ SECURITY_BASE ]
++#  BASE =           [ PF VPN NFS ]
++#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE    PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE SECURITY_RELEASE ]
++#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV     ]
++#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG   SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG      PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   SECURITY_DEBUG   ]
++#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_KASAN   MACH_DEV     SCHED_DEV     VM_KASAN   SECURITY_DEV     ]
++#  SPTM =           [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV     ]
++#
++######################################################################
++#
++machine		"arm64"						# <arm64>
++
++makeoptions	OSFMK_MACHINE = "arm64"				# <mach>
++
++options		COUNT_SYSCALLS		# count bsd system calls 	# <countcalls>
++options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
++options		ALTERNATE_DEBUGGER	# <alternate_debugger>
++
++options   CONFIG_VNODES=1024		# <xsmall>
++
++options   CONFIG_FREEZE_SUSPENDED_MIN=4		# <xsmall>
++
++options	  CONFIG_MACH_APPROXIMATE_TIME
++
++options   CONFIG_KERNEL_INTEGRITY		# <kernel_integrity>
++
++options CONFIG_MACF_LAZY_VNODE_LABELS   # Turn on labels, don't preallocate
++
++options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
++options   CONFIG_KERNEL_TBI		# <kernel_tbi>
++options   CONFIG_KERNEL_TAGGING		# <kernel_tagging>
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 0dc88a6..013076c 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+-SUPPORTED_ARM64_MACHINE_CONFIGS = T6000 T6020 T6030 T6031 T6041 T6050 T8101 T8103 T8112 T8122 T8132 T8142 VMAPPLE
++SUPPORTED_ARM64_MACHINE_CONFIGS = T6000 T6020 T6030 T6031 T6041 T6050 T8101 T8103 T8112 T8122 T8132 T8142 VMAPPLE NEGRONI
+ 
+ SPTM_ENABLED_SOCS_MacOSX = t6000 t8112 t6020 t8122 t6030 t6031 t6041 t6050 t8132 t8142
+ EXCLAVES_ENABLED_SOCS_MacOSX = t8142 t6050
+@@ -93,6 +93,13 @@ MACHINE_FLAGS_ARM64_T8132 = -DARM64_BOARD_CONFIG_T8132			-mcpu=apple-m4
+ MACHINE_FLAGS_ARM64_T8142 = -DARM64_BOARD_CONFIG_T8142 			-mcpu=apple-m4+memtag+predres2
+ 
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a+sme2
++# negroni (SM8450: Cortex-X2/A710/A510, ARMv9.0 with PAC). Stage 1 is plain arm64 at an ARMv8.2 baseline
++# (the iOS 16 port level); NEGRONI_ARM64E=1 (stage 2) builds arm64e with the architected PAC instructions.
++ifeq ($(NEGRONI_ARM64E),1)
++MACHINE_FLAGS_ARM64_NEGRONI = -DARM64_BOARD_CONFIG_NEGRONI -DNEGRONI_ARM64E=1
++else
++MACHINE_FLAGS_ARM64_NEGRONI = -DARM64_BOARD_CONFIG_NEGRONI              -march=armv8.2-a+crypto
++endif
+ 
+ 
+ #
+@@ -370,8 +377,11 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+ # Without embdedded device map, use a default arch string
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
+ ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
++# negroni stage 1 stays plain arm64 (no native PAC key code yet); NEGRONI_ARM64E=1 gives arm64e
++ifneq ($(CURRENT_MACHINE_CONFIG)$(NEGRONI_ARM64E),NEGRONI)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
+ endif
++endif
+ 
+ endif
+ 
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index f4d148b..a142835 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -243,6 +243,14 @@
+ /* D-Cache, 128KB for Acc8 PCore, 8-way. 64KB for ECore, 8-way. */
+ #define MMU_CLINE   6                      /* cache line size is 1<<MMU_CLINE (64) */
+ 
++#elif defined (NEGRONI) /* Qualcomm SM8450: Cortex-X2 + Cortex-A710 + Cortex-A510 */
++
++/* I-Cache: 64-byte lines on all three cores. */
++#define MMU_I_CLINE 6
++
++/* D-Cache. */
++#define MMU_CLINE   6
++
+ #elif defined (VMAPPLE)
+ 
+ /* I-Cache. */
+diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
+index 75938b5..c3fe465 100644
+--- a/pexpert/pexpert/arm64/Makefile
++++ b/pexpert/pexpert/arm64/Makefile
+@@ -33,7 +33,8 @@ PRIVATE_KERNELFILES = \
+ 	H15.h \
+ 	H16.h \
+ 	H17.h \
+-	VMAPPLE.h
++	VMAPPLE.h \
++	NEGRONI.h
+ 
+ 
+ # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
+diff --git a/pexpert/pexpert/arm64/NEGRONI.h b/pexpert/pexpert/arm64/NEGRONI.h
+new file mode 100644
+index 0000000..5842a2c
+--- /dev/null
++++ b/pexpert/pexpert/arm64/NEGRONI.h
+@@ -0,0 +1,87 @@
++/*
++ * Board config for the OnePlus 10 Pro 5G ("negroni", Qualcomm SM8450 / Snapdragon 8 Gen 1):
++ * 1x Cortex-X2 + 3x Cortex-A710 + 4x Cortex-A510, ARMv9.0 (FEAT_PAuth present, Android reports
++ * "paca pacg"). XNU runs at EL1 under the Gunyah hypervisor (EL2).
++ *
++ * xnu-12377 (iOS 26) port. Same shape as the iOS 16 (xnu-8796) NEGRONI board: generic ARM like
++ * BCM2837 (no APPLE_ARM64_ARCH_FAMILY: none of Apple's implementation-defined system registers
++ * exist), 16K pages and GICv3 like VMAPPLE. The GIC has two security states: Group 0 belongs to
++ * TrustZone, so every interrupt, including the timer, is a Group 1 IRQ taken through sleh_irq().
++ *
++ * Stage 1 (default): plain arm64 kernel at an ARMv8.2 baseline, no PAC.
++ * Stage 2 (NEGRONI_ARM64E=1): arm64e kernel with the architected PAC instructions; the keys are
++ * written natively (no hvc, unlike VMAPPLE's HAS_PARAVIRTUALIZED_PAC). See docs/ios26-port-status.md.
++ */
++
++#ifndef _PEXPERT_ARM64_NEGRONI_H
++#define _PEXPERT_ARM64_NEGRONI_H
++
++#define NO_MONITOR                1
++#define NO_ECORE                  1
++
++#define NEGRONI                   1
++
++/* All eight cores as one homogeneous SMP cluster (no AMP P/E clusters yet). */
++#define NEGRONI_SMP_MAX_CPUS      8
++
++#define ARM_ARCH_TIMER
++#define __ARM_ARCH__              8
++#define __ARM_VMSA__              8
++#define __ARM_VFP__               4
++#define __ARM_COHERENT_CACHE__    1
++#define __ARM_DEBUG__             7
++#define __ARM_ENABLE_SWAP__       1
++#define __ARM_V8_CRYPTO_EXTENSIONS__ 1
++#define __ARM_PAN_AVAILABLE__     1
++#define __ARM_16K_PG__            1
++
++#define HAS_GIC_V3                1
++
++#if defined(NEGRONI_ARM64E) && NEGRONI_ARM64E
++/* Architected PAC (FEAT_PAuth) with natively written keys; not the Apple PAC MSRs of A12+. */
++#define CPU_HAS_APPLE_PAC         1
++#define HAS_NATIVE_ARM_PAC        1
++#endif
++
++#ifndef ASSEMBLER
++#define PLATFORM_PANIC_LOG_DISABLED
++#endif /* ! ASSEMBLER */
++
++/*
++ * Qualcomm numbers the architected timer PPIs 1/2/3/0 (secure phys, phys, virt, hyp) instead of
++ * the usual 13/14/11/10: the virtual timer XNU uses (CNTV) is INTID 16 + 3 = 19.
++ */
++#define NEGRONI_VTIMER_INTID      19
++#define NEGRONI_IPI_SGI           1       // SGI used for cross-CPU signals
++
++#define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
++
++#define GICR_PE_SIZE              0x20000 // Size of each redistributor region
++
++/* GICv3 register definitions; see GICv3 spec (Arm IHI 0069G) */
++#define GICD_CTLR                 0x0
++
++/* Non-secure view of GICD_CTLR (DS=0) */
++#define GICD_CTLR_ENABLEGRP1      0x1
++#define GICD_CTLR_ENABLEGRP1A     0x2
++#define GICD_CTLR_ARE_NS          0x10
++#define GICD_CTLR_RWP             0x80000000
++
++#define GICR_TYPER                              0x08
++#define GICR_WAKER                              0x14
++#define GICR_IGROUPR0                           0x10080
++#define GICR_ISENABLER0                         0x10100
++#define GICR_IPRIORITYR0                        0x10400
++
++#define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
++#define GICR_TYPER_LAST                         0x10
++
++#define GICR_WAKER_PROCESSORSLEEP               0x2
++#define GICR_WAKER_CHILDRENASLEEP               0x4
++
++#define ICC_CTLR_EOIMODE                        0x2
++
++#define ICC_SRE_SRE                             0x1
++/* End of GICv3 register definitions */
++
++#endif /* ! _PEXPERT_ARM64_NEGRONI_H */
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 5a6cd33..b39a685 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -304,6 +304,18 @@
+ 
+ 
+ 
++#ifdef ARM64_BOARD_CONFIG_NEGRONI
++#include <pexpert/arm64/NEGRONI.h>
++
++#define MAX_L2_CLINE                   6
++#define MAX_CPUS                       8
++#define MAX_CPU_CLUSTERS               1
++
++#define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
++#define NO_XNU_PLATFORM_ERROR_HANDLER  1
++
++#endif  /* ARM64_BOARD_CONFIG_NEGRONI */
++
+ #ifdef ARM64_BOARD_CONFIG_VMAPPLE
+ #include <pexpert/arm64/VMAPPLE.h>
+ 
