@@ -1,8 +1,33 @@
 # Plan and status
 
-Status date: 2026-10-26 (14:30).
+Status date: 2026-10-27 (12:15).
 
-## Next (owner + main session)
+## TODO (2026-10-27, end of the night session; owner: "bluetooth works, wifi doesn't")
+State at the stop: boot_a = out/ios16-safe. Latest reviewed kernel out/kernel/local-20261027-023416 (all committed
+patches up to 0379 + 0345/0374/0375/0376; no 0380). Test image out/ios16-t23 (ADSP off, Wi-Fi MSI on, camera ADT nodes,
+watchdogs 0371=60 s / 0375=30 s). Details: docs/notes.md sections 57-63, patches/xnu/README-*.md.
+
+1. **Wi-Fi does not work for the owner (priority 1).** Proven: with 0344 MSI the chip reaches WMI SERVICE_READY and
+   iOS has en0 (t21, notes 57). Not proven: scan and join. 0345 (wifid answers + join fix) is committed, never booted.
+   Next: boot t23, open Settings > Wi-Fi, read `NEGRONI WLAN iOS` lines (scan request? scan done? SCAN_RESULT? join?).
+   If wifid never asks for a scan: 96 VIRTUAL_IF_ROLE, 51 COUNTRY_CODE, event 55 (README-wifi.md "0345" risks).
+2. **USB data watchdog 0375: first phone test inconclusive.** t23 12:12: armed (`reboot after 30 s without USB data`),
+   but 45 s of `ifconfig en10 down` on the Mac did not fire it, so frames still reached the phone (or macOS kept the
+   link busy). A second 20 s down at 12:14 lost the link at 12:14:51 (cause not read yet: read `make bootlog`, boot 13
+   end mark). Prove 0375 fires before any more ADSP tests (keep-usb-reachable rule).
+3. **ADSP + Type-C fix 0374** (notes 58): t22 05:05 got the Mac back as host 6 s after the drop, but the data path
+   died and the phone needed a button reset. Retest only with 0375 proven.
+4. **Camera.app**: test images now carry the camera ADT nodes; run `scripts/camera/phone-camera.sh push`, boot t23,
+   open Camera.app (docs/camera-ios-2026-10-27.md section 7).
+5. **Passcode 0221** (committed): owner test in Settings > Passcode (README-aks-amfi.md "0221 passcode").
+6. **Sensors**: 0376 (SLPI start, phase 1) committed, needs the ADSP-area write (`scripts/fw/build-areas.sh`,
+   `write-areas.sh`; owner approval) and `negronislpi=1..3` tests. Phase 2 (0380 FastRPC file server + sns_client) is
+   HELD, unreviewed, outside the repo in out/hold/sensors-phase2-final-20261027-0806/ (its agent run was stopped by a
+   safety classifier once); owner decides: review + commit, or leave.
+7. Audio (needs the ADSP, item 3), VOOC fast charge (default off, after item 3), location services (not started),
+   watchdogd fixed (0378), Bluetooth works (owner, 2026-10-27).
+
+## Next (owner + main session, older list of 2026-10-26)
 1. Charge in fastbootd to > 60 %. Then `scripts/flash/ios16.sh userdata` (fastbootd; writes the root + firmware areas),
    `vendor_boot`, `vbmeta`, `dtbo`, `boot` with `IOS16_OUT=out/ios16-all2` (safe baseline) or `out/ios16-everything`
    (diagnostic: every addition on), `active`.
