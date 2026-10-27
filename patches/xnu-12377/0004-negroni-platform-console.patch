@@ -682,10 +682,10 @@ index f2aa835..1a19a3d 100644
 +iokit/Kernel/arm/NegroniCPU.cpp                                    optional iokitcpp
 diff --git a/osfmk/arm64/negroni_weak_hooks.c b/osfmk/arm64/negroni_weak_hooks.c
 new file mode 100644
-index 0000000..a806c58
+index 0000000..1f66698
 --- /dev/null
 +++ b/osfmk/arm64/negroni_weak_hooks.c
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,33 @@
 +/*
 + * iOS 26 port (xnu-12377): weak default definitions of the negroni driver hooks that the machine layer, the
 + * console and the platform expert call. The drivers (bsd/dev/negroni_*.c, iokit/Kernel/arm/Negroni*.cpp) give the
@@ -702,6 +702,7 @@ index 0000000..a806c58
 +/* bsd/dev/negroni_ufs.c: persistent boot log, boot-log end mark (0047, 0367) */
 +NEGRONI_WEAK void negroni_log_append(const char *c __unused, int size __unused) {}
 +NEGRONI_WEAK void negroni_bootlog_end(unsigned kind __unused, const char *why __unused) {}
++NEGRONI_WEAK void negroni_log_panic(const char *text __unused, size_t length __unused) {}
 +/* bsd/dev/negroni_rpmh.c (0383): never ready = no cluster power-down request */
 +NEGRONI_WEAK bool negroni_rpmh_sleep_ready(void) { return false; }
 +NEGRONI_WEAK void negroni_rpmh_sleep_log(void) {}
@@ -789,10 +790,10 @@ index 48f9405..864e857 100644
  #endif
 diff --git a/osfmk/kern/negroni_top.c b/osfmk/kern/negroni_top.c
 new file mode 100644
-index 0000000..f84734a
+index 0000000..0c455a3
 --- /dev/null
 +++ b/osfmk/kern/negroni_top.c
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,346 @@
 +/*
 + * NEGRONI (SM8450) "top" in the kernel log, patch 0382 (patches/xnu/README-power-idle.md).
 + *
@@ -940,7 +941,11 @@ index 0000000..f84734a
 +		struct recount_usage u = { 0 };
 +		uint64_t idle = 0;
 +		recount_processor_usage(&p->pr_recount, &u, &idle);
-+		uint64_t b = u.ru_user_time_mach + u.ru_system_time_mach;
++		/* 12377 recount: per-level metrics (user/system[/secure]) instead of ru_user/system_time_mach */
++		uint64_t b = 0;
++		for (int l = 0; l < RCT_LVL_COUNT; l++) {
++			b += u.ru_metrics[l].rm_time_mach;
++		}
 +		uint64_t db = b - nt_cpu[i].busy, di = idle - nt_cpu[i].idle;
 +		busy[i] = (uint32_t)(db + di ? db * 100 / (db + di) : 0);
 +		irq[i] = (uint32_t)((cd->cpu_stat.irq_ex_cnt - nt_cpu[i].irq) * 1000 / ms);
@@ -1136,16 +1141,21 @@ index 0000000..f84734a
 +}
 +#endif /* NEGRONI */
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index 032d9e0..a902c3b 100644
+index 032d9e0..8c4820f 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -26,8 +26,151 @@
+@@ -26,6 +26,7 @@
  #include <pexpert/arm/consistent_debug.h>
  #include <pexpert/arm64/board_config.h>
  #include <arm64/proc_reg.h>
 +#include <arm64/negroni_early.h>
  #include <pexpert/arm/protos.h>
  #include <kern/sched_prim.h>
+ #ifdef PL011_UART
+@@ -643,6 +644,148 @@ static struct pe_serial_functions dockchannel_serial_functions =
+ 
+ /*****************************************************************************/
+ 
 +/*
 + * negroni: framebuffer "serial" for boards with no usable UART (the OnePlus
 + * 10 Pro's debug UART engine runs in SPI mode). kprintf output is drawn onto
@@ -1289,8 +1299,8 @@ index 032d9e0..a902c3b 100644
 +}
 +
  #ifdef PL011_UART
- #include <pexpert/arm/pl011.h>
- #endif /* PL011_UART */
+ 
+ static unsigned int
 @@ -697,6 +840,9 @@ pl011_uart_init(void)
  	pl011_registers->uartcr.raw = uartcr.raw;
  }

@@ -15,10 +15,10 @@ Open points (docs/ios26-port-status.md, PAC section): Gunyah must not trap the k
 paca/pacg, so EL1 access works [I]); per-process B keys; the shared-region slide of auth rebases (slide info v5).
 
 diff --git a/osfmk/arm64/negroni_weak_hooks.c b/osfmk/arm64/negroni_weak_hooks.c
-index a806c58..5cc03ea 100644
+index 1f66698..80a4480 100644
 --- a/osfmk/arm64/negroni_weak_hooks.c
 +++ b/osfmk/arm64/negroni_weak_hooks.c
-@@ -30,3 +30,8 @@ NEGRONI_WEAK int negroni_display_asleep;
+@@ -31,3 +31,8 @@ NEGRONI_WEAK int negroni_display_asleep;
  /* bsd/dev/negroni_rtc.c: no RTC = the epoch */
  NEGRONI_WEAK void negroni_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs) { *secs = 0; *nsecs = 0; }
  NEGRONI_WEAK void negroni_rtc_set(clock_sec_t secs __unused, clock_nsec_t nsecs __unused) {}
