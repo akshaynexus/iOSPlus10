@@ -13,6 +13,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | `external/Mu-Silicium-negroni` & submodules | Andrei Warkentin, Project Silicium, Microsoft Corp., ARM Ltd., Intel Corp., Apple Inc., Linux Foundation | BSD-2-Clause / Project Mu / EDK II |
 | `external/hackios-xnu-userland` | OOSEX GANG | MIT |
 | HakiOS userland (hackios-next; parts in `userland/negronigl/`) | the HakiOS authors | MIT |
+| HakiOS kernel `hakios.mpss.c` (RMTFS / TFTP / service-registry / QRTR name-service port in `patches/xnu/0397-negroni-gnss.patch`: `bsd/dev/negroni_gnss.c`; hackios-next 88513176) | the HakiOS authors | APSL 2.0 (as XNU) |
 | `external/ios-flame` | NWylynko, dipa-studio | MIT |
 | `external/metal2vulkan` | steelbrain | GPL-2.0-or-later OR LGPL-3.0-or-later |
 | `external/ios-sweet` & `external/ios-sweet-upstream` | dipa-studio | MIT |

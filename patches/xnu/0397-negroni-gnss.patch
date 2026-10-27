@@ -1,0 +1,4294 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index bdafab2..b36270c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -138,6 +138,7 @@ bsd/dev/negroni_wlan_bhi.c		standard
+ bsd/dev/negroni_wlan_mhi.c		standard
+ bsd/dev/negroni_adsp.c			standard
+ bsd/dev/negroni_slpi.c			standard
++bsd/dev/negroni_gnss.c			standard
+ bsd/dev/negroni_rpmh.c			standard
+ bsd/dev/negroni_bt.c			standard
+ bsd/dev/negroni_bt_hci.c		standard
+diff --git a/bsd/dev/negroni_gnss.c b/bsd/dev/negroni_gnss.c
+new file mode 100644
+index 0000000..5a48eb2
+--- /dev/null
++++ b/bsd/dev/negroni_gnss.c
+@@ -0,0 +1,3538 @@
++/*
++ * SPDX-License-Identifier: APSL-2.0
++ *
++ * NEGRONI (OnePlus 10 Pro 5G NE2211, SM8450): GNSS through the modem, patch 0397 of iOSPlus10
++ * (docs/location-plan.md path L3/C, patches/xnu/README-gnss.md). UNTESTED ON HARDWARE.
++ *
++ * The NE2211 has no GNSS chip of its own: the GNSS engine is in the modem (MPSS, a Hexagon DSP), and the
++ * modem speaks QMI LOC (service 16) over QRTR. This file starts the modem in its default (low power,
++ * never "online") mode, serves the three things the modem asks the HLOS for before it offers its
++ * services (RMTFS, TFTP, the service registry locator), and runs a QMI LOC client. Fixes go to
++ * /dev/negroni_gnss and sysctl kern.negroni_gnss (text, format below) for userland/location/negroni-locd.
++ *
++ * Feature rules (CLAUDE.md "No probes"): on by default; boot-arg negronignss=0 is the only switch (kill
++ * switch). The steps below are the self-check. Any failure stops and powers the modem down (if it was
++ * started), and prints ONE line "NEGRONI GNSS: off: <reason>". A modem crash (SMP2P FATAL), a dead GLINK
++ * or a modem that stops answering after "on" does the same. No restart in that boot.
++ *
++ * Sources. Linux qcom_q6v5_pas.c sm8450_mpss_resource (pas_id 4, crash reason 421, load_state "modem",
++ * proxy power domains cx + mss); the live DT (out/live.dts): remoteproc-mss@04080000, mpss_region@8bc00000
++ * size 0x13200000, qcom,smp2p-modem (items in 435 / out 428, remote pid 1, IPCC client 2 signal 2),
++ * glink-edge "mpss" (IPCC client 2 signal 0, channel IPCRTR), qcom,rmtfs_sharedmem@0 (0x280000, client 1,
++ * no qcom,vm-nav-path). The PAS/SMEM/SMP2P/GLINK/QRTR code is negroni_slpi.c (0376, itself a copy of the
++ * ADSP code 0240/0242/0248) with the modem's numbers. The RMTFS, TFTP and service-registry servers and the
++ * QRTR name service are ported from HakiOS xnu/files/bsd/dev/hakios.mpss.c (APSL 2.0, Copyright (c)
++ * 2025-2026 the HakiOS authors; reference tree out/src/hackios-next, commit
++ * 88513176b1e96ecf0b764cd62c6f4e6ac71345e3), whose modem runs on SM7325 with the same protocol. QMI LOC
++ * and DMS message and TLV numbers: libqmi data/qmi-service-loc.json, qmi-service-dms.json,
++ * qmi-flags64-loc.h, qmi-enums-loc.h (gitlab.freedesktop.org/mobile-broadband/libqmi
++ * 3454c2c619d516fd46a08fe16c6eebdee061857d).
++ *
++ * Steps (thread "NEGRONI GNSS", after GN_SETTLE_S seconds of boot):
++ *   0  waits   for the ADSP (0240) and SLPI (0376) start threads if they run (QMP mailbox, TCSR mutex 3)
++ *   1  reads   SMEM: the apps<->modem partition (hosts 0/1); the modem's SMP2P item 435 must be absent
++ *   2  reads   UFS LUN 4 "modem_a" (FAT16, READ ONLY): image/modem.mdt + modem.bNN, the image/NAME.jsn files
++ *   3  reads   UFS LUN 5 modemst1, modemst2, fsg, fsc (READ ONLY) into kernel memory: the RMTFS backing.
++ *              The modem's writes go into that memory only. Nothing in this file can write a partition.
++ *   4  maps    the RMTFS buffer (GN_RMTFS_PHYS: below 4 GiB, outside XNU's RAM), zero, pattern check
++ *   5  writes  RPMh: mss.lvl level 384 (the modem's own rail; never cx.lvl, which USB and UFS share)
++ *   6  writes  AOSS QMP: "{class: image, res: load_state, name: modem, val: on}"
++ *   7  asks    TrustZone: PAS init image (id 4), PAS mem setup (0x8bc00000, span)
++ *   8  writes  the carveout 0x8bc00000 + 0x13200000 only: zero, PT_LOAD segments, read back (SHA-256)
++ *   9  writes  SMEM: our SMP2P item 428 ("master-kernel" = 0), IPCC ring (client 2, signal 2)
++ *  10  asks    TrustZone: SCM memory assign of the RMTFS buffer to HLOS + MSS_MSA (the DT has no NAV path),
++ *              PAS auth and reset (id 4); waits for "slave-kernel" READY (handover drops the mss vote)
++ *  11  writes  SMEM: GLINK items 478 + 479 (0/1 partition); version; channel IPCRTR
++ *  12  talks   QRTR: HELLO; serves RMTFS (14), TFTP (4096), servreg locator (64); waits for LOC (16)
++ *  13  talks   QMI LOC: register events (answer OK = the last self-check), engine lock none, standalone
++ * Then "NEGRONI GNSS: on: ..." and the run loop: GLINK polled every 200 ms (50 ms with a session), the
++ * modem's SMP2P FATAL bit watched (0248 style), a LOC request every 30 s as a liveness check (3 lost answers
++ * = off). A LOC session (periodic, 1 s) runs while /dev/negroni_gnss was read in the last GN_DEMAND_S
++ * seconds; without readers it stops (GNSS off, modem idle).
++ *
++ * USB safety (README-gnss.md "USB"): the USB drop after the ADSP start (notes 48/55/58) comes from the ADSP
++ * charger PD (Type-C role flip, PHY rails). The modem owns no USB, Type-C, PMIC or PHY resource; this file
++ * writes no GPIO, clock, PMIC or USB register, and votes only mss.lvl (modem-only). UFS: only READ(10) on
++ * other LUNs, one 1 MiB command at a time under the UFS lock (root I/O interleaves).
++ *
++ * Interface (docs/location-plan.md section 6): /dev/negroni_gnss root:wheel 0440, pread(fd, buf, n, 0) gives
++ *   state=<starting|on|off> session=<0|1> engine=<on|off|unknown> reports=<N> reason=<text>\n
++ *   fix=<seq> final=<0|1> utc_ms=<ms> lat=<deg> lon=<deg> alt_m=<m|-> ealt_m=<m|-> hacc_m=<m|-> vacc_m=<m|->
++ *       speed_mps=<m/s|-> course_deg=<deg|-> sats=<n> age_ms=<ms>\n      (second line only after a fix)
++ *   locd=LAT LON HACC ALT VACC SPEED COURSE\n   (third line only for a fix younger than 3 s; negroni-locd's text form)
++ * Each device read counts as demand; kern.negroni_gnss gives the same text and is not demand.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <stdarg.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/sysctl.h>
++#include <sys/time.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include <libkern/crypto/sha2.h>
++#include "negroni_gnss_core.h"            /* the host-tested parts (patches/xnu/tests/gnss-core-test.c) */
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern uint64_t kvtophys(vm_offset_t va);
++extern kern_return_t thread_terminate(thread_t);
++extern void IOSleep(unsigned int milliseconds);
++extern int negroni_ufs_part_open(const char *name, uint64_t *bytes);              /* 0397 negroni_ufs.c */
++extern int negroni_ufs_part_read(int handle, uint64_t at, void *dst, uint32_t count);  /* 0397, read only */
++extern int negroni_rpmh_arc_vote(const char *res, unsigned level);
++extern int negroni_adsp_phase(void);            /* 0376: 0 not asked, 1 running, 2 done */
++extern int negroni_slpi_phase(void);            /* 0397 (negroni_slpi.c): same */
++extern void negroni_qmp_lock(void);             /* 0397 (negroni_spmi.c): the AOSS QMP mailbox */
++extern void negroni_qmp_unlock(void);
++void negroni_gnss_init(void);
++
++#define GN_WIMG_WCOMB           0x6u            /* VM_WIMG_WCOMB, as negroni_adsp.c */
++#define GN_SETTLE_S             20u             /* boot I/O first: the firmware read is ~110 MB */
++#define GN_READY_S              10u             /* step 10: READY after auth and reset */
++#define GN_LOC_WAIT_S           180u            /* step 12: the modem reads its files first (~30 s on SM7325) */
++#define GN_DEMAND_S             30u             /* a session runs while /dev/negroni_gnss was read in the last 30 s */
++#define GN_PING_S               30u             /* liveness request period */
++#define GN_PING_LOST            3u              /* lost answers in a row = off */
++#define GN_FRESH_MS             3000u           /* the locd= line only for a fix younger than this */
++
++/* ---- addresses (live DT) ---- */
++#define SMEM_PHYS               0x80900000UL
++#define SMEM_SIZE               0x00200000u
++#define MPSS_MEM_PHYS           0x8bc00000UL    /* mpss_region@8bc00000 { reg = <0 0x8bc00000 0 0x13200000> } */
++#define MPSS_MEM_SIZE           0x13200000u
++_Static_assert((MPSS_MEM_SIZE & 0x3fffu) == 0, "ml_io_unmap needs a 16 KiB page multiple");
++#define IPCC_PHYS               0x0ed18000UL
++#define AOSS_PHYS               0x0c300000UL
++#define AOSS_SIZE               0x400u
++#define TCSR_MUTEX_PHYS         0x01f43000UL    /* smem hwlocks = <&tcsr_mutex 3> */
++/*
++ * The RMTFS buffer. The DT node qcom,rmtfs_sharedmem@0 has a dynamic address (Linux takes it from its CMA
++ * below 4 GiB). The modem's RMTFS requests carry 32-bit addresses (HakiOS: a buffer above 4 GiB fails), and
++ * all XNU RAM on this port is at 0x841000000 or higher. So the buffer is the start of the Mu memory map
++ * region "Kernel" 0xa8000000 + 256 MiB (Reserv, HLOS memory: where ABL loads a Linux kernel; nothing of
++ * this port uses it after Mu) [I: free; HakiOS used the same Mu region on SM7325].
++ */
++#define GN_RMTFS_PHYS           0xa8000000UL
++#define GN_RMTFS_SIZE           0x280000u       /* reg of qcom,rmtfs_sharedmem@0 */
++_Static_assert((GN_RMTFS_SIZE & 0x3fffu) == 0, "16 KiB page multiple");
++
++/* ---- SCM ---- */
++#define SCM_64                  (1ull << 30)
++#define SCM_SIP                 (2ull << 24)
++#define SCM_CALL(svc, cmd)      ((uint64_t)(svc) << 8 | (cmd))
++#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
++#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
++#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
++#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
++#define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
++#define SCM_MP_ASSIGN           SCM_CALL(0xc, 0x16)
++#define SCM_ONE_VALUE           1
++#define SCM_THREE_VALUES        3
++#define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)
++#define SCM_ASSIGN_ARGS         0x1117          /* 7 args: buf, val, buf, val, buf, val, val (qcom_scm_assign_mem) */
++#define SCM_INTERRUPTED         1
++#define PAS_MPSS                4               /* sm8450_mpss_resource .pas_id */
++#define VMID_HLOS               3
++#define VMID_MSS_MSA            15
++#define VM_PERM_RW              6
++
++/* ---- SMEM ---- */
++#define SMEM_APPS               0
++#define SMEM_MPSS               1               /* qcom,remote-pid of smp2p-modem and the glink-edge */
++#define SMEM_GLOBAL             0xfffe
++#define SMEM_CANARY             0xa5a5
++#define ITEM_CRASH_REASON       421             /* sm8450_mpss_resource .crash_reason_smem */
++#define ITEM_SMP2P_OURS         428             /* qcom,smem = <0x1b3 0x1ac> = <435 428>: inbound, outbound */
++#define ITEM_SMP2P_THEIRS       435
++#define ITEM_GLINK_DESC         478
++#define ITEM_GLINK_FIFO0        479
++#define ITEM_GLINK_FIFO1        480
++
++/* ---- SMP2P ---- */
++#define SMP2P_MAGIC             0x504d5324      /* "$SMP" */
++#define SMP2P_VERSION           1
++#define SMP2P_FEATURE_SSR_ACK   1u
++#define SMP2P_ENTRIES           16
++#define SMP2P_ITEM_SIZE         (20 + 20 * SMP2P_ENTRIES)
++#define DSP_FATAL               (1u << 0)
++#define DSP_READY               (1u << 1)
++#define DSP_HANDOVER            (1u << 2)
++#define DSP_STOP_ACK            (1u << 3)
++
++/* ---- IPCC ---- */
++#define IPCC_SEND_ID            0x0c
++#define IPCC_CLIENT_AOP         0u
++#define IPCC_CLIENT_MPSS        2u              /* mboxes = <&ipcc 2 ...> */
++#define IPCC_SIGNAL_GLINK       0u
++#define IPCC_SIGNAL_SMP2P       2u
++
++/* ---- AOSS QMP (qcom_aoss.c) ---- */
++#define QMP_MAGIC               0x00
++#define QMP_MAGIC_VALUE         0x4d41494c
++#define QMP_VERSION             0x04
++#define QMP_UCORE_LINK          0x0c
++#define QMP_UCORE_LINK_ACK      0x10
++#define QMP_UCORE_CH            0x14
++#define QMP_UCORE_CH_ACK        0x18
++#define QMP_MCORE_LINK          0x24
++#define QMP_MCORE_LINK_ACK      0x28
++#define QMP_MCORE_CH            0x2c
++#define QMP_MCORE_CH_ACK        0x30
++#define QMP_MCORE_MBOX_SIZE     0x34
++#define QMP_MCORE_MBOX_OFFSET   0x38
++#define QMP_UP                  0x0000ffffu
++#define QMP_MSG_LEN             64u
++
++/* ---- MDT ---- */
++#define PT_LOAD                 1
++#define MDT_TYPE(flags)         (((flags) >> 24) & 7)
++#define MDT_TYPE_HASH           2
++#define MDT_RELOCATABLE         (1u << 27)
++#define MAX_SEGMENTS            48
++#define CHUNK                   (1u << 20)
++
++struct seg {
++	uint32_t type, offset, paddr, filesz, memsz, flags;
++};
++
++#define STEPS                   13
++static const char *const step_names[STEPS + 1] = {
++	"wait for the DSP threads", "SMEM survey", "firmware", "modem file systems", "RMTFS buffer", "rails", "AOP QMP",
++	"PAS init", "load", "SMP2P", "start", "GLINK", "QRTR services", "LOC",
++};
++
++static uint32_t step;
++static vm_offset_t smem, ipcc, aoss, tcsr;
++static uint8_t *mdt;
++static uint32_t mdt_size, nseg, min_pa, max_pa;
++static struct seg segs[MAX_SEGMENTS];
++static bool relocatable, rails_on, qmp_on, pas_inited, modem_running;
++static uint32_t our_item, their_item;
++static char fail_why[192];
++
++#define say(fmt, ...) printf("NEGRONI GNSS: " fmt "\n", ##__VA_ARGS__)
++#define FAIL(fmt, ...) do { snprintf(fail_why, sizeof(fail_why), fmt, ##__VA_ARGS__); } while (0)
++
++/* ---- the state userland sees ---- */
++
++enum { GN_STARTING = 0, GN_ON = 1, GN_OFF = 2 };
++static LCK_GRP_DECLARE(gn_grp, "negroni_gnss");
++static LCK_MTX_DECLARE(gn_lock, &gn_grp);      /* gn_state, gn_reason, gn_fix, the counters below */
++static int gn_state = GN_STARTING;
++static char gn_reason[192] = "starting";
++static bool gn_session_on, gn_engine_known, gn_engine_on;
++static uint32_t gn_reports;
++static uint64_t gn_last_read_abs;               /* mach_absolute_time() of the last /dev read; 0: never */
++
++#define GN_NO                   GC_NO           /* a value the report did not carry */
++struct gn_fix {
++	bool have, final;
++	uint64_t seq, utc_ms, at_abs;
++	int64_t lat_e7, lon_e7;                 /* degrees * 1e7 */
++	int64_t alt_cm, ealt_cm, hacc_cm, vacc_cm, speed_cms, course_cdeg;
++	uint32_t sats;
++};
++static struct gn_fix gn_fix;
++
++static void
++gn_set_off(const char *fmt, ...) __printflike(1, 2);
++
++static void
++gn_set_off(const char *fmt, ...)
++{
++	char why[192];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(why, sizeof(why), fmt, ap);
++	va_end(ap);
++	lck_mtx_lock(&gn_lock);
++	if (gn_state == GN_OFF) {
++		lck_mtx_unlock(&gn_lock);
++		return;
++	}
++	gn_state = GN_OFF;
++	gn_session_on = false;
++	strlcpy(gn_reason, why, sizeof(gn_reason));
++	lck_mtx_unlock(&gn_lock);
++	printf("NEGRONI GNSS: off: %s\n", why);
++}
++
++static uint64_t
++ms_since(uint64_t t0)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns / 1000000;
++}
++
++static uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static void
++wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb osh" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++#define le16 gc_le16
++#define le32 gc_le32
++#define le64 gc_le64
++
++/* The SCM call of negroni_slpi.c, with a fourth argument in x5 (the extra-argument buffer of a 7-arg call). */
++static int32_t
++scm(const char *what, uint64_t function, uint64_t args, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t *answer)
++{
++	uint64_t t0 = mach_absolute_time();
++
++	for (int busy = 0; busy <= 20; busy++) {
++		uint64_t session = 0;
++		int i;
++		for (i = 0; i < 2000000; i++) {
++			register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
++			register uint64_t x1 __asm__("x1") = args;
++			register uint64_t x2 __asm__("x2") = a0;
++			register uint64_t x3 __asm__("x3") = a1;
++			register uint64_t x4 __asm__("x4") = a2;
++			register uint64_t x5 __asm__("x5") = a3;
++			register uint64_t x6 __asm__("x6") = session;
++			register uint64_t x7 __asm__("x7") = 0;
++
++			__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
++			    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++			session = x6;
++			if (x0 == SCM_INTERRUPTED) {
++				continue;
++			}
++			if ((int32_t)x0 == -12 && busy < 20) {
++				IOSleep(30);
++				break;
++			}
++			if (x0 == 2) {
++				say("%u SCM %s: WAITQ_SLEEP: not supported", step, what);
++				return -1;
++			}
++			say("%u SCM %s -> %d, answer %#llx (%llu ms)", step, what, (int32_t)x0, x1, ms_since(t0));
++			*answer = x1;
++			return (int32_t)x0;
++		}
++		if (i == 2000000) {
++			break;
++		}
++	}
++	say("%u SCM %s keeps returning interrupted or busy (%llu ms)", step, what, ms_since(t0));
++	return -1;
++}
++
++/* ---- SMEM (smem.c layouts; the walkers of negroni_slpi.c with hosts 0/1) ---- */
++
++static uint32_t
++smem_partition(uint16_t a, uint16_t b, uint32_t *size, uint32_t *cacheline)
++{
++	uint32_t toc = SMEM_SIZE - 0x1000;
++
++	if (rd32(smem, toc) != 0x434f5424 /* "$TOC" */ || rd32(smem, toc + 4) != 1) {
++		return 0;
++	}
++	uint32_t count = rd32(smem, toc + 8);
++	for (uint32_t i = 0; i < count && i < 64; i++) {
++		uint32_t e = toc + 32 + 48 * i;
++		uint32_t off = rd32(smem, e), sz = rd32(smem, e + 4), hosts = rd32(smem, e + 12);
++		uint16_t h0 = (uint16_t)hosts, h1 = (uint16_t)(hosts >> 16);
++		if (off == 0 || sz == 0 || !((h0 == a && h1 == b) || (h0 == b && h1 == a))) {
++			continue;
++		}
++		if ((uint64_t)off + sz > toc || rd32(smem, off) != 0x54525024 /* "$PRT" */ || rd32(smem, off + 8) != sz) {
++			return 0;
++		}
++		*size = sz;
++		*cacheline = rd32(smem, e + 16);
++		return off;
++	}
++	return 0;
++}
++
++static uint32_t
++smem_find_in(uint32_t p, uint32_t psize, uint32_t cacheline, uint32_t item, uint32_t *size)
++{
++	uint32_t free_uncached = rd32(smem, p + 12), free_cached = rd32(smem, p + 16);
++
++	if (free_uncached > psize || free_cached > psize) {
++		return 0;
++	}
++	for (uint32_t at = 32; at + 16 <= free_uncached;) {
++		uint32_t w0 = rd32(smem, p + at), sz = rd32(smem, p + at + 4), pad = rd32(smem, p + at + 8);
++		if ((w0 & 0xffff) != SMEM_CANARY || sz > psize || (pad & 0xffff) > sz ||
++		    (uint64_t)at + 16 + (pad >> 16) + sz > free_uncached) {
++			break;
++		}
++		if ((w0 >> 16) == item) {
++			*size = sz - (pad & 0xffff);
++			return p + at + 16 + (pad >> 16);
++		}
++		at += 16 + (pad >> 16) + sz;
++	}
++	if (cacheline == 0 || (cacheline & (cacheline - 1))) {
++		return 0;
++	}
++	uint32_t back = (16 + cacheline - 1) & ~(cacheline - 1);
++	for (uint32_t at = psize - back; at > free_cached && at < psize;) {
++		uint32_t w0 = rd32(smem, p + at), sz = rd32(smem, p + at + 4), pad = rd32(smem, p + at + 8);
++		if ((w0 & 0xffff) != SMEM_CANARY || sz > at || at - sz < free_cached || (pad & 0xffff) > sz) {
++			break;
++		}
++		if ((w0 >> 16) == item) {
++			*size = sz - (pad & 0xffff);
++			return p + at - sz;
++		}
++		if (sz + back > at) {
++			break;
++		}
++		at -= sz + back;
++	}
++	return 0;
++}
++
++/* The modem's items only in the 0/1 partition (0376 review F1); the crash reason may come from global. */
++static uint32_t
++smem_item_in(uint32_t item, uint32_t *size, unsigned nhosts)
++{
++	static const uint16_t hosts[2][2] = { { SMEM_APPS, SMEM_MPSS }, { SMEM_GLOBAL, SMEM_GLOBAL } };
++
++	for (unsigned h = 0; h < nhosts; h++) {
++		uint32_t psize = 0, cacheline = 0, p = smem_partition(hosts[h][0], hosts[h][1], &psize, &cacheline);
++		uint32_t at = p ? smem_find_in(p, psize, cacheline, item, size) : 0;
++		if (at) {
++			return at;
++		}
++	}
++	return 0;
++}
++
++#define smem_item(item, size)   smem_item_in((item), (size), 1)
++#define smem_item_any(item, size) smem_item_in((item), (size), 2)
++
++/* The modem's last words (item 421) into buf ("" when absent). */
++static void
++last_words(char *buf, size_t len)
++{
++	char text[81];
++	uint32_t size = 0, at = smem ? smem_item_any(ITEM_CRASH_REASON, &size) : 0;
++
++	buf[0] = 0;
++	if (at == 0 || size == 0) {
++		return;
++	}
++	bzero(text, sizeof(text));
++	for (uint32_t i = 0; i < MIN(size, (uint32_t)sizeof(text) - 1) / 4; i++) {
++		uint32_t w = rd32(smem, at + 4 * i);
++		memcpy(text + 4 * i, &w, 4);
++	}
++	for (size_t i = 0; i < sizeof(text) && text[i]; i++) {
++		if (text[i] < 0x20 || text[i] > 0x7e) {
++			text[i] = '?';
++		}
++	}
++	strlcpy(buf, text, len);
++}
++
++static bool
++smp2p_value(uint32_t at, const char *name, uint32_t *value)
++{
++	if (at == 0 || rd32(smem, at) != SMP2P_MAGIC) {
++		return false;
++	}
++	uint32_t valid = rd32(smem, at + 12) >> 16;
++	for (uint32_t i = 0; i < valid && i < SMP2P_ENTRIES; i++) {
++		char n[17];
++		for (uint32_t w = 0; w < 4; w++) {
++			uint32_t v = rd32(smem, at + 20 + 20 * i + 4 * w);
++			memcpy(n + 4 * w, &v, 4);
++		}
++		n[16] = 0;
++		if (strncmp(n, name, 16) == 0) {
++			*value = rd32(smem, at + 36 + 20 * i);
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++kick(uint32_t client, uint32_t signal)
++{
++	wr32(ipcc, IPCC_SEND_ID, client << 16 | signal);
++}
++
++/* ---- FAT16 reader (negroni_gnss_core.h) over the read-only UFS partition modem_a (the modem firmware volume) ---- */
++
++#define FAT_DIR_MAX             (256u << 10)
++static int fw_part = -1;
++static struct gc_fat fv;
++
++static int
++fw_read(__unused void *ctx, uint64_t at, void *dst, uint32_t n)
++{
++	return negroni_ufs_part_read(fw_part, at, dst, n);
++}
++
++static bool
++fat_mount(void)
++{
++	static const char *const why[] = { "", "not a FAT16 boot sector", "layout beyond the partition", "not FAT16 (cluster count)",
++		                           "FAT size", "root directory too big" };
++	uint8_t bs[512];
++	vm_offset_t a = 0, d = 0;
++	int part, rc;
++
++	bzero(&fv, sizeof(fv));
++	part = negroni_ufs_part_open("modem_a", &fv.size);
++	if (part < 0) {
++		FAIL("no partition modem_a on the UFS (errno %d)", -part);
++		return false;
++	}
++	fw_part = part;
++	fv.read = fw_read;
++	fv.dir_max = FAT_DIR_MAX;
++	fv.max_read = CHUNK;
++	if (fv.size < 1u << 20 || negroni_ufs_part_read(part, 0, bs, sizeof(bs)) != 0) {
++		FAIL("modem_a: boot sector not readable");
++		return false;
++	}
++	rc = gc_fat_parse(&fv, bs);
++	if (rc != 0) {
++		FAIL("modem_a: %s", why[rc < 6 ? rc : 1]);
++		return false;
++	}
++	if (kmem_alloc(kernel_map, &a, round_page(fv.fat_bytes), KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, &d, FAT_DIR_MAX, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		if (a) {
++			kmem_free(kernel_map, a, round_page(fv.fat_bytes));
++		}
++		FAIL("no memory for the FAT");
++		return false;
++	}
++	if (negroni_ufs_part_read(part, fv.fat_off, (void *)a, fv.fat_bytes) != 0) {
++		kmem_free(kernel_map, a, round_page(fv.fat_bytes));
++		kmem_free(kernel_map, d, FAT_DIR_MAX);
++		FAIL("modem_a: FAT not readable");
++		return false;
++	}
++	fv.fat = (const uint16_t *)a;
++	fv.dir = (uint8_t *)d;
++	say("2 modem_a: FAT16, %u-byte sectors, %u KiB clusters, %u clusters", fv.bps, fv.cl_bytes >> 10, fv.nclusters);
++	return true;
++}
++
++static bool
++fat_lookup(const char *path, uint32_t *cluster, uint32_t *size)
++{
++	return fv.fat != NULL && gc_fat_lookup(&fv, path, cluster, size);
++}
++
++static int
++fat_read(uint32_t cluster, uint32_t size, uint64_t off, void *dst, uint32_t n)
++{
++	return fv.fat != NULL ? gc_fat_read(&fv, cluster, size, off, dst, n) : ENXIO;
++}
++
++/* A whole file into kalloc_data memory of MAX(size, 1) bytes (caller frees with kfree_data(p, MAX(*size, 1))). */
++static uint8_t *
++fat_slurp(const char *path, uint32_t max, uint32_t *size)
++{
++	uint32_t c = 0, s = 0;
++	uint8_t *p;
++
++	if (!fat_lookup(path, &c, &s) || s > max) {
++		return NULL;
++	}
++	p = kalloc_data(MAX(s, 1u), Z_WAITOK | Z_ZERO);
++	if (p == NULL) {
++		return NULL;
++	}
++	if (fat_read(c, s, 0, p, s) != 0) {
++		kfree_data(p, MAX(s, 1u));
++		return NULL;
++	}
++	*size = s;
++	return p;
++}
++
++/* ---- step 0 ---- */
++
++static bool
++step_wait(void)
++{
++	uint32_t s;
++
++	for (s = 0; s < 600 && ((negroni_adsp_phase() == 1) || (negroni_slpi_phase() == 1)); s++) {
++		if (s % 60 == 0) {
++			say("0 waiting for the ADSP/SLPI start threads (shared QMP mailbox and TCSR mutex)");
++		}
++		IOSleep(1000);
++	}
++	if (negroni_adsp_phase() == 1 || negroni_slpi_phase() == 1) {
++		FAIL("the ADSP/SLPI start threads still run after %u s (shared QMP mailbox and TCSR mutex)", s);
++		return false;
++	}
++	return true;
++}
++
++/* ---- step 1 ---- */
++
++static bool
++step_survey(void)
++{
++	uint32_t psize = 0, cacheline = 0, size = 0, p, at, value = 0;
++	uint64_t answer = 0;
++
++	smem = ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, GN_WIMG_WCOMB);
++	ipcc = ml_io_map(IPCC_PHYS, 0x1000);
++	aoss = ml_io_map(AOSS_PHYS, AOSS_SIZE);
++	if (smem == 0 || ipcc == 0 || aoss == 0) {
++		FAIL("no mapping of SMEM/IPCC/AOSS");
++		return false;
++	}
++	p = smem_partition(SMEM_APPS, SMEM_MPSS, &psize, &cacheline);
++	if (p == 0) {
++		FAIL("no SMEM partition for hosts 0/1 ($TOC %#x)", rd32(smem, SMEM_SIZE - 0x1000));
++		return false;
++	}
++	at = smem_item(ITEM_SMP2P_THEIRS, &size);
++	if (at != 0) {
++		bool have = smp2p_value(at, "slave-kernel", &value);
++		FAIL("the modem's SMP2P item %u is there (slave-kernel %s %#x): the modem has run since the reset; not started twice",
++		    ITEM_SMP2P_THEIRS, have ? "=" : "missing", value);
++		return false;
++	}
++	say("1 SMEM partition 0/1 at %#lx, %#x bytes; no modem SMP2P item %u (the modem has not run)", SMEM_PHYS + p, psize,
++	    ITEM_SMP2P_THEIRS);
++	/* logged, not obeyed (0241: TrustZone answers 0 for the ADSP too, and the ADSP starts) */
++	(void)scm("PAS is supported (modem)", SCM_64 | SCM_SIP | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, PAS_MPSS, 0, 0, 0, &answer);
++	return true;
++}
++
++/* ---- step 2: firmware from modem_a ---- */
++
++static struct {
++	uint32_t cluster, size;
++} segfile[MAX_SEGMENTS];
++
++static void servreg_load(void);
++
++static bool
++step_firmware(void)
++{
++	uint32_t phoff, phnum, bytes = 0, c = 0, s = 0;
++	vm_offset_t m = 0;
++
++	if (!fat_mount()) {
++		return false;
++	}
++	if (!fat_lookup("image/modem.mdt", &c, &s) || s < 52 || s > PAGE_SIZE) {
++		FAIL("modem_a has no image/modem.mdt of 52..%u bytes", (unsigned)PAGE_SIZE);
++		return false;
++	}
++	if (kmem_alloc(kernel_map, &m, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    fat_read(c, s, 0, (void *)m, s) != 0) {
++		if (m) {
++			kmem_free(kernel_map, m, PAGE_SIZE);
++		}
++		FAIL("image/modem.mdt not readable");
++		return false;
++	}
++	mdt = (uint8_t *)m;
++	mdt_size = s;
++	memcpy(&phoff, mdt + 28, 4);
++	phnum = (uint32_t)(mdt[44] | mdt[45] << 8);
++	if (memcmp(mdt, "\177ELF\1\1", 6) != 0 || phnum == 0 || phnum > MAX_SEGMENTS || phoff > mdt_size ||
++	    32 * phnum > mdt_size - phoff) {
++		FAIL("modem.mdt is not an ELF32 LE header with <= %u program headers", MAX_SEGMENTS);
++		return false;
++	}
++	nseg = phnum;
++	min_pa = ~0u;
++	max_pa = 0;
++	for (uint32_t i = 0; i < nseg; i++) {
++		uint32_t ph[8];
++		memcpy(ph, mdt + phoff + 32 * i, sizeof(ph));
++		segs[i] = (struct seg){ ph[0], ph[1], ph[3], ph[4], ph[5], ph[6] };
++		if (segs[i].type != PT_LOAD || segs[i].memsz == 0 || MDT_TYPE(segs[i].flags) == MDT_TYPE_HASH) {
++			continue;
++		}
++		if ((uint64_t)segs[i].paddr + segs[i].memsz > 0xffffffffull || segs[i].filesz > segs[i].memsz) {
++			FAIL("segment %u wraps or filesz > memsz (%#x + %#x)", i, segs[i].paddr, segs[i].memsz);
++			return false;
++		}
++		relocatable |= (segs[i].flags & MDT_RELOCATABLE) != 0;
++		min_pa = MIN(min_pa, segs[i].paddr);
++		max_pa = MAX(max_pa, segs[i].paddr + segs[i].memsz);
++		if (segs[i].filesz == 0) {
++			continue;
++		}
++		char name[32];
++		snprintf(name, sizeof(name), "image/modem.b%02u", i);
++		if (!fat_lookup(name, &segfile[i].cluster, &segfile[i].size) || segfile[i].size != segs[i].filesz) {
++			FAIL("%s missing or not %u bytes", name + 6, segs[i].filesz);
++			return false;
++		}
++		bytes += segfile[i].size;
++	}
++	max_pa = (max_pa + 0xfff) & ~0xfffu;
++	say("2 modem.mdt: %u program headers, load %#x..%#x (%u KiB), %u KiB of segments, %s", nseg, min_pa, max_pa,
++	    (max_pa - min_pa) >> 10, bytes >> 10, relocatable ? "relocatable" : "fixed");
++	if (min_pa == ~0u || max_pa - min_pa > MPSS_MEM_SIZE || (!relocatable && (min_pa < MPSS_MEM_PHYS ||
++	    max_pa > MPSS_MEM_PHYS + MPSS_MEM_SIZE))) {
++		FAIL("the modem image does not fit the carveout %#lx + %#x", MPSS_MEM_PHYS, MPSS_MEM_SIZE);
++		return false;
++	}
++	servreg_load();
++	return true;
++}
++
++/* ---- step 3: the modem file systems (RMTFS backing), read only, into kernel memory ---- */
++
++static struct {
++	const char *path, *partition;
++	uint8_t *data;
++	uint32_t size;
++	bool open;
++} rmtfs_files[4] = {
++	{ "/boot/modem_fs1", "modemst1", NULL, 0, false }, { "/boot/modem_fs2", "modemst2", NULL, 0, false },
++	{ "/boot/modem_fsc", "fsc", NULL, 0, false }, { "/boot/modem_fsg", "fsg", NULL, 0, false },
++};
++
++static bool
++step_filesystems(void)
++{
++	for (unsigned f = 0; f < 4; f++) {
++		uint64_t bytes = 0;
++		vm_offset_t a = 0;
++		int h = negroni_ufs_part_open(rmtfs_files[f].partition, &bytes);
++
++		if (h < 0 || bytes == 0 || bytes > (64u << 20)) {
++			FAIL("partition %s: %s (errno %d)", rmtfs_files[f].partition, h < 0 ? "not found" : "bad size", h < 0 ? -h : 0);
++			return false;
++		}
++		if (kmem_alloc(kernel_map, &a, round_page((vm_size_t)bytes), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			FAIL("no memory for %s (%llu bytes)", rmtfs_files[f].partition, bytes);
++			return false;
++		}
++		if (negroni_ufs_part_read(h, 0, (void *)a, (uint32_t)bytes) != 0) {
++			kmem_free(kernel_map, a, round_page((vm_size_t)bytes));
++			FAIL("partition %s: read error", rmtfs_files[f].partition);
++			return false;
++		}
++		rmtfs_files[f].data = (uint8_t *)a;
++		rmtfs_files[f].size = (uint32_t)bytes;
++	}
++	say("3 modemst1 %u KiB, modemst2 %u KiB, fsc %u KiB, fsg %u KiB in kernel memory (writes stay there)",
++	    rmtfs_files[0].size >> 10, rmtfs_files[1].size >> 10, rmtfs_files[2].size >> 10, rmtfs_files[3].size >> 10);
++	return true;
++}
++
++/* ---- step 4: the RMTFS buffer ---- */
++
++static volatile uint8_t *rmtfs_window;
++static bool rmtfs_shared;
++
++static bool
++step_buffer(void)
++{
++	volatile uint64_t *w;
++
++	rmtfs_window = (volatile uint8_t *)ml_io_map_unmappable(GN_RMTFS_PHYS, GN_RMTFS_SIZE, GN_WIMG_WCOMB);
++	if (rmtfs_window == NULL) {
++		FAIL("no mapping of the RMTFS buffer %#lx", GN_RMTFS_PHYS);
++		return false;
++	}
++	w = (volatile uint64_t *)(uintptr_t)rmtfs_window;
++	for (uint32_t i = 0; i < GN_RMTFS_SIZE / 8; i++) {
++		w[i] = 0x9e55a5a5u ^ i;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (uint32_t i = 0; i < GN_RMTFS_SIZE / 8; i++) {
++		if (w[i] != (0x9e55a5a5u ^ i)) {
++			FAIL("the RMTFS buffer %#lx does not hold a pattern (word %u)", GN_RMTFS_PHYS, i);
++			return false;
++		}
++		w[i] = 0;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	say("4 RMTFS buffer %#lx + %#x mapped, pattern ok, zeroed", GN_RMTFS_PHYS, GN_RMTFS_SIZE);
++	return true;
++}
++
++/* TrustZone/hypervisor: the buffer to HLOS + MSS_MSA (in) or back to HLOS (out). qcom_scm_assign_mem layout. */
++static bool
++rmtfs_assign(bool in)
++{
++	struct assign_page {
++		uint64_t address, size;                 /* +0 the memory */
++		uint64_t pad0[6];
++		uint32_t sources[2];                    /* +64 who has it */
++		uint32_t pad1[14];
++		struct {                                /* +128 who gets it */
++			uint32_t vmid, perm;
++			uint64_t ctx;
++			uint32_t ctx_size, unused;
++		} dest[2];
++		uint8_t pad2[64];
++		uint64_t more[4];                       /* +240 arguments 3..6 */
++	} *page;
++	_Static_assert(__builtin_offsetof(struct assign_page, sources) == 64, "sources at +64");
++	_Static_assert(__builtin_offsetof(struct assign_page, dest) == 128, "destinations at +128");
++	_Static_assert(__builtin_offsetof(struct assign_page, more) == 240, "extra arguments at +240");
++	vm_offset_t mem = 0;
++	uint64_t pa, answer = ~0ull;
++	int32_t rc;
++
++	if (rmtfs_shared == in) {
++		return true;
++	}
++	if (kmem_alloc(kernel_map, &mem, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	page = (struct assign_page *)mem;
++	page->address = GN_RMTFS_PHYS;
++	page->size = GN_RMTFS_SIZE;
++	if (in) {
++		page->sources[0] = VMID_HLOS;
++		page->dest[0].vmid = VMID_HLOS;
++		page->dest[0].perm = VM_PERM_RW;
++		page->dest[1].vmid = VMID_MSS_MSA;
++		page->dest[1].perm = VM_PERM_RW;
++	} else {
++		page->sources[0] = VMID_HLOS;
++		page->sources[1] = VMID_MSS_MSA;
++		page->dest[0].vmid = VMID_HLOS;
++		page->dest[0].perm = VM_PERM_RW;
++	}
++	pa = kvtophys(mem);
++	page->more[0] = in ? 4 : 8;                             /* size of the source list */
++	page->more[1] = pa + 128;                               /* the destination list */
++	page->more[2] = (in ? 2u : 1u) * sizeof(page->dest[0]); /* its size */
++	page->more[3] = 0;
++	clean_dcache(mem, PAGE_SIZE, FALSE);
++	rc = scm(in ? "assign the RMTFS buffer to HLOS+MSS" : "take the RMTFS buffer back", SCM_64 | SCM_SIP | SCM_MP_ASSIGN,
++	    SCM_ASSIGN_ARGS, pa, 16, pa + 64, pa + 240, &answer);
++	kmem_free(kernel_map, mem, PAGE_SIZE);
++	if (rc != 0 || answer != 0) {
++		return false;
++	}
++	rmtfs_shared = in;
++	return true;
++}
++
++/* ---- step 5: rails ---- */
++
++static int
++rail_vote(const char *res, unsigned lvl)
++{
++	int error = EBUSY;
++
++	for (int i = 0; i < 200 && error == EBUSY; i++) {
++		error = negroni_rpmh_arc_vote(res, lvl);
++		if (error == EBUSY) {
++			IOSleep(5);
++		}
++	}
++	return error;
++}
++
++static void
++rails_drop(const char *why)
++{
++	if (!rails_on) {
++		return;
++	}
++	rails_on = false;
++	int e = rail_vote("mss.lvl", 0);
++	say("mss.lvl vote dropped (%s)%s", why, e ? " FAILED" : "");
++}
++
++static bool
++step_rails(void)
++{
++	rails_on = true;
++	int e = rail_vote("mss.lvl", 384);
++	if (e != 0) {
++		FAIL("RPMh mss.lvl level 384 vote failed (errno %d)", e);
++		return false;
++	}
++	return true;
++}
++
++/* ---- step 6: AOP ---- */
++
++static bool
++qmp_wait(uint32_t off, uint32_t want, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms; i++) {
++		if (rd32(aoss, off) == want) {
++			return true;
++		}
++		IOSleep(1);
++	}
++	return rd32(aoss, off) == want;
++}
++
++/* One AOSS QMP message under the shared QMP lock (negroni_spmi.c). 0 or a reason. */
++static const char *
++qmp_send(const char *text)
++{
++	uint32_t words[QMP_MSG_LEN / 4] = { 0 }, box, boxsize;
++	const char *why = NULL;
++	size_t n = strlen(text);
++
++	if (n >= QMP_MSG_LEN) {
++		return "message too long";
++	}
++	negroni_qmp_lock();
++	if (rd32(aoss, QMP_MAGIC) != QMP_MAGIC_VALUE || rd32(aoss, QMP_VERSION) != 1) {
++		why = "AOSS QMP magic/version";
++		goto out;
++	}
++	box = rd32(aoss, QMP_MCORE_MBOX_OFFSET);
++	boxsize = rd32(aoss, QMP_MCORE_MBOX_SIZE);
++	if ((box & 3) || box < 0x3c || boxsize < QMP_MSG_LEN + 4 || (uint64_t)box + boxsize > AOSS_SIZE) {
++		why = "QMP mailbox does not fit";
++		goto out;
++	}
++	if (!(rd32(aoss, QMP_MCORE_LINK) == QMP_UP && rd32(aoss, QMP_MCORE_LINK_ACK) == QMP_UP &&
++	    rd32(aoss, QMP_MCORE_CH) == QMP_UP && rd32(aoss, QMP_UCORE_CH) == QMP_UP && rd32(aoss, QMP_MCORE_CH_ACK) == QMP_UP)) {
++		wr32(aoss, QMP_UCORE_LINK_ACK, rd32(aoss, QMP_UCORE_LINK));
++		wr32(aoss, QMP_MCORE_LINK, QMP_UP);
++		kick(IPCC_CLIENT_AOP, 0);
++		if (!qmp_wait(QMP_MCORE_LINK_ACK, QMP_UP, 1000)) {
++			why = "AOP does not ack our QMP link";
++			goto out;
++		}
++		wr32(aoss, QMP_MCORE_CH, QMP_UP);
++		kick(IPCC_CLIENT_AOP, 0);
++		if (!qmp_wait(QMP_UCORE_CH, QMP_UP, 1000)) {
++			why = "AOP does not open its QMP channel";
++			goto out;
++		}
++		wr32(aoss, QMP_UCORE_CH_ACK, QMP_UP);
++		kick(IPCC_CLIENT_AOP, 0);
++		if (!qmp_wait(QMP_MCORE_CH_ACK, QMP_UP, 1000)) {
++			why = "AOP does not ack our QMP channel";
++			goto out;
++		}
++	}
++	if (!qmp_wait(box, 0, 1000)) {
++		why = "QMP mailbox stays full";
++		goto out;
++	}
++	memcpy(words, text, n);
++	for (uint32_t i = 0; i < QMP_MSG_LEN / 4; i++) {
++		wr32(aoss, box + 4 + 4 * i, words[i]);
++	}
++	wr32(aoss, box, QMP_MSG_LEN);
++	kick(IPCC_CLIENT_AOP, 0);
++	if (!qmp_wait(box, 0, 1000)) {
++		wr32(aoss, box, 0);
++		why = "AOP does not take the QMP message";
++	}
++out:
++	negroni_qmp_unlock();
++	return why;
++}
++
++static bool
++step_aop(void)
++{
++	const char *why = qmp_send("{class: image, res: load_state, name: modem, val: on}");
++
++	if (why) {
++		FAIL("AOP QMP modem on: %s", why);
++		return false;
++	}
++	qmp_on = true;
++	return true;
++}
++
++/* ---- step 7: PAS init ---- */
++
++static bool
++step_pas_init(void)
++{
++	vm_offset_t page = 0;
++	uint64_t answer = ~0ull;
++	uint32_t ehdr = segs[0].filesz, hash = ~0u;
++
++	for (uint32_t i = 0; i < nseg; i++) {
++		if (MDT_TYPE(segs[i].flags) == MDT_TYPE_HASH) {
++			hash = i;
++			break;
++		}
++	}
++	if (segs[0].type == PT_LOAD || hash == ~0u || ehdr == 0 || ehdr > mdt_size || (uint64_t)ehdr + segs[hash].filesz > PAGE_SIZE) {
++		FAIL("no usable ELF-header/hash segments (hash segment %u)", hash);
++		return false;
++	}
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		FAIL("no memory");
++		return false;
++	}
++	memcpy((void *)page, mdt, ehdr);
++	if (ehdr + segs[hash].filesz == mdt_size) {
++		memcpy((void *)(page + ehdr), mdt + ehdr, segs[hash].filesz);
++	} else if ((uint64_t)segs[hash].offset + segs[hash].filesz <= mdt_size) {
++		memcpy((void *)(page + ehdr), mdt + segs[hash].offset, segs[hash].filesz);
++	} else {
++		char name[32];
++		uint32_t c = 0, s = 0;
++		snprintf(name, sizeof(name), "image/modem.b%02u", hash);
++		if (!fat_lookup(name, &c, &s) || s != segs[hash].filesz || fat_read(c, s, 0, (void *)(page + ehdr), s) != 0) {
++			kmem_free(kernel_map, page, PAGE_SIZE);
++			FAIL("hash segment %s not readable", name + 6);
++			return false;
++		}
++	}
++	clean_dcache((vm_offset_t)page, PAGE_SIZE, FALSE);
++	/* page stays allocated: TrustZone may read it until auth and reset */
++	if (scm("PAS init image (modem)", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_MPSS, kvtophys(page), 0, 0,
++	    &answer) != 0 || answer != 0) {
++		FAIL("TrustZone refuses the modem metadata (%#llx)", answer);
++		return false;
++	}
++	pas_inited = true;
++	if (relocatable) {
++		answer = ~0ull;
++		if (scm("PAS mem setup (modem)", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_MPSS, MPSS_MEM_PHYS,
++		    max_pa - min_pa, 0, &answer) != 0 || answer != 0) {
++			FAIL("TrustZone refuses the carveout (%#llx)", answer);
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * Linux qcom_pas_stop(): sm8450_mpss_resource has decrypt_shutdown, so a shutdown that TrustZone answers with an
++ * error is asked again every 100 ms, up to 50 times (qcom_pas_shutdown_poll_decrypt). true: the modem is down.
++ */
++static bool
++pas_shutdown(void)
++{
++	if (!pas_inited) {
++		return true;
++	}
++	for (int i = 0; i <= 50; i++) {
++		uint64_t answer = ~0ull;
++		if (i > 0) {
++			IOSleep(100);
++		}
++		int32_t rc = scm("PAS shutdown (modem)", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_MPSS, 0, 0, 0,
++		    &answer);
++		if (rc == 0 && answer == 0) {
++			pas_inited = false;
++			return true;
++		}
++		if (rc != 0) {
++			break;
++		}
++	}
++	return false;
++}
++
++/* ---- step 8: load (writes only inside 0x8bc00000 + 0x13200000) ---- */
++
++static bool
++step_load(void)
++{
++	vm_offset_t buf = 0;
++	volatile uint64_t *mem;
++	bool ok = false;
++	uint32_t bytes = 0;
++
++	if (kmem_alloc(kernel_map, &buf, CHUNK, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		FAIL("no memory");
++		return false;
++	}
++	mem = (volatile uint64_t *)ml_io_map_unmappable(MPSS_MEM_PHYS, MPSS_MEM_SIZE, GN_WIMG_WCOMB);
++	if (mem == NULL) {
++		FAIL("no mapping of the carveout %#lx + %#x", MPSS_MEM_PHYS, MPSS_MEM_SIZE);
++		kmem_free(kernel_map, buf, CHUNK);
++		return false;
++	}
++	for (uint32_t i = 0; i < MPSS_MEM_SIZE / 8; i++) {
++		mem[i] = 0;
++	}
++	for (uint32_t i = 0; i < nseg; i++) {
++		struct seg *s = &segs[i];
++		if (s->type != PT_LOAD || s->memsz == 0 || MDT_TYPE(s->flags) == MDT_TYPE_HASH || s->filesz == 0) {
++			continue;
++		}
++		uint64_t base = (relocatable ? 0 : (uint64_t)(min_pa - MPSS_MEM_PHYS)) + (s->paddr - min_pa);
++		uint32_t size = segfile[i].size;
++		SHA256_CTX ctx;
++		uint8_t want[32], got[32];
++
++		/* bounds again, here where the writes happen: never outside the carveout */
++		if ((base & 7) || base > MPSS_MEM_SIZE || size > MPSS_MEM_SIZE - base || size != s->filesz) {
++			FAIL("modem.b%02u not 8-byte aligned or outside the carveout (+%#llx, %u bytes)", i, base, size);
++			goto out;
++		}
++		SHA256_Init(&ctx);
++		for (uint32_t at = 0; at < size; at += CHUNK) {
++			uint32_t n = MIN(CHUNK, size - at);
++			if (fat_read(segfile[i].cluster, size, at, (void *)buf, n) != 0) {
++				FAIL("read error in modem.b%02u", i);
++				goto out;
++			}
++			SHA256_Update(&ctx, (const void *)buf, n);
++			uint32_t words = n / 8;
++			const uint64_t *src = (const uint64_t *)buf;
++			for (uint32_t w = 0; w < words; w++) {
++				mem[(base + at) / 8 + w] = src[w];
++			}
++			for (uint32_t t = words * 8; t < n; t++) {
++				((volatile uint8_t *)mem)[base + at + t] = ((const uint8_t *)buf)[t];
++			}
++		}
++		SHA256_Final(want, &ctx);
++		SHA256_Init(&ctx);
++		for (uint32_t at = 0; at < size; at += CHUNK) {
++			uint32_t n = MIN(CHUNK, size - at), words = n / 8;
++			uint64_t *dst = (uint64_t *)buf;
++			for (uint32_t w = 0; w < words; w++) {   /* 8-byte loads: 110 MB through the WC mapping */
++				dst[w] = mem[(base + at) / 8 + w];
++			}
++			for (uint32_t t = words * 8; t < n; t++) {
++				((uint8_t *)buf)[t] = ((volatile uint8_t *)mem)[base + at + t];
++			}
++			SHA256_Update(&ctx, (const void *)buf, n);
++		}
++		SHA256_Final(got, &ctx);
++		if (memcmp(want, got, 32) != 0) {
++			FAIL("modem.b%02u does not read back from the carveout (+%#llx)", i, base);
++			goto out;
++		}
++		bytes += size;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	say("8 %u KiB of segments written at %#lx and read back OK", bytes >> 10, MPSS_MEM_PHYS);
++	ok = true;
++out:
++	ml_io_unmap((vm_offset_t)mem, MPSS_MEM_SIZE);
++	kmem_free(kernel_map, buf, CHUNK);
++	return ok;
++}
++
++/* ---- step 9: our SMP2P item (and the SMEM allocator for step 11) ---- */
++
++static bool
++smem_alloc(uint32_t item, uint32_t bytes)
++{
++	uint32_t psize = 0, cacheline = 0, p = smem_partition(SMEM_APPS, SMEM_MPSS, &psize, &cacheline);
++	uint32_t size = (bytes + 7) & ~7u, owner = ~0u, at, have = 0;
++	bool made = false;
++
++	if (p == 0) {
++		FAIL("no SMEM partition 0/1 for item %u", item);
++		return false;
++	}
++	if (smem_item(item, &have) != 0) {
++		return true;
++	}
++	if (tcsr == 0) {
++		tcsr = ml_io_map(TCSR_MUTEX_PHYS, 0x1000);
++	}
++	if (tcsr == 0) {
++		FAIL("no TCSR mutex mapping");
++		return false;
++	}
++	for (uint32_t ms = 0; ms <= 1000; ms++) {
++		wr32(tcsr, 0, 1);               /* QCOM_MUTEX_APPS_PROC_ID */
++		owner = rd32(tcsr, 0);
++		if (owner == 1) {
++			break;
++		}
++		IOSleep(1);
++	}
++	if (owner != 1) {
++		FAIL("SMEM hwlock 3 held by %u (item %u)", owner, item);
++		return false;
++	}
++	uint32_t free_uncached = rd32(smem, p + 12), free_cached = rd32(smem, p + 16);
++	for (at = 32; at < free_uncached;) {
++		uint32_t w0 = rd32(smem, p + at), sz = rd32(smem, p + at + 4), pad = rd32(smem, p + at + 8);
++		if ((w0 & 0xffff) != SMEM_CANARY || (w0 >> 16) == item || sz > psize) {
++			break;
++		}
++		at += 16 + (pad >> 16) + sz;
++	}
++	if (at != free_uncached || free_uncached > free_cached || at + 16 + size > free_cached) {
++		FAIL("SMEM partition walk for item %u ends at +%#x, free uncached +%#x cached +%#x: nothing written", item, at,
++		    free_uncached, free_cached);
++		goto out;
++	}
++	wr32(smem, p + at, SMEM_CANARY | item << 16);
++	wr32(smem, p + at + 4, size);
++	wr32(smem, p + at + 8, size - bytes);
++	wr32(smem, p + at + 12, 0);
++	wr32(smem, p + 12, at + 16 + size);
++	made = true;
++out:
++	wr32(tcsr, 0, 0);
++	return made;
++}
++
++static void
++smp2p_entry(uint32_t i, const char *name, uint32_t value)
++{
++	char n[16];
++	uint32_t w[4];
++
++	bzero(n, sizeof(n));
++	strlcpy(n, name, sizeof(n));
++	memcpy(w, n, sizeof(w));
++	for (uint32_t k = 0; k < 4; k++) {
++		wr32(smem, our_item + 20 + 20 * i + 4 * k, w[k]);
++	}
++	wr32(smem, our_item + 36 + 20 * i, value);
++}
++
++static bool
++step_smp2p(void)
++{
++	uint32_t size = 0;
++
++	our_item = smem_item(ITEM_SMP2P_OURS, &size);
++	if (our_item == 0) {
++		if (!smem_alloc(ITEM_SMP2P_OURS, SMP2P_ITEM_SIZE)) {
++			return false;
++		}
++		our_item = smem_item(ITEM_SMP2P_OURS, &size);
++	}
++	if (our_item == 0 || size < SMP2P_ITEM_SIZE) {
++		FAIL("our item %u not found after allocation (%u bytes)", ITEM_SMP2P_OURS, size);
++		our_item = 0;
++		return false;
++	}
++	for (uint32_t at = 0; at < SMP2P_ITEM_SIZE; at += 4) {
++		wr32(smem, our_item + at, 0);
++	}
++	wr32(smem, our_item, SMP2P_MAGIC);
++	wr32(smem, our_item + 8, SMEM_APPS | SMEM_MPSS << 16);
++	/* only "master-kernel" (stop = bit 0); no "ipa" entry: the modem stays in low power mode without the IPA */
++	smp2p_entry(0, "master-kernel", 0);
++	wr32(smem, our_item + 12, SMP2P_ENTRIES | 1u << 16);
++	wr32(smem, our_item + 4, SMP2P_FEATURE_SSR_ACK << 8);
++	wr32(smem, our_item + 4, SMP2P_FEATURE_SSR_ACK << 8 | SMP2P_VERSION);
++	kick(IPCC_CLIENT_MPSS, IPCC_SIGNAL_SMP2P);
++	return true;
++}
++
++/* ---- step 10: start ---- */
++
++static bool
++step_start(void)
++{
++	uint64_t answer = ~0ull;
++	uint32_t size = 0, value = 0, last = ~0u, ms;
++	bool ready = false, fatal = false;
++
++	if (!rmtfs_assign(true)) {
++		FAIL("TrustZone does not assign the RMTFS buffer %#lx to HLOS + MSS_MSA", GN_RMTFS_PHYS);
++		return false;
++	}
++	if (scm("PAS auth and reset (modem)", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_MPSS, 0, 0, 0,
++	    &answer) != 0 || answer != 0) {
++		FAIL("TrustZone does not start the modem (%#llx)", answer);
++		return false;
++	}
++	modem_running = true;               /* from here the stop path asks it to stop first */
++	for (ms = 0; ms < GN_READY_S * 1000; ms++) {
++		if (their_item == 0) {
++			their_item = smem_item(ITEM_SMP2P_THEIRS, &size);
++		}
++		if (their_item && smp2p_value(their_item, "slave-kernel", &value) && value != last) {
++			say("10 +%u ms: slave-kernel = %#x%s%s%s", ms, value, value & DSP_FATAL ? " FATAL" : "",
++			    value & DSP_READY ? " READY" : "", value & DSP_HANDOVER ? " HANDOVER" : "");
++			last = value;
++			if (value & DSP_HANDOVER) {
++				rails_drop("handover");
++			}
++			if (value & DSP_FATAL) {
++				fatal = true;
++				break;
++			}
++			if (value & DSP_READY) {
++				ready = true;
++				break;
++			}
++		}
++		IOSleep(1);
++	}
++	if (!ready) {
++		char lw[96];
++		last_words(lw, sizeof(lw));
++		FAIL("%s after %u ms%s%s", fatal ? "the modem reports FATAL" : "no READY from the modem", ms, lw[0] ? ": " : "", lw);
++		return false;
++	}
++	say("10 THE MODEM IS UP after %u ms", ms);
++	for (uint32_t t = 0; t < 2000 && rails_on; t++) {
++		if (smp2p_value(their_item, "slave-kernel", &value) && (value & DSP_HANDOVER)) {
++			rails_drop("handover");
++			break;
++		}
++		IOSleep(1);
++	}
++	if (rails_on) {
++		say("10 no handover seen: the mss.lvl vote stays at 384");
++	}
++	return true;
++}
++
++/* ---- step 11: GLINK over SMEM, edge "mpss" (negroni_slpi.c step 9, one channel of ours) ---- */
++
++#define GLINK_FIFO_SIZE         0x4000u
++#define GLINK_RESERVE           16u
++#define GL_VERSION              0
++#define GL_VERSION_ACK          1
++#define GL_OPEN                 2
++#define GL_CLOSE                3
++#define GL_OPEN_ACK             4
++#define GL_INTENT               5
++#define GL_RX_DONE              6
++#define GL_RX_INTENT_REQ        7
++#define GL_RX_INTENT_REQ_ACK    8
++#define GL_TX_DATA              9
++#define GL_CLOSE_ACK            11
++#define GL_TX_DATA_CONT         12
++#define GL_READ_NOTIF           13
++#define GL_RX_DONE_W_REUSE      14
++#define GL_SIGNALS              15
++#define GL_FEATURE_INTENT_REUSE 1u
++#define GL_OURS                 16
++#define GL_THEIRS               32
++#define GL_INTENT_SIZE          4096u
++#define GL_INTENT_MAX           0x4400u         /* live DT IPCRTR intents: 5 x 0x800, 3 x 0x2000, 2 x 0x4400 */
++#define GL_SEND_MAX             0x3f00u         /* one message must fit our 0x4000-byte TX FIFO (minus header, reserve) */
++#define GL_MSG_MAX              (GL_INTENT_MAX + 16)
++#define GL_LOG_MAX              16
++#define GQ_MAX                  64              /* received QRTR packets waiting for the dispatcher */
++
++struct gl_intent {
++	uint32_t id, size;
++	bool used;
++};
++
++static struct {
++	uint16_t lcid, rcid;
++	bool open_sent, remote_open, open_acked;
++	int32_t req_result;
++	struct gl_intent ours[GL_OURS];
++	uint8_t *buf[GL_OURS];
++	uint32_t fill[GL_OURS];
++	uint32_t nours;
++	struct gl_intent theirs[GL_THEIRS];
++} gl_ch = { .lcid = 1 };
++static const char gl_name[] = "IPCRTR";
++static uint32_t gl_desc, gl_tx, gl_rx, gl_rx_len, gl_features = GL_FEATURE_INTENT_REUSE, gl_next_liid = 1;
++static bool gl_version_ok, gl_dead, gl_notified, gl_started;
++static uint8_t gl_msg[GL_MSG_MAX];
++static uint32_t gl_complaints, gl_dropped;
++static struct {
++	uint8_t *data;
++	uint32_t len;
++} gq[GQ_MAX];
++static uint32_t gq_head, gq_tail;
++#define gl_complain(fmt, ...) do { if (gl_complaints < GL_LOG_MAX) { gl_complaints++; say(fmt, ##__VA_ARGS__); } } while (0)
++
++static uint32_t
++gl_mod(uint32_t v, uint32_t len)
++{
++	return v >= len ? v - len : v;
++}
++
++static uint32_t
++gl_tx_avail(void)
++{
++	uint32_t tail = rd32(smem, gl_desc + 0), head = rd32(smem, gl_desc + 4), avail;
++
++	if (tail >= GLINK_FIFO_SIZE || head >= GLINK_FIFO_SIZE) {
++		gl_complain("GLINK: TX tail %#x / head %#x outside the FIFO: GLINK stopped", tail, head);
++		gl_dead = true;
++		return 0;
++	}
++	avail = tail <= head ? GLINK_FIFO_SIZE - head + tail : tail - head;
++	return avail < GLINK_RESERVE ? 0 : avail - GLINK_RESERVE;
++}
++
++static int
++gl_write(const void *msg, uint32_t len)
++{
++	const uint32_t *w = msg;
++	uint32_t head;
++
++	if (gl_dead || (len & 7) || len >= GLINK_FIFO_SIZE - GLINK_RESERVE) {
++		return EINVAL;
++	}
++	for (uint32_t ms = 0; gl_tx_avail() < len; ms++) {
++		if (gl_dead) {
++			return EIO;
++		}
++		if (ms == 500) {
++			gl_complain("GLINK: our TX FIFO stays full (tail %#x head %#x)", rd32(smem, gl_desc), rd32(smem, gl_desc + 4));
++			return ETIMEDOUT;
++		}
++		if (!gl_notified) {
++			gl_notified = true;
++			head = rd32(smem, gl_desc + 4);
++			uint32_t tl = rd32(smem, gl_desc + 0);
++			uint32_t raw = tl <= head ? GLINK_FIFO_SIZE - head + tl : tl - head;
++			if (raw > 8) {
++				wr32(smem, gl_tx + head, GL_READ_NOTIF);
++				wr32(smem, gl_tx + head + 4, 0);
++				wr32(smem, gl_desc + 4, gl_mod(head + 8, GLINK_FIFO_SIZE));
++				kick(IPCC_CLIENT_MPSS, IPCC_SIGNAL_GLINK);
++			}
++		}
++		IOSleep(1);
++	}
++	gl_notified = false;
++	head = rd32(smem, gl_desc + 4);
++	for (uint32_t i = 0; i < len / 4; i++) {
++		wr32(smem, gl_tx + head, w[i]);
++		head = gl_mod(head + 4, GLINK_FIFO_SIZE);
++	}
++	wr32(smem, gl_desc + 4, head);
++	kick(IPCC_CLIENT_MPSS, IPCC_SIGNAL_GLINK);
++	return 0;
++}
++
++static int
++gl_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint32_t m[2] = { cmd | (uint32_t)p1 << 16, p2 };
++	return gl_write(m, sizeof(m));
++}
++
++static uint32_t
++gl_rx_avail(void)
++{
++	uint32_t size = 0;
++
++	if (gl_rx == 0) {
++		gl_rx = smem_item(ITEM_GLINK_FIFO1, &size);
++		if (gl_rx == 0) {
++			return 0;
++		}
++		gl_rx_len = size & ~7u;
++		if (gl_rx_len < 64 || gl_rx_len > 0x100000) {
++			gl_complain("GLINK: the modem's FIFO size %#x is not usable: GLINK stopped", size);
++			gl_dead = true;
++			gl_rx = 0;
++			return 0;
++		}
++	}
++	uint32_t tail = rd32(smem, gl_desc + 8), head = rd32(smem, gl_desc + 12);
++	if (head >= gl_rx_len || tail >= gl_rx_len) {
++		gl_complain("GLINK: RX head %#x / tail %#x outside the FIFO (%#x): GLINK stopped", head, tail, gl_rx_len);
++		gl_dead = true;
++		return 0;
++	}
++	return head >= tail ? head - tail : gl_rx_len - tail + head;
++}
++
++static void
++gl_peek(uint32_t off, void *dst, uint32_t len)
++{
++	uint32_t *w = dst, at = gl_mod(rd32(smem, gl_desc + 8) + off, gl_rx_len);
++
++	for (uint32_t i = 0; i < (len + 3) / 4; i++) {
++		w[i] = rd32(smem, gl_rx + at);
++		at = gl_mod(at + 4, gl_rx_len);
++	}
++}
++
++static void
++gl_advance(uint32_t len)
++{
++	wr32(smem, gl_desc + 8, gl_mod(rd32(smem, gl_desc + 8) + ((len + 7) & ~7u), gl_rx_len));
++}
++
++static bool
++gl_up(void)
++{
++	return !gl_dead && gl_ch.remote_open && gl_ch.open_acked;
++}
++
++static int
++gl_send_open(void)
++{
++	uint32_t m[2 + 8] = { 0 }, n = (uint32_t)sizeof(gl_name);
++
++	m[0] = GL_OPEN | (uint32_t)gl_ch.lcid << 16;
++	m[1] = n;
++	memcpy(&m[2], gl_name, n);
++	gl_ch.open_sent = true;
++	return gl_write(m, (8 + n + 7) & ~7u);
++}
++
++static int
++gl_advertise(unsigned i)
++{
++	uint32_t m[4] = { GL_INTENT | (uint32_t)gl_ch.lcid << 16, 1, gl_ch.ours[i].size, gl_ch.ours[i].id };
++
++	return gl_write(m, sizeof(m));
++}
++
++static bool
++gl_add_intent(uint32_t size)
++{
++	vm_offset_t b = 0;
++	uint32_t bytes = MAX(size, GL_INTENT_SIZE);
++
++	if (gl_ch.nours >= GL_OURS || size > GL_INTENT_MAX ||
++	    kmem_alloc(kernel_map, &b, round_page(bytes), KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	unsigned i = gl_ch.nours++;
++	gl_ch.buf[i] = (uint8_t *)b;
++	gl_ch.ours[i] = (struct gl_intent){ gl_next_liid++, bytes, false };
++	gl_ch.fill[i] = 0;
++	return gl_advertise(i) == 0;
++}
++
++/* A whole message is queued (copied) for gl_drain(); the intent goes back at once. Never dispatched here. */
++static void
++gl_rx_data(uint32_t liid, const uint8_t *data, uint32_t chunk, uint32_t left)
++{
++	unsigned i;
++
++	for (i = 0; i < gl_ch.nours && gl_ch.ours[i].id != liid; i++) {
++	}
++	if (i == gl_ch.nours) {
++		gl_complain("GLINK: data for an intent %u we never gave", liid);
++		return;
++	}
++	if (gl_ch.fill[i] + chunk > gl_ch.ours[i].size) {
++		gl_complain("GLINK: %u + %u bytes do not fit intent %u: dropped", gl_ch.fill[i], chunk, liid);
++		gl_ch.fill[i] = 0;
++		return;
++	}
++	memcpy(gl_ch.buf[i] + gl_ch.fill[i], data, chunk);
++	gl_ch.fill[i] += chunk;
++	if (left) {
++		return;
++	}
++	uint32_t whole = gl_ch.fill[i];
++	gl_ch.fill[i] = 0;
++	if (whole > 0 && gq_tail - gq_head < GQ_MAX) {
++		uint8_t *copy = kalloc_data(whole, Z_WAITOK);
++		if (copy != NULL) {
++			memcpy(copy, gl_ch.buf[i], whole);
++			gq[gq_tail % GQ_MAX].data = copy;
++			gq[gq_tail % GQ_MAX].len = whole;
++			gq_tail++;
++		} else {
++			gl_dropped++;
++		}
++	} else if (whole > 0) {
++		gl_dropped++;
++		gl_complain("GLINK: receive queue full: a %u-byte message dropped", whole);
++	}
++	if (gl_features & GL_FEATURE_INTENT_REUSE) {
++		(void)gl_cmd(GL_RX_DONE_W_REUSE, gl_ch.lcid, liid);
++	} else {
++		(void)gl_cmd(GL_RX_DONE, gl_ch.lcid, liid);
++		gl_ch.ours[i].id = gl_next_liid++;
++		(void)gl_advertise(i);
++	}
++}
++
++static bool
++gl_is_ours(uint32_t rcid)
++{
++	return gl_ch.remote_open && gl_ch.rcid == rcid;
++}
++
++static void
++gl_poll(void)
++{
++	for (int n = 0; n < 256 && !gl_dead; n++) {
++		uint32_t avail = gl_rx_avail(), hdr[4], cmd, p1, p2, need = 8;
++
++		if (avail < 8) {
++			return;
++		}
++		gl_peek(0, hdr, 8);
++		cmd = hdr[0] & 0xffff;
++		p1 = hdr[0] >> 16;
++		p2 = hdr[1];
++		switch (cmd) {
++		case GL_VERSION:
++			if (p1 == 1) {
++				gl_features &= p2;
++			}
++			gl_advance(8);
++			if (p1 != 0) {
++				(void)gl_cmd(GL_VERSION_ACK, 1, gl_features);
++				gl_version_ok = true;
++			}
++			break;
++		case GL_VERSION_ACK:
++			gl_advance(8);
++			if (p1 == 0) {
++				gl_complain("GLINK: the modem refuses version 1: GLINK stopped");
++				gl_dead = true;
++			} else if (p1 == 1 && p2 != gl_features) {
++				gl_features &= p2;
++				(void)gl_cmd(GL_VERSION, 1, gl_features);
++			} else {
++				gl_version_ok = true;
++			}
++			break;
++		case GL_OPEN: {
++			char name[33];
++			uint32_t len = p2 & 0xffff, w[10];
++
++			need = 8 + len;
++			if (len > GL_INTENT_MAX || need > gl_rx_len - 8) {
++				gl_complain("GLINK: OPEN with a %u-byte name: GLINK stopped", len);
++				gl_dead = true;
++				return;
++			}
++			if (avail < need) {
++				return;
++			}
++			bzero(name, sizeof(name));
++			gl_peek(0, w, 8 + MIN(len, 32u));
++			memcpy(name, (uint8_t *)w + 8, MIN(len, 32u));
++			name[32] = 0;
++			gl_advance(need);
++			if (strcmp(name, gl_name) == 0) {
++				gl_ch.rcid = (uint16_t)p1;
++				gl_ch.remote_open = true;
++				(void)gl_cmd(GL_OPEN_ACK, gl_ch.rcid, 0);
++				if (!gl_ch.open_sent) {
++					(void)gl_send_open();
++				}
++			} else {
++				say("11 GLINK: the modem opens \"%s\" (rcid %u): not ours, left unanswered", name, p1);
++			}
++			break;
++		}
++		case GL_CLOSE:
++			gl_advance(8);
++			if (gl_is_ours(p1)) {
++				say("GLINK: the modem closes IPCRTR");
++				(void)gl_cmd(GL_CLOSE_ACK, (uint16_t)p1, 0);
++				gl_ch.remote_open = false;
++			}
++			break;
++		case GL_CLOSE_ACK:
++			gl_advance(8);
++			break;
++		case GL_OPEN_ACK:
++			gl_advance(8);
++			if (gl_ch.lcid == p1 && gl_ch.open_sent) {
++				gl_ch.open_acked = true;
++			}
++			break;
++		case GL_INTENT: {
++			uint32_t pair[2];
++
++			need = 8 + 8 * p2;
++			if (p2 > 64 || need > gl_rx_len - 8) {
++				gl_complain("GLINK: INTENT with %u entries: GLINK stopped", p2);
++				gl_dead = true;
++				return;
++			}
++			if (avail < need) {
++				return;
++			}
++			for (uint32_t i = 0; gl_is_ours(p1) && i < p2; i++) {
++				gl_peek(8 + 8 * i, pair, 8);
++				for (unsigned k = 0; k < GL_THEIRS; k++) {
++					if (gl_ch.theirs[k].size == 0) {
++						gl_ch.theirs[k] = (struct gl_intent){ pair[1], pair[0], false };
++						break;
++					}
++				}
++			}
++			gl_advance(need);
++			break;
++		}
++		case GL_RX_DONE:
++		case GL_RX_DONE_W_REUSE:
++			gl_advance(8);
++			for (unsigned k = 0; gl_is_ours(p1) && k < GL_THEIRS; k++) {
++				if (gl_ch.theirs[k].size && gl_ch.theirs[k].id == p2) {
++					if (cmd == GL_RX_DONE) {
++						gl_ch.theirs[k].size = 0;
++					}
++					gl_ch.theirs[k].used = false;
++				}
++			}
++			break;
++		case GL_RX_INTENT_REQ:
++			gl_advance(8);
++			if (gl_is_ours(p1)) {
++				bool granted = gl_add_intent(p2);
++				(void)gl_cmd(GL_RX_INTENT_REQ_ACK, gl_ch.lcid, granted);
++				if (!granted) {
++					gl_complain("GLINK: the modem asks for an intent of %u bytes: refused", p2);
++				}
++			}
++			break;
++		case GL_RX_INTENT_REQ_ACK:
++			gl_advance(8);
++			if (gl_is_ours(p1)) {
++				gl_ch.req_result = (int32_t)p2;
++			}
++			break;
++		case GL_TX_DATA:
++		case GL_TX_DATA_CONT: {
++			uint32_t chunk, left;
++
++			if (avail < 16) {
++				return;
++			}
++			gl_peek(0, hdr, 16);
++			chunk = hdr[2];
++			left = hdr[3];
++			need = 16 + chunk;
++			if (chunk > GL_INTENT_MAX || need > gl_rx_len - 8) {
++				gl_complain("GLINK: a %u-byte chunk is bigger than any intent of ours: GLINK stopped", chunk);
++				gl_dead = true;
++				return;
++			}
++			if (avail < need) {
++				return;
++			}
++			gl_peek(16, gl_msg, chunk);
++			gl_advance(need);
++			if (gl_is_ours(p1)) {
++				gl_rx_data(p2, gl_msg, chunk, left);
++			}
++			break;
++		}
++		case GL_READ_NOTIF:
++			gl_advance(8);
++			kick(IPCC_CLIENT_MPSS, IPCC_SIGNAL_GLINK);
++			break;
++		case GL_SIGNALS:
++			gl_advance(8);
++			break;
++		default:
++			gl_complain("GLINK: unknown command %u (%#x %#x): GLINK stopped", cmd, hdr[0], hdr[1]);
++			gl_dead = true;
++			return;
++		}
++	}
++}
++
++/* One message on IPCRTR: needs a remote intent (asks with RX_INTENT_REQ, waits up to 1 s). Never dispatches. */
++static int
++gl_send(const void *data, uint32_t len)
++{
++	struct gl_intent *best = NULL;
++	static uint32_t m[(16 + GL_SEND_MAX + 7) / 4];
++
++	if (len == 0 || len > GL_SEND_MAX) {
++		return EINVAL;
++	}
++	if (!gl_up()) {
++		return ENOTCONN;
++	}
++	for (int round = 0; round < 2 && best == NULL; round++) {
++		for (unsigned k = 0; k < GL_THEIRS; k++) {
++			struct gl_intent *t = &gl_ch.theirs[k];
++			if (t->size >= len && !t->used && (best == NULL || t->size < best->size)) {
++				best = t;
++			}
++		}
++		if (best == NULL && round == 0) {
++			gl_ch.req_result = -1;
++			if (gl_cmd(GL_RX_INTENT_REQ, gl_ch.lcid, len) != 0) {
++				return EIO;
++			}
++			for (uint32_t ms = 0; ms < 1000 && gl_ch.req_result < 0 && !gl_dead; ms++) {
++				gl_poll();              /* data only queued (gl_rx_data): no handler runs inside a send */
++				if (gl_ch.req_result < 0) {
++					IOSleep(1);
++				}
++			}
++			gl_poll();
++			if (gl_ch.req_result <= 0) {
++				gl_complain("GLINK: the modem gives no intent for %u bytes (answer %d)", len, gl_ch.req_result);
++				return EAGAIN;
++			}
++		}
++	}
++	if (best == NULL) {
++		return EAGAIN;
++	}
++	best->used = true;
++	m[0] = GL_TX_DATA | (uint32_t)gl_ch.lcid << 16;
++	m[1] = best->id;
++	m[2] = len;
++	m[3] = 0;
++	memcpy(&m[4], data, len);
++	bzero((uint8_t *)&m[4] + len, ((len + 7) & ~7u) - len);
++	if (gl_write(m, 16 + ((len + 7) & ~7u)) != 0) {
++		best->used = false;
++		return EIO;
++	}
++	return 0;
++}
++
++static bool
++step_glink(void)
++{
++	uint32_t size = 0, ms;
++
++	if (!smem_alloc(ITEM_GLINK_DESC, 32) || !smem_alloc(ITEM_GLINK_FIFO0, GLINK_FIFO_SIZE)) {
++		return false;
++	}
++	gl_desc = smem_item(ITEM_GLINK_DESC, &size);
++	if (gl_desc == 0 || size != 32) {
++		FAIL("GLINK descriptor item %u: %s (%u bytes)", ITEM_GLINK_DESC, gl_desc ? "wrong size" : "absent", size);
++		gl_desc = 0;
++		return false;
++	}
++	gl_tx = smem_item(ITEM_GLINK_FIFO0, &size);
++	if (gl_tx == 0 || size < GLINK_FIFO_SIZE) {
++		FAIL("GLINK TX FIFO item %u: %s (%u bytes)", ITEM_GLINK_FIFO0, gl_tx ? "too small" : "absent", size);
++		gl_tx = 0;
++		return false;
++	}
++	wr32(smem, gl_desc + 8, 0);             /* our RX tail */
++	wr32(smem, gl_desc + 4, 0);             /* our TX head */
++	gl_started = true;
++	if (gl_cmd(GL_VERSION, 1, gl_features) != 0) {
++		FAIL("GLINK: VERSION does not go out");
++		return false;
++	}
++	for (ms = 0; ms < 15000 && !gl_dead; ms++) {
++		gl_poll();
++		if (gl_version_ok && !gl_ch.open_sent) {
++			(void)gl_send_open();
++		}
++		if (gl_up()) {
++			break;
++		}
++		IOSleep(1);
++	}
++	if (gl_dead || !gl_up()) {
++		FAIL("GLINK: %s after %u ms (version %s, IPCRTR remote open %u ack %u, FIFO 480 %s)", gl_dead ? "stopped" : "not up", ms,
++		    gl_version_ok ? "ok" : "no answer", gl_ch.remote_open, gl_ch.open_acked, gl_rx ? "there" : "missing");
++		return false;
++	}
++	for (unsigned i = 0; gl_ch.nours + 6 < GL_OURS && i < 8; i++) {
++		if (!gl_add_intent(GL_INTENT_SIZE)) {
++			FAIL("GLINK: IPCRTR: intent %u not given", i);
++			return false;
++		}
++	}
++	gl_poll();
++	say("11 GLINK UP after %u ms: IPCRTR open (lcid %u rcid %u), %u intents", ms, gl_ch.lcid, gl_ch.rcid, gl_ch.nours);
++	return true;
++}
++
++/* ---- QRTR (version 1 out; 1 and 2 in), ports, and the name service's part (HakiOS hakios.mpss.c) ---- */
++
++#define QRTR_NODE_US            1u
++#define QRTR_PORT_CTRL          0xfffffffeu
++#define QRTR_NODE_BCAST         0xffffffffu
++#define QRTR_TYPE_DATA          1u
++#define QRTR_TYPE_HELLO         2u
++#define QRTR_TYPE_BYE           3u
++#define QRTR_TYPE_NEW_SERVER    4u
++#define QRTR_TYPE_DEL_SERVER    5u
++#define QRTR_TYPE_DEL_CLIENT    6u
++#define QRTR_TYPE_RESUME_TX     7u
++#define QRTR_TYPE_NEW_LOOKUP    10u
++#define QRTR_HDR                32u
++#define QRTR_MAX                (GL_SEND_MAX - QRTR_HDR)
++#define GP_MAX                  16
++#define SRV_MAX                 128
++
++#define SVC_DMS                 2u
++#define SVC_LOC                 16u
++#define SVC_RMTFS               14u
++#define SVC_SERVREG             64u
++#define SVC_TQFTP               4096u
++
++struct gn_port;
++typedef void (*gn_rx_t)(struct gn_port *p, uint32_t node, uint32_t port, const uint8_t *d, uint32_t n);
++struct gn_port {
++	uint32_t num;                           /* 0: free */
++	gn_rx_t rx;
++	void *ctx;
++};
++static struct gn_port gports[GP_MAX];
++static uint32_t gport_next = 0x4000;
++static struct {
++	uint32_t service, instance, node, port;
++	bool there;
++} servers[SRV_MAX];
++static uint32_t modem_node = ~0u, qrtr_hellos, qrtr_in, qrtr_out, qrtr_servers_seen;
++static struct {
++	uint32_t service, instance;
++	struct gn_port *port;
++} our_servers[3];
++
++static int
++qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *d, uint32_t n)
++{
++	static uint8_t pkt[QRTR_HDR + QRTR_MAX + 4];
++	uint32_t h[8] = { 1, type, QRTR_NODE_US, from_port, 0, n, to_node, to_port };
++	uint32_t padded = (n + 3) & ~3u;
++
++	if (n == 0 || n > QRTR_MAX) {
++		return EMSGSIZE;
++	}
++	memcpy(pkt, h, QRTR_HDR);
++	memcpy(pkt + QRTR_HDR, d, n);
++	bzero(pkt + QRTR_HDR + n, padded - n);
++	int error = gl_send(pkt, QRTR_HDR + padded);
++	qrtr_out += error == 0;
++	return error;
++}
++
++static void
++qrtr_ctrl(uint32_t cmd, uint32_t to_node, uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3)
++{
++	uint32_t c[5] = { cmd, w0, w1, w2, w3 };
++
++	(void)qrtr_out_packet(cmd, QRTR_PORT_CTRL, to_node, QRTR_PORT_CTRL, c, sizeof(c));
++}
++
++static struct gn_port *
++port_open(gn_rx_t rx, void *ctx)
++{
++	for (unsigned i = 0; i < GP_MAX; i++) {
++		if (gports[i].num == 0) {
++			gports[i].num = gport_next++;
++			gports[i].rx = rx;
++			gports[i].ctx = ctx;
++			return &gports[i];
++		}
++	}
++	return NULL;
++}
++
++static void
++port_close(struct gn_port *p)
++{
++	if (p == NULL || p->num == 0) {
++		return;
++	}
++	if (modem_node != ~0u && gl_up()) {
++		qrtr_ctrl(QRTR_TYPE_DEL_CLIENT, modem_node, QRTR_NODE_US, p->num, 0, 0);
++	}
++	p->num = 0;
++}
++
++static int
++qrtr_send(struct gn_port *p, uint32_t node, uint32_t port, const void *d, uint32_t n)
++{
++	if (p == NULL || p->num == 0) {
++		return EINVAL;
++	}
++	return qrtr_out_packet(QRTR_TYPE_DATA, p->num, node, port, d, n);
++}
++
++static void
++announce_ours(uint32_t node, uint32_t service_filter, uint32_t instance_filter)
++{
++	for (unsigned i = 0; i < sizeof(our_servers) / sizeof(our_servers[0]); i++) {
++		if (our_servers[i].port == NULL || (service_filter && our_servers[i].service != service_filter) ||
++		    (instance_filter && our_servers[i].instance != instance_filter)) {
++			continue;
++		}
++		qrtr_ctrl(QRTR_TYPE_NEW_SERVER, node, our_servers[i].service, our_servers[i].instance, QRTR_NODE_US,
++		    our_servers[i].port->num);
++	}
++}
++
++static const char *
++svc_name(uint32_t s)
++{
++	switch (s) {
++	case 2: return " (DMS)";
++	case 3: return " (NAS)";
++	case 14: return " (RMTFS)";
++	case 16: return " (LOC)";
++	case 43: return " (SSCTL)";
++	case 64: return " (servreg locator)";
++	case 66: return " (servreg notifier)";
++	case 4096: return " (TFTP)";
++	default: return "";
++	}
++}
++
++static void server_arrived(uint32_t service, uint32_t node, uint32_t port);
++static void server_gone(uint32_t service, uint32_t node, uint32_t port);
++static void tftp_peer_gone(uint32_t node, uint32_t port);
++
++static void
++qrtr_control(uint32_t from_node, const uint32_t *w)
++{
++	switch (w[0]) {
++	case QRTR_TYPE_HELLO:
++		if (qrtr_hellos++ < 4) {
++			qrtr_ctrl(QRTR_TYPE_HELLO, from_node, 0, 0, 0, 0);
++			announce_ours(from_node, 0, 0);
++			say("12 QRTR: HELLO from node %u: answered, our 3 servers announced", from_node);
++		}
++		break;
++	case QRTR_TYPE_NEW_SERVER: {
++		int slot = -1;
++		if (w[1] == 0 && w[2] == 0) {
++			break;                  /* the end of a lookup answer */
++		}
++		for (int i = 0; i < SRV_MAX; i++) {
++			if (servers[i].there && servers[i].node == w[3] && servers[i].port == w[4]) {
++				slot = i;
++				break;
++			}
++			if (!servers[i].there && slot < 0) {
++				slot = i;
++			}
++		}
++		if (slot >= 0) {
++			servers[slot].service = w[1];
++			servers[slot].instance = w[2];
++			servers[slot].node = w[3];
++			servers[slot].port = w[4];
++			servers[slot].there = true;
++		}
++		qrtr_servers_seen++;
++		if (w[1] == SVC_LOC || w[1] == SVC_DMS || qrtr_servers_seen <= 4) {
++			say("12 QRTR: service %u%s version %u instance %u at %u:%#x", w[1], svc_name(w[1]), w[2] & 0xff, w[2] >> 8, w[3], w[4]);
++		}
++		server_arrived(w[1], w[3], w[4]);
++		break;
++	}
++	case QRTR_TYPE_DEL_SERVER:
++		for (int i = 0; i < SRV_MAX; i++) {
++			if (servers[i].there && servers[i].node == w[3] && servers[i].port == w[4]) {
++				servers[i].there = false;
++				server_gone(servers[i].service, w[3], w[4]);
++			}
++		}
++		break;
++	case QRTR_TYPE_BYE:
++		say("QRTR: BYE from node %u", from_node);
++		for (int i = 0; i < SRV_MAX; i++) {
++			if (servers[i].there && servers[i].node == from_node) {
++				servers[i].there = false;
++				server_gone(servers[i].service, servers[i].node, servers[i].port);
++			}
++		}
++		break;
++	case QRTR_TYPE_DEL_CLIENT:
++		tftp_peer_gone(w[1], w[2]);
++		break;
++	case QRTR_TYPE_NEW_LOOKUP:
++		announce_ours(from_node, w[1], w[2]);
++		qrtr_ctrl(QRTR_TYPE_NEW_SERVER, from_node, 0, 0, 0, 0);
++		break;
++	default:
++		break;
++	}
++}
++
++/* One QRTR datagram from the modem (from gl_drain, never inside a send). */
++static void
++qrtr_rx(const uint8_t *d, uint32_t len)
++{
++	uint32_t type, from_node, from_port, size, to_port, confirm, at;
++
++	if (len >= QRTR_HDR && le32(d) == 1) {
++		type = le32(d + 4);
++		from_node = le32(d + 8);
++		from_port = le32(d + 12);
++		confirm = le32(d + 16);
++		size = le32(d + 20);
++		to_port = le32(d + 28);
++		at = QRTR_HDR;
++	} else if (len >= 16 && d[0] == 3) {
++		type = d[1];
++		confirm = d[2] & 1;
++		size = le32(d + 4);
++		from_node = le16(d + 8);
++		from_port = le16(d + 10);
++		to_port = le16(d + 14);
++		from_port = from_port == 0xfffe ? QRTR_PORT_CTRL : from_port;
++		to_port = to_port == 0xfffe ? QRTR_PORT_CTRL : to_port;
++		at = 16u + d[3];
++	} else {
++		return;
++	}
++	if (at > len || size > len - at) {
++		return;
++	}
++	qrtr_in++;
++	if (type != QRTR_TYPE_DATA && from_node != QRTR_NODE_US) {
++		modem_node = from_node;
++	}
++	if (type == QRTR_TYPE_RESUME_TX) {
++		return;
++	}
++	if (confirm) {
++		uint32_t c[5] = { QRTR_TYPE_RESUME_TX, QRTR_NODE_US, to_port, 0, 0 };
++		(void)qrtr_out_packet(QRTR_TYPE_RESUME_TX, to_port, from_node, from_port, c, sizeof(c));
++	}
++	if (to_port == QRTR_PORT_CTRL || type != QRTR_TYPE_DATA) {
++		uint32_t w[5] = { 0 };
++		memcpy(w, d + at, MIN(size, (uint32_t)sizeof(w)));
++		if (w[0] == 0) {
++			w[0] = type;
++		}
++		qrtr_control(from_node, w);
++		return;
++	}
++	for (unsigned i = 0; i < GP_MAX; i++) {
++		if (gports[i].num != 0 && gports[i].num == to_port) {
++			gports[i].rx(&gports[i], from_node, from_port, d + at, size);
++			return;
++		}
++	}
++}
++
++/* Everything queued by gl_rx_data, in order; handlers may send (their sends only queue new input). */
++static void
++gl_drain(void)
++{
++	for (uint32_t n = 0; gq_head != gq_tail && n < 2 * GQ_MAX; n++) {
++		uint8_t *p = gq[gq_head % GQ_MAX].data;
++		uint32_t len = gq[gq_head % GQ_MAX].len;
++		gq_head++;
++		qrtr_rx(p, len);
++		kfree_data(p, len);
++	}
++}
++
++/* ---- QMI helpers (header {u8 type; le16 txn; le16 msg; le16 len}, then TLVs {u8; le16; value}) ---- */
++
++#define QMI_REQUEST             0u
++#define QMI_RESPONSE            2u
++#define QMI_INDICATION          4u
++#define QMI_RESULT_FAILURE      1u
++#define QMI_ERR_INTERNAL        3u
++#define QMI_ERR_MALFORMED       1u
++#define QMI_MAX                 1024u
++
++struct qmi_out {
++	uint8_t b[QMI_MAX];
++	uint32_t len;
++};
++
++static void
++qmi_begin(struct qmi_out *q, uint8_t type, uint16_t txn, uint16_t msg)
++{
++	q->b[0] = type;
++	q->b[1] = (uint8_t)txn;
++	q->b[2] = (uint8_t)(txn >> 8);
++	q->b[3] = (uint8_t)msg;
++	q->b[4] = (uint8_t)(msg >> 8);
++	q->len = 7;
++}
++
++static void
++qmi_tlv(struct qmi_out *q, uint8_t t, const void *v, uint32_t n)
++{
++	if (q->len + 3 + n > QMI_MAX) {
++		return;
++	}
++	q->b[q->len] = t;
++	q->b[q->len + 1] = (uint8_t)n;
++	q->b[q->len + 2] = (uint8_t)(n >> 8);
++	memcpy(q->b + q->len + 3, v, n);
++	q->len += 3 + n;
++}
++
++static void
++qmi_u8(struct qmi_out *q, uint8_t t, uint8_t v)
++{
++	qmi_tlv(q, t, &v, 1);
++}
++
++static void
++qmi_u32(struct qmi_out *q, uint8_t t, uint32_t v)
++{
++	uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
++	qmi_tlv(q, t, b, 4);
++}
++
++static void
++qmi_u64(struct qmi_out *q, uint8_t t, uint64_t v)
++{
++	uint8_t b[8];
++	for (int i = 0; i < 8; i++) {
++		b[i] = (uint8_t)(v >> (8 * i));
++	}
++	qmi_tlv(q, t, b, 8);
++}
++
++/* the result TLV (0x02: u16 result, u16 error) as the first TLV of a response */
++static void
++qmi_result(struct qmi_out *q, uint16_t result, uint16_t error)
++{
++	uint8_t b[4] = { (uint8_t)result, (uint8_t)(result >> 8), (uint8_t)error, (uint8_t)(error >> 8) };
++	qmi_tlv(q, 0x02, b, 4);
++}
++
++static void
++qmi_end(struct qmi_out *q)
++{
++	q->b[5] = (uint8_t)(q->len - 7);
++	q->b[6] = (uint8_t)((q->len - 7) >> 8);
++}
++
++#define qmi_find gc_qmi_find
++
++/* A response's result: true for success; *err = the QMI error. */
++static bool
++qmi_ok(const uint8_t *m, uint32_t n, uint16_t *err)
++{
++	uint16_t s = 0;
++	const uint8_t *v = qmi_find(m, n, 0x02, &s);
++
++	*err = 0xffff;
++	if (v == NULL || s < 4) {
++		return false;
++	}
++	*err = le16(v + 2);
++	return le16(v) == 0;
++}
++
++/* ---- RMTFS server (QMI 14), read-only backing (HakiOS rmtfs_receive, linux-msm/rmtfs) ---- */
++
++#define RMTFS_SECTOR            512u
++#define RMTFS_OPEN              1
++#define RMTFS_CLOSE             2
++#define RMTFS_RW_IOVEC          3
++#define RMTFS_ALLOC_BUFF        4
++#define RMTFS_GET_DEV_ERROR     5
++static uint32_t rmtfs_requests, rmtfs_reads, rmtfs_writes, rmtfs_refused;
++
++static void
++rmtfs_rx(struct gn_port *p, uint32_t node, uint32_t port, const uint8_t *m, uint32_t n)
++{
++	struct qmi_out q;
++	const uint8_t *v;
++	uint16_t msg, size = 0, result = 0, error = 0;
++	unsigned file = 4;
++	uint8_t extra[8];
++	uint32_t extra_n = 0;
++
++	if (n < 7 || m[0] != QMI_REQUEST) {
++		return;
++	}
++	msg = le16(m + 3);
++	rmtfs_requests++;
++	switch (msg) {
++	case RMTFS_OPEN:
++		v = qmi_find(m, n, 0x01, &size);
++		for (unsigned f = 0; v != NULL && f < 4; f++) {
++			if (size == strlen(rmtfs_files[f].path) && memcmp(v, rmtfs_files[f].path, size) == 0) {
++				file = f;
++			}
++		}
++		if (file == 4 || rmtfs_files[file].data == NULL) {
++			say("RMTFS: the modem opens \"%.*s\": not served", v ? (int)MIN(size, 64) : 0, v ? (const char *)v : "");
++			result = QMI_RESULT_FAILURE;
++			error = QMI_ERR_INTERNAL;
++			rmtfs_refused++;
++			break;
++		}
++		rmtfs_files[file].open = true;
++		say("RMTFS: the modem opens %s (%s, %u KiB)", rmtfs_files[file].path, rmtfs_files[file].partition,
++		    rmtfs_files[file].size >> 10);
++		extra[0] = (uint8_t)(file + 1);
++		extra[1] = extra[2] = extra[3] = 0;
++		extra_n = 4;
++		break;
++	case RMTFS_CLOSE:
++		v = qmi_find(m, n, 0x01, &size);
++		file = v != NULL && size == 4 && le32(v) >= 1 && le32(v) <= 4 ? le32(v) - 1 : 4;
++		if (file < 4) {
++			rmtfs_files[file].open = false;
++		}
++		break;
++	case RMTFS_ALLOC_BUFF:
++		v = qmi_find(m, n, 0x02, &size);
++		if (v == NULL || size != 4 || le32(v) > GN_RMTFS_SIZE || rmtfs_window == NULL || !rmtfs_shared) {
++			say("RMTFS: the modem asks for a buffer of %u bytes: not given", v && size == 4 ? le32(v) : 0);
++			result = QMI_RESULT_FAILURE;
++			error = QMI_ERR_INTERNAL;
++			rmtfs_refused++;
++			break;
++		}
++		for (unsigned b = 0; b < 8; b++) {
++			extra[b] = (uint8_t)((uint64_t)GN_RMTFS_PHYS >> (8 * b));
++		}
++		extra_n = 8;
++		break;
++	case RMTFS_RW_IOVEC: {
++		uint16_t dsize = 0, esize = 0;
++		const uint8_t *dir = qmi_find(m, n, 0x02, &dsize), *ent = qmi_find(m, n, 0x03, &esize);
++		v = qmi_find(m, n, 0x01, &size);
++		file = v != NULL && size == 4 && le32(v) >= 1 && le32(v) <= 4 ? le32(v) - 1 : 4;
++		if (file == 4 || !rmtfs_files[file].open || dir == NULL || dsize != 1 || ent == NULL || esize < 1 ||
++		    esize != 1 + 12 * ent[0] || rmtfs_window == NULL) {
++			result = QMI_RESULT_FAILURE;
++			error = QMI_ERR_MALFORMED;
++			rmtfs_refused++;
++			break;
++		}
++		bool write = dir[0] != 0;
++		for (unsigned e = 0; e < ent[0] && result == 0; e++) {
++			uint64_t sector = le32(ent + 1 + 12 * e), phys = le32(ent + 5 + 12 * e), count = le32(ent + 9 + 12 * e);
++			uint64_t bytes = count * RMTFS_SECTOR;
++			if (phys < GN_RMTFS_PHYS || phys - GN_RMTFS_PHYS > GN_RMTFS_SIZE || bytes > GN_RMTFS_SIZE - (phys - GN_RMTFS_PHYS) ||
++			    sector * RMTFS_SECTOR > rmtfs_files[file].size || bytes > rmtfs_files[file].size - sector * RMTFS_SECTOR) {
++				say("RMTFS: %s %llu sectors at %llu of %s via %#llx: outside the file or the buffer", write ? "write" : "read",
++				    count, sector, rmtfs_files[file].partition, phys);
++				result = QMI_RESULT_FAILURE;
++				error = QMI_ERR_MALFORMED;
++				rmtfs_refused++;
++				break;
++			}
++			volatile uint8_t *win = rmtfs_window + (phys - GN_RMTFS_PHYS);
++			uint8_t *data = rmtfs_files[file].data + sector * RMTFS_SECTOR;
++			if (write) {
++				/* the modem's write: into our RAM copy only; the partition is never written */
++				for (uint64_t i = 0; i < bytes; i++) {
++					data[i] = win[i];
++				}
++			} else {
++				for (uint64_t i = 0; i < bytes; i++) {
++					win[i] = data[i];
++				}
++			}
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (result == 0) {
++			rmtfs_reads += !write;
++			rmtfs_writes += write;
++		}
++		break;
++	}
++	case RMTFS_GET_DEV_ERROR:
++		extra[0] = 0;
++		extra_n = 1;
++		break;
++	default:
++		result = QMI_RESULT_FAILURE;
++		error = QMI_ERR_MALFORMED;
++		break;
++	}
++	qmi_begin(&q, QMI_RESPONSE, le16(m + 1), msg);
++	qmi_result(&q, result, error);
++	if (extra_n && result == 0) {
++		qmi_tlv(&q, 0x10, extra, extra_n);
++	}
++	qmi_end(&q);
++	(void)qrtr_send(p, node, port, q.b, q.len);
++}
++
++/* ---- TFTP over QRTR (QMI-less service 4096; HakiOS tftp_*; tqftpserv) ---- */
++
++#define TFTP_RRQ                1
++#define TFTP_WRQ                2
++#define TFTP_DATA               3
++#define TFTP_ACK                4
++#define TFTP_ERROR              5
++#define TFTP_OACK               6
++#define TFTP_ENOENT             1
++#define TFTP_EBADOP             4
++#define TFTP_END_OF_TRANSFER    9
++#define TFTP_MAX_BLOCK          8000u
++#define TFTP_MAX_WINDOW         4u
++#define TFTP_FILE_MAX           (16u << 20)
++#define TFTP_WRITE_MAX          (1u << 20)
++#define TFTP_KEEP               8
++
++struct tftp_xfer {
++	struct gn_port *port;
++	uint32_t node, peer;
++	uint8_t *data;                          /* read: the file (owned unless borrowed); write: what came */
++	uint32_t size, cap;
++	uint32_t blksize, wsize, rsize, seek, expected;
++	uint32_t final_block;                   /* read: the short (last) block once sent; 0 before */
++	bool writing, borrowed;
++	char name[96];
++};
++static struct tftp_xfer tftp_x[4];
++static struct {
++	char name[96];
++	uint8_t *data;
++	uint32_t size;
++} tftp_kept[TFTP_KEEP];
++static uint32_t tftp_requests, tftp_served, tftp_refused;
++static struct gn_port *tftp_port;
++
++static void
++tftp_error(struct gn_port *from, uint32_t node, uint32_t port, uint16_t code, const char *text)
++{
++	uint8_t pkt[64];
++	size_t n = MIN(strlen(text) + 1, sizeof(pkt) - 4);
++
++	pkt[0] = 0;
++	pkt[1] = TFTP_ERROR;
++	pkt[2] = (uint8_t)(code >> 8);
++	pkt[3] = (uint8_t)code;
++	memcpy(pkt + 4, text, n);
++	pkt[4 + n - 1] = 0;
++	(void)qrtr_send(from, node, port, pkt, (uint32_t)(4 + n));
++}
++
++static void
++tftp_end(struct tftp_xfer *t)
++{
++	if (t->data != NULL && !t->borrowed) {
++		kfree_data(t->data, t->cap);
++	}
++	t->data = NULL;
++	if (t->port != NULL) {
++		port_close(t->port);
++		t->port = NULL;
++	}
++}
++
++static void
++tftp_peer_gone(uint32_t node, uint32_t port)
++{
++	for (unsigned i = 0; i < 4; i++) {
++		if (tftp_x[i].port != NULL && tftp_x[i].node == node && tftp_x[i].peer == port) {
++			tftp_end(&tftp_x[i]);
++		}
++	}
++}
++
++static void
++tftp_window(struct tftp_xfer *t, uint32_t from)
++{
++	static uint8_t pkt[4 + TFTP_MAX_BLOCK];
++
++	for (uint32_t w = 0; w < t->wsize; w++) {
++		uint32_t block = from + 1 + w;
++		uint64_t off = (uint64_t)t->seek + (uint64_t)(block - 1) * t->blksize;
++		uint32_t n = off >= t->size ? 0 : (uint32_t)MIN((uint64_t)t->blksize, t->size - off);
++
++		if (t->rsize != 0 && (uint64_t)(block - 1) * t->blksize >= t->rsize) {
++			break;
++		}
++		if (t->rsize != 0 && (uint64_t)block * t->blksize > t->rsize) {
++			n = MIN(n, (uint32_t)(t->rsize - (uint64_t)(block - 1) * t->blksize));
++		}
++		pkt[0] = 0;
++		pkt[1] = TFTP_DATA;
++		pkt[2] = (uint8_t)(block >> 8);
++		pkt[3] = (uint8_t)block;
++		if (n) {
++			memcpy(pkt + 4, t->data + off, n);
++		}
++		if (qrtr_send(t->port, t->node, t->peer, pkt, 4 + n) != 0) {
++			break;
++		}
++		if (n < t->blksize) {
++			t->final_block = block;         /* RFC 1350: a short block ends the file (0 bytes after a full one) */
++			break;
++		}
++	}
++}
++
++static void
++tftp_xfer_rx(struct gn_port *p, uint32_t node, uint32_t port, const uint8_t *m, uint32_t n)
++{
++	struct tftp_xfer *t = p->ctx;
++	uint16_t op, block;
++
++	if (t == NULL || t->port != p || node != t->node || port != t->peer || n < 4) {
++		return;
++	}
++	op = (uint16_t)(m[0] << 8 | m[1]);
++	block = (uint16_t)(m[2] << 8 | m[3]);
++	if (t->writing && op == TFTP_DATA) {
++		uint32_t len = n - 4;
++		uint8_t ack[4] = { 0, TFTP_ACK, (uint8_t)(block >> 8), (uint8_t)block };
++		if (block != t->expected || t->size + len > t->cap) {
++			tftp_error(t->port, node, port, TFTP_EBADOP, block != t->expected ? "block out of sequence" : "too much");
++			tftp_end(t);
++			return;
++		}
++		memcpy(t->data + t->size, m + 4, len);
++		t->size += len;
++		t->expected++;
++		if (block % t->wsize == 0 || len < t->blksize) {
++			(void)qrtr_send(t->port, node, port, ack, sizeof(ack));
++		}
++		if (len < t->blksize) {
++			/* the last block: kept in RAM under its name for this boot (never on a partition) */
++			unsigned f, free_slot = TFTP_KEEP;
++			for (f = 0; f < TFTP_KEEP; f++) {
++				if (tftp_kept[f].data != NULL && strcmp(tftp_kept[f].name, t->name) == 0) {
++					break;
++				}
++				if (tftp_kept[f].data == NULL && free_slot == TFTP_KEEP) {
++					free_slot = f;
++				}
++			}
++			f = f < TFTP_KEEP ? f : free_slot;
++			if (f < TFTP_KEEP) {
++				if (tftp_kept[f].data != NULL) {
++					kfree_data(tftp_kept[f].data, tftp_kept[f].size ? tftp_kept[f].size : 1);
++				}
++				tftp_kept[f].data = kalloc_data(t->size ? t->size : 1, Z_WAITOK);
++				if (tftp_kept[f].data != NULL) {
++					memcpy(tftp_kept[f].data, t->data, t->size);
++					tftp_kept[f].size = t->size;
++					strlcpy(tftp_kept[f].name, t->name, sizeof(tftp_kept[f].name));
++				}
++			}
++			tftp_served++;
++			tftp_end(t);
++		}
++		return;
++	}
++	if (op == TFTP_ERROR) {
++		tftp_end(t);
++		return;
++	}
++	if (op != TFTP_ACK) {
++		tftp_error(t->port, node, port, TFTP_EBADOP, "expected ACK");
++		tftp_end(t);
++		return;
++	}
++	if ((t->final_block != 0 && block >= t->final_block) || (t->rsize != 0 && (uint64_t)block * t->blksize >= t->rsize)) {
++		tftp_served++;
++		tftp_end(t);
++		return;
++	}
++	tftp_window(t, block);
++}
++
++static uint32_t
++tftp_num(const char *s)
++{
++	uint32_t v = 0;
++
++	for (int i = 0; s[i] >= '0' && s[i] <= '9' && i < 10; i++) {
++		v = v * 10 + (uint32_t)(s[i] - '0');
++	}
++	return v;
++}
++
++static void
++tftp_rx(__unused struct gn_port *p, uint32_t node, uint32_t port, const uint8_t *m, uint32_t n)
++{
++	const char *end = (const char *)m + n, *name, *s;
++	uint32_t blksize = 512, wsize = 1, rsize = 0, seek = 0;
++	bool tsize = false, options = false, writing;
++	struct tftp_xfer *t = NULL;
++	uint8_t oack[192];
++	uint32_t at;
++	char fat[160];
++
++	if (n < 4) {
++		return;
++	}
++	tftp_requests++;
++	uint16_t op = (uint16_t)(m[0] << 8 | m[1]);
++	writing = op == TFTP_WRQ;
++	if (op != TFTP_RRQ && !writing) {
++		tftp_error(tftp_port, node, port, TFTP_EBADOP, "not a read nor a write");
++		tftp_refused++;
++		return;
++	}
++	name = (const char *)m + 2;
++	for (s = name; s < end && *s; s++) {
++	}
++	if (s >= end) {
++		return;
++	}
++	for (s++; s < end && *s; s++) {        /* the mode */
++	}
++	if (s >= end) {
++		return;
++	}
++	s++;
++	while (s < end) {
++		const char *opt = s, *val;
++		for (; s < end && *s; s++) {
++		}
++		if (s >= end) {
++			break;
++		}
++		val = ++s;
++		for (; s < end && *s; s++) {
++		}
++		if (s >= end) {
++			break;
++		}
++		s++;
++		options = true;
++		if (strcmp(opt, "blksize") == 0) {
++			blksize = tftp_num(val);
++		} else if (strcmp(opt, "wsize") == 0) {
++			wsize = tftp_num(val);
++		} else if (strcmp(opt, "rsize") == 0) {
++			rsize = tftp_num(val);
++		} else if (strcmp(opt, "seek") == 0) {
++			seek = tftp_num(val);
++		} else if (strcmp(opt, "tsize") == 0) {
++			tsize = true;
++		}
++	}
++	blksize = MIN(MAX(blksize, 8u), TFTP_MAX_BLOCK);
++	wsize = MIN(MAX(wsize, 1u), TFTP_MAX_WINDOW);
++	for (unsigned i = 0; i < 4 && t == NULL; i++) {
++		if (tftp_x[i].port == NULL) {
++			t = &tftp_x[i];
++		}
++	}
++	if (t == NULL) {
++		tftp_error(tftp_port, node, port, TFTP_ENOENT, "busy");
++		tftp_refused++;
++		return;
++	}
++	bzero(t, sizeof(*t));
++	strlcpy(t->name, name, sizeof(t->name));
++	if (writing) {
++		t->data = kalloc_data(TFTP_WRITE_MAX, Z_WAITOK);
++		t->cap = TFTP_WRITE_MAX;
++		if (t->data == NULL) {
++			tftp_error(tftp_port, node, port, TFTP_ENOENT, "no memory");
++			return;
++		}
++	} else {
++		for (unsigned f = 0; f < TFTP_KEEP && t->data == NULL; f++) {
++			if (tftp_kept[f].data != NULL && strcmp(tftp_kept[f].name, name) == 0) {
++				t->data = tftp_kept[f].data;
++				t->size = tftp_kept[f].size;
++				t->borrowed = true;
++			}
++		}
++		if (t->data == NULL) {
++			uint32_t size = 0;
++			if (!gc_tftp_path(name, fat, sizeof(fat)) || (t->data = fat_slurp(fat, TFTP_FILE_MAX, &size)) == NULL) {
++				if (tftp_refused < 32) {
++					say("TFTP: the modem reads \"%s\": not here", name);
++				}
++				tftp_error(tftp_port, node, port, TFTP_ENOENT, "file not found");
++				tftp_refused++;
++				return;
++			}
++			t->size = size;
++			t->cap = MAX(size, 1u);
++		}
++	}
++	t->port = port_open(tftp_xfer_rx, t);
++	if (t->port == NULL) {
++		tftp_end(t);
++		tftp_error(tftp_port, node, port, TFTP_ENOENT, "no port");
++		return;
++	}
++	t->node = node;
++	t->peer = port;
++	t->writing = writing;
++	t->expected = 1;
++	t->blksize = blksize;
++	t->wsize = wsize;
++	t->rsize = rsize;
++	t->seek = seek;
++	if (tftp_requests <= 24) {
++		say("TFTP: the modem %s \"%s\" (%u bytes, block %u, window %u)", writing ? "writes (kept in RAM)" : "reads", name,
++		    t->size, blksize, wsize);
++	}
++	if (!options) {
++		if (writing) {
++			uint8_t ack[4] = { 0, TFTP_ACK, 0, 0 };
++			(void)qrtr_send(t->port, node, port, ack, sizeof(ack));
++		} else {
++			tftp_window(t, 0);
++		}
++		return;
++	}
++	oack[0] = 0;
++	oack[1] = TFTP_OACK;
++	at = 2;
++#define OPT(k, fmt, v) do { at += (uint32_t)snprintf((char *)oack + at, sizeof(oack) - at, "%s", k) + 1; \
++	                    at += (uint32_t)snprintf((char *)oack + at, sizeof(oack) - at, fmt, v) + 1; } while (0)
++	OPT("blksize", "%u", blksize);
++	OPT("timeoutms", "%u", 1000u);
++	if (tsize && !writing) {
++		OPT("tsize", "%u", t->size);
++	}
++	OPT("wsize", "%u", wsize);
++	if (rsize) {
++		OPT("rsize", "%u", rsize);
++	}
++	if (seek) {
++		OPT("seek", "%u", seek);
++	}
++#undef OPT
++	(void)qrtr_send(t->port, node, port, oack, MIN(at, (uint32_t)sizeof(oack)));
++}
++
++/* ---- the service registry locator (QMI 64; HakiOS servreg_*; pd-mapper) ---- */
++
++#define SERVREG_GET_DOMAIN_LIST 0x21
++#define SERVREG_PFR             0x24
++static struct {
++	char service[48], domain[48];
++	uint32_t instance;
++} sr_map[32];
++static uint32_t sr_maps, servreg_requests;
++
++static const char *
++jsn_value(const char *from, const char *end, const char *key, char *out, size_t outlen)
++{
++	char quoted[48];
++	const char *at;
++
++	snprintf(quoted, sizeof(quoted), "\"%s\"", key);
++	at = strnstr(from, quoted, (size_t)(end - from));
++	if (at == NULL) {
++		return NULL;
++	}
++	at += strlen(quoted);
++	while (at < end && (*at == ':' || *at == ' ' || *at == '\t' || *at == '\n' || *at == '\r')) {
++		at++;
++	}
++	if (at >= end) {
++		return NULL;
++	}
++	if (*at == '"') {
++		const char *close = at + 1;
++		while (close < end && *close != '"') {
++			close++;
++		}
++		if (close >= end) {
++			return NULL;
++		}
++		snprintf(out, outlen, "%.*s", (int)(close - at - 1), at + 1);
++		return close + 1;
++	}
++	const char *close = at;
++	while (close < end && ((*close >= '0' && *close <= '9') || *close == '-')) {
++		close++;
++	}
++	snprintf(out, outlen, "%.*s", (int)(close - at), at);
++	return close;
++}
++
++static void
++servreg_load(void)
++{
++	static const char *const files[] = { "image/modemr.jsn", "image/adspr.jsn", "image/adspua.jsn", "image/battmgr.jsn",
++		                             "image/cdspr.jsn", "image/slpir.jsn", "image/slpius.jsn" };
++
++	sr_maps = 0;
++	for (unsigned f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
++		char soc[24], dom[24], sub[24], inst[16], prov[24], svc[24];
++		uint32_t size = 0;
++		uint8_t *data = fat_slurp(files[f], 16384, &size);
++		if (data == NULL || size == 0) {
++			if (data) {
++				kfree_data(data, 1);
++			}
++			continue;
++		}
++		/* a NUL-terminated copy for strnstr */
++		char *text = kalloc_data(size + 1, Z_WAITOK);
++		if (text == NULL) {
++			kfree_data(data, size);
++			continue;
++		}
++		memcpy(text, data, size);
++		text[size] = 0;
++		kfree_data(data, size);
++		const char *end = text + size, *at = text;
++		if (jsn_value(text, end, "soc", soc, sizeof(soc)) && jsn_value(text, end, "domain", dom, sizeof(dom)) &&
++		    jsn_value(text, end, "subdomain", sub, sizeof(sub)) && jsn_value(text, end, "qmi_instance_id", inst, sizeof(inst))) {
++			while (sr_maps < sizeof(sr_map) / sizeof(sr_map[0]) && (at = jsn_value(at, end, "provider", prov, sizeof(prov))) != NULL &&
++			    jsn_value(at, end, "service", svc, sizeof(svc)) != NULL) {
++				snprintf(sr_map[sr_maps].service, sizeof(sr_map[0].service), "%s/%s", prov, svc);
++				snprintf(sr_map[sr_maps].domain, sizeof(sr_map[0].domain), "%s/%s/%s", soc, dom, sub);
++				sr_map[sr_maps].instance = tftp_num(inst);
++				sr_maps++;
++			}
++		}
++		kfree_data(text, size + 1);
++	}
++	say("2 service registry: %u services from the image/*.jsn files", sr_maps);
++}
++
++static void
++servreg_rx(struct gn_port *p, uint32_t node, uint32_t port, const uint8_t *m, uint32_t n)
++{
++	struct qmi_out q;
++	const uint8_t *v;
++	uint16_t msg, size = 0;
++	char want[64] = "";
++	uint32_t found = 0;
++
++	if (n < 7 || m[0] != QMI_REQUEST) {
++		return;
++	}
++	msg = le16(m + 3);
++	servreg_requests++;
++	qmi_begin(&q, QMI_RESPONSE, le16(m + 1), msg);
++	if (msg == SERVREG_GET_DOMAIN_LIST) {
++		uint8_t list[400];
++		uint32_t at = 1;
++		v = qmi_find(m, n, 0x01, &size);
++		if (v != NULL) {
++			snprintf(want, sizeof(want), "%.*s", (int)MIN(size, 63), (const char *)v);
++		}
++		for (uint32_t i = 0; i < sr_maps; i++) {
++			size_t dl = strlen(sr_map[i].domain);
++			if (strcmp(sr_map[i].service, want) != 0 || at + 1 + dl + 9 > sizeof(list)) {
++				continue;
++			}
++			list[at++] = (uint8_t)dl;
++			memcpy(list + at, sr_map[i].domain, dl);
++			at += (uint32_t)dl;
++			for (unsigned b = 0; b < 4; b++) {
++				list[at++] = (uint8_t)(sr_map[i].instance >> (8 * b));
++			}
++			list[at++] = 0;                 /* service data valid: no */
++			bzero(list + at, 4);
++			at += 4;
++			found++;
++		}
++		list[0] = (uint8_t)found;
++		qmi_result(&q, 0, 0);
++		uint16_t ndom = (uint16_t)found, rev = 1;
++		qmi_tlv(&q, 0x10, &ndom, 2);
++		qmi_tlv(&q, 0x11, &rev, 2);
++		if (found) {
++			qmi_tlv(&q, 0x12, list, at);
++		}
++		if (servreg_requests <= 16) {
++			say("servreg: the modem asks where \"%s\" is: %u domain(s)", want, found);
++		}
++	} else if (msg == SERVREG_PFR) {
++		v = qmi_find(m, n, 0x01, &size);
++		say("servreg: the modem reports a PD failure \"%.*s\"", v ? (int)MIN(size, 63) : 0, v ? (const char *)v : "");
++		qmi_result(&q, 0, 0);
++	} else {
++		qmi_result(&q, QMI_RESULT_FAILURE, QMI_ERR_MALFORMED);
++	}
++	qmi_end(&q);
++	(void)qrtr_send(p, node, port, q.b, q.len);
++}
++
++/* ---- QMI clients: DMS (logging + the low power fallback) and LOC ---- */
++
++#define DMS_GET_OPERATING_MODE  0x002D
++#define DMS_SET_OPERATING_MODE  0x002E
++#define DMS_MODE_LOW_POWER      1u
++#define LOC_REG_EVENTS          0x0021
++#define LOC_START               0x0022
++#define LOC_STOP                0x0023
++#define LOC_IND_POSITION        0x0024
++#define LOC_IND_ENGINE_STATE    0x002B
++#define LOC_IND_FIX_SESSION     0x002C
++#define LOC_IND_INJECT_TIME     0x0028
++#define LOC_INJECT_UTC_TIME     0x0038
++#define LOC_SET_ENGINE_LOCK     0x003A
++#define LOC_GET_ENGINE_LOCK     0x003B
++#define LOC_SET_OPERATION_MODE  0x004A
++#define LOC_GET_OPERATION_MODE  0x004B
++#define LOC_EV_POSITION         (1ull << 0)
++#define LOC_EV_INJECT_TIME      (1ull << 4)
++#define LOC_EV_ENGINE_STATE     (1ull << 7)
++#define LOC_EV_FIX_SESSION      (1ull << 8)
++#define LOC_OPMODE_STANDALONE   4u
++#define LOC_LOCK_NONE           1u
++#define LOC_SESSION_ID          1u
++#define LOC_STATUS_PHONE_OFFLINE 6u
++#define LOC_STATUS_ENGINE_LOCKED 7u              /* loc_api_v02 eQMI_LOC_SESS_STATUS_ENGINE_LOCKED (libqmi has 6, a typo) */
++
++struct qclient {
++	const char *name;
++	uint32_t service, node, port;
++	bool up;
++	struct gn_port *p;
++	uint16_t txn;
++	uint16_t wait_msg;                      /* response awaited: message id; 0 none */
++	bool got;
++	bool ok;
++	uint16_t err;
++	uint16_t ind_msg;                       /* indication awaited (LOC status indications) */
++	bool ind_got;
++	uint32_t ind_status;
++};
++static struct qclient dms = { .name = "DMS", .service = SVC_DMS }, loc = { .name = "LOC", .service = SVC_LOC };
++static uint32_t dms_mode = 0xff;
++static uint32_t loc_lock = 0, loc_pings_lost;
++static bool loc_ping_out, dms_lpm_asked;
++static uint64_t loc_last_rx_abs, session_start_abs;
++
++static int
++qc_send(struct qclient *c, struct qmi_out *q)
++{
++	qmi_end(q);
++	if (!c->up || c->p == NULL) {
++		return ENOTCONN;
++	}
++	return qrtr_send(c->p, c->node, c->port, q->b, q->len);
++}
++
++static void gn_position(const uint8_t *m, uint32_t n);
++static void loc_inject_time(void);
++
++static void
++dms_rx(__unused struct gn_port *p, __unused uint32_t node, __unused uint32_t port, const uint8_t *m, uint32_t n)
++{
++	uint16_t msg, size = 0, err = 0;
++	const uint8_t *v;
++
++	if (n < 7 || m[0] != QMI_RESPONSE) {
++		return;
++	}
++	msg = le16(m + 3);
++	bool ok = qmi_ok(m, n, &err);
++	if (msg == DMS_GET_OPERATING_MODE) {
++		v = qmi_find(m, n, 0x01, &size);
++		dms_mode = ok && v && size >= 1 ? v[0] : 0xff;
++		say("DMS: operating mode %u (0 online, 1 low power, 3 offline, 6 persistent low power, 0xff unknown)", dms_mode);
++	} else if (msg == DMS_SET_OPERATING_MODE) {
++		say("DMS: set low power mode: %s (error %u)", ok ? "OK" : "refused", err);
++	}
++}
++
++static void
++loc_rx(__unused struct gn_port *p, __unused uint32_t node, __unused uint32_t port, const uint8_t *m, uint32_t n)
++{
++	uint16_t msg, size = 0;
++	const uint8_t *v;
++
++	if (n < 7) {
++		return;
++	}
++	loc_last_rx_abs = mach_absolute_time();
++	msg = le16(m + 3);
++	if (m[0] == QMI_RESPONSE) {
++		if (msg == LOC_GET_OPERATION_MODE && loc_ping_out) {
++			loc_ping_out = false;
++			loc_pings_lost = 0;
++		}
++		if (loc.wait_msg == msg) {
++			loc.ok = qmi_ok(m, n, &loc.err);
++			loc.got = true;
++		}
++		return;
++	}
++	if (m[0] != QMI_INDICATION) {
++		return;
++	}
++	switch (msg) {
++	case LOC_IND_POSITION:
++		gn_position(m, n);
++		break;
++	case LOC_IND_ENGINE_STATE:
++		v = qmi_find(m, n, 0x01, &size);
++		if (v && size >= 4) {
++			lck_mtx_lock(&gn_lock);
++			gn_engine_known = true;
++			gn_engine_on = le32(v) == 1;
++			lck_mtx_unlock(&gn_lock);
++		}
++		break;
++	case LOC_IND_INJECT_TIME:
++		loc_inject_time();
++		break;
++	default:
++		if (loc.ind_msg == msg) {
++			v = qmi_find(m, n, 0x01, &size);
++			loc.ind_status = v && size >= 4 ? le32(v) : ~0u;
++			if (msg == LOC_GET_ENGINE_LOCK) {
++				v = qmi_find(m, n, 0x10, &size);
++				loc_lock = v && size >= 4 ? le32(v) : 0;
++			}
++			loc.ind_got = true;
++		}
++		break;
++	}
++}
++
++static void
++server_arrived(uint32_t service, uint32_t node, uint32_t port)
++{
++	struct qclient *c = service == SVC_LOC ? &loc : service == SVC_DMS ? &dms : NULL;
++
++	if (c == NULL || c->up) {
++		return;
++	}
++	c->node = node;
++	c->port = port;
++	c->p = port_open(c == &loc ? loc_rx : dms_rx, c);
++	c->up = c->p != NULL;
++	if (c == &dms && c->up) {
++		struct qmi_out q;
++		qmi_begin(&q, QMI_REQUEST, ++c->txn, DMS_GET_OPERATING_MODE);
++		(void)qc_send(c, &q);
++	}
++}
++
++static void
++server_gone(uint32_t service, uint32_t node, uint32_t port)
++{
++	struct qclient *c = service == SVC_LOC ? &loc : service == SVC_DMS ? &dms : NULL;
++
++	if (c && c->up && c->node == node && c->port == port) {
++		say("QRTR: the modem's %s service has gone", c->name);
++		c->up = false;
++		if (c->p) {
++			c->p->num = 0;
++			c->p = NULL;
++		}
++	}
++}
++
++/* The run loop pump: GLINK in, dispatch, the modem's SMP2P FATAL bit. false when the link or the modem is dead. */
++static bool gn_fatal;
++
++static bool
++pump(void)
++{
++	uint32_t value = 0;
++
++	gl_poll();
++	gl_drain();
++	if (their_item && smp2p_value(their_item, "slave-kernel", &value) && (value & DSP_FATAL)) {
++		gn_fatal = true;
++	}
++	return !gl_dead && !gn_fatal;
++}
++
++/* A LOC request and (optionally) its status indication, pumping up to ms. */
++static bool
++loc_call(struct qmi_out *q, uint16_t msg, bool want_ind, uint32_t ms)
++{
++	loc.wait_msg = msg;
++	loc.got = false;
++	loc.ok = false;
++	loc.ind_msg = want_ind ? msg : 0;
++	loc.ind_got = false;
++	if (qc_send(&loc, q) != 0) {
++		loc.wait_msg = 0;
++		return false;
++	}
++	for (uint32_t t = 0; t < ms && pump(); t += 2) {
++		if (loc.got && (!want_ind || !loc.ok || loc.ind_got)) {
++			break;
++		}
++		IOSleep(2);
++	}
++	loc.wait_msg = 0;
++	loc.ind_msg = 0;
++	return loc.got && loc.ok && (!want_ind || loc.ind_got);
++}
++
++static void
++loc_inject_time(void)
++{
++	struct timeval tv;
++	struct qmi_out q;
++
++	microtime(&tv);
++	if (tv.tv_sec < 1735689600) {           /* 2025-01-01: the clock is not set; no time is better than a wrong one */
++		return;
++	}
++	qmi_begin(&q, QMI_REQUEST, ++loc.txn, LOC_INJECT_UTC_TIME);
++	qmi_u64(&q, 0x01, (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000);
++	qmi_u32(&q, 0x02, 10000);               /* uncertainty 10 s: the AP clock, maybe without NTP */
++	(void)qc_send(&loc, &q);
++}
++
++/* ---- position reports: IEEE-754 without the FPU (the kernel is built -mkernel) ---- */
++
++static int64_t
++tlv_f32(const uint8_t *m, uint32_t n, uint8_t t, uint64_t scale)
++{
++	uint16_t s = 0;
++	const uint8_t *v = qmi_find(m, n, t, &s);
++
++	return v && s == 4 ? gc_flt_scaled(le32(v), scale) : GN_NO;
++}
++
++static void
++gn_position(const uint8_t *m, uint32_t n)
++{
++	uint16_t s1 = 0, s2 = 0, s3 = 0, s4 = 0;
++	const uint8_t *st = qmi_find(m, n, 0x01, &s1), *la = qmi_find(m, n, 0x10, &s2), *lo = qmi_find(m, n, 0x11, &s3);
++	const uint8_t *ts = qmi_find(m, n, 0x25, &s4), *sv;
++	uint32_t status = st && s1 >= 4 ? le32(st) : ~0u;
++	static uint32_t logged;
++	bool first;
++
++	lck_mtx_lock(&gn_lock);
++	gn_reports++;
++	lck_mtx_unlock(&gn_lock);
++	if (status == LOC_STATUS_PHONE_OFFLINE && !dms_lpm_asked && dms.up) {
++		/* the engine refuses while the modem is "offline": ask for low power mode once (never online) */
++		struct qmi_out q;
++		dms_lpm_asked = true;
++		qmi_begin(&q, QMI_REQUEST, ++dms.txn, DMS_SET_OPERATING_MODE);
++		qmi_u8(&q, 0x01, DMS_MODE_LOW_POWER);
++		(void)qc_send(&dms, &q);
++		say("LOC: session status PHONE_OFFLINE: asking DMS for low power mode");
++	}
++	if (status == LOC_STATUS_ENGINE_LOCKED && logged < 8) {
++		say("LOC: session status ENGINE_LOCKED (engine lock %u)", loc_lock);
++	}
++	if ((status != 0 && status != 1) || la == NULL || lo == NULL || s2 != 8 || s3 != 8) {
++		if (logged < 8 && status > 1) {
++			logged++;
++			say("LOC: position report without a fix: session status %u", status);
++		}
++		return;
++	}
++	struct gn_fix f;
++	bzero(&f, sizeof(f));
++	f.have = true;
++	f.final = status == 0;
++	f.lat_e7 = gc_dbl_scaled(le64(la), 10000000);
++	f.lon_e7 = gc_dbl_scaled(le64(lo), 10000000);
++	if (f.lat_e7 == GN_NO || f.lon_e7 == GN_NO || f.lat_e7 > 900000000 || f.lat_e7 < -900000000 || f.lon_e7 > 1800000000 ||
++	    f.lon_e7 < -1800000000) {
++		return;
++	}
++	f.utc_ms = ts && s4 == 8 ? le64(ts) : 0;
++	f.alt_cm = tlv_f32(m, n, 0x1B, 100);
++	f.ealt_cm = tlv_f32(m, n, 0x1A, 100);
++	if (f.alt_cm == GN_NO) {
++		f.alt_cm = f.ealt_cm;
++	}
++	f.hacc_cm = tlv_f32(m, n, 0x12, 100);
++	f.vacc_cm = tlv_f32(m, n, 0x1C, 100);
++	f.speed_cms = tlv_f32(m, n, 0x18, 100);
++	f.course_cdeg = tlv_f32(m, n, 0x20, 100);
++	sv = qmi_find(m, n, 0x2C, &s1);
++	f.sats = sv && s1 >= 1 ? sv[0] : 0;
++	f.at_abs = mach_absolute_time();
++	lck_mtx_lock(&gn_lock);
++	first = !gn_fix.have;
++	f.seq = gn_fix.seq + 1;
++	gn_fix = f;
++	lck_mtx_unlock(&gn_lock);
++	if (first || f.seq % 600 == 0) {
++		int64_t la_a = f.lat_e7 < 0 ? -f.lat_e7 : f.lat_e7, lo_a = f.lon_e7 < 0 ? -f.lon_e7 : f.lon_e7;
++		say("%s fix %llu: %s%lld.%07lld %s%lld.%07lld, hacc %lld m, %u satellites, %llu s after the session start",
++		    first ? "FIRST" : "LOC:", f.seq, f.lat_e7 < 0 ? "-" : "", la_a / 10000000, la_a % 10000000, f.lon_e7 < 0 ? "-" : "",
++		    lo_a / 10000000, lo_a % 10000000, f.hacc_cm == GN_NO ? -1 : f.hacc_cm / 100, f.sats,
++		    session_start_abs ? ms_since(session_start_abs) / 1000 : 0);
++	}
++}
++
++/* ---- step 12: QRTR, our three servers, and the wait for LOC ---- */
++
++static struct gn_port *rmtfs_port, *servreg_port;
++
++static bool
++step_qrtr(void)
++{
++	uint64_t t0 = mach_absolute_time();
++	uint32_t s;
++
++	rmtfs_port = port_open(rmtfs_rx, NULL);
++	tftp_port = port_open(tftp_rx, NULL);
++	servreg_port = port_open(servreg_rx, NULL);
++	if (rmtfs_port == NULL || tftp_port == NULL || servreg_port == NULL) {
++		FAIL("no QRTR ports");
++		return false;
++	}
++	our_servers[0].service = SVC_RMTFS;
++	our_servers[0].instance = 1;            /* version 1, instance 0 */
++	our_servers[0].port = rmtfs_port;
++	our_servers[1].service = SVC_TQFTP;
++	our_servers[1].instance = 1;
++	our_servers[1].port = tftp_port;
++	our_servers[2].service = SVC_SERVREG;
++	our_servers[2].instance = 257;          /* version 1, instance 1 (pd-mapper) */
++	our_servers[2].port = servreg_port;
++	qrtr_ctrl(QRTR_TYPE_HELLO, QRTR_NODE_BCAST, 0, 0, 0, 0);
++	for (s = 0; s < GN_LOC_WAIT_S * 100 && !loc.up; s++) {
++		if (!pump()) {
++			char lw[96];
++			last_words(lw, sizeof(lw));
++			FAIL("%s while waiting for LOC%s%s", gn_fatal ? "the modem crashed (FATAL)" : "GLINK stopped", lw[0] ? ": " : "", lw);
++			return false;
++		}
++		if (s > 0 && s % 3000 == 0) {
++			say("12 %u s: %u services, RMTFS %u requests (%u reads, %u writes), TFTP %u, servreg %u; no LOC yet", s / 100,
++			    qrtr_servers_seen, rmtfs_requests, rmtfs_reads, rmtfs_writes, tftp_requests, servreg_requests);
++		}
++		IOSleep(10);
++	}
++	if (!loc.up) {
++		FAIL("no LOC service (16) after %u s (%u services; RMTFS %u requests, %u refused; TFTP %u, %u refused; servreg %u)",
++		    GN_LOC_WAIT_S, qrtr_servers_seen, rmtfs_requests, rmtfs_refused, tftp_requests, tftp_refused, servreg_requests);
++		return false;
++	}
++	say("12 LOC service up after %llu ms (%u services; RMTFS %u reads %u writes; TFTP %u; servreg %u)", ms_since(t0),
++	    qrtr_servers_seen, rmtfs_reads, rmtfs_writes, tftp_requests, servreg_requests);
++	return true;
++}
++
++/* ---- step 13: LOC ---- */
++
++static bool
++step_loc(void)
++{
++	struct qmi_out q;
++
++	qmi_begin(&q, QMI_REQUEST, ++loc.txn, LOC_REG_EVENTS);
++	qmi_u64(&q, 0x01, LOC_EV_POSITION | LOC_EV_ENGINE_STATE | LOC_EV_FIX_SESSION | LOC_EV_INJECT_TIME);
++	if (!loc_call(&q, LOC_REG_EVENTS, false, 5000)) {
++		FAIL("LOC: register events: %s (error %u)", loc.got ? "refused" : "no answer in 5 s", loc.err);
++		return false;
++	}
++	qmi_begin(&q, QMI_REQUEST, ++loc.txn, LOC_GET_ENGINE_LOCK);
++	bool got_lock = loc_call(&q, LOC_GET_ENGINE_LOCK, true, 3000);
++	say("13 LOC: engine lock %s %u (1 none, 2 MI, 3 MT, 4 all)", got_lock ? "=" : "unknown", loc_lock);
++	if (got_lock && loc_lock != LOC_LOCK_NONE) {
++		qmi_begin(&q, QMI_REQUEST, ++loc.txn, LOC_SET_ENGINE_LOCK);
++		qmi_u32(&q, 0x01, LOC_LOCK_NONE);
++		say("13 LOC: set engine lock none: %s", loc_call(&q, LOC_SET_ENGINE_LOCK, true, 3000) ? "OK" : "failed");
++	}
++	qmi_begin(&q, QMI_REQUEST, ++loc.txn, LOC_SET_OPERATION_MODE);
++	qmi_u32(&q, 0x01, LOC_OPMODE_STANDALONE);
++	say("13 LOC: operation mode standalone: %s", loc_call(&q, LOC_SET_OPERATION_MODE, true, 3000) ? "OK" : "failed (kept default)");
++	return true;
++}
++
++/* ---- stop ---- */
++
++static void
++modem_down(void)
++{
++	uint32_t value = 0;
++
++	gl_dead = true;
++	if (modem_running && our_item) {
++		wr32(smem, our_item + 36, rd32(smem, our_item + 36) | 1u);     /* master-kernel: "stop" */
++		kick(IPCC_CLIENT_MPSS, IPCC_SIGNAL_SMP2P);
++		for (uint32_t ms = 0; ms < 5000; ms += 10) {
++			if (smp2p_value(their_item, "slave-kernel", &value) && (value & (DSP_STOP_ACK | DSP_FATAL))) {
++				break;
++			}
++			IOSleep(10);
++		}
++		say("stop: slave-kernel = %#x%s", value, value & DSP_STOP_ACK ? " (STOP-ACK)" : " (no STOP-ACK in 5 s)");
++		wr32(smem, our_item + 36, rd32(smem, our_item + 36) & ~1u);
++		kick(IPCC_CLIENT_MPSS, IPCC_SIGNAL_SMP2P);
++	}
++	modem_running = false;
++	if (!pas_shutdown()) {
++		/* the modem may still run: it keeps its RMTFS buffer (outside XNU's RAM; this boot does not use it again) */
++		say("stop: TrustZone refuses the PAS shutdown; the RMTFS buffer stays assigned to the modem");
++	} else if (rmtfs_shared && !rmtfs_assign(false)) {
++		say("stop: the RMTFS buffer stays assigned to the modem's VM (no longer used by this boot)");
++	}
++	if (qmp_on) {
++		const char *why = qmp_send("{class: image, res: load_state, name: modem, val: off}");
++		if (why) {
++			say("stop: AOP QMP modem off: %s", why);
++		}
++		qmp_on = false;
++	}
++	rails_drop("modem stopped");
++}
++
++/* ---- the run loop ---- */
++
++static void
++gn_run(void)
++{
++	uint64_t last_ping = mach_absolute_time(), last_status = mach_absolute_time();
++	bool session = false;
++
++	for (;;) {
++		if (!pump()) {
++			char lw[96];
++			last_words(lw, sizeof(lw));
++			if (gn_fatal) {
++				gn_set_off("the modem crashed (SMP2P FATAL)%s%s; modem stopped", lw[0] ? ": " : "", lw);
++			} else {
++				gn_set_off("GLINK to the modem stopped; modem stopped");
++			}
++			return;
++		}
++		if (!loc.up) {
++			gn_set_off("the modem's LOC service went away; modem stopped");
++			return;
++		}
++		lck_mtx_lock(&gn_lock);
++		uint64_t last_read = gn_last_read_abs;
++		lck_mtx_unlock(&gn_lock);
++		bool demand = last_read != 0 && ms_since(last_read) < GN_DEMAND_S * 1000ull;
++		if (demand && !session) {
++			struct qmi_out q;
++			qmi_begin(&q, QMI_REQUEST, ++loc.txn, LOC_START);
++			qmi_u8(&q, 0x01, LOC_SESSION_ID);
++			qmi_u32(&q, 0x10, 1);           /* periodic fixes */
++			qmi_u32(&q, 0x12, 1);           /* intermediate reports on */
++			qmi_u32(&q, 0x13, 1000);        /* 1 s */
++			if (loc_call(&q, LOC_START, false, 3000)) {
++				session = true;
++				session_start_abs = mach_absolute_time();
++				say("LOC: session started (a reader of /dev/negroni_gnss)");
++			} else {
++				say("LOC: start refused (error %u); next try in 5 s", loc.err);
++				IOSleep(5000);
++				continue;
++			}
++		} else if (!demand && session) {
++			struct qmi_out q;
++			qmi_begin(&q, QMI_REQUEST, ++loc.txn, LOC_STOP);
++			qmi_u8(&q, 0x01, LOC_SESSION_ID);
++			(void)loc_call(&q, LOC_STOP, false, 3000);
++			session = false;
++			say("LOC: session stopped (no reader for %u s)", GN_DEMAND_S);
++		}
++		lck_mtx_lock(&gn_lock);
++		gn_session_on = session;
++		lck_mtx_unlock(&gn_lock);
++		/* liveness: a cheap LOC request every GN_PING_S s; GN_PING_LOST lost answers in a row = off */
++		if (ms_since(last_ping) >= GN_PING_S * 1000ull) {
++			if (loc_ping_out) {
++				loc_pings_lost++;
++				if (loc_pings_lost >= GN_PING_LOST) {
++					gn_set_off("the modem stopped answering LOC (%u requests lost); modem stopped", loc_pings_lost);
++					return;
++				}
++			}
++			struct qmi_out q;
++			qmi_begin(&q, QMI_REQUEST, ++loc.txn, LOC_GET_OPERATION_MODE);
++			loc_ping_out = qc_send(&loc, &q) == 0;
++			last_ping = mach_absolute_time();
++		}
++		if (session && ms_since(last_status) >= 300000) {
++			lck_mtx_lock(&gn_lock);
++			uint32_t reports = gn_reports;
++			uint64_t age = gn_fix.have ? ms_since(gn_fix.at_abs) : 0;
++			bool have = gn_fix.have;
++			lck_mtx_unlock(&gn_lock);
++			say("session: %u reports, %s%llu ms; RMTFS %u writes (RAM), TFTP %u", reports, have ? "last fix age " : "no fix, ",
++			    have ? age : ms_since(session_start_abs), rmtfs_writes, tftp_requests);
++			last_status = mach_absolute_time();
++		}
++		IOSleep(session ? 50 : 200);
++	}
++}
++
++/* ---- thread ---- */
++
++static bool (*const steps[STEPS + 1])(void) = {
++	step_wait, step_survey, step_firmware, step_filesystems, step_buffer, step_rails, step_aop, step_pas_init, step_load,
++	step_smp2p, step_start, step_glink, step_qrtr, step_loc,
++};
++
++static void
++gn_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	IOSleep(GN_SETTLE_S * 1000);
++	for (step = 0; step <= STEPS; step++) {
++		uint64_t t0 = mach_absolute_time();
++
++		fail_why[0] = 0;
++		if (!steps[step]()) {
++			modem_down();
++			gn_set_off("step %u (%s): %s", step, step_names[step], fail_why[0] ? fail_why : "no reason logged");
++			(void)thread_terminate(current_thread());
++			return;
++		}
++		say("step %u (%s) ok in %llu ms", step, step_names[step], ms_since(t0));
++	}
++	lck_mtx_lock(&gn_lock);
++	gn_state = GN_ON;
++	strlcpy(gn_reason, "ok", sizeof(gn_reason));
++	lck_mtx_unlock(&gn_lock);
++	say("on: modem up (PAS 4), LOC service at %u:%#x, /dev/negroni_gnss; a session runs while it is read", loc.node, loc.port);
++	gn_run();
++	modem_down();
++	(void)thread_terminate(current_thread());
++}
++
++/* ---- /dev/negroni_gnss and kern.negroni_gnss ---- */
++
++static void
++fmt_cm(char *b, size_t n, int64_t v)
++{
++	if (v == GN_NO) {
++		snprintf(b, n, "-");
++		return;
++	}
++	int64_t a = v < 0 ? -v : v;
++	snprintf(b, n, "%s%lld.%02lld", v < 0 ? "-" : "", a / 100, a % 100);
++}
++
++static int
++gn_text(char *buf, size_t len)
++{
++	static const char *const names[] = { "starting", "on", "off" };
++	char alt[24], ealt[24], hacc[24], vacc[24], spd[24], crs[24];
++	int n;
++
++	lck_mtx_lock(&gn_lock);
++	n = snprintf(buf, len, "state=%s session=%d engine=%s reports=%u reason=%s\n", names[gn_state], gn_session_on ? 1 : 0,
++	    !gn_engine_known ? "unknown" : gn_engine_on ? "on" : "off", gn_reports, gn_reason);
++	if (gn_fix.have && n > 0 && (size_t)n < len) {
++		struct gn_fix f = gn_fix;
++		int64_t la = f.lat_e7 < 0 ? -f.lat_e7 : f.lat_e7, lo = f.lon_e7 < 0 ? -f.lon_e7 : f.lon_e7;
++		fmt_cm(alt, sizeof(alt), f.alt_cm);
++		fmt_cm(ealt, sizeof(ealt), f.ealt_cm);
++		fmt_cm(hacc, sizeof(hacc), f.hacc_cm);
++		fmt_cm(vacc, sizeof(vacc), f.vacc_cm);
++		fmt_cm(spd, sizeof(spd), f.speed_cms);
++		fmt_cm(crs, sizeof(crs), f.course_cdeg);
++		n += snprintf(buf + n, len - (size_t)n, "fix=%llu final=%d utc_ms=%llu lat=%s%lld.%07lld lon=%s%lld.%07lld alt_m=%s "
++		    "ealt_m=%s hacc_m=%s vacc_m=%s speed_mps=%s course_deg=%s sats=%u age_ms=%llu\n", f.seq, f.final ? 1 : 0, f.utc_ms,
++		    f.lat_e7 < 0 ? "-" : "", la / 10000000, la % 10000000, f.lon_e7 < 0 ? "-" : "", lo / 10000000, lo % 10000000, alt, ealt,
++		    hacc, vacc, spd, crs, f.sats, ms_since(f.at_abs));
++		/*
++		 * The negroni-locd text form (docs/location-plan.md 6.4): "LAT LON HACC ALT VACC SPEED COURSE", only while the
++		 * fix is fresh (< GN_FRESH_MS); -1 = unknown (VACC -1 = no altitude). The reader takes it once per new fix= seq.
++		 */
++		if (ms_since(f.at_abs) < GN_FRESH_MS && n > 0 && (size_t)n < len) {
++			bool altok = f.alt_cm != GN_NO && f.vacc_cm != GN_NO && f.vacc_cm > 0;
++			if (f.hacc_cm == GN_NO || f.hacc_cm <= 0) {
++				snprintf(hacc, sizeof(hacc), f.hacc_cm == GN_NO ? "100.00" : "0.01");
++			}
++			if (!altok) {
++				snprintf(alt, sizeof(alt), "0");
++				snprintf(vacc, sizeof(vacc), "-1");
++			}
++			if (f.speed_cms == GN_NO || f.speed_cms < 0) {
++				snprintf(spd, sizeof(spd), "-1");
++			}
++			if (f.course_cdeg == GN_NO || f.course_cdeg < 0 || f.course_cdeg > 36000) {
++				snprintf(crs, sizeof(crs), "-1");
++			}
++			n += snprintf(buf + n, len - (size_t)n, "locd=%s%lld.%07lld %s%lld.%07lld %s %s %s %s %s\n", f.lat_e7 < 0 ? "-" : "",
++			    la / 10000000, la % 10000000, f.lon_e7 < 0 ? "-" : "", lo / 10000000, lo % 10000000, hacc, alt, vacc, spd, crs);
++		}
++	}
++	lck_mtx_unlock(&gn_lock);
++	return n < 0 ? 0 : (int)MIN((size_t)n, len - 1);
++}
++
++static int
++gn_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++gn_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++gn_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	char text[1024];
++	int len = gn_text(text, sizeof(text));
++	off_t off = uio_offset(uio);
++
++	lck_mtx_lock(&gn_lock);
++	gn_last_read_abs = mach_absolute_time();        /* demand: a session runs while somebody reads */
++	lck_mtx_unlock(&gn_lock);
++	if (off < 0 || off >= len) {
++		return 0;
++	}
++	return uiomove(text + off, (int)MIN((user_ssize_t)(len - off), uio_resid(uio)), uio);
++}
++
++static const struct cdevsw gn_cdevsw = {
++	.d_open = gn_open,
++	.d_close = gn_close,
++	.d_read = gn_read,
++	.d_write = eno_rdwrt,
++	.d_ioctl = eno_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type = 0,
++};
++
++static bool gn_enabled;
++
++static int
++gn_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char text[1024];
++	int len;
++
++	if (!gn_enabled) {
++		len = snprintf(text, sizeof(text), "state=off session=0 engine=unknown reports=0 reason=negronignss=0\n");
++	} else {
++		len = gn_text(text, sizeof(text));
++	}
++	return SYSCTL_OUT(req, text, (size_t)len + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, negroni_gnss, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, gn_sysctl, "A",
++    "NEGRONI GNSS state and last fix (patch 0397)");
++
++void
++negroni_gnss_init(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++	int major;
++
++	(void)PE_parse_boot_argn("negronignss", &on, sizeof(on));
++	if (on == 0) {
++		printf("NEGRONI GNSS: off: negronignss=0\n");
++		return;
++	}
++	gn_enabled = true;
++	major = cdevsw_add(-1, &gn_cdevsw);
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0440, "negroni_gnss") == NULL) {
++		gn_set_off("/dev/negroni_gnss cannot be made");
++		return;
++	}
++	if (kernel_thread_start(gn_thread, NULL, &thread) != KERN_SUCCESS) {
++		gn_set_off("no kernel thread");
++		return;
++	}
++	thread_deallocate(thread);
++	printf("NEGRONI GNSS: starting in %u s (modem PAS %u, carveout %#lx + %#x, RMTFS buffer %#lx; negronignss=0 turns it off)\n",
++	    GN_SETTLE_S, PAS_MPSS, MPSS_MEM_PHYS, MPSS_MEM_SIZE, GN_RMTFS_PHYS);
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_gnss_core.h b/bsd/dev/negroni_gnss_core.h
+new file mode 100644
+index 0000000..8f6971e
+--- /dev/null
++++ b/bsd/dev/negroni_gnss_core.h
+@@ -0,0 +1,409 @@
++/*
++ * SPDX-License-Identifier: APSL-2.0
++ *
++ * NEGRONI GNSS (patch 0397): the pure parts of bsd/dev/negroni_gnss.c, shared by the kernel and the host
++ * test patches/xnu/tests/gnss-core-test.c (which runs them on a copy of the modem_a FAT image and on
++ * known numbers). No includes: the includer gives uint8_t..uint64_t, bool, size_t, memcpy, strlen.
++ *
++ *   - a read-only FAT16 reader (long VFAT names, case-insensitive) over a read callback
++ *   - IEEE-754 double/float to a scaled integer without the FPU (the kernel is built -mkernel)
++ *   - the QMI TLV lookup (bounded by the message length)
++ *   - the TFTP path map of the modem's read requests to the firmware volume
++ */
++#ifndef NEGRONI_GNSS_CORE_H
++#define NEGRONI_GNSS_CORE_H
++
++#define GC_NO                   (-0x7fffffffffffffffLL - 1)     /* INT64_MIN: a value that is not there */
++
++static inline uint16_t
++gc_le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++static inline uint32_t
++gc_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static inline uint64_t
++gc_le64(const uint8_t *p)
++{
++	return (uint64_t)gc_le32(p) | (uint64_t)gc_le32(p + 4) << 32;
++}
++
++/* ---- FAT16 ---- */
++
++typedef int (*gc_read_t)(void *ctx, uint64_t at, void *dst, uint32_t n);
++
++struct gc_fat {
++	gc_read_t read;
++	void *ctx;
++	uint64_t size;                          /* partition bytes */
++	uint32_t bps, cl_bytes, nclusters, root_bytes, fat_bytes;
++	uint64_t fat_off, root_off, data_off;
++	const uint16_t *fat;                    /* FAT #1 (fat_bytes), set by the caller after gc_fat_parse */
++	uint8_t *dir;                           /* scratch for one directory, dir_max bytes */
++	uint32_t dir_max;
++	uint32_t max_read;                      /* largest single read (the caller's bounce size) */
++};
++
++/* The boot sector. 0 = a FAT16 volume inside v->size; else a reason code 1..5. */
++static inline int
++gc_fat_parse(struct gc_fat *v, const uint8_t *bs)
++{
++	uint32_t bps = gc_le16(bs + 11), spc = bs[13], res = gc_le16(bs + 14), nf = bs[16], rootents = gc_le16(bs + 17);
++	uint32_t tot = gc_le16(bs + 19) ? gc_le16(bs + 19) : gc_le32(bs + 32), fatsz = gc_le16(bs + 22);
++
++	if (bs[510] != 0x55 || bs[511] != 0xaa || (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096) || spc == 0 ||
++	    (spc & (spc - 1)) || bps * spc > (64u << 10) || nf < 1 || nf > 2 || rootents == 0 || fatsz == 0 || res == 0) {
++		return 1;
++	}
++	v->bps = bps;
++	v->cl_bytes = bps * spc;
++	v->fat_off = (uint64_t)res * bps;
++	v->root_off = v->fat_off + (uint64_t)nf * fatsz * bps;
++	v->root_bytes = rootents * 32;
++	v->data_off = v->root_off + (uint64_t)((v->root_bytes + bps - 1) / bps) * bps;
++	if ((uint64_t)tot * bps > v->size || v->data_off >= (uint64_t)tot * bps) {
++		return 2;
++	}
++	v->nclusters = (uint32_t)(((uint64_t)tot * bps - v->data_off) / v->cl_bytes);
++	v->fat_bytes = fatsz * bps;
++	if (v->nclusters < 4085 || v->nclusters >= 65525) {
++		return 3;                       /* FAT12 or FAT32 */
++	}
++	if (v->fat_bytes < 2 * (v->nclusters + 2) || v->fat_bytes > (256u << 10)) {
++		return 4;
++	}
++	if (v->root_bytes > v->dir_max) {
++		return 5;
++	}
++	return 0;
++}
++
++/* Next cluster of a chain; 0 at the end or on a bad link. */
++static inline uint32_t
++gc_fat_next(const struct gc_fat *v, uint32_t c)
++{
++	if (c < 2 || c >= v->nclusters + 2) {
++		return 0;
++	}
++	uint32_t n = v->fat[c];
++	return n >= 2 && n < v->nclusters + 2 ? n : 0;
++}
++
++static inline uint64_t
++gc_fat_cluster_off(const struct gc_fat *v, uint32_t c)
++{
++	return v->data_off + (uint64_t)(c - 2) * v->cl_bytes;
++}
++
++/* A directory (cluster 0 = the root) into v->dir; its length (0 on an error). */
++static inline uint32_t
++gc_fat_dir_load(struct gc_fat *v, uint32_t cluster)
++{
++	if (cluster == 0) {
++		return v->read(v->ctx, v->root_off, v->dir, v->root_bytes) == 0 ? v->root_bytes : 0;
++	}
++	uint32_t len = 0;
++	for (uint32_t c = cluster, n = 0; c != 0 && len + v->cl_bytes <= v->dir_max && n < 4096; c = gc_fat_next(v, c), n++) {
++		if (v->read(v->ctx, gc_fat_cluster_off(v, c), v->dir + len, v->cl_bytes) != 0) {
++			return 0;
++		}
++		len += v->cl_bytes;
++	}
++	return len;
++}
++
++/* name (n bytes, not terminated) equal to the terminated b, ASCII case-insensitive */
++static inline bool
++gc_name_eq(const char *a, size_t n, const char *b)
++{
++	for (size_t i = 0; i < n; i++) {
++		char x = a[i], y = b[i];
++		if (y == 0) {
++			return false;
++		}
++		if (x >= 'A' && x <= 'Z') {
++			x = (char)(x - 'A' + 'a');
++		}
++		if (y >= 'A' && y <= 'Z') {
++			y = (char)(y - 'A' + 'a');
++		}
++		if (x != y) {
++			return false;
++		}
++	}
++	return b[n] == 0;
++}
++
++/* `name` (n bytes) in the directory in v->dir (len bytes): long (VFAT) or 8.3 names. */
++static inline bool
++gc_fat_dir_find(const struct gc_fat *v, uint32_t len, const char *name, size_t n, uint32_t *cluster, uint32_t *size,
++    bool *isdir)
++{
++	static const uint8_t pos[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
++	char lfn[261];
++	bool have_lfn = false;
++
++	memset(lfn, 0, sizeof(lfn));
++	for (uint32_t at = 0; at + 32 <= len; at += 32) {
++		const uint8_t *e = v->dir + at;
++		if (e[0] == 0) {
++			break;
++		}
++		if (e[0] == 0xe5) {
++			have_lfn = false;
++			continue;
++		}
++		if (e[11] == 0x0f) {
++			uint32_t seq = e[0] & 0x1f;
++			if (seq == 0 || seq > 20) {
++				have_lfn = false;
++				continue;
++			}
++			if (e[0] & 0x40) {
++				memset(lfn, 0, sizeof(lfn));
++				have_lfn = true;
++			}
++			for (uint32_t k = 0; k < 13; k++) {
++				uint16_t ch = gc_le16(e + pos[k]);
++				uint32_t i = (seq - 1) * 13 + k;
++				if (i >= sizeof(lfn) - 1) {
++					break;
++				}
++				lfn[i] = ch == 0 || ch == 0xffff ? 0 : (ch < 0x80 ? (char)ch : '?');
++			}
++			continue;
++		}
++		if (e[11] & 0x08) {                     /* volume label */
++			have_lfn = false;
++			continue;
++		}
++		char sfn[13];
++		uint32_t k = 0;
++		for (uint32_t i = 0; i < 8 && e[i] != ' '; i++) {
++			sfn[k++] = (char)e[i];
++		}
++		if (e[8] != ' ') {
++			sfn[k++] = '.';
++			for (uint32_t i = 8; i < 11 && e[i] != ' '; i++) {
++				sfn[k++] = (char)e[i];
++			}
++		}
++		sfn[k] = 0;
++		bool hit = (have_lfn && gc_name_eq(name, n, lfn)) || gc_name_eq(name, n, sfn);
++		have_lfn = false;
++		if (hit) {
++			*cluster = gc_le16(e + 26);
++			*size = gc_le32(e + 28);
++			*isdir = (e[11] & 0x10) != 0;
++			return true;
++		}
++	}
++	return false;
++}
++
++/* A file below the volume root ("image/modem.mdt"): first cluster and size. No "..", at most 16 levels. */
++static inline bool
++gc_fat_lookup(struct gc_fat *v, const char *path, uint32_t *cluster, uint32_t *size)
++{
++	uint32_t dir = 0;
++	const char *p = path;
++
++	while (*p == '/') {
++		p++;
++	}
++	for (int depth = 0; *p && depth < 16; depth++) {
++		const char *end = p;
++		uint32_t c = 0, s = 0, len;
++		bool isdir = false;
++
++		while (*end && *end != '/') {
++			end++;
++		}
++		if ((end - p == 2 && p[0] == '.' && p[1] == '.') || end - p > 255) {
++			return false;
++		}
++		len = gc_fat_dir_load(v, dir);
++		if (len == 0 || !gc_fat_dir_find(v, len, p, (size_t)(end - p), &c, &s, &isdir)) {
++			return false;
++		}
++		while (*end == '/') {
++			end++;
++		}
++		if (*end == 0) {
++			if (isdir) {
++				return false;
++			}
++			*cluster = c;
++			*size = s;
++			return true;
++		}
++		if (!isdir || c < 2) {
++			return false;
++		}
++		dir = c;
++		p = end;
++	}
++	return false;
++}
++
++/* n bytes at off of the file (first cluster, size) into dst: each run of adjacent clusters in one read. 0 or 5 (EIO)/22. */
++static inline int
++gc_fat_read(const struct gc_fat *v, uint32_t cluster, uint32_t size, uint64_t off, void *dst, uint32_t n)
++{
++	uint8_t *to = (uint8_t *)dst;
++	uint32_t c = cluster;
++
++	if (off > size || n > size - off) {
++		return 22;
++	}
++	if (n == 0) {
++		return 0;
++	}
++	for (uint64_t skip = off / v->cl_bytes; skip > 0; skip--) {
++		c = gc_fat_next(v, c);
++		if (c == 0) {
++			return 5;
++		}
++	}
++	uint32_t in = (uint32_t)(off % v->cl_bytes);
++	while (n > 0) {
++		uint32_t run = 1, last = c;
++		if (c < 2 || c >= v->nclusters + 2) {
++			return 5;
++		}
++		while ((uint64_t)run * v->cl_bytes - in < n && (uint64_t)(run + 1) * v->cl_bytes <= v->max_read &&
++		    gc_fat_next(v, last) == last + 1) {
++			last++;
++			run++;
++		}
++		uint32_t take = (uint32_t)((uint64_t)run * v->cl_bytes - in < n ? (uint64_t)run * v->cl_bytes - in : n);
++		int error = v->read(v->ctx, gc_fat_cluster_off(v, c) + in, to, take);
++		if (error) {
++			return error;
++		}
++		to += take;
++		n -= take;
++		in = 0;
++		if (n > 0) {
++			c = gc_fat_next(v, last);
++			if (c == 0) {
++				return 5;
++			}
++		}
++	}
++	return 0;
++}
++
++/* ---- IEEE-754 without the FPU ---- */
++
++/* round(value * scale) of an IEEE-754 double given as its bits; GC_NO for NaN/Inf/overflow. */
++static inline int64_t
++gc_dbl_scaled(uint64_t bits, uint64_t scale)
++{
++	uint32_t exp = (uint32_t)(bits >> 52) & 0x7ff;
++	uint64_t man = bits & ((1ull << 52) - 1);
++	unsigned __int128 v;
++
++	if (exp == 0x7ff) {
++		return GC_NO;
++	}
++	if (exp == 0) {
++		return 0;                               /* zero and subnormals */
++	}
++	man |= 1ull << 52;
++	v = (unsigned __int128)man * scale;
++	int e = (int)exp - 1075;                        /* value = man * 2^e */
++	if (e >= 0) {
++		if (e > 20) {
++			return GC_NO;
++		}
++		v <<= e;
++	} else if (-e >= 120) {
++		v = 0;
++	} else {
++		v += (unsigned __int128)1 << (-e - 1);  /* round half away from zero */
++		v >>= -e;
++	}
++	if (v > (unsigned __int128)0x7fffffffffffffffull) {
++		return GC_NO;
++	}
++	return (bits >> 63) ? -(int64_t)v : (int64_t)v;
++}
++
++/* the same for an IEEE-754 float */
++static inline int64_t
++gc_flt_scaled(uint32_t bits, uint64_t scale)
++{
++	uint32_t exp = (bits >> 23) & 0xff;
++
++	if (exp == 0xff) {
++		return GC_NO;
++	}
++	if (exp == 0) {
++		return 0;
++	}
++	return gc_dbl_scaled((uint64_t)(bits >> 31) << 63 | (uint64_t)(exp - 127 + 1023) << 52 | (uint64_t)(bits & 0x7fffff) << 29,
++	           scale);
++}
++
++/* ---- QMI ---- */
++
++/* TLV `t` of a QMI message (7-byte header, then TLVs), bounded by the header's length and n; NULL if absent. */
++static inline const uint8_t *
++gc_qmi_find(const uint8_t *m, uint32_t n, uint8_t t, uint16_t *size)
++{
++	if (n < 7) {
++		return NULL;
++	}
++	uint32_t end = 7u + gc_le16(m + 5);
++	end = end < n ? end : n;
++	for (uint32_t at = 7; at + 3 <= end;) {
++		uint16_t len = gc_le16(m + at + 1);
++		if (at + 3 + len > end) {
++			return NULL;
++		}
++		if (m[at] == t) {
++			*size = len;
++			return m + at + 3;
++		}
++		at += 3u + len;
++	}
++	return NULL;
++}
++
++/* ---- TFTP ---- */
++
++/* The modem's read path to a path on the firmware volume ("image/..."); false if not served (or ".."). */
++static inline bool
++gc_tftp_path(const char *path, char *out, size_t outlen)
++{
++	static const char *const prefixes[] = { "/readonly/firmware/image/", "/readonly/vendor/firmware_mnt/image/",
++		                                "/readonly/vendor/firmware/", "/readonly/firmware/" };
++
++	for (unsigned i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
++		size_t n = strlen(prefixes[i]), rest;
++		if (strncmp(path, prefixes[i], n) != 0) {
++			continue;
++		}
++		rest = strlen(path + n);
++		for (size_t k = 0; k + 1 < rest; k++) {
++			if (path[n + k] == '.' && path[n + k + 1] == '.') {
++				return false;
++			}
++		}
++		if (rest == 0 || 6 + rest + 1 > outlen) {
++			return false;
++		}
++		memcpy(out, "image/", 6);
++		memcpy(out + 6, path + n, rest + 1);
++		return true;
++	}
++	return false;
++}
++
++#endif /* NEGRONI_GNSS_CORE_H */
+diff --git a/bsd/dev/negroni_rpmh.c b/bsd/dev/negroni_rpmh.c
+index 25c410d..2843148 100644
+--- a/bsd/dev/negroni_rpmh.c
++++ b/bsd/dev/negroni_rpmh.c
+@@ -564,7 +564,9 @@ rh_lookup_arc(const char *res, unsigned level, uint32_t *address, unsigned *hlvl
+ int
+ negroni_rpmh_arc_vote(const char *res, unsigned level)
+ {
+-	if (!res || (strcmp(res, "lcx.lvl") && strcmp(res, "lmx.lvl") && strcmp(res, "mmcx.lvl") && strcmp(res, "mxc.lvl")) ||
++	/* 0397 (negroni_gnss.c): also mss.lvl, the modem's own rail (its proxy vote while it boots); never cx.lvl */
++	if (!res || (strcmp(res, "lcx.lvl") && strcmp(res, "lmx.lvl") && strcmp(res, "mmcx.lvl") && strcmp(res, "mxc.lvl") &&
++	    strcmp(res, "mss.lvl")) ||
+ 	    level > 416 || (strcmp(res, "mmcx.lvl") == 0 && level > 256) || (strcmp(res, "mxc.lvl") == 0 && level > 256)) {
+ 		return EINVAL;
+ 	}
+diff --git a/bsd/dev/negroni_slpi.c b/bsd/dev/negroni_slpi.c
+index 4b9c9f7..2f8e15c 100644
+--- a/bsd/dev/negroni_slpi.c
++++ b/bsd/dev/negroni_slpi.c
+@@ -199,6 +199,15 @@ static struct seg segs[MAX_SEGMENTS];
+ static bool relocatable, rails_on, slpi_running, pas_inited;
+ static uint32_t our_item;
+ static char fail_why[192];
++static int slpi_phase;                          /* 0397: 0 not asked, 1 the start steps run, 2 they are over */
++
++/* 0397 (negroni_gnss.c): the GNSS thread waits for this thread's start steps (QMP mailbox, TCSR mutex 3) */
++int negroni_slpi_phase(void);
++int
++negroni_slpi_phase(void)
++{
++	return __atomic_load_n(&slpi_phase, __ATOMIC_ACQUIRE);
++}
+ static const char *const step_names[STEPS + 1] = {
+ 	"wait for the ADSP", "SMEM survey", "firmware", "rails", "AOP QMP", "PAS init", "load", "SMP2P", "start",
+ 	"GLINK", "QRTR",
+@@ -1983,6 +1992,7 @@ slpi_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 	printf("NEGRONI SLPI: done (level %u, asked 0..%u, %s at %u)%s\n", level, last_step, failed ? "stopped" : "complete",
+ 	    MIN(step, last_step), slpi_running ? "; the SLPI runs" : "");
++	__atomic_store_n(&slpi_phase, 2, __ATOMIC_RELEASE);    /* 0397: QMP and the SMEM mutex are free for the GNSS thread */
+ 	if (slpi_running) {
+ 		slpi_watch();
+ 	}
+@@ -2018,9 +2028,11 @@ negroni_slpi_init(void)
+ 	pause_ms = MIN(pause_ms, 10000u);
+ 	printf("NEGRONI SLPI: level %u, steps 0..%u (UNTESTED: PAS id %u, carveout %#lx + %#x)\n", level, last_step, PAS_SLPI,
+ 	    SLPI_MEM_PHYS, SLPI_MEM_SIZE);
++	slpi_phase = 1;                         /* 0397 */
+ 	if (kernel_thread_start(slpi_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
++		slpi_phase = 2;
+ 		printf("NEGRONI SLPI: kernel_thread_start failed\n");
+ 	}
+ }
+diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
+index 3aaf8a6..5c2887c 100644
+--- a/bsd/dev/negroni_spmi.c
++++ b/bsd/dev/negroni_spmi.c
+@@ -352,9 +352,39 @@ qm_wait(vm_offset_t aoss, unsigned off, uint32_t want, unsigned ms)
+ 	return sp_rd(aoss, off) == want;
+ }
+ 
++/*
++ * 0397: one lock for the AOSS QMP mailbox between this file and the GNSS thread (negroni_gnss.c). The ADSP
++ * (0240) and SLPI (0376) threads do not take it; the GNSS thread starts only after both are done with
++ * their start, and this file skips its vote while negroniadsp/negronislpi are set.
++ */
++static LCK_MTX_DECLARE(negroni_qmp_mtx, &sp_grp);
++void negroni_qmp_lock(void);
++void negroni_qmp_unlock(void);
++void
++negroni_qmp_lock(void)
++{
++	lck_mtx_lock(&negroni_qmp_mtx);
++}
++void
++negroni_qmp_unlock(void)
++{
++	lck_mtx_unlock(&negroni_qmp_mtx);
++}
++
++static int qm_send_locked(const char *text, char *why, size_t len);
++
+ /* Thread context, sleeps; not under sp_lock (QMP is not SPMI). 0 when the AOP took the message. */
+ static int
+ qm_send(const char *text, char *why, size_t len)
++{
++	negroni_qmp_lock();
++	int rc = qm_send_locked(text, why, len);
++	negroni_qmp_unlock();
++	return rc;
++}
++
++static int
++qm_send_locked(const char *text, char *why, size_t len)
+ {
+ 	static vm_offset_t aoss, ipcc;
+ 	uint32_t words[QM_MSG_LEN / 4] = { 0 }, box, boxsize;
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 3ec2ee1..264492b 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -64,6 +64,7 @@ extern void negroni_adreno_init(void);
+ extern void negroni_wifi_init(void);
+ extern void negroni_adsp_init(void);
+ extern void negroni_slpi_init(void);    /* patch 0376: SLPI (sensor DSP) start (negronislpi) */
++extern void negroni_gnss_init(void);    /* patch 0397: GNSS through the modem (negronignss) */
+ extern void negroni_bt_init(void);      /* patch 0330: QCA6490 Bluetooth (negronibt) */
+ extern void negroni_fp_init(void);      /* patch 0350: fingerprint sensor stage A (negronifp) */
+ extern void negroni_probe_menu(void);
+@@ -163,6 +164,12 @@ dma_clean(uint32_t off, uint32_t len)
+  */
+ /* Sense key of the last failed command (0xff: no sense data). */
+ static uint8_t ufs_last_sense;
++/*
++ * 0397 (GNSS, negroni_gnss.c): the LUN of a READ (a command that moves no data out) while
++ * negroni_ufs_part_read() reads another LUN; 0xff = su.lun. Writes always go to su.lun, the root LUN:
++ * this path cannot write another LUN. Set and cleared under negroni_ufs_lock; the panic path clears it.
++ */
++static uint8_t ufs_read_lun = 0xff;
+ 
+ /*
+  * 0367: set by the panic path of the boot log (negroni_log_panic): commands
+@@ -194,7 +201,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 
+ 	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+ 	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
+-	ucd->cmd[2] = su.lun;
++	ucd->cmd[2] = (!write && ufs_read_lun != 0xff) ? ufs_read_lun : su.lun;   /* 0397: reads only */
+ 	ucd->cmd[3] = ++su.tag;
+ 	ucd->cmd[12] = (uint8_t)(len >> 24);
+ 	ucd->cmd[13] = (uint8_t)(len >> 16);
+@@ -825,6 +832,7 @@ negroni_ufs_init(void)
+ 	negroni_wifi_init();
+ 	negroni_adsp_init();            /* boot-arg negroniadsp=1 (default off): own thread */
+ 	negroni_slpi_init();            /* patch 0376: negronislpi=1|2|3 (default off): own thread, after the ADSP thread */
++	negroni_gnss_init();            /* patch 0397: GNSS (modem), default on, own thread; negronignss=0 kill switch */
+ 	negroni_bt_init();              /* patch 0330: negronibt=1|2 (default off): own thread */
+ 	negroni_fp_init();              /* patch 0350: negronifp=1|2 (default off): own thread */
+ 	negroni_keys_init();
+@@ -1098,6 +1106,173 @@ negroni_ufs_wlan_area_read(uint64_t at, void *dst, uint32_t count)
+ 	return 0;
+ }
+ 
++/*
++ * 0397 (iOSPlus10, bsd/dev/negroni_gnss.c, patches/xnu/README-gnss.md): READ-ONLY access to a few GPT
++ * partitions of the other LUNs, found by name: the modem firmware volume modem_a (FAT16, LUN 4 on the
++ * NE2211) and the modem file systems modemst1, modemst2, fsg, fsc (LUN 5). Only these five names. Every
++ * command of this path is READ(10) with the LUN set for that command (ufs_read_lun); nothing here
++ * writes, and a write elsewhere goes to su.lun whatever ufs_read_lun says. The owner rule (never write
++ * the modem partitions) is kept by construction: there is no write call for them.
++ */
++static const char *const ufs_part_allowed[] = { "modem_a", "modemst1", "modemst2", "fsg", "fsc" };
++#define UFS_PART_MAX    (sizeof(ufs_part_allowed) / sizeof(ufs_part_allowed[0]))
++#define UFS_LUN_MAX     8u
++static struct {
++	bool found;
++	uint8_t lun;
++	uint64_t first, blocks;
++} ufs_part[UFS_PART_MAX];
++
++/* One READ(10) on `lun` into the bounce buffer; one retry on a unit attention (first access of a LUN). */
++static int
++ufs_read_blocks_lun(uint8_t lun, uint64_t lba, uint32_t count)
++{
++	int error = EIO;
++
++	for (int i = 0; i < 3; i++) {
++		ufs_read_lun = lun;
++		error = ufs_read_blocks(lba, count);
++		ufs_read_lun = 0xff;
++		if (error != EIO || ufs_last_sense != 0x6) {    /* 6 = UNIT ATTENTION */
++			break;
++		}
++	}
++	return error;
++}
++
++/* Under negroni_ufs_lock: the GPT of `lun` searched for `want`. 0, ENOENT, or an I/O error. */
++static int
++ufs_part_scan_locked(uint8_t lun, const char *want, uint64_t *first, uint64_t *blocks)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	int error = ufs_read_blocks_lun(lun, 1, 1);
++
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		return ENOENT;
++	}
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (esz != 128 || nent == 0 || nent > 1024 || nent * esz > BOUNCE_SIZE || entry_lba < 2 || entry_lba > 64) {
++		return ENOENT;
++	}
++	error = ufs_read_blocks_lun(lun, entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	if (error) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		uint64_t f, l;
++
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		memcpy(&f, e + 32, 8);
++		memcpy(&l, e + 40, 8);
++		if (l < f || l > UINT32_MAX) {
++			return ENOENT;
++		}
++		*first = f;
++		*blocks = l - f + 1;
++		return 0;
++	}
++	return ENOENT;
++}
++
++/*
++ * The partition `name` (one of ufs_part_allowed) on LUN 0..7: its handle (>= 0) and size in bytes, or
++ * -errno. The scan result is kept; LUNs are searched in the order 4, 5, then 0..7 (NE2211 layout first).
++ */
++int negroni_ufs_part_open(const char *name, uint64_t *bytes);
++
++int
++negroni_ufs_part_open(const char *name, uint64_t *bytes)
++{
++	static const uint8_t order[] = { 4, 5, 0, 1, 2, 3, 6, 7 };
++	unsigned h;
++	int error = ENOENT;
++
++	for (h = 0; h < UFS_PART_MAX && strcmp(ufs_part_allowed[h], name) != 0; h++) {
++	}
++	if (h == UFS_PART_MAX || !su.ready) {
++		return h == UFS_PART_MAX ? -EPERM : -ENXIO;
++	}
++	lck_mtx_lock(&negroni_ufs_lock);
++	for (unsigned i = 0; i < sizeof(order) && !ufs_part[h].found; i++) {
++		uint64_t f = 0, n = 0;
++		int e = ufs_part_scan_locked(order[i], name, &f, &n);
++		if (e == 0) {
++			ufs_part[h].lun = order[i];
++			ufs_part[h].first = f;
++			ufs_part[h].blocks = n;
++			ufs_part[h].found = true;
++		} else if (e != ENOENT && error == ENOENT) {
++			error = e;
++		}
++	}
++	lck_mtx_unlock(&negroni_ufs_lock);
++	if (!ufs_part[h].found) {
++		return -error;
++	}
++	printf("NEGRONI UFS: partition \"%s\" (read only): LUN %u, first block 0x%llx, %llu KiB\n", name, ufs_part[h].lun,
++	    ufs_part[h].first, ufs_part[h].blocks * (UFS_BLOCK / 1024));
++	*bytes = ufs_part[h].blocks * UFS_BLOCK;
++	return (int)h;
++}
++
++/* `count` bytes at byte `at` of an opened partition into `dst` (kernel memory). Read only. */
++int negroni_ufs_part_read(int handle, uint64_t at, void *dst, uint32_t count);
++
++int
++negroni_ufs_part_read(int handle, uint64_t at, void *dst, uint32_t count)
++{
++	const uint8_t *bounce = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	uint8_t *to = (uint8_t *)dst;
++
++	if (handle < 0 || (unsigned)handle >= UFS_PART_MAX || !ufs_part[handle].found || !su.ready) {
++		return EINVAL;
++	}
++	uint64_t size = ufs_part[handle].blocks * UFS_BLOCK;
++	if (at > size || count > size - at) {
++		return EINVAL;
++	}
++	while (count > 0) {
++		uint32_t skip = (uint32_t)(at % UFS_BLOCK);
++		uint32_t n = MIN(count, BOUNCE_SIZE - skip);
++		uint32_t nblk = (skip + n + UFS_BLOCK - 1) / UFS_BLOCK;
++		int error;
++
++		lck_mtx_lock(&negroni_ufs_lock);
++		error = ufs_read_blocks_lun(ufs_part[handle].lun, ufs_part[handle].first + at / UFS_BLOCK, nblk);
++		if (!error) {
++			memcpy(to, bounce + skip, n);
++		}
++		lck_mtx_unlock(&negroni_ufs_lock);
++		if (error) {
++			return error;
++		}
++		to += n;
++		at += n;
++		count -= n;
++	}
++	return 0;
++}
++
+ /*
+  * Boot log (patch 0367, patches/xnu/README-bootlog.md). The console ring of
+  * each boot goes into one slot of a reserved area of the partition, so a
+@@ -1436,6 +1611,7 @@ nbl_panic_enter(void)
+ 	}
+ 	nbl.panic = true;
+ 	ufs_polled_only = true;
++	ufs_read_lun = 0xff;                    /* 0397: the panic path reads and writes the root LUN only */
+ 	nbl_panic_take_host();
+ 	result = 1;
+ 	return true;

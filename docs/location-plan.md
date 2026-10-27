@@ -443,3 +443,47 @@ The modem GNSS work (path C) is another agent's. Nothing is agreed; negroni-locd
   time of the fix stays the delivery time (CoreLocation's simulation takes the `CLLocation` as given; a source must not
   send old fixes).
 
+## 7. L3 kernel GNSS: patch 0397 (2026-10-27, GNSS kernel agent; compile-checked, not booted)
+
+Details, expected log lines and risks: `patches/xnu/README-gnss.md`. This section is the contract for negroni-locd.
+
+### 7.1 What the kernel does
+
+- [V source] One kernel thread `NEGRONI GNSS`, on by default, kill switch `negronignss=0`. 20 s after the start: modem
+  firmware from UFS LUN 4 `modem_a` (FAT16, read only), modem file systems from LUN 5 `modemst1/2`, `fsg`, `fsc` (read
+  only, into RAM), PAS start (id 4) of the modem, GLINK `mpss` + QRTR, our RMTFS/TFTP/servreg servers, QMI LOC client.
+  Never sends DMS "online" (no SIM, no network, no IPA). Any failure: modem stopped and one line
+  `NEGRONI GNSS: off: <reason>`.
+- [I] First possible fix: modem up + its file reads (~30 s on SM7325) + a cold start outdoors (30 s to minutes, no XTRA).
+
+### 7.2 Interface for negroni-locd
+
+- `/dev/negroni_gnss` (root:wheel 0440; negroni-locd runs as root). `sysctl kern.negroni_gnss` gives the same text
+  (for shells and logs; not demand).
+- Read with `pread(fd, buf, 1024, 0)` (each read starts at offset 0; the device returns a snapshot, it never blocks):
+
+```
+state=on session=1 engine=on reports=57 reason=ok
+fix=12 final=1 utc_ms=1793124000123 lat=12.9716000 lon=77.5946000 alt_m=920.50 ealt_m=834.10 hacc_m=7.50 vacc_m=12.00 speed_mps=0.10 course_deg=- sats=9 age_ms=420
+locd=12.9716000 77.5946000 7.50 920.50 12.00 0.10 -1
+```
+
+  - Line 1 always: `state=starting|on|off`, `session=0|1`, `engine=on|off|unknown`, `reports=N`, `reason=` (`ok`,
+    `starting`, or the off reason; the rest of the line).
+  - Line 2 (`fix=`) after the first fix; `fix=` is a sequence number (new fix = new number). `-` = not reported.
+    `final=0` = an intermediate (in-progress) fix. `alt_m` above sea level, `ealt_m` above the ellipsoid.
+  - Line 3 (`locd=`) only while that fix is younger than 3 s, in the section 6.4 text form `LAT LON HACC ALT VACC SPEED
+    COURSE` (always 7 fields; `-1` = unknown; `VACC -1` = no altitude, ALT then 0). It passes the 6.4 range checks.
+- Demand: every device read restarts a 30 s window; a LOC session (periodic 1 s, standalone) runs while the window is
+  open and stops after it (GNSS off, less power). So negroni-locd reads once per second while locationd wants a fix
+  and stops reading when it does not.
+- Suggested reader (iOS agent owns it): open once; every second `pread`; if `state=off` log the reason once and stop
+  the GNSS source (no-probes rule: the source turns off with one line); if a `locd=` line has a new `fix=` number,
+  feed it to `parse_fix()` -> `fix_deliver()`. With `state=starting` keep reading (up to ~4 min at boot).
+
+### 7.3 Status
+
+- [V] compile-one clean for all changed files; host test `scripts/kernel/test-gnss-core.sh` PASS (soft float on 2 M
+  values, QMI TLV bounds, TFTP paths, the FAT reader = Python reader on 10 files of `out/firmware/modem/modem.img`).
+- [U] Everything on the phone. The biggest unknowns: the RMTFS buffer place (0xa8000000) and its memory assign, the
+  modem's mode for GNSS without ONLINE, the IPA. See README-gnss.md "Risks".
