@@ -39,3 +39,4 @@
 0204-negroni-hfs-clonefile.patch open: HFS only (bsd/negroni_hfs); waits for the 12377 HFS stage
 0363-negroni-boot-line-1024.patch not needed: 12377 BOOT_LINE_LENGTH is already 1024
 0362-negroni-kmem-report.patch open: 12377 kmem ranges differ (no kmem_large_ranges/sprayqtn split; kalloc_large reworked); the KMEM report needs a rewrite
+0066-negroni-crash-fault-region.patch open: 12377 VM map uses range locks (no vm_map_lock_read/vm_map_lookup_entry); the fault-region crash line needs a rewrite
