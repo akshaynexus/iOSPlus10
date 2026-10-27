@@ -74,3 +74,38 @@ read. It still works with this patch (same value) and can be removed after the t
   cache are not searched.
 - The values are defaults, not measured D22 values. If later work needs a real stride requirement (e.g. our DPU scanout
   of client surfaces), change `NEGRONI_FB_STRIDE_*`; QuartzCore then aligns its display surfaces to it.
+
+
+# 0391: clock shift only in the clock's rows and the left-ear box (`0391-negroni-fb-clock-band.patch`, 2026-10-27)
+
+## Problem [V]
+- Owner photo 2026-10-27 19:39 (Today view): a dark step under the punch hole at the top edge of the first widget.
+- Render-server screenshot (userland/screenshot negroni-shot -> logs/shots/shot1.png, 1125x2436): clean, clock at the left.
+  So the step is ours: the 0256/0267 shift (`negronifb_clockshift=100`, config) moved panel rows 0..120 (the whole 44 pt
+  status bar), left half rotated right by n, the n columns at the left filled from the middle. Content that scrolls under
+  the status bar (the grey widget starts at canvas row ~95; its left edge at panel x 46) moved with it.
+- Clock glyphs (`scripts/display/clockshift-sim.py`): canvas x 93..186, y 53..84 (shot1), x 97..178, y 54..84 (test-shot)
+  = panel rows 41..72.
+
+## Change (NegroniFramebuffer.cpp, NegroniGPU.h)
+- Band: panel rows 34..80 only (was 0..120). Box: in the band, panel columns 50..228 move n to the right; the n columns
+  right of the box (228..328: the iPhone X notch area, status bar background) fill the gap. Rows above/below the band and
+  everything else are a plain copy. GPU: up to 6 rectangles in one IB (NEGRONI_GPU_PRESENT_RECTS 6: 6 x 98 words); CPU copy,
+  the 0256 in-place path and the zero-copy path do the same per row. A shift that does not fit the box (n > 178) uses
+  the 0267 half-row rotation inside the band.
+- Kill switch `negronifb_clockband=0`: the old strip (0..negronifb_clockrows) and rotation. Start line:
+  `NEGRONI FB: 0391 clock shift on panel rows 34..80 only ...` (at the first shift).
+
+## Test
+- Host: `patches/xnu/tests/fb-clock-copy-test.c` (strip, band, band + box; n 1, 100, 200, 539): GPU rectangles and CPU rows
+  equal the reference: PASS.
+- Simulation on the screenshots: `uv run --with pillow scripts/display/clockshift-sim.py logs/shots/shot1.png
+  logs/shots/test-shot.png OUT.png`: the 0267 strip shows the widget-edge block and a doubled "27"; 0391 leaves the widget
+  edge and the date in place; a faint box can stay where the band background has a horizontal gradient.
+- Phone: Today view and the lock screen; the clock right of the hole, no step at the widget's top edge. Compile-one OK.
+
+## Risks / not done
+- The shift still moves whatever lies in the box rows 34..80 x 50..328 (content scrolled under a transparent status bar).
+- Clean fix [I]: UIKit places the time itself: `+[_UIStatusBarVisualProvider_Split1125 leadingCenteringOffset]` (20H392
+  UIKitCore; also `_FixedSplit`, `Split1080_Wide`) returns the left ear's centring offset. A userland hook in every
+  process that draws a status bar (apps and SpringBoard) would need a tweak loader; then `negronifb_clockshift` goes.

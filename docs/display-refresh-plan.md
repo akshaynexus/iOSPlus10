@@ -265,3 +265,26 @@ out/kernel/local-20261026-213038/kernel.development.negroni sha256
 127cae2a976695d78131e9116be18f99daa601010f80aa4520b8de9698ac9c7c (after the review fixes B1, C1-C3, C5) (0364 applied, only the 4 dxb skips; strings
 `modes: TimingElements`, `GetBlock 0x%llx`, `PreciseSyncRate`). Patch sha256
 89ba7e3ea2c1c61adf317f6289c51129697d3d4ada23a263f562787eef6e9c46. Not booted.
+
+## 10. What limits the frame rate at 120 Hz, and patch 0389 (2026-10-27, 120 Hz agent)
+
+Measured with `scripts/display/fbstat-report.py` on logs/usblog-20261027-171256.txt (17:12:56-19:14:00; config args with
+`negronifb_te=1 negronifb_vrr=1 negronifb_dbuf=1 negronifb_teirq=1`). Full numbers: patches/xnu/README-gpu-kernel.md section 29.
+
+- The 120 Hz path works when the GPU keeps up: 18:39:35-47 shows 99-119 presents/s at 220 MHz with 0 skips and copy max
+  < 350 us (a light scroll). The VRR idle (10 Hz) and the wake (5 DCS packets, 0 ms) work.
+- Heavier content falls to 40-60 presents/s: 16 gpu-wait skips/s (frames whose render was not done at the vsync tick),
+  GPU at 220-380 MHz with 8-10 governor changes a second (limiter 1), CPU copies of "behind" layers on the tick at 4-7 ms
+  with late ticks (limiter 2).
+- Section 5 (0259 TE lock) [V]: with the auto-refresh at 1/1 the INT_COUNT_VAL frame field does not count, so the lock had
+  "no sample" in 98 % of the ticks at 120 Hz and the tick ran free against the TE (limiter 3). The lock worked only in VRR
+  idle (51 % locked). The 0295 interrupt counted 120 TEs/s all the time.
+- Section 7 item 4 (a real rd_ptr interrupt instead of sampling): 0389 now uses it for the lock (TE count + stamp, period
+  between stamps).
+- 0389: GPU pacing floor (`negronigpu_pace=0` = off), GPU input boost at touch (`negronigpu_inputboost=0` = off), GPU copy of behind layers into a 0269 back buffer
+  (`negronifb_gpubehind=0` = off), TE lock on the interrupt. Expected lines: README-gpu-kernel.md section 29.
+- Next, if 0389 is not enough [I]: present on render completion (fence interrupt) inside CA's 1 ms SwapWait retry; per-frame
+  render time from the swap to the fence (a pacing input better than held ticks); better placement of backboardd's render thread on the big cores (CPU agent).
+- Update (same day): 0389 also ports the Android GPU governor msm_adreno_tz (TrustZone DCVS, 10 ms bins; `negronigpu_tz=0`
+  = off; mapping in README-gpu-kernel.md section 29). 0391 limits the clock shift to panel rows 34..80 and the left-ear box
+  50..228 (the step under the punch hole; `negronifb_clockband=0` = off; README-display.md "0391").

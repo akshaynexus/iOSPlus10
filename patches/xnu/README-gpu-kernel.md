@@ -1566,3 +1566,154 @@ not as before: the 0281 DCVS used 12 as its max; a fixed level has no DCVS, so t
 2026-10-27 16:38, job `gpudcvs-kernel` (scripts/kernel/build-local.sh, all patches/xnu up to 0384, the 4 usual dxb skips, 0 compile
 errors, no new warnings in the 3 files against the unpatched tree): kernel `out/kernel/local-20261027-110800`
 (sha256 cee20b34f7e6e935d98021c656795df5a09b7d6e50a74f798a31829bf3825dbc). No image (owner rule: one image at the end). Not booted.
+
+## 29. Frame pacing for 120 Hz: GPU pacing floor, GPU copy behind newer work, TE lock on the interrupt (0389, `0389-negroni-gpu-frame-pace.patch`)
+
+Owner goal: smooth 120 Hz. Files: negroni_adreno.c (governor: TZ port, pacing floor, input boost), NegroniFramebuffer.cpp (present, teTick), negroni_dpu.c
+(TE count), negroni_touch.c (1 call). Analysis tool: `scripts/display/fbstat-report.py LOG [--from T --to T]`.
+
+### What the log shows [V logs/usblog-20261027-171256.txt 17:12:56-19:14:00, config args with negronifb_te=1 vrr=1 dbuf=1 teirq=1]
+- 5503 FB STAT seconds, 2653 active (swaps/s >= 10). Active means: swaps 19.3, presents 18.7, gpu-wait skips 11.0,
+  swapwait busy 8.1, late ticks 1.2. Totals: 29143 skips for 49620 presents (59 %), 0.42 busy answers per swap.
+- The 242 seconds with >= 40 swaps/s (scrolling, app switches), by presents/s:
+  - 40-60 (n 123): skips 16.0/s, busy answers 43.5/s, late ticks 3.2/s, copy max 6971 us, DCVS 9.2 changes/s, 378 MHz.
+  - 60-80 (n 25): skips 11.6, late 0.6, copy max 2661 us, 289 MHz.
+  - 80-100 (n 24): skips 1.7, copy max 842 us.
+  - 100-130 (n 37): skips 0.1, late 0.1, copy max 537 us (example 18:39:35-47: 99-119 presents/s at 220 MHz, 0 skips).
+  - corr(skips, presents/s) = -0.72; corr(swapwait busy, presents/s) = -0.31.
+- GPU clock: in the 1160 active seconds with >= 10 skips the DCVS line changed the level 8.2 times a second (the 0384
+  late-frame step goes up, the busy rule comes down at the next tick: GMU busy 20-30 % because the GPU idles between
+  frames), end level 363 MHz mean; 841 of 1238 DCVS lines in active seconds end at level <= 3 (<= 317 MHz). Example
+  19:08:22-34: levels 1 -> 9 -> 3 -> 1 -> 7 -> 1 -> 6 -> 1 in 12 s, 8-46 skips/s, 8-78 presents/s.
+- CPU copies: in the seconds with >= 40 swaps, cpu 3.5 frames/s at 4-7 ms each on the vsync tick (copy max 4711 us mean)
+  and late ticks 2.4/s. Cause [V code]: a GPU-rendered layer whose surface is listed in newer in-flight work (Turnip lists
+  every BO in every submit) is "behind" (0254) and goes the CPU way; the tick sends CA's vsync notification after it (0267).
+- TE lock: in 3175 seconds with autorefresh 0x80000001 (120 Hz) the 0259 lock had 7196 samples and 371186 "no sample"
+  ticks: `te/s 0 ... locked 0/0 ticks (no sample 121)`. The INT_COUNT_VAL frame field does not move while the auto-refresh
+  sends every frame, and teTick returned before it used the 0295 stamp. Same seconds: `DPU TE IRQ: irqs/s 120 rd_ptr 120`.
+  So the 120 Hz tick ran free against the panel TE (the flip of 0269 is taken at the next TE after the tick).
+- VRR wake: presents/s in the wake second and the next two: 11.2, 15.2, 14.6 (the first frames run at level 1).
+- Not a limit: DBUF waits 0.1/s; gave-up 0; zc 0.
+- [I] Long 10-19 swaps/s stretches (69 % of active seconds; 19:09-19:28 almost only those) with one skip per frame: a
+  low-rate animation, not the UI at its limit (GMU busy 10 %). 0389 leaves it alone (below the 2-of-12 rule).
+
+### What 0389 does
+1. Frame-pacing floor in the 0384 governor (negroni_adreno.c `pace_tick`). Per governor tick (100 ms while busy): if the UI
+   swapped and the FB held a frame for the GPU in >= 2 of the 12 vsync ticks (`negroni_gpu_late_frames`), the floor =
+   max(floor, level) + 1 (+ 2 at >= 6). No late tick for 500 ms: floor - 1, then - 1 every 200 ms until a tick is late
+   again; a step down that was late makes the next step down wait 2000 ms. No swap for 300 ms: floor 0 (simple_ondemand
+   alone, level 1 when idle), the level is remembered; the next burst starts one level under it (forgotten after 10 s
+   idle). Display off: floor 0. The thermal cap (0280) and `negronigpu_maxlevel` still win. The late-frame counter is read
+   once per tick (before: only inside gov_want).
+2. GPU copy behind newer work (NegroniFramebuffer.cpp present): with 0269 on, a "behind" layer whose swap-time fence is done
+   is copied by the 2D engine into a back buffer (not the shown or the flipped one); the copy waits behind the newer work on
+   the in-order ring and dbufTick flips the buffer only after its fence: no 4-7 ms CPU copy on the tick, no tear. Not with
+   badges or the fingerprint highlight (presentFinish would wait for that copy). STAT gets ` gpu-behind N` at the end.
+3. TE lock on the interrupt (teTick, negroni_dpu.c `negroni_dpu_te_count`): with the 0295 rd_ptr interrupt live and its stamp
+   fresh (< 25 ms), the TE count and the last TE stamp come from the interrupt (seqlock against the handler); the TE period
+   is measured between stamps over >= 1 s and sets the tick period (within 15 % of nominal); the phase is the stamp's age
+   at the deadline. Without the interrupt, or with a stale stamp (VRR idle), the 0259 counter path as before.
+
+4. Input boost (negroni_adreno.c `negroni_input_boost`, called by negroni_touch.c `touch_report` on each finger-down or
+   move report): while the pacing floor is on and the display is on, the governor level is at least 6 (492 MHz, bus 6) for
+   200 ms after the last report; the watch is woken at once from its 250 ms idle tick. The pacing floor can still go higher.
+   This is the one input-boost hook: the CPU side (owned by the CPU-scheduler agent) may add its own call inside it.
+
+5. GPU governor = msm_adreno_tz (the Android governor of this phone), ported (`negronigpu_tz=0` = off; then the 0384
+   simple_ondemand decides). Sources pinned by `scripts/setup/fetch-gpu-governor-sources.sh`: OnePlusOSS
+   android_kernel_oneplus_sm8450, branch oneplus/sm8450_b_16.0_oneplus_10_pro, commit e9da592 (QCOM
+   AU_LINUX_KERNEL.PLATFORM.1.0.R1.00.00.00.000.130), GPL-2.0-only. The level decision runs in TrustZone (SCM service
+   DCVS 0x0d), as on Android; our kernel does what governor_msm_adreno_tz.c and kgsl_pwrscale.c do around it.
+   Self-check: is-call-available for DCVS INIT/UPDATE/RESET, then DCVS_INIT_V2 must answer 0 and version 0; else one
+   `NEGRONI GPU TZ: off: <reason>` line and simple_ondemand. Three failed DCVS_UPDATE_V2 in a row: the same at runtime.
+   The pacing floor (1) and the input boost (4) stay on top of the TZ level (Android does input/frame boosts in userspace).
+
+### Android -> our function (0389 governor)
+| Android (commit e9da592) | Ours (negroni_adreno.c) | Notes |
+|---|---|---|
+| governor_msm_adreno_tz.c `tz_start` + `tz_init` (qcom_scm_dcvs_core_available, qcom_scm_dcvs_init_v2) | `tz_start()` | table `{n, freq_table[] in Hz}`, pwrlevel 0 = 818 MHz .. 11 = 220 MHz (live.dts qcom,gpu-pwrlevel@0..11); buffer page cleaned from the cache (dma_sync_single_for_device); no shmbridge: if TZ refuses the plain page, TZ is off |
+| `tz_get_target_freq` (FLOOR 5000 us, MIN_BUSY 1000 us, CEILING 50000 us, mod_percent 100, bin) | `tz_want()` | same constants and order; `val = -level` burst to the top; level clamped to 0..max_state-1, then to our min/max/thermal cap |
+| `__secure_tz_update_entry3` -> qcom_scm_dcvs_update_v2 (svc 0x0d cmd 0x0a, 3 values) | `scm_quiet(... TZ_DCVS_UPDATE_V2 ...)` | result[0] = the level step |
+| `tz_suspend` -> qcom_scm_dcvs_reset (cmd 0x07) | `tz_reset()` | at display off (the GPU's lowest level, KGSL: GPU suspend) |
+| context-aware DCVS (`tz_init_ca`, `qcom,enable-ca-jump`) | not ported | not in live.dts |
+| kgsl_pwrscale.c `polling_ms = 10`, KGSL_GOVERNOR_CALL_INTERVAL 10000 us | watch tick `TZ_POLL_MS` 10 ms while the GPU works | 100 ms (DCVS_TICK_MS) without TZ |
+| adreno_gen7.c `gen7_power_stats`: busy = GMU POWER_COUNTER_XOCLK_0 x 10 / 192 | `busy_counter_pct()` -> `busy_tick_xo/ao` | total = GMU always-on counter delta (19.2 MHz), the same unit |
+| adreno_gen7_gmu.c `gen7_gmu_dcvs_set` (HFI H2F_MSG_GX_BW_PERF_VOTE, ack block, freq = gpu_level_num - pwrlevel - 1, bw = the level's bus index) | `dcvs_tick()` -> `hfi_send("GX_BW_PERF_VOTE")` (0281/0298) | unchanged; bus = DT qcom,bus-freq of the level (`dcvs_bw_for`, 0298) |
+| governor_gpubw_mon.c (bus level between qcom,bus-min/max from GBIF RAM time/wait) | not ported | needs the GBIF RAM counters (gen7_read_bus_stats); the default per-level bus-freq is KGSL's vote without it |
+| userspace input boost (Android PowerHAL / perf HAL GPU min freq on touch) | `negroni_input_boost()` (item 4) | kernel hook from negroni_touch.c |
+
+### Coordinator questions (2026-10-27) [V same log]
+- Under-used GPU: yes. In the 1160 active seconds with >= 10 skips the GMU busy share was 23 % mean and the level changed
+  8.2 times a second (ping-pong 1 <-> 9 in places); frames are late while the GPU is mostly idle: latency, not throughput.
+  0389 items 1 and 4.
+- Fence interrupt: live, not the limit. `GPU IRQ: irq live N/s fence N/s woke W missed 0` in all 3651 lines: 1-80 fence
+  interrupts a second, missed 0, `woke` small because few kernel threads sleep on a fence (the FB tick never waits: it asks
+  NegroniGPUFenceDone at each tick; RedwoodGPU gpuWait sleeps on the interrupt with the 1000 us look as fallback). The 0-8.3 ms
+  tick quantization is the cost, not the fence path.
+- CPU clusters (owned by the CPU agent, not changed here): in the 135 seconds with >= 40 swaps and a CPUFREQ line, the slow
+  ones (presents < 60, n 82) had d1 1985 MHz (busy 55 %, LMH 1721) and d2 1728 MHz (busy 39 %, LMH 2183); the fast ones
+  (presents >= 100, n 20) had d1 926 / d2 898 MHz. So the big clusters do ramp in heavy seconds; d1 sat at its LMH limit in
+  124 of 135 seconds and d0 (little) was 74-79 % busy at 1775 MHz. [I] Thread placement of backboardd's render thread is unknown.
+
+### Boot-args (kill switches only)
+| Boot-arg | Default | Meaning |
+|---|---|---|
+| `negronigpu_pace` | 1 | 0 = no pacing floor (0384 as before). Off by itself with `negronigpu_level=N`, `negronigpu_gov=0`, `negronigpu_dcvs=0` |
+| `negronigpu_inputboost` | 1 | 0 = no level floor at touch. Off by itself when the pacing floor is off |
+| `negronigpu_tz` | 1 | 0 = no TrustZone DCVS (simple_ondemand 0384). Off by itself when TZ has no DCVS service or refuses the init |
+| `negronifb_gpubehind` | 1 | 0 = behind layers go the CPU way (0254). Off by itself without 0269 (`negronifb_dbuf=1`) |
+| `negronifb_te` | 0 (config 1) | the TE lock (0259); 0389 changes only its TE source |
+
+### Log lines
+- Start: `NEGRONI GPU PACE: on (0389): ...` or `NEGRONI GPU PACE: off: <reason>`; `NEGRONI FB: 0389 GPU copy behind newer GPU
+  work on (into a back buffer)` or `off: ...`; `NEGRONI FB TE: 0389 lock on the rd_ptr interrupt's TE count and stamp ...`
+  once at the first interrupt sample.
+- Start: `NEGRONI GPU PACE: input boost on: level 6 (492 MHz) or more for 200 ms after each touch report ...` or `off ...`.
+  The per-second PACE line has `input ticks N (reports N)`.
+- Start: `NEGRONI GPU TZ: on (0389, msm_adreno_tz port): 12 levels 220..818 MHz to TrustZone (DCVS_INIT_V2 version 0), poll
+  10 ms, ...` or `NEGRONI GPU TZ: off: <reason>`. Per second with TZ calls: `NEGRONI GPU TZ: N updates (U up, D down, B busy
+  bursts to the top), level L (M MHz)`.
+- Per second while the floor is on or moved: `NEGRONI GPU PACE: floor F (max M this second), level L (N MHz), held frames H,
+  swaps S, raises R decays D resumes U, cap C`. Once: `NEGRONI GPU PACE: at the top allowed level ... for N ms and frames still
+  wait: the render time, not the clock, limits the frame rate now`.
+- First 4 behind copies: `NEGRONI FB: 0389 frame N: GPU copy of surface S behind newer GPU work (fence F, surface now at G) into
+  panel buffer B, no CPU copy`.
+
+### Expected on the phone [I, not booted]
+- Scroll Settings for 10 s: `FB STAT` presents/s >= 100 in most seconds where the old kernel showed 40-80; `gpu-wait skips`
+  < 5/s; `cpu` 0 and `gpu-behind` 1-5/s instead; `late ticks` 0; `copy max` < 1000 us. `GPU PACE` floor 5-9 while the
+  content is heavy, then down; DCVS changes per second 1-3 instead of 8-10.
+- `FB TE: te/s 120 period us 8333 ... locked >= 110/120 ticks (no sample ~0)` with autorefresh 0x80000001.
+- `DBUF latch max us` <= 8400 (one TE) instead of up to 16756.
+- Heat: the floor holds a higher GPU level only while frames are late; idle and low-rate animation stay at level 1.
+- `scripts/display/fbstat-report.py logs/usblog.log --from HH:MM:SS` gives the same tables for the new boot.
+
+### Risks [I]
+- More GPU power while the UI is heavy (up to 818 MHz for seconds). The thermal cap limits it; `negronigpu_pace=0` = 0384.
+- The pacing floor follows only the FB's held frames: a Metal app that renders off-screen without swaps gets no floor.
+- A behind copy shows its frame later (after the newer work); the newest done buffer is flipped, so a frame can be skipped
+  instead of shown late. With 3 panel buffers a second behind copy can find no free buffer (`DBUF waits`): the frame then
+  stays pending one tick.
+- The TE lock now moves the tick by up to a quarter period per tick while it locks (the first second): a few late ticks.
+  `negronifb_te=0` = free-running tick.
+
+### Verification
+- TZ part: compile-one OK; [I] not run: whether TrustZone accepts DCVS_INIT_V2 from a plain page (Linux uses the shm bridge
+  on this SoC) is seen only at boot (`NEGRONI GPU TZ: on|off`).
+- Host test `patches/xnu/tests/gpu-pace-test.c` (pace_tick, same code): light UI no floor; heavy UI (needs level 7) reached in
+  300 ms, then levels 6-7, late in 8 of 100 ticks; lighter content down to <= 3 in 1.9 s; pause -> floor 0, next burst at 6+;
+  thermal max wins; display off; 10 fps animation with 1 held tick per 100 ms -> no floor: PASS.
+- Compile: `scripts/kernel/compile-one.sh` on a STAGE=0 scratch tree with all patches/xnu up to 0388 + 0389: negroni_adreno.c,
+  negroni_dpu.c, negroni_touch.c, NegroniFramebuffer.cpp OK, no new warning in the four files (negroni_adreno.c keeps its 3 old ones).
+  0390 (NegroniSurface.cpp) applies after 0389. No full kernel, no image (owner rule: one image at the end). Not booted.
+- Opus review (2026-10-27), fixes in 0389: (a) `tz_want` ran also on ticks without a counter sample (busy counter given up,
+  or `negronigpu_busy_pct=0`) and sent the stale last bin to TrustZone again each tick: TZ now runs only with this tick's
+  sample; TZ is off with one line when the busy counter is given up, and does not start with `negronigpu_busy_pct=0`.
+  (b) The 0298 give-up "busy counter did not move" counted 50 ticks; with the 10 ms TZ poll that was 0.5 s instead of
+  5 s: it now counts 5 s of always-on time. (c) TZ gets only pwrlevels 0..11 (guard on our level 1..12). (d) A
+  DCVS_UPDATE_V2 answer WAITQ_SLEEP/WAKE (2/3; live.dts qcom_scm has the wait-queue IRQ 0x3a2) turns TZ off at once with
+  one line (WAITQ_RESUME is not ported; the parked TZ context holds one of qcom,max-queues = 2). Boot risk of the TZ
+  calls [I]: is-call-available is the same fast call as step 1; INIT_V2 reads a 68-byte table from a normal DRAM page
+  (TZ may read non-secure memory; with the shm bridge enforced, TZ answers an error, then TZ off); UPDATE_V2/RESET take
+  values only. All run in the watch thread (gpu_pm_lock is a mutex, interrupts on), as Linux runs them from the devfreq
+  work. THIRD_PARTY_NOTICES.md section 10 (GPL-2.0-only).

@@ -24,6 +24,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | Linux kernel drivers (ath11k / Qualcomm) | Qualcomm Technologies Inc., Linux Foundation | BSD-3-Clause-Clear |
 | seemoo-lab/owl (port in `patches/xnu/0347-negroni-awdl.patch`: `bsd/dev/negroni_awdl_owl.{c,h}`) | The Open Wireless Link Project, Milan Stute | GPL-3.0-or-later |
 | Qualcomm WALT / OPLUS frame_boost (logic port in `patches/xnu/0395-negroni-cpuperf.patch`: `bsd/dev/negroni_cpuperf.c`) | The Linux Foundation, Intel Corporation, Oplus | GPL-2.0-only |
+| KGSL msm_adreno_tz GPU governor (logic port in `patches/xnu/0389-negroni-gpu-frame-pace.patch`: `bsd/dev/negroni_adreno.c` tz_start/tz_want) | The Linux Foundation, Qualcomm Innovation Center | GPL-2.0-only |
 
 ---
 
@@ -386,3 +387,21 @@ Copyright (C) 2020 Oplus. All rights reserved.
 The complete GNU General Public License v2.0 text is in `LICENSES/GPL-2.0.txt` (copied from `external/metal2vulkan/LICENSE-GPL-2.0`).
 A kernel built with patch 0395 contains this code; the kill switch `negronicpuperf=0` turns it off at run time but does not
 remove it from the binary.
+
+---
+
+## 10. GNU GPL v2.0 (KGSL msm_adreno_tz GPU governor, patch 0389)
+
+`patches/xnu/0389-negroni-gpu-frame-pace.patch` adds to `bsd/dev/negroni_adreno.c` a port of the GPU governor of the
+Android kernel of this phone: `drivers/gpu/msm/governor_msm_adreno_tz.c` (tz_start, tz_init, tz_get_target_freq,
+tz_suspend), `kgsl_pwrscale.c` and the DCVS calls of `drivers/firmware/qcom_scm.c` of OnePlusOSS/android_kernel_oneplus_sm8450
+commit `e9da5922d6d1925fa7cc3062b65d92fa2812c3aa`. Fetch: `scripts/setup/fetch-gpu-governor-sources.sh`.
+
+```
+SPDX-License-Identifier: GPL-2.0-only
+Copyright (c) 2010-2021, The Linux Foundation. All rights reserved.
+Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+```
+
+The complete GNU General Public License v2.0 text is in `LICENSES/GPL-2.0.txt`. A kernel built with patch 0389 contains
+this code; the kill switch `negronigpu_tz=0` turns it off at run time but does not remove it from the binary.
