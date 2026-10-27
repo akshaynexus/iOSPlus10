@@ -1,0 +1,99 @@
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 4c98ee2..1525838 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -801,6 +801,85 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * Display pipe requirements (patch 0388, boot-arg negronifb_pipedict, default 1).
++ * Two readers in the 20H392 dyld shared cache, both on this service:
++ *  - VideoToolbox FigGetAlignmentForIOSurfaceOutputToDisplayService (image-queue sinks: camera
++ *    preview, AVPlayer, AVSampleBufferDisplayLayer) calls CFDictionaryGetValue on
++ *    "DisplayPipePlaneBaseAlignment" without a type check ("PlaneBaseAlignmentLinear") and on
++ *    "DisplayPipeStrideRequirements" ("StrideLinearHorizontal"). A plain number there throws
++ *    -[__NSCFNumber objectForKey:]. A missing property gives 64 for both.
++ *  - QuartzCore CA::WindowServer::AppleDisplay::AppleDisplay takes both only when they are a
++ *    CFDictionary: PlaneBaseAlignmentLinear, StrideLinearHorizontal, StrideLinearVertical;
++ *    its defaults are 64, 64 and 1. It ignored the old number.
++ * So we publish dictionaries with the same values as the defaults (64, 64, 1): VideoToolbox
++ * stops throwing and nothing else changes. Self-check: read both back; if one is wrong or a
++ * dictionary cannot be made, remove both (the readers then use the same defaults) and log why.
++ * negronifb_pipedict=0 restores the old number 64 (kill switch).
++ */
++#define NEGRONI_FB_PLANE_ALIGN   64
++#define NEGRONI_FB_STRIDE_H      64
++#define NEGRONI_FB_STRIDE_V      1
++
++static bool
++negroni_fb_dict_number_is(IOService *fb, const char *prop, const char *key, uint32_t want)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, fb->getProperty(prop));
++	OSNumber *n = (d != NULL) ? OSDynamicCast(OSNumber, d->getObject(key)) : NULL;
++	return n != NULL && n->unsigned32BitValue() == want;
++}
++
++static void
++negroni_fb_publish_pipe_reqs(IOService *fb)
++{
++	uint32_t pipedict = 1;
++	const char *why = NULL;
++
++	PE_parse_boot_argn("negronifb_pipedict", &pipedict, sizeof(pipedict));
++	if (pipedict == 0) {
++		fb->setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++		IOLog("NEGRONI FB: display pipe: off (negronifb_pipedict=0): DisplayPipePlaneBaseAlignment is the number 64 "
++		    "(VideoToolbox image-queue sinks throw)\n");
++		return;
++	}
++
++	OSDictionary *align = OSDictionary::withCapacity(1);
++	OSDictionary *stride = OSDictionary::withCapacity(2);
++	OSNumber *a = OSNumber::withNumber((unsigned long long)NEGRONI_FB_PLANE_ALIGN, 32);
++	OSNumber *h = OSNumber::withNumber((unsigned long long)NEGRONI_FB_STRIDE_H, 32);
++	OSNumber *v = OSNumber::withNumber((unsigned long long)NEGRONI_FB_STRIDE_V, 32);
++
++	if (align == NULL || stride == NULL || a == NULL || h == NULL || v == NULL) {
++		why = "no memory";
++	} else if (!align->setObject("PlaneBaseAlignmentLinear", a) ||
++	    !stride->setObject("StrideLinearHorizontal", h) ||
++	    !stride->setObject("StrideLinearVertical", v)) {
++		why = "dictionary setObject failed";
++	} else if (!fb->setProperty("DisplayPipePlaneBaseAlignment", align) ||
++	    !fb->setProperty("DisplayPipeStrideRequirements", stride)) {
++		why = "setProperty failed";
++	} else if (!negroni_fb_dict_number_is(fb, "DisplayPipePlaneBaseAlignment", "PlaneBaseAlignmentLinear", NEGRONI_FB_PLANE_ALIGN) ||
++	    !negroni_fb_dict_number_is(fb, "DisplayPipeStrideRequirements", "StrideLinearHorizontal", NEGRONI_FB_STRIDE_H) ||
++	    !negroni_fb_dict_number_is(fb, "DisplayPipeStrideRequirements", "StrideLinearVertical", NEGRONI_FB_STRIDE_V)) {
++		why = "read-back check failed";
++	}
++	OSSafeReleaseNULL(align);
++	OSSafeReleaseNULL(stride);
++	OSSafeReleaseNULL(a);
++	OSSafeReleaseNULL(h);
++	OSSafeReleaseNULL(v);
++
++	if (why != NULL) {
++		fb->removeProperty("DisplayPipePlaneBaseAlignment");
++		fb->removeProperty("DisplayPipeStrideRequirements");
++		IOLog("NEGRONI FB: display pipe: off: %s; properties removed (readers use their defaults 64/64/1)\n", why);
++		return;
++	}
++	IOLog("NEGRONI FB: display pipe: DisplayPipePlaneBaseAlignment {PlaneBaseAlignmentLinear=%u}, "
++	    "DisplayPipeStrideRequirements {StrideLinearHorizontal=%u, StrideLinearVertical=%u}\n",
++	    NEGRONI_FB_PLANE_ALIGN, NEGRONI_FB_STRIDE_H, NEGRONI_FB_STRIDE_V);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -900,7 +979,7 @@ AppleCLCD::start(IOService *provider)
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	negroni_fb_publish_pipe_reqs(this);     /* 0388: dictionaries, as VideoToolbox and QuartzCore read them */
+ 	uint32_t carefresh = 1;
+ 	PE_parse_boot_argn("negronifb_carefresh", &carefresh, sizeof(carefresh));
+ 	if (carefresh != 0) {
