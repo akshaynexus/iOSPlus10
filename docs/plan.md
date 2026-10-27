@@ -11,6 +11,11 @@ watchdogs 0371=60 s / 0375=30 s). Details: docs/notes.md sections 57-63, patches
    iOS has en0 (t21, notes 57). Not proven: scan and join. 0345 (wifid answers + join fix) is committed, never booted.
    Next: boot t23, open Settings > Wi-Fi, read `NEGRONI WLAN iOS` lines (scan request? scan done? SCAN_RESULT? join?).
    If wifid never asks for a scan: 96 VIRTUAL_IF_ROLE, 51 COUNTRY_CODE, event 55 (README-wifi.md "0345" risks).
+   **Owner test on t23 (12:11-12:14, logs/usblog-20261027-060101.txt):** [V] the radio works: the driver's own
+   passive scan saw 19 BSS (27 beacons/probe responses). [V] wifid sent NO scan request; it asked twice
+   `user client type 0 asked of en0's service: none (ioctl path)` and only polled a few ioctls (CARD_CAPABILITIES,
+   SSID ENXIO). [I] iOS 16 wifid wants an IO80211 user client (type 0) on the interface's service and stops without
+   it. Next: find what wifid/IO80211.framework expects from that user client (selectors) and add it, then retest.
 2. **USB data watchdog 0375: first phone test inconclusive.** t23 12:12: armed (`reboot after 30 s without USB data`),
    but 45 s of `ifconfig en10 down` on the Mac did not fire it, so frames still reached the phone (or macOS kept the
    link busy). A second 20 s down at 12:14 lost the link at 12:14:51 (cause not read yet: read `make bootlog`, boot 13
