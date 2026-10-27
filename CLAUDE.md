@@ -28,6 +28,12 @@ decision we learned; add yours before you stop), `docs/plan.md` (status and next
   hackios-xnu-userland, metal2vulkan) are submodules; the reference ones come from `scripts/setup/get-references.sh`
   (`make references`), are git-ignored and pinned in that script. Do not commit changes inside either kind; put our
   changes as patches or scripts in this repo and apply them from a script.
+- **No probes.** Every patch or tool is a real feature, on by default. At start it checks that it can work
+  (hardware, firmware support, handshake). If it cannot, it turns itself off cleanly and logs one line with
+  the reason (e.g. `NEGRONI AWDL: off: firmware passes no AWDL action frames`). No probe-only or
+  diagnostic-only patches or boot-args; read-only checks exist only as the self-check of a real feature.
+  A boot-arg may exist only as a kill switch (`=0`). A failure turns off only that feature, never Wi-Fi,
+  USB or the boot.
 - **Reply style:** ASD-STE100, STE-flavored (short sentences, active voice, technical terms and
   numbers unchanged).
 - **Clean old builds after every new build.** The Mac disk is nearly full (a full disk breaks builds and
