@@ -1,0 +1,976 @@
+diff --git a/bsd/dev/negroni_bt_h4.c b/bsd/dev/negroni_bt_h4.c
+index b595fe6..028b61b 100644
+--- a/bsd/dev/negroni_bt_h4.c
++++ b/bsd/dev/negroni_bt_h4.c
+@@ -589,6 +589,9 @@ h4_rx_thread(void *arg __unused, wait_result_t w __unused)
+ 		}
+ 		uint64_t idle = now_us() - t.last_act;
+ 		uint32_t ms = idle < 200000u ? 1u : idle < 5000000u ? 5u : 20u;
++		if (t.off && !t.powering) {
++			ms = 1000u;     /* 0382: chip off (BT_EN low): nothing to read; power-on kicks (kick()) */
++		}
+ 		lck_mtx_lock(&h4_lock);
+ 		if (!t.kick) {
+ 			struct timespec ts = { 0, (long)ms * 1000 * 1000 };
+diff --git a/bsd/dev/negroni_dpu.c b/bsd/dev/negroni_dpu.c
+index 12e08e4..e3ebb4e 100644
+--- a/bsd/dev/negroni_dpu.c
++++ b/bsd/dev/negroni_dpu.c
+@@ -258,6 +258,15 @@ ndpu_teirq_init(void)
+ 	    "0259's TE lock takes its phase from it\n", intid, intid - 32, ndpu_te_init + 1, rdptr, ndpu_line_ns);
+ }
+ 
++/*
++ * 0382 (README-power-idle.md): while the display is asleep (negroni_display_asleep, NegroniFramebuffer.cpp)
++ * the TE line is masked (nothing uses a TE while dark: teTick is skipped then) and the per-second line
++ * prints only when interrupts came, or once a minute. Unmasked on the first tick after the wake.
++ */
++extern int negroni_display_asleep;
++static bool ndpu_dark_masked;
++static uint64_t ndpu_print_at;
++
+ /* Work loop, each tick: unmask after a foreign interrupt, the per-second line, the storm guard. */
+ static void
+ ndpu_teirq_tick(uint64_t now)
+@@ -265,7 +274,15 @@ ndpu_teirq_tick(uint64_t now)
+ 	if (!ndpu_irq_on) {
+ 		return;
+ 	}
+-	if (ndpu_irq_masked) {
++	bool dark = __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE) != 0;
++	if (dark != ndpu_dark_masked) {
++		ndpu_dark_masked = dark;
++		negroni_spi_enable(ndpu_intid, !dark);  /* 0382 */
++		if (!dark) {
++			ndpu_irq_masked = false;
++		}
++	}
++	if (ndpu_irq_masked && !dark) {
+ 		ndpu_irq_masked = false;
+ 		negroni_spi_enable(ndpu_intid, true);
+ 	}
+@@ -284,6 +301,10 @@ ndpu_teirq_tick(uint64_t now)
+ 	absolutetime_to_nanoseconds(rd != 0 ? lat / rd : 0, &ns);
+ 	absolutetime_to_nanoseconds(latMax, &nsMax);
+ 	ndpu_sec_t0 = now;
++	if (dark && irqs == 0 && now - ndpu_print_at < 60 * ndpu_sec_abs) {
++		return;                 /* 0382: dark and quiet */
++	}
++	ndpu_print_at = now;
+ 	printf("NEGRONI DPU TE IRQ: irqs/s %u rd_ptr %u foreign %u (masked %u) TE-to-handler us avg/max %llu/%llu\n",
+ 	    irqs, rd, fo, ma, ns / 1000, nsMax / 1000);
+ 	if (irqs > NDPU_IRQ_STORM) {
+diff --git a/bsd/dev/negroni_keys.c b/bsd/dev/negroni_keys.c
+index bf60208..b524ff2 100644
+--- a/bsd/dev/negroni_keys.c
++++ b/bsd/dev/negroni_keys.c
+@@ -31,11 +31,18 @@ static struct sk_keys keys_apid;
+ static bool keys_started;
+ static int keys_sleep_chan;
+ 
++/*
++ * 0382 (README-power-idle.md): 20 ms; with the display asleep and no key down negronikeys_dark_ms
++ * (default 40; 20 = as before). A press lasts 80 ms or more, so 40 ms still sees every press.
++ */
++extern int negroni_display_asleep;      /* NegroniFramebuffer.cpp */
++static uint32_t keys_dark_ms = 40;
++
+ static void
+-keys_wait(void)
++keys_wait(uint32_t ms)
+ {
+ 	uint64_t deadline;
+-	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+ 	(void)assert_wait_deadline(&keys_sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+@@ -85,7 +92,8 @@ keys_thread(void *arg, wait_result_t result)
+ 				}
+ 			}
+ 		}
+-		keys_wait();
++		bool down = state[0] || state[1] || state[2];
++		keys_wait(!down && __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE) ? keys_dark_ms : 20);
+ 	}
+ }
+ 
+@@ -198,6 +206,10 @@ negroni_keys_init(void)
+ 	keys_started = true;
+ 	(void)PE_parse_boot_argn("negronikeys", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("negronikeyslog", &keys_log, sizeof(keys_log));
++	(void)PE_parse_boot_argn("negronikeys_dark_ms", &keys_dark_ms, sizeof(keys_dark_ms));
++	if (keys_dark_ms < 20 || keys_dark_ms > 60) {
++		keys_dark_ms = keys_dark_ms < 20 ? 20 : 60;     /* 0382: a short tap is about 80 ms */
++	}
+ 	if (!enabled) {
+ 		printf("NEGRONI KEYS: disabled (negronikeys=0)\n");
+ 		return;
+diff --git a/bsd/dev/negroni_touch.c b/bsd/dev/negroni_touch.c
+index f313b50..6c1f52b 100644
+--- a/bsd/dev/negroni_touch.c
++++ b/bsd/dev/negroni_touch.c
+@@ -142,6 +142,14 @@ touch_setup(void)
+ 	return rc;
+ }
+ 
++/*
++ * 0382 (README-power-idle.md): the ATTN poll is 10 ms; with the display asleep and no finger down it is
++ * negronitouch_dark_ms (default 50; 10 = as before). ATTN is a level (low until the report is read),
++ * so a slower poll only delays a report, it does not lose one.
++ */
++extern int negroni_display_asleep;      /* NegroniFramebuffer.cpp */
++static uint32_t touch_dark_ms = 50;
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -199,7 +207,7 @@ touch_thread(void *arg, wait_result_t result)
+ 				touch_report();
+ 			}
+ 		}
+-		IOSleep(10);
++		IOSleep(st.active == 0 && __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE) ? touch_dark_ms : 10);
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
+@@ -217,6 +225,10 @@ negroni_touch_init(void)
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("negronitouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("negronitouchlog", &st.log, sizeof(st.log));
++	(void)PE_parse_boot_argn("negronitouch_dark_ms", &touch_dark_ms, sizeof(touch_dark_ms));
++	if (touch_dark_ms < 10 || touch_dark_ms > 200) {
++		touch_dark_ms = touch_dark_ms < 10 ? 10 : 200;
++	}
+ 	if (!enabled) {
+ 		printf("NEGRONI TOUCH: disabled (negronitouch=0)\n");
+ 		return;
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index c5ccb93..f5253e7 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -297,6 +297,9 @@ static struct {
+ 	uint64_t    rx_bytes, tx_bytes, tx_drops;
+ 	uint32_t    rx_max_poll, tx_max_batch;
+ 	uint64_t    last_active;    /* mach_absolute_time of the last frame or event */
++	uint64_t    last_rx;        /* 0382: the last host frame or host event (not our own TX completions) */
++	int         poll_chan;      /* 0382: ud_thread's own sleep (ud_if_output wakes it) */
++	bool        poll_long;      /* 0382: ud_thread sleeps longer than 1 ms now */
+ 	/* 0366: transfers per physical endpoint, link watchdog */
+ 	bool        ep_busy[6];     /* STARTTRANSFER issued, no XferComplete or ENDTRANSFER since */
+ 	uint32_t    ep_rsc[6];      /* its transfer resource index (for ENDTRANSFER) */
+@@ -335,6 +338,15 @@ static struct {
+ static int  ud_panic_enabled = 1;       /* 0360: boot-arg negronipanicusb */
+ static int  ud_ring = 1;                /* 0361: boot-arg negroniusb_ring (0 = one TRB per direction) */
+ static int  ud_poll_us = 200;           /* 0361: boot-arg negroniusb_pollus: poll period while frames move */
++/*
++ * 0382 (README-power-idle.md): ud_thread's poll period when nothing moves. Host data in the last 2 s,
++ * a TX in flight or the PHY watch window: 1 ms as before. Else negroniusb_idle_ms (default 4) with the
++ * display on and negroniusb_idle_off_ms (default 20) with the display asleep or no host configured.
++ * negroniusb_idle_ms=1 = the old fixed 1 ms. A frame we send (ud_if_output) wakes the thread at once.
++ */
++static int  ud_idle_ms = 4;
++static int  ud_idle_off_ms = 20;
++extern int negroni_display_asleep;      /* NegroniFramebuffer.cpp (0382) */
+ static bool ud_running;                 /* 0360: gadget set up (event buffer, ep0) */
+ 
+ static inline void
+@@ -772,6 +784,7 @@ ud_rx_done(void)
+ 	mbuf_t head = NULL, tail = NULL;
+ 
+ 	ud_sync(UD_TRB_RX, 16);
++	ud.last_rx = mach_absolute_time();      /* 0382 */
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
+ 	ud_rx_frame((const uint8_t *)(ud.dma + UD_RX), len, &head, &tail, &stats);
+@@ -866,6 +879,7 @@ ud_rx_ring_poll(void)
+ 			ud.rx_max_poll = frames;
+ 		}
+ 		ud.last_active = mach_absolute_time();
++		ud.last_rx = ud.last_active;    /* 0382 */
+ 	}
+ 	if (!ud_in_panic) {
+ 		ud_rx_input(head, &stats);
+@@ -954,6 +968,9 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ 	ud.txq_count++;
+ 	ud_tx_kick_locked();
+ 	lck_mtx_unlock(ud.lock);
++	if (__atomic_load_n(&ud.poll_long, __ATOMIC_SEQ_CST)) {
++		thread_wakeup((event_t)&ud.poll_chan);  /* 0382: the completion is seen within 1 ms, not one idle period */
++	}
+ 	return 0;
+ }
+ 
+@@ -2869,6 +2886,54 @@ ud_event(uint32_t ev)
+ 	}
+ }
+ 
++/* 0382: ud_thread's long sleep, on its own event: ud_if_output wakes it, nothing else does. */
++static void
++ud_poll_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&ud.poll_chan, THREAD_UNINT, deadline);
++	/*
++	 * Review: a frame queued after ud_poll_period() (poll_long still false in ud_if_output, or its
++	 * wakeup before this assert_wait) would wait one long period for its completion: check again.
++	 * Only for a long sleep: the 1 ms sleep with a TX in flight must still sleep (no spin).
++	 */
++	if (ms > 1 && (__atomic_load_n(&ud.tx_busy, __ATOMIC_SEQ_CST) || __atomic_load_n(&ud.txq_count, __ATOMIC_SEQ_CST) != 0)) {
++		clear_wait(current_thread(), THREAD_AWAKENED);
++		return;
++	}
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* 0382: the next poll period in us (see ud_idle_ms). */
++static unsigned
++ud_poll_period(uint64_t now, uint64_t idle_after)
++{
++	bool fast_ok = ud_poll_us > 0 && ud_poll_us < 1000;
++
++	if (ud_idle_ms <= 1) {
++		/* the 0361 rule */
++		return fast_ok && now - ud.last_active < idle_after ? (unsigned)ud_poll_us : 1000;
++	}
++	bool txq = __atomic_load_n(&ud.tx_busy, __ATOMIC_ACQUIRE) || ud.txq_count != 0;
++	uint64_t rx_age = now - ud.last_rx;
++	if (fast_ok && ud.last_rx != 0 && (rx_age < idle_after || (txq && rx_age < ud_abs_ms(2000)))) {
++		return (unsigned)ud_poll_us;    /* the host sends (or acks a stream of ours) */
++	}
++	if (txq || now - ud.last_active < idle_after || (ud.last_rx != 0 && rx_age < ud_abs_ms(2000)) ||
++	    ud.ctl_action != UD_CTL_NONE) {
++		return 1000;
++	}
++	if (hp.ok) {
++		uint64_t st = hp.adsp_start_at, up = hp.adsp_up_at;
++		if (st != 0 && now < st + ud_abs_ms(30000) && (up == 0 || now < up + ud_abs_ms(10000))) {
++			return 1000;            /* 0368: the PHY watch samples every 10 ms in this window */
++		}
++	}
++	bool dark = __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE) != 0;
++	return (unsigned)(dark || !ud.configured ? ud_idle_off_ms : ud_idle_ms) * 1000u;
++}
++
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -2900,6 +2965,9 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 					printf("NEGRONI USB: event 0x%08x\n", ev);
+ 				}
+ 				ud.last_ev = ev;        /* 0375 */
++				if ((ev & 1) || ((ev >> 1) & 0x1f) != EP_TX) {
++					ud.last_rx = mach_absolute_time();      /* 0382: a host event, not our TX completion */
++				}
+ 				ud_event(ev);
+ 			}
+ 			ud.last_active = mach_absolute_time();
+@@ -2931,12 +2999,20 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			rep_rx = ud.rx_frames; rep_tx = ud.tx_frames; rep_rxb = ud.rx_bytes; rep_txb = ud.tx_bytes;
+ 			next_report = now + period;
+ 		}
+-		/* 0361: poll every negroniusb_pollus while frames move (20 ms after the last), else every 1 ms */
+-		if (ud_poll_us > 0 && ud_poll_us < 1000 && (now - ud.last_active < idle_after)) {   /* review 2026-10-27: tx_busy alone no longer keeps the fast poll (a hung batch would spin 5000/s) */
+-			ud_sleep_us((unsigned)ud_poll_us);
++		/*
++		 * 0361: poll every negroniusb_pollus while frames move (20 ms after the last), else every 1 ms.
++		 * 0382: "move" = host frames or host events (our own TX completions alone no longer keep 200 us);
++		 * a TX in flight or queued, host data in the last 2 s, a recent event or the PHY watch window:
++		 * 1 ms; else the idle period (ud_poll_period). The old rule with negroniusb_idle_ms=1.
++		 */
++		unsigned us = ud_poll_period(now, idle_after);
++		__atomic_store_n(&ud.poll_long, us > 1000, __ATOMIC_SEQ_CST);
++		if (us < 1000) {
++			ud_sleep_us(us);
+ 		} else {
+-			ud_sleep_ms(1);
++			ud_poll_sleep_ms(us / 1000);
+ 		}
++		__atomic_store_n(&ud.poll_long, false, __ATOMIC_RELAXED);
+ 	}
+ }
+ 
+@@ -3108,7 +3184,8 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	to.sin_port = htons(5140);
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
+-		ud_sleep_ms(100);
++		/* 0382: 100 ms; 250 ms with the display asleep; 1 s with no host configured */
++		ud_sleep_ms(!ud.configured ? 1000 : __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE) ? 250 : 100);
+ 		if (!ud.configured || ud_in_panic) {
+ 			continue;
+ 		}
+@@ -3559,6 +3636,18 @@ negroni_usb_gadget_start(vm_offset_t dwc)
+ 	PE_parse_boot_argn("negronictl", &ctl, sizeof(ctl));
+ 	PE_parse_boot_argn("negroniusb_resetdrop", &ud_reset_drop, sizeof(ud_reset_drop));
+ 	PE_parse_boot_argn("negroniusb_pollus", &ud_poll_us, sizeof(ud_poll_us));
++	PE_parse_boot_argn("negroniusb_idle_ms", &ud_idle_ms, sizeof(ud_idle_ms));
++	PE_parse_boot_argn("negroniusb_idle_off_ms", &ud_idle_off_ms, sizeof(ud_idle_off_ms));
++	if (ud_idle_ms > 100) {
++		ud_idle_ms = 100;
++	}
++	if (ud_idle_off_ms < ud_idle_ms) {
++		ud_idle_off_ms = ud_idle_ms;
++	} else if (ud_idle_off_ms > 100) {
++		ud_idle_off_ms = 100;
++	}
++	printf("NEGRONI USB: 0382 idle poll %d ms, %d ms dark or no host (1 ms with host data in the last 2 s; "
++	    "negroniusb_idle_ms/_idle_off_ms)\n", ud_idle_ms <= 1 ? 1 : ud_idle_ms, ud_idle_ms <= 1 ? 1 : ud_idle_off_ms);
+ 	ud.ctl_enabled = ctl != 0 && ud.ifp != NULL;
+ 	PE_parse_boot_argn("negronipanicusb", &ud_panic_enabled, sizeof(ud_panic_enabled));
+ 	ud_running = true;              /* 0360: event buffer and ep0 are set up */
+diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBattery.cpp
+index e03691d..8552ab5 100644
+--- a/iokit/Kernel/arm/NegroniBattery.cpp
++++ b/iokit/Kernel/arm/NegroniBattery.cpp
+@@ -343,7 +343,10 @@ private:
+ 	bool fVbusMeasured;        /* 0377: the last full read's external state came from a VADC USBIN reading */
+ 	unsigned fOutliers;        /* conversions far from the filtered voltage, in a row */
+ 	int fSocLogKey;            /* the last logged percent/source/target */
+-	unsigned fFastMs, fTicks;  /* plug tick period (0 = off) and ticks since the last full read */
++	unsigned fFastMs, fTicks;  /* plug tick period (0 = off) and ms (0382; was ticks) since the last full read */
++	unsigned fDarkMs;          /* 0382: plug tick period while the display is asleep (negronibatt_dark_ms) */
++	unsigned fArmedMs;         /* 0382: the period the timer was armed with */
++	unsigned nextMs(void);
+ 	uint64_t fFastNs;          /* uptime of the last plug tick */
+ 	/* 0278: the saved percentage */
+ 	bool fStoreDone;           /* the saved value was used or refused (saves start after this) */
+@@ -430,6 +433,11 @@ NegroniBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fTicks = 0;
+ 	fFastNs = 0;
++	fDarkMs = 5000;
++	(void)PE_parse_boot_argn("negronibatt_dark_ms", &fDarkMs, sizeof(fDarkMs));
++	if (fDarkMs > NB_POLL_MS) {
++		fDarkMs = NB_POLL_MS;
++	}
+ 	fStoreDone = false;
+ 	fStoreTries = 0;
+ 	fLastSavedSoc = -1;
+@@ -1601,19 +1609,39 @@ NegroniBattery::storeSave(uint64_t ns)
+ 	fLastSaveNs = ns;
+ }
+ 
++/*
++ * 0382 (README-power-idle.md): the plug tick is negronibatt_fast (1 s) with the display on and
++ * negronibatt_dark_ms (default 5000; 0 = as with the display on) while it is asleep: a cable plugged in
++ * with the screen dark is seen within 5 s. The full read stays every NB_POLL_MS.
++ */
++extern "C" int negroni_display_asleep;  /* NegroniFramebuffer.cpp */
++
++unsigned
++NegroniBattery::nextMs(void)
++{
++	unsigned ms = fFastMs ? fFastMs : NB_POLL_MS;
++	if (fFastMs && fDarkMs > ms && __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE)) {
++		ms = fDarkMs;
++	}
++	fArmedMs = ms;
++	return ms;
++}
++
+ void
+ NegroniBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	NegroniBattery *self = OSDynamicCast(NegroniBattery, owner);
+ 	if (self && self->fRunning) {
+ 		/* 0276: a full read every NB_POLL_MS; between them the plug-state ticks (negronibatt_fast) */
+-		if (!self->fFastMs || ++self->fTicks >= NB_POLL_MS / self->fFastMs) {
++		/* 0382: the full read by time (the plug tick is longer while the display is asleep) */
++		self->fTicks += self->fArmedMs;
++		if (!self->fFastMs || self->fTicks >= NB_POLL_MS) {
+ 			self->fTicks = 0;
+ 			self->poll();
+ 		} else {
+ 			self->fastCheck();
+ 		}
+-		sender->setTimeoutMS(self->fFastMs ? self->fFastMs : NB_POLL_MS);
++		sender->setTimeoutMS(self->nextMs());
+ 	}
+ }
+ 
+@@ -1769,7 +1797,7 @@ NegroniBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(fFastMs ? fFastMs : NB_POLL_MS);
++			fTimer->setTimeoutMS(nextMs());
+ 		} else {
+ 			fReal = false;
+ 			poll();
+diff --git a/iokit/Kernel/arm/NegroniCPU.cpp b/iokit/Kernel/arm/NegroniCPU.cpp
+index 6b016fb..750000d 100644
+--- a/iokit/Kernel/arm/NegroniCPU.cpp
++++ b/iokit/Kernel/arm/NegroniCPU.cpp
+@@ -21,6 +21,7 @@
+ extern "C" void negroni_secondary_entry(void);
+ extern "C" boolean_t negroni_cpu_signal_is_enabled(unsigned int cpu);
+ extern "C" void negroni_cpuidle_init(void);     /* osfmk/arm64/negroni_cpuidle.c (0288) */
++extern "C" void negroni_top_start(void);        /* osfmk/kern/negroni_top.c (0382) */
+ 
+ class NegroniCPU;
+ static NegroniCPU *negroni_cpus[MAX_CPUS];
+@@ -190,6 +191,7 @@ NegroniCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	IOLog("NEGRONI CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
+ 	negroni_cpuidle_init();         /* 0288: CPU idle states (negronicpuidle, default 0 = WFI only) */
++	negroni_top_start();            /* 0382: NEGRONI TOP lines (negronitop, default 60 s) */
+ 	thread_terminate(current_thread());
+ }
+ 
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 23f04bb..aaa480c 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -204,6 +204,23 @@ enum {
+ #define NEGRONI_FB_NOTIFY_VSYNC           5
+ #define NEGRONI_FB_VSYNC_US               8333    /* 120 Hz, the panel's native rate */
+ #define NEGRONI_FB_OFF_TICKS              12      /* 0258: vsync periods per tick while the display is off (100 ms) */
++/*
++ * 0382 (README-power-idle.md): display-asleep state for the pollers (negroni_usb.c, negroni_keys.c,
++ * negroni_touch.c, NegroniBattery.cpp, negroni_dpu.c read it; 1 from the first slow tick after the
++ * DCS sleep until RequestPowerChange(1)). Dark for NEGRONI_FB_OFF_SLOW_MS: the off tick becomes
++ * negronifb_offtick_ms (default 500; 100 = the old 0258 tick); negronifb_offnotify=0 also stops the
++ * vsync notifications to the clients while dark (default 1: they go out on each off tick as before).
++ * While dark, the per-second FB/TE/VRR lines print only when something happened, or every
++ * negronifb_offstat_s (default 60).
++ */
++#define NEGRONI_FB_OFF_SLOW_MS            5000
++extern "C" {
++int negroni_display_asleep;
++}
++static uint32_t negroni_fb_offtick_ms = 500;
++static uint32_t negroni_fb_offnotify = 1;
++static uint32_t negroni_fb_offstat_s = 60;
++static uint32_t negroni_fb_asleep_on = 1;        /* negronifb_asleep=0: the flag stays 0 (every dark poller as before) */
+ #define NEGRONI_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+@@ -590,6 +607,10 @@ public:
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* off ticks done: 0 black, 1 backlight off, then slow ticks (0275) */
+ 	uint64_t      fOffAt;         /* RequestPowerChange(0) time (0258: fade length in the log) */
++	bool          fWakeKick;      /* 0382: RequestPowerChange(1) during a long off tick: the next tick now */
++	bool          fStatQuiet;     /* 0382: dark and nothing happened: this second's lines are not printed */
++	uint64_t      fStatPrintAt;   /* 0382: the last printed STAT line */
++	void          wakeKick(void);
+ 	/* GPU present (0231) */
+ 	NegroniSurface *fPendHold[NEGRONI_FB_LAYERS];   /* held surfaces of fPending */
+ 	bool          fPendGPU;       /* fPending is all GPU-rendered layers */
+@@ -838,6 +859,18 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t stats = 1;
+ 	PE_parse_boot_argn("negronifb_stats", &stats, sizeof(stats));
+ 	fStats = stats != 0;
++	PE_parse_boot_argn("negronifb_offtick_ms", &negroni_fb_offtick_ms, sizeof(negroni_fb_offtick_ms));
++	PE_parse_boot_argn("negronifb_offnotify", &negroni_fb_offnotify, sizeof(negroni_fb_offnotify));
++	PE_parse_boot_argn("negronifb_offstat_s", &negroni_fb_offstat_s, sizeof(negroni_fb_offstat_s));
++	PE_parse_boot_argn("negronifb_asleep", &negroni_fb_asleep_on, sizeof(negroni_fb_asleep_on));
++	if (negroni_fb_offtick_ms < 100) {
++		negroni_fb_offtick_ms = 100;
++	} else if (negroni_fb_offtick_ms > 2000) {
++		negroni_fb_offtick_ms = 2000;
++	}
++	IOLog("NEGRONI FB: 0382 dark: tick %u ms after %u ms, vsync notifications %s, idle lines every %u s, "
++	    "dark flag %s (negronifb_offtick_ms/_offnotify/_offstat_s/_asleep)\n", negroni_fb_offtick_ms, NEGRONI_FB_OFF_SLOW_MS,
++	    negroni_fb_offnotify ? "on" : "off", negroni_fb_offstat_s, negroni_fb_asleep_on ? "on" : "off");
+ 	nanoseconds_to_absolutetime((uint64_t)NEGRONI_FB_VSYNC_US * 500ull, &fStatLateAbs);
+ 	nanoseconds_to_absolutetime(1000000000ull, &fStatSecAbs);
+ 	nanoseconds_to_absolutetime((uint64_t)NEGRONI_FB_VSYNC_US * 1000ull, &fTickAbs);
+@@ -929,7 +962,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 * the clock shift, so CoreAnimation's 1 ms SwapWait retry ran out and it skipped the heartbeat.
+ 	 */
+ 	bool notifyLate = fb->fNotifyLate && !fb->fPowerOff;
+-	for (unsigned int i = 0; !notifyLate && i < fb->fClients->getCount(); i++) {
++	/* 0382: negronifb_offnotify=0: no vsync notifications once dark (fade step 2 on) */
++	bool notifyOff = fb->fPowerOff && fb->fFadeStep >= 2 && negroni_fb_offnotify == 0;
++	for (unsigned int i = 0; !notifyLate && !notifyOff && i < fb->fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(NEGRONI_FB_NOTIFY_VSYNC, values, 6);
+@@ -1005,7 +1040,25 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			}
+ 		} else {
+ 			/* 0258: dark and idle: a slow tick (NEGRONI_FB_OFF_TICKS periods, 100 ms) until the wake */
+-			fb->fDeadline += (NEGRONI_FB_OFF_TICKS - 1) * fb->fTickAbs;
++			uint64_t ticks = NEGRONI_FB_OFF_TICKS, slowAbs;
++			nanoseconds_to_absolutetime((uint64_t)NEGRONI_FB_OFF_SLOW_MS * NSEC_PER_MSEC, &slowAbs);
++			/*
++			 * 0382: under fLock and only while still off. Review: a store after the unlock above could
++			 * land after a RequestPowerChange(1) cleared the flag and leave it at 1 with the display on.
++			 */
++			IOLockLock(fb->fLock);
++			if (fb->fPowerOff && negroni_fb_asleep_on) {
++				__atomic_store_n(&negroni_display_asleep, 1, __ATOMIC_RELEASE);
++			}
++			IOLockUnlock(fb->fLock);
++			if (now - fb->fOffAt >= slowAbs) {
++				/* 0382: dark for a while: the longer tick; RequestPowerChange(1) kicks the timer (wakeKick) */
++				ticks = (uint64_t)negroni_fb_offtick_ms * 1000ull / NEGRONI_FB_VSYNC_US;
++				if (ticks < NEGRONI_FB_OFF_TICKS) {
++					ticks = NEGRONI_FB_OFF_TICKS;
++				}
++			}
++			fb->fDeadline += (ticks - 1) * fb->fTickAbs;
+ 		}
+ 		fb->rearm(sender);
+ 		return;
+@@ -1120,6 +1173,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	fb->rearm(sender);
+ }
+ 
++/* 0382: RequestPowerChange(1) while the off tick is long: tick now (rearm() restarts the deadlines). */
++void
++AppleCLCD::wakeKick(void)
++{
++	__atomic_store_n(&fWakeKick, true, __ATOMIC_RELEASE);
++	if (fVsync != NULL) {
++		fVsync->wakeAtTime(mach_absolute_time());
++	}
++}
++
+ /* The vsync notification to every client (fLock held). */
+ void
+ AppleCLCD::notifyVsync(const uint64_t *values)
+@@ -1140,6 +1203,11 @@ AppleCLCD::rearm(IOTimerEventSource *sender)
+ {
+ 	uint64_t now = mach_absolute_time();
+ 
++	if (__atomic_exchange_n(&fWakeKick, false, __ATOMIC_ACQ_REL)) {
++		fDeadline = now;        /* 0382: the display came on during a long off tick: full rate from now */
++		fTeAdjAbs = 0;
++	}
++
+ 	/* 0259: the TE lock moves the next deadline by at most a quarter period; the step after is a full one */
+ 	int64_t step = (int64_t)fTickAbs + fTeAdjAbs;
+ 	fTeAdjAbs = 0;
+@@ -1249,16 +1317,23 @@ AppleCLCD::statTick(uint64_t now)
+ 	uint64_t waitAbs = __atomic_exchange_n(&fStatWaitAbs, 0, __ATOMIC_RELAXED);
+ 	uint64_t waitMax = __atomic_exchange_n(&fStatWaitMaxAbs, 0, __ATOMIC_RELAXED);
+ 	uint32_t copies = fStatCPU + fStatGPU;
+-	IOLog("NEGRONI FB STAT: swaps/s %u presents/s %u (cpu %u gpu %u zc %u) copy avg/max us %llu/%llu "
++	/* 0382: dark and nothing happened: no lines (the counters still restart), at most every negronifb_offstat_s */
++	fStatQuiet = __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE) && swaps == 0 && copies == 0 &&
++	    fStatZC == 0 && waits == 0 && timeouts == 0 && fStatGaveUp == 0 &&
++	    (negroni_fb_offstat_s == 0 || now - fStatPrintAt < (uint64_t)negroni_fb_offstat_s * fStatSecAbs);
++	if (!fStatQuiet) {
++		fStatPrintAt = now;
++		IOLog("NEGRONI FB STAT: swaps/s %u presents/s %u (cpu %u gpu %u zc %u) copy avg/max us %llu/%llu "
+ 	    "late ticks %u swapwait calls %u waited us avg/max %llu/%llu timeouts %u gpu-wait skips %u gave-up %u\n",
+ 	    swaps, copies + fStatZC, fStatCPU, fStatGPU, fStatZC,
+ 	    copies ? negroni_fb_abs_us(fStatCopyAbs) / copies : 0, negroni_fb_abs_us(fStatCopyMaxAbs),
+ 	    fStatLate, waits, waits ? negroni_fb_abs_us(waitAbs) / waits : 0, negroni_fb_abs_us(waitMax), timeouts,
+ 	    fStatSkips, fStatGaveUp);
++	}
+ 	fStatT0 = now;
+ 	fStatCPU = fStatGPU = fStatZC = fStatLate = fStatSkips = fStatGaveUp = 0;
+ 	fStatCopyAbs = fStatCopyMaxAbs = 0;
+-	if (fDbuf) {
++	if (fDbuf && !fStatQuiet) {
+ 		IOLog("NEGRONI FB DBUF: flips/s %u waits %u in-place %u latch max us %llu (buffer %d shown, %d flipped, %llu flips)\n",
+ 		    fStatDbFlips, fStatDbWaits, fStatDbInPlace, negroni_fb_abs_us(fStatDbLatchMaxAbs), fDbShown, fDbFlipped,
+ 		    fDbFlipsTotal);
+@@ -1518,17 +1593,19 @@ AppleCLCD::teLog(void)
+ 			snprintf(ts, sizeof(ts), " ts 0x%llx (+%llu)", t, t - fTeTs);
+ 			fTeTs = t;
+ 		}
++		if (!fStatQuiet) {      /* 0382 */
+ 		IOLog("NEGRONI FB TE: te/s %u period us %u tick us %llu phase us %d target %d err avg/max us %lld/%d "
+ 		    "adj us %d locked %u/%u ticks (no sample %u) count 0x%08x autorefresh 0x%08x%s\n",
+ 		    frames, fTePeriodUs, negroni_fb_abs_us(fTickAbs), fTePhaseUs,
+ 		    fTeTarget < 0 ? (int32_t)(fTePeriodUs != 0 ? fTePeriodUs : 8333) + fTeTarget : fTeTarget,
+ 		    fTeSamples != 0 ? fTeErrSum / fTeSamples : 0, fTeErrMax, fTeAdjUs, fTeLocked, fTeSamples, fTeNoSample,
+ 		    negroni_dpu_rd(fIntf + INTF_TEAR_INT_COUNT_VAL), negroni_dpu_rd(fIntf + INTF_TEAR_AUTOREFRESH_CONFIG), ts);
++		}
+ 		fTeLocked = fTeSamples = fTeNoSample = 0;
+ 		fTeErrSum = 0;
+ 		fTeErrMax = 0;
+ 	}
+-	if (fVrrMode != 0) {
++	if (fVrrMode != 0 && !fStatQuiet) {     /* 0382 */
+ 		IOLockLock(fLock);
+ 		uint32_t state = fVrrState;
+ 		uint64_t idleAbs = fVrrIdleTotalAbs + (state == kNegroniVrrIdle ? mach_absolute_time() - fVrrIdleAt : 0);
+@@ -3718,7 +3795,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			 * DBV 0 and puts the panel to sleep (negronifb_sleep). On: the
+ 			 * backlight wakes the panel at once and the next tick redraws.
+ 			 */
+-			bool none = false;
++			/* 0382: on, from the slow off tick: tick at once (read before the lock: at worst one extra tick) */
++			bool none = false, kick = !off && fFB->fPowerOff && fFB->fFadeStep >= 2;
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+@@ -3734,6 +3812,12 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				}
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			if (!off) {
++				__atomic_store_n(&negroni_display_asleep, 0, __ATOMIC_RELEASE);        /* 0382 */
++			}
++			if (kick) {
++				fFB->wakeKick();        /* 0382: the next tick now, not at the end of a long off tick */
++			}
+ 			if (none) {
+ 				IOLog("NEGRONI FB: display on (sleep-out 0 ms, no backlight service)\n");
+ 			}
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index c4ec9d7..83ea9f0 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -42,6 +42,7 @@ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/negroni_early.c	standard
+ osfmk/arm64/negroni_cpuidle.c	standard
++osfmk/kern/negroni_top.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+diff --git a/osfmk/kern/negroni_top.c b/osfmk/kern/negroni_top.c
+new file mode 100644
+index 0000000..f84734a
+--- /dev/null
++++ b/osfmk/kern/negroni_top.c
+@@ -0,0 +1,342 @@
++/*
++ * NEGRONI (SM8450) "top" in the kernel log, patch 0382 (patches/xnu/README-power-idle.md).
++ *
++ * Why: the 0284 CPUFREQ line gives the busiest core of a domain, mostly at the moments a row changes
++ * (a biased sample), and nothing tells WHICH thread uses the CPU or how often the cores wake. Every
++ * negronitop seconds (default 60; 0 = off) one kernel thread prints:
++ *
++ *   NEGRONI TOP 60 s dark 1: busy% 3 1 0 0 0 0 0 0 | irq/s 1012 40 12 9 3 3 2 2 | timer/s ... | ipi/s ...
++ *   NEGRONI TOP procs: kernel_task 4.1%, backboardd[58] 0.9%, ...
++ *   NEGRONI TOP thr 3.0% kernel_task tid 123 "name" st 0x1 lr 0x... 0x... 0x... 0x... 0x...
++ *
++ * busy% per CPU = (user + system) / (user + system + idle) time of that processor over the window
++ * (recount_processor_usage, the same counters as host_statistics). irq/s = cpu_stat.irq_ex_cnt
++ * (every IRQ exception: device interrupts, the timer, IPIs), timer/s = cpu_stat.timer_cnt, ipi/s =
++ * cpu_stat.ipi_cnt: the wakeups. Threads: CPU time in the window (recount_thread_time_mach) in % of one
++ * core, top NT_TOP; for a kernel_task thread the first return addresses of its kernel stack (unslid:
++ * scripts/debug/panic-symbolize.sh -a ADDR...), which name the polling loop it sleeps in.
++ * Cost: one pass over the thread list per window under tasks_threads_lock (about 1-3 ms).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(NEGRONI)
++#include <stdint.h>
++#include <stdbool.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/task.h>
++#include <kern/processor.h>
++#include <kern/recount.h>
++#include <kern/sched_prim.h>
++#include <kern/misc_protos.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <arm/cpu_data_internal.h>
++#include <pexpert/pexpert.h>
++#include <libkern/OSAtomic.h>
++
++extern lck_mtx_t tasks_threads_lock;
++extern char *proc_name_address(void *p);
++extern int task_pid(task_t task);
++extern processor_t cpu_to_processor(int cpu);
++extern int negroni_display_asleep;      /* NegroniFramebuffer.cpp (0382) */
++
++void negroni_top_start(void);
++
++#define NT_SLOTS        8192            /* thread table (open addressing on the thread id) */
++#define NT_TOP          6
++#define NT_PROCS        6
++#define NT_TASKS        96
++#define NT_FRAMES       6
++#define NT_CPUS         8
++
++struct nt_ent {
++	uint64_t tid;           /* 0 = empty */
++	uint64_t time;          /* recount_thread_time_mach at the last window */
++};
++
++static struct nt_ent *nt_tab[2];
++static int nt_cur;
++static uint32_t nt_secs = 60;
++
++static struct {
++	uint64_t busy, idle, irq, timer, ipi;
++} nt_cpu[NT_CPUS];
++
++static uint64_t
++nt_prev(const struct nt_ent *tab, uint64_t tid, bool *found)
++{
++	uint32_t h = (uint32_t)(tid * 2654435761u) & (NT_SLOTS - 1);
++	for (uint32_t n = 0; n < NT_SLOTS; n++, h = (h + 1) & (NT_SLOTS - 1)) {
++		if (tab[h].tid == tid) {
++			*found = true;
++			return tab[h].time;
++		}
++		if (tab[h].tid == 0) {
++			break;
++		}
++	}
++	*found = false;
++	return 0;
++}
++
++static void
++nt_put(struct nt_ent *tab, uint64_t tid, uint64_t time)
++{
++	uint32_t h = (uint32_t)(tid * 2654435761u) & (NT_SLOTS - 1);
++	for (uint32_t n = 0; n < NT_SLOTS; n++, h = (h + 1) & (NT_SLOTS - 1)) {
++		if (tab[h].tid == 0 || tab[h].tid == tid) {
++			tab[h].tid = tid;
++			tab[h].time = time;
++			return;
++		}
++	}
++}
++
++static void
++nt_name(task_t task, char *buf, size_t size)
++{
++	if (task == kernel_task) {
++		strlcpy(buf, "kernel_task", size);
++		return;
++	}
++	void *p = get_bsdtask_info(task);
++	snprintf(buf, size, "%s[%d]", p ? proc_name_address(p) : "?", task_pid(task));
++}
++
++static uint64_t
++nt_pct10(uint64_t part, uint64_t whole)        /* tenths of a percent */
++{
++	return whole ? part * 1000 / whole : 0;
++}
++
++static void
++nt_window(uint64_t window_abs, bool print)
++{
++	struct nt_ent *old = nt_tab[nt_cur], *tab = nt_tab[nt_cur ^ 1];
++	struct {
++		thread_t th;
++		uint64_t delta, tid;
++	} top[NT_TOP] = {};
++	static struct {
++		task_t task;
++		uint64_t sum;
++	} tasks[NT_TASKS];      /* one thread uses these: static, off the kernel stack */
++	static char thr[NT_TOP][300], procs[400];
++	uint32_t ntasks = 0, nthreads = 0;
++	char line[480];
++	int at;
++
++	/* per CPU: busy share and the wakeups */
++	const ml_topology_info_t *topo = ml_get_topology_info();
++	unsigned ncpu = topo->num_cpus < NT_CPUS ? topo->num_cpus : NT_CPUS;
++	uint32_t busy[NT_CPUS] = {}, irq[NT_CPUS] = {}, tmr[NT_CPUS] = {}, ipi[NT_CPUS] = {};
++	uint64_t ns;
++	absolutetime_to_nanoseconds(window_abs, &ns);
++	uint64_t ms = ns / NSEC_PER_MSEC ? ns / NSEC_PER_MSEC : 1;
++	for (unsigned i = 0; i < ncpu; i++) {
++		int cpu = (int)topo->cpus[i].cpu_id;
++		processor_t p = cpu_to_processor(cpu);
++		cpu_data_t *cd = cpu_datap(cpu);
++		if (p == PROCESSOR_NULL || cd == NULL) {
++			continue;
++		}
++		struct recount_usage u = { 0 };
++		uint64_t idle = 0;
++		recount_processor_usage(&p->pr_recount, &u, &idle);
++		uint64_t b = u.ru_user_time_mach + u.ru_system_time_mach;
++		uint64_t db = b - nt_cpu[i].busy, di = idle - nt_cpu[i].idle;
++		busy[i] = (uint32_t)(db + di ? db * 100 / (db + di) : 0);
++		irq[i] = (uint32_t)((cd->cpu_stat.irq_ex_cnt - nt_cpu[i].irq) * 1000 / ms);
++		tmr[i] = (uint32_t)((cd->cpu_stat.timer_cnt - nt_cpu[i].timer) * 1000 / ms);
++		ipi[i] = (uint32_t)((cd->cpu_stat.ipi_cnt - nt_cpu[i].ipi) * 1000 / ms);
++		nt_cpu[i].busy = b;
++		nt_cpu[i].idle = idle;
++		nt_cpu[i].irq = cd->cpu_stat.irq_ex_cnt;
++		nt_cpu[i].timer = cd->cpu_stat.timer_cnt;
++		nt_cpu[i].ipi = cd->cpu_stat.ipi_cnt;
++	}
++
++	bzero(tab, NT_SLOTS * sizeof(*tab));
++	bzero(tasks, sizeof(tasks));
++	lck_mtx_lock(&tasks_threads_lock);
++	thread_t th;
++	queue_iterate(&threads, th, thread_t, threads) {
++		uint64_t now_t = recount_thread_time_mach(th), tid = th->thread_id;
++		bool found;
++		uint64_t was = nt_prev(old, tid, &found);
++		uint64_t delta = found && now_t >= was ? now_t - was : (found ? 0 : now_t);
++		nt_put(tab, tid, now_t);
++		nthreads++;
++		if (!print || delta == 0) {
++			continue;
++		}
++		task_t task = get_threadtask(th);
++		uint32_t k;
++		for (k = 0; k < ntasks && tasks[k].task != task; k++) {
++			;
++		}
++		if (k < ntasks) {
++			tasks[k].sum += delta;
++		} else if (ntasks < NT_TASKS) {
++			tasks[ntasks].task = task;
++			tasks[ntasks++].sum = delta;
++		}
++		for (int i = 0; i < NT_TOP; i++) {
++			if (delta > top[i].delta) {
++				for (int j = NT_TOP - 1; j > i; j--) {
++					top[j] = top[j - 1];
++				}
++				top[i].th = th;
++				top[i].delta = delta;
++				top[i].tid = tid;
++				break;
++			}
++		}
++	}
++	/* still under the lock: the threads in top[] are on the list (review: no bzero(tasks) here, it cleared the sums) */
++	for (int i = 0; i < NT_TOP; i++) {
++		thr[i][0] = 0;
++		if (top[i].th == THREAD_NULL) {
++			continue;
++		}
++		thread_t t = top[i].th;
++		task_t task = get_threadtask(t);
++		char who[48], tn[MAXTHREADNAMESIZE] = "";
++		nt_name(task, who, sizeof(who));
++		thread_get_thread_name(t, tn);
++		at = snprintf(thr[i], sizeof(thr[i]), "NEGRONI TOP thr %llu.%llu%% %s tid %llu \"%s\" st 0x%x",
++		    nt_pct10(top[i].delta, window_abs) / 10, nt_pct10(top[i].delta, window_abs) % 10, who, top[i].tid,
++		    tn, t->state);
++		if (task == kernel_task && t != current_thread()) {
++			/*
++			 * A blocked kernel thread: its saved lr, then the frame chain (as the 0360 BT dump).
++			 * Review: read under the thread lock at splsched. A thread with TH_RUN clear cannot be
++			 * unblocked (thread_go needs this lock), so it keeps its kernel stack while we read it;
++			 * without the lock it could run, hand off its stack and stack_collect could unmap it.
++			 */
++			uint64_t fr[1 + NT_FRAMES];
++			int nfr = 0;
++			spl_t s = splsched();
++			thread_lock(t);
++			if (t->kernel_stack != 0 && !(t->state & TH_RUN)) {
++				thread_kernel_state_t ks = (thread_kernel_state_t)t->machine.kstackptr;
++				uint64_t base = t->kernel_stack, topa = base + kernel_stack_size;
++				uint64_t fp = ks->machine.ss.fp;
++				fr[nfr++] = ks->machine.ss.lr;
++				for (int f = 0; f < NT_FRAMES && fp >= base && fp + 16 <= topa && (fp & 7) == 0; f++) {
++					uint64_t next = ((uint64_t *)fp)[0];
++					fr[nfr++] = ((uint64_t *)fp)[1];
++					if (next <= fp) {
++						break;
++					}
++					fp = next;
++				}
++			}
++			thread_unlock(t);
++			splx(s);
++			for (int f = 0; f < nfr && at < 260; f++) {
++				at += snprintf(thr[i] + at, sizeof(thr[i]) - at, f ? " 0x%llx" : " lr 0x%llx",
++				    (uint64_t)VM_KERNEL_UNSLIDE(fr[f]));
++			}
++		}
++	}
++	/* process names under the lock too (the tasks are alive while their threads are listed) */
++	at = snprintf(procs, sizeof(procs), "NEGRONI TOP procs (%u threads):", nthreads);
++	for (int n = 0; n < NT_PROCS && print; n++) {
++		uint32_t best = NT_TASKS;
++		for (uint32_t k = 0; k < ntasks; k++) {
++			if (tasks[k].sum != 0 && (best == NT_TASKS || tasks[k].sum > tasks[best].sum)) {
++				best = k;
++			}
++		}
++		if (best == NT_TASKS) {
++			break;
++		}
++		char who[48];
++		nt_name(tasks[best].task, who, sizeof(who));
++		uint64_t p10 = nt_pct10(tasks[best].sum, window_abs);
++		at += snprintf(procs + at, sizeof(procs) - at, "%s %s %llu.%llu%%", n ? "," : "", who, p10 / 10, p10 % 10);
++		tasks[best].sum = 0;
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	nt_cur ^= 1;
++	if (!print) {
++		return;
++	}
++
++	at = snprintf(line, sizeof(line), "NEGRONI TOP %llu s dark %d: busy%%", ms / 1000,
++	    __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE));
++	for (unsigned i = 0; i < ncpu; i++) {
++		at += snprintf(line + at, sizeof(line) - at, " %u", busy[i]);
++	}
++	at += snprintf(line + at, sizeof(line) - at, " | irq/s");
++	for (unsigned i = 0; i < ncpu; i++) {
++		at += snprintf(line + at, sizeof(line) - at, " %u", irq[i]);
++	}
++	at += snprintf(line + at, sizeof(line) - at, " | timer/s");
++	for (unsigned i = 0; i < ncpu; i++) {
++		at += snprintf(line + at, sizeof(line) - at, " %u", tmr[i]);
++	}
++	at += snprintf(line + at, sizeof(line) - at, " | ipi/s");
++	for (unsigned i = 0; i < ncpu; i++) {
++		at += snprintf(line + at, sizeof(line) - at, " %u", ipi[i]);
++	}
++	printf("%s\n", line);
++	printf("%s\n", procs);
++	for (int i = 0; i < NT_TOP; i++) {
++		if (thr[i][0]) {
++			printf("%s\n", thr[i]);
++		}
++	}
++}
++
++__attribute__((noreturn)) static void
++nt_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static int chan;
++	uint64_t last = mach_absolute_time();
++
++	nt_window(0, false);    /* the base of the first window */
++	for (;;) {
++		assert_wait_timeout((event_t)&chan, THREAD_UNINT, nt_secs, NSEC_PER_SEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		uint64_t now = mach_absolute_time();
++		nt_window(now - last, true);
++		last = now;
++	}
++}
++
++/* NegroniCPU.cpp, once all CPUs run (thread context). */
++void
++negroni_top_start(void)
++{
++	static bool started;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	PE_parse_boot_argn("negronitop", &nt_secs, sizeof(nt_secs));
++	if (nt_secs == 0) {
++		printf("NEGRONI TOP: off (negronitop=0)\n");
++		return;
++	}
++	if (nt_secs < 5) {
++		nt_secs = 5;
++	}
++	for (int i = 0; i < 2; i++) {
++		nt_tab[i] = kalloc_data(NT_SLOTS * sizeof(struct nt_ent), Z_WAITOK | Z_ZERO);
++		if (nt_tab[i] == NULL) {
++			printf("NEGRONI TOP: no memory\n");
++			return;
++		}
++	}
++	if (kernel_thread_start(nt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("NEGRONI TOP: a line set every %u s (negronitop; 0 = off)\n", nt_secs);
++	}
++}
++#endif /* NEGRONI */
