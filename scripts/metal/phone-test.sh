@@ -39,9 +39,14 @@ push)
   if tar -tzf "$T/metal.tgz" | grep -Eq '(^|/)$|^var/|^\./'; then echo "push: archive has directory or var/ entries" >&2; exit 1; fi
   "$SSHP" push "$T/metal.tgz" /private/var/tmp/metal.tgz
   rm -rf "$T"
-  # keep an existing clients/env on the phone; the probes and the bundle are replaced
+  # keep an existing clients/env on the phone; the probes and the bundle are replaced.
+  # Each file is unlinked first, so the new one is a new inode: a signed Mach-O written over the old inode can keep
+  # the old code signature on the cached vnode, and every process that maps it then gets cs_invalid_page and loses
+  # CS_VALID (2026-10-27 18:44: SpringBoard/backboardd after a Metal push; tccd then treated SpringBoard as
+  # unverified and its Motion request crashed it; docs/camera-ios-2026-10-27.md section 13).
   run 'cd / && [ -L /var ] || { echo "/var is not a symlink: stop"; exit 1; };
        mkdir -p /var/db/negronimetal && cp -p /var/db/negronimetal/clients /var/tmp/clients.keep 2>/dev/null;
+       tar -tzf /private/var/tmp/metal.tgz | while read -r f; do rm -f "/$f"; done;
        tar -xzpf /private/var/tmp/metal.tgz -C / && rm /private/var/tmp/metal.tgz;
        [ -f /var/tmp/clients.keep ] && mv /var/tmp/clients.keep /var/db/negronimetal/clients;
        mkdir -p /var/db/negronimetal/cache /var/db/negronimetal/strikes && chmod 1777 /var/db/negronimetal/cache /var/db/negronimetal/strikes;
