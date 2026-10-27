@@ -308,10 +308,10 @@ and `docs/ru/cellular.md` [V for SM7325, I for SM8450]:
 |---|---|
 | `userland/location/negroni-locd.m` | the daemon/CLI (Objective-C, ARC; CoreLocation by `dlopen`, classes by name) |
 | `userland/location/entitlements.plist` | `platform-application`, `com.apple.private.security.no-sandbox`, `com.apple.locationd.simulation` [V], `com.apple.locationd.authorizeapplications` [V, for `enable`/`disable`, section 6.1], `com.apple.locationd.status` (not needed by the SPI; kept, Preferences.app has it too) |
-| `userland/location/com.iosplus10.negroni-locd.plist` | launchd job `listen 5155`; not loaded unless `LOCD_JOB=1`; `KeepAlive` = `SuccessfulExit` false (`stop` and a missing CoreLocation class exit 0, so no restart loop) |
+| `userland/location/com.iosplus10.negroni-locd.plist` | launchd job `gnss` (section 7.4; was `listen 5155`), as root; added by default (`LOCD_JOB=0` = no job); `KeepAlive` = `SuccessfulExit` false (`stop` and a missing CoreLocation class exit 0, so no restart loop) |
 | `userland/location/build.sh` | build + checks + ad hoc sign -> `out/location/userland/` |
-| `scripts/location/phone-location.sh` | live phone over SSH: push, remove, set, hold, listen, stream, stop, enable, disable, status, log |
-| `scripts/location/root-add-locd.sh` | root image hook: `LOCD=1` (binary), `LOCD_JOB=1` (launchd job); `root-finish.sh` calls it (default off); `root-update.sh` hook `location` |
+| `scripts/location/phone-location.sh` | live phone over SSH: push, remove, set, hold, listen, gnss, stream, stop, enable, disable, status, log |
+| `scripts/location/root-add-locd.sh` | root image hook: binary + `gnss` launchd job, default on (kill switches `LOCD=0`, `LOCD_JOB=0`); `root-finish.sh` calls it (on when `out/location/userland/negroni-locd` is built); `root-update.sh` hook `location` |
 | `scripts/ios16/root-tweaks-extra.py` item 7 | L0 switch key in the root (default on since section 6; `LOCATION_SWITCH=0` leaves the root as is) |
 
 `negroni-locd` commands (options before the command):
@@ -358,7 +358,8 @@ as it is (log line `location: off: LOCATION_SWITCH=0, ...`). A root change needs
 5. Stream from the Mac: `scripts/location/phone-location.sh stream LAT LON 10` (Ctrl-C ends the Mac side),
    or `phone-location.sh listen` and own UDP lines to 192.168.7.2:5155.
 6. `scripts/location/phone-location.sh stop`; the dot goes away (or stays as the last known fix [I]).
-7. Boot test (optional, later): a root with `LOCD=1 LOCD_JOB=1` (and `LOCATION_SWITCH=1`) starts the listener.
+7. Boot test (optional, later): a default root (LOCD, LOCD_JOB, LOCATION_SWITCH on) starts the `gnss` job (section 7.4);
+   the UDP listener is manual (`phone-location.sh listen`).
 
 ### 5.5 Risks
 
@@ -487,3 +488,37 @@ locd=12.9716000 77.5946000 7.50 920.50 12.00 0.10 -1
   values, QMI TLV bounds, TFTP paths, the FAT reader = Python reader on 10 files of `out/firmware/modem/modem.img`).
 - [U] Everything on the phone. The biggest unknowns: the RMTFS buffer place (0xa8000000) and its memory assign, the
   modem's mode for GNSS without ONLINE, the IPA. See README-gnss.md "Risks".
+
+### 7.4 negroni-locd `gnss` mode (2026-10-27, location userland agent; Mac build, host test, one foreground run on the phone)
+
+- `negroni-locd gnss` (`userland/location/negroni-locd.m`, `cmd_gnss`): opens `/dev/negroni_gnss` once (fallback:
+  `sysctl kern.negroni_gnss`, which is not demand, logged once), `pread(fd, buf, 1024, 0)` once per second, parses
+  line 1 (`state=`, `reason=`), line 2 (`fix=` number) and line 3 (`locd=`, 7 fields, through `parse_fix()`).
+  A new `fix=` number with a valid `locd=` line -> `fix_deliver()` (the same simulation path as L1). A bad `locd=` line
+  is logged and dropped.
+- No stale positions: locationd repeats the last simulated location every second, so the daemon calls `sim_stop()`
+  when `locd=` goes away (fix older than 3 s in the kernel), when one `fix=` number stays for more than 3 s on our
+  monotonic clock, or when the state leaves `on`.
+- Self-check (no-probes rule): no device and no sysctl (kernel without 0397) -> one line
+  `negroni-locd: gnss: off: no /dev/negroni_gnss`; `state=off` -> `negroni-locd: gnss: off: <kernel reason>` (e.g.
+  `negronignss=0` from the sysctl when the kill switch removes the device). Then a re-check every 60 s (one read;
+  the process stays, so launchd does not restart it). A new or changed reason gives one new line. `state=starting`
+  -> one line, reads every 1 s (the kernel needs ~20 s + modem start). `state=on` -> one line `gnss: on (...)`, then
+  `gnss: fix N: ...` for the first fresh fix after a gap and `gnss: N fixes in the last 600 s` as a summary.
+- The launchd job `com.iosplus10.negroni-locd` runs `negroni-locd gnss` as root (`UserName root`; the device is
+  root:wheel 0440). `scripts/location/root-add-locd.sh` adds it by default (`LOCD=0`, `LOCD_JOB=0` are the kill switches).
+  `root-finish.sh` turns LOCD on when the binary is built (like METAL/CAMERA).
+- Dev modes stay: `set`, `hold`, `listen` (UDP), `stop`. `phone-location.sh listen|hold|gnss` first runs `stop`, which
+  ends the boot job (exit 0 on SIGTERM, so launchd does not restart it until the next boot). `phone-location.sh gnss`
+  starts the gnss mode in the background by hand.
+- [V] `userland/location/build.sh` passes (no warnings, arm64, minos 16.0, entitlements). [V] host test (macOS build
+  with the device path pointed at a text file): no file -> `gnss: off: no <path>`; `state=starting` -> one line;
+  `state=on` + `fix=1` + `locd=` -> `gnss: on`, first fix line; the same `fix=` for > 3 s -> `simulation stopped`;
+  `locd=99 ...` -> `bad locd= line ignored`; `state=off reason=step 12 ...` -> `gnss: off: step 12 ...`; SIGTERM ->
+  `gnss: ended`. [V] root hook on a fake root: job `/usr/local/bin/negroni-locd gnss` in launchd.plist; `LOCD=0`
+  and `LOCD_JOB=0` print one `off:` line.
+- [V] Live phone (kernel t29, no 0397; binary pushed with `phone-location.sh push`, sha256 365fb813..., run once in the
+  foreground, no launchd job, no reboot): `negroni-locd: gnss: off: no /dev/negroni_gnss`, then SIGTERM after 4 s ->
+  `gnss: ended`, exit 0 (the 60 s re-check sleep ends at once on a signal).
+- [I] Power: the job reads every second for as long as the kernel is `on`, so the LOC session (GNSS engine) runs all
+  the time. A later step: read only while locationd has a client that wants a fix (no signal for that is known yet).

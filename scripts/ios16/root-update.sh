@@ -53,7 +53,7 @@ for h in $hooks; do
     bt)        BT=1 sh "$REPO/scripts/bt/root-add-bt.sh" "$R" ;;
     camera)    CAMERA=1 sh "$REPO/scripts/camera/root-add-camera.sh" "$R" ;;
     fpd)       FPD=1 sh "$REPO/scripts/fp/root-add-fpd.sh" "$R" ;;
-    location)  LOCD=1 sh "$REPO/scripts/location/root-add-locd.sh" "$R" ;;   # LOCD_JOB=1 also adds the launchd job
+    location)  LOCD=1 sh "$REPO/scripts/location/root-add-locd.sh" "$R" ;;   # with the gnss launchd job (LOCD_JOB=0: binary only)
     tweaks)    python3 "$REPO/scripts/ios16/root-tweaks-extra.py" "$R" --migration "${MIGRATION:-skip}" ;;
   esac
 done

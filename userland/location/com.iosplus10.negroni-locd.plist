@@ -7,8 +7,7 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/local/bin/negroni-locd</string>
-		<string>listen</string>
-		<string>5155</string>
+		<string>gnss</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

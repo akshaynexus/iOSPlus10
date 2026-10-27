@@ -22,8 +22,9 @@
 #     BlueTool job -> /usr/libexec/negroni-bluetool, hcitest (docs/bluetooth-plan.md section 4)
 # 1j. fingerprint glyph daemon negroni-fpd: scripts/fp/root-add-fpd.sh (FPD=1; default off): kern.negroni_fp_ui from
 #     the SpringBoard lock state (patches/xnu/README-fingerprint.md "0354")
-# 1l. negroni-locd (simulated positions into locationd): scripts/location/root-add-locd.sh (LOCD=1; default off;
-#     LOCD_JOB=1 also adds its launchd job). The Location Services switch: root-tweaks-extra.py item 7
+# 1l. negroni-locd (positions into locationd; launchd job `gnss` = kernel GNSS fixes of patch 0397):
+#     scripts/location/root-add-locd.sh (LOCD=1; default on when out/location/userland/negroni-locd is built,
+#     LOCD=0 to leave it out; LOCD_JOB=0 = binary only). The Location Services switch: root-tweaks-extra.py item 7
 #     (default on; LOCATION_SWITCH=0 leaves it off). docs/location-plan.md
 # 1k. Camera: NegroniCamera.driver (capture plug-in for the stock Camera.app) + MobileGestalt cache cleared:
 #     scripts/camera/root-add-camera.sh (CAMERA=1; default on when out/camera/ios/NegroniCamera.driver is built,
@@ -54,7 +55,8 @@ BT=${BT:-0} sh "$REPO/scripts/bt/root-add-bt.sh" "$R"   # Bluetooth userland (do
 if [ -z "${CAMERA:-}" ] && [ -f "$REPO/out/camera/ios/NegroniCamera.driver/NegroniCamera" ]; then CAMERA=1; fi
 CAMERA=${CAMERA:-0} sh "$REPO/scripts/camera/root-add-camera.sh" "$R"   # Camera.app capture plug-in (userland/camera/README.md)
 FPD=${FPD:-0} sh "$REPO/scripts/fp/root-add-fpd.sh" "$R"   # fingerprint lock-screen glyph daemon (patch 0354)
-LOCD=${LOCD:-0} sh "$REPO/scripts/location/root-add-locd.sh" "$R"   # simulated positions (docs/location-plan.md L1)
+if [ -z "${LOCD:-}" ] && [ -f "$REPO/out/location/userland/negroni-locd" ]; then LOCD=1; fi
+LOCD=${LOCD:-0} sh "$REPO/scripts/location/root-add-locd.sh" "$R"   # negroni-locd gnss job (docs/location-plan.md 7)
 
 n=0
 for app in "$R"/private/var/staged_system_apps/*.app; do

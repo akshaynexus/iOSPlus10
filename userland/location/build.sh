@@ -5,7 +5,7 @@
 #   userland/location/build.sh      (seconds; no tmux needed)
 # Output (out/location/userland/):
 #   negroni-locd                       arm64, minos 16.0, ad hoc signed with entitlements.plist
-#   com.iosplus10.negroni-locd.plist   launchd job (listen on UDP 5155); not loaded unless a root hook adds it
+#   com.iosplus10.negroni-locd.plist   launchd job (negroni-locd gnss, as root); scripts/location/root-add-locd.sh adds it
 #   SHA256SUMS
 # Same toolchain as userland/camera and userland/fp. CoreLocation is opened with dlopen at run time, so the
 # binary links only Foundation and libobjc (no CoreLocation class symbol).

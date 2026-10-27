@@ -6,10 +6,14 @@
 #   scripts/location/phone-location.sh set LAT LON [ACC]   one position (ACC m, default 10)
 #   scripts/location/phone-location.sh hold LAT LON [ACC]  the same; a background process sends it again every 1 s
 #   scripts/location/phone-location.sh listen          background UDP listener on 192.168.7.2:5155
+#   scripts/location/phone-location.sh gnss            background GNSS source (kernel patch 0397, /dev/negroni_gnss;
+#                                                      the boot job runs the same; without 0397 one "gnss: off:" line)
 #   scripts/location/phone-location.sh stream LAT LON [ACC] [SEC]
 #                                                      listener + send the position from this host every SEC s
 #                                                      (default 1) until Ctrl-C (the Mac side of "listen")
-#   scripts/location/phone-location.sh stop            end the listener/hold process, stop the simulation
+#   scripts/location/phone-location.sh stop            end the gnss/listen/hold process, stop the simulation
+#                                                      (listen/hold/gnss end the running one first; the boot job
+#                                                      exits 0 and launchd does not restart it until the next boot)
 #   scripts/location/phone-location.sh enable|disable  Location Services switch through CoreLocation (L0 fallback)
 #   scripts/location/phone-location.sh status          switch state, listener pid, the daemon log tail
 #   scripts/location/phone-location.sh log             live unified log of locationd + negroni-locd
@@ -17,7 +21,7 @@
 # 192.168.7.2:5155 from 192.168.7.1 (format: docs/location-plan.md section 6.4),
 # e.g. printf '48.8584 2.2945 10\n' | nc -u -w0 192.168.7.2 5155
 # The root is mounted writable (rootrw=1). Needs userland/location/build.sh output and scripts/net/ssh-phone.sh.
-# Never writes a partition. Nothing here starts at boot (root hook: scripts/location/root-add-locd.sh).
+# Never writes a partition. Nothing here starts at boot (the boot job comes from scripts/location/root-add-locd.sh).
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SSH=$REPO/scripts/net/ssh-phone.sh
@@ -49,6 +53,8 @@ hold)
   nums "$@"; need; ph "$BIN stop >/dev/null 2>&1; $BIN -b hold $*" ;;
 listen)
   need; ph "$BIN stop >/dev/null 2>&1; $BIN -b listen $PORT" ;;
+gnss)
+  need; ph "$BIN stop >/dev/null 2>&1; $BIN -b gnss" ;;
 stream)
   shift; [ $# -ge 2 ] || { echo "usage: $0 stream LAT LON [ACC] [SEC]" >&2; exit 2; }
   lat=$1; lon=$2; acc=${3:-10}; sec=${4:-1}
@@ -65,5 +71,5 @@ status)
   need; ph "$BIN status; echo '--- $LOGF (last 20 lines)'; tail -n 20 $LOGF 2>/dev/null || echo 'no log yet'" ;;
 log)
   exec "$REPO/scripts/net/phone-log.sh" locationd negroni-locd ;;
-*) sed -n 2,20p "$0"; exit 2 ;;
+*) sed -n 2,24p "$0"; exit 2 ;;
 esac
