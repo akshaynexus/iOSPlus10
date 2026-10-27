@@ -22,6 +22,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | `external/hackios-xnu-kernel` & XNU patches | Apple Inc. | Apple Public Source License (APSL) 2.0 |
 | `userland/negronigl/` (Mesa integration / freedreno) | Mesa contributors, Rob Clark | MIT |
 | Linux kernel drivers (ath11k / Qualcomm) | Qualcomm Technologies Inc., Linux Foundation | BSD-3-Clause-Clear |
+| seemoo-lab/owl (port in `patches/xnu/0347-negroni-awdl.patch`: `bsd/dev/negroni_awdl_owl.{c,h}`) | The Open Wireless Link Project, Milan Stute | GPL-3.0-or-later |
 
 ---
 
@@ -344,3 +345,21 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON A
 IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
+
+---
+
+## 8. GNU GPL v3.0 (OWL, AWDL engine)
+
+`patches/xnu/0347-negroni-awdl.patch` adds `bsd/dev/negroni_awdl_owl.c` and `bsd/dev/negroni_awdl_owl.h`, a kernel port of
+OWL (https://github.com/seemoo-lab/owl, commit `0ee3263f944ea721c355f826aa90d636d012a512`; reference repo in
+`external/owl`, pinned in `scripts/setup/get-references.sh`).
+
+```
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright (C) 2018  The Open Wireless Link Project
+Copyright (C) 2018  Milan Stute
+```
+
+The complete GNU General Public License v3.0 text is in `LICENSES/GPL-3.0.txt` (copied from OWL's `COPYING`).
+A kernel built with patch 0347 contains this GPL-3.0 code; the kill switch `negroniawdl=0` turns it off at run time
+but does not remove it from the binary.

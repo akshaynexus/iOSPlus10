@@ -501,3 +501,19 @@ Host test (macOS/Linux, seconds): `scripts/kernel/test-bt-shim.sh TREE` (TREE fr
    locally with 0x0c while advertising is on.
 4. A deferred (F5) command counts twice in n_tx/b_tx.
 Regression ideas for tools/bt-shim-test: 31-byte report (F1), multi-report events, malformed events.
+
+## AirDrop and Bluetooth (2026-10-27, AirDrop agent; no Bluetooth change)
+
+AirDrop discovery uses BLE: sharingd sends and scans AirDrop advertisements through bluetoothd, then starts AWDL
+(plan: docs/airdrop-plan.md). What the Bluetooth side has for it now: LE scanning works (0338 extended -> legacy
+reports); legacy advertising commands 0x2006/0x2008/0x2009/0x200a are translated to the extended set 0 (0338).
+Not checked yet [U]: whether sharingd/bluetoothd start an AirDrop advertisement on this phone, and random-address
+handling (0x2005 while advertising, open item 3 above).
+Test later with the AWDL steps: `lext:` lines with 0x2036/0x2039 while the share sheet is open.
+
+Update (patch 0347, AWDL engine): the AWDL side now exists (in-kernel engine on the WCN6855, patches/xnu/README-wifi.md
+"0347"). So the two halves of AirDrop discovery are both present in code: BLE advertise/scan (the Bluetooth shim, 0338)
+and AWDL (0347). The chain still to prove on the phone [U]: sharingd sends the BLE AirDrop advertisement -> the peer
+starts AWDL -> both sides on `awdl0` with IPv6 link-local -> mDNS `_airdrop._tcp` -> HTTPS transfer. The engine sends PSF
+on channel 6 only while en0 is idle; a nearby Apple device must hold its AirDrop sheet open (its AWDL active) for the two
+to meet. No Bluetooth change in 0347.

@@ -1399,3 +1399,85 @@ configd 20H392 InterfaceNamer:
 2. Kernel log: `wifid gets 19 (POWER)` and `exec wifianalyticsd` within ~5 s of `exec wifid`, in every boot (try 4+ boots).
 3. Phone log configd: `timed out waiting for IOKit to quiesce` about 10 s after configd start.
 4. Settings > Wi-Fi opens the list at once.
+
+## 0347: AWDL engine for AirDrop (boot-arg `negroniawdl`, default on) (2026-10-27, AirDrop agent)
+
+Plan, sources and the ranking of the paths: [docs/airdrop-plan.md](../../docs/airdrop-plan.md). This grew the earlier
+read-only probe into the real in-kernel AWDL engine (path A). Files:
+- `bsd/dev/negroni_awdl_owl.{c,h}` (new, **GPL-3.0-or-later**): a kernel port of seemoo-lab/owl, pin
+  `0ee3263f944ea721c355f826aa90d636d012a512` (`src/{frame.h,state.h,sync.c,election.c,schedule.c,channel.c,tx.c,rx.c,peers.c}`).
+  SPDX + the GPL copyright in each file. Ported: the sync math, the master election, the PSF/MIF frame build and the RX
+  TLV parse. Our changes: no malloc (a fixed 32-peer table), the clock is a parameter, frames are built/parsed with
+  explicit little-endian byte accessors (no casts to packed structs). GPL is allowed here per the owner decision
+  (airdrop-plan "License note"); the full GPL-3.0 text lives in `external/owl/COPYING`.
+- `bsd/dev/negroni_awdl.{c,h}` (APSL, our glue): boot-arg, RX classification (bit 0), the awdl0 observer (bit 1), and the
+  engine (bit 2) on the Wi-Fi driver thread.
+- hooks in `negroni_wlan_wmi.c` (`negroni_awdl_roc`/`_roc_stop`/`_mgmt_tx`; `negroni_awdl_wmi_event` in the event
+  dispatch for our MGMT_TX_COMPLETION; `negroni_awdl_scan_event` in the scan-event loop), `negroni_wlan_sta.c`
+  (`negroni_awdl_service()` once per keep-alive pass), `negroni_wlan_ios.c` and `NegroniWLAN.cpp` (as the probe),
+  `bsd/conf/files` (two lines).
+
+| `negroniawdl` | What |
+|---|---|
+| 0 | off: the kill switch (no line beyond `off`, no interface, no frame) |
+| unset | **default = 7** (RX + awdl0 + engine) |
+| bit 0 (1) | WMI service bits + classify every `WMI_MGMT_RX` management frame (read only) |
+| bit 1 (2) | `awdl0` (IFEF_AWDL) + IOService `NegroniAWDL` (`IO80211VirtualInterfaceRole` = `AirLink`), made **only after the first received AWDL frame** proves the firmware passes AWDL frames to the host |
+| bit 2 (4) | the engine: park on channel 6, TX PSF (110 TU)/MIF, election, sync, peer table |
+
+### How the engine runs
+- One pass per keep-alive loop, from `negroni_wlan_sta_service` (driver thread; may send WMI). It runs **only while en0 is
+  idle** (`NWLAN_STATE_IDLE` and not scanning); if en0 is scanning/joining/connected it stops the remain-on-channel scan
+  and returns, so **en0 never breaks**.
+- Radio: parks on channel 6 (2437 MHz) with a single-channel passive scan that carries the offchan-mgmt-tx flag and **our
+  own scan id** `0xa0d1` (en0 uses `0xa001`, so en0's scan handling is untouched). The window is re-armed while en0 stays idle.
+- TX: PSF/MIF action frames by `WMI_MGMT_TX_SEND` from **our own DMA slots**, desc ids `0x100+` (the join code uses 0..3).
+  A TX-completion hook clears the slot.
+- RX: AWDL action frames go to the OWL receive code (peer table, election).
+
+### Self-checks (NO PROBES rule: the feature proves itself or turns off and says why)
+- No `WMI_SERVICE_MGMT_TX_WMI` (76): engine off, one line `no WMI_SERVICE_MGMT_TX_WMI (76) ...`.
+- TX completions must succeed: 3 failures with no success turn the engine off with the last status.
+- `awdl0` + AirLink are made only after the first real AWDL RX (not on a timer).
+- Kill switch `negroniawdl=0`. The fake radio (`negroniwlan_ios=2`) keeps the engine inert.
+
+### wifip2pd
+`APPLE80211_IOC_AWDL_SYNC_ENABLED` (117) is answered (get = engine on/off; set = accepted). Every other
+`APPLE80211_IOC_AWDL_*` request is logged and gets a clean error — the work list for step 6 (the layouts are [U] until
+the 20H392 structs are confirmed from `out/research/airdrop/`).
+
+### Lines (all `NEGRONI AWDL: `)
+`on (negroniawdl=7: RX awdl0 engine)`; the service-bit line and RX classification as before; `first AWDL frame RX: the
+firmware passes AWDL frames to the host`; `awdl0 + AirLink IOService made after the first AWDL RX (...)`; `engine ready
+(self .., channel 6, PSF 110 TU)`; every 60 s `engine summary: N peers, TX S (ok, fail), RX action R; self .. master ..`;
+`engine OFF: <why> ...` on a self-check failure.
+
+### Build and test
+- **[V] compiles**: full local kernel build, `out/kernel/local-<UTC>/kernel.development.negroni` (path + sha256 in
+  docs/notes.md section 74).
+- **[U] runtime**: not run on the phone (no-phone task). The firmware [U]s stay open: does WCN6855 honour the
+  offchan-mgmt-tx scan and send our action frames (self-check 2 answers on the phone); does it pass foreign AWDL action
+  frames to the host (bit 0 answers); does wifip2pd bind awdl0.
+- Test steps: docs/airdrop-plan.md section 5, then watch for `engine ready` and `engine summary`, and `wdutil`/AWDL log
+  on a nearby Mac for our PSF on channel 6.
+
+### Review fixes (2026-10-27, Opus review; compile-one only, no full build yet)
+- [V code] **Radio hand-back was late.** `negroni_awdl_service()` ran after en0's scan start and after the join in
+  `negroni_wlan_sta_service`, so en0's START_SCAN / VDEV_START met our HIGH-priority ROC scan (en0's scan does not ask
+  for START_FAILED events, so a refused en0 scan waited 30 s). Fix: `negroni_awdl_yield()` (STOP_SCAN, then wait at most
+  300 ms for COMPLETED/DEQUEUED of scan id `0xa0d1`) before en0's scan start (`negroni_wlan_sta.c`) and before every
+  associate/disassociate (`negroni_wlan_join.c`). Line if no end event: `no end event of our ROC scan in 300 ms after STOP`.
+- [V ath11k wmi.h] **STOP_SCAN req_type was 1.** `WMI_SCAN_STOP_ONE` is `0x00000000`; requestor now matches our
+  `scan_req_id` (1).
+- ROC: one scan at a time (re-arm only after its end event, or 1.5 s after the window with no event); 1 s back-off after a
+  failed start; 10 failed starts in a row: `engine OFF: the firmware refuses the remain-on-channel scan ...`.
+- TX only after our scan STARTED. A slot with no completion for 1 s is freed (`tx_lost`); 8 lost and none completed:
+  `engine OFF: no TX completion from the firmware for our AWDL frames`.
+- awdl0 gate: with the engine bit, awdl0 + AirLink wait for both self-checks (first AWDL RX and one TX completion with
+  status 0). Line: `awdl0 + AirLink IOService made after the self-checks (first AWDL RX, first TX OK) (...)`.
+- The RX path ran only with bit 0, so `negroniawdl=4` or `6` never started. It now runs for every non-zero value
+  (the classification lines stay bit 0) and feeds the engine only after `negroni_awdl_start` (frames from the boot scan
+  came before the awdl0 MAC and the IO80211Controller existed).
+- OWL parse: the V2 election height is clamped, so `height + 1` cannot wrap past the tree-height check.
+- License: OWL entry + section 8 in `THIRD_PARTY_NOTICES.md`; full GPL-3.0 text in `LICENSES/GPL-3.0.txt`
+  (`external/owl` is git-ignored).
