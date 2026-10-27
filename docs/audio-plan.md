@@ -1,7 +1,8 @@
 # Audio plan (iOS 16.7.16 on the NE2211, SM8450)
 
-Status date: 2026-10-26 (evening). Audio does not work yet. Nothing in this plan ran on the phone yet except ADSP step 1.
-Newest work: section "Implemented 2026-10-26 evening: patches 0244-0248".
+Status date: 2026-10-27 (night). Audio does not work yet. **Read section "Status 2026-10-27 and patch 0400" first.**
+On the phone [V]: the ADSP starts, GLINK, QRTR, SPF ready and the PRM I2S clock request pass (3 boots); GRAPH_OPEN
+fails in 1 ms. Cause [I, strong]: a GLINK intent-request bug on our side, fixed in patch 0400 (not booted yet).
 
 Marks: **[V]** verified in code, DT, firmware or logs. **[I]** inference. **[U]** unknown.
 
@@ -10,6 +11,135 @@ Short source names below: `AK` = `out/src/op-modules/vendor/qcom/opensource/audi
 (mainline 5b0764a), `SPF` = `out/src/audioreach-graphservices/spf/api`, `AS` = `out/audio-src`
 (stock vendor/odm files, git-ignored). `scripts/audio/fetch-sources.sh` and
 `scripts/audio/extract-vendor-audio.sh` make them; `out/src/COMMITS.txt` has the commits.
+
+## Status 2026-10-27 and patch 0400 (audio agent; build-only, compile-check)
+
+### Phone results that were not in this plan [V: logs/bootlog-3.txt :2404-2937, bootlog-9.txt :2483-3209, bootlog-1.txt (t25) :2360-2704]
+
+Three boots with `negroniadsp=1 negroniadsp_step=15` (bootlog-3 2026-10-26 15:23; bootlog-9 = t19; bootlog-1 = t25) ran
+stage (b) and stopped at the same place:
+
+```
+NEGRONI ADSP: 8 THE ADSP IS UP after 27..35 ms
+NEGRONI ADSP: 9 GLINK UP after 0..9 ms            (IPCRTR + adsp_apps open, 8 intents of 4096 bytes given)
+NEGRONI AUDIO: 10 QRTR: HELLO from node 5, 8..13 NEW_SERVER packets (step 10 ok in ~3355 ms)
+NEGRONI AUDIO: 11 SPF READY                        (2 ms)
+NEGRONI AUDIO: 12 PRM clock up, I2S pins 121..124 to function 1 (ctl 0xc4 0xc4 0xc4 0xc4 at 0xf179000)
+NEGRONI AUDIO: 13 stop: GRAPH_OPEN failed (status 0xffffffff, 568 bytes)   (after 1 ms)
+NEGRONI ADSP: 13 watch: polling slave-kernel every 200 ms for FATAL       (the ADSP stays up, 0x6)
+```
+
+So the ADSP boot, GLINK, QRTR, the GPR transport, APM (SPF ready) and PRM (TER MI2S IBIT clock accepted, status 0)
+work on the phone. No servreg locator / PD mapper is needed for SPF ready. The amps (step 15) never ran.
+
+### GRAPH_OPEN "status 0xffffffff" is not an ADSP answer [V code, I cause]
+
+- `gpr_send_wait` starts with status `~0u` and returns the GLINK error without touching it: 0xffffffff = "not sent".
+  SPF status codes are 0..24 (`out/src/audioreach-engine/ar_osal/api/ar_osal_error.h`); 0xffffffff is none of them.
+- The 568-byte GRAPH_OPEN is the first GPR packet that is bigger than the ADSP's own (TX) intents (SPF state 40 bytes,
+  PRM 76 bytes passed). `gl_send` then sends RX_INTENT_REQ, waits for the ACK, polls once, and returns EAGAIN **with no
+  line** when the INTENT is not there yet. The ADSP sends the ACK and the INTENT in two FIFO writes. 1 ms total fits.
+- Linux waits for both: `qcom_glink_request_intent` waits for `intent_req_result == 0 || (intent_req_result > 0 &&
+  intent_received)` (`out/src/linux/drivers/rpmsg/qcom_glink_native.c:1438-1465`).
+- Other candidates (APM refuses the graph values) give a real SPF status; the 0400 lines tell them apart.
+
+### Patch 0400 `negroni-audio-graph-open-amp-park` (bsd/dev/negroni_adsp.c, negroni_audio.c, negroni_tfa.c/.h)
+
+| Part | What | Lines |
+|---|---|---|
+| GLINK intent wait | `gl_send`: after RX_INTENT_REQ wait up to 1 s until the ADSP refuses (answer 0) or a free ADSP intent of the size is there (the Linux rule). One line per request (first 6 granted, 12 in all), with the ADSP's intents of the channel | `NEGRONI ADSP: 13 GLINK: adsp_apps: intent request for 568 bytes: granted after N ms (answer 1; the ADSP's intents: 512 512u ...)`; on failure `... granted, but no INTENT came` / `refused` / `no answer` |
+| GPR error lines | a GLINK send error or a reply timeout is logged as such (max 8), not as a status | `NEGRONI AUDIO: N GPR: opcode 0x1001000 (568 bytes) not sent: GLINK error 35 (no ADSP intent for this size); no ADSP answer` |
+| GRAPH_OPEN fail line | errno vs SPF status with its name | `GRAPH_OPEN failed: not answered (errno N, ...)` or `GRAPH_OPEN failed: SPF status 2 (EBADPARAM), 568 bytes` |
+| TFA9874 boot park | every boot (ADSP on or off), 15 s after the UFS start, own thread: pins, reset pulse (active-high), revision of 0x34/0x35, status/MTP/R25C read only, then the container table (moved after the I2C check, so a missing `tfa-init.bin` no longer hides the I2C result). No register write; amps stay in their power-on state. The ADSP sink (step 15) reuses the result (retries only the table). Kill switch `negroniaudio_park=0` | `NEGRONI TFA: probe (boot park, UNTESTED): pins 48..51 at 0xf130000 ...`, `reset pulse on GPIO50/51 done; SDA 1 SCL 1`, `0x34 top (earpiece, left): TFA9874 revision 0x0?74 ...`, `probe done: 2 of 2 amps usable`, `park: amps answer and stay powered down until audio plays (negroniaudio_amp=0)`; off: `park: off: no TFA9874 answers on SE13 (GPIO48/49, 0x34/0x35) (errno 6); no amp register written`; amps answer but the table is bad: `park: amps answer; container table not usable (errno N), ...` |
+
+Compile check [V]: `scripts/kernel/compile-one.sh` on a full STAGE=0 tree (all patches/xnu up to 0399 + 0400):
+negroni_adsp.c 0 warnings, negroni_audio.c 3 and negroni_tfa.c 10 warnings, all of the old kinds (same counts before
+the change for negroni_tfa.c). `git apply --check` of 0400 on that tree: OK. Patch sha256
+9fa273dfaaf51b333f2fd72860750b5fb3d1ad3955351cb32d8cdb40b068a5c7. Not built in a full kernel, not booted, not reviewed.
+Scratch tree deleted.
+
+### End-to-end status (2026-10-27)
+
+| Stage | What exists | Tested | Missing |
+|---|---|---|---|
+| ADSP boot (PAS 1, SMP2P, handover) | 0240/0241/0248 | [V] phone: up in 27-35 ms, crash watch runs | default on (blocked by USB, below) |
+| ADSP side effect: USB | 0366/0368/0371-0375/0381/0385 | [V] t11-t25: the charger PD's TCPM/BC1.2 takes the HS PHY ~2.2 s after up; 0385 not booted | 0385 test; else Wi-Fi as the link (below) |
+| GLINK (SMEM, intents) | 0242 | [V] channels open; [V] big-packet bug (0400 fix [U]) | 0400 boot |
+| QRTR, PD/servreg | 0243 step 10 (HELLO, NEW_SERVER) | [V] node 5, services 15/24/43/51/66/769 | locator not needed for SPF ready [V] |
+| GPR + APM SPF ready | 0243 step 11 | [V] SPF READY | - |
+| PRM clock + I2S pins | 0243/0244 step 12 | [V] status 0, pins 0xc4; clock on the pins [U] | - |
+| AudioReach graph (WR_EP -> PCM_CNV -> MFC -> I2S_SINK TERT SD1) | 0243/0247 step 13 | [V] GRAPH_OPEN never got to the ADSP | 0400 boot; SET_CFG/PREPARE [U] |
+| Shared memory + START | 0243 step 14, 0249 (SMMU stage 1, SID 0x1801, IOVA 0x10000000) | [U] never ran; the s1 helper works for the camera [V notes 52] | needs `negroniaudio_smmu=1` (default 0 = physical ring, fails: RAM is above 4 GiB) |
+| LPASS DMA / LPAIF | the ADSP owns it (I2S sink module) | - | nothing on the APPS side |
+| Speaker amps 2x TFA9874 (I2C SE13 bit-bang) | 0244 (+0400 park) | [U] I2C never ran | T0 below |
+| Guard, tone, route, earpiece | 0244/0245/0246 | [V] host test of the guard only | - |
+| WCD938x, DMIC, headset, mic | nothing | - | weeks (SoundWire, TX macro, MBHC) |
+| XNU interface `/dev/negroni-audio` (S16LE 48 kHz write, volume, stats, route) | 0243 step 15 | [U] | - |
+| iOS HAL: NegroniAudio.driver (AudioServerPlugIn in mediaserverd) + VirtualAudio | userland/audio, root hook `AUDIO=1` / haptics hook | [V] loads in mediaserverd (2026-10-26 push); writes only when the node exists | receiver route from iOS [U] |
+| IOAudio family / AppleHAL kexts | not needed [I] (HackiOS plays through a plug-in + char dev) | - | - |
+
+### Is there an ADSP-free path? No practical one [V pins, I rest]
+
+- The TFA9874 is an I2S/TDM **slave**: it needs BCLK + WS from the SoC. GPIO121..124 have only the `mi2s2_*` functions
+  (124 also `sec_mi2s`, `audio_ref`) (`out/src/extra/pinctrl-sm8450.c:1534-1537`) [V]: no QUP/SPI function that could fake
+  I2S on these pins.
+- The MI2S/LPAIF block and its clocks are inside LPASS. On SM8450 Linux drives them only through the ADSP (q6prm clocks,
+  `sound/soc/qcom/qdsp6/q6prm-clocks.c`; I2S sink module); the APPS-driven `lpass-cpu` driver exists only for older SoCs
+  (sc7180/sc7280/apq8016/ipq806x) [I: not in our sparse clone]. Direct APPS programming of LPASS needs the LPASS core
+  power, the LPASS audio clock controller and XPU access that TrustZone gives the ADSP [U; high risk, weeks].
+- Bit-banged I2S from a CPU core (3.072 MHz BCLK, 6 M pin writes per second, no jitter for the amp PLL): not realistic.
+- What needs no ADSP: the amps' I2C control path (0400 park). So the ADSP is strictly needed for sound; the USB problem
+  must be solved or worked around, not avoided.
+
+### Shortest path to the first sound (ordered)
+
+1. Main session: build one kernel with 0400 (owner rule: one image at the end).
+2. **T0** (USB-safe, any normal test boot, ADSP off): read the 0400 park lines. Pass = `probe done: 2 of 2 amps usable`
+   (and no "no container table"). Fail -> fix I2C/reset first (cheap, no ADSP). "no container table" -> write the ADSP
+   area again (`mkadsparea.py` + `dd`, owner approval).
+3. **T1** (ADSP on, RAM boot, test plan below): GRAPH_OPEN -> PREPARE -> map -> START -> kernel tone through both
+   speakers. This is the first sound. It does not need live USB: the audio steps end ~6 s after ADSP up; the boot log
+   keeps every line across the 0371/0375 reboot (`make bootlog`).
+4. If GRAPH_OPEN still fails: the decision table below (out-of-band GRAPH_OPEN, graph values, PCM_DEC).
+5. iOS sound: a root with NegroniAudio.driver + VirtualAudio (`AUDIO=1` or the haptics hook) and the same boot-args:
+   the lock sound / key clicks reach `/dev/negroni-audio` (plug-in `kernel: ...` line every 30 s) -> speaker.
+6. Daily use: the ADSP must be on by default. Either 0385 keeps USB, or the session uses Wi-Fi (SSH over en0, which
+   works now) as the link and leaves out `negroniusb_lost_reboot`/`negroniusb_idle_reboot` [I]. Then the stage (b)
+   defaults go on with self-checks (each step failure = one `NEGRONI AUDIO: ... stop:` line, the ADSP stays up).
+
+Risks: GRAPH_OPEN refused for a graph reason (fix in hours, the status says which); no I2S clock at the amps (PRM clock
+attributes; `no CLKS after 100 ms`); no DONE (V2 opcode, SMMU); speaker damage (no NXP protection: guard -20 dBFS,
+TDMSPKG floors, 3 s silence off, panic off); USB loss makes every ADSP test a reboot cycle.
+
+### T1 test plan: ADSP-on RAM boot with 0385 + 0400
+
+Preconditions: kernel with 0400 (and 0385); battery > 50 %; good boot_a; `make usblog` running with the keepalive
+script; T0 passed. Phone away from the ear; listen from the Apple logo on.
+
+Boot-args (added to the test image's args; keep `negronipanic=30 negronipanicreason=2`):
+
+```
+negroniadsp=1 negroniadsp_step=15 negronichg_glink=1 negronichg_typec=3 negronichg_ulog=1
+negroniaudio_smmu=1 negroniaudio_amp=1 negroniaudio_tone=1
+negroniusb_lost_reboot=60 negroniusb_idle_reboot=90 negroniusb_datafix=0xb
+```
+
+Expected lines, in order (live log while USB lasts; else `make bootlog` after the reboot):
+
+| # | Line | Decision if absent / different |
+|---|---|---|
+| 1 | `NEGRONI TFA: ... probe done: 2 of 2 amps usable` (park, ~15 s after UFS; may come after step 15, then step 15 prints it) | T0 failure rules |
+| 2 | `NEGRONI ADSP: 8 THE ADSP IS UP after ~30 ms`, `9 GLINK UP` | as t25 (seen 3 times) |
+| 3 | `NEGRONI AUDIO: 11 SPF READY`, `12 PRM clock up ... 0xc4 0xc4 0xc4 0xc4` | as t25 |
+| 4 | `NEGRONI ADSP: 13 GLINK: adsp_apps: intent request for 568 bytes: granted after N ms (answer 1; the ADSP's intents: ...)` | `granted, but no INTENT came` / `refused` / `no answer` -> GLINK side: next work = GRAPH_OPEN out of band (payload in mapped shared memory + `mem_map_handle`, as GSL `gsl_graph.c:3197`; map a region before step 13) |
+| 5 | `NEGRONI AUDIO: 13 GRAPH_OPEN ok (568 bytes)` | `SPF status 2 (EBADPARAM)` -> retry with `negroniaudio_graph=1`; `19 (ENOTEXIST)`/`3 (EUNSUPPORTED)` -> module/param not in this firmware: add PCM_DEC before PCM_CNV (mainline order) |
+| 6 | `GRAPH SET_CFG and PREPARE ok` | `SET_CFG iid 0x600N pid 0x... failed (status N)` -> that module's param layout |
+| 7 | `ring ... -> ADSP address 0x110000000 (SMMU stage 1, SID 0x1801)`, `shared memory mapped: handle 0x...`, `GRAPH STARTED` | `ring ... not below 4 GiB` = `negroniaudio_smmu=1` missing; `gave no handle` -> SMMU lines / addr_msw |
+| 8 | `THE SPEAKER SINK IS LIVE`, `TONE: 1 kHz, 2 s, speaker, -20 dBFS ...`, `NEGRONI TFA: 0x34 ...: AMPE 1 ... MANSTATE 9`, same 0x35 | `no CLKS after 100 ms` = no I2S clock at the amps (graph runs but the sink does not clock: PRM clock attributes, pin function) |
+| 9 | `TONE done in ~2500 ms ... DONE 125`; **the owner hears 2 s of 1 kHz from both speakers** | `TONE stopped: no DONE` -> `negroniaudio_v2=1`, then the SMMU (fault lines) |
+| 10 | USB (0385): ~2.2 s after up `PHY change ...` (as t25), then `PHY re-init #1: UTMI overrides cleared ...`, `configured (1)`, en10 back | still lost -> 0371 reboot after 60 s into boot_a; read `make bootlog`; next suspect = the PD's Type-C state (0372 rails, ULOG) |
+
+Second run only if 1-9 pass: earpiece tone `negroniaudio_tone=2` (0x34 alone, receiver profile).
 
 ## Summary
 
@@ -556,6 +686,7 @@ The persistent log in userdata keeps the lines after a hang.
 | `scripts/audio/fetch-sources.sh` | sparse clones of the OnePlus/Linux/AudioReach sources -> `out/src/` |
 | `scripts/audio/extract-vendor-audio.sh` | stock vendor/odm audio files -> `out/audio-src/` (never commit) |
 | `patches/xnu/0240-negroni-adsp-boot.patch` | stage a kernel code, default off |
+| `patches/xnu/0400-negroni-audio-graph-open-amp-park.patch` | GLINK intent wait (GRAPH_OPEN), GPR error lines, TFA9874 boot park (`negroniaudio_park=0` kill switch) |
 
 Run on 2026-10-24 [V]: OTA modem.img sha256 `bcd07e89...f71e`, 29 files extracted (adsp.mdt,
 25 segments, 3 .jsn), `adsp-area.bin` 18.7 MB used of 32 MiB.
