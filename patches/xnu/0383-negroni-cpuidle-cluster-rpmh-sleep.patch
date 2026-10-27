@@ -1,0 +1,770 @@
+From: iOSPlus10 kernel agent (power)
+Subject: [PATCH] negroni cpuidle: OSI cluster states, RPMh sleep/wake sets, sleep stats (0383)
+
+Findings: every logged boot ran negronicpuidle=0 (WFI only). Under Gunyah a vCPU in WFI stays "active"
+for the PSCI aggregation (quic/gunyah-hypervisor psci_osi_handle_idle_yield), so no core, cluster or
+APSS power-down ever happened and the APSS RSC never sent a sleep set: CX and XO cannot drop.
+
+- negronicpuidle=3: SET_SUSPEND_MODE(OSI) at start (Linux psci_set_osi_mode; Gunyah gives the HLOS
+  FEATURES(CPU_SUSPEND) = 3); the last core passes the cluster param when the earliest deadline of all
+  cores fits the cluster residency (Linux genpd + cpuidle-psci-domain). DENIED -> 4 idles core-only.
+  If the switch fails, level 3 = level 2 (PC, each core asks, Gunyah aggregates).
+- llcc-off (cluster-e3) only with negronicpuidle_llcc=1 (default 0); l3-off with level >= 2.
+- Before any cluster param: negroni_rpmh_sleep_ready() (RPMh DRV idle, sets current; Linux
+  rpmh_rsc_pd_cb at the cluster PRE_OFF).
+- bsd/dev/negroni_rpmh.c: read-only dump of the 8 DRV2 TCS at first use; a cache of every ACTIVE vote;
+  negronirpmh_sleep (default 0 = never written): 1 = Linux rules (sleep != wake only: BCM keepalive
+  -> 0), 2 = + ARC level 0 / BCM 0 in sleep. SLEEP TCS 3-4, WAKE TCS 5-6 (live.dts qcom,tcs-config),
+  rewritten in thread context after each changed vote, WAKE first.
+- Read-only stats every 60 s (negronicpuidle_stats, default 7 at level >= 1; at level 0 only when
+  given): AOP rpmh-sleep-stats (aosd/cxsd/ddr count + time), DDR LPM counts, CPUSS C4/D4 counters.
+
+diff --git a/bsd/dev/negroni_rpmh.c b/bsd/dev/negroni_rpmh.c
+index 50a7c2f..25c410d 100644
+--- a/bsd/dev/negroni_rpmh.c
++++ b/bsd/dev/negroni_rpmh.c
+@@ -61,6 +61,15 @@ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+ static bool rh_poisoned;
+ 
++/*
++ * 0383: SLEEP and WAKE sets of this DRV (boot-arg negronirpmh_sleep, default 0 = never written). Forward
++ * declarations; the code is at the end of this file.
++ */
++#include <pexpert/pexpert.h>
++static void rh_sleep_init(void);
++static void rh_note_vote(uint32_t address, const uint32_t *offsets, const uint32_t *values, unsigned ncmd, int mode);
++static bool rh_keepalive;       /* negroni_rpmh_qup_bcm: this BCM vote is the keepalive minimum (Linux: sleep 0) */
++
+ static uint32_t
+ rh_read(vm_offset_t base, uint32_t off)
+ {
+@@ -152,6 +161,7 @@ rh_map(void)
+ 		printf("NEGRONI RPMH: unsupported/standalone cmd-db\n");
+ 		return EINVAL;
+ 	}
++	rh_sleep_init();        /* 0383: once: read-only TCS dump, sleep/wake set mode */
+ 	return 0;
+ }
+ 
+@@ -350,6 +360,7 @@ rh_send(uint32_t address, unsigned mv, int mode)
+ 	}
+ 	rh_poisoned = false;
+ 	printf("NEGRONI RPMH: ACTIVE vote for %#x complete\n", address);
++	rh_note_vote(address, offsets, values, ncmd, mode);     /* 0383: cache + SLEEP/WAKE sets */
+ 	return 0;
+ }
+ 
+@@ -764,6 +775,7 @@ negroni_rpmh_qup_bcm(const char *res, uint32_t avg_kbps, uint32_t peak_kbps, uin
+ 		uint64_t y = rh_bcm_div(rh_bcm_div((uint64_t)peak_kbps * width, buswidth) * vote_scale, unit);
+ 		if (x == 0 && y == 0) {
+ 			x = y = 1;      /* keepalive */
++			rh_keepalive = true;    /* 0383: Linux bcm-voter keepalive is AMC + WAKE only: sleep 0 */
+ 		}
+ 		x = MIN(x, 0x3fffull);
+ 		y = MIN(y, 0x3fffull);
+@@ -776,10 +788,265 @@ negroni_rpmh_qup_bcm(const char *res, uint32_t avg_kbps, uint32_t peak_kbps, uin
+ 		error = rh_send(address, data, RH_MODE_BCM);
+ 	}
+ out:
++	rh_keepalive = false;
+ 	if (error) {
+ 		printf("NEGRONI RPMH: BCM %s vote failed errno=%d\n", res, error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * 0383 (iOSPlus10): SLEEP and WAKE sets of the apps DRV 2, as Linux drivers/soc/qcom/rpmh.c (cache_rpm_request,
++ * _rpmh_flush, is_req_valid) and rpmh-rsc.c (rpmh_probe_tcs_config, tcs_invalidate, find_slots, __tcs_buffer_write).
++ *
++ * The RSC of this DRV has no HW solver (DRV_SOLVER_CONFIG bit 24 = 0: solver=0x4010100 on the phone), so the
++ * hardware sends the SLEEP TCS commands when the APSS goes to its deepest state (the cluster collapse) and the WAKE
++ * TCS commands when it comes back, before a CPU runs. Linux writes them at the cluster power-domain PRE_OFF
++ * (rpmh_rsc_pd_cb, live.dts rsc@17a00000 power-domains = cluster-pd). Here they are written at once in thread
++ * context, after every ACTIVE vote that changes the cache (under rh_lock; the APSS is awake then, so the hardware
++ * does not run them while we write). The idle path only asks negroni_rpmh_sleep_ready() (no MMIO writes).
++ *
++ * TCS layout: live.dts qcom,tcs-config = <2 3> <0 2> <1 2> <3 0> <4 1> = ACTIVE 3, SLEEP 2, WAKE 2, CONTROL 0,
++ * FAST_PATH 1, numbered in that order: TCS 0-2 ACTIVE, 3-4 SLEEP, 5-6 WAKE, 7 FAST_PATH; 16 commands per TCS.
++ *
++ * Linux puts a request into the sets only when its sleep value differs from its wake value (is_req_valid). Our votes:
++ *   VRM rails (touch, Wi-Fi, BT, USB PHY, camera): Linux qcom,set = 3 = the same value in both sets -> not written.
++ *   ARC levels (lcx/lmx/mmcx/mxc), BCM bandwidth: rpmhpd non-AO / icc tag ALWAYS = the same value -> not written,
++ *     except negronirpmh_sleep=2 (ours, not Linux): sleep = level 0 / bandwidth 0.
++ *   BCM keepalive-only vote (QUP x = y = 1 for 0 kBps): bcm-voter keepalive covers AMC + WAKE only -> sleep 0.
++ * WAKE = the ACTIVE value. Sleep commands are fire-and-forget, wake commands need a response (Linux send_single).
++ *
++ * Boot-arg negronirpmh_sleep: 0 (default) = the sets are never written (as before 0383); 1 = Linux rules above;
++ * 2 = + ARC level 0 and BCM 0 in sleep for every ARC/BCM vote of this DRV.
++ */
++#define RH_TCS_COUNT    8u
++#define RH_SLEEP_TCS0   3u
++#define RH_WAKE_TCS0    5u
++#define RH_FAST_TCS     7u
++#define RH_SW_N         2u              /* TCS per set */
++#define RH_CACHE_MAX    48u
++#define RH_MSG_FIRE     (8u | (1u << 16))               /* CMD_MSGID_LEN | CMD_MSGID_WRITE */
++#define RH_MSG_RESP     (8u | (1u << 8) | (1u << 16))   /* + CMD_MSGID_RESP_REQ */
++#define RH_BCM_SLEEP0   (1u << 30)                      /* BCM_TCS_CMD(commit, !valid, 0, 0): bcm-voter tcs_cmd_gen */
++
++enum { RH_K_SAME = 0, RH_K_ARC, RH_K_BCM, RH_K_KEEPALIVE };
++
++struct rh_entry {
++	uint32_t addr, wake;
++	uint8_t kind;
++};
++
++static struct rh_entry rh_cache[RH_CACHE_MAX];
++static unsigned rh_ncache;
++static uint32_t rh_sleep_mode;
++static bool rh_sleep_inited, rh_sw_ok, rh_sw_broken, rh_dirty;
++static uint32_t rh_flushes, rh_flush_fail, rh_nsleep, rh_cache_full, rh_busy_idle;
++
++bool negroni_rpmh_sleep_ready(void);
++void negroni_rpmh_sleep_log(void);
++
++static uint32_t
++rh_sleep_value(const struct rh_entry *e)
++{
++	switch (e->kind) {
++	case RH_K_KEEPALIVE:
++		return RH_BCM_SLEEP0;
++	case RH_K_BCM:
++		return rh_sleep_mode >= 2 ? RH_BCM_SLEEP0 : e->wake;
++	case RH_K_ARC:
++		return rh_sleep_mode >= 2 ? 0u : e->wake;
++	default:
++		return e->wake;
++	}
++}
++
++/* Once, under rh_lock, after the first good rh_map(): a read-only dump of all 8 TCS and the mode. */
++static void
++rh_sleep_init(void)
++{
++	if (rh_sleep_inited) {
++		return;
++	}
++	rh_sleep_inited = true;
++	(void)PE_parse_boot_argn("negronirpmh_sleep", &rh_sleep_mode, sizeof(rh_sleep_mode));
++	uint32_t config = rh_read(rh_rsc, 0x0c);
++	unsigned count = (config >> (6u * RH_DRV)) & 0x3fu;
++	bool inherited = false;
++	for (unsigned t = 0; t < RH_TCS_COUNT && t < count; ++t) {
++		uint32_t b = t * RH_TCS_STRIDE, en = rh_read(rh_tcs, b + RH_ENABLE);
++		const char *kind = t < RH_ACTIVE_N ? "ACTIVE" : t < RH_WAKE_TCS0 ? "SLEEP" : t < RH_FAST_TCS ? "WAKE" : "FAST";
++		printf("NEGRONI RPMH: 0383 TCS%u %s status %#x control %#x enable %#x wait %#x\n", t, kind,
++		    rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL), en, rh_read(rh_tcs, b + RH_WAIT));
++		for (unsigned c = 0; c < rh_ncpt && c < 16; ++c) {
++			if (!(en & (1u << c))) {
++				continue;
++			}
++			uint32_t cb = b + c * RH_CMD_STRIDE;
++			printf("NEGRONI RPMH: 0383 TCS%u cmd%u msgid %#x addr %#x data %#x status %#x\n", t, c,
++			    rh_read(rh_tcs, cb + RH_MSGID), rh_read(rh_tcs, cb + RH_ADDR), rh_read(rh_tcs, cb + RH_DATA),
++			    rh_read(rh_tcs, cb + RH_CMD_STATUS));
++			if (t >= RH_SLEEP_TCS0 && t < RH_FAST_TCS) {
++				inherited = true;
++			}
++		}
++	}
++	const char *why = NULL;
++	if (rh_sleep_mode == 0) {
++		why = "negronirpmh_sleep=0 (default)";
++	} else if (count != RH_TCS_COUNT || rh_ncpt != 16) {
++		why = "TCS geometry is not the live DT one (8 TCS, 16 commands)";
++	} else if (inherited) {
++		why = "the boot chain left SLEEP/WAKE commands: not touched";
++	}
++	rh_sw_ok = why == NULL;
++	printf("NEGRONI RPMH: 0383 sleep/wake sets %s (mode %u%s%s)\n", rh_sw_ok ? "ON" : "off", rh_sleep_mode,
++	    why ? ": " : "", why ? why : "");
++}
++
++static bool
++rh_sw_cmd(unsigned t, unsigned c, uint32_t msgid, uint32_t addr, uint32_t data)
++{
++	uint32_t cb = t * RH_TCS_STRIDE + c * RH_CMD_STRIDE;
++	return rh_sync(cb + RH_MSGID, msgid) && rh_sync(cb + RH_ADDR, addr) && rh_sync(cb + RH_DATA, data);
++}
++
++/*
++ * Under rh_lock, thread context: rewrite both sets from the cache (Linux _rpmh_flush: invalidate, then every valid
++ * request as one sleep + one wake command). WAKE commands and enables go in first, SLEEP last, so a partial write
++ * never leaves a sleep value without its wake value. On a failure the SLEEP and then the WAKE enables are cleared (empty
++ * sets change nothing); if even that fails, the cluster states stay off for this boot (negroni_rpmh_sleep_ready).
++ */
++static void
++rh_flush_sets(void)
++{
++	uint32_t wen[RH_SW_N] = { 0 }, sen[RH_SW_N] = { 0 };
++	unsigned n = 0;
++	bool ok = true;
++
++	for (unsigned i = 0; i < RH_SW_N && ok; ++i) {
++		uint32_t bs = (RH_SLEEP_TCS0 + i) * RH_TCS_STRIDE, bw = (RH_WAKE_TCS0 + i) * RH_TCS_STRIDE;
++		ok = rh_sync(bs + RH_ENABLE, 0) && rh_sync(bs + RH_WAIT, 0) && rh_sync(bw + RH_ENABLE, 0) &&
++		    rh_sync(bw + RH_WAIT, 0);
++	}
++	for (unsigned i = 0; i < rh_ncache && ok; ++i) {
++		const struct rh_entry *e = &rh_cache[i];
++		uint32_t sleep = rh_sleep_value(e);
++		if (sleep == e->wake) {
++			continue;
++		}
++		if (n >= RH_SW_N * rh_ncpt) {
++			rh_cache_full++;
++			break;
++		}
++		unsigned t = n / rh_ncpt, c = n % rh_ncpt;
++		ok = rh_sw_cmd(RH_WAKE_TCS0 + t, c, RH_MSG_RESP, e->addr, e->wake) &&
++		    rh_sw_cmd(RH_SLEEP_TCS0 + t, c, RH_MSG_FIRE, e->addr, sleep);
++		wen[t] |= 1u << c;
++		sen[t] |= 1u << c;
++		n++;
++	}
++	for (unsigned t = 0; t < RH_SW_N && ok; ++t) {
++		ok = rh_sync((RH_WAKE_TCS0 + t) * RH_TCS_STRIDE + RH_ENABLE, wen[t]);
++	}
++	for (unsigned t = 0; t < RH_SW_N && ok; ++t) {
++		ok = rh_sync((RH_SLEEP_TCS0 + t) * RH_TCS_STRIDE + RH_ENABLE, sen[t]);
++	}
++	rh_flushes++;
++	if (ok) {
++		rh_nsleep = n;
++		rh_dirty = false;
++		return;
++	}
++	rh_flush_fail++;
++	rh_sw_ok = false;
++	/*
++	 * SLEEP first, then WAKE: the sets are not rewritten after this, so a WAKE command left enabled would send a
++	 * stale value at every APSS wake and undo a later ACTIVE vote for the same resource.
++	 */
++	bool cleared = true;
++	for (unsigned t = 0; t < RH_SW_N; ++t) {
++		cleared &= rh_sync((RH_SLEEP_TCS0 + t) * RH_TCS_STRIDE + RH_ENABLE, 0);
++	}
++	for (unsigned t = 0; t < RH_SW_N; ++t) {
++		cleared &= rh_sync((RH_WAKE_TCS0 + t) * RH_TCS_STRIDE + RH_ENABLE, 0);
++	}
++	rh_sw_broken = !cleared;
++	rh_dirty = false;
++	rh_nsleep = 0;
++	printf("NEGRONI RPMH: 0383 sleep/wake set write failed: sets off for this boot, sets %s\n",
++	    cleared ? "emptied" : "NOT emptied (cluster states stay off)");
++}
++
++/* Under rh_lock after a completed ACTIVE vote: cache each command (WAKE = ACTIVE value), then rewrite the sets. */
++static void
++rh_note_vote(uint32_t address, const uint32_t *offsets, const uint32_t *values, unsigned ncmd, int mode)
++{
++	uint8_t kind = mode == RH_MODE_ARC ? RH_K_ARC : mode == RH_MODE_BCM ? (rh_keepalive ? RH_K_KEEPALIVE : RH_K_BCM) :
++	    RH_K_SAME;
++	bool changed = false;
++
++	for (unsigned c = 0; c < ncmd; ++c) {
++		uint32_t a = address + offsets[c];
++		unsigned i = 0;
++		while (i < rh_ncache && rh_cache[i].addr != a) {
++			i++;
++		}
++		if (i == rh_ncache) {
++			if (rh_ncache >= RH_CACHE_MAX) {
++				rh_cache_full++;
++				continue;
++			}
++			rh_ncache++;
++			rh_cache[i].addr = a;
++			rh_cache[i].wake = ~values[c];
++		}
++		struct rh_entry old = rh_cache[i];
++		rh_cache[i].wake = values[c];
++		rh_cache[i].kind = kind;
++		changed |= old.wake != values[c] || old.kind != kind;
++	}
++	if (!rh_sw_ok || !changed) {
++		return;
++	}
++	rh_dirty = true;
++	rh_flush_sets();
++}
++
++/*
++ * The CPU idle path (osfmk/arm64/negroni_cpuidle.c, interrupts masked), before a cluster state: false when an RPMh
++ * transaction of this DRV may be in flight or the sets are not current (Linux rpmh_rsc_ctrlr_is_busy + a failed
++ * flush = NOTIFY_BAD). Reads only; never waits.
++ */
++bool
++negroni_rpmh_sleep_ready(void)
++{
++	if (__atomic_load_n(&rh_lock, __ATOMIC_ACQUIRE) || rh_sw_broken || (rh_sw_ok && rh_dirty)) {
++		__atomic_fetch_add(&rh_busy_idle, 1, __ATOMIC_RELAXED);
++		return false;
++	}
++	vm_offset_t tcs = rh_tcs;
++	if (tcs != 0) {
++		for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
++			if (rh_read(tcs, t * RH_TCS_STRIDE + RH_STATUS) == 0) {
++				__atomic_fetch_add(&rh_busy_idle, 1, __ATOMIC_RELAXED);
++				return false;
++			}
++		}
++		if (rh_read(tcs, RH_FAST_TCS * RH_TCS_STRIDE + RH_STATUS) == 0) {
++			__atomic_fetch_add(&rh_busy_idle, 1, __ATOMIC_RELAXED);
++			return false;
++		}
++	}
++	return true;
++}
++
++/* One status line (the 60 s line of negroni_cpuidle.c). */
++void
++negroni_rpmh_sleep_log(void)
++{
++	printf("NEGRONI RPMH: 0383 sleep/wake sets %s, mode %u, %u cached votes, %u sleep+wake pairs written, flushes %u "
++	    "(failed %u), cache full %u, busy at idle %u\n", rh_sw_broken ? "BROKEN" : rh_sw_ok ? "on" : "off", rh_sleep_mode,
++	    rh_ncache, rh_nsleep, rh_flushes, rh_flush_fail, rh_cache_full, rh_busy_idle);
++}
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/osfmk/arm64/negroni_cpuidle.c b/osfmk/arm64/negroni_cpuidle.c
+index 121b1fb..4964eb4 100644
+--- a/osfmk/arm64/negroni_cpuidle.c
++++ b/osfmk/arm64/negroni_cpuidle.c
+@@ -42,6 +42,27 @@
+  * shorter than the residency -> the next 8 idles of that core are WFI.
+  * Log: "NEGRONI CPUIDLE: ..." at start, then every 60 s one line per core and state:
+  * "NEGRONI CPUIDLE: cpuN state S param 0x... entered N times: ...".
++ *
++ * Patch 0383 (cluster states as Linux, RPMh sleep sets, sleep statistics):
++ * - Gunyah (the hypervisor) implements PSCI for the HLOS VM (quic/gunyah-hypervisor hyp/vm/psci_osi): FEATURES
++ *   (CPU_SUSPEND) = 3 for the HLOS (OSI + extended StateID), the VM starts in PC mode, a vCPU in WFI stays "active"
++ *   for the aggregation, so the physical core only clock-gates (psci_osi_handle_idle_yield: no suspend while an
++ *   affine vCPU is active). Only CPU_SUSPEND lets Gunyah power the core, the cluster (L3) or the APSS down.
++ * - negronicpuidle=3: OS-initiated mode, as Linux cpuidle-psci-domain (psci_pd_init_topology -> psci_set_osi_mode):
++ *   SET_SUSPEND_MODE(OSI) at start (Gunyah allows it while every other vCPU is active = here, before ci_ready), then
++ *   the last core (every other core inside CPU_SUSPEND) passes the cluster param when the earliest deadline of all
++ *   cores is at least the cluster residency away (the genpd governor's next wakeup); the others pass the core param.
++ *   Gunyah answers DENIED when its view differs (osi_mode_suspend_state_validation_at_level): counted, then 4 idles
++ *   core-only. If SET_SUSPEND_MODE fails, level 3 works as level 2 (PC).
++ * - Before any cluster param: negroni_rpmh_sleep_ready() (bsd/dev/negroni_rpmh.c) must say the RPMh DRV is idle and
++ *   its SLEEP/WAKE sets are current (Linux rpmh_rsc_pd_cb at the cluster PRE_OFF); else the core param.
++ * - llcc-off (cluster-e3, the state with the APSS RSC sleep) only with negronicpuidle_llcc=1 (default 0).
++ * - Sleep statistics, read-only (negronicpuidle_stats, default 7 at level >= 1, 0 at level 0): bit 0 the AOP
++ *   rpmh-sleep-stats records (live.dts soc-sleep-stats@c3f0000, Linux soc_sleep_stats.c rpmh_data: base = 0xc3f0000 |
++ *   [0xc3f0004], 3 records of 32 bytes: name, count, last entered, last exited, accumulated 19.2 MHz ticks), bit 1 the
++ *   DDR stats (base = 0xc3f0000 | [0xc3f001c], magic 0xa1157a75), bit 2 the CPUSS LPM counters (live.dts
++ *   cpuss-sleep-stats apss_seq_mem_base 0x178c0000, qcom_cpuss_sleep_stats.c v1 offsets: C4 count 0x80d8 + 8n,
++ *   cluster D4 count at n = 8, C4/D4 residency 0xc0d0 + 8n). One line each per 60 s with the change.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -65,6 +86,11 @@ extern int setPop(uint64_t time);                               /* osfmk/arm/rtc
+ extern void negroni_gic_spi_enable(uint32_t intid, uint64_t mpidr);     /* pexpert/arm/pe_fiq.c (0288) */
+ extern void negroni_gic_spi_route(uint32_t intid, uint64_t mpidr);
+ 
++extern bool negroni_rpmh_sleep_ready(void);              /* bsd/dev/negroni_rpmh.c (0383) */
++extern void negroni_rpmh_sleep_log(void);
++extern int negroni_mmio_try_rd32(vm_offset_t a, uint32_t *v);  /* osfmk/arm64/sleh.c (0297): 0 = read, < 0 = refused */
++extern uint32_t negroni_mmio_try_faults;
++
+ void negroni_cpuidle_init(void);
+ void negroni_cpuidle_idle(void);
+ void negroni_cpuidle_resume(void);
+@@ -77,6 +103,18 @@ bool negroni_cpuidle_bcast_irq(uint32_t intid);
+ #define PSCI_CPU_SUSPEND64      0xc4000001ull
+ #define PSCI_SET_SUSPEND_MODE   0x8400000full
+ #define PSCI_INVALID_PARAMETERS (-2)
++#define PSCI_DENIED             (-3)
++#define PSCI_MODE_OSI           1ull
++#define CI_CL_SKIP              4       /* idles core-only after a DENIED cluster request */
++#define SS_AOP_PHYS             0xc3f0000ull    /* live.dts soc-sleep-stats@c3f0000 */
++#define SS_AOP_WIN              0x10000ull      /* base = 0xc3f0000 | offset word: inside this window */
++#define SS_RECORDS              3
++#define SS_RECORD               32
++#define SS_DDR_MAGIC            0xa1157a75u
++#define SS_DDR_MAX              0x14
++#define SS_CPUSS_CNT_PHYS       0x178c8000ull   /* apss_seq_mem_base 0x178c0000 + 0x8000 (LPM counters) */
++#define SS_CPUSS_RES_PHYS       0x178cc000ull   /* + 0xc000 (residency counters) */
++#define SS_TICKS_PER_MS         19200ull        /* AOP/arch counter 19.2 MHz */
+ #define BC_CTL_PHYS             0x17420000ull   /* CNTCTLBase */
+ #define BC_FRAME_PHYS           0x17421000ull   /* frame 0, CNTBase0 */
+ #define BC_INTID                40              /* frame 0 physical timer: GIC_SPI 8 */
+@@ -108,6 +146,7 @@ static struct ci_state ci_llcc = { "cluster-e3 llcc-off", 0x4100c344, 2700, 3500
+ 
+ struct ci_cpu {
+ 	struct ci_state *state[CI_STATES];      /* NULL: not allowed */
++	uint32_t cl_skip;                       /* 0383: idles left without a cluster param */
+ 	uint32_t index;                         /* the state being entered (CI_STATES: none) */
+ 	bool down;                              /* between CPU_SUSPEND and its return or resume */
+ 	uint64_t t0, mpidr;
+@@ -122,6 +161,13 @@ struct ci_cpu {
+ 
+ static uint32_t ci_level, ci_mask = 0xff, ci_bcast_arg = 1;
+ static bool ci_ready;
++/* 0383 */
++static uint32_t ci_llcc_arg, ci_stats_arg = ~0u;
++static bool ci_osi;                             /* SET_SUSPEND_MODE(OSI) accepted */
++static uint32_t ci_all_mask;                    /* cores with a core state */
++static uint32_t ci_down_mask;                   /* cores in or about to enter CPU_SUSPEND (bit per core) */
++static uint64_t ci_pop[CI_CPUS];                /* each core's timer deadline when it went down */
++static uint32_t cl_last, cl_pick[CI_STATES], cl_short, cl_rpmh_busy, cl_denied;
+ static uint64_t ci_entry_pa;
+ static struct ci_cpu ci[CI_CPUS];
+ 
+@@ -258,20 +304,64 @@ bc_leave(int n)
+ 	bc_unlock();
+ }
+ 
+-/* The deepest allowed state whose residency fits before the next timer deadline */
++/*
++ * The deepest allowed state whose residency fits before the next timer deadline.
++ * 0383: a cluster state (1, 2) needs (a) in OSI mode: this core is the last one up and the earliest deadline of all
++ * cores fits (Linux genpd: the cluster's next wakeup = the earliest of its CPUs'); (b) RPMh idle with current
++ * SLEEP/WAKE sets (Linux rpmh_rsc_pd_cb); (c) no DENIED backoff.
++ */
+ static uint32_t
+-ci_pick(struct ci_cpu *c, uint64_t now, uint64_t pop)
++ci_pick(struct ci_cpu *c, int n, uint64_t now, uint64_t pop, uint32_t down_before)
+ {
+ 	if (pop <= now) {
+ 		return CI_STATES;
+ 	}
+ 	uint64_t left = pop - now;
+-	for (int s = CI_STATES - 1; s >= 0; s--) {
+-		if (c->state[s] != NULL && !c->refused[s] && left >= c->state[s]->residency_abs) {
++	if (c->state[0] == NULL || c->refused[0] || left < c->state[0]->residency_abs) {
++		return CI_STATES;
++	}
++	if (c->state[1] == NULL) {
++		return 0;
++	}
++	if (c->cl_skip) {
++		c->cl_skip--;
++		return 0;
++	}
++	uint64_t cl_left = left;
++	if (ci_osi) {
++		uint32_t others = ci_all_mask & ~(1u << n);
++		if ((down_before & others) != others) {
++			return 0;
++		}
++		__atomic_fetch_add(&cl_last, 1, __ATOMIC_RELAXED);
++		for (int i = 0; i < CI_CPUS; i++) {
++			if (!(others & (1u << i))) {
++				continue;
++			}
++			uint64_t p = ci_pop[i];
++			if (p <= now) {
++				cl_left = 0;
++				break;
++			}
++			if (p - now < cl_left) {
++				cl_left = p - now;
++			}
++		}
++	}
++	for (int s = CI_STATES - 1; s >= 1; s--) {
++		if (c->state[s] != NULL && !c->refused[s] && cl_left >= c->state[s]->residency_abs) {
++			if (!negroni_rpmh_sleep_ready()) {
++				__atomic_fetch_add(&cl_rpmh_busy, 1, __ATOMIC_RELAXED);
++				return 0;
++			}
++			__atomic_fetch_add(&cl_pick[s], 1, __ATOMIC_RELAXED);
+ 			return (uint32_t)s;
+ 		}
+ 	}
+-	return CI_STATES;
++	if (ci_osi) {
++		__atomic_fetch_add(&cl_short, 1, __ATOMIC_RELAXED);
++	}
++	return 0;
+ }
+ 
+ /* cpu_idle(), interrupts masked, in place of the WFI */
+@@ -288,10 +378,22 @@ negroni_cpuidle_idle(void)
+ 	}
+ 	struct ci_cpu *c = &ci[n];
+ 	uint64_t now = mach_absolute_time();
+-	uint32_t s = c->skip ? CI_STATES : ci_pick(c, now, cdp->rtcPop);
++	uint32_t s = CI_STATES;
+ 
+ 	if (c->skip) {
+ 		c->skip--;
++	} else {
++		/*
++		 * 0383: this core counts as down before it picks. The atomic OR orders the cores that go idle at the same time:
++		 * exactly one of them sees every other bit set (the last core). With a load after the pick, two cores that
++		 * pick together would both see the other one up and the cluster would stay on for that whole idle period.
++		 */
++		ci_pop[n] = cdp->rtcPop;
++		uint32_t down_before = __atomic_fetch_or(&ci_down_mask, 1u << n, __ATOMIC_ACQ_REL);
++		s = ci_pick(c, n, now, cdp->rtcPop, down_before);
++		if (s == CI_STATES) {
++			__atomic_fetch_and(&ci_down_mask, ~(1u << n), __ATOMIC_RELEASE);
++		}
+ 	}
+ 	if (s == CI_STATES) {
+ 		__builtin_arm_dsb(DSB_SY);
+@@ -319,6 +421,7 @@ negroni_cpuidle_idle(void)
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int64_t rc = ci_psci(PSCI_CPU_SUSPEND64, st->param, ci_entry_pa, (uint64_t)n);
+ 	/* returned: no power-down (a pending interrupt, or the firmware said no) */
++	__atomic_fetch_and(&ci_down_mask, ~(1u << n), __ATOMIC_RELEASE);
+ 	c->down = false;
+ 	c->last_rc = rc;
+ 	if (rc == 0) {
+@@ -327,6 +430,9 @@ negroni_cpuidle_idle(void)
+ 		c->denied[s]++;
+ 		if (rc == PSCI_INVALID_PARAMETERS) {
+ 			c->refused[s] = true;   /* this param is not the firmware's: never again on this core */
++		} else if (rc == PSCI_DENIED && s >= 1) {
++			__atomic_fetch_add(&cl_denied, 1, __ATOMIC_RELAXED);
++			c->cl_skip = CI_CL_SKIP; /* 0383: OSI view raced with a waking core: core-only for a few idles */
+ 		}
+ 	}
+ 	bc_leave(n);
+@@ -345,6 +451,7 @@ negroni_cpuidle_resume(void)
+ 	struct ci_cpu *c = &ci[n];
+ 	uint32_t s = c->index < CI_STATES ? c->index : 0;
+ 
++	__atomic_fetch_and(&ci_down_mask, ~(1u << n), __ATOMIC_RELEASE);  /* 0383 */
+ 	PE_init_cpu();                  /* GIC redistributor wake + CPU interface (lost with the core) */
+ 	setPop(cdp->rtcPop);            /* the virtual timer's compare value was lost too */
+ 	uint64_t slept = mach_absolute_time() - c->t0;
+@@ -363,6 +470,148 @@ negroni_cpuidle_resume(void)
+ 	bc_leave(n);
+ }
+ 
++/*
++ * 0383: read-only sleep statistics (Linux soc_sleep_stats.c rpmh_data + DDR stats, qcom_cpuss_sleep_stats.c v1).
++ * Only 32-bit loads; a 64-bit counter is read as low word, high word (an update in between can give one odd
++ * sample, the next line corrects it).
++ */
++static vm_offset_t ss_aop, ss_ddr, ss_cnt, ss_res;
++static uint32_t ss_ddr_n;
++static uint32_t ss_prev_cnt[SS_RECORDS];
++static uint64_t ss_prev_acc[SS_RECORDS];
++static uint32_t ss_prev_ddr[SS_DDR_MAX];
++static uint64_t ss_prev_c4[CI_CPUS + 1], ss_prev_res[CI_CPUS + 1];
++
++static uint64_t
++ss_rd64(vm_offset_t base, uint32_t off)
++{
++	return (uint64_t)bc_rd(base, off + 4) << 32 | bc_rd(base, off);
++}
++
++/*
++ * A stats page may be outside the HLOS VM's stage-2 map (Gunyah injects a synchronous external abort): the first
++ * and the last word of each region are read with the 0297 try-accessor (sleh.c) first; a refused region stays off.
++ * negroni_mmio_try_rd32 returns -2 without an access on kernels without CONFIG_XNUPOST: then the stats stay off.
++ */
++static bool
++ss_probe(vm_offset_t base, uint32_t first, uint32_t last)
++{
++	uint32_t v;
++
++	return base != 0 && negroni_mmio_try_rd32(base + first, &v) == 0 && negroni_mmio_try_rd32(base + last, &v) == 0;
++}
++
++static void
++ss_start(void)
++{
++	if (ci_stats_arg & 3) {
++		vm_offset_t hdr = ml_io_map(SS_AOP_PHYS, 0x20);
++		uint32_t off = 0, doff = 0;
++		if (hdr == 0 || negroni_mmio_try_rd32(hdr + 0x4, &off) != 0 || negroni_mmio_try_rd32(hdr + 0x1c, &doff) != 0) {
++			printf("NEGRONI CPUIDLE: sleep stats header at 0x%llx not readable (try faults %u): AOP/DDR stats off\n",
++			    SS_AOP_PHYS, negroni_mmio_try_faults);
++			off = doff = 0;
++		}
++		/* Linux: stats_base = res->start | readl(res->start + 4); the word may hold the full address or the offset */
++		if ((off & ~(uint32_t)(SS_AOP_WIN - 1)) == SS_AOP_PHYS) {
++			off &= (uint32_t)(SS_AOP_WIN - 1);
++		}
++		if ((doff & ~(uint32_t)(SS_AOP_WIN - 1)) == SS_AOP_PHYS) {
++			doff &= (uint32_t)(SS_AOP_WIN - 1);
++		}
++		if ((ci_stats_arg & 1) && off != 0 && (off & 3) == 0 && off <= SS_AOP_WIN - SS_RECORDS * SS_RECORD) {
++			vm_offset_t a = ml_io_map(SS_AOP_PHYS | off, SS_RECORDS * SS_RECORD);
++			ss_aop = ss_probe(a, 0, SS_RECORDS * SS_RECORD - 4) ? a : 0;
++		}
++		if ((ci_stats_arg & 2) && doff != 0 && (doff & 3) == 0 && doff <= SS_AOP_WIN - (8 + SS_DDR_MAX * 16)) {
++			vm_offset_t d = ml_io_map(SS_AOP_PHYS | doff, 8 + SS_DDR_MAX * 16);
++			bool readable = ss_probe(d, 0, 8 + SS_DDR_MAX * 16 - 4);
++			uint32_t magic = readable ? bc_rd(d, 0) : 0, num = readable ? bc_rd(d, 4) : 0;
++			if (magic == SS_DDR_MAGIC && num > 0) {
++				ss_ddr = d;
++				ss_ddr_n = num < SS_DDR_MAX ? num : SS_DDR_MAX;
++			}
++			printf("NEGRONI CPUIDLE: DDR stats at 0x%llx: %s magic %#x, %u entries%s\n", SS_AOP_PHYS | doff,
++			    readable ? "readable," : "NOT readable,", magic, num, ss_ddr ? "" : ": not used");
++		}
++		printf("NEGRONI CPUIDLE: rpmh sleep stats at 0x%llx (offset word %#x)%s\n", SS_AOP_PHYS | off, off,
++		    ss_aop ? "" : ": not used");
++	}
++	if (ci_stats_arg & 4) {
++		vm_offset_t cnt = ml_io_map(SS_CPUSS_CNT_PHYS, 0x200), res = ml_io_map(SS_CPUSS_RES_PHYS, 0x200);
++		/* ss_log reads C4 0xd8 + 8n and residency 0xd0 + 8n, n = 0..CI_CPUS, 64 bit each */
++		if (ss_probe(cnt, 0xd8, 0xd8 + 8 * CI_CPUS + 4) && ss_probe(res, 0xd0, 0xd0 + 8 * CI_CPUS + 4)) {
++			ss_cnt = cnt;
++			ss_res = res;
++		} else {
++			printf("NEGRONI CPUIDLE: cpuss counters at 0x%llx not readable (try faults %u): off\n", SS_CPUSS_CNT_PHYS,
++			    negroni_mmio_try_faults);
++		}
++	}
++}
++
++/* every 60 s from the log thread */
++static void
++ss_log(void)
++{
++	if (ss_aop) {
++		char line[256];
++		int len = 0;
++		for (int i = 0; i < SS_RECORDS; i++) {
++			uint32_t b = (uint32_t)(i * SS_RECORD), type = bc_rd(ss_aop, b), cnt = bc_rd(ss_aop, b + 4);
++			uint64_t acc = ss_rd64(ss_aop, b + 0x18);
++			char name[5];
++			for (int k = 0; k < 4; k++) {
++				char ch = (char)(type >> (8 * k));
++				name[k] = (ch >= 0x20 && ch < 0x7f) ? ch : '.';
++			}
++			name[4] = 0;
++			len += snprintf(line + len, sizeof(line) - (size_t)len, "%s%s count %u (+%u) time %llu ms (+%llu ms)",
++			    i ? ", " : "", name, cnt, cnt - ss_prev_cnt[i], acc / SS_TICKS_PER_MS,
++			    (acc - ss_prev_acc[i]) / SS_TICKS_PER_MS);
++			if (len >= (int)sizeof(line)) {
++				len = (int)sizeof(line) - 1;
++			}
++			ss_prev_cnt[i] = cnt;
++			ss_prev_acc[i] = acc;
++		}
++		printf("NEGRONI CPUIDLE: rpmh stats (aosd = AOSS sleep / XO off, cxsd = CX collapse): %s\n", line);
++	}
++	if (ss_ddr) {
++		char line[256];
++		int len = 0;
++		for (uint32_t i = 0; i < ss_ddr_n; i++) {
++			uint32_t b = 8 + 16 * i, name = bc_rd(ss_ddr, b), cnt = bc_rd(ss_ddr, b + 4);
++			if (((name >> 8) & 0xff) != 0) {
++				continue;       /* frequency rows: not an LPM mode */
++			}
++			len += snprintf(line + len, sizeof(line) - (size_t)len, " lpm%#x %u (+%u)", name & 0xff, cnt,
++			    cnt - ss_prev_ddr[i]);
++			if (len >= (int)sizeof(line)) {
++				len = (int)sizeof(line) - 1;
++			}
++			ss_prev_ddr[i] = cnt;
++		}
++		printf("NEGRONI CPUIDLE: ddr stats:%s\n", len ? line : " no LPM rows");
++	}
++	if (ss_cnt && ss_res) {
++		char line[320];
++		int len = 0;
++		for (int i = 0; i <= CI_CPUS; i++) {
++			uint64_t c4 = ss_rd64(ss_cnt, 0xd8 + 8 * (uint32_t)i), res = ss_rd64(ss_res, 0xd0 + 8 * (uint32_t)i);
++			len += snprintf(line + len, sizeof(line) - (size_t)len, " %s%d %llu (+%llu, res +%llu)",
++			    i < CI_CPUS ? "C4 cpu" : "D4 cluster", i < CI_CPUS ? i : 0, c4, c4 - ss_prev_c4[i],
++			    res - ss_prev_res[i]);
++			if (len >= (int)sizeof(line)) {
++				len = (int)sizeof(line) - 1;
++			}
++			ss_prev_c4[i] = c4;
++			ss_prev_res[i] = res;
++		}
++		printf("NEGRONI CPUIDLE: cpuss hw counters (0 = counting off or never entered):%s\n", line);
++	}
++}
++
+ static void
+ ci_log(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -398,6 +647,24 @@ ci_log(void *arg __unused, wait_result_t wr __unused)
+ 			printf("NEGRONI CPUIDLE: wake timer: %u interrupts, armed %s, target cpu%d\n", bc_irqs, bc_armed ? "yes" : "no",
+ 			    bc_target);
+ 		}
++		if (ci_level >= 2) {
++			printf("NEGRONI CPUIDLE: cluster (%s): last-core chances %u, l3-off picks %u, llcc-off picks %u, too short %u, "
++			    "rpmh busy %u, denied %u\n", ci_osi ? "OSI" : "PC", cl_last, cl_pick[1], cl_pick[2], cl_short, cl_rpmh_busy,
++			    cl_denied);
++			negroni_rpmh_sleep_log();
++		}
++		ss_log();
++	}
++}
++
++/* 0383: level 0 with negronicpuidle_stats: only the statistics, every 60 s (the WFI-only baseline) */
++__dead2 static void
++ss_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		assert_wait_timeout((event_t)&ci_log_event, THREAD_UNINT, 60, NSEC_PER_SEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		ss_log();
+ 	}
+ }
+ 
+@@ -436,8 +703,24 @@ negroni_cpuidle_init(void)
+ 	(void)PE_parse_boot_argn("negronicpuidle", &ci_level, sizeof(ci_level));
+ 	(void)PE_parse_boot_argn("negronicpuidle_mask", &ci_mask, sizeof(ci_mask));
+ 	(void)PE_parse_boot_argn("negronicpuidle_bcast", &ci_bcast_arg, sizeof(ci_bcast_arg));
++	(void)PE_parse_boot_argn("negronicpuidle_llcc", &ci_llcc_arg, sizeof(ci_llcc_arg));
++	(void)PE_parse_boot_argn("negronicpuidle_stats", &ci_stats_arg, sizeof(ci_stats_arg));
++	if (ci_stats_arg == ~0u) {
++		ci_stats_arg = ci_level >= 1 ? 7 : 0;  /* 0383 default: the stats with the PSCI levels only */
++	}
++	if (ci_level > 3) {
++		ci_level = 3;
++	}
+ 	if (ci_level == 0) {
+-		printf("NEGRONI CPUIDLE: level 0: WFI only (negronicpuidle=1 or 2 for the PSCI states)\n");
++		printf("NEGRONI CPUIDLE: level 0: WFI only (negronicpuidle=1 core, 2 + cluster PC, 3 + cluster OSI)%s\n",
++		    ci_stats_arg ? ", sleep stats every 60 s" : "");
++		if (ci_stats_arg) {
++			ss_start();
++			thread_t st;
++			if (kernel_thread_start(ss_thread, NULL, &st) == KERN_SUCCESS) {
++				thread_deallocate(st);
++			}
++		}
+ 		return;
+ 	}
+ 	int64_t ver = ci_psci(PSCI_VERSION, 0, 0, 0);
+@@ -473,7 +756,21 @@ negroni_cpuidle_init(void)
+ 		c->state[0] = ((t->phys_id >> 8) & 0xff) < 4 ? &ci_silver : &ci_gold;     /* MPIDR Aff1 0-3: the A510s */
+ 		if (ci_level >= 2) {
+ 			c->state[1] = &ci_l3;
+-			c->state[2] = &ci_llcc;
++			c->state[2] = ci_llcc_arg ? &ci_llcc : NULL;   /* 0383: llcc-off only with negronicpuidle_llcc=1 */
++		}
++		ci_all_mask |= 1u << t->cpu_id;
++	}
++	/* 0383: OS-initiated mode (Linux psci_set_osi_mode), while every other core is still in WFI (ci_ready false) */
++	if (ci_level >= 3) {
++		if (ci_all_mask != (1u << topo->num_cpus) - 1u) {
++			printf("NEGRONI CPUIDLE: OSI needs every core in negronicpuidle_mask (%#x): PC mode\n", ci_all_mask);
++		} else if (!(feat & 1)) {
++			printf("NEGRONI CPUIDLE: OSI not offered (CPU_SUSPEND features %#llx): PC mode\n", feat);
++		} else {
++			int64_t rc = ci_psci(PSCI_SET_SUSPEND_MODE, PSCI_MODE_OSI, 0, 0);
++			ci_osi = rc == 0;
++			printf("NEGRONI CPUIDLE: SET_SUSPEND_MODE(OSI) rc %lld: %s\n", rc, ci_osi ? "OS-initiated mode" :
++			    "PC mode kept");
+ 		}
+ 	}
+ 	ci_entry_pa = ml_static_vtop((vm_offset_t)&negroni_secondary_entry);
+@@ -485,7 +782,9 @@ negroni_cpuidle_init(void)
+ 	printf("NEGRONI CPUIDLE: level %u, cores %#x (of %u), entry 0x%llx, wake timer %s; silver param %#x (exit %u us, residency %u us), "
+ 	    "gold param %#x (exit %u us, residency %u us)%s\n", ci_level, ci_mask, topo->num_cpus, ci_entry_pa, bc_on ? "on" : "OFF",
+ 	    ci_silver.param, ci_silver.exit_us, ci_silver.residency_us, ci_gold.param, ci_gold.exit_us, ci_gold.residency_us,
+-	    ci_level >= 2 ? ", cluster l3-off 0x41000044 (>= 5309 us), llcc-off 0x4100c344 (>= 13959 us)" : "");
++	    ci_level >= 2 ? (ci_llcc_arg ? ", cluster l3-off 0x41000044 (>= 5309 us), llcc-off 0x4100c344 (>= 13959 us)" :
++	    ", cluster l3-off 0x41000044 (>= 5309 us), llcc-off off (negronicpuidle_llcc=1)") : "");
++	ss_start();
+ 	__atomic_store_n(&ci_ready, true, __ATOMIC_RELEASE);
+ 	thread_t thread;
+ 	if (kernel_thread_start(ci_log, NULL, &thread) == KERN_SUCCESS) {

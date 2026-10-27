@@ -3266,3 +3266,84 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   (RBSProcessMonitor in CWFXPCManager init), cfprefsd, accountsd.
 - Next (phone): in the stall run `scripts/wifi/wifid-stall.sh` (spindump of wifid + all processes) and read the main
   thread; test the work-around "kill wifid, launchd restarts it" (boot 16 #2 got through). Then decide the fix.
+
+## 67. GPU "iffy" and hot: IFPC was off after every 0298 boot; 0384 governor + fence IRQ + slumber fix (2026-10-27, GPU kernel agent; patch 0384, details patches/xnu/README-gpu-kernel.md section 28)
+- [V] Every 0298 boot: IFPC accepted and on, then 3 x `17 HFI PREPARE_SLUMBER ack, error 1002` -> `slumber off for this boot`
+  (bootlog-13.txt:1693-1758, also bootlog-3/6/11, usblog-20261027-060101.txt:732-797, usblog-20261027-121304.txt:3255-3306).
+  The code then set `PM_OFF` with OOB GPU_SET held: GX powered for the whole boot (`pm off`, `GX 0xf8222800` in all 3819
+  WATCH lines of bootlog-12.txt, a 7.1 h boot). The 0285-only boot had IFPC working (usblog-20261026-131747.txt:1030
+  `GX collapsed 100%`).
+- [V] The 0286 UI floor held 640 MHz + DT bus 10 (bootlog-12.txt: level 9 in 3482 of 3819 lines, busy 0 % in 3768).
+- [V] Frames wait on the GPU fence, not on the clock: usblog-20261027-121304.txt 3112 `gpu-wait skips` for 6218 presents,
+  also at level 9. No hang or recovery in any log. Metal client crashes are userland: AegirPoster `CAMetalLayerInvalid:
+  unsupported extended range format` (:111), then 73 x SIGABRT in a loop.
+- [V code] KGSL turns the GMU power counter off before PREPARE_SLUMBER and sends `{freq 2, bw 2}` (initial-pwrlevel 10), after
+  the lowest idle level (adreno_gen7_gmu.c:1424-1450, 2513-2535). 0298 sent `{0, 0}` with the counter on. [I] that is error 1002.
+- 0384: IFPC never goes off on a slumber failure; KGSL slumber order; slumber only with the display off (FB power request);
+  wake retry after a reset; Linux simple_ondemand governor (90/5) on the GMU busy counter over the DT OPPs (220-818 MHz, DT bus
+  vote), level 1 when idle or display off, late-frame step, no UI floor by default; `negronigpu_level=N` = fixed level (removed
+  from config/negroni-ne2211.toml); fence interrupt on GIC SPI 300 (INTID 332, CACHE_CLEAN_TS) wakes RedwoodGPU's fence
+  waiters, polled fallback 1000 us. Kernel out/kernel/local-20261027-110800 (sha256
+  cee20b34f7e6e935d98021c656795df5a09b7d6e50a74f798a31829bf3825dbc), no image, not booted.
+- Next: boot it (README section 28 test plan). If `irq armed` with `fence 0/s`: the line does not reach the CPU (INTID or
+  GIC group). If PREPARE_SLUMBER is still refused: IFPC stays (cost far below `pm off`); look at the ack word.
+
+## 68. Phone hot with the screen off: no core, cluster or APSS power-down ever ran; 0383 OSI cluster states, RPMh sleep sets, sleep stats (2026-10-27, power kernel agent; patch 0383, details patches/xnu/README-cpuidle.md "0383")
+
+- [V logs] All logged boots ran `negronicpuidle=0` (WFI only); no PSCI idle line exists in logs/. The everything image
+  has `negronicpuidle=1`, but no log of it shows the CPUIDLE lines.
+- [V Gunyah source, out/src/gunyah via scripts/setup/fetch-rpmh-sleep-sources.sh] XNU is the HLOS VM of Gunyah. A vCPU
+  in WFI stays "active" for Gunyah's PSCI aggregation, so the physical CPU only clock-gates. Only CPU_SUSPEND lets
+  Gunyah power down the core / L3 / APSS. Gunyah gives the HLOS FEATURES(CPU_SUSPEND) = 3 (OSI + extended StateID), the
+  VM starts in PC mode, SET_SUSPEND_MODE(OSI) is allowed while no other vCPU is suspended.
+- [V] apps RSC DRV 2: no HW solver (solver=0x4010100), TCS 0-2 ACTIVE, 3-4 SLEEP, 5-6 WAKE, 7 FAST (live.dts
+  tcs-config). Before 0383 only ACTIVE votes. With Linux rules (sleep != wake only) our current votes give no sleep/wake
+  pairs: the missing APSS collapse, not the sleep sets, is the main reason CX/XO stay up. [I] UEFI votes left in DRV 2
+  are not visible.
+- 0383: `negronicpuidle=3` (OSI, last core picks l3-off; llcc-off only with `negronicpuidle_llcc=1`), RPMh ready check
+  before any cluster param, `negronirpmh_sleep=1|2` SLEEP/WAKE sets (default 0), read-only stats every 60 s: AOP
+  rpmh-sleep-stats (aosd/cxsd/ddr), DDR LPM counts, CPUSS C4/D4 counters (`negronicpuidle_stats`, also at level 0 when
+  given = WFI baseline). Kernel defaults unchanged (0).
+- [V] Build `k0383`: kernel out/kernel/local-20261027-111225 (sha256
+  0a0f433450f4452cb430c6c00d715cb8853a118667b2dbf0e673349fa097498b), 0383 applied, the 4 usual dxb skips. Not booted.
+- Next: README-cpuidle.md "0383" test plan, steps 1-5 (baseline stats, level 1, 3, + llcc, + rpmh sleep), screen off
+  5 min each, compare `aosd`/`cxsd` `+N` and the battery current.
+
+## 69. Screen-off wakeups: ~1270 timer wakes/s from pollers; 0382 adaptive polls + NEGRONI TOP (2026-10-27, power-idle kernel agent; patch 0382, details patches/xnu/README-power-idle.md)
+
+- [V source] Before 0382 no driver read the display state. Screen off: USB `ud_thread` 1 ms (also with no cable),
+  touch 10 ms, keys 20 ms, BT RX 20 ms (also with the chip off), chg GLINK 50 ms, FB tick 100 ms + a vsync
+  notification to every client per tick, cpufreq 100 ms, battery 1 s (+8 IOSleep(1)): [I] about 1270 wakes/s,
+  so no core reaches the 4 ms PSCI residency (0288/0383).
+- [V source] The CPUFREQ `busy` is the busiest core over 300 ms, printed mostly on row changes: a biased sample.
+  Unbiased minute lines with the screen off (usblog-20261026-131747 13:28-13:30): d0 34-56 %, d1/d2 ~0.
+- [V source] `delay()` never spins in thread context here: powergate_latency 0 -> cpu_idle_latency 0 ->
+  ml_delay_should_spin FALSE -> it blocks on a timer. negronicpuidle=0 = WFI (clock gating only).
+- [V log] FB STAT/TE/VRR/DBUF/DPU lines print every 1 s with the screen off (297 FB STAT lines in 322 s off),
+  which also keeps the UFS boot log writing every 5 s.
+- [V log] bluetoothd crash-loops every 10 s (`reason=1201`), each start reloads the BT controller (500-780 BT
+  lines/min); AegirPoster crash-loops (60-90 per 10 min). Userland, not changed.
+- [V log] Boot 12 (7 h): no `display off` in the last 4352 s; 66 frames/s on the lock screen, GPU 639 MHz at 0 %
+  busy, CPU 49-53 C on USB power. The display never slept (check Auto-Lock).
+- 0382: `negroni_display_asleep` (FB); USB idle poll 4 ms / 20 ms dark or no host (1 ms with host data in 2 s,
+  200 us only for host traffic, TX wakes the thread); USB live log 250 ms dark / 1 s unconfigured; touch 50 ms,
+  keys 40 ms, battery plug tick 5 s while dark; BT RX 1 s with the chip off; FB off tick 500 ms after 5 s dark
+  with a wake kick; dark stat lines once a minute; DPU TE SPI masked while dark; `negronifb_offnotify=0`
+  (gated, default 1) stops dark vsync notifications. Watchdogs 0371/0375/0381/0368 unchanged in function.
+- New diagnostic `NEGRONI TOP` every 60 s (negronitop): busy % and irq/timer/ipi per second per CPU, top
+  processes and threads (kernel threads with unslid return addresses). `scripts/power/idle-log.py LOG` sums it.
+- Build [V]: out/kernel/local-20261027-111424/kernel.development.negroni sha256
+  783eb5ca4f53f6e5458b01a6889141c9ad398983e5f8218ec5203af5806801f1 (0382 + 0383 + 0384, the 4 usual dxb skips).
+  Not booted, no image.
+- Next: README-power-idle.md section 6 (screen off 5 min with usblog, then idle-log.py; A/B with the old values).
+- Opus review (2026-10-27), 4 fixes in 0382 (compile-checked: negroni_usb.c, NegroniFramebuffer.cpp with 0384,
+  negroni_top.c; 0383/0384 still apply). The build above is from before these fixes.
+  (1) FB: the dark flag was stored after fLock was dropped. A wake in that window left it at 1 with the display
+  on (slow pollers, TE IRQ masked until the next off/on). Now it is stored under fLock, only while fPowerOff.
+  (2) TOP: `bzero(tasks)` after the thread walk cleared the sums, so the procs line was always empty. Moved
+  before the walk. (3) TOP: the kernel-stack read of a blocked thread was not locked. The thread could run,
+  hand off its stack, and stack_collect could unmap it (data abort). Now read under thread_lock at splsched.
+  (4) USB: a frame queued between ud_poll_period() and assert_wait got no wakeup (one long period, max 100 ms,
+  for its completion). ud_poll_sleep_ms checks the TX state again after assert_wait (long sleeps only).
+  New A/B switch `negronifb_asleep=0`: the flag stays 0, so every dark-dependent poller is as before.
+  idle-log.py: TOP thread frames were never captured (regex); TOP procs now follow the window's dark flag.

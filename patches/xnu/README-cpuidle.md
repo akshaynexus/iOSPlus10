@@ -98,3 +98,123 @@ Files: `osfmk/arm64/negroni_cpuidle.c` (new, `osfmk/conf/files.arm64`), `osfmk/a
   `out/kernel/local-20261026-174403` (sha256 dfa9a8a550ecc79d89b7478f1c3217850b55efb9c8cacd124893cf26346e887e), no image. The earlier
   kernels read the bits swapped: there `negronicpuidle=1` would fall back to WFI.
 - compile-one: negroni_cpuidle.c, cpu.c, sleh.c, pe_fiq.c, NegroniCPU.cpp: 0 errors. Not booted.
+
+## 0383: cluster states as Linux (OSI), RPMh sleep/wake sets, sleep statistics (2026-10-27, power kernel agent)
+
+### Findings
+- [V logs] Every logged boot ran WFI only: logs/bootlog-3..13 and the usblogs have only `NEGRONI CPUIDLE: level 0`.
+  The boot-args of bootlog-3..13 have no `negronicpuidle`. The usblog-20261026-233816 boots at 02:02/02:04/02:06 had
+  `negronicpuidle=1`, but they were the flat-battery reboot loop (about 2 min each, early lines not captured, no
+  60 s line). No log shows a PSCI probe line, a residency line or a stats line.
+- [V Gunyah source, quic/gunyah-hypervisor hyp/vm/psci_osi + psci_common, fetched by
+  `scripts/setup/fetch-rpmh-sleep-sources.sh` to out/src/gunyah] XNU runs as the HLOS VM. Gunyah answers
+  FEATURES(CPU_SUSPEND) = 3 for the HLOS (OSI + extended StateID), starts the VM in PC mode, and puts Gunyah itself
+  into OSI with the firmware. A vCPU in WFI stays "active" in the aggregation: `psci_osi_handle_idle_yield` does no
+  CPU_SUSPEND while an affine vCPU is active. So with WFI only, the physical core only clock-gates: no core
+  power-down, no L3 off, no APSS collapse.
+- [V Gunyah source] CPU_SUSPEND with a power-down state: the vCPU blocks, Gunyah picks the shallowest state of the
+  affine vCPUs; the last core of the cluster gets the cluster state = the shallowest over all VM groups. PC mode: the
+  VM's cluster state = the shallowest system-level request of all its vCPUs (so 0288 level 2 is valid). OSI: the
+  request is checked per level; a cluster request while another vCPU is active = DENIED (-3). SET_SUSPEND_MODE(OSI)
+  is DENIED while another vCPU is inside a suspend state. After a power-down the vCPU is warm-reset to the entry point.
+- [V live.dts + log] apps RSC DRV 2: `qcom,tcs-config` = ACTIVE 3, SLEEP 2, WAKE 2, CONTROL 0, FAST_PATH 1 = TCS 0-2,
+  3-4, 5-6, 7; 8 TCS x 16 commands (`config=0x800c8104`); `solver=0x4010100` (bit 24 = 0: no HW solver, so the SW must
+  write the SLEEP/WAKE sets; Linux does it at the cluster-pd PRE_OFF, rpmh_rsc_pd_cb, because rsc@17a00000 has
+  `power-domains = <cluster-pd>`). negroni_rpmh.c before 0383 wrote only ACTIVE TCS.
+- [V Linux rpmh.c is_req_valid] Linux writes a request to the sets only when sleep != wake. With Linux rules all our
+  current votes have sleep == wake: rails (qcom,set = 3), ARC (rpmhpd non-AO), BCM (icc tag 0 = ALWAYS; BT/FP QUP votes
+  are real bandwidth, not keepalive). So the missing sleep sets are NOT the main blocker. The main blocker is that the
+  APSS never collapses (above). [I] Votes left in DRV 2 by UEFI cannot be seen (the ACTIVE TCS read idle with enable 0
+  at our first use).
+- [I] Wake sources in llcc-off/AOSS sleep: the PDC (live.dts pdc-ranges) is not programmed by XNU; SPI 8 (the frame-0
+  timer) is not in the PDC map. Gunyah keeps the vCPU timers. If an interrupt that is not PDC-routed cannot wake the
+  APSS from the deepest state, devices answer late. That is why llcc-off has its own boot-arg, default off.
+- [I] Busy pollers (USB, glink, watch threads, other agents' work) wake cores often; residency 5.3 ms (l3-off) and
+  14 ms (llcc-off) need idle gaps that long on all 8 cores.
+
+### What 0383 does
+Files: `osfmk/arm64/negroni_cpuidle.c`, `bsd/dev/negroni_rpmh.c`.
+- `negronicpuidle=3`: SET_SUSPEND_MODE(OSI) at start, before any core suspends (Linux psci_set_osi_mode). The last
+  core (all other cores inside CPU_SUSPEND, bit mask `ci_down_mask`) passes the cluster param when the earliest
+  deadline of all cores is at least the cluster residency away (Linux genpd next wakeup). Other cores pass 0x40000004.
+  DENIED -> counted, then 4 idles core-only. Switch refused or OSI not offered -> level 3 works as level 2 (PC).
+- Level 2/3: before any cluster param, `negroni_rpmh_sleep_ready()` must be true (RPMh lock free, no ACTIVE or
+  fast-path TCS busy, sets current); else the core param ("rpmh busy").
+- `negronicpuidle_llcc=1` allows llcc-off (0x4100c344); default 0 = l3-off only.
+- RPMh: a read-only dump of all 8 TCS at first use (`NEGRONI RPMH: 0383 TCSn ...`); a cache of each ACTIVE command;
+  `negronirpmh_sleep` 0 (default, nothing written) / 1 (Linux rules: only sleep != wake, today 0 pairs: proves the
+  path) / 2 (+ every ARC vote sleep level 0, every BCM vote sleep 0 = commit, not valid). Rails stay on in sleep
+  (Wi-Fi/BT/USB PHY/touch need them; Linux qcom,set = 3). WAKE = ACTIVE value with response; written WAKE first, SLEEP
+  last; on a write error the SLEEP enables are cleared; if that also fails, cluster states stay off.
+  The sets are written in thread context after a changed vote (the APSS is awake then), not in the idle path.
+  If the boot chain left SLEEP/WAKE commands, nothing is written (line says so).
+- Stats (read-only, every 60 s, `negronicpuidle_stats` bits: 1 AOP rpmh stats, 2 DDR stats, 4 CPUSS counters;
+  default 7 at level >= 1, 0 at level 0; at level 0 a given value starts a stats-only thread = WFI baseline).
+
+### Boot-args (new)
+| Boot-arg | Default | Meaning |
+|---|---|---|
+| `negronicpuidle=3` | (0) | 2 + OS-initiated mode, the last core picks the cluster state |
+| `negronicpuidle_llcc` | 0 | 1 = allow llcc-off (cluster-e3, the APSS RSC sleep) at level 2/3 |
+| `negronicpuidle_stats` | 7 at level >= 1, else 0 | 1 AOP rpmh stats, 2 DDR stats, 4 CPUSS hw counters |
+| `negronirpmh_sleep` | 0 | 1 Linux sleep/wake rules, 2 + ARC/BCM sleep 0 |
+
+### Log lines
+- `NEGRONI CPUIDLE: SET_SUSPEND_MODE(OSI) rc 0: OS-initiated mode` (or `PC mode kept` / `OSI not offered`).
+- `NEGRONI CPUIDLE: level 3, cores 0xff ..., cluster l3-off 0x41000044 (>= 5309 us), llcc-off ...`
+- `NEGRONI CPUIDLE: rpmh sleep stats at 0x...` and `DDR stats at 0x...: magic 0xa1157a75, N entries`.
+- every 60 s: the 0288 per-core lines (state 2 = l3-off, state 3 = llcc-off), then
+  `NEGRONI CPUIDLE: cluster (OSI): last-core chances N, l3-off picks N, llcc-off picks N, too short N, rpmh busy N, denied N`,
+  `NEGRONI RPMH: 0383 sleep/wake sets on|off, mode M, N cached votes, N sleep+wake pairs written, flushes N ...`,
+  `NEGRONI CPUIDLE: rpmh stats (aosd = AOSS sleep / XO off, cxsd = CX collapse): aosd count N (+N) time N ms (+N ms), cxsd ..., ddr ...`,
+  `NEGRONI CPUIDLE: ddr stats: lpm0x.. N (+N) ...`,
+  `NEGRONI CPUIDLE: cpuss hw counters (...): C4 cpu0 N (+N, res +N) ... D4 cluster0 N (+N, res +N)`.
+  [I] record names `aosd`/`cxsd`/`ddr` are the usual AOP names; the line prints the 4 characters it reads.
+
+### Phone test plan (RAM boot, `fastboot boot`, one step at a time)
+1. Baseline: `negronicpuidle=0 negronicpuidle_stats=7`, screen off 5 min. Expect the stats lines; aosd/cxsd `+0`
+   (WFI only). `not readable` in the start lines: Gunyah does not map that region for the VM (no panic, the region
+   stays off).
+2. `negronicpuidle=1`: PSCI line with `CPU_SUSPEND features 0x3`, per-core `down %` > 0, C4 counters rise.
+3. `negronicpuidle=3`: `SET_SUSPEND_MODE(OSI) rc 0`; cluster line: l3-off picks rise with the screen off, denied low;
+   D4 counter rises.
+4. `negronicpuidle=3 negronicpuidle_llcc=1`: llcc-off picks rise; watch aosd/cxsd `+N` with the screen off 5 min, and
+   USB/touch/BT response after wake.
+5. `+ negronirpmh_sleep=1`, then `=2`: the RPMh dump lines, `sleep/wake sets on`, pairs written (0 for mode 1,
+   QUP/camera/ARC votes for mode 2), aosd/cxsd counts vs step 4, battery current (0271 line) vs step 1.
+Bisect: any hang -> drop the last added arg. `negronicpuidle_mask=0x0f` limits power-down to the A510s (no cluster
+states then in OSI).
+
+### Risks
+- [I] A wrong cluster param or a lost wake in llcc-off hangs the phone (wdt off): llcc and RPMh sleep are separate,
+  default-off args.
+- [I] Stats MMIO (0xc3f0000, 0x178c8000, 0x178cc000) is read by Linux in the same HLOS VM. ss_start reads the first
+  and the last word of each region with the 0297 try-accessor first (`negroni_mmio_try_rd32`); a refused region is
+  logged as `not readable` and stays off, no panic. (The everything image has `negronicpuidle=1`, so the stats are
+  on there by default.)
+- [I] `negronirpmh_sleep=2` drops camera BCM/ARC and QUP votes while the APSS sleeps: camera streaming and BT/FP UART
+  RX during APSS sleep may fail. Mode 1 writes nothing today.
+- [I] OSI races with a waking core give DENIED; bounded by the 4-idle backoff.
+
+### Review (2026-10-27, Opus review agent): 3 fixes in the patch
+- OSI last core: the down bit is now set with one atomic `fetch_or` before the pick, and the pick uses the old mask.
+  Before, the bit was set after the pick: two cores that go idle together (coalesced timers) both saw the other one
+  up, and the cluster stayed on for that idle period. Now exactly one core sees every other bit. A core whose pick
+  gives WFI clears its bit at once (a cluster request in that window gets DENIED -> 4-idle backoff, as before).
+- Stats: try-accessor probe of each region (see Risks); no panic when Gunyah does not map a region.
+- RPMh flush failure: the WAKE enables are cleared too (SLEEP first). Before, a WAKE command left enabled was never
+  rewritten and would send a stale value at each APSS wake, over a later ACTIVE vote for the same resource.
+- Checked, no change: idle path takes no lock (rh_lock only loaded; bc_lock is the 0288 spin lock), no allocation,
+  no printf; params 0x40000004 / 0x41000044 / 0x4100c344 = live.dts (Qualcomm composites, the same in OSI and PC);
+  Gunyah DENIED (-3) on an OSI race, INVALID_PARAMETERS (-2) only from the platform validation; a power-down
+  CPU_SUSPEND that is not BUSY always comes back through the entry point (Gunyah `vcpu_warm_reset` in `psci_suspend`),
+  so 0383 adds no new resume path: level 3 uses the 0288 resume path, which has not run on the phone yet (test plan
+  step 2 first). TCS 0-2/3-4/5-6/7 = tcs-config; MSGID, WAIT 0, enables, invalidate as Linux.
+- [I] Not checked (closed code): the Gunyah platform StateID validation in OSI mode, and the APSS wake source in
+  llcc-off (Gunyah/PDC). If the first RPMh dump shows inherited SLEEP/WAKE commands, do not use `negronicpuidle_llcc=1`:
+  the hardware would send the boot chain's sets at the APSS sleep.
+
+### Build
+- 2026-10-27 16:42 (job `k0383`, all patches/xnu incl. 0384, only the 4 usual dxb skips): kernel
+  `out/kernel/local-20261027-111225` (sha256 0a0f433450f4452cb430c6c00d715cb8853a118667b2dbf0e673349fa097498b). compile-one: negroni_cpuidle.c,
+  negroni_rpmh.c 0 errors. Not booted.
