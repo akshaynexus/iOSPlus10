@@ -82,6 +82,9 @@ cd "$W/dxb"
 # MakeInc.def turns arm64 into arm64e; our NEGRONI patch keeps plain arm64 unless NEGRONI_ARM64E=1
 # (stage 2, after the native PAC patches). make reads the variable from the environment.
 [ "$ARCH_STRING" = arm64e ] && export NEGRONI_ARM64E=1
+# Xcode 27.1 clang warns on every kernel header (-Wreserved-identifier ...): without this list the log grows to
+# GBs (disk). make takes CFLAGS_EXTRA from the environment (MakeInc.def: ifeq ($(CFLAGS_EXTRA),)).
+export CFLAGS_EXTRA="-Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers -Wno-suggest-override -Wno-unnecessary-virtual-specifier -Wno-suggest-destructor-override -Wno-ms-bitfield-padding"
 bash build.sh 2>&1 | tee "$W/build.log"
 D=$OUT/kernel/local-ios26-$(date -u +%Y%m%d-%H%M%S)
 mkdir -p "$D"
