@@ -1,0 +1,61 @@
+diff --git a/iokit/Kernel/arm/NegroniSurface.cpp b/iokit/Kernel/arm/NegroniSurface.cpp
+index 5e2cba8..3bbe968 100644
+--- a/iokit/Kernel/arm/NegroniSurface.cpp
++++ b/iokit/Kernel/arm/NegroniSurface.cpp
+@@ -55,6 +55,7 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
+ 
+ enum {
+ 	kNegroniSurfaceCreate             = 0,
+@@ -89,6 +90,7 @@ static IOLock       *negroni_surface_lock;
+ static NegroniSurface *negroni_surface_table[NEGRONI_SURFACE_MAX_ID];
+ static uint32_t      negroni_surface_users[NEGRONI_SURFACE_MAX_ID];
+ static uint32_t      negroni_surface_next_id = 1;
++static uint32_t      negroni_surface_plane_bpr_at = 0x10;   /* patch 0390: see negroni_surface_fill_result */
+ static uint32_t      negroni_surface_creates_logged;
+ static uint64_t      negroni_surface_wired;       /* bytes of buffer surfaces */
+ #define NEGRONI_SURFACE_WIRED_MAX         (1536ull << 20)
+@@ -533,6 +535,11 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 		return false;
+ 	}
+ 	negroni_surface_init_lock();
++	uint32_t planebpr = 1;
++	PE_parse_boot_argn("negronisurf_planebpr", &planebpr, sizeof(planebpr));
++	negroni_surface_plane_bpr_at = planebpr ? 0x10 : 0x08;
++	IOLog("NEGRONI SURF: plane bytesPerRow at +0x%x of each plane record (%s)\n", negroni_surface_plane_bpr_at,
++	    planebpr ? "IOSurface 20H392 layout" : "off: negronisurf_planebpr=0, old 0046 layout");
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("NEGRONI SURF: IOCoreSurfaceRoot registered\n");
+@@ -703,6 +710,19 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
+ 	memcpy(p + off, &v, 8);
+ }
+ 
++/*
++ * Plane bytesPerRow (patch 0390, boot-arg negronisurf_planebpr, default 1). IOSurface.framework 20H392
++ * reads plane i of the lock result at 0x68 + i * 0x80 (IOSurfaceClient + 0xd0 + i * 0x80): +0x00 width,
++ * +0x04 height, +0x0c offset, +0x10 bytesPerRow (IOSurfaceClientGetBytesPerRowOfPlane: ldr [x8, #0xe0]),
++ * +0x14 size, +0x18 bytesPerElement, +0x1a/+0x1b element width/height, +0x54 compression type (1 =
++ * compressed: the base address and bytesPerRow getters answer 0). 0046 wrote bytesPerRow at +0x08, which
++ * nothing reads, so IOSurfaceGetBytesPerRowOfPlane and CVPixelBufferGetBytesPerRowOfPlane answered 0 for
++ * every plane of every surface: the camera plug-in wrote every row of its 420f frames over row 0, Metal
++ * read YCbCr planes with rows 0 apart, H264SW decoded with a stride of 0. negronisurf_planebpr=0 puts
++ * the old layout back (kill switch).
++ * (negroni_surface_plane_bpr_at, set in IOCoreSurfaceRoot::start.)
++ */
++
+ /* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). */
+ static void
+ negroni_surface_fill_result(NegroniSurface *s, NegroniSurfaceRef *ref, uint8_t *out)
+@@ -731,7 +751,7 @@ negroni_surface_fill_result(NegroniSurface *s, NegroniSurfaceRef *ref, uint8_t *
+ 		const struct negroni_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
++		put32(p, negroni_surface_plane_bpr_at, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);

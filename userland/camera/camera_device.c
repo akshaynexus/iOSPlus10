@@ -60,6 +60,25 @@
 #include "camera_isp.h"
 
 void negronicam_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
+void negronicam_console(const char *line, size_t n);
+
+/*
+ * The camera's lines also go to /dev/console, so the kernel's USB log has them (as NegroniMetal's NMTL lines):
+ * mediaserverd's stderr goes nowhere, and the unified log needs a live capture. The lines are few (first
+ * pictures, faults, each at most every 300th frame).
+ */
+void
+negronicam_console(const char *line, size_t n)
+{
+	static int console = -2;
+
+	if (console == -2) {
+		console = open("/dev/console", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+	}
+	if (console >= 0) {
+		(void)write(console, line, n);
+	}
+}
 
 void
 negronicam_say(const char *format, ...)
@@ -78,6 +97,7 @@ negronicam_say(const char *format, ...)
 	os_log(OS_LOG_DEFAULT, "%{public}s", line);
 	line[n++] = '\n';
 	(void)write(2, line, (size_t)n);
+	negronicam_console(line, (size_t)n);
 }
 #define say negronicam_say
 
@@ -432,6 +452,7 @@ struct output {
 	bool            enabled;
 	void *          handler;                /* a block: ^(CVPixelBufferRef, CMTime) */
 	bool            said_shape;
+	bool            said_rows;              /* the planes' bytesPerRow under the width, said once */
 	uint64_t        delivered, refused;
 	CVPixelBufferRef held[HELD];            /* the pictures given last, kept from the pool (see deliver) */
 	unsigned        held_next;
@@ -999,6 +1020,22 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 			out->said_shape = true;
 			say("%s: %ux%u %c%c%c%c buffers are not for this ISP", out->name, width, height, pf >> 24, pf >> 16 & 255,
 			    pf >> 8 & 255, pf & 255);
+		}
+		CVPixelBufferRelease(pb);
+		return;
+	}
+	if (pf != PF_BGRA && (CVPixelBufferGetBytesPerRowOfPlane(pb, 0) < width || CVPixelBufferGetBytesPerRowOfPlane(pb, 1) < width)) {
+		/*
+		 * A plane's bytesPerRow under its packed row: every row would land on the first ones and the
+		 * rest of the buffer would show what the pool held before (flashing colours). Before kernel patch
+		 * 0390 IOSurface answered 0 for every plane (bytesPerRow at the wrong place in the lock result).
+		 * The frame is not given; logged once per output.
+		 */
+		if (!out->said_rows) {
+			out->said_rows = true;
+			say("%s: off: %ux%u %c%c%c%c buffer planes have bytesPerRow %zu/%zu, under the width (kernel IOSurface "
+			    "plane layout, patch 0390)", out->name, width, height, pf >> 24, pf >> 16 & 255, pf >> 8 & 255, pf & 255,
+			    CVPixelBufferGetBytesPerRowOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 1));
 		}
 		CVPixelBufferRelease(pb);
 		return;

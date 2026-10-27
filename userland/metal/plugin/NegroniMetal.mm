@@ -122,6 +122,20 @@ __attribute__((constructor)) static void nmtl_error_mode(void)
 	setenv("CA_USE_CGTEXTUREDATA", "0", 0);
 	setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
 	setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+	/*
+	 * RB_COLOR_MODE=fixed (2026-10-27, blank/white widgets): RenderBox (SwiftUI's renderer: chronod's widget snapshots,
+	 * SpringBoard, SwiftUI apps) picks its RBLayer drawable format in RB::ColorMode::pixel_format from the colour mode and
+	 * the device's highest MTLGPUFamilyApple (RB::Device+0x111, supportsFamily: 1001..1007), not from
+	 * supportsExtendedXR10Formats. On our device (Apple3+) a non-opaque wide-colour layer gets MTLPixelFormatRGB10A8_2P_XR10
+	 * over a two-plane IOSurface (RenderBox's OSType '_RB4', 465x465 per widget). The frontend refused every surface with
+	 * planes, so RenderBox logged "RBDisplayList: no drawable" and backboardd "Failed to allocate MTLTexture from IOSurface"
+	 * every frame: the widget stayed blank. RB_COLOR_MODE (RenderBox's own override, parsed once at the first
+	 * RB::ColorMode, after the device exists) "fixed" sets the depth/gamut to 0: BGRA8Unorm(_sRGB), one plane, the 8-bit
+	 * display chain's format. overwrite 0: a launchd value wins; "RB_COLOR_MODE=" (empty) in NMTL_DIR/env turns it off
+	 * (load_env runs before the first ColorMode). Options RenderBox knows: deep wide extended fixed linear nonlinear 5bpc
+	 * 422 420.
+	 */
+	setenv("RB_COLOR_MODE", "fixed", 0);
 	CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 	CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 	CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
@@ -1034,18 +1048,36 @@ static void watchdog_start(void)
 		else
 			deadman_refused(strike);
 		/*
-		 * Extended-range (XR10) formats: NO in every process (the frontend answers NO too, flame 0003). The display chain is
-		 * 8-bit BGRA. With YES, the iOS 16 poster extensions (AegirPoster) render into BGR10_XR_sRGB attachments with source-alpha
-		 * blending, metal2vulkan refuses those pipelines (ExtendedRangeBlend(SrgbForm) not implemented) and the tiles stay empty.
+		 * Extended-range (XR10) formats (NEGRONIMETAL_XR10: auto = default, 0 = NO everywhere, 1 = YES everywhere).
+		 * auto: YES in the wallpaper poster extensions (name ending in Poster, PosterExtension or PosterProvider), NO elsewhere.
+		 * - NO everywhere (2026-10-25..27): the display chain is 8-bit BGRA and backboardd with YES picks a deep framebuffer the
+		 *   display driver refuses (int-089). But ClockKitUI (AegirPoster = Astronomy) sets an XR pixel format on its
+		 *   CAMetalLayer whatever the answer, and -[CAMetalLayer setPixelFormat:] -> layer_private_check_pixel_format throws
+		 *   CAMetalLayerInvalid "unsupported extended range format" when the device answers NO (QuartzCore 20H392,
+		 *   0x1883712dc): AegirPoster aborted in a loop (143 CRASH lines in logs/usblog-20261027-171256.txt).
+		 * - YES before 2026-10-25: AegirPoster's BGR10_XR_sRGB blends were refused by metal2vulkan 720ef1ce
+		 *   (ExtendedRangeBlend(SrgbForm)); metal2vulkan f6a96b7d builds every blend into BGR10_XR_sRGB (only BGRA10_XR_sRGB
+		 *   beyond the narrow blends stays refused).
 		 */
 		if (device) {
+			const char *xr = getenv("NEGRONIMETAL_XR10");
+			const char *name = getprogname() ?: ""; /* NULL before libc sets __progname: no poster */
+			const size_t nl = strlen(name);
+			auto ends = [&](const char *tail) {
+				const size_t tl = strlen(tail);
+				return nl >= tl && strcmp(name + nl - tl, tail) == 0;
+			};
+			const bool poster = ends("Poster") || ends("PosterExtension") || ends("PosterProvider");
+			const BOOL xr10 = (xr && *xr && strcmp(xr, "auto") != 0) ? (strtol(xr, NULL, 0) != 0) : poster;
 			class_replaceMethod(object_getClass(device), sel_registerName("supportsExtendedXR10Formats"),
 					    imp_implementationWithBlock(^BOOL(id me) {
 						    (void)me;
-						    return NO;
+						    return xr10;
 					    }),
 					    "B16@0:8");
-			nlog("supportsExtendedXR10Formats = 0 (NegroniMetal A730 answer: 8-bit BGRA display chain, every process)");
+			nlog("supportsExtendedXR10Formats = %d (NegroniMetal A730 answer, NEGRONIMETAL_XR10=%s: YES only in poster "
+			     "extensions by default; RB_COLOR_MODE=%s)",
+			     (int)xr10, xr && *xr ? xr : "auto", getenv("RB_COLOR_MODE") ?: "(unset)");
 			/*
 			 * MetalPerformanceShaders (MPSCore, 20H392 selector references [V ipsw dyld macho --objc-refs]) asks the device these
 			 * feature flags; the frontend has no answer for them, and an unanswered selector is an NSInvalidArgumentException in the

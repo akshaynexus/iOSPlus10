@@ -21,16 +21,20 @@
  * function (camera_device.c). With /dev/negronicam absent or failed, that create function fails at once,
  * so the capture stack has a vendor with no device instead of none at all [I: Camera.app shows its
  * "camera not available" state; the stock nil vendor came with a hung Camera launch, docs/notes.md "2026-10-26 handoff (main session, afternoon)"].
+ * The capture servers: our root has StartRecorderServer false, so mediaserverd does not start them; the
+ * constructor queues start_capture_servers() (below), which starts them after the hooks are in.
  * Scripts: scripts/camera/check-cache.sh checks the table against the cache on the host.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
+#include <objc/objc-exception.h>
 #include <objc/runtime.h>
 #include <os/log.h>
 #include <pthread.h>
@@ -41,6 +45,8 @@
 #include <unistd.h>
 #include <uuid/uuid.h>
 #include "negronicam.h"
+
+extern void negronicam_console(const char *line, size_t n);     /* camera_device.c: to /dev/console (USB log) */
 
 static void
 say(const char *format, ...)
@@ -59,6 +65,7 @@ say(const char *format, ...)
 		n = sizeof(line) - 1;
 	}
 	(void)write(2, line, (size_t)n);
+	negronicam_console(line, (size_t)n);
 	if (n > 0 && line[n - 1] == '\n') {
 		line[n - 1] = 0;
 	}
@@ -342,6 +349,44 @@ register_hevc_encoder(void)
 }
 
 /*
+ * Diagnosis of "<<<< BWGraph >>>> -[BWGraph stop:]: Not all sink nodes became idle after waiting 10s": stop: then
+ * logs the active sinks (only to the unified log), writes a stackshot report and traps (brk #1, sig 5; t27 18:36:29,
+ * section 12). The trap stays; this replacement of -[BWGraph _logActiveSinkNodesAfterGraphStopTimeout] (called just
+ * before it) also says each still-active sink (-[BWSinkNode isActive]) with its name and class, so the USB log
+ * names the node that did not finish.
+ */
+static IMP original_log_active_sinks;
+static const char *ns_string(id object, char *buffer, size_t size);
+
+static void
+log_active_sinks(id self, SEL selector)
+{
+	id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	SEL active = sel_registerName("isActive");
+	CFArrayRef sinks;
+	char name[120], cls[80];
+	unsigned n = 0;
+
+	((void (*)(id, SEL))original_log_active_sinks)(self, selector);
+	sinks = (CFArrayRef)send(self, sel_registerName("_sinkNodes"));
+	if (sinks == NULL || CFGetTypeID(sinks) != CFArrayGetTypeID()) {
+		say("negroni: camera hooks: graph stop timeout: no sink list\n");
+		return;
+	}
+	for (CFIndex i = 0; i < CFArrayGetCount(sinks); i++) {
+		id sink = (id)CFArrayGetValueAtIndex(sinks, i);
+		bool busy = class_respondsToSelector(object_getClass(sink), active) && ((BOOL (*)(id, SEL))objc_msgSend)(sink, active);
+
+		snprintf(cls, sizeof(cls), "%s", class_getName(object_getClass(sink)));
+		say("negroni: camera hooks: graph stop timeout: sink %ld %s %s (%s)\n", (long)i, busy ? "ACTIVE" : "idle",
+		    ns_string(send(sink, sel_registerName("name")), name, sizeof(name)), cls);
+		n += busy;
+	}
+	say("negroni: camera hooks: graph stop timeout: %u of %ld sinks active; mediaserverd traps now (CMCapture's own brk)\n", n,
+	    (long)CFArrayGetCount(sinks));
+}
+
+/*
  * The methods replaced, each as soon as its class exists. `expected` is the unslid address of the code in
  * iOS 16.7.x (20H392, `ipsw dyld symaddr`, docs/camera-ios-2026-10-27.md section 3) and `first` its first
  * instruction word there: a method that is not what it was is left alone. `original`, where there is one,
@@ -371,9 +416,12 @@ static struct replacement {
 	  (IMP)gnr_render, NULL, true, false },
 	{ "BWNodeOutput", "emitSampleBuffer:", 0x1a1ef3760UL, 0xd10343ffu,
 	  (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
+	{ "BWGraph", "_logActiveSinkNodesAfterGraphStopTimeout", 0x1a218a970UL, 0xa9ba6ffcu,
+	  (IMP)log_active_sinks, &original_log_active_sinks, true, false },
 };
 
 static unsigned replaced, left_alone;
+static bool replaced_ok[sizeof(replacements) / sizeof(replacements[0])];   /* this entry's method is ours now */
 
 static void
 image_added(__unused const struct mach_header *header, __unused intptr_t image_slide)
@@ -406,6 +454,7 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 			*r->original = original;
 		}
 		method_setImplementation(method, r->replacement);
+		replaced_ok[i] = true;
 		replaced++;
 		say("negroni: camera hooks: %c[%s %s] replaced (%u of %zu)\n", r->instance ? '-' : '+', r->class_name, r->selector,
 		    replaced, sizeof(replacements) / sizeof(replacements[0]));
@@ -427,6 +476,218 @@ pin_self(void)
 		return false;
 	}
 	return true;
+}
+
+/*
+ * The capture servers (docs/camera-ios-2026-10-27.md section 8). mediaserverd starts them in FigMediaServerStart
+ * (MediaToolbox) only when SubServerConfiguration.plist has StartRecorderServer true, and our root has it false
+ * (slop sweet-root-tweaks.py and scripts/audio/root-add-audio.sh: the portrait-filter prewarm of those servers
+ * called a NULL GL function before there was a GPU). Without the servers, launchd keeps the receive rights of
+ * com.apple.coremedia.capturesource / capturesession / cameraviewfinder (mediaserverd's MachServices), so
+ * -[AVCaptureSession init] in Camera.app waits for ever in csr_ensureClientEstablished -> FigXPCRemoteClientCreate
+ * ("com.apple.coremedia.capturesource", CMCapture 20H392 0x1a20307ec..0x1a2030820; the stackshots
+ * Camera-2026-10-27-050719/051639.ips: "turnstile blocked on task pid 1") and Camera.app stays black.
+ * Here, after the hooks are in (the portrait prewarm is a stub), the plug-in starts them itself, on the main
+ * queue, so after FigMediaServerStart: the same functions FigStartCaptureServers (CMCaptureCore) calls, in its
+ * order, except FigPreloadShaders (a Metal shader precompile; its only other effects are flags for ISP
+ * processors this phone does not have). Knobs in /var/db/negronicam: "noservers" = do not start them;
+ * "preload" = call the stock FigStartCaptureServers (with the shader preload) instead.
+ */
+#define NEGRONICAM_NOSERVERS_FILE "/var/db/negronicam/noservers"
+#define NEGRONICAM_PRELOAD_FILE "/var/db/negronicam/preload"
+
+/* the stock rule (feServer_ShouldStartSubServer in MediaToolbox): no plist or no key = start; else the key's value */
+static int
+stock_starts_capture_servers(void)
+{
+	CFPropertyListRef (*create)(CFStringRef) = dlsym(RTLD_DEFAULT, "CelestialCFCreatePropertyList");
+	CFPropertyListRef plist;
+	const void *value = NULL;
+	int starts = 1;
+
+	if (create == NULL) {
+		return -1;
+	}
+	plist = create(CFSTR("SubServerConfiguration.plist"));
+	if (plist != NULL && CFGetTypeID(plist) == CFDictionaryGetTypeID() &&
+	    CFDictionaryGetValueIfPresent((CFDictionaryRef)plist, CFSTR("StartRecorderServer"), &value) &&
+	    value != NULL && CFGetTypeID(value) == CFBooleanGetTypeID()) {
+		starts = value == kCFBooleanTrue;
+	}
+	if (plist != NULL) {
+		CFRelease(plist);
+	}
+	return starts;
+}
+
+static void
+start_capture_servers(__unused void *context)
+{
+	int stock = stock_starts_capture_servers();
+	void (*full)(void);
+
+	if (stock != 0) {
+		say(stock > 0 ? "negroni: camera hooks: capture servers: StartRecorderServer is on, mediaserverd starts them itself\n" :
+		    "negroni: camera hooks: capture servers NOT started: CelestialCFCreatePropertyList not found (cannot tell whether "
+		    "mediaserverd starts them)\n");
+		return;
+	}
+	if (access(NEGRONICAM_NOSERVERS_FILE, F_OK) == 0) {
+		say("negroni: camera hooks: capture servers NOT started: %s exists (Camera.app will wait at launch)\n",
+		    NEGRONICAM_NOSERVERS_FILE);
+		return;
+	}
+	if (objc_getClass("BWCoreImageFilterRenderer") == NULL &&
+	    dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_NOW | RTLD_GLOBAL) == NULL) {
+		say("negroni: camera hooks: capture servers NOT started: CMCapture does not load (%s)\n", dlerror());
+		return;
+	}
+	/* replacements[0] = the portrait prewarm (the old crash), [1] = the device vendor */
+	if (!replaced_ok[0] || !replaced_ok[1]) {
+		say("negroni: camera hooks: capture servers NOT started: the portrait prewarm (%s) or the vendor (%s) is not replaced\n",
+		    replaced_ok[0] ? "ok" : "stock", replaced_ok[1] ? "ok" : "stock");
+		return;
+	}
+	if (access(NEGRONICAM_PRELOAD_FILE, F_OK) == 0) {
+		if ((full = dlsym(RTLD_DEFAULT, "FigStartCaptureServers")) == NULL) {
+			say("negroni: camera hooks: capture servers NOT started: %s exists but FigStartCaptureServers not found\n",
+			    NEGRONICAM_PRELOAD_FILE);
+			return;
+		}
+		say("negroni: camera hooks: capture servers: FigStartCaptureServers (with the shader preload, %s)\n", NEGRONICAM_PRELOAD_FILE);
+		full();
+		say("negroni: camera hooks: capture servers started (stock list): com.apple.coremedia.capturesource/capturesession answer now\n");
+		return;
+	}
+	{
+		/* FigStartCaptureServers' list and order (20H392 CMCaptureCore 0x1d3fdc828), without FigPreloadShaders */
+		const struct {
+			const char *name;
+			void (*start)(void);
+		} servers[] = {
+			{ "FigCaptureMemoryReporterStart", (void (*)(void))dlsym(RTLD_DEFAULT, "FigCaptureMemoryReporterStart") },
+			{ "FigCaptureSourceServerStart", (void (*)(void))dlsym(RTLD_DEFAULT, "FigCaptureSourceServerStart") },
+			{ "FigCameraViewfinderServerStart", (void (*)(void))dlsym(RTLD_DEFAULT, "FigCameraViewfinderServerStart") },
+			{ "FigCaptureSessionServerStart", (void (*)(void))dlsym(RTLD_DEFAULT, "FigCaptureSessionServerStart") },
+			{ "FigFlashlightServerStart", (void (*)(void))dlsym(RTLD_DEFAULT, "FigFlashlightServerStart") },
+			{ "FigCaptureDeferredContainerManagerServerStart",
+			  (void (*)(void))dlsym(RTLD_DEFAULT, "FigCaptureDeferredContainerManagerServerStart") },
+		};
+		unsigned started = 0, missing = 0;
+
+		/* all or nothing: a part of the list (e.g. a session server without its source server) is worse than none */
+		for (size_t i = 0; i < sizeof(servers) / sizeof(servers[0]); i++) {
+			if (servers[i].start == NULL) {
+				say("negroni: camera hooks: capture servers NOT started: %s not found\n", servers[i].name);
+				missing++;
+			}
+		}
+		if (missing != 0) {
+			return;
+		}
+		for (size_t i = 0; i < sizeof(servers) / sizeof(servers[0]); i++) {
+			servers[i].start();
+			started++;
+		}
+		say("negroni: camera hooks: capture servers started (%u of %zu, shader preload skipped): "
+		    "com.apple.coremedia.capturesource/capturesession answer now\n", started, sizeof(servers) / sizeof(servers[0]));
+	}
+}
+
+/*
+ * The preview's image-queue sink (-[BWImageQueueSinkNode _updateInputRequirements]) asks VideoToolbox
+ * FigGetAlignmentForIOSurfaceOutputToDisplayService (20H392 0x194f3b410) for the display's plane base alignment. That
+ * reads the AppleCLCD property "DisplayPipePlaneBaseAlignment" as a dictionary and takes its
+ * "PlaneBaseAlignmentLinear" (CFDictionaryGetValue at 0x194f3b488). Our kernel's AppleCLCD stand-in (slop 0046/0061,
+ * our 0250/0253) publishes it as the number 64, so CFDictionaryGetValue sent -objectForKey: to an NSNumber:
+ * NSInvalidArgumentException, mediaserverd abort at each Camera.app session start (t27 18:29, section 11).
+ * The function keeps its answer in two statics: _planeBaseRequirement.requirement (__DATA 0x1dd2bd42c) and
+ * _planeBaseRequirement.checked (__bss 0x1dd2bd853). We store the kernel's value (64) and mark it checked, so the
+ * registry is not read. Guards: cache UUID (constructor), the function's first word and the ldrb of `checked`.
+ * (The stride query of the same function reads "DisplayPipeStrideRequirements", which our AppleCLCD does not
+ * publish: NULL, the default 64, no exception.)
+ */
+#define DISPLAY_ALIGN_FUNCTION  0x194f3b410UL   /* _FigGetAlignmentForIOSurfaceOutputToDisplayService */
+#define DISPLAY_ALIGN_FIRST     0xd10183ffu     /* sub sp, sp, #0x60 */
+#define DISPLAY_ALIGN_LDRB      0x194f3b43cUL   /* ldrb w8, [x25, #0x853]: reads `checked` */
+#define DISPLAY_ALIGN_LDRB_WORD 0x39614f28u
+#define DISPLAY_ALIGN_CHECKED   0x1dd2bd853UL   /* _planeBaseRequirement.checked (uint8_t) */
+#define DISPLAY_ALIGN_VALUE     0x1dd2bd42cUL   /* _planeBaseRequirement.requirement (uint32_t) */
+#define DISPLAY_ALIGN_BYTES     64              /* the kernel's DisplayPipePlaneBaseAlignment */
+
+static void
+seed_display_alignment(void)
+{
+	uint32_t first = 0, ldrb = 0;
+	volatile uint8_t *checked = (volatile uint8_t *)(DISPLAY_ALIGN_CHECKED + slide);
+	volatile uint32_t *value = (volatile uint32_t *)(DISPLAY_ALIGN_VALUE + slide);
+
+	if (dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL) == NULL) {
+		say("negroni: camera hooks: display alignment NOT seeded: VideoToolbox does not load\n");
+		return;
+	}
+	memcpy(&first, (const void *)(DISPLAY_ALIGN_FUNCTION + slide), sizeof(first));
+	memcpy(&ldrb, (const void *)(DISPLAY_ALIGN_LDRB + slide), sizeof(ldrb));
+	if (first != DISPLAY_ALIGN_FIRST || ldrb != DISPLAY_ALIGN_LDRB_WORD) {
+		say("negroni: camera hooks: display alignment NOT seeded: code is %#x/%#x, expected %#x/%#x\n", first, ldrb,
+		    DISPLAY_ALIGN_FIRST, DISPLAY_ALIGN_LDRB_WORD);
+		return;
+	}
+	if (*checked) {
+		say("negroni: camera hooks: display alignment already read (%u), left as it is\n", *value);
+		return;
+	}
+	*value = DISPLAY_ALIGN_BYTES;
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	*checked = 1;
+	say("negroni: camera hooks: display plane base alignment seeded (%u bytes; AppleCLCD's DisplayPipePlaneBaseAlignment is "
+	    "a number, VideoToolbox wants a dictionary)\n", DISPLAY_ALIGN_BYTES);
+}
+
+/*
+ * An Objective-C exception that nobody catches ends mediaserverd in abort() (sig 6, t27 18:25: after the first
+ * pictures of each Camera.app session, thrown on a dispatch queue, so the kernel's backtrace shows only the
+ * terminate path). This handler says its name, reason and the return addresses of where it was thrown (unslid:
+ * `ipsw dyld a2s out/dsc/cache/dyld_shared_cache_arm64 ADDR`), to the USB log too, and then calls the handler
+ * that was there before (CoreFoundation's, which logs and lets the process end as before).
+ */
+static objc_uncaught_exception_handler previous_exception_handler;
+
+static const char *
+ns_string(id object, char *buffer, size_t size)
+{
+	if (object == NULL || !CFStringGetCString((CFStringRef)object, buffer, (CFIndex)size, kCFStringEncodingUTF8)) {
+		snprintf(buffer, size, "?");
+	}
+	return buffer;
+}
+
+static void
+uncaught_exception(id exception)
+{
+	char name[96], reason[240], frames[16 * 40] = "", *at = frames;
+	id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	CFArrayRef addresses = (CFArrayRef)send(exception, sel_registerName("callStackReturnAddresses"));
+	size_t length = 0;
+	uintptr_t base = (uintptr_t)_dyld_get_shared_cache_range(&length);
+
+	say("negroni: camera hooks: UNCAUGHT EXCEPTION %s: %s\n", ns_string(send(exception, sel_registerName("name")), name, sizeof(name)),
+	    ns_string(send(exception, sel_registerName("reason")), reason, sizeof(reason)));
+	/*
+	 * The throw's return addresses on one line (16 lines in a row did not all reach the USB log at t27 18:29, only
+	 * the unified log): "c" = unslid shared-cache address (ipsw dyld a2s), "x" = an address outside the cache.
+	 */
+	for (CFIndex i = 0; addresses != NULL && i < CFArrayGetCount(addresses) && i < 16; i++) {
+		uint64_t a = 0;
+
+		CFNumberGetValue((CFNumberRef)CFArrayGetValueAtIndex(addresses, i), kCFNumberSInt64Type, &a);
+		at += snprintf(at, (size_t)(frames + sizeof(frames) - at), " %s%llx", a >= base && a < base + length ? "c" : "x",
+		    (unsigned long long)(a >= base && a < base + length ? a - slide : a));
+	}
+	say("negroni: camera hooks: throw stack:%s\n", frames[0] ? frames : " (none)");
+	if (previous_exception_handler != NULL) {
+		previous_exception_handler(exception);
+	}
 }
 
 __attribute__((constructor))
@@ -463,7 +724,11 @@ negroni_camera_init(void)
 	if (access(NEGRONICAM_DEVICE, F_OK) == 0) {
 		register_hevc_encoder();
 	}
+	previous_exception_handler = objc_setUncaughtExceptionHandler(uncaught_exception);
+	seed_display_alignment();
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */
+	/* the main queue runs once mediaserverd's main() is in its run loop: after FigMediaServerStart */
+	dispatch_async_f(dispatch_get_main_queue(), NULL, start_capture_servers);
 }
 
 /*

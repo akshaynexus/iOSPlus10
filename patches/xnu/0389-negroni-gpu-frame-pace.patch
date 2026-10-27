@@ -1,0 +1,812 @@
+diff --git a/bsd/dev/negroni_adreno.c b/bsd/dev/negroni_adreno.c
+index b605620..7c58b2f 100644
+--- a/bsd/dev/negroni_adreno.c
++++ b/bsd/dev/negroni_adreno.c
+@@ -216,9 +216,15 @@ static bool k_args_read, hfi_runtime;
+  *   negronigpu_dispoff_slumber  1 = IFPC mode slumbers only while the display is off; 0 = after negronigpu_ifpc_slumber ms
+  *                            idle with the display on too (0298)
+  * negronigpu_level=N (0235) is now a fixed level: the governor is off when it is set.
++ *
++ * Patch 0389 (README-gpu-kernel.md section 29): frame-pacing floor for the governor.
++ *   negronigpu_pace          kill switch: 0 = off (default 1 = on while the 0384 governor runs)
++ *   negronigpu_inputboost    kill switch: 0 = no GPU level floor at touch (default 1, needs the pacing floor)
++ *   negronigpu_tz            kill switch: 0 = no TrustZone DCVS (msm_adreno_tz port); simple_ondemand (0384) decides
+  */
+ static uint32_t k_gov = 1, k_up = 90, k_down = 5, k_minlevel = 1, k_maxlevel = 12, k_late_pct = 10;
+ static uint32_t k_irq = 1, k_irq_poll_us = 1000, k_irq_intid = 332, k_dispoff_slumber = 1;
++static uint32_t k_pace = 1, k_inputboost = 1, k_tz = 1;
+ 
+ static void
+ k_args(void)
+@@ -237,6 +243,9 @@ k_args(void)
+ 	(void)PE_parse_boot_argn("negronigpu_irq_poll_us", &k_irq_poll_us, sizeof(k_irq_poll_us));
+ 	(void)PE_parse_boot_argn("negronigpu_irq_intid", &k_irq_intid, sizeof(k_irq_intid));
+ 	(void)PE_parse_boot_argn("negronigpu_dispoff_slumber", &k_dispoff_slumber, sizeof(k_dispoff_slumber));
++	(void)PE_parse_boot_argn("negronigpu_pace", &k_pace, sizeof(k_pace));
++	(void)PE_parse_boot_argn("negronigpu_inputboost", &k_inputboost, sizeof(k_inputboost));
++	(void)PE_parse_boot_argn("negronigpu_tz", &k_tz, sizeof(k_tz));
+ 	k_up = k_up < 10 ? 10 : k_up > 100 ? 100 : k_up;
+ 	k_down = k_down >= k_up ? k_up / 2 : k_down;
+ 	k_maxlevel = k_maxlevel < 1 ? 1 : k_maxlevel > 12 ? 12 : k_maxlevel;
+@@ -2825,6 +2834,7 @@ static uint32_t pm_wake_retries;                /* 0384: failed slumber wakes th
+ static void rec_reset(uint32_t n, bool collapse);
+ bool negroni_gpu_done(uint32_t fence);
+ static uint64_t busy_last_xo, busy_last_ao, busy_acc_xo, busy_acc_ao;   /* 0298: GMU busy counter */
++static uint64_t busy_tick_xo, busy_tick_ao;     /* 0389: the last tick's raw deltas (19.2 MHz ticks) for the TZ governor */
+ static bool busy_counter_ok = true;
+ static uint32_t busy_zero_ticks;
+ 
+@@ -4471,12 +4481,15 @@ busy_counter_pct(bool pending)
+ 	uint64_t dxo = xo - busy_last_xo, dao = ao - busy_last_ao;
+ 	busy_last_xo = xo;
+ 	busy_last_ao = ao;
++	busy_tick_xo = dxo;
++	busy_tick_ao = dao;
+ 	busy_acc_xo += dxo;
+ 	busy_acc_ao += dao;
+ 	if (dxo == 0 && pending) {
+-		if (++busy_zero_ticks >= 50) {
++		busy_zero_ticks += (uint32_t)MIN(dao / 19200, 1000ull);        /* 0389: ms (ticks are 10 ms with the TZ poll) */
++		if (busy_zero_ticks >= 5000) {
+ 			busy_counter_ok = false;
+-			printf("NEGRONI GPU DCVS: the GMU busy counter did not move in 50 ticks with work queued: the fence rule stays\n");
++			printf("NEGRONI GPU DCVS: the GMU busy counter did not move in 5 s with work queued: the fence rule stays\n");
+ 		}
+ 	} else if (dxo != 0) {
+ 		busy_zero_ticks = 0;
+@@ -4494,8 +4507,308 @@ busy_counter_pct(bool pending)
+  * (negroni_gpu_late_frames) with busy >= negronigpu_late_pct -> one level up.
+  */
+ static uint32_t gov_pct_acc, gov_pct_ms, gov_pct_last, gov_late_boosts, gov_late_seen, gov_tops;
++
++/*
++ * 0389: frame-pacing floor. [V logs/usblog-20261027-171256.txt, scripts/display/fbstat-report.py] With the UI moving,
++ * simple_ondemand sees the GMU busy share of a 100 ms tick: 20-30 % (CoreAnimation renders one frame, then the GPU idles
++ * until the next vsync tick), so it picks the lowest level >= cur x busy / 87.5 % (220-317 MHz) although the display
++ * holds frames for the GPU: 1160 active seconds with >= 10 "gpu-wait skips" averaged 0.85 held ticks per frame, the DCVS
++ * line showed 8.2 level changes a second (late-frame step up, busy rule down again), end level 363 MHz mean; in seconds
++ * with 100-130 presents the skips were 0.1/s. corr(skips, presents/s) = -0.72 over the 242 seconds with >= 40 swaps.
++ * A busy-share governor cannot see a latency limit; KGSL's msm-adreno-tz has the same blind spot and Android adds
++ * input/frame boosts in userspace.
++ * Rule: in a governor tick where the UI swapped and the display held a frame for the GPU in at least PACE_LATE_PER_100MS
++ * of the (12 per 100 ms) vsync ticks, the floor goes to max(floor, current level) + 1 (+ 2 when half of the ticks held a
++ * frame). Without such a tick for PACE_HOLD_MS the floor goes down one level, then one more every PACE_STEP_MS until a
++ * tick is late again, so it settles at the lowest level that keeps the frames on time; when a step down was late, the
++ * next step down waits PACE_PROBE_HOLD_MS (fewer probe misses while the content stays the same). No swap for PACE_IDLE_MS: the floor is dropped (simple_ondemand alone, level 1 when idle) and
++ * remembered; the next UI burst starts one level under it (the VRR wake and the first touch frames). Display off: none.
++ * The thermal cap (0280) and negronigpu_maxlevel still win. negronigpu_pace=0: off.
++ */
++#define PACE_LATE_PER_100MS     2       /* held vsync ticks per 100 ms (of 12) that count as "the GPU is late" */
++#define PACE_FAST_PER_100MS     6       /* half of the ticks held: two levels at once */
++#define PACE_HOLD_MS            500     /* no late tick this long after a raise: one level down */
++#define PACE_PROBE_HOLD_MS      2000    /* a step down was late again: the next step down waits this long */
++#define PACE_STEP_MS            200     /* then one more level down every this long while no tick is late */
++#define PACE_IDLE_MS            300     /* no swap this long: the floor goes (remembered for the next burst) */
++#define PACE_FORGET_MS          10000   /* idle this long: the remembered level is forgotten */
++#define PACE_TOP_MS             5000    /* at the top allowed level and still late this long: one line */
++static bool pace_on;
++static uint32_t pace_floor, pace_resume, pace_quiet_ms, pace_idle_ms, pace_top_ms;
++static uint32_t pace_sec_late, pace_sec_swaps, pace_sec_raises, pace_sec_decays, pace_sec_resumes, pace_sec_max;
++static bool pace_top_logged, pace_was, pace_falling;
++static uint32_t pace_acc_late, pace_acc_sw, pace_acc_ms;
++
++/*
++ * 0389 input boost: a finger down or moving (negroni_touch.c touch_report -> negroni_input_boost) holds the GPU at
++ * PACE_INPUT_LEVEL or more for PACE_INPUT_MS after the last report, so the first frames of a touch burst do not start at
++ * 220 MHz (VRR wake second: 11.2 presents/s, the 2 after 15.2/14.6). The watch is woken at once when it is in its 250 ms
++ * idle tick. The pacing floor still goes higher when frames are late. One hook for every input-driven boost: the CPU
++ * side may add its own call inside negroni_input_boost(). negronigpu_inputboost=0: off.
++ */
++#define PACE_INPUT_LEVEL        6       /* 492 MHz, bus 6: mid table */
++#define PACE_INPUT_MS           200
++static bool input_boost_on;
++static volatile uint64_t input_boost_at;        /* mach time of the last input report (0: none) */
++static uint64_t input_boost_abs;
++static uint32_t pace_sec_inputs;
++static volatile uint32_t input_boost_reports;
++static uint32_t pace_hold_ms = PACE_HOLD_MS;
++
+ static uint32_t
+-gov_want(uint32_t cur, uint32_t pct, uint32_t min, uint32_t max)
++pace_tick(uint32_t late, uint32_t sw, uint32_t ms, bool dark, uint32_t max)
++{
++	if (!pace_on) {
++		return 0;
++	}
++	pace_sec_late += late;
++	pace_sec_swaps += sw;
++	if (dark) {
++		pace_floor = pace_resume = pace_quiet_ms = pace_idle_ms = pace_top_ms = 0;
++		pace_falling = false;
++		return 0;
++	}
++	if (sw == 0) {
++		pace_idle_ms += ms;
++		if (pace_idle_ms >= PACE_IDLE_MS && pace_floor != 0) {
++			pace_resume = pace_floor;
++			pace_floor = pace_quiet_ms = pace_top_ms = 0;
++			pace_falling = false;
++		}
++		if (pace_idle_ms >= PACE_FORGET_MS) {
++			pace_resume = 0;
++		}
++		return pace_floor;
++	}
++	if (pace_idle_ms >= PACE_IDLE_MS && pace_resume > 1 && pace_floor < pace_resume - 1) {
++		pace_floor = MIN(pace_resume - 1, max);         /* a new burst: one under the level that kept up last time */
++		pace_quiet_ms = 0;
++		pace_falling = true;            /* not proven for this burst: down at the fast step */
++		pace_sec_resumes++;
++	}
++	pace_idle_ms = 0;
++	uint32_t per100 = late * 100 / MAX(ms, 1u);
++	if (per100 >= PACE_LATE_PER_100MS) {
++		uint32_t base = MAX(pace_floor, dcvs_level);
++		uint32_t up = per100 >= PACE_FAST_PER_100MS ? 2 : 1;
++		pace_floor = MIN(base + up, max);
++		pace_quiet_ms = 0;
++		pace_hold_ms = pace_falling ? PACE_PROBE_HOLD_MS : PACE_HOLD_MS;     /* the level under was too low */
++		pace_falling = false;
++		pace_sec_raises++;
++		if (pace_floor >= max) {
++			pace_top_ms += ms;
++			if (pace_top_ms >= PACE_TOP_MS && !pace_top_logged) {
++				pace_top_logged = true;
++				printf("NEGRONI GPU PACE: at the top allowed level %u (%u MHz, cap %u) for %u ms and frames still wait: the "
++				    "render time, not the clock, limits the frame rate now\n", max, gpu_khz[max] / 1000,
++				    negroni_thermal_gpu_cap(), pace_top_ms);
++			}
++		} else {
++			pace_top_ms = 0;
++		}
++	} else if (pace_floor != 0) {
++		pace_top_ms = 0;
++		pace_quiet_ms += ms;
++		if (pace_quiet_ms >= (pace_falling ? PACE_STEP_MS : pace_hold_ms)) {
++			pace_floor--;
++			pace_quiet_ms = 0;
++			pace_falling = true;
++			pace_sec_decays++;
++		}
++	}
++	if (pace_floor > max) {
++		pace_floor = max;
++	}
++	pace_sec_max = MAX(pace_sec_max, pace_floor);
++	return pace_floor;
++}
++
++/*
++ * 0389: msm_adreno_tz, the GPU governor of the phone's own Android kernel, ported. Source (GPL-2.0-only, SPDX kept by
++ * reference): OnePlusOSS android_kernel_oneplus_sm8450, branch oneplus/sm8450_b_16.0_oneplus_10_pro, commit e9da592
++ * (QCOM AU_LINUX_KERNEL.PLATFORM.1.0.R1.00.00.00.000.130), drivers/gpu/msm/governor_msm_adreno_tz.c
++ * ("Copyright (c) 2010-2021, The Linux Foundation. Copyright (c) 2022 Qualcomm Innovation Center, Inc."),
++ * kgsl_pwrscale.c, drivers/firmware/qcom_scm.c; fetched by scripts/setup/fetch-gpu-governor-sources.sh.
++ * The level decision is TrustZone's (QCOM_SCM_SVC_DCVS): Android gives TZ the pwrlevel frequency table once
++ * (DCVS_INIT_V2) and every devfreq poll (10 ms, kgsl_pwrscale polling_ms / KGSL_GOVERNOR_CALL_INTERVAL) the current
++ * pwrlevel and the busy and total time in us of the bin (DCVS_UPDATE_V2); TZ answers a level step. Kernel side, as
++ * tz_get_target_freq: bins below FLOOR (5 ms) are kept; a bin with less than MIN_BUSY (1 ms) busy at the lowest level is
++ * kept; busy > CEILING (50 ms) jumps to pwrlevel 0 (the top); mod_percent 100. Busy = GMU power counter XOCLK_0 x 10 / 192
++ * (gen7_power_stats), total = the GMU always-on counter (both 19.2 MHz). Level index: KGSL pwrlevel 0 = 818 MHz ..
++ * 11 = 220 MHz (live.dts qcom,gpu-pwrlevel@0..11) = our level 12 - pwrlevel. No context-aware DCVS (no qcom,enable-ca-jump
++ * in live.dts) and no busy-time burst disable (no qcom,disable-busy-time-burst). gpubw_mon is not ported: it needs the
++ * GBIF RAM counters (gen7_read_bus_stats); the bus vote stays the level's DT qcom,bus-freq (KGSL's default).
++ * Self-check: is-call-available for DCVS INIT/UPDATE/RESET (qcom_scm_dcvs_core_available), then INIT_V2 must return 0
++ * and version 0 (MAX_TZ_VERSION); else simple_ondemand (0384) with one line. Three failed updates in a row: the same.
++ */
++#define TZ_SVC_DCVS             0x0d
++#define TZ_DCVS_RESET           0x07
++#define TZ_DCVS_UPDATE          0x08
++#define TZ_DCVS_INIT            0x09
++#define TZ_DCVS_UPDATE_V2       0x0a
++#define TZ_DCVS_INIT_V2         0x0b
++#define TZ_FLOOR_US             5000
++#define TZ_MIN_BUSY_US          1000
++#define TZ_CEILING_US           50000
++#define TZ_MAX_PWRLEVELS        16      /* MSM_ADRENO_MAX_PWRLEVELS */
++#define TZ_POLL_MS              10      /* kgsl_pwrscale polling_ms */
++#define SCM_ARGS_RW_VAL         (2 | 2 << 4)    /* QCOM_SCM_ARGS(2, QCOM_SCM_RW, QCOM_SCM_VAL) */
++#define SCM_ARGS_3VAL           3
++#define SCM_WAITQ_SLEEP         2       /* QCOM_SCM_WAITQ_SLEEP / _WAKE (qcom_scm.h) */
++#define SCM_WAITQ_WAKE          3
++static bool tz_on, tz_suspended;
++static uint64_t tz_bin_total, tz_bin_busy;
++static uint32_t tz_errors, tz_sec_calls, tz_sec_ups, tz_sec_downs, tz_sec_bursts;
++
++/* One SCM call without the bring-up print and pause of scm() (runtime: up to 100 a second). */
++static int32_t
++scm_quiet(uint64_t function, uint64_t args, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *answer)
++{
++	uint64_t session = 0;
++
++	for (int i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
++		register uint64_t x1 __asm__("x1") = args;
++		register uint64_t x2 __asm__("x2") = a0;
++		register uint64_t x3 __asm__("x3") = a1;
++		register uint64_t x4 __asm__("x4") = a2;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
++		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		session = x6;
++		if (x0 != SCM_INTERRUPTED) {
++			*answer = x1;
++			return (int32_t)x0;
++		}
++	}
++	return -1;
++}
++
++/* tz_start + tz_init: the pwrlevel table to TrustZone. false: not available (the reason is logged). */
++static bool
++tz_start(void)
++{
++	uint64_t answer = 0, how = SCM_FAST | SCM_64 | SCM_SIP | SCM_IS_CALL_AVAILABLE;
++	static const uint32_t need[3] = { TZ_DCVS_INIT, TZ_DCVS_UPDATE, TZ_DCVS_RESET };
++
++	for (int i = 0; i < 3; i++) {
++		answer = 0;
++		if (scm_quiet(how, SCM_ONE_VALUE, SCM_SIP | SCM_CALL(TZ_SVC_DCVS, need[i]), 0, 0, &answer) != 0 || answer != 1) {
++			printf("NEGRONI GPU TZ: off: TrustZone has no DCVS call %#x (is-call-available %llu): simple_ondemand decides\n",
++			    need[i], answer);
++			return false;
++		}
++	}
++	vm_offset_t page = 0;
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("NEGRONI GPU TZ: off: no memory for the level table\n");
++		return false;
++	}
++	/* tz_pwrlevels[0] = the number of levels, then freq_table[] in Hz, pwrlevel 0 (the top) first */
++	uint32_t *t = (uint32_t *)page, top = sizeof(gpu_khz) / sizeof(gpu_khz[0]) - 1;
++	t[0] = top;
++	for (uint32_t p = 0; p < top; p++) {
++		t[1 + p] = gpu_khz[top - p] * 1000;
++	}
++	clean_dcache(page, PAGE_SIZE, FALSE);   /* TrustZone reads memory (dma_sync_single_for_device) */
++	answer = ~0ull;
++	int32_t r = scm_quiet(SCM_64 | SCM_SIP | SCM_CALL(TZ_SVC_DCVS, TZ_DCVS_INIT_V2), SCM_ARGS_RW_VAL, kvtophys(page),
++	    (TZ_MAX_PWRLEVELS + 1) * sizeof(uint32_t), 0, &answer);
++	kmem_free(kernel_map, page, PAGE_SIZE);
++	if (r != 0 || answer > 0) {
++		printf("NEGRONI GPU TZ: off: DCVS_INIT_V2 returned %d, version %llu (want 0, 0): simple_ondemand decides\n", r, answer);
++		return false;
++	}
++	printf("NEGRONI GPU TZ: on (0389, msm_adreno_tz port): %u levels %u..%u MHz to TrustZone (DCVS_INIT_V2 version 0), "
++	    "poll %u ms, floor %u us, min busy %u us, ceiling %u us; negronigpu_tz=0 = off\n", top, gpu_khz[top] / 1000,
++	    gpu_khz[1] / 1000, TZ_POLL_MS, TZ_FLOOR_US, TZ_MIN_BUSY_US, TZ_CEILING_US);
++	return true;
++}
++
++/* tz_suspend: the display went off (KGSL: the GPU suspends). */
++static void
++tz_reset(void)
++{
++	uint64_t answer;
++
++	tz_bin_total = tz_bin_busy = 0;
++	(void)scm_quiet(SCM_64 | SCM_SIP | SCM_CALL(TZ_SVC_DCVS, TZ_DCVS_RESET), 0, 0, 0, 0, &answer);
++}
++
++/* tz_get_target_freq on our levels (1 = 220 .. 12 = 818 MHz); returns the wanted level. */
++static uint32_t
++tz_want(uint32_t cur, uint32_t min, uint32_t max)
++{
++	uint32_t top = sizeof(gpu_khz) / sizeof(gpu_khz[0]) - 1;
++	uint64_t tot_us = busy_tick_ao * 10 / 192, busy_us = busy_tick_xo * 10 / 192;     /* us */
++	int32_t level = (int32_t)(top - cur), val;     /* KGSL pwrlevel */
++
++	if (cur < 1 || cur > top) {
++		return cur;                                     /* TZ gets only pwrlevels 0..top - 1 */
++	}
++	busy_us = MIN(busy_us, tot_us);                        /* mod_percent 100 */
++	tz_bin_total += tot_us;
++	tz_bin_busy += busy_us;
++	if (tot_us == 0 || tz_bin_total < TZ_FLOOR_US ||
++	    (tz_bin_busy < TZ_MIN_BUSY_US && level == (int32_t)top - 1)) {
++		return cur;
++	}
++	if (tz_bin_busy > TZ_CEILING_US) {
++		val = -level;
++		tz_sec_bursts++;
++	} else {
++		uint64_t answer = 0;
++		int32_t r = scm_quiet(SCM_64 | SCM_SIP | SCM_CALL(TZ_SVC_DCVS, TZ_DCVS_UPDATE_V2), SCM_ARGS_3VAL, (uint64_t)level,
++		    tz_bin_total, tz_bin_busy, &answer);
++		tz_sec_calls++;
++		if (r != 0) {
++			tz_bin_total = tz_bin_busy = 0;
++			if (r == SCM_WAITQ_SLEEP || r == SCM_WAITQ_WAKE) {
++				tz_on = false;          /* qcom_scm-smc.c: needs WAITQ_RESUME after the wait-queue IRQ; not ported */
++				printf("NEGRONI GPU TZ: off: DCVS_UPDATE_V2 answered wait-queue %d: simple_ondemand decides now\n", r);
++				return cur;
++			}
++			if (++tz_errors >= 3) {
++				tz_on = false;
++				printf("NEGRONI GPU TZ: off: DCVS_UPDATE_V2 failed 3 times (last %d): simple_ondemand decides now\n", r);
++			}
++			return cur;
++		}
++		tz_errors = 0;
++		val = (int32_t)answer;
++	}
++	tz_bin_total = tz_bin_busy = 0;
++	if (val != 0) {
++		level += val;
++		level = level < 0 ? 0 : level > (int32_t)top - 1 ? (int32_t)top - 1 : level;
++		val < 0 ? tz_sec_ups++ : tz_sec_downs++;
++	}
++	uint32_t want = top - (uint32_t)level;
++	return want < min ? min : want > max ? max : want;
++}
++
++/* 0389: called by the touch driver on every finger-down / move report (any thread, no lock). */
++void negroni_input_boost(void);
++void
++negroni_input_boost(void)
++{
++	if (!input_boost_on) {
++		return;
++	}
++	uint64_t now = mach_absolute_time(), last = input_boost_at;
++	input_boost_at = now;
++	__atomic_fetch_add(&input_boost_reports, 1, __ATOMIC_RELAXED);
++	if ((last == 0 || now - last > input_boost_abs) && pm_watch_idle) {
++		thread_wakeup((event_t)&gpu_kept);      /* the watch leaves its 250 ms idle tick now */
++	}
++}
++
++static uint32_t
++gov_want(uint32_t cur, uint32_t pct, uint32_t min, uint32_t max, uint32_t late)
+ {
+ 	uint32_t want;
+ 
+@@ -4509,7 +4822,6 @@ gov_want(uint32_t cur, uint32_t pct, uint32_t min, uint32_t max)
+ 		for (want = min; want < max && gpu_khz[want] < target; want++) {
+ 		}
+ 	}
+-	uint32_t late = __atomic_exchange_n(&negroni_gpu_late_frames, 0, __ATOMIC_RELAXED);
+ 	gov_late_seen += late;
+ 	if (late && k_late_pct && pct >= k_late_pct && want <= cur && cur < max) {
+ 		want = cur + 1;
+@@ -4542,7 +4854,9 @@ dcvs_tick(bool gx, bool busy, uint32_t cpct, uint32_t ms, uint32_t *idle_ms, uin
+ 		*ticks = *busy_ticks = 0;
+ 	}
+ 	/* 0286: the swap rate over at least 100 ms */
+-	dcvs_ui_count += __atomic_exchange_n(&negroni_gpu_ui_swaps, 0, __ATOMIC_RELAXED);
++	uint32_t sw = __atomic_exchange_n(&negroni_gpu_ui_swaps, 0, __ATOMIC_RELAXED);
++	uint32_t late = __atomic_exchange_n(&negroni_gpu_late_frames, 0, __ATOMIC_RELAXED);     /* 0389: read once here */
++	dcvs_ui_count += sw;
+ 	dcvs_ui_ms += ms;
+ 	if (dcvs_ui_ms >= DCVS_TICK_MS) {
+ 		dcvs_ui_rate = dcvs_ui_count * 1000 / dcvs_ui_ms;
+@@ -4576,10 +4890,40 @@ dcvs_tick(bool gx, bool busy, uint32_t cpct, uint32_t ms, uint32_t *idle_ms, uin
+ 			gov_pct_acc += pct * ms;
+ 			gov_pct_ms += ms;
+ 			gov_pct_last = pct;
+-			want = gov_want(dcvs_level, pct, floor, max < top ? max : top);
++			/* 0389: TZ only with this tick's counter sample (busy_tick_*); without the counter: simple_ondemand */
++			if (tz_on && !busy_counter_ok) {
++				tz_on = false;
++				printf("NEGRONI GPU TZ: off: the GMU busy counter was given up: simple_ondemand (fence rule) decides now\n");
++			}
++			want = tz_on && cpct != ~0u ? tz_want(dcvs_level, floor, max < top ? max : top) :
++			    gov_want(dcvs_level, pct, floor, max < top ? max : top, late);
++		}
++		/* 0389: the frame-pacing floor (0 = none); the thermal cap below still wins */
++		/* the pacing rule counts per 100 ms window (the TZ poll is 10 ms) */
++		pace_acc_late += late;
++		pace_acc_sw += sw;
++		pace_acc_ms += ms;
++		uint32_t pace = pace_floor;
++		if (dark || pace_acc_ms >= DCVS_TICK_MS) {
++			pace = pace_tick(pace_acc_late, pace_acc_sw, pace_acc_ms, dark, max < top ? max : top);
++			pace_acc_late = pace_acc_sw = pace_acc_ms = 0;
++		}
++		uint64_t in_at = input_boost_at;
++		if (input_boost_on && !dark && in_at != 0 && mach_absolute_time() - in_at <= input_boost_abs) {
++			pace = MAX(pace, MIN((uint32_t)PACE_INPUT_LEVEL, max < top ? max : top));   /* 0389 input boost */
++			pace_sec_inputs++;
++		}
++		if (pace > want) {
++			want = pace;
+ 		}
+ 		if (dark) {
+ 			want = floor;
++			if (tz_on && !tz_suspended) {
++				tz_suspended = true;
++				tz_reset();             /* 0389: tz_suspend */
++			}
++		} else {
++			tz_suspended = false;
+ 		}
+ 	} else if (*idle_ms >= DCVS_IDLE_MS) {
+ 		want = DCVS_FLOOR;
+@@ -4658,6 +5002,27 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 		printf("NEGRONI GPU DCVS: off: fixed level %u (%u MHz, bw %u) from negronigpu_level\n", vote_level,
+ 		    gpu_khz[vote_level] / 1000, vote_bw);
+ 	}
++	/* 0389: the frame-pacing floor needs the 0384 governor (it raises the governor's level) */
++	pace_on = dcvs_on && k_gov && k_pace;
++	if (dcvs_on && k_gov && k_tz && k_busy_pct) {
++		tz_on = tz_start();             /* 0389: msm_adreno_tz; logs on or off with the reason */
++	} else {
++		printf("NEGRONI GPU TZ: off: %s\n", !k_tz ? "negronigpu_tz=0" : vote_arg ? "fixed level (negronigpu_level)" :
++		    !dcvs_on ? "no DCVS (negronigpu_dcvs=0)" : !k_gov ? "negronigpu_gov=0" : "no GMU busy counter (negronigpu_busy_pct=0)");
++	}
++	nanoseconds_to_absolutetime((uint64_t)PACE_INPUT_MS * NSEC_PER_MSEC, &input_boost_abs);
++	input_boost_on = pace_on && k_inputboost;
++	printf("NEGRONI GPU PACE: input boost %s\n", input_boost_on ? "on: level 6 (492 MHz) or more for 200 ms after each touch report "
++	    "(negronigpu_inputboost=0 = off)" : !k_inputboost ? "off (negronigpu_inputboost=0)" : "off: needs the pacing floor");
++	if (pace_on) {
++		printf("NEGRONI GPU PACE: on (0389): a 100 ms governor tick where the display held a frame for the GPU in >= %u of "
++		    "12 vsync ticks lifts a level floor (+1, +2 at >= %u), one level down after %u ms without, then every %u ms, dropped after %u ms "
++		    "without a swap (the next burst starts one under it); thermal cap wins; negronigpu_pace=0 = off\n",
++		    PACE_LATE_PER_100MS, PACE_FAST_PER_100MS, PACE_HOLD_MS, PACE_STEP_MS, PACE_IDLE_MS);
++	} else {
++		printf("NEGRONI GPU PACE: off: %s\n", !k_pace ? "negronigpu_pace=0" : vote_arg ? "fixed level (negronigpu_level)" :
++		    !dcvs_on ? "no DCVS (negronigpu_dcvs=0)" : "the 0384 governor is off (negronigpu_gov=0)");
++	}
+ 	if (dcvs_on && k_gov) {
+ 		printf("NEGRONI GPU DCVS: on (0384 simple_ondemand): start level %u (%u MHz), levels %u..%u (%u..%u MHz), up %u%% "
+ 		    "down %u%%, busy from the GMU counter (fence rule without it), bus vote = DT bus-freq of the level, lowest level "
+@@ -4687,7 +5052,7 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 			bool pending = negroni_gpu_completed() != gpu_fence;
+ 			uint32_t idle_for = pending ? 0 : pm_us_since(pm_last_submit) / 1000;
+ 			uint32_t tick = !dcvs_on && pm_mode == PM_OFF ? 1000 :
+-			    (pending || idle_for < DCVS_IDLE_MS) ? DCVS_TICK_MS : PM_IDLE_TICK_MS;
++			    (pending || idle_for < DCVS_IDLE_MS) ? (tz_on ? TZ_POLL_MS : DCVS_TICK_MS) : PM_IDLE_TICK_MS;
+ 			uint64_t t0 = mach_absolute_time();
+ 
+ 			pm_watch_idle = tick == PM_IDLE_TICK_MS;
+@@ -4738,6 +5103,25 @@ gpu_watch(void *arg __unused, wait_result_t wr __unused)
+ 			changes = 0;
+ 			from = dcvs_level;
+ 		}
++		if (tz_on && (tz_sec_calls != 0 || tz_sec_bursts != 0)) {
++			printf("NEGRONI GPU TZ: %u updates (%u up, %u down, %u busy bursts to the top), level %u (%u MHz)\n",
++			    tz_sec_calls, tz_sec_ups, tz_sec_downs, tz_sec_bursts, dcvs_level, gpu_khz[dcvs_level] / 1000);
++		}
++		tz_sec_calls = tz_sec_ups = tz_sec_downs = tz_sec_bursts = 0;
++		if (pace_on) {
++			/* 0389: one line in each second the floor was on or moved */
++			bool any = pace_sec_max != 0 || pace_sec_raises != 0 || pace_sec_decays != 0 || pace_sec_resumes != 0 ||
++			    pace_sec_inputs != 0;
++			if (any || pace_was) {
++				printf("NEGRONI GPU PACE: floor %u (max %u this second), level %u (%u MHz), held frames %u, swaps %u, "
++				    "raises %u decays %u resumes %u, input ticks %u (reports %u), cap %u\n", pace_floor, pace_sec_max,
++				    dcvs_level, gpu_khz[dcvs_level] / 1000, pace_sec_late, pace_sec_swaps, pace_sec_raises, pace_sec_decays,
++				    pace_sec_resumes, pace_sec_inputs, __atomic_exchange_n(&input_boost_reports, 0, __ATOMIC_RELAXED),
++				    negroni_thermal_gpu_cap());
++			}
++			pace_was = any;
++			pace_sec_late = pace_sec_swaps = pace_sec_raises = pace_sec_decays = pace_sec_resumes = pace_sec_max = pace_sec_inputs = 0;
++		}
+ 		uint32_t gov_avg = gov_pct_ms ? gov_pct_acc / gov_pct_ms : 0;   /* 0384: for the WATCH line */
+ 		gov_pct_acc = gov_pct_ms = 0;
+ 		char iline[200];
+diff --git a/bsd/dev/negroni_dpu.c b/bsd/dev/negroni_dpu.c
+index e3ebb4e..5363109 100644
+--- a/bsd/dev/negroni_dpu.c
++++ b/bsd/dev/negroni_dpu.c
+@@ -136,6 +136,7 @@ extern volatile uint32_t *negroni_dsi_base(void);     /* NegroniBacklight.cpp (0
+ 
+ void negroni_dpu_start(uintptr_t mdss, uint32_t ctlOff);
+ bool negroni_dpu_te_since(uint64_t now, uint64_t *sinceNs);
++bool negroni_dpu_te_count(uint32_t *count, uint64_t *lastAbs);
+ void negroni_dpu_tick(uint64_t now, uint64_t lastSwapAbs, uint32_t presentedID, bool frameDone, bool powerOff);
+ 
+ static uintptr_t ndpu_mdss;             /* 0234's MDSS mapping (0x84000) */
+@@ -147,6 +148,7 @@ static uint32_t ndpu_te_init, ndpu_line_ns;
+ static uint64_t ndpu_line_abs;          /* one tearcheck line in mach ticks x 1024 */
+ static volatile uint64_t ndpu_te_abs;   /* the last TE, from the rd_ptr interrupt */
+ static volatile uint32_t ndpu_irqs, ndpu_rdptr, ndpu_foreign, ndpu_masks;
++static volatile uint32_t ndpu_te_seq;    /* 0389: 2 x the rd_ptr interrupts since boot; odd while the stamp changes */
+ static uint32_t ndpu_irqs_sec;
+ static uint64_t ndpu_sec_t0, ndpu_sec_abs, ndpu_stale_abs;
+ static volatile uint64_t ndpu_lat_sum_abs, ndpu_lat_max_abs;
+@@ -168,7 +170,11 @@ ndpu_mdss_irq(__unused void *arg, uint32_t intid)
+ 		uint32_t v = ndpu_rd(ndpu_mdss + NDPU_INTF1 + NDPU_INTF_TEAR_INT_COUNT_VAL);
+ 		uint32_t line = v & 0xffffu, lines = line >= ndpu_te_init ? line - ndpu_te_init : 0;
+ 		uint64_t back = (uint64_t)lines * ndpu_line_abs / 1024;
++		ndpu_te_seq++;                  /* 0389: odd: negroni_dpu_te_count retries */
++		__builtin_arm_dmb(0xb);
+ 		ndpu_te_abs = now - back;
++		__builtin_arm_dmb(0xb);
++		ndpu_te_seq++;
+ 		ndpu_rdptr++;
+ 		ndpu_lat_sum_abs += back;
+ 		if (back > ndpu_lat_max_abs) {
+@@ -196,6 +202,31 @@ negroni_dpu_te_since(uint64_t now, uint64_t *sinceNs)
+ 	return true;
+ }
+ 
++/*
++ * 0389 teTick (work loop): the number of TEs since boot and the stamp of the last one, from the rd_ptr interrupt
++ * (0259's frame field of INT_COUNT_VAL does not count while the auto-refresh sends every frame: "te/s 0 ... locked
++ * 0/0 ticks (no sample 121)" with "DPU TE IRQ: irqs/s 120 rd_ptr 120" in the same seconds). false: no interrupt.
++ */
++bool
++negroni_dpu_te_count(uint32_t *count, uint64_t *lastAbs)
++{
++	if (!ndpu_irq_on) {
++		return false;
++	}
++	for (int i = 0; i < 4; i++) {
++		uint32_t c = ndpu_te_seq;
++		__builtin_arm_dmb(0xb);
++		uint64_t t = ndpu_te_abs;
++		__builtin_arm_dmb(0xb);
++		if ((c & 1u) == 0 && ndpu_te_seq == c) {
++			*count = c / 2;
++			*lastAbs = t;
++			return c != 0;
++		}
++	}
++	return false;
++}
++
+ static void
+ ndpu_teirq_init(void)
+ {
+diff --git a/bsd/dev/negroni_touch.c b/bsd/dev/negroni_touch.c
+index 6c1f52b..99c8bee 100644
+--- a/bsd/dev/negroni_touch.c
++++ b/bsd/dev/negroni_touch.c
+@@ -25,6 +25,7 @@ extern kern_return_t thread_terminate(thread_t);
+ extern void IOSleep(unsigned int milliseconds);
+ extern void negroni_hid_touch(int finger, int down, int x, int y);
+ extern void negroni_fp_touch(int finger, int down, int x, int y);   /* 0354: NegroniFramebuffer.cpp, fingerprint overlay */
++extern void negroni_input_boost(void);   /* 0389: negroni_adreno.c, GPU level floor at touch (the one input-boost hook) */
+ void negroni_touch_init(void);
+ 
+ /* TLMM pages of GPIO16..23: SDA 16, SCL 17, reset 20, ATTN 21 */
+@@ -95,6 +96,7 @@ touch_report(void)
+ 		if (!(st.active & bit) || x != st.x[id] || y != st.y[id]) {
+ 			negroni_hid_touch((int)id, 1, x, y);
+ 			negroni_fp_touch((int)id, 1, x, y);
++			negroni_input_boost();
+ 			if (st.log && !(st.active & bit)) {
+ 				printf("NEGRONI TOUCH: finger %u down %d,%d\n", id, x, y);
+ 			}
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index 1525838..f06f5c7 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -240,6 +240,7 @@ void negroni_backlight_attach(IOService *provider);            /* NegroniBacklig
+ extern "C" void negroni_dsi_esd_start(void);                   /* bsd/dev/negroni_dsi.c (0293) */
+ extern "C" void negroni_dpu_start(uintptr_t mdss, uint32_t ctlOff);       /* bsd/dev/negroni_dpu.c (0295) */
+ extern "C" bool negroni_dpu_te_since(uint64_t now, uint64_t *sinceNs);
++extern "C" bool negroni_dpu_te_count(uint32_t *count, uint64_t *lastAbs);   /* 0389 */
+ extern "C" void negroni_dpu_tick(uint64_t now, uint64_t lastSwapAbs, uint32_t presentedID, bool frameDone, bool powerOff);
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -629,6 +630,9 @@ public:
+ 	/* 0267: present before the vsync notification, clock shift inside the copy (work loop only) */
+ 	bool          fNotifyLate;    /* negronifb_notifylate (default 1): notify after the frame is queued */
+ 	bool          fClockCopy;     /* negronifb_clockcopy (default 1): the copy writes the strip shifted */
++	bool          fGpuBehind;     /* 0389: GPU copy into a back buffer behind newer GPU work (needs 0269 dbuf) */
++	uint32_t      fStatBehind;    /* 0389: frames so copied this second (the CPU copy before) */
++	uint64_t      fBehindFrames;
+ 	bool          fFinishPending; /* present() left its CPU drawing (shift, badges) to presentFinish() */
+ 	bool          fFinishTop;     /* that frame rewrote the status bar's left ear */
+ 	uint32_t      fFinishFence;   /* that frame's GPU copy */
+@@ -705,6 +709,9 @@ public:
+ 	uint32_t      fTeLineNs;      /* one tearcheck line, ns (vsync_count / 19.2 MHz) */
+ 	int32_t       fTeTarget;      /* negronifb_te_off: wanted tick phase after the TE, us (< 0: before the next) */
+ 	bool          fTeSeen;
++	bool          fTeIrqSeen, fTeIrqLogged;   /* 0389: TE count and stamp from the rd_ptr interrupt (0295) */
++	uint32_t      fTeIrqC0, fTeIrqLast;
++	uint64_t      fTeIrqT0;
+ 	uint32_t      fTeLastFrame, fTeStopped, fTeFrames;
+ 	uint64_t      fTeFirstAbs;    /* period measurement window */
+ 	uint32_t      fTeFirstFrame, fTePeriodUs;
+@@ -970,6 +977,22 @@ AppleCLCD::start(IOService *provider)
+ 	fTickNominalAbs = fTickAbs;
+ 	zeroCopyInit();
+ 	dbufInit();
++	{
++		/*
++		 * 0389: a GPU-written layer whose surface newer GPU work already lists ("behind", 0254) was copied by the
++		 * CPU on the vsync tick: 10 MB at 4-7 ms [V usblog-20261027-171256.txt: copy max 4711 us mean and late ticks
++		 * 2.4/s in the 242 seconds with >= 40 swaps; cpu 3.5 frames/s there], and the vsync notification (0267: after
++		 * the frame) waited for it, so CoreAnimation started its next frame 4-7 ms late. With the panel double buffer
++		 * the 2D copy goes into a back buffer instead (queued behind that newer work on the in-order ring) and the
++		 * buffer is flipped only when the copy's fence is done: no CPU copy, no tear. Self-check: needs 0269 on and
++		 * the GPU present ready (per frame); else the CPU copy as before. negronifb_gpubehind=0: off.
++		 */
++		uint32_t behind = 1;
++		PE_parse_boot_argn("negronifb_gpubehind", &behind, sizeof(behind));
++		fGpuBehind = behind != 0 && fDbuf;
++		IOLog("NEGRONI FB: 0389 GPU copy behind newer GPU work %s\n", fGpuBehind ? "on (into a back buffer)" :
++		    behind == 0 ? "off (negronifb_gpubehind=0)" : "off: needs the panel double buffer (0269, negronifb_dbuf=1)");
++	}
+ 	teInit();
+ 	if (fIntf == 0 && fMdss == 0) {
+ 		/* 0268: the wake check reads the TE counter (negroni_fb_te_check) */
+@@ -1406,14 +1429,14 @@ AppleCLCD::statTick(uint64_t now)
+ 	if (!fStatQuiet) {
+ 		fStatPrintAt = now;
+ 		IOLog("NEGRONI FB STAT: swaps/s %u presents/s %u (cpu %u gpu %u zc %u) copy avg/max us %llu/%llu "
+-	    "late ticks %u swapwait calls %u waited us avg/max %llu/%llu timeouts %u gpu-wait skips %u gave-up %u\n",
++	    "late ticks %u swapwait calls %u waited us avg/max %llu/%llu timeouts %u gpu-wait skips %u gave-up %u gpu-behind %u\n",
+ 	    swaps, copies + fStatZC, fStatCPU, fStatGPU, fStatZC,
+ 	    copies ? negroni_fb_abs_us(fStatCopyAbs) / copies : 0, negroni_fb_abs_us(fStatCopyMaxAbs),
+ 	    fStatLate, waits, waits ? negroni_fb_abs_us(waitAbs) / waits : 0, negroni_fb_abs_us(waitMax), timeouts,
+-	    fStatSkips, fStatGaveUp);
++	    fStatSkips, fStatGaveUp, fStatBehind);
+ 	}
+ 	fStatT0 = now;
+-	fStatCPU = fStatGPU = fStatZC = fStatLate = fStatSkips = fStatGaveUp = 0;
++	fStatCPU = fStatGPU = fStatZC = fStatLate = fStatSkips = fStatGaveUp = fStatBehind = 0;
+ 	fStatCopyAbs = fStatCopyMaxAbs = 0;
+ 	if (fDbuf && !fStatQuiet) {
+ 		IOLog("NEGRONI FB DBUF: flips/s %u waits %u in-place %u latch max us %llu (buffer %d shown, %d flipped, %llu flips)\n",
+@@ -1578,51 +1601,93 @@ AppleCLCD::teTick(uint64_t now)
+ 
+ 	absolutetime_to_nanoseconds(fTickNominalAbs, &nominalNs);
+ 	uint32_t nominalUs = (uint32_t)(nominalNs / 1000);
+-	if (!fTeSeen) {
+-		fTeSeen = true;
+-		fTeLastFrame = fTeFirstFrame = frame;
+-		fTeFirstAbs = now;
+-		return;
+-	}
+-	uint32_t df = (frame - fTeLastFrame) & 0xffffu;
+-	fTeLastFrame = frame;
+-	fTeFrames += df;
+-	if (df == 0) {
+-		if (++fTeStopped == 120) {
+-			IOLog("NEGRONI FB TE: no TE for 120 ticks (count 0x%08x)\n", v);
++	uint64_t sinceTeNs = 0;
++	uint32_t periodUs;
++	uint32_t teCount = 0;
++	uint64_t teLast = 0;
++	/*
++	 * 0389: with the 0295 rd_ptr interrupt live, the TE count and the last TE's stamp come from it. The frame field of
++	 * INT_COUNT_VAL does not count while the auto-refresh sends every frame [V usblog-20261027-171256.txt: in the 3330
++	 * seconds with autorefresh 0x80000001 the lock had 8193 samples and 388761 "no sample" ticks, te/s 0, while "DPU TE
++	 * IRQ: irqs/s 120 rd_ptr 120"], so the lock never ran at 120 Hz and the tick drifted against the panel's TE. The
++	 * period is measured between TE stamps (not tick times) over >= 1 s; the phase is the stamp's age at the deadline.
++	 */
++	if (negroni_dpu_te_count(&teCount, &teLast) && negroni_dpu_te_since(now, &sinceTeNs)) {
++		if (!fTeIrqSeen) {
++			fTeIrqSeen = true;
++			fTeIrqC0 = fTeIrqLast = teCount;
++			fTeIrqT0 = teLast;
++			return;
++		}
++		if (!fTeIrqLogged) {
++			fTeIrqLogged = true;
++			IOLog("NEGRONI FB TE: 0389 lock on the rd_ptr interrupt's TE count and stamp (the INT_COUNT_VAL frame field "
++			    "is used only without it)\n");
++		}
++		fTeFrames += teCount - fTeIrqLast;
++		fTeIrqLast = teCount;
++		fTeStopped = 0;
++		uint32_t n = teCount - fTeIrqC0;
++		if (teLast > fTeIrqT0 && teLast - fTeIrqT0 >= fStatSecAbs && n != 0) {
++			uint64_t per = (teLast - fTeIrqT0) / n;
++			fTePeriodUs = (uint32_t)negroni_fb_abs_us(per);
++			fTeIrqC0 = teCount;
++			fTeIrqT0 = teLast;
++			uint32_t lo = nominalUs - nominalUs * 15 / 100, hi = nominalUs + nominalUs * 15 / 100;
++			fTickAbs = (fTePeriodUs >= lo && fTePeriodUs <= hi) ? per : fTickNominalAbs;
++		}
++		periodUs = fTePeriodUs != 0 ? fTePeriodUs : nominalUs;
++		if (sinceTeNs > 2ull * periodUs * 1000ull) {
++			fTeNoSample++;
++			return;
+ 		}
+ 	} else {
+-		if (fTeStopped >= 120) {
+-			IOLog("NEGRONI FB TE: TE back after %u ticks\n", fTeStopped);
++		/* the INT_COUNT_VAL counter (0259) */
++		if (!fTeSeen) {
++			fTeSeen = true;
++			fTeLastFrame = fTeFirstFrame = frame;
++			fTeFirstAbs = now;
++			return;
++		}
++		uint32_t df = (frame - fTeLastFrame) & 0xffffu;
++		fTeLastFrame = frame;
++		fTeFrames += df;
++		if (df == 0) {
++			if (++fTeStopped == 120) {
++				IOLog("NEGRONI FB TE: no TE for 120 ticks (count 0x%08x)\n", v);
++			}
++		} else {
++			if (fTeStopped >= 120) {
++				IOLog("NEGRONI FB TE: TE back after %u ticks\n", fTeStopped);
++				fTeFirstFrame = frame;
++				fTeFirstAbs = now;
++			}
++			fTeStopped = 0;
++		}
++		uint64_t window = now - fTeFirstAbs;
++		uint32_t frames = (frame - fTeFirstFrame) & 0xffffu;
++		if (window >= fStatSecAbs && frames != 0) {
++			fTePeriodUs = (uint32_t)(negroni_fb_abs_us(window) / frames);
+ 			fTeFirstFrame = frame;
+ 			fTeFirstAbs = now;
++			/* the tick period follows the measured TE period (bounded; the nominal one when unsure) */
++			uint32_t lo = nominalUs - nominalUs * 15 / 100, hi = nominalUs + nominalUs * 15 / 100;
++			fTickAbs = (fTePeriodUs >= lo && fTePeriodUs <= hi) ? negroni_fb_us_abs(fTePeriodUs) : fTickNominalAbs;
++		}
++		periodUs = fTePeriodUs != 0 ? fTePeriodUs : nominalUs;
++		if (fTeStopped != 0 && df == 0 && fTeStopped > 2) {
++			fTeNoSample++;
++			return;                 /* no TE for several ticks: no phase to lock on */
++		}
++		if (line < fTeInit) {
++			fTeNoSample++;
++			return;
++		}
++		sinceTeNs = (uint64_t)(line - fTeInit) * fTeLineNs;
++		if (sinceTeNs > 2ull * periodUs * 1000ull) {
++			fTeNoSample++;
++			return;                 /* the counter ran past a frame: no TE came */
+ 		}
+-		fTeStopped = 0;
+-	}
+-	uint64_t window = now - fTeFirstAbs;
+-	uint32_t frames = (frame - fTeFirstFrame) & 0xffffu;
+-	if (window >= fStatSecAbs && frames != 0) {
+-		fTePeriodUs = (uint32_t)(negroni_fb_abs_us(window) / frames);
+-		fTeFirstFrame = frame;
+-		fTeFirstAbs = now;
+-		/* the tick period follows the measured TE period (bounded; the nominal one when unsure) */
+-		uint32_t lo = nominalUs - nominalUs * 15 / 100, hi = nominalUs + nominalUs * 15 / 100;
+-		fTickAbs = (fTePeriodUs >= lo && fTePeriodUs <= hi) ? negroni_fb_us_abs(fTePeriodUs) : fTickNominalAbs;
+-	}
+-	uint32_t periodUs = fTePeriodUs != 0 ? fTePeriodUs : nominalUs;
+-	if (fTeStopped != 0 && df == 0 && fTeStopped > 2) {
+-		fTeNoSample++;
+-		return;                 /* no TE for several ticks: no phase to lock on */
+-	}
+-	if (line < fTeInit) {
+-		fTeNoSample++;
+-		return;
+-	}
+-	uint64_t sinceTeNs = (uint64_t)(line - fTeInit) * fTeLineNs;
+-	(void)negroni_dpu_te_since(now, &sinceTeNs);    /* 0295 negronifb_teirq=1: the rd_ptr interrupt's TE stamp */
+-	if (sinceTeNs > 2ull * periodUs * 1000ull) {
+-		fTeNoSample++;
+-		return;                 /* the counter ran past a frame: no TE came */
+ 	}
+ 	int64_t lateNs = 0;
+ 	if (now > fDeadline) {
+@@ -2748,7 +2813,14 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 		bool behind = s->gpuFence != written && !NegroniGPUFenceDone(s->gpuFence);
+ 		bool inCopy = shiftPx > 0 && shiftPx < half && oneLayer && dy == 0 && dx == 0 &&
+ 		    h >= clockRows && w >= (int32_t)half;
+-		if (fits && bpe == 4 && written != 0 && !stale && !behind && gpuReady && held[layer] == s) {
++		/*
++		 * 0389: behind newer GPU work, but into a back buffer of 0269 (not the one shown or being flipped): the 2D copy
++		 * waits behind that work on the ring and the flip waits for its fence, so the late copy never tears. Not with
++		 * CPU drawing over the frame (badges, the fingerprint highlight): presentFinish would wait for that copy.
++		 */
++		bool behindOk = behind && fGpuBehind && fDbuf && fDbTarget >= 0 && fDbTarget != fDbShown &&
++		    fDbTarget != fDbFlipped && negroni_badges <= 0 && negroni_fp_hl_show() == 0;
++		if (fits && bpe == 4 && written != 0 && !stale && (!behind || behindOk) && gpuReady && held[layer] == s) {
+ 			if (dy == 0 && dx == 0 && h >= clockRows && w >= (int32_t)fWidth / 2) {
+ 				topRedrawn = true;
+ 			}
+@@ -2777,6 +2849,14 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 			}
+ 			if (f != 0) {
+ 				fence = f;
++				if (behind) {
++					fStatBehind++;          /* 0389 */
++					if (fBehindFrames++ < 4) {
++						IOLog("NEGRONI FB: 0389 frame %u: GPU copy of surface %u behind newer GPU work (fence %u, "
++						    "surface now at %u) into panel buffer %d, no CPU copy\n", get32(rec, 0x50), s->id, written,
++						    s->gpuFence, fDbTarget);
++					}
++				}
+ 				s->release();
+ 				continue;
+ 			}

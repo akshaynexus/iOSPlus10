@@ -167,3 +167,135 @@ VFX render pipeline is nil, see below), the Sleep widget renders, and widgets no
 Open: FitnessWidget `render pipeline skipped: nil render pipeline` (VFX metallib pipeline not built by metal2vulkan),
 MusicWidgets (re-check after the reflash), and the reflash with a simg from the new op10tool for the 112 damaged files
 (shared cache included).
+
+## 8. Blank/white widgets: root cause, metal2vulkan f6a96b7d, fix (2026-10-27 18:30, Metal widgets agent)
+
+Evidence: logs/usblog-20261027-171256.txt (kernel), logs/camlog3/4/5-full.txt and logs/phone-full-20261027-1743.txt
+(unified log, phone clock = host - 12.5 h). Disassembly: `ipsw dyld disass out/dsc/cache/dyld_shared_cache_arm64`
+(RenderBox, QuartzCore, MediaPlayer of 20H392).
+
+### 8.1 What fails [V]
+
+- chronod renders the home-screen widgets in its own scenes (`ChronoCore.WidgetWindow`) with SwiftUI -> RenderBox
+  (RBLayer) on our Metal device (`NMTL[126 chronod]: device Turnip Adreno (TM) 730`, pipelines 2, 0 refused). backboardd
+  composites the result from the IOSurfaces of those layers.
+- chronod creates the widget surfaces as `465x465 fmt 0x5f524234 planes 2` (OSType `'_RB4'`). RenderBox makes them in
+  `RB::create_iosurface(MTLPixelFormat 550/551)`: plane 0 = 4 bytes a texel, plane 1 = 1 byte a texel, that is
+  MTLPixelFormatRGB10A8_2P_XR10 (_sRGB).
+- RenderBox picks that format in `RB::ColorMode::pixel_format` (0x1e68c944c): for a wide colour mode, a non-opaque layer
+  and a device of tier >= 3 it reads the table at 0x1e6945390 = {554 BGR10_XR, 555 BGR10_XR_sRGB, 550, 551}. The tier is
+  the highest `supportsFamily:MTLGPUFamilyAppleN` (RB::Device ctor, loop 1001..1007, stored at +0x111). It does NOT read
+  `supportsExtendedXR10Formats`, so our NO answer did not stop it.
+- The frontend refused every IOSurface with planes: `newTextureWithDescriptor:iosurface:plane:` started with
+  `if(... plane || IOSurfaceGetPlaneCount(surface)) return nil;` and logged nothing.
+- Result in chronod: `(RenderBox) RBDisplayList: no drawable` (RB::DisplayList::RootTexture::make_texture: the drawable
+  callback gave nil). Result in backboardd: `(QuartzCore) Failed to allocate MTLTexture from IOSurface 0x3d4/0x3de`,
+  the same 2 surface IDs every frame, right after the chronod line (camlog5 05:24:44.853 -> .873). [I] The 2 IDs are
+  the Weather and Calendar widget surfaces (timing; the kernel logs only the first 64 creations). Counts: camlog3 496,
+  camlog4 84, camlog5 125, phone-full 118. The widget area keeps only what CA draws on the CPU (background): blank/white.
+- 3 more backboardd lines: `Failed to allocate [WxH] b3a8 framebuffer MTLPixelFormatRGB10A8_2P_XR10` (same refusal).
+- Not the cause: memory (chronod 14-19 MiB, no jetsam), pipelines (0 refused), `FB STAT ... gpu-wait skips 0`.
+
+### 8.2 AegirPoster crash loop: same family, other check [V]
+
+`NMTL[AegirPoster]: uncaught exception CAMetalLayerInvalid: unsupported extended range format`, frame 3 =
+QuartzCore + 0x288b8 = `-[CAMetalLayer setPixelFormat:]` -> `layer_private_check_pixel_format` (0x1883712dc): an XR
+CA format and `[device supportsExtendedXR10Formats] == NO` -> raise. ClockKitUI (Astronomy face) sets the XR format
+whatever the answer. 143 `CRASH AegirPoster` lines in the log. Our answer NO (since 2026-10-25) causes it. The reason for
+NO was metal2vulkan 720ef1ce refusing BGR10_XR_sRGB blends (`ExtendedRangeBlend(SrgbForm)`); f6a96b7d builds every
+blend into BGR10_XR_sRGB (crates/metal2vulkan/src/lower/arith/extended_range/blend.rs: SrgbForm is now only
+BGRA10_XR_sRGB beyond the narrow blends).
+
+### 8.3 Fix (three layers)
+
+1. RenderBox setting (plugin, `userland/metal/plugin/NegroniMetal.mm`, constructor): `setenv("RB_COLOR_MODE", "fixed", 0)`.
+   RenderBox parses RB_COLOR_MODE once at the first RB::ColorMode (after the device exists; options deep wide extended
+   fixed linear nonlinear 5bpc 422 420). `fixed` sets the depth/gamut byte to 0: BGRA8Unorm(_sRGB), one plane, the 8-bit
+   display chain's format. [I] This is the main fix: chronod's widget surfaces become plain BGRA. Off: a line
+   `RB_COLOR_MODE=` in /var/db/negronimetal/env.
+2. Surfaces with planes (flame/0016 + metal2vulkan f6a96b7d): the frontend makes textures over any plane through the new
+   bridge call `nmb_texture_new_on_surface_plane` -> `Buffer::new_texture_with_iosurface_plane` with the surface's facts
+   (`IoSurfaceYCbCr`: OSType, plane, size, plane 1 offset/bytesPerRow). metal2vulkan f6a96b7d holds RGB10A8_2P_XR10 over a
+   `'b3a8'` surface (texture/surface_two_planes.rs, a shadow image) and two-plane YCbCr (`420f`/`420v`) surfaces
+   (ycbcr.rs). `'_RB4'` with 4+1 bytes a texel is passed as `'b3a8'`. Refusals are now logged once per reason. This
+   covers the `_RB4` surfaces made before the env takes effect, CA's `b3a8` framebuffers in backboardd and the posters'
+   camera/photo surfaces.
+3. XR10 answer per process (plugin): `NEGRONIMETAL_XR10` = auto (default) | 0 | 1. auto = YES in processes whose name
+   ends in Poster, PosterExtension or PosterProvider; NO elsewhere (backboardd and SpringBoard keep the 8-bit chain).
+   Log line: `supportsExtendedXR10Formats = 1 (NegroniMetal A730 answer, NEGRONIMETAL_XR10=auto: ...; RB_COLOR_MODE=fixed)`.
+
+### 8.4 metal2vulkan update 720ef1ce -> f6a96b7d [V]
+
+- Submodule working tree: `external/metal2vulkan` at f6a96b7da82f3032e3fd7b1dc52c07bfd9b78dc8 (origin/master = the
+  default branch, 2026-10-26, 688 commits after 720ef1ce; `development` is 13 commits further, not taken). The gitlink
+  is not committed. ios-flame: no new upstream commit (still 745c434).
+- Relevant upstream changes: two-plane IOSurface textures (YCbCr, RGB10A8_2P_XR10), XR blends into BGR10_XR_sRGB,
+  host-import residency (imports may be released while idle), PaddedReadsPolicy removed, profile fingerprint once per
+  profile (4348323b), module decode once per creation (cba1270d). `library::function::from_metallib` still copies the
+  whole metallib (function.rs unchanged): FitnessWidget's memory cost stays.
+- Patches. ios-flame's copies (for 720ef1ce) are replaced by rebased ones in `userland/metal/patches/m2v-flame/`;
+  `scripts/metal/fetch-sources.sh` takes ios-flame's only for pin 720ef1ce.
+
+| patch | result on f6a96b7d |
+|---|---|
+| flame 0001 optional-constant-output-members | applies unchanged |
+| flame 0002 resource-wait-storage-dependencies | applies unchanged |
+| flame 0003 cache-device-entry-point-priming | ported: prime() takes push/calibration/drawn, `Has` has 13 fields (+Debug); Store::new(dir, sink, None), write_record_soon, name(&Hash256) |
+| flame 0004 fold-constant-global-field-loads | applies unchanged |
+| flame 0005 keep-module-decodes-and-profile-fingerprints | dropped: upstream 4348323b (fingerprint once per profile, same effect) + cba1270d (decode kept per `StageEntries`, 4 decodes / 32 MiB; flame kept 4 per process, keyed by bytes: a new MTLFunction object decodes again) |
+| flame 0100 sweet-8mb-memory-blocks | applies unchanged |
+| flame 0101 sweet-padded-writers-alias | ported: `PADDING_ALIASES` const in linear_plan::holding (PaddedReadsPolicy is gone) and in `aliases()` (`padded_alone`, the old `Holds::Padding` check; review 2026-10-27: without it `texels_alone` refused every padded image after a wasted vkCreateImage). Reaches only padded textures over the runtime's own buffers: since upstream e35bf78b every texture over host pages (each IOSurface) is a shadow first. Unit tests follow the const |
+| m2v/0001 host-import-noncoherent | ported: `HostPages::import_range` reads the import through `listing()` (no expose), `None` while released |
+| m2v/0002 host-invalidate-stats | ported (context only) |
+| m2v/0003 compositor-policy | ported: no framebuffer_fetch/PaddedReads in the policy any more; `ColorWritesPolicy` added beside the new fields |
+| flame/0016 (new) | bridge: `SharedEventListener::new()` is infallible; plane textures (8.3 item 2) |
+
+- Build [V]: fetch-sources.sh applies all 6 + 3 + 16 patches; the patch series on a clean f6a96b7d export reproduces
+  out/metal/src/metal2vulkan byte for byte. build-bridge.sh ios: exit 0 (libnative_metal_bridge.a 363,960,232 bytes).
+  build.sh: exit 0, NegroniMetal 26,579,264 bytes (sha256 85af9a19ba084227...), check-imports PASS (0 missing).
+  No test on the phone yet. Review 2026-10-27: `cargo +1.98.0 test -p metal2vulkan-runtime --lib -- linear_plan
+  shader_cache prime texture` on the Mac: 169 passed, 0 failed (before the 0101 test fixes: 2 failed in linear_plan).
+- Review 2026-10-27 [V]: fetch-sources.sh skipped every flame patch with exit 0 ("Skipped patch": out/metal/src/flame
+  had no own git repository, so `git -C` used this repo); it now runs `git init` there first. Rebuild after the review
+  fixes: fetch (6 + 3 + 16 patches really applied), build-bridge exit 0, build.sh exit 0, NegroniMetal 26,680,832 bytes
+  (sha256 d8f20dc714489...), check-imports PASS.
+
+### 8.5 Other widget items [V/I]
+
+- MusicWidgets sig 11 (9 lines): `-[MPMediaLibrary(MediaLibraryCore) _MediaLibrary_coreLibrary]+140`:
+  `[[self databasePath] lastPathComponent].UTF8String` is NULL (databasePath nil) -> `std::string(NULL)` -> strlen.
+  [I] The widget's sandbox has no media library path (TCC/MediaLibrary access), not Metal. Not fixed.
+- WeatherWidget: `getTimelines(1)` watchdog -> CHSErrorDomain 1050 (camlog5): a data/network timeout, not rendering.
+
+### 8.6 Test procedure (main session; no new root)
+
+1. `scripts/metal/phone-test.sh push` (copies out/metal/stage: bundle, probes; keeps clients/env; ends with sync).
+2. `scripts/net/ssh-phone.sh 'rm -f /var/db/negronimetal/strikes/*'` and respring: `scripts/net/ssh-phone.sh 'kill -9
+   $(ps -eo pid,comm | grep -E "backboardd$" | sed "s/^ *//;s/ .*//")'` (or a reboot). The new metal2vulkan changes the
+   profile fingerprint: every process compiles its pipelines again once (slow first start; posters can hit the launchd
+   check-in timeout on the first try).
+3. Proof lines (usblog / metal.log):
+   - `NMTL[... chronod]: supportsExtendedXR10Formats = 0 (... RB_COLOR_MODE=fixed)`.
+   - `NEGRONI SURF: chronod create ... 465x465 fmt 0x42475241 ... planes 0` (BGRA, not 0x5f524234 planes 2).
+   - unified log: no `RBDisplayList: no drawable` (chronod), no `Failed to allocate MTLTexture from IOSurface`
+     (backboardd), in a new unified-log capture made the same way as logs/camlog5-full.txt.
+   - `NMTL[... AegirPoster]: supportsExtendedXR10Formats = 1`, no `CAMetalLayerInvalid`, no `CRASH AegirPoster`.
+   - A plane texture, if any process still makes one: `native-metal: first texture over a surface with planes: fmt 550 ...`;
+     a refusal: `native-metal: refused (logged once per reason): texture fmt N ... over plane P of 2 of a 'xxxx' surface: ...`.
+   - Owner check: the widgets show content.
+4. A/B (no rebuild): `RB_COLOR_MODE=` in /var/db/negronimetal/env + kill chronod: widgets then depend on item 2 alone.
+
+### 8.7 Risks [I]
+
+- RB_COLOR_MODE=fixed applies to every RenderBox user with our plugin (SpringBoard, SwiftUI apps): wide-colour/XR
+  content renders in 8-bit sRGB. The display chain is 8-bit already.
+- Plane textures of RGB10A8_2P_XR10 are shadow images (copy in/out per use): slower than plain BGRA.
+- [V code, I cost] metal2vulkan e35bf78b: every texture over a no-copy buffer (each IOSurface the frontend imports:
+  CA framebuffers, layer contents) is a shadow image, copied in before a use and merged back after a write. On 720ef1ce
+  these were linear images over the pages. Watch the frame time of backboardd/SpringBoard against the 720ef1ce stage.
+- YES for posters: the poster's BGR10_XR drawables must be sampled by backboardd, which still answers NO. If backboardd
+  refuses them, the wallpaper stays empty, but the crash loop stops.
+- metal2vulkan is 688 commits newer: unknown regressions in other processes (backboardd's 41 pipelines, apps). Fallback:
+  check out 720ef1ce in external/metal2vulkan, fetch-sources.sh (for that pin: ios-flame's m2v patches, our
+  `userland/metal/patches/m2v-720ef1ce/`, and no flame `*-m2v-*.patch`, so flame/0016 is left out), or push the previous
+  stage from a backup.

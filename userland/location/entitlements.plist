@@ -10,5 +10,7 @@
 	<true/>
 	<key>com.apple.locationd.status</key>
 	<true/>
+	<key>com.apple.locationd.authorizeapplications</key>
+	<true/>
 </dict>
 </plist>

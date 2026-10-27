@@ -48,6 +48,7 @@ kernel_args = [
   "debug=0xc",
   "serial=3",
   "cpus=8",
+  "negronicpufreq_floor=lut",
   "keepsyms=1",
   "-noprogress",
   "rd=ufsroot0",

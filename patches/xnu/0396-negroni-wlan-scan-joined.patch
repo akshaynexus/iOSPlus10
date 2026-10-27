@@ -1,0 +1,508 @@
+diff --git a/bsd/dev/negroni_wlan_api.h b/bsd/dev/negroni_wlan_api.h
+index cadeb6e..08fb460 100644
+--- a/bsd/dev/negroni_wlan_api.h
++++ b/bsd/dev/negroni_wlan_api.h
+@@ -118,7 +118,11 @@ int negroni_wlan_register(const struct nwlan_callbacks *cb);
+ /* link state, counters, MAC (copy) */
+ int negroni_wlan_link(struct nwlan_link *out);
+ 
+-/* start a passive scan of all channels (about 6 s); NWLAN_EV_SCAN_DONE at the end. EBUSY while joining. */
++/*
++ * start a passive scan of all channels (about 6 s); NWLAN_EV_SCAN_DONE at the end. EBUSY while joining.
++ * 0396: also while CONNECTED (on the joined STA vdev, the link stays up, the state does not change; at most one per
++ * 20 s, a request inside the gap ends at once with the current list). EBUSY again when that feature is off.
++ */
+ int negroni_wlan_scan(void);
+ /* copy up to `max` BSS of the list (newest first); returns how many were copied */
+ uint32_t negroni_wlan_scan_results(struct nwlan_bss *out, uint32_t max);
+diff --git a/bsd/dev/negroni_wlan_join.c b/bsd/dev/negroni_wlan_join.c
+index 11b756f..110e7fc 100644
+--- a/bsd/dev/negroni_wlan_join.c
++++ b/bsd/dev/negroni_wlan_join.c
+@@ -105,6 +105,7 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ #define JOIN_TRIES                      3u
+ #define JOIN_FRAME_MS                   500u
+ #define BEACON_LOSS_MS                  10000u
++#define BEACON_LOSS_SCAN_MS             40000u  /* 0396: the cap while joined scans run (30 s API time-out + 10 s) */
+ #define MGMT_SLOTS                      4u
+ #define MGMT_SLOT                       1024u
+ 
+@@ -977,7 +978,7 @@ negroni_wlan_sta_join_service(void)
+ 	uint32_t ssid_len = 0, psk_len = 0;
+ 	char psk[NWLAN_PSK_MAX + 1];
+ 
+-	if (negroni_wlan_sta_scanning()) {
++	if (negroni_wlan_sta_scanning() && !negroni_wlan_sta_scan_joined()) {
+ 		return;                 /* an API scan runs: requests wait for its end (or its 30 s time-out) */
+ 	}
+ 	lck_mtx_lock(&j_mtx);
+@@ -994,6 +995,10 @@ negroni_wlan_sta_join_service(void)
+ 	}
+ 	lck_mtx_unlock(&j_mtx);
+ 
++	if ((disassoc || assoc) && negroni_wlan_sta_scan_joined()) {
++		/* 0396: a scan while joined runs (the link is serviced as usual); the request taken above stops it first */
++		negroni_wlan_sta_scan_joined_stop("a join or leave request");
++	}
+ 	if (disassoc || assoc) {
+ 		negroni_awdl_yield();                  /* 0347 review: the AWDL ROC scan ends before the join */
+ 	}
+@@ -1016,11 +1021,21 @@ negroni_wlan_sta_join_service(void)
+ 		J.lost = true;
+ 		J.lost_why = "HTT PEER_UNMAP of the AP";             /* 0328 review */
+ 	}
+-	if (J.up && !J.lost && negroni_wlan_ms() - J.last_beacon_ms > BEACON_LOSS_MS) {
++	/*
++	 * 0396: no 10 s beacon-loss verdict while a joined scan runs (off-channel dwells); the 10 s restart at its end.
++	 * Back-to-back joined scans never hide a lost AP for more than BEACON_LOSS_SCAN_MS.
++	 */
++	if (J.up && !J.lost && negroni_wlan_ms() - MAX(J.last_beacon_ms, negroni_wlan_sta_scan_joined_quiet_ms()) >
++	    BEACON_LOSS_MS) {
+ 		J.lost = true;
+ 		J.lost_why = "no beacon for 10 s";
+ 	}
++	if (J.up && !J.lost && negroni_wlan_ms() - J.last_beacon_ms > BEACON_LOSS_SCAN_MS) {
++		J.lost = true;
++		J.lost_why = "no beacon for 40 s (joined scans)";
++	}
+ 	if (J.lost) {
++		negroni_wlan_sta_scan_joined_link_lost(J.lost_why);   /* 0396: only if a joined scan runs: stop + off */
+ 		join_down(ENOTCONN, J.lost_reason, J.lost_why ? J.lost_why : "link lost");
+ 		return;
+ 	}
+diff --git a/bsd/dev/negroni_wlan_sta.c b/bsd/dev/negroni_wlan_sta.c
+index ad5feb1..181f9a0 100644
+--- a/bsd/dev/negroni_wlan_sta.c
++++ b/bsd/dev/negroni_wlan_sta.c
+@@ -5,6 +5,8 @@
+  *       security and the elements a join needs), scan requests from the API.
+  * 0327+: join, data path and WPA2 add to the service pass.
+  *
++ * 0396: scan while joined (ath11k_mac_op_hw_scan on the associated STA vdev): see "scan while joined" below.
++ *
+  * Threads: the API functions take g_mtx, copy, post a request flag and return. The driver thread (keep-alive loop,
+  * negroni_wlan_sta_service) does all chip work. Callbacks run on the driver thread with g_mtx not held.
+  * UNTESTED ON HARDWARE.
+@@ -14,6 +16,8 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/locks.h>
++#include <stdarg.h>
++#include <pexpert/pexpert.h>
+ #include "negroni_wlan.h"
+ #include "negroni_wlan_mhi.h"
+ #include "negroni_wlan_sta.h"
+@@ -35,6 +39,39 @@ static uint32_t g_scan_count;
+ static uint64_t g_scan_start_ms;
+ #define API_SCAN_TIMEOUT_MS     30000u
+ 
++/*
++ * ---- 0396: scan while joined ----
++ * While CONNECTED, an API scan is the same WMI_START_SCAN on the joined STA vdev (vdev 0), as ath11k does it
++ * (Linux 5b0764a5 mac.c ath11k_mac_op_hw_scan + wmi.c ath11k_wmi_start_scan_init: no extra command; the firmware
++ * leaves the home channel for one dwell and comes back for min_rest..max_rest between the foreign channels). It does
++ * not change g_link.state (no SCANNING, no LINK_DOWN); the beacons and probe responses go into the same list with
++ * fresh seen_ms. Not while JOINING / HANDSHAKE (EBUSY as before).
++ * Rate limit: one joined scan per SJ_GAP_MS; a request inside the gap ends at once with SCAN_DONE and the current list.
++ * Self-check (no probes): the firmware must answer the first joined scan with STARTED (in 5 s) and COMPLETED (reason
++ * COMPLETED, PREEMPTED or TIMEDOUT). The first failure before that or 3 failures in a row after it (a link loss while
++ * one runs is a failure) turn the feature off for the boot with one line `scan while joined off: <reason>`; then a
++ * scan request while joined gets EBUSY again (the iOS side answers with the last list, 0340).
++ * Kill switch: negroniwlan_scanjoined=0.
++ */
++#define SJ_GAP_MS               20000u  /* at most one joined scan per 20 s (throughput, power) */
++#define SJ_START_MS             5000u   /* STARTED must come in 5 s (ath11k: 1 s, 5 s with the 11d offload) */
++#define SJ_STOP_MS              300u    /* the end event after our STOP_SCAN */
++#define SJ_FAIL_ROW             3u
++#define SJ_EV_STARTED           0x1u    /* WMI_SCAN_EVENT_* (ath11k wmi.h) */
++#define SJ_EV_START_FAILED      0x40u
++#define SJ_REASON_COMPLETED     0u      /* WMI_SCAN_REASON_* (ath11k wmi.h) */
++#define SJ_REASON_CANCELLED     1u
++#define SJ_REASON_PREEMPTED     2u
++#define SJ_REASON_TIMEDOUT      3u
++static int g_sj_switch = -1;            /* negroniwlan_scanjoined: -1 not read, 0 kill switch, 1 on */
++static bool g_sj_off;                   /* self-check failed: off for the boot */
++static bool g_req_synth;                /* under g_mtx: a rate-limited request, SCAN_DONE with the current list */
++/* driver thread only */
++static bool g_sj_run, g_sj_started, g_sj_start_failed, g_sj_stopping, g_sj_proven;
++static uint32_t g_sj_scans, g_sj_fail_row, g_sj_limited, g_sj_lines;
++static uint64_t g_sj_last_ms, g_sj_end_ms;
++static bool sj_enabled(void);
++
+ /* ---- events: called on the driver thread without the lock ---- */
+ static void
+ emit(uint32_t ev)
+@@ -79,6 +116,7 @@ negroni_wlan_sta_lifecycle(uint32_t state, int error)
+ 			memcpy(g_link.mac, mac, 6);
+ 		}
+ 		lck_mtx_unlock(&g_mtx);
++		(void)sj_enabled();                    /* 0396: the kill switch line at start, if set */
+ 	}
+ 	set_state(state, error);
+ }
+@@ -260,10 +298,174 @@ negroni_wlan_sta_mgmt_rx(const uint8_t *frame, uint32_t len, int32_t rssi, uint3
+ 	}
+ }
+ 
++/* 0396: the kill switch, read once (the first time a joined scan is asked for) */
++static bool
++sj_enabled(void)
++{
++	if (g_sj_switch < 0) {
++		uint32_t v = 1;
++		(void)PE_parse_boot_argn("negroniwlan_scanjoined", &v, sizeof(v));
++		g_sj_switch = v ? 1 : 0;
++		if (!g_sj_switch) {
++			g_sj_off = true;
++			printf("NEGRONI WLAN: scan while joined off: negroniwlan_scanjoined=0\n");
++		}
++	}
++	return g_sj_switch == 1 && !g_sj_off;
++}
++
++static void
++sj_turn_off(const char *why)
++{
++	if (g_sj_off) {
++		return;
++	}
++	g_sj_off = true;
++	printf("NEGRONI WLAN: scan while joined off: %s (scan %u; scan requests while joined get the last list again)\n",
++	    why, g_sj_scans);
++}
++
++/* a failed joined scan: off before the first success, or after SJ_FAIL_ROW failures in a row */
++static void sj_failed(const char *fmt, ...) __printflike(1, 2);
++static void
++sj_failed(const char *fmt, ...)
++{
++	char why[160];
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(why, sizeof(why), fmt, ap);
++	va_end(ap);
++	g_sj_fail_row++;
++	if (!g_sj_proven || g_sj_fail_row >= SJ_FAIL_ROW) {
++		sj_turn_off(why);
++		return;
++	}
++	printf("NEGRONI WLAN: scan while joined: failure %u of %u in a row: %s\n", g_sj_fail_row, SJ_FAIL_ROW, why);
++}
++
+ void
+-negroni_wlan_sta_scan_done(uint32_t reason)
++negroni_wlan_sta_scan_event(uint32_t ev, uint32_t reason)
+ {
+ 	(void)reason;
++	if (!g_sj_run) {
++		return;
++	}
++	if (ev == SJ_EV_STARTED) {
++		g_sj_started = true;
++	} else if (ev == SJ_EV_START_FAILED) {
++		g_sj_start_failed = true;
++	}
++}
++
++/* the end of a joined scan (inside the service pass, or from sj_stop): never touches g_link.state */
++static void
++sj_done(uint32_t reason)
++{
++	uint64_t now = negroni_wlan_ms();
++	uint32_t ms = (uint32_t)MIN(now - g_scan_start_ms, 0xffffffffull), fresh = 0, n;
++
++	g_sj_run = false;
++	g_scanning = false;
++	g_scan_count++;
++	g_sj_end_ms = now;
++	if (g_sj_start_failed) {
++		sj_failed("the firmware refuses a scan on the joined STA vdev (START_FAILED, reason %u)", reason);
++	} else if (g_sj_stopping) {
++		/* our STOP (a join request, a time-out, a link loss): not a firmware verdict */
++	} else if (!g_sj_started) {
++		sj_failed("scan end (reason %u) without a STARTED event after %u ms", reason, ms);
++	} else if (reason != SJ_REASON_COMPLETED && reason != SJ_REASON_PREEMPTED && reason != SJ_REASON_TIMEDOUT &&
++	    reason != SJ_REASON_CANCELLED) {
++		sj_failed("the firmware ended the scan with reason %u after %u ms", reason, ms);
++	} else {
++		g_sj_fail_row = 0;
++		if (!g_sj_proven) {
++			g_sj_proven = true;
++			printf("NEGRONI WLAN: scan while joined on: the firmware ran scan %u on the joined STA vdev (STARTED, "
++			    "COMPLETED reason %u, %u ms); the link stays up\n", g_scan_count, reason, ms);
++		}
++	}
++	lck_mtx_lock(&g_mtx);
++	n = g_nbss;
++	for (uint32_t i = 0; i < g_nbss; i++) {
++		fresh += g_bss[i].seen_ms >= g_scan_start_ms;
++	}
++	lck_mtx_unlock(&g_mtx);
++	/* the first 10 joined scans, then every 20th (locationd may ask every few seconds) */
++	if (g_sj_lines < 10 || g_sj_scans % 20 == 0) {
++		g_sj_lines++;
++		printf("NEGRONI WLAN: API scan %u while joined done: %u BSS in the list, %u seen in this scan, %u ms, reason %u "
++		    "(%u joined scans, %u requests inside the %u s gap)\n", g_scan_count, n, fresh, ms, reason, g_sj_scans,
++		    g_sj_limited, SJ_GAP_MS / 1000);
++	}
++	emit(NWLAN_EV_SCAN_DONE);
++}
++
++/* STOP_SCAN of a running joined scan; waits at most SJ_STOP_MS for the end event, then ends it here */
++static void
++sj_stop(const char *why)
++{
++	uint64_t deadline;
++
++	if (!g_sj_run) {
++		return;
++	}
++	g_sj_stopping = true;
++	if (negroni_wlan_wmi_scan_stop() == 0) {
++		deadline = negroni_wlan_ms() + SJ_STOP_MS;
++		while (g_sj_run && negroni_wlan_ms() < deadline) {
++			if (negroni_wlan_service() != 0) {
++				break;
++			}
++			negroni_wlan_nap(2);
++		}
++	}
++	if (g_sj_run) {
++		printf("NEGRONI WLAN: scan while joined: no end event in %u ms after STOP (%s); ending it here\n", SJ_STOP_MS,
++		    why);
++		sj_done(SJ_REASON_CANCELLED);
++	}
++	g_sj_stopping = false;
++}
++
++bool
++negroni_wlan_sta_scan_joined(void)
++{
++	return g_sj_run;
++}
++
++void
++negroni_wlan_sta_scan_joined_stop(const char *why)
++{
++	sj_stop(why);
++}
++
++void
++negroni_wlan_sta_scan_joined_link_lost(const char *why)
++{
++	if (!g_sj_run) {
++		return;
++	}
++	sj_stop(why);
++	/* a failure: off before the first good scan, else after SJ_FAIL_ROW in a row (locationd keeps a scan running
++	 * most of the time, so one AP loss alone must not turn the feature off for the boot) */
++	sj_failed("the link ended during a joined scan (%s)", why ? why : "link lost");
++}
++
++uint64_t
++negroni_wlan_sta_scan_joined_quiet_ms(void)
++{
++	return g_sj_run ? negroni_wlan_ms() : g_sj_end_ms;
++}
++
++void
++negroni_wlan_sta_scan_done(uint32_t reason)
++{
++	if (g_sj_run) {
++		sj_done(reason);                /* 0396 */
++		return;
++	}
+ 	if (!g_scanning && g_link.state != NWLAN_STATE_SCANNING) {
+ 		g_scan_count++;                 /* the level-10 scan or a join's own scan: no API scan to finish */
+ 		emit(NWLAN_EV_SCAN_DONE);
+@@ -282,14 +484,45 @@ negroni_wlan_sta_scan_done(uint32_t reason)
+ void
+ negroni_wlan_sta_service(void)
+ {
+-	bool scan;
++	bool scan, joined, synth;
+ 
+ 	lck_mtx_lock(&g_mtx);
+ 	scan = g_req_scan && !g_scanning && g_link.state == NWLAN_STATE_IDLE;
+-	if (scan) {
++	/* 0396: a request while CONNECTED is a joined scan; with the feature off (now) it ends with the current list */
++	joined = g_req_scan && !g_scanning && g_link.state == NWLAN_STATE_CONNECTED;
++	if (scan || joined) {
+ 		g_req_scan = false;
+ 	}
++	synth = g_req_synth || (joined && !sj_enabled());
++	g_req_synth = false;
++	joined = joined && sj_enabled();
+ 	lck_mtx_unlock(&g_mtx);
++	if (synth) {
++		emit(NWLAN_EV_SCAN_DONE);
++	}
++	if (joined) {
++		negroni_awdl_yield();                  /* never armed while en0 is joined; kept for symmetry with en0's scan */
++		g_sj_started = g_sj_start_failed = false;
++		int error = negroni_wlan_wmi_scan_start_joined();
++		g_sj_scans++;
++		g_sj_last_ms = negroni_wlan_ms();
++		if (error) {
++			sj_failed("WMI START_SCAN not sent (error %d)", error);
++			emit(NWLAN_EV_SCAN_DONE);
++		} else {
++			g_scanning = true;
++			g_sj_run = true;
++			g_scan_start_ms = g_sj_last_ms;
++		}
++	}
++	if (g_sj_run && !g_sj_started && !g_sj_start_failed && negroni_wlan_ms() - g_scan_start_ms > SJ_START_MS) {
++		sj_stop("no STARTED");
++		sj_failed("no SCAN STARTED event in %u ms", SJ_START_MS);
++	}
++	if (g_sj_run && negroni_wlan_ms() - g_scan_start_ms > API_SCAN_TIMEOUT_MS) {
++		sj_stop("time-out");
++		sj_failed("no SCAN COMPLETED in %u ms", API_SCAN_TIMEOUT_MS);
++	}
+ 	if (scan) {
+ 		negroni_awdl_yield();                  /* 0347 review: the AWDL ROC scan ends before en0's scan */
+ 		int error = negroni_wlan_wmi_scan_start();
+@@ -377,7 +610,18 @@ negroni_wlan_scan(void)
+ 	int error = 0;
+ 
+ 	lck_mtx_lock(&g_mtx);
+-	if (g_link.state != NWLAN_STATE_IDLE && g_link.state != NWLAN_STATE_SCANNING) {
++	if (g_link.state == NWLAN_STATE_CONNECTED && g_sj_switch != 0 && !g_sj_off) {
++		/* 0396: scan while joined. A running joined scan answers this request too (its SCAN_DONE). */
++		uint64_t now = negroni_wlan_ms();
++		if (g_scanning || g_req_scan) {
++			/* nothing to add */
++		} else if (g_sj_last_ms != 0 && now - g_sj_last_ms < SJ_GAP_MS) {
++			g_req_synth = true;             /* rate limit: SCAN_DONE with the current list */
++			g_sj_limited++;
++		} else {
++			g_req_scan = true;
++		}
++	} else if (g_link.state != NWLAN_STATE_IDLE && g_link.state != NWLAN_STATE_SCANNING) {
+ 		error = (g_link.state < NWLAN_STATE_IDLE || g_link.state == NWLAN_STATE_FAILED) ? ENXIO : EBUSY;
+ 	} else {
+ 		g_req_scan = true;
+diff --git a/bsd/dev/negroni_wlan_sta.h b/bsd/dev/negroni_wlan_sta.h
+index e0474fc..5e75f25 100644
+--- a/bsd/dev/negroni_wlan_sta.h
++++ b/bsd/dev/negroni_wlan_sta.h
+@@ -25,6 +25,16 @@ int negroni_wlan_sta_parse_bss(const uint8_t *f, uint32_t len, struct nwlan_bss
+ 
+ /* negroni_wlan_wmi.c (0326): a passive scan of all channels on vdev 0, without waiting */
+ int negroni_wlan_wmi_scan_start(void);
++/* 0396: the same scan on the joined STA vdev (2.4 GHz last, START_FAILED asked), and WMI_STOP_SCAN of en0's scan */
++int negroni_wlan_wmi_scan_start_joined(void);
++int negroni_wlan_wmi_scan_stop(void);
++/* 0396: every SCAN event of en0's scan id (inside the service pass: record only) */
++void negroni_wlan_sta_scan_event(uint32_t ev, uint32_t reason);
++/* 0396: scan while joined, for the join part (driver thread, top level) */
++bool negroni_wlan_sta_scan_joined(void);                       /* a scan while joined runs */
++void negroni_wlan_sta_scan_joined_stop(const char *why);       /* STOP_SCAN, wait <= 300 ms, SCAN_DONE */
++void negroni_wlan_sta_scan_joined_link_lost(const char *why);  /* the link ended while it ran: a failure */
++uint64_t negroni_wlan_sta_scan_joined_quiet_ms(void);          /* beacon-loss reference: now while it runs, else its end */
+ 
+ /* negroni_wlan_wmi.c */
+ const uint8_t *negroni_wlan_wmi_mac(void);
+diff --git a/bsd/dev/negroni_wlan_wmi.c b/bsd/dev/negroni_wlan_wmi.c
+index 67a99f2..6894a11 100644
+--- a/bsd/dev/negroni_wlan_wmi.c
++++ b/bsd/dev/negroni_wlan_wmi.c
+@@ -1029,6 +1029,7 @@ scan_cb(uint32_t id, const uint8_t *p, uint32_t len)
+ 		if (scan_id != WLAN_SCAN_ID) {
+ 			continue;
+ 		}
++		negroni_wlan_sta_scan_event(ev, reason);       /* 0396: the self-check of the scan while joined */
+ 		switch (ev) {
+ 		case WMI_SCAN_EV_STARTED:
+ 			S.started = true;
+@@ -1160,8 +1161,18 @@ wmi_vdev_create(void)
+ 	return error;
+ }
+ 
++/*
++ * WMI_START_SCAN on vdev 0 with the ath11k_wmi_start_scan_init timings (Linux 5b0764a5 wmi.c: dwell active 50,
++ * passive 150, min rest 50, max rest 500, idle 0, max scan time 20000, probe delay 5, priority LOW).
++ * 0396 `joined`: the same scan on the joined STA vdev, as ath11k_mac_op_hw_scan does it while associated (no other
++ * command: the firmware leaves the home channel for one dwell, returns between the foreign channels for min..max rest
++ * time and keeps the link; BSS_CHANNEL / FOREIGN_CHAN events). Our changes for it: START_FAILED is asked for (the
++ * self-check), the 2.4 GHz channels come last (they hold most APs; a 5 s age limit in locationd keeps only BSS seen in
++ * the last 5 s of the scan) and the max scan time is 25 s (with 500 ms rests on a busy link 38 channels need more than
++ * 20 s; the API time-out is 30 s). Every channel is passive (WMI_SCAN_CHAN_LIST, no regulatory domain applied).
++ */
+ static int
+-wmi_start_scan(void)
++wmi_start_scan(bool joined)
+ {
+ 	static uint8_t m[4 + 39 * 4 + 4 + NFREQ * 4 + 4 + 4 + 8 + 4];
+ 	uint8_t *p, *c;
+@@ -1174,12 +1185,12 @@ wmi_start_scan(void)
+ 	w[2] = 0;                               /* vdev */
+ 	w[3] = 1;                               /* priority LOW */
+ 	w[4] = WMI_SCAN_EV_STARTED | WMI_SCAN_EV_COMPLETED | WMI_SCAN_EV_BSS_CHANNEL | WMI_SCAN_EV_FOREIGN_CHAN |
+-	    WMI_SCAN_EV_DEQUEUED;
++	    WMI_SCAN_EV_DEQUEUED | (joined ? WMI_SCAN_EV_START_FAILED : 0);
+ 	w[5] = 50;                              /* dwell active */
+ 	w[6] = 150;                             /* dwell passive */
+ 	w[7] = 50;                              /* min rest */
+ 	w[8] = 500;                             /* max rest */
+-	w[12] = 20000;                          /* max scan time */
++	w[12] = joined ? 25000 : 20000;         /* max scan time */
+ 	w[13] = 5;                              /* probe delay */
+ 	w[14] = WMI_SCAN_FLAG_PASSIVE | WMI_SCAN_CHAN_STAT_EVENT;
+ 	w[16] = NFREQ;                          /* num_chan */
+@@ -1189,7 +1200,9 @@ wmi_start_scan(void)
+ 	memcpy(c, w, sizeof(w));
+ 	p = c + sizeof(w);
+ 	c = put_tlv(p, WMI_TAG_ARRAY_UINT32, NFREQ * 4);
+-	for (uint32_t i = 0; i < NFREQ; i++) {
++	for (uint32_t k = 0; k < NFREQ; k++) {
++		/* joined: 5 GHz first, 2.4 GHz last (g_freqs: the 13 2.4 GHz channels come first) */
++		uint32_t i = joined ? (k + 13) % NFREQ : k;
+ 		c = put32(c, g_freqs[i]);
+ 	}
+ 	p = put_tlv(c, WMI_TAG_ARRAY_FIXED_STRUCT, 0);         /* ssids: none (passive) */
+@@ -1204,7 +1217,32 @@ int
+ negroni_wlan_wmi_scan_start(void)
+ {
+ 	S.started = S.completed = S.failed = false;
+-	return wmi_start_scan();
++	return wmi_start_scan(false);
++}
++
++/* 0396: the scan while joined (the same vdev 0, now up and associated); the end comes as negroni_wlan_sta_scan_done */
++int
++negroni_wlan_wmi_scan_start_joined(void)
++{
++	S.started = S.completed = S.failed = false;
++	return wmi_start_scan(true);
++}
++
++/* 0396: WMI_STOP_SCAN of en0's scan (WLAN_SCAN_ID); the firmware answers with COMPLETED (reason CANCELLED) */
++int
++negroni_wlan_wmi_scan_stop(void)
++{
++	uint8_t m[4 + 5 * 4];
++	uint8_t *p;
++
++	memset(m, 0, sizeof(m));
++	p = put_tlv(m, TAG_STOP_SCAN_CMD_W, 5 * 4);     /* wmi_stop_scan_cmd */
++	p = put32(p, 1);                                /* requestor = our START_SCAN scan_req_id */
++	p = put32(p, WLAN_SCAN_ID);                     /* scan_id */
++	p = put32(p, 0);                                /* WMI_SCAN_STOP_ONE (ath11k wmi.h: 0x00000000) */
++	p = put32(p, 0);                                /* vdev 0 */
++	p = put32(p, negroni_wlan_wmi_pdev_id());
++	return negroni_wlan_wmi_send(WMI_STOP_SCAN_CMDID_W, m, (uint32_t)(p - m));
+ }
+ 
+ /* ---- 0347: remain-on-channel and AWDL management TX ----
+@@ -1305,7 +1343,7 @@ negroni_wlan_scan_level(void)
+ 		return error;
+ 	}
+ 	negroni_wlan_step(35, "WMI passive scan");
+-	error = wmi_start_scan();
++	error = wmi_start_scan(false);
+ 	if (error) {
+ 		return error;
+ 	}

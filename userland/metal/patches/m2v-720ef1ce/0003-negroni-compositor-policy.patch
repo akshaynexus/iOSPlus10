@@ -1,0 +1,202 @@
+NegroniMetal change to metal2vulkan 720ef1ce, on top of m2v/0002 (applied by scripts/metal/fetch-sources.sh):
+a compositor policy for the per-pixel emulations a UI compositor does not need.
+- DevicePolicy::color_writes (ColorWritesPolicy: Exact = default, DeviceUnorm8, DeviceUnorm8Srgb), carried in
+  ProfileFields (so in the fingerprint). Under DeviceUnorm8 each 8-bit unorm channel of a replace/opaque attachment
+  takes the device's conversion (ChannelWrite::Device) in exact_writes, so color_writes() selects no rounding for it
+  (no ~35 instructions per channel); DeviceUnorm8Srgb also leaves the 8-bit sRGB encode to the device (no ~70
+  instructions + 4 KiB table read per channel). A driver row (DriverDeviation::MetalColorWrites) cannot do this: it is
+  format-agnostic (every unorm/snorm/10:10:10:2 format) and no policy switches it off for an A/B.
+- driver_facts DEVIATIONS: a DriverId::MESA_TURNIP row of Unorm8LinearFilter (Qualcomm vendorID 0x5143, every GPU,
+  Mesa 25.0.7). "NegroniMetal: unmeasured on A730, accepted for a UI compositor [I]". Taken only under
+  Unorm8LinearFilterPolicy::DeviceWithinOneCode (derive.rs accepted()); the filter path is already limited to
+  R8/RG8/RGBA8/BGRA8 Unorm 2D samples.
+The bridge chooses the policy from env NEGRONIMETAL_POLICY (flame/0007).
+
+diff --git a/crates/metal2vulkan/src/device/derive.rs b/crates/metal2vulkan/src/device/derive.rs
+index 33108bc3..b18d8a6b 100644
+--- a/crates/metal2vulkan/src/device/derive.rs
++++ b/crates/metal2vulkan/src/device/derive.rs
+@@ -329,6 +329,7 @@ fn derive_fields(
+         containment,
+         isolation: policy.isolation,
+         framebuffer_fetch: policy.framebuffer_fetch,
++        color_writes: policy.color_writes,
+         texel_conversion: policy.texel_conversion,
+         half_blend: policy.half_blend,
+         // Metal's where a form is measured to be Metal's or the policy asks for Metal's rounding;
+diff --git a/crates/metal2vulkan/src/device/driver_facts.rs b/crates/metal2vulkan/src/device/driver_facts.rs
+index 7ab05114..3e8ea02a 100644
+--- a/crates/metal2vulkan/src/device/driver_facts.rs
++++ b/crates/metal2vulkan/src/device/driver_facts.rs
+@@ -670,6 +670,16 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
+         DriverId::INTEL_OPEN_SOURCE_MESA,
+         (INTEL_VENDOR_ID, INTEL_UHD_770_RPL_S),
+     ),
++    // NegroniMetal: unmeasured on A730, accepted for a UI compositor [I]. Turnip (Mesa 25.0.7, the
++    // phone's build) on Qualcomm's Adreno; taken only under `Unorm8LinearFilterPolicy::DeviceWithinOneCode`.
++    Measured {
++        fact: DriverDeviation::Unorm8LinearFilter,
++        driver: DriverId::MESA_TURNIP,
++        vendor: Some(QUALCOMM_VENDOR_ID),
++        device: None,
++        first: mesa(25, 0, 7),
++        last: mesa(25, 0, 7),
++    },
+     Measured {
+         fact: DriverDeviation::Unorm8LinearFilter,
+         driver: DriverId::MESA_LLVMPIPE,
+@@ -680,6 +690,9 @@ pub(crate) const DEVIATIONS: &[Measured<DriverDeviation>] = &[
+     },
+ ];
+ 
++/// Qualcomm's `vendorID` (Adreno; NegroniMetal's Turnip row).
++const QUALCOMM_VENDOR_ID: u32 = 0x5143;
++
+ /// NVIDIA's `vendorID`.
+ const NVIDIA_VENDOR_ID: u32 = 0x10de;
+ 
+diff --git a/crates/metal2vulkan/src/device/mod.rs b/crates/metal2vulkan/src/device/mod.rs
+index d61b5dc2..6000f943 100644
+--- a/crates/metal2vulkan/src/device/mod.rs
++++ b/crates/metal2vulkan/src/device/mod.rs
+@@ -66,7 +66,7 @@ pub use enables::{EnableSet, Exposure};
+ pub(crate) use mechanism::mechanism;
+ pub use metal::{MetalDeviceProperties, SimdSupport, StageSimd};
+ pub use policy::{
+-    ContainmentPolicy, DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy,
++    ColorWritesPolicy, ContainmentPolicy, DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy,
+     NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
+     Unorm8LinearFilterPolicy,
+ };
+diff --git a/crates/metal2vulkan/src/device/policy.rs b/crates/metal2vulkan/src/device/policy.rs
+index 29b06675..d0e422ed 100644
+--- a/crates/metal2vulkan/src/device/policy.rs
++++ b/crates/metal2vulkan/src/device/policy.rs
+@@ -25,6 +25,10 @@ pub struct DevicePolicy {
+     /// filter on a device measured within one code of Metal; by default it is Metal's filter,
+     /// emulated exactly.
+     pub unorm8_linear_filter: Unorm8LinearFilterPolicy,
++    /// Whether a float color output to an 8-bit unorm (or 8-bit sRGB) attachment that stores it
++    /// as written (no blend, or factors one and zero) is rounded to Metal's code in the shader (the
++    /// default) or left to the device's conversion (NegroniMetal, for a UI compositor).
++    pub color_writes: ColorWritesPolicy,
+     /// Whether a device that does not sample through Metal's own sampler samples natively (the
+     /// default) or emulates Metal's sampler exactly.
+     pub sampling: SamplingPolicy,
+@@ -76,6 +80,7 @@ impl DevicePolicy {
+         isolation: GuestIsolation::On,
+         framebuffer_fetch: FramebufferFetchPolicy::RequireOrdered,
+         unorm8_linear_filter: Unorm8LinearFilterPolicy::Exact,
++        color_writes: ColorWritesPolicy::Exact,
+         sampling: SamplingPolicy::NativeDevice,
+         float_maths: FloatMathsPolicy::Native,
+         texel_conversion: TexelConversionPolicy::Device,
+@@ -149,6 +154,24 @@ pub enum Unorm8LinearFilterPolicy {
+     DeviceWithinOneCode,
+ }
+ 
++/// How a float color output reaches an 8-bit attachment that stores it as written
++/// (`pipeline::color_writes`; NegroniMetal's addition). Other formats keep their rules.
++#[non_exhaustive]
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub enum ColorWritesPolicy {
++    /// Metal's code, rounded in the shader where the device does not store it
++    /// (`VkProperty::MetalColorWrites`): the default.
++    #[default]
++    Exact,
++    /// The device's conversion for each 8-bit unorm channel (`R8Unorm`, `RG8Unorm`, `RGBA8Unorm`,
++    /// `BGRA8Unorm`, `ARGB8Unorm`, and the alpha of the 8-bit sRGB formats), recorded as
++    /// `PrecisionNote::DeviceColorConversion`. At most one code off Metal's near a tie.
++    DeviceUnorm8,
++    /// `DeviceUnorm8`, and the device's sRGB encode for the 8-bit sRGB formats' color channels.
++    DeviceUnorm8Srgb,
++}
++
+ /// How a device that does not sample through Metal's own sampler (MoltenVK on Apple's GPU,
+ /// `DriverDeviation::MetalSampler`) answers a module's samples, gathers and comparisons: natively,
+ /// its own sampler's answer (the default: the owner's ruling of 2026-10-11, making time before
+diff --git a/crates/metal2vulkan/src/device/profile.rs b/crates/metal2vulkan/src/device/profile.rs
+index 2684ba6b..4bb5c1df 100644
+--- a/crates/metal2vulkan/src/device/profile.rs
++++ b/crates/metal2vulkan/src/device/profile.rs
+@@ -394,6 +394,8 @@ pub struct ProfileFields {
+     pub containment: Containment,
+     pub isolation: GuestIsolation,
+     pub framebuffer_fetch: FramebufferFetchPolicy,
++    /// Whether an 8-bit color write rounds in the shader or is the device's (the policy's).
++    pub color_writes: crate::device::policy::ColorWritesPolicy,
+     /// Whether a texel's value is the device's conversion or Metal's (the policy's).
+     pub texel_conversion: crate::device::policy::TexelConversionPolicy,
+     /// Whether a `half4` output of a module without fast math blends into a 16-bit float
+diff --git a/crates/metal2vulkan/src/pipeline/color_writes.rs b/crates/metal2vulkan/src/pipeline/color_writes.rs
+index 86f6acba..beffa2c1 100644
+--- a/crates/metal2vulkan/src/pipeline/color_writes.rs
++++ b/crates/metal2vulkan/src/pipeline/color_writes.rs
+@@ -105,7 +105,7 @@ pub(crate) fn exact_writes(
+         let coverage_alpha = attachment == 0 && alpha_to_coverage;
+         let write = match metal {
+             true => metal_stored(&c),
+-            false => attachment_write(&c, coverage_alpha),
++            false => attachment_write(&c, coverage_alpha).map(|w| device_8bit(w, p)),
+         };
+         let write = match rounding {
+             TextureWriteRoundingMode::NearestEven => {
+@@ -778,6 +778,28 @@ fn attachment_write(
+     Some(rules)
+ }
+ 
++/// `rules` with each 8-bit unorm (and, under `DeviceUnorm8Srgb`, 8-bit sRGB) channel left to the
++/// device's conversion where the profile's `ColorWritesPolicy` asks for it (NegroniMetal).
++fn device_8bit(
++    mut rules: [Option<ChannelWrite>; 4],
++    p: &DeviceProfile,
++) -> [Option<ChannelWrite>; 4] {
++    use crate::device::ColorWritesPolicy as P;
++    let srgb = match p.fields().color_writes {
++        P::DeviceUnorm8 => false,
++        P::DeviceUnorm8Srgb => true,
++        _ => return rules,
++    };
++    for rule in rules.iter_mut().flatten() {
++        match rule {
++            ChannelWrite::Unorm { bits: 8 } => *rule = ChannelWrite::Device,
++            ChannelWrite::Srgb if srgb => *rule = ChannelWrite::Device,
++            _ => {}
++        }
++    }
++    rules
++}
++
+ /// Whether the pipeline's attachment `c` blends the fragment function's output: its blend is
+ /// enabled and it writes some channel. Where it does not, a `half` output of a module without
+ /// fast math stores Metal's value (`StageIo::half_blend_colors`). Factors one and zero, added,
+diff --git a/crates/metal2vulkan/src/tests/fast_paths.rs b/crates/metal2vulkan/src/tests/fast_paths.rs
+index 63966c5b..1db1675f 100644
+--- a/crates/metal2vulkan/src/tests/fast_paths.rs
++++ b/crates/metal2vulkan/src/tests/fast_paths.rs
+@@ -9,7 +9,7 @@
+ use crate::device::{
+     DevicePolicy, FloatMathsPolicy, FramebufferFetchPolicy, HalfBlendPolicy, HalfRoundingPolicy,
+     NanMinMaxPolicy, PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
+-    Unorm8LinearFilterPolicy,
++    Unorm8LinearFilterPolicy, ColorWritesPolicy,
+ };
+ use crate::pipeline::PrecisionNote;
+ use std::collections::BTreeSet;
+@@ -61,6 +61,7 @@ fn choices() -> Vec<Choice> {
+         // The accuracy choices, below.
+         framebuffer_fetch: _,
+         unorm8_linear_filter: _,
++        color_writes: _,
+         sampling: _,
+         float_maths: _,
+         texel_conversion: _,
+@@ -74,6 +75,7 @@ fn choices() -> Vec<Choice> {
+     vec![
+         choice!(p.framebuffer_fetch: FramebufferFetchPolicy { RequireOrdered, AcceptUnordered }),
+         choice!(p.unorm8_linear_filter: Unorm8LinearFilterPolicy { Exact, DeviceWithinOneCode }),
++        choice!(p.color_writes: ColorWritesPolicy { Exact, DeviceUnorm8, DeviceUnorm8Srgb }),
+         choice!(p.sampling: SamplingPolicy { NativeDevice, Exact }),
+         choice!(p.float_maths: FloatMathsPolicy { Native, Exact }),
+         choice!(p.texel_conversion: TexelConversionPolicy { Device, Exact }),

@@ -198,6 +198,10 @@ host test's own directory on a Mac) makes every commit wait for completion; `NEG
 scheduled handlers until completion.
 
 ### Idle load knobs and measurement (flame/0010, scripts/metal/idle-stats.sh)
+* `NEGRONIMETAL_XR10=auto|0|1` (env file, 2026-10-27): the supportsExtendedXR10Formats answer. auto (default) = YES only in
+  processes named *Poster, *PosterExtension, *PosterProvider (AegirPoster throws CAMetalLayerInvalid with NO), NO elsewhere.
+* `RB_COLOR_MODE=fixed` (set by the plugin, 2026-10-27): RenderBox draws BGRA8, not two-plane XR10 surfaces (blank widgets).
+  A line `RB_COLOR_MODE=` (empty) in the env file turns it off. docs/metal-widgets-2026-10-27.md section 8.
 * `NEGRONIMETAL_SURFACE_FLUSH=0|1` (env file): the per-command-buffer CPU cache invalidate (`dc civac`) over every
   IOSurface a command buffer rendered into, run on the completion thread in every process but backboardd. `0` = off
   everywhere, `1` = on everywhere, unset = unchanged (on except backboardd). m2v/0001 already invalidates every host import

@@ -8,6 +8,12 @@
  *  - GL_EXT_shader_framebuffer_fetch: Mesa's freedreno on a6xx/a7xx exposes it itself (native);
  *    if it does not (or NEGRONIGL_FBFETCH=emulate), gl_LastFragData[0] becomes a texture read of
  *    the framebuffer's own color texture, bound to unit NGL_FBFETCH_UNIT before the draw.
+ *  - full precision (2026-10-27): "lowp" and "mediump" are defined to "highp" in every shader. On Adreno
+ *    mediump is a 16-bit float: CA's gradient lookup (32x1024 table, the "c_st" fragment shader) then gives
+ *    about 60 shades and the Weather widget sky draws in bands. Idea and text from HackiOS
+ *    (out/src/hackios-next 8851317 userland/src/eagl.c:3621-3634, MIT, Copyright (c) 2025-2026 the HakiOS
+ *    authors). NEGRONIGL_PRECISION=0 keeps the shaders' own precision. Self-check: a shader that does not
+ *    compile with the two defines is compiled again without them (eagl.c ngl_h_CompileShader).
  * Ideas from ios-sailfish tools/sweetgl/eagl.c (rect_prelude, fbfetch_rewrite); own code.
  */
 #include <stdio.h>
@@ -60,6 +66,18 @@ after_directives(const char *src)
 	return at;
 }
 
+/* the offset after the #version line (only white space may come before it), else 0 */
+static size_t
+after_version(const char *src)
+{
+	size_t at = strspn(src, " \t\r\n");
+	if (strncmp(src + at, "#version", 8) != 0) {
+		return 0;
+	}
+	const char *nl = strchr(src + at, '\n');
+	return nl ? (size_t)(nl - src + 1) : strlen(src);
+}
+
 /* src with text inserted at offset at (src is freed) */
 static char *
 insert_at(char *src, size_t at, const char *text)
@@ -107,6 +125,22 @@ replace_all(char *src, const char *from, const char *to)
 	return out;
 }
 
+const char ngl_precision_prelude[] =
+    "#define lowp highp /* negronigl precision */\n"
+    "#define mediump highp /* negronigl precision */\n";
+
+bool
+ngl_full_precision(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = ngl_env_on("NEGRONIGL_PRECISION", true) ? 1 : 0;
+		ngl_log("negronigl: shader precision %s", on ? "highp everywhere (NEGRONIGL_PRECISION=0: as written)" :
+		    "as written (NEGRONIGL_PRECISION=0)");
+	}
+	return on == 1;
+}
+
 static const char rect_prelude[] =
     "#define sampler2DRect sampler2D\n"
     "#define texture2DRect(s, c) texture2D(s, (c) * ngl_rect_scale)\n"
@@ -144,6 +178,12 @@ ngl_shader_rewrite(struct ngl_state *st, GLuint shader, char *src)
 		src = insert_at(src, after_directives(src), fbf_decl);
 		src = replace_all(src, "gl_LastFragData[0]", "texture2D(ngl_fb, gl_FragCoord.xy * ngl_fb_scale)");
 		kind |= 2;
+	}
+	if (ngl_full_precision() && !strstr(src, ngl_precision_prelude)) {
+		/* right after #version (else at the top), not at after_directives(): that also skips indented code
+		 * lines, so the defines could land after declarations and leave a uniform mediump in one stage and
+		 * highp in the other (a link error) */
+		src = insert_at(src, after_version(src), ngl_precision_prelude);
 	}
 	if (st && shader < NGL_NAMES) {
 		st->shader_kind[shader] = kind;

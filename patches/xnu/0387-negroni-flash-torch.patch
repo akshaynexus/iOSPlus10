@@ -1,0 +1,762 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c8cd8f7..5d44cc0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/negroni_cpufreq.c		standard
+ bsd/dev/negroni_thermal.c		standard
+ bsd/dev/negroni_haptic.c		standard
+ bsd/dev/negroni_cam.c			standard
++bsd/dev/negroni_flash.c			standard
+ bsd/dev/negroni_fp.c			standard
+ bsd/dev/negroni_adreno.c		standard
+ bsd/dev/negroni_wifi.c			standard
+diff --git a/bsd/dev/negroni_flash.c b/bsd/dev/negroni_flash.c
+new file mode 100644
+index 0000000..52963fd
+--- /dev/null
++++ b/bsd/dev/negroni_flash.c
+@@ -0,0 +1,519 @@
++/*
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450): the rear flash LED as a torch (flashlight), patch 0387.
++ *
++ * Hardware [V live DT out/live.dts:12933-13052, 37143-37170]: PM8350C (SPMI bus 0, SID 2)
++ * "qcom,pm8350c-flash-led" at 0xee00, a 4-channel module (TYPE 0x18, SUBTYPE 0x07). The rear camera's
++ * flash nodes (qcom,camera-flash@0/1/2) all use torch-source = torch_0 + torch_1 and flash-source =
++ * flash_0 + flash_1, switch led_switch_2 (mask 0x0f): the LED is on channels 0 and 1, driven together
++ * (qcom,symmetry-en). torch_N: qcom,max-current-ma = 500, qcom,ires-ua = 5000 (5 mA steps).
++ * flash_N: 1500 mA, 12.5 mA steps, duration 1280 ms. This driver never uses flash mode.
++ *
++ * Register sequence: Linux drivers/leds/flash/leds-qcom-flash.c (mvflash_4ch_regs,
++ * qcom_flash_led_brightness_set), the torch path:
++ *   off first:  CHAN_EN 0x4e bits 0,1 = 0; MODULE_EN 0x46 bit 7 = 0
++ *   current:    ITARGET 0x42/0x43 = mA / 5 - 1 (7 bits); IRESOLUTION 0x49 bits 0,1 = 1 (5 mA steps)
++ *   timer:      CHAN_TIMER 0x3e/0x3f = 0 (safety timer off: torch only, 5 mA steps only)
++ *   on:         MODULE_EN 0x46 bit 7 = 1; CHAN_STROBE 0x4a/0x4b bits 6:0 = 0x01 (software strobe,
++ *               level trigger, active high); CHAN_EN 0x4e bits 0,1 = 1
++ *   first light: TORCH_CLAMP 0xed bits 6:0 = the per-channel cap code (hardware limit of the torch code)
++ * Every write goes through negroni_spmi_write (patch 0270 + the 0387 allowlist: these ten registers
++ * only) and is read back. A refused write or a wrong read-back stops all writes for the boot (the
++ * off path still runs).
++ *
++ * Limits:
++ *   - torch only: IRESOLUTION 5 mA and the timer off are written together; the ITARGET code is at
++ *     most cap / 5 - 1, cap 100 mA per channel (FL_CAP_MA; the DT torch maximum is 500, and the
++ *     cap is checked against it at compile time). No flash-mode current.
++ *   - auto-off after 600 s (10 min, FL_SECS) of continuous light; a new
++ *     write of a level lights it again and restarts the time.
++ *   - fault watch every 100 ms while lit: INT_RT_STS bit 0 (led-fault), STATUS1 channel 0/1 short
++ *     (bits 0, 2), STATUS2 (VPH low, BCL, BoB current limit, over-temperature 1/2, BoB thermal) -> off.
++ *     Before the light only the fault interrupt, a short and the thermal flags (STATUS2 0x70) stop it
++ *     (the other STATUS2 flags are load flags). Three faults in one boot -> no more light for the boot.
++ *   - off at halt, restart and panic (negroni_flash_quiesce from NegroniPlatformExpert).
++ *
++ * Interface: /dev/negroniflash, root:mobile (gid 501) 0660.
++ *   write: ASCII "0".."10" (optional newline): 0 = off, N = N/10 of the cap per channel
++ *          (rounded to 5 mA, at least 5 mA). Other text: EINVAL. Values above 10 are taken as 10.
++ *          EIO when the writes failed, EBUSY after the fault limit.
++ *   read:  one line "level=L max=10 ma=M cap_ma=C lit=0|1 cut=N faults=N broken=0|1\n".
++ *
++ * On by default. Self-check at start (own thread): SPMI arbiter, TYPE 0x18 / SUBTYPE 0x07 of 0xee00,
++ * EE 0 owns the module's APID, the channel window maps, CHAN_EN/MODULE_EN read. On a failure the
++ * feature turns itself off with one line "NEGRONI FLASH: off: <reason>" (no node, no PMIC write).
++ * The LED lights only when someone writes a level. Kill switch: boot-arg negroniflash=0.
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "negroni_spmi.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);
++extern void IOSleep(unsigned int milliseconds);
++
++void negroni_flash_init(void);
++void negroni_flash_quiesce(void);
++
++#define FL_SID                  2u
++#define FL_BASE                 0xee00u
++#define FL_REVISION1            0x00u
++#define FL_TYPE                 0x04u           /* 0x18: flash LED module */
++#define FL_SUBTYPE              0x05u           /* 0x07: 4 channels (mvflash_4ch) */
++#define FL_STATUS1              0x06u           /* channel short: bit chan * 2 */
++#define FL_STATUS2              0x07u           /* VPH low, BCL, BoB ILIM, OTST2, OTST1, BoB thermal */
++#define FL_STATUS3              0x09u
++#define FL_INT_RT_STS           0x10u           /* bit 0: led-fault-irq (DT interrupts 0xee 0) */
++#define FL_CHAN_TIMER(c)        (0x3eu + (c))
++#define FL_ITARGET(c)           (0x42u + (c))
++#define FL_MODULE_EN            0x46u
++#define FL_IRESOLUTION          0x49u
++#define FL_CHAN_STROBE(c)       (0x4au + (c))
++#define FL_CHAN_EN              0x4eu
++#define FL_THERM_THRSH2         0x78u
++#define FL_THERM_THRSH1         0x7au
++#define FL_TORCH_CLAMP          0xedu
++
++#define FL_TYPE_VAL             0x18u
++#define FL_SUBTYPE_4CH          0x07u
++#define FL_CHANS                0x03u           /* channels 0 and 1 (torch_0, torch_1) */
++#define FL_MODULE_EN_BIT        0x80u
++#define FL_ITARGET_MASK         0x7fu
++#define FL_STROBE_MASK          0x7fu
++#define FL_STROBE_SW            0x01u           /* SW strobe (bit 2 = 0), level trigger (bit 1 = 0), active high (bit 0 = 1) */
++#define FL_STS1_SHORT           0x05u           /* channel 0 bit 0, channel 1 bit 2 */
++#define FL_STS2_FAULTS          0x7fu           /* every 4ch STATUS2 flag (while lit) */
++#define FL_STS2_HOT             0x70u           /* OTST2, OTST1, BoB thermal overload (also before the light) */
++#define FL_RT_FAULT             0x01u
++
++#define FL_IRES_UA              5000u           /* DT torch qcom,ires-ua; TORCH_IRES_UA */
++#define FL_DT_TORCH_MAX_MA      500u            /* DT torch qcom,max-current-ma; TORCH_CURRENT_MAX_UA */
++#define FL_LEVELS               10u
++#define FL_CAP_MA               100u            /* per channel at level 10 (two channels: 200 mA total) */
++#define FL_SECS                 600u            /* auto-off */
++_Static_assert(FL_CAP_MA >= 5 && FL_CAP_MA <= FL_DT_TORCH_MAX_MA && FL_CAP_MA % 5 == 0, "torch cap");
++#define FL_POLL_MS              100u
++#define FL_MAX_FAULTS           3u
++#define FL_GID_MOBILE           501             /* iOS group "mobile" (mediaserverd) */
++
++static LCK_GRP_DECLARE(fl_grp, "negroni_flash");
++static LCK_MTX_DECLARE(fl_lock, &fl_grp);
++
++static uint32_t fl_mode = 1;                    /* negroniflash (kill switch: 0) */
++static const uint32_t fl_cap_ma = FL_CAP_MA;
++static const uint32_t fl_secs = FL_SECS;
++static volatile bool fl_ready;                  /* probe passed, writes unlocked (quiesce clears it) */
++static bool fl_broken;                          /* a write failed: no more writes (the off path still runs) */
++static bool fl_configured;                      /* TORCH_CLAMP written */
++static volatile bool fl_lit;                    /* CHAN_EN bits on as far as we know */
++static volatile bool fl_ever_lit;               /* for the quiesce path */
++static uint32_t fl_level;                       /* level now (0 = off) */
++static uint64_t fl_lit_since;                   /* mach_absolute_time of the last level write that lit */
++static uint32_t fl_cuts, fl_faults;
++static int fl_major = -1;
++static int fl_event;
++
++static int
++fl_rd(unsigned reg, uint8_t *v)
++{
++	return negroni_spmi_read(FL_SID, FL_BASE + reg, v);
++}
++
++/* One allowlisted register written and read back. false (and fl_broken) on any failure. */
++static bool
++fl_put(unsigned reg, uint8_t value)
++{
++	uint8_t back = 0xff;
++	int rc = -1;
++	if (fl_broken || !fl_ready) {
++		return false;
++	}
++	for (int tries = 0; tries < 3 && rc != 0; ++tries) {
++		rc = negroni_spmi_write(FL_SID, FL_BASE + reg, value);     /* (a dropped command reports an error status) */
++	}
++	if (rc != 0 || fl_rd(reg, &back) != 0 || back != value) {
++		printf("NEGRONI FLASH: write %#x <- %#04x %s (reads %#04x): no more writes this boot\n", FL_BASE + reg, value,
++		    rc != 0 ? "refused" : "not read back", back);
++		fl_broken = true;
++		return false;
++	}
++	return true;
++}
++
++/* Only the bits of mask changed (as regmap_update_bits). */
++static bool
++fl_put_bits(unsigned reg, uint8_t mask, uint8_t value)
++{
++	uint8_t now = 0;
++	if (fl_broken || fl_rd(reg, &now) != 0) {
++		if (!fl_broken) {
++			printf("NEGRONI FLASH: read %#x failed: no more writes this boot\n", FL_BASE + reg);
++			fl_broken = true;
++		}
++		return false;
++	}
++	uint8_t want = (uint8_t)((now & ~mask) | (value & mask));
++	return want == now || fl_put(reg, want);
++}
++
++static uint32_t
++fl_level_ma(uint32_t level)
++{
++	uint32_t ma = (level * fl_cap_ma + FL_LEVELS / 2) / FL_LEVELS;
++	ma = (ma + 2) / 5 * 5;
++	if (ma < 5) {
++		ma = 5;
++	}
++	return ma > fl_cap_ma ? fl_cap_ma : ma;
++}
++
++/* leds-qcom-flash.c set_flash_current: itarget = (uA + 1) / 5000 - 1 */
++static uint8_t
++fl_code(uint32_t ma)
++{
++	uint32_t code = (ma * 1000u + 1u) / FL_IRES_UA;
++	code = code ? code - 1 : 0;
++	uint32_t cap = (fl_cap_ma * 1000u + 1u) / FL_IRES_UA - 1;
++	return (uint8_t)(code > cap ? cap : code);
++}
++
++/*
++ * Off (fl_lock held): CHAN_EN, MODULE_EN, ITARGET, as the torch-off path of brightness_set. When a write
++ * failed (now or earlier: fl_broken), the emergency off: CHAN_EN = 0 and MODULE_EN = 0 straight on the
++ * flash channel (negroni_spmi_flash_off_nolock; every other flash write runs under fl_lock, which we
++ * hold), then both read back. So a failed write never leaves the LED lit.
++ */
++static bool
++fl_dark(void)
++{
++	bool ok = !fl_broken && fl_put_bits(FL_CHAN_EN, FL_CHANS, 0) && fl_put_bits(FL_MODULE_EN, FL_MODULE_EN_BIT, 0) &&
++	    fl_put_bits(FL_ITARGET(0), FL_ITARGET_MASK, 0) && fl_put_bits(FL_ITARGET(1), FL_ITARGET_MASK, 0);
++	if (!ok && fl_ever_lit) {
++		uint8_t en = 0xff, mod = 0xff;
++		int rc = negroni_spmi_flash_off_nolock();
++		ok = rc == 0 && fl_rd(FL_CHAN_EN, &en) == 0 && fl_rd(FL_MODULE_EN, &mod) == 0 && !(en & 0x0fu) &&
++		    !(mod & FL_MODULE_EN_BIT);
++		printf("NEGRONI FLASH: emergency off (rc %d): CHAN_EN %#04x MODULE_EN %#04x: %s\n", rc, en, mod,
++		    ok ? "dark" : "NOT CONFIRMED");
++	}
++	if (ok) {
++		fl_lit = false;
++		fl_level = 0;
++	}
++	return ok;
++}
++
++/* The torch at level (1..10) (fl_lock held): qcom_flash_led_brightness_set order. */
++static bool
++fl_light(uint32_t level)
++{
++	uint32_t ma = fl_level_ma(level);
++	uint8_t code = fl_code(ma);
++	if (!fl_configured) {
++		uint8_t clamp = fl_code(fl_cap_ma), back = 0xff;
++		/* TORCH_CLAMP: a hardware limit, not needed for the software cap: a mismatch is only logged */
++		if (negroni_spmi_write(FL_SID, FL_BASE + FL_TORCH_CLAMP, clamp) != 0 || fl_rd(FL_TORCH_CLAMP, &back) != 0 ||
++		    back != clamp) {
++			printf("NEGRONI FLASH: TORCH_CLAMP %#04x not taken (reads %#04x): software cap only\n", clamp, back);
++		}
++		fl_configured = true;
++	}
++	bool ok = fl_put_bits(FL_CHAN_EN, FL_CHANS, 0) && fl_put_bits(FL_MODULE_EN, FL_MODULE_EN_BIT, 0) &&
++	    fl_put_bits(FL_ITARGET(0), FL_ITARGET_MASK, code) && fl_put_bits(FL_ITARGET(1), FL_ITARGET_MASK, code) &&
++	    fl_put_bits(FL_IRESOLUTION, FL_CHANS, FL_CHANS) &&
++	    fl_put(FL_CHAN_TIMER(0), 0) && fl_put(FL_CHAN_TIMER(1), 0) &&
++	    fl_put_bits(FL_MODULE_EN, FL_MODULE_EN_BIT, FL_MODULE_EN_BIT) &&
++	    fl_put_bits(FL_CHAN_STROBE(0), FL_STROBE_MASK, FL_STROBE_SW) &&
++	    fl_put_bits(FL_CHAN_STROBE(1), FL_STROBE_MASK, FL_STROBE_SW);
++	if (ok) {
++		fl_ever_lit = true;
++		fl_lit = true;                  /* (set before CHAN_EN: the quiesce path must cover the write) */
++		ok = fl_put_bits(FL_CHAN_EN, FL_CHANS, FL_CHANS);
++	}
++	if (!ok) {
++		(void)fl_dark();                /* (no-op when broken; the quiesce path stays armed) */
++		return false;
++	}
++	fl_level = level;
++	fl_lit_since = mach_absolute_time();
++	printf("NEGRONI FLASH: on: level %u/%u, %u mA per channel x 2 (ITARGET %#04x, 5 mA steps, timer off)\n", level,
++	    FL_LEVELS, ma, code);
++	return true;
++}
++
++/* fl_lock held: a fault flag of sts2_mask (or a short, or the fault interrupt) set? Fills why. */
++static bool
++fl_fault(uint8_t sts2_mask, char *why, size_t len)
++{
++	uint8_t rt = 0, s1 = 0, s2 = 0;
++	if (fl_rd(FL_INT_RT_STS, &rt) || fl_rd(FL_STATUS1, &s1) || fl_rd(FL_STATUS2, &s2)) {
++		snprintf(why, len, "status read failed");
++		return true;
++	}
++	if ((rt & FL_RT_FAULT) || (s1 & FL_STS1_SHORT) || (s2 & sts2_mask)) {
++		snprintf(why, len, "INT_RT_STS %#04x STATUS1 %#04x STATUS2 %#04x", rt, s1, s2);
++		return true;
++	}
++	return false;
++}
++
++/* The level asked for by userland (or the self-test). 0 ok, else errno. */
++static int
++fl_set(uint32_t level)
++{
++	int error = 0;
++	if (level > FL_LEVELS) {
++		level = FL_LEVELS;
++	}
++	lck_mtx_lock(&fl_lock);
++	if (!fl_ready) {
++		error = ENXIO;
++	} else if (level == 0) {
++		if ((fl_lit || fl_level || fl_broken) && !fl_dark()) {
++			error = EIO;
++		} else {
++			printf("NEGRONI FLASH: off\n");
++		}
++	} else if (fl_faults >= FL_MAX_FAULTS) {
++		error = EBUSY;
++	} else if (fl_broken) {
++		error = EIO;
++	} else {
++		char why[96];
++		if (!fl_lit && fl_fault(FL_STS2_HOT, why, sizeof(why))) {
++			fl_faults++;
++			printf("NEGRONI FLASH: not lit, fault before the light: %s (fault %u/%u)\n", why, fl_faults, FL_MAX_FAULTS);
++			error = EIO;
++		} else if (!fl_light(level)) {
++			error = EIO;
++		}
++	}
++	lck_mtx_unlock(&fl_lock);
++	thread_wakeup((event_t)&fl_event);
++	return error;
++}
++
++/* The watch: faults every 100 ms and the auto-off while lit; sleeps while dark. */
++__attribute__((noreturn))
++static void
++fl_watch(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t limit;
++	nanoseconds_to_absolutetime((uint64_t)fl_secs * NSEC_PER_SEC, &limit);
++	lck_mtx_lock(&fl_lock);
++	for (;;) {
++		if (!fl_lit) {
++			(void)lck_mtx_sleep(&fl_lock, LCK_SLEEP_DEFAULT, (event_t)&fl_event, THREAD_UNINT);
++			continue;
++		}
++		char why[96];
++		if (fl_fault(FL_STS2_FAULTS, why, sizeof(why))) {
++			fl_faults++;
++			printf("NEGRONI FLASH: OFF: fault %s (fault %u/%u)%s\n", why, fl_faults, FL_MAX_FAULTS,
++			    fl_faults >= FL_MAX_FAULTS ? ": no more light this boot" : "");
++			if (!fl_dark()) {
++				fl_lit = false;         /* (broken: stop polling; the quiesce path still turns it off) */
++			}
++		} else if (mach_absolute_time() - fl_lit_since >= limit) {
++			fl_cuts++;
++			printf("NEGRONI FLASH: auto-off after %u s\n", fl_secs);
++			if (!fl_dark()) {
++				fl_lit = false;
++			}
++		}
++		lck_mtx_unlock(&fl_lock);
++		IOSleep(FL_POLL_MS);
++		lck_mtx_lock(&fl_lock);
++	}
++}
++
++/* ---- /dev/negroniflash ---- */
++
++static int
++fl_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return fl_ready ? 0 : ENXIO;
++}
++
++static int
++fl_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++fl_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	char buf[16];
++	user_ssize_t n = uio_resid(uio);
++	uint32_t level = 0;
++	int error, digits = 0;
++	if (n <= 0 || n >= (user_ssize_t)sizeof(buf)) {
++		return EINVAL;
++	}
++	bzero(buf, sizeof(buf));
++	if ((error = uiomove(buf, (int)n, uio)) != 0) {
++		return error;
++	}
++	for (int i = 0; i < n; ++i) {
++		char c = buf[i];
++		if (c >= '0' && c <= '9' && digits < 4) {
++			level = level * 10u + (uint32_t)(c - '0');
++			digits++;
++		} else if ((c == '\n' || c == '\r' || c == ' ' || c == 0) && digits > 0) {
++			break;
++		} else {
++			return EINVAL;
++		}
++	}
++	return digits ? fl_set(level) : EINVAL;
++}
++
++static int
++fl_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	char line[128];
++	lck_mtx_lock(&fl_lock);
++	int len = snprintf(line, sizeof(line), "level=%u max=%u ma=%u cap_ma=%u lit=%d cut=%u faults=%u broken=%d\n",
++	    fl_level, FL_LEVELS, fl_level ? fl_level_ma(fl_level) : 0, fl_cap_ma, fl_lit ? 1 : 0, fl_cuts, fl_faults,
++	    fl_broken ? 1 : 0);
++	lck_mtx_unlock(&fl_lock);
++	off_t off = uio_offset(uio);
++	if (off < 0 || off >= len) {
++		return 0;
++	}
++	return uiomove(line + off, (int)MIN((user_ssize_t)(len - off), uio_resid(uio)), uio);
++}
++
++static const struct cdevsw fl_cdevsw = {
++	.d_open = fl_open,
++	.d_close = fl_close,
++	.d_read = fl_read,
++	.d_write = fl_write,
++	.d_ioctl = eno_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type = 0,
++};
++
++/* ---- probe ---- */
++
++static void
++fl_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint8_t type = 0, subtype = 0, rev = 0, en = 0, mod = 0;
++	int apid = -1;
++	unsigned owner = 7;
++	thread_t watch;
++
++	uint8_t s1 = 0, s2 = 0, rt = 0;
++
++	if (negroni_spmi_init() != 0) {
++		printf("NEGRONI FLASH: off: no SPMI arbiter\n");
++		goto out;
++	}
++	if (fl_rd(FL_TYPE, &type) || fl_rd(FL_SUBTYPE, &subtype) || fl_rd(FL_REVISION1, &rev)) {
++		printf("NEGRONI FLASH: off: PM8350C flash module 0xee00 does not answer reads\n");
++		goto out;
++	}
++	if (type != FL_TYPE_VAL || subtype != FL_SUBTYPE_4CH) {
++		printf("NEGRONI FLASH: off: 0xee00 TYPE %#04x SUBTYPE %#04x is not a 4-channel flash module (0x18/0x07)\n",
++		    type, subtype);
++		goto out;
++	}
++	if (!negroni_spmi_flash_unlock(&apid, &owner)) {
++		printf("NEGRONI FLASH: off: flash module APID %d owner EE %u (not EE 0, or no channel window): no writes\n",
++		    apid, owner);
++		goto out;
++	}
++	if (fl_rd(FL_CHAN_EN, &en) || fl_rd(FL_MODULE_EN, &mod) || fl_rd(FL_STATUS1, &s1) || fl_rd(FL_STATUS2, &s2) ||
++	    fl_rd(FL_INT_RT_STS, &rt)) {
++		printf("NEGRONI FLASH: off: status registers of 0xee00 do not answer reads\n");
++		goto out;
++	}
++	lck_mtx_lock(&fl_lock);
++	fl_ready = true;
++	/* something (the bootloader) left a channel on: off */
++	if ((en & FL_CHANS) || (mod & FL_MODULE_EN_BIT)) {
++		printf("NEGRONI FLASH: found CHAN_EN %#04x MODULE_EN %#04x at boot: switching off\n", en, mod);
++		fl_ever_lit = true;
++		(void)fl_dark();
++	}
++	bool broken = fl_broken;
++	lck_mtx_unlock(&fl_lock);
++	if (broken) {
++		printf("NEGRONI FLASH: off: the switch-off at boot failed\n");
++		goto out;
++	}
++	if (kernel_thread_start(fl_watch, NULL, &watch) != KERN_SUCCESS) {
++		lck_mtx_lock(&fl_lock);
++		fl_ready = false;
++		lck_mtx_unlock(&fl_lock);
++		printf("NEGRONI FLASH: off: no watch thread\n");
++		goto out;
++	}
++	thread_deallocate(watch);
++	fl_major = cdevsw_add(-1, &fl_cdevsw);
++	if (fl_major < 0 || devfs_make_node(makedev(fl_major, 0), DEVFS_CHAR, UID_ROOT, FL_GID_MOBILE, 0660,
++	    "negroniflash") == NULL) {
++		lck_mtx_lock(&fl_lock);
++		fl_ready = false;
++		lck_mtx_unlock(&fl_lock);
++		printf("NEGRONI FLASH: off: /dev/negroniflash cannot be made\n");
++		goto out;
++	}
++	printf("NEGRONI FLASH: on: PM8350C 0xee00 rev %#04x APID %d (EE 0), channels 0+1, levels 0..%u = 0..%u mA per channel "
++	    "(DT max %u), auto-off %u s, /dev/negroniflash; idle STATUS1 %#04x STATUS2 %#04x INT_RT_STS %#04x\n", rev, apid,
++	    FL_LEVELS, fl_cap_ma, FL_DT_TORCH_MAX_MA, fl_secs, s1, s2, rt);
++out:
++	(void)thread_terminate(current_thread());
++}
++
++void
++negroni_flash_init(void)
++{
++	thread_t thread;
++	(void)PE_parse_boot_argn("negroniflash", &fl_mode, sizeof(fl_mode));
++	if (fl_mode == 0) {
++		printf("NEGRONI FLASH: off: boot-arg negroniflash=0\n");
++		return;
++	}
++	if (kernel_thread_start(fl_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++/*
++ * Halt, restart, panic (NegroniPlatformExpert, any context): CHAN_EN and MODULE_EN to 0 with no lock,
++ * only when this boot ever lit the LED (or found it lit). No printf (panic context).
++ */
++void
++negroni_flash_quiesce(void)
++{
++	if (!fl_ever_lit) {
++		return;
++	}
++	fl_ready = false;               /* fl_put refuses every later write: no light after this point */
++	fl_lit = false;
++	/* halt/restart (thread context): wait for no writer if fl_lock is free; panic: no lock at all */
++	bool locked = ml_get_interrupts_enabled() && lck_mtx_try_lock(&fl_lock);
++	(void)negroni_spmi_flash_off_nolock();
++	if (locked) {
++		lck_mtx_unlock(&fl_lock);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
+index 7666fc3..3aaf8a6 100644
+--- a/bsd/dev/negroni_spmi.c
++++ b/bsd/dev/negroni_spmi.c
+@@ -70,6 +70,14 @@
+  * val: 0}", Linux qmp_qdss_clk_unprepare, qcom_aoss.c:294-296) on every path where the debug path
+  * ends after the vote: the core map fails, the check read fails, or a later timeout/32 failures
+  * close it. While the debug path is open the vote stays (its reads need the clock).
++ *
++ * Patch 0387: the rear flash LED (bsd/dev/negroni_flash.c). Read allowlist: SID 2 peripheral 0xee
++ * (PM8350C FLASH_LED module, live DT qcom,flash_led@ee00), any register. Writes after
++ * negroni_spmi_flash_unlock() (only when EE 0 owns the module's APID), these ten registers only:
++ * 0xee3e 0xee3f CHAN_TIMER ch0/ch1, 0xee42 0xee43 ITARGET ch0/ch1, 0xee46 MODULE_EN,
++ * 0xee49 IRESOLUTION, 0xee4a 0xee4b CHAN_STROBE ch0/ch1, 0xee4e CHAN_EN, 0xeeed TORCH_CLAMP
++ * (Linux drivers/leds/flash/leds-qcom-flash.c mvflash_4ch_regs). negroni_spmi_flash_off_nolock()
++ * is the halt/restart/panic path: CHAN_EN = 0 and MODULE_EN = 0, no lock, bounded polls.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -109,6 +117,7 @@ extern void IOSleep(unsigned int milliseconds);
+ #define SP_BCL_PPID       0x347u          /* SID 3, PM8350B BCL 0x4700 */
+ #define SP_CHGR_PPID      0x310u          /* SID 3, PM8350B SMB5 CHGR 0x1000 (0272) */
+ #define SP_USBIN_PPID     0x313u          /* SID 3, PM8350B SMB5 USBIN 0x1300 (0272) */
++#define SP_FLASH_PPID     0x2eeu          /* SID 2, PM8350C FLASH_LED 0xee00 (0387) */
+ 
+ /* 0273: the debug arbiter (spmi-pmic-arb-debug.c register layout) and what it needs */
+ #define SD_CORE_PA        0x10b14000u     /* reg "core" 0x10b14000 0x60 */
+@@ -183,6 +192,10 @@ static bool sd_voted, sd_release_pending;
+ /* 0278: the BCL MONITOR_EN write window (one write) */
+ static vm_offset_t sp_bcl_chn;
+ static bool sp_bcl_unlocked;
++/* 0387: the flash LED module's channel window (writes of the ten registers of sp_flash_reg) */
++static vm_offset_t sp_flash_chn;
++static uint16_t sp_flash_apid = SP_NO_APID;
++static bool sp_flash_unlocked;
+ 
+ int
+ negroni_spmi_arbiter(struct sk_arbiter *arb, vm_offset_t *cnfg)
+@@ -646,6 +659,9 @@ sp_read_allowed(unsigned sid, unsigned addr)
+ 	if (sid == 3 && peripheral >= 0x10 && peripheral <= 0x16) {
+ 		return true;            /* 0272: SMB5 charger blocks */
+ 	}
++	if (sid == 2 && peripheral == 0xee) {
++		return true;            /* 0387: PM8350C flash LED module (status, read-back) */
++	}
+ 	if (((sid == 1 && (peripheral == 0x41 || peripheral == 0x44 || peripheral == 0x45)) || (sid == 2 && peripheral == 0x40)) &&
+ 	    (reg == 0x08 || reg == 0x40 || reg == 0x41 || reg == 0x45 || reg == 0x46)) {
+ 		return true;            /* 0372: USB PHY LDOs (PM8350 L2/L5/L6, PM8350C L1): STATUS1, VSET, MODE, EN_CTL */
+@@ -703,11 +719,35 @@ negroni_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	return negroni_spmi_read_rc(sid, addr, out) ? -1 : 0;
+ }
+ 
++/* 0387: the ten writable registers of the PM8350C flash LED module (SID 2), channels 0 and 1 only */
++static bool
++sp_flash_reg(unsigned addr)
++{
++	switch (addr) {
++	case 0xee3e: case 0xee3f:       /* CHAN_TIMER ch0, ch1 (safety timer; 0 = off for torch) */
++	case 0xee42: case 0xee43:       /* ITARGET ch0, ch1 */
++	case 0xee46:                    /* MODULE_EN (bit 7) */
++	case 0xee49:                    /* IRESOLUTION (bit per channel: 1 = 5 mA steps) */
++	case 0xee4a: case 0xee4b:       /* CHAN_STROBE ch0, ch1 */
++	case 0xee4e:                    /* CHAN_EN (bit per channel) */
++	case 0xeeed:                    /* TORCH_CLAMP */
++		return true;
++	default:
++		return false;
++	}
++}
++
+ /* The channel window of a writable register (sp_lock held): the VADC request registers after the
+  * VADC unlock, the six SMB5 charger registers after the charger unlock (0272). */
+ static bool
+ sp_write_target(unsigned sid, unsigned addr, vm_offset_t *chn, uint16_t *apid)
+ {
++	/* 0387: the flash LED registers after negroni_spmi_flash_unlock() */
++	if (sid == 2 && sp_flash_reg(addr)) {
++		*chn = sp_flash_chn;
++		*apid = sp_flash_apid;
++		return sp_flash_unlocked && sp_flash_chn != 0 && sp_flash_apid != SP_NO_APID;
++	}
+ 	/* ADC7 user registers of the PMK8350 VADC; 0x3146 (EN_CTL1) is not written */
+ 	if (sid == 0 && addr >= 0x3140 && addr <= 0x3147 && addr != 0x3146) {
+ 		*chn = sp_vadc_chn;
+@@ -830,6 +870,68 @@ negroni_spmi_bcl_monitor_on(void)
+ 	return rc == 0 && (back & 0x80u) ? 1 : -1;
+ }
+ 
++/*
++ * 0387: opens the ten flash LED registers (sp_flash_reg) for writes. Only when the module's APID is
++ * mapped and EE 0 owns it (no force option). One 0x1000 channel window, kept for the boot. Thread
++ * context. True when unlocked; *apid_out / *owner_out (either may be NULL) get the APID and owner.
++ */
++bool
++negroni_spmi_flash_unlock(int *apid_out, unsigned *owner_out)
++{
++	unsigned owner = 7;
++	bool ok = false;
++	lck_mtx_lock(&sp_lock);
++	if (sp_ready) {
++		sp_flash_apid = sp_find_apid(SP_FLASH_PPID, &owner);
++		if (sp_flash_apid != SP_NO_APID && owner == SP_EE && !sp_poisoned[sp_flash_apid]) {
++			if (!sp_flash_chn) {
++				sp_flash_chn = ml_io_map(SP_CHNLS_PA + SP_CHNL_STRIDE * sp_flash_apid, SP_CHNL_STRIDE);
++			}
++			ok = sp_flash_unlocked = sp_flash_chn != 0;
++		}
++	}
++	if (apid_out) {
++		*apid_out = sp_flash_apid == SP_NO_APID ? -1 : (int)sp_flash_apid;
++	}
++	if (owner_out) {
++		*owner_out = owner;
++	}
++	lck_mtx_unlock(&sp_lock);
++	return ok;
++}
++
++/*
++ * 0387: halt/restart/panic: CHAN_EN (0xee4e) = 0, then MODULE_EN (0xee46) = 0, straight on the flash
++ * channel window: no mutex (the panic path may have stopped a CPU that holds sp_lock), no printf,
++ * bounded polls (delay() spins with interrupts off). Only the flash driver uses this channel.
++ * Returns 0 when both writes completed without an error status, -1 otherwise (or when locked).
++ */
++int
++negroni_spmi_flash_off_nolock(void)
++{
++	static const uint8_t regs[2] = { 0x4e, 0x46 };
++	int rc = 0;
++	if (!sp_flash_unlocked || !sp_flash_chn || sp_flash_apid == SP_NO_APID) {
++		return -1;
++	}
++	for (unsigned r = 0; r < 2; ++r) {
++		uint32_t s = 0;
++		sp_wr(sp_flash_chn, SP_WDATA0, 0);
++		sp_wr(sp_flash_chn, SP_CMD, (SP_OP_WRITEL << 27) | ((uint32_t)regs[r] << 4));
++		for (unsigned i = 0; i < SP_WRITE_POLLS; ++i) {
++			s = sp_rd(sp_flash_chn, SP_STATUS);
++			if (s & SP_DONE) {
++				break;
++			}
++			delay(1);
++		}
++		if (!(s & SP_DONE) || (s & SP_ERRORS)) {
++			rc = -1;
++		}
++	}
++	return rc;
++}
++
+ unsigned
+ negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max)
+ {
+diff --git a/bsd/dev/negroni_spmi.h b/bsd/dev/negroni_spmi.h
+index f1fe91f..e312077 100644
+--- a/bsd/dev/negroni_spmi.h
++++ b/bsd/dev/negroni_spmi.h
+@@ -46,6 +46,11 @@ int negroni_spmi_write(unsigned sid, unsigned addr, uint8_t value);
+ /* 0278: BCL MONITOR_EN (0x4746 bit 7) on when it reads off and EE 0 owns the BCL APID (bcl_pmic5.c:779).
+  * 0 already on (no write), 1 set by this call, -1 failure. Thread context. */
+ int negroni_spmi_bcl_monitor_on(void);
++/* 0387: the PM8350C flash LED registers (SID 2: 0xee3e 0xee3f 0xee42 0xee43 0xee46 0xee49 0xee4a 0xee4b
++ * 0xee4e 0xeeed) open for negroni_spmi_write, only when EE 0 owns the module's APID. Thread context. */
++bool negroni_spmi_flash_unlock(int *apid_out, unsigned *owner_out);
++/* 0387: CHAN_EN 0xee4e = 0, MODULE_EN 0xee46 = 0 with no lock (halt, restart, panic). 0 ok, -1 failed/locked. */
++int negroni_spmi_flash_off_nolock(void);
+ /* The arbiter's APID map (PPID = SID << 8 | peripheral) and owner EEs; returns the count. */
+ unsigned negroni_spmi_ppids(uint16_t *ppids, uint8_t *owners, unsigned max);
+ #ifdef __cplusplus
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index 2f68ce0..3ec2ee1 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -59,6 +59,7 @@ extern void negroni_cpufreq_init(void);
+ extern void negroni_thermal_init(void);
+ extern void negroni_haptic_init(void);   /* patch 0300: vibration motor (negronihap) */
+ extern void negroni_cam_init(void);      /* patch 0310: camera bring-up (negronicam) */
++extern void negroni_flash_init(void);    /* patch 0387: rear flash LED torch (negroniflash) */
+ extern void negroni_adreno_init(void);
+ extern void negroni_wifi_init(void);
+ extern void negroni_adsp_init(void);
+@@ -818,6 +819,7 @@ negroni_ufs_init(void)
+ 	negroni_thermal_init();         /* patch 0280: TSENS readings + thermal caps */
+ 	negroni_haptic_init();          /* patch 0300: negronihap=1 buzzes 300 ms */
+ 	negroni_cam_init();             /* patch 0310/0311: negronicam=1|2, own thread, default off */
++	negroni_flash_init();           /* patch 0387: /dev/negroniflash torch, own thread, default on, self-check */
+ 	negroni_probe_menu();
+ 	negroni_adreno_init();
+ 	negroni_wifi_init();
+diff --git a/iokit/Kernel/arm/NegroniPlatformExpert.cpp b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+index fb91679..1bd0e10 100644
+--- a/iokit/Kernel/arm/NegroniPlatformExpert.cpp
++++ b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+@@ -49,6 +49,7 @@ void negroni_panic_restart(void);
+ void negroni_reboot_settle(unsigned ms);
+ void negroni_fb_panic(void);            /* NegroniFramebuffer.cpp: zero-copy pipes back on the panel memory */
+ void negroni_tfa_panic(void);           /* negroni_tfa.c (0244): speaker amps off, reset pins held */
++void negroni_flash_quiesce(void);       /* negroni_flash.c (0387): torch LED off */
+ void negroni_bootlog_end(unsigned kind, const char *why);  /* negroni_ufs.c (0367): 3 halt, 4 restart */
+ }
+ 
+@@ -62,6 +63,7 @@ negroni_halt_restart(unsigned int type)
+ 		negroni_in_panic = true;
+ 		negroni_fb_panic();             /* the panic text must be on screen (0234) */
+ 		negroni_tfa_panic();            /* no amp left playing a stuck buffer (0244) */
++		negroni_flash_quiesce();        /* no torch left on (0387) */
+ 		return 0;
+ 	case kPEHaltCPU:
+ 		if (negroni_in_panic) {
+@@ -70,6 +72,7 @@ negroni_halt_restart(unsigned int type)
+ 		IOLog("NEGRONI: power off\n");
+ 		negroni_bootlog_end(3, "halt (power off)");     /* clean end mark in the boot log (0367) */
+ 		negroni_tfa_panic();                    /* amps off before the rails go (0244) */
++		negroni_flash_quiesce();                /* torch off (0387) */
+ 		negroni_reboot_settle(300);             /* the USB log thread sends the last lines */
+ 		negroni_power_off();
+ 		return -1;                              /* refused: halt_all_cpus() spins */
+@@ -80,6 +83,7 @@ negroni_halt_restart(unsigned int type)
+ 		IOLog("NEGRONI: restart\n");
+ 		negroni_bootlog_end(4, "restart (reboot)");     /* clean end mark in the boot log (0367) */
+ 		negroni_tfa_panic();                    /* amps off (0244) */
++		negroni_flash_quiesce();                /* torch off (0387) */
+ 		negroni_reboot_settle(300);
+ 		negroni_restart();                      /* kern.negroni_reboot_mode (0213) */
+ 		return -1;

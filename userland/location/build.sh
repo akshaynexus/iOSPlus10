@@ -38,6 +38,8 @@ weak=$(nm -m "$X" | grep 'weak external' || true)
 
 codesign --force -s - --entitlements "$HERE/entitlements.plist" "$X"
 codesign -v "$X"
-codesign -d --entitlements - "$X" 2>/dev/null | grep -q 'com.apple.locationd.simulation' ||
-  { echo "entitlement com.apple.locationd.simulation missing" >&2; exit 1; }
+# simulation: set/hold/listen; authorizeapplications: enable/disable (locationd's SPI check, docs/notes.md section 80)
+for e in com.apple.locationd.simulation com.apple.locationd.authorizeapplications; do
+  codesign -d --entitlements - "$X" 2>/dev/null | grep -q "$e" || { echo "entitlement $e missing" >&2; exit 1; }
+done
 (cd "$W" && shasum -a 256 negroni-locd com.iosplus10.negroni-locd.plist > SHA256SUMS && cat SHA256SUMS)

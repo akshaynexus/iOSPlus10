@@ -1,0 +1,233 @@
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index f06f5c7..cc6f38a 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -263,6 +263,25 @@ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ #define NEGRONI_ZC_LATCH_TICKS            12      /* 100 ms without the engine taking a flush: zero-copy off */
+ #define NEGRONI_ZC_WAIT_MS                50      /* longest SwapWait before 0254 (now: no wait) */
+ #define NEGRONI_FB_CLOCK_ROWS             120     /* 0256: the clock shift's panel rows (negronifb_clockrows) */
++/*
++ * 0391: the clock band. The 0256/0267 strip (panel rows 0..120 = CA rows 12..132, the whole 44 pt status bar) also
++ * moved the content that scrolls under the status bar: on the Today view the grey widget starts at CA row ~95, so its
++ * top edge was shifted n pixels right inside the strip and not below it, and the left n columns got the middle pixels:
++ * a dark step under the punch hole (owner photo 2026-10-27 19:39). A render-server screenshot (userland/screenshot
++ * negroni-shot, logs/shots/shot1.png, 1125x2436) has the clock glyphs at CA x 93..186, y 53..84 (test-shot.png: y 54..84)
++ * = panel rows 41..72 (fOffY 12). The band is panel rows 34..80 (7 rows margin), and in it only the left ear's box moves:
++ * panel columns 50..228 (the clock at 71..164; the Today widget's left edge at 46 stays out; 228 = CA x 250, where the
++ * iPhone X notch area starts, nothing of the left ear lies right of it) go n to the right, and the n columns it opens
++ * get the n columns right of the box (228..228+n, the notch area: status bar background) instead of the middle of the
++ * row. Content that scrolls under the status bar now moves only inside that box. The clean way is UIKit placing the time
++ * itself (+[_UIStatusBarVisualProvider_Split1125 leadingCenteringOffset], 20H392 UIKitCore; needs a userland hook in
++ * every process that draws a status bar): not done here. negronifb_clockband=0: the whole 0..negronifb_clockrows strip
++ * and the half-row rotation as before.
++ */
++#define NEGRONI_FB_CLOCK_BAND_TOP         34
++#define NEGRONI_FB_CLOCK_BAND_BOTTOM      80
++#define NEGRONI_FB_CLOCK_BOX_LEFT         50
++#define NEGRONI_FB_CLOCK_BOX_RIGHT        228
+ #define NEGRONI_SSPPS                     8
+ #define NEGRONI_CTLS                      6
+ #define SSPP_SRC_SIZE                     0x00
+@@ -2275,6 +2294,64 @@ negroni_clock_rows(void)
+ 	return (uint32_t)negroni_clock_rows_arg;
+ }
+ 
++/* 0391: the first panel row of the clock band (0 with negronifb_clockband=0) */
++static int negroni_clock_band = -1;
++
++static bool
++negroni_clock_band_on(void)
++{
++	if (negroni_clock_band < 0) {
++		negroni_clock_band = 1;
++		PE_parse_boot_argn("negronifb_clockband", &negroni_clock_band, sizeof(negroni_clock_band));
++		negroni_clock_band = negroni_clock_band != 0;
++		IOLog("NEGRONI FB: 0391 clock shift %s\n", negroni_clock_band ? "on panel rows 34..80 only (the clock's rows; "
++		    "content under the status bar below them stays in place)" : "on the whole strip (negronifb_clockband=0)");
++	}
++	return negroni_clock_band != 0;
++}
++
++static uint32_t
++negroni_clock_top(void)
++{
++	return negroni_clock_band_on() && negroni_clock_rows() > NEGRONI_FB_CLOCK_BAND_TOP ? NEGRONI_FB_CLOCK_BAND_TOP : 0;
++}
++
++/* 0391: the box shift fits this row width (n <= box width, box end + n <= half the row) */
++static bool
++negroni_clock_box(uint32_t width, uint32_t n)
++{
++	return negroni_clock_band_on() && n <= NEGRONI_FB_CLOCK_BOX_RIGHT - NEGRONI_FB_CLOCK_BOX_LEFT &&
++	       NEGRONI_FB_CLOCK_BOX_RIGHT + n <= width / 2;
++}
++
++/* 0391: one band row shifted in place (row = panel pixels of one row; box or the 0256 half-row shift with edge fill) */
++static void
++negroni_clock_row_inplace(uint32_t *row, uint32_t width, uint32_t n, const uint32_t *fillFrom)
++{
++	uint32_t half = width / 2;
++	if (negroni_clock_box(width, n)) {
++		uint32_t tmp[400];
++		memcpy(tmp, row + NEGRONI_FB_CLOCK_BOX_RIGHT, (size_t)n * 4);
++		memmove(row + NEGRONI_FB_CLOCK_BOX_LEFT + n, row + NEGRONI_FB_CLOCK_BOX_LEFT,
++		    (size_t)(NEGRONI_FB_CLOCK_BOX_RIGHT - NEGRONI_FB_CLOCK_BOX_LEFT) * 4);
++		memcpy(row + NEGRONI_FB_CLOCK_BOX_LEFT, tmp, (size_t)n * 4);
++		return;
++	}
++	uint32_t edge = row[0];         /* the status bar's own colour at its left edge */
++	memmove(row + n, row, (size_t)(half - n) * 4);
++	for (uint32_t x = 0; x < n; x++) {
++		row[x] = fillFrom != NULL ? fillFrom[half - n + x] : edge;
++	}
++}
++
++/* the row after the band: with the band, the 0391 bottom (or negronifb_clockrows when that is lower) */
++static uint32_t
++negroni_clock_bottom(void)
++{
++	uint32_t rows = negroni_clock_rows();
++	return negroni_clock_band_on() && rows > NEGRONI_FB_CLOCK_BAND_BOTTOM ? NEGRONI_FB_CLOCK_BAND_BOTTOM : rows;
++}
++
+ /* The shift in panel pixels (0: off), parsed once (0256: also before the first shift). */
+ static uint32_t
+ negroni_clock_shift_px(void)
+@@ -2292,18 +2369,13 @@ negroni_clock_shift_px(void)
+ static void
+ negroni_shift_clock(uintptr_t pixels, uint32_t rowBytes, uint32_t width, uint32_t height)
+ {
+-	const uint32_t rows = negroni_clock_rows();
++	const uint32_t rows = negroni_clock_bottom(), top = negroni_clock_top();
+ 	uint32_t n = negroni_clock_shift_px(), half = width / 2;
+-	if (n == 0 || n >= half || rows > height) {
++	if (n == 0 || n >= half || rows > height || top >= rows) {
+ 		return;
+ 	}
+-	for (uint32_t y = 0; y < rows; y++) {
+-		uint32_t *row = (uint32_t *)(pixels + (uint64_t)y * rowBytes);
+-		uint32_t edge = row[0];         /* the status bar's own colour at its left edge */
+-		memmove(row + n, row, (size_t)(half - n) * 4);
+-		for (uint32_t x = 0; x < n; x++) {
+-			row[x] = edge;
+-		}
++	for (uint32_t y = top; y < rows; y++) {
++		negroni_clock_row_inplace((uint32_t *)(pixels + (uint64_t)y * rowBytes), width, n, NULL);
+ 	}
+ }
+ 
+@@ -2713,7 +2785,7 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 	bool topRedrawn = false;
+ 	uint32_t fence = 0;             /* the newest GPU copy of this frame */
+ 	bool gpuReady = NegroniGPUPresentReady(), cpuCopied = false;
+-	const int32_t clockRows = (int32_t)negroni_clock_rows();
++	const int32_t clockRows = (int32_t)negroni_clock_bottom(), clockTop = (int32_t)negroni_clock_top();   /* 0391 */
+ 	/*
+ 	 * 0267: the clock shift inside the copy. A frame of one layer that covers the status bar's
+ 	 * left half is written with that strip already shifted (GPU: four rectangles in one
+@@ -2829,14 +2901,26 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 				/* rows below the strip as they are; the strip's left half n to the right, its
+ 				 * last n pixels to the left edge; the strip's right half as it is */
+ 				struct NegroniGPURect r[NEGRONI_GPU_PRESENT_RECTS];
+-				uint32_t nr = 0, R = (uint32_t)clockRows, n = shiftPx;
++				uint32_t nr = 0, R = (uint32_t)clockRows, T = (uint32_t)clockTop, B = R - T, n = shiftPx;
++				if (T > 0) {
++					r[nr++] = { (uint32_t)sx, (uint32_t)sy, 0, 0, (uint32_t)w, T };    /* 0391: rows above the band */
++				}
+ 				if ((uint32_t)h > R) {
+ 					r[nr++] = { (uint32_t)sx, (uint32_t)sy + R, 0, R, (uint32_t)w, (uint32_t)h - R };
+ 				}
+-				r[nr++] = { (uint32_t)sx, (uint32_t)sy, n, 0, half - n, R };
+-				r[nr++] = { (uint32_t)sx + half - n, (uint32_t)sy, 0, 0, n, R };
+-				if ((uint32_t)w > half) {
+-					r[nr++] = { (uint32_t)sx + half, (uint32_t)sy, half, 0, (uint32_t)w - half, R };
++				if (negroni_clock_box(fWidth, n) && (uint32_t)w >= NEGRONI_FB_CLOCK_BOX_RIGHT + n) {
++					/* 0391: the band's left part, the box n to the right, the fill from right of the box, the rest */
++					const uint32_t a = NEGRONI_FB_CLOCK_BOX_LEFT, bb = NEGRONI_FB_CLOCK_BOX_RIGHT;
++					r[nr++] = { (uint32_t)sx, (uint32_t)sy + T, 0, T, a, B };
++					r[nr++] = { (uint32_t)sx + a, (uint32_t)sy + T, a + n, T, bb - a, B };
++					r[nr++] = { (uint32_t)sx + bb, (uint32_t)sy + T, a, T, n, B };
++					r[nr++] = { (uint32_t)sx + bb + n, (uint32_t)sy + T, bb + n, T, (uint32_t)w - bb - n, B };
++				} else {
++					r[nr++] = { (uint32_t)sx, (uint32_t)sy + T, n, T, half - n, B };
++					r[nr++] = { (uint32_t)sx + half - n, (uint32_t)sy + T, 0, T, n, B };
++					if ((uint32_t)w > half) {
++						r[nr++] = { (uint32_t)sx + half, (uint32_t)sy + T, half, T, (uint32_t)w - half, B };
++					}
+ 				}
+ 				f = NegroniGPUPresentRects(s, fDrawPhys, fRowBytes, fHeight, r, nr);
+ 				if (f != 0) {
+@@ -2880,7 +2964,15 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 				uint8_t *d = (uint8_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4);
+ 				const uint8_t *r = (const uint8_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow +
+ 				    (uint64_t)sx * 4);
+-				if (inCopy && y < clockRows) {
++				if (inCopy && y >= clockTop && y < clockRows && negroni_clock_box(fWidth, shiftPx) &&
++				    w >= (int32_t)(NEGRONI_FB_CLOCK_BOX_RIGHT + shiftPx)) {
++					/* 0391: the box n to the right, the n columns right of it into the opened gap */
++					memcpy(d, r, (size_t)w * 4);
++					memcpy(d + (uint64_t)(NEGRONI_FB_CLOCK_BOX_LEFT + shiftPx) * 4, r + (uint64_t)NEGRONI_FB_CLOCK_BOX_LEFT * 4,
++					    (size_t)(NEGRONI_FB_CLOCK_BOX_RIGHT - NEGRONI_FB_CLOCK_BOX_LEFT) * 4);
++					memcpy(d + (uint64_t)NEGRONI_FB_CLOCK_BOX_LEFT * 4, r + (uint64_t)NEGRONI_FB_CLOCK_BOX_RIGHT * 4,
++					    (size_t)shiftPx * 4);
++				} else if (inCopy && y >= clockTop && y < clockRows) {
+ 					/* 0267: the strip row shifted while it is copied (dx == 0, w >= half) */
+ 					memcpy(d + (uint64_t)shiftPx * 4, r, (size_t)(half - shiftPx) * 4);
+ 					memcpy(d, r + (uint64_t)(half - shiftPx) * 4, (size_t)shiftPx * 4);
+@@ -3160,11 +3252,11 @@ AppleCLCD::zeroCopyUnshow(NegroniSurface *s)
+ 		uint32_t half = fWidth / 2, bpr = s->bytesPerRow;
+ 		if (k != 0) {
+ 			uintptr_t top = k + (uint64_t)fOffY * bpr;
+-			for (uint32_t y = 0; y < negroni_clock_rows(); y++) {
++			for (uint32_t y = negroni_clock_top(); y < negroni_clock_bottom(); y++) {
+ 				memcpy((uint32_t *)(top + (uint64_t)y * bpr) + fOffX, (uint32_t *)s->save + (uint64_t)y * half,
+ 				    (size_t)half * 4);
+ 			}
+-			negroni_surface_cache(top, (uint64_t)negroni_clock_rows() * bpr, kNegroniCacheFlush);
++			negroni_surface_cache(top, (uint64_t)negroni_clock_bottom() * bpr, kNegroniCacheFlush);
+ 		}
+ 		s->saved = false;
+ 	}
+@@ -3180,7 +3272,8 @@ AppleCLCD::zeroCopyUnshow(NegroniSurface *s)
+ void
+ AppleCLCD::zeroCopyShiftClock(NegroniSurface *s, uintptr_t k, bool gpu)
+ {
+-	uint32_t half = fWidth / 2, bpr = s->bytesPerRow, rows = negroni_clock_rows(), size = rows * half * 4;
++	uint32_t half = fWidth / 2, bpr = s->bytesPerRow, rows = negroni_clock_bottom(), size = rows * half * 4;
++	uint32_t band = negroni_clock_top();    /* 0391 */
+ 
+ 	if (negroni_clock_shift < 0) {
+ 		negroni_clock_shift = 0;
+@@ -3206,16 +3299,12 @@ AppleCLCD::zeroCopyShiftClock(NegroniSurface *s, uintptr_t k, bool gpu)
+ 		/* the GPU's pixels from memory, not lines the CPU caches may still hold from before */
+ 		negroni_surface_cache(top, (uint64_t)rows * bpr, kNegroniCacheFlush);
+ 	}
+-	for (uint32_t y = 0; y < rows; y++) {
++	for (uint32_t y = band; y < rows; y++) {
+ 		uint32_t *row = (uint32_t *)(top + (uint64_t)y * bpr) + fOffX;
+-		uint32_t edge = row[0];
+ 		const uint32_t *saved = (const uint32_t *)s->save + (uint64_t)y * half;
+ 		memcpy((uint32_t *)s->save + (uint64_t)y * half, row, (size_t)half * 4);
+-		memmove(row + n, row, (size_t)(half - n) * 4);
+-		for (uint32_t x = 0; x < n; x++) {
+-			/* 0267: the same fill as the copy paths (the pixels pushed out at the middle) */
+-			row[x] = fClockCopy ? saved[half - n + x] : edge;
+-		}
++		/* 0267/0391: the same shift and fill as the copy paths (2 x half: the box test sees the row width) */
++		negroni_clock_row_inplace(row, 2 * half, n, fClockCopy ? saved : NULL);
+ 	}
+ 	negroni_surface_cache(top, (uint64_t)rows * bpr, kNegroniCacheClean);
+ 	s->saved = true;
+diff --git a/iokit/Kernel/arm/NegroniGPU.h b/iokit/Kernel/arm/NegroniGPU.h
+index 37ab104..7804b21 100644
+--- a/iokit/Kernel/arm/NegroniGPU.h
++++ b/iokit/Kernel/arm/NegroniGPU.h
+@@ -32,7 +32,7 @@ uint32_t NegroniGPUPresent(NegroniSurface *s, uint64_t panelPhys, uint32_t pitch
+  * left half written n pixels to the right), so the CPU never reads or rewrites the panel memory
+  * after the copy. All or nothing: 0 when one rectangle cannot be done.
+  */
+-#define NEGRONI_GPU_PRESENT_RECTS 4
++#define NEGRONI_GPU_PRESENT_RECTS 6       /* 0391: rows above and below the clock band, 4 in the band */
+ struct NegroniGPURect {
+ 	uint32_t sx, sy, dx, dy, w, h;
+ };

@@ -30,7 +30,7 @@ cp "$G/ngl_test" "$STAGE/usr/local/bin/ngl_test"
 "$STRIP" -x "$STAGE/usr/lib/negronigl.dylib" "$STAGE/usr/local/bin/ngl_test"
 codesign -s - -f "$STAGE/usr/lib/negronigl.dylib" "$STAGE/usr/local/bin/ngl_test" 2>/dev/null ||
 	ldid -S "$STAGE/usr/lib/negronigl.dylib" "$STAGE/usr/local/bin/ngl_test"
-cp "$G/NegroniGL.bundle/NegroniGL" "$G/NegroniGL.bundle/Info.plist" "$BSTAGE/"
+cp "$G/NegroniGL.bundle/NegroniGL" "$G/NegroniGL.bundle/Info.plist" "$G/NegroniGL.bundle/gpu-policy" "$BSTAGE/"
 "$STRIP" -x "$BSTAGE/NegroniGL"
 codesign -s - -f "$BSTAGE/NegroniGL" 2>/dev/null || ldid -S "$BSTAGE/NegroniGL"
 cat > "$BSTAGE/apps" <<'EOF'

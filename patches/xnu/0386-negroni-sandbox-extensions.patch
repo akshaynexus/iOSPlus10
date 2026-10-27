@@ -1,0 +1,62 @@
+diff --git a/bsd/kern/negroni_amfi.c b/bsd/kern/negroni_amfi.c
+index 8170bbf..941575a 100644
+--- a/bsd/kern/negroni_amfi.c
++++ b/bsd/kern/negroni_amfi.c
+@@ -281,7 +281,7 @@ negroni_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *labe
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). NEGRONI runs without a sandbox: operations succeed
+  * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
++ * data (container paths) fail with ENOENT; extension tokens: op 5 below. The first
+  * use of each operation number is logged.
+  */
+ static uint64_t negroni_sandbox_seen;
+@@ -331,6 +331,38 @@ negroni_sandbox_container_path(user_addr_t arg)
+ 	return err;
+ }
+ 
++/*
++ * Op 5, extension issue (libsystem_sandbox __sandbox_extension_issue, 20H392
++ * 0x1d1af4f98): arg -> { char *class; u64 type (0 file, 1 mach, 3 generic);
++ * char *data; u64 flags; char *token_buf (malloc 0x800); i64 pid; u64 pidversion }; the policy writes the token
++ * string into token_buf. Op 6, extension consume (sandbox_extension_consume
++ * 0x1d1af4ecc): arg -> { char *token; u64 length; i64 *handle }; 0 = the
++ * handle (left 0 by the library). With ENOENT for both, tccd answered every
++ * TCC request "Failed to issue Sandbox Extension" (kTCCErrorDomain 6) and
++ * Camera.app got "This app is not authorized to use Back Camera" (-11852),
++ * so its capture session ran without an input (camera doc section 9).
++ * Without a sandbox an extension grants nothing: issue gives a fixed token,
++ * consume accepts any. Boot-arg negronisbext=0: ENOENT for both, as before.
++ */
++static TUNABLE(uint32_t, negroni_sandbox_extensions, "negronisbext", 1);
++
++static int
++negroni_sandbox_extension_issue(user_addr_t arg)
++{
++	static const char token[] =
++	    "0000000000000000000000000000000000000000000000000000000000000000;00;00000000;00000000;00000000;"
++	    "000000000000001a;negroni.sandbox.extension;00000001;00000000;0000000000000000";
++	uint64_t a[7];
++
++	if (!negroni_sandbox_extensions) {
++		return ENOENT;
++	}
++	if (copyin(arg, a, sizeof(a)) != 0 || a[4] == 0) {
++		return EINVAL;
++	}
++	return copyout(token, (user_addr_t)a[4], sizeof(token));
++}
++
+ static int
+ negroni_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+@@ -344,7 +376,9 @@ negroni_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ 	case 4:         /* container path (pid) */
+ 		return negroni_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
++		return negroni_sandbox_extension_issue(arg);
+ 	case 6:         /* extension consume */
++		return negroni_sandbox_extensions ? 0 : ENOENT;
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:

@@ -160,6 +160,8 @@ void ngl_tex_size(GLenum target, GLint level, GLsizei w, GLsizei h);
 /* shaders.c */
 bool ngl_fbfetch_native(void);
 char *ngl_shader_rewrite(struct ngl_state *st, GLuint shader, char *src);   /* takes src, returns new */
+extern const char ngl_precision_prelude[];  /* the two "#define ... highp" lines shaders.c inserts */
+bool ngl_full_precision(void);              /* NEGRONIGL_PRECISION (default on) */
 void ngl_program_linked(struct ngl_state *st, GLuint program);
 void ngl_shader_deleted(struct ngl_state *st, GLuint shader);
 const char *ngl_extensions(const char *mesa);

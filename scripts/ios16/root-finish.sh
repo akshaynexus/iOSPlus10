@@ -23,8 +23,8 @@
 # 1j. fingerprint glyph daemon negroni-fpd: scripts/fp/root-add-fpd.sh (FPD=1; default off): kern.negroni_fp_ui from
 #     the SpringBoard lock state (patches/xnu/README-fingerprint.md "0354")
 # 1l. negroni-locd (simulated positions into locationd): scripts/location/root-add-locd.sh (LOCD=1; default off;
-#     LOCD_JOB=1 also adds its launchd job). The Location Services switch: LOCATION_SWITCH=1 for
-#     root-tweaks-extra.py (default off). docs/location-plan.md
+#     LOCD_JOB=1 also adds its launchd job). The Location Services switch: root-tweaks-extra.py item 7
+#     (default on; LOCATION_SWITCH=0 leaves it off). docs/location-plan.md
 # 1k. Camera: NegroniCamera.driver (capture plug-in for the stock Camera.app) + MobileGestalt cache cleared:
 #     scripts/camera/root-add-camera.sh (CAMERA=1; default on when out/camera/ios/NegroniCamera.driver is built,
 #     CAMERA=0 to leave it out); it writes out/camera/root-has-camera, which scripts/ios16/build.sh needs for its

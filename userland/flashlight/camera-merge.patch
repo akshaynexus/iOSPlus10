@@ -1,0 +1,107 @@
+diff -ru a/userland/camera/build.sh b/userland/camera/build.sh
+--- a/userland/camera/build.sh	2026-10-27 18:32:16
++++ b/userland/camera/build.sh	2026-10-27 18:32:38
+@@ -27,7 +27,8 @@
+ 
+ "$ICC" -arch arm64 -isysroot "$SDK" -mios-version-min=$MINOS $CFLAGS -fblocks -bundle \
+   -framework CoreFoundation -framework CoreMedia -framework CoreVideo -lobjc \
+-  "$HERE/media_hooks.c" "$HERE/camera_device.c" "$HERE/camera_isp.c" -o "$B/NegroniCamera"
++  -I"$HERE/../flashlight" "$HERE/media_hooks.c" "$HERE/camera_device.c" "$HERE/camera_isp.c" \
++  "$HERE/../flashlight/negroni_flashlight.c" -o "$B/NegroniCamera"
+ cp "$HERE/Info.plist" "$B/Info.plist"
+ plutil -lint "$B/Info.plist" >/dev/null
+ 
+diff -ru a/userland/camera/camera_device.c b/userland/camera/camera_device.c
+--- a/userland/camera/camera_device.c	2026-10-27 18:32:16
++++ b/userland/camera/camera_device.c	2026-10-27 18:32:52
+@@ -58,7 +58,10 @@
+ #include <unistd.h>
+ #include <os/log.h>
+ #include "camera_isp.h"
++#include "negroni_flashlight.h"     /* userland/flashlight (kernel patch 0387, /dev/negroniflash) */
+ 
++static float torch_level;                /* the last TorchLevel set (one LED for every stream) */
++
+ void negronicam_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
+ void negronicam_console(const char *line, size_t n);
+ 
+@@ -555,7 +558,9 @@
+ 		value = number_f(s->max_fps);
+ 	} else if (key_is(key, "Clock")) {
+ 		value = CFRetain(CMClockGetHostTimeClock());
+-	} else if (key_is(key, "TorchLevel") || key_is(key, "ExposureBias")) {
++	} else if (key_is(key, "TorchLevel")) {
++		value = number_f(torch_level);
++	} else if (key_is(key, "ExposureBias")) {
+ 		value = number_f(0);
+ 	} else if (key_is(key, "VideoOutputConfigurations") || key_is(key, "VideoOutputsEnabled")) {
+ 		/*
+@@ -836,19 +841,18 @@
+ 	return 0;
+ }
+ 
+-/* the flashlight: TorchLevel (0 to 1). iOSPlus10: no torch driver yet: said, not acted on (no ADT "flash") */
++/* the flashlight: TorchLevel (0 to 1) -> /dev/negroniflash level 0..10 (userland/flashlight/negroni_flashlight.c) */
+ static void
+ torch_set(struct stream *s, CFTypeRef value)
+ {
+ 	float level = 0;
+-	uint32_t thousandths;
+ 
+ 	if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
+ 		CFNumberGetValue(value, kCFNumberFloatType, &level);
+ 	}
+ 	level = level < 0 ? 0 : level > 1 ? 1 : level;
+-	thousandths = (uint32_t)(level * 1000 + 0.5f);
+-	say("the flashlight at %u of 1000 NOT TAKEN (no torch driver)", thousandths);
++	torch_level = level;
++	negroni_flashlight_set(level);
+ }
+ 
+ /* ---- the frames ------------------------------------------------------------------------------------- */
+diff -ru a/userland/camera/media_hooks.c b/userland/camera/media_hooks.c
+--- a/userland/camera/media_hooks.c	2026-10-27 18:32:16
++++ b/userland/camera/media_hooks.c	2026-10-27 18:32:38
+@@ -45,6 +45,7 @@
+ #include <unistd.h>
+ #include <uuid/uuid.h>
+ #include "negronicam.h"
++#include "negroni_flashlight.h"     /* userland/flashlight (kernel patch 0387) */
+ 
+ extern void negronicam_console(const char *line, size_t n);     /* camera_device.c: to /dev/console (USB log) */
+ 
+@@ -98,6 +99,7 @@
+ static id
+ shared_vendor(id self, SEL selector)
+ {
++	uintptr_t caller = (uintptr_t)__builtin_return_address(0);
+ 	id vendor = ((id (*)(id, SEL))original_shared_vendor)(self, selector);
+ 	static id camera_vendor;
+ 	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+@@ -105,6 +107,18 @@
+ 	if (vendor != NULL) {
+ 		return vendor;          /* (an Apple ISP driver after all: as it is) */
+ 	}
++	/*
++	 * The torch without a camera device (no /dev/negronicam, or it failed): FigFlashlight, and only FigFlashlight
++	 * (by its 20H392 call sites), gets the flashlight's own vendor (userland/flashlight). NULL when there is no
++	 * /dev/negroniflash or the caller is not FigFlashlight.
++	 */
++	if (negronicam_failed || access(NEGRONICAM_DEVICE, F_OK) != 0) {
++		id torch_vendor = (id)negroni_flashlight_vendor_for(caller);
++
++		if (torch_vendor != NULL) {
++			return torch_vendor;
++		}
++	}
+ 	pthread_mutex_lock(&lock);
+ 	if (camera_vendor == NULL) {
+ 		bool present = access(NEGRONICAM_DEVICE, F_OK) == 0;
+@@ -684,6 +698,7 @@
+ 	if (access(NEGRONICAM_DEVICE, F_OK) == 0) {
+ 		register_hevc_encoder();
+ 	}
++	(void)negroni_flashlight_init(slide);       /* /dev/negroniflash (kernel 0387); off with one log line if absent */
+ 	previous_exception_handler = objc_setUncaughtExceptionHandler(uncaught_exception);
+ 	seed_display_alignment();
+ 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */

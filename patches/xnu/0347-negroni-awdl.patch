@@ -1,0 +1,2230 @@
+0347-negroni-awdl: AirDrop AWDL engine (boot-arg negroniawdl, default on; kill switch negroniawdl=0; docs/airdrop-plan.md).
+In-kernel AWDL (Apple Wireless Direct Link) on the WCN6855 Wi-Fi driver, a port of seemoo-lab/owl (GPL-3.0-or-later, pin
+0ee3263f944ea721c355f826aa90d636d012a512): negroni_awdl_owl.c/.h hold the ported sync math, election and frame build/parse;
+negroni_awdl.c holds the engine on the Wi-Fi driver thread (from negroni_wlan_sta_service). It parks on channel 6 by a
+single-channel passive scan with the offchan-mgmt-tx flag and its own scan id (en0's scan id is untouched), runs only while
+en0 is idle, and gives the radio back (STOP_SCAN) the moment en0 needs it. PSF every 110 TU and MIF are sent by
+WMI_MGMT_TX_SEND from our own DMA slots (desc ids 0x100+); a TX-completion hook clears the slots. RX AWDL action frames go
+to the OWL receive code (peer table, election). Self-checks (NO PROBES rule): no WMI_SERVICE_MGMT_TX_WMI (76) turns the
+engine off with one line; failed TX completions turn it off with the status; awdl0 and the AirLink IOService are made ONLY
+after the first received AWDL frame proves the firmware passes AWDL frames to the host. wifip2pd's AWDL_SYNC_ENABLED is
+answered; the other APPLE80211_IOC_AWDL_* requests are logged and get a clean error (the work list, step 6). Bit 0 (RX
+classification) and bit 1 (awdl0 observer) are the earlier probe, kept. Details: patches/xnu/README-wifi.md "0347".
+Review fixes (2026-10-27): negroni_awdl_yield() stops our ROC scan and waits <= 300 ms for its end before en0's
+scan and before a join/disassociate; STOP_SCAN req_type WMI_SCAN_STOP_ONE = 0; one ROC at a time (no re-arm before
+the end event), back-off + engine off after 10 failed ROC starts; TX only while our ROC runs; lost TX completions
+free the slot after 1 s, 8 lost with none completed = engine off; awdl0 with the engine bit waits for RX + one TX OK;
+the RX path runs for every non-zero negroniawdl (bits 2/4 alone work) and only after negroni_awdl_start.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c8cd8f7..3972774 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -689,3 +689,5 @@ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
+ bsd/dev/negroni_wlan_ios.c		standard
+ bsd/dev/negroni_apple80211.c		standard
++bsd/dev/negroni_awdl.c			standard
++bsd/dev/negroni_awdl_owl.c		standard
+diff --git a/bsd/dev/negroni_awdl.c b/bsd/dev/negroni_awdl.c
+new file mode 100644
+index 0000000..9036300
+--- /dev/null
++++ b/bsd/dev/negroni_awdl.c
+@@ -0,0 +1,1113 @@
++/*
++ * Copyright (c) 2026 iOSPlus10.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed software or any other software. Please obtain a
++ * copy of the License at http://www.opensource.apple.com/apsl/ and read it
++ * before using this file.
++ *
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ */
++/*
++ * NEGRONI AirDrop step 1 (patch 0347): the AWDL probe. See negroni_awdl.h and docs/airdrop-plan.md.
++ *
++ * Own code. The AWDL frame layout comes from the public description of the protocol (Stute et al., "One Billion
++ * Apples' Secret Sauce", MobiCom 2018; seemoo-lab/owl frame.h was read as a reference, nothing is copied). The
++ * Apple80211 request numbers and names come from IO80211.framework 20H392 kIoctlNameTable
++ * (out/research/wifid/ioctl_names.txt). The role string "AirLink" comes from IO80211.framework 20H392
++ * __isVirtualInterface (0x1d3ed3bf0), which compares IO80211VirtualInterfaceRole with "AirLink",
++ * "WiFi-Aware Discovery", "WiFi-Aware Discovery+Data", "WiFi-Aware Data" and "SoftAP".
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/sockio.h>
++#include <sys/kpi_mbuf.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <net/if.h>
++#include <net/if_private.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/if_media.h>
++#include <net/bpf.h>
++#include "negroni_awdl.h"
++#include "negroni_awdl_owl.h"     /* 0347: the ported OWL AWDL core */
++#include "negroni_wlan_sta.h"     /* 0347: wmi_send, our MAC, DMA, en0 state */
++#include "negroni_wlan_mhi.h"     /* 0347: negroni_wlan_ms */
++#include "negroni_wlan_wmi.h"     /* 0347: struct wmi_tlv_it, negroni_wmi_tlv_next */
++
++#define SIOCSA80211_CMD         0x802869c8ul    /* _IOW('i', 200, struct apple80211req) */
++#define SIOCGA80211_CMD         0xc02869c9ul    /* _IOWR('i', 201, struct apple80211req) */
++
++struct apple80211req {
++	char req_if_name[16];
++	int32_t req_type;
++	int32_t req_val;
++	uint32_t req_len;
++	user_addr_t req_data __attribute__((aligned(8)));
++};
++_Static_assert(sizeof(struct apple80211req) == 40, "struct apple80211req (SIOCGA80211 length 0x28)");
++
++/* the AWDL, NAN, P2P and virtual-interface requests of IO80211.framework 20H392 (plus a few generic ones) */
++static const struct {
++	int32_t type;
++	const char *name;
++} names[] = {
++	{ 7, "TXPOWER" }, { 12, "CARD_CAPABILITIES" },
++	{ 19, "POWER" }, { 27, "SUPPORTED_CHANNELS" },
++	{ 43, "DRIVER_VERSION" }, { 44, "HARDWARE_VERSION" },
++	{ 51, "COUNTRY_CODE" }, { 91, "P2P_ENABLE" },
++	{ 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" },
++	{ 96, "VIRTUAL_IF_ROLE" }, { 97, "VIRTUAL_IF_PARENT" },
++	{ 104, "BT_POWER" }, { 108, "TX_CHAIN_POWER" },
++	{ 116, "AWDL_SYNC_PARAMS" }, { 117, "AWDL_SYNC_ENABLED" },
++	{ 118, "AWDL_EXTENSION_STATE_MACHINE_PARAMETERS" }, { 119, "AWDL_SERVICE_PARAMS" },
++	{ 120, "AWDL_PEER_SERVICE_REQUEST" }, { 121, "AWDL_ELECTION_ALGORITHM_ENABLED" },
++	{ 122, "AWDL_ELECTION_ID" }, { 123, "AWDL_MAX_TREE_DEPTH" },
++	{ 124, "AWDL_GUARD_TIME" }, { 125, "AWDL_BSSID" },
++	{ 126, "AWDL_ELECTION_METRIC" }, { 127, "AWDL_AVAILABILITY_WINDOW_AP_ALIGNMENT" },
++	{ 128, "AWDL_SYNC_FRAME_AP_BEACON_ALIGNMENT" }, { 129, "AWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE" },
++	{ 131, "AWDL_OUI" }, { 132, "AWDL_MASTER_CHANNEL" },
++	{ 133, "AWDL_TOP_MASTER" }, { 134, "AWDL_SYNC_STATE" },
++	{ 135, "AWDL_ELECTION_RSSI_THRESHOLDS" }, { 136, "AWDL_PRESENCE_MODE" },
++	{ 137, "AWDL_ELECTION_MASTER_COUNTS" }, { 138, "AWDL_PERIODIC_SYNC_FRAME_PACKET_LIFETIME" },
++	{ 139, "AWDL_MASTER_MODE_SYNC_FRAME_PERIOD" }, { 140, "AWDL_NON_ELECTION_MASTER_MODE_SYNC_FRAME_PERIOD" },
++	{ 141, "AWDL_EXPLICIT_AVAILABILITY_WINDOW_EXTENSION_OPT_OUT" }, { 142, "AWDL_GET_AWDL_MASTER_DATABASE" },
++	{ 144, "AWDL_BATTERY_LEVEL" }, { 145, "AWDL_BT_COEX_AW_PROTECTED_PERIOD_LENGTH" },
++	{ 146, "AWDL_BT_COEX_AGREEMENT" }, { 147, "AWDL_BT_COEX_AGREEMENT_ENABLED" },
++	{ 148, "AWDL_STRATEGY" }, { 149, "AWDL_OOB_REQUEST" },
++	{ 150, "AWDL_MAX_NO_MASTER_PERIODS" }, { 151, "AWDL_SYNC_FRAME_TEMPLATE" },
++	{ 155, "AWDL_ELECTION_PARAMS" }, { 158, "AWDL_DEVICE_CAPABILITIES" },
++	{ 159, "AWDL_RSSI_MEASUREMENT_REQUEST" }, { 160, "AWDL_AES_KEY" },
++	{ 161, "AWDL_SCAN_RESERVED_TIME" }, { 162, "AWDL_CTL" },
++	{ 163, "AWDL_SOCIAL_TIME_SLOTS" }, { 164, "AWDL_PEER_TRAFFIC_REGISTRATION" },
++	{ 167, "AWDL_FORCED_ROAM_CONFIG" }, { 168, "AWDL_QUIET" },
++	{ 178, "OFFLOAD_COUNTRY_CODE" }, { 201, "AWDL_BTLE_PEER_INDICATION" },
++	{ 202, "AWDL_BTLE_STATE_PARAMS" }, { 203, "AWDL_PEER_DATABASE" },
++	{ 204, "AWDL_BTLE_ENABLE_SYNC_WITH_PARAMS" }, { 205, "AWDL_SECONDARY_MASTER_CHANNEL" },
++	{ 207, "CHANNELS_INFO" }, { 208, "AWDL_AF_TX_MODE" },
++	{ 211, "AWDL_PIGGYBACK_SCAN_REQ" }, { 212, "AWDL_PRIVATE_ELECTION_ID" },
++	{ 213, "AWDL_MIN_RATE" }, { 217, "AWDL_OPER_MODE" },
++	{ 219, "AWDL_ENCRYPTION_KEYS" }, { 220, "AWDL_ENCRYPTION_TYPE" },
++	{ 223, "AWDL_STATISTICS" }, { 224, "AWDL_ENABLE_ROAMING" },
++	{ 225, "AWDL_OOB_AUTO_REQUEST" }, { 226, "AWDL_TXCAL_PERIOD" },
++	{ 229, "AWDL_AWDL_ADVERTISERS" }, { 233, "AWDL_BLOCK_SET_COMMANDS" },
++	{ 244, "AWDL_PREFERRED_CHANNELS" }, { 246, "AWDL_RSDB_CAPS" },
++	{ 247, "AWDL_DEV_STATS" }, { 249, "AWDL_COMMON_CHANNEL" },
++	{ 250, "AWDL_PEERS_INFO" }, { 253, "AWDL_NEARBY_LOG_TRIGGER" },
++	{ 254, "HW_SUPPORTED_CHANNELS" }, { 262, "AWDL_DFSP_CONFIG" },
++	{ 263, "AWDL_DFSP_UCSA_CONFIG" }, { 268, "NAN_ENABLED" },
++	{ 269, "NAN_INIT" }, { 270, "NAN_CLUSTER_ID" },
++	{ 271, "NAN_DISC_BCN_PERIOD" }, { 272, "NAN_SYNC_BCN_PERIOD" },
++	{ 273, "NAN_DW_AWAKE_PERIOD" }, { 274, "NAN_BCN_TX_CONTROL" },
++	{ 275, "NAN_HOST_ELECTION" }, { 276, "NAN_RSSI_CLOSE" },
++	{ 277, "NAN_RSSI_MIDDLE" }, { 278, "NAN_RSSI_5G_CLOSE" },
++	{ 279, "NAN_RSSI_5G_MIDDLE" }, { 280, "NAN_DEVICE_INFO" },
++	{ 281, "NAN_MASTER_PREFERENCE" }, { 282, "NAN_RANDOM_FACTOR" },
++	{ 283, "NAN_RANDOM_FACTOR_ROTATION" }, { 284, "NAN_HOP_COUNT_TO_ANCHOR_MASTER" },
++	{ 285, "NAN_MASTER_RANK" }, { 286, "NAN_MAX_PEERS" },
++	{ 287, "NAN_MASTER_CHANNEL" }, { 288, "NAN_SECONDARY_MASTER_CHANNEL" },
++	{ 289, "NAN_TX_RATE" }, { 290, "NAN_WARMUP_TIME" },
++	{ 291, "NAN_CURRENT_ANCHOR_MASTER_RECORD" }, { 292, "NAN_LAST_ANCHOR_MASTER_RECORD" },
++	{ 293, "COMPANION_SKYWALK_IF_CREATE" }, { 294, "NAN_CW" },
++	{ 295, "NAN_CW_RS" }, { 296, "NAN_SYNC_STATS" },
++	{ 297, "NAN_HOP_COUNT_LIMIT" }, { 298, "NAN_AF_TX" },
++	{ 299, "NAN_CHANNEL_SEQUENCE" }, { 300, "NAN_PUBLISH" },
++	{ 301, "NAN_CANCEL_PUBLISH" }, { 302, "NAN_PUBLISHED_SERVICE_LIST" },
++	{ 303, "NAN_SUBSCRIBE" }, { 304, "NAN_SUBSCRIBED_SERVICE_LIST" },
++	{ 305, "NAN_PUBLISHERS_LIST" }, { 306, "NAN_CANCEL_SUBSCRIBE" },
++	{ 307, "NAN_FOLLOW_UP_TRANSMIT" }, { 308, "NAN_DISCOVERY_RESULT" },
++	{ 309, "NAN_FOLLOW_UP_RECEIVE" }, { 310, "NAN_SERVICE_DISCOVERY_STATS" },
++	{ 311, "NAN_SERVICE_DESCRIPTOR_EXTENSION" }, { 312, "NAN_RANGING_REQUEST" },
++	{ 313, "NAN_RANGING_RESPONSE" }, { 314, "NAN_RANGING_CANCEL" },
++	{ 315, "NAN_DP_REQ" }, { 316, "NAN_DP_RESP" },
++	{ 317, "NAN_SCHEDULE_UPDATE" }, { 318, "NAN_DP_END" },
++	{ 319, "NAN_DP_CONF" }, { 320, "NAN_ADVERTISERS" },
++	{ 321, "NAN_COMMITTED_AVAILABILITY" }, { 322, "NAN_POTENTIAL_AVAILABILITY" },
++	{ 323, "NAN_DEVICE_CAPABILITY" }, { 324, "NAN_NDC_AVAILABILITY" },
++	{ 325, "NAN_IMMUTABLE_AVAILABILITY" }, { 326, "NAN_RANGING_AVAILABILITY" },
++	{ 327, "NAN_PEER_DATABASE" }, { 328, "NAN_CTL" },
++	{ 329, "NAN_DP_INFO" }, { 330, "NAN_VENDOR_PAYLOAD" },
++	{ 331, "NAN_ELECTION_ROLE" }, { 332, "NAN_QOS_PARAMS" },
++	{ 333, "NAN_FAST_DISCOVERY" }, { 335, "NAN_DATA_PATH_RESTORE" },
++	{ 338, "AWDL_CCA" }, { 341, "AWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES" },
++	{ 342, "AWDL_OOB_SEC_PAYLOAD_REQUEST" }, { 343, "AWDL_LOW_LATENCY_STATISTICS" },
++	{ 344, "LLW_PARAMS" }, { 351, "AWDL_SIDECAR_DIAGNOSTICS" },
++	{ 355, "NAN_LLW_PARAMS" }, { 356, "HP2P_CAPS" },
++	{ 357, "RLLW_STATS" }, { 366, "NAN_OOB_AF_TX" },
++	{ 367, "NAN_DATA_PATH_KEEP_ALIVE_IDENTIFIER" }, { 370, "AWDL_AIRPLAY_STATISTICS" },
++	{ 371, "HP2P_CTRL" }, { 379, "COUNTRY_CHANNELS_INFO" },
++	{ 385, "NAN_DP_LINK_STATUS" }, { 389, "USERSPACE_P2P_OPTIONS" },
++	{ 395, "AWDL_UPDATE_SERVICE_COUNT" }, { 398, "NAN_RESTRICT_POWER_SAVE" },
++	{ 400, "NAN_INFRA_STATUS" }, { 401, "NAN_INFRA_RELAY_PACKETS_DUMP" },
++	{ 414, "P2P_COEX_PROTECTION" }, { 416, "AWDL_MI_BITMAP" },
++	{ 417, "AWDL_UMI_TX_PEER" }, { 424, "AWDL_DEVICE_MAC_ADDRESS" },
++};
++
++static const char *
++type_name(int32_t type)
++{
++	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++		if (names[i].type == type) {
++			return names[i].name;
++		}
++	}
++	return "?";
++}
++
++/* ---- boot-arg ------------------------------------------------------------------------------------------------ */
++
++static uint32_t awdl_mode_value;
++static bool awdl_mode_read;
++
++uint32_t
++negroni_awdl_mode(void)
++{
++	if (!awdl_mode_read) {
++		uint32_t v = 0;
++
++		/* default on (kill switch negroniawdl=0); an explicit value picks the bits */
++		if (PE_parse_boot_argn("negroniawdl", &v, sizeof(v))) {
++			awdl_mode_value = v & (NAWDL_RX | NAWDL_IF | NAWDL_ENGINE);
++		} else {
++			awdl_mode_value = NAWDL_DEFAULT;
++		}
++		awdl_mode_read = true;
++	}
++	return awdl_mode_value;
++}
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* engine hook, defined with the engine below (one driver thread, no lock needed with the RX path) */
++static void engine_rx(const uint8_t *frame, const uint8_t *body, uint32_t blen, int32_t rssi, uint32_t freq);
++static bool engine_is_on(void);
++
++/* ---- RX classification (bit 0), driver thread only ------------------------------------------------------------ */
++
++#define FC_TYPE(fc)             (((fc) >> 2) & 3u)
++#define FC_SUBTYPE(fc)          (((fc) >> 4) & 0xfu)
++#define FC_ORDER                0x8000u
++#define CAT_PUBLIC              4u
++#define CAT_VENDOR              127u
++#define AWDL_TYPE               8u
++#define AWDL_PSF                0u              /* periodic synchronization frame */
++#define AWDL_MIF                3u              /* master indication frame */
++#define AWDL_HDR                16u             /* category, OUI, type, version, subtype, reserved, 2 x u32 time */
++#define SOURCES_MAX             16u
++#define AWDL_LINES_MAX          12u
++#define NAN_LINES_MAX           4u
++
++static const uint8_t oui_apple[3] = { 0x00, 0x17, 0xf2 };
++static const uint8_t oui_wfa[3] = { 0x50, 0x6f, 0x9a };
++static const uint8_t awdl_bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
++
++static struct {
++	uint32_t frames, beacons, probe_req, probe_resp, action, other, short_frames;
++	uint32_t public_action, vendor_action, other_action;
++	uint32_t awdl, awdl_psf, awdl_mif, awdl_other, awdl_foreign_bssid, awdl_2g, awdl_5g;
++	uint32_t nan_sdf;
++	uint32_t lines, nan_lines;
++	uint32_t nsources;
++	struct {
++		uint8_t mac[6];
++		uint32_t frames, freq;
++		int32_t rssi;
++	} src[SOURCES_MAX];
++	uint32_t said_frames;           /* summary: frames at the last summary */
++} R;
++
++static const char *
++awdl_subtype_name(uint32_t subtype)
++{
++	return subtype == AWDL_PSF ? "PSF" : subtype == AWDL_MIF ? "MIF" : "subtype?";
++}
++
++/* "t1 t2 ..." of the first TLVs after the 16-byte AWDL action header (type u8, length u16 little endian) */
++static void
++awdl_tlv_list(const uint8_t *p, uint32_t len, char *out, size_t out_size)
++{
++	size_t used = 0;
++	uint32_t n = 0;
++
++	out[0] = '\0';
++	while (len >= 3 && n < 12 && used + 8 < out_size) {
++		uint32_t t = p[0], l = (uint32_t)p[1] | ((uint32_t)p[2] << 8);
++
++		used += (size_t)snprintf(out + used, out_size - used, "%s%u", n ? " " : "", t);
++		n++;
++		if (l > len - 3) {
++			used += (size_t)snprintf(out + used, out_size - used, "(cut)");
++			break;
++		}
++		p += 3 + l;
++		len -= 3 + l;
++	}
++}
++
++static void
++awdl_source(const uint8_t mac[6], int32_t rssi, uint32_t freq)
++{
++	uint32_t i;
++
++	for (i = 0; i < R.nsources; i++) {
++		if (memcmp(R.src[i].mac, mac, 6) == 0) {
++			R.src[i].frames++;
++			R.src[i].rssi = rssi;
++			R.src[i].freq = freq;
++			return;
++		}
++	}
++	if (R.nsources < SOURCES_MAX) {
++		memcpy(R.src[R.nsources].mac, mac, 6);
++		R.src[R.nsources].frames = 1;
++		R.src[R.nsources].rssi = rssi;
++		R.src[R.nsources].freq = freq;
++		R.nsources++;
++		/* the address is a peer's (random for AWDL): only its first three bytes are logged */
++		printf("NEGRONI AWDL: new AWDL peer %u: %02x:%02x:%02x:xx:xx:xx, %u MHz, RSSI %d dBm\n", R.nsources, mac[0], mac[1],
++		    mac[2], freq, rssi);
++	}
++}
++
++void
++negroni_awdl_mgmt_rx(const uint8_t *f, uint32_t len, int32_t rssi, uint32_t freq)
++{
++	uint32_t fc, hdr = 24, subtype;
++	const uint8_t *body;
++	uint32_t blen;
++
++	if (negroni_awdl_mode() == 0 || f == NULL) {
++		return;         /* 0347 review: bits 1/2 also need the RX path (negroniawdl=4 or 6 never started) */
++	}
++	R.frames++;
++	if (len < 24) {
++		R.short_frames++;
++		return;
++	}
++	fc = (uint32_t)f[0] | ((uint32_t)f[1] << 8);
++	if (FC_TYPE(fc) != 0) {
++		R.other++;
++		return;
++	}
++	subtype = FC_SUBTYPE(fc);
++	if (subtype == 8) {
++		R.beacons++;
++		return;
++	}
++	if (subtype == 4) {
++		R.probe_req++;
++		return;
++	}
++	if (subtype == 5) {
++		R.probe_resp++;
++		return;
++	}
++	if (subtype != 13 && subtype != 14) {           /* action, action no ack */
++		R.other++;
++		return;
++	}
++	R.action++;
++	if (fc & FC_ORDER) {
++		hdr += 4;                               /* HT control */
++	}
++	if (len < hdr + 1) {
++		R.short_frames++;
++		return;
++	}
++	body = f + hdr;
++	blen = len - hdr;
++	if (body[0] == CAT_PUBLIC) {
++		R.public_action++;
++		/* NAN SDF: public action 9 (vendor specific), OUI 50:6f:9a, OUI type 0x13 */
++		if (blen >= 6 && body[1] == 9 && memcmp(body + 2, oui_wfa, 3) == 0 && body[5] == 0x13) {
++			R.nan_sdf++;
++			if (R.nan_lines < NAN_LINES_MAX) {
++				R.nan_lines++;
++				printf("NEGRONI AWDL: RX NAN service discovery frame from %02x:%02x:%02x:xx:xx:xx, %u MHz, RSSI %d dBm, "
++				    "%u bytes\n", f[10], f[11], f[12], freq, rssi, len);
++			}
++		}
++		return;
++	}
++	if (body[0] != CAT_VENDOR) {
++		R.other_action++;
++		return;
++	}
++	R.vendor_action++;
++	if (blen < AWDL_HDR || memcmp(body + 1, oui_apple, 3) != 0 || body[4] != AWDL_TYPE) {
++		return;
++	}
++	R.awdl++;
++	R.awdl_psf += body[6] == AWDL_PSF;
++	R.awdl_mif += body[6] == AWDL_MIF;
++	R.awdl_other += body[6] != AWDL_PSF && body[6] != AWDL_MIF;
++	R.awdl_foreign_bssid += memcmp(f + 16, awdl_bssid, 6) != 0;
++	if (freq < 4000) {
++		R.awdl_2g++;
++	} else {
++		R.awdl_5g++;
++	}
++	awdl_source(f + 10, rssi, freq);
++	engine_rx(f, body, blen, rssi, freq);           /* 0347: feed the OWL engine + make awdl0 lazily */
++	if ((negroni_awdl_mode() & NAWDL_RX) && R.lines < AWDL_LINES_MAX) {
++		char tlvs[80];
++
++		R.lines++;
++		awdl_tlv_list(body + AWDL_HDR, blen - AWDL_HDR, tlvs, sizeof(tlvs));
++		printf("NEGRONI AWDL: RX AWDL %s (version %#x) from %02x:%02x:%02x:xx:xx:xx to %s, BSSID %s, %u MHz, RSSI %d dBm, "
++		    "%u bytes, TLV types: %s\n", awdl_subtype_name(body[6]), body[5], f[10], f[11], f[12],
++		    (f[4] & 1) ? "a group address" : "one station", memcmp(f + 16, awdl_bssid, 6) == 0 ? "00:25:00:ff:94:73 (AWDL)" :
++		    "another one", freq, rssi, len, tlvs[0] ? tlvs : "none");
++	}
++}
++
++static void
++rx_summary(bool force)
++{
++	if (!(negroni_awdl_mode() & NAWDL_RX) || (!force && R.frames == R.said_frames)) {
++		return;
++	}
++	R.said_frames = R.frames;
++	printf("NEGRONI AWDL: RX summary: %u management frames (%u beacons, %u probe requests, %u probe responses, %u action, "
++	    "%u other, %u short); action: %u public, %u vendor, %u other; AWDL %u (PSF %u, MIF %u, other %u, not the AWDL BSSID %u; "
++	    "2.4 GHz %u, 5 GHz %u) from %u peers; NAN SDF %u\n", R.frames, R.beacons, R.probe_req, R.probe_resp, R.action, R.other,
++	    R.short_frames, R.public_action, R.vendor_action, R.other_action, R.awdl, R.awdl_psf, R.awdl_mif, R.awdl_other,
++	    R.awdl_foreign_bssid, R.awdl_2g, R.awdl_5g, R.nsources, R.nan_sdf);
++}
++
++/* ---- WMI services (bit 0) ------------------------------------------------------------------------------------------ */
++
++static const struct {
++	uint32_t bit;
++	const char *name;
++} services[] = {
++	/* WMI_TLV_SERVICE_* numbers: Linux ath11k wmi.h (enum wmi_tlv_service) */
++	{ 52, "NAN" }, { 96, "NAN_DATA" }, { 97, "NAN_RTT" }, { 164, "NAN_DBS" }, { 166, "NAN_SAP" }, { 175, "NAN_DISABLE" },
++	{ 75, "MGMT_TX_HTT" }, { 76, "MGMT_TX_WMI" }, { 123, "OFFCHAN_TX_WMI" }, { 130, "VDEV_LIMIT_OFFCHAN" },
++	{ 144, "OFFCHAN_DATA_TID" }, { 105, "VDEV_RX_FILTER" }, { 145, "RX_PROMISC_ENABLE" }, { 106, "P2P_LISTEN_OFFLOAD" },
++	{ 56, "TDLS_OFFCHAN" }, { 59, "IBSS_PWRSAVE" }, { 174, "TX_DATA_MGMT_ACK_RSSI" },
++};
++
++static void
++service_line(bool fake)
++{
++	char line[400];
++	size_t used = 0;
++
++	if (fake) {
++		printf("NEGRONI AWDL: fake radio: no WMI service bits\n");
++		return;
++	}
++	if (!negroni_wlan_wmi_services_known()) {
++		printf("NEGRONI AWDL: the WMI service bitmap is not known (no SERVICE_READY)\n");
++		return;
++	}
++	line[0] = '\0';
++	for (unsigned i = 0; i < sizeof(services) / sizeof(services[0]) && used + 32 < sizeof(line); i++) {
++		used += (size_t)snprintf(line + used, sizeof(line) - used, "%s%s %u %s", i ? ", " : "", services[i].name,
++		    services[i].bit, negroni_wlan_wmi_service(services[i].bit) ? "yes" : "no");
++	}
++	printf("NEGRONI AWDL: WMI services for AWDL/NAN: %s\n", line);
++}
++
++/* ---- observer awdl0 (bit 1) ---------------------------------------------------------------------------------------- */
++
++#define KINDS_MAX               64u
++#define PER_KIND_LOG            4u
++#define REQUEST_LINES_MAX       300u
++
++static LCK_GRP_DECLARE(awdl_lock_group, "negroni-awdl");
++static LCK_MTX_DECLARE(awdl_lock, &awdl_lock_group);
++
++static struct {
++	ifnet_t ifp;
++	uint8_t mac[6];
++	bool published;
++	uint64_t attached_ms, summary_at, rx_summary_at;
++	uint64_t requests, requests_at_summary, tx_drop;
++	uint32_t lines, other_ioctls;
++	uint32_t kind_count;
++	struct {
++		int32_t type;
++		bool set;
++		uint32_t times;
++		uint32_t len;
++		char who[20];
++	} kinds[KINDS_MAX];
++} A;
++
++/* true if this request gets a log line */
++static bool
++awdl_note(const struct apple80211req *r, bool is_set, const char *who)
++{
++	uint32_t i;
++	bool say;
++
++	lck_mtx_lock(&awdl_lock);
++	A.requests++;
++	for (i = 0; i < A.kind_count && !(A.kinds[i].type == r->req_type && A.kinds[i].set == is_set); i++) {
++	}
++	if (i == A.kind_count && i < KINDS_MAX) {
++		A.kinds[i].type = r->req_type;
++		A.kinds[i].set = is_set;
++		strlcpy(A.kinds[i].who, who, sizeof(A.kinds[i].who));
++		A.kind_count++;
++	}
++	if (i < KINDS_MAX) {
++		A.kinds[i].times++;
++		A.kinds[i].len = r->req_len;
++		say = A.kinds[i].times <= PER_KIND_LOG;
++	} else {
++		say = true;
++	}
++	if (say) {
++		say = A.lines < REQUEST_LINES_MAX;
++		A.lines += say;
++	}
++	lck_mtx_unlock(&awdl_lock);
++	return say;
++}
++
++static void
++awdl_request_summary(void)
++{
++	lck_mtx_lock(&awdl_lock);
++	A.requests_at_summary = A.requests;
++	printf("NEGRONI AWDL: awdl0 Apple80211 summary: %u request kinds, %llu requests (SYNC_ENABLED answered; the rest "
++	    "refused, airdrop-plan step 6)\n", A.kind_count, A.requests);
++	for (uint32_t i = 0; i < A.kind_count; i++) {
++		printf("NEGRONI AWDL: awdl0 %s %d (%s) %u times, %u bytes, first from %s\n", A.kinds[i].set ? "set" : "get",
++		    A.kinds[i].type, type_name(A.kinds[i].type), A.kinds[i].times, A.kinds[i].len, A.kinds[i].who);
++	}
++	lck_mtx_unlock(&awdl_lock);
++}
++
++static int
++awdl_apple80211(u_long command, void *data)
++{
++	struct apple80211req *r = data;
++	bool is_set = command == SIOCSA80211_CMD;
++	char who[32] = "?";
++	int ret = EOPNOTSUPP;
++	const char *how = "refused (layout not confirmed: airdrop-plan [U])";
++
++	proc_selfname(who, sizeof(who));
++	/* Answer the requests whose layout is confirmed from the 20H392 binaries. AWDL_SYNC_ENABLED (117)
++	 * is a simple on/off carried in req_val. The engine runs on its own; a set only tracks the wish.
++	 * Every other AWDL_* request is logged and gets a clean error (the work list, airdrop-plan step 6). */
++	switch (r->req_type) {
++	case 117:       /* AWDL_SYNC_ENABLED */
++		if (is_set) {
++			ret = 0;
++			how = "accepted";
++		} else {
++			r->req_val = engine_is_on() ? 1 : 0;
++			ret = 0;
++			how = "answered";
++		}
++		break;
++	default:
++		break;
++	}
++	if (awdl_note(r, is_set, who)) {
++		printf("NEGRONI AWDL: %s %s %d (%s) on %.16s, value %d, %u bytes: %s\n", who, is_set ? "sets" : "gets",
++		    r->req_type, type_name(r->req_type), r->req_if_name, r->req_val, r->req_len, how);
++	}
++	return ret;
++}
++
++static errno_t
++awdl_output(ifnet_t ifp, mbuf_t packet)
++{
++	/* no data path yet: everything is dropped (a later step sends AWDL data frames) */
++	A.tx_drop++;
++	ifnet_stat_increment_out(ifp, 0, 0, 1);
++	mbuf_freem(packet);
++	return 0;
++}
++
++static errno_t
++awdl_ioctl(ifnet_t ifp, u_long command, void *data)
++{
++	const int media[] = { IFM_IEEE80211 | IFM_AUTO };      /* wifip2pd: "not a WiFi interface" otherwise [I] */
++	struct ifreq *request = data;
++	struct ifmediareq *media_request = data;
++	user_addr_t list;
++	errno_t error = 0;
++
++	switch (command) {
++	case SIOCSA80211_CMD:
++	case SIOCGA80211_CMD:
++		return awdl_apple80211(command, data);
++	case SIOCSIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		break;
++	case SIOCSIFFLAGS:
++		ifnet_set_flags(ifp, (ifnet_flags(ifp) & IFF_UP) ? IFF_RUNNING : 0, IFF_RUNNING);
++		break;
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64:
++		list = command == SIOCGIFMEDIA64 ? ((struct ifmediareq64 *)media_request)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)media_request)->ifmu_ulist);
++		media_request->ifm_active = media_request->ifm_current = media[0];
++		media_request->ifm_mask = 0;
++		media_request->ifm_status = IFM_AVALID;         /* never ACTIVE: there is no AWDL link */
++		if (list != USER_ADDR_NULL && media_request->ifm_count > 0) {
++			error = copyout(media, list, sizeof(media));
++		}
++		media_request->ifm_count = 1;
++		break;
++	case SIOCGIFDEVMTU:
++		request->ifr_devmtu.ifdm_current = ifnet_mtu(ifp);
++		request->ifr_devmtu.ifdm_max = ETHERMTU;
++		request->ifr_devmtu.ifdm_min = IF_MINMTU;
++		break;
++	case SIOCSIFMTU:
++		error = request->ifr_mtu > ETHERMTU || request->ifr_mtu < IF_MINMTU ? EINVAL : ifnet_set_mtu(ifp, request->ifr_mtu);
++		break;
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		break;
++	default:
++		if (A.other_ioctls++ < 20) {
++			char who[32] = "?";
++
++			proc_selfname(who, sizeof(who));
++			printf("NEGRONI AWDL: awdl0 ioctl %#lx from %s: not handled\n", command, who);
++		}
++		error = EOPNOTSUPP;
++		break;
++	}
++	return error;
++}
++
++static bool
++awdl_attach(void)
++{
++	struct ifnet_init_eparams init = {
++		.ver = IFNET_INIT_CURRENT_VERSION,
++		.len = sizeof(init),
++		.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO,
++		.uniqueid = "negroni-wlan-awdl0",
++		.uniqueid_len = sizeof("negroni-wlan-awdl0") - 1,
++		.name = "awdl",
++		.unit = 0,
++		.family = IFNET_FAMILY_ETHERNET,
++		.subfamily = IFNET_SUBFAMILY_WIFI,
++		.type = IFT_ETHER,
++		.output = awdl_output,
++		.demux = ether_demux,
++		.add_proto = ether_add_proto,
++		.del_proto = ether_del_proto,
++		.check_multi = ether_check_multi,
++		.framer_extended = ether_frameout_extended,
++		.ioctl = awdl_ioctl,
++		.broadcast_addr = etherbroadcastaddr,
++		.broadcast_len = ETHER_ADDR_LEN,
++	};
++	ifnet_t ifp = NULL;
++	errno_t error;
++
++	error = ifnet_allocate_extended(&init, &ifp);
++	if (error != 0) {
++		printf("NEGRONI AWDL: awdl0 cannot be made: error %d\n", error);
++		return false;
++	}
++	ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
++	ifnet_set_baudrate(ifp, 100 * 1000 * 1000);
++	ifnet_set_mtu(ifp, ETHERMTU);
++	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
++	ifnet_set_hdrlen(ifp, ETHER_HDR_LEN);
++	ifnet_set_offload(ifp, 0);
++	error = ifnet_attach(ifp, NULL);
++	if (error != 0) {
++		printf("NEGRONI AWDL: awdl0 cannot be attached: error %d\n", error);
++		ifnet_release(ifp);
++		return false;
++	}
++	ifnet_set_lladdr(ifp, A.mac, ETHER_ADDR_LEN);
++	/* the kernel adds IFEF_LOCALNET_PRIVATE, IFEF_IPV6_ND6ALT, IFEF_RESTRICTED_RECV (IFEF_AWDL_MASK) */
++	error = ifnet_set_eflags(ifp, IFEF_AWDL, IFEF_AWDL);
++	bpfattach(ifp, DLT_EN10MB, ETHER_HDR_LEN);
++	A.ifp = ifp;
++	printf("NEGRONI AWDL: awdl0 attached (MAC %02x:%02x:%02x:.., locally administered), IFEF_AWDL %s (eflags %#x), link down\n",
++	    A.mac[0], A.mac[1], A.mac[2], error == 0 ? "set" : "NOT set", ifnet_eflags(ifp));
++	return true;
++}
++
++/* ==== the AWDL engine (bit 2, NAWDL_ENGINE): OWL port on the driver thread ========================================== */
++
++#define AWDL_CHAN_NUM           6u              /* social channel 6 */
++#define AWDL_CHAN_OPCLASS       0x51u
++#define AWDL_CHAN_FREQ          2437u           /* MHz */
++#define AWDL_TX_SLOTS           4u
++#define AWDL_TX_SLOT            1024u
++#define AWDL_DESC_BASE          0x100u          /* our MGMT_TX desc ids; the join code uses 0..3 */
++#define AWDL_PSF_MS             112u            /* 110 TU ~= 112 ms */
++#define AWDL_MIF_MS             440u
++#define AWDL_ELECTION_MS        1000u
++#define AWDL_PEER_TIMEOUT_US    3000000ull      /* a peer is dropped after 3 s of silence */
++#define AWDL_ROC_MS             2000u           /* remain-on-channel window, re-armed while en0 is idle */
++#define AWDL_ROC_LOST_MS        1500u           /* no end event this long after the window: take it as ended */
++#define AWDL_ROC_RETRY_MS       1000u           /* back-off after a failed ROC start */
++#define AWDL_ROC_FAIL_MAX       10u             /* failed ROC starts in a row: engine off */
++#define AWDL_YIELD_MS           300u            /* en0 waits at most this long for our ROC to end */
++#define AWDL_TX_LOST_MS         1000u           /* a slot with no completion this long is free again */
++#define AWDL_TX_NOCOMPL_MAX     8u              /* sent frames with no completion at all: engine off */
++
++static struct {
++	bool inited, on;
++	const char *off_why;
++	struct awdl_state owl;
++	struct nwlan_dma dma;
++	bool slot_busy[AWDL_TX_SLOTS];
++	uint64_t slot_ms[AWDL_TX_SLOTS];        /* 0347 review: send time, a lost completion frees the slot */
++	bool roc_armed;                         /* START_SCAN sent, no end event yet */
++	bool roc_on;                            /* STARTED seen: the radio is on our channel */
++	volatile bool roc_ended;                /* yield: the end event of our scan came */
++	uint32_t roc_fail_run;                  /* START_FAILED (or send errors) in a row, no STARTED */
++	uint64_t roc_until_ms, roc_retry_ms, next_psf_ms, next_mif_ms, next_election_ms;
++	uint32_t tx_sent, tx_ok, tx_fail, tx_lost, roc_start_fail, last_tx_status;
++	bool first_rx;
++	uint64_t last_summary_ms;
++} E;
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++static bool
++engine_is_on(void)
++{
++	return E.on;
++}
++
++static void
++engine_off(const char *why)
++{
++	if (E.on) {
++		E.on = false;
++		E.off_why = why;
++		if (E.roc_armed || E.roc_on) {
++			(void)negroni_awdl_roc_stop();
++		}
++		E.roc_armed = E.roc_on = false;
++		printf("NEGRONI AWDL: engine OFF: %s (TX sent %u, ok %u, fail %u, last status %u)\n", why, E.tx_sent,
++		    E.tx_ok, E.tx_fail, E.last_tx_status);
++	}
++}
++
++static void
++peer_gone(const struct awdl_peer *p)
++{
++	printf("NEGRONI AWDL: peer %02x:%02x:%02x:xx:xx:xx gone (name '%s')\n", p->addr.a[0], p->addr.a[1], p->addr.a[2],
++	    p->name);
++}
++
++/* en0 must never break: the engine takes the radio only when en0 does not use it */
++static bool
++en0_idle(void)
++{
++	return negroni_wlan_sta_state() == NWLAN_STATE_IDLE && !negroni_wlan_sta_scanning();
++}
++
++/* self-check 1: the firmware must let us send management frames by WMI */
++static bool
++engine_services_ok(void)
++{
++	if (!negroni_wlan_wmi_services_known()) {
++		return true;            /* not known yet: do not judge */
++	}
++	if (!negroni_wlan_wmi_service(76)) {    /* WMI_SERVICE_MGMT_TX_WMI */
++		return false;
++	}
++	return true;
++}
++
++static void
++engine_init(void)
++{
++	struct awdl_ea self;
++
++	if (E.inited) {
++		return;
++	}
++	memcpy(self.a, A.mac, 6);
++	negroni_owl_init_state(&E.owl, "negroni", &self, AWDL_CHAN_NUM, AWDL_CHAN_OPCLASS, now_us());
++	if (negroni_wlan_dma_alloc(AWDL_TX_SLOTS * AWDL_TX_SLOT, &E.dma) != 0) {
++		E.off_why = "no DMA for the TX slots";
++		printf("NEGRONI AWDL: engine OFF: %s\n", E.off_why);
++		E.inited = true;
++		return;
++	}
++	E.inited = true;
++	E.on = true;
++	printf("NEGRONI AWDL: engine ready (self %02x:%02x:%02x:%02x:%02x:%02x, channel %u, PSF %u TU)\n", A.mac[0],
++	    A.mac[1], A.mac[2], A.mac[3], A.mac[4], A.mac[5], AWDL_CHAN_NUM, E.owl.psf_interval);
++}
++
++/* build the 802.11 header + AWDL action body into a free slot and send it by WMI */
++static void
++engine_tx(uint8_t subtype)
++{
++	uint32_t slot = AWDL_TX_SLOTS, hlen, blen;
++	uint8_t *f;
++	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++	static const uint8_t awdl_bssid3[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
++
++	for (uint32_t i = 0; i < AWDL_TX_SLOTS; i++) {
++		if (!E.slot_busy[i]) {
++			slot = i;
++			break;
++		}
++	}
++	if (slot == AWDL_TX_SLOTS || !E.dma.nc || !E.roc_on) {
++		return;         /* no free slot, or the radio is not on our channel */
++	}
++	f = (uint8_t *)(E.dma.nc + slot * AWDL_TX_SLOT);
++	/* 802.11 management action header: type 0 subtype 13 (action), to broadcast, BSSID = AWDL */
++	f[0] = 0xd0;            /* fc: version 0, type mgmt, subtype action */
++	f[1] = 0x00;
++	f[2] = f[3] = 0;        /* duration (firmware fills) */
++	memcpy(f + 4, bcast, 6);                /* addr1 = broadcast */
++	memcpy(f + 10, A.mac, 6);               /* addr2 = our awdl0 MAC */
++	memcpy(f + 16, awdl_bssid3, 6);         /* addr3 = AWDL BSSID */
++	f[22] = (uint8_t)(E.owl.sequence_number << 4);
++	f[23] = (uint8_t)(E.owl.sequence_number >> 4);
++	E.owl.sequence_number++;
++	hlen = 24;
++	blen = negroni_owl_build_action(&E.owl, subtype, now_us(), f + hlen, AWDL_TX_SLOT - hlen);
++	if (blen == 0) {
++		return;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	E.slot_busy[slot] = true;
++	E.slot_ms[slot] = negroni_wlan_ms();
++	E.tx_sent++;
++	if (negroni_awdl_mgmt_tx(E.dma.dva + (uint64_t)slot * AWDL_TX_SLOT, hlen + blen, f, AWDL_DESC_BASE + slot,
++	    AWDL_CHAN_FREQ) != 0) {
++		E.slot_busy[slot] = false;
++		E.tx_sent--;
++	}
++}
++
++/* WMI MGMT_TX_COMPLETION for our desc range (service pass: record only) */
++bool
++negroni_awdl_wmi_event(uint32_t id, const uint8_t *p, uint32_t len)
++{
++	if (id != 0x7006u) {            /* WMI_MGMT_TX_COMPLETION_EVENTID */
++		return false;
++	}
++	/* TLV: tag 0x1a7 (MGMT_TX_COMPL_EVENT): desc_id, status */
++	struct wmi_tlv_it it = { p, p + len };
++	const uint8_t *v;
++	uint32_t tag, l;
++
++	while (negroni_wmi_tlv_next(&it, &tag, &v, &l) == 1) {
++		if (tag == 0x1a7u && l >= 8) {
++			uint32_t desc = (uint32_t)v[0] | ((uint32_t)v[1] << 8) | ((uint32_t)v[2] << 16) |
++			    ((uint32_t)v[3] << 24);
++			uint32_t status = (uint32_t)v[4] | ((uint32_t)v[5] << 8) | ((uint32_t)v[6] << 16) |
++			    ((uint32_t)v[7] << 24);
++
++			if (desc < AWDL_DESC_BASE || desc >= AWDL_DESC_BASE + AWDL_TX_SLOTS) {
++				return false;   /* a join-code frame: let the join handler take it */
++			}
++			E.slot_busy[desc - AWDL_DESC_BASE] = false;
++			E.last_tx_status = status;
++			if (status == 0) {
++				E.tx_ok++;
++			} else {
++				E.tx_fail++;
++				/* self-check 2: TX completions must succeed */
++				if (E.tx_ok == 0 && E.tx_fail >= 3) {
++					engine_off("the firmware rejects our AWDL TX (completion status not 0)");
++				}
++			}
++			return true;
++		}
++	}
++	return false;           /* a completion event with no readable TLV: let the join handler try */
++}
++
++void
++negroni_awdl_scan_event(uint32_t ev, uint32_t reason, uint32_t freq __unused)
++{
++	switch (ev) {
++	case 0x1u:              /* STARTED */
++		E.roc_on = true;
++		E.roc_fail_run = 0;
++		break;
++	case 0x40u:             /* WMI_SCAN_EV_START_FAILED */
++		E.roc_start_fail++;
++		E.roc_fail_run++;
++		E.roc_armed = E.roc_on = false;
++		E.roc_ended = true;
++		E.roc_retry_ms = negroni_wlan_ms() + AWDL_ROC_RETRY_MS;
++		if (E.roc_start_fail <= 3) {
++			printf("NEGRONI AWDL: remain-on-channel start failed (reason %u)\n", reason);
++		}
++		break;
++	case 0x2u:              /* COMPLETED */
++	case 0x10u:             /* DEQUEUED */
++		E.roc_armed = E.roc_on = false;
++		E.roc_ended = true;
++		break;
++	default:
++		break;
++	}
++}
++
++static void
++engine_summary(void)
++{
++	char tree[160];
++
++	negroni_owl_election_tree(&E.owl, tree, sizeof(tree));
++	printf("NEGRONI AWDL: engine summary: %u peers, TX %u (ok %u, fail %u), RX action %llu; %s\n", E.owl.npeers,
++	    E.tx_sent, E.tx_ok, E.tx_fail, E.owl.rx_action, tree);
++}
++
++static bool awdl_fake;
++static bool awdl_started;               /* 0347 review: set (release) at the end of negroni_awdl_start */
++
++/* make awdl0 + the AirLink IOService, only after a real AWDL RX proved the firmware passes frames */
++static void
++awdl_ensure_if(void)
++{
++	if (!(negroni_awdl_mode() & NAWDL_IF) || A.ifp != NULL) {
++		return;
++	}
++	/* 0347 review: with the engine bit, awdl0 waits for both self-checks (RX seen + one TX completed OK) */
++	if ((negroni_awdl_mode() & NAWDL_ENGINE) && !(E.on && E.tx_ok > 0)) {
++		return;
++	}
++	if (!awdl_attach()) {
++		return;
++	}
++	A.published = negroni_awdl_publish("awdl0", A.mac);
++	A.attached_ms = now_ms();
++	A.summary_at = A.attached_ms + 120 * 1000;
++	printf("NEGRONI AWDL: awdl0 + AirLink IOService made after the self-checks (first AWDL RX%s) (%s)\n",
++	    (negroni_awdl_mode() & NAWDL_ENGINE) ? ", first TX OK" : "",
++	    A.published ? "service registered" : "service NOT registered");
++}
++
++static void
++engine_rx(const uint8_t *frame, const uint8_t *body, uint32_t blen, int32_t rssi, uint32_t freq)
++{
++	struct awdl_ea sa;
++
++	if (!__atomic_load_n(&awdl_started, __ATOMIC_ACQUIRE)) {
++		return;         /* 0347 review: before negroni_awdl_start (boot scan): no MAC, no IO80211Controller yet */
++	}
++	if (!E.first_rx) {
++		E.first_rx = true;
++		printf("NEGRONI AWDL: first AWDL frame RX: the firmware passes AWDL frames to the host\n");
++	}
++	awdl_ensure_if();
++	if (E.inited && E.on) {
++		memcpy(sa.a, frame + 10, 6);
++		negroni_owl_rx_action(&E.owl, &sa, body, blen, rssi, freq, now_us());
++	}
++}
++
++/*
++ * 0347 review: en0 needs the radio (scan, join, or not idle). Stop our ROC scan and wait, bounded, for its end
++ * event, so en0's START_SCAN / VDEV_START never meet our scan. Driver thread, top level only.
++ */
++void
++negroni_awdl_yield(void)
++{
++	uint64_t deadline;
++
++	if (!E.roc_armed && !E.roc_on) {
++		return;
++	}
++	E.roc_ended = false;
++	if (negroni_awdl_roc_stop() == 0) {
++		deadline = negroni_wlan_ms() + AWDL_YIELD_MS;
++		while (!E.roc_ended && negroni_wlan_ms() < deadline) {
++			if (negroni_wlan_service() != 0) {
++				break;
++			}
++			negroni_wlan_nap(2);
++		}
++	}
++	if (!E.roc_ended) {
++		printf("NEGRONI AWDL: no end event of our ROC scan in %u ms after STOP (en0 goes on)\n", AWDL_YIELD_MS);
++	}
++	E.roc_armed = E.roc_on = false;
++	E.roc_retry_ms = negroni_wlan_ms() + AWDL_ROC_RETRY_MS;
++}
++
++/* ---- driver-thread top level (negroni_wlan_sta_service) ---- */
++void
++negroni_awdl_service(void)
++{
++	if (awdl_fake) {
++		return;         /* the fake backend has no radio */
++	}
++	uint64_t now;
++
++	if (!(negroni_awdl_mode() & NAWDL_ENGINE)) {
++		return;
++	}
++	if (!E.inited && A.ifp == NULL && !E.first_rx) {
++		return;         /* wait for the first AWDL RX before spending the radio */
++	}
++	if (!E.inited) {
++		if (!engine_services_ok()) {
++			E.inited = true;
++			E.off_why = "no WMI_SERVICE_MGMT_TX_WMI (76): the firmware cannot send our frames";
++			printf("NEGRONI AWDL: engine OFF: %s\n", E.off_why);
++			return;
++		}
++		engine_init();
++	}
++	if (!E.on) {
++		return;
++	}
++	awdl_ensure_if();                               /* 0347 review: after both self-checks */
++	if (!en0_idle()) {
++		negroni_awdl_yield();                   /* give the radio back to en0 */
++		return;
++	}
++	now = negroni_wlan_ms();
++	/* lost completions: free the slot; no completion at all: self-check 2 */
++	for (uint32_t i = 0; i < AWDL_TX_SLOTS; i++) {
++		if (E.slot_busy[i] && now - E.slot_ms[i] > AWDL_TX_LOST_MS) {
++			E.slot_busy[i] = false;
++			E.tx_lost++;
++		}
++	}
++	if (E.tx_ok == 0 && E.tx_fail == 0 && E.tx_lost >= AWDL_TX_NOCOMPL_MAX) {
++		engine_off("no TX completion from the firmware for our AWDL frames");
++		return;
++	}
++	if (E.roc_fail_run >= AWDL_ROC_FAIL_MAX) {
++		engine_off("the firmware refuses the remain-on-channel scan (START_FAILED in a row)");
++		return;
++	}
++	/* park on channel 6: arm the next window only after the last one ended (no overlapping scans) */
++	if (E.roc_armed && now >= E.roc_until_ms + AWDL_ROC_LOST_MS) {
++		E.roc_armed = E.roc_on = false;         /* no end event came: take it as ended */
++	}
++	if (!E.roc_armed && now >= E.roc_retry_ms) {
++		if (negroni_awdl_roc(AWDL_CHAN_FREQ, AWDL_ROC_MS) == 0) {
++			E.roc_armed = true;
++			E.roc_until_ms = now + AWDL_ROC_MS;
++		} else {
++			E.roc_fail_run++;
++			E.roc_retry_ms = now + AWDL_ROC_RETRY_MS;
++			if (E.roc_start_fail++ < 3) {
++				printf("NEGRONI AWDL: remain-on-channel WMI send failed\n");
++			}
++		}
++	}
++	/* timers (OWL daemon): PSF every 110 TU, MIF in the extended availability window */
++	if (now >= E.next_psf_ms) {
++		E.next_psf_ms = now + AWDL_PSF_MS;
++		engine_tx(AWDL_ACTION_PSF);
++	}
++	if (now >= E.next_mif_ms) {
++		E.next_mif_ms = now + AWDL_MIF_MS;
++		engine_tx(AWDL_ACTION_MIF);
++	}
++	if (now >= E.next_election_ms) {
++		E.next_election_ms = now + AWDL_ELECTION_MS;
++		negroni_owl_peers_clean(&E.owl, now_us() - AWDL_PEER_TIMEOUT_US, peer_gone);
++		negroni_owl_election_run(&E.owl);
++	}
++	if (now - E.last_summary_ms >= 60000) {
++		E.last_summary_ms = now;
++		engine_summary();
++	}
++}
++
++/* ---- entry points (negroni-wlan-ios thread) ------------------------------------------------------------------------ */
++
++void
++negroni_awdl_start(const uint8_t en0_mac[6], bool fake)
++{
++	uint32_t mode = negroni_awdl_mode();
++
++	if (mode == 0) {
++		printf("NEGRONI AWDL: off (negroniawdl=0)\n");
++		return;
++	}
++	awdl_fake = fake;
++	printf("NEGRONI AWDL: on (negroniawdl=%u:%s%s%s)\n", mode, (mode & NAWDL_RX) ? " RX" : "",
++	    (mode & NAWDL_IF) ? " awdl0" : "", (mode & NAWDL_ENGINE) ? " engine" : "");
++	if (mode & NAWDL_RX) {
++		service_line(fake);
++		A.rx_summary_at = now_ms() + 60 * 1000;
++	}
++	if (!(mode & (NAWDL_IF | NAWDL_ENGINE))) {
++		return;
++	}
++	/* our own address, as Apple's awdl0 has: en0's with the locally administered bit set and byte 3 changed */
++	memcpy(A.mac, en0_mac, 6);
++	A.mac[0] = (uint8_t)((A.mac[0] | 0x02) & ~0x01);
++	A.mac[3] ^= 0xa5;
++	/* awdl0 and the engine both wait for the first AWDL RX (NO PROBES: a feature that proves itself).
++	 * Nothing is sent and no interface is made until the firmware shows it passes AWDL frames. */
++	printf("NEGRONI AWDL: self MAC %02x:%02x:%02x:%02x:%02x:%02x; awdl0/engine start after the first AWDL frame\n",
++	    A.mac[0], A.mac[1], A.mac[2], A.mac[3], A.mac[4], A.mac[5]);
++	__atomic_store_n(&awdl_started, true, __ATOMIC_RELEASE);
++}
++
++void
++negroni_awdl_tick(void)
++{
++	uint64_t now;
++
++	if (negroni_awdl_mode() == 0) {
++		return;
++	}
++	now = now_ms();
++	if ((negroni_awdl_mode() & NAWDL_RX) && now >= A.rx_summary_at) {
++		A.rx_summary_at = now + 60 * 1000;
++		rx_summary(false);
++	}
++	if (A.ifp != NULL && now >= A.summary_at) {
++		/* 120 s after awdl0, then every 600 s while requests come */
++		A.summary_at = now + 600 * 1000;
++		if (A.requests != A.requests_at_summary || A.requests == 0) {
++			awdl_request_summary();
++		}
++	}
++}
+diff --git a/bsd/dev/negroni_awdl.h b/bsd/dev/negroni_awdl.h
+new file mode 100644
+index 0000000..2a6f7cc
+--- /dev/null
++++ b/bsd/dev/negroni_awdl.h
+@@ -0,0 +1,91 @@
++/*
++ * Copyright (c) 2026 iOSPlus10.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed software or any other software. Please obtain a
++ * copy of the License at http://www.opensource.apple.com/apsl/ and read it
++ * before using this file.
++ *
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ */
++/*
++ * NEGRONI AirDrop (patch 0347, docs/airdrop-plan.md): the AWDL engine. Boot-arg negroniawdl.
++ * Default (arg unset) = on (NAWDL_RX | NAWDL_IF | NAWDL_ENGINE = 7). negroniawdl=0 is the kill switch.
++ *   bit 0 (NAWDL_RX, 1):     WMI service bits + classify every management frame of WMI_MGMT_RX.
++ *   bit 1 (NAWDL_IF, 2):     awdl0 BSD interface + AirLink IOService, made ONLY after the first
++ *                            received AWDL frame proves the firmware passes AWDL frames to the host.
++ *   bit 2 (NAWDL_ENGINE, 4): the AWDL engine (OWL port): park on channel 6, TX PSF/MIF action frames
++ *                            by WMI_MGMT_TX_SEND from our own DMA slots (desc ids 0x100+), election,
++ *                            sync, peer table. Runs on the Wi-Fi driver thread, only while en0 is idle.
++ *
++ * Self-checks (NO PROBES rule): no MGMT_TX_WMI service (76) -> engine off + one line; a failed TX
++ * completion -> engine off + the status; awdl0/AirLink made only after a real AWDL RX. Everything
++ * logs why it turned itself off.
++ */
++#ifndef _NEGRONI_AWDL_H_
++#define _NEGRONI_AWDL_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define NAWDL_RX                1u      /* service bits + RX classification (read only) */
++#define NAWDL_IF                2u      /* awdl0 + AirLink IOService (after first AWDL RX) */
++#define NAWDL_ENGINE            4u      /* the AWDL engine: park, TX PSF/MIF, election, sync */
++#define NAWDL_DEFAULT           (NAWDL_RX | NAWDL_IF | NAWDL_ENGINE)
++
++uint32_t negroni_awdl_mode(void);       /* the boot-arg, read once (default on) */
++
++/* driver thread (negroni_wlan_wmi.c scan_mgmt_rx), every management frame; never blocks */
++void negroni_awdl_mgmt_rx(const uint8_t *frame, uint32_t len, int32_t rssi, uint32_t freq);
++
++/* negroni-wlan-ios thread: once after en0 is attached, then on every loop pass (about 10 per second) */
++void negroni_awdl_start(const uint8_t en0_mac[6], bool fake);
++void negroni_awdl_tick(void);
++
++/* driver thread top level (negroni_wlan_sta_service): one engine pass (may send WMI, may wait) */
++void negroni_awdl_service(void);
++
++/* negroni_wlan_wmi.c event dispatch: our MGMT_TX_COMPLETION (desc ids 0x100+). True if consumed. */
++/* driver thread, top level: en0 needs the radio now; stop our ROC scan and wait (<= 300 ms) for its end */
++void negroni_awdl_yield(void);
++bool negroni_awdl_wmi_event(uint32_t id, const uint8_t *p, uint32_t len);
++/* negroni_wlan_wmi.c scan-event loop: a WMI_SCAN event of our remain-on-channel scan id */
++void negroni_awdl_scan_event(uint32_t ev, uint32_t reason, uint32_t freq);
++
++/* NegroniWLAN.cpp: the AirLink IOService under the IO80211Controller of en0 */
++bool negroni_awdl_publish(const char *ifname, const uint8_t mac[6]);
++
++/* negroni_wlan_wmi.c: a bit of the firmware's WMI service bitmap (SERVICE_READY + SERVICE_AVAILABLE) */
++bool negroni_wlan_wmi_service(uint32_t bit);
++bool negroni_wlan_wmi_services_known(void);
++
++/* negroni_wlan_wmi.c (0347): remain-on-channel on one frequency by a single-channel passive scan with
++ * the offchan-mgmt-tx flag and our own scan id; stop gives the radio back to en0. Our MGMT_TX of one
++ * AWDL action frame from a device buffer (dva) with a desc id and the channel frequency. */
++int negroni_awdl_roc(uint32_t freq_mhz, uint32_t max_ms);
++int negroni_awdl_roc_stop(void);
++int negroni_awdl_mgmt_tx(uint64_t dva, uint32_t frame_len, const uint8_t *frame, uint32_t desc_id, uint32_t chanfreq);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _NEGRONI_AWDL_H_ */
+diff --git a/bsd/dev/negroni_awdl_owl.c b/bsd/dev/negroni_awdl_owl.c
+new file mode 100644
+index 0000000..b3dbe4c
+--- /dev/null
++++ b/bsd/dev/negroni_awdl_owl.c
+@@ -0,0 +1,482 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/*
++ * NEGRONI AWDL core (patch 0347): a kernel port of the portable AWDL engine of
++ *
++ *   OWL: an open Apple Wireless Direct Link (AWDL) implementation
++ *   Copyright (C) 2018  The Open Wireless Link Project
++ *   Copyright (C) 2018  Milan Stute
++ *   seemoo-lab/owl, commit 0ee3263f944ea721c355f826aa90d636d012a512 (GPL-3.0-or-later)
++ *   src/{frame.h,state.h,sync.c,election.c,schedule.c,channel.c,tx.c,rx.c,peers.c}
++ *
++ * This program is free software: you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation, either version 3 of the License, or (at your option) any later
++ * version. This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
++ * details. You should have received a copy of the GNU General Public License
++ * along with this program. If not, see <https://www.gnu.org/licenses/>.
++ *
++ * The AWDL frame layouts, the sync math and the election algorithm are kept as
++ * in OWL. Our changes: no malloc (fixed peer array), the clock is passed in,
++ * frames are built and parsed with explicit little-endian byte accessors (no
++ * casts to packed structs), logging through printf.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "negroni_awdl_owl.h"
++
++/* ---- little-endian byte accessors (frames are little-endian on the wire) ---- */
++static inline uint8_t *w8(uint8_t *p, uint8_t v) { *p = v; return p + 1; }
++static inline uint8_t *w16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); return p + 2; }
++static inline uint8_t *w32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
++	return p + 4;
++}
++static inline uint8_t *wea(uint8_t *p, const struct awdl_ea *e) { memcpy(p, e->a, 6); return p + 6; }
++static inline uint16_t r16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
++static inline uint32_t r32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* TU <-> us (OWL ieee80211.h) */
++static inline uint64_t tu_to_us(uint64_t tu) { return tu * 1024ull; }
++static inline uint64_t us_to_tu(uint64_t us) { return us / 1024ull; }
++
++static inline int ea_cmp(const struct awdl_ea *a, const struct awdl_ea *b) { return memcmp(a->a, b->a, 6); }
++
++/* ================= sync (OWL sync.c, verbatim logic) ================= */
++static void
++sync_init(struct awdl_sync_state *st, uint64_t now)
++{
++	st->last_update = now;
++	st->aw_counter = 0;
++	st->aw_period = 16;
++	st->presence_mode = 4;
++}
++
++uint16_t
++negroni_owl_sync_next_aw_tu(uint64_t now_us, const struct awdl_sync_state *st)
++{
++	uint64_t eaw_period = (uint64_t)st->presence_mode * st->aw_period;
++	uint64_t time_since = us_to_tu(now_us - st->last_update);
++	return (uint16_t)(eaw_period - (time_since % eaw_period));
++}
++
++uint64_t
++negroni_owl_sync_next_aw_us(uint64_t now_us, const struct awdl_sync_state *st)
++{
++	uint64_t eaw_period = tu_to_us((uint64_t)st->presence_mode * st->aw_period);
++	uint64_t time_since = now_us - st->last_update;
++	return eaw_period - (time_since % eaw_period);
++}
++
++uint16_t
++negroni_owl_sync_current_aw(uint64_t now_us, const struct awdl_sync_state *st)
++{
++	uint64_t eaw_period = (uint64_t)st->presence_mode * st->aw_period;
++	uint64_t time_since = us_to_tu(now_us - st->last_update);
++	uint64_t current_aw = st->aw_counter +
++	    (time_since % eaw_period) / st->aw_period +
++	    (uint64_t)st->presence_mode * (time_since / eaw_period);
++	return (uint16_t)current_aw;
++}
++
++/* OWL schedule.c awdl_is_multicast_eaw: extended availability window boundary */
++bool
++negroni_owl_is_multicast_eaw(const struct awdl_state *s, uint64_t now_us)
++{
++	uint16_t aw = negroni_owl_sync_current_aw(now_us, &s->sync);
++	return (aw % s->sync.presence_mode) == 0;
++}
++
++/* ================= election (OWL election.c, verbatim logic) ================= */
++static void
++election_reset_self(struct awdl_election_state *st)
++{
++	st->height = 0;
++	st->master_addr = st->self_addr;
++	st->sync_addr = st->self_addr;
++	st->master_metric = st->self_metric;
++	st->master_counter = st->self_counter;
++}
++
++static void
++election_init(struct awdl_election_state *st, const struct awdl_ea *self)
++{
++	st->self_addr = *self;
++	st->self_counter = 0;
++	st->self_metric = AWDL_ELECTION_METRIC_INIT;
++	st->master_addr = *self;
++	st->sync_addr = *self;
++	election_reset_self(st);
++}
++
++static inline int
++cmp_u32(uint32_t a, uint32_t b) { return (a < b) ? -1 : (a > b); }
++
++static int
++election_compare_master(const struct awdl_election_state *a, const struct awdl_election_state *b)
++{
++	int result = cmp_u32(a->master_counter, b->master_counter);
++	if (!result) {
++		result = cmp_u32(a->master_metric, b->master_metric);
++	}
++	return result;
++}
++
++void
++negroni_owl_election_run(struct awdl_state *s)
++{
++	struct awdl_election_state *state = &s->election;
++	struct awdl_election_state *master_state = state;
++
++	election_reset_self(state);
++	for (uint32_t i = 0; i < AWDL_PEERS_MAX; i++) {
++		struct awdl_peer *peer = &s->peers[i];
++		struct awdl_election_state *ps = &peer->election;
++		int cmp;
++
++		if (!peer->used || !peer->is_valid) {
++			continue;
++		}
++		if (ps->height + 1 > AWDL_ELECTION_TREE_MAX_HEIGHT) {
++			continue;       /* sync tree would get too large */
++		}
++		if (ea_cmp(&ps->sync_addr, &state->self_addr) == 0) {
++			continue;       /* no cycles */
++		}
++		cmp = election_compare_master(ps, master_state);
++		if (cmp < 0) {
++			continue;
++		} else if (cmp == 0) {
++			if (ps->height > master_state->height) {
++				continue;
++			} else if (ps->height == master_state->height) {
++				if (ea_cmp(&ps->self_addr, &master_state->self_addr) <= 0) {
++					continue;
++				}
++			}
++		}
++		master_state = ps;      /* accept */
++	}
++	if (state != master_state) {
++		state->master_addr = master_state->master_addr;
++		state->sync_addr = master_state->self_addr;
++		state->master_metric = master_state->master_metric;
++		state->master_counter = master_state->master_counter;
++		state->height = master_state->height + 1;
++	}
++}
++
++int
++negroni_owl_election_tree(const struct awdl_state *s, char *str, int len)
++{
++	const struct awdl_election_state *st = &s->election;
++	return snprintf(str, len, "self %02x:%02x:%02x:%02x:%02x:%02x master %02x:%02x:%02x:%02x:%02x:%02x "
++	    "height %u metric %u counter %u", st->self_addr.a[0], st->self_addr.a[1], st->self_addr.a[2],
++	    st->self_addr.a[3], st->self_addr.a[4], st->self_addr.a[5], st->master_addr.a[0], st->master_addr.a[1],
++	    st->master_addr.a[2], st->master_addr.a[3], st->master_addr.a[4], st->master_addr.a[5], st->height,
++	    st->master_metric, st->master_counter);
++}
++
++/* ================= peers (OWL peers.c, fixed array) ================= */
++struct awdl_peer *
++negroni_owl_peer_get(struct awdl_state *s, const struct awdl_ea *addr, uint64_t now_us, bool *is_new)
++{
++	uint32_t free_slot = AWDL_PEERS_MAX;
++
++	if (is_new) {
++		*is_new = false;
++	}
++	for (uint32_t i = 0; i < AWDL_PEERS_MAX; i++) {
++		if (s->peers[i].used) {
++			if (ea_cmp(&s->peers[i].addr, addr) == 0) {
++				s->peers[i].last_update = now_us;
++				return &s->peers[i];
++			}
++		} else if (free_slot == AWDL_PEERS_MAX) {
++			free_slot = i;
++		}
++	}
++	if (free_slot == AWDL_PEERS_MAX) {
++		return NULL;    /* table full */
++	}
++	struct awdl_peer *p = &s->peers[free_slot];
++	memset(p, 0, sizeof(*p));
++	p->used = true;
++	p->addr = *addr;
++	p->last_update = now_us;
++	election_init(&p->election, addr);
++	s->npeers++;
++	if (is_new) {
++		*is_new = true;
++	}
++	return p;
++}
++
++void
++negroni_owl_peers_clean(struct awdl_state *s, uint64_t before_us, void (*gone)(const struct awdl_peer *))
++{
++	for (uint32_t i = 0; i < AWDL_PEERS_MAX; i++) {
++		if (s->peers[i].used && s->peers[i].last_update < before_us) {
++			if (gone) {
++				gone(&s->peers[i]);
++			}
++			s->peers[i].used = false;
++			if (s->npeers) {
++				s->npeers--;
++			}
++		}
++	}
++}
++
++/* ================= node state ================= */
++void
++negroni_owl_init_state(struct awdl_state *s, const char *hostname, const struct awdl_ea *self,
++    uint8_t chan_num, uint8_t chan_opclass, uint64_t now_us)
++{
++	memset(s, 0, sizeof(*s));
++	s->self_address = *self;
++	strlcpy(s->name, hostname ? hostname : "negroni", sizeof(s->name));
++	s->version = AWDL_VERSION_COMPAT;
++	s->dev_class = 1;               /* macOS, OWL default */
++	s->psf_interval = 110;          /* TU, OWL daemon default */
++	s->chan_num = chan_num;
++	s->chan_opclass = chan_opclass;
++	sync_init(&s->sync, now_us);
++	election_init(&s->election, self);
++}
++
++/* ================= frame build (OWL tx.c) ================= */
++/* static channel sequence: every slot is our social channel (opclass encoding, 2 bytes/slot) */
++static uint8_t *
++build_chanseq(uint8_t *p, const struct awdl_state *s)
++{
++	p = w8(p, AWDL_CHANSEQ_LENGTH - 1);     /* count (+1) */
++	p = w8(p, AWDL_CHAN_ENC_OPCLASS);       /* encoding */
++	p = w8(p, 0);                           /* duplicate_count */
++	p = w8(p, 3);                           /* step_count */
++	p = w16(p, 0xffff);                     /* fill_channel: repeat current */
++	for (uint32_t i = 0; i < AWDL_CHANSEQ_LENGTH; i++) {
++		p = w8(p, s->chan_num);         /* opclass encoding: chan_num then opclass */
++		p = w8(p, s->chan_opclass);
++	}
++	return p;
++}
++
++/* sync parameters TLV (type 4) + embedded channel sequence + 2 pad */
++static uint8_t *
++build_sync_params(uint8_t *p, struct awdl_state *s, uint64_t now_us)
++{
++	uint8_t *len_at;
++	uint8_t *start;
++
++	p = w8(p, AWDL_SYNCHRONIZATON_PARAMETERS_TLV);
++	len_at = p;                     /* fill length (u16) after the body */
++	p = w16(p, 0);
++	start = p;
++	p = w8(p, s->chan_num);                                 /* next_aw_channel */
++	p = w16(p, negroni_owl_sync_next_aw_tu(now_us, &s->sync)); /* tx_down_counter */
++	p = w8(p, s->chan_num);                                 /* master_channel */
++	p = w8(p, 0);                                           /* guard_time */
++	p = w16(p, s->sync.aw_period);                          /* aw_period */
++	p = w16(p, s->psf_interval);                            /* af_period */
++	p = w16(p, 0x1800);                                     /* flags (OWL) */
++	p = w16(p, s->sync.aw_period);                          /* aw_ext_length */
++	p = w16(p, s->sync.aw_period);                          /* aw_com_length */
++	p = w16(p, 0);                                          /* remaining_aw_length */
++	p = w8(p, (uint8_t)(s->sync.presence_mode - 1));        /* min_ext */
++	p = w8(p, (uint8_t)(s->sync.presence_mode - 1));        /* max_ext_multicast */
++	p = w8(p, (uint8_t)(s->sync.presence_mode - 1));        /* max_ext_unicast */
++	p = w8(p, (uint8_t)(s->sync.presence_mode - 1));        /* max_ext_af */
++	p = wea(p, &s->election.master_addr);                   /* master_addr */
++	p = w8(p, s->sync.presence_mode);                       /* presence_mode */
++	p = w8(p, 0);                                           /* reserved */
++	p = w16(p, negroni_owl_sync_current_aw(now_us, &s->sync)); /* next_aw_seq */
++	p = w16(p, negroni_owl_sync_current_aw(now_us, &s->sync)); /* ap_alignment = next_aw_seq */
++	p = build_chanseq(p, s);
++	p = w8(p, 0);
++	p = w8(p, 0);                                           /* padding */
++	(void)w16(len_at, (uint16_t)(p - start));
++	return p;
++}
++
++static uint8_t *
++build_chanseq_tlv(uint8_t *p, const struct awdl_state *s)
++{
++	uint8_t *len_at, *start;
++
++	p = w8(p, AWDL_CHAN_SEQ_TLV);
++	len_at = p;
++	p = w16(p, 0);
++	start = p;
++	p = build_chanseq(p, s);
++	p = w8(p, 0);
++	p = w8(p, 0);
++	p = w8(p, 0);                   /* padding */
++	(void)w16(len_at, (uint16_t)(p - start));
++	return p;
++}
++
++static uint8_t *
++build_election_params(uint8_t *p, const struct awdl_state *s)
++{
++	p = w8(p, AWDL_ELECTION_PARAMETERS_TLV);
++	p = w16(p, 21);                 /* body length = sizeof - 3 */
++	p = w8(p, 0);                   /* flags */
++	p = w16(p, 0);                  /* id */
++	p = w8(p, (uint8_t)s->election.height); /* distancetop */
++	p = w8(p, 0);                   /* unknown */
++	p = wea(p, &s->election.master_addr);   /* top_master_addr */
++	p = w32(p, s->election.master_metric);  /* top_master_metric */
++	p = w32(p, s->election.self_metric);    /* self_metric */
++	p = w8(p, 0);
++	p = w8(p, 0);                   /* pad */
++	return p;
++}
++
++static uint8_t *
++build_election_params_v2(uint8_t *p, const struct awdl_state *s)
++{
++	p = w8(p, AWDL_ELECTION_PARAMETERS_V2_TLV);
++	p = w16(p, 40);                 /* body length */
++	p = wea(p, &s->election.master_addr);
++	p = wea(p, &s->election.sync_addr);
++	p = w32(p, s->election.master_counter);
++	p = w32(p, s->election.height); /* distance_to_master */
++	p = w32(p, s->election.master_metric);
++	p = w32(p, s->election.self_metric);
++	p = w32(p, 0);                  /* unknown */
++	p = w32(p, 0);                  /* reserved */
++	p = w32(p, s->election.self_counter);
++	return p;
++}
++
++static uint8_t *
++build_service_params(uint8_t *p)
++{
++	p = w8(p, AWDL_SERVICE_PARAMETERS_TLV);
++	p = w16(p, 9);                  /* body length = sizeof - 3 */
++	p = w8(p, 0); p = w8(p, 0); p = w8(p, 0);       /* unknown[3] */
++	p = w16(p, 0);                  /* sui */
++	p = w32(p, 0);                  /* bitmask */
++	return p;
++}
++
++uint32_t
++negroni_owl_build_action(struct awdl_state *s, uint8_t subtype, uint64_t now_us, uint8_t *buf, uint32_t cap)
++{
++	uint8_t *p = buf;
++	uint32_t steady = (uint32_t)now_us;
++
++	if (cap < 256) {
++		return 0;
++	}
++	/* action header (OWL struct awdl_action, 16 bytes) */
++	p = w8(p, IEEE80211_VENDOR_SPECIFIC);
++	p = w8(p, AWDL_OUI0); p = w8(p, AWDL_OUI1); p = w8(p, AWDL_OUI2);
++	p = w8(p, AWDL_TYPE);
++	p = w8(p, AWDL_VERSION_COMPAT);
++	p = w8(p, subtype);
++	p = w8(p, 0);                   /* reserved */
++	p = w32(p, steady);             /* phy_tx */
++	p = w32(p, steady);             /* target_tx */
++	/* TLVs, same order as OWL awdl_send_psf/mif */
++	p = build_sync_params(p, s, now_us);
++	p = build_election_params(p, s);
++	p = build_chanseq_tlv(p, s);
++	p = build_election_params_v2(p, s);
++	p = build_service_params(p);
++	s->tx_action++;
++	return (uint32_t)(p - buf);
++}
++
++/* ================= frame parse (OWL rx.c) ================= */
++/* walk the TLVs of an AWDL action body (after the 16-byte header) and update the peer */
++static void
++parse_tlvs(struct awdl_peer *peer, const uint8_t *p, uint32_t len)
++{
++	while (len >= 3) {
++		uint8_t type = p[0];
++		uint16_t l = r16(p + 1);
++		const uint8_t *v = p + 3;
++
++		if (l > len - 3) {
++			break;          /* runs past the end */
++		}
++		switch (type) {
++		case AWDL_ELECTION_PARAMETERS_TLV:
++			if (l >= 21) {
++				peer->election.height = v[3];
++				memcpy(peer->election.master_addr.a, v + 5, 6);
++				peer->election.master_metric = r32(v + 11);
++				peer->election.self_metric = r32(v + 15);
++				peer->election.self_addr = peer->addr;
++				peer->election.sync_addr = peer->addr;
++				peer->election.master_counter = 0;
++			}
++			break;
++		case AWDL_ELECTION_PARAMETERS_V2_TLV:
++			if (l >= 40) {
++				memcpy(peer->election.master_addr.a, v + 0, 6);
++				memcpy(peer->election.sync_addr.a, v + 6, 6);
++				peer->election.master_counter = r32(v + 12);
++				/* 0347 review: clamp (height + 1 must not wrap past the tree-height check) */
++				peer->election.height = MIN(r32(v + 16), AWDL_ELECTION_TREE_MAX_HEIGHT + 1);
++				peer->election.master_metric = r32(v + 20);
++				peer->election.self_metric = r32(v + 24);
++				peer->election.self_addr = peer->addr;
++			}
++			break;
++		case AWDL_VERSION_TLV:
++			if (l >= 2) {
++				peer->version = v[0];
++				peer->devclass = v[1];
++			}
++			break;
++		case AWDL_ARPA_TLV:
++			if (l >= 3) {
++				uint8_t nl = v[1];
++				if (nl > AWDL_NAME_MAX) {
++					nl = AWDL_NAME_MAX;
++				}
++				if ((uint32_t)nl + 2 <= l) {
++					memcpy(peer->name, v + 2, nl);
++					peer->name[nl] = '\0';
++				}
++			}
++			break;
++		default:
++			break;
++		}
++		p += 3 + l;
++		len -= 3 + l;
++	}
++}
++
++bool
++negroni_owl_rx_action(struct awdl_state *s, const struct awdl_ea *sa, const uint8_t *body, uint32_t blen,
++    int32_t rssi, uint32_t freq, uint64_t now_us)
++{
++	struct awdl_peer *peer;
++	bool is_new = false;
++
++	if (blen < 16 || body[0] != IEEE80211_VENDOR_SPECIFIC ||
++	    body[1] != AWDL_OUI0 || body[2] != AWDL_OUI1 || body[3] != AWDL_OUI2 || body[4] != AWDL_TYPE) {
++		s->rx_unknown++;
++		return false;
++	}
++	s->rx_action++;
++	peer = negroni_owl_peer_get(s, sa, now_us, &is_new);
++	if (peer == NULL) {
++		return true;    /* table full: still a valid frame */
++	}
++	peer->is_valid = true;
++	peer->rssi = rssi;
++	peer->freq = freq;
++	parse_tlvs(peer, body + 16, blen - 16);
++	return true;
++}
+diff --git a/bsd/dev/negroni_awdl_owl.h b/bsd/dev/negroni_awdl_owl.h
+new file mode 100644
+index 0000000..02309ea
+--- /dev/null
++++ b/bsd/dev/negroni_awdl_owl.h
+@@ -0,0 +1,150 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later */
++/*
++ * NEGRONI AWDL core (patch 0347): a kernel port of the portable AWDL engine of
++ *
++ *   OWL: an open Apple Wireless Direct Link (AWDL) implementation
++ *   Copyright (C) 2018  The Open Wireless Link Project
++ *   Copyright (C) 2018  Milan Stute
++ *   seemoo-lab/owl, commit 0ee3263f944ea721c355f826aa90d636d012a512 (GPL-3.0-or-later)
++ *   src/{frame.h,state.h,sync.c,election.c,schedule.c,channel.c,tx.c,rx.c,peers.c}
++ *
++ * This program is free software: you can redistribute it and/or modify it under
++ * the terms of the GNU General Public License as published by the Free Software
++ * Foundation, either version 3 of the License, or (at your option) any later
++ * version. This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
++ * details. You should have received a copy of the GNU General Public License
++ * along with this program. If not, see <https://www.gnu.org/licenses/>.
++ *
++ * Port notes (ours): no malloc (fixed peer array), no libpcap/netlink, clock is
++ * passed in as a parameter (us, monotonic), hashmap and iterators replaced by a
++ * linear table, logging through printf. Frame layouts, the sync math and the
++ * election algorithm are kept as in OWL; the AWDL BSSID, OUI, type and TLV ids
++ * are the public protocol constants (Stute et al., MobiCom 2018).
++ */
++#ifndef _NEGRONI_AWDL_OWL_H_
++#define _NEGRONI_AWDL_OWL_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* ---- constants (OWL frame.h / channel.h; public AWDL protocol) ---- */
++#define AWDL_OUI0               0x00u
++#define AWDL_OUI1               0x17u
++#define AWDL_OUI2               0xf2u
++#define AWDL_TYPE               8u
++#define AWDL_VERSION_COMPAT     0x10u   /* awdl_version(1,0) = (1<<4)|0 */
++#define IEEE80211_VENDOR_SPECIFIC 127u
++#define AWDL_ACTION_PSF         0u
++#define AWDL_ACTION_MIF         3u
++
++#define AWDL_CHANSEQ_LENGTH     16u
++#define AWDL_CHAN_ENC_OPCLASS   3u
++
++/* TLV ids (OWL enum awdl_tlvs) */
++#define AWDL_SYNCHRONIZATON_PARAMETERS_TLV      4u
++#define AWDL_ELECTION_PARAMETERS_TLV            5u
++#define AWDL_SERVICE_PARAMETERS_TLV             6u
++#define AWDL_DATA_PATH_STATE_TLV                12u
++#define AWDL_ARPA_TLV                           16u
++#define AWDL_CHAN_SEQ_TLV                       18u
++#define AWDL_SYNCTREE_TLV                       20u
++#define AWDL_VERSION_TLV                        21u
++#define AWDL_ELECTION_PARAMETERS_V2_TLV         24u
++
++#define AWDL_ELECTION_TREE_MAX_HEIGHT   10u
++#define AWDL_ELECTION_METRIC_INIT       60u
++#define AWDL_PEERS_MAX                  32u
++#define AWDL_NAME_MAX                   64u
++
++/* a 6-byte MAC; its own type so it never clashes with net/ethernet struct ether_addr */
++struct awdl_ea { uint8_t a[6]; };
++
++/* ---- sync (OWL sync.h / sync.c) ---- */
++struct awdl_sync_state {
++	uint16_t aw_counter;
++	uint64_t last_update;   /* us */
++	uint16_t aw_period;     /* TU */
++	uint8_t presence_mode;
++};
++
++/* ---- election (OWL election.h / election.c) ---- */
++struct awdl_election_state {
++	struct awdl_ea master_addr;
++	struct awdl_ea sync_addr;
++	struct awdl_ea self_addr;
++	uint32_t height;
++	uint32_t master_metric;
++	uint32_t self_metric;
++	uint32_t master_counter;
++	uint32_t self_counter;
++};
++
++/* ---- one peer (OWL peers.h, trimmed) ---- */
++struct awdl_peer {
++	bool used;
++	bool is_valid;
++	struct awdl_ea addr;
++	uint64_t last_update;           /* us */
++	struct awdl_election_state election;
++	uint8_t version;
++	uint8_t devclass;
++	char name[AWDL_NAME_MAX + 1];
++	int32_t rssi;
++	uint32_t freq;
++};
++
++/* ---- complete node state (OWL state.h, trimmed) ---- */
++struct awdl_state {
++	struct awdl_ea self_address;
++	char name[AWDL_NAME_MAX + 1];
++	uint8_t version;
++	uint8_t dev_class;
++	uint16_t sequence_number;       /* data frames */
++	uint16_t psf_interval;          /* TU */
++	uint8_t chan_num;               /* social channel we park on (6/44/149) */
++	uint8_t chan_opclass;
++	struct awdl_sync_state sync;
++	struct awdl_election_state election;
++	struct awdl_peer peers[AWDL_PEERS_MAX];
++	uint32_t npeers;
++	/* statistics */
++	uint64_t tx_action, rx_action, rx_unknown;
++};
++
++/* init the whole node state (OWL awdl_init_state) */
++void negroni_owl_init_state(struct awdl_state *s, const char *hostname, const struct awdl_ea *self,
++    uint8_t chan_num, uint8_t chan_opclass, uint64_t now_us);
++
++/* sync math (OWL sync.c), verbatim logic */
++uint16_t negroni_owl_sync_next_aw_tu(uint64_t now_us, const struct awdl_sync_state *st);
++uint64_t negroni_owl_sync_next_aw_us(uint64_t now_us, const struct awdl_sync_state *st);
++uint16_t negroni_owl_sync_current_aw(uint64_t now_us, const struct awdl_sync_state *st);
++bool negroni_owl_is_multicast_eaw(const struct awdl_state *s, uint64_t now_us);
++
++/* election (OWL election.c), run over the live peer table */
++void negroni_owl_election_run(struct awdl_state *s);
++int negroni_owl_election_tree(const struct awdl_state *s, char *str, int len);
++
++/* peers (OWL peers.c), fixed array */
++struct awdl_peer *negroni_owl_peer_get(struct awdl_state *s, const struct awdl_ea *addr, uint64_t now_us, bool *is_new);
++void negroni_owl_peers_clean(struct awdl_state *s, uint64_t before_us, void (*gone)(const struct awdl_peer *));
++
++/* build one PSF or MIF action frame body (category..last TLV). Returns length, 0 on overflow. */
++uint32_t negroni_owl_build_action(struct awdl_state *s, uint8_t subtype, uint64_t now_us, uint8_t *buf, uint32_t cap);
++
++/* parse one received AWDL action frame body (starts at the 127 category octet). Updates the peer.
++ * sa is the 802.11 source address. Returns true if it was a well-formed AWDL action. */
++bool negroni_owl_rx_action(struct awdl_state *s, const struct awdl_ea *sa, const uint8_t *body, uint32_t blen,
++    int32_t rssi, uint32_t freq, uint64_t now_us);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _NEGRONI_AWDL_OWL_H_ */
+diff --git a/bsd/dev/negroni_wlan_ios.c b/bsd/dev/negroni_wlan_ios.c
+index 909433e..d8e26e1 100644
+--- a/bsd/dev/negroni_wlan_ios.c
++++ b/bsd/dev/negroni_wlan_ios.c
+@@ -74,6 +74,7 @@
+ #include <net/bpf.h>
+ #include <net/dlil.h>
+ #include "negroni_wlan_ios.h"
++#include "negroni_awdl.h"         /* 0347 */
+ 
+ #define NWIOS_FRAME_MAX         1514
+ 
+@@ -878,6 +879,7 @@ nwios_thread(void *arg __unused, wait_result_t wr __unused)
+ 	    nwios_backend_name(), nwios_caps(), wi.mac[0], wi.mac[1], wi.mac[2]);
+ 	negroni_wlan_ios_publish(NWIOS_IFNAME, wi.mac);
+ 	negroni_apple80211_event(NWIOS_EV_POWER, 1);
++	negroni_awdl_start(wi.mac, wi.mode == 2);       /* 0347: AWDL probe, off unless negroniawdl is set */
+ 	summary_at = nwios_ms() + 180 * 1000;
+ 	next_stats = nwios_ms() + 60 * 1000;
+ 
+@@ -895,6 +897,7 @@ nwios_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		bits = __atomic_exchange_n(&wi.pending, 0, __ATOMIC_SEQ_CST);
+ 		work(bits);                     /* also with no bits: time-outs and the driver state are polled */
++		negroni_awdl_tick();
+ 		if (nwios_ms() >= summary_at) {
+ 			/* 0345: 180 s after en0, then every 600 s while wifid sends requests */
+ 			summary_at = nwios_ms() + 600 * 1000;
+diff --git a/bsd/dev/negroni_wlan_join.c b/bsd/dev/negroni_wlan_join.c
+index c7637a2..11b756f 100644
+--- a/bsd/dev/negroni_wlan_join.c
++++ b/bsd/dev/negroni_wlan_join.c
+@@ -33,6 +33,7 @@
+ #include "negroni_wlan_mhi.h"
+ #include "negroni_wlan_wmi.h"
+ #include "negroni_wlan_sta.h"
++#include "negroni_awdl.h"         /* 0347 review: negroni_awdl_yield */
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+@@ -993,6 +994,9 @@ negroni_wlan_sta_join_service(void)
+ 	}
+ 	lck_mtx_unlock(&j_mtx);
+ 
++	if (disassoc || assoc) {
++		negroni_awdl_yield();                  /* 0347 review: the AWDL ROC scan ends before the join */
++	}
+ 	if ((disassoc || assoc) && J.active) {
+ 		if (J.up) {
+ 			(void)send_deauth(3);           /* leaving */
+diff --git a/bsd/dev/negroni_wlan_sta.c b/bsd/dev/negroni_wlan_sta.c
+index 078ea9f..ad5feb1 100644
+--- a/bsd/dev/negroni_wlan_sta.c
++++ b/bsd/dev/negroni_wlan_sta.c
+@@ -17,6 +17,7 @@
+ #include "negroni_wlan.h"
+ #include "negroni_wlan_mhi.h"
+ #include "negroni_wlan_sta.h"
++#include "negroni_awdl.h"         /* 0347: the AWDL engine, one pass per keep-alive loop */
+ 
+ static LCK_GRP_DECLARE(g_grp, "negroni_wlan_api");
+ static LCK_MTX_DECLARE(g_mtx, &g_grp);
+@@ -290,6 +291,7 @@ negroni_wlan_sta_service(void)
+ 	}
+ 	lck_mtx_unlock(&g_mtx);
+ 	if (scan) {
++		negroni_awdl_yield();                  /* 0347 review: the AWDL ROC scan ends before en0's scan */
+ 		int error = negroni_wlan_wmi_scan_start();
+ 		if (error) {
+ 			printf("NEGRONI WLAN: API scan not started (error %d)\n", error);
+@@ -305,6 +307,7 @@ negroni_wlan_sta_service(void)
+ 		negroni_wlan_sta_scan_done(~0u);
+ 	}
+ 	negroni_wlan_sta_join_service();               /* 0327 */
++	negroni_awdl_service();                        /* 0347: AWDL engine (only while en0 is idle) */
+ }
+ 
+ void
+diff --git a/bsd/dev/negroni_wlan_wmi.c b/bsd/dev/negroni_wlan_wmi.c
+index 50c87eb..67a99f2 100644
+--- a/bsd/dev/negroni_wlan_wmi.c
++++ b/bsd/dev/negroni_wlan_wmi.c
+@@ -28,6 +28,7 @@
+ #include "negroni_wlan_ce.h"
+ #include "negroni_wlan_wmi.h"
+ #include "negroni_wlan_sta.h"     /* 0326 */
++#include "negroni_awdl.h"         /* 0347 */
+ 
+ /* ==== pure parsers (host-tested: patches/xnu/tests/wlan-wmi-test.c) ==== */
+ static uint32_t
+@@ -212,6 +213,19 @@ svc_has(uint32_t bit)
+ 	return bit < WMI_MAX_EXT2_SERVICE && (M.svc_map[bit / 32] >> (bit % 32)) & 1;
+ }
+ 
++/* 0347: for the AWDL probe (negroni_awdl.c) */
++bool
++negroni_wlan_wmi_service(uint32_t bit)
++{
++	return svc_has(bit);
++}
++
++bool
++negroni_wlan_wmi_services_known(void)
++{
++	return M.svc_ready;
++}
++
+ static void
+ svc_set(uint32_t bit)
+ {
+@@ -410,6 +424,9 @@ wmi_event(const uint8_t *p, uint32_t len)
+ 		M.diag++;
+ 		break;
+ 	default:
++		if (negroni_awdl_wmi_event(id, p, len)) {
++			break;                  /* 0347: our AWDL MGMT_TX_COMPLETION (desc ids 0x100+) */
++		}
+ 		if (negroni_wlan_join_wmi_event(id, p, len)) {
+ 			break;                  /* 0327: vdev / peer / mgmt tx / kickout / roam events */
+ 		}
+@@ -884,6 +901,15 @@ negroni_wlan_wmi_chains(void)
+ #define WMI_VDEV_TYPE_STA               2u
+ #define WLAN_NOISE_FLOOR                (-95)
+ #define WLAN_SCAN_ID                    0xa001u
++#define AWDL_ROC_SCAN_ID                0xa0d1u /* 0347: our remain-on-channel scan (distinct from en0) */
++#define WMI_SCAN_FLAG_OFFCHAN_MGMT_TX   0x2000u /* ath11k wmi.h: send mgmt frames while off channel */
++#define WMI_SCAN_FLAG_FORCE_ACTIVE      0x2u
++#define WMI_MGMT_TX_SEND_CMDID_W        0x7008u
++#define WMI_STOP_SCAN_CMDID_W           0x03002u
++#define TAG_MGMT_TX_SEND_CMD_W          0x1a6u
++#define TAG_STOP_SCAN_CMD_W             0x4eu
++#define TAG_ARRAY_BYTE_W                0x11u
++#define AWDL_MGMT_DOWNLD_LEN            64u
+ #define WLAN_BSS_MAX                    64u
+ 
+ static const uint16_t g_freqs[] = {
+@@ -934,6 +960,7 @@ scan_mgmt_rx(const uint8_t *p, uint32_t len)
+ 		return;
+ 	}
+ 	negroni_wlan_sta_mgmt_rx(frame, buf_len, (int32_t)snr + WLAN_NOISE_FLOOR, freq);  /* 0326: the API's BSS list */
++	negroni_awdl_mgmt_rx(frame, buf_len, (int32_t)snr + WLAN_NOISE_FLOOR, freq);      /* 0347: AWDL probe (negroniawdl) */
+ 	int r = negroni_wlan_beacon_parse(frame, buf_len, &b);
+ 	if (r == ENOENT) {
+ 		S.other_frames++;
+@@ -995,6 +1022,10 @@ scan_cb(uint32_t id, const uint8_t *p, uint32_t len)
+ 		}
+ 		uint32_t ev = rd32(v), reason = rd32(v + 4), freq = rd32(v + 8), scan_id = rd32(v + 16);
+ 		S.events++;
++		if (scan_id == AWDL_ROC_SCAN_ID) {
++			negroni_awdl_scan_event(ev, reason, freq);      /* 0347: our remain-on-channel scan */
++			continue;
++		}
+ 		if (scan_id != WLAN_SCAN_ID) {
+ 			continue;
+ 		}
+@@ -1176,6 +1207,85 @@ negroni_wlan_wmi_scan_start(void)
+ 	return wmi_start_scan();
+ }
+ 
++/* ---- 0347: remain-on-channel and AWDL management TX ----
++ * ROC = a single-channel passive scan with the offchan-mgmt-tx flag and our own scan id, so en0's
++ * scan handling (WLAN_SCAN_ID) is untouched. Stop = WMI_STOP_SCAN. The AWDL engine never arms this
++ * unless en0 is idle, and stops it before en0 needs the radio (negroni_awdl.c).
++ */
++int
++negroni_awdl_roc(uint32_t freq_mhz, uint32_t max_ms)
++{
++	static uint8_t m[4 + 39 * 4 + 4 + 1 * 4 + 4 + 4 + 8 + 4];
++	uint8_t *p, *c;
++	uint32_t w[39] = { 0 };
++
++	memset(m, 0, sizeof(m));
++	c = put_tlv(m, WMI_TAG_START_SCAN_CMD, 39 * 4);
++	w[0] = AWDL_ROC_SCAN_ID;                /* scan_id */
++	w[1] = 1;                               /* scan_req_id */
++	w[2] = 0;                               /* vdev 0 */
++	w[3] = 4;                               /* priority HIGH */
++	w[4] = WMI_SCAN_EV_STARTED | WMI_SCAN_EV_COMPLETED | WMI_SCAN_EV_FOREIGN_CHAN | WMI_SCAN_EV_DEQUEUED |
++	    WMI_SCAN_EV_START_FAILED;
++	w[5] = max_ms;                          /* dwell active */
++	w[6] = max_ms;                          /* dwell passive: stay on the channel */
++	w[7] = 0;                               /* min rest */
++	w[8] = 0;                               /* max rest */
++	w[12] = max_ms;                         /* max scan time: the ROC window */
++	w[14] = WMI_SCAN_FLAG_PASSIVE | WMI_SCAN_FLAG_OFFCHAN_MGMT_TX;
++	w[16] = 1;                              /* num_chan */
++	w[17] = 1;                              /* num_bssid */
++	memcpy(c, w, sizeof(w));
++	p = c + sizeof(w);
++	c = put_tlv(p, WMI_TAG_ARRAY_UINT32, 1 * 4);
++	c = put32(c, freq_mhz);
++	p = put_tlv(c, WMI_TAG_ARRAY_FIXED_STRUCT, 0);          /* ssids: none */
++	c = put_tlv(p, WMI_TAG_ARRAY_FIXED_STRUCT, 8);          /* bssid: broadcast */
++	memset(c, 0xff, 6);
++	p = put_tlv(c + 8, WMI_TAG_ARRAY_BYTE, 0);              /* extra IEs: none */
++	return negroni_wlan_wmi_send(WMI_START_SCAN_CMDID, m, (uint32_t)(p - m));
++}
++
++int
++negroni_awdl_roc_stop(void)
++{
++	uint8_t m[4 + 5 * 4];
++	uint8_t *p;
++
++	memset(m, 0, sizeof(m));
++	p = put_tlv(m, TAG_STOP_SCAN_CMD_W, 5 * 4);     /* wmi_stop_scan_cmd */
++	p = put32(p, 1);                                /* requestor = our START_SCAN scan_req_id */
++	p = put32(p, AWDL_ROC_SCAN_ID);                 /* scan_id */
++	p = put32(p, 0);                                /* WMI_SCAN_STOP_ONE (ath11k wmi.h: 0x00000000) */
++	p = put32(p, 0);                                /* vdev 0 */
++	p = put32(p, negroni_wlan_wmi_pdev_id());
++	return negroni_wlan_wmi_send(WMI_STOP_SCAN_CMDID_W, m, (uint32_t)(p - m));
++}
++
++/* send one AWDL action frame (already in a device buffer at dva) by WMI_MGMT_TX_SEND */
++int
++negroni_awdl_mgmt_tx(uint64_t dva, uint32_t frame_len, const uint8_t *frame, uint32_t desc_id, uint32_t chanfreq)
++{
++	uint8_t m[4 + 32 + 4 + AWDL_MGMT_DOWNLD_LEN];
++	uint8_t *p;
++	uint32_t dl = MIN(frame_len, AWDL_MGMT_DOWNLD_LEN);
++
++	memset(m, 0, sizeof(m));
++	p = put_tlv(m, TAG_MGMT_TX_SEND_CMD_W, 32);
++	p = put32(p, 0);                        /* vdev 0 */
++	p = put32(p, desc_id);                  /* desc_id (our range 0x100+) */
++	p = put32(p, chanfreq);                 /* chanfreq: the ROC channel */
++	p = put32(p, (uint32_t)dva);
++	p = put32(p, (uint32_t)(dva >> 32));
++	p = put32(p, frame_len);
++	p = put32(p, dl);
++	p = put32(p, 0);                        /* tx_params_valid */
++	p = put_tlv(p, TAG_ARRAY_BYTE_W, dl);
++	memcpy(p, frame, dl);
++	p += (dl + 3) & ~3u;
++	return negroni_wlan_wmi_send(WMI_MGMT_TX_SEND_CMDID_W, m, (uint32_t)(p - m));
++}
++
+ int
+ negroni_wlan_scan_level(void)
+ {
+diff --git a/iokit/Kernel/arm/NegroniWLAN.cpp b/iokit/Kernel/arm/NegroniWLAN.cpp
+index 8e3eef5..4aaf066 100644
+--- a/iokit/Kernel/arm/NegroniWLAN.cpp
++++ b/iokit/Kernel/arm/NegroniWLAN.cpp
+@@ -50,6 +50,7 @@
+ 
+ extern "C" {
+ #include "../../../bsd/dev/negroni_wlan_ios.h"
++#include "../../../bsd/dev/negroni_awdl.h"
+ }
+ 
+ class IO80211Controller : public IOService
+@@ -90,6 +91,36 @@ NegroniWLANInterface::newUserClient(task_t owningTask, void * securityID, UInt32
+ 	return kIOReturnUnsupported;
+ }
+ 
++/*
++ * 0347: awdl0's service. IO80211.framework 20H392 __isVirtualInterface reads IO80211VirtualInterfaceRole and compares it
++ * with "AirLink" (AWDL), "WiFi-Aware ..." (NAN) and "SoftAP"; wifip2pd matches services with that property and binds
++ * with Apple80211BindToInterfaceWithService (user client first, then the ioctl path with IOInterfaceName).
++ */
++class NegroniAWDLInterface : public IONetworkInterface
++{
++	OSDeclareDefaultStructors(NegroniAWDLInterface);
++
++public:
++	virtual IOReturn newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++	    IOUserClient ** handler) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(NegroniAWDLInterface, IONetworkInterface);
++
++IOReturn
++NegroniAWDLInterface::newUserClient(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties,
++    IOUserClient ** handler)
++{
++	static unsigned said;
++
++	if (said++ < 8) {
++		IOLog("NEGRONI AWDL: user client type %u asked of awdl0's service: none (ioctl path)\n", (unsigned) type);
++	}
++	return kIOReturnUnsupported;
++}
++
++static IO80211Controller * wlan_controller;     /* 0347: kept for awdl0's service (one reference) */
++
+ static IOService *
+ publish(IOService * service, IOService * provider, const char * name)
+ {
+@@ -227,5 +258,50 @@ negroni_wlan_ios_publish(const char * ifname, const uint8_t mac[6])
+ 		    ifname);
+ 		wlan->release();
+ 	}
+-	controller->release();
++	if (wlan_controller == NULL) {
++		wlan_controller = controller;   /* 0347: keep our reference for awdl0 */
++	} else {
++		controller->release();
++	}
++}
++
++/* 0347: awdl0's IOService below the controller of en0; false if en0's services are not there */
++extern "C" bool
++negroni_awdl_publish(const char * ifname, const uint8_t mac[6])
++{
++	NegroniAWDLInterface * awdl;
++	OSData * address;
++	OSNumber * number;
++
++	if (wlan_controller == NULL) {
++		IOLog("NEGRONI AWDL: no IO80211Controller (en0's services did not start): no awdl0 service\n");
++		return false;
++	}
++	awdl = OSTypeAlloc(NegroniAWDLInterface);
++	if (awdl == NULL || !awdl->init()) {
++		OSSafeReleaseNULL(awdl);
++		return false;
++	}
++	awdl->setProperty("IOInterfaceName", ifname);
++	awdl->setProperty("BSD Name", ifname);
++	awdl->setProperty("IOInterfaceNamePrefix", "awdl");
++	if ((number = OSNumber::withNumber(6ULL, 32)) != NULL) {        /* IFT_ETHER */
++		awdl->setProperty("IOInterfaceType", number);
++		number->release();
++	}
++	if ((number = OSNumber::withNumber(0ULL, 32)) != NULL) {
++		awdl->setProperty("IOInterfaceUnit", number);
++		number->release();
++	}
++	if ((address = OSData::withBytes(mac, 6)) != NULL) {
++		awdl->setProperty("IOMACAddress", address);
++		address->release();
++	}
++	awdl->setProperty("IOBuiltin", true);
++	awdl->setProperty("IO80211VirtualInterfaceRole", "AirLink");
++	if (publish(awdl, wlan_controller, "NegroniAWDL") == NULL) {
++		return false;
++	}
++	awdl->release();
++	return true;
+ }

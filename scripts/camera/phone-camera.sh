@@ -14,12 +14,17 @@
 #   scripts/camera/phone-camera.sh off|on   hot switch: /var/db/negronicam/off makes the plug-in do nothing at the
 #                                           next mediaserverd start (built 2026-10-27 05:55 and later); then restart
 #   scripts/camera/phone-camera.sh log      live unified log of mediaserverd + Camera, filtered to the camera lines
+#   scripts/camera/phone-camera.sh servers on|off
+#                                           the capture servers the plug-in starts (StartRecorderServer is false on
+#                                           our root): off = /var/db/negronicam/noservers (Camera.app then waits at
+#                                           launch, as before 2026-10-27 18:00); then restart. docs/camera-ios-2026-10-27.md 8
 # push keeps the plug-in it replaces in /var/db/negronicam/NegroniCamera.driver.prev; "revert prev" puts it back.
 # push also writes the stamp out/camera/root-has-camera (the phone's root now has this build), so the next
 # scripts/ios16/build.sh adds the camera ADT nodes by default.
 # The root is mounted writable (rootrw=1). The phone has no killall/launchctl: kill by pid.
 # Logs: scripts/net/phone-log.sh mediaserverd (lines "negroni: camera"); kernel: the USB log, "NEGRONI CAM:"
-# cameracaptured does not exist in iOS 16 (the capture server runs in mediaserverd; applecamerad is unused here).
+# cameracaptured does not exist in iOS 16 (the capture servers run in mediaserverd; our root has StartRecorderServer
+# false, so the plug-in starts them itself: docs/camera-ios-2026-10-27.md section 8; applecamerad is unused here).
 # Needs: userland/camera/build.sh output, scripts/net/ssh-phone.sh. Never writes a partition.
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -67,10 +72,18 @@ on)
   ph "rm -f /var/db/negronicam/off && echo 'camera plug-in on at the next mediaserverd start'"
   kill_camera_app
   restart_ms ;;
+servers)
+  case "${2:-}" in
+  on) ph "rm -f /var/db/negronicam/noservers && echo 'capture servers on at the next mediaserverd start'" ;;
+  off) ph "mkdir -p /var/db/negronicam && touch /var/db/negronicam/noservers && echo 'capture servers off at the next mediaserverd start'" ;;
+  *) echo "usage: $0 servers on|off" >&2; exit 2 ;;
+  esac
+  kill_camera_app
+  restart_ms ;;
 log)
   exec "$REPO/scripts/net/phone-log.sh" -g "negroni: camera" mediaserverd Camera ;;
 status)
-  ph "ls -l /dev/negronicam 2>&1; ls -la $HAL 2>&1; ls -l /var/db/negronicam 2>&1; ls -l $MG1 $MG2 2>&1; ls /var/db/negronicam 2>&1; ps ax -o pid,start,time,command | grep '[m]ediaserverd'" ;;
+  ph "ls -l /dev/negronicam 2>&1; ls -la $HAL 2>&1; ls -l /var/db/negronicam 2>&1; ls -l $MG1 $MG2 2>&1; ls /var/db/negronicam 2>&1; grep -A1 StartRecorderServer /System/Library/Frameworks/MediaToolbox.framework/D22/SubServerConfiguration.plist 2>&1; ps ax -o pid,start,time,command | grep -E '[m]ediaserverd|[/]Camera.app/Camera'" ;;
 frame)
   [ -x "$REPO/out/camera/host/isp-render" ] || { echo "missing out/camera/host/isp-render: run userland/camera/build.sh" >&2; exit 1; }
   f=$REPO/out/camera/frame-$(date +%Y%m%d-%H%M%S).raw
@@ -89,5 +102,5 @@ revert)
   fi
   kill_camera_app
   restart_ms ;;
-*) echo "usage: $0 push|status|frame|restart|off|on|log|revert [prev]" >&2; exit 2 ;;
+*) echo "usage: $0 push|status|frame|restart|off|on|servers on|off|log|revert [prev]" >&2; exit 2 ;;
 esac

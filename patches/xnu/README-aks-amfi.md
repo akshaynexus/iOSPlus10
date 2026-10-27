@@ -14,6 +14,7 @@ Base: branch `base` of `out/kernel/xnu` (xnu-8796.141.3 + dxb + slop negroni pat
 | `0221-negroni-amfi-policy.patch` | MAC policy named `AMFI` (ops 0x5a, 0x60), `AppleMobileFileIntegrity` IOService | `negroniamfi=` (bits), `negroniamfi=0` = all off |
 | `0222-negroni-sandbox-privileges.patch` | Sandbox grants privileges 1002, 1007, 12000 to system code | `negronisandbox=0` |
 | `0223-negroni-sandbox-appex-container.patch` | Sandbox op 4 gives app extensions a container path | `negroniappex=0` |
+| `0386-negroni-sandbox-extensions.patch` | Sandbox op 5 issues a fixed extension token, op 6 accepts any (tccd "Failed to issue Sandbox Extension", Camera.app not authorized; section "0386" below) | `negronisbext=0` |
 
 Each patch applies alone on `base` with `git apply --check`. The full set
 (0200-0202 + 0220-0223) applies in name order (tested 2026-10-24). 0221-0223 were made with
@@ -428,3 +429,21 @@ With 0221: no passcode = 0x6 from boot (bit 2 set); with a passcode bit 2 is set
 sends 0xe3ffd00d (-> lock_status, wifid re-checks) and 0xe3ffd00f (-> first_unlock). bluetoothd, locationd and apsd
 use the `com.apple.mobile.keybagd.first_unlock` notification (locationd also lock_status) [V: strings]; the
 UserEventAgent plugin posts it at its start when bit 2 is set, else on 0xe3ffd00f. No code change was needed.
+
+## 0386: Sandbox ops 5 and 6, extension issue and consume (2026-10-27)
+
+File: `bsd/kern/negroni_amfi.c`, `negroni_sandbox_extension_issue()`, `negroni_sandbox_syscall()`.
+
+- [V log] `logs/camlog6-full.txt` 05:42:04: tccd grants kTCCServiceCamera/Microphone to Camera.app (authValue 2) and
+  then replies `Failed to issue Sandbox Extension` (kTCCErrorDomain 6). AVFCapture treats that as denied:
+  `Creating an AVCaptureDeviceInput ... failed: -11852 "This app is not authorized to use Back Camera"`. The session
+  runs with no input, so no stream starts. tccd fails the same way for sharingd/contactsd (AddressBook) and Safari.
+- [V disasm 20H392] `__sandbox_extension_issue` (libsystem_sandbox 0x1d1af4f98) mallocs 0x800 bytes and calls
+  `__sandbox_ms("Sandbox", 5, {class, type (0 file, 1 mach, 3 generic), data, flags, token_buf, pid, pidversion})`; the policy writes the token string into
+  `token_buf` (offset 0x20). `sandbox_extension_consume` (0x1d1af4ecc) calls op 6 with `{token, length, &handle}`
+  and returns the handle (0 when the policy writes nothing) on success.
+- Before: ENOENT for both. Now: op 5 copies out a fixed token of the usual shape, op 6 returns 0. Without a sandbox an
+  extension grants nothing, so this only removes the error. `negronisbext=0` restores ENOENT.
+- [I] Same fix for other services that tccd issues extensions for (AddressBook, Photos, Microphone).
+- Built: syntax check only (`scripts/kernel/compile-one.sh`, OK). Applies on the current patched tree
+  (`git apply --check` on `out/kernel/tree-airdrop`). Not booted.

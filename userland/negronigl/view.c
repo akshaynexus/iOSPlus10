@@ -44,6 +44,7 @@
 #include <IOSurface/IOSurfaceRef.h>
 
 #include "negronigl.h"
+#include "negroni_gpu_policy.h"
 
 struct ngl_nw {                 /* _CAEAGLNativeWindow function table (head only) */
 	uint32_t version;
@@ -113,6 +114,7 @@ ngl_flush(void)
 	} else {
 		glFlush();
 	}
+	ngp_gl_frame_ok();      /* GPU policy dead-man: the first frames clear the armed GL strike */
 }
 
 /* callbacks CA calls when it makes or drops a drawable surface for us */

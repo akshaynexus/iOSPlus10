@@ -36,12 +36,15 @@
    com.apple.widgetkit-extension to 30 MiB (com.apple.jetsamproperties.<model>.plist, read by runningboardd); our
    Metal device needs ~15-20 MiB more, FitnessWidget was jetsam-killed (docs/metal-widgets-2026-10-27.md).
    scripts/ios16/jetsam_widgets.py patches every jetsamproperties plist. Live phone: scripts/metal/phone-widget-jetsam.sh.
-7. Location Services switch on (env LOCATION_SWITCH=1; default off, docs/location-plan.md step L0):
+7. Location Services switch on (env LOCATION_SWITCH; default 1 = on, LOCATION_SWITCH=0 leaves the root as is;
+   docs/location-plan.md step L0, proven on the live phone 2026-10-27, docs/notes.md section 80):
    LocationServicesEnabledIn8.0 = true in /private/var/mobile/Library/Preferences/com.apple.locationd.plist
    (owner mobile 501:501, 0600). [V] 20H392 locationd reads the switch with CFPreferencesCopyValue(
    "LocationServicesEnabledIn8.0", "com.apple.locationd", "mobile", kCFPreferencesAnyHost) and takes a CFBoolean
-   true or a non-zero CFNumber as "on". [I] the user "mobile" + AnyHost source is that file (cfprefsd's usual path).
-   Normal way: Settings > Privacy & Security > Location Services, or `negroni-locd enable` on a live phone.
+   true or a non-zero CFNumber as "on". [V] cfprefsd keeps it in that file: after the SPI call the key is there
+   (501:501, 0600), and a restarted locationd reads it (BigSwitch 1). The owner's later Settings choice stays until
+   the next root image (this tweak runs only when an image is built). Live phone: `negroni-locd enable|disable`
+   (scripts/location/phone-location.sh); Settings > Privacy & Security > Location Services uses the same SPI.
 8. InterfaceNamer WaitStackTimeout (env IFNAMER_WAIT_S, seconds; default 10, empty = off; proven t26 2026-10-27: wifid init 12 s after configd instead of 300 s): configd's InterfaceNamer
    publishes Plugin:InterfaceNamer *QUIET* only through the IONetworkStack user client, and our kernel has no
    IONetworkStack, so in about half of the boots the key gets *QUIET*/*TIMEOUT* only when the 300 s stack timer fires.
@@ -169,11 +172,11 @@ def main():
     else:
         print('interface namer: WaitStackTimeout left as is (IFNAMER_WAIT_S=10 sets 10 s; default 300 s)')
 
-    if os.environ.get('LOCATION_SWITCH', '0') == '1':
+    if os.environ.get('LOCATION_SWITCH', '1') == '1':
         merge_pref(r, 'com.apple.locationd', {'LocationServicesEnabledIn8.0': True})
         print('location: LocationServicesEnabledIn8.0 = true (com.apple.locationd, user mobile)')
     else:
-        print('location: switch left as is (LOCATION_SWITCH=1 turns Location Services on)')
+        print('location: off: LOCATION_SWITCH=0, the switch is left as the root has it')
 
 if __name__ == '__main__':
     main()

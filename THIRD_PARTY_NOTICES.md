@@ -13,6 +13,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | `patches/xnu-12377/0001-non-apple-soc-base.patch`, `scripts/ios26/kdk-headers.py` (from UniXNU-ios26) | UniXNU contributors | BSD-2-Clause-Patent |
 | `external/Mu-Silicium-negroni` & submodules | Andrei Warkentin, Project Silicium, Microsoft Corp., ARM Ltd., Intel Corp., Apple Inc., Linux Foundation | BSD-2-Clause / Project Mu / EDK II |
 | `external/hackios-xnu-userland` | OOSEX GANG | MIT |
+| HakiOS userland (hackios-next; parts in `userland/negronigl/`) | the HakiOS authors | MIT |
 | `external/ios-flame` | NWylynko, dipa-studio | MIT |
 | `external/metal2vulkan` | steelbrain | GPL-2.0-or-later OR LGPL-3.0-or-later |
 | `external/ios-sweet` & `external/ios-sweet-upstream` | dipa-studio | MIT |
@@ -22,6 +23,9 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | `external/hackios-xnu-kernel` & XNU patches | Apple Inc. | Apple Public Source License (APSL) 2.0 |
 | `userland/negronigl/` (Mesa integration / freedreno) | Mesa contributors, Rob Clark | MIT |
 | Linux kernel drivers (ath11k / Qualcomm) | Qualcomm Technologies Inc., Linux Foundation | BSD-3-Clause-Clear |
+| seemoo-lab/owl (port in `patches/xnu/0347-negroni-awdl.patch`: `bsd/dev/negroni_awdl_owl.{c,h}`) | The Open Wireless Link Project, Milan Stute | GPL-3.0-or-later |
+| Qualcomm WALT / OPLUS frame_boost (logic port in `patches/xnu/0395-negroni-cpuperf.patch`: `bsd/dev/negroni_cpuperf.c`) | The Linux Foundation, Intel Corporation, Oplus | GPL-2.0-only |
+| KGSL msm_adreno_tz GPU governor (logic port in `patches/xnu/0389-negroni-gpu-frame-pace.patch`: `bsd/dev/negroni_adreno.c` tz_start/tz_want) | The Linux Foundation, Qualcomm Innovation Center | GPL-2.0-only |
 
 ---
 
@@ -209,6 +213,33 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+### D. HakiOS userland (hackios-next, reference tree out/src/hackios-next)
+Used in `userland/negronigl/shaders.c` (the two full-precision `#define` lines) and `userland/negronigl/surface.c`
+(texel-size table, plane-copy idea). Only the userland part (`userland/src/`) is MIT; its kernel part is APSL 2.0.
+```text
+MIT License
+
+Copyright (c) 2025-2026 the HakiOS authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ---
 
 ## 4. GNU LGPL v3.0 / GPL v2.0 (metal2vulkan)
@@ -317,3 +348,61 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON A
 IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
+
+---
+
+## 8. GNU GPL v3.0 (OWL, AWDL engine)
+
+`patches/xnu/0347-negroni-awdl.patch` adds `bsd/dev/negroni_awdl_owl.c` and `bsd/dev/negroni_awdl_owl.h`, a kernel port of
+OWL (https://github.com/seemoo-lab/owl, commit `0ee3263f944ea721c355f826aa90d636d012a512`; reference repo in
+`external/owl`, pinned in `scripts/setup/get-references.sh`).
+
+```
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright (C) 2018  The Open Wireless Link Project
+Copyright (C) 2018  Milan Stute
+```
+
+The complete GNU General Public License v3.0 text is in `LICENSES/GPL-3.0.txt` (copied from OWL's `COPYING`).
+A kernel built with patch 0347 contains this GPL-3.0 code; the kill switch `negroniawdl=0` turns it off at run time
+but does not remove it from the binary.
+
+---
+
+## 9. GNU GPL v2.0 (WALT / OPLUS CPU policy, patch 0395)
+
+`patches/xnu/0395-negroni-cpuperf.patch` adds `bsd/dev/negroni_cpuperf.c`, a re-written port of the CPU frequency and
+placement policy of the Android kernel of this phone: Qualcomm WALT (`kernel/sched/walt/walt.c`, `cpufreq_walt.c`,
+`input-boost.c`, `boost.c` of OnePlusOSS/android_kernel_oneplus_sm8450 commit `e9da5922d6d1925fa7cc3062b65d92fa2812c3aa`)
+and the OPLUS frame boost (`vendor/oplus/kernel/cpu/sched/frame_boost/` of
+OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8450 commit `835109f6cf48dbae09b68ef072bfecbf48e15064`).
+Fetch: `scripts/setup/fetch-cpuperf-sources.sh`.
+
+```
+SPDX-License-Identifier: GPL-2.0-only
+Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+Copyright (C) 2016, Intel Corporation
+Copyright (C) 2020 Oplus. All rights reserved.
+```
+
+The complete GNU General Public License v2.0 text is in `LICENSES/GPL-2.0.txt` (copied from `external/metal2vulkan/LICENSE-GPL-2.0`).
+A kernel built with patch 0395 contains this code; the kill switch `negronicpuperf=0` turns it off at run time but does not
+remove it from the binary.
+
+---
+
+## 10. GNU GPL v2.0 (KGSL msm_adreno_tz GPU governor, patch 0389)
+
+`patches/xnu/0389-negroni-gpu-frame-pace.patch` adds to `bsd/dev/negroni_adreno.c` a port of the GPU governor of the
+Android kernel of this phone: `drivers/gpu/msm/governor_msm_adreno_tz.c` (tz_start, tz_init, tz_get_target_freq,
+tz_suspend), `kgsl_pwrscale.c` and the DCVS calls of `drivers/firmware/qcom_scm.c` of OnePlusOSS/android_kernel_oneplus_sm8450
+commit `e9da5922d6d1925fa7cc3062b65d92fa2812c3aa`. Fetch: `scripts/setup/fetch-gpu-governor-sources.sh`.
+
+```
+SPDX-License-Identifier: GPL-2.0-only
+Copyright (c) 2010-2021, The Linux Foundation. All rights reserved.
+Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+```
+
+The complete GNU General Public License v2.0 text is in `LICENSES/GPL-2.0.txt`. A kernel built with patch 0389 contains
+this code; the kill switch `negronigpu_tz=0` turns it off at run time but does not remove it from the binary.
