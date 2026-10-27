@@ -3,7 +3,9 @@
 Status date: 2026-10-27 (12:15).
 
 ## TODO (2026-10-27, end of the night session; owner: "bluetooth works, wifi doesn't")
-State at the stop: boot_a = out/ios16-safe. Latest reviewed kernel out/kernel/local-20261027-023416 (all committed
+State 2026-10-27 14:50: the phone runs stock Android + Magisk again (restore.sh --magisk, userdata formatted: no iOS root on
+the phone). An iOS test session starts with a full iOS flash (scripts/flash/ios16.sh order) and ends with restore.sh --magisk.
+Earlier state: boot_a = out/ios16-safe. Latest reviewed kernel out/kernel/local-20261027-023416 (all committed
 patches up to 0379 + 0345/0374/0375/0376; no 0380). Test image out/ios16-t23 (ADSP off, Wi-Fi MSI on, camera ADT nodes,
 watchdogs 0371=60 s / 0375=30 s). Details: docs/notes.md sections 57-63, patches/xnu/README-*.md.
 
