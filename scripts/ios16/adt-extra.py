@@ -24,6 +24,12 @@ still-camera and rear-facing-camera, so SpringBoard shows Camera.app), and /prod
 kernel driver. scripts/ios16/build.sh sets ADT_CAM=1 by default when out/camera/ios/NegroniCamera.driver is built
 (the same rule that makes scripts/ios16/root-finish.sh install it with CAMERA=1): the Camera icon and the capture
 plug-in ship together.
+
+ADT_FLASH=1 (torch, kernel patch 0387 /dev/negroniflash, userland/flashlight/README.md) adds the property "flash"
+(4 bytes, 1) to /product/camera, and makes /product/camera when ADT_CAM did not. libMobileGestalt 20H392
+(0x19c563598) answers camera-flash = true when IODeviceTree:/product/camera has "flash" (presence only), and
++[AVFlashlight hasFlashlight] is MGGetBoolAnswer("camera-flash"): Control Center then shows the flashlight button.
+Without ADT_FLASH the ADT is unchanged.
 """
 import os, sys, tomllib
 from pathlib import Path
@@ -74,6 +80,13 @@ def main():
     if os.environ.get('ADT_CAM') == '1':
         add_node('arm-io', 'isp', [('camera-rear', 0, (1).to_bytes(4, 'little'))])
         add_node('product', 'camera', [])
+    if os.environ.get('ADT_FLASH') == '1':
+        product = find(root, 'product')
+        cam = next((c for c in product.children if c.name == 'camera'), None)
+        if cam is None:
+            cam = add_node('product', 'camera', [])
+        cam.props = [p for p in cam.props if p[0] != 'flash'] + [('flash', 0, (1).to_bytes(4, 'little'))]
+        print('/product/camera flash = 01:00:00:00')
     if os.environ.get('ADT_BT') == '1':
         bt = tomllib.loads((REPO / 'config/negroni-ne2211.toml').read_text())['adt']['bluetooth']
         armio = find(root, 'arm-io')
