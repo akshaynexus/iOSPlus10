@@ -1481,3 +1481,91 @@ firmware passes AWDL frames to the host`; `awdl0 + AirLink IOService made after 
 - OWL parse: the V2 election height is clamped, so `height + 1` cannot wrap past the tree-height check.
 - License: OWL entry + section 8 in `THIRD_PARTY_NOTICES.md`; full GPL-3.0 text in `LICENSES/GPL-3.0.txt`
   (`external/owl` is git-ignored).
+
+## 0396: scan while joined (boot-arg `negroniwlan_scanjoined`, default on) (2026-10-27, Wi-Fi scan agent)
+
+Problem [V, docs/notes.md section 80]: while en0 is joined, `negroni_wlan_scan()` (0326) returned EBUSY. 0340
+`nwios_scan()` then answered wifid with the last list (`scan refused by the driver (error 16): answering with the last
+list`, 77 times in logs/usblog-20261027-171256.txt). Only the joined AP got a new `seen_ms`. locationd keeps only APs
+younger than 5 s (`WifiScan, addAps ... stale, 63`), so Wi-Fi positioning gave no fix. The Settings list also went stale.
+
+Files: `bsd/dev/negroni_wlan_sta.{c,h}`, `negroni_wlan_wmi.c`, `negroni_wlan_join.c`, `negroni_wlan_api.h` (comment).
+The iOS side (0340/0341/0345) is not changed. Compile-check only (`compile-one.sh` on a STAGE=0 scratch tree, all 5
+changed C files OK, also `negroni_wlan_ios.c`, `negroni_apple80211.c`, `negroni_awdl.c`). Not run on the phone.
+
+### Reference (design and parameter values; no GPL code is copied)
+
+Linux `5b0764a53235d3c77e1ed674e836e1b3fe1a4b1f` (out/src/wlan-linux), `drivers/net/wireless/ath/ath11k`:
+`mac.c ath11k_mac_op_hw_scan` sends the same `WMI_START_SCAN` on the vif's vdev also while it is associated. There is no
+other command for it. `wmi.c ath11k_wmi_start_scan_init`: dwell active 50 ms, passive 150 ms, min rest 50 ms, max rest
+500 ms, idle 0, max scan time 20000 ms, probe delay 5, priority LOW, events STARTED | COMPLETED | BSS_CHANNEL |
+FOREIGN_CHAN | DEQUEUED. The firmware leaves the home channel for one dwell and comes back for min..max rest time
+between the foreign channels (BSS_CHANNEL / FOREIGN_CHAN events). 0323 already used these values; 0396 uses them on
+the joined vdev 0.
+
+### What changes
+
+- `negroni_wlan_scan()` while `NWLAN_STATE_CONNECTED`: accepted (0). The driver thread sends the joined scan. It does
+  not change `g_link.state` (no SCANNING, no LINK_DOWN, en0 stays up). Beacons and probe responses go into the same BSS
+  list with a new `seen_ms` (the 0326 path). It still returns EBUSY while JOINING / HANDSHAKE.
+- The joined scan (`negroni_wlan_wmi_scan_start_joined`): the ath11k values above, plus three changes. START_FAILED is in
+  the event mask (the self-check). The channel order is 5 GHz first, 2.4 GHz last: the scan lasts 7.6 s or more (38
+  passive channels x (150 ms dwell + 50 ms rest)), and the 2.4 GHz APs (most APs) then have an age under ~2.6 s when
+  wifid reads the list. Max scan time 25 s (with 500 ms rests on a busy link, 38 channels need more than 20 s; the API
+  time-out stays 30 s). Every channel stays passive: WMI_SCAN_CHAN_LIST marks all channels passive (no regulatory
+  domain applied), so the firmware does not send probe requests.
+- Rate limit: one joined scan per 20 s (`SJ_GAP_MS`). A request inside the gap ends at once with SCAN_DONE and the
+  current list (honest ages). A request while a joined scan runs gets that scan's SCAN_DONE.
+- Join path: while a joined scan runs, the join service still runs (deauth, HTT PEER_UNMAP, WPA2 group rekey). A join
+  or leave request first stops the scan (`WMI_STOP_SCAN` of scan id 0xa001, wait at most 300 ms for the end event). The
+  10 s beacon-loss check pauses while the scan runs and restarts at its end (off-channel dwells miss beacons). A second
+  check (no beacon for 40 s) never pauses, so back-to-back joined scans cannot hide a lost AP (review fix). The stop
+  decision uses the request that the service pass took, so a request that arrives during the pass cannot skip it.
+- AWDL (0347): its engine runs only while en0 is IDLE, so it is never armed while joined. `negroni_awdl_yield()` is
+  still called before the joined scan (nothing to do then). The AWDL scan id 0xa0d1 and its STOP_SCAN are not changed.
+
+### Self-check and kill switch (no probes)
+
+- Kill switch `negroniwlan_scanjoined=0`: off at start with one line; scans while joined get EBUSY as before.
+- The first joined scan must get STARTED (in 5 s) and an end with reason COMPLETED (0), CANCELLED (1), PREEMPTED (2) or
+  TIMEDOUT (3). Then: `scan while joined on: the firmware ran scan K on the joined STA vdev (STARTED, COMPLETED reason
+  R, T ms); the link stays up`.
+- Failure (START_FAILED, no STARTED in 5 s, an end without STARTED, reason INTERNAL_FAILURE, no end in 30 s, the
+  START_SCAN command not sent): before the first success the feature goes off for the boot; after it, 3 failures in a
+  row turn it off. A link loss while a joined scan runs is a failure of that scan (review fix: locationd keeps a scan
+  running most of the time, so one AP loss alone does not turn the feature off after it worked). Off = one line
+  `NEGRONI WLAN: scan while joined off: <reason> (scan K; scan requests while joined get the last list again)`; then
+  `negroni_wlan_scan()` returns EBUSY while joined (the old 0340 "last list" answer). A failure only stops the scan
+  (STOP_SCAN); it never calls a disassociate, a VDEV command or a chip reset.
+
+### Lines (all `NEGRONI WLAN: `)
+
+- `scan while joined on: the firmware ran scan K on the joined STA vdev (STARTED, COMPLETED reason R, T ms); the link stays up` (once)
+- `API scan K while joined done: N BSS in the list, F seen in this scan, T ms, reason R (J joined scans, L requests inside the 20 s gap)` (the first 10, then every 20th)
+- `SCAN event STARTED`, `SCAN on F MHz` (0323 lines; the first SCAN on line is now a 5 GHz channel for a joined scan)
+- failures: `scan while joined: failure k of 3 in a row: <reason>`, `scan while joined: no end event in 300 ms after STOP (<why>); ending it here`, `scan while joined off: <reason> ...`
+- On the iOS side, `scan refused by the driver (error 16)` must not appear while joined (it can still appear while a join runs).
+
+### Test (main session builds the image)
+
+1. Join the home network (WPA2). Check `JOIN associated` and `API state 5 -> 6`.
+2. Open Maps (or `negroni-locd status`) with Location Services on. wifid asks for scans for locationd.
+3. Kernel log: `scan while joined on: ...`, then `API scan K while joined done: N BSS ..., F seen in this scan` with F > 1.
+   No `API state 6 -> 2`, no `JOIN down` during the scan. Ping over Wi-Fi keeps working (some delay during the scan).
+4. locationd (`oslogstream -l -g "WifiScan, add" locationd`): `WifiScan, addAps, ... stale, S` with S near 0 (only 5 GHz
+   APs of the first channels can be stale), then `@ClxWifi, Fix, 1`.
+5. Settings > Wi-Fi while joined: the network list changes (new networks appear within 20 s).
+
+### Risks [I]
+
+- The firmware may refuse or pre-empt the scan on the joined vdev (then the self-check turns it off; the link stays).
+- Throughput drops during a joined scan (~75 % off-channel time for ~8-25 s); the 20 s gap bounds it. No power save is
+  set (0327 turns STA power save off); the firmware sends the null-data PM frames for the off-channel time itself
+  [I: ath11k relies on this; not seen on this chip yet].
+- 5 GHz APs on the first channels can be older than 5 s at the end; locationd drops them. Active probing (shorter
+  dwell) needs a regulatory domain first.
+- A link loss during a joined scan counts as a failure, even when the scan did not cause it (before the first good
+  scan: off at once; after it: 3 in a row).
+- STOP_SCAN waits 300 ms (ath11k waits 3 s). A late end event after that only gives one more SCAN_DONE; if it comes
+  while the join's own scan runs, that scan ends early (rare: join_down's VDEV_STOP wait usually takes it first).
+- No screen-on / Settings special case: the kernel does not see the requester; DISPLAY_STATE (365) is still only accepted.
