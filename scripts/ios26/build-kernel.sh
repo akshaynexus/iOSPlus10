@@ -12,9 +12,11 @@
 #   - dxb pin DXB_SHA (same pin as iOS 16; knows MACOS_VERSION=26.5 and its patches/26.0 set)
 #   - headers-only KDKROOT from scripts/ios26/kdk-headers.py (KDK 26.5.2 25F84, about 200 headers,
 #     read over HTTP; no 1.2 GB download). NEGRONI links no KDK archive.
-#   - patches/xnu-12377/*.patch (our iOS 26 series), copied into dxb/patches/26.0 as zz-<name>
-#     so they apply after dxb's own 26.0 patches.
-# Output: out/kernel/local-ios26-<UTC>/kernel.<config>.negroni + patch-report.txt + SHA256SUMS
+#   - the negroni series, applied by scripts/ios26/apply-series.py right after dxb's own 26.0 patches
+#     (a hook in dxb's patches()): the 12377 base patches/xnu-12377/NNNN-*.patch, then the SAME series as
+#     the iOS 16 kernel (external/slop + patches/xnu) with the 12377 rules of scripts/ios26/patch-rules.py
+#     (patches/xnu-12377/README.md). Any unexpected result stops the build.
+# Output: out/kernel/local-ios26-<UTC>/kernel.<config>.negroni + patch-report.txt + series-report.txt + SHA256SUMS
 #         (link out/kernel/kernel-ios26.macho). The iOS 16 link out/kernel/kernel.macho stays.
 # Env: KERNEL_CONFIG (DEVELOPMENT), XCODE_APP (/Applications/Xcode.app), KDKROOT, STAGE (build|prepare),
 #      ARCH_STRING (arm64 = stage 1, plain arm64; arm64e = stage 2, after the PAC patches exist).
@@ -50,17 +52,27 @@ if [ ! -d "$W/dxb/.git" ]; then
   git init -q "$W/dxb"
   git -C "$W/dxb" fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build "$DXB_SHA"
   git -C "$W/dxb" checkout -q FETCH_HEAD
-  # libfirehose_kernel: dxb builds x86_64+arm64e; stage 1 (plain arm64 kernel) needs arm64 too
-  sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' "$W/dxb/build.sh"
 fi
-# our series, after dxb's own 26.0 patches (glob order: digits < letters < "zz-")
-P=$W/dxb/patches/26.0
-git -C "$W/dxb" checkout -q -- patches
-rm -f "$P"/zz-*
-for f in "$REPO"/patches/xnu-12377/*.patch "$REPO"/patches/xnu-12377/*.sh; do
-  [ -e "$f" ] && cp "$f" "$P/zz-$(basename "$f")"
-done
-echo "patches/xnu-12377: $(ls "$REPO"/patches/xnu-12377/*.patch 2>/dev/null | wc -l | tr -d ' ') patches"
+# dxb as pinned (its own 26.0 patches only), then our two edits of build.sh:
+#  - libfirehose_kernel: dxb builds x86_64+arm64e; stage 1 (plain arm64 kernel) needs arm64 too
+#  - the series hook: apply-series.py on the xnu tree right after dxb's patch loop; a failure stops the build
+git -C "$W/dxb" checkout -q -- build.sh patches
+git -C "$W/dxb" clean -qfd patches
+sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' "$W/dxb/build.sh"
+python3 -I - "$W/dxb/build.sh" <<'PY'
+import sys
+p = sys.argv[1]
+t = open(p).read()
+loop = 'warning "Skipping patch ${PATCH} (already upstream, previously applied, or malformed): ${APPLY_CHECK}"\n            fi\n        done\n'
+assert t.count(loop) == 1, "dxb build.sh patch loop changed"
+hook = ('        if [ -n "${NEGRONI_SERIES:-}" ]; then\n'
+        '            python3 -I "${NEGRONI_SERIES}" "${WORK_DIR}/xnu" > "${WORK_DIR}/series-report.txt" 2>&1; rc=$?\n'
+        '            cat "${WORK_DIR}/series-report.txt"\n'
+        '            [ "$rc" = 0 ] || { error "negroni series: unexpected result (series-report.txt)"; exit 1; }\n'
+        '        fi\n')
+open(p, "w").write(t.replace(loop, loop + hook))
+PY
+export NEGRONI_SERIES=$REPO/scripts/ios26/apply-series.py
 
 [ -d "$W/xnu-pristine/.git" ] || git clone -q --depth 1 --branch "$XNU_TAG" https://github.com/apple-oss-distributions/xnu.git "$W/xnu-pristine"
 rm -rf "${W:?}/dxb/xnu" "${W:?}/dxb/build/xnu.obj" "${W:?}/dxb/build/xnu.sym"
@@ -75,7 +87,8 @@ if [ "$STAGE" = prepare ]; then
   sed 's/^main "\$@"$//' build.sh > .build-functions.sh     # bash 3.2: no "source <(...)"
   bash -c 'set -euo pipefail; . ./.build-functions.sh; setup_xcode_toolchain; choose_xnu; get_xnu; patches' 2>&1 | tee "$W/prepare.log"
   grep -E "Applying patch|Skipping patch" "$W/prepare.log" | sed -E 's#.*(Applying|Skipping) patch:? .*/patches/26.0/#\1 #' > "$W/patch-report.txt" || true
-  echo "prepared $W/dxb/xnu"; grep "^Skipping" "$W/patch-report.txt" || echo "skipped: none"
+  echo "prepared $W/dxb/xnu"; grep "^Skipping" "$W/patch-report.txt" || echo "dxb skipped: none"
+  tail -1 "$W/dxb/series-report.txt"
   exit 0
 fi
 cd "$W/dxb"
@@ -90,10 +103,11 @@ D=$OUT/kernel/local-ios26-$(date -u +%Y%m%d-%H%M%S)
 mkdir -p "$D"
 find fakeroot/System/Library/Kernels -maxdepth 1 -type f -name "kernel.*negroni*" -exec cp {} "$D/" \;
 grep -E "Applying patch|Skipping patch" "$W/build.log" | sed -E 's#.*(Applying|Skipping) patch:? .*/patches/26.0/#\1 #' > "$D/patch-report.txt" || true
+cp "$W/dxb/series-report.txt" "$D/" 2>/dev/null || true
 (cd "$D" && shasum -a 256 kernel.* > SHA256SUMS)
 ln -sfn "$(basename "$D")/kernel.$(echo "$KERNEL_CONFIG" | tr '[:upper:]' '[:lower:]').negroni" "$OUT/kernel/kernel-ios26.macho"
-echo "skipped patches:"; grep "^Skipping" "$D/patch-report.txt" || echo "  none"
-if grep -qE "^Skipping zz-" "$D/patch-report.txt"; then echo "ERROR: a patches/xnu-12377 patch did not apply (above)" >&2; exit 1; fi
+echo "dxb skipped patches:"; grep "^Skipping" "$D/patch-report.txt" || echo "  none"
+tail -1 "$D/series-report.txt"
 "$REPO/scripts/lib/notify.sh" "iOS 26 kernel build done: $D" || true
 ls -l "$D"
 file "$D"/kernel.*
