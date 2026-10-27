@@ -4,7 +4,7 @@ The base driver comes from slop (patches 0072-0077, 0081, 0119: DWC3 at 0x0a6000
 live log). Our patches: 0210 (UDP command server), 0212 (settime), 0282 (bus reset drops the data endpoints),
 0360 (panic mode, README-panic.md), 0361 (throughput, this file), 0366 (reconnect after unplug or a Type-C
 re-attach, this file), 0368 (the HS PHY after the ADSP start, this file), 0371 (reboot when the host stays lost, this file), 0372 (the PHY supply rails and the ADSP, this file), 0373 (the
-charger PD log over GLINK, this file). Host side: docs/usb-network.md.
+charger PD log over GLINK, this file), 0385 (the 0368 repair gate after a PD charger detection, adapter type 17, this file). Host side: docs/usb-network.md.
 
 ## 0361: throughput (RX ring, TX batches, short polls)
 
@@ -751,3 +751,77 @@ re-init like after an hp_watch reconnect; 0375 runs in its own thread and its OU
 Open [I]: the trigger counts from SET_INTERFACE alt 1; with usblog.sh the first host frames (settime + ARP) come ~1-3 s
 after en10 appears, so 10 s is enough; a quiet host (no usblog, en10 inactive) gives 3 re-enumerations, then lines
 only. The 3 tries come back only after a working frame (not after an unplug).
+
+## 0385: the 0368 PHY repair gate after a PD charger detection (adapter type 17)
+
+### Observations (t25, 2026-10-27 17:20, logs/bootlog-1.txt from line 2360) [V]
+
+- Boot-args: the "everything" image with `negroniadsp=1 negronichg_glink=1 negronichg_typec=3`, `negroniusb_phyfix` default 1.
+- Before the ADSP a host was there: `PHY watch: a host is there (SOF number moves)` (line 1145), configured.
+- ADSP start +2167 ms: `PHY change: utmi0 1010101->21212121 utmi1 0->1010101 ctrl2 6060606->e0e0e0e cfg0 0->3030303`,
+  51 ms later back. Then link L2 (suspend), bus reset, not configured.
+- ADSP start +5931 ms: `PHY change: utmi0 1010101->9090909 cfg0 0->1010101`. The PHY stays so.
+  utmi0 9 = SLEEPM + OPMODE 1 (non-driving), cfg0 bit 0 = UTMI datapath override: the PD holds the PHY non-driving
+  (no D+ pull-up). The host sees no device.
+- Our typec writes (SNK, OTG off) succeed (ret_code 0).
+- `USB in (online 1 ... adapter type 17)`. Then every repair: `PHY repair waits: the adapter type is not a host port
+  (SDP/CDP)`, every soft reconnect: `PHY init skipped in this reconnect: ...`. 12 soft reconnects, no SOF, 0371 reboot
+  after 60 s.
+
+### Adapter type 17 [V source]
+
+- `out/src/op-modules/vendor/oplus/kernel/charger/oplus_charger.h:481` (and `v2/charger_ic/oplus_hal_sm8450.h:625`):
+  `POWER_SUPPLY_USB_TYPE_PD_SDP = 17, /* USB With PD Port */`.
+- `charger_ic/oplus_battery_sm8450.c` usb_type_work (line ~2040): `case POWER_SUPPLY_USB_TYPE_PD_SDP:
+  usb_psy_desc.type = POWER_SUPPLY_TYPE_USB;` (same as SDP). So 17 = a USB host port that is also a PD source
+  (here the Mac Type-C port). It is a host type.
+- The other values (Linux enum + QTI, `power_supply_usb_type_text` in the same file): 0 Unknown, 1 SDP, 2 DCP, 3 CDP,
+  4 ACA, 5 C, 6 PD, 7 PD_DRP, 8 PD_PPS, 9 BrickID, 0x80 HVDCP, 0x81 HVDCP_3, 0x82 HVDCP_3P5.
+
+### Change (bsd/dev/negroni_usb.c)
+
+- `hp_init_blocked()`: the EUD, the ADSP hold-off, the 5 inits per ADSP start (0381 one-shot bypass stays) and VOOC
+  (0369) rules are unchanged. After them:
+  - adapter type SDP 1, CDP 3 or PD_SDP 17: allowed.
+  - wall charger (DCP 2, BrickID 9, HVDCP 0x80-0x82) and no SET_CONFIGURATION in this boot: refused
+    (`a wall charger (adapter type N, DCP/HVDCP/BrickID) and no SET_CONFIGURATION in this boot`).
+  - else allowed when a host was there in this boot: `ud.ever_configured` (SET_CONFIGURATION(1), 0371 flag) or
+    `hp.host_seen` (SOFFN moved). Else `no host seen in this boot (...) and adapter type N is not a host port ...`.
+  - without the charger client: allowed when a host was there in this boot (old rule + SET_CONFIGURATION).
+- `hp_init()`: after the Linux init sequence, whole-register writes of utmi0, utmi1, ctrl2 to the values of the gadget
+  start, then cfg0 to the gadget start value (0 = the controller drives UTMI). New line after each re-init:
+  `PHY re-init #N: UTMI overrides cleared (as at the gadget start)|NOT cleared: utmi0 a->b utmi1 .. ctrl2 .. cfg0 ..`.
+- Re-apply: as before, the watch compares with the state after the last re-init. When the PD writes the PHY again,
+  the watch repairs again after 1500 ms stable, at most every 3 s, at most 5 per ADSP start (0368 F3).
+- Not changed: 0366, 0371, 0375, 0381 (it uses the same gate).
+
+### Boot-args (test)
+
+The t25 args unchanged (`negroniadsp=1 negronichg_glink=1 negronichg_typec=3`, `negroniusb_phyfix` default 1,
+`negroniusb_lost_reboot=60 negroniusb_idle_reboot=90 negroniusb_datafix=0xb`). Cable in the Mac, `make usblog`.
+
+### Expected lines
+
+- Boot: `PHY watch on: repair on (negroniusb_phyfix=1), ... host ports (SDP/CDP/PD_SDP) or a host in this boot, not for
+  a wall charger without SET_CONFIGURATION, not during VOOC`.
+- After the ADSP: the `PHY change` lines as in t25. Before ADSP up + 5 s: `PHY repair waits: ADSP hold-off ...`.
+- Then (no `adapter type is not a host port` line): `soft reconnect #N ...: the PHY differs from the reference ...`
+  (or the 0366 no-SOF reconnect), `PHY before the re-init`, `PHY after the re-init`, `PHY re-init #1 ...`,
+  `PHY re-init #1: UTMI overrides cleared (as at the gadget start): utmi0 9090909->1010101 ... cfg0 1010101->0 ...`,
+  then `bus reset`, `connected`, `configured (1)`, en10 back on the Mac.
+- If the PD writes the PHY again: a new `PHY change`, `PHY differs from the reference`, `PHY re-init #2`, up to 5.
+- If the link still does not come back with `UTMI overrides cleared`: the PD state (Type-C role, rails 0372) is the
+  next suspect; send the boot log.
+
+### Build [V]
+
+out/kernel/local-20261027-115931/kernel.development.negroni sha256
+de9908ce7d530e80c2633efda81114ad56df8e0fa510ab31fdf41a655fbb5ae5 (all patches incl. 0382-0385, the 4 usual dxb skips;
+link out/kernel/kernel.macho). Patch sha256 f8b4a2c0a681efa074fd2fba996010826f30212def4b39bbfaafa064d25d3ce9.
+negroni_usb.c: only the old warning kinds. Not booted, no image, no review yet.
+
+### Open [I]
+
+- A cable swap from a Mac to a wall charger in the same boot: `ever_configured` stays set, so a DCP gets up to 5 PHY
+  inits per ADSP start. The PD's own HVDCP detection runs before ADSP up + 5 s (hold-off), so it is not disturbed [I].
+- Not booted.

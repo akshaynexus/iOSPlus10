@@ -3347,3 +3347,21 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   for its completion). ud_poll_sleep_ms checks the TX state again after assert_wait (long sleeps only).
   New A/B switch `negronifb_asleep=0`: the flag stays 0, so every dark-dependent poller is as before.
   idle-log.py: TOP thread frames were never captured (regex); TOP procs now follow the window's dark flag.
+
+## 70. t25: the 0368 PHY repair refused a Mac port (adapter type 17 = PD_SDP); 0385 gate fix (2026-10-27, USB kernel agent; patch 0385, details patches/xnu/README-usb.md "0385")
+
+- [V log] t25 (logs/bootlog-1.txt, `negroniadsp=1 negronichg_typec=3`): ~2.2 s after the ADSP start the charger PD writes
+  the HS PHY (utmi0 21212121, utmi1 1010101, ctrl2 e0e0e0e, cfg0 3030303), at +5931 ms it leaves utmi0 9090909 +
+  cfg0 1010101 (SLEEPM + OPMODE non-driving with the datapath override: no pull-up). Link L2, never back.
+- [V log] Our typec SNK and OTG-off writes succeed. The PD reports `adapter type 17`. Every 0368 repair and every
+  reconnect PHY init was refused (`the adapter type is not a host port (SDP/CDP)`); 0371 rebooted after 60 s.
+- [V source] 17 = `POWER_SUPPLY_USB_TYPE_PD_SDP` ("USB With PD Port", oplus_charger.h:481); stock maps it to
+  POWER_SUPPLY_TYPE_USB (an SDP host port that is also a PD source).
+- 0385: the gate allows SDP/CDP/PD_SDP, or any type after a host in this boot (SET_CONFIGURATION or SOFs); it refuses a
+  wall charger (DCP/HVDCP/BrickID) without a SET_CONFIGURATION in this boot and VOOC (0369). hp_init now writes utmi0,
+  utmi1, ctrl2 and cfg0 back to the gadget start values and logs `UTMI overrides cleared|NOT cleared`. Re-apply after a
+  new PD write: the 0368 watch, at most 5 per ADSP start. 0366/0371/0375/0381 unchanged.
+- [I] The PD's non-driving write is part of its BC1.2/PD detection on D+/D-; it does not undo it because on stock the
+  HLOS USB driver re-inits the PHY at each role change. Not booted yet.
+- Build [V]: out/kernel/local-20261027-115931/kernel.development.negroni sha256
+  de9908ce7d530e80c2633efda81114ad56df8e0fa510ab31fdf41a655fbb5ae5 (the 4 usual dxb skips). Not booted, no image.

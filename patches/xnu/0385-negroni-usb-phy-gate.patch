@@ -1,0 +1,126 @@
+diff --git a/bsd/dev/negroni_usb.c b/bsd/dev/negroni_usb.c
+index f5253e7..1a432aa 100644
+--- a/bsd/dev/negroni_usb.c
++++ b/bsd/dev/negroni_usb.c
+@@ -1892,6 +1892,7 @@ static struct {
+ 	uint32_t    start_inits;        /* PHY inits since the last ADSP start (review F3: at most HP_MAX_INITS) */
+ 	uint32_t    window_lines;       /* change lines in the 10 ms window (review F4: at most HP_MAX_WINDOW_LINES) */
+ 	bool        cap_bypass;         /* 0381: a data path re-init may run one PHY init past HP_MAX_INITS */
++	char        why[160];           /* 0385: hp_init_blocked() reason with the adapter type (ud_thread only) */
+ } hp;
+ 
+ /* the slots a repair looks at: the PHY registers, clkref enable (bit 0) + CLK_OFF (bit 31), BCR (bit 0); not EUD */
+@@ -1968,7 +1969,8 @@ hp_setup(void)
+ 	hp.ok = true;
+ 	hp_dump("baseline at the gadget start", hp.base);
+ 	printf("NEGRONI USB: PHY watch on: repair %s (negroniusb_phyfix=%d), stable %d ms before a repair (negroniusb_phyfix_ms), "
+-	    "hold-off ADSP up + %d s, at most %d PHY inits per ADSP start, host ports only, not during VOOC\n",
++	    "hold-off ADSP up + %d s, at most %d PHY inits per ADSP start, host ports (SDP/CDP/PD_SDP) or a host in this boot, "
++	    "not for a wall charger without SET_CONFIGURATION, not during VOOC\n",
+ 	    ud_phyfix >= 2 ? "on + re-init after each ADSP up" : ud_phyfix ? "on" : "off (log only)", ud_phyfix, ud_phyfix_ms,
+ 	    ud_phyfix_holdoff_s, HP_MAX_INITS);
+ }
+@@ -1981,11 +1983,30 @@ hp_rmw(uint32_t off, uint32_t mask, uint32_t val)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * 0385: the charger client's adapter type (Linux POWER_SUPPLY_USB_TYPE_*, oplus_battery_sm8450.c usb_type_work).
++ * Host ports: SDP 1, CDP 3, PD_SDP 17 (oplus_charger.h:481, OPLUS: "USB With PD Port", a PD source that is also
++ * a USB host, e.g. a Mac Type-C port; stock maps it to POWER_SUPPLY_TYPE_USB). Wall chargers: DCP 2, BrickID 9,
++ * QTI HVDCP 0x80/0x81/0x82 (stock maps all of them to POWER_SUPPLY_TYPE_USB_DCP).
++ */
++static bool
++hp_type_host(int32_t t)
++{
++	return t == 1 || t == 3 || t == 17;
++}
++
++static bool
++hp_type_wall(int32_t t)
++{
++	return t == 2 || t == 9 || (t >= 0x80 && t <= 0x82);
++}
++
+ /*
+  * Review F2/F3: may the PHY be set up now? Not while the EUD owns the PHY (eud_en bit 0), not before ADSP up +
+- * negroniusb_phyfix_holdoff_s, not while the ADSP's VOOC path is active, only on a host port (the charger client's
+- * adapter type SDP 1 / CDP 3; without that client: a host was seen, SOFs since boot), at most HP_MAX_INITS per
+- * ADSP start. NULL = yes, else the reason.
++ * negroniusb_phyfix_holdoff_s, not while the ADSP's VOOC path is active, at most HP_MAX_INITS per ADSP start.
++ * 0385: then yes when the adapter type is a host port (SDP/CDP/PD_SDP) or a host was there in this boot
++ * (SET_CONFIGURATION once, or SOFFN moved); never for a wall charger (DCP/HVDCP/BrickID) without a
++ * SET_CONFIGURATION in this boot. NULL = yes, else the reason. ud_thread only (hp.why).
+  */
+ static const char *
+ hp_init_blocked(void)
+@@ -2002,16 +2023,32 @@ hp_init_blocked(void)
+ 	if (hp.start_inits >= HP_MAX_INITS && !hp.cap_bypass) {
+ 		return "5 PHY inits since the ADSP start already (log only now)";
+ 	}
++	/*
++	 * 0385: a host in this boot (SET_CONFIGURATION or SOFFN moved) also allows the init. t25: the PD reported
++	 * adapter type 17 (POWER_SUPPLY_USB_TYPE_PD_SDP, oplus_charger.h:481 "USB With PD Port", stock maps it to
++	 * POWER_SUPPLY_TYPE_USB = SDP) for a Mac port; the old SDP/CDP-only rule refused every repair.
++	 */
++	bool host = ud.ever_configured || hp.host_seen;
+ 	if (negroni_chg_glink_get(&cs) && cs.ready) {
+ 		if (cs.vooc_active) {
+ 			return "VOOC is active (the ADSP owns D+/D-)";      /* 0369 */
+ 		}
+-		if (cs.usb_type != 1 && cs.usb_type != 3) {
+-			return "the adapter type is not a host port (SDP/CDP)";
++		if (hp_type_host(cs.usb_type)) {
++			return NULL;
++		}
++		if (hp_type_wall(cs.usb_type) && !ud.ever_configured) {
++			snprintf(hp.why, sizeof(hp.why), "a wall charger (adapter type %d, DCP/HVDCP/BrickID) and no "
++			    "SET_CONFIGURATION in this boot", cs.usb_type);
++			return hp.why;
++		}
++		if (host) {
++			return NULL;
+ 		}
+-		return NULL;
++		snprintf(hp.why, sizeof(hp.why), "no host seen in this boot (no SET_CONFIGURATION, SOFFN never moved) "
++		    "and adapter type %d is not a host port (SDP 1/CDP 3/PD_SDP 17)", cs.usb_type);
++		return hp.why;
+ 	}
+-	return hp.host_seen ? NULL : "no host seen (SOFFN never moved between two samples) and no adapter type";
++	return host ? NULL : "no host seen in this boot (no SET_CONFIGURATION, SOFFN never moved) and no adapter type";
+ }
+ 
+ /*
+@@ -2059,8 +2096,21 @@ hp_init(void)
+ 	hp_rmw(HP_UTMI_CTRL5, 1u << 1, 0);                     /* POR release */
+ 	hp_rmw(HP_CTRL2, 1u << 3, 0);                          /* USB2_SUSPEND_N_SEL off */
+ 	hp_rmw(HP_CFG0, 3u, hp.base[12] & 3u);                 /* override enables as at the baseline (Linux: CMN off) */
++	/*
++	 * 0385: the PD's UTMI overrides off in any case (t25: utmi0 9 = SLEEPM + OPMODE non-driving with cfg0 1 =
++	 * datapath override: no pull-up). utmi0/utmi1/ctrl2 as at the gadget start, then cfg0 as at the gadget start
++	 * (0 = the controller drives UTMI). Whole-register writes: these are byte registers (reads repeat the byte).
++	 */
++	*(volatile uint32_t *)(hp.phy + HP_UTMI_CTRL0) = hp.base[0];
++	*(volatile uint32_t *)(hp.phy + HP_UTMI_CTRL1) = hp.base[1];
++	*(volatile uint32_t *)(hp.phy + HP_CTRL2) = hp.base[7];
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(hp.phy + HP_CFG0) = hp.base[12];
++	__asm__ volatile ("dsb sy" ::: "memory");
+ 	ud_udelay(1000);
+ 	hp_snap(after);
++	bool clean = after[0] == hp.base[0] && after[1] == hp.base[1] && after[7] == hp.base[7] &&
++	    after[12] == hp.base[12];
+ 	hp.repairs++;
+ 	hp.start_inits++;
+ 	if (hp.repairs <= 10 || hp.repairs % 10 == 0) {
+@@ -2071,6 +2121,10 @@ hp_init(void)
+ 		    hp.repairs, hp.start_inits, clk_was_off ? "was OFF, now on" : "on", before[12] & 1, after[12] & 1,
+ 		    after[8], after[9], after[10], after[11],
+ 		    hp_dt_override[0], hp_dt_override[1], hp_dt_override[2], hp_dt_override[3]);
++		printf("NEGRONI USB: PHY re-init #%u: UTMI overrides %s: utmi0 %x->%x utmi1 %x->%x ctrl2 %x->%x cfg0 %x->%x "
++		    "(gadget start %x %x %x %x)\n", hp.repairs, clean ? "cleared (as at the gadget start)" : "NOT cleared",
++		    before[0], after[0], before[1], after[1], before[7], after[7], before[12], after[12],
++		    hp.base[0], hp.base[1], hp.base[7], hp.base[12]);
+ 	}
+ 	memcpy(hp.ref, after, sizeof(hp.ref));
+ 	memcpy(hp.last, after, sizeof(hp.last));
