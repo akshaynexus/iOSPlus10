@@ -6,10 +6,14 @@ this port (iOS 16.7.16 20H392, D22 userland, SM8450)?
 Marks: **[V]** seen in a log, DT, ADT, firmware image, root image, shared cache or source. **[I]** inference.
 **[U]** unknown, a test must decide. Nothing in this file ran on the phone. Section 5 (added 2026-10-27, location
 userland agent) describes the L0/L1 code: `userland/location/`, `scripts/location/`, an optional root tweak.
-It is built on the Mac only; no phone test yet.
+It is built on the Mac only; no phone test yet. Section 6 (2026-10-27, location iOS agent) has the live phone results:
+L0 works (switch on, default on in the root), L1 works, Wi-Fi positioning is blocked by the kernel scan while joined, and
+the negroni-locd input interface for a later kernel GNSS source.
 
 ## Short answer
 
+- Update 2026-10-27 (section 6): the switch is on and works (`BigSwitch 1`); simulated fixes work; Wi-Fi positioning waits
+  for a kernel scan while Wi-Fi is joined (locationd drops 63 of 64 APs as older than 5 s).
 - [V] `locationd` runs and does not crash. It denies every client with `location disabled system-wide`
   (`BigSwitch 0`, `isLocationServicesEnabled 0`). So "off" is the switch (a preference), not a missing
   driver. Step L0 (switch on) costs nothing.
@@ -303,12 +307,12 @@ and `docs/ru/cellular.md` [V for SM7325, I for SM8450]:
 | File | What |
 |---|---|
 | `userland/location/negroni-locd.m` | the daemon/CLI (Objective-C, ARC; CoreLocation by `dlopen`, classes by name) |
-| `userland/location/entitlements.plist` | `platform-application`, `com.apple.private.security.no-sandbox`, `com.apple.locationd.simulation` [V], `com.apple.locationd.status` [I, for `enable`] |
+| `userland/location/entitlements.plist` | `platform-application`, `com.apple.private.security.no-sandbox`, `com.apple.locationd.simulation` [V], `com.apple.locationd.authorizeapplications` [V, for `enable`/`disable`, section 6.1], `com.apple.locationd.status` (not needed by the SPI; kept, Preferences.app has it too) |
 | `userland/location/com.iosplus10.negroni-locd.plist` | launchd job `listen 5155`; not loaded unless `LOCD_JOB=1`; `KeepAlive` = `SuccessfulExit` false (`stop` and a missing CoreLocation class exit 0, so no restart loop) |
 | `userland/location/build.sh` | build + checks + ad hoc sign -> `out/location/userland/` |
 | `scripts/location/phone-location.sh` | live phone over SSH: push, remove, set, hold, listen, stream, stop, enable, disable, status, log |
 | `scripts/location/root-add-locd.sh` | root image hook: `LOCD=1` (binary), `LOCD_JOB=1` (launchd job); `root-finish.sh` calls it (default off); `root-update.sh` hook `location` |
-| `scripts/ios16/root-tweaks-extra.py` item 7 | `LOCATION_SWITCH=1`: L0 switch key in the root (default off) |
+| `scripts/ios16/root-tweaks-extra.py` item 7 | L0 switch key in the root (default on since section 6; `LOCATION_SWITCH=0` leaves the root as is) |
 
 `negroni-locd` commands (options before the command):
 
@@ -333,11 +337,11 @@ A macOS build of the same source passed a local smoke test (argument errors, UDP
 
 ### 5.3 L0 root tweak
 
-`LOCATION_SWITCH=1` (env for `root-tweaks-extra.py`, so for `root-finish.sh` and the `tweaks` hook of
-`sudo LOCATION_SWITCH=1 scripts/ios16/root-update.sh IN OUT tweaks`) merges `LocationServicesEnabledIn8.0 = true`
-into `/private/var/mobile/Library/Preferences/com.apple.locationd.plist` (binary plist, owner 501:501, 0600, the
-same helper as the FBLaunchWatchdogScale preference). The read is [V] (5.1); the file is [I] (cfprefsd's path for
-user `mobile`, any host). Default off. A root change needs a new root image (not done here).
+`root-tweaks-extra.py` item 7 (so `root-finish.sh` and the `tweaks` hook of `sudo scripts/ios16/root-update.sh IN OUT
+tweaks`) merges `LocationServicesEnabledIn8.0 = true` into `/private/var/mobile/Library/Preferences/com.apple.locationd.plist`
+(binary plist, owner 501:501, 0600, the same helper as the FBLaunchWatchdogScale preference). The read is [V] (5.1); the
+file is [V] since section 6.1 (cfprefsd wrote the key there). Default on since section 6; `LOCATION_SWITCH=0` leaves the root
+as it is (log line `location: off: LOCATION_SWITCH=0, ...`). A root change needs a new root image (not done here).
 
 ### 5.4 Test steps (phone with SSH, `rootrw=1`)
 
@@ -362,7 +366,80 @@ user `mobile`, any host). Default off. A root change needs a new root image (not
   `Beginning Simulation Service` after the first `set`.
 - [U] The call order and the default delivery/repeat behaviour (we do not set them) may give one fix only, or a
   replay. `hold`/`listen` resend every second to cover this.
-- [U] `com.apple.locationd.status` for `enable` is a guess; if refused, use Settings or `LOCATION_SWITCH=1`.
+- Resolved (section 6.1): `enable` needs `com.apple.locationd.authorizeapplications`, not `com.apple.locationd.status`.
 - [I] Some consumers drop simulated fixes (`location is simulated, rejecting`): country code, harvesting.
 - The UDP listener takes positions from 192.168.7.1 only by default; with `-a 0.0.0.0 -s any` any host on any
   network can move the phone's position.
+
+## 6. Live phone results (2026-10-27, location iOS agent; iOS up over USB, no reboot, no flash)
+
+### 6.1 L0: the switch
+
+- [V] Before: `negroni-locd enable` printed `setLocationServicesEnabled:1 sent` but `locationServicesEnabled 0`. locationd
+  logged `CL: _CLDaemonSetLocationServicesEnabled (Fallback)` and `#Spi, connecting process isn't entitled, they shall not
+  pass`; CoreLocation logged `#Spi, CLInternalSetLocationServicesEnabled failed`.
+- [V] Cause: the SPI handler (locationd 20H392, function at 0x1012d42a0: `valueForEntitlement:` on the CFString at
+  0x101c0a418, `isKindOfClass:` NSNumber, `boolValue`) wants `com.apple.locationd.authorizeapplications`. The CFString
+  was read from the binary (chained-fixup target 0x18e88fc). `com.apple.locationd.status` is checked by other handlers.
+  `/Applications/Preferences.app/Preferences` on the phone has `authorizeapplications`, `status`, `effective_bundle`,
+  `defaults_access`, `usage_oracle`.
+- [V] After the entitlement: `#Spi, [mobile]/usr/local/bin/negroni-locd is setting location services to enabled`,
+  `"property":"locationServicesEnabledStatus", "old":0, "new":1`, `#authsync sending kNotificationLocationServicesStatus`,
+  `"BigSwitch":1` for every client (Maps, Weather, the location bundles), no more `location disabled system-wide`.
+  `disable` then `enable` works both ways.
+- [V] cfprefsd wrote `LocationServicesEnabledIn8.0 = true` to `/private/var/mobile/Library/Preferences/com.apple.locationd.plist`
+  (501:501, 0600). After `kill` of locationd, the new locationd read it: 400 `"BigSwitch":1` lines, 0 with 0.
+- [I] The Settings toggle (Privacy & Security > Location Services) calls the same SPI with the same entitlement, so it works
+  too; it was not tapped in this session.
+- The root tweak (item 7) is default on now. The live phone has the switch on.
+- [U] Which GNSS device locationd builds: no `Eureka`/`CLGnss...Device`/`ClxGps` line in 2 min with the switch on (only
+  `#Manufacturing service complete ... CLGnssProvider`). A fine-accuracy client (Maps) must ask first.
+
+### 6.2 L1: simulation
+
+- [V] `negroni-locd set 48.8584 2.2945 10`: `Simulation start request received`, `Setting simulation to 1 for all location
+  providers`, then `@ClxSimulated, Fix, 1, ll, <private>, <private>, acc, 10.00` once per second. No `Beginning Simulation
+  Service` line is needed: the listener is on demand. `stop` ends it.
+- [V] The course of a simulated fix is not passed on: a fix with course 90 logs `course, -1.0`.
+
+### 6.3 L2: Wi-Fi positioning
+
+- [V] Internet: ue0 is the primary interface (router 192.168.7.1, DNS 1.1.1.1, 8.8.8.8); `nc -z gs-loc.apple.com 443` works.
+- [V] Apple's location server answers this not-activated phone: `@AlsFlow, request, tag, 0, wifi, 1, surrounding, 100`,
+  CFNetwork `status 200`, `transaction_duration_ms=855`, interface ue0, `@AlsFlow, reply, tag, 0, wifi, rtt, 0.9, aps, 1`.
+- [V] wifid scans for locationd: `Async scan requested by "locationd"`, `found 64 networks`; locationd gets
+  `WifiMgr, onWiFiDeviceClientScanCallback, error, 0, valid, 1, count, 64`.
+- [V] Blocker: `WifiScan, addAps, scan, returned, 64, unique, 1, insert, 1, keep, 0, error, 0, stale, 63`. Debug lines
+  (`oslogstream -l -g "WifiScan, add" locationd`): `WifiScan, addAp, 2, stale, <private>, age, 368.709s, max 5.000s`, and
+  19 s later the same APs at 387 s. locationd keeps only APs younger than 5 s.
+- [V] Why: Wi-Fi is joined (`JOIN associated (SSID of 15 bytes) AID 2` at 19:36:45). `negroni_wlan_scan()` (patch 0326)
+  returns EBUSY when the link state is not IDLE/SCANNING; `nwios_scan()` (0340) then answers with the last list:
+  `NEGRONI WLAN iOS: scan refused by the driver (error 16): answering with the last list` (77 times in
+  logs/usblog-20261027-171256.txt). The ages are right (0341 `age_ms` = now - `seen_ms`), but no BSS except the joined
+  one gets a new `seen_ms`. The one fresh AP is not in Apple's database (`AlsWifi, unknown`), so `@ClxWifi, Fix, 0, ll, N/A`.
+- Not fixable on the iOS side: locationd's 5 s limit is in its code; a fake list through `setWifiScanResults:` would need
+  fresh data from the same kernel. No code was added for L2; the kernel line above is the one "off" line.
+- Fix (kernel Wi-Fi, not this session): scan while joined. ath11k sends WMI_START_SCAN on the STA vdev while
+  associated (firmware does the off-channel dwell and returns to the home channel); our driver can let
+  `negroni_wlan_scan()` go on in the joined state with the scan state machine not touching `g_link.state`. Test: with Wi-Fi
+  joined, `stale` in `WifiScan, addAps` drops from 63 to ~0 and `@ClxWifi, Fix, 1` follows. [I] With Wi-Fi not joined the
+  driver scans for real (state IDLE), so a fix should come then already; not tested (other agents use Wi-Fi now).
+
+### 6.4 negroni-locd input interface (for a later kernel GNSS source)
+
+The modem GNSS work (path C) is another agent's. Nothing is agreed; negroni-locd only keeps one clean input:
+
+- Record: `struct nl_fix { lat, lon, hacc, alt, vacc, speed, course }` (degrees WGS-84, m, m, m, m/s, degrees; `vacc -1` =
+  no altitude, `speed`/`course -1` = unknown). Every source fills it; `fix_deliver()` is the only output (a `CLLocation` with
+  the delivery time into `CLSimulationManager`). Fixes reach apps as `isSimulatedBySoftware = 1`.
+- Text form, one fix per line: `LAT LON [HACC [ALT VACC [SPEED COURSE]]]` (2, 3, 5 or 7 fields, spaces or tabs), or `stop`.
+  Range checks: LAT -90..90, LON -180..180, 0 < HACC <= 100000, VACC -1 or 0 < VACC <= 100000 with ALT -1000..100000,
+  SPEED -1 or 0..1000, COURSE -1 or 0..360. Bad lines are logged (`bad line ignored`) and dropped.
+- Today's transport: UDP `listen` (192.168.7.2:5155 from 192.168.7.1). [V] `12.9716 77.5946 25 920 15 1.5 90` gives
+  `ClxSimulated, Fix, 1, ... acc, 25.00`.
+- For a kernel source, the simplest contract: the kernel gives the same text lines (a character device or a sysctl
+  string), one line per new fix, only when the fix is valid and fresh; negroni-locd gets a second reader for it that
+  feeds `parse_fix()` -> `fix_deliver()`. With no source present it turns off with one log line (no-probes rule). The
+  time of the fix stays the delivery time (CoreLocation's simulation takes the `CLLocation` as given; a source must not
+  send old fixes).
+

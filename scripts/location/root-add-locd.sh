@@ -9,8 +9,8 @@
 #  3. only with LOCD_JOB=1: launchd job com.iosplus10.negroni-locd (listen on UDP 192.168.7.2:5155 for the
 #     Mac's "LAT LON ACC" lines) in /System/Library/xpc/launchd.plist (the only path launchd reads on these
 #     ports; scripts/fp/root-add-fpd.sh does the same). Default: no job, so nothing runs at boot.
-# The Location Services switch itself is a separate, optional root tweak: LOCATION_SWITCH=1 for
-# scripts/ios16/root-tweaks-extra.py.
+# The Location Services switch itself is a separate root tweak: scripts/ios16/root-tweaks-extra.py item 7
+# (default on; LOCATION_SWITCH=0 leaves it off).
 set -eu
 R=${1:?usage: LOCD=1 [LOCD_JOB=1] $0 MOUNTED_ROOT}
 if [ "${LOCD:-0}" != 1 ]; then echo "locd: skipped (LOCD=1 adds negroni-locd, docs/location-plan.md)"; exit 0; fi

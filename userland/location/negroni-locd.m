@@ -3,7 +3,7 @@
  *
  *   negroni-locd set LAT LON [ACC]       one position (ACC = horizontal accuracy in m, default 10), then exit
  *   negroni-locd hold LAT LON [ACC]      the same, but stay and send the position again every -r seconds
- *   negroni-locd listen [PORT]           read "LAT LON [ACC]" lines (or "stop") from UDP PORT (default 5155)
+ *   negroni-locd listen [PORT]           read fix lines (or "stop") from UDP PORT (default 5155)
  *   negroni-locd stop                    end a running listener (pid file) and stop the simulation
  *   negroni-locd enable | disable        Location Services switch (+[CLLocationManager setLocationServicesEnabled:])
  *   negroni-locd status                  +[CLLocationManager locationServicesEnabled], listener pid
@@ -21,8 +21,19 @@
  * locationd mach service com.apple.locationd.simulation. locationd accepts the connection only if the client
  * has the entitlement com.apple.locationd.simulation = true ([V] 20H392 locationd: valueForEntitlement: +
  * NSNumber boolValue check before the "unentitled client attempting to simulate location" log line).
- * Call order stop/clear/append/flush/start: [I] (the order Xcode's location simulation is said to use).
+ * Call order stop/clear/append/flush/start: [V] on the phone 2026-10-27 (ClxSimulated fixes every 1 s after one set).
+ * enable/disable: locationd's CLInternalService SPI accepts setLocationServicesEnabled only with the entitlement
+ * com.apple.locationd.authorizeapplications ([V] 20H392, the same one Preferences.app has); else it logs
+ * "#Spi, connecting process isn't entitled, they shall not pass".
  * Signed ad hoc with entitlements.plist (userland/location/build.sh). Our own code.
+ *
+ * Input interface (docs/location-plan.md section 6): every source makes a struct nl_fix and calls fix_deliver().
+ * The text form of a fix, one per line (UDP today; a later kernel GNSS source can give the same lines):
+ *   LAT LON [HACC [ALT VACC [SPEED COURSE]]]
+ *   LAT -90..90, LON -180..180 (degrees, WGS-84); HACC m (0 < HACC <= 100000, default 10); ALT m above sea level
+ *   with VACC m (VACC -1 = no altitude, the default); SPEED m/s (-1 = unknown) and COURSE degrees 0..360
+ *   (-1 = unknown). Fields are separated by spaces or tabs; "stop" ends the simulation. The timestamp is the
+ *   time of delivery (CoreLocation's simulation takes the CLLocation as it is; a source sends fresh fixes only).
  */
 #import <Foundation/Foundation.h>
 #import <CoreLocation/CoreLocation.h>   /* types and method declarations only; no class is linked */
@@ -105,40 +116,60 @@ sim_new(void)
 	return [[c alloc] init];
 }
 
+/* one position fix, whatever its source (the input interface; see the header comment) */
+struct nl_fix {
+	double lat, lon, hacc;  /* degrees, degrees, m */
+	double alt, vacc;       /* m; vacc -1 = no altitude */
+	double speed, course;   /* m/s, degrees; -1 = unknown */
+};
+
 static int
-parse_pos(const char *s1, const char *s2, const char *s3, double *lat, double *lon, double *acc)
+num(const char *s, double *v)
 {
 	char *e;
-	*lat = strtod(s1, &e);
-	if (*e || e == s1) return -1;
-	*lon = strtod(s2, &e);
-	if (*e || e == s2) return -1;
-	*acc = 10;
-	if (s3) {
-		*acc = strtod(s3, &e);
-		if (*e || e == s3) return -1;
-	}
-	if (!isfinite(*lat) || !isfinite(*lon) || !isfinite(*acc)) return -1;
-	if (*lat < -90 || *lat > 90 || *lon < -180 || *lon > 180 || *acc <= 0 || *acc > 100000) return -1;
+	*v = strtod(s, &e);
+	return (*e || e == s || !isfinite(*v)) ? -1 : 0;
+}
+
+/* n text fields (2, 3, 5 or 7) in the order LAT LON HACC ALT VACC SPEED COURSE -> *f; 0 or -1 */
+static int
+parse_fix(char *const *t, int n, struct nl_fix *f)
+{
+	*f = (struct nl_fix){ .hacc = 10, .vacc = -1, .speed = -1, .course = -1 };
+	if (n != 2 && n != 3 && n != 5 && n != 7) return -1;
+	if (num(t[0], &f->lat) || num(t[1], &f->lon)) return -1;
+	if (n >= 3 && num(t[2], &f->hacc)) return -1;
+	if (n >= 5 && (num(t[3], &f->alt) || num(t[4], &f->vacc))) return -1;
+	if (n >= 7 && (num(t[5], &f->speed) || num(t[6], &f->course))) return -1;
+	if (f->lat < -90 || f->lat > 90 || f->lon < -180 || f->lon > 180 || f->hacc <= 0 || f->hacc > 100000) return -1;
+	if (f->vacc != -1 && (f->vacc <= 0 || f->vacc > 100000 || f->alt < -1000 || f->alt > 100000)) return -1;
+	if (f->speed != -1 && (f->speed < 0 || f->speed > 1000)) return -1;
+	if (f->course != -1 && (f->course < 0 || f->course > 360)) return -1;
 	return 0;
 }
 
+static int
+fix_same(const struct nl_fix *a, const struct nl_fix *b)
+{
+	return memcmp(a, b, sizeof *a) == 0;
+}
+
 static id
-make_location(double lat, double lon, double acc)
+make_location(const struct nl_fix *f)
 {
 	Class c = NSClassFromString(@"CLLocation");
 	CLLocationCoordinate2D co;
-	co.latitude = lat;
-	co.longitude = lon;
-	/* altitude unknown: verticalAccuracy -1; course and speed unknown: -1 */
-	return [[c alloc] initWithCoordinate:co altitude:0 horizontalAccuracy:acc verticalAccuracy:-1
-	                              course:-1 speed:-1 timestamp:[NSDate date]];
+	co.latitude = f->lat;
+	co.longitude = f->lon;
+	return [[c alloc] initWithCoordinate:co altitude:(f->vacc > 0 ? f->alt : 0) horizontalAccuracy:f->hacc
+	                    verticalAccuracy:f->vacc course:f->course speed:f->speed timestamp:[NSDate date]];
 }
 
+/* the one output: a fix into locationd's simulation service */
 static void
-sim_send(id<NLSimManager> m, double lat, double lon, double acc, int quiet)
+fix_deliver(id<NLSimManager> m, const struct nl_fix *f, int quiet)
 {
-	id loc = make_location(lat, lon, acc);
+	id loc = make_location(f);
 	[m stopLocationSimulation];
 	[m clearSimulatedLocations];
 	[m appendSimulatedLocation:loc];
@@ -146,7 +177,7 @@ sim_send(id<NLSimManager> m, double lat, double lon, double acc, int quiet)
 	[m startLocationSimulation];
 	[m flush];
 	if (!quiet)
-		say("position %.7f %.7f acc %.1f m sent", lat, lon, acc);
+		say("position %.7f %.7f acc %.1f m sent", f->lat, f->lon, f->hacc);
 }
 
 static void
@@ -221,15 +252,15 @@ sigsetup(void)
 }
 
 static int
-cmd_hold(id<NLSimManager> m, double lat, double lon, double acc)
+cmd_hold(id<NLSimManager> m, const struct nl_fix *f)
 {
 	pidfile_write();
 	sigsetup();
-	sim_send(m, lat, lon, acc, 0);
+	fix_deliver(m, f, 0);
 	while (!quit) {
 		if (opt_repeat <= 0) { pause(); continue; }
 		usleep((useconds_t)(opt_repeat * 1e6));
-		if (!quit) @autoreleasepool { sim_send(m, lat, lon, acc, 1); }
+		if (!quit) @autoreleasepool { fix_deliver(m, f, 1); }
 	}
 	if (!opt_keep) sim_stop(m);
 	unlink(PIDFILE);
@@ -280,7 +311,7 @@ cmd_listen(id<NLSimManager> m, int port)
 	say("listening on udp %s:%d (from %s), repeat %.1f s", opt_addr, port, opt_src, opt_repeat);
 
 	int have = 0;
-	double lat = 0, lon = 0, acc = 0;
+	struct nl_fix cur;
 	struct timespec last = {0, 0};
 	while (!quit) @autoreleasepool {
 		fd_set rs;
@@ -304,19 +335,21 @@ cmd_listen(id<NLSimManager> m, int port)
 				/* the last valid line of the datagram wins */
 				char *save = NULL, *line;
 				int got = 0, stop = 0;
-				double la = 0, lo = 0, ac = 0;
+				struct nl_fix nf, in;
 				for (line = strtok_r(buf, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save)) {
-					char a1[64], a2[64], a3[64];
-					int k = sscanf(line, "%63s %63s %63s", a1, a2, a3);
-					if (k >= 1 && strcmp(a1, "stop") == 0) { stop = 1; got = 0; continue; }
-					if (k >= 2 && parse_pos(a1, a2, k >= 3 ? a3 : NULL, &la, &lo, &ac) == 0) { got = 1; stop = 0; }
-					else if (k >= 1) say("bad line ignored: %.80s", line);
+					char copy[256], *t[8], *s2 = NULL, *w;
+					int k = 0;
+					strlcpy(copy, line, sizeof copy);
+					for (w = strtok_r(copy, " \t", &s2); w && k < 8; w = strtok_r(NULL, " \t", &s2)) t[k++] = w;
+					if (k == 1 && strcmp(t[0], "stop") == 0) { stop = 1; got = 0; continue; }
+					if (k > 0 && k < 8 && parse_fix(t, k, &in) == 0) { nf = in; got = 1; stop = 0; }
+					else if (k > 0) say("bad line ignored: %.80s", line);
 				}
 				if (stop && have) { sim_stop(m); have = 0; }
 				if (got) {
-					int moved = !have || la != lat || lo != lon || ac != acc;
-					lat = la; lon = lo; acc = ac; have = 1;
-					sim_send(m, lat, lon, acc, !moved);
+					int moved = !have || !fix_same(&nf, &cur);
+					cur = nf; have = 1;
+					fix_deliver(m, &cur, !moved);
 					clock_gettime(CLOCK_MONOTONIC, &last);
 				}
 			}
@@ -325,7 +358,7 @@ cmd_listen(id<NLSimManager> m, int port)
 			struct timespec now;
 			clock_gettime(CLOCK_MONOTONIC, &now);
 			double dt = (now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
-			if (dt >= opt_repeat) { sim_send(m, lat, lon, acc, 1); last = now; }
+			if (dt >= opt_repeat) { fix_deliver(m, &cur, 1); last = now; }
 		}
 	}
 	close(fd);
@@ -371,11 +404,11 @@ main(int argc, char **argv)
 		const char *cmd = argv[0];
 		int is_set = strcmp(cmd, "set") == 0, is_hold = strcmp(cmd, "hold") == 0;
 		int is_listen = strcmp(cmd, "listen") == 0;
-		double lat = 0, lon = 0, acc = 0;
+		struct nl_fix fix;
 		int port = DEF_PORT;
 		/* check every argument before CoreLocation, XPC or libdispatch are used: -b forks below */
 		if (is_set || is_hold) {
-			if (argc < 3 || argc > 4 || parse_pos(argv[1], argv[2], argc == 4 ? argv[3] : NULL, &lat, &lon, &acc)) {
+			if (argc < 3 || argc > 4 || parse_fix(argv + 1, argc - 1, &fix)) {
 				fprintf(stderr, "negroni-locd: %s LAT LON [ACC]: LAT -90..90, LON -180..180, ACC 0..100000 m\n", cmd);
 				return 2;
 			}
@@ -425,8 +458,8 @@ main(int argc, char **argv)
 			return perm;
 		}
 		if (is_set || is_hold) {
-			if (is_hold) return cmd_hold(m, lat, lon, acc);
-			sim_send(m, lat, lon, acc, 0);
+			if (is_hold) return cmd_hold(m, &fix);
+			fix_deliver(m, &fix, 0);
 			usleep(300000);   /* let the XPC messages leave before exit */
 			return 0;
 		}

@@ -13,7 +13,8 @@
 #   scripts/location/phone-location.sh enable|disable  Location Services switch through CoreLocation (L0 fallback)
 #   scripts/location/phone-location.sh status          switch state, listener pid, the daemon log tail
 #   scripts/location/phone-location.sh log             live unified log of locationd + negroni-locd
-# A stream from another program: send UDP lines "LAT LON ACC" (or "stop") to 192.168.7.2:5155 from 192.168.7.1,
+# A stream from another program: send UDP lines "LAT LON [HACC [ALT VACC [SPEED COURSE]]]" (or "stop") to
+# 192.168.7.2:5155 from 192.168.7.1 (format: docs/location-plan.md section 6.4),
 # e.g. printf '48.8584 2.2945 10\n' | nc -u -w0 192.168.7.2 5155
 # The root is mounted writable (rootrw=1). Needs userland/location/build.sh output and scripts/net/ssh-phone.sh.
 # Never writes a partition. Nothing here starts at boot (root hook: scripts/location/root-add-locd.sh).
@@ -64,5 +65,5 @@ status)
   need; ph "$BIN status; echo '--- $LOGF (last 20 lines)'; tail -n 20 $LOGF 2>/dev/null || echo 'no log yet'" ;;
 log)
   exec "$REPO/scripts/net/phone-log.sh" locationd negroni-locd ;;
-*) sed -n 2,22p "$0"; exit 2 ;;
+*) sed -n 2,20p "$0"; exit 2 ;;
 esac
