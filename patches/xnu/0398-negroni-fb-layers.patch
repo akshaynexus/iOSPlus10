@@ -1,0 +1,610 @@
+diff --git a/iokit/Kernel/arm/NegroniFramebuffer.cpp b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+index cc6f38a..cee8ada 100644
+--- a/iokit/Kernel/arm/NegroniFramebuffer.cpp
++++ b/iokit/Kernel/arm/NegroniFramebuffer.cpp
+@@ -652,6 +652,30 @@ public:
+ 	bool          fGpuBehind;     /* 0389: GPU copy into a back buffer behind newer GPU work (needs 0269 dbuf) */
+ 	uint32_t      fStatBehind;    /* 0389: frames so copied this second (the CPU copy before) */
+ 	uint64_t      fBehindFrames;
++	/*
++	 * 0398: IOMobileFramebuffer layers (negronifb_layers, default 1). A SwapEnd names only the layers
++	 * it changes (+0x104; +0x108: those of them turned off); the others keep what they showed. The
++	 * state below is that per-layer picture (under fLock); a frame of several layers is composed by
++	 * the CPU, layer 0 at the bottom, premultiplied source-over (work loop: fLyrRow, fLyr*Logged).
++	 */
++	bool          fLayersKeep;
++	uint32_t      fLyrId[NEGRONI_FB_LAYERS];      /* the surface id each layer shows (0: off) */
++	uint8_t       fLyrA[NEGRONI_FB_LAYERS][16], fLyrB[NEGRONI_FB_LAYERS][16];     /* its source / display rects */
++	uint32_t      fLyrFence[NEGRONI_FB_LAYERS];   /* its swap-time GPU fence (0254) */
++	NegroniSurface *fLyrHold[NEGRONI_FB_LAYERS];  /* retained and held in use while the layer shows it */
++	uint32_t     *fLyrRow;        /* one composed panel row */
++	uint8_t      *fLyrKind;       /* per panel row: how compose() writes it (GPU from a layer, or the CPU) */
++	IOMobileFramebufferUserClient *fLyrOwner;     /* the client whose swaps set the layers (compared only) */
++	uint64_t      fComposedGPU;   /* composed frames with GPU copies of the clear / opaque row runs */
++	uint32_t      fLyrRefused[8], fLyrRefusedN;   /* unsupported layer configurations already logged */
++	uint64_t      fComposed;      /* frames composed from several layers */
++	bool          composeFrame(const uint8_t *rec);
++	bool          compose(const uint8_t *rec, const uint32_t *fences, NegroniSurface *const *held, uint32_t shiftPx,
++	    bool *shifted, uint32_t *gpuFence);
++	void          layersOwner(IOMobileFramebufferUserClient *client, bool closing);
++	void          composeRefuse(uint32_t layer, NegroniSurface *s, uint32_t key, const char *why);
++	void          layersMerge(const uint8_t *rec, uint8_t *out, uint32_t *fences, uint32_t *touched);
++	void          layersReset(void);
+ 	bool          fFinishPending; /* present() left its CPU drawing (shift, badges) to presentFinish() */
+ 	bool          fFinishTop;     /* that frame rewrote the status bar's left ear */
+ 	uint32_t      fFinishFence;   /* that frame's GPU copy */
+@@ -1012,6 +1036,23 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("NEGRONI FB: 0389 GPU copy behind newer GPU work %s\n", fGpuBehind ? "on (into a back buffer)" :
+ 		    behind == 0 ? "off (negronifb_gpubehind=0)" : "off: needs the panel double buffer (0269, negronifb_dbuf=1)");
+ 	}
++	{
++		/*
++		 * 0398: CoreAnimation "detaches" a full-screen opaque layer (Maps' VectorKit CAMetalLayer) onto its own
++		 * IOMFB layer: the app's drawable on layer 0, backboardd's framebuffer with a clear hole over it on layer
++		 * 1 (QuartzCore 20H392 IOMFBDisplay::detach_layer / finish_update), and swaps only the layer that
++		 * changed. One layer at a time, as copied before, put the framebuffer's clear hole (black) or the map
++		 * without the UI on the panel. Self-check: one panel row (and one byte per row) of memory for the composition.
++		 * negronifb_layers=0: off (each swap's own layers, copied in order, as before).
++		 */
++		uint32_t layers = 1;
++		PE_parse_boot_argn("negronifb_layers", &layers, sizeof(layers));
++		fLyrRow = layers != 0 ? (uint32_t *)IOMallocData((vm_size_t)fWidth * 4) : NULL;
++		fLyrKind = fLyrRow != NULL ? (uint8_t *)IOMallocData((vm_size_t)fHeight) : NULL;
++		fLayersKeep = fLyrRow != NULL && fLyrKind != NULL;
++		IOLog("NEGRONI FB: 0398 IOMFB layers %s\n", fLayersKeep ? "on (kept across swaps, several composed: mixed rows by the CPU, clear or opaque runs by the GPU)" :
++		    layers == 0 ? "off (negronifb_layers=0)" : "off: no memory for a panel row");
++	}
+ 	teInit();
+ 	if (fIntf == 0 && fMdss == 0) {
+ 		/* 0268: the wake check reads the TE counter (negroni_fb_te_check) */
+@@ -2116,6 +2157,104 @@ AppleCLCD::removeClient(IOMobileFramebufferUserClient *client)
+ 		fClients->removeObject(i);
+ 	}
+ 	IOLockUnlock(fLock);
++	layersOwner(client, true);      /* 0398: the render server went away: its layers with it */
++}
++
++/*
++ * 0398: the layers belong to the client that swaps them. Its close, or swaps from another client (a new
++ * render server while another process keeps the framebuffer open), turn every layer off first, so no
++ * layer of a dead render server stays on the panel or keeps its surface. SwapEnd / clientClose.
++ */
++void
++AppleCLCD::layersOwner(IOMobileFramebufferUserClient *client, bool closing)
++{
++	bool reset;
++
++	if (!fLayersKeep) {
++		return;
++	}
++	IOLockLock(fLock);
++	reset = closing ? fLyrOwner == client : fLyrOwner != client;
++	if (reset) {
++		fLyrOwner = closing ? NULL : client;
++	}
++	IOLockUnlock(fLock);
++	if (reset) {
++		layersReset();
++	}
++}
++
++/* 0398: every layer off; the surfaces they held go back to their owners. */
++void
++AppleCLCD::layersReset(void)
++{
++	NegroniSurface *old[NEGRONI_FB_LAYERS];
++
++	IOLockLock(fLock);
++	memcpy(old, fLyrHold, sizeof(old));
++	bzero(fLyrHold, sizeof(fLyrHold));
++	bzero(fLyrId, sizeof(fLyrId));
++	bzero(fLyrFence, sizeof(fLyrFence));
++	IOLockUnlock(fLock);
++	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++		if (old[layer] != NULL) {
++			negroni_surface_hold(old[layer], false);
++			old[layer]->release();
++		}
++	}
++}
++
++/*
++ * 0398: rec (a SwapEnd) applied to the per-layer state; out = the whole picture as a swap record:
++ * every layer that shows something in +0x54/+0x64/+0xc4 and +0x104, +0x108 cleared. fences: the
++ * swap-time GPU fence of each layer this swap did not change (the one it was set with; the surface's
++ * gpuFence names newer work by now). touched: the layers rec changed. Not in the work loop.
++ */
++void
++AppleCLCD::layersMerge(const uint8_t *rec, uint8_t *out, uint32_t *fences, uint32_t *touched)
++{
++	uint32_t mask = get32(rec, 0x104) & ((1u << NEGRONI_FB_LAYERS) - 1), off = get32(rec, 0x108), all = 0;
++	NegroniSurface *add[NEGRONI_FB_LAYERS] = {}, *old[NEGRONI_FB_LAYERS] = {};
++
++	/* surface lookups outside fLock (the surface registry has a lock of its own) */
++	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if ((mask & (1u << layer)) && !(off & (1u << layer)) && id != 0) {
++			add[layer] = negroni_surface_copy(id);
++			if (add[layer] != NULL) {
++				negroni_surface_hold(add[layer], true);
++			}
++		}
++	}
++	memcpy(out, rec, NEGRONI_FB_SWAP_REC_SIZE);
++	IOLockLock(fLock);
++	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++		if (mask & (1u << layer)) {
++			bool on = !(off & (1u << layer));
++			old[layer] = fLyrHold[layer];
++			fLyrHold[layer] = add[layer];
++			fLyrId[layer] = on ? get32(rec, 0x54 + 4 * layer) : 0;
++			fLyrFence[layer] = add[layer] != NULL ? add[layer]->gpuFence : 0;
++			memcpy(fLyrA[layer], rec + 0x64 + 16 * layer, 16);
++			memcpy(fLyrB[layer], rec + 0xc4 + 16 * layer, 16);
++		}
++		uint32_t id = fLyrId[layer];
++		memcpy(out + 0x54 + 4 * layer, &id, 4);
++		memcpy(out + 0x64 + 16 * layer, fLyrA[layer], 16);
++		memcpy(out + 0xc4 + 16 * layer, fLyrB[layer], 16);
++		fences[layer] = fLyrFence[layer];
++		all |= id != 0 ? 1u << layer : 0;
++	}
++	IOLockUnlock(fLock);
++	memcpy(out + 0x104, &all, 4);
++	bzero(out + 0x108, 4);
++	*touched = mask;
++	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++		if (old[layer] != NULL) {
++			negroni_surface_hold(old[layer], false);
++			old[layer]->release();
++		}
++	}
+ }
+ 
+ static uint32_t
+@@ -2137,9 +2276,17 @@ static uint64_t negroni_fb_swap_count;
+  * default 10 Hz).
+  */
+ void
+-AppleCLCD::swap(const uint8_t *rec)
++AppleCLCD::swap(const uint8_t *swapRec)
+ {
+ 	NegroniSurface *held[NEGRONI_FB_LAYERS] = {}, *dropped[NEGRONI_FB_LAYERS];
++	uint8_t merged[NEGRONI_FB_SWAP_REC_SIZE];
++	uint32_t keptFences[NEGRONI_FB_LAYERS] = {}, touched = ~0u;
++	const uint8_t *rec = swapRec;
++	if (fLayersKeep) {
++		/* 0398: the whole picture (this swap's layers and the ones it left as they were) */
++		layersMerge(swapRec, merged, keptFences, &touched);
++		rec = merged;
++	}
+ 	uint32_t mask = get32(rec, 0x104);
+ 	NegroniSurface *zc = zeroCopySurface(rec);       /* retained, or NULL */
+ 	bool gpu = zc == NULL && NegroniGPUPresentReady() && mask != 0;
+@@ -2186,12 +2333,14 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			continue;
+ 		}
+ 		NegroniSurface *s = held[layer] != NULL ? held[layer] : negroni_surface_copy(id);
++		/* 0398: a layer this swap left as it was: the fence it was set with */
++		uint32_t f = s == NULL ? 0 : (touched & (1u << layer)) ? s->gpuFence : keptFences[layer];
+ 		if (s != NULL && s != fSurface) {
+-			pendFences[layer] = s->gpuFence;
++			pendFences[layer] = f;
+ 		}
+-		if (s != NULL && s != fSurface && s->gpuFence != 0 &&
+-		    (pendFence == 0 || (int32_t)(s->gpuFence - pendFence) > 0)) {
+-			pendFence = s->gpuFence;
++		if (s != NULL && s != fSurface && f != 0 &&
++		    (pendFence == 0 || (int32_t)(f - pendFence) > 0)) {
++			pendFence = f;
+ 			pendSurface = s->id;
+ 		}
+ 		if (s != held[layer]) {
+@@ -2773,6 +2922,372 @@ negroni_fp_finger_down(void)
+ }
+ 
+ 
++/* 0398: a frame (a merged swap record) of two or more layers, none of them the panel memory itself */
++bool
++AppleCLCD::composeFrame(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104), n = 0;
++
++	if (!fLayersKeep) {
++		return false;
++	}
++	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		if (fSurface != NULL && id == fSurface->id) {
++			return false;
++		}
++		n++;
++	}
++	return n > 1;
++}
++
++/* 0398: one line per layer configuration the composition cannot take (8 at most) */
++void
++AppleCLCD::composeRefuse(uint32_t layer, NegroniSurface *s, uint32_t key, const char *why)
++{
++	for (uint32_t i = 0; i < fLyrRefusedN; i++) {
++		if (fLyrRefused[i] == key) {
++			return;
++		}
++	}
++	if (fLyrRefusedN >= sizeof(fLyrRefused) / sizeof(fLyrRefused[0])) {
++		return;
++	}
++	fLyrRefused[fLyrRefusedN++] = key;
++	IOLog("NEGRONI FB: 0398 layer %u not composed: %s (surface %u %ux%u fmt 0x%x bpe %u planes %u); the frame "
++	    "is composed without it\n", layer, why, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
++	    s->planeCount);
++}
++
++/* premultiplied source-over: s over d, per 8-bit channel */
++static inline uint32_t
++negroni_over(uint32_t s, uint32_t d)
++{
++	uint32_t a = s >> 24, ia, o = 0;
++
++	if (a == 255) {
++		return s;
++	}
++	if (s == 0) {
++		return d;
++	}
++	ia = 255 - a;
++	for (uint32_t c = 0; c < 32; c += 8) {
++		uint32_t v = ((s >> c) & 0xff) + (((d >> c) & 0xff) * ia + 127) / 255;
++		o |= (v > 255 ? 255 : v) << c;
++	}
++	return o;
++}
++
++/* 0398: one layer of a composed frame */
++struct NegroniComposeLayer {
++	NegroniSurface *s;
++	uintptr_t       base;           /* first pixel of the source rect */
++	uint32_t        bpr;
++	uint32_t        sx, sy;         /* the source rect's surface position */
++	uint32_t        layer;
++	uint32_t        ah;             /* the source rect's rows */
++	bool            gpuWritten;     /* the CPU drops its cache lines of the rows it reads (NegroniGPUSurfaceForCPU) */
++	int32_t         px, py;         /* panel position of the display rect (may be off the panel) */
++	int32_t         x0, x1, y0, y1; /* its part on the panel */
++	uint32_t        stepX, stepY;   /* source pixels per panel pixel, 16.16 */
++	bool            scaled;
++};
++
++#define NEGRONI_FB_ROW_CPU      0       /* fLyrKind: the CPU composes the row */
++#define NEGRONI_FB_ROW_LOWER    1       /* the upper layer is clear in the whole row: a GPU copy of the lower one */
++#define NEGRONI_FB_ROW_UPPER    2       /* the upper layer is opaque in the whole row: a GPU copy of it */
++#define NEGRONI_FB_COMPOSE_MIN_ROWS     8       /* shorter clear / opaque runs: the CPU (one submission less) */
++#define NEGRONI_FB_COMPOSE_SUBMITS      8       /* GPU submissions per composed frame at most; the rest: the CPU */
++
++/*
++ * 0398: panel row y of a composed frame through r (one cached row): layer 0 at the bottom, each higher layer
++ * premultiplied source-over, nearest scaling, black where no layer is; then written once into d (the 0267 /
++ * 0391 clock shift on the band rows). true: the row was shifted.
++ */
++static bool
++negroni_compose_row(uint32_t *r, uint8_t *d, uint32_t W, uint32_t y, const struct NegroniComposeLayer *ly, uint32_t n,
++    uint32_t shiftPx, uint32_t top, uint32_t bottom, bool box)
++{
++	const uint32_t half = W / 2;
++	bool any = false;
++
++	for (uint32_t i = 0; i < n; i++) {
++		if ((int32_t)y < ly[i].y0 || (int32_t)y >= ly[i].y1) {
++			continue;
++		}
++		uint32_t srow = (uint32_t)(((uint64_t)((int32_t)y - ly[i].py) * ly[i].stepY) >> 16);
++		const uint32_t *sp = (const uint32_t *)(ly[i].base + (uintptr_t)srow * ly[i].bpr);
++		int32_t x0 = ly[i].x0, x1 = ly[i].x1;
++		if (!any) {
++			/* the lowest layer on this row: over black, a premultiplied pixel stays as it is */
++			if (x0 > 0) {
++				bzero(r, (size_t)x0 * 4);
++			}
++			if (x1 < (int32_t)W) {
++				bzero(r + x1, (size_t)(W - (uint32_t)x1) * 4);
++			}
++			if (!ly[i].scaled) {
++				memcpy(r + x0, sp + (x0 - ly[i].px), (size_t)(x1 - x0) * 4);
++			} else {
++				for (int32_t x = x0; x < x1; x++) {
++					r[x] = sp[((uint64_t)(x - ly[i].px) * ly[i].stepX) >> 16];
++				}
++			}
++			any = true;
++		} else if (!ly[i].scaled) {
++			const uint32_t *q = sp + (x0 - ly[i].px);
++			for (int32_t x = x0; x < x1; x++, q++) {
++				r[x] = negroni_over(*q, r[x]);
++			}
++		} else {
++			for (int32_t x = x0; x < x1; x++) {
++				r[x] = negroni_over(sp[((uint64_t)(x - ly[i].px) * ly[i].stepX) >> 16], r[x]);
++			}
++		}
++	}
++	if (!any) {
++		bzero(r, (size_t)W * 4);
++	}
++	const uint8_t *rr = (const uint8_t *)r;
++	if (shiftPx > 0 && shiftPx < half && y >= top && y < bottom) {
++		if (box) {
++			/* 0391: the box n to the right, the n columns right of it into the opened gap */
++			memcpy(d, rr, (size_t)W * 4);
++			memcpy(d + (uint64_t)(NEGRONI_FB_CLOCK_BOX_LEFT + shiftPx) * 4, rr + (uint64_t)NEGRONI_FB_CLOCK_BOX_LEFT * 4,
++			    (size_t)(NEGRONI_FB_CLOCK_BOX_RIGHT - NEGRONI_FB_CLOCK_BOX_LEFT) * 4);
++			memcpy(d + (uint64_t)NEGRONI_FB_CLOCK_BOX_LEFT * 4, rr + (uint64_t)NEGRONI_FB_CLOCK_BOX_RIGHT * 4,
++			    (size_t)shiftPx * 4);
++		} else {
++			/* 0267: the left half n to the right, its last n pixels to the left edge */
++			memcpy(d + (uint64_t)shiftPx * 4, rr, (size_t)(half - shiftPx) * 4);
++			memcpy(d, rr + (uint64_t)(half - shiftPx) * 4, (size_t)shiftPx * 4);
++			memcpy(d + (uint64_t)half * 4, rr + (uint64_t)half * 4, (size_t)(W - half) * 4);
++		}
++		return true;
++	}
++	memcpy(d, rr, (size_t)W * 4);
++	return false;
++}
++
++/* 0398: NEGRONI_FB_ROW_LOWER if the n pixels at p are all clear (0), _UPPER if all opaque (alpha 255), else _CPU */
++static uint8_t
++negroni_compose_row_kind(const uint32_t *p, uint32_t n)
++{
++	uint64_t ors = 0, ands = ~0ull, v[4];
++	uint32_t x = 0;
++
++	for (; x + 8 <= n; x += 8) {
++		memcpy(v, p + x, sizeof(v));
++		ors |= v[0] | v[1] | v[2] | v[3];
++		ands &= v[0] & v[1] & v[2] & v[3];
++		if (ors != 0 && (ands & 0xff000000ff000000ull) != 0xff000000ff000000ull) {
++			return NEGRONI_FB_ROW_CPU;
++		}
++	}
++	for (; x < n; x++) {
++		ors |= p[x];
++		ands &= p[x] | 0xffffffff00000000ull;
++	}
++	if (ors == 0) {
++		return NEGRONI_FB_ROW_LOWER;
++	}
++	return (ands & 0xff000000ff000000ull) == 0xff000000ff000000ull ? NEGRONI_FB_ROW_UPPER : NEGRONI_FB_ROW_CPU;
++}
++
++/*
++ * 0398: the frame's layers composed into the panel buffer: layer 0 at the bottom (CoreAnimation puts a detached
++ * layer on 0 under its framebuffer on 1), each higher layer premultiplied source-over, nearest-pixel scaling when
++ * the source and display rects differ, black where no layer is. The CPU reads only the surfaces (cached), never
++ * the write-combined panel memory, and writes each panel row once (negroni_compose_row). shiftPx: the 0267 clock
++ * shift applied to the band rows on the way (0: none). Two unscaled full-panel layers, both GPU copies allowed
++ * (held, fence passed, as present()'s copy loop): the row runs where the upper layer is all clear or all opaque
++ * are GPU 2D copies of one layer (*gpuFence: the newest), the CPU composes only the mixed rows and the band.
++ * Only 32-bit BGRA single-plane surfaces; another layer is left out with one line (composeRefuse). Every panel
++ * row is written (0269 counts the frame as full). Work loop.
++ */
++bool
++AppleCLCD::compose(const uint8_t *rec, const uint32_t *fences, NegroniSurface *const *held, uint32_t shiftPx,
++    bool *shifted, uint32_t *gpuFence)
++{
++	struct NegroniComposeLayer ly[NEGRONI_FB_LAYERS];
++	uint32_t n = 0, mask = get32(rec, 0x104), used = 0, fence = 0, gpuRows = 0;
++
++	*gpuFence = 0;
++	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		NegroniSurface *s = negroni_surface_copy(id);
++		if (s == NULL) {
++			continue;               /* gone since the swap */
++		}
++		const uint8_t *a = rec + 0x64 + 16 * layer, *b = rec + 0xc4 + 16 * layer;
++		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4), aw = (int32_t)get32(a, 8), ah = (int32_t)get32(a, 12);
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4), bw = (int32_t)get32(b, 8), bh = (int32_t)get32(b, 12);
++		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		const char *why = NULL;
++		uintptr_t k = 0;
++		if (bw <= 0 || bh <= 0) {
++			bw = (int32_t)s->width;
++			bh = (int32_t)s->height;
++		}
++		if (aw <= 0 || ah <= 0) {
++			aw = bw;
++			ah = bh;
++		}
++		if (sx < 0 || sy < 0) {
++			sx = sy = 0;
++		}
++		if (bpe != 4 || s->elementWidth != 1 || s->elementHeight != 1 || s->planeCount > 1 ||
++		    (s->pixelFormat != 0x42475241 /* 'BGRA' */ && s->pixelFormat != 0)) {
++			why = "not 32-bit BGRA";
++		} else if ((uint64_t)sx + (uint64_t)aw > s->width || (uint64_t)sy + (uint64_t)ah > s->height || bw <= 0 || bh <= 0) {
++			why = "source rect outside the surface";
++		} else if (s->memory == NULL || (uint64_t)s->offset + (uint64_t)(sy + ah - 1) * s->bytesPerRow +
++		    (uint64_t)(sx + aw) * 4 > s->memory->getLength()) {
++			why = "source rect outside the memory";
++		} else if ((k = s->kernelAddress()) == 0) {
++			why = "no kernel mapping";
++		}
++		if (why != NULL) {
++			composeRefuse(layer, s, (layer << 28) ^ s->pixelFormat ^ (uint32_t)(uintptr_t)why, why);
++			s->release();
++			continue;
++		}
++		struct NegroniComposeLayer *l = &ly[n];
++		l->s = s;
++		l->bpr = s->bytesPerRow;
++		l->sx = (uint32_t)sx;
++		l->sy = (uint32_t)sy;
++		l->layer = layer;
++		l->base = k + s->offset + (uintptr_t)sy * s->bytesPerRow + (uintptr_t)sx * 4;
++		l->px = dx - fOffX;     /* logical (presented) display coordinates -> panel coordinates */
++		l->py = dy - fOffY;
++		l->x0 = l->px < 0 ? 0 : l->px;
++		l->y0 = l->py < 0 ? 0 : l->py;
++		l->x1 = l->px + bw > (int32_t)fWidth ? (int32_t)fWidth : l->px + bw;
++		l->y1 = l->py + bh > (int32_t)fHeight ? (int32_t)fHeight : l->py + bh;
++		l->scaled = aw != bw || ah != bh;
++		l->stepX = (uint32_t)(((uint64_t)aw << 16) / (uint64_t)bw);
++		l->stepY = (uint32_t)(((uint64_t)ah << 16) / (uint64_t)bh);
++		if (l->x0 >= l->x1 || l->y0 >= l->y1) {
++			s->release();
++			continue;               /* off the panel */
++		}
++		l->ah = (uint32_t)ah;
++		l->gpuWritten = fences[layer] != 0;     /* its swap-time fence passed */
++		used |= 1u << layer;
++		n++;
++	}
++
++	const uint32_t W = fWidth, H = fHeight, half = W / 2, top = negroni_clock_top(), bottom = negroni_clock_bottom();
++	const bool box = shiftPx > 0 && negroni_clock_box(W, shiftPx) && W >= NEGRONI_FB_CLOCK_BOX_RIGHT + shiftPx;
++	const bool band = shiftPx > 0 && shiftPx < half;
++	bool shiftedRows = false, gpu = n == 2 && held != NULL && NegroniGPUPresentReady();
++
++	/* the GPU copies of present()'s loop: held for the GPU, fence passed, behind newer work only into a back buffer */
++	for (uint32_t i = 0; gpu && i < n; i++) {
++		const struct NegroniComposeLayer *l = &ly[i];
++		uint32_t written = fences[l->layer];
++		bool behind = written != 0 && l->s->gpuFence != written && !NegroniGPUFenceDone(l->s->gpuFence);
++		gpu = !l->scaled && l->x0 == 0 && l->y0 == 0 && l->x1 == (int32_t)W && l->y1 == (int32_t)H &&
++		    held[l->layer] == l->s && written != 0 && NegroniGPUFenceDone(written) &&
++		    (!behind || (fGpuBehind && fDbuf && fDbTarget >= 0 && fDbTarget != fDbShown && fDbTarget != fDbFlipped &&
++		    negroni_badges <= 0 && negroni_fp_hl_show() == 0));
++	}
++	/* the GPU wrote them: none of the CPU's old lines over what it reads (the lower layer of a GPU frame: per CPU run) */
++	for (uint32_t i = 0; i < n; i++) {
++		if (ly[i].gpuWritten && !(gpu && i == 0)) {
++			NegroniGPUSurfaceForCPU(ly[i].s, (uint64_t)ly[i].s->offset + (uint64_t)ly[i].sy * ly[i].bpr,
++			    (uint64_t)ly[i].ah * ly[i].bpr);
++		}
++	}
++	memset(fLyrKind, NEGRONI_FB_ROW_CPU, H);
++	if (gpu) {
++		/* each row: the upper layer all clear, all opaque, or mixed (the band: the CPU shifts it) */
++		for (uint32_t y = 0; y < H; y++) {
++			if (!(band && y >= top && y < bottom)) {
++				const uint32_t *u = (const uint32_t *)(ly[1].base + (uintptr_t)((int32_t)y - ly[1].py) * ly[1].bpr) - ly[1].px;
++				fLyrKind[y] = negroni_compose_row_kind(u, W);
++			}
++		}
++		/* runs; short ones to the CPU */
++		for (uint32_t y = 0, y1; y < H; y = y1) {
++			for (y1 = y + 1; y1 < H && fLyrKind[y1] == fLyrKind[y]; y1++) {
++			}
++			if (fLyrKind[y] != NEGRONI_FB_ROW_CPU && y1 - y < NEGRONI_FB_COMPOSE_MIN_ROWS) {
++				memset(fLyrKind + y, NEGRONI_FB_ROW_CPU, y1 - y);
++			}
++		}
++		/* one layer's runs per submission (6 rects); a refused or capped submission: those rows to the CPU */
++		uint32_t submits = 0;
++		for (uint32_t i = 0; i < 2; i++) {
++			const struct NegroniComposeLayer *l = &ly[i];
++			const uint8_t kind = i == 0 ? NEGRONI_FB_ROW_LOWER : NEGRONI_FB_ROW_UPPER;
++			struct NegroniGPURect r[NEGRONI_GPU_PRESENT_RECTS];
++			uint32_t nr = 0;
++			for (uint32_t y = 0, y1; y <= H; y = y1) {
++				y1 = y + 1;
++				if (y < H && fLyrKind[y] == kind) {
++					for (; y1 < H && fLyrKind[y1] == kind; y1++) {
++					}
++					r[nr++] = { l->sx + (uint32_t)(-l->px), l->sy + (uint32_t)((int32_t)y - l->py), 0, y, W, y1 - y };
++				}
++				if (nr == NEGRONI_GPU_PRESENT_RECTS || (y >= H && nr > 0)) {
++					uint32_t f = submits < NEGRONI_FB_COMPOSE_SUBMITS ?
++					    NegroniGPUPresentRects(l->s, fDrawPhys, fRowBytes, H, r, nr) : 0;
++					submits++;
++					for (uint32_t j = 0; j < nr; j++) {
++						if (f == 0) {
++							memset(fLyrKind + r[j].dy, NEGRONI_FB_ROW_CPU, r[j].h);
++						} else {
++							gpuRows += r[j].h;
++						}
++					}
++					if (f != 0 && (fence == 0 || (int32_t)(f - fence) > 0)) {
++						fence = f;
++					}
++					nr = 0;
++				}
++			}
++		}
++		for (uint32_t y = 0, y1; ly[0].gpuWritten && y < H; y = y1) {
++			for (y1 = y + 1; y1 < H && fLyrKind[y1] == fLyrKind[y]; y1++) {
++			}
++			if (fLyrKind[y] == NEGRONI_FB_ROW_CPU) {
++				NegroniGPUSurfaceForCPU(ly[0].s, (uint64_t)ly[0].s->offset +
++				    (uint64_t)(ly[0].sy + (uint32_t)((int32_t)y - ly[0].py)) * ly[0].bpr, (uint64_t)(y1 - y) * ly[0].bpr);
++			}
++		}
++	}
++	for (uint32_t y = 0; y < H; y++) {
++		if (fLyrKind[y] == NEGRONI_FB_ROW_CPU) {
++			shiftedRows |= negroni_compose_row(fLyrRow, (uint8_t *)(fPixels + (uint64_t)y * fRowBytes), W, y, ly, n,
++			    shiftPx, top, bottom, box);
++		}
++	}
++	if (shiftedRows) {
++		*shifted = true;
++		fClockCopyCPU++;
++	}
++	*gpuFence = fence;
++	fComposedGPU += fence != 0;
++	if (fComposed++ == 0 || fComposed % 1000 == 0) {
++		IOLog("NEGRONI FB: 0398 %llu frames composed from several layers, %llu with GPU row copies (this one: layers "
++		    "0x%x of 0x%x, %u, %u of %u rows by the GPU)\n", fComposed, fComposedGPU, used,
++		    mask & ((1u << NEGRONI_FB_LAYERS) - 1), n, gpuRows, H);
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		ly[i].s->release();
++	}
++	return true;
++}
++
+ /*
+  * held: the frame's surfaces swap() holds for a GPU present (NULL entries: that layer, if any,
+  * goes the CPU way). fences: each layer's swap-time GPU fence (0254), done or given up when the
+@@ -2811,7 +3326,16 @@ AppleCLCD::present(const uint8_t *rec, NegroniSurface *const *held, const uint32
+ 		}
+ 	}
+ 
+-	for (uint32_t layer = 0; layer < NEGRONI_FB_LAYERS; layer++) {
++	/* 0398: several layers: composed row by row (every panel row written, the clock band shifted on the way) */
++	uint32_t composedFence = 0;
++	const bool composed = composeFrame(rec) &&
++	    compose(rec, fences, held, shiftPx < half ? shiftPx : 0, &shiftedInCopy, &composedFence);
++	if (composed) {
++		topRedrawn = true;
++		cpuCopied = true;
++		fence = composedFence;  /* the GPU row copies: the surfaces stay held and the buffer flips after it */
++	}
++	for (uint32_t layer = 0; !composed && layer < NEGRONI_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+ 		const uint8_t *b = rec + 0xc4 + 16 * layer;
+@@ -3551,6 +4075,8 @@ AppleCLCD::dbufTarget(const uint8_t *rec)
+ 		full = (int32_t)get32(b, 0) >= 0 && (int32_t)get32(b, 4) >= 0 && w > 0 && h > 0 && dx <= 0 && dy <= 0 &&
+ 		    w - cx >= (int32_t)fWidth && h - cy >= (int32_t)fHeight &&
+ 		    aw - cx >= (int32_t)fWidth && ah - cy >= (int32_t)fHeight;
++	} else if (!panel && layers > 1 && composeFrame(rec)) {
++		full = true;            /* 0398: the composition writes every panel row */
+ 	}
+ 	int32_t t = -1;
+ 	if (panel) {
+@@ -4004,6 +4530,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			break;
+ 		}
+ 		memcpy(rec, args->structureInput, sizeof(rec));
++		fFB->layersOwner(this, false);  /* 0398 */
+ 		fFB->swap(rec);
+ 		break;
+ 	}

@@ -1717,3 +1717,93 @@ Owner goal: smooth 120 Hz. Files: negroni_adreno.c (governor: TZ port, pacing fl
   (TZ may read non-secure memory; with the shm bridge enforced, TZ answers an error, then TZ off); UPDATE_V2/RESET take
   values only. All run in the watch thread (gpu_pm_lock is a mutex, interrupts on), as Linux runs them from the devfreq
   work. THIRD_PARTY_NOTICES.md section 10 (GPL-2.0-only).
+
+## 30. IOMFB layers kept across swaps and composed: Maps black (0398, `0398-negroni-fb-layers.patch`)
+
+Symptom (owner photo 2026-10-27 20:01): Apple Maps open. On the panel the map area is black; only the status-bar band
+(blurred map), the map/locate buttons, the location dot and the search sheet show. A render-server picture at the same
+time (`logs/shots/maps4.png`, negroni-shot = `CARenderServerRenderDisplay`) shows the full map. So Metal draws the map;
+it is lost between backboardd's display path and the panel.
+
+### Cause [V unless marked]
+- IOMobileFramebuffer 20H392 `kern_SwapSetLayer` (dyld cache, `ipsw dyld disass --symbol _kern_SwapSetLayer`): the swap
+  record is zeroed at SwapBegin; SetLayer(layer, surface) puts the id at +0x54+4*layer, sets bit `layer` in +0x104 and
+  clears it in +0x108; SetLayer(layer, NULL) sets the bit in **both** +0x104 and +0x108. So +0x104 = the layers this swap
+  changes, +0x108 = those of them turned off. A layer not in +0x104 keeps what it showed (a "turn off" mask would make no
+  sense otherwise).
+- QuartzCore 20H392 `IOMFBDisplay::finish_update` (0x1882d1540..) and `detach_layer` (0x18830ef38): while CA
+  "detaches" a layer (here Maps' full-screen opaque VectorKit CAMetalLayer, `kCADetachReasonCode*`), the app's drawable
+  goes on layer `[+0x611]` (default 0, `str wzr,[sp,#0x7c]`), backboardd's framebuffer on layer `[+0x610]` = 1 (with a
+  clear hole over the map; the status-bar backdrop is drawn into it, hence the blurred map band), and the third layer is
+  set to NULL (`w1 = (idx == 0) << 1`). `delete_detached_layer` puts the framebuffer back on `[+0x612]` (0) and sets flag
+  0x80, after which finish_update sets layers 1 and 2 to NULL. CA swaps a layer only when its surface changed (it keeps
+  the last id per layer at +0x884).
+- Our FB (0231..0389) treated each swap as the whole picture: only the layers in +0x104, copied in index order with no
+  blending. A swap of layer 1 alone (UI changed, map not) copied the framebuffer with its clear hole: black map (the
+  photo). A swap of layer 0 alone showed the map without the UI; both together: the hole (0x00000000) copied over the map.
+- Live check 2026-10-27 20:07 (no reboot; `uiopen maps://...`, usblog): `DBUF in-place` (0269: frames of several layers
+  or part of the panel) is 0 all day except while Maps draws (19:49: 84 in 23 s; 19:55-19:57; 20:04; 20:07:16-18 after
+  opening Maps 5/4/4 per second; 20:07:50-52 during a pan 3/7/3), while most Maps frames are single-layer flips.
+- No userland way out [V]: `CA_DISABLE_DETACHED` is a CA debug option; `init_debug` reads options only when
+  `CADeviceHasInternalBuild`, and `_XSetDebugOption` (CARenderServerSetDebugOption) needs an audit-token bit our client
+  does not get (a test client with `com.apple.QuartzCore.debug` read 0 -> 0 on the live server).
+  `IOMFBDisplay::supports_multiple_layers()` returns 1 unconditionally. The FB must implement the layer contract.
+
+### What 0398 does (NegroniFramebuffer.cpp only)
+1. `layersMerge()` (in `swap()`, before everything else): applies the swap to a per-layer state (`fLyrId`, rects,
+   swap-time fence, and the surface retained + held in use while the layer shows it, as a display holds a scanned-out
+   surface: the app cannot render into the map drawable on screen). The rest of swap() and the tick see the merged
+   record: every layer that shows something, +0x108 cleared. A layer the swap did not change keeps the GPU fence it was
+   set with (its `gpuFence` names newer work by then, 0254). The layers belong to the client that swaps them
+   (`layersOwner`): its close, or a swap from another client (a new backboardd while another process keeps the
+   framebuffer open), turns every layer off first (review fix: "last client closes" left a dead render server's
+   layers and surfaces on the panel when any other client kept the framebuffer open).
+2. `compose()` (present(), when the merged frame has 2+ layers and none is the panel memory): row by row through one
+   cached panel-row buffer: layer 0 at the bottom (copied; premultiplied over black = itself), each higher layer
+   premultiplied source-over (`negroni_over`: alpha 255 = copy, pixel 0 = skip, else per channel, saturated), nearest
+   scaling when the source and display rects differ, black where no layer is. The CPU reads only the surfaces (cache
+   lines of GPU-written ones dropped first, `NegroniGPUSurfaceForCPU`) and writes each panel row once; the 0267/0391
+   clock shift is done on the band rows on the way. Such a frame counts as "full" for 0269 (`dbufTarget`), so it goes
+   into a free back buffer and flips (before: drawn in place over the shown buffer). Every panel row is written, also
+   when no layer can be read (black; review fix: the old copy loop then wrote only part of a stale back buffer).
+   GPU row runs (review, for the Maps lag): two unscaled full-panel layers whose GPU copies present()'s loop would
+   allow (held, swap-time fence passed, behind newer GPU work only into a 0269 back buffer): each panel row is classed
+   by the upper layer (all clear / all opaque / mixed, 8 pixels per step); runs of 8+ clear rows are GPU 2D copies of
+   the lower layer, runs of opaque rows GPU copies of the upper one (`NegroniGPUPresentRects`, 6 rects per submission,
+   8 submissions per frame at most); the CPU composes only the mixed rows and the clock band (and any rows of a refused
+   submission). Output is the same pixels (clear = lower, opaque = upper). The lower layer's cache lines are dropped
+   only for the CPU rows. The buffer flips after the copies' fence; the surfaces stay held until then (keepBusy).
+3. Self-check / refusals: start needs one panel row of memory (`NEGRONI FB: 0398 IOMFB layers on|off: ...`). A layer
+   that is not 32-bit single-plane BGRA (or fmt 0), whose source rect is outside the surface or memory, or without a
+   kernel mapping is left out with one line per configuration (8 at most):
+   `NEGRONI FB: 0398 layer L not composed: <why> (surface ...)`. No layer readable -> a black frame (every row written).
+   Frames of one layer, the panel-memory layer (GetLayerDefaultSurface) and zero-copy are unchanged.
+4. Kill switch `negronifb_layers=0`: each swap's own layers copied in order, as before 0398.
+
+### Log lines
+- Boot: `NEGRONI FB: 0398 IOMFB layers on (kept across swaps, several composed: mixed rows by the CPU, clear or opaque
+  runs by the GPU)`.
+- First composed frame, then every 1000: `NEGRONI FB: 0398 N frames composed from several layers, M with GPU row copies
+  (this one: layers 0x3 of 0x3, 2, R of 2400 rows by the GPU)`.
+
+### Cost and risks [I]
+- An all-CPU composed frame is work on the vsync tick: read 2 x 10 MB, write 10 MB (the 10 MB CPU copy measured
+  2.5-3.7 ms, so about 5-9 ms, over the 8.3 ms tick at 120 Hz). With the GPU row runs the CPU reads the upper layer
+  once (the class scan) and composes only the mixed rows. Host model (M-series, cached output, Maps-like layout: bands
+  opaque, hole clear, 278 mixed rows of 2400): all-CPU 2.3-2.8 ms, row scan + mixed rows 0.5-0.6 ms (4-5x less). [I]
+  Phone: not measured; STAT `copy avg/max us` and the 0398 line (rows by the GPU) show it. The CPU path stays for
+  scaled / partial layers and refused submissions.
+- Z order = layer index (0 bottom) is read from CA's layout (detached on 0 under the framebuffer on 1); a detached layer
+  above the framebuffer (index 2) is composed on top, as CA intends.
+- A layer whose surface is not BGRA (a 10-bit 'w30r' map, a YUV video) is left out (black under the UI, as before) with
+  its one line; that would be the next format to add.
+- The held-in-use count of a layer surface stays +1 while it is on a layer (balanced on replace / off / last close).
+
+### Verification
+- Compile: `scripts/kernel/compile-one.sh` on a STAGE=0 scratch tree with every patches/xnu patch through 0396 (0389,
+  0390, 0391, 0395, 0396 included): NegroniFramebuffer.cpp OK, no warning from the file. `git apply --check` of 0398 on
+  that tree: OK (it must apply after 0389/0391). Not booted.
+- Host test `patches/xnu/tests/fb-layers-test.c` (merge with CA's detach swap sequence, source-over math): PASS.
+- Phone: open Maps; the panel must match `scripts/screenshot/phone-shot.sh` (map visible under the UI, also after a
+  pan and with the sheet moved). Log: the `0398 ... composed` line, `DBUF in-place 0` while Maps draws, no
+  `0398 layer ... not composed` line for Maps. Then other apps: unchanged (single-layer frames).
