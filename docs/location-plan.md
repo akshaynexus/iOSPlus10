@@ -4,7 +4,9 @@ Owner: "location services are off". Question: what is the shortest working path 
 this port (iOS 16.7.16 20H392, D22 userland, SM8450)?
 
 Marks: **[V]** seen in a log, DT, ADT, firmware image, root image, shared cache or source. **[I]** inference.
-**[U]** unknown, a test must decide. Nothing in this file ran on the phone. No patch and no script exist yet.
+**[U]** unknown, a test must decide. Nothing in this file ran on the phone. Section 5 (added 2026-10-27, location
+userland agent) describes the L0/L1 code: `userland/location/`, `scripts/location/`, an optional root tweak.
+It is built on the Mac only; no phone test yet.
 
 ## Short answer
 
@@ -62,10 +64,9 @@ Marks: **[V]** seen in a log, DT, ADT, firmware image, root image, shared cache 
 - [V] The log shows `locationd` reads the domain `com.apple.locationd` as `User: mobile` and as
   `kCFPreferencesAnyUser, ByHost: Yes`. [I] Setup.app writes the switch on a real phone; we skip Setup,
   so the key is absent and the default is off.
-- Fallback for L0 (only if the Settings switch does not work): call
-  `[CLLocationManager setLocationServicesEnabled:YES]` from `negroni-locd` (entitlement to find:
-  `com.apple.locationd.status` or `com.apple.locationd.preauthorized` [I]). This is better than a root
-  tweak that writes a plist, because the file path and ByHost form are [I].
+- Fallback for L0 (only if the Settings switch does not work): `negroni-locd enable` calls
+  `[CLLocationManager setLocationServicesEnabled:YES]` (entitlement `com.apple.locationd.status` [I]), or the
+  root tweak `LOCATION_SWITCH=1` writes the key (section 5.3: the read is [V], the file path is [I]).
 
 ### 1.3 GNSS stack in locationd (20H392)
 
@@ -271,3 +272,97 @@ and `docs/ru/cellular.md` [V for SM7325, I for SM8450]:
   `out/src/hackios-next/docs/cellular.md`, `docs/ru/cellular.md`.
 - Earlier notes: `docs/references-2026-10-27.md` section 2 (L1-L4 estimate; this file replaces the
   "feed is the hard part" item with the simulation service).
+
+## 5. L0 + L1 implementation (2026-10-27, location userland agent; Mac build only, no phone test)
+
+### 5.1 What locationd checks (20H392 `out/research/location/usr/libexec/locationd`)
+
+- [V] Simulation service entitlement: the connection handler calls
+  `[connection valueForEntitlement:@"com.apple.locationd.simulation"]`, checks `isKindOfClass:` NSNumber and
+  `boolValue`; only then it sets up the exported interface. Else it logs `unentitled client attempting to
+  simulate location` and refuses. (Code at `0x10084e194..0x10084e2e0`; CFString `0x101bf4f38`; selector refs
+  `valueForEntitlement:` and `boolValue` resolved from the binary.) No other check in that path; no Developer
+  Mode string in `locationd`.
+- [V] The listener is made in the function at `0x10084cabc` (`Beginning Simulation Service`, `NSXPCListener`
+  with `com.apple.locationd.simulation`). [V] That log line is in none of our `logs/phone-log-*.txt`.
+  [U] So the listener may start only on demand or under a condition we did not find. If `negroni-locd set`
+  hangs or has no effect, this is the first suspect.
+- [V] Switch read: the function at `0x1001b33c8` calls `CFPreferencesCopyValue(CFSTR("LocationServicesEnabledIn8.0"),
+  CFSTR("com.apple.locationd"), CFSTR("mobile"), kCFPreferencesAnyHost)` (GOT binds resolved with
+  `dyld_info -fixups`); CFBoolean true or a non-zero CFNumber = on. It caches the result in a global.
+- [I] `com.apple.locationd.bigswitch` is used as a notification name (passed to a C call next to a log line),
+  not as an entitlement.
+- [V] CoreLocation 20H392 (`ipsw class-dump` of `out/dsc/cache`): `CLSimulationManager` has `init`, `flush`,
+  `appendSimulatedLocation:`, `clearSimulatedLocations`, `startLocationSimulation`, `stopLocationSimulation`,
+  `setLocationDeliveryBehavior:(unsigned char)`, `setLocationRepeatBehavior:(unsigned char)`,
+  `setWifiScanResults:`, `startWifiSimulation`, and holds an `NSXPCConnection`.
+- [V] `libobjc` in the 20H392 cache exports `objc_retain_x*`/`objc_release_x*`, which the Xcode build imports.
+
+### 5.2 Files
+
+| File | What |
+|---|---|
+| `userland/location/negroni-locd.m` | the daemon/CLI (Objective-C, ARC; CoreLocation by `dlopen`, classes by name) |
+| `userland/location/entitlements.plist` | `platform-application`, `com.apple.private.security.no-sandbox`, `com.apple.locationd.simulation` [V], `com.apple.locationd.status` [I, for `enable`] |
+| `userland/location/com.iosplus10.negroni-locd.plist` | launchd job `listen 5155`; not loaded unless `LOCD_JOB=1`; `KeepAlive` = `SuccessfulExit` false (`stop` and a missing CoreLocation class exit 0, so no restart loop) |
+| `userland/location/build.sh` | build + checks + ad hoc sign -> `out/location/userland/` |
+| `scripts/location/phone-location.sh` | live phone over SSH: push, remove, set, hold, listen, stream, stop, enable, disable, status, log |
+| `scripts/location/root-add-locd.sh` | root image hook: `LOCD=1` (binary), `LOCD_JOB=1` (launchd job); `root-finish.sh` calls it (default off); `root-update.sh` hook `location` |
+| `scripts/ios16/root-tweaks-extra.py` item 7 | `LOCATION_SWITCH=1`: L0 switch key in the root (default off) |
+
+`negroni-locd` commands (options before the command):
+
+- `set LAT LON [ACC]`: `stopLocationSimulation`, `clearSimulatedLocations`, `appendSimulatedLocation:`
+  (a `CLLocation` with the time now, ACC m, default 10), `flush`, `startLocationSimulation`, `flush`, exit.
+  [I] call order (as Xcode's device location simulation is said to do).
+- `hold LAT LON [ACC]`: the same, then again every `-r SEC` (default 1) with a new timestamp, until SIGTERM.
+- `listen [PORT]`: UDP on `-a ADDR` (default 192.168.7.2:5155), only from `-s ADDR` (default 192.168.7.1; `any`).
+  Each datagram: lines `LAT LON [ACC]` or `stop`; the last valid line wins. The last position is sent again every
+  `-r SEC`. Bind failures retry every 5 s (the USB address comes late at boot).
+- `stop`: SIGTERM to the `hold`/`listen` process (pid file `/private/var/run/negroni-locd.pid`), then stop + clear.
+- `enable` / `disable` / `status`: `+[CLLocationManager setLocationServicesEnabled:]`, `+locationServicesEnabled`.
+- `-b` runs `hold`/`listen` in the background (log `/private/var/log/iosplus10-negroni-locd.log`); on exit the
+  simulation stops unless `-k`. Every line also goes to os_log (subsystem `dev.iosplus10.negroni-locd`).
+  `-b` forks after the argument checks and before CoreLocation/XPC are used. `stop` acts only on a pid whose
+  process name is `negroni-locd` (stale pid file). `-r` accepts 0..3600.
+
+Build (macOS + Xcode, seconds): `userland/location/build.sh`. Result 2026-10-27: arm64, minos 16.0, links only
+Foundation/libobjc/libSystem/CoreFoundation, entitlements as above, sha256 in `out/location/userland/SHA256SUMS`.
+A macOS build of the same source passed a local smoke test (argument errors, UDP lines, `bad line ignored`,
+`stop`, SIGTERM) with 127.0.0.1; that says nothing about locationd on the phone.
+
+### 5.3 L0 root tweak
+
+`LOCATION_SWITCH=1` (env for `root-tweaks-extra.py`, so for `root-finish.sh` and the `tweaks` hook of
+`sudo LOCATION_SWITCH=1 scripts/ios16/root-update.sh IN OUT tweaks`) merges `LocationServicesEnabledIn8.0 = true`
+into `/private/var/mobile/Library/Preferences/com.apple.locationd.plist` (binary plist, owner 501:501, 0600, the
+same helper as the FBLaunchWatchdogScale preference). The read is [V] (5.1); the file is [I] (cfprefsd's path for
+user `mobile`, any host). Default off. A root change needs a new root image (not done here).
+
+### 5.4 Test steps (phone with SSH, `rootrw=1`)
+
+1. L0: Settings > Privacy & Security > Location Services: on (or `scripts/location/phone-location.sh enable`
+   after step 2). Keep `scripts/location/phone-location.sh log` open. Expect `#Actor
+   handleLocationServicesStatusChange ... 1` and `isLocationServicesEnabled":1`; `status` prints
+   `locationServicesEnabled 1`.
+2. `userland/location/build.sh`, then `scripts/location/phone-location.sh push`.
+3. `scripts/location/phone-location.sh set 48.8584 2.2945 10`. Expect in the log: no `unentitled client
+   attempting to simulate location`; `Setting simulation to 1 for all location providers` /
+   `Simulation is now ...`; `ClxSimulated, Fix, 1, ll, 48.858...`.
+4. Open Maps: blue dot at the Eiffel Tower. If the dot goes away after the CLI exits, use
+   `phone-location.sh hold 48.8584 2.2945 10` ([U] whether the simulation survives the client's exit).
+5. Stream from the Mac: `scripts/location/phone-location.sh stream LAT LON 10` (Ctrl-C ends the Mac side),
+   or `phone-location.sh listen` and own UDP lines to 192.168.7.2:5155.
+6. `scripts/location/phone-location.sh stop`; the dot goes away (or stays as the last known fix [I]).
+7. Boot test (optional, later): a root with `LOCD=1 LOCD_JOB=1` (and `LOCATION_SWITCH=1`) starts the listener.
+
+### 5.5 Risks
+
+- [U] The simulation listener may not be up (5.1); then `set` has no effect or `flush` waits. Look for
+  `Beginning Simulation Service` after the first `set`.
+- [U] The call order and the default delivery/repeat behaviour (we do not set them) may give one fix only, or a
+  replay. `hold`/`listen` resend every second to cover this.
+- [U] `com.apple.locationd.status` for `enable` is a guess; if refused, use Settings or `LOCATION_SWITCH=1`.
+- [I] Some consumers drop simulated fixes (`location is simulated, rejecting`): country code, harvesting.
+- The UDP listener takes positions from 192.168.7.1 only by default; with `-a 0.0.0.0 -s any` any host on any
+  network can move the phone's position.

@@ -36,6 +36,12 @@
    com.apple.widgetkit-extension to 30 MiB (com.apple.jetsamproperties.<model>.plist, read by runningboardd); our
    Metal device needs ~15-20 MiB more, FitnessWidget was jetsam-killed (docs/metal-widgets-2026-10-27.md).
    scripts/ios16/jetsam_widgets.py patches every jetsamproperties plist. Live phone: scripts/metal/phone-widget-jetsam.sh.
+7. Location Services switch on (env LOCATION_SWITCH=1; default off, docs/location-plan.md step L0):
+   LocationServicesEnabledIn8.0 = true in /private/var/mobile/Library/Preferences/com.apple.locationd.plist
+   (owner mobile 501:501, 0600). [V] 20H392 locationd reads the switch with CFPreferencesCopyValue(
+   "LocationServicesEnabledIn8.0", "com.apple.locationd", "mobile", kCFPreferencesAnyHost) and takes a CFBoolean
+   true or a non-zero CFNumber as "on". [I] the user "mobile" + AnyHost source is that file (cfprefsd's usual path).
+   Normal way: Settings > Privacy & Security > Location Services, or `negroni-locd enable` on a live phone.
 """
 import argparse, glob, os, plistlib, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -125,6 +131,12 @@ def main():
             print('jetsam:', jetsam_widgets.patch(path, int(wmb)))
     else:
         print('jetsam: WIDGET_JETSAM_MB empty, widget limits left as is')
+
+    if os.environ.get('LOCATION_SWITCH', '0') == '1':
+        merge_pref(r, 'com.apple.locationd', {'LocationServicesEnabledIn8.0': True})
+        print('location: LocationServicesEnabledIn8.0 = true (com.apple.locationd, user mobile)')
+    else:
+        print('location: switch left as is (LOCATION_SWITCH=1 turns Location Services on)')
 
 if __name__ == '__main__':
     main()

@@ -3238,3 +3238,15 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Build [V]: out/kernel/local-20261027-100646/kernel.development.negroni sha256
   f5af17707f1294d0c1eebb5d137aeaaa8329b17d050e35f15841c4ac8d5504bf (278 applied incl. 0381; 4 dxb skips). Only old
   warning kinds. Not booted, not reviewed, no image.
+
+## 65. Location L0/L1 code: negroni-locd + simulation entitlement (2026-10-27, location userland agent; details docs/location-plan.md section 5)
+
+- [V] 20H392 `locationd` accepts `com.apple.locationd.simulation` clients only with the entitlement
+  `com.apple.locationd.simulation` = true (`valueForEntitlement:` + NSNumber `boolValue`); else
+  `unentitled client attempting to simulate location`.
+- [V] The switch read: `CFPreferencesCopyValue("LocationServicesEnabledIn8.0", "com.apple.locationd", "mobile",
+  kCFPreferencesAnyHost)`. [I] file `/private/var/mobile/Library/Preferences/com.apple.locationd.plist`.
+- [V] `Beginning Simulation Service` is in no phone log so far: [U] the listener may start late or on a condition.
+- Code: `userland/location/` (build.sh -> `out/location/userland/negroni-locd`), `scripts/location/phone-location.sh`
+  (live phone), `scripts/location/root-add-locd.sh` (LOCD=1, LOCD_JOB=1), `root-tweaks-extra.py` LOCATION_SWITCH=1.
+  All default off. Not tested on the phone.

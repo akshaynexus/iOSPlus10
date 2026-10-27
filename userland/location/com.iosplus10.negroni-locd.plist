@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.iosplus10.negroni-locd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/negroni-locd</string>
+		<string>listen</string>
+		<string>5155</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>UserName</key>
+	<string>root</string>
+	<key>StandardOutPath</key>
+	<string>/private/var/log/iosplus10-negroni-locd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/private/var/log/iosplus10-negroni-locd.log</string>
+</dict>
+</plist>
