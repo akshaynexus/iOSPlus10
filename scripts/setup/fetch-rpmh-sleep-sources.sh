@@ -22,6 +22,6 @@ for f in hyp/vm/psci/src/psci_common.c hyp/vm/psci/aarch64/src/psci.c hyp/vm/psc
   hyp/vm/psci_pc/src/psci_pc.c hyp/vm/psci/include/psci_common.h hyp/platform/psci_smc/src/psci_smc.c \
   hyp/core/idle/src/idle.c hyp/vm/vpm_base/src/vpm_group.c hyp/vm/psci/psci.tc hyp/vm/psci_osi/psci_osi.tc; do
   mkdir -p "$G/$(dirname "$f")"
-  curl -fsSL --retry 3 -o "$G/$f" "https://raw.githubusercontent.com/quic/gunyah-hypervisor/develop/$f"
+  curl -fsSL --retry 3 -o "$G/$f" "https://raw.githubusercontent.com/quic/gunyah-hypervisor/254727746fce809aba0e629a13711a954b246968/$f"
 done
 ls -R "$G" | head -40
