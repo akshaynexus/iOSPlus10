@@ -1,0 +1,937 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 9e83d41..c8cd8f7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/negroni_tfa.c			standard
+ bsd/dev/negroni_sample.c			standard
+ bsd/dev/negroni_keys.c			standard
+ bsd/dev/negroni_reboot.c		standard
++bsd/dev/negroni_charge.c		standard
+ bsd/dev/negroni_touch.c			standard
+ bsd/dev/negroni_cpufreq.c		standard
+ bsd/dev/negroni_thermal.c		standard
+diff --git a/bsd/dev/negroni_charge.c b/bsd/dev/negroni_charge.c
+new file mode 100644
+index 0000000..35e2de4
+--- /dev/null
++++ b/bsd/dev/negroni_charge.c
+@@ -0,0 +1,407 @@
++/*
++ * NEGRONI (OnePlus 10 Pro 5G, SM8450) patch 0377: charge-only mode after a cable power-on.
++ *
++ * Problem: with the phone off, the USB cable powers the PMIC on (PON trigger USB_CHARGER). On
++ * Android, ABL then boots with androidboot.mode=charger and the off-mode charging screen runs.
++ * Our chain (ABL -> boot_a UEFI shim -> DarwinBoot -> XNU) does not pass ABL's /chosen/bootargs
++ * to XNU (the boot line comes from payload.bin), so iOS boots. The kernel reads the PMIC PON log
++ * (SDAM 0x7400, negroni_reboot.c 0214) and can tell the cable power-on apart by itself.
++ *
++ * negroni_charge_check() runs at the start of load_init_program() (bsd/kern/kern_exec.c), in
++ * the init process's thread, before launchd. Boot-args:
++ *   negronicharge=0 (default)  dry run: the decision is logged, iOS always boots
++ *   negronicharge=1            the decision is acted on
++ *   negronicharge_force=1      enter the mode on every boot, also without negronicharge=1 (test
++ *                              with fastboot boot: a RAM boot cannot be a cable power-on). The
++ *                              actions are the real ones.
++ * Decision (bsd/dev/negroni_charge_core.h, host-tested): enter when
++ *   (last PON trigger USB_CHARGER, or boot-arg androidboot.mode=charger) AND no reset entry after
++ *   that trigger AND no warm/hard reset type before it AND the power key is up AND VBUS is present
++ *   (the NegroniBattery plug reading: VADC USBIN >= 4000 mV in negronibatt=4/5; without the
++ *   VADC only a charge current >= 50 mA says "present", and nothing can say "absent", so the
++ *   unplug power off needs negronibatt=4/5).
++ * In the mode:
++ *   - launchd is never started; the kernel threads keep running (USB gadget + command server:
++ *     "op10tool ctl reboot|bootloader|poweroff" work; NegroniBattery; the ADSP charger PD and
++ *     GLINK client when negroniadsp/negronichg_glink are on). Nothing here writes the charger:
++ *     without the PD the PM8350B charges on its XBL/hardware defaults (README-battery.md).
++ *   - the kernel console stops drawing (negroni_console_muted; the log ring and USB log keep it)
++ *     and a battery screen is drawn into the boot framebuffer: an outline, the fill, the percent.
++ *   - screen off after 10 s (black pixels + negroni_backlight_display_off), a short power key
++ *     press turns it on again; key held >= 2 s: PS_HOLD type HARD_RESET + reason 0 + reset, so the
++ *     next boot logs PON trigger HARD_RESET and boots iOS; no VBUS for 3 s: PMIC power off
++ *     (negroni_power_off, 0214), and if that returns, the same reboot into iOS.
++ * Every line starts "NEGRONI CHARGE:". The mode's loop has one 50 ms tick; every step in it is
++ * bounded; it ends only with a reset or a power off (that is its purpose).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "negroni_charge_core.h"
++
++void negroni_charge_check(void);
++void negroni_charge_batt_update(int percent, int percent_known, int external, int charging, unsigned usb_mv,
++    int vbus_measured);
++void negroni_charge_batt_plug(int external, unsigned usb_mv, int vbus_measured);
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);  /* kernel_map VA */
++extern int negroni_reboot_pon_info(int *trigger, int *type_before, int *reset_after);  /* negroni_reboot.c */
++extern const char *negroni_reboot_pon_summary(void);
++extern int negroni_reboot_hard_type(void);
++extern void negroni_reboot(unsigned reason);
++extern void negroni_power_off(void);
++extern void negroni_bootlog_end(unsigned kind, const char *why);        /* negroni_ufs.c 0367 */
++extern int negroni_keys_power(void);                                    /* negroni_keys.c */
++extern int negroni_console_muted;                                       /* serial_console.c */
++extern unsigned char iso_font[256 * 16];
++extern bool negroni_backlight_display_off(uint32_t fade_ms);            /* NegroniBacklight.cpp */
++extern bool negroni_backlight_display_on(void);
++
++#define NC_TICK_MS              50u
++#define NC_WAIT_BATT_MS         15000u  /* at most this long for the first battery reading */
++#define NC_PLUG_AGE_MS          30000u  /* an older plug reading counts as "not known" */
++#define NC_STATUS_MS            60000u  /* one status line this often */
++#define NC_REDRAW_MS            30000u  /* the screen is drawn again this often while on */
++
++/* ---- the battery snapshot (written by NegroniBattery's work loop, read by the mode) ---- */
++static volatile int nc_pct = -1;                /* percent, -1 = no reading */
++/* VBUS in one word (no torn pair, review F1): NC_PLUG_NONE, else bit 0 = present, bit 1 = measured by the VADC */
++#define NC_PLUG_NONE    (-1)
++static volatile int nc_plug = NC_PLUG_NONE;
++static volatile int nc_chg = -1;                /* charging: 1 / 0 / -1 */
++static volatile unsigned nc_usb_mv;
++static volatile uint64_t nc_plug_ms;            /* time of the last plug reading, 0 = none */
++
++static uint64_t
++nc_now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC + 1;          /* never 0: 0 means "not set" in the snapshot */
++}
++
++/*
++ * NegroniBattery (its work loop): publish() every full read (20 s), fastCheck() every plug tick
++ * (negronibatt_fast, 1 s) that has a reading. vbus_measured: the reading is the VADC USBIN voltage
++ * (negronibatt=4/5); else "external" is the driver's guess from the battery current (or false
++ * when it has nothing), which nc_vbus() uses only as "present".
++ */
++/* external -1: no plug state in this update (the driver's static placeholder) */
++void
++negroni_charge_batt_update(int percent, int percent_known, int external, int charging, unsigned usb_mv,
++    int vbus_measured)
++{
++	nc_pct = percent_known && percent >= 0 && percent <= 100 ? percent : -1;
++	nc_chg = charging ? 1 : 0;
++	if (external >= 0) {
++		negroni_charge_batt_plug(external, usb_mv, vbus_measured);
++	}
++}
++
++void
++negroni_charge_batt_plug(int external, unsigned usb_mv, int vbus_measured)
++{
++	nc_plug = (external ? 1 : 0) | (vbus_measured ? 2 : 0);
++	nc_usb_mv = usb_mv;
++	nc_plug_ms = nc_now_ms();
++}
++
++static int
++nc_vbus(void)
++{
++	uint64_t at = nc_plug_ms, now = nc_now_ms();
++	int plug = nc_plug;
++	if (at == 0 || now - at > NC_PLUG_AGE_MS || plug == NC_PLUG_NONE) {
++		return -1;
++	}
++	/* Only a measured VBUS can say "no cable" (that powers the phone off); a guess says "present" only. */
++	if ((plug & 1) == 0 && (plug & 2) == 0) {
++		return -1;
++	}
++	return plug & 1;
++}
++
++static int nc_sleep_chan;
++
++static void
++nc_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline((event_t)&nc_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* ---- the screen: the boot framebuffer (a8r8g8b8), write-combined, written only ---- */
++static volatile uint32_t *nc_fb;
++static uint32_t nc_w, nc_h, nc_stride;          /* stride in pixels */
++
++#define NC_BLACK        0xff000000u
++#define NC_WHITE        0xffffffffu
++#define NC_GREY         0xff808080u
++#define NC_GREEN        0xff30d158u
++#define NC_RED          0xffff453au
++
++static bool
++nc_fb_open(void)
++{
++	PE_Video v;
++
++	bzero(&v, sizeof(v));
++	PE_current_console(&v);
++	uint64_t pa = v.v_baseAddr & ~3ul;
++	if (pa == 0 || v.v_width == 0 || v.v_height == 0 || v.v_rowBytes < v.v_width * 4 || (v.v_rowBytes & 3) ||
++	    (v.v_depth != 0 && (v.v_depth & 0xff) != 32)) {
++		printf("NEGRONI CHARGE: no 32-bit boot framebuffer (base %#llx %lux%lu row %lu depth %lu): no screen\n",
++		    (unsigned long long)pa, v.v_width, v.v_height, v.v_rowBytes, v.v_depth);
++		return false;
++	}
++	/* 0x6 = VM_WIMG_WCOMB. Not ml_io_map_wcomb: io_submap is 8 MiB (KMA_NOFAIL panics), 1080x2412x4 = 10.4 MB */
++	vm_offset_t va = ml_io_map_unmappable((vm_offset_t)pa, (vm_size_t)(v.v_rowBytes * v.v_height), 0x6u);
++	if (va == 0) {
++		printf("NEGRONI CHARGE: framebuffer map failed: no screen\n");
++		return false;
++	}
++	nc_fb = (volatile uint32_t *)va;
++	nc_w = (uint32_t)v.v_width;
++	nc_h = (uint32_t)v.v_height;
++	nc_stride = (uint32_t)(v.v_rowBytes / 4);
++	printf("NEGRONI CHARGE: framebuffer %ux%u (row %u px) at %#llx\n", nc_w, nc_h, nc_stride,
++	    (unsigned long long)pa);
++	return true;
++}
++
++static void
++nc_rect(int x, int y, int w, int h, uint32_t c)
++{
++	if (nc_fb == NULL) {
++		return;
++	}
++	int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
++	int x1 = x + w > (int)nc_w ? (int)nc_w : x + w, y1 = y + h > (int)nc_h ? (int)nc_h : y + h;
++	for (int yy = y0; yy < y1; yy++) {
++		volatile uint32_t *row = nc_fb + (uint32_t)yy * nc_stride;
++		for (int xx = x0; xx < x1; xx++) {
++			row[xx] = c;
++		}
++	}
++}
++
++/* Text in the 8x16 console font, each font pixel a scale x scale square, centred at cx. */
++static void
++nc_text(int cx, int y, int scale, const char *s, uint32_t c)
++{
++	int n = (int)strlen(s);
++	int x = cx - n * 8 * scale / 2;
++	for (int i = 0; i < n; i++, x += 8 * scale) {
++		const unsigned char *g = &iso_font[(unsigned char)s[i] * 16];
++		for (int gy = 0; gy < 16; gy++) {
++			for (int gx = 0; gx < 8; gx++) {
++				if (g[gy] & (1u << gx)) {
++					nc_rect(x + gx * scale, y + gy * scale, scale, scale, c);
++				}
++			}
++		}
++	}
++}
++
++static void
++nc_draw(int pct, int vbus, int chg)
++{
++	if (nc_fb == NULL) {
++		return;
++	}
++	const int W = (int)nc_w, H = (int)nc_h;
++	nc_rect(0, 0, W, H, NC_BLACK);
++	/* battery outline: body 360 x 640, wall 16, cap 140 x 40, upper half of the screen */
++	const int bw = 360, bh = 640, t = 16, capw = 140, caph = 40;
++	const int bx = (W - bw) / 2, by = H / 2 - bh - 40;
++	const uint32_t edge = NC_WHITE;
++	nc_rect(bx + (bw - capw) / 2, by - caph, capw, caph, edge);
++	nc_rect(bx, by, bw, t, edge);
++	nc_rect(bx, by + bh - t, bw, t, edge);
++	nc_rect(bx, by, t, bh, edge);
++	nc_rect(bx + bw - t, by, t, bh, edge);
++	/* fill from the bottom, inside a 12 px gap */
++	const int gap = 12, ih = bh - 2 * (t + gap), iw = bw - 2 * (t + gap);
++	uint32_t fill = pct < 0 ? NC_GREY : pct <= 15 ? NC_RED : chg == 1 ? NC_GREEN : NC_WHITE;
++	int fh = pct < 0 ? ih / 20 : ih * pct / 100;
++	if (fh > 0) {
++		nc_rect(bx + t + gap, by + t + gap + ih - fh, iw, fh, fill);
++	}
++	char line[16];
++	if (pct >= 0) {
++		snprintf(line, sizeof(line), "%d%%", pct);
++	} else {
++		strlcpy(line, "--%", sizeof(line));
++	}
++	nc_text(W / 2, H / 2 + 60, 14, line, NC_WHITE);                 /* 112 x 224 per glyph */
++	const char *state = vbus == 0 ? "Not connected" : chg == 1 ? "Charging" : vbus == 1 ? "Connected" : "";
++	nc_text(W / 2, H / 2 + 60 + 224 + 60, 5, state, chg == 1 ? NC_GREEN : NC_WHITE);
++	nc_text(W / 2, H - 260, 3, "Hold power 2 s to start iOS", NC_GREY);
++}
++
++static void
++nc_screen_off(void)
++{
++	nc_rect(0, 0, (int)nc_w, (int)nc_h, NC_BLACK);
++	if (!negroni_backlight_display_off(0)) {
++		printf("NEGRONI CHARGE: no backlight service: screen off = black pixels only\n");
++	}
++}
++
++/* Reboot into iOS: HARD_RESET type (a new PON trigger at the next boot), reason 0 (normal). */
++static void
++nc_reboot_ios(const char *why)
++{
++	printf("NEGRONI CHARGE: reboot into iOS (%s)\n", why);
++	if (negroni_reboot_hard_type() != 0) {
++		printf("NEGRONI CHARGE: PS_HOLD type HARD_RESET not set: the next boot may enter the mode again\n");
++	}
++	negroni_bootlog_end(4, why);
++	negroni_reboot(0);
++	printf("NEGRONI CHARGE: reset failed (PSCI returned)\n");
++}
++
++static void
++nc_power_off(void)
++{
++	printf("NEGRONI CHARGE: power off (no VBUS for %u ms)\n", NC_UNPLUG_MS);
++	negroni_bootlog_end(3, "power off (charge mode: cable unplugged)");
++	negroni_power_off();
++	printf("NEGRONI CHARGE: power off failed: rebooting into iOS instead\n");
++	nc_reboot_ios("charge mode: power off failed");
++}
++
++/* The mode. Never returns. */
++__attribute__((noreturn)) static void
++nc_mode(void)
++{
++	struct nc_state st;
++	uint64_t now = nc_now_ms(), drawn_at = 0, status_at = now;
++	int drawn_pct = -2, drawn_vbus = -2, drawn_chg = -2;
++	bool lit = true;        /* the panel is on (the boot left it on) */
++
++	negroni_console_muted = 1;
++	printf("NEGRONI CHARGE: mode on: launchd not started; console drawing muted; screen off after %u s, "
++	    "short press = screen on, hold %u s = iOS, unplug %u s = power off; USB ctl stays up\n",
++	    NC_SCREEN_MS / 1000, NC_LONG_PRESS_MS / 1000, NC_UNPLUG_MS / 1000);
++	(void)nc_fb_open();
++	nc_init(&st, now);
++	for (;;) {
++		now = nc_now_ms();
++		int key = negroni_keys_power(), vbus = nc_vbus(), pct = nc_pct, chg = nc_chg;
++		enum nc_action a = nc_step(&st, now, key, vbus);
++		switch (a) {
++		case NC_SCREEN_ON:
++			printf("NEGRONI CHARGE: short press: screen on%s\n", lit ? " (was on: 10 s again)" : "");
++			if (!lit) {
++				(void)negroni_backlight_display_on();
++				lit = true;
++			}
++			drawn_at = 0;   /* draw now */
++			break;
++		case NC_SCREEN_OFF:
++			printf("NEGRONI CHARGE: %u s without a press: screen off\n", NC_SCREEN_MS / 1000);
++			nc_screen_off();
++			lit = false;
++			break;
++		case NC_REBOOT:
++			printf("NEGRONI CHARGE: power key held %u ms\n", NC_LONG_PRESS_MS);
++			nc_reboot_ios("charge mode: power key held 2 s");
++			nc_sleep_ms(5000);      /* only if the reset failed: a new press tries again */
++			break;
++		case NC_POWEROFF:
++			nc_power_off();
++			nc_sleep_ms(5000);      /* only if both failed: try again after 5 s + 3 s */
++			st.unplug_since = 0;
++			break;
++		default:
++			break;
++		}
++		if (st.screen_on && (drawn_at == 0 || pct != drawn_pct || vbus != drawn_vbus || chg != drawn_chg ||
++		    now - drawn_at >= NC_REDRAW_MS)) {
++			nc_draw(pct, vbus, chg);
++			drawn_at = now;
++			drawn_pct = pct;
++			drawn_vbus = vbus;
++			drawn_chg = chg;
++		}
++		if (now - status_at >= NC_STATUS_MS) {
++			status_at = now;
++			printf("NEGRONI CHARGE: status: %d%% vbus %d (%u mV) charging %d key %d screen %s\n",
++			    pct, vbus, nc_usb_mv, chg, key, st.screen_on ? "on" : "off");
++		}
++		nc_sleep_ms(NC_TICK_MS);
++	}
++}
++
++void
++negroni_charge_check(void)
++{
++	static bool done;
++	int mode = 0, force = 0;
++	char abl[32];
++
++	if (done) {
++		return;
++	}
++	done = true;
++	(void)PE_parse_boot_argn("negronicharge", &mode, sizeof(mode));
++	(void)PE_parse_boot_argn("negronicharge_force", &force, sizeof(force));
++
++	if (force == 1) {
++		mode = 1;               /* the force acts; it is not a dry run */
++	}
++	struct nc_inputs in;
++	bzero(&in, sizeof(in));
++	in.pon = in.type_before = -1;
++	in.force = force == 1;
++	in.pon_decoded = negroni_reboot_pon_info(&in.pon, &in.type_before, &in.reset_after) == 0;
++	bzero(abl, sizeof(abl));
++	bool abl_seen = PE_parse_boot_arg_str("androidboot.mode", abl, sizeof(abl));
++	in.abl_charger = abl_seen && strcmp(abl, "charger") == 0;
++	printf("NEGRONI CHARGE: negronicharge=%d force=%d; PON log %s: trigger %#06x, reset type before %d, "
++	    "reset after %d (summary: %s); ABL mode %s\n", mode, force,
++	    in.pon_decoded ? "decoded" : "NOT decoded", in.pon < 0 ? 0 : in.pon, in.type_before, in.reset_after,
++	    negroni_reboot_pon_summary()[0] ? negroni_reboot_pon_summary() : "-",
++	    abl_seen ? abl : "not passed (the UEFI shim gives XNU the payload boot line, not ABL's /chosen/bootargs)");
++
++	enum nc_reason r = nc_boot_reason(&in);
++	if (!nc_enters(r) && mode != 0) {
++		printf("NEGRONI CHARGE: decision: boot iOS (%s)\n", nc_reason_text(r));
++		return;
++	}
++	/* A cable power-on (or forced, or the dry run): the key and VBUS too */
++	in.key = negroni_keys_power();
++	if (mode != 0) {
++		uint64_t until = nc_now_ms() + NC_WAIT_BATT_MS;
++		if (nc_plug_ms == 0) {
++			printf("NEGRONI CHARGE: waiting up to %u s for the first battery reading\n", NC_WAIT_BATT_MS / 1000);
++		}
++		while (nc_plug_ms == 0 && nc_now_ms() < until) {
++			nc_sleep_ms(100);
++		}
++	}
++	in.vbus = nc_vbus();
++	r = nc_decide(&in);
++	printf("NEGRONI CHARGE: key %d, vbus %d (%u mV), battery %d%% charging %d\n", in.key, in.vbus, nc_usb_mv,
++	    nc_pct, nc_chg);
++	if (mode == 0) {
++		printf("NEGRONI CHARGE: dry run (negronicharge=0): would %s (%s); iOS boots\n",
++		    nc_enters(r) ? "ENTER the charge-only mode" : "boot iOS", nc_reason_text(r));
++		return;
++	}
++	if (!nc_enters(r)) {
++		printf("NEGRONI CHARGE: decision: boot iOS (%s)\n", nc_reason_text(r));
++		return;
++	}
++	printf("NEGRONI CHARGE: decision: charge-only mode (%s)\n", nc_reason_text(r));
++	nc_mode();
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_charge_core.h b/bsd/dev/negroni_charge_core.h
+new file mode 100644
+index 0000000..d4f1d55
+--- /dev/null
++++ b/bsd/dev/negroni_charge_core.h
+@@ -0,0 +1,202 @@
++/*
++ * NEGRONI (SM8450) patch 0377: the decisions of the charge-only mode (bsd/dev/negroni_charge.c),
++ * as pure C with no kernel calls, so a host test (tools/charge-core-test, scripts/kernel/
++ * test-charge-core.sh) checks exactly this code.
++ *
++ *   nc_decide()  at boot, once: enter the charge-only mode or boot iOS.
++ *   nc_step()    in the mode, every tick: the power key, the cable and the screen timer.
++ *
++ * Inputs use -1 for "not known". Nothing here loops: every call is O(1).
++ */
++#ifndef NEGRONI_CHARGE_CORE_H
++#define NEGRONI_CHARGE_CORE_H
++
++#include <stdint.h>
++#include <stdbool.h>
++
++/* PMIC PON log codes (downstream pmic-pon-log.c, as decoded by negroni_reboot.c 0214) */
++#define NC_PON_USB_CHARGER_A    0x31c2
++#define NC_PON_USB_CHARGER_B    0x8732
++#define NC_TYPE_WARM_RESET      0x01
++#define NC_TYPE_HARD_RESET      0x07
++#define NC_TYPE_DVDD_HARD_RESET 0x08
++
++#define NC_LONG_PRESS_MS        2000u   /* power key held this long: reboot into iOS */
++#define NC_UNPLUG_MS            3000u   /* no VBUS this long: power off */
++#define NC_SCREEN_MS            10000u  /* screen on this long without a key press: screen off */
++
++struct nc_inputs {
++	int pon_decoded;        /* 1: the PON log was read and decoded */
++	int pon;                /* last PON trigger code, -1 none */
++	int type_before;        /* reset type logged before that trigger (the previous cycle's end), -1 none */
++	int reset_after;        /* 1: a RESET_TRIGGER/RESET_TYPE entry after the last PON trigger (warm reset) */
++	int abl_charger;        /* 1: boot-arg androidboot.mode=charger (ABL's mode, if a shim passes it) */
++	int key;                /* power key: 1 pressed, 0 released, -1 unknown */
++	int vbus;               /* 1 cable power present, 0 none, -1 unknown */
++	int force;              /* boot-arg negronicharge_force=1 */
++};
++
++enum nc_reason {
++	NC_YES_CABLE = 0,       /* enter: cable power-on */
++	NC_YES_FORCED,          /* enter: negronicharge_force=1 */
++	NC_NO_PON_UNKNOWN,      /* the PON log was not decoded */
++	NC_NO_TRIGGER,          /* the last PON trigger is not the charger (key, reset, RTC ...) */
++	NC_NO_RESET_BEFORE,     /* a reset type (warm/hard) before the trigger */
++	NC_NO_RESET_AFTER,      /* a reset after the last PON trigger: this boot is a reset */
++	NC_NO_KEY,              /* the power key is held */
++	NC_NO_VBUS,             /* no cable power */
++	NC_NO_VBUS_UNKNOWN,     /* cable power not known (no battery data) */
++};
++
++static inline const char *
++nc_reason_text(enum nc_reason r)
++{
++	switch (r) {
++	case NC_YES_CABLE:       return "cable power-on (PON trigger USB_CHARGER or ABL mode charger), key up, VBUS present";
++	case NC_YES_FORCED:      return "forced (negronicharge_force=1)";
++	case NC_NO_PON_UNKNOWN:  return "PON log not decoded and no ABL mode";
++	case NC_NO_TRIGGER:      return "the power-on trigger is not the charger";
++	case NC_NO_RESET_BEFORE: return "a warm/hard reset type before the PON trigger";
++	case NC_NO_RESET_AFTER:  return "a reset after the last PON trigger (this boot is a reset)";
++	case NC_NO_KEY:          return "the power key is held";
++	case NC_NO_VBUS:         return "no VBUS";
++	case NC_NO_VBUS_UNKNOWN: return "VBUS not known (no battery data)";
++	default:                 return "?";
++	}
++}
++
++static inline bool
++nc_is_charger_trigger(int pon)
++{
++	return pon == NC_PON_USB_CHARGER_A || pon == NC_PON_USB_CHARGER_B;
++}
++
++static inline bool
++nc_is_reset_type(int type)
++{
++	return type == NC_TYPE_WARM_RESET || type == NC_TYPE_HARD_RESET || type == NC_TYPE_DVDD_HARD_RESET;
++}
++
++/* Cable power-on by the boot reasons alone (no key, no VBUS): the first test, before any wait. */
++static inline enum nc_reason
++nc_boot_reason(const struct nc_inputs *in)
++{
++	if (in->force) {
++		return NC_YES_FORCED;
++	}
++	if (!in->abl_charger) {
++		if (!in->pon_decoded) {
++			return NC_NO_PON_UNKNOWN;
++		}
++		if (!nc_is_charger_trigger(in->pon)) {
++			return NC_NO_TRIGGER;
++		}
++	}
++	if (in->pon_decoded && in->reset_after) {
++		return NC_NO_RESET_AFTER;
++	}
++	if (in->pon_decoded && nc_is_reset_type(in->type_before)) {
++		return NC_NO_RESET_BEFORE;
++	}
++	return NC_YES_CABLE;
++}
++
++/* The whole decision. NC_YES_* = enter the charge-only mode. */
++static inline enum nc_reason
++nc_decide(const struct nc_inputs *in)
++{
++	enum nc_reason r = nc_boot_reason(in);
++	if (r != NC_YES_CABLE) {
++		return r;
++	}
++	if (in->key == 1) {
++		return NC_NO_KEY;
++	}
++	if (in->vbus == 0) {
++		return NC_NO_VBUS;
++	}
++	if (in->vbus < 0) {
++		return NC_NO_VBUS_UNKNOWN;
++	}
++	return NC_YES_CABLE;
++}
++
++static inline bool
++nc_enters(enum nc_reason r)
++{
++	return r == NC_YES_CABLE || r == NC_YES_FORCED;
++}
++
++/* The mode's state. Times in ms of one monotonic clock; 0 = "not set". */
++struct nc_state {
++	bool     screen_on;
++	uint64_t screen_on_at;
++	bool     key_down;          /* a press seen (key went 0 -> 1 in the mode) */
++	uint64_t key_down_at;
++	bool     key_long;          /* this press already asked for the reboot */
++	uint64_t unplug_since;
++};
++
++enum nc_action {
++	NC_NONE = 0,
++	NC_SCREEN_ON,           /* short press: screen on (and the 10 s timer starts again) */
++	NC_SCREEN_OFF,          /* 10 s without a press */
++	NC_REBOOT,              /* key held >= 2 s: reboot into iOS (once per press) */
++	NC_POWEROFF,            /* no VBUS for >= 3 s */
++};
++
++static inline void
++nc_init(struct nc_state *s, uint64_t now_ms)
++{
++	s->screen_on = true;
++	s->screen_on_at = now_ms;
++	s->key_down = false;
++	s->key_down_at = 0;
++	s->key_long = false;
++	s->unplug_since = 0;
++}
++
++/*
++ * One tick. key: 1, 0 or -1 (not known: no change). vbus: 1, 0, or -1 (not known: the unplug
++ * stretch starts again, so 3 s of new "0" readings are needed). A press that started before the mode
++ * (key already 1 at the first tick) counts from that tick. The power off wins over the key.
++ */
++static inline enum nc_action
++nc_step(struct nc_state *s, uint64_t now_ms, int key, int vbus)
++{
++	if (vbus == 0) {
++		if (s->unplug_since == 0) {
++			s->unplug_since = now_ms ? now_ms : 1;
++		} else if (now_ms - s->unplug_since >= NC_UNPLUG_MS) {
++			return NC_POWEROFF;
++		}
++	} else {
++		s->unplug_since = 0;    /* present, or not known (review F4) */
++	}
++	if (key == 1) {
++		if (!s->key_down) {
++			s->key_down = true;
++			s->key_down_at = now_ms;
++			s->key_long = false;
++		} else if (!s->key_long && now_ms - s->key_down_at >= NC_LONG_PRESS_MS) {
++			s->key_long = true;
++			return NC_REBOOT;
++		}
++	} else if (key == 0 && s->key_down) {
++		bool was_long = s->key_long;
++		s->key_down = false;
++		s->key_long = false;
++		if (!was_long) {
++			s->screen_on = true;
++			s->screen_on_at = now_ms;
++			return NC_SCREEN_ON;
++		}
++	}
++	if (s->screen_on && !s->key_down && now_ms - s->screen_on_at >= NC_SCREEN_MS) {
++		s->screen_on = false;
++		return NC_SCREEN_OFF;
++	}
++	return NC_NONE;
++}
++
++#endif /* NEGRONI_CHARGE_CORE_H */
+diff --git a/bsd/dev/negroni_keys.c b/bsd/dev/negroni_keys.c
+index 74251af..bf60208 100644
+--- a/bsd/dev/negroni_keys.c
++++ b/bsd/dev/negroni_keys.c
+@@ -43,6 +43,15 @@ keys_wait(void)
+ /* negronikeyslog=1: print every press/release */
+ static int keys_log;
+ 
++/*
++ * 0377 (negroni_charge.c): the power key as the key thread last read it: 1 pressed, 0 released,
++ * -1 not known (no read yet, or 5 read errors in a row). keys_running: the thread owns the
++ * observer channel (nobody else samples it then).
++ */
++static volatile int keys_power = -1;
++static volatile bool keys_running;
++int negroni_keys_power(void);
++
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+@@ -59,8 +68,12 @@ keys_thread(void *arg, wait_result_t result)
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("NEGRONI KEYS: read error %d\n", rc);
+ 			}
++			if (errors >= 5) {
++				keys_power = -1;        /* 0377 */
++			}
+ 		} else {
+ 			errors = 0;
++			keys_power = (pressed & SK_KEY_POWER) ? 1 : 0;  /* 0377 */
+ 			for (int k = 0; k < 3; ++k) {
+ 				int now = !!(pressed & bit[k]);
+ 				if (now != state[k]) {
+@@ -192,11 +205,32 @@ negroni_keys_init(void)
+ 	if (keys_open()) {
+ 		return;
+ 	}
++	keys_running = true;    /* 0377: before the thread runs, so negroni_keys_power() never samples beside it */
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
++		keys_running = false;
+ 		printf("NEGRONI KEYS: kernel_thread_start failed %d\n", kr);
+ 	}
+ }
++
++/*
++ * 0377: the power key for the charge-only mode. With the key thread: its last reading. Without
++ * it (negronikeys=0, or not started): one read of its own (thread context; the probe menu is over
++ * by then, so there is no other reader of the PON channel).
++ */
++int
++negroni_keys_power(void)
++{
++	uint8_t pressed = 0;
++
++	if (keys_running) {
++		return keys_power;
++	}
++	if (keys_open() != 0 || sk_sample(&keys_arb, &keys_apid, &pressed) != 0) {
++		return -1;
++	}
++	return (pressed & SK_KEY_POWER) ? 1 : 0;
++}
+ #endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_reboot.c b/bsd/dev/negroni_reboot.c
+index 1f17778..a6c67fb 100644
+--- a/bsd/dev/negroni_reboot.c
++++ b/bsd/dev/negroni_reboot.c
+@@ -167,6 +167,17 @@ nr_udelay(uint32_t us)
+ #define NR_PONLOG_FIFO_START    0x4bu
+ #define NR_PONLOG_FIFO_END      0xbfu
+ #define NR_PONLOG_FIFO_SIZE     (NR_PONLOG_FIFO_END - NR_PONLOG_FIFO_START + 1)
++/*
++ * 0377: the log read failed at random offsets on the phone ("FIFO read failed at +0x4b", +0x9c;
++ * bootlogs 10 and 13). [I] Another reader uses the same EE 0 observer channel of APID 60 at that
++ * time (the NegroniBattery census reads type/subtype/rt_sts of every APID just before), so a
++ * command can fail or (worse) return the other reader's byte. Now: each byte is tried up to
++ * NR_PONLOG_TRIES times, and the whole log (header + FIFO) is read until two passes in a row
++ * agree, at most NR_PONLOG_PASSES passes.
++ */
++#define NR_PONLOG_TRIES         4u
++#define NR_PONLOG_PASSES        4u
++#define NR_PONLOG_HDR           3u              /* +0x45 count, +0x46 push pointer, +0x47 push SDAM */
+ 
+ #define PSCI_SYSTEM_OFF         0x84000008ull
+ #define PSCI_SYSTEM_RESET       0x84000009ull
+@@ -537,6 +548,9 @@ nr_pon_log_trigger_name(uint8_t event, uint16_t code)
+  * after a power off. Empty until negroni_reboot_prepare() ran.
+  */
+ static char nr_pon_summary[200];
++/* 0377: the decoded fields for the charge-only mode (negroni_charge.c); -1 = none */
++static bool nr_pon_decoded;
++static int nr_pon_last_trigger = -1, nr_pon_last_rst = -1, nr_pon_last_type = -1, nr_pon_reset_after;
+ 
+ const char *negroni_reboot_pon_summary(void);
+ 
+@@ -563,22 +577,47 @@ nr_pon_log_dump(void)
+ 	if (!nr_open(&nr_ponlog)) {
+ 		return;
+ 	}
+-	if (nr_read(&nr_ponlog, NR_PONLOG_SDAM_COUNT, &count) || nr_read(&nr_ponlog, NR_PONLOG_PUSH_PTR, &ptr) ||
+-	    nr_read(&nr_ponlog, NR_PONLOG_PUSH_SDAM, &sdam)) {
+-		printf("NEGRONI PON LOG: SDAM 0x7400 header read failed\n");
++	/* 0377: header + FIFO in one buffer, read until two passes agree (see NR_PONLOG_TRIES) */
++	static uint8_t pass[2][NR_PONLOG_HDR + NR_PONLOG_FIFO_SIZE];
++	unsigned retries = 0, passes = 0;
++	bool stable = false;
++	for (unsigned n = 0; n < NR_PONLOG_PASSES && !stable; n++) {
++		uint8_t *b = pass[n & 1];
++		for (unsigned i = 0; i < NR_PONLOG_HDR + NR_PONLOG_FIFO_SIZE; i++) {
++			uint32_t reg = i < NR_PONLOG_HDR ? NR_PONLOG_SDAM_COUNT + i : NR_PONLOG_FIFO_START + (i - NR_PONLOG_HDR);
++			int rc = -1;
++			for (unsigned t = 0; t < NR_PONLOG_TRIES && rc != 0; t++) {
++				if (t > 0) {
++					retries++;
++					nr_udelay(20);
++				}
++				rc = nr_read(&nr_ponlog, reg, &b[i]);
++			}
++			if (rc != 0) {
++				printf("NEGRONI PON LOG: %s read failed at +%#x (%u tries, rc %d)\n",
++				    i < NR_PONLOG_HDR ? "header" : "FIFO", reg, NR_PONLOG_TRIES, rc);
++				return;
++			}
++		}
++		passes = n + 1;
++		stable = n > 0 && memcmp(pass[0], pass[1], sizeof(pass[0])) == 0;
++	}
++	if (!stable) {
++		printf("NEGRONI PON LOG: not decoded (no two equal reads in %u passes, %u retries)\n", passes, retries);
+ 		return;
+ 	}
++	if (retries > 0 || passes > 2) {
++		printf("NEGRONI PON LOG: read needed %u retries and %u passes\n", retries, passes);
++	}
++	count = pass[0][0];
++	ptr = pass[0][1];
++	sdam = pass[0][2];
++	memcpy(fifo, &pass[0][NR_PONLOG_HDR], sizeof(fifo));
+ 	printf("NEGRONI PON LOG: SDAM 0x7400: %u SDAM(s), push pointer +%#x in SDAM %u\n", count, ptr, sdam);
+ 	if (ptr < NR_PONLOG_FIFO_START || ptr > NR_PONLOG_FIFO_END || sdam != 0) {
+ 		printf("NEGRONI PON LOG: not decoded (pointer outside the FIFO, or in another SDAM)\n");
+ 		return;
+ 	}
+-	for (unsigned i = 0; i < NR_PONLOG_FIFO_SIZE; i++) {
+-		if (nr_read(&nr_ponlog, NR_PONLOG_FIFO_START + i, &fifo[i])) {
+-			printf("NEGRONI PON LOG: FIFO read failed at +%#x\n", NR_PONLOG_FIFO_START + i);
+-			return;
+-		}
+-	}
+ 	const unsigned entries = NR_PONLOG_FIFO_SIZE / 4;
+ 	/*
+ 	 * 0367: for nr_pon_summary, the reset entries logged before the LAST
+@@ -655,10 +694,19 @@ nr_pon_log_dump(void)
+ 	if (last_f3 > 0) {
+ 		NR_SUM("fault3=%#06x ", last_f3);
+ 	}
++	/* 0377: a reset logged after the last PON trigger = a warm reset without a new power-on */
++	if (w_rst >= 0 || w_type >= 0) {
++		NR_SUM("after=%s ", w_type >= 0 ? nr_pon_type_name((uint8_t)w_type) : "reset");
++	}
+ #undef NR_SUM
+ 	if (o > nr_pon_summary && o[-1] == ' ') {
+ 		o[-1] = 0;
+ 	}
++	nr_pon_last_trigger = last_pon;
++	nr_pon_last_rst = last_rst;
++	nr_pon_last_type = last_type;
++	nr_pon_reset_after = (w_rst >= 0 || w_type >= 0) ? 1 : 0;
++	nr_pon_decoded = true;
+ 	printf("NEGRONI PON LOG: summary: %s\n", nr_pon_summary[0] ? nr_pon_summary : "(no entries)");
+ }
+ 
+@@ -682,6 +730,46 @@ negroni_reboot_prepare(void)
+ 	    nr_panic_secs > 0 ? "reset after" : "stay", nr_panic_secs, nr_panic_reason);
+ }
+ 
++/*
++ * 0377 (negroni_charge.c): the last PON trigger of the log (-1 none), the reset type logged before
++ * it (-1 none), and 1 in *reset_after when a reset entry follows it (a warm reset keeps the old
++ * trigger). Reads the log again once when the boot read did not decode it. 0 = decoded, -1 = not.
++ * Thread context, after negroni_reboot_prepare().
++ */
++int negroni_reboot_pon_info(int *trigger, int *type_before, int *reset_after);
++
++int
++negroni_reboot_pon_info(int *trigger, int *type_before, int *reset_after)
++{
++	static bool reread;
++
++	if (!nr_pon_decoded && nr_prepared && !reread) {
++		reread = true;
++		printf("NEGRONI PON LOG: read again (the boot read was not decoded)\n");
++		nr_pon_log_dump();
++	}
++	if (!nr_pon_decoded) {
++		return -1;
++	}
++	*trigger = nr_pon_last_trigger;
++	*type_before = nr_pon_last_type;
++	*reset_after = nr_pon_reset_after;
++	return 0;
++}
++
++/*
++ * 0377: PS_HOLD reset type HARD_RESET before a restart, whatever the bootloader left (WARM_RESET on
++ * this phone): the PMIC then logs a new PON trigger (HARD_RESET), so the next boot does not see the
++ * old USB_CHARGER trigger again. 0 = set, -1 = not (logged).
++ */
++int negroni_reboot_hard_type(void);
++
++int
++negroni_reboot_hard_type(void)
++{
++	return nr_pon_set_type(NR_PON_TYPE_HARD_RESET);
++}
++
+ /*
+  * Reboot reason field of 0x7148 = reason (0 normal, 1 recovery,
+  * 2 bootloader); bit 0 is kept. 0 = set and read back, -1 = not set.
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index e1b5048..c29554f 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6885,6 +6885,16 @@ load_init_program(proc_t p)
+ 	mach_vm_offset_t scratch_addr = 0;
+ 	mach_vm_size_t map_page_size = vm_map_page_size(map);
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/*
++	 * Patch 0377: a power-on by the charger cable (boot-arg negronicharge=1) runs the kernel
++	 * charge-only mode here, before launchd. That call returns only for a normal boot; in the
++	 * mode it ends with a reboot into iOS or a power off.
++	 */
++	extern void negroni_charge_check(void);
++	negroni_charge_check();
++#endif
++
+ 	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
+ #if CONFIG_MEMORYSTATUS
+ 	(void) memorystatus_init_at_boot_snapshot();
+diff --git a/iokit/Kernel/arm/NegroniBattery.cpp b/iokit/Kernel/arm/NegroniBattery.cpp
+index b0c535f..e03691d 100644
+--- a/iokit/Kernel/arm/NegroniBattery.cpp
++++ b/iokit/Kernel/arm/NegroniBattery.cpp
+@@ -102,6 +102,10 @@ int negroni_spmi_bcl_monitor_on(void);                                  /* 0278
+ /* bsd/dev/negroni_batt_store.c (0278) */
+ int negroni_batt_store_load(int32_t *soc_centi, uint64_t *wall_s);
+ void negroni_batt_store_save(int32_t soc_centi);
++/* bsd/dev/negroni_charge.c (0377): what the charge-only mode shows and watches */
++void negroni_charge_batt_update(int percent, int percent_known, int external, int charging, unsigned usb_mv,
++    int vbus_measured);
++void negroni_charge_batt_plug(int external, unsigned usb_mv, int vbus_measured);
+ }
+ #include <sys/errno.h>
+ 
+@@ -336,6 +340,7 @@ private:
+ 	int32_t fCurAvg;           /* filtered battery current (mA, + = charging) */
+ 	int32_t fSocTarget;        /* the table value of fOcvMv (1/100 %) */
+ 	int fSocSrc;               /* NB_SOC_* */
++	bool fVbusMeasured;        /* 0377: the last full read's external state came from a VADC USBIN reading */
+ 	unsigned fOutliers;        /* conversions far from the filtered voltage, in a row */
+ 	int fSocLogKey;            /* the last logged percent/source/target */
+ 	unsigned fFastMs, fTicks;  /* plug tick period (0 = off) and ticks since the last full read */
+@@ -528,6 +533,19 @@ NegroniBattery::publish(unsigned percent, unsigned mv, int ma, int centiC, bool
+ {
+ 	const unsigned mah = (NB_DESIGN_MAH * percent + 50u) / 100u;
+ 	const bool measured = source != NB_SRC_STATIC;
++	/*
++	 * 0377 (review F1/F2): the charge-only mode's snapshot. A measured read gives its external state, "measured"
++	 * only when it came from this read's VADC USBIN value; the PD path (static source with the PD's SoC) gives
++	 * the PD's usb_online as a guess (only "present" counts); the static placeholder (100 %, external) gives
++	 * neither a percent nor a plug state (-1).
++	 */
++	if (measured) {
++		negroni_charge_batt_update((int)percent, 1, external, charging, usbMv, fVbusMeasured ? 1 : 0);
++	} else if (fSocSrc == NB_SOC_GLINK) {
++		negroni_charge_batt_update((int)percent, 1, external, charging, usbMv, 0);
++	} else {
++		negroni_charge_batt_update(-1, 0, -1, charging, usbMv, 0);
++	}
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(percent);
+ 	setMaxCapacity(100);
+@@ -1316,6 +1334,7 @@ NegroniBattery::poll(void)
+ 	/* Charger: the USBIN plug status of the charger (0272); else VBUS when the VADC measures it; else the
+ 	 * current direction with hysteresis (full on a charger: ~0 mA keeps the state). */
+ 	/* 0276: VBUS first (the plug tick uses it too; a disagreement would re-run the full read every tick) */
++	fVbusMeasured = s.usbOk;        /* 0377 */
+ 	if (s.usbOk) {
+ 		fExternal = s.usbMv >= NB_EXT_MV;
+ 	} else if (s.chgRead) {
+@@ -1633,6 +1652,9 @@ NegroniBattery::fastCheck(void)
+ 	}
+ 	uint64_t sinceMs = fFastNs && ns > fFastNs ? (ns - fFastNs) / 1000000ull : 0;
+ 	fFastNs = ns;
++	if (known) {
++		negroni_charge_batt_plug(ext, usbMv, fVadc ? 1 : 0);   /* 0377: every tick with a reading */
++	}
+ #if NB_HAVE_GLINK
+ 	/* 0365 (review C2): a new PD cycle with a new BATT_STATUS runs the full read at once (the bolt follows in ~1 s) */
+ 	if (!known || ext == fExternal) {

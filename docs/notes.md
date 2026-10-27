@@ -3186,3 +3186,25 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - 0345 (build-only): answers 5, 6, 8, 14, 17, 18, 106; accepts 86 (scan), 5, 365, 382; fix: DISASSOCIATE no longer
   looks like a driver LINK_DOWN to the next join (stale EAUTH could end it at once). Next: phone test with Settings >
   Wi-Fi open, then a WPA2 join (README "0345" Test).
+
+## 63. Cable power-on boots iOS: kernel charge-only mode, patch 0377 negronicharge (2026-10-27, charge kernel agent; details patches/xnu/README-charge.md)
+
+- [V] The shim does not pass ABL's `/chosen/bootargs` (e.g. `androidboot.mode=charger`) to XNU: `NegroniBootMemoryDxe.c`
+  reads only `/memory`, `/reserved-memory` and the initrd from ABL's DT; `NegroniXnuBoot.c` uses the `payload.bin`
+  command line. The kernel decides from the PMIC PON log (SDAM 0x7400) instead.
+- [V] Boot logs 10/13: `NEGRONI PON LOG: FIFO read failed at +0x4b` / `+0x9c` (offset changes). [I] Cause: the
+  NegroniBattery census uses the same EE 0 observer channel (APID 60) at that time. 0377: 4 tries per byte, header +
+  FIFO read until two passes agree (max 4); summary gets `after=` (a reset after the last PON trigger).
+- 0377 `negronicharge` (default 0 = dry run, log only; 1 = act; `negronicharge_force=1` = enter on every boot, test
+  only, never on boot_a). Hook: start of `load_init_program()` (init thread, before launchd). Enter when: last PON
+  trigger USB_CHARGER (0x31c2/0x8732) or `androidboot.mode=charger`, no reset after it, no warm/hard reset type before
+  it, power key up, VBUS present (NegroniBattery snapshot; "absent" only from a VADC USBIN reading).
+- Mode: no launchd, console drawing muted, battery screen in the boot framebuffer, screen off after 10 s, short press
+  = on, hold 2 s = PS_HOLD HARD_RESET + reason 0 + reset (next boot: trigger HARD_RESET = iOS), no VBUS 3 s = PMIC power
+  off (0214). USB ctl stays up. No charger writes (XBL defaults without the ADSP PD).
+- Host test: `scripts/kernel/test-charge-core.sh` (decision + state machine from the patch's header). Opus review
+  ACCEPT WITH FIXES: F1/F2/F4/F5 fixed; F3 (blocks the bootstrap thread) checked and not true.
+- Build: out/kernel/local-20261027-090703/kernel.development.negroni sha256 dceee47df05df4671ad5619d053e19f707bc6ba12d6a87d64b494dd8c2201a28 (277 applied, only the 4 usual dxb skips; 0377 applied; only the usual declaration-after-statement warnings). Not booted.
+- [U] The real PON trigger code of a cable power-on on this phone. Test order: dry run on a normal boot, RAM boot with
+  `BOOTARGS_ADD="negronicharge_force=1"` (screen, 10 s off, short press, `op10tool ctl reboot`, hold 2 s, unplug 3 s),
+  then `negronicharge=1` on boot_a (owner's go) and a real cable power-on.

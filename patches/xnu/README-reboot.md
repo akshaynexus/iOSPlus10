@@ -519,6 +519,8 @@ File: `bsd/dev/negroni_reboot.c` only. Applies after 0213; no later patch touche
   `USB_CHARGER`, Android then shows off-mode charging; under our boot chain it is iOS). The PON log at
   the next boot tells the two cases apart: `PON_TRIGGER USB_CHARGER` after `RESET_TYPE SHUTDOWN`
   (cable auto-boot) against `RESET_TYPE HARD_RESET`/`WARM_RESET` (the reset case fixed here).
+  Patch 0377 (README-charge.md) uses this for a kernel charge-only mode (`negronicharge`), and makes the
+  log read robust (the `FIFO read failed at +0x..` lines: per-byte retries, two equal passes).
 
 ### What 0214 changes
 
