@@ -42,6 +42,13 @@
    "LocationServicesEnabledIn8.0", "com.apple.locationd", "mobile", kCFPreferencesAnyHost) and takes a CFBoolean
    true or a non-zero CFNumber as "on". [I] the user "mobile" + AnyHost source is that file (cfprefsd's usual path).
    Normal way: Settings > Privacy & Security > Location Services, or `negroni-locd enable` on a live phone.
+8. InterfaceNamer WaitStackTimeout (env IFNAMER_WAIT_S, seconds; default 10, empty = off; proven t26 2026-10-27: wifid init 12 s after configd instead of 300 s): configd's InterfaceNamer
+   publishes Plugin:InterfaceNamer *QUIET* only through the IONetworkStack user client, and our kernel has no
+   IONetworkStack, so in about half of the boots the key gets *QUIET*/*TIMEOUT* only when the 300 s stack timer fires.
+   wifid's first SCNetworkInterfaceCopyAll waits for that key (__wait_for_IOKit_to_quiesce), so wifid init and the
+   Settings Wi-Fi page wait up to 5 min (logs/wifid-spindump-20261027-173347.txt, docs/notes.md section 71).
+   Sets WaitStackTimeout (a real) in /System/Library/SystemConfiguration/InterfaceNamer.bundle/Info.plist; configd
+   reads it at start. Live phone: scripts/wifi/phone-ifnamer-timeout.sh.
 """
 import argparse, glob, os, plistlib, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +68,22 @@ def merge_pref(root, name, values):
     with open(path, 'wb') as fh:
         plistlib.dump(data, fh, fmt=plistlib.FMT_BINARY)
     os.chown(path, MOBILE, MOBILE); os.chmod(path, 0o600)
+
+
+IFNAMER = 'System/Library/SystemConfiguration/InterfaceNamer.bundle/Info.plist'
+
+def ifnamer_wait(root, seconds):
+    """WaitStackTimeout = seconds (> 0) in configd's InterfaceNamer Info.plist; keeps owner, mode and binary format."""
+    if not seconds > 0:
+        raise SystemExit('IFNAMER_WAIT_S must be > 0')
+    path = os.path.join(root, IFNAMER)
+    st = os.stat(path)
+    data = plistlib.load(open(path, 'rb'))
+    data['WaitStackTimeout'] = float(seconds)
+    with open(path, 'wb') as fh:
+        plistlib.dump(data, fh, fmt=plistlib.FMT_BINARY)
+    os.chown(path, st.st_uid, st.st_gid); os.chmod(path, st.st_mode & 0o7777)
+    return f'WaitStackTimeout {float(seconds)} s in {IFNAMER}'
 
 
 def main():
@@ -139,6 +162,12 @@ def main():
             print('jetsam:', jetsam_widgets.patch_daemon(path, 'com.apple.lsd', int(lmb)))
     else:
         print('jetsam: LSD_JETSAM_MB empty, lsd limits left as is')
+
+    ifw = os.environ.get('IFNAMER_WAIT_S', '10')
+    if ifw:
+        print('interface namer:', ifnamer_wait(r, float(ifw)))
+    else:
+        print('interface namer: WaitStackTimeout left as is (IFNAMER_WAIT_S=10 sets 10 s; default 300 s)')
 
     if os.environ.get('LOCATION_SWITCH', '0') == '1':
         merge_pref(r, 'com.apple.locationd', {'LocationServicesEnabledIn8.0': True})

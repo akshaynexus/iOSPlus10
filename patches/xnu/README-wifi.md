@@ -1331,3 +1331,71 @@ wifid's own log, boot 16 #2 (pid 387):
   (boot 16 #2). No 0346 patch.
 - Root tweak: none until the spindump names the blocking call. If it is RunningBoard or cfprefsd, a root tweak cannot
   remove a framework call; a wifid restart job or a fix in that daemon is the next step.
+
+## wifid stall root cause: configd InterfaceNamer never publishes *QUIET* (2026-10-27, Wi-Fi agent; no kernel patch)
+
+Sources: `logs/wifid-spindump-20261027-173347.txt` (slide 0x26ebc000), 20H392 DSC `out/dsc/cache/dyld_shared_cache_arm64`
+(`ipsw dyld a2s` / `disass` / `dump`), `/usr/libexec/configd` and `InterfaceNamer.bundle/Info.plist` from
+`~/op10-apple/ios16-root.simg` (`scripts/audio/hfs-extract.py`), `logs/usblog-20261026-233816.txt`,
+`logs/usblog-20261027-171256.txt`, `logs/phone-log-20261027-004129.txt` (t23, configd log).
+
+### The blocking call [V]
+
+wifid thread 0x3ae (queue `com.apple.corewifi.XPC-common-mutex`), unslid:
+- CoreWiFi 0x1abdb5dc0 / 0x1abdb46a4 (XPC request work) -> 0x1abdb8948 (lazy `[[CWFSCNetworkInterface alloc] init...]`,
+  per interface name) -> 0x1abde28c0 (its init, queue `com.apple.corewifi.SC-interface-mutex`) -> 0x1abde34f0
+  (`SCNetworkInterfaceCopyAll`, it looks up BSD name -> MAC).
+- SystemConfiguration `__SCNetworkInterfaceCopyAllWithPreferences+532` -> `dispatch_once` ->
+  `__wait_for_IOKit_to_quiesce_block_invoke+324` -> `SCDynamicStoreNotifyWait+148` -> `waitForMachMessage+92` -> mach_msg.
+- The block ("Waiting for IOKit to quiesce (or timeout)") watches the configd key `Plugin:InterfaceNamer` and loops until
+  that dictionary has `*QUIET*`, `*COMPLETE*` or `*TIMEOUT*` (cfstrings at 0x1906ae083..). No timeout on the client side.
+- Receiver: configd (com.apple.SystemConfiguration.configd, pid 35), its builtin plugin InterfaceNamer. configd is
+  idle in the spindump: it has nothing to send, the key does not change.
+
+### Why configd does not publish the key [V disassembly, V timing]
+
+configd 20H392 InterfaceNamer:
+- quietCallback (0x100018468): on IOKit quiet (msg 0xe0000120) it adds `*QUIET*` to the in-memory state (addTimestamp
+  0x1000183d8 does not publish) and logs `IOKit quiet`. Then, if `S_connect` (IONetworkStack user client) is 0, it logs
+  `No network stack object` and returns before updateStore (0x100018ccc). It also keeps the quiet notification, so this
+  repeats (234 pairs in t23).
+- updateInterfaces (0x10001a1d4) also returns at once without `S_connect`.
+- `S_connect` is set only in stackCallback (0x100018894, `IOServiceOpen` on an `IONetworkStack` service). Our kernel has
+  no IONetworkStack class (IONetworkingFamily is not there; NegroniWLAN.cpp makes only IO80211Controller and an
+  IONetworkInterface). `IONetworkStack found` never appears in a log.
+- The only other publishers: the stack timer (0x100018710: `*TIMEOUT*`, `*TIMEOUT&NAMED*`, updateStore), created in setup
+  as now + WaitStackTimeout (Info.plist key, default 0x4072c00000000000 = 300.0 s), plus updateStore calls from
+  upgradeNetworkConfiguration (`*UPGRADED*`), the pre-configured list and the lockdown host trust list.
+- Timing: boot 16 configd exec 02:49:24, second wifid reached its init at 02:54:26 (+302 s). Spindump boot configd exec
+  17:32:38, wifid `gets 19` + `exec wifianalyticsd` at 17:37:39 (+301 s), also after a wifid restart at 17:35:15.
+  So the stall always ends at configd start + 300 s.
+- `logs/phone-full-20261027-1743.txt` (phone 05:13:21-05:14:20 = Mac 17:43:51-17:44:50) does not show the stall:
+  wifid[407] (the 17:35:15 restart) answers CoreWiFi XPC (mediaserverd INTERFACE ADDED / GET INTF NAME every ~2 s) and
+  issues en0 ioctls. It got through at 17:37:39 with the 300 s `*TIMEOUT*`, 6 min before the capture began. Side
+  notes [V]: `GET INTF NAME` ends err=6 because `Apple80211GetVirtualIfListCopy` returns -3903 (ifCount 0);
+  `APPLE80211_IOC_SET_PROPERTY` (383, IO80211AppState) fails errno 102; `CURRENT_NETWORK` -3903 (no association).
+- [I] Good boots (init in 3 s): one of the other updateStore calls ran after the first quietCallback and published the
+  state with `*QUIET*` in it. Which one is a race (not proven); that gives the "about half of the boots".
+- Our en0 IORegistry properties are not the cause: InterfaceNamer does not reach the interface code without the stack.
+
+### Fix
+
+- Root / live tweak (default off): `WaitStackTimeout` (real, seconds) in
+  `/System/Library/SystemConfiguration/InterfaceNamer.bundle/Info.plist`; setup (0x100016cfc) reads it from the
+  bundle info dictionary. With 10 s the key gets `*TIMEOUT*` 10 s after configd starts; wifid starts later, so it never
+  waits. Same end state as today at 300 s.
+  - Root image: `IFNAMER_WAIT_S=10` for `scripts/ios16/root-tweaks-extra.py` (item 8).
+  - Live phone: `scripts/wifi/phone-ifnamer-timeout.sh on 10`, reboot; `off` restores `Info.plist.orig`; `status`.
+  - [U] The bundle has `_CodeSignature/CodeResources` with a hash of Info.plist; it is a builtin plugin with no
+    executable, CFBundle does not check it [I]. Check `status` and the configd log after the reboot.
+- Kernel option (not done, larger): an `IONetworkStack` IOService whose newUserClient gives a user client that accepts
+  `setProperties` (InterfaceNamer names interfaces with IOConnectSetCFProperties, key `IONetworkStackUserCommand`).
+  Then quietCallback publishes `*QUIET*` / `*QUIET&NAMED*` on the first quiet. Risk: InterfaceNamer then runs its
+  naming code and writes NetworkInterfaces.plist for en0; not checked.
+
+### Test
+
+1. `scripts/wifi/phone-ifnamer-timeout.sh on 10`, reboot (or root with `IFNAMER_WAIT_S=10`).
+2. Kernel log: `wifid gets 19 (POWER)` and `exec wifianalyticsd` within ~5 s of `exec wifid`, in every boot (try 4+ boots).
+3. Phone log configd: `timed out waiting for IOKit to quiesce` about 10 s after configd start.
+4. Settings > Wi-Fi opens the list at once.

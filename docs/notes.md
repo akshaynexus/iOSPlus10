@@ -3365,3 +3365,18 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   HLOS USB driver re-inits the PHY at each role change. Not booted yet.
 - Build [V]: out/kernel/local-20261027-115931/kernel.development.negroni sha256
   de9908ce7d530e80c2633efda81114ad56df8e0fa510ab31fdf41a655fbb5ae5 (the 4 usual dxb skips). Not booted, no image.
+
+## 71. Wi-Fi: Settings hangs on Wi-Fi because configd InterfaceNamer never publishes *QUIET* (no IONetworkStack); WaitStackTimeout tweak (2026-10-27, Wi-Fi agent; no kernel patch, details patches/xnu/README-wifi.md "wifid stall root cause")
+- [V] Spindump (`logs/wifid-spindump-20261027-173347.txt`): wifid's first `SCNetworkInterfaceCopyAll` (CoreWiFi
+  `CWFSCNetworkInterface` init on the XPC-common-mutex queue) is in `__wait_for_IOKit_to_quiesce`, a
+  `SCDynamicStoreNotifyWait` loop on configd key `Plugin:InterfaceNamer` until it has `*QUIET*`, `*COMPLETE*` or `*TIMEOUT*`.
+  Every other wifid queue waits on that thread, so the WiFiManager server is not up and Settings waits.
+- [V] configd InterfaceNamer adds `*QUIET*` but publishes only with an IONetworkStack user client (`No network stack
+  object` x234 in t23). Our kernel has no IONetworkStack. The stack timer (WaitStackTimeout, default 300 s) publishes
+  `*TIMEOUT*`. Boot 16 and the spindump boot: wifid init at configd exec + 302 s and + 301 s.
+- [V] `logs/phone-full-20261027-1743.txt` was taken after the stall ended (wifid[407] passed at 17:37:39, configd + 301 s);
+  it shows wifid working (XPC answers, en0 ioctls), not the wait.
+- [I] Good boots: another updateStore (upgrade / pre-configured / lockdown trust list) published `*QUIET*` early; a race.
+- Fix (default off): `WaitStackTimeout` in `InterfaceNamer.bundle/Info.plist`. Root: `IFNAMER_WAIT_S=10`
+  (`scripts/ios16/root-tweaks-extra.py` item 8). Live: `scripts/wifi/phone-ifnamer-timeout.sh on 10`, reboot.
+  Not tested on the phone. Kernel option (IONetworkStack stub with a user client) is in the README, not done.
