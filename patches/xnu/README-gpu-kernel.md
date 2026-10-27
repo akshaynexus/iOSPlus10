@@ -1807,3 +1807,52 @@ it is lost between backboardd's display path and the panel.
 - Phone: open Maps; the panel must match `scripts/screenshot/phone-shot.sh` (map visible under the UI, also after a
   pan and with the sheet moved). Log: the `0398 ... composed` line, `DBUF in-place 0` while Maps draws, no
   `0398 layer ... not composed` line for Maps. Then other apps: unchanged (single-layer frames).
+
+## 31. Wired memory guard for surfaces and GPU buffers (0399, `0399-negroni-wired-guard.patch`)
+
+### Problem
+- Two whole-userland freezes in `logs/usblog-20261027-171256.txt` (Safari video, camera session just before each):
+  20:25:36-20:26:36 `VM_compressor` 80 %, `VM_pageout_scan` 64-73 %, `VM_pageout_external_iothread` 37-45 %; from
+  20:27:36 every user process 0.0-0.1 % until the reboot at 20:32-20:34. Second boot: 20:37:42 `VM_pageout_scan` 81 %,
+  all user processes under 6 %, then the phone interface went away at 20:38:19. Thread counts stay normal
+  (950-1388). No jetsam kill (`CRASH ... sig 9`) in either freeze.
+- Kernel-allocated IOSurfaces (IOBufferMemoryDescriptor, cap 1536 MiB), RedwoodGPU buffers of a client's own
+  (1024 MiB per client, 10+ clients) and host imports / client-memory wraps (prepare() of the task's pages) are wired.
+  XNU cannot compress or page out wired pages.
+
+### What 0399 does
+- `NegroniWiredAllow(bytes, who, what)` (NegroniSurface.cpp, declared in NegroniGPU.h): refuses when
+  `vm_page_wire_count * PAGE_SIZE + bytes` is above 55 % of `max_mem` (1689 MiB of 3072 MiB). backboardd and
+  SpringBoard get 65 % (1996 MiB): a refusal there is a black screen or a respring loop.
+- Callers (answer `kIOReturnNoMemory`): surface create (kernel buffer only; display slots are not RAM XNU
+  manages and are not checked), client-memory wrap sel 6/7, RedwoodGPU `makeBuffer` own buffer (not the
+  write-combined pool, which is outside XNU RAM), host import 0x49. `importSurface` is not checked (the pages are
+  already wired).
+- Lines: one start line `NEGRONI WIRED: guard on: ...` (or `off: <reason>`), one `near the limit` line per boot
+  at 90 % of the limit, `refused ...` lines (the first 8, then every 256th). Kill switch `negroniwiredguard=0`.
+
+### Counter facts (xnu-8796 source)
+- `vm_page_wire_count` starts as all pages XNU does not hand to the free list (kernelcache, early allocations:
+  `vm_page_wire_count_initial`) and then counts every wired page.
+- Compressor pages are not in it: `kernel_memory_populate_object_and_unlock` subtracts KMA_COMPRESSOR pages
+  ("the compressor wired pages don't really count as wired").
+- The GPU write-combined pool (512 MiB at 0x980000000) and the display slots are outside `max_mem`.
+- Baseline: `NEGRONI KMEM: before root mount` shows 5508 wired pages of 16 KiB = 86 MiB, 2980 MiB free.
+
+### Review (2026-10-27, Opus)
+- [I] The diagnosis is not proven by the log: it has no wired, free or compressed count at runtime. The
+  compressor at 80 % also fits a working set of anonymous memory that is too large. The `near the limit` and
+  `refused` lines give the first runtime numbers.
+- Per-task charging (Apple charges IOSurface memory to the owner with `setOwnership` / ledger tags) is not
+  modest here: `vm_object_ownership_change` refuses a non-purgeable object that already has resident pages, and our
+  buffers are wired at allocation. Host imports and wraps are the task's own anonymous pages and are already in its
+  `phys_footprint`.
+- Fixes: UI reserve for backboardd/SpringBoard, the near-limit line, wrap refusal kind 8 (kind 7 was also
+  "no free surface id", so one of the two lines was never logged).
+
+### Verification
+- Compile: STAGE=0 scratch tree with all patches/xnu through 0399, `scripts/kernel/compile-one.sh`:
+  NegroniSurface.cpp, NegroniGPU.cpp, NegroniFramebuffer.cpp OK, no new warning. `git apply --check` on the tree
+  before 0399: OK. Not booted.
+- Phone: Safari video for 10 min. Expect the start line, then either no `refused` line or `refused` lines for
+  WebKit only, and no freeze. If backboardd or SpringBoard shows in a `refused` line, raise the UI percent.

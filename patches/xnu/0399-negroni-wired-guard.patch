@@ -1,0 +1,170 @@
+diff --git a/iokit/Kernel/arm/NegroniGPU.cpp b/iokit/Kernel/arm/NegroniGPU.cpp
+index a8ad66a..74266bf 100644
+--- a/iokit/Kernel/arm/NegroniGPU.cpp
++++ b/iokit/Kernel/arm/NegroniGPU.cpp
+@@ -973,6 +973,9 @@ RedwoodGPUUserClient::makeBuffer(uint64_t size, uint32_t flags, bool scalar, uin
+ 		}
+ 	}
+ 	if (b->memory == NULL) {
++		if (!NegroniWiredAllow(size, fName, "GPU buffer")) {     /* 0399: wired kernel RAM */
++			goto fail;
++		}
+ 		b->memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut |
+ 		    kIOMemoryKernelUserShared, (vm_size_t)size, PAGE_SIZE);
+ 		b->kind = kBufferOwn;
+@@ -1100,6 +1103,9 @@ RedwoodGPUUserClient::importHost(uint64_t pointer, uint64_t size, uint32_t flags
+ 	if (fHostBytes + size > GPU_CLIENT_HOST_BYTES) {
+ 		return kIOReturnNoMemory;
+ 	}
++	if (!NegroniWiredAllow(size, fName, "GPU host import")) {     /* 0399: prepare() wires the pages */
++		return kIOReturnNoMemory;
++	}
+ 	b = newBuffer(handle);
+ 	if (b == NULL) {
+ 		IOLog("RedwoodGPU: %s has no handles left\n", fName);
+diff --git a/iokit/Kernel/arm/NegroniGPU.h b/iokit/Kernel/arm/NegroniGPU.h
+index 7804b21..01dce51 100644
+--- a/iokit/Kernel/arm/NegroniGPU.h
++++ b/iokit/Kernel/arm/NegroniGPU.h
+@@ -66,5 +66,19 @@ void NegroniGPUSurfaceForCPU(NegroniSurface *s, uint64_t offset, uint64_t length
+ #define NEGRONI_SURFACE_GPU_WAIT_MS 50          /* the same bound as the framebuffer's NEGRONI_FB_GPU_WAIT_MS */
+ uint32_t NegroniGPUSurfaceWaitMS(void);
+ 
++/*
++ * 0399 (wired memory guard, NegroniSurface.cpp): IOSurfaces, RedwoodGPU buffers of their own and
++ * host imports are wired pages that no task footprint counts, so jetsam never frees them. true when
++ * bytes more wired pages keep the system's wired count (vm_page_wire_count) at or below
++ * NEGRONI_WIRED_GUARD_PERCENT of max_mem (NEGRONI_WIRED_GUARD_UI_PERCENT when who is backboardd or
++ * SpringBoard); one "NEGRONI WIRED: near the limit" line per boot at 90 % of it; else one rate-limited
++ * "NEGRONI WIRED: refused" line and
++ * false (the caller answers kIOReturnNoMemory). Always true before IOCoreSurfaceRoot started and with
++ * boot-arg negroniwiredguard=0 (kill switch).
++ */
++#define NEGRONI_WIRED_GUARD_PERCENT 55
++#define NEGRONI_WIRED_GUARD_UI_PERCENT 65       /* backboardd and SpringBoard (who): a reserve above the limit */
++bool NegroniWiredAllow(uint64_t bytes, const char *who, const char *what);
++
+ #endif /* NEGRONI */
+ #endif /* _NEGRONI_GPU_H */
+diff --git a/iokit/Kernel/arm/NegroniSurface.cpp b/iokit/Kernel/arm/NegroniSurface.cpp
+index 3bbe968..1c16031 100644
+--- a/iokit/Kernel/arm/NegroniSurface.cpp
++++ b/iokit/Kernel/arm/NegroniSurface.cpp
+@@ -95,6 +95,83 @@ static uint32_t      negroni_surface_creates_logged;
+ static uint64_t      negroni_surface_wired;       /* bytes of buffer surfaces */
+ #define NEGRONI_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
++/*
++ * Patch 0399: wired memory guard (NegroniGPU.h NegroniWiredAllow). Freeze of 2026-10-27 20:24 and
++ * 20:36 (Safari video, logs/usblog-20261027-171256.txt): VM_pageout_scan / VM_compressor /
++ * VM_pageout_external_iothread at 60-80 % of a CPU each, then every user thread at 0 %: the
++ * pageable memory was gone. Surfaces (up to 1536 MiB) and every GPU client (1024 MiB own + 1024 MiB
++ * host imports) may wire far more than the 3072 MiB this kernel has, and no footprint counts it.
++ * The guard keeps the system's wired pages at or below NEGRONI_WIRED_GUARD_PERCENT of max_mem.
++ * Compressor pages are not in vm_page_wire_count (VM_PAGE_USED_BY_COMPRESSOR), the GPU pool and the
++ * display slots are outside the kernel's RAM, so the count is wired kernel and driver memory.
++ */
++extern "C" unsigned int vm_page_wire_count;
++extern "C" unsigned int vm_page_free_count;
++/* max_mem: mach/vm_param.h */
++static uint64_t      negroni_wired_limit;          /* bytes; 0 = guard off (not started, or negroniwiredguard=0) */
++static uint32_t      negroni_wired_refusals;
++static bool          negroni_wired_near;           /* the one "near the limit" line was logged */
++
++static void
++negroni_wired_guard_start(void)
++{
++	uint32_t on = 1;
++	uint64_t wired = (uint64_t)vm_page_wire_count * PAGE_SIZE;
++
++	PE_parse_boot_argn("negroniwiredguard", &on, sizeof(on));
++	if (!on) {
++		IOLog("NEGRONI WIRED: off: negroniwiredguard=0\n");
++		return;
++	}
++	uint64_t limit = max_mem / 100 * NEGRONI_WIRED_GUARD_PERCENT;
++	if (max_mem == 0 || vm_page_wire_count == 0 || wired >= limit) {
++		IOLog("NEGRONI WIRED: off: max_mem %llu MiB, %llu MiB wired at start (limit %u%%)\n",
++		    max_mem >> 20, wired >> 20, NEGRONI_WIRED_GUARD_PERCENT);
++		return;
++	}
++	__atomic_store_n(&negroni_wired_limit, limit, __ATOMIC_RELEASE);
++	IOLog("NEGRONI WIRED: guard on: surfaces, GPU buffers and host imports refused above %llu MiB wired "
++	    "(%u%% of %llu MiB; backboardd and SpringBoard up to %u%%); %llu MiB wired, %llu MiB free now; "
++	    "negroniwiredguard=0 = off\n",
++	    limit >> 20, NEGRONI_WIRED_GUARD_PERCENT, max_mem >> 20, NEGRONI_WIRED_GUARD_UI_PERCENT, wired >> 20,
++	    ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20);
++}
++
++bool
++NegroniWiredAllow(uint64_t bytes, const char *who, const char *what)
++{
++	uint64_t limit = __atomic_load_n(&negroni_wired_limit, __ATOMIC_ACQUIRE);
++
++	if (limit == 0) {
++		return true;
++	}
++	/*
++	 * The UI shell keeps a reserve above the limit: backboardd's render targets and SpringBoard's
++	 * surfaces are what the screen needs; a refusal there is a black screen or a respring loop,
++	 * while a refused app (WebKit, an extension) takes its other path or exits.
++	 */
++	if (who != NULL && (strcmp(who, "backboardd") == 0 || strcmp(who, "SpringBoard") == 0)) {
++		limit = max_mem / 100 * NEGRONI_WIRED_GUARD_UI_PERCENT;
++	}
++	uint64_t wired = (uint64_t)vm_page_wire_count * PAGE_SIZE;
++	if (wired + bytes <= limit) {
++		if (wired + bytes > limit / 10 * 9 && !__atomic_exchange_n(&negroni_wired_near, true, __ATOMIC_RELAXED)) {
++			IOLog("NEGRONI WIRED: near the limit: %s of %llu KiB for %s: %llu MiB wired, limit %llu MiB, "
++			    "surfaces %llu MiB (once per boot)\n", what, bytes >> 10, who != NULL ? who : "?", wired >> 20,
++			    limit >> 20, __atomic_load_n(&negroni_surface_wired, __ATOMIC_RELAXED) >> 20);
++		}
++		return true;
++	}
++	uint32_t n = OSIncrementAtomic((volatile SInt32 *)&negroni_wired_refusals) + 1;
++	if (n <= 8 || (n & 255) == 0) {
++		IOLog("NEGRONI WIRED: refused %s of %llu KiB for %s: %llu MiB wired, limit %llu MiB, %llu MiB free, "
++		    "surfaces %llu MiB (refusal %u)\n", what, bytes >> 10, who != NULL ? who : "?", wired >> 20,
++		    limit >> 20, ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20,
++		    __atomic_load_n(&negroni_surface_wired, __ATOMIC_RELAXED) >> 20, n);
++	}
++	return false;
++}
++
+ /* Display slots (negroni_surface_set_display_slots), under negroni_surface_lock. */
+ static uint64_t      negroni_slot_phys, negroni_slot_size;
+ static uint32_t      negroni_slot_count, negroni_slot_width, negroni_slot_height, negroni_slot_format;
+@@ -540,6 +617,7 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 	negroni_surface_plane_bpr_at = planebpr ? 0x10 : 0x08;
+ 	IOLog("NEGRONI SURF: plane bytesPerRow at +0x%x of each plane record (%s)\n", negroni_surface_plane_bpr_at,
+ 	    planebpr ? "IOSurface 20H392 layout" : "off: negronisurf_planebpr=0, old 0046 layout");
++	negroni_wired_guard_start();     /* 0399 */
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("NEGRONI SURF: IOCoreSurfaceRoot registered\n");
+@@ -879,7 +957,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&negroni_surface_wired) +
+-		    s->allocSize <= NEGRONI_SURFACE_WIRED_MAX) {
++		    s->allocSize <= NEGRONI_SURFACE_WIRED_MAX &&
++		    NegroniWiredAllow(s->allocSize, who, "surface")) {     /* 0399 */
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+ 		}
+@@ -1016,6 +1095,15 @@ IOSurfaceRootUserClient::wrapClient(uint32_t selector, IOExternalMethodArguments
+ 			ret = kIOReturnNoMemory;
+ 			goto fail;
+ 		}
++		char wname[32];
++		proc_selfname(wname, sizeof(wname));
++		if (!NegroniWiredAllow(round_page_64(size), wname, "client memory wrap")) {     /* 0399 */
++			s->release();
++			why = "over the wired memory guard (0399)";
++			kind = 8;     /* 7 is "no free surface id" (one line per kind) */
++			ret = kIOReturnNoMemory;
++			goto fail;
++		}
+ 		ret = negroni_surface_wrap_task_memory(s, fTask, address, size);
+ 		if (ret != kIOReturnSuccess) {
+ 			s->release();
