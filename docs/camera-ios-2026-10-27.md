@@ -196,3 +196,95 @@ None writes a partition. A hung Camera.app launch is limited by the root tweak `
 - A crash in the plug-in kills mediaserverd (audio too); launchd restarts it, and the next start crashes again.
   Then `phone-camera.sh off` (works before the hooks install) or `revert`.
 - The section 6 risks stay (IFE latch event, Bayer order, gain formula, CPU ISP speed at 12 MP).
+
+## 8. 2026-10-27 18:00: Camera.app hangs in launch: no capture server in mediaserverd (root cause + fix)
+
+Marks: [V] seen in a tool output or a file, [I] inference.
+
+### Observations [V]
+
+- `logs/camlog4-full.txt`: Camera[702] logs `Camera launched.`, the two orientation lines, and then nothing from its main
+  thread. Its UIKit adds deactivation reasons 10, 5, 11 and never removes one (MobileSafari in `camlog3` removes 10 at
+  +0.5 s, then 11 and 12). No tccd request for kTCCServiceCamera, no CMCapture/AVFCapture line, no capture session in
+  mediaserverd, no `ios session: start` in the kernel. The same in `camlog5` (Camera[301], started at boot).
+- FrontBoard stackshots on the phone, `Camera-2026-10-27-050719.ips` and `-051639.ips` (copied to `logs/`; "failed to
+  terminate gracefully"): `python3 -I scripts/debug/ips-stackshot.py logs/Camera-2026-10-27-051639.ips Camera`:
+  - main thread: `-[CAMApplicationDelegate application:didFinishLaunchingWithOptions:]` ->
+    `_createSubsystemsWithLaunchOptions:` -> `-[CUCaptureController init...]` -> `-[CAMCaptureEngine
+    initWithPowerController:options:]` -> `prewarmedCaptureSession` -> `_prewarmAVCaptureSession` ->
+    `_dispatch_once_wait` (the once is owned by the session-queue thread);
+  - `com.apple.camera.capture-engine.session-queue`: `-[AVCaptureSession init]` -> `pthread_once` ->
+    `csr_ensureClientEstablished` -> `FigXPCRemoteClientCreate` -> `xpc_connection_send_message_with_reply_sync`;
+    `turnstileInfo`: "turnstile blocked on task pid 1". The block sends to `"com.apple.coremedia.capturesource"`
+    (CMCapture 20H392 0x1a20307ec..0x1a2030820, `ipsw dyld disass`).
+  - mediaserverd (pid 460) in the same stackshot: no CMCapture or capture-server thread.
+  So launchd (pid 1) still holds the receive right of the service: nobody checked it in.
+- `com.apple.mediaserverd.plist` (20H392) has `com.apple.coremedia.capturesource`, `capturesession`, `cameraviewfinder`
+  in MachServices. iOS 16.7 has no cameracaptured.
+- Who starts them: mediaserverd `main` -> `FigMediaServerStart` (MediaToolbox 0x194fee230) -> `if
+  (feServer_ShouldStartSubServer(plist, "StartRecorderServer")) FigStartCaptureServers()` (CMCaptureCore 0x1d3fdc828:
+  FigCaptureMemoryReporterStart, FigPreloadShaders, FigCaptureSourceServerStart, FigCameraViewfinderServerStart,
+  FigCaptureSessionServerStart, FigFlashlightServerStart, FigCaptureDeferredContainerManagerServerStart). The plist
+  is `CelestialCFCreatePropertyList("SubServerConfiguration.plist")` = `MediaToolbox.framework/D22/...`.
+- On the phone, `D22`, `D221` and `Default/SubServerConfiguration.plist` all have `StartRecorderServer` **false**. Set by
+  slop `sweet-root-tweaks.py` and by our `scripts/audio/root-add-audio.sh` step 3 (2026-10: "the portrait prewarm calls
+  a NULL GL function without a GPU", a mediaserverd crash loop).
+- HAL plug-ins load in `AudioToolboxServerInit` before `FigMediaServerStart` (camlog4: `HALS_PlugInManager::LoadPlugIns`
+  24.109, all 8 hooks replaced at 24.191, the Fig servers after that). So our portrait-prewarm stub is in place before
+  any capture server code can run.
+- MobileGestalt: the cache (`systemgroup.com.apple.mobilegestaltcache/.../com.apple.MobileGestalt.plist`, read over SSH)
+  has CacheVersion 20H392, 5346 entries in CacheData (bit-packed, keys hashed); no camera key in CacheExtra. [I] The
+  icon shows and CameraUI starts its capture engine, so the MobileGestalt camera answers are not the blocker.
+- HakiOS (`out/src/hackios-next`) does not touch SubServerConfiguration: its hooks come in by launchd
+  `DYLD_INSERT_LIBRARIES` before `main`, and its root keeps the stock plist [I: the stock value is true; with false no
+  iPhone could use its camera]. Everything else HakiOS needed (VIS refused, audio source 'nope', quality, GNR,
+  NULL samples, HEVC encoder, buffer pool, metadata) is already in our 8 hooks and `camera_device.c`.
+
+### Root cause [V for the chain, I for "nothing else blocks after it"]
+
+StartRecorderServer = false on our root -> mediaserverd never starts the capture servers -> launchd keeps
+`com.apple.coremedia.capturesource` -> `-[AVCaptureSession init]` in Camera.app waits for ever in its first XPC
+message -> the main thread waits on the same dispatch_once in `didFinishLaunching` -> no UI, black screen, no
+device-vendor call, no `/dev/negronicam` open. Our hooks worked (all 8 replaced); nobody asked for a device.
+
+### Fix (build only; nothing written on the phone)
+
+- `userland/camera/media_hooks.c`: the constructor queues `start_capture_servers()` on the main queue (runs once
+  mediaserverd's `main` is in its run loop, after FigMediaServerStart). It:
+  1. reads the same plist with `CelestialCFCreatePropertyList` and does nothing when StartRecorderServer is on (no
+     double start);
+  2. needs the portrait prewarm stub and the vendor hook replaced, else it does not start (the old crash);
+  3. calls FigStartCaptureServers' list in its order **without FigPreloadShaders** (a Metal shader precompile; its other
+     effect is flags for SIS/TMBNR/HDR/GNR processors that this phone does not have; `FigWaitForPreloadShadersCompletion`
+     with no preload queue returns at once [V disasm]);
+  4. knobs in `/var/db/negronicam`: `noservers` = do not start (Camera.app then hangs as before), `preload` = call the stock
+     `FigStartCaptureServers` with the shader preload. The old `off` switch stops everything (no hooks, no servers).
+  Log lines: `negroni: camera hooks: capture servers started (6 of 6, shader preload skipped): ...`.
+- No root change: StartRecorderServer stays false (audio keeps the old safe state; the servers come only with our
+  plug-in and its hooks).
+- `scripts/camera/phone-camera.sh servers on|off` (the `noservers` file + restart); `status` shows StartRecorderServer and
+  the Camera.app process.
+- `scripts/debug/ips-stackshot.py`: symbolicates a FrontBoard stackshot `.ips` (all threads, waitInfo, turnstiles).
+- Build: `userland/camera/build.sh` -> `out/camera/ios/NegroniCamera.driver/NegroniCamera` 145 008 bytes, sha256
+  35f07636079acc1d52d750cbe38053b413a863bbc45b031372860b7affb5ab11 (18:14, after the review: all-or-nothing start). `scripts/camera/check-cache.sh` PASS (all new dlsym names exported).
+
+### Test (main session)
+
+1. `scripts/camera/phone-camera.sh push` (installs the bundle, kills Camera.app and mediaserverd; launchd restarts it).
+2. `scripts/bg.sh camlog scripts/camera/phone-camera.sh log`. Expect after the mediaserverd start: the old lines (hooks,
+   8 replaced, HAL factory) and then `capture servers started (6 of 6, shader preload skipped)`.
+   `scripts/camera/phone-camera.sh status`: mediaserverd keeps its pid (no crash loop).
+3. Open Camera.app. Expect `the camera's device vendor made`, `the device made: one stream`, `stream: frames begin`;
+   kernel (USB log) `NEGRONI CAM: ios session: start (IMX789)`. The app UI (shutter, modes) shows even without frames.
+4. If Camera.app still hangs: new `.ips` in `/var/mobile/Library/Logs/CrashReporter/` -> `scripts/net/ssh-phone.sh pull`
+   -> `scripts/debug/ips-stackshot.py FILE Camera,mediaserverd`.
+5. Rollback: mediaserverd crash loop or no audio -> `phone-camera.sh servers off` (or `off`, or `revert prev`).
+   A crash in FigCaptureSourceServerStart / our device: `servers off`, then report the mediaserverd `.ips`.
+
+### Risks [I]
+
+- The capture servers have never run on this root: a crash in their start (e.g. FigFlashlightServerStart without a torch,
+  FigCaptureSourceInitialize with our vendor) kills mediaserverd, so audio too. `servers off` is the hot way back.
+- The server checks camera access with tccd; tccd here fails to make sandbox extensions ("Failed to issue sandbox
+  extension", camlog3) but answers authValue 2. Camera.app has the private TCC entitlement.
+- The `preload` knob runs Metal shader compiles in mediaserverd; use it only to test the GPU path.

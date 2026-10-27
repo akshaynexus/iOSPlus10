@@ -21,11 +21,14 @@
  * function (camera_device.c). With /dev/negronicam absent or failed, that create function fails at once,
  * so the capture stack has a vendor with no device instead of none at all [I: Camera.app shows its
  * "camera not available" state; the stock nil vendor came with a hung Camera launch, docs/notes.md "2026-10-26 handoff (main session, afternoon)"].
+ * The capture servers: our root has StartRecorderServer false, so mediaserverd does not start them; the
+ * constructor queues start_capture_servers() (below), which starts them after the hooks are in.
  * Scripts: scripts/camera/check-cache.sh checks the table against the cache on the host.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
@@ -374,6 +377,7 @@ static struct replacement {
 };
 
 static unsigned replaced, left_alone;
+static bool replaced_ok[sizeof(replacements) / sizeof(replacements[0])];   /* this entry's method is ours now */
 
 static void
 image_added(__unused const struct mach_header *header, __unused intptr_t image_slide)
@@ -406,6 +410,7 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 			*r->original = original;
 		}
 		method_setImplementation(method, r->replacement);
+		replaced_ok[i] = true;
 		replaced++;
 		say("negroni: camera hooks: %c[%s %s] replaced (%u of %zu)\n", r->instance ? '-' : '+', r->class_name, r->selector,
 		    replaced, sizeof(replacements) / sizeof(replacements[0]));
@@ -427,6 +432,122 @@ pin_self(void)
 		return false;
 	}
 	return true;
+}
+
+/*
+ * The capture servers (docs/camera-ios-2026-10-27.md section 8). mediaserverd starts them in FigMediaServerStart
+ * (MediaToolbox) only when SubServerConfiguration.plist has StartRecorderServer true, and our root has it false
+ * (slop sweet-root-tweaks.py and scripts/audio/root-add-audio.sh: the portrait-filter prewarm of those servers
+ * called a NULL GL function before there was a GPU). Without the servers, launchd keeps the receive rights of
+ * com.apple.coremedia.capturesource / capturesession / cameraviewfinder (mediaserverd's MachServices), so
+ * -[AVCaptureSession init] in Camera.app waits for ever in csr_ensureClientEstablished -> FigXPCRemoteClientCreate
+ * ("com.apple.coremedia.capturesource", CMCapture 20H392 0x1a20307ec..0x1a2030820; the stackshots
+ * Camera-2026-10-27-050719/051639.ips: "turnstile blocked on task pid 1") and Camera.app stays black.
+ * Here, after the hooks are in (the portrait prewarm is a stub), the plug-in starts them itself, on the main
+ * queue, so after FigMediaServerStart: the same functions FigStartCaptureServers (CMCaptureCore) calls, in its
+ * order, except FigPreloadShaders (a Metal shader precompile; its only other effects are flags for ISP
+ * processors this phone does not have). Knobs in /var/db/negronicam: "noservers" = do not start them;
+ * "preload" = call the stock FigStartCaptureServers (with the shader preload) instead.
+ */
+#define NEGRONICAM_NOSERVERS_FILE "/var/db/negronicam/noservers"
+#define NEGRONICAM_PRELOAD_FILE "/var/db/negronicam/preload"
+
+/* the stock rule (feServer_ShouldStartSubServer in MediaToolbox): no plist or no key = start; else the key's value */
+static int
+stock_starts_capture_servers(void)
+{
+	CFPropertyListRef (*create)(CFStringRef) = dlsym(RTLD_DEFAULT, "CelestialCFCreatePropertyList");
+	CFPropertyListRef plist;
+	const void *value = NULL;
+	int starts = 1;
+
+	if (create == NULL) {
+		return -1;
+	}
+	plist = create(CFSTR("SubServerConfiguration.plist"));
+	if (plist != NULL && CFGetTypeID(plist) == CFDictionaryGetTypeID() &&
+	    CFDictionaryGetValueIfPresent((CFDictionaryRef)plist, CFSTR("StartRecorderServer"), &value) &&
+	    value != NULL && CFGetTypeID(value) == CFBooleanGetTypeID()) {
+		starts = value == kCFBooleanTrue;
+	}
+	if (plist != NULL) {
+		CFRelease(plist);
+	}
+	return starts;
+}
+
+static void
+start_capture_servers(__unused void *context)
+{
+	int stock = stock_starts_capture_servers();
+	void (*full)(void);
+
+	if (stock != 0) {
+		say(stock > 0 ? "negroni: camera hooks: capture servers: StartRecorderServer is on, mediaserverd starts them itself\n" :
+		    "negroni: camera hooks: capture servers NOT started: CelestialCFCreatePropertyList not found (cannot tell whether "
+		    "mediaserverd starts them)\n");
+		return;
+	}
+	if (access(NEGRONICAM_NOSERVERS_FILE, F_OK) == 0) {
+		say("negroni: camera hooks: capture servers NOT started: %s exists (Camera.app will wait at launch)\n",
+		    NEGRONICAM_NOSERVERS_FILE);
+		return;
+	}
+	if (objc_getClass("BWCoreImageFilterRenderer") == NULL &&
+	    dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_NOW | RTLD_GLOBAL) == NULL) {
+		say("negroni: camera hooks: capture servers NOT started: CMCapture does not load (%s)\n", dlerror());
+		return;
+	}
+	/* replacements[0] = the portrait prewarm (the old crash), [1] = the device vendor */
+	if (!replaced_ok[0] || !replaced_ok[1]) {
+		say("negroni: camera hooks: capture servers NOT started: the portrait prewarm (%s) or the vendor (%s) is not replaced\n",
+		    replaced_ok[0] ? "ok" : "stock", replaced_ok[1] ? "ok" : "stock");
+		return;
+	}
+	if (access(NEGRONICAM_PRELOAD_FILE, F_OK) == 0) {
+		if ((full = dlsym(RTLD_DEFAULT, "FigStartCaptureServers")) == NULL) {
+			say("negroni: camera hooks: capture servers NOT started: %s exists but FigStartCaptureServers not found\n",
+			    NEGRONICAM_PRELOAD_FILE);
+			return;
+		}
+		say("negroni: camera hooks: capture servers: FigStartCaptureServers (with the shader preload, %s)\n", NEGRONICAM_PRELOAD_FILE);
+		full();
+		say("negroni: camera hooks: capture servers started (stock list): com.apple.coremedia.capturesource/capturesession answer now\n");
+		return;
+	}
+	{
+		/* FigStartCaptureServers' list and order (20H392 CMCaptureCore 0x1d3fdc828), without FigPreloadShaders */
+		const struct {
+			const char *name;
+			void (*start)(void);
+		} servers[] = {
+			{ "FigCaptureMemoryReporterStart", (void (*)(void))dlsym(RTLD_DEFAULT, "FigCaptureMemoryReporterStart") },
+			{ "FigCaptureSourceServerStart", (void (*)(void))dlsym(RTLD_DEFAULT, "FigCaptureSourceServerStart") },
+			{ "FigCameraViewfinderServerStart", (void (*)(void))dlsym(RTLD_DEFAULT, "FigCameraViewfinderServerStart") },
+			{ "FigCaptureSessionServerStart", (void (*)(void))dlsym(RTLD_DEFAULT, "FigCaptureSessionServerStart") },
+			{ "FigFlashlightServerStart", (void (*)(void))dlsym(RTLD_DEFAULT, "FigFlashlightServerStart") },
+			{ "FigCaptureDeferredContainerManagerServerStart",
+			  (void (*)(void))dlsym(RTLD_DEFAULT, "FigCaptureDeferredContainerManagerServerStart") },
+		};
+		unsigned started = 0, missing = 0;
+
+		/* all or nothing: a part of the list (e.g. a session server without its source server) is worse than none */
+		for (size_t i = 0; i < sizeof(servers) / sizeof(servers[0]); i++) {
+			if (servers[i].start == NULL) {
+				say("negroni: camera hooks: capture servers NOT started: %s not found\n", servers[i].name);
+				missing++;
+			}
+		}
+		if (missing != 0) {
+			return;
+		}
+		for (size_t i = 0; i < sizeof(servers) / sizeof(servers[0]); i++) {
+			servers[i].start();
+			started++;
+		}
+		say("negroni: camera hooks: capture servers started (%u of %zu, shader preload skipped): "
+		    "com.apple.coremedia.capturesource/capturesession answer now\n", started, sizeof(servers) / sizeof(servers[0]));
+	}
 }
 
 __attribute__((constructor))
@@ -464,6 +585,8 @@ negroni_camera_init(void)
 		register_hevc_encoder();
 	}
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */
+	/* the main queue runs once mediaserverd's main() is in its run loop: after FigMediaServerStart */
+	dispatch_async_f(dispatch_get_main_queue(), NULL, start_capture_servers);
 }
 
 /*

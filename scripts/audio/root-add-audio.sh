@@ -16,7 +16,8 @@
 #     (__xpc_api_misuse / _os_object_retain, logs/symb-ms.log, symb-ms2.log; the crash offsets
 #     match this bundle only, scripts/audio/hfs-extract.py). The phone has no Bluetooth driver.
 #  3. StartRecorderServer = false in every MediaToolbox SubServerConfiguration.plist (the
-#     portrait prewarm calls a NULL GL function without a GPU)
+#     portrait prewarm calls a NULL GL function without a GPU). NegroniCamera.driver starts the capture servers
+#     itself after its hooks (docs/camera-ios-2026-10-27.md section 8), so keep this false
 #  4. checks: the D22 tunings and the UI sounds are in the root
 # Undo: AUDIO=0 does nothing; to remove, delete the driver and run the slop tweaks again;
 # BTAUDIO=1 moves BTAudioHALPlugin.driver back from HAL.disabled (or keeps it in place).

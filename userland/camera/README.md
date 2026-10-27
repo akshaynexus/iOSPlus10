@@ -11,6 +11,10 @@ a source, [I] inference.
 - The constructor replaces 8 CMCapture methods (`media_hooks.c`, from HakiOS `inject_media.c`). The main one is
   `+[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor]`: where the stock one gives nil (no Apple ISP driver), it
   gives `[[BWFigCaptureDeviceVendor alloc] initWithDeviceCreateFunction:negroni_camera_device_create]`.
+- The capture servers: our root has `StartRecorderServer` false (slop + `scripts/audio/root-add-audio.sh`), so
+  mediaserverd does not start `com.apple.coremedia.capturesource`/`capturesession` and Camera.app waits for ever in
+  `-[AVCaptureSession init]`. The constructor queues `start_capture_servers()` on the main queue: after the hooks, it
+  calls FigStartCaptureServers' list without FigPreloadShaders (`docs/camera-ios-2026-10-27.md` section 8).
 - `camera_device.c` (HakiOS, MIT): a FigCaptureDevice with one FigCaptureStream (back camera). Frames come from
   `/dev/negronicam` (kernel patch 0318, boot-arg `negronicam=7`; ABI in `negronicam.h`), go through the CPU ISP
   `camera_isp.c` (HakiOS, MIT), and go to the capture graph as CVPixelBuffers.
@@ -48,6 +52,9 @@ section 7.
 
 Hot off switch (builds of 2026-10-27 05:55 and later): a file `/var/db/negronicam/off` makes the constructor log
 `negroni: camera hooks: /var/db/negronicam/off exists: off, nothing replaced` and do nothing (`phone-camera.sh off`).
+Capture-server knobs (builds of 2026-10-27 18:00 and later): `/var/db/negronicam/noservers` = hooks only, no capture
+servers (`phone-camera.sh servers off`); `/var/db/negronicam/preload` = the stock `FigStartCaptureServers` with the
+Metal shader preload.
 
 ## Build and check
 
