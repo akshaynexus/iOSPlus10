@@ -7,7 +7,9 @@
 sha256[32]}; files from 8 KiB on, each 4 KiB aligned, named by their basename. Content: adsp.mdt,
 adsp.bNN, *.jsn of DIR, and tfa-init.bin if present (the TFA9874 amp table for patch 0244:
 scripts/audio/tfa-cnt.py bin writes it into DIR), and CAMERA_ICP.mdt + CAMERA_ICP.bNN if present (the
-camera ICP firmware for patch 0316: scripts/camera/extract-icp-fw.sh copies them into DIR).
+camera ICP firmware for patch 0316: scripts/camera/extract-icp-fw.sh copies them into DIR), and
+slpi.pak if present (the SLPI firmware pack for patch 0376: scripts/sensors/extract-slpi-fw.sh writes
+it into DIR; one entry with its own table, so the 64-entry table does not overflow).
 
 Place on the phone (4096-byte blocks of the userdata partition, N = partition size in blocks):
   persistent log   N-1025 .. N-1         (negroni_ufs.c NEGRONI_LOG_BLOCKS = 1025)
@@ -32,7 +34,7 @@ def main():
     d = sys.argv[2] if len(sys.argv) == 3 else os.path.join(
         os.path.dirname(os.path.abspath(__file__)), '..', '..', 'out', 'firmware', 'adsp')
     files = sorted(glob.glob(os.path.join(d, 'adsp.mdt')) + glob.glob(os.path.join(d, 'adsp.b[0-9][0-9]')) +
-                   glob.glob(os.path.join(d, '*.jsn')) + glob.glob(os.path.join(d, 'tfa-init.bin')) +
+                   glob.glob(os.path.join(d, '*.jsn')) + glob.glob(os.path.join(d, 'tfa-init.bin')) + glob.glob(os.path.join(d, 'slpi.pak')) +
                    glob.glob(os.path.join(d, 'CAMERA_ICP.mdt')) + [f for f in glob.glob(os.path.join(d, 'CAMERA_ICP.b[0-9][0-9]'))
                       if os.path.getsize(f) > 0])   # empty segment files: nothing to load
     if not any(f.endswith('adsp.mdt') for f in files):

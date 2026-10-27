@@ -22,6 +22,29 @@ KINDS = {  # size, header bytes (first file offset), max entries, magic, names t
 }
 
 
+def check_slpi_pak(p):
+    """The SLPI pack inside the ADSP area (patch 0376 negroni_slpi.c, scripts/sensors/mkslpipak.py)."""
+    errs = []
+    if len(p) < 4096 or len(p) > 12 << 20 or p[:8] != b'NEGRSLPI':
+        return [f'slpi.pak: size {len(p)} or magic {p[:8]!r} wrong']
+    version, count = struct.unpack_from('<II', p, 8)
+    if version != 1 or not 0 < count <= 32:
+        return [f'slpi.pak: version {version}, count {count} (max 32)']
+    names = []
+    for i in range(count):
+        raw, off, n, digest = struct.unpack_from('<48sII32s', p, 16 + 88 * i)
+        name = raw.split(b'\0')[0].decode()
+        names.append(name)
+        if off < 4096 or off > len(p) or n > len(p) - off:
+            errs.append(f'slpi.pak/{name}: offset {off:#x} size {n} out of range')
+        elif hashlib.sha256(p[off:off + n]).digest() != digest:
+            errs.append(f'slpi.pak/{name}: SHA-256 mismatch')
+    if 'slpi.mdt' not in names:
+        errs.append('slpi.pak: no slpi.mdt')
+    print(f'  slpi.pak: {count} files, {len(p)} bytes')
+    return errs
+
+
 def main():
     if len(sys.argv) != 3 or sys.argv[1] not in KINDS:
         sys.exit(__doc__)
@@ -58,6 +81,10 @@ def main():
     if kind == 'wlan' and not {'amss.bin', 'amss20.bin'} & set(names):
         errs.append('no amss.bin or amss20.bin')
     errs += [f'missing {n}' for n in need if n not in names]
+    if kind == 'adsp' and 'slpi.pak' in names:
+        i = names.index('slpi.pak')
+        _, off, n, _ = struct.unpack_from('<48sII32s', a, 16 + 88 * i)
+        errs += check_slpi_pak(a[off:off + n])
     used = max(e for _, e, _ in spans) if spans else 0
     print(f'{path}: {kind} {count} files, {used} of {size} bytes used, sha256 {hashlib.sha256(a).hexdigest()}')
     for e in errs:

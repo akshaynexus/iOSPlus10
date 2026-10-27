@@ -3141,3 +3141,29 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   enough; `ADT_CAM=0` overrides). Plug-in: hot off switch `/var/db/negronicam/off`; build sha256 ea16947e...
   `phone-camera.sh`: restart / off / on / log / revert prev; push keeps `.prev` and writes the stamp.
 - [I] Main cause = no `rear-facing-camera` in MobileGestalt. Not verified on the phone.
+
+## 61. SLPI (sensor DSP) start, phase 1: patch 0376 negronislpi (2026-10-27, sensors kernel agent; details patches/xnu/README-sensors.md)
+
+- [V] SLPI values: PAS id 12 (Linux `sdm845_slpi_resource_init`, used for sm8450), crash reason 424, load_state
+  `slpi`, proxy lcx/lmx, no minidump id; carveout 0x87f00000 + 0x1a00000; SMEM hosts 0/3; SMP2P in 481 / out 430
+  (entries master-kernel, sleepstate bit 12); IPCC client 4 (signal 2 SMP2P, 0 GLINK); GLINK edge `dsps` items
+  478-480; channels IPCRTR + fastrpcglink-apps-dsp; QMI 400 = sns_client.
+- [V] Firmware: slpi.mdt + 22 segment files (24 headers, b22 BSS, b23 hash; span 0x88000000..0x89a00000 =
+  0x1a00000, relocatable). The ADSP area table is 64 entries (44 used), so the SLPI files go in as one entry
+  `slpi.pak` (own table `NEGRSLPI`, 26 files, 9662464 bytes). `scripts/sensors/extract-slpi-fw.sh` makes it;
+  `mkadsparea.py` adds it (45 files, 29392896 of 33554432 bytes); `checkarea.py` checks it. The area on the
+  phone is NOT rewritten yet (owner: `scripts/fw/build-areas.sh` + `write-areas.sh`).
+- 0376: `negronislpi=1` PAS start ("THE SLPI IS UP"), `=2` + GLINK listen (logs each channel the SLPI opens,
+  answers none), `=3` + IPCRTR/QRTR (logs NEW_SERVER, expects service 400). Own file negroni_slpi.c (copy of the
+  0240/0242/0248 code, the proven ADSP file is not refactored). Step 0 waits for the ADSP thread (QMP mailbox,
+  TCSR mutex 3, lcx/lmx vote are shared with no lock). No USB/charger access. Crash watch after start.
+- Opus review ACCEPT WITH FIXES; F1-F8 applied (partition-only SMEM items, SPMI QDSS QMP guard also for
+  negronislpi, ADSP `rails_on` after the failure unvote, GLINK oversize stop, QRTR handler before open, atomics,
+  SMEM header bounds, intent slots).
+- [V] Build out/kernel/local-20261027-004027/kernel.development.negroni sha256
+  07f6194ef8cff8bf08f0bb1c8fb11a9dbf5add9efaea6ffffe19996a89e6996a (275 applied, 4 dxb skips). Not booted.
+- Test order: `negronislpi=1 negroniadsp=0`, then `=2`, `=3`, then with `negroniadsp=1`.
+- Phase 2 (README-sensors.md): FastRPC `apps_std` file server in the kernel (SLPI asks for
+  `/vendor/etc/sensors/sns_reg_config`, the persist registry dir, `/odm/etc/sensor/config`, `/sys/devices/soc0/*`
+  [V strings / I]); apps SMMU SIDs 0x541-0x543; maybe a servreg locator for `msm/slpi/sensor_pd`; sns_client QMI
+  0x20/0x21/0x22 with protobuf [I].

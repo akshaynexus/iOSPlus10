@@ -1,0 +1,2143 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index f5bcbc5..9e83d41 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -134,6 +134,7 @@ bsd/dev/negroni_wlan_wpa_crypto.c	standard
+ bsd/dev/negroni_wlan_bhi.c		standard
+ bsd/dev/negroni_wlan_mhi.c		standard
+ bsd/dev/negroni_adsp.c			standard
++bsd/dev/negroni_slpi.c			standard
+ bsd/dev/negroni_rpmh.c			standard
+ bsd/dev/negroni_bt.c			standard
+ bsd/dev/negroni_bt_hci.c		standard
+diff --git a/bsd/dev/negroni_adsp.c b/bsd/dev/negroni_adsp.c
+index c56fc7e..938e9e2 100644
+--- a/bsd/dev/negroni_adsp.c
++++ b/bsd/dev/negroni_adsp.c
+@@ -199,6 +199,23 @@ static const char *const step_names[] = {
+ 	"SMEM survey", "firmware area", "rails", "AOP QMP", "PAS init", "load", "SMP2P", "start", "GLINK",
+ };
+ static char stage_b_why[192];
++static int adsp_phase;                       /* 0376: 0 not asked, 1 the thread runs, 2 the thread is done */
++
++/* 0376 (negroni_slpi.c): the SLPI thread waits for this thread (QMP mailbox, TCSR mutex 3: no lock) */
++int negroni_adsp_phase(void);
++bool negroni_adsp_rails_held(void);
++int
++negroni_adsp_phase(void)
++{
++	return __atomic_load_n(&adsp_phase, __ATOMIC_ACQUIRE);
++}
++
++/* 0376: lcx/lmx are one APPS vote for both DSPs; the SLPI keeps its vote while the ADSP holds them */
++bool
++negroni_adsp_rails_held(void)
++{
++	return rails_on;
++}
+ 
+ #define say(fmt, ...) printf("NEGRONI ADSP: %u " fmt "\n", step, ##__VA_ARGS__)
+ /* the reason of a failed step: kept for the "step N failed" line, and logged at once */
+@@ -1861,6 +1878,7 @@ adsp_thread(__unused void *arg, __unused wait_result_t wr)
+ 	if (failed && rails_on) {
+ 		(void)rail_vote("lcx.lvl", 0);
+ 		(void)rail_vote("lmx.lvl", 0);
++		rails_on = false;               /* 0376 review F3: negroni_adsp_rails_held() reads it */
+ 	}
+ 	printf("NEGRONI ADSP: done (asked 1..%u, %s at %u)\n", last_step, failed ? "stopped" : "complete",
+ 	    MIN(step, last_step));
+@@ -1870,6 +1888,7 @@ adsp_thread(__unused void *arg, __unused wait_result_t wr)
+ 			thread_deallocate(w);
+ 		}
+ 	}
++	__atomic_store_n(&adsp_phase, 2, __ATOMIC_RELEASE);    /* 0376: QMP and the SMEM mutex are free for the SLPI thread */
+ 	(void)thread_terminate(current_thread());
+ }
+ 
+@@ -1891,9 +1910,11 @@ negroni_adsp_init(void)
+ 	step_budget_ms = MIN(MAX(step_budget_ms, 1000u), 120000u);
+ 	last_step = MIN(MAX(last_step, 1u), (uint32_t)STEPS);
+ 	printf("NEGRONI ADSP: steps 1..%u (UNTESTED stage (a): PAS id 1, carveout %#lx)\n", last_step, ADSP_MEM_PHYS);
++	adsp_phase = 1;                         /* 0376 */
+ 	if (kernel_thread_start(adsp_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
++		adsp_phase = 2;
+ 		printf("NEGRONI ADSP: kernel_thread_start failed\n");
+ 	}
+ }
+diff --git a/bsd/dev/negroni_slpi.c b/bsd/dev/negroni_slpi.c
+new file mode 100644
+index 0000000..76d7710
+--- /dev/null
++++ b/bsd/dev/negroni_slpi.c
+@@ -0,0 +1,2027 @@
++/*
++ * NEGRONI (SM8450) sensor DSP (SLPI, the Hexagon of the SSC block) start, phase 1 of the iOSPlus10
++ * sensors plan (docs/sensors-plan.md, patches/xnu/README-sensors.md). Patch 0376. UNTESTED ON HARDWARE.
++ *
++ * Off by default. Boot-arg negronislpi=N runs the steps on a kernel thread of its own:
++ *   1  steps 1..8: load the SLPI image and start it with PAS (id 12), wait for "ready"
++ *   2  + step 9:   the GLINK SMEM edge "dsps" (version, then every channel the SLPI opens is logged and
++ *                  left unanswered)
++ *   3  + step 10:  the IPCRTR channel is ours: QRTR HELLO, every NEW_SERVER of the SLPI is logged
++ *                  (expect QMI service 400 = sns_client)
++ * negronislpi_step=N stops after step N (lower than the level only). Every line starts "NEGRONI SLPI:".
++ *
++ * The steps are those of negroni_adsp.c (patch 0240, proven on the ADSP: "THE ADSP IS UP") with the
++ * SLPI values of the live DT and Linux qcom_q6v5_pas.c sdm845_slpi_resource_init (used for
++ * qcom,sm8450-slpi-pas): PAS id 12, crash reason item 424, AOP load_state "slpi", proxy votes lcx/lmx,
++ * no minidump id. Live DT: remoteproc-slpi@02400000, slpi_region 0x87f00000 + 0x1a00000,
++ * qcom,smp2p-dsps (items in 481 / out 430, remote pid 3, IPCC client 4 signal 2, outbound entries
++ * "master-kernel" and "sleepstate"), glink-edge "dsps" (remote pid 3, IPCC client 4 signal 0).
++ *
++ *   0  waits   for the ADSP thread (negroniadsp) to end: the AOSS QMP mailbox and TCSR mutex 3 (SMEM
++ *              allocation) have no lock between the two threads (the hardware mutex is per CPU
++ *              cluster, not per thread)
++ *   1  reads   SMEM: the apps<->SLPI partition (hosts 0 and 3); the SLPI's SMP2P item 481 (if present
++ *              the SLPI has run since the reset: stop, it is not started twice), its last words (424)
++ *   2  reads   the ADSP firmware area, entry "slpi.pak" (scripts/sensors/mkslpipak.py): its table,
++ *              slpi.mdt, the SHA-256 of each slpi.bNN, the load span fits the carveout
++ *   3  writes  RPMh: lcx.lvl and lmx.lvl at level 384 (the SLPI's proxy votes)
++ *   4  writes  AOSS QMP: "{class: image, res: load_state, name: slpi, val: on}"
++ *   5  asks    TrustZone: PAS init image (id 12), PAS mem setup (0x87f00000, span)
++ *   6  writes  the carveout 0x87f00000 + 0x1a00000 only: zero, PT_LOAD segments, read back (SHA-256)
++ *   7  writes  SMEM: our SMP2P item 430 (master-kernel = 0, sleepstate = bit 12 "APPS awake", as the
++ *              Linux smp2p_sleepstate driver sets it), IPCC ring (client 4, signal 2)
++ *   8  asks    TrustZone: PAS auth and reset (id 12); polls item 481 "slave-kernel" for ready (bit 1),
++ *              handover (bit 2), fatal (bit 0) for negronislpi_wait s (default 10). Ready: "THE SLPI IS UP"
++ *   9  writes  SMEM: GLINK items 478 + 479 in the 0/3 partition; version 1; logs each OPEN of the SLPI
++ *  10  sends   QRTR over IPCRTR: HELLO; logs HELLO, NEW_SERVER, DEL_SERVER, BYE, NEW_LOOKUP of the SLPI
++ *
++ * After the steps the thread stays as the crash watch (as 0248 for the ADSP): every 200 ms it reads
++ * "slave-kernel" for FATAL and (levels 2/3) polls GLINK. On FATAL: last words, our "stop" bit, up to
++ * 5 s for STOP-ACK, PAS shutdown; no restart in this boot.
++ *
++ * Not touched: USB, the charger, the ADSP edge (other SMEM partition, other IPCC client, other
++ * items), the ADSP carveout. Writes: SMEM items 430/478/479 of the 0/3 partition, the SLPI carveout,
++ * QMP mailbox, IPCC doorbells, the RPMh votes. More boot-args: negronislpi_wait=S, negronislpi_listen=S
++ * (GLINK/QRTR log window after step 9/10, default 15), negronislpi_unvote=0 (keep the rail votes after
++ * handover), negronislpi_sleepstate=0 (no "sleepstate" entry), negronislpi_pause=MS (before each
++ * write step), negronislpi_adspwait=S (default 240), negronislpi_steptimeout=MS (default 15000).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <vm/vm_kern.h>
++#include <arm/caches_internal.h>
++#include <libkern/crypto/sha2.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern uint64_t kvtophys(vm_offset_t va);
++extern kern_return_t thread_terminate(thread_t);
++extern void IOSleep(unsigned int milliseconds);
++extern int negroni_ufs_adsp_area_read(uint64_t at, void *dst, uint32_t count);
++extern int negroni_rpmh_arc_vote(const char *res, unsigned level);
++extern int negroni_adsp_phase(void);            /* 0376 (negroni_adsp.c): 0 not asked, 1 running, 2 done */
++extern bool negroni_adsp_rails_held(void);      /* 0376 (negroni_adsp.c): the ADSP keeps lcx/lmx at 384 */
++void negroni_slpi_init(void);
++
++#define SL_WIMG_WCOMB           0x6u            /* VM_WIMG_WCOMB, as negroni_adsp.c */
++
++/* ---- addresses (live DT) ---- */
++#define SMEM_PHYS               0x80900000UL
++#define SMEM_SIZE               0x00200000u
++#define SLPI_MEM_PHYS           0x87f00000UL    /* slpi_region@87F00000 { reg = <0 0x87f00000 0 0x1a00000> } */
++#define SLPI_MEM_SIZE           0x01a00000u
++_Static_assert((SLPI_MEM_SIZE & 0x3fffu) == 0, "ml_io_unmap needs a 16 KiB page multiple");
++#define IPCC_PHYS               0x0ed18000UL
++#define AOSS_PHYS               0x0c300000UL
++#define AOSS_SIZE               0x400u
++#define TCSR_MUTEX_PHYS         0x01f43000UL    /* smem hwlocks = <&tcsr_mutex 3> */
++
++/* ---- SCM / PAS ---- */
++#define SCM_64                  (1ull << 30)
++#define SCM_SIP                 (2ull << 24)
++#define SCM_CALL(svc, cmd)      ((uint64_t)(svc) << 8 | (cmd))
++#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
++#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
++#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
++#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
++#define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
++#define SCM_ONE_VALUE           1
++#define SCM_THREE_VALUES        3
++#define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)
++#define SCM_INTERRUPTED         1
++#define PAS_SLPI                12              /* qcom_q6v5_pas.c sdm845_slpi_resource_init .pas_id */
++
++/* ---- SMEM ---- */
++#define SMEM_APPS               0
++#define SMEM_SLPI               3               /* qcom,remote-pid of smp2p-dsps and the glink-edge */
++#define SMEM_GLOBAL             0xfffe
++#define SMEM_CANARY             0xa5a5
++#define ITEM_CRASH_REASON       424
++#define ITEM_SMP2P_OURS         430             /* qcom,smem = <0x1e1 0x1ae> = <481 430>: inbound, outbound */
++#define ITEM_SMP2P_THEIRS       481
++#define ITEM_GLINK_DESC         478
++#define ITEM_GLINK_FIFO0        479
++#define ITEM_GLINK_FIFO1        480
++
++/* ---- SMP2P ---- */
++#define SMP2P_MAGIC             0x504d5324      /* "$SMP" */
++#define SMP2P_VERSION           1
++#define SMP2P_FEATURE_SSR_ACK   1u
++#define SMP2P_ENTRIES           16
++#define SMP2P_ITEM_SIZE         (20 + 20 * SMP2P_ENTRIES)
++#define DSP_FATAL               (1u << 0)
++#define DSP_READY               (1u << 1)
++#define DSP_HANDOVER            (1u << 2)
++#define DSP_STOP_ACK            (1u << 3)
++#define SLEEPSTATE_AWAKE        (1u << 12)      /* smp2p_sleepstate.c PROC_AWAKE_ID 12 */
++
++/* ---- IPCC ---- */
++#define IPCC_SEND_ID            0x0c
++#define IPCC_CLIENT_AOP         0u
++#define IPCC_CLIENT_SLPI        4u              /* mboxes = <&ipcc 4 ...> */
++#define IPCC_SIGNAL_GLINK       0u
++#define IPCC_SIGNAL_SMP2P       2u
++
++/* ---- AOSS QMP (qcom_aoss.c) ---- */
++#define QMP_MAGIC               0x00
++#define QMP_MAGIC_VALUE         0x4d41494c
++#define QMP_VERSION             0x04
++#define QMP_UCORE_LINK          0x0c
++#define QMP_UCORE_LINK_ACK      0x10
++#define QMP_UCORE_CH            0x14
++#define QMP_UCORE_CH_ACK        0x18
++#define QMP_MCORE_LINK          0x24
++#define QMP_MCORE_LINK_ACK      0x28
++#define QMP_MCORE_CH            0x2c
++#define QMP_MCORE_CH_ACK        0x30
++#define QMP_MCORE_MBOX_SIZE     0x34
++#define QMP_MCORE_MBOX_OFFSET   0x38
++#define QMP_UP                  0x0000ffffu
++#define QMP_MSG_LEN             64u
++
++/* ---- ADSP firmware area (mkadsparea.py) and the SLPI pack inside it (mkslpipak.py) ---- */
++#define AREA_MAGIC              "NEGRADSP"
++#define AREA_MAX                64
++#define AREA_HEADER             8192u
++#define AREA_SIZE               (32u << 20)
++#define PAK_NAME                "slpi.pak"
++#define PAK_MAGIC               "NEGRSLPI"
++#define PAK_MAX                 32
++#define PAK_HEADER              4096u
++#define PAK_SIZE_MAX            (12u << 20)
++#define CHUNK                   (1u << 20)
++
++struct area_entry {
++	char name[48];
++	uint32_t offset, size;
++	uint8_t sha256[32];
++};
++struct area_header {
++	char magic[8];
++	uint32_t version, count;
++	struct area_entry entry[AREA_MAX];
++};
++struct pak_header {
++	char magic[8];
++	uint32_t version, count;
++	struct area_entry entry[PAK_MAX];
++};
++_Static_assert(sizeof(struct area_header) <= AREA_HEADER, "area table fits its header");
++_Static_assert(sizeof(struct pak_header) <= PAK_HEADER, "pack table fits its header");
++
++/* ---- MDT ---- */
++#define PT_LOAD                 1
++#define MDT_TYPE(flags)         (((flags) >> 24) & 7)
++#define MDT_TYPE_HASH           2
++#define MDT_RELOCATABLE         (1u << 27)
++#define MAX_SEGMENTS            48
++
++struct seg {
++	uint32_t type, offset, paddr, filesz, memsz, flags;
++};
++
++#define STEPS                   10
++static uint32_t level, step, last_step, pause_ms, wait_s = 10, unvote = 1, sleepstate = 1, listen_s = 15;
++static uint32_t adsp_wait_s = 240, step_budget_ms = 15000;
++static vm_offset_t smem, ipcc, aoss, tcsr;
++static struct pak_header *pak;                  /* kmem, PAK_HEADER bytes */
++static uint32_t pak_base, pak_size;             /* the pack inside the ADSP area */
++static uint8_t *mdt;
++static uint32_t mdt_size, nseg, min_pa, max_pa;
++static struct seg segs[MAX_SEGMENTS];
++static bool relocatable, rails_on, slpi_running, pas_inited;
++static uint32_t our_item;
++static char fail_why[192];
++static const char *const step_names[STEPS + 1] = {
++	"wait for the ADSP", "SMEM survey", "firmware", "rails", "AOP QMP", "PAS init", "load", "SMP2P", "start",
++	"GLINK", "QRTR",
++};
++
++#define say(fmt, ...) printf("NEGRONI SLPI: %u " fmt "\n", step, ##__VA_ARGS__)
++#define FAIL(fmt, ...) do { snprintf(fail_why, sizeof(fail_why), fmt, ##__VA_ARGS__); say("stop: %s", fail_why); } while (0)
++
++static void
++announce(const char *what)
++{
++	say("about to: %s", what);
++	if (pause_ms) {
++		IOSleep(pause_ms);
++	}
++}
++
++static uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb osh" ::: "memory");
++	return v;
++}
++
++static void
++wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb osh" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++/* The SCM call of negroni_adsp.c (0240 with the resume bound): resume while interrupted, retry busy. */
++static int32_t
++scm(const char *what, uint64_t function, uint64_t args, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *answer)
++{
++	uint64_t t0 = mach_absolute_time(), ns;
++
++	say("SCM %s: smc %#llx (%#llx, %#llx, %#llx)", what, function, a0, a1, a2);
++	for (int busy = 0; busy <= 20; busy++) {
++		uint64_t session = 0;
++		int i;
++		for (i = 0; i < 2000000; i++) {
++			register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
++			register uint64_t x1 __asm__("x1") = args;
++			register uint64_t x2 __asm__("x2") = a0;
++			register uint64_t x3 __asm__("x3") = a1;
++			register uint64_t x4 __asm__("x4") = a2;
++			register uint64_t x5 __asm__("x5") = 0;
++			register uint64_t x6 __asm__("x6") = session;
++			register uint64_t x7 __asm__("x7") = 0;
++
++			__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
++			    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++			session = x6;
++			if (x0 == SCM_INTERRUPTED) {
++				continue;
++			}
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++			if ((int32_t)x0 == -12 && busy < 20) {
++				say("SCM %s: TrustZone busy (-12), retry %d in 30 ms", what, busy + 1);
++				IOSleep(30);
++				break;
++			}
++			if (x0 == 2) {
++				say("SCM %s: WAITQ_SLEEP after %d resumes, %llu ms: not supported", what, i, ns / 1000000);
++				return -1;
++			}
++			say("SCM %s -> %d, answer %#llx (%d resumes, %llu ms)", what, (int32_t)x0, x1, i, ns / 1000000);
++			*answer = x1;
++			return (int32_t)x0;
++		}
++		if (i == 2000000) {
++			break;
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	say("SCM %s keeps returning interrupted or busy (%llu ms)", what, ns / 1000000);
++	return -1;
++}
++
++/* ---- SMEM (smem.c layouts; the same walkers as negroni_adsp.c, hosts 0/3) ---- */
++
++static uint32_t
++smem_partition(uint16_t a, uint16_t b, uint32_t *size, uint32_t *cacheline)
++{
++	uint32_t toc = SMEM_SIZE - 0x1000;
++
++	if (rd32(smem, toc) != 0x434f5424 /* "$TOC" */ || rd32(smem, toc + 4) != 1) {
++		return 0;
++	}
++	uint32_t count = rd32(smem, toc + 8);
++	for (uint32_t i = 0; i < count && i < 64; i++) {
++		uint32_t e = toc + 32 + 48 * i;
++		uint32_t off = rd32(smem, e), sz = rd32(smem, e + 4), hosts = rd32(smem, e + 12);
++		uint16_t h0 = (uint16_t)hosts, h1 = (uint16_t)(hosts >> 16);
++		if (off == 0 || sz == 0 || !((h0 == a && h1 == b) || (h0 == b && h1 == a))) {
++			continue;
++		}
++		if ((uint64_t)off + sz > toc || rd32(smem, off) != 0x54525024 /* "$PRT" */ || rd32(smem, off + 8) != sz) {
++			return 0;
++		}
++		*size = sz;
++		*cacheline = rd32(smem, e + 16);
++		return off;
++	}
++	return 0;
++}
++
++static uint32_t
++smem_find_in(uint32_t p, uint32_t psize, uint32_t cacheline, uint32_t item, uint32_t *size)
++{
++	uint32_t free_uncached = rd32(smem, p + 12), free_cached = rd32(smem, p + 16);
++
++	if (free_uncached > psize || free_cached > psize) {
++		return 0;
++	}
++	for (uint32_t at = 32; at + 16 <= free_uncached;) {
++		uint32_t w0 = rd32(smem, p + at), sz = rd32(smem, p + at + 4), pad = rd32(smem, p + at + 8);
++		/* untrusted (the DSP writes SMEM too): the item and its padding stay inside the uncached area */
++		if ((w0 & 0xffff) != SMEM_CANARY || sz > psize || (pad & 0xffff) > sz ||
++		    (uint64_t)at + 16 + (pad >> 16) + sz > free_uncached) {
++			break;
++		}
++		if ((w0 >> 16) == item) {
++			*size = sz - (pad & 0xffff);
++			return p + at + 16 + (pad >> 16);
++		}
++		at += 16 + (pad >> 16) + sz;
++	}
++	if (cacheline == 0 || (cacheline & (cacheline - 1))) {
++		return 0;
++	}
++	uint32_t back = (16 + cacheline - 1) & ~(cacheline - 1);
++	for (uint32_t at = psize - back; at > free_cached && at < psize;) {
++		uint32_t w0 = rd32(smem, p + at), sz = rd32(smem, p + at + 4), pad = rd32(smem, p + at + 8);
++		if ((w0 & 0xffff) != SMEM_CANARY || sz > at || at - sz < free_cached || (pad & 0xffff) > sz) {
++			break;
++		}
++		if ((w0 >> 16) == item) {
++			*size = sz - (pad & 0xffff);
++			return p + at - sz;
++		}
++		if (sz + back > at) {
++			break;
++		}
++		at -= sz + back;
++	}
++	return 0;
++}
++
++/*
++ * Item lookup. The SLPI's own items (430, 478-481) live only in the 0/3 partition: Linux qcom_smem_get(host)
++ * does not fall back to the global partition when the host partition exists, and a global item of the same
++ * number belongs to someone else (review F1). Only the crash reason (424, HOST_ANY) may come from global.
++ */
++static uint32_t
++smem_item_in(uint32_t item, uint32_t *size, unsigned nhosts)
++{
++	static const uint16_t hosts[2][2] = { { SMEM_APPS, SMEM_SLPI }, { SMEM_GLOBAL, SMEM_GLOBAL } };
++
++	for (unsigned h = 0; h < nhosts; h++) {
++		uint32_t psize = 0, cacheline = 0, p = smem_partition(hosts[h][0], hosts[h][1], &psize, &cacheline);
++		uint32_t at = p ? smem_find_in(p, psize, cacheline, item, size) : 0;
++		if (at) {
++			return at;
++		}
++	}
++	return 0;
++}
++
++#define smem_item(item, size)   smem_item_in((item), (size), 1)     /* 0/3 partition only */
++#define smem_item_any(item, size) smem_item_in((item), (size), 2)   /* 0/3, then global */
++
++static void
++last_words(void)
++{
++	char text[81];
++	uint32_t size = 0, at = smem_item_any(ITEM_CRASH_REASON, &size);
++
++	if (at == 0 || size == 0) {
++		say("item %u (last words): not there", ITEM_CRASH_REASON);
++		return;
++	}
++	bzero(text, sizeof(text));
++	for (uint32_t i = 0; i < MIN(size, (uint32_t)sizeof(text) - 1) / 4; i++) {
++		uint32_t w = rd32(smem, at + 4 * i);
++		memcpy(text + 4 * i, &w, 4);
++	}
++	say("SLPI LAST WORDS (item %u, %u bytes): \"%s\"", ITEM_CRASH_REASON, size, text);
++}
++
++static bool
++smp2p_value(uint32_t at, const char *name, uint32_t *value)
++{
++	if (rd32(smem, at) != SMP2P_MAGIC) {
++		return false;
++	}
++	uint32_t valid = rd32(smem, at + 12) >> 16;
++	for (uint32_t i = 0; i < valid && i < SMP2P_ENTRIES; i++) {
++		char n[17];
++		for (uint32_t w = 0; w < 4; w++) {
++			uint32_t v = rd32(smem, at + 20 + 20 * i + 4 * w);
++			memcpy(n + 4 * w, &v, 4);
++		}
++		n[16] = 0;
++		if (strncmp(n, name, 16) == 0) {
++			*value = rd32(smem, at + 36 + 20 * i);
++			return true;
++		}
++	}
++	return false;
++}
++
++/* ---- step 0: the ADSP thread first ---- */
++
++static bool
++step_wait_adsp(void)
++{
++	uint32_t s;
++
++	if (negroni_adsp_phase() == 0) {        /* 0376 negroni_adsp.c: acquire load */
++		say("no ADSP thread (negroniadsp=0): nothing to wait for");
++		return true;
++	}
++	for (s = 0; s < adsp_wait_s && negroni_adsp_phase() != 2; s++) {
++		if (s % 30 == 0) {
++			say("the ADSP thread runs: waiting (%u s so far, at most %u s)", s, adsp_wait_s);
++		}
++		IOSleep(1000);
++	}
++	if (negroni_adsp_phase() != 2) {
++		FAIL("the ADSP thread still runs after %u s: no SLPI start (shared QMP mailbox and TCSR mutex)", s);
++		return false;
++	}
++	say("the ADSP thread is done after %u s; ADSP rail votes %s", s, negroni_adsp_rails_held() ? "held (384)" : "not held");
++	return true;
++}
++
++/* ---- step 1 ---- */
++
++static bool
++step_survey(void)
++{
++	uint32_t psize = 0, cacheline = 0, size = 0, p, at, value = 0;
++	uint64_t answer = 0;
++
++	if (smem == 0) {
++		smem = ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, SL_WIMG_WCOMB);
++	}
++	if (smem == 0) {
++		FAIL("no mapping of SMEM %#lx + %#x", SMEM_PHYS, SMEM_SIZE);
++		return false;
++	}
++	p = smem_partition(SMEM_APPS, SMEM_SLPI, &psize, &cacheline);
++	if (p == 0) {
++		FAIL("no SMEM partition for hosts 0/3 ($TOC %#x)", rd32(smem, SMEM_SIZE - 0x1000));
++		return false;
++	}
++	say("SMEM partition 0/3 at %#lx, %#x bytes, cacheline %u, free uncached %#x cached %#x", SMEM_PHYS + p, psize,
++	    cacheline, rd32(smem, p + 12), rd32(smem, p + 16));
++	at = smem_item(ITEM_SMP2P_THEIRS, &size);
++	if (at != 0) {
++		bool have = smp2p_value(at, "slave-kernel", &value);
++		FAIL("SLPI SMP2P item %u is there (slave-kernel %s %#x): the SLPI has run since the reset; not started twice",
++		    ITEM_SMP2P_THEIRS, have ? "=" : "missing", value);
++		last_words();
++		return false;
++	}
++	say("no SLPI SMP2P item %u: the SLPI has not run since the reset", ITEM_SMP2P_THEIRS);
++	at = smem_item(ITEM_SMP2P_OURS, &size);
++	say("our SMP2P item %u: %s", ITEM_SMP2P_OURS, at ? "present (an earlier kernel made it)" : "absent");
++	for (uint32_t item = ITEM_GLINK_DESC; item <= ITEM_GLINK_FIFO1; item++) {
++		at = smem_item(item, &size);
++		say("GLINK SMEM item %u (0/3): %s", item, at ? "present" : "absent");
++	}
++	/* logged, not obeyed (0241: TrustZone answers 0 for the ADSP too, and the ADSP starts) */
++	scm("PAS is supported (slpi)", SCM_64 | SCM_SIP | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, PAS_SLPI, 0, 0, &answer);
++	say("PAS is supported (id %u): answer %#llx (logged only)", PAS_SLPI, answer);
++	return true;
++}
++
++/* ---- step 2: the pack in the ADSP area ---- */
++
++static const struct area_entry *
++pak_file(const char *name)
++{
++	for (uint32_t i = 0; pak && i < pak->count; i++) {
++		if (strncmp(pak->entry[i].name, name, sizeof(pak->entry[i].name)) == 0) {
++			return &pak->entry[i];
++		}
++	}
++	return NULL;
++}
++
++/* Read n bytes of the pack at off (both checked against the pack). */
++static int
++pak_read(uint32_t off, void *dst, uint32_t n)
++{
++	if (off > pak_size || n > pak_size - off) {
++		return EINVAL;
++	}
++	return negroni_ufs_adsp_area_read((uint64_t)pak_base + off, dst, n);
++}
++
++static bool
++pak_check(const struct area_entry *e, uint8_t *buf)
++{
++	SHA256_CTX ctx;
++	uint8_t digest[32];
++
++	SHA256_Init(&ctx);
++	for (uint32_t at = 0; at < e->size; at += CHUNK) {
++		uint32_t n = MIN(CHUNK, e->size - at);
++		if (pak_read(e->offset + at, buf, n) != 0) {
++			return false;
++		}
++		SHA256_Update(&ctx, buf, n);
++	}
++	SHA256_Final(digest, &ctx);
++	return memcmp(digest, e->sha256, 32) == 0;
++}
++
++static bool
++step_firmware(void)
++{
++	vm_offset_t a = 0, b = 0, m = 0, k = 0;
++	struct area_header *area;
++	const struct area_entry *e = NULL;
++	uint32_t phoff, phnum, bytes = 0;
++	bool ok = false;
++
++	if (kmem_alloc(kernel_map, &a, AREA_HEADER, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, &k, PAK_HEADER, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, &b, CHUNK, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		FAIL("no memory");
++		goto out;
++	}
++	area = (struct area_header *)a;
++	if (negroni_ufs_adsp_area_read(0, area, AREA_HEADER) != 0 || memcmp(area->magic, AREA_MAGIC, 8) != 0 ||
++	    area->version != 1 || area->count == 0 || area->count > AREA_MAX) {
++		FAIL("no ADSP firmware area (scripts/fw/build-areas.sh + write-areas.sh; magic %.8s)", area->magic);
++		goto out;
++	}
++	for (uint32_t i = 0; i < area->count; i++) {
++		area->entry[i].name[47] = 0;
++		if (strcmp(area->entry[i].name, PAK_NAME) == 0) {
++			e = &area->entry[i];
++		}
++	}
++	if (e == NULL) {
++		FAIL("the ADSP area (%u files) has no %s (scripts/sensors/extract-slpi-fw.sh, then build-areas.sh)", area->count,
++		    PAK_NAME);
++		goto out;
++	}
++	if (e->offset < AREA_HEADER || e->offset > AREA_SIZE || e->size > AREA_SIZE - e->offset || e->size < PAK_HEADER ||
++	    e->size > PAK_SIZE_MAX) {
++		FAIL("%s at %#x size %#x out of range", PAK_NAME, e->offset, e->size);
++		goto out;
++	}
++	pak_base = e->offset;
++	pak_size = e->size;
++	pak = (struct pak_header *)k;
++	if (pak_read(0, pak, PAK_HEADER) != 0 || memcmp(pak->magic, PAK_MAGIC, 8) != 0 || pak->version != 1 ||
++	    pak->count == 0 || pak->count > PAK_MAX) {
++		FAIL("%s: bad table (magic %.8s, count %u)", PAK_NAME, pak->magic, pak->count);
++		pak = NULL;
++		goto out;
++	}
++	for (uint32_t i = 0; i < pak->count; i++) {
++		struct area_entry *x = &pak->entry[i];
++		x->name[47] = 0;
++		if (x->offset < PAK_HEADER || x->offset > pak_size || x->size > pak_size - x->offset) {
++			FAIL("pack entry %u (%s) out of range", i, x->name);
++			pak = NULL;
++			goto out;
++		}
++	}
++	say("%s: %u files, %u KiB, at area offset %#x", PAK_NAME, pak->count, pak_size >> 10, pak_base);
++	e = pak_file("slpi.mdt");
++	if (e == NULL || e->size < 52 || e->size > PAGE_SIZE || !pak_check(e, (uint8_t *)b)) {
++		FAIL("slpi.mdt missing, too big for one page, or SHA-256 mismatch");
++		goto out;
++	}
++	if (kmem_alloc(kernel_map, &m, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
++	    pak_read(e->offset, (void *)m, e->size) != 0) {
++		FAIL("slpi.mdt not readable");
++		goto out;
++	}
++	mdt = (uint8_t *)m;
++	mdt_size = e->size;
++	memcpy(&phoff, mdt + 28, 4);
++	phnum = (uint32_t)(mdt[44] | mdt[45] << 8);
++	if (memcmp(mdt, "\177ELF\1\1", 6) != 0 || phnum == 0 || phnum > MAX_SEGMENTS || phoff > mdt_size ||
++	    32 * phnum > mdt_size - phoff) {
++		FAIL("slpi.mdt is not an ELF32 LE header with <= %u program headers", MAX_SEGMENTS);
++		goto out;
++	}
++	nseg = phnum;
++	min_pa = ~0u;
++	max_pa = 0;
++	for (uint32_t i = 0; i < nseg; i++) {
++		uint32_t ph[8];
++		memcpy(ph, mdt + phoff + 32 * i, sizeof(ph));
++		segs[i] = (struct seg){ ph[0], ph[1], ph[3], ph[4], ph[5], ph[6] };
++		if (segs[i].type != PT_LOAD || segs[i].memsz == 0 || MDT_TYPE(segs[i].flags) == MDT_TYPE_HASH) {
++			continue;
++		}
++		if ((uint64_t)segs[i].paddr + segs[i].memsz > 0xffffffffull) {
++			FAIL("segment %u wraps (%#x + %#x)", i, segs[i].paddr, segs[i].memsz);
++			goto out;
++		}
++		relocatable |= (segs[i].flags & MDT_RELOCATABLE) != 0;
++		min_pa = MIN(min_pa, segs[i].paddr);
++		max_pa = MAX(max_pa, segs[i].paddr + segs[i].memsz);
++		if (segs[i].filesz == 0) {
++			continue;
++		}
++		char name[16];
++		snprintf(name, sizeof(name), "slpi.b%02u", i);
++		const struct area_entry *f = pak_file(name);
++		if (f == NULL || f->size != segs[i].filesz || segs[i].filesz > segs[i].memsz) {
++			FAIL("%s missing or not %u bytes", name, segs[i].filesz);
++			goto out;
++		}
++		if (!pak_check(f, (uint8_t *)b)) {
++			FAIL("%s SHA-256 mismatch", name);
++			goto out;
++		}
++		bytes += f->size;
++	}
++	max_pa = (max_pa + 0xfff) & ~0xfffu;
++	say("slpi.mdt: %u program headers, load %#x..%#x (%u KiB), %u KiB of segments, %s", nseg, min_pa, max_pa,
++	    (max_pa - min_pa) >> 10, bytes >> 10, relocatable ? "relocatable" : "fixed");
++	if (min_pa == ~0u || max_pa - min_pa > SLPI_MEM_SIZE || (!relocatable && (min_pa < SLPI_MEM_PHYS ||
++	    max_pa > SLPI_MEM_PHYS + SLPI_MEM_SIZE))) {
++		FAIL("the image does not fit the carveout %#lx + %#x", SLPI_MEM_PHYS, SLPI_MEM_SIZE);
++		goto out;
++	}
++	ok = true;
++out:
++	if (b) {
++		kmem_free(kernel_map, b, CHUNK);
++	}
++	if (a) {
++		kmem_free(kernel_map, a, AREA_HEADER);
++	}
++	if (pak == NULL && k) {
++		kmem_free(kernel_map, k, PAK_HEADER);
++	}
++	/* k (the pack table) and m (slpi.mdt) stay: steps 5 and 6 read them */
++	return ok;
++}
++
++/* ---- step 3: rails ---- */
++
++static int
++rail_vote(const char *res, unsigned level_)
++{
++	int error = EBUSY;
++
++	for (int i = 0; i < 200 && error == EBUSY; i++) {
++		error = negroni_rpmh_arc_vote(res, level_);
++		if (error == EBUSY) {
++			IOSleep(5);
++		}
++	}
++	if (error != 0) {
++		say("RPMh vote %s level %u failed: errno %d", res, level_, error);
++	}
++	return error;
++}
++
++/*
++ * lcx/lmx are one APPS vote for both DSPs. Drop it only if the ADSP does not keep it (an ADSP without
++ * handover keeps level 384; dropping it here would cut the ADSP's proxy vote).
++ */
++static void
++rails_drop(const char *why)
++{
++	if (!rails_on) {
++		return;
++	}
++	rails_on = false;
++	if (negroni_adsp_rails_held()) {
++		say("proxy rail votes kept (%s): the ADSP still holds lcx/lmx at 384", why);
++		return;
++	}
++	(void)rail_vote("lcx.lvl", 0);
++	(void)rail_vote("lmx.lvl", 0);
++	say("proxy rail votes dropped (%s)", why);
++}
++
++static bool
++step_rails(void)
++{
++	announce("vote RPMh lcx.lvl and lmx.lvl to level 384 (SLPI proxy votes)");
++	rails_on = true;
++	if (rail_vote("lcx.lvl", 384) != 0 || rail_vote("lmx.lvl", 384) != 0) {
++		FAIL("rail vote failed");
++		return false;
++	}
++	return true;
++}
++
++/* ---- step 4: AOP ---- */
++
++static void
++kick(uint32_t client, uint32_t signal)
++{
++	wr32(ipcc, IPCC_SEND_ID, client << 16 | signal);
++}
++
++static bool
++qmp_wait(uint32_t off, uint32_t want, uint32_t ms)
++{
++	for (uint32_t i = 0; i < ms; i++) {
++		if (rd32(aoss, off) == want) {
++			return true;
++		}
++		IOSleep(1);
++	}
++	return rd32(aoss, off) == want;
++}
++
++static bool
++step_aop(void)
++{
++	static const char text[] = "{class: image, res: load_state, name: slpi, val: on}";
++	uint32_t words[QMP_MSG_LEN / 4] = { 0 }, box, boxsize;
++
++	_Static_assert(sizeof(text) <= QMP_MSG_LEN, "QMP message fits");
++	if (ipcc == 0) {
++		ipcc = ml_io_map(IPCC_PHYS, 0x1000);
++	}
++	if (aoss == 0) {
++		aoss = ml_io_map(AOSS_PHYS, AOSS_SIZE);
++	}
++	if (ipcc == 0 || aoss == 0) {
++		FAIL("no IPCC/AOSS mapping");
++		return false;
++	}
++	if (rd32(aoss, QMP_MAGIC) != QMP_MAGIC_VALUE || rd32(aoss, QMP_VERSION) != 1) {
++		FAIL("AOSS QMP magic %#x version %u", rd32(aoss, QMP_MAGIC), rd32(aoss, QMP_VERSION));
++		return false;
++	}
++	box = rd32(aoss, QMP_MCORE_MBOX_OFFSET);
++	boxsize = rd32(aoss, QMP_MCORE_MBOX_SIZE);
++	if ((box & 3) || box < 0x3c || boxsize < QMP_MSG_LEN + 4 || (uint64_t)box + boxsize > AOSS_SIZE) {
++		FAIL("QMP mailbox at %#x size %#x does not fit", box, boxsize);
++		return false;
++	}
++	if (rd32(aoss, QMP_MCORE_LINK) == QMP_UP && rd32(aoss, QMP_MCORE_LINK_ACK) == QMP_UP &&
++	    rd32(aoss, QMP_MCORE_CH) == QMP_UP && rd32(aoss, QMP_UCORE_CH) == QMP_UP && rd32(aoss, QMP_MCORE_CH_ACK) == QMP_UP) {
++		say("QMP link and channel are already up");
++	} else {
++		announce("open the QMP link and channel to the AOP (qmp_open)");
++		wr32(aoss, QMP_UCORE_LINK_ACK, rd32(aoss, QMP_UCORE_LINK));
++		wr32(aoss, QMP_MCORE_LINK, QMP_UP);
++		kick(IPCC_CLIENT_AOP, 0);
++		if (!qmp_wait(QMP_MCORE_LINK_ACK, QMP_UP, 1000)) {
++			FAIL("AOP does not ack our QMP link");
++			return false;
++		}
++		wr32(aoss, QMP_MCORE_CH, QMP_UP);
++		kick(IPCC_CLIENT_AOP, 0);
++		if (!qmp_wait(QMP_UCORE_CH, QMP_UP, 1000)) {
++			FAIL("AOP does not open its QMP channel");
++			return false;
++		}
++		wr32(aoss, QMP_UCORE_CH_ACK, QMP_UP);
++		kick(IPCC_CLIENT_AOP, 0);
++		if (!qmp_wait(QMP_MCORE_CH_ACK, QMP_UP, 1000)) {
++			FAIL("AOP does not ack our QMP channel");
++			return false;
++		}
++		say("QMP OPEN");
++	}
++	/* the previous message (the ADSP's, or another QMP user's) must be taken first: wait up to 1 s */
++	if (!qmp_wait(box, 0, 1000)) {
++		FAIL("QMP mailbox still holds %u bytes", rd32(aoss, box));
++		return false;
++	}
++	memcpy(words, text, sizeof(text));
++	announce("send the AOP \"slpi load_state on\"");
++	for (uint32_t i = 0; i < QMP_MSG_LEN / 4; i++) {
++		wr32(aoss, box + 4 + 4 * i, words[i]);
++	}
++	wr32(aoss, box, QMP_MSG_LEN);
++	kick(IPCC_CLIENT_AOP, 0);
++	if (!qmp_wait(box, 0, 1000)) {
++		wr32(aoss, box, 0);
++		FAIL("AOP does not take the QMP message");
++		return false;
++	}
++	say("AOP took \"%s\"", text);
++	return true;
++}
++
++/* ---- step 5: PAS init ---- */
++
++static bool
++step_pas_init(void)
++{
++	vm_offset_t page = 0;
++	uint64_t answer = ~0ull;
++	uint32_t ehdr = segs[0].filesz, hash = ~0u;
++
++	for (uint32_t i = 0; i < nseg; i++) {
++		if (MDT_TYPE(segs[i].flags) == MDT_TYPE_HASH) {
++			hash = i;
++			break;
++		}
++	}
++	if (segs[0].type == PT_LOAD || hash == ~0u || ehdr == 0 || ehdr > mdt_size ||
++	    (uint64_t)ehdr + segs[hash].filesz > PAGE_SIZE) {
++		FAIL("no usable ELF-header/hash segments (hash segment %u)", hash);
++		return false;
++	}
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		FAIL("no memory");
++		return false;
++	}
++	memcpy((void *)page, mdt, ehdr);
++	if (ehdr + segs[hash].filesz == mdt_size) {
++		memcpy((void *)(page + ehdr), mdt + ehdr, segs[hash].filesz);
++	} else if ((uint64_t)segs[hash].offset + segs[hash].filesz <= mdt_size) {
++		memcpy((void *)(page + ehdr), mdt + segs[hash].offset, segs[hash].filesz);
++	} else {
++		char name[16];
++		snprintf(name, sizeof(name), "slpi.b%02u", hash);
++		const struct area_entry *f = pak_file(name);
++		if (f == NULL || f->size != segs[hash].filesz || pak_read(f->offset, (void *)(page + ehdr), f->size) != 0) {
++			FAIL("hash segment %s not readable", name);
++			return false;
++		}
++	}
++	clean_dcache((vm_offset_t)page, PAGE_SIZE, FALSE);
++	/* page stays allocated: TrustZone may read it until auth and reset */
++	announce("hand the SLPI metadata to TrustZone (PAS init image, id 12)");
++	if (scm("PAS init image (slpi)", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_SLPI,
++	    kvtophys(page), 0, &answer) != 0 || answer != 0) {
++		FAIL("TrustZone refuses the SLPI metadata (%#llx)", answer);
++		return false;
++	}
++	pas_inited = true;
++	say("TRUSTZONE ACCEPTS THE SLPI SIGNATURE");
++	if (relocatable) {
++		answer = ~0ull;
++		if (scm("PAS mem setup (slpi)", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_SLPI, SLPI_MEM_PHYS,
++		    max_pa - min_pa, &answer) != 0 || answer != 0) {
++			FAIL("TrustZone refuses the carveout (%#llx)", answer);
++			return false;
++		}
++		say("TrustZone takes the carveout %#lx + %#x", SLPI_MEM_PHYS, max_pa - min_pa);
++	}
++	return true;
++}
++
++static void
++pas_shutdown(const char *why)
++{
++	uint64_t answer = ~0ull;
++
++	say("PAS shutdown: %s", why);
++	scm("PAS shutdown (slpi)", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_SLPI, 0, 0, &answer);
++}
++
++/* ---- step 6: load (writes only inside 0x87f00000 + 0x1a00000) ---- */
++
++static bool
++step_load(void)
++{
++	vm_offset_t buf = 0;
++	volatile uint64_t *mem;
++	bool ok = false;
++
++	if (kmem_alloc(kernel_map, &buf, CHUNK, KMA_KOBJECT | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		FAIL("no memory");
++		return false;
++	}
++	announce("zero the carveout 0x87f00000 + 26 MiB and write the PT_LOAD segments");
++	mem = (volatile uint64_t *)ml_io_map_unmappable(SLPI_MEM_PHYS, SLPI_MEM_SIZE, SL_WIMG_WCOMB);
++	if (mem == NULL) {
++		FAIL("no mapping of the carveout %#lx + %#x", SLPI_MEM_PHYS, SLPI_MEM_SIZE);
++		kmem_free(kernel_map, buf, CHUNK);
++		return false;
++	}
++	for (uint32_t i = 0; i < SLPI_MEM_SIZE / 8; i++) {
++		mem[i] = 0;
++	}
++	for (uint32_t i = 0; i < nseg; i++) {
++		struct seg *s = &segs[i];
++		if (s->type != PT_LOAD || s->memsz == 0 || MDT_TYPE(s->flags) == MDT_TYPE_HASH || s->filesz == 0) {
++			continue;
++		}
++		char name[16];
++		snprintf(name, sizeof(name), "slpi.b%02u", i);
++		const struct area_entry *f = pak_file(name);
++		uint64_t base = (relocatable ? 0 : (uint64_t)(min_pa - SLPI_MEM_PHYS)) + (s->paddr - min_pa);
++		SHA256_CTX ctx;
++		uint8_t digest[32];
++
++		/* bounds again, here where the writes happen: never outside the carveout */
++		if (f == NULL || (base & 7) || base > SLPI_MEM_SIZE || f->size > SLPI_MEM_SIZE - base) {
++			FAIL("%s missing, not 8-byte aligned or outside the carveout (+%#llx, %u bytes)", name, base,
++			    f ? f->size : 0);
++			goto out;
++		}
++		for (uint32_t at = 0; at < f->size; at += CHUNK) {
++			uint32_t n = MIN(CHUNK, f->size - at);
++			if (pak_read(f->offset + at, (void *)buf, n) != 0) {
++				FAIL("read error in %s", name);
++				goto out;
++			}
++			uint32_t words = n / 8;
++			const uint64_t *src = (const uint64_t *)buf;
++			for (uint32_t w = 0; w < words; w++) {
++				mem[(base + at) / 8 + w] = src[w];
++			}
++			for (uint32_t t = words * 8; t < n; t++) {
++				((volatile uint8_t *)mem)[base + at + t] = ((const uint8_t *)buf)[t];
++			}
++		}
++		SHA256_Init(&ctx);
++		for (uint32_t at = 0; at < f->size; at += CHUNK) {
++			uint32_t n = MIN(CHUNK, f->size - at);
++			for (uint32_t t = 0; t < n; t++) {
++				((uint8_t *)buf)[t] = ((volatile uint8_t *)mem)[base + at + t];
++			}
++			SHA256_Update(&ctx, (const void *)buf, n);
++		}
++		SHA256_Final(digest, &ctx);
++		if (memcmp(digest, f->sha256, 32) != 0) {
++			FAIL("%s does not read back from the carveout (+%#llx)", name, base);
++			goto out;
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	say("segments written at %#lx and read back OK", SLPI_MEM_PHYS);
++	ok = true;
++out:
++	ml_io_unmap((vm_offset_t)mem, SLPI_MEM_SIZE);
++	kmem_free(kernel_map, buf, CHUNK);
++	return ok;
++}
++
++/* ---- step 7: our SMP2P item (and the SMEM allocator for step 9) ---- */
++
++static bool
++smem_alloc(uint32_t item, uint32_t bytes)
++{
++	uint32_t psize = 0, cacheline = 0, p = smem_partition(SMEM_APPS, SMEM_SLPI, &psize, &cacheline);
++	uint32_t size = (bytes + 7) & ~7u, owner = ~0u, at, have = 0;
++	bool made = false;
++
++	if (p == 0) {
++		FAIL("no SMEM partition 0/3 for item %u", item);
++		return false;
++	}
++	if (smem_item(item, &have) != 0) {
++		say("SMEM item %u is there already (%u bytes)", item, have);
++		return true;
++	}
++	if (tcsr == 0) {
++		tcsr = ml_io_map(TCSR_MUTEX_PHYS, 0x1000);
++	}
++	if (tcsr == 0) {
++		FAIL("no TCSR mutex mapping");
++		return false;
++	}
++	for (uint32_t ms = 0; ms <= 1000; ms++) {
++		wr32(tcsr, 0, 1);               /* QCOM_MUTEX_APPS_PROC_ID */
++		owner = rd32(tcsr, 0);
++		if (owner == 1) {
++			break;
++		}
++		IOSleep(1);
++	}
++	if (owner != 1) {
++		FAIL("SMEM hwlock 3 held by %u (item %u)", owner, item);
++		return false;
++	}
++	uint32_t free_uncached = rd32(smem, p + 12), free_cached = rd32(smem, p + 16);
++	for (at = 32; at < free_uncached;) {
++		uint32_t w0 = rd32(smem, p + at), sz = rd32(smem, p + at + 4), pad = rd32(smem, p + at + 8);
++		if ((w0 & 0xffff) != SMEM_CANARY || (w0 >> 16) == item || sz > psize) {
++			break;
++		}
++		at += 16 + (pad >> 16) + sz;
++	}
++	if (at != free_uncached || free_uncached > free_cached || at + 16 + size > free_cached) {
++		FAIL("SMEM partition walk for item %u ends at +%#x, free uncached +%#x cached +%#x: nothing written", item, at,
++		    free_uncached, free_cached);
++		goto out;
++	}
++	wr32(smem, p + at, SMEM_CANARY | item << 16);
++	wr32(smem, p + at + 4, size);
++	wr32(smem, p + at + 8, size - bytes);
++	wr32(smem, p + at + 12, 0);
++	wr32(smem, p + 12, at + 16 + size);
++	say("SMEM item %u: %u bytes at %#lx", item, bytes, SMEM_PHYS + p + at + 16);
++	made = true;
++out:
++	wr32(tcsr, 0, 0);
++	return made;
++}
++
++static void
++smp2p_entry(uint32_t i, const char *name, uint32_t value)
++{
++	char n[16];
++	uint32_t w[4];
++
++	bzero(n, sizeof(n));
++	strlcpy(n, name, sizeof(n));
++	memcpy(w, n, sizeof(w));
++	for (uint32_t k = 0; k < 4; k++) {
++		wr32(smem, our_item + 20 + 20 * i + 4 * k, w[k]);
++	}
++	wr32(smem, our_item + 36 + 20 * i, value);
++}
++
++static bool
++step_smp2p(void)
++{
++	uint32_t size = 0, valid = sleepstate ? 2 : 1;
++
++	announce("create/fill our SMP2P item 430 (0/3 partition, TCSR mutex 3) and ring the SLPI (IPCC 4/2)");
++	our_item = smem_item(ITEM_SMP2P_OURS, &size);
++	if (our_item == 0) {
++		if (!smem_alloc(ITEM_SMP2P_OURS, SMP2P_ITEM_SIZE)) {
++			return false;
++		}
++		our_item = smem_item(ITEM_SMP2P_OURS, &size);
++	}
++	if (our_item == 0 || size < SMP2P_ITEM_SIZE) {
++		FAIL("our item %u not found after allocation (%u bytes)", ITEM_SMP2P_OURS, size);
++		our_item = 0;
++		return false;
++	}
++	for (uint32_t at = 0; at < SMP2P_ITEM_SIZE; at += 4) {
++		wr32(smem, our_item + at, 0);
++	}
++	wr32(smem, our_item, SMP2P_MAGIC);
++	wr32(smem, our_item + 8, SMEM_APPS | SMEM_SLPI << 16);
++	smp2p_entry(0, "master-kernel", 0);
++	if (sleepstate) {
++		smp2p_entry(1, "sleepstate", SLEEPSTATE_AWAKE);
++	}
++	wr32(smem, our_item + 12, SMP2P_ENTRIES | valid << 16);
++	wr32(smem, our_item + 4, SMP2P_FEATURE_SSR_ACK << 8);
++	wr32(smem, our_item + 4, SMP2P_FEATURE_SSR_ACK << 8 | SMP2P_VERSION);
++	kick(IPCC_CLIENT_SLPI, IPCC_SIGNAL_SMP2P);
++	say("our SMP2P item at %#lx: magic %#x version %#x pids %#x counts %#x (master-kernel 0%s)", SMEM_PHYS + our_item,
++	    rd32(smem, our_item), rd32(smem, our_item + 4), rd32(smem, our_item + 8), rd32(smem, our_item + 12),
++	    sleepstate ? ", sleepstate 0x1000" : "");
++	return true;
++}
++
++/* ---- step 8: start ---- */
++
++static bool
++step_start(void)
++{
++	uint64_t answer = ~0ull;
++	uint32_t theirs = 0, size = 0, value = 0, last = ~0u, ms;
++	bool ready = false, fatal = false;
++
++	announce("ask TrustZone to authenticate and start the SLPI (PAS auth and reset, id 12)");
++	if (scm("PAS auth and reset (slpi)", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_SLPI, 0, 0,
++	    &answer) != 0 || answer != 0) {
++		FAIL("TrustZone does not start the SLPI (%#llx)", answer);
++		return false;               /* the thread does the PAS shutdown */
++	}
++	say("TRUSTZONE HAS RELEASED THE SLPI FROM RESET; waiting %u s for ready", wait_s);
++	for (ms = 0; ms < wait_s * 1000; ms++) {
++		if (theirs == 0) {
++			theirs = smem_item(ITEM_SMP2P_THEIRS, &size);
++			if (theirs) {
++				say("+%u ms: SLPI SMP2P item %u appears (%u bytes, version %#x)", ms, ITEM_SMP2P_THEIRS, size,
++				    rd32(smem, theirs + 4));
++			}
++		}
++		if (theirs && smp2p_value(theirs, "slave-kernel", &value) && value != last) {
++			say("+%u ms: slave-kernel = %#x%s%s%s%s", ms, value, value & DSP_FATAL ? " FATAL" : "",
++			    value & DSP_READY ? " READY" : "", value & DSP_HANDOVER ? " HANDOVER" : "",
++			    value & DSP_STOP_ACK ? " STOP-ACK" : "");
++			last = value;
++			if ((value & DSP_HANDOVER) && unvote) {
++				rails_drop("handover");
++			}
++			if (value & DSP_FATAL) {
++				fatal = true;
++				break;
++			}
++			if (value & DSP_READY) {
++				ready = true;
++				break;
++			}
++		}
++		IOSleep(1);
++	}
++	if (!ready) {
++		FAIL("%s after %u ms", fatal ? "SLPI REPORTS FATAL" : "NO READY FROM THE SLPI", ms);
++		last_words();
++		return false;               /* the thread does the PAS shutdown */
++	}
++	say("THE SLPI IS UP after %u ms", ms);
++	slpi_running = true;
++	for (uint32_t t = 0; t < 2000 && rails_on && unvote; t++) {
++		if (smp2p_value(theirs, "slave-kernel", &value) && (value & DSP_HANDOVER)) {
++			say("+%u ms: handover (slave-kernel = %#x)", ms + t, value);
++			rails_drop("handover");
++			break;
++		}
++		IOSleep(1);
++	}
++	if (rails_on) {
++		say("no handover seen: the rail votes stay at level 384");
++	}
++	if (theirs && smp2p_value(theirs, "sleepstate_see", &value)) {
++		say("SLPI entry sleepstate_see = %#x", value);
++	}
++	for (uint32_t item = ITEM_GLINK_DESC; item <= ITEM_GLINK_FIFO1; item++) {
++		uint32_t at = smem_item(item, &size);
++		say("GLINK SMEM item %u: %s (%u bytes)", item, at ? "present" : "absent", at ? size : 0);
++	}
++	return true;
++}
++
++static void qrtr_rx(const uint8_t *data, uint32_t len);
++
++/* ---- step 9: GLINK over SMEM, edge "dsps" (the protocol of negroni_adsp.c 0242, one channel of ours) ---- */
++
++#define GLINK_FIFO_SIZE         0x4000u
++#define GLINK_RESERVE           16u
++#define GL_VERSION              0
++#define GL_VERSION_ACK          1
++#define GL_OPEN                 2
++#define GL_CLOSE                3
++#define GL_OPEN_ACK             4
++#define GL_INTENT               5
++#define GL_RX_DONE              6
++#define GL_RX_INTENT_REQ        7
++#define GL_RX_INTENT_REQ_ACK    8
++#define GL_TX_DATA              9
++#define GL_CLOSE_ACK            11
++#define GL_TX_DATA_CONT         12
++#define GL_READ_NOTIF           13
++#define GL_RX_DONE_W_REUSE      14
++#define GL_SIGNALS              15
++#define GL_FEATURE_INTENT_REUSE 1u
++#define GL_OURS                 12
++#define GL_THEIRS               32
++#define GL_INTENT_SIZE          4096u
++#define GL_INTENT_MAX           0x4400u         /* live DT IPCRTR intents: 5 x 0x800, 3 x 0x2000, 2 x 0x4400 */
++#define GL_MSG_MAX              (GL_INTENT_MAX + 16)
++#define GL_LOG_MAX              8
++#define GL_SEEN_MAX             8
++
++struct gl_intent {
++	uint32_t id, size;
++	bool used;
++};
++
++struct gl_channel {
++	const char *name;
++	uint16_t lcid, rcid;
++	bool open_sent, remote_open, open_acked;
++	int32_t req_result;
++	struct gl_intent ours[GL_OURS];
++	uint8_t *buf[GL_OURS];
++	uint32_t fill[GL_OURS];
++	uint32_t nours;
++	struct gl_intent theirs[GL_THEIRS];
++	void (*rx)(const uint8_t *data, uint32_t len);
++	uint64_t rx_count, tx_count;
++};
++
++/* Only IPCRTR, and only at level 3. Everything else the SLPI opens is logged and left unanswered. */
++static struct gl_channel gl_ipcrtr = { .name = "IPCRTR", .lcid = 1 };
++static uint32_t gl_desc, gl_tx, gl_rx, gl_rx_len, gl_features = GL_FEATURE_INTENT_REUSE, gl_next_liid = 1;
++static bool gl_version_ok, gl_dead, gl_notified, gl_started;
++static uint8_t gl_msg[GL_MSG_MAX];
++static uint32_t gl_complaints, gl_nseen;
++static char gl_seen[GL_SEEN_MAX][33];
++static uint32_t gl_seen_rcid[GL_SEEN_MAX];
++#define gl_complain(fmt, ...) do { if (gl_complaints < GL_LOG_MAX) { gl_complaints++; say(fmt, ##__VA_ARGS__); } } while (0)
++
++static uint32_t
++gl_mod(uint32_t v, uint32_t len)
++{
++	return v >= len ? v - len : v;
++}
++
++static uint32_t
++gl_tx_avail(void)
++{
++	uint32_t tail = rd32(smem, gl_desc + 0), head = rd32(smem, gl_desc + 4);
++	uint32_t avail;
++
++	if (tail >= GLINK_FIFO_SIZE || head >= GLINK_FIFO_SIZE) {
++		gl_complain("GLINK: TX tail %#x / head %#x outside the FIFO: GLINK stopped", tail, head);
++		gl_dead = true;
++		return 0;
++	}
++	avail = tail <= head ? GLINK_FIFO_SIZE - head + tail : tail - head;
++	return avail < GLINK_RESERVE ? 0 : avail - GLINK_RESERVE;
++}
++
++static int
++gl_write(const void *msg, uint32_t len)
++{
++	const uint32_t *w = msg;
++	uint32_t head;
++
++	if (gl_dead || (len & 7) || len >= GLINK_FIFO_SIZE - GLINK_RESERVE) {
++		return EINVAL;
++	}
++	for (uint32_t ms = 0; gl_tx_avail() < len; ms++) {
++		if (gl_dead) {
++			return EIO;
++		}
++		if (ms == 200) {
++			gl_complain("GLINK: our TX FIFO stays full (tail %#x head %#x)", rd32(smem, gl_desc), rd32(smem, gl_desc + 4));
++			return ETIMEDOUT;
++		}
++		if (!gl_notified) {
++			gl_notified = true;
++			head = rd32(smem, gl_desc + 4);
++			uint32_t tl = rd32(smem, gl_desc + 0);
++			uint32_t raw = tl <= head ? GLINK_FIFO_SIZE - head + tl : tl - head;
++			if (raw > 8) {
++				wr32(smem, gl_tx + head, GL_READ_NOTIF);
++				wr32(smem, gl_tx + head + 4, 0);
++				wr32(smem, gl_desc + 4, gl_mod(head + 8, GLINK_FIFO_SIZE));
++				kick(IPCC_CLIENT_SLPI, IPCC_SIGNAL_GLINK);
++			}
++		}
++		IOSleep(1);
++	}
++	gl_notified = false;
++	head = rd32(smem, gl_desc + 4);
++	for (uint32_t i = 0; i < len / 4; i++) {
++		wr32(smem, gl_tx + head, w[i]);
++		head = gl_mod(head + 4, GLINK_FIFO_SIZE);
++	}
++	wr32(smem, gl_desc + 4, head);
++	kick(IPCC_CLIENT_SLPI, IPCC_SIGNAL_GLINK);
++	return 0;
++}
++
++static int
++gl_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint32_t m[2] = { cmd | (uint32_t)p1 << 16, p2 };
++	return gl_write(m, sizeof(m));
++}
++
++static uint32_t
++gl_rx_avail(void)
++{
++	uint32_t size = 0;
++
++	if (gl_rx == 0) {
++		gl_rx = smem_item(ITEM_GLINK_FIFO1, &size);
++		if (gl_rx == 0) {
++			return 0;
++		}
++		gl_rx_len = size & ~7u;
++		say("GLINK: the SLPI's FIFO (item %u) is there: %#x bytes", ITEM_GLINK_FIFO1, size);
++		if (gl_rx_len < 64 || gl_rx_len > 0x100000) {
++			say("GLINK: FIFO size %#x is not usable: GLINK stopped", size);
++			gl_dead = true;
++			gl_rx = 0;
++			return 0;
++		}
++	}
++	uint32_t tail = rd32(smem, gl_desc + 8), head = rd32(smem, gl_desc + 12);
++	if (head >= gl_rx_len || tail >= gl_rx_len) {
++		say("GLINK: RX head %#x / tail %#x outside the FIFO (%#x): GLINK stopped", head, tail, gl_rx_len);
++		gl_dead = true;
++		return 0;
++	}
++	return head >= tail ? head - tail : gl_rx_len - tail + head;
++}
++
++static void
++gl_peek(uint32_t off, void *dst, uint32_t len)
++{
++	uint32_t *w = dst, at = gl_mod(rd32(smem, gl_desc + 8) + off, gl_rx_len);
++
++	for (uint32_t i = 0; i < (len + 3) / 4; i++) {
++		w[i] = rd32(smem, gl_rx + at);
++		at = gl_mod(at + 4, gl_rx_len);
++	}
++}
++
++static void
++gl_advance(uint32_t len)
++{
++	wr32(smem, gl_desc + 8, gl_mod(rd32(smem, gl_desc + 8) + ((len + 7) & ~7u), gl_rx_len));
++}
++
++static bool
++gl_up(void)
++{
++	return !gl_dead && gl_ipcrtr.remote_open && gl_ipcrtr.open_acked;
++}
++
++static int
++gl_send_open(struct gl_channel *ch)
++{
++	uint32_t m[2 + 8] = { 0 }, n = (uint32_t)strlen(ch->name) + 1;
++
++	m[0] = GL_OPEN | (uint32_t)ch->lcid << 16;
++	m[1] = n;
++	memcpy(&m[2], ch->name, n);
++	ch->open_sent = true;
++	return gl_write(m, (8 + n + 7) & ~7u);
++}
++
++static int
++gl_advertise(struct gl_channel *ch, unsigned i)
++{
++	uint32_t m[4] = { GL_INTENT | (uint32_t)ch->lcid << 16, 1, ch->ours[i].size, ch->ours[i].id };
++
++	return gl_write(m, sizeof(m));
++}
++
++static bool
++gl_add_intent(struct gl_channel *ch, uint32_t size)
++{
++	vm_offset_t b = 0;
++	uint32_t bytes = MAX(size, GL_INTENT_SIZE);
++
++	if (ch->nours >= GL_OURS || size > GL_INTENT_MAX ||
++	    kmem_alloc(kernel_map, &b, round_page(bytes), KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	unsigned i = ch->nours++;
++	ch->buf[i] = (uint8_t *)b;
++	ch->ours[i] = (struct gl_intent){ gl_next_liid++, bytes, false };
++	ch->fill[i] = 0;
++	return gl_advertise(ch, i) == 0;
++}
++
++static void
++gl_rx_data(struct gl_channel *ch, uint32_t liid, const uint8_t *data, uint32_t chunk, uint32_t left)
++{
++	unsigned i;
++
++	for (i = 0; i < ch->nours && ch->ours[i].id != liid; i++) {
++	}
++	if (i == ch->nours) {
++		gl_complain("GLINK: %s: data for an intent %u we never gave", ch->name, liid);
++		return;
++	}
++	if (ch->fill[i] + chunk > ch->ours[i].size) {
++		gl_complain("GLINK: %s: %u + %u bytes do not fit intent %u: dropped", ch->name, ch->fill[i], chunk, liid);
++		ch->fill[i] = 0;
++		return;
++	}
++	memcpy(ch->buf[i] + ch->fill[i], data, chunk);
++	ch->fill[i] += chunk;
++	if (left) {
++		return;
++	}
++	uint32_t whole = ch->fill[i];
++	ch->fill[i] = 0;
++	ch->rx_count++;
++	if (ch->rx) {
++		ch->rx(ch->buf[i], whole);
++	}
++	if (gl_features & GL_FEATURE_INTENT_REUSE) {
++		(void)gl_cmd(GL_RX_DONE_W_REUSE, ch->lcid, liid);
++	} else {
++		(void)gl_cmd(GL_RX_DONE, ch->lcid, liid);
++		ch->ours[i].id = gl_next_liid++;
++		(void)gl_advertise(ch, i);
++	}
++}
++
++static struct gl_channel *
++gl_by_rcid(uint32_t rcid)
++{
++	return gl_ipcrtr.remote_open && gl_ipcrtr.rcid == rcid ? &gl_ipcrtr : NULL;
++}
++
++static void
++gl_note_open(const char *name, uint32_t rcid, bool ours)
++{
++	for (uint32_t i = 0; i < gl_nseen; i++) {
++		if (strcmp(gl_seen[i], name) == 0) {
++			gl_complain("GLINK: the SLPI opens \"%s\" again (rcid %u)", name, rcid);
++			return;
++		}
++	}
++	if (gl_nseen < GL_SEEN_MAX) {
++		strlcpy(gl_seen[gl_nseen], name, sizeof(gl_seen[0]));
++		gl_seen_rcid[gl_nseen] = rcid;
++		gl_nseen++;
++	}
++	say("GLINK: the SLPI opens \"%s\" (rcid %u): %s", name, rcid, ours ? "ours, answered" : "not ours, left unanswered");
++}
++
++static void
++gl_poll(void)
++{
++	for (int n = 0; n < 256 && !gl_dead; n++) {
++		uint32_t avail = gl_rx_avail(), hdr[4], cmd, p1, p2, need = 8;
++		struct gl_channel *ch;
++
++		if (avail < 8) {
++			return;
++		}
++		gl_peek(0, hdr, 8);
++		cmd = hdr[0] & 0xffff;
++		p1 = hdr[0] >> 16;
++		p2 = hdr[1];
++		switch (cmd) {
++		case GL_VERSION:
++			if (p1 == 1) {
++				gl_features &= p2;
++			}
++			gl_advance(8);
++			if (p1 != 0) {
++				(void)gl_cmd(GL_VERSION_ACK, 1, gl_features);
++				if (!gl_version_ok) {
++					say("GLINK: the SLPI offers version %u features %#x: version 1 ok (features %#x)", p1, p2, gl_features);
++				}
++				gl_version_ok = true;
++			}
++			break;
++		case GL_VERSION_ACK:
++			gl_advance(8);
++			if (p1 == 0) {
++				say("GLINK: the SLPI refuses version 1: GLINK stopped");
++				gl_dead = true;
++			} else if (p1 == 1 && p2 != gl_features) {
++				gl_features &= p2;
++				(void)gl_cmd(GL_VERSION, 1, gl_features);
++			} else {
++				if (!gl_version_ok) {
++					say("GLINK: version 1 ok (features %#x)", gl_features);
++				}
++				gl_version_ok = true;
++			}
++			break;
++		case GL_OPEN: {
++			char name[33];
++			uint32_t len = p2 & 0xffff, w[10];
++
++			need = 8 + len;
++			if (len > GL_INTENT_MAX || need > gl_rx_len - 8) {
++				say("GLINK: OPEN with a %u-byte name: GLINK stopped", len);
++				gl_dead = true;
++				return;
++			}
++			if (avail < need) {
++				return;
++			}
++			bzero(name, sizeof(name));
++			gl_peek(0, w, 8 + MIN(len, 32u));
++			memcpy(name, (uint8_t *)w + 8, MIN(len, 32u));
++			name[32] = 0;
++			gl_advance(need);
++			if (level >= 3 && strcmp(name, gl_ipcrtr.name) == 0) {
++				gl_ipcrtr.rcid = (uint16_t)p1;
++				gl_ipcrtr.remote_open = true;
++				gl_note_open(name, p1, true);
++				(void)gl_cmd(GL_OPEN_ACK, gl_ipcrtr.rcid, 0);
++				if (!gl_ipcrtr.open_sent) {
++					(void)gl_send_open(&gl_ipcrtr);
++				}
++			} else {
++				gl_note_open(name, p1, false);
++			}
++			break;
++		}
++		case GL_CLOSE:
++			gl_advance(8);
++			ch = gl_by_rcid(p1);
++			say("GLINK: the SLPI closes rcid %u (%s)", p1, ch ? ch->name : "not ours");
++			if (ch) {
++				(void)gl_cmd(GL_CLOSE_ACK, (uint16_t)p1, 0);
++				ch->remote_open = false;
++			}
++			break;
++		case GL_CLOSE_ACK:
++			gl_advance(8);
++			break;
++		case GL_OPEN_ACK:
++			gl_advance(8);
++			if (gl_ipcrtr.lcid == p1 && gl_ipcrtr.open_sent) {
++				gl_ipcrtr.open_acked = true;
++				say("GLINK: the SLPI acks our open of %s", gl_ipcrtr.name);
++			}
++			break;
++		case GL_INTENT: {
++			uint32_t pair[2];
++
++			need = 8 + 8 * p2;
++			if (p2 > 64 || need > gl_rx_len - 8) {
++				say("GLINK: INTENT with %u entries: GLINK stopped", p2);
++				gl_dead = true;
++				return;
++			}
++			if (avail < need) {
++				return;
++			}
++			ch = gl_by_rcid(p1);
++			for (uint32_t i = 0; ch && i < p2; i++) {
++				gl_peek(8 + 8 * i, pair, 8);
++				for (unsigned k = 0; k < GL_THEIRS; k++) {
++					if (ch->theirs[k].size == 0) {
++						ch->theirs[k] = (struct gl_intent){ pair[1], pair[0], false };
++						break;
++					}
++				}
++			}
++			gl_advance(need);
++			break;
++		}
++		case GL_RX_DONE:
++		case GL_RX_DONE_W_REUSE:
++			gl_advance(8);
++			ch = gl_by_rcid(p1);
++			for (unsigned k = 0; ch && k < GL_THEIRS; k++) {
++				if (ch->theirs[k].size && ch->theirs[k].id == p2) {
++					if (cmd == GL_RX_DONE) {
++						ch->theirs[k].size = 0;
++					}
++					ch->theirs[k].used = false;
++				}
++			}
++			break;
++		case GL_RX_INTENT_REQ:
++			gl_advance(8);
++			ch = gl_by_rcid(p1);
++			if (ch) {
++				bool granted = gl_add_intent(ch, p2);
++				(void)gl_cmd(GL_RX_INTENT_REQ_ACK, ch->lcid, granted);
++				if (!granted) {
++					gl_complain("GLINK: %s: the SLPI asks for an intent of %u bytes: refused", ch->name, p2);
++				}
++			} else {
++				gl_complain("GLINK: the SLPI asks for an intent of %u bytes on rcid %u (not ours): no answer", p2, p1);
++			}
++			break;
++		case GL_RX_INTENT_REQ_ACK:
++			gl_advance(8);
++			ch = gl_by_rcid(p1);
++			if (ch) {
++				ch->req_result = (int32_t)p2;
++			}
++			break;
++		case GL_TX_DATA:
++		case GL_TX_DATA_CONT: {
++			uint32_t chunk, left;
++
++			if (avail < 16) {
++				return;
++			}
++			gl_peek(0, hdr, 16);
++			chunk = hdr[2];
++			left = hdr[3];
++			need = 16 + chunk;
++			if (chunk > GL_INTENT_MAX || need > gl_rx_len - 8) {
++				say("GLINK: a %u-byte chunk is bigger than any intent of ours: GLINK stopped", chunk);
++				gl_dead = true;
++				return;
++			}
++			if (avail < need) {
++				return;
++			}
++			gl_peek(16, gl_msg, chunk);
++			gl_advance(need);
++			ch = gl_by_rcid(p1);
++			if (ch) {
++				gl_rx_data(ch, p2, gl_msg, chunk, left);
++			} else {
++				gl_complain("GLINK: %u bytes on rcid %u (not ours): dropped", chunk, p1);
++			}
++			break;
++		}
++		case GL_READ_NOTIF:
++			gl_advance(8);
++			kick(IPCC_CLIENT_SLPI, IPCC_SIGNAL_GLINK);
++			break;
++		case GL_SIGNALS:
++			gl_advance(8);
++			break;
++		default:
++			say("GLINK: unknown command %u (%#x %#x): GLINK stopped", cmd, hdr[0], hdr[1]);
++			gl_dead = true;
++			return;
++		}
++	}
++}
++
++/* One message on IPCRTR: needs a remote intent (asks with RX_INTENT_REQ, waits up to 1 s). */
++static int
++gl_send(const void *data, uint32_t len)
++{
++	struct gl_channel *ch = &gl_ipcrtr;
++	struct gl_intent *best = NULL;
++	static uint32_t m[(16 + GL_INTENT_SIZE + 7) / 4];
++
++	if (len == 0 || len > GL_INTENT_SIZE) {
++		return EINVAL;
++	}
++	if (!gl_up()) {
++		return ENOTCONN;
++	}
++	for (int round = 0; round < 2 && best == NULL; round++) {
++		for (unsigned k = 0; k < GL_THEIRS; k++) {
++			struct gl_intent *t = &ch->theirs[k];
++			if (t->size >= len && !t->used && (best == NULL || t->size < best->size)) {
++				best = t;
++			}
++		}
++		if (best == NULL && round == 0) {
++			ch->req_result = -1;
++			if (gl_cmd(GL_RX_INTENT_REQ, ch->lcid, len) != 0) {
++				return EIO;
++			}
++			for (uint32_t ms = 0; ms < 1000 && ch->req_result < 0 && !gl_dead; ms++) {
++				gl_poll();
++				if (ch->req_result < 0) {
++					IOSleep(1);
++				}
++			}
++			gl_poll();
++			if (ch->req_result <= 0) {
++				gl_complain("GLINK: %s: the SLPI gives no intent for %u bytes (answer %d)", ch->name, len, ch->req_result);
++				return EAGAIN;
++			}
++		}
++	}
++	if (best == NULL) {
++		return EAGAIN;
++	}
++	best->used = true;
++	m[0] = GL_TX_DATA | (uint32_t)ch->lcid << 16;
++	m[1] = best->id;
++	m[2] = len;
++	m[3] = 0;
++	memcpy(&m[4], data, len);
++	bzero((uint8_t *)&m[4] + len, ((len + 7) & ~7u) - len);
++	if (gl_write(m, 16 + ((len + 7) & ~7u)) != 0) {
++		best->used = false;
++		return EIO;
++	}
++	ch->tx_count++;
++	return 0;
++}
++
++static void
++gl_summary(void)
++{
++	char list[GL_SEEN_MAX * 40];
++
++	list[0] = 0;
++	for (uint32_t i = 0; i < gl_nseen; i++) {
++		char one[48];
++		snprintf(one, sizeof(one), "%s%s (rcid %u)", i ? ", " : "", gl_seen[i], gl_seen_rcid[i]);
++		strlcat(list, one, sizeof(list));
++	}
++	say("GLINK: version %s, the SLPI opened %u channel(s): %s%s", gl_version_ok ? "ok" : "no answer", gl_nseen,
++	    gl_nseen ? list : "none", gl_dead ? "; GLINK stopped" : "");
++}
++
++static bool
++step_glink(void)
++{
++	uint32_t size = 0, ms;
++	uint32_t window = MIN(listen_s, 120u) * 1000;
++
++	announce("GLINK dsps: allocate SMEM items 478 (descriptors) and 479 (our TX FIFO) in 0/3, say version 1");
++	if (!smem_alloc(ITEM_GLINK_DESC, 32) || !smem_alloc(ITEM_GLINK_FIFO0, GLINK_FIFO_SIZE)) {
++		return false;
++	}
++	gl_desc = smem_item(ITEM_GLINK_DESC, &size);
++	if (gl_desc == 0 || size != 32) {
++		FAIL("GLINK descriptor item %u: %s (%u bytes)", ITEM_GLINK_DESC, gl_desc ? "wrong size" : "absent", size);
++		gl_desc = 0;
++		return false;
++	}
++	gl_tx = smem_item(ITEM_GLINK_FIFO0, &size);
++	if (gl_tx == 0 || size < GLINK_FIFO_SIZE) {
++		FAIL("GLINK TX FIFO item %u: %s (%u bytes)", ITEM_GLINK_FIFO0, gl_tx ? "too small" : "absent", size);
++		gl_tx = 0;
++		return false;
++	}
++	wr32(smem, gl_desc + 8, 0);             /* our RX tail */
++	wr32(smem, gl_desc + 4, 0);             /* our TX head */
++	gl_started = true;
++	say("GLINK: descriptors at %#lx, TX FIFO at %#lx (%#x bytes)", SMEM_PHYS + gl_desc, SMEM_PHYS + gl_tx, size);
++	if (gl_cmd(GL_VERSION, 1, gl_features) != 0) {
++		FAIL("GLINK: VERSION does not go out");
++		return false;
++	}
++	/* level 2: only listen. level 3: open IPCRTR as soon as the version is agreed. */
++	for (ms = 0; ms < window && !gl_dead; ms++) {
++		gl_poll();
++		if (level >= 3 && gl_version_ok && !gl_ipcrtr.open_sent) {
++			gl_ipcrtr.rx = qrtr_rx;         /* review F5: no QRTR packet is lost during step 9 */
++			say("GLINK: open %s (lcid %u)", gl_ipcrtr.name, gl_ipcrtr.lcid);
++			(void)gl_send_open(&gl_ipcrtr);
++		}
++		if (level >= 3 && gl_up()) {
++			break;
++		}
++		IOSleep(1);
++	}
++	gl_summary();
++	if (gl_dead || !gl_version_ok) {
++		FAIL("GLINK: %s after %u ms (FIFO 480 %s)", gl_dead ? "stopped" : "no version answer", ms, gl_rx ? "there" : "missing");
++		return false;
++	}
++	if (level < 3) {
++		say("GLINK UP (listen only) after %u ms", ms);
++		return true;
++	}
++	if (!gl_up()) {
++		FAIL("GLINK: IPCRTR not up after %u ms (remote open %u, ack %u)", ms, gl_ipcrtr.remote_open, gl_ipcrtr.open_acked);
++		return false;
++	}
++	/* up to 8, leaves 4 slots for RX_INTENT_REQ (the SLPI may have asked for some already: review F8) */
++	for (unsigned i = 0; gl_ipcrtr.nours + 4 < GL_OURS && i < 8; i++) {
++		if (!gl_add_intent(&gl_ipcrtr, GL_INTENT_SIZE)) {
++			FAIL("GLINK: IPCRTR: intent %u not given", i);
++			return false;
++		}
++	}
++	gl_poll();
++	say("GLINK UP after %u ms: IPCRTR open (lcid %u rcid %u), %u intents of %u bytes given", ms, gl_ipcrtr.lcid,
++	    gl_ipcrtr.rcid, gl_ipcrtr.nours, GL_INTENT_SIZE);
++	return true;
++}
++
++/* ---- step 10: QRTR on IPCRTR (as negroni_audio.c step 10; log only, no server of ours) ---- */
++
++struct qrtr_hdr {
++	uint32_t version, type, src_node, src_port, confirm_rx, size, dst_node, dst_port;
++} __attribute__((packed));
++#define QRTR_CTRL_BYTES         20u
++#define QRTR_VER                1u
++#define QRTR_TYPE_DATA          1u
++#define QRTR_TYPE_HELLO         2u
++#define QRTR_TYPE_BYE           3u
++#define QRTR_TYPE_NEW_SERVER    4u
++#define QRTR_TYPE_DEL_SERVER    5u
++#define QRTR_TYPE_DEL_CLIENT    6u
++#define QRTR_TYPE_RESUME_TX     7u
++#define QRTR_TYPE_EXIT          8u
++#define QRTR_TYPE_PING          9u
++#define QRTR_TYPE_NEW_LOOKUP    10u
++#define QRTR_TYPE_DEL_LOOKUP    11u
++#define QRTR_PORT_CTRL          0xfffffffeu
++#define QRTR_NODE_BCAST         0xffffffffu
++#define QRTR_LOCAL_NODE         1u
++#define QRTR_LOG_MAX            64
++#define SNS_CLIENT_SERVICE      400u            /* 0x190: live DT qcom,no-wake-svc; SEE sns_client */
++
++static uint32_t qrtr_node = ~0u, qrtr_servers, qrtr_lines, qrtr_other, qrtr_data, qrtr_hellos;
++static uint32_t sns_node = ~0u, sns_port, sns_instance;
++#define qrtr_say(fmt, ...) do { if (qrtr_lines < QRTR_LOG_MAX) { qrtr_lines++; say(fmt, ##__VA_ARGS__); } } while (0)
++
++static void
++qrtr_send_ctrl(uint32_t cmd, uint32_t dst_node)
++{
++	uint32_t pkt[(sizeof(struct qrtr_hdr) + QRTR_CTRL_BYTES) / 4];
++	struct qrtr_hdr h = {
++		.version = QRTR_VER, .type = cmd, .src_node = QRTR_LOCAL_NODE, .src_port = QRTR_PORT_CTRL,
++		.confirm_rx = 0, .size = QRTR_CTRL_BYTES, .dst_node = dst_node, .dst_port = QRTR_PORT_CTRL,
++	};
++	int error;
++
++	bzero(pkt, sizeof(pkt));
++	memcpy(pkt, &h, sizeof(h));
++	pkt[sizeof(h) / 4] = cmd;
++	error = gl_send(pkt, sizeof(pkt));
++	if (error) {
++		qrtr_say("QRTR: control %u to node %#x does not go out (errno %d)", cmd, dst_node, error);
++	}
++}
++
++static const char *
++qrtr_service_name(uint32_t service)
++{
++	switch (service) {
++	case 0x10: return "TFTP";
++	case 0x2b: return "SSCTL";
++	case 0x40: return "servreg locator";
++	case 0x42: return "servreg notifier";
++	case 0x1a: return "TMD";
++	case SNS_CLIENT_SERVICE: return "SNS client (sns_client, SEE)";
++	default: return "";
++	}
++}
++
++static void
++qrtr_rx(const uint8_t *data, uint32_t len)
++{
++	struct qrtr_hdr h;
++	uint32_t b[5];
++
++	if (len < sizeof(h)) {
++		qrtr_say("QRTR: %u-byte packet without a header", len);
++		return;
++	}
++	memcpy(&h, data, sizeof(h));
++	if (h.version != QRTR_VER) {
++		qrtr_say("QRTR: version %u packet (type %u): ignored", h.version, h.type);
++		return;
++	}
++	bzero(b, sizeof(b));
++	memcpy(b, data + sizeof(h), MIN(len - (uint32_t)sizeof(h), (uint32_t)sizeof(b)));
++	if (h.type != QRTR_TYPE_DATA) {
++		qrtr_node = h.src_node;
++	}
++	switch (h.type) {
++	case QRTR_TYPE_HELLO:
++		qrtr_say("QRTR: HELLO from node %u", h.src_node);
++		if (qrtr_hellos++ < 4) {
++			qrtr_send_ctrl(QRTR_TYPE_HELLO, h.src_node);    /* answer, as the Linux core does */
++		}
++		break;
++	case QRTR_TYPE_NEW_SERVER:
++		if (len < sizeof(h) + QRTR_CTRL_BYTES) {
++			break;
++		}
++		qrtr_servers++;
++		/* b[1] service, b[2] instance (version | instance << 8), b[3] node, b[4] port */
++		qrtr_say("QRTR: NEW_SERVER service %u (%#x) version %u instance %u node %u port %#x %s", b[1], b[1], b[2] & 0xff,
++		    b[2] >> 8, b[3], b[4], qrtr_service_name(b[1]));
++		if (b[1] == SNS_CLIENT_SERVICE) {
++			sns_node = b[3];
++			sns_port = b[4];
++			sns_instance = b[2];
++		}
++		break;
++	case QRTR_TYPE_DEL_SERVER:
++		qrtr_say("QRTR: DEL_SERVER service %u instance %#x node %u port %#x", b[1], b[2], b[3], b[4]);
++		break;
++	case QRTR_TYPE_NEW_LOOKUP:
++		qrtr_say("QRTR: the SLPI looks up service %u (%#x) instance %#x %s", b[1], b[1], b[2], qrtr_service_name(b[1]));
++		break;
++	case QRTR_TYPE_BYE:
++		qrtr_say("QRTR: BYE from node %u", h.src_node);
++		break;
++	case QRTR_TYPE_DATA:
++		qrtr_data++;
++		qrtr_say("QRTR: DATA %u bytes from %u:%#x to %u:%#x (no server of ours: dropped)", h.size, h.src_node, h.src_port,
++		    h.dst_node, h.dst_port);
++		break;
++	default:
++		qrtr_other++;
++		qrtr_say("QRTR: control type %u from node %u (%#x %#x %#x %#x)", h.type, h.src_node, b[1], b[2], b[3], b[4]);
++		break;
++	}
++}
++
++static bool
++step_qrtr(void)
++{
++	uint32_t window = MIN(listen_s, 120u) * 1000;
++
++	announce("QRTR: say HELLO on the SLPI IPCRTR, log the SLPI's servers");
++	if (!gl_up()) {
++		FAIL("GLINK channel IPCRTR is not up");
++		return false;
++	}
++	gl_ipcrtr.rx = qrtr_rx;
++	qrtr_send_ctrl(QRTR_TYPE_HELLO, QRTR_NODE_BCAST);
++	for (uint32_t ms = 0; ms < window && !gl_dead; ms++) {
++		gl_poll();
++		IOSleep(1);
++	}
++	say("QRTR: SLPI node %s%u, %u NEW_SERVER, %u DATA, %u other packets in %u s", qrtr_node == ~0u ? "unknown " : "",
++	    qrtr_node == ~0u ? 0 : qrtr_node, qrtr_servers, qrtr_data, qrtr_other, window / 1000);
++	if (sns_node != ~0u) {
++		say("SNS CLIENT SERVICE 400 IS THERE: node %u port %#x version %u instance %u", sns_node, sns_port,
++		    sns_instance & 0xff, sns_instance >> 8);
++	} else {
++		say("no service 400 (sns_client) announced (phase 2: the sensor PD may wait for the servreg locator)");
++	}
++	gl_summary();
++	if (gl_dead) {
++		FAIL("GLINK stopped during the QRTR window");
++		return false;
++	}
++	return true;
++}
++
++/* ---- thread ---- */
++
++static bool (*const steps[STEPS + 1])(void) = {
++	step_wait_adsp, step_survey, step_firmware, step_rails, step_aop, step_pas_init, step_load, step_smp2p,
++	step_start, step_glink, step_qrtr,
++};
++
++/*
++ * The crash watch (0248 for the ADSP): every 200 ms FATAL in "slave-kernel"; GLINK polled when step 9
++ * ran (the SLPI must not find our RX FIFO full). FATAL: last words, our "stop" bit + up to 5 s for
++ * STOP-ACK, PAS shutdown. No restart in this boot.
++ */
++static void
++slpi_watch(void)
++{
++	uint32_t size = 0, value = 0, last = ~0u, theirs = 0;
++
++	say("watch: polling slave-kernel every 200 ms for FATAL%s", gl_started && !gl_dead ? ", GLINK too" : "");
++	for (;;) {
++		IOSleep(200);
++		if (gl_started && !gl_dead) {
++			gl_poll();
++		}
++		if (theirs == 0) {
++			theirs = smem_item(ITEM_SMP2P_THEIRS, &size);
++		}
++		if (theirs == 0 || !smp2p_value(theirs, "slave-kernel", &value) || value == last) {
++			continue;
++		}
++		say("watch: slave-kernel = %#x%s%s", value, value & DSP_FATAL ? " FATAL" : "", value & DSP_STOP_ACK ? " STOP-ACK" : "");
++		last = value;
++		if (value & DSP_FATAL) {
++			break;
++		}
++	}
++	say("SLPI FATAL AFTER START: stop, PAS shutdown (no restart in this boot)");
++	last_words();
++	gl_dead = true;
++	if (our_item) {
++		wr32(smem, our_item + 36, rd32(smem, our_item + 36) | 1u);     /* master-kernel: "stop" */
++		kick(IPCC_CLIENT_SLPI, IPCC_SIGNAL_SMP2P);
++		for (uint32_t ms = 0; ms < 5000; ms += 10) {
++			if (smp2p_value(theirs, "slave-kernel", &value) && (value & DSP_STOP_ACK)) {
++				say("watch: STOP-ACK after %u ms", ms);
++				break;
++			}
++			IOSleep(10);
++		}
++		wr32(smem, our_item + 36, rd32(smem, our_item + 36) & ~1u);
++		kick(IPCC_CLIENT_SLPI, IPCC_SIGNAL_SMP2P);
++	}
++	pas_shutdown("SLPI fatal after start");
++	slpi_running = false;
++}
++
++static void
++slpi_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	bool failed = false;
++
++	for (step = 0; step <= last_step; step++) {
++		uint64_t t0 = mach_absolute_time(), ns = 0;
++		bool ok;
++
++		fail_why[0] = 0;
++		ok = steps[step]();
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		if (!ok) {
++			printf("NEGRONI SLPI: step %u (%s) failed: %s (after %llu ms)\n", step, step_names[step],
++			    fail_why[0] ? fail_why : "no reason logged", ns / 1000000);
++			failed = true;
++			break;
++		}
++		printf("NEGRONI SLPI: step %u (%s) ok in %llu ms%s\n", step, step_names[step], ns / 1000000,
++		    step >= 1 && ns / 1000000 > step_budget_ms ? " (OVER the step time limit)" : "");
++	}
++	/* PAS init done but no running SLPI (steps 5..8 failed): give the image back to TrustZone */
++	if (failed && pas_inited && !slpi_running) {
++		pas_shutdown("a step after PAS init failed");
++	}
++	if (failed && !slpi_running) {
++		rails_drop("start failed");
++	}
++	printf("NEGRONI SLPI: done (level %u, asked 0..%u, %s at %u)%s\n", level, last_step, failed ? "stopped" : "complete",
++	    MIN(step, last_step), slpi_running ? "; the SLPI runs" : "");
++	if (slpi_running) {
++		slpi_watch();
++	}
++	(void)thread_terminate(current_thread());
++}
++
++void
++negroni_slpi_init(void)
++{
++	uint32_t want = 0;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("negronislpi", &level, sizeof(level));
++	if (level == 0) {
++		return;
++	}
++	level = MIN(level, 3u);
++	last_step = 7 + level;                  /* 1 -> 8, 2 -> 9, 3 -> 10 */
++	if (PE_parse_boot_argn("negronislpi_step", &want, sizeof(want))) {
++		last_step = MIN(last_step, MAX(want, 1u));
++	}
++	(void)PE_parse_boot_argn("negronislpi_pause", &pause_ms, sizeof(pause_ms));
++	(void)PE_parse_boot_argn("negronislpi_wait", &wait_s, sizeof(wait_s));
++	(void)PE_parse_boot_argn("negronislpi_unvote", &unvote, sizeof(unvote));
++	(void)PE_parse_boot_argn("negronislpi_sleepstate", &sleepstate, sizeof(sleepstate));
++	(void)PE_parse_boot_argn("negronislpi_listen", &listen_s, sizeof(listen_s));
++	(void)PE_parse_boot_argn("negronislpi_adspwait", &adsp_wait_s, sizeof(adsp_wait_s));
++	(void)PE_parse_boot_argn("negronislpi_steptimeout", &step_budget_ms, sizeof(step_budget_ms));
++	wait_s = MIN(MAX(wait_s, 1u), 60u);
++	listen_s = MIN(MAX(listen_s, 1u), 120u);
++	adsp_wait_s = MIN(adsp_wait_s, 600u);
++	step_budget_ms = MIN(MAX(step_budget_ms, 1000u), 120000u);
++	pause_ms = MIN(pause_ms, 10000u);
++	printf("NEGRONI SLPI: level %u, steps 0..%u (UNTESTED: PAS id %u, carveout %#lx + %#x)\n", level, last_step, PAS_SLPI,
++	    SLPI_MEM_PHYS, SLPI_MEM_SIZE);
++	if (kernel_thread_start(slpi_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("NEGRONI SLPI: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_spmi.c b/bsd/dev/negroni_spmi.c
+index 787d4ec..7666fc3 100644
+--- a/bsd/dev/negroni_spmi.c
++++ b/bsd/dev/negroni_spmi.c
+@@ -510,12 +510,13 @@ sd_open(bool check_fuse, bool qdss)
+ 	if (!fuse || (check_fuse && !enabled)) {
+ 		return false;
+ 	}
+-	unsigned adsp = 0;
++	unsigned adsp = 0, slpi = 0;
+ 	(void)PE_parse_boot_argn("negroniadsp", &adsp, sizeof(adsp));
+-	if (qdss && adsp) {
++	(void)PE_parse_boot_argn("negronislpi", &slpi, sizeof(slpi));   /* 0376: the SLPI start uses QMP too */
++	if (qdss && (adsp || slpi)) {
+ 		/* patch 0240 (negroniadsp) uses the same QMP mailbox with no shared lock: no vote, no debug path */
+-		printf("NEGRONI BATTERY: debug arbiter: QDSS vote skipped: negroniadsp=%u shares the QMP mailbox; debug path "
+-		    "closed (negronichg_qdss=0 opens it without the vote)\n", adsp);
++		printf("NEGRONI BATTERY: debug arbiter: QDSS vote skipped: negroniadsp=%u negronislpi=%u share the QMP mailbox; "
++		    "debug path closed (negronichg_qdss=0 opens it without the vote)\n", adsp, slpi);
+ 		return false;
+ 	}
+ 	if (qdss) {
+diff --git a/bsd/dev/negroni_ufs.c b/bsd/dev/negroni_ufs.c
+index a650ce7..2f68ce0 100644
+--- a/bsd/dev/negroni_ufs.c
++++ b/bsd/dev/negroni_ufs.c
+@@ -62,6 +62,7 @@ extern void negroni_cam_init(void);      /* patch 0310: camera bring-up (negroni
+ extern void negroni_adreno_init(void);
+ extern void negroni_wifi_init(void);
+ extern void negroni_adsp_init(void);
++extern void negroni_slpi_init(void);    /* patch 0376: SLPI (sensor DSP) start (negronislpi) */
+ extern void negroni_bt_init(void);      /* patch 0330: QCA6490 Bluetooth (negronibt) */
+ extern void negroni_fp_init(void);      /* patch 0350: fingerprint sensor stage A (negronifp) */
+ extern void negroni_probe_menu(void);
+@@ -821,6 +822,7 @@ negroni_ufs_init(void)
+ 	negroni_adreno_init();
+ 	negroni_wifi_init();
+ 	negroni_adsp_init();            /* boot-arg negroniadsp=1 (default off): own thread */
++	negroni_slpi_init();            /* patch 0376: negronislpi=1|2|3 (default off): own thread, after the ADSP thread */
+ 	negroni_bt_init();              /* patch 0330: negronibt=1|2 (default off): own thread */
+ 	negroni_fp_init();              /* patch 0350: negronifp=1|2 (default off): own thread */
+ 	negroni_keys_init();
