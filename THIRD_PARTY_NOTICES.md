@@ -23,6 +23,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | `userland/negronigl/` (Mesa integration / freedreno) | Mesa contributors, Rob Clark | MIT |
 | Linux kernel drivers (ath11k / Qualcomm) | Qualcomm Technologies Inc., Linux Foundation | BSD-3-Clause-Clear |
 | seemoo-lab/owl (port in `patches/xnu/0347-negroni-awdl.patch`: `bsd/dev/negroni_awdl_owl.{c,h}`) | The Open Wireless Link Project, Milan Stute | GPL-3.0-or-later |
+| Qualcomm WALT / OPLUS frame_boost (logic port in `patches/xnu/0395-negroni-cpuperf.patch`: `bsd/dev/negroni_cpuperf.c`) | The Linux Foundation, Intel Corporation, Oplus | GPL-2.0-only |
 
 ---
 
@@ -363,3 +364,25 @@ Copyright (C) 2018  Milan Stute
 The complete GNU General Public License v3.0 text is in `LICENSES/GPL-3.0.txt` (copied from OWL's `COPYING`).
 A kernel built with patch 0347 contains this GPL-3.0 code; the kill switch `negroniawdl=0` turns it off at run time
 but does not remove it from the binary.
+
+---
+
+## 9. GNU GPL v2.0 (WALT / OPLUS CPU policy, patch 0395)
+
+`patches/xnu/0395-negroni-cpuperf.patch` adds `bsd/dev/negroni_cpuperf.c`, a re-written port of the CPU frequency and
+placement policy of the Android kernel of this phone: Qualcomm WALT (`kernel/sched/walt/walt.c`, `cpufreq_walt.c`,
+`input-boost.c`, `boost.c` of OnePlusOSS/android_kernel_oneplus_sm8450 commit `e9da5922d6d1925fa7cc3062b65d92fa2812c3aa`)
+and the OPLUS frame boost (`vendor/oplus/kernel/cpu/sched/frame_boost/` of
+OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8450 commit `835109f6cf48dbae09b68ef072bfecbf48e15064`).
+Fetch: `scripts/setup/fetch-cpuperf-sources.sh`.
+
+```
+SPDX-License-Identifier: GPL-2.0-only
+Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
+Copyright (C) 2016, Intel Corporation
+Copyright (C) 2020 Oplus. All rights reserved.
+```
+
+The complete GNU General Public License v2.0 text is in `LICENSES/GPL-2.0.txt` (copied from `external/metal2vulkan/LICENSE-GPL-2.0`).
+A kernel built with patch 0395 contains this code; the kill switch `negronicpuperf=0` turns it off at run time but does not
+remove it from the binary.

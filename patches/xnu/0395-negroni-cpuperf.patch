@@ -1,0 +1,825 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 03def34..bdafab2 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/negroni_reboot.c		standard
+ bsd/dev/negroni_charge.c		standard
+ bsd/dev/negroni_touch.c			standard
+ bsd/dev/negroni_cpufreq.c		standard
++bsd/dev/negroni_cpuperf.c		standard
+ bsd/dev/negroni_thermal.c		standard
+ bsd/dev/negroni_haptic.c		standard
+ bsd/dev/negroni_cam.c			standard
+diff --git a/bsd/dev/negroni_cpufreq.c b/bsd/dev/negroni_cpufreq.c
+index 393cd71..dfab1fd 100644
+--- a/bsd/dev/negroni_cpufreq.c
++++ b/bsd/dev/negroni_cpufreq.c
+@@ -50,6 +50,12 @@
+  * lines 495-506: src = [31:30], lval = [7:0], src ? xo * lval : alternate / 2;
+  * the table ends at the first repeated frequency (line 516). Domain bases and
+  * qcom,lut-row-size = 4: out/live.dts qcom,cpufreq-hw (reg 0x17d91000/92000/93000).
++ *
++ * Patch 0395 (NEGRONI CPUPERF, bsd/dev/negroni_cpuperf.c, README-cpufreq.md "0395"): when the controller
++ * passes its self-check it replaces the 0284 step (gov_step) in the same thread: a 20 ms window (100 ms
++ * with the display off), the row = the lowest row at or above the controller's wanted clock, then the same
++ * bounds (floor: ABL row or 0291 LUT row; cap: negronicpufreq_mhz and the 0280 thermal cap; the one writer
++ * wr_perf_state). When it is off (negronicpuperf=0 or a failed self-check) the 0284 step runs as before.
+  */
+ #if defined(ARM64_BOARD_CONFIG_NEGRONI)
+ #include <sys/param.h>
+@@ -71,6 +77,11 @@ void negroni_cpufreq_init(void);
+ void negroni_cpufreq_cap(uint32_t mhz);
+ void negroni_cpufreq_line(char *buf, size_t size);
+ void negroni_cpufreq_mhz_line(char *buf, size_t size);
++void negroni_cpufreq_kick(void);
++/* 0395: bsd/dev/negroni_cpuperf.c */
++extern bool negroni_cpuperf_start(const uint32_t *cpu_dom, uint32_t ncpu, bool domains_ok);
++extern bool negroni_cpuperf_policy(const uint32_t cur_khz[3], uint32_t want_khz[3], uint32_t busy_pct[3],
++    uint32_t cap_khz[3], uint32_t *tick_ms);
+ 
+ #define EPSS_PHYS               0x17d91000UL    /* domain 0: A510 0-3, 1: A710 4-6, 2: X2 7 */
+ #define EPSS_DOMAIN_SIZE        0x1000UL
+@@ -85,8 +96,6 @@ void negroni_cpufreq_mhz_line(char *buf, size_t size);
+ #define GOV_TICK_MS             100
+ #define GOV_LOW_TICKS           3               /* 300 ms below the low mark before -1 row */
+ #define GOV_WINDOW              3               /* busy % over the last 3 samples (300 ms) */
+-#define GOV_LOG_TICKS           600             /* a line a minute */
+-#define GOV_CHANGE_TICKS        10              /* at most one change line a second */
+ #define GOV_MAX_CPUS            16
+ 
+ static vm_offset_t dom_base[EPSS_DOMAINS];
+@@ -111,6 +120,8 @@ static uint32_t cpu_busy_d[GOV_MAX_CPUS][GOV_WINDOW], cpu_all_d[GOV_MAX_CPUS][GO
+ static uint32_t win_at;
+ static bool sampled;                            /* the first sample only sets the base */
+ static char gov_line[128];
++static bool cpuperf_on;                         /* 0395: the controller runs the policy */
++static uint32_t gov_event;                      /* the governor thread waits on it; negroni_cpufreq_kick() */
+ /* the governor thread and the thermal thread (0280) both move the rows */
+ static LCK_GRP_DECLARE(cpufreq_grp, "negroni_cpufreq");
+ static LCK_MTX_DECLARE(cpufreq_lock, &cpufreq_grp);
+@@ -330,27 +341,122 @@ gov_step(void)
+ 	return changed;
+ }
+ 
++/* 0395: the lowest row of the domain at or above khz (CPUFREQ_RELATION_L); the top row when every row is below. */
++static uint32_t
++row_at_or_above(uint32_t domain, uint32_t khz)
++{
++	for (uint32_t row = 0; row < dom_rows[domain]; row++) {
++		if (dom_khz[domain][row] >= khz) {
++			return row;
++		}
++	}
++	return dom_rows[domain] ? dom_rows[domain] - 1 : 0;
++}
++
++/* 0395: one window of the CPUPERF controller. Returns -1 when it turned itself off, else 1 if a row changed. */
++static int
++cpuperf_step(uint32_t *tick_ms)
++{
++	uint32_t cur[EPSS_DOMAINS] = { 0 }, want[EPSS_DOMAINS] = { 0 }, busy[EPSS_DOMAINS] = { 0 }, cap[EPSS_DOMAINS] = { 0 };
++	int changed = 0;
++
++	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
++		uint32_t lmh;
++
++		if (!dom_base[d]) {
++			continue;
++		}
++		/* a row past the table (a PERF_STATE value we did not write) counts as the top row */
++		cur[d] = dom_khz[d][dom_row[d] < dom_rows[d] ? dom_row[d] : dom_rows[d] - 1];
++		lmh = lmh_mhz(d) * 1000;
++		if (lmh != 0 && lmh < cur[d]) {
++			cur[d] = lmh;           /* LMh throttles: the cores ran at its limit */
++		}
++	}
++	if (!negroni_cpuperf_policy(cur, want, busy, cap, tick_ms)) {
++		return -1;
++	}
++	lck_mtx_lock(&cpufreq_lock);
++	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
++		uint32_t row, top;
++
++		if (!dom_base[d]) {
++			continue;
++		}
++		dom_busy[d] = busy[d];
++		row = row_at_or_above(d, want[d]);
++		top = dom_cap_row[d];
++		if (cap[d] != 0 && row_for_khz(d, cap[d]) < top) {
++			top = row_for_khz(d, cap[d]);     /* display off: the low rows */
++		}
++		if (row > top) {
++			row = top;
++		}
++		if (row > dom_cap_row[d]) {
++			row = dom_cap_row[d];
++		}
++		if (row < dom_floor_row[d]) {
++			row = dom_floor_row[d];
++		}
++		if (row != dom_row[d]) {
++			wr_perf_state(d, row);
++			changed = 1;
++		}
++	}
++	lck_mtx_unlock(&cpufreq_lock);
++	return changed;
++}
++
++/* 0395: wake the governor thread now (an input boost). */
++void
++negroni_cpufreq_kick(void)
++{
++	if (cpuperf_on) {
++		thread_wakeup((event_t)&gov_event);
++	}
++}
++
+ __attribute__((noreturn)) static void
+ gov_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	uint32_t tick = 0, printed = 0;
++	uint32_t tick_ms = GOV_TICK_MS;
++	uint64_t now, printed = 0, minute = 0, sec_abs, min_abs;
+ 	bool pending = false;   /* a row changed since the last line */
+ 
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec_abs);
++	nanoseconds_to_absolutetime(60 * NSEC_PER_SEC, &min_abs);
++	minute = mach_absolute_time() + min_abs;
+ 	sample_busy();          /* the first delta starts here */
+ 	for (;;) {
+-		assert_wait_timeout((event_t)&tick, THREAD_UNINT, GOV_TICK_MS, NSEC_PER_MSEC);
++		assert_wait_timeout((event_t)&gov_event, THREAD_UNINT, tick_ms, NSEC_PER_MSEC);
+ 		thread_block(THREAD_CONTINUE_NULL);
+-		tick++;
+-		sample_busy();
+-		if (gov_step()) {
+-			pending = true;
++		if (cpuperf_on) {
++			int r = cpuperf_step(&tick_ms);
++
++			if (r < 0) {
++				/* the controller turned itself off (its own line): the 0284 step from now on */
++				cpuperf_on = false;
++				tick_ms = GOV_TICK_MS;
++				sample_busy();
++			} else if (r > 0) {
++				pending = true;
++			}
++		} else {
++			sample_busy();
++			if (gov_step()) {
++				pending = true;
++			}
+ 		}
+ 		format_line();
+ 		/* change lines: at most one a second (the state then, not each step); the minute line always */
+-		if ((pending && tick - printed >= GOV_CHANGE_TICKS) || tick % GOV_LOG_TICKS == 0) {
++		now = mach_absolute_time();
++		if ((pending && now - printed >= sec_abs) || now >= minute) {
+ 			printf("NEGRONI CPUFREQ: %s\n", gov_line);
+-			printed = tick;
++			printed = now;
+ 			pending = false;
++			if (now >= minute) {
++				minute = now + min_abs;
++			}
+ 		}
+ 	}
+ }
+@@ -428,8 +534,32 @@ gov_start(void)
+ 		at += snprintf(rows + at, sizeof(rows) - at, "%sd%u rows %u..%u (%u..%u MHz)", at ? ", " : "",
+ 		    d, dom_floor_row[d], dom_cap_row[d], row_mhz(d, dom_floor_row[d]), row_mhz(d, dom_cap_row[d]));
+ 	}
+-	printf("NEGRONI CPUFREQ: governor on (%s; up > %u%%, down < %u%% for %u ms, tick %u ms)\n",
+-	    rows, gov_hi, gov_lo, GOV_LOW_TICKS * GOV_TICK_MS, GOV_TICK_MS);
++	/* 0395: the CPU -> EPSS domain map for the controller, then its self-check */
++	{
++		const ml_topology_info_t *topology = ml_get_topology_info();
++		uint32_t cpu_dom[GOV_MAX_CPUS] = { 0 }, ncpu = 0;
++		bool ok = dom_base[0] && dom_base[1] && dom_base[2] && dom_rows[0] > 1 && dom_rows[1] > 1 && dom_rows[2] > 1;
++
++		for (unsigned int i = 0; i < topology->num_cpus; i++) {
++			uint32_t id = (uint32_t)topology->cpus[i].cpu_id;
++
++			if (id >= GOV_MAX_CPUS) {
++				ok = false;
++				continue;
++			}
++			cpu_dom[id] = domain_of(topology->cpus[i].phys_id);
++			if (id + 1 > ncpu) {
++				ncpu = id + 1;
++			}
++		}
++		cpuperf_on = negroni_cpuperf_start(cpu_dom, ncpu, ok);
++	}
++	if (cpuperf_on) {
++		printf("NEGRONI CPUFREQ: governor on (%s; policy CPUPERF 0395, window 20 ms)\n", rows);
++	} else {
++		printf("NEGRONI CPUFREQ: governor on (%s; up > %u%%, down < %u%% for %u ms, tick %u ms)\n",
++		    rows, gov_hi, gov_lo, GOV_LOW_TICKS * GOV_TICK_MS, GOV_TICK_MS);
++	}
+ 	if (kernel_thread_start(gov_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+@@ -452,6 +582,7 @@ negroni_cpufreq_init(void)
+ 	floor_lut = strcmp(fl, "lut") == 0 || strcmp(fl, "1") == 0;
+ 	if (!enabled) {
+ 		printf("NEGRONI CPUFREQ: disabled (negronicpufreq=0)\n");
++		printf("NEGRONI CPUPERF: off: negronicpufreq=0\n");
+ 		return;
+ 	}
+ 	cap_mhz_now = cap_mhz;
+@@ -471,6 +602,7 @@ negroni_cpufreq_init(void)
+ 		gov_start();
+ 	} else {
+ 		printf("NEGRONI CPUFREQ: governor off (negronicpufreq_gov=0): the rows stay\n");
++		printf("NEGRONI CPUPERF: off: negronicpufreq_gov=0\n");
+ 	}
+ }
+ 
+diff --git a/bsd/dev/negroni_cpuperf.c b/bsd/dev/negroni_cpuperf.c
+new file mode 100644
+index 0000000..0931d59
+--- /dev/null
++++ b/bsd/dev/negroni_cpuperf.c
+@@ -0,0 +1,415 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * NEGRONI CPUPERF (patch 0395): the CPU performance controller of the SM8450 port, as a client of the XNU
++ * perfcontrol callouts (sched_perfcontrol_register_callbacks, the interface Apple's closed CLPC kext uses).
++ * Policy ported from the Android kernel of this phone (OnePlus 10 Pro NE2211, SM8450 "waipio"/"taro"):
++ *
++ *   OnePlusOSS/android_kernel_oneplus_sm8450 @ e9da5922d6d1925fa7cc3062b65d92fa2812c3aa (msm-kernel 5.10, WALT):
++ *     kernel/sched/walt/walt.c          Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
++ *     kernel/sched/walt/cpufreq_walt.c  Copyright (C) 2016, Intel Corporation
++ *                                       Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
++ *     kernel/sched/walt/input-boost.c   Copyright (c) 2013-2015,2017,2019-2021, The Linux Foundation. All rights reserved.
++ *     kernel/sched/walt/boost.c         Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
++ *   OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8450 @ 835109f6cf48dbae09b68ef072bfecbf48e15064:
++ *     vendor/oplus/kernel/cpu/sched/frame_boost/   Copyright (C) 2020 Oplus. All rights reserved.
++ *   (fetched by scripts/setup/fetch-cpuperf-sources.sh; GPL-2.0-only, LICENSES/ in this repo)
++ *
++ * The logic is re-written for XNU; no Linux code is copied verbatim. Mapping (README-cpufreq.md "0395"):
++ *   WALT window busy time (walt.c update_cpu_busy_time, prev_runnable_sum)
++ *        -> cp_oncore()/cp_offcore(): exact on-core time per CPU from the scheduler callouts
++ *   scale_exec_time() (busy time * cur_freq / max_freq: frequency-invariant load)
++ *        -> work kHz = busy % * the clock the domain ran at (min(EPSS row, LMh limit))
++ *   WINDOW_STATS_MAX_RECENT_AVG over sched_ravg_hist_size = 5 windows
++ *        -> demand = max(last window, average of the last 5 windows): fast up, ~100 ms down
++ *   cpufreq_walt.c walt_map_util_freq(): freq = 1.25 * util (TARGET_LOAD 80)
++ *        -> want kHz = demand * 100 / 80; the EPSS row is the lowest row at or above it
++ *           (cpufreq_driver_resolve_freq, CPUFREQ_RELATION_L)
++ *   waltgov_walt_adjust() hispeed_load 90 % -> hispeed_freq
++ *        -> a CPU busy >= 90 % in the window lifts its domain to cp_hispeed_khz[]
++ *   rtg_boost_freq (cpu0 1000000, cpu4 768000, cpu7 0 kHz while a related thread group is active)
++ *        -> a work interval (os_workgroup frame) reported from a domain in the last 50 ms lifts it to cp_rtg_khz[]
++ *   OPLUS frame_boost (late frame -> raise util of the frame group)
++ *        -> a work interval that finished after its deadline lifts its domain to hispeed for 100 ms
++ *   input-boost.c (input_boost_freq per CPU, input_boost_ms, MIN_INPUT_INTERVAL 150 ms, sched_boost_on_input)
++ *        -> negroni_cpuperf_input() from the touch driver: d1/d2 at least cp_input_khz[] for 150 ms, and the
++ *           placement threshold of osfmk/kern/sched_prim.c (0395) drops to BASEPRI_DEFAULT (top-app on big)
++ *   boost.c / walt task_boost_policy() SCHED_BOOST_ON_BIG -> osfmk/kern/sched_prim.c negroni_pick_cpu()
++ *
++ * Self-check (CLAUDE.md "No probes"): negroni_cpuperf_start() needs the three EPSS domains and the CPU
++ * map (E and P CPUs); 500 ms after the start the callouts must have run, else the controller turns itself
++ * off with one line "NEGRONI CPUPERF: off: <reason>", unregisters, and negroni_cpufreq.c goes back to the
++ * 0284 policy. Kill switches: negronicpuperf=0 (all of 0395), negronicpuperf_place=0 (placement only).
++ */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/cpu_number.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <mach/machine.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++#define CP_DOMS                 3
++#define CP_MAX_CPUS             16
++#define CP_HIST                 5       /* walt.c sched_ravg_hist_size = 5 */
++#define CP_WINDOW_MS            20      /* walt.c sched_ravg_window = 20000000 ns at init */
++#define CP_DARK_WINDOW_MS       100     /* display off: the 0284 tick (0382: fewer wakeups while dark) */
++#define CP_TARGET_LOAD          80      /* cpufreq_walt.c TARGET_LOAD 80: freq = util * 100 / 80 = 1.25 * util */
++#define CP_HISPEED_LOAD         90      /* cpufreq_walt.c DEFAULT_HISPEED_LOAD */
++#define CP_INPUT_BOOST_MS       150     /* input-boost.c input_boost_ms (sysctl default 40; ours, see README) */
++#define CP_MIN_INPUT_MS         150     /* input-boost.c MIN_INPUT_INTERVAL 150 ms */
++#define CP_RTG_MS               50      /* a frame from the domain within the last 50 ms = the group is active */
++#define CP_FRAME_BOOST_MS       100     /* a late frame lifts its domain for 100 ms */
++#define CP_CHECK_MS             500     /* self-check: callouts must have run by then */
++#define CP_LOG_S                60
++#define CP_PRI_PERF             37      /* BASEPRI_USER_INITIATED (osfmk/kern/sched.h) */
++#define CP_PRI_BOOST            31      /* BASEPRI_DEFAULT: sched_boost_on_input */
++#define CP_THREAD_URGENCY_NONE  0       /* osfmk/kern/sched_urgency.h THREAD_URGENCY_NONE: the idle thread */
++
++/* kHz per domain (d0 A510 x4, d1 A710 x3, d2 X2); 0 = none. The EPSS tables are in the 0284 boot line. */
++static const uint32_t cp_hispeed_khz[CP_DOMS] = { 0, 1555200, 1401600 };
++static const uint32_t cp_input_khz[CP_DOMS]   = { 0, 1555200, 1401600 };
++static const uint32_t cp_rtg_khz[CP_DOMS]     = { 1000000, 768000, 0 };   /* cpufreq_walt.c DEFAULT_CPU0/4/7_RTG_BOOST_FREQ */
++static const uint32_t cp_dark_khz[CP_DOMS]    = { 0, 1209600, 1209600 };  /* display off: d1/d2 cap */
++
++struct cp_cpu {
++	/* written only by the CPU itself, in the callouts (interrupts off) */
++	uint64_t busy;          /* mach time on core with a non-idle thread */
++	uint64_t start;         /* when the running non-idle thread went on core; 0 = idle */
++	uint64_t calls;
++	/* the governor thread only */
++	uint64_t busy_last;
++	uint32_t hist[CP_HIST]; /* work kHz of the last windows */
++	uint32_t dom;
++} __attribute__((aligned(64)));
++
++static struct cp_cpu cp_cpus[CP_MAX_CPUS];
++static uint32_t cp_ncpu;
++static bool cp_on, cp_checked, cp_place_on;
++static uint32_t cp_hist_at;
++static uint64_t cp_last, cp_check_at, cp_log_at;
++static uint64_t cp_win_abs, cp_dark_win_abs, cp_input_abs, cp_min_input_abs, cp_rtg_abs, cp_frame_abs, cp_log_abs;
++static uint64_t cp_input_at, cp_boost_until, cp_rtg_until[CP_DOMS], cp_frame_until[CP_DOMS];
++static uint64_t cp_inputs, cp_frames, cp_late, cp_dark_ticks;
++static uint64_t cp_boost_ticks[CP_DOMS], cp_hs_ticks[CP_DOMS];
++
++extern int negroni_display_asleep;      /* NegroniFramebuffer.cpp (0382) */
++extern uint64_t negroni_sched_to_p, negroni_sched_to_e;
++extern int negroni_sched_perf_pri;            /* osfmk/kern/sched_prim.c (0395) */
++void negroni_sched_placement(uint64_t pmask);
++void negroni_sched_set_perf_pri(int pri);
++void negroni_cpufreq_kick(void);        /* negroni_cpufreq.c: wake the governor thread now */
++
++bool negroni_cpuperf_start(const uint32_t *cpu_dom, uint32_t ncpu, bool domains_ok);
++bool negroni_cpuperf_policy(const uint32_t cur_khz[CP_DOMS], uint32_t want_khz[CP_DOMS], uint32_t busy_pct[CP_DOMS],
++    uint32_t cap_khz[CP_DOMS], uint32_t *tick_ms);
++void negroni_cpuperf_input(void);
++
++static inline void
++cp_store(uint64_t *p, uint64_t v)
++{
++	__atomic_store_n(p, v, __ATOMIC_RELAXED);
++}
++
++static inline uint64_t
++cp_load(const uint64_t *p)
++{
++	return __atomic_load_n(p, __ATOMIC_RELAXED);
++}
++
++static inline uint64_t
++cp_ms_abs(uint32_t ms)
++{
++	uint64_t abs;
++
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &abs);
++	return abs;
++}
++
++/* A thread goes on core (also on a quantum end or a priority change of the running thread). */
++static void
++cp_oncore(perfcontrol_state_t state __unused, going_on_core_t on)
++{
++	unsigned int c = (unsigned int)cpu_number();
++	struct cp_cpu *p;
++	uint64_t now = on->start_time;
++
++	if (c >= cp_ncpu) {
++		return;
++	}
++	p = &cp_cpus[c];
++	if (p->start != 0 && now > p->start) {
++		cp_store(&p->busy, p->busy + (now - p->start));
++	}
++	cp_store(&p->start, on->urgency == CP_THREAD_URGENCY_NONE ? 0 : (now ? now : 1));
++	cp_store(&p->calls, p->calls + 1);
++}
++
++/* The thread that ran is off core (the idle thread never gets this callout). */
++static void
++cp_offcore(perfcontrol_state_t state __unused, going_off_core_t off, boolean_t terminating __unused)
++{
++	unsigned int c = (unsigned int)cpu_number();
++	struct cp_cpu *p;
++
++	if (c >= cp_ncpu) {
++		return;
++	}
++	p = &cp_cpus[c];
++	if (p->start != 0 && off->end_time > p->start) {
++		cp_store(&p->busy, p->busy + (off->end_time - p->start));
++	}
++	cp_store(&p->start, 0);
++}
++
++/* A work interval (an os_workgroup frame, e.g. CoreAnimation) reports a finished frame. */
++static void
++cp_work_interval(perfcontrol_state_t state __unused, perfcontrol_work_interval_t wi)
++{
++	unsigned int c = (unsigned int)cpu_number();
++	uint64_t now = mach_absolute_time();
++	uint32_t d;
++
++	if (c >= cp_ncpu) {
++		return;
++	}
++	d = cp_cpus[c].dom;
++	cp_store(&cp_rtg_until[d], now + cp_rtg_abs);
++	__atomic_fetch_add(&cp_frames, 1, __ATOMIC_RELAXED);
++	if (wi->deadline != 0 && wi->finish > wi->deadline) {
++		__atomic_fetch_add(&cp_late, 1, __ATOMIC_RELAXED);
++		cp_store(&cp_frame_until[d], now + cp_frame_abs);
++	}
++}
++
++static struct sched_perfcontrol_callbacks cp_callbacks = {
++	.version = SCHED_PERFCONTROL_CALLBACKS_VERSION_2,
++	.offcore = cp_offcore,
++	.oncore = cp_oncore,
++	.work_interval_notify = cp_work_interval,
++};
++
++static void
++cp_off(const char *why)
++{
++	cp_on = false;
++	sched_perfcontrol_register_callbacks(NULL, 0);
++	negroni_sched_placement(0);
++	negroni_sched_set_perf_pri(CP_PRI_PERF);
++	printf("NEGRONI CPUPERF: off: %s\n", why);
++}
++
++static uint64_t
++cp_mask_of(const uint32_t *cpu_dom, uint32_t ncpu, bool p)
++{
++	uint64_t m = 0;
++
++	for (uint32_t c = 0; c < ncpu; c++) {
++		if ((cpu_dom[c] != 0) == p) {
++			m |= 1ULL << c;
++		}
++	}
++	return m;
++}
++
++/*
++ * cpu_dom[cpu_id] = EPSS domain of each CPU (0 = A510, 1 = A710, 2 = X2). domains_ok: negroni_cpufreq.c
++ * mapped all three domains and read their tables. Returns true when the controller runs.
++ */
++bool
++negroni_cpuperf_start(const uint32_t *cpu_dom, uint32_t ncpu, bool domains_ok)
++{
++	uint32_t enabled = 1, place = 1;
++	uint64_t pmask, emask;
++
++	(void)PE_parse_boot_argn("negronicpuperf", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("negronicpuperf_place", &place, sizeof(place));
++	if (!enabled) {
++		printf("NEGRONI CPUPERF: off: negronicpuperf=0\n");
++		return false;
++	}
++	if (!domains_ok) {
++		printf("NEGRONI CPUPERF: off: the EPSS domains 0-2 are not all mapped\n");
++		return false;
++	}
++	if (ncpu == 0 || ncpu > CP_MAX_CPUS) {
++		printf("NEGRONI CPUPERF: off: %u CPUs (1..%u supported)\n", ncpu, CP_MAX_CPUS);
++		return false;
++	}
++	pmask = cp_mask_of(cpu_dom, ncpu, true);
++	emask = cp_mask_of(cpu_dom, ncpu, false);
++	if (pmask == 0 || emask == 0) {
++		printf("NEGRONI CPUPERF: off: no %s cores in the CPU map\n", pmask ? "A510" : "A710/X2");
++		return false;
++	}
++	for (uint32_t c = 0; c < ncpu; c++) {
++		cp_cpus[c].dom = cpu_dom[c] < CP_DOMS ? cpu_dom[c] : 0;
++	}
++	cp_win_abs = cp_ms_abs(CP_WINDOW_MS);
++	cp_dark_win_abs = cp_ms_abs(CP_DARK_WINDOW_MS);
++	cp_input_abs = cp_ms_abs(CP_INPUT_BOOST_MS);
++	cp_min_input_abs = cp_ms_abs(CP_MIN_INPUT_MS);
++	cp_rtg_abs = cp_ms_abs(CP_RTG_MS);
++	cp_frame_abs = cp_ms_abs(CP_FRAME_BOOST_MS);
++	cp_log_abs = cp_ms_abs(CP_LOG_S * 1000);
++	cp_last = mach_absolute_time();
++	cp_check_at = cp_last + cp_ms_abs(CP_CHECK_MS);
++	cp_log_at = cp_last + cp_log_abs;
++	cp_ncpu = ncpu;
++	sched_perfcontrol_register_callbacks(&cp_callbacks, 0);
++	cp_on = true;
++	cp_place_on = place != 0;
++	if (cp_place_on) {
++		negroni_sched_placement(pmask);
++	}
++	printf("NEGRONI CPUPERF: on (WALT/schedutil port: window %u ms, history %u, target load %u%%, hispeed %u%% -> "
++	    "d1 %u/d2 %u MHz, input boost %u ms -> d1 %u/d2 %u MHz + placement pri %u, frame boost %u ms; dark: window %u ms, "
++	    "d1/d2 cap %u MHz; placement %s: P mask 0x%llx (pri >= %u, RT), E mask 0x%llx)\n",
++	    CP_WINDOW_MS, CP_HIST, CP_TARGET_LOAD, CP_HISPEED_LOAD, cp_hispeed_khz[1] / 1000, cp_hispeed_khz[2] / 1000,
++	    CP_INPUT_BOOST_MS, cp_input_khz[1] / 1000, cp_input_khz[2] / 1000, CP_PRI_BOOST, CP_FRAME_BOOST_MS,
++	    CP_DARK_WINDOW_MS, cp_dark_khz[1] / 1000, cp_place_on ? "on" : "off (negronicpuperf_place=0)",
++	    pmask, CP_PRI_PERF, emask);
++	return true;
++}
++
++/* Touch (bsd/dev/negroni_touch.c): input-boost.c inputboost_input_event() + do_input_boost(). */
++void
++negroni_cpuperf_input(void)
++{
++	uint64_t now;
++
++	if (!cp_on || __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE)) {
++		return;
++	}
++	now = mach_absolute_time();
++	if (now - cp_load(&cp_input_at) < cp_min_input_abs) {
++		return;
++	}
++	cp_store(&cp_input_at, now);
++	cp_store(&cp_boost_until, now + cp_input_abs);
++	__atomic_fetch_add(&cp_inputs, 1, __ATOMIC_RELAXED);
++	if (cp_place_on) {
++		negroni_sched_set_perf_pri(CP_PRI_BOOST);
++	}
++	negroni_cpufreq_kick();
++}
++
++static inline uint32_t
++cp_max(uint32_t a, uint32_t b)
++{
++	return a > b ? a : b;
++}
++
++/*
++ * One window. cur_khz[d]: the clock domain d ran at (the row asked, or the LMh limit when lower).
++ * Out: want_khz[d] (the governor takes the lowest row at or above it, then its floor and cap),
++ * busy_pct[d] (busiest CPU of the window, for the CPUFREQ line), cap_khz[d] (0 = no extra cap),
++ * tick_ms (the next window). Returns false when the controller is off (0284 runs instead).
++ */
++bool
++negroni_cpuperf_policy(const uint32_t cur_khz[CP_DOMS], uint32_t want_khz[CP_DOMS], uint32_t busy_pct[CP_DOMS],
++    uint32_t cap_khz[CP_DOMS], uint32_t *tick_ms)
++{
++	uint64_t now, dt, calls = 0;
++	uint32_t demand[CP_DOMS] = { 0 };
++	bool dark;
++
++	if (!cp_on) {
++		return false;
++	}
++	now = mach_absolute_time();
++	if (!cp_checked && now >= cp_check_at) {
++		for (uint32_t c = 0; c < cp_ncpu; c++) {
++			calls += cp_load(&cp_cpus[c].calls);
++		}
++		if (calls == 0) {
++			cp_off("the scheduler made no perfcontrol callout in 500 ms; the 0284 governor runs");
++			return false;
++		}
++		cp_checked = true;
++	}
++	dt = now - cp_last;
++	cp_last = now;
++	if (dt == 0) {
++		dt = 1;
++	}
++	dark = __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE) != 0;
++	for (uint32_t d = 0; d < CP_DOMS; d++) {
++		busy_pct[d] = 0;
++	}
++	for (uint32_t c = 0; c < cp_ncpu; c++) {
++		struct cp_cpu *p = &cp_cpus[c];
++		uint32_t d = p->dom, pct, work, sum = 0, dem;
++		uint64_t start = cp_load(&p->start);
++		uint64_t busy = cp_load(&p->busy) + (start != 0 && now > start ? now - start : 0);
++		uint64_t delta = busy > p->busy_last ? busy - p->busy_last : 0;
++
++		/* busy and start are two loads: a callout between them can count a piece twice; the clamp bounds it */
++		if (busy > p->busy_last) {
++			p->busy_last = busy;
++		}
++		if (delta > dt) {
++			delta = dt;
++		}
++		pct = (uint32_t)(delta * 100 / dt);
++		work = (uint32_t)((uint64_t)pct * cur_khz[d] / 100);      /* scale_exec_time(): frequency-invariant */
++		p->hist[cp_hist_at] = work;
++		for (uint32_t h = 0; h < CP_HIST; h++) {
++			sum += p->hist[h];
++		}
++		dem = cp_max(work, sum / CP_HIST);                          /* WINDOW_STATS_MAX_RECENT_AVG */
++		demand[d] = cp_max(demand[d], dem);
++		busy_pct[d] = cp_max(busy_pct[d], pct);
++	}
++	cp_hist_at = (cp_hist_at + 1) % CP_HIST;
++	/*
++	 * do_input_boost_rem(): the placement threshold follows the boost every window, so a boost that started and
++	 * ended between two windows (or a reset that raced a new touch) cannot leave the threshold at 31.
++	 */
++	{
++		int pri = (cp_place_on && now < cp_load(&cp_boost_until)) ? CP_PRI_BOOST : CP_PRI_PERF;
++
++		if (__atomic_load_n(&negroni_sched_perf_pri, __ATOMIC_RELAXED) != pri) {
++			negroni_sched_set_perf_pri(pri);
++		}
++	}
++	for (uint32_t d = 0; d < CP_DOMS; d++) {
++		uint32_t want = (uint32_t)((uint64_t)demand[d] * 100 / CP_TARGET_LOAD);   /* walt_map_util_freq() */
++
++		if (busy_pct[d] >= CP_HISPEED_LOAD && cp_hispeed_khz[d] > want) {
++			want = cp_hispeed_khz[d];
++			cp_hs_ticks[d]++;
++		}
++		cap_khz[d] = 0;
++		if (dark) {
++			cap_khz[d] = cp_dark_khz[d];
++		} else {
++			if (now < cp_load(&cp_boost_until) && cp_input_khz[d] > want) {
++				want = cp_input_khz[d];
++				cp_boost_ticks[d]++;
++			}
++			if (now < cp_load(&cp_rtg_until[d])) {
++				want = cp_max(want, cp_rtg_khz[d]);
++			}
++			if (now < cp_load(&cp_frame_until[d])) {
++				want = cp_max(want, cp_hispeed_khz[d]);
++			}
++		}
++		want_khz[d] = want;
++	}
++	if (dark) {
++		cp_dark_ticks++;
++	}
++	*tick_ms = dark ? CP_DARK_WINDOW_MS : CP_WINDOW_MS;
++	if (now >= cp_log_at) {
++		cp_log_at = now + cp_log_abs;
++		printf("NEGRONI CPUPERF: inputs %llu, frames %llu (late %llu), placed on P %llu / on E %llu, ticks: boost d1 %llu d2 %llu, "
++		    "hispeed d0 %llu d1 %llu d2 %llu, dark %llu\n", cp_inputs, cp_frames, cp_late,
++		    cp_load(&negroni_sched_to_p), cp_load(&negroni_sched_to_e), cp_boost_ticks[1], cp_boost_ticks[2],
++		    cp_hs_ticks[0], cp_hs_ticks[1], cp_hs_ticks[2], cp_dark_ticks);
++	}
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
+diff --git a/bsd/dev/negroni_touch.c b/bsd/dev/negroni_touch.c
+index 99c8bee..1e31599 100644
+--- a/bsd/dev/negroni_touch.c
++++ b/bsd/dev/negroni_touch.c
+@@ -26,6 +26,7 @@ extern void IOSleep(unsigned int milliseconds);
+ extern void negroni_hid_touch(int finger, int down, int x, int y);
+ extern void negroni_fp_touch(int finger, int down, int x, int y);   /* 0354: NegroniFramebuffer.cpp, fingerprint overlay */
+ extern void negroni_input_boost(void);   /* 0389: negroni_adreno.c, GPU level floor at touch (the one input-boost hook) */
++extern void negroni_cpuperf_input(void); /* 0395: negroni_cpuperf.c, CPU input boost (WALT input-boost.c) */
+ void negroni_touch_init(void);
+ 
+ /* TLMM pages of GPIO16..23: SDA 16, SCL 17, reset 20, ATTN 21 */
+@@ -97,6 +98,7 @@ touch_report(void)
+ 			negroni_hid_touch((int)id, 1, x, y);
+ 			negroni_fp_touch((int)id, 1, x, y);
+ 			negroni_input_boost();
++			negroni_cpuperf_input();
+ 			if (st.log && !(st.active & bit)) {
+ 				printf("NEGRONI TOUCH: finger %u down %d,%d\n", id, x, y);
+ 			}
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..b59eab7 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5009,6 +5009,93 @@ choose_next_pset(
+ 	return nset;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++/*
++ * Patch 0395 (NEGRONI CPUPERF, patches/xnu/README-cpufreq.md "0395"): core placement on the SM8450.
++ * This kernel runs the SMP Clutch scheduler: one pset, MAX_CPU_CLUSTERS 1, the ADT gives every CPU
++ * cluster-type 0 (slop mkadt.py), no __AMP__/CONFIG_SCHED_EDGE. choose_processor() then takes the lowest
++ * idle CPU (lsb_first), so a woken thread lands on an A510 (cpu 0-3) whenever one is idle, and the A710/X2
++ * (cpu 4-7) only get work when all four A510 are busy. This hook keeps the SMP scheduler and only changes
++ * which idle CPU is chosen, the analog of WALT's placement (msm-kernel 5.10 kernel/sched/walt: task_boost_policy()
++ * SCHED_BOOST_ON_BIG for top-app tasks and sched_boost_on_input during an input boost):
++ *   - a perf thread (a user thread with base_pri >= negroni_sched_perf_pri, default BASEPRI_USER_INITIATED 37:
++ *     QoS USER_INITIATED / USER_INTERACTIVE / foreground app main threads, and every realtime thread) takes
++ *     an idle P core (A710 4-6 first, then X2 7) before an idle A510;
++ *   - any other thread (kernel threads, QoS default/utility/background) takes an idle A510 first;
++ *   - with no idle CPU of the preferred kind it takes any idle CPU, as before (no thread waits for a kind).
++ * During an input boost bsd/dev/negroni_cpuperf.c lowers negroni_sched_perf_pri to BASEPRI_DEFAULT (31).
++ * negroni_sched_pmask = 0 (the default until negroni_cpuperf.c passes its self-check) = the old behaviour.
++ */
++cpumap_t negroni_sched_pmask;
++int negroni_sched_perf_pri = BASEPRI_USER_INITIATED;
++uint64_t negroni_sched_to_p, negroni_sched_to_e;   /* placements that the hook moved, for the CPUPERF minute line */
++void negroni_sched_placement(uint64_t pmask);
++void negroni_sched_set_perf_pri(int pri);
++
++void
++negroni_sched_placement(uint64_t pmask)
++{
++	os_atomic_store(&negroni_sched_pmask, (cpumap_t)pmask, release);
++}
++
++void
++negroni_sched_set_perf_pri(int pri)
++{
++	os_atomic_store(&negroni_sched_perf_pri, pri, relaxed);
++}
++
++static inline bool
++negroni_thread_wants_p(thread_t thread)
++{
++	if (get_threadtask(thread) == kernel_task) {
++		return false;
++	}
++	return thread->sched_pri >= BASEPRI_RTQUEUES ||
++	       thread->base_pri >= os_atomic_load(&negroni_sched_perf_pri, relaxed);
++}
++
++/* The CPU of map that the thread should take: the preferred kind first, else any. -1 when map is empty. */
++static int
++negroni_pick_cpu(thread_t thread, cpumap_t map)
++{
++	cpumap_t pmask = os_atomic_load(&negroni_sched_pmask, relaxed);
++
++	if (pmask == 0 || map == 0) {
++		return lsb_first(map);
++	}
++	bool want_p = negroni_thread_wants_p(thread);
++	cpumap_t pref = want_p ? (map & pmask) : (map & ~pmask);
++	int cpu = lsb_first(pref ? pref : map);
++	if (pref && cpu != lsb_first(map)) {
++		/* counted only when the old rule (lowest idle CPU) would have chosen another CPU */
++		os_atomic_inc(want_p ? &negroni_sched_to_p : &negroni_sched_to_e, relaxed);
++	}
++	return cpu;
++}
++
++/* The idle hint (last processor) of a non-RT thread is kept unless it is the wrong kind and the right kind is idle. */
++static processor_t
++negroni_check_idle_hint(processor_set_t pset, processor_t hint, thread_t thread)
++{
++	cpumap_t pmask = os_atomic_load(&negroni_sched_pmask, relaxed);
++
++	if (pmask == 0) {
++		return hint;
++	}
++	bool want_p = negroni_thread_wants_p(thread);
++	if (bit_test(pmask, hint->cpu_id) == want_p) {
++		return hint;
++	}
++	cpumap_t idle = pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map & pset->recommended_bitmask;
++	cpumap_t pref = want_p ? (idle & pmask) : (idle & ~pmask);
++	if (pref == 0) {
++		return hint;
++	}
++	os_atomic_inc(want_p ? &negroni_sched_to_p : &negroni_sched_to_e, relaxed);
++	return processor_array[lsb_first(pref)];
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++
+ /*
+  *	choose_processor:
+  *
+@@ -5083,6 +5170,11 @@ choose_processor(
+ 				 * idle processor. The platform layer had an opportunity to provide
+ 				 * the "least cost idle" processor above.
+ 				 */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++				if (thread->sched_pri < BASEPRI_RTQUEUES) {
++					return negroni_check_idle_hint(pset, processor, thread);     /* 0395 */
++				}
++#endif
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 					return processor;
+ 				}
+@@ -5246,7 +5338,11 @@ no_available_cpus:
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++		int cpuid = negroni_pick_cpu(thread, idle_primary_map);     /* 0395: P cores first for a perf thread */
++#else
+ 		int cpuid = lsb_first(idle_primary_map);
++#endif
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
+ 			return processor;
+@@ -8308,6 +8404,20 @@ try_again:
+ 		primary_map = bit_ror64(primary_map, 1);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/*
++	 * 0395: a realtime thread takes an idle P core, else any idle CPU, before it preempts a busy one
++	 * (the stock rule takes the lowest available CPU, busy or idle: an A510 first).
++	 */
++	cpumap_t ng_pmask = os_atomic_load(&negroni_sched_pmask, relaxed);
++	if (ng_pmask != 0 && !avoid_cpu0) {
++		cpumap_t ng_idle = primary_map & pset->cpu_state_map[PROCESSOR_IDLE];
++		cpumap_t ng_pick = (ng_idle & ng_pmask) ? (ng_idle & ng_pmask) : ng_idle;
++		if (ng_pick != 0) {
++			return processor_array[lsb_first(ng_pick)];
++		}
++	}
++#endif
+ 	int rotid = lsb_first(primary_map);
+ 	if (rotid >= 0) {
+ 		int cpuid = avoid_cpu0 ? ((rotid + 1) & 63) : rotid;
