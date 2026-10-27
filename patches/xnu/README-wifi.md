@@ -1152,3 +1152,107 @@ How to read it [I]:
 
 - [I] The DWC root port has an iMSI-RX block that catches upstream writes to its own MSI address. The survey does not
   program it (no `PCIE_MSI_ADDR` write in negroni_wifi.c), so a write to 0xa0008000 should go upstream. Not read back.
+
+## 0345: scan + WPA2-PSK join path for wifid 20H392 (2026-10-27)
+
+File: `bsd/dev/negroni_apple80211.c`, `negroni_wlan_ios.{c,h}` (iOS side only; the driver is not changed). Made in
+`out/kernel/tree-a80211` (patched-tree.sh, all patches). Build-only: not run on the phone.
+
+### Sources [V]
+
+- Phone logs `logs/usblog-20261026-233816.txt`: t21 (04:42:54, real chip, `negroniwlan_msi=1`) and boot 16 (02:49:23,
+  fake radio `negroniwlan_ios=2`).
+- The 20H392 binaries (Apple files, git-ignored, in `out/research/wifid/`): `/usr/sbin/wifid` (from the root with
+  `scripts/audio/hfs-extract.py`) and IO80211.framework (from `out/dsc/cache` with `ipsw dyld extract`). Type names:
+  IO80211 `kIoctlNameTable` (418 entries, `convertApple80211IOCTLToString`); event names: `eventArray`
+  (`convertApple80211EventToString`). Lists: `out/research/wifid/ioctl_names.txt`, `event_names.txt`.
+- Design references (not copied): ios-sailfish 0179 (iOS 16.7.16, Settings join works there, no license file),
+  HakiOS `hakios.apple80211.c` (APSL 2.0, already the base of 0341).
+
+### How wifid uses Apple80211 (20H392)
+
+| Step | What wifid / IO80211 does | Our answer |
+|---|---|---|
+| Find the interface | getifaddrs + SIOCGIFMEDIA (802.11), IOService `IO80211InterfaceRole`, IOServiceOpen type 0 fails -> ioctl path | 0340 |
+| Open | CopyValue 12 CARD_CAPABILITIES, get 96 VIRTUAL_IF_ROLE, 97 VIRTUAL_IF_PARENT, 1 SSID | 12 answered; 96/97 refused (sailfish too); 1 ENXIO before a join |
+| Device init | 19 POWER, 106 RSSI_BOUNDS (6 tries, 500 ms apart, only on error -3905/61/16), 254, 207, 27, 51 COUNTRY_CODE, 115 POWER_DEBUG_INFO | all answered except 51, 115 (refused) |
+| Events | `Apple80211StartMonitoringEvent` for 63 codes: 1-14, 30-32, 35-39, 55 DRIVER_AVAILABLE, 57, 60, 61, 63, 75, 76, 79, 80, 83, 89, 90, 92, 93, 137-145, 148-151, 156-201 (some); not 20 RSN_HANDSHAKE_DONE | we post 1, 2, 3, 4, 9, 10 |
+| Status poll | Apple80211GetInfoCopy: 18 INT_MIT, 5 POWERSAVE, 13 STATE, 14 PHY_MODE, 15 OP_MODE, 8 RATE, 57 MCS, 16 RSSI, 17 NOISE, 4 CHANNEL, 2 AUTH_TYPE, 6 PROTMODE, 1 SSID, 9 BSSID; 103 CURRENT_NETWORK (polled: 192 times in 5 min in t21) | 0345 adds 5, 6, 8, 14, 17, 18; 57 refused |
+| Settings sets | 383 SET_PROPERTY (4104 bytes, every 5-20 s), 25 HOST_AP_MODE (value 2), 365 DISPLAY_STATE, 419 LTE_RESTRICTED_CHANNELS | 365 accepted (0345); 383, 25, 419 refused (harmless in sailfish and ios-flame) |
+| Scan | `Apple80211ScanAsync`: RawSet 10 SCAN_REQ, 5456 bytes; on event 10 SCAN_DONE: get 11 SCAN_RESULT (1164 bytes) until an error. `Apple80211ScanDynamic` uses 86 SCAN_REQ_MULTIPLE. wifid also sets 382 ABORT_SCAN, 267 SUPPRESS_SCANS, 47 BACKGROUND_SCAN | 10 answered (fake boot 16: 3 results + EIO); 86 and 382 added (0345) |
+| Join | `__performAssociation`: RawSet 20 ASSOCIATE (ssid len @12, ssid @16, bssid @48, key len @60, cipher @64, key @72). Sync: `__waitForJoinResult` gets 21 ASSOCIATE_RESULT every 20 ms, 400 times (**8 s**), 0 = still running. Async: on event 9 ASSOC_DONE it gets 21 once; 0xffff = try again (up to 39 times). `__errorForAssociateResult`: 1 = success, others = errors -3906..; 0 = generic error | 0341: 21 is 0 while the join runs, then 1 / 21 / 9 / 2; ASSOC_DONE only after the result is set |
+| Link | events 2, 3, 4 (LINK_CHANGED, 32 bytes) + KEV_DL_LINK_ON on en0 (configd DHCP) | 0341 |
+
+Kernel event format [V IO80211 `__eventRead`]: `kern_event_msg` header, interface name 16 bytes at +0x18 (compared with
+strncmp), data at +0x28 (length = total - 0x28). Our `post()` matches. Event 55 DRIVER_AVAILABLE has a 0xb8-byte payload
+(version, flags, available, event id, reason, subreason, minor reason, strings at 0x1c/0x70/0x94); we do not post it
+(fake boot 16 scanned without it).
+
+### What 0345 changes
+
+- New gets: 106 RSSI_BOUNDS `{1, -90, -40, -80}` (layout [V]: 16 bytes, version 1, RSSI_MIN +4, RSSI_MAX +8,
+  RSSI_THRESHOLD +12; the values are a guess, min < threshold < max); 5 POWERSAVE and 18 INT_MIT value 0; 6 PROTMODE
+  `{1, 0, 0}`; 14 PHY_MODE `{1, a|b|g, active}` (active 11g on 2.4 GHz, 11a on 5 GHz, 0 when not joined); 17 NOISE
+  (RSSI layout, -95 dBm, ENXIO when not joined); 8 RATE value = the highest legacy rate in the joined BSS's rates
+  elements (not measured; 54 if none; ENXIO when not joined).
+- New sets: 86 SCAN_REQ_MULTIPLE = the same passive all-channel scan as 10 (layout not read); 5 POWERSAVE, 365
+  DISPLAY_STATE, 382 ABORT_SCAN accepted (nothing to do: the passive scan ends by itself with SCAN_DONE).
+- Join fix (negroni_wlan_ios.c): `nwios_disassociate` kicked `P_LINK_DOWN`; reconcile() reads that bit as "the driver
+  ended an association" for the pending join. wifid sends DISASSOCIATE before ASSOCIATE; the driver keeps `last_error`
+  from an older failed join (it changes only on the next failure). So the second try after a wrong password could
+  fail at once with the old EAUTH (result 21) while the driver was still IDLE. Now a leave kicks the new bit `P_LEAVE`;
+  only the driver's callback sets `P_LINK_DOWN`.
+- Log: at most 6 request lines per kind (type + get/set); a changed result of a kind (the error, or the value of a get: 21 ASSOCIATE_RESULT 0 -> 1, 13 STATE) is always said; `negroniwlan_ios_log=0` turns all request lines off. Scans (10, 86),
+  joins (20), leaves (22) and power sets (19) are always said, up to 200 lines (in t21 the CURRENT_NETWORK polls used all
+  400 lines in 5 min). The summary comes 180 s after en0, then every 600 s while requests come (line now ends `..., N
+  requests`). Names for 96, 97, 115, 267, 365, 382, 383, 419 from the 20H392 table.
+- Not changed: the driver (negroni_wlan_*.c), boot-args, defaults. All new answers are on by default (no new gate):
+  they only answer requests that were refused before.
+
+### Why t21 showed no scan [V log, I cause]
+
+- [V] t21: en0 attached 04:42:59; burst 04:42:59 (open), burst 04:47:58 (status poll, CURRENT_NETWORK, 383, 25, 365,
+  419); no `sets 10`, no driver `API state 2 -> 3`, no `scan done` until the log limit at 04:52:35. wifid never set
+  POWER off. `wifip2pd` restarts every 10 s (no AWDL/P2P interface; not needed for infra Wi-Fi [I]).
+- [V] Fake boot 16: the same requests, then `sets 10 (SCAN_REQ) ... type 1, 13 channels` 9 s after the burst, SCAN_DONE,
+  3 x SCAN_RESULT + EIO. So the scan path works end to end when wifid asks.
+- [I] wifid scans when a client asks (Settings > Wi-Fi page open, auto-join with known networks, location). In t21 no
+  page was open and no network is known, so wifid had no reason to scan. Guess, not proven.
+
+### Test (main session builds the image; boot-args as `scripts/ios16/variants/everything.args`)
+
+What the owner does:
+1. Unlock. Open **Settings > Wi-Fi**. If the switch is off, turn it on. Stay on this page for 30 s.
+2. The network list should fill ("NETWORKS" / "OTHER NETWORKS"), WPA2 networks with a lock.
+3. Tap the home network (WPA2-PSK), type the password, tap **Join**. Wait up to 40 s.
+4. Then once a wrong password on purpose (expect "Incorrect password"), then the right one (checks the 0345 join fix).
+
+Expected lines (`NEGRONI WLAN iOS:` unless said):
+- `wifid gets 106 (RSSI_BOUNDS), value 0, 16 bytes: answered`
+- `wifid sets 10 (SCAN_REQ), value 0, 5456 bytes (a scan: type T, N channels, ...): answered` (or `sets 86
+  (SCAN_REQ_MULTIPLE) ... (a scan of several names, L bytes)`), then the driver: `NEGRONI WLAN: API state 2 -> 3`,
+  `NEGRONI WLAN: API scan K done: M BSS in the list`, then `scan done, M networks for wifid`, `Apple80211 event: scan
+  done, 0`, `wifid gets 11 (SCAN_RESULT) ... answered` and `... error EIO (end of list)`.
+- Join: `wifid sets 22 (DISASSOCIATE) ...` (maybe), `wifid sets 20 (ASSOCIATE) ... (a join: a name of N bytes, ..., a key
+  of 32 bytes of kind 6)` (or 8-63 bytes of kind 10), driver `API state 2 -> 4 ... -> 5 ... -> 6`, `connected: a network
+  name of N bytes, F MHz, RSSI R`, `en0 link UP (KEV_DL_LINK_ON: configd starts DHCP)`, `Apple80211 event: link, 1`,
+  `Apple80211 event: join done, 0`, then `wifid gets 21 (ASSOCIATE_RESULT)` (value 1), gets 8/14/16/17 answered.
+- Wrong password: `join K failed: error 80, 802.11 code 15, ...` (EAUTH), `Apple80211 event: join done, 80`; the next
+  join must not end at once.
+- Every 600 s: `Apple80211 summary: K request kinds, N requests` + one line per kind.
+
+How to read it [I]:
+- No `sets 10`/`sets 86` while the Settings page is open: wifid does not want to scan. Then read the refusals in the
+  summary (57 MCS, 96/97, 51 COUNTRY_CODE, 115) and the wifid syslog (the `Device RSSI bounds (...)` line shows 106
+  worked); next candidates: 96 VIRTUAL_IF_ROLE, 51 COUNTRY_CODE, event 55 DRIVER_AVAILABLE.
+- Scan lines but an empty list in Settings: SCAN_RESULT layout or channel flags. Compare with boot 16 (fake: 3 results).
+- `sets 20` and success in the kernel, but Settings says "Unable to join": the sync wait is only 8 s
+  (`__waitForJoinResult`); a join that needs a new scan first (BSS older than 60 s) can take longer. Then: start the
+  join without a scan when wifid's scan is fresh, or answer 21 with 0xffff semantics for the async path.
+
+### Open
+
+- RSSI_BOUNDS values, the RATE value and the noise floor are guesses (no measured value in the driver seam).
+- COUNTRY_CODE (51): the chip reports the regulatory country (`WMI regulatory event: ... country "US?"`), but the seam
+  has no getter; refused as before.
+- No DRIVER_AVAILABLE (55) and no RSN_HANDSHAKE_DONE (20, wifid does not monitor it) events.

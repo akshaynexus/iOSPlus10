@@ -3167,3 +3167,22 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   `/vendor/etc/sensors/sns_reg_config`, the persist registry dir, `/odm/etc/sensor/config`, `/sys/devices/soc0/*`
   [V strings / I]); apps SMMU SIDs 0x541-0x543; maybe a servreg locator for `msm/slpi/sensor_pd`; sns_client QMI
   0x20/0x21/0x22 with protobuf [I].
+
+## 62. Wi-Fi iOS side: wifid's scan + join requests mapped from the 20H392 binaries; patch 0345 (2026-10-27, Wi-Fi iOS agent; details patches/xnu/README-wifi.md "0345")
+- [V] Type and event names come from IO80211.framework 20H392 itself: `kIoctlNameTable` (418 entries) and `eventArray`
+  (`ipsw dyld extract out/dsc/cache/dyld_shared_cache_arm64 IO80211`; wifid from the root with
+  `scripts/audio/hfs-extract.py ~/op10-apple/ios16-root.simg OUT /usr/sbin/wifid`; tables dumped with `ipsw dyld dump`).
+  The unknown types of t21: 96 VIRTUAL_IF_ROLE, 97 VIRTUAL_IF_PARENT, 115 POWER_DEBUG_INFO, 365 DISPLAY_STATE,
+  383 SET_PROPERTY, 419 LTE_RESTRICTED_CHANNELS.
+- [V] RSSI_BOUNDS (106) = 16 bytes {version 1, RSSI_MIN, RSSI_MAX, RSSI_THRESHOLD} (int32); wifid retries it 6 times only
+  on -3905/61/16, a refusal is skipped.
+- [V] Join result: sync `__waitForJoinResult` polls ASSOCIATE_RESULT (21) every 20 ms for 8 s (0 = running); async reads
+  21 on ASSOC_DONE (9), 0xffff = try again. 1 = success. wifid monitors 63 event codes, not RSN_HANDSHAKE_DONE (20).
+- [V] t21 (real chip): no SCAN_REQ came in 10 min; the fake boot 16 (02:54:35) got `SCAN_REQ type 1, 13 channels`,
+  SCAN_DONE, 3 SCAN_RESULT + EIO, so the scan path works when wifid asks. [I] wifid scans for a client (Settings >
+  Wi-Fi open) or for known networks; in t21 nobody asked.
+- [V] t21 log budget: wifid's CURRENT_NETWORK polls (192 in 5 min) used all 400 request lines. 0345: 6 lines per kind,
+  scans/joins/leaves/power sets always.
+- 0345 (build-only): answers 5, 6, 8, 14, 17, 18, 106; accepts 86 (scan), 5, 365, 382; fix: DISASSOCIATE no longer
+  looks like a driver LINK_DOWN to the next join (stale EAUTH could end it at once). Next: phone test with Settings >
+  Wi-Fi open, then a WPA2 join (README "0345" Test).

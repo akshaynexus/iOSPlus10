@@ -1,0 +1,348 @@
+0345-negroni-apple80211-scan-join: Wi-Fi iOS side: the scan and WPA2-PSK join path for wifid 20H392 complete. Gets 106
+RSSI_BOUNDS {1, -90, -40, -80} (layout from IO80211 20H392 Apple80211GetWithIOCTL: RSSI_MIN/MAX/THRESHOLD at +4/+8/+12),
+5 POWERSAVE and 18 INT_MIT (value 0), 6 PROTMODE, 14 PHY_MODE (a/b/g), 17 NOISE (-95 dBm), 8 RATE (value: the joined BSS's
+best legacy rate); sets 86 SCAN_REQ_MULTIPLE (same passive scan as 10), 5 POWERSAVE, 365 DISPLAY_STATE and 382 ABORT_SCAN
+(accepted, nothing to do). Fix: DISASSOCIATE no longer kicks P_LINK_DOWN (new bit P_LEAVE), so a DISASSOCIATE right
+before an ASSOCIATE cannot end the new join with the stale error of an older failed join. Request log: at most 6 lines
+per kind (a changed result is always said), scans/joins/leaves/power sets always (up to 200); the summary repeats every
+600 s while requests come. Type names 96 97 115 267 365 382 383 419 from the IO80211 20H392 name table.
+Details: patches/xnu/README-wifi.md "0345".
+
+diff --git a/bsd/dev/negroni_apple80211.c b/bsd/dev/negroni_apple80211.c
+index e892652..9f178a3 100644
+--- a/bsd/dev/negroni_apple80211.c
++++ b/bsd/dev/negroni_apple80211.c
+@@ -42,6 +42,15 @@
+  * Root only: every set, and gets 1 SSID, 9 BSSID, 11 SCAN_RESULT, 103 CURRENT_NETWORK (EPERM otherwise; wifid runs
+  * as root).
+  *
++ * Patch 0345 (scan + join completion for wifid 20H392; layouts read from IO80211.framework 20H392):
++ *   gets 106 RSSI_BOUNDS {version 1, min, max, threshold} (Apple80211GetWithIOCTL: 16 bytes, CFNumbers RSSI_MIN at +4,
++ *   RSSI_MAX at +8, RSSI_THRESHOLD at +12), 5 POWERSAVE (value 0: off), 18 INT_MIT (value 0: off), 6 PROTMODE
++ *   {version, 0, 0}, 14 PHY_MODE {version, supported a/b/g, active}, 17 NOISE (the RSSI layout, -95 dBm), 8 RATE (value:
++ *   the joined BSS's highest legacy rate, Mbit/s); sets 86 SCAN_REQ_MULTIPLE (same scan as 10), 5 POWERSAVE and
++ *   365 DISPLAY_STATE and 382 ABORT_SCAN (accepted, nothing to do). Request lines: at most PER_KIND_LOG of each kind (a new error, or
++ *   a new value of a get, is always said); scans, joins, leaves and power sets always (wifid's CURRENT_NETWORK polls ate the 400 lines in t21).
++ *   The summary comes 180 s after en0 and then every 600 s while new requests come.
++ *
+  * Layouts: as HakiOS read them out of IO80211.framework of iOS 16.5 (20F66) [I: the same in 16.7 20H392; the
+  * _Static_asserts keep them as HakiOS had them]. Each request is logged (process, get/set, type, value, length,
+  * never the SSID or key) for the first negroniwlan_ios_log requests, and a per-type summary 180 s after en0.
+@@ -84,6 +93,9 @@ type_name(int32_t type)
+ 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
+ 		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
+ 		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
++		/* 0345: names from IO80211.framework 20H392 (kIoctlNameTable) for the types wifid sent in t21 */
++		{ 96, "VIRTUAL_IF_ROLE" }, { 97, "VIRTUAL_IF_PARENT" }, { 115, "POWER_DEBUG_INFO" }, { 365, "DISPLAY_STATE" },
++		{ 383, "SET_PROPERTY" }, { 419, "LTE_RESTRICTED_CHANNELS" }, { 382, "ABORT_SCAN" }, { 267, "SUPPRESS_SCANS" },
+ 	};
+ 
+ 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+@@ -171,6 +183,20 @@ struct apple80211_assoc {
+ #define CIPHER_PMK              6
+ #define CIPHER_PASSPHRASE       10
+ 
++/* 0345: RSSI_BOUNDS answer (dBm). Guess: no Apple driver value is known; min < threshold < max as wifid prints them */
++#define RSSI_BOUND_MIN          (-90)
++#define RSSI_BOUND_MAX          (-40)
++#define RSSI_BOUND_THRESHOLD    (-80)
++#define NOISE_DBM               (-95)
++
++/* PHY modes (APPLE80211_MODE_*): 11a 0x2, 11b 0x4, 11g 0x8 */
++#define PHY_11A                 0x2u
++#define PHY_11B                 0x4u
++#define PHY_11G                 0x8u
++
++#define PER_KIND_LOG            6       /* request lines of one kind (type + get/set) */
++#define KEY_LOG_MAX             200     /* scan / join / leave / power lines (always said, up to this many) */
++
+ struct apple80211_link_changed {
+ 	uint8_t down, unused_0[3];
+ 	int32_t rssi;
+@@ -332,6 +358,24 @@ joined_bss(const struct nwlan_link *link, struct nwlan_bss *bss)
+ 	bss->security = link->security;
+ }
+ 
++/* 0345: the highest legacy rate (Mbit/s) in the rates elements (1, 50) of a BSS; 0 if it has none */
++static unsigned
++bss_best_rate(const struct nwlan_bss *bss)
++{
++	unsigned best = 0, length = MIN(bss->ie_len, (uint16_t)NWLAN_IE_MAX);
++
++	for (unsigned at = 0; at + 2 <= length && at + 2 + bss->ie[at + 1] <= length; at += 2 + bss->ie[at + 1]) {
++		for (unsigned i = 0; (bss->ie[at] == 1 || bss->ie[at] == 50) && i < bss->ie[at + 1]; i++) {
++			unsigned rate = (bss->ie[at + 2 + i] & 0x7f) / 2;
++
++			if (rate <= 54 && rate > best) {
++				best = rate;
++			}
++		}
++	}
++	return best;
++}
++
+ /* ---- get -------------------------------------------------------------------------------------------------- */
+ 
+ static int
+@@ -366,6 +410,25 @@ get(struct apple80211req *request)
+ 	case 15:                                /* op mode: station (APPLE80211_M_STA) */
+ 		request->req_val = 1;
+ 		return 0;
++	case 106: {                             /* 0345: RSSI bounds {version, min, max, threshold} (dBm) */
++		struct {
++			uint32_t version;
++			int32_t min, max, threshold;
++		} answer = { .version = 1, .min = RSSI_BOUND_MIN, .max = RSSI_BOUND_MAX, .threshold = RSSI_BOUND_THRESHOLD };
++
++		return give(request, &answer, sizeof(answer));
++	}
++	case 5:                                 /* 0345: power save: off (value) */
++	case 18:                                /* 0345: interference mitigation: off (value) */
++		request->req_val = 0;
++		return 0;
++	case 6: {                               /* 0345: protection mode {version, mode (off), threshold} */
++		struct {
++			uint32_t version, mode, threshold;
++		} answer = { .version = 1 };
++
++		return give(request, &answer, sizeof(answer));
++	}
+ 	case 27:
+ 	case 254: {
+ 		struct apple80211_channels *answer = kalloc_data(sizeof(*answer), Z_WAITOK | Z_ZERO);
+@@ -468,6 +531,45 @@ get(struct apple80211req *request)
+ 		error = !nwios_joined() ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+ 	}
++	case 14: {                              /* 0345: PHY mode {version, supported, active}: a/b/g; active 0 when not joined */
++		struct {
++			uint32_t version, supported, active;
++		} answer = { .version = 1, .supported = PHY_11A | PHY_11B | PHY_11G };
++
++		if (nwios_joined()) {
++			answer.active = link->freq != 0 && link->freq < 4000 ? PHY_11G : PHY_11A;
++		}
++		error = give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 17: {                              /* 0345: noise, the RSSI layout; the driver measures none: -95 dBm */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { NOISE_DBM }, .all = NOISE_DBM, .each_ext = { NOISE_DBM },
++			     .all_ext = NOISE_DBM };
++
++		error = !nwios_joined() ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 8: {                               /* 0345: rate (value, Mbit/s): the joined BSS's best legacy rate, not measured */
++		struct nwlan_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
++		unsigned rate;
++
++		if (bss == NULL) {
++			error = ENOMEM;
++		} else {
++			if (!nwios_joined()) {
++				error = ENXIO;
++			} else {
++				joined_bss(link, bss);
++				rate = bss_best_rate(bss);
++				request->req_val = (int32_t)(rate != 0 ? rate : 54);
++			}
++			kfree_data(bss, sizeof(*bss));
++		}
++		break;
++	}
+ 	case 103: {
+ 		struct nwlan_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
+ 
+@@ -508,6 +610,20 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
+ 	struct apple80211_scan_request *asked;
+ 	int error;
+ 
++	if (request->req_type == 86) {
++		/*
++		 * 0345: SCAN_REQ_MULTIPLE (IO80211 Apple80211ScanDynamic; a list of names and channels). The driver scans all
++		 * channels passively in any case (0326), so this is the same scan as type 10; the layout is not read.
++		 */
++		if (!nwios_present()) {
++			return EBUSY;
++		}
++		snprintf(said, said_size, " (a scan of several names, %u bytes)", request->req_len);
++		lck_mtx_lock(&a80211_lock);
++		result_next = 0;
++		lck_mtx_unlock(&a80211_lock);
++		return nwios_scan();
++	}
+ 	if (request->req_len != sizeof(*asked)) {
+ 		return EINVAL;
+ 	}
+@@ -615,7 +731,13 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+ 		return nwios_set_power(asked.state[0] != 0);
+ 	}
+ 	case 10:
++	case 86:
+ 		return set_scan(request, said, said_size);
++	case 5:                                 /* 0345: power save (value): the driver has none; accepted */
++	case 365:                               /* 0345: display state (value: on/off): nothing to do; accepted */
++	case 382:                               /* 0345: abort scan: the passive scan ends by itself (SCAN_DONE) */
++		snprintf(said, said_size, " (accepted, nothing to do)");
++		return 0;
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}
+@@ -689,15 +811,25 @@ static struct {
+ 	bool set;
+ 	unsigned times, answered;
+ 	int last_error;
++	int said_error;                 /* 0345: the result of the last request line said for this kind */
++	int32_t said_val;               /* 0345: the value of that line (gets: 21 ASSOCIATE_RESULT 0 -> 1, 13 STATE) */
+ } kinds[96];
+ static unsigned kind_count;
++static uint64_t requests_total, requests_at_summary;
+ 
+-static void
++/*
++ * Count the request; true if it gets a log line (0345): the first PER_KIND_LOG of its kind, or a result (error, or
++ * for a get the value) that differs from the last one said for its kind. Scans, joins, leaves and power sets are said
++ * in any case (the caller).
++ */
++static bool
+ note(const struct apple80211req *request, bool is_set, int error)
+ {
++	bool say = false;
+ 	unsigned i;
+ 
+ 	lck_mtx_lock(&a80211_lock);
++	requests_total++;
+ 	for (i = 0; i < kind_count && !(kinds[i].type == request->req_type && kinds[i].set == is_set); i++) {
+ 	}
+ 	if (i < sizeof(kinds) / sizeof(kinds[0])) {
+@@ -709,14 +841,31 @@ note(const struct apple80211req *request, bool is_set, int error)
+ 		kinds[i].times++;
+ 		kinds[i].answered += error == 0;
+ 		kinds[i].last_error = error != 0 ? error : kinds[i].last_error;
++		say = kinds[i].times <= PER_KIND_LOG || kinds[i].said_error != error ||
++		    (!is_set && kinds[i].said_val != request->req_val);
++		if (say) {
++			kinds[i].said_error = error;
++			kinds[i].said_val = request->req_val;
++		}
++	} else {
++		say = true;                     /* the table is full: say every one of the other kinds */
+ 	}
+ 	lck_mtx_unlock(&a80211_lock);
++	return say;
++}
++
++/* 0345: true if requests came since the last summary (the worker says one every 600 s then) */
++bool
++negroni_apple80211_summary_due(void)
++{
++	return requests_total != requests_at_summary;
+ }
+ 
+ void
+ negroni_apple80211_summary(void)
+ {
+-	printf("NEGRONI WLAN iOS: Apple80211 summary: %u request kinds\n", kind_count);
++	requests_at_summary = requests_total;
++	printf("NEGRONI WLAN iOS: Apple80211 summary: %u request kinds, %llu requests\n", kind_count, requests_total);
+ 	for (unsigned i = 0; i < kind_count; i++) {
+ 		printf("NEGRONI WLAN iOS: Apple80211 %s %d (%s) %u times, answered %u, last refusal %d%s\n", kinds[i].set ? "set" : "get",
+ 		    kinds[i].type, type_name(kinds[i].type), kinds[i].times, kinds[i].answered, kinds[i].last_error,
+@@ -729,10 +878,10 @@ negroni_apple80211_summary(void)
+ int
+ negroni_apple80211_ioctl(unsigned long command, void *data)
+ {
+-	static unsigned said;
++	static unsigned said, said_key;
+ 	struct apple80211req *request = data;
+ 	char who[32] = "?", what[200] = "";
+-	bool is_set = command == SIOCSA80211_CMD;
++	bool is_set = command == SIOCSA80211_CMD, key, say;
+ 	int error;
+ 
+ 	if (command != SIOCSA80211_CMD && command != SIOCGA80211_CMD) {
+@@ -749,9 +898,18 @@ negroni_apple80211_ioctl(unsigned long command, void *data)
+ 	} else {
+ 		error = is_set ? set(request, what, sizeof(what)) : get(request);
+ 	}
+-	note(request, is_set, error);
+-	if (said < negroni_wlan_ios_log_max()) {
+-		said++;
++	/* scans (10, 86), joins (20), leaves (22) and power sets (19): always said, up to KEY_LOG_MAX lines */
++	key = is_set && (request->req_type == 10 || request->req_type == 86 || request->req_type == 20 ||
++	    request->req_type == 22 || request->req_type == 19);
++	say = note(request, is_set, error);
++
++	/* negroniwlan_ios_log=0 turns all request lines off, the key lines too */
++	if (negroni_wlan_ios_log_max() != 0 && (key ? said_key < KEY_LOG_MAX : (say && said < negroni_wlan_ios_log_max()))) {
++		if (key) {
++			said_key++;
++		} else {
++			said++;
++		}
+ 		printf("NEGRONI WLAN iOS: %s %s %d (%s), value %d, %u bytes%s: %s%s\n", who, is_set ? "sets" : "gets", request->req_type,
+ 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered" :
+ 		    error == EOPNOTSUPP ? "REFUSED (not built)" : "error ", error == 0 || error == EOPNOTSUPP ? "" :
+diff --git a/bsd/dev/negroni_wlan_ios.c b/bsd/dev/negroni_wlan_ios.c
+index a4ff1d6..909433e 100644
+--- a/bsd/dev/negroni_wlan_ios.c
++++ b/bsd/dev/negroni_wlan_ios.c
+@@ -87,6 +87,13 @@ enum {
+ 	P_SCAN_SYNTH    = 1u << 4,      /* a scan refused at once (EBUSY): answer with the list we have */
+ 	P_POWER         = 1u << 5,      /* the soft switch changed */
+ 	P_STATE         = 1u << 6,      /* the driver state changed (FAILED / OFF take en0 down) */
++	/*
++	 * 0345: wifid asked to leave (DISASSOCIATE / power off). It was P_LINK_DOWN before; but P_LINK_DOWN marks
++	 * "the driver ended an association" for the join wifid waits for (join_down_seen), so a DISASSOCIATE right before an
++	 * ASSOCIATE (wifid does that) could end the new join at once with the error of an older failed join (the driver
++	 * keeps last_error until the next failure). Only the driver's callback sets P_LINK_DOWN now.
++	 */
++	P_LEAVE         = 1u << 7,
+ };
+ 
+ #define JOIN_TIMEOUT_MS         40000   /* wifid never waits longer than this for ASSOC_DONE */
+@@ -415,11 +422,11 @@ nwios_disassociate(void)
+ 			fk.link.last_error = 0;
+ 		}
+ 		lck_mtx_unlock(wi.lock);
+-		nwios_kick(P_LINK_DOWN);
++		nwios_kick(P_LEAVE);
+ 		return 0;
+ 	}
+ 	lck_mtx_unlock(wi.lock);
+-	nwios_kick(P_LINK_DOWN);
++	nwios_kick(P_LEAVE);
+ 	return negroni_wlan_disassociate();
+ }
+ 
+@@ -888,9 +895,12 @@ nwios_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		bits = __atomic_exchange_n(&wi.pending, 0, __ATOMIC_SEQ_CST);
+ 		work(bits);                     /* also with no bits: time-outs and the driver state are polled */
+-		if (summary_at != 0 && nwios_ms() >= summary_at) {
+-			summary_at = 0;
+-			negroni_apple80211_summary();
++		if (nwios_ms() >= summary_at) {
++			/* 0345: 180 s after en0, then every 600 s while wifid sends requests */
++			summary_at = nwios_ms() + 600 * 1000;
++			if (negroni_apple80211_summary_due()) {
++				negroni_apple80211_summary();
++			}
+ 		}
+ 		if (nwios_ms() >= next_stats) {
+ 			uint64_t moved = wi.tx + wi.rx + wi.tx_drop + wi.rx_drop;
+diff --git a/bsd/dev/negroni_wlan_ios.h b/bsd/dev/negroni_wlan_ios.h
+index fbb9566..4e02950 100644
+--- a/bsd/dev/negroni_wlan_ios.h
++++ b/bsd/dev/negroni_wlan_ios.h
+@@ -76,6 +76,7 @@ enum nwios_event {
+ int negroni_apple80211_ioctl(unsigned long command, void *data);
+ void negroni_apple80211_event(enum nwios_event event, int status);     /* worker thread only */
+ void negroni_apple80211_summary(void);
++bool negroni_apple80211_summary_due(void);     /* 0345: requests came since the last summary */
+ 
+ /* ---- registry (NegroniWLAN.cpp) ---- */
+ bool negroni_wlan_ios_dt_entry(void);          /* make IODeviceTree "wlan" if no entry has that name */
