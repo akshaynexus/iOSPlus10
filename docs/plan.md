@@ -14,8 +14,15 @@ watchdogs 0371=60 s / 0375=30 s). Details: docs/notes.md sections 57-63, patches
    **Owner test on t23 (12:11-12:14, logs/usblog-20261027-060101.txt):** [V] the radio works: the driver's own
    passive scan saw 19 BSS (27 beacons/probe responses). [V] wifid sent NO scan request; it asked twice
    `user client type 0 asked of en0's service: none (ioctl path)` and only polled a few ioctls (CARD_CAPABILITIES,
-   SSID ENXIO). [I] iOS 16 wifid wants an IO80211 user client (type 0) on the interface's service and stops without
-   it. Next: find what wifid/IO80211.framework expects from that user client (selectors) and add it, then retest.
+   SSID ENXIO). Correction (Wi-Fi agent, 2026-10-27, IO80211.framework 20H392 disassembly): [V] when IOServiceOpen
+   type 0 fails, Apple80211BindToInterfaceWithService falls back to the ioctl path, and event monitoring falls back to
+   the kernel event socket; [V] in boot 16 (02:54) wifid had the same "none" line and still sent SCAN_REQ. So the
+   user client is probably NOT the blocker. [V] In two boots wifid's full init (POWER, 106, 254, 207) started within
+   1 s of an `exit bluetoothd` line; [I] wifid may wait on bluetoothd (BT/Wi-Fi coex?). [V] The t23 log has a gap
+   12:12:18-12:13:04, so "no scan" is proven only for the logged windows. Next: boot with 0345, open Settings > Wi-Fi,
+   capture the full log (no gap), and watch bluetoothd state. User-client facts (selectors 0-6, 0x3c30-byte request,
+   event ring 0x30-byte records) are in this agent's report if the path is needed later; its run was stopped by a
+   safety classifier, no patch exists.
 2. **USB data watchdog 0375: first phone test inconclusive.** t23 12:12: armed (`reboot after 30 s without USB data`),
    but 45 s of `ifconfig en10 down` on the Mac did not fire it, so frames still reached the phone (or macOS kept the
    link busy). A second 20 s down at 12:14 lost the link at 12:14:51 (cause not read yet: read `make bootlog`, boot 13
