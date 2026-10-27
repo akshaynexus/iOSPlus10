@@ -25,6 +25,13 @@ watchdogs 0371=60 s / 0375=30 s). Details: docs/notes.md sections 57-63, patches
    capture the full log (no gap), and watch bluetoothd state. User-client facts (selectors 0-6, 0x3c30-byte request,
    event ring 0x30-byte records) are in this agent's report if the path is needed later; its run was stopped by a
    safety classifier, no patch exists.
+   **Wi-Fi analysis 2 (2026-10-27, README-wifi.md "0346 analysis", notes 66):** the Bluetooth lead is wrong
+   (bluetoothd crashed every 10 s in boot 16; the timing was chance). [V] wifid's own init stalls in
+   WiFiManagerScheduleWithQueue for up to minutes in about half of the boots with en0; during the stall the WiFiManager
+   server is not up, so Settings gets no interface. After the stall wifid powers on and scans (boot 16). Kernel side OK.
+   [I] a synchronous wait on another process (runningboardd / cfprefsd / accountsd?). Next test: during the stall run
+   scripts/wifi/wifid-stall.sh (spindump of wifid) to name the blocking call; work-around to try: kill wifid over SSH
+   (launchd restarts it).
 2. **USB data watchdog 0375: first phone test inconclusive.** t23 12:12: armed (`reboot after 30 s without USB data`),
    but 45 s of `ifconfig en10 down` on the Mac did not fire it, so frames still reached the phone (or macOS kept the
    link busy). A second 20 s down at 12:14 lost the link at 12:14:51 (cause not read yet: read `make bootlog`, boot 13

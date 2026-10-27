@@ -1256,3 +1256,78 @@ How to read it [I]:
 - COUNTRY_CODE (51): the chip reports the regulatory country (`WMI regulatory event: ... country "US?"`), but the seam
   has no getter; refused as before.
 - No DRIVER_AVAILABLE (55) and no RSN_HANDSHAKE_DONE (20, wifid does not monitor it) events.
+
+## 0346 analysis: why wifid does not scan (2026-10-27, Wi-Fi iOS agent 2; no patch, 0346 stays free)
+
+Sources: `logs/usblog-20261026-233816.txt` (boots 02:42-05:05), `logs/usblog-20261027-060101.txt` +
+`logs/usblog-20261027-121304.txt` + `logs/bootlog-13.txt` (t23), wifid's own syslog in
+`logs/phone-log-20261027-025222.txt` / `-025305.txt` (boot 16, phone time = Mac time + 11:30), `/usr/sbin/wifid`
+20H392 disassembly (`ipsw macho disass`), MobileKeyBag + CoreWiFi from `out/dsc` (`ipsw dyld disass`).
+
+### The Bluetooth lead is wrong [V]
+
+Marker for "wifid finished its init": the kernel lines `wifid gets 19 (POWER)` / `106` / `254` / `207` and
+`exec wifianalyticsd` (wifid starts it at the end of its init, in every good boot).
+
+| Boot | wifid exec | open (12, 96, 97) | init (19/106/254, wifianalyticsd) | bluetoothd |
+|---|---|---|---|---|
+| 02:42 fake | 02:42:18 | 02:42:21 | 02:42:21 | 1 exit (02:42:21) |
+| 16 #1 fake | 02:49:24 | 02:49:27 | never (killed 02:53:36, 4 min) | exit 02:49:27, then every 10 s |
+| 16 #2 fake | 02:53:36 | 02:53:36 | 02:54:26 (50 s) | exits 02:53:44, :54, 02:54:04, :15, :25 |
+| 03:01 real | 03:01:43 | 03:01:46 | 03:01:47 | bluetoothd[86] alive until 03:02:01 |
+| 03:12 fake | 03:12:01 | 03:12:03 | never (log ends 03:13:09) | exits every 16 s |
+| 03:16 fake | 03:16:52 | 03:16:54 | 03:16:55 | exits |
+| t21 real | 04:42:56 | 04:42:59 | 04:42:59 | 0 exits |
+| t23 real | 12:11:51 | 12:11:54 | never (log to 12:14:51, 3 min; Settings open 12:13:14) | 0 exits, BT works |
+| no-en0 boots 04:06-04:38 | | none | wifianalyticsd 3-4 s after exec | any |
+
+- [V] t21 and 03:01 reached the init with bluetoothd alive or never exiting; 16 #1 saw an exit and stayed stuck;
+  16 #2 saw four exits during its stall. The exit-then-init lines in 02:42 and 02:54 are coincidence: in boot 16
+  bluetoothd exited every ~10 s (HCI init failed, reason 108).
+- [V] wifid does not use bluetoothd before its init: `BTSessionAttachWithQueue("com.apple.wifi.manager")` and the
+  coex manager registration come later in `WiFiManagerScheduleWithQueue` (wifid 0x10006bf54, 0x10006c050). The coex
+  path (WirelessCoexManager XPC, `wifi_device_set_coex_parameters`, BT_COEX events) has no gate on power or scan.
+
+### What really blocks: a stall in `WiFiManagerScheduleWithQueue` [V log, U cause]
+
+wifid's own log, boot 16 #2 (pid 387):
+- 14:23:36.412 `WiFiManagerScheduleWithQueue: entering`, then nothing from that function until 14:24:26.179.
+- [V] In the stall: no `com.apple.wifi.manager` MIG server (Preferences and bluetoothd log `bootstrap_look_up of
+  WiFiManager server failed`), the CoreWiFi XPC requests of SpringBoard / mediaserverd / Preferences wait and are all
+  answered at 14:24:26.18. So Settings has no Wi-Fi interface ("failed to acquire WiFiDeviceClientRef").
+- [V] After it, in 0.5 s: `First unlock since launch`, `Turning WiFiManager ON`, `unlockedSinceBoot TRUE`,
+  `WiFiDeviceManagerCreate`, `Device power state = ON`, auto-join `trigger=power_on`, Preferences `interface became
+  available` (14:24:35) and the only SCAN_REQ ever seen (kernel 02:54:35 = 14:24:35). The kernel side and the AKS answer
+  (lock state 0x6, bit 2 = unlocked since boot) are good; nothing else was missing.
+- [V] Code order (wifid 0x10006b8c0): log "entering" -> `[[WiFiXPCManager sharedXPCManager] activate]` ->
+  `[CWFKeyValueStore(type 4, known networks) activate]` (dispatch_sync into its queue) -> sub_1000bf43c
+  (`bootstrap_check_in` of the WiFiManager MIG port, `WiFiManager/base` dispatch_mach) -> `isSetupCompleted` /
+  buddy log -> `MKBUserUnlockedSinceBoot` -> ... -> BTSession -> coex -> `com.apple.wifi.manager.available`. The
+  first lines after the stall are `nw_path_evaluator_start` and `Apple80211EventMonitoringInit2` (XPC manager
+  start), so the wait is in or before `WiFiXPCManager activate` / `CWFKeyValueStore activate`.
+- [I] It is a synchronous wait for another process: no CPU, no timeout (16 #1 waited > 4 min, t23 > 3 min), random
+  per boot (about half of the boots with en0). Candidates (not proven): `+[WiFiXPCManager sharedXPCManager]`
+  dispatch_once (CWFXPCManager init makes an `RBSProcessMonitor`, runningboardd), the CWFKeyValueStore queue
+  (CFPreferences with protection class C -> cfprefsd), accountsd (`The connection to ACDAccountStore was invalidated`
+  in wifid at 14:24:21, 5 s before the end). The Bluetooth timing does not explain it.
+- [I] t21 (init OK, no scan): no known network and no Settings page open, so wifid had no reason to scan
+  (auto-join `power_on` with an empty known list scans nothing).
+
+### What the next phone test must capture
+
+- While the stall lasts (kernel log shows `wifid gets 97` and no `wifid gets 19` / `exec wifianalyticsd` for > 10 s):
+  `scripts/wifi/wifid-stall.sh` (spindump of wifid + all processes, `/usr/sbin/spindump` is on the 20H392 root;
+  output `logs/wifid-spindump-<date>.txt`) [U: spindump on this kernel not tried]. The main thread stack names the
+  call; the peer daemon is in the same report.
+- Also `scripts/net/phone-log.sh wifid Preferences runningboardd cfprefsd accountsd` from boot (the stall starts
+  2-3 s after wifid starts).
+- Work-around to test (no build): kill wifid over SSH (`scripts/net/ssh-phone.sh 'kill $(pgrep wifid)'`; the root
+  has no launchctl, launchd restarts wifid because of `KeepAlive`). Boot 16 did this at 02:53:36: the second wifid got
+  through after 50 s; [U] if a new start always gets through.
+
+### Kernel or root tweak needed?
+
+- Kernel: nothing proven missing. AKS 0x6 makes `MKBUserUnlockedSinceBoot` true; en0, Apple80211 and the scan path work
+  (boot 16 #2). No 0346 patch.
+- Root tweak: none until the spindump names the blocking call. If it is RunningBoard or cfprefsd, a root tweak cannot
+  remove a framework call; a wifid restart job or a fix in that daemon is the next step.

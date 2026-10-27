@@ -3250,3 +3250,19 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Code: `userland/location/` (build.sh -> `out/location/userland/negroni-locd`), `scripts/location/phone-location.sh`
   (live phone), `scripts/location/root-add-locd.sh` (LOCD=1, LOCD_JOB=1), `root-tweaks-extra.py` LOCATION_SWITCH=1.
   All default off. Not tested on the phone.
+
+## 66. Wi-Fi: wifid does not scan because its init stalls, not because of Bluetooth (2026-10-27, Wi-Fi iOS agent 2; no patch; details patches/xnu/README-wifi.md "0346 analysis")
+- [V] The lead "wifid waits for bluetoothd to exit" is wrong. t21 (0 bluetoothd exits) and 03:01 (bluetoothd alive)
+  finished the init within 1-3 s; boot 16 #1 saw an exit and stayed stuck 4 min; 16 #2 saw four exits in its 50 s
+  stall. The exit timing in 02:42 / 02:54 is coincidence (bluetoothd crashed every ~10 s then).
+- [V] wifid's own log (logs/phone-log-20261027-025305.txt): `WiFiManagerScheduleWithQueue: entering` at 14:23:36.4,
+  then nothing until 14:24:26.18 (50 s). In the stall the WiFiManager MIG server and the CoreWiFi XPC listener are
+  not up, so Settings has no Wi-Fi interface. After it: `First unlock since launch`, `Turning WiFiManager ON`,
+  `Device power state = ON`, Settings `interface became available`, and the only SCAN_REQ (02:54:35).
+- [V] t23 is the same stall: open (12, 96, 97) at 12:11:54, no POWER/106/254, no `exec wifianalyticsd` until the log
+  ended at 12:14:51, Settings opened at 12:13:14. The kernel (en0, Apple80211, AKS lock state 0x6) is not the blocker.
+- [I] The stall is a synchronous wait for another process in `WiFiXPCManager activate` / `CWFKeyValueStore activate`
+  (wifid 0x10006b954-0x10006b968), about half of the boots with en0, no timeout. Suspects, not proven: runningboardd
+  (RBSProcessMonitor in CWFXPCManager init), cfprefsd, accountsd.
+- Next (phone): in the stall run `scripts/wifi/wifid-stall.sh` (spindump of wifid + all processes) and read the main
+  thread; test the work-around "kill wifid, launchd restarts it" (boot 16 #2 got through). Then decide the fix.
