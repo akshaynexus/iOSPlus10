@@ -1,0 +1,22 @@
+# GPU policy (userland/gpu-policy, docs/gpu-hybrid-plan.md): which API a process tries, in order.
+#   PATTERN  API...      PATTERN = fnmatch glob on the process name, or ext:GLOB on NSExtensionPointIdentifier.
+#   API = metal | gl | cpu. The first matching line wins; the owner's /var/db/negronigpu/policy and
+#   BUNDLE/gpu-policy.local are read before this staged file. No match: "metal gl cpu".
+# Only a FAILED API (dead-man strikes at the limit, GPU lost, a failure record of this boot) is skipped for the
+# next one. A DISABLED API (off file, not in clients, boot-arg, memory rule) keeps today's meaning.
+# Off: /var/db/negronigpu/off, BUNDLE/gpu-policy.off or NEGRONIGPU=0.
+
+# Render server: Metal (YUV/XR surfaces, 41 pipelines); GL (CA's OGL renderer on Mesa) when Metal failed.
+backboardd                       metal gl cpu
+# In-process Metal users with no GL path in iOS 16 (RenderBox, VFX, CAMetalLayer posters, MPS, VectorKit, ANGLE-Metal):
+# a GL context would not be used, so the fallback is the CPU path of the framework.
+SpringBoard                      metal cpu
+chronod                          metal cpu
+*Poster                          metal cpu
+*PosterExtension                 metal cpu
+*PosterProvider                  metal cpu
+ext:com.apple.widgetkit-extension metal cpu
+com.apple.MapKit.SnapshotService metal cpu
+com.apple.WebKit.GPU             metal cpu
+# Everything else: EAGLContext users (GLKit, games, CoreImage-on-GL) get GL from NegroniGL.bundle as before.
+*                                metal gl cpu

@@ -98,6 +98,7 @@ apps)
       echo "apps on: $B/NegroniGL is the staged build (${want%"${want#????????}"}...)" | tee -a "$LOG"
     fi
     put "$S$B/apps" "$B/apps" 644
+    put "$S$B/gpu-policy" "$B/gpu-policy" 644     # the GPU policy (docs/gpu-hybrid-plan.md)
     names=${*:-"* -backboardd"}
     printf '# phone-gl.sh apps on, %s\n%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$names" > "$REPO/logs/negronigl-apps.local"
     put "$REPO/logs/negronigl-apps.local" "$B/apps.local" 644

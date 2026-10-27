@@ -6,7 +6,8 @@
 #     PROFILE   default: metal2vulkan's vk12-floor profile (a bare Vulkan 1.2 device). Replace it with the A730's
 #               profile once vkprobe/vulkaninfo gives one (docs/metal-design.md "Device profile").
 # Per function: kernels and vertex functions alone; each fragment with the vertex functions until one links.
-# Output: out/metal/translate/<lib>/{results.tsv,summary.txt,*.spv} (OUTNAME=NAME sets <lib>). Builds the CLI on first use.
+# Output: out/metal/translate/<lib>/{results.tsv,summary.txt,*.spv} (OUTNAME=NAME sets <lib>, TRANSLATE_DIR the parent,
+# M2V_CLI another CLI). Builds the CLI on first use.
 # A730 profile (estimate): python3 -I scripts/metal/a730-profile.py \$M2V/.../vk12-floor.json out/metal/profiles/a730-turnip-est.json
 # Run in tmux: scripts/bg.sh metal-translate scripts/metal/host-translate.sh
 set -euo pipefail
@@ -16,14 +17,15 @@ LIB=${1:-$MOUT/rootmnt/System/Library/Frameworks/QuartzCore.framework/default.me
 # out/metal/ref/QuartzCore.default.metallib)
 [ -f "$LIB" ] || [ -n "${1:-}" ] || LIB=$MOUT/ref/QuartzCore.default.metallib
 PROFILE=${2:-$M2V/crates/metal2vulkan-validation/profiles/vk12-floor.json}
-CLI=$MOUT/bin/metal2vulkan   # the CLI is kept, its cargo target dir (1 GB) may be deleted
+# M2V_CLI=PATH: a CLI built elsewhere (scripts/metal/shader-corpus-test.sh builds one per metal2vulkan commit + patches)
+CLI=${M2V_CLI:-$MOUT/bin/metal2vulkan}   # the CLI is kept, its cargo target dir (1 GB) may be deleted
 if [ ! -x "$CLI" ]; then
   cargo "+$RUST_TOOLCHAIN" build --release --manifest-path "$M2V/Cargo.toml" -p metal2vulkan --features cli \
     --bin metal2vulkan --target-dir "$MOUT/m2v-host" -j "$NPROC"
   mkdir -p "$MOUT/bin" && cp "$MOUT/m2v-host/release/metal2vulkan" "$CLI"
 fi
 name=${OUTNAME:-$(basename "$(dirname "$LIB")" .framework)_$(basename "$LIB" .metallib)}
-T=$MOUT/translate/$name
+T=${TRANSLATE_DIR:-$MOUT/translate}/$name   # TRANSLATE_DIR: another parent directory (corpus runs)
 rm -rf "$T" && mkdir -p "$T"
 python3 -I "$REPO/scripts/metal/metallib-info.py" "$LIB" | tail -n +2 | awk '{print $1, $2}' > "$T/functions.txt"
 export METAL2VULKAN_REPRO_DIR=$T/repros

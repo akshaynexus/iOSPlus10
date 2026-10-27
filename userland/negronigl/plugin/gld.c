@@ -27,6 +27,7 @@
 
 #include "gld.h"
 #include "negronigl.h"
+#include "negroni_gpu_policy.h"
 
 /* Apple's defaults (AppleMetalGLRenderer GLRPixelFormat::preflight, 20H392 0x209fd28d0/0x209fd28e0) */
 struct ngl_pixel_format ngl_pf = {
@@ -146,6 +147,21 @@ apps_closed(const char *prog, char *why, size_t size)
 	return NULL;
 }
 
+static void
+policy_log(const char *line)
+{
+	ngl_log("negronigl: %s", line);
+}
+
+/*
+ * GPU policy (userland/gpu-policy, docs/gpu-hybrid-plan.md), on top of the lists above:
+ *   - fallback: a process the lists leave closed gets GL when its policy order puts gl after metal and Metal
+ *     FAILED in this boot (NegroniMetal dead-man at the limit, or a failure record). A self-test (triangle +
+ *     IOSurface) must pass first; a failed self-test marks GL failed for the process (next: CPU).
+ *   - dead-man: an open gate arms a GL strike (cleared by the first frames, 15 s or exit); at the limit
+ *     (NEGRONIGL_STRIKE_LIMIT, 2) GL stays closed for the process in this boot. Metal and GL both failed = CPU.
+ *   - NEGRONIGPU=0, /var/db/negronigpu/off or BUNDLE/gpu-policy.off: the lists alone, as before.
+ */
 static bool
 apps_gate(const char *prog)
 {
@@ -153,13 +169,26 @@ apps_gate(const char *prog)
 	if (decided >= 0) {
 		return decided == 1;
 	}
-	char buf[700];
+	char buf[700], pw[1200], dir[512];
 	const char *why = NULL;
+	bool fallback = false, policy = !ngp_off();
+	if (policy) {
+		ngp_set_logger(policy_log);
+	}
+	const char *gl_bundle = bundle_dir(dir, sizeof(dir)) ? dir : NULL;
 	const char *e = getenv("NEGRONIGL_APPS");
 	if (e != NULL && e[0] != 0) {
 		why = ngl_env_on("NEGRONIGL_APPS", false) ? NULL : "NEGRONIGL_APPS=0";
 	} else {
 		why = apps_closed(prog, buf, sizeof(buf));
+		if (why != NULL && policy && ngp_gl_fallback(prog, NULL, gl_bundle, pw, sizeof(pw)) == NGP_GL) {
+			ngl_log("negronigl: gpu-policy: GL as the fallback renderer for %s (%s)", prog, pw);
+			why = NULL;
+			fallback = true;
+		}
+	}
+	if (why == NULL && policy && ngp_gl_health(prog, gl_bundle, pw, sizeof(pw)) == NGP_FAILED) {
+		why = pw;
 	}
 	if (why == NULL && !ngl_init()) {
 		why = "no GL screen (RedwoodGPU did not open and softpipe failed)";
@@ -171,9 +200,19 @@ apps_gate(const char *prog)
 			why = "screen is softpipe, not the GPU (NEGRONIGL_ALLOW_SW=1 allows it)";
 		}
 	}
+	/* armed before the fallback self-test: a crash in it counts as an unclean start too */
+	if (why == NULL && policy && !ngp_gl_arm(prog, pw, sizeof(pw))) {
+		why = pw;
+	}
+	if (why == NULL && fallback && !(ngl_selftest() && ngl_surface_selftest())) {
+		ngp_record_failure(prog, NGP_GL, "NegroniGL fallback self-test (triangle + IOSurface) failed");
+		ngp_gl_disarm("fallback self-test failed: clean refusal, GL marked failed");
+		why = "GL fallback self-test failed (GL marked failed for this boot)";
+	}
 	decided = why == NULL ? 1 : 0;
 	if (why == NULL) {
-		ngl_log("negronigl: NegroniGL app gate open for %s (%s)", prog, ngl_soft() ? "softpipe" : "freedreno");
+		ngl_log("negronigl: NegroniGL app gate open for %s (%s%s)", prog, ngl_soft() ? "softpipe" : "freedreno",
+		    fallback ? ", gpu-policy fallback" : "");
 	} else {
 		ngl_log("negronigl: NegroniGL app gate closed for %s: %s; EAGLContexts stay nil", prog, why);
 	}

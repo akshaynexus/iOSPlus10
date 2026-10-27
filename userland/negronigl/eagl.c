@@ -185,6 +185,31 @@ ngl_h_CompileShader(void *rctx, GLuint shader)
 	GLint ok = 0;
 	glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
 	if (!ok) {
+		/* self-check of the full-precision rewrite (shaders.c): compile again without the two defines */
+		GLint len = 0;
+		glGetShaderiv(shader, GL_SHADER_SOURCE_LENGTH, &len);
+		char *src = len > 0 ? malloc((size_t)len + 1) : NULL;
+		char *at = NULL;
+		if (src != NULL) {
+			glGetShaderSource(shader, len + 1, NULL, src);
+			at = strstr(src, ngl_precision_prelude);
+		}
+		if (at != NULL) {
+			size_t pl = strlen(ngl_precision_prelude);
+			memmove(at, at + pl, strlen(at + pl) + 1);
+			const GLchar *one = src;
+			glShaderSource(shader, 1, &one, NULL);
+			glCompileShader(shader);
+			glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+			static unsigned logged;
+			if (logged++ < 8) {
+				ngl_log("negronigl: shader %u: full precision refused by the compiler, compiled as written: %s",
+				    shader, ok ? "ok" : "still fails");
+			}
+		}
+		free(src);
+	}
+	if (!ok) {
 		static char log[1024], src[4096];
 		glGetShaderInfoLog(shader, sizeof(log), NULL, log);
 		glGetShaderSource(shader, sizeof(src), NULL, src);

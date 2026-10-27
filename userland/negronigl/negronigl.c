@@ -45,6 +45,7 @@
 #include "frontend/sw_winsys.h"
 
 #include "negronigl.h"
+#include "negroni_gpu_policy.h"
 
 #ifndef NEGRONIGL_MESA_VERSION
 #define NEGRONIGL_MESA_VERSION "?"
@@ -499,6 +500,14 @@ ngl_gate_off(void)
 	return access(NGL_GATE_DIR "/off", F_OK) == 0;
 }
 
+static void
+policy_log(const char *line)
+{
+	ngl_log("negronigl: %s", line);
+}
+
+/* the shim gate: the clients list, else the GPU policy's fallback (Metal FAILED in this boot and the order puts
+ * gl after metal: userland/gpu-policy). The policy's GL dead-man is armed in ngl_load once the shim goes in. */
 static bool
 gate_open(const char *prog)
 {
@@ -511,6 +520,14 @@ gate_open(const char *prog)
 		return false;
 	}
 	int c = ngl_gate_list(NGL_GATE_DIR "/clients", prog);
+	if (c == 0 && !ngp_off()) {
+		char pw[1200];
+		ngp_set_logger(policy_log);
+		if (ngp_gl_fallback(prog, NULL, NULL, pw, sizeof(pw)) == NGP_GL) {
+			ngl_log("negronigl: gpu-policy: EAGL shim as the fallback renderer for %s (%s)", prog, pw);
+			return true;
+		}
+	}
 	if (c != 1) {
 		ngl_log("negronigl: %s is not in %s/clients (%s): EAGL shim not installed", prog, NGL_GATE_DIR,
 		    c < 0 ? "listed as -" : "no entry or no file");
@@ -571,8 +588,23 @@ ngl_load(void)
 	bool eagl = gate_open(prog);
 	ngl_log("negronigl: loaded into %s (pid %d), EAGL shim %s", prog, getpid(), eagl ? "wanted" : "off");
 	ngl_log_image_base();
-	if (eagl && ngl_preflight()) {
-		ngl_eagl_install();
+	if (eagl) {
+		bool policy = !ngp_off();
+		char pw[1200];
+		if (policy) {
+			ngp_set_logger(policy_log);
+		}
+		/* armed before the preflight: a crash in the preflight counts as an unclean start too */
+		if (policy && (ngp_gl_health(prog, NULL, pw, sizeof(pw)) == NGP_FAILED || !ngp_gl_arm(prog, pw, sizeof(pw)))) {
+			ngl_log("negronigl: %s: Apple's EAGL kept", pw);
+		} else if (!ngl_preflight()) {
+			if (policy) {
+				ngp_record_failure(prog, NGP_GL, "EAGL shim preflight failed");
+				ngp_gl_disarm("preflight failed: clean refusal, GL marked failed");
+			}
+		} else {
+			ngl_eagl_install();
+		}
 	}
 	if (ngl_env_on("NEGRONIGL_TEST", false)) {
 		pthread_t th;

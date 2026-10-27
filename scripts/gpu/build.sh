@@ -35,6 +35,8 @@ rm -rf "$B"
 mkdir -p "$B"
 cp "$MESA_BUILD/$T/NegroniGL.bin" "$B/NegroniGL"
 cp "$NGL/plugin/Info.plist" "$B/Info.plist"
+# the staged GPU policy (userland/gpu-policy, docs/gpu-hybrid-plan.md): readable by sandboxed apps here
+cp "$REPO/userland/gpu-policy/gpu-policy" "$B/gpu-policy"
 plutil -lint "$B/Info.plist" >/dev/null
 
 # checks: arm64, minos, the GLD exports libGFXShared needs (129 table names + 2), nothing else

@@ -5,7 +5,7 @@
 # mesa-patches/0001-negronigl-target.patch adds `subdir('targets/negronigl')` to
 # src/gallium/meson.build (Darwin + freedreno only). Linking follows the osmesa target.
 
-ngl_inc = include_directories('.', 'drm')
+ngl_inc = include_directories('.', 'drm', 'gpu-policy')
 
 ngl_gli_c = custom_target(
   'gli_dispatch.c',
@@ -16,7 +16,9 @@ ngl_gli_c = custom_target(
 )
 
 ngl_core_src = files('negronigl.c', 'eagl.c', 'view.c', 'surface.c', 'shaders.c', 'sw_winsys.c', 'log.c',
-                     'drm/negroni_drm.c')
+                     'drm/negroni_drm.c',
+                     # userland/gpu-policy (copied in by scripts/gpu/sync-target.sh): Metal/GL/CPU per process
+                     'gpu-policy/negroni_gpu_policy.c')
 # GLI plugin entries (NegroniGL.bundle only): the 18 _gli_plugin slots EAGL binds on Mesa. The dylib
 # uses the Obj-C EAGL shim in eagl.c instead, so these are not part of ngl_core_src.
 ngl_plugin_src = files('plugin/gli_table.c', 'plugin/gli_context.c', 'plugin/gli_view.c')

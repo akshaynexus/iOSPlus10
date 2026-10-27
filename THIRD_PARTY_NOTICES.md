@@ -12,6 +12,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | `external/UniXNU/drivers/DarwinBoot` | UniXNU contributors | BSD-2-Clause-Patent |
 | `external/Mu-Silicium-negroni` & submodules | Andrei Warkentin, Project Silicium, Microsoft Corp., ARM Ltd., Intel Corp., Apple Inc., Linux Foundation | BSD-2-Clause / Project Mu / EDK II |
 | `external/hackios-xnu-userland` | OOSEX GANG | MIT |
+| HakiOS userland (hackios-next; parts in `userland/negronigl/`) | the HakiOS authors | MIT |
 | `external/ios-flame` | NWylynko, dipa-studio | MIT |
 | `external/metal2vulkan` | steelbrain | GPL-2.0-or-later OR LGPL-3.0-or-later |
 | `external/ios-sweet` & `external/ios-sweet-upstream` | dipa-studio | MIT |
@@ -188,6 +189,33 @@ SOFTWARE.
 MIT License
 
 Copyright (c) 2026 the Chlorophyll authors (ry-diffusion/Chlorophyll)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### D. HakiOS userland (hackios-next, reference tree out/src/hackios-next)
+Used in `userland/negronigl/shaders.c` (the two full-precision `#define` lines) and `userland/negronigl/surface.c`
+(texel-size table, plane-copy idea). Only the userland part (`userland/src/`) is MIT; its kernel part is APSL 2.0.
+```text
+MIT License
+
+Copyright (c) 2025-2026 the HakiOS authors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
