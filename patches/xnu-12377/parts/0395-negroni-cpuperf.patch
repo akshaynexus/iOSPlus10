@@ -1,0 +1,149 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index b2aae03..f89dbad 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -4677,6 +4677,94 @@ choose_next_pset(
+ 	return nset;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++/*
++ * Patch 0395 (NEGRONI CPUPERF, patches/xnu/README-cpufreq.md "0395"): core placement on the SM8450.
++ * This kernel runs the SMP Clutch scheduler: one pset, the ADT gives every CPU
++ * cluster-type 0 (slop mkadt.py), no __AMP__/CONFIG_SCHED_EDGE. choose_processor() then takes the lowest
++ * idle CPU (lsb_first), so a woken thread lands on an A510 (cpu 0-3) whenever one is idle, and the A710/X2
++ * (cpu 4-7) only get work when all four A510 are busy. This hook keeps the SMP scheduler and only changes
++ * which idle CPU is chosen, the analog of WALT's placement (msm-kernel 5.10 kernel/sched/walt: task_boost_policy()
++ * SCHED_BOOST_ON_BIG for top-app tasks and sched_boost_on_input during an input boost):
++ *   - a perf thread (a user thread with base_pri >= negroni_sched_perf_pri, default BASEPRI_USER_INITIATED 37:
++ *     QoS USER_INITIATED / USER_INTERACTIVE / foreground app main threads, and every realtime thread) takes
++ *     an idle P core (A710 4-6 first, then X2 7) before an idle A510;
++ *   - any other thread (kernel threads, QoS default/utility/background) takes an idle A510 first;
++ *   - with no idle CPU of the preferred kind it takes any idle CPU, as before (no thread waits for a kind).
++ * During an input boost bsd/dev/negroni_cpuperf.c lowers negroni_sched_perf_pri to BASEPRI_DEFAULT (31).
++ * negroni_sched_pmask = 0 (the default until negroni_cpuperf.c passes its self-check) = the old behaviour.
++ */
++cpumap_t negroni_sched_pmask;
++int negroni_sched_perf_pri = BASEPRI_USER_INITIATED;
++uint64_t negroni_sched_to_p, negroni_sched_to_e;   /* placements that the hook moved, for the CPUPERF minute line */
++void negroni_sched_placement(uint64_t pmask);
++void negroni_sched_set_perf_pri(int pri);
++
++void
++negroni_sched_placement(uint64_t pmask)
++{
++	os_atomic_store(&negroni_sched_pmask, (cpumap_t)pmask, release);
++}
++
++void
++negroni_sched_set_perf_pri(int pri)
++{
++	os_atomic_store(&negroni_sched_perf_pri, pri, relaxed);
++}
++
++static inline bool
++negroni_thread_wants_p(thread_t thread)
++{
++	if (get_threadtask(thread) == kernel_task) {
++		return false;
++	}
++	return thread->sched_pri >= BASEPRI_RTQUEUES ||
++	       thread->base_pri >= os_atomic_load(&negroni_sched_perf_pri, relaxed);
++}
++
++/* The CPU of map that the thread should take: the preferred kind first, else any. -1 when map is empty. */
++static int
++negroni_pick_cpu(thread_t thread, cpumap_t map)
++{
++	cpumap_t pmask = os_atomic_load(&negroni_sched_pmask, relaxed);
++
++	if (pmask == 0 || map == 0) {
++		return lsb_first(map);
++	}
++	bool want_p = negroni_thread_wants_p(thread);
++	cpumap_t pref = want_p ? (map & pmask) : (map & ~pmask);
++	int cpu = lsb_first(pref ? pref : map);
++	if (pref && cpu != lsb_first(map)) {
++		/* counted only when the old rule (lowest idle CPU) would have chosen another CPU */
++		os_atomic_inc(want_p ? &negroni_sched_to_p : &negroni_sched_to_e, relaxed);
++	}
++	return cpu;
++}
++
++/* The idle hint (last processor) of a non-RT thread is kept unless it is the wrong kind and the right kind is idle. */
++static processor_t
++negroni_check_idle_hint(processor_set_t pset, processor_t hint, thread_t thread)
++{
++	cpumap_t pmask = os_atomic_load(&negroni_sched_pmask, relaxed);
++
++	if (pmask == 0) {
++		return hint;
++	}
++	bool want_p = negroni_thread_wants_p(thread);
++	if (bit_test(pmask, hint->cpu_id) == want_p) {
++		return hint;
++	}
++	/* 12377: no pset->primary_map without CONFIG_SCHED_SMT (NEGRONI has no SMT) */
++	cpumap_t idle = pset->cpu_state_map[PROCESSOR_IDLE] & pset->recommended_bitmask;
++	cpumap_t pref = want_p ? (idle & pmask) : (idle & ~pmask);
++	if (pref == 0) {
++		return hint;
++	}
++	os_atomic_inc(want_p ? &negroni_sched_to_p : &negroni_sched_to_e, relaxed);
++	return processor_array[lsb_first(pref)];
++}
++#endif /* ARM64_BOARD_CONFIG_NEGRONI */
++
+ #if CONFIG_SCHED_SMT
+ /*
+  *	choose_processor_smt:
+@@ -5136,6 +5224,11 @@ choose_processor(
+ 				 * idle processor. The platform layer had an opportunity to provide
+ 				 * the "least cost idle" processor above.
+ 				 */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++				if (thread->sched_pri < BASEPRI_RTQUEUES) {
++					return negroni_check_idle_hint(pset, processor, thread);     /* 0395 */
++				}
++#endif
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 					uint64_t idle_map = (pset->cpu_state_map[PROCESSOR_IDLE] & pset->recommended_bitmask);
+ 					uint64_t non_avoided_idle_map = idle_map & ~pset->perfcontrol_cpu_migration_bitmask;
+@@ -5248,7 +5341,11 @@ choose_processor(
+ 		/*
+ 		 * Fall back to any remaining idle cores if none of the preferred ones and non-avoided ones are available.
+ 		 */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++		cpuid = negroni_pick_cpu(thread, idle_map);     /* 0395: P cores first for a perf thread */
++#else
+ 		cpuid = lsb_first(idle_map);
++#endif
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
+ 			return processor;
+diff --git a/osfmk/kern/sched_rt.c b/osfmk/kern/sched_rt.c
+index 531dbfe..7e97bc3 100644
+--- a/osfmk/kern/sched_rt.c
++++ b/osfmk/kern/sched_rt.c
+@@ -1085,6 +1085,21 @@ pset_choose_processor_for_realtime_thread(processor_set_t pset, processor_t skip
+ 		cpu_map &= ~pset->rt_pending_spill_cpu_mask;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/*
++	 * 0395: a realtime thread takes an idle P core, else any idle CPU, before it preempts a busy one
++	 * (the stock rule takes the lowest available CPU, busy or idle: an A510 first).
++	 */
++	extern cpumap_t negroni_sched_pmask;    /* sched_prim.c */
++	cpumap_t ng_pmask = os_atomic_load(&negroni_sched_pmask, relaxed);
++	if (ng_pmask != 0) {
++		cpumap_t ng_idle = cpu_map & pset->cpu_state_map[PROCESSOR_IDLE];
++		cpumap_t ng_pick = (ng_idle & ng_pmask) ? (ng_idle & ng_pmask) : ng_idle;
++		if (ng_pick != 0) {
++			return processor_array[lsb_first(ng_pick)];
++		}
++	}
++#endif
+ 	int rotid = lsb_first(cpu_map);
+ 	if (rotid >= 0) {
+ 		return processor_array[rotid];
