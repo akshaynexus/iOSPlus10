@@ -11,8 +11,7 @@ The iOS 16 machine-layer state (xnu-8796 + slop + patches/xnu) carried to xnu-12
 - osfmk/arm64/machine_routines.c: cpus=N clamp, cluster ids from Aff1, no CNTP_CTL write under Gunyah (slop 0083)
 - osfmk/arm64/cpu.c: PoC cleans of the reset data for PSCI secondaries
 - osfmk/arm64/arm_vm_init.c, negroni_early.[ch]: early framebuffer marks across the TTBR switch
-- osfmk/arm64/negroni_cpuidle.c (ours 0288/0382/0383): PSCI idle; the RPMh hooks are weak until
-  bsd/dev/negroni_rpmh.c is ported
+- osfmk/arm64/negroni_cpuidle.c (ours 0288/0382/0383): PSCI idle (RPMh hooks: weak defaults in 0004)
 - arm_init.c, model_dep.c, caches_asm.s (clean_mmu_dcache label), protos.h (SERIAL_NEGRONI_FBCON = 0x10:
   12377 merged PI3/VMAPPLE into SERIAL_PL011_UART = 0x4)
 Not needed on 12377: 0363/0378 boot-line 1024 (12377 BOOT_LINE_LENGTH is already 1024), kpc.c stub (12377 has kpc.c).
@@ -446,10 +445,10 @@ index 07143d5..bb186b6 100644
  #endif
 diff --git a/osfmk/arm64/negroni_cpuidle.c b/osfmk/arm64/negroni_cpuidle.c
 new file mode 100644
-index 0000000..35256c4
+index 0000000..4964eb4
 --- /dev/null
 +++ b/osfmk/arm64/negroni_cpuidle.c
-@@ -0,0 +1,797 @@
+@@ -0,0 +1,794 @@
 +/*
 + * NEGRONI (SM8450) CPU idle states, patch 0288.
 + *
@@ -538,9 +537,8 @@ index 0000000..35256c4
 +extern void negroni_gic_spi_enable(uint32_t intid, uint64_t mpidr);     /* pexpert/arm/pe_fiq.c (0288) */
 +extern void negroni_gic_spi_route(uint32_t intid, uint64_t mpidr);
 +
-+/* iOS 26 port: weak until bsd/dev/negroni_rpmh.c (0383) is ported; absent = never ready, no log. */
-+extern bool negroni_rpmh_sleep_ready(void) __attribute__((weak));     /* bsd/dev/negroni_rpmh.c (0383) */
-+extern void negroni_rpmh_sleep_log(void) __attribute__((weak));
++extern bool negroni_rpmh_sleep_ready(void);              /* bsd/dev/negroni_rpmh.c (0383) */
++extern void negroni_rpmh_sleep_log(void);
 +extern int negroni_mmio_try_rd32(vm_offset_t a, uint32_t *v);  /* osfmk/arm64/sleh.c (0297): 0 = read, < 0 = refused */
 +extern uint32_t negroni_mmio_try_faults;
 +
@@ -803,7 +801,7 @@ index 0000000..35256c4
 +	}
 +	for (int s = CI_STATES - 1; s >= 1; s--) {
 +		if (c->state[s] != NULL && !c->refused[s] && cl_left >= c->state[s]->residency_abs) {
-+			if (negroni_rpmh_sleep_ready == NULL || !negroni_rpmh_sleep_ready()) {
++			if (!negroni_rpmh_sleep_ready()) {
 +				__atomic_fetch_add(&cl_rpmh_busy, 1, __ATOMIC_RELAXED);
 +				return 0;
 +			}
@@ -1104,9 +1102,7 @@ index 0000000..35256c4
 +			printf("NEGRONI CPUIDLE: cluster (%s): last-core chances %u, l3-off picks %u, llcc-off picks %u, too short %u, "
 +			    "rpmh busy %u, denied %u\n", ci_osi ? "OSI" : "PC", cl_last, cl_pick[1], cl_pick[2], cl_short, cl_rpmh_busy,
 +			    cl_denied);
-+			if (negroni_rpmh_sleep_log != NULL) {
-+				negroni_rpmh_sleep_log();
-+			}
++			negroni_rpmh_sleep_log();
 +		}
 +		ss_log();
 +	}

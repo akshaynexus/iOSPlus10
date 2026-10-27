@@ -1,7 +1,8 @@
 #!/bin/bash
 # Try the whole iOS 16 kernel patch stack (slop negroni patches + patches/xnu) on xnu-12377.121.6, in the
 # iOS 16 build order, and record per patch: clean / fuzz / partial / fail / stage.
-# Cumulative: a patch that applies (clean or with fuzz) stays in the tree, so later patches see it.
+# Cumulative: every hunk that applies (clean, with fuzz, or from a partial patch) stays in the tree, so later
+# patches see it. upstream = all hunks already in 12377; clean = all hunks exact; fuzz = all hunks with offset/fuzz; partial = some hunks failed; fail = none.
 # Nothing here goes into the real iOS 26 build: that uses only patches/xnu-12377 (scripts/ios26/build-kernel.sh).
 #
 #   scripts/ios26/patch-check.sh            -> out/kernel/local-ios26/patch-check.tsv (+ .log)
@@ -31,13 +32,18 @@ for p in $list; do
   total=$(grep -c '^@@ ' "$p" || true)
   missing=0
   for f in $(grep '^--- a/' "$p" | sed 's#^--- a/##' | sort -u); do [ -f "$T/$f" ] || missing=$((missing+1)); done
-  out=$(cd "$T" && patch -p1 -N --dry-run -F3 -i "$p" 2>&1) && rc=0 || rc=$?
-  failed=$(printf '%s\n' "$out" | grep -c 'FAILED\|failed' || true)
+  # one real run: hunks that apply stay (best effort, so later patches see as much as possible), the rest -> .rej
+  out=$(cd "$T" && patch -p1 -N -t -F3 -i "$p" </dev/null 2>&1) && rc=0 || rc=$?
+  # Apple/BSD patch: "N out of M hunks failed while patching F", "N out of M hunks ignored" (= already in the tree)
+  failed=$(printf '%s\n' "$out" | awk '/hunks failed/ {n += $1} END {print n + 0}')
+  ignored=$(printf '%s\n' "$out" | awk '/hunks ignored/ {n += $1} END {print n + 0}')
   echo "== $n rc=$rc" >> "$LOG"; printf '%s\n' "$out" >> "$LOG"
-  if [ $rc = 0 ]; then
+  find "$T" \( -name '*.orig' -o -name '*.rej' \) -delete
+  # a file that 12377 does not have also gives "ignored": count those hunks as failed
+  [ "$missing" -gt 0 ] && failed=$((failed + ignored)) && ignored=0
+  if [ "$ignored" -gt 0 ] && [ "$ignored" -ge "$total" ]; then st=upstream
+  elif [ "$failed" = 0 ]; then
     if printf '%s\n' "$out" | grep -q 'with fuzz\|offset'; then st=fuzz; else st=clean; fi
-    (cd "$T" && patch -p1 -N -s -F3 -i "$p" >/dev/null 2>&1) || true
-    find "$T" -name '*.orig' -delete
   elif [ "$failed" -lt "$total" ]; then st=partial
   else st=fail; fi
   printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$st" "$failed" "$total" "$missing" >> "$TSV"

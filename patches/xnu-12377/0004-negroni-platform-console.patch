@@ -1,0 +1,1310 @@
+From: iOSPlus10 ios26 port
+Subject: [PATCH 0004] NEGRONI platform expert, boot CPU/SMP driver, framebuffer console, IOKit start
+
+- iokit/Kernel/arm/NegroniPlatformExpert.cpp (slop 0016; ours 0211/0213 halt/restart hook), NegroniCPU.cpp
+  (slop 0018, 0065, 0078: PSCI CPU_ON, 8 cores), KernelConfigTables.cpp + iokit/conf/files.arm64 (these two only;
+  each driver patch adds its own personality and file line)
+- pexpert/arm/pe_serial.c: framebuffer "serial" console from the ADT node negroni-fbcon (slop 0003, 0088);
+  12377 serial_init looks for a /chosen serial phandle, so fbcon_probe() runs before that lookup
+- osfmk/console/serial_console.c: persistent-log tee and console mute (slop 0043, 0047, 0067)
+- osfmk/kern/debug.c: panic hooks (ours 0360, 0367)
+- iokit/Kernel/IOStartIOKit.cpp, IOService.cpp: no 30 s IORTC wait (ours 0200), no kernelmanagerd busy hold
+- osfmk/kern/negroni_top.c (ours 0382)
+- osfmk/arm64/negroni_weak_hooks.c (new for 12377): weak default definitions of the driver hooks that the
+  machine layer, console and platform expert call (log append, reboot/power off, RTC, RPMh sleep, panic hooks).
+  The drivers give the strong definitions. So 0001-0004 link and boot to the console without bsd/dev drivers.
+
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 6824ed8..727967f 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1234,7 +1234,16 @@ IOService::iokitDaemonLaunched(void)
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/* NEGRONI takes the hold only with negronidaemonhold=1 (IOStartIOKit.cpp). */
++	extern bool gIONegroniDaemonBusyHold;
++	if (gIONegroniDaemonBusyHold) {
++		gIONegroniDaemonBusyHold = false;
++		getServiceRoot()->adjustBusy(-1);
++	}
++#else
+ 	getServiceRoot()->adjustBusy(-1);
++#endif
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+ }
+@@ -5396,7 +5405,9 @@ IOService::publishHiddenMedia(IOService * parent)
+ 	bool                wasHiding;
+ 
+ 	iomediaClass = OSMetaClass::getMetaClassWithName(gIOMediaKey);
++#if !defined(ARM64_BOARD_CONFIG_NEGRONI)
+ 	assert(iomediaClass);
++#endif
+ 
+ 	LOCKWRITENOTIFY();
+ 	wasHiding = gIOServiceHideIOMedia;
+@@ -5405,6 +5416,13 @@ IOService::publishHiddenMedia(IOService * parent)
+ 	}
+ 	UNLOCKNOTIFY();
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/* NEGRONI has no IOStorageFamily: without the IOMedia class no media exists to unhide. */
++	if (!iomediaClass) {
++		wasHiding = false;
++	}
++#endif
++
+ 	FindRootMediaContext ctx = { .services = NULL, .parent = parent };
+ 
+ 	if (wasHiding) {
+@@ -5449,7 +5467,17 @@ IOService::setRootMedia(IOService * root)
+ 	bool unhide;
+ 
+ 	ioblockstoragedriverClass = OSMetaClass::getMetaClassWithName(gIOBlockStorageDriverKey);
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/*
++	 * NEGRONI has no IOStorageFamily, so no service can be a block storage
++	 * driver: the root (e.g. a RAM disk) is not block media, as for image boot.
++	 */
++	if (!ioblockstoragedriverClass) {
++		root = NULL;
++	}
++#else
+ 	assert(ioblockstoragedriverClass);
++#endif
+ 
+ 	while (root) {
+ 		if (root->metaCast(ioblockstoragedriverClass)) {
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index 95553a0..b9edbd1 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -77,8 +77,37 @@ IOKitInitializeTime( void )
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/*
++	 * NEGRONI: no driver publishes IORTC (the PMK8350 RTC on SPMI has none),
++	 * so this wait always ran its full 30 s at every boot. Skip it:
++	 * clock_initialize_calendar() below reads PEGetUTCTimeOfDay() exactly as
++	 * it did after the timeout. Boot-arg negronirtcwait=N waits up to N s
++	 * again (for an RTC driver test). After ios-sailfish 0086 / pong.
++	 */
++	uint32_t negroni_rtc_wait = 0;
++	PE_parse_boot_argn("negronirtcwait", &negroni_rtc_wait, sizeof(negroni_rtc_wait));
++	if (negroni_rtc_wait != 0) {
++		t.tv_sec = negroni_rtc_wait;
++		IOService::waitForService(
++			IOService::resourceMatching("IORTC"), &t );
++	} else {
++		IOLog("NEGRONI: no IORTC provider, calendar from the platform (no 30 s wait)\n");
++	}
++	/*
++	 * The calendar comes from NegroniPlatformExpert::getUTCTimeOfDay()
++	 * (bsd/dev/negroni_rtc.c). Without the platform expert,
++	 * PEGetUTCTimeOfDay() gives 0 (the epoch): wait for it (it is
++	 * normally registered long before bsd_init).
++	 */
++	t.tv_sec = 10;
++	if (IOService::waitForService(IOService::serviceMatching("IOPlatformExpert"), &t) == NULL) {
++		IOLog("NEGRONI: no platform expert after 10 s: the calendar starts at the epoch\n");
++	}
++#else
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
++#endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IONVRAM"), &t );
+@@ -174,6 +203,11 @@ ConfigureIOKit(void)
+ 	gRootNub->configureDefaults();
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_NEGRONI) && !NO_KEXTD
++/* The registry root holds a busy count for the IOKit daemon (IOService.cpp reads it). */
++bool gIONegroniDaemonBusyHold;
++#endif
++
+ void
+ StartIOKitMatching(void)
+ {
+@@ -185,7 +219,23 @@ StartIOKitMatching(void)
+ 	}
+ 
+ #if !NO_KEXTD
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	/*
++	 * NEGRONI: this kernel is built as XNU_TARGET_OS_OSX, so the hold below
++	 * waits for kernelmanagerd, which iOS does not have: nothing ever drops
++	 * it, the registry root stays busy and IOKit never quiesces (callers of
++	 * IOKitWaitQuiet such as configd's InterfaceNamer wait for their whole
++	 * timeout). Take no hold; iokitDaemonLaunched() drops it only if it was
++	 * taken. Boot-arg negronidaemonhold=1 takes it as before. After
++	 * ios-sailfish 0166 / bergamota 0123 (ios-topaz 0128).
++	 */
++	uint32_t negroni_daemon_hold = 0;
++	PE_parse_boot_argn("negronidaemonhold", &negroni_daemon_hold, sizeof(negroni_daemon_hold));
++	if (negroni_daemon_hold != 0 && OSKext::iokitDaemonAvailable()) {
++		gIONegroniDaemonBusyHold = true;
++#else
+ 	if (OSKext::iokitDaemonAvailable()) {
++#endif
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been
+diff --git a/iokit/Kernel/arm/NegroniCPU.cpp b/iokit/Kernel/arm/NegroniCPU.cpp
+new file mode 100644
+index 0000000..750000d
+--- /dev/null
++++ b/iokit/Kernel/arm/NegroniCPU.cpp
+@@ -0,0 +1,288 @@
++/*
++ * A55 SMP bring-up for negroni using XNU's legacy IOCPU interface and PSCI.
++ * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
++ * CPU_OFF, suspend and the A76 cores still require separate platform work.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(NEGRONI)
++#include <IOKit/IOCPU.h>
++#include <IOKit/IOLib.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <arm64/proc_reg.h>
++#include <machine/atomic.h>
++#include <kern/clock.h>
++#include <kern/processor.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern "C" void negroni_secondary_entry(void);
++extern "C" boolean_t negroni_cpu_signal_is_enabled(unsigned int cpu);
++extern "C" void negroni_cpuidle_init(void);     /* osfmk/arm64/negroni_cpuidle.c (0288) */
++extern "C" void negroni_top_start(void);        /* osfmk/kern/negroni_top.c (0382) */
++
++class NegroniCPU;
++static NegroniCPU *negroni_cpus[MAX_CPUS];
++static uint32_t negroni_cpus_registered;
++
++/* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
++static int32_t
++negroni_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
++{
++	register uint64_t x0 __asm__("x0") = 0xC4000003ULL;
++	register uint64_t x1 __asm__("x1") = target;
++	register uint64_t x2 __asm__("x2") = entry;
++	register uint64_t x3 __asm__("x3") = context;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++class NegroniCPU : public IOCPU {
++	OSDeclareDefaultStructors(NegroniCPU);
++	const OSSymbol *cpuName = NULL;
++	uint32_t initialized = 0; /* release/acquire publication after initCPU sends SGI */
++
++public:
++	static void startAll(void *arg, wait_result_t result);
++	IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	void initCPU(bool boot) APPLE_KEXT_OVERRIDE;
++	void quiesceCPU(void) APPLE_KEXT_OVERRIDE;
++	kern_return_t startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr) APPLE_KEXT_OVERRIDE;
++	void haltCPU(void) APPLE_KEXT_OVERRIDE;
++	void signalCPU(IOCPU *target) APPLE_KEXT_OVERRIDE;
++	const OSSymbol *getCPUName(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(NegroniCPU, IOCPU);
++
++/* CPUs left out by cpus= are not matched, so start() never fails for them. */
++IOService *
++NegroniCPU::probe(IOService *provider, SInt32 *score)
++{
++	OSNumber *logical = OSDynamicCast(OSNumber, provider->getProperty("logical-cpu-id"));
++
++	if (logical == NULL || logical->unsigned32BitValue() >= ml_get_topology_info()->num_cpus) {
++		return NULL;
++	}
++	return IOCPU::probe(provider, score);
++}
++
++bool
++NegroniCPU::start(IOService *provider)
++{
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	OSNumber *logical = OSDynamicCast(OSNumber, provider->getProperty("logical-cpu-id"));
++	OSData *reg = OSDynamicCast(OSData, provider->getProperty("reg"));
++
++	if (logical == NULL || reg == NULL || reg->getLength() != sizeof(uint32_t) ||
++	    logical->unsigned32BitValue() >= topology->num_cpus) {
++		return false;
++	}
++	const ml_topology_cpu_t *cpu = &topology->cpus[logical->unsigned32BitValue()];
++	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
++		return false;
++	}
++	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
++	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++	    topology->num_cpus > NEGRONI_SMP_MAX_CPUS) {
++		panic("NEGRONI CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
++		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
++	}
++	if (!IOCPU::start(provider)) {
++		return false;
++	}
++	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	if (cpuName == NULL) {
++		return false;
++	}
++	setCPUNumber(cpu->cpu_id);
++
++	ml_processor_info_t info = {};
++	info.cpu_id = reinterpret_cast<cpu_id_t>(this);
++	info.phys_id = cpu->phys_id;
++	info.log_id = cpu->cpu_id;
++	info.cluster_id = cpu->cluster_id;
++	info.cluster_type = cpu->cluster_type;
++	info.l2_cache_id = cpu->l2_cache_id;
++	info.l2_cache_size = cpu->l2_cache_size;
++	info.l3_cache_id = cpu->l3_cache_id;
++	info.l3_cache_size = cpu->l3_cache_size;
++	perfmon_interrupt_handler_func pmi_handler = NULL;
++	kern_return_t result = ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler);
++	if (result != KERN_SUCCESS) {
++		panic("NEGRONI CPU: ml_processor_register failed: %d", result);
++	}
++	if (pmi_handler != NULL) {
++		panic("NEGRONI CPU: PMI routing is not implemented");
++	}
++
++	registerService();
++	__atomic_store_n(&negroni_cpus[cpu->cpu_id], this, __ATOMIC_RELEASE);
++	__atomic_add_fetch(&negroni_cpus_registered, 1, __ATOMIC_ACQ_REL);
++	if (cpu == topology->boot_cpu) {
++		thread_t thread;
++		result = kernel_thread_start(&NegroniCPU::startAll, NULL, &thread);
++		if (result != KERN_SUCCESS) {
++			panic("NEGRONI CPU: cannot create startup thread: %d", result);
++		}
++		thread_deallocate(thread);
++	}
++	return true;
++}
++
++/* Do not wait in a nub's start(): matching can be asynchronous or serialized. */
++void
++NegroniCPU::startAll(void *arg __unused, wait_result_t result __unused)
++{
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	uint32_t requested = 1;
++	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
++	IOLog("NEGRONI CPU: requested=%u selected=%u (limit=%u)\n",
++	    requested, topology->num_cpus, NEGRONI_SMP_MAX_CPUS);
++
++	uint64_t deadline;
++	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
++	while (__atomic_load_n(&negroni_cpus_registered, __ATOMIC_ACQUIRE) != topology->num_cpus) {
++		if (mach_absolute_time() > deadline) {
++			for (unsigned int i = 0; i < topology->num_cpus; i++) {
++				if (__atomic_load_n(&negroni_cpus[i], __ATOMIC_ACQUIRE) == NULL) {
++					IOLog("NEGRONI CPU: cpu=%u NOT registered (IOKit matching timeout)\n", i);
++				}
++			}
++			panic("NEGRONI CPU: CPU registration timeout");
++		}
++		IOSleep(1);
++	}
++	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
++	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
++		panic("NEGRONI CPU: expected boot MPIDR 0 and logical CPU 0");
++	}
++	for (unsigned int i = 0; i < topology->num_cpus; i++) {
++		NegroniCPU *cpu = __atomic_load_n(&negroni_cpus[i], __ATOMIC_ACQUIRE);
++		kern_return_t kr = processor_start(cpu->machProcessor);
++		if (kr != KERN_SUCCESS) {
++			panic("NEGRONI CPU: cpu=%u processor_start failed: %d", i, kr);
++		}
++		/* processor_start() is asynchronous for secondaries in this XNU. */
++		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
++		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
++		    !negroni_cpu_signal_is_enabled(i)) {
++			if (mach_absolute_time() > deadline) {
++				IOLog("NEGRONI CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
++				    i, topology->cpus[i].phys_id);
++				panic("NEGRONI CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++			}
++			IOSleep(1);
++		}
++		IOLog("NEGRONI CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
++		    i, topology->cpus[i].phys_id);
++	}
++	/* Publish exactly once, after every selected CPU has completed initCPU(). */
++	ml_cpu_init_completed();
++	__atomic_load_n(&negroni_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
++	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
++	ml_set_max_cpus(topology->max_cpu_id + 1);
++	IOLog("NEGRONI CPU: %u/%u CPUs initialized, SGI1 verified\n",
++	    topology->num_cpus, topology->num_cpus);
++	negroni_cpuidle_init();         /* 0288: CPU idle states (negronicpuidle, default 0 = WFI only) */
++	negroni_top_start();            /* 0382: NEGRONI TOP lines (negronitop, default 60 s) */
++	thread_terminate(current_thread());
++}
++
++void
++NegroniCPU::free(void)
++{
++	OSSafeReleaseNULL(cpuName);
++	IOCPU::free();
++}
++
++void
++NegroniCPU::initCPU(bool boot)
++{
++	if (!boot) {
++		panic("NEGRONI CPU: cpu=%u resume is not implemented", getCPUNumber());
++	}
++	assert(cpu_number() == (int)getCPUNumber());
++
++	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
++
++	/* Secondary startup runs at splsched: queue the self-IPI and return.
++	 * startAll waits for its delivery after the startup thread unmasks IRQs.
++	 * Waiting here with DAIF.I set would deadlock every secondary. */
++	signalCPU(this);
++	setCPUState(kIOCPUStateRunning);
++	kprintf("NEGRONI CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
++	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
++	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
++	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
++}
++
++void
++NegroniCPU::signalCPU(IOCPU *target)
++{
++	const ml_topology_info_t *topology = ml_get_topology_info();
++	unsigned int logical = target->getCPUNumber();
++	if (logical >= topology->num_cpus) {
++		panic("NEGRONI CPU: invalid SGI target %u", logical);
++	}
++	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
++	uint64_t mpidr = topology->cpus[logical].phys_id;
++	unsigned int aff0 = mpidr & 0xff;
++	if (aff0 >= 16) {
++		panic("NEGRONI CPU: SGI target requires unsupported range selector");
++	}
++	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
++	    (((mpidr >> 16) & 0xff) << 32) |
++	    (((mpidr >> 8) & 0xff) << 16) |
++	    ((uint64_t)NEGRONI_IPI_SGI << 24) | (1ULL << aff0);
++	__builtin_arm_dsb(DSB_ISHST);
++	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
++	__builtin_arm_isb(ISB_SY);
++}
++
++kern_return_t
++NegroniCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
++{
++	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
++	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
++	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
++		panic("NEGRONI CPU: cpu=%u unsupported restart", getCPUNumber());
++	}
++	vm_offset_t entry = ml_static_vtop((vm_offset_t)&negroni_secondary_entry);
++	IOLog("NEGRONI CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
++	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
++	__builtin_arm_dsb(DSB_SY);
++	int32_t rc = negroni_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
++	IOLog("NEGRONI CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
++	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
++	if (rc != 0) {
++		panic("NEGRONI CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
++	}
++	return KERN_SUCCESS;
++}
++
++void
++NegroniCPU::quiesceCPU(void)
++{
++	panic("NEGRONI CPU: CPU quiesce is not implemented");
++}
++
++void
++NegroniCPU::haltCPU(void)
++{
++	panic("NEGRONI CPU: CPU halt/suspend is not implemented");
++}
++
++const OSSymbol *
++NegroniCPU::getCPUName(void)
++{
++	return cpuName;
++}
++#endif /* NEGRONI */
+diff --git a/iokit/Kernel/arm/NegroniPlatformExpert.cpp b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+new file mode 100644
+index 0000000..fb91679
+--- /dev/null
++++ b/iokit/Kernel/arm/NegroniPlatformExpert.cpp
+@@ -0,0 +1,189 @@
++/*
++ * Minimal device-tree platform expert for OnePlus 10 Pro 5G (negroni).
++ * Uses XNU's normal platform, power-domain and nub initialization. Hardware
++ * interrupt and power-management services are supplied by separate drivers.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(NEGRONI)
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <IOKit/IOLib.h>
++
++class NegroniPlatformExpert : public IODTPlatformExpert {
++	OSDeclareDefaultStructors(NegroniPlatformExpert);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
++	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
++	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	void getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs) APPLE_KEXT_OVERRIDE;
++	void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(NegroniPlatformExpert, IODTPlatformExpert);
++
++/*
++ * Halt/restart (bsd/dev/negroni_reboot.c). Without a PE_halt_restart hook
++ * IOPlatformExpert::haltRestart() returned -1 for every type, so power off
++ * ("slide to power off": launchd reboot(RB_HALT) -> reboot_kernel() ->
++ * host_reboot(HOST_REBOOT_HALT) -> halt_all_cpus(FALSE) ->
++ * PEHaltRestart(kPEHaltCPU)) and restart only printed "CPU halted" /
++ * "MACH Reboot" and spun; 30 s later "Halt/Restart Timed Out" panicked.
++ *   kPEHaltCPU          PSCI SYSTEM_OFF (boot-arg negronipoweroff)
++ *   kPERestartCPU       reboot reason of kern.negroni_reboot_mode (0213;
++ *                       default normal), PSCI SYSTEM_RESET
++ *   kPEPanicRestartCPU  panic text kept on the screen for negronipanic
++ *                       seconds (default 0 = for ever), then reset
++ *   kPEPanicDiagnosticsDone  the same hold (0360): reached also when
++ *                       panicDebugging (debug=0x4) skips the restart
++ * kPEPanicBegin marks the panic; other types (panic callouts) do nothing.
++ */
++extern "C" {
++void negroni_reboot_prepare(void);
++void negroni_reboot(unsigned reason);
++void negroni_restart(void);
++void negroni_power_off(void);
++void negroni_panic_restart(void);
++void negroni_reboot_settle(unsigned ms);
++void negroni_fb_panic(void);            /* NegroniFramebuffer.cpp: zero-copy pipes back on the panel memory */
++void negroni_tfa_panic(void);           /* negroni_tfa.c (0244): speaker amps off, reset pins held */
++void negroni_bootlog_end(unsigned kind, const char *why);  /* negroni_ufs.c (0367): 3 halt, 4 restart */
++}
++
++static bool negroni_in_panic;
++
++static int
++negroni_halt_restart(unsigned int type)
++{
++	switch (type) {
++	case kPEPanicBegin:
++		negroni_in_panic = true;
++		negroni_fb_panic();             /* the panic text must be on screen (0234) */
++		negroni_tfa_panic();            /* no amp left playing a stuck buffer (0244) */
++		return 0;
++	case kPEHaltCPU:
++		if (negroni_in_panic) {
++			negroni_panic_restart();        /* does not return */
++		}
++		IOLog("NEGRONI: power off\n");
++		negroni_bootlog_end(3, "halt (power off)");     /* clean end mark in the boot log (0367) */
++		negroni_tfa_panic();                    /* amps off before the rails go (0244) */
++		negroni_reboot_settle(300);             /* the USB log thread sends the last lines */
++		negroni_power_off();
++		return -1;                              /* refused: halt_all_cpus() spins */
++	case kPERestartCPU:
++		if (negroni_in_panic) {
++			negroni_panic_restart();        /* does not return */
++		}
++		IOLog("NEGRONI: restart\n");
++		negroni_bootlog_end(4, "restart (reboot)");     /* clean end mark in the boot log (0367) */
++		negroni_tfa_panic();                    /* amps off (0244) */
++		negroni_reboot_settle(300);
++		negroni_restart();                      /* kern.negroni_reboot_mode (0213) */
++		return -1;
++	case kPEPanicRestartCPU:
++		negroni_panic_restart();                /* does not return */
++		return -1;
++	case kPEPanicDiagnosticsDone:
++		/*
++		 * 0360: the panic log is complete (paniclog, backtraces, the
++		 * console ring copy). Hold the panic here: with debug=0x4
++		 * (DB_NMI) xnu sets panicDebugging, never sends
++		 * kPEPanicRestartCPU and spins in panic_spin_forever(), so
++		 * negronipanic=N never reset (the 2026-10-26 panics). The hold
++		 * loop sends the log over USB, takes ctl commands and runs the
++		 * timed reset.
++		 */
++		if (negroni_in_panic) {
++			negroni_panic_restart();        /* does not return */
++		}
++		return 0;
++	default:
++		return 0;
++	}
++}
++
++bool
++NegroniPlatformExpert::start(IOService *provider)
++{
++	IOLog("NEGRONI: starting device-tree platform expert\n");
++	if (!IODTPlatformExpert::start(provider)) {
++		return false;
++	}
++	registerService();
++	negroni_reboot_prepare();
++	PE_halt_restart = &negroni_halt_restart;
++	IOLog("NEGRONI: platform expert registered, halt/restart hook set\n");
++	return true;
++}
++
++const char *
++NegroniPlatformExpert::deleteList(void)
++{
++	return "()";
++}
++
++const char *
++NegroniPlatformExpert::excludeList(void)
++{
++	return "('chosen', 'defaults', 'cpus', 'options')";
++}
++
++void
++NegroniPlatformExpert::processTopLevel(IORegistryEntry *root)
++{
++	/*
++	 * The stock implementation requires an Apple NVRAM /options node.
++	 * NEGRONI has no NVRAM controller; publish real CPU/device nodes without
++	 * inventing one. createNubs adds the topology's logical CPU/cluster IDs.
++	 */
++	IORegistryEntry *cpus = root->childFromPath("cpus", gIODTPlane);
++	if (cpus != NULL) {
++		createNubs(this, IODTFindMatchingEntries(cpus, kIODTExclusive, NULL));
++		cpus->release();
++	}
++	createNubs(this, IODTFindMatchingEntries(root, kIODTExclusive, excludeList()));
++
++	/*
++	 * No AppleARMIO driver publishes the /arm-io children: do it here so
++	 * built-in drivers (the display, AppleCLCD) can match them. The GIC is
++	 * driven by the platform code and gets no nub. The nubs hang off this
++	 * platform expert: IOPlatformDevice::compareName asks its provider.
++	 */
++	IORegistryEntry *armio = root->childFromPath("arm-io", gIODTPlane);
++	if (armio != NULL) {
++		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));
++		armio->release();
++	}
++}
++
++/*
++ * hw.target / hw.product come from IODTPlatformExpert: the first root
++ * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
++ * is what the iPhone userland (MobileGestalt) expects.
++ */
++
++/*
++ * Calendar time (bsd/dev/negroni_rtc.c): the PMK8350 RTC + an offset, or
++ * a build-date floor. Without these overrides IOPlatformExpert returned 0
++ * and the calendar started at the epoch (1969-12-31 in Pacific time).
++ */
++extern "C" {
++void negroni_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs);
++void negroni_rtc_set(clock_sec_t secs, clock_nsec_t nsecs);
++}
++
++void
++NegroniPlatformExpert::getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs)
++{
++	negroni_rtc_get(secs, nsecs);
++}
++
++void
++NegroniPlatformExpert::setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs)
++{
++	negroni_rtc_set(secs, nsecs);
++}
++#endif /* NEGRONI */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 559a9db..8eaea0d 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -34,6 +34,20 @@
+ 
+ const char * gIOKernelConfigTables =
+     "("
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++    "   {"
++    "     'IOClass'         = NegroniPlatformExpert;"
++    "     'IOProviderClass' = IOPlatformExpertDevice;"
++    "     'IONameMatch'     = 'oneplus,negroni';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
++    "   {"
++    "     'IOClass'         = NegroniCPU;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'qcom,kryo470';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
++#endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index f2aa835..1a19a3d 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -6,3 +6,6 @@ iokit/Kernel/IOPMrootDomain.cpp    					optional iokitcpp
+ # SMP
+ iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+ 
++# NEGRONI device-tree platform (empty translation unit on other boards)
++iokit/Kernel/arm/NegroniPlatformExpert.cpp                         optional iokitcpp
++iokit/Kernel/arm/NegroniCPU.cpp                                    optional iokitcpp
+diff --git a/osfmk/arm64/negroni_weak_hooks.c b/osfmk/arm64/negroni_weak_hooks.c
+new file mode 100644
+index 0000000..a806c58
+--- /dev/null
++++ b/osfmk/arm64/negroni_weak_hooks.c
+@@ -0,0 +1,32 @@
++/*
++ * iOS 26 port (xnu-12377): weak default definitions of the negroni driver hooks that the machine layer, the
++ * console and the platform expert call. The drivers (bsd/dev/negroni_*.c, iokit/Kernel/arm/Negroni*.cpp) give the
++ * strong definitions; ld64 takes those when they are linked. With only the machine layer (patches 0001-0004) the
++ * kernel still links and boots to the console: no persistent log, no PMIC reboot (PSCI only), no RTC (epoch).
++ */
++#include <stdint.h>
++#include <stdbool.h>
++#include <kern/clock.h>
++#include <kern/misc_protos.h>
++
++#define NEGRONI_WEAK __attribute__((weak))
++
++/* bsd/dev/negroni_ufs.c: persistent boot log, boot-log end mark (0047, 0367) */
++NEGRONI_WEAK void negroni_log_append(const char *c __unused, int size __unused) {}
++NEGRONI_WEAK void negroni_bootlog_end(unsigned kind __unused, const char *why __unused) {}
++/* bsd/dev/negroni_rpmh.c (0383): never ready = no cluster power-down request */
++NEGRONI_WEAK bool negroni_rpmh_sleep_ready(void) { return false; }
++NEGRONI_WEAK void negroni_rpmh_sleep_log(void) {}
++/* bsd/dev/negroni_reboot.c (0211, 0213, 0214) */
++NEGRONI_WEAK void negroni_reboot_prepare(void) {}
++NEGRONI_WEAK void negroni_reboot_settle(unsigned ms __unused) {}
++NEGRONI_WEAK void negroni_restart(void) {}
++NEGRONI_WEAK void negroni_power_off(void) {}
++NEGRONI_WEAK void negroni_panic_restart(void) { for (;;) { __builtin_arm_wfi(); } }
++/* NegroniFramebuffer.cpp (0234), negroni_tfa.c (0244), negroni_flash.c */
++NEGRONI_WEAK void negroni_fb_panic(void) {}
++NEGRONI_WEAK void negroni_tfa_panic(void) {}
++NEGRONI_WEAK int negroni_display_asleep;
++/* bsd/dev/negroni_rtc.c: no RTC = the epoch */
++NEGRONI_WEAK void negroni_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs) { *secs = 0; *nsecs = 0; }
++NEGRONI_WEAK void negroni_rtc_set(clock_sec_t secs __unused, clock_nsec_t nsecs __unused) {}
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index d8df278..2c388a1 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -54,6 +54,8 @@ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/negroni_early.c	standard
+ osfmk/arm64/negroni_cpuidle.c	standard
++osfmk/arm64/negroni_weak_hooks.c	standard
++osfmk/kern/negroni_top.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 7784e72..0fcbcf0 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -275,9 +275,25 @@ _cnputc(char c, bool poll)
+  *             waiting for an interrupt when the hardware device isn't ready
+  * @param size The number of characters to print to the console.
+  */
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++extern void negroni_log_append(const char *c, int size);  /* bsd/dev/negroni_ufs.c */
++/*
++ * Set by AppleCLCD (boot-arg negronifb_noconsole=1) once the GUI presents:
++ * console text still goes to the persistent log, but is not drawn over
++ * the GUI. A panic draws again.
++ */
++int negroni_console_muted;
++#endif
++
+ static inline void
+ _cnputs(char *c, int size, bool poll)
+ {
++#if defined(ARM64_BOARD_CONFIG_NEGRONI)
++	negroni_log_append(c, size);
++	if (negroni_console_muted && !panic_active()) {
++		return;
++	}
++#endif
+ 	if (disableConsoleOutput) {
+ 		return;
+ 	}
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 48f9405..864e857 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -86,6 +86,9 @@
+ #include <stdatomic.h>
+ #include <sys/pgo.h>
+ #include <console/serial_protos.h>
++#if defined(__arm64__)
++#include <arm64/negroni_early.h>
++#endif
+ #include <IOKit/IOBSD.h>
+ #include <libkern/crc.h>
+ 
+@@ -1253,6 +1256,11 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ {
+ #pragma clang diagnostic pop
+ 
++#if defined(NEGRONI)
++	/* No CPU/thread/debugger state is required for this first panic copy. */
++	negroni_early_panic(panic_format_str, panic_args);
++#endif
++
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+ 	read_lbr();
+ #endif
+diff --git a/osfmk/kern/negroni_top.c b/osfmk/kern/negroni_top.c
+new file mode 100644
+index 0000000..f84734a
+--- /dev/null
++++ b/osfmk/kern/negroni_top.c
+@@ -0,0 +1,342 @@
++/*
++ * NEGRONI (SM8450) "top" in the kernel log, patch 0382 (patches/xnu/README-power-idle.md).
++ *
++ * Why: the 0284 CPUFREQ line gives the busiest core of a domain, mostly at the moments a row changes
++ * (a biased sample), and nothing tells WHICH thread uses the CPU or how often the cores wake. Every
++ * negronitop seconds (default 60; 0 = off) one kernel thread prints:
++ *
++ *   NEGRONI TOP 60 s dark 1: busy% 3 1 0 0 0 0 0 0 | irq/s 1012 40 12 9 3 3 2 2 | timer/s ... | ipi/s ...
++ *   NEGRONI TOP procs: kernel_task 4.1%, backboardd[58] 0.9%, ...
++ *   NEGRONI TOP thr 3.0% kernel_task tid 123 "name" st 0x1 lr 0x... 0x... 0x... 0x... 0x...
++ *
++ * busy% per CPU = (user + system) / (user + system + idle) time of that processor over the window
++ * (recount_processor_usage, the same counters as host_statistics). irq/s = cpu_stat.irq_ex_cnt
++ * (every IRQ exception: device interrupts, the timer, IPIs), timer/s = cpu_stat.timer_cnt, ipi/s =
++ * cpu_stat.ipi_cnt: the wakeups. Threads: CPU time in the window (recount_thread_time_mach) in % of one
++ * core, top NT_TOP; for a kernel_task thread the first return addresses of its kernel stack (unslid:
++ * scripts/debug/panic-symbolize.sh -a ADDR...), which name the polling loop it sleeps in.
++ * Cost: one pass over the thread list per window under tasks_threads_lock (about 1-3 ms).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(NEGRONI)
++#include <stdint.h>
++#include <stdbool.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/task.h>
++#include <kern/processor.h>
++#include <kern/recount.h>
++#include <kern/sched_prim.h>
++#include <kern/misc_protos.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <arm/cpu_data_internal.h>
++#include <pexpert/pexpert.h>
++#include <libkern/OSAtomic.h>
++
++extern lck_mtx_t tasks_threads_lock;
++extern char *proc_name_address(void *p);
++extern int task_pid(task_t task);
++extern processor_t cpu_to_processor(int cpu);
++extern int negroni_display_asleep;      /* NegroniFramebuffer.cpp (0382) */
++
++void negroni_top_start(void);
++
++#define NT_SLOTS        8192            /* thread table (open addressing on the thread id) */
++#define NT_TOP          6
++#define NT_PROCS        6
++#define NT_TASKS        96
++#define NT_FRAMES       6
++#define NT_CPUS         8
++
++struct nt_ent {
++	uint64_t tid;           /* 0 = empty */
++	uint64_t time;          /* recount_thread_time_mach at the last window */
++};
++
++static struct nt_ent *nt_tab[2];
++static int nt_cur;
++static uint32_t nt_secs = 60;
++
++static struct {
++	uint64_t busy, idle, irq, timer, ipi;
++} nt_cpu[NT_CPUS];
++
++static uint64_t
++nt_prev(const struct nt_ent *tab, uint64_t tid, bool *found)
++{
++	uint32_t h = (uint32_t)(tid * 2654435761u) & (NT_SLOTS - 1);
++	for (uint32_t n = 0; n < NT_SLOTS; n++, h = (h + 1) & (NT_SLOTS - 1)) {
++		if (tab[h].tid == tid) {
++			*found = true;
++			return tab[h].time;
++		}
++		if (tab[h].tid == 0) {
++			break;
++		}
++	}
++	*found = false;
++	return 0;
++}
++
++static void
++nt_put(struct nt_ent *tab, uint64_t tid, uint64_t time)
++{
++	uint32_t h = (uint32_t)(tid * 2654435761u) & (NT_SLOTS - 1);
++	for (uint32_t n = 0; n < NT_SLOTS; n++, h = (h + 1) & (NT_SLOTS - 1)) {
++		if (tab[h].tid == 0 || tab[h].tid == tid) {
++			tab[h].tid = tid;
++			tab[h].time = time;
++			return;
++		}
++	}
++}
++
++static void
++nt_name(task_t task, char *buf, size_t size)
++{
++	if (task == kernel_task) {
++		strlcpy(buf, "kernel_task", size);
++		return;
++	}
++	void *p = get_bsdtask_info(task);
++	snprintf(buf, size, "%s[%d]", p ? proc_name_address(p) : "?", task_pid(task));
++}
++
++static uint64_t
++nt_pct10(uint64_t part, uint64_t whole)        /* tenths of a percent */
++{
++	return whole ? part * 1000 / whole : 0;
++}
++
++static void
++nt_window(uint64_t window_abs, bool print)
++{
++	struct nt_ent *old = nt_tab[nt_cur], *tab = nt_tab[nt_cur ^ 1];
++	struct {
++		thread_t th;
++		uint64_t delta, tid;
++	} top[NT_TOP] = {};
++	static struct {
++		task_t task;
++		uint64_t sum;
++	} tasks[NT_TASKS];      /* one thread uses these: static, off the kernel stack */
++	static char thr[NT_TOP][300], procs[400];
++	uint32_t ntasks = 0, nthreads = 0;
++	char line[480];
++	int at;
++
++	/* per CPU: busy share and the wakeups */
++	const ml_topology_info_t *topo = ml_get_topology_info();
++	unsigned ncpu = topo->num_cpus < NT_CPUS ? topo->num_cpus : NT_CPUS;
++	uint32_t busy[NT_CPUS] = {}, irq[NT_CPUS] = {}, tmr[NT_CPUS] = {}, ipi[NT_CPUS] = {};
++	uint64_t ns;
++	absolutetime_to_nanoseconds(window_abs, &ns);
++	uint64_t ms = ns / NSEC_PER_MSEC ? ns / NSEC_PER_MSEC : 1;
++	for (unsigned i = 0; i < ncpu; i++) {
++		int cpu = (int)topo->cpus[i].cpu_id;
++		processor_t p = cpu_to_processor(cpu);
++		cpu_data_t *cd = cpu_datap(cpu);
++		if (p == PROCESSOR_NULL || cd == NULL) {
++			continue;
++		}
++		struct recount_usage u = { 0 };
++		uint64_t idle = 0;
++		recount_processor_usage(&p->pr_recount, &u, &idle);
++		uint64_t b = u.ru_user_time_mach + u.ru_system_time_mach;
++		uint64_t db = b - nt_cpu[i].busy, di = idle - nt_cpu[i].idle;
++		busy[i] = (uint32_t)(db + di ? db * 100 / (db + di) : 0);
++		irq[i] = (uint32_t)((cd->cpu_stat.irq_ex_cnt - nt_cpu[i].irq) * 1000 / ms);
++		tmr[i] = (uint32_t)((cd->cpu_stat.timer_cnt - nt_cpu[i].timer) * 1000 / ms);
++		ipi[i] = (uint32_t)((cd->cpu_stat.ipi_cnt - nt_cpu[i].ipi) * 1000 / ms);
++		nt_cpu[i].busy = b;
++		nt_cpu[i].idle = idle;
++		nt_cpu[i].irq = cd->cpu_stat.irq_ex_cnt;
++		nt_cpu[i].timer = cd->cpu_stat.timer_cnt;
++		nt_cpu[i].ipi = cd->cpu_stat.ipi_cnt;
++	}
++
++	bzero(tab, NT_SLOTS * sizeof(*tab));
++	bzero(tasks, sizeof(tasks));
++	lck_mtx_lock(&tasks_threads_lock);
++	thread_t th;
++	queue_iterate(&threads, th, thread_t, threads) {
++		uint64_t now_t = recount_thread_time_mach(th), tid = th->thread_id;
++		bool found;
++		uint64_t was = nt_prev(old, tid, &found);
++		uint64_t delta = found && now_t >= was ? now_t - was : (found ? 0 : now_t);
++		nt_put(tab, tid, now_t);
++		nthreads++;
++		if (!print || delta == 0) {
++			continue;
++		}
++		task_t task = get_threadtask(th);
++		uint32_t k;
++		for (k = 0; k < ntasks && tasks[k].task != task; k++) {
++			;
++		}
++		if (k < ntasks) {
++			tasks[k].sum += delta;
++		} else if (ntasks < NT_TASKS) {
++			tasks[ntasks].task = task;
++			tasks[ntasks++].sum = delta;
++		}
++		for (int i = 0; i < NT_TOP; i++) {
++			if (delta > top[i].delta) {
++				for (int j = NT_TOP - 1; j > i; j--) {
++					top[j] = top[j - 1];
++				}
++				top[i].th = th;
++				top[i].delta = delta;
++				top[i].tid = tid;
++				break;
++			}
++		}
++	}
++	/* still under the lock: the threads in top[] are on the list (review: no bzero(tasks) here, it cleared the sums) */
++	for (int i = 0; i < NT_TOP; i++) {
++		thr[i][0] = 0;
++		if (top[i].th == THREAD_NULL) {
++			continue;
++		}
++		thread_t t = top[i].th;
++		task_t task = get_threadtask(t);
++		char who[48], tn[MAXTHREADNAMESIZE] = "";
++		nt_name(task, who, sizeof(who));
++		thread_get_thread_name(t, tn);
++		at = snprintf(thr[i], sizeof(thr[i]), "NEGRONI TOP thr %llu.%llu%% %s tid %llu \"%s\" st 0x%x",
++		    nt_pct10(top[i].delta, window_abs) / 10, nt_pct10(top[i].delta, window_abs) % 10, who, top[i].tid,
++		    tn, t->state);
++		if (task == kernel_task && t != current_thread()) {
++			/*
++			 * A blocked kernel thread: its saved lr, then the frame chain (as the 0360 BT dump).
++			 * Review: read under the thread lock at splsched. A thread with TH_RUN clear cannot be
++			 * unblocked (thread_go needs this lock), so it keeps its kernel stack while we read it;
++			 * without the lock it could run, hand off its stack and stack_collect could unmap it.
++			 */
++			uint64_t fr[1 + NT_FRAMES];
++			int nfr = 0;
++			spl_t s = splsched();
++			thread_lock(t);
++			if (t->kernel_stack != 0 && !(t->state & TH_RUN)) {
++				thread_kernel_state_t ks = (thread_kernel_state_t)t->machine.kstackptr;
++				uint64_t base = t->kernel_stack, topa = base + kernel_stack_size;
++				uint64_t fp = ks->machine.ss.fp;
++				fr[nfr++] = ks->machine.ss.lr;
++				for (int f = 0; f < NT_FRAMES && fp >= base && fp + 16 <= topa && (fp & 7) == 0; f++) {
++					uint64_t next = ((uint64_t *)fp)[0];
++					fr[nfr++] = ((uint64_t *)fp)[1];
++					if (next <= fp) {
++						break;
++					}
++					fp = next;
++				}
++			}
++			thread_unlock(t);
++			splx(s);
++			for (int f = 0; f < nfr && at < 260; f++) {
++				at += snprintf(thr[i] + at, sizeof(thr[i]) - at, f ? " 0x%llx" : " lr 0x%llx",
++				    (uint64_t)VM_KERNEL_UNSLIDE(fr[f]));
++			}
++		}
++	}
++	/* process names under the lock too (the tasks are alive while their threads are listed) */
++	at = snprintf(procs, sizeof(procs), "NEGRONI TOP procs (%u threads):", nthreads);
++	for (int n = 0; n < NT_PROCS && print; n++) {
++		uint32_t best = NT_TASKS;
++		for (uint32_t k = 0; k < ntasks; k++) {
++			if (tasks[k].sum != 0 && (best == NT_TASKS || tasks[k].sum > tasks[best].sum)) {
++				best = k;
++			}
++		}
++		if (best == NT_TASKS) {
++			break;
++		}
++		char who[48];
++		nt_name(tasks[best].task, who, sizeof(who));
++		uint64_t p10 = nt_pct10(tasks[best].sum, window_abs);
++		at += snprintf(procs + at, sizeof(procs) - at, "%s %s %llu.%llu%%", n ? "," : "", who, p10 / 10, p10 % 10);
++		tasks[best].sum = 0;
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	nt_cur ^= 1;
++	if (!print) {
++		return;
++	}
++
++	at = snprintf(line, sizeof(line), "NEGRONI TOP %llu s dark %d: busy%%", ms / 1000,
++	    __atomic_load_n(&negroni_display_asleep, __ATOMIC_ACQUIRE));
++	for (unsigned i = 0; i < ncpu; i++) {
++		at += snprintf(line + at, sizeof(line) - at, " %u", busy[i]);
++	}
++	at += snprintf(line + at, sizeof(line) - at, " | irq/s");
++	for (unsigned i = 0; i < ncpu; i++) {
++		at += snprintf(line + at, sizeof(line) - at, " %u", irq[i]);
++	}
++	at += snprintf(line + at, sizeof(line) - at, " | timer/s");
++	for (unsigned i = 0; i < ncpu; i++) {
++		at += snprintf(line + at, sizeof(line) - at, " %u", tmr[i]);
++	}
++	at += snprintf(line + at, sizeof(line) - at, " | ipi/s");
++	for (unsigned i = 0; i < ncpu; i++) {
++		at += snprintf(line + at, sizeof(line) - at, " %u", ipi[i]);
++	}
++	printf("%s\n", line);
++	printf("%s\n", procs);
++	for (int i = 0; i < NT_TOP; i++) {
++		if (thr[i][0]) {
++			printf("%s\n", thr[i]);
++		}
++	}
++}
++
++__attribute__((noreturn)) static void
++nt_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	static int chan;
++	uint64_t last = mach_absolute_time();
++
++	nt_window(0, false);    /* the base of the first window */
++	for (;;) {
++		assert_wait_timeout((event_t)&chan, THREAD_UNINT, nt_secs, NSEC_PER_SEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		uint64_t now = mach_absolute_time();
++		nt_window(now - last, true);
++		last = now;
++	}
++}
++
++/* NegroniCPU.cpp, once all CPUs run (thread context). */
++void
++negroni_top_start(void)
++{
++	static bool started;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	PE_parse_boot_argn("negronitop", &nt_secs, sizeof(nt_secs));
++	if (nt_secs == 0) {
++		printf("NEGRONI TOP: off (negronitop=0)\n");
++		return;
++	}
++	if (nt_secs < 5) {
++		nt_secs = 5;
++	}
++	for (int i = 0; i < 2; i++) {
++		nt_tab[i] = kalloc_data(NT_SLOTS * sizeof(struct nt_ent), Z_WAITOK | Z_ZERO);
++		if (nt_tab[i] == NULL) {
++			printf("NEGRONI TOP: no memory\n");
++			return;
++		}
++	}
++	if (kernel_thread_start(nt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("NEGRONI TOP: a line set every %u s (negronitop; 0 = off)\n", nt_secs);
++	}
++}
++#endif /* NEGRONI */
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 032d9e0..9c263dc 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -26,6 +26,7 @@
+ #include <pexpert/arm/consistent_debug.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <arm64/proc_reg.h>
++#include <arm64/negroni_early.h>
+ #include <pexpert/arm/protos.h>
+ #include <kern/sched_prim.h>
+ #ifdef PL011_UART
+@@ -697,6 +698,150 @@ pl011_uart_init(void)
+ 	pl011_registers->uartcr.raw = uartcr.raw;
+ }
+ 
++/*****************************************************************************/
++
++/*
++ * negroni: framebuffer "serial" for boards with no usable UART (the OnePlus
++ * 10 Pro's debug UART engine runs in SPI mode). kprintf output is drawn onto
++ * the boot framebuffer described by the ADT node "negroni-fbcon":
++ *   reg    = <phys size>       absolute physical address, not arm-io relative
++ *   width, height              pixels
++ *   stride                     bytes per line, 32bpp
++ * Lines wrap back to the top instead of scrolling; the line after the cursor
++ * is kept blank so the newest output is easy to find.
++ */
++
++extern unsigned char iso_font[256 * 16];
++
++#define FBCON_SCALE     2
++#define FBCON_FG        0xffffffffu
++#define FBCON_BG        0xff000000u
++
++static volatile uint32_t *fbcon_base;
++static uint32_t fbcon_width, fbcon_height, fbcon_stride;
++static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
++
++static void
++fbcon_clear_row(uint32_t row)
++{
++	for (uint32_t y = row * 16 * FBCON_SCALE; y < (row + 1) * 16 * FBCON_SCALE; y++) {
++		volatile uint32_t *line = fbcon_base + y * (fbcon_stride / 4);
++		for (uint32_t x = 0; x < fbcon_width; x++) {
++			line[x] = FBCON_BG;
++		}
++	}
++}
++
++static void
++fbcon_newline(void)
++{
++	fbcon_col = 0;
++	fbcon_row = (fbcon_row + 1) % fbcon_rows;
++	fbcon_clear_row(fbcon_row);
++	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++}
++
++static void
++fbcon_init(void)
++{
++	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
++	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
++	fbcon_col = fbcon_row = 0;
++	for (uint32_t r = 0; r < fbcon_rows; r++) {
++		fbcon_clear_row(r);
++	}
++}
++
++static unsigned int
++fbcon_transmit_ready(void)
++{
++	return 1;
++}
++
++static void
++fbcon_transmit_data(uint8_t c)
++{
++	if (c == '\r') {
++		fbcon_col = 0;
++		return;
++	}
++	if (c == '\n') {
++		fbcon_newline();
++		return;
++	}
++	if (fbcon_col >= fbcon_cols) {
++		fbcon_newline();
++	}
++	const unsigned char *glyph = iso_font + c * 16;
++	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
++	for (uint32_t gy = 0; gy < 16; gy++) {
++		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
++			volatile uint32_t *line = fbcon_base + (y0 + gy * FBCON_SCALE + sy) * (fbcon_stride / 4) + x0;
++			for (uint32_t gx = 0; gx < 8; gx++) {
++				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
++				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
++					line[gx * FBCON_SCALE + sx] = px;
++				}
++			}
++		}
++	}
++	fbcon_col++;
++}
++
++static unsigned int
++fbcon_receive_ready(void)
++{
++	return 0;
++}
++
++static uint8_t
++fbcon_receive_data(void)
++{
++	return 0;
++}
++
++SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) negroni_fbcon_serial_functions =
++{
++	.init = fbcon_init,
++	.transmit_ready = fbcon_transmit_ready,
++	.transmit_data = fbcon_transmit_data,
++	.receive_ready = fbcon_receive_ready,
++	.receive_data = fbcon_receive_data,
++	.device = SERIAL_NEGRONI_FBCON
++};
++
++static void
++fbcon_probe(void)
++{
++	DTEntry entry;
++	uint64_t const *reg;
++	uint32_t const *val;
++	unsigned int size;
++
++	if (SecureDTFindEntry("name", "negroni-fbcon", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		return;
++	}
++	if (SecureDTGetProperty(entry, "width", (void const **)&val, &size) == kSuccess) {
++		fbcon_width = *val;
++	}
++	if (SecureDTGetProperty(entry, "height", (void const **)&val, &size) == kSuccess) {
++		fbcon_height = *val;
++	}
++	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
++		fbcon_stride = *val;
++	}
++	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
++		return;
++	}
++	negroni_early_mark(17, "fbcon config read; mapping");
++	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
++	negroni_early_mark(18, "fbcon mapping returned");
++	if (fbcon_base != NULL) {
++		register_serial_functions(&negroni_fbcon_serial_functions);
++	}
++}
++
+ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) pl011_uart_serial_functions =
+ {
+ 	.init = pl011_uart_init,
+@@ -908,6 +1053,9 @@ serial_init(void)
+ 
+ 	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
+ 
++	/* negroni: the framebuffer console does not need a serial phandle in /chosen */
++	fbcon_probe();
++
+ 	// Get the phandle of the serial device XNU has been configured to use.
+ 	uint32_t phandle;
+ 	if (!get_serial_device_phandle(&phandle)) {
