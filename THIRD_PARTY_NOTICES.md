@@ -10,6 +10,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 |---|---|---|
 | `external/UniXNU` & `external/slop/unixnu-negroni` | UniXNU contributors | BSD-2-Clause-Patent |
 | `external/UniXNU/drivers/DarwinBoot` | UniXNU contributors | BSD-2-Clause-Patent |
+| `patches/xnu-12377/0001-non-apple-soc-base.patch`, `scripts/ios26/kdk-headers.py` (from UniXNU-ios26) | UniXNU contributors | BSD-2-Clause-Patent |
 | `external/Mu-Silicium-negroni` & submodules | Andrei Warkentin, Project Silicium, Microsoft Corp., ARM Ltd., Intel Corp., Apple Inc., Linux Foundation | BSD-2-Clause / Project Mu / EDK II |
 | `external/hackios-xnu-userland` | OOSEX GANG | MIT |
 | `external/ios-flame` | NWylynko, dipa-studio | MIT |
@@ -26,7 +27,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 
 ## 1. BSD-2-Clause-Patent
 
-Used by **UniXNU**, **DarwinBoot**, **UniXNU-negroni**, **UniXNU-pong**, **UniXNU-zeta**, and **slop**:
+Used by **UniXNU**, **DarwinBoot**, **UniXNU-negroni**, **UniXNU-pong**, **UniXNU-zeta**, **UniXNU-ios26** (parts of `patches/xnu-12377/` and `scripts/ios26/kdk-headers.py`), and **slop**:
 
 ```text
 Copyright (c) 2026, UniXNU contributors. All rights reserved.
