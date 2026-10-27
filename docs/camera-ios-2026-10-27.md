@@ -288,3 +288,41 @@ device-vendor call, no `/dev/negronicam` open. Our hooks worked (all 8 replaced)
 - The server checks camera access with tccd; tccd here fails to make sandbox extensions ("Failed to issue sandbox
   extension", camlog3) but answers authValue 2. Camera.app has the private TCC entitlement.
 - The `preload` knob runs Metal shader compiles in mediaserverd; use it only to test the GPU path.
+
+## 9. 2026-10-27 18:15: Camera.app runs, no preview: the app is "not authorized" (tccd sandbox extension)
+
+### Observations [V, `logs/camlog6-full.txt`, mediaserverd[603], Camera[614] from 05:42:04]
+
+- The section 8 fix works: `capture servers started (6 of 6, ...)`; the iOS prewarm made our device
+  (`the device made: one stream`) and a kernel session ran (82 frames, then closed). Camera.app launches.
+- `FigCaptureGetCaptureDeviceCreateFunction: Failed to load CaptureDeviceCreate function` is the stock lookup of the
+  Apple ISP driver; our vendor hook covers it (`-[BWFigCaptureDeviceVendor _createDevice:clientPID:]` follows at once).
+  Not a cause.
+- The cause: Camera[614] `TCC ... Code=6 "server error: Failed to issue Sandbox Extension for kTCCServiceCamera"`, then
+  `Creating an AVCaptureDeviceInput for the captureDevice (... [Back Camera] ...) failed: (AVFoundationErrorDomain
+  Code=-11852 "Cannot use Back Camera" ... This app is not authorized to use Back Camera.)`. The same for the
+  microphone. So the session has no camera input. The rest follows from that [I]: `Failed to find video output
+  connection for <AVCapturePhotoOutput>`, `CAMModeAndDeviceCommand configuration failed! (-32200)`, `Failed to set
+  exposure mode ... not supported by (null)` (no device), `startRunning succeeded` with nothing to run, no kernel session.
+- tccd grants the service (authValue 2) and then fails `sandbox_extension_issue` because our kernel's Sandbox stand-in
+  answers op 5 (extension issue) and op 6 (consume) with ENOENT (slop 0050, kept by our 0223).
+- HakiOS: its `kern_minimac.c` Sandbox stub answers every op except 4 with 0 ("allowed"), so tccd works there.
+
+### Fix: kernel patch 0386 (build-only; userland cannot fix it: tccd builds the extension classes in, no plist)
+
+- `patches/xnu/0386-negroni-sandbox-extensions.patch`: op 5 writes a fixed token into the library's 0x800-byte buffer
+  (arg offset 0x20, layout from `__sandbox_extension_issue` 20H392 0x1d1af4f98), op 6 returns 0. Boot-arg
+  `negronisbext=0` = old behaviour. Details: `patches/xnu/README-aks-amfi.md` "0386". Syntax check OK, applies on the
+  current patched tree. No new kernel built (one combined build by the main session).
+- No change in userland/camera for this. The 18:08 NegroniCamera.driver stays.
+
+### Test
+
+1. Build the kernel with 0386 (with the other pending patches), new test image, RAM boot as usual (`negronicam=7`).
+   The plug-in is on the root already (pushed 18:11).
+2. `scripts/bg.sh camlog scripts/camera/phone-camera.sh log`; open Camera.app. Expect: no `Failed to issue Sandbox
+   Extension` for Camera[pid], no `-11852`; mediaserverd `captureSession ... graph` lines, `negroni: camera: device:
+   streams asked for (1)`, `stream: the graph starts the stream`, `frames of 4000x3008`; kernel `ios session: start`.
+3. Kernel log once per boot: `NEGRONI Sandbox: tccd op 5` (first use).
+4. If something else fails after that, the next blocker is in the graph build (formats/preset): grep mediaserverd for
+   `captureSession_buildGraph`, `-[BWFigCaptureDevice`, `FigCaptureStream`.
