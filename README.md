@@ -1,5 +1,10 @@
 # iOSPlus10
 
+> [!NOTE]
+> **Project Update: Pausing OnePlus 10 Pro Development — Moving to OnePlus 15**  
+> Active development on the OnePlus 10 Pro port is paused and focus is shifting to exploring iOS 16 and iOS 26 on the **OnePlus 15**.  
+> The physical 10 Pro device has been sold; this repository remains preserved as an open reference for the work completed (UEFI boot, Metal2Vulkan GPU acceleration, Wi-Fi, Bluetooth, and battery fixes).
+
 iOS on the OnePlus 10 Pro 5G (NE2211, "negroni", Snapdragon 8 Gen 1 / SM8450), booted natively
 through UEFI. Goal: iOS 26 with GPU (Metal) acceleration. First milestone: the existing iOS 16
 port on this phone.
@@ -103,14 +108,16 @@ Mu-Silicium has its own submodules; initialize them only when you build the UEFI
 ## Credits
 
 This project builds directly upon groundbreaking work across the open-source XNU and Android porting communities:
+- [UniXNU-negroni](https://github.com/pawlickerr/UniXNU-negroni) & [Mu-Silicium-negroni](https://github.com/pawlickerr/Mu-Silicum-negroni) (pawlickerr, Project Silicium): Starting point, board definitions, and UEFI firmware tree for negroni.
 - [slop](https://github.com/MellysInformejtik/slop) (MellysInformejtik / akshaynexus): Negroni XNU kernel patches, device shim, and root tools.
+- [ios-sweet](https://github.com/dipa-studio/ios-sweet) (dipa-studio): Foundational XNU-on-Qualcomm port and root tools.
 - [UniXNU](https://github.com/UniXNU/UniXNU) & [DarwinBoot](https://github.com/UniXNU/DarwinBoot): Unified UEFI boot manager and XNU loader on ARM64.
-- [Mu-Silicium](https://github.com/Project-Silicium/Mu-Silicium) / [Mu-Silicium-negroni](https://github.com/pawlickerr/Mu-Silicium-negroni) (pawlickerr, Project Silicium): TianoCore / Microsoft Project Mu UEFI firmware tree for negroni.
 - [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland) & [hackios-xnu-kernel](https://github.com/oosexgang/hackios-xnu-kernel) (OOSEX GANG): HackiOS userland integration and Mesa/EAGL userspace.
-- [ios-sweet](https://github.com/dipa-studio/ios-sweet) (dipa-studio): The foundational XNU-on-Qualcomm port from which this ecosystem originated.
-- [ios-sailfish](https://github.com/joranv1/ios-sailfish) (joranv1): Working GPU acceleration on iOS (Mesa freedreno + EAGL shim) and fast boot optimizations.
-- [Chlorophyll](https://github.com/ry-diffusion/Chlorophyll) (ry-diffusion): AIR -> NIR -> ir3 Metal driver translation layer.
+- [ios-flame](https://github.com/NWylynko/ios-flame) (NWylynko): Pixel 4 (SM8150) port and userland tools.
 - [metal2vulkan](https://github.com/steelbrain/metal2vulkan) (steelbrain): Metal shading language / API translation to Vulkan.
+- [ios-sailfish](https://github.com/joranv1/ios-sailfish) (joranv1): Working GPU acceleration on iOS (Mesa freedreno + EAGL shim) and fast boot optimizations.
+- [bergamota](https://github.com/ry-diffusion/bergamota) & [Chlorophyll](https://github.com/ry-diffusion/Chlorophyll) (ry-diffusion): Bergamota iOS 18 kernel port and Chlorophyll Metal driver.
+- [UniXNU-pong](https://github.com/Chengdong-Yu/UniXNU-pong) (Chengdong Yu): Nothing Phone 2 (SM8475, Adreno 730) reference port.
 - [Mesa](https://mesa3d.org/) / freedreno: Open-source Gallium Adreno driver and Turnip Vulkan driver.
 - [Apple Inc.](https://opensource.apple.com/): Open-source releases of the XNU kernel and Darwin libraries (APSL 2.0).
 
