@@ -1,0 +1,42 @@
+# Series patches (and slop stage scripts) that the 12377 kernel does not apply. One line each: NAME REASON.
+# Reasons: "upstream: ..." (12377 has it), "in 12377 base 000N" (the base patch holds the ported change),
+# "not needed: ..." (12377 does not need it), "open: ..." (still to port; the kernel builds without it).
+0001-new-clang-drop-removed-auto-var-init-flag.patch upstream: 12377 makedefs no longer pass the removed auto-var-init flag
+0003-negroni-framebuffer-serial-console.patch in 12377 base 0003/0004 (pe_serial.c fbcon outside PL011_UART, protos.h)
+0004-negroni-machine-config.patch in 12377 base 0002/0003 (machine config, GIC, start.s, sleh.c, pe_fiq.c)
+0005-non-pac-build-fixes.patch not needed: 12377 base 0005 builds PAC natively (stage 2) or plain arm64 (stage 1)
+0006-negroni-master-config-open-source-asm-pmap.patch in 12377 base 0002 (MASTER.arm64.negroni from the 12377 MacOSX master)
+0009-negroni-drop-apple-soc-only-exports.patch in 12377 base 0002 (12377 export lists)
+0011-negroni-physmap-alignment-padding.patch in 12377 base 0003 (arm_vm_init.c)
+0016-negroni-device-tree-platform-expert.patch in 12377 base 0004 (NegroniPlatformExpert)
+0018-negroni-boot-cpu-driver.patch in 12377 base 0004 (NegroniCPU)
+0082-negroni-gicr-stride-from-adt.patch in 12377 base 0003 (pe_fiq.c)
+0083-negroni-no-physical-timer-write.patch in 12377 base 0003 (machine_routines.c)
+0084-negroni-irq-trace.patch in 12377 base 0003 (sleh.c)
+0085-negroni-kernel-thread-backtraces.patch in 12377 base 0003 (sleh.c)
+0086-negroni-bt-short-lines.patch in 12377 base 0003 (sleh.c)
+0094-negroni-trace-boot-arg.patch in 12377 base 0003 (sleh.c)
+0126-negroni-pmap-sync-page-64bit.patch in 12377 base 0001 (UniXNU pmap sync 64-bit PA)
+0200-negroni-no-rtc-wait.patch in 12377 base 0004 (IOStartIOKit.cpp)
+0019-stage-libpthread.sh open: libpthread-514 is the xnu-8796 pair; 12377 needs libpthread-539 and its callback ABI
+0019-negroni-builtin-pthread.patch open: needs the 12377 pthread stage (see 0019-stage-libpthread.sh)
+0026-stage-hfs.sh open: hfs-627 is the xnu-8796 pair; the hfs tag of macos-265 must be staged
+0010-negroni-early-framebuffer-debug.patch in 12377 base 0003 (start.s band, negroni_early.c, arm_vm_init.c)
+0012-negroni-keep-debug-console-after-ttbr0.patch in 12377 base 0003/0004 (negroni_early.c, pe_serial.c)
+0017-negroni-device-tree-virtual-timer-irq.patch in 12377 base 0003 (pe_fiq.c vtimer INTID from the ADT)
+0022-negroni-ramdisk-root-without-iomedia.patch in 12377 base 0004 (IOService.cpp)
+0065-negroni-smp-psci.patch in 12377 base 0003/0004 (start.s PSCI entry, NegroniCPU)
+0078-negroni-smp-8-cores.patch in 12377 base 0003/0004 (8 cores)
+0202-negroni-iokit-quiet.patch in 12377 base 0004 (IOService.cpp, IOStartIOKit.cpp)
+0288-negroni-cpu-idle-psci.patch in 12377 base 0003 (negroni_cpuidle.c, cpu.c, sleh.c, pe_fiq.c)
+0002-new-clang-backport-UIO_STACKBUF.patch not needed: 12377 + dxb 26.0 build with Xcode 27.1 without it
+0007-negroni-stub-apple-internal-headers.patch not needed: 12377 + base 0001 (UniXNU) build without the stub headers; 12377 task.c has no t_kpc
+0008-negroni-fill-closed-lib-gaps-kpc-stub.patch in 12377 base 0001 (machine_routines_nos.c; 12377 has kpc.c, amcc via apple_amcc)
+0013-negroni-kmem-rng-without-corecrypto.patch open: 12377 crypto init differs (corecrypto KPI v14); port UniXNU source corecrypto instead
+0014-negroni-kernel-hmac-prng.patch open: same as 0013 (12377 entropy.c/prng_random.c)
+0026-negroni-builtin-hfs.patch open: needs the 12377 HFS stage (see 0026-stage-hfs.sh)
+0041-negroni-hfs-link-notes.patch open: HFS only (bsd/negroni_hfs); waits for the 12377 HFS stage
+0204-negroni-hfs-clonefile.patch open: HFS only (bsd/negroni_hfs); waits for the 12377 HFS stage
+0363-negroni-boot-line-1024.patch not needed: 12377 BOOT_LINE_LENGTH is already 1024
+0362-negroni-kmem-report.patch open: 12377 kmem ranges differ (no kmem_large_ranges/sprayqtn split; kalloc_large reworked); the KMEM report needs a rewrite
+0066-negroni-crash-fault-region.patch open: 12377 VM map uses range locks (no vm_map_lock_read/vm_map_lookup_entry); the fault-region crash line needs a rewrite

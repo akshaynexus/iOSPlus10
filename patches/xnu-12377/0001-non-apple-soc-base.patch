@@ -1,0 +1,356 @@
+From: iOSPlus10 ios26 port
+Subject: [PATCH 0001] non-Apple SoC base for xnu-12377 (from UniXNU-ios26)
+
+Generic changes that let xnu-12377.121.6 build and start on a non-Apple ARMv8/v9 SoC with the PPL-era
+open-source pmap and no KDK KernelSupport archive:
+- machine_routines_nos.c: source for ml_device_is_prod_fused/siq_init/siq_cpu_init (only in KDK archives)
+- link the KDK lib<SoC>.os.<config>.a only when it exists
+- CONFIG_APPLE_AMCC option: AMCC read-only-region code only on Apple SoCs
+- start.s: Apple per-SoC tunables only with APPLE_ARM64_ARCH_FAMILY
+- apple_arm64_cpu.h includes apple_arm64_regs.h (MPIDR_CORETYPE_*)
+- no ml_enable_monitor() without XNU_MONITOR; CleanPoC_DcacheRegion_Force_nopreempt_nohid alias
+- pmap.c: no SART/UAT without XNU_MONITOR; pmap_cs lockdown helpers only with PMAP_CS
+- pmap_sync_page_attributes_phys: ptoa() (64-bit PA; = slop 0126 of the iOS 16 port)
+- -v gives the text console; boot-args are logged
+- device-tree panic region: size checks
+
+Source: UniXNU-ios26 patches/xnu-12377 (01-kernel-support-source, source-machine-layer [without the
+MASTER.arm64.bcm2837 hunk], apple-only-cpu-tunables, non-apple-core-type-header, non-apple-cache-monitor,
+non-apple-iommu-bootstrap, zzx-pmap-sync-64bit-pa, native-verbose-console, native-dt-panic-region),
+commit 68c5134. License: BSD-2-Clause-Patent, Copyright (c) 2026, UniXNU contributors (text in
+docs/ios26-port-status.md, section Licenses).
+
+diff --git a/config/MASTER b/config/MASTER
+index 1b97480..192e99c 100644
+--- a/config/MASTER
++++ b/config/MASTER
+@@ -328,6 +328,8 @@ options		CONFIG_EXCLAVES			# <config_exclaves>
+ # Compile XNU with PPL support.
+ options   CONFIG_PMAP_PPL			# <config_pmap_ppl>
+ 
++options   CONFIG_APPLE_AMCC			# <apple_amcc>
++
+ options   NOS_ARM_ASM			# <nos_arm_asm>
+ options   NOS_ARM_PMAP			# <nos_arm_pmap>
+ 
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index e37762b..0dc88a6 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -1151,9 +1151,12 @@ LD_KERNEL_LIBS	   = -lcc_kext
+ LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel
+ 
+ # Link binary support library
++# (only Apple SoCs have one; BCM2837 builds the machine layer from source)
+ ifneq ($(CURRENT_MACHINE_CONFIG),NONE)
++ifneq ($(wildcard $(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a),)
+         LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
+ endif
++endif
+ 
+ #
+ # Derive SPTM/TXM and Exclaves enablement from the EDM properties.
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 19e7e67..6ae16de 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -84,8 +84,10 @@
+ 
+ #include <arm64/proc_reg.h>
+ #include <pexpert/arm64/boot.h>
++#if XNU_MONITOR
+ #include <arm64/ppl/sart.h>
+ #include <arm64/ppl/uat.h>
++#endif
+ 
+ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)
+ #include <arm64/amcc_rorgn.h>
+@@ -922,6 +924,8 @@ PMAP_SUPPORT_PROTOTYPES(
+ 	vm_prot_t allow_mode,
+ 	int options), ARM_FORCE_FAST_FAULT_INDEX);
+ 
++MARK_AS_PMAP_TEXT static void pmap_phys_write_disable(vm_address_t va);
++
+ MARK_AS_PMAP_TEXT static boolean_t
+ arm_force_fast_fault_with_flush_range(
+ 	ppnum_t ppnum,
+@@ -2334,7 +2338,9 @@ pmap_bootstrap(
+ 	/**
+ 	 * Bootstrap any necessary SART data structures and values needed from the device tree.
+ 	 */
++#if XNU_MONITOR
+ 	sart_bootstrap();
++#endif
+ 
+ 	/**
+ 	 * Don't make any assumptions about the alignment of avail_start before this
+@@ -4947,13 +4953,13 @@ pmap_page_protect_options_with_flush_range(
+ 		if (pvh_ptep_is_iommu(pte_p)) {
+ #if XNU_MONITOR
+ 			if (__improbable(pvh_flags & PVH_FLAG_LOCKDOWN_MASK)) {
+-				panic("pmap_page_protect: ppnum 0x%x locked down, cannot be owned by iommu %p, pve_p=%p",
+-				    ppnum, ptep_get_iommu(pte_p), pve_p);
++				panic("pmap_page_protect: ppnum 0x%x locked down, cannot be owned by iommu ptep %p, pve_p=%p",
++				    ppnum, pte_p, pve_p);
+ 			}
+ #endif
+ 			if (remove && (options & PMAP_OPTIONS_COMPRESSOR)) {
+-				panic("pmap_page_protect: attempt to compress ppnum 0x%x owned by iommu %p, pve_p=%p",
+-				    ppnum, ptep_get_iommu(pte_p), pve_p);
++				panic("pmap_page_protect: attempt to compress ppnum 0x%x owned by iommu ptep %p, pve_p=%p",
++				    ppnum, pte_p, pve_p);
+ 			}
+ 			goto protect_skip_pve_pass1;
+ 		}
+@@ -7235,7 +7241,9 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/* ptoa() widens before the shift: pp << PAGE_SHIFT is a 32-bit shift and drops the high bits of physical
++	 * addresses at or above 4 GiB (all of DRAM on boards whose memory starts there), which phystokv() then rejects. */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP
+@@ -12237,6 +12245,7 @@ pmap_unpin_kernel_pages(vm_offset_t kva __unused, size_t nbytes __unused)
+ #endif /* !XNU_MONITOR */
+ 
+ 
++#if PMAP_CS_PPL_MONITOR || PMAP_CS_INCLUDE_CODE_SIGNING
+ MARK_AS_PMAP_TEXT static inline void
+ pmap_cs_lockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+ {
+@@ -12257,6 +12266,8 @@ pmap_cs_unlockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+ #endif
+ }
+ 
++#endif /* PMAP_CS_PPL_MONITOR || PMAP_CS_INCLUDE_CODE_SIGNING */
++
+ /**
+  * Perform basic validation checks on the destination only and
+  * corresponding offset/sizes prior to writing to a read only allocation.
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 756af52..0ac4b57 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2164,7 +2164,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	arm_vm_physmap_init(args);
+ 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
+ 
++#if XNU_MONITOR
+ 	ml_enable_monitor();
++#endif
+ 
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+diff --git a/osfmk/arm64/caches_asm.s b/osfmk/arm64/caches_asm.s
+index 1588830..58a91a8 100644
+--- a/osfmk/arm64/caches_asm.s
++++ b/osfmk/arm64/caches_asm.s
+@@ -304,6 +304,10 @@ L_cpudr_loop:
+  */
+ 	.text
+ 	.align 2
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++	.globl EXT(CleanPoC_DcacheRegion_Force_nopreempt_nohid)
++LEXT(CleanPoC_DcacheRegion_Force_nopreempt_nohid)
++#endif
+ LEXT(CleanPoC_DcacheRegion_internal)
+ 	dsb		sy
+ 	CLEANPOC_DCACHEREGION
+diff --git a/osfmk/arm64/machine_routines_nos.c b/osfmk/arm64/machine_routines_nos.c
+new file mode 100644
+index 0000000..523fe6c
+--- /dev/null
++++ b/osfmk/arm64/machine_routines_nos.c
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/*
++ * Source for the machine routines that xnu-12377 only ships as
++ * machine_routines_nos.o in the KDK KernelSupport archives
++ * (lib<SoC>.os.<config>.a). Behaviour follows the T8101 object of the
++ * macOS 26.5.2 (25F84) KDK, without its Apple SPRR programming.
++ */
++#include <arm/machine_routines.h>
++#include <pexpert/device_tree.h>
++
++boolean_t
++ml_device_is_prod_fused(void)
++{
++	DTEntry chosen = NULL;
++	void const *value = NULL;
++	unsigned int size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess) {
++		return FALSE;
++	}
++	if (SecureDTGetProperty(chosen, "certificate-production-status", &value, &size) != kSuccess ||
++	    size != sizeof(uint32_t)) {
++		return FALSE;
++	}
++	return *(uint32_t const *)value;
++}
++
++/* SIQ is an SPTM-platform interrupt facility; arm_init_sptm.c is its only caller. */
++void
++siq_init(void)
++{
++}
++
++void
++siq_cpu_init(void)
++{
++}
+diff --git a/osfmk/arm64/sptm/pmap/pmap.c b/osfmk/arm64/sptm/pmap/pmap.c
+index 3622ef2..54faef4 100644
+--- a/osfmk/arm64/sptm/pmap/pmap.c
++++ b/osfmk/arm64/sptm/pmap/pmap.c
+@@ -7568,7 +7568,9 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/* ptoa() widens before the shift: pp << PAGE_SHIFT is a 32-bit shift and drops the high bits of physical
++	 * addresses at or above 4 GiB (all of DRAM on boards whose memory starts there), which phystokv() then rejects. */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 6aa6fe4..d16045d 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -33,7 +33,9 @@
+ #include <pexpert/arm64/board_config.h>
+ #include <mach_assert.h>
+ #include <machine/asm.h>
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ #include <arm64/tunables/tunables.s>
++#endif
+ #include <arm64/exception_asm.h>
+ 
+ #if __ARM_KERNEL_PROTECT__
+@@ -781,10 +783,13 @@ common_start:
+ 	// Initialization common to all non-virtual Apple targets
+ #endif  // APPLE_ARM64_ARCH_FAMILY
+ 
++
++#if defined(APPLE_ARM64_ARCH_FAMILY)
+ 	// Read MIDR before start of per-SoC tunables
+ 	mrs x12, MIDR_EL1
+ 
+ 	APPLY_TUNABLES x12, x13, x14
++#endif
+ 
+ #if HAS_CLUSTER && !NO_CPU_OVRD
+ 	// Unmask external IRQs if we're restarting from non-retention WFI
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index 878b515..d24eea1 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -35,10 +35,10 @@ osfmk/arm64/WKdmCompress_4k.s	standard
+ osfmk/arm64/WKdmData.s		standard
+ osfmk/arm64/lz4_decode_arm64.s  standard
+ osfmk/arm64/lz4_encode_arm64.s  standard
+-osfmk/arm64/amcc_rorgn_ppl.c optional nos_arm_asm config_pmap_ppl
+-osfmk/arm64/amcc_rorgn_ppl_amcc.c optional nos_arm_asm config_pmap_ppl
+-osfmk/arm64/amcc_rorgn_common.c optional nos_arm_asm
+-osfmk/arm64/amcc_rorgn_pv_ctrr.c optional nos_arm_asm
++osfmk/arm64/amcc_rorgn_ppl.c optional nos_arm_asm config_pmap_ppl apple_amcc
++osfmk/arm64/amcc_rorgn_ppl_amcc.c optional nos_arm_asm config_pmap_ppl apple_amcc
++osfmk/arm64/amcc_rorgn_common.c optional nos_arm_asm apple_amcc
++osfmk/arm64/amcc_rorgn_pv_ctrr.c optional nos_arm_asm apple_amcc
+ osfmk/arm64/bcopy.s standard
+ osfmk/arm64/bzero.s standard
+ osfmk/arm/caches.c		standard
+@@ -72,6 +72,7 @@ osfmk/arm64/machine_routines.c		standard
+ osfmk/arm64/machine_routines_asm.s	optional nos_arm_asm
+ osfmk/arm64/machine_task.c		standard
+ osfmk/arm/machine_routines_apple.c	optional nos_arm_asm
++osfmk/arm64/machine_routines_nos.c	optional nos_arm_asm
+ osfmk/arm/pal_routines.c		standard
+ osfmk/arm/preemption_disable.c	standard
+ osfmk/arm64/mcount.s		optional profile
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index c977c98..101dc31 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -527,6 +527,7 @@ kernel_bootstrap(void)
+ 	code_signing_config_t cs_config;
+ 
+ 	printf("%s\n", version); /* log kernel version */
++	printf("Kernel boot args: %s\n", PE_boot_args());
+ 
+ #if HAS_UPSI_FAILURE_INJECTION
+ 	check_for_failure_injection(XNU_STAGE_BOOTSTRAP_START);
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index db1c4a0..992b08c 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -128,7 +128,7 @@ pe_init_fill_buffer_from_property(DTEntry entry, const char *property_name, char
+ static void
+ check_for_panic_log(void)
+ {
+-#ifdef PLATFORM_PANIC_LOG_PADDR
++#if defined(PLATFORM_PANIC_LOG_PADDR) && !(defined(XNU_DT_PANIC_REGION) && XNU_DT_PANIC_REGION)
+ 	gPanicBase = ml_io_map_wcomb(PLATFORM_PANIC_LOG_PADDR, PLATFORM_PANIC_LOG_SIZE);
+ 	panic_text_len = PLATFORM_PANIC_LOG_SIZE - sizeof(struct embedded_panic_header);
+ 	gPanicSize = PLATFORM_PANIC_LOG_SIZE;
+@@ -158,7 +158,10 @@ check_for_panic_log(void)
+ 		return;
+ 	}
+ 
+-	if (kSuccess != SecureDTGetProperty(entry, "reg", (void const **)&reg_prop, &size)) {
++	if (kSuccess != SecureDTGetProperty(entry, "reg", (void const **)&reg_prop, &size) ||
++	    size != 2 * sizeof(*reg_prop) || !reg_prop[0] ||
++	    reg_prop[1] < sizeof(struct embedded_panic_header) ||
++	    reg_prop[0] > UINTPTR_MAX - reg_prop[1]) {
+ 		return;
+ 	}
+ 
+@@ -166,11 +169,17 @@ check_for_panic_log(void)
+ 		return;
+ 	}
+ 
+-	if (kSuccess != SecureDTGetProperty(chosen, "embedded-panic-log-size", (void const **) &panic_region_length, &size)) {
++	if (kSuccess != SecureDTGetProperty(chosen, "embedded-panic-log-size", (void const **) &panic_region_length, &size) ||
++	    size != sizeof(*panic_region_length) ||
++	    panic_region_length[0] < sizeof(struct embedded_panic_header) ||
++	    panic_region_length[0] > reg_prop[1]) {
+ 		return;
+ 	}
+ 
+ 	gPanicBase = ml_io_map_wcomb(reg_prop[0], panic_region_length[0]);
++	if (!gPanicBase) {
++		return;
++	}
+ 
+ 	/* Deduct the size of the panic header from the panic region size */
+ 	panic_text_len = panic_region_length[0] - sizeof(struct embedded_panic_header);
+@@ -552,7 +561,10 @@ PE_create_console(void)
+ 	 */
+ 	check_for_panic_log();
+ 
+-	if (PE_state.video.v_display) {
++	/* The ARM graphics path otherwise ignores -v and hides the kernel log. */
++	int verbose = 0;
++	PE_parse_boot_argn("-v", &verbose, sizeof(verbose));
++	if (PE_state.video.v_display && !verbose) {
+ 		PE_initialize_console(&PE_state.video, kPEGraphicsMode);
+ 	} else {
+ 		PE_initialize_console(&PE_state.video, kPETextMode);
+diff --git a/pexpert/pexpert/arm64/apple_arm64_cpu.h b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+index e462ede..2138af0 100644
+--- a/pexpert/pexpert/arm64/apple_arm64_cpu.h
++++ b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+@@ -28,6 +28,9 @@
+ 
+ #pragma once
+ 
++/* MPIDR_CORETYPE_*, which apple_arm64_common.h includes first on Apple boards only. */
++#include <pexpert/arm64/apple_arm64_regs.h>
++
+ #if !defined(__ASSEMBLER__)
+ 
+ #include <stdbool.h>
