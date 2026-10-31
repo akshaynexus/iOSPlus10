@@ -1,0 +1,42 @@
+Linux build only: with stock clang every kalloc type is data-only (xnu_clang_compat.h), so no fixed or
+variable type view is left to place and the DEVELOPMENT asserts in the iterators fired at boot
+("kalloc.c:1264 Assertion failed: c_idx == p_idx", Mi A3 first boot 2026-10-31). Return early instead.
+--- a/osfmk/kern/kalloc.c
++++ b/osfmk/kern/kalloc.c
+@@ -1784,6 +1784,18 @@
+ 	 */
+ 	kt_count = kalloc_type_view_parse(KTV_FIXED);
+ 	assert(kt_count < KALLOC_TYPE_SIZE_MASK);
++#if XNU_NO_TYPE_BUILTINS
++	/*
++	 * Stock clang has no __builtin_xnu_type_summary: xnu_clang_compat.h calls every
++	 * type data-only, so kalloc_type_view_copy() sent every fixed view to the data
++	 * heap and none is left to place. The iterator below assumes at least one view
++	 * (assert c_idx == p_idx), so stop here: there are no type zones to create.
++	 */
++	if (kt_count == 0) {
++		printf("kalloc_type: no fixed type views left (stock clang: all data), no type zones\n");
++		return;
++	}
++#endif
+ 
+ #if DEBUG || DEVELOPMENT
+ 	vm_size_t sig_slist_size = (size_t) kt_count * sizeof(uint16_t);
+@@ -1904,6 +1916,17 @@
+ 	 */
+ 	kt_count = kalloc_type_view_parse(KTV_VAR);
+ 	assert(kt_count < UINT32_MAX);
++#if XNU_NO_TYPE_BUILTINS
++	/*
++	 * Same as the fixed views: with every type data-only (stock clang) no variable
++	 * view needs a heap; the heaps above exist, the iterators assume kt_count > 1.
++	 */
++	if (kt_count <= 1) {
++		printf("kalloc_type: %llu variable type views left (stock clang: all data), no heap assignment\n",
++		    (unsigned long long)kt_count);
++		return;
++	}
++#endif
+ 
+ #if DEBUG || DEVELOPMENT
+ 	vm_size_t sig_slist_size = (size_t) kt_count * sizeof(uint32_t);

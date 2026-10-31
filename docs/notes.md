@@ -3418,3 +3418,8 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - [V] Host: Google platform-tools 37.0.1 in ~/.local/bin (scripts/setup/platform-tools.sh); distro fastboot 37.0.0 behaves the same.
 - Shim: draws into the buffer the MDP scans out (patches/laurel/shim/0001: VIG0/DMA0/DMA1 SRC0_ADDR/stride/format),
   first lines `FB <addr>`, `pipe= fmt=`, `stride= bpp=`.
+- [V] First boot from boot_b (2026-10-31 23:11): shim + Gold handoff + XNU early console work (photo). Panic after
+  "VM bootstrap done": `kalloc.c:1264 Assertion failed: c_idx == p_idx`. Cause: Linux build only. Stock clang has no
+  `__builtin_xnu_type_summary`; ios-sweet-linux's compat header calls every type data-only, so every kalloc_type
+  view goes to the data heap and the fixed/var iterators run with 0 views (DEVELOPMENT asserts).
+  Fix: `patches/laurel/xnu-linux-fixes/0102` (return early when no view is left, one log line).
