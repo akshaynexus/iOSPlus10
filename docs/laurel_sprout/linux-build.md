@@ -43,3 +43,27 @@ Note: clang 23 is newer than the clang 18 that ios-sweet-linux uses on CI; more 
 The build runs third-party code: the ios-sweet-linux scripts (pinned commit), theos (pinned commit) and a
 prebuilt toolchain tarball from `L1ghtmann/llvm-project` release `test-210562a`. Review them before the first run.
 A stricter path builds cctools-port from source with `external/xnu-linux-toolchain/bootstrap.sh`.
+
+## Measured (2026-10-31, CachyOS, 20 cores, clang 23)
+
+| Step | Wall | CPU | Cores busy |
+| --- | --- | --- | --- |
+| fetch (toolchain, SDK, xnu tag from the local mirror `out/laurel-kernel/cache/xnu.git`; parallel) | 0-4 s | — | — |
+| patch + deps (apply 201 patches **parallel with** stage 1 host tools) | 7.5 s | 1.9 s | 0.3 |
+| kernel (make -j20 + iig relink) | 27.8 s | 426 s | **15.3 of 20** (the final link + dsymutil is serial) |
+| total | 36 s | | |
+
+Fixes found on the way:
+- `libfirehose_kernel.a` was built without `-mcpu=cortex-a53` and had 11 LSE/LDAPR instructions (would trap on the
+  Kryo 260 at the first kernel log). The script now builds it for cortex-a53 and **fails** on any LSE/RCpc instruction.
+- clang 23: `-Wincompatible-pointer-types` is an error (`patches/laurel/xnu-linux-fixes/0101`).
+- Install `ccache` (`pacman -S ccache` / `apt install ccache`): the script uses it when present.
+
+## Multicore: PAGES=4k (default)
+
+`PAGES=4k` sets `TOPAZ_4K=1` (topaz 0140/0141/0142): 4 KiB pages, so the Silver A53 cores (no 16K granule) can run
+XNU. Gold A73 = P cluster (boot CPU 0x100), Silver = E cluster, Edge scheduler, `MAX_CPU_CLUSTERS 2`. The script checks
+that the 4K code is in the kernel (`_sweet_early_fb_mapped`; kernel base 0xfffffff007... instead of 0xfffffe0007...).
+`PAGES=16k` builds the topaz CI kernel (4 Gold cores only) as a fallback.
+The ADT must list the 8 CPUs with `cluster-type` = `'P'` (0x50) for 0x100-0x103 and `'E'` (0x45) for 0x0-0x3
+(`osfmk/arm64/machine_routines.c:1036`); topaz `mkadt.py` emits only the 4 Gold cores, so our ADT builder must do this.
