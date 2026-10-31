@@ -9,6 +9,10 @@ been quiet for --quiet ms, prints what it dropped, and releases the interface.
   scripts/laurel/fastboot-drain.py [--serial SERIAL] [--quiet 300]            drain only
   scripts/laurel/fastboot-drain.py getvar NAME                                one getvar
   scripts/laurel/fastboot-drain.py flash PARTITION FILE                       download + flash
+      (in sparse pieces of --piece MiB, default 8: a fastboot session entered with the buttons takes
+       only ~16 MiB per download; the reported max-download-size of 768 MiB holds only after
+       'adb reboot bootloader'. Each piece is a whole-partition sparse image: RAW for its slice,
+       DONT_CARE elsewhere, as 'fastboot flash -S' sends it.)
   scripts/laurel/fastboot-drain.py reboot | reboot-bootloader
 Why: on this ABL the stock fastboot client gets out of step (each command receives the previous
 answer), so it refuses uploads ("download size is more than max allowed") and boots. Every command
@@ -94,6 +98,38 @@ def _command(fd, ep_in, ep_out, cmd, timeout_ms):
         return st, txt
 
 
+def sparse_pieces(data, piece, blk=4096):
+    """Android sparse images, each RAW for one slice of data and DONT_CARE for the rest."""
+    if len(data) % blk:
+        data += b'\0' * (blk - len(data) % blk)
+    total = len(data) // blk
+    per = max(1, piece // blk)
+    out = []
+    for start in range(0, total, per):
+        n = min(per, total - start)
+        chunks = []
+        if start:
+            chunks.append(struct.pack('<HHII', 0xCAC3, 0, start, 12))
+        chunks.append(struct.pack('<HHII', 0xCAC1, 0, n, 12 + n * blk) + data[start * blk:(start + n) * blk])
+        if start + n < total:
+            chunks.append(struct.pack('<HHII', 0xCAC3, 0, total - start - n, 12))
+        hdr = struct.pack('<IHHHHIIII', 0xED26FF3A, 1, 0, 28, 12, blk, total, len(chunks), 0)
+        out.append(hdr + b''.join(chunks))
+    return out
+
+
+def download(fd, ep_in, ep_out, data):
+    st, txt = command(fd, ep_in, ep_out, f'download:{len(data):08x}')
+    if st != 'DATA' or int(txt, 16) != len(data):
+        sys.exit(f'fastboot-drain: download refused: {st} {txt}')
+    for off in range(0, len(data), CHUNK):
+        if bulk(fd, ep_out, data[off:off + CHUNK], 10000) is None:
+            sys.exit(f'fastboot-drain: upload stopped at {off} of {len(data)}')
+    r = bulk(fd, ep_in, 256, 30000)
+    if r is None or r[:4] != b'OKAY':
+        sys.exit(f'fastboot-drain: download not confirmed: {r!r}')
+
+
 def drain(fd, ep_in, quiet):
     dropped = 0
     while True:
@@ -109,6 +145,7 @@ def main():
     ap.add_argument('--serial')
     ap.add_argument('--quiet', type=int, default=300)
     ap.add_argument('--probe', action='store_true')
+    ap.add_argument('--piece', type=int, default=8, help='sparse piece size in MiB for flash')
     ap.add_argument('cmd', nargs='*')
     a = ap.parse_args()
     path, itf, ep_in, ep_out = find(a.serial)
@@ -129,25 +166,15 @@ def main():
             rc = st != 'OKAY'
         elif c[0] == 'flash' and len(c) == 3:
             data = open(c[2], 'rb').read()
-            # no getvar: on Xiaomi ABLs getvar leaves the bootloader in a bad state (topaz NOTES.md:38
-            # "NEVER fastboot getvar"); the limit was read once in a clean session (805306368 bytes)
-            if len(data) > MAX_DOWNLOAD:
-                sys.exit(f'fastboot-drain: {c[2]} is {len(data)} bytes, more than max-download-size {MAX_DOWNLOAD}')
-            st, txt = command(fd, ep_in, ep_out, f'download:{len(data):08x}')
-            if st != 'DATA' or int(txt, 16) != len(data):
-                sys.exit(f'fastboot-drain: download refused: {st} {txt}')
-            # 16 KiB writes, as the stock fastboot client on Linux (usbfs bulk size): with 1 MiB writes
-            # this ABL stopped taking data at exactly 16 MiB and reset (2026-10-31, twice)
-            for off in range(0, len(data), CHUNK):
-                if bulk(fd, ep_out, data[off:off + CHUNK], 10000) is None:
-                    sys.exit(f'fastboot-drain: upload stopped at {off}')
-            r = bulk(fd, ep_in, 256, 30000)
-            if r is None or r[:4] != b'OKAY':
-                sys.exit(f'fastboot-drain: download not confirmed: {r!r}')
-            print(f'fastboot-drain: sent {len(data)} bytes')
-            st, txt = command(fd, ep_in, ep_out, f'flash:{c[1]}', 120000)
-            print(f'fastboot-drain: flash {c[1]}: {st} {txt}')
-            rc = st != 'OKAY'
+            # no getvar: on Xiaomi ABLs getvar leaves the bootloader in a bad state (topaz NOTES.md:38)
+            pieces = sparse_pieces(data, a.piece << 20) if len(data) > (a.piece << 20) else [data]
+            for i, p in enumerate(pieces):
+                download(fd, ep_in, ep_out, p)
+                st, txt = command(fd, ep_in, ep_out, f'flash:{c[1]}', 120000)
+                print(f'fastboot-drain: flash {c[1]} piece {i + 1}/{len(pieces)} ({len(p)} bytes): {st} {txt}')
+                if st != 'OKAY':
+                    rc = 1
+                    break
         elif c[0] in ('reboot', 'reboot-bootloader') and len(c) == 1:
             st, txt = command(fd, ep_in, ep_out, c[0])
             print(f'fastboot-drain: {c[0]}: {st} {txt}')
