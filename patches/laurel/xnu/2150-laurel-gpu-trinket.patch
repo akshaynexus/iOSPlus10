@@ -1,45 +1,125 @@
-laurel 2150: Adreno 610 on the Mi A3 (SM6125 trinket), on by default (gpu=0 = kill switch). TopazAdreno.cpp (topaz 0901-0947) with the trinket values of the stock 4.14 kernel: zap carve-out 0x57515000, gpucc-trinket alpha PLLs (PLL0 +0x0, PLL1 +0x100, gfx3d = AUX2/2, OPPs 320-950 MHz for gpu_mhz) instead of khaje's Zonda PLL, GX GDSC without the GMU-era sw-reset/clamp registers, gcc_gpu_cfg_ahb + gcc_sys_noc_compute_sf_axi on, kgsl chip id 0x06010000 and highest bank bit 14 (NC_MODE_CNTL 0xb, UCHE_MODE_CNTL hbb). The zap shader (a610_zap.mdt + .bNN, signed for this SoC/OEM) and the SQE (a630_sqe.fw) come from the root (/usr/share/firmware/laurel, installed by scripts/laurel/root-add-gpu.sh from the phone's own vendor image); the built-in topaz SQE is the fallback, the zap has none. The 6860-byte zap metadata spans two 4 KB pages (TOPAZ_4K): the contiguous pool buffer is used. GPU pool at run time: DDR after the kernel's DarwinBoot window, [align64M(max(kernel end, 0xC0000000)), 0xE0000000) (TopazModem's pool starts at 0xE0000000), else kernel memory below 4 GiB (gpu_midmem). Self-check: one CP fence write through UCHE/SMMU/DDR after ME_INIT. One line: 'LAUREL GPU: on: Adreno 610 chip 0x06010000, core 300 MHz, zap PAS 13 at 0x57515000 (own a610_zap, ...), SQE own ..., SMMU pass-through, pool ...; RedwoodGPU published' or 'LAUREL GPU: off: <step> failed: <reason>'. A failure leaves RedwoodGPU unpublished: backboardd keeps its software renderer.
+laurel 2150: Adreno 610 on the Mi A3 (SM6125 trinket), on by default (gpu=0 = kill switch). TopazAdreno.cpp (topaz 0901-0947) with the trinket values of the stock 4.14 kernel: zap carve-out 0x57515000 (laurel_sprout-trinket-memory.dtsi:34), GX GDSC without the GMU-era sw-reset/clamp registers, gcc_gpu_cfg_ahb + gcc_sys_noc_compute_sf_axi on, no write to 0x1060 (no such clock on trinket), kgsl chip id 0x06010000 and highest bank bit 14 (NC_MODE_CNTL 0xb, UCHE_MODE_CNTL hbb). Core 300 MHz from GPLL0 only: gfx3d votes the CX rail and nothing votes it; topaz's gpu_mhz is removed (no tuning boot-args). Zap shader (a610_zap.mdt + .bNN, signed for this SoC/OEM) and SQE (a630_sqe.fw) from the root (/usr/share/firmware/laurel, scripts/laurel/root-add-gpu.sh); the built-in topaz SQE is the fallback, the zap has none; the 6860-byte metadata spans two 4 KB pages (TOPAZ_4K): a contiguous pool buffer. GPU pool = the largest ADT /chosen laurel-ram-reserved range (area A 2100 map: 0xC0000000 + 512 MiB) that is >= 128 MiB, below 4 GiB, inside laurel-ram-banks and outside kernel RAM and TopazModem's pool; none -> kernel memory below 4 GiB (gpu_midmem). Self-check: one CP fence write (CP -> UCHE -> SMMU -> DDR) after ME_INIT, the last seqno written back. RedwoodGPU.cpp: with the SMMU in pass-through only backboardd may open the GPU (GPU VA = PA); its open marks GL as loaded (topaz_gpu_gl_active, read by 2151/2152); a surface is shared with the GPU only below 4 GiB (topaz: 36 bits) and never from a cached scanout slot. Lines: 'TopazGPU: kernel RAM ..., GPU pool ... (ADT laurel-ram-reserved)', 'LAUREL GPU: on: Adreno 610 chip 0x06010000, core 300 MHz, zap PAS 13 at 0x57515000 (own a610_zap, ...), SQE own ..., SMMU pass-through, pool ...; RedwoodGPU published' or 'LAUREL GPU: off: <step> failed: <reason>', 'LAUREL GPU: GL: backboardd opened the GPU ...', 'LAUREL GPU: client X refused: ...'. A failure leaves RedwoodGPU unpublished: backboardd keeps its software renderer.
 
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index a4e5569..d3fa332 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -56,6 +56,7 @@ bool redwood_gpu_identity(void);
+ uint64_t topaz_gpu_pool_alloc(uint64_t size, void ** va);
+ IOMemoryDescriptor * topaz_gpu_pool_md(uint64_t pa, uint64_t size);
+ bool topaz_gpu_midmem(void);
++void topaz_gpu_gl_opened(void);                 /* laurel 2150 (TopazAdreno.cpp): backboardd's GL has the GPU */
+ bool redwood_gpu_parameter(uint32_t which, uint64_t * value);
+ uint64_t redwood_gpu_address(uint64_t size);
+ void redwood_gpu_address_free(uint64_t address, uint64_t size);
+@@ -460,19 +461,35 @@ RedwoodGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32
+ bool
+ RedwoodGPUUserClient::start(IOService * provider)
+ {
++	char name[32];
++
++	proc_selfname(name, sizeof(name));
++	/*
++	 * laurel 2150: with the SMMU in pass-through (gpu_identity, the default) a GPU address is a physical
++	 * address: a command stream of any client could write kernel memory or a TrustZone carve-out (an access
++	 * fault resets the SoC). Until the stage-1 tables are in use, only the window server may open the GPU.
++	 */
++	if (redwood_gpu_identity() && strcmp(name, "backboardd") != 0) {
++		static uint32_t refused;
++		if (refused++ < 8) {
++			IOLog("LAUREL GPU: client %s refused: SMMU pass-through (GPU VA = PA), only backboardd may open the GPU\n", name);
++		}
++		return false;
++	}
+ 	if (!redwood_gpu_ready() || !IOUserClient::start(provider)) {
+ 		return false;
+ 	}
+ 	{
+-		/* topaz: who connects (the backboardd loader knocks once before and once after loading GL) */
++		/* topaz: who connects */
+ 		static uint32_t opens;
+-		char name[32];
+-		proc_selfname(name, sizeof(name));
+ 		if (opens++ < 32) {
+ 			IOLog("RedwoodGPU: client %s (open %u)\n", name, opens);
+ 		}
+ 	}
+ 	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	if (fBuffers != NULL && strcmp(name, "backboardd") == 0) {
++		topaz_gpu_gl_opened();                  /* only backboardd's Mesa opens the GPU: GL is loaded */
++	}
+ 	return fBuffers != NULL;
+ }
+ 
+@@ -886,7 +903,12 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 		 * allocSize was often someone else's page: garbage in text textures.
+ 		 */
+ 		uint64_t need = s->wrapped ? s->memory->getLength() : s->allocSize;
+-		if (phys == 0 || length < need || phys + need > (1ull << 36) || (s->wrapped && s->wrapDelta != 0)) {
++		/*
++		 * laurel 2150: below 4 GiB (the GPU does not reach DRAM above it, TopazGpuW; topaz allowed 36 bits), and
++		 * no scanout-slot surface: those are cached CPU memory, the GPU would read DRAM behind the cache.
++		 */
++		if (phys == 0 || length < need || phys + need > (1ull << 32) || (s->wrapped && s->wrapDelta != 0) ||
++		    (s->scanoutSlot >= 0 && !s->gpuPool)) {
+ 			static uint32_t told;
+ 			if (told++ < 16) {
+ 				IOLog("RedwoodGPU: surface %u (%ux%u, %u bytes) not shared: phys %#llx, contiguous %llu bytes, "
 diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 16da336..fd1679d 100644
 --- a/iokit/Kernel/arm/TopazAdreno.cpp
 +++ b/iokit/Kernel/arm/TopazAdreno.cpp
-@@ -16,6 +16,16 @@
+@@ -15,12 +15,27 @@
+  * Boot-arg gpu=1: a thread waits for the root filesystem, loads the firmware
   * (/usr/share/firmware/topaz/{a610_zap.mdt,a610_zap.b02,a630_sqe.fw}), starts
   * the GPU and publishes the RedwoodGPU service. gpu_mhz=600 runs the core at
-  * 600 MHz instead of 300.
+- * 600 MHz instead of 300.
++ * 600 MHz instead of 300. (laurel 2150: gpu_mhz is gone, see below.)
 + *
 + * laurel 2150 (Xiaomi Mi A3, SM6125 "trinket", the same Adreno 610): on by default, boot-arg gpu=0 is the
 + * kill switch. Trinket values from the stock 4.14 kernel (laurel-kernel-los): zap carve-out 0x57515000
-+ * (trinket.dtsi), gpucc-trinket.c (GX GDSC without the GMU-era sw-reset/clamp registers, alpha PLLs
-+ * PLL0 at +0x0 / PLL1 at +0x100 instead of khaje's Zonda PLL), kgsl qcom,chipid 0x06010000 and
-+ * qcom,highest-bank-bit 14 (trinket-gpu.dtsi). The zap shader is signed per SoC/OEM: it and the SQE come
-+ * from the phone's own vendor image, installed on the root by scripts/laurel/root-add-gpu.sh
-+ * (/usr/share/firmware/laurel/a610_zap.mdt + .bNN, a630_sqe.fw); topaz's embedded SQE is the fallback.
-+ * The GPU pool lies in DDR outside the kernel's RAM (below the modem pool, below 4 GiB); without room
-+ * there GPU memory is the kernel's own (gpu_midmem). One line: "LAUREL GPU: on: ..." or "off: <reason>".
++ * (dts/xiaomi/laurel_sprout/laurel_sprout-trinket-memory.dtsi:34; qcom/trinket.dtsi has 0x57115000, which the
++ * laurel file overrides), gpucc-trinket.c (GX GDSC without the GMU-era sw-reset/clamp registers), kgsl
++ * qcom,chipid 0x06010000 and qcom,highest-bank-bit 14 (trinket-gpu.dtsi). The core runs at 300 MHz from
++ * GPLL0 only: gfx3d votes the CX rail (gpucc-trinket.c), nothing here votes it, and 300 MHz is below the
++ * lowest level's 320 MHz limit. The zap shader is signed per SoC/OEM: it and the SQE come from the phone's
++ * own vendor image, installed on the root by scripts/laurel/root-add-gpu.sh (/usr/share/firmware/laurel/
++ * a610_zap.mdt + .bNN, a630_sqe.fw); topaz's embedded SQE is the fallback. The GPU pool is the range the
++ * ADT reserves for it (/chosen laurel-ram-reserved, mkadt.py; area A's memory map: 0xC0000000 + 512 MiB),
++ * checked against laurel-ram-banks, the kernel's RAM and TopazModem's pool; without one GPU memory is the
++ * kernel's own below 4 GiB (gpu_midmem). The SMMU passes addresses through (GPU VA = PA), so only backboardd
++ * may open the GPU (RedwoodGPU.cpp). One line: "LAUREL GPU: on: ..." or "off: <reason>".
   */
  #include <IOKit/IOLib.h>
  #include <IOKit/IOBufferMemoryDescriptor.h>
-@@ -34,6 +44,9 @@
+ #include <IOKit/IOLocks.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ 
+@@ -34,6 +49,11 @@ void topaz_fw_free(void *data, size_t size);
  int topaz_root_mounted(void);
  void RedwoodGPUStart(void);
  void topaz_adreno_init(void);
 +bool topaz_gpu_wanted(void);
 +bool topaz_gpu_ready(void);
++bool topaz_gpu_gl_active(void);
++void topaz_gpu_gl_opened(void);
 +extern unsigned long gPhysBase, gPhysSize;
  extern const uint8_t topaz_fw_zap_mdt[], topaz_fw_zap_b02[], topaz_fw_sqe_fw[];
  extern const size_t topaz_fw_zap_mdt_size, topaz_fw_zap_b02_size, topaz_fw_sqe_fw_size;
  
-@@ -64,7 +77,7 @@
+@@ -64,7 +84,7 @@ uint32_t gpu_log;
  #define SMMU_BASE       0x059A0000ull
  #define SMMU_SIZE       0x10000
  #define SMMU_CB0        0x8000
 -#define ZAP_REGION      0x55B15000ull
-+#define ZAP_REGION      0x57515000ull   /* laurel: trinket.dtsi gpu zap (topaz khaje: 0x55B15000) */
++#define ZAP_REGION      0x57515000ull   /* laurel: laurel_sprout-trinket-memory.dtsi:34 (topaz khaje: 0x55B15000) */
  #define ZAP_REGION_SIZE 0x2000
  #define GPU_PAS_ID      13
  
-@@ -98,10 +111,15 @@
+@@ -98,10 +118,15 @@ uint32_t gpu_log;
  /* topaz: all kernel RAM is the upper DDR bank (0x1_40000000+): the SMMU takes 36-bit output addresses */
  #define LOW_MASK            0x0000000ffffff000ull
  
@@ -57,22 +137,22 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  static uint32_t wptr, seqno, core_mhz = 300;
  static IOLock *hw_lock;
  
-@@ -159,11 +177,22 @@
+@@ -159,11 +184,22 @@ kbuf_pa(struct kbuf *b, uint64_t off)
   * reserved regions in the stock DT, not given to the kernel): a pool of it is
   * the GPU's, mapped write-combined (Normal non-cacheable: no cache upkeep).
   */
 -#define GPU_POOL_BASE       0x90000000ull
 -#define GPU_POOL_SIZE       0x40000000ull       /* 1 GB */
 +/*
-+ * laurel: the Mi A3 has DDR 0x80000000-0x1BFFFFFFF in one piece (the live FDT through Mu, 6 GB model) and the
-+ * kernel gets only its DarwinBoot window (ADT dram, 0x81000000+). The pool is DDR behind that window, below
-+ * TopazModem's 0xE0000000 and below 4 GiB: [align64M(kernel end, 0xC0000000), 0xE0000000), at most 1 GB.
-+ * gpu_pool_place() picks it at start; with less than 128 MB there the GPU takes kernel memory (gpu_midmem).
++ * laurel: the pool is the range the ADT reserves for it: /chosen laurel-ram-reserved (u64 base/size pairs,
++ * mkadt.py; area A's map: 0xC0000000 + 512 MiB GPU, 0xE0000000 + 16 MiB modem). gpu_pool_place() takes the
++ * largest reserved range that is >= 128 MiB, below 4 GiB, 64 MiB aligned, inside one /chosen laurel-ram-banks
++ * range, and outside the kernel's RAM and TopazModem's pool. None: the GPU takes kernel memory (gpu_midmem).
 + */
-+#define GPU_POOL_LOW        0xC0000000ull       /* above every Mu/DarwinBoot use [I] and the 0x80000000 bank's kernel window */
-+#define GPU_POOL_TOP        0xE0000000ull       /* TopazModem's pool starts here */
 +#define GPU_POOL_MIN        0x08000000ull       /* 128 MB */
 +#define GPU_POOL_MAX        0x40000000ull       /* 1 GB */
++#define MODEM_POOL          0xE0000000ull       /* TopazModem.cpp MODEM_POOL_BASE + 16 MB */
++#define MODEM_POOL_END      0xE1000000ull
  #define GPU_POOL_UNIT       0x10000ull          /* 64 KB */
  #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MB: mapped on first use (1 GB at once is more IO space than there is) */
 -#define GPU_POOL_CHUNKS     (GPU_POOL_SIZE / GPU_POOL_CHUNK)
@@ -83,7 +163,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  static uint8_t *gpu_chunk_va[GPU_POOL_CHUNKS];
  static bool gpu_pool_ready;
  static struct { uint64_t start, size; } pool_free[2048];
-@@ -246,12 +275,12 @@
+@@ -246,12 +282,12 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
  	uint64_t pa;
  
  	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
@@ -98,7 +178,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  			range_free(pool_free, &pool_free_count, 2048, GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT);
  		}
  		gpu_pool_ready = true;
-@@ -293,10 +322,36 @@
+@@ -293,10 +329,82 @@ static void
  pool_give_back(uint64_t pa, uint64_t size)
  {
  	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
@@ -107,52 +187,92 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  		range_free(pool_free, &pool_free_count, 2048, pa, size);
  	}
  }
-+/* laurel: place the pool (see GPU_POOL_LOW); false: no room, the GPU uses kernel memory below 4 GiB */
++static char pool_why[128];
++
++static bool
++dt_pairs(DTEntry chosen, const char *name, uint64_t (*out)[2], unsigned max, unsigned *count)
++{
++	void const *prop = NULL;
++	unsigned int len = 0;
++
++	*count = 0;
++	if (SecureDTGetProperty(chosen, name, &prop, &len) != kSuccess || len == 0 || len % 16 != 0) {
++		return false;
++	}
++	for (unsigned i = 0; i < len / 16 && i < max; i++) {
++		memcpy(out[i], (const uint8_t *)prop + 16 * i, 16);
++		(*count)++;
++	}
++	return true;
++}
++
++static bool
++overlaps(uint64_t b0, uint64_t e0, uint64_t b1, uint64_t e1)
++{
++	return b0 < e1 && b1 < e0;
++}
++
++/* laurel: the GPU pool from the ADT (see above); false: none (pool_why says why), the GPU uses kernel memory */
 +static bool
 +gpu_pool_place(void)
 +{
-+	uint64_t kend = (uint64_t)gPhysBase + (uint64_t)gPhysSize;
-+	uint64_t base = GPU_POOL_LOW;
++	DTEntry chosen;
++	uint64_t banks[8][2], res[8][2], kbase = (uint64_t)gPhysBase, kend = kbase + (uint64_t)gPhysSize;
++	unsigned nb = 0, nr = 0;
 +
-+	if (gPhysBase < GPU_POOL_TOP && kend > GPU_POOL_LOW) {
-+		/* the kernel's RAM reaches into [LOW, TOP): the pool starts after it */
-+		base = (kend + GPU_POOL_CHUNK - 1) & ~(GPU_POOL_CHUNK - 1);
-+		if (gPhysBase < GPU_POOL_LOW + GPU_POOL_MIN && gPhysBase > GPU_POOL_LOW) {
-+			return false;                   /* (a window starting inside the pool's place: no room below it either) */
++	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess) {
++		snprintf(pool_why, sizeof(pool_why), "no /chosen in the ADT");
++		return false;
++	}
++	if (!dt_pairs(chosen, "laurel-ram-reserved", res, 8, &nr)) {
++		snprintf(pool_why, sizeof(pool_why), "no /chosen laurel-ram-reserved (u64 pairs) in the ADT");
++		return false;
++	}
++	if (!dt_pairs(chosen, "laurel-ram-banks", banks, 8, &nb)) {
++		snprintf(pool_why, sizeof(pool_why), "no /chosen laurel-ram-banks (u64 pairs) in the ADT");
++		return false;
++	}
++	gpu_pool_base = gpu_pool_size = 0;
++	for (unsigned i = 0; i < nr; i++) {
++		uint64_t b = res[i][0], sz = res[i][1] > GPU_POOL_MAX ? GPU_POOL_MAX : res[i][1], e;
++		bool in_bank = false;
++
++		sz &= ~(GPU_POOL_CHUNK - 1);
++		e = b + sz;
++		if (sz < GPU_POOL_MIN || (b & (GPU_POOL_CHUNK - 1)) != 0 || e > 0x100000000ull ||
++		    overlaps(b, e, kbase, kend) || overlaps(b, e, MODEM_POOL, MODEM_POOL_END)) {
++			continue;
++		}
++		for (unsigned j = 0; j < nb; j++) {
++			in_bank |= b >= banks[j][0] && e <= banks[j][0] + banks[j][1];
++		}
++		if (in_bank && sz > gpu_pool_size) {
++			gpu_pool_base = b;
++			gpu_pool_size = sz;
 +		}
 +	}
-+	if (base < GPU_POOL_LOW || base + GPU_POOL_MIN > GPU_POOL_TOP) {
-+		return false;                           /* no 128 MB of DDR left outside the kernel below the modem pool */
++	if (gpu_pool_size == 0) {
++		snprintf(pool_why, sizeof(pool_why), "no reserved range of >= 128 MiB below 4 GiB outside kernel RAM %#llx-%#llx",
++		    kbase, kend);
++		return false;
 +	}
-+	gpu_pool_base = base;
-+	gpu_pool_size = GPU_POOL_TOP - base;
-+	if (gpu_pool_size > GPU_POOL_MAX) {
-+		gpu_pool_size = GPU_POOL_MAX;
-+	}
-+	gpu_pool_size &= ~(GPU_POOL_CHUNK - 1);
 +	return true;
 +}
 +
  /* boot-arg gpu_identity (default 1): the SMMU passes addresses through (TopazGpuW G1), GPU VA = PA */
  static uint32_t gpu_identity = 1;
  
-@@ -361,74 +416,73 @@
+@@ -361,77 +469,6 @@ kbuf_alloc_high(struct kbuf *b, uint64_t size)
  	return true;
  }
  
 -/* ---------------------------------------------------------------- gpu_cc_pll0 (topaz-woa TopazGpuW v0.43) */
-+/* ---------------------------------------------------------------- gpu_cc_pll0/1 (laurel: trinket alpha PLLs) */
- 
- /*
+-
+-/*
 - * Zonda PLL at GPU CC + 0, sequence from the stock khaje kernel (gpucc-khaje.c, clk-alpha-pll.c):
 - * f = 19.2 MHz * (L + alpha / 2^16) at the stock OPPs. The GX voltage corner is not voted (RPM):
 - * high rates run on whatever the bootloader left and may hang (gpu_mhz is opt-in).
-+ * laurel: gpucc-trinket.c has two "default" alpha PLLs (clk-alpha-pll.c register layout, 40-bit alpha),
-+ * PLL0 at GPU CC + 0x0 and PLL1 at + 0x100; gfx3d runs at PLL / 2 through their AUX2 outputs (RCG source 2 =
-+ * PLL0_OUT_AUX2, 4 = PLL1_OUT_AUX2). f(PLL) = 19.2 MHz * (L + alpha / 2^40). Stock OPPs 320-950 MHz
-+ * (trinket-gpu.dtsi). 300 and 600 MHz come from GPLL0 as on topaz. The GX voltage corner is not voted
-+ * (RPM): high rates run on whatever the bootloader left and may hang (gpu_mhz is opt-in, as on topaz).
-  */
+- */
 -#define ZP_MODE        0x00
 -#define ZP_L           0x04
 -#define ZP_ALPHA       0x08
@@ -182,46 +302,16 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
 -	}
 -	return false;
 -}
-+#define AP_MODE        0x00
-+#define AP_L           0x04
-+#define AP_ALPHA       0x08
-+#define AP_ALPHA_U     0x0c
-+#define AP_USER        0x10
-+#define AP_CONFIG      0x18
-+#define AP_TEST_U      0x20
-+#define AP_OUTCTRL     (1u << 0)
-+#define AP_BYPASSNL    (1u << 1)
-+#define AP_RESET_N     (1u << 2)
-+#define AP_LOCK        (1u << 31)
-+#define AP_AUX2_OUT    (1u << 2)            /* USER_CTL */
-+#define AP_ALPHA_EN    (1u << 24)
-+#define AP_VCO_SHIFT   20
-+
-+struct trinket_opp { uint32_t mhz, pll, l, alpha_u, alpha, vco; };
-+static const struct trinket_opp trinket_opps[] = {
-+	{ 320, 1, 33, 0x55, 0x55555555, 2 }, { 465, 1, 48, 0x70, 0x00000000, 2 }, { 745, 0, 77, 0x9a, 0xaaaaaaaa, 0 },
-+	{ 820, 0, 85, 0x6a, 0xaaaaaaaa, 0 }, { 900, 0, 93, 0xc0, 0x00000000, 0 }, { 950, 0, 98, 0xf5, 0x55555555, 0 },
-+};
-+static const struct trinket_opp *pll_opp;
- 
- static bool
- gpu_pll_start(uint32_t mhz)
- {
+-
+-static bool
+-gpu_pll_start(uint32_t mhz)
+-{
 -	uint32_t l, a;
-+	const struct trinket_opp *o = NULL;
-+	uint32_t b;
- 
+-
 -	if (!zonda_la(mhz, &l, &a)) {
 -		IOLog("TopazGPU: gpu_mhz=%u is not a stock OPP (320 465 600 785 820 980 1025 1100 1260)\n", mhz);
-+	for (unsigned i = 0; i < sizeof(trinket_opps) / sizeof(trinket_opps[0]); i++) {
-+		if (trinket_opps[i].mhz == mhz) {
-+			o = &trinket_opps[i];
-+		}
-+	}
-+	if (o == NULL) {
-+		IOLog("TopazGPU: gpu_mhz=%u is not a stock OPP (300 320 465 600 745 820 900 950)\n", mhz);
- 		return false;
- 	}
+-		return false;
+-	}
 -	rmw(gpucc, ZP_MODE, ZP_OUTCTRL, 0);
 -	wr(gpucc, ZP_OPMODE, 0);
 -	wr(gpucc, ZP_L, l);
@@ -238,35 +328,19 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
 -	wr(gpucc, ZP_OPMODE, 1);
 -	if (!poll(gpucc, ZP_MODE, ZP_LOCK, ZP_LOCK, 1000)) {
 -		IOLog("TopazGPU: gpu_cc_pll0: no lock at %u MHz (mode %08x)\n", mhz, rd(gpucc, ZP_MODE));
-+	b = o->pll ? 0x100 : 0x0;
-+	rmw(gpucc, b + AP_MODE, AP_OUTCTRL, 0);                 /* off before a rate change (no dynamic update) */
-+	rmw(gpucc, b + AP_MODE, AP_BYPASSNL | AP_RESET_N, 0);
-+	wr(gpucc, b + AP_L, o->l);
-+	wr(gpucc, b + AP_ALPHA, o->alpha);
-+	wr(gpucc, b + AP_ALPHA_U, o->alpha_u);
-+	wr(gpucc, b + AP_CONFIG, 0x4001055b);
-+	rmw(gpucc, b + AP_USER, (3u << AP_VCO_SHIFT) | AP_AUX2_OUT | AP_ALPHA_EN,
-+	    (o->vco << AP_VCO_SHIFT) | AP_AUX2_OUT | AP_ALPHA_EN);
-+	rmw(gpucc, b + AP_TEST_U, 1, 0);
-+	rmw(gpucc, b + AP_MODE, 0, AP_BYPASSNL);
-+	IODelay(5);
-+	rmw(gpucc, b + AP_MODE, 0, AP_RESET_N);
-+	if (!poll(gpucc, b + AP_MODE, AP_LOCK, AP_LOCK, 200)) {
-+		IOLog("TopazGPU: gpu_cc_pll%u: no lock for %u MHz (mode %08x)\n", o->pll, mhz, rd(gpucc, b + AP_MODE));
- 		return false;
- 	}
+-		return false;
+-	}
 -	rmw(gpucc, ZP_USER, 0, 0xF);
 -	rmw(gpucc, ZP_MODE, 0, ZP_OUTCTRL);
 -	IODelay(100);
 -	IOLog("TopazGPU: gpu_cc_pll0 locked at %u MHz (l %u alpha %04x)\n", mhz, l, a);
-+	rmw(gpucc, b + AP_MODE, 0, AP_OUTCTRL);
-+	IODelay(10);
-+	pll_opp = o;
-+	IOLog("TopazGPU: gpu_cc_pll%u locked at %u MHz (l %u alpha %02x%08x)\n", o->pll, 2 * mhz, o->l, o->alpha_u, o->alpha);
- 	return true;
- }
+-	return true;
+-}
+-
+ /* ---------------------------------------------------------------- power (TopazGpuW PowerUp) */
  
-@@ -481,8 +535,7 @@
+ static bool
+@@ -481,8 +518,7 @@ power_cycle_if_on(void)
  	}
  	rmw(gpucc, 0x1054, CBCR_EN, 0);
  	rmw(gpucc, 0x100c, 0, GDSC_COLLAPSE);
@@ -276,7 +350,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	rmw(gpucc, 0x1098, CBCR_EN, 0);
  	rmw(gpucc, 0x106c, 0, GDSC_COLLAPSE);
  	IODelay(1000);
-@@ -496,6 +549,8 @@
+@@ -496,6 +532,8 @@ power_up(void)
  	branch_on(gcc, 0x71154, "gcc_bimc_gpu_axi");
  	branch_on(gcc, 0x3600c, "gcc_gpu_memnoc_gfx");
  	branch_on(gcc, 0x36018, "gcc_gpu_snoc_dvm_gfx");
@@ -285,7 +359,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	if (!gdsc_on(0x106c, 0, 0, 0x1540)) {
  		IOLog("TopazGPU: CX GDSC: no PWR_ON\n");
  		return false;
-@@ -507,13 +562,13 @@
+@@ -507,28 +545,22 @@ power_up(void)
  	rmw(gpucc, 0x1098, 0xFF0, 0xFF0);
  	branch_on(gpucc, 0x1098, "gpucc_cx_gmu");
  	branch_on(gpucc, 0x5000, "gpucc_hlos1_vote_gpu_smmu");
@@ -295,14 +369,34 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  		return false;
  	}
 -	/* gfx3d: 300/600 MHz from GPLL0 (/2, /1), other stock OPPs from gpu_cc_pll0 (the GX corner is not voted) */
-+	/* gfx3d: 300/600 MHz from GPLL0 (/2, /1), other stock OPPs from gpu_cc_pll0/1 AUX2 / 2 (the GX corner is not voted) */
- 	if (core_mhz != 300 && core_mhz != 600 && gpu_pll_start(core_mhz)) {
+-	if (core_mhz != 300 && core_mhz != 600 && gpu_pll_start(core_mhz)) {
 -		if (!rcg_set(0x101c, 1, 1)) {                   /* parent 1 = GPU_CC_PLL0_OUT_MAIN */
-+		if (!rcg_set(0x101c, pll_opp->pll ? 4 : 2, 2)) {        /* laurel: 2 = PLL0_OUT_AUX2, 4 = PLL1_OUT_AUX2 */
- 			return false;
- 		}
- 	} else {
-@@ -573,11 +628,20 @@
+-			return false;
+-		}
+-	} else {
+-		if (core_mhz != 300 && core_mhz != 600) {
+-			core_mhz = 300;
+-		}
+-		if (!rcg_set(0x101c, SRC_GPLL0, core_mhz >= 600 ? 1 : 2)) {
+-			return false;
+-		}
++	/*
++	 * gfx3d: 300 MHz = GPLL0 / 2 (source 5). laurel: gfx3d votes the CX rail (gpucc-trinket.c) and nothing here
++	 * votes it; 300 MHz is below the lowest level's limit (320 MHz), the stock PLLs (above 1 GHz VCO, MX nominal)
++	 * stay off. Faster clocks come with a CX/MX vote (RPM), not with a boot-arg (docs/laurel_sprout/gpu.md).
++	 */
++	if (!rcg_set(0x101c, SRC_GPLL0, 2)) {
++		return false;
+ 	}
+ 	rmw(gpucc, 0x1054, 0, (1u << 14) | (1u << 13));
+ 	if (!branch_on(gpucc, 0x1054, "gpucc_gx_gfx3d")) {
+ 		return false;
+ 	}
+-	branch_on(gpucc, 0x1060, "gpucc_gx_cxo");
+ 	return true;
+ }
+ 
+@@ -573,11 +605,20 @@ zap_load(void)
  	struct kbuf meta = {};
  	bool ok = false;
  
@@ -328,7 +422,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	{
  		const uint8_t *m = (const uint8_t *)mdt;
  		uint32_t phoff = *(const uint32_t *)(m + 28), phnum = *(const uint16_t *)(m + 44);
-@@ -592,15 +656,34 @@
+@@ -592,15 +633,34 @@ zap_load(void)
  				min_a = paddr < min_a ? paddr : min_a;
  				uint32_t end = (paddr + memsz + 0xfff) & ~0xfffu;
  				max_a = end > max_a ? end : max_a;
@@ -367,7 +461,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  			goto out;
  		}
  		IOLog("TopazGPU: zap: metadata at %#llx\n", meta.pa);
-@@ -610,11 +693,13 @@
+@@ -610,11 +670,13 @@ zap_load(void)
  		scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
  		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta.pa, 0, &res);
  		if (st != 0 || res != 0) {
@@ -381,7 +475,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  			IOLog("TopazGPU: zap mem_setup: %llx/%llx\n", st, res);
  			goto out;
  		}
-@@ -634,9 +719,17 @@
+@@ -634,9 +696,17 @@ zap_load(void)
  		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, GPU_PAS_ID, 0, 0, &res);
  		IOLog("TopazGPU: zap auth_and_reset: %llx/%llx\n", st, res);
  		ok = st == 0 && res == 0;
@@ -400,7 +494,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	return ok;
  }
  
-@@ -943,10 +1036,10 @@
+@@ -943,10 +1013,10 @@ hw_init_regs(void)
  	gpu_wr(0x90E, 47);                              /* CP_MEM_POOL_DBG_ADDR */
  	gpu_wr(0x50B, 0xffffffff);                      /* RBBM_PERFCTR_GPU_BUSY_MASKED */
  	gpu_wr(0x8D0, 0);                               /* CP_PERFCTR_CP_SEL0 */
@@ -415,7 +509,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	gpu_wr(0x534, 0);                               /* RBBM_NC_MODE_CNTL */
  }
  
-@@ -956,9 +1049,23 @@
+@@ -956,9 +1026,23 @@ cp_start(void)
  	void *fw = NULL;
  	size_t fw_size = 0;
  
@@ -442,7 +536,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	if ((sqe.md == NULL && (!kbuf_alloc(&sqe, fw_size - 4) || !kbuf_map(&sqe))) ||
  	    (ring.md == NULL && (!kbuf_alloc(&ring, RB_BYTES) || !kbuf_map(&ring))) ||
  	    (mem.md == NULL && (!kbuf_alloc(&mem, PAGE_SIZE) || !kbuf_map(&mem)))) {
-@@ -998,6 +1105,33 @@
+@@ -998,6 +1082,33 @@ cp_start(void)
  		return false;
  	}
  	IOLog("TopazGPU: CP up (ME_INIT, SET_SECURE_MODE 0), core %u MHz\n", core_mhz);
@@ -470,13 +564,13 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
 +		redwood_gpu_report("fence test");
 +		return false;
 +	}
-+	*(volatile uint32_t *)mem.va = 0;
++	*(volatile uint32_t *)mem.va = seqno;          /* waiters compare with the last real fence, not with 0 */
 +	sweet_dcache_flush((vm_offset_t)mem.va, 64);
 +	IOLog("TopazGPU: fence test ok in %llu us\n", t1 / 1000);
  	return true;
  }
  
-@@ -1010,15 +1144,26 @@
+@@ -1010,15 +1121,26 @@ hw_start(void)
  	smmu = (volatile uint8_t *)ml_io_map(SMMU_BASE, SMMU_SIZE);
  	if (gcc == NULL || gpucc == NULL || gpu == NULL || smmu == NULL) {
  		IOLog("TopazGPU: map failed\n");
@@ -504,7 +598,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  }
  
  /* ---------------------------------------------------------------- the interface RedwoodGPU.cpp uses */
-@@ -1035,7 +1180,7 @@
+@@ -1035,7 +1157,7 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
  	switch (which) {
  	case 0x01: *value = 610; return true;                   /* GPU_ID */
  	case 0x02: *value = GMEM_SIZE; return true;             /* GMEM_SIZE */
@@ -513,7 +607,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	case 0x04: *value = core_mhz * 1000000ull; return true; /* MAX_FREQ */
  	case 0x05:                                              /* TIMESTAMP: CP always-on counter */
  		*value = ready ? ((uint64_t)gpu_rd(0x981) << 32 | gpu_rd(0x980)) : 0;
-@@ -1045,7 +1190,7 @@
+@@ -1045,7 +1167,7 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
  	case 0x08: case 0x09: case 0x0a: case 0x11:             /* PP_PGTABLE FAULTS SUSPENDS RAYTRACING */
  		*value = 0;
  		return true;
@@ -522,7 +616,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	case 0x12: *value = 7; return true;                     /* UBWC_SWIZZLE */
  	case 0x13: *value = 0; return true;                     /* MACROTILE_MODE */
  	default:
-@@ -1192,7 +1337,9 @@
+@@ -1192,7 +1314,9 @@ topaz_adreno_thread(__unused void *param, __unused wait_result_t wr_)
  	}
  	IOSleep(500);
  	if (!topaz_root_mounted()) {
@@ -532,7 +626,7 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  		return;
  	}
  	IOLockLock(hw_lock);
-@@ -1201,11 +1348,35 @@
+@@ -1201,26 +1325,86 @@ topaz_adreno_thread(__unused void *param, __unused wait_result_t wr_)
  	if (!ok) {
  		failed = true;
  		IOLog("TopazGPU: THE GPU IS NOT STARTED\n");
@@ -565,11 +659,36 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
 +topaz_gpu_ready(void)
 +{
 +	return ready;
++}
++
++/*
++ * laurel: backboardd has loaded GL: its Mesa opened the GPU (RedwoodGPU user client, backboardd only). From
++ * then on its screen surfaces come from the write-combined GPU pool and direct scanout (cached memory) is
++ * off; before that, and with gl=0, a failed inject or no libtopaz-gl, CoreAnimation draws in software into
++ * cached memory as without a GPU.
++ */
++static bool gl_active;
++
++bool
++topaz_gpu_gl_active(void)
++{
++	return gl_active && ready;
++}
++
++void
++topaz_gpu_gl_opened(void)
++{
++	if (!gl_active && ready) {
++		gl_active = true;
++		IOLog("LAUREL GPU: GL: backboardd opened the GPU: its screen surfaces from the GPU pool, direct scanout off\n");
++	}
  }
  
  void
-@@ -1214,11 +1385,24 @@
- 	uint32_t on = 0, mhz = 0;
+ topaz_adreno_init(void)
+ {
+-	uint32_t on = 0, mhz = 0;
++	uint32_t on = 0;
  	thread_t thread;
  
 -	if (!PE_parse_boot_argn("gpu", &on, sizeof(on)) || on == 0 || hw_lock != NULL) {
@@ -586,11 +705,15 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
  	}
  	(void)PE_parse_boot_argn("gpu_identity", &gpu_identity, sizeof(gpu_identity));
  	(void)PE_parse_boot_argn("gpu_midmem", &gpu_midmem, sizeof(gpu_midmem));
+-	if (PE_parse_boot_argn("gpu_mhz", &mhz, sizeof(mhz)) && mhz >= 300) {
+-		core_mhz = mhz;                                 /* (checked against the OPP table in power_up) */
 +	if (!gpu_midmem && !gpu_pool_place()) {
-+		gpu_midmem = 1;                         /* no DDR left outside the kernel below 4 GiB: kernel memory */
-+	}
-+	IOLog("TopazGPU: kernel RAM %#lx+%#lx, %s %#llx+%#llx\n", gPhysBase, gPhysSize,
-+	    gpu_midmem ? "GPU memory from the kernel (midmem); pool" : "GPU pool", gpu_pool_base, gpu_pool_size);
- 	if (PE_parse_boot_argn("gpu_mhz", &mhz, sizeof(mhz)) && mhz >= 300) {
- 		core_mhz = mhz;                                 /* (checked against the OPP table in power_up) */
++		gpu_midmem = 1;                         /* no pool in the ADT: kernel memory below 4 GiB */
++		IOLog("TopazGPU: kernel RAM %#lx+%#lx; no GPU pool (%s): GPU memory from the kernel below 4 GiB (midmem)\n",
++		    gPhysBase, gPhysSize, pool_why);
++	} else {
++		IOLog("TopazGPU: kernel RAM %#lx+%#lx, GPU pool %#llx+%#llx (ADT laurel-ram-reserved)\n", gPhysBase, gPhysSize,
++		    gpu_pool_base, gpu_pool_size);
  	}
+ 	hw_lock = IOLockAlloc();
+ 	if (kernel_thread_start(topaz_adreno_thread, NULL, &thread) == KERN_SUCCESS) {

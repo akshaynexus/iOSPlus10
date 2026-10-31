@@ -19,7 +19,7 @@ T0=$(date +%s)
 fetch_mesa() {
   local a=$DL/mesa-$MESA_VERSION.tar.xz
   [ -f "$a" ] || curl -fsSL --retry 5 -o "$a.partial" "$MESA_URL" && { [ -f "$a" ] || mv "$a.partial" "$a"; }
-  echo "$MESA_SHA256  $a" | sha256sum -c --quiet || { rm -f "$a"; gpu_die "mesa archive: sha256 mismatch"; }
+  [ "$(gpu_sha256 < "$a")" = "$MESA_SHA256" ] || { rm -f "$a"; gpu_die "mesa archive: sha256 mismatch"; }
 }
 gpu_fetch_sdk > "$G/sdk-fetch.log" 2>&1 & p1=$!
 fetch_mesa & p2=$!
@@ -31,7 +31,7 @@ echo "mesa-linux: SDK $(basename "$(readlink -f "$SDK")") (theos/sdks ${SDKS_COM
 
 # 2. source tree = archive + topaz patches (a tree patched with other patches is unpacked again)
 S=$M/mesa-$MESA_VERSION
-PATCHES=$(cat "$TOPAZ"/userland/mesa/*.patch | sha256sum | cut -d' ' -f1)
+PATCHES=$(cat "$TOPAZ"/userland/mesa/*.patch | gpu_sha256)
 if [ "${CLEAN:-0}" = 1 ] || [ ! -d "$S" ] || [ "$(cat "$S/.laurel-patches" 2>/dev/null)" != "$PATCHES" ]; then
   rm -rf "$S" "$M"/build-*
   tar -xJf "$DL/mesa-$MESA_VERSION.tar.xz" -C "$M"
@@ -103,7 +103,7 @@ L=$B/src/gallium/targets/osmesa/libOSMesa.8.dylib
 "$LDID" -S "$O/libOSMesa.8.dylib"
 "$NM" -gU "$O/libOSMesa.8.dylib" | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > "$O/exported-gl.txt"
 cp "$S/src/mapi/glapi/registry/gl.xml" "$O/gl.xml"
-cat "$TOPAZ"/userland/mesa/*.patch "$TOPAZ"/userland/mesa/redwood-drm/* | sha256sum > "$O/built-from"
+cat "$TOPAZ"/userland/mesa/*.patch "$TOPAZ"/userland/mesa/redwood-drm/* | gpu_sha256 > "$O/built-from"
 gpu_check_v80 "$O/libOSMesa.8.dylib" || gpu_die "libOSMesa has ARMv8.1+ instructions"
 file "$O/libOSMesa.8.dylib"
-echo "mesa-linux: $O/libOSMesa.8.dylib, $(stat -c %s "$O/libOSMesa.8.dylib") bytes, $(wc -l < "$O/exported-gl.txt") gl* functions, $(( $(date +%s) - T0 )) s"
+echo "mesa-linux: $O/libOSMesa.8.dylib, $(wc -c < "$O/libOSMesa.8.dylib" | tr -d ' ') bytes, $(wc -l < "$O/exported-gl.txt") gl* functions, $(( $(date +%s) - T0 )) s"

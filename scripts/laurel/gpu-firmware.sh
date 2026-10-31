@@ -42,6 +42,6 @@ ls "$F"/a610_zap.b0* >/dev/null 2>&1 || gpu_die "no a610_zap.bNN segments in $VE
 [ -s "$F/a630_sqe.fw" ] || echo "gpu-firmware: note: no a630_sqe.fw in the vendor image: the kernel uses its built-in SQE (topaz)"
 # sanity: the .mdt is a 32-bit ELF (Qualcomm PIL metadata), the kernel driver rejects others too
 head -c 5 "$F/a610_zap.mdt" | od -An -tx1 | grep -q '7f 45 4c 46 01' || gpu_die "a610_zap.mdt is not an ELF32 file"
-(cd "$F" && sha256sum -- * > SHA256SUMS)
+(cd "$F" && gpu_sha256_files * > SHA256SUMS)
 ls -l "$F"
 echo "gpu-firmware: $F (not for git: Qualcomm/Xiaomi firmware)"

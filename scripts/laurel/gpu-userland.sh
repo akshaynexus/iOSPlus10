@@ -2,7 +2,8 @@
 # The iOS-side GPU pieces for the Mi A3, built on Linux (no Mac): CoreAnimation's OpenGL ES renderer in backboardd
 # draws through Mesa freedreno on the Adreno 610 (kernel: TopazAdreno + RedwoodGPU, patches topaz 0901-0947 + laurel 2150/2151).
 #   scripts/bg.sh laurel-gpu-user scripts/laurel/gpu-userland.sh      (runs mesa-linux.sh first when Mesa is missing or stale)
-# Sources (read-only): external/ios-topaz/userland/gpu/{eagl.c,gl_osmesa.c,redwood_gl.h,topaz_inject.c,bbd_wrap.c}; the EAGL
+# Sources: userland/laurel/gpu/bbd_wrap.c (ours: kill switches, crash guard); read-only:
+# external/ios-topaz/userland/gpu/{eagl.c,gl_osmesa.c,redwood_gl.h,topaz_inject.c}; the EAGL
 # table generator external/hackios-scion/userland/mkeagl.py + src/eagl_slots.txt (the offsets of iOS's OpenGLES dispatch table).
 # Output: out/laurel/gpu/root/ = the files root-add-gpu.sh installs, laid out as on the phone:
 #   topaz/lib/libOSMesa.8.dylib  topaz/lib/libtopaz-gl.dylib  topaz/lib/libtopaz-inject.dylib  usr/libexec/backboardd.wrap
@@ -13,7 +14,7 @@ gpu_need_toolchain
 gpu_fetch_sdk
 U=$TOPAZ/userland/gpu
 M=$G/mesa/out
-want=$(cat "$TOPAZ"/userland/mesa/*.patch "$TOPAZ"/userland/mesa/redwood-drm/* | sha256sum)
+want=$(cat "$TOPAZ"/userland/mesa/*.patch "$TOPAZ"/userland/mesa/redwood-drm/* | gpu_sha256)
 if [ ! -s "$M/libOSMesa.8.dylib" ] || [ "$(cat "$M/built-from" 2>/dev/null)" != "$want" ]; then
   echo "gpu-userland: Mesa missing or older than the topaz Mesa patches: scripts/laurel/mesa-linux.sh"
   "$(dirname "$0")/mesa-linux.sh"
@@ -35,8 +36,9 @@ gpu_cc "$R$PREFIX/lib/libtopaz-gl.dylib" -dynamiclib -install_name $PREFIX/lib/l
 gpu_cc "$R$PREFIX/lib/libtopaz-inject.dylib" -dynamiclib -install_name $PREFIX/lib/libtopaz-inject.dylib \
   -framework CoreFoundation -framework IOKit -lobjc "$U/topaz_inject.c" 2> "$O/inject.log" ||
   { cat "$O/inject.log"; gpu_die "libtopaz-inject did not build"; }
-# 4. the backboardd stand-in: adds the loader (if it is there) to DYLD_INSERT_LIBRARIES, execs /usr/libexec/real/backboardd
-gpu_cc "$R/usr/libexec/backboardd.wrap" "$U/bbd_wrap.c" 2> "$O/bbd.log" || { cat "$O/bbd.log"; gpu_die "bbd_wrap did not build"; }
+# 4. the backboardd stand-in (ours): the loader only without gpu=0/gl=0 and after < 2 fast exits, execs /usr/libexec/real/backboardd
+gpu_cc "$R/usr/libexec/backboardd.wrap" "$REPO/userland/laurel/gpu/bbd_wrap.c" 2> "$O/bbd.log" ||
+  { cat "$O/bbd.log"; gpu_die "bbd_wrap did not build"; }
 cp "$M/libOSMesa.8.dylib" "$R$PREFIX/lib/"
 
 # ad-hoc signatures (the kernel's AMFI stand-in accepts them; the code directory hashes must still match)
@@ -56,6 +58,6 @@ if [ -s "$F/a610_zap.mdt" ]; then
 else
   echo "gpu-userland: note: no firmware in $F (scripts/laurel/gpu-firmware.sh): the kernel will log 'LAUREL GPU: off: zap shader failed'"
 fi
-(cd "$R" && find . -type f | sort | xargs sha256sum > "$G/root.SHA256SUMS")
+(cd "$R" && find . -type f | sort | { while read -r f; do gpu_sha256_files "$f"; done; } > "$G/root.SHA256SUMS")
 (cd "$R" && find . -type f -exec ls -l {} + | awk '{print $5, $9}')
 echo "gpu-userland: $R (root-add-gpu.sh installs it)"

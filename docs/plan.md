@@ -570,4 +570,14 @@ freedreno, 47 s), `gpu-userland.sh` (libtopaz-gl, libtopaz-inject, backboardd wr
 Details and expected log lines: docs/laurel_sprout/gpu.md.
 Next: rebuild the root (`sudo scripts/laurel/root.sh` after gpu-firmware.sh + gpu-userland.sh as the user), flash userdata
 (owner approval), boot the 2150-2152 kernel; check `LAUREL GPU: on: Adreno 610 chip 0x06010000 ...`, backboardd
-`libtopaz-gl.dylib loaded`, `SWEET FPS` lines. Then GX corner vote and clocks; Turnip + metal2vulkan (Metal) later.
+`libtopaz-gl.dylib loaded`, `SWEET FPS` lines. Then CX/MX vote and clocks; Turnip + metal2vulkan (Metal) later.
+
+Review fixes 2026-11-01 05:10 (rebased on laurel-int-1) [V build]: RedwoodGPU only for backboardd while the SMMU passes
+through; pool/scanout placement by "backboardd loaded GL" (asked per create); our backboardd wrapper (userland/laurel/gpu,
+gpu=0/gl=0 whole-word, crash guard after 2 fast exits, checked before install); 2151 on area A's 2101 (GPU pool -> scanout/
+SPOOL only without GL -> LAUREL SURF -> contiguous below 4 GiB); GPU pool from ADT laurel-ram-reserved (else midmem); no
+0x1060 write; gpu_mhz removed (CX not voted); fence self-check writes seqno back; SWEET FPS only while GL is loaded;
+pinned pip hashes; wider ARMv8.1 check. Kernel 230 patches, 0 LSE. Image out/laurel/uefi/laurel-uefi-boot.img (worktree).
+**Owner decision (CLAUDE.md "macOS and Linux"):** the laurel GPU scripts (gpu-env/-firmware/-userland, mesa-linux,
+root-add-gpu) are Linux x86_64 only, like kernel-linux.sh and mu-build.sh (pinned theos toolchain is x86_64). Accept this
+exception, or ask for a macOS path (Xcode clang/ld/codesign in gpu-env.sh).

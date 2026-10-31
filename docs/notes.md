@@ -3855,3 +3855,11 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   mkeagl.py), libtopaz-inject, bbd_wrap; ad-hoc signed with theos ldid; 0 LSE. `scripts/laurel/root-add-gpu.sh` installs
   them (+ firmware to /usr/share/firmware/laurel) and moves backboardd to /usr/libexec/real/; root.sh calls it.
 - Open: first boot of 2150-2152 + a root with the GPU files; GX corner vote (RPM) before clocks above 300 MHz; Turnip/metal2vulkan later.
+- [V build 05:10] Review fixes (ACCEPT-WITH-FIXES, rebased on laurel-int-1 = A bf51862 + C 7de9719 + H 8df44c2): see
+  docs/laurel_sprout/gpu.md ("SMMU pass-through risk", "GPU pool", "Recovery", "Mesa's highest bank bit"). Facts: with
+  area A's map the kernel window is 0xE1004000-0x1AD004000 (495 MiB below 4 GiB), the ADT reserves 0xC0000000 + 512 MiB
+  (GPU) and 0xE0000000 + 16 MiB (modem); 2150 reads them. RedwoodGPU surface sharing allowed 36-bit addresses (topaz);
+  now 4 GiB, and never a cached scanout slot. Mesa 25.0.7 GL never reads the static A610 bank bit (13): only
+  fdl6_memcpy (Turnip) does. topaz_inject.c's `strstr(args, " gl=0")` misses gl=0 as the first boot-arg: our wrapper
+  parses whole words and does not insert the loader then. Mu not rebuilt here: patches/laurel/mu is equal to
+  laurel-int-1, the main checkout's FD (04:50, has "Pool RAM") was reused for uefi-image.sh.

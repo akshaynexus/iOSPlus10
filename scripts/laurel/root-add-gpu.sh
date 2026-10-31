@@ -6,11 +6,14 @@
 # What it does:
 #   /topaz/lib/{libOSMesa.8.dylib,libtopaz-gl.dylib,libtopaz-inject.dylib}   (root:wheel 755)
 #   /usr/share/firmware/laurel/{a610_zap.mdt,a610_zap.bNN,a630_sqe.fw}     (root:wheel 644; the kernel reads them)
-#   /usr/libexec/real/backboardd = Apple's backboardd (moved once), /usr/libexec/backboardd = bbd_wrap (topaz): it adds
-#   /topaz/lib/libtopaz-inject.dylib to DYLD_INSERT_LIBRARIES when the file is there and execs the real one (same pid,
-#   same Mach services). libtopaz-inject waits up to 5 s for RedwoodGPU and loads libtopaz-gl only then; without the GPU
-#   CoreAnimation keeps its software renderer. Kill switches: boot-arg gl=0 (no GL in backboardd), gpu=0 (no GPU).
-# Undo: mv usr/libexec/real/backboardd usr/libexec/backboardd; rm -rf topaz usr/share/firmware/laurel.
+#   /usr/libexec/real/backboardd = Apple's backboardd (moved once), /usr/libexec/backboardd = our wrapper
+#   (userland/laurel/gpu/bbd_wrap.c): it adds /topaz/lib/libtopaz-inject.dylib to DYLD_INSERT_LIBRARIES unless gpu=0 or
+#   gl=0 is in the boot-args or backboardd exited fast twice in this boot (/var/tmp/laurel-bbd.state), then execs the
+#   real one (same pid, same Mach services). libtopaz-inject waits up to 5 s for RedwoodGPU and loads libtopaz-gl only
+#   then; without the GPU CoreAnimation keeps its software renderer.
+#   The wrapper is checked first (thin arm64 Mach-O executable with a code signature, names the real path); a failed
+#   check leaves Apple's backboardd where it is (no GL, the UI still comes up).
+# Undo / recovery: docs/laurel_sprout/gpu.md "Recovery" (mv usr/libexec/real/backboardd usr/libexec/backboardd).
 set -euo pipefail
 R=${1:?usage: $0 MOUNTED_ROOT}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -40,6 +43,26 @@ else
   fw="none (the kernel will report 'LAUREL GPU: off')"
 fi
 
+# the wrapper must be sound before Apple's backboardd moves: a broken one means no window server, no UI
+W=$S/usr/libexec/backboardd.wrap
+if ! python3 -I - "$W" <<'PY'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+magic, cpu, sub, ftype, ncmds, size = struct.unpack_from('<IiiIII', d)
+assert magic == 0xfeedfacf and cpu == 0x0100000c, 'not a thin arm64 Mach-O'
+assert ftype == 2, 'not an executable (MH_EXECUTE)'
+cmds, pos = set(), 32
+for _ in range(ncmds):
+    c, l = struct.unpack_from('<II', d, pos); cmds.add(c); pos += l
+assert 0x1d in cmds, 'no LC_CODE_SIGNATURE (ldid -S)'
+assert 0x80000028 in cmds, 'no LC_MAIN'
+assert b'/usr/libexec/real/backboardd' in d, 'does not exec /usr/libexec/real/backboardd'
+PY
+then
+  echo "root-add-gpu: the backboardd wrapper $W failed its check: Apple's backboardd stays (no GL in the window server)" >&2
+  echo "root-add-gpu: /topaz/lib + firmware installed; backboardd unchanged"
+  exit 0
+fi
 # backboardd: Apple's binary moves once; a Mach-O that is our wrapper is never moved over the real one
 real=$R/usr/libexec/real/backboardd
 if [ ! -e "$real" ]; then

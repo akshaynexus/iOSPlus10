@@ -16,7 +16,8 @@ MESA_URL=https://archive.mesa3d.org/mesa-$MESA_VERSION.tar.xz
 # iPhoneOS16.5.sdk from github.com/theos/sdks (hackios-scion xnu-deps/setup.sh fetches the same one, unpinned).
 SDKS_URL=https://github.com/theos/sdks.git
 SDKS_COMMIT=0222fd5413cf4b9af096f37b4621afa2688572f7   # HEAD on 2026-11-01
-SDK=${SDK:-$DEPS/sdks/iPhoneOS16.5.sdk}
+SDK_DEFAULT=$DEPS/sdks/iPhoneOS16.5.sdk
+SDK=${SDK:-$SDK_DEFAULT}
 IOS_MIN=16.0
 # ARMv8.0 only (Kryo 260 Gold A73 + Silver A53: no LSE, no RCpc, no PAC). The kernel emulates LSE/LDAPR in
 # user space (topaz 0081) but a trap per atomic is slow; -mcpu=cortex-a53 emits none.
@@ -58,6 +59,8 @@ gpu_need_toolchain() {
 # iPhoneOS16.5.sdk: sparse, blob-filtered clone of theos/sdks at the pinned commit (about 220 MB)
 gpu_fetch_sdk() {
   [ -d "$SDK/usr/include" ] && return 0
+  # a user-given SDK (SDK=...) is used as it is: nothing is fetched or linked outside out/
+  [ "$SDK" = "$SDK_DEFAULT" ] || gpu_die "SDK=$SDK has no usr/include"
   local r=$DEPS/sdks-git
   rm -rf "$r"
   mkdir -p "$DEPS/sdks"
@@ -68,16 +71,30 @@ gpu_fetch_sdk() {
   git -C "$r" fetch -q --depth 1 --filter=blob:none origin "$SDKS_COMMIT"
   git -C "$r" checkout -q FETCH_HEAD
   [ "$(git -C "$r" rev-parse HEAD)" = "$SDKS_COMMIT" ] || gpu_die "theos/sdks: wrong commit"
-  ln -sfn "$r/iPhoneOS16.5.sdk" "$SDK"
+  ln -sfn "$r/iPhoneOS16.5.sdk" "$SDK_DEFAULT"
   [ -d "$SDK/usr/include" ] || gpu_die "theos/sdks: no iPhoneOS16.5.sdk/usr/include"
 }
 
-# Python venv with meson's Mako/PyYAML/packaging for Mesa's code generators (host meson + ninja are used)
+# Python venv with Mako/PyYAML/packaging for Mesa's code generators (host meson + ninja are used). Versions and
+# sha256 of every PyPI file: scripts/laurel/gpu-requirements.txt (pip --require-hashes, wheels only: no build step).
+REQS=$REPO/scripts/laurel/gpu-requirements.txt
 gpu_venv() {
-  [ -x "$DEPS/venv/bin/python3" ] && "$DEPS/venv/bin/python3" -c 'import mako, yaml, packaging' 2>/dev/null && return 0
+  local want
+  want=$(gpu_sha256 < "$REQS")
+  [ -x "$DEPS/venv/bin/python3" ] && [ "$(cat "$DEPS/venv/.laurel-reqs" 2>/dev/null)" = "$want" ] && return 0
   rm -rf "$DEPS/venv"
   python3 -m venv "$DEPS/venv"
-  "$DEPS/venv/bin/pip" -q install mako pyyaml packaging
+  "$DEPS/venv/bin/pip" -q install --require-hashes --only-binary :all: --no-deps -r "$REQS"
+  echo "$want" > "$DEPS/venv/.laurel-reqs"
+}
+
+# sha256 of files, "HASH  NAME" lines (Linux sha256sum, macOS shasum)
+gpu_sha256_files() {
+  if command -v sha256sum >/dev/null; then sha256sum -- "$@"; else shasum -a 256 -- "$@"; fi
+}
+# sha256 of stdin, hex only (Linux sha256sum, macOS shasum)
+gpu_sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
 }
 
 # compile + link one iOS arm64 Mach-O: gpu_cc OUT [clang args...]
@@ -87,10 +104,12 @@ gpu_cc() {
     -fno-stack-check -O2 -Wall -Wno-unused-function -o "$out" "$@"
 }
 
-# ARMv8.0 check on a Mach-O: no LSE atomics, no LDAPR (prints the count; fails on any)
+# ARMv8.0 check on a Mach-O: no LSE atomics (cas*, swp*, ld<op>*, st<op>* aliases), no RCpc (ldapr*, ldapur*, stlur*)
+# (prints the count; fails on any)
+V81_PAT='\t(cas\w*|swp\w*|ld(add|set|clr|eor|smax|smin|umax|umin)\w*|st(add|set|clr|eor|smax|smin|umax|umin)\w*|ldapr\w*|ldapur\w*|stlur\w*)\s'
 gpu_check_v80() {
   local n
-  n=$(llvm-objdump -d --mattr=+v8.5a "$1" 2>/dev/null | grep -cP '\t(cas\w*|ldadd\w*|ldset\w*|ldclr\w*|ldeor\w*|swp\w*|ldapr\w*)\s' || true)
+  n=$(llvm-objdump -d --mattr=+v8.5a "$1" 2>/dev/null | grep -cP "$V81_PAT" || true)
   echo "$(basename "$0"): $(basename "$1"): LSE/RCpc instructions: $n"
   [ "$n" = 0 ]
 }

@@ -1,30 +1,63 @@
-laurel 2151: IOSurface placement follows the GPU state instead of boot-arg gpu=1 (the GPU is on by default since 2150): direct scanout slots (cached) are off while the GPU is wanted (not gpu=0, not failed); contiguous below-4-GiB surfaces while wanted; backboardd's screen-sized surfaces from the write-combined GPU pool only once RedwoodGPU is up (asked at every create, not cached at the first one: the GPU starts after the root mount), and screen-sized includes the Mi A3's 720x1560 (topaz: >= 1000x2000).
+laurel 2151: IOSurface placement follows the GPU state (2150) instead of boot-arg gpu=1, on top of area A's 2101. Order in create(): (1) backboardd's screen-sized BGRA surfaces (>= 700x1500: the Mi A3 720x1560) from the write-combined GPU pool only while backboardd's GL has the GPU (topaz_gpu_gl_active, asked per create); (2) the scanout path (cached slots, LAUREL SPOOL) only while GL is not loaded (asked per create, no longer cached at the first surface: GL loads after the first surfaces); (3) other surfaces: while GL is loaded the topaz reserve for screen-sized ones (contiguous, guard rows), then LAUREL SURF wired pages for all (no contiguous-first per surface; eagl copies such a surface into a texture), then contiguous memory below 4 GiB (mask 0xFFFFC000; kernel RAM now reaches 0x1AD004000, the GPU does not reach above 4 GiB) only while the GPU is wanted, then ordinary memory. The reserve buffers are below 4 GiB too.
 
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index ac612e6..b412a2b 100644
+index 291bf77..c279367 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -50,6 +50,9 @@
- extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
- extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
+@@ -52,6 +52,16 @@ extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
  extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
-+/* laurel 2151: the GPU is on by default (gpu=0 kills it); wanted = not killed and not failed, ready = RedwoodGPU up */
+ /* laurel 2100 (osfmk/arm64/laurel_ram.c): the LAUREL RAM line, repeated at the first surface for the USB log */
+ extern "C" const char *laurel_ram_summary(void);
++/*
++ * laurel 2151 (TopazAdreno.cpp, 2150): the GPU is on by default (gpu=0 kills it). wanted = not killed and not
++ * failed; gl_active = backboardd's Mesa opened the GPU (GL loaded). Placement: backboardd's screen surfaces from
++ * the GPU pool only while GL is loaded; the scanout path (cached, SPOOL) only while it is not; other surfaces
++ * from wired pages (LAUREL SURF), contiguous below 4 GiB only as the fallback while the GPU is wanted.
++ */
 +extern "C" bool topaz_gpu_wanted(void);
-+extern "C" bool topaz_gpu_ready(void);
++extern "C" bool topaz_gpu_gl_active(void);
++#define LAUREL_GPU_MASK         0x00000000FFFFC000ull   /* the GPU reaches DRAM below 4 GiB only; 16 KiB aligned */
++#define LAUREL_SCREEN_SIZED(s)  ((s)->width >= 700 && (s)->height >= 1500)     /* Mi A3 720x1560 (topaz: 1000x2000) */
  
  enum {
  	kSweetSurfaceCreate             = 0,
-@@ -141,8 +144,7 @@ sweet_scanout_eligible(const SweetSurface *s)
- 		 * (cached CPU memory below 4 GiB) would be handed to the GPU as they are, which reads DRAM
- 		 * behind the CPU's cache: applications' pixels came out as garbage (text, images).
- 		 */
+@@ -138,18 +148,16 @@ sweet_scanout_eligible(const SweetSurface *s)
+ 	if (sweet_scanout_enabled < 0) {
+ 		int on = 1;
+ 		PE_parse_boot_argn("sweetfb_direct", &on, sizeof(on));
+-		/*
+-		 * topaz GPU: with gpu=1 the window server's frames come from the GPU pool; the scanout slots
+-		 * (cached CPU memory below 4 GiB) would be handed to the GPU as they are, which reads DRAM
+-		 * behind the CPU's cache: applications' pixels came out as garbage (text, images).
+-		 */
 -		uint32_t gpu = 0;
 -		if (PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu != 0) {
-+		if (topaz_gpu_wanted()) {      /* laurel 2151: was boot-arg gpu=1 */
- 			on = 0;
- 		}
+-			on = 0;
+-		}
  		sweet_scanout_enabled = on;
-@@ -492,17 +494,19 @@ static IOReturn sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint
+ 	}
+-	if (!sweet_scanout_enabled || s->bytesPerElement != 4 || s->planeCount > 1 ||
++	/*
++	 * topaz GPU: while GL draws, the window server's frames come from the GPU pool; the scanout slots
++	 * (cached CPU memory below 4 GiB) would be handed to the GPU as they are, which reads DRAM
++	 * behind the CPU's cache: applications' pixels came out as garbage (text, images).
++	 * laurel 2151: asked at every create (GL loads after the first surfaces), not cached at the first one;
++	 * RedwoodGPU also refuses to share a scanout-slot surface (2150).
++	 */
++	if (!sweet_scanout_enabled || topaz_gpu_gl_active() || s->bytesPerElement != 4 || s->planeCount > 1 ||
+ 	    s->elementWidth != 1 || s->elementHeight != 1 || s->allocSize > SWEET_SCANOUT_SLOT) {
+ 		return false;
+ 	}
+@@ -189,7 +197,7 @@ sweet_res_fill(void)
+ 	for (; n < SWEET_RES_COUNT; n++) {
+ 		mem[n] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, SWEET_RES_SIZE,
+-		    0x0000000FFFFFC000ull);
++		    LAUREL_GPU_MASK);   /* laurel 2151: below 4 GiB (kernel RAM reaches 0x1AD004000; topaz: 36 bits) */
+ 		if (mem[n] == NULL) {
+ 			break;
+ 		}
+@@ -663,17 +671,15 @@ static IOReturn sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint
  static bool
  sweet_gpu_pool_eligible(const SweetSurface *s)
  {
@@ -40,19 +73,15 @@ index ac612e6..b412a2b 100644
 -		}
 +		fbpool = !(PE_parse_boot_argn("gpu_fbpool", &pool, sizeof(pool)) && pool == 0);
  	}
-+	/*
-+	 * laurel 2151: asked at every create, not once: the GPU comes up after the root is mounted, and a
-+	 * window server that draws in software (GPU off) keeps cached memory. Screen-sized = the Mi A3's
-+	 * 720x1560 too (topaz: 1080x2400).
-+	 */
-+	bool gpu = fbpool && topaz_gpu_ready();
++	/* laurel 2151: only while backboardd's GL has the GPU (asked per create), Mi A3 screen size */
++	bool gpu = fbpool && topaz_gpu_gl_active();
  	if (!(gpu && s->bytesPerElement == 4 && s->planeCount <= 1 && s->elementWidth == 1 && s->elementHeight == 1 &&
 -	    s->width >= 1000 && s->height >= 2000 && s->allocSize <= (48u << 20))) {
-+	    s->width >= 700 && s->height >= 1500 && s->allocSize <= (48u << 20))) {
++	    LAUREL_SCREEN_SIZED(s) && s->allocSize <= (48u << 20))) {
  		return false;
  	}
  	/* only the window server's own (the display's frames); applications' screen-sized surfaces came out black */
-@@ -1075,11 +1079,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -1262,11 +1268,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  		IOBufferMemoryDescriptor *mem = NULL;
  		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
  		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
@@ -61,8 +90,38 @@ index ac612e6..b412a2b 100644
 -				uint32_t on = 0;
 -				gpu_low = PE_parse_boot_argn("gpu", &on, sizeof(on)) && on != 0;
 -			}
-+			/* surfaces the Adreno draws into stay below 4 GiB (laurel 2151: GPU wanted, was boot-arg gpu=1) */
-+			bool gpu_low = topaz_gpu_wanted();
++			/*
++			 * laurel 2151: gl = backboardd's GL has the GPU (the topaz gpu=1 path below: guard rows, the reserve
++			 * for screen-sized surfaces); wanted = the GPU may still come (contiguous fallback below 4 GiB).
++			 */
++			bool gpu_low = topaz_gpu_gl_active(), wanted = topaz_gpu_wanted();
  			/*
  			 * gpu=1: physically contiguous memory (up to 16 MB: a full screen, 1125x2436, is 11 MB), so that the Adreno, whose
  			 * addresses are physical with the SMMU in pass-through, reads the surface where it
+@@ -1281,20 +1287,21 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			uint64_t take = gpu_low ? sweet_round_upage(s->allocSize + 64ull * s->bytesPerRow) : s->allocSize;
+ 			if (gpu_low) {
+ 				sweet_res_fill();
+-				if (s->width >= 1000 && s->height >= 2000 && s->bytesPerElement == 4) {
++				if (LAUREL_SCREEN_SIZED(s) && s->bytesPerElement == 4) {
+ 					mem = sweet_res_take(take);
+ 				}
+ 			}
+ #if defined(TOPAZ_4K)
+-			if (mem == NULL && !gpu_low) {
+-				mem = laurel_surf_pages(take);  /* laurel 2101: no contiguous run */
++			if (mem == NULL) {
++				/* laurel 2101: no contiguous run (2151: also while the GPU is wanted; eagl copies such a surface) */
++				mem = laurel_surf_pages(take);
+ 				s->pagesWired = mem != NULL;
+ 			}
+ #endif
+-			if (mem == NULL && gpu_low && take <= (16u << 20)) {
++			if (mem == NULL && wanted && take <= (16u << 20)) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
+-				    0x0000000FFFFFC000ull);
++				    LAUREL_GPU_MASK);   /* laurel 2151: below 4 GiB for the GPU (topaz: 36 bits) */
+ 			}
+ 			if (mem == NULL) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
