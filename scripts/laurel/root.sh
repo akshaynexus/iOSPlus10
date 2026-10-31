@@ -5,7 +5,7 @@
 # Steps: 1. external/ios-topaz/tools/mkiosroot.sh (case-sensitive journaled HFS+, OS + SystemOS/AppOS cryptexes,
 #        dyld cache link, plain system keybag); 2. topaz sweet-root-tweaks.py (build 20H392 fixes, launchd,
 #        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped) and
-#        root-tweaks-boldtext.py; 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
+#        root-tweaks-boldtext.py + root-bt.sh (Bluetooth userland; BT=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
 # Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
 #   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg
@@ -67,6 +67,8 @@ python3 -I "$TOPAZ/sweet-root-tweaks.py" "$mnt"
 # CA heartbeat 60: the Mi A3 panel runs at 60 Hz (negroni's default 120 is for its 120 Hz panel).
 CA_HEARTBEAT=${CA_HEARTBEAT:-60} python3 -I "$REPO/scripts/ios16/root-tweaks-extra.py" "$mnt"
 python3 -I "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$mnt"
+# Bluetooth (kernel patch 2600): bluetoothd job back + the BlueTool stand-in; BT=0 skips
+BT=${BT:-1} bash "$REPO/scripts/laurel/root-bt.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-bt.sh failed; root built without Bluetooth" >&2
 sync
 umount "$mnt"
 

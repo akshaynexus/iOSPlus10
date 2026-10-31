@@ -25,7 +25,10 @@ extern xpc_connection_t nb_create_mach_service(const char *name, dispatch_queue_
     __asm__("_xpc_connection_create_mach_service");
 
 #define QCA_MANUFACTURER 29     /* 0x001d, Qualcomm; only used by bluetoothd for a metrics string (0x100272664) */
+/* the laurel build (userland/laurel/bt/build.sh) passes its own string */
+#ifndef FIRMWARE
 #define FIRMWARE "QCA6490 hpbtfw21.tlv (loaded by the kernel, negronibt=4)"
+#endif
 
 static void say(const char *fmt, const char *a, const char *b)
 {

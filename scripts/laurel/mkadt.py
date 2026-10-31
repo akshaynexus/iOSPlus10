@@ -26,6 +26,8 @@ UFS, buttons, D22AP /product) and changes what differs on the Mi A3:
     3264 MiB (window 0xE1004000..0x1AD004000; the largest 64 MiB multiple that leaves 256 MiB for UEFI, at most 4608 MiB,
     the TOPAZ_4K bootstrap page-table limit). An older FD (Kernel RAM to 0xC0000000): 768 MiB, as before, with a
     "LAUREL RAM: off:" line.
+  * /arm-io/bluetooth (kernel patch 2600): local-mac-address (fallback 02:4c:41:33:42:54, synthetic),
+    transport-encoding 3 (H4BC), transport-speed 3000000, as the negroni [adt.bluetooth] node.
   * /chosen laurel-ram-banks (u64 base/size pairs): the DDR banks XNU may manage, B 0x80000000 + 1 GiB and
     C 0xC0000000 + 4 GiB (they touch; bank A 0x40000000-0x7CC00000 holds every fixed carve-out). /chosen
     laurel-ram-reserved: device pools that must stay out of kernel RAM: 0xC0000000 + 512 MiB (Adreno GPU pool) and
@@ -59,6 +61,10 @@ UEFI_HEADROOM = 256 << 20        # room left in "Kernel RAM" above the window fo
 DARWINBOOT_BLOCK, KERNEL_BLOCK_OFFSET = 2 << 20, 0x4000   # DarwinBoot.c BLOCK_SIZE; VM_KERNEL_LINK_ADDRESS & 0x1FFFFF
 FB_W, FB_H = 720, 1560
 LAUREL_ECID = 0x4C415552454C0001       # 'LAUREL' + 1, synthetic (not the phone's)
+# Bluetooth (patch 2600): fallback address, locally administered, synthetic (not the phone's), used only when the
+# WCN3990 has no unique address of its own; the speed the kernel leaves the chip at
+BT_ADDR = bytes.fromhex('024c41334254')   # 02:4c:41:33:42:54 ("LA3BT")
+BT_SPEED = 3000000
 GOLD_HZ, SILVER_HZ = 2000000000, 1800000000   # SM6125: Gold 2.0 GHz, Silver 1.8 GHz [I: public spec; OSM LUT not read yet]
 
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
@@ -162,7 +168,22 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
     phandles = iter(range(max(used) + 1, max(used) + 100))
     cpus = find(root, 'cpus')
     cpus.children = cpu_nodes(cores, phandles, boot)
+    arm_io.children = [c for c in arm_io.children if c.name != 'bluetooth']
+    arm_io.children.append(bluetooth_node(next(phandles)))
     return root
+
+
+def bluetooth_node(phandle):
+    """/arm-io/bluetooth for iOS bluetoothd (kernel patch 2600, docs/laurel_sprout/bluetooth.md). SweetPlatformExpert
+    makes it the registry entry "bluetooth" that bluetoothd 20H392 looks for; it reads local-mac-address,
+    transport-encoding (3 = H4BC) and transport-speed. The kernel puts the address in use into local-mac-address
+    (the chip's own one when unique) and hides the node when Bluetooth is off."""
+    n = adt.Node()
+    n.props = [('name', 0, cstr('bluetooth')), ('AAPL,phandle', 0, u32(phandle)),
+               ('device_type', 0, cstr('bluetooth')), ('compatible', 0, cstr('bluetooth,wcn3990')),
+               ('local-mac-address', 0, BT_ADDR), ('transport-encoding', 0, u32(3)),
+               ('transport-speed', 0, u32(BT_SPEED)), ('vendor-id', 0, u32(0x05ac)), ('product-id', 0, u32(0x12a0))]
+    return n
 
 
 def mu_kernel_ram(fd_path):
