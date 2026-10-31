@@ -4,10 +4,11 @@ diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.c
 index 291bf77..c279367 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -52,6 +52,16 @@ extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
+@@ -52,7 +52,17 @@ extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
  extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
  /* laurel 2100 (osfmk/arm64/laurel_ram.c): the LAUREL RAM line, repeated at the first surface for the USB log */
  extern "C" const char *laurel_ram_summary(void);
+ extern "C" uint64_t laurel_ram_free_below_4g(void);
 +/*
 + * laurel 2151 (TopazAdreno.cpp, 2150): the GPU is on by default (gpu=0 kills it). wanted = not killed and not
 + * failed; gl_active = backboardd's Mesa opened the GPU (GL loaded). Placement: backboardd's screen surfaces from
