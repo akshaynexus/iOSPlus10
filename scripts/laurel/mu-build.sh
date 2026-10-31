@@ -4,6 +4,11 @@
 #   scripts/bg.sh laurel-mu scripts/laurel/mu-build.sh [DEBUG|RELEASE]      (always in tmux; 10-30 min the first time)
 #   SETUP=0: skip the submodule setup (scripts/uefi/setup-mu.sh) when the tree is already prepared
 #   CLEAN=1: empty Build/laurel_sproutPkg first
+#   MU_RAM_LAYOUT=static (default) | late: memory map for the XNU window (docs/laurel_sprout/uefi-boot.md "RAM").
+#     static = mu 0101: "Kernel RAM" 0xE1000000-0x1C0000000 in the static map (6 GB Mi A3 only; UEFI allocates
+#     above 4 GiB from its first DXE). late = mu late/0101 instead (applied last): 240 MiB "UEFI RAM" 0x81000000
+#     for early UEFI, RamManagerDxe adds 0xE1000000-0x1C0000000 late. Use late when Mu dies with the static map.
+#     The ADT follows the FD (mkadt.py --dram auto); both give the window 0xE1004000 + 3264 MiB.
 # Base: external/Mu-Silicium-negroni (akshaynexus fork of Project-Silicium/Mu-Silicium; it carries the UniXNU/DarwinBoot
 # pieces negroni uses: SEC entry-argument HOB, NegroniBootMemoryDxe, Mu_Basecore boot-menu/timer patches). Its
 # Platforms/Xiaomi/laurel_sproutPkg is identical to upstream Mu-Silicium 4bd8ae83 (checked 2026-11-01); our
@@ -38,21 +43,28 @@ say "venv $VENV: $("$VENV/bin/python3" -c 'import edk2toolext; print("edk2toolex
 if [ "${SETUP:-1}" = 1 ]; then
   "$REPO/scripts/uefi/setup-mu.sh"
 fi
-git -C "$UNIXNU" submodule update -q --init --depth 1 drivers/DarwinBoot
-say "DarwinBoot $(git -C "$UNIXNU/drivers/DarwinBoot" rev-parse --short HEAD), UniXNU $(git -C "$UNIXNU" rev-parse --short HEAD), Mu fork $(git -C "$MU" rev-parse --short HEAD)"
-
-# 3. Our laurel changes: reset every file they touch, then apply them in order (re-runnable; a later patch may
-# change a file an earlier one changed, e.g. mu 0101 after 0001). A patch whose paths start with DarwinBootPkg/
-# (mu 0102) goes to UniXNU's DarwinBoot submodule, the others to the Mu tree.
+# 3. Our laurel changes: reset every file they touch (before the DarwinBoot submodule update: a pin change cannot
+# check out over a patched file), then apply them in order (re-runnable; a later patch may change a file an
+# earlier one changed, e.g. mu 0101 after 0001). A patch whose paths start with DarwinBootPkg/ (mu 0102) goes to
+# UniXNU's DarwinBoot submodule, the others to the Mu tree. MU_RAM_LAYOUT=late: late/*.patch replace 0101, last.
 DB=$UNIXNU/drivers/DarwinBoot
+LAYOUT=${MU_RAM_LAYOUT:-static}
+case "$LAYOUT" in static|late) ;; *) echo "mu-build: MU_RAM_LAYOUT must be static or late" >&2; exit 1 ;; esac
 target() { if grep -q '^+++ b/DarwinBootPkg/' "$1"; then echo "$DB"; else echo "$MU"; fi; }
-for pt in "$REPO"/patches/laurel/mu/*.patch; do
+for pt in "$REPO"/patches/laurel/mu/*.patch "$REPO"/patches/laurel/mu/late/*.patch; do
   [ -f "$pt" ] || continue
   t=$(target "$pt")
+  [ -e "$t/.git" ] || continue
   grep -E '^\+\+\+ b/' "$pt" | sed 's|^+++ b/||' | while read -r f; do git -C "$t" checkout -q -- "$f" 2>/dev/null || true; done
 done
-for pt in "$REPO"/patches/laurel/mu/*.patch; do
-  [ -f "$pt" ] || continue
+git -C "$UNIXNU" submodule update -q --init --depth 1 drivers/DarwinBoot
+say "DarwinBoot $(git -C "$UNIXNU/drivers/DarwinBoot" rev-parse --short HEAD), UniXNU $(git -C "$UNIXNU" rev-parse --short HEAD), Mu fork $(git -C "$MU" rev-parse --short HEAD), RAM layout $LAYOUT"
+if [ "$LAYOUT" = late ]; then
+  PATCHES=$(ls "$REPO"/patches/laurel/mu/*.patch | grep -v '/0101-'; ls "$REPO"/patches/laurel/mu/late/*.patch)
+else
+  PATCHES=$(ls "$REPO"/patches/laurel/mu/*.patch)
+fi
+for pt in $PATCHES; do
   t=$(target "$pt")
   git -C "$t" apply "$pt"
   say "applied $(basename "$pt") to $([ "$t" = "$DB" ] && echo DarwinBoot || echo Mu)"

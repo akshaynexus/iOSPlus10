@@ -1,0 +1,36 @@
+laurel mu 0103: laurel_sprout.dsc options for the XNU window (kernel patch 2100). (1) PcdSmbiosEntryPointProvideMethod 0x2: SMBIOS 3.x
+64-bit entry point only. SmbiosDxe allocates the 32-bit table AllocateMaxAddress 0xFFFFFFFF, i.e. just below 4 GiB, inside the window
+run 0xE1000000-0x1C0000000 (Mu 0101): the run would split at 0xFFFFF000 and DarwinBoot would find no 3264 MiB window. XNU reads no
+SMBIOS. (2) DarwinBoot BuildOptions DARWINBOOT_MAX_WINDOW 4608 MiB and DARWINBOOT_LOW4G_MIN 256 MiB (laurel mu 0102).
+diff --git a/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc b/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc
+index e35da387..107c7480 100644
+--- a/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc
++++ b/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc
+@@ -33,6 +33,13 @@
+   #
+   gEfiMdePkgTokenSpaceGuid.PcdDebugPropertyMask|0x0F
+ 
++  #
++  # iOSPlus10 laurel mu 0103: SMBIOS 3.x 64-bit entry point only. The 32-bit table is allocated
++  # AllocateMaxAddress 0xFFFFFFFF (SmbiosDxe.c), i.e. just below 4 GiB, inside the XNU window run
++  # 0xE1000000-0x1C0000000: DarwinBoot then found no run for the window. XNU reads no SMBIOS.
++  #
++  gEfiMdeModulePkgTokenSpaceGuid.PcdSmbiosEntryPointProvideMethod|0x2
++
+   #
+   # DDR Memory
+   #
+@@ -88,7 +95,12 @@
+   #
+   UniXNUPkg/Application/UniXNU/UniXNU.inf
+   UniXNUPkg/Driver/UniXNUDxe/UniXNUDxe.inf
+-  DarwinBootPkg/Driver/DarwinBoot.inf
++  # iOSPlus10 laurel mu 0103: the window limits of laurel mu 0102 (TOPAZ_4K start.s table budget 4608 MiB;
++  # a run must start below 4 GiB and hold 256 MiB there: USB/UFS DMA, MDP scanout)
++  DarwinBootPkg/Driver/DarwinBoot.inf {
++    <BuildOptions>
++      *_*_*_CC_FLAGS = -DDARWINBOOT_MAX_WINDOW=0x120000000ULL -DDARWINBOOT_LOW4G_MIN=0x10000000ULL
++  }
+   negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.inf
+ 
+   #

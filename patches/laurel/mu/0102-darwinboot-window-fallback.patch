@@ -1,20 +1,43 @@
-laurel mu 0102 (DarwinBoot, external/UniXNU/drivers/DarwinBoot): when no UEFI run holds the window the ADT asks for
-(darwinboot-memory-size), DarwinBoot takes the biggest window a run holds (2 MiB multiple, >= 256 MiB) and passes that size to
-XNU (boot_args memSize = memSizeActual), instead of stopping with "NO WINDOW". Screen line "WINDOW <size> OF <asked> @ <base>"
-and a DEBUG line; XNU patch 2100 then reports "LAUREL RAM: on: ... ; DarwinBoot gave N of the M MiB the ADT asks". So a Mu FD
-with less free RAM than the ADT expects (e.g. an FD from before mu 0101 with the 4608 MiB ADT) costs RAM, not the boot.
-scripts/laurel/mu-build.sh applies it to the DarwinBoot submodule of UniXNU (paths start with DarwinBootPkg/).
+laurel mu 0102 (DarwinBoot, external/UniXNU/drivers/DarwinBoot): window fallback and platform limits.
+(1) When no UEFI run holds the window the ADT asks for (darwinboot-memory-size), DarwinBoot takes the biggest window a usable run
+holds (2 MiB multiple, >= 256 MiB) and passes that size to XNU (boot_args memSize = memSizeActual), instead of stopping with
+"NO WINDOW". Screen line "WINDOW <size> OF <asked> @ <base>" and a DEBUG line. No usable run: "NO WINDOW" + the FREE list, as before.
+(2) Two C defines a platform DSC may set (laurel mu 0103 does; without them DarwinBoot behaves as before, e.g. for negroni):
+DARWINBOOT_MAX_WINDOW caps the window (Mi A3 TOPAZ_4K kernel: start.s bootstrap tables map the whole window; 4608 MiB fits the
+16-page budget), DARWINBOOT_LOW4G_MIN makes a run usable only when the window starts below 4 GiB with at least that much below 4 GiB
+(Mi A3: 256 MiB; USB/UFS DMA and the MDP scanout need kernel RAM below 4 GiB). XNU patch 2100 then reports
+"LAUREL RAM: on: ... ; DarwinBoot gave N of the M MiB the ADT asks". scripts/laurel/mu-build.sh applies it to the DarwinBoot submodule
+of UniXNU (paths start with DarwinBootPkg/).
 diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
-index ddb1fa8..afdb933 100644
+index ddb1fa8..b6d9121 100644
 --- a/DarwinBootPkg/Driver/DarwinBoot.c
 +++ b/DarwinBootPkg/Driver/DarwinBoot.c
-@@ -396,10 +396,16 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
+@@ -396,10 +396,35 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
    }
  }
  
-+// iOSPlus10 laurel mu 0102: when no run holds the asked window, take the biggest window a run holds (2 MiB
-+// multiple, at least the DarwinWindowSizeValid minimum) and pass that size to the kernel (boot_args memSize):
-+// a Mu map with less free RAM than the ADT expects costs RAM, not the boot. One line on the screen and the log.
++// iOSPlus10 laurel mu 0102. Two platform options (C defines from the platform DSC; without them DarwinBoot
++// behaves as before):
++//   DARWINBOOT_MAX_WINDOW  cap of the window (the kernel's bootstrap page tables map all of it);
++//   DARWINBOOT_LOW4G_MIN   a run is used only when the window starts below 4 GiB with at least this much of
++//                          it below 4 GiB (devices with 32-bit DMA need kernel RAM there).
++// When no run holds the asked window, the biggest window a usable run holds (2 MiB multiple, at least the
++// DarwinWindowSizeValid minimum) is taken and its size goes to the kernel (boot_args memSize): one line
++// "WINDOW <size> OF <asked> @ <base>" on the screen and the log. No usable run: "NO WINDOW" + the FREE list.
++#define DARWINBOOT_4G  0x100000000ULL
++
++STATIC
++BOOLEAN
++WindowRunUsable (UINT64 Candidate, UINT64 End)
++{
++  if (End <= Candidate) { return FALSE; }
++#ifdef DARWINBOOT_LOW4G_MIN
++  if (Candidate >= DARWINBOOT_4G) { return FALSE; }
++  if (MIN (End, DARWINBOOT_4G) - Candidate < DARWINBOOT_LOW4G_MIN) { return FALSE; }
++#endif
++  return TRUE;
++}
++
  STATIC
  EFI_STATUS
 -AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
@@ -26,28 +49,36 @@ index ddb1fa8..afdb933 100644
    EFI_MEMORY_DESCRIPTOR *Map;
    EFI_MEMORY_DESCRIPTOR *Descriptor;
    EFI_STATUS            Status;
-@@ -419,6 +425,8 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
+@@ -419,6 +444,14 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
    Capacity = 0;
    BestStart = 0;
    BestBytes = 0;
 +  FitStart = 0;
 +  FitBytes = 0;
++#ifdef DARWINBOOT_MAX_WINDOW
++  if (WindowSize > DARWINBOOT_MAX_WINDOW) {
++    DEBUG ((DEBUG_ERROR, "DARWINBOOT: window 0x%lx capped at 0x%lx\n", WindowSize, (UINT64)DARWINBOOT_MAX_WINDOW));
++    WindowSize = DARWINBOOT_MAX_WINDOW;
++  }
++#endif
    Status = GetMap (&Map, &Capacity, &Size, &Key, &Stride);
    if (EFI_ERROR (Status)) { if (Map != NULL) { FreePool (Map); } return Status; }
    Status = EFI_OUT_OF_RESOURCES;
-@@ -430,10 +438,28 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
+@@ -430,9 +463,27 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
      RunBytes = End - Descriptor->PhysicalStart;
      if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
      Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
-+    if ((Candidate >= Descriptor->PhysicalStart) && (End > Candidate) &&
-+        (((End - Candidate) & ~((UINT64)BLOCK_SIZE - 1)) > FitBytes)) {
+-    if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
++    if ((Candidate < Descriptor->PhysicalStart) || !WindowRunUsable (Candidate, End)) { continue; }
++    if (((End - Candidate) & ~((UINT64)BLOCK_SIZE - 1)) > FitBytes) {
 +      FitBytes = (End - Candidate) & ~((UINT64)BLOCK_SIZE - 1);
 +      FitStart = Candidate;
 +    }
-     if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
++    if (End - Candidate < WindowSize) { continue; }
      Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
-     if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
-   }
+-    if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
++    if (!EFI_ERROR (Status)) { *Address = Candidate; *WindowSizeInOut = WindowSize; break; }
++  }
 +  if (EFI_ERROR (Status) && (FitBytes < WindowSize) && DarwinWindowSizeValid (FitBytes)) {
 +    Candidate = FitStart;
 +    Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (FitBytes), &Candidate);
@@ -60,11 +91,10 @@ index ddb1fa8..afdb933 100644
 +      *Address = Candidate;
 +      *WindowSizeInOut = FitBytes;
 +    }
-+  }
+   }
    if (EFI_ERROR (Status)) {
      CHAR16 Line[96];
-     UINTN  Row = 1;
-@@ -599,7 +625,7 @@ Boot (
+@@ -599,7 +650,7 @@ Boot (
    }
    Status = ReadBootVideo (Video);
    if (EFI_ERROR (Status)) { goto Fail; }
