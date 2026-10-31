@@ -52,7 +52,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  	for (vm_offset_t offset = 0; offset < gicr_size; offset += GICR_PE_SIZE) {
  		vm_offset_t gicr_pe_base = gicr_base + offset;
  		uint64_t gicr_typer = gicr_read64(GICR_TYPER);
-@@ -69,10 +99,183 @@
+@@ -69,10 +99,200 @@
  			break;
  		}
  	}
@@ -183,10 +183,27 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 +		printf("LAUREL GIC: off: no redistributor init ran on the boot CPU\n");
 +		return;
 +	}
++	/*
++	 * laurel 2016 (boot 2026-11-01 03:41): the writes of pe_init_fiq vanished on
++	 * the UEFI path (Silver and Gold boot CPUs alike), but the same writes made
++	 * here, at LOCKDOWN, stuck and the timer ticked. Late re-enable: if the
++	 * timer PPI is not enabled now, program the frame again and read back.
++	 */
++	vm_offset_t gicr_pe_base = gicr_base + (vm_offset_t)(s->frame & 0x7FFFFFFF) * GICR_PE_SIZE;
++	uint32_t en_now = gicr_read32(GICR_ISENABLER0), en_late = en_now, late = 0;
++	if (!(en_now & (1U << sweet_vtimer_intid))) {
++		laurel_gicr_program(gicr_pe_base, s->want);
++		en_late = gicr_read32(GICR_ISENABLER0);
++		late = (en_late & (1U << sweet_vtimer_intid)) ? 1 : 2;
++		s->grp = gicr_read32(GICR_IGROUPR0);
++		s->prio16 = gicr_read32(GICR_IPRIORITYR0 + 16);
++		s->pend = gicr_read32(GICR_ISPENDR0);
++	}
 +	printf("LAUREL GIC: %s: boot cpu mpidr=0x%x gicr frame %u%s TYPER 0x%08x%08x IIDR 0x%08x PWRR 0x%x "
-+	    "ISENABLER0 0x%08x (was 0x%08x, want 0x%08x, try %u)\n",
-+	    s->tries ? "on" : "off", s->mpidr, s->frame & 0x7FFFFFFF, (s->frame & 0x80000000) ? " (fallback)" : "",
-+	    s->typer_hi, s->typer_lo, s->iidr, s->pwrr, s->en_after, s->en_before, s->want, s->tries);
++	    "ISENABLER0 0x%08x (was 0x%08x, want 0x%08x, try %u) at lockdown 0x%08x%s%08x\n",
++	    (s->tries || late == 1) ? "on" : "off", s->mpidr, s->frame & 0x7FFFFFFF, (s->frame & 0x80000000) ? " (fallback)" : "",
++	    s->typer_hi, s->typer_lo, s->iidr, s->pwrr, s->en_after, s->en_before, s->want, s->tries, en_now,
++	    late ? (late == 1 ? ", late re-enable OK -> 0x" : ", late re-enable FAILED -> 0x") : ", no re-enable needed 0x", en_late);
 +	printf("LAUREL GIC: IGROUPR0 0x%08x IGRPMODR0 0x%08x ISPENDR0 0x%08x ISACTIVER0 0x%08x ICFGR1 0x%08x "
 +	    "prio16 0x%08x WAKER 0x%x GICD_CTLR 0x%08x%s\n",
 +	    s->grp, s->grpmod, s->pend, s->active, s->cfg1, s->prio16, s->waker, gicd_read32(GICD_CTLR),

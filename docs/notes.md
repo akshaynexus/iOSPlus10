@@ -3709,3 +3709,18 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   `LAUREL USB: timer service:` lines are the only survivors of that part. 2016 therefore adds `laurel_gic_report_short()` to the
   NO-tick path (one line right after the timer-service lines: frame, PA, TYPER, IIDR, PWRR, GICR_CTLR, ISENABLER0 was/after/now,
   prio16 was/now, IGROUPR0, ICFGR1, a GICD ISENABLER1 bit-8 write test). The next photo must show this line.
+- [V boot 03:40:53, image 73ab4a4] **Timer, USB and PSCI secondaries work.** Panel: `LAUREL CPU: boot cpu mpidr=0x100 (Gold; hand-off
+  from Silver 0x0: PSCI CPU_ON rc=0, arrived mpidr=0x100 at EL1)`, `SWEET CPU: cpu=0 mpidr=0x100 came alive; SGI1 OK`, cpu=1..3
+  (0x101-0x103) and cpu=4..6 (Silver 0x0-0x2) `CPU_ON rc=0` + `came alive; SGI1 OK` (so the CPU_OFF of the Silver boot core works),
+  `SWEET I2C1: SE1 ready`, `SWEET BATTERY: static fallback`. Host: CDC-ECM interface after 15 s, `pong after 1 s`. Then a panic:
+  `op10tool ctl ping` answers `pong (panic)`, the panel is black (the panic came after the display was turned off or retargeted).
+- [I, strong] Why the timer ticked this time: the only kernel change was `laurel_gic_report_short()` in the NO-tick path, which
+  writes ISENABLER0/priorities again at LOCKDOWN. So the pe_init_fiq writes vanish on the UEFI path (both boot CPUs) but the same
+  writes ~1 s later stick. Candidate cause: the Silver core's PSCI CPU_OFF (TZ cluster/GIC power work) runs concurrently with the
+  kernel's early GICR writes on Gold; on the 03:14 Silver boot, Mu's exit path or TZ state may have had the same effect. 2015 now has
+  the late re-enable as a feature in `laurel_gic_report` (LOCKDOWN): `... at lockdown 0x.., late re-enable OK -> 0x..` or
+  `no re-enable needed`. Built 03:50 (217 patches, 0 LSE), image rebuilt, NOT flashed (the phone holds the panic).
+- [V] The USB log never reached a listener on this host: `ufw` is active (CachyOS default deny incoming); IP InReceives - InDelivers
+  grew by the number of log datagrams with no error counter, while the 5141 replies (conntrack) passed. Fix: `sudo ufw allow in on
+  <usb-if> to any port 5140 proto udp` (the auto-mode classifier refused to let the agent add this to usblog.sh; owner decision).
+  `ctl log` in panic mode re-sends the last 64 KiB after the rule is in place.
