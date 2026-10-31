@@ -1,7 +1,7 @@
 # Mi A3 Wi-Fi (WCN3990 through the modem)
 
-Area E, patches `patches/laurel/xnu/2400-2402`, on top of topaz 0113-0130 (TopazModem) and 0900
-(en0 + Apple80211 + MiniIONetworkStack for wifid). Status 2026-11-01: [V] builds (221 patches, 0 LSE),
+Area E, patches `patches/laurel/xnu/2400-2404`, on top of topaz 0113-0130 (TopazModem) and 0900
+(en0 + Apple80211 + MiniIONetworkStack for wifid). Status 2026-11-01: [V] builds on laurel-int-1 (0 LSE),
 [U] not booted.
 
 Labels: [V] read in source or measured on the host, [I] inference, [U] unknown.
@@ -21,7 +21,7 @@ Labels: [V] read in source or measured on the host, [I] inference, [U] unknown.
 6. SMP2P 435/428 (bit 14): READY, IPA power answer; GLINK IPCRTR over SMEM (bit 12); QRTR; our
    pd-mapper / tftp (files from the FAT index, `/readwrite` in RAM) / rmtfs (modemst1, modemst2, fsc,
    fsg read-only, writes not kept).
-7. WLFW (QMI 0x45): ind_register, host_cap, msa_info (MSA 0x53300000, 1 MiB, assigned to MSS/WLAN/WLAN_CE),
+7. WLFW (QMI 0x45): ind_register, host_cap, msa_info (MSA 0x53300000, 2 MiB, assigned to MSS/WLAN/WLAN_CE),
    msa_ready, cap (board id), board data `bdwlan.bNN`/`.NNN`/`.bin`, cal_report, FW_READY, wlan_cfg,
    mission mode. 2402 fallbacks for WLAN.HL.3.0.2 (below).
 8. Copy engines at 0xC800000+0x240000 (polled), HTC, WMI-TLV READY -> `LAUREL WIFI: on`, HTT, passive
@@ -55,7 +55,7 @@ no WLFW service in 30 s, WLFW stuck at a step (60 s), no WMI READY 30 s after mi
 | Item | Mi A3 | topaz | Change |
 | --- | --- | --- | --- |
 | Modem carve-out | pil_modem_mem 0x4b000000+0x7e00000; our modem.mdt loads 0x4b000000..0x52e00000 | 0x4ab00000+0x6900000 | 2401 |
-| MSA | wlan_msa_mem 0x53300000 (2 MiB), icnss `qcom,wlan-msa-memory` 0x100000 | 0x51900000, 1 MiB | 2401 |
+| MSA | wlan_msa_mem 0x53300000, 2 MiB: `qcom,wlan-msa-fixed-region` makes icnss use the region size (icnss.c:3767-3791), not `qcom,wlan-msa-memory` 0x100000 | 0x51900000, 1 MiB | 2401 |
 | WLAN SMMU stream | apps_smmu 0x80 mask 1 | 0x1a0 mask 1 | 2401 |
 | WLAN supplies | L8A cx-mx 0.64 V, L16A 1.8 V, L17A 1.304 V, L23A 3.0-3.312 V (PM6125, RPM SMD, set 3) | none voted | 2401 |
 | Firmware partition | modem_b (active slot b), FAT16 4 KiB sectors | modem_a, offset table | 2400 |
@@ -67,7 +67,7 @@ no WLFW service in 30 s, WLFW stuck at a step (60 s), no WMI READY 30 s after mi
 | RPM | rpm-glink, msg RAM 0x45F0000 (0x7000), "rpm_requests" | same | none |
 | PAS id | 4 (pil-tz-generic, qcom,mss@6080000) | 4 | none |
 | rmtfs | modemst1, modemst2, fsc, fsg (no slot suffix); sharedmem 0x200000 + guard | buffer 0x300000 | none (bigger buffer is fine) |
-| Modem pool | 0xE0000000+16 MiB (bank C 0xC0000000-0x1C0000000, not in the kernel window 0x81000000+0x30000000) | same | none [I] |
+| Modem pool | 0xE0000000-0xE1000000 (area A map, uefi-boot.md "Memory map": GPU 0xC0000000-0xE0000000, Mu reserves 0x80000000-0xE1000000, XNU 0xE1004000-0x1AD004000); one define, static_asserts (no GPU pool overlap, below 0xF0000000), boot check against [gPhysBase, +gPhysSize) | same base | 2401, 2404 |
 
 ## Firmware HL3.0 vs topaz [V source, I behaviour]
 
@@ -81,12 +81,13 @@ already in topaz; ath10k uses it for all WCN3990 firmware.
 
 ## Risks [I]
 
-- Modem pool 0xE0000000-0xE1000000: no other driver may use it. topaz's GPU pool 0x90000000+1 GiB lies
-  inside the Mi A3 kernel window; if the GPU area moves it to bank C, it must avoid this range.
+- Modem pool 0xE0000000-0xE1000000: area A owns the map (uefi-boot.md). Area F's audio code uses the same pool
+  through topaz_pool_alloc / topaz_soc_map (one pool, shared allocator), not a second one at the same base.
+  Overlap with XNU's RAM is checked at start (2404): `LAUREL MODEM POOL: off: ...`.
 - Apps SMMU writes: the trinket hypervisor may ignore them (read-back -> Wi-Fi off) or abort (panic). topaz
   does the same on SM6225 and it works there.
 - RPM: TopazRpm refuses the link when the GLINK FIFOs were used since boot (Mu/UEFI may use the RPM). Then
-  the supply votes are refused (logged) and the chip may be unpowered (WLFW stuck or modem crash).
+  the supply votes are refused and Wi-Fi turns off (`LAUREL WIFI: off: RPM refused ...`); the modem still boots.
 - Modem PIL proxy votes (CX turbo, CXO, crypto bus) are not made; topaz does not make them either.
 - EFS is read-only (rmtfs writes are dropped), as on topaz.
 - Not booted yet: every number above the "[V]" rows needs the first boot log.
@@ -97,3 +98,18 @@ already in topaz; ath10k uses it for all WCN3990 firmware.
 2. If `modem boot: ... auth_and_reset refused`: check the PAS proxy votes (CX corner over RPM `rwcx`).
 3. If `WLFW stuck`: the step tells which message; compare with icnss order (no host_cap).
 4. If `on`: Settings > Wi-Fi lists networks (scan results also in `TopazModem: scan:` lines).
+
+## Review fixes (2026-11-01, 2400-2404)
+
+- 2400: FAT size in 64 bits, at most 0x0FFFFFF5 clusters, data area inside the GPT partition size
+  (`sweet_ufs_part_info`), 1024-directory budget, a directory already on the scan path is skipped, 255-character
+  paths, a directory that cannot be read is skipped, the cluster walk for the fragment count is capped; a WARNING
+  line when the modem partition used is not the active slot's. The host model (`op10tool fatls`, `--part-bytes`,
+  default 184320 KiB) has the same limits; `tools/op10tool/tests/fatls-test.sh` checks it on mkfs.fat FAT16/FAT32
+  images (long names, 13-deep path, fragmented file, path over 255 characters, partition too small).
+- 2401: MSA 2 MiB; refused RPM vote -> Wi-Fi off; `on` also after an earlier `off`; WLFW timers start again when
+  WLFW restarts; pool define with static_asserts.
+- 2403: rmtfs RW_IOVEC entries must lie inside their TLV.
+- 2404 (shared with TopazAudio): one lock over every TrustZone call incl. the resume loop, SCM_V2_EBUSY retried
+  (30 ms, 100 times); one lock over the SMMU stream setup; pool vs XNU RAM check. `topaz_part_fw_size/read` stay
+  for TopazAudio (paths like `image/adsp.mdt`).

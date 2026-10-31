@@ -570,3 +570,8 @@ dark, then back with a fade). Details: notes.md, same date, 04:40.
   Details: `docs/laurel_sprout/wifi.md`. No root-image change (the ADT `wlan` node for wifid is in mkadt.py already).
 - Not booted. Next (coordinator): boot, read `TopazModem: firmware:`, `smmu:`, `wlan: RPM`, PAS, `wlfw:` lines and `LAUREL WIFI:`;
   then Settings > Wi-Fi. If `off`, the reason names the step (wifi.md "Next").
+- Review fixes 2026-11-01 04:56 [V build]: 2400-2404 rebased on origin/laurel-int-1 (232 patches, 0 LSE, kernel sha256 545cab2a18a1c392...):
+  FAT bounds, MSA 2 MiB, RPM refusal -> Wi-Fi off, TrustZone/SMMU locks shared with TopazAudio, pool vs XNU RAM check (area A map:
+  pool 0xE0000000-0xE1000000 unchanged). `tools/op10tool/tests/fatls-test.sh` all ok. No image built in this round (needs the Mu FD
+  with area A's 0101); the coordinator builds it.
+

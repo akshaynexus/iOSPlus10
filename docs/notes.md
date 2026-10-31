@@ -3833,7 +3833,7 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   closed-loop only when the root has RedwoodAudio.driver + VirtualAudio.plugin: today it has neither [V root.sh, topaz
   sweet-root-tweaks.py moves VirtualAudio to HAL.disabled], so expect `LAUREL HAPTIC UI: off` and ringtone vibration only; UI and
   keyboard taps need the audio plug-in in the root. Built 04:26 (220 patches, 0 LSE, no new warnings). NOT BOOTED.
-## Mi A3 Wi-Fi (area E, 2026-11-01, branch t3/laurel-wifi-modem-firmware): patches 2400-2402, build only
+## Mi A3 Wi-Fi (area E, 2026-11-01, branch t3/laurel-wifi-modem-firmware): patches 2400-2404, build only
 
 Details and expected lines: `docs/laurel_sprout/wifi.md`.
 - [V] topaz 0115/0121 read the modem firmware at fixed byte offsets of HyperOS 2.0.208's NON-HLOS (generator fwtable_all.py not
@@ -3847,8 +3847,8 @@ Details and expected lines: `docs/laurel_sprout/wifi.md`.
   `scripts/laurel/modem-fw-check.sh` (CRC-32 equal to mtools for wlanmdsp.mbn: 513030ce).
 - [V] modem.mdt: 31 phdrs, hash segment 1 (0x1f78 bytes, split into modem.b01), relocatable, load range 0x4b000000..0x52e00000 =
   exactly trinket pil_modem_mem; topaz's check (0x4ab00000+0x6900000) would refuse it. No modem.b13/b19/b30 (filesz 0).
-- [V] trinket.dtsi: icnss membase 0xC800000, CE SPI 358-369, iommus apps_smmu 0x80 mask 1, `qcom,wlan-msa-memory` 0x100000 in
-  wlan_msa_mem 0x53300000 (2 MiB), supplies L8A (WCSS_CX, 0.64 V), L16A 1.8 V, L17A (icnss default 1.304 V), L23A (3.0-3.312 V);
+- [V] trinket.dtsi: icnss membase 0xC800000, CE SPI 358-369, iommus apps_smmu 0x80 mask 1, wlan_msa_mem 0x53300000 (2 MiB; it has
+  `qcom,wlan-msa-fixed-region`, so icnss uses the region size, not `qcom,wlan-msa-memory` 0x100000), supplies L8A (WCSS_CX, 0.64 V), L16A 1.8 V, L17A (icnss default 1.304 V), L23A (3.0-3.312 V);
   pil_modem pil-tz-generic PAS 4, proxy vdd_cx TURBO + CXO (not voted, as topaz); SMP2P 435/428 mbox 14 SPI 70; GLINK modem mbox 12
   SPI 68; RPM over glink-rpm msg RAM 0x45F0000 (same as khaje: TopazRpm works unchanged); rmtfs sharedmem 0x200000 + guard.
 - [V] Firmware versions (NON-HLOS verinfo): WLAN.HL.3.0.2-00215, MPSS.AT.4.3.1-00206.2, ADSP.VT.5.4. icnss 4.14 sends no host_cap
@@ -3856,6 +3856,11 @@ Details and expected lines: `docs/laurel_sprout/wifi.md`.
   indication, wait for FW_READY after a refused board data).
 - [V] 2401: Wi-Fi on by default (`modem=0` / `wifi=0` kill switches), one line `LAUREL WIFI: on: modem up, WLFW ready, board id 0x..,
   MAC .. (modem_b)` or `LAUREL WIFI: off: <first failure>`. Kernel 221 patches, 0 LSE, no TopazModem warning.
-- [I] Risks: modem pool 0xE0000000+16 MiB in bank C must stay free (topaz's GPU pool 0x90000000+1 GiB is inside the Mi A3 kernel
-  window 0x81000000+0x30000000 and must move; not to this range); apps SMMU writes under the trinket hypervisor; TopazRpm refuses
-  if Mu used the RPM FIFOs (supply votes then refused, logged).
+- [I] Risks: modem pool 0xE0000000+16 MiB must stay free (area A map: GPU 0xC0000000-0xE0000000, XNU from 0xE1004000; at the time
+  of the first build the ADT window was 0x81000000+0x30000000 and topaz's GPU pool 0x90000000 lay inside it); apps SMMU writes under
+  the trinket hypervisor; TopazRpm refuses if Mu used the RPM FIFOs (supply votes refused -> Wi-Fi off after the review fixes).
+- [V review 2026-11-01] Fixes 2400-2404 (details `wifi.md` "Review fixes"): FAT bounds against the GPT partition,
+  MSA 2 MiB, RPM refusal -> Wi-Fi off, TrustZone call lock + EBUSY retry and SMMU lock (TopazAudio runs PAS and
+  the SMMU setup in parallel), pool vs XNU RAM check. Area A map: modem pool stays 0xE0000000-0xE1000000.
+  op10tool fatls fixture test: FAT32 mtools allocates after the FSInfo next-free hint, so the test resets the
+  hint to get a fragmented file.

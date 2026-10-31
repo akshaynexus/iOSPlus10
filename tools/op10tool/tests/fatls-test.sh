@@ -35,6 +35,10 @@ for fat in 16 32; do
   # fragmented: a.bin, b.bin, delete a.bin, big.bin fills a's hole and goes on after b.bin
   mcopy -i "$I" "$T/src/a.bin" "$T/src/b.bin" ::/image/
   mdel -i "$I" ::/image/a.bin
+  # FAT32: forget the FSInfo next-free hint (else mtools allocates after b.bin, not in the hole)
+  [ $fat = 32 ] && python3 -I -c 'import struct,sys
+f=open(sys.argv[1],"r+b"); bs=f.read(512); fsi=struct.unpack_from("<H",bs,48)[0]*512
+f.seek(fsi+492); f.write(b"\xff\xff\xff\xff")' "$I"
   mcopy -i "$I" "$T/src/big.bin" ::/image/
   deep=image; for k in 1 2 3 4 5 6 7 8 9 10 11 12; do deep=$deep/d$k; mmd -i "$I" "::/$deep"; done
   mcopy -i "$I" "$T/src/deep.bin" "::/$deep/"
