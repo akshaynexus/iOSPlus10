@@ -83,7 +83,30 @@ ADT (`scripts/laurel/mkadt.py --boot silver --dram 0x81000000:0x30000000 --darwi
 the window, `darwinboot-memory-size` = dram-size, `firmware-version` "laurel-uefi". The kernel reads none of
 `dram-base` (grep of all topaz and laurel patches); mkpayload (shim path) was its only user.
 
-## Boot CPU: Silver 0x0, no hand-off [decision 2026-11-01]
+## Boot CPU: Gold 0x100 after a PSCI hand-off at the kernel entry [decision 2026-11-01 03:40, patch 2016]
+
+Boot 03:14 (patch 2015) showed why Silver 0x0 cannot be the boot CPU: `ISENABLER0 0x00000000 ISPENDR0 0x08280000
+IGROUPR0 0x00000000` after pe_init_fiq had written the enable, `GICD_CTLR 0x12` (DS = 0: two security states).
+TrustZone keeps the SGIs/PPIs of the firmware's boot core in Group 0 (Secure); Non-secure writes to IGROUPR0 and
+ISENABLER0 for them are RAZ/WI; the virtual timer (INTID 19) pends for ever and no tick reaches EL1 NS. A core
+started with PSCI CPU_ON gets a redistributor set up for a NS OS (the shim path booted this kernel on Gold 0x100 that
+way, timer OK).
+
+`patches/laurel/xnu/2016-laurel-boot-handoff-gold.patch`: at the first instructions of `start_first_cpu` (MMU and
+caches off, x0 = boot_args PA, DarwinBoot's DarwinEnter state) a Silver core (MPIDR Aff1 == 0) calls
+PSCI CPU_ON(0x100, `laurel_handoff_entry` PA, boot_args PA), writes the result into `laurel_handoff_state` and turns
+itself off with PSCI CPU_OFF (shim patch 0002 logic: a parked core is ALREADY_ON for the kernel's later CPU_ON; the
+wfi loop stays as a fallback). Gold 0x100 arrives at `laurel_handoff_entry` at EL1 (or EL2: the EL2 setup of
+`sweet_secondary_entry` is repeated and it drops to EL1), stores its MPIDR/EL, and continues in `start_first_cpu`
+as the boot CPU: the white stage-0 band is then drawn by Gold. CPU_ON refused: Silver boots the kernel itself
+(2012 accepts MPIDR 0x0). DarwinBoot and Mu are unchanged (no MMU state to rebuild: the entry already runs with the
+MMU off and a physical x0). No kill switch (boot-args are not parsed yet); the feature turns itself off on a PSCI
+refusal. Report on the panel (SweetCPU::startAll): `LAUREL CPU: boot cpu mpidr=0x100 (Gold; hand-off from Silver
+0x0: PSCI CPU_ON rc=0, arrived mpidr=0x100 at EL1)` or `(Silver; hand-off off: PSCI CPU_ON rc=N, ...)`.
+ADT: `mkadt --boot gold` again (cpu0 = 0x100 `state = running`, Gold cluster 0 'P', Silver cluster 1 'E').
+2015 now writes only what NS may write (no IGROUPR0/IGRPMODR0/GICR_PWRR writes) and keeps its read-back lines.
+
+### Earlier decision (02:00, superseded): Silver 0x0, no hand-off
 
 ABL, BootShim, UEFI and DarwinBoot run on Kryo 260 Silver CPU0 (MPIDR 0x0, Cortex-A53 class, no 16K granule). The
 topaz shim woke Gold 0x100 with PSCI CPU_ON and parked Silver because its 16K kernel cannot run on Silver, and topaz
@@ -197,3 +220,7 @@ image is 2,535,424 bytes.
   the console ring = the USB log. NOT BOOTED yet; `scripts/bg.sh laurel-test ...` waits for fastboot (owner: Power+VolDown).
   Expected next photo: the `timer service:` line right after `trust caches`; if "on", the host enumerates the ECM
   device and `logs/laurel-boot-*.log` ends with the last `kernel_bootstrap_thread:` / `SWEET CPU:` line.
+- [V photo 03:14, image 93fa4fd] `LAUREL USB: timer service: NO tick in 50 ms: EL1 DAIF 0x200 ISR 0x0 CNTV_CTL 0x5 TVAL
+  -2070685 ICC SRE 0x1 PMR 0xf0 IGRPEN1 1 RPR 0xff CTLR 0x440 | GICD_CTLR 0x00000012 GICR WAKER 0x00000000 ISENABLER0
+  0x00000000 ISPENDR0 0x08280000 ISACTIVER0 0x00000000 IGROUPR0 0x00000000 prio 0x80 intid 19`: right frame (19, 21, 27
+  pending), enable refused, IGROUPR0 reads 0, DS = 0. Conclusion and fix: section "Boot CPU" above (patch 2016).

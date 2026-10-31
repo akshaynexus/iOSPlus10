@@ -3673,3 +3673,25 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   re-enumeration -71, "unable to enumerate" 03:15:29: EP0 still unserved. PHOTO PENDING: `LAUREL GIC:` lines decide (on + `timer
   service: on` = the fault moves into the DWC3 EP0 path; off = the enable is refused from EL1 NS on this frame: next is to compare
   with Mu's own GIC use of PPI 18 and the frame Mu picked, or boot on Gold 0x100 with a PSCI hand-off as the shim did).
+
+## Mi A3: boot 03:14 photo = timer PPI Group 0/Secure on the firmware core; patch 2016 PSCI hand-off to Gold (2026-11-01 03:50, branch laurel-sprout)
+- [V photo 03:14, image 93fa4fd] `LAUREL USB: timer service: NO tick in 50 ms: EL1 DAIF 0x200 ISR 0x0 CNTV_CTL 0x5 TVAL -2070685
+  ICC SRE 0x1 PMR 0xf0 IGRPEN1 1 RPR 0xff CTLR 0x440 | GICD_CTLR 0x00000012 GICR WAKER 0x00000000 ISENABLER0 0x00000000 ISPENDR0
+  0x08280000 ISACTIVER0 0x00000000 IGROUPR0 0x00000000 prio 0x80 intid 19`. The frame is right (19 = vtimer, 21, 27 pending), the
+  enable that 2015 wrote is gone again and IGROUPR0 reads 0 with GICD_CTLR.DS = 0 (two security states).
+- [I, strong] Reading: the SGIs/PPIs of the core the firmware booted on (Silver 0x0: ABL, Mu, DarwinBoot) are Group 0 = Secure in
+  TrustZone's redistributor setup; from EL1 NS the IGROUPR0 and ISENABLER0 bits of a Group 0 interrupt are RAZ/WI, so no NS write can
+  ever enable INTID 19 there. A core started with PSCI CPU_ON gets its redistributor set up for a NS OS by TrustZone (the shim path
+  booted this kernel on Gold 0x100 that way and the timer ticked). Lesson: on Qualcomm with DS = 0, boot XNU only on a core that
+  PSCI CPU_ON started; the firmware's own core is not usable as the boot CPU from NS.
+- Patch `2016-laurel-boot-handoff-gold`: in `start_first_cpu` (first instructions, MMU/caches off, x0 = boot_args PA) a Silver core
+  (MPIDR Aff1 == 0) does PSCI CPU_ON(0x100, `laurel_handoff_entry` PA, boot_args PA), records the rc in `laurel_handoff_state`
+  (64-byte __DATA line: attempted, rc, arrived MPIDR, CurrentEL), then PSCI CPU_OFF (shim 0002 logic; wfi only as fallback). Gold
+  arrives at EL1 (EL2 handled as sweet_secondary_entry: HCR/CNTHCTL/ICC_SRE_EL2, eret to EL1) and continues in start_first_cpu as
+  the boot CPU. CPU_ON refused: Silver boots on (2012 keeps MPIDR 0x0 legal). DarwinBoot/Mu untouched: the entry state is already
+  MMU off + physical x0, which is what PSCI gives. Report line `LAUREL CPU: boot cpu mpidr=0x100 (Gold; hand-off from Silver 0x0:
+  PSCI CPU_ON rc=0, arrived mpidr=0x100 at EL1)`. ADT `--boot gold` again (uefi-image.sh). No kill switch (boot-args unparsed).
+- 2015 revised: no IGROUPR0 / IGRPMODR0 / GICR_PWRR writes (Secure-only with DS = 0); clears, priorities, enables and the two
+  read-back lines stay.
+- Patch-writing lesson: a block-scoped `extern "C"` inside a function is an error in C++ (SweetCPU.cpp); declare at file scope.
+  `git apply` (what apply-xnu.sh uses) took a hunk that GNU `patch` refused; hunk headers must carry exact line counts.

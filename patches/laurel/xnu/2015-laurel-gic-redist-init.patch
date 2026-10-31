@@ -1,4 +1,4 @@
-laurel 2015: per-CPU GIC redistributor init with read-back (pe_fiq.c laurel_gicr_setup) and a panel report at STARTUP(LOCKDOWN). Boot 2026-11-01 02:57 on the UEFI path (Mu-Silicium -> UniXNU -> DarwinBoot, boot CPU Silver 0x0): the 2013 self-check read GICR ISENABLER0 bit 19 = 0 after pe_init_fiq had written it, CNTV_CTL ISTATUS=1, ICC/GICD fine: no timer tick reached the boot CPU, every thread starved (PE_lockdown_iokit, ud_thread, bsd_init). The setup now: find_gicr_pe_base prefers a frame whose TYPER is not 0 (a dead frame reads 0 and matches MPIDR 0x0); disable + deactivate + clear pending SGIs/PPIs, IGROUPR0 = ~0, IGRPMODR0 = 0, priority 0xA0, ISENABLER0 = vtimer 19 | ptimer 18 | IPI SGI 1; read back; on failure retry once after a GIC-600 GICR_PWRR power-on attempt. The boot CPU's record goes to the panel as 'LAUREL GIC: on|off: boot cpu mpidr=.. gicr frame N TYPER IIDR PWRR ISENABLER0 (was, want, try)' + a second line (IGROUPR0 IGRPMODR0 ISPENDR0 ISACTIVER0 ICFGR1 prio16 WAKER GICD_CTLR); secondaries kprintf one line into the ring. The 2013 USB check moves to RANK_SECOND and prints its GIC state on a second line (a 260-byte line was cut at the 256-byte console buffer). Harmless on the shim path (same writes as before plus the clears).
+laurel 2015: per-CPU GIC redistributor init with read-back (pe_fiq.c laurel_gicr_setup) and a panel report at STARTUP(LOCKDOWN). Boot 2026-11-01 02:57 on the UEFI path (Mu-Silicium -> UniXNU -> DarwinBoot, boot CPU Silver 0x0): the 2013 self-check read GICR ISENABLER0 bit 19 = 0 after pe_init_fiq had written it, CNTV_CTL ISTATUS=1, ICC/GICD fine: no timer tick reached the boot CPU, every thread starved (PE_lockdown_iokit, ud_thread, bsd_init). The setup now: find_gicr_pe_base prefers a frame whose TYPER is not 0 (a dead frame reads 0 and matches MPIDR 0x0); disable + deactivate + clear pending SGIs/PPIs, IGROUPR0 = ~0, IGRPMODR0 = 0, priority 0xA0, ISENABLER0 = vtimer 19 | ptimer 18 | IPI SGI 1; read back; on failure retry once after a GIC-600 GICR_PWRR power-on attempt. The boot CPU's record goes to the panel as 'LAUREL GIC: on|off: boot cpu mpidr=.. gicr frame N TYPER IIDR PWRR ISENABLER0 (was, want, try)' + a second line (IGROUPR0 IGRPMODR0 ISPENDR0 ISACTIVER0 ICFGR1 prio16 WAKER GICD_CTLR); secondaries kprintf one line into the ring. The 2013 USB check moves to RANK_SECOND and prints its GIC state on a second line (a 260-byte line was cut at the 256-byte console buffer). Harmless on the shim path (same writes as before plus the clears). Revised with laurel 2016: only registers NS may write (no IGROUPR0/IGRPMODR0/PWRR writes; GICD_CTLR.DS = 0 on this SoC), the read-back line stays.
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
@@ -52,7 +52,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  	for (vm_offset_t offset = 0; offset < gicr_size; offset += GICR_PE_SIZE) {
  		vm_offset_t gicr_pe_base = gicr_base + offset;
  		uint64_t gicr_typer = gicr_read64(GICR_TYPER);
-@@ -69,10 +99,147 @@
+@@ -69,10 +99,145 @@
  			break;
  		}
  	}
@@ -110,8 +110,12 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 +	}
 +	gicr_write32(GICR_ICACTIVER0, 0xFFFFFFFF);
 +	gicr_write32(GICR_ICPENDR0, 0xFFFFFFFF);
-+	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);        /* Group 1 (NS view: NS Group 1) */
-+	gicr_write32(GICR_IGRPMODR0, 0);                /* not Secure Group 1 */
++	/*
++	 * laurel 2016: no IGROUPR0 / IGRPMODR0 / GICR_PWRR writes: with GICD_CTLR.DS = 0
++	 * (two security states, boot 2026-11-01 03:14) they are Secure-only, RAZ/WI from
++	 * EL1 NS. The group of the SGIs/PPIs is what TrustZone set for this core (Group 1
++	 * NS on a CPU_ON core); only NS Group 1 enables, priorities and clears are ours.
++	 */
 +	for (unsigned int i = 0; i < 32; i += 4) {
 +		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0); /* below PMR */
 +	}
@@ -136,13 +140,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 +	st.want = laurel_gicr_want();
 +
 +	for (uint32_t t = 1; t <= 2; t++) {
-+		if (t == 2 && (gicr_read32(GICR_PWRR) & 0x1)) {
-+			/* GIC-600: a powered-down redistributor ignores writes. NS may not own PWRR; try. */
-+			gicr_write32(GICR_PWRR, 0);
-+			for (unsigned int i = 0; i < 100000 && (gicr_read32(GICR_PWRR) & 0x1); i++) {
-+				;
-+			}
-+		}
++		/* retry once (GICR_PWRR is read for the report only: Secure-owned) */
 +		laurel_gicr_program(gicr_pe_base, st.want);
 +		st.en_after = gicr_read32(GICR_ISENABLER0);
 +		if (st.en_after & (1U << sweet_vtimer_intid)) {
@@ -192,7 +190,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 +	printf("LAUREL GIC: IGROUPR0 0x%08x IGRPMODR0 0x%08x ISPENDR0 0x%08x ISACTIVER0 0x%08x ICFGR1 0x%08x "
 +	    "prio16 0x%08x WAKER 0x%x GICD_CTLR 0x%08x%s\n",
 +	    s->grp, s->grpmod, s->pend, s->active, s->cfg1, s->prio16, s->waker, gicd_read32(GICD_CTLR),
-+	    s->tries ? "" : " | timer PPI not enableable from EL1 NS on this frame");
++	    s->tries ? "" : " | timer PPI not enableable from EL1 NS on this frame (Group 0/Secure: firmware core?)");
 +}
 +STARTUP(LOCKDOWN, STARTUP_RANK_FIRST, laurel_gic_report);
 +#endif /* SWEET */
