@@ -1,0 +1,42 @@
+laurel 2017: Mi A3 touch pins and TLMM tiles (SM6125 trinket): reset GPIO 87, IRQ 88 (WEST 0x500000), ts_vdd enable 83 (SOUTH 0x900000), I2C GPIO 6/7 qup02 unchanged; QUP0 SE2 and GCC offsets are the same as topaz. Boots 2026-11-01 03:41 and 03:49 (UEFI path, iOS userland up to backboardd/SpringBoard) ended in the SError 'Unhandled implementation specific error' right after 'SWEET TOUCH: TLMM reset=0 irq=0 avdd=0': the next access was the topaz AVDD pin (GPIO 36) in the EAST tile at 0xd00000, which does not hold GPIO 36 on trinket. The IC probes (Goodix 0x5d, FocalTech 0x38) run as before and report what answers (hardware-map: GT9883 or FT3518).
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -26,13 +26,20 @@
+ 
+ #define TOUCH_SE_PA      0x04a88000u /* QUP0 SE2 */
+ #define TOUCH_GCC_PA     0x01400000u
+-#define TOUCH_WEST_PA    0x00500000u /* TLMM 0x400000 + WEST tile: GPIO 6/7/80/86 */
+-#define TOUCH_EAST_PA    0x00d00000u /* TLMM 0x400000 + EAST tile: GPIO 36 */
++/*
++ * laurel 2017 (Mi A3, SM6125 trinket): TLMM 0x400000, tiles WEST +0x100000, SOUTH +0x500000,
++ * EAST +0x900000 (pinctrl-trinket.c). Touch: GPIO 6/7 qup02 I2C (WEST), reset 87 (WEST), IRQ 88 (WEST),
++ * ts_vdd enable 83 (SOUTH). topaz used GPIO 86/80 and AVDD 36 in EAST; the EAST write for GPIO 36 raised
++ * the SError "Unhandled implementation specific error" on the Mi A3 (boot 2026-11-01 03:41, after backboardd).
++ * QUP0 SE2 and its GCC offsets (0x7900c vote bits 0x13c0, RCG 0x1f3a8) are the same on trinket.
++ */
++#define TOUCH_WEST_PA    0x00500000u /* TLMM + WEST tile: GPIO 6/7/87/88 */
++#define TOUCH_EAST_PA    0x00900000u /* TLMM + SOUTH tile: GPIO 83 (ts_vdd enable); field name kept */
+ #define TOUCH_GCC_VOTE   0x7900cu    /* QUP0 wrapper + SE2 vote, bits 0x13c0 */
+ #define TOUCH_RCG       0x1f3a8u    /* QUP0 S2 CMD; CFG +4, CBCR -4 (gcc-khaje.c) */
+-#define TOUCH_PIN_RESET  86u
+-#define TOUCH_PIN_IRQ    80u
+-#define TOUCH_PIN_AVDD   36u
++#define TOUCH_PIN_RESET  87u
++#define TOUCH_PIN_IRQ    88u
++#define TOUCH_PIN_AVDD   83u
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+ #define TOUCH_MAX        10u
+@@ -630,8 +637,8 @@
+ 	st.stage = "map";
+ 	printf("SWEET TOUCH: mapping GCC/TLMM/SE2\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x80000);
+-	st.west = ml_io_map(TOUCH_WEST_PA, 0x58000);
+-	st.east = ml_io_map(TOUCH_EAST_PA, 0x25000);
++	st.west = ml_io_map(TOUCH_WEST_PA, 0x59000);  /* up to GPIO 88 */
++	st.east = ml_io_map(TOUCH_EAST_PA, 0x54000);  /* up to GPIO 83 */
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+ 	if (!st.gcc || !st.west || !st.east || !st.se) {
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");

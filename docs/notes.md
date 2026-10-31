@@ -3724,3 +3724,14 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   grew by the number of log datagrams with no error counter, while the 5141 replies (conntrack) passed. Fix: `sudo ufw allow in on
   <usb-if> to any port 5140 proto udp` (the auto-mode classifier refused to let the agent add this to usblog.sh; owner decision).
   `ctl log` in panic mode re-sends the last 64 KiB after the rule is in place.
+- [V boot 03:48:48, image 73ab4a4, full live log `logs/laurel-boot-0349-full.log` after the ufw rule] `ctl bootloader` from the panic
+  hold reset the phone but ABL booted boot_b normally (no fastboot): the IMEM reason path does not reach the Mi A3 ABL fastboot;
+  owner buttons are still needed for a flash. The boot: `/dev/ufsroot0 on / (hfs)`, launchd boot tasks (data-protection, keybag,
+  usermanagerd ...), backboardd + SpringBoard IOKit matching, `SWEET TOUCH: mapping GCC/TLMM/SE2 ... TLMM reset=0 irq=0 avdd=0`,
+  then **`Unhandled implementation specific error`** (SError) = the same panic as 03:41. **iOS 16 userland runs on the Mi A3 up to
+  SpringBoard** on the UEFI path. The live log starts at the ue0 attach (the raw frames before it went out before the host
+  interface was up): the kernel's early lines are only on the panel.
+- Patch `2017-laurel-touch-pins`: the topaz touch driver wrote the AVDD pin GPIO 36 in the EAST tile (0xd00000), which does not
+  hold GPIO 36 on trinket -> SError. Mi A3 pins: reset 87, IRQ 88 (WEST 0x500000), ts_vdd enable 83 (SOUTH 0x900000); I2C
+  GPIO 6/7, QUP0 SE2, GCC vote 0x7900c/0x13c0, RCG 0x1f3a8 unchanged (gcc-trinket.c = gcc-khaje.c offsets). Built 03:55
+  (218 patches, 0 LSE), image rebuilt; `laurel-test` waits for the ABL fastboot (owner: power off, Power+VolDown).
