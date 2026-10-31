@@ -560,3 +560,16 @@ dark, then back with a fade). Details: notes.md, same date, 04:40.
   /dev/redwood-haptic; expected line `LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)`. Test: Settings > Sounds &
   Haptics > Ringtone > Vibration preview. UI/keyboard taps wait for the RedwoodAudio plug-in + VirtualAudio in the root
   (docs/laurel_sprout/haptics.md).
+
+## Mi A3: battery, charger, charge mode, power off, thermal + cpufreq built (2026-11-01 04:30, area D, patches 2300-2303)
+
+Done [V build]: 2300 PMI632 SID 2 SPMI reads + owner-checked writes; 2301 `laurel_pmi632.c` (QG gauge, ADC5 NTC, SoC model
+with SDAM save, SMB5 input limit + software JEITA, full IOPMPowerSource key set incl. AdapterDetails); 2302 charge-only boot
+(cold charger power-on -> no launchd, battery line every 10 s, power key = boot iOS, unplug = power off) + PS_HOLD SHUTDOWN
+type before PSCI SYSTEM_OFF (boot showed type 0x01 = warm reset); 2303 OSM governor (Silver + Gold) + TSENS caps instead
+of the topaz Gold pin. Kernel builds (223 patches, 0 LSE). Not booted. Details: `docs/laurel_sprout/battery-power.md`.
+Next (coordinator): boot; check `LAUREL BATTERY: on: PMI632 QG soc N% ...`, `LAUREL CHARGER: on: ...`, `LAUREL CPUFREQ: on`,
+`LAUREL THERMAL: on`, `LAUREL CHARGE MODE: on: normal boot (pon ..)`; iOS battery % = the logged soc; plug/unplug -> the
+`LAUREL CHARGER: on: SMB5 usbin ...` line and the bolt; `ctl poweroff` -> `PS_HOLD_RST_CTL 0x01 -> 0x04 (shutdown)` and the
+phone stays off; then power off + plug in the charger -> `charger power-on` line (charge mode).
+

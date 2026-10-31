@@ -1,0 +1,181 @@
+laurel 2300: SPMI reads of the PMI632 (SID 2) battery, charger, ADC and SDAM blocks, and owner-checked writes. sweet_spmi_read took SID 0 only (the PM6150 map of sweet): on the Mi A3 the gauge and the charger are at SID 2 (pmi632.dtsi), so no battery register was reachable even with the trinket arbiter bases of 2018. New: sweet_spmi_owner() (ownership table cnfg 0x700 + 4 * APID) and sweet_spmi_write() (EXT_WRITEL on the APID's rw channel, only EE 0 APIDs, only the SMB5 FCC/FV/ICL registers, the VADC conversion request and our SDAM record 0xa8..0xaf). Reads and writes keep the lock and the per-APID poison of the topaz reader.
+
+diff -ruN a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c	2026-11-01 04:17:22.474216041 +0530
++++ b/bsd/dev/sweet_spmi.c	2026-11-01 04:18:00.268420263 +0530
+@@ -1,8 +1,7 @@
+ /*
+- * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+- * Init is serialized by the single built-in SweetBattery personality.
++ * Battery adaptation of input/sweet_keys.c, observer EXT_READL.
++ * laurel 2300: plus owner-checked writes to a short list of PMI632 registers
++ * (charger limits, ADC conversion request, our SDAM record), see sweet_spmi_write.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -143,14 +142,71 @@
+ 	return sp_pon_wait(sp_pon_rw, 0);
+ }
+ 
++/*
++ * laurel 2300: the PMI632 (SID 2) battery, charger, ADC and SDAM blocks, and locked writes.
++ * Mi A3 PMICs (trinket.dtsi, pmi632.dtsi): PM6125 = SID 0/1, PMI632 = SID 2/3. Before this patch
++ * the reader took SID 0 only (the PM6150 map of sweet): no PMI632 register was reachable.
++ * Reads: observer channel (EE 0) of the peripheral's APID, any owner. Writes: the APID's rw channel,
++ * only when the ownership table (cnfg 0x700 + 4 * APID, [2:0]) gives the APID to EE 0 (apps), as
++ * spmi-pmic-arb.c pmic_arb_write_cmd checks; an APID owned by another EE is refused (-1), never
++ * forced. Both are limited to the peripherals below; the keys and the PON lane keep their own paths.
++ */
++static bool
++sp_read_allowed(unsigned sid, unsigned peripheral)
++{
++	if (sid == 2) {
++		return peripheral == 0x08 ||                        /* PMI632 PON (reasons) */
++		       (peripheral >= 0x10 && peripheral <= 0x16) || /* SMB5 CHGR..MISC */
++		       peripheral == 0x31 ||                        /* VADC (ADC5 user) */
++		       peripheral == 0x48 ||                        /* QG */
++		       peripheral == 0xb1;                          /* QG SDAM */
++	}
++	return false;
++}
++
++static bool
++sp_write_allowed(unsigned sid, unsigned addr)
++{
++	unsigned peripheral = addr >> 8, reg = addr & 0xffu;
++	if (sid != 2) {
++		return false;
++	}
++	switch (peripheral) {
++	case 0x10:      /* CHGR: FCC 0x61, FV 0x70 */
++		return reg == 0x61 || reg == 0x70;
++	case 0x13:      /* USBIN: ICL cfg 0x70, ICL options 0x66, ICL override cmd 0x42, load cfg 0x65 */
++		return reg == 0x70 || reg == 0x66 || reg == 0x42 || reg == 0x65;
++	case 0x31:      /* VADC conversion request 0x42..0x47 */
++		return reg >= 0x42 && reg <= 0x47;
++	case 0xb1:      /* QG SDAM: only our own record 0xa8..0xaf (the Linux QG area ends at 0xa3) */
++		return reg >= 0xa8 && reg <= 0xaf;
++	default:
++		return false;
++	}
++}
++
++static vm_offset_t sp_rw[512];          /* rw channel page per APID, mapped on the first write */
++
++static int
++sp_wait_done(vm_offset_t base, unsigned off, uint16_t apid, unsigned sid, unsigned addr)
++{
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(base, off + 0x08u);
++		if (status & 1u) {
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
++	return -1;
++}
++
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	if (!sp_ready || !out || addr > 0xffffu || !sp_read_allowed(sid, peripheral)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -160,27 +216,56 @@
+ 		return -1;
+ 	}
+ 	unsigned off = 0x80u * apid;
+-	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
++	*(volatile uint32_t *)(sp_obs + off) = (1u << 27) | ((addr & 0xffu) << 4); /* EXT_READL, BC=0 */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+-		if (status & 1u) {
+-			if (status & 0x0eu) {
+-				IOLockUnlock(sp_lock);
+-				return -1;
+-			}
+-			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++	int rc = sp_wait_done(sp_obs, off, apid, sid, addr);
++	if (rc == 0) {
++		*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++	}
++	IOLockUnlock(sp_lock);
++	return rc;
++}
++
++int
++sweet_spmi_owner(unsigned sid, unsigned peripheral)
++{
++	if (!sp_ready || sid > 15 || peripheral > 0xff) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
++	int owner = apid == SP_NO_APID ? -1 : (int)(sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u);
++	IOLockUnlock(sp_lock);
++	return owner;
++}
++
++int
++sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
++{
++	if (!sp_ready || addr > 0xffffu || !sp_write_allowed(sid, addr)) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	if (apid == SP_NO_APID || sp_poisoned[apid] || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	if (!sp_rw[apid]) {
++		sp_rw[apid] = ml_io_map(SP_RW_PA + 0x10000u * apid, 0x1000);
++		if (!sp_rw[apid]) {
+ 			IOLockUnlock(sp_lock);
+-			return 0;
++			return -1;
+ 		}
+-		delay(1);
+ 	}
+-	sp_poisoned[apid] = true;
+-	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+-	    sid, addr, apid);
++	vm_offset_t rw = sp_rw[apid];
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(rw + 0x10u) = val;                               /* WDATA0 */
++	*(volatile uint32_t *)(rw + 0x00u) = ((addr & 0xffu) << 4);             /* EXT_WRITEL (0), BC=0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	int rc = sp_wait_done(rw, 0, apid, sid, addr);
+ 	IOLockUnlock(sp_lock);
+-	return -1;
++	return rc;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+--- a/bsd/dev/sweet_spmi.h	2026-11-01 04:17:22.475216050 +0530
++++ b/bsd/dev/sweet_spmi.h	2026-11-01 04:18:00.268697833 +0530
+@@ -12,6 +12,11 @@
+  * panic hold and from a timer call: observer read and EXT_WRITEL. 0 success, -1 failure. */
+ int sweet_spmi_pon_read(unsigned addr, uint8_t *out);
+ int sweet_spmi_pon_write(unsigned addr, uint8_t val);
++/* laurel 2300: owner (EE) of a peripheral's APID, -1 when it has none. Thread context. */
++int sweet_spmi_owner(unsigned sid, unsigned peripheral);
++/* laurel 2300: one-byte write over the APID's rw channel; only EE 0 APIDs and the listed
++ * PMI632 registers (sweet_spmi.c sp_write_allowed). 0 success, -1 refused or failed. Thread context. */
++int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+ }
+ #endif

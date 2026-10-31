@@ -3833,3 +3833,26 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   closed-loop only when the root has RedwoodAudio.driver + VirtualAudio.plugin: today it has neither [V root.sh, topaz
   sweet-root-tweaks.py moves VirtualAudio to HAL.disabled], so expect `LAUREL HAPTIC UI: off` and ringtone vibration only; UI and
   keyboard taps need the audio plug-in in the root. Built 04:26 (220 patches, 0 LSE, no new warnings). NOT BOOTED.
+
+## Mi A3 area D: battery, charger, charge-only boot, power off, thermal + cpufreq (2026-11-01 04:30, patches 2300-2303)
+
+Details: `docs/laurel_sprout/battery-power.md`.
+- [V source] Why the battery stayed `static fallback` after 2018: (1) `SweetBattery::poll()` read SPMI only with `fReal`
+  false but required `fReal` for a valid sample (dead code); with `fReal` true it read the topaz I2C chips (SM5602 0x71,
+  bq2589x 0x6a) that the Mi A3 does not have; (2) `sweet_spmi_read()` took SID 0 only; the Mi A3 gauge/charger are PMI632
+  SID 2 (PPID 0x248 QG, 0x210-0x216 SMB5). The arbiter path itself was right (keys and the PON lane use it).
+- [V boot log 03:59] `PS_HOLD_RST_CTL 0x01` at boot = warm-reset type: a PS_HOLD drop for "power off" would reset, not
+  power off [I]. 2302 sets type 4 (SHUTDOWN) before PSCI SYSTEM_OFF, as Linux qpnp_pon_system_pwr_off.
+- [V source] SM6125 cpufreq is the OSM (`qcom,clk-cpu-osm-trinket`), not cpufreq-hw: pwrcl 0xf521000, perfcl 0xf523000, LUT
+  0x110 + 32 * row (12 rows), perf state 0x920 (same offsets topaz used for Gold). TSENS v2 TM 0x4411000, status 0xa0 + 4n,
+  sensors 6-8 Silver, 9-12 Gold, 15 GPU (trinket-thermal.dtsi).
+- [V source] PM6125 PON is GEN2 (subtype 0x04 seen at boot): PON_REASON1 is at 0x8c0, WARM_RESET_REASON1 0x8c2
+  (qpnp-power-on.c PON_OFFSET), not 0x808.
+- [V source] PMI632 ADC5 battery NTC: BAT_THERM_PU2 (0x4a), ratiometric, adcmap_batt_therm_100k (lut index 0), full scale 0x70e4.
+- [V source] Battery: 4030-4040 mAh 4.40 V (Sunwoda/Feimaotui/default Wingtech profiles), JEITA hard 0/60 C, FV 4100 mV above
+  44 C; charger DT: ICL 2000 mA, FCC max 3000 mA, SMB1355 as parallel (not driven by us).
+- Patches 2300 (SPMI SID 2 + owner-checked writes), 2301 (laurel_pmi632.c gauge + SMB5 charger + negroni key set),
+  2302 (charge-only boot before launchd, PS_HOLD shutdown type), 2303 (laurel_thermal.c OSM governor + TSENS caps).
+  Build `areaD-k2303`: 223 patches applied, 0 LSE. NOT BOOTED (the coordinator tests).
+- [U] SMB5/VADC/SDAM APID owners (expected EE 0), the PON reason bits of a cable power-on, whether power off with the cable
+  in powers on again. The first boot prints all of them (`LAUREL BATTERY: on: ... pon 0x.. warm 0x.. pmi 0x..`).

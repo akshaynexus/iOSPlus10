@@ -1,0 +1,366 @@
+laurel 2303: CPU frequency governor on the SM6125 OSM + TSENS thermal caps (new bsd/dev/laurel_thermal.c; negroni 0280/0283/0284 ideas on trinket hardware). One 100 ms kernel thread: busy % per cluster (processor_cpu_load_info, busiest core over 300 ms) steps the OSM row of Silver (pwrcl 0xf521000) and Gold (perfcl 0xf523000) between the ABL row (floor) and the cap; every 1 s TSENS (0x4411000, sensors 6-12 CPU, 15 GPU) lowers the Gold cap at >= 95 C (Silver too at >= 105 C) and raises it again below 85 C. Replaces the topaz 0094 pin of Gold at max (kept as the fallback when the governor is off). Lines 'LAUREL CPUFREQ: on: OSM governor, silver rows ..' / 'off: ..', 'LAUREL THERMAL: on: TSENS cpu N C gpu N C ..' / 'off: ..', a status line a minute and on cap changes. Kill switches laurelcpugov=0, laurelthermal=0.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 04:22:01.766885025 +0530
++++ b/bsd/conf/files	2026-11-01 04:25:29.588857004 +0530
+@@ -115,6 +115,7 @@
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/laurel_pmi632.c			standard
++bsd/dev/laurel_thermal.c			standard
+ bsd/dev/topaz_fw.c			standard
+ bsd/dev/topaz_redwood_audio.c		standard
+ bsd/kern/topaz_sandbox_container.c		standard
+diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
+--- a/bsd/dev/laurel_thermal.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_thermal.c	2026-11-01 04:25:06.037633969 +0530
+@@ -0,0 +1,326 @@
++/*
++ * laurel 2303 (Xiaomi Mi A3, SM6125): CPU frequency governor on the OSM + TSENS thermal caps.
++ * Port of the negroni 0280/0283/0284 ideas to the trinket hardware.
++ *
++ * topaz 0094 (sweet_cpufreq.c) pins the Gold cluster at its top row for the whole boot and leaves
++ * the Silver cluster where ABL put it, with no thermal limit. Here one kernel thread (100 ms tick):
++ *   OSM    clk-cpu-osm.c, "qcom,clk-cpu-osm-trinket" (trinket.dtsi clock_cpucc): pwrcl (Silver,
++ *          MPIDR 0x0-0x3) 0xf521000, perfcl (Gold, 0x100-0x103) 0xf523000; LUT FREQ_REG 0x110 + 32 * row,
++ *          12 rows (OSM_TABLE_REDUCED_SIZE), src [31:30], lval [7:0] (19.2 MHz * lval, src 0 = 300 MHz),
++ *          the table ends at a repeated frequency; DCVS_PERF_STATE_DESIRED_REG(0) 0x920 = the row of the
++ *          cluster (no per-core DCVS on trinket).
++ *   load   processor_cpu_load_info() (the HOST_CPU_LOAD_INFO ticks): busy % of the busiest core of a
++ *          cluster over the last 300 ms. busy > 70 % -> +1 row (> 90 %: the cap at once), busy < 30 %
++ *          for 300 ms -> -1 row. Floor = the row ABL left (never below it, negroni 0098 rule), cap =
++ *          the top row lowered by the thermal cap.
++ *   TSENS  tsens0 (trinket.dtsi, "qcom,sm6150-tsens", TSENS v2): TM 0x4411000, SN_STATUS(n) = 0xa0 + 4n,
++ *          [11:0] signed 0.1 C, valid bit 21 (tsens2xxx.c); sensors 6-8 cpuss (Silver), 9-12 Gold cores,
++ *          15 GPU (trinket-thermal.dtsi). Every 1 s: CPU max >= 95 C: Gold cap -1 row per second
++ *          (>= 105 C: Silver cap -1 row too); < 85 C: caps +1 row every 2 s. The Linux DT trips are
++ *          110 C passive (cpuss-x-step); LMh still throttles in hardware.
++ * Lines: "LAUREL THERMAL: on|off: ...", "LAUREL CPUFREQ: on|off: ...", then a line a minute and on cap
++ * changes. Kill switches: laurelcpugov=0 (topaz behaviour: Gold pinned at max), laurelthermal=0 (no caps).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/processor.h>
++#include <mach/machine.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* osfmk/kern/processor.c: the HOST_CPU_LOAD_INFO counters of one CPU */
++extern void processor_cpu_load_info(processor_t processor, natural_t ticks[CPU_STATE_MAX]);
++int laurel_cpufreq_start(void);
++
++#define OSM_SILVER_PA   0x0f521000u
++#define OSM_GOLD_PA     0x0f523000u
++#define OSM_FREQ_REG    0x110u
++#define OSM_ROW_SIZE    0x20u
++#define OSM_PERF_STATE  0x920u
++#define OSM_ROWS        12u
++#define TSENS_TM_PA     0x04411000u
++#define TSENS_SENSORS   16u
++
++#define GOV_TICK_MS     100u
++#define GOV_WINDOW      3u
++#define GOV_HI          70u
++#define GOV_JUMP        90u
++#define GOV_LO          30u
++#define GOV_MAX_CPUS    8u
++#define TH_HOT_DC       950
++#define TH_CRIT_DC      1050
++#define TH_COOL_DC      850
++
++enum { CL_SILVER = 0, CL_GOLD = 1, CL_N = 2 };
++static const char *const cl_name[CL_N] = { "silver", "gold" };
++static const uint32_t cl_pa[CL_N] = { OSM_SILVER_PA, OSM_GOLD_PA };
++
++static vm_offset_t cl_base[CL_N];
++static uint32_t cl_khz[CL_N][OSM_ROWS];
++static uint32_t cl_rows[CL_N], cl_floor[CL_N], cl_row[CL_N], cl_cap[CL_N];
++static uint32_t cl_busy[CL_N], cl_low[CL_N];
++static vm_offset_t ts_base;
++static bool th_on;
++static int th_cpu = -1000, th_gpu = -1000;
++
++static uint32_t cpu_busy_last[GOV_MAX_CPUS], cpu_all_last[GOV_MAX_CPUS];
++static uint32_t cpu_busy_d[GOV_MAX_CPUS][GOV_WINDOW], cpu_all_d[GOV_MAX_CPUS][GOV_WINDOW];
++static uint32_t win_at;
++static bool sampled;
++
++static void
++wr_row(unsigned c, uint32_t row)
++{
++	if (row < cl_floor[c]) {
++		row = cl_floor[c];
++	}
++	if (row >= cl_rows[c]) {
++		row = cl_rows[c] - 1;
++	}
++	if (row == cl_row[c]) {
++		return;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(cl_base[c] + OSM_PERF_STATE) = row;
++	__asm__ volatile("dsb sy" ::: "memory");
++	cl_row[c] = row;
++}
++
++static int
++read_table(unsigned c)
++{
++	cl_base[c] = ml_io_map(cl_pa[c], 0x1000);
++	if (!cl_base[c]) {
++		return -1;
++	}
++	uint32_t prev = 0, n = 0;
++	for (uint32_t i = 0; i < OSM_ROWS; i++) {
++		uint32_t v = *(volatile uint32_t *)(cl_base[c] + OSM_FREQ_REG + i * OSM_ROW_SIZE);
++		uint32_t khz = ((v >> 30) & 3u) ? 19200u * (v & 0xffu) : 300000u;
++		if (i > 0 && khz == prev) {
++			break;
++		}
++		if (khz < 100000u || khz > 3500000u || (i > 0 && khz < prev)) {
++			return -1;      /* not an OSM table */
++		}
++		cl_khz[c][i] = khz;
++		prev = khz;
++		n++;
++	}
++	if (n < 2) {
++		return -1;
++	}
++	cl_rows[c] = n;
++	uint32_t abl = *(volatile uint32_t *)(cl_base[c] + OSM_PERF_STATE);
++	cl_floor[c] = abl < n ? abl : 0;
++	cl_row[c] = cl_floor[c];
++	cl_cap[c] = n - 1;
++	return 0;
++}
++
++static int
++tsens_dC(unsigned n, int *dC)
++{
++	for (unsigned t = 0; t < 3; t++) {
++		uint32_t code = *(volatile uint32_t *)(ts_base + 0xa0u + 4u * n);
++		if (code & (1u << 21)) {
++			int v = (int)(code & 0xfffu);
++			if (v & 0x800) {
++				v -= 0x1000;
++			}
++			*dC = v;
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static void
++read_temps(void)
++{
++	int cpu = -1000, gpu = -1000, v;
++	for (unsigned n = 6; n <= 12; n++) {
++		if (tsens_dC(n, &v) == 0 && v > -400 && v < 1500 && v > cpu) {
++			cpu = v;
++		}
++	}
++	if (tsens_dC(15, &v) == 0 && v > -400 && v < 1500) {
++		gpu = v;
++	}
++	th_cpu = cpu;
++	th_gpu = gpu;
++}
++
++static void
++sample_busy(void)
++{
++	const ml_topology_info_t *topo = ml_get_topology_info();
++	cl_busy[CL_SILVER] = cl_busy[CL_GOLD] = 0;
++	for (unsigned i = 0; i < topo->num_cpus && i < GOV_MAX_CPUS; i++) {
++		unsigned c = ((topo->cpus[i].phys_id & 0xff00u) == 0x100u) ? CL_GOLD : CL_SILVER;
++		processor_t p = cpu_to_processor((int)topo->cpus[i].cpu_id);
++		natural_t ticks[CPU_STATE_MAX] = { 0 };
++		if (p == PROCESSOR_NULL) {
++			continue;
++		}
++		processor_cpu_load_info(p, ticks);
++		uint32_t busy = ticks[CPU_STATE_USER] + ticks[CPU_STATE_SYSTEM] + ticks[CPU_STATE_NICE];
++		uint32_t all = busy + ticks[CPU_STATE_IDLE];
++		cpu_busy_d[i][win_at] = sampled ? busy - cpu_busy_last[i] : 0;
++		cpu_all_d[i][win_at] = sampled ? all - cpu_all_last[i] : 0;
++		cpu_busy_last[i] = busy;
++		cpu_all_last[i] = all;
++		uint32_t bw = 0, aw = 0;
++		for (unsigned w = 0; w < GOV_WINDOW; w++) {
++			bw += cpu_busy_d[i][w];
++			aw += cpu_all_d[i][w];
++		}
++		uint32_t pct = aw ? bw * 100u / aw : 0;
++		if (pct > cl_busy[c]) {
++			cl_busy[c] = pct;
++		}
++	}
++	win_at = (win_at + 1) % GOV_WINDOW;
++	sampled = true;
++}
++
++static void
++gov_step(void)
++{
++	for (unsigned c = 0; c < CL_N; c++) {
++		uint32_t cap = cl_cap[c] < cl_floor[c] ? cl_floor[c] : cl_cap[c];
++		if (cl_row[c] > cap) {
++			wr_row(c, cap);
++		} else if (cl_busy[c] > GOV_JUMP) {
++			wr_row(c, cap);
++			cl_low[c] = 0;
++		} else if (cl_busy[c] > GOV_HI) {
++			if (cl_row[c] < cap) {
++				wr_row(c, cl_row[c] + 1);
++			}
++			cl_low[c] = 0;
++		} else if (cl_busy[c] < GOV_LO) {
++			if (++cl_low[c] >= GOV_WINDOW && cl_row[c] > cl_floor[c]) {
++				wr_row(c, cl_row[c] - 1);
++				cl_low[c] = 0;
++			}
++		} else {
++			cl_low[c] = 0;
++		}
++	}
++}
++
++/* 1 s: the thermal caps; returns true when a cap changed */
++static bool
++thermal_step(uint32_t sec)
++{
++	if (!th_on) {
++		return false;
++	}
++	read_temps();
++	uint32_t g = cl_cap[CL_GOLD], s = cl_cap[CL_SILVER];
++	if (th_cpu >= TH_HOT_DC) {
++		if (cl_cap[CL_GOLD] > cl_floor[CL_GOLD]) {
++			cl_cap[CL_GOLD]--;
++		}
++		if (th_cpu >= TH_CRIT_DC && cl_cap[CL_SILVER] > cl_floor[CL_SILVER]) {
++			cl_cap[CL_SILVER]--;
++		}
++	} else if (th_cpu > -1000 && th_cpu < TH_COOL_DC && (sec & 1u) == 0) {
++		if (cl_cap[CL_SILVER] + 1 < cl_rows[CL_SILVER]) {
++			cl_cap[CL_SILVER]++;
++		} else if (cl_cap[CL_GOLD] + 1 < cl_rows[CL_GOLD]) {
++			cl_cap[CL_GOLD]++;
++		}
++	}
++	return g != cl_cap[CL_GOLD] || s != cl_cap[CL_SILVER];
++}
++
++static void
++log_line(const char *why)
++{
++	printf("LAUREL THERMAL: %s: cpu %d.%d C gpu %d.%d C | silver %u MHz (busy %u%%, cap %u) gold %u MHz (busy %u%%, cap %u)\n",
++	    why, th_cpu / 10, (th_cpu < 0 ? -th_cpu : th_cpu) % 10, th_gpu / 10, (th_gpu < 0 ? -th_gpu : th_gpu) % 10,
++	    cl_khz[CL_SILVER][cl_row[CL_SILVER]] / 1000, cl_busy[CL_SILVER], cl_khz[CL_SILVER][cl_cap[CL_SILVER]] / 1000,
++	    cl_khz[CL_GOLD][cl_row[CL_GOLD]] / 1000, cl_busy[CL_GOLD], cl_khz[CL_GOLD][cl_cap[CL_GOLD]] / 1000);
++}
++
++__attribute__((noreturn)) static void
++gov_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t tick = 0;
++	sample_busy();
++	for (;;) {
++		assert_wait_timeout((event_t)&tick, THREAD_UNINT, GOV_TICK_MS, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++		tick++;
++		sample_busy();
++		if (tick % 10u == 0 && thermal_step(tick / 10u)) {
++			log_line("cap");
++		}
++		gov_step();
++		if (tick % 600u == 0) {
++			log_line("on");
++		}
++	}
++}
++
++int
++laurel_cpufreq_start(void)
++{
++	static int started = -1;
++	if (started >= 0) {
++		return started ? 0 : -1;
++	}
++	started = 0;
++	int gov = 1, th = 1;
++	(void)PE_parse_boot_argn("laurelcpugov", &gov, sizeof(gov));
++	(void)PE_parse_boot_argn("laurelthermal", &th, sizeof(th));
++	if (!gov) {
++		printf("LAUREL CPUFREQ: off: laurelcpugov=0 (topaz: Gold pinned at max)\n");
++		return -1;
++	}
++	if (read_table(CL_SILVER) != 0 || read_table(CL_GOLD) != 0) {
++		printf("LAUREL CPUFREQ: off: OSM LUT not readable (topaz: Gold pinned at max)\n");
++		return -1;
++	}
++	const ml_topology_info_t *topo = ml_get_topology_info();
++	if (!topo || topo->num_cpus == 0) {
++		printf("LAUREL CPUFREQ: off: no CPU topology\n");
++		return -1;
++	}
++	if (!th) {
++		printf("LAUREL THERMAL: off: laurelthermal=0\n");
++	} else if (!(ts_base = ml_io_map(TSENS_TM_PA, 0x1000))) {
++		printf("LAUREL THERMAL: off: TSENS not mapped\n");
++	} else {
++		read_temps();
++		if (th_cpu <= -1000 || th_cpu < 0 || th_cpu > 1200) {
++			printf("LAUREL THERMAL: off: no valid TSENS CPU sensor (6-12): %d\n", th_cpu);
++		} else {
++			th_on = true;
++			printf("LAUREL THERMAL: on: TSENS cpu %d.%d C gpu %d.%d C; caps at %d C (Gold), %d C (Silver), release < %d C\n",
++			    th_cpu / 10, th_cpu % 10, th_gpu / 10, (th_gpu < 0 ? -th_gpu : th_gpu) % 10,
++			    TH_HOT_DC / 10, TH_CRIT_DC / 10, TH_COOL_DC / 10);
++		}
++	}
++	thread_t thread;
++	if (kernel_thread_start(gov_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("LAUREL CPUFREQ: off: no governor thread (topaz: Gold pinned at max)\n");
++		return -1;
++	}
++	thread_deallocate(thread);
++	started = 1;
++	printf("LAUREL CPUFREQ: on: OSM governor, silver rows %u..%u (%u..%u MHz), gold rows %u..%u (%u..%u MHz), %u cpus\n",
++	    cl_floor[CL_SILVER], cl_rows[CL_SILVER] - 1, cl_khz[CL_SILVER][cl_floor[CL_SILVER]] / 1000,
++	    cl_khz[CL_SILVER][cl_rows[CL_SILVER] - 1] / 1000, cl_floor[CL_GOLD], cl_rows[CL_GOLD] - 1,
++	    cl_khz[CL_GOLD][cl_floor[CL_GOLD]] / 1000, cl_khz[CL_GOLD][cl_rows[CL_GOLD] - 1] / 1000, topo->num_cpus);
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:21:46.923283962 +0530
++++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:25:29.566481431 +0530
+@@ -17,6 +17,7 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" int sweet_cpufreq_max(void);    /* bsd/dev/sweet_cpufreq.c */
++extern "C" int laurel_cpufreq_start(void); /* bsd/dev/laurel_thermal.c (laurel 2303) */
+ #include "../../../bsd/dev/laurel_pmi632.h"
+ 
+ class SweetBattery : public IOPMPowerSource {
+@@ -245,7 +246,10 @@
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	(void)sweet_cpufreq_max();
++	/* laurel 2303: OSM governor + TSENS caps; off: the topaz pin of the Gold cluster at max */
++	if (laurel_cpufreq_start() != 0) {
++		(void)sweet_cpufreq_max();
++	}
+ 	int real = 1;   /* real gauge by default; sweetbattery=0 for the static fallback */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && laurel_pmi632_init() == 0;   /* laurel 2301: PMI632 over SPMI */
