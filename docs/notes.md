@@ -3754,3 +3754,13 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Open after this session: (1) UI on the panel (no GPU: a software compositor path or metal2vulkan), (2) touch coordinates
   720x1560 (driver assumes 1080x2400), (3) battery SPMI reads, (4) the early kernel lines are not in the live USB log (raw frames go
   out before the host interface is up; `ctl log` resends only the last 64 KiB): keep the ring from byte 0 until the host asks once.
+- Patch `2700-laurel-pmi632-haptics` (area H, vibration; details docs/laurel_sprout/haptics.md): PMI632 LDO vibrator (ERM, SID 3,
+  0x5700, pmi632.dtsi:412) over an own SPMI lane in `bsd/dev/laurel_haptic.c` (APID of PPID 0x357, EE 0 owner check, observer
+  EXT_READL + rw EXT_WRITEL, own lock; no state shared with sweet_spmi.c, but the same arbiter bases are hard-coded in both).
+  Registers [V leds-qpnp-vibrator-ldo.c]: VSET 0x40/0x41 mV LE (3000 = 0x0bb8), EN_CTL 0x46 bit 7, STATUS1 0x08 bit 7 ready.
+  Policy: overdrive start 3544 mV / 30 ms (Qualcomm default; DT turns it off for Android's 50 ms min play) [I: needed for 3-20 ms
+  iOS taps], tap >= 30 ms, duty heat budget 70 % (cut 4000 ms, resume 2000 ms), 1 s watchdog thread call. iOS: "vibrator"
+  IOService (LaurelVibrator.cpp = negroni 0301) + /dev/redwood-haptic (topaz audio_plugin.c Actuator). /product/haptics
+  closed-loop only when the root has RedwoodAudio.driver + VirtualAudio.plugin: today it has neither [V root.sh, topaz
+  sweet-root-tweaks.py moves VirtualAudio to HAL.disabled], so expect `LAUREL HAPTIC UI: off` and ringtone vibration only; UI and
+  keyboard taps need the audio plug-in in the root. Built 04:26 (220 patches, 0 LSE, no new warnings). NOT BOOTED.

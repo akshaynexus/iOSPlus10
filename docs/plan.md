@@ -538,3 +538,7 @@ as the shim did, (c) check IIDR/TYPER of the matched frame (a zero frame = wrong
   commands work; `ctl bootloader` reaches the ABL fastboot without buttons (2018). Details: docs/laurel_sprout/uefi-boot.md,
   notes.md sections of 2026-11-01 03:20-04:10.
 - Next: UI on the panel (no GPU), touch scaling to 720x1560, battery SPMI reads, full early log over USB.
+- Vibration (area H, patch 2700, build only, NOT BOOTED): PMI632 LDO ERM over SPMI SID 3 + "vibrator" IOService +
+  /dev/redwood-haptic; expected line `LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)`. Test: Settings > Sounds &
+  Haptics > Ringtone > Vibration preview. UI/keyboard taps wait for the RedwoodAudio plug-in + VirtualAudio in the root
+  (docs/laurel_sprout/haptics.md).
