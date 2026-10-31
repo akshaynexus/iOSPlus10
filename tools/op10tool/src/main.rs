@@ -3,6 +3,7 @@
 
 mod bootlog;
 mod ctl;
+mod fat;
 mod im4p;
 mod img2simg;
 mod ipsw;
@@ -54,6 +55,16 @@ enum Cmd {
         #[arg(long)]
         byte: Vec<String>,
     },
+    /// FAT16/FAT32 index of a modem firmware image (NON-HLOS.bin, modem_a/modem_b dump), made like the
+    /// kernel's (laurel patch 2400): summary line as the phone logs it, then every file; with PATHs only
+    /// those (size, first cluster, runs, CRC-32), exit 1 if one is missing
+    Fatls {
+        image: PathBuf,
+        paths: Vec<String>,
+        /// size of the partition the image stands for (the kernel checks the volume against the GPT size)
+        #[arg(long, value_parser = parse_u64, default_value_t = fat::MI_A3_MODEM_BYTES)]
+        part_bytes: u64,
+    },
     /// Extract the payload of an IM4P (raw or LZFSE)
     Im4p { input: PathBuf, output: PathBuf },
     /// Command to the negroni kernel over USB Ethernet (UDP 5141): ping, reboot, bootloader, recovery, poweroff, panic, settime, time
@@ -93,6 +104,11 @@ fn parse_int(s: &str) -> Result<usize, String> {
     r.map_err(|e| e.to_string())
 }
 
+fn parse_u64(s: &str) -> Result<u64, String> {
+    let r = if let Some(h) = s.strip_prefix("0x") { u64::from_str_radix(h, 16) } else { s.parse() };
+    r.map_err(|e| e.to_string())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Img2simg { input, output } => img2simg::img2simg(&input, &output),
@@ -104,6 +120,7 @@ fn main() -> Result<()> {
             let ok = portpatch::run(&orig, &patched, &target, &out, &skip, &byte)?;
             std::process::exit(if ok { 0 } else { 1 })
         }
+        Cmd::Fatls { image, paths, part_bytes } => fat::run(&image, &paths, part_bytes),
         Cmd::Im4p { input, output } => im4p::run(&input, &output),
         Cmd::Ctl { command, host } => ctl::run(command, &host),
         Cmd::Bootlog { count, host, file, out, kernels, mkarea } => {

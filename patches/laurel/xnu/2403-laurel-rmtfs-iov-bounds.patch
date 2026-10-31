@@ -1,0 +1,16 @@
+laurel 2403: rmtfs RW_IOVEC: the iovec entries (u8 count + count x 12 bytes: sector, phys, count) must lie inside the TLV the modem sent; topaz read iov[0] entries without a length check (a short or bad request read past the message). Out of bounds = QMI error result, as for a bad buffer address.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 02e597f..d8a8fcd 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -2013,7 +2013,8 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ 		const uint8_t *dir = qm_find(d, len, 2, &l2);
+ 		const uint8_t *iov = qm_find(d, len, 3, &l2);
+ 		bool write = dir != NULL && *dir != 0;
+-		ok = caller >= 1 && caller <= 4 && iov != NULL && rmtfs_pa != 0;
++		/* laurel 2403: the entries must lie inside the iovec TLV (u8 count + count x 12 bytes) */
++		ok = caller >= 1 && caller <= 4 && iov != NULL && l2 >= 1 && 1u + 12u * iov[0] <= l2 && rmtfs_pa != 0;
+ 		for (i = 0; ok && i < iov[0]; i++) {
+ 			uint32_t e[3];                      /* sector, phys, count */
+ 			memcpy(e, iov + 1 + 12 * i, 12);

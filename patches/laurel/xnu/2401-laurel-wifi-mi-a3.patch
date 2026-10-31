@@ -1,0 +1,416 @@
+laurel 2401: Wi-Fi on the Mi A3 (SM6125 trinket, WCN3990 through the modem), on by default. Values from the downstream trinket.dtsi: modem carve-out pil_modem_mem 0x4b000000+0x7e00000 (topaz checked 0x4ab00000+0x6900000; our modem.mdt loads 0x4b000000..0x52e00000), WLFW MSA wlan_msa_mem 0x53300000 size 0x200000 (qcom,wlan-msa-fixed-region: icnss takes the region size, icnss.c:3767-3791), WLAN SMMU stream 0x80 mask 1 (topaz 0x1a0). New: the WCN3990 supply votes icnss makes (RPM SMD ldoa 8 0.64 V, 16 1.8 V, 17 1.304 V, 23 3.0 V, uv + swen, both sets); a refused vote turns the radio off with one line, the modem still boots. MODEM_POOL_BASE/SIZE: one place, 'pool map owned by area A (docs/laurel_sprout/memory-map.md)', static_asserts: no overlap with the GPU pool (area B 0xC0000000+0x20000000) and below 0xF0000000; the topaz value 0xE0000000 stays until the coordinator sets the final map (it collides with area F's audio pool). modem=1/wifi=1 opt-ins become modem=0/wifi=0 kill switches. Status line: 'LAUREL WIFI: on: modem up, WLFW ready, board id 0x.., MAC .. (modem_b)' at WMI READY (also after an earlier off), or 'LAUREL WIFI: off: <reason>' once at the first failure: firmware partition (2400), apps SMMU, RPM supplies, each TrustZone PAS step (init_image / mem_setup / auth_and_reset with ret/res), carve-out layout, modem crash reason, modem not READY in 60 s, no WLFW in 30 s, WLFW stuck (step) 60 s, no WMI READY 30 s after mission mode; the WLFW timers start again when WLFW restarts. Unchanged topaz values checked against trinket.dtsi: SMEM 0x46000000, TCSR mutex 0x340000 (hwlock 3), APCS 0x0F111000 (SMP2P 435/428 bit 14, GLINK modem bit 12), apps SMMU 0xC600000, CE 0xC800000+0x240000 (polled, no SPI 358-369), RPM msg RAM 0x45F0000, rmtfs on modemst1/modemst2/fsc/fsg.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index 7998e40..ebfd759 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -6,10 +6,10 @@
+  *   the carveout (0x4AB00000, 0x6900000) -> auth_and_reset -> wait for the modem's SMP2P
+  *   "slave-kernel" READY bit (SMEM item 435) and answer its IPA power query (item 428).
+  *
+- * Boot-arg modem=1. Firmware from the root filesystem, /usr/share/firmware/topaz/modem/
+- * (stock HyperOS 2.0.208 NON-HLOS: it must match this phone's EFS partitions).
+- * Rules (WIFI_RISKS.md): buffers TZ/the modem see are below 0xF0000000 (own pool, not the
+- * GPU's 0x90000000-0xD0000000), memory shared with the modem is write-combined (Normal NC:
++ * laurel: on by default (modem=0 kill switch). Firmware from the active slot's modem partition
++ * (2400), the phone's own NON-HLOS: it must match this phone's EFS partitions.
++ * Rules (WIFI_RISKS.md): buffers TZ/the modem see are below 0xF0000000 (own pool MODEM_POOL_*,
++ * kept off the GPU pool by a static_assert), memory shared with the modem is write-combined (Normal NC:
+  * no cache upkeep, unaligned access ok), the carveout is mapped only while copying, the
+  * modem must start cold, polling only (no interrupts), no EFS writes.
+  */
+@@ -27,6 +27,41 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #define LOG(fmt, ...)       IOLog("TopazModem: " fmt "\n", ##__VA_ARGS__)
+ 
++/*
++ * laurel 2401: Xiaomi Mi A3 (SM6125 trinket, WCN3990 through the modem). Values from the
++ * downstream trinket.dtsi: pil_modem_mem 0x4b000000 (0x7e00000) = the modem.mdt load range,
++ * wlan_msa_mem 0x53300000 (2 MiB; qcom,wlan-msa-fixed-region: icnss takes the region size), icnss
++ * iommus = <&apps_smmu 0x80 0x1>, supplies L8A/L16A/L17A/L23A (PM6125, RPM SMD). SMEM 0x46000000,
++ * TCSR mutex 0x340000, APCS 0x0F111000 (SMP2P bit 14, GLINK bit 12), apps SMMU 0xC600000, CE at
++ * 0xC800000 + 0x240000 and RPM message RAM 0x45F0000 are the topaz values already.
++ * Wi-Fi is on by default; boot-args modem=0 / wifi=0 are kill switches. One status line:
++ * "LAUREL WIFI: on: ..." at WMI READY or "LAUREL WIFI: off: <reason>" at the first failure.
++ */
++#define MODEM_CARVE_PA      0x4B000000u
++#define MODEM_CARVE_SIZE    0x07E00000u
++
++static bool laurel_wifi_said, laurel_wifi_said_on;  /* one 'off' at most, and one 'on' (also after an 'off') */
++
++static void __printflike(2, 3)
++laurel_wifi(bool on, const char *fmt, ...)
++{
++	char b[192];
++	va_list ap;
++
++	if (on ? laurel_wifi_said_on : laurel_wifi_said) {
++		return;
++	}
++	laurel_wifi_said = true;
++	laurel_wifi_said_on |= on;
++	va_start(ap, fmt);
++	vsnprintf(b, sizeof(b), fmt, ap);
++	va_end(ap);
++	printf("LAUREL WIFI: %s: %s\n", on ? "on" : "off", b);
++}
++
++static char boot_why[128];                      /* first modem_boot failure, for the status line */
++#define WHY(fmt, ...)       do { snprintf(boot_why, sizeof(boot_why), fmt, ##__VA_ARGS__); LOG("%s", boot_why); } while (0)
++
+ #define PAS_ID_MODEM        4
+ #define SCM_FN(svc, cmd)    (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
+ #define SCM_SVC_PIL         0x02
+@@ -42,9 +77,18 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define MDT_TYPE_HASH       (2u << 24)
+ #define MDT_RELOCATABLE     (1u << 27)
+ 
+-/* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
++/*
++ * laurel 2401: pool map owned by area A (docs/laurel_sprout/memory-map.md). RAM the kernel does
++ * not manage (outside the ADT dram window), below 0xF0000000 for TZ/the modem. The coordinator
++ * sets the final base/size at merge time: the topaz value 0xE0000000 is also area F's audio pool.
++ */
+ #define MODEM_POOL_BASE     0xE0000000ull
+ #define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
++#define LAUREL_GPU_POOL_BASE 0xC0000000ull      /* area B GPU pool (TopazAdreno GPU_POOL_*), same map */
++#define LAUREL_GPU_POOL_SIZE 0x20000000ull
++static_assert(MODEM_POOL_BASE + MODEM_POOL_SIZE <= LAUREL_GPU_POOL_BASE ||
++    MODEM_POOL_BASE >= LAUREL_GPU_POOL_BASE + LAUREL_GPU_POOL_SIZE, "modem pool overlaps the GPU pool");
++static_assert(MODEM_POOL_BASE + MODEM_POOL_SIZE <= 0xF0000000ull, "TZ and the modem need the pool below 0xF0000000");
+ 
+ #define SMEM_PA             0x46000000ull
+ #define SMEM_SIZE           0x00200000u
+@@ -2047,8 +2091,8 @@ rmtfs_rx(uint32_t node, uint32_t port, uint16_t txn, uint16_t msg, const uint8_t
+ #define WLFW_MSA_INFO       0x2D
+ #define WLFW_MSA_READY      0x2E
+ #define WLFW_HOST_CAP       0x34
+-#define WLFW_MSA_BASE       0x51900000u         /* DTB wlan_msa_region, inside "PIL Reserved" */
+-#define WLFW_MSA_SIZE       0x00100000u
++#define WLFW_MSA_BASE       0x53300000u         /* laurel 2401: trinket wlan_msa_mem */
++#define WLFW_MSA_SIZE       0x00200000u         /* the fixed region's size (icnss.c: qcom,wlan-msa-fixed-region) */
+ #define WLFW_CLIENT_ID      0x4b4e454c          /* ath10k ATH10K_QMI_CLIENT_ID */
+ #define WLFW_SEG            6144                /* QMI_WLFW_MAX_DATA_SIZE_V01 */
+ #define VMID_WLAN           0x18
+@@ -2462,7 +2506,7 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+  */
+ #define SMMU_PA             0x0C600000ull
+ #define SMMU_SIZE           0x00080000u
+-#define WLAN_SID            0x1A0
++#define WLAN_SID            0x80                /* laurel 2401: trinket icnss iommus <&apps_smmu 0x80 0x1> */
+ #define WLAN_SID_MASK       0x1
+ #define CB_CLONE_CBAR       0x0001f000u         /* S1_TRANS_S2_FAULT, S1_MEMATTR WB */
+ #define CB_CLONE_CBA2R      0x00000001u         /* VA64 */
+@@ -2474,8 +2518,9 @@ static bool
+ wifi_enabled(void)
+ {
+ 	if (wifi_on < 0) {
+-		uint32_t v = 0;
+-		wifi_on = PE_parse_boot_argn("wifi", &v, sizeof(v)) && v != 0;
++		uint32_t v = 1;                         /* laurel 2401: on by default, wifi=0 kill switch */
++		(void)PE_parse_boot_argn("wifi", &v, sizeof(v));
++		wifi_on = v != 0;
+ 	}
+ 	return wifi_on > 0;
+ }
+@@ -4879,6 +4924,8 @@ wmi_rx(const uint8_t *d, uint32_t len)
+ 		LOG("t=%u ms: *** WMI READY (fw MAC %02x:%02x:%02x:%02x:%02x:%02x) ***", g_ms, wmi_mac[0], wmi_mac[1],
+ 		    wmi_mac[2], wmi_mac[3], wmi_mac[4], wmi_mac[5]);
+ 		if (wmi_ready) {
++			laurel_wifi(true, "modem up, WLFW ready, board id 0x%x, MAC %02x:%02x:%02x:%02x:%02x:%02x (%s)", w_board,
++			    wmi_mac[0], wmi_mac[1], wmi_mac[2], wmi_mac[3], wmi_mac[4], wmi_mac[5], fw_part);
+ 			htt_start();                        /* the host rx ring first, then the scan */
+ 		}
+ 		break;
+@@ -5001,6 +5048,8 @@ svc_summary(void)
+  * bit2 handover) and answer its IPA power query ("valid, AP IPA power off"): unanswered,
+  * modem_cfg starves and the modem watchdog fires once data services come up.
+  */
++static void laurel_wifi_watch(unsigned ms, bool ready, uint32_t sk);
++
+ static void
+ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ {
+@@ -5011,6 +5060,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 
+ 	if (out == NULL) {
+ 		LOG("cannot create SMP2P item %u", ITEM_SMP2P_OUT);
++		laurel_wifi(false, "cannot create SMP2P item %u", ITEM_SMP2P_OUT);
+ 		return;
+ 	}
+ 	ipa_out = smp2p_add_out(out, "ipa", 0);
+@@ -5020,6 +5070,7 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 			glink = glink_start(part);
+ 			if (!glink) {
+ 				ready = false;  /* no retry */
++				laurel_wifi(false, "modem up, GLINK (IPCRTR over SMEM) did not start");
+ 			}
+ 		}
+ 		if (glink) {
+@@ -5061,12 +5112,16 @@ modem_watch(struct smem_part_hdr *part, unsigned seconds)
+ 					memcpy(buf, why, MIN(sz, (uint32_t)sizeof(buf) - 1));
+ 				}
+ 				LOG("modem crash reason: %s", why != NULL ? buf : "(none)");
++				laurel_wifi(false, "modem crashed: %s", why != NULL ? buf : "(no reason in SMEM)");
+ 				if (glink) {
+ 					glink_summary();
+ 				}
+ 				return;
+ 			}
+ 		}
++		if (wifi_enabled()) {
++			laurel_wifi_watch(ms, ready || glink, sk_last == ~0u ? 0 : sk_last);
++		}
+ 		if (ipa_in != NULL && ipa_out != NULL && *ipa_in != ipa_last) {
+ 			uint32_t v = *ipa_in;
+ 			if ((v & 1) && !(ipa_last != ~0u && (ipa_last & 1))) {
+@@ -5104,10 +5159,11 @@ modem_boot(void)
+ 	struct smem_part_hdr *part = smem_partition(0, 1);
+ 	LOG("SMEM apps<->modem partition %p", part);
+ 	if (part == NULL) {
++		WHY("no SMEM apps<->modem partition");
+ 		return false;
+ 	}
+ 	if (smem_get(part, ITEM_SMP2P_IN, NULL) != NULL) {
+-		LOG("modem SMP2P item %u already exists: modem is not cold, not touching it", ITEM_SMP2P_IN);
++		WHY("modem SMP2P item %u already exists: modem is not cold, not touching it", ITEM_SMP2P_IN);
+ 		return false;
+ 	}
+ 	st = scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, PAS_ID_MODEM, 0, 0, &res);
+@@ -5116,18 +5172,19 @@ modem_boot(void)
+ 
+ 	mdt_size = fw_size("modem.mdt");
+ 	if (mdt_size <= (int64_t)sizeof(struct elf32_ehdr) || mdt_size > 0x100000) {
+-		LOG("modem.mdt: size %lld", mdt_size);
++		WHY("%s: image/modem.mdt size %lld", fw_part, mdt_size);
+ 		return false;
+ 	}
+ 	mdt = (uint8_t *)IOMalloc(mdt_size);
+ 	if (mdt == NULL || fw_read("modem.mdt", mdt, mdt_size) != mdt_size) {
++		WHY("%s: image/modem.mdt not readable", fw_part);
+ 		goto out;
+ 	}
+ 	{
+ 		struct elf32_ehdr *eh = (struct elf32_ehdr *)mdt;
+ 		if (memcmp(eh->e_ident, "\x7f" "ELF", 4) != 0 ||
+ 		    eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct elf32_phdr) > (uint64_t)mdt_size) {
+-			LOG("modem.mdt: bad ELF header");
++			WHY("modem.mdt: bad ELF header");
+ 			goto out;
+ 		}
+ 		struct elf32_phdr *ph = (struct elf32_phdr *)(mdt + eh->e_phoff);
+@@ -5145,8 +5202,9 @@ modem_boot(void)
+ 			max_a = MAX(max_a, ph[i].p_paddr + ph[i].p_memsz);
+ 		}
+ 		LOG("phdrs=%u hash=%u region %08x..%08x relocate=%u", eh->e_phnum, hash, min_a, max_a, relocate);
+-		if (hash == ~0u || min_a < 0x4AB00000u || max_a > 0x4AB00000u + 0x6900000u) {
+-			LOG("unexpected layout (carveout is 0x4ab00000+0x6900000)");
++		if (hash == ~0u || min_a < MODEM_CARVE_PA || max_a > MODEM_CARVE_PA + MODEM_CARVE_SIZE) {
++			WHY("modem.mdt layout %08x..%08x hash %d: not inside the carve-out %08x+%x", min_a, max_a, (int)hash,
++			    MODEM_CARVE_PA, MODEM_CARVE_SIZE);
+ 			goto out;
+ 		}
+ 
+@@ -5155,7 +5213,7 @@ modem_boot(void)
+ 		uint64_t meta_size = hdr + ph[hash].p_filesz;
+ 		meta = (uint8_t *)pool_alloc(meta_size, &meta_pa);
+ 		if (meta == NULL) {
+-			LOG("metadata: pool allocation of %llu bytes failed", meta_size);
++			WHY("metadata: pool allocation of %llu bytes failed", meta_size);
+ 			goto out;
+ 		}
+ 		memcpy(meta, mdt, hdr);
+@@ -5168,6 +5226,7 @@ modem_boot(void)
+ 			int64_t got = fw_read(hname, meta + hdr, ph[hash].p_filesz);
+ 			LOG("hash from %s: %lld of %u bytes", hname, got, ph[hash].p_filesz);
+ 			if (got != (int64_t)ph[hash].p_filesz) {
++				WHY("hash segment %s: %lld of %u bytes", hname, got, ph[hash].p_filesz);
+ 				goto out;
+ 			}
+ 		}
+@@ -5176,6 +5235,7 @@ modem_boot(void)
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), PAS_ID_MODEM, meta_pa, 0, &res);
+ 		LOG("init_image: ret=%llx res=%llx resumes=%u (meta %llu bytes @%llx)", st, res, scm_resumes, meta_size, meta_pa);
+ 		if (st != 0 || res != 0) {
++			WHY("TrustZone PAS init_image refused: ret %llx res %llx", st, res);
+ 			goto out;
+ 		}
+ 		if (relocate) {
+@@ -5183,6 +5243,7 @@ modem_boot(void)
+ 			    ((uint64_t)(max_a - min_a) + 0xfff) & ~0xfffull, &res);
+ 			LOG("mem_setup: ret=%llx res=%llx", st, res);
+ 			if (st != 0 || res != 0) {
++				WHY("TrustZone PAS mem_setup refused: ret %llx res %llx", st, res);
+ 				goto shutdown;
+ 			}
+ 		}
+@@ -5197,7 +5258,7 @@ modem_boot(void)
+ 			uint64_t len = (off + ph[i].p_memsz + 0x3fff) & ~0x3fffull;
+ 			IOMemoryMap *m = map_phys(pa, len, true);
+ 			if (m == NULL) {
+-				LOG("segment %u: cannot map %08x+%x", i, ph[i].p_paddr, ph[i].p_memsz);
++				WHY("segment %u: cannot map %08x+%x", i, ph[i].p_paddr, ph[i].p_memsz);
+ 				goto shutdown;
+ 			}
+ 			uint8_t *dst = (uint8_t *)m->getVirtualAddress() + off;
+@@ -5206,7 +5267,7 @@ modem_boot(void)
+ 				snprintf(name, sizeof(name), "modem.b%02u", i);
+ 				got = fw_read(name, dst, ph[i].p_filesz);
+ 				if (got != (int64_t)ph[i].p_filesz) {
+-					LOG("%s: %lld of %u bytes", name, got, ph[i].p_filesz);
++					WHY("%s: %lld of %u bytes", name, got, ph[i].p_filesz);
+ 					m->release();
+ 					goto shutdown;
+ 				}
+@@ -5222,6 +5283,7 @@ modem_boot(void)
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, PAS_ID_MODEM, 0, 0, &res);
+ 		LOG("auth_and_reset: ret=%llx res=%llx resumes=%u", st, res, scm_resumes);
+ 		if (st != 0 || res != 0) {
++			WHY("TrustZone PAS auth_and_reset refused: ret %llx res %llx (signature or carve-out)", st, res);
+ 			goto shutdown;
+ 		}
+ 		ok = true;
+@@ -5344,6 +5406,95 @@ topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ 	return smmu_identity(sid, mask, name);
+ }
+ 
++/*
++ * laurel 2401: the WCN3990 supplies, as icnss votes them (icnss_vreg_info + trinket DT config):
++ * L8A vdd-cx-mx 0.64 V, L16A vdd-1.8-xo, L17A vdd-1.3-rfa 1.304 V, L23A vdd-3.3-ch0 3.0 V; RPM
++ * SMD "ldoa" N, key "uv" then "swen" = 1, active and sleep set (qcom,set = <3>). Before the modem
++ * boots (icnss powers the chip at probe). A refused vote turns the radio off (one LAUREL WIFI
++ * line); the modem still boots (the rest of the modem services do not need the chip).
++ */
++extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++#define RPM_LDOA            0x616F646Cu         /* "ldoa" */
++#define RPM_KEY_UV          0x00007675u         /* "uv" */
++#define RPM_KEY_SWEN        0x6E657773u         /* "swen" */
++
++static bool
++wlan_supplies_on(char *refused, size_t rlen)
++{
++	static const struct { uint32_t ldo, uv; } sup[] = { { 8, 640000 }, { 16, 1800000 }, { 17, 1304000 }, { 23, 3000000 } };
++	unsigned ok = 0;
++
++	refused[0] = 0;
++	for (unsigned i = 0; i < sizeof(sup) / sizeof(sup[0]); i++) {
++		bool r = true;
++		for (uint32_t set = 0; set <= 1; set++) {
++			r &= topaz_rpm_write(set, RPM_LDOA, sup[i].ldo, RPM_KEY_UV, sup[i].uv);
++			r &= topaz_rpm_write(set, RPM_LDOA, sup[i].ldo, RPM_KEY_SWEN, 1);
++		}
++		ok += r;
++		LOG("wlan: RPM L%uA %u uV on: %s", sup[i].ldo, sup[i].uv, r ? "OK" : "refused");
++		if (!r) {
++			size_t l = strlen(refused);
++			snprintf(refused + l, rlen - l, "%sL%uA", l != 0 ? " " : "", sup[i].ldo);
++		}
++	}
++	return ok == sizeof(sup) / sizeof(sup[0]);
++}
++
++/*
++ * laurel 2401: first failure after the modem boot, for the status line (called every loop ms).
++ * Limits: modem READY 60 s after auth_and_reset, WLFW service 30 s after READY, firmware ready
++ * 60 s after WLFW, WMI READY 30 s after mission mode.
++ */
++static void
++laurel_wifi_watch(unsigned ms, bool ready, uint32_t sk)
++{
++	static unsigned t_ready, t_wlfw, t_mission, arrivals;
++
++	if (w_arrivals != arrivals) {               /* WLFW (re)started: its timers start again */
++		arrivals = w_arrivals;
++		t_wlfw = t_mission = 0;
++		if (w_arrivals > 1) {
++			t_ready = 0;
++		}
++	}
++	if (laurel_wifi_said) {
++		return;
++	}
++	if (!ready) {
++		if (ms >= 60000) {
++			laurel_wifi(false, "modem not READY 60 s after auth_and_reset (slave-kernel %08x)", sk);
++		}
++		return;
++	}
++	if (t_ready == 0) {
++		t_ready = ms + 1;
++	}
++	if (w_arrivals == 0) {
++		if (ms + 1 - t_ready >= 30000) {
++			laurel_wifi(false, "modem up, no WLFW service in 30 s (%u QRTR services, pd-mapper %u, tftp %u reqs)",
++			    q_srv_count, pd_reqs, tftp_reqs);
++		}
++		return;
++	}
++	if (t_wlfw == 0) {
++		t_wlfw = ms + 1;
++	}
++	if (!w_mission) {
++		if (ms + 1 - t_wlfw >= 60000) {
++			laurel_wifi(false, "modem up, WLFW stuck: %s (board id 0x%x)", w_step, w_board);
++		}
++		return;
++	}
++	if (t_mission == 0) {
++		t_mission = ms + 1;
++	}
++	if (!wmi_ready && ms + 1 - t_mission >= 30000) {
++		laurel_wifi(false, "modem up, WLFW ready, board id 0x%x, no WMI READY in 30 s (copy engines %s)", w_board,
++		    ce_up ? "up" : "not started");
++	}
++}
++
+ static void
+ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -5354,16 +5505,28 @@ topaz_modem_thread(void *arg __unused, wait_result_t wr __unused)
+ 	(void)smem_map;
+ 	(void)pool_map;
+ 	if (!topaz_soc_map()) {
++		laurel_wifi(false, "%s", soc_why);
+ 		thread_terminate(current_thread());
+ 		return;
+ 	}
+ 	LOG("SMEM version %u", *(volatile uint32_t *)(smem + 64 + 7 * 4) >> 16);
+-	if (wifi_enabled() && !smmu_identity(WLAN_SID, WLAN_SID_MASK, "WLAN")) {
++	if (!wifi_enabled()) {
++		laurel_wifi(false, "boot-arg wifi=0 (the modem still boots)");
++	} else if (!smmu_identity(WLAN_SID, WLAN_SID_MASK, "WLAN")) {
+ 		LOG("wifi: no SMMU stream for WLAN, the radio stays off");
+ 		wifi_on = 0;
++		laurel_wifi(false, "apps SMMU: no identity stream for WLAN SID 0x%x", WLAN_SID);
++	} else {
++		char refused[32];
++		if (!wlan_supplies_on(refused, sizeof(refused))) {
++			wifi_on = 0;
++			laurel_wifi(false, "RPM refused the WCN3990 supply vote for %s (TopazRpm lines); the modem still boots", refused);
++		}
+ 	}
+ 	if (modem_boot()) {
+ 		modem_watch(smem_partition(0, 1), watch);
++	} else {
++		laurel_wifi(false, "modem boot: %s", boot_why[0] != 0 ? boot_why : "failed");
+ 	}
+ 	/* keep the mappings: the modem uses SMEM from now on */
+ 	thread_terminate(current_thread());
+@@ -5378,10 +5541,16 @@ topaz_modem_init(void)
+ 	uint32_t on = 0;
+ 	thread_t thread;
+ 
+-	if (started || !PE_parse_boot_argn("modem", &on, sizeof(on)) || on == 0) {
++	if (started) {
+ 		return;
+ 	}
+ 	started = true;
++	on = 1;                                     /* laurel 2401: on by default, modem=0 kill switch */
++	(void)PE_parse_boot_argn("modem", &on, sizeof(on));
++	if (on == 0) {
++		laurel_wifi(false, "boot-arg modem=0");
++		return;
++	}
+ 	topaz_sta_init();                           /* private: bsd/dev/topaz_sta.c (en0 + Apple80211 for wifid) */
+ 	if (kernel_thread_start(topaz_modem_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);

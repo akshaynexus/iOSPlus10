@@ -595,4 +595,18 @@ exception, or ask for a macOS path (Xcode clang/ld/codesign in gpu-env.sh).
   100 ms poll, stop on topaz_gpu_wanted/failed); clients default = probes only; Turnip 0101 caps buffers at the kernel's
   RedwoodMaxBuffer (< 64 MiB); macOS path runs the negroni scripts unchanged; LLVM >= 18 floor; wider LSE check.
   Merge: A -> B (2150-2152; B adds root-add-gpu.sh before root-add-metal.sh in root.sh) -> J 2850.
+## Mi A3 Wi-Fi: patches 2400-2402 built (2026-11-01 04:35, area E, branch t3/laurel-wifi-modem-firmware)
+
+- Done [V build]: 2400 modem firmware through a runtime FAT16/FAT32 index of `modem_<active slot>` (GPT A/B bit; Mi A3: modem_b),
+  replaces topaz's HyperOS offset tables; 2401 Mi A3 values (carve-out 0x4b000000+0x7e00000, MSA 0x53300000, SMMU SID 0x80, WCN3990
+  supply votes over RPM), on by default (`modem=0`/`wifi=0` kill switches), `LAUREL WIFI: on|off:` line; 2402 fallbacks for the
+  WLAN.HL.3.0.2 firmware. `op10tool fatls` + `scripts/laurel/modem-fw-check.sh` (host model of the parser: stock NON-HLOS FAT16,
+  420 files, 0 fragmented). Kernel 221 patches, 0 LSE; image `out/laurel/uefi/laurel-uefi-boot.img` in the area-E worktree.
+  Details: `docs/laurel_sprout/wifi.md`. No root-image change (the ADT `wlan` node for wifid is in mkadt.py already).
+- Not booted. Next (coordinator): boot, read `TopazModem: firmware:`, `smmu:`, `wlan: RPM`, PAS, `wlfw:` lines and `LAUREL WIFI:`;
+  then Settings > Wi-Fi. If `off`, the reason names the step (wifi.md "Next").
+- Review fixes 2026-11-01 04:56 [V build]: 2400-2404 rebased on origin/laurel-int-1 (232 patches, 0 LSE, kernel sha256 545cab2a18a1c392...):
+  FAT bounds, MSA 2 MiB, RPM refusal -> Wi-Fi off, TrustZone/SMMU locks shared with TopazAudio, pool vs XNU RAM check (area A map:
+  pool 0xE0000000-0xE1000000 unchanged). `tools/op10tool/tests/fatls-test.sh` all ok. No image built in this round (needs the Mu FD
+  with area A's 0101); the coordinator builds it.
 
