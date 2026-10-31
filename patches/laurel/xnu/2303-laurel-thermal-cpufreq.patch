@@ -1,8 +1,8 @@
 laurel 2303: CPU frequency governor on the SM6125 OSM + TSENS thermal caps (new bsd/dev/laurel_thermal.c; negroni 0280/0283/0284 ideas on trinket hardware). One 100 ms kernel thread: busy % per cluster (processor_cpu_load_info, busiest core over 300 ms) steps the OSM row of Silver (pwrcl 0xf521000) and Gold (perfcl 0xf523000) between the ABL row (floor) and the cap; every 1 s TSENS (0x4411000, sensors 6-12 CPU, 15 GPU) reads -40..125 C and ignores a single sensor > 20 C above the others, lowers the Gold cap at >= 95 C (down to row 0, below the ABL floor of the governor) (Silver too at >= 105 C) and raises it again below 85 C. Replaces the topaz 0094 pin of Gold at max (kept as the fallback when the governor is off). Lines 'LAUREL CPUFREQ: on: OSM governor, silver rows ..' / 'off: ..', 'LAUREL THERMAL: on: TSENS cpu N C gpu N C ..' / 'off: ..', a status line a minute and on cap changes. Kill switches laurelcpugov=0, laurelthermal=0.
 
 diff -ruN a/bsd/conf/files b/bsd/conf/files
---- a/bsd/conf/files	2026-11-01 04:55:55.223886189 +0530
-+++ b/bsd/conf/files	2026-11-01 04:55:55.267772327 +0530
+--- a/bsd/conf/files	2026-11-01 05:07:52.869073653 +0530
++++ b/bsd/conf/files	2026-11-01 05:07:52.878757458 +0530
 @@ -114,6 +114,7 @@
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_i2c1.c			standard
@@ -13,7 +13,7 @@ diff -ruN a/bsd/conf/files b/bsd/conf/files
  bsd/dev/topaz_redwood_audio.c		standard
 diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 --- a/bsd/dev/laurel_thermal.c	1970-01-01 05:30:00.000000000 +0530
-+++ b/bsd/dev/laurel_thermal.c	2026-11-01 04:59:21.115899047 +0530
++++ b/bsd/dev/laurel_thermal.c	2026-11-01 05:07:52.879820093 +0530
 @@ -0,0 +1,350 @@
 +/*
 + * laurel 2303 (Xiaomi Mi A3, SM6125): CPU frequency governor on the OSM + TSENS thermal caps.
@@ -366,9 +366,9 @@ diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff -ruN a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
---- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:55:45.808807838 +0530
-+++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:55:45.817377678 +0530
-@@ -17,6 +17,7 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 05:09:33.452433265 +0530
++++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 05:09:33.452889928 +0530
+@@ -19,6 +19,7 @@
  extern "C" int sweet_spmi_init(void);
  extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
  extern "C" int sweet_cpufreq_max(void);    /* bsd/dev/sweet_cpufreq.c */
@@ -376,7 +376,7 @@ diff -ruN a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cp
  #include "../../../bsd/dev/laurel_pmi632.h"
  
  class SweetBattery : public IOPMPowerSource {
-@@ -245,7 +246,10 @@
+@@ -270,7 +271,10 @@
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}

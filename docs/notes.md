@@ -3869,3 +3869,8 @@ Details: `docs/laurel_sprout/battery-power.md`.
   -40..125 C with outlier rejection; PS_HOLD writes read back; charge mode powers off only after the USBIN plug-in bit is
   clear 5 s. `bsd/conf/files` entries moved after sweet_i2c1.c (2700's hunk context). Build `areaD-k2305`: 231 patches,
   0 LSE, kernel sha256 ddfd8d15... NOT BOOTED.
+- Unattended-safety follow-up (2026-11-01 05:10, on top of 58b85b8 = SAFE-TO-TEST supervised): failed safe writes retried
+  every 10 s until read back (timer never stops while pending); FV written even when its read fails; write-check and
+  battery self-check failures write the safe limits (SMB5 EE 0); safe limits before IOPMrootDomain will-sleep; kill
+  switches laurelbatt=0/laurelchg=0 = no writes (previous limits stay). Build `areaD-k2306`: 231 patches, 0 LSE, kernel
+  sha256 7bda8194... NOT BOOTED.

@@ -1,6 +1,8 @@
 # Mi A3: battery, charger, charge-only boot, power off, thermal + cpufreq (area D, patches 2300-2303)
 
-Status 2026-11-01 05:01: safety re-check fixes built on laurel-int-1 (`areaD-k2305`: 231 patches applied, 0 LSE; kernel sha256 ddfd8d1522cd0059ce0b3935123490a4e61f3eb5b8819628556678139ba3e248). Review fixes 92713a8 were b1cc64f1..., first version 661609a was (`scripts/bg.sh areaD-k2303 scripts/laurel/kernel-linux.sh`: 223 patches applied, 0 LSE; kernel sha256 b96061512f0aed39d72a7d00e63a2b3a3a0bc815b9f126eb0f8d537414f8dc28). NOT BOOTED. [V] = read in files / build,
+Status 2026-11-01 05:10: unattended-safety follow-up built on laurel-int-1 (`areaD-k2306`: 231 patches applied, 0 LSE;
+kernel sha256 7bda8194fc8e77b3867535c5a4202e25ce1023a988ccfcfb278eea475131c6bb). Final safety check of 58b85b8:
+SAFE-TO-TEST (supervised bench test); this follow-up is for unattended charging. NOT BOOTED. [V] = read in files / build,
 [I] = inference, [U] = unknown until a boot.
 
 ## Why the battery reads failed before 2300 [V]
@@ -199,3 +201,26 @@ Rebased onto `origin/laurel-int-1` (A, C, H). The `bsd/conf/files` entries moved
 | SHOULD 5 | TSENS -40..125 C, single outlier > 20 C ignored |
 | SHOULD 6 | PS_HOLD writes checked + read back; charge mode powers off only after the plug-in RT bit is clear 5 s |
 - [I] Silver/Gold rows below what topaz used: the OSM handles the voltage (CPR) in hardware, as under Linux.
+
+## Unattended-safety follow-up 2026-11-01 (on top of 58b85b8)
+
+| Item | Fix |
+| --- | --- |
+| F1 | a failed safe write sets `lp_safe_pending`; the 10 s guard timer retries 500 mA / 4100 mV until the read-back is good and never stops while one is pending (`LAUREL CHARGER: safe limits ... written after N retries`) |
+| F2 | `set_fcc_fv` writes FV (then FCC, both read back) also when the FV read fails |
+| F3 | `SMB5 write check failed` now writes the safe limits too |
+| F4 | battery self-check failures after the SPMI start (QG type, no battery, implausible vbat): input suspend released and safe limits written when CHGR/USBIN are EE 0 (`LAUREL CHARGER: off: battery gauge off; safe limits ...`). SPMI arbiter not ready / no lock: no SPMI at all, no writes |
+| F5 | kill switches below |
+| sleep | see below |
+
+Kill switches: `laurelbatt=0` and `laurelchg=0` mean **no PMIC writes at all**: the charger keeps whatever limits it had
+(the XBL/ABL defaults, or the limits of an earlier boot, e.g. 3000 mA / 4400 mV). Use them only on a supervised bench.
+`laurelbatt=0` also skips the release of a USB input suspend left by an earlier boot.
+
+System sleep [V source, U behaviour]: topaz and SweetPlatformExpert have no CPU suspend path, so whether iOS ever
+puts this kernel to system sleep is unknown. The guard timer is a thread_call on absolute time: it does not fire while
+asleep (no code runs then anyway). SweetBattery registers an IOPMrootDomain sleep/wake interest; on
+`kIOMessageSystemWillSleep` the charger gets 500 mA / 4100 mV (`LAUREL CHARGER: system sleep: safe limits ...`),
+and the first charger step after wake writes the zone limits again. The NTC watchdog does not count sleep time
+(absolute time stops), so a wake does not trip it.
+

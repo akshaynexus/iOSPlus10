@@ -1,9 +1,9 @@
 laurel 2302: charge-only boot and a real power off. Charge mode (negroni 0377 idea): before launchd (load_init_program), a cold charger power-on (PM6125 PON_REASON1 0x8c0 USB_CHG/CBL/DC, or PON1 with the PMI632 charger reason; no warm-reset reason 0x8c2, no hard reset/SMPL/RTC/power key) with the charger still in keeps launchd stopped and prints the battery on the kernel console every 10 s while the charger loop runs; power key = boot iOS, charger out for 3 s = power off; any failed check (also 10 failed PMIC reads in a row inside charge mode) boots iOS normally; power key polled every 200 ms; power off only after the USBIN plug-in RT bit is clear for 5 s (a collapsing charger keeps it). Power off and restart release our USB input suspend first; the PS_HOLD writes are checked and read back (failure logged, the S2 enable always restored). Lines 'LAUREL CHARGE MODE: on: normal boot (pon .. warm .. pmi .. charger N)' / 'on: charger power-on ...' / 'off: <reason>'; kill switch laurelchgmode=0. Power off (2003) now sets the PM6125 PS_HOLD reset type to SHUTDOWN (0x85A type 4 with the 0x85B enable cleared and set, as Linux qpnp_pon_system_pwr_off) before PSCI SYSTEM_OFF, and writes the old type back if PSCI returns; a plain restart selects HARD_RESET (type 7, msm-poweroff without a command), a restart with a reason keeps the 2018 warm reset; line 'LAUREL REBOOT: PS_HOLD_RST_CTL 0x.. -> 0x.. (shutdown)'.
 
 diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
---- a/bsd/dev/laurel_pmi632.c	2026-11-01 04:58:46.631453264 +0530
-+++ b/bsd/dev/laurel_pmi632.c	2026-11-01 04:58:46.631935833 +0530
-@@ -992,4 +992,128 @@
+--- a/bsd/dev/laurel_pmi632.c	2026-11-01 05:08:53.033026620 +0530
++++ b/bsd/dev/laurel_pmi632.c	2026-11-01 05:09:33.453487740 +0530
+@@ -1110,4 +1110,128 @@
  	IOLockUnlock(lp_lock);
  	return 0;
  }
@@ -133,20 +133,20 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff -ruN a/bsd/dev/laurel_pmi632.h b/bsd/dev/laurel_pmi632.h
---- a/bsd/dev/laurel_pmi632.h	2026-11-01 04:58:11.035509253 +0530
-+++ b/bsd/dev/laurel_pmi632.h	2026-11-01 04:59:06.538438032 +0530
-@@ -30,6 +30,8 @@
- int laurel_pmi632_pon(uint8_t *reason, uint8_t *warm, uint8_t *pmi);
- /* Power off / restart path, any context (no lock): release our USB input suspend. */
+--- a/bsd/dev/laurel_pmi632.h	2026-11-01 05:08:53.033534922 +0530
++++ b/bsd/dev/laurel_pmi632.h	2026-11-01 05:09:33.453189195 +0530
+@@ -32,6 +32,8 @@
  void laurel_pmi632_release_input(void);
+ /* IOPMrootDomain will-sleep (SweetBattery): safe charger limits before the system sleeps. Thread context. */
+ void laurel_pmi632_will_sleep(void);
 +/* laurel 2302: charge-only boot; init thread, before launchd. Returns to boot iOS; may power off. */
 +void laurel_charge_mode(void);
  #ifdef __cplusplus
  }
  #endif
 diff -ruN a/bsd/dev/laurel_reboot.c b/bsd/dev/laurel_reboot.c
---- a/bsd/dev/laurel_reboot.c	2026-11-01 04:55:11.000000000 +0530
-+++ b/bsd/dev/laurel_reboot.c	2026-11-01 04:59:21.078632646 +0530
+--- a/bsd/dev/laurel_reboot.c	2026-11-01 05:07:24.000000000 +0530
++++ b/bsd/dev/laurel_reboot.c	2026-11-01 05:07:52.874193438 +0530
 @@ -39,6 +39,7 @@
   * word alone did nothing on this device (boot 2026-11-01 03:48: "ctl bootloader" booted normally).
   */
@@ -230,8 +230,8 @@ diff -ruN a/bsd/dev/laurel_reboot.c b/bsd/dev/laurel_reboot.c
  	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_RESET (%s)\n", lr_modes[lr_mode].name);
  	int64_t rc = lr_psci(PSCI_SYSTEM_RESET);
 diff -ruN a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
---- a/bsd/kern/kern_exec.c	2026-11-01 04:55:11.000000000 +0530
-+++ b/bsd/kern/kern_exec.c	2026-11-01 04:55:45.813300719 +0530
+--- a/bsd/kern/kern_exec.c	2026-11-01 05:07:24.000000000 +0530
++++ b/bsd/kern/kern_exec.c	2026-11-01 05:07:52.874963811 +0530
 @@ -7026,6 +7026,9 @@
   * 3		2		NA		/usr/appleinternal/sbin/launchd.development
   * 4		3		1		/sbin/launchd

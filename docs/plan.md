@@ -575,3 +575,4 @@ phone stays off; then power off + plug in the charger -> `charger power-on` line
 Review fixes built 04:47 (B1 NTC-gated charger + 30 s NTC watchdog, M1 hard JEITA check + boot limits restore, M2-M7, minor
 m4-m7): `areaD-k2304`, 223 patches, 0 LSE. Not booted. Table in `docs/laurel_sprout/battery-power.md` "Review".
 Safety re-check fixes built 05:01 on laurel-int-1 (MUST 1-3, SHOULD 4-6): `areaD-k2305`, 231 patches, 0 LSE. Not booted.
+Unattended-safety follow-up built 05:10 (F1-F5, safe limits before system sleep): `areaD-k2306`, 231 patches, 0 LSE. Not booted.
