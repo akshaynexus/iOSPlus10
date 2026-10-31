@@ -1,0 +1,385 @@
+laurel 2006: USB gadget starts from STARTUP(EARLY_BOOT) (kernel_bootstrap_thread, before IOKit matching ends and bsd_init) in raw-frame mode (the panic engine: ARP by hand, console ring from byte 0 as UDP 5140, commands on UDP 5141 incl. panic); bsd_init attaches ue0 after net_init_run (laurel_usb_net_attach) and the socket log goes on at the raw position. sweet_cpu_mark_offline also clears cpu_running and sets SIGPdisabled so cross-calls never wait on a half-started core.
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 96c6f09..418b18f 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -821,8 +821,7 @@ sweet_ufs_init(void)
+ 	 */
+ 	sweet_touch_init();
+ 	sweet_keys_init();
+-	/* laurel 2005: the USB gadget has its own self-check and kill switch (laurelusb=0) */
+-	sweet_usb_probe();
++	/* laurel 2006: the USB gadget starts from STARTUP(EARLY_BOOT) in sweet_usb.c, ue0 from bsd_init */
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 8f63464..0e99682 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -16,6 +16,17 @@
+  * else changes. Kill switches: laurelusb=0 (all), laurelctl=0 (commands),
+  * laurelpanicusb=0 (panic hold), sweetusblog=0 (live log).
+  *
++ * Patch 2006: early start. The gadget starts from the STARTUP(EARLY_BOOT)
++ * hook of kernel_bootstrap_thread (threads, timers and kmem work; no BSD
++ * yet), so the host sees the ECM device seconds after the kernel starts.
++ * Until bsd_init has the network stack up (laurel_usb_net_attach(), after
++ * net_init_run) the driver runs in "raw" mode, the same frame engine as
++ * the panic hold: ARP by hand, the console ring from byte 0 as UDP 5140
++ * datagrams, commands on UDP 5141. So a boot that hangs anywhere after
++ * the hook still gives the whole log and answers `op10tool ctl ping` /
++ * `bootloader`. The attach switches to ue0 + mbufs + sockets without a
++ * gap (the socket log goes on at the raw stream position).
++ *
+  * SWEET: USB bring-up, step 1 - read-only state probe.
+  *
+  * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+@@ -39,6 +50,7 @@
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
++#include <kern/startup.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+ #include <sys/sockio.h>
+@@ -52,8 +64,15 @@
+ #include <netinet/in.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-void sweet_usb_probe(void);
++void laurel_usb_net_attach(void);
++static void laurel_usb_early_start(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
++static bool ud_early;                   /* raw frames (no ifnet) until laurel_usb_net_attach() */
++static int  ud_livelog = 1;             /* boot-arg sweetusblog */
++static bool ud_log_from_raw;            /* ud_log_thread starts at ud_log_sent (set by the attach) */
++static void ud_raw_begin(void);
++static int  ud_raw_tx_service(void);
++static void ud_raw_action(int action);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ /*
+@@ -125,8 +144,8 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
+-void
+-sweet_usb_probe(void)
++static void
++laurel_usb_early_start(void)
+ {
+ 	int enabled = 1;
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+@@ -193,6 +212,8 @@ sweet_usb_probe(void)
+ 	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+ 	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+ }
++/* kernel_bootstrap_thread, just before interrupts go on: before IOKit matching ends and bsd_init */
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, laurel_usb_early_start);
+ 
+ /*
+  * Step 2: USB device mode with only the default control endpoint, enough
+@@ -587,8 +608,8 @@ ud_rx_done(void)
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
+-	if (ud_in_panic) {
+-		/* no network stack in panic mode; only ARP and the command server */
++	if (ud_in_panic || ud_early) {
++		/* no network stack in panic mode or before bsd_init: ARP and the command server by hand */
+ 		if (len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 			ud.rx_frames++;
+ 			ud_panic_rx((const uint8_t *)(ud.dma + UD_RX), len);
+@@ -973,6 +994,7 @@ ud_ctl_poll(void)
+ #define DEPCMD_ENDTRANSFER      8
+ #define DEPCMD_FORCERM          (1u << 11)
+ #define UD_PANIC_ACT_POWEROFF   0x100
++#define UD_PANIC_ACT_PANIC      0x101   /* raw mode only */
+ 
+ enum { UD_PREPLY_UDP = 1, UD_PREPLY_ARP = 2 };
+ static struct {
+@@ -1052,29 +1074,40 @@ ud_panic_rx(const uint8_t *f, uint32_t len)
+ 	(void)ud_ctl_word(udp, ulen, cmd, sizeof(cmd));
+ 
+ 	const char *reply;
++	const char *sfx = ud_in_panic ? " (panic)" : "";
+ 	char text[64];
+ 	int action = -1;
++	bool busy = ud_panic_busy || ud_panic_action >= 0 || (!ud_in_panic && ud.ctl_action != UD_CTL_NONE);
+ 	if (strcmp(cmd, "ping") == 0) {
+-		reply = "pong (panic)";
++		snprintf(text, sizeof(text), "pong%s", sfx);
++		reply = text;
+ 	} else if (strcmp(cmd, "log") == 0) {
+ 		uint64_t end = sweet_log_position();
+ 		ud_panic_pos = end > 65536 ? end - 65536 : 0;
+-		reply = "ok log (panic)";
++		snprintf(text, sizeof(text), "ok log%s", sfx);
++		reply = text;
+ 	} else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "recovery") == 0 ||
+ 	    strcmp(cmd, "bootloader") == 0 || strcmp(cmd, "poweroff") == 0) {
+-		if (ud_panic_busy || ud_panic_action >= 0) {
++		if (busy) {
+ 			reply = "error: busy";
+ 		} else {
+ 			action = cmd[0] == 'p' ? UD_PANIC_ACT_POWEROFF : cmd[2] == 'b' ? 0 : cmd[2] == 'c' ? 1 : 2;
+-			snprintf(text, sizeof(text), "ok %s (panic)", cmd);
++			snprintf(text, sizeof(text), "ok %s%s", cmd, sfx);
+ 			reply = text;
+ 		}
+ 	} else if (strcmp(cmd, "panic") == 0) {
+-		reply = "error: already in panic";
++		if (ud_in_panic) {
++			reply = "error: already in panic";
++		} else if (busy) {
++			reply = "error: busy";
++		} else {
++			action = UD_PANIC_ACT_PANIC;
++			reply = "ok panic";
++		}
+ 	} else {
+-		reply = "error: panic mode: ping log reboot bootloader recovery poweroff";
++		reply = ud_in_panic ? "error: panic mode: ping log reboot bootloader recovery poweroff" : "error: unknown command";
+ 	}
+-	printf("LAUREL PANIC CTL: \"%s\" -> %s\n", cmd, reply);
++	printf("LAUREL %sCTL: \"%s\" -> %s\n", ud_in_panic ? "PANIC " : "", cmd, reply);
+ 	ud_panic_queue(UD_PREPLY_UDP, f + ETHER_ADDR_LEN, ip + 12, ud_be16(udp), reply);
+ 	if (action >= 0) {
+ 		ud_panic_action = action;
+@@ -1168,6 +1201,9 @@ ud_panic_tx_next(void)
+ 		ud_panic_tx_start((uint32_t)len);
+ 		return;
+ 	}
++	if (!ud_in_panic && !ud_livelog) {
++		return;                         /* sweetusblog=0: commands only */
++	}
+ 	uint32_t n = sweet_log_copy(&ud_panic_pos, (char *)f + ETHER_HDR_LEN + 20 + 8, UD_PANIC_CHUNK);
+ 	if (n > 0) {
+ 		ud_panic_tx_start(ud_udp_build(f, ud_host_mac, ud_host_ip, UD_LOG_PORT, UD_LOG_PORT,
+@@ -1186,14 +1222,12 @@ ud_panic_begin(void)
+ 		return false;
+ 	}
+ 	ud_in_panic = true;
+-	nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &ud_panic_tx_timeout);
+-	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &ud_panic_host_wait);
+-	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &ud_panic_gap);
+ 	/* the live log reached the host before the panic: no need to wait for it */
+ 	ud_panic_host_seen = ud.configured && ud.rx_frames > 0;
+ 	ud_panic_was_configured = ud.configured;
+ 	ud_panic_conf_at = mach_absolute_time();
+-	uint64_t end = sweet_log_position(), from = ud_log_sent;
++	/* raw mode (before the network attach): the panic goes on where the raw stream is */
++	uint64_t end = sweet_log_position(), from = ud_early ? ud_panic_pos : ud_log_sent;
+ 	if (from > end || end - from > UD_PANIC_RING_MAX) {
+ 		from = end > UD_PANIC_RING_MAX ? end - UD_PANIC_RING_MAX : 0;
+ 	}
+@@ -1240,9 +1274,20 @@ ud_panic_service(bool busy)
+ 			ud_event(ev);
+ 		}
+ 	}
++	return ud_raw_tx_service();
++}
++
++/*
++ * Raw-frame transmit step, shared by the panic loop and ud_thread in early
++ * mode (ud.lock held there): a 2 s TX timeout, then the next frame when the
++ * IN endpoint is free. Returns the command action to run (-1: none).
++ */
++static int
++ud_raw_tx_service(void)
++{
+ 	if (ud.configured != ud_panic_was_configured) {
+ 		ud_panic_was_configured = ud.configured;
+-		if (ud.configured) {            /* (re)enumerated in panic mode: wait for the host's address */
++		if (ud.configured) {            /* (re)enumerated: wait for the host's address */
+ 			ud_panic_host_seen = false;
+ 			ud_panic_conf_at = mach_absolute_time();
+ 		}
+@@ -1267,6 +1312,44 @@ ud_panic_service(bool busy)
+ 	return action;
+ }
+ 
++/* Early (raw) mode: the engine above runs from ud_thread until the network attach. */
++static void
++ud_raw_begin(void)
++{
++	nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &ud_panic_tx_timeout);
++	nanoseconds_to_absolutetime(10 * NSEC_PER_SEC, &ud_panic_host_wait);
++	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &ud_panic_gap);
++	ud_panic_pos = 0;                       /* the console ring from the first byte */
++	ud_panic_txq_left = 0;
++	ud_panic_host_seen = false;
++	ud_panic_was_configured = false;
++	ud_panic_conf_at = mach_absolute_time();
++	ud_early = true;
++}
++
++/* A command action from ud_raw_tx_service() in early mode: run it like ud_ctl_input does. */
++static void
++ud_raw_action(int action)
++{
++	if (action < 0 || ud.ctl_action != UD_CTL_NONE) {
++		return;
++	}
++	if (action == UD_PANIC_ACT_PANIC) {
++		printf("LAUREL CTL: panic in %u ms\n", UD_CTL_DELAY_MS);
++		ud_ctl_schedule(UD_CTL_PANIC);
++		return;
++	}
++	if (action == UD_PANIC_ACT_POWEROFF) {
++		printf("LAUREL CTL: power off in %u ms\n", UD_CTL_DELAY_MS);
++		ud_ctl_schedule(UD_CTL_POWEROFF);
++		return;
++	}
++	bool set = laurel_reboot_set_mode(ud_ctl_resets[action].mode) == 0;
++	printf("LAUREL CTL: %s: mode %s %s, reset in %u ms\n", ud_ctl_resets[action].name,
++	    ud_ctl_resets[action].mode, set ? "set" : "NOT set (plain reset)", UD_CTL_DELAY_MS);
++	ud_ctl_schedule(UD_CTL_RESET);
++}
++
+ /*
+  * Panic hold: called by the platform expert at kPEPanicDiagnosticsDone (the
+  * panic log is complete) or kPEPanicRestartCPU. Returns at once when USB is
+@@ -1357,10 +1440,6 @@ static void
+ ud_if_create(void)
+ {
+ 	struct ifnet_init_eparams init;
+-	static lck_grp_t *grp;
+-
+-	grp = lck_grp_alloc_init("sweet_usb", LCK_GRP_ATTR_NULL);
+-	ud.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
+ 
+ 	bzero(&init, sizeof(init));
+ 	init.ver = IFNET_INIT_CURRENT_VERSION;
+@@ -1537,6 +1616,12 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 				ud_event(ev);
+ 			}
+ 		}
++		if (ud_early) {
++			lck_mtx_lock(ud.lock);
++			int action = ud_raw_tx_service();
++			lck_mtx_unlock(ud.lock);
++			ud_raw_action(action);
++		}
+ 		ud_ctl_poll();
+ 		if ((++ticks % 30000) == 0) {
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+@@ -1564,6 +1649,9 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	uint64_t pos = sweet_log_position();
+ 
+ 	pos = pos > 65536 ? pos - 65536 : 0;
++	if (ud_log_from_raw) {
++		pos = ud_log_sent;              /* go on where the raw stream of early mode stopped */
++	}
+ 	ud_log_sent = pos;
+ 	bzero(&to, sizeof(to));
+ 	to.sin_len = sizeof(to);
+@@ -1616,7 +1704,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+-	ud_if_create();
++	static lck_grp_t *grp;
++	grp = lck_grp_alloc_init("sweet_usb", LCK_GRP_ATTR_NULL);
++	ud.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+@@ -1673,17 +1763,45 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
+ 	int ctl = 1;
+ 	PE_parse_boot_argn("laurelctl", &ctl, sizeof(ctl));
+-	ud.ctl_enabled = ctl != 0 && ud.ifp != NULL;
++	ud.ctl_enabled = ctl != 0;
+ 	PE_parse_boot_argn("laurelpanicusb", &ud_panic_enabled, sizeof(ud_panic_enabled));
++	PE_parse_boot_argn("sweetusblog", &ud_livelog, sizeof(ud_livelog));
++	ud_raw_begin();
+ 	ud_running = true;
+-	printf("LAUREL USB: on: ECM ue0 192.168.7.2, log udp 192.168.7.1:5140, commands udp :5141 %s, panic hold %s\n",
++	printf("LAUREL USB: on: ECM 192.168.7.2 (raw frames until bsd_init attaches ue0), log udp 192.168.7.1:5140 %s, "
++	    "commands udp :5141 %s, panic hold %s\n", ud_livelog ? "on" : "off",
+ 	    ud.ctl_enabled ? "on" : "off", ud_panic_enabled ? "on" : "off");
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+-	int livelog = 1;
+-	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
+-	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
++}
++
++/*
++ * bsd_init, after net_init_run(): ue0 (192.168.7.2/24) on the gadget and the
++ * switch from raw frames to the network stack. Without the gadget (self-check
++ * failed, laurelusb=0) nothing happens.
++ */
++void
++laurel_usb_net_attach(void)
++{
++	thread_t thread;
++
++	if (!ud_running || ud.ifp != NULL) {
++		return;
++	}
++	ud_if_create();
++	if (ud.ifp == NULL) {
++		printf("LAUREL USB: ue0 not attached: raw frames stay on (log and commands still work)\n");
++		return;
++	}
++	lck_mtx_lock(ud.lock);
++	ud_early = false;
++	ud_log_sent = ud_panic_pos;             /* the socket log goes on here */
++	ud_log_from_raw = true;
++	ud_preply_count = 0;                    /* replies not sent yet: the host asks again */
++	lck_mtx_unlock(ud.lock);
++	printf("LAUREL USB: ue0 attached; %llu console bytes went out as raw frames\n", ud_panic_pos);
++	if (ud_livelog && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..f1061aa 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -207,6 +207,9 @@ void IOKitInitializeTime(void);         /* XXX */
+ void IOSleep(unsigned int);             /* XXX */
+ void IOSetImageBoot(void);              /* XXX */
+ void loopattach(void);                  /* XXX */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++void laurel_usb_net_attach(void);       /* laurel 2006 */
++#endif
+ 
+ void ipc_task_enable(task_t task);
+ 
+@@ -863,6 +866,10 @@ bsd_init(void)
+ 	 */
+ 	bsd_init_kprintf("calling net_init_run\n");
+ 	net_init_run();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* laurel 2006: ue0 on the USB gadget that runs since STARTUP(EARLY_BOOT) (bsd/dev/sweet_usb.c) */
++	laurel_usb_net_attach();
++#endif
+ #endif /* NETWORKING */
+ 
+ 	bsd_init_kprintf("calling inittodr\n");
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index 3ef1f92..16c0f59 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -998,6 +998,16 @@ sweet_cpu_mark_offline(unsigned int cpu)
+ 	}
+ 	pset_unlock(pset);
+ 	splx(s);
++	/*
++	 * laurel 2006: a core that began to run (cpu_running from cpu_init) but
++	 * never unmasked IRQs would still be a target of cpu_broadcast_xcall and
++	 * hang the caller for ever. Take it out of the IPI set as well.
++	 */
++	cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
++	if (cdp != NULL) {
++		cdp->cpu_running = FALSE;
++		os_atomic_or(&cdp->cpu_signal, SIGPdisabled, relaxed);
++	}
+ 	ml_cpu_end_state_transition(cpu);
+ }
+ #endif
