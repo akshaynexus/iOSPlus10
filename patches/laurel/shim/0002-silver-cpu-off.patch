@@ -1,0 +1,19 @@
+laurel shim 0002: the Silver boot core turns itself off (PSCI CPU_OFF) after the hand-off to Gold 0x100, so XNU can CPU_ON it later (a parked core is ALREADY_ON = -4).
+diff -ruN a/shim.c b/shim.c
+--- a/shim.c	2026-11-01 00:02:39.078762588 +0530
++++ b/shim.c	2026-11-01 00:02:39.092240211 +0530
+@@ -521,6 +521,14 @@
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
+ 		if (r == 0) {
++			/*
++			 * laurel: turn this core OFF. A parked (wfi) core is still ON
++			 * for PSCI, so XNU's later CPU_ON of MPIDR 0x0 got -4
++			 * (ALREADY_ON) and panicked. CPU_OFF does not return; the wfi
++			 * loop stays as the fallback when it does.
++			 */
++			__asm__ volatile("dsb sy" ::: "memory");
++			smc(PSCI_CPU_OFF, 0, 0, 0);
+ 			for (;;)	/* parked with DAIF masked (start.S) */
+ 				__asm__ volatile("wfi");
+ 		}

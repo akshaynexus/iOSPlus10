@@ -446,3 +446,13 @@ release on failed stages: proposal in docs/audit/2026-10-26-power.md section 6 f
 1. Fix the RedwoodGPU user client panic in slop's A730 path.
 2. Port UniXNU NativeAdreno board code (GMU, RSC, votes, cmd-db, SMMU) to SM8450.
 3. Port NativeMetal (metal2vulkan via Turnip FD730) to the iOS 26 Metal interface.
+
+## Mi A3 (laurel_sprout) status (2026-11-01, branch laurel-sprout)
+
+Done: kalloc assert fix (0102); SMP CPU_ON -4 panic: shim 0002 (Silver boot core CPU_OFF) + kernel 2004
+(SweetCPU soft-fail, dead cores off-line, boot goes on); USB log channel 2005 (negroni protocol: ECM,
+UDP 5140 log, UDP 5141 commands, panic hold over USB; docs/laurel_sprout/usb-debug.md); host loop
+`scripts/laurel/boot-test.sh`. Image built, not booted (phone not on USB).
+Next: owner puts the phone in fastboot and runs `make usblog` (sudo); then
+`scripts/bg.sh laurel-test scripts/laurel/boot-test.sh`; read logs/laurel-boot-*.log; fix the next panic.
+Exact results go to docs/notes.md.

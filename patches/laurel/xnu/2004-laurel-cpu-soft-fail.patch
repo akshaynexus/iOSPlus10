@@ -1,0 +1,131 @@
+laurel 2004: SweetCPU soft-fail: a secondary core the firmware refuses (PSCI CPU_ON != 0, -4 = ALREADY_ON) or that is not alive after 5 s is marked off-line (LAUREL CPU: off: ...) and the boot goes on with the cores that came up. The boot core still panics. Helper sweet_cpu_mark_offline (osfmk/arm64/cpu.c) puts the processor back to PROCESSOR_OFF_LINE.
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -20,6 +20,7 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++extern "C" void sweet_cpu_mark_offline(unsigned int cpu);
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -43,6 +44,7 @@
+ 	OSDeclareDefaultStructors(SweetCPU);
+ 	const OSSymbol *cpuName = NULL;
+ 	uint32_t initialized = 0; /* release/acquire publication after initCPU sends SGI */
++	uint32_t failed = 0;      /* laurel: PSCI CPU_ON refused; the core stays off */
+ 
+ public:
+ 	static void startAll(void *arg, wait_result_t result);
+@@ -152,6 +154,12 @@
+ 		panic("SWEET CPU: expected boot MPIDR 0x100 and logical CPU 0, got 0x%x/%u",
+ 		    topology->boot_cpu->phys_id, topology->boot_cpu->cpu_id);
+ 	}
++	/*
++	 * laurel: a secondary core that the firmware refuses (PSCI CPU_ON != 0)
++	 * or that does not come alive in 5 s is marked off-line and the boot
++	 * goes on with the cores that came up (one line per dead core).
++	 */
++	unsigned int alive = 0;
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+@@ -160,15 +168,29 @@
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
++		bool dead = false;
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !sweet_cpu_signal_is_enabled(i)) {
++			if (__atomic_load_n(&cpu->failed, __ATOMIC_ACQUIRE) != 0) {
++				dead = true;
++				break;
++			}
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
++				IOLog("LAUREL CPU: off: cpu=%u mpidr=0x%x not alive after 5 s (reset/MMU/GIC/SGI)\n",
+ 				    i, topology->cpus[i].phys_id);
+-				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++				dead = true;
++				break;
+ 			}
+ 			IOSleep(1);
+ 		}
++		if (dead) {
++			if (cpu == __atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)) {
++				panic("SWEET CPU: boot cpu=%u not alive", i);
++			}
++			sweet_cpu_mark_offline(i);
++			continue;
++		}
++		alive++;
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
+ 	}
+@@ -178,7 +200,7 @@
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+-	    topology->num_cpus, topology->num_cpus);
++	    alive, topology->num_cpus);
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -248,9 +270,12 @@
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+ 	IOLog("SWEET CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
+-	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
++	/* cpu_start() discards PE_cpu_start's return: startAll reads `failed`. */
+ 	if (rc != 0) {
+-		panic("SWEET CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
++		IOLog("LAUREL CPU: off: cpu=%u mpidr=0x%x PSCI CPU_ON rc=%d (-4 = ALREADY_ON: the shim left it parked)\n",
++		    getCPUNumber(), cpu->phys_id, rc);
++		__atomic_store_n(&failed, 1, __ATOMIC_RELEASE);
++		return KERN_FAILURE;
+ 	}
+ 	return KERN_SUCCESS;
+ }
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -36,6 +36,7 @@
+ #include <kern/machine.h>
+ #include <kern/cpu_number.h>
+ #include <kern/percpu.h>
++#include <kern/processor.h>
+ #include <kern/thread.h>
+ #include <kern/timer_queue.h>
+ #include <arm/cpu_data.h>
+@@ -975,6 +976,30 @@
+ 	cpu_data_t *cdp = CpuDataEntries[cpu].cpu_data_vaddr;
+ 	return cdp != NULL && !(os_atomic_load(&cdp->cpu_signal, acquire) & SIGPdisabled);
+ }
++
++/*
++ * laurel: a secondary that never came up stays in PROCESSOR_START forever
++ * (processor_startup only marks OFF_LINE on x86). Put it back OFF_LINE so the
++ * scheduler never counts it, and end the state transition it began.
++ */
++void sweet_cpu_mark_offline(unsigned int cpu);
++void
++sweet_cpu_mark_offline(unsigned int cpu)
++{
++	processor_t processor = cpu >= MAX_SCHED_CPUS ? PROCESSOR_NULL : processor_array[cpu];
++	if (processor == PROCESSOR_NULL || processor->processor_set == PROCESSOR_SET_NULL) {
++		return;
++	}
++	processor_set_t pset = processor->processor_set;
++	spl_t s = splsched();
++	pset_lock(pset);
++	if (processor->state == PROCESSOR_START) {
++		pset_update_processor_state(pset, processor, PROCESSOR_OFF_LINE);
++	}
++	pset_unlock(pset);
++	splx(s);
++	ml_cpu_end_state_transition(cpu);
++}
+ #endif
+ 
+ 

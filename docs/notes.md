@@ -3455,3 +3455,40 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   -> wait for the new USB device -> `fastboot flash boot_b out/laurel/laurel-boot.img` (plain, full
   size) -> `fastboot reboot`. Restore: `BOOTIMG=~/laurel-backup/stock/images/boot.img scripts/laurel/flash-boot.sh`.
   Random "unknown command" (~1 in 5, broken sessions only): the script reboots the bootloader and retries.
+
+## Mi A3: CPU_ON panic fix, SweetCPU soft-fail, USB log channel (2026-11-01, branch laurel-sprout)
+- [V photo 2026-10-31 23:58] After the kalloc fix the boot got to SMP: CPUs 1-3 (Gold 0x101-0x103) came alive,
+  then `SWEET CPU: cpu=4 CPU_ON target=0x0 ... PSCI CPU_ON rc=-4` and the panic at SweetCPU.cpp:253.
+  Cause [V code]: PSCI -4 = ALREADY_ON. ABL enters the shim on Silver CPU 0x0; the topaz shim does CPU_ON of
+  Gold 0x100 and parks the Silver core in a `wfi` loop with DAIF masked (external/ios-topaz/shim/shim.c:512-526),
+  so the firmware still counts it as on.
+- Fix 1: `patches/laurel/shim/0002-silver-cpu-off.patch`: after a successful CPU_ON(0x100) the Silver core calls
+  PSCI CPU_OFF (0x84000002); the `wfi` loop stays only as the fallback if CPU_OFF returns.
+- Fix 2: `patches/laurel/xnu/2004-laurel-cpu-soft-fail.patch`: SweetCPU::startCPU no longer panics on a CPU_ON
+  error; it sets `failed` and startAll logs `LAUREL CPU: off: cpu=N mpidr=0x.. PSCI CPU_ON rc=..` (or `not alive
+  after 5 s`), calls `sweet_cpu_mark_offline(N)` (new, osfmk/arm64/cpu.c: PROCESSOR_START -> PROCESSOR_OFF_LINE
+  under the pset lock + ml_cpu_end_state_transition; processor_startup only does that on x86) and goes on. The
+  final line is `SWEET CPU: <alive>/<n> CPUs initialized`. The boot CPU still panics.
+  [U] Whether the Edge scheduler (TOPAZ_4K, 2 psets) is happy with an off-line core in a cluster; test = boot
+  with the shim fix removed or `cpus=` variations. Not booted yet.
+- USB log channel = patch `2005-laurel-usb-ecm-ctl-panic.patch` (docs/laurel_sprout/usb-debug.md). The sweet
+  driver (topaz 0072-0077) was already the negroni protocol base (negroni copied it): same ECM descriptors, MACs,
+  192.168.7.2, UDP 5140 live log. Changes: Mi A3 addresses (DWC3 0x4e00000, QSCRATCH 0x4ef8800, QUSB2 0x1613000,
+  GCC 0x1400000: GDSC 0x1a004, master 0x1a010, sleep 0x1a014, utmi 0x1a018, cfg-noc 0x1a084, sys-noc 0x1a080,
+  ahb2phy 0x1d008, clkref 0x80278, from gcc-trinket.c halt registers), the topaz `sweethw=1` gate removed
+  (sweet_ufs.c calls sweet_usb_probe always; the self-check inside decides), command server from negroni 0210
+  (ping log reboot bootloader recovery poweroff panic; resets via laurel_reboot.c 2003 `laurel_reboot_set_mode`
+  + IMEM reason + PSCI), panic hold from negroni 0360 (SweetPlatformExpert kPEPanicDiagnosticsDone /
+  kPEPanicRestartCPU -> `laurel_usb_panic_hold()`), bus-reset handling (DALEPENA=3, configured=false: sweet
+  never re-configured after a host re-enumeration). Not ported: 0212 settime (usblog.sh tolerates the
+  `error: unknown command`), 0367 bootlog ring, 0361/0366/0381 throughput/reconnect work.
+- [V] Both patches apply (207/207) and the kernel builds (kernel-linux 37 s, 0 LSE/RCpc); shim with 0001+0002
+  builds; image out/laurel/laurel-boot.img 17481728 bytes (2026-11-01 00:11). NOT BOOTED: the phone was not on
+  USB at the end of this session.
+- Host loop: `make usblog` (sudo once, stays up) + `scripts/bg.sh laurel-test scripts/laurel/boot-test.sh`
+  (flash -> USB interface -> `op10tool ctl ping` -> hold 120 s or until `panic(cpu` -> logs/laurel-boot-<time>.log
+  -> `op10tool ctl bootloader` -> fastboot). op10tool (out/bin, built 2026-10-31) and scripts/debug/usblog.sh are
+  used unchanged. Linux hosts: sudo asks a password (no passwordless sudo here), so usblog needs one tmux attach.
+- Next panics to expect [I]: (a) the 4K/E-cluster Edge scheduler paths once 8 cores run (`cpus=4` as fallback:
+  `CPUS=4 scripts/laurel/shim.sh`), (b) topaz touch/keys on SM6225 QUP/TLMM addresses (sweet_touch_init,
+  sweet_keys_init; they log and give up on an error, not a panic, per topaz 0083/0087), (c) the IORTC/root mount.
