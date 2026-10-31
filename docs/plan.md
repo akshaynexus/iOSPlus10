@@ -519,3 +519,14 @@ for Silver 0x1-0x3 and Gold 0x100-0x103 with PSCI CPU_ON from Silver 0x0; 2004 k
 Boot 02:57 (image f196ef7) [V host]: same host result (HS device, no EP0 answer at 02:58:12). The panel photo decides:
 `timer service: on` (EP0/DWC3 fault, next: compare DEPCFG/TRB/event path with ABL usbfn and hackios dwc3) or `NO tick`
 (GIC/timer after Mu on Silver CPU0: read the register values, next fix in pe_init_fiq or a Gold hand-off in DarwinBoot).
+
+## Mi A3: boot 02:57 = no timer PPI enable on Silver CPU0; kernel 2015 GICR init with read-back (2026-11-01 03:20)
+
+Done [V]: photo of boot 02:57: `timer service: NO tick`, CNTV fired, ICC/GICD fine, GICR WAKER 0, ISENABLER0 bit 19 = 0 after
+pe_init_fiq wrote it. Patch 2015 (commit 93fa4fd): per-CPU redistributor init with read-back and retry (TYPER-nonzero frame match,
+clear/deactivate, group/priority, enable 19/18/SGI1, GICR_PWRR attempt), `LAUREL GIC:` report on the panel at LOCKDOWN; 2013 line
+split. Boot 03:14:50: host result unchanged (HS device, no EP0 answer, unable to enumerate 03:15:29).
+Next: panel photo of boot 03:14 (`LAUREL GIC: on|off ...`, `timer service:`). `on` + `timer service: on`: EP0 path (DWC3) is the
+fault, read `logs/laurel-boot-*.log` if the ECM comes up. `off`: the enable is refused from NS on this frame; options: (a) use the
+frame/INTID Mu used (PPI 18 physical timer works for Mu on the same core?), (b) PSCI hand-off to Gold 0x100 + `mkadt --boot gold`
+as the shim did, (c) check IIDR/TYPER of the matched frame (a zero frame = wrong frame). Then the secondary start under Mu.

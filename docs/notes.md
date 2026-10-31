@@ -3647,3 +3647,29 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   after the reset = the same point as 02:28). EP0 still unserved, so either the timer call never ran (no timer interrupt on
   Silver CPU0: the panel line `LAUREL USB: timer service: NO tick ...` with the GIC state) or the DWC3 EP0 path itself fails
   (`timer service: on` on the panel). PHOTO PENDING. No USB interface in 180 s (boot-test exit 2).
+
+## Mi A3: boot 02:57 photo = GICR ISENABLER0 bit 19 refused on Silver CPU0; patch 2015 (2026-11-01 03:20, branch laurel-sprout)
+- [V photo 02:57, image f196ef7] After `trust caches unavailable`: `LAUREL USB: timer service: NO tick in 50 ms, the timer interrupt
+  does not reach this CPU: EL1 DAIF 0x200 ISR 0x0 CNTV_CTL 0x5 TVAL -2093968 ICC SRE 0x1 PMR 0xf0 IGRPEN1 1 RPR 0xff CTLR 0x440 |
+  GICD_CTLR 0x00000012 GICR WAKER 0x00000000 ISENABLER0 0x000000..` (the line was cut at the 256-byte console buffer,
+  serial_console.c CPU_CONS_BUF_SIZE: ISPENDR0/ISACTIVER0/IGROUPR0/prio not shown). Reading: the virtual timer fired (ISTATUS=1,
+  IMASK=0), IRQs unmasked, ICC and GICD fine (PMR 0xf0 = 0xFF written through the NS shift with 5 priority bits), redistributor
+  awake, but ISENABLER0 bit 19 is 0 although pe_init_fiq had written `(1<<19)|(1<<1)` on this same frame: the enable of the
+  vtimer PPI did not stick on the boot CPU's redistributor. No timer tick -> every waiter starves (PE_lockdown_iokit,
+  ud_thread, bsd_init), EP0 unserved, no CPU_ON.
+- [V code] The shim path never proved the kernel's GICR writes: test_gic()/gold_gicr_prepare() (ios-topaz shim.c) enabled 19/18/SGI1
+  on the boot and all Gold frames before XNU ran (topaz NOTES: "priority/enable writes stick", IGROUPR0 reads 0 from NS = not a
+  health check). The UEFI path (Mu, boot CPU Silver 0x0) is the first boot where the kernel's own write must work. Linux on this
+  device enables PPI 19 on CPU0 from NS, so the hardware allows it after ABL; what Mu leaves behind, or whether MPIDR 0x0 matched a
+  frame whose TYPER reads 0 (find_gicr_pe_base takes the first affinity match; a dead/unpowered GIC-600 frame reads zeros and
+  affinity 0 == MPIDR 0x0), is what the 2015 report tells.
+- Patch `2015-laurel-gic-redist-init`: `laurel_gicr_setup` on every CPU inside pe_init_fiq: frame = first TYPER-nonzero affinity
+  match (fallback: stock match, flagged), ICENABLER0/ICACTIVER0/ICPENDR0 = ~0 (RWP wait), IGROUPR0 = ~0, IGRPMODR0 = 0, priority
+  0xA0, ISENABLER0 = 19|18|SGI1, read back; if bit 19 is clear: GIC-600 GICR_PWRR (0x24) power-on attempt (NS may not own it) and
+  one retry. Panel at STARTUP(LOCKDOWN, FIRST): `LAUREL GIC: on|off: boot cpu mpidr=.. gicr frame N TYPER IIDR PWRR ISENABLER0 (was,
+  want, try)` + `LAUREL GIC: IGROUPR0 IGRPMODR0 ISPENDR0 ISACTIVER0 ICFGR1 prio16 WAKER GICD_CTLR`; secondaries kprintf the same
+  into the ring. The 2013 check moves to RANK_SECOND and prints its GIC state on a second line. Kernel 216 patches, 26.7 s, 0 LSE.
+- [V boot 03:14:50, image 93fa4fd] host: HS device 03:15:06 (16 s after the reset), `device descriptor read/64, error -110` x2,
+  re-enumeration -71, "unable to enumerate" 03:15:29: EP0 still unserved. PHOTO PENDING: `LAUREL GIC:` lines decide (on + `timer
+  service: on` = the fault moves into the DWC3 EP0 path; off = the enable is refused from EL1 NS on this frame: next is to compare
+  with Mu's own GIC use of PPI 18 and the frame Mu picked, or boot on Gold 0x100 with a PSCI hand-off as the shim did).
