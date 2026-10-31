@@ -3695,3 +3695,17 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   read-back lines stay.
 - Patch-writing lesson: a block-scoped `extern "C"` inside a function is an error in C++ (SweetCPU.cpp); declare at file scope.
   `git apply` (what apply-xnu.sh uses) took a hunk that GNU `patch` refused; hunk headers must carry exact line counts.
+- [V photo, boot 03:27:21, image bc29a48 = kernel 2016] **The hand-off works**: `LAUREL CPU: boot cpu mpidr=0x100 (Gold; hand-off
+  from Silver 0x0: PSCI CPU_ON rc=0, arrived mpidr=0x100 at EL1)`; the rest of the boot is as before (SWEET FB, AKS, WDT, HID, CPUFREQ,
+  AMFI, FB SCANOUT VIG0, DSI0, INTF1). **Still no tick on Gold**: `timer service: NO tick ... EL1 DAIF 0x200 ISR 0x0 CNTV_CTL 0x5
+  TVAL -4124635 ICC SRE 0x1 PMR 0xf0 IGRPEN1 1 RPR 0xff CTLR 0x440 | GICD_CTLR 0x00000012 GICR WAKER 0x00000000 ISENABLER0 0x00000000
+  ISPENDR0 0x08280000 ISACTIVER0 0x00000000 IGROUPR0 0x00000000 prio 0x00 intid 19`. Host: no USB interface in 180 s (exit 2).
+- [I, strong] So "firmware core = Group 0" was not the cause: on a PSCI CPU_ON core the kernel's redistributor writes vanish too, and
+  not only the enable: prio reads 0x00 (the kernel wrote 0xA0; on Silver it read 0x80 = Mu's EDK2 default, so Mu's NS priority
+  write had stuck and the kernel's did not). The same pending set 0x08280000 (19, 21, 27) on both cores. Candidates: (a) GIC-600
+  redistributor power (GICR_PWRR RDPD) left by Mu/TZ on frames the kernel uses; (b) the kernel's VA->PA for the frame (ml_io_map
+  of 0xf300000 + frame * 0x20000) is not the frame it reads; (c) no GIC write at all sticks (GICD too). The 2015 LOCKDOWN report
+  (frame, TYPER, IIDR, PWRR, en_after) was overwritten on the panel: the top of the screen holds the SweetCPU lines and the
+  `LAUREL USB: timer service:` lines are the only survivors of that part. 2016 therefore adds `laurel_gic_report_short()` to the
+  NO-tick path (one line right after the timer-service lines: frame, PA, TYPER, IIDR, PWRR, GICR_CTLR, ISENABLER0 was/after/now,
+  prio16 was/now, IGROUPR0, ICFGR1, a GICD ISENABLER1 bit-8 write test). The next photo must show this line.

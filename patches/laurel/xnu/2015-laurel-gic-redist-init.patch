@@ -52,7 +52,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  	for (vm_offset_t offset = 0; offset < gicr_size; offset += GICR_PE_SIZE) {
  		vm_offset_t gicr_pe_base = gicr_base + offset;
  		uint64_t gicr_typer = gicr_read64(GICR_TYPER);
-@@ -69,10 +99,145 @@
+@@ -69,10 +99,183 @@
  			break;
  		}
  	}
@@ -193,6 +193,44 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 +	    s->tries ? "" : " | timer PPI not enableable from EL1 NS on this frame (Group 0/Secure: firmware core?)");
 +}
 +STARTUP(LOCKDOWN, STARTUP_RANK_FIRST, laurel_gic_report);
++
++/*
++ * laurel 2016: called by the USB timer-service check when no tick came (its
++ * lines survive the panel wrap; the LOCKDOWN report above was overwritten on
++ * the 2026-11-01 03:27 photo). One line with the boot CPU's record, the frame's
++ * physical address, a fresh ISENABLER0/priority write + read-back, and a GICD
++ * write test (SPI 40 enable bit set, read, cleared) to tell "no GIC write
++ * sticks" from "no redistributor write sticks".
++ */
++#define LAUREL_GICD_ISENABLER1 0x104
++#define LAUREL_GICD_ICENABLER1 0x184
++void laurel_gic_report_short(void);
++void
++laurel_gic_report_short(void)
++{
++	struct laurel_gic_cpu *s = &laurel_gic_boot;
++	vm_offset_t gicr_pe_base = gicr_base + (vm_offset_t)(s->frame & 0x7FFFFFFF) * GICR_PE_SIZE;
++	uint32_t want = laurel_gicr_want();
++	gicr_write32(GICR_ISENABLER0, want);
++	__builtin_arm_dsb(DSB_SY);
++	uint32_t en_now = gicr_read32(GICR_ISENABLER0);
++	gicr_write32(GICR_IPRIORITYR0 + 16, 0xA0A0A0A0);
++	__builtin_arm_dsb(DSB_SY);
++	uint32_t prio_now = gicr_read32(GICR_IPRIORITYR0 + 16);
++	uint32_t d_before = gicd_read32(LAUREL_GICD_ISENABLER1);
++	gicd_write32(LAUREL_GICD_ISENABLER1, 1U << 8);         /* SPI 40 */
++	__builtin_arm_dsb(DSB_SY);
++	uint32_t d_after = gicd_read32(LAUREL_GICD_ISENABLER1);
++	gicd_write32(LAUREL_GICD_ICENABLER1, 1U << 8);
++	__builtin_arm_dsb(DSB_SY);
++	printf("LAUREL GIC: boot cpu mpidr=0x%x frame %u%s pa 0x%llx TYPER 0x%08x%08x IIDR 0x%08x PWRR 0x%x CTLR 0x%x "
++	    "ISENABLER0 was 0x%08x -> 0x%08x (try %u) now 0x%08x prio16 0x%08x now 0x%08x IGROUPR0 0x%08x ICFGR1 0x%08x | "
++	    "GICD ISENABLER1 0x%08x -> 0x%08x (bit 8 test)\n",
++	    s->mpidr, s->frame & 0x7FFFFFFF, (s->frame & 0x80000000) ? " (fallback)" : "",
++	    (unsigned long long)ml_vtophys(gicr_pe_base), s->typer_hi, s->typer_lo, s->iidr, s->pwrr,
++	    gicr_read32(GICR_CTLR_REG), s->en_before, s->en_after, s->tries, en_now, s->prio16, prio_now, s->grp, s->cfg1,
++	    d_before, d_after);
++}
 +#endif /* SWEET */
 +
  void
@@ -224,7 +262,7 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
-@@ -1939,18 +1939,20 @@
+@@ -1939,18 +1939,24 @@
  	}
  	uint32_t g[8];
  	sweet_gic_state(g);
@@ -242,6 +280,10 @@ diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
 +	printf("LAUREL USB: timer service: GICD_CTLR 0x%08x GICR WAKER 0x%08x ISENABLER0 0x%08x ISPENDR0 0x%08x "
 +	    "ISACTIVER0 0x%08x IGROUPR0 0x%08x prio 0x%02x intid %u\n",
  	    g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
++	{
++		extern void laurel_gic_report_short(void);
++		laurel_gic_report_short();           /* laurel 2016: the GICR record, on a line that survives the panel wrap */
++	}
  	printf("LAUREL USB: timer service: log and commands wait for the first timer interrupt\n");
  }
 -STARTUP(LOCKDOWN, STARTUP_RANK_FIRST, laurel_usb_timer_check);
