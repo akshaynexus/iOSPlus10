@@ -1,10 +1,10 @@
-laurel 2200: Mi A3 touch: FT3518 / GT9883 at panel resolution, TLMM edge latch, HID map from the framebuffer layout. topaz scaled the FT5452 grid 0..1349 x 0..2999 to 1080x2400 with 2-bit fractions from byte 4, and SweetHID.cpp normalized with /1080 /2400 and the 1080x2400 offsets in the iPhone X canvas. The Mi A3 (laurel_sprout-trinket-touchscreen.dtsi) has FocalTech FT3518 at 0x38 (display-coords 0 0 720 1560; byte 4 is the pressure) or Goodix GT9883 at 0x5d (goodix_gtx8 Normandy, panel-max 720x1560: event block 0x4100, 8-byte LE records, u8 checksum, handshake write 0). The boot of 2026-11-01 03:52 logged touches up to y=1247 after topaz's 4/5 scale = raw 1559: the FT3518 reports panel pixels. Raw -> panel pixels (PE_current_console); one log line if a raw value leaves the DT grid (moves once to 1350x3000 / 1080x2400). Any answer at 0x38 selects FocalTech (chip id reads 54:52 here, 35:18 in the Linux table); 0x5d without the GT9896 id selects GT9883. GPIO 88 falling edge latched in TLMM INTR_STATUS (raw status on, no summary interrupt), the thread reads on the latch / finger down / every 100 ms; the latch turns itself off after 3 touches found with no edge (poll 10 ms). SweetHID.cpp maps panel pixels with the layout SweetFramebuffer.cpp reports (sweet_hid_set_geometry: off + panel * num / den; default = the framebuffer's own formula on the console size), clamps and edge zones scale with the panel, SurfaceWidth/Height 65x140 mm. Lines: `LAUREL TOUCH: on: <vendor> <rawW>x<rawH> -> 720x1560, ...`, `LAUREL TOUCH: display map: panel 720x1560 at X,Y of WxH (scale 1/1)`. Kill switches unchanged: sweettouch=0, sweettouchirq=0 (latch off, poll).
+laurel 2200: Mi A3 touch: FT3518 / GT9883 at panel resolution, TLMM edge latch, HID map from the framebuffer layout. topaz scaled the FT5452 grid 0..1349 x 0..2999 to 1080x2400 with 2-bit fractions from byte 4, and SweetHID.cpp normalized with /1080 /2400 and the 1080x2400 offsets in the iPhone X canvas. The Mi A3 (laurel_sprout-trinket-touchscreen.dtsi) has FocalTech FT3518 at 0x38 (display-coords 0 0 720 1560; byte 4 is the pressure) or Goodix GT9883 at 0x5d (goodix_gtx8 Normandy, panel-max 720x1560, x2x/y2y: event block 0x4100, 8-byte LE records, u8 checksum, handshake write 0). The boot of 2026-11-01 03:52 logged touches up to y=1247 after topaz's 4/5 scale = raw 1559: the FT3518 reports panel pixels. Raw 0..720 x 0..1560 (inclusive maxima, as Linux input_set_abs_params) -> panel pixels (PE_current_console), clamped. FocalTech keeps the DT grid; GT9883 is inverted (x = 720 - x, y = 1560 - y, goodix_swap_coords) and moves once to 1080x2400 after 5 values past 1.1x, with one log line. Any answer at 0x38 selects FocalTech (the chip id reads 54:52, the F9S FTS_CHIP_TYPE_MAPPING value); 0x5d without the GT9896 id selects GT9883. GPIO 88 falling edge latched in TLMM INTR_STATUS (raw status on, no summary interrupt), the thread reads on the latch / finger down / every 100 ms; the latch turns itself off after 3 touches found with no edge (poll 10 ms). SweetHID.cpp maps panel pixels with the layout SweetFramebuffer.cpp reports (sweet_hid_set_geometry: off + panel * num / den; default = the framebuffer's own formula on the console size), clamps and edge zones scale with the panel, SurfaceWidth/Height 65x140 mm. Lines: `LAUREL TOUCH: on: <vendor> <rawW>x<rawH> -> 720x1560, ...`, `LAUREL TOUCH: display map: panel 720x1560 at X,Y of WxH (scale 1/1)`. Kill switches unchanged: sweettouch=0, sweettouchirq=0 (latch off, poll).
 
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
-index 002945a..c070d23 100644
+index 002945a..332073d 100644
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -24,6 +24,30 @@ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+@@ -24,6 +24,32 @@ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
  extern void sweet_hid_touch(int finger, int down, int x, int y);
  void sweet_touch_init(void);
  
@@ -12,13 +12,15 @@ index 002945a..c070d23 100644
 + * laurel 2200 (Mi A3): two touch vendors (laurel_sprout-trinket-touchscreen.dtsi), detected at the probe:
 + *   FocalTech FT3518 at 0x38 (focaltech_touch_f9s): display-coords 0 0 720 1560, raw = panel pixels,
 + *     12-bit X/Y; byte 4 of a record is the pressure (not topaz's 2-bit fractions of the 1.25x FT5452 grid).
-+ *   Goodix GT9883 at 0x5d (goodix_gtx8, Normandy): panel-max 720x1560, x2x/y2y; event block at 0x4100:
++ *   Goodix GT9883 at 0x5d (goodix_gtx8, Normandy): panel-max 720x1560, x2x/y2y (x = 720 - x, y = 1560 - y,
++ *     goodix_swap_coords); event block at 0x4100:
 + *     [0] status (0x80 touch, 0x40 request), [1] count | key, then 8-byte records {id, x LE16, y LE16, w, ..},
 + *     u8 sum of the block = 0, handshake = write 0 to 0x4100.
 + * Raw coordinates are mapped to panel pixels (PE_current_console, 720x1560 on the Mi A3); SweetHID.cpp maps
-+ * panel pixels onto the presented display as SweetFramebuffer.cpp lays it out. A raw value outside the DT
-+ * range moves the range once to the vendor's other known grid (FT5452 1350x3000, GT9896 1080x2400) with one
-+ * log line. IRQ: GPIO 88 falling edge is latched in TLMM INTR_STATUS (raw status on, enable off: no summary
++ * panel pixels onto the presented display as SweetFramebuffer.cpp lays it out. The DT maxima are inclusive
++ * (Linux input_set_abs_params, focaltech_core.c:904): 0..720 x 0..1560 is valid and clamped to the panel.
++ * FocalTech keeps the DT grid. GT9883 moves once to 1080x2400 (GT9896 grid) after 5 values past 1.1x the DT
++ * grid, with one log line; values past the grid are dropped. IRQ: GPIO 88 falling edge is latched in TLMM INTR_STATUS (raw status on, enable off: no summary
 + * interrupt); the poll thread reads the IC only when the latch is set, while a finger is down, or every 100 ms.
 + * If contacts are found three times by the 100 ms read with no latch ever, the latch turns itself off and the
 + * thread polls every 10 ms. Kill switch for the latch: sweettouchirq=0.
@@ -35,50 +37,58 @@ index 002945a..c070d23 100644
  #define TOUCH_SE_PA      0x04a88000u /* QUP0 SE2 */
  #define TOUCH_GCC_PA     0x01400000u
  /*
-@@ -88,6 +112,11 @@ static struct {
+@@ -88,6 +114,11 @@ static struct {
  	vm_offset_t se, gcc, west, east;
  	bool started, dead, probing;
  	int kind, irq_hint;
 +	/* laurel 2200: raw grid of the IC, the panel it maps to, the IRQ latch */
-+	unsigned raw_w, raw_h, alt_w, alt_h, pan_w, pan_h;
-+	bool grown, latch;
++	unsigned raw_w, raw_h, alt_w, alt_h, pan_w, pan_h, over;
++	bool grown, latch, flip_x, flip_y;
 +	unsigned latched, missed;
 +	const char *name;
  	uint32_t irq_status, irq_last, active;
  	unsigned sent, got;
  	int x[TOUCH_MAX], y[TOUCH_MAX];
-@@ -400,6 +429,30 @@ touch_checksum(const uint8_t *buf, unsigned len)
+@@ -400,6 +431,38 @@ touch_checksum(const uint8_t *buf, unsigned len)
  	return (sum & 0xffffu) == touch_be16(buf + len - 2);
  }
  
 +/*
-+ * laurel 2200: raw IC coordinates -> panel pixels. false: outside every known grid (the frame is dropped).
-+ * The first value past the DT grid moves the grid once to the vendor's other known one.
++ * laurel 2200: raw IC coordinates (0..raw_w x 0..raw_h, inclusive) -> panel pixels, clamped.
++ * false: outside the grid (the frame is dropped). Only a vendor with alt_w/alt_h above its DT grid
++ * (GT9883) moves the grid, once, after 5 values past 1.1x of it.
 + */
 +static bool
 +touch_map(unsigned px, unsigned py, int *x, int *y)
 +{
-+	if ((px >= st.raw_w || py >= st.raw_h) && !st.grown && px < st.alt_w && py < st.alt_h) {
-+		printf("LAUREL TOUCH: raw %u,%u outside %ux%u: grid is now %ux%u\n",
++	if ((px > st.raw_w || py > st.raw_h) && !st.grown && (st.alt_w > st.raw_w || st.alt_h > st.raw_h) &&
++	    px <= st.alt_w && py <= st.alt_h && (px * 10u > st.raw_w * 11u || py * 10u > st.raw_h * 11u) &&
++	    ++st.over >= 5) {
++		printf("LAUREL TOUCH: raw %u,%u past 1.1x of %ux%u (5 times): grid is now %ux%u\n",
 +		    px, py, st.raw_w, st.raw_h, st.alt_w, st.alt_h);
 +		st.raw_w = st.alt_w;
 +		st.raw_h = st.alt_h;
 +		st.grown = true;
 +	}
-+	if (px >= st.raw_w || py >= st.raw_h) {
++	if (px > st.raw_w || py > st.raw_h) {
 +		return false;
 +	}
-+	*x = (int)((px * st.pan_w + st.raw_w / 2u) / st.raw_w);
-+	*y = (int)((py * st.pan_h + st.raw_h / 2u) / st.raw_h);
-+	*x = *x >= (int)st.pan_w ? (int)st.pan_w - 1 : *x;
-+	*y = *y >= (int)st.pan_h ? (int)st.pan_h - 1 : *y;
++	if (st.flip_x) {
++		px = st.raw_w - px;
++	}
++	if (st.flip_y) {
++		py = st.raw_h - py;
++	}
++	unsigned mx = px * st.pan_w / st.raw_w, my = py * st.pan_h / st.raw_h;
++	*x = (int)(mx >= st.pan_w ? st.pan_w - 1u : mx);
++	*y = (int)(my >= st.pan_h ? st.pan_h - 1u : my);
 +	return true;
 +}
 +
  static void
  touch_report(uint32_t mask, const int *x, const int *y)
  {
-@@ -464,13 +517,11 @@ touch_goodix(void)
+@@ -464,13 +527,11 @@ touch_goodix(void)
  		unsigned px = touch_be16(p + 2), py = touch_be16(p + 4);
  		/* Low nibble 1/3 denotes pen data in the vendor parser. */
  		if ((p[0] & 15u) == 1u || (p[0] & 15u) == 3u || id >= TOUCH_MAX ||
@@ -93,7 +103,7 @@ index 002945a..c070d23 100644
  	}
  	err = touch_goodix_ack();
  	if (!err) {
-@@ -479,6 +530,93 @@ touch_goodix(void)
+@@ -479,6 +540,93 @@ touch_goodix(void)
  	return err;
  }
  
@@ -187,7 +197,7 @@ index 002945a..c070d23 100644
  static int
  touch_focaltech(void)
  {
-@@ -541,17 +679,11 @@ touch_focaltech(void)
+@@ -541,17 +689,11 @@ touch_focaltech(void)
  		}
  		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
  		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
@@ -207,7 +217,7 @@ index 002945a..c070d23 100644
  		++active;
  	}
  	(void)active;   /* topaz: byte 2 does not always match the records */
-@@ -665,7 +797,7 @@ touch_thread(void *arg, wait_result_t result)
+@@ -665,7 +807,7 @@ touch_thread(void *arg, wait_result_t result)
  	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, false);      /* CTL 0x2c3, low */
  	touch_wait(20);
  	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, true);
@@ -216,7 +226,7 @@ index 002945a..c070d23 100644
  	st.stage = "probe";
  	uint8_t gid[32], legacy[32], fid1 = 0, fid2 = 0;
  	st.probing = true;
-@@ -673,6 +805,13 @@ touch_thread(void *arg, wait_result_t result)
+@@ -673,6 +815,13 @@ touch_thread(void *arg, wait_result_t result)
  	printf("SWEET TOUCH: probe 0x5d err=%d pid=%02x%02x%02x%02x fw=%02x.%02x.%02x.%02x irq=%#x\n",
  	    ge, gid[0], gid[1], gid[2], gid[3], gid[8], gid[9], gid[10], gid[11], st.irq_status);
  	(void)touch_probe_info(0x8240, legacy);
@@ -230,7 +240,7 @@ index 002945a..c070d23 100644
  	int fe1 = touch_read(0x38, 0xa3, false, &fid1, 1);
  	int fe2 = touch_read(0x38, 0x9f, false, &fid2, 1);
  	printf("SWEET TOUCH: probe 0x38 err=%d/%d chip-id=%02x:%02x irq=%#x\n",
-@@ -694,16 +833,44 @@ touch_thread(void *arg, wait_result_t result)
+@@ -694,16 +843,44 @@ touch_thread(void *arg, wait_result_t result)
  	st.d_fid1 = fid1;
  	st.d_fid2 = fid2;
  	bool goodix = !ge && gid[0] == '9' && gid[1] == '8' && gid[2] == '9' && gid[3] == '6';
@@ -239,9 +249,9 @@ index 002945a..c070d23 100644
 -		printf("SWEET TOUCH: no unique supported IC (goodix=%d fts=%d dead=%d); stopping\n",
 -		    goodix, fts, st.dead);
 +	/*
-+	 * laurel 2200: 0x38 is the FT3518 on this board (DT); its chip id reads 54:52 (boot 2026-11-01 03:52) where
-+	 * the Linux table has 35:18, so any answer at 0x38 selects the FocalTech protocol. 0x5d without the GT9896
-+	 * id is the GT9883 (Normandy).
++	 * laurel 2200: 0x38 is the FT3518 on this board (DT). Its chip id reads 54:52 (boot 2026-11-01 03:52), which
++	 * is what the F9S driver expects (focaltech_common.h FTS_CHIP_TYPE_MAPPING {0x81, 0x54, 0x52, ...}); any
++	 * answer at 0x38 selects the FocalTech protocol. 0x5d without the GT9896 id is the GT9883 (Normandy).
 +	 */
 +	bool fts = !fe1 && !fe2;
 +	bool gtx8 = !ge && !goodix;
@@ -257,9 +267,8 @@ index 002945a..c070d23 100644
 -	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
 +	if (fts) {
 +		st.kind = TOUCH_FTS;
-+		st.name = (fid1 == 0x54 && fid2 == 0x52) ? "Focaltech FT3518 (54:52)" :
-+		    (fid1 == 0x35 && fid2 == 0x18) ? "Focaltech FT3518 (35:18)" : "Focaltech (other id)";
-+		st.raw_w = 720; st.raw_h = 1560; st.alt_w = 1350; st.alt_h = 3000;
++		st.name = (fid1 == 0x54 && fid2 == 0x52) ? "Focaltech FT3518 (54:52)" : "Focaltech (other id)";
++		st.raw_w = st.alt_w = 720; st.raw_h = st.alt_h = 1560;          /* DT display-coords: no other grid */
 +	} else if (goodix) {
 +		st.kind = TOUCH_GOODIX;
 +		st.name = "Goodix GT9896 Yellowstone";
@@ -268,6 +277,7 @@ index 002945a..c070d23 100644
 +		st.kind = TOUCH_GTX8;
 +		st.name = n988 ? "Goodix GT9883 Normandy" : "Goodix GT9883 Normandy (PID not read)";
 +		st.raw_w = 720; st.raw_h = 1560; st.alt_w = 1080; st.alt_h = 2400;
++		st.flip_x = st.flip_y = true;   /* DT goodix,x2x; goodix,y2y */
 +	}
 +	st.latch = st.irq_hint && touch_latch_setup();
  	st.stage = "polling";
@@ -276,13 +286,13 @@ index 002945a..c070d23 100644
 +	printf("LAUREL TOUCH: on: %s %ux%u -> %ux%u, %s\n", st.name, st.raw_w, st.raw_h, st.pan_w, st.pan_h,
 +	    st.latch ? "IRQ GPIO 88 falling edge latched (TLMM), read on edge / finger down / 100 ms" :
 +	    st.irq_hint ? "IRQ latch does not read back: poll every 10 ms" : "sweettouchirq=0: poll every 10 ms");
-+	if (fts && (fid1 != 0x54 || fid2 != 0x52) && (fid1 != 0x35 || fid2 != 0x18)) {
-+		printf("LAUREL TOUCH: FocalTech chip id %02x:%02x is not 54:52 or 35:18; FT protocol used\n", fid1, fid2);
++	if (fts && (fid1 != 0x54 || fid2 != 0x52)) {
++		printf("LAUREL TOUCH: FocalTech chip id %02x:%02x is not 54:52 (F9S FT3518); FT protocol used\n", fid1, fid2);
 +	}
  	unsigned errors = 0, ticks = 0, polls = 0;
  	while (!st.dead) {
  		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */
-@@ -714,11 +881,22 @@ touch_thread(void *arg, wait_result_t result)
+@@ -714,11 +891,22 @@ touch_thread(void *arg, wait_result_t result)
  			    st.s_raw[3], st.s_raw[4], st.s_raw[5], st.s_raw[6], st.s_raw[7],
  			    st.s_raw[8], st.s_raw[9], st.s_raw[10], st.s_raw[11]);
  		}
@@ -310,7 +320,7 @@ index 002945a..c070d23 100644
  			if (err) {
  				st.s_errs++;
  				st.s_lasterr = err;
-@@ -757,7 +935,7 @@ sweet_touch_init(void)
+@@ -757,7 +945,7 @@ sweet_touch_init(void)
  	}
  	st.started = true;
  	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));

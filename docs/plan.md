@@ -542,8 +542,9 @@ as the shim did, (c) check IIDR/TYPER of the matched frame (a zero frame = wrong
 ## Mi A3: touch 720x1560, keys, brightness, panel power (2026-11-01 04:40, area C, build only)
 
 Done [V build]: patches 2200 (touch: FT3518 raw = panel pixels per DT and log, GT9883 Normandy path, TLMM edge latch, HID map from the
-framebuffer layout), 2201 (panel detect from INTF_1 timing, DCS max 2047/4095, AppleARMBacklight on by default with the apollo 0154
-slider protocol, 300 ms fades, AMOLED off/on timing), 2202 (keys self-check line; the topaz key code is right for trinket).
+framebuffer layout), 2201 (panel detect from INTF_1 timing, DCS max 2047/4095, AppleARMBacklight only with the GPU renderer, apollo
+0154 slider protocol, 300 ms fades, AMOLED off/on timing with a wake retry), 2202 (keys self-check line; the topaz key code is right
+for trinket). Revised after the review (05:00): inclusive touch maxima, GT9883 inversion, power-change serialization.
 `uefi-image.sh` drops `sweetfb_stayon=1`. Not booted.
 Next (coordinator): boot and check `LAUREL TOUCH: on:`, `LAUREL TOUCH: display map:`, `LAUREL KEYS: on:`, `LAUREL BACKLIGHT: on: DCS max
 2047 (Samsung s6e8fco ...)`; press volume up; move the brightness slider (`SWEET BL: ... -> DBV`); lock/unlock with the power key (panel
