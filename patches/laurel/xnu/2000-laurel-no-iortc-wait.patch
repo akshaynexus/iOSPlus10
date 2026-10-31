@@ -1,0 +1,30 @@
+laurel 2000: skip the 30 s IORTC wait at boot (port of negroni 0200).
+No driver publishes IORTC on the topaz base; the wait always timed out.
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -77,8 +77,24 @@
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * laurel_sprout/topaz: no driver publishes IORTC, so this wait ran its full
++	 * 30 s on every boot (topaz NOTES.md). Skip it: clock_initialize_calendar()
++	 * below reads PEGetUTCTimeOfDay() as it did after the timeout. If an IORTC
++	 * is already published it is used. Kill switch: laurelrtcskip=0 (wait 30 s).
++	 * Port of negroni 0200 (after ios-sailfish 0086).
++	 */
++	uint32_t laurel_rtc_skip = 1;
++	PE_parse_boot_argn("laurelrtcskip", &laurel_rtc_skip, sizeof(laurel_rtc_skip));
++	if (laurel_rtc_skip == 0) {
++		IOService::waitForService(
++			IOService::resourceMatching("IORTC"), &t );
++	} else {
++		IOLog("LAUREL RTC: on: no IORTC wait, calendar from the platform\n");
++	}
+ // RTC is not present on this target
+-#ifndef BCM2837
++#elif !defined(BCM2837)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif

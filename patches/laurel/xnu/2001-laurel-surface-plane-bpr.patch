@@ -1,0 +1,18 @@
+laurel 2001: IOSurface plane bytesPerRow at +0x10 of the plane record (port of negroni 0390).
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -875,7 +875,13 @@
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
++		/*
++		 * laurel 2001 (port of negroni 0390): IOSurface.framework 20H392 reads the plane
++		 * bytesPerRow at +0x10 of each plane record (IOSurfaceClientGetBytesPerRowOfPlane:
++		 * ldr [x8, #0xe0] = 0xd0 + 0x10). +0x08 is read by nothing, so every plane stride was 0
++		 * (video decode, YCbCr surfaces, camera frames wrote every row over row 0).
++		 */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);

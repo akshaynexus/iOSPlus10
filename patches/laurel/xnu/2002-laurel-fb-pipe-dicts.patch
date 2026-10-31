@@ -1,0 +1,90 @@
+laurel 2002: DisplayPipe requirements as dictionaries (port of negroni 0388).
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -304,6 +304,77 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * laurel 2002 (port of negroni 0388): display pipe requirements as dictionaries.
++ * VideoToolbox FigGetAlignmentForIOSurfaceOutputToDisplayService (image-queue sinks: camera
++ * preview, AVPlayer, AVSampleBufferDisplayLayer) calls CFDictionaryGetValue on
++ * "DisplayPipePlaneBaseAlignment" ("PlaneBaseAlignmentLinear") and "DisplayPipeStrideRequirements"
++ * ("StrideLinearHorizontal") without a type check: the old plain number threw
++ * -[__NSCFNumber objectForKey:]. QuartzCore takes both only as dictionaries (defaults 64, 64, 1).
++ * Same values as those defaults. Self-check: read back; on failure remove both (readers use the
++ * defaults) and log why. Kill switch laurelfb_pipedict=0: the old number.
++ */
++#define LAUREL_FB_PLANE_ALIGN   64
++#define LAUREL_FB_STRIDE_H      64
++#define LAUREL_FB_STRIDE_V      1
++
++static bool
++laurel_fb_dict_number_is(IOService *fb, const char *prop, const char *key, uint32_t want)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, fb->getProperty(prop));
++	OSNumber *n = (d != NULL) ? OSDynamicCast(OSNumber, d->getObject(key)) : NULL;
++	return n != NULL && n->unsigned32BitValue() == want;
++}
++
++static void
++laurel_fb_publish_pipe_reqs(IOService *fb)
++{
++	uint32_t pipedict = 1;
++	const char *why = NULL;
++
++	PE_parse_boot_argn("laurelfb_pipedict", &pipedict, sizeof(pipedict));
++	if (pipedict == 0) {
++		fb->setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++		IOLog("LAUREL FB PIPE: off: laurelfb_pipedict=0 (number 64; VideoToolbox image-queue sinks throw)\n");
++		return;
++	}
++
++	OSDictionary *align = OSDictionary::withCapacity(1);
++	OSDictionary *stride = OSDictionary::withCapacity(2);
++	OSNumber *a = OSNumber::withNumber((unsigned long long)LAUREL_FB_PLANE_ALIGN, 32);
++	OSNumber *h = OSNumber::withNumber((unsigned long long)LAUREL_FB_STRIDE_H, 32);
++	OSNumber *v = OSNumber::withNumber((unsigned long long)LAUREL_FB_STRIDE_V, 32);
++
++	if (align == NULL || stride == NULL || a == NULL || h == NULL || v == NULL) {
++		why = "no memory";
++	} else if (!align->setObject("PlaneBaseAlignmentLinear", a) ||
++	    !stride->setObject("StrideLinearHorizontal", h) ||
++	    !stride->setObject("StrideLinearVertical", v)) {
++		why = "dictionary setObject failed";
++	} else if (!fb->setProperty("DisplayPipePlaneBaseAlignment", align) ||
++	    !fb->setProperty("DisplayPipeStrideRequirements", stride)) {
++		why = "setProperty failed";
++	} else if (!laurel_fb_dict_number_is(fb, "DisplayPipePlaneBaseAlignment", "PlaneBaseAlignmentLinear", LAUREL_FB_PLANE_ALIGN) ||
++	    !laurel_fb_dict_number_is(fb, "DisplayPipeStrideRequirements", "StrideLinearHorizontal", LAUREL_FB_STRIDE_H) ||
++	    !laurel_fb_dict_number_is(fb, "DisplayPipeStrideRequirements", "StrideLinearVertical", LAUREL_FB_STRIDE_V)) {
++		why = "read-back check failed";
++	}
++	OSSafeReleaseNULL(align);
++	OSSafeReleaseNULL(stride);
++	OSSafeReleaseNULL(a);
++	OSSafeReleaseNULL(h);
++	OSSafeReleaseNULL(v);
++
++	if (why != NULL) {
++		fb->removeProperty("DisplayPipePlaneBaseAlignment");
++		fb->removeProperty("DisplayPipeStrideRequirements");
++		IOLog("LAUREL FB PIPE: off: %s; properties removed (readers use their defaults 64/64/1)\n", why);
++		return;
++	}
++	IOLog("LAUREL FB PIPE: on: alignment {PlaneBaseAlignmentLinear=%u}, stride {H=%u, V=%u}\n",
++	    LAUREL_FB_PLANE_ALIGN, LAUREL_FB_STRIDE_H, LAUREL_FB_STRIDE_V);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -470,7 +541,7 @@
+ 	publishModes();
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	laurel_fb_publish_pipe_reqs(this);     /* laurel 2002: dictionaries, as VideoToolbox and QuartzCore read them */
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
