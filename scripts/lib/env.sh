@@ -12,7 +12,7 @@ case "$(uname -m)" in
 arm64|aarch64) PLATFORM=${PLATFORM:-linux/arm64} ;;
 *)             PLATFORM=${PLATFORM:-linux/amd64} ;;
 esac
-IMAGE=${IMAGE:-iosplus10-build:${PLATFORM#linux/}}
+DOCKER_IMAGE=${DOCKER_IMAGE:-iosplus10-build:${PLATFORM#linux/}}   # only for the Mu UEFI container build (scripts/setup/docker-image.sh, in-docker.sh)
 case "$(uname -s)" in
 Darwin)
   # Colima: a Docker config without Docker Desktop's credential helper.

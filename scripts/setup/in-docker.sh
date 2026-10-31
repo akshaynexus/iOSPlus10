@@ -12,4 +12,4 @@ tty=""; [ -t 0 ] && tty="-it"
 mono=""; [ "$(uname -s)" = Darwin ] && [ "$PLATFORM" = linux/amd64 ] && mono="--interpreter"
 exec docker run --rm $tty --platform "$PLATFORM" \
   -v "$REPO:$REPO" -v "$BACKUP:$BACKUP:ro" -w "$REPO" \
-  -e HOME=/tmp -e BACKUP="$BACKUP" -e MONO_ENV_OPTIONS="$mono" "$IMAGE" "$@"
+  -e HOME=/tmp -e BACKUP="$BACKUP" -e MONO_ENV_OPTIONS="$mono" "$DOCKER_IMAGE" "$@"
