@@ -1,0 +1,144 @@
+laurel shim 0001: draw into the buffer the MDP really scans out (SM6125 source pipes), pass it to XNU.
+diff -ruN a/console.c b/console.c
+--- a/console.c	2026-10-31 23:04:54.927564502 +0530
++++ b/console.c	2026-10-31 23:04:54.941906053 +0530
+@@ -15,15 +15,76 @@
+ static uint32_t con_bg;
+ static int row;
+ 
+-void con_clear(uint32_t bg)
++/*
++ * laurel: draw into the buffer the panel really scans out. ABL's fastboot
++ * screen on the Mi A3 is not necessarily the cont_splash region, so read the
++ * SM6125 MDP source pipes (VIG0, DMA0, DMA1 at mdp 0x5e00000 + 0x5000 /
++ * 0x25000 / 0x27000; trinket-sde.dtsi) and take the first active one:
++ * SRC_SIZE +0x00 (h<<16 | w), SRC0_ADDR +0x14, SRC_YSTRIDE0 +0x24 (plane 0 in
++ * bits 15:0), SRC_FORMAT +0x30 (bits 10:9 = bytes per pixel - 1). The panels
++ * are video mode, so a write shows without a flush. No active pipe: topaz's
++ * fixed splash buffer.
++ */
++#define MDP_BASE	0x05e00000UL
++static const uint32_t sspp_off[3] = { 0x5000, 0x25000, 0x27000 };
++static uintptr_t fb_base = FB_BASE;
++static uint32_t fb_stride = FB_STRIDE, fb_bpp = 4, fb_w = FB_W, fb_h = FB_H;
++static int fb_pipe = -1, fb_init;
++static uint32_t fb_fmt;
++
++static void con_scanout_init(void)
++{
++	fb_init = 1;
++	for (int i = 0; i < 3; i++) {
++		volatile uint32_t *p = (volatile uint32_t *)(MDP_BASE + sspp_off[i]);
++		uint32_t size = p[0x00 / 4], addr = p[0x14 / 4];
++		uint32_t stride = p[0x24 / 4] & 0xffff, fmt = p[0x30 / 4];
++		uint32_t w = size & 0xffff, h = size >> 16, bpp = ((fmt >> 9) & 3) + 1;
++		if (addr < 0x40000000U || w < 360 || h < 360 || bpp < 3 || stride < w * bpp)
++			continue;
++		fb_base = addr;
++		fb_stride = stride;
++		fb_bpp = bpp;
++		fb_w = w < FB_W ? w : FB_W;
++		fb_h = h < FB_H ? h : FB_H;
++		fb_pipe = i;
++		fb_fmt = fmt;
++		con_fb = (volatile uint32_t *)fb_base;
++		return;
++	}
++}
++
++uintptr_t con_fb_base(void) { return fb_base; }
++uint32_t con_fb_stride(void) { return fb_stride; }
++uint32_t con_fb_depth(void) { return fb_bpp * 8; }
++uint32_t con_fb_width(void) { return fb_w; }
++uint32_t con_fb_height(void) { return fb_h; }
++
++static void px(int x, int y, uint32_t c)
+ {
+-	for (int y = 0; y < FB_H; y++) {
+-		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
+-		for (int x = 0; x < FB_W; x++)
+-			line[x] = bg;
++	volatile uint8_t *p = (volatile uint8_t *)fb_base + (uintptr_t)y * fb_stride + (uintptr_t)x * fb_bpp;
++	if (fb_bpp == 4) {
++		*(volatile uint32_t *)p = c;
++	} else {	/* 24 bpp: B, G, R in memory (MDP RGB888) */
++		p[0] = c & 0xff;
++		p[1] = (c >> 8) & 0xff;
++		p[2] = (c >> 16) & 0xff;
+ 	}
++}
++
++void con_clear(uint32_t bg)
++{
++	if (!fb_init)
++		con_scanout_init();
++	for (uint32_t y = 0; y < fb_h; y++)
++		for (uint32_t x = 0; x < fb_w; x++)
++			px(x, y, bg);
+ 	con_bg = bg;
+ 	row = 0;
++	/* first lines: what the panel scans out (or the topaz fallback) */
++	con_hex("FB", fb_base);
++	con_hex2("FB", "pipe=", (uint32_t)fb_pipe, "fmt=", fb_fmt);
++	con_hex2("FB", "stride=", fb_stride, "bpp=", fb_bpp);
+ }
+ 
+ static void put_char(int col, char ch, uint32_t fg)
+@@ -32,17 +93,14 @@
+ 		ch = '?';
+ 	const unsigned char *g = font8x16[ch - 0x20];
+ 	int x0 = MARGIN + col * CH_W, y0 = MARGIN + row * CH_H;
+-	if (x0 + CH_W > FB_W || y0 + CH_H > FB_H)
++	if (x0 + CH_W > (int)fb_w || y0 + CH_H > (int)fb_h)
+ 		return;
+ 	for (int gy = 0; gy < 16; gy++)
+ 		for (int gx = 0; gx < 8; gx++) {
+ 			uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
+-			for (int sy = 0; sy < SCALE; sy++) {
+-				volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (FB_STRIDE / 4)
+-						       + x0 + gx * SCALE;
++			for (int sy = 0; sy < SCALE; sy++)
+ 				for (int sx = 0; sx < SCALE; sx++)
+-					p[sx] = c;
+-			}
++					px(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, c);
+ 		}
+ }
+ 
+diff -ruN a/console.h b/console.h
+--- a/console.h	2026-10-31 23:04:54.927603722 +0530
++++ b/console.h	2026-10-31 23:04:54.941927023 +0530
+@@ -13,6 +13,12 @@
+ #define GREEN	0xff00ff00U
+ 
+ extern volatile uint32_t *con_fb;
++/* laurel: the buffer the panel scans out (MDP source pipe), or FB_BASE */
++uintptr_t con_fb_base(void);
++uint32_t con_fb_stride(void);
++uint32_t con_fb_depth(void);
++uint32_t con_fb_width(void);
++uint32_t con_fb_height(void);
+ 
+ void con_clear(uint32_t bg);
+ void con_skip(void);
+diff -ruN a/loader.c b/loader.c
+--- a/loader.c	2026-10-31 23:04:54.927838269 +0530
++++ b/loader.c	2026-10-31 23:04:54.941980983 +0530
+@@ -162,12 +162,12 @@
+ 	ba->physBase = p->phys_base;
+ 	ba->memSize = p->mem_size;
+ 	ba->topOfKernelData = top;
+-	ba->Video.v_baseAddr = FB_BASE;
++	ba->Video.v_baseAddr = con_fb_base();
+ 	ba->Video.v_display = 1;
+-	ba->Video.v_rowBytes = FB_STRIDE;
+-	ba->Video.v_width = FB_W;
+-	ba->Video.v_height = FB_H;
+-	ba->Video.v_depth = 32;
++	ba->Video.v_rowBytes = con_fb_stride();
++	ba->Video.v_width = con_fb_width();
++	ba->Video.v_height = con_fb_height();
++	ba->Video.v_depth = con_fb_depth();
+ 	ba->deviceTreeP = adt_pa - pa_of_va_base;	/* xnu reads it with the MMU on: a VA */
+ 	ba->deviceTreeLength = (uint32_t)p->adt_size;
+ 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)

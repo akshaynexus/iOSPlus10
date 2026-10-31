@@ -3404,3 +3404,17 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - [V] Mu-Silicium has `Platforms/Xiaomi/laurel_sproutPkg` on `Silicon/Qualcomm/NicobarPkg`.
 - [I] iOS 26 needs PAC lowering of the arm64e userland (zeta route); the negroni native-PAC route does not apply.
 - `/proc/cmdline` and the live FDT need root; the RAM banks for the ADT are still [U].
+
+## Mi A3 fastboot facts and first boot tests (2026-10-31, branch laurel-sprout)
+- [V] Bootloader fastboot (ABL, USB 18d1:d00d) is the right mode; no fastbootd (no dynamic partitions,
+  `is-userspace` unknown). Enter it with `adb reboot bootloader`; max-download-size 805306368.
+- [V] **This ABL refuses `fastboot boot` ("unknown command") for every image, also the stock boot.img**, in any
+  command order. The upload (`download`) works. So the shim image must be flashed to `boot_b` (owner approved
+  2026-10-31). Restore: `fastboot flash boot_b ~/laurel-backup/stock/images/boot.img` (V12.0.26.0.RFQMIXM, sha256 201b9e9f...).
+- [V] ABL replies get out of step after some failed commands (`getvar` answers belong to the previous command,
+  "unknown command"); entry by buttons after a failed boot left `getvar` broken. A clean session (Android ->
+  `adb reboot bootloader`) fixes it. `fastboot reboot bootloader` started Android instead of fastboot.
+- [V] The first test (22:51) hung the ABL after the upload (USB dropped at 22:52:24, nothing drawn); not our image running.
+- [V] Host: Google platform-tools 37.0.1 in ~/.local/bin (scripts/setup/platform-tools.sh); distro fastboot 37.0.0 behaves the same.
+- Shim: draws into the buffer the MDP scans out (patches/laurel/shim/0001: VIG0/DMA0/DMA1 SRC0_ADDR/stride/format),
+  first lines `FB <addr>`, `pipe= fmt=`, `stride= bpp=`.
