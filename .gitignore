@@ -52,3 +52,5 @@ external/xnu-linux-toolchain/
 external/hackios-umi/
 external/hackios-scion/
 external/*.partial/
+external/ios-sweet-umi/
+external/ios-topaz-evergo/
