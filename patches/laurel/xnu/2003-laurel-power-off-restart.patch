@@ -1,0 +1,188 @@
+laurel 2003: power off (PSCI SYSTEM_OFF), restart (IMEM restart reason + PSCI SYSTEM_RESET),
+sysctl kern.laurel_reboot_mode (normal | bootloader | fastboot | recovery). Port of negroni 0211/0213.
+Self-check of the IMEM word at start; kill switch laurelreboot=0.
+diff --git a/bsd/dev/laurel_reboot.c b/bsd/dev/laurel_reboot.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/laurel_reboot.c
+@@ -0,0 +1,125 @@
++/*
++ * laurel_sprout (Xiaomi Mi A3, SM6125): power off, restart and reboot mode.
++ * Port of negroni 0211/0213 (bsd/dev/negroni_reboot.c) to the topaz/sweet base.
++ *
++ * Without a PE_halt_restart hook IOPlatformExpert::haltRestart() returns -1, so
++ * "slide to power off" and restart only stop the CPUs (no reset).
++ *   power off  PSCI SYSTEM_OFF (0x84000008)
++ *   restart    Qualcomm restart reason in IMEM (0x0c125000 + 0x65c, the value
++ *              Linux msm-poweroff.c writes: normal 0x77665501, bootloader
++ *              0x77665500, recovery 0x77665502), then PSCI SYSTEM_RESET.
++ * The reason comes from the root-only string sysctl kern.laurel_reboot_mode
++ * (normal | bootloader | fastboot | recovery), default normal.
++ * Self-check at start: the IMEM word can be mapped and reads back what was
++ * written; if not, restart still resets (PSCI) without a reason and one line
++ * says why. Kill switch: laurelreboot=0 (no hook, XNU default).
++ * Linux also writes the PMIC PON soft reason over SPMI; that needs an SPMI write
++ * path (todo). The topaz shim reaches ABL fastboot with the IMEM reason only.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define LAUREL_IMEM_PA            0x0c125000ull
++#define LAUREL_IMEM_RESTART_OFF   0x65c
++#define PSCI_SYSTEM_OFF           0x84000008ull
++#define PSCI_SYSTEM_RESET         0x84000009ull
++
++static const struct { const char *name; uint32_t imem; } lr_modes[] = {
++	{ "normal",     0x77665501 },
++	{ "bootloader", 0x77665500 },
++	{ "fastboot",   0x77665500 },
++	{ "recovery",   0x77665502 },
++};
++
++static volatile uint32_t *lr_reason;      /* NULL: no IMEM reason (self-check failed) */
++static unsigned lr_mode;                   /* index in lr_modes */
++static int lr_on;
++
++static int64_t
++lr_psci(uint64_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "memory");
++	return (int64_t)x0;
++}
++
++int
++laurel_reboot_prepare(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("laurelreboot", &on, sizeof(on));
++	if (on == 0) {
++		printf("LAUREL REBOOT: off: laurelreboot=0\n");
++		return 0;
++	}
++	vm_offset_t va = ml_io_map(LAUREL_IMEM_PA, 0x1000);
++	if (va == 0) {
++		printf("LAUREL REBOOT: on without reason: IMEM 0x%llx not mapped\n", LAUREL_IMEM_PA);
++	} else {
++		volatile uint32_t *r = (volatile uint32_t *)(va + LAUREL_IMEM_RESTART_OFF);
++		uint32_t old = *r;
++		*r = lr_modes[0].imem;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		if (*r == lr_modes[0].imem) {
++			lr_reason = r;
++			printf("LAUREL REBOOT: on: PSCI off/reset, IMEM reason at 0x%llx (was 0x%08x)\n",
++			    LAUREL_IMEM_PA + LAUREL_IMEM_RESTART_OFF, old);
++		} else {
++			printf("LAUREL REBOOT: on without reason: IMEM read back 0x%08x\n", *r);
++		}
++	}
++	lr_on = 1;
++	return 1;
++}
++
++void
++laurel_power_off(void)
++{
++	printf("LAUREL REBOOT: PSCI SYSTEM_OFF\n");
++	int64_t rc = lr_psci(PSCI_SYSTEM_OFF);
++	printf("LAUREL REBOOT: PSCI SYSTEM_OFF returned %lld\n", (long long)rc);
++}
++
++void
++laurel_restart(void)
++{
++	if (lr_reason != NULL) {
++		*lr_reason = lr_modes[lr_mode].imem;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	printf("LAUREL REBOOT: PSCI SYSTEM_RESET (%s)\n", lr_modes[lr_mode].name);
++	int64_t rc = lr_psci(PSCI_SYSTEM_RESET);
++	printf("LAUREL REBOOT: PSCI SYSTEM_RESET returned %lld\n", (long long)rc);
++}
++
++/* kern.laurel_reboot_mode: the reason of the next restart. */
++static int
++lr_sysctl_mode(struct sysctl_oid *oidp __unused, void *arg1 __unused, int arg2 __unused,
++    struct sysctl_req *req)
++{
++	char buf[16];
++	int changed = 0;
++	strlcpy(buf, lr_modes[lr_mode].name, sizeof(buf));
++	int error = sysctl_io_string(req, buf, sizeof(buf), 0, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	for (unsigned i = 0; i < sizeof(lr_modes) / sizeof(lr_modes[0]); i++) {
++		if (strcmp(buf, lr_modes[i].name) == 0) {
++			lr_mode = i;
++			return 0;
++		}
++	}
++	return EINVAL;
++}
++SYSCTL_PROC(_kern, OID_AUTO, laurel_reboot_mode, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, lr_sysctl_mode, "A", "LAUREL reboot mode: normal | bootloader | fastboot | recovery");
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,7 @@
+ bsd/kern/topaz_sandbox_container.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/laurel_reboot.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,30 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++
++/* laurel 2003: power off, restart, reboot mode (bsd/dev/laurel_reboot.c) */
++extern "C" {
++int laurel_reboot_prepare(void);
++void laurel_power_off(void);
++void laurel_restart(void);
++}
++
++static int
++laurel_halt_restart(unsigned int type)
++{
++	switch (type) {
++	case kPEHaltCPU:
++		laurel_power_off();
++		return -1;          /* returned: SYSTEM_OFF refused; XNU halts the CPU */
++	case kPERestartCPU:
++	case kPEPanicRestartCPU:
++	case kPEPanicRestartCPUNoCallouts:
++		laurel_restart();
++		return -1;
++	default:
++		return 0;           /* panic callouts and the rest: nothing to do */
++	}
++}
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -30,6 +54,9 @@
+ 		return false;
+ 	}
+ 	registerService();
++	if (laurel_reboot_prepare()) {
++		PE_halt_restart = &laurel_halt_restart;
++	}
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }
