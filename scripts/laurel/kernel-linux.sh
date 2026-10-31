@@ -20,7 +20,11 @@ W=$OUT/laurel-kernel
 SRC=$EXT/ios-sweet-linux
 TOPAZ=$EXT/ios-topaz
 THEOS_SHA=6e7b8c40e0f5f9f5b2377800dc1e42cd2560d24a
+# theos' own installer (bin/install-theos) takes this toolchain from L1ghtmann/llvm-project; the release has
+# no checksum, so ours is pinned (first download 2026-10-31; tar list checked: only linux/iphone/..., no
+# absolute or ../ paths, no device files). A changed file stops the build.
 TOOLCHAIN_URL=https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz
+TOOLCHAIN_SHA256=a72a7a577e2fbe2838b6b5e9c72034fa7d114af96f0e1d4b016f18730ce4056e
 
 for d in "$SRC/linux" "$TOPAZ/xnu/patches"; do
   [ -d "$d" ] || { echo "kernel-linux: missing $d: scripts/setup/get-references.sh ios-sweet-linux ios-topaz" >&2; exit 1; }
@@ -53,8 +57,11 @@ if [ ! -x "$THEOS/toolchain/linux/iphone/bin/ld" ]; then
   git init -q "$THEOS"
   git -C "$THEOS" fetch -q --depth 1 https://github.com/theos/theos.git "$THEOS_SHA"
   git -C "$THEOS" checkout -q FETCH_HEAD
-  mkdir -p "$THEOS/toolchain"
-  curl -fsSL --retry 5 "$TOOLCHAIN_URL" | tar -xJf - -C "$THEOS/toolchain/"
+  mkdir -p "$THEOS/toolchain" "$W/dl"
+  tc=$W/dl/iOSToolchain-x86_64.tar.xz
+  [ -f "$tc" ] || curl -fsSL --retry 5 -o "$tc" "$TOOLCHAIN_URL"
+  echo "$TOOLCHAIN_SHA256  $tc" | sha256sum -c - || { echo "kernel-linux: toolchain checksum changed" >&2; exit 1; }
+  tar -xJf "$tc" -C "$THEOS/toolchain/"
 fi
 cd "$W"
 bash linux/setup-sdk.sh
