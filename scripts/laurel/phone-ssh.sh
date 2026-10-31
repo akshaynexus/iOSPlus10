@@ -31,13 +31,13 @@ bootlog)
   exec "$OP" bootlog $n --file "$d/area.bin" --out "$d" --kernels "$REPO/out/laurel-kernel/out"
   ;;
 *)
-  if ! "$SSHP" "$@"; then
+  "$SSHP" "$@" || {
     rc=$?
     if [ $rc = 255 ] && [ -x "$OP" ]; then
       echo "phone-ssh: kernel command server: $("$OP" ctl ping 2>&1 | tail -1)" >&2
       echo "  (pong = the kernel and ue0 run: SSH is missing on the root, or dropbear did not start)" >&2
     fi
     exit $rc
-  fi
+  }
   ;;
 esac

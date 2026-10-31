@@ -1,18 +1,22 @@
 laurel 2906: wired memory guard for IOSurfaces (port of negroni 0399).
 
 bsd/dev/laurel_wired.c: laurel_wired_allow(bytes, what) keeps the system's wired pages (vm_page_wire_count) at
-or below 55 % of max_mem (65 % for backboardd and SpringBoard). SweetSurface.cpp asks it before a buffer surface
+or below 55 % of max_mem (backboardd and SpringBoard exempt). SweetSurface.cpp asks it before a buffer surface
 is allocated (one condition next to SWEET_SURFACE_WIRED_MAX); a refusal is kIOReturnNoMemory, so an app gets an
 allocation failure instead of the system running out of pageable memory (negroni freeze of 2026-10-27).
 Lines: "LAUREL WIRED: on: ..." at the first surface, one "near the limit" per boot, rate-limited "refused".
 Kill switch laurelwiredguard=0. The GPU buffer paths (RedwoodGPU / TopazAdreno, GPU area) can call the same
 function; they are not hooked here.
 
+Review fixes: M3 backboardd and SpringBoard are exempt; the limit is 55 % of max_mem, i.e. of the 2100 RAM window
+(3264 MiB -> 1795 MiB wired; 768 MiB fallback -> 422 MiB), both in the "LAUREL WIRED: on:" line. Rebased after
+area A 2101 (the hook stays in the non-pool buffer path, before laurel_surf_pages); area B's 2151 rebases on top.
+
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 8d69557..fbfdfe8 100644
+index 8443b4f..f06f893 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -400,6 +400,7 @@ bsd/kern/kern_crossarch.c		standard
+@@ -401,6 +401,7 @@ bsd/kern/kern_crossarch.c		standard
  bsd/kern/kern_cs.c			standard
  bsd/kern/sweet_amfi.c			standard
  bsd/dev/laurel_rtc.c			standard
@@ -22,10 +26,10 @@ index 8d69557..fbfdfe8 100644
  bsd/sweet_hfs/core/BTree.c		optional sweet_hfs
 diff --git a/bsd/dev/laurel_wired.c b/bsd/dev/laurel_wired.c
 new file mode 100644
-index 0000000..cbb34da
+index 0000000..06dc5ca
 --- /dev/null
 +++ b/bsd/dev/laurel_wired.c
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,102 @@
 +/*
 + * laurel 2906: wired memory guard (port of negroni 0399).
 + *
@@ -35,9 +39,14 @@ index 0000000..cbb34da
 + * pageout and compressor threads then ran at 60-80 % of a CPU each and every
 + * user thread stopped: the pageable memory was gone. laurel_wired_allow()
 + * keeps the system's wired pages (vm_page_wire_count; compressor pages are
-+ * not in it) at or below LAUREL_WIRED_PERCENT of max_mem, or
-+ * LAUREL_WIRED_UI_PERCENT for backboardd and SpringBoard (a refusal there is
-+ * a black screen or a respring loop; a refused app takes its other path).
++ * not in it) at or below LAUREL_WIRED_PERCENT of max_mem. backboardd and
++ * SpringBoard are exempt (review M3: a refusal there is a black screen or a
++ * respring loop; a refused app takes its other path).
++ * Thresholds after laurel 2100: max_mem is the XNU RAM window, 3264 MiB
++ * (0xE1004000..), so the limit is 1795 MiB of wired pages; with the 768 MiB
++ * fallback window it is 422 MiB. The screen-surface pool of 2101 (6 x 8 MiB,
++ * reserved before user space) does not pass this guard. SweetSurface.cpp keeps
++ * its own 1536 MiB cap on buffer surfaces as well.
 + * Callers answer kIOReturnNoMemory on false. One line "LAUREL WIRED: on: ..."
 + * at the first call (or "off: reason"), one "near the limit" line per boot at
 + * 90 % of the limit, rate-limited "refused" lines. Kill switch:
@@ -53,7 +62,7 @@ index 0000000..cbb34da
 +#include <libkern/OSAtomic.h>
 +
 +#define LAUREL_WIRED_PERCENT     55
-+#define LAUREL_WIRED_UI_PERCENT  65
++#define LAUREL_WIRED_WINDOW_MIB  3264u          /* laurel 2100 RAM window (for the log line) */
 +
 +extern unsigned int vm_page_wire_count;
 +extern unsigned int vm_page_free_count;
@@ -86,9 +95,10 @@ index 0000000..cbb34da
 +	}
 +	__atomic_store_n(&laurel_wired_limit, limit, __ATOMIC_RELEASE);
 +	laurel_wired_state = 1;
-+	printf("LAUREL WIRED: on: surfaces refused above %llu MiB wired (%u%% of %llu MiB; backboardd and SpringBoard "
-+	    "up to %u%%); %llu MiB wired, %llu MiB free now\n", limit >> 20, LAUREL_WIRED_PERCENT, max_mem >> 20,
-+	    LAUREL_WIRED_UI_PERCENT, wired >> 20, ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20);
++	printf("LAUREL WIRED: on: buffer surfaces refused above %llu MiB wired = %u%% of max_mem %llu MiB (%s); "
++	    "backboardd and SpringBoard exempt; %llu MiB wired, %llu MiB free now\n", limit >> 20, LAUREL_WIRED_PERCENT,
++	    max_mem >> 20, (max_mem >> 20) == LAUREL_WIRED_WINDOW_MIB ? "the 2100 window" : "not the 3264 MiB 2100 window",
++	    wired >> 20, ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20);
 +}
 +
 +bool
@@ -104,7 +114,7 @@ index 0000000..cbb34da
 +	char who[32];
 +	proc_selfname(who, sizeof(who));
 +	if (strcmp(who, "backboardd") == 0 || strcmp(who, "SpringBoard") == 0) {
-+		limit = max_mem / 100 * LAUREL_WIRED_UI_PERCENT;
++		return true;            /* review M3: the UI shell is never refused */
 +	}
 +	uint64_t wired = (uint64_t)vm_page_wire_count * PAGE_SIZE;
 +	if (wired + bytes <= limit) {
@@ -123,10 +133,10 @@ index 0000000..cbb34da
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index ac612e6..0b54173 100644
+index 291bf77..346102c 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -112,6 +112,7 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+@@ -114,6 +114,7 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
  static uint32_t      sweet_surface_next_id = 1;
  static uint32_t      sweet_surface_creates_logged;
  static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
@@ -134,7 +144,7 @@ index ac612e6..0b54173 100644
  #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
  
  /* topaz scanout: at most 6 contiguous 16 MiB surfaces */
-@@ -1074,7 +1075,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -1261,7 +1262,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  	if (ret == kIOReturnSuccess && s->memory == NULL) {
  		IOBufferMemoryDescriptor *mem = NULL;
  		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +

@@ -5,17 +5,19 @@ laurel 2901: calendar from the PM6125 RTC, USB settime/time (port of negroni 020
   its APID (trinket bases as laurel 2018), never written (DT qcom,qpnp-rtc-write = <0>). Wall = RTC +
   offset; the offset of the last set (settimeofday / USB settime) is saved in /private/var/db/laurel_rtc
   and applied in bsd_init before launchd. Floor: the kernel build date. One line
-  "LAUREL CALENDAR: on: PM6125 RTC ..." or "LAUREL CALENDAR: off: <reason> (...)". Kill switch laurelrtc=0;
-  laurelrtcoff=<s> gives the offset.
+  "LAUREL CALENDAR: on: PM6125 RTC ..." or "LAUREL CALENDAR: off: <reason> (...)". Kill switch laurelrtc=0.
 - IOKitInitializeTime waits (10 s max) for the platform expert, so the calendar is not the epoch.
 - Command server: "settime S[.U]" (usblog.sh sends it at every connect) and "time". In raw mode (before the
   ue0 attach) the settime value is kept and set at the attach, plus the time since it came.
 
+Review fixes: m7 no offset boot-arg (laurelrtc=0 is the only switch); m9 TODO: move the RTC lane into sweet_spmi.c
+after area D (2300) merges.
+
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 94b8d1c..8d69557 100644
+index 77e54cc..8443b4f 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -399,6 +399,7 @@ bsd/kern/kern_credential.c		standard
+@@ -400,6 +400,7 @@ bsd/kern/kern_credential.c		standard
  bsd/kern/kern_crossarch.c		standard
  bsd/kern/kern_cs.c			standard
  bsd/kern/sweet_amfi.c			standard
@@ -25,10 +27,10 @@ index 94b8d1c..8d69557 100644
  bsd/sweet_hfs/core/BTree.c		optional sweet_hfs
 diff --git a/bsd/dev/laurel_rtc.c b/bsd/dev/laurel_rtc.c
 new file mode 100644
-index 0000000..2200c90
+index 0000000..0773001
 --- /dev/null
 +++ b/bsd/dev/laurel_rtc.c
-@@ -0,0 +1,609 @@
+@@ -0,0 +1,607 @@
 +/*
 + * laurel 2901: calendar (wall-clock) time on the Mi A3 (SM6125, PM6125 RTC).
 + * Port of negroni 0203 (bsd/dev/negroni_rtc.c) and 0212 (USB settime).
@@ -44,9 +46,9 @@ index 0000000..2200c90
 + *     qpnp_read_wrapper(): the 4 bytes, then byte 0 again; a smaller byte 0
 + *     means a carry during the read, so read once more. The DT has
 + *     qcom,qpnp-rtc-write = <0>: like Linux and Android (time_daemon) this
-+ *     code never writes the RTC. Wall time = RTC + an offset:
-+ *       - boot-arg laurelrtcoff=<seconds> (wins over the saved offset), or
-+ *       - the offset saved in /private/var/db/laurel_rtc (below).
++ *     code never writes the RTC. Wall time = RTC + the offset saved in
++ *     /private/var/db/laurel_rtc (below). (negroni's offset boot-arg is not
++ *     ported: review m7, boot-args are =0 kill switches only.)
 + *     The read uses the SPMI arbiter v5 observer channel of the RTC APID
 + *     (trinket: core 0x1c40000, observer 0x3e00000, config 0x1c0a000, as
 + *     sweet_spmi.c after laurel 2018), mapped here: the RTC lane is used by
@@ -67,6 +69,10 @@ index 0000000..2200c90
 + * and the counter reads twice. One line: "LAUREL CALENDAR: on: ..." or
 + * "LAUREL CALENDAR: off: <reason> (build-date floor + uptime)". Kill switch:
 + * boot-arg laurelrtc=0 (no PMIC access; the floor and settime still work).
++ *
++ * TODO (review m9): after area D (patch 2300, sweet_spmi.c reads/writes for the
++ * battery and charger) is merged, move lc_map/lc_read8 into sweet_spmi.c as a
++ * lane like the PON one; the own mapping here only avoids a merge conflict.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -117,8 +123,6 @@ index 0000000..2200c90
 +	vm_offset_t core, obs, cfg;
 +	uint32_t    apid;
 +	uint64_t    floor;           /* seconds */
-+	bool        bootarg_off_set;
-+	int64_t     bootarg_off;
 +	int64_t     offset;          /* wall = RTC + offset (rtc_ok) */
 +	const char *source;          /* where the current time came from */
 +	uint64_t    soft_wall_ns;    /* wall time at soft_abs: the clock without the RTC */
@@ -307,7 +311,6 @@ index 0000000..2200c90
 +	int64_t days = lc_build_days();
 +	lc.floor = days > 0 ? (uint64_t)(days - 1) * 86400ull : 1761955200ull;   /* 2025-11-01 */
 +	(void)PE_parse_boot_argn("laurelrtc", &enabled, sizeof(enabled));
-+	lc.bootarg_off_set = PE_parse_boot_argn("laurelrtcoff", &lc.bootarg_off, sizeof(lc.bootarg_off));
 +
 +	if (!enabled) {
 +		strlcpy(why, "laurelrtc=0", sizeof(why));
@@ -326,13 +329,12 @@ index 0000000..2200c90
 +
 +	uint64_t t;
 +	if (lc.rtc_ok) {
-+		int64_t off = lc.bootarg_off_set ? lc.bootarg_off : 0;
++		int64_t off = 0;
 +		t = (uint64_t)((int64_t)raw + off);
-+		lc.source = lc.bootarg_off_set ? "RTC + boot-arg laurelrtcoff" : "RTC counter (no offset yet)";
++		lc.source = "RTC counter (no offset yet)";
 +		if ((int64_t)raw + off < 0 || t < lc.floor) {
 +			t = lc.floor;
-+			lc.source = lc.bootarg_off_set ? "build-date floor (RTC + laurelrtcoff below it)" :
-+			    "build-date floor (RTC counter below it)";
++			lc.source = "build-date floor (RTC counter below it)";
 +		}
 +		lc.offset = (int64_t)t - (int64_t)raw;
 +		printf("LAUREL CALENDAR: on: PM6125 RTC APID %u, ctrl 0x%02x, counter %u s; boot calendar %llu s from the %s, "
@@ -493,8 +495,6 @@ index 0000000..2200c90
 +		what = "saved file not understood: ignored";
 +	} else if (lc.set_this_boot) {
 +		what = "time already set this boot: saved offset not used";
-+	} else if (lc.bootarg_off_set) {
-+		what = "boot-arg laurelrtcoff given: saved offset not used";
 +	} else if (lc.rtc_ok && lc_rtc_raw(&raw) == 0 && (!lc.saved_has_rtc || raw >= lc.saved_rtc) &&
 +	    (int64_t)raw + lc.saved_offset > 0) {
 +		apply = (uint64_t)((int64_t)raw + lc.saved_offset);
@@ -639,11 +639,11 @@ index 0000000..2200c90
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index 9fb5f7a..fa15013 100644
+index fcaca16..af53493 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -129,6 +129,11 @@ extern void laurel_bootlog_info(char *buf, size_t size);
- extern int laurel_bootlog_read(uint32_t blk, uint32_t count, void *dst);
+ extern int laurel_bootlog_read(uint32_t blk, uint32_t count, void *dst, bool nowait);
  extern void laurel_bootlog_end(unsigned kind, const char *why);
  static char ud_ctl_why[48];             /* end text of the pending reset / power off */
 +/* laurel 2901: calendar (bsd/dev/laurel_rtc.c) */
@@ -717,7 +717,7 @@ index 9fb5f7a..fa15013 100644
  /*
   * laurel 2900 (port of negroni 0367): boot log commands, ud_thread only.
   *   bootlog          one text line (laurel_bootlog_info)
-@@ -1279,6 +1333,21 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+@@ -1288,6 +1342,21 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
  		ud_ctl_bootlog(f, cmd);         /* laurel 2900 */
  		return true;
  	}
@@ -739,7 +739,7 @@ index 9fb5f7a..fa15013 100644
  	if (ud.ctl_action != UD_CTL_NONE) {
  		printf("LAUREL CTL: busy (a reset or panic is pending)\n");
  		ud_ctl_reply(f, "error: busy");
-@@ -1454,9 +1523,23 @@ ud_panic_rx(const uint8_t *f, uint32_t len)
+@@ -1463,9 +1532,23 @@ ud_panic_rx(const uint8_t *f, uint32_t len)
  		ud_panic_pos = 0;               /* laurel 2900: all of it (head buffer + ring) */
  		snprintf(text, sizeof(text), "ok log (%llu console bytes from byte 0)%s", sweet_log_position(), sfx);
  		reply = text;
@@ -765,7 +765,7 @@ index 9fb5f7a..fa15013 100644
  	} else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "recovery") == 0 ||
  	    strcmp(cmd, "bootloader") == 0 || strcmp(cmd, "poweroff") == 0) {
  		if (busy) {
-@@ -2302,6 +2385,7 @@ ud_attach_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -2320,6 +2403,7 @@ ud_attach_thread(void *arg __unused, wait_result_t wr __unused)
  	ud_preply_count = 0;                    /* replies not sent yet: the host asks again */
  	lck_mtx_unlock(ud.lock);
  	printf("LAUREL USB: ue0 attached; %llu console bytes went out as raw frames\n", ud_panic_pos);

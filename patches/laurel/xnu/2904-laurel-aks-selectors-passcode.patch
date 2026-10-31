@@ -1,15 +1,18 @@
 laurel 2904: AppleKeyStore with the missing selectors and a software keybag passcode (port of negroni 0220 + 0221-aks-passcode).
 
 iokit/Kernel/arm/SweetKeyStore.cpp is replaced by the negroni NegroniKeyStore.cpp after 0220 and 0221 (slop
-0038/0055 base), renamed for SWEET: boot-args laurelaks (bit mask, default 7: bit 0 "no passcode" lock state
-0x6 / sls 3 while no passcode is set, bit 1 key wrap 10/11, bit 2 passcode support), laurelaks_log=1 (every
-call), laurelaks_reset=1 (ignore the stored passcode for one boot); log prefix "LAUREL AKS:";
+0038/0055 base), renamed for SWEET: always "no passcode" lock state 0x6 / sls 3 while no passcode is set, key
+wrap 10/11 and passcode support; kill switch laurelaks_passcode=0; laurelaks_reset=1 (ignore the stored passcode
+for one boot); log prefix "LAUREL AKS:";
 iokit/Kernel/arm/LaurelKeyStoreCore.h (PBKDF2-HMAC-SHA256 verifier, bag blob). Added selectors: 8 lock,
 15 change secret, 23 bag UUID, 30/31 configuration, 32 lock now, 40 generation, 42 verify password,
 87 invalidate bag, 100 assert promote, 105 change secret epilogue, 115 prewarm. The wrap format ("HKwr") is
 the topaz/HackiOS one, so existing keychain items stay readable. A lock-screen gate only: class keys do
 not depend on the passcode (no SEP).
 Line: "LAUREL AKS: AppleKeyStore registered (unlocked, lock state 0x6, key wrap on, passcode on)".
+
+Review fixes: m7 no bit mask / log-all boot-args; kill switch laurelaks_passcode=0; laurelaks_reset=1 stays as the
+documented recovery switch (owner-approved exception, docs/plan.md).
 
 diff --git a/iokit/Kernel/arm/LaurelKeyStoreCore.h b/iokit/Kernel/arm/LaurelKeyStoreCore.h
 new file mode 100644
@@ -533,7 +536,7 @@ index 0000000..82237bc
 +
 +#endif /* LAUREL_KEYSTORE_CORE_H */
 diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
-index 73d9267..7dd1b23 100644
+index 73d9267..f959d82 100644
 --- a/iokit/Kernel/arm/SweetKeyStore.cpp
 +++ b/iokit/Kernel/arm/SweetKeyStore.cpp
 @@ -1,6 +1,14 @@
@@ -546,7 +549,7 @@ index 73d9267..7dd1b23 100644
 + * laurel 2904: port of negroni 0220 (missing selectors, "no passcode" lock
 + * state, quiet logging) and 0221-aks-passcode (software keybag passcode):
 + * the negroni NegroniKeyStore.cpp after both patches, renamed (boot-args
-+ * laurelaks / laurelaks_log / laurelaks_reset, log prefix "LAUREL AKS:",
++ * laurelaks_passcode=0 / laurelaks_reset=1, log prefix "LAUREL AKS:",
 + * LaurelKeyStoreCore.h). The bag blob and the key wrap ("HKwr", as topaz /
 + * HackiOS) keep the negroni format. Replaces the topaz version (selectors
 + * 0-17 + wrap, every call logged, never a passcode).
@@ -562,17 +565,17 @@ index 73d9267..7dd1b23 100644
 - * with kIOReturnUnsupported.
 + * The first calls of each selector are logged (selector, caller, argument
 + * shapes, result) so the next selectors the system needs show up on the
-+ * console; unknown ones fail with kIOReturnUnsupported. Boot-arg
-+ * laurelaks_log=1 logs every call.
++ * console; unknown ones fail with kIOReturnUnsupported.
 + *
-+ * Boot-arg laurelaks (bit mask, default 7):
-+ *   bit 0  "no passcode": lock state 0x6 and device state sls 3 (else 0x4 / 0)
-+ *          while no passcode is set
-+ *   bit 1  key wrap/unwrap (selectors 10/11, else kIOReturnUnsupported)
-+ *   bit 2  passcode support: a software keybag (below). Clear: the 0220
-+ *          behaviour (never a passcode, change secret unsupported).
-+ * Boot-arg laurelaks_reset=1: forget the stored passcode for this boot
-+ * (the loaded bag counts as "no passcode"; recovery: patches/xnu/README-aks-amfi.md, docs/laurel_sprout/negroni-ports.md).
++ * Always on: "no passcode" lock state 0x6 and device state sls 3 while no
++ * passcode is set; key wrap/unwrap (selectors 10/11); passcode support (a
++ * software keybag, below). Review m7: negroni's bit mask (negroniaks) and the
++ * log-all switch are not ported. Kill switch laurelaks_passcode=0: the 0220
++ * behaviour (never a passcode, change secret unsupported).
++ * Boot-arg laurelaks_reset=1: forget the stored passcode for this boot (the
++ * loaded bag counts as "no passcode"). The one boot-arg here that is not a
++ * =0 kill switch: the recovery path when the passcode is lost (owner-approved
++ * exception, docs/plan.md; patches/xnu/README-aks-amfi.md).
 + *
 + * Passcode (0221): a software keybag, no SEP. The kernel keeps a salted,
 + * iterated hash of the passcode (PBKDF2-HMAC-SHA256, LaurelKeyStoreCore.h),
@@ -668,8 +671,10 @@ index 73d9267..7dd1b23 100644
  /* The system (device) bag handle. */
 -#define SWEET_AKS_SYSTEM_HANDLE 0
 +#define LAUREL_AKS_SYSTEM_HANDLE 0
-+
-+/*
+ 
+ /*
+- * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
 + * aks lock state bits (aks_get_lock_state): bit 1 "no passcode", bit 2
 + * "unlocked since boot" (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear
 + * lock bits = unlocked. Device state "sls" (MKBGetDeviceLockState): 0
@@ -680,10 +685,11 @@ index 73d9267..7dd1b23 100644
 + * 17) in storms (ios-sailfish saw thousands a minute from coreduetd).
 + * ios-sailfish 0180 and HackiOS (MiniAppleKeyStore.cpp) answer "no
 + * passcode": 0x6 and sls 3.
-+ */
+  */
+-#define SWEET_AKS_LOCK_STATE    0x4
 +#define LAUREL_AKS_LOCK_STATE_NOPASSCODE  0x6
 +#define LAUREL_AKS_SLS_NOPASSCODE         3
-+#define LAUREL_AKS_LOCK_STATE_UNLOCKED    0x4     /* laurelaks bit 0 clear: the old answer */
++#define LAUREL_AKS_LOCK_STATE_UNLOCKED    0x4     /* the old answer (negroniaks bit 0 clear; not selectable here) */
 +#define LAUREL_AKS_SLS_UNLOCKED           0
 +
 +#define LAUREL_AKS_OPT_NOPASSCODE         0x1
@@ -692,7 +698,7 @@ index 73d9267..7dd1b23 100644
 +
 +static uint32_t laurel_aks_options = LAUREL_AKS_OPT_NOPASSCODE | LAUREL_AKS_OPT_WRAP |
 +    LAUREL_AKS_OPT_PASSCODE;
-+static uint32_t laurel_aks_log_all;
++static uint32_t laurel_aks_log_all;     /* 0: the first calls of each selector only (no boot-arg) */
 +static uint32_t laurel_aks_reset;      /* laurelaks_reset=1: ignore the stored passcode */
 +static bool laurel_aks_notify_state;  /* first-unlock notification posted (selector 102) */
 +
@@ -732,10 +738,8 @@ index 73d9267..7dd1b23 100644
 +static bool laurel_aks_unlocked_once = true;   /* unlocked since boot */
 +static uint64_t laurel_aks_lock_deadline;      /* mach_continuous_time; 0 = no lock pending */
 +static uint32_t laurel_aks_failed;     /* wrong passcodes since the last unlock */
- 
- /*
-- * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
-- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
++
++/*
 + * Interest messages on the AppleKeyStore service (IOGeneralInterest). The
 + * UserEventAgent plugin MobileKeyBagLockState.plugin listens: 0xe3ffd00d
 + * -> notify_post("com.apple.mobile.keybagd.lock_status"); 0xe3ffd00f ->
@@ -743,8 +747,7 @@ index 73d9267..7dd1b23 100644
 + * MKBNotifyStateSet, selectors 103 / 102); 0xe3ffd00c passcode threshold.
 + * Without a passcode the plugin posts first_unlock at its start (lock state
 + * bit 2); with one, the kernel must tell it about the first unlock.
-  */
--#define SWEET_AKS_LOCK_STATE    0x4
++ */
 +#define LAUREL_AKS_MSG_LOCK_STATUS  0xe3ffd00d
 +#define LAUREL_AKS_MSG_FIRST_UNLOCK 0xe3ffd00f
 +#define LAUREL_AKS_POST_LOCK_STATUS 0x1
@@ -797,12 +800,14 @@ index 73d9267..7dd1b23 100644
  
  class AppleKeyStore : public IOService {
  	OSDeclareDefaultStructors(AppleKeyStore);
-@@ -74,9 +266,21 @@ AppleKeyStore::start(IOService *provider)
+@@ -74,9 +266,23 @@ AppleKeyStore::start(IOService *provider)
  	if (!IOService::start(provider)) {
  		return false;
  	}
-+	(void)PE_parse_boot_argn("laurelaks", &laurel_aks_options, sizeof(laurel_aks_options));
-+	(void)PE_parse_boot_argn("laurelaks_log", &laurel_aks_log_all, sizeof(laurel_aks_log_all));
++	uint32_t passcode = 1;
++	if (PE_parse_boot_argn("laurelaks_passcode", &passcode, sizeof(passcode)) && passcode == 0) {
++		laurel_aks_options &= ~LAUREL_AKS_OPT_PASSCODE;
++	}
 +	(void)PE_parse_boot_argn("laurelaks_reset", &laurel_aks_reset, sizeof(laurel_aks_reset));
 +	laurel_aks_mtx = IOLockAlloc();
 +	if (laurel_aks_mtx == NULL) {
@@ -820,7 +825,7 @@ index 73d9267..7dd1b23 100644
  	return true;
  }
  
-@@ -99,15 +303,28 @@ AppleKeyStoreUserClient::clientClose(void)
+@@ -99,15 +305,28 @@ AppleKeyStoreUserClient::clientClose(void)
  	return kIOReturnSuccess;
  }
  
@@ -853,7 +858,7 @@ index 73d9267..7dd1b23 100644
  		args->structureOutputDescriptorSize = len;
  		return kIOReturnSuccess;
  	}
-@@ -119,52 +336,722 @@ sweet_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t
+@@ -119,52 +338,722 @@ sweet_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t
  	return kIOReturnSuccess;
  }
  
@@ -1604,7 +1609,7 @@ index 73d9267..7dd1b23 100644
  {
  	return args->structureOutputDescriptor != NULL ?
  	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
-@@ -180,29 +1067,142 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -180,29 +1069,142 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  	uint32_t in_struct = args->structureInputDescriptor != NULL ?
  	    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
  	uint32_t out_scalars = args->scalarOutputCount;
@@ -1749,7 +1754,7 @@ index 73d9267..7dd1b23 100644
  		args->scalarOutputCount = 1;
  		break;
  	case kAKSGetLockState:
-@@ -210,75 +1210,57 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -210,75 +1212,57 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  			ret = kIOReturnBadArgument;
  			break;
  		}

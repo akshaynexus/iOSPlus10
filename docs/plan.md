@@ -572,3 +572,14 @@ applied=226, 0 LSE. Host: userland/ssh builds on Linux (fetch-sdk.sh + build.sh)
 log-pull.sh reads the boot log area, op10tool texts. Not done: 0288 cpuidle, 0361 ring, 0366 watchdog.
 Next (coordinator, phone): boot it; check the LAUREL BOOTLOG/CALENDAR/SANDBOX/AKS/USB POLL/WIRED/SSD lines and that the live
 log starts with the first kernel line; `op10tool bootlog`; rebuild the root with SSH and flash it (owner approval).
+
+### Area I review fixes (2026-11-01, rebased on laurel-int-1)
+
+M1 live-log burst limit (half the TX queue, 1 ms per 32 datagrams; ctl replies keep room), M2 patch 2907 (SPMI init
+mutex, PON spinlock, try-lock in panic), M3 wired guard: backboardd/SpringBoard exempt, 55 % of the 2100 window
+(3264 MiB -> 1795 MiB), m4 flush retry time, m5 `bootlog read` try-lock + busy replies, m6 phone-ssh.sh exit code,
+m7 tuning boot-args removed (laurelrtcoff, laurelusb_pollus/_idle_ms/_nohost_ms, laurelaks bit mask, laurelaks_log);
+new kill switches laurelusb_poll=0, laurelaks_passcode=0. **Owner-approval exception to the "=0 kill switch only" rule:
+`laurelaks_reset=1`** (2904): ignores the stored software passcode for one boot, the only way back into a phone
+whose passcode is lost (no SEP, no other reset path). m9 TODO: RTC lane into sweet_spmi.c after area D merges.
+m10 host-wait behaviour documented in usb-debug.md.

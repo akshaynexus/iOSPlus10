@@ -146,6 +146,13 @@ Now:
 - Raw mode and ue0 mode send nothing until a frame from 192.168.7.1 came (ARP or IPv4: usblog's `settime`, its
   keepalive, or any `op10tool ctl` command), then from byte 0. A failed send keeps its bytes. In a panic the old 10 s
   fallback stays. `op10tool ctl log` resends all (head + ring).
+- Host wait (review m10), what to expect: after the USB link comes up the phone sends no log datagram until the host
+  shows itself with any frame from 192.168.7.1 (ARP request, IPv4: usblog.sh's `settime` and its 10 s keepalive
+  broadcast do it within about 1 s of the address; `op10tool ctl ping` does it too). A host that only listens
+  (`nc -ukl 5140` with no traffic) gets nothing until then. Before a panic there is no time-out; in the panic hold the
+  log goes out after 10 s without a sign, as before. A resend (`ctl log`, up to 5 MiB) goes out in bursts that stop at
+  half of the TX queue (64 of 128 frames) and pause 1 ms per 32 datagrams, so `pong` and `ok bootloader` are never
+  dropped; `bootlog read` answers `error: busy (TX queue)` or `error: busy (UFS in use, ask again)` (op10tool asks again).
 - Boot log: the negroni 0367 slot area at userdata block N-28673 (9216 blocks: superblock `NEGRBLOG`, 8 slots of one
   header + 4 MiB ring; same structs, so `out/bin/op10tool bootlog` works unchanged). Self-check: the HFS+ volume header
   (partition byte 1024) must end below the area ([I] root image 16 GiB = 4194304 blocks; userdata 110501 MiB, so the area
@@ -171,7 +178,8 @@ date) in `/private/var/db/laurel_rtc`, applied in bsd_init before launchd; floor
 Lines: `LAUREL CALENDAR: on: PM6125 RTC APID N, ctrl 0x80, counter C s; boot calendar ...` or `LAUREL CALENDAR: off:
 <reason> (...)`; `LAUREL CALENDAR: /private/var/db/laurel_rtc: no saved offset yet` (first boot); `LAUREL CTL: ok
 settime ...`. In raw mode usblog's settime gets `ok settime S (pending: set at the ue0 attach)` and the attach prints
-`LAUREL CTL: settime from raw mode: ok settime ...`. Kill switch `laurelrtc=0`; `laurelrtcoff=<s>`.
+`LAUREL CTL: settime from raw mode: ok settime ...`. Kill switch `laurelrtc=0`. TODO (review m9): move the RTC lane into sweet_spmi.c
+after area D (2300) merges.
 
 ### 2902-2906
 
@@ -182,12 +190,17 @@ settime ...`. In raw mode usblog's settime gets `ok settime S (pending: set at t
   tccd's ENOENT for op 5 go away; 10001/10003/1005/12001 stay denied (not in negroni either).
 - 2904 (0220 + 0221-aks-passcode): SweetKeyStore.cpp = the negroni AppleKeyStore (selectors 8/15/23/30/31/32/40/42/87/
   100/105/115, "no passcode" lock state 0x6 / sls 3, quiet log, software keybag passcode). Line `LAUREL AKS:
-  AppleKeyStore registered (unlocked, lock state 0x6, key wrap on, passcode on)`. `laurelaks`, `laurelaks_reset=1`.
+  AppleKeyStore registered (unlocked, lock state 0x6, key wrap on, passcode on)`. Kill switch `laurelaks_passcode=0`; `laurelaks_reset=1` = recovery (exception, plan.md).
 - 2905 (0361 poll, 0382 USB, 0366 reset): poll 200 us while frames move, 4 ms idle, 20 ms without a host, TX queue 128,
   ENDTRANSFER at bus reset. Line `LAUREL USB POLL: on: ...`; status line `LAUREL USB: ue0 rx .. tx .. frames, N polls`.
-  Old behaviour: `laurelusb_pollus=1000 laurelusb_idle_ms=1`, `laurelusb_resetend=0`.
-- 2906 (0399): wired guard for buffer IOSurfaces (55 % of max_mem, 65 % for backboardd/SpringBoard). Line `LAUREL WIRED:
-  on: ...` at the first surface; `laurelwiredguard=0`.
+  Old behaviour: `laurelusb_poll=0` (line `LAUREL USB POLL: off: ...`), `laurelusb_resetend=0`.
+- 2906 (0399): wired guard for buffer IOSurfaces: 55 % of max_mem = of the 2100 RAM window (3264 MiB -> 1795 MiB wired;
+  768 MiB fallback -> 422 MiB); backboardd and SpringBoard exempt; the 2101 screen pool does not pass it. Line `LAUREL
+  WIRED: on: buffer surfaces refused above 1795 MiB wired = 55% of max_mem 3264 MiB (the 2100 window); backboardd and
+  SpringBoard exempt; ...` at the first buffer surface; `laurelwiredguard=0`.
+- 2907 (review M2): sweet_spmi.c init once under a mutex (sp_ready published last), PON lane under a spinlock with
+  interrupts off (try-lock in a panic: the PON access fails, the reset still runs). Only the init and the two PON
+  functions change (area D 2300 edits the same file).
 - Not ported: 0288 PSCI cpuidle (below), the 0361 RX ring / TX batch, the 0366 soft-reconnect watchdog, the non-USB
   parts of 0382 (display-dark polls of touch/keys/battery belong to those areas).
 

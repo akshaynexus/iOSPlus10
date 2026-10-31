@@ -5,7 +5,7 @@ Line "LAUREL SSD: on: ..." at the first query (HFS mount); kill switch laurelssd
 fix) is 16 KiB-page only: the Mi A3 kernel has 4 KiB pages.
 
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index aebd203..9d5f49b 100644
+index 06559bd..7f0bf7f 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -688,6 +688,29 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
