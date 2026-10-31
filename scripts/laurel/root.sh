@@ -2,6 +2,7 @@
 # Build the Mi A3 (laurel_sprout) iOS 16.7.16 root for userdata (rd=ufsroot0) on Linux, as a sparse image.
 #   scripts/bg.sh laurel-root sudo scripts/laurel/root.sh       (needs root: loop mounts, apfs-fuse, rsync -aH)
 # Input: $APPLE/20H392/*.dmg (scripts/ios16/fetch-dmgs.sh, op10tool ipsw-get; default APPLE=~/op10-apple).
+# SSH=1 (default, when out/ssh/ios exists): dropbear + tools (scripts/net/root-add-ssh.sh); SSH=0: none.
 # Steps: 1. external/ios-topaz/tools/mkiosroot.sh (case-sensitive journaled HFS+, OS + SystemOS/AppOS cryptexes,
 #        dyld cache link, plain system keybag); 2. topaz sweet-root-tweaks.py (build 20H392 fixes, launchd,
 #        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped) and
@@ -67,6 +68,13 @@ python3 -I "$TOPAZ/sweet-root-tweaks.py" "$mnt"
 # CA heartbeat 60: the Mi A3 panel runs at 60 Hz (negroni's default 120 is for its 120 Hz panel).
 CA_HEARTBEAT=${CA_HEARTBEAT:-60} python3 -I "$REPO/scripts/ios16/root-tweaks-extra.py" "$mnt"
 python3 -I "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$mnt"
+# SSH (dropbear on 192.168.7.2:22, dash, toybox, usbreboot, oslogstream; docs/usb-network.md) when the iOS
+# builds exist (userland/ssh/build.sh, Linux or macOS). SSH=0: none. Host key and known_hosts as root-add-ssh.py.
+if [ "${SSH:-1}" = 1 ] && [ -x "$REPO/out/ssh/ios/dropbearmulti" ]; then
+  SSH=1 sh "$REPO/scripts/net/root-add-ssh.sh" "$mnt"
+elif [ "${SSH:-1}" = 1 ]; then
+  echo "$(ts) laurel-root: SSH skipped: no out/ssh/ios (userland/ssh/fetch.sh, fetch-sdk.sh, build.sh)"
+fi
 sync
 umount "$mnt"
 

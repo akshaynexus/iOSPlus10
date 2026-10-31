@@ -11,15 +11,14 @@ The laurel kernel speaks the same USB protocol as negroni, so the negroni host t
 | USB function | CDC-ECM, VID:PID 1209:0001, strings "iOSPlus10" / "Mi A3 iOS (USB Ethernet)" |
 | Phone | `ue0`, 192.168.7.2/24, MAC 02:00:5e:77:ee:02 |
 | Host | 192.168.7.1/24, ECM MAC 02:00:5e:77:ee:01 (usblog.sh finds the interface by it) |
-| Live console | UDP to 192.168.7.1:5140 every 100 ms, starts with the last 64 KiB of the console ring |
+| Live console | UDP to 192.168.7.1:5140 every 100 ms; since 2900 from byte 0 of the boot, after the first frame from 192.168.7.1 |
 | Commands | UDP to 192.168.7.2:5141, one ASCII word per datagram, reply to the source port, only from 192.168.7.1 |
 
-Commands: `ping` -> `pong`; `log` -> `ok log` (the last 64 KiB again); `reboot` / `bootloader` / `recovery`
--> `ok <cmd>` then, 500 ms later, the IMEM restart reason of patch 2003 (`kern.laurel_reboot_mode`) + PSCI
-SYSTEM_RESET; `poweroff` -> PSCI SYSTEM_OFF; `panic` -> `panic("requested over USB")`. Unknown words
-(e.g. negroni's `settime`, `bootlog`, `usbstats`) get `error: unknown command`; usblog.sh tolerates that.
-Not ported: 0367 `bootlog` (the userdata ring). topaz 0047 already writes the console ring to the end of
-the UFS partition; a reader for it is future work.
+Commands: `ping` -> `pong`; `log` -> `ok log (N console bytes from byte 0)` (2900: everything again);
+`reboot` / `bootloader` / `recovery` -> `ok <cmd>` then, 500 ms later, the IMEM restart reason of patch 2003
+(`kern.laurel_reboot_mode`) + PSCI SYSTEM_RESET; `poweroff` -> PSCI SYSTEM_OFF; `panic` ->
+`panic("requested over USB")`; `bootlog`, `bootlog read A C` (2900, `op10tool bootlog`); `settime S[.U]`, `time`
+(2901). Unknown words (negroni's `usbstats`) get `error: unknown command`; usblog.sh tolerates that.
 
 ## Panic over USB
 
@@ -129,3 +128,80 @@ What the next boot shows, by case:
 | `timer service: on, first tick after N us` and the host enumerates (usblog gets the ring) | log ends with the last `kernel_bootstrap_thread:`/`SWEET CPU:` line | the hang is in that step; interrupts work |
 | `timer service: NO tick ...` | still "unable to enumerate" | the timer interrupt does not reach Silver CPU0 after Mu; the register values in the line say where (GIC vs CNTV vs DAIF) |
 | `timer service: on` but no enumeration | - | EP0 is served; the fault is in the DWC3 setup itself (next: compare DEPCFG/TRB with ABL usbfn) |
+
+## Patches 2900-2906: debug channel complete, calendar, generic negroni ports (2026-11-01, area I)
+
+Built [V] 2026-11-01 04:40: `kernel-linux: topaz e477291, 226 patches, 25 of them laurel`, `apply-xnu: applied=226 known-skip=0 failed=0`, 0 LSE/RCpc.
+NOT BOOTED (the coordinator tests). Numbers below marked [I] are computed, not seen on the phone.
+
+### 2900 console head buffer, live log from byte 0, boot log (negroni 0367)
+
+Why the early lines were missing [V code + usblog-20261101-001446.txt]: the raw stream (before the ue0 attach) sent the
+ring from byte 0 but, after a 10 s wait, also when no frame from the host had come; the host gets its address only when
+usblog.sh sees the interface, so those datagrams were dropped (the 03:59:59 boot starts at `Skywalk: ... PASSED`). The
+ue0 log thread started at the last 64 KiB, and a failed `sock_send` lost its chunk (the position had already moved).
+Now:
+- The first 1 MiB of console text of every boot is kept in a head buffer that is never overwritten (`laurel_log_head`);
+  bytes the 4 MiB ring lost come from it, a gap is one line `[LAUREL LOG: console bytes A..B were overwritten ...]`.
+- Raw mode and ue0 mode send nothing until a frame from 192.168.7.1 came (ARP or IPv4: usblog's `settime`, its
+  keepalive, or any `op10tool ctl` command), then from byte 0. A failed send keeps its bytes. In a panic the old 10 s
+  fallback stays. `op10tool ctl log` resends all (head + ring).
+- Boot log: the negroni 0367 slot area at userdata block N-28673 (9216 blocks: superblock `NEGRBLOG`, 8 slots of one
+  header + 4 MiB ring; same structs, so `out/bin/op10tool bootlog` works unchanged). Self-check: the HFS+ volume header
+  (partition byte 1024) must end below the area ([I] root image 16 GiB = 4194304 blocks; userdata 110501 MiB, so the area
+  starts near partition block 28259583); then a write
+  gate opens for the area only (no ufsrw=1 needed). Negroni's second anchor (the WLAN area header) does not exist here.
+  Header: boot counter, state, SpringBoard mark, kernel UUID/version, boot-args, the PM6125 PON reasons of this
+  power-on (`gen2 pon=0x.. warm=0x....(..) poff=0x....(..) fault=0x.... off=0x.. s3=0x..`, why the previous boot
+  ended). Flush every 1 s for 5 min, then 5 s, wear budget, 30 s heartbeat. Panic: one polled write before the USB
+  panic hold (only if the UFS lock is free). Halt/restart and the USB reset/poweroff commands write the end state.
+  `/dev/laurelbootlog` (root, 0400) for `scripts/laurel/phone-ssh.sh bootlog`; `scripts/laurel/log-pull.sh` reads the
+  area over adb from another system. The topaz SWEETLOG area is written only when the boot log is off.
+- Lines: `LAUREL BOOTLOG: on: area at partition block N-28673 (9216 blocks, HFS+ ends at 4194304), new superblock;
+  boot 1 -> slot 0; PON gen2 pon=...` (first boot), later `... boot N -> slot M` + up to 3 `LAUREL BOOTLOG: earlier boot
+  ...` lines; `LAUREL BOOTLOG: boot N reached SpringBoard (pid P) T s after start`; `LAUREL BOOTLOG: off: <reason>`.
+  Kill switch `laurelbootlog=0`.
+
+### 2901 calendar (negroni 0203 + 0212)
+
+SweetPlatformExpert had no getUTCTimeOfDay: the calendar started at 1970. Now `bsd/dev/laurel_rtc.c`: PM6125 RTC_RW
+(SID 0, peripheral 0x60; qpnp-rtc ctrl 0x6046 bit 7, seconds 0x6048..0x604b) over the arbiter v5 observer channel of
+its own APID (trinket bases), never written; wall = RTC + offset; the offset of the last set (USB `settime`, timed,
+date) in `/private/var/db/laurel_rtc`, applied in bsd_init before launchd; floor = the kernel build date.
+Lines: `LAUREL CALENDAR: on: PM6125 RTC APID N, ctrl 0x80, counter C s; boot calendar ...` or `LAUREL CALENDAR: off:
+<reason> (...)`; `LAUREL CALENDAR: /private/var/db/laurel_rtc: no saved offset yet` (first boot); `LAUREL CTL: ok
+settime ...`. In raw mode usblog's settime gets `ok settime S (pending: set at the ue0 attach)` and the attach prints
+`LAUREL CTL: settime from raw mode: ok settime ...`. Kill switch `laurelrtc=0`; `laurelrtcoff=<s>`.
+
+### 2902-2906
+
+- 2902 (0204 bit 0): `DKIOCISSOLIDSTATE` = 1, line `LAUREL SSD: on: ...` at the HFS mount; `laurelssd=0`.
+- 2903 (0222 + 0386): privileges 1002/1007 (platform binaries) and 12000 (entitlement), sandbox extension ops 5/6;
+  line `LAUREL SANDBOX: privileges 1002/1007/12000 on, extension tokens on`, then `LAUREL SANDBOX: <proc> privilege N
+  granted (first grant)`; `laurelsandbox=0`, `laurelsbext=0`. Expected: the `privilege 1002/1007/12000 denied` lines and
+  tccd's ENOENT for op 5 go away; 10001/10003/1005/12001 stay denied (not in negroni either).
+- 2904 (0220 + 0221-aks-passcode): SweetKeyStore.cpp = the negroni AppleKeyStore (selectors 8/15/23/30/31/32/40/42/87/
+  100/105/115, "no passcode" lock state 0x6 / sls 3, quiet log, software keybag passcode). Line `LAUREL AKS:
+  AppleKeyStore registered (unlocked, lock state 0x6, key wrap on, passcode on)`. `laurelaks`, `laurelaks_reset=1`.
+- 2905 (0361 poll, 0382 USB, 0366 reset): poll 200 us while frames move, 4 ms idle, 20 ms without a host, TX queue 128,
+  ENDTRANSFER at bus reset. Line `LAUREL USB POLL: on: ...`; status line `LAUREL USB: ue0 rx .. tx .. frames, N polls`.
+  Old behaviour: `laurelusb_pollus=1000 laurelusb_idle_ms=1`, `laurelusb_resetend=0`.
+- 2906 (0399): wired guard for buffer IOSurfaces (55 % of max_mem, 65 % for backboardd/SpringBoard). Line `LAUREL WIRED:
+  on: ...` at the first surface; `laurelwiredguard=0`.
+- Not ported: 0288 PSCI cpuidle (below), the 0361 RX ring / TX batch, the 0366 soft-reconnect watchdog, the non-USB
+  parts of 0382 (display-dark polls of touch/keys/battery belong to those areas).
+
+0288 facts for a later port [V trinket-pm.dtsi]: trinket uses qcom,lpm-levels, not PSCI idle-states. CPU levels: C1 wfi
+(psci mode 0, residency 91 us), C3 "pc" (mode 3, is-reset, use-broadcast-timer, entry 290 / exit 376 / residency 1182
+us). Cluster (shift 4): D1 l2-wfi 1, D3G l2-gdhs 2, D3 l2-pc 4 (Silver residency 7376 us, Gold 8094 us). System (shift
+8): wfi 0, pc 3 (residency 15338 us). lpm-levels power_state = psci_id | is_reset << 30 | affinity << 24, so a CPU
+power collapse is CPU_SUSPEND 0x40000003. The C3 state stops the local timer: a broadcast timer (the MMIO frame of
+timer@f120000) must wake the core, and the resume path must re-init the GICR of the core (2015) and the Gold hand-off
+(2016) must stay valid for the boot CPU 0x100.
+
+### Host side
+
+- `out/bin/op10tool bootlog [N]` (USB, a good boot), `scripts/laurel/phone-ssh.sh bootlog` (SSH), `scripts/laurel/log-pull.sh
+  DIR` (adb from another system). `op10tool ctl log|time|settime|bootlog`.
+- SSH: `userland/ssh/build.sh` builds on Linux now (docs/usb-network.md "Build (Linux x86_64)"); `scripts/laurel/root.sh`
+  installs dropbear + tools when `out/ssh/ios` exists (SSH=0: none); `scripts/laurel/phone-ssh.sh` runs commands.

@@ -56,7 +56,7 @@ enum Cmd {
     },
     /// Extract the payload of an IM4P (raw or LZFSE)
     Im4p { input: PathBuf, output: PathBuf },
-    /// Command to the negroni kernel over USB Ethernet (UDP 5141): ping, reboot, bootloader, recovery, poweroff, panic, settime, time
+    /// Command to the negroni or Mi A3 kernel over USB Ethernet (UDP 5141): ping, reboot, bootloader, recovery, poweroff, panic, settime, time, log, bootlog
     Ctl {
         #[arg(value_enum)]
         command: ctl::Command,
@@ -64,9 +64,9 @@ enum Cmd {
         #[arg(long, default_value = "192.168.7.2")]
         host: String,
     },
-    /// Boot log of the last boots (kernel patch 0367): writes OUT/bootlog-<boot>.txt per boot and prints one
+    /// Boot log of the last boots (kernel patch 0367; Mi A3 2900): writes OUT/bootlog-<boot>.txt per boot and prints one
     /// summary line per boot (end: panic / reset without panic / clean / still running) and its last 5 lines.
-    /// Source: the USB command server (UDP 5141) or --file (dump of /dev/negronibootlog or of the area)
+    /// Source: the USB command server (UDP 5141) or --file (dump of /dev/negronibootlog, /dev/laurelbootlog or of the area)
     Bootlog {
         /// only the newest COUNT boots (default: every valid slot, at most 8)
         count: Option<usize>,

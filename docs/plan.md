@@ -560,3 +560,15 @@ dark, then back with a fade). Details: notes.md, same date, 04:40.
   /dev/redwood-haptic; expected line `LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)`. Test: Settings > Sounds &
   Haptics > Ringtone > Vibration preview. UI/keyboard taps wait for the RedwoodAudio plug-in + VirtualAudio in the root
   (docs/laurel_sprout/haptics.md).
+
+## Mi A3 area I: debug channel, calendar, generic negroni ports (2026-11-01 04:50) [built, not booted]
+
+Done [V build]: patches 2900 (console head buffer, live log from byte 0 after the host's first frame, `ctl log` = all,
+boot log area N-28673 in the negroni 0367 format with `bootlog`/`bootlog read` and /dev/laurelbootlog, panic + end marks),
+2901 (PM6125 RTC calendar, saved offset, USB `settime`/`time`), 2902 (UFS solid state), 2903 (sandbox privileges
+1002/1007/12000 + extension tokens), 2904 (negroni AppleKeyStore: missing selectors + software passcode), 2905 (USB poll
+200 us / 4 ms / 20 ms, TX queue 128, ENDTRANSFER at bus reset), 2906 (wired guard for IOSurfaces). Kernel 226 patches,
+applied=226, 0 LSE. Host: userland/ssh builds on Linux (fetch-sdk.sh + build.sh), root.sh installs SSH, phone-ssh.sh,
+log-pull.sh reads the boot log area, op10tool texts. Not done: 0288 cpuidle, 0361 ring, 0366 watchdog.
+Next (coordinator, phone): boot it; check the LAUREL BOOTLOG/CALENDAR/SANDBOX/AKS/USB POLL/WIRED/SSD lines and that the live
+log starts with the first kernel line; `op10tool bootlog`; rebuild the root with SSH and flash it (owner approval).

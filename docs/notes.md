@@ -3833,3 +3833,29 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   closed-loop only when the root has RedwoodAudio.driver + VirtualAudio.plugin: today it has neither [V root.sh, topaz
   sweet-root-tweaks.py moves VirtualAudio to HAL.disabled], so expect `LAUREL HAPTIC UI: off` and ringtone vibration only; UI and
   keyboard taps need the audio plug-in in the root. Built 04:26 (220 patches, 0 LSE, no new warnings). NOT BOOTED.
+
+## Mi A3 area I (kernel infra, debug channel, generic negroni ports) 2026-11-01 04:10-04:50
+
+Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected lines: docs/laurel_sprout/usb-debug.md
+"Patches 2900-2906"). All built (226 patches, 0 LSE), none booted.
+- [V code] Cause of the missing early lines in the live log: raw frames were sent after a 10 s wait also without a sign of
+  the host (the host has no 192.168.7.1 yet: dropped), the ue0 thread started at the last 64 KiB, and a failed `sock_send`
+  lost its chunk. Fix 2900: wait for any frame from 192.168.7.1, start at byte 0, keep the bytes on a failed send, 1 MiB
+  head buffer, `ctl log` = everything.
+- [V code] Boot log = negroni 0367 layout at userdata N-28673, so `op10tool bootlog` needs no change. Its only safety
+  check on the Mi A3 is the HFS+ volume end (no WLAN area anchor as on negroni). The superblock is written at the first
+  boot with 2900 (8 slot headers zeroed): the area lies about 92 GiB behind the 16 GiB root, inside userdata only.
+- [V code] SweetPlatformExpert had no getUTCTimeOfDay: the calendar was the epoch + uptime until timed set it. 2901 reads the
+  PM6125 RTC (PPID 0x060, observer channel) and keeps an offset file /private/var/db/laurel_rtc.
+- [V log 03:58/03:59] Sandbox denials on the Mi A3: 1002 (logd, cloudd, healthd, rapportd, aggregated, symptomsd),
+  1007 SpringBoard, 12000/12001 identityservicesd + rapportd, 10001 cloudd/dasd/kernel_task, 10003 symptomsd, 1005 dasd;
+  tccd op 5. 2903 grants 1002/1007/12000 and ops 5/6 (the negroni set); the others stay denied.
+- [V build] The SSH userland builds on Linux: stock clang + theos ld64/ldid + theos/sdks iPhoneOS16.5 (pinned). Pitfalls:
+  toybox uses `--gc-sections` when the build host is not Darwin; GNU ar archives are ignored by ld64; the theos cctools
+  `ar` calls a missing `aarch64-apple-darwin14-ranlib` (use theos llvm-ar/llvm-ranlib).
+- [I] 0288 cpuidle not ported: trinket lpm-levels C3 = CPU_SUSPEND 0x40000003, needs a broadcast timer and a GICR
+  re-init on resume; too risky without a boot test (facts in usb-debug.md).
+- Phone needs (coordinator): one boot of the 2900-2906 kernel with usblog running; check the lines listed in
+  usb-debug.md; `op10tool ctl time`, `op10tool bootlog`; reboot once with `op10tool ctl reboot` and check the
+  `earlier boot 1 (slot 0): restart` line; for SSH: a root rebuilt with `scripts/laurel/root.sh` (out/ssh/ios present)
+  and flashed (owner approval: userdata), then `scripts/laurel/phone-ssh.sh 'uname -a'`.

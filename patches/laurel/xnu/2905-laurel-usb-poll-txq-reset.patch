@@ -1,0 +1,211 @@
+laurel 2905: USB poll period, TX queue, ENDTRANSFER at bus reset (ports of the poll part of negroni 0361, the USB
+part of 0382 and the reset part of 0366).
+
+- ud_thread polled every 1 ms with the default timer leeway: one frame per poll and direction (about 1 MB/s).
+  Now: frames in the last 2 s or a TX in flight/queued: every laurelusb_pollus (200 us, no leeway);
+  configured and idle: laurelusb_idle_ms (4 ms); no host configured: laurelusb_nohost_ms (20 ms). Every
+  controller event and every queued frame (ud_if_output wakes the thread) returns to the fast poll. Raw mode
+  (before the ue0 attach) and the timer-call service keep 1 ms.
+- TX queue 32 -> 128 frames (a full queue drops frames and TCP backs off).
+- Bus reset: ENDTRANSFER + FORCERM on every active data transfer (RX, TX, notification) before the data
+  endpoints go off (Linux dwc3_stop_active_transfers). Kill switch laurelusb_resetend=0. (The 0282 part, data
+  endpoints dropped until SET_CONFIGURATION, was already in laurel 2005.)
+- Status line counts polls; line "LAUREL USB POLL: on: 200 us while frames move, 4 ms idle, 20 ms without a host,
+  TX queue 128, ENDTRANSFER at bus reset on". The old poll: laurelusb_pollus=1000 laurelusb_idle_ms=1.
+- Not ported: the 0361 RX ring / TX batch (new DMA layout) and the 0366 soft-reconnect watchdog.
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fa15013..234f4fb 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -272,7 +272,7 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, laurel_usb_early_start);
+ #define EP_INT          5               /* 0x82 interrupt IN */
+ #define TRBCTL_NORMAL   (1u << 4)
+ 
+-#define UD_TXQ          32
++#define UD_TXQ          128             /* laurel 2905 (negroni 0361): was 32; a full queue drops frames, TCP backs off */
+ 
+ static struct {
+ 	vm_offset_t dwc;
+@@ -292,6 +292,10 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	/* laurel 2905: poll period and data transfers (negroni 0361/0366/0382) */
++	uint64_t    last_active;    /* mach time of the last frame, event or queued TX */
++	bool        ep_busy[6];     /* STARTTRANSFER issued, no XferComplete or ENDTRANSFER since */
++	uint32_t    ep_rsc[6];      /* its transfer resource index (ENDTRANSFER) */
+ 	/* command server (UDP 5141), used by ud_thread only */
+ 	bool        ctl_enabled;
+ 	int         ctl_action;
+@@ -299,6 +303,26 @@ static struct {
+ 	uint16_t    ctl_ip_id;
+ } ud;
+ static int  ud_panic_enabled = 1;       /* boot-arg laurelpanicusb */
++/*
++ * laurel 2905 (negroni 0361 poll part, 0382 USB part, 0366 reset part). ud_thread
++ * served the controller every 1 ms with the default timer leeway (often several
++ * ms): one frame per poll and direction, about 1 MB/s. Now:
++ *   frames moved in the last 2 s, a TX in flight or queued: poll every
++ *     laurelusb_pollus us (default 200), no leeway;
++ *   configured, idle: every laurelusb_idle_ms (default 4); not configured
++ *     (no host): every laurelusb_nohost_ms (default 20); any controller event
++ *     or a frame we queue (ud_if_output wakes the thread) goes back to the fast poll;
++ *   raw mode (before the ue0 attach): 1 ms as before.
++ * Bus reset: ENDTRANSFER (FORCERM) on every active data transfer before the
++ * data endpoints go off (Linux dwc3_stop_active_transfers), kill switch
++ * laurelusb_resetend=0. laurelusb_pollus=1000 laurelusb_idle_ms=1 = the old poll.
++ * The RX ring / TX batch of 0361 and the soft-reconnect watchdog of 0366 are not ported.
++ */
++static int  ud_poll_us = 200;
++static int  ud_idle_ms = 4;
++static int  ud_nohost_ms = 20;
++static int  ud_reset_end = 1;
++static int  ud_poll_chan;               /* ud_thread's poll sleep (ud_if_output wakes it) */
+ static bool ud_running;                 /* gadget set up (event buffer, ep0) */
+ 
+ static inline void
+@@ -329,6 +353,17 @@ ud_sleep_ms(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/* laurel 2905: ud_thread's poll sleep, without timer coalescing (the default leeway stretches short sleeps). */
++static void
++ud_poll_sleep_us(unsigned us)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(us, NSEC_PER_USEC, &deadline);
++	(void)assert_wait_deadline_with_leeway(&ud_poll_chan, THREAD_UNINT,
++	    TIMEOUT_URGENCY_SYS_CRITICAL | TIMEOUT_URGENCY_LEEWAY, deadline, 0);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ /* delay() waits with WFE (or blocks the thread); in panic mode spin on the counter instead. */
+ static void
+ ud_udelay(uint32_t us)
+@@ -383,7 +418,10 @@ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0 && ep >= 2 && ep < 6) {
++		ud.ep_busy[ep] = true;          /* laurel 2905: for the ENDTRANSFER at a bus reset */
++		ud.ep_rsc[ep] = (dwc_rd(DEPCMD(ep)) >> 16) & 0x7f;
++	}
+ }
+ 
+ static void
+@@ -873,6 +911,7 @@ ud_rx_done(void)
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
++	ud.last_active = mach_absolute_time();          /* laurel 2905 */
+ 	if (ud_in_panic || ud_early) {
+ 		/* no network stack in panic mode or before bsd_init: ARP and the command server by hand */
+ 		if (len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+@@ -955,7 +994,9 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ 	ud.txq[(ud.txq_head + ud.txq_count) % UD_TXQ] = m;
+ 	ud.txq_count++;
+ 	ud_tx_kick_locked();
++	ud.last_active = mach_absolute_time();          /* laurel 2905: fast poll for the completion */
+ 	lck_mtx_unlock(ud.lock);
++	thread_wakeup(&ud_poll_chan);
+ 	return 0;
+ }
+ 
+@@ -1973,6 +2014,20 @@ ud_event(uint32_t ev)
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
++			/*
++			 * laurel 2905 (negroni 0366): end every active data transfer first
++			 * (ENDTRANSFER + FORCERM, then 1 ms as Linux dwc3), so no stale TRB
++			 * of the old session stays with the controller.
++			 */
++			static const unsigned data_eps[3] = { EP_RX, EP_TX, EP_INT };
++			for (unsigned i = 0; i < 3 && ud_reset_end; i++) {
++				unsigned e = data_eps[i];
++				if (ud.ep_busy[e]) {
++					(void)ud_epcmd(e, 8u /* ENDTRANSFER */ | (1u << 11) /* FORCERM */ | (ud.ep_rsc[e] << 16), 0, 0, 0);
++					ud.ep_busy[e] = false;
++					ud_udelay(1000);
++				}
++			}
+ 			/* laurel: the host re-enumerates: data endpoints off until SET_CONFIGURATION */
+ 			dwc_wr(DALEPENA, 0x3);
+ 			if (!ud_nolock()) {
+@@ -2002,6 +2057,10 @@ ud_event(uint32_t ev)
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (type == 1 && ep >= 2 && ep < 6) {
++		ud.ep_busy[ep] = false;         /* laurel 2905: XferComplete ends the transfer */
++	}
++
+ 	if (ep == EP_RX && type == 1) {
+ 		ud_rx_done();
+ 		return;
+@@ -2057,6 +2116,9 @@ static void
+ ud_service_events(void)
+ {
+ 	uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++	if (count) {
++		ud.last_active = mach_absolute_time();  /* laurel 2905 */
++	}
+ 	if (count > UD_EVT_SIZE) {
+ 		count = UD_EVT_SIZE;
+ 	}
+@@ -2175,6 +2237,20 @@ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t ticks = 0;
++	uint64_t t0 = mach_absolute_time(), sec, recent, next_nohost, next_stat;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec);
++	recent = 2 * sec;
++	next_nohost = t0 + 10 * sec;
++	next_stat = t0 + 30 * sec;
++	PE_parse_boot_argn("laurelusb_pollus", &ud_poll_us, sizeof(ud_poll_us));
++	PE_parse_boot_argn("laurelusb_idle_ms", &ud_idle_ms, sizeof(ud_idle_ms));
++	PE_parse_boot_argn("laurelusb_nohost_ms", &ud_nohost_ms, sizeof(ud_nohost_ms));
++	PE_parse_boot_argn("laurelusb_resetend", &ud_reset_end, sizeof(ud_reset_end));
++	ud_poll_us = MAX(50, MIN(ud_poll_us, 1000));
++	ud_idle_ms = MAX(1, MIN(ud_idle_ms, 50));
++	ud_nohost_ms = MAX(1, MIN(ud_nohost_ms, 100));
++	printf("LAUREL USB POLL: on: %d us while frames move, %d ms idle, %d ms without a host, TX queue %u, "
++	    "ENDTRANSFER at bus reset %s\n", ud_poll_us, ud_idle_ms, ud_nohost_ms, UD_TXQ, ud_reset_end ? "on" : "off");
+ 	for (;;) {
+ 		if (ud_in_panic) {              /* the panic CPU owns the controller now */
+ 			ud_sleep_ms(1000);
+@@ -2191,15 +2267,26 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 			ud_ctl_poll();
+ 		}
+ 		++ticks;
+-		if (!ud.configured && (ticks % 10000) == 0) {
++		uint64_t now = mach_absolute_time();
++		if (!ud.configured && now >= next_nohost) {
+ 			/* one line per 10 s until the host configures the gadget: the panel shows where it stops */
++			next_nohost = now + 10 * sec;
+ 			uint32_t dsts = dwc_rd(DSTS);
+-			printf("LAUREL USB: no host yet (%u s): DSTS 0x%08x link %u speed %u events %u%s, timer ticks %llu\n",
+-			    ticks / 1000, dsts, (dsts >> 18) & 0xf, dsts & 7, ud.events, ud_early ? ", raw mode" : "", ud_tc_ticks);
+-		} else if (ud.configured && (ticks % 30000) == 0) {
+-			printf("LAUREL USB: %s rx %llu tx %llu frames\n", ud_early ? "raw" : "ue0", ud.rx_frames, ud.tx_frames);
++			printf("LAUREL USB: no host yet (%llu s): DSTS 0x%08x link %u speed %u events %u%s, timer ticks %llu\n",
++			    (now - t0) / sec, dsts, (dsts >> 18) & 0xf, dsts & 7, ud.events, ud_early ? ", raw mode" : "", ud_tc_ticks);
++		} else if (ud.configured && now >= next_stat) {
++			next_stat = now + 30 * sec;
++			printf("LAUREL USB: %s rx %llu tx %llu frames, %u polls\n", ud_early ? "raw" : "ue0", ud.rx_frames,
++			    ud.tx_frames, ticks);
++		}
++		/* laurel 2905: the poll period */
++		if (ud_tc_mode || ud_early) {
++			ud_sleep_ms(1);
++		} else if (ud.tx_busy || ud.txq_count > 0 || now - ud.last_active < recent) {
++			ud_poll_sleep_us((unsigned)ud_poll_us);
++		} else {
++			ud_poll_sleep_us((unsigned)(ud.configured ? ud_idle_ms : ud_nohost_ms) * 1000u);
+ 		}
+-		ud_sleep_ms(1);
+ 	}
+ }
+ 
