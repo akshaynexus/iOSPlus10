@@ -1,0 +1,500 @@
+laurel 2007: the kernel powers the USB block up itself (usb30_prim GDSC, RCGs 133 MHz/19.2 MHz, 7 branch clocks, USB30_PRIM_BCR), QUSB2 PHY init (trinket init sequence, QFPROM TUNE2, PLL lock check), QSCRATCH UTMI-as-pipe clock and GCTL/GUSB2PHYCFG device setup when ABL left the controller off (plain boot from boot_b: no fastboot session); warm path (fastboot continue/boot) unchanged + PHY init when powered down. One "LAUREL USB:" line per stage, a line every 10 s until the host configures the gadget, the off reason printed again from bsd_init, ue0 attached from a kernel thread (bsd_init never waits).
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -144,74 +144,6 @@
+ 	return v;
+ }
+ 
+-static void
+-laurel_usb_early_start(void)
+-{
+-	int enabled = 1;
+-	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+-	bool clocks_on = true;
+-
+-	/* laurelusb=0: kill switch. Default on; the self-check below decides. */
+-	PE_parse_boot_argn("laurelusb", &enabled, sizeof(enabled));
+-	if (!enabled) {
+-		printf("LAUREL USB: off: laurelusb=0\n");
+-		return;
+-	}
+-	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+-	if (gcc == 0) {
+-		printf("LAUREL USB: off: GCC 0x%x not mapped\n", GCC_PA);
+-		return;
+-	}
+-	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+-	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+-	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+-		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
+-		printf("SWEET USB: clk %-12s CBCR 0x%08x (%s)\n", usb_cbcr[i].name, cbcr[i],
+-		    (cbcr[i] & CBCR_CLK_OFF) ? "off" : "on");
+-	}
+-	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
+-	clocks_on = (gdscr & (1u << 31)) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
+-	if (!clocks_on) {
+-		printf("LAUREL USB: off: controller unpowered or unclocked (GDSC 0x%08x master 0x%08x cfg-noc 0x%08x)\n",
+-		    gdscr, cbcr[0], cbcr[3]);
+-		return;
+-	}
+-	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+-	if (dwc == 0) {
+-		printf("LAUREL USB: off: DWC3 0x%x not mapped\n", DWC3_PA);
+-		return;
+-	}
+-	if ((usb_rd(dwc, 0xc120) & 0xffff0000) != DWC3_GSNPSID_MAGIC) {
+-		printf("LAUREL USB: off: no DWC3 at 0x%x (GSNPSID 0x%08x)\n", DWC3_PA, usb_rd(dwc, 0xc120));
+-		return;
+-	}
+-	if (usb_rd(dwc, 0xc110) & (1u << 12)) {   /* GCTL.PrtCapDir bit 12 set = host mode (1 host, 2 device) */
+-		printf("LAUREL USB: off: controller left in host mode (GCTL 0x%08x)\n", usb_rd(dwc, 0xc110));
+-		return;
+-	}
+-	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
+-	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
+-	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+-	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
+-	    usb_rd(dwc, 0xc720));
+-	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+-	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+-	    usb_rd(dwc, 0xc140));
+-	sweet_usb_gadget_start(dwc);
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+-	if (phy == 0) {
+-		return;
+-	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
+-}
+ /* kernel_bootstrap_thread, just before interrupts go on: before IOKit matching ends and bsd_init */
+ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, laurel_usb_early_start);
+ 
+@@ -593,6 +525,296 @@
+ 	}
+ }
+ 
++/*
++ * Patch 2007: the kernel powers the USB block up itself. The Mi A3 boots
++ * from boot_b after a full reset, so ABL never ran fastboot on this
++ * controller and leaves the usb30_prim GDSC and clocks off (the topaz
++ * phone always came from `fastboot boot`, which leaves them on). Cold
++ * path (GDSC or master clock off): GDSC on, RCGs (master GPLL0/4.5 =
++ * 133 MHz, mock UTMI XO 19.2 MHz), the 7 branch clocks, USB30_PRIM_BCR
++ * reset, QUSB2 PHY init (trinket-usb.dtsi qcom,qusb-phy-init-seq, TUNE2
++ * high nibble from the QFPROM, phy-msm-qusb.c), QSCRATCH UTMI-as-pipe
++ * clock (no SS PHY, dwc3-qcom.c), GCTL device mode + GUSB2PHYCFG UTMI
++ * 8-bit (dwc3 core.c). Warm path (fastboot `continue`/`boot`): as before,
++ * plus the PHY init when the PHY is powered down. Every stage prints one
++ * "LAUREL USB:" line; ud_thread prints one line every 10 s until the host
++ * configures the gadget, so the panel shows where it stops.
++ * GCC offsets: gcc-sm6125.c; PHY registers: QUSB2 v1 layout (PLL_STATUS
++ * 0x38, TUNE1-5 0x80-0x90, TEST2 0x9c, POWERDOWN 0xb4).
++ */
++#define GDSCR_PWR_ON            (1u << 31)
++#define GDSCR_SW_COLLAPSE       (1u << 0)
++#define GCC_USB30_PRIM_BCR      0x1a000
++#define GCC_QUSB2PHY_PRIM_BCR   0x1c000
++#define GCC_USB30_MASTER_CMD    0x1a01c         /* RCG: CMD_RCGR, CFG_RCGR at +4 */
++#define GCC_USB30_UTMI_CMD      0x1a034
++#define RCG_CMD_UPDATE          (1u << 0)
++#define RCG_CMD_ROOT_EN         (1u << 1)
++#define TCSR_USB_CLAMP_PA       0x003cb250      /* tcsr_clamp_dig_n_1p8 */
++#define QFPROM_TUNE2_PA         0x01b44258      /* TUNE2 high nibble: bits 28:25 */
++#define QUSB2_PLL_STATUS        0x38            /* bit 5: PLL locked */
++#define QUSB2_PORT_TUNE1        0x80
++#define QUSB2_PORT_TUNE2        0x84
++#define QUSB2_PORT_POWERDOWN    0xb4            /* 0x20 CLAMP_N_EN, 0x02 FREEZIO_N, 0x01 POWER_DOWN */
++#define QSCRATCH_GENERAL_CFG    0x08
++#define   PIPE_UTMI_CLK_SEL     (1u << 0)
++#define   PIPE3_PHYSTATUS_SW    (1u << 3)
++#define   PIPE_UTMI_CLK_DIS     (1u << 8)
++#define QSCRATCH_CGCTL          0x28
++#define GUSB2PHYCFG             0xc200
++
++static char ud_off_reason[128];         /* why the gadget is off; printed again from bsd_init */
++static bool ud_cold;                    /* the kernel powered the block up (ABL fastboot did not run) */
++static vm_offset_t ud_qs;               /* QSCRATCH */
++
++static void ud_off(const char *fmt, ...) __printflike(1, 2);
++static void
++ud_off(const char *fmt, ...)
++{
++	va_list ap;
++
++	va_start(ap, fmt);
++	vsnprintf(ud_off_reason, sizeof(ud_off_reason), fmt, ap);
++	va_end(ap);
++	printf("LAUREL USB: off: %s\n", ud_off_reason);
++}
++
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* One GCC branch clock: CBCR bit 0 on, wait until CLK_OFF (bit 31) clears. */
++static bool
++gcc_branch_on(vm_offset_t gcc, uint32_t off)
++{
++	usb_wr(gcc, off, usb_rd(gcc, off) | 1u);
++	for (int i = 0; i < 1000; i++) {
++		if (!(usb_rd(gcc, off) & CBCR_CLK_OFF)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* One RCG: root on, CFG = source select + pre-divider (2*div-1), update and wait. */
++static bool
++gcc_rcg_set(vm_offset_t gcc, uint32_t cmd, uint32_t src, uint32_t prediv)
++{
++	usb_wr(gcc, cmd, usb_rd(gcc, cmd) | RCG_CMD_ROOT_EN);
++	usb_wr(gcc, cmd + 4, (src << 8) | prediv);
++	usb_wr(gcc, cmd, usb_rd(gcc, cmd) | RCG_CMD_UPDATE);
++	for (int i = 0; i < 1000; i++) {
++		if (!(usb_rd(gcc, cmd) & RCG_CMD_UPDATE)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* Cold path: GDSC, clocks and the block reset. false: off, reason printed. */
++static bool
++ud_power_up(vm_offset_t gcc)
++{
++	uint32_t v = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	int i;
++
++	if (!(v & GDSCR_PWR_ON)) {
++		usb_wr(gcc, GCC_USB30_PRIM_GDSCR, v & ~GDSCR_SW_COLLAPSE);
++		for (i = 0; i < 2000 && !(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & GDSCR_PWR_ON); i++) {
++			delay(1);
++		}
++		if (!(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & GDSCR_PWR_ON)) {
++			ud_off("GDSC usb30_prim did not power on (GDSCR 0x%08x)", usb_rd(gcc, GCC_USB30_PRIM_GDSCR));
++			return false;
++		}
++		delay(1);
++	}
++	/* master: GPLL0 600 MHz / 4.5 = 133.33 MHz (sel 1, pre-div 8); mock UTMI: XO 19.2 MHz (sel 0, div 1) */
++	if (!gcc_rcg_set(gcc, GCC_USB30_MASTER_CMD, 1, 8)) {
++		ud_off("master clock RCG did not update (CMD 0x%08x)", usb_rd(gcc, GCC_USB30_MASTER_CMD));
++		return false;
++	}
++	if (!gcc_rcg_set(gcc, GCC_USB30_UTMI_CMD, 0, 1)) {
++		ud_off("utmi clock RCG did not update (CMD 0x%08x)", usb_rd(gcc, GCC_USB30_UTMI_CMD));
++		return false;
++	}
++	static const unsigned order[] = { 3, 4, 0, 1, 2, 6, 5 };   /* cfg-noc, sys-noc, master, sleep, utmi, clkref, ahb2phy */
++	for (i = 0; i < (int)(sizeof(order) / sizeof(order[0])); i++) {
++		unsigned k = order[i];
++		if (!gcc_branch_on(gcc, usb_cbcr[k].off)) {
++			ud_off("clock %s did not start (CBCR 0x%08x)", usb_cbcr[k].name, usb_rd(gcc, usb_cbcr[k].off));
++			return false;
++		}
++	}
++	/* block reset under running clocks (dwc3-qcom.c: assert, 10 us, deassert) */
++	usb_wr(gcc, GCC_USB30_PRIM_BCR, 1);
++	delay(10);
++	usb_wr(gcc, GCC_USB30_PRIM_BCR, 0);
++	delay(10);
++	printf("LAUREL USB: power: GDSC 0x%08x, clocks master 0x%08x utmi 0x%08x sleep 0x%08x cfg-noc 0x%08x "
++	    "sys-noc 0x%08x ahb2phy 0x%08x clkref 0x%08x, block reset done\n",
++	    usb_rd(gcc, GCC_USB30_PRIM_GDSCR), usb_rd(gcc, usb_cbcr[0].off), usb_rd(gcc, usb_cbcr[2].off),
++	    usb_rd(gcc, usb_cbcr[1].off), usb_rd(gcc, usb_cbcr[3].off), usb_rd(gcc, usb_cbcr[4].off),
++	    usb_rd(gcc, usb_cbcr[5].off), usb_rd(gcc, usb_cbcr[6].off));
++	return true;
++}
++
++/*
++ * QUSB2 PHY init (phy-msm-qusb.c qusb_phy_init, major-rev 1, cmos = single-
++ * ended reference clock): clamp release, PHY reset, power down, the init
++ * sequence of trinket-usb.dtsi, TUNE2 high nibble from the QFPROM, power
++ * up, PLL lock check.
++ */
++static void
++ud_phy_init(vm_offset_t gcc, vm_offset_t phy)
++{
++	static const struct { uint8_t off, val; } seq[] = {
++		{ 0x80, 0xf8 }, { 0x84, 0xb3 }, { 0x88, 0x81 }, { 0x8c, 0xc0 },  /* TUNE1-4 */
++		{ 0x08, 0x30 }, { 0x0c, 0x79 }, { 0x10, 0x21 },                  /* PLL_TUNE, PLL_USER_CTL1/2 */
++		{ 0x9c, 0x14 }, { 0x04, 0x80 },                                  /* TEST2, PLL_TEST (CLK_REF_SEL: SE) */
++		{ 0x1c, 0x9f }, { 0x18, 0x00 },                                  /* PLL_AUTOPGM_CTL1, PLL_PWR_CTL */
++	};
++	vm_offset_t tcsr = ml_io_map(TCSR_USB_CLAMP_PA & ~0xfffu, 0x1000);
++	vm_offset_t qf = ml_io_map(QFPROM_TUNE2_PA & ~0xfffu, 0x1000);
++	uint32_t clamp = 0xffffffff, nib = 0;
++
++	if (tcsr != 0) {
++		clamp = usb_rd(tcsr, TCSR_USB_CLAMP_PA & 0xfffu);
++		usb_wr(tcsr, TCSR_USB_CLAMP_PA & 0xfffu, 1);
++	}
++	usb_wr(gcc, GCC_QUSB2PHY_PRIM_BCR, 1);
++	delay(100);
++	usb_wr(gcc, GCC_QUSB2PHY_PRIM_BCR, 0);
++	usb_wr(phy, QUSB2_PORT_POWERDOWN, 0x23);                /* CLAMP_N_EN | FREEZIO_N | POWER_DOWN */
++	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
++		usb_wr(phy, seq[i].off, seq[i].val);
++	}
++	if (qf != 0) {
++		nib = (usb_rd(qf, QFPROM_TUNE2_PA & 0xfffu) >> 25) & 0xf;
++		if (nib != 0) {
++			usb_wr(phy, QUSB2_PORT_TUNE2, (usb_rd(phy, QUSB2_PORT_TUNE2) & 0x0f) | (nib << 4));
++		}
++	}
++	usb_wr(phy, QUSB2_PORT_POWERDOWN, 0x22);                /* CLAMP_N_EN | FREEZIO_N: on */
++	delay(150);
++	delay(100);
++	uint32_t st = usb_rd(phy, QUSB2_PLL_STATUS);
++	printf("LAUREL USB: PHY init: PLL %s (status 0x%02x), TUNE1-4 %02x %02x %02x %02x (efuse nibble %u), "
++	    "clamp was 0x%x, POWERDOWN 0x%02x\n", (st & 0x20) ? "locked" : "NOT locked", st,
++	    usb_rd(phy, 0x80), usb_rd(phy, 0x84), usb_rd(phy, 0x88), usb_rd(phy, 0x8c), nib, clamp,
++	    usb_rd(phy, QUSB2_PORT_POWERDOWN));
++}
++
++/* No SS PHY: the controller takes the UTMI clock as its pipe clock (dwc3-qcom.c, dwc3-msm.c). */
++static void
++ud_qscratch_cfg(void)
++{
++	usb_wr(ud_qs, QSCRATCH_CGCTL, usb_rd(ud_qs, QSCRATCH_CGCTL) | 0x18);   /* RAM clocks on */
++	usb_wr(ud_qs, QSCRATCH_GENERAL_CFG, usb_rd(ud_qs, QSCRATCH_GENERAL_CFG) | PIPE_UTMI_CLK_DIS);
++	delay(5);
++	usb_wr(ud_qs, QSCRATCH_GENERAL_CFG, usb_rd(ud_qs, QSCRATCH_GENERAL_CFG) | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
++	delay(5);
++	usb_wr(ud_qs, QSCRATCH_GENERAL_CFG, usb_rd(ud_qs, QSCRATCH_GENERAL_CFG) & ~PIPE_UTMI_CLK_DIS);
++}
++
++/* After the device soft reset: UTMI 8-bit PHY interface, no PHY suspend; device mode, no clock gating. */
++static void
++ud_core_cfg(void)
++{
++	uint32_t p = usb_rd(ud.dwc, GUSB2PHYCFG);
++	p &= ~((1u << 4) | (1u << 3) | (0xfu << 10) | (1u << 6) | (1u << 8));   /* UTMI, 8-bit, TRDTIM, SUSPHY, ENBLSLPM */
++	p |= 9u << 10;
++	usb_wr(ud.dwc, GUSB2PHYCFG, p);
++	uint32_t g = usb_rd(ud.dwc, GCTL);
++	g &= ~((3u << 4) | (1u << 3) | (3u << 12));                            /* SCALEDOWN, DISSCRAMBLE, PRTCAPDIR */
++	g |= (2u << 12) | (1u << 16) | 1u;                                     /* device, U2RSTECN, DSBLCLKGTNG */
++	usb_wr(ud.dwc, GCTL, g);
++	printf("LAUREL USB: core: GCTL 0x%08x GUSB2PHYCFG 0x%08x GENERAL_CFG 0x%08x\n",
++	    usb_rd(ud.dwc, GCTL), usb_rd(ud.dwc, GUSB2PHYCFG), usb_rd(ud_qs, QSCRATCH_GENERAL_CFG));
++}
++
++static void
++laurel_usb_early_start(void)
++{
++	int enabled = 1;
++	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
++
++	/* laurelusb=0: kill switch. Default on; the self-check below decides. */
++	PE_parse_boot_argn("laurelusb", &enabled, sizeof(enabled));
++	if (!enabled) {
++		ud_off("laurelusb=0");
++		return;
++	}
++	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	if (gcc == 0) {
++		ud_off("GCC 0x%x not mapped", GCC_PA);
++		return;
++	}
++	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++		cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
++	}
++	printf("LAUREL USB: at start: GDSC 0x%08x (%s), clocks master 0x%08x sleep 0x%08x utmi 0x%08x "
++	    "cfg-noc 0x%08x sys-noc 0x%08x ahb2phy 0x%08x clkref 0x%08x\n", gdscr,
++	    (gdscr & GDSCR_PWR_ON) ? "on" : "off", cbcr[0], cbcr[1], cbcr[2], cbcr[3], cbcr[4], cbcr[5], cbcr[6]);
++	/* DWC3 registers need the GDSC, the master clock and the config-NoC path. */
++	bool warm = (gdscr & GDSCR_PWR_ON) && !(cbcr[0] & CBCR_CLK_OFF) && !(cbcr[3] & CBCR_CLK_OFF);
++	if (warm) {
++		printf("LAUREL USB: power: controller on as ABL left it (fastboot session before the boot)\n");
++	} else {
++		printf("LAUREL USB: power: controller off (plain boot): the kernel powers it up\n");
++		if (!ud_power_up(gcc)) {
++			return;
++		}
++		ud_cold = true;
++	}
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	if (dwc == 0) {
++		ud_off("DWC3 0x%x not mapped", DWC3_PA);
++		return;
++	}
++	if ((usb_rd(dwc, 0xc120) & 0xffff0000) != DWC3_GSNPSID_MAGIC) {
++		ud_off("no DWC3 at 0x%x (GSNPSID 0x%08x)", DWC3_PA, usb_rd(dwc, 0xc120));
++		return;
++	}
++	if (warm && (usb_rd(dwc, 0xc110) & (1u << 12))) {   /* GCTL.PrtCapDir bit 12 set = host mode (1 host, 2 device) */
++		ud_off("controller left in host mode (GCTL 0x%08x)", usb_rd(dwc, 0xc110));
++		return;
++	}
++	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
++	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
++	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
++	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
++	    usb_rd(dwc, 0xc720));
++	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
++	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
++	    usb_rd(dwc, 0xc140));
++	ud_qs = ml_io_map(QSCRATCH_PA, 0x100);
++	if (ud_qs == 0) {
++		ud_off("QSCRATCH 0x%x not mapped", QSCRATCH_PA);
++		return;
++	}
++	/* The PHY: alive after a fastboot session; powered down or in reset after a plain boot. */
++	vm_offset_t phy = (usb_rd(gcc, usb_cbcr[5].off) & CBCR_CLK_OFF) ? 0 : ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	if (phy == 0) {
++		ud_off("QUSB2 PHY not reachable (ahb2phy CBCR 0x%08x)", usb_rd(gcc, usb_cbcr[5].off));
++		return;
++	}
++	uint32_t pd = usb_rd(phy, QUSB2_PORT_POWERDOWN), st = usb_rd(phy, QUSB2_PLL_STATUS);
++	printf("LAUREL USB: PHY at start: POWERDOWN 0x%02x PLL_STATUS 0x%02x TUNE1-4 %02x %02x %02x %02x\n",
++	    pd, st, usb_rd(phy, 0x80), usb_rd(phy, 0x84), usb_rd(phy, 0x88), usb_rd(phy, 0x8c));
++	if (ud_cold || (pd & 1u)) {
++		ud_phy_init(gcc, phy);
++	} else {
++		printf("LAUREL USB: PHY: kept as ABL left it (PLL %s)\n", (st & 0x20) ? "locked" : "not locked");
++	}
++	sweet_usb_gadget_start(dwc);
++}
+ /* ---- network interface (ue0) ---- */
+ 
+ static void
+@@ -1623,8 +1845,14 @@
+ 			ud_raw_action(action);
+ 		}
+ 		ud_ctl_poll();
+-		if ((++ticks % 30000) == 0) {
+-			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
++		++ticks;
++		if (!ud.configured && (ticks % 10000) == 0) {
++			/* one line per 10 s until the host configures the gadget: the panel shows where it stops */
++			uint32_t dsts = dwc_rd(DSTS);
++			printf("LAUREL USB: no host yet (%u s): DSTS 0x%08x link %u speed %u events %u%s\n",
++			    ticks / 1000, dsts, (dsts >> 18) & 0xf, dsts & 7, ud.events, ud_early ? ", raw mode" : "");
++		} else if (ud.configured && (ticks % 30000) == 0) {
++			printf("LAUREL USB: %s rx %llu tx %llu frames\n", ud_early ? "raw" : "ue0", ud.rx_frames, ud.tx_frames);
+ 		}
+ 		ud_sleep_ms(1);
+ 	}
+@@ -1696,11 +1924,12 @@
+ 	ud.dwc = dwc;
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET USB: no DMA memory\n");
++		ud_off("no DMA memory");
+ 		return;
+ 	}
+ 	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+ 	if (!pn) {
++		ud_off("DMA memory has no physical page");
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+@@ -1708,8 +1937,11 @@
+ 	grp = lck_grp_alloc_init("sweet_usb", LCK_GRP_ATTR_NULL);
+ 	ud.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+-	dwc_wr(DCTL, DCTL_CSFTRST);
++	if (ud_cold) {
++		ud_qscratch_cfg();      /* before the soft reset: the core needs a pipe clock to leave it */
++	}
++	/* Device controller soft reset (warm: PHY and global setup stay as ABL left them). */
++	dwc_wr(DCTL, DCTL_CSFTRST | (dwc_rd(DCTL) & ~DCTL_RUN_STOP));
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+ 		delay(1000);
+@@ -1717,8 +1949,12 @@
+ 	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+ 	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++		ud_off("device soft reset stuck (DCTL 0x%08x)", dwc_rd(DCTL));
+ 		return;
+ 	}
++	if (ud_cold) {
++		ud_core_cfg();
++	}
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+@@ -1738,13 +1974,13 @@
+ 	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
+ 	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+ 	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+-		printf("SWEET USB: endpoint 0 setup failed\n");
++		ud_off("endpoint 0 setup failed");
+ 		return;
+ 	}
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	vm_offset_t qs = ud_qs;
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+ 		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+@@ -1778,17 +2014,15 @@
+ 
+ /*
+  * bsd_init, after net_init_run(): ue0 (192.168.7.2/24) on the gadget and the
+- * switch from raw frames to the network stack. Without the gadget (self-check
+- * failed, laurelusb=0) nothing happens.
++ * switch from raw frames to the network stack, from its own kernel thread
++ * so bsd_init never waits for it. Without the gadget (self-check failed,
++ * laurelusb=0) only the reason is printed again (the panel wrapped by now).
+  */
+-void
+-laurel_usb_net_attach(void)
++static void
++ud_attach_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	thread_t thread;
+ 
+-	if (!ud_running || ud.ifp != NULL) {
+-		return;
+-	}
+ 	ud_if_create();
+ 	if (ud.ifp == NULL) {
+ 		printf("LAUREL USB: ue0 not attached: raw frames stay on (log and commands still work)\n");
+@@ -1805,4 +2039,26 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++void
++laurel_usb_net_attach(void)
++{
++	static bool started;
++	thread_t thread;
++
++	if (!ud_running) {
++		printf("LAUREL USB: off: %s (no ue0)\n", ud_off_reason[0] ? ud_off_reason : "gadget not started");
++		return;
++	}
++	if (ud.ifp != NULL || started) {
++		return;
++	}
++	started = true;
++	if (kernel_thread_start(ud_attach_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("LAUREL USB: attaching ue0 from a kernel thread (raw frames until then)\n");
++	} else {
++		printf("LAUREL USB: ue0 not attached: no thread; raw frames stay on\n");
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

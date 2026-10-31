@@ -4,6 +4,10 @@
 #   default image out/laurel/laurel-boot.img; restore: BOOTIMG=~/laurel-backup/stock/images/boot.img
 #   WAIT_NEW=1 (default): wait for a NEW fastboot USB connection first (put the phone in fastboot after start)
 #   REBOOT=0: do not reboot after the flash
+#   BOOT=continue (default): leave fastboot with 'fastboot continue' (ABL boots boot_b without a reset,
+#     so the USB controller stays powered and in device mode as the fastboot session left it, like
+#     'fastboot boot' on topaz); BOOT=reboot: full reset ('fastboot reboot'), the kernel powers the
+#     USB block up itself (patch 2007 cold path).
 # Why 'fastboot reboot bootloader' first (docs/notes.md, 2026-10-31): a fastboot session entered with
 # Power+VolDown (after a panic of our kernel) has a broken ABL USB state: commands get the tail of
 # the previous command ('download:' size garbled -> "more than max allowed"), ~1 in 5 commands is
@@ -47,5 +51,10 @@ until fastboot flash boot_b "$IMG"; do
 done
 echo "$(ts) flash-boot: flashed boot_b"
 [ "${REBOOT:-1}" = 1 ] || exit 0
-fastboot reboot || { sleep 1; fastboot reboot; }
-echo "$(ts) flash-boot: rebooted"
+if [ "${BOOT:-continue}" = continue ]; then
+  fastboot continue || { sleep 1; fastboot continue; }
+  echo "$(ts) flash-boot: fastboot continue (boot_b without a reset)"
+else
+  fastboot reboot || { sleep 1; fastboot reboot; }
+  echo "$(ts) flash-boot: rebooted"
+fi

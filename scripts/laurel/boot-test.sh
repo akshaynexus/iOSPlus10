@@ -12,7 +12,7 @@
 #   4. `op10tool ctl bootloader`: the kernel (or the panic hold) resets into ABL fastboot, so the next
 #      run needs no Power+VolDown; wait for the fastboot USB device
 # Env: HOLD_S=120, IMG=out/laurel/laurel-boot.img, NOFLASH=1 (phone already booting), NOBACK=1 (leave it running),
-#      WAIT_IF_S=180 (USB interface), WAIT_PING_S=60. Exit 0 = log captured (a panic is reported, not an error),
+#      WAIT_IF_S=180 (USB interface), WAIT_PING_S=60, BOOT=continue|reboot (flash-boot.sh: how ABL leaves fastboot). Exit 0 = log captured (a panic is reported, not an error),
 #      2 = no USB interface, 3 = no pong.
 set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd)

@@ -3496,3 +3496,30 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   laurel-ios16-root.img (16 GiB HFS+ case-sensitive journaled, iOSRoot) + .simg (12.1 GB, op10tool img2simg), 2.5 min.
   Linux fsck_hfs 540.1 keeps reporting "Volume header needs minor repair (1, 0)" on verify after every repair;
   root.sh accepts exactly that finding. topaz sweet-root-tweaks.py ran (launchd, CommCenter, containers, prefs).
+
+## Mi A3: USB never enumerated: ABL state, patch 2007 (2026-11-01 01:10, USB agent, branch laurel-sprout)
+- [V photo 00:40, image 704e2a0, cpus=4] Boot stops after `mbinit: done` (no panic, minutes). No `LAUREL USB:` line
+  on the panel, no USB device on the host (only the fastboot disconnect). The panel wraps: the oldest visible line is
+  `SWEET CPU: cpu=1 CPU_ON`, so everything the EARLY_BOOT hook printed (before the CPU start lines) was overwritten.
+- [I, strong] topaz always booted with `fastboot boot` (ABL fastboot ran on the DWC3: GDSC and clocks on, device mode,
+  halted). The Mi A3 ABL refuses `fastboot boot`; we flash boot_b and `fastboot reboot` = full reset, ABL never runs
+  fastboot, so the usb30_prim GDSC/clocks are off and the 2005 self-check turned the gadget off (`LAUREL USB: off:
+  controller unpowered or unclocked`), overwritten on the panel. The attach in bsd_init is then a no-op, so the
+  hang after mbinit is not in the USB attach. [U] what hangs after mbinit (next in bsd_init: audit/knote/aio/
+  dlil/socketinit/domaininit/memorystatus/bsd_autoconf/loopattach/net_init_run/inittodr/IOFindBSDRoot). The ADT UFS
+  node is 0x4804000 (correct for SM6125), so a wrong UFS address is not it; `sweet_ufs_init` prints nothing before
+  its first register access, and IOFindBSDRoot's 30 s IOBSD wait prints `!BSD` on timeout (not seen).
+- [V] `fastboot continue` exists in this ABL (CmdContinue: LoadImageAndAuth of the active slot, FastbootUsbDeviceStop,
+  BootLinux; "Resuming boot OKAY"): the kernel starts without a reset, the USB block stays as the fastboot session
+  left it (topaz state). flash-boot.sh default BOOT=continue; BOOT=reboot for the cold path.
+- Patch 2007 (docs/laurel_sprout/usb-debug.md "Patch 2007"): cold-path power-up from Linux (gcc-sm6125.c offsets,
+  dwc3-qcom.c reset+clocks+utmi-as-pipe, phy-msm-qusb.c + trinket-usb.dtsi init-seq, dwc3 core.c GCTL/GUSB2PHYCFG),
+  warm path unchanged + PHY init when POWER_DOWN; stage lines; `no host yet` line every 10 s; off reason printed again
+  from bsd_init; ue0 attach in a kernel thread. 2005's QUSB2 register offsets were the v2 layout; SM6125 is v1.
+- [V] Build: 209 patches apply, kernel 01:01, image out/laurel/laurel-boot.img 17481728 bytes (cpus=4, 8-core ADT).
+- [V boot 01:03, warm path] flash OK, `fastboot continue` OK, fastboot device disconnected 01:03:18, then NO USB
+  device on the host for 180 s (boot-test exit 2). Photo pending: the stage lines tell which step fails
+  (`SWEET USB: soft reset STUCK`, `running (DSTS ..)`, `no host yet ... link N speed N`). If `running` is printed and
+  the link state stays in "early suspend"/"disconnected", the next suspects are the PHY after ABL's
+  FastbootUsbDeviceStop/ExitBootServices (POWER_DOWN set? then 2007 re-inits it), VBUS override in QSCRATCH, and
+  GUSB2PHYCFG.SUSPHY.

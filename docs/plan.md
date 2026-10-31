@@ -452,7 +452,11 @@ release on failed stages: proposal in docs/audit/2026-10-26-power.md section 6 f
 Done: kalloc assert fix (0102); SMP CPU_ON -4 panic: shim 0002 (Silver boot core CPU_OFF) + kernel 2004
 (SweetCPU soft-fail, dead cores off-line, boot goes on); USB log channel 2005 (negroni protocol: ECM,
 UDP 5140 log, UDP 5141 commands, panic hold over USB; docs/laurel_sprout/usb-debug.md); host loop
-`scripts/laurel/boot-test.sh`. Image built, not booted (phone not on USB).
-Next: owner puts the phone in fastboot and runs `make usblog` (sudo); then
-`scripts/bg.sh laurel-test scripts/laurel/boot-test.sh`; read logs/laurel-boot-*.log; fix the next panic.
+`scripts/laurel/boot-test.sh`; 2006 early USB start (raw frames from STARTUP(EARLY_BOOT)); 2007 USB power-up by
+the kernel (GDSC, clocks, reset, QUSB2 PHY, core) + one line per stage + `no host yet` heartbeat + ue0 attach thread;
+`flash-boot.sh BOOT=continue` (ABL boots boot_b without a reset, USB left as fastboot had it).
+Boots: 00:40 (2006, `fastboot reboot`): console stops after `mbinit: done`, no USB device, no `LAUREL USB:` line
+visible (panel wrapped). 01:03 (2007, `fastboot continue`): no USB device on the host in 180 s; photo pending.
+Next: read the photo (the `LAUREL USB:` stage lines and the 10 s heartbeat show where the gadget stops), fix that
+stage, boot again; then `BOOT=reboot` to test the cold path. Root mount wait on userdata (still Android) is expected.
 Exact results go to docs/notes.md.
