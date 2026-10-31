@@ -125,7 +125,8 @@ static void print_device(id<MTLDevice> d)
 	  "recommendedMaxWorkingSetSize %llu MiB, hasUnifiedMemory %d, lowPower %d, headless %d\n",
 	  (unsigned long)d.maxThreadsPerThreadgroup.width, (unsigned long)d.maxThreadsPerThreadgroup.height,
 	  (unsigned long)d.maxThreadsPerThreadgroup.depth, (unsigned long)(d.maxBufferLength >> 20),
-	  (unsigned long)d.maxThreadgroupMemoryLength, (unsigned long long)(d.recommendedMaxWorkingSetSize >> 20),
+	  (unsigned long)d.maxThreadgroupMemoryLength, /* KVC: the iPhoneOS16.5 SDK marks the property unavailable on iOS (Xcode 15 SDKs do not) */
+	  [[(id)d valueForKey:@"recommendedMaxWorkingSetSize"] unsignedLongLongValue] >> 20,
 	  d.hasUnifiedMemory, d.isLowPower, d.isHeadless);
 	NSMutableString *fam = [NSMutableString string];
 	struct { MTLGPUFamily f; const char *n; } fams[] = {

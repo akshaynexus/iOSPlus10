@@ -25,7 +25,7 @@ if [ $probes_only = 1 ]; then BRIDGE_LIB=""; fi
 
 export IOS_MIN SDK
 cmake -S "$METAL" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_TOOLCHAIN_FILE="$METAL/cmake/ios-arm64.cmake" \
+  -DCMAKE_TOOLCHAIN_FILE="${NMTL_CMAKE_TOOLCHAIN:-$METAL/cmake/ios-arm64.cmake}" \
   -DNMTL_BRIDGE_LIB="$BRIDGE_LIB" -DNMTL_FLAME_SRC="$FRONT" -DNMTL_CLASS="$PLUGIN_CLASS" > "$MOUT/cmake.log" 2>&1 ||
   { tail -30 "$MOUT/cmake.log"; exit 1; }
 ninja -C "$BUILD" -j "$NPROC"

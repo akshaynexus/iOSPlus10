@@ -3833,3 +3833,24 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   closed-loop only when the root has RedwoodAudio.driver + VirtualAudio.plugin: today it has neither [V root.sh, topaz
   sweet-root-tweaks.py moves VirtualAudio to HAL.disabled], so expect `LAUREL HAPTIC UI: off` and ringtone vibration only; UI and
   keyboard taps need the audio plug-in in the root. Built 04:26 (220 patches, 0 LSE, no new warnings). NOT BOOTED.
+## Mi A3: Metal path (AREA J) built natively on Linux, kernel 2850 (2026-11-01 04:45)
+
+Done [V, logs/laurel-metal.log, logs/laurel-kernel-metal.log]; nothing ran on the phone. Full text: docs/laurel_sprout/metal.md.
+- Decision: negroni's stack unchanged (NegroniMetal plug-in -> ios-flame frontend/bridge -> metal2vulkan f6a96b7d -> Turnip
+  Mesa 25.0.7). Mesa 25.0.7 has the A610: `GPUId(610)` = chip 0x060100ff, matches topaz CHIP_ID 0x06010001 (patch id
+  wildcard), props a6xx_gen1_low (no sampler min/max, no HW multiview, no GMEM fast clear), num_ccu 1, GMEM from the kernel
+  (topaz 0x21000). HackiOS gfxstream is a guest encoder for a host GPU under AVF: does not apply.
+- The topaz RedwoodGPU (0901) is the same msm-struct ABI as negroni's; negroni_drm.c talks to it unchanged (0-cmd submits and
+  syncobjs in user space). No VA_START -> Turnip uses kernel addresses. SMMU pass-through (gpu_identity=1, GPU VA = PA):
+  no host-page import (0x49) possible; only IOSurface import 0x7e (contiguous surfaces).
+- Kernel 2850: IOAcceleratorES (topaz 0138) is registered only after a check (root, RedwoodGPU <= 20 s after root, ready,
+  chip 0x0601xxxx, GMEM, bundle files) with MetalPluginName/ClassName, else empty. Reason: topaz starts the GPU after the
+  root mount and only with `gpu=1`; Metal registers devices once per process; CA polls IOAcceleratorES (300 x 100 ms).
+  Log `LAUREL METAL: on: Turnip a610 (...)` / `off: <reason>`; kill switch `laurelmetal=0`.
+- Linux fixes: meson `c_ld = 'lld'` (lld in the compiler command broke every meson -Werror check -> `struct timespec`
+  redefinition); every ld64.lld output has an unused undefined `dyld_stub_binder` in its symbol table (not in the chained
+  imports, no stub helper): turnip-build.sh and check-imports.py now read the import table; llvm-lipo `-archs` prints a
+  trailing blank; GNU `stat -f` is file-system stat; theos "iPhoneOS16.5.sdk" is Version 16.4 and marks
+  `recommendedMaxWorkingSetSize` unavailable on iOS (metalprobe reads it by KVC); CMake iOS on Linux needs full compiler
+  paths. The 20H392 dyld cache is readable without root: `apfs-fuse -o ro 087-86593-047.dmg MNT`.
+- Next: coordinator test (metal.md section 8): `LAUREL METAL:` line, then vkprobe / m2vtest / metalprobe over SSH.

@@ -1,0 +1,253 @@
+From: iOSPlus10 laurel <laurel@local>
+Subject: [PATCH] laurel 2850: Metal plug-in names on IOAcceleratorES after a self-check (Adreno 610)
+
+topaz 0138 publishes an empty IOAcceleratorES, so Metal.framework finds no device. Now a thread holds the
+service back until the check is done: root mounted (<= 60 s), RedwoodGPU published (<= 20 s after the root),
+GPU ready, CHIP_ID 0x0601xxxx (Adreno 610, Turnip FD610), GMEM, NegroniMetal.bundle files in the root. Then it
+sets MetalPluginName = NegroniMetal, MetalPluginClassName = NegroniMTLDevice and registers the service; on any
+failure it registers it empty, as 0138 did. CoreAnimation polls for IOAcceleratorES (300 x 100 ms), so even
+backboardd sees the names. One line: "LAUREL METAL: on: Turnip a610 (...)" or "LAUREL METAL: off: <reason>".
+Kill switch: laurelmetal=0 (topaz 0138 behaviour). Design: docs/laurel_sprout/metal.md.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 94b8d1c..6c59c6f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
++bsd/dev/laurel_metal.c			standard
+ bsd/dev/topaz_redwood_audio.c		standard
+ bsd/kern/topaz_sandbox_container.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/laurel_metal.c b/bsd/dev/laurel_metal.c
+new file mode 100644
+index 0000000..dfdd029
+--- /dev/null
++++ b/bsd/dev/laurel_metal.c
+@@ -0,0 +1,32 @@
++/*
++ * laurel 2850: the root-file part of the Metal registration self-check (iokit/Kernel/arm/LaurelMetal.cpp): is a
++ * file of the NegroniMetal plug-in in the root file system. Only a lookup; nothing is read or opened.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++
++int laurel_metal_root_has(const char *path);
++
++int
++laurel_metal_root_has(const char *path)
++{
++	vnode_t vp = NULLVP;
++	int err;
++
++	if (rootvnode == NULLVP) {
++		return ENOENT;
++	}
++	err = vnode_lookup(path, 0, &vp, vfs_context_kernel());
++	if (err == 0) {
++		if (vnode_vtype(vp) != VREG) {
++			err = EFTYPE;
++		}
++		vnode_put(vp);
++	}
++	return err;
++}
++#endif
+diff --git a/iokit/Kernel/arm/LaurelMetal.cpp b/iokit/Kernel/arm/LaurelMetal.cpp
+new file mode 100644
+index 0000000..10f5b7d
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelMetal.cpp
+@@ -0,0 +1,155 @@
++/*
++ * laurel 2850: Metal device registration on the Mi A3 (Adreno 610). docs/laurel_sprout/metal.md.
++ *
++ * Metal.framework (_MTLRegisterDevices, iOS 16.7.16 20H392) looks at every IOAcceleratorES service and loads
++ * /System/Library/Extensions/<MetalPluginName>.bundle, class <MetalPluginClassName> (docs/metal-design.md section 2).
++ * topaz 0138 publishes that service without the two properties, so Metal finds no device. This feature names the
++ * NegroniMetal plug-in (Metal -> metal2vulkan -> Turnip, userland; built by scripts/laurel/metal-build.sh) on it, but
++ * only when the plug-in can work:
++ *   1. RedwoodGPU is published (topaz TopazAdreno + RedwoodGPU: the GPU runs and takes submissions),
++ *   2. the GPU is an Adreno 610 (CHIP_ID 0x0601xxxx, Mesa 25.0.7 Turnip table entry FD610) and has GMEM,
++ *   3. the root has the bundle and its Turnip (scripts/laurel/root-add-metal.sh).
++ * If one check fails, the service stays empty (CoreAnimation keeps the renderer it has now) and one line tells why.
++ * Kill switch: boot-arg laurelmetal=0. Log: "LAUREL METAL: on: ..." or "LAUREL METAL: off: <reason>".
++ *
++ * Timing: topaz starts the GPU only after the root mount (TopazAdreno.cpp topaz_adreno_thread: root, 0.5 s, hw_start),
++ * long after AppleCLCD::start. Metal registers its devices once per process, so a backboardd that looked before the
++ * names were there would stay without Metal. So this feature takes over the publication of the service: it is
++ * registered when the check is done, with the names (on) or without (off). CoreAnimation polls for IOAcceleratorES
++ * (300 x 100 ms, topaz 0138) and finds it then. The check gives the GPU LAUREL_METAL_GPU_WAIT_S after the root mount.
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern "C" {
++bool redwood_gpu_ready(void);
++bool redwood_gpu_parameter(uint32_t which, uint64_t * value);
++int topaz_root_mounted(void);
++int laurel_metal_root_has(const char * path);  /* bsd/dev/laurel_metal.c: 0 = the file is there, else errno */
++}
++
++bool laurel_metal_publish(IOService * accel);
++
++#define LAUREL_METAL_PLUGIN     "NegroniMetal"          /* scripts/metal/env.sh PLUGIN_NAME */
++#define LAUREL_METAL_CLASS      "NegroniMTLDevice"      /* scripts/metal/env.sh PLUGIN_CLASS */
++#define LAUREL_METAL_BUNDLE     "/System/Library/Extensions/" LAUREL_METAL_PLUGIN ".bundle"
++#define LAUREL_METAL_ROOT_WAIT_S 60                     /* as topaz_adreno_thread waits for the root */
++#define LAUREL_METAL_GPU_WAIT_S 20                      /* after the root mount: 0.5 s + hw_start (zap, SQE, ring) */
++
++#define MSM_PARAM_GMEM_SIZE     0x02
++#define MSM_PARAM_CHIP_ID       0x03
++#define MSM_PARAM_MAX_FREQ      0x04
++
++static IOService * gLaurelAccel;
++
++static void
++laurel_metal_off(const char * why)
++{
++	IOLog("LAUREL METAL: off: %s\n", why);
++}
++
++static void
++laurel_metal_thread(void *, wait_result_t)
++{
++	IOService * accel = gLaurelAccel;
++	char why[160];
++	uint64_t chip = 0, gmem = 0, freq = 0;
++
++	/* 1. the root, then the GPU service (published by RedwoodGPUStart() once the A610 runs) */
++	for (int i = 0; !topaz_root_mounted() && i < LAUREL_METAL_ROOT_WAIT_S * 10; i++) {
++		IOSleep(100);
++	}
++	if (!topaz_root_mounted()) {
++		laurel_metal_off("root file system not mounted");
++		goto out;
++	}
++	IOService * gpu;
++	gpu = IOService::waitForMatchingService(IOService::serviceMatching("RedwoodGPU"), LAUREL_METAL_GPU_WAIT_S * NSEC_PER_SEC);
++	if (gpu == NULL) {
++		snprintf(why, sizeof(why), "no RedwoodGPU service %d s after the root mount (the Adreno 610 did not start)",
++		    LAUREL_METAL_GPU_WAIT_S);
++		laurel_metal_off(why);
++		goto out;
++	}
++	gpu->release();
++	if (!redwood_gpu_ready()) {
++		laurel_metal_off("RedwoodGPU is published but the GPU is not ready (stopped or hung)");
++		goto out;
++	}
++
++	/* 2. the chip: Turnip's device table has the A610 as FD610 (chip id 0x060100ff, patch id wildcard) */
++	if (!redwood_gpu_parameter(MSM_PARAM_CHIP_ID, &chip) || (chip >> 8) != 0x060100) {
++		snprintf(why, sizeof(why), "GPU chip id %#llx is not an Adreno 610 (no Turnip table entry here)",
++		    (unsigned long long)chip);
++		laurel_metal_off(why);
++		goto out;
++	}
++	if (!redwood_gpu_parameter(MSM_PARAM_GMEM_SIZE, &gmem) || gmem == 0) {
++		laurel_metal_off("GPU reports no GMEM size (Turnip needs MSM_PARAM_GMEM_SIZE)");
++		goto out;
++	}
++	(void)redwood_gpu_parameter(MSM_PARAM_MAX_FREQ, &freq);
++
++	/* 3. the plug-in in the root (scripts/laurel/root-add-metal.sh) */
++	{
++		static const char * const files[] = {
++			LAUREL_METAL_BUNDLE "/" LAUREL_METAL_PLUGIN,
++			LAUREL_METAL_BUNDLE "/libvulkan_freedreno.dylib",
++			LAUREL_METAL_BUNDLE "/Info.plist",
++		};
++		for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
++			int e = laurel_metal_root_has(files[i]);
++			if (e != 0) {
++				snprintf(why, sizeof(why), "%s missing (errno %d): root without scripts/laurel/root-add-metal.sh",
++				    files[i], e);
++				laurel_metal_off(why);
++				goto out;
++			}
++		}
++	}
++
++	accel->setProperty("MetalPluginName", LAUREL_METAL_PLUGIN);
++	accel->setProperty("MetalPluginClassName", LAUREL_METAL_CLASS);
++	accel->setProperty("IOGLBundleName", LAUREL_METAL_PLUGIN);   /* not read by Metal; flame and negroni set it too */
++	IOLog("LAUREL METAL: on: Turnip a610 (chip %#llx, GMEM %llu KiB, %llu MHz), metal2vulkan plug-in "
++	    LAUREL_METAL_PLUGIN ".bundle class " LAUREL_METAL_CLASS " on IOAcceleratorES\n",
++	    (unsigned long long)chip, (unsigned long long)gmem >> 10, (unsigned long long)freq / 1000000);
++out:
++	accel->registerService();                       /* with the names (on) or empty (off), as topaz 0138 did at once */
++	gLaurelAccel = NULL;
++	accel->release();
++	thread_terminate(current_thread());
++}
++
++/*
++ * AppleCLCD::start (topaz 0138) calls this with the attached, not yet registered IOAcceleratorES. true: the check
++ * registers it later; false: the caller registers it now (empty, as topaz 0138 does).
++ */
++bool
++laurel_metal_publish(IOService * accel)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	if (PE_parse_boot_argn("laurelmetal", &on, sizeof(on)) && on == 0) {
++		laurel_metal_off("laurelmetal=0");
++		return false;
++	}
++	if (accel == NULL || gLaurelAccel != NULL) {
++		return false;
++	}
++	accel->retain();
++	gLaurelAccel = accel;
++	if (kernel_thread_start(laurel_metal_thread, NULL, &thread) != KERN_SUCCESS) {
++		gLaurelAccel = NULL;
++		accel->release();
++		laurel_metal_off("no thread for the check");
++		return false;
++	}
++	thread_deallocate(thread);
++	return true;
++}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9f802ad..52c1226 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -535,8 +535,12 @@ AppleCLCD::start(IOService *provider)
+ 	if (accel != NULL && accel->init()) {
+ 		accel->setName("sgx");
+ 		if (accel->attach(this)) {
+-			accel->registerService();
+-			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
++			/* laurel 2850: the Metal check registers it when it is done (with or without the plug-in names) */
++			extern bool laurel_metal_publish(IOService *accel);
++			if (!laurel_metal_publish(accel)) {
++				accel->registerService();
++				IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
++			}
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(accel);
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index c92beb0..c3a299e 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -25,6 +25,7 @@ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitc
+ iokit/Kernel/arm/TopazAdreno.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/TopazAdrenoFw.cpp                               optional iokitcpp
+ iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
++iokit/Kernel/arm/LaurelMetal.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

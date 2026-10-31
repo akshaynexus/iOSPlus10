@@ -560,3 +560,11 @@ dark, then back with a fade). Details: notes.md, same date, 04:40.
   /dev/redwood-haptic; expected line `LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)`. Test: Settings > Sounds &
   Haptics > Ringtone > Vibration preview. UI/keyboard taps wait for the RedwoodAudio plug-in + VirtualAudio in the root
   (docs/laurel_sprout/haptics.md).
+## Mi A3 Metal path, AREA J (2026-11-01 04:45)
+
+- Done [V]: path decided (metal2vulkan + Turnip, negroni stack, docs/laurel_sprout/metal.md); whole stack built natively on
+  Linux (`scripts/bg.sh laurel-metal scripts/laurel/metal-build.sh`: Turnip for the A610, bridge, NegroniMetal.bundle,
+  probes, ldid, import check PASS vs 20H392, 0 LSE); `scripts/laurel/root-add-metal.sh` (called by root.sh, METAL=0 skips);
+  kernel patch 2850 (Metal plug-in names on IOAcceleratorES after a self-check) builds, 220 patches, 0 LSE.
+- Not done: phone test; 0x49 host import (impossible with the pass-through SMMU); Turnip on the A610 never ran.
+- Next: AREA B's GPU driver + 2850 kernel, root with the Metal stage; test plan metal.md section 8.

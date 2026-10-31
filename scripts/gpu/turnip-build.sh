@@ -91,7 +91,9 @@ endian = 'little'
 needs_exe_wrapper = true
 EOF
   case "$(uname -s)" in
-  Linux) sed -i "s|^c = \['$CLANG'|c = ['$CLANG', '-fuse-ld=lld'|; s|^cpp = \['$CLANGXX'|cpp = ['$CLANGXX', '-fuse-ld=lld'|" "$CROSS" ;;
+  # Linux: ld64.lld through clang (meson's c_ld: -fuse-ld=lld at link time only; in the compiler command it would be an
+  # unused argument, and meson's -Werror=unused-command-line-argument checks then fail: no HAVE_* defines).
+  Linux) sed -i "s|^\[binaries\]|[binaries]\nc_ld = 'lld'\ncpp_ld = 'lld'\nobjc_ld = 'lld'|" "$CROSS" ;;
   esac
   rm -rf "$TU_BUILD"
   meson setup "$TU_BUILD" "$TU_SRC" --cross-file "$CROSS" --wrap-mode=nofallback \
@@ -139,7 +141,12 @@ minos=$($OTOOL -l "$VK" | awk '/LC_BUILD_VERSION/{p=1;next} p&&/minos/{print $2;
 $OTOOL -l "$VK" | grep -q 'cmd LC_DYLD_CHAINED_FIXUPS' || { echo "turnip: no LC_DYLD_CHAINED_FIXUPS" >&2; fail=1; }
 ! $OTOOL -l "$VK" | grep -q 'cmd LC_DYLD_INFO' || { echo "turnip: has LC_DYLD_INFO(_ONLY)" >&2; fail=1; }
 "$NM" -m "$VK" > "$TU/nm-m.txt"
-! grep -q 'dyld_stub_binder' "$TU/nm-m.txt" || { echo "turnip: imports dyld_stub_binder" >&2; fail=1; }
+# dyld binds what the chained-fixup import table names. ld64.lld (Linux) also leaves an unused undefined dyld_stub_binder
+# in the symbol table (every lld output has it); only the import table counts there.
+case "$(uname -s)" in
+Darwin) ! grep -q 'dyld_stub_binder' "$TU/nm-m.txt" || { echo "turnip: imports dyld_stub_binder" >&2; fail=1; } ;;
+*) ! llvm-objdump --macho --chained-fixups "$VK" | grep -q 'dyld_stub_binder' || { echo "turnip: imports dyld_stub_binder" >&2; fail=1; } ;;
+esac
 strong=$(grep '(undefined)' "$TU/nm-m.txt" | grep 'dynamically looked up' | grep -v 'weak external' || true)
 [ -z "$strong" ] || { echo "turnip: strong symbols without a library:" >&2; echo "$strong" | head -20 >&2; fail=1; }
 weak=$(grep '(undefined)' "$TU/nm-m.txt" | grep -c 'dynamically looked up' || true)
@@ -153,5 +160,5 @@ cp "$VK" "$OUTVK"
 codesign -s - -f "$OUTVK" 2>/dev/null || ldid -S "$OUTVK"
 echo "turnip: arm64, minos $minos, chained fixups, $weak weak symbols looked up at load time (resolve to NULL when absent)"
 echo "turnip: exports: $(echo "$exports" | tr '\n' ' ')"
-stat -f '%N %z bytes' "$OUTVK" 2>/dev/null || stat -c '%n %s bytes' "$OUTVK"
+stat -c '%n %s bytes' "$OUTVK" 2>/dev/null || stat -f '%N %z bytes' "$OUTVK"
 shasum -a 256 "$OUTVK"
