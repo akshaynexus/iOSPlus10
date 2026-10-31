@@ -1,6 +1,6 @@
 # Mi A3: battery, charger, charge-only boot, power off, thermal + cpufreq (area D, patches 2300-2303)
 
-Status 2026-11-01 04:47: review fixes built (`areaD-k2304`: 223 patches applied, 0 LSE; kernel sha256 b1cc64f13835572880059308a1fd8588880e04007439a212426ad17e1c42b450). First version 661609a was (`scripts/bg.sh areaD-k2303 scripts/laurel/kernel-linux.sh`: 223 patches applied, 0 LSE; kernel sha256 b96061512f0aed39d72a7d00e63a2b3a3a0bc815b9f126eb0f8d537414f8dc28). NOT BOOTED. [V] = read in files / build,
+Status 2026-11-01 05:01: safety re-check fixes built on laurel-int-1 (`areaD-k2305`: 231 patches applied, 0 LSE; kernel sha256 ddfd8d1522cd0059ce0b3935123490a4e61f3eb5b8819628556678139ba3e248). Review fixes 92713a8 were b1cc64f1..., first version 661609a was (`scripts/bg.sh areaD-k2303 scripts/laurel/kernel-linux.sh`: 223 patches applied, 0 LSE; kernel sha256 b96061512f0aed39d72a7d00e63a2b3a3a0bc815b9f126eb0f8d537414f8dc28). NOT BOOTED. [V] = read in files / build,
 [I] = inference, [U] = unknown until a boot.
 
 ## Why the battery reads failed before 2300 [V]
@@ -74,9 +74,18 @@ bit 0 = power key, PS_HOLD_RST_CTL 0x85a (type: 1 warm, 4 shutdown, 7 hard), RST
   Linux codes 0x15aa (60 C) / 0x6894 (0 C) of `qcom,jeita-hard-thresholds` (smb5-lib.c smblib_update_jeita), written
   and read back when not; JEITA_EN_CFG 0x1090 is logged. Any failure: `LAUREL CHARGER: off: ...` (reads stay; the
   hardware keeps charging on its boot defaults). The boot FCC/FV are saved.
-- NTC watchdog: no good NTC sample for 30 s with a charger in -> FCC 500 mA, FV 4100 mV, control off
-  (`off: no battery NTC sample for 30 s; safe ...`). A stale temperature is never used for a zone.
-- Control off after a write failure: boot FCC/FV written back (best effort), ICL HW_AUTO, input un-suspended.
+- NTC watchdog: no good NTC sample for 30 s -> FCC 500 mA, FV 4100 mV, control off
+  (`off: no battery NTC sample for 30 s; FCC 500 mA FV 4100 mV (safe)`). A stale temperature is never used for a zone.
+  It runs first in every sample (before a gauge read can return early) and from its own 10 s thread_call, so a
+  stopped SweetBattery poll does not stop it.
+- Every control-off: ICL HW_AUTO, input un-suspended, 500 mA / 4100 mV first; the boot FCC/FV come back only when
+  they are not above that. Control cannot turn on (no NTC, hard limits, no timer) while CHGR/USBIN are EE 0:
+  `LAUREL CHARGER: safe limits FCC 500 mA FV 4100 mV without software JEITA`. `laurelchg=0`: no charger writes.
+- USB input suspend (0x1340 bit 0): one left by an earlier boot is released at start (also with control off or
+  `laurelchg=0`, while USBIN is EE 0): `LAUREL CHARGER: USB input suspend of an earlier boot released`. Ours is
+  released in laurel_power_off / laurel_restart over a lock-free USBIN lane (panic hold, timer call).
+- Hard-limit accept window only on the safe side: hot code 0x15aa..0x17aa (trips at <= 60 C), cold 0x6494..0x6894
+  (trips at >= 0 C); else the Linux codes are written.
 - Unplug: ICL back to HW_AUTO (LOAD_CFG 0x1365 bit 4 cleared), input un-suspended, FCC at most 500 mA until the next
   charger step after a plug-in (10 s poll). No ICL wanted (SDP without Rp): HW_AUTO too.
 - Input limit (charger in): APSD DCP/QC 2000 mA, float 1000, CDP 1500, SDP: Type-C Rp 3.0 A -> 2000, 1.5 A -> 1500,
@@ -104,7 +113,8 @@ bit 0 = power key, PS_HOLD_RST_CTL 0x85a (type: 1 warm, 4 shutdown, 7 hard), RST
 - Rule: cold (0x8c2 = 0), PON_REASON1 has USB_CHG/CBL/DC (or PON1 + a PMI632 charger reason), and none of
   HARD_RESET/SMPL/RTC/KPD, and the charger is in -> charge mode. Else `LAUREL CHARGE MODE: on: normal boot (...)`.
 - Charge mode: before launchd; power key polled every 200 ms (RT status; a shorter press can be missed [I]); a
-  console line every 10 s (`LAUREL CHARGE MODE: battery N% charging, mV mA C`);
+  console line every 10 s; power off only when the cable is gone: USBIN plug-in RT bit (0x1310 bit 4) clear for 5
+  checks 1 s apart (a collapsing or weak charger keeps that bit, the power path may drop: no off/on loop) (`LAUREL CHARGE MODE: battery N% charging, mV mA C`);
   the charger loop runs (SweetBattery 10 s poll). Power key -> boot iOS; charger out 3 s -> power off; 10 failed
   PMIC reads in a row -> `LAUREL CHARGE MODE: off: N PMIC reads failed in a row: booting iOS`.
 - [U] Cable power-on that stops in ABL: if ABL shows its own charger screen or goes to fastboot on a cable power-on
@@ -112,7 +122,9 @@ bit 0 = power key, PS_HOLD_RST_CTL 0x85a (type: 1 warm, 4 shutdown, 7 hard), RST
   unplug. Only the owner's test shows which path this ABL takes.
 - Every reset selects its own PS_HOLD type (msm-poweroff): power off type 4 (SHUTDOWN) before PSCI SYSTEM_OFF, the
   old type written back if PSCI returns; plain restart type 7 (HARD_RESET; no `qcom,force-warm-reboot` in the Mi A3 DT);
-  restart with a reason type 1 (WARM, 2018). Before, the type was whatever XBL/ABL left (2018 sets warm reset only for reboots with a reason) [I]:
+  restart with a reason type 1 (WARM, 2018). The writes are checked and the type is read back; on a failure the
+  S2 enable is still set again and one line says `NOT SET: the PMIC keeps its old type`. Power off and restart
+  release our USB input suspend first. Before, the type was whatever XBL/ABL left (2018 sets warm reset only for reboots with a reason) [I]:
   a hard-reset type turns the PS_HOLD drop into a reboot. Line: `LAUREL REBOOT: PS_HOLD_RST_CTL 0x.. -> 0x..4 (shutdown)`.
 - [U] Whether a power off with the charger in powers on again (cable PON trigger level vs edge). If it does, the
   next boot is a charge-mode boot (cold, charger reason), which is the wanted result.
@@ -123,7 +135,8 @@ bit 0 = power key, PS_HOLD_RST_CTL 0x85a (type: 1 warm, 4 shutdown, 7 hard), RST
   32 * row, 12 rows; perf state 0x920. topaz 0094 used the same Gold offsets (`CPUFREQ gold 0->7 (2016 MHz)` on the Mi A3).
 - Governor (100 ms): busiest core per cluster over 300 ms; > 90 % -> cap, > 70 % -> +1 row, < 30 % for 300 ms -> -1
   row; governor floor = ABL row (Gold: row 0 = 300 MHz, from the topaz line "gold 0->7"); the thermal cap may go
-  below the floor, down to row 0 (the cap wins). Self-check accepts -40..120 C (cold start) and prints the cap range.
+  below the floor, down to row 0 (the cap wins). Sensors count in -40..125 C; one sensor more than 20 C above all
+  others is ignored (outlier). Self-check accepts -40..125 C (cold start) and prints the cap range.
 - TSENS v2 at 0x4411000: SN_STATUS 0xa0 + 4n, sensors 6-8 Silver cpuss, 9-12 Gold, 15 GPU. Caps: >= 95 C Gold -1
   row/s, >= 105 C Silver too, < 85 C +1 row / 2 s. Linux DT trips: 110 C passive.
 - Lines: `LAUREL CPUFREQ: on: OSM governor, silver rows a..b (MHz..MHz), gold rows ...`, `LAUREL THERMAL: on: TSENS
@@ -171,4 +184,18 @@ vbat N mV ibat N mA temp N` line and the `LAUREL CHARGER` change lines come late
 | m4, m5, m6 | timestamps (30 s) for rest/empty; safe FCC at unplug; sub-zero thermal self-check |
 | m7 | power key polled every 200 ms (RT status; latched status not used: its latch depends on the IRQ enable [I]) |
 | m1, m2, m3 | documented / not done (see Risks) |
+
+## Safety re-check 2026-11-01 (FIX-FIRST) and what changed
+
+Rebased onto `origin/laurel-int-1` (A, C, H). The `bsd/conf/files` entries moved after `sweet_i2c1.c` so that
+2700's hunk (context `sweet_cpufreq.c` / `topaz_fw.c`) still applies after ours.
+
+| Item | Fix |
+| --- | --- |
+| MUST 1 | NTC watchdog before every early return of the sample + own 10 s thread_call |
+| MUST 2 | every control-off writes 500 mA / 4100 mV first; boot limits only when not above; safe limits when control cannot turn on |
+| MUST 3 | USBIN_CMD_IL bit 0 released at start (also control off) and in power off / restart (lock-free lane) |
+| SHOULD 4 | hard-limit window only on the safe side |
+| SHOULD 5 | TSENS -40..125 C, single outlier > 20 C ignored |
+| SHOULD 6 | PS_HOLD writes checked + read back; charge mode powers off only after the plug-in RT bit is clear 5 s |
 - [I] Silver/Gold rows below what topaz used: the OSM handles the voltage (CPR) in hardware, as under Linux.

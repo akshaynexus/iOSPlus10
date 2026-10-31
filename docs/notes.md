@@ -3863,3 +3863,9 @@ Details: `docs/laurel_sprout/battery-power.md`.
   failed reads; M6 PS_HOLD type per reset (off 4 with restore, plain restart 7, reason 1); M7 thermal cap to row 0.
   Build `areaD-k2304`: 223 patches, 0 LSE, kernel sha256 b1cc64f1... (the two `linker command failed` lines in build.log
   are the usual PGO ones, also in the main tree's log). NOT BOOTED.
+- Safety re-check fixes (2026-11-01 05:01, rebased onto laurel-int-1): NTC watchdog before every early return + own 10 s
+  thread_call; every charger control-off writes 500 mA / 4100 mV first; safe limits when control cannot turn on; USB input
+  suspend released at start and before power off / restart (lock-free USBIN lane); one-sided hard-limit window; TSENS
+  -40..125 C with outlier rejection; PS_HOLD writes read back; charge mode powers off only after the USBIN plug-in bit is
+  clear 5 s. `bsd/conf/files` entries moved after sweet_i2c1.c (2700's hunk context). Build `areaD-k2305`: 231 patches,
+  0 LSE, kernel sha256 ddfd8d15... NOT BOOTED.

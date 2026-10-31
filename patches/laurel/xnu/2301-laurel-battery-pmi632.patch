@@ -1,20 +1,20 @@
-laurel 2301: battery gauge + charger on the PMI632 over SPMI (new bsd/dev/laurel_pmi632.c). SweetBattery: the topaz SM5602/bq2589x I2C path (chips the Mi A3 does not have) and the dead PM6150 reader are replaced by laurel_pmi632_sample(): QG voltage/current, ADC5 battery NTC (100k table), SoC from the saved SDAM value or the QG PON OCV (Sunwoda 25 C OCV table) + coulomb count + rest-OCV drift fix + "terminated" = 100 %, saved to our SDAM record once a minute; SMB5 input limit from APSD/Type-C Rp (HW_AUTO again on unplug or without a limit), software JEITA zones for FCC/FV (Mi A3 DT values) with the warm-zone input suspend above FV + 50 mV, every write read back. Charger control only with a working battery NTC and the hardware JEITA hard limits at the Linux 0/60 C codes (written when not); no good NTC sample for 30 s = 500 mA at 4100 mV and control off; boot FCC/FV written back when control turns off on a write failure; FCC <= 500 mA at unplug. Review fixes 2026-11-01 (B1, M1-M4, m4, m5). Publishes the negroni 0271/0365 key set (CurrentCapacity, IsCharging, FullyCharged, ExternalConnected, AdapterDetails with FamilyCode, Voltage, Amperage, InstantAmperage, Temperature, CycleCount, times to full/empty). Self-check lines: 'LAUREL BATTERY: on: PMI632 QG soc N% ...' / 'off: <reason>', 'LAUREL CHARGER: on: ...' / 'off: <reason>'. Kill switches laurelbatt=0, laurelchg=0 (sweetbattery=0 still gives the static fallback).
+laurel 2301: battery gauge + charger on the PMI632 over SPMI (new bsd/dev/laurel_pmi632.c). SweetBattery: the topaz SM5602/bq2589x I2C path (chips the Mi A3 does not have) and the dead PM6150 reader are replaced by laurel_pmi632_sample(): QG voltage/current, ADC5 battery NTC (100k table), SoC from the saved SDAM value or the QG PON OCV (Sunwoda 25 C OCV table) + coulomb count + rest-OCV drift fix + "terminated" = 100 %, saved to our SDAM record once a minute; SMB5 input limit from APSD/Type-C Rp (HW_AUTO again on unplug or without a limit), software JEITA zones for FCC/FV (Mi A3 DT values) with the warm-zone input suspend above FV + 50 mV, every write read back. Charger control only with a working battery NTC and the hardware JEITA hard limits at the Linux 0/60 C codes (written when not); no good NTC sample for 30 s = 500 mA at 4100 mV and control off; boot FCC/FV written back when control turns off on a write failure; FCC <= 500 mA at unplug. Review fixes 2026-11-01 (B1, M1-M4, m4, m5). Safety re-check fixes: the NTC watchdog runs before any early return of the sample and from its own 10 s thread_call (independent of SweetBattery); every control-off writes 500 mA / 4100 mV first (boot limits only when not above that), also when control cannot turn on with SMB5 ours; a USB input suspend of an earlier boot is released at start; hard-limit accept window only on the safe side. Publishes the negroni 0271/0365 key set (CurrentCapacity, IsCharging, FullyCharged, ExternalConnected, AdapterDetails with FamilyCode, Voltage, Amperage, InstantAmperage, Temperature, CycleCount, times to full/empty). Self-check lines: 'LAUREL BATTERY: on: PMI632 QG soc N% ...' / 'off: <reason>', 'LAUREL CHARGER: on: ...' / 'off: <reason>'. Kill switches laurelbatt=0, laurelchg=0 (sweetbattery=0 still gives the static fallback).
 
 diff -ruN a/bsd/conf/files b/bsd/conf/files
---- a/bsd/conf/files	2026-11-01 04:41:57.000000000 +0530
-+++ b/bsd/conf/files	2026-11-01 04:42:07.918236976 +0530
-@@ -114,6 +114,7 @@
+--- a/bsd/conf/files	2026-11-01 04:55:45.791963810 +0530
++++ b/bsd/conf/files	2026-11-01 04:55:55.150339524 +0530
+@@ -113,6 +113,7 @@
+ bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_i2c1.c			standard
- bsd/dev/sweet_cpufreq.c			standard
 +bsd/dev/laurel_pmi632.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
  bsd/dev/topaz_fw.c			standard
  bsd/dev/topaz_redwood_audio.c		standard
- bsd/kern/topaz_sandbox_container.c		standard
 diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 --- a/bsd/dev/laurel_pmi632.c	1970-01-01 05:30:00.000000000 +0530
-+++ b/bsd/dev/laurel_pmi632.c	2026-11-01 04:44:33.708229418 +0530
-@@ -0,0 +1,877 @@
++++ b/bsd/dev/laurel_pmi632.c	2026-11-01 04:58:46.631453264 +0530
+@@ -0,0 +1,995 @@
 +/*
 + * laurel 2301 (Xiaomi Mi A3, SM6125 + PMI632): battery gauge and charger over SPMI.
 + *
@@ -45,7 +45,7 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 + *          are past the Linux QG area (0x45..0xa3) and below the PBS PON OCV (0xbc); not proven free.
 + * Charger (HLOS owns SMB5 on this device: Android 4.14 qpnp-smb5 writes it). On only with a working
 + * battery NTC and the hardware JEITA hard limits at the Linux values (0 C / 60 C, written when not).
-+ * The boot FCC/FV are saved and written back when control turns off (write failure). With a charger in:
++ * The boot FCC/FV are saved. With a charger in:
 + *   input  APSD result: DCP / QC 2000 mA, float 1000 mA, CDP 1500 mA, SDP: the Type-C Rp current
 + *          (3.0 A -> 2000, 1.5 A -> 1500), else the hardware's (HW_AUTO); SW_OVERRIDE_HC mode of
 + *          smb5-lib.c smblib_icl_override (USBIN_MODE_CHG, no ICL override, override after APSD).
@@ -56,6 +56,12 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 + *          only 1.5 C inside it. FCC 0 = no charge. Warm zone with VBAT > FV + 50 mV: USB input
 + *          suspended until VBAT < FV - 50 mV (step-chg-jeita.c handle_jeita).
 + *   NTC    no good NTC sample for 30 s: 500 mA at 4100 mV, control off (never a stale temperature).
++ *          The watchdog runs first in every sample (before any gauge read can return early) and from
++ *          its own 10 s thread_call, so it does not depend on the SweetBattery poll.
++ *   off    every control-off writes 500 mA / 4100 mV first; the boot limits only when not above that.
++ *          Control cannot turn on (no NTC, hard limits, no timer) with SMB5 ours: 500 mA / 4100 mV too.
++ *          A USB input suspend left by an earlier boot is released at start (also with control off),
++ *          ours before a power off / restart (lock-free USBIN lane).
 + *   Every write is read back; a failed write turns the charger control off (the reads stay).
 + * SMB1355 (parallel charger on QUP0 SE1 I2C) is not used: the PMI632 charges alone (max 3 A FCC).
 + *
@@ -69,12 +75,15 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/clock.h>
++#include <kern/thread_call.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <IOKit/IOLocks.h>
 +extern void IOSleep(unsigned milliseconds);
 +#include "sweet_spmi.h"
 +#include "laurel_pmi632.h"
++
++extern int kdb_printf(const char *format, ...) __printflike(1, 2);
 +
 +#define PMI_SID         2u
 +#define QG              0x4800u
@@ -96,6 +105,8 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +#define LP_30S_NS       30000000000ull
 +#define NTC_STALE_NS    30000000000ull  /* no good NTC sample for 30 s: charger to the safe state, control off */
 +#define SAFE_FCC_MA     500u
++#define SAFE_FV_MV      4100u
++#define GUARD_S         10u             /* the NTC watchdog / charger step timer, independent of SweetBattery */
 +
 +/* Sunwoda pc-temp-v1-lut, 25 C column: { OCV in 0.1 mV, SoC in 0.01 % } (descending) */
 +static const uint16_t lp_ocv[][2] = {
@@ -148,6 +159,8 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +static int lp_last_temp = 250;
 +static uint64_t lp_temp_ok_ns;          /* last good NTC sample */
 +static bool lp_was_ext = true, lp_usb_susp;
++static uint8_t lp_usb_cmd;              /* USBIN_CMD_IL without the suspend bit (for the lock-free release) */
++static thread_call_t lp_guard_tc;
 +static uint8_t lp_boot_fcc, lp_boot_fv;  /* SMB5 FCC/FV codes at our start, restored when control turns off */
 +static uint8_t lp_pon_reason, lp_pon_warm, lp_pmi_reason;
 +static bool lp_pon_known;
@@ -355,6 +368,9 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +}
 +
 +static int lp_init_locked(void);
++static int set_fcc_fv(uint8_t fcc, uint8_t fv);
++static void lp_guard_fire(thread_call_param_t p0, thread_call_param_t p1);
++static void lp_guard_arm(void);
 +static uint64_t now_ns(void);
 +static int jeita_hw_check(unsigned *hot, unsigned *cold);
 +static volatile int lp_init_busy;
@@ -475,17 +491,36 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +	uint8_t jen = 0;
 +	unsigned hot = 0, cold = 0;
 +	int jh = -1;
++	/* a USB input suspend left by an earlier boot (our warm-zone suspend; the PMIC keeps it): release it */
++	if (ou == 0) {
++		uint8_t cmd = 0;
++		if (rd(USBIN + 0x40, &cmd) == 0) {
++			lp_usb_cmd = (uint8_t)(cmd & ~0x01u);
++			if (cmd & 0x01u) {
++				int w = wr(USBIN + 0x40, lp_usb_cmd);
++				printf("LAUREL CHARGER: USB input suspend of an earlier boot released (USBIN_CMD_IL 0x%02x, %s)\n", cmd,
++				    w ? "write failed" : "written");
++			}
++		}
++		(void)sweet_spmi_usbin_lane_init();
++	}
++	bool safe_needed = false;
 +	if (!chg) {
 +		printf("LAUREL CHARGER: off: laurelchg=0\n");
 +	} else if (!lp_temp_on) {
++		safe_needed = true;
 +		printf("LAUREL CHARGER: off: no battery NTC (ADC5 BAT_THERM_PU2 not readable; hardware limits only)\n");
 +	} else if (oc != 0 || ou != 0) {
 +		printf("LAUREL CHARGER: off: SMB5 CHGR/USBIN owned by EE %d/%d, not 0 (reads only)\n", oc, ou);
 +	} else if (rd(CHGR + 0x61, &fcc) || rd(CHGR + 0x70, &fv) || wr(CHGR + 0x70, fv) || rd(CHGR + 0x90, &jen)) {
 +		printf("LAUREL CHARGER: off: SMB5 write check failed (reads only)\n");
 +	} else if ((jh = jeita_hw_check(&hot, &cold)) < 0) {
-+		printf("LAUREL CHARGER: off: hardware JEITA hard limits hot 0x%04x cold 0x%04x not near 60/0 C and not writable\n",
++		safe_needed = true;
++		printf("LAUREL CHARGER: off: hardware JEITA hard limits hot 0x%04x cold 0x%04x not at 60/0 C and not writable\n",
 +		    hot, cold);
++	} else if (!(lp_guard_tc = thread_call_allocate(lp_guard_fire, NULL))) {
++		safe_needed = true;
++		printf("LAUREL CHARGER: off: no NTC watchdog timer\n");
 +	} else {
 +		lp_boot_fcc = fcc;
 +		lp_boot_fv = fv;
@@ -494,6 +529,13 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +		printf("LAUREL CHARGER: on: SMB5 owner EE 0, boot FCC %u mA FV %u mV; hard JEITA hot 0x%04x cold 0x%04x%s "
 +		    "(JEITA_EN_CFG 0x%02x); software JEITA zones on the NTC, ICL from APSD\n",
 +		    fcc * 50u, 3600u + fv * 10u, hot, cold, jh ? " -> Linux 0x15aa/0x6894" : "", jen);
++		lp_guard_arm();
++	}
++	/* control cannot run (no NTC, bad hard limits, no timer) but the charger is ours: 500 mA / 4100 mV */
++	if (safe_needed && oc == 0 && ou == 0) {
++		int rc = set_fcc_fv((uint8_t)(SAFE_FCC_MA / 50u), (uint8_t)((SAFE_FV_MV - 3600u) / 10u));
++		printf("LAUREL CHARGER: safe limits FCC %u mA FV %u mV without software JEITA (%s)\n", SAFE_FCC_MA, SAFE_FV_MV,
++		    rc ? "a write failed" : "written");
 +	}
 +	lp_state = 1;
 +	printf("LAUREL BATTERY: on: PMI632 QG soc %d%% (%s; pon-ocv %u mV) vbat %u mV temp %s%d.%d C cap %u mAh cycles %d; "
@@ -529,6 +571,7 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +	if (lp_usb_susp) {
 +		if (rd(USBIN + 0x40, &v) == 0) {
 +			rc |= wr(USBIN + 0x40, (uint8_t)(v & ~0x01u));
++			lp_usb_cmd = (uint8_t)(v & ~0x01u);
 +		} else {
 +			rc = -1;
 +		}
@@ -544,18 +587,25 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +	return rc;
 +}
 +
-+/* charger control off: safe = 500 mA at 4100 mV (no trusted temperature), else the boot limits back */
++/*
++ * charger control off: always 500 mA at 4100 mV first (software JEITA is off from here on); the boot
++ * limits come back only when they are not above that (no 3000 mA / 4400 mV without our JEITA).
++ */
 +static void
-+chg_off(const char *why, bool safe)
++chg_off(const char *why)
 +{
 +	int rc = input_auto();
-+	uint8_t fcc = safe ? (uint8_t)(SAFE_FCC_MA / 50u) : lp_boot_fcc;
-+	uint8_t fv = safe ? (uint8_t)((FV_WARM_MV - 3600u) / 10u) : lp_boot_fv;
-+	rc |= set_fcc_fv(fcc, fv);
++	uint8_t sfcc = (uint8_t)(SAFE_FCC_MA / 50u), sfv = (uint8_t)((SAFE_FV_MV - 3600u) / 10u);
++	rc |= set_fcc_fv(sfcc, sfv);
++	bool boot = rc == 0 && lp_boot_fcc <= sfcc && lp_boot_fv <= sfv && (lp_boot_fcc != sfcc || lp_boot_fv != sfv);
++	if (boot) {
++		rc |= set_fcc_fv(lp_boot_fcc, lp_boot_fv);
++	}
 +	lp_chg_on = false;
 +	lp_zone = LP_ZONES;
-+	printf("LAUREL CHARGER: off: %s; %s FCC %u mA FV %u mV (%s)\n", why, safe ? "safe" : "boot limits back:",
-+	    fcc * 50u, 3600u + fv * 10u, rc ? "a write failed" : "written");
++	printf("LAUREL CHARGER: off: %s; FCC %u mA FV %u mV%s (%s)\n", why,
++	    (boot ? lp_boot_fcc : sfcc) * 50u, 3600u + (boot ? lp_boot_fv : sfv) * 10u, boot ? " (boot limits)" : " (safe)",
++	    rc ? "a write failed" : "written");
 +}
 +
 +/*
@@ -575,8 +625,9 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +	}
 +	*hot = (unsigned)(r[0] << 8 | r[1]);
 +	*cold = (unsigned)(r[2] << 8 | r[3]);
-+	bool hot_ok = *hot >= 0x15aau - 0x200u && *hot <= 0x15aau + 0x200u;
-+	bool cold_ok = *cold >= 0x6894u - 0x400u && *cold <= 0x6894u + 0x400u;
++	/* only the safe side: a lower code is hotter, so hot >= 0x15aa trips at <= 60 C, cold <= 0x6894 at >= 0 C */
++	bool hot_ok = *hot >= 0x15aau && *hot <= 0x15aau + 0x200u;
++	bool cold_ok = *cold <= 0x6894u && *cold >= 0x6894u - 0x400u;
 +	if (hot_ok && cold_ok) {
 +		return 0;
 +	}
@@ -653,17 +704,13 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +				rc |= wr(CHGR + 0x61, (uint8_t)(SAFE_FCC_MA / 50u));
 +			}
 +			if (rc) {
-+				chg_off("SMB5 write failed at unplug", false);
++				chg_off("SMB5 write failed at unplug");
 +			}
 +		}
 +		return;
 +	}
 +	lp_was_ext = true;
-+	/* never charge on a stale temperature */
-+	if (ns - lp_temp_ok_ns > NTC_STALE_NS) {
-+		chg_off("no battery NTC sample for 30 s", true);
-+		return;
-+	}
++	(void)ns;       /* the NTC watchdog runs in lp_guard_locked before every step */
 +	int dC = lp_last_temp;
 +	unsigned z = jeita_zone(dC);
 +	if (lp_zone < LP_ZONES && z != lp_zone && lp_jeita[z].fcc_ma >= lp_jeita[lp_zone].fcc_ma &&
@@ -711,18 +758,19 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +	 */
 +	unsigned zfv = lp_jeita[z].fv_mv;
 +	bool susp = lp_usb_susp;
-+	if (zfv < FV_MV && !susp && mv > zfv + 50u) {
++	if (zfv < FV_MV && !susp && mv && mv > zfv + 50u) {
 +		susp = true;
-+	} else if (susp && (zfv >= FV_MV || mv + 50u < zfv)) {
++	} else if (susp && (zfv >= FV_MV || (mv && mv + 50u < zfv))) {
 +		susp = false;
 +	}
 +	if (susp != lp_usb_susp) {
++		lp_usb_cmd = (uint8_t)(cmd & ~0x01u);
 +		rc |= wr(USBIN + 0x40, (uint8_t)(susp ? (cmd | 0x01u) : (cmd & ~0x01u)));
 +		lp_usb_susp = susp;
 +		changed = true;
 +	}
 +	if (rc) {
-+		chg_off("SMB5 write failed", false);
++		chg_off("SMB5 write failed");
 +		return;
 +	}
 +	if (changed || z != lp_zone) {
@@ -734,6 +782,84 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +	lp_zone = z;
 +	b->fcc_ma = lp_jeita[z].fcc_ma;
 +	b->fv_mv = zfv;
++}
++
++/* the inputs of one charger step */
++struct lp_in {
++	uint8_t usbrt, path, apsd_st, apsd, snk;
++	bool external, temp_ok;
++};
++
++/*
++ * Locked. A fresh NTC sample, the NTC watchdog (no good sample for 30 s: 500 mA / 4100 mV and control
++ * off, whatever else fails) and one charger step. Runs first in every laurel_pmi632_sample (before any
++ * gauge read can return early) and from the GUARD_S timer, which does not depend on SweetBattery.
++ */
++static void
++lp_guard_locked(uint64_t ns, struct lp_in *in, struct laurel_batt *b)
++{
++	bzero(in, sizeof(*in));
++	int t = 0;
++	in->temp_ok = lp_temp_on && read_temp(&t) == 0;
++	if (in->temp_ok) {
++		lp_last_temp = t;
++		lp_temp_ok_ns = ns;
++	}
++	if (lp_chg_on && ns - lp_temp_ok_ns > NTC_STALE_NS) {
++		chg_off("no battery NTC sample for 30 s");
++	}
++	bool ok = rd(USBIN + 0x10, &in->usbrt) == 0 && rd(DCDC + 0x0b, &in->path) == 0;
++	(void)rd(USBIN + 0x07, &in->apsd_st);
++	(void)rd(USBIN + 0x08, &in->apsd);
++	(void)rd(TYPEC + 0x06, &in->snk);
++	/* a suspended input (our warm-zone suspend) has no valid power path but is still plugged in */
++	in->external = ok && (in->usbrt & 0x10u) && ((in->path & 0x01u) || lp_usb_susp);
++	uint16_t vr = 0;
++	unsigned mv = rd16(QG + 0xc0, &vr) == 0 ? (unsigned)(((uint64_t)vr * 194637u) / 1000000u) : 0;
++	if (mv < 2800 || mv > 4600) {
++		mv = 0;         /* unknown: the warm-zone suspend keeps its state */
++	}
++	if (ok) {
++		charger_step(b, (in->apsd_st & 1u) ? in->apsd : 0, in->snk, in->external, mv, ns);
++	}
++}
++
++static void
++lp_guard_fire(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	struct lp_in in;
++	struct laurel_batt scratch;
++	IOLockLock(lp_lock);
++	if (lp_chg_on) {
++		bzero(&scratch, sizeof(scratch));
++		lp_guard_locked(now_ns(), &in, &scratch);
++	}
++	bool again = lp_chg_on;
++	IOLockUnlock(lp_lock);
++	if (again) {
++		lp_guard_arm();
++	}
++}
++
++static void
++lp_guard_arm(void)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(GUARD_S, NSEC_PER_SEC, &deadline);
++	(void)thread_call_enter_delayed(lp_guard_tc, deadline);
++}
++
++/* laurel 2301: power off / restart path (panic hold, timer call): no lock, kdb_printf only */
++void
++laurel_pmi632_release_input(void)
++{
++	if (!lp_usb_susp) {
++		return;
++	}
++	int w = sweet_spmi_usbin_lane_write(0x40, lp_usb_cmd);
++	lp_usb_susp = false;
++	kdb_printf("LAUREL CHARGER: USB input suspend released before the reset (USBIN_CMD_IL 0x%02x, write %d)\n",
++	    lp_usb_cmd, w);
 +}
 +
 +static uint64_t
@@ -753,6 +879,9 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +	}
 +	bzero(b, sizeof(*b));
 +	IOLockLock(lp_lock);
++	uint64_t ns = now_ns();
++	struct lp_in in;
++	lp_guard_locked(ns, &in, b);    /* NTC watchdog + charger step, before any early return below */
 +	uint16_t vr = 0, ir = 0;
 +	uint8_t st1 = 0;
 +	if (rd16(QG + 0xc0, &vr) || rd16(QG + 0xc6, &ir) || rd(QG + 0x08, &st1)) {
@@ -764,28 +893,17 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +		IOLockUnlock(lp_lock);
 +		return -1;
 +	}
-+	uint64_t ns = now_ns();
 +	/* Linux: + = discharge; iOS: + = into the battery */
 +	int ma = (int)(-((int64_t)(int16_t)ir * lp_ilsb_nua) / 1000000);
-+	int t = lp_last_temp;
-+	bool temp_ok = lp_temp_on && read_temp(&t) == 0;
-+	if (temp_ok) {
-+		lp_last_temp = t;
-+		lp_temp_ok_ns = ns;
-+	}
++	bool temp_ok = in.temp_ok;
 +
-+	uint8_t usbrt = 0, path = 0, cs1 = 0, cs2 = 0, cs7 = 0, apsd_st = 0, apsd = 0, snk = 0, icl_st = 0, fvr = 0;
-+	bool chg_ok = rd(USBIN + 0x10, &usbrt) == 0 && rd(DCDC + 0x0b, &path) == 0 && rd(CHGR + 0x06, &cs1) == 0 &&
-+	    rd(CHGR + 0x07, &cs2) == 0 && rd(CHGR + 0x0d, &cs7) == 0;
-+	(void)rd(USBIN + 0x07, &apsd_st);
-+	(void)rd(USBIN + 0x08, &apsd);
-+	(void)rd(TYPEC + 0x06, &snk);
++	uint8_t cs1 = 0, cs2 = 0, cs7 = 0, icl_st = 0, fvr = 0;
++	uint8_t apsd_st = in.apsd_st, apsd = in.apsd, snk = in.snk;
++	bool chg_ok = rd(CHGR + 0x06, &cs1) == 0 && rd(CHGR + 0x07, &cs2) == 0 && rd(CHGR + 0x0d, &cs7) == 0;
 +	(void)rd(DCDC + 0x07, &icl_st);
 +	bool fv_ok = rd(CHGR + 0x70, &fvr) == 0;
-+	/* a suspended input (our warm-zone suspend) has no valid power path but is still plugged in */
-+	bool external = chg_ok && (usbrt & 0x10u) && ((path & 0x01u) || lp_usb_susp);
++	bool external = chg_ok && in.external;
 +	unsigned state = cs1 & 7u;
-+	charger_step(b, (apsd_st & 1u) ? apsd : 0, snk, external, mv, ns);
 +	bool charging = external && !lp_usb_susp && state >= 1 && state <= 4 && !(cs2 & 2u) && !(cs7 & 0x0cu);
 +	/* "terminated" is full only at the full FV (4400 mV), not at the warm 4100 mV */
 +	bool terminated = external && state == 5 && fv_ok && 3600u + 10u * fvr >= FV_MV - 10u;
@@ -894,8 +1012,8 @@ diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff -ruN a/bsd/dev/laurel_pmi632.h b/bsd/dev/laurel_pmi632.h
 --- a/bsd/dev/laurel_pmi632.h	1970-01-01 05:30:00.000000000 +0530
-+++ b/bsd/dev/laurel_pmi632.h	2026-11-01 04:42:07.918613196 +0530
-@@ -0,0 +1,34 @@
++++ b/bsd/dev/laurel_pmi632.h	2026-11-01 04:58:11.035509253 +0530
+@@ -0,0 +1,36 @@
 +/* laurel 2301: PMI632 battery gauge + SMB5 charger (bsd/dev/laurel_pmi632.c). C and C++. */
 +#ifndef LAUREL_PMI632_H
 +#define LAUREL_PMI632_H
@@ -926,13 +1044,15 @@ diff -ruN a/bsd/dev/laurel_pmi632.h b/bsd/dev/laurel_pmi632.h
 +int laurel_pmi632_sample(struct laurel_batt *b);
 +/* PON reasons read at init: PM6125 PON_REASON1, WARM_RESET_REASON1, PMI632 PON_REASON1. -1 unknown. */
 +int laurel_pmi632_pon(uint8_t *reason, uint8_t *warm, uint8_t *pmi);
++/* Power off / restart path, any context (no lock): release our USB input suspend. */
++void laurel_pmi632_release_input(void);
 +#ifdef __cplusplus
 +}
 +#endif
 +#endif
 diff -ruN a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
---- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:41:56.000000000 +0530
-+++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:42:07.918760705 +0530
+--- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:55:11.000000000 +0530
++++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:55:45.808807838 +0530
 @@ -1,8 +1,9 @@
  /*
 - * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
