@@ -1,0 +1,87 @@
+laurel 2014: kprintf lines go into the console ring (sweet_log_append), which the USB log carries to the host, never onto the panel; kprintf is on (the DEVELOPMENT kernel has it off without -enable_kprintf_spam); startup_debug defaults to verbose under SWEET (kernel_bootstrap / kernel_bootstrap_thread step names, startup subsystem names) and bsd_init's DEBUG_BSDINIT is 1 ('bsd_init: calling ...'). So the USB log of a boot that hangs shows the last bootstrap step (2026-11-01 02:28: nothing on the panel after 'trust caches unavailable'; the next steps are STARTUP_SUB_LOCKDOWN, OSKextRemoveKextBootstrap, machine_lockdown, PE_lockdown_iokit = ml_wait_max_cpus = SweetCPU::startAll, bsd_init). Kill switch laurelklog=0.
+diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
+--- a/pexpert/arm/pe_kprintf.c
++++ b/pexpert/arm/pe_kprintf.c
+@@ -30,6 +30,24 @@
+ 
+ static void serial_putc_crlf(char c);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * laurel 2014: kprintf lines go into the console ring (bsd/dev/sweet_ufs.c
++ * sweet_log_append), which the USB log (bsd/dev/sweet_usb.c) carries to the
++ * host, never onto the panel: kernel_bootstrap step names (startup_debug
++ * verbose, osfmk/kern/startup.c), bsd_init steps (DEBUG_BSDINIT), the
++ * SWEET CPU/GIC kprintf lines. The DEVELOPMENT kernel has kprintf off
++ * unless -enable_kprintf_spam; here it is on. Kill switch: laurelklog=0.
++ */
++extern void sweet_log_append(const char *c, int size);
++static int laurel_klog = 1;
++static void
++laurel_kputc_ring(char c)
++{
++	sweet_log_append(&c, 1);
++}
++#endif
++
+ __startup_func
+ static void
+ PE_init_kprintf_config(void)
+@@ -41,6 +59,14 @@
+ 	if (debug_boot_arg & DB_KPRT) {
+ 		disable_serial_output = false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	PE_parse_boot_argn("laurelklog", &laurel_klog, sizeof(laurel_klog));
++	if (laurel_klog) {
++		disable_serial_output = false;
++		disable_kprintf_output = false;
++		PE_kputc = laurel_kputc_ring;   /* a kprintf before STARTUP(KPRINTF) has a sink */
++	}
++#endif
+ 
+ #if DEBUG
+ 	disable_kprintf_output = false;
+@@ -68,6 +94,11 @@
+ 		 */
+ 		PE_kputc = console_write_unbuffered;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (laurel_klog) {
++		PE_kputc = laurel_kputc_ring;   /* laurel 2014: ring only, see above */
++	}
++#endif
+ }
+ STARTUP(KPRINTF, STARTUP_RANK_FIRST, PE_init_kprintf);
+ 
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -216,7 +216,12 @@
+ 
+ extern int serverperfmode;
+ 
++#if defined(SWEET)
++/* laurel 2014: the kernel_bootstrap step names go to kprintf = the console ring / USB log; startup_debug=0 turns them off */
++TUNABLE(startup_debug_t, startup_debug, "startup_debug", STARTUP_DEBUG_VERBOSE);
++#else
+ TUNABLE(startup_debug_t, startup_debug, "startup_debug", 0);
++#endif
+ 
+ static inline void
+ kernel_bootstrap_log(const char *message)
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -493,7 +493,11 @@
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#define DEBUG_BSDINIT 1         /* laurel 2014: "bsd_init: calling ..." via kprintf = console ring / USB log */
++#else
+ #define DEBUG_BSDINIT 0
++#endif
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)

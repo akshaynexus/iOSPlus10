@@ -1,0 +1,332 @@
+laurel 2013: the USB gadget is served from a timer call (interrupt context, 1 ms) until bsd_init attaches ue0, not from a kernel thread: on the first UEFI boot (2026-11-01 02:28) the host asked GET_DESCRIPTOR for 30 s and got no answer because the boot hung after 'trust caches unavailable' and the service thread never ran (kernel_bootstrap_thread never blocked, or no timer interrupt). In the callback: no locks, spin delays, printf into the console ring only (console I/O with interrupts off panics on arm64). ud_thread prints the status lines and takes over at the attach. Self-check at STARTUP(LOCKDOWN) (right after the trust caches, on the panel): 'LAUREL USB: timer service: on, first tick after N us' or 'NO tick in 50 ms' + EL/DAIF/ISR/CNTV/ICC_*/GICD_CTLR/GICR state of the boot CPU (pe_fiq.c sweet_gic_state). pe_init_fiq also clears ICC_AP1R0_EL1 so no active priority left by the firmware blocks the PPIs/SGIs.
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -27,6 +27,23 @@
+  * `bootloader`. The attach switches to ue0 + mbufs + sockets without a
+  * gap (the socket log goes on at the raw stream position).
+  *
++ * Patch 2013: timer-call service. Until bsd_init attaches ue0 the
++ * controller is served from a timer call (interrupt context, every 1 ms),
++ * not from a kernel thread: a thread runs only when the kernel_bootstrap
++ * thread blocks, and the first UEFI boot (2026-11-01 02:28) showed the
++ * host trying GET_DESCRIPTOR for 30 s with no answer while the boot hung
++ * after "trust caches unavailable" (the thread never ran). The timer call
++ * needs only the timer interrupt, so the log and the commands work as
++ * long as interrupts reach the boot CPU. In the callback nothing sleeps,
++ * locks or prints to the panel (console I/O with interrupts off panics on
++ * arm64): printf goes to the console ring only, like the panic hold.
++ * ud_thread prints the status lines on the panel and takes over the
++ * service at the ue0 attach. Self-check (STARTUP LOCKDOWN, right after
++ * the trust caches, on the panel): "LAUREL USB: timer service: first tick
++ * after N us" or, when no tick comes in 50 ms, one line with the CPU and
++ * GIC state (EL, DAIF, ISR, CNTV, ICC_*, GICD_CTLR, GICR of this CPU) so
++ * the photo tells why the timer interrupt does not arrive.
++ *
+  * SWEET: USB bring-up, step 1 - read-only state probe.
+  *
+  * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+@@ -51,6 +68,7 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
+ #include <kern/startup.h>
++#include <kern/timer_call.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+ #include <sys/sockio.h>
+@@ -90,6 +108,13 @@
+ extern void laurel_restart(void);
+ extern void laurel_power_off(void);
+ static volatile bool ud_in_panic;
++/* Patch 2013: the timer call owns the controller until the ue0 attach */
++static timer_call_data_t ud_tc;
++static volatile bool ud_tc_mode;        /* ud_thread only prints status lines while set */
++static volatile bool ud_in_tc;          /* inside the callback: ring-only printf, spin delays, no locks */
++static volatile uint64_t ud_tc_ticks;
++static uint64_t ud_tc_period;
++#define ud_nolock() (ud_in_panic || ud_in_tc)
+ static volatile bool ud_log_rewind;     /* "log" command: ud_log_thread sends the last 64 KiB again */
+ static volatile uint64_t ud_log_sent;   /* console ring position that ud_log_thread has sent up to */
+ 
+@@ -109,7 +134,7 @@
+ 	sweet_log_append(buf, n);
+ 	return n;
+ }
+-#define printf(...) (ud_in_panic ? ud_panic_log(__VA_ARGS__) : printf(__VA_ARGS__))
++#define printf(...) ((ud_in_panic || ud_in_tc) ? ud_panic_log(__VA_ARGS__) : printf(__VA_ARGS__))
+ 
+ /* Mi A3: GCC 0x1400000 (gcc-trinket.c halt registers), GDSC usb30_prim 0x141a004 */
+ #define GCC_PA                  0x01400000
+@@ -290,7 +315,7 @@
+ static void
+ ud_udelay(uint32_t us)
+ {
+-	if (!ud_in_panic) {
++	if (!ud_nolock()) {
+ 		delay(us);
+ 		return;
+ 	}
+@@ -1737,11 +1762,11 @@
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+ 			/* laurel: the host re-enumerates: data endpoints off until SET_CONFIGURATION */
+ 			dwc_wr(DALEPENA, 0x3);
+-			if (!ud_in_panic) {
++			if (!ud_nolock()) {
+ 				lck_mtx_lock(ud.lock);
+ 			}
+ 			ud.tx_busy = false;
+-			if (!ud_in_panic) {
++			if (!ud_nolock()) {
+ 				lck_mtx_unlock(ud.lock);
+ 			}
+ 			ud.configured = false;
+@@ -1769,8 +1794,8 @@
+ 		return;
+ 	}
+ 	if (ep == EP_TX && type == 1) {
+-		if (ud_in_panic) {
+-			ud.tx_busy = false;     /* laurel_usb_panic_service() sends the next frame */
++		if (ud_nolock()) {
++			ud.tx_busy = false;     /* the panic loop / timer callback sends the next frame */
+ 			return;
+ 		}
+ 		lck_mtx_lock(ud.lock);
+@@ -1814,6 +1839,119 @@
+ 	}
+ }
+ 
++/* The pending controller events (polled; the event interrupt is masked). */
++static void
++ud_service_events(void)
++{
++	uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++	if (count > UD_EVT_SIZE) {
++		count = UD_EVT_SIZE;
++	}
++	if (count) {
++		ud_sync(UD_EVT, UD_EVT_SIZE);
++		for (uint32_t done = 0; done + 4 <= count; done += 4) {
++			uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++			ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++			/* ack each event before it is handled: a panic inside ud_event()
++			 * leaves GEVNTCOUNT and evt_pos in step for the panic loop */
++			dwc_wr(GEVNTCOUNT, 4);
++			if (ud.events++ < 200) {
++				printf("SWEET USB: event 0x%08x\n", ev);
++			}
++			ud_event(ev);
++		}
++	}
++}
++
++/*
++ * Patch 2013: one service step from the timer call (interrupt context, on
++ * whatever CPU the timer fires). Everything here is the panic-loop code
++ * path: no locks (ud_nolock()), spin delays, printf into the ring only.
++ */
++static void
++ud_tc_func(timer_call_param_t p0 __unused, timer_call_param_t p1 __unused)
++{
++	if (ud_in_panic || !ud_tc_mode) {
++		return;                         /* the panic CPU or ud_thread owns the controller: no re-arm */
++	}
++	ud_in_tc = true;
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++	ud_tc_ticks++;
++	ud_service_events();
++	ud_raw_action(ud_raw_tx_service());
++	ud_ctl_poll();
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++	ud_in_tc = false;
++	if (ud_tc_mode && !ud_in_panic) {
++		timer_call_enter(&ud_tc, mach_absolute_time() + ud_tc_period, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
++	}
++}
++
++static void
++ud_tc_start(void)
++{
++	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &ud_tc_period);
++	timer_call_setup(&ud_tc, ud_tc_func, NULL);
++	ud_tc_mode = true;
++	timer_call_enter(&ud_tc, mach_absolute_time() + ud_tc_period, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
++}
++
++/* Hand the controller to ud_thread (the ue0 attach): no callback runs after this returns. */
++static void
++ud_tc_stop(void)
++{
++	ud_tc_mode = false;
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++	(void)timer_call_cancel(&ud_tc);
++	while (ud_in_tc) {
++		ud_udelay(10);
++	}
++	printf("LAUREL USB: timer service handed to ud_thread after %llu ticks\n", ud_tc_ticks);
++}
++
++/*
++ * Self-check of the timer service, at STARTUP(LOCKDOWN) = right after
++ * "trust caches" in kernel_bootstrap_thread, interrupts enabled, before
++ * PE_lockdown_iokit waits for the CPU bring-up: the first tick must have
++ * come (the controller was started before IOKit matching). If not, the
++ * timer interrupt does not reach this CPU and nothing that sleeps can go
++ * on (SweetCPU::startAll, ud_thread, bsd_init); the line gives the state
++ * that decides where it is lost: CNTV (the timer itself), ICC_* (CPU
++ * interface, running priority), GICR (enable/pending/active/group of this
++ * CPU's PPI), GICD_CTLR, DAIF/ISR (pending at the PE but masked?).
++ */
++extern void sweet_gic_state(uint32_t out[8]);   /* pexpert/arm/pe_fiq.c, laurel 2013 */
++static void laurel_usb_timer_check(void);
++static void
++laurel_usb_timer_check(void)
++{
++	if (!ud_running || !ud_tc_mode) {
++		return;
++	}
++	uint64_t t0 = mach_absolute_time(), limit, ns;
++	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &limit);
++	while (ud_tc_ticks == 0 && mach_absolute_time() - t0 < limit) {
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	if (ud_tc_ticks) {
++		printf("LAUREL USB: timer service: on, first tick after %llu us (timer interrupt and GIC OK)\n", ns / 1000);
++		return;
++	}
++	uint32_t g[8];
++	sweet_gic_state(g);
++	printf("LAUREL USB: timer service: NO tick in %llu ms: the timer interrupt does not reach this CPU: "
++	    "EL%llu DAIF 0x%llx ISR 0x%llx CNTV_CTL 0x%llx TVAL %lld ICC SRE 0x%llx PMR 0x%llx IGRPEN1 %llu RPR 0x%llx "
++	    "CTLR 0x%llx | GICD_CTLR 0x%08x GICR WAKER 0x%08x ISENABLER0 0x%08x ISPENDR0 0x%08x ISACTIVER0 0x%08x "
++	    "IGROUPR0 0x%08x prio 0x%02x intid %u\n", ns / NSEC_PER_MSEC,
++	    __builtin_arm_rsr64("CurrentEL") >> 2, __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("ISR_EL1"),
++	    __builtin_arm_rsr64("CNTV_CTL_EL0"), (int64_t)(int32_t)__builtin_arm_rsr64("CNTV_TVAL_EL0"),
++	    __builtin_arm_rsr64("ICC_SRE_EL1"), __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
++	    __builtin_arm_rsr64("ICC_RPR_EL1"), __builtin_arm_rsr64("ICC_CTLR_EL1"),
++	    g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
++	printf("LAUREL USB: timer service: log and commands wait for the first timer interrupt\n");
++}
++STARTUP(LOCKDOWN, STARTUP_RANK_FIRST, laurel_usb_timer_check);
++
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -1823,34 +1961,22 @@
+ 			ud_sleep_ms(1000);
+ 			continue;
+ 		}
+-		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+-		if (count) {
+-			ud_sync(UD_EVT, UD_EVT_SIZE);
+-			for (uint32_t done = 0; done < count; done += 4) {
+-				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
+-				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
+-				/* ack each event before it is handled: a panic inside ud_event()
+-				 * leaves GEVNTCOUNT and evt_pos in step for the panic loop */
+-				dwc_wr(GEVNTCOUNT, 4);
+-				if (ud.events++ < 200) {
+-					printf("SWEET USB: event 0x%08x\n", ev);
+-				}
+-				ud_event(ev);
++		if (!ud_tc_mode) {              /* patch 2013: the timer call serves until the ue0 attach */
++			ud_service_events();
++			if (ud_early) {
++				lck_mtx_lock(ud.lock);
++				int action = ud_raw_tx_service();
++				lck_mtx_unlock(ud.lock);
++				ud_raw_action(action);
+ 			}
++			ud_ctl_poll();
+ 		}
+-		if (ud_early) {
+-			lck_mtx_lock(ud.lock);
+-			int action = ud_raw_tx_service();
+-			lck_mtx_unlock(ud.lock);
+-			ud_raw_action(action);
+-		}
+-		ud_ctl_poll();
+ 		++ticks;
+ 		if (!ud.configured && (ticks % 10000) == 0) {
+ 			/* one line per 10 s until the host configures the gadget: the panel shows where it stops */
+ 			uint32_t dsts = dwc_rd(DSTS);
+-			printf("LAUREL USB: no host yet (%u s): DSTS 0x%08x link %u speed %u events %u%s\n",
+-			    ticks / 1000, dsts, (dsts >> 18) & 0xf, dsts & 7, ud.events, ud_early ? ", raw mode" : "");
++			printf("LAUREL USB: no host yet (%u s): DSTS 0x%08x link %u speed %u events %u%s, timer ticks %llu\n",
++			    ticks / 1000, dsts, (dsts >> 18) & 0xf, dsts & 7, ud.events, ud_early ? ", raw mode" : "", ud_tc_ticks);
+ 		} else if (ud.configured && (ticks % 30000) == 0) {
+ 			printf("LAUREL USB: %s rx %llu tx %llu frames\n", ud_early ? "raw" : "ue0", ud.rx_frames, ud.tx_frames);
+ 		}
+@@ -2004,8 +2130,9 @@
+ 	PE_parse_boot_argn("sweetusblog", &ud_livelog, sizeof(ud_livelog));
+ 	ud_raw_begin();
+ 	ud_running = true;
++	ud_tc_start();                  /* patch 2013: served from the timer call until the ue0 attach */
+ 	printf("LAUREL USB: on: ECM 192.168.7.2 (raw frames until bsd_init attaches ue0), log udp 192.168.7.1:5140 %s, "
+-	    "commands udp :5141 %s, panic hold %s\n", ud_livelog ? "on" : "off",
++	    "commands udp :5141 %s, panic hold %s, timer service 1 ms\n", ud_livelog ? "on" : "off",
+ 	    ud.ctl_enabled ? "on" : "off", ud_panic_enabled ? "on" : "off");
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+@@ -2023,6 +2150,7 @@
+ {
+ 	thread_t thread;
+ 
++	ud_tc_stop();                   /* patch 2013: from here ud_thread serves the controller */
+ 	ud_if_create();
+ 	if (ud.ifp == NULL) {
+ 		printf("LAUREL USB: ue0 not attached: raw frames stay on (log and commands still work)\n");
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -197,6 +197,10 @@
+ 	__builtin_arm_wsr64("ICC_BPR0_EL1", 0);
+ #endif /* SWEET */
+ 	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
++#if defined(SWEET)
++	/* laurel 2013: no active priority left by the firmware (UEFI) may block the PPIs/SGIs */
++	__builtin_arm_wsr64("ICC_AP1R0_EL1", 0);
++#endif
+ 
+ 	// Set EOI mode of this processor
+ 	uint64_t icc_ctlr = __builtin_arm_rsr64("ICC_CTLR_EL1");
+@@ -222,6 +226,40 @@
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++
++#if defined(SWEET)
++/*
++ * laurel 2013: GIC state of the calling CPU for the USB timer-service
++ * self-check (bsd/dev/sweet_usb.c): GICD_CTLR, GICR WAKER, ISENABLER0,
++ * ISPENDR0, ISACTIVER0, IGROUPR0, the priority of the timer PPI, its INTID.
++ */
++#ifndef GICR_ISPENDR0
++#define GICR_ISPENDR0   0x10200
++#endif
++#ifndef GICR_ISACTIVER0
++#define GICR_ISACTIVER0 0x10300
++#endif
++void sweet_gic_state(uint32_t out[8]);
++void
++sweet_gic_state(uint32_t out[8])
++{
++	if (!gicd_base || !gicr_base) {
++		for (int i = 0; i < 8; i++) {
++			out[i] = 0;
++		}
++		return;
++	}
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	out[0] = gicd_read32(GICD_CTLR);
++	out[1] = gicr_read32(GICR_WAKER);
++	out[2] = gicr_read32(GICR_ISENABLER0);
++	out[3] = gicr_read32(GICR_ISPENDR0);
++	out[4] = gicr_read32(GICR_ISACTIVER0);
++	out[5] = gicr_read32(GICR_IGROUPR0);
++	out[6] = (gicr_read32(GICR_IPRIORITYR0 + (sweet_vtimer_intid & ~3u)) >> (8 * (sweet_vtimer_intid & 3))) & 0xff;
++	out[7] = sweet_vtimer_intid;
++}
++#endif /* SWEET */
+ #else
+ void
+ pe_init_fiq()

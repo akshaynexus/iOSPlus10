@@ -168,3 +168,32 @@ image is 2,535,424 bytes.
 - 02:23 [V]: Mu rebuilt (both patches apply, 52 images, 15 s), both images rebuilt. NOT BOOTED since the fix. Next:
   owner puts the phone in fastboot (Power+VolDown), flash the Mu-only image, photo: expect the bank lines, no
   exception, the Mu front page; then the full image.
+- 02:28 **first full-chain boot [V photo]: the whole chain works.** Mu (both patches), UniXNU, DarwinBoot, XNU on Silver
+  0x0. Panel lines: keepsyms, "No POST boot-arg set", SWEET platform expert, `LAUREL REBOOT: on: PSCI off/reset, IMEM
+  reason at 0xc12565c`, AKS, WDT, SURF, HID touch/buttons, `CPUFREQ gold 0->7 (2016 MHz)`, AMFI, `LAUREL FB SCANOUT: on:
+  VIG0 (0x5e05000) fetches 0x5c000000 720x1560 stride 2880` (Mu's SimpleFb stages the screen on VIG0, as topaz), DSI0,
+  INTF1, `SWEET CPU: requested=8 selected=8 (limit=8)`, `LAUREL CPU: boot cpu mpidr=0x0 (Silver, UEFI path)`, `SWEET USB:
+  running (DSTS 0x00820001 after 0 ms), DMA at 0x83113000`, `LAUREL USB: on: ECM 192.168.7.2 ...`, vnguard, `SWEET: trust
+  caches unavailable (Image4/AMFI not installed)` = last line. No `SWEET CPU: cpu=1 CPU_ON`, no bsd_init copyright banner.
+  Host (xHCI, 02:28:02-02:28:36): "new high-speed USB device", `device descriptor read/64, error -110` then `-71`, port
+  power cycle, "device not accepting address", "unable to enumerate": the DWC3 connected (pull-up, HS link) and no one
+  served EP0.
+- Reading [I, strong, from the code]: after the trust-cache line kernel_bootstrap_thread runs STARTUP_SUB_LOCKDOWN,
+  OSKextRemoveKextBootstrap, machine_lockdown, then `PE_lockdown_iokit()` = `ml_wait_max_cpus()`, which sleeps until
+  `SweetCPU::startAll` calls `ml_set_max_cpus` after every core came up; then bsd_init (`printf(copyright)` is its first
+  console line). startAll had printed its first two lines, then waits for the boot CPU's own self-SGI and each
+  secondary's start with `IOSleep(1)`; `ud_thread` (USB) waits with 1 ms sleeps. All three stop at once if the timer
+  interrupt does not reach Silver CPU0 (every IOSleep/thread_block needs it), which also explains the silent panel
+  (the "not alive after 5 s" and "CPU_ON" lines come after a sleep). On the shim path (ABL -> shim, boot CPU Gold
+  0x100) the same kernel got past this point. Differences: the boot CPU (CPU0's redistributor was used by ABL and Mu),
+  Mu's GIC exit state (`GicV3ExitBootServicesEvent`: sources, CPU interface and distributor disabled; pe_init_fiq
+  re-enables them), the timer PPI (sweet uses the ADT `virtual-timer-intid`; Mu used INTID 18, the physical timer,
+  and disabled it). Alternative [I]: kernel_bootstrap_thread spins without blocking; both cases starve the threads.
+- Fixes built 02:56 (kernel 215 patches, 0 LSE/RCpc; image `laurel-uefi-boot.img` 52862976 bytes), details in
+  `usb-debug.md` "Patches 2013 and 2014": **2013** serves the USB gadget from a 1 ms `timer_call` (interrupt context,
+  no scheduler) until bsd_init attaches ue0, with a self-check at STARTUP(LOCKDOWN) that prints on the panel whether
+  the first tick came (`LAUREL USB: timer service: on, first tick after N us`) or the full CPU/GIC state when no tick
+  comes in 50 ms; pe_init_fiq clears `ICC_AP1R0_EL1`. **2014** puts kprintf (bootstrap step names, bsd_init steps) into
+  the console ring = the USB log. NOT BOOTED yet; `scripts/bg.sh laurel-test ...` waits for fastboot (owner: Power+VolDown).
+  Expected next photo: the `timer service:` line right after `trust caches`; if "on", the host enumerates the ECM
+  device and `logs/laurel-boot-*.log` ends with the last `kernel_bootstrap_thread:` / `SWEET CPU:` line.

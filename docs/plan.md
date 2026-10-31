@@ -498,3 +498,21 @@ IMG=out/laurel/uefi/laurel-uefi-boot.img NOFLASH=1` (usblog is up): UniXNU menu,
 bar, `LAUREL CPU: boot cpu mpidr=0x0`, USB Ethernet + `op10tool ctl ping`. Fallback if the Silver boot fails: DarwinBoot
 PSCI hand-off to Gold 0x100 + `--boot gold`. Restore Android: `BOOTIMG=~/laurel-backup/stock/images/boot.img
 scripts/laurel/flash-boot.sh`.
+
+## Mi A3: full UEFI chain boots XNU (2026-11-01 02:28); hang after trust caches; patches 2013/2014 (02:58)
+
+Done [V]: boot 02:28 of commit ccb5eaa reached the kernel console through Mu -> UniXNU -> DarwinBoot on Silver 0x0 (photo:
+FB scan-out on VIG0, USB `running`, `LAUREL USB: on`, last line `SWEET: trust caches unavailable`). The host saw the DWC3
+connect but got no EP0 answer (GET_DESCRIPTOR timeouts): the USB service thread never ran, nor did `SweetCPU::startAll`
+(no CPU_ON lines), nor bsd_init. Analysis (`docs/laurel_sprout/uefi-boot.md` Status, `usb-debug.md` "Patches 2013 and
+2014"): the next bootstrap step `PE_lockdown_iokit` = `ml_wait_max_cpus` sleeps until startAll finishes; every waiter
+needs the timer interrupt on the boot CPU. Patch 2013: USB gadget served from a 1 ms timer_call (no scheduler) + panel
+self-check of the timer interrupt at STARTUP(LOCKDOWN) with the GIC/CNTV/ICC state; pe_init_fiq clears ICC_AP1R0.
+Patch 2014: kprintf (bootstrap and bsd_init step names) into the console ring = USB log. Kernel 215 patches, 0 LSE;
+image `out/laurel/uefi/laurel-uefi-boot.img` 02:56.
+Next (owner): Power+VolDown into fastboot; the tmux job `laurel-test` (started 02:56:51) flashes boot_b and boots. Photo
+of the panel: the line after `trust caches` must be `LAUREL USB: timer service: on, first tick after N us` (then the host
+enumerates and `logs/laurel-boot-*.log` shows the last `kernel_bootstrap_thread:`/`SWEET CPU:` step before the hang) or
+`... NO tick in 50 ms: ...` with the register values (then the fix is in the GIC/timer bring-up after Mu: read ISPENDR0,
+ISR, RPR, CNTV_CTL per the table in usb-debug.md). Then: the secondary-CPU start under the UEFI path (startAll waits
+for Silver 0x1-0x3 and Gold 0x100-0x103 with PSCI CPU_ON from Silver 0x0; 2004 keeps the boot going with dead cores).

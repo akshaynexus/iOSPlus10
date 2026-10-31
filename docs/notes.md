@@ -3608,3 +3608,37 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - `uefi-image.sh`: MU_ONLY output is now `laurel-mu-only-boot.img` (both modes wrote `laurel-uefi-boot.img` before), and
   the empty cpio is padded to 4096 bytes (NegroniBootMemoryDxe needs a 512 multiple).
 - `make laurel-mu` already runs in tmux (`scripts/bg.sh laurel-mu`); do not wrap it in bg.sh again ("session already running").
+
+## Mi A3: full UEFI chain boots XNU; hang after trust caches = starved threads; patches 2013/2014 (2026-11-01 02:58, branch laurel-sprout)
+- [V photo 02:28, image ccb5eaa] ABL -> Mu (MCCC fix works) -> UniXNU -> DarwinBoot -> XNU on Silver 0x0: panel shows the
+  kernel console up to `SWEET: trust caches unavailable (Image4/AMFI not installed)`; `LAUREL FB SCANOUT: on: VIG0`, `SWEET USB:
+  running (DSTS 0x00820001)`, `LAUREL USB: on:` before it. No `SWEET CPU: cpu=1 CPU_ON`, no bsd_init banner, no panic.
+- [V host dmesg 02:28:02-36] HS device appears, every GET_DESCRIPTOR times out (-110, -71), "unable to enumerate": the gadget
+  connected (Run/Stop + VBUS override OK) but EP0 was never served. ud_thread never ran.
+- [V code] What comes next in kernel_bootstrap_thread (osfmk/kern/startup.c): STARTUP_SUB_LOCKDOWN, OSKextRemoveKextBootstrap,
+  machine_lockdown, PE_lockdown_iokit = `ml_wait_max_cpus()` (pexpert/arm/pe_init.c:198) -> sleeps until SweetCPU::startAll calls
+  `ml_set_max_cpus` after every core came alive; bsd_init's first console line is `printf(copyright)`. startAll (SweetCPU.cpp)
+  prints "requested/selected" and "LAUREL CPU: boot cpu" (both seen), then waits on `IOSleep(1)` for the boot CPU's self-SGI
+  and each secondary. Everything that waits (startAll, ud_thread, bootstrap) needs the timer interrupt on the boot CPU.
+  [I, strong] No timer interrupt reaches Silver CPU0 after Mu (or the bootstrap thread spins); either way threads starve.
+- [V code] printf from interrupt context panics on arm64 after EARLY_BOOT (`console_io_allowed`, serial_console.c:167): any
+  service that runs from a timer call may only write to the console ring (`sweet_log_append`, lockless).
+- [V code] kprintf is off in the DEVELOPMENT kernel (`disable_kprintf_output` unless -enable_kprintf_spam); `debug=0xc` only
+  clears `disable_serial_output`. The sweet "serial" is the fbcon on the boot framebuffer (pe_serial.c), so kprintf on the panel
+  would clutter it. IOLog goes to the console via `console_printbuf_putc` gated by `disable_iolog_serial_output` (NOT a kprintf
+  tee; do not set it true, it would silence IOLog on the panel).
+- [V code] Mu GicV3ExitBootServicesEvent (fork Mu_Basecore ArmGicV3Dxe.c:718) disables sources (0..max SPI), CPU interface
+  and distributor; no EOI loop. Mu's timer: `PcdArmArchTimerIntrNum|18` (NicobarPkg.dsc.inc) = the Qualcomm NS physical timer
+  PPI (trinket: PPI 2; virtual timer = PPI 3 = INTID 19, not the ARM default 27).
+- Patch 2013 `laurel-usb-timer-service`: USB served from a 1 ms timer_call until the ue0 attach (panic-loop rules inside:
+  `ud_nolock()`, ring-only printf, spin delays); ud_thread = panel status + takes over at the attach; self-check
+  STARTUP(LOCKDOWN, RANK_FIRST) prints `LAUREL USB: timer service: on, first tick after N us` or `NO tick in 50 ms` + EL, DAIF,
+  ISR, CNTV_CTL/TVAL, ICC SRE/PMR/IGRPEN1/RPR/CTLR, GICD_CTLR, GICR WAKER/ISENABLER0/ISPENDR0/ISACTIVER0/IGROUPR0/prio/intid
+  (`sweet_gic_state` in pe_fiq.c); pe_init_fiq writes ICC_AP1R0_EL1 = 0.
+- Patch 2014 `laurel-klog-ring`: kprintf on, into the console ring only (`laurel_kputc_ring`), `startup_debug` default verbose
+  under SWEET, `DEBUG_BSDINIT 1`; kill switch `laurelklog=0`. The USB log then ends with the last bootstrap step.
+- [V] Build 02:56: 215 patches apply, kernel 26.6 s, 0 LSE/RCpc, symbols ud_tc_func/laurel_usb_timer_check/sweet_gic_state/
+  laurel_kputc_ring present; image rebuilt 52862976 bytes. `scripts/bg.sh laurel-test env IMG=out/laurel/uefi/laurel-uefi-boot.img
+  BOOT=reboot HOLD_S=180 scripts/laurel/boot-test.sh` started 02:56:51, waiting for fastboot (owner: Power+VolDown).
+- Lesson: a kernel thread is not a safe home for a debug channel on an unknown boot; a timer_call needs only the timer IRQ, and
+  its self-check at the last known-good point tells timer-dead from thread-starved with one panel line.

@@ -83,3 +83,49 @@ bsd_init was a silent no-op (so "no USB device at all" and no `LAUREL USB:` line
 
 Boot 2026-11-01 01:03 (image: kernel 2007, cpus=4 on the 8-core ADT, `fastboot continue` = warm path): "Resuming boot
 OKAY", fastboot device gone at 01:03:18, no USB device on the host in 180 s (exit 2). Panel photo pending.
+
+## Patches 2013 and 2014: timer-call service, kprintf in the USB log (2026-11-01 02:50)
+
+Boot 02:28 (UEFI chain, image of commit ccb5eaa, panel photo + host `dmesg`): the kernel printed
+`LAUREL USB: on: ...` and stopped after `SWEET: trust caches unavailable`; the host saw a high-speed device
+(pull-up on, so Run/Stop and the VBUS override work) but every GET_DESCRIPTOR timed out (`-110`, then `-71`,
+"unable to enumerate"). So the DWC3 connected and nobody served EP0: `ud_thread` (a kernel thread) never ran.
+A kernel thread runs only when `kernel_bootstrap_thread` blocks and the timer interrupt delivers the wake-ups;
+the same two conditions hold for `SweetCPU::startAll` (no `CPU_ON` line either) and bsd_init.
+
+- **2013 timer-call service.** Until bsd_init attaches ue0 the controller is served by a `timer_call` every 1 ms
+  (interrupt context, `ud_tc_func`): events, EP0, raw-mode frames (log, ARP, commands), `ud_ctl_poll`. It needs
+  only the timer interrupt, not the scheduler. Inside the callback the code runs the panic-loop rules
+  (`ud_nolock()`): no mutex, spin delays, `printf` into the console ring only (console I/O with interrupts off
+  panics on arm64, `console_io_allowed`). `ud_thread` still prints the 10 s status line on the panel
+  (`... events N, timer ticks M`) and takes the controller over at the ue0 attach (`ud_tc_stop`, line
+  `LAUREL USB: timer service handed to ud_thread after N ticks`). Panic hold: unchanged (the callback stops
+  itself when `ud_in_panic` is set).
+- **Self-check** `laurel_usb_timer_check`, `STARTUP(LOCKDOWN, RANK_FIRST)` = right after the trust-cache line,
+  interrupts enabled, before `PE_lockdown_iokit` (which waits for the CPU bring-up): waits up to 50 ms for the
+  first tick. Panel line `LAUREL USB: timer service: on, first tick after N us (timer interrupt and GIC OK)`, or
+  `LAUREL USB: timer service: NO tick in 50 ms: the timer interrupt does not reach this CPU: EL.. DAIF.. ISR..
+  CNTV_CTL.. TVAL.. ICC SRE.. PMR.. IGRPEN1.. RPR.. CTLR.. | GICD_CTLR.. GICR WAKER.. ISENABLER0.. ISPENDR0..
+  ISACTIVER0.. IGROUPR0.. prio.. intid..` (`sweet_gic_state()` in pe_fiq.c reads this CPU's redistributor). How
+  to read it: `ISPENDR0` bit `intid` set + `ISR` bit 7 clear = the GIC holds the PPI (group/enable/priority/
+  running-priority problem); `ISR` set + `DAIF` I bit set = masked at the PE; `CNTV_CTL` not 1 or TVAL positive
+  = the timer is not armed; `RPR` below 0xFF = an active priority blocks (firmware leftover).
+- `pe_init_fiq` (pe_fiq.c) also writes `ICC_AP1R0_EL1 = 0` on every CPU: a stale active priority left by the
+  firmware cannot block the PPIs/SGIs. [I] Mu's `GicV3ExitBootServicesEvent` (Mu_Basecore ArmGicV3Dxe.c:718)
+  disables the sources and the CPU interface and the distributor; it does not EOI, so this is a guard, not a
+  known fix.
+- **2014 kprintf in the ring.** `kprintf` is on and writes into the console ring only (`laurel_kputc_ring`,
+  never the panel); `startup_debug` defaults to verbose under SWEET (`kernel_bootstrap: ...`,
+  `kernel_bootstrap_thread: ...`, startup subsystem names) and `DEBUG_BSDINIT` is 1 (`bsd_init: calling ...`).
+  The USB log of a hanging boot therefore ends with the last bootstrap step. Kill switch `laurelklog=0`.
+  Expected sequence after `trust caches`: `kernel_bootstrap_thread: OSKextRemoveKextBootstrap`,
+  `machine_lockdown`, `PE_lockdown_iokit` (waits in `ml_wait_max_cpus` for `SweetCPU::startAll`, which calls
+  `ml_set_max_cpus` after all cores), then `bsd_init: calling ...`.
+
+What the next boot shows, by case:
+
+| Panel | USB on the host | Meaning |
+| --- | --- | --- |
+| `timer service: on, first tick after N us` and the host enumerates (usblog gets the ring) | log ends with the last `kernel_bootstrap_thread:`/`SWEET CPU:` line | the hang is in that step; interrupts work |
+| `timer service: NO tick ...` | still "unable to enumerate" | the timer interrupt does not reach Silver CPU0 after Mu; the register values in the line say where (GIC vs CNTV vs DAIF) |
+| `timer service: on` but no enumeration | - | EP0 is served; the fault is in the DWC3 setup itself (next: compare DEPCFG/TRB with ABL usbfn) |
