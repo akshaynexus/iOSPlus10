@@ -1,0 +1,42 @@
+laurel 2152: the SWEET FPS line (topaz 0942/0943/0946: frames swapped per window, longest gap, late frames, present + latch time) is the frame-rate report of the GPU path and is on by default: the first 6 lines every second, then one line every 10 s while frames come (a 10 s window: frames/10 = fps). Boot-arg sweetfps=0 turns it off; sweetfps=1 keeps topaz's line every second.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -895,16 +895,22 @@
+ static void
+ sweet_fps_count(void)
+ {
+-	static int on = -1;                     /* boot-arg sweetfps=1: the SWEET FPS line */
++	/*
++	 * laurel 2152: the SWEET FPS line is the frame-rate report of the GPU path and is on by default, one line
++	 * every 10 s while frames come (the first 6 lines: every second, to see the start); sweetfps=0 turns it off,
++	 * sweetfps=1 keeps topaz's line every second.
++	 */
++	static int on = -1;
+ 	if (on < 0) {
+-		uint32_t v = 0;
+-		on = PE_parse_boot_argn("sweetfps", &v, sizeof(v)) && v != 0;
++		uint32_t v = 2;
++		(void)PE_parse_boot_argn("sweetfps", &v, sizeof(v));
++		on = (int)v;
+ 	}
+ 	if (!on) {
+ 		return;
+ 	}
+ 	static uint64_t last, window, gap_max;
+-	static uint32_t frames, late;
++	static uint32_t frames, late, lines;
+ 	uint64_t now = mach_absolute_time(), ns = 0, gap = 0;
+ 
+ 	if (last != 0) {
+@@ -926,7 +932,8 @@
+ 	}
+ 	gap_max = gap > gap_max ? gap : gap_max;
+ 	absolutetime_to_nanoseconds(now - window, &ns);
+-	if (ns >= 1000000000ull) {
++	if (ns >= (on == 1 || lines < 6 ? 1000000000ull : 10000000000ull)) {
++		lines++;
+ 		IOLog("SWEET FPS: %u frames in %llu ms, longest gap %llu ms, %u late; a frame: %llu us in present + latch, "
+ 		    "came %llu us after the tick\n", frames, ns / 1000000, gap_max / 1000000, late,
+ 		    frames ? sweet_fps_wait_ns / 1000 / frames : 0, frames ? sweet_fps_after_ns / 1000 / frames : 0);

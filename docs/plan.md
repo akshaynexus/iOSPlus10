@@ -560,3 +560,14 @@ dark, then back with a fade). Details: notes.md, same date, 04:40.
   /dev/redwood-haptic; expected line `LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)`. Test: Settings > Sounds &
   Haptics > Ringtone > Vibration preview. UI/keyboard taps wait for the RedwoodAudio plug-in + VirtualAudio in the root
   (docs/laurel_sprout/haptics.md).
+## Mi A3: GPU (Adreno 610) path built, not booted (2026-11-01 05:00, area B, branch t3/laurel-adreno-610-gpu)
+
+Done [V build]: kernel patches 2150 (TopazAdreno trinket values, on by default, `gpu=0` kill switch, own zap shader + SQE from
+the root, run-time GPU pool 0xC0000000+512 MB with midmem fallback, CP fence self-check, `LAUREL GPU: on|off`), 2151 (IOSurface
+placement by GPU state, 720x1560 screen surfaces from the pool), 2152 (`SWEET FPS` every 10 s by default); 222 patches, 0 LSE.
+Linux builds: `scripts/laurel/gpu-firmware.sh` (stock vendor image -> a610_zap + a630_sqe.fw), `mesa-linux.sh` (Mesa 25.0.7
+freedreno, 47 s), `gpu-userland.sh` (libtopaz-gl, libtopaz-inject, backboardd wrapper), `root-add-gpu.sh` (root.sh calls it).
+Details and expected log lines: docs/laurel_sprout/gpu.md.
+Next: rebuild the root (`sudo scripts/laurel/root.sh` after gpu-firmware.sh + gpu-userland.sh as the user), flash userdata
+(owner approval), boot the 2150-2152 kernel; check `LAUREL GPU: on: Adreno 610 chip 0x06010000 ...`, backboardd
+`libtopaz-gl.dylib loaded`, `SWEET FPS` lines. Then GX corner vote and clocks; Turnip + metal2vulkan (Metal) later.

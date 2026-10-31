@@ -1,0 +1,68 @@
+laurel 2151: IOSurface placement follows the GPU state instead of boot-arg gpu=1 (the GPU is on by default since 2150): direct scanout slots (cached) are off while the GPU is wanted (not gpu=0, not failed); contiguous below-4-GiB surfaces while wanted; backboardd's screen-sized surfaces from the write-combined GPU pool only once RedwoodGPU is up (asked at every create, not cached at the first one: the GPU starts after the root mount), and screen-sized includes the Mi A3's 720x1560 (topaz: >= 1000x2000).
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index ac612e6..b412a2b 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -50,6 +50,9 @@
+ extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
+ extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
+ extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
++/* laurel 2151: the GPU is on by default (gpu=0 kills it); wanted = not killed and not failed, ready = RedwoodGPU up */
++extern "C" bool topaz_gpu_wanted(void);
++extern "C" bool topaz_gpu_ready(void);
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -141,8 +144,7 @@ sweet_scanout_eligible(const SweetSurface *s)
+ 		 * (cached CPU memory below 4 GiB) would be handed to the GPU as they are, which reads DRAM
+ 		 * behind the CPU's cache: applications' pixels came out as garbage (text, images).
+ 		 */
+-		uint32_t gpu = 0;
+-		if (PE_parse_boot_argn("gpu", &gpu, sizeof(gpu)) && gpu != 0) {
++		if (topaz_gpu_wanted()) {      /* laurel 2151: was boot-arg gpu=1 */
+ 			on = 0;
+ 		}
+ 		sweet_scanout_enabled = on;
+@@ -492,17 +494,19 @@ static IOReturn sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint
+ static bool
+ sweet_gpu_pool_eligible(const SweetSurface *s)
+ {
+-	static int gpu = -1;
+-	if (gpu < 0) {
+-		uint32_t on = 0;
+-		gpu = PE_parse_boot_argn("gpu", &on, sizeof(on)) && on != 0;
++	static int fbpool = -1;
++	if (fbpool < 0) {
+ 		uint32_t pool = 1;
+-		if (PE_parse_boot_argn("gpu_fbpool", &pool, sizeof(pool)) && pool == 0) {
+-			gpu = 0;
+-		}
++		fbpool = !(PE_parse_boot_argn("gpu_fbpool", &pool, sizeof(pool)) && pool == 0);
+ 	}
++	/*
++	 * laurel 2151: asked at every create, not once: the GPU comes up after the root is mounted, and a
++	 * window server that draws in software (GPU off) keeps cached memory. Screen-sized = the Mi A3's
++	 * 720x1560 too (topaz: 1080x2400).
++	 */
++	bool gpu = fbpool && topaz_gpu_ready();
+ 	if (!(gpu && s->bytesPerElement == 4 && s->planeCount <= 1 && s->elementWidth == 1 && s->elementHeight == 1 &&
+-	    s->width >= 1000 && s->height >= 2000 && s->allocSize <= (48u << 20))) {
++	    s->width >= 700 && s->height >= 1500 && s->allocSize <= (48u << 20))) {
+ 		return false;
+ 	}
+ 	/* only the window server's own (the display's frames); applications' screen-sized surfaces came out black */
+@@ -1075,11 +1079,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			static int gpu_low = -1;        /* boot-arg gpu=1: surfaces the Adreno draws into stay below 4 GiB */
+-			if (gpu_low < 0) {
+-				uint32_t on = 0;
+-				gpu_low = PE_parse_boot_argn("gpu", &on, sizeof(on)) && on != 0;
+-			}
++			/* surfaces the Adreno draws into stay below 4 GiB (laurel 2151: GPU wanted, was boot-arg gpu=1) */
++			bool gpu_low = topaz_gpu_wanted();
+ 			/*
+ 			 * gpu=1: physically contiguous memory (up to 16 MB: a full screen, 1125x2436, is 11 MB), so that the Adreno, whose
+ 			 * addresses are physical with the SMMU in pass-through, reads the surface where it
