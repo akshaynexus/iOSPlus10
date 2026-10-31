@@ -3877,3 +3877,40 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   fdl6_memcpy (Turnip) does. topaz_inject.c's `strstr(args, " gl=0")` misses gl=0 as the first boot-arg: our wrapper
   parses whole words and does not insert the loader then. Mu not rebuilt here: patches/laurel/mu is equal to
   laurel-int-1, the main checkout's FD (04:50, has "Pool RAM") was reused for uefi-image.sh.
+## Mi A3: Metal path (AREA J) built natively on Linux, kernel 2850 (2026-11-01 04:45)
+
+Done [V, logs/laurel-metal.log, logs/laurel-kernel-metal.log]; nothing ran on the phone. Full text: docs/laurel_sprout/metal.md.
+- Decision: negroni's stack unchanged (NegroniMetal plug-in -> ios-flame frontend/bridge -> metal2vulkan f6a96b7d -> Turnip
+  Mesa 25.0.7). Mesa 25.0.7 has the A610: `GPUId(610)` = chip 0x060100ff, matches topaz CHIP_ID 0x06010001 (patch id
+  wildcard), props a6xx_gen1_low (no sampler min/max, no HW multiview, no GMEM fast clear), num_ccu 1, GMEM from the kernel
+  (topaz 0x21000). HackiOS gfxstream is a guest encoder for a host GPU under AVF: does not apply.
+- The topaz RedwoodGPU (0901) is the same msm-struct ABI as negroni's; negroni_drm.c talks to it unchanged (0-cmd submits and
+  syncobjs in user space). No VA_START -> Turnip uses kernel addresses. SMMU pass-through (gpu_identity=1, GPU VA = PA):
+  no host-page import (0x49) possible; only IOSurface import 0x7e (contiguous surfaces).
+- Kernel 2850: IOAcceleratorES (topaz 0138) is registered only after a check (root, RedwoodGPU <= 20 s after root, ready,
+  chip 0x0601xxxx, GMEM, bundle files) with MetalPluginName/ClassName, else empty. Reason: topaz starts the GPU after the
+  root mount and only with `gpu=1`; Metal registers devices once per process; CA polls IOAcceleratorES (300 x 100 ms).
+  Log `LAUREL METAL: on: Turnip a610 (...)` / `off: <reason>`; kill switch `laurelmetal=0`.
+- Linux fixes: meson `c_ld = 'lld'` (lld in the compiler command broke every meson -Werror check -> `struct timespec`
+  redefinition); every ld64.lld output has an unused undefined `dyld_stub_binder` in its symbol table (not in the chained
+  imports, no stub helper): turnip-build.sh and check-imports.py now read the import table; llvm-lipo `-archs` prints a
+  trailing blank; GNU `stat -f` is file-system stat; theos "iPhoneOS16.5.sdk" is Version 16.4 and marks
+  `recommendedMaxWorkingSetSize` unavailable on iOS (metalprobe reads it by KVC); CMake iOS on Linux needs full compiler
+  paths. The 20H392 dyld cache is readable without root: `apfs-fuse -o ro 087-86593-047.dmg MNT`.
+- Next: coordinator test (metal.md section 8): `LAUREL METAL:` line, then vkprobe / m2vtest / metalprobe over SSH.
+
+## Mi A3: Metal (AREA J) review fixes on laurel-int-1 (2026-11-01 05:05)
+
+Done [V logs/laurel-metal.log, logs/laurel-kernel-metal.log, logs/laurel-kernel-btest.log]; nothing ran on the phone.
+- 2850: bundle files checked right after the root mount (a root without the Metal stage: no GPU wait); the GPU wait is a
+  100 ms poll that stops at once on `!topaz_gpu_wanted() || topaz_gpu_failed()` (B 2150 has `topaz_gpu_wanted`; weak
+  stand-ins in LaurelMetal.cpp, B can add a strong `topaz_gpu_failed`); `copyMatchingService` instead of the blocking
+  match (dictionary released); whole file under ARM64_BOARD_CONFIG_SWEET; no bsd/ file and no bsd/conf/files hunk any more
+  (the vnode lookup is in the .cpp: fewer conf conflicts with other areas); RedwoodMaxBuffer = 64 MiB - 64 KiB on RedwoodGPU
+  when B did not set it. Link test with B's 2150: B's strong topaz_gpu_wanted is taken. B's 2151 does not apply on
+  laurel-int-1 (SweetSurface.cpp vs A's 2101).
+- Turnip 0101 (userland/laurel/metal/turnip-patches, TU_EXTRA_PATCHES): maxMemoryAllocationSize/maxBufferSize = RedwoodMaxBuffer,
+  so Metal maxBufferLength < 64 MiB (metal2vulkan device/metal.rs:168 takes min(maxBufferSize, maxMemoryAllocationSize)).
+  The env file is not enough: sandboxed apps cannot read /var/db/negronimetal/env.
+- Clients default = probes only; `*` gets `-backboardd` when B's /usr/libexec/real/backboardd is in the root.
+- CHIP_ID 0x06010000 and HBB 14 (B's values; Turnip takes HBB from the kernel). LSE regex covers every LSE/RCpc form.

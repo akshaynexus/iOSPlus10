@@ -56,6 +56,20 @@ SYM = re.compile(r"\s(_[^\s]+)\s*$")
 UNDEF = re.compile(r"\(undefined\) external\s+(_\S+)\s+\(from ([^)]+)\)")
 
 
+def lld_unbound_stub_binder(b):
+    """ld64.lld (the Linux build) leaves an undefined dyld_stub_binder in every output's symbol table. With chained
+    fixups dyld binds only what the import table names, so the entry is dead when it is not there (and the binary has
+    no LC_DYLD_INFO / lazy-binding stub helper). True = skip it."""
+    try:
+        lc = subprocess.run(["llvm-otool", "-l", b], capture_output=True, text=True).stdout
+        if "LC_DYLD_CHAINED_FIXUPS" not in lc or "LC_DYLD_INFO" in lc:
+            return False
+        fx = subprocess.run(["llvm-objdump", "--macho", "--chained-fixups", b], capture_output=True, text=True)
+        return fx.returncode == 0 and "dyld_stub_binder" not in fx.stdout
+    except FileNotFoundError:
+        return False
+
+
 def exports(dsc, image):
     os.makedirs(CACHE, exist_ok=True)
     out = os.path.join(CACHE, image.strip("/").replace("/", "_") + ".txt")
@@ -96,6 +110,8 @@ def main(argv):
             if not m:
                 continue
             sym, lib = m.group(1), m.group(2)
+            if sym == "dyld_stub_binder" and lld_unbound_stub_binder(b):
+                continue
             need.setdefault(lib, {}).setdefault(sym, []).append(os.path.basename(b))
     images = sorted({i for lib in need for i in IMAGES.get(lib, [])})
     with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:

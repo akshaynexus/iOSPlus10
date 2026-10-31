@@ -5,7 +5,7 @@
 # Steps: 1. external/ios-topaz/tools/mkiosroot.sh (case-sensitive journaled HFS+, OS + SystemOS/AppOS cryptexes,
 #        dyld cache link, plain system keybag); 2. topaz sweet-root-tweaks.py (build 20H392 fixes, launchd,
 #        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped) and
-#        root-tweaks-boldtext.py; 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
+#        root-tweaks-boldtext.py, then scripts/laurel/root-add-metal.sh (Metal path, METAL=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
 # Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
 #   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg
@@ -70,6 +70,10 @@ python3 -I "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$mnt"
 # GPU user space (docs/laurel_sprout/gpu.md): Mesa + EAGL GL + backboardd loader + the phone's own GPU firmware, from
 # out/laurel/gpu/root (scripts/laurel/gpu-firmware.sh + gpu-userland.sh as the user first); skipped with a note when absent
 bash "$REPO/scripts/laurel/root-add-gpu.sh" "$mnt"
+# Metal path (docs/laurel_sprout/metal.md): NegroniMetal.bundle (Turnip a610 + metal2vulkan) + probes, when
+# scripts/laurel/metal-build.sh has staged them; METAL=0 skips. Without the stage it logs "metal: off" and goes on.
+# (AREA B's scripts/laurel/root-add-gpu.sh, GPU firmware + GL, goes before this line: Metal checks for B's backboardd wrapper)
+METAL=${METAL:-1} sh "$REPO/scripts/laurel/root-add-metal.sh" "$mnt"
 sync
 umount "$mnt"
 

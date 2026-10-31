@@ -17,12 +17,15 @@ TU=$G/turnip
 TU_SRC=$TU/mesa-$MESA_VERSION
 TU_BUILD=$TU/build-ios
 TU_PATCHES=$REPO/userland/turnip/mesa-patches
+# Device ports add their own Turnip patches after these (e.g. scripts/laurel/metal-build.sh: userland/laurel/metal/turnip-patches)
+TU_EXTRA_PATCHES=${TU_EXTRA_PATCHES:-}
 A=$DL/mesa-$MESA_VERSION.tar.xz
 
 stamp() {
   echo "mesa $MESA_VERSION $MESA_SHA256"
   echo "hackios $HACKIOS_COMMIT: $HACKIOS_PATCHES"
   for p in "$TU_PATCHES"/*.patch; do echo "turnip $(basename "$p") $(shasum -a 256 "$p" | cut -c1-16)"; done
+  for d in $TU_EXTRA_PATCHES; do for p in "$d"/*.patch; do echo "extra $p $(shasum -a 256 "$p" | cut -c1-16)"; done; done
   for f in negroni_drm.c negroni_drm.h ngl_abi.h xf86drm.h; do echo "drm $f $(shasum -a 256 "$NGL/drm/$f" | cut -c1-16)"; done
   echo "log.c $(shasum -a 256 "$NGL/log.c" | cut -c1-16)"
 }
@@ -55,6 +58,12 @@ make_tree() {
   for p in "$TU_PATCHES"/*.patch; do
     echo "patch turnip $(basename "$p")"
     patch -s --no-backup-if-mismatch -d "$TU_SRC" -p1 < "$p"
+  done
+  for d in $TU_EXTRA_PATCHES; do
+    for p in "$d"/*.patch; do
+      echo "patch extra $p"
+      patch -s --no-backup-if-mismatch -d "$TU_SRC" -p1 < "$p"
+    done
   done
   find "$TU_SRC" -name '*.orig' -delete
   stamp > "$TU_SRC/TURNIP-SOURCE"
@@ -91,7 +100,9 @@ endian = 'little'
 needs_exe_wrapper = true
 EOF
   case "$(uname -s)" in
-  Linux) sed -i "s|^c = \['$CLANG'|c = ['$CLANG', '-fuse-ld=lld'|; s|^cpp = \['$CLANGXX'|cpp = ['$CLANGXX', '-fuse-ld=lld'|" "$CROSS" ;;
+  # Linux: ld64.lld through clang (meson's c_ld: -fuse-ld=lld at link time only; in the compiler command it would be an
+  # unused argument, and meson's -Werror=unused-command-line-argument checks then fail: no HAVE_* defines).
+  Linux) sed -i "s|^\[binaries\]|[binaries]\nc_ld = 'lld'\ncpp_ld = 'lld'\nobjc_ld = 'lld'|" "$CROSS" ;;
   esac
   rm -rf "$TU_BUILD"
   meson setup "$TU_BUILD" "$TU_SRC" --cross-file "$CROSS" --wrap-mode=nofallback \
@@ -139,7 +150,16 @@ minos=$($OTOOL -l "$VK" | awk '/LC_BUILD_VERSION/{p=1;next} p&&/minos/{print $2;
 $OTOOL -l "$VK" | grep -q 'cmd LC_DYLD_CHAINED_FIXUPS' || { echo "turnip: no LC_DYLD_CHAINED_FIXUPS" >&2; fail=1; }
 ! $OTOOL -l "$VK" | grep -q 'cmd LC_DYLD_INFO' || { echo "turnip: has LC_DYLD_INFO(_ONLY)" >&2; fail=1; }
 "$NM" -m "$VK" > "$TU/nm-m.txt"
-! grep -q 'dyld_stub_binder' "$TU/nm-m.txt" || { echo "turnip: imports dyld_stub_binder" >&2; fail=1; }
+# dyld binds what the chained-fixup import table names. ld64.lld (Linux) also leaves an unused undefined dyld_stub_binder
+# in the symbol table (every lld output has it); only the import table counts there.
+case "$(uname -s)" in
+Darwin) ! grep -q 'dyld_stub_binder' "$TU/nm-m.txt" || { echo "turnip: imports dyld_stub_binder" >&2; fail=1; } ;;
+*) if ! fx=$(llvm-objdump --macho --chained-fixups "$VK" 2>&1); then
+     echo "turnip: llvm-objdump --chained-fixups failed (LLVM too old?): $(echo "$fx" | head -1)" >&2; fail=1
+   elif echo "$fx" | grep -q 'dyld_stub_binder'; then
+     echo "turnip: imports dyld_stub_binder" >&2; fail=1
+   fi ;;
+esac
 strong=$(grep '(undefined)' "$TU/nm-m.txt" | grep 'dynamically looked up' | grep -v 'weak external' || true)
 [ -z "$strong" ] || { echo "turnip: strong symbols without a library:" >&2; echo "$strong" | head -20 >&2; fail=1; }
 weak=$(grep '(undefined)' "$TU/nm-m.txt" | grep -c 'dynamically looked up' || true)
@@ -153,5 +173,5 @@ cp "$VK" "$OUTVK"
 codesign -s - -f "$OUTVK" 2>/dev/null || ldid -S "$OUTVK"
 echo "turnip: arm64, minos $minos, chained fixups, $weak weak symbols looked up at load time (resolve to NULL when absent)"
 echo "turnip: exports: $(echo "$exports" | tr '\n' ' ')"
-stat -f '%N %z bytes' "$OUTVK" 2>/dev/null || stat -c '%n %s bytes' "$OUTVK"
+stat -c '%n %s bytes' "$OUTVK" 2>/dev/null || stat -f '%N %z bytes' "$OUTVK"
 shasum -a 256 "$OUTVK"

@@ -583,3 +583,16 @@ pinned pip hashes; wider ARMv8.1 check. Kernel 230 patches, 0 LSE. Image out/lau
 **Owner decision (CLAUDE.md "macOS and Linux"):** the laurel GPU scripts (gpu-env/-firmware/-userland, mesa-linux,
 root-add-gpu) are Linux x86_64 only, like kernel-linux.sh and mu-build.sh (pinned theos toolchain is x86_64). Accept this
 exception, or ask for a macOS path (Xcode clang/ld/codesign in gpu-env.sh).
+## Mi A3 Metal path, AREA J (2026-11-01 04:45)
+
+- Done [V]: path decided (metal2vulkan + Turnip, negroni stack, docs/laurel_sprout/metal.md); whole stack built natively on
+  Linux (`scripts/bg.sh laurel-metal scripts/laurel/metal-build.sh`: Turnip for the A610, bridge, NegroniMetal.bundle,
+  probes, ldid, import check PASS vs 20H392, 0 LSE); `scripts/laurel/root-add-metal.sh` (called by root.sh, METAL=0 skips);
+  kernel patch 2850 (Metal plug-in names on IOAcceleratorES after a self-check) builds, 220 patches, 0 LSE.
+- Not done: phone test; 0x49 host import (impossible with the pass-through SMMU); Turnip on the A610 never ran.
+- Next: AREA B's GPU driver + 2850 kernel, root with the Metal stage; test plan metal.md section 8.
+- Review fixes (2026-11-01 05:05, rebased on laurel-int-1): 2850 never delays the UI on a GPU failure (bundle check first,
+  100 ms poll, stop on topaz_gpu_wanted/failed); clients default = probes only; Turnip 0101 caps buffers at the kernel's
+  RedwoodMaxBuffer (< 64 MiB); macOS path runs the negroni scripts unchanged; LLVM >= 18 floor; wider LSE check.
+  Merge: A -> B (2150-2152; B adds root-add-gpu.sh before root-add-metal.sh in root.sh) -> J 2850.
+

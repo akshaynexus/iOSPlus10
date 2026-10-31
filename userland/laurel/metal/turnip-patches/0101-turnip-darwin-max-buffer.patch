@@ -1,0 +1,111 @@
+laurel (Mi A3, Adreno 610): cap maxMemoryAllocationSize and maxBufferSize (so Metal's maxBufferLength) at the kernel's
+largest contiguous buffer, RedwoodGPU property RedwoodMaxBuffer (patch 2850); TU_DARWIN_MAX_BO overrides. No property = no cap.
+Applied after userland/turnip/mesa-patches by scripts/gpu/turnip-build.sh (TU_EXTRA_PATCHES, set by scripts/laurel/metal-build.sh).
+
+diff -ruN a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
+--- a/src/freedreno/vulkan/meson.build	2026-11-01 04:55:01.050516751 +0530
++++ b/src/freedreno/vulkan/meson.build	2026-11-01 04:55:20.183810118 +0530
+@@ -159,7 +159,7 @@
+ darwin_drm_sources = []
+ darwin_drm_link_args = []
+ if host_machine.system() == 'darwin'
+-  darwin_drm_sources = files('../../redwood-drm/negroni_drm.c', '../../redwood-drm/log.c')
++  darwin_drm_sources = files('../../redwood-drm/negroni_drm.c', '../../redwood-drm/log.c', 'tu_darwin_limits.c')
+   darwin_drm_link_args = ['-framework', 'IOKit', '-framework', 'IOSurface', '-framework', 'CoreFoundation']
+   # Mach-O "weak" is weak_import: the entrypoint tables' weak references to entrypoints that no layer defines
+   # (wsi_*, ...) need a definition at link time, so they are looked up at load time and resolve to NULL (as Mesa's
+diff -ruN a/src/freedreno/vulkan/tu_darwin_limits.c b/src/freedreno/vulkan/tu_darwin_limits.c
+--- a/src/freedreno/vulkan/tu_darwin_limits.c	1970-01-01 05:30:00.000000000 +0530
++++ b/src/freedreno/vulkan/tu_darwin_limits.c	2026-11-01 04:55:20.172160851 +0530
+@@ -0,0 +1,46 @@
++/*
++ * laurel (Mi A3, Adreno 610): the largest buffer the kernel can give, for Turnip's maxMemoryAllocationSize and
++ * maxBufferSize (metal2vulkan derives Metal's maxBufferLength from them). The topaz RedwoodGPU runs the SMMU in
++ * pass-through (GPU VA = PA): every buffer is one contiguous run of its GPU pool, at most one pool chunk. The kernel
++ * publishes that as the RedwoodGPU registry property RedwoodMaxBuffer (bytes; laurel patch 2850). No property
++ * (negroni kernels, own SMMU tables) = no cap. TU_DARWIN_MAX_BO=N (bytes) overrides, 0 = no cap.
++ * In its own C file: IOKit's headers do not mix with Mesa's C++ headers.
++ */
++#include <stdint.h>
++#include <stdlib.h>
++#include <CoreFoundation/CoreFoundation.h>
++#include <IOKit/IOKitLib.h>
++
++#include "util/log.h"
++
++uint64_t tu_darwin_max_bo(void);
++
++uint64_t
++tu_darwin_max_bo(void)
++{
++   static int done;
++   static uint64_t cap;
++   if (done)
++      return cap;
++   uint64_t v = 0;
++   const char *e = getenv("TU_DARWIN_MAX_BO");
++   if (e && *e) {
++      v = strtoull(e, NULL, 0);
++   } else {
++      io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedwoodGPU"));
++      if (s != IO_OBJECT_NULL) {
++         CFTypeRef p = IORegistryEntryCreateCFProperty(s, CFSTR("RedwoodMaxBuffer"), kCFAllocatorDefault, 0);
++         if (p && CFGetTypeID(p) == CFNumberGetTypeID())
++            CFNumberGetValue((CFNumberRef)p, kCFNumberSInt64Type, &v);
++         if (p)
++            CFRelease(p);
++         IOObjectRelease(s);
++      }
++   }
++   if (v)
++      mesa_logi("turnip: one buffer at most %llu bytes (%s)", (unsigned long long)v,
++                e && *e ? "TU_DARWIN_MAX_BO" : "RedwoodGPU RedwoodMaxBuffer");
++   cap = v;
++   done = 1;
++   return cap;
++}
+diff -ruN a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+--- a/src/freedreno/vulkan/tu_device.cc	2026-11-01 04:55:01.050516751 +0530
++++ b/src/freedreno/vulkan/tu_device.cc	2026-11-01 04:55:20.193823072 +0530
+@@ -59,6 +59,23 @@
+ #define DARWIN_NO_FD false
+ #endif
+ 
++#ifdef __APPLE__
++/* tu_darwin_limits.c: largest buffer of a pass-through-SMMU kernel (RedwoodMaxBuffer), 0 = no cap */
++extern "C" uint64_t tu_darwin_max_bo(void);
++static uint64_t
++tu_buffer_cap(uint64_t v)
++{
++   uint64_t cap = tu_darwin_max_bo();
++   return cap && cap < v ? cap : v;
++}
++#else
++static uint64_t
++tu_buffer_cap(uint64_t v)
++{
++   return v;
++}
++#endif
++
+ static int
+ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
+ {
+@@ -788,7 +805,7 @@
+     */
+    p->maxPerSetDescriptors = MAX_SET_SIZE / (2 * A6XX_TEX_CONST_DWORDS * 4);
+    /* Our buffer size fields allow only this much */
+-   p->maxMemoryAllocationSize = 0xFFFFFFFFull;
++   p->maxMemoryAllocationSize = tu_buffer_cap(0xFFFFFFFFull);
+ 
+ }
+ 
+@@ -949,7 +966,7 @@
+     * GetBufferDeviceRequirements won't fall over if someone actually creates
+     * a 4GB buffer.
+     */
+-   p->maxBufferSize = 1ull << 32;
++   p->maxBufferSize = tu_buffer_cap(1ull << 32);
+ }
+ 
+ /* CP_ALWAYS_ON_COUNTER is fixed 19.2 MHz */
