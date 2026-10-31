@@ -1,0 +1,27 @@
+laurel 2202: Mi A3 keys: self-check summary line. The topaz key driver (0060/0087) already reads the right PMIC on trinket: SPMI arbiter v5 core 0x1c40000 / observer 0x3e00000 / config 0x1c0a000, PM6125 SID 0, PON PPID 0x008 (power = KPDPWR_N bit 0, volume down = RESIN_N bit 1), volume up = PM6125 GPIO 5 PPID 0x0c4, active low (laurel_sprout-trinket.dtsi gpio-keys). Boot 2026-11-01 03:58: `SWEET KEYS: arb=0x50010000 apids=256 pon-apid=112 gpio4-apid=124 ... en=0x80/1 subtype=0x10/1`, power and volume-down events reached SweetHIDButtons. No logic change; one line `LAUREL KEYS: on: power+vol-down polled (PON APID 112), vol-up polled (PM6125 GPIO5 APID 124)` (or off with the arbiter status). Kill switch unchanged: sweetkeys=0.
+
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 65970f9..6db6e47 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -173,6 +173,20 @@ sweet_keys_init(void)
+ 	if (!pok && !gok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
++	/*
++	 * laurel 2202: Mi A3 (laurel_sprout-trinket.dtsi gpio-keys, pm6125.dtsi pon): power = PON KPDPWR_N (RT bit 0),
++	 * volume down = PON RESIN_N (bit 1), volume up = PM6125 GPIO 5 active low; PM6125 is SID 0, so the PPIDs
++	 * 0x008 (PON) and 0x0c4 (GPIO 5) are the topaz ones. Boot 2026-11-01 03:58: arbiter 0x50010000, PON APID 112,
++	 * GPIO 5 APID 124, power and volume down events reached SweetHIDButtons.
++	 */
++	if (pok || keys_gpio_apid != KEYS_NO_APID) {
++		printf("LAUREL KEYS: on: power+vol-down %s (PON APID %u), vol-up %s (PM6125 GPIO5 APID %u)\n",
++		    pok ? "polled" : "unreadable", keys_pon_apid,
++		    keys_gpio_apid != KEYS_NO_APID ? "polled" : "withheld", keys_gpio_apid);
++	} else {
++		printf("LAUREL KEYS: off: PMIC reads fail (arbiter %#x, PON APID %u, status %#x)\n",
++		    keys_version, keys_pon_apid, keys_last_status);
++	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
