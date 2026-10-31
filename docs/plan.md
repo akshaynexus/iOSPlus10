@@ -560,3 +560,13 @@ dark, then back with a fade). Details: notes.md, same date, 04:40.
   /dev/redwood-haptic; expected line `LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)`. Test: Settings > Sounds &
   Haptics > Ringtone > Vibration preview. UI/keyboard taps wait for the RedwoodAudio plug-in + VirtualAudio in the root
   (docs/laurel_sprout/haptics.md).
+## Mi A3 Wi-Fi: patches 2400-2402 built (2026-11-01 04:35, area E, branch t3/laurel-wifi-modem-firmware)
+
+- Done [V build]: 2400 modem firmware through a runtime FAT16/FAT32 index of `modem_<active slot>` (GPT A/B bit; Mi A3: modem_b),
+  replaces topaz's HyperOS offset tables; 2401 Mi A3 values (carve-out 0x4b000000+0x7e00000, MSA 0x53300000, SMMU SID 0x80, WCN3990
+  supply votes over RPM), on by default (`modem=0`/`wifi=0` kill switches), `LAUREL WIFI: on|off:` line; 2402 fallbacks for the
+  WLAN.HL.3.0.2 firmware. `op10tool fatls` + `scripts/laurel/modem-fw-check.sh` (host model of the parser: stock NON-HLOS FAT16,
+  420 files, 0 fragmented). Kernel 221 patches, 0 LSE; image `out/laurel/uefi/laurel-uefi-boot.img` in the area-E worktree.
+  Details: `docs/laurel_sprout/wifi.md`. No root-image change (the ADT `wlan` node for wifid is in mkadt.py already).
+- Not booted. Next (coordinator): boot, read `TopazModem: firmware:`, `smmu:`, `wlan: RPM`, PAS, `wlfw:` lines and `LAUREL WIFI:`;
+  then Settings > Wi-Fi. If `off`, the reason names the step (wifi.md "Next").

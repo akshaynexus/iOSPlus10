@@ -1,0 +1,100 @@
+laurel 2402: WLFW fallbacks for the Mi A3 firmware WLAN.HL.3.0.2 (NON-HLOS verinfo; topaz's WCN3988 runs a newer HL3.x). Downstream icnss (laurel-kernel-los drivers/soc/qcom/icnss.c) sends only ind_register, msa_info, msa_ready, cap (+ dynamic feature mask): no host_cap and no board data over QMI; the WLAN PD reads bdwlan.* itself over tftp (served by 0121 from the FAT index of 2400). topaz's ath10k sequence could stall on such firmware, so: no host_cap answer in 1 s -> msa_info anyway (a late answer is ignored); no MSA_READY indication 1 s after cap -> board data anyway (ath10k qcom,no-msa-ready-indicator); a refused or missing board data file -> wait for FW_READY (the indication is handled in every state). Each fallback logs one 'wlfw:' line; the WLFW step shows in the LAUREL WIFI off line (2401). WMI-TLV (ABI 1.53, resource config, CE layout, HTT v2 descriptors) is the ath10k WCN3990 set in topaz already; ath10k drives HL2.0-HL3.x with it unchanged.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index f084c85..651c99c 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -2204,7 +2204,8 @@ w_start_bdf(void)
+ 		w_bdf_fi = fw_all_find(name);
+ 	}
+ 	if (w_bdf_fi < 0) {
+-		LOG("wlfw: no board data file");
++		LOG("wlfw: no board data file: waiting for FW_READY");
++		w_step = "no board data file, waiting FW_READY";
+ 		return;
+ 	}
+ 	w_bdf_len = fw_all_size(w_bdf_fi);
+@@ -2294,6 +2295,14 @@ w_on_msa_info(const uint8_t *d, uint32_t len)
+ }
+ 
+ static unsigned w_arrivals, w_cap_tries, w_cap_retry_ms;
++/*
++ * laurel 2402: the Mi A3 runs WLAN.HL.3.0.2 (NON-HLOS verinfo); downstream icnss drives it with
++ * ind_register, msa_info, msa_ready, cap only (no host_cap, no board data over QMI: the WLAN PD
++ * reads bdwlan.* itself over our tftp). Fallbacks so the ath10k sequence cannot stall on it:
++ * no host_cap answer in 1 s -> msa_info; no MSA_READY indication 1 s after cap -> board data
++ * (ath10k qcom,no-msa-ready-indicator); board data refused or missing -> wait for FW_READY.
++ */
++static unsigned w_hostcap_ms, w_capdone_ms;
+ 
+ static void
+ wlfw_arrive(uint32_t node, uint32_t port)
+@@ -2308,6 +2317,7 @@ wlfw_arrive(uint32_t node, uint32_t port)
+ 		w_board = 0xFF;
+ 		w_cap_tries = 0;
+ 		w_cap_retry_ms = 0;
++		w_hostcap_ms = w_capdone_ms = 0;
+ 	}
+ 	w_node = node;
+ 	w_port = port;
+@@ -2367,11 +2377,16 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			wm_u32(&m, 0x10, 0);                /* daemon_support = 0 */
+ 			wm_send(&m);
+ 			w_step = "host_cap sent";
++			w_hostcap_ms = g_ms + 1000;         /* laurel 2402 */
+ 		}
+ 		break;
+ 	}
+ 	case WLFW_HOST_CAP:
+ 		LOG("wlfw: host_cap %s err %u", ok ? "ok" : "rejected (not fatal)", err);
++		if (w_hostcap_ms == 0) {
++			break;                              /* late answer: msa_info already went out */
++		}
++		w_hostcap_ms = 0;
+ 		if (wm_new(&m, WLFW_MSA_INFO)) {
+ 			uint64_t a = WLFW_MSA_BASE;
+ 			wm_tlv(&m, 0x01, &a, 8);            /* msa_addr */
+@@ -2409,12 +2424,15 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+ 			}
+ 		}
+ 		w_cap_done = true;
++		w_capdone_ms = g_ms + 1000;             /* laurel 2402 */
+ 		w_step = "waiting MSA_READY ind";
+ 		w_start_bdf();
+ 		break;
+ 	case WLFW_BDF_DOWNLOAD:
+ 		if (!ok) {
+-			LOG("wlfw: bdf segment %u FAILED err %u", w_bdf_seg - 1, err);
++			LOG("wlfw: bdf segment %u FAILED err %u: waiting for FW_READY (the firmware can read bdwlan.* over tftp)",
++			    w_bdf_seg - 1, err);
++			w_step = "board data refused, waiting FW_READY";
+ 			break;
+ 		}
+ 		if (w_bdf_off < w_bdf_len) {
+@@ -4920,6 +4938,26 @@ radio_poll(unsigned ms)
+ 		w_cap_retry_ms = 0;
+ 		w_simple(WLFW_CAP, "cap sent again");
+ 	}
++	if (w_hostcap_ms != 0 && g_ms >= w_hostcap_ms) {    /* laurel 2402 */
++		struct wmsg m;
++		w_hostcap_ms = 0;
++		LOG("t=%u ms: wlfw: no host_cap answer in 1 s (older firmware): msa_info", g_ms);
++		if (wm_new(&m, WLFW_MSA_INFO)) {
++			uint64_t a = WLFW_MSA_BASE;
++			wm_tlv(&m, 0x01, &a, 8);
++			wm_u32(&m, 0x02, WLFW_MSA_SIZE);
++			wm_send(&m);
++			w_step = "msa_info sent";
++		}
++	}
++	if (w_capdone_ms != 0 && g_ms >= w_capdone_ms) {
++		w_capdone_ms = 0;
++		if (!w_msa_ind && !w_bdf_started && !w_fw_ready) {
++			LOG("t=%u ms: wlfw: no MSA_READY indication 1 s after cap (older firmware): board data now", g_ms);
++			w_msa_ind = true;
++			w_start_bdf();
++		}
++	}
+ 	if (!ce_up) {
+ 		return;
+ 	}
