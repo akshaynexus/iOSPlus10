@@ -1,0 +1,1896 @@
+laurel 2500: speaker audio on the Mi A3. TopazAudio keeps the ADSP PAS 1 boot, SMP2P, GLINK lpass edge, QRTR + pd-mapper of topaz; the Mi A3 firmware (ADSP.VT.5.4-00283-NICOBAR, modem partition) is Elite/APR, not AudioReach/GPR, so the GPR/WCD937x/SoundWire half is replaced: carveout 0x55300000+0x2200000; a FAT16 reader for image/adsp.* in modem_b (else modem_a); APR on apr_audio_svc (core state poll); AFE SEC_MI2S_RX (0x1002, IBIT 1.536 MHz, I2S SD0 48 kHz 16-bit stereo) <- ADM COPP (NULL topology) <- ASM session 1 (16-bit PCM writes, 8 x 20 ms periods from the pool, apps SMMU SID 0x41 identity, msw = SID low bits); MAX98927/MAX98937 amp at QUP0 SE1 I2C 0x3a (reset GPIO 95, vendor register maps, safe gains: no DSM); SEC_MI2S pins GPIO 125-128 function 2. sweet_i2c1 gets 16-bit register read/write. /dev/topaz-audio (+ /dev/redwood-audio of 0935) is made before the ADSP is up and drops frames while audio is off. On by default; kill switch adsp=0 or laurelaudio=0; one line LAUREL AUDIO: on|off: reason, after a self-check (path start with silence, the DSP must return 2 periods in 500 ms).
+
+diff --git a/bsd/dev/sweet_i2c1.c b/bsd/dev/sweet_i2c1.c
+index 8037ad6..1b58239 100644
+--- a/bsd/dev/sweet_i2c1.c
++++ b/bsd/dev/sweet_i2c1.c
+@@ -16,6 +16,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_i2c1_init(void);
+ int sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+ int sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
++int sweet_i2c1_write16(uint8_t addr, uint16_t reg, uint8_t val);
++int sweet_i2c1_read16(uint8_t addr, uint16_t reg, uint8_t *val);
+ 
+ #define I2C1_SE_PA      0x04a84000u
+ #define I2C1_GCC_PA     0x01400000u
+@@ -187,6 +189,41 @@ sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val)
+ 	return err;
+ }
+ 
++/*
++ * laurel: 16-bit register addresses, big-endian on the wire (regmap reg_bits 16), for the
++ * MAX98927/MAX98937 speaker amp at 0x3a (iokit/Kernel/arm/TopazAudio.cpp).
++ */
++int
++sweet_i2c1_write16(uint8_t addr, uint16_t reg, uint8_t val)
++{
++	uint8_t tx[3] = { (uint8_t)(reg >> 8), (uint8_t)reg, val };
++
++	if (!i2c1_ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_i2c1_lock);
++	int err = i2c1_msg(addr, tx, 3, NULL, 0, false);
++	lck_mtx_unlock(&sweet_i2c1_lock);
++	return err;
++}
++
++int
++sweet_i2c1_read16(uint8_t addr, uint16_t reg, uint8_t *val)
++{
++	uint8_t tx[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
++
++	if (!i2c1_ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_i2c1_lock);
++	int err = i2c1_msg(addr, tx, 2, NULL, 0, true);
++	if (!err) {
++		err = i2c1_msg(addr, NULL, 0, val, 1, false);
++	}
++	lck_mtx_unlock(&sweet_i2c1_lock);
++	return err;
++}
++
+ int
+ sweet_i2c1_init(void)
+ {
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+index 6bfe1a2..7d002e1 100644
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1,17 +1,19 @@
+ /*
+- * topaz (SM6225): sound, step 1 - boot the ADSP (LPASS Hexagon) and reach AudioReach (SPF).
+- * Port of MakrSas/topaz-woa drivers/TopazAudio (Pas.c, Glink.c, Qrtr.c, Gpr.c), where the
+- * whole speaker chain works on Windows (docs/P9_audio.md there):
+- *   TrustZone PAS (id 1): init_image (.mdt metadata) -> mem_setup -> copy the adsp.bNN
+- *   segments into the carveout 0x53800000+0x2300000 -> auth_and_reset -> SMP2P: our item 429,
+- *   the ADSP's item 443 with "slave-kernel" READY -> GLINK on the "lpass" edge (apps<->adsp
+- *   SMEM partition, items 478/479/480, APCS IPC bit 8) -> QRTR on IPCRTR (+ pd-mapper for the
+- *   ADSP's protection domains) -> GPR on adsp_apps: APM GET_SPF_STATE until it says 1.
+- *
+- * Boot-arg adsp=1. Firmware: image/adsp.* from the modem partition (TopazModem's reader).
+- * SMEM, the APCS doorbell, SCM and the pool are TopazModem's (topaz_* calls). Polling only.
+- * Lesson from Windows: never boot the ADSP over SMEM state of an earlier run (the SoC reset):
+- * if item 443 or 480 exists, refuse.
++ * laurel (Mi A3, SM6125): sound from the speaker. The topaz (SM6225) driver's first half stays:
++ * ADSP PAS 1 boot, SMP2P, GLINK on the lpass edge, QRTR + pd-mapper (port of topaz-woa
++ * TopazAudio). The rest is the Mi A3's (laurel patch 2500):
++ *   - the image (ADSP.VT.5.4 NICOBAR, Android 11) goes into its carveout 0x55300000+0x2200000; it
++ *     is read from the stock modem partition (modem_b, else modem_a) by a small FAT16 reader;
++ *   - this firmware is Elite/APR, not AudioReach/GPR: GLINK channel apr_audio_svc, core service
++ *     ready check, then the Android path of the speaker: AFE port SEC_MI2S_RX (bit clock
++ *     1.536 MHz, I2S SD0, 48 kHz 16-bit stereo) <- ADM COPP (no processing) <- ASM session 1
++ *     (16-bit PCM writes from pool memory, apps SMMU stream 0x41 as identity);
++ *   - the codec (WCD937x) is not used: the speaker amp is a MAX98927/MAX98937 on QUP0 SE1 I2C
++ *     0x3a (reset GPIO 95), I2S slave on SEC_MI2S (GPIO 125..128).
++ * On by default; kill switch adsp=0 (or laurelaudio=0). One result line:
++ *   LAUREL AUDIO: on: ADSP up (APR), MAX98927 rev 0x.., SEC_MI2S 48 kHz (...)
++ *   LAUREL AUDIO: off: <reason>   (a failure turns off only the sound)
++ * Polling only. Never boots the ADSP over SMEM state of an earlier run (item 443 or 480).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -31,13 +33,11 @@ extern "C" void    *topaz_smem_alloc(void *part, uint16_t item, uint32_t size);
+ extern "C" void     topaz_apcs_kick(unsigned bit);
+ extern "C" uint64_t topaz_scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1);
+ extern "C" void    *topaz_pool_alloc(uint64_t size, uint64_t *pa);
+-extern "C" int64_t  topaz_part_fw_size(const char *path);
+-extern "C" bool     topaz_part_fw_read(const char *path, uint64_t off, void *dst, uint64_t n);
+ 
+ #define ADSP_PID            2                   /* SMEM host / SMP2P / GLINK remote pid */
+ #define ADSP_PAS_ID         1
+-#define ADSP_CARVE_PA       0x53800000u         /* DT pil_adsp_region */
+-#define ADSP_CARVE_SIZE     0x02300000u
++#define ADSP_CARVE_PA       0x55300000u         /* laurel DT pil_adsp_region */
++#define ADSP_CARVE_SIZE     0x02200000u
+ #define ITEM_SMP2P_OUT      429                 /* apps -> adsp (DT qcom,smem = <443 429>: in, out) */
+ #define ITEM_SMP2P_IN       443                 /* adsp -> apps */
+ #define ITEM_ADSP_CRASH     423
+@@ -163,6 +163,225 @@ crash_reason(void)
+ 	LOG("crash reason (%u): %s", ITEM_ADSP_CRASH, msg);
+ }
+ 
++/* ---------------------------------------------------------------- firmware (laurel: FAT16 modem partition) */
++
++/*
++ * The Mi A3's ADSP image is image/adsp.mdt + adsp.b00..b27 in the stock modem partition (FAT16,
++ * 4 KiB sectors, NON-HLOS.bin). TopazModem's reader has a file table of the topaz NON-HLOS; this
++ * one reads the volume itself: boot sector, FAT, root directory, the "image" directory, then each
++ * file through its cluster chain. Read-only through sweet_ufs. Slot b first (the Mi A3 boots
++ * slot b), then slot a.
++ */
++extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++
++#define FW_MAX_FILES        64
++static const char *const fw_parts[] = { "modem_b", "modem_a" };
++static char fw_part[16];
++static struct { char name[13]; uint32_t cluster, size; } fw_files[FW_MAX_FILES];
++static uint32_t fw_nfiles, fw_fat_entries, fw_cluster_bytes;
++static uint16_t *fw_fat;
++static uint32_t fw_fat_bytes;
++static uint64_t fw_data_off;
++
++static inline uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
++static inline uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
++
++static bool
++fat_read(uint64_t off, void *dst, uint64_t n)
++{
++	return sweet_ufs_read_part(fw_part, off, dst, n) == 0;
++}
++
++/* "ADSP    B00" -> "adsp.b00" */
++static void
++fat_name(const uint8_t *e, char *out)
++{
++	uint32_t k = 0;
++
++	for (uint32_t i = 0; i < 8 && e[i] != ' '; i++) {
++		out[k++] = (char)((e[i] >= 'A' && e[i] <= 'Z') ? e[i] + 32 : e[i]);
++	}
++	if (e[8] != ' ') {
++		out[k++] = '.';
++		for (uint32_t i = 8; i < 11 && e[i] != ' '; i++) {
++			out[k++] = (char)((e[i] >= 'A' && e[i] <= 'Z') ? e[i] + 32 : e[i]);
++		}
++	}
++	out[k] = 0;
++}
++
++/* the next cluster of a chain, or 0 at its end / on a bad entry */
++static uint32_t
++fat_next(uint32_t c)
++{
++	if (c < 2 || c >= fw_fat_entries) {
++		return 0;
++	}
++	uint32_t n = fw_fat[c];
++	return (n >= 2 && n < fw_fat_entries) ? n : 0;
++}
++
++/* one directory block of `bytes': the "image" entry (want_dir) or the adsp.* files */
++static bool
++fat_dir_block(const uint8_t *d, uint32_t bytes, bool want_dir, uint32_t *dir_cluster)
++{
++	for (uint32_t o = 0; o + 32 <= bytes; o += 32) {
++		const uint8_t *e = d + o;
++		char name[13];
++
++		if (e[0] == 0) {
++			return false;                   /* end of the directory */
++		}
++		if (e[0] == 0xE5 || e[11] == 0x0F || (e[11] & 0x08) != 0) {
++			continue;                       /* deleted, long-name part, volume label */
++		}
++		fat_name(e, name);
++		if (want_dir) {
++			if ((e[11] & 0x10) != 0 && strcmp(name, "image") == 0) {
++				*dir_cluster = le16(e + 26);
++				return false;
++			}
++		} else if ((e[11] & 0x10) == 0 && strncmp(name, "adsp.", 5) == 0 && fw_nfiles < FW_MAX_FILES) {
++			strlcpy(fw_files[fw_nfiles].name, name, sizeof(fw_files[fw_nfiles].name));
++			fw_files[fw_nfiles].cluster = le16(e + 26);
++			fw_files[fw_nfiles].size = le32(e + 28);
++			fw_nfiles++;
++		}
++	}
++	return true;                            /* more entries may follow */
++}
++
++static bool
++fw_mount_one(const char *partition)
++{
++	uint8_t bs[512], *buf = NULL;
++	uint32_t image = 0, root_bytes, bps, spc, rsv, nfat, nroot, spf, total, clusters, steps;
++	uint64_t fat_off, root_off;
++	bool more;
++
++	strlcpy(fw_part, partition, sizeof(fw_part));
++	fw_nfiles = 0;
++	if (!fat_read(0, bs, sizeof(bs)) || bs[510] != 0x55 || bs[511] != 0xAA) {
++		return false;
++	}
++	bps = le16(bs + 11); spc = bs[13]; rsv = le16(bs + 14); nfat = bs[16]; nroot = le16(bs + 17); spf = le16(bs + 22);
++	total = le16(bs + 19) != 0 ? le16(bs + 19) : le32(bs + 32);
++	if (bps < 512 || bps > 4096 || (bps & (bps - 1)) != 0 || spc == 0 || nfat == 0 || nroot == 0 || spf == 0) {
++		LOG("%s: not a FAT16 volume", fw_part);
++		return false;
++	}
++	fat_off = (uint64_t)rsv * bps;
++	root_off = fat_off + (uint64_t)nfat * spf * bps;
++	root_bytes = nroot * 32;
++	fw_data_off = root_off + (uint64_t)((root_bytes + bps - 1) / bps) * bps;
++	fw_cluster_bytes = bps * spc;
++	clusters = (uint32_t)((total - fw_data_off / bps) / spc);
++	if (clusters < 4085 || clusters >= 65525 || (uint64_t)(clusters + 2) * 2 > (uint64_t)spf * bps) {
++		LOG("%s: %u clusters: not FAT16", fw_part, clusters);
++		return false;
++	}
++	fw_fat_entries = clusters + 2;
++	if (fw_fat != NULL) {
++		IOFree(fw_fat, fw_fat_bytes);
++	}
++	fw_fat_bytes = spf * bps;
++	fw_fat = (uint16_t *)IOMalloc(fw_fat_bytes);
++	buf = (uint8_t *)IOMalloc(MAX(root_bytes, fw_cluster_bytes));
++	if (fw_fat == NULL || buf == NULL || !fat_read(fat_off, fw_fat, fw_fat_bytes) || !fat_read(root_off, buf, root_bytes)) {
++		goto fail;
++	}
++	(void)fat_dir_block(buf, root_bytes, true, &image);
++	more = true;
++	for (steps = 0; image >= 2 && more && steps < 64; steps++) {
++		if (!fat_read(fw_data_off + (uint64_t)(image - 2) * fw_cluster_bytes, buf, fw_cluster_bytes)) {
++			goto fail;
++		}
++		more = fat_dir_block(buf, fw_cluster_bytes, false, NULL);
++		image = fat_next(image);
++	}
++	IOFree(buf, MAX(root_bytes, fw_cluster_bytes));
++	return fw_nfiles != 0;
++fail:
++	if (buf != NULL) {
++		IOFree(buf, MAX(root_bytes, fw_cluster_bytes));
++	}
++	fw_nfiles = 0;
++	return false;
++}
++
++static int
++fw_find(const char *path)
++{
++	if (strncmp(path, "image/", 6) == 0) {
++		path += 6;
++	}
++	for (uint32_t i = 0; i < fw_nfiles; i++) {
++		if (strcmp(fw_files[i].name, path) == 0) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++static bool
++fw_mount(void)
++{
++	for (uint32_t i = 0; i < sizeof(fw_parts) / sizeof(fw_parts[0]); i++) {
++		if (fw_mount_one(fw_parts[i]) && fw_find("adsp.mdt") >= 0) {
++			LOG("firmware: %s, %u adsp files", fw_part, fw_nfiles);
++			return true;
++		}
++	}
++	return false;
++}
++
++static int64_t
++fw_size(const char *path)
++{
++	int i = fw_find(path);
++	return i < 0 ? -1 : (int64_t)fw_files[i].size;
++}
++
++/* bytes off..off+n of a file: runs of contiguous clusters in one read each */
++static bool
++fw_read(const char *path, uint64_t off, void *dst, uint64_t n)
++{
++	int i = fw_find(path);
++	uint8_t *d = (uint8_t *)dst;
++	uint64_t pos = 0;
++	uint32_t c, guard = 0;
++
++	if (i < 0 || off + n > fw_files[i].size) {
++		return false;
++	}
++	c = fw_files[i].cluster;
++	while (n > 0) {
++		uint32_t run = 1;
++		if (c < 2 || c >= fw_fat_entries || ++guard > fw_fat_entries) {
++			return false;
++		}
++		while (run < 1024 && c + run < fw_fat_entries && fw_fat[c + run - 1] == c + run) {
++			run++;
++		}
++		uint64_t run_bytes = (uint64_t)run * fw_cluster_bytes;
++		if (off < pos + run_bytes) {
++			uint64_t skip = off - pos, take = MIN(n, run_bytes - skip);
++			if (!fat_read(fw_data_off + (uint64_t)(c - 2) * fw_cluster_bytes + skip, d, take)) {
++				return false;
++			}
++			d += take;
++			off += take;
++			n -= take;
++		}
++		pos += run_bytes;
++		c = fat_next(c + run - 1);
++		if (n > 0 && c == 0) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ /* ---------------------------------------------------------------- PAS load */
+ 
+ static bool
+@@ -174,7 +393,7 @@ phdr_loadable(const struct elf32_phdr *p)
+ static bool
+ adsp_load(void)
+ {
+-	int64_t mdt_size = topaz_part_fw_size("image/adsp.mdt");
++	int64_t mdt_size = fw_size("image/adsp.mdt");
+ 	uint8_t *mdt = NULL, *meta;
+ 	uint64_t meta_pa = 0, st, res = 0;
+ 	uint32_t min_addr = 0xFFFFFFFFu, max_addr = 0, hash_idx = 0xFFFFFFFFu;
+@@ -182,7 +401,7 @@ adsp_load(void)
+ 	char name[32];
+ 
+ 	if (mdt_size <= 0 || mdt_size > 0x100000 || (mdt = (uint8_t *)IOMalloc((vm_size_t)mdt_size)) == NULL ||
+-	    !topaz_part_fw_read("image/adsp.mdt", 0, mdt, (uint64_t)mdt_size)) {
++	    !fw_read("image/adsp.mdt", 0, mdt, (uint64_t)mdt_size)) {
+ 		LOG("image/adsp.mdt: not readable (%lld bytes)", mdt_size);
+ 		goto out;
+ 	}
+@@ -225,8 +444,8 @@ adsp_load(void)
+ 			memcpy(meta + hsz, mdt + ph[hash_idx].p_offset, ph[hash_idx].p_filesz);
+ 		} else {
+ 			snprintf(name, sizeof(name), "image/adsp.b%02u", hash_idx);
+-			if (topaz_part_fw_size(name) != (int64_t)ph[hash_idx].p_filesz ||
+-			    !topaz_part_fw_read(name, 0, meta + hsz, ph[hash_idx].p_filesz)) {
++			if (fw_size(name) != (int64_t)ph[hash_idx].p_filesz ||
++			    !fw_read(name, 0, meta + hsz, ph[hash_idx].p_filesz)) {
+ 				LOG("%s: hash segment not readable", name);
+ 				goto out;
+ 			}
+@@ -261,8 +480,8 @@ adsp_load(void)
+ 			uint8_t *dst = carve + (ph[i].p_paddr - min_addr);
+ 			if (ph[i].p_filesz != 0) {
+ 				snprintf(name, sizeof(name), "image/adsp.b%02u", i);
+-				if (topaz_part_fw_size(name) != (int64_t)ph[i].p_filesz || !topaz_part_fw_read(name, 0, dst, ph[i].p_filesz)) {
+-					LOG("%s: not readable (%lld of %u bytes)", name, topaz_part_fw_size(name), ph[i].p_filesz);
++				if (fw_size(name) != (int64_t)ph[i].p_filesz || !fw_read(name, 0, dst, ph[i].p_filesz)) {
++					LOG("%s: not readable (%lld of %u bytes)", name, fw_size(name), ph[i].p_filesz);
+ 					loaded = false;
+ 					break;
+ 				}
+@@ -1115,672 +1334,772 @@ qrtr_poll(void)
+ 	}
+ }
+ 
+-/* ---------------------------------------------------------------- GPR (AudioReach) */
++/* ---------------------------------------------------------------- APR (laurel: Elite ADSP firmware) */
+ 
+-#define GCHAN               "adsp_apps"
+-#define GPR_DOMAIN_ADSP     2
+-#define GPR_DOMAIN_APPS     3
+-#define GPR_HDR_WORDS       6
+-#define GPR_OUR_PORT        3                   /* spf_core: gpr service reg = <3> */
+-#define APM_MODULE_IID      1
+-#define GPR_BASIC_RSP_RESULT        0x02001005u
+-#define APM_CMD_GET_SPF_STATE       0x01001021u
+-#define APM_CMD_RSP_GET_SPF_STATE   0x02001007u
+-
+-struct gpr_hdr {
+-	uint32_t word0;                         /* version:4 hdr_size:4 (words) pkt_size:24 (bytes) */
+-	uint8_t  dest_domain, src_domain;
+-	uint16_t rsvd;
+-	uint32_t src_port, dest_port, token, opcode;
++/*
++ * ADSP.VT.5.4 (Nicobar) speaks APR, not GPR: GLINK channel "apr_audio_svc" (DT qcom,apr_tal_rpmsg),
++ * a 20-byte header {hdr_field, pkt_size, src svc/domain/port, dst svc/domain/port, token, opcode}.
++ * Apps = domain 5, ADSP = domain 4; services core 3, AFE 4, ASM 7, ADM 8 (techpack/audio apr.h,
++ * q6core.c). Commands are answered with APR_BASIC_RSP_RESULT {opcode, status} or their own reply.
++ */
++#define ACHAN               "apr_audio_svc"
++#define APR_DOMAIN_ADSP     4
++#define APR_DOMAIN_APPS     5
++#define APR_SVC_CORE        3
++#define APR_SVC_AFE         4
++#define APR_SVC_ASM         7
++#define APR_SVC_ADM         8
++#define APR_HDR_FIELD       ((2u << 8) | (5u << 4))     /* SEQ_CMD, 20-byte header, version 0 */
++#define APR_BASIC_RSP       0x000110E8u
++#define AVCS_GET_STATE      0x0001290Cu
++#define AVCS_GET_STATE_RSP  0x0001290Du
++
++struct apr_hdr {
++	uint16_t hdr_field, pkt_size;
++	uint8_t  src_svc, src_domain;
++	uint16_t src_port;
++	uint8_t  dst_svc, dst_domain;
++	uint16_t dst_port;
++	uint32_t token, opcode;
+ } __attribute__((packed));
+ 
+-static bool gpr_reply(const struct gpr_hdr *h, const uint8_t *data, uint32_t len);
+-static uint32_t gpr_token = 0x100, spf_state = 0xFFFFFFFFu, gpr_asks, gpr_rxn;
+-static unsigned gpr_last_ask, spf_ready_ms;
++static uint32_t apr_token = 1, apr_rxn, apr_other;
++static uint32_t call_token, call_op, call_len, call_rsp[16];
++static bool call_done;
++static uint32_t core_state, core_asks;
++static unsigned core_last_ask;
++
++static bool apr_event(uint8_t svc, uint32_t opcode, uint32_t token, const uint32_t *p, uint32_t len);
+ 
+ static void
+-gpr_send(uint32_t dest_port, uint32_t opcode, const void *payload, uint32_t len)
++apr_rx(const uint8_t *data, uint32_t len)
+ {
+-	uint8_t buf[sizeof(struct gpr_hdr) + 256];
+-	struct gpr_hdr *h = (struct gpr_hdr *)buf;
++	const struct apr_hdr *h = (const struct apr_hdr *)data;
++	uint32_t hlen, plen;
+ 
+-	if (len > 256) {
++	apr_rxn++;
++	if (len < sizeof(*h) || (hlen = ((h->hdr_field >> 4) & 0xF) * 4) < sizeof(*h) || hlen > len) {
++		LOG("t=%u.%03u apr: short packet %u B", T, len);
+ 		return;
+ 	}
+-	bzero(buf, sizeof(buf));
+-	h->word0 = (GPR_HDR_WORDS << 4) | ((uint32_t)(sizeof(struct gpr_hdr) + len) << 8);
+-	h->dest_domain = GPR_DOMAIN_ADSP;
+-	h->src_domain = GPR_DOMAIN_APPS;
+-	h->src_port = GPR_OUR_PORT;
+-	h->dest_port = dest_port;
+-	h->token = gpr_token++;
+-	h->opcode = opcode;
+-	memcpy(buf + sizeof(struct gpr_hdr), payload, len);
+-	glink_send(GCHAN, buf, (uint32_t)sizeof(struct gpr_hdr) + len);
++	plen = len - hlen;
++	const uint32_t *p = (const uint32_t *)(data + hlen);
++	if (h->opcode == AVCS_GET_STATE_RSP && plen >= 4) {
++		if (p[0] != core_state) {
++			LOG("t=%u.%03u apr: ADSP core state %u%s (after %u asks)", T, p[0], p[0] == 1 ? " READY" : "", core_asks);
++		}
++		core_state = p[0];
++		return;
++	}
++	if (call_token != 0 && h->token == call_token) {
++		call_op = h->opcode;
++		call_len = plen;
++		bzero(call_rsp, sizeof(call_rsp));
++		memcpy(call_rsp, p, MIN(plen, (uint32_t)sizeof(call_rsp)));
++		call_done = true;
++		return;
++	}
++	if (apr_event(h->src_svc, h->opcode, h->token, p, plen)) {
++		return;
++	}
++	if (h->opcode == APR_BASIC_RSP && plen >= 8 && p[0] == AVCS_GET_STATE) {
++		return;                                 /* the core service is not ready yet */
++	}
++	if (apr_other++ < 16) {
++		LOG("t=%u.%03u apr rx svc %u port %x token %x opcode %08x, %u B: %08x %08x", T, h->src_svc, h->src_port, h->token,
++		    h->opcode, plen, plen >= 4 ? p[0] : 0, plen >= 8 ? p[1] : 0);
++	}
+ }
+ 
+-static void
+-gpr_rx(const uint8_t *data, uint32_t len)
++static bool
++apr_send(uint8_t svc, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t len)
+ {
+-	const struct gpr_hdr *h = (const struct gpr_hdr *)data;
++	uint8_t buf[sizeof(struct apr_hdr) + 128];
++	struct apr_hdr *h = (struct apr_hdr *)buf;
+ 
+-	gpr_rxn++;
+-	if (len < sizeof(struct gpr_hdr)) {
+-		LOG("t=%u.%03u gpr: short packet %u B", T, len);
+-		return;
++	if (len > sizeof(buf) - sizeof(*h)) {
++		return false;
++	}
++	bzero(buf, sizeof(*h));
++	h->hdr_field = APR_HDR_FIELD;
++	h->pkt_size = (uint16_t)(sizeof(*h) + len);
++	h->src_svc = svc;
++	h->src_domain = APR_DOMAIN_APPS;
++	h->src_port = port;
++	h->dst_svc = svc;
++	h->dst_domain = APR_DOMAIN_ADSP;
++	h->dst_port = port;
++	h->token = token;
++	h->opcode = opcode;
++	if (len != 0) {
++		memcpy(buf + sizeof(*h), payload, len);
+ 	}
+-	uint32_t hlen = ((h->word0 >> 4) & 0xF) * 4;
+-	uint32_t p0 = len >= hlen + 4 ? *(const uint32_t *)(data + hlen) : 0;
+-	uint32_t p1 = len >= hlen + 8 ? *(const uint32_t *)(data + hlen + 4) : 0;
++	return glink_send(ACHAN, buf, (uint32_t)sizeof(*h) + len);
++}
+ 
+-	if (h->opcode == APM_CMD_RSP_GET_SPF_STATE && len >= hlen + 4) {
+-		if (p0 != spf_state) {
+-			LOG("t=%u.%03u *** APM SPF state = %u%s (after %u asks) ***", T, p0, p0 == 1 ? " READY" : "", gpr_asks);
+-		}
+-		spf_state = p0;
+-		if (spf_state == 1 && spf_ready_ms == 0) {
+-			spf_ready_ms = ms();
++/* one command, GLINK pumped until its answer (the token) comes; events are handled meanwhile */
++static bool
++apr_call(uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len, unsigned timeout_ms)
++{
++	call_token = apr_token++;
++	if (apr_token >= 0x01000000u) {
++		apr_token = 1;
++	}
++	call_done = false;
++	if (!apr_send(svc, port, call_token, opcode, payload, len)) {
++		call_token = 0;
++		return false;
++	}
++	for (unsigned t = ms(); !call_done && ms() - t < timeout_ms;) {
++		if (!glink_poll()) {
++			IOSleep(1);
+ 		}
+-		return;
+ 	}
+-	if (h->opcode == GPR_BASIC_RSP_RESULT && p0 == APM_CMD_GET_SPF_STATE && h->dest_port == GPR_OUR_PORT) {
+-		return;                                 /* "not ready yet" */
++	call_token = 0;
++	return call_done;
++}
++
++static const char *
++apr_status(uint32_t s)
++{
++	static const char *const n[] = { "ok", "failed", "bad param", "unsupported", "version", "unexpected", "panic",
++		                         "no resource", "bad handle", "already", "not ready", "pending", "busy", "aborted",
++		                         "preempted", "continue", "immediate", "not impl", "need more", "no memory", "not exist" };
++	return s < sizeof(n) / sizeof(n[0]) ? n[s] : "?";
++}
++
++static char why[96];                            /* the reason of the last failed command */
++
++/* a command whose answer is APR_BASIC_RSP status 0, or the opcode `want' (then in call_rsp) */
++static bool
++cmd(const char *what, uint8_t svc, uint16_t port, uint32_t opcode, const void *payload, uint32_t len, uint32_t want)
++{
++	if (!apr_call(svc, port, opcode, payload, len, 1000)) {
++		snprintf(why, sizeof(why), "%s: no answer (opcode %08x)", what, opcode);
++		LOG("%s", why);
++		return false;
+ 	}
+-	if (gpr_reply(h, data, len)) {
+-		return;
++	if (want != 0 && call_op == want) {
++		return true;
+ 	}
+-	if (gpr_rxn <= 32) {
+-		LOG("t=%u.%03u gpr rx %u B: port %x->%x token %x opcode %08x payload %08x %08x", T, len, h->src_port,
+-		    h->dest_port, h->token, h->opcode, p0, p1);
++	if (call_op == APR_BASIC_RSP && call_len >= 8 && call_rsp[0] == opcode) {
++		if (call_rsp[1] == 0 && want == 0) {
++			return true;
++		}
++		snprintf(why, sizeof(why), "%s: refused (%s)", what, apr_status(call_rsp[1]));
++	} else {
++		snprintf(why, sizeof(why), "%s: answer %08x", what, call_op);
+ 	}
++	LOG("%s", why);
++	return false;
+ }
+ 
++/* ask the core service until it says the audio services are up (q6core_is_adsp_ready) */
+ static void
+-gpr_poll(void)
++apr_core_poll(void)
+ {
+-	if (!glink_chan_up(GCHAN) || spf_state == 1 || gpr_asks >= 120) {
++	if (!glink_chan_up(ACHAN) || core_state == 1 || core_asks >= 150) {
+ 		return;
+ 	}
+-	if (gpr_asks == 0 || ms() - gpr_last_ask >= 1000) {
+-		gpr_last_ask = ms();
+-		gpr_asks++;
+-		gpr_send(APM_MODULE_IID, APM_CMD_GET_SPF_STATE, NULL, 0);
++	if (core_asks == 0 || ms() - core_last_ask >= 200) {
++		core_last_ask = ms();
++		core_asks++;
++		(void)apr_send(APR_SVC_CORE, 0, 0x100, AVCS_GET_STATE, NULL, 0);
+ 	}
+ }
+ 
+-/* ---------------------------------------------------------------- GPR calls (wait for the reply) */
++/* ---------------------------------------------------------------- speaker amp (MAX98927 / MAX98937) */
+ 
+-extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
+-extern "C" bool topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
++/*
++ * QUP0 SE1 I2C 0x3a, reset GPIO 95 (TLMM SOUTH), I2S slave on SEC_MI2S. Register tables from the
++ * vendor driver (techpack/audio/asoc/codecs/max98937.c, "mono" channel map + common map; the chip
++ * tells its kind: REV_ID 0x01ff bit 6 = MAX98927, else 0x0600 bit 6 = MAX98937). No speaker
++ * protection runs (Android's Maxim DSM lives in the ADSP with IV feedback), so the amp uses the
++ * vendor's safe gains (spk_safe_gain 1, digital_safe_gain 44) that it applies without DSM.
++ */
+ extern "C" int  sweet_i2c1_init(void);
+-extern "C" int  sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
++extern "C" int  sweet_i2c1_write16(uint8_t addr, uint16_t reg, uint8_t val);
++extern "C" int  sweet_i2c1_read16(uint8_t addr, uint16_t reg, uint8_t *val);
++extern "C" bool topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+-static uint32_t call_token, call_op, call_words, call_rsp[16];
+-static bool call_done;
++#define AMP_I2C             0x3a
++#define TLMM_GPIO95_PA      0x0095F000ull       /* TLMM SOUTH 0x900000 + 95 * 0x1000 */
++#define TLMM_GPIO125_PA     0x00D7D000ull       /* TLMM EAST 0xd00000 + 125 * 0x1000: SEC_MI2S 125..128 */
++#define MI2S_PIN_CFG        ((2u << 2) | (3u << 6))     /* function 2 sec_mi2s, 8 mA */
++#define AUDIO_SID           0x41                /* DT msm_audio_ion iommus <&apps_smmu 0x41 0>, sid mask 0xf */
++#define AUDIO_MSW           (AUDIO_SID & 0xF)   /* the SID's low bits go in address bits 32..35 */
++
++struct amp_regs { uint16_t global, amp_en, spk_gain, mode, master, clock, rate1, rate2; };
++static const struct amp_regs amp27 = { 0x00FF, 0x003A, 0x003C, 0x0020, 0x0021, 0x0022, 0x0023, 0x0024 };
++static const struct amp_regs amp37 = { 0x0500, 0x0039, 0x003B, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027 };
++static const uint16_t amp27_init[][2] = {
++	/* channel map "mono" */
++	{ 0x41, 0x01 }, { 0x1e, 0x01 }, { 0x18, 0x03 }, { 0x1a, 0x03 }, { 0x1c, 0xFC }, { 0x25, 0x80 }, { 0x26, 0x01 },
++	/* common map */
++	{ 0x53, 0x00 }, { 0x55, 0x00 }, { 0x72, 0x14 }, { 0x73, 0x00 }, { 0x74, 0x0c }, { 0x75, 0x00 }, { 0x76, 0x10 },
++	{ 0x77, 0x00 }, { 0x78, 0x0c }, { 0x79, 0x00 }, { 0x7a, 0x0c }, { 0x7b, 0x06 }, { 0x7c, 0x18 }, { 0x7d, 0x0c },
++	{ 0x7e, 0x08 }, { 0x7f, 0x0e }, { 0x80, 0x80 }, { 0x81, 0x00 }, { 0x5e, 0x00 }, { 0x5f, 0x00 }, { 0x60, 0x00 },
++	{ 0x61, 0x00 }, { 0x43, 0x07 }, { 0x14, 0x78 }, { 0x15, 0xFF }, { 0x17, 0x55 }, { 0x3f, 0xF7 }, { 0x1b, 0x00 },
++	{ 0x19, 0x00 }, { 0x1f, 0x00 }, { 0x1d, 0xFF }, { 0x3e, 0x00 }, { 0x35, 0x00 }, { 0x36, 0x38 }, { 0x37, 0x33 },
++	{ 0x39, 0x01 }, { 0x3c, 0x05 }, { 0x3d, 0x85 }, { 0x40, 0x1c }, { 0x42, 0x3e }, { 0x44, 0x00 }, { 0x45, 0x00 },
++	{ 0x16, 0x00 }, { 0x82, 0x0C }, { 0x86, 0x01 }, { 0x52, 0x00 },
++};
++static const uint16_t amp37_init[][2] = {
++	/* channel map "mono" */
++	{ 0x40, 0x01 }, { 0x1e, 0x01 }, { 0x18, 0x03 }, { 0x1a, 0x03 }, { 0x1c, 0xFC }, { 0x28, 0x80 }, { 0x29, 0x01 },
++	/* common map */
++	{ 0x11, 0x03 }, { 0x53, 0x00 }, { 0x55, 0x00 }, { 0x5e, 0x16 }, { 0x5f, 0x00 }, { 0x60, 0x0c }, { 0x61, 0x0c },
++	{ 0x62, 0x12 }, { 0x63, 0x00 }, { 0x64, 0x0c }, { 0x65, 0x0c }, { 0x66, 0x0e }, { 0x67, 0x03 }, { 0x68, 0x18 },
++	{ 0x69, 0x18 }, { 0x6a, 0x0a }, { 0x6b, 0x00 }, { 0x6c, 0x80 }, { 0x6d, 0x00 }, { 0x5a, 0x00 }, { 0x5b, 0x00 },
++	{ 0x5c, 0x1f }, { 0x5d, 0x00 }, { 0x42, 0x07 }, { 0x14, 0x75 }, { 0x15, 0x8c }, { 0x17, 0x55 }, { 0x3e, 0xF7 },
++	{ 0x23, 0x40 }, { 0x3a, 0x00 }, { 0x1b, 0x00 }, { 0x19, 0x00 }, { 0x1f, 0x03 }, { 0x1d, 0xFF }, { 0x3d, 0x00 },
++	{ 0x35, 0x00 }, { 0x36, 0x38 }, { 0x37, 0x0f }, { 0x3b, 0x55 }, { 0x3c, 0x85 }, { 0x3f, 0x1c }, { 0x41, 0x40 },
++	{ 0x43, 0x00 }, { 0x44, 0xFF }, { 0x16, 0x08 }, { 0x73, 0x0f }, { 0x77, 0x01 }, { 0x52, 0x02 }, { 0x20, 0x00 },
++	{ 0x21, 0x00 }, { 0x22, 0x00 }, { 0x4e, 0x10 }, { 0x79, 0x45 }, { 0x7a, 0x2B }, { 0x7b, 0x04 }, { 0x39, 0x80 },
++};
+ 
+-/* called from gpr_rx for every packet that is not our SPF polling */
+-static bool
+-gpr_reply(const struct gpr_hdr *h, const uint8_t *data, uint32_t len)
+-{
+-	uint32_t hlen = ((h->word0 >> 4) & 0xF) * 4;
++static const struct amp_regs *amp;
++static uint8_t amp_rev;
++static bool amp_running;
+ 
+-	if (call_token == 0 || h->token != call_token || len < hlen) {
+-		return false;
+-	}
+-	call_op = h->opcode;
+-	call_words = MIN((len - hlen) / 4, (uint32_t)(sizeof(call_rsp) / 4));
+-	memcpy(call_rsp, data + hlen, call_words * 4);
+-	call_done = true;
+-	return true;
++static int
++amp_update(uint16_t reg, uint8_t mask, uint8_t val)
++{
++	uint8_t v = 0;
++	int err = sweet_i2c1_read16(AMP_I2C, reg, &v);
++	return err != 0 ? err : sweet_i2c1_write16(AMP_I2C, reg, (uint8_t)((v & ~mask) | (val & mask)));
+ }
+ 
+-/*
+- * Send one GPR packet to port dst (from port src), optionally with an in-band apm_cmd_header
+- * (payload_size), and pump GLINK until the reply with the same token. TopazSpeaker ta.c TaGpr.
+- */
++/* reset, identify, configure (I2S slave, 16-bit, 48 kHz, BCLK = 32 x LRCLK), left powered down */
+ static bool
+-gpr_call(uint32_t dst, uint32_t src, uint32_t opcode, bool apm_hdr, const uint32_t *dw, uint32_t n, unsigned timeout_ms)
++amp_probe(void)
+ {
+-	uint32_t pkt[96], k = 6;
++	volatile uint32_t *g = (volatile uint32_t *)ml_io_map(TLMM_GPIO95_PA, 0x1000);
++	uint8_t rev = 0;
++	int err;
+ 
+-	if (n + 10 > sizeof(pkt) / 4) {
++	if ((err = sweet_i2c1_init()) != 0) {
++		snprintf(why, sizeof(why), "QUP0 SE1 I2C: error %d", err);
+ 		return false;
+ 	}
+-	bzero(pkt, sizeof(pkt));
+-	if (apm_hdr) {
+-		pkt[k + 3] = n * 4;                     /* apm_cmd_header.payload_size */
+-		k += 4;
+-	}
+-	for (uint32_t i = 0; i < n; i++) {
+-		pkt[k++] = dw[i];
++	if (g != NULL) {                                    /* GPIO 95: output, low 1 ms, high (vendor probe) */
++		g[1] = 0; mb();
++		g[0] = 1u << 9; mb();
++		IOSleep(1);
++		g[1] = 2; mb();
++		IOSleep(10);
+ 	}
+-	call_token = gpr_token++;
+-	call_done = false;
+-	pkt[0] = (GPR_HDR_WORDS << 4) | ((k * 4) << 8);
+-	pkt[1] = GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8);
+-	pkt[2] = src;
+-	pkt[3] = dst;
+-	pkt[4] = call_token;
+-	pkt[5] = opcode;
+-	glink_send(GCHAN, pkt, k * 4);
+-	for (unsigned t = ms(); !call_done && ms() - t < timeout_ms;) {
+-		if (!glink_poll()) {
+-			IOSleep(1);
++	for (uint32_t i = 0; i < 5 && amp == NULL; i++) {
++		if (sweet_i2c1_read16(AMP_I2C, 0x01FF, &rev) == 0 && (rev & 0x40) != 0) {
++			amp = &amp27;
++		} else if (sweet_i2c1_read16(AMP_I2C, 0x0600, &rev) == 0 && (rev & 0x40) != 0) {
++			amp = &amp37;
++		} else {
++			IOSleep(10 * (i + 1));
+ 		}
+ 	}
+-	call_token = 0;
+-	if (!call_done) {
+-		LOG("gpr %08x: no reply", opcode);
++	if (amp == NULL) {
++		snprintf(why, sizeof(why), "no MAX98927/MAX98937 answers at I2C 0x%x", AMP_I2C);
++		return false;
+ 	}
+-	return call_done;
++	amp_rev = rev;
++	const uint16_t (*t)[2] = amp == &amp27 ? amp27_init : amp37_init;
++	uint32_t n = amp == &amp27 ? sizeof(amp27_init) / sizeof(amp27_init[0]) : sizeof(amp37_init) / sizeof(amp37_init[0]);
++	err = 0;
++	for (uint32_t i = 0; i < n && err == 0; i++) {
++		err = sweet_i2c1_write16(AMP_I2C, t[i][0], (uint8_t)t[i][1]);
++	}
++	/* hw_params + set_clock of the vendor driver: I2S, 16-bit slots, slave, BSEL 32, 48 kHz (code 8) */
++	err = err ?: amp_update(amp->mode, 0xF8, 0x40);
++	err = err ?: amp_update(amp->master, 0x03, 0x00);
++	err = err ?: amp_update(amp->clock, 0x0F, 0x02);
++	err = err ?: amp_update(amp->rate1, 0x0F, 0x08);
++	err = err ?: amp_update(amp->rate2, 0xFF, 0x88);
++	/* safe gains (no DSM): digital 44, speaker PCM gain 1 */
++	err = err ?: amp_update(0x0036, 0x7F, 44);
++	err = err ?: amp_update(amp->spk_gain, 0x07, 1);
++	err = err ?: amp_update(amp->global, 0x01, 0);
++	err = err ?: amp_update(amp->amp_en, 0x01, 0);
++	if (err != 0) {
++		snprintf(why, sizeof(why), "MAX989%s7 rev 0x%02x: I2C write error %d", amp == &amp27 ? "2" : "3", rev, err);
++		amp = NULL;
++		return false;
++	}
++	LOG("amp: MAX989%s7 rev 0x%02x at 0x%x configured (I2S slave 16-bit 48 kHz, safe gains), powered down",
++	    amp == &amp27 ? "2" : "3", rev, AMP_I2C);
++	return true;
+ }
+ 
+-/* APM command: true if GPR_BASIC_RSP_RESULT says 0 (or another reply came) */
++/* SEC_MI2S GPIO 125..128 (SCK, WS, DATA0, DATA1): function sec_mi2s, 8 mA, pulls kept (DT sec_mi2s_gpios_active) */
+ static bool
+-apm(uint32_t opcode, bool apm_hdr, const uint32_t *dw, uint32_t n)
++mi2s_pins(void)
+ {
+-	if (!gpr_call(1, 1, opcode, apm_hdr, dw, n, 1000)) {
++	volatile uint8_t *t = (volatile uint8_t *)ml_io_map(TLMM_GPIO125_PA, 0x4000);
++
++	if (t == NULL) {
++		snprintf(why, sizeof(why), "TLMM: no mapping for GPIO 125..128");
+ 		return false;
+ 	}
+-	if (call_op == GPR_BASIC_RSP_RESULT && call_words >= 2 && call_rsp[1] != 0) {
+-		LOG("apm %08x: status %u", opcode, call_rsp[1]);
+-		return false;
++	for (uint32_t i = 0; i < 4; i++) {
++		volatile uint32_t *cfg = (volatile uint32_t *)(t + 0x1000 * i);
++		*cfg = (*cfg & 0x3u) | MI2S_PIN_CFG;
++		mb();
+ 	}
++	LOG("SEC_MI2S pins 125..128: cfg %03x %03x %03x %03x", *(volatile uint32_t *)t, *(volatile uint32_t *)(t + 0x1000),
++	    *(volatile uint32_t *)(t + 0x2000), *(volatile uint32_t *)(t + 0x3000));
+ 	return true;
+ }
+ 
+-/* PRM (module iid 2) PRM_CMD_REQUEST_HW_RSC */
+-static bool
+-prm(const uint32_t *dw, uint32_t n)
++/* unmute order of the vendor's mute_stream: AMP enable, then global; mute: global, then AMP */
++static void
++amp_power(bool on)
+ {
+-	if (!gpr_call(2, 2, 0x0100100Fu, true, dw, n, 1000)) {
+-		return false;
++	int err;
++
++	if (amp == NULL || amp_running == on) {
++		return;
+ 	}
+-	if (call_words >= 2 && call_rsp[1] != 0) {
+-		LOG("prm %08x: status %u", dw[1], call_rsp[1]);
+-		return false;
++	if (on) {
++		err = amp_update(amp->amp_en, 0x01, 1);
++		err = err ?: amp_update(amp->global, 0x01, 1);
++	} else {
++		err = amp_update(amp->global, 0x01, 0);
++		int e2 = amp_update(amp->amp_en, 0x01, 0);
++		err = err ?: e2;
++	}
++	amp_running = on;
++	if (err != 0) {
++		LOG("t=%u.%03u amp %s: I2C error %d", T, on ? "on" : "off", err);
+ 	}
+-	return true;
+ }
+ 
+-/* ---------------------------------------------------------------- codec (WCD937x AUX + sia8159) */
++/* ---------------------------------------------------------------- AFE port SEC_MI2S_RX */
+ 
+-#define LPASS_PA            0x0A600000ull       /* RX/TX/VA macros, SoundWire masters, LPI TLMM, CGCRs */
+-#define LPASS_SIZE          0x00360000u
+-#define RX_MACRO            0x0A600000u
+-#define TX_MACRO            0x0A620000u
+-#define VA_MACRO            0x0A730000u
+-#define RX_SWR              0x0A610000u
+-#define VA_SWR              0x0A740000u
+-#define LPI_TLMM            0x0A7C0000u
+-#define TLMM_GPIO92_PA      0x0055C000ull       /* WCD937x reset, TLMM WEST */
+-#define AMP_I2C             0x2b                /* sia8159 on QUP0 SE1 */
++/*
++ * What sm6150.c + msm-dai-q6-v2.c + q6afe.c send for the speaker (SEC_MI2S_RX, 48 kHz S16_LE
++ * stereo, CPU is the I2S master: CBS_CFS): the internal bit clock SEC_MI2S_IBIT at
++ * 48000 x 2 x 16 = 1.536 MHz, the port's I2S config on data line SD0, then DEVICE_START.
++ */
++#define AFE_PORT            0x1002              /* AFE_PORT_ID_SECONDARY_MI2S_RX */
++#define AFE_CLK_SEC_IBIT    0x102
++#define AFE_PORT_START      0x000100E5u
++#define AFE_PORT_STOP       0x000100E6u
++#define AFE_PORT_SET_PARAM  0x000100EFu
++#define AFE_SVC_SET_PARAM   0x000100F3u
++#define AFE_MOD_DEV_IF      0x0001020Cu
++#define AFE_PARAM_I2S       0x0001020Du
++#define AFE_MOD_CLOCK       0x0001028Fu
++#define AFE_PARAM_CLOCK     0x00010290u
++#define RATE                48000u
++#define BCLK_HZ             (RATE * 2 * 16)
++
++struct afe_param { uint32_t module, param; uint16_t size, reserved; } __attribute__((packed));
++struct afe_clk { uint32_t version, id, hz; uint16_t attr, root; uint32_t enable; } __attribute__((packed));
++struct afe_i2s { uint32_t version; uint16_t bits, lines, stereo, ws_src; uint32_t rate; uint16_t format, reserved; } __attribute__((packed));
++
++static bool afe_clock_on, afe_started;
+ 
+-static volatile uint8_t *lpass, *gpio92;
+-static uint32_t swr_id;
++static bool
++afe_svc_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
++{
++	uint8_t m[16 + sizeof(struct afe_param) + 32];
++	struct afe_param *p = (struct afe_param *)(m + 16);
+ 
+-static void
+-lw(uint32_t pa, uint32_t v)
++	bzero(m, sizeof(m));
++	*(uint32_t *)m = (uint32_t)sizeof(*p) + size;       /* payload size; address 0, handle 0: in band */
++	p->module = module;
++	p->param = param;
++	p->size = size;
++	memcpy(m + 16 + sizeof(*p), data, size);
++	return cmd(what, APR_SVC_AFE, 0, AFE_SVC_SET_PARAM, m, 16 + (uint32_t)sizeof(*p) + size, 0);
++}
++
++static bool
++afe_port_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
+ {
+-	mb();
+-	*(volatile uint32_t *)(lpass + (pa - LPASS_PA)) = v;
+-	mb();
++	uint8_t m[16 + sizeof(struct afe_param) + 32];
++	struct afe_param *p = (struct afe_param *)(m + 16);
++
++	bzero(m, sizeof(m));
++	*(uint16_t *)m = AFE_PORT;
++	*(uint16_t *)(m + 2) = (uint16_t)(sizeof(*p) + size);
++	p->module = module;
++	p->param = param;
++	p->size = size;
++	memcpy(m + 16 + sizeof(*p), data, size);
++	return cmd(what, APR_SVC_AFE, 0, AFE_PORT_SET_PARAM, m, 16 + (uint32_t)sizeof(*p) + size, 0);
+ }
+ 
+-static uint32_t
+-lr(uint32_t pa)
++static bool
++afe_clock(bool on)
+ {
+-	uint32_t v = *(volatile uint32_t *)(lpass + (pa - LPASS_PA));
+-	mb();
+-	return v;
++	struct afe_clk c = { 1, AFE_CLK_SEC_IBIT, BCLK_HZ, 1 /* COUPLE_NO */, 0, on ? 1u : 0u };
++	return afe_svc_param(on ? "SEC_MI2S bit clock on" : "SEC_MI2S bit clock off", AFE_MOD_CLOCK, AFE_PARAM_CLOCK, &c, sizeof(c));
+ }
+ 
+-/* SoundWire command FIFO write: SWR_REG_VAL_PACK reg | id << 16 | dev << 20 | data << 24 */
+-static void
+-swr_wr(uint32_t master, uint32_t dev, uint32_t reg, uint32_t val)
++static bool
++afe_on(void)
+ {
+-	swr_id = (swr_id % 14) + 1;
+-	lw(master + 0x300, (val << 24) | (dev << 20) | (swr_id << 16) | reg);
+-	IOSleep(1);
++	struct afe_i2s i2s = { 1, 16, 1 /* SD0 */, 1 /* stereo */, 1 /* WS internal */, RATE, 0 /* linear PCM */, 0 };
++	uint16_t start[2] = { AFE_PORT, 0 };
++
++	afe_clock_on = afe_clock(true);
++	afe_started = afe_clock_on &&
++	    afe_port_param("SEC_MI2S_RX I2S config", AFE_MOD_DEV_IF, AFE_PARAM_I2S, &i2s, sizeof(i2s)) &&
++	    cmd("SEC_MI2S_RX start", APR_SVC_AFE, 0, AFE_PORT_START, start, sizeof(start), 0);
++	return afe_started;
+ }
+ 
+ static void
+-swr_master_init(uint32_t m)
+-{
+-	lw(m + 0x008, 1); lw(m + 0x008, 1); lw(m + 0x1044, 1); IOSleep(2);
+-	lw(m + 0x101C, 0x2F0008); lw(m + 0x500, 1);
+-	uint32_t cfg = lr(m + 0x1048);
+-	lw(m + 0x1048, (cfg & ~0x3E0000u) | (0x1Fu << 17));
+-	lw(m + 0x314, 3); lw(m + 0x1044, 2);
+-	lw(m + 0x04, 2); lw(m + 0x208, 0xFFFFFFFF); lw(m + 0x204, 0x1FDFD); lw(m + 0x210, 0x1FDFD);
+-	lw(m + 0x04, 3); lw(m + 0x314, 0x80000003);
+-}
+-
+-/* RX macro registers from the stock Android dump while playing (topaz-woa rxtab.h) */
+-static const uint16_t rx_stock[][2] = {
+-	{ 0x070, 0x11 }, { 0x074, 0x20 }, { 0x080, 0x11 }, { 0x084, 0x20 }, { 0x090, 0x0c }, { 0x094, 0x0c },
+-	{ 0x098, 0x0c }, { 0x110, 0x08 }, { 0x144, 0x38 }, { 0x190, 0x07 }, { 0x200, 0x01 }, { 0x204, 0x03 },
+-	{ 0x208, 0x02 }, { 0x20c, 0x1c }, { 0x210, 0x39 }, { 0x214, 0x0c }, { 0x218, 0x0c }, { 0x21c, 0x01 },
+-	{ 0x228, 0x80 }, { 0x238, 0x07 }, { 0x244, 0x02 }, { 0x248, 0x9a }, { 0x24c, 0x10 }, { 0x284, 0x10 },
+-	{ 0x290, 0x04 }, { 0x294, 0xe0 }, { 0x298, 0x01 }, { 0x29c, 0x40 }, { 0x2a0, 0x2a }, { 0x2ac, 0x18 },
+-	{ 0x2b0, 0x18 }, { 0x2b4, 0x03 }, { 0x2b8, 0x01 }, { 0x2c4, 0x64 }, { 0x2c8, 0x01 }, { 0x2d8, 0x0c },
+-	{ 0x2e0, 0x77 }, { 0x2e4, 0x01 }, { 0x2ec, 0x4b }, { 0x2f4, 0x01 }, { 0x300, 0x04 }, { 0x304, 0x08 },
+-	{ 0x308, 0x0c }, { 0x30c, 0xe2 }, { 0x314, 0x04 }, { 0x318, 0x3e }, { 0x360, 0xff }, { 0x380, 0xff },
+-	{ 0x408, 0x64 }, { 0x40c, 0x8f }, { 0x410, 0x02 }, { 0x418, 0x04 }, { 0x41c, 0x7e }, { 0x424, 0x08 },
+-	{ 0x434, 0x02 }, { 0x438, 0x08 }, { 0x440, 0x08 }, { 0x450, 0x55 }, { 0x454, 0x55 }, { 0x458, 0x55 },
+-	{ 0x488, 0x64 }, { 0x48c, 0x8f }, { 0x490, 0x02 }, { 0x498, 0x04 }, { 0x49c, 0x7e }, { 0x4a4, 0x08 },
+-	{ 0x4b4, 0x02 }, { 0x4b8, 0x08 }, { 0x4c0, 0x08 }, { 0x4d0, 0x55 }, { 0x4d4, 0x55 }, { 0x4d8, 0x55 },
+-	{ 0x504, 0x18 }, { 0x508, 0x64 }, { 0x50c, 0x8f }, { 0x510, 0x02 }, { 0x518, 0x04 }, { 0x51c, 0x7e },
+-	{ 0x524, 0x04 }, { 0x528, 0x08 }, { 0x540, 0x02 }, { 0x544, 0x08 }, { 0x54c, 0x01 }, { 0x784, 0x07 },
+-	{ 0x788, 0x3c }, { 0x800, 0x60 }, { 0x804, 0xdb }, { 0x808, 0xff }, { 0x80c, 0x35 }, { 0x810, 0xff },
+-	{ 0x818, 0x01 }, { 0x81c, 0x28 }, { 0x840, 0x60 }, { 0x844, 0xdb }, { 0x848, 0xff }, { 0x84c, 0x35 },
+-	{ 0x850, 0xff }, { 0x858, 0x01 }, { 0x85c, 0x28 }, { 0xa24, 0x40 }, { 0xaa4, 0x40 }, { 0xb40, 0x04 },
+-	{ 0xb50, 0x04 }, { 0xc04, 0x01 }, { 0xc44, 0x01 }, { 0xc84, 0x01 }, { 0xd0c, 0xa8 }, { 0xd4c, 0xa8 },
+-	{ 0xd8c, 0xa8 }, { 0xf08, 0x62 }, { 0xf0c, 0x96 }, { 0xf88, 0x62 }, { 0xf8c, 0x96 },
+-};
++afe_off(void)
++{
++	uint16_t stop[2] = { AFE_PORT, 0 };
++
++	if (afe_started) {
++		(void)cmd("SEC_MI2S_RX stop", APR_SVC_AFE, 0, AFE_PORT_STOP, stop, sizeof(stop), 0);
++		afe_started = false;
++	}
++	if (afe_clock_on) {
++		(void)afe_clock(false);
++		afe_clock_on = false;
++	}
++}
+ 
+-static int vol_db = -30;
+-static bool codec_up, ports_up, amp_init;
++/* ---------------------------------------------------------------- ADM path + ASM stream */
+ 
+ /*
+- * Once per boot, after SPF is ready: L14 (WCD937x VDD_BUCK) through the RPM, then topaz-woa
+- * TopazSpeaker hw.c CodecBringUp(): PRM DCODEC vote + only the TX core/NPL clocks (RX and VA
+- * run on the TX MCLK; asking for their own clocks left the SoundWire masters dead), LPI pins,
+- * macros, both SoundWire masters with the codec in reset, SMMU identity for the audio DMA
+- * stream 0x1C1, the stock RX macro registers, WCD937x init + AUX DAC.
++ * Android's playback path for that port, without processing: ADM COPP (NULL topology, 2 ch 16-bit
++ * 48 kHz) on port 0x1002; ASM session 1 stream 1 opened for writing 16-bit PCM (no post-processing),
++ * routed to the COPP; our periods (pool memory, NC) mapped once for the DSP through the apps SMMU
++ * stream 0x41 (identity), the SID's low bits in the address' upper word as msm_audio_ion does.
+  */
++#define ADM_OPEN_V5         0x00010326u
++#define ADM_OPEN_V5_RSP     0x00010329u
++#define ADM_CLOSE_V5        0x00010327u
++#define ADM_ROUTE_V5        0x00010325u
++#define ASM_MAP             0x00010D92u
++#define ASM_MAP_RSP         0x00010D93u
++#define ASM_OPEN_WRITE_V3   0x00010DB3u
++#define ASM_MEDIA_FMT_V2    0x00010D98u
++#define ASM_RUN_V2          0x00010DAAu
++#define ASM_WRITE_V2        0x00010DABu
++#define ASM_WRITE_DONE_V2   0x00010D99u
++#define ASM_RX_UNDERFLOW    0x00010C17u
++#define ASM_CLOSE           0x00010BCDu
++#define ASM_PORT            0x0101              /* session 1, stream 1 */
++#define PERIODS             8
++#define PERIOD_FRAMES       960                 /* 20 ms */
++#define PERIOD_BYTES        (PERIOD_FRAMES * 4)
++#define WRITE_TOKEN         0x80000000u         /* | generation << 8 | period */
++
++static uint8_t *periods;                        /* PERIODS pages of the pool */
++static uint64_t periods_pa;
++static uint32_t map_handle, copp;
++static bool copp_open, asm_open;
++static volatile uint32_t returned, inflight;
++static uint32_t writes_done, write_errors, underflows, stale_events, wgen;
++
++/* write-done events (on this thread, from glink_poll) */
+ static bool
+-codec_bringup(void)
++apr_event(uint8_t svc, uint32_t opcode, uint32_t token, const uint32_t *p, uint32_t len)
+ {
+-	static const uint32_t pins[6] = { 0xD04, 0xD06, 0xD06, 0xD04, 0xD06, 0xD06 };
+-	uint32_t dw[9];
+-	bool ok = true;
++	if (svc != APR_SVC_ASM) {
++		return false;
++	}
++	if ((opcode == ASM_WRITE_DONE_V2 || opcode == APR_BASIC_RSP) && (token & WRITE_TOKEN) != 0) {
++		uint32_t bit = 1u << (token & 31);
++		if (((token >> 8) & 0xFFFF) != wgen) {
++			stale_events++;                         /* from a stream that has been closed */
++			return true;
++		}
++		if (opcode == APR_BASIC_RSP && (len < 8 || p[1] == 0)) {
++			return true;                            /* an "accepted": the write-done follows */
++		}
++		if (opcode == APR_BASIC_RSP || (len >= 16 && p[3] != 0)) {
++			write_errors++;                         /* refused outright, or done with an error */
++		}
++		writes_done++;
++		inflight &= ~bit;
++		returned |= bit;
++		return true;
++	}
++	if (opcode == ASM_RX_UNDERFLOW) {
++		underflows++;
++		return true;
++	}
++	return false;
++}
+ 
+-	for (uint32_t set = 0; set <= 1; set++) {         /* "ldoa" 14: "uv" 1.8 V, "swen" 1 */
+-		ok &= topaz_rpm_write(set, 0x616F646Cu, 14, 0x00007675u, 1800000);
+-		ok &= topaz_rpm_write(set, 0x616F646Cu, 14, 0x6E657773u, 1);
++static bool
++stream_on(void)
++{
++	struct { uint16_t flags, mode, ep1, ep2; uint32_t topology; uint16_t channels, bits; uint32_t rate; uint8_t map[8]; }
++	__attribute__((packed)) open = { 0, 1 /* RX path */, AFE_PORT, 0xFFFF, 0x00010312u /* NULL_COPP */, 2, 16, RATE,
++		                         { 1, 2, 0, 0, 0, 0, 0, 0 } };
++	struct { uint32_t matrix, sessions; uint16_t session, copps; uint16_t copp[2]; } __attribute__((packed))
++	route = { 0 /* AUDIO_RX */, 1, 1, 1, { 0, 0 } };
++	struct { uint32_t flags; uint16_t sink, bits; uint32_t topology, format; } __attribute__((packed))
++	wr = { 0, 0 /* COPP */, 16, 0x00010C68u /* POSTPROC NONE */, 0x00010DA5u /* MULTI_CHANNEL_PCM_V2 */ };
++	struct { uint32_t size; uint16_t channels, bits; uint32_t rate; uint16_t is_signed, reserved; uint8_t map[8]; }
++	__attribute__((packed)) fmt = { 20, 2, 16, RATE, 1, 0, { 1, 2, 0, 0, 0, 0, 0, 0 } };
++	uint32_t run[3] = { 0, 0, 0 };
++
++	if (map_handle == 0) {
++		struct { uint16_t pool, regions; uint32_t property; uint32_t lsw, msw, size; } __attribute__((packed))
++		map = { 3 /* SHMEM8_4K_POOL */, 1, 0, (uint32_t)periods_pa, AUDIO_MSW, PERIODS * 4096 };
++		if (!cmd("ASM map periods", APR_SVC_ASM, 0, ASM_MAP, &map, sizeof(map), ASM_MAP_RSP)) {
++			return false;
++		}
++		map_handle = call_rsp[0];
+ 	}
+-	LOG("t=%u.%03u RPM L14 on: %s", T, ok ? "OK" : "FAILED");
+-	lpass = (volatile uint8_t *)ml_io_map(LPASS_PA, LPASS_SIZE);
+-	gpio92 = (volatile uint8_t *)ml_io_map(TLMM_GPIO92_PA, 0x1000);
+-	if (lpass == NULL || gpio92 == NULL) {
+-		LOG("LPASS map failed");
++	if (!cmd("ADM open COPP", APR_SVC_ADM, AFE_PORT, ADM_OPEN_V5, &open, sizeof(open), ADM_OPEN_V5_RSP)) {
+ 		return false;
+ 	}
+-	/* 1. PRM: DCODEC HW vote, TX core + TX NPL clocks 19.2 MHz */
+-	dw[0] = 2; dw[1] = 0x08001032; dw[2] = 4; dw[3] = 0; dw[4] = 2;
+-	ok = prm(dw, 5);
+-	for (uint32_t i = 0; i < 2 && ok; i++) {
+-		dw[0] = 2; dw[1] = 0x0800102C; dw[2] = 20; dw[3] = 0; dw[4] = 1;
+-		dw[5] = 0x30C + i; dw[6] = 19200000; dw[7] = 1; dw[8] = 0;
+-		ok = prm(dw, 9);
+-	}
+-	LOG("t=%u.%03u PRM vote + clocks: %s", T, ok ? "OK" : "FAILED");
+-	if (!ok) {
++	if (call_rsp[0] != 0) {
++		snprintf(why, sizeof(why), "ADM open COPP: refused (%s)", apr_status(call_rsp[0]));
++		LOG("%s", why);
+ 		return false;
+ 	}
+-	/* 2. LPI pins (SWR clk/data, func1) + slew */
+-	for (uint32_t i = 0; i < 6; i++) {
+-		lw(LPI_TLMM + 0x1000 * i, pins[i]);
+-	}
+-	lw(0x0A95A000, 0x3F3F);
+-	/* 3. VA macro fs-gen + SWR clock */
+-	lw(VA_MACRO, 1); lw(VA_MACRO + 4, 3); lw(VA_MACRO + 4, 1); lw(VA_MACRO + 0x80, 2);
+-	lw(VA_MACRO + 8, 2); lw(VA_MACRO + 8, 3); lw(VA_MACRO + 8, 1);
+-	/* 4. RX macro MCLK, FS, SWR clock; RX CGCR */
+-	lw(RX_MACRO + 0x100, 3); lw(RX_MACRO + 0x104, 3); lw(RX_MACRO + 0x104, 1);
+-	lw(RX_MACRO + 0x108, 2); lw(RX_MACRO + 0x108, 3); lw(RX_MACRO + 0x108, 1);
+-	lw(0x0A6A9098, 3); IOSleep(1); lw(0x0A6A9098, 1);
+-	/* 5. TX macro MCLK, FS, SWR clock; VA/TX CGCR */
+-	lw(TX_MACRO, 1); lw(TX_MACRO + 4, 3); lw(TX_MACRO + 4, 1);
+-	lw(TX_MACRO + 8, 2); lw(TX_MACRO + 8, 3); lw(TX_MACRO + 8, 1);
+-	lw(0x0A7EC100, 3); IOSleep(1); lw(0x0A7EC100, 1);
+-	/* 6. WCD937x reset (gpio92) low while both masters start, then high */
+-	*(volatile uint32_t *)(gpio92 + 4) = 0; mb();
+-	*(volatile uint32_t *)(gpio92 + 0) = 0x200; mb();
+-	swr_master_init(RX_SWR);
+-	swr_master_init(VA_SWR);
+-	IOSleep(20);
+-	*(volatile uint32_t *)(gpio92 + 4) = 2; mb();
+-	IOSleep(300);
+-	LOG("t=%u.%03u SoundWire: slaves rx %x va %x, ids %08x %08x", T, lr(RX_SWR + 0x1090), lr(VA_SWR + 0x1090),
+-	    lr(RX_SWR + 0x538), lr(VA_SWR + 0x538));
+-	/* 7. audio DMA (apps SMMU stream 0x1C1) passes addresses through */
+-	if (!topaz_smmu_identity(0x1C1, 0, "audio")) {
++	copp_open = true;
++	copp = call_rsp[1] & 0xFFFF;
++	route.copp[0] = (uint16_t)copp;
++	if (!cmd("ASM open write", APR_SVC_ASM, ASM_PORT, ASM_OPEN_WRITE_V3, &wr, sizeof(wr), 0)) {
+ 		return false;
+ 	}
+-	/* 8. RX macro as on stock; RX0..2 paths muted */
+-	for (uint32_t i = 0; i < sizeof(rx_stock) / sizeof(rx_stock[0]); i++) {
+-		lw(RX_MACRO + rx_stock[i][0], rx_stock[i][1]);
+-	}
+-	lw(RX_MACRO + 0x400, 4); lw(RX_MACRO + 0x480, 4); lw(RX_MACRO + 0x500, 4);
+-	/* 9. WCD937x init + RX clocks + AUX DAC (its TX slave on the VA bus, dev 1) */
+-	swr_wr(VA_SWR, 1, 0x3103, 0xD6); IOSleep(2);
+-	swr_wr(VA_SWR, 1, 0x312A, 0x00);
+-	swr_wr(VA_SWR, 1, 0x3029, 0x85);
+-	swr_wr(VA_SWR, 1, 0x3001, 0xC0); IOSleep(10); swr_wr(VA_SWR, 1, 0x3001, 0x80);
+-	swr_wr(VA_SWR, 1, 0x30E2, 0xD9);
+-	swr_wr(VA_SWR, 1, 0x30A5, 0xEB);
+-	swr_wr(VA_SWR, 1, 0x3409, 0x08); swr_wr(VA_SWR, 1, 0x3408, 0x01); swr_wr(VA_SWR, 1, 0x3008, 0x01);
+-	swr_wr(VA_SWR, 1, 0x340D, 0xBC); swr_wr(VA_SWR, 1, 0x340E, 0xBC); swr_wr(VA_SWR, 1, 0x340F, 0xBC);
+-	swr_wr(VA_SWR, 1, 0x3408, 0x03);
+-	swr_wr(VA_SWR, 1, 0x3408, 0x07); swr_wr(VA_SWR, 1, 0x3409, 0x0C); swr_wr(VA_SWR, 1, 0x344F, 0x01);
+-	swr_wr(VA_SWR, 1, 0x3009, 0x0C); swr_wr(VA_SWR, 1, 0x300A, 0x40); swr_wr(VA_SWR, 1, 0x300B, 0x12);
+-	swr_wr(VA_SWR, 1, 0x3008, 0x41); swr_wr(VA_SWR, 1, 0x3008, 0xC1);
+-	lw(RX_MACRO + 0x514, (uint32_t)vol_db & 0xFF);      /* RX_RX2_RX_VOL_CTL, s8 dB */
+-	codec_up = true;
+-	LOG("t=%u.%03u codec ready", T);
+-	return true;
++	asm_open = true;
++	return cmd("ADM route session 1", APR_SVC_ADM, 0, ADM_ROUTE_V5, &route, sizeof(route), 0) &&
++	       cmd("ASM media format", APR_SVC_ASM, ASM_PORT, ASM_MEDIA_FMT_V2, &fmt, sizeof(fmt), 0) &&
++	       cmd("ASM run", APR_SVC_ASM, ASM_PORT, ASM_RUN_V2, run, sizeof(run), 0);
+ }
+ 
+-/* SoundWire data ports + WCD937x AUX PA, after the first graph start (ports.ps1, wcd_auxpa.ps1) */
+ static void
+-ports_and_pa(void)
++stream_off(void)
+ {
+-	static const uint32_t slv[][2] = { { 0x203, 7 }, { 0x230, 1 }, { 0x232, 0x1F }, { 0x233, 0 }, { 0x234, 0 },
+-		                           { 0x236, 0x36 }, { 0x430, 1 }, { 0x432, 7 }, { 0x433, 0 }, { 0x434, 1 } };
+-
+-	lw(RX_SWR + 0x1264, 0x0100001F); lw(RX_SWR + 0x127C, 0); lw(RX_SWR + 0x122C, 7); lw(RX_SWR + 0x1274, 0x63);
+-	lw(RX_SWR + 0x1464, 0x01000107); lw(RX_SWR + 0x147C, 0); lw(RX_SWR + 0x1474, 0);
+-	for (uint32_t i = 0; i < sizeof(slv) / sizeof(slv[0]); i++) {
+-		swr_wr(RX_SWR, 1, slv[i][0], slv[i][1]);
++	if (asm_open) {
++		(void)cmd("ASM close", APR_SVC_ASM, ASM_PORT, ASM_CLOSE, NULL, 0, 0);
++		asm_open = false;
+ 	}
+-	lw(RX_SWR + 0x105C, 0x5000F);
+-	lw(RX_SWR + 0x300, (0x0Fu << 24) | (15u << 20) | (15u << 16) | 0x70);   /* broadcast bank switch */
+-	IOSleep(5);
+-	swr_wr(VA_SWR, 1, 0x3467, 0x05);
+-	swr_wr(VA_SWR, 1, 0x3128, 0x80);
+-	swr_wr(VA_SWR, 1, 0x346B, 0x4C);
+-	swr_wr(VA_SWR, 1, 0x346C, 0x7F);
+-	swr_wr(VA_SWR, 1, 0x346D, 0x0F);
+-	LOG("t=%u.%03u ports: rx frame b1 %08x, irq %08x", T, lr(RX_SWR + 0x105C), lr(RX_SWR + 0x200));
+-}
+-
+-static void
+-amp_on(bool on)
+-{
+-	static const uint8_t regs[][2] = { { 1, 0x7c }, { 2, 0x21 }, { 5, 0x01 }, { 3, 0x30 }, { 4, 0xc5 },
+-		                           { 6, 0x48 }, { 7, 0x5d }, { 8, 0x8a }, { 9, 0x0e }, { 10, 0xa4 } };
+-	int err = 0;
+-
+-	if (on && !amp_init) {
+-		err = sweet_i2c1_init();
+-		for (uint32_t i = 0; i < sizeof(regs) / sizeof(regs[0]) && err == 0; i++) {
+-			err = sweet_i2c1_write(AMP_I2C, regs[i][0], regs[i][1]);
+-		}
+-		amp_init = err == 0;
+-	} else {
+-		err = sweet_i2c1_write(AMP_I2C, 5, on ? 1 : 0);
++	if (copp_open) {
++		(void)cmd("ADM close", APR_SVC_ADM, (uint16_t)copp, ADM_CLOSE_V5, NULL, 0, 0);
++		copp_open = false;
+ 	}
+-	LOG("t=%u.%03u amp %s: %d", T, on ? "on" : "off", err);
++	inflight = 0;
++	returned = 0;
+ }
+ 
+-/* ---------------------------------------------------------------- AudioReach graph */
+-
+-#define SG                  0x4001
+-#define CONT                0x4101
+-#define DMA                 0x7001
+-#define PULL                0x7002
+-#define APM_GRAPH_OPEN      0x01001000u
+-#define APM_GRAPH_PREPARE   0x01001001u
+-#define APM_GRAPH_START     0x01001002u
+-#define APM_GRAPH_STOP      0x01001003u
+-#define APM_GRAPH_CLOSE     0x01001004u
+-#define APM_SET_CFG         0x01001006u
+-#define APM_MEM_MAP         0x0100100Cu
+-#define APM_MEM_UNMAP       0x0100100Du
+-#define APM_RSP_MEM_MAP     0x02001001u
+-
+-static uint32_t ring_map, pos_map;
+-
+-/* APM_CMD_SHARED_MEM_MAP_REGIONS, raw (no apm_cmd_header); msw 1 = the SMMU SID offset */
+ static bool
+-mem_map(uint64_t pa, uint32_t bytes, uint32_t prop, uint32_t *handle)
++period_send(uint32_t i)
+ {
+-	uint32_t base = (uint32_t)pa & ~0xFFFu, end = ((uint32_t)pa + bytes + 0xFFF) & ~0xFFFu;
+-	uint32_t dw[5] = { 3 | (1u << 16), prop, base, 1, end - base };
++	uint64_t a = periods_pa + 4096ull * i;
++	uint32_t w[8] = { (uint32_t)a, AUDIO_MSW, map_handle, PERIOD_BYTES, i, 0, 0, 0 };
+ 
+-	*handle = 0;
+-	if (!gpr_call(1, 1, APM_MEM_MAP, false, dw, 5, 1000) || call_op != APM_RSP_MEM_MAP || call_words < 1) {
+-		LOG("mem map %x: reply %08x status %u", base, call_op, call_words >= 2 ? call_rsp[1] : 0);
++	inflight |= 1u << i;
++	if (!apr_send(APR_SVC_ASM, ASM_PORT, WRITE_TOKEN | (wgen << 8) | i, ASM_WRITE_V2, w, sizeof(w))) {
++		inflight &= ~(1u << i);
+ 		return false;
+ 	}
+-	*handle = call_rsp[0];
+ 	return true;
+ }
+ 
+-static bool
+-sg_cmd(uint32_t opcode)
+-{
+-	uint32_t dw[6] = { 1, 0x08001005, 8, 0, 1, SG };
+-	return apm(opcode, true, dw, 6);
+-}
++/* ---------------------------------------------------------------- the stream iOS plays into */
+ 
+ /*
+- * Graph SH_MEM_PULL_MODE (the DSP reads the ring itself) -> CODEC_DMA_SINK on RX_CODEC_DMA_RX_1
+- * (AIF2_PB -> RX2 -> INT2 -> AUX), 48 kHz 16-bit stereo; TopazSpeaker HwStreamPrepare().
++ * /dev/topaz-audio (= /dev/redwood-audio): whole 48 kHz S16 stereo frames, never waits. The frames
++ * go to a 0.34 s ring; the audio thread fills each period the DSP gives back from it (silence when
++ * it is empty). Path + amp start on the first frames that are not silence and stop after 2 s of
++ * silence or no writes. ioctl _IOW('r', 1, {below, muted}): volume in eighths of a dB, applied to
++ * the samples (Q15).
+  */
+-static bool
+-graph_open(uint64_t ring_pa, uint32_t ring_bytes, uint64_t pos_pa)
+-{
+-	static const uint32_t open[] = {
+-		1, 0x08001001, 48, 0, 1, SG, 3, 0x0800100E, 4, 2, 0x0800100F, 4, 1, 0x08001010, 4, 1,
+-		1, 0x08001000, 64, 0, 1, CONT, 4, 0x08001011, 8, 1, 3, 0x08001012, 4, 1, 0x08001013, 4, 8192, 0x08001014, 4, 2,
+-		1, 0x08001002, 32, 0, 1, SG, CONT, 2, 0x07001006, PULL, 0x07001023, DMA,
+-		1, 0x08001003, 56, 0, 2, PULL, 1, 0x08001015, 8, 0, 1, DMA, 1, 0x08001015, 8, 1, 0, 0,
+-		1, 0x08001004, 24, 0, 1, PULL, 1, DMA, 2, 0
+-	};
+-	const uint32_t ch = 2, rate = 48000;
+-	uint32_t mf[12] = { PULL, 0x0800100C, 32, 0, 1, 0x09001000, 20, rate, 16 | (1u << 16), 16 | (15u << 16),
+-		            1 | (ch << 16), 1 | (2u << 8) };
+-	bool ok = mem_map(ring_pa, ring_bytes, 0, &ring_map) && mem_map(pos_pa, 0x1000, 2, &pos_map) &&
+-	    apm(APM_GRAPH_OPEN, true, open, sizeof(open) / 4);
+-	uint32_t pc[12] = { PULL, 0x0800100A, 28, 0, (uint32_t)ring_pa, 1, ring_bytes, ring_map,
+-		            (uint32_t)pos_pa, 1, pos_map, 0 };
+-	uint32_t ep[8] = { DMA, 0x08001017, 12, 0, rate, 16 | (ch << 16), 1, 0 };
+-	uint32_t intf[8] = { DMA, 0x08001063, 12, 0, 1, 2, 3, 0 };          /* RXTX, RX_1, channels 0x3 */
+-
+-	ok = ok && apm(APM_SET_CFG, true, mf, 12) && apm(APM_SET_CFG, true, pc, 12) && apm(APM_SET_CFG, true, ep, 8) &&
+-	    apm(APM_SET_CFG, true, intf, 8) && sg_cmd(APM_GRAPH_PREPARE);
+-	LOG("t=%u.%03u graph open/prepare: %s (maps %x %x)", T, ok ? "OK" : "FAILED", ring_map, pos_map);
+-	return ok;
+-}
++#define RING_FRAMES         16384u              /* power of two */
++#define SILENCE             8                   /* |sample| <= this: silence */
++#define QUIET_MS            2000
++
++static int16_t *ring;
++static volatile uint32_t ring_w, ring_r;        /* frame counters, wrap at 2^32 */
++static IOSimpleLock *ring_lock;
++static volatile bool stream_ready, playing;
++static volatile uint64_t last_sound;            /* mach_absolute_time() of the last frames that are not silence */
++static volatile uint32_t vol_below, vol_muted, vol_gen;
++static uint32_t vol_applied = ~0u, gain_q15 = 32767;
++static uint64_t frames_in, frames_dropped, underruns, starts;
++static bool stream_wake_flag;
++
++static const uint16_t db_q15[97] = {
++	32767, 29205, 26029, 23198, 20675, 18427, 16423, 14637, 13045, 11627, 10362, 9235, 8231, 7336, 6538, 5827, 5193,
++	4629, 4125, 3677, 3277, 2920, 2603, 2320, 2068, 1843, 1642, 1464, 1305, 1163, 1036, 924, 823, 734, 654, 583, 519,
++	463, 413, 368, 328, 292, 260, 232, 207, 184, 164, 146, 130, 116, 104, 92, 82, 73, 65, 58, 52, 46, 41, 37, 33, 29,
++	26, 23, 21, 18, 16, 15, 13, 12, 10, 9, 8, 7, 7, 6, 5, 5, 4, 4, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
++};
+ 
+-/* boot-arg adsp_tone=N: N seconds of 1 kHz from the speaker, once the codec is up */
+ static void
+-tone_test(unsigned seconds)
++apply_volume(void)
+ {
+-	const uint32_t frames = 48000, bytes = frames * 4;  /* 1 s, a whole number of 1 kHz periods */
+-	uint64_t ring_pa = 0, pos_pa = 0;
+-	int16_t *ring = (int16_t *)topaz_pool_alloc(bytes, &ring_pa);
+-	volatile uint32_t *pos = (volatile uint32_t *)topaz_pool_alloc(0x1000, &pos_pa);
+-	/* sin(2 pi k / 48) * 0.1 * 32767, one period */
+-	static const int16_t q[13] = { 0, 428, 848, 1253, 1638, 1997, 2317, 2604, 2838, 3020, 3165, 3240, 3277 };
++	uint32_t b = vol_below, db = b / 8, f = b % 8;
+ 
+-	if (ring == NULL || pos == NULL) {
+-		LOG("tone: no pool memory");
+-		return;
+-	}
+-	for (uint32_t f = 0; f < frames; f++) {
+-		uint32_t k = f % 48, a = k % 24;
+-		int16_t v = a <= 12 ? q[a] : q[24 - a];
+-		v = k < 24 ? v : (int16_t)-v;
+-		ring[2 * f] = v;
+-		ring[2 * f + 1] = v;
+-	}
+-	mb();
+-	if (!graph_open(ring_pa, bytes, pos_pa) || !sg_cmd(APM_GRAPH_START)) {
+-		LOG("tone: graph failed");
++	vol_applied = vol_gen;
++	if (vol_muted || db >= 96) {
++		gain_q15 = 0;
+ 		return;
+ 	}
+-	if (!ports_up) {
+-		ports_and_pa();
+-		ports_up = true;
+-	}
+-	amp_on(true);
+-	lw(RX_MACRO + 0x514, (uint32_t)vol_db & 0xFF);
+-	lw(RX_MACRO + 0x518, 0x04);
+-	lw(RX_MACRO + 0x500, 0x24);                         /* RX2 path on */
+-	LOG("t=%u.%03u tone: playing %u s at %d dB", T, seconds, vol_db);
+-	for (unsigned t = ms(); ms() - t < seconds * 1000;) {
+-		if (!glink_poll()) {
+-			IOSleep(2);
++	gain_q15 = (db_q15[db] * (8 - f) + db_q15[db + 1] * f) / 8;
++}
++
++/* one period from the ring (gain applied), silence for what is missing */
++static void
++period_fill(uint32_t i)
++{
++	int16_t *dst = (int16_t *)(periods + 4096ull * i);
++	uint32_t got = 0;
++
++	IOSimpleLockLock(ring_lock);
++	uint32_t avail = ring_w - ring_r;
++	if (avail > 0) {
++		got = MIN(avail, (uint32_t)PERIOD_FRAMES);
++		for (uint32_t k = 0; k < got; k++) {
++			uint32_t at = ((ring_r + k) & (RING_FRAMES - 1)) * 2;
++			dst[2 * k] = (int16_t)(((int32_t)ring[at] * (int32_t)gain_q15) >> 15);
++			dst[2 * k + 1] = (int16_t)(((int32_t)ring[at + 1] * (int32_t)gain_q15) >> 15);
++		}
++		ring_r += got;
++	}
++	IOSimpleLockUnlock(ring_lock);
++	if (got < PERIOD_FRAMES) {
++		bzero(dst + 2 * got, (PERIOD_FRAMES - got) * 4);
++		if (got != 0) {
++			underruns++;
+ 		}
+ 	}
+-	LOG("t=%u.%03u tone: DSP position frame %u index %u", T, pos[0], pos[1]);
+-	amp_on(false);
+-	lw(RX_MACRO + 0x500, 0x04);
+-	(void)sg_cmd(APM_GRAPH_STOP);
+-	(void)sg_cmd(APM_GRAPH_CLOSE);
+-	LOG("t=%u.%03u tone: stopped", T);
++	mb();
+ }
+ 
+-/* ---------------------------------------------------------------- the stream iOS plays into */
+-
+-/*
+- * One graph for the session, opened after the codec bring-up: the DSP pulls a 1 s ring of
+- * 48 kHz 16-bit stereo from the pool. /dev/topaz-audio write() puts frames ahead of the DSP's
+- * read index (pos buffer word 1, bytes) and never waits; the audio thread starts the graph,
+- * the SoundWire ports, the amp and the RX2 path when frames come, and stops them 0.5 s after
+- * the last write. ioctl _IOW('r', 1, {below, muted}): the volume, eighths of a dB under the
+- * loudest (boot-arg adsp_vol, dB of the RX2 digital gain).
+- */
+-#define RING_BYTES          (48000u * 4)
+-#define LEAD_BYTES          (48u * 4 * 40)          /* 40 ms ahead of the DSP */
+-#define QUIET_MS            500
+-
+-static uint8_t *ring;
+-static volatile uint32_t *pos_buf;
+-static uint64_t ring_pa, pos_pa;
+-static bool stream_ready, stream_ran;
+-static volatile bool playing;
+-static volatile uint32_t write_off;
+-static volatile uint64_t last_write;            /* mach_absolute_time() */
+-static volatile uint32_t vol_below, vol_muted, vol_gen, vol_applied;
+-static uint64_t frames_in, frames_dropped, underruns;
+-static IOLock *stream_lock;
+-static bool stream_wake_flag;
+-
+ static bool
+-stream_open(void)
+-{
+-	ring = (uint8_t *)topaz_pool_alloc(RING_BYTES, &ring_pa);
+-	pos_buf = (volatile uint32_t *)topaz_pool_alloc(0x1000, &pos_pa);
+-	stream_lock = IOLockAlloc();
+-	if (ring == NULL || pos_buf == NULL || stream_lock == NULL) {
+-		LOG("stream: no memory");
++path_start(void)
++{
++	wgen = (wgen + 1) & 0xFFFF;
++	returned = 0;
++	inflight = 0;
++	if (!afe_on() || !stream_on()) {
++		stream_off();
++		afe_off();
+ 		return false;
+ 	}
+-	stream_ready = graph_open(ring_pa, RING_BYTES, pos_pa);
+-	return stream_ready;
++	for (uint32_t i = 0; i < PERIODS; i++) {
++		period_fill(i);
++		if (!period_send(i)) {
++			snprintf(why, sizeof(why), "ASM write: GLINK queue full");
++			stream_off();
++			afe_off();
++			return false;
++		}
++	}
++	return true;
+ }
+ 
+ static void
+-apply_volume(void)
++path_stop(void)
+ {
+-	int db = vol_muted ? -84 : vol_db - (int)(vol_below / 8);
+-	if (db < -84) {
+-		db = -84;
+-	}
+-	lw(RX_MACRO + 0x514, (uint32_t)db & 0xFF);          /* RX_RX2_RX_VOL_CTL, s8 dB */
+-	vol_applied = vol_gen;
++	stream_off();
++	afe_off();
+ }
+ 
+ static void
+ stream_start(void)
+ {
+-	if (stream_ran) {
+-		(void)sg_cmd(APM_GRAPH_PREPARE);
++	if (vol_applied != vol_gen) {
++		apply_volume();
+ 	}
+-	if (!sg_cmd(APM_GRAPH_START)) {
+-		LOG("stream: start failed");
++	if (!path_start()) {
++		LOG("t=%u.%03u stream: start failed: %s", T, why);
++		last_sound = 0;
++		IOSimpleLockLock(ring_lock);
++		ring_r = ring_w;                                /* no stale frames at the next start */
++		IOSimpleLockUnlock(ring_lock);
+ 		return;
+ 	}
+-	stream_ran = true;
+-	if (!ports_up) {
+-		ports_and_pa();
+-		ports_up = true;
+-	}
+-	amp_on(true);
+-	apply_volume();
+-	lw(RX_MACRO + 0x518, 0x04);
+-	lw(RX_MACRO + 0x500, 0x24);                         /* RX2 path on */
++	amp_power(gain_q15 != 0);
+ 	playing = true;
+-	LOG("t=%u.%03u stream: playing", T);
++	starts++;
++	LOG("t=%u.%03u stream: playing (start %llu)", T, starts);
+ }
+ 
+ static void
+ stream_stop(void)
+ {
++	amp_power(false);                                   /* the amp first: no pop */
++	IOSleep(5);
+ 	playing = false;
+-	lw(RX_MACRO + 0x514, (uint32_t)-84 & 0xFF);         /* mute first, then the amp: no pop */
+-	IOSleep(30);
+-	amp_on(false);
+-	IOSleep(10);
+-	lw(RX_MACRO + 0x500, 0x04);
+-	(void)sg_cmd(APM_GRAPH_STOP);
+-	bzero(ring, RING_BYTES);
+-	LOG("t=%u.%03u stream: stopped (%llu frames in, %llu dropped, %llu underruns)", T, frames_in, frames_dropped,
+-	    underruns);
+-}
+-
+-/* the audio thread: start / stop / volume, between GLINK polls */
++	path_stop();
++	IOSimpleLockLock(ring_lock);
++	ring_r = ring_w;
++	IOSimpleLockUnlock(ring_lock);
++	LOG("t=%u.%03u stream: stopped (%llu frames in, %llu dropped, %llu underruns, %u done, %u errors, %u DSP underflows, "
++	    "%u stale)", T, frames_in, frames_dropped, underruns, writes_done, write_errors, underflows, stale_events);
++}
++
++/* the audio thread, between GLINK polls */
+ static void
+ stream_poll(void)
+ {
+-	uint64_t now = mach_absolute_time(), quiet;
++	uint64_t ls = last_sound, now = mach_absolute_time(), quiet;   /* ls first: now >= ls */
+ 
+ 	if (!stream_ready) {
+ 		return;
+ 	}
+ 	nanoseconds_to_absolutetime((uint64_t)QUIET_MS * 1000000, &quiet);
+-	if (!playing && last_write != 0 && now - last_write < quiet) {
++	if (!playing && ls != 0 && now - ls < quiet) {
+ 		stream_start();
+-	} else if (playing && now - last_write >= quiet) {
+-		stream_stop();
++		return;
+ 	}
+-	if (playing && vol_applied != vol_gen) {
++	if (!playing) {
++		return;
++	}
++	if (vol_applied != vol_gen) {
+ 		apply_volume();
++		amp_power(gain_q15 != 0);
++	}
++	uint32_t back = returned;
++	returned = 0;
++	for (uint32_t i = 0; i < PERIODS; i++) {
++		if ((back & (1u << i)) != 0) {
++			period_fill(i);
++			(void)period_send(i);
++		}
++	}
++	if (now - ls >= quiet) {
++		stream_stop();                                  /* 2 s without sound: what the ring holds is silence */
+ 	}
+ }
+ 
+-/* frames from /dev/topaz-audio: never waits; returns how many were taken */
++/* frames from /dev/topaz-audio: never waits; returns how many were taken (all: what does not fit is dropped) */
+ extern "C" uint32_t
+ topaz_audio_write(const int16_t *frames, uint32_t count)
+ {
++	bool sound = false;
++
+ 	if (!stream_ready || count == 0) {
+-		return 0;
++		return count;                                   /* audio off or not up yet: dropped */
++	}
++	for (uint32_t k = 0; k < count * 2 && !sound; k++) {
++		sound = frames[k] > SILENCE || frames[k] < -SILENCE;
++	}
++	if (!sound && !playing) {
++		return count;                                   /* silence while stopped: nothing to start */
++	}
++	IOSimpleLockLock(ring_lock);
++	uint32_t room = RING_FRAMES - (ring_w - ring_r), n = MIN(count, room);
++	for (uint32_t k = 0; k < n; k++) {
++		uint32_t at = ((ring_w + k) & (RING_FRAMES - 1)) * 2;
++		ring[at] = frames[2 * k];
++		ring[at + 1] = frames[2 * k + 1];
++	}
++	ring_w += n;
++	IOSimpleLockUnlock(ring_lock);
++	frames_in += n;
++	frames_dropped += count - n;
++	if (sound) {
++		last_sound = mach_absolute_time();
+ 	}
+-	IOLockLock(stream_lock);
+-	uint32_t bytes = MIN(count * 4, RING_BYTES / 2);
+-	uint32_t r = playing ? (pos_buf[1] % RING_BYTES) & ~3u : 0;
+-	uint32_t w = write_off;
+-	uint32_t ahead = (w + RING_BYTES - r) % RING_BYTES;
+-	if (!playing || ahead > RING_BYTES / 2) {           /* not started yet, or the DSP passed us */
+-		if (playing) {
+-			underruns++;
+-		}
+-		w = (r + LEAD_BYTES) % RING_BYTES;
+-		ahead = LEAD_BYTES;
+-	}
+-	if (ahead + bytes > RING_BYTES - 4096) {            /* too far ahead: drop the rest */
+-		uint32_t room = RING_BYTES - 4096 > ahead ? (RING_BYTES - 4096 - ahead) & ~3u : 0;
+-		frames_dropped += (bytes - room) / 4;
+-		bytes = room;
+-	}
+-	uint32_t n1 = MIN(bytes, RING_BYTES - w);
+-	memcpy(ring + w, frames, n1);
+-	memcpy(ring, (const uint8_t *)frames + n1, bytes - n1);
+-	/* silence after the data: when iOS stops writing the DSP must not replay the ring (a click at the end) */
+-	uint32_t z = (w + bytes) % RING_BYTES, zl = 2 * LEAD_BYTES, z1 = MIN(zl, RING_BYTES - z);
+-	bzero(ring + z, z1);
+-	bzero(ring, zl - z1);
+-	mb();
+-	write_off = (w + bytes) % RING_BYTES;
+-	frames_in += bytes / 4;
+-	last_write = mach_absolute_time();
+-	IOLockUnlock(stream_lock);
+ 	if (!playing) {
+ 		thread_wakeup((event_t)&stream_wake_flag);
+ 	}
+@@ -1856,99 +2175,177 @@ topaz_audio_dev_alias(int major __unused)
+ {
+ }
+ 
++/*
++ * Made early, before the ADSP is up: the HAL plug-in opens the device once, when mediaserverd
++ * loads it. Until the speaker path is up (or if it never comes up) writes are taken and dropped.
++ * The audio thread calls this after the UFS wait; devfs may still be starting then: retried.
++ */
+ static void
+ audio_dev_init(void)
+ {
+ 	int major = cdevsw_add(-1, &ta_cdevsw);
++	void *node = NULL;
++
+ 	if (major < 0) {
+ 		LOG("/dev/topaz-audio: no major");
+ 		return;
+ 	}
+-	void *node = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "topaz-audio");
++	for (uint32_t i = 0; i < 120 && node == NULL; i++) {
++		node = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "topaz-audio");
++		if (node == NULL) {
++			IOSleep(500);
++		}
++	}
+ 	LOG("/dev/topaz-audio: %s", node != NULL ? "ready" : "devfs failed");
+ 	if (node != NULL) {
+ 		topaz_audio_dev_alias(major);
+ 	}
+ }
+ 
+-/* ---------------------------------------------------------------- thread */
++/* ---------------------------------------------------------------- self-check + thread */
++
++/* the whole path once, with silence and the amp off: the DSP must give two periods back in 0.5 s */
++static bool
++path_check(uint32_t *done_ms)
++{
++	uint32_t done0 = writes_done;
++	unsigned t;
++
++	gain_q15 = 0;
++	if (!path_start()) {
++		return false;
++	}
++	for (t = ms(); writes_done - done0 < 2 && ms() - t < 500;) {
++		if (!glink_poll()) {
++			IOSleep(1);
++		}
++	}
++	*done_ms = ms() - t;
++	bool ok = writes_done - done0 >= 2 && write_errors == 0;
++	if (!ok) {
++		snprintf(why, sizeof(why), "SEC_MI2S: the DSP took %u of 2 periods in 500 ms (%u errors)", writes_done - done0,
++		    write_errors);
++	}
++	path_stop();
++	gain_q15 = 32767;
++	return ok;
++}
++
++static bool killed;                             /* boot-arg kill switch */
++
++static void
++say_off(const char *reason)
++{
++	IOLog("LAUREL AUDIO: off: %s\n", reason);
++}
+ 
+ static void
+ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	uint32_t st;
+-	unsigned last_status = 0;
+-	bool codec_tried = false;
++	uint32_t st, done_ms = 0;
++	unsigned last_status = 0, up_since = 0;
++	bool tried = false, adsp_up = false;
+ 
+ 	if (!topaz_soc_map()) {
+-		LOG("no SoC mappings (see TopazModem)");
++		say_off("no SoC mappings (SMEM/pool/UFS, see TopazModem)");
++		goto out;
++	}
++	audio_dev_init();                                   /* the node exists even if audio stays off */
++	if (killed) {
++		say_off("kill switch (boot-arg adsp=0 / laurelaudio=0)");
++		goto out;
++	}
++	if (ring == NULL || ring_lock == NULL) {
++		say_off("no memory for the ring");
+ 		goto out;
+ 	}
+ 	part = topaz_smem_partition(0, ADSP_PID);
+-	LOG("apps<->adsp SMEM partition %p", part);
+ 	if (part == NULL) {
++		say_off("no apps<->adsp SMEM partition");
+ 		goto out;
+ 	}
+ 	crash_reason();
+ 	if (topaz_smem_get(part, ITEM_SMP2P_IN, NULL) != NULL || topaz_smem_get(part, ITEM_GLINK_FIFO_RX, NULL) != NULL) {
+-		LOG("ADSP state from an earlier run is in SMEM (item %u or %u): not booting it again", ITEM_SMP2P_IN,
+-		    ITEM_GLINK_FIFO_RX);
++		say_off("ADSP state from an earlier run is in SMEM (item 443 or 480): not booting it again");
++		goto out;
++	}
++	if (!fw_mount()) {
++		say_off("no image/adsp.mdt in modem_b or modem_a");
+ 		goto out;
+ 	}
+ 	if (!smp2p_out_init()) {
+-		LOG("SMP2P item %u: no SMEM", ITEM_SMP2P_OUT);
++		say_off("SMP2P item 429: no SMEM");
+ 		goto out;
+ 	}
+ 	*stop_entry = 0;
+ 	topaz_apcs_kick(ADSP_SMP2P_BIT);
+ 	t0 = mach_absolute_time();
+ 	if (!adsp_load()) {
++		say_off("ADSP PAS load/auth failed (see TopazAudio lines)");
+ 		goto out;
+ 	}
+ 	t0 = mach_absolute_time();
+ 	st = wait_ready(20000);
+ 	if ((st & 3) != 2) {
+-		LOG("ADSP did not report READY (slave-kernel %08x)", st);
++		snprintf(why, sizeof(why), "ADSP did not report READY (slave-kernel %08x)", st);
++		say_off(why);
+ 		crash_reason();
+ 		goto out;
+ 	}
++	adsp_up = true;
+ 	if (!glink_init()) {
++		say_off("GLINK: no SMEM for the lpass edge");
+ 		goto out;
+ 	}
+ 	glink_register(QCHAN, qrtr_rx);
+-	glink_register(GCHAN, gpr_rx);
++	glink_register(ACHAN, apr_rx);
++	up_since = ms();
+ 	for (;;) {
+ 		bool busy = glink_poll();
+ 		qrtr_poll();
+-		gpr_poll();
++		apr_core_poll();
+ 		stream_poll();
+-		if (spf_state == 1 && !codec_tried) {
+-			uint32_t tone = 0;
+-			codec_tried = true;
+-			(void)PE_parse_boot_argn("adsp_vol", &vol_db, sizeof(vol_db));
+-			if (codec_bringup()) {
+-				if (PE_parse_boot_argn("adsp_tone", &tone, sizeof(tone)) && tone != 0) {
+-					tone_test(MIN(tone, 10u));
+-				}
+-				if (stream_open()) {
+-					audio_dev_init();
+-				}
++		if (!tried && (core_state == 1 || ms() - up_since > 30000)) {
++			tried = true;
++			if (core_state != 1) {
++				snprintf(why, sizeof(why), "ADSP up, but the APR core service never said READY (%s, %u asks)",
++				    glink_chan_up(ACHAN) ? "apr_audio_svc up" : "apr_audio_svc not open", core_asks);
++				say_off(why);
++			} else if (!amp_probe() || !mi2s_pins()) {
++				say_off(why);
++			} else if ((periods = (uint8_t *)topaz_pool_alloc(PERIODS * 4096, &periods_pa)) == NULL || ring == NULL) {
++				say_off("no memory for the periods");
++			} else if (!topaz_smmu_identity(AUDIO_SID, 0, "audio")) {
++				say_off("apps SMMU: no identity context for the audio stream 0x41");
++			} else if (!path_check(&done_ms)) {
++				say_off(why);
++			} else {
++				stream_ready = true;
++				IOLog("LAUREL AUDIO: on: ADSP up (APR), MAX989%s7 rev 0x%02x, SEC_MI2S 48 kHz (2 periods back in %u ms)\n",
++				    amp == &amp27 ? "2" : "3", amp_rev, done_ms);
+ 			}
+ 		}
+ 		if (*adsp_state & 1) {
+ 			LOG("t=%u.%03u *** ADSP FATAL (slave-kernel %08x) ***", T, *adsp_state);
+ 			crash_reason();
++			if (stream_ready) {
++				amp_power(false);
++				stream_ready = false;
++				playing = false;
++				say_off("ADSP fatal error");
++			}
+ 			break;
+ 		}
+ 		if (ms() - last_status >= 60000) {
+ 			last_status = ms();
+-			LOG("t=%u.%03u status: slave-kernel %08x, qrtr node %x hello %u, %u services, %u lookups, pd-mapper %u, "
+-			    "SPF %d", T, *adsp_state, q_node, q_hello_rx, q_services, q_lookups, q_pdreqs, (int)spf_state);
++			LOG("t=%u.%03u status: slave-kernel %08x, qrtr node %x, %u services, pd-mapper %u, apr rx %u core %u, "
++			    "%llu frames in, %llu starts", T, *adsp_state, q_node, q_services, q_pdreqs, apr_rxn, core_state,
++			    frames_in, starts);
+ 			glink_summary();
+ 		}
+ 		if (busy) {
+ 			IODelay(200);
+-		} else if (stream_ready && !playing) {
++		} else if (!playing && tried) {
+ 			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, 20, 1000 * NSEC_PER_USEC);
+ 			thread_block(THREAD_CONTINUE_NULL);
+ 		} else {
+@@ -1956,22 +2353,31 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 	}
+ out:
++	(void)adsp_up;
+ 	thread_terminate(current_thread());
+ }
+ 
++/* on by default; kill switch adsp=0 (or laurelaudio=0) */
+ extern "C" void
+ topaz_audio_init(void)
+ {
+ 	static bool started;
+-	uint32_t on = 0;
++	uint32_t on = 1, on2 = 1;
+ 	thread_t thread;
+ 
+-	if (started || !PE_parse_boot_argn("adsp", &on, sizeof(on)) || on == 0) {
++	if (started) {
+ 		return;
+ 	}
+ 	started = true;
++	(void)PE_parse_boot_argn("adsp", &on, sizeof(on));
++	(void)PE_parse_boot_argn("laurelaudio", &on2, sizeof(on2));
++	killed = on == 0 || on2 == 0;
++	ring = (int16_t *)IOMallocZero(RING_FRAMES * 4);
++	ring_lock = IOSimpleLockAlloc();
+ 	if (kernel_thread_start(topaz_audio_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
++	} else {
++		say_off("no kernel thread");
+ 	}
+ }
+ 

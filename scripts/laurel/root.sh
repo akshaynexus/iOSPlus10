@@ -5,7 +5,7 @@
 # Steps: 1. external/ios-topaz/tools/mkiosroot.sh (case-sensitive journaled HFS+, OS + SystemOS/AppOS cryptexes,
 #        dyld cache link, plain system keybag); 2. topaz sweet-root-tweaks.py (build 20H392 fixes, launchd,
 #        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped) and
-#        root-tweaks-boldtext.py; 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
+#        root-tweaks-boldtext.py + root-audio.sh (speaker HAL plug-in; AUDIO=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
 # Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
 #   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg
@@ -67,6 +67,8 @@ python3 -I "$TOPAZ/sweet-root-tweaks.py" "$mnt"
 # CA heartbeat 60: the Mi A3 panel runs at 60 Hz (negroni's default 120 is for its 120 Hz panel).
 CA_HEARTBEAT=${CA_HEARTBEAT:-60} python3 -I "$REPO/scripts/ios16/root-tweaks-extra.py" "$mnt"
 python3 -I "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$mnt"
+# speaker audio (kernel patch 2500): RedwoodAudio.driver HAL plug-in, VirtualAudio back, BTAudio off
+AUDIO=${AUDIO:-1} bash "$REPO/scripts/laurel/root-audio.sh" "$mnt"
 sync
 umount "$mnt"
 
