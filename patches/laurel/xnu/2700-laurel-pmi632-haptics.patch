@@ -14,7 +14,7 @@ diff -ruN a/bsd/conf/files b/bsd/conf/files
 diff -ruN a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
 --- a/bsd/dev/laurel_haptic.c	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_haptic.c	2026-11-01 04:22:40.745811129 +0530
-@@ -0,0 +1,758 @@
+@@ -0,0 +1,785 @@
 +/*
 + * laurel_sprout (Xiaomi Mi A3, SM6125): the vibration motor (laurel 2700).
 + *
@@ -310,8 +310,9 @@ diff -ruN a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
 +	}
 +	if (rc == 0 && on && lh_poll_ready() != 0) {
 +		en = (uint8_t)(en & ~LH_EN);            /* Linux: keep VIB_LDO disabled */
-+		(void)lh_write(LH_REG_EN_CTL, &en, 1);
-+		lh_hw_on = false;
++		if (lh_write(LH_REG_EN_CTL, &en, 1) == 0) {
++			lh_hw_on = false;       /* only after a disable that worked (review M2) */
++		}
 +		return -1;
 +	}
 +	return rc;
@@ -357,8 +358,16 @@ diff -ruN a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
 +static void
 +lh_wdog_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 +{
-+	if (lh_hw_on) {
++	if (!lh_hw_on) {
++		return;
++	}
++	if (!lh_dead) {
 +		lh_fail("watchdog: the motor thread stalled with the motor on");
++	} else {
++		lh_off_raw(false);              /* the feature is off but the LDO is still on: try again */
++	}
++	if (lh_hw_on) {                         /* review M2: never give up while the motor runs */
++		thread_call_enter_delayed(lh_wdog, mach_absolute_time() + lh_abs(LH_WDOG_MS));
 +	}
 +}
 +
@@ -473,6 +482,7 @@ diff -ruN a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
 +			rc = rc == 0 ? lh_enable(true) : rc;
 +			if (rc == 0) {
 +				on = true;
++				lh_fails = 0;           /* review m1: count failures in a row, not per boot */
 +				od = kick;
 +				od_start = kick;
 +				on_since = now;
@@ -499,9 +509,24 @@ diff -ruN a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
 +			}
 +		}
 +		if (on && od && mach_absolute_time() >= od_end) {
-+			(void)lh_vset(LH_NOMINAL_MV);
-+			(void)lh_poll_ready();
 +			od = false;
++			if (lh_vset(LH_NOMINAL_MV) != 0 || lh_poll_ready() != 0) {
++				/* review M1: never keep the motor at the overdrive voltage: stop it */
++				(void)lh_enable(false);
++				on = false;
++				off_since = mach_absolute_time();
++				if (!lh_dead && ++lh_fails >= LH_FAIL_MAX) {
++					lh_fail("the LDO did not step down from the overdrive voltage");
++				}
++			}
++		}
++		/* review M2b: the hardware says the motor is on although no play wants it (a disable failed) */
++		if (!on && lh_hw_on) {
++			if (lh_dead) {
++				lh_off_raw(true);
++			} else {
++				(void)lh_enable(false);
++			}
 +		}
 +		if (lh_hw_on) {
 +			thread_call_enter_delayed(lh_wdog, mach_absolute_time() + lh_abs(LH_WDOG_MS));
@@ -740,8 +765,10 @@ diff -ruN a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
 +		lh_obs = lh_rw = 0;
 +		return -1;
 +	}
-+	if (en & LH_EN) {
-+		(void)lh_enable(false);         /* the boot chain left it on */
++	if ((en & LH_EN) && lh_enable(false) != 0) {    /* the boot chain left it on */
++		printf("LAUREL HAPTIC: off: the boot chain left the LDO on and the disable failed\n");
++		lh_obs = lh_rw = 0;
++		return -1;
 +	}
 +	lh_hw_on = false;
 +	/* the handshake: write the nominal voltage, read it back (the LDO is off: nothing moves) */
