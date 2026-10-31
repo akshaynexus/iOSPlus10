@@ -3427,8 +3427,31 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   bytes of a longer previous command and parses the download size as hex until the first non-hex character.
   Stock `fastboot flash` sends `getvar:max-download-size` (24 chars) right before `download:010a8000` (17 chars),
   so ABL reads `download:010a8000ad...` = 0x010a8000ad. `fastboot -S <size>` skips that getvar.
-- [V] Downloads stop at exactly 16 MiB in fastboot sessions entered after an iOS panic (4 times, any write size,
-  stock client too); the session then hangs and needs Power+VolDown. Use `fastboot -S 8M flash ...`
-  (sparse pieces < 16 MiB). Random "unknown command" answers (~1 in 5) are ABL dropping a command: run it again.
-- Procedure: phone in fastboot -> `fastboot -S 8M flash boot_b out/laurel/laurel-boot.img` as the FIRST command
-  (no getvar before) -> `fastboot reboot`. Restore: `fastboot -S 8M flash boot_b ~/laurel-backup/stock/images/boot.img`.
+- [V] **Cause of the slow/stalled uploads (2026-10-31 23:56): a fastboot session entered with Power+VolDown
+  (after a panic of our kernel) has a broken ABL USB state. `fastboot reboot bootloader` fixes it.**
+  Evidence, same phone, same cable, same client (37.0.1), same image, 2 minutes apart:
+  - Button session (USB device 033, device kept awake, no suspend/resume): `fastboot flash boot_b` ->
+    "Requested download size is more than max allowed" (the `download:010a8000` command got the tail
+    `ad-size` of the previous `getvar:max-download-size`: ABL's `AcceptCmd` does `Data[Size] = 0` with
+    the USB-reported Size, so the driver reports a wrong rx length in this state).
+  - `fastboot reboot bootloader` (OKAY, new USB device 034 after 4 s) -> `fastboot flash boot_b` of the
+    full 17465344 bytes: Sending 0.505 s, Writing 0.101 s, and `getvar partition-size:boot_b` answered
+    (no "skip copying avb footer" warning). Then `fastboot reboot` (OKAY).
+  - Host autosuspend is not the cause: the bad session was resumed and active before the test. Also no
+    xHCI resets in the kernel log during the stalled sessions.
+  - Earlier bad sessions: uploads stopped at exactly 16 MiB (4 times, any write size, stock client too)
+    = `USB_BUFFER_SIZE` (16 MiB on non-LE UFS/eMMC targets, `FastbootCmds.h`): the ABL queues the
+    download rx in 16 MiB pieces (`AcceptData` -> `GetXfrSize`); in the broken state the completion of
+    the first piece is not handled, so the OUT endpoint is never re-armed. Source: QRD-Development/abl
+    (QcomModulePkg/Library/FastbootLib), copied to `out/laurel/abl-src/` (git-ignored).
+  - A stalled session dies completely: opening the suspended USB device at 23:53 made usbcore reset it
+    ("reset high-speed USB device", then "device not accepting address", error -71): the ABL was no
+    longer polling USB. Only Power+VolDown brings it back.
+  - The entry 'via fastboot reboot-bootloader' listed as bad earlier is not reproduced; the earlier note
+    "fastboot reboot bootloader started Android" was with stock boot_b and a garbled session. Today
+    `reboot-bootloader` (17 chars, same length as `download:010a8000`, so no tail garbage) worked.
+  - Not tested: entry by buttons from a fully powered-off phone; `fastboot -S 8M` is not needed.
+- Procedure (scripts/laurel/flash-boot.sh): phone in fastboot (any entry) -> `fastboot reboot bootloader`
+  -> wait for the new USB device -> `fastboot flash boot_b out/laurel/laurel-boot.img` (plain, full
+  size) -> `fastboot reboot`. Restore: `BOOTIMG=~/laurel-backup/stock/images/boot.img scripts/laurel/flash-boot.sh`.
+  Random "unknown command" (~1 in 5, broken sessions only): the script reboots the bootloader and retries.

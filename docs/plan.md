@@ -6,6 +6,11 @@ no PAC, needs zeta-style PAC lowering). Done: device facts (`scripts/device/info
 (ios-topaz, Mu-Silicium, MiCode `laurel-r-oss`, Lineage kernel/device/common, mainline), port plan with the topaz
 comparison. Next: owner sets phone-safety targets (active slot is `_b`), root + backup, live FDT, port the topaz shim.
 Details: `docs/laurel_sprout/port-plan.md`.
+Flashing (2026-10-31 23:58): `fastboot boot` is refused by this ABL; the shim image goes to `boot_b` with
+`scripts/bg.sh laurel-flash scripts/laurel/flash-boot.sh`. The script runs `fastboot reboot bootloader` first:
+a session entered with Power+VolDown has a broken ABL USB state (garbled commands, uploads stall at 16 MiB); after the
+warm reset the plain full-size flash takes 0.5 s. Latest `out/laurel/laurel-boot.img` (23:16 build, kalloc fix 0102)
+flashed and booted at 23:58; result (photo) pending.
 
 Status date: 2026-10-27 (12:15).
 
