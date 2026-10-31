@@ -3945,3 +3945,45 @@ Details and expected lines: `docs/laurel_sprout/wifi.md`.
   the SMMU setup in parallel), pool vs XNU RAM check. Area A map: modem pool stays 0xE0000000-0xE1000000.
   op10tool fatls fixture test: FAT32 mtools allocates after the FSInfo next-free hint, so the test resets the
   hint to get a fragmented file.
+
+
+## Mi A3: speaker audio = APR firmware, patch 2500 + RedwoodAudio plug-in (2026-11-01 04:40, area F agent, branch t3/laurel-audio-speaker-adsp)
+- [V firmware] `image/adsp.*` in the stock NON-HLOS.bin (FAT16): `ADSP.VT.5.4-00283-NICOBAR-1`, has `apr_audio_svc`, no
+  `adsp_apps`: **Elite/APR, not AudioReach/GPR**, so topaz's GPR/WCD937x/SoundWire half does not apply. 29 files (mdt +
+  b00..b27); loadable segments fill the carveout 0x55300000..0x57500000 exactly; pd-mapper jsn = topaz's table.
+- [V code] topaz's firmware reader (TopazModem `fw_all`) is a file table of the topaz NON-HLOS: useless here. 2500 has its
+  own FAT16 reader (modem_b, then modem_a) over `sweet_ufs_read_part`.
+- [V DT] Speaker = SEC_MI2S_RX 0x1002, IBIT 1.536 MHz (48000 x 2 x 16), SD0, CPU master; MAX98927/98937 at QUP0 SE1 0x3a
+  (16-bit register addresses: sweet_i2c1 gets read16/write16), reset GPIO 95 (SOUTH), MI2S GPIO 125-128 function 2 (EAST);
+  audio SMMU SID 0x41, address msw = 1 (sid mask 0xf). The mics are analog on the WCD937x: no mic without a codec driver.
+- [V code] The HAL plug-in opens /dev/redwood-audio once at mediaserverd load (audio_plugin.c `initialize`): the node must
+  exist before the ADSP is up, so 2500 makes it right after the UFS wait and drops frames until the path is up.
+  [I] topaz_audio_init runs from AppleCLCD::start, which can come before vfsinit (devfs): no devfs calls there.
+- [V] The laurel root had no audio plug-in and topaz's tweaks move VirtualAudio.plugin out: `scripts/laurel/root-audio.sh`
+  (root.sh step 2) installs RedwoodAudio.driver, puts VirtualAudio back, disables BTAudioHALPlugin.
+- [V] The plug-in builds on Linux without an iOS SDK: theos clang/ld64/ldid + MacOSX13.3.sdk headers + .tbd stubs made
+  from `llvm-nm -u` (needs `dyld_stub_binder` in the libSystem stub; `-fvisibility=hidden` hid the factory: use
+  `-exported_symbol`).
+- Build 04:36: 220 patches apply (2500 included), no warnings in the two files, 0 LSE, kernel sha256 7158a9c3...;
+  out/laurel/uefi/laurel-uefi-boot.img sha256 d82f593b.... NOT BOOTED. Expected line `LAUREL AUDIO: on: ADSP up (APR),
+  MAX98927 rev 0x.., SEC_MI2S 48 kHz (2 periods back in N ms)`; else `LAUREL AUDIO: off: <step>`. Details:
+  docs/laurel_sprout/audio.md.
+- [I] Risks: PAS without the CX/crypto proxy votes (topaz's modem boots without them); the ADSP may wait for servreg QMI
+  that nobody serves (then `APR core service never said READY`); identity SMMU + msw 1 is topaz-woa's way (HackiOS maps an
+  IOVA instead); the pool at 0xE0000000 could hold Mu runtime data (bank C top-down allocations).
+
+## Mi A3: area F review fixes, rebased on laurel-int-1 (2026-11-01, area F agent)
+- [V doc] After area A, XNU is at 0xE1004000-0x1AD004000 (3264 MiB, most above 4 GiB); the TopazModem pool 0xE0000000 +
+  16 MiB is in Mu "Pool RAM" (reserved). Rule for the ADSP: every buffer it reads needs a PA below 4 GiB (SID bits in
+  the upper address word). 2500 now checks the metadata and the periods; the ring, FAT buffers and APR packets are CPU
+  only. Kernel heap memory must never be given to the ADSP.
+- [V code, review] devfs_make_node() before vfsinit() panics (dev_finddir reads dev_root->de_dnp); the audio thread is
+  safe only because it waits for sweet_ufs (setconf, after vfsinit). Comment fixed in 2500.
+- Fixes in 2500: core-poll token 0x40000000, volume re-applied after the self-check, failed period sends re-queued,
+  idle wait 200 ms after 1 s without GLINK traffic, auth_and_reset duration logged. root-audio.sh: fsck verify gate,
+  toolchain-missing skip, Linux-only --image. Own FAT reader stays (TODO) until area E's 2400 is merged.
+- Build on laurel-int-1: 228 patches apply, no warnings in the two files, 0 LSE, kernel sha256 1fc7d60f...;
+  RedwoodAudio sha256 33449356... (unchanged). UEFI image not rebuilt here (needs the Mu 0101 FD of area A for DRAM=auto).
+- Then rebased on area E (282bc27: 2400 FAT index, 2404 TrustZone/SMMU locks + pool check; it holds laurel-int-1): 2500's
+  own FAT16 reader is gone, TopazAudio reads image/adsp.* through topaz_part_fw_* again (2500 now needs 2400).
+  Build: 233 patches apply, no warnings, 0 LSE, kernel sha256 b16faf25...; RedwoodAudio 33449356... (same).

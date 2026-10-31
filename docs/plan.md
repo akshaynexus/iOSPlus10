@@ -455,6 +455,19 @@ release on failed stages: proposal in docs/audit/2026-10-26-power.md section 6 f
 2. Port UniXNU NativeAdreno board code (GMU, RSC, votes, cmd-db, SMMU) to SM8450.
 3. Port NativeMetal (metal2vulkan via Turnip FD730) to the iOS 26 Metal interface.
 
+## Mi A3 (laurel_sprout): speaker audio built (2026-11-01 04:40, area F, branch t3/laurel-audio-speaker-adsp)
+Done [V build]: patch 2500 (ADSP PAS 1 from modem_b/modem_a via a FAT16 reader, GLINK + QRTR + pd-mapper, APR on
+apr_audio_svc, AFE SEC_MI2S_RX + ADM + ASM, MAX98927/98937 at 0x3a, /dev/redwood-audio early, self-check + one
+`LAUREL AUDIO: on|off:` line, kill switch `adsp=0`/`laurelaudio=0`); RedwoodAudio.driver built on Linux
+(`userland/laurel/audio/build.sh`); `scripts/laurel/root-audio.sh` in root.sh. Kernel 7158a9c3..., image
+out/laurel/uefi/laurel-uefi-boot.img d82f593b.... Not booted. Root image change: plug-in + VirtualAudio back +
+BTAudio off (apply to the current image: `scripts/bg.sh laurel-root-audio sudo scripts/laurel/root-audio.sh --image
+$APPLE/laurel-ios16-root.img`, then flash userdata with owner approval).
+Review fixes (ACCEPT-WITH-FIXES) done on top of laurel-int-1: 4 GiB checks for ADSP buffers, token/volume/re-queue/idle
+fixes, root-audio.sh fsck gate + skip; rebased on area E 282bc27: own FAT reader removed, `topaz_part_fw_*` (2400).
+Next (coordinator): boot the image, read the `TopazAudio:`/`LAUREL AUDIO:` lines; with the new root, play a ringtone
+(Settings > Sounds). Mic, headset, earpiece need the WCD937x codec (not started). docs/laurel_sprout/audio.md.
+
 ## Mi A3 (laurel_sprout) status (2026-11-01, branch laurel-sprout)
 
 Done: kalloc assert fix (0102); SMP CPU_ON -4 panic: shim 0002 (Silver boot core CPU_OFF) + kernel 2004

@@ -30,7 +30,7 @@ Gold cpufreq domain 0xf523000, PAS IDs (modem 4, ADSP 1, zap 13), touch bus QUP0
 | 12 | Modem firmware tables | hard-coded offsets in HyperOS NON-HLOS (0115, 0121; generator missing) | our `NON-HLOS.bin` from V12.0.26.0.RFQMIXM; write the generator in `tools/op10tool` or Python | new tool |
 | 13 | Zap shader | embedded topaz-signed blob (0905) | stock `a610_zap` from our vendor image | build step |
 | 14 | WLAN | WCN3988, SID 0x1A0 | WCN3990, SMMU SID 0x80 mask 1 (DT iommus); CE SPI 358-369 | patch |
-| 15 | Audio | AudioReach/GPR, WCD937x reset GPIO92, SIA8159 amp @0x2b, RPM ldoa14 | WCD937x reset GPIO 120, **MAX98927 amp @0x3a on QUP0 SE1 (reset GPIO 95), SEC_MI2S**; ADSP firmware is likely APR/Q6 (Android 11, 4.14) [I] | largest change: APR + MI2S path |
+| 15 | Audio | AudioReach/GPR, WCD937x reset GPIO92, SIA8159 amp @0x2b, RPM ldoa14 | WCD937x reset GPIO 120, **MAX98927 amp @0x3a on QUP0 SE1 (reset GPIO 95), SEC_MI2S**; ADSP firmware is APR/Elite (ADSP.VT.5.4-00283-NICOBAR, `apr_audio_svc`, no `adsp_apps`) [V] | patch 2500: APR + AFE SEC_MI2S_RX + ADM/ASM + MAX98927 (docs/laurel_sprout/audio.md) |
 | 16 | CPU clock in ADT | 2803200000 | read OSM LUT (SM6125 Gold max ~2.0 GHz [I]) | mkadt |
 | 17 | GPU clock | Zonda PLL OPPs (0922) | trinket gpucc PLL; OPPs 320-950 MHz | patch |
 
