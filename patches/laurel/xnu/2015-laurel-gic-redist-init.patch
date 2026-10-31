@@ -1,0 +1,253 @@
+laurel 2015: per-CPU GIC redistributor init with read-back (pe_fiq.c laurel_gicr_setup) and a panel report at STARTUP(LOCKDOWN). Boot 2026-11-01 02:57 on the UEFI path (Mu-Silicium -> UniXNU -> DarwinBoot, boot CPU Silver 0x0): the 2013 self-check read GICR ISENABLER0 bit 19 = 0 after pe_init_fiq had written it, CNTV_CTL ISTATUS=1, ICC/GICD fine: no timer tick reached the boot CPU, every thread starved (PE_lockdown_iokit, ud_thread, bsd_init). The setup now: find_gicr_pe_base prefers a frame whose TYPER is not 0 (a dead frame reads 0 and matches MPIDR 0x0); disable + deactivate + clear pending SGIs/PPIs, IGROUPR0 = ~0, IGRPMODR0 = 0, priority 0xA0, ISENABLER0 = vtimer 19 | ptimer 18 | IPI SGI 1; read back; on failure retry once after a GIC-600 GICR_PWRR power-on attempt. The boot CPU's record goes to the panel as 'LAUREL GIC: on|off: boot cpu mpidr=.. gicr frame N TYPER IIDR PWRR ISENABLER0 (was, want, try)' + a second line (IGROUPR0 IGRPMODR0 ISPENDR0 ISACTIVER0 ICFGR1 prio16 WAKER GICD_CTLR); secondaries kprintf one line into the ring. The 2013 USB check moves to RANK_SECOND and prints its GIC state on a second line (a 260-byte line was cut at the 256-byte console buffer). Harmless on the shim path (same writes as before plus the clears).
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -11,6 +11,10 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
++#if defined(SWEET)
++#include <kern/startup.h>
++#include <string.h>
++#endif
+ 
+ 
+ #if HAS_GIC_V3
+@@ -50,12 +54,38 @@
+ #define gicr_write32(offset, data) (_gic_write32(gicr_pe_base + (offset), (data)))
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
+ 
++#if defined(SWEET)
++static bool laurel_gicr_fallback_match;
++#endif
++
+ static vm_offset_t
+ find_gicr_pe_base()
+ {
+ 	// We only care about aff1 and aff0
+ 	uint32_t phys_id = __builtin_arm_rsr64("MPIDR_EL1") & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
+ 
++#if defined(SWEET)
++	/*
++	 * laurel 2015: a frame that reads TYPER = 0 (unpowered, absent) matches
++	 * MPIDR 0x0 (Silver CPU0, the UEFI-path boot CPU). First pass: only
++	 * frames with a real TYPER; second pass: the stock match.
++	 */
++	for (int pass = 0; pass < 2; pass++) {
++		for (vm_offset_t offset = 0; offset < gicr_size; offset += GICR_PE_SIZE) {
++			vm_offset_t gicr_pe_base = gicr_base + offset;
++			uint64_t gicr_typer = gicr_read64(GICR_TYPER);
++			uint32_t aff_value = (uint32_t) (gicr_typer >> GICR_TYPER_AFFINITY_VALUE_SHIFT) & (MPIDR_AFF1_MASK | MPIDR_AFF0_MASK);
++
++			if (phys_id == aff_value && (pass == 1 || gicr_typer != 0)) {
++				laurel_gicr_fallback_match = (pass == 1);
++				return gicr_pe_base;
++			}
++			if (gicr_typer & GICR_TYPER_LAST) {
++				break;
++			}
++		}
++	}
++#else
+ 	for (vm_offset_t offset = 0; offset < gicr_size; offset += GICR_PE_SIZE) {
+ 		vm_offset_t gicr_pe_base = gicr_base + offset;
+ 		uint64_t gicr_typer = gicr_read64(GICR_TYPER);
+@@ -69,10 +99,147 @@
+ 			break;
+ 		}
+ 	}
++#endif
+ 
+ 	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
+ }
+ 
++#if defined(SWEET)
++/*
++ * laurel 2015: per-CPU GIC redistributor init with read-back.
++ * SGI/PPI frame registers (GICv3 spec, GIC-600 TRM for PWRR).
++ */
++#define GICR_CTLR_REG     0x00
++#define GICR_IIDR         0x04
++#define GICR_PWRR         0x24      /* GIC-600 only: RDPD bit 0, RDAG 1, RDGPD 2, RDGPO 3 */
++#ifndef GICR_ISPENDR0
++#define GICR_ISPENDR0     0x10200
++#endif
++#ifndef GICR_ISACTIVER0
++#define GICR_ISACTIVER0   0x10300
++#endif
++#define GICR_ICENABLER0   0x10180
++#define GICR_ICPENDR0     0x10280
++#define GICR_ICACTIVER0   0x10380
++#define GICR_ICFGR1       0x10C04
++#define GICR_IGRPMODR0    0x10D00
++#define LAUREL_PTIMER_INTID 18      /* Qualcomm: NS physical timer = PPI 2 (Mu's timer) */
++
++struct laurel_gic_cpu {
++	uint32_t mpidr;
++	uint32_t frame;          /* index of the GICR frame used; bit 31 = fallback match (TYPER read 0) */
++	uint32_t typer_lo, typer_hi, iidr, pwrr, waker;
++	uint32_t en_before, en_after, want;
++	uint32_t grp, grpmod, pend, active, cfg1, prio16;
++	uint32_t tries;          /* 1 = first write stuck, 2 = after the retry, 0 = the timer PPI never enabled */
++};
++static struct laurel_gic_cpu laurel_gic_boot;           /* the boot CPU's record for the LOCKDOWN report */
++static bool laurel_gic_boot_recorded;
++static uint32_t laurel_gic_cpus_ok, laurel_gic_cpus_bad; /* every CPU after the boot CPU */
++
++static inline uint32_t
++laurel_gicr_want(void)
++{
++	return (1U << sweet_vtimer_intid) | (1U << LAUREL_PTIMER_INTID) | (1U << SWEET_IPI_SGI);
++}
++
++static void
++laurel_gicr_program(vm_offset_t gicr_pe_base, uint32_t want)
++{
++	/* nothing is in service on this CPU here: disable, deactivate, clear pending */
++	gicr_write32(GICR_ICENABLER0, 0xFFFFFFFF);
++	for (unsigned int i = 0; i < 100000 && (gicr_read32(GICR_CTLR_REG) & 0x8); i++) {
++		; /* GICR_CTLR.RWP */
++	}
++	gicr_write32(GICR_ICACTIVER0, 0xFFFFFFFF);
++	gicr_write32(GICR_ICPENDR0, 0xFFFFFFFF);
++	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);        /* Group 1 (NS view: NS Group 1) */
++	gicr_write32(GICR_IGRPMODR0, 0);                /* not Secure Group 1 */
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0); /* below PMR */
++	}
++	gicr_write32(GICR_ISENABLER0, want);
++	__builtin_arm_dsb(DSB_SY);
++}
++
++static void
++laurel_gicr_setup(vm_offset_t gicr_pe_base)
++{
++	struct laurel_gic_cpu st;
++	uint64_t typer = gicr_read64(GICR_TYPER);
++
++	bzero(&st, sizeof(st));
++	st.mpidr = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") & 0xFFFFFF);
++	st.frame = (uint32_t)((gicr_pe_base - gicr_base) / GICR_PE_SIZE) | (laurel_gicr_fallback_match ? 0x80000000u : 0);
++	st.typer_lo = (uint32_t)typer;
++	st.typer_hi = (uint32_t)(typer >> 32);
++	st.iidr = gicr_read32(GICR_IIDR);
++	st.pwrr = gicr_read32(GICR_PWRR);
++	st.en_before = gicr_read32(GICR_ISENABLER0);
++	st.want = laurel_gicr_want();
++
++	for (uint32_t t = 1; t <= 2; t++) {
++		if (t == 2 && (gicr_read32(GICR_PWRR) & 0x1)) {
++			/* GIC-600: a powered-down redistributor ignores writes. NS may not own PWRR; try. */
++			gicr_write32(GICR_PWRR, 0);
++			for (unsigned int i = 0; i < 100000 && (gicr_read32(GICR_PWRR) & 0x1); i++) {
++				;
++			}
++		}
++		laurel_gicr_program(gicr_pe_base, st.want);
++		st.en_after = gicr_read32(GICR_ISENABLER0);
++		if (st.en_after & (1U << sweet_vtimer_intid)) {
++			st.tries = t;
++			break;
++		}
++	}
++	st.waker = gicr_read32(GICR_WAKER);
++	st.grp = gicr_read32(GICR_IGROUPR0);
++	st.grpmod = gicr_read32(GICR_IGRPMODR0);
++	st.pend = gicr_read32(GICR_ISPENDR0);
++	st.active = gicr_read32(GICR_ISACTIVER0);
++	st.cfg1 = gicr_read32(GICR_ICFGR1);
++	st.prio16 = gicr_read32(GICR_IPRIORITYR0 + 16);
++	st.pwrr = gicr_read32(GICR_PWRR);
++
++	if (!laurel_gic_boot_recorded) {
++		laurel_gic_boot = st;
++		laurel_gic_boot_recorded = true;
++		return;
++	}
++	if (st.tries) {
++		os_atomic_inc(&laurel_gic_cpus_ok, relaxed);
++	} else {
++		os_atomic_inc(&laurel_gic_cpus_bad, relaxed);
++	}
++	/* ring only (laurel 2014): the USB log carries it */
++	kprintf("LAUREL GIC: %s: cpu mpidr=0x%x gicr frame %u TYPER 0x%08x%08x IIDR 0x%08x PWRR 0x%x "
++	    "ISENABLER0 0x%08x (was 0x%08x, want 0x%08x, try %u) WAKER 0x%x pend 0x%08x act 0x%08x\n",
++	    st.tries ? "on" : "off", st.mpidr, st.frame & 0x7FFFFFFF, st.typer_hi, st.typer_lo, st.iidr, st.pwrr,
++	    st.en_after, st.en_before, st.want, st.tries, st.waker, st.pend, st.active);
++}
++
++/* Panel report at STARTUP(LOCKDOWN), before the USB timer-service check (same rank order: FIRST here, SECOND there). */
++static void
++laurel_gic_report(void)
++{
++	struct laurel_gic_cpu *s = &laurel_gic_boot;
++	if (!laurel_gic_boot_recorded) {
++		printf("LAUREL GIC: off: no redistributor init ran on the boot CPU\n");
++		return;
++	}
++	printf("LAUREL GIC: %s: boot cpu mpidr=0x%x gicr frame %u%s TYPER 0x%08x%08x IIDR 0x%08x PWRR 0x%x "
++	    "ISENABLER0 0x%08x (was 0x%08x, want 0x%08x, try %u)\n",
++	    s->tries ? "on" : "off", s->mpidr, s->frame & 0x7FFFFFFF, (s->frame & 0x80000000) ? " (fallback)" : "",
++	    s->typer_hi, s->typer_lo, s->iidr, s->pwrr, s->en_after, s->en_before, s->want, s->tries);
++	printf("LAUREL GIC: IGROUPR0 0x%08x IGRPMODR0 0x%08x ISPENDR0 0x%08x ISACTIVER0 0x%08x ICFGR1 0x%08x "
++	    "prio16 0x%08x WAKER 0x%x GICD_CTLR 0x%08x%s\n",
++	    s->grp, s->grpmod, s->pend, s->active, s->cfg1, s->prio16, s->waker, gicd_read32(GICD_CTLR),
++	    s->tries ? "" : " | timer PPI not enableable from EL1 NS on this frame");
++}
++STARTUP(LOCKDOWN, STARTUP_RANK_FIRST, laurel_gic_report);
++#endif /* SWEET */
++
+ void
+ pe_init_fiq()
+ {
+@@ -170,12 +331,17 @@
+ 	 * non-secure writes to it are ignored. Everything we own is Group 1 NS
+ 	 * and arrives as an IRQ (see sleh_irq). GICR_IGROUPR0 reads as zero
+ 	 * from the non-secure side even after this write; delivery still works.
++	 *
++	 * laurel 2015: the redistributor setup is a checked feature
++	 * (laurel_gicr_setup): on the UEFI path (Mu-Silicium -> DarwinBoot, boot
++	 * CPU Silver 0x0) the 2013 self-check read GICR ISENABLER0 bit 19 = 0
++	 * after this write, so no timer tick reached the boot CPU and every
++	 * thread starved. The setup now deactivates and clears the SGIs/PPIs,
++	 * sets group/group-modifier/priority, enables the timers and the IPI
++	 * SGI, reads everything back, retries once (after a GIC-600 GICR_PWRR
++	 * power-on attempt) and keeps the result for the LOCKDOWN report.
+ 	 */
+-	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
+-	for (unsigned int i = 0; i < 32; i += 4) {
+-		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+-	}
+-	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	laurel_gicr_setup(gicr_pe_base);
+ #else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1939,18 +1939,20 @@
+ 	}
+ 	uint32_t g[8];
+ 	sweet_gic_state(g);
++	/* laurel 2015: two lines; one line of this length was cut at the console buffer (256 bytes) on 2026-11-01 02:57 */
+ 	printf("LAUREL USB: timer service: NO tick in %llu ms: the timer interrupt does not reach this CPU: "
+ 	    "EL%llu DAIF 0x%llx ISR 0x%llx CNTV_CTL 0x%llx TVAL %lld ICC SRE 0x%llx PMR 0x%llx IGRPEN1 %llu RPR 0x%llx "
+-	    "CTLR 0x%llx | GICD_CTLR 0x%08x GICR WAKER 0x%08x ISENABLER0 0x%08x ISPENDR0 0x%08x ISACTIVER0 0x%08x "
+-	    "IGROUPR0 0x%08x prio 0x%02x intid %u\n", ns / NSEC_PER_MSEC,
++	    "CTLR 0x%llx\n", ns / NSEC_PER_MSEC,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("ISR_EL1"),
+ 	    __builtin_arm_rsr64("CNTV_CTL_EL0"), (int64_t)(int32_t)__builtin_arm_rsr64("CNTV_TVAL_EL0"),
+ 	    __builtin_arm_rsr64("ICC_SRE_EL1"), __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"),
+-	    __builtin_arm_rsr64("ICC_RPR_EL1"), __builtin_arm_rsr64("ICC_CTLR_EL1"),
++	    __builtin_arm_rsr64("ICC_RPR_EL1"), __builtin_arm_rsr64("ICC_CTLR_EL1"));
++	printf("LAUREL USB: timer service: GICD_CTLR 0x%08x GICR WAKER 0x%08x ISENABLER0 0x%08x ISPENDR0 0x%08x "
++	    "ISACTIVER0 0x%08x IGROUPR0 0x%08x prio 0x%02x intid %u\n",
+ 	    g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
+ 	printf("LAUREL USB: timer service: log and commands wait for the first timer interrupt\n");
+ }
+-STARTUP(LOCKDOWN, STARTUP_RANK_FIRST, laurel_usb_timer_check);
++STARTUP(LOCKDOWN, STARTUP_RANK_SECOND, laurel_usb_timer_check); /* laurel 2015: after the LAUREL GIC report */
+ 
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
