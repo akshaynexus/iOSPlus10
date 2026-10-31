@@ -30,7 +30,8 @@ Order (one thread, polled, like topaz):
 1. `topaz_soc_map()` (waits for UFS, maps SMEM, pool, APCS) -> `/dev/topaz-audio` + `/dev/redwood-audio` (0935 alias)
    are made now, so mediaserverd's plug-in can open them at load time; writes are dropped until the path is up.
 2. Refuse when SMEM already has items 443/480 (a DSP of an earlier run).
-3. FAT16 reader: `modem_b`, else `modem_a`; boot sector, FAT, root dir, `image` dir, cluster chains.
+3. Firmware through `topaz_part_fw_size/read` = TopazModem's FAT index of modem_<active slot> (area E, patch 2400);
+   2500 needs 2400 (it had its own FAT16 reader until E's review fixes landed).
 4. PAS 1: init_image (metadata in the pool), mem_setup, segments into 0x55300000, auth_and_reset; SMP2P READY.
 5. GLINK + QRTR + pd-mapper (topaz code), APR channel `apr_audio_svc`; `AVCS_CMD_ADSP_EVENT_GET_STATE` every 200 ms
    until 1 (30 s limit).
@@ -69,10 +70,11 @@ XNU now runs at 0xE1004000-0x1AD004000, mostly above 4 GiB, so nothing the ADSP 
   `audio_dev_init` (devfs_make_node before vfsinit panics; only after the UFS wait); idle wait 20 ms for 1 s after
   GLINK traffic, then 200 ms (5 wakeups/s; a write wakes the thread at once); `PAS auth_and_reset: ... N ms` (no proxy
   votes sent: a slow crypto engine shows here).
-- FAT reader: TODO in the code. When area E's 2400 (FAT index of modem_<active slot>, `topaz_part_fw_*`) is merged,
-  `fw_mount/fw_read/fw_size` go and TopazAudio calls `topaz_part_fw_*`. 2500 sorts after 2400-2402 and touches neither
-  TopazModem.cpp nor sweet_ufs.c.
-- Shared TopazModem.cpp fixes (scm() lock + busy retry, smmu_identity() lock, pool-vs-XNU-window check) are area E's.
+- FAT reader: removed. The branch is rebased on area E (origin/t3/laurel-wifi-modem-firmware 282bc27, which holds
+  laurel-int-1); TopazAudio calls `topaz_part_fw_*` (2400 index of modem_<active slot>) again. 2500 sorts after
+  2400-2404 and touches neither TopazModem.cpp nor sweet_ufs.c.
+- Shared TopazModem.cpp fixes (scm() lock + busy retry, smmu_identity() lock, pool-vs-XNU-window check) are area E's
+  patch 2404 (in this branch now).
 - root-audio.sh: `--image` checks the fsck verify result before the sparse step (only the known Linux "Volume header
   needs minor repair" is accepted, as in root.sh); no toolchain -> warning, audio skipped, exit 0 (root.sh also goes on
   if the script fails); `--image` is Linux only (stated in the script).

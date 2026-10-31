@@ -3903,3 +3903,6 @@ Details and expected lines: `docs/laurel_sprout/wifi.md`.
   toolchain-missing skip, Linux-only --image. Own FAT reader stays (TODO) until area E's 2400 is merged.
 - Build on laurel-int-1: 228 patches apply, no warnings in the two files, 0 LSE, kernel sha256 1fc7d60f...;
   RedwoodAudio sha256 33449356... (unchanged). UEFI image not rebuilt here (needs the Mu 0101 FD of area A for DRAM=auto).
+- Then rebased on area E (282bc27: 2400 FAT index, 2404 TrustZone/SMMU locks + pool check; it holds laurel-int-1): 2500's
+  own FAT16 reader is gone, TopazAudio reads image/adsp.* through topaz_part_fw_* again (2500 now needs 2400).
+  Build: 233 patches apply, no warnings, 0 LSE, kernel sha256 b16faf25...; RedwoodAudio 33449356... (same).
