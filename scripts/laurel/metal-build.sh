@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build the Metal path for the Mi A3 (Adreno 610) natively on Linux (no Mac, no Xcode):
+# Build the Metal path for the Mi A3 (Adreno 610) natively on Linux (no Mac, no Xcode); on macOS the same steps run the
+# negroni scripts as they are (Xcode SDK, Apple clang/ld64, codesign), with this port's Turnip patches:
 #   iPhoneOS16.5.sdk + Rust 1.98.0 (aarch64-apple-ios) -> Turnip (Mesa 25.0.7, msm KMD over the RedwoodGPU user client)
 #   -> metal2vulkan bridge (Rust staticlib) -> NegroniMetal.bundle + probes, signed with ldid, staged in out/metal/stage
 #   (the layout scripts/laurel/root-add-metal.sh installs into the root). Design: docs/laurel_sprout/metal.md.
@@ -17,9 +18,12 @@ set -euo pipefail
 . "$(cd "$(dirname "$0")" && pwd)/metal-env.sh"
 mkdir -p "$LM" "$REPO/logs"
 ts() { date +%H:%M:%S; }
+sha256() { if command -v sha256sum > /dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+LINUX=0; [ "$(uname -s)" = Linux ] && LINUX=1
 
 step_fetch() {
   laurel_metal_tools
+  if [ $LINUX = 0 ]; then "$REPO/scripts/metal/fetch-sources.sh"; return; fi   # macOS: Xcode SDK, the negroni fetch
   # 1. SDK: sparse, blob-less clone of one SDK directory at the pinned commit
   if [ ! -f "$SDK/SDKSettings.json" ] && [ ! -f "$SDK/SDKSettings.plist" ]; then
     case "$SDK" in "$LM"/*) ;; *) echo "metal: SDK=$SDK is not an SDK directory" >&2; exit 1 ;; esac
@@ -46,7 +50,7 @@ step_fetch() {
       curl -sL --fail --retry 3 -o "$a.part" "$IPSW_URL"
       mv "$a.part" "$a"
     fi
-    echo "$IPSW_SHA256  $a" | sha256sum -c --quiet || { rm -f "$a"; echo "metal: ipsw archive hash mismatch" >&2; exit 1; }
+    echo "$IPSW_SHA256  $a" | sha256 -c --quiet || { rm -f "$a"; echo "metal: ipsw archive hash mismatch" >&2; exit 1; }
     tar -xzf "$a" -C "$LM/ipsw" ipsw
   fi
   [ "$(uname -s)" != Linux ] || ln -sf "$LM/ipsw/ipsw" "$TOOLBIN/ipsw"
@@ -56,7 +60,7 @@ step_fetch() {
   command -v rustup > /dev/null || { echo "metal: rustup missing (https://rustup.rs)" >&2; exit 1; }
   local stamp=$OUT/metal/src/.laurel-fetch want
   want=$( { git -C "$EXT/metal2vulkan" rev-parse HEAD; cat "$REPO/scripts/metal/env.sh" "$REPO/scripts/metal/fetch-sources.sh" \
-    "$REPO"/userland/metal/patches/*/*.patch; } | sha256sum | cut -c1-16)
+    "$REPO"/userland/metal/patches/*/*.patch; } | sha256 | cut -c1-16)
   if [ "${FORCE:-0}" = 1 ] || [ "$(cat "$stamp" 2>/dev/null)" != "$want" ] || [ ! -d "$OUT/metal/src/flame/phone/metal2" ]; then
     "$REPO/scripts/metal/fetch-sources.sh"
     echo "$want" > "$stamp"
@@ -73,7 +77,7 @@ step_turnip() {
 step_bridge() {
   laurel_metal_tools
   # cc-rs (sha2 asm) finds the iOS SDK through SDKROOT on a host without xcrun; host build scripts ignore it
-  SDKROOT=$SDK "$REPO/scripts/metal/build-bridge.sh" ios
+  if [ $LINUX = 1 ]; then SDKROOT=$SDK "$REPO/scripts/metal/build-bridge.sh" ios; else "$REPO/scripts/metal/build-bridge.sh" ios; fi
 }
 
 # Mount the 20H392 SystemOS image read-only (user space) so IOS_DSC names its dyld cache; unmounted on exit.
@@ -96,6 +100,7 @@ dsc_mount() {
 
 step_plugin() {
   laurel_metal_tools
+  if [ $LINUX = 0 ]; then "$REPO/scripts/metal/build.sh"; return; fi   # macOS: negroni's build, unchanged
   dsc_mount
   # scripts/metal/build.sh with our Linux toolchain file (clang -target arm64-apple-ios16.0 + ld64.lld)
   NMTL_CMAKE_TOOLCHAIN=$LMSRC/cmake/ios-arm64-linux.cmake "$REPO/scripts/metal/build.sh"
@@ -104,6 +109,7 @@ step_plugin() {
 # The A610 facts this path depends on, read from the patched Turnip tree and the staged binaries.
 step_check() {
   local fail=0 tu=$OUT/gpu/turnip/mesa-25.0.7 st=$OUT/metal/stage
+  command -v llvm-objdump > /dev/null && command -v llvm-otool > /dev/null || { echo "check: needs llvm-objdump, llvm-otool"; return 1; }
   if [ -d "$tu" ]; then
     python3 -I "$REPO/scripts/laurel/metal-a610.py" "$tu" "$LAUREL_CHIP_ID" || fail=1
   else
@@ -117,7 +123,10 @@ step_check() {
     local minos lse
     minos=$(llvm-otool -l "$b" | awk '/LC_BUILD_VERSION/{p=1;next} p&&/minos/{print $2;exit}')
     # ARMv8.0 (Kryo 260): LSE atomics and LDAPR trap; XNU emulates them (topaz), but each one is a trap: count them
-    lse=$(llvm-objdump -d --no-show-raw-insn "$b" 2>/dev/null | grep -cE '\s(cas|casp|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|swp)[alh]*\s|\sldapr' || true)
+    # every LSE form: CAS/CASP, LD<op>/ST<op> (ST<op> = LD<op> to xzr) with A/L/AL and B/H, SWP; RCpc LDAPR/LDAPUR
+    local dis
+    dis=$(llvm-objdump -d --no-show-raw-insn "$b") || { echo "check: llvm-objdump failed on $b"; fail=1; continue; }
+    lse=$(printf '%s\n' "$dis" | grep -cE '\s((casp?|ld(add|clr|eor|set|[su]m(ax|in))|st(add|clr|eor|set|[su]m(ax|in))|swp)(a|l|al)?(b|h)?|ldapu?r(b|h)?)\s' || true)
     printf 'check: %-60s minos %s, %s LSE/RCpc\n' "${b#$st/}" "$minos" "$lse"
     [ "$minos" = 16.0 ] || fail=1
     [ "$lse" = 0 ] || fail=1

@@ -69,6 +69,7 @@ CA_HEARTBEAT=${CA_HEARTBEAT:-60} python3 -I "$REPO/scripts/ios16/root-tweaks-ext
 python3 -I "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$mnt"
 # Metal path (docs/laurel_sprout/metal.md): NegroniMetal.bundle (Turnip a610 + metal2vulkan) + probes, when
 # scripts/laurel/metal-build.sh has staged them; METAL=0 skips. Without the stage it logs "metal: off" and goes on.
+# (AREA B's scripts/laurel/root-add-gpu.sh, GPU firmware + GL, goes before this line: Metal checks for B's backboardd wrapper)
 METAL=${METAL:-1} sh "$REPO/scripts/laurel/root-add-metal.sh" "$mnt"
 sync
 umount "$mnt"

@@ -3854,3 +3854,19 @@ Done [V, logs/laurel-metal.log, logs/laurel-kernel-metal.log]; nothing ran on th
   `recommendedMaxWorkingSetSize` unavailable on iOS (metalprobe reads it by KVC); CMake iOS on Linux needs full compiler
   paths. The 20H392 dyld cache is readable without root: `apfs-fuse -o ro 087-86593-047.dmg MNT`.
 - Next: coordinator test (metal.md section 8): `LAUREL METAL:` line, then vkprobe / m2vtest / metalprobe over SSH.
+
+## Mi A3: Metal (AREA J) review fixes on laurel-int-1 (2026-11-01 05:05)
+
+Done [V logs/laurel-metal.log, logs/laurel-kernel-metal.log, logs/laurel-kernel-btest.log]; nothing ran on the phone.
+- 2850: bundle files checked right after the root mount (a root without the Metal stage: no GPU wait); the GPU wait is a
+  100 ms poll that stops at once on `!topaz_gpu_wanted() || topaz_gpu_failed()` (B 2150 has `topaz_gpu_wanted`; weak
+  stand-ins in LaurelMetal.cpp, B can add a strong `topaz_gpu_failed`); `copyMatchingService` instead of the blocking
+  match (dictionary released); whole file under ARM64_BOARD_CONFIG_SWEET; no bsd/ file and no bsd/conf/files hunk any more
+  (the vnode lookup is in the .cpp: fewer conf conflicts with other areas); RedwoodMaxBuffer = 64 MiB - 64 KiB on RedwoodGPU
+  when B did not set it. Link test with B's 2150: B's strong topaz_gpu_wanted is taken. B's 2151 does not apply on
+  laurel-int-1 (SweetSurface.cpp vs A's 2101).
+- Turnip 0101 (userland/laurel/metal/turnip-patches, TU_EXTRA_PATCHES): maxMemoryAllocationSize/maxBufferSize = RedwoodMaxBuffer,
+  so Metal maxBufferLength < 64 MiB (metal2vulkan device/metal.rs:168 takes min(maxBufferSize, maxMemoryAllocationSize)).
+  The env file is not enough: sandboxed apps cannot read /var/db/negronimetal/env.
+- Clients default = probes only; `*` gets `-backboardd` when B's /usr/libexec/real/backboardd is in the root.
+- CHIP_ID 0x06010000 and HBB 14 (B's values; Turnip takes HBB from the kernel). LSE regex covers every LSE/RCpc form.

@@ -17,12 +17,15 @@ TU=$G/turnip
 TU_SRC=$TU/mesa-$MESA_VERSION
 TU_BUILD=$TU/build-ios
 TU_PATCHES=$REPO/userland/turnip/mesa-patches
+# Device ports add their own Turnip patches after these (e.g. scripts/laurel/metal-build.sh: userland/laurel/metal/turnip-patches)
+TU_EXTRA_PATCHES=${TU_EXTRA_PATCHES:-}
 A=$DL/mesa-$MESA_VERSION.tar.xz
 
 stamp() {
   echo "mesa $MESA_VERSION $MESA_SHA256"
   echo "hackios $HACKIOS_COMMIT: $HACKIOS_PATCHES"
   for p in "$TU_PATCHES"/*.patch; do echo "turnip $(basename "$p") $(shasum -a 256 "$p" | cut -c1-16)"; done
+  for d in $TU_EXTRA_PATCHES; do for p in "$d"/*.patch; do echo "extra $p $(shasum -a 256 "$p" | cut -c1-16)"; done; done
   for f in negroni_drm.c negroni_drm.h ngl_abi.h xf86drm.h; do echo "drm $f $(shasum -a 256 "$NGL/drm/$f" | cut -c1-16)"; done
   echo "log.c $(shasum -a 256 "$NGL/log.c" | cut -c1-16)"
 }
@@ -55,6 +58,12 @@ make_tree() {
   for p in "$TU_PATCHES"/*.patch; do
     echo "patch turnip $(basename "$p")"
     patch -s --no-backup-if-mismatch -d "$TU_SRC" -p1 < "$p"
+  done
+  for d in $TU_EXTRA_PATCHES; do
+    for p in "$d"/*.patch; do
+      echo "patch extra $p"
+      patch -s --no-backup-if-mismatch -d "$TU_SRC" -p1 < "$p"
+    done
   done
   find "$TU_SRC" -name '*.orig' -delete
   stamp > "$TU_SRC/TURNIP-SOURCE"
@@ -145,7 +154,11 @@ $OTOOL -l "$VK" | grep -q 'cmd LC_DYLD_CHAINED_FIXUPS' || { echo "turnip: no LC_
 # in the symbol table (every lld output has it); only the import table counts there.
 case "$(uname -s)" in
 Darwin) ! grep -q 'dyld_stub_binder' "$TU/nm-m.txt" || { echo "turnip: imports dyld_stub_binder" >&2; fail=1; } ;;
-*) ! llvm-objdump --macho --chained-fixups "$VK" | grep -q 'dyld_stub_binder' || { echo "turnip: imports dyld_stub_binder" >&2; fail=1; } ;;
+*) if ! fx=$(llvm-objdump --macho --chained-fixups "$VK" 2>&1); then
+     echo "turnip: llvm-objdump --chained-fixups failed (LLVM too old?): $(echo "$fx" | head -1)" >&2; fail=1
+   elif echo "$fx" | grep -q 'dyld_stub_binder'; then
+     echo "turnip: imports dyld_stub_binder" >&2; fail=1
+   fi ;;
 esac
 strong=$(grep '(undefined)' "$TU/nm-m.txt" | grep 'dynamically looked up' | grep -v 'weak external' || true)
 [ -z "$strong" ] || { echo "turnip: strong symbols without a library:" >&2; echo "$strong" | head -20 >&2; fail=1; }

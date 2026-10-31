@@ -568,3 +568,8 @@ dark, then back with a fade). Details: notes.md, same date, 04:40.
   kernel patch 2850 (Metal plug-in names on IOAcceleratorES after a self-check) builds, 220 patches, 0 LSE.
 - Not done: phone test; 0x49 host import (impossible with the pass-through SMMU); Turnip on the A610 never ran.
 - Next: AREA B's GPU driver + 2850 kernel, root with the Metal stage; test plan metal.md section 8.
+- Review fixes (2026-11-01 05:05, rebased on laurel-int-1): 2850 never delays the UI on a GPU failure (bundle check first,
+  100 ms poll, stop on topaz_gpu_wanted/failed); clients default = probes only; Turnip 0101 caps buffers at the kernel's
+  RedwoodMaxBuffer (< 64 MiB); macOS path runs the negroni scripts unchanged; LLVM >= 18 floor; wider LSE check.
+  Merge: A -> B (2150-2152; B adds root-add-gpu.sh before root-add-metal.sh in root.sh) -> J 2850.
+

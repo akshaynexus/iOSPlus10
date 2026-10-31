@@ -7,7 +7,7 @@ Built on Linux (CachyOS, 20 cores) [V]. **Not run on the phone yet**: the coordi
 
 | Path | What it is | Fit for the A610 | Verdict |
 |---|---|---|---|
-| (a) metal2vulkan + Mesa Turnip (negroni `userland/metal` + `userland/turnip`, ios-flame frontend + bridge) | Metal.framework loads a plug-in bundle; its `_MTLDevice` subclass forwards to metal2vulkan (Rust: AIR -> SPIR-V, Metal objects on Vulkan 1.2); Turnip runs the Vulkan on the Adreno | Mesa 25.0.7 has the A610 (`GPUId(610)`, chip id `0x060100ff`, matches topaz's `0x06010001`) with an A6xx gen1 "low" property set [V `metal-a610.py`]. The Turnip msm KMD talks to the topaz RedwoodGPU user client through negroni's libdrm stand-in with **no new kernel ABI** (section 4) [V source] | **chosen** |
+| (a) metal2vulkan + Mesa Turnip (negroni `userland/metal` + `userland/turnip`, ios-flame frontend + bridge) | Metal.framework loads a plug-in bundle; its `_MTLDevice` subclass forwards to metal2vulkan (Rust: AIR -> SPIR-V, Metal objects on Vulkan 1.2); Turnip runs the Vulkan on the Adreno | Mesa 25.0.7 has the A610 (`GPUId(610)`, chip id `0x060100ff`, matches B's `0x06010000` and topaz's `0x06010001`) with an A6xx gen1 "low" property set [V `metal-a610.py`]. The Turnip msm KMD talks to the topaz RedwoodGPU user client through negroni's libdrm stand-in with **no new kernel ABI** (section 4) [V source] | **chosen** |
 | (a') same, UniXNU `tu_knl_darwin` KMD (ios-redfin A620, ios-flame A640, UniXNU A740) | Turnip with a Darwin backend over a `NativeAdreno`/`SweetAccelerator v2` user client | Needs that kernel ABI; topaz has the msm one | rejected (second GPU ABI in the kernel) |
 | (b) HackiOS-scion `tools/gfxstream` | gfxstream GLES/Vulkan **encoder** that sends the calls through `/dev/vgpu3d` to a host GPU (Pixel 10 PowerVR under AVF/crosvm) [V `tools/gfxstream/STATUS.md`, `VULKAN.md`] | No host: the Mi A3 runs XNU on the metal | does not apply |
 | (b') HackiOS `tools/mk-mesa.sh` `AIR=1` (`libhakiosair`, AIR -> NIR -> ir3 on gallium freedreno) | Shader front end only; HackiOS itself says "a shader compiler, no Metal" (docs/gpu-comparison-2026-10-27.md) | No Metal runtime for CoreAnimation | rejected (fallback shader path only) |
@@ -35,11 +35,11 @@ CoreAnimation (backboardd, SpringBoard, apps)
 | Fact | Value | Source |
 |---|---|---|
 | Mesa table entry | `GPUId(610)` = chip `0x060100ff` (patch id wildcard) in the group 605/608/610/612, props `[a6xx_base, a6xx_gen1_low]` | Mesa 25.0.7 `src/freedreno/common/freedreno_devices.py` [V] |
-| Kernel chip id | `0x06010001` (MSM_PARAM_CHIP_ID), GPU_ID 610 | topaz TopazAdreno.cpp `redwood_gpu_parameter` [V] |
+| Kernel chip id | `0x06010000` (MSM_PARAM_CHIP_ID, kgsl value of the Mi A3), GPU_ID 610; base topaz answered `0x06010001` | B 2150 [V], topaz TopazAdreno.cpp [V] |
 | Matching rule | table patch id `0xff` + same core/major/minor | `freedreno_dev_info.c` [V] |
 | GMEM | `0x21000` (128 KiB + 4 KiB), base `0x100000` | TopazAdreno.cpp `GMEM_SIZE`, `GMEM_BASE` [V] |
 | CCU / tiles | `num_ccu 1`, tile align 32x16, 16 VSC pipes, cs shared mem 16 KiB | Mesa table [V] |
-| UBWC | highest_bank_bit 13, swizzle 7, macrotile 0 (kernel answers the same) | Mesa table, TopazAdreno.cpp [V] |
+| UBWC | kernel: highest_bank_bit **14** (B 2150), swizzle 7, macrotile 0. Turnip uses the kernel's HBB (`tu_knl_drm_msm.cc` MSM_PARAM_HIGHEST_BANK_BIT); the table's 13 is only the fallback | B 2150, Mesa [V] |
 | a6xx_gen1_low | reg_size_vec4 48, no GMEM fast clear, no HW multiview, **no sampler min/max**, no FS tex prefetch, no double thread size, 16 VS inputs | Mesa table [V] |
 | GMU | no GMU firmware on the A610 (Linux drives it with the "GMU wrapper"; topaz brings it up without one); negroni's A730 GMU/IFPC work does not apply | topaz TopazAdreno.cpp [V], Linux [I from memory] |
 | GPU addresses | SMMU pass-through by default (`gpu_identity=1`): GPU VA = PA, 36 bit; every buffer must be physically contiguous | TopazAdreno.cpp:300, RedwoodGPU.cpp `newBuffer` [V] |
@@ -60,7 +60,7 @@ Turnip as it is**, if it keeps this table:
 |---|---|---|
 | service `RedwoodGPU`, user client type 0, `IOConnectMapMemory64(handle)` = mmap | yes | OK |
 | 0x40 GET_PARAM: GPU_ID, CHIP_ID, GMEM_SIZE, GMEM_BASE, MAX_FREQ, TIMESTAMP, PRIORITIES, FAULTS, SUSPENDS, HIGHEST_BANK_BIT, UBWC_SWIZZLE, MACROTILE_MODE | all (VA_START/VA_SIZE: EINVAL on purpose) | OK |
-| 0x42 GEM_NEW (WC/CACHED flags) | WC pool memory, contiguous, kept buffers reused | OK; one buffer <= 64 MiB pool chunk [V GPU_POOL_CHUNK] |
+| 0x42 GEM_NEW (WC/CACHED flags) | WC pool memory, contiguous, kept buffers reused | OK; one buffer < 64 MiB (`GPU_POOL_CHUNK - GPU_POOL_UNIT`), told to Turnip as `RedwoodMaxBuffer` (4.1) |
 | 0x43 GEM_INFO GET_IOVA/GET_OFFSET/GET_FLAGS/SET_NAME | yes; SET_IOVA no | OK (Turnip uses GET_IOVA) |
 | 0x44 CPU_PREP, 0x47 WAIT_FENCE (absolute timeout), 0x45/0x48/0x4b stubs | yes (polled every 200 us) | OK |
 | 0x46 GEM_SUBMIT: CMD_BUF cmds, bo list, SYNCOBJ flags ignored | 1..128 cmds, <= 8192 bos | OK; the stand-in answers 0-cmd submits and the syncobjs itself [V negroni_drm.c:717-756] |
@@ -71,26 +71,45 @@ Turnip as it is**, if it keeps this table:
 
 ### Patch 2850 `laurel-metal-registration` (range 2850-2899)
 
-- New `iokit/Kernel/arm/LaurelMetal.cpp` + `bsd/dev/laurel_metal.c`; in `AppleCLCD::start` (topaz 0138) the attached
-  IOAcceleratorES goes to `laurel_metal_publish()`, which registers it later (false = kill switch: 0138 registers it now).
-- A kernel thread waits for the root (<= 60 s) and then the `RedwoodGPU` service (<= 20 s), checks `redwood_gpu_ready()`, CHIP_ID `0x0601xxxx`,
-  GMEM size != 0, then that the root has `NegroniMetal.bundle/{NegroniMetal,libvulkan_freedreno.dylib,Info.plist}`
-  (`vnode_lookup`, regular files). Then it sets `MetalPluginName = NegroniMetal`, `MetalPluginClassName =
-  NegroniMTLDevice`, `IOGLBundleName = NegroniMetal` and registers the service (any failure: registers it empty).
+- New `iokit/Kernel/arm/LaurelMetal.cpp` (whole file under `ARM64_BOARD_CONFIG_SWEET`; other boards get a stub that
+  returns false) and one line in `iokit/conf/files.arm64`. In `AppleCLCD::start` (topaz 0138) the attached IOAcceleratorES
+  goes to `laurel_metal_publish()`, which registers it later (false = kill switch: 0138 registers it at once).
+- The check thread, in this order (review M1, 2026-11-01):
+  1. root mounted (100 ms poll, <= 60 s);
+  2. at once: `NegroniMetal.bundle/{NegroniMetal,libvulkan_freedreno.dylib,Info.plist}` are regular files (`vnode_lookup`);
+     a root without the Metal stage ends here, with no GPU wait;
+  3. every 100 ms: stop at once when `!topaz_gpu_wanted() || topaz_gpu_failed()` (gpu=0, or the bring-up failed); go on
+     when `redwood_gpu_ready()` and the `RedwoodGPU` service is in the registry (`copyMatchingService`, no blocking wait,
+     the matching dictionary released); give up 20 s after the root mount only if the bring-up neither ends nor fails;
+  4. CHIP_ID `(chip >> 8) == 0x060100` (B's 0x06010000 and topaz's 0x06010001 both pass), GMEM size != 0.
+- On: `MetalPluginName = NegroniMetal`, `MetalPluginClassName = NegroniMTLDevice`, `IOGLBundleName = NegroniMetal`, and
+  `RedwoodMaxBuffer` = 64 MiB - 64 KiB on RedwoodGPU if the GPU driver has not set it (section 4.1). Then the service is
+  registered. Any failure: registered empty.
 - Kill switch `laurelmetal=0`. The plug-in has its own (`negronimetal=0`, `/var/db/negronimetal/off`, clients list,
   dead-man strikes: docs/metal-management.md).
-- Log, one line: `LAUREL METAL: on: Turnip a610 (chip 0x6010001, GMEM 132 KiB, N MHz), metal2vulkan plug-in
-  NegroniMetal.bundle class NegroniMTLDevice on IOAcceleratorES`, or `LAUREL METAL: off: <reason>` with the reasons
-  `laurelmetal=0`, `no RedwoodGPU service 20 s after the root mount (the Adreno 610 did not start)`, `RedwoodGPU is published but the GPU
-  is not ready (stopped or hung)`, `GPU chip id ... is not an Adreno 610`, `GPU reports no GMEM size`, `root file system not
-  mounted`, `<file> missing (errno N): root without scripts/laurel/root-add-metal.sh`, `no thread for the check`.
-- Depends on topaz symbols that AREA B must keep: `redwood_gpu_ready`, `redwood_gpu_parameter`, `topaz_root_mounted`,
-  the `RedwoodGPU` service name, and the 0138 block in `SweetFramebuffer.cpp` (the hunk context of 2850).
-- Timing [V TopazAdreno.cpp `topaz_adreno_thread`]: topaz starts the GPU only after the root mount (+0.5 s + hw start) and
-  only with boot-arg `gpu=1` (AREA B decides the default). Metal registers its devices once per process, so 2850 **holds
-  the IOAcceleratorES registration back** until the check ends (root <= 60 s, then RedwoodGPU <= 20 s), and registers it
-  with the names (on) or empty (off). CoreAnimation polls for the service (300 x 100 ms, topaz 0138 comment), so backboardd
-  finds it with the names. Cost when the GPU does not start: CA waits up to 20 s once at its start [I].
+- Log, one line: `LAUREL METAL: on: Turnip a610 (chip 0x6010000, GMEM 132 KiB, N MHz, buffers < 64 MiB), metal2vulkan
+  plug-in NegroniMetal.bundle class NegroniMTLDevice on IOAcceleratorES, GPU up N ms after the root`, or
+  `LAUREL METAL: off: <reason>`: `laurelmetal=0`, `root file system not mounted`, `<file> missing (errno N): root without
+  scripts/laurel/root-add-metal.sh`, `the GPU is off (boot-arg gpu=0, or its bring-up failed)`, `the GPU bring-up failed
+  (LAUREL GPU line above)`, `no RedwoodGPU 20 s after the root mount (the Adreno 610 neither started nor failed)`,
+  `GPU chip id ... is not an Adreno 610`, `GPU reports no GMEM size`, `no thread for the check`.
+- Why the hold-back [V TopazAdreno.cpp `topaz_adreno_thread`]: the GPU starts only after the root mount (+0.5 s + hw
+  start). Metal registers its devices once per process. CoreAnimation polls for IOAcceleratorES (300 x 100 ms, topaz 0138
+  comment), so backboardd finds the service with the names. A GPU that is off or fails costs CA nothing (the check stops
+  at once); only a hung bring-up costs up to 20 s once [I].
+
+### 4.1 Interface with AREA B (GPU driver) and A (memory)
+
+| Symbol / property | Owner | Use here | Without the owner |
+|---|---|---|---|
+| `redwood_gpu_ready()`, `redwood_gpu_parameter()`, `topaz_root_mounted()`, service `RedwoodGPU`, 0138 block in `SweetFramebuffer.cpp` | topaz (B keeps them) | check, chip, GMEM | - |
+| `extern "C" bool topaz_gpu_wanted(void)` | B 2150 (TopazAdreno.cpp: not killed by `gpu=0` and not failed) | stop the wait at once | weak stand-in in LaurelMetal.cpp: the topaz rule (`gpu=1` boot-arg) |
+| `extern "C" bool topaz_gpu_failed(void)` | B (to add: return the `failed` flag) | stop the wait at once | weak stand-in: false (B's `topaz_gpu_wanted` already covers `failed`) |
+| RedwoodGPU property `RedwoodMaxBuffer` (OSNumber, 64 bit, bytes) | B should set it from its pool chunk / midmem limit | Turnip 0101 caps `maxMemoryAllocationSize`, `maxBufferSize`, so Metal `maxBufferLength` | 2850 sets 0x3FF0000 (topaz `GPU_POOL_CHUNK - GPU_POOL_UNIT`) when it is absent |
+
+[V] Link test 2026-11-01: 2850 + B's 2150 (origin/t3/laurel-adreno-610-gpu 5e93823) links with B's strong
+`topaz_gpu_wanted` (external) and our weak `topaz_gpu_failed`; 229 patches, 0 LSE. B's 2151 does not apply on
+laurel-int-1 (SweetSurface.cpp, A's 2101): B rebases it.
 
 ## 5. Build on Linux
 
@@ -109,21 +128,40 @@ build at the same time, all host cores). Products: `out/gpu/turnip/libvulkan_fre
 | 20H392 dyld cache for `check-imports.py` | the IPSW SystemOS image `087-86593-047.dmg` mounted read-only with apfs-fuse (user space) + blacktop `ipsw` 3.1.741 (SHA-256 pinned) | `metal-build.sh plugin` |
 | `xcrun metal` (layerprobe.metallib) | none: skipped with a NOTE (layerprobe takes a metallib argument) | |
 
+macOS: `metal-build.sh` runs the negroni scripts as they are (`fetch-sources.sh`, `turnip-build.sh`, `build-bridge.sh`,
+`build.sh`: Xcode SDK, Apple clang/ld64, codesign); only this port's Turnip patch list (`TU_EXTRA_PATCHES`) is added.
+Linux host floor: clang and ld64.lld major >= 18 (`LLVM_MIN`, checked in `laurel_metal_tools`) [I: older lld may not emit
+chained fixups by default]; meson 1.7.2 is pinned in the venv; ldid comes from the pinned theos toolchain; apfs-fuse is
+only for the import check.
+
+Turnip patches of this port: `userland/laurel/metal/turnip-patches/0101-turnip-darwin-max-buffer.patch` (applied after
+`userland/turnip/mesa-patches` through `TU_EXTRA_PATCHES`; new `tu_darwin_limits.c` reads `RedwoodMaxBuffer`, override
+`TU_DARWIN_MAX_BO=N`, no property = no cap, so negroni kernels are unchanged).
+
 Fixes to shared scripts that the Linux route needed (they keep macOS as it was):
 `scripts/gpu/turnip-build.sh` (lld through meson `c_ld`, not in the compiler command: there it made every meson
 `-Werror=unused-command-line-argument` check fail and the build broke on `struct timespec`; the `dyld_stub_binder` check
 reads the chained-fixup import table on Linux, because every ld64.lld output keeps an unused undefined `dyld_stub_binder` in
 its symbol table; GNU `stat -f` printed file-system data), `scripts/metal/build.sh` (`NMTL_CMAKE_TOOLCHAIN`),
-`userland/metal/probes/metalprobe.m` (`recommendedMaxWorkingSetSize` through KVC: the 16.5 SDK marks it unavailable on iOS).
+`userland/metal/probes/metalprobe.m` (`recommendedMaxWorkingSetSize` through KVC: the 16.5 SDK marks it unavailable on iOS),
+`turnip-build.sh` `TU_EXTRA_PATCHES` and a failing `llvm-objdump --chained-fixups` fails the check (review m3).
+The LSE check (review m2) matches every LSE/RCpc form: `(casp?|ld(add|clr|eor|set|[su]m(ax|in))|st(add|clr|eor|set|[su]m(ax|in))|swp)(a|l|al)?(b|h)?|ldapu?r(b|h)?`
+(tested: it finds ldaddalb, casb, swph, stsmaxl, ldapur, caspal, ldaprb; it does not match ldxr, ldr, stlr, ldar).
 
 Measured (2026-11-01, CachyOS, 20 cores) [V]: section 9.
 
 ## 6. Root
 
-`scripts/laurel/root.sh` calls `scripts/laurel/root-add-metal.sh` after the tweaks (on by default, `METAL=0` skips; no
-stage = one `metal: off` line, the root build goes on). It installs the bundle, the probes and
-`/var/db/negronimetal/{clients ("*"),env,cache,strikes,metal.log,build.txt}` through `scripts/metal/root-add-metal.sh`.
-`METAL_CLIENTS=` and `METAL_ENV=` add lines (e.g. `METAL_CLIENTS="-backboardd"` keeps backboardd on its current renderer).
+`scripts/laurel/root.sh` calls `scripts/laurel/root-add-metal.sh` after the tweaks and after AREA B's
+`root-add-gpu.sh` (B's line goes before ours: the clients rule looks for B's backboardd wrapper). On by default, `METAL=0`
+skips; no stage = one `metal: off` line, the root build goes on. It installs the bundle, the probes and
+`/var/db/negronimetal/{clients,env,cache,strikes,metal.log,build.txt}` through `scripts/metal/root-add-metal.sh`.
+
+Clients (review M2): the default list is **the probes only** (`metalprobe m2vtest carenderprobe layerprobe`): Turnip has
+not run on the A610, and a failure in backboardd would freeze the UI that the software renderer draws now.
+`METAL_CLIENTS="..."` replaces the list: `SpringBoard` after phone test 2, then `* -backboardd`, and `*` only after test 3
+passes. When B's GL wrapper is in the root (`/usr/libexec/real/backboardd`), a list with `*` gets `-backboardd` unless it
+names backboardd. A root that already has a list keeps it when `METAL_CLIENTS` is empty. `METAL_ENV=` adds env lines.
 
 ## 7. Open items and risks
 
@@ -131,12 +169,14 @@ stage = one `metal: off` line, the root build goes on). It installs the bundle, 
    (topaz's ring framing for Turnip's IBs: Turnip expects the kernel's `a6xx_submit` wrapper, CCU invalidate at the start,
    CACHE_FLUSH_TS fence; flame's first submits failed without it, docs/metal-design.md 4.3 item 4).
 2. Contiguous memory: every GEM_NEW and every imported surface must be physically contiguous (pass-through SMMU); one
-   buffer at most 64 MiB (pool chunk). metal2vulkan heaps (8 MB blocks, flame 0100) fit; a large texture may not.
+   buffer < 64 MiB (pool chunk). Turnip 0101 reports that limit (`maxMemoryAllocationSize`, `maxBufferSize` =
+   `RedwoodMaxBuffer`), so Metal's `maxBufferLength` is < 64 MiB and too-large buffers are refused at creation. A texture
+   of 64 MiB or more (4096x4096 RGBA8) still fails at allocation [I]. metal2vulkan heaps (8 MB blocks, flame 0100) fit.
    AREA A (contiguous surface pool) owns the pool; `gpu_identity=0` (SMMU tables) would lift it and allow 0x49.
 3. No host-page import (0x49): `newBufferWithBytesNoCopy:` and non-IOSurface host imports fail or copy [I].
 4. One shared GPU address space, no per-client isolation, polled fences (200 us), at most 128 IBs per submit.
-5. GL path (AREA B, EAGL injection into backboardd, topaz 0919) and Metal both want backboardd: CA in a process with an
-   EAGL injection keeps GL. Decide per process with the clients list (`-backboardd`) until Metal is proven.
+5. GL path (AREA B, GL wrapper/injection into backboardd) and Metal both want backboardd. Which one CA takes in a
+   process with both is not known [U]. So backboardd is not a client by default (section 6).
 6. RAM: 6 GB phone; Turnip + metal2vulkan cost 15-20 MiB per process (docs/metal-widgets-2026-10-27.md); the plug-in's
    memory rule skips jetsam-limited processes.
 7. CA framebuffers are 720x1560 BGRA (4.5 MB): topaz 0939 keeps surfaces up to 16 MB contiguous.
@@ -147,7 +187,8 @@ stage = one `metal: off` line, the root build goes on). It installs the bundle, 
 2. Over SSH: `vkprobe` (Turnip: instance, device "FD610", features), `m2vtest` (bridge self-test: compute, render,
    IOSurface import), `metalprobe` (Metal device through the plug-in), then `metalprobe --compute`.
    (`scripts/metal/phone-test.sh push|0|1|2|3|log` has the sequence; `logs/metal-phone-*.log`.)
-3. Then clients: `metalprobe m2vtest` only, then `SpringBoard`, then `*` (backboardd last).
+3. Then clients (the root default is the probes only): `METAL_CLIENTS=SpringBoard`, then `"* -backboardd"`, then `"*"`
+   (backboardd last, and only without B's GL wrapper or with `backboardd` named).
 4. Expected: `NMTL[pid backboardd]: ...` lines in `/var/db/negronimetal/metal.log`; CA renders through Metal.
 
 ## 9. Versions and measurements
@@ -173,3 +214,6 @@ Measured 2026-11-01 (CachyOS, clang 23.1.4, LLD 23.1.4, 20 cores) [V logs/laurel
 | check | Mesa A610 entry PASS; all staged binaries minos 16.0, 0 LSE/RCpc instructions (the check finds a test `ldaddal`) | 8 s |
 | whole `all` again, nothing changed | exit 0 | 15 s |
 | kernel `scripts/laurel/kernel-linux.sh` with 2850 | 220 patches apply (19 laurel), 0 LSE/RCpc, both `LAUREL METAL:` strings and `laurel_metal_publish` in the kernel | 42-77 s |
+| review fixes, base laurel-int-1 (1e793cb), `all` with the Turnip rebuild (0101) | exit 0, import check PASS, check PASS | 113 s |
+| kernel with 2850 on laurel-int-1 | 228 patches, 0 LSE/RCpc; weak `topaz_gpu_wanted`/`topaz_gpu_failed` | 97 s |
+| kernel with 2850 + B's 2150 (link test, not committed) | 229 patches, 0 LSE; B's strong `topaz_gpu_wanted` taken | ~90 s |

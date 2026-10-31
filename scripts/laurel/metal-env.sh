@@ -1,4 +1,6 @@
-# Shared settings of the Mi A3 (laurel_sprout, Adreno 610) Metal build on Linux, sourced by scripts/laurel/metal-*.sh.
+# Shared settings of the Mi A3 (laurel_sprout, Adreno 610) Metal build, sourced by scripts/laurel/metal-*.sh.
+# Linux: everything below. macOS: only the paths and the Turnip patch list; the negroni scripts then run as they are
+# (Xcode SDK through xcrun, Apple clang/ld64, codesign).
 # The Metal stack is negroni's (docs/metal-design.md: NegroniMetal plug-in -> ios-flame frontend + bridge ->
 # metal2vulkan -> Turnip). This file only makes the negroni scripts (scripts/gpu/turnip-build.sh, scripts/metal/*.sh)
 # run on a Linux host with no Xcode. Decision and interfaces: docs/laurel_sprout/metal.md.
@@ -13,11 +15,19 @@ LMSRC=$REPO/userland/laurel/metal          # our sources (CMake toolchain for Li
 SDK_REPO=https://github.com/theos/sdks.git
 SDK_COMMIT=0222fd5413cf4b9af096f37b4621afa2688572f7   # theos/sdks master, 2026-11-01
 SDK_NAME=iPhoneOS16.5.sdk
-export SDK=${SDK:-$LM/sdk/$SDK_NAME}
+[ "$(uname -s)" = Darwin ] || export SDK=${SDK:-$LM/sdk/$SDK_NAME}   # macOS: scripts/metal/env.sh asks xcrun
 
 # Mesa freedreno Vulkan (Turnip) for the A610: Mesa 25.0.7, as the negroni Metal path (scripts/gpu/env.sh). The A610
-# entry of Mesa's device table (chip id 0x06010000, a6xx gen1) is in this release: docs/laurel_sprout/metal.md.
-LAUREL_CHIP_ID=0x06010001                  # what topaz TopazAdreno.cpp answers for CHIP_ID (MSM_PARAM 0x03)
+# entry of Mesa's device table (GPUId(610) = 0x060100ff, a6xx gen1 low) is in this release: docs/laurel_sprout/metal.md.
+# AREA B (laurel 2150) answers CHIP_ID 0x06010000 (kgsl, Mi A3) and HIGHEST_BANK_BIT 14; Turnip uses the kernel's HBB
+# (tu_knl_drm_msm.cc), the table's 13 is only its fallback. Base topaz answered 0x06010001; both match the table.
+LAUREL_CHIP_ID=0x06010000
+# Turnip patches of this port, after userland/turnip/mesa-patches (scripts/gpu/turnip-build.sh TU_EXTRA_PATCHES):
+# 0101 caps maxMemoryAllocationSize/maxBufferSize at the kernel's RedwoodMaxBuffer (pass-through SMMU: < 64 MiB)
+export TU_EXTRA_PATCHES="$LMSRC/turnip-patches"
+# Host tool floor (Linux): ld64.lld emits chained fixups by default from LLVM 18 on [I: older ones fail the Turnip check
+# late]; checked in laurel_metal_tools.
+LLVM_MIN=18
 
 # Linux stand-ins for the Apple tools the negroni scripts call (each one is an LLVM tool that reads Mach-O):
 #   lipo -> llvm-lipo, otool -> llvm-otool, install_name_tool -> llvm-install-name-tool, nm -> llvm-nm (nm -m),
@@ -32,8 +42,15 @@ APPLE=${APPLE:-$HOME/op10-apple}
 DSC_DMG=${DSC_DMG:-$APPLE/20H392/087-86593-047.dmg}
 THEOS_BIN=${THEOS_BIN:-$OUT/laurel-kernel/theos/toolchain/linux/iphone/bin}
 laurel_metal_tools() {
+  [ "$(uname -s)" = Linux ] || return 0          # macOS: Xcode's own tools
   mkdir -p "$TOOLBIN"
-  local t
+  local t v
+  for t in clang ld64.lld; do
+    command -v $t > /dev/null || { echo "metal: missing $t (pacman -S clang lld / apt install clang lld)" >&2; return 1; }
+    v=$($t --version 2>/dev/null | sed -n 's/.*\(clang version\|LLD\) \([0-9][0-9]*\)\..*/\2/p' | head -1)
+    [ -n "$v" ] && [ "$v" -ge "$LLVM_MIN" ] ||
+      { echo "metal: $t major version ${v:-?} < $LLVM_MIN" >&2; return 1; }
+  done
   # lipo: llvm-lipo prints "arm64 " (a blank at the end); the negroni scripts compare the whole line
   command -v llvm-lipo > /dev/null || { echo "metal: missing llvm-lipo (pacman -S llvm / apt install llvm)" >&2; return 1; }
   rm -f "$TOOLBIN/lipo"
