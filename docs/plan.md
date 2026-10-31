@@ -461,6 +461,8 @@ apr_audio_svc, AFE SEC_MI2S_RX + ADM + ASM, MAX98927/98937 at 0x3a, /dev/redwood
 out/laurel/uefi/laurel-uefi-boot.img d82f593b.... Not booted. Root image change: plug-in + VirtualAudio back +
 BTAudio off (apply to the current image: `scripts/bg.sh laurel-root-audio sudo scripts/laurel/root-audio.sh --image
 $APPLE/laurel-ios16-root.img`, then flash userdata with owner approval).
+Review fixes (ACCEPT-WITH-FIXES) done on top of laurel-int-1: 4 GiB checks for ADSP buffers, token/volume/re-queue/idle
+fixes, root-audio.sh fsck gate + skip; own FAT reader -> `topaz_part_fw_*` after area E's 2400 merges (TODO).
 Next (coordinator): boot the image, read the `TopazAudio:`/`LAUREL AUDIO:` lines; with the new root, play a ringtone
 (Settings > Sounds). Mic, headset, earpiece need the WCD937x codec (not started). docs/laurel_sprout/audio.md.
 

@@ -3,6 +3,9 @@
 #   sudo scripts/laurel/root-audio.sh MOUNTED_ROOT          (root.sh step 2 calls this; AUDIO=0 skips)
 #   sudo scripts/laurel/root-audio.sh --image ROOT.img      (an existing image: mount, install, fsck,
 #                                                            new ROOT.simg; run in tmux: scripts/bg.sh)
+# --image is Linux only (modprobe, mount -t hfsplus, fsck.hfsplus), as root.sh is. MOUNTED_ROOT mode works on
+# macOS and Linux. A plug-in that cannot be built (no theos toolchain / SDK) is a warning: audio is skipped,
+# the caller (root.sh) goes on.
 # Needs out/laurel/audio/RedwoodAudio.driver (userland/laurel/audio/build.sh; built here if missing).
 # Steps (idempotent):
 #  1. /System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver (root:wheel, 755/644)
@@ -20,6 +23,7 @@ ts() { date +%H:%M:%S; }
 
 if [ "${1:-}" = --image ]; then
   IMG=${2:?usage: $0 --image ROOT.img}
+  [ "$(uname -s)" = Linux ] || { echo "root-audio: --image needs Linux (hfsplus mount); on macOS mount the image and pass the root" >&2; exit 1; }
   [ "$(id -u)" = 0 ] || { echo "root-audio: run with sudo" >&2; exit 1; }
   [ -s "$IMG" ] || { echo "root-audio: no $IMG" >&2; exit 1; }
   U=${SUDO_USER:-$USER}
@@ -32,6 +36,19 @@ if [ "${1:-}" = --image ]; then
   umount "$mnt"
   echo "$(ts) root-audio: fsck"
   fsck.hfsplus -fy "$IMG" | grep -v 'Illegal name' | tail -3 || true
+  # verify: no sparse image of a volume that is not clean. The one finding Linux fsck_hfs 540.1 repeats
+  # after a repair ("Volume header needs minor repair") is accepted, as in root.sh.
+  if ! v=$(fsck.hfsplus -f -n "$IMG" 2>&1); then
+    others=$(printf '%s\n' "$v" | grep -E 'needs|invalid|Invalid|incorrect|Incorrect|error|Error|missing|Missing|overlap' |
+      grep -v 'Volume header needs minor repair' | grep -v 'needs to be repaired' || true)
+    if printf '%s\n' "$v" | grep -q 'Volume header needs minor repair' && [ -z "$others" ]; then
+      echo "$(ts) root-audio: note: only 'Volume header needs minor repair' remains (Linux fsck_hfs); accepted"
+    else
+      echo "root-audio: fsck: the volume is not clean; no sparse image made" >&2
+      printf '%s\n' "$v" | tail -8 >&2
+      exit 1
+    fi
+  fi
   OP=$REPO/out/bin/op10tool
   [ -x "$OP" ] || sudo -u "$U" "$REPO/scripts/setup/build-op10tool.sh"
   echo "$(ts) root-audio: sparse image (op10tool img2simg)"
@@ -45,7 +62,11 @@ R=${1:?usage: $0 MOUNTED_ROOT | --image ROOT.img}
 if [ "${AUDIO:-1}" = 0 ]; then echo "root-audio: skipped (AUDIO=0)"; exit 0; fi
 [ -d "$R/System/Library/xpc" ] || { echo "root-audio: $R is not an iOS root" >&2; exit 1; }
 if [ ! -f "$SRC/RedwoodAudio" ]; then
-  if [ -n "${SUDO_USER:-}" ]; then sudo -u "$SUDO_USER" "$REPO/userland/laurel/audio/build.sh"; else "$REPO/userland/laurel/audio/build.sh"; fi
+  if [ -n "${SUDO_USER:-}" ]; then b() { sudo -u "$SUDO_USER" "$REPO/userland/laurel/audio/build.sh"; }; else b() { "$REPO/userland/laurel/audio/build.sh"; }; fi
+  if ! b || [ ! -f "$SRC/RedwoodAudio" ]; then
+    echo "root-audio: WARNING: RedwoodAudio.driver could not be built (theos toolchain/SDK: run scripts/laurel/kernel-linux.sh once); audio skipped, root unchanged" >&2
+    exit 0
+  fi
 fi
 own() { [ "$(id -u)" != 0 ] || chown -R 0:0 "$@"; }
 

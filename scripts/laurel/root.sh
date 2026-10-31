@@ -68,7 +68,7 @@ python3 -I "$TOPAZ/sweet-root-tweaks.py" "$mnt"
 CA_HEARTBEAT=${CA_HEARTBEAT:-60} python3 -I "$REPO/scripts/ios16/root-tweaks-extra.py" "$mnt"
 python3 -I "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$mnt"
 # speaker audio (kernel patch 2500): RedwoodAudio.driver HAL plug-in, VirtualAudio back, BTAudio off
-AUDIO=${AUDIO:-1} bash "$REPO/scripts/laurel/root-audio.sh" "$mnt"
+AUDIO=${AUDIO:-1} bash "$REPO/scripts/laurel/root-audio.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-audio.sh failed; root built without audio" >&2
 sync
 umount "$mnt"
 

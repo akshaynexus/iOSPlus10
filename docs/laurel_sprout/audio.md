@@ -22,7 +22,7 @@ for this agent; the coordinator tests).
 | Amp | `maxim,max98927L` at I2C 0x3a on QUP0 SE1, mono; chip is MAX98927 (REV_ID 0x01ff bit 6) or MAX98937 (0x0600 bit 6); 16-bit register addresses | X laurel_sprout-trinket-audio.dtsi, asoc/codecs/max98937.c |
 | Amp protection | Android runs Maxim DSM inside the ADSP AFE with IV feedback on SEC_MI2S_TX; without DSM the vendor driver uses `spk_safe_gain 1`, `digital_safe_gain 44` | max98937.c 1590-1606, 2838-2841 |
 | Microphones | analog mics on WCD937x (TX macro + SoundWire): no I2S mic | X laurel_sprout-trinket-audio.dtsi routing |
-| DRAM at the pool | 0xE0000000 (topaz MODEM_POOL, 16 MiB) is in DRAM bank C 0xC0000000-0x1C0000000, outside the XNU window | docs/laurel_sprout/uefi-boot.md "RAM layout" |
+| DRAM at the pool | 0xE0000000 (TopazModem pool, 16 MiB, shared bump allocator with area E) is in Mu "Pool RAM" (reserved), below XNU's window 0xE1004000-0x1AD004000 (area A) | docs/laurel_sprout/uefi-boot.md "Memory map" |
 
 ## What the kernel does (patch 2500)
 
@@ -52,6 +52,33 @@ Log lines to look for (USB log): `TopazAudio: firmware: modem_b, 29 adsp files`,
 `PAS auth_and_reset: ret=0`, `slave-kernel 00000002 READY`, `glink ADSP OPEN "apr_audio_svc"`, `apr: ADSP core state 1
 READY`, `amp: MAX989x7 rev 0x.. at 0x3a configured`, `SEC_MI2S pins 125..128: cfg 0c8 ...`, `smmu: audio identity (sid
 41 ...) -> OK`, then the `LAUREL AUDIO:` line; at a sound `stream: playing (start N)` and `stream: stopped (...)`.
+
+## Memory rule (after area A, 2026-11-01)
+
+Every buffer the ADSP reads needs a PA below 4 GiB: the audio SID's low bits go in the upper address word (msw = 1).
+XNU now runs at 0xE1004000-0x1AD004000, mostly above 4 GiB, so nothing the ADSP reads may come from the kernel heap.
+- ADSP reads: carve-out 0x55300000 (fixed), PAS metadata and the 8 periods (TopazModem pool 0xE0000000, checked
+  `< 4 GiB` at allocation: else `PAS ... not below 4 GiB` / `LAUREL AUDIO: off: periods at ...`), GLINK FIFOs (SMEM).
+- CPU only: the 64 KiB ring (IOMallocZero; writer -> ring -> period_fill copies into the pool), FAT buffers (UFS DMA
+  goes to sweet_ufs's bounce buffer, below 4 GiB since 2100), the APR packets (copied into SMEM by GLINK).
+
+## Review fixes (2026-11-01, after review "ACCEPT-WITH-FIXES")
+
+- 4 GiB checks above; core-poll token 0x40000000 (call tokens < 0x01000000, writes bit 31); `vol_applied = ~0u` after
+  the self-check; a failed period send is re-queued (bit back in `returned`); devfs order rule in the comment of
+  `audio_dev_init` (devfs_make_node before vfsinit panics; only after the UFS wait); idle wait 20 ms for 1 s after
+  GLINK traffic, then 200 ms (5 wakeups/s; a write wakes the thread at once); `PAS auth_and_reset: ... N ms` (no proxy
+  votes sent: a slow crypto engine shows here).
+- FAT reader: TODO in the code. When area E's 2400 (FAT index of modem_<active slot>, `topaz_part_fw_*`) is merged,
+  `fw_mount/fw_read/fw_size` go and TopazAudio calls `topaz_part_fw_*`. 2500 sorts after 2400-2402 and touches neither
+  TopazModem.cpp nor sweet_ufs.c.
+- Shared TopazModem.cpp fixes (scm() lock + busy retry, smmu_identity() lock, pool-vs-XNU-window check) are area E's.
+- root-audio.sh: `--image` checks the fsck verify result before the sparse step (only the known Linux "Volume header
+  needs minor repair" is accepted, as in root.sh); no toolchain -> warning, audio skipped, exit 0 (root.sh also goes on
+  if the script fails); `--image` is Linux only (stated in the script).
+- Open question from the review: VirtualAudio back on. RedwoodAudio always publishes "Speaker" + "Hawking" (also when
+  `/dev/redwood-audio` does not open), which removes topaz's crash cause; count `CRASH mediaserverd` over several boots
+  before calling it fixed.
 
 ## Userland
 

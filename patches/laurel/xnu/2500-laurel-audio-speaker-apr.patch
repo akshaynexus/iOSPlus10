@@ -1,4 +1,4 @@
-laurel 2500: speaker audio on the Mi A3. TopazAudio keeps the ADSP PAS 1 boot, SMP2P, GLINK lpass edge, QRTR + pd-mapper of topaz; the Mi A3 firmware (ADSP.VT.5.4-00283-NICOBAR, modem partition) is Elite/APR, not AudioReach/GPR, so the GPR/WCD937x/SoundWire half is replaced: carveout 0x55300000+0x2200000; a FAT16 reader for image/adsp.* in modem_b (else modem_a); APR on apr_audio_svc (core state poll); AFE SEC_MI2S_RX (0x1002, IBIT 1.536 MHz, I2S SD0 48 kHz 16-bit stereo) <- ADM COPP (NULL topology) <- ASM session 1 (16-bit PCM writes, 8 x 20 ms periods from the pool, apps SMMU SID 0x41 identity, msw = SID low bits); MAX98927/MAX98937 amp at QUP0 SE1 I2C 0x3a (reset GPIO 95, vendor register maps, safe gains: no DSM); SEC_MI2S pins GPIO 125-128 function 2. sweet_i2c1 gets 16-bit register read/write. /dev/topaz-audio (+ /dev/redwood-audio of 0935) is made before the ADSP is up and drops frames while audio is off. On by default; kill switch adsp=0 or laurelaudio=0; one line LAUREL AUDIO: on|off: reason, after a self-check (path start with silence, the DSP must return 2 periods in 500 ms).
+laurel 2500: speaker audio on the Mi A3. TopazAudio keeps the ADSP PAS 1 boot, SMP2P, GLINK lpass edge, QRTR + pd-mapper of topaz; the Mi A3 firmware (ADSP.VT.5.4-00283-NICOBAR, modem partition) is Elite/APR, not AudioReach/GPR, so the GPR/WCD937x/SoundWire half is replaced: carveout 0x55300000+0x2200000; a FAT16 reader for image/adsp.* in modem_b (else modem_a); APR on apr_audio_svc (core state poll); AFE SEC_MI2S_RX (0x1002, IBIT 1.536 MHz, I2S SD0 48 kHz 16-bit stereo) <- ADM COPP (NULL topology) <- ASM session 1 (16-bit PCM writes, 8 x 20 ms periods from the pool, apps SMMU SID 0x41 identity, msw = SID low bits); MAX98927/MAX98937 amp at QUP0 SE1 I2C 0x3a (reset GPIO 95, vendor register maps, safe gains: no DSM); SEC_MI2S pins GPIO 125-128 function 2. sweet_i2c1 gets 16-bit register read/write. /dev/topaz-audio (+ /dev/redwood-audio of 0935) is made before the ADSP is up and drops frames while audio is off. On by default; kill switch adsp=0 or laurelaudio=0; one line LAUREL AUDIO: on|off: reason, after a self-check (path start with silence, the DSP must return 2 periods in 500 ms). Review fixes (2026-11-01): ADSP-visible buffers (metadata, periods) checked below 4 GiB, core-poll token 0x40000000, volume re-applied after the self-check, a failed period send is re-queued, devfs order rule, idle wait 200 ms after 1 s without GLINK traffic, auth_and_reset duration logged; TODO: own FAT reader goes when area E 2400 is merged.
 
 diff --git a/bsd/dev/sweet_i2c1.c b/bsd/dev/sweet_i2c1.c
 index 8037ad6..1b58239 100644
@@ -56,7 +56,7 @@ index 8037ad6..1b58239 100644
  sweet_i2c1_init(void)
  {
 diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
-index 6bfe1a2..7d002e1 100644
+index 6bfe1a2..b806344 100644
 --- a/iokit/Kernel/arm/TopazAudio.cpp
 +++ b/iokit/Kernel/arm/TopazAudio.cpp
 @@ -1,17 +1,19 @@
@@ -108,11 +108,17 @@ index 6bfe1a2..7d002e1 100644
  #define ITEM_SMP2P_OUT      429                 /* apps -> adsp (DT qcom,smem = <443 429>: in, out) */
  #define ITEM_SMP2P_IN       443                 /* adsp -> apps */
  #define ITEM_ADSP_CRASH     423
-@@ -163,6 +163,225 @@ crash_reason(void)
+@@ -163,6 +163,231 @@ crash_reason(void)
  	LOG("crash reason (%u): %s", ITEM_ADSP_CRASH, msg);
  }
  
 +/* ---------------------------------------------------------------- firmware (laurel: FAT16 modem partition) */
++
++/*
++ * TODO(area E 2400): when 2400 (FAT index of modem_<active slot> in TopazModem) is merged, delete
++ * fw_mount/fw_read/fw_size here and call topaz_part_fw_size/read again (with 2400, topaz_soc_map
++ * already fails when that index fails). Until then this reader is the only one on laurel-int-1.
++ */
 +
 +/*
 + * The Mi A3's ADSP image is image/adsp.mdt + adsp.b00..b27 in the stock modem partition (FAT16,
@@ -334,7 +340,7 @@ index 6bfe1a2..7d002e1 100644
  /* ---------------------------------------------------------------- PAS load */
  
  static bool
-@@ -174,7 +393,7 @@ phdr_loadable(const struct elf32_phdr *p)
+@@ -174,7 +399,7 @@ phdr_loadable(const struct elf32_phdr *p)
  static bool
  adsp_load(void)
  {
@@ -343,7 +349,7 @@ index 6bfe1a2..7d002e1 100644
  	uint8_t *mdt = NULL, *meta;
  	uint64_t meta_pa = 0, st, res = 0;
  	uint32_t min_addr = 0xFFFFFFFFu, max_addr = 0, hash_idx = 0xFFFFFFFFu;
-@@ -182,7 +401,7 @@ adsp_load(void)
+@@ -182,7 +407,7 @@ adsp_load(void)
  	char name[32];
  
  	if (mdt_size <= 0 || mdt_size > 0x100000 || (mdt = (uint8_t *)IOMalloc((vm_size_t)mdt_size)) == NULL ||
@@ -352,7 +358,18 @@ index 6bfe1a2..7d002e1 100644
  		LOG("image/adsp.mdt: not readable (%lld bytes)", mdt_size);
  		goto out;
  	}
-@@ -225,8 +444,8 @@ adsp_load(void)
+@@ -216,6 +441,10 @@ adsp_load(void)
+ 		uint64_t hsz = eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(struct elf32_phdr);
+ 		uint64_t meta_size = hsz + ph[hash_idx].p_filesz;
+ 		meta = (uint8_t *)topaz_pool_alloc(meta_size, &meta_pa);
++		if (meta != NULL && meta_pa + meta_size > 0x100000000ull) {
++			LOG("metadata at %llx: not below 4 GiB", meta_pa);    /* TrustZone takes a 32-bit-safe PA */
++			goto out;
++		}
+ 		if (meta == NULL) {
+ 			LOG("no pool memory for %llu bytes of metadata", meta_size);
+ 			goto out;
+@@ -225,8 +454,8 @@ adsp_load(void)
  			memcpy(meta + hsz, mdt + ph[hash_idx].p_offset, ph[hash_idx].p_filesz);
  		} else {
  			snprintf(name, sizeof(name), "image/adsp.b%02u", hash_idx);
@@ -363,7 +380,7 @@ index 6bfe1a2..7d002e1 100644
  				LOG("%s: hash segment not readable", name);
  				goto out;
  			}
-@@ -261,8 +480,8 @@ adsp_load(void)
+@@ -261,8 +490,8 @@ adsp_load(void)
  			uint8_t *dst = carve + (ph[i].p_paddr - min_addr);
  			if (ph[i].p_filesz != 0) {
  				snprintf(name, sizeof(name), "image/adsp.b%02u", i);
@@ -374,13 +391,23 @@ index 6bfe1a2..7d002e1 100644
  					loaded = false;
  					break;
  				}
-@@ -1115,672 +1334,772 @@ qrtr_poll(void)
+@@ -278,8 +507,9 @@ adsp_load(void)
+ 		}
+ 		LOG("segments loaded");
+ 
++		unsigned auth_t = ms();
+ 		st = topaz_scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, ADSP_PAS_ID, 0, 0, &res);
+-		LOG("PAS auth_and_reset: ret=%llx res=%llx", st, res);
++		LOG("PAS auth_and_reset: ret=%llx res=%llx, %u ms (no CX/XO/crypto proxy votes sent)", st, res, ms() - auth_t);
+ 		ok = st == 0 && res == 0;
+ 		if (ok) {
+ 			goto out;
+@@ -1115,672 +1345,775 @@ qrtr_poll(void)
  	}
  }
  
 -/* ---------------------------------------------------------------- GPR (AudioReach) */
-+/* ---------------------------------------------------------------- APR (laurel: Elite ADSP firmware) */
- 
+-
 -#define GCHAN               "adsp_apps"
 -#define GPR_DOMAIN_ADSP     2
 -#define GPR_DOMAIN_APPS     3
@@ -390,7 +417,8 @@ index 6bfe1a2..7d002e1 100644
 -#define GPR_BASIC_RSP_RESULT        0x02001005u
 -#define APM_CMD_GET_SPF_STATE       0x01001021u
 -#define APM_CMD_RSP_GET_SPF_STATE   0x02001007u
--
++/* ---------------------------------------------------------------- APR (laurel: Elite ADSP firmware) */
+ 
 -struct gpr_hdr {
 -	uint32_t word0;                         /* version:4 hdr_size:4 (words) pkt_size:24 (bytes) */
 -	uint8_t  dest_domain, src_domain;
@@ -413,6 +441,7 @@ index 6bfe1a2..7d002e1 100644
 +#define APR_BASIC_RSP       0x000110E8u
 +#define AVCS_GET_STATE      0x0001290Cu
 +#define AVCS_GET_STATE_RSP  0x0001290Du
++#define CORE_TOKEN          0x40000000u         /* core polls: apr_call tokens stay below 0x01000000, writes have bit 31 */
 +
 +struct apr_hdr {
 +	uint16_t hdr_field, pkt_size;
@@ -479,7 +508,7 @@ index 6bfe1a2..7d002e1 100644
 +	if (apr_event(h->src_svc, h->opcode, h->token, p, plen)) {
 +		return;
 +	}
-+	if (h->opcode == APR_BASIC_RSP && plen >= 8 && p[0] == AVCS_GET_STATE) {
++	if (h->token == CORE_TOKEN && h->opcode == APR_BASIC_RSP) {
 +		return;                                 /* the core service is not ready yet */
 +	}
 +	if (apr_other++ < 16) {
@@ -503,7 +532,10 @@ index 6bfe1a2..7d002e1 100644
 -		return;
 +	if (len > sizeof(buf) - sizeof(*h)) {
 +		return false;
-+	}
+ 	}
+-	uint32_t hlen = ((h->word0 >> 4) & 0xF) * 4;
+-	uint32_t p0 = len >= hlen + 4 ? *(const uint32_t *)(data + hlen) : 0;
+-	uint32_t p1 = len >= hlen + 8 ? *(const uint32_t *)(data + hlen + 4) : 0;
 +	bzero(buf, sizeof(*h));
 +	h->hdr_field = APR_HDR_FIELD;
 +	h->pkt_size = (uint16_t)(sizeof(*h) + len);
@@ -517,10 +549,7 @@ index 6bfe1a2..7d002e1 100644
 +	h->opcode = opcode;
 +	if (len != 0) {
 +		memcpy(buf + sizeof(*h), payload, len);
- 	}
--	uint32_t hlen = ((h->word0 >> 4) & 0xF) * 4;
--	uint32_t p0 = len >= hlen + 4 ? *(const uint32_t *)(data + hlen) : 0;
--	uint32_t p1 = len >= hlen + 8 ? *(const uint32_t *)(data + hlen + 4) : 0;
++	}
 +	return glink_send(ACHAN, buf, (uint32_t)sizeof(*h) + len);
 +}
  
@@ -612,7 +641,7 @@ index 6bfe1a2..7d002e1 100644
 +	if (core_asks == 0 || ms() - core_last_ask >= 200) {
 +		core_last_ask = ms();
 +		core_asks++;
-+		(void)apr_send(APR_SVC_CORE, 0, 0x100, AVCS_GET_STATE, NULL, 0);
++		(void)apr_send(APR_SVC_CORE, 0, CORE_TOKEN, AVCS_GET_STATE, NULL, 0);
  	}
  }
  
@@ -882,17 +911,15 @@ index 6bfe1a2..7d002e1 100644
 +struct afe_i2s { uint32_t version; uint16_t bits, lines, stereo, ws_src; uint32_t rate; uint16_t format, reserved; } __attribute__((packed));
 +
 +static bool afe_clock_on, afe_started;
- 
--static volatile uint8_t *lpass, *gpio92;
--static uint32_t swr_id;
++
 +static bool
 +afe_svc_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
 +{
 +	uint8_t m[16 + sizeof(struct afe_param) + 32];
 +	struct afe_param *p = (struct afe_param *)(m + 16);
  
--static void
--lw(uint32_t pa, uint32_t v)
+-static volatile uint8_t *lpass, *gpio92;
+-static uint32_t swr_id;
 +	bzero(m, sizeof(m));
 +	*(uint32_t *)m = (uint32_t)sizeof(*p) + size;       /* payload size; address 0, handle 0: in band */
 +	p->module = module;
@@ -901,7 +928,9 @@ index 6bfe1a2..7d002e1 100644
 +	memcpy(m + 16 + sizeof(*p), data, size);
 +	return cmd(what, APR_SVC_AFE, 0, AFE_SVC_SET_PARAM, m, 16 + (uint32_t)sizeof(*p) + size, 0);
 +}
-+
+ 
+-static void
+-lw(uint32_t pa, uint32_t v)
 +static bool
 +afe_port_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
  {
@@ -989,7 +1018,9 @@ index 6bfe1a2..7d002e1 100644
 +afe_off(void)
 +{
 +	uint16_t stop[2] = { AFE_PORT, 0 };
-+
+ 
+-static int vol_db = -30;
+-static bool codec_up, ports_up, amp_init;
 +	if (afe_started) {
 +		(void)cmd("SEC_MI2S_RX stop", APR_SVC_AFE, 0, AFE_PORT_STOP, stop, sizeof(stop), 0);
 +		afe_started = false;
@@ -999,9 +1030,7 @@ index 6bfe1a2..7d002e1 100644
 +		afe_clock_on = false;
 +	}
 +}
- 
--static int vol_db = -30;
--static bool codec_up, ports_up, amp_init;
++
 +/* ---------------------------------------------------------------- ADM path + ASM stream */
  
  /*
@@ -1570,11 +1599,11 @@ index 6bfe1a2..7d002e1 100644
 -	} else if (playing && now - last_write >= quiet) {
 -		stream_stop();
 +		return;
- 	}
--	if (playing && vol_applied != vol_gen) {
++	}
 +	if (!playing) {
 +		return;
-+	}
+ 	}
+-	if (playing && vol_applied != vol_gen) {
 +	if (vol_applied != vol_gen) {
  		apply_volume();
 +		amp_power(gain_q15 != 0);
@@ -1584,7 +1613,9 @@ index 6bfe1a2..7d002e1 100644
 +	for (uint32_t i = 0; i < PERIODS; i++) {
 +		if ((back & (1u << i)) != 0) {
 +			period_fill(i);
-+			(void)period_send(i);
++			if (!period_send(i)) {
++				returned |= 1u << i;                    /* GLINK queue full: again at the next poll */
++			}
 +		}
 +	}
 +	if (now - ls >= quiet) {
@@ -1655,14 +1686,17 @@ index 6bfe1a2..7d002e1 100644
  	if (!playing) {
  		thread_wakeup((event_t)&stream_wake_flag);
  	}
-@@ -1856,99 +2175,177 @@ topaz_audio_dev_alias(int major __unused)
+@@ -1856,122 +2189,222 @@ topaz_audio_dev_alias(int major __unused)
  {
  }
  
 +/*
 + * Made early, before the ADSP is up: the HAL plug-in opens the device once, when mediaserverd
 + * loads it. Until the speaker path is up (or if it never comes up) writes are taken and dropped.
-+ * The audio thread calls this after the UFS wait; devfs may still be starting then: retried.
++ * Order rule: devfs_make_node() before vfsinit() does not fail, it panics (dev_finddir reads
++ * dev_root->de_dnp). So this runs only on the audio thread after topaz_soc_map(): that waits for
++ * sweet_ufs, which setconf() starts after vfsinit(). Never call it from topaz_audio_init()
++ * (AppleCLCD::start can run before vfsinit). The retry only covers a failed node allocation.
 + */
  static void
  audio_dev_init(void)
@@ -1714,6 +1748,7 @@ index 6bfe1a2..7d002e1 100644
 +	}
 +	path_stop();
 +	gain_q15 = 32767;
++	vol_applied = ~0u;                                  /* a volume set during the check is applied at the first start */
 +	return ok;
 +}
 +
@@ -1732,7 +1767,7 @@ index 6bfe1a2..7d002e1 100644
 -	unsigned last_status = 0;
 -	bool codec_tried = false;
 +	uint32_t st, done_ms = 0;
-+	unsigned last_status = 0, up_since = 0;
++	unsigned last_status = 0, up_since = 0, last_busy = 0;
 +	bool tried = false, adsp_up = false;
  
  	if (!topaz_soc_map()) {
@@ -1823,6 +1858,10 @@ index 6bfe1a2..7d002e1 100644
 +				say_off(why);
 +			} else if ((periods = (uint8_t *)topaz_pool_alloc(PERIODS * 4096, &periods_pa)) == NULL || ring == NULL) {
 +				say_off("no memory for the periods");
++			} else if (periods_pa + PERIODS * 4096 > 0x100000000ull) {
++				snprintf(why, sizeof(why), "periods at 0x%llx: the ADSP needs a PA below 4 GiB (the SID is in the upper word)",
++				    periods_pa);
++				say_off(why);
 +			} else if (!topaz_smmu_identity(AUDIO_SID, 0, "audio")) {
 +				say_off("apps SMMU: no identity context for the audio stream 0x41");
 +			} else if (!path_check(&done_ms)) {
@@ -1854,13 +1893,17 @@ index 6bfe1a2..7d002e1 100644
  			glink_summary();
  		}
  		if (busy) {
++			last_busy = ms();
  			IODelay(200);
 -		} else if (stream_ready && !playing) {
+-			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, 20, 1000 * NSEC_PER_USEC);
 +		} else if (!playing && tried) {
- 			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, 20, 1000 * NSEC_PER_USEC);
++			/* idle: 20 ms for 1 s after GLINK traffic, then 200 ms (5 wakeups/s); a write wakes us at once */
++			uint32_t wait = ms() - last_busy < 1000 ? 20 : 200;
++			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, wait, 1000 * NSEC_PER_USEC);
  			thread_block(THREAD_CONTINUE_NULL);
  		} else {
-@@ -1956,22 +2353,31 @@ topaz_audio_thread(void *arg __unused, wait_result_t wr __unused)
+ 			IOSleep(2);
  		}
  	}
  out:
@@ -1885,6 +1928,8 @@ index 6bfe1a2..7d002e1 100644
 +	(void)PE_parse_boot_argn("adsp", &on, sizeof(on));
 +	(void)PE_parse_boot_argn("laurelaudio", &on2, sizeof(on2));
 +	killed = on == 0 || on2 == 0;
++	/* CPU only (writer -> ring -> period_fill copies into the pool): may be above 4 GiB. What the ADSP
++	 * reads is in the pool (metadata, periods), the carve-out or SMEM, all below 4 GiB (checked). */
 +	ring = (int16_t *)IOMallocZero(RING_FRAMES * 4);
 +	ring_lock = IOSimpleLockAlloc();
  	if (kernel_thread_start(topaz_audio_thread, NULL, &thread) == KERN_SUCCESS) {

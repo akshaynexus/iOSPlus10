@@ -3890,3 +3890,16 @@ Details and expected lines: `docs/laurel_sprout/wifi.md`.
 - [I] Risks: PAS without the CX/crypto proxy votes (topaz's modem boots without them); the ADSP may wait for servreg QMI
   that nobody serves (then `APR core service never said READY`); identity SMMU + msw 1 is topaz-woa's way (HackiOS maps an
   IOVA instead); the pool at 0xE0000000 could hold Mu runtime data (bank C top-down allocations).
+
+## Mi A3: area F review fixes, rebased on laurel-int-1 (2026-11-01, area F agent)
+- [V doc] After area A, XNU is at 0xE1004000-0x1AD004000 (3264 MiB, most above 4 GiB); the TopazModem pool 0xE0000000 +
+  16 MiB is in Mu "Pool RAM" (reserved). Rule for the ADSP: every buffer it reads needs a PA below 4 GiB (SID bits in
+  the upper address word). 2500 now checks the metadata and the periods; the ring, FAT buffers and APR packets are CPU
+  only. Kernel heap memory must never be given to the ADSP.
+- [V code, review] devfs_make_node() before vfsinit() panics (dev_finddir reads dev_root->de_dnp); the audio thread is
+  safe only because it waits for sweet_ufs (setconf, after vfsinit). Comment fixed in 2500.
+- Fixes in 2500: core-poll token 0x40000000, volume re-applied after the self-check, failed period sends re-queued,
+  idle wait 200 ms after 1 s without GLINK traffic, auth_and_reset duration logged. root-audio.sh: fsck verify gate,
+  toolchain-missing skip, Linux-only --image. Own FAT reader stays (TODO) until area E's 2400 is merged.
+- Build on laurel-int-1: 228 patches apply, no warnings in the two files, 0 LSE, kernel sha256 1fc7d60f...;
+  RedwoodAudio sha256 33449356... (unchanged). UEFI image not rebuilt here (needs the Mu 0101 FD of area A for DRAM=auto).
