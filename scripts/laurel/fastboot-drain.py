@@ -20,6 +20,8 @@ import argparse, ctypes, fcntl, glob, os, struct, sys, time
 USBDEVFS_BULK = 0xC0185502            # _IOWR('U', 2, struct usbdevfs_bulktransfer), 64-bit
 USBDEVFS_CLAIMINTERFACE = 0x8004550F  # _IOR('U', 15, unsigned int)
 USBDEVFS_RELEASEINTERFACE = 0x80045510
+CHUNK = 16384                        # bulk OUT write size during download
+MAX_DOWNLOAD = 805306368            # Mi A3 ABL max-download-size (clean session, 2026-10-31)
 
 
 def find(serial):
@@ -127,14 +129,17 @@ def main():
             rc = st != 'OKAY'
         elif c[0] == 'flash' and len(c) == 3:
             data = open(c[2], 'rb').read()
-            st, txt = command(fd, ep_in, ep_out, 'getvar:max-download-size')
-            if st == 'OKAY' and len(data) > int(txt, 0):
-                sys.exit(f'fastboot-drain: {c[2]} is {len(data)} bytes, more than max-download-size {txt}')
+            # no getvar: on Xiaomi ABLs getvar leaves the bootloader in a bad state (topaz NOTES.md:38
+            # "NEVER fastboot getvar"); the limit was read once in a clean session (805306368 bytes)
+            if len(data) > MAX_DOWNLOAD:
+                sys.exit(f'fastboot-drain: {c[2]} is {len(data)} bytes, more than max-download-size {MAX_DOWNLOAD}')
             st, txt = command(fd, ep_in, ep_out, f'download:{len(data):08x}')
             if st != 'DATA' or int(txt, 16) != len(data):
                 sys.exit(f'fastboot-drain: download refused: {st} {txt}')
-            for off in range(0, len(data), 1 << 20):
-                if bulk(fd, ep_out, data[off:off + (1 << 20)], 30000) is None:
+            # 16 KiB writes, as the stock fastboot client on Linux (usbfs bulk size): with 1 MiB writes
+            # this ABL stopped taking data at exactly 16 MiB and reset (2026-10-31, twice)
+            for off in range(0, len(data), CHUNK):
+                if bulk(fd, ep_out, data[off:off + CHUNK], 10000) is None:
                     sys.exit(f'fastboot-drain: upload stopped at {off}')
             r = bulk(fd, ep_in, 256, 30000)
             if r is None or r[:4] != b'OKAY':
