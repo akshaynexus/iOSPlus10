@@ -1,0 +1,17 @@
+laurel mu 0002: NegroniBootMemoryDxe logs each DT memory bank (NEGRONIMEM: DT memory bank 0x..-0x..), so the UEFI screen
+log shows the DDR banks ABL wrote into the live FDT (the Mi A3 has 6 GB; the 2026-11-01 boot showed only the holes it added).
+Applied to external/Mu-Silicium-negroni by scripts/laurel/mu-build.sh (shared with negroniPkg, harmless there).
+diff --git a/Platforms/OnePlus/negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.c b/Platforms/OnePlus/negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.c
+index e1a1c298..affd9d85 100644
+--- a/Platforms/OnePlus/negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.c
++++ b/Platforms/OnePlus/negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.c
+@@ -184,6 +184,9 @@ AddMemory (
+   }
+ 
+   DEBUG ((DEBUG_ERROR, "NEGRONIMEM: DT has %u memory ranges and %u reserved ranges\n", (UINT32)BankCount, (UINT32)ReservedCount));
++  for (Index = 0; Index < BankCount; Index++) {
++    DEBUG ((DEBUG_ERROR, "NEGRONIMEM: DT memory bank 0x%lx-0x%lx\n", Banks[Index].Base, Banks[Index].End - 1));
++  }
+   if (BankCount == 0) {
+     return;
+   }

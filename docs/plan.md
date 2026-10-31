@@ -482,8 +482,16 @@ hand-off); `scripts/laurel/mkadt.py --boot silver --darwinboot`; `scripts/laurel
 FAT); `scripts/laurel/uefi-image.sh` (`make laurel-uefi-image [MU_ONLY=1]`): boot image v2 with
 gzip(BootShim + FD) as kernel, the payload FAT as ramdisk, stock DTB. Images: `out/laurel/uefi/laurel-mu-only-boot.img`
 (2.5 MB, Mu alone) and `out/laurel/uefi/laurel-uefi-boot.img` (52.9 MB, full chain). Kernel 213 patches, 0 LSE/RCpc.
-NOT BOOTED: the phone was not on USB.
-Next (owner): phone into fastboot (Power+VolDown or `adb reboot bootloader`), then
+First boot 02:16 (Mu-only image) [V photo]: ABL inflates and starts Mu; 11 drivers load, display console works,
+NEGRONIMEM reads the live FDT (3 memory banks, 21 reserved ranges, adds 0x1D000000 bytes of holes below 4 GiB),
+RamManagerDxe maps the RAM partitions (0x45700000.. holes and 0xC0000000-0x1C0000000). Then a synchronous exception
+in the Qualcomm DDRInfoDxe (called by SmBiosTableDxe): data abort, translation fault level 3, FAR 0x0447D220.
+Fix 02:21 [V build]: upstream laurel_sproutPkg lacks the "MCCC_MCCC_MSTR" 0x0447D000 MMIO region every other
+NicobarPkg device maps (ginkgo, willow, lime, fog, ...); `patches/laurel/mu/0001` adds it. `0002` logs each DT memory
+bank (`NEGRONIMEM: DT memory bank`) to confirm the 6 GB layout; `uefi-image.sh` pads the Mu-only ramdisk to 4096 bytes
+(the 94-byte cpio gave "initrd ... is not a whole number of sectors") and names it `laurel-mu-only-boot.img`.
+Both images rebuilt 02:23. NOT BOOTED since the fix: the phone sits in the Mu ASSERT, not on USB.
+Next (owner): phone into fastboot (Power+VolDown, hold until the fastboot screen), then
 `scripts/bg.sh laurel-flash sh -c 'BOOT=reboot scripts/laurel/flash-boot.sh out/laurel/uefi/laurel-mu-only-boot.img'`;
 photo of the Mu screen (step 1). Then the same with `laurel-uefi-boot.img` + `scripts/laurel/boot-test.sh
 IMG=out/laurel/uefi/laurel-uefi-boot.img NOFLASH=1` (usblog is up): UniXNU menu, `DARWINBOOT: ... pa=0x81004000`, green

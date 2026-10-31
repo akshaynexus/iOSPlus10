@@ -7,7 +7,7 @@
 #   DRAM=BASE:SIZE (default 0x81000000:0x30000000 = the DarwinBoot window: Mu "Kernel RAM" 0x81000000 + 0x3F000000,
 #     window at 0x81004000 = the shim path's __TEXT address; patches/laurel/mu/0001)
 #   CPUS=N (XNU cpus= boot-arg, default 8)   SIZE_MIB=48 (payload FAT)
-# Output: out/laurel/uefi/laurel-uefi-boot.img (+ laurel.adt, payload.img, kernel.gz, cmdline.txt)
+# Output: out/laurel/uefi/laurel-uefi-boot.img (+ laurel.adt, payload.img, kernel.gz, cmdline.txt); MU_ONLY=1: laurel-mu-only-boot.img
 # Flash: scripts/bg.sh laurel-flash sh -c 'BOOT=reboot scripts/laurel/flash-boot.sh out/laurel/uefi/laurel-uefi-boot.img'
 #
 # Layout (docs/laurel_sprout/uefi-boot.md): boot image v2 with the stock header values and the stock DTB (as
@@ -46,7 +46,10 @@ gzip -9 -n -c "$W/kernel.bin" > "$W/kernel.gz"
 if [ "${MU_ONLY:-0}" = 1 ]; then
   rd=$W/ramdisk-empty.cpio.gz
   (d=$(mktemp -d); cd "$d" && find . | cpio -o -H newc --quiet | gzip -9 -n > "$rd"; rm -rf "$d")
-  printf '%s\n' "(Mu alone, no payload)" > "$W/cmdline.txt"
+  # NegroniBootMemoryDxe publishes the ramdisk as a 512-byte-sector block device and refuses an odd size
+  # ("initrd ... is not a whole number of sectors" on the 2026-11-01 boot, 94 bytes): pad to one page.
+  truncate -s 4096 "$rd"
+  IMG=$W/laurel-mu-only-boot.img
 else
   [ -f "$KERNEL" ] || { echo "uefi-image: missing kernel $KERNEL (scripts/laurel/kernel-linux.sh)" >&2; exit 1; }
   python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot silver --dram "$DRAM" --darwinboot
@@ -54,6 +57,7 @@ else
     --cmdline "$CMDLINE" --size-mib "$SIZE_MIB" --timeout 3
   printf '%s\n' "$CMDLINE" > "$W/cmdline.txt"
   rd=$W/payload.img
+  IMG=$W/laurel-uefi-boot.img
 fi
 
 # 3. stock DTB and header values (header v2, as the stock image and scripts/laurel/shim.sh)
@@ -63,6 +67,6 @@ unpack_bootimg --boot_img "$STOCK" --out "$W/stockboot" > "$W/stockboot.txt"
 mkbootimg --header_version 2 --kernel "$W/kernel.gz" --ramdisk "$rd" --dtb "$W/stockboot/dtb" \
   --pagesize 4096 --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 --tags_offset 0x100 \
   --dtb_offset 0x1f00000 --os_version 11.0.0 --os_patch_level 2022-08 --cmdline "console=null" \
-  -o "$W/laurel-uefi-boot.img"
-ls -l "$W/laurel-uefi-boot.img" "$W/kernel.gz" "$rd"
-echo "uefi-image: $W/laurel-uefi-boot.img (FD $fdlen bytes$([ "${MU_ONLY:-0}" = 1 ] && echo ', Mu alone' || echo ", kernel $(basename "$KERNEL"), cpus=$CPUS, dram $DRAM, boot CPU Silver 0x0"))"
+  -o "$IMG"
+ls -l "$IMG" "$W/kernel.gz" "$rd"
+echo "uefi-image: $IMG (FD $fdlen bytes$([ "${MU_ONLY:-0}" = 1 ] && echo ', Mu alone' || echo ", kernel $(basename "$KERNEL"), cpus=$CPUS, dram $DRAM, boot CPU Silver 0x0"))"

@@ -139,5 +139,32 @@ image is 2,535,424 bytes.
 
 ## Status
 
-- 2026-11-01 02:10 [V]: everything builds; both images exist. NOT BOOTED: the phone was not on USB. Next: owner puts
-  the phone in fastboot, `make laurel-flash-uefi` with the Mu-only image first, photo; then the full image.
+- 2026-11-01 02:10 [V]: everything builds; both images exist.
+- 02:16 first Mu-only boot [V photo]: the ABL inflates gzip(BootShim + FD) and Mu runs (so the v2 boot image recipe
+  with the stock DTB works). Loaded: RngDxe, DDRInfoDxe, SimpleTextInOutSerial, ConPlatformDxe, ConSplitterDxe,
+  GraphicsConsoleDxe, NegroniBootMemoryDxe, DarwinBoot.efi, RamManagerDxe, SmbiosDxe, SmBiosTableDxe; the display
+  console works. NEGRONIMEM: device tree at 0x454FD000 (502099 bytes), 3 memory ranges, 21 reserved ranges, system
+  memory added 0x57E00000-0x5BBFFFFF, 0x5D000000-0x5E3FFFFF, 0x65E00000-0x7CBFFFFF, 0x80000000-0x80FFFFFF
+  (0x1D000000 bytes). RamManagerDxe (RAM partition protocol, gaps of the EFI memory map): 0x45700000-0x45CF0000,
+  0x45D00000-0x45F20000, 0x45F40000-0x46000000, 0x46200000-0x4AB00000, 0x57D00000-0x57E00000, 0x5E400000-0x5F800000,
+  0x5FF8C000-0x5FF8D000, 0x5FFD0000-0x5FFF7000, 0x60000000-0x62000000, 0x65D00000-0x65E00000, 0xC0000000-0x1C0000000.
+  Then `Synchronous Exception at 0x6288CF64` in DDRInfoDxe.dll (Qualcomm binary, NicobarLAA RELEASE), called from
+  SmBiosTableDxe (Silicium) <- DxeCore: ESR 0x96000007 (data abort, translation fault level 3), FAR 0x0447D220,
+  X0 0x46008170 (SMEM); ASSERT [ArmCpuDxe] CpuExceptionHandlerLib.c(438), Mu stops.
+- Fix [V source]: upstream `laurel_sproutPkg` MemoryMapLib has no "MCCC_MCCC_MSTR" region; ginkgo, willow, lime, fog,
+  spes, tapas, citrus, veux, gta4l map it at 0x0447D000 (4 KiB MMIO). 0x0447D220 is inside it. `patches/laurel/mu/0001`
+  adds the region. No change to SmBiosTableDxe/DDRInfoDxe.
+- RAM layout [I from the two lists]: RamManager maps a RAM partition hole only where the EFI memory map has nothing, so
+  its lists give the partitions: bank A 0x40000000-0x7CC00000 (its last hole ends at 0x65E00000 where NEGRONIMEM's piece
+  starts; 0x7CC00000-0x80000000 was mapped by nobody = outside every bank), bank B 0x80000000-0xC0000000 (NEGRONIMEM
+  added 0x80000000-0x81000000, "Kernel RAM" covers the rest), bank C 0xC0000000-0x1C0000000. Sum 0x3CC00000 + 1 GiB +
+  4 GiB = 5.95 GiB = the 6 GB Mi A3. So "Kernel RAM" 0x81000000-0xC0000000 lies in bank B and the DarwinBoot window
+  0x81004000 is valid; the 4 GiB above 0xC0000000 is conventional memory after it in map order (DarwinBoot takes the
+  first run that fits, so the window stays at 0x81004000). `patches/laurel/mu/0002` prints `NEGRONIMEM: DT memory bank
+  0x..-0x..` per bank so the next photo confirms this.
+- `NEGRONIMEM: initrd 0x456FE000-0x456FE05E is not a whole number of sectors`: the Mu-only image's empty cpio (94 bytes)
+  is not a 512 multiple; expected, harmless (no payload wanted). `uefi-image.sh` now pads it to 4096 bytes and writes the
+  Mu-only image to `laurel-mu-only-boot.img` (before, both modes wrote `laurel-uefi-boot.img`).
+- 02:23 [V]: Mu rebuilt (both patches apply, 52 images, 15 s), both images rebuilt. NOT BOOTED since the fix. Next:
+  owner puts the phone in fastboot (Power+VolDown), flash the Mu-only image, photo: expect the bank lines, no
+  exception, the Mu front page; then the full image.

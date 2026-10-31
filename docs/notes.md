@@ -3591,3 +3591,20 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   Silver boot CPU is untested with this kernel (0141 comment "gold = boot, pset0"); (c) GICR of the secondaries: the shim
   pre-set IGROUPR0/priorities/enables for Gold 0x101-0x103, the kernel's pe_fiq.c only does WAKER; if secondaries do not
   come alive, port the shim's gold_gicr_prepare into a kernel patch (2004 keeps the boot going with dead cores).
+
+## Mi A3: first Mu boot, DDRInfoDxe fault = missing MCCC_MCCC_MSTR region (2026-11-01 02:25, UEFI agent, branch laurel-sprout)
+- [V photo 02:16, Mu-only image] The Mi A3 ABL boots gzip(BootShim + FD) in a v2 boot image with the stock DTB: Mu runs,
+  console on the panel, NEGRONIMEM reads the live FDT (3 memory banks, 21 reserved ranges), RamManagerDxe maps the RAM
+  partitions (incl. 0xC0000000-0x1C0000000). Then `Synchronous Exception` in the Qualcomm DDRInfoDxe (from SmBiosTableDxe):
+  ESR 0x96000007 = data abort, translation fault level 3, FAR 0x0447D220, X0 = SMEM 0x46008170.
+- [V source] Cause: `Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib` (upstream Mu-Silicium) has no
+  "MCCC_MCCC_MSTR" 0x0447D000 + 0x1000 MMIO region; every other NicobarPkg/trinket device (ginkgo, willow, lime, fog, spes,
+  tapas, citrus, veux, gta4l) maps it. DDRInfoDxe reads the MCCC master block for the DDR type/frequency. Fix:
+  `patches/laurel/mu/0001` adds the region (upstream-worthy). Lesson: when a Qualcomm binary DXE faults with a FAR in the
+  0x0xxxxxxx range, diff the device's MemoryMapLib against its SoC siblings first.
+- [I] RAM banks from the two lists (details in docs/laurel_sprout/uefi-boot.md): 0x40000000-0x7CC00000, 0x80000000-0xC0000000,
+  0xC0000000-0x1C0000000 = 5.95 GiB. "Kernel RAM" 0x81000000-0xC0000000 is real DDR. `patches/laurel/mu/0002` prints each
+  DT bank (`NEGRONIMEM: DT memory bank`) to confirm on the next boot.
+- `uefi-image.sh`: MU_ONLY output is now `laurel-mu-only-boot.img` (both modes wrote `laurel-uefi-boot.img` before), and
+  the empty cpio is padded to 4096 bytes (NegroniBootMemoryDxe needs a 512 multiple).
+- `make laurel-mu` already runs in tmux (`scripts/bg.sh laurel-mu`); do not wrap it in bg.sh again ("session already running").
