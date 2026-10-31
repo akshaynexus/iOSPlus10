@@ -1,0 +1,1675 @@
+laurel 2301: battery gauge + charger on the PMI632 over SPMI (new bsd/dev/laurel_pmi632.c). SweetBattery: the topaz SM5602/bq2589x I2C path (chips the Mi A3 does not have) and the dead PM6150 reader are replaced by laurel_pmi632_sample(): QG voltage/current, ADC5 battery NTC (100k table), SoC from the saved SDAM value or the QG PON OCV (Sunwoda 25 C OCV table) + coulomb count + rest-OCV drift fix + "terminated" = 100 %, saved to our SDAM record once a minute; SMB5 input limit from APSD/Type-C Rp (HW_AUTO again on unplug or without a limit), software JEITA zones for FCC/FV (Mi A3 DT values) with the warm-zone input suspend above FV + 50 mV, every write read back. Charger control only with a working battery NTC and the hardware JEITA hard limits at the Linux 0/60 C codes (written when not); no good NTC sample for 30 s = 500 mA at 4100 mV and control off; boot FCC/FV written back when control turns off on a write failure; FCC <= 500 mA at unplug. Review fixes 2026-11-01 (B1, M1-M4, m4, m5). Safety re-check fixes: the NTC watchdog runs before any early return of the sample and from its own 10 s thread_call (independent of SweetBattery); every control-off writes 500 mA / 4100 mV first (boot limits only when not above that), also when control cannot turn on with SMB5 ours; a USB input suspend of an earlier boot is released at start; hard-limit accept window only on the safe side. Unattended-safety follow-up: a failed safe write is retried every 10 s by the guard timer until it reads back (the timer never stops while one is pending); FV is written even when its read fails; the write-check failure and every battery self-check failure (QG type, no battery, vbat) also write the safe limits and release a left input suspend when SMB5 is EE 0 (laurelbatt=0 / laurelchg=0: no writes); before a system sleep (IOPMrootDomain will-sleep) the charger gets 500 mA / 4100 mV. Publishes the negroni 0271/0365 key set (CurrentCapacity, IsCharging, FullyCharged, ExternalConnected, AdapterDetails with FamilyCode, Voltage, Amperage, InstantAmperage, Temperature, CycleCount, times to full/empty). Self-check lines: 'LAUREL BATTERY: on: PMI632 QG soc N% ...' / 'off: <reason>', 'LAUREL CHARGER: on: ...' / 'off: <reason>'. Kill switches laurelbatt=0, laurelchg=0 (sweetbattery=0 still gives the static fallback).
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 05:07:52.859869174 +0530
++++ b/bsd/conf/files	2026-11-01 05:07:52.869073653 +0530
+@@ -113,6 +113,7 @@
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_i2c1.c			standard
++bsd/dev/laurel_pmi632.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
+ bsd/dev/topaz_redwood_audio.c		standard
+diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
+--- a/bsd/dev/laurel_pmi632.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_pmi632.c	2026-11-01 05:08:53.033026620 +0530
+@@ -0,0 +1,1113 @@
++/*
++ * laurel 2301 (Xiaomi Mi A3, SM6125 + PMI632): battery gauge and charger over SPMI.
++ *
++ * The Mi A3 has no SM5602 / bq2589x I2C chips (topaz 0091/0148): the gauge (QG) and the charger
++ * (SMB5) are blocks of the PMI632 at SPMI SID 2 (pmi632.dtsi, laurel_sprout-trinket-battery.dtsi).
++ *   QG     0x4800  type 0x0d; LAST_ADC_V 0xc0 (194.637 uV/LSB), LAST_BURST_AVG_I 0xc6 (152.588 uA/LSB
++ *                  on the 5 A subtype 3, 305.176 on subtype 4; + = discharge), S7 PON OCV 0x70
++ *                  (qg-reg.h, qg-defs.h V_RAW_TO_UV / I_RAW_TO_UA, qg-util.c)
++ *   SDAM   0xb100  Linux QG record: valid 0x46, soc 0x47, learned capacity 0x68 (mAh), cycle buckets
++ *                  0x58 (8 x u16); our own record 0xa8..0xaf (after the Linux area, 0x45..0xa3)
++ *   VADC   0x3100  ADC5 user channel: BAT_THERM_PU2 (0x4a), ratiometric, 100k NTC table of
++ *                  qcom-vadc-common.c adcmap_batt_therm_100k (lut index 0), full scale 0x70e4
++ *   SMB5   CHGR 0x1000, DCDC 0x1100, BATIF 0x1200, USBIN 0x1300, TYPEC 0x1500 (smb5-reg.h; PMI632
++ *          params of qpnp-smb5.c: FCC 50 mA steps max 3000, FV 3600 + 10 mV steps, ICL 50 mA steps)
++ * Battery: Sunwoda/Feimaotui 4030-4040 mAh, 4.40 V (batterydata-wingtech-*-4v4-4040mah.dtsi); the OCV
++ * table below is the 25 C column of the Sunwoda pc-temp-v1-lut.
++ *
++ * SoC. The Linux QG computes the SoC in software (qg-soc.c with the battery profile). Here:
++ *   start  saved SoC (our SDAM record, else the Linux QG SDAM SoC) after a warm reset; after a cold
++ *          start the saved SoC only when it is within 10 % of the SoC of the PON OCV (QG S7, measured
++ *          before the load), else the PON OCV SoC; no OCV: the saved SoC, else the voltage curve.
++ *   run    coulomb count of the QG burst current over the learned capacity (SDAM, else 4000 mAh), in
++ *          uAh (the master value; only a clamp or a correction writes it back); at rest (|I| < 30 mA
++ *          for 30 s, on battery) a drift of more than 5 % to the OCV SoC is corrected by 1 % per
++ *          sample; charger "terminated" at FV 4400 mV with a charger in = 100 % (held while plugged);
++ *          below 3300 mV for 30 s on battery = 0 % (critical), else never below 1 %.
++ *   save   our SDAM record once a minute when the SoC changed (owner check: EE 0). [I] 0xa8..0xaf
++ *          are past the Linux QG area (0x45..0xa3) and below the PBS PON OCV (0xbc); not proven free.
++ * Charger (HLOS owns SMB5 on this device: Android 4.14 qpnp-smb5 writes it). On only with a working
++ * battery NTC and the hardware JEITA hard limits at the Linux values (0 C / 60 C, written when not).
++ * The boot FCC/FV are saved. With a charger in:
++ *   input  APSD result: DCP / QC 2000 mA, float 1000 mA, CDP 1500 mA, SDP: the Type-C Rp current
++ *          (3.0 A -> 2000, 1.5 A -> 1500), else the hardware's (HW_AUTO); SW_OVERRIDE_HC mode of
++ *          smb5-lib.c smblib_icl_override (USBIN_MODE_CHG, no ICL override, override after APSD).
++ *          Unplug: HW_AUTO again, input un-suspended, FCC at most 500 mA until the next step.
++ *   JEITA  software zones on the NTC (negroni 0277 rule, Mi A3 DT values: COLD 0 C / HOT 60 C hard
++ *          limits stay in the hardware, FV 4100 mV above 44 C): < 0 C 0, 0..10 C 400 mA, 10..15 C
++ *          1200 mA, 15..44 C 3000 mA, 44..58 C 1500 mA at 4100 mV, >= 58 C 0. A zone with more current
++ *          only 1.5 C inside it. FCC 0 = no charge. Warm zone with VBAT > FV + 50 mV: USB input
++ *          suspended until VBAT < FV - 50 mV (step-chg-jeita.c handle_jeita).
++ *   NTC    no good NTC sample for 30 s: 500 mA at 4100 mV, control off (never a stale temperature).
++ *          The watchdog runs first in every sample (before any gauge read can return early) and from
++ *          its own 10 s thread_call, so it does not depend on the SweetBattery poll.
++ *   off    every control-off writes 500 mA / 4100 mV first; the boot limits only when not above that.
++ *          Control cannot turn on (no NTC, write check, hard limits, no timer) or the battery self-check
++ *          fails, with SMB5 ours: 500 mA / 4100 mV too. A safe write that fails is retried every 10 s by
++ *          the guard timer until it reads back (the timer never stops while one is pending). Before a
++ *          system sleep: 500 mA / 4100 mV (the timer does not run while asleep). laurelbatt=0 /
++ *          laurelchg=0 are kill switches: no writes, the previous limits stay.
++ *          A USB input suspend left by an earlier boot is released at start (also with control off),
++ *          ours before a power off / restart (lock-free USBIN lane).
++ *   Every write is read back; a failed write turns the charger control off (the reads stay).
++ * SMB1355 (parallel charger on QUP0 SE1 I2C) is not used: the PMI632 charges alone (max 3 A FCC).
++ *
++ * Self-check (laurel_pmi632_init): QG type 0x0d, battery present, a sane voltage; else
++ * "LAUREL BATTERY: off: <reason>" and SweetBattery keeps its static fallback. Charger control needs
++ * the NTC, the SMB5 CHGR/USBIN APIDs owned by EE 0 and the hard limits ("LAUREL CHARGER: off: ..."
++ * otherwise, reads stay).
++ * Kill switches: laurelbatt=0 (no PMI632 reads at all), laurelchg=0 (no charger writes).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread_call.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOLocks.h>
++extern void IOSleep(unsigned milliseconds);
++#include "sweet_spmi.h"
++#include "laurel_pmi632.h"
++
++extern int kdb_printf(const char *format, ...) __printflike(1, 2);
++
++#define PMI_SID         2u
++#define QG              0x4800u
++#define SDAM            0xb100u
++#define VADC            0x3100u
++#define CHGR            0x1000u
++#define DCDC            0x1100u
++#define USBIN           0x1300u
++#define TYPEC           0x1500u
++
++#define DESIGN_MAH      4030u
++#define DEFAULT_MAH     4000u
++#define FV_MV           4400u
++#define FV_WARM_MV      4100u
++#define REC_OFF         0xa8u           /* our SDAM record: 'L', 0x23, soc, soc/100 frac, tempL, tempH, xor, 0 */
++#define REC_MAGIC0      0x4cu
++#define REC_MAGIC1      0x23u
++#define SAVE_NS         60000000000ull
++#define LP_30S_NS       30000000000ull
++#define NTC_STALE_NS    30000000000ull  /* no good NTC sample for 30 s: charger to the safe state, control off */
++#define SAFE_FCC_MA     500u
++#define SAFE_FV_MV      4100u
++#define GUARD_S         10u             /* the NTC watchdog / charger step timer, independent of SweetBattery */
++
++/* Sunwoda pc-temp-v1-lut, 25 C column: { OCV in 0.1 mV, SoC in 0.01 % } (descending) */
++static const uint16_t lp_ocv[][2] = {
++	{43858, 10000}, {43633, 9800}, {43403, 9600}, {43165, 9400}, {42930, 9200}, {42698, 9000},
++	{42467, 8800}, {42235, 8600}, {42004, 8400}, {41778, 8200}, {41556, 8000}, {41342, 7800},
++	{41139, 7600}, {40944, 7400}, {40740, 7200}, {40526, 7000}, {40323, 6800}, {40138, 6600},
++	{39964, 6400}, {39808, 6200}, {39668, 6000}, {39501, 5800}, {39244, 5600}, {38994, 5400},
++	{38848, 5200}, {38743, 5000}, {38645, 4800}, {38548, 4600}, {38459, 4400}, {38378, 4200},
++	{38306, 4000}, {38241, 3800}, {38184, 3600}, {38133, 3400}, {38090, 3200}, {38050, 3000},
++	{38009, 2800}, {37970, 2600}, {37918, 2400}, {37835, 2200}, {37729, 2000}, {37616, 1800},
++	{37485, 1600}, {37328, 1400}, {37182, 1200}, {37085, 1000}, {37057, 900}, {37042, 800},
++	{37025, 700}, {36975, 600}, {36730, 500}, {36294, 400}, {35715, 300}, {34928, 200},
++	{33689, 100}, {30000, 0},
++};
++
++/* adcmap_batt_therm_100k: { mV, deci-C } (descending mV) */
++static const int16_t lp_ntc[][2] = {
++	{1840, -400}, {1835, -380}, {1828, -360}, {1821, -340}, {1813, -320}, {1803, -300}, {1793, -280},
++	{1781, -260}, {1768, -240}, {1753, -220}, {1737, -200}, {1719, -180}, {1700, -160}, {1679, -140},
++	{1655, -120}, {1630, -100}, {1603, -80}, {1574, -60}, {1543, -40}, {1510, -20}, {1475, 0},
++	{1438, 20}, {1400, 40}, {1360, 60}, {1318, 80}, {1276, 100}, {1232, 120}, {1187, 140},
++	{1142, 160}, {1097, 180}, {1051, 200}, {1005, 220}, {960, 240}, {915, 260}, {871, 280},
++	{828, 300}, {786, 320}, {745, 340}, {705, 360}, {666, 380}, {629, 400}, {594, 420}, {560, 440},
++	{527, 460}, {497, 480}, {467, 500}, {439, 520}, {413, 540}, {388, 560}, {365, 580}, {343, 600},
++	{322, 620}, {302, 640}, {284, 660}, {267, 680}, {251, 700}, {235, 720}, {221, 740}, {208, 760},
++	{195, 780}, {184, 800}, {173, 820}, {163, 840}, {153, 860}, {144, 880}, {136, 900}, {128, 920},
++	{120, 940}, {114, 960}, {107, 980},
++};
++
++static const struct { int min_dC; unsigned fcc_ma, fv_mv; } lp_jeita[] = {
++	{ -1000, 0, FV_MV }, { 0, 400, FV_MV }, { 100, 1200, FV_MV }, { 150, 3000, FV_MV },
++	{ 440, 1500, FV_WARM_MV }, { 580, 0, FV_WARM_MV },
++};
++#define LP_ZONES (sizeof(lp_jeita) / sizeof(lp_jeita[0]))
++
++static IOLock *lp_lock;
++static int lp_state = -1;               /* -1 not tried, 0 off, 1 on */
++static bool lp_chg_on, lp_temp_on, lp_save_on;
++static unsigned lp_ilsb_nua;            /* current LSB in nA */
++static unsigned lp_cap_mah = DEFAULT_MAH;
++static int lp_cycles = -1;
++static int64_t lp_soc_uah;              /* charge left, uAh */
++static int lp_soc_cent = -1;            /* SoC in 0.01 % */
++static const char *lp_soc_src = "none";
++static uint64_t lp_last_ns, lp_saved_ns, lp_log_ns;
++static int lp_saved_pct = -1;
++static uint64_t lp_rest_since, lp_low_since;   /* ns: at rest / below 3300 mV since (0 = not) */
++static unsigned lp_zone = LP_ZONES;
++static bool lp_held_full;
++static int lp_last_temp = 250;
++static uint64_t lp_temp_ok_ns;          /* last good NTC sample */
++static bool lp_was_ext = true, lp_usb_susp;
++static uint8_t lp_usb_cmd;              /* USBIN_CMD_IL without the suspend bit (for the lock-free release) */
++static thread_call_t lp_guard_tc;
++static bool lp_safe_pending;            /* a safe-limit write failed: the guard timer retries it every 10 s */
++static unsigned lp_safe_tries;
++static uint8_t lp_boot_fcc, lp_boot_fv;  /* SMB5 FCC/FV codes at our start, restored when control turns off */
++static uint8_t lp_pon_reason, lp_pon_warm, lp_pmi_reason;
++static bool lp_pon_known;
++
++static int
++rd(unsigned addr, uint8_t *v)
++{
++	for (unsigned t = 0; t < 2; t++) {
++		if (sweet_spmi_read(PMI_SID, addr, v) == 0) {
++			return 0;
++		}
++	}
++	return -1;
++}
++
++/* two matching whole words: rejects most torn samples without the QG hold bit */
++static int
++rd16(unsigned addr, uint16_t *v)
++{
++	uint16_t prev = 0;
++	for (unsigned a = 0; a < 4; a++) {
++		uint8_t lo, hi;
++		if (rd(addr, &lo) || rd(addr + 1, &hi)) {
++			return -1;
++		}
++		uint16_t next = (uint16_t)(lo | (hi << 8));
++		if (a && next == prev) {
++			*v = next;
++			return 0;
++		}
++		prev = next;
++	}
++	return -1;
++}
++
++/* write and read back; 0 ok */
++static int
++wr(unsigned addr, uint8_t v)
++{
++	uint8_t back = 0;
++	if (sweet_spmi_write(PMI_SID, addr, v) != 0 || rd(addr, &back) != 0) {
++		return -1;
++	}
++	return back == v ? 0 : -1;
++}
++
++static unsigned
++ocv_soc_cent(unsigned mv)
++{
++	unsigned t = mv * 10u;
++	unsigned n = sizeof(lp_ocv) / sizeof(lp_ocv[0]);
++	if (t >= lp_ocv[0][0]) {
++		return 10000;
++	}
++	for (unsigned i = 1; i < n; i++) {
++		if (t >= lp_ocv[i][0]) {
++			unsigned v0 = lp_ocv[i][0], v1 = lp_ocv[i - 1][0];
++			unsigned s0 = lp_ocv[i][1], s1 = lp_ocv[i - 1][1];
++			return s0 + (t - v0) * (s1 - s0) / (v1 - v0);
++		}
++	}
++	return 0;
++}
++
++static int
++ntc_dC(unsigned mv)
++{
++	unsigned n = sizeof(lp_ntc) / sizeof(lp_ntc[0]);
++	if ((int)mv >= lp_ntc[0][0]) {
++		return lp_ntc[0][1];
++	}
++	for (unsigned i = 1; i < n; i++) {
++		if ((int)mv >= lp_ntc[i][0]) {
++			int v0 = lp_ntc[i][0], v1 = lp_ntc[i - 1][0], t0 = lp_ntc[i][1], t1 = lp_ntc[i - 1][1];
++			return t0 + ((int)mv - v0) * (t1 - t0) / (v1 - v0);
++		}
++	}
++	return lp_ntc[n - 1][1];
++}
++
++/* ADC5 user conversion of BAT_THERM_PU2 (qcom-spmi-adc5.c adc_configure, poll EOC); deci-C */
++static int
++read_temp(int *dC)
++{
++	uint8_t dig, avg, dly, en, st = 0, lo, hi;
++	if (rd(VADC + 0x42, &dig) || rd(VADC + 0x43, &avg) || rd(VADC + 0x45, &dly) || rd(VADC + 0x46, &en)) {
++		return -1;
++	}
++	dig = (uint8_t)((dig & ~0x7cu) | (1u << 4) | (2u << 2));   /* ratiometric cal, decimation 2, timer cal */
++	avg = (uint8_t)(avg & ~0x07u);                               /* 1 sample */
++	dly = (uint8_t)((dly & ~0x0fu) | 2u);                        /* 200 us settle */
++	if (sweet_spmi_write(PMI_SID, VADC + 0x42, dig) || sweet_spmi_write(PMI_SID, VADC + 0x43, avg) ||
++	    sweet_spmi_write(PMI_SID, VADC + 0x44, 0x4a) || sweet_spmi_write(PMI_SID, VADC + 0x45, dly) ||
++	    sweet_spmi_write(PMI_SID, VADC + 0x46, (uint8_t)(en | 0x80u))) {
++		return -1;
++	}
++	uint8_t ch = 0;
++	if (rd(VADC + 0x44, &ch) || ch != 0x4a) {       /* PMI632: adc_channel_check */
++		if (sweet_spmi_write(PMI_SID, VADC + 0x44, 0x4a) || rd(VADC + 0x44, &ch) || ch != 0x4a) {
++			return -1;
++		}
++	}
++	if (sweet_spmi_write(PMI_SID, VADC + 0x47, 0x80)) {
++		return -1;
++	}
++	for (unsigned i = 0; i < 40; i++) {
++		delay(500);
++		if (rd(VADC + 0x08, &st) == 0 && (st & 3u) == 1u) {
++			if (rd(VADC + 0x50, &lo) || rd(VADC + 0x51, &hi)) {
++				return -1;
++			}
++			unsigned code = (unsigned)(lo | (hi << 8));
++			if (code > 0x7fffu) {
++				code = 0;
++			}
++			unsigned mv = code * 1875u / 0x70e4u;
++			if (mv < 100 || mv > 1850) {
++				return -1;     /* open or shorted NTC */
++			}
++			*dC = ntc_dC(mv);
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static void
++save_record(int pct, int dC)
++{
++	uint8_t r[7] = { REC_MAGIC0, REC_MAGIC1, (uint8_t)pct, (uint8_t)(lp_soc_cent % 100),
++		         (uint8_t)(dC & 0xff), (uint8_t)((dC >> 8) & 0xff), 0 };
++	uint8_t x = 0x5a;
++	for (unsigned i = 0; i < 6; i++) {
++		x ^= r[i];
++	}
++	r[6] = x;
++	for (unsigned i = 0; i < 7; i++) {
++		if (sweet_spmi_write(PMI_SID, SDAM + REC_OFF + i, r[i]) != 0) {
++			lp_save_on = false;
++			printf("LAUREL BATTERY: save off: SDAM write failed at +%u\n", i);
++			return;
++		}
++	}
++	lp_saved_pct = pct;
++}
++
++static int
++load_record(void)
++{
++	uint8_t r[7];
++	for (unsigned i = 0; i < 7; i++) {
++		if (rd(SDAM + REC_OFF + i, &r[i])) {
++			return -1;
++		}
++	}
++	uint8_t x = 0x5a;
++	for (unsigned i = 0; i < 6; i++) {
++		x ^= r[i];
++	}
++	if (r[0] != REC_MAGIC0 || r[1] != REC_MAGIC1 || r[6] != x || r[2] > 100 || r[3] > 99) {
++		return -1;
++	}
++	return r[2] * 100 + (r[2] < 100 ? r[3] : 0);
++}
++
++/* PM6125 PON reason (GEN2: PON_REASON1 0x8c0, WARM_RESET_REASON1 0x8c2) and the PMI632's */
++static void
++read_pon(void)
++{
++	uint8_t sub = 0, a = 0, b = 0, a2 = 0, b2 = 0, ps = 0, pr = 0;
++	if (sweet_spmi_pon_read(0x805, &sub) || sub < 4) {
++		return;
++	}
++	/* the keys thread polls the same APID: take two agreeing reads */
++	for (unsigned t = 0; t < 4; t++) {
++		if (sweet_spmi_pon_read(0x8c0, &a) || sweet_spmi_pon_read(0x8c2, &b) ||
++		    sweet_spmi_pon_read(0x8c0, &a2) || sweet_spmi_pon_read(0x8c2, &b2)) {
++			continue;
++		}
++		if (a == a2 && b == b2) {
++			lp_pon_reason = a;
++			lp_pon_warm = b;
++			lp_pon_known = true;
++			break;
++		}
++	}
++	if (rd(0x805, &ps) == 0) {
++		unsigned off = ps >= 4 ? 0xc0u : 0x08u;
++		if (rd(0x800 + off, &pr) == 0) {
++			lp_pmi_reason = pr;
++		}
++	}
++}
++
++int
++laurel_pmi632_pon(uint8_t *reason, uint8_t *warm, uint8_t *pmi)
++{
++	if (!lp_pon_known) {
++		return -1;
++	}
++	*reason = lp_pon_reason;
++	*warm = lp_pon_warm;
++	*pmi = lp_pmi_reason;
++	return 0;
++}
++
++static int lp_init_locked(void);
++static int set_fcc_fv(uint8_t fcc, uint8_t fv);
++static void lp_guard_fire(thread_call_param_t p0, thread_call_param_t p1);
++static void lp_guard_arm(void);
++static void lp_guard_start(void);
++static int lp_write_safe(void);
++static void lp_release_left_suspend(void);
++static void lp_charger_failsafe(const char *why);
++static uint64_t now_ns(void);
++static int jeita_hw_check(unsigned *hot, unsigned *cold);
++static volatile int lp_init_busy;
++
++/* SweetBattery::start (IOKit) and load_init_program (init thread) may both call it: one runs it */
++int
++laurel_pmi632_init(void)
++{
++	while (!__sync_bool_compare_and_swap(&lp_init_busy, 0, 1)) {
++		IOSleep(1);
++	}
++	int rc = lp_state >= 0 ? (lp_state ? 0 : -1) : lp_init_locked();
++	__sync_lock_release(&lp_init_busy);
++	return rc;
++}
++
++static int
++lp_init_locked(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("laurelbatt", &on, sizeof(on));
++	if (!on) {
++		lp_state = 0;
++		printf("LAUREL BATTERY: off: laurelbatt=0\n");
++		return -1;
++	}
++	if (sweet_spmi_init() != 0) {
++		lp_state = 0;
++		printf("LAUREL BATTERY: off: SPMI arbiter not ready\n");
++		return -1;
++	}
++	lp_lock = IOLockAlloc();
++	if (!lp_lock) {
++		lp_state = 0;
++		printf("LAUREL BATTERY: off: no lock\n");
++		return -1;
++	}
++	uint8_t type = 0, sub = 0, st1 = 0;
++	uint16_t v = 0;
++	if (rd(QG + 0x04, &type) || type != 0x0d) {
++		lp_state = 0;
++		printf("LAUREL BATTERY: off: PMI632 QG type 0x%02x (want 0x0d)\n", type);
++		lp_charger_failsafe("battery gauge off");
++		return -1;
++	}
++	if (rd(QG + 0x05, &sub) || rd(QG + 0x08, &st1) || !(st1 & 1u)) {
++		lp_state = 0;
++		printf("LAUREL BATTERY: off: no battery (QG status1 0x%02x)\n", st1);
++		lp_charger_failsafe("battery gauge off");
++		return -1;
++	}
++	unsigned mv = (rd16(QG + 0xc0, &v) == 0) ? (unsigned)(((uint64_t)v * 194637u) / 1000000u) : 0;
++	if (mv < 2800 || mv > 4600) {
++		lp_state = 0;
++		printf("LAUREL BATTERY: off: implausible vbat %u mV\n", mv);
++		lp_charger_failsafe("battery gauge off");
++		return -1;
++	}
++	lp_ilsb_nua = sub == 4 ? 305176u : 152588u;
++	read_pon();
++
++	/* learned capacity and cycle count of the Linux QG (SDAM) */
++	uint16_t cap = 0;
++	if (rd16(SDAM + 0x68, &cap) == 0 && cap >= 3000 && cap <= 4600) {
++		lp_cap_mah = cap;
++	}
++	uint32_t sum = 0;
++	bool cyc_ok = true;
++	for (unsigned i = 0; i < 8; i++) {
++		uint16_t c;
++		if (rd16(SDAM + 0x58 + 2 * i, &c)) {
++			cyc_ok = false;
++			break;
++		}
++		sum += c;
++	}
++	if (cyc_ok && sum / 8 < 5000) {
++		lp_cycles = (int)(sum / 8);
++	}
++
++	/* start SoC */
++	uint16_t ocvr = 0;
++	unsigned ocv = (rd16(QG + 0x70, &ocvr) == 0) ? (unsigned)(((uint64_t)ocvr * 194637u) / 1000000u) : 0;
++	bool ocv_ok = ocv >= 3000 && ocv <= 4500;
++	int saved = load_record();
++	const char *saved_src = "sdam";
++	if (saved < 0) {
++		uint8_t valid = 0, s = 0;
++		if (rd(SDAM + 0x46, &valid) == 0 && valid == 1 && rd(SDAM + 0x47, &s) == 0 && s <= 100) {
++			saved = s * 100;
++			saved_src = "qg-sdam";
++		}
++	}
++	bool warm = lp_pon_known && lp_pon_warm != 0;
++	int ocv_cent = ocv_ok ? (int)ocv_soc_cent(ocv) : -1;
++	if (saved >= 0 && (warm || !ocv_ok || (saved - ocv_cent <= 1000 && ocv_cent - saved <= 1000))) {
++		lp_soc_cent = saved;
++		lp_soc_src = saved_src;
++	} else if (ocv_ok) {
++		lp_soc_cent = ocv_cent;
++		lp_soc_src = "pon-ocv";
++	} else {
++		lp_soc_cent = (int)ocv_soc_cent(mv);
++		lp_soc_src = "vbat";
++	}
++	lp_soc_uah = (int64_t)lp_soc_cent * lp_cap_mah / 10;   /* 0.01 % * mAh * 1000 / 10000 = uAh */
++	lp_saved_pct = saved >= 0 ? saved / 100 : -1;
++	lp_last_ns = 0;
++
++	int t = 0;
++	lp_temp_on = sweet_spmi_owner(PMI_SID, 0x31) == 0 && read_temp(&t) == 0;
++	if (lp_temp_on) {
++		lp_last_temp = t;
++	}
++	lp_save_on = sweet_spmi_owner(PMI_SID, 0xb1) == 0;
++
++	int chg = 1;
++	(void)PE_parse_boot_argn("laurelchg", &chg, sizeof(chg));
++	int oc = sweet_spmi_owner(PMI_SID, 0x10), ou = sweet_spmi_owner(PMI_SID, 0x13);
++	uint8_t fcc = 0, fv = 0;
++	uint8_t jen = 0;
++	unsigned hot = 0, cold = 0;
++	int jh = -1;
++	if (ou == 0) {
++		lp_release_left_suspend();
++	}
++	bool safe_needed = false;
++	if (!chg) {
++		printf("LAUREL CHARGER: off: laurelchg=0\n");
++	} else if (!lp_temp_on) {
++		safe_needed = true;
++		printf("LAUREL CHARGER: off: no battery NTC (ADC5 BAT_THERM_PU2 not readable; hardware limits only)\n");
++	} else if (oc != 0 || ou != 0) {
++		printf("LAUREL CHARGER: off: SMB5 CHGR/USBIN owned by EE %d/%d, not 0 (reads only)\n", oc, ou);
++	} else if (rd(CHGR + 0x61, &fcc) || rd(CHGR + 0x70, &fv) || wr(CHGR + 0x70, fv) || rd(CHGR + 0x90, &jen)) {
++		safe_needed = true;
++		printf("LAUREL CHARGER: off: SMB5 write check failed\n");
++	} else if ((jh = jeita_hw_check(&hot, &cold)) < 0) {
++		safe_needed = true;
++		printf("LAUREL CHARGER: off: hardware JEITA hard limits hot 0x%04x cold 0x%04x not at 60/0 C and not writable\n",
++		    hot, cold);
++	} else if (!lp_guard_tc && !(lp_guard_tc = thread_call_allocate(lp_guard_fire, NULL))) {
++		safe_needed = true;
++		printf("LAUREL CHARGER: off: no NTC watchdog timer\n");
++	} else {
++		lp_boot_fcc = fcc;
++		lp_boot_fv = fv;
++		lp_temp_ok_ns = now_ns();
++		lp_chg_on = true;
++		printf("LAUREL CHARGER: on: SMB5 owner EE 0, boot FCC %u mA FV %u mV; hard JEITA hot 0x%04x cold 0x%04x%s "
++		    "(JEITA_EN_CFG 0x%02x); software JEITA zones on the NTC, ICL from APSD\n",
++		    fcc * 50u, 3600u + fv * 10u, hot, cold, jh ? " -> Linux 0x15aa/0x6894" : "", jen);
++		lp_guard_arm();
++	}
++	/* control cannot run (no NTC, bad hard limits, no timer) but the charger is ours: 500 mA / 4100 mV */
++	if (safe_needed && oc == 0 && ou == 0) {
++		IOLockLock(lp_lock);
++		int rc = lp_write_safe();
++		IOLockUnlock(lp_lock);
++		printf("LAUREL CHARGER: safe limits FCC %u mA FV %u mV without software JEITA (%s)\n", SAFE_FCC_MA, SAFE_FV_MV,
++		    rc ? "a write failed: retried every 10 s" : "written");
++		if (rc) {
++			lp_guard_start();
++		}
++	}
++	lp_state = 1;
++	printf("LAUREL BATTERY: on: PMI632 QG soc %d%% (%s; pon-ocv %u mV) vbat %u mV temp %s%d.%d C cap %u mAh cycles %d; "
++	    "pon 0x%02x warm 0x%02x pmi 0x%02x; save %s\n",
++	    lp_soc_cent / 100, lp_soc_src, ocv, mv, lp_temp_on ? "" : "(fixed) ", lp_last_temp / 10,
++	    (lp_last_temp < 0 ? -lp_last_temp : lp_last_temp) % 10, lp_cap_mah, lp_cycles, lp_pon_reason, lp_pon_warm,
++	    lp_pmi_reason, lp_save_on ? "on" : "off (SDAM not EE 0)");
++	return 0;
++}
++
++/* write FCC/FV in the safe order (FV down before, up after) */
++static int
++set_fcc_fv(uint8_t fcc, uint8_t fv)
++{
++	uint8_t cur = 0;
++	if (rd(CHGR + 0x70, &cur) != 0) {
++		/* FV unknown: write FV, then FCC, both read back (a failure is retried by the caller) */
++		return wr(CHGR + 0x70, fv) | wr(CHGR + 0x61, fcc);
++	}
++	int rc = 0;
++	if (fv < cur) {
++		rc |= wr(CHGR + 0x70, fv);
++	}
++	rc |= wr(CHGR + 0x61, fcc);
++	if (fv > cur) {
++		rc |= wr(CHGR + 0x70, fv);
++	}
++	return rc;
++}
++
++/* USB input un-suspended and the ICL back to HW_AUTO (smblib_icl_override: no override after APSD) */
++static int
++input_auto(void)
++{
++	int rc = 0;
++	uint8_t v = 0;
++	if (lp_usb_susp) {
++		if (rd(USBIN + 0x40, &v) == 0) {
++			rc |= wr(USBIN + 0x40, (uint8_t)(v & ~0x01u));
++			lp_usb_cmd = (uint8_t)(v & ~0x01u);
++		} else {
++			rc = -1;
++		}
++		lp_usb_susp = false;
++	}
++	if (rd(USBIN + 0x65, &v) == 0) {
++		if (v & 0x10u) {
++			rc |= wr(USBIN + 0x65, (uint8_t)(v & ~0x10u));
++		}
++	} else {
++		rc = -1;
++	}
++	return rc;
++}
++
++/*
++ * charger control off: always 500 mA at 4100 mV first (software JEITA is off from here on); the boot
++ * limits come back only when they are not above that (no 3000 mA / 4400 mV without our JEITA).
++ */
++static void
++chg_off(const char *why)
++{
++	uint8_t sfcc = (uint8_t)(SAFE_FCC_MA / 50u), sfv = (uint8_t)((SAFE_FV_MV - 3600u) / 10u);
++	int rc = lp_write_safe();               /* failure: lp_safe_pending, retried by the guard timer */
++	bool boot = rc == 0 && lp_boot_fcc <= sfcc && lp_boot_fv <= sfv && (lp_boot_fcc != sfcc || lp_boot_fv != sfv);
++	if (boot) {
++		rc |= set_fcc_fv(lp_boot_fcc, lp_boot_fv);
++	}
++	lp_chg_on = false;
++	lp_zone = LP_ZONES;
++	printf("LAUREL CHARGER: off: %s; FCC %u mA FV %u mV%s (%s)\n", why,
++	    (boot ? lp_boot_fcc : sfcc) * 50u, 3600u + (boot ? lp_boot_fv : sfv) * 10u, boot ? " (boot limits)" : " (safe)",
++	    rc ? "a write failed: retried every 10 s" : "written");
++	if (rc) {
++		lp_guard_start();
++	}
++}
++
++/*
++ * Hardware JEITA hard limits (charger stops by itself): CHGR_JEITA_THRESHOLD_BASE_REG(JEITA_HARD) 0x1098,
++ * hot code at 0x98/0x99 (MSB first), cold at 0x9a/0x9b; Linux writes qcom,jeita-hard-thresholds
++ * <0x6894 0x15aa> (cold 0 C, hot 60 C) in smblib_update_jeita (smb5-lib.c:4841, 7904). Not near those
++ * codes: write them and read back. 0 = as Linux, 1 = written now, -1 = not usable.
++ */
++static int
++jeita_hw_check(unsigned *hot, unsigned *cold)
++{
++	uint8_t r[4];
++	for (unsigned i = 0; i < 4; i++) {
++		if (rd(CHGR + 0x98 + i, &r[i])) {
++			return -1;
++		}
++	}
++	*hot = (unsigned)(r[0] << 8 | r[1]);
++	*cold = (unsigned)(r[2] << 8 | r[3]);
++	/* only the safe side: a lower code is hotter, so hot >= 0x15aa trips at <= 60 C, cold <= 0x6894 at >= 0 C */
++	bool hot_ok = *hot >= 0x15aau && *hot <= 0x15aau + 0x200u;
++	bool cold_ok = *cold <= 0x6894u && *cold >= 0x6894u - 0x400u;
++	if (hot_ok && cold_ok) {
++		return 0;
++	}
++	static const uint8_t lin[4] = { 0x15, 0xaa, 0x68, 0x94 };
++	for (unsigned i = 0; i < 4; i++) {
++		if (wr(CHGR + 0x98 + i, lin[i])) {
++			return -1;
++		}
++	}
++	return 1;
++}
++
++static unsigned
++jeita_zone(int dC)
++{
++	unsigned z = 0;
++	while (z + 1 < LP_ZONES && dC >= lp_jeita[z + 1].min_dC) {
++		z++;
++	}
++	return z;
++}
++
++static unsigned
++family_code(uint8_t apsd, uint8_t snk)
++{
++	if (apsd & 0x60u) {
++		return 0xe0004004u;                     /* QC 2.0/3.0 (HVDCP): dedicated port */
++	}
++	if (apsd & 0x08u) {
++		return 0xe0004004u;                     /* DCP: kIOPSFamilyCodeUSBChargingPortDedicated */
++	}
++	if (apsd & 0x04u) {
++		return 0xe0004005u;                     /* CDP: kIOPSFamilyCodeUSBChargingPortDownstream */
++	}
++	if (apsd & 0x01u) {
++		return (snk & 0x06u) ? 0xe0004009u : 0xe0004000u;      /* Type-C current, else USB host */
++	}
++	return 0xe0004007u;                             /* float / unknown */
++}
++
++/* input limit for the APSD result; 0 = leave it to the hardware */
++static unsigned
++want_icl(uint8_t apsd, uint8_t snk)
++{
++	if (apsd & 0x68u) {
++		return 2000;    /* QC, DCP */
++	}
++	if (apsd & 0x10u) {
++		return 1000;    /* float */
++	}
++	if (apsd & 0x04u) {
++		return 1500;    /* CDP */
++	}
++	if (apsd & 0x01u) {
++		return (snk & 0x02u) ? 2000 : (snk & 0x04u) ? 1500 : 0;   /* SDP with Rp 3.0 / 1.5 A */
++	}
++	return 0;
++}
++
++static void
++charger_step(struct laurel_batt *b, uint8_t apsd, uint8_t snk, bool external, unsigned mv, uint64_t ns)
++{
++	if (!lp_chg_on) {
++		return;
++	}
++	if (!external) {
++		/* unplug: ICL back to HW_AUTO, input un-suspended, a safe FCC for the next plug-in (until the next step) */
++		if (lp_was_ext) {
++			lp_was_ext = false;
++			lp_zone = LP_ZONES;
++			uint8_t fcc = 0;
++			int rc = input_auto();
++			if (rd(CHGR + 0x61, &fcc) == 0 && fcc > SAFE_FCC_MA / 50u) {
++				rc |= wr(CHGR + 0x61, (uint8_t)(SAFE_FCC_MA / 50u));
++			}
++			if (rc) {
++				chg_off("SMB5 write failed at unplug");
++			}
++		}
++		return;
++	}
++	lp_was_ext = true;
++	(void)ns;       /* the NTC watchdog runs in lp_guard_locked before every step */
++	int dC = lp_last_temp;
++	unsigned z = jeita_zone(dC);
++	if (lp_zone < LP_ZONES && z != lp_zone && lp_jeita[z].fcc_ma >= lp_jeita[lp_zone].fcc_ma &&
++	    (jeita_zone(dC - 15) != z || jeita_zone(dC + 15) != z)) {
++		z = lp_zone;
++	}
++	unsigned icl = want_icl(apsd, snk);
++	uint8_t fcc = 0, fv = 0, icfg = 0, opt = 0, ovr = 0, load = 0, cmd = 0;
++	if (rd(CHGR + 0x61, &fcc) || rd(CHGR + 0x70, &fv) || rd(USBIN + 0x70, &icfg) || rd(USBIN + 0x66, &opt) ||
++	    rd(USBIN + 0x42, &ovr) || rd(USBIN + 0x65, &load) || rd(USBIN + 0x40, &cmd)) {
++		return;
++	}
++	uint8_t wfcc = (uint8_t)(lp_jeita[z].fcc_ma / 50u), wfv = (uint8_t)((lp_jeita[z].fv_mv - 3600u) / 10u);
++	int rc = 0;
++	bool changed = wfcc != fcc || wfv != fv;
++	if (changed) {
++		rc |= set_fcc_fv(wfcc, wfv);
++	}
++	if (icl) {
++		uint8_t wicfg = (uint8_t)(icl / 50u);
++		if (wicfg != icfg) {
++			rc |= wr(USBIN + 0x70, wicfg);
++			changed = true;
++		}
++		if (!(opt & 0x01u)) {
++			rc |= wr(USBIN + 0x66, (uint8_t)(opt | 0x01u));      /* USBIN_MODE_CHG: high-current mode */
++			changed = true;
++		}
++		if (ovr & 0x01u) {
++			rc |= wr(USBIN + 0x42, (uint8_t)(ovr & ~0x01u));     /* no USB51 ICL override */
++			changed = true;
++		}
++		if (!(load & 0x10u)) {
++			rc |= wr(USBIN + 0x65, (uint8_t)(load | 0x10u));     /* ICL_OVERRIDE_AFTER_APSD */
++			changed = true;
++		}
++	} else if (load & 0x10u) {
++		rc |= wr(USBIN + 0x65, (uint8_t)(load & ~0x10u));            /* HW_AUTO: the hardware's ICL */
++		changed = true;
++	}
++	/*
++	 * Warm zone (FV 4100 mV): a cell above FV + 50 mV cannot come down by charging at the lower FV;
++	 * suspend the USB input until it is below FV - 50 mV (Linux step-chg-jeita.c handle_jeita,
++	 * JEITA_SUSPEND_HYST_UV; USBIN_CMD_IL 0x1340 bit 0).
++	 */
++	unsigned zfv = lp_jeita[z].fv_mv;
++	bool susp = lp_usb_susp;
++	if (zfv < FV_MV && !susp && mv && mv > zfv + 50u) {
++		susp = true;
++	} else if (susp && (zfv >= FV_MV || (mv && mv + 50u < zfv))) {
++		susp = false;
++	}
++	if (susp != lp_usb_susp) {
++		lp_usb_cmd = (uint8_t)(cmd & ~0x01u);
++		rc |= wr(USBIN + 0x40, (uint8_t)(susp ? (cmd | 0x01u) : (cmd & ~0x01u)));
++		lp_usb_susp = susp;
++		changed = true;
++	}
++	if (rc) {
++		chg_off("SMB5 write failed");
++		return;
++	}
++	if (changed || z != lp_zone) {
++		printf("LAUREL CHARGER: on: SMB5 usbin apsd 0x%02x rp 0x%02x, %d.%d C zone %u: ICL %u mA, FCC %u mA, FV %u mV, %s\n",
++		    apsd, snk, dC / 10, (dC < 0 ? -dC : dC) % 10, z, icl ? icl : 50u * icfg, lp_jeita[z].fcc_ma,
++		    zfv, lp_usb_susp ? "input suspended (vbat above the warm FV)" :
++		    lp_jeita[z].fcc_ma ? "charging" : "NOT charging (temperature)");
++	}
++	lp_zone = z;
++	b->fcc_ma = lp_jeita[z].fcc_ma;
++	b->fv_mv = zfv;
++}
++
++/* the inputs of one charger step */
++struct lp_in {
++	uint8_t usbrt, path, apsd_st, apsd, snk;
++	bool external, temp_ok;
++};
++
++/*
++ * Locked. A fresh NTC sample, the NTC watchdog (no good sample for 30 s: 500 mA / 4100 mV and control
++ * off, whatever else fails) and one charger step. Runs first in every laurel_pmi632_sample (before any
++ * gauge read can return early) and from the GUARD_S timer, which does not depend on SweetBattery.
++ */
++static void
++lp_guard_locked(uint64_t ns, struct lp_in *in, struct laurel_batt *b)
++{
++	bzero(in, sizeof(*in));
++	int t = 0;
++	in->temp_ok = lp_temp_on && read_temp(&t) == 0;
++	if (in->temp_ok) {
++		lp_last_temp = t;
++		lp_temp_ok_ns = ns;
++	}
++	if (lp_chg_on && ns - lp_temp_ok_ns > NTC_STALE_NS) {
++		chg_off("no battery NTC sample for 30 s");
++	}
++	bool ok = rd(USBIN + 0x10, &in->usbrt) == 0 && rd(DCDC + 0x0b, &in->path) == 0;
++	(void)rd(USBIN + 0x07, &in->apsd_st);
++	(void)rd(USBIN + 0x08, &in->apsd);
++	(void)rd(TYPEC + 0x06, &in->snk);
++	/* a suspended input (our warm-zone suspend) has no valid power path but is still plugged in */
++	in->external = ok && (in->usbrt & 0x10u) && ((in->path & 0x01u) || lp_usb_susp);
++	uint16_t vr = 0;
++	unsigned mv = rd16(QG + 0xc0, &vr) == 0 ? (unsigned)(((uint64_t)vr * 194637u) / 1000000u) : 0;
++	if (mv < 2800 || mv > 4600) {
++		mv = 0;         /* unknown: the warm-zone suspend keeps its state */
++	}
++	if (ok) {
++		charger_step(b, (in->apsd_st & 1u) ? in->apsd : 0, in->snk, in->external, mv, ns);
++	}
++}
++
++static void
++lp_guard_fire(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	struct lp_in in;
++	struct laurel_batt scratch;
++	IOLockLock(lp_lock);
++	if (lp_safe_pending) {
++		if (lp_write_safe() == 0) {
++			printf("LAUREL CHARGER: safe limits FCC %u mA FV %u mV written after %u retries\n", SAFE_FCC_MA, SAFE_FV_MV,
++			    lp_safe_tries);
++		}
++	}
++	if (lp_chg_on) {
++		bzero(&scratch, sizeof(scratch));
++		lp_guard_locked(now_ns(), &in, &scratch);
++	}
++	bool again = lp_chg_on || lp_safe_pending;      /* never stop while a safe write is pending */
++	IOLockUnlock(lp_lock);
++	if (again) {
++		lp_guard_arm();
++	}
++}
++
++static void
++lp_guard_arm(void)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(GUARD_S, NSEC_PER_SEC, &deadline);
++	(void)thread_call_enter_delayed(lp_guard_tc, deadline);
++}
++
++/* allocate (once) and arm the guard timer */
++static void
++lp_guard_start(void)
++{
++	if (!lp_guard_tc) {
++		lp_guard_tc = thread_call_allocate(lp_guard_fire, NULL);
++	}
++	if (lp_guard_tc) {
++		lp_guard_arm();
++	} else {
++		printf("LAUREL CHARGER: no guard timer: a failed safe write is not retried\n");
++	}
++}
++
++/* 500 mA / 4100 mV, ICL HW_AUTO, input un-suspended, all read back; sets/clears lp_safe_pending */
++static int
++lp_write_safe(void)
++{
++	int rc = input_auto();
++	rc |= set_fcc_fv((uint8_t)(SAFE_FCC_MA / 50u), (uint8_t)((SAFE_FV_MV - 3600u) / 10u));
++	if (rc) {
++		lp_safe_pending = true;
++		lp_safe_tries++;
++	} else {
++		lp_safe_pending = false;
++	}
++	return rc;
++}
++
++/* a USB input suspend left by an earlier boot (our warm-zone suspend; the PMIC keeps it): release it */
++static void
++lp_release_left_suspend(void)
++{
++	uint8_t cmd = 0;
++	if (rd(USBIN + 0x40, &cmd) == 0) {
++		lp_usb_cmd = (uint8_t)(cmd & ~0x01u);
++		if (cmd & 0x01u) {
++			int w = wr(USBIN + 0x40, lp_usb_cmd);
++			printf("LAUREL CHARGER: USB input suspend of an earlier boot released (USBIN_CMD_IL 0x%02x, %s)\n", cmd,
++			    w ? "write failed" : "written");
++		}
++	}
++	(void)sweet_spmi_usbin_lane_init();
++}
++
++/*
++ * Battery self-check failed after the SPMI start (QG type, no battery, implausible vbat): no gauge and no
++ * software JEITA, so with SMB5 ours: input suspend released, 500 mA / 4100 mV (retried every 10 s until
++ * read back). laurelchg=0 (kill switch) or SMB5 not EE 0: no writes.
++ */
++static void
++lp_charger_failsafe(const char *why)
++{
++	int chg = 1;
++	(void)PE_parse_boot_argn("laurelchg", &chg, sizeof(chg));
++	if (!chg) {
++		printf("LAUREL CHARGER: off: %s, laurelchg=0: no writes (the previous limits stay)\n", why);
++		return;
++	}
++	int oc = sweet_spmi_owner(PMI_SID, 0x10), ou = sweet_spmi_owner(PMI_SID, 0x13);
++	if (oc != 0 || ou != 0) {
++		printf("LAUREL CHARGER: off: %s, SMB5 owned by EE %d/%d: no writes\n", why, oc, ou);
++		return;
++	}
++	IOLockLock(lp_lock);
++	lp_release_left_suspend();
++	int rc = lp_write_safe();
++	IOLockUnlock(lp_lock);
++	printf("LAUREL CHARGER: off: %s; safe limits FCC %u mA FV %u mV without software JEITA (%s)\n", why, SAFE_FCC_MA,
++	    SAFE_FV_MV, rc ? "a write failed: retried every 10 s" : "written");
++	if (rc) {
++		lp_guard_start();
++	}
++}
++
++/*
++ * System sleep (IOPMrootDomain will-sleep, from SweetBattery): the guard timer and the poll do not run
++ * while asleep (absolute time stops), so the charger gets 500 mA / 4100 mV before; the next charger step
++ * after wake writes the zone limits again. Locked. [U] whether this kernel ever sleeps (no CPU suspend path
++ * in topaz/SweetPlatformExpert).
++ */
++void
++laurel_pmi632_will_sleep(void)
++{
++	if (lp_state != 1 || !lp_lock) {
++		return;
++	}
++	IOLockLock(lp_lock);
++	if (lp_chg_on || lp_safe_pending) {
++		int rc = lp_write_safe();
++		lp_zone = LP_ZONES;
++		printf("LAUREL CHARGER: system sleep: safe limits FCC %u mA FV %u mV (%s)\n", SAFE_FCC_MA, SAFE_FV_MV,
++		    rc ? "a write failed" : "written");
++	}
++	IOLockUnlock(lp_lock);
++}
++
++/* laurel 2301: power off / restart path (panic hold, timer call): no lock, kdb_printf only */
++void
++laurel_pmi632_release_input(void)
++{
++	if (!lp_usb_susp) {
++		return;
++	}
++	int w = sweet_spmi_usbin_lane_write(0x40, lp_usb_cmd);
++	lp_usb_susp = false;
++	kdb_printf("LAUREL CHARGER: USB input suspend released before the reset (USBIN_CMD_IL 0x%02x, write %d)\n",
++	    lp_usb_cmd, w);
++}
++
++static uint64_t
++now_ns(void)
++{
++	uint64_t now, ns;
++	clock_get_uptime(&now);
++	absolutetime_to_nanoseconds(now, &ns);
++	return ns;
++}
++
++int
++laurel_pmi632_sample(struct laurel_batt *b)
++{
++	if (lp_state != 1 || !b) {
++		return -1;
++	}
++	bzero(b, sizeof(*b));
++	IOLockLock(lp_lock);
++	uint64_t ns = now_ns();
++	struct lp_in in;
++	lp_guard_locked(ns, &in, b);    /* NTC watchdog + charger step, before any early return below */
++	uint16_t vr = 0, ir = 0;
++	uint8_t st1 = 0;
++	if (rd16(QG + 0xc0, &vr) || rd16(QG + 0xc6, &ir) || rd(QG + 0x08, &st1)) {
++		IOLockUnlock(lp_lock);
++		return -1;
++	}
++	unsigned mv = (unsigned)(((uint64_t)vr * 194637u) / 1000000u);
++	if (mv < 2800 || mv > 4600 || !(st1 & 1u)) {
++		IOLockUnlock(lp_lock);
++		return -1;
++	}
++	/* Linux: + = discharge; iOS: + = into the battery */
++	int ma = (int)(-((int64_t)(int16_t)ir * lp_ilsb_nua) / 1000000);
++	bool temp_ok = in.temp_ok;
++
++	uint8_t cs1 = 0, cs2 = 0, cs7 = 0, icl_st = 0, fvr = 0;
++	uint8_t apsd_st = in.apsd_st, apsd = in.apsd, snk = in.snk;
++	bool chg_ok = rd(CHGR + 0x06, &cs1) == 0 && rd(CHGR + 0x07, &cs2) == 0 && rd(CHGR + 0x0d, &cs7) == 0;
++	(void)rd(DCDC + 0x07, &icl_st);
++	bool fv_ok = rd(CHGR + 0x70, &fvr) == 0;
++	bool external = chg_ok && in.external;
++	unsigned state = cs1 & 7u;
++	bool charging = external && !lp_usb_susp && state >= 1 && state <= 4 && !(cs2 & 2u) && !(cs7 & 0x0cu);
++	/* "terminated" is full only at the full FV (4400 mV), not at the warm 4100 mV */
++	bool terminated = external && state == 5 && fv_ok && 3600u + 10u * fvr >= FV_MV - 10u;
++
++	/* coulomb count: lp_soc_uah is the master value */
++	if (lp_last_ns && ns > lp_last_ns) {
++		uint64_t dt_ms = (ns - lp_last_ns) / 1000000u;
++		if (dt_ms > 600000u) {
++			dt_ms = 600000u;        /* a long gap (sleep): count at most 10 min of the last current */
++		}
++		lp_soc_uah += (int64_t)ma * (int64_t)dt_ms / 3600;     /* mA * ms / 3600 = uAh */
++	}
++	lp_last_ns = ns;
++	int64_t full_uah = (int64_t)lp_cap_mah * 1000;
++	if (lp_soc_uah > full_uah) {
++		lp_soc_uah = full_uah;
++	}
++	if (lp_soc_uah < 0) {
++		lp_soc_uah = 0;
++	}
++	int cent = (int)(lp_soc_uah * 10000 / full_uah);
++	int adj = cent;
++
++	/* at rest for 30 s on battery: pull a drift of more than 5 % back toward the OCV SoC, 1 % per sample */
++	int a = ma < 0 ? -ma : ma;
++	lp_rest_since = (a < 30) ? (lp_rest_since ? lp_rest_since : ns) : 0;
++	if (lp_rest_since && ns - lp_rest_since >= LP_30S_NS && !external) {
++		int ocv_c = (int)ocv_soc_cent(mv);
++		if (ocv_c - cent > 500) {
++			adj = cent + 100;
++		} else if (cent - ocv_c > 500) {
++			adj = cent - 100;
++		}
++	}
++	/* charger terminated at the full FV: 100 %, held while plugged (qcom,hold-soc-while-full) */
++	if (terminated) {
++		lp_held_full = true;
++	}
++	if (!external) {
++		lp_held_full = false;
++	}
++	if (lp_held_full) {
++		adj = 10000;
++	} else if (adj >= 9950 && charging) {
++		adj = 9949;                     /* 100 % only when the charger says so */
++	}
++	/* empty: below 3300 mV on battery for 30 s; until then never below 1 % */
++	lp_low_since = (!external && mv < 3300) ? (lp_low_since ? lp_low_since : ns) : 0;
++	bool empty = lp_low_since && ns - lp_low_since >= LP_30S_NS;
++	if (empty) {
++		adj = 0;
++	} else if (adj < 100) {
++		adj = 100;
++	}
++	if (adj != cent) {
++		lp_soc_uah = (int64_t)adj * lp_cap_mah / 10;   /* only a correction or a clamp writes back */
++	}
++	lp_soc_cent = adj;
++	int pct = (adj + 50) / 100;
++	if (pct > 100) {
++		pct = 100;
++	}
++
++	if (lp_save_on && pct != lp_saved_pct && (ns - lp_saved_ns >= SAVE_NS || lp_saved_ns == 0)) {
++		save_record(pct, lp_last_temp);
++		lp_saved_ns = ns;
++	}
++
++	b->valid = 1;
++	b->soc = (unsigned)pct;
++	b->mv = mv;
++	b->ma = ma;
++	b->temp_dC = lp_last_temp;
++	b->temp_valid = temp_ok;
++	b->cycles = lp_cycles;
++	b->full_mah = lp_cap_mah;
++	b->design_mah = DESIGN_MAH;
++	b->external = external;
++	b->charging = charging;
++	b->full = lp_held_full;
++	b->critical = empty;
++	b->icl_ma = 50u * icl_st;
++	b->family = external ? family_code((apsd_st & 1u) ? apsd : 0, snk) : 0;
++	b->adapter_mv = 5000;
++	b->adapter_ma = b->icl_ma ? b->icl_ma : 500;
++	b->soc_src = lp_soc_src;
++	unsigned left = (unsigned)(lp_soc_uah / 1000);
++	b->ttf_min = (charging && ma > 50) ? (int)((lp_cap_mah - left) * 60u / (unsigned)ma) : 0xffff;
++	b->tte_min = (!external && ma < -50) ? (int)(left * 60u / (unsigned)(-ma)) : 0xffff;
++	if (b->ttf_min > 0xfffe && b->ttf_min != 0xffff) {
++		b->ttf_min = 0xfffe;
++	}
++	if (b->tte_min > 0xfffe && b->tte_min != 0xffff) {
++		b->tte_min = 0xfffe;
++	}
++	if (ns - lp_log_ns >= 300000000000ull || lp_log_ns == 0) {   /* a line every 5 min */
++		lp_log_ns = ns;
++		printf("LAUREL BATTERY: on: PMI632 QG soc %d%% vbat %u mV ibat %d mA temp %d.%d C%s; usbin %s chg state %u icl %u mA%s\n",
++		    pct, mv, ma, lp_last_temp / 10, (lp_last_temp < 0 ? -lp_last_temp : lp_last_temp) % 10,
++		    temp_ok ? "" : " (stale)", external ? "in" : "out", state, b->icl_ma,
++		    charging ? " charging" : lp_held_full ? " full" : lp_usb_susp ? " input suspended" : "");
++	}
++	IOLockUnlock(lp_lock);
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_pmi632.h b/bsd/dev/laurel_pmi632.h
+--- a/bsd/dev/laurel_pmi632.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_pmi632.h	2026-11-01 05:08:53.033534922 +0530
+@@ -0,0 +1,38 @@
++/* laurel 2301: PMI632 battery gauge + SMB5 charger (bsd/dev/laurel_pmi632.c). C and C++. */
++#ifndef LAUREL_PMI632_H
++#define LAUREL_PMI632_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++struct laurel_batt {
++	int valid;              /* 1: a full gauge sample */
++	unsigned soc;           /* 0..100 % */
++	unsigned mv;            /* battery voltage */
++	int ma;                 /* battery current, + = into the battery */
++	int temp_dC;            /* NTC, 0.1 C (25.0 C fixed when temp_valid = 0) */
++	int temp_valid;
++	int cycles;             /* Linux QG cycle count, -1 unknown */
++	unsigned full_mah, design_mah;
++	int external, charging, full, critical;
++	unsigned icl_ma;        /* input current limit now (AICL result) */
++	unsigned fcc_ma, fv_mv; /* our charger limits (0 when not set) */
++	unsigned family;        /* IOPS family code, 0 = no adapter */
++	unsigned adapter_mv, adapter_ma;
++	int ttf_min, tte_min;   /* 0xffff = unknown */
++	const char *soc_src;
++};
++/* Thread context. 0 = on (self-check passed), -1 = off (one "LAUREL BATTERY: off:" line). Idempotent. */
++int laurel_pmi632_init(void);
++/* Thread context. A gauge sample + one charger step. 0 ok, -1 no sample. */
++int laurel_pmi632_sample(struct laurel_batt *b);
++/* PON reasons read at init: PM6125 PON_REASON1, WARM_RESET_REASON1, PMI632 PON_REASON1. -1 unknown. */
++int laurel_pmi632_pon(uint8_t *reason, uint8_t *warm, uint8_t *pmi);
++/* Power off / restart path, any context (no lock): release our USB input suspend. */
++void laurel_pmi632_release_input(void);
++/* IOPMrootDomain will-sleep (SweetBattery): safe charger limits before the system sleeps. Thread context. */
++void laurel_pmi632_will_sleep(void);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff -ruN a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 05:07:24.000000000 +0530
++++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 05:09:13.851000052 +0530
+@@ -1,8 +1,9 @@
+ /*
+- * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+- * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+- * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+- * See report.md for binary evidence, register provenance and integration.
++ * Built-in iOS battery service. Fallback: 100%, AC, not charging.
++ * laurel 2301 (Mi A3): the PMI632 QG gauge + SMB5 charger over SPMI (bsd/dev/laurel_pmi632.c),
++ * polled every 10 s; replaces the topaz SM5602/bq2589x I2C path (the Mi A3 has neither chip) and
++ * the PM6150 reader (SID 0, dead code: it ran only when the I2C path was off). sweetbattery=0 =
++ * static fallback.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -10,16 +11,15 @@
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
++#include <IOKit/pwr_mgt/RootDomain.h>
++#include <IOKit/IOMessage.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+-/* bsd/dev/sweet_i2c1.c: topaz battery bus (QUP0 SE1) */
+-extern "C" int sweet_i2c1_init(void);
+ extern "C" int sweet_cpufreq_max(void);    /* bsd/dev/sweet_cpufreq.c */
+-extern "C" int sweet_i2c1_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len);
+-extern "C" int sweet_i2c1_write(uint8_t addr, uint8_t reg, uint8_t val);
++#include "../../../bsd/dev/laurel_pmi632.h"
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -35,14 +35,13 @@
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+-	void publish(unsigned percent, unsigned mv, int ma, bool external,
+-	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	void publish(const struct laurel_batt *b);
+ 	void poll(void);
+-	bool pollTopaz(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+-	static bool readWord(unsigned address, uint16_t *value);
+-	static unsigned estimatePercent(unsigned mv);
++	static IOReturn sleepWake(void *target, void *refCon, UInt32 messageType, IOService *provider,
++	    void *messageArgument, vm_size_t argSize);
++	IONotifier *fSleepNotifier;
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
+@@ -57,6 +56,7 @@
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
++	fSleepNotifier = NULL;
+ 	fTimerAdded = fRunning = fReal = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+@@ -103,39 +103,98 @@
+ 	}
+ }
+ 
++/* b == NULL: the static fallback (100 %, AC, not charging, nothing measured) */
+ void
+-SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+-    bool capable, bool charging, bool full, bool measured, bool currentValid)
++SweetBattery::publish(const struct laurel_batt *b)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	const bool measured = b != NULL;
++	const unsigned percent = b ? b->soc : 100, mv = b ? b->mv : 4200;
++	const int ma = b ? b->ma : 0;
++	const bool external = b ? b->external : true, charging = b ? b->charging : false;
++	const bool full = b ? b->full : true;
++	const unsigned maxc = b && b->full_mah ? b->full_mah : 4000;
++	const unsigned design = b && b->design_mah ? b->design_mah : 4030;
++	const unsigned capacity = (maxc * percent + 50u) / 100u;
++	const int centiC = b ? b->temp_dC * 10 : 2500;
++	const int cycles = b && b->cycles >= 0 ? b->cycles : 0;
++	const int ttf = b ? b->ttf_min : 0xffff, tte = b ? b->tte_min : 0xffff;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(maxc);
+ 	setExternalConnected(external);
+-	setExternalChargeCapable(capable);
++	setExternalChargeCapable(external);
+ 	setIsCharging(charging);
+-	setAtWarnLevel(false);
+-	/* An uncalibrated voltage curve must not assert a critical shutdown. */
+-	setAtCriticalLevel(false);
++	setAtWarnLevel(b && !external && percent <= 10);
++	/* critical only on a measured empty cell (below 3300 mV for 30 s on battery) */
++	setAtCriticalLevel(b && b->critical);
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+-	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
+-	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
++	/* minutes to full while charging, to empty on battery; 65535 = unknown; never zero minutes */
++	setTimeRemaining(charging ? ttf : !external ? tte : 0xffff);
++	setCycleCount(cycles);
+ 	putBool("FullyCharged", full);
++	putBool("built-in", true);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", maxc);
++	putNumber("AppleRawBatteryVoltage", mv);
++	putNumber("NominalChargeCapacity", maxc);
++	putNumber("DesignCapacity", design);
++	putNumber("DesignCycleCount9C", 500);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	putNumber("Temperature", (UInt32)centiC);  /* hundredths of a degree C */
++	putNumber("AvgTimeToFull", charging ? (UInt32)ttf : 0xffff);
++	putNumber("AvgTimeToEmpty", external ? 0xffff : (UInt32)tte);
++	putNumber("InstantTimeToEmpty", external ? 0xffff : (UInt32)tte);
++	putNumber("PermanentFailureStatus", 0);
++	putNumber("BatteryCellDisconnectCount", 0);
++	putBool("CapacityEstimated", true);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+-	putBool("SweetBatteryCurrentValid", currentValid);
++	putBool("SweetBatteryCurrentValid", measured);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryTemperatureEstimated", !(b && b->temp_valid));
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
++	if (b) {
++		putNumber("LaurelChargerIclMa", b->icl_ma);
++		putNumber("LaurelChargerFccMa", b->fcc_ma);
++		putNumber("LaurelChargerFvMv", b->fv_mv);
++		const OSSymbol *src = OSSymbol::withCString("LaurelBatterySOCSource");
++		OSString *val = OSString::withCString(b->soc_src ? b->soc_src : "none");
++		if (src && val) {
++			setPSProperty(src, val);
++		}
++		OSSafeReleaseNULL(val);
++		OSSafeReleaseNULL(src);
++	}
++
++	/* AdapterDetails: FamilyCode 0 = no adapter (negroni 0365 key set) */
++	{
++		OSDictionary *d = OSDictionary::withCapacity(6);
++		if (d) {
++			unsigned volt = external ? (b ? b->adapter_mv : 5000) : 0;
++			unsigned cur = external ? (b ? b->adapter_ma : 500) : 0;
++			UInt32 family = external ? (b && b->family ? b->family : 0xe0004007u) : 0;
++			static const char *const k[] = {kIOPMPSAdapterDetailsVoltage, kIOPMPSAdapterDetailsAmperageKey,
++				                        kIOPMPSAdapterDetailsWattsKey, kIOPMPSAdapterDetailsSourceIDKey,
++				                        kIOPMPSAdapterDetailsFamilyKey};
++			const UInt32 v[] = {volt, cur, (UInt32)(((uint64_t)volt * cur + 500000) / 1000000), 0, family};
++			for (unsigned i = 0; i < 5; i++) {
++				OSNumber *n = OSNumber::withNumber(v[i], 32);
++				if (n) {
++					d->setObject(k[i], n);
++					n->release();
++				}
++			}
++			d->setObject("IsWireless", kOSBooleanFalse);
++			const OSSymbol *key = OSSymbol::withCString(kIOPMPSAdapterDetailsKey);
++			if (key) {
++				setPSProperty(key, d);
++				key->release();
++			}
++			d->release();
++		}
++	}
+ 
+ 	/* IOPMCopyBatteryInfo's per-source compatibility dictionary. */
+ 	OSDictionary *legacy = OSDictionary::withCapacity(7);
+@@ -143,7 +202,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, maxc, mv, (UInt32)ma, (UInt32)cycles,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -160,263 +219,39 @@
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
+-		    percent, mv, external, charging);
++		    measured ? "PMI632 QG" : "static fallback", percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+ }
+ 
+-/* Keep the proven single-byte observer command. Read two matching whole
+- * words to reject most torn ADC samples without writing the QG HOLD bit.
+- * This is a bounded consistency check, not a hardware snapshot guarantee. */
+-bool
+-SweetBattery::readWord(unsigned address, uint16_t *value)
+-{
+-	uint16_t previous = 0;
+-	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+-		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
+-			return false;
+-		}
+-		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+-		if (attempt && next == previous) {
+-			*value = next;
+-			return true;
+-		}
+-		previous = next;
+-	}
+-	return false;
+-}
+-
+-unsigned
+-SweetBattery::estimatePercent(unsigned mv)
+-{
+-	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
+-	 * Load sag, temperature, aging and charging introduce large errors. */
+-	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
+-	    4000, 4100, 4200, 4350};
+-	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
+-	if (mv <= volts[0]) {
+-		return soc[0];
+-	}
+-	for (unsigned i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
+-		if (mv < volts[i]) {
+-			return soc[i - 1] + (mv - volts[i - 1]) * (soc[i] - soc[i - 1]) /
+-			       (volts[i] - volts[i - 1]);
+-		}
+-	}
+-	return 100;
+-}
+-
+-/*
+- * topaz charger control (MakrSas/topaz-woa TopazBattery gauge.c ChargerLimits/ChargerPolicy):
+- * left alone the bq2589x-class charger at 0x6a runs on its power-on defaults (slow, and its
+- * watchdog puts them back), so with an adapter in: input limit from BC1.2 (CDP 1.5 A,
+- * DCP/HVDCP 2 A), charge current 2 A and 4.40 V with the topaz DTB software JEITA zones on
+- * the pack's NTC (SM5602 TEMP_EX, DTB thermal table), charging on, OTG off, watchdog off.
+- * No PD contract, no charge pumps (the fast path stays Windows-only for now). sweetchg=0: hands off.
+- */
+-static const uint16_t topaz_ntc[101] = {        /* -20..80 degC, signed 16-bit */
+-	0x506e, 0x4f35, 0x4e07, 0x4cc0, 0x4b76, 0x4a25, 0x48bd, 0x475d, 0x45f5, 0x4477,
+-	0x4304, 0x4175, 0x3fde, 0x3e4a, 0x3ca2, 0x3af6, 0x3945, 0x378a, 0x35cb, 0x33fc,
+-	0x322b, 0x3059, 0x2e82, 0x2ca0, 0x2ac6, 0x28c6, 0x26e0, 0x24ea, 0x22e8, 0x20ef,
+-	0x1ee7, 0x1cee, 0x1ae8, 0x18d0, 0x16d6, 0x14ce, 0x12f3, 0x10e4, 0x0ed6, 0x0cc4,
+-	0x0abc, 0x08bc, 0x06a8, 0x04ad, 0x02a1, 0x009e, 0xf669, 0xf471, 0xf278, 0xf081,
+-	0xee7b, 0xec8c, 0xeaa1, 0xe8be, 0xe6e1, 0xe505, 0xe332, 0xe162, 0xdf9b, 0xddd9,
+-	0xdc1f, 0xda67, 0xd8b4, 0xd70b, 0xd565, 0xd3c7, 0xd232, 0xd0a1, 0xcf18, 0xcd94,
+-	0xcc18, 0xcaa5, 0xc936, 0xc7d3, 0xc670, 0xc519, 0xc3c6, 0xc27a, 0xc136, 0xbff7,
+-	0xbec1, 0xbd92, 0xbc6e, 0xbb4d, 0xba36, 0xb922, 0xb816, 0xb712, 0xb611, 0xb517,
+-	0xb422, 0xb334, 0xb249, 0xb164, 0xb085, 0xafad, 0xaed8, 0xae0a, 0xad3e, 0xac78,
+-	0xabb7,
+-};
+-
+-static int
+-topaz_ntc_tenths(uint16_t raw)
+-{
+-	int16_t v = (int16_t)raw;
+-	if (raw >= 0x8001 && raw <= 0x823B) {
+-		v = 0;
+-	}
+-	if (v >= (int16_t)topaz_ntc[0]) {
+-		return -200;
+-	}
+-	for (int i = 1; i < 101; i++) {
+-		if (v >= (int16_t)topaz_ntc[i]) {
+-			int hi = (int16_t)topaz_ntc[i - 1], lo = (int16_t)topaz_ntc[i];
+-			return (i - 1) * 10 - 200 + (hi - v) * 10 / (hi - lo);
+-		}
+-	}
+-	return 800;
+-}
+-
+-static const struct { int min_tenths; unsigned ichg_ma, vreg_mv; } topaz_jeita[] = {
+-	{ -1000, 0, 0 }, { -100, 490, 4400 }, { 0, 950, 4400 }, { 50, 2000, 4400 },
+-	{ 480, 1024, 4100 }, { 600, 0, 0 },
+-};
+-#define TOPAZ_JEITA_ZONES (sizeof(topaz_jeita) / sizeof(topaz_jeita[0]))
+-
+-static unsigned
+-topaz_jeita_zone(int tenths)
+-{
+-	unsigned z = 0;
+-	while (z + 1 < TOPAZ_JEITA_ZONES && tenths >= topaz_jeita[z + 1].min_tenths) {
+-		z++;
+-	}
+-	return z;
+-}
+-
+-static void
+-topaz_charger(uint8_t r0b, int tenths)
++void
++SweetBattery::poll(void)
+ {
+-	static int enabled = -1;
+-	static unsigned zone = TOPAZ_JEITA_ZONES;
+-	unsigned vbus = (r0b >> 5) & 7u;
+-	uint8_t r00, r03, r04, r06, r07;
+-
+-	if (enabled < 0) {
+-		enabled = 1;
+-		(void)PE_parse_boot_argn("sweetchg", &enabled, sizeof(enabled));
+-	}
+-	if (!enabled || vbus < 1 || vbus > 6) {
++	struct laurel_batt b;
++	if (fReal && laurel_pmi632_sample(&b) == 0 && b.valid) {
++		publish(&b);
+ 		return;
+ 	}
+-	/* to a zone with less current at once, to one with more only 1.5 degC inside it */
+-	unsigned z = topaz_jeita_zone(tenths);
+-	if (zone < TOPAZ_JEITA_ZONES && z != zone && topaz_jeita[z].ichg_ma >= topaz_jeita[zone].ichg_ma &&
+-	    (topaz_jeita_zone(tenths - 15) != z || topaz_jeita_zone(tenths + 15) != z)) {
+-		z = zone;
+-	}
+-	if (sweet_i2c1_read(0x6a, 0x00, &r00, 1) || sweet_i2c1_read(0x6a, 0x03, &r03, 1) ||
+-	    sweet_i2c1_read(0x6a, 0x04, &r04, 1) || sweet_i2c1_read(0x6a, 0x06, &r06, 1) ||
+-	    sweet_i2c1_read(0x6a, 0x07, &r07, 1)) {
+-		return;
+-	}
+-	unsigned iin = vbus == 2 ? 1500 : (vbus == 3 || vbus == 4) ? 2000 : 0;
+-	uint8_t w00 = iin ? (uint8_t)((r00 & 0xC0) | ((iin - 100) / 50)) : r00;
+-	uint8_t w04 = r04, w06 = r06;
+-	bool allow = topaz_jeita[z].ichg_ma != 0;
+-	if (allow) {
+-		w04 = (uint8_t)((r04 & 0x80) | (topaz_jeita[z].ichg_ma / 64));
+-		w06 = (uint8_t)((r06 & 0x03) | (((topaz_jeita[z].vreg_mv - 3840) / 16) << 2));
+-	}
+-	uint8_t w03 = (uint8_t)(((r03 & ~0x10u) | (allow ? 0x10u : 0)) & ~0x20u);   /* CHG_CONFIG, OTG off */
+-	uint8_t w07 = (uint8_t)(r07 & ~0x30u);                                    /* watchdog off */
+-	if (w06 != r06) sweet_i2c1_write(0x6a, 0x06, w06);
+-	if (w04 != r04) sweet_i2c1_write(0x6a, 0x04, w04);
+-	if (w00 != r00) sweet_i2c1_write(0x6a, 0x00, w00);
+-	if (w07 != r07) sweet_i2c1_write(0x6a, 0x07, w07);
+-	if (w03 != r03) sweet_i2c1_write(0x6a, 0x03, w03);
+-	if (z != zone || w00 != r00 || w04 != r04 || w03 != r03) {
+-		IOLog("SWEET CHARGER: vbus_stat %u, %d.%d C zone %u: iinlim %u mA, ichg %u mA, vreg %u mV, %s (r00 %02x r03 %02x r04 %02x r06 %02x r07 %02x)\n",
+-		    vbus, tenths / 10, (tenths < 0 ? -tenths : tenths) % 10, z, 100 + 50 * (w00 & 0x3F), 64 * (w04 & 0x7F),
+-		    3840 + 16 * (w06 >> 2), allow ? "charging" : "NOT charging (temperature)", w00, w03, w04, w06, w07);
+-	}
+-	zone = z;
++	publish(NULL);
+ }
+ 
+ /*
+- * topaz (MakrSas/topaz-woa TopazBattery gauge.c): SM5602 fuel gauge at 0x71
+- * (16-bit little-endian words) and the bq25890-map charger at 0x6a, REG0B.
+- * The gauge is only read; the charger gets its limits from topaz_charger() above.
++ * laurel 2301: before a system sleep the charger gets 500 mA / 4100 mV (the gauge poll and the charger
++ * guard timer do not run while asleep); the first charger step after wake writes the zone limits again.
+  */
+-bool
+-SweetBattery::pollTopaz(void)
+-{
+-	uint8_t w[2], st = 0;
+-	uint16_t soc, volt, cur, full;
+-	if (sweet_i2c1_read(0x71, 0x05, w, 2)) {
+-		return false;
+-	}
+-	soc = (uint16_t)(w[0] | w[1] << 8);
+-	if (sweet_i2c1_read(0x71, 0x07, w, 2)) {
+-		return false;
+-	}
+-	volt = (uint16_t)(w[0] | w[1] << 8);
+-	if (sweet_i2c1_read(0x71, 0x08, w, 2)) {
+-		return false;
+-	}
+-	cur = (uint16_t)(w[0] | w[1] << 8);
+-	bool fullOk = sweet_i2c1_read(0x71, 0x62, w, 2) == 0;
+-	full = fullOk ? (uint16_t)(w[0] | w[1] << 8) : 0;
+-	bool chgOk = sweet_i2c1_read(0x6a, 0x0b, &st, 1) == 0;
+-	bool texOk = sweet_i2c1_read(0x71, 0x0a, w, 2) == 0;
+-	int tenths = texOk ? topaz_ntc_tenths((uint16_t)(w[0] | w[1] << 8)) : 250;
+-	if (chgOk && texOk) {
+-		topaz_charger(st, tenths);
+-	}
+-
+-	unsigned percent = (soc & 0x8000u) ? 0 : ((soc >> 8) & 0x7fu);
+-	unsigned mv = 1800u * (volt & 0x7fffu) / 19622u + 2700u;
+-	int ma = (int)((cur & 0x7fffu) * 1000u / 4088u * 2u);
+-	if (cur & 0x8000u) {
+-		ma = -ma;               /* bit 15: discharging */
+-	}
+-	unsigned fullMah = (full & 0x7fffu) * 1000u / 2048u;
+-	if (percent > 100 || mv < 2800 || mv > 4600) {
+-		return false;
+-	}
+-	unsigned vbus = (st >> 5) & 7u, chrg = (st >> 3) & 3u;
+-	bool external = chgOk && vbus >= 1 && vbus <= 6 && (st & 4u);
+-	bool charging = external && (chrg == 1 || chrg == 2);
+-	bool done = external && chrg == 3;
+-	publish(done ? 100 : percent, mv, ma, external, external, charging, done, true, true);
+-	static unsigned logs;
+-	if (logs++ % 20 == 0) {
+-		IOLog("SWEET BATTERY: topaz %u%% %umV %dmA full=%umAh chg=%#x external=%d charging=%d\n",
+-		    percent, mv, ma, fullMah, st, external, charging);
+-	}
+-	return true;
+-}
+-
+-void
+-SweetBattery::poll(void)
+-{
+-	if (fReal && pollTopaz()) {
+-		return;
+-	}
+-	if (fReal) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
+-		return;
+-	}
+-	uint8_t type, present, usb, path, charger, error, temperature;
+-	uint16_t rawVoltage;
+-	bool valid = fReal &&
+-	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+-	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
+-	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+-	    !sweet_spmi_read(0, 0x1310, &usb) &&
+-	    !sweet_spmi_read(0, 0x110b, &path) &&
+-	    !sweet_spmi_read(0, 0x1006, &charger) &&
+-	    !sweet_spmi_read(0, 0x1007, &error) &&
+-	    !sweet_spmi_read(0, 0x100d, &temperature);
+-	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
+-	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+-	valid = valid && mv >= 2800 && mv <= 4600;
+-	if (!valid) {
+-		publish(100, 4200, 0, true, true, false, true, false, false);
+-		return;
+-	}
+-	bool external = (usb & 0x10u) != 0;
+-	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+-	unsigned state = charger & 7u;
+-	bool charging = capable && state >= 1 && state <= 4 &&
+-	    !(error & 2u) && !(temperature & 0x0cu);
+-	/* Inhibit (0) does not by itself establish full capacity. */
+-	bool full = external && state == 5 && !(error & 2u);
+-	int ma = 0;
+-	uint8_t subtype;
+-	uint16_t rawCurrent;
+-	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
+-	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
+-	    rawCurrent != 0x8000;
+-	if (currentValid) {
+-		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
+-		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+-		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
++IOReturn
++SweetBattery::sleepWake(void *target, void *refCon, UInt32 messageType, IOService *provider,
++    void *messageArgument, vm_size_t argSize)
++{
++	(void)target; (void)refCon; (void)provider; (void)argSize;
++	if (messageType == kIOMessageSystemWillSleep) {
++		laurel_pmi632_will_sleep();
++		IOPowerStateChangeNotification *note = (IOPowerStateChangeNotification *)messageArgument;
++		if (note) {
++			note->returnValue = 0;  /* done synchronously */
++		}
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
+-	    charging, full, true, currentValid);
++	return kIOReturnSuccess;
+ }
+ 
+ void
+@@ -436,9 +271,15 @@
+ 		return false;
+ 	}
+ 	(void)sweet_cpufreq_max();
+-	int real = 1;   /* topaz: real gauge by default; sweetbattery=0 for the static fallback */
++	int real = 1;   /* real gauge by default; sweetbattery=0 for the static fallback */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_i2c1_init() == 0;
++	fReal = real == 1 && laurel_pmi632_init() == 0;   /* laurel 2301: PMI632 over SPMI */
++	if (fReal) {
++		fSleepNotifier = registerSleepWakeInterest(&SweetBattery::sleepWake, this, NULL);
++		if (!fSleepNotifier) {
++			IOLog("LAUREL CHARGER: no sleep notification: limits are not lowered before a system sleep\n");
++		}
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -467,6 +308,10 @@
+ 		fLoop->removeEventSource(fTimer);
+ 		fTimerAdded = false;
+ 	}
++	if (fSleepNotifier) {
++		fSleepNotifier->remove();
++		fSleepNotifier = NULL;
++	}
+ 	IOPMPowerSource::stop(provider);
+ }
+ 

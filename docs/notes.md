@@ -3987,3 +3987,44 @@ Details and expected lines: `docs/laurel_sprout/wifi.md`.
 - Then rebased on area E (282bc27: 2400 FAT index, 2404 TrustZone/SMMU locks + pool check; it holds laurel-int-1): 2500's
   own FAT16 reader is gone, TopazAudio reads image/adsp.* through topaz_part_fw_* again (2500 now needs 2400).
   Build: 233 patches apply, no warnings, 0 LSE, kernel sha256 b16faf25...; RedwoodAudio 33449356... (same).
+
+## Mi A3 area D: battery, charger, charge-only boot, power off, thermal + cpufreq (2026-11-01 04:30, patches 2300-2303)
+
+Details: `docs/laurel_sprout/battery-power.md`.
+- [V source] Why the battery stayed `static fallback` after 2018: (1) `SweetBattery::poll()` read SPMI only with `fReal`
+  false but required `fReal` for a valid sample (dead code); with `fReal` true it read the topaz I2C chips (SM5602 0x71,
+  bq2589x 0x6a) that the Mi A3 does not have; (2) `sweet_spmi_read()` took SID 0 only; the Mi A3 gauge/charger are PMI632
+  SID 2 (PPID 0x248 QG, 0x210-0x216 SMB5). The arbiter path itself was right (keys and the PON lane use it).
+- [V boot log 03:59] `PS_HOLD_RST_CTL 0x01` at boot = warm-reset type: a PS_HOLD drop for "power off" would reset, not
+  power off [I]. 2302 sets type 4 (SHUTDOWN) before PSCI SYSTEM_OFF, as Linux qpnp_pon_system_pwr_off.
+- [V source] SM6125 cpufreq is the OSM (`qcom,clk-cpu-osm-trinket`), not cpufreq-hw: pwrcl 0xf521000, perfcl 0xf523000, LUT
+  0x110 + 32 * row (12 rows), perf state 0x920 (same offsets topaz used for Gold). TSENS v2 TM 0x4411000, status 0xa0 + 4n,
+  sensors 6-8 Silver, 9-12 Gold, 15 GPU (trinket-thermal.dtsi).
+- [V source] PM6125 PON is GEN2 (subtype 0x04 seen at boot): PON_REASON1 is at 0x8c0, WARM_RESET_REASON1 0x8c2
+  (qpnp-power-on.c PON_OFFSET), not 0x808.
+- [V source] PMI632 ADC5 battery NTC: BAT_THERM_PU2 (0x4a), ratiometric, adcmap_batt_therm_100k (lut index 0), full scale 0x70e4.
+- [V source] Battery: 4030-4040 mAh 4.40 V (Sunwoda/Feimaotui/default Wingtech profiles), JEITA hard 0/60 C, FV 4100 mV above
+  44 C; charger DT: ICL 2000 mA, FCC max 3000 mA, SMB1355 as parallel (not driven by us).
+- Patches 2300 (SPMI SID 2 + owner-checked writes), 2301 (laurel_pmi632.c gauge + SMB5 charger + negroni key set),
+  2302 (charge-only boot before launchd, PS_HOLD shutdown type), 2303 (laurel_thermal.c OSM governor + TSENS caps).
+  Build `areaD-k2303`: 223 patches applied, 0 LSE. NOT BOOTED (the coordinator tests).
+- [U] SMB5/VADC/SDAM APID owners (expected EE 0), the PON reason bits of a cable power-on, whether power off with the cable
+  in powers on again. The first boot prints all of them (`LAUREL BATTERY: on: ... pon 0x.. warm 0x.. pmi 0x..`).
+- Review fixes (2026-11-01 04:47, review ACCEPT-WITH-FIXES of 661609a): B1 charger control only with a working battery NTC,
+  30 s without a good sample -> 500 mA / 4100 mV and control off; M1 hard JEITA thresholds 0x1098-0x109b checked against the
+  Linux codes 0x15aa/0x6894 (written + read back if not), boot FCC/FV restored on control off; M2 ICL HW_AUTO on unplug;
+  M3 warm-zone USB input suspend above FV + 50 mV, full only at FV 4400; M4 uAh master SoC; M5 charge mode exits after 10
+  failed reads; M6 PS_HOLD type per reset (off 4 with restore, plain restart 7, reason 1); M7 thermal cap to row 0.
+  Build `areaD-k2304`: 223 patches, 0 LSE, kernel sha256 b1cc64f1... (the two `linker command failed` lines in build.log
+  are the usual PGO ones, also in the main tree's log). NOT BOOTED.
+- Safety re-check fixes (2026-11-01 05:01, rebased onto laurel-int-1): NTC watchdog before every early return + own 10 s
+  thread_call; every charger control-off writes 500 mA / 4100 mV first; safe limits when control cannot turn on; USB input
+  suspend released at start and before power off / restart (lock-free USBIN lane); one-sided hard-limit window; TSENS
+  -40..125 C with outlier rejection; PS_HOLD writes read back; charge mode powers off only after the USBIN plug-in bit is
+  clear 5 s. `bsd/conf/files` entries moved after sweet_i2c1.c (2700's hunk context). Build `areaD-k2305`: 231 patches,
+  0 LSE, kernel sha256 ddfd8d15... NOT BOOTED.
+- Unattended-safety follow-up (2026-11-01 05:10, on top of 58b85b8 = SAFE-TO-TEST supervised): failed safe writes retried
+  every 10 s until read back (timer never stops while pending); FV written even when its read fails; write-check and
+  battery self-check failures write the safe limits (SMB5 EE 0); safe limits before IOPMrootDomain will-sleep; kill
+  switches laurelbatt=0/laurelchg=0 = no writes (previous limits stay). Build `areaD-k2306`: 231 patches, 0 LSE, kernel
+  sha256 7bda8194... NOT BOOTED.

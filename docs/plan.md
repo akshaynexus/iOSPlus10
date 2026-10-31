@@ -623,3 +623,19 @@ exception, or ask for a macOS path (Xcode clang/ld/codesign in gpu-env.sh).
   pool 0xE0000000-0xE1000000 unchanged). `tools/op10tool/tests/fatls-test.sh` all ok. No image built in this round (needs the Mu FD
   with area A's 0101); the coordinator builds it.
 
+
+## Mi A3: battery, charger, charge mode, power off, thermal + cpufreq built (2026-11-01 04:30, area D, patches 2300-2303)
+
+Done [V build]: 2300 PMI632 SID 2 SPMI reads + owner-checked writes; 2301 `laurel_pmi632.c` (QG gauge, ADC5 NTC, SoC model
+with SDAM save, SMB5 input limit + software JEITA, full IOPMPowerSource key set incl. AdapterDetails); 2302 charge-only boot
+(cold charger power-on -> no launchd, battery line every 10 s, power key = boot iOS, unplug = power off) + PS_HOLD SHUTDOWN
+type before PSCI SYSTEM_OFF (boot showed type 0x01 = warm reset); 2303 OSM governor (Silver + Gold) + TSENS caps instead
+of the topaz Gold pin. Kernel builds (223 patches, 0 LSE). Not booted. Details: `docs/laurel_sprout/battery-power.md`.
+Next (coordinator): boot; check `LAUREL BATTERY: on: PMI632 QG soc N% ...`, `LAUREL CHARGER: on: ...`, `LAUREL CPUFREQ: on`,
+`LAUREL THERMAL: on`, `LAUREL CHARGE MODE: on: normal boot (pon ..)`; iOS battery % = the logged soc; plug/unplug -> the
+`LAUREL CHARGER: on: SMB5 usbin ...` line and the bolt; `ctl poweroff` -> `PS_HOLD_RST_CTL 0x01 -> 0x04 (shutdown)` and the
+phone stays off; then power off + plug in the charger -> `charger power-on` line (charge mode).
+Review fixes built 04:47 (B1 NTC-gated charger + 30 s NTC watchdog, M1 hard JEITA check + boot limits restore, M2-M7, minor
+m4-m7): `areaD-k2304`, 223 patches, 0 LSE. Not booted. Table in `docs/laurel_sprout/battery-power.md` "Review".
+Safety re-check fixes built 05:01 on laurel-int-1 (MUST 1-3, SHOULD 4-6): `areaD-k2305`, 231 patches, 0 LSE. Not booted.
+Unattended-safety follow-up built 05:10 (F1-F5, safe limits before system sleep): `areaD-k2306`, 231 patches, 0 LSE. Not booted.

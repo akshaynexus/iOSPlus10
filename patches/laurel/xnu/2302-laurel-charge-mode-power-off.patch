@@ -1,0 +1,254 @@
+laurel 2302: charge-only boot and a real power off. Charge mode (negroni 0377 idea): before launchd (load_init_program), a cold charger power-on (PM6125 PON_REASON1 0x8c0 USB_CHG/CBL/DC, or PON1 with the PMI632 charger reason; no warm-reset reason 0x8c2, no hard reset/SMPL/RTC/power key) with the charger still in keeps launchd stopped and prints the battery on the kernel console every 10 s while the charger loop runs; power key = boot iOS, charger out for 3 s = power off; any failed check (also 10 failed PMIC reads in a row inside charge mode) boots iOS normally; power key polled every 200 ms; power off only after the USBIN plug-in RT bit is clear for 5 s (a collapsing charger keeps it). Power off and restart release our USB input suspend first; the PS_HOLD writes are checked and read back (failure logged, the S2 enable always restored). Lines 'LAUREL CHARGE MODE: on: normal boot (pon .. warm .. pmi .. charger N)' / 'on: charger power-on ...' / 'off: <reason>'; kill switch laurelchgmode=0. Power off (2003) now sets the PM6125 PS_HOLD reset type to SHUTDOWN (0x85A type 4 with the 0x85B enable cleared and set, as Linux qpnp_pon_system_pwr_off) before PSCI SYSTEM_OFF, and writes the old type back if PSCI returns; a plain restart selects HARD_RESET (type 7, msm-poweroff without a command), a restart with a reason keeps the 2018 warm reset; line 'LAUREL REBOOT: PS_HOLD_RST_CTL 0x.. -> 0x.. (shutdown)'.
+
+diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
+--- a/bsd/dev/laurel_pmi632.c	2026-11-01 05:08:53.033026620 +0530
++++ b/bsd/dev/laurel_pmi632.c	2026-11-01 05:09:33.453487740 +0530
+@@ -1110,4 +1110,128 @@
+ 	IOLockUnlock(lp_lock);
+ 	return 0;
+ }
++/*
++ * laurel 2302: charge-only boot (negroni 0377 idea, Mi A3 path). Powered off + a charger plugged in:
++ * the PMIC powers on (PON reason USB_CHG / CBL / DC on the PM6125, or PON1 = the PMI632 with the
++ * charger reason), ABL starts boot_b (our UEFI image; androidboot.mode=charger, if ABL adds it, is not
++ * passed on by Mu/DarwinBoot), and iOS would come up fully. Here, before launchd (load_init_program):
++ * a cold charger power-on (no warm-reset reason, no hard reset / SMPL / RTC / power key) with the
++ * charger still in enters charge mode: no launchd, one console line every 10 s with the battery
++ * (kernel console on the panel), the charger loop runs (SweetBattery's 10 s poll and our sample).
++ * Power key pressed: leave charge mode and boot iOS. Cable out (USBIN plug-in RT clear) for 5 s: power off. Any check that
++ * fails boots iOS normally, also 10 failed PMIC reads in a row inside charge mode. Kill switch
++ * laurelchgmode=0. [U] If ABL itself stops on a cable power-on (its charger screen, or fastboot), our
++ * kernel never runs: that case is ABL's (docs/laurel_sprout/battery-power.md).
++ */
++extern void laurel_power_off(void);
++#define CM_FAILS 10
++#define CM_OUT_S 5      /* USBIN plug-in RT clear for 5 checks (1 s apart) before power off */
++
++/* charger in now: USBIN plug-in RT status and a valid input in the power path */
++static int
++lp_external(void)
++{
++	uint8_t usbrt = 0, path = 0;
++	if (rd(USBIN + 0x10, &usbrt) || rd(DCDC + 0x0b, &path)) {
++		return -1;
++	}
++	return (usbrt & 0x10u) && ((path & 0x01u) || lp_usb_susp);   /* our warm-zone suspend: still plugged */
++}
++
++/* cable present: USBIN plug-in RT status alone (a collapsing or weak charger keeps it; the power path
++ * may drop). 1 in, 0 out, -1 read failed. Charge mode powers off only on this one. */
++static int
++lp_plugged(void)
++{
++	uint8_t usbrt = 0;
++	if (rd(USBIN + 0x10, &usbrt)) {
++		return -1;
++	}
++	return (usbrt & 0x10u) != 0;
++}
++
++/* power key down (PM6125 PON INT_RT_STS 0x810 bit 0): 1 down, 0 up, -1 no agreeing read (the keys thread
++ * polls the same APID). Polled every 200 ms: a press shorter than that can be missed [I]. */
++static int
++lp_power_key(void)
++{
++	uint8_t a = 0, b = 0;
++	for (unsigned t = 0; t < 3; t++) {
++		if (sweet_spmi_pon_read(0x810, &a) == 0 && sweet_spmi_pon_read(0x810, &b) == 0 && a == b) {
++			return (a & 1u) != 0;
++		}
++	}
++	return -1;
++}
++
++void
++laurel_charge_mode(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("laurelchgmode", &on, sizeof(on));
++	if (!on) {
++		printf("LAUREL CHARGE MODE: off: laurelchgmode=0\n");
++		return;
++	}
++	if (laurel_pmi632_init() != 0) {
++		printf("LAUREL CHARGE MODE: off: no PMI632 gauge\n");
++		return;
++	}
++	uint8_t r = 0, w = 0, p = 0;
++	if (laurel_pmi632_pon(&r, &w, &p) != 0) {
++		printf("LAUREL CHARGE MODE: off: PM6125 PON reason not read\n");
++		return;
++	}
++	/* PON_REASON1: 0 HARD_RESET, 1 SMPL, 2 RTC, 3 DC_CHG, 4 USB_CHG, 5 PON1 (secondary PMIC), 6 CBL, 7 KPD */
++	bool cable = (r & 0x58u) || ((r & 0x20u) && (p & 0x58u));
++	bool other = (r & 0x87u) != 0;
++	int ext = lp_external();
++	if (w || other || !cable || ext != 1) {
++		printf("LAUREL CHARGE MODE: on: normal boot (pon 0x%02x warm 0x%02x pmi 0x%02x charger %d)\n", r, w, p, ext);
++		return;
++	}
++	printf("LAUREL CHARGE MODE: on: charger power-on (pon 0x%02x pmi 0x%02x): charging screen; power key = boot iOS, cable out 5 s = power off\n",
++	    r, p);
++	/* 200 ms ticks: power key every tick, charger presence every 1 s, battery line every 10 s.
++	 * CM_FAILS reads in a row that fail: leave charge mode and boot iOS (never hang on a dead bus). */
++	unsigned out_n = 0, fails = 0;
++	for (unsigned tick = 0;; tick++) {
++		int k = lp_power_key();
++		fails = (k < 0) ? fails + 1 : fails;
++		if (k == 1) {
++			printf("LAUREL CHARGE MODE: power key: booting iOS\n");
++			return;
++		}
++		if (tick % 5 == 0) {
++			IOLockLock(lp_lock);
++			int e = lp_plugged();
++			IOLockUnlock(lp_lock);
++			fails = (e < 0) ? fails + 1 : (k >= 0 ? 0 : fails);
++			out_n = (e == 0) ? out_n + 1 : (e == 1 ? 0 : out_n);
++			if (out_n >= CM_OUT_S) {
++				printf("LAUREL CHARGE MODE: charger out: power off\n");
++				delay(200000);
++				laurel_power_off();
++				printf("LAUREL CHARGE MODE: power off refused: booting iOS\n");
++				return;
++			}
++		}
++		if (tick % 50 == 0) {
++			struct laurel_batt b;
++			if (laurel_pmi632_sample(&b) == 0) {
++				printf("LAUREL CHARGE MODE: battery %u%% %s, %u mV %d mA %d.%d C\n", b.soc,
++				    b.full ? "full" : b.charging ? "charging" : "not charging", b.mv, b.ma, b.temp_dC / 10,
++				    (b.temp_dC < 0 ? -b.temp_dC : b.temp_dC) % 10);
++			} else {
++				fails++;
++			}
++		}
++		if (fails >= CM_FAILS) {
++			printf("LAUREL CHARGE MODE: off: %u PMIC reads failed in a row: booting iOS\n", fails);
++			return;
++		}
++		IOSleep(200);
++	}
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_pmi632.h b/bsd/dev/laurel_pmi632.h
+--- a/bsd/dev/laurel_pmi632.h	2026-11-01 05:08:53.033534922 +0530
++++ b/bsd/dev/laurel_pmi632.h	2026-11-01 05:09:33.453189195 +0530
+@@ -32,6 +32,8 @@
+ void laurel_pmi632_release_input(void);
+ /* IOPMrootDomain will-sleep (SweetBattery): safe charger limits before the system sleeps. Thread context. */
+ void laurel_pmi632_will_sleep(void);
++/* laurel 2302: charge-only boot; init thread, before launchd. Returns to boot iOS; may power off. */
++void laurel_charge_mode(void);
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN a/bsd/dev/laurel_reboot.c b/bsd/dev/laurel_reboot.c
+--- a/bsd/dev/laurel_reboot.c	2026-11-01 05:07:24.000000000 +0530
++++ b/bsd/dev/laurel_reboot.c	2026-11-01 05:07:52.874193438 +0530
+@@ -39,6 +39,7 @@
+  * word alone did nothing on this device (boot 2026-11-01 03:48: "ctl bootloader" booted normally).
+  */
+ #include "sweet_spmi.h"
++#include "laurel_pmi632.h"   /* laurel 2302: laurel_pmi632_release_input */
+ #define LR_PON_SUBTYPE   0x805u
+ #define LR_PON_RST_CTL   0x85au
+ #define LR_PON_RST_CTL2  0x85bu
+@@ -147,22 +148,72 @@
+ 	    spare, back, reason, w1, w2, w3, w4);
+ }
+ 
++/*
++ * laurel 2302: every reset selects its own PS_HOLD type on the PM6125 PON, as Linux does
++ * (qpnp_pon_reset_config: clear the S2 enable 0x85B bit 7, type in 0x85A [3:0], enable again; types of
++ * qcom,qpnp-power-on.h: 1 warm reset, 4 shutdown, 7 hard reset). The PMIC otherwise keeps the type of
++ * the last writer (boot 2026-11-01 03:59: 0x01 = warm, so a PS_HOLD drop for "power off" resets).
++ *   power off             4 SHUTDOWN (msm-poweroff do_msm_poweroff), then PSCI SYSTEM_OFF; if PSCI
++ *                         returns, the old type is written back
++ *   restart, no reason    7 HARD_RESET (msm_restart_prepare without a command; no
++ *                         qcom,force-warm-reboot in the Mi A3 DT)
++ *   restart with reason   1 WARM_RESET + SOFT_RB_SPARE (2018 lr_pon_set)
++ * No PON lane (self-check of 2018 failed): PSCI alone, as before.
++ * Returns the old type, -1 when nothing was written. kdb_printf only (panic hold, timer call).
++ */
++static int
++lr_pon_type(uint8_t type, const char *what)
++{
++	if (lr_pon_shift < 0) {
++		kdb_printf("LAUREL REBOOT: PS_HOLD type not set (no PON lane)\n");
++		return -1;
++	}
++	uint8_t ctl = 0, ctl2 = 0, back = 0;
++	if (sweet_spmi_pon_read(LR_PON_RST_CTL2, &ctl2) != 0 || sweet_spmi_pon_read(LR_PON_RST_CTL, &ctl) != 0) {
++		kdb_printf("LAUREL REBOOT: PS_HOLD type not set (PON read failed)\n");
++		return -1;
++	}
++	int w1 = sweet_spmi_pon_write(LR_PON_RST_CTL2, (uint8_t)(ctl2 & ~0x80u));
++	delay(500);
++	int w2 = w1 == 0 ? sweet_spmi_pon_write(LR_PON_RST_CTL, (uint8_t)((ctl & ~0x0fu) | (type & 0x0fu))) : -1;
++	/* the S2 enable goes back on in every case (also when the type write failed) */
++	int w3 = sweet_spmi_pon_write(LR_PON_RST_CTL2, (uint8_t)(ctl2 | 0x80u));
++	int r = sweet_spmi_pon_read(LR_PON_RST_CTL, &back);
++	int ok = w1 == 0 && w2 == 0 && w3 == 0 && r == 0 && (back & 0x0f) == (type & 0x0f);
++	kdb_printf("LAUREL REBOOT: PS_HOLD_RST_CTL 0x%02x -> 0x%02x (%s)%s, writes %d %d %d\n", ctl, back, what,
++	    ok ? "" : " NOT SET: the PMIC keeps its old type", w1, w2, w3);
++	return ok ? (ctl & 0x0f) : -1;
++}
++
+ void
+ laurel_power_off(void)
+ {
++	laurel_pmi632_release_input();          /* the charger must not stay suspended while off */
++	int old = lr_pon_type(0x04, "shutdown");
++	if (old < 0) {
++		kdb_printf("LAUREL REBOOT: power off without the shutdown type: the PS_HOLD drop may reset\n");
++	}
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_OFF\n");
+ 	int64_t rc = lr_psci(PSCI_SYSTEM_OFF);
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_OFF returned %lld\n", (long long)rc);
++	if (old >= 0) {
++		(void)lr_pon_type((uint8_t)old, "restored");
++	}
+ }
+ 
+ void
+ laurel_restart(void)
+ {
++	laurel_pmi632_release_input();
+ 	if (lr_reason != NULL) {
+ 		*lr_reason = lr_modes[lr_mode].imem;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
+-	lr_pon_set(lr_modes[lr_mode].pon);
++	if (lr_modes[lr_mode].pon) {
++		lr_pon_set(lr_modes[lr_mode].pon);
++	} else {
++		(void)lr_pon_type(0x07, "hard reset");   /* laurel 2302: plain restart, msm-poweroff */
++	}
+ 	/* kdb_printf: also safe in the panic hold (console only, no os_log, no locks) */
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_RESET (%s)\n", lr_modes[lr_mode].name);
+ 	int64_t rc = lr_psci(PSCI_SYSTEM_RESET);
+diff -ruN a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c	2026-11-01 05:07:24.000000000 +0530
++++ b/bsd/kern/kern_exec.c	2026-11-01 05:07:52.874963811 +0530
+@@ -7026,6 +7026,9 @@
+  * 3		2		NA		/usr/appleinternal/sbin/launchd.development
+  * 4		3		1		/sbin/launchd
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern void laurel_charge_mode(void);   /* bsd/dev/laurel_pmi632.c (laurel 2302) */
++#endif
+ void
+ load_init_program(proc_t p)
+ {
+@@ -7034,6 +7037,9 @@
+ 	vm_map_t map = current_map();
+ 	mach_vm_offset_t scratch_addr = 0;
+ 	mach_vm_size_t map_page_size = vm_map_page_size(map);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	laurel_charge_mode();   /* laurel 2302: charge-only boot after a charger power-on */
++#endif
+ 
+ 	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
+ #if CONFIG_MEMORYSTATUS
