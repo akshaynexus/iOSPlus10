@@ -3423,3 +3423,12 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   `__builtin_xnu_type_summary`; ios-sweet-linux's compat header calls every type data-only, so every kalloc_type
   view goes to the data heap and the fixed/var iterators run with 0 views (DEVELOPMENT asserts).
   Fix: `patches/laurel/xnu-linux-fixes/0102` (return early when no view is left, one log line).
+- [V] Mi A3 ABL fastboot, cause of "Requested download size is more than max allowed" (2026-10-31): ABL keeps the
+  bytes of a longer previous command and parses the download size as hex until the first non-hex character.
+  Stock `fastboot flash` sends `getvar:max-download-size` (24 chars) right before `download:010a8000` (17 chars),
+  so ABL reads `download:010a8000ad...` = 0x010a8000ad. `fastboot -S <size>` skips that getvar.
+- [V] Downloads stop at exactly 16 MiB in fastboot sessions entered after an iOS panic (4 times, any write size,
+  stock client too); the session then hangs and needs Power+VolDown. Use `fastboot -S 8M flash ...`
+  (sparse pieces < 16 MiB). Random "unknown command" answers (~1 in 5) are ABL dropping a command: run it again.
+- Procedure: phone in fastboot -> `fastboot -S 8M flash boot_b out/laurel/laurel-boot.img` as the FIRST command
+  (no getvar before) -> `fastboot reboot`. Restore: `fastboot -S 8M flash boot_b ~/laurel-backup/stock/images/boot.img`.
