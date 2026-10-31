@@ -3856,3 +3856,10 @@ Details: `docs/laurel_sprout/battery-power.md`.
   Build `areaD-k2303`: 223 patches applied, 0 LSE. NOT BOOTED (the coordinator tests).
 - [U] SMB5/VADC/SDAM APID owners (expected EE 0), the PON reason bits of a cable power-on, whether power off with the cable
   in powers on again. The first boot prints all of them (`LAUREL BATTERY: on: ... pon 0x.. warm 0x.. pmi 0x..`).
+- Review fixes (2026-11-01 04:47, review ACCEPT-WITH-FIXES of 661609a): B1 charger control only with a working battery NTC,
+  30 s without a good sample -> 500 mA / 4100 mV and control off; M1 hard JEITA thresholds 0x1098-0x109b checked against the
+  Linux codes 0x15aa/0x6894 (written + read back if not), boot FCC/FV restored on control off; M2 ICL HW_AUTO on unplug;
+  M3 warm-zone USB input suspend above FV + 50 mV, full only at FV 4400; M4 uAh master SoC; M5 charge mode exits after 10
+  failed reads; M6 PS_HOLD type per reset (off 4 with restore, plain restart 7, reason 1); M7 thermal cap to row 0.
+  Build `areaD-k2304`: 223 patches, 0 LSE, kernel sha256 b1cc64f1... (the two `linker command failed` lines in build.log
+  are the usual PGO ones, also in the main tree's log). NOT BOOTED.

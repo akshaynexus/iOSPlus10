@@ -1,8 +1,8 @@
-laurel 2303: CPU frequency governor on the SM6125 OSM + TSENS thermal caps (new bsd/dev/laurel_thermal.c; negroni 0280/0283/0284 ideas on trinket hardware). One 100 ms kernel thread: busy % per cluster (processor_cpu_load_info, busiest core over 300 ms) steps the OSM row of Silver (pwrcl 0xf521000) and Gold (perfcl 0xf523000) between the ABL row (floor) and the cap; every 1 s TSENS (0x4411000, sensors 6-12 CPU, 15 GPU) lowers the Gold cap at >= 95 C (Silver too at >= 105 C) and raises it again below 85 C. Replaces the topaz 0094 pin of Gold at max (kept as the fallback when the governor is off). Lines 'LAUREL CPUFREQ: on: OSM governor, silver rows ..' / 'off: ..', 'LAUREL THERMAL: on: TSENS cpu N C gpu N C ..' / 'off: ..', a status line a minute and on cap changes. Kill switches laurelcpugov=0, laurelthermal=0.
+laurel 2303: CPU frequency governor on the SM6125 OSM + TSENS thermal caps (new bsd/dev/laurel_thermal.c; negroni 0280/0283/0284 ideas on trinket hardware). One 100 ms kernel thread: busy % per cluster (processor_cpu_load_info, busiest core over 300 ms) steps the OSM row of Silver (pwrcl 0xf521000) and Gold (perfcl 0xf523000) between the ABL row (floor) and the cap; every 1 s TSENS (0x4411000, sensors 6-12 CPU, 15 GPU) lowers the Gold cap at >= 95 C (down to row 0, below the ABL floor of the governor) (Silver too at >= 105 C) and raises it again below 85 C. Replaces the topaz 0094 pin of Gold at max (kept as the fallback when the governor is off). Lines 'LAUREL CPUFREQ: on: OSM governor, silver rows ..' / 'off: ..', 'LAUREL THERMAL: on: TSENS cpu N C gpu N C ..' / 'off: ..', a status line a minute and on cap changes. Kill switches laurelcpugov=0, laurelthermal=0.
 
 diff -ruN a/bsd/conf/files b/bsd/conf/files
---- a/bsd/conf/files	2026-11-01 04:22:01.766885025 +0530
-+++ b/bsd/conf/files	2026-11-01 04:25:29.588857004 +0530
+--- a/bsd/conf/files	2026-11-01 04:42:07.918236976 +0530
++++ b/bsd/conf/files	2026-11-01 04:42:07.955226513 +0530
 @@ -115,6 +115,7 @@
  bsd/dev/sweet_i2c1.c			standard
  bsd/dev/sweet_cpufreq.c			standard
@@ -13,8 +13,8 @@ diff -ruN a/bsd/conf/files b/bsd/conf/files
  bsd/kern/topaz_sandbox_container.c		standard
 diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 --- a/bsd/dev/laurel_thermal.c	1970-01-01 05:30:00.000000000 +0530
-+++ b/bsd/dev/laurel_thermal.c	2026-11-01 04:25:06.037633969 +0530
-@@ -0,0 +1,326 @@
++++ b/bsd/dev/laurel_thermal.c	2026-11-01 04:46:00.623516933 +0530
+@@ -0,0 +1,336 @@
 +/*
 + * laurel 2303 (Xiaomi Mi A3, SM6125): CPU frequency governor on the OSM + TSENS thermal caps.
 + * Port of the negroni 0280/0283/0284 ideas to the trinket hardware.
@@ -28,11 +28,11 @@ diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 + *          cluster (no per-core DCVS on trinket).
 + *   load   processor_cpu_load_info() (the HOST_CPU_LOAD_INFO ticks): busy % of the busiest core of a
 + *          cluster over the last 300 ms. busy > 70 % -> +1 row (> 90 %: the cap at once), busy < 30 %
-+ *          for 300 ms -> -1 row. Floor = the row ABL left (never below it, negroni 0098 rule), cap =
-+ *          the top row lowered by the thermal cap.
++ *          for 300 ms -> -1 row. The governor's floor = the row ABL left (negroni 0098 rule); the
++ *          thermal cap lowers the top row and may go below that floor, down to row 0 (the cap wins).
 + *   TSENS  tsens0 (trinket.dtsi, "qcom,sm6150-tsens", TSENS v2): TM 0x4411000, SN_STATUS(n) = 0xa0 + 4n,
 + *          [11:0] signed 0.1 C, valid bit 21 (tsens2xxx.c); sensors 6-8 cpuss (Silver), 9-12 Gold cores,
-+ *          15 GPU (trinket-thermal.dtsi). Every 1 s: CPU max >= 95 C: Gold cap -1 row per second
++ *          15 GPU (trinket-thermal.dtsi). Every 1 s: CPU max >= 95 C: Gold cap -1 row per second (to row 0)
 + *          (>= 105 C: Silver cap -1 row too); < 85 C: caps +1 row every 2 s. The Linux DT trips are
 + *          110 C passive (cpuss-x-step); LMh still throttles in hardware.
 + * Lines: "LAUREL THERMAL: on|off: ...", "LAUREL CPUFREQ: on|off: ...", then a line a minute and on cap
@@ -91,14 +91,21 @@ diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 +static uint32_t win_at;
 +static bool sampled;
 +
++/* the governor's lower bound: the ABL row, or the thermal cap when that is lower (the cap wins) */
++static uint32_t
++lo_row(unsigned c)
++{
++	return cl_cap[c] < cl_floor[c] ? cl_cap[c] : cl_floor[c];
++}
++
 +static void
 +wr_row(unsigned c, uint32_t row)
 +{
-+	if (row < cl_floor[c]) {
-+		row = cl_floor[c];
++	if (row < lo_row(c)) {
++		row = lo_row(c);
 +	}
-+	if (row >= cl_rows[c]) {
-+		row = cl_rows[c] - 1;
++	if (row > cl_cap[c]) {
++		row = cl_cap[c];
 +	}
 +	if (row == cl_row[c]) {
 +		return;
@@ -211,7 +218,7 @@ diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 +gov_step(void)
 +{
 +	for (unsigned c = 0; c < CL_N; c++) {
-+		uint32_t cap = cl_cap[c] < cl_floor[c] ? cl_floor[c] : cl_cap[c];
++		uint32_t cap = cl_cap[c];
 +		if (cl_row[c] > cap) {
 +			wr_row(c, cap);
 +		} else if (cl_busy[c] > GOV_JUMP) {
@@ -223,7 +230,7 @@ diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 +			}
 +			cl_low[c] = 0;
 +		} else if (cl_busy[c] < GOV_LO) {
-+			if (++cl_low[c] >= GOV_WINDOW && cl_row[c] > cl_floor[c]) {
++			if (++cl_low[c] >= GOV_WINDOW && cl_row[c] > lo_row(c)) {
 +				wr_row(c, cl_row[c] - 1);
 +				cl_low[c] = 0;
 +			}
@@ -243,10 +250,10 @@ diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 +	read_temps();
 +	uint32_t g = cl_cap[CL_GOLD], s = cl_cap[CL_SILVER];
 +	if (th_cpu >= TH_HOT_DC) {
-+		if (cl_cap[CL_GOLD] > cl_floor[CL_GOLD]) {
++		if (cl_cap[CL_GOLD] > 0) {             /* the cap may go below the ABL row, down to row 0 */
 +			cl_cap[CL_GOLD]--;
 +		}
-+		if (th_cpu >= TH_CRIT_DC && cl_cap[CL_SILVER] > cl_floor[CL_SILVER]) {
++		if (th_cpu >= TH_CRIT_DC && cl_cap[CL_SILVER] > 0) {
 +			cl_cap[CL_SILVER]--;
 +		}
 +	} else if (th_cpu > -1000 && th_cpu < TH_COOL_DC && (sec & 1u) == 0) {
@@ -318,13 +325,16 @@ diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 +		printf("LAUREL THERMAL: off: TSENS not mapped\n");
 +	} else {
 +		read_temps();
-+		if (th_cpu <= -1000 || th_cpu < 0 || th_cpu > 1200) {
++		if (th_cpu < -400 || th_cpu > 1200) {    /* -40..120 C: also a cold start below 0 C */
 +			printf("LAUREL THERMAL: off: no valid TSENS CPU sensor (6-12): %d\n", th_cpu);
 +		} else {
 +			th_on = true;
-+			printf("LAUREL THERMAL: on: TSENS cpu %d.%d C gpu %d.%d C; caps at %d C (Gold), %d C (Silver), release < %d C\n",
-+			    th_cpu / 10, th_cpu % 10, th_gpu / 10, (th_gpu < 0 ? -th_gpu : th_gpu) % 10,
-+			    TH_HOT_DC / 10, TH_CRIT_DC / 10, TH_COOL_DC / 10);
++			printf("LAUREL THERMAL: on: TSENS cpu %d.%d C gpu %d.%d C; caps at %d C (Gold), %d C (Silver), release < %d C; "
++			    "cap range gold %u..%u MHz, silver %u..%u MHz\n",
++			    th_cpu / 10, (th_cpu < 0 ? -th_cpu : th_cpu) % 10, th_gpu / 10, (th_gpu < 0 ? -th_gpu : th_gpu) % 10,
++			    TH_HOT_DC / 10, TH_CRIT_DC / 10, TH_COOL_DC / 10,
++			    cl_khz[CL_GOLD][0] / 1000, cl_khz[CL_GOLD][cl_rows[CL_GOLD] - 1] / 1000,
++			    cl_khz[CL_SILVER][0] / 1000, cl_khz[CL_SILVER][cl_rows[CL_SILVER] - 1] / 1000);
 +		}
 +	}
 +	thread_t thread;
@@ -342,8 +352,8 @@ diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff -ruN a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
---- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:21:46.923283962 +0530
-+++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:25:29.566481431 +0530
+--- a/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:42:07.918760705 +0530
++++ b/iokit/Kernel/arm/SweetBattery.cpp	2026-11-01 04:42:07.955868827 +0530
 @@ -17,6 +17,7 @@
  extern "C" int sweet_spmi_init(void);
  extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);

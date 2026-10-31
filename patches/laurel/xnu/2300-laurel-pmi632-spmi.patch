@@ -1,8 +1,8 @@
-laurel 2300: SPMI reads of the PMI632 (SID 2) battery, charger, ADC and SDAM blocks, and owner-checked writes. sweet_spmi_read took SID 0 only (the PM6150 map of sweet): on the Mi A3 the gauge and the charger are at SID 2 (pmi632.dtsi), so no battery register was reachable even with the trinket arbiter bases of 2018. New: sweet_spmi_owner() (ownership table cnfg 0x700 + 4 * APID) and sweet_spmi_write() (EXT_WRITEL on the APID's rw channel, only EE 0 APIDs, only the SMB5 FCC/FV/ICL registers, the VADC conversion request and our SDAM record 0xa8..0xaf). Reads and writes keep the lock and the per-APID poison of the topaz reader.
+laurel 2300: SPMI reads of the PMI632 (SID 2) battery, charger, ADC and SDAM blocks, and owner-checked writes. sweet_spmi_read took SID 0 only (the PM6150 map of sweet): on the Mi A3 the gauge and the charger are at SID 2 (pmi632.dtsi), so no battery register was reachable even with the trinket arbiter bases of 2018. New: sweet_spmi_owner() (ownership table cnfg 0x700 + 4 * APID) and sweet_spmi_write() (EXT_WRITEL on the APID's rw channel, only EE 0 APIDs, only the SMB5 FCC/FV/ICL/input-suspend registers and the hard JEITA thresholds, the VADC conversion request and our SDAM record 0xa8..0xaf). Reads and writes keep the lock and the per-APID poison of the topaz reader.
 
 diff -ruN a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
---- a/bsd/dev/sweet_spmi.c	2026-11-01 04:17:22.474216041 +0530
-+++ b/bsd/dev/sweet_spmi.c	2026-11-01 04:18:00.268420263 +0530
+--- a/bsd/dev/sweet_spmi.c	2026-11-01 04:41:57.000000000 +0530
++++ b/bsd/dev/sweet_spmi.c	2026-11-01 04:42:23.848108654 +0530
 @@ -1,8 +1,7 @@
  /*
 - * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
@@ -49,10 +49,10 @@ diff -ruN a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
 +		return false;
 +	}
 +	switch (peripheral) {
-+	case 0x10:      /* CHGR: FCC 0x61, FV 0x70 */
-+		return reg == 0x61 || reg == 0x70;
-+	case 0x13:      /* USBIN: ICL cfg 0x70, ICL options 0x66, ICL override cmd 0x42, load cfg 0x65 */
-+		return reg == 0x70 || reg == 0x66 || reg == 0x42 || reg == 0x65;
++	case 0x10:      /* CHGR: FCC 0x61, FV 0x70, hard JEITA thresholds 0x98..0x9b */
++		return reg == 0x61 || reg == 0x70 || (reg >= 0x98 && reg <= 0x9b);
++	case 0x13:      /* USBIN: suspend cmd 0x40, ICL override cmd 0x42, load cfg 0x65, ICL options 0x66, ICL cfg 0x70 */
++		return reg == 0x40 || reg == 0x42 || reg == 0x65 || reg == 0x66 || reg == 0x70;
 +	case 0x31:      /* VADC conversion request 0x42..0x47 */
 +		return reg >= 0x42 && reg <= 0x47;
 +	case 0xb1:      /* QG SDAM: only our own record 0xa8..0xaf (the Linux QG area ends at 0xa3) */
@@ -165,8 +165,8 @@ diff -ruN a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
  }
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff -ruN a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
---- a/bsd/dev/sweet_spmi.h	2026-11-01 04:17:22.475216050 +0530
-+++ b/bsd/dev/sweet_spmi.h	2026-11-01 04:18:00.268697833 +0530
+--- a/bsd/dev/sweet_spmi.h	2026-11-01 04:41:57.000000000 +0530
++++ b/bsd/dev/sweet_spmi.h	2026-11-01 04:42:07.916013805 +0530
 @@ -12,6 +12,11 @@
   * panic hold and from a timer call: observer read and EXT_WRITEL. 0 success, -1 failure. */
  int sweet_spmi_pon_read(unsigned addr, uint8_t *out);

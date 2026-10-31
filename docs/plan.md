@@ -572,4 +572,5 @@ Next (coordinator): boot; check `LAUREL BATTERY: on: PMI632 QG soc N% ...`, `LAU
 `LAUREL THERMAL: on`, `LAUREL CHARGE MODE: on: normal boot (pon ..)`; iOS battery % = the logged soc; plug/unplug -> the
 `LAUREL CHARGER: on: SMB5 usbin ...` line and the bolt; `ctl poweroff` -> `PS_HOLD_RST_CTL 0x01 -> 0x04 (shutdown)` and the
 phone stays off; then power off + plug in the charger -> `charger power-on` line (charge mode).
-
+Review fixes built 04:47 (B1 NTC-gated charger + 30 s NTC watchdog, M1 hard JEITA check + boot limits restore, M2-M7, minor
+m4-m7): `areaD-k2304`, 223 patches, 0 LSE. Not booted. Table in `docs/laurel_sprout/battery-power.md` "Review".
