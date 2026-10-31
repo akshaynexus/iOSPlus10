@@ -1,0 +1,2 @@
+# topaz patches that do not apply to xnu-8796.141.3 (darwin-xnu-build skips them too).
+# One file name per line. Filled from the AUDIT=1 report of scripts/laurel/kernel-linux.sh.

@@ -32,6 +32,10 @@ laurel-kernel-oss  https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git d3766f
 laurel-kernel-los  https://github.com/LineageOS/android_kernel_xiaomi_sm6125.git 8aaa002bfb7ba1cac2c02dbb42ae0259ef2e47ba lineage-24.0
 laurel-device-los  https://github.com/LineageOS/android_device_xiaomi_laurel_sprout.git d389daebe22c2713b09742ab7153535c421ebdeb lineage-24.0
 sm6125-common-los  https://github.com/LineageOS/android_device_xiaomi_sm6125-common.git 0e2b2bbfbc218d73a1f9fc17cfb3d82401f06ad9 lineage-24.0
+ios-sweet-linux    https://github.com/myh120405/ios-sweet-linux.git   8d09cf0d6748e40845dd413e9157e465024252ab main
+xnu-linux-toolchain https://github.com/Allenwdk/xnu-linux-toolchain.git 909990e4ec2c6cda30c20cdb23219946918c7fd6 main
+hackios-umi        https://github.com/ls9875/hackios-umi.git          6ac5eee39b076faf5c33ee14a9b17558779ee0b4 main
+hackios-scion      https://github.com/Scion-Project/hackios-xnu-kernel.git e407d1e75a8d79b1cf5975e9abe52f23a71106f2 main
 laurel-mainline    https://github.com/laurel-sprout-mainline/laurel_sprout_mainline.git 2cb8fd07918d6dd07180796da5b75cb491400df9 mainline-6.18-split
 '
 

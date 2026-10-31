@@ -47,4 +47,8 @@ external/laurel-kernel-los/
 external/laurel-device-los/
 external/sm6125-common-los/
 external/laurel-mainline/
+external/ios-sweet-linux/
+external/xnu-linux-toolchain/
+external/hackios-umi/
+external/hackios-scion/
 external/*.partial/
