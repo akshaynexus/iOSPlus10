@@ -1,0 +1,54 @@
+laurel 2152: the SWEET FPS line (topaz 0942/0943/0946: frames swapped per window, longest gap, late frames, present + latch time) is part of the GPU feature's report: it runs only while backboardd draws with GL on the GPU (2150 topaz_gpu_gl_active), the first 6 lines every second, then one line every 10 s while frames come. Kill switch sweetfps=0 (topaz: only with sweetfps=1).
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4eb5d3d..1a8665f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -44,7 +44,8 @@ extern "C" void topaz_audio_init(void);
+ extern "C" void sweet_amfi_service_init(void);
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+-extern "C" void topaz_adreno_init(void);           /* iokit/Kernel/arm/TopazAdreno.cpp (boot-arg gpu=1) */
++extern "C" void topaz_adreno_init(void);
++extern "C" bool topaz_gpu_gl_active(void);          /* laurel 2150: backboardd's GL has the GPU (SWEET FPS, 2152) */           /* iokit/Kernel/arm/TopazAdreno.cpp (boot-arg gpu=1) */
+ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* RedwoodGPU.cpp */
+ 
+ /*
+@@ -1040,16 +1041,22 @@ static uint64_t sweet_fps_wait_ns, sweet_fps_after_ns;  /* this second: latch wa
+ static void
+ sweet_fps_count(void)
+ {
+-	static int on = -1;                     /* boot-arg sweetfps=1: the SWEET FPS line */
++	/*
++	 * laurel 2152: the SWEET FPS line is part of the GPU feature's report: it runs while backboardd draws with
++	 * GL on the GPU (2150 topaz_gpu_gl_active), the first 6 lines every second, then one every 10 s while
++	 * frames come. Kill switch sweetfps=0. (topaz: only with boot-arg sweetfps=1.)
++	 */
++	static int on = -1;
+ 	if (on < 0) {
+-		uint32_t v = 0;
+-		on = PE_parse_boot_argn("sweetfps", &v, sizeof(v)) && v != 0;
++		uint32_t v = 1;
++		(void)PE_parse_boot_argn("sweetfps", &v, sizeof(v));
++		on = v != 0;
+ 	}
+-	if (!on) {
++	if (!on || !topaz_gpu_gl_active()) {
+ 		return;
+ 	}
+ 	static uint64_t last, window, gap_max;
+-	static uint32_t frames, late;
++	static uint32_t frames, late, lines;
+ 	uint64_t now = mach_absolute_time(), ns = 0, gap = 0;
+ 
+ 	if (last != 0) {
+@@ -1071,7 +1078,8 @@ sweet_fps_count(void)
+ 	}
+ 	gap_max = gap > gap_max ? gap : gap_max;
+ 	absolutetime_to_nanoseconds(now - window, &ns);
+-	if (ns >= 1000000000ull) {
++	if (ns >= (lines < 6 ? 1000000000ull : 10000000000ull)) {
++		lines++;
+ 		IOLog("SWEET FPS: %u frames in %llu ms, longest gap %llu ms, %u late; a frame: %llu us in present + latch, "
+ 		    "came %llu us after the tick\n", frames, ns / 1000000, gap_max / 1000000, late,
+ 		    frames ? sweet_fps_wait_ns / 1000 / frames : 0, frames ? sweet_fps_after_ns / 1000 / frames : 0);

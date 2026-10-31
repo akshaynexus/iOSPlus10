@@ -3847,3 +3847,33 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   closed-loop only when the root has RedwoodAudio.driver + VirtualAudio.plugin: today it has neither [V root.sh, topaz
   sweet-root-tweaks.py moves VirtualAudio to HAL.disabled], so expect `LAUREL HAPTIC UI: off` and ringtone vibration only; UI and
   keyboard taps need the audio plug-in in the root. Built 04:26 (220 patches, 0 LSE, no new warnings). NOT BOOTED.
+## Mi A3: Adreno 610 GPU path ported from topaz, built on Linux (2026-11-01 05:00, area B agent, branch t3/laurel-adreno-610-gpu)
+- [V] Our kernel already contains topaz's whole GPU stack (0901-0947 apply with every topaz patch) but it was off: topaz
+  gates it on boot-arg `gpu=1`, uses khaje values, an embedded khaje-signed zap shader and a pool at 0x90000000 (inside our
+  kernel window 0x81000000-0xB1000000). Patches 2150-2152 (docs/laurel_sprout/gpu.md): trinket values, on by default,
+  firmware from the root, run-time pool, fence self-check, `LAUREL GPU: on|off` line, IOSurface placement by GPU state,
+  `SWEET FPS` line by default. Kernel 222 patches, 0 LSE/RCpc.
+- [V] Trinket vs khaje GPU deltas (laurel-kernel-los): chip id 0x06010000 (khaje 0x06010001), highest bank bit 14 (kgsl writes
+  RB/TPL1/SP_NC_MODE_CNTL 0xb), zap carve-out 0x57515000, GX GDSC without sw-reset/clamp (no GMU), two default alpha PLLs at
+  GPUCC +0x0/+0x100 (not Zonda), gfx3d sources 2/4 = PLL0/PLL1 AUX2, 5 = GPLL0 (same as khaje). GCC GPU branch offsets are equal.
+- [V] Stock vendor image has `/firmware/a610_zap.{mdt,b00,b01,b02,elf}` and `a630_sqe.fw`. Our `a610_zap.b02` = topaz's
+  byte for byte; our `.mdt` differs in 788 bytes (signature) -> topaz's embedded mdt would fail TZ auth here [I].
+  SQE 32304 bytes (topaz 32504). Script: `scripts/laurel/gpu-firmware.sh`.
+- [V] TOPAZ_4K trap: topaz's zap_load refused metadata larger than PAGE_SIZE; with 4 KB pages the 6860-byte mdt failed
+  that test. 2150 uses the contiguous pool buffer (up to 64 KB).
+- [V] Mesa 25.0.7 freedreno + softpipe builds on Linux in 47 s (`scripts/laurel/mesa-linux.sh`): host clang -target
+  arm64-apple-ios16.0 -mcpu=cortex-a53, theos ld64, iPhoneOS16.5.sdk (theos/sdks 0222fd5). Error -> fix: meson feature checks
+  all failed (`redefinition of 'timespec'`) because `--ld-path` on compile-only lines gives "argument unused" under
+  `-Werror=unused-command-line-argument`; the wrapper adds `--ld-path` only on link lines.
+- [V] Userland (`scripts/laurel/gpu-userland.sh`): libtopaz-gl (eagl.c + gl_osmesa.c + eagl_gen.h from hackios-scion
+  mkeagl.py), libtopaz-inject, bbd_wrap; ad-hoc signed with theos ldid; 0 LSE. `scripts/laurel/root-add-gpu.sh` installs
+  them (+ firmware to /usr/share/firmware/laurel) and moves backboardd to /usr/libexec/real/; root.sh calls it.
+- Open: first boot of 2150-2152 + a root with the GPU files; GX corner vote (RPM) before clocks above 300 MHz; Turnip/metal2vulkan later.
+- [V build 05:10] Review fixes (ACCEPT-WITH-FIXES, rebased on laurel-int-1 = A bf51862 + C 7de9719 + H 8df44c2): see
+  docs/laurel_sprout/gpu.md ("SMMU pass-through risk", "GPU pool", "Recovery", "Mesa's highest bank bit"). Facts: with
+  area A's map the kernel window is 0xE1004000-0x1AD004000 (495 MiB below 4 GiB), the ADT reserves 0xC0000000 + 512 MiB
+  (GPU) and 0xE0000000 + 16 MiB (modem); 2150 reads them. RedwoodGPU surface sharing allowed 36-bit addresses (topaz);
+  now 4 GiB, and never a cached scanout slot. Mesa 25.0.7 GL never reads the static A610 bank bit (13): only
+  fdl6_memcpy (Turnip) does. topaz_inject.c's `strstr(args, " gl=0")` misses gl=0 as the first boot-arg: our wrapper
+  parses whole words and does not insert the loader then. Mu not rebuilt here: patches/laurel/mu is equal to
+  laurel-int-1, the main checkout's FD (04:50, has "Pool RAM") was reused for uefi-image.sh.
