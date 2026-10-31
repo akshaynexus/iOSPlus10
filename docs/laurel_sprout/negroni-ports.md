@@ -21,7 +21,7 @@ mechanically: each port is re-written on the topaz files as `patches/laurel/xnu/
 | 7 | 0272, 0271, 0276, 0365 | charger (SMB5) + IOPMPowerSource % + SoC | PMI632 = same SMB5 map, SID 2; topaz 0091/0148 drive I2C chips the Mi A3 lacks | `SweetBattery.cpp`, `sweet_spmi.c` |
 | 8 | 0204 bit 0 | UFS solid-state flag | no HFS defrag/hot-file work on flash (bit 1 is 16K only) | `sweet_ufs.c` |
 | 9 | 0332, 0333, 0336, 0337 (+0330, 0331, 0334, 0335 adapted) | Bluetooth: iOS side (H4 kernel control, /dev/uart.bluetooth, /dev/btwake, VSC answers) + WCN3990 UART/HCI | the only proven path from a non-Apple controller to bluetoothd (negroni: "Bluetooth works") | new `sweet_bt*.c`, ADT `bluetooth` node |
-| 10 | 0301, 0302 | vibrator IOService + UI haptics node | topaz userland already writes `/dev/redwood-haptic`; backend = PMI632 LDO ERM (SID 3, 0x5700) | new `SweetVibrator.cpp`, `sweet_haptic.c` |
+| 10 | 0301, 0302 | vibrator IOService + UI haptics node | topaz userland already writes `/dev/redwood-haptic`; backend = PMI632 LDO ERM (SID 3, 0x5700) | **done as laurel 2700**: `LaurelVibrator.cpp`, `laurel_haptic.c` (docs/laurel_sprout/haptics.md) |
 | 11 | 0221-aks-passcode | software keybag passcode | lock screen and passcode | `SweetKeyStore.cpp` |
 | 12 | 0203, 0212 | calendar from PM6125 RTC | correct time before NTP | `SweetPlatformExpert.cpp` |
 | 13 | 0280, 0283, 0284 | thermal (TSENS) + cpufreq governor | topaz runs Gold at max with no thermal limit (0094) | new `sweet_thermal.c`, `sweet_cpufreq.c` |

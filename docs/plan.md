@@ -556,3 +556,7 @@ Next (coordinator): boot and check `LAUREL TOUCH: on:`, `LAUREL TOUCH: display m
 2047 (Samsung s6e8fco ...)`; press volume up; move the brightness slider (`SWEET BL: ... -> DBV`); lock/unlock with the power key (panel
 dark, then back with a fade). Details: notes.md, same date, 04:40.
 
+- Vibration (area H, patch 2700, build only, NOT BOOTED): PMI632 LDO ERM over SPMI SID 3 + "vibrator" IOService +
+  /dev/redwood-haptic; expected line `LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)`. Test: Settings > Sounds &
+  Haptics > Ringtone > Vibration preview. UI/keyboard taps wait for the RedwoodAudio plug-in + VirtualAudio in the root
+  (docs/laurel_sprout/haptics.md).

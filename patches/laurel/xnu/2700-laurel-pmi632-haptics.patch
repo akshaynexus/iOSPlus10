@@ -1,0 +1,1071 @@
+laurel 2700: vibration on the Mi A3. PMI632 LDO vibrator (ERM, SPMI SID 3, base 0x5700, 3000 mV) over an own SPMI lane (APID of PPID 0x357, EE 0 owner check; observer EXT_READL + rw-channel EXT_WRITEL; no state shared with sweet_spmi.c). Motor thread: overdrive start 3544 mV / 30 ms (Qualcomm default, kill switch laurel_haptic_od=0), minimum on-time 30 ms (50 ms without overdrive), duty limit (heat budget: 70 % sustainable, cut at 4000 ms, resume at 2000 ms), watchdog thread call (motor on + thread stalled 1 s = off). iOS: "vibrator" IOService (LaurelVibrator.cpp, port of negroni 0301: FigVibrator hertz_millisecs/repeat/stop) and /dev/redwood-haptic (topaz audio_plugin.c Actuator samples, S16LE mono 48 kHz -> 2 ms blocks -> on-windows). IODeviceTree:/product/haptics closed-loop = 1 (negroni 0302) only when the root has RedwoodAudio.driver + VirtualAudio.plugin. Self-check at start: 'LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)' or 'LAUREL HAPTIC: off: <why>'; 'LAUREL HAPTIC UI: on|off: <why>'. Kill switch laurel_haptic=0, laurel_haptic_ui=0. Details: docs/laurel_sprout/haptics.md.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 04:19:08.720234572 +0530
++++ b/bsd/conf/files	2026-11-01 04:23:22.362151954 +0530
+@@ -116,6 +116,7 @@
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/topaz_fw.c			standard
+ bsd/dev/topaz_redwood_audio.c		standard
++bsd/dev/laurel_haptic.c			standard
+ bsd/kern/topaz_sandbox_container.c		standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+diff -ruN a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
+--- a/bsd/dev/laurel_haptic.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_haptic.c	2026-11-01 04:22:40.745811129 +0530
+@@ -0,0 +1,785 @@
++/*
++ * laurel_sprout (Xiaomi Mi A3, SM6125): the vibration motor (laurel 2700).
++ *
++ * Hardware [V external/laurel-kernel-los arch/arm64/boot/dts/qcom/pmi632.dtsi:412-422]: an ERM motor on
++ * the PMI632 vibrator LDO, `qcom,qpnp-vibrator-ldo`, SPMI SID 3, base 0x5700, vmax 3.0 V,
++ * qcom,disable-overdrive. Registers [V drivers/leds/leds-qpnp-vibrator-ldo.c]: STATUS1 0x08 (bit 7
++ * VREG_READY), VSET_LB/UB 0x40/0x41 (mV, 8 mV steps, 1504..3544 mV), EN_CTL 0x46 (bit 7 enable).
++ * Linux: min play 50 ms, enable -> poll VREG_READY 100 us steps for 1 ms (on a timeout: disable).
++ *
++ * SPMI: our own lane. The arbiter bases are the ones of laurel 2018 (sweet_spmi.c, trinket.dtsi
++ * spmi@1c40000, v5): core 0x1c40000 (APID map 0x900 + 4n), config 0x1c0a000 (owner 0x700 + 4n),
++ * observer 0x3e00000 (EE 0, 0x80 per APID), rw channels 0x1e00000 (0x10000 per APID). This file maps
++ * only the vibrator's APID (PPID 0x357) and takes its own lock: it shares no state with sweet_spmi.c
++ * (battery, area D; PON lane of 2018). Each APID has its own command registers, so the lanes do not
++ * race. Writes only when EE 0 (apps) owns the APID.
++ *
++ * Motor policy (an ERM spins up slowly and coasts; it has no brake on an LDO):
++ *   overdrive   a start from rest (off >= LH_SPIN_MS) runs at LH_OD_MV for LH_OD_MS, then 3000 mV.
++ *               3544 mV / 30 ms = Qualcomm's own default overdrive (min(2 * vmax, VMAX), 30 ms) of the
++ *               same driver; pmi632.dtsi turns it off for Android, which has a 50 ms minimum play.
++ *               iOS taps are 3-20 ms long, so without it a tap is not felt. Kill switch laurel_haptic_od=0
++ *               (then 50 ms minimum on-time, Linux's).
++ *   min on-time LH_MIN_OD_MS (with overdrive) or LH_MIN_MS: every start runs at least this long.
++ *   duty limit  a heat budget: +(100 - LH_DUTY) % of the on-time, -LH_DUTY % of all time; at
++ *               LH_HEAT_MAX_MS the motor is cut and rests until LH_HEAT_RESUME_MS. So <= 70 % duty forever
++ *               (ringtone patterns are about 50-67 %), a continuous buzz of about 13 s, then 2.9 s rest.
++ *   watchdog    while on, the motor thread re-arms a thread call every loop (<= 250 ms); if the thread
++ *               stops for 1 s with the motor on, the call turns the LDO off and the feature off.
++ *   failures    3 failed enables (VREG_READY timeout or SPMI error) or one SPMI timeout: LDO off,
++ *               feature off, one line. Nothing else (USB, Wi-Fi, boot) depends on it.
++ *
++ * iOS paths (both fed here; docs/laurel_sprout/haptics.md):
++ *   1. "vibrator" IOService (LaurelVibrator.cpp, port of negroni 0301): FigVibrator's legacy IOKit
++ *      path (closed-loop MobileGestalt answer false): ringtone, alert and system-sound vibration.
++ *      API laurel_haptic_vib(ms): on for ms from now (0: stop).
++ *   2. /dev/redwood-haptic (this file, the node topaz userland/audio/audio_plugin.c actuator_write()
++ *      opens): S16LE mono 48 kHz samples of the HAL "Actuator" output. 2 ms blocks with a peak above
++ *      LH_SILENT are "on"; runs closer than LH_GAP_MS merge; the run plays in real time from the
++ *      write (stream clock, at most LH_LEAD_MS ahead). This is the closed-loop path (CoreHaptics,
++ *      UIFeedbackGenerator, keyboard taps, and then also ringtones). It needs IODeviceTree:/product/
++ *      haptics closed-loop = 1; LaurelVibrator publishes it only when the root has the RedwoodAudio.driver
++ *      HAL plug-in and VirtualAudio.plugin (self-check after the root mount, here), because with
++ *      closed-loop on and no Actuator device iOS plays no vibration at all.
++ *
++ * Log: "LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)" or "LAUREL HAPTIC: off: <why>";
++ * "LAUREL HAPTIC UI: on|off: <why>" for the closed-loop node; the first LH_LOG plays.
++ * Kill switches: laurel_haptic=0 (all), laurel_haptic_od=0 (overdrive), laurel_haptic_ui=0 (no
++ * closed-loop node).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/thread_call.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern kern_return_t thread_terminate(thread_t);
++
++int laurel_haptic_start(void);
++int laurel_haptic_vib(uint32_t ms);
++int laurel_haptic_publish_closed_loop(void);     /* LaurelVibrator.cpp */
++
++/* SPMI arbiter v5 of the SM6125 (same bases as sweet_spmi.c, laurel 2018) */
++#define LH_CORE_PA      0x01c40000u
++#define LH_CFG_PA       0x01c0a000u
++#define LH_OBS_PA       0x03e00000u
++#define LH_RW_PA        0x01e00000u
++#define LH_SID          3u
++#define LH_BASE         0x5700u
++#define LH_PPID         ((LH_SID << 8) | (LH_BASE >> 8))        /* 0x357 */
++#define LH_NO_APID      0xffffu
++
++/* vibrator LDO registers (offsets in the peripheral) */
++#define LH_REG_TYPE     0x04u
++#define LH_REG_SUBTYPE  0x05u
++#define LH_REG_STATUS1  0x08u
++#define LH_VREG_READY   0x80u
++#define LH_REG_VSET_LB  0x40u
++#define LH_REG_EN_CTL   0x46u
++#define LH_EN           0x80u
++#define LH_VMIN_MV      1504u
++#define LH_VMAX_MV      3544u
++
++/* policy */
++#define LH_NOMINAL_MV   3000u           /* qcom,vib-ldo-volt-uv */
++#define LH_OD_MV        3544u           /* Qualcomm default overdrive: min(2 * vmax, VMAX) */
++#define LH_OD_MS        30u             /* QPNP_VIB_OVERDRIVE_PLAY_MS */
++#define LH_MIN_OD_MS    30u             /* shortest play with overdrive */
++#define LH_MIN_MS       50u             /* shortest play without (QPNP_VIB_MIN_PLAY_MS) */
++#define LH_SPIN_MS      60u             /* off this long: the motor is at rest, the next start gets overdrive */
++#define LH_DUTY         70u             /* % sustainable duty */
++#define LH_HEAT_MAX_MS  4000u
++#define LH_HEAT_RESUME_MS 2000u
++#define LH_WAKE_MS      250u            /* the thread runs at least this often while the motor is on */
++#define LH_WDOG_MS      1000u
++#define LH_FAIL_MAX     3u
++#define LH_LOG          24u
++
++/* /dev/redwood-haptic stream */
++#define LH_RATE         48000u
++#define LH_BLOCK        (LH_RATE / 1000u * 2u)  /* 96 frames = 2 ms */
++#define LH_SILENT       256u            /* of 32768 (HackiOS SILENT_BELOW) */
++#define LH_GAP_MS       10u
++#define LH_LEAD_MS      100u
++#define LH_WIN          64u             /* queued on-windows, power of two */
++
++static LCK_GRP_DECLARE(lh_grp, "laurel_haptic");
++static LCK_MTX_DECLARE(lh_spmi_lock, &lh_grp);  /* our APID lane */
++static LCK_MTX_DECLARE(lh_lock, &lh_grp);       /* requests, windows, state below */
++static LCK_MTX_DECLARE(lh_wlock, &lh_grp);      /* /dev stream clock */
++
++static vm_offset_t lh_obs, lh_rw;               /* this APID's observer and rw channel */
++static uint16_t lh_apid = LH_NO_APID;
++static bool lh_ready;                           /* self-check passed, thread running */
++static volatile bool lh_dead;                   /* turned off after a failure */
++static volatile bool lh_hw_on;                  /* EN_CTL bit 7 as last written */
++static uint32_t lh_od = 1, lh_ui = 1;
++static uint32_t lh_fails;
++static thread_call_t lh_wdog;
++
++/* requests (lh_lock) */
++static uint64_t lh_vib_until;                   /* IOService: on until (abs) */
++static struct { uint64_t s, e; } lh_w[LH_WIN];  /* /dev: on-windows (abs), in time order */
++static uint32_t lh_wh, lh_wt;
++static bool lh_kick;
++static int lh_event;
++
++/* stream (lh_wlock) */
++static uint64_t lh_ts;                          /* abs time of the next sample */
++static uint32_t lh_part, lh_part_peak;
++static uint64_t lh_run_s, lh_run_e;             /* open loud run */
++static uint64_t lh_frames, lh_loud_blocks;
++static uint32_t lh_said;
++
++static uint64_t
++lh_abs(uint64_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(ms * NSEC_PER_MSEC, &t);
++	return t;
++}
++
++static uint64_t
++lh_ms(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* ---- SPMI lane ---------------------------------------------------------------------------------- */
++
++static uint32_t
++lh_rd32(vm_offset_t a)
++{
++	uint32_t v = *(volatile uint32_t *)a;
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static vm_offset_t
++lh_map(uint32_t pa, uint32_t size)
++{
++	uint32_t page = pa & ~0xfffu;
++	vm_offset_t va = ml_io_map(page, (vm_size_t)((pa - page) + size + 0xfffu) & ~(vm_size_t)0xfffu);
++	return va ? va + (pa - page) : 0;
++}
++
++/* 0 done, -1 error/denied, -2 timeout (lane poisoned by the caller) */
++static int
++lh_wait(vm_offset_t ch)
++{
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t st = lh_rd32(ch + 0x08u);
++		if (st & 1u) {
++			return (st & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	return -2;
++}
++
++static void lh_fail(const char *why);
++
++/* read n (1..4) bytes at offset off of the vibrator peripheral */
++static int
++lh_read(unsigned off, uint8_t *buf, unsigned n)
++{
++	if (n == 0 || n > 4) {
++		return -1;
++	}
++	lck_mtx_lock(&lh_spmi_lock);
++	vm_offset_t ch = lh_obs;
++	if (ch == 0 || lh_dead) {
++		lck_mtx_unlock(&lh_spmi_lock);
++		return -1;
++	}
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)ch = (1u << 27) | ((off & 0xffu) << 4) | ((n - 1u) & 7u);  /* EXT_READL */
++	__asm__ volatile ("dsb osh" ::: "memory");
++	int rc = lh_wait(ch);
++	uint32_t d = rc == 0 ? lh_rd32(ch + 0x18u) : 0;        /* RDATA0 */
++	lck_mtx_unlock(&lh_spmi_lock);
++	if (rc == -2) {
++		lh_fail("SPMI read timeout");
++	}
++	if (rc == 0) {
++		for (unsigned i = 0; i < n; i++) {
++			buf[i] = (uint8_t)(d >> (8u * i));
++		}
++	}
++	return rc == 0 ? 0 : -1;
++}
++
++static int
++lh_write(unsigned off, const uint8_t *buf, unsigned n)
++{
++	if (n == 0 || n > 4) {
++		return -1;
++	}
++	uint32_t d = 0;
++	for (unsigned i = 0; i < n; i++) {
++		d |= (uint32_t)buf[i] << (8u * i);
++	}
++	lck_mtx_lock(&lh_spmi_lock);
++	vm_offset_t ch = lh_rw;
++	if (ch == 0 || lh_dead) {
++		lck_mtx_unlock(&lh_spmi_lock);
++		return -1;
++	}
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x10u) = d;                                         /* WDATA0 */
++	*(volatile uint32_t *)ch = (0u << 27) | ((off & 0xffu) << 4) | ((n - 1u) & 7u); /* EXT_WRITEL */
++	__asm__ volatile ("dsb osh" ::: "memory");
++	int rc = lh_wait(ch);
++	lck_mtx_unlock(&lh_spmi_lock);
++	if (rc == -2) {
++		lh_fail("SPMI write timeout");
++	}
++	return rc == 0 ? 0 : -1;
++}
++
++/* ---- LDO ---------------------------------------------------------------------------------------- */
++
++static int
++lh_vset(uint32_t mv)
++{
++	mv = mv < LH_VMIN_MV ? LH_VMIN_MV : mv > LH_VMAX_MV ? LH_VMAX_MV : mv;
++	mv = (mv + 7u) / 8u * 8u;                       /* roundup(uV, 8000) / 1000 */
++	uint8_t r[2] = { (uint8_t)(mv & 0xffu), (uint8_t)(mv >> 8) };
++	return lh_write(LH_REG_VSET_LB, r, 2);
++}
++
++static int
++lh_poll_ready(void)
++{
++	for (unsigned i = 0; i <= 10; i++) {            /* 100 us steps, 1 ms (Linux) */
++		uint8_t st = 0;
++		if (lh_read(LH_REG_STATUS1, &st, 1) != 0) {
++			return -1;
++		}
++		if (st & LH_VREG_READY) {
++			return 0;
++		}
++		delay(100);
++	}
++	return -1;
++}
++
++static int
++lh_enable(bool on)
++{
++	uint8_t en = 0;
++	if (lh_read(LH_REG_EN_CTL, &en, 1) != 0) {
++		return -1;
++	}
++	en = (uint8_t)(on ? (en | LH_EN) : (en & ~LH_EN));
++	int rc = lh_write(LH_REG_EN_CTL, &en, 1);
++	if (rc == 0) {
++		lh_hw_on = on;
++	}
++	if (rc == 0 && on && lh_poll_ready() != 0) {
++		en = (uint8_t)(en & ~LH_EN);            /* Linux: keep VIB_LDO disabled */
++		if (lh_write(LH_REG_EN_CTL, &en, 1) == 0) {
++			lh_hw_on = false;       /* only after a disable that worked (review M2) */
++		}
++		return -1;
++	}
++	return rc;
++}
++
++/*
++ * After a failure: EN_CTL = 0 on the rw lane, outside lh_read/lh_write (they refuse once lh_dead).
++ * wait = false (watchdog): try_lock only, the motor thread may hold the lane; it then calls this
++ * with wait = true when it comes back. The bases stay mapped (another context may be in a call).
++ */
++static void
++lh_off_raw(bool wait)
++{
++	if (lh_rw == 0) {
++		return;
++	}
++	if (wait) {
++		lck_mtx_lock(&lh_spmi_lock);
++	} else if (!lck_mtx_try_lock(&lh_spmi_lock)) {
++		return;
++	}
++	*(volatile uint32_t *)(lh_rw + 0x10u) = 0;
++	*(volatile uint32_t *)lh_rw = (LH_REG_EN_CTL & 0xffu) << 4;     /* EXT_WRITEL, 1 byte */
++	__asm__ volatile ("dsb osh" ::: "memory");
++	if (lh_wait(lh_rw) == 0) {
++		lh_hw_on = false;
++	}
++	lck_mtx_unlock(&lh_spmi_lock);
++}
++
++static void
++lh_fail(const char *why)
++{
++	if (lh_dead) {
++		return;
++	}
++	lh_dead = true;                 /* lh_read/lh_write refuse from now on */
++	lh_off_raw(false);
++	printf("LAUREL HAPTIC: off: %s (motor stopped, vibration off for this boot)\n", why);
++	thread_wakeup((event_t)&lh_event);
++}
++
++static void
++lh_wdog_fire(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	if (!lh_hw_on) {
++		return;
++	}
++	if (!lh_dead) {
++		lh_fail("watchdog: the motor thread stalled with the motor on");
++	} else {
++		lh_off_raw(false);              /* the feature is off but the LDO is still on: try again */
++	}
++	if (lh_hw_on) {                         /* review M2: never give up while the motor runs */
++		thread_call_enter_delayed(lh_wdog, mach_absolute_time() + lh_abs(LH_WDOG_MS));
++	}
++}
++
++/* ---- requests ----------------------------------------------------------------------------------- */
++
++static void
++lh_add_window_locked(uint64_t s, uint64_t e)
++{
++	if (e <= s) {
++		return;
++	}
++	if (lh_wh != lh_wt) {
++		uint32_t last = (lh_wh - 1u) % LH_WIN;
++		if (s <= lh_w[last].e + lh_abs(LH_GAP_MS)) {
++			lh_w[last].e = e > lh_w[last].e ? e : lh_w[last].e;
++			return;
++		}
++	}
++	if (lh_wh - lh_wt >= LH_WIN) {
++		lh_wt++;                                /* drop the oldest */
++	}
++	lh_w[lh_wh % LH_WIN].s = s;
++	lh_w[lh_wh % LH_WIN].e = e;
++	lh_wh++;
++}
++
++static void
++lh_kick_locked(void)
++{
++	lh_kick = true;
++	thread_wakeup((event_t)&lh_event);
++}
++
++int
++laurel_haptic_vib(uint32_t ms)
++{
++	if (!lh_ready || lh_dead) {
++		return -1;
++	}
++	uint64_t now = mach_absolute_time();
++	lck_mtx_lock(&lh_lock);
++	lh_vib_until = ms ? now + lh_abs(ms) : 0;
++	lh_kick_locked();
++	lck_mtx_unlock(&lh_lock);
++	return 0;
++}
++
++/* want the motor at now? next = the next time that answer can change */
++static bool
++lh_want_locked(uint64_t now, uint64_t *next)
++{
++	bool want = false;
++	while (lh_wt != lh_wh && lh_w[lh_wt % LH_WIN].e <= now) {
++		lh_wt++;
++	}
++	if (lh_vib_until > now) {
++		want = true;
++		*next = lh_vib_until < *next ? lh_vib_until : *next;
++	}
++	if (lh_wt != lh_wh) {
++		uint64_t s = lh_w[lh_wt % LH_WIN].s, e = lh_w[lh_wt % LH_WIN].e;
++		if (s <= now) {
++			want = true;
++			*next = e < *next ? e : *next;
++		} else {
++			*next = s < *next ? s : *next;
++		}
++	}
++	return want;
++}
++
++/* ---- motor thread ------------------------------------------------------------------------------- */
++
++__attribute__((noreturn)) static void
++lh_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	bool on = false, od = false, resting = false;
++	uint64_t last = mach_absolute_time(), on_since = 0, off_since = 0, od_end = 0, min_end = 0;
++	int64_t heat = 0;                       /* abs units */
++	const int64_t heat_max = (int64_t)lh_abs(LH_HEAT_MAX_MS), heat_resume = (int64_t)lh_abs(LH_HEAT_RESUME_MS);
++	uint32_t plays = 0;
++	bool od_start = false;
++
++	lck_mtx_lock(&lh_lock);
++	for (;;) {
++		uint64_t now = mach_absolute_time();
++		int64_t dt = (int64_t)(now - last);
++		last = now;
++		heat += on ? dt * (int64_t)(100u - LH_DUTY) / 100 : -(dt * (int64_t)LH_DUTY / 100);
++		heat = heat < 0 ? 0 : heat;
++
++		uint64_t next = UINT64_MAX;
++		bool want = lh_want_locked(now, &next);
++		if (lh_dead) {
++			want = false;
++		}
++		if (on && heat >= heat_max) {
++			resting = true;
++		} else if (resting && heat <= heat_resume) {
++			resting = false;
++		}
++		bool keep = want && !resting && !lh_dead;
++		if (on && !keep && !resting && !lh_dead && now < min_end) {
++			keep = true;                    /* the shortest play of a start */
++		}
++		lh_kick = false;
++		lck_mtx_unlock(&lh_lock);
++
++		if (!on && keep) {
++			bool kick = lh_od && now - off_since >= lh_abs(LH_SPIN_MS);
++			int rc = lh_vset(kick ? LH_OD_MV : LH_NOMINAL_MV);
++			rc = rc == 0 ? lh_enable(true) : rc;
++			if (rc == 0) {
++				on = true;
++				lh_fails = 0;           /* review m1: count failures in a row, not per boot */
++				od = kick;
++				od_start = kick;
++				on_since = now;
++				od_end = now + lh_abs(LH_OD_MS);
++				/* with overdrive on, a restart within LH_SPIN_MS finds the motor still spinning */
++				min_end = now + lh_abs(lh_od ? LH_MIN_OD_MS : LH_MIN_MS);
++			} else if (!lh_dead && ++lh_fails >= LH_FAIL_MAX) {
++				lh_fail("the LDO did not report VREG_READY after 3 enables");
++			}
++		} else if (on && !keep) {
++			if (lh_dead) {
++				lh_off_raw(true);       /* lh_enable refuses after a failure */
++			} else {
++				(void)lh_enable(false);
++			}
++			on = false;
++			od = false;
++			off_since = now;
++			plays++;
++			if (plays <= LH_LOG || resting) {
++				printf("LAUREL HAPTIC: play %u: %llu ms (%s); heat %llu of %u ms%s\n", plays, lh_ms(now - on_since),
++				    od_start ? "overdrive start" : "nominal start", lh_ms((uint64_t)heat), LH_HEAT_MAX_MS,
++				    resting ? " (CUT: duty limit, the motor rests)" : "");
++			}
++		}
++		if (on && od && mach_absolute_time() >= od_end) {
++			od = false;
++			if (lh_vset(LH_NOMINAL_MV) != 0 || lh_poll_ready() != 0) {
++				/* review M1: never keep the motor at the overdrive voltage: stop it */
++				(void)lh_enable(false);
++				on = false;
++				off_since = mach_absolute_time();
++				if (!lh_dead && ++lh_fails >= LH_FAIL_MAX) {
++					lh_fail("the LDO did not step down from the overdrive voltage");
++				}
++			}
++		}
++		/* review M2b: the hardware says the motor is on although no play wants it (a disable failed) */
++		if (!on && lh_hw_on) {
++			if (lh_dead) {
++				lh_off_raw(true);
++			} else {
++				(void)lh_enable(false);
++			}
++		}
++		if (lh_hw_on) {
++			thread_call_enter_delayed(lh_wdog, mach_absolute_time() + lh_abs(LH_WDOG_MS));
++		} else {
++			thread_call_cancel(lh_wdog);
++		}
++
++		lck_mtx_lock(&lh_lock);
++		if (lh_kick) {
++			continue;                       /* a request came while the lock was free */
++		}
++		now = mach_absolute_time();
++		if (on) {
++			next = min_end > now && min_end < next ? min_end : next;
++			next = od && od_end < next ? od_end : next;
++			uint64_t wake = now + lh_abs(LH_WAKE_MS);
++			next = wake < next ? wake : next;
++			uint64_t to_max = (uint64_t)((heat_max - heat) > 0 ? (heat_max - heat) : 0) * 100u / (100u - LH_DUTY);
++			next = now + to_max < next ? now + to_max : next;
++		}
++		if (resting) {
++			uint64_t to_resume = (uint64_t)((heat - heat_resume) > 0 ? (heat - heat_resume) : 0) * 100u / LH_DUTY;
++			next = now + to_resume + 1u < next ? now + to_resume + 1u : next;
++		}
++		if (lh_dead) {
++			next = UINT64_MAX;              /* off for this boot: sleep */
++		}
++		if (next == UINT64_MAX) {
++			(void)lck_mtx_sleep(&lh_lock, LCK_SLEEP_DEFAULT, (event_t)&lh_event, THREAD_UNINT);
++		} else if (next > now) {
++			(void)lck_mtx_sleep_deadline(&lh_lock, LCK_SLEEP_DEFAULT, (event_t)&lh_event, THREAD_UNINT, next);
++		}
++	}
++}
++
++/* ---- /dev/redwood-haptic ------------------------------------------------------------------------ */
++
++static void
++lh_flush_run_locked(void)
++{
++	if (lh_run_e > lh_run_s) {
++		lck_mtx_lock(&lh_lock);
++		lh_add_window_locked(lh_run_s, lh_run_e);
++		lh_kick_locked();
++		lck_mtx_unlock(&lh_lock);
++	}
++	lh_run_s = lh_run_e = 0;
++}
++
++static int
++lh_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t s[256];
++	int error = 0;
++	uint32_t peak_all = 0;
++	const uint64_t block = lh_abs(2);
++
++	lck_mtx_lock(&lh_wlock);
++	uint64_t now = mach_absolute_time();
++	if (lh_ts < now) {
++		lh_ts = now;                    /* a pause: the stream starts again now */
++	} else if (lh_ts > now + lh_abs(LH_LEAD_MS)) {
++		lh_ts = now + lh_abs(LH_LEAD_MS);       /* writes ran ahead: keep the latency bounded */
++	}
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t n = uio_resid(uio);
++		n = n > (user_ssize_t)sizeof(s) ? (user_ssize_t)sizeof(s) : n;
++		n &= ~(user_ssize_t)1;
++		if ((error = uiomove((caddr_t)s, (int)n, uio)) != 0) {
++			break;
++		}
++		for (unsigned i = 0; i < (unsigned)n / 2u; i++) {
++			uint32_t v = s[i] < 0 ? (uint32_t)(-(int32_t)s[i]) : (uint32_t)s[i];
++			lh_part_peak = v > lh_part_peak ? v : lh_part_peak;
++			if (++lh_part < LH_BLOCK) {
++				continue;
++			}
++			if (lh_part_peak > LH_SILENT) {
++				lh_loud_blocks++;
++				peak_all = lh_part_peak > peak_all ? lh_part_peak : peak_all;
++				if (lh_run_e == 0 || lh_ts > lh_run_e + lh_abs(LH_GAP_MS)) {
++					lh_flush_run_locked();
++					lh_run_s = lh_ts;
++				}
++				lh_run_e = lh_ts + block;
++			}
++			lh_ts += block;
++			lh_part = 0;
++			lh_part_peak = 0;
++		}
++		lh_frames += (uint64_t)n / 2u;
++	}
++	lh_flush_run_locked();
++	if (peak_all > 0 && lh_said < LH_LOG) {
++		lh_said++;
++		printf("LAUREL HAPTIC: /dev/redwood-haptic: iOS plays (peak %u of 32768; %llu frames, %llu loud 2 ms blocks so far)%s\n",
++		    peak_all, lh_frames, lh_loud_blocks, lh_ready && !lh_dead ? "" : " (motor off: not felt)");
++	}
++	lck_mtx_unlock(&lh_wlock);
++	return error;
++}
++
++static int
++lh_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static const struct cdevsw lh_cdevsw = {
++	.d_open = lh_dev_open,
++	.d_close = lh_dev_open,
++	.d_read = eno_rdwrt,
++	.d_write = lh_dev_write,
++	.d_ioctl = eno_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type = 0,
++};
++
++static bool
++lh_exists(const char *path)
++{
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, vfs_context_kernel()) != 0) {
++		return false;
++	}
++	vnode_put(vp);
++	return true;
++}
++
++#define LH_PLUGIN   "/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver"
++#define LH_VIRTUAL  "/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin"
++
++/* after the root mount (devfs is up then): the node, then the closed-loop self-check */
++static void
++lh_root_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	unsigned waited = 0;
++	while (rootvnode == NULLVP && waited < 600u * 1000u) {
++		delay_for_interval(20, NSEC_PER_MSEC);
++		waited += 20;
++	}
++	int major = cdevsw_add(-1, &lh_cdevsw);
++	void *node = major < 0 ? NULL :
++	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-haptic");
++	printf("LAUREL HAPTIC: /dev/redwood-haptic %s (S16LE mono %u Hz, 2 ms blocks, >%u of 32768 = on)\n",
++	    node ? "ready" : "not made (devfs)", LH_RATE, LH_SILENT);
++	if (rootvnode == NULLVP) {
++		printf("LAUREL HAPTIC UI: off: no root file system after %u s\n", waited / 1000u);
++	} else if (lh_ui == 0) {
++		printf("LAUREL HAPTIC UI: off: laurel_haptic_ui=0\n");
++	} else if (!node) {
++		printf("LAUREL HAPTIC UI: off: no /dev/redwood-haptic\n");
++	} else if (!lh_exists(LH_PLUGIN)) {
++		printf("LAUREL HAPTIC UI: off: no %s in the root: iOS vibrates through the \"vibrator\" service "
++		    "(ringtones, alerts; no UI/keyboard taps)\n", LH_PLUGIN);
++	} else if (!lh_exists(LH_VIRTUAL)) {
++		printf("LAUREL HAPTIC UI: off: no %s (disabled in the root): no Actuator route; \"vibrator\" service only\n",
++		    LH_VIRTUAL);
++	} else if (laurel_haptic_publish_closed_loop() != 0) {
++		printf("LAUREL HAPTIC UI: off: IODeviceTree:/product/haptics not published\n");
++	} else {
++		printf("LAUREL HAPTIC UI: on: /product/haptics closed-loop = 1 (CoreHaptics, UI and keyboard taps, "
++		    "ringtones -> Actuator -> /dev/redwood-haptic)\n");
++	}
++	(void)thread_terminate(current_thread());
++}
++
++/* ---- start (LaurelVibrator::start, IOKit matching thread) --------------------------------------- */
++
++int
++laurel_haptic_start(void)
++{
++	static bool tried;
++	uint32_t on = 1;
++	thread_t th;
++
++	if (tried) {
++		return lh_ready ? 0 : -1;
++	}
++	tried = true;
++	(void)PE_parse_boot_argn("laurel_haptic", &on, sizeof(on));
++	(void)PE_parse_boot_argn("laurel_haptic_od", &lh_od, sizeof(lh_od));
++	(void)PE_parse_boot_argn("laurel_haptic_ui", &lh_ui, sizeof(lh_ui));
++	if (on == 0) {
++		printf("LAUREL HAPTIC: off: laurel_haptic=0\n");
++		return -1;
++	}
++	vm_offset_t core = lh_map(LH_CORE_PA, 0x2000), cfg = lh_map(LH_CFG_PA, 0x1000);
++	if (!core || !cfg) {
++		printf("LAUREL HAPTIC: off: SPMI arbiter not mapped\n");
++		return -1;
++	}
++	uint32_t ver = lh_rd32(core), count = lh_rd32(core + 4u) & 0x7ffu;
++	if (ver < 0x50000000u || ver >= 0x70000000u || count == 0 || count > 512u) {
++		printf("LAUREL HAPTIC: off: SPMI arbiter %#x with %u APIDs is not v5\n", ver, count);
++		return -1;
++	}
++	unsigned owner = 8;
++	for (unsigned i = 0; i < count; i++) {
++		uint32_t map = lh_rd32(core + 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != LH_PPID) {
++			continue;
++		}
++		unsigned o = lh_rd32(cfg + 0x700u + 4u * i) & 7u;
++		if (lh_apid == LH_NO_APID || o == 0) {
++			lh_apid = (uint16_t)i;
++			owner = o;
++		}
++	}
++	if (lh_apid == LH_NO_APID) {
++		printf("LAUREL HAPTIC: off: no SPMI APID for PMI632 SID3 0x5700 (PPID 0x%03x)\n", LH_PPID);
++		return -1;
++	}
++	if (owner != 0) {
++		printf("LAUREL HAPTIC: off: APID %u (SID3 0x5700) is owned by EE %u, not the apps EE 0\n", lh_apid, owner);
++		return -1;
++	}
++	lh_obs = lh_map(LH_OBS_PA + 0x80u * lh_apid, 0x80);
++	lh_rw = lh_map(LH_RW_PA + 0x10000u * lh_apid, 0x100);
++	uint8_t id[2] = { 0, 0 }, vs[2] = { 0, 0 }, en = 0, st = 0, back[2] = { 0, 0 };
++	if (!lh_obs || !lh_rw || lh_read(LH_REG_TYPE, id, 2) != 0 || lh_read(LH_REG_VSET_LB, vs, 2) != 0 ||
++	    lh_read(LH_REG_EN_CTL, &en, 1) != 0 || lh_read(LH_REG_STATUS1, &st, 1) != 0) {
++		printf("LAUREL HAPTIC: off: SPMI read of SID3 0x5700 failed (APID %u)\n", lh_apid);
++		lh_obs = lh_rw = 0;
++		return -1;
++	}
++	if (id[0] == 0xffu || (id[0] == 0 && id[1] == 0)) {
++		printf("LAUREL HAPTIC: off: SID3 0x5700 type 0x%02x subtype 0x%02x: no peripheral\n", id[0], id[1]);
++		lh_obs = lh_rw = 0;
++		return -1;
++	}
++	if ((en & LH_EN) && lh_enable(false) != 0) {    /* the boot chain left it on */
++		printf("LAUREL HAPTIC: off: the boot chain left the LDO on and the disable failed\n");
++		lh_obs = lh_rw = 0;
++		return -1;
++	}
++	lh_hw_on = false;
++	/* the handshake: write the nominal voltage, read it back (the LDO is off: nothing moves) */
++	if (lh_vset(LH_NOMINAL_MV) != 0 || lh_read(LH_REG_VSET_LB, back, 2) != 0 ||
++	    (uint32_t)(back[0] | (back[1] << 8)) != LH_NOMINAL_MV) {
++		printf("LAUREL HAPTIC: off: VSET write did not read back (0x%02x%02x, was 0x%02x%02x)\n",
++		    back[1], back[0], vs[1], vs[0]);
++		lh_obs = lh_rw = 0;
++		return -1;
++	}
++	lh_wdog = thread_call_allocate(lh_wdog_fire, NULL);
++	if (lh_wdog == NULL || kernel_thread_start(lh_thread, NULL, &th) != KERN_SUCCESS) {
++		printf("LAUREL HAPTIC: off: no motor thread\n");
++		lh_obs = lh_rw = 0;
++		return -1;
++	}
++	thread_deallocate(th);
++	lh_ready = true;
++	printf("LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 %u mV (APID %u, type 0x%02x/0x%02x, VSET was %u mV, "
++	    "EN_CTL 0x%02x, STATUS1 0x%02x; overdrive %s, tap >= %u ms, duty <= %u %%, cut at %u ms of heat)\n",
++	    LH_NOMINAL_MV, lh_apid, id[0], id[1], (uint32_t)(vs[0] | (vs[1] << 8)), en, st,
++	    lh_od ? "3544 mV 30 ms" : "off (laurel_haptic_od=0)", lh_od ? LH_MIN_OD_MS : LH_MIN_MS, LH_DUTY,
++	    LH_HEAT_MAX_MS);
++	if (kernel_thread_start(lh_root_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		printf("LAUREL HAPTIC UI: off: no root-wait thread (no /dev/redwood-haptic)\n");
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64	2026-11-01 04:19:08.723234601 +0530
++++ b/iokit/conf/files.arm64	2026-11-01 04:23:22.363427382 +0530
+@@ -26,6 +26,7 @@
+ iokit/Kernel/arm/TopazAdrenoFw.cpp                               optional iokitcpp
+ iokit/Kernel/arm/RedwoodGPU.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/LaurelVibrator.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrator.cpp
+--- a/iokit/Kernel/arm/LaurelVibrator.cpp	1970-01-01 05:30:00.000000000 +0530
++++ b/iokit/Kernel/arm/LaurelVibrator.cpp	2026-11-01 04:23:21.881646320 +0530
+@@ -0,0 +1,239 @@
++/*
++ * laurel_sprout (Xiaomi Mi A3): the legacy iOS "vibrator" IOService (laurel 2700, port of negroni 0301)
++ * on the PMI632 LDO ERM motor of bsd/dev/laurel_haptic.c, and the closed-loop node (negroni 0302).
++ *
++ * iOS 16 20H392 [V negroni docs/haptics-plan.md section 4, shared cache]: MediaExperience FigVibrator,
++ * when VibeSynthEngineHasHardwareSupport() is false (closed-loop MobileGestalt answer false), takes
++ * IOServiceGetMatchingService(IOServiceNameMatching("vibrator")) and IORegistryEntrySetCFProperties:
++ *   start:   { "hertz_millisecs" = ( {"intensity" = SInt32 16.16}, on_ms, false, off_ms, ... ), "repeat" = bool }
++ *   stop:    a bare CFNumber 0
++ * No user client. Here: pairs (state, ms); state = a dictionary with "intensity" > 0 or true = on,
++ * false or intensity 0 = off (an ERM on an LDO has no amplitude control worth using: lower voltages
++ * do not start it reliably). The steps run on our work loop timer; an on step asks
++ * laurel_haptic_vib(ms + 10) so back-to-back on steps do not gap. repeat loops for at most 5 min;
++ * laurel_haptic.c adds the minimum on-time, the overdrive start and the duty limit.
++ *
++ * laurel_haptic_publish_closed_loop(): IODeviceTree:/product/haptics {closed-loop 1,
++ * supports-3rd-party-haptics 1} (D22 ADT values). Called by laurel_haptic.c only when the root has the
++ * RedwoodAudio.driver HAL plug-in (its "Actuator" -> /dev/redwood-haptic) and VirtualAudio.plugin:
++ * with closed-loop on, FigVibrator, CoreHaptics and UIKit all play on VirtualAudioDevice_Actuator.
++ * Not in scripts/laurel/mkadt.py on purpose: a static node would turn every vibration off on a root
++ * without the plug-in.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOWorkLoop.h>
++#include <IOKit/IOCommandGate.h>
++#include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IORegistryEntry.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++
++extern "C" int laurel_haptic_start(void);
++extern "C" int laurel_haptic_vib(uint32_t ms);
++extern "C" int laurel_haptic_publish_closed_loop(void);
++
++#define LV_MAX_STEPS        64u
++#define LV_MAX_STEP_MS      10000u
++#define LV_REPEAT_MAX_MS    (5u * 60u * 1000u)
++#define LV_LOG              16u
++
++class LaurelVibrator : public IOService {
++	OSDeclareDefaultStructors(LaurelVibrator);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++private:
++	struct Step { uint32_t ms; bool on; };
++	IOWorkLoop *fLoop;
++	IOCommandGate *fGate;
++	IOTimerEventSource *fTimer;
++	Step fSteps[LV_MAX_STEPS];
++	uint32_t fCount, fNext, fElapsedMs, fCalls;
++	bool fRepeat, fRunning;
++	static IOReturn gatedSet(OSObject *owner, void *arg0, void *, void *, void *);
++	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
++	IOReturn apply(OSObject *properties);
++	void runStep();
++	void stopAll();
++};
++
++OSDefineMetaClassAndStructors(LaurelVibrator, IOService);
++
++bool
++LaurelVibrator::start(IOService *provider)
++{
++	if (laurel_haptic_start() != 0) {
++		return false;                   /* laurel_haptic.c said why ("LAUREL HAPTIC: off: ...") */
++	}
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fLoop = IOWorkLoop::workLoop();
++	fGate = fLoop ? IOCommandGate::commandGate(this, gatedSet) : NULL;
++	fTimer = fLoop ? IOTimerEventSource::timerEventSource(this, timerFired) : NULL;
++	if (!fGate || !fTimer || fLoop->addEventSource(fGate) != kIOReturnSuccess ||
++	    fLoop->addEventSource(fTimer) != kIOReturnSuccess) {
++		IOLog("LAUREL VIBRATOR: off: no work loop (the motor works, iOS cannot reach it)\n");
++		return false;
++	}
++	setName("vibrator");
++	setProperty("LaurelHaptics", "PMI632 LDO ERM, SID3 0x5700 (laurel 2700)");
++	registerService();
++	IOLog("LAUREL VIBRATOR: on: published \"vibrator\" (FigVibrator hertz_millisecs)\n");
++	return true;
++}
++
++IOReturn
++LaurelVibrator::setProperties(OSObject *properties)
++{
++	if (!fGate) {
++		return kIOReturnNotReady;
++	}
++	return fGate->runAction(gatedSet, properties);
++}
++
++IOReturn
++LaurelVibrator::gatedSet(OSObject *owner, void *arg0, void *, void *, void *)
++{
++	return static_cast<LaurelVibrator *>(owner)->apply(static_cast<OSObject *>(arg0));
++}
++
++void
++LaurelVibrator::stopAll()
++{
++	fTimer->cancelTimeout();
++	fRunning = false;
++	(void)laurel_haptic_vib(0);
++}
++
++IOReturn
++LaurelVibrator::apply(OSObject *properties)
++{
++	bool log = fCalls++ < LV_LOG;
++	if (OSDynamicCast(OSNumber, properties)) {
++		if (log) {
++			IOLog("LAUREL VIBRATOR: stop\n");
++		}
++		stopAll();
++		return kIOReturnSuccess;
++	}
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	OSArray *a = d ? OSDynamicCast(OSArray, d->getObject("hertz_millisecs")) : NULL;
++	if (!a) {
++		if (log) {
++			IOLog("LAUREL VIBRATOR: unknown request (%s)\n", properties ? properties->getMetaClass()->getClassName() : "null");
++		}
++		return kIOReturnBadArgument;
++	}
++	stopAll();
++	fCount = 0;
++	uint32_t onMs = 0;
++	for (unsigned i = 0; i + 1 < a->getCount() && fCount < LV_MAX_STEPS; i += 2) {
++		OSObject *state = a->getObject(i);
++		OSNumber *ms = OSDynamicCast(OSNumber, a->getObject(i + 1));
++		if (!ms) {
++			continue;
++		}
++		bool on = false;
++		if (OSDictionary *sd = OSDynamicCast(OSDictionary, state)) {
++			OSNumber *in = OSDynamicCast(OSNumber, sd->getObject("intensity"));
++			int64_t v = in ? (int64_t)in->unsigned64BitValue() : 65536;
++			if (in && in->numberOfBits() <= 32) {
++				v = (int32_t)in->unsigned32BitValue();
++			}
++			on = v > 0;
++		} else if (state == kOSBooleanTrue) {
++			on = true;
++		}
++		uint64_t t = ms->unsigned64BitValue();
++		fSteps[fCount].ms = t == 0 ? 1 : t > LV_MAX_STEP_MS ? LV_MAX_STEP_MS : (uint32_t)t;
++		fSteps[fCount].on = on;
++		onMs += on ? fSteps[fCount].ms : 0;
++		fCount++;
++	}
++	OSBoolean *rep = OSDynamicCast(OSBoolean, d->getObject("repeat"));
++	fRepeat = rep == kOSBooleanTrue;
++	if (log) {
++		IOLog("LAUREL VIBRATOR: start: %u steps (first %u ms %s, %u ms on in all), repeat %d\n", fCount,
++		    fCount ? fSteps[0].ms : 0, fCount && fSteps[0].on ? "on" : "off", onMs, fRepeat);
++	}
++	if (fCount == 0) {
++		return kIOReturnBadArgument;
++	}
++	fNext = 0;
++	fElapsedMs = 0;
++	fRunning = true;
++	runStep();
++	return kIOReturnSuccess;
++}
++
++void
++LaurelVibrator::runStep()
++{
++	if (!fRunning) {
++		return;
++	}
++	if (fNext >= fCount) {
++		if (!fRepeat || fElapsedMs >= LV_REPEAT_MAX_MS) {
++			stopAll();
++			return;
++		}
++		fNext = 0;
++	}
++	const Step &s = fSteps[fNext++];
++	if (s.on) {
++		(void)laurel_haptic_vib(s.ms + 10u);
++	}
++	fElapsedMs += s.ms;
++	fTimer->setTimeoutMS(s.ms);
++}
++
++void
++LaurelVibrator::timerFired(OSObject *owner, IOTimerEventSource *)
++{
++	static_cast<LaurelVibrator *>(owner)->runStep();
++}
++
++/* IODeviceTree:/product/haptics as in the D22 ADT; 0 = published (or there already). */
++extern "C" int
++laurel_haptic_publish_closed_loop(void)
++{
++	IORegistryEntry *product = IORegistryEntry::fromPath("/product", gIODTPlane);
++	if (product == NULL) {
++		IOLog("LAUREL HAPTIC UI: no IODeviceTree:/product (ADT built without d22ap.adt)\n");
++		return -1;
++	}
++	IORegistryEntry *old = product->childFromPath("haptics", gIODTPlane);
++	if (old != NULL) {
++		IOLog("LAUREL HAPTIC UI: IODeviceTree:/product/haptics is in the ADT already: kept\n");
++		old->release();
++		product->release();
++		return 0;
++	}
++	static const uint32_t one = 1;
++	static const char name[] = "haptics";
++	IORegistryEntry *node = new IORegistryEntry;
++	OSData *n = OSData::withBytes(name, sizeof(name));
++	OSData *cl = OSData::withBytes(&one, sizeof(one));
++	OSData *third = OSData::withBytes(&one, sizeof(one));
++	bool ok = node && n && cl && third && node->init(NULL);
++	if (ok) {
++		node->setName(name);
++		ok = node->setProperty("name", n) && node->setProperty("closed-loop", cl) &&
++		    node->setProperty("supports-3rd-party-haptics", third) && node->attachToParent(product, gIODTPlane);
++	}
++	OSSafeReleaseNULL(n);
++	OSSafeReleaseNULL(cl);
++	OSSafeReleaseNULL(third);
++	OSSafeReleaseNULL(node);        /* the parent link keeps it */
++	product->release();
++	return ok ? 0 : -1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp	2026-11-01 04:19:08.730234668 +0530
++++ b/iokit/KernelConfigTables.cpp	2026-11-01 04:23:22.363588173 +0530
+@@ -82,6 +82,11 @@
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = LaurelVibrator;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = LaurelVibrator;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"

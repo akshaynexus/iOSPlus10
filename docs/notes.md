@@ -3823,3 +3823,13 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   display off, sleep in: done` on lock, `SWEET FB: panel sleep out, display on: done` on wake.
 - Why AppleARMBacklight waits for the GPU: topaz 0110 made it opt-in because CoreBrightness then ran digital dimming that the CPU
   renderer could not afford (<1 fps). 430 nits is an estimate [I]: no luminance value in the DT or drivers.
+- Patch `2700-laurel-pmi632-haptics` (area H, vibration; details docs/laurel_sprout/haptics.md): PMI632 LDO vibrator (ERM, SID 3,
+  0x5700, pmi632.dtsi:412) over an own SPMI lane in `bsd/dev/laurel_haptic.c` (APID of PPID 0x357, EE 0 owner check, observer
+  EXT_READL + rw EXT_WRITEL, own lock; no state shared with sweet_spmi.c, but the same arbiter bases are hard-coded in both).
+  Registers [V leds-qpnp-vibrator-ldo.c]: VSET 0x40/0x41 mV LE (3000 = 0x0bb8), EN_CTL 0x46 bit 7, STATUS1 0x08 bit 7 ready.
+  Policy: overdrive start 3544 mV / 30 ms (Qualcomm default; DT turns it off for Android's 50 ms min play) [I: needed for 3-20 ms
+  iOS taps], tap >= 30 ms, duty heat budget 70 % (cut 4000 ms, resume 2000 ms), 1 s watchdog thread call. iOS: "vibrator"
+  IOService (LaurelVibrator.cpp = negroni 0301) + /dev/redwood-haptic (topaz audio_plugin.c Actuator). /product/haptics
+  closed-loop only when the root has RedwoodAudio.driver + VirtualAudio.plugin: today it has neither [V root.sh, topaz
+  sweet-root-tweaks.py moves VirtualAudio to HAL.disabled], so expect `LAUREL HAPTIC UI: off` and ringtone vibration only; UI and
+  keyboard taps need the audio plug-in in the root. Built 04:26 (220 patches, 0 LSE, no new warnings). NOT BOOTED.
