@@ -14,3 +14,12 @@ almost the same base as our topaz series and port more easily than the negroni (
 
 Apollo boots like topaz (`fastboot boot` of a shim). The Mi A3 path is moving to Mu-Silicium + UniXNU (docs/laurel_sprout/uefi-boot.md);
 the driver patches above are independent of the boot path.
+
+## ios-redfin (Pixel 5, SM7250) - also a reference
+
+`external/ios-redfin` (DenialOfGravity/ios-redfin, pinned 0c4433cf, 2026-10-29), an ios-sweet descendant via ios-flame:
+8 cores with DVFS + thermal caps, Metal via Turnip/metal2vulkan, haptics (DRV2624 through the RedwoodAudio actuator),
+sound, mic, camera, Wi-Fi from userland. Owner's report (2026-11-01): killing `vmd` (broken without a network/modem)
+brought the average CPU load to ~5 %. Not in the pushed repo yet; the same fix is in negroni's
+`scripts/ios16/root-tweaks-extra.py` DROP list, which `scripts/laurel/root.sh` now applies (9 jobs removed incl.
+com.apple.voicemail.vmd; CA_HEARTBEAT_RATE=60; lsd/widget jetsam 64 MiB; Bold Text off).

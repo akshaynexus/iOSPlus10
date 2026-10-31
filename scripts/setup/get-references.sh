@@ -38,6 +38,7 @@ hackios-umi        https://github.com/ls9875/hackios-umi.git          6ac5eee39b
 hackios-scion      https://github.com/Scion-Project/hackios-xnu-kernel.git e407d1e75a8d79b1cf5975e9abe52f23a71106f2 main
 ios-sweet-umi      https://github.com/myh982516/ios-sweet-umi.git     952cf3329e24c99adbb08f13fb78afe57f72ffc4 main
 ios-topaz-evergo   https://github.com/wlw333554/ios-topaz.git         3ed18504136a8363ab20be1759fb00b290e10081 main
+ios-redfin         https://github.com/DenialOfGravity/ios-redfin.git  0c4433cf0060e5f0cd8947e558841c113bbad4db main
 laurel-mainline    https://github.com/laurel-sprout-mainline/laurel_sprout_mainline.git 2cb8fd07918d6dd07180796da5b75cb491400df9 mainline-6.18-split
 '
 

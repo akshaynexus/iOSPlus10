@@ -4,7 +4,8 @@
 # Input: $APPLE/20H392/*.dmg (scripts/ios16/fetch-dmgs.sh, op10tool ipsw-get; default APPLE=~/op10-apple).
 # Steps: 1. external/ios-topaz/tools/mkiosroot.sh (case-sensitive journaled HFS+, OS + SystemOS/AppOS cryptexes,
 #        dyld cache link, plain system keybag); 2. topaz sweet-root-tweaks.py (build 20H392 fixes, launchd,
-#        CommCenter drop, Setup, migration); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
+#        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped) and
+#        root-tweaks-boldtext.py; 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
 # Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
 #   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg
@@ -59,6 +60,13 @@ mnt=$(mktemp -d)
 trap 'umount "$mnt" 2>/dev/null || true; rmdir "$mnt" 2>/dev/null || true' EXIT
 mount -t hfsplus -o loop,force,rw "$IMG" "$mnt"
 python3 -I "$TOPAZ/sweet-root-tweaks.py" "$mnt"
+# negroni's tweaks on top (docs/laurel_sprout/negroni-ports.md "Userland / root image"): launchd drop list
+# (vmd: ~29k CommCenter retries per boot without a modem, the main idle CPU load; the ios-redfin Pixel 5 port
+# measured ~5 % average CPU after killing it; fairplayd.H2, ReportCrash, spindump, tailspind, aggregated,
+# bluetoothd, activityawardsd), ExtensionKit signing flag, FBLaunchWatchdogScale 3, migration skip.
+# CA heartbeat 60: the Mi A3 panel runs at 60 Hz (negroni's default 120 is for its 120 Hz panel).
+CA_HEARTBEAT=${CA_HEARTBEAT:-60} python3 -I "$REPO/scripts/ios16/root-tweaks-extra.py" "$mnt"
+python3 -I "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$mnt"
 sync
 umount "$mnt"
 
