@@ -36,6 +36,8 @@ ios-sweet-linux    https://github.com/myh120405/ios-sweet-linux.git   8d09cf0d67
 xnu-linux-toolchain https://github.com/Allenwdk/xnu-linux-toolchain.git 909990e4ec2c6cda30c20cdb23219946918c7fd6 main
 hackios-umi        https://github.com/ls9875/hackios-umi.git          6ac5eee39b076faf5c33ee14a9b17558779ee0b4 main
 hackios-scion      https://github.com/Scion-Project/hackios-xnu-kernel.git e407d1e75a8d79b1cf5975e9abe52f23a71106f2 main
+ios-sweet-umi      https://github.com/myh982516/ios-sweet-umi.git     952cf3329e24c99adbb08f13fb78afe57f72ffc4 main
+ios-topaz-evergo   https://github.com/wlw333554/ios-topaz.git         3ed18504136a8363ab20be1759fb00b290e10081 main
 laurel-mainline    https://github.com/laurel-sprout-mainline/laurel_sprout_mainline.git 2cb8fd07918d6dd07180796da5b75cb491400df9 mainline-6.18-split
 '
 

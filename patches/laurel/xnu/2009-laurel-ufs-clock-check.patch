@@ -1,0 +1,84 @@
+laurel 2009: UFS host GDSC/clock self-check in the GCC before the first host register access (an unclocked block hangs the bus with nothing on the panel) + laurel 2010: the persistent log thread keeps running after a failed flush (port of evergo 0105e, wlw333554/ios-topaz 3ed185041).
+
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -736,7 +736,47 @@
+ 	}
+ }
+ 
++static 
++/*
++ * laurel 2009: before the first UFS host register access, check in the GCC
++ * (always on) that the host is powered and clocked. An AXI access to a block
++ * whose GDSC or clocks are off never answers: the boot stops after "mbinit: done"
++ * with nothing on the panel. topaz always came from `fastboot boot`; the Mi A3
++ * boots from boot_b after a full reset, so the state ABL leaves is not known.
++ * gcc-sm6125.c: ufs_phy_gdsc 0x45004, gcc_ufs_phy_axi 0x45010, ahb 0x45014,
++ * unipro_core 0x45040, ice_core 0x45044 (CBCR bit 31 = CLK_OFF, GDSCR bit 31 = PWR_ON).
++ */
++#define LAUREL_GCC_PA               0x01400000ull
++#define LAUREL_GCC_UFS_PHY_GDSCR    0x45004
++#define LAUREL_GCC_UFS_PHY_AXI      0x45010
++#define LAUREL_GCC_UFS_PHY_AHB      0x45014
++#define LAUREL_GCC_UFS_UNIPRO_CORE  0x45040
++#define LAUREL_GCC_UFS_ICE_CORE     0x45044
++
+ static int
++laurel_ufs_clock_check(uint64_t host_pa)
++{
++	static volatile uint8_t *gcc;
++	if (gcc == NULL) {
++		gcc = (volatile uint8_t *)ml_io_map(LAUREL_GCC_PA + 0x45000, 0x1000);
++		if (gcc == NULL) {
++			printf("SWEET UFS: GCC 0x%llx not mapped; host state unknown\n", LAUREL_GCC_PA + 0x45000);
++			return 0;
++		}
++	}
++#define LGCC(off) (*(volatile uint32_t *)(gcc + ((off) - 0x45000)))
++	uint32_t gdscr = LGCC(LAUREL_GCC_UFS_PHY_GDSCR), axi = LGCC(LAUREL_GCC_UFS_PHY_AXI),
++	    ahb = LGCC(LAUREL_GCC_UFS_PHY_AHB), unipro = LGCC(LAUREL_GCC_UFS_UNIPRO_CORE),
++	    ice = LGCC(LAUREL_GCC_UFS_ICE_CORE);
++#undef LGCC
++	bool on = (gdscr & (1u << 31)) && !(axi & (1u << 31)) && !(ahb & (1u << 31));
++	printf("SWEET UFS: host 0x%llx %s: GDSCR 0x%08x axi 0x%08x ahb 0x%08x unipro 0x%08x ice 0x%08x\n",
++	    host_pa, on ? "powered and clocked" : "off: unpowered or unclocked (no register access)",
++	    gdscr, axi, ahb, unipro, ice);
++	return on ? 0 : ENXIO;
++}
++
++int
+ sweet_ufs_init(void)
+ {
+ 	DTEntry node;
+@@ -774,6 +814,10 @@
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
++	error = laurel_ufs_clock_check((uint64_t)reg[0]);        /* laurel 2009 */
++	if (error) {
++		return error;
++	}
+ 	lck_mtx_lock(&sweet_ufs_lock);
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+@@ -941,8 +985,18 @@
+ 		}
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		if (error) {
+-			printf("SWEET LOG: write failed (%d), stopping\n", error);
+-			return;
++			/*
++			 * laurel 2010 (port of evergo 0105e, wlw333554/ios-topaz): keep the
++			 * thread; the first failed flush used to end the only full log of a
++			 * boot. The complaint is rate limited so the panel tail stays readable.
++			 */
++			static uint32_t fails;
++			if (fails < 20) {
++				fails++;
++				printf("SWEET LOG: flush failed (%d) at block 0x%llx (%s); retry in %u s\n", error,
++				    base, fails < 20 ? "kept" : "last complaint", sweet_log_secs);
++			}
++			continue;
+ 		}
+ 		flushed = total;
+ 	}

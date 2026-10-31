@@ -3523,3 +3523,41 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   the link state stays in "early suspend"/"disconnected", the next suspects are the PHY after ABL's
   FastbootUsbDeviceStop/ExitBootServices (POWER_DOWN set? then 2007 re-inits it), VBUS override in QSCRATCH, and
   GUSB2PHYCFG.SUSPHY.
+
+## Mi A3: fork survey, console scan-out pipe, UFS clock check (2026-11-01 01:40, branch laurel-sprout)
+- Survey of ios-sweet / HackiOS / topaz forks for the three open problems: table in `docs/laurel_sprout/fork-fixes.md`.
+  [V] MakrSas/ios-topaz has no commit after our pin e4772911 (2026-10-22); dipa-studio/ios-sweet HEAD is still
+  45263bee5 (the pinned one). New references (get-references.sh): `ios-sweet-umi` 952cf3329 (162 umi patches),
+  `ios-topaz-evergo` 3ed185041 (wlw333554, evergo). hackios-scion e407d1e75 (pinned) has the DWC3 gadget `hakios.dwc3.c`.
+- [V code] What follows `mbinit: done`: bsd_init goes to IOFindBSDRoot -> sweet_ufs_init; the first line it prints
+  is `SWEET UFS: "userdata" on LUN 0` (topaz NOTES: then `BSD root:`, `cannot mount root, errno = 19` retried for ever).
+  None of that was on the 00:40 photo. In parallel `AppleCLCD::start` (SweetFramebuffer.cpp:379) prints `SWEET FB:
+  DSI0 ctrl` (on the photo), then allocates a console shadow, retargets the kernel console into it and points **VIG0**
+  (0x5e05000, CTL_FLUSH 0x20001) at it. The Mi A3 ABL does not stage its screen on VIG0 like topaz (that is why shim
+  patch 0001 exists: VIG0/DMA0/DMA1 by SRC0_ADDR). [I, strong] If the panel is fed by DMA0/DMA1, every line after
+  the retarget (UFS, root, panics) lands in a buffer the panel never shows: the console "stops" at the last bsd_init
+  line, `mbinit: done`, with the same timing on every boot (cpus=4 and 8), no panic. The 01:19 boot (root on userdata):
+  two flashes = backboardd's first swaps/fade through the wrong pipe, then `display off` (RequestPowerChange(0),
+  topaz 0079/0106, DCS 0x28) = an AMOLED with no light = "phone off". Refutation: the shim's `FB pipe=0` line.
+- Fix `patches/laurel/xnu/2008-laurel-fb-scanout-pipe.patch`: AppleCLCD takes the SSPP whose SRC0_ADDR is the boot
+  framebuffer (VIG0 0x5e05000 flush bit 0, DMA0 0x5e25000 bit 11, DMA1 0x5e27000 bit 12, + CTL bit 17; dpu_5_4_sm6125.h,
+  dpu_hw_ctl.c). Line `LAUREL FB SCANOUT: on: DMA0 (0x5e25000) fetches 0x5c000000, 720x1560 stride 2880 format .. CTL
+  flush 0x20800`. No match or not 32 bpp: `LAUREL FB SCANOUT: off: ...`, fVig0 = NULL = topaz' CPU-copy path, the
+  console stays on the boot framebuffer for the whole boot (panics too). Kill switch `laurelfb_scanout=0`.
+- `scripts/laurel/shim.sh`: boot-arg `sweetfb_stayon=1` (topaz' own; = umi 0157 `sweetfb_alwayson`): backboardd's
+  display-off is ignored until touch/keys can wake the panel.
+- `2009-laurel-ufs-clock-check.patch`: before the first UFS host register access, `laurel_ufs_clock_check` reads the GCC
+  (ufs_phy_gdsc 0x45004 PWR_ON, axi 0x45010, ahb 0x45014, unipro 0x45040, ice 0x45044; CBCR bit 31 = CLK_OFF) and prints
+  `SWEET UFS: host 0x4804000 powered and clocked: GDSCR .. axi .. ahb ..` or `off: unpowered or unclocked` + ENXIO
+  (the root panic then names it, instead of a silent bus hang). Second hunk ("laurel 2010", port of evergo 0105e):
+  the 0047 persistent-log thread keeps running after a failed flush (`SWEET LOG: flush failed (N) ... retry`, 20 lines max).
+- `scripts/laurel/log-pull.sh`: port of topaz tools/sweet-log-pull.sh: reads the last 1025 4 KiB blocks of userdata over
+  adb (recovery or rooted Android: owner decision, boot_b write) and decodes with topaz' sweet-log.py. The ring is
+  written only after `SWEET UFS: "userdata"` with `ufsrw=1` (set), every 10 s.
+- Not ported, with reasons, in fork-fixes.md: umi 0153 (IOEventSource is enabled by default: IOEventSource.cpp:169),
+  umi 0154/0155/0152/0156 (diagnostics), upstream /pram region (topaz passes kdp_core; no reader), hackios DWC3
+  stop-before-reset + GSBUSCFG/GUCTL tuning (candidate 2011 once a stage line is read), evergo userland-stage patches.
+- [V] Build 01:39: 211 patches apply, kernel 27 s, 0 LSE/RCpc, `laurel_scanout_pipe` + `laurel_ufs_clock_check` in the
+  symbol table; shim default cpus=8 (8-core ADT); image out/laurel/laurel-boot.img 17481728 bytes with the new boot-args.
+  NOT BOOTED (phone off). Next boot: `scripts/bg.sh laurel-test scripts/laurel/boot-test.sh` (BOOT=continue) or
+  `BOOT=reboot` for the cold path; film the panel: `FB pipe=`, `LAUREL FB SCANOUT:`, `SWEET UFS: host`, `LAUREL USB:`.

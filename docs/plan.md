@@ -457,6 +457,14 @@ the kernel (GDSC, clocks, reset, QUSB2 PHY, core) + one line per stage + `no hos
 `flash-boot.sh BOOT=continue` (ABL boots boot_b without a reset, USB left as fastboot had it).
 Boots: 00:40 (2006, `fastboot reboot`): console stops after `mbinit: done`, no USB device, no `LAUREL USB:` line
 visible (panel wrapped). 01:03 (2007, `fastboot continue`): no USB device on the host in 180 s; photo pending.
-Next: read the photo (the `LAUREL USB:` stage lines and the 10 s heartbeat show where the gadget stops), fix that
-stage, boot again; then `BOOT=reboot` to test the cold path. Root mount wait on userdata (still Android) is expected.
+01:19 (2007, `fastboot reboot`, iOS root on userdata): console as usual, then two flashes, then the panel dark.
+01:40 fork survey (`docs/laurel_sprout/fork-fixes.md`): the console stop after `mbinit: done` is most likely the
+AppleCLCD start moving the kernel console to a shadow buffer scanned through VIG0 while the Mi A3 panel is fed by
+another pipe (our shim 0001 finding); 2008 picks the pipe that fetches the boot framebuffer or keeps the console on
+it; `sweetfb_stayon=1` stops backboardd's display-off; 2009 checks the UFS GDSC/clocks before the first host access
+and keeps the persistent-log thread alive (evergo 0105e); `scripts/laurel/log-pull.sh` reads the 0047 ring.
+Image 01:39 (cpus=8, 17481728 bytes) not booted: the phone is off.
+Next: owner powers the phone on (Power+VolDown for fastboot) -> `scripts/bg.sh laurel-test scripts/laurel/boot-test.sh`
+(warm path) and a film of the panel: `FB pipe=`, `LAUREL FB SCANOUT:`, `SWEET UFS: host`, the `LAUREL USB:` stage lines.
+Then `BOOT=reboot` (cold path). If `FB pipe=0` the scan-out theory is wrong and the next suspect is the UFS line.
 Exact results go to docs/notes.md.

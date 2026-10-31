@@ -1,0 +1,129 @@
+laurel 2008: the SSPP that fetches the boot framebuffer (VIG0, DMA0 or DMA1) drives the direct scanout; none or not 32 bpp: CPU copy and the console stays on the boot framebuffer. Kill switch laurelfb_scanout=0. Source: our shim patch 0001 (the Mi A3 ABL does not stage its screen on VIG0 like topaz); dpu_5_4_sm6125 catalog offsets, dpu_hw_ctl.c flush bits.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -177,8 +177,9 @@
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	/* topaz direct MDP scanout (VIG0 / CTL0 from TopazGpuW disp.c) */
+-	volatile uint32_t *fVig0;
++	volatile uint32_t *fVig0;       /* laurel 2008: the SSPP that fetches the boot framebuffer (VIG0, DMA0 or DMA1) */
+ 	volatile uint32_t *fCtl0;
++	uint32_t      fFlush;         /* laurel 2008: CTL_FLUSH bits of that pipe + CTL */
+ 	volatile uint32_t *fIntf1;      /* INTF_1 (DSI0) timing engine: refresh diagnostics */
+ 	uint32_t      fIntfFrames;
+ 	/* boot-arg sweetfb_lock=1: the vsync timer follows the panel (vsyncNext) */
+@@ -281,6 +282,75 @@
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * laurel 2008: the MDP source pipe that fetches the boot framebuffer.
++ * topaz drives VIG0 blindly (its ABL stages the splash on VIG0). The Mi A3 ABL
++ * stages its screen on any of VIG0, DMA0, DMA1 (the shim, patches/laurel/shim/0001,
++ * looks for the active one and hands the kernel that buffer). Pointing VIG0 at our
++ * buffers while the mixer shows another pipe makes every frame, the console shadow
++ * and every panic invisible: the panel seems to stop right after the AppleCLCD start.
++ * Self-check: the pipe whose SRC0_ADDR is the boot framebuffer, 32 bpp, a sane size.
++ * None: direct scanout off, the console stays on the boot framebuffer, frames reach it
++ * by CPU copy (the pre-topaz sweet path). Kill switch laurelfb_scanout=0 (the same).
++ * dpu_5_4_sm6125: sspp_0 VIG0 mdp+0x4000, sspp_8 DMA0 +0x24000, sspp_9 DMA1 +0x26000,
++ * mdp at 0x5e01000; CTL_FLUSH bits VIG0 0, DMA0 11, DMA1 12, CTL 17 (dpu_hw_ctl.c).
++ */
++struct laurel_sspp { const char *name; uint32_t pa; uint32_t flush; };
++static const struct laurel_sspp laurel_sspps[] = {
++	{ "VIG0", 0x05e05000, 1u << 0 },
++	{ "DMA0", 0x05e25000, 1u << 11 },
++	{ "DMA1", 0x05e27000, 1u << 12 },
++};
++#define LAUREL_CTL_FLUSH_CTL    (1u << 17)
++#define LAUREL_SSPP_N           (sizeof(laurel_sspps) / sizeof(laurel_sspps[0]))
++
++static volatile uint32_t *
++laurel_scanout_pipe(uint64_t bootPhys, uint32_t *flush)
++{
++	uint32_t on = 1;
++	volatile uint32_t *regs[LAUREL_SSPP_N];
++	uint32_t src[LAUREL_SSPP_N], size[LAUREL_SSPP_N], stride[LAUREL_SSPP_N], fmt[LAUREL_SSPP_N];
++	int found = -1;
++
++	PE_parse_boot_argn("laurelfb_scanout", &on, sizeof(on));
++	if (on == 0) {
++		IOLog("LAUREL FB SCANOUT: off: laurelfb_scanout=0 (CPU copy, console stays on the boot framebuffer)\n");
++		return NULL;
++	}
++	for (unsigned i = 0; i < LAUREL_SSPP_N; i++) {
++		regs[i] = (volatile uint32_t *)ml_io_map(laurel_sspps[i].pa, 0x1000);
++		src[i] = size[i] = stride[i] = fmt[i] = 0;
++		if (regs[i] == NULL) {
++			continue;
++		}
++		src[i] = regs[i][0x14 / 4];
++		size[i] = regs[i][0x00 / 4];
++		stride[i] = regs[i][0x24 / 4] & 0xffff;
++		fmt[i] = regs[i][0x30 / 4];
++		if (found < 0 && src[i] == (uint32_t)bootPhys && (size[i] & 0xffff) >= 360 && (size[i] >> 16) >= 360) {
++			found = (int)i;
++		}
++	}
++	if (found < 0) {
++		IOLog("LAUREL FB SCANOUT: off: no pipe fetches the boot framebuffer %#llx (VIG0 src %#x DMA0 src %#x "
++		    "DMA1 src %#x); CPU copy, console stays on the boot framebuffer\n",
++		    (unsigned long long)bootPhys, src[0], src[1], src[2]);
++		return NULL;
++	}
++	uint32_t bpp = ((fmt[found] >> 9) & 3) + 1;
++	if (bpp != 4) {
++		IOLog("LAUREL FB SCANOUT: off: %s fetches the boot framebuffer at %u bpp (format %#x); kernel frames are "
++		    "32 bpp; CPU copy, console stays on the boot framebuffer\n", laurel_sspps[found].name, bpp, fmt[found]);
++		return NULL;
++	}
++	*flush = laurel_sspps[found].flush | LAUREL_CTL_FLUSH_CTL;
++	IOLog("LAUREL FB SCANOUT: on: %s (%#x) fetches %#x, %ux%u stride %u format %#x, CTL flush %#x\n",
++	    laurel_sspps[found].name, laurel_sspps[found].pa, src[found], size[found] & 0xffff, size[found] >> 16,
++	    stride[found], fmt[found], *flush);
++	return regs[found];
++}
++
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -423,8 +493,9 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++	fFlush = LAUREL_CTL_FLUSH_CTL | laurel_sspps[0].flush;
++	fVig0 = laurel_scanout_pipe(fPhys, &fFlush);      /* laurel 2008: VIG0, DMA0 or DMA1, or NULL */
+ 	topaz_adreno_init();
+ 	setProperty("RedwoodWaitsForGPU", true);         /* present() waits for the GPU (eagl.c reads it) */
+ 	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
+@@ -485,7 +556,7 @@
+ 		fBootStride = fVig0[0x24 / 4];
+ 		fScanPhys = fBootSrc;
+ 		fScanStride = fBootStride;
+-		IOLog("SWEET FB: MDP VIG0 src %#x stride %u (boot), direct scanout ready\n",
++		IOLog("SWEET FB: MDP pipe src %#x stride %u (boot), direct scanout ready\n",
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ 		vm_size_t fsz = (vm_size_t)fRowBytes * fHeight;
+@@ -974,7 +1045,7 @@
+ 		sweet_hold_set(dropped, false);
+ 		uint64_t waited = mach_absolute_time(), wns = 0;  /* (present waits for the GPU too) */
+ 		present(rec);
+-		for (int t = 0; t < 250 && (fCtl0[0x18 / 4] & 0x20001) != 0; t++) {
++		for (int t = 0; t < 250 && (fCtl0[0x18 / 4] & fFlush) != 0; t++) {
+ 			IODelay(100);                           /* until the MDP has latched it */
+ 		}
+ 		absolutetime_to_nanoseconds(mach_absolute_time() - waited, &wns);
+@@ -1017,7 +1088,7 @@
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next vsync */
++	fCtl0[0x18 / 4] = fFlush;       /* flush the pipe + CTL: latched at the next vsync (laurel 2008) */
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fScanPhys = pa;
+ 	fScanStride = stride;
