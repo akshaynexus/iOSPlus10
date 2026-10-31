@@ -1,0 +1,200 @@
+laurel 2018: 'ctl bootloader' / 'recovery' reach the Mi A3 ABL fastboot/recovery: the PM6125 PON soft-reboot spare register (SOFT_RB_SPARE 0x88F, qpnp_pon_set_restart_reason: reason << 1 on a GEN2 PON; ABL reads 2 = fastboot, 1 = recovery) is written over SPMI and a warm reset is selected (PS_HOLD_RST_CTL 0x85A type 1, enable in 0x85B) before PSCI SYSTEM_RESET; the IMEM word of 2003 stays. The IMEM reason alone did nothing (boot 2026-11-01 03:48: the phone booted normally). sweet_spmi.c gets the trinket arbiter bases (core 0x1c40000, rw 0x1e00000, observer 0x3e00000, config 0x1c0a000; same v5 layout as topaz) so SweetBattery's reads can work too, plus a lock-free PON lane (observer read + EXT_WRITEL) usable in the panic hold and from the USB timer call. Self-check at start: 'LAUREL REBOOT: PON reason on: subtype .. SOFT_RB_SPARE .. PS_HOLD_RST_CTL ..' or 'off: ...' (the restart then falls back to IMEM + reset as before).
+
+diff -ruN a/bsd/dev/laurel_reboot.c b/bsd/dev/laurel_reboot.c
+--- a/bsd/dev/laurel_reboot.c	2026-11-01 03:56:53.043294511 +0530
++++ b/bsd/dev/laurel_reboot.c	2026-11-01 03:57:23.078829308 +0530
+@@ -31,12 +31,25 @@
+ #define LAUREL_IMEM_RESTART_OFF   0x65c
+ #define PSCI_SYSTEM_OFF           0x84000008ull
+ #define PSCI_SYSTEM_RESET         0x84000009ull
+-
+-static const struct { const char *name; uint32_t imem; } lr_modes[] = {
+-	{ "normal",     0x77665501 },
+-	{ "bootloader", 0x77665500 },
+-	{ "fastboot",   0x77665500 },
+-	{ "recovery",   0x77665502 },
++/*
++ * laurel 2018: the Mi A3 ABL takes the boot mode from the PM6125 PON soft-reboot spare register
++ * (qpnp-power-on.c qpnp_pon_set_restart_reason: SOFT_RB_SPARE 0x88F, reason << 1 on a GEN2 PON,
++ * << 2 on an older one; ABL: 1 = recovery, 2 = fastboot), after a warm reset (PS_HOLD_RST_CTL 0x85A
++ * type 1, enable bit 7 of 0x85B; msm-poweroff.c sets warm for every reboot with a reason). The IMEM
++ * word alone did nothing on this device (boot 2026-11-01 03:48: "ctl bootloader" booted normally).
++ */
++#include "sweet_spmi.h"
++#define LR_PON_SUBTYPE   0x805u
++#define LR_PON_RST_CTL   0x85au
++#define LR_PON_RST_CTL2  0x85bu
++#define LR_PON_SPARE     0x88fu
++static int lr_pon_shift = -1;             /* -1: PON not reachable (self-check) */
++
++static const struct { const char *name; uint32_t imem; uint8_t pon; } lr_modes[] = {  /* pon: laurel 2018 ABL reason */
++	{ "normal",     0x77665501, 0 },
++	{ "bootloader", 0x77665500, 2 },
++	{ "fastboot",   0x77665500, 2 },
++	{ "recovery",   0x77665502, 1 },
+ };
+ 
+ static volatile uint32_t *lr_reason;      /* NULL: no IMEM reason (self-check failed) */
+@@ -93,10 +106,47 @@
+ 			printf("LAUREL REBOOT: on without reason: IMEM read back 0x%08x\n", *r);
+ 		}
+ 	}
++	/* laurel 2018: PON reason self-check (thread context: the SPMI init allocates a lock) */
++	if (sweet_spmi_init() == 0) {
++		uint8_t sub = 0, spare = 0, ctl = 0;
++		if (sweet_spmi_pon_read(LR_PON_SUBTYPE, &sub) == 0 && sweet_spmi_pon_read(LR_PON_SPARE, &spare) == 0 &&
++		    sweet_spmi_pon_read(LR_PON_RST_CTL, &ctl) == 0) {
++			lr_pon_shift = sub >= 4 ? 1 : 2;      /* PON_GEN2_PRIMARY 4 / SECONDARY 5 */
++			printf("LAUREL REBOOT: PON reason on: subtype 0x%02x (shift %d) SOFT_RB_SPARE 0x%02x PS_HOLD_RST_CTL 0x%02x\n",
++			    sub, lr_pon_shift, spare, ctl);
++		} else {
++			printf("LAUREL REBOOT: PON reason off: SPMI read of the PON failed\n");
++		}
++	} else {
++		printf("LAUREL REBOOT: PON reason off: SPMI arbiter not ready\n");
++	}
+ 	lr_on = 1;
+ 	return 1;
+ }
+ 
++/* Write the ABL reason and select a warm reset; kdb_printf only (panic hold, timer call). */
++static void
++lr_pon_set(uint8_t reason)
++{
++	if (lr_pon_shift < 0 || reason == 0) {
++		return;
++	}
++	uint8_t spare = 0, ctl = 0, ctl2 = 0;
++	uint8_t mask = (uint8_t)(lr_pon_shift == 1 ? 0xfe : 0xfc);
++	(void)sweet_spmi_pon_read(LR_PON_SPARE, &spare);
++	int w1 = sweet_spmi_pon_write(LR_PON_SPARE, (uint8_t)((spare & ~mask) | (reason << lr_pon_shift)));
++	(void)sweet_spmi_pon_read(LR_PON_RST_CTL2, &ctl2);
++	int w2 = sweet_spmi_pon_write(LR_PON_RST_CTL2, (uint8_t)(ctl2 & ~0x80u));
++	delay(500);
++	(void)sweet_spmi_pon_read(LR_PON_RST_CTL, &ctl);
++	int w3 = sweet_spmi_pon_write(LR_PON_RST_CTL, (uint8_t)((ctl & ~0x0fu) | 0x01u));   /* warm reset */
++	int w4 = sweet_spmi_pon_write(LR_PON_RST_CTL2, (uint8_t)(ctl2 | 0x80u));
++	uint8_t back = 0;
++	(void)sweet_spmi_pon_read(LR_PON_SPARE, &back);
++	kdb_printf("LAUREL REBOOT: PON SOFT_RB_SPARE 0x%02x -> 0x%02x (reason %u), warm reset; writes %d %d %d %d\n",
++	    spare, back, reason, w1, w2, w3, w4);
++}
++
+ void
+ laurel_power_off(void)
+ {
+@@ -112,6 +162,7 @@
+ 		*lr_reason = lr_modes[lr_mode].imem;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
++	lr_pon_set(lr_modes[lr_mode].pon);
+ 	/* kdb_printf: also safe in the panic hold (console only, no os_log, no locks) */
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_RESET (%s)\n", lr_modes[lr_mode].name);
+ 	int64_t rc = lr_psci(PSCI_SYSTEM_RESET);
+diff -ruN a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c	2026-11-01 03:56:53.040038350 +0530
++++ b/bsd/dev/sweet_spmi.c	2026-11-01 03:56:53.054673595 +0530
+@@ -14,12 +14,24 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+-#define SP_CORE_PA 0x0c440000u
+-#define SP_OBS_PA  0x0e600000u
+-#define SP_CFG_PA  0x0c40a000u
++/*
++ * laurel 2018 (Mi A3, SM6125 trinket.dtsi spmi@1c40000): core 0x1c40000, rw channels 0x1e00000
++ * (0x10000 per APID), observer 0x3e00000 (0x80 per APID, EE 0), config 0x1c0a000. Arbiter v5: the
++ * same layout as topaz (khaje), only the bases differ (the topaz bases 0x0c440000/0x0e600000 are
++ * not SPMI on trinket: "SWEET BATTERY: static fallback" on every Mi A3 boot before this patch).
++ * Adds the PON lane (sid 0, peripheral 0x08) for the restart reason: observer read + EXT_WRITEL on
++ * the rw channel, without the lock (own APID lane; usable in the panic hold).
++ */
++#define SP_CORE_PA 0x01c40000u
++#define SP_OBS_PA  0x03e00000u
++#define SP_CFG_PA  0x01c0a000u
++#define SP_RW_PA   0x01e00000u
++#define SP_PON_PPID 0x008u
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
++static vm_offset_t sp_pon_rw;            /* rw channel lane of the PON APID, mapped at init */
++static uint16_t sp_pon_apid = SP_NO_APID;
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
+@@ -78,11 +90,59 @@
+ 		return -1;
+ 	}
+ 	sp_ready = true;
+-	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
+-	    arb_version, sp_count);
++	sp_pon_apid = sp_find_apid(SP_PON_PPID);
++	if (sp_pon_apid != SP_NO_APID) {
++		sp_pon_rw = ml_io_map(SP_RW_PA + 0x10000u * sp_pon_apid, 0x1000);
++	}
++	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads; PON APID %u rw lane %s\n",
++	    arb_version, sp_count, sp_pon_apid, sp_pon_rw ? "mapped" : "none");
+ 	return 0;
+ }
+ 
++/* laurel 2018: PON lane, no lock (its APID is used by nobody else in this kernel). */
++static int
++sp_pon_wait(vm_offset_t base, unsigned off)
++{
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(base, off + 0x08u);
++		if (status & 1u) {
++			return (status & 0x0eu) ? -1 : 0;
++		}
++		delay(1);
++	}
++	return -1;
++}
++
++int
++sweet_spmi_pon_read(unsigned addr, uint8_t *out)
++{
++	if (!sp_ready || sp_pon_apid == SP_NO_APID || (addr >> 8) != SP_PON_PPID || !out) {
++		return -1;
++	}
++	unsigned off = 0x80u * sp_pon_apid;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sp_obs + off) = (1u << 27) | ((addr & 0xffu) << 4); /* EXT_READL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	if (sp_pon_wait(sp_obs, off) != 0) {
++		return -1;
++	}
++	*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++	return 0;
++}
++
++int
++sweet_spmi_pon_write(unsigned addr, uint8_t val)
++{
++	if (!sp_ready || !sp_pon_rw || (addr >> 8) != SP_PON_PPID) {
++		return -1;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sp_pon_rw + 0x10u) = val;                               /* WDATA0 */
++	*(volatile uint32_t *)(sp_pon_rw + 0x00u) = (0u << 27) | ((addr & 0xffu) << 4); /* EXT_WRITEL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	return sp_pon_wait(sp_pon_rw, 0);
++}
++
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+diff -ruN a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+--- a/bsd/dev/sweet_spmi.h	2026-11-01 03:56:53.041854185 +0530
++++ b/bsd/dev/sweet_spmi.h	2026-11-01 03:56:53.054644150 +0530
+@@ -8,6 +8,10 @@
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* laurel 2018: PM6125 PON (sid 0, 0x800) over its own APID lane, no lock, usable in the
++ * panic hold and from a timer call: observer read and EXT_WRITEL. 0 success, -1 failure. */
++int sweet_spmi_pon_read(unsigned addr, uint8_t *out);
++int sweet_spmi_pon_write(unsigned addr, uint8_t val);
+ #ifdef __cplusplus
+ }
+ #endif

@@ -3735,3 +3735,9 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   hold GPIO 36 on trinket -> SError. Mi A3 pins: reset 87, IRQ 88 (WEST 0x500000), ts_vdd enable 83 (SOUTH 0x900000); I2C
   GPIO 6/7, QUP0 SE2, GCC vote 0x7900c/0x13c0, RCG 0x1f3a8 unchanged (gcc-trinket.c = gcc-khaje.c offsets). Built 03:55
   (218 patches, 0 LSE), image rebuilt; `laurel-test` waits for the ABL fastboot (owner: power off, Power+VolDown).
+- Patch `2018-laurel-abl-reboot-reason`: `ctl bootloader`/`recovery` write the PM6125 PON SOFT_RB_SPARE (0x88F, reason << 1 on
+  GEN2; 2 = fastboot, 1 = recovery) over SPMI and select a warm reset (0x85A type 1, 0x85B bit 7) before PSCI SYSTEM_RESET.
+  sweet_spmi.c now has the trinket arbiter bases (core 0x1c40000, rw 0x1e00000 at 0x10000/APID, observer 0x3e00000 at 0x80/APID,
+  config 0x1c0a000; v5 layout as topaz) + a lock-free PON lane. Self-check line `LAUREL REBOOT: PON reason on: subtype ..`.
+  [I] SweetBattery may now read the PMIC too (its "static fallback" came from the topaz SPMI bases). Built 04:05 (219 patches,
+  0 LSE), image rebuilt (kernels 2015 late re-enable + 2016 + 2017 + 2018). NOT BOOTED.
