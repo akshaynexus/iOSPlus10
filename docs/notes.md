@@ -3561,3 +3561,33 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   symbol table; shim default cpus=8 (8-core ADT); image out/laurel/laurel-boot.img 17481728 bytes with the new boot-args.
   NOT BOOTED (phone off). Next boot: `scripts/bg.sh laurel-test scripts/laurel/boot-test.sh` (BOOT=continue) or
   `BOOT=reboot` for the cold path; film the panel: `FB pipe=`, `LAUREL FB SCANOUT:`, `SWEET UFS: host`, `LAUREL USB:`.
+
+## Mi A3: UEFI boot path (Mu-Silicium -> UniXNU -> DarwinBoot -> XNU) built (2026-11-01 02:10, UEFI agent, branch laurel-sprout)
+- Owner decision: the negroni chain instead of the topaz shim. Full write-up: `docs/laurel_sprout/uefi-boot.md`.
+- [V] Base = `external/Mu-Silicium-negroni` 4b524aba (akshaynexus fork): it has the SEC entry-argument HOB, NegroniBootMemoryDxe,
+  Mu_Basecore/Silicium-ACPI forks that UniXNU/DarwinBoot need; its `Platforms/Xiaomi/laurel_sproutPkg` = upstream 4bd8ae83
+  byte for byte. Device-Binaries a1501e0c (the fork's pin) has `laurel_sprout/` with 46 Qualcomm DXEs: no stock-ROM extraction.
+- [V] Native stuart on CachyOS works: clang 23 + lld-link + llvm-lib, `uv` venv out/venv-mu (Mu pip-requirements), env
+  `CLANGPDB_AARCH64_PREFIX=llvm-` `UNIXNU_ROOT` `PYTHON_COMMAND=python3`. 52 images in 11 s on 20 cores (`make laurel-mu`).
+- [V] Error -> fix: `scripts/uefi/setup-mu.sh` ran the fork's `patches/apply.sh`, which failed with "patch does not apply" for
+  `mu_basecore-negroni.patch`: the fork's Mu_Basecore fa7fe5f already contains it (fork commit 81f18229). setup-mu.sh now
+  skips a patch that reverse-applies (negroni builds too).
+- [V code] DarwinBoot 616a8fa: window = ADT `darwinboot-memory-size` (>= 256 MiB, 2 MiB multiple) at `ALIGN(run, 2 MiB) +
+  (kernel base VA & 0x1FFFFF)` in the first conventional run that fits; zero-size segments skipped (base VA = __TEXT
+  0xFFFFFFF007004000); LC_UNIXTHREAD must be 288 bytes, flavor 6 (our kernel: yes); boot_args Darwin 23 layout, 1024-byte
+  command line; MMU off; jump in EL1 on the current CPU (Silver 0x0). Mu laurel_sproutPkg has only a 60 MiB conventional
+  heap: `patches/laurel/mu/0001` adds "Kernel RAM" 0x81000000 + 0x3F000000 -> window 0x81004000 = the shim path's __TEXT PA
+  (32 MiB-aligned VA-PA delta 0x7A000000). ADT dram 0x81000000:0x30000000 (768 MiB; the kernel reads dram-base nowhere).
+- [V code] XNU takes the boot CPU from ADT `state = "running"` (ml_is_boot_cpu), logical IDs from DT order, cluster IDs in
+  first-seen order. Decision: boot on Silver 0x0 (no PSCI hand-off): kernel 2012 (TOPAZ_4K accepts MPIDR 0x0 or 0x100),
+  mkadt `--boot silver` (Silver first, cluster 0 'E'; Gold cluster 1 'P'), like Apple SoCs (cpu0 = E). Kernel 2011 =
+  negroni 0363 (BOOT_LINE_LENGTH 1024); the shim path's 608-byte mkpayload header does not match this kernel any more.
+- [V] Build 02:03: 213 patches, kernel 28.7 s, 0 LSE/RCpc. Images 02:09: `out/laurel/uefi/laurel-mu-only-boot.img` 2535424 B,
+  `laurel-uefi-boot.img` 52862976 B (kernel.gz 1363150 B = BootShim 112 B + FD 3 MiB; ramdisk = 48 MiB FAT "LAURELESP":
+  unixnu.toml, kernel.macho 16103616 B with 0 rebases, kernel.macho.adt). Boot image v2, stock header values + stock DTB
+  (the layout the Mi A3 ABL booted). NOT BOOTED (phone not on USB). Mu config FD 0x5FC00000/0x300000, BootShim with header.
+- [I] Risks for the first boot: (a) ABL must inflate a gzip kernel of 1.4 MB that is BootShim+FD (Mu's standard recipe for
+  every Qualcomm device, but Mu's own image uses header v1 + appended DTB; ours is v2 + dtb field as the shim); (b) the
+  Silver boot CPU is untested with this kernel (0141 comment "gold = boot, pset0"); (c) GICR of the secondaries: the shim
+  pre-set IGROUPR0/priorities/enables for Gold 0x101-0x103, the kernel's pe_fiq.c only does WAKER; if secondaries do not
+  come alive, port the shim's gold_gicr_prepare into a kernel patch (2004 keeps the boot going with dead cores).

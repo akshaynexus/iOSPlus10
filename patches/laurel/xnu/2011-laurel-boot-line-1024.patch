@@ -1,0 +1,24 @@
+laurel 2011: the arm64 boot_args command line is 1024 bytes, as DarwinBoot (UniXNU) writes it (= negroni 0363).
+
+The UEFI boot path (docs/laurel_sprout/uefi-boot.md) hands the kernel DARWIN_BOOT_ARGS from
+external/UniXNU/drivers/DarwinBoot/DarwinBootPkg/Driver/BootArgs.h: CommandLine[1024], bootFlags at 0x470,
+memSizeActual at 0x478 (the macOS arm64 layout). xnu-8796 has BOOT_LINE_LENGTH 608, so it would read bootFlags
+at 0x2d0 and memSizeActual at 0x2d8 = bytes 612..627 of the command line (negroni: docs/notes.md section 35,
+hw.memsize = boot-arg text, HFS+ journal sized from it, NULL write). With 1024 the fields are read where
+DarwinBoot writes them. The topaz shim path (external/ios-topaz/tools/mkpayload.py, 608-byte header) does not
+match this kernel any more; it is replaced by the UEFI path.
+
+diff --git a/pexpert/pexpert/arm64/boot.h b/pexpert/pexpert/arm64/boot.h
+--- a/pexpert/pexpert/arm64/boot.h
++++ b/pexpert/pexpert/arm64/boot.h
+@@ -23,7 +23,9 @@
+  * This value matches iBoot's IBOOT_MAX_ENV_VAR_DATA_SIZE.
+  * There are no iBoot headers so have to duplicate it here for now.
+  */
+-#define BOOT_LINE_LENGTH        608
++/* laurel 2011 (= negroni 0363): DarwinBoot (UniXNU) writes the macOS arm64 layout, CommandLine[1024];
++ * with 608 the kernel reads memSizeActual from inside a long command line. */
++#define BOOT_LINE_LENGTH        1024
+ 
+ /*
+  * Video information..

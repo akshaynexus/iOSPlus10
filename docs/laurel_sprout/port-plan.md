@@ -94,4 +94,5 @@ Back up first (needs root or a TWRP `fastboot boot`; Magisk on `boot_b` is one o
    720x1560, ADT from `mkadt.py` with Mi A3 values.
 4. Build XNU (topaz `xnu.yml` on GitHub macOS runners) and the shim; `fastboot boot` test with `cpus=1`.
 5. iOS 16.7.16 iPhone X root on `userdata` (owner approval).
-6. Then: Mu UEFI path, GPU (Adreno 610 through Mesa freedreno like topaz), iOS 26 research.
+6. Mu UEFI path: built 2026-11-01 (owner decision; replaces the shim path): `uefi-boot.md`. Then GPU (Adreno 610
+   through Mesa freedreno like topaz), iOS 26 research.

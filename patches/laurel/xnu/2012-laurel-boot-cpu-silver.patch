@@ -1,0 +1,37 @@
+laurel 2012: the boot CPU may be Silver 0x0 (UEFI/DarwinBoot path) as well as Gold 0x100 (topaz shim path).
+
+Mu-Silicium UEFI and DarwinBoot run on the core the ABL started, Kryo 260 Silver CPU0 (MPIDR 0x0, Cortex-A53
+class, no 16K granule). The TOPAZ_4K kernel (4 KiB pages, topaz 0140/0141) runs on both clusters, so no hand-off
+to a Gold core is needed; the ADT marks the running core (scripts/laurel/mkadt.py --boot silver: Silver cluster
+first = E cluster 0, Gold = P cluster 1, like Apple SoCs whose cpu0 is an E core). topaz 0082 demanded MPIDR 0x100
+because its 16K kernel cannot run on Silver; that stays for a 16K build. Decision and reasons:
+docs/laurel_sprout/uefi-boot.md "Boot CPU".
+
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -149,11 +149,24 @@
+ 	/*
+ 	 * topaz: the ADT lists only the A73 (gold) cores and the shim boots xnu
+ 	 * on gold CPU 0x100 (the silver cluster has no 16K granule).
++	 * laurel 2012: under TOPAZ_4K (4 KiB pages, both clusters) UEFI/DarwinBoot
++	 * boots xnu on the ABL's core, Silver 0x0; the ADT marks it "running" and
++	 * lists it first. A 16K kernel still needs Gold 0x100.
+ 	 */
++#if defined(TOPAZ_4K)
++	if (topology->boot_cpu->cpu_id != 0 ||
++	    (topology->boot_cpu->phys_id != 0x100 && topology->boot_cpu->phys_id != 0x0)) {
++		panic("SWEET CPU: expected boot MPIDR 0x0 or 0x100 and logical CPU 0, got 0x%x/%u",
++		    topology->boot_cpu->phys_id, topology->boot_cpu->cpu_id);
++	}
++	IOLog("LAUREL CPU: boot cpu mpidr=0x%x (%s)\n", topology->boot_cpu->phys_id,
++	    topology->boot_cpu->phys_id == 0x100 ? "Gold, shim path" : "Silver, UEFI path");
++#else
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0x100) {
+ 		panic("SWEET CPU: expected boot MPIDR 0x100 and logical CPU 0, got 0x%x/%u",
+ 		    topology->boot_cpu->phys_id, topology->boot_cpu->cpu_id);
+ 	}
++#endif
+ 	/*
+ 	 * laurel: a secondary core that the firmware refuses (PSCI CPU_ON != 0)
+ 	 * or that does not come alive in 5 s is marked off-line and the boot

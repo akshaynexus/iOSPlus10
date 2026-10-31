@@ -58,4 +58,10 @@ for p in Mu_Basecore Common/Mu Common/Mu_OEM_Sample Common/Features/mu_feature_d
   git -C "$p" submodule update -q --init --recursive --depth 1 --jobs "$NPROC" --checkout --force
 done
 
-sh patches/apply.sh
+# The fork's patches to its submodules (patches/apply.sh). Since fork commit 81f18229 Mu_Basecore points at
+# akshaynexus/mu_basecore, which already holds mu_basecore-negroni.patch: a patch that reverse-applies is skipped.
+for pt in patches/*.patch; do
+  case "$pt" in *mu_basecore*) sub=Mu_Basecore ;; *silicium-acpi*) sub=Silicium-ACPI ;; *) echo "setup-mu: unknown patch target $pt" >&2; exit 1 ;; esac
+  if git -C "$sub" apply --reverse --check "$PWD/$pt" 2>/dev/null; then echo "$sub: $(basename "$pt") already in $(git -C "$sub" rev-parse --short HEAD)"
+  else git -C "$sub" apply "$PWD/$pt"; echo "$sub: $(basename "$pt") applied"; fi
+done

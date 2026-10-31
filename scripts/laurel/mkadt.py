@@ -3,9 +3,13 @@
 
 Reuses topaz's builder (external/ios-topaz/tools/mkadt.py: chosen, arm-io, gic, wdt, wlan, disp0, fbcon,
 UFS, buttons, D22AP /product) and changes what differs on the Mi A3:
-  * CPUs: --cores 8 (default, needs the PAGES=4k kernel): Gold A73 0x100-0x103 = cluster 0 'P' (boot CPU
-    0x100 first), Silver A53 0x0-0x3 = cluster 1 'E'. XNU reads cluster-type as 'E'/'P'
-    (osfmk/arm64/machine_routines.c:1036). --cores 4: the 4 Gold cores only (PAGES=16k kernel).
+  * CPUs: --cores 8 (default, needs the PAGES=4k kernel): Gold A73 0x100-0x103 = 'P' cluster, Silver A53
+    0x0-0x3 = 'E' cluster. XNU reads cluster-type as 'E'/'P' (osfmk/arm64/machine_routines.c:1036) and takes
+    the boot CPU from state = "running" (ml_is_boot_cpu); it must be first (logical CPU 0, topaz 0082 / laurel 2012).
+    --boot gold (default; topaz shim path: the shim hands off to Gold 0x100): Gold cluster first.
+    --boot silver (UEFI/DarwinBoot path, docs/laurel_sprout/uefi-boot.md): Silver 0x0 first, the core ABL and
+    UEFI run on; Silver = cluster 0 'E', Gold = cluster 1 'P' (Apple SoCs boot on an E core too).
+    --cores 4: the 4 Gold cores only (PAGES=16k kernel; --boot gold only).
   * Panel 720x1560 AMOLED (stride 2880) at the same splash region 0x5c000000 (0xf00000), native canvas,
     display-scale 2 (360x780 points). [I: scale 2 is our choice; iPhone X itself is 3x]
   * Identity strings: xiaomi,laurel_sprout / qcom,trinket. Kept: xiaomi,sweet and qcom,kryo470 (the
@@ -14,7 +18,10 @@ UFS, buttons, D22AP /product) and changes what differs on the Mi A3:
     FDT; docs/laurel_sprout/hardware-map.md). Default 0x80000000:0x40000000 [I]: 1 GiB below 4 GiB
     (the GPU needs RAM below 4 GiB) and above every fixed carve-out (the highest ends at 0x62100000).
     Replace it with the real bank once the live FDT is read.
-Usage: mkadt.py OUT.adt [--cores 8|4] [--dram BASE:SIZE] [--dump]
+  * --darwinboot: /chosen darwinboot-memory-size = dram SIZE (UniXNU DarwinBoot allocates a window of that size
+    in the first UEFI conventional-memory run that fits: Mu "Kernel RAM" 0x80000000, patches/laurel/mu/0001);
+    firmware-version "laurel-uefi".
+Usage: mkadt.py OUT.adt [--cores 8|4] [--boot gold|silver] [--dram BASE:SIZE] [--darwinboot] [--dump]
 The D22AP /product node needs the iPhone X device tree $APPLE/d22ap.adt (default ~/op10-apple; Apple file,
 never in git; get it with scripts/ios16/fetch-d22ap-adt.sh). Without it the node is left out (warning).
 """
@@ -63,12 +70,18 @@ def getprop(n, key):
     return None
 
 
-def cpu_nodes(cores, phandles):
-    """Gold first: XNU takes DT order for logical IDs and boots on the first (shim hands off to 0x100)."""
+def cpu_nodes(cores, phandles, boot='gold'):
+    """XNU takes DT order for logical IDs; the first node is state=running = the boot CPU
+    (gold: the shim hands off to 0x100; silver: UEFI/DarwinBoot stay on the ABL's core 0x0)."""
     out = []
-    plan = [(0x100 | c, 0, ord('P'), GOLD_HZ) for c in range(4)]
-    if cores == 8:
-        plan += [(c, 1, ord('E'), SILVER_HZ) for c in range(4)]
+    gold = [(0x100 | c, 0 if boot == 'gold' else 1, ord('P'), GOLD_HZ) for c in range(4)]
+    silver = [(c, 1 if boot == 'gold' else 0, ord('E'), SILVER_HZ) for c in range(4)]
+    if boot == 'silver':
+        if cores != 8:
+            raise SystemExit('mkadt: --boot silver needs --cores 8 (the 16K kernel cannot run on Silver)')
+        plan = silver + gold
+    else:
+        plan = gold + (silver if cores == 8 else [])
     for i, (mpidr, cluster, ctype, hz) in enumerate(plan):
         out.append(topaz.node(f'cpu{i}', [
             ('AAPL,phandle', u32(next(phandles))),
@@ -98,7 +111,7 @@ _topaz_product = topaz.d22ap_product
 topaz.d22ap_product = lambda: _topaz_product(D22AP_ADT)   # its default path is bound at import
 
 
-def build(cores=8, dram=(0x80000000, 0x40000000), seed=None):
+def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwinboot=False):
     topaz.FB_W, topaz.FB_H, topaz.FB_STRIDE = FB_W, FB_H, FB_W * 4
     topaz.SWEET_ECID = LAUREL_ECID
     root = topaz.build(seed=seed, native=True)
@@ -111,8 +124,12 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None):
     setprop(chosen, 'dram-base', u64(dram[0]))
     setprop(chosen, 'dram-size', u64(dram[1]))
     setprop(chosen, 'display-scale', u32(2))
-    setprop(chosen, 'firmware-version', cstr('laurel-shim'))
-    setprop(chosen, 'system-firmware-version', cstr('laurel-shim'))
+    fw = 'laurel-uefi' if darwinboot else 'laurel-shim'
+    setprop(chosen, 'firmware-version', cstr(fw))
+    setprop(chosen, 'system-firmware-version', cstr(fw))
+    if darwinboot:
+        # UniXNU DarwinBoot: size of the RAM window it allocates (>= 256 MiB, 2 MiB multiple); XNU gets exactly it
+        setprop(chosen, 'darwinboot-memory-size', u64(dram[1]))
 
     arm_io = find(root, 'arm-io')
     disp0 = find(arm_io, 'disp0')
@@ -124,7 +141,7 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None):
     used = [struct.unpack('<I', getprop(n, 'AAPL,phandle'))[0] for n in walk(root) if getprop(n, 'AAPL,phandle')]
     phandles = iter(range(max(used) + 1, max(used) + 100))
     cpus = find(root, 'cpus')
-    cpus.children = cpu_nodes(cores, phandles)
+    cpus.children = cpu_nodes(cores, phandles, boot)
     return root
 
 
@@ -134,12 +151,19 @@ def walk(n):
         yield from walk(c)
 
 
-def check(root, cores):
-    """Self-check of the tree we write: one boot CPU 0x100 first, P/E counts, sizes."""
+def check(root, cores, boot='gold', darwinboot=False):
+    """Self-check of the tree we write: one boot CPU (0x100 or 0x0) first and running, P/E counts, sizes."""
     cpus = find(root, 'cpus').children
     regs = [struct.unpack('<I', getprop(c, 'reg'))[0] for c in cpus]
     types = [struct.unpack('<I', getprop(c, 'cluster-type'))[0] for c in cpus]
-    assert len(cpus) == cores and regs[0] == 0x100, regs
+    states = [getprop(c, 'state') for c in cpus]
+    assert len(cpus) == cores and regs[0] == (0x100 if boot == 'gold' else 0x0), regs
+    assert states[0] == cstr('running') and states.count(cstr('running')) == 1, states
+    if darwinboot:
+        ws = struct.unpack('<Q', getprop(find(root, 'chosen'), 'darwinboot-memory-size'))[0]
+        assert ws >= 0x10000000 and ws % 0x200000 == 0, 'darwinboot-memory-size: >= 256 MiB, 2 MiB multiple'
+    else:
+        assert getprop(find(root, 'chosen'), 'darwinboot-memory-size') is None
     assert types.count(ord('P')) == 4 and types.count(ord('E')) == cores - 4, types
     fb = find(root, 'sweet-fbcon')
     assert struct.unpack('<I', getprop(fb, 'stride'))[0] == FB_W * 4
@@ -153,16 +177,19 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('out')
     ap.add_argument('--cores', type=int, choices=(4, 8), default=8)
+    ap.add_argument('--boot', choices=('gold', 'silver'), default='gold')
     ap.add_argument('--dram', default='0x80000000:0x40000000')
+    ap.add_argument('--darwinboot', action='store_true')
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
     b, s = (int(x, 0) for x in a.dram.split(':'))
-    root = build(a.cores, (b, s))
-    check(root, a.cores)
+    root = build(a.cores, (b, s), boot=a.boot, darwinboot=a.darwinboot)
+    check(root, a.cores, a.boot, a.darwinboot)
     blob = adt.serialize(root)
     adt.parse(blob)   # round trip
     with open(a.out, 'wb') as f:
         f.write(blob)
     if a.dump:
         adt.dump(adt.parse(blob)[0])
-    print(f'{a.out}: {len(blob)} bytes, {a.cores} cores, dram {b:#x}+{s:#x}', file=sys.stderr)
+    print(f'{a.out}: {len(blob)} bytes, {a.cores} cores, boot {a.boot}, dram {b:#x}+{s:#x}'
+          f'{", darwinboot window" if a.darwinboot else ""}', file=sys.stderr)

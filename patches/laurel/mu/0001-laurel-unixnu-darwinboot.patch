@@ -1,0 +1,116 @@
+laurel mu 0001: laurel_sproutPkg boots UniXNU/DarwinBoot like negroniPkg (iOSPlus10 laurel-sprout, 2026-11-01).
+Applied to external/Mu-Silicium-negroni by scripts/laurel/mu-build.sh (git apply; the tree is reset first).
+- dsc/fdf/DXE.inc: UniXNU boot manager app + UniXNUDxe (Boot#### "unixnu:firmware"), DarwinBoot (XNU loader),
+  negroniPkg's NegroniBootMemoryDxe (publishes the ABL ramdisk = our payload FAT as a read-only block device from
+  /chosen linux,initrd-start/end of the live FDT; adds the DT memory banks' holes as system memory, 1 GiB max).
+- MemoryMapLib: "Kernel RAM" 0x80000000 + 0x40000000 conventional: the DarwinBoot window (ADT darwinboot-memory-size,
+  768 MiB) lands at the first conventional run that fits = 0x80000000 + (kernel VA & 0x1FFFFFF); the shim boots ran
+  XNU in the same 1 GiB (mkadt --dram 0x80000000:0x40000000).
+- DeviceBuild.py: PackagesPath gets UniXNU/package, UniXNU/drivers/DarwinBoot (UNIXNU_ROOT) and Platforms/OnePlus.
+- PcdDebugPropertyMask 0x0F: DarwinBoot's DEBUG_ERROR hand-off facts reach the screen log.
+diff --git a/Platforms/Xiaomi/laurel_sproutPkg/DeviceBuild.py b/Platforms/Xiaomi/laurel_sproutPkg/DeviceBuild.py
+index ce96043d..308389d6 100644
+--- a/Platforms/Xiaomi/laurel_sproutPkg/DeviceBuild.py
++++ b/Platforms/Xiaomi/laurel_sproutPkg/DeviceBuild.py
+@@ -30,6 +30,10 @@ class CommonPlatform ():
+     Scopes = ('laurel_sprout', 'gcc_aarch64_linux', 'edk2-build')
+     WorkspaceRoot = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+     PackagesPath = (
++        # iOSPlus10 laurel-sprout: UniXNU boot manager + DarwinBoot (external/UniXNU), negroniPkg's boot memory driver
++        os.path.join(os.environ.get("UNIXNU_ROOT", os.path.join(WorkspaceRoot, "..", "UniXNU")), "package"),
++        os.path.join(os.environ.get("UNIXNU_ROOT", os.path.join(WorkspaceRoot, "..", "UniXNU")), "drivers", "DarwinBoot"),
++        "Platforms/OnePlus",
+         "Platforms/Xiaomi",
+         "Common/Mu",
+         "Common/Mu_OEM_Sample",
+diff --git a/Platforms/Xiaomi/laurel_sproutPkg/Include/DXE.inc b/Platforms/Xiaomi/laurel_sproutPkg/Include/DXE.inc
+index 7aeed328..55eb4247 100644
+--- a/Platforms/Xiaomi/laurel_sproutPkg/Include/DXE.inc
++++ b/Platforms/Xiaomi/laurel_sproutPkg/Include/DXE.inc
+@@ -37,6 +37,9 @@
+ 
+   INF MdeModulePkg/Universal/Disk/DiskIoDxe/DiskIoDxe.inf
+   INF MdeModulePkg/Universal/Disk/PartitionDxe/PartitionDxe.inf
++  # iOSPlus10 laurel-sprout: ABL ramdisk (UniXNU payload FAT) as a block device, XNU loader
++  INF negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.inf
++  INF DarwinBootPkg/Driver/DarwinBoot.inf
+   INF FatPkg/EnhancedFatDxe/Fat.inf
+   INF MdeModulePkg/Universal/Disk/UnicodeCollation/EnglishDxe/EnglishDxe.inf
+ 
+diff --git a/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c b/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c
+index 21fe3d89..ec93e295 100644
+--- a/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c
++++ b/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c
+@@ -24,6 +24,13 @@ gMemoryDescriptor[] = {
+   {"Info Blk",          0x5FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
+   {"WtShareMem",        0x62000000, 0x00100000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_THROUGH_XN},
+   {"DXE Heap",          0x62100000, 0x03C00000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK},
++  // iOSPlus10 laurel-sprout: conventional RAM for the DarwinBoot window (XNU): 0x80000000-0xC0000000 is above every
++  // fixed carve-out of this map, below 4 GiB (GPU buffers) and the range the topaz-shim boots ran XNU in. The region
++  // starts 16 MiB in (0x81000000, as negroni's 0x841000000): DarwinBoot puts the window at region + (kernel VA &
++  // 0x1FFFFF) = 0x81004000, so __TEXT (VA 0xFFFFFFF007004000) lands at the shim's PA 0x81004000 and the VA-PA delta
++  // stays a 32 MiB multiple. UEFI's own allocations go top-down from 0xC0000000; the ADT darwinboot-memory-size
++  // (768 MiB, window end 0xB1004000) leaves 240 MiB headroom.
++  {"Kernel RAM",        0x81000000, 0x3F000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
+ 
+   // Other Memory Regions
+   {"AOP_SS_MSG_RAM",    0x045F0000, 0x00007000, NoHob,  MMAP_IO, INITIALIZED, Conv,   NS_DEVICE},
+diff --git a/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc b/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc
+index 0054a496..e35da387 100644
+--- a/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc
++++ b/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc
+@@ -28,6 +28,11 @@
+ !include NicobarPkg/NicobarPkg.dsc.inc
+ 
+ [PcdsFixedAtBuild]
++  #
++  # Debug output on the screen log (iOSPlus10: DarwinBoot prints its hand-off facts with DEBUG_ERROR)
++  #
++  gEfiMdePkgTokenSpaceGuid.PcdDebugPropertyMask|0x0F
++
+   #
+   # DDR Memory
+   #
+@@ -61,6 +66,12 @@
+   gQcomPkgTokenSpaceGuid.PcdPlatformType|"LA"
+ 
+ [LibraryClasses]
++  #
++  # UniXNU boot manager + DarwinBoot (iOSPlus10 laurel-sprout: external/UniXNU, UNIXNU_ROOT)
++  #
++  UniXNULib|UniXNUPkg/Library/UniXNULib/UniXNULib.inf
++  FdtLib|MdePkg/Library/BaseFdtLib/BaseFdtLib.inf
++
+   #
+   # Memory Libraries
+   #
+@@ -72,6 +83,14 @@
+   ConfigurationMapLib|laurel_sproutPkg/Library/ConfigurationMapLib/ConfigurationMapLib.inf
+ 
+ [Components]
++  #
++  # UniXNU boot manager, DarwinBoot, payload ramdisk as a block device (iOSPlus10 laurel-sprout)
++  #
++  UniXNUPkg/Application/UniXNU/UniXNU.inf
++  UniXNUPkg/Driver/UniXNUDxe/UniXNUDxe.inf
++  DarwinBootPkg/Driver/DarwinBoot.inf
++  negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.inf
++
+   #
+   # ACPI Tables
+   #
+diff --git a/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.fdf b/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.fdf
+index 4e6be499..7fc036ad 100644
+--- a/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.fdf
++++ b/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.fdf
+@@ -90,6 +90,10 @@ READ_LOCK_STATUS   = TRUE
+   INF MdeModulePkg/Universal/SmbiosDxe/SmbiosDxe.inf
+   INF SiliciumPkg/Drivers/SmBiosTableDxe/SmBiosTableDxe.inf
+ 
++  # UniXNU boot manager (iOSPlus10 laurel-sprout)
++  INF UniXNUPkg/Application/UniXNU/UniXNU.inf
++  INF UniXNUPkg/Driver/UniXNUDxe/UniXNUDxe.inf
++
+   # ACPI
+   #INF MdeModulePkg/Universal/Acpi/AcpiTableDxe/AcpiTableDxe.inf
+   #INF MdeModulePkg/Universal/Acpi/AcpiPlatformDxe/AcpiPlatformDxe.inf

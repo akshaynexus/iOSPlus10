@@ -468,3 +468,25 @@ Next: owner powers the phone on (Power+VolDown for fastboot) -> `scripts/bg.sh l
 (warm path) and a film of the panel: `FB pipe=`, `LAUREL FB SCANOUT:`, `SWEET UFS: host`, the `LAUREL USB:` stage lines.
 Then `BOOT=reboot` (cold path). If `FB pipe=0` the scan-out theory is wrong and the next suspect is the UFS line.
 Exact results go to docs/notes.md.
+
+## Mi A3 (laurel_sprout): UEFI boot path built (2026-11-01 02:10, branch laurel-sprout)
+
+Owner decision 2026-11-01: replace the topaz shim path by the negroni-style chain stock ABL -> Mu-Silicium UEFI
+(laurel_sproutPkg) -> UniXNU boot manager + DarwinBoot -> our XNU -> iOS root on userdata. Details and reasons:
+`docs/laurel_sprout/uefi-boot.md`.
+Done [V]: `scripts/laurel/mu-build.sh` (`make laurel-mu`): native stuart build of the akshaynexus Mu fork's
+laurel_sproutPkg + UniXNU + DarwinBoot + NegroniBootMemoryDxe with `patches/laurel/mu/0001` (52 images, 11 s EDK2 time,
+Device-Binaries has laurel_sprout, no ROM extraction); kernel patches 2011 (boot_args command line 1024 = DarwinBoot
+layout) and 2012 (boot CPU may be Silver 0x0 under TOPAZ_4K: UEFI/DarwinBoot stay on the ABL's core, no Gold
+hand-off); `scripts/laurel/mkadt.py --boot silver --darwinboot`; `scripts/laurel/mkdarwinboot.py` (UniXNU payload
+FAT); `scripts/laurel/uefi-image.sh` (`make laurel-uefi-image [MU_ONLY=1]`): boot image v2 with
+gzip(BootShim + FD) as kernel, the payload FAT as ramdisk, stock DTB. Images: `out/laurel/uefi/laurel-mu-only-boot.img`
+(2.5 MB, Mu alone) and `out/laurel/uefi/laurel-uefi-boot.img` (52.9 MB, full chain). Kernel 213 patches, 0 LSE/RCpc.
+NOT BOOTED: the phone was not on USB.
+Next (owner): phone into fastboot (Power+VolDown or `adb reboot bootloader`), then
+`scripts/bg.sh laurel-flash sh -c 'BOOT=reboot scripts/laurel/flash-boot.sh out/laurel/uefi/laurel-mu-only-boot.img'`;
+photo of the Mu screen (step 1). Then the same with `laurel-uefi-boot.img` + `scripts/laurel/boot-test.sh
+IMG=out/laurel/uefi/laurel-uefi-boot.img NOFLASH=1` (usblog is up): UniXNU menu, `DARWINBOOT: ... pa=0x81004000`, green
+bar, `LAUREL CPU: boot cpu mpidr=0x0`, USB Ethernet + `op10tool ctl ping`. Fallback if the Silver boot fails: DarwinBoot
+PSCI hand-off to Gold 0x100 + `--boot gold`. Restore Android: `BOOTIMG=~/laurel-backup/stock/images/boot.img
+scripts/laurel/flash-boot.sh`.

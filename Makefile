@@ -5,7 +5,7 @@
 BG := scripts/bg.sh
 OS := $(shell uname -s)
 
-.PHONY: help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
+.PHONY: laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
         kernel kernel-local kernel-ci xcode15 ssh devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog bootlog
 
 help:
@@ -19,6 +19,7 @@ help:
 	@echo "build:   make ios16  (kernel devicetree dmgs boot root simg, in order)"
 	@echo "flash:   make flash CONFIRM=yes | flash-boot CONFIRM=yes (no userdata) | flash-restore CONFIRM=yes"
 	@echo "debug:   make usblog | bootlog (boot log of the last 8 boots, patch 0367)"
+	@echo "laurel:  make laurel-mu | laurel-kernel | laurel-uefi-image [MU_ONLY=1] | laurel-flash-uefi  (Mi A3, docs/laurel_sprout/uefi-boot.md)"
 	@echo "status:  make status"
 
 status:
@@ -113,3 +114,16 @@ bootlog:
 	$(BG) bootlog out/bin/op10tool bootlog
 flash-restore:
 	$(BG) flash-restore env CONFIRM=$(CONFIRM) scripts/flash/restore.sh
+
+# --- Mi A3 (laurel_sprout, branch laurel-sprout): UEFI boot path, docs/laurel_sprout/uefi-boot.md ----------------
+# Mu-Silicium laurel_sproutPkg + UniXNU + DarwinBoot, native stuart build (Linux); kernel: scripts/laurel/kernel-linux.sh
+laurel-mu:
+	$(BG) laurel-mu scripts/laurel/mu-build.sh DEBUG
+laurel-kernel:
+	$(BG) laurel-kernel scripts/laurel/kernel-linux.sh
+# boot image out/laurel/uefi/laurel-uefi-boot.img (XNU payload); MU_ONLY=1: Mu UEFI alone (its boot menu)
+laurel-uefi-image:
+	MU_ONLY=$(MU_ONLY) scripts/laurel/uefi-image.sh
+# flash it to boot_b (owner-approved target) and reset; restore: BOOTIMG=~/laurel-backup/stock/images/boot.img
+laurel-flash-uefi:
+	$(BG) laurel-flash env BOOT=reboot scripts/laurel/flash-boot.sh out/laurel/uefi/laurel-uefi-boot.img
