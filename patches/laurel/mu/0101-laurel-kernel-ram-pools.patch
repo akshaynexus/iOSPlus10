@@ -1,0 +1,37 @@
+laurel mu 0101: Mu memory map for the large XNU window (kernel patch 2100). DDR banks B (0x80000000-0xC0000000) and C
+(0xC0000000-0x1C0000000) touch. "Pool RAM" 0x80000000-0xE1000000 is reserved (device pools that are not kernel RAM: the
+Adreno GPU pool 0xC0000000 + 512 MiB and room below it, the TopazModem pool 0xE0000000 + 16 MiB; no DT hole gets added there
+by NegroniBootMemoryDxe or RamManagerDxe). "Kernel RAM" 0xE1000000 + 0xDF000000 (to 0x1C0000000; was 0x81000000 + 0x3F000000)
+holds the DarwinBoot window 0xE1004000 + 3264 MiB (ADT darwinboot-memory-size from scripts/laurel/mkadt.py --dram auto, which
+reads this entry from the FD; the window base keeps a 32 MiB-aligned VA-PA delta). UEFI's own allocations go top-down from
+0x1C0000000, 304 MiB above the window end 0x1AD004000. Before, UEFI allocated below 0xC0000000 and RamManagerDxe added bank C
+late, so no run could hold more than 1 GiB. Applied after 0001 by scripts/laurel/mu-build.sh.
+diff --git a/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c b/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c
+--- a/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c
++++ b/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c
+@@ -24,13 +24,18 @@
+   {"Info Blk",          0x5FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
+   {"WtShareMem",        0x62000000, 0x00100000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_THROUGH_XN},
+   {"DXE Heap",          0x62100000, 0x03C00000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK},
+-  // iOSPlus10 laurel-sprout: conventional RAM for the DarwinBoot window (XNU): 0x80000000-0xC0000000 is above every
+-  // fixed carve-out of this map, below 4 GiB (GPU buffers) and the range the topaz-shim boots ran XNU in. The region
+-  // starts 16 MiB in (0x81000000, as negroni's 0x841000000): DarwinBoot puts the window at region + (kernel VA &
+-  // 0x1FFFFF) = 0x81004000, so __TEXT (VA 0xFFFFFFF007004000) lands at the shim's PA 0x81004000 and the VA-PA delta
+-  // stays a 32 MiB multiple. UEFI's own allocations go top-down from 0xC0000000; the ADT darwinboot-memory-size
+-  // (768 MiB, window end 0xB1004000) leaves 240 MiB headroom.
+-  {"Kernel RAM",        0x81000000, 0x3F000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
++  // iOSPlus10 laurel-sprout (laurel mu 0101; was "Kernel RAM" 0x81000000 + 0x3F000000): DDR banks B 0x80000000-0xC0000000
++  // and C 0xC0000000-0x1C0000000 touch. Layout (XNU kernel patch 2100, docs/laurel_sprout/uefi-boot.md "RAM"):
++  //   "Pool RAM"   0x80000000-0xE1000000 reserved: device pools that are not kernel RAM (Adreno GPU pool 0xC0000000 +
++  //                512 MiB, room below it; TopazModem pool 0xE0000000 + 16 MiB). Reserved here, NegroniBootMemoryDxe and
++  //                RamManagerDxe add no DT hole there, and no UEFI run next to "Kernel RAM" can pull the window down.
++  //   "Kernel RAM" 0xE1000000-0x1C0000000 conventional: DarwinBoot puts the window at region + (kernel VA & 0x1FFFFF) =
++  //                0xE1004000 (VA-PA delta a 32 MiB multiple, as 0x81004000 before); ADT darwinboot-memory-size 3264 MiB
++  //                (mkadt.py --dram auto) ends at 0x1AD004000. UEFI's own allocations go top-down from 0x1C0000000, so
++  //                they stay above the window (304 MiB); before, they sat below 0xC0000000 and RamManagerDxe added bank C
++  //                late, so no run could hold more than 1 GiB.
++  {"Pool RAM",          0x80000000, 0x61000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"Kernel RAM",        0xE1000000, 0xDF000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
+ 
+   // Other Memory Regions
+   {"AOP_SS_MSG_RAM",    0x045F0000, 0x00007000, NoHob,  MMAP_IO, INITIALIZED, Conv,   NS_DEVICE},

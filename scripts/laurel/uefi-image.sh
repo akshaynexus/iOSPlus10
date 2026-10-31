@@ -4,8 +4,9 @@
 #   scripts/laurel/uefi-image.sh [CMDLINE]
 #   MU_ONLY=1   boot image with Mu UEFI alone (empty ramdisk): Mu's boot menu/front page, no XNU (step 1 of the plan)
 #   KERNEL=path (default out/laurel-kernel/out/kernel.development.sweet.4k)   FD=path (default out/laurel/mu/SILICIUM_UEFI-DEBUG.fd)
-#   DRAM=BASE:SIZE (default 0x81000000:0x30000000 = the DarwinBoot window: Mu "Kernel RAM" 0x81000000 + 0x3F000000,
-#     window at 0x81004000 = the shim path's __TEXT address; patches/laurel/mu/0001)
+#   DRAM=BASE:SIZE or auto (default): the DarwinBoot window size from the FD's Mu "Kernel RAM" entry (mkadt.py --dram
+#     auto): Mu 0101 (0x81000000 + 0x13F000000) gives 4608 MiB at 0x81004000 (kernel patch 2100), an older FD 768 MiB;
+#     the window starts at 0x81004000 = the shim path's __TEXT address either way
 #   CPUS=N (XNU cpus= boot-arg, default 8)   SIZE_MIB=48 (payload FAT)
 # Output: out/laurel/uefi/laurel-uefi-boot.img (+ laurel.adt, payload.img, kernel.gz, cmdline.txt); MU_ONLY=1: laurel-mu-only-boot.img
 # Flash: scripts/bg.sh laurel-flash sh -c 'BOOT=reboot scripts/laurel/flash-boot.sh out/laurel/uefi/laurel-uefi-boot.img'
@@ -23,7 +24,7 @@ MU=$OUT/laurel/mu
 FD=${FD:-$MU/SILICIUM_UEFI-DEBUG.fd}
 SHIM=${SHIM:-$MU/BootShim.bin}
 KERNEL=${KERNEL:-$OUT/laurel-kernel/out/kernel.development.sweet.4k}
-DRAM=${DRAM:-0x81000000:0x30000000}
+DRAM=${DRAM:-auto}
 CPUS=${CPUS:-8}
 SIZE_MIB=${SIZE_MIB:-48}
 # boot-args: the shim set (scripts/laurel/shim.sh) without the ones the shim path needed; DarwinBoot copies them unchanged
@@ -52,7 +53,7 @@ if [ "${MU_ONLY:-0}" = 1 ]; then
   IMG=$W/laurel-mu-only-boot.img
 else
   [ -f "$KERNEL" ] || { echo "uefi-image: missing kernel $KERNEL (scripts/laurel/kernel-linux.sh)" >&2; exit 1; }
-  python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --darwinboot   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
+  python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
   "$OUT/venv/bin/python3" "$REPO/scripts/laurel/mkdarwinboot.py" "$KERNEL" "$W/laurel.adt" "$W/payload.img" \
     --cmdline "$CMDLINE" --size-mib "$SIZE_MIB" --timeout 3
   printf '%s\n' "$CMDLINE" > "$W/cmdline.txt"

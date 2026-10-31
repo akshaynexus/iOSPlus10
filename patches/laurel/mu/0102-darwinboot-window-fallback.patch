@@ -1,0 +1,75 @@
+laurel mu 0102 (DarwinBoot, external/UniXNU/drivers/DarwinBoot): when no UEFI run holds the window the ADT asks for
+(darwinboot-memory-size), DarwinBoot takes the biggest window a run holds (2 MiB multiple, >= 256 MiB) and passes that size to
+XNU (boot_args memSize = memSizeActual), instead of stopping with "NO WINDOW". Screen line "WINDOW <size> OF <asked> @ <base>"
+and a DEBUG line; XNU patch 2100 then reports "LAUREL RAM: on: ... ; DarwinBoot gave N of the M MiB the ADT asks". So a Mu FD
+with less free RAM than the ADT expects (e.g. an FD from before mu 0101 with the 4608 MiB ADT) costs RAM, not the boot.
+scripts/laurel/mu-build.sh applies it to the DarwinBoot submodule of UniXNU (paths start with DarwinBootPkg/).
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+index ddb1fa8..afdb933 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -396,10 +396,16 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
+   }
+ }
+ 
++// iOSPlus10 laurel mu 0102: when no run holds the asked window, take the biggest window a run holds (2 MiB
++// multiple, at least the DarwinWindowSizeValid minimum) and pass that size to the kernel (boot_args memSize):
++// a Mu map with less free RAM than the ADT expects costs RAM, not the boot. One line on the screen and the log.
+ STATIC
+ EFI_STATUS
+-AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
++AllocateWindow (KERNEL *Kernel, UINT64 *WindowSizeInOut, EFI_PHYSICAL_ADDRESS *Address)
+ {
++  UINT64                WindowSize = *WindowSizeInOut;
++  UINT64                FitStart;
++  UINT64                FitBytes;
+   EFI_MEMORY_DESCRIPTOR *Map;
+   EFI_MEMORY_DESCRIPTOR *Descriptor;
+   EFI_STATUS            Status;
+@@ -419,6 +425,8 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
+   Capacity = 0;
+   BestStart = 0;
+   BestBytes = 0;
++  FitStart = 0;
++  FitBytes = 0;
+   Status = GetMap (&Map, &Capacity, &Size, &Key, &Stride);
+   if (EFI_ERROR (Status)) { if (Map != NULL) { FreePool (Map); } return Status; }
+   Status = EFI_OUT_OF_RESOURCES;
+@@ -430,10 +438,28 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
+     RunBytes = End - Descriptor->PhysicalStart;
+     if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
+     Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
++    if ((Candidate >= Descriptor->PhysicalStart) && (End > Candidate) &&
++        (((End - Candidate) & ~((UINT64)BLOCK_SIZE - 1)) > FitBytes)) {
++      FitBytes = (End - Candidate) & ~((UINT64)BLOCK_SIZE - 1);
++      FitStart = Candidate;
++    }
+     if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
+     Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
+     if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
+   }
++  if (EFI_ERROR (Status) && (FitBytes < WindowSize) && DarwinWindowSizeValid (FitBytes)) {
++    Candidate = FitStart;
++    Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (FitBytes), &Candidate);
++    if (!EFI_ERROR (Status)) {
++      CHAR16 Line[96];
++      UnicodeSPrint (Line, sizeof (Line), L"WINDOW %lx OF %lx @ %lx", FitBytes, WindowSize, Candidate);
++      DiagDraw (Line, 0);
++      DEBUG ((DEBUG_ERROR, "DARWINBOOT: window 0x%lx of the 0x%lx asked, at 0x%lx (no run holds the whole window)\n",
++              FitBytes, WindowSize, Candidate));
++      *Address = Candidate;
++      *WindowSizeInOut = FitBytes;
++    }
++  }
+   if (EFI_ERROR (Status)) {
+     CHAR16 Line[96];
+     UINTN  Row = 1;
+@@ -599,7 +625,7 @@ Boot (
+   }
+   Status = ReadBootVideo (Video);
+   if (EFI_ERROR (Status)) { goto Fail; }
+-  Status = AllocateWindow (&Kernel, WindowSize, &Address);
++  Status = AllocateWindow (&Kernel, &WindowSize, &Address);
+   if (EFI_ERROR (Status)) { goto Fail; }
+   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
+   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;

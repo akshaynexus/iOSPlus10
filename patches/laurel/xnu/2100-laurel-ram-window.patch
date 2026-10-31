@@ -1,0 +1,286 @@
+laurel 2100: XNU gets 3264 MiB of the 6 GB Mi A3 (was 768 MiB). Memory map: 0x80000000-0xE0000000 device pools outside kernel RAM (Adreno GPU pool 0xC0000000 + 512 MiB, room below it), 0xE0000000-0xE1000000 TopazModem pool (16 MiB), 0xE1000000-0x1C0000000 Mu 'Kernel RAM' with the DarwinBoot window 0xE1004000..0x1AD004000 (DDR banks B and C touch; UEFI allocates top-down from 0x1C0000000 above it). Self-check before arm_vm_init (osfmk/arm64/laurel_ram.c): the window must lie inside one run of the ADT /chosen laurel-ram-banks, at most 4608 MiB (TOPAZ_4K BOOTSTRAP_TABLE_SIZE), and overlap no /chosen laurel-ram-reserved pool (a pool above the base caps it); else (or laurelram=0) XNU keeps the first 768 MiB as before. A window of 768 MiB or less (old ADT/Mu FD) is left alone. USB and UFS DMA blocks (kmem_alloc_contig) now stay below 4 GiB. One line at EARLY_BOOT, again at the first surface: 'LAUREL RAM: on: 3264 MiB at 0xe1004000..0x1ad004000 (banks 0x80000000..0x1c0000000; 495 MiB below 4 GiB)' or 'LAUREL RAM: off: <reason>; XNU keeps 768 MiB ...'. Needs patches/laurel/mu/0101 and mkadt.py --dram auto.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 3d3e0c8..6b30196 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -801,7 +801,7 @@ sweet_ufs_init(void)
+ 	su.wait = (wait == 1);
+ 
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+-	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, (ppnum_t)(atop_64(1ULL << 32) - 1), 0,   /* laurel 2100: below 4 GiB */
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+ 		return ENOMEM;
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index c0575f4..128558a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -2054,7 +2054,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, (ppnum_t)(atop_64(1ULL << 32) - 1), 0,   /* laurel 2100: below 4 GiB */
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		ud_off("no DMA memory");
+ 		return;
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..fa30ed9 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -56,6 +56,10 @@
+ #include <pexpert/arm/consistent_debug.h>
+ #include <pexpert/device_tree.h>
+ #include <arm64/proc_reg.h>
++#include <pexpert/arm64/board_config.h>
++#if defined(SWEET)
++extern uint64_t laurel_ram_limit(const boot_args *args, uint64_t memory_size);       /* osfmk/arm64/laurel_ram.c (laurel 2100) */
++#endif
+ #include <arm64/sweet_early.h>
+ #include <arm/pmap.h>
+ #include <arm/caches_internal.h>
+@@ -483,6 +487,10 @@ arm_init(
+ 	} else {
+ 		xmaxmem = 0;
+ 	}
++#if defined(SWEET)
++	/* laurel 2100: XNU manages the whole DarwinBoot window only when it passes the checks of laurel_ram.c */
++	xmaxmem = laurel_ram_limit(args, xmaxmem);
++#endif
+ 
+ #if SCHED_HYGIENE_DEBUG
+ 	{
+diff --git a/osfmk/arm64/laurel_ram.c b/osfmk/arm64/laurel_ram.c
+new file mode 100644
+index 0000000..ed16b3e
+--- /dev/null
++++ b/osfmk/arm64/laurel_ram.c
+@@ -0,0 +1,214 @@
++/*
++ * LAUREL RAM (patch 2100): XNU gets 3264 MiB of the 6 GB Mi A3 instead of 768 MiB, with a self-check
++ * and the old 768 MiB as fallback.
++ *
++ * Memory map (docs/laurel_sprout/uefi-boot.md "RAM"): DDR banks A 0x40000000-0x7CC00000 (every fixed
++ * carve-out, UEFI's fixed regions), B 0x80000000-0xC0000000 and C 0xC0000000-0x1C0000000 (B and C touch).
++ *   0x80000000-0xE0000000  free for device pools that are not kernel RAM (the GPU pool of the Adreno port,
++ *                          0xC0000000 + 512 MiB; the room below it for later pools); Mu "Pool RAM" reserved
++ *   0xE0000000-0xE1000000  TopazModem pool (Wi-Fi through the modem), 16 MiB
++ *   0xE1000000-0x1C0000000 Mu "Kernel RAM" (patches/laurel/mu/0101): DarwinBoot window 0xE1004000 +
++ *                          darwinboot-memory-size (mkadt.py --dram auto: 3264 MiB, end 0x1AD004000), UEFI's own
++ *                          allocations top-down from 0x1C0000000 above it
++ * XNU's managed RAM is one range from boot_args physBase, so the pools live below the window: they keep no
++ * cacheable alias in the physical aperture, and nothing XNU allocates can land in them.
++ *
++ * Before arm_vm_init this file checks the window. XNU manages all of it only when every check passes:
++ *   1. /chosen laurel-ram-banks (u64 base/size pairs, mkadt.py) exists, and the window is inside one run
++ *      of touching banks (B + C);
++ *   2. the window is at most LAUREL_RAM_MAX: BOOTSTRAP_TABLE_SIZE of TOPAZ_4K (16 pages, pmap.h) covers
++ *      the kernel + physical aperture + its 1 GiB slide up to 6 GiB of VA (arm_vm_init panics above);
++ *   3. it overlaps no range of /chosen laurel-ram-reserved (u64 base/size pairs: the pools above); a range
++ *      above the window base caps the window below it.
++ * On a failure, or with the kill switch laurelram=0, XNU manages only the first 768 MiB of the window
++ * (the maxmem path of arm_vm_init: mem_size, max_mem and hw.memsize), as before this patch. A window of
++ * 768 MiB or less (an old ADT or an old Mu FD) is left as it is. DarwinBoot may give a smaller window than
++ * the ADT asks (patches/laurel/mu/0102 shrinks it when no UEFI run is big enough): the line says so.
++ *
++ * DMA below 4 GiB: the window now reaches above 4 GiB (495 MiB of it is below). The display (MDP,
++ * SweetFramebuffer/SweetSurface) and the GPU already ask for memory below 4 GiB with a physical mask; the
++ * USB (sweet_usb.c) and UFS (sweet_ufs.c) DMA blocks come from kmem_alloc_contig, which now gets
++ * max_pnum = 4 GiB as well (both are allocated early, while RAM below 4 GiB is free).
++ *
++ * One line at EARLY_BOOT (console), repeated by laurel_ram_summary() for the USB log:
++ *   "LAUREL RAM: on: 3264 MiB at 0xe1004000..0x1ad004000 (banks 0x80000000..0x1c0000000; 495 MiB below 4 GiB)"
++ *   "LAUREL RAM: off: <reason>; XNU keeps 768 MiB of the 3264 MiB window at 0xe1004000"
++ */
++
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++
++#include <stdint.h>
++#include <string.h>
++#include <kern/misc_protos.h>
++#include <kern/startup.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/boot.h>
++#include <pexpert/device_tree.h>
++
++uint64_t laurel_ram_limit(const boot_args *args, uint64_t memory_size);
++const char *laurel_ram_summary(void);
++
++#define LAUREL_RAM_FALLBACK     (768ULL << 20)          /* what XNU managed before 2100 */
++#define LAUREL_RAM_MAX          (4608ULL << 20)         /* BOOTSTRAP_TABLE_SIZE limit, see above */
++#define LAUREL_RAM_4G           (1ULL << 32)
++#define LAUREL_GPU_POOL         0x90000000ULL           /* topaz TopazAdreno.cpp GPU_POOL_BASE (gpu=1, no gpu_midmem) */
++#define LAUREL_GPU_POOL_SIZE    0x40000000ULL
++#define LAUREL_RAM_BANKS_MAX    8u
++#define LAUREL_RAM_RESERVED_MAX 8u
++
++static char laurel_ram_line[256];
++
++/* One u64 of an ADT property (any alignment); false when the property is missing or too short. */
++static bool
++laurel_ram_dt_u64(DTEntry chosen, const char *name, unsigned int index, uint64_t *out)
++{
++	void const *prop = NULL;
++	unsigned int len = 0;
++
++	if (SecureDTGetProperty(chosen, name, &prop, &len) != kSuccess || len < (index + 1) * 8) {
++		return false;
++	}
++	memcpy(out, (const uint8_t *)prop + index * 8, sizeof(*out));
++	return true;
++}
++
++/*
++ * The run of touching banks that holds base: [*run0, *run1). Banks may come in any order;
++ * false when no bank holds base.
++ */
++static bool
++laurel_ram_run(DTEntry chosen, unsigned int count, uint64_t base, uint64_t *run0, uint64_t *run1)
++{
++	uint64_t b[LAUREL_RAM_BANKS_MAX], e[LAUREL_RAM_BANKS_MAX];
++	bool grew = true, found = false;
++
++	for (unsigned int i = 0; i < count; i++) {
++		uint64_t s = 0;
++		laurel_ram_dt_u64(chosen, "laurel-ram-banks", 2 * i, &b[i]);
++		laurel_ram_dt_u64(chosen, "laurel-ram-banks", 2 * i + 1, &s);
++		e[i] = (s > UINT64_MAX - b[i]) ? b[i] : b[i] + s;
++		if (base >= b[i] && base < e[i]) {
++			*run0 = b[i];
++			*run1 = e[i];
++			found = true;
++		}
++	}
++	while (found && grew) {
++		grew = false;
++		for (unsigned int i = 0; i < count; i++) {
++			if (b[i] == *run1 && e[i] > *run1) {
++				*run1 = e[i];
++				grew = true;
++			}
++			if (e[i] == *run0 && b[i] < *run0) {
++				*run0 = b[i];
++				grew = true;
++			}
++		}
++	}
++	return found;
++}
++
++/*
++ * Called by arm_init with the maxmem/hw.memsize limit (0: none) before arm_vm_init; returns the limit
++ * arm_vm_init applies. Runs before the console: the result is printed by laurel_ram_report.
++ */
++uint64_t
++laurel_ram_limit(const boot_args *args, uint64_t memory_size)
++{
++	const uint64_t base = args->physBase, size = args->memSize, end = base + size;
++	uint64_t run0 = 0, run1 = 0, asked = 0, limit = 0;
++	uint32_t on = 1, gpu = 0, midmem = 0;
++	char why[128], note[96];
++	DTEntry chosen = NULL;
++	void const *prop = NULL;
++	unsigned int len = 0, rlen = 0;
++
++	why[0] = '\0';
++	note[0] = '\0';
++	if (size <= LAUREL_RAM_FALLBACK) {
++		snprintf(laurel_ram_line, sizeof(laurel_ram_line),
++		    "LAUREL RAM: off: the boot window is %llu MiB at 0x%llx (not above %llu MiB: ADT or Mu FD from before 2100)",
++		    size >> 20, base, LAUREL_RAM_FALLBACK >> 20);
++		return memory_size;
++	}
++	PE_parse_boot_argn("laurelram", &on, sizeof(on));
++	PE_parse_boot_argn("gpu", &gpu, sizeof(gpu));
++	PE_parse_boot_argn("gpu_midmem", &midmem, sizeof(midmem));
++
++	limit = memory_size;
++	if (on == 0) {
++		snprintf(why, sizeof(why), "kill switch laurelram=0");
++	} else if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess) {
++		snprintf(why, sizeof(why), "no /chosen in the ADT");
++	} else if (SecureDTGetProperty(chosen, "laurel-ram-banks", &prop, &len) != kSuccess ||
++	    len == 0 || len % 16 != 0 || len / 16 > LAUREL_RAM_BANKS_MAX) {
++		snprintf(why, sizeof(why), "no /chosen laurel-ram-banks (u64 base/size pairs) in the ADT");
++	} else if (end < base || !laurel_ram_run(chosen, len / 16, base, &run0, &run1) || end > run1) {
++		snprintf(why, sizeof(why), "window 0x%llx..0x%llx is not inside one run of the ADT RAM banks", base, end);
++	} else if (SecureDTGetProperty(chosen, "laurel-ram-reserved", &prop, &rlen) == kSuccess &&
++	    (rlen % 16 != 0 || rlen / 16 > LAUREL_RAM_RESERVED_MAX)) {
++		snprintf(why, sizeof(why), "/chosen laurel-ram-reserved has %u bytes (u64 base/size pairs)", rlen);
++	} else {
++		/* pools: one that holds the window base turns the feature off; one above it caps the window */
++		for (unsigned int i = 0; why[0] == '\0' && i < rlen / 16; i++) {
++			uint64_t rb = 0, rs = 0;
++			laurel_ram_dt_u64(chosen, "laurel-ram-reserved", 2 * i, &rb);
++			laurel_ram_dt_u64(chosen, "laurel-ram-reserved", 2 * i + 1, &rs);
++			if (rb <= base && base < rb + rs) {
++				snprintf(why, sizeof(why), "window base 0x%llx is inside the pool 0x%llx..0x%llx", base, rb, rb + rs);
++			} else if (rb > base && rb < end && (limit == 0 || limit > rb - base)) {
++				limit = rb - base;
++				snprintf(note, sizeof(note), "; ends below the pool at 0x%llx", rb);
++			}
++		}
++	}
++
++	if (why[0] != '\0') {
++		limit = LAUREL_RAM_FALLBACK;
++		if (memory_size != 0 && memory_size < limit) {
++			limit = memory_size;
++		}
++		snprintf(laurel_ram_line, sizeof(laurel_ram_line),
++		    "LAUREL RAM: off: %s; XNU keeps %llu MiB of the %llu MiB window at 0x%llx", why, limit >> 20, size >> 20, base);
++		return limit;
++	}
++
++	if (size > LAUREL_RAM_MAX && (limit == 0 || limit > LAUREL_RAM_MAX)) {
++		limit = LAUREL_RAM_MAX;
++		snprintf(note, sizeof(note), "; capped at %llu MiB (bootstrap page tables)", LAUREL_RAM_MAX >> 20);
++	}
++	uint64_t managed = (limit != 0 && limit < size) ? limit : size;
++	uint64_t low = base < LAUREL_RAM_4G ? ((base + managed < LAUREL_RAM_4G ? base + managed : LAUREL_RAM_4G) - base) : 0;
++	if (gpu != 0 && midmem == 0 && base < LAUREL_GPU_POOL + LAUREL_GPU_POOL_SIZE && LAUREL_GPU_POOL < base + managed &&
++	    note[0] == '\0') {
++		snprintf(note, sizeof(note), "; gpu=1: the topaz GPU pool 0x%llx is inside, use gpu_midmem=1", LAUREL_GPU_POOL);
++	}
++	if (laurel_ram_dt_u64(chosen, "darwinboot-memory-size", 0, &asked) && asked > size && note[0] == '\0') {
++		snprintf(note, sizeof(note), "; DarwinBoot gave %llu of the %llu MiB the ADT asks", size >> 20, asked >> 20);
++	}
++	snprintf(laurel_ram_line, sizeof(laurel_ram_line),
++	    "LAUREL RAM: on: %llu MiB at 0x%llx..0x%llx (banks 0x%llx..0x%llx; %llu MiB below 4 GiB)%s%s",
++	    managed >> 20, base, base + managed, run0, run1, low >> 20, note,
++	    (memory_size != 0 && memory_size < size) ? "; maxmem limits it" : "");
++	return limit;
++}
++
++const char *
++laurel_ram_summary(void)
++{
++	return laurel_ram_line;
++}
++
++static void
++laurel_ram_report(void)
++{
++	if (laurel_ram_line[0] != '\0') {
++		printf("%s\n", laurel_ram_line);
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, laurel_ram_report);
++
++#endif /* SWEET */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index b0dad49..5addf4d 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/laurel_ram.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard

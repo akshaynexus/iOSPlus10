@@ -17,8 +17,8 @@ stock ABL (boot_b, header v2, stock DTB)
      published as a read-only block device; PartitionDxe + Fat mount it
   -> UniXNU boot manager (UniXNUDxe makes it Boot#### "unixnu:firmware", first in BootOrder): reads
      \EFI\UniXNU\unixnu.toml from the payload, 3 s menu, entry "iOS 16 (laurel XNU, TOPAZ_4K)"
-  -> DarwinBoot: Payloads\kernel.macho + kernel.macho.adt, window of darwinboot-memory-size (768 MiB) in the first
-     conventional-memory run that fits = Mu "Kernel RAM" 0x81000000 -> window 0x81004000, boot_args (Darwin 23
+  -> DarwinBoot: Payloads\kernel.macho + kernel.macho.adt, window of darwinboot-memory-size (3264 MiB since 2100; was 768) in
+     the first conventional-memory run that fits = Mu "Kernel RAM" 0xE1000000 (was 0x81000000) -> window 0xE1004000, boot_args (Darwin 23
      layout, 1024-byte command line), ExitBootServices, MMU off, green bar, jump to the kernel entry in EL1
   -> XNU xnu-8796.141.3 TOPAZ_4K (4 KiB pages, 8 cores), patches external/ios-topaz + patches/laurel/xnu/2000-2012
   -> iOS 16.7.16 root on userdata (rd=ufsroot0, already flashed; never write userdata again)
@@ -82,6 +82,61 @@ VirtualBase = kernel base VA, DeviceTree inside the window after the kernel, Com
 ADT (`scripts/laurel/mkadt.py --boot silver --dram 0x81000000:0x30000000 --darwinboot`): `dram-base`/`dram-size` =
 the window, `darwinboot-memory-size` = dram-size, `firmware-version` "laurel-uefi". The kernel reads none of
 `dram-base` (grep of all topaz and laurel patches); mkpayload (shim path) was its only user.
+
+## RAM, memory map, screen surfaces, canvas [2026-11-01 05:00, kernel 2100-2103, Mu 0101/0102; NOT BOOTED]
+
+Problem [V boot 03:59, live log 04:04]: XNU had only the 768 MiB window. backboardd's 720x1560 BGRA surface (4.8 MB)
+needs one physically contiguous run: `vm_page_find_contiguous(num=1172,low=0): found 0 pages ... scanned 188404 pages`
+(= all 736 MiB), then `SWEET SURF: backboardd create id 0 720x1560 ... -> 0xe00002bd` in a loop. No frame was ever swapped.
+[V code] Two causes: (1) the window is small and fragmented; (2) on the TOPAZ_4K kernel every surface buffer is 16 KiB aligned
+(`SWEET_UPAGE`, user tasks have 16 KiB pages), and IOBufferMemoryDescriptor makes any buffer with alignment > page_size
+physically contiguous (`IOBufferMemoryDescriptor.cpp`: `if (alignment > page_size) options |= kIOMemoryPhysicallyContiguous`).
+So even surfaces that no hardware reads needed a contiguous run (the scanout attempt with a mask below 4 GiB and the generic
+attempt each gave two `vm_page_find_contiguous` lines per create).
+
+### Memory map (final; areas B and E place their pools by it)
+
+| Range | Size | Owner | Notes |
+| --- | --- | --- | --- |
+| 0x40000000-0x7CC00000 | 972 MiB | bank A: fixed carve-outs (hardware-map.md), Mu fixed regions (FD 0x5FC00000, DXE heap 0x62100000) | not kernel RAM |
+| 0x7CC00000-0x80000000 | | no RAM | |
+| 0x80000000-0xC0000000 | 1 GiB | free for device pools (Mu "Pool RAM", reserved) | e.g. a later pool; topaz TopazAdreno 0x90000000 + 1 GiB (gpu=1 without gpu_midmem) overlaps 0xC0000000+ |
+| 0xC0000000-0xE0000000 | 512 MiB | Adreno GPU pool (area B, `laurel-ram-reserved`) | Mu "Pool RAM" |
+| 0xE0000000-0xE1000000 | 16 MiB | TopazModem pool (area E, MODEM_POOL_BASE, `laurel-ram-reserved`) | Mu "Pool RAM" |
+| 0xE1000000-0xE1004000 | 16 KiB | Mu "Kernel RAM" start; DarwinBoot keeps the kernel's 2 MiB offset | |
+| 0xE1004000-0x1AD004000 | 3264 MiB | XNU (DarwinBoot window, boot_args physBase/memSize); 495 MiB of it below 4 GiB | MDP scanout pool, USB/UFS DMA, DSI/flip buffers: below 4 GiB by mask |
+| 0x1AD004000-0x1C0000000 | 304 MiB | UEFI's own allocations (top-down from 0x1C0000000), free after ExitBootServices | not kernel RAM |
+
+XNU's managed RAM is one range from physBase, so pools go below it: no cacheable alias of a pool in the physical aperture,
+and nothing XNU allocates lands in one. The UEFI map reserves 0x80000000-0xE1000000 ("Pool RAM"), so NegroniBootMemoryDxe
+and RamManagerDxe add no DT hole there and no free run next to "Kernel RAM" can pull the window down. The window base
+0xE1004000 keeps a 32 MiB-aligned VA-PA delta (as 0x81004000 did). The 1 GiB at 0x80000000 could become kernel RAM only
+with a window from 0x81004000 that passes over the pools (a hole in XNU's range: not supported).
+
+| Piece | Change |
+| --- | --- |
+| Mu 0101 | "Pool RAM" 0x80000000 + 0x61000000 reserved, "Kernel RAM" 0xE1000000 + 0xDF000000 (was 0x81000000 + 0x3F000000). UEFI now allocates top-down from 0x1C0000000 (before: from 0xC0000000, and RamManagerDxe added bank C late, so no run crossed 0xC0000000). |
+| Mu 0102 (DarwinBoot) | no run holds the asked window: take the biggest run (2 MiB multiple, >= 256 MiB), screen line `WINDOW <size> OF <asked> @ <base>`; boot_args memSize = that size. Old FD + new ADT boots with less RAM instead of `NO WINDOW`. |
+| mkadt.py `--dram auto --mu-fd FD` | window size from the FD's "Kernel RAM" entry (PrePi table, uncompressed in the FD): largest 64 MiB multiple that leaves 256 MiB for UEFI, max 4608 MiB, no overlap with a pool -> 3264 MiB; older FD -> 768 MiB + `LAUREL RAM: off:` line. `/chosen laurel-ram-banks` = B 0x80000000 + 1 GiB, C 0xC0000000 + 4 GiB; `/chosen laurel-ram-reserved` = 0xC0000000 + 512 MiB, 0xE0000000 + 16 MiB. `uefi-image.sh` default `DRAM=auto`. |
+| kernel 2100 | `osfmk/arm64/laurel_ram.c` before arm_vm_init: window inside one run of `laurel-ram-banks`, <= 4608 MiB (TOPAZ_4K BOOTSTRAP_TABLE_SIZE = 16 pages; arm_vm_init's DEVELOPMENT check needs kernel + physmap + 1 GiB slide <= 6 GiB of VA), no overlap with `laurel-ram-reserved` (a pool above the base caps the window; the base inside a pool = off). Failure or `laurelram=0`: XNU keeps 768 MiB (maxmem path). USB and UFS DMA blocks (kmem_alloc_contig) get max_pnum = 4 GiB. |
+| kernel 2101 | LAUREL SPOOL: IOCoreSurfaceRoot::start (before user space) takes 6 x 8 MiB contiguous, 16 KiB-aligned buffers below 4 GiB for the scanout path (screen-sized BGRA surfaces); reuse only at retain count 1. LAUREL SURF (TOPAZ_4K, no GPU): other surfaces get a pageable IOBMD wired by prepare() (own VM object, offset 0: correct for 16 KiB user pages; no physical run); the old allocation stays as the fallback. Kill switches `laurelspool=0`, `laurelsurf=0`. |
+| kernel 2102 | one line at the first iOS frame shown (direct = scanout surface copied to the back buffer and flipped; copy = composed). |
+| kernel 2103 | native canvas: AppleCLCD presented the topaz iPhone X canvas 1125x2436 unless `sweetfb_native=1` (not in the UEFI boot-args): the panel showed only the centre 64 % of the UI, and IOMFB's size did not match the ADT canvas 720x1560. Now native is the default when disp0 canvas-width/height = the panel and `/chosen display-scale` (2) divides it: 360x780 points. Kill switch `sweetfb_native=0`. The layout is set at the top of AppleCLCD::start, so area C's `sweet_hid_set_geometry()` call (2200, later in start) gets it. |
+
+Display path without a GPU (topaz 0092-0103, 0945, unchanged): backboardd swaps (IOMFB SwapEnd) -> `showPending` -> flush timer
+(`sweetfb_hz=30`) -> `present()`: one full-screen scanout surface -> `directPresent` (copy into the cached flip buffer, MDP VIG0
+flips to it); several layers -> copy path (composed into the back buffer). The first swap hides the kernel console
+(`fConsShown = false`; `sweetfb_console=1` keeps it).
+
+Expected boot lines: `LAUREL RAM: on: 3264 MiB at 0xe1004000..0x1ad004000 (banks 0x80000000..0x1c0000000; 495 MiB below 4 GiB)`,
+`LAUREL SPOOL: on: 6 x 8 MiB contiguous below 4 GiB at 0x..-0x.. for screen surfaces` (both again at the first surface, so they are
+in the USB log), `LAUREL FB CANVAS: on: native 720x1560 at display-scale 2 (360x780 points)`, `SWEET FB: modes published: 720x1560
+at 60 Hz`, `LAUREL SURF: on: surfaces from wired pages (no contiguous RAM needed), first N bytes`, `SWEET SURF: backboardd create id
+N 720x1560 ... -> 0x0`, no `vm_page_find_contiguous` lines, `LAUREL FB: first iOS frame on the panel: swap N, ...`, `SWEET FB: swap
+...` (copy path, first 16) or `SWEET FB: 1000 swaps`. `hw.memsize` 3422552064.
+Failure signs: no UniXNU menu (Mu 0101: a UEFI driver that cannot use RAM above 4 GiB; flash the previous image),
+`WINDOW ... OF ...` on the screen (DarwinBoot shrank the window), `LAUREL RAM: off: ...`, a red status bar (no iOS layout for
+360x780 points: `sweetfb_native=0` returns to the cropped iPhone X canvas).
 
 ## Boot CPU: Gold 0x100 after a PSCI hand-off at the kernel entry [decision 2026-11-01 03:40, patch 2016]
 

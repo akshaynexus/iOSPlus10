@@ -1,0 +1,84 @@
+laurel 2103: native canvas on the Mi A3. AppleCLCD presented the topaz iPhone X canvas 1125x2436 unless sweetfb_native=1 (not in the UEFI boot-args), so the 720x1560 panel showed only the centre 64 % of the UI (status bar, dock, home bar cut off) and the size IOMFB reported did not match the ADT canvas (disp0 canvas-width/height 720x1560). Now native is the default when the ADT says so: disp0 canvas = the panel and /chosen display-scale (2) divides both sides (360x780 points). Kill switch sweetfb_native=0 (iPhone X canvas); sweetfb_native=1 forces native as before. The layout (fLogicalW/H, fOffX/Y) is set before the rest of AppleCLCD::start, so the touch map hook of laurel 2200 (sweet_hid_set_geometry) gets the final layout. Line: 'LAUREL FB CANVAS: on: native 720x1560 at display-scale 2 (360x780 points)' or 'LAUREL FB CANVAS: off: <reason>; iPhone X canvas 1125x2436'. [U] iOS has no status bar layout for 360x780 points (topaz 0061 saw the red rdar:45025538 bar at 360x800).
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8da3eb2..7bd0099 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -97,6 +97,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOUserClient.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <kern/thread_call.h>
+@@ -445,6 +446,59 @@ laurel_fb_publish_pipe_reqs(IOService *fb)
+ 	    LAUREL_FB_PLANE_ALIGN, LAUREL_FB_STRIDE_H, LAUREL_FB_STRIDE_V);
+ }
+ 
++/*
++ * laurel 2103: the Mi A3 presents its real panel (720x1560) to iOS, not the iPhone X canvas. With the
++ * 1125x2436 canvas the panel showed only its centre (64 % of the width: status bar, dock and home bar cut
++ * off), and the ADT canvas (disp0 canvas-width/height 720x1560, mkadt.py) did not match the size IOMFB
++ * reported. On by default when the ADT says so: disp0 canvas-width/height equal the panel and /chosen
++ * display-scale (2: 360x780 points) divides both. Boot-arg sweetfb_native=0 is the kill switch (iPhone X
++ * canvas, as topaz 0114); sweetfb_native=1 forces the panel size. One line:
++ *   "LAUREL FB CANVAS: on: native 720x1560 at display-scale 2 (360x780 points)"
++ *   "LAUREL FB CANVAS: off: <reason>; iPhone X canvas 1125x2436"
++ * [U] iOS has no status bar layout for 360x780 points (topaz 0061 saw the red "rdar:45025538" bar at
++ * 360x800); everything else of SpringBoard worked there.
++ */
++static uint32_t
++laurel_fb_prop_u32(IORegistryEntry *e, const char *key)
++{
++	OSData *d = e != NULL ? OSDynamicCast(OSData, e->getProperty(key)) : NULL;
++	uint32_t v = 0;
++	if (d != NULL && d->getLength() >= sizeof(v)) {
++		memcpy(&v, d->getBytesNoCopy(), sizeof(v));
++	}
++	return v;
++}
++
++static int
++laurel_fb_native(IOService *provider, uint32_t w, uint32_t h)
++{
++	int arg = -1;
++	char why[96];
++	uint32_t cw = laurel_fb_prop_u32(provider, "canvas-width"), ch = laurel_fb_prop_u32(provider, "canvas-height");
++	IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++	uint32_t scale = laurel_fb_prop_u32(chosen, "display-scale");
++	OSSafeReleaseNULL(chosen);
++
++	why[0] = '\0';
++	PE_parse_boot_argn("sweetfb_native", &arg, sizeof(arg));
++	if (arg == 0) {
++		snprintf(why, sizeof(why), "kill switch sweetfb_native=0");
++	} else if (arg > 0) {
++		/* forced: as topaz */
++	} else if (cw != w || ch != h) {
++		snprintf(why, sizeof(why), "ADT canvas %ux%u is not the panel %ux%u", cw, ch, w, h);
++	} else if (scale == 0 || w % scale != 0 || h % scale != 0) {
++		snprintf(why, sizeof(why), "/chosen display-scale %u does not divide the panel %ux%u", scale, w, h);
++	}
++	if (why[0] != '\0') {
++		IOLog("LAUREL FB CANVAS: off: %s; iPhone X canvas %ux%u\n", why, SWEET_FB_LOGICAL_W, SWEET_FB_LOGICAL_H);
++		return 0;
++	}
++	IOLog("LAUREL FB CANVAS: on: native %ux%u at display-scale %u (%ux%u points)%s\n", w, h, scale,
++	    scale ? w / scale : 0, scale ? h / scale : 0, arg > 0 ? " (sweetfb_native=1)" : "");
++	return 1;
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -466,8 +520,7 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+-	int native = 0;
+-	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	int native = laurel_fb_native(provider, fWidth, fHeight);       /* laurel 2103: native canvas by default */
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {

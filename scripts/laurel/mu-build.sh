@@ -15,8 +15,9 @@
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 TARGET=${1:-DEBUG}
-MU=$EXT/Mu-Silicium-negroni
-UNIXNU=$EXT/UniXNU
+# MU_TREE / UNIXNU_TREE: build from other checkouts (a parallel agent's copy; default the submodules)
+MU=${MU_TREE:-$EXT/Mu-Silicium-negroni}
+UNIXNU=${UNIXNU_TREE:-$EXT/UniXNU}
 VENV=$OUT/venv-mu
 O=$OUT/laurel/mu
 [ "$(uname -s)" = Linux ] || { echo "mu-build: Linux only (macOS: port the BaseTools steps of scripts/uefi/build-macos.sh)" >&2; exit 1; }
@@ -40,12 +41,21 @@ fi
 git -C "$UNIXNU" submodule update -q --init --depth 1 drivers/DarwinBoot
 say "DarwinBoot $(git -C "$UNIXNU/drivers/DarwinBoot" rev-parse --short HEAD), UniXNU $(git -C "$UNIXNU" rev-parse --short HEAD), Mu fork $(git -C "$MU" rev-parse --short HEAD)"
 
-# 3. Our laurel changes: reset the files they touch, then apply (re-runnable)
+# 3. Our laurel changes: reset every file they touch, then apply them in order (re-runnable; a later patch may
+# change a file an earlier one changed, e.g. mu 0101 after 0001). A patch whose paths start with DarwinBootPkg/
+# (mu 0102) goes to UniXNU's DarwinBoot submodule, the others to the Mu tree.
+DB=$UNIXNU/drivers/DarwinBoot
+target() { if grep -q '^+++ b/DarwinBootPkg/' "$1"; then echo "$DB"; else echo "$MU"; fi; }
 for pt in "$REPO"/patches/laurel/mu/*.patch; do
   [ -f "$pt" ] || continue
-  git -C "$MU" apply --numstat "$pt" | awk '{print $3}' | while read -r f; do git -C "$MU" checkout -q -- "$f" 2>/dev/null || true; done
-  git -C "$MU" apply "$pt"
-  say "applied $(basename "$pt")"
+  t=$(target "$pt")
+  grep -E '^\+\+\+ b/' "$pt" | sed 's|^+++ b/||' | while read -r f; do git -C "$t" checkout -q -- "$f" 2>/dev/null || true; done
+done
+for pt in "$REPO"/patches/laurel/mu/*.patch; do
+  [ -f "$pt" ] || continue
+  t=$(target "$pt")
+  git -C "$t" apply "$pt"
+  say "applied $(basename "$pt") to $([ "$t" = "$DB" ] && echo DarwinBoot || echo Mu)"
 done
 miss=0
 for f in $(grep -rhoE 'Binaries/laurel_sprout/[^ |}]+' "$MU/Platforms/Xiaomi/laurel_sproutPkg" | sort -u); do

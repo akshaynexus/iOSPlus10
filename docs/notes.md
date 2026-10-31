@@ -3754,3 +3754,31 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Open after this session: (1) UI on the panel (no GPU: a software compositor path or metal2vulkan), (2) touch coordinates
   720x1560 (driver assumes 1080x2400), (3) battery SPMI reads, (4) the early kernel lines are not in the live USB log (raw frames go
   out before the host interface is up; `ctl log` resends only the last 64 KiB): keep the ring from byte 0 until the host asks once.
+
+## Mi A3: 3264 MiB for XNU above the device pools, screen-surface pool, surfaces without contiguous RAM, native canvas; kernel 2100-2103, Mu 0101/0102 (2026-11-01 05:00, area A, NOT BOOTED)
+- [V live log 04:04, boot 03:59] `vm_page_find_contiguous(num=1172,low=0): found 0 pages ... scanned 188404 pages ... wired count
+  is 41124` (two lines with low=1048575 = the scanout mask below 4 GiB, two with low=0), then `SWEET SURF: backboardd create id 0
+  720x1560 fmt 0x42475241 bpe 4 bpr 3072 ... size 4800512 keys 10 -> 0xe00002bd`, looping. The window was 768 MiB (188404 pages).
+- [V code] The low=0 attempt is not the GPU path: on TOPAZ_4K `SWEET_UPAGE` is 16 KiB and the generic surface buffer is
+  `inTaskWithOptions(..., take, SWEET_UPAGE)`; IOBufferMemoryDescriptor turns alignment > page_size into
+  kIOMemoryPhysicallyContiguous. Every surface needed a contiguous run on the 4K kernel. Lesson: on a 4 KiB kernel with 16 KiB
+  user pages, use a pageable IOBMD (own VM object, offset 0) + prepare() for user-shared buffers that no device reads; keep
+  16 KiB-aligned contiguous IOBMDs for DMA/scanout only, and take those early.
+- [V code] EDK2 allocates top-down from the highest free address. With "Kernel RAM" ending at 0xC0000000, UEFI's early
+  allocations sat just below 0xC0000000 and RamManagerDxe added bank C (0xC0000000-0x1C0000000) late: no free run could cross
+  0xC0000000. Mu 0101 puts "Kernel RAM" at 0xE1000000-0x1C0000000; UEFI then allocates from 0x1C0000000 down.
+- Memory map decision (coordinator, areas B/E): device pools stay out of kernel RAM (GPU pool 0xC0000000 + 512 MiB, modem pool
+  0xE0000000 + 16 MiB); XNU's range is one piece, so the window starts above them at 0xE1004000 (3264 MiB, 495 MiB below 4 GiB).
+  0x80000000-0xE1000000 is Mu "Pool RAM" (reserved). A first version (window 0x81004000 + 4608 MiB over the pools) was dropped.
+  Table: `docs/laurel_sprout/uefi-boot.md` "Memory map".
+- [I] NegroniBootMemoryDxe adds DT bank holes below 4 GiB as system memory (up to 1 GiB); a hole next to "Kernel RAM" would
+  move the first free run (and the window) down. "Pool RAM" makes bank B no hole. The earlier boots' real window base is not
+  known (no photo of the DARWINBOOT line); `LAUREL RAM: on:` prints it.
+- [V code] TOPAZ_4K BOOTSTRAP_TABLE_SIZE is 16 pages; arm_vm_init (DEVELOPMENT) panics when 2 * (1 + ceil((kernel + physmap +
+  1 GiB slide) / 1 GiB) + 1) > 16, so the window may be at most ~4.9 GiB: 2100 caps at 4608 MiB.
+- Canvas [V code]: AppleCLCD::start used the iPhone X canvas 1125x2436 unless `sweetfb_native=1`; the UEFI boot-args do not set it,
+  so the 720x1560 panel showed the centre 64 % and IOMFB disagreed with the ADT canvas 720x1560 (backboardd already made 720x1560
+  surfaces). 2103: native by default when the ADT canvas = the panel and display-scale divides it. [U] 360x780 points has no iOS
+  status bar layout (topaz 0061: red rdar:45025538 bar at 360x800); kill switch `sweetfb_native=0`.
+- Built (worktree branch t3/laurel-kernel-ram-surface-pool): see the commit; image `out/laurel/uefi/laurel-uefi-boot.img` of that
+  worktree. Expected lines: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".

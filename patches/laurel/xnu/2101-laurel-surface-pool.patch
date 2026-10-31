@@ -1,0 +1,273 @@
+laurel 2101: surfaces without contiguous RAM. (a) LAUREL SPOOL: when IOCoreSurfaceRoot starts (before user space) 6 x 8 MiB physically contiguous, 16 KiB aligned buffers below 4 GiB are set aside for the scanout path (the window server's 720x1560 BGRA surfaces, 4.8 MB); a buffer is reused only when nobody holds it. (b) LAUREL SURF (TOPAZ_4K): every other surface without the GPU gets a pageable IOBufferMemoryDescriptor wired by prepare() (own VM object, offset 0: right for 16 KiB user pages) instead of a 16 KiB-aligned IOBMD, which IOBufferMemoryDescriptor makes physically contiguous (alignment > page_size); the old path stays as the fallback. Boot 2026-11-01 04:04: vm_page_find_contiguous(num=1172) found 0 pages and 'backboardd create id 0 720x1560 ... -> 0xe00002bd' looped. Lines: 'LAUREL SPOOL: on: 6 x 8 MiB contiguous below 4 GiB at 0x..-0x.. for screen surfaces' (start, again at the first surface with the LAUREL RAM line), 'LAUREL SURF: on: surfaces from wired pages (no contiguous RAM needed), first N bytes'. Kill switches laurelspool=0, laurelsurf=0.
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index ac612e6..291bf77 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -50,6 +50,8 @@
+ extern "C" uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
+ extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
+ extern "C" IOMemoryDescriptor *topaz_gpu_pool_md(uint64_t pa, uint64_t size);
++/* laurel 2100 (osfmk/arm64/laurel_ram.c): the LAUREL RAM line, repeated at the first surface for the USB log */
++extern "C" const char *laurel_ram_summary(void);
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -253,6 +255,171 @@ sweet_res_give(IOMemoryDescriptor *md)
+ 	return kept;
+ }
+ 
++/*
++ * laurel 2101: screen-surface pool. The window server's screen-sized surfaces (720x1560 BGRA, 4.8 MB) go to
++ * the MDP scanout path, which needs physically contiguous memory below 4 GiB. Taken per surface, late in
++ * the boot, that failed on every try (boot 2026-11-01 04:04: vm_page_find_contiguous(num=1172) found 0
++ * pages, "backboardd create id 0 720x1560 ... -> 0xe00002bd" in a loop, no frame). So the buffers are
++ * set aside once, when IOCoreSurfaceRoot starts (before user space runs): LAUREL_SPOOL_COUNT (= the
++ * scanout slots) of LAUREL_SPOOL_SIZE, contiguous, 16 KiB aligned (user tasks have 16 KiB pages), below
++ * 4 GiB. A buffer goes back when its surface is freed; it is handed out again only when nobody else (a
++ * task's mapping, the framebuffer) holds it any more. Kill switch laurelspool=0. One line at start:
++ *   "LAUREL SPOOL: on: 6 x 8 MiB contiguous below 4 GiB at 0x..-0x.. for screen surfaces"
++ *   "LAUREL SPOOL: off: <reason>" (the scanout path then allocates per surface, as before)
++ */
++#define LAUREL_SPOOL_SIZE       (8u << 20)
++#define LAUREL_SPOOL_COUNT      SWEET_SCANOUT_SLOTS
++static IOBufferMemoryDescriptor *laurel_spool[LAUREL_SPOOL_COUNT];     /* the pool's own references */
++static bool laurel_spool_busy[LAUREL_SPOOL_COUNT];                     /* sweet_surface_lock */
++static unsigned laurel_spool_count, laurel_spool_takes, laurel_spool_misses;
++static char laurel_spool_line[160];
++
++static void
++laurel_spool_fill(void)
++{
++	uint32_t on = 1;
++	uint64_t lo = ~0ull, hi = 0;
++	unsigned n = 0;
++
++	PE_parse_boot_argn("laurelspool", &on, sizeof(on));
++	if (on == 0) {
++		snprintf(laurel_spool_line, sizeof(laurel_spool_line), "LAUREL SPOOL: off: kill switch laurelspool=0");
++		IOLog("%s\n", laurel_spool_line);
++		return;
++	}
++	for (; n < LAUREL_SPOOL_COUNT; n++) {
++		IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, LAUREL_SPOOL_SIZE,
++		    0x00000000FFFFC000ull);
++		uint64_t pa = mem != NULL ? mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++		if (mem != NULL && (pa == 0 || (pa & 0x3fff) != 0 || pa + LAUREL_SPOOL_SIZE > 0x100000000ull)) {
++			mem->release();
++			mem = NULL;
++		}
++		if (mem == NULL) {
++			break;
++		}
++		bzero(mem->getBytesNoCopy(), LAUREL_SPOOL_SIZE);
++		laurel_spool[n] = mem;
++		lo = pa < lo ? pa : lo;
++		hi = pa + LAUREL_SPOOL_SIZE > hi ? pa + LAUREL_SPOOL_SIZE : hi;
++	}
++	laurel_spool_count = n;
++	if (n == 0) {
++		snprintf(laurel_spool_line, sizeof(laurel_spool_line),
++		    "LAUREL SPOOL: off: no %u MiB of contiguous RAM below 4 GiB at start", LAUREL_SPOOL_SIZE >> 20);
++	} else {
++		snprintf(laurel_spool_line, sizeof(laurel_spool_line),
++		    "LAUREL SPOOL: on: %u x %u MiB contiguous below 4 GiB at 0x%llx-0x%llx for screen surfaces%s",
++		    n, LAUREL_SPOOL_SIZE >> 20, lo, hi, n < LAUREL_SPOOL_COUNT ? " (fewer than asked)" : "");
++	}
++	IOLog("%s\n", laurel_spool_line);
++}
++
++/* A pool buffer (one more reference, for the surface) for size bytes, or NULL. */
++static IOBufferMemoryDescriptor *
++laurel_spool_take(uint64_t size)
++{
++	IOBufferMemoryDescriptor *mem = NULL;
++
++	if (laurel_spool_count == 0 || size > LAUREL_SPOOL_SIZE) {
++		return NULL;
++	}
++	IOLockLock(sweet_surface_lock);
++	for (unsigned i = 0; i < laurel_spool_count && mem == NULL; i++) {
++		/* free, and nobody holds it: only the pool's reference is left */
++		if (!laurel_spool_busy[i] && laurel_spool[i]->getRetainCount() == 1) {
++			laurel_spool_busy[i] = true;
++			mem = laurel_spool[i];
++			mem->retain();
++		}
++	}
++	if (mem != NULL) {
++		laurel_spool_takes++;
++	} else {
++		laurel_spool_misses++;
++	}
++	unsigned misses = laurel_spool_misses;
++	IOLockUnlock(sweet_surface_lock);
++	if (mem != NULL) {
++		bzero(mem->getBytesNoCopy(), LAUREL_SPOOL_SIZE);  /* (the surface clears its own part again) */
++	} else if (misses <= 4) {
++		IOLog("LAUREL SPOOL: all %u buffers in use (surface of %llu bytes): contiguous memory for this one\n",
++		    laurel_spool_count, size);
++	}
++	return mem;
++}
++
++/* The surface lets go of md: true when it is a pool buffer (the caller still drops its reference). */
++static bool
++laurel_spool_give(IOMemoryDescriptor *md)
++{
++	bool mine = false;
++
++	if (laurel_spool_count == 0 || md == NULL) {
++		return false;
++	}
++	IOLockLock(sweet_surface_lock);
++	for (unsigned i = 0; i < laurel_spool_count && !mine; i++) {
++		if (laurel_spool[i] == md) {
++			laurel_spool_busy[i] = false;
++			mine = true;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return mine;
++}
++
++#if defined(TOPAZ_4K)
++/*
++ * laurel 2101: surface memory without a contiguous run. On the 4 KiB-page kernel a surface buffer is 16 KiB
++ * aligned (SWEET_UPAGE: user tasks have 16 KiB pages), and an IOBufferMemoryDescriptor alignment above
++ * page_size makes it physically contiguous (IOBufferMemoryDescriptor.cpp: "alignment > page_size" adds
++ * kIOMemoryPhysicallyContiguous). Every surface the GPU does not touch then needed one contiguous run:
++ * with fragmented RAM even a 4.8 MB one failed. A pageable buffer is its own VM object (offset 0, so a 16 KiB
++ * user page never shows a neighbour), its pages are wired by prepare() for the surface's life (the
++ * framebuffer copies from it), and no physical run is needed. Used for every surface that is not for the
++ * scanout path or the GPU; when it fails, the old contiguous allocation runs. Kill switch laurelsurf=0.
++ * One line at the first surface: "LAUREL SURF: on: surfaces from wired pages (no contiguous RAM needed)"
++ * or "LAUREL SURF: off: <reason>".
++ */
++static int laurel_surf_on = -1;
++
++static IOBufferMemoryDescriptor *
++laurel_surf_pages(uint64_t size)
++{
++	if (laurel_surf_on < 0) {
++		uint32_t on = 1;
++		PE_parse_boot_argn("laurelsurf", &on, sizeof(on));
++		laurel_surf_on = on != 0;
++		if (!laurel_surf_on) {
++			IOLog("LAUREL SURF: off: kill switch laurelsurf=0\n");
++		}
++	}
++	if (!laurel_surf_on) {
++		return NULL;
++	}
++	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryPageable, sweet_round_upage(size), page_size);   /* (VM object offset 0: no 16 KiB alignment needed) */
++	IOReturn ret = mem != NULL ? mem->prepare() : kIOReturnNoMemory;
++	static bool told;
++	if (ret != kIOReturnSuccess) {
++		OSSafeReleaseNULL(mem);
++	}
++	if (!told) {
++		told = true;
++		if (mem != NULL) {
++			IOLog("LAUREL SURF: on: surfaces from wired pages (no contiguous RAM needed), first %llu bytes\n", size);
++		} else {
++			/* the first one failed: the feature is off, the contiguous path stays */
++			laurel_surf_on = 0;
++			IOLog("LAUREL SURF: off: a pageable buffer of %llu bytes could not be wired (0x%x)\n", size, ret);
++		}
++	}
++	return mem;
++}
++#endif /* TOPAZ_4K */
++
+ static int
+ sweet_scanout_alloc_slot(void)
+ {
+@@ -297,7 +464,11 @@ SweetSurface::free()
+ 	if (wrapped && memory != NULL) {
+ 		memory->complete();
+ 	}
+-	if (!wrapped && !gpuPool && memory != NULL && sweet_res_give(memory)) {
++	if (pagesWired && memory != NULL) {
++		memory->complete();                     /* laurel 2101 */
++	}
++	(void)laurel_spool_give(memory);                /* laurel 2101: a pool buffer goes back (our reference drops below) */
++	if (!wrapped && !gpuPool && !pagesWired && memory != NULL && sweet_res_give(memory)) {   /* (laurel 2101: not a wired-pages buffer) */
+ 		memory = NULL;
+ 	}
+ 	OSSafeReleaseNULL(memory);
+@@ -668,6 +839,7 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 		return false;
+ 	}
+ 	sweet_surface_init_lock();
++	laurel_spool_fill();            /* laurel 2101: before user space, while RAM below 4 GiB is in one piece */
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
+@@ -968,6 +1140,17 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		return kIOReturnBadArgument;
+ 	}
+ 
++	static bool laurel_told;                /* laurel 2100/2101: the start lines again, for the USB log */
++	if (!laurel_told) {
++		laurel_told = true;
++		const char *ram = laurel_ram_summary();
++		if (ram != NULL && ram[0] != '\0') {
++			IOLog("%s\n", ram);
++		}
++		if (laurel_spool_line[0] != '\0') {
++			IOLog("%s\n", laurel_spool_line);
++		}
++	}
+ 	SweetSurface *s = sweet_surface_alloc();
+ 	if (s == NULL) {
+ 		props->release();
+@@ -1043,11 +1226,15 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			 * bypassed). A raw physical window outside the kernel's RAM maps as
+ 			 * Device memory, where bzero/memcpy take alignment faults.
+ 			 */
+-			IOBufferMemoryDescriptor *cmem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+-			    s->allocSize, 0x00000000fffff000ull);
++			IOBufferMemoryDescriptor *cmem = laurel_spool_take(s->allocSize);     /* laurel 2101 */
++			if (cmem == NULL) {
++				cmem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
++				    s->allocSize, 0x00000000fffff000ull);
++			}
+ 			uint64_t pa = cmem != NULL ? cmem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 			if (cmem != NULL && (pa == 0 || pa + s->allocSize > 0x100000000ull)) {
++				(void)laurel_spool_give(cmem);
+ 				cmem->release();
+ 				cmem = NULL;
+ 			}
+@@ -1098,6 +1285,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 					mem = sweet_res_take(take);
+ 				}
+ 			}
++#if defined(TOPAZ_4K)
++			if (mem == NULL && !gpu_low) {
++				mem = laurel_surf_pages(take);  /* laurel 2101: no contiguous run */
++				s->pagesWired = mem != NULL;
++			}
++#endif
+ 			if (mem == NULL && gpu_low && take <= (16u << 20)) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 5b74320..863efbd 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -48,8 +48,9 @@ public:
+ 	bool                      gpuPool;      /* topaz GPU: memory from the GPU pool below 4 GiB (scanoutPhys = its address) */
+ 	uint64_t                  poolSize;     /* bytes taken from the GPU pool (allocSize and a guard) */
+ 	uint32_t                  drawn;        /* topaz GPU: last submission naming this surface (RedwoodGPU.cpp) */
++	bool                      pagesWired;   /* laurel 2101: pageable buffer wired by prepare() (complete() in free) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; pagesWired = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */

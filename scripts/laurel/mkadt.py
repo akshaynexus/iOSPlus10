@@ -19,9 +19,18 @@ UFS, buttons, D22AP /product) and changes what differs on the Mi A3:
     (the GPU needs RAM below 4 GiB) and above every fixed carve-out (the highest ends at 0x62100000).
     Replace it with the real bank once the live FDT is read.
   * --darwinboot: /chosen darwinboot-memory-size = dram SIZE (UniXNU DarwinBoot allocates a window of that size
-    in the first UEFI conventional-memory run that fits: Mu "Kernel RAM" 0x80000000, patches/laurel/mu/0001);
+    in the first UEFI conventional-memory run that fits: Mu "Kernel RAM", patches/laurel/mu/0001 + 0101);
     firmware-version "laurel-uefi".
-Usage: mkadt.py OUT.adt [--cores 8|4] [--boot gold|silver] [--dram BASE:SIZE] [--darwinboot] [--dump]
+  * --dram auto --mu-fd FD (UEFI path, kernel patch 2100): the window size from the Mu FD's "Kernel RAM" entry
+    (PrePi memory map table, uncompressed in the FD). Mu 0101 ("Kernel RAM" 0xE1000000 + 0xDF000000, to 0x1C0000000):
+    3264 MiB (window 0xE1004000..0x1AD004000; the largest 64 MiB multiple that leaves 256 MiB for UEFI, at most 4608 MiB,
+    the TOPAZ_4K bootstrap page-table limit). An older FD (Kernel RAM to 0xC0000000): 768 MiB, as before, with a
+    "LAUREL RAM: off:" line.
+  * /chosen laurel-ram-banks (u64 base/size pairs): the DDR banks XNU may manage, B 0x80000000 + 1 GiB and
+    C 0xC0000000 + 4 GiB (they touch; bank A 0x40000000-0x7CC00000 holds every fixed carve-out). /chosen
+    laurel-ram-reserved: device pools that must stay out of kernel RAM: 0xC0000000 + 512 MiB (Adreno GPU pool) and
+    0xE0000000 + 16 MiB (TopazModem pool). Kernel patch 2100 checks the boot window against both.
+Usage: mkadt.py OUT.adt [--cores 8|4] [--boot gold|silver] [--dram BASE:SIZE|auto] [--mu-fd FD] [--darwinboot] [--dump]
 The D22AP /product node needs the iPhone X device tree $APPLE/d22ap.adt (default ~/op10-apple; Apple file,
 never in git; get it with scripts/ios16/fetch-d22ap-adt.sh). Without it the node is left out (warning).
 """
@@ -39,6 +48,15 @@ import adt  # noqa: E402
 import mkadt as topaz  # noqa: E402
 
 # Mi A3 values (docs/laurel_sprout/hardware-map.md)
+# DDR banks XNU may manage (docs/laurel_sprout/uefi-boot.md "RAM layout"; kernel patch 2100)
+RAM_BANKS = ((0x80000000, 0x40000000), (0xC0000000, 0x100000000))
+# device pools outside kernel RAM (Mu 0101 "Pool RAM" 0x80000000-0xE1000000 holds them): GPU, modem
+RAM_RESERVED = ((0xC0000000, 0x20000000), (0xE0000000, 0x01000000))
+RAM_STEP = 64 << 20              # --dram auto window granularity
+RAM_MAX = 4608 << 20             # laurel 2100 LAUREL_RAM_MAX (TOPAZ_4K BOOTSTRAP_TABLE_SIZE)
+RAM_FALLBACK = 768 << 20         # the window before 2100 (Mu "Kernel RAM" to 0xC0000000)
+UEFI_HEADROOM = 256 << 20        # room left in "Kernel RAM" above the window for UEFI's own allocations
+DARWINBOOT_BLOCK, KERNEL_BLOCK_OFFSET = 2 << 20, 0x4000   # DarwinBoot.c BLOCK_SIZE; VM_KERNEL_LINK_ADDRESS & 0x1FFFFF
 FB_W, FB_H = 720, 1560
 LAUREL_ECID = 0x4C415552454C0001       # 'LAUREL' + 1, synthetic (not the phone's)
 GOLD_HZ, SILVER_HZ = 2000000000, 1800000000   # SM6125: Gold 2.0 GHz, Silver 1.8 GHz [I: public spec; OSM LUT not read yet]
@@ -124,6 +142,8 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
     setprop(chosen, 'dram-base', u64(dram[0]))
     setprop(chosen, 'dram-size', u64(dram[1]))
     setprop(chosen, 'display-scale', u32(2))
+    setprop(chosen, 'laurel-ram-banks', b''.join(u64(b, sz) for b, sz in RAM_BANKS))   # laurel 2100 self-check
+    setprop(chosen, 'laurel-ram-reserved', b''.join(u64(b, sz) for b, sz in RAM_RESERVED))
     fw = 'laurel-uefi' if darwinboot else 'laurel-shim'
     setprop(chosen, 'firmware-version', cstr(fw))
     setprop(chosen, 'system-firmware-version', cstr(fw))
@@ -143,6 +163,46 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
     cpus = find(root, 'cpus')
     cpus.children = cpu_nodes(cores, phandles, boot)
     return root
+
+
+def mu_kernel_ram(fd_path):
+    """(base, size) of the Mu memory map entry "Kernel RAM" in an FD (PrePi table: CHAR8 Name[32], UINT64 Address,
+    UINT64 Length, ...; stored uncompressed), or None. Same reader as scripts/ios16/adt-extra.py."""
+    try:
+        with open(fd_path, 'rb') as f:
+            d = f.read()
+    except OSError:
+        return None
+    i = d.find(b'Kernel RAM'.ljust(32, b'\0'))
+    if i < 0 or i + 48 > len(d):
+        return None
+    base, size = struct.unpack_from('<QQ', d, i + 32)
+    return (base, size) if base and size else None
+
+
+def auto_dram(fd_path):
+    """(dram base, window size) for --dram auto, and the LAUREL RAM line for the build log."""
+    mu = mu_kernel_ram(fd_path)
+    if mu is None:
+        return (0x81000000, RAM_FALLBACK), f'LAUREL RAM: off: no Mu "Kernel RAM" entry in {fd_path}; ADT window 768 MiB'
+    base, size = mu
+    start = ((base + DARWINBOOT_BLOCK - 1) & ~(DARWINBOOT_BLOCK - 1)) + KERNEL_BLOCK_OFFSET
+    room = base + size - start - UEFI_HEADROOM
+    run = next(((b, b + s) for b, s in RAM_BANKS if b <= start < b + s), None)
+    if run is not None:   # extend over touching banks
+        for b, s in RAM_BANKS:
+            if b == run[1]:
+                run = (run[0], b + s)
+    win = min(RAM_MAX, max(room, 0) // RAM_STEP * RAM_STEP)
+    clash = next(((b, b + s) for b, s in RAM_RESERVED if b < start + win and start < b + s), None)
+    if win > RAM_FALLBACK and run is not None and start + win <= run[1] and clash is None:
+        return (base, win), (f'LAUREL RAM: on: {win >> 20} MiB window 0x{start:x}..0x{start + win:x} in Mu '
+                             f'"Kernel RAM" 0x{base:x}..0x{base + size:x} ({(base + size - start - win) >> 20} MiB '
+                             f'left for UEFI)')
+    why = (f'window 0x{start:x}..0x{start + win:x} overlaps the pool 0x{clash[0]:x}..0x{clash[1]:x}' if clash else
+           f'Mu FD "Kernel RAM" 0x{base:x}..0x{base + size:x} has no room for more than {RAM_FALLBACK >> 20} MiB + '
+           f'{UEFI_HEADROOM >> 20} MiB for UEFI (FD from before patches/laurel/mu/0101: make laurel-mu)')
+    return (base, RAM_FALLBACK), f'LAUREL RAM: off: {why}; ADT window {RAM_FALLBACK >> 20} MiB'
 
 
 def walk(n):
@@ -170,7 +230,10 @@ def check(root, cores, boot='gold', darwinboot=False):
     base, size = (struct.unpack('<Q', getprop(find(root, 'chosen'), k))[0] for k in ('dram-base', 'dram-size'))
     assert base >= 0x62100000, 'kernel RAM must be above the fixed carve-outs (highest ends at 0x62100000)'
     if base + size > 1 << 32:
-        print('mkadt: note: kernel RAM reaches above 4 GiB; GPU buffers need RAM below 4 GiB', file=sys.stderr)
+        print(f'mkadt: note: kernel RAM reaches above 4 GiB ({((1 << 32) - base) >> 20} MiB below): display/GPU/DMA '
+              f'buffers ask for RAM below 4 GiB (laurel 2100/2101)', file=sys.stderr)
+    banks = getprop(find(root, 'chosen'), 'laurel-ram-banks')
+    assert banks and len(banks) % 16 == 0, 'laurel-ram-banks: u64 base/size pairs'
 
 
 if __name__ == '__main__':
@@ -178,11 +241,18 @@ if __name__ == '__main__':
     ap.add_argument('out')
     ap.add_argument('--cores', type=int, choices=(4, 8), default=8)
     ap.add_argument('--boot', choices=('gold', 'silver'), default='gold')
-    ap.add_argument('--dram', default='0x80000000:0x40000000')
+    ap.add_argument('--dram', default='0x80000000:0x40000000', help='BASE:SIZE, or auto (needs --mu-fd)')
+    ap.add_argument('--mu-fd', help='Mu FD for --dram auto (its "Kernel RAM" entry decides the window size)')
     ap.add_argument('--darwinboot', action='store_true')
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
-    b, s = (int(x, 0) for x in a.dram.split(':'))
+    if a.dram == 'auto':
+        if not a.mu_fd:
+            sys.exit('mkadt: --dram auto needs --mu-fd FD')
+        (b, s), line = auto_dram(a.mu_fd)
+        print(line, file=sys.stderr)
+    else:
+        b, s = (int(x, 0) for x in a.dram.split(':'))
     root = build(a.cores, (b, s), boot=a.boot, darwinboot=a.darwinboot)
     check(root, a.cores, a.boot, a.darwinboot)
     blob = adt.serialize(root)
