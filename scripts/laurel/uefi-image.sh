@@ -4,9 +4,9 @@
 #   scripts/laurel/uefi-image.sh [CMDLINE]
 #   MU_ONLY=1   boot image with Mu UEFI alone (empty ramdisk): Mu's boot menu/front page, no XNU (step 1 of the plan)
 #   KERNEL=path (default out/laurel-kernel/out/kernel.development.sweet.4k)   FD=path (default out/laurel/mu/SILICIUM_UEFI-DEBUG.fd)
-#   DRAM=BASE:SIZE or auto (default): the DarwinBoot window size from the FD's Mu "Kernel RAM" entry (mkadt.py --dram
-#     auto): Mu 0101 (0x81000000 + 0x13F000000) gives 4608 MiB at 0x81004000 (kernel patch 2100), an older FD 768 MiB;
-#     the window starts at 0x81004000 = the shim path's __TEXT address either way
+#   DRAM=BASE:SIZE or auto (default): the DarwinBoot window from the FD's Mu memory map (mkadt.py --dram auto):
+#     Mu 0101 ("Kernel RAM" 0xE1000000 + 0xDF000000) or the late layout (MU_RAM_LAYOUT=late) gives 3264 MiB at
+#     0xE1004000 (kernel patch 2100); an older FD (Kernel RAM 0x81000000 + 0x3F000000) 768 MiB at 0x81004000
 #   CPUS=N (XNU cpus= boot-arg, default 8)   SIZE_MIB=48 (payload FAT)
 # Output: out/laurel/uefi/laurel-uefi-boot.img (+ laurel.adt, payload.img, kernel.gz, cmdline.txt); MU_ONLY=1: laurel-mu-only-boot.img
 # Flash: scripts/bg.sh laurel-flash sh -c 'BOOT=reboot scripts/laurel/flash-boot.sh out/laurel/uefi/laurel-uefi-boot.img'

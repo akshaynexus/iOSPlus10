@@ -1,0 +1,70 @@
+laurel mu late/0101: LATE memory layout, used instead of mu 0101 with `MU_RAM_LAYOUT=late scripts/laurel/mu-build.sh` (applied after
+every other mu patch). For the case that the static map of 0101 kills Mu (UEFI then allocates above 4 GiB from its first DXE; a
+Qualcomm binary with 32-bit DMA could fail). "Pool RAM Guard" 0x80000000 + 16 MiB and "Pool RAM" 0x90000000 + 0x51000000 (to
+0xE1000000: GPU pool 0xC0000000 + 512 MiB, modem pool 0xE0000000 + 16 MiB) reserved; "UEFI RAM" 0x81000000 + 240 MiB conventional,
+the highest RAM until RamManagerDxe runs, so every early allocation stays below 4 GiB. No static "Kernel RAM": RamManagerDxe maps
+the bank C hole 0xE1000000-0x1C0000000 late (one run; the DarwinBoot window 0xE1004000 + 3264 MiB, as with 0101). NegroniBootMemoryDxe
+gets NEGRONIMEM_ADD_BELOW 0xE1000000 from the dsc (the define is a no-op elsewhere), or it would add 0xE1000000-0x100000000 as an
+early DT hole and UEFI's early allocations would cut the window run. Any RAM size (bank C from SMEM, not hard-coded).
+mkadt.py --dram auto recognises this FD by its "UEFI RAM" entry and plans the same window.
+diff --git a/Platforms/OnePlus/negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.c b/Platforms/OnePlus/negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.c
+index affd9d85..de80ca8e 100644
+--- a/Platforms/OnePlus/negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.c
++++ b/Platforms/OnePlus/negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.c
+@@ -13,7 +13,11 @@
+ #define MAX_RANGES        64
+ #define MIN_PIECE_SIZE    SIZE_16MB
+ #define ADD_LIMIT         SIZE_1GB
++#ifdef NEGRONIMEM_ADD_BELOW
++#define ADD_BELOW         NEGRONIMEM_ADD_BELOW   /* iOSPlus10 laurel mu late/0101: platform DSC limit */
++#else
+ #define ADD_BELOW         SIZE_4GB
++#endif
+ 
+ typedef struct {
+   UINT64  Base;
+diff --git a/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c b/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c
+index 41e6245f..585ede15 100644
+--- a/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c
++++ b/Platforms/Xiaomi/laurel_sproutPkg/Library/MemoryMapLib/MemoryMapLib.c
+@@ -24,13 +24,16 @@ gMemoryDescriptor[] = {
+   {"Info Blk",          0x5FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
+   {"WtShareMem",        0x62000000, 0x00100000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_THROUGH_XN},
+   {"DXE Heap",          0x62100000, 0x03C00000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK},
+-  // iOSPlus10 laurel-sprout: conventional RAM for the DarwinBoot window (XNU): 0x80000000-0xC0000000 is above every
+-  // fixed carve-out of this map, below 4 GiB (GPU buffers) and the range the topaz-shim boots ran XNU in. The region
+-  // starts 16 MiB in (0x81000000, as negroni's 0x841000000): DarwinBoot puts the window at region + (kernel VA &
+-  // 0x1FFFFF) = 0x81004000, so __TEXT (VA 0xFFFFFFF007004000) lands at the shim's PA 0x81004000 and the VA-PA delta
+-  // stays a 32 MiB multiple. UEFI's own allocations go top-down from 0xC0000000; the ADT darwinboot-memory-size
+-  // (768 MiB, window end 0xB1004000) leaves 240 MiB headroom.
+-  {"Kernel RAM",        0x81000000, 0x3F000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
++  // iOSPlus10 laurel-sprout, LATE layout (laurel mu late/0101, scripts/laurel/mu-build.sh MU_RAM_LAYOUT=late): the fallback
++  // when the static "Kernel RAM" 0xE1000000-0x1C0000000 (mu 0101) kills Mu (a Qualcomm DXE that cannot use RAM above 4 GiB).
++  // Early UEFI allocations stay below 4 GiB, in "UEFI RAM" 0x81000000-0x90000000 (240 MiB, the highest conventional RAM
++  // until RamManagerDxe runs). The device pools (GPU 0xC0000000 + 512 MiB, modem 0xE0000000 + 16 MiB) stay reserved.
++  // RamManagerDxe adds the bank C hole 0xE1000000-0x1C0000000 late, as one run: the DarwinBoot window 0xE1004000 +
++  // 3264 MiB, UEFI's later allocations top-down from 0x1C0000000. NegroniBootMemoryDxe adds DT holes only below
++  // 0xE1000000 (dsc NEGRONIMEM_ADD_BELOW), so it does not add 0xE1000000-0x100000000 early. Works on any RAM size.
++  {"Pool RAM Guard",    0x80000000, 0x01000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
++  {"UEFI RAM",          0x81000000, 0x0F000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
++  {"Pool RAM",          0x90000000, 0x51000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
+ 
+   // Other Memory Regions
+   {"AOP_SS_MSG_RAM",    0x045F0000, 0x00007000, NoHob,  MMAP_IO, INITIALIZED, Conv,   NS_DEVICE},
+diff --git a/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc b/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc
+index 107c7480..071122c6 100644
+--- a/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc
++++ b/Platforms/Xiaomi/laurel_sproutPkg/laurel_sprout.dsc
+@@ -101,7 +101,11 @@
+     <BuildOptions>
+       *_*_*_CC_FLAGS = -DDARWINBOOT_MAX_WINDOW=0x120000000ULL -DDARWINBOOT_LOW4G_MIN=0x10000000ULL
+   }
+-  negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.inf
++  # iOSPlus10 laurel mu late/0101: no early DT hole at or above 0xE1000000 (RamManagerDxe adds the XNU window run late)
++  negroniPkg/Drivers/NegroniBootMemoryDxe/NegroniBootMemoryDxe.inf {
++    <BuildOptions>
++      *_*_*_CC_FLAGS = -DNEGRONIMEM_ADD_BELOW=0xE1000000ULL
++  }
+ 
+   #
+   # ACPI Tables

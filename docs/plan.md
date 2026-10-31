@@ -7,11 +7,13 @@ no PAC, needs zeta-style PAC lowering). Done: device facts (`scripts/device/info
 comparison. Next: owner sets phone-safety targets (active slot is `_b`), root + backup, live FDT, port the topaz shim.
 Details: `docs/laurel_sprout/port-plan.md`.
 RAM + screen surfaces + canvas (2026-11-01 05:00, area A, built, NOT BOOTED): kernel 2100 (XNU 3264 MiB at 0xE1004000 above the
-device pools, self-check, 768 MiB fallback, USB/UFS DMA below 4 GiB), 2101 (6 x 8 MiB contiguous screen-surface pool below 4 GiB;
-other surfaces from wired pages), 2102 (first-frame line), 2103 (native 720x1560 canvas at scale 2 by default); Mu 0101 ("Pool RAM"
+device pools, self-check, 768 MiB fallback, USB/UFS DMA below 4 GiB), 2101 (6 x 12 MiB contiguous screen-surface pool below 4 GiB;
+other surfaces from wired pages), 2103 (native 720x1560 canvas at scale 2 by default, first-frame self-report); Mu 0101 ("Pool RAM"
 0x80000000-0xE1000000 reserved: GPU pool 0xC0000000 + 512 MiB, modem pool 0xE0000000 + 16 MiB; "Kernel RAM" 0xE1000000-0x1C0000000)
-+ 0102 (DarwinBoot shrinks the window instead of "NO WINDOW"); mkadt `--dram auto`. Next: boot, read `LAUREL RAM:`, `LAUREL SPOOL:`,
-`LAUREL FB CANVAS:`, `LAUREL FB: first iOS frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
++ 0102 (DarwinBoot shrinks the window instead of "NO WINDOW") + 0103 (SMBIOS 64-bit only, DarwinBoot limits); late layout
+`MU_RAM_LAYOUT=late` as the fallback; mkadt `--dram auto`. Review fixes 05:15: low RAM used last (vm_himemory_mode), spool 6 x 12 MiB,
+2102 merged into 2103. Test = boot_b flash (no fastboot boot). Next: boot, read `LAUREL RAM:`, `LAUREL SPOOL:`,
+`LAUREL FB CANVAS:`, `LAUREL FB CANVAS: first frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
 Flashing (2026-10-31 23:58): `fastboot boot` is refused by this ABL; the shim image goes to `boot_b` with
 `scripts/bg.sh laurel-flash scripts/laurel/flash-boot.sh`. The script runs `fastboot reboot bootloader` first:
 a session entered with Power+VolDown has a broken ABL USB state (garbled commands, uploads stall at 16 MiB); after the

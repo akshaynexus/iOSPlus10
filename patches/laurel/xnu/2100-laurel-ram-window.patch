@@ -1,4 +1,4 @@
-laurel 2100: XNU gets 3264 MiB of the 6 GB Mi A3 (was 768 MiB). Memory map: 0x80000000-0xE0000000 device pools outside kernel RAM (Adreno GPU pool 0xC0000000 + 512 MiB, room below it), 0xE0000000-0xE1000000 TopazModem pool (16 MiB), 0xE1000000-0x1C0000000 Mu 'Kernel RAM' with the DarwinBoot window 0xE1004000..0x1AD004000 (DDR banks B and C touch; UEFI allocates top-down from 0x1C0000000 above it). Self-check before arm_vm_init (osfmk/arm64/laurel_ram.c): the window must lie inside one run of the ADT /chosen laurel-ram-banks, at most 4608 MiB (TOPAZ_4K BOOTSTRAP_TABLE_SIZE), and overlap no /chosen laurel-ram-reserved pool (a pool above the base caps it); else (or laurelram=0) XNU keeps the first 768 MiB as before. A window of 768 MiB or less (old ADT/Mu FD) is left alone. USB and UFS DMA blocks (kmem_alloc_contig) now stay below 4 GiB. One line at EARLY_BOOT, again at the first surface: 'LAUREL RAM: on: 3264 MiB at 0xe1004000..0x1ad004000 (banks 0x80000000..0x1c0000000; 495 MiB below 4 GiB)' or 'LAUREL RAM: off: <reason>; XNU keeps 768 MiB ...'. Needs patches/laurel/mu/0101 and mkadt.py --dram auto.
+laurel 2100: XNU gets 3264 MiB of the 6 GB Mi A3 (was 768 MiB). Memory map: 0x80000000-0xE0000000 device pools outside kernel RAM (Adreno GPU pool 0xC0000000 + 512 MiB, room below it), 0xE0000000-0xE1000000 TopazModem pool (16 MiB), 0xE1000000-0x1C0000000 Mu 'Kernel RAM' with the DarwinBoot window 0xE1004000..0x1AD004000 (DDR banks B and C touch; UEFI allocates top-down from 0x1C0000000 above it). Self-check before arm_vm_init (osfmk/arm64/laurel_ram.c): the window must lie inside one run of the ADT /chosen laurel-ram-banks, at most 4608 MiB (TOPAZ_4K BOOTSTRAP_TABLE_SIZE), and overlap no /chosen laurel-ram-reserved pool (a pool above the base caps it); else (or laurelram=0) XNU keeps the first 768 MiB as before. A window of 768 MiB or less (old ADT/Mu FD) is left alone. USB and UFS DMA blocks (kmem_alloc_contig) now stay below 4 GiB. One line at EARLY_BOOT, again at the first surface: 'LAUREL RAM: on: 3264 MiB at 0xe1004000..0x1ad004000 (banks 0x80000000..0x1c0000000; 495 MiB below 4 GiB)' or 'LAUREL RAM: off: <reason>; XNU keeps 768 MiB ...'. Needs patches/laurel/mu/0101 and mkadt.py --dram auto. Review fixes: when the window crosses 4 GiB, vm_himemory_mode = FALSE (pmap_startup fills the free queue from the top: general allocations use RAM above 4 GiB first, the RAM below 4 GiB stays for DMA/scanout); a window with less than 128 MiB below 4 GiB is off (768 MiB fallback); laurel_ram_free_below_4g() for the LAUREL SPOOL line; the 4608 MiB cap is the start.s bootstrap table budget (DarwinBoot 0102 and mkadt cap it too); the off line names the RAM below 4 GiB (768 MiB at 0xE1004000 = 495 below + 273 above).
 
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 3d3e0c8..6b30196 100644
@@ -54,10 +54,10 @@ index 42362c5..fa30ed9 100644
  	{
 diff --git a/osfmk/arm64/laurel_ram.c b/osfmk/arm64/laurel_ram.c
 new file mode 100644
-index 0000000..ed16b3e
+index 0000000..01b59ba
 --- /dev/null
 +++ b/osfmk/arm64/laurel_ram.c
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,266 @@
 +/*
 + * LAUREL RAM (patch 2100): XNU gets 3264 MiB of the 6 GB Mi A3 instead of 768 MiB, with a self-check
 + * and the old 768 MiB as fallback.
@@ -76,14 +76,29 @@ index 0000000..ed16b3e
 + * Before arm_vm_init this file checks the window. XNU manages all of it only when every check passes:
 + *   1. /chosen laurel-ram-banks (u64 base/size pairs, mkadt.py) exists, and the window is inside one run
 + *      of touching banks (B + C);
-+ *   2. the window is at most LAUREL_RAM_MAX: BOOTSTRAP_TABLE_SIZE of TOPAZ_4K (16 pages, pmap.h) covers
-+ *      the kernel + physical aperture + its 1 GiB slide up to 6 GiB of VA (arm_vm_init panics above);
++ *   2. XNU manages at most LAUREL_RAM_MAX. The real limit is start.s: its bootstrap tables (TOPAZ_4K
++ *      BOOTSTRAP_TABLE_SIZE = 16 pages, pmap.h) take 2 L1 + one L2 per GiB of V=P and of KVA mapping + 1 L2
++ *      for the splash framebuffer: 15 pages for 4608 MiB at the worst offset. start.s maps the whole
++ *      boot_args memSize before this check runs, so DarwinBoot (patches/laurel/mu/0102) and mkadt.py cap
++ *      the window at 4608 MiB too; the cap here only limits what XNU manages;
 + *   3. it overlaps no range of /chosen laurel-ram-reserved (u64 base/size pairs: the pools above); a range
-+ *      above the window base caps the window below it.
++ *      above the window base caps the window below it;
++ *   4. at least LAUREL_RAM_LOW_MIN of it is below 4 GiB (USB/UFS DMA, MDP scanout, flip buffers).
 + * On a failure, or with the kill switch laurelram=0, XNU manages only the first 768 MiB of the window
-+ * (the maxmem path of arm_vm_init: mem_size, max_mem and hw.memsize), as before this patch. A window of
-+ * 768 MiB or less (an old ADT or an old Mu FD) is left as it is. DarwinBoot may give a smaller window than
-+ * the ADT asks (patches/laurel/mu/0102 shrinks it when no UEFI run is big enough): the line says so.
++ * (the maxmem path of arm_vm_init: mem_size, max_mem and hw.memsize). That is the old size, not the old
++ * place: at 0xE1004000 it is 495 MiB below 4 GiB + 273 MiB above. A window of 768 MiB or less (an old ADT or
++ * an old Mu FD) is left as it is. DarwinBoot may give a smaller window than the ADT asks (0102 shrinks it
++ * when no UEFI run is big enough): the line says so.
++ *
++ * Page order: when the window crosses 4 GiB, vm_himemory_mode = FALSE (vm_resident.c pmap_startup): the
++ * free queue is filled from the top, so general allocations (zones, user pages) use RAM above 4 GiB first
++ * and the 495 MiB below 4 GiB stay free for the buffers that need them (the screen-surface pool of 2101
++ * reports what is left: "below-4G free N MiB"). Only the boot allocations of pmap_steal (vm_pages array,
++ * page tables) come from just above the kernel, below 4 GiB.
++ *
++ * Early alias [I]: until arm_vm_init, start.s maps the whole boot window cacheable. A pool inside it (only
++ * with an old Mu FD and a new ADT, where 3. caps the window) has a cacheable alias for that short time;
++ * nothing touches it then. The final physical aperture ends at physBase + mem_size.
 + *
 + * DMA below 4 GiB: the window now reaches above 4 GiB (495 MiB of it is below). The display (MDP,
 + * SweetFramebuffer/SweetSurface) and the GPU already ask for memory below 4 GiB with a physical mask; the
@@ -91,8 +106,9 @@ index 0000000..ed16b3e
 + * max_pnum = 4 GiB as well (both are allocated early, while RAM below 4 GiB is free).
 + *
 + * One line at EARLY_BOOT (console), repeated by laurel_ram_summary() for the USB log:
-+ *   "LAUREL RAM: on: 3264 MiB at 0xe1004000..0x1ad004000 (banks 0x80000000..0x1c0000000; 495 MiB below 4 GiB)"
-+ *   "LAUREL RAM: off: <reason>; XNU keeps 768 MiB of the 3264 MiB window at 0xe1004000"
++ *   "LAUREL RAM: on: 3264 MiB at 0xe1004000..0x1ad004000 (banks 0x80000000..0x1c0000000; 495 MiB below 4 GiB,
++ *    used last)"
++ *   "LAUREL RAM: off: <reason>; XNU keeps the first 768 MiB of the 3264 MiB window at 0xe1004000 (495 MiB below 4 GiB)"
 + */
 +
 +#include <pexpert/arm64/board_config.h>
@@ -106,12 +122,16 @@ index 0000000..ed16b3e
 +#include <pexpert/pexpert.h>
 +#include <pexpert/arm64/boot.h>
 +#include <pexpert/device_tree.h>
++#include <vm/vm_page.h>
 +
 +uint64_t laurel_ram_limit(const boot_args *args, uint64_t memory_size);
 +const char *laurel_ram_summary(void);
++uint64_t laurel_ram_free_below_4g(void);
++extern unsigned int vm_pages_count;     /* vm_resident.c */
 +
 +#define LAUREL_RAM_FALLBACK     (768ULL << 20)          /* what XNU managed before 2100 */
-+#define LAUREL_RAM_MAX          (4608ULL << 20)         /* BOOTSTRAP_TABLE_SIZE limit, see above */
++#define LAUREL_RAM_MAX          (4608ULL << 20)         /* start.s bootstrap table budget, see above */
++#define LAUREL_RAM_LOW_MIN      (128ULL << 20)          /* RAM below 4 GiB the window must hold */
 +#define LAUREL_RAM_4G           (1ULL << 32)
 +#define LAUREL_GPU_POOL         0x90000000ULL           /* topaz TopazAdreno.cpp GPU_POOL_BASE (gpu=1, no gpu_midmem) */
 +#define LAUREL_GPU_POOL_SIZE    0x40000000ULL
@@ -225,14 +245,24 @@ index 0000000..ed16b3e
 +			}
 +		}
 +	}
++	if (why[0] == '\0') {
++		uint64_t m = (limit != 0 && limit < size) ? limit : size;
++		uint64_t lo = base < LAUREL_RAM_4G ? ((base + m < LAUREL_RAM_4G ? base + m : LAUREL_RAM_4G) - base) : 0;
++		if (lo < LAUREL_RAM_LOW_MIN) {
++			snprintf(why, sizeof(why), "only %llu MiB of the window 0x%llx..0x%llx is below 4 GiB (need %llu)",
++			    lo >> 20, base, base + m, LAUREL_RAM_LOW_MIN >> 20);
++		}
++	}
 +
 +	if (why[0] != '\0') {
 +		limit = LAUREL_RAM_FALLBACK;
 +		if (memory_size != 0 && memory_size < limit) {
 +			limit = memory_size;
 +		}
++		uint64_t lo = base < LAUREL_RAM_4G ? ((base + limit < LAUREL_RAM_4G ? base + limit : LAUREL_RAM_4G) - base) : 0;
 +		snprintf(laurel_ram_line, sizeof(laurel_ram_line),
-+		    "LAUREL RAM: off: %s; XNU keeps %llu MiB of the %llu MiB window at 0x%llx", why, limit >> 20, size >> 20, base);
++		    "LAUREL RAM: off: %s; XNU keeps the first %llu MiB of the %llu MiB window at 0x%llx (%llu MiB below 4 GiB)",
++		    why, limit >> 20, size >> 20, base, lo >> 20);
 +		return limit;
 +	}
 +
@@ -249,11 +279,33 @@ index 0000000..ed16b3e
 +	if (laurel_ram_dt_u64(chosen, "darwinboot-memory-size", 0, &asked) && asked > size && note[0] == '\0') {
 +		snprintf(note, sizeof(note), "; DarwinBoot gave %llu of the %llu MiB the ADT asks", size >> 20, asked >> 20);
 +	}
++	if (base < LAUREL_RAM_4G && base + managed > LAUREL_RAM_4G) {
++		vm_himemory_mode = FALSE;       /* pmap_startup fills the free queue from the top */
++	}
 +	snprintf(laurel_ram_line, sizeof(laurel_ram_line),
-+	    "LAUREL RAM: on: %llu MiB at 0x%llx..0x%llx (banks 0x%llx..0x%llx; %llu MiB below 4 GiB)%s%s",
-+	    managed >> 20, base, base + managed, run0, run1, low >> 20, note,
++	    "LAUREL RAM: on: %llu MiB at 0x%llx..0x%llx (banks 0x%llx..0x%llx; %llu MiB below 4 GiB%s)%s%s",
++	    managed >> 20, base, base + managed, run0, run1, low >> 20,
++	    vm_himemory_mode ? "" : ", used last", note,
 +	    (memory_size != 0 && memory_size < size) ? "; maxmem limits it" : "");
 +	return limit;
++}
++
++/* Free pages below 4 GiB now (a snapshot without the free-queue lock; for the LAUREL SPOOL line). */
++uint64_t
++laurel_ram_free_below_4g(void)
++{
++	uint64_t n = 0;
++
++	for (unsigned int i = 0; i < vm_pages_count; i++) {
++		vm_page_t m = &vm_pages[i];
++		if (VM_PAGE_GET_PHYS_PAGE(m) >= (ppnum_t)atop_64(LAUREL_RAM_4G)) {
++			break;                  /* vm_pages[] is in physical order */
++		}
++		if (m->vmp_q_state == VM_PAGE_ON_FREE_Q) {
++			n++;
++		}
++	}
++	return ptoa_64(n);
 +}
 +
 +const char *

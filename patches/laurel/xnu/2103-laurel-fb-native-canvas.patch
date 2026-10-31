@@ -1,7 +1,7 @@
-laurel 2103: native canvas on the Mi A3. AppleCLCD presented the topaz iPhone X canvas 1125x2436 unless sweetfb_native=1 (not in the UEFI boot-args), so the 720x1560 panel showed only the centre 64 % of the UI (status bar, dock, home bar cut off) and the size IOMFB reported did not match the ADT canvas (disp0 canvas-width/height 720x1560). Now native is the default when the ADT says so: disp0 canvas = the panel and /chosen display-scale (2) divides both sides (360x780 points). Kill switch sweetfb_native=0 (iPhone X canvas); sweetfb_native=1 forces native as before. The layout (fLogicalW/H, fOffX/Y) is set before the rest of AppleCLCD::start, so the touch map hook of laurel 2200 (sweet_hid_set_geometry) gets the final layout. Line: 'LAUREL FB CANVAS: on: native 720x1560 at display-scale 2 (360x780 points)' or 'LAUREL FB CANVAS: off: <reason>; iPhone X canvas 1125x2436'. [U] iOS has no status bar layout for 360x780 points (topaz 0061 saw the red rdar:45025538 bar at 360x800).
+laurel 2103: native canvas on the Mi A3. AppleCLCD presented the topaz iPhone X canvas 1125x2436 unless sweetfb_native=1 (not in the UEFI boot-args), so the 720x1560 panel showed only the centre 64 % of the UI (status bar, dock, home bar cut off) and the size IOMFB reported did not match the ADT canvas (disp0 canvas-width/height 720x1560). Now native is the default when the ADT says so: disp0 canvas = the panel and /chosen display-scale (2) divides both sides (360x780 points). Kill switch sweetfb_native=0 (iPhone X canvas); sweetfb_native=1 forces native as before. The layout (fLogicalW/H, fOffX/Y) is set before the rest of AppleCLCD::start, so the touch map hook of laurel 2200 (sweet_hid_set_geometry) gets the final layout. Line: 'LAUREL FB CANVAS: on: native 720x1560 at display-scale 2 (360x780 points)' or 'LAUREL FB CANVAS: off: <reason>; iPhone X canvas 1125x2436'. [U] iOS has no status bar layout for 360x780 points (topaz 0061 saw the red rdar:45025538 bar at 360x800). Self-report of this feature (was laurel 2102): 'LAUREL FB CANVAS: first frame on the panel: swap N, L layer(s), surface S WxH fmt F, canvas WxH, direct|copy path, T s after boot' at the first swap with a layer.
 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 8da3eb2..7bd0099 100644
+index 9f802ad..510fec9 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -97,6 +97,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -12,7 +12,7 @@ index 8da3eb2..7bd0099 100644
  #include <IOKit/IOUserClient.h>
  #include <libkern/c++/OSCollectionIterator.h>
  #include <kern/thread_call.h>
-@@ -445,6 +446,59 @@ laurel_fb_publish_pipe_reqs(IOService *fb)
+@@ -445,6 +446,63 @@ laurel_fb_publish_pipe_reqs(IOService *fb)
  	    LAUREL_FB_PLANE_ALIGN, LAUREL_FB_STRIDE_H, LAUREL_FB_STRIDE_V);
  }
  
@@ -25,6 +25,10 @@ index 8da3eb2..7bd0099 100644
 + * canvas, as topaz 0114); sweetfb_native=1 forces the panel size. One line:
 + *   "LAUREL FB CANVAS: on: native 720x1560 at display-scale 2 (360x780 points)"
 + *   "LAUREL FB CANVAS: off: <reason>; iPhone X canvas 1125x2436"
++ * and, as its self-report, one line when the first iOS frame with a layer reaches the panel on that canvas:
++ *   "LAUREL FB CANVAS: first frame on the panel: swap N, L layer(s), surface S WxH fmt F, canvas WxH,
++ *    direct|copy path, T s after boot" (direct = a scanout surface copied to the back buffer and flipped,
++ *    copy = layers composed into it)
 + * [U] iOS has no status bar layout for 360x780 points (topaz 0061 saw the red "rdar:45025538" bar at
 + * 360x800); everything else of SpringBoard worked there.
 + */
@@ -72,7 +76,7 @@ index 8da3eb2..7bd0099 100644
  bool
  AppleCLCD::start(IOService *provider)
  {
-@@ -466,8 +520,7 @@ AppleCLCD::start(IOService *provider)
+@@ -466,8 +524,7 @@ AppleCLCD::start(IOService *provider)
  		IOLog("SWEET FB: no boot framebuffer\n");
  		return false;
  	}
@@ -82,3 +86,56 @@ index 8da3eb2..7bd0099 100644
  	fLogicalW = fWidth;
  	fLogicalH = fHeight;
  	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+@@ -1447,6 +1504,36 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	return ok;
+ }
+ 
++/* laurel 2103: self-report of the canvas (see laurel_fb_native) */
++static void
++laurel_fb_first_frame(const uint8_t *rec, const char *path, uint32_t cw, uint32_t chh)
++{
++	static bool told;
++	uint32_t mask = get32(rec, 0x104), layers = 0, sid = 0;
++
++	if (told) {
++		return;
++	}
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		uint32_t id = get32(rec, 0x54 + 4 * i);
++		if ((mask & (1u << i)) && id != 0) {
++			layers++;
++			sid = sid != 0 ? sid : id;
++		}
++	}
++	if (layers == 0) {
++		return;                 /* (a swap without a layer shows nothing of iOS) */
++	}
++	told = true;
++	SweetSurface *s = sweet_surface_copy(sid);
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	IOLog("LAUREL FB CANVAS: first frame on the panel: swap %u, %u layer(s), surface %u %ux%u fmt 0x%x, canvas %ux%u, %s path, %llu s after boot\n",
++	    get32(rec, 0x50), layers, sid, s ? s->width : 0, s ? s->height : 0, s ? s->pixelFormat : 0, cw, chh, path,
++	    ns / 1000000000ull);
++	OSSafeReleaseNULL(s);
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -1464,6 +1551,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 	fConsShown = false;
+ 	if (directPresent(rec)) {
++		laurel_fb_first_frame(rec, "direct", fLogicalW, fLogicalH);     /* laurel 2103 */
+ 		if (!fConsolePaused) {
+ 			int quiet = 0;
+ 			fConsolePaused = true;
+@@ -1576,6 +1664,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fFlip[0] != NULL) {
+ 		flipBack();
+ 	}
++	laurel_fb_first_frame(rec, "copy", fLogicalW, fLogicalH);               /* laurel 2103 */
+ }
+ 
+ bool

@@ -3782,3 +3782,17 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   status bar layout (topaz 0061: red rdar:45025538 bar at 360x800); kill switch `sweetfb_native=0`.
 - Built (worktree branch t3/laurel-kernel-ram-surface-pool): see the commit; image `out/laurel/uefi/laurel-uefi-boot.img` of that
   worktree. Expected lines: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
+- Review fixes (2026-11-01 05:15, area A review ACCEPT-WITH-FIXES): (M1) [V code vm_resident.c] vm_himemory_mode TRUE releases the
+  pages in ascending order to the tail of the free queue and grabs take the head: boot RAM came from just above the kernel, i.e.
+  from the 495 MiB below 4 GiB. 2100 sets it FALSE when the window crosses 4 GiB (descending fill); 2101 prints `below-4G free N
+  MiB`. (M2) [V code] SmbiosDxe allocates the SMBIOS 32-bit table `AllocateMaxAddress 0xFFFFFFFF` (RtData; the memory-type bin is
+  at the top of RAM, above 4 GiB, so it cannot serve it): it lands just below 4 GiB inside "Kernel RAM" and splits the window run.
+  Mu 0103: `PcdSmbiosEntryPointProvideMethod 0x2` (64-bit entry point only; SMBIOS 3.8). DarwinBoot 0102 uses only runs that
+  start below 4 GiB with >= 256 MiB there and caps at 4608 MiB (laurel dsc defines; negroni unchanged); 2100 needs >= 128 MiB below
+  4 GiB. Qualcomm binaries with AllocateMaxAddress below 4 GiB are not known [U]: `WINDOW ... OF ...` on the screen would show such
+  a split. (M3) late layout `MU_RAM_LAYOUT=late` (uefi-boot.md "Late layout"); [V code] NegroniBootMemoryDxe would add 0xE1000000-
+  0x100000000 early as a DT hole below 4 GiB, so the late patch limits it to 0xE1000000 (NEGRONIMEM_ADD_BELOW). (M4) 2102 merged
+  into 2103 as its self-report; frames with 0 layers are not reported. (m1) spool 6 x 12 MiB, full pool -> wired pages at once.
+  (m9) mu-build resets the patched files before the DarwinBoot submodule update. The 0x80000000-0xC0000000 room stays free; area F
+  shares area E's pool allocator in 0xE0000000-0xE1000000 (coordinator).
+- This ABL refuses `fastboot boot`: every test is a boot_b flash. Keep the previous image to flash back.

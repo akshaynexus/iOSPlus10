@@ -22,7 +22,8 @@ UFS, buttons, D22AP /product) and changes what differs on the Mi A3:
     in the first UEFI conventional-memory run that fits: Mu "Kernel RAM", patches/laurel/mu/0001 + 0101);
     firmware-version "laurel-uefi".
   * --dram auto --mu-fd FD (UEFI path, kernel patch 2100): the window size from the Mu FD's "Kernel RAM" entry
-    (PrePi memory map table, uncompressed in the FD). Mu 0101 ("Kernel RAM" 0xE1000000 + 0xDF000000, to 0x1C0000000):
+    (PrePi memory map table, uncompressed in the FD); a late-layout FD (mu late/0101: "UEFI RAM" + "Pool RAM", no
+    "Kernel RAM") gives the bank run above "Pool RAM", which RamManagerDxe adds late. Mu 0101 ("Kernel RAM" 0xE1000000 + 0xDF000000, to 0x1C0000000):
     3264 MiB (window 0xE1004000..0x1AD004000; the largest 64 MiB multiple that leaves 256 MiB for UEFI, at most 4608 MiB,
     the TOPAZ_4K bootstrap page-table limit). An older FD (Kernel RAM to 0xC0000000): 768 MiB, as before, with a
     "LAUREL RAM: off:" line.
@@ -165,19 +166,37 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
     return root
 
 
-def mu_kernel_ram(fd_path):
-    """(base, size) of the Mu memory map entry "Kernel RAM" in an FD (PrePi table: CHAR8 Name[32], UINT64 Address,
-    UINT64 Length, ...; stored uncompressed), or None. Same reader as scripts/ios16/adt-extra.py."""
+def mu_entry(fd_path, name):
+    """(base, size) of a Mu memory map entry in an FD (PrePi table: CHAR8 Name[32], UINT64 Address, UINT64 Length,
+    ...; stored uncompressed), or None. Same reader as scripts/ios16/adt-extra.py."""
     try:
         with open(fd_path, 'rb') as f:
             d = f.read()
     except OSError:
         return None
-    i = d.find(b'Kernel RAM'.ljust(32, b'\0'))
+    i = d.find(name.encode().ljust(32, b'\0'))
     if i < 0 or i + 48 > len(d):
         return None
     base, size = struct.unpack_from('<QQ', d, i + 32)
     return (base, size) if base and size else None
+
+
+def mu_kernel_ram(fd_path):
+    """(base, size, layout) of the RAM DarwinBoot will find: the static "Kernel RAM" entry (mu 0101), or for the late
+    layout (mu late/0101: "UEFI RAM" + "Pool RAM", no "Kernel RAM") the bank run above "Pool RAM" that RamManagerDxe
+    adds late. None when the FD has neither."""
+    k = mu_entry(fd_path, 'Kernel RAM')
+    if k is not None:
+        return k + ('static',)
+    pool, uefi = mu_entry(fd_path, 'Pool RAM'), mu_entry(fd_path, 'UEFI RAM')
+    if pool is None or uefi is None:
+        return None
+    base = pool[0] + pool[1]
+    end = next((b + s for b, s in RAM_BANKS if b <= base < b + s), None)
+    for b, s in RAM_BANKS:   # touching banks
+        if end is not None and b == end:
+            end = b + s
+    return (base, end - base, 'late') if end else None
 
 
 def auto_dram(fd_path):
@@ -185,7 +204,7 @@ def auto_dram(fd_path):
     mu = mu_kernel_ram(fd_path)
     if mu is None:
         return (0x81000000, RAM_FALLBACK), f'LAUREL RAM: off: no Mu "Kernel RAM" entry in {fd_path}; ADT window 768 MiB'
-    base, size = mu
+    base, size, layout = mu
     start = ((base + DARWINBOOT_BLOCK - 1) & ~(DARWINBOOT_BLOCK - 1)) + KERNEL_BLOCK_OFFSET
     room = base + size - start - UEFI_HEADROOM
     run = next(((b, b + s) for b, s in RAM_BANKS if b <= start < b + s), None)
@@ -196,9 +215,9 @@ def auto_dram(fd_path):
     win = min(RAM_MAX, max(room, 0) // RAM_STEP * RAM_STEP)
     clash = next(((b, b + s) for b, s in RAM_RESERVED if b < start + win and start < b + s), None)
     if win > RAM_FALLBACK and run is not None and start + win <= run[1] and clash is None:
-        return (base, win), (f'LAUREL RAM: on: {win >> 20} MiB window 0x{start:x}..0x{start + win:x} in Mu '
-                             f'"Kernel RAM" 0x{base:x}..0x{base + size:x} ({(base + size - start - win) >> 20} MiB '
-                             f'left for UEFI)')
+        src = ('"Kernel RAM"' if layout == 'static' else 'the run RamManagerDxe adds late (late layout)')
+        return (base, win), (f'LAUREL RAM: on: {win >> 20} MiB window 0x{start:x}..0x{start + win:x} in Mu {src} '
+                             f'0x{base:x}..0x{base + size:x} ({(base + size - start - win) >> 20} MiB left for UEFI)')
     why = (f'window 0x{start:x}..0x{start + win:x} overlaps the pool 0x{clash[0]:x}..0x{clash[1]:x}' if clash else
            f'Mu FD "Kernel RAM" 0x{base:x}..0x{base + size:x} has no room for more than {RAM_FALLBACK >> 20} MiB + '
            f'{UEFI_HEADROOM >> 20} MiB for UEFI (FD from before patches/laurel/mu/0101: make laurel-mu)')
