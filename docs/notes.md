@@ -3782,3 +3782,44 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   status bar layout (topaz 0061: red rdar:45025538 bar at 360x800); kill switch `sweetfb_native=0`.
 - Built (worktree branch t3/laurel-kernel-ram-surface-pool): see the commit; image `out/laurel/uefi/laurel-uefi-boot.img` of that
   worktree. Expected lines: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
+## Mi A3: touch at 720x1560, GT9883 path, keys check, AMOLED brightness + panel power; patches 2200-2202 (2026-11-01 04:40, area C, build only)
+- [V log 04:01, image 01b6319] Touches arrived (`SWEET HID: touch 0 down at 397,1247`, x up to 564) after topaz's FT5452 scale
+  `(raw*4 + frac)/5`: raw y = 1559, raw x <= 705. So the Mi A3 FT3518 reports panel pixels 0..719 x 0..1559, as the DT says
+  (`focaltech,display-coords = <0 0 720 1560>`). Byte 4 of a FocalTech record is the pressure on FT3518 (focaltech_core.c
+  FTS_TOUCH_PRE_POS), not topaz's 2-bit fractions. Chip id reads 54:52 = the F9S driver's FTS_CHIP_TYPE_MAPPING
+  {0x81, 0x54, 0x52, ...} (focaltech_common.h:58). The DT maxima are inclusive (input_set_abs_params, focaltech_core.c:904).
+- [V code] SweetHID.cpp normalized with topaz's 1080x2400 numbers while SweetFramebuffer.cpp presents the Mi A3 as 1125x2436 with
+  the 720x1560 panel at offset 200,438 (`presented as 1125x2436` in the 03:58 log): touches landed at the wrong place. Fix: the FB
+  reports its layout (`sweet_hid_set_geometry(panel, logical, off, num/den)`, called at the end of AppleCLCD::start); a later
+  canvas or scale change (native 720x1560 with ADT display-scale 2, or an apollo-0150-style fit) only has to pass its numbers.
+- [V DT/driver] Goodix GT9883 (second touch vendor, 0x5d, goodix_gtx8 IC_TYPE_NORMANDY): event block 0x4100 = [0] status (0x80
+  touch, 0x40 request), [1] count (low nibble) | key (bit 4), records of 8 bytes {id low nibble (>= 0x80 pen), x LE16, y LE16, w},
+  u8 sum of bytes 0..n*8+3 = 0, handshake write 0 to 0x4100. Version block 0x452c (PID ASCII inside). Not tested on hardware (the
+  owner's phone has the FT3518).
+- [V pinctrl-trinket.c / pinctrl-msm.c] TLMM interrupt config of a GPIO at tile + n*0x1000 + 8: enable bit 0, polarity 1, detection
+  2-3 (2 = falling), raw-status-enable 4, target 5-7 (3 = APPS); status at +0xc bit 0, cleared by writing 0. With raw status on and
+  enable off the edge latches without a summary interrupt: a poll thread can test one register instead of an I2C read.
+- [V log 03:58] Keys: arbiter 0x50010000, PON APID 112 (PPID 0x008), GPIO 5 APID 124 (PPID 0x0c4), GPIO 5 en=0x80 input; power and
+  volume-down events seen. The topaz key code is right for trinket; volume-up not pressed in any log yet.
+- [V DT] Panels: Samsung s6e8fco (h 720+350+294+40 = 1404, pulse 40; bl-max 2047) and GVO r692a9 (720+252+252+136 = 1360, pulse 136;
+  bl-max 4095); both bl-min 4, default 268, brightness-max-level 2047, DCS 0x51 {DBV>>8 & 0xf, DBV & 0xff} (F9S path, the
+  bl-inverted-dbv byte swap is only in the non-F9S branch), 0x53 0x20 = BCTRL on, 0x53 0x28 = + dimming. Off: 0x28 (Samsung 20 ms,
+  GVO 50 ms), 0x10 (120 / 20 ms); on: 0x11 (50 / 100 ms), 0x29. INTF_1 HSYNC_CTL = (htotal << 16) | pulse tells which panel ABL lit.
+- [V code] Linux sets COMMAND_MODE_DMA_CTRL bit 28 (embedded mode) on every command; topaz did not (ABL's LK sets 0x14000000 at init,
+  so it was likely already set). 2201 sets it.
+- Patches (build only, NOT BOOTED; revised after review 2026-11-01 05:00): 2200 touch (FT3518 / GT9883 at 720x1560, raw 0..720 x
+  0..1560 inclusive and clamped; FocalTech keeps the DT grid; GT9883 inverted x2x/y2y and moves to 1080x2400 only after 5 values past
+  1.1x; TLMM edge latch with a self-check: off after 3 touches found with no latched edge), 2201 brightness + panel power (panel from
+  INTF_1, DBV range, self-check = default level through the command DMA; AppleARMBacklight only after RedwoodGPU appears (180 s wait),
+  else CPU renderer = IOMFBBrightnessLevel only; once the slider is used IOMFBBrightnessLevel is ignored; level >= 4 while on;
+  serialized power changes: fade out before fPowerOff, 0x28/0x10 with per-panel delays, wake 0x11/120 ms/0x29/0x53 0x20/one frame
+  with one retry (twice not done = feature off), fade in), 2202 keys summary line. `scripts/laurel/uefi-image.sh` no longer passes
+  `sweetfb_stayon=1` (a topaz boot-arg that ignores display-off requests; lock now turns the panel off).
+- Lines to check on the next boot: `LAUREL TOUCH: on: Focaltech FT3518 (54:52) 720x1560 -> 720x1560, IRQ GPIO 88 falling edge latched
+  ...`, `LAUREL TOUCH: display map: panel 720x1560 at 200,438 of 1125x2436 (scale 1/1)`, `LAUREL KEYS: on: ...`,
+  `LAUREL BACKLIGHT: on: DCS max 2047 (Samsung s6e8fco: INTF1 hsync 0x57c0028) ...` (0x57c = 1404, 0x28 = 40), then within 180 s
+  `LAUREL BACKLIGHT: on: ... AppleARMBacklight published (RedwoodGPU up ...)` or `... AppleARMBacklight off: CPU renderer (digital
+  dimming ...)`, `LAUREL BACKLIGHT: first IOMFBBrightnessLevel ...` / `first AppleARMBacklight brightness ...`, `SWEET FB: panel
+  display off, sleep in: done` on lock, `SWEET FB: panel sleep out, display on: done` on wake.
+- Why AppleARMBacklight waits for the GPU: topaz 0110 made it opt-in because CoreBrightness then ran digital dimming that the CPU
+  renderer could not afford (<1 fps). 430 nits is an estimate [I]: no luminance value in the DT or drivers.
