@@ -20,7 +20,7 @@ UniXNU-pong        https://github.com/Chengdong-Yu/UniXNU-pong.git    ab74f07532
 ios-sailfish       https://github.com/joranv1/ios-sailfish.git        6f27e41ff249f2680540ebe8ee5ab982c5e641c9
 bergamota          https://github.com/ry-diffusion/bergamota.git      0826e48c3d3f4bd9b0ab7d5af82ed92dfaeec425 develop
 hackios-xnu-kernel https://github.com/oosexgang/hackios-xnu-kernel.git d82c64a3a31cd27a0a0afbf6e213e467e44b1b4c main
-ios-apollo         https://github.com/aTechGeekDev/ios-apollo.git     1c1a199c4f2fcf3484a58a5e8248caffdf14e45e main
+ios-apollo         https://github.com/aTechGeekDev/ios-apollo.git     c0b4400685fb8e23dcb28a1ec2dba4bc7343fe3a main
 ios-s9             https://github.com/syncmodz/ios-s9.git             7b72f7c0db34fc396498d71bb7e1af90d6f899f3
 Chlorophyll        https://github.com/ry-diffusion/Chlorophyll.git    787338fc7c297f54e2000bca02f4fa36f1154c5a
 ios-spes           https://github.com/AdyaGMD/ios-spes.git            2cd45c4fb30c9edd3ebc45321d41fce24ad8e0ab spes
