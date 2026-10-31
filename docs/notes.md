@@ -3741,3 +3741,16 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   config 0x1c0a000; v5 layout as topaz) + a lock-free PON lane. Self-check line `LAUREL REBOOT: PON reason on: subtype ..`.
   [I] SweetBattery may now read the PMIC too (its "static fallback" came from the topaz SPMI bases). Built 04:05 (219 patches,
   0 LSE), image rebuilt (kernels 2015 late re-enable + 2016 + 2017 + 2018). NOT BOOTED.
+- [V boot 03:52, image b50f1f5 = 2017] No panic in 5 min: `SWEET TOUCH: selected Focaltech 54:52, 1080x2400, poll=10ms` (an FT
+  chip answered at 0x38; the 1080x2400 is topaz's panel size: touch scaling for 720x1560 is open), SpringBoard, bluetoothd,
+  fairplayd run, INTF1 317 frames / 5 s. **iOS 16 userland runs on the Mi A3 (UEFI path)**; the panel keeps showing the kernel
+  console (no GPU: `SWEET FB: empty IOAcceleratorES`, nothing draws over the console; the power key toggles the display and
+  repaints it). Log: `logs/laurel-boot-20261101-035240.log`.
+- [V boot 03:59:44, image 01b6319 = 2018, photo + `logs/laurel-boot-20261101-035850.log`] `SWEET BATTERY: SPMI arb=0x50010000
+  APIDs=256, observer reads; PON APID 112 rw lane mapped`, `LAUREL REBOOT: PON reason on: subtype 0x04 (shift 1) SOFT_RB_SPARE 0x00
+  PS_HOLD_RST_CTL 0x01`, 8/8 CPUs. **`op10tool ctl bootloader` now lands in the ABL fastboot in 5 s** (boot-test step 4 at 04:05:00,
+  `product: laurel_sprout`): the flash loop needs no buttons any more. `SWEET BATTERY: static fallback` still (its PMIC reads fail
+  even with the right arbiter: next is the PM6125 battery/charger peripheral addresses).
+- Open after this session: (1) UI on the panel (no GPU: a software compositor path or metal2vulkan), (2) touch coordinates
+  720x1560 (driver assumes 1080x2400), (3) battery SPMI reads, (4) the early kernel lines are not in the live USB log (raw frames go
+  out before the host interface is up; `ctl log` resends only the last 64 KiB): keep the ring from byte 0 until the host asks once.

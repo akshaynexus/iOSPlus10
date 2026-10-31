@@ -530,3 +530,11 @@ Next: panel photo of boot 03:14 (`LAUREL GIC: on|off ...`, `timer service:`). `o
 fault, read `logs/laurel-boot-*.log` if the ECM comes up. `off`: the enable is refused from NS on this frame; options: (a) use the
 frame/INTID Mu used (PPI 18 physical timer works for Mu on the same core?), (b) PSCI hand-off to Gold 0x100 + `mkadt --boot gold`
 as the shim did, (c) check IIDR/TYPER of the matched frame (a zero frame = wrong frame). Then the secondary start under Mu.
+
+## Mi A3 (laurel_sprout) status 2026-11-01 04:10 [V]
+
+- UEFI chain (ABL -> Mu-Silicium -> UniXNU -> DarwinBoot -> XNU) boots iOS 16 userland to SpringBoard on the Mi A3; the kernel
+  hands the boot from Silver 0x0 to Gold 0x100 with PSCI CPU_ON at its entry (patch 2016); all 8 cores up; USB CDC-ECM log and
+  commands work; `ctl bootloader` reaches the ABL fastboot without buttons (2018). Details: docs/laurel_sprout/uefi-boot.md,
+  notes.md sections of 2026-11-01 03:20-04:10.
+- Next: UI on the panel (no GPU), touch scaling to 720x1560, battery SPMI reads, full early log over USB.
