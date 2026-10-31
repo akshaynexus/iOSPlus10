@@ -26,6 +26,13 @@ Chlorophyll        https://github.com/ry-diffusion/Chlorophyll.git    787338fc7c
 ios-spes           https://github.com/AdyaGMD/ios-spes.git            2cd45c4fb30c9edd3ebc45321d41fce24ad8e0ab spes
 owl                https://github.com/seemoo-lab/owl.git              0ee3263f944ea721c355f826aa90d636d012a512 master
 opendrop           https://github.com/seemoo-lab/opendrop.git         11fe7ba7861093b302bc0637e8cb10adf2d29337 master
+ios-topaz          https://github.com/MakrSas/ios-topaz.git           e4772911e116ab4ab6c4ac1f38e6106fefe8b483 topaz
+Mu-Silicium        https://github.com/Project-Silicium/Mu-Silicium.git 4bd8ae83bf37de41777f19e0777db70f59383a6d main
+laurel-kernel-oss  https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git d3766fc8cda2d96de2850faa9ce58e5a37ea9f9c laurel-r-oss
+laurel-kernel-los  https://github.com/LineageOS/android_kernel_xiaomi_sm6125.git 8aaa002bfb7ba1cac2c02dbb42ae0259ef2e47ba lineage-24.0
+laurel-device-los  https://github.com/LineageOS/android_device_xiaomi_laurel_sprout.git d389daebe22c2713b09742ab7153535c421ebdeb lineage-24.0
+sm6125-common-los  https://github.com/LineageOS/android_device_xiaomi_sm6125-common.git 0e2b2bbfbc218d73a1f9fc17cfb3d82401f06ad9 lineage-24.0
+laurel-mainline    https://github.com/laurel-sprout-mainline/laurel_sprout_mainline.git 2cb8fd07918d6dd07180796da5b75cb491400df9 mainline-6.18-split
 '
 
 rows() { printf '%s\n' "$TABLE" | sed '/^[[:space:]]*$/d'; }

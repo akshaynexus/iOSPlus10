@@ -39,3 +39,12 @@ skills/
 external/ios-spes/
 external/owl/
 external/opendrop/
+# laurel_sprout (Mi A3) references
+external/ios-topaz/
+external/Mu-Silicium/
+external/laurel-kernel-oss/
+external/laurel-kernel-los/
+external/laurel-device-los/
+external/sm6125-common-los/
+external/laurel-mainline/
+external/*.partial/

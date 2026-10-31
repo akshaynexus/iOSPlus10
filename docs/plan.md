@@ -1,5 +1,12 @@
 # Plan and status
 
+## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+Target: Xiaomi Mi A3 (`laurel_sprout`, SM6125, ARMv8.0, no PAC, Adreno 610). iOS 16 first, iOS 26 later (research:
+no PAC, needs zeta-style PAC lowering). Done: device facts (`scripts/device/info.sh`), 7 pinned reference trees
+(ios-topaz, Mu-Silicium, MiCode `laurel-r-oss`, Lineage kernel/device/common, mainline), port plan with the topaz
+comparison. Next: owner sets phone-safety targets (active slot is `_b`), root + backup, live FDT, port the topaz shim.
+Details: `docs/laurel_sprout/port-plan.md`.
+
 Status date: 2026-10-27 (12:15).
 
 ## Priorities (2026-10-27 20:55, owner)

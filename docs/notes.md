@@ -3395,3 +3395,12 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - 12377 API facts: `kmem_alloc`/`KMA_*` in `vm/vm_kern_xnu.h`; `struct vm_shared_region` in
   `vm/vm_shared_region_xnu.h`; no `vm_map_lock_read`/`vm_map_lookup_entry` (VM map range locks); `pid_hibernate`
   in `kern_proc.c`; `pset->primary_map` only with `CONFIG_SCHED_SMT`; the realtime CPU choice is in `sched_rt.c`.
+
+## Mi A3 (laurel_sprout) port start (2026-10-31, branch laurel-sprout; details docs/laurel_sprout/port-plan.md)
+- [V] Phone: SM6125, Kryo 260 Gold `0x51AF8002` x4 + Silver `0x51AF8014` x4, ARMv8.0 (no LSE, no RCpc, no PAC, no PAN),
+  6 GB, Adreno 610 v1, 720x1560 Samsung AMOLED, UFS `0x4804000`, Android One 11 `V12.0.26.0.RFQMIXM`, active slot `_b`, no root.
+- [V] Same MIDRs, GPU, GIC (`0xF200000`/`0xF300000`), UFS and splash FB (`0x5C000000`) as ios-topaz (SM6225). Topaz runs
+  XNU on the Gold cores only (Silver has no 16K granule) and emulates LSE/`ldapr` for the iPhone X userland.
+- [V] Mu-Silicium has `Platforms/Xiaomi/laurel_sproutPkg` on `Silicon/Qualcomm/NicobarPkg`.
+- [I] iOS 26 needs PAC lowering of the arm64e userland (zeta route); the negroni native-PAC route does not apply.
+- `/proc/cmdline` and the live FDT need root; the RAM banks for the ADT are still [U].
