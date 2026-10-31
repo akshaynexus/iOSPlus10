@@ -516,3 +516,6 @@ enumerates and `logs/laurel-boot-*.log` shows the last `kernel_bootstrap_thread:
 `... NO tick in 50 ms: ...` with the register values (then the fix is in the GIC/timer bring-up after Mu: read ISPENDR0,
 ISR, RPR, CNTV_CTL per the table in usb-debug.md). Then: the secondary-CPU start under the UEFI path (startAll waits
 for Silver 0x1-0x3 and Gold 0x100-0x103 with PSCI CPU_ON from Silver 0x0; 2004 keeps the boot going with dead cores).
+Boot 02:57 (image f196ef7) [V host]: same host result (HS device, no EP0 answer at 02:58:12). The panel photo decides:
+`timer service: on` (EP0/DWC3 fault, next: compare DEPCFG/TRB/event path with ABL usbfn and hackios dwc3) or `NO tick`
+(GIC/timer after Mu on Silver CPU0: read the register values, next fix in pe_init_fiq or a Gold hand-off in DarwinBoot).

@@ -3642,3 +3642,8 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
   BOOT=reboot HOLD_S=180 scripts/laurel/boot-test.sh` started 02:56:51, waiting for fastboot (owner: Power+VolDown).
 - Lesson: a kernel thread is not a safe home for a debug channel on an unknown boot; a timer_call needs only the timer IRQ, and
   its self-check at the last known-good point tells timer-dead from thread-starved with one panel line.
+- [V boot 02:57, image of commit f196ef7 = kernel 2013/2014] flash boot_b 02:57:36, reboot; host 02:58:12-14: HS device, `device
+  descriptor read/64, error -71` x2, re-enumeration 62/63 "Device not responding to setup address", "unable to enumerate" (36 s
+  after the reset = the same point as 02:28). EP0 still unserved, so either the timer call never ran (no timer interrupt on
+  Silver CPU0: the panel line `LAUREL USB: timer service: NO tick ...` with the GIC state) or the DWC3 EP0 path itself fails
+  (`timer service: on` on the panel). PHOTO PENDING. No USB interface in 180 s (boot-test exit 2).
