@@ -8,9 +8,16 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+// limits of the kernel parser (patch 2400 FAT_MAX_*); keep them equal
 const MAX_FILES: usize = 4096;
+const MAX_NAMES: usize = 256 << 10; // bytes of all paths, with their NULs
 const MAX_DIR: u64 = 1 << 20;
+const MAX_DIRS: u32 = 1024;
 const MAX_DEPTH: u32 = 16;
+const MAX_PATH: usize = 255;
+const FAT32_MAX_CLUSTERS: u64 = 0x0fff_fff5;
+/// modem_a / modem_b size on the Mi A3 (partition.xml: 184320 KiB); the kernel takes the GPT size
+pub const MI_A3_MODEM_BYTES: u64 = 184320 * 1024;
 
 pub struct Entry {
     pub path: String,
@@ -28,6 +35,9 @@ pub struct Volume {
     data_off: u64,
     fat: Vec<u8>,
     pub files: Vec<Entry>,
+    names_used: usize,
+    ndirs: u32,
+    path_clus: Vec<u32>,
 }
 
 fn le16(b: &[u8], o: usize) -> u32 {
@@ -105,10 +115,11 @@ impl Volume {
     }
 
     fn add(&mut self, path: String, clus: u32, size: u32) {
-        if self.files.len() >= MAX_FILES {
+        if self.files.len() >= MAX_FILES || self.names_used + path.len() + 1 > MAX_NAMES {
             return;
         }
-        let want = (size as u64).div_ceil(self.clus_bytes as u64) as u32;
+        self.names_used += path.len() + 1;
+        let want = (size as u64).div_ceil(self.clus_bytes as u64).min(self.nclus as u64) as u32;
         let (mut c, mut runs) = (clus, 0);
         for _ in 0..want {
             if !self.valid(c) {
@@ -183,14 +194,22 @@ impl Volume {
             }
             let clus = le16(e, 26) | if self.kind == 32 { le16(e, 20) << 16 } else { 0 };
             let path = if dir.is_empty() { name } else { format!("{dir}/{name}") };
+            if path.len() > MAX_PATH {
+                continue;
+            }
             if e[11] & 0x10 != 0 {
                 let nc = self.chain_clusters(clus);
                 let bytes = nc as u64 * self.clus_bytes as u64;
-                if depth >= MAX_DEPTH || nc == 0 || bytes > MAX_DIR {
+                let looped = self.path_clus[..=depth as usize].contains(&clus);
+                if depth >= MAX_DEPTH || nc == 0 || bytes > MAX_DIR || looped || self.ndirs >= MAX_DIRS {
                     continue;
                 }
-                let sub = self.read_chain(clus, 0, bytes as usize)?;
-                self.scan(&path, &sub, depth + 1)?;
+                self.ndirs += 1;
+                // a failed read skips this directory, like the kernel
+                if let Ok(sub) = self.read_chain(clus, 0, bytes as usize) {
+                    self.path_clus[depth as usize + 1] = clus;
+                    self.scan(&path, &sub, depth + 1)?;
+                }
             } else {
                 self.add(path, clus, le32(e, 28));
             }
@@ -198,7 +217,7 @@ impl Volume {
         Ok(())
     }
 
-    pub fn open(path: &Path) -> Result<Volume> {
+    pub fn open(path: &Path, part_bytes: u64) -> Result<Volume> {
         let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let mut bs = [0u8; 512];
         f.read_exact(&mut bs)?;
@@ -218,14 +237,22 @@ impl Volume {
         if first_data >= total as u64 {
             bail!("data area outside the volume");
         }
-        let nclus = ((total as u64 - first_data) / spc as u64) as u32;
+        let nclus64 = (total as u64 - first_data) / spc as u64;
+        if nclus64 > FAT32_MAX_CLUSTERS {
+            bail!("{nclus64} clusters: more than FAT32 allows");
+        }
+        let nclus = nclus64 as u32;
         let kind = if nclus < 4085 { 12 } else if nclus < 65525 { 16 } else { 32 };
         if kind == 12 {
             bail!("FAT12 (the kernel reads FAT16 and FAT32 only)");
         }
-        let fat_bytes = (nclus + 2) as u64 * (kind / 8) as u64;
+        let fat_bytes = (nclus as u64 + 2) * (kind / 8) as u64;
         if fat_bytes > spf as u64 * bps as u64 || fat_bytes > 16 << 20 {
             bail!("FAT size {fat_bytes} does not fit");
+        }
+        let end = first_data * bps as u64 + nclus as u64 * (bps * spc) as u64;
+        if end > part_bytes {
+            bail!("data area ends at {end:#x}, past the partition ({part_bytes:#x} bytes)");
         }
         let mut v = Volume {
             f,
@@ -236,6 +263,9 @@ impl Volume {
             data_off: first_data * bps as u64,
             fat: vec![0; fat_bytes as usize],
             files: Vec::new(),
+            names_used: 0,
+            ndirs: 0,
+            path_clus: vec![0; MAX_DEPTH as usize + 1],
         };
         let mut fat = vec![0u8; fat_bytes as usize];
         v.read_at(rsvd as u64 * bps as u64, &mut fat)?;
@@ -246,6 +276,7 @@ impl Volume {
             r
         } else {
             let rc = le32(&bs, 44);
+            v.path_clus[0] = rc;
             let b = (v.chain_clusters(rc) as u64 * v.clus_bytes as u64).min(MAX_DIR);
             v.read_chain(rc, 0, b as usize)?
         };
@@ -255,8 +286,8 @@ impl Volume {
 }
 
 /// op10tool fatls IMAGE [PATH...]: summary line as the kernel logs it, then every file (or the named ones)
-pub fn run(image: &Path, paths: &[String]) -> Result<()> {
-    let mut v = Volume::open(image)?;
+pub fn run(image: &Path, paths: &[String], part_bytes: u64) -> Result<()> {
+    let mut v = Volume::open(image, part_bytes)?;
     let frag = v.files.iter().filter(|e| e.runs > 1).count();
     let mdt = v.files.iter().any(|e| e.path == "image/modem.mdt");
     println!(

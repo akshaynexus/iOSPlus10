@@ -1,7 +1,7 @@
-laurel 2400: modem firmware from the active slot's modem partition through a FAT16/FAT32 index read at start, not topaz's offset tables. topaz 0115/0121 read fixed byte offsets of the HyperOS 2.0.208 NON-HLOS (generator fwtable_all.py not published): wrong for any other image. Now topaz_soc_map picks modem_<active slot> (GPT attribute bit 50 of boot_a/boot_b via the new sweet_ufs_part_attr; Mi A3: slot b), then the other slot, then 'modem', reads the boot sector, the FAT and every directory (long names, lowercase paths like image/modem.mdt) and reads files cluster run by cluster run (fragmented files work). fw_size/fw_read (PAS loader), fw_all_* (tftp, board data) and topaz_part_fw_* (TopazAudio ADSP) use the index. The CRC check and boot-arg modem_part= are gone (no boot-args except kill switches; TrustZone checks the signatures). sweet_ufs.c: 16 partition cache slots and the GPT attributes. Log: 'TopazModem: firmware: modem_b (active slot b): FAT16, 4096-byte sectors, 16 KiB clusters, N files (M fragmented)'; on failure the reason goes to the LAUREL WIFI line (2401).
+laurel 2400: modem firmware from the active slot's modem partition through a FAT16/FAT32 index read at start, not topaz's offset tables. topaz 0115/0121 read fixed byte offsets of the HyperOS 2.0.208 NON-HLOS (generator fwtable_all.py not published): wrong for any other image. Now topaz_soc_map picks modem_<active slot> (GPT attribute bit 50 of boot_a/boot_b via the new sweet_ufs_part_info; Mi A3: slot b), then the other slot (with a WARNING line: its firmware may not match the EFS), then 'modem'; reads the boot sector, the FAT and every directory (long names, lowercase paths like image/modem.mdt) and reads files cluster run by cluster run (fragmented files work). Checks: FAT12 refused, at most 0x0FFFFFF5 clusters, FAT size in 64 bits and inside the FAT sectors (16 MiB max), data area inside the GPT partition size. Limits (equal in tools/op10tool fat.rs, the host model: op10tool fatls, tests/fatls-test.sh): 4096 files, 256 KiB of paths, 255-character paths, 1 MiB per directory, 1024 directories, depth 16, a directory whose first cluster is already on the scan path is skipped (loop), a directory that cannot be read is skipped; shared name/path buffers keep the recursion small on the 16 KiB kernel stack. fw_size/fw_read (PAS loader), fw_all_* (tftp, board data) and topaz_part_fw_* (TopazAudio ADSP) use the index. The CRC table and boot-arg modem_part= are gone (TrustZone checks the signatures). sweet_ufs.c: 16 partition cache slots, the GPT attributes and the partition size. Log: 'TopazModem: firmware: modem_b (active slot b): FAT16, 4096-byte sectors, 16 KiB clusters, N files (M fragmented)'; on failure the reason goes to the LAUREL WIFI line (2401).
 
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 3d3e0c8..7143785 100644
+index 3d3e0c8..44358d2 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -375,7 +375,9 @@ ufs_find_partition(const char *want)
@@ -35,17 +35,18 @@ index 3d3e0c8..7143785 100644
  			printf("SWEET UFS: partition %s: LUN %u blocks 0x%llx+0x%llx (read-only)\n",
  			    want, lun, first, last - first + 1);
  			*slot = k;
-@@ -472,6 +476,31 @@ sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len)
+@@ -472,6 +476,35 @@ sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len)
  	return error;
  }
  
 +/*
-+ * laurel 2400: the GPT attribute bits of a partition (A/B: bit 50 active, 54 successful,
-+ * 55 unbootable, 48-49 priority). Same lookup and cache as sweet_ufs_read_part. Read-only.
++ * laurel 2400: the GPT attribute bits (A/B: bit 50 active, 54 successful, 55 unbootable,
++ * 48-49 priority) and the size in bytes of a partition; either pointer may be NULL. Same
++ * lookup and cache as sweet_ufs_read_part. Read-only.
 + */
-+int sweet_ufs_part_attr(const char *want, uint64_t *attr);
++int sweet_ufs_part_info(const char *want, uint64_t *attr, uint64_t *bytes);
 +int
-+sweet_ufs_part_attr(const char *want, uint64_t *attr)
++sweet_ufs_part_info(const char *want, uint64_t *attr, uint64_t *bytes)
 +{
 +	unsigned slot = 0;
 +	int error;
@@ -56,8 +57,11 @@ index 3d3e0c8..7143785 100644
 +	lck_mtx_lock(&sweet_ufs_lock);
 +	uint8_t saved = su.lun;
 +	error = ufs_lookup_part(want, &slot);
-+	if (!error) {
++	if (!error && attr != NULL) {
 +		*attr = part_cache[slot].attr;
++	}
++	if (!error && bytes != NULL) {
++		*bytes = part_cache[slot].nblocks * UFS_BLOCK;
 +	}
 +	su.lun = saved;
 +	lck_mtx_unlock(&sweet_ufs_lock);
@@ -68,7 +72,7 @@ index 3d3e0c8..7143785 100644
  ufs_take_over_host(void)
  {
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index 8aa0c2f..0ce0c1c 100644
+index 8aa0c2f..7998e40 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
 @@ -20,7 +20,6 @@
@@ -79,7 +83,7 @@ index 8aa0c2f..0ce0c1c 100644
  #include <sys/param.h>
  #include <sys/errno.h>
  
-@@ -168,85 +167,402 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
+@@ -168,85 +167,425 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
  /* ---------------------------------------------------------------- firmware files */
  
  /*
@@ -96,12 +100,16 @@ index 8aa0c2f..0ce0c1c 100644
 + * Paths are lowercase and relative to the volume root: "image/modem.mdt".
   */
  extern "C" int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
-+extern "C" int sweet_ufs_part_attr(const char *want, uint64_t *attr);
++extern "C" int sweet_ufs_part_info(const char *want, uint64_t *attr, uint64_t *bytes);
 +
++/* limits; tools/op10tool/src/fat.rs has the same ones and must stay equal */
 +#define FAT_MAX_FILES       4096
-+#define FAT_MAX_NAMES       (256u << 10)
++#define FAT_MAX_NAMES       (256u << 10)        /* bytes of all paths, with their NULs */
 +#define FAT_MAX_DIR         (1u << 20)          /* bytes of one directory */
++#define FAT_MAX_DIRS        1024                /* directories read */
 +#define FAT_MAX_DEPTH       16
++#define FAT_MAX_PATH        255                 /* characters of one path */
++#define FAT32_MAX_CLUSTERS  0x0FFFFFF5u
 +#define GPT_ATTR_ACTIVE     (1ull << 50)        /* Qualcomm A/B: slot active */
 +
 +static char fw_part[32] = "modem_b";
@@ -112,9 +120,10 @@ index 8aa0c2f..0ce0c1c 100644
 +	uint8_t *fat;
 +	uint32_t fat_bytes;
 +	struct fat_file *files;
-+	uint32_t nfiles, fragmented;
++	uint32_t nfiles, fragmented, ndirs;
 +	char *names;
 +	uint32_t names_used;
++	uint32_t path_clus[FAT_MAX_DEPTH + 1];      /* first cluster of each directory on the scan path */
 +} fv;
 +
 +static inline uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
@@ -223,7 +232,7 @@ index 8aa0c2f..0ce0c1c 100644
 +	f->size = size;
 +	memcpy(fv.names + fv.names_used, path, l);
 +	fv.names_used += l;
-+	uint32_t want = (uint32_t)(((uint64_t)size + fv.clus_bytes - 1) / fv.clus_bytes), runs = 0;
++	uint32_t want = (uint32_t)MIN(((uint64_t)size + fv.clus_bytes - 1) / fv.clus_bytes, (uint64_t)fv.nclus), runs = 0;
 +	for (uint32_t c = clus, k = 0; fat_valid(c) && k < want; k++) {
 +		uint32_t nx = fat_next(c);
 +		if (nx != c + 1) {
@@ -317,18 +326,25 @@ index 8aa0c2f..0ce0c1c 100644
 +		}
 +		uint32_t clus = le16(e + 26) | (fv.type == 32 ? (uint32_t)le16(e + 20) << 16 : 0);
 +		int pl = snprintf(fat_path + dir_len, sizeof(fat_path) - dir_len, "%s%s", dir_len != 0 ? "/" : "", name);
-+		if (pl <= 0 || dir_len + (uint32_t)pl >= sizeof(fat_path)) {
++		if (pl <= 0 || dir_len + (uint32_t)pl > FAT_MAX_PATH) {
 +			fat_path[dir_len] = 0;
 +			continue;
 +		}
 +		if (e[11] & 0x10) {
 +			uint32_t nc = fat_chain_clusters(clus);
 +			uint64_t bytes = (uint64_t)nc * fv.clus_bytes;
-+			if (depth >= FAT_MAX_DEPTH || nc == 0 || bytes > FAT_MAX_DIR) {
++			bool loop = false;
++			for (unsigned k = 0; k <= depth; k++) {
++				loop |= fv.path_clus[k] == clus;    /* a directory that contains itself */
++			}
++			if (depth >= FAT_MAX_DEPTH || nc == 0 || bytes > FAT_MAX_DIR || loop || fv.ndirs >= FAT_MAX_DIRS) {
++				fat_path[dir_len] = 0;
 +				continue;
 +			}
++			fv.ndirs++;
 +			uint8_t *sub = (uint8_t *)IOMalloc((vm_size_t)bytes);
-+			if (sub != NULL && fat_read_chain(clus, 0, sub, bytes)) {
++			if (sub != NULL && fat_read_chain(clus, 0, sub, bytes)) {   /* a failed read skips this directory */
++				fv.path_clus[depth + 1] = clus;
 +				fat_scan(dir_len + (uint32_t)pl, sub, (uint32_t)bytes, depth + 1);
 +			}
 +			if (sub != NULL) {
@@ -367,13 +383,17 @@ index 8aa0c2f..0ce0c1c 100644
 +		return false;
 +	}
 +	uint32_t root_secs = (rootents * 32 + bps - 1) / bps;
-+	uint64_t first_data = rsvd + (uint64_t)nfats * spf + root_secs;
-+	if (first_data >= total) {
++	uint64_t first_data = rsvd + (uint64_t)nfats * spf + root_secs, part_bytes = 0;
++	if (first_data >= total || sweet_ufs_part_info(fw_part, NULL, &part_bytes) != 0) {
 +		return false;
 +	}
 +	fv.bps = bps;
 +	fv.clus_bytes = bps * spc;
-+	fv.nclus = (uint32_t)((total - first_data) / spc);
++	uint64_t nclus = (total - first_data) / spc;
++	if (nclus > FAT32_MAX_CLUSTERS) {
++		return false;
++	}
++	fv.nclus = (uint32_t)nclus;
 +	fv.type = fv.nclus < 4085 ? 12 : fv.nclus < 65525 ? 16 : 32;
 +	if (fv.type == 12) {
 +		return false;
@@ -383,10 +403,12 @@ index 8aa0c2f..0ce0c1c 100644
 +	fv.root_bytes = root_secs * bps;
 +	fv.root_clus = fv.type == 32 ? le32(bs + 44) : 0;
 +	fv.data_off = first_data * bps;
-+	fv.fat_bytes = (fv.nclus + 2) * (fv.type / 8);
-+	if (fv.fat_bytes > (uint64_t)spf * bps || fv.fat_bytes > (16u << 20)) {
-+		return false;
++	uint64_t fat_bytes = ((uint64_t)fv.nclus + 2) * (fv.type / 8);
++	if (fat_bytes > (uint64_t)spf * bps || fat_bytes > (16u << 20) ||
++	    fv.data_off + (uint64_t)fv.nclus * fv.clus_bytes > part_bytes) {
++		return false;                           /* FAT or data area past the FAT / the partition */
 +	}
++	fv.fat_bytes = (uint32_t)fat_bytes;
 +	fv.fat = (uint8_t *)IOMalloc(fv.fat_bytes);
 +	if (fv.files == NULL) {
 +		fv.files = (struct fat_file *)IOMalloc(FAT_MAX_FILES * sizeof(struct fat_file));
@@ -406,6 +428,7 @@ index 8aa0c2f..0ce0c1c 100644
 +	    fat_read_chain(fv.root_clus, 0, root, rb));
 +	if (ok) {
 +		fat_path[0] = 0;
++		fv.path_clus[0] = fv.root_clus;
 +		fat_scan(0, root, rb, 0);
 +	}
 +	if (root != NULL) {
@@ -457,8 +480,8 @@ index 8aa0c2f..0ce0c1c 100644
 +	char active = 0;
 +
 +	for (int i = 0; i < 120 && (ea == EAGAIN || eb == EAGAIN); i++) {
-+		ea = sweet_ufs_part_attr("boot_a", &aa);
-+		eb = sweet_ufs_part_attr("boot_b", &ab);
++		ea = sweet_ufs_part_info("boot_a", &aa, NULL);
++		eb = sweet_ufs_part_info("boot_b", &ab, NULL);
 +		if (ea == EAGAIN || eb == EAGAIN) {
 +			IOSleep(500);
 +		}
@@ -485,6 +508,10 @@ index 8aa0c2f..0ce0c1c 100644
 +		    fw_part, active != 0 ? active : '?', fv.type, fv.bps, fv.clus_bytes >> 10, fv.nfiles, fv.fragmented,
 +		    m < 0 ? ", no image/modem.mdt" : "");
 +		if (m >= 0) {
++			if (k != 0) {
++				LOG("firmware: WARNING: %s is not the active slot's partition (%s unusable): its firmware may not "
++				    "match this phone's EFS", fw_part, order[0]);
++			}
 +			return true;
 +		}
 +	}
@@ -536,7 +563,7 @@ index 8aa0c2f..0ce0c1c 100644
  }
  
  /* ---------------------------------------------------------------- SMEM */
-@@ -1037,1356 +1353,6 @@ glink_summary(void)
+@@ -1037,1356 +1376,6 @@ glink_summary(void)
  #define QMI_REQ             0
  #define QMI_RESP            2
  
@@ -1893,7 +1920,7 @@ index 8aa0c2f..0ce0c1c 100644
  /* QMI */
  struct qmsg { uint8_t b[512]; uint32_t n; };
  
-@@ -2780,7 +1746,7 @@ tftp_request(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
+@@ -2780,7 +1769,7 @@ tftp_request(uint32_t node, uint32_t port, const uint8_t *d, uint32_t len)
  			tftp_close(s);
  			return;
  		}
@@ -1902,7 +1929,7 @@ index 8aa0c2f..0ce0c1c 100644
  		LOG("t=%u ms: tftp RRQ %s seek %u rsize %u blk %u w %u (%llu B)", g_ms, path, s->seek, s->rsize, s->blk, s->wsize, s->size);
  	}
  	if (!opts) {
-@@ -3207,7 +2173,7 @@ w_start_bdf(void)
+@@ -3207,7 +2196,7 @@ w_start_bdf(void)
  		LOG("wlfw: no board data file");
  		return;
  	}
@@ -1911,7 +1938,7 @@ index 8aa0c2f..0ce0c1c 100644
  	w_bdf_off = 0;
  	w_bdf_seg = 0;
  	LOG("t=%u ms: wlfw: board data %s, %u bytes", g_ms, name, w_bdf_len);
-@@ -6248,6 +5214,8 @@ out:
+@@ -6248,6 +5237,8 @@ out:
  	return ok;
  }
  
@@ -1920,7 +1947,7 @@ index 8aa0c2f..0ce0c1c 100644
  /*
   * Wait for the firmware partition (sweet_ufs comes up with the root device) and map SMEM, the
   * pool, APCS and the TCSR mutex. Once, for whichever of TopazModem / TopazAudio comes first;
-@@ -6273,22 +5241,15 @@ topaz_soc_map(void)
+@@ -6273,22 +5264,15 @@ topaz_soc_map(void)
  	}
  	state = -1;
  	soc_lock = IOLockAlloc();
@@ -1946,7 +1973,7 @@ index 8aa0c2f..0ce0c1c 100644
  		LOG("mappings failed");
  	} else {
  		smem = (uint8_t *)smem_map->getVirtualAddress();
-@@ -6344,14 +5305,14 @@ extern "C" int64_t
+@@ -6344,14 +5328,14 @@ extern "C" int64_t
  topaz_part_fw_size(const char *path)
  {
  	int i = fw_all_find(path);

@@ -1,10 +1,10 @@
 laurel 2402: WLFW fallbacks for the Mi A3 firmware WLAN.HL.3.0.2 (NON-HLOS verinfo; topaz's WCN3988 runs a newer HL3.x). Downstream icnss (laurel-kernel-los drivers/soc/qcom/icnss.c) sends only ind_register, msa_info, msa_ready, cap (+ dynamic feature mask): no host_cap and no board data over QMI; the WLAN PD reads bdwlan.* itself over tftp (served by 0121 from the FAT index of 2400). topaz's ath10k sequence could stall on such firmware, so: no host_cap answer in 1 s -> msa_info anyway (a late answer is ignored); no MSA_READY indication 1 s after cap -> board data anyway (ath10k qcom,no-msa-ready-indicator); a refused or missing board data file -> wait for FW_READY (the indication is handled in every state). Each fallback logs one 'wlfw:' line; the WLFW step shows in the LAUREL WIFI off line (2401). WMI-TLV (ABI 1.53, resource config, CE layout, HTT v2 descriptors) is the ath10k WCN3990 set in topaz already; ath10k drives HL2.0-HL3.x with it unchanged.
 
 diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
-index f084c85..651c99c 100644
+index ebfd759..02e597f 100644
 --- a/iokit/Kernel/arm/TopazModem.cpp
 +++ b/iokit/Kernel/arm/TopazModem.cpp
-@@ -2204,7 +2204,8 @@ w_start_bdf(void)
+@@ -2237,7 +2237,8 @@ w_start_bdf(void)
  		w_bdf_fi = fw_all_find(name);
  	}
  	if (w_bdf_fi < 0) {
@@ -14,7 +14,7 @@ index f084c85..651c99c 100644
  		return;
  	}
  	w_bdf_len = fw_all_size(w_bdf_fi);
-@@ -2294,6 +2295,14 @@ w_on_msa_info(const uint8_t *d, uint32_t len)
+@@ -2327,6 +2328,14 @@ w_on_msa_info(const uint8_t *d, uint32_t len)
  }
  
  static unsigned w_arrivals, w_cap_tries, w_cap_retry_ms;
@@ -29,7 +29,7 @@ index f084c85..651c99c 100644
  
  static void
  wlfw_arrive(uint32_t node, uint32_t port)
-@@ -2308,6 +2317,7 @@ wlfw_arrive(uint32_t node, uint32_t port)
+@@ -2341,6 +2350,7 @@ wlfw_arrive(uint32_t node, uint32_t port)
  		w_board = 0xFF;
  		w_cap_tries = 0;
  		w_cap_retry_ms = 0;
@@ -37,7 +37,7 @@ index f084c85..651c99c 100644
  	}
  	w_node = node;
  	w_port = port;
-@@ -2367,11 +2377,16 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+@@ -2400,11 +2410,16 @@ wlfw_rx(const uint8_t *d, uint32_t len)
  			wm_u32(&m, 0x10, 0);                /* daemon_support = 0 */
  			wm_send(&m);
  			w_step = "host_cap sent";
@@ -54,7 +54,7 @@ index f084c85..651c99c 100644
  		if (wm_new(&m, WLFW_MSA_INFO)) {
  			uint64_t a = WLFW_MSA_BASE;
  			wm_tlv(&m, 0x01, &a, 8);            /* msa_addr */
-@@ -2409,12 +2424,15 @@ wlfw_rx(const uint8_t *d, uint32_t len)
+@@ -2442,12 +2457,15 @@ wlfw_rx(const uint8_t *d, uint32_t len)
  			}
  		}
  		w_cap_done = true;
@@ -71,7 +71,7 @@ index f084c85..651c99c 100644
  			break;
  		}
  		if (w_bdf_off < w_bdf_len) {
-@@ -4920,6 +4938,26 @@ radio_poll(unsigned ms)
+@@ -4953,6 +4971,26 @@ radio_poll(unsigned ms)
  		w_cap_retry_ms = 0;
  		w_simple(WLFW_CAP, "cap sent again");
  	}

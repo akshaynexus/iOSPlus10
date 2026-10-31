@@ -1,0 +1,157 @@
+laurel 2404: TopazModem.cpp is shared with TopazAudio (ADSP loader, area F): (1) every TrustZone call (scm(), topaz_scm(), the hyp_assign of MSA/rmtfs) runs under one lock over the whole call incl. the resume loop (x0 = 1, session in x6); a busy answer (SCM_V2_EBUSY -12) is retried after 30 ms, at most 100 times, the lock released while waiting (qcom_scm / downstream scm.c behaviour); the modem PAS and the ADSP PAS run in parallel threads at boot. (2) smmu_identity()/topaz_smmu_identity(): one lock over the read of the SMRs/S2CRs, the pick of a free SMR and context bank and the writes (WLAN stream 0x80 and the audio stream raced for the same slot); the SMMU is mapped once. (3) topaz_soc_map checks that the modem pool [MODEM_POOL_BASE, +SIZE) lies outside XNU's RAM [gPhysBase, gPhysBase + gPhysSize); on overlap one line 'LAUREL MODEM POOL: off: modem pool .. overlaps XNU RAM ..: modem, Wi-Fi and ADSP audio off' and topaz_soc_map fails (modem thread and TopazAudio stop; the LAUREL WIFI line names the reason). Area A map (uefi-boot.md): pool 0xE0000000-0xE1000000, XNU 0xE1004000-0x1AD004000: no overlap.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index d8a8fcd..580a7b7 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -188,20 +188,70 @@ smc(uint64_t a[8])
+ 
+ static unsigned scm_resumes;
+ 
++/*
++ * laurel 2404: one TrustZone call at a time (modem PAS here, ADSP PAS in TopazAudio and the
++ * hyp_assign calls run in parallel threads at boot), the lock held over the whole call with its
++ * resume loop; a busy answer (SCM_V2_EBUSY -12) is retried after 30 ms, at most 100 times
++ * (qcom_scm / downstream scm.c do the same).
++ */
++#define SCM_INTERRUPTED     1
++#define SCM_V2_EBUSY        ((uint64_t)(int64_t)-12)
++#define SCM_EBUSY_WAIT_MS   30
++#define SCM_EBUSY_TRIES     100
++
++static IOLock *
++lazy_lock(IOLock **lp)
++{
++	if (*lp == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, (void * volatile *)lp)) {
++			IOLockFree(l);
++		}
++	}
++	return *lp;
++}
++
++static IOLock *scm_lock_p, *smmu_lock_p;
++
++/* args[0..5] in, the full result in args; returns x0 */
+ static uint64_t
+-scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1)
++scm_call(uint64_t args[8])
+ {
+-	uint64_t args[8] = { fn, arginfo, a, b, c, 0, 0, 0 };
+-	unsigned n;
++	uint64_t in[8];
++	unsigned n = 0, busy = 0;
+ 
+-	smc(args);
+-	/* long calls return INTERRUPTED (1): resume with x0 = 1 and the session from x6 */
+-	for (n = 0; args[0] == 1 && n < 100000; n++) {
+-		uint64_t again[8] = { 1, arginfo, a, b, c, 0, args[6], 0 };
+-		memcpy(args, again, sizeof(args));
++	memcpy(in, args, sizeof(in));
++	IOLockLock(lazy_lock(&scm_lock_p));
++	for (;;) {
++		memcpy(args, in, sizeof(in));
+ 		smc(args);
++		/* long calls return INTERRUPTED (1): resume with x0 = 1 and the session from x6 */
++		for (n = 0; args[0] == SCM_INTERRUPTED && n < 100000; n++) {
++			uint64_t again[8] = { SCM_INTERRUPTED, in[1], in[2], in[3], in[4], in[5], args[6], 0 };
++			memcpy(args, again, sizeof(again));
++			smc(args);
++		}
++		if (args[0] != SCM_V2_EBUSY || ++busy > SCM_EBUSY_TRIES) {
++			break;
++		}
++		IOLockUnlock(scm_lock_p);               /* let the other caller finish */
++		IOSleep(SCM_EBUSY_WAIT_MS);
++		IOLockLock(scm_lock_p);
+ 	}
+ 	scm_resumes = n;
++	IOLockUnlock(scm_lock_p);
++	if (busy != 0) {
++		LOG("SCM %llx: TrustZone busy %u time(s)%s", in[0], busy, args[0] == SCM_V2_EBUSY ? ", gave up" : "");
++	}
++	return args[0];
++}
++
++static uint64_t
++scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1)
++{
++	uint64_t args[8] = { fn, arginfo, a, b, c, 0, 0, 0 };
++
++	scm_call(args);
+ 	if (res1 != NULL) {
+ 		*res1 = args[1];
+ 	}
+@@ -1958,12 +2008,7 @@ scm_assign(uint64_t addr, uint64_t size, const uint32_t *vmids, unsigned count)
+ 	p[35] = 0;
+ 	mb();
+ 	uint64_t args[8] = { SCM_FN(0x0C, 0x16), 7 | (1 << 4) | (1 << 8) | (1 << 12), pa, 16, pa + 0x40, pa + 0x100, 0, 0 };
+-	smc(args);
+-	for (unsigned n = 0; args[0] == 1 && n < 100000; n++) {
+-		uint64_t again[8] = { 1, 7 | (1 << 4) | (1 << 8) | (1 << 12), pa, 16, pa + 0x40, pa + 0x100, args[6], 0 };
+-		memcpy(args, again, sizeof(args));
+-		smc(args);
+-	}
++	scm_call(args);                             /* laurel 2404: under the TrustZone lock, busy retried */
+ 	res = args[1];
+ 	LOG("SCM assign %llx+%llx -> %u vmids: ret=%llx res=%llx", addr, size, count, args[0], res);
+ 	return args[0] != 0 ? args[0] : res;
+@@ -2554,10 +2599,29 @@ smmu_sid_match(uint32_t smr, uint32_t sid, uint32_t mask)
+ 	return ((id ^ sid) & ~(m | mask) & 0x7FFF) == 0;
+ }
+ 
++/*
++ * laurel 2404: callers (WLAN SID 0x80 here, the audio stream in TopazAudio) run in parallel; the
++ * free SMR / context bank pick and the writes happen under one lock, so two streams never take
++ * the same slot or bank.
++ */
++static bool smmu_identity_locked(uint32_t sid, uint32_t mask, const char *name);
++
+ static bool
+ smmu_identity(uint32_t sid, uint32_t mask, const char *name)
+ {
+-	volatile uint8_t *s = (volatile uint8_t *)ml_io_map(SMMU_PA, SMMU_SIZE);
++	IOLockLock(lazy_lock(&smmu_lock_p));
++	bool ok = smmu_identity_locked(sid, mask, name);
++	IOLockUnlock(smmu_lock_p);
++	return ok;
++}
++
++static bool
++smmu_identity_locked(uint32_t sid, uint32_t mask, const char *name)
++{
++	static volatile uint8_t *s;
++	if (s == NULL) {
++		s = (volatile uint8_t *)ml_io_map(SMMU_PA, SMMU_SIZE);      /* once (laurel 2404) */
++	}
+ 	if (s == NULL) {
+ 		LOG("smmu: map failed");
+ 		return false;
+@@ -5339,6 +5403,7 @@ out:
+ }
+ 
+ static char soc_why[96];                        /* why topaz_soc_map failed (laurel 2400) */
++extern unsigned long gPhysBase, gPhysSize;      /* osfmk/arm64/arm_vm_init.c: XNU's physical RAM */
+ 
+ /*
+  * Wait for the firmware partition (sweet_ufs comes up with the root device) and map SMEM, the
+@@ -5365,6 +5430,18 @@ topaz_soc_map(void)
+ 	}
+ 	state = -1;
+ 	soc_lock = IOLockAlloc();
++	/*
++	 * laurel 2404: the pool must be RAM XNU does not manage. XNU's physical range is
++	 * [gPhysBase, gPhysBase + gPhysSize) (gPhysSize >= mem_size). On overlap the modem (Wi-Fi)
++	 * and the ADSP audio (TopazAudio uses this pool and topaz_soc_map) stay off.
++	 */
++	if (MODEM_POOL_BASE < (uint64_t)gPhysBase + gPhysSize && (uint64_t)gPhysBase < MODEM_POOL_BASE + MODEM_POOL_SIZE) {
++		snprintf(soc_why, sizeof(soc_why), "modem pool %llx..%llx overlaps XNU RAM %lx..%lx",
++		    MODEM_POOL_BASE, MODEM_POOL_BASE + MODEM_POOL_SIZE, gPhysBase, gPhysBase + gPhysSize);
++		printf("LAUREL MODEM POOL: off: %s: modem, Wi-Fi and ADSP audio off\n", soc_why);
++		IOLockUnlock(once);
++		return false;
++	}
+ 	int err = fw_pick(soc_why, sizeof(soc_why)) ? 0 : ENOENT;     /* laurel 2400: FAT index */
+ 	smem_map = err == 0 ? map_phys(SMEM_PA, SMEM_SIZE, true) : NULL;
+ 	pool_map = err == 0 ? map_phys(MODEM_POOL_BASE, MODEM_POOL_SIZE, true) : NULL;
