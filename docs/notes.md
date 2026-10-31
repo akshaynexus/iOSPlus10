@@ -3492,3 +3492,7 @@ Input: docs/audit/2026-10-26-metal-gl.md section 4 ("what remains"), the items t
 - Next panics to expect [I]: (a) the 4K/E-cluster Edge scheduler paths once 8 cores run (`cpus=4` as fallback:
   `CPUS=4 scripts/laurel/shim.sh`), (b) topaz touch/keys on SM6225 QUP/TLMM addresses (sweet_touch_init,
   sweet_keys_init; they log and give up on an error, not a panic, per topaz 0083/0087), (c) the IORTC/root mount.
+- [V] iOS root for the Mi A3 (2026-11-01): `scripts/bg.sh laurel-root sudo scripts/laurel/root.sh` -> ~/op10-apple/
+  laurel-ios16-root.img (16 GiB HFS+ case-sensitive journaled, iOSRoot) + .simg (12.1 GB, op10tool img2simg), 2.5 min.
+  Linux fsck_hfs 540.1 keeps reporting "Volume header needs minor repair (1, 0)" on verify after every repair;
+  root.sh accepts exactly that finding. topaz sweet-root-tweaks.py ran (launchd, CommCenter, containers, prefs).

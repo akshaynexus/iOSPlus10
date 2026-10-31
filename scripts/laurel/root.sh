@@ -28,7 +28,31 @@ ts() { date +%H:%M:%S; }
 
 echo "$(ts) laurel-root: 1/4 mkiosroot -> $IMG (${SIZE:-16G})"
 rm -f "$IMG"
-bash "$TOPAZ/mkiosroot.sh" "$D/087-86698-044.dmg" "$D/087-86593-047.dmg" "$D/087-86715-047.dmg" "$IMG" "${SIZE:-16G}"
+# mkiosroot ends with one fsck repair and a read-only verify; after the big copy the verify can still ask
+# for a "minor repair" of the volume header (2026-11-01). Repair again (max 3) until the verify is clean.
+if ! bash "$TOPAZ/mkiosroot.sh" "$D/087-86698-044.dmg" "$D/087-86593-047.dmg" "$D/087-86715-047.dmg" "$IMG" "${SIZE:-16G}"; then
+  [ -s "$IMG" ] || { echo "laurel-root: mkiosroot failed before the image existed" >&2; exit 1; }
+  ok=0
+  for i in 1 2 3; do
+    echo "$(ts) laurel-root: verify failed: fsck repair pass $i"
+    fsck.hfsplus -f -y "$IMG" | grep -v 'Illegal name' || true
+    if fsck.hfsplus -f -n "$IMG" >/dev/null 2>&1; then ok=1; break; fi
+  done
+  if [ $ok = 0 ]; then
+    # Linux fsck_hfs 540.1 repairs the volume header and reports "Volume header needs minor repair (1, 0)"
+    # again on the next verify-only pass (seen 2026-11-01 after 3 repairs; catalog, extents, bitmap and
+    # attributes all pass). Accept exactly that one finding; any other problem stops the build.
+    v=$(fsck.hfsplus -f -n "$IMG" 2>&1 || true)
+    others=$(printf '%s\n' "$v" | grep -E 'needs|invalid|Invalid|incorrect|Incorrect|error|Error|missing|Missing|overlap' | grep -v 'Volume header needs minor repair' | grep -v 'needs to be repaired' || true)
+    if printf '%s\n' "$v" | grep -q 'Volume header needs minor repair' && [ -z "$others" ]; then
+      echo "$(ts) laurel-root: note: only 'Volume header needs minor repair' remains (Linux fsck_hfs); accepted"
+      ok=1
+    else
+      echo "laurel-root: volume still not clean after 3 repairs" >&2; printf '%s\n' "$v" | tail -8; exit 1
+    fi
+  fi
+  echo "$(ts) laurel-root: volume checked"
+fi
 
 echo "$(ts) laurel-root: 2/4 root tweaks (topaz sweet-root-tweaks.py)"
 mnt=$(mktemp -d)
@@ -39,7 +63,7 @@ sync
 umount "$mnt"
 
 echo "$(ts) laurel-root: 3/4 fsck"
-fsck.hfsplus -fy "$IMG" | grep -v 'Illegal name' || true
+fsck.hfsplus -fy "$IMG" | grep -v 'Illegal name' | tail -3 || true
 
 echo "$(ts) laurel-root: 4/4 sparse image (op10tool img2simg)"
 OP=$REPO/out/bin/op10tool
