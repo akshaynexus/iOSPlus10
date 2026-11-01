@@ -1,0 +1,79 @@
+laurel 2931: LAUREL AWDL line: AWDL self-check over the frames that en0 scans hear. Nothing is sent, so Wi-Fi cannot break. Kill switch awdl=0. docs/laurel_sprout/airplay-airdrop.md
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -26,6 +26,7 @@
+ #include "LaurelWifiPhy.h"                      /* laurel 2405 */
+ #include "LaurelWifiLink.h"                     /* laurel 2407 */
+ #include "LaurelWifiPath.h"                     /* laurel 2880 */
++#include "LaurelWifiAwdl.h"                     /* laurel 2930 */
+ 
+ /* laurel 2884: real milliseconds (g_ms counts passes of the watch loop, about 0.8 a millisecond when idle) */
+ static uint64_t
+@@ -3196,6 +3197,15 @@
+ 	return v != 0;
+ }
+ 
++/*
++ * laurel 2931: AWDL (AirDrop) self-check, docs/laurel_sprout/airplay-airdrop.md. It only looks at frames that en0's scans bring in:
++ * no command, no vdev, no frame sent, so it cannot touch Wi-Fi. AWDL needs AWDL data frames both ways, and this driver has no path for them:
++ * OWL needs monitor mode with injection, the vendor driver's monitor device has no Tx. The line stays "off" until such a path exists;
++ * wifip2pd stays out of the root until then (scripts/laurel/root-tweaks-perf.py). Kill switch awdl=0.
++ */
++#define LW_AWDL_LINE_MS (5u * 60 * 1000)        /* time for scans on 6, 44, 149 with an Apple device near */
++static struct { bool on, said; uint32_t frames; uint64_t start_ms; } lw_awdl;
++
+ static void
+ lw_fw_report(void)
+ {
+@@ -3203,6 +3213,11 @@
+ 		return;
+ 	}
+ 	lw_said = true;
++	lw_awdl.on = lw_switch("awdl");
++	lw_awdl.start_ms = lw_ms();
++	if (!lw_awdl.on) {
++		printf("LAUREL AWDL: off: boot-arg awdl=0\n");
++	}
+ 	printf("LAUREL WIFI: radio: phy 0x%x, %u rf chains, ht 0x%x, vht 0x%x, vht mcs 0x%x, regulatory 0x%x, 5 GHz %u-%u MHz\n",
+ 	    lw_fw.phy, lw_fw.rf_chains, lw_fw.ht, lw_fw.vht, lw_fw.vht_mcs, lw_fw.rd, lw_fw.low5, lw_fw.high5);
+ 	lw_5g_on = !lw_fw.valid || lw_fw.phy == 0 || (lw_fw.phy & 1) != 0;   /* a firmware that says nothing keeps 5 GHz */
+@@ -3789,6 +3804,9 @@
+ 		return;
+ 	}
+ 	flen = MIN(hdr[4], flen);
++	if (lw_awdl.on && lw_awdl_frame(f, flen) && lw_awdl.frames++ == 0) {   /* laurel 2931: the frame goes on as before */
++		printf("LAUREL AWDL: off: first AWDL frame heard (channel %u, subtype %u): the firmware passes them to the host; no data path yet\n", hdr[0], f[30]);
++	}
+ 	if (flen >= 24 && (f[0] & 0x0C) == 0 && (f[0] >> 4) != 8 && (f[0] >> 4) != 5) {
+ 		w_assoc_mgmt_rx(f, flen);               /* auth, assoc response, deauth, disassoc */
+ 		return;
+@@ -5385,6 +5403,19 @@
+ 	return s_state == S_UP ? lw_rssi_now() : 0;
+ }
+ 
++/* laurel 2931: the one summary line: what the firmware says of itself, and what the scans heard */
++static void
++lw_awdl_poll(void)
++{
++	if (!lw_awdl.on || lw_awdl.said || lw_ms() - lw_awdl.start_ms < LW_AWDL_LINE_MS) {
++		return;
++	}
++	lw_awdl.said = true;
++	printf("LAUREL AWDL: off: no AWDL data path: the vendor driver's monitor device has no Tx, OWL needs it; WMI mgmt-tx %s, offchan-tx %s, promisc %s, nan %s, nan-data %s; "
++	    "%u AWDL frames in %u scans; wifip2pd stays out\n", wmi_svc(76) ? "yes" : "no", wmi_svc(123) ? "yes" : "no", wmi_svc(145) ? "yes" : "no",
++	    wmi_svc(52) ? "yes" : "no", wmi_svc(96) ? "yes" : "no", lw_awdl.frames, scans);
++}
++
+ static void
+ lw_status_poll(void)
+ {
+@@ -5624,6 +5655,7 @@
+ 		w_join_poll();
+ 		(void)w_tx_pump();
+ 		lw_status_poll();
++		lw_awdl_poll();
+ 	}
+ 	{
+ 		/* laurel 2409: frames in about a second (the loop's pass is about 1 ms) */

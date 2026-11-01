@@ -106,6 +106,15 @@ def check_xnutils(root):
     return []
 
 
+def check_airplay(root):
+    bad = []
+    if '/System/Library/LaunchDaemons/com.laurel.airplay.plist' not in plist(root, 'System/Library/xpc/launchd.plist').get('LaunchDaemons', {}):
+        bad.append('no job com.laurel.airplay')
+    if os.environ.get('AIRDROP_LAN', '1') != '0' and not plist(root, 'private/var/Managed Preferences/mobile/com.apple.Sharing.plist').get('BrowseAllInterfaces'):
+        bad.append('no BrowseAllInterfaces in the managed preferences')
+    return bad
+
+
 def check_ssh(root):
     bad = [] if job(root, 'dev.iosplus10.dropbear') else ['no dev.iosplus10.dropbear job in the launchd cache']
     if not job(root, 'dev.iosplus10.laurelnet'):
@@ -166,6 +175,8 @@ FEATURES = [
          stage=[XNU + 'Applications/XNUtils.app/XNUtils', XNU + 'usr/local/libexec/powermenu-helper', XNU + 'usr/local/bin/pmregister'],
          trees=[XNU], sources=['userland/laurel/xnutils', 'userland/rebootapp'],
          root=['Applications/XNUtils.app/XNUtils', 'Applications/XNUtils.app/Info.plist', 'usr/local/libexec/powermenu-helper', 'usr/local/bin/pmregister'], check=check_xnutils),
+    dict(name='airplay', switch='AIRPLAY', build='scripts/laurel/airplay-build.sh', stage=['out/laurel/airplay/root/usr/libexec/laurel-airplay'],
+         trees=['out/laurel/airplay/root'], sources=['userland/laurel/airplay'], root=['usr/libexec/laurel-airplay'], check=check_airplay),
     dict(name='ssh', switch='SSH', build='userland/ssh/fetch.sh, fetch-sdk.sh, build.sh', stage=['out/ssh/ios/dropbearmulti', 'out/ssh/ios/laurelnet'], trees=['out/ssh/ios'],
          sources=['userland/ssh'], root=['usr/local/bin/dropbearmulti', 'usr/local/bin/laurelnet'], check=check_ssh),
 ]

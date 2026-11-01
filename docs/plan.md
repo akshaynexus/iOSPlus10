@@ -1,6 +1,10 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+AirPlay and AirDrop round (2026-11-01, branch t3/laurel-airplay-airdrop, patches 2930 + 2931, NOT RUN ON THE PHONE): owner "AirPlay and AirDrop both aren't working: enable or fix them". docs/laurel_sprout/airplay-airdrop.md.
+Done: `LAUREL AWDL` self-check (only looks at scanned frames; sends nothing; awdl=0); `laurel-airplay` job and `LAUREL AIRPLAY` line (airplay=0, AIRPLAY=0); AirDrop preferences for en0 (AIRDROP_LAN=0); wifip2pd stays out.
+[V] qcacld monitor device has no Tx, OWL needs injection; negroni 0347 has no data path and never ran. [I] no awdl0 is the right state now. [V] mirroring has no AppleAVE2Driver. [I] Apple TV/HomePod may fail at /fp-setup or PTP. [U] AirPlay audio on en0: no blocker found, no run log.
+Results [V]: see the airplay-airdrop section in docs/notes.md. Next: root with t3/laurel-safari-net merged, boot, test steps in section 7 of the doc; the log decides the AirPlay fix; `first AWDL frame heard` decides whether the IBSS test is worth doing.
 Microphone round (2026-11-01, branch t3/laurel-mic, patch 2920 + plug-in mic-input.patch, built + host tests, NOT BOOTED): owner "Voice input is not working."
 Done: AMIC1 -> WCD937x ADC1 -> SoundWire TX -> TX macro DEC0 -> TX_CDC_DMA_TX_3 -> ADM -> ASM session 2 -> /dev/redwood-mic -> plug-in "Codec". On by default, mic=0, `LAUREL MIC: on|off`, `LAUREL MIC: first capture: rms N`. Capture gain (HAL + ioctl). XNUtils row. Camera hook stays, with a line that decides. Headphones + earpiece not done.
 Results [V]: 297/297 patches, 0 LSE, printf check OK, kernel sha256 570f52c889b9bece; plug-in 2a4afb9a810dc0ed; armv80-check kernel 21 (no new), plug-ins 0; mic-host-test + xnutils-test PASS. Nothing ran on the phone. Next: boot image + root flash (owner approves), docs/laurel_sprout/audio.md "Microphone", test steps.
