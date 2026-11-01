@@ -1,0 +1,74 @@
+20:03:02 LAUREL GPU: on: Adreno 610 chip 0x06010000, core 300 MHz, zap PAS 13 at 0x57515000, SMMU stage 1, pool 0xc0000000+0x20000000; RedwoodGPU published
+20:03:02 LAUREL GPU SMMU: on: stage 1; any process may open the GPU
+20:03:02 LAUREL GPU HOST PAGES: on: a client's own pages as GPU buffers (request 0x49), 1024 MiB a client at most
+20:03:03 LAUREL GPU CLOCK: on: GPLL0 300/600 MHz, measured GCC 300/600 CP 300/600 MHz, CP fence at 600 in 12 us; MX+CX NOM held
+20:03:03 LAUREL DDR: on: 1017 MHz measured, not lower than the GPU's bus level (1017 MHz at 600 MHz): no vote needed
+20:03:03 LAUREL GPU SMMU: fault FSR 00000402 FAR 00000000c1234000 FSYNR0 00000012 (access refused, the GPU goes on)
+20:03:04 LAUREL GPU SMMU: fault FSR 00000402 FAR 00000000c1235000 FSYNR0 00000012 (access refused, the GPU goes on)
+20:03:05 RedwoodGPU: client backboardd (open 1)
+20:03:05 RedwoodGPU: client m2vtest (open 2)
+20:03:05 RedwoodGPU: submission 7: 5 command buffers, the first at 0xc5c40000, 263 words
+20:03:06 RedwoodGPU: buffers: 39 made in 0 us each, 0 kept ones given again (0 MB kept); GPU pool 419 of 512 MB free in 7 ranges, 0 frees refused, 0 lost, 0 bad ranges passed over
+20:03:06 RedwoodGPU: 300 submissions in 5012 ms: 900 command buffers and 1170 buffers named, 3 KB out of the cache in 3 us a submission; GPU busy 41.2 %, core 300 MHz while busy, 297 MHz over the window
+20:03:06 RedwoodGPU: the GPU worked 2702 us on each of 6 (1 under 0.1 ms, 0 under 0.25, 0 under 0.5, 0 under 1, 0 under 2, 3 under 4, 2 longer; 16 ms in all)
+20:03:06 LAUREL GPU CLOCK: on: last minute 300 MHz 41 s, 600 MHz 19 s, 12 raises, 0 hot refusals; busy 22 % of the time, gpu 41.2 C, DDR 1017 MHz
+20:03:07 LAUREL METAL: on: Turnip a610 (chip 0x6010000, GMEM 132 KiB, 300 MHz, buffers up to 256 MiB), metal2vulkan plug-in NegroniMetal.bundle class NegroniMTLDevice on IOAcceleratorES
+20:03:07 LAUREL METAL CLIENTS: on: m2vtest passed: compute bad 0/1000, render bad 0/64, import bad 0/4096; GPU on, SMMU stage 1, plug-in registered
+20:03:07 |SpringBoard| noise line
+20:03:07 NMTL[26 SpringBoard]: device Turnip Adreno (TM) 610 in 10330 ms (turnip libvulkan_freedreno.dylib)
+20:03:07 NMTL[26 SpringBoard]: pipelines 6 compiled in 415 ms, 0 from cache (longest 117 ms, 0 failed; shader cache 0 hits 29 misses 23 writes)
+20:03:07 NMTL[97 chronod]: device Turnip Adreno (TM) 610 in 4136 ms
+20:03:07 NMTL[57 backboardd]: not listed in clients: no Metal device
+20:03:08 LAUREL BBD: on: /topaz/lib/libtopaz-inject.dylib inserted
+20:03:08 |backboardd| LAUREL GL DRAWN: on: surfaces the GPU drew get their new seed from the kernel (request 0x7d), no cache push for them
+20:03:08 |backboardd| redwood-gl: -setParameter:0x260 to:0: noted
+20:03:08 |backboardd| redwood-gl: frame 12: 135 GL calls, 4 draws, 8 triangles, 0 clears; 54154 us (6555 handing on, 1612 waiting, 2 copying out)
+20:03:09 SWEET FPS: 598 frames in 10003 ms, longest gap 33 ms, 2 late; a frame: 9000 us in present + latch, came 100 us after the tick
+20:03:09 LAUREL BACKLIGHT: on: DCS max 2047 (Samsung s6e8fco), DCS HS, DMA at line 1568, FIFO, reads in LP; panel power 0x9f
+20:03:09 LAUREL BACKLIGHT: brightness 128 of 255 from backboardd -> DBV 515 (108 nits): panel at it, 1 panel writes, 0 failed
+20:03:09 LAUREL PANEL: on: display off = light out + black frame, the panel stays awake (no 0x28/0x10); DCS HS
+20:03:10 LAUREL PANEL: wake 4: panel power 0x9f (start 0x9f)
+20:03:10 LAUREL PANEL: wake 5: panel power 0x9f (start 0x9f)
+20:03:10 LAUREL FB OWNER: on: after the first iOS frame only iOS frames reach the panel
+20:03:10 LAUREL FB OWNER: refused: x (caller 0x1) asked the panel to show
+20:03:10 LAUREL FB OWNER: refused: x (caller 0x2) asked the panel to show
+20:03:10 LAUREL FB OWNER: refused: x (caller 0x3) asked the panel to show
+20:03:11 LAUREL CPUFREQ: on: OSM governor 20 ms tick, UI hold gold 1401 MHz, silver 1305 MHz; 8 cpus
+20:03:11 LAUREL CPUFREQ: on: gold MHz:seconds in the last minute: 300:40 1401:12 2016:8
+20:03:11 LAUREL CPU TOP: 60 s, busy 41.2 s of 480: SpringBoard 21.2, backboardd 10.3; ended tasks 0.3; 88 tasks
+20:03:11 LAUREL THERMAL: on: cpu 38.5 C gpu 38.2 C | silver 1305 MHz (busy 0%, cap 1804) gold 300 MHz (busy 6%, cap 2016)
+20:03:11 LAUREL WIRED: on: buffer surfaces refused above 1795 MiB wired = 55% of max_mem 3264 MiB
+20:03:11 LAUREL RAM: on: 3264 MiB at 0xe1004000..0x1ad004000
+20:03:12 LAUREL BATTERY: on: PMI632 QG soc 77% vbat 3912 mV ibat -210 mA temp 30.5 C; usbin out chg state 0 icl 0 mA; spmi errors pon 0
+20:03:12 LAUREL CHARGER: on: SMB5 owner EE 0, boot FCC 2000 mA FV 4400 mV; hard JEITA hot 0x0 cold 0x0
+20:03:12 LAUREL CHARGER: on: SMB5 usbin apsd 0x01 rp 0x00, 30.5 C zone 1: ICL 1500 mA, FCC 2000 mA, FV 4400 mV, SDP
+20:03:13 LAUREL WIFI: on: modem up, WLFW ready, board id 0xff, MAC 00:00:00:00:00:00 (modem_b)
+20:03:13 LAUREL WIFI: tx queue: on: output queue with flow control
+20:03:13 LAUREL WIFI: band choice: on: 5 GHz first when it is heard well
+20:03:13 LAUREL WIFI: HT/VHT: on: 1 stream(s), VHT on 5 GHz
+20:03:13 LAUREL WIFI: scan limit: on
+20:03:13 LAUREL WIFI: link 5 GHz ch 44 5220 MHz, 80 MHz VHT QoS 1x1 | rx VHT mcs 7 sgi 80 MHz 325.0 Mbps | tx 433 Mbps | RSSI -57 dBm 3 bars
+20:03:14 LAUREL WIFI: path | tcp sent 10 retrans 1 timeouts 0 dup in 0 | connects 2 | dns asked 3 answers 3
+20:03:14 LAUREL BT: on: WCN39xx product 0x000f rom 0x0102, cmbtfw12.tlv + cmnv12.bin, 3000000 baud, BD_ADDR 02:4c:41:33:42:54
+20:03:14 LAUREL BT: ios: client control connected; bring-up on: WCN39xx product 0x000f rom 0x0102
+20:03:15 LAUREL CELL: on: SIM1 present (USIM detected), SIM2 absent; modem mode unknown; radio off: AP IPA side off: boot-arg ipa=0; data off (no IPA path; APN "?")
+20:03:15 LAUREL TESTCARD: on: ICCID 8991000123456789012 in a line
+20:03:15 LAUREL IPA: off: boot-arg ipa=0
+20:03:16 LAUREL CAMERA: /dev/negronicam: on: rear IMX586 preview 1920x1440 RAW10, Bayer RGGB, black 64
+20:03:16 LAUREL CAMERA: focus: on: DAC 0..1023, at 381, control 0x0
+20:03:16 LAUREL CAMERA: ios session: start (rear IMX586 1920x1440, line 12800 ns, frame 2604 lines = 30 fps, photograph mode on)
+20:03:16 LAUREL CAMERA: ios session: 30 frames in 1006 ms, 6 read, 1920x1440 exposure 2556 lines (32716 us) gain 1741/256, frame 2604 lines; above black: mean 0; VFE errors 0 (0)
+20:03:16 LAUREL CAMERA: ios: memory at frame 900: footprint 310 MB, malloc 20 MB; by VM tag: 1 2 MB
+20:03:17 LAUREL AUDIO: on: ADSP up (APR), MAX98937 rev 0x43, SEC_MI2S 48 kHz (2 periods back in 13 ms)
+20:03:17 TopazAudio: t=0.031 adsp SMP2P item 443 appeared (340 bytes)
+20:03:17 TopazAudio: t=60.200 status: slave-kernel 00000006, qrtr node 5, 13 services, pd-mapper 4, apr rx 23 core 1, 0 frames in, 0 starts
+20:03:18 LAUREL RTC: on: 2026-11-01 20:02:30 UTC (raw 12345 + saved offset 678)
+20:03:18 LAUREL SSD: on: UFS reports solid state (HFS: no file relocation, no hot files)
+20:03:18 SWEET UFS: link up, gear 3
+20:03:18 torch by mediaserverd; start result: LAUREL TORCH: on: PMI632 flash LED SID3 0xd300
+20:03:19 LAUREL STATS: on: kern.laurel_stats reads the console ring (112 state + 128 line slots), no work in the drivers
+20:03:19 CRASH driverkitd[68] sig 9 code 0x0 sub 0x0 slide 0x20220000 mh 0x1003f0000
+20:03:19 CRASH driverkitd pc 0x1e2831d98 lr 0x1a13c43a4 sp 0x16fa0d1f0
+20:03:19 CRASH driverkitd reason ns 1 code 0x7: (none)
+20:05:13 CRASH syncdefaultsd[121] sig 6 code 0x0 sub 0x0 slide 0x20220000 mh 0x100c30000
+20:06:13 CRASH syncdefaultsd[122] sig 6 code 0x0 sub 0x0 slide 0x20220000 mh 0x100c30000

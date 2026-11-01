@@ -79,7 +79,7 @@ Actions: **ON** = enabled by this branch. **DRIVER** = needs a driver. **OFF** =
 - [V] Setup is skipped, activation seeded (`data_ark`), no restriction or managed-configuration key in our root scripts.
 - [V] The 36 `Disabled` jobs in the cache are Apple's stock state (Watch companions, `iap2d`, `sntpd`, ...). No change.
 - [V] No script hides an app. SpringBoard hides by `SBAppTags` and MobileGestalt: `any-telephony`, `magnetometer`, `arkit`, `watch-companion`, `MusicStore`. We do not fake answers: an icon must work.
-- Negroni extras not ported: XNUtils (power menu), `negroni-locd`, fingerprint daemon. The stock power-off slider exists. Not a disabled stock feature.
+- Negroni extras not ported: `negroni-locd`, fingerprint daemon. XNUtils is ported: `docs/laurel_sprout/xnutils.md`. The stock power-off slider exists. Not a disabled stock feature.
 
 ## 3. What changed
 

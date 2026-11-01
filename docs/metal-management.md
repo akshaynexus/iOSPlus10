@@ -233,6 +233,8 @@ The installed **XNUtils** app (`/Applications/XNUtils.app`) displays:
 * Supported Metal Feature Sets and VRAM limits
 * Quick power controls (Reboot to Bootloader, Restart System, Shut Down)
 
+Mi A3: another build with other files and live stats: `docs/laurel_sprout/xnutils.md`.
+
 ---
 
 ## 4. On-phone test plan (2026-10-26, audit follow-up; the phone ran Android when this was written)

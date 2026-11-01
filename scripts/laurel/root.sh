@@ -12,7 +12,7 @@
 #        CAMERA=0 skips), root-statusbar.py
 #        (status bar provider for 360x780 pt + the waterdrop dylib for SpringBoard from out/laurel/notch, scripts/laurel/notch-build.sh;
 #        STATUSBAR=0 skips both, NOTCH=0 only the dylib), root-flashlight.sh (the flashlight's one owner: camera plug-in, else its own plug-in; TORCH=0 = no button) and root-brightness.py
-#        (auto-brightness off; BRIGHTNESS=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
+#        (auto-brightness off; BRIGHTNESS=0 skips), root-xnutils.sh (XNUtils.app; XNUTILS=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
 # Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
 #   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg
@@ -103,6 +103,8 @@ STATUSBAR=${STATUSBAR:-1} NOTCH=${NOTCH:-1} python3 -I "$REPO/scripts/laurel/roo
 TORCH=${TORCH:-1} bash "$REPO/scripts/laurel/root-flashlight.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-flashlight.sh failed; root built without the flashlight" >&2
 # auto-brightness off: no ambient light sensor for iOS (kernel 2201; docs/laurel_sprout/brightness.md); BRIGHTNESS=0 skips
 BRIGHTNESS=${BRIGHTNESS:-1} python3 -I "$REPO/scripts/laurel/root-brightness.py" "$mnt"
+# XNUtils (docs/laurel_sprout/xnutils.md): system app + setuid helper; live stats, Metal and GL switches, power actions; XNUTILS=0 skips
+XNUTILS=${XNUTILS:-1} bash "$REPO/scripts/laurel/root-xnutils.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-xnutils.sh failed; root built without XNUtils" >&2
 # SSH (dropbear on 192.168.7.2:22, dash, toybox, usbreboot, oslogstream; docs/usb-network.md) when the iOS
 # builds exist (userland/ssh/build.sh, Linux or macOS). SSH=0: none. Host key and known_hosts as root-add-ssh.py.
 if [ "${SSH:-1}" = 1 ] && [ -x "$REPO/out/ssh/ios/dropbearmulti" ]; then
