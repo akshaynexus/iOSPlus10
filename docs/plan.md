@@ -776,3 +776,13 @@ Not booted. Next: boot; expect `LAUREL GPU SMMU: check 1..2`, then `on: stage 1`
 `pass-through: the CP goes on` + `LAUREL GPU: on ... SMMU pass-through`; BT `fw: cmbtfw12.tlv ...` and `on: WCN39xx product 0x000f`.
 The failure line's FSR/FSYNR0/walk text decides the next table fix. Details: docs/laurel_sprout/gpu.md "Stage-1 check failure",
 docs/laurel_sprout/bluetooth.md "The chip is WCN3950 family".
+
+## Mi A3: SMMU stage 1, Bluetooth, RTC, SIM status on the phone (2026-11-01 07:45, coordinator)
+
+Observed [V, usblog boot 07:44:5x, laurel-int-1 8660387, root of 07:16]:
+- `LAUREL GPU SMMU: on: stage 1, context bank 0 ... any process may open the GPU` (checks 1-4 passed, fences 56/61 us);
+  `LAUREL GPU: on: ... SMMU stage 1`; `LAUREL METAL: on`.
+- `LAUREL BT: on: WCN39xx product 0x000f rom 0x0102, cmbtfw12.tlv + cmnv12.bin, 3000000 baud` (SE DMA, WCN3950 family).
+- `LAUREL RTC: saved offset ...` after the host settime.
+- `LAUREL CELL: on: SIM1 present (USIM detected), SIM2 absent; ... radio off: no AP IPA driver yet`; NAS1 BIND_SUBSCRIPTION error
+  0x3, DMS GET_OPERATING_MODE error 0x4a (to check in step 2).
