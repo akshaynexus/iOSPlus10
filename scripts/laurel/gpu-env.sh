@@ -7,6 +7,7 @@ TOPAZ=$EXT/ios-topaz                     # userland/gpu (eagl, gl_osmesa, topaz_
 SCION=$EXT/hackios-scion                 # userland/mkeagl.py + src/eagl_slots.txt (the EAGL table generator)
 G=$OUT/laurel/gpu                        # every build product of the GPU user space
 LAUREL_MESA_PATCHES=$REPO/userland/laurel/gpu/mesa-patches   # our redwood-drm patches (mesa-linux.sh)
+LAUREL_MESA_TREE_PATCHES=$REPO/userland/laurel/gpu/mesa-tree-patches   # our Mesa tree patches, on top of topaz's (mesa-linux.sh)
 DL=$G/dl                                 # downloads (untrusted until the hash matches)
 DEPS=$G/deps                             # SDK, Python venv
 
@@ -57,6 +58,7 @@ FW_DIR_ON_PHONE=/usr/share/firmware/laurel
 gpu_mesa_inputs() {
   cat "$TOPAZ"/userland/mesa/*.patch "$TOPAZ"/userland/mesa/redwood-drm/*
   cat "$LAUREL_MESA_PATCHES"/*.patch 2>/dev/null || true
+  cat "$LAUREL_MESA_TREE_PATCHES"/*.patch 2>/dev/null || true
 }
 
 gpu_die() { echo "$(basename "$0"): $*" >&2; exit 1; }

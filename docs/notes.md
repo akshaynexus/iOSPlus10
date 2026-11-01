@@ -4669,3 +4669,16 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Tool: `dsc-dis.py` + `dsc-annotate.py` read the cache; a class's relative method list: selector base 0x18229979f in 20H392, entry size 12.
 - Build [V]: merged with origin/laurel-sprout 3ee7345. kernel-linux.sh 291/291 patches, 90 laurel, 0 failed, 0 LSE, sha256 fb4252a3fd2db69f... (no kernel change here); plug-in 164336 bytes, sha256 320ac73d62013137...; cam-test.sh OK; cam-leak-test.sh OK (cam5 + cam6); camera-cache-check.sh PASS, 11 hooks, 140 imports (run before the merge and the noise fix; neither changes the hook table or the imports).
 - Next: root (userdata) + owner test, section 11. No boot image for this change.
+## Mi A3: blank widgets, false colours, GL crash (boot 2026-11-01 20:02; branch t3/laurel-render-fixes; built, NOT BOOTED)
+
+- Full trace: docs/laurel_sprout/metal.md section 12; formats and crash: gpu.md "IOSurface formats and blank layers".
+- [V] `far` in the `CRASH` line can be stale: backboardd's `far` 0x10179b91e (prot 1/7, libtopaz-gl) had nothing to do with its sig 11. Read `sub` and `topaz-crash: signal 11 at address`: 0x18. A "write to a read-only mapping" theory came from that field.
+- [V] `topaz-crash` names in libOSMesa are the nearest export: use `llvm-symbolizer --obj=out/laurel/gpu/dsym/libOSMesa.8.dylib.dSYM/Contents/Resources/DWARF/libOSMesa.8.dylib --inlining 0xOFFSET`.
+- [V] CA ignores `-attachImage:`'s answer. A log line "not done" there means a blank layer, whatever the format.
+- [V] `_RB4` = Metal 542 RGB8_444_2P: 1 + 2 bytes, not the 4 + 1 of RGB10A8_2P_XR10 (550). flame/0016's `surfaceOSType` maps only 4 + 1 to `b3a8`: `_RB4` stays itself, which is right for m2v. RB picks it for opaque layers on family >= Apple3, whatever RB_COLOR_MODE says about depth.
+- [V] `SWEET SURF: ... create` stops after 64 lines in a boot, and prints the format after the kernel's rewrite: "formats seen" from those lines proved nothing about posters. New `SWEET SURF: kind:` has one line per process + OSType, with what the client asked for.
+- [V] Page tables came from the pool they map: pool full = scattered fallback dead. Now held at first use.
+- Tools: `scripts/debug/render-re.sh` (disassembly into out/rend; `ipsw dyld disass --quiet` 20 s; with symbols it needs `--cache` on a writable path, a copy of out/smp-symbolize/a2s.cache saves 2 min). `ipsw dyld symaddr` has no `--cache`. RenderBox pixel format table: 0x1e6945390.. 32 bytes an entry (format, flags, OSType at +0xc).
+- Gotcha: a forgotten `cat > file` in a foreground shell waits for stdin until the tool's timeout; pass `</dev/null` to `scripts/bg.sh` too.
+- Honest limit: nothing here ran on the phone. Host: decoder test (ASan, UBSan) passes; kernel and userland build. `xr_pass`, the sum over planes and the `contents` lines have run nowhere.
+- Built 20:54: 287/287 patches, kernel.development.sweet.4k sha256 80c684f2662a97fa, LSE/RCpc 0; armv80-check 21 (the same count as the 19:46 kernel: no new one). libtopaz-gl 11af3da001e94d1a, NegroniMetal 67652deae032f75e, metal-build check PASS, 0 instructions newer than ARMv8.0 in the userland. Gotcha: a reflinked `out/metal/build` keeps the main checkout's CMake cache: `rm -rf out/metal/build` in a worktree.
