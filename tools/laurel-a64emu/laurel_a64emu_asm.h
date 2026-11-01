@@ -3,7 +3,7 @@
  *   kernel: osfmk/arm64/machine_routines_asm.s, before copyio_recover_table_end (a range after that symbol is not in the table
  *           that find_copyio_recovery_entry() walks: a fault there is a panic).
  *   test:   tools/laurel-a64emu/test/harness_asm.S
- * The includer defines LEXT, EXT, PUSH_FRAME, POP_FRAME, ARM64_STACK_PROLOG, ARM64_STACK_EPILOG and the macro
+ * The includer defines A64S(name) (the symbol of a C name), PUSH_FRAME, POP_FRAME, ARM64_STACK_PROLOG, ARM64_STACK_EPILOG and the macro
  * A64EMU_RECOVER_RANGE end, recovery.
  *
  * Between LDXR and STXR there is no memory access and no call: the code is a short loop, as the architecture wants for forward
@@ -19,8 +19,8 @@
 .macro A64EMU_RMW name, ldx, stx, r, sxa, sxb, post
 	.text
 	.align	2
-	.globl	EXT(\name)
-LEXT(\name)
+	.globl	\name
+\name:
 	ARM64_STACK_PROLOG
 	PUSH_FRAME
 	mov	w14, #A64EMU_SPINS
@@ -86,10 +86,10 @@ LEXT(\name)
 .endmacro
 
 .macro A64EMU_RMW4 s, ldx, ldax, stx, stlx, r, sxa, sxb
-	A64EMU_RMW a64emu_rmw_\s,    \ldx,  \stx,  \r, "\sxa", "\sxb", "nop"
-	A64EMU_RMW a64emu_rmw_\s\()_a,  \ldax, \stx,  \r, "\sxa", "\sxb", "nop"
-	A64EMU_RMW a64emu_rmw_\s\()_l,  \ldx,  \stlx, \r, "\sxa", "\sxb", "nop"
-	A64EMU_RMW a64emu_rmw_\s\()_al, \ldax, \stlx, \r, "\sxa", "\sxb", "dmb ish"
+	A64EMU_RMW A64S(a64emu_rmw_\s),    \ldx,  \stx,  \r, "\sxa", "\sxb", "nop"
+	A64EMU_RMW A64S(a64emu_rmw_\s\()_a),  \ldax, \stx,  \r, "\sxa", "\sxb", "nop"
+	A64EMU_RMW A64S(a64emu_rmw_\s\()_l),  \ldx,  \stlx, \r, "\sxa", "\sxb", "nop"
+	A64EMU_RMW A64S(a64emu_rmw_\s\()_al), \ldax, \stlx, \r, "\sxa", "\sxb", "dmb ish"
 .endm
 
 	A64EMU_RMW4 b, ldxrb, ldaxrb, stxrb, stlxrb, w, "sxtb w12, w10", "sxtb w13, w2"
@@ -104,8 +104,8 @@ LEXT(\name)
 .macro A64EMU_CASP name, ldxp, stxp, post
 	.text
 	.align	2
-	.globl	EXT(\name)
-LEXT(\name)
+	.globl	\name
+\name:
 	ARM64_STACK_PROLOG
 	PUSH_FRAME
 	mov	w14, #A64EMU_SPINS
@@ -131,17 +131,17 @@ LEXT(\name)
 	ARM64_STACK_EPILOG
 .endmacro
 
-	A64EMU_CASP a64emu_casp,    ldxp,  stxp,  "nop"
-	A64EMU_CASP a64emu_casp_a,  ldaxp, stxp,  "nop"
-	A64EMU_CASP a64emu_casp_l,  ldxp,  stlxp, "nop"
-	A64EMU_CASP a64emu_casp_al, ldaxp, stlxp, "dmb ish"
+	A64EMU_CASP A64S(a64emu_casp), ldxp,  stxp,  "nop"
+	A64EMU_CASP A64S(a64emu_casp_a), ldaxp, stxp,  "nop"
+	A64EMU_CASP A64S(a64emu_casp_l), ldxp,  stlxp, "nop"
+	A64EMU_CASP A64S(a64emu_casp_al), ldaxp, stlxp, "dmb ish"
 
 /* int a64emu_load*(addr, size_log2, uint64_t *out), int a64emu_store*(addr, size_log2, val): one access, single-copy atomic when aligned */
 .macro A64EMU_LOAD name, b, h, w, x
 	.text
 	.align	2
-	.globl	EXT(\name)
-LEXT(\name)
+	.globl	\name
+\name:
 	ARM64_STACK_PROLOG
 	PUSH_FRAME
 	A64EMU_RECOVER_RANGE 9f, 9f
@@ -167,8 +167,8 @@ LEXT(\name)
 .macro A64EMU_STORE name, b, h, w, x
 	.text
 	.align	2
-	.globl	EXT(\name)
-LEXT(\name)
+	.globl	\name
+\name:
 	ARM64_STACK_PROLOG
 	PUSH_FRAME
 	A64EMU_RECOVER_RANGE 9f, 9f
@@ -190,7 +190,7 @@ LEXT(\name)
 	ARM64_STACK_EPILOG
 .endmacro
 
-	A64EMU_LOAD  a64emu_load,      ldrb, ldrh, ldr,  ldr
-	A64EMU_LOAD  a64emu_load_acq,  ldarb, ldarh, ldar, ldar
-	A64EMU_STORE a64emu_store,     strb, strh, str,  str
-	A64EMU_STORE a64emu_store_rel, stlrb, stlrh, stlr, stlr
+	A64EMU_LOAD  A64S(a64emu_load), ldrb, ldrh, ldr,  ldr
+	A64EMU_LOAD  A64S(a64emu_load_acq), ldarb, ldarh, ldar, ldar
+	A64EMU_STORE A64S(a64emu_store), strb, strh, str,  str
+	A64EMU_STORE A64S(a64emu_store_rel), stlrb, stlrh, stlr, stlr

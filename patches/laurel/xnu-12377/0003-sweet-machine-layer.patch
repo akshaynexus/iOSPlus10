@@ -400,7 +400,7 @@ index 53f9ce5..55b3f19 100644
  cpu_timebase_init(boolean_t from_boot)
  {
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 0554aa8..eb04389 100644
+index 0554aa8..9e6f9cf 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -32,6 +32,7 @@
@@ -495,12 +495,12 @@ index 0554aa8..eb04389 100644
  	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
  
 +#if defined(SWEET)
-+	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && sweet_emulate_lse(state, instr)) {
++	/* laurel iOS 26: words newer than ARMv8.0 (osfmk/arm64/laurel_abi.c, laurel_a64emu.c). With laurelemu=0 the older LSE path below still runs */
++	extern bool laurel_abi_trap(arm_saved_state_t *state, uint32_t instr);
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && laurel_abi_trap(state, instr)) {
 +		return;
 +	}
-+	/* laurel iOS 26: PAC instructions outside the hint space, LDAPUR, STLUR (osfmk/arm64/laurel_abi.c) */
-+	extern bool laurel_abi_emulate(arm_saved_state_t *state, uint32_t instr);
-+	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && laurel_abi_emulate(state, instr)) {
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && sweet_emulate_lse(state, instr)) {
 +		return;
 +	}
 +#endif
@@ -508,7 +508,22 @@ index 0554aa8..eb04389 100644
  #if CONFIG_DTRACE
  
  	if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
-@@ -3008,6 +3092,42 @@ sleh_irq(arm_saved_state_t *state)
+@@ -2821,6 +2905,14 @@ handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 	codes[1] = instr;
+ 
++#if defined(SWEET)
++	/* a read of an Apple register or DIT can arrive here instead of as undefined; the same emulator */
++	extern bool laurel_abi_trap(arm_saved_state_t *state, uint32_t instr);
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && laurel_abi_trap(state, instr)) {
++		return;
++	}
++#endif
++
+ 	exception_triage(exception, codes, numcodes);
+ 	__builtin_unreachable();
+ }
+@@ -3008,6 +3100,42 @@ sleh_irq(arm_saved_state_t *state)
  #endif
  
  
@@ -551,7 +566,7 @@ index 0554aa8..eb04389 100644
  	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
  
  #if USE_APPLEARMSMP
-@@ -3019,6 +3139,7 @@ sleh_irq(arm_saved_state_t *state)
+@@ -3019,6 +3147,7 @@ sleh_irq(arm_saved_state_t *state)
  	    cdp->interrupt_nub,
  	    cdp->interrupt_source);
  #endif

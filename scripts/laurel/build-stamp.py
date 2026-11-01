@@ -77,6 +77,9 @@ def ios26_files():
     for d in (p26, os.path.join(p26, 'stage'), os.path.join(p26, 'post')):
         files.update({n: os.path.join(d, n) for n in listdir_files(d) if n.endswith(('.patch', '.sh', '.txt'))})
     files['0001-non-apple-soc-base.patch'] = os.path.join(REPO, 'patches/xnu-12377/0001-non-apple-soc-base.patch')
+    # the EL0 emulator: real files, staged into osfmk/arm64 (patches/laurel/xnu-12377/stage/0090), and the same files as the host test
+    for n in ('laurel_a64emu.c', 'laurel_a64emu.h', 'laurel_a64emu_asm.h'):
+        files[n] = os.path.join(REPO, 'tools/laurel-a64emu', n)
     for s in ('scripts/laurel/ios26-series.py', 'scripts/laurel/ios26-env.sh', 'scripts/ios26/apply-series.py'):
         files[os.path.basename(s)] = os.path.join(REPO, s)
     return files

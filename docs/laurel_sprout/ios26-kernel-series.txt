@@ -10,6 +10,7 @@
 0026-stage-hfs.sh                                              skipped: replaced: hfs-627 is the xnu-8796 pair; patches/laurel/xnu-12377/stage/0026-stage-hfs-715.sh stages the 12377 pair at the same path
 0019-stage-libpthread-539.sh                                   ran
 0026-stage-hfs-715.sh                                          ran
+0090-stage-a64emu.sh                                           ran
 == series (slop + patches/xnu)
 0001-new-clang-drop-removed-auto-var-init-flag.patch           base: base 0002
 0002-new-clang-backport-UIO_STACKBUF.patch                     skipped: upstream: 12377 has UIO_STACKBUF (bsd/sys/uio_internal.h) and uses it at each call site

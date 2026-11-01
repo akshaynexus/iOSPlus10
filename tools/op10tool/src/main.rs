@@ -12,6 +12,7 @@ mod ctl;
 mod dsc;
 mod dualboot;
 mod fat;
+mod hfs;
 mod im4p;
 mod img2simg;
 mod ipsw;
@@ -63,6 +64,9 @@ enum DualbootCmd {
     },
     /// The area size to allocate: donor image bytes x expand + /private/var margin
     Size {
+        /// The owner's area in GiB: print the largest HFS+ volume it holds (header and log subtracted)
+        #[arg(long)]
+        area_gib: Option<u64>,
         #[arg(long, value_delimiter = ',', value_parser = parse_u64)]
         donor_bytes: Vec<u64>,
         #[arg(long, default_value_t = 1.68)]
@@ -196,6 +200,36 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Make an HFSX volume image from a spec, with no mount and no root access (scripts/laurel/ios26-root.sh)
+    HfsBuild {
+        #[arg(long)]
+        spec: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Volume size in bytes, a multiple of 4096
+        #[arg(long)]
+        size: u64,
+        #[arg(long, default_value = "iOSRoot")]
+        label: String,
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Refuse when less free space stays after the data (bytes)
+        #[arg(long, default_value_t = 0)]
+        min_free: u64,
+        /// Volume dates: seconds since 1970 (same value, same image)
+        #[arg(long, default_value_t = 1_700_000_000)]
+        created: u64,
+        /// Refuse a bigger volume: the dual boot area minus its header and log
+        #[arg(long, default_value_t = u64::MAX)]
+        max_size: u64,
+    },
+    /// Check an image of hfs-build: volume structure, B-tree order, threads, valences, extents, bitmap, every file against the manifest
+    HfsVerify {
+        #[arg(long)]
+        image: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+    },
     /// Disassemble a function of a cache image, or list callers of a symbol (--xref)
     A64Dis {
         #[arg(long)]
@@ -281,7 +315,7 @@ fn main() -> Result<()> {
             DualbootCmd::Check { table } => dualboot::check(&table),
             DualbootCmd::Show { table } => dualboot::show(&table),
             DualbootCmd::Stream { table, image, index, null } => dualboot::stream(&table, &image, index.as_deref(), null),
-            DualbootCmd::Size { donor_bytes, expand, var_gib } => dualboot::size(&donor_bytes, expand, var_gib),
+            DualbootCmd::Size { donor_bytes, expand, var_gib, area_gib } => dualboot::size(&donor_bytes, expand, var_gib, area_gib),
         },
         Cmd::Img2simg { input, output } => img2simg::img2simg(&input, &output),
         Cmd::Simg2img { input, output } => img2simg::simg2img(&input, &output),
@@ -300,6 +334,10 @@ fn main() -> Result<()> {
             lower::run(cache.as_deref(), &macho, &out, &rules, page_shift, &dead_image, plan)
         }
         Cmd::A64Verify { orig, lowered, dead_image, macho_orig } => lower::verify(&orig, &lowered, &dead_image, macho_orig.as_deref()),
+        Cmd::HfsBuild { spec, out, size, label, manifest, min_free, created, max_size } => {
+            hfs::build(&hfs::BuildOpts { spec: &spec, out: &out, size, label: &label, manifest: &manifest, min_free, created, max_size })
+        }
+        Cmd::HfsVerify { image, manifest } => hfs::verify(&image, &manifest),
         Cmd::A64Abi { cache, out } => abi::run(&cache, &out),
         Cmd::A64Dis { cache, image, symbol, xref, count } => abi::dis(&cache, &image, &symbol, xref, count, std::path::Path::new("out/ios26/tmp-dis")),
         Cmd::Ctl { command, host } => ctl::run(command, &host),

@@ -1,8 +1,7 @@
 /*
  * The host test of laurel_a64emu: the same asm as the kernel, plus the code that runs one case. See scripts/laurel/test-a64emu.sh.
  */
-#define LEXT(x) x:
-#define EXT(x) x
+#define A64S(x) x
 .macro PUSH_FRAME
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
