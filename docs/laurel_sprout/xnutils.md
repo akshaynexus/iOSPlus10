@@ -31,7 +31,7 @@ The OnePlus version stays as it is in `userland/rebootapp` (macOS + Xcode, negro
 | Metal device card | `MTLCreateSystemDefaultDevice` | **removed**: the app must not need Metal. State comes from the kernel and files | owner |
 | Layout | 34 pt title, fixed margins, no launch screen | table with no fixed width, safe area from UIKit, `UILaunchScreen` (else iOS gives the app a small 320 x 480 frame [I]) | `rtc-statusbar.md`: 360 x 780 pt, 38 + 29 pt |
 
-Metal modes: `auto` writes the gate's mark and the probes to `clients` and `clients.local`, removes `gate` and `off`; the gate decides at the next boot (`m2vtest`). `all` = own list `* -backboardd -mediaserverd`, the gate leaves it alone. `probes` = own list. `off` = the off file.
+Metal modes: `auto` writes the gate's mark and the probes to `clients` and `clients.local`, removes `gate` and `off`; the gate decides at the next boot (`m2vtest`). `all` = own list `* -backboardd`, the gate leaves it alone. `probes` = own list. `off` = the off file.
 If t3/laurel-mediaserverd-metal changes the gate's wide list, change `XT_METAL_WIDE` in `collect.h` with it.
 
 Registration [V negroni, I here]: `root.sh` makes a new root: no LaunchServices store, no `LastBuildInfo.plist`, so lsd's first seed registers every app in `/Applications` with no Setup step, as for the 32 apps of `root-system-features.py`. Owner saw this path work on negroni (notes "XNUtils rename", the phone showed the app of the root).

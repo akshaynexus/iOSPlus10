@@ -15,7 +15,7 @@
  * The caller check says "mobile code to root, for these verbs only" (userland/rebootapp/README.md "Privileges").
  *
  * metal:  auto    list with the gate's mark + the probes, in both list files, off file removed: the gate decides at the next boot
- *         all     own list "* -backboardd -mediaserverd" (the gate's wide list, never changed by the gate)
+ *         all     own list "* -backboardd" (the gate's wide list, never changed by the gate)
  *         probes  own list, the probes only
  *         off     the off file: no process gets a device
  * Exit codes: 0 ok / 1 a call failed / 2 usage / 3 no reboot-mode sysctl / 4 caller refused / 5 not setuid root.

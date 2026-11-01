@@ -61,7 +61,7 @@ if unshare -r true 2>/dev/null; then
     -include sys/types.h -include stdint.h -o "$D/helper" "$S/helper.c" "$S/helper_files.c" "$S/test/host_stubs.c" "$S/report_core.c" "$S/report_row.c" "$S/report_gfx.c" "$S/report_sys.c" "$S/report_io.c" 2>"$D/helper.log" || { cat "$D/helper.log"; exit 1; }
   h() { unshare -r "$D/helper" "$@"; }
   C=$F/private/var/db/negronimetal/clients L=$F/System/Library/Extensions/NegroniMetal.bundle/clients.local
-  h metal all; [ "$(tail -1 "$C")" = "* -backboardd -mediaserverd" ] && cmp -s "$C" "$L" && ! head -1 "$C" | grep -q laurel-metal-gate || { echo "xnutils-test: FAIL: metal all" >&2; fail=1; }
+  h metal all; [ "$(tail -1 "$C")" = "* -backboardd" ] && cmp -s "$C" "$L" && ! head -1 "$C" | grep -q laurel-metal-gate || { echo "xnutils-test: FAIL: metal all" >&2; fail=1; }
   h metal off; [ -f "$F/private/var/db/negronimetal/off" ] || { echo "xnutils-test: FAIL: metal off" >&2; fail=1; }
   h metal probes; [ "$(tail -1 "$C")" = "metalprobe m2vtest carenderprobe layerprobe" ] && [ ! -e "$F/private/var/db/negronimetal/off" ] || { echo "xnutils-test: FAIL: metal probes" >&2; fail=1; }
   : > "$F/private/var/db/negronimetal/gate"

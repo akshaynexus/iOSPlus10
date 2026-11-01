@@ -16,7 +16,7 @@
 /* userland/laurel/metal/metal_gate.c: the gate changes a list only when its first line is this mark */
 #define XT_GATE_MARK     "# laurel-metal-gate"
 #define XT_METAL_PROBES  "metalprobe m2vtest carenderprobe layerprobe"
-#define XT_METAL_WIDE    "* -backboardd -mediaserverd"
+#define XT_METAL_WIDE    "* -backboardd"
 /* userland/laurel/gpu/bbd_wrap.c reads this file at each start of backboardd */
 #define XT_GL_DIR        XT_ROOT "/private/var/db/laurelgl"
 #define XT_GL_OFF        XT_GL_DIR "/off"
