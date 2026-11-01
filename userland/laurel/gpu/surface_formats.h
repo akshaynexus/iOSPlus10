@@ -68,6 +68,26 @@ void lsf_contents_of_pixels(const struct lsf_format *f, const uint8_t *pixels, s
 void lsf_contents_of_rb4(const struct lsf_plane *plane, uint32_t width, uint32_t height, struct lsf_contents *c);
 void lsf_contents_of_words(enum lsf_kind kind, const uint8_t *words, size_t row, uint32_t width, uint32_t height, struct lsf_contents *c);
 
+/*
+ * laurel 0006: the surfaces that were black at a first draw and have not been seen lit since, for the LAUREL BLANK line. Note: new surface (the caller
+ * fills `who`), NULL when it is on the list already or the list is full. Filled: off the list, counted with the time it took. Take: one older than
+ * `age` ms comes off the list.
+ */
+#define LSF_BLANKS 32
+struct lsf_blank {
+	uint32_t surface, pixels, width, height;
+	uint64_t since_ms;
+	char who[20];
+};
+struct lsf_blanks {
+	struct lsf_blank list[LSF_BLANKS];
+	unsigned count, lost, seen, filled;
+	uint64_t filled_ms;
+};
+struct lsf_blank *lsf_blank_note(struct lsf_blanks *b, uint32_t surface, uint32_t pixels, uint32_t width, uint32_t height, uint64_t now_ms);
+bool lsf_blank_filled(struct lsf_blanks *b, uint32_t surface, uint64_t now_ms);
+bool lsf_blank_take(struct lsf_blanks *b, uint64_t now_ms, uint64_t age, struct lsf_blank *out);
+
 /* Four characters for the log, printable or dots. */
 void lsf_name(uint32_t ostype, char name[5]);
 

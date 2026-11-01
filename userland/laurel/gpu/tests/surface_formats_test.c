@@ -135,6 +135,23 @@ main(void)
 		printf("%s contents one lit: %u lit %u unlike\n", c.lit == 1 && c.unlike == 1 ? "ok  " : "FAIL", c.lit, c.unlike);
 		failed += !(c.lit == 1 && c.unlike == 1);
 	}
+	{	/* laurel 0006: the list behind LAUREL BLANK */
+		static struct lsf_blanks b;
+		struct lsf_blank out;
+		struct lsf_blank *n = lsf_blank_note(&b, 7, FOURCC("BGRA"), 720, 1560, 100);
+		int bad = n == NULL || lsf_blank_note(&b, 7, FOURCC("BGRA"), 720, 1560, 150) != NULL || b.count != 1 || b.seen != 2;
+
+		bad |= lsf_blank_take(&b, 1000, 2000, &out);    /* too young */
+		bad |= !lsf_blank_filled(&b, 7, 400) || b.count != 0 || b.filled != 1 || b.filled_ms != 300 || lsf_blank_filled(&b, 7, 500);
+		(void)lsf_blank_note(&b, 8, 0, 1, 1, 0);
+		bad |= !lsf_blank_take(&b, 5000, 2000, &out) || out.surface != 8 || b.count != 0;
+		for (uint32_t i = 0; i < LSF_BLANKS + 3; i++) {
+			(void)lsf_blank_note(&b, 100 + i, 0, 1, 1, i);
+		}
+		bad |= b.count != LSF_BLANKS || b.lost != 3;
+		printf("%s LAUREL BLANK list\n", bad ? "FAIL" : "ok  ");
+		failed += bad;
+	}
 	printf(failed ? "%d FAILED\n" : "all good\n", failed);
 	return failed != 0;
 }

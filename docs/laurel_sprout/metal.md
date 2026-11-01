@@ -532,3 +532,8 @@ Rebuild: Metal stage + gate + camera plug-in = root (userdata) only: `scripts/la
 ## 14. RenderBox and `_RB4` on the A610 (boot 22:08; plug-in; built, NOT BOOTED)
 
 chronod's `primitive_image` and `primitive_gradient` on fmt 542 + depth 260 are refused by m2v (`Unsupported(Format at Color(0))`): draws skipped, widgets without images and gradients. On a 610 `supportsFamily:` answers RenderBox NO from Apple3 on: `hasYCbCrFormats` and `hasXR10Formats` are off, opaque layers are BGRA. `NEGRONIMETAL_RB_FAMILY=0` turns it off. Evidence and addresses: gpu.md "Frame budget", Widgets.
+
+## 15. Maps black, widgets refused (boot 23:28; kernel 2916; built, NOT BOOTED)
+
+Walk of the path, evidence, lines: gpu.md "Black layers". For the Metal side [V]: `present` runs after the GPU's completion (flame `-finish`), the seed moves there before it, caches are upkept at import, submit, commit and completion. No Metal fault in the log. A nil `nextDrawable` is what a refused surface gives: `LAUREL WIRED: REFUSED, A LAYER STAYS BLACK`. Maps itself has no log yet.
+

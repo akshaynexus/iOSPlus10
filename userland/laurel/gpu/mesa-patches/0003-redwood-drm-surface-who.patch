@@ -1,0 +1,31 @@
+laurel 2916: redwood_drm_surface_who() (request 0x7b kRedwoodWho): the process that created an IOSurface, for eagl.c's LAUREL BLANK line (dlsym).
+
+--- a/redwood_drm.c
++++ b/redwood_drm.c
+@@ -185,6 +185,26 @@
+ 	return 0;
+ }
+ 
++/* laurel 2916: which process created an IOSurface. 0, or an errno (ENOSYS: a kernel without request 0x7b) */
++#define REDWOOD_GPU_WHO         0x7b
++__attribute__((visibility("default"))) int redwood_drm_surface_who(uint32_t surface, char *name, size_t size);
++int
++redwood_drm_surface_who(uint32_t surface, char *name, size_t size)
++{
++	struct { uint32_t surface; char name[20]; } request = { surface, { 0 } };
++	int error;
++
++	if (connection == 0) {
++		return ENODEV;
++	}
++	error = call(REDWOOD_GPU_WHO, &request, sizeof(request));
++	if (error == 0) {
++		request.name[sizeof(request.name) - 1] = 0;
++		strlcpy(name, request.name, size);
++	}
++	return error;
++}
++
+ /* laurel 2913: where one plane of an IOSurface is. 0, or -1 with errno (a kernel without request 0x7c) */
+ #define REDWOOD_GPU_PLANE       0x7c
+ __attribute__((visibility("default"))) int redwood_drm_plane(int fd, struct redwood_drm_plane *plane);
