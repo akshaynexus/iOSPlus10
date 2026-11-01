@@ -1003,3 +1003,11 @@ Results [V boot 22:08]: the pixel array works (22:19:19 max 842, frame 10 max 10
 Done: `_silenceFramesFillingDisabled` set in the start hook; fast preview `camera_fast.c` (host 27.6 -> 7.1 ms one thread, same picture); AE capped at 30 fps; session starts at the shortest frame; read() through a write-back alias with clean + invalidate and a self-check; `speed:` lines a second for each stage and node; console opened per line (pid 28 said nothing); guard stacks whole.
 Unproven: all phone timing; the graph's own cost (`nodes:`, Espresso [I]); why audio time stamps jump [U]; photo path not exercised; kernel panic hold 22:22 has no reason text [U].
 Next: boot + root, owner approval; camera.md section 13 "Test steps". Next fix follows the `speed:` line.
+
+## Mi A3: Wi-Fi up, no page loads; SSH login (2026-11-01, branch t3/laurel-safari-net, patch 2888, `userland/ssh/laurelnet.c`; build + dry run, NOT BOOTED)
+Owner: "Wi-Fi is fine, but fast.com and speedtest don't load." Docs: docs/laurel_sprout/wifi.md "No page loads", docs/usb-network.md "ue0 and Wi-Fi", "Login".
+Cause [V config and boots, I on the phone]: `usbnetcfg` (new in the root with SSH) gave default route and DNS to ue0, a host without NAT. Queue, link, Safari's crashes: not the cause.
+Done: no `usbnetcfg` at boot, USB service without router or DNS, rank Last; `share-internet.sh` runs it; `LAUREL NET:` line; `dns asked N (v6 N)`; repo SSH key, `alpine` fallback without a prompt.
+Not done, cause [U]: reason of the two sig 6 crashes: read over SSH now.
+Next: owner's test 1 (no build: `usbnetcfg show` + `down` on the running phone), then root + kernel build and flash (owner approves).
+

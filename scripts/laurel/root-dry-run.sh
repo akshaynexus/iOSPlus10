@@ -104,6 +104,8 @@ if [ "${FEATURES:-1}" != 0 ]; then
   python3 -I "$REPO/scripts/laurel/root-manifest.py" preflight --inputs "$W/inputs"
   bash "$REPO/scripts/laurel/root-features.sh" "$R" --inputs "$W/inputs" --sidecar "$W/root.manifest"
   python3 -I "$REPO/scripts/laurel/root-manifest.py" inputs-check "$W/inputs"
+  # the USB link must not take the default route or DNS from Wi-Fi; SSH works with the repo key (docs/usb-network.md)
+  python3 -I "$REPO/scripts/net/usbnet-check.py" "$R" "$REPO/out/ssh/phone_ed25519.pub"
   echo "root-dry-run: feature step PASS: first line of the manifest: $(head -1 "$R/usr/share/laurel/root-manifest")"
 fi
 echo "root-dry-run: PASS"

@@ -6,20 +6,22 @@ gives its interface `ue0` the address 192.168.7.2/24 and streams its console to 
 This document adds, on the same cable:
 
 - a root shell in iOS: **dropbear** SSH on 192.168.7.2:22, **dash** as `/bin/sh`, **toybox** commands;
-- **internet for iOS** through the host: the host does NAT, iOS uses 192.168.7.1 as router and
-  1.1.1.1 / 8.8.8.8 as DNS servers.
+- **internet for iOS** through the host, only while `scripts/net/share-internet.sh` is on: the host does NAT, iOS uses
+  192.168.7.1 as router and 1.1.1.1 / 8.8.8.8 as DNS servers, with rank last (Wi-Fi with a router stays first). See "ue0 and Wi-Fi".
 
 | Path | What |
 |---|---|
 | `userland/ssh/fetch.sh` | downloads dropbear 2026.94, dash 0.5.13.5, toybox 0.8.15 into `out/ssh/dl/`, checks pinned SHA-256 (+ dropbear's GPG-signed `SHA256SUM.asc`), unpacks to `out/ssh/src/` |
 | `userland/ssh/build.sh` | builds everything for iOS arm64 (minos 16.0) into `out/ssh/ios/`, macOS builds into `out/ssh/host/`, signs, checks (macOS + Xcode only) |
 | `userland/ssh/localoptions.h`, `entitlements.plist`, `compat/sys/disk.h` | dropbear options, signature entitlements, the one header the iPhoneOS SDK lacks for toybox |
-| `userland/ssh/usbnetcfg.c` | our tool: publishes ue0 as the primary network service in configd |
+| `userland/ssh/usbnetcfg.c` | our tool: publishes ue0 to configd (router + DNS, rank last). Run by `share-internet.sh`, not at boot |
+| `userland/ssh/laurelnet.c` | our tool: the `LAUREL NET:` line in the kernel log (default route, DNS, reachability). On in every root with SSH; kill switch boot-arg `laurelnet=0` |
 | `userland/ssh/usbreboot.c` | our tool: sync + reboot, with a reboot mode if the kernel supports one |
 | `userland/ssh/oslogstream.m` (+ `oslogstream.entitlements`) | our tool: live unified log on the phone, like `log stream` (iOS ships no `log`) |
 | `scripts/net/root-add-ssh.sh` (+ `.py`) | installs all of it into a mounted root (gated by `SSH=1`) |
 | `scripts/net/share-internet.sh` | host NAT on/off (macOS pf, Linux iptables/nft) |
-| `scripts/net/ssh-phone.sh` | ssh/scp wrapper, `reboot-bootloader` |
+| `scripts/net/ssh-phone.sh` (+ `phone-askpass.sh`) | ssh/scp wrapper, `reboot-bootloader`. Login with no setup: repo key, else the stock password |
+| `scripts/net/usbnet-check.py` | checks a root: USB has no router or DNS, no boot job, repo key in place (`root-dry-run.sh`) |
 | `scripts/net/phone-run.sh` | copy a program or script to the phone, run it, print output + exit code (main test loop) |
 | `scripts/net/phone-log.sh` | live unified log over SSH (oslogstream), crash reports (tail, list, show, pull) |
 
@@ -102,24 +104,27 @@ What it writes (idempotent; a second run changes nothing):
 
 | Item | Where |
 |---|---|
-| binaries | `/usr/local/bin/{dropbearmulti,dash,toybox,usbnetcfg,usbreboot,oslogstream}`, links `dropbear dropbearkey dbclient scp` -> dropbearmulti, toybox applet links (not for names that exist in `/bin /sbin /usr/bin /usr/sbin`, e.g. `df`) |
+| binaries | `/usr/local/bin/{dropbearmulti,dash,toybox,usbnetcfg,laurelnet,usbreboot,oslogstream}`, links `dropbear dropbearkey dbclient scp` -> dropbearmulti, toybox applet links (not for names that exist in `/bin /sbin /usr/bin /usr/sbin`, e.g. `df`) |
 | shell | `/bin/sh` -> `/usr/local/bin/dash` (stock iOS 16 has no `/bin/sh`; an existing file is kept); `/private/etc/shells` += `/bin/sh`, `/usr/local/bin/dash` (dropbear checks the login shell with `getusershell()`); `/private/var/root/.profile` (PATH, PS1) if missing |
-| login | `/private/var/root/.ssh/authorized_keys` (0600, dir 0700, root) from `SSH_PUBKEY=FILE`, else `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`, `id_rsa.pub` of `SUDO_USER` |
+| login | `/private/var/root/.ssh/authorized_keys` (0600, dir 0700, root): the repo key `out/ssh/phone_ed25519.pub` (made once with `ssh-keygen`, kept for later images, owner = `SUDO_USER`), and the user's key if there is one: `SSH_PUBKEY=FILE`, else `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub`, `id_rsa.pub` of `SUDO_USER` |
 | host key | `out/ssh/hostkeys/dropbear_ed25519_host_key` (made once with the host dropbearkey, kept for later images) -> `/private/etc/dropbear/` (0600); public key -> `out/ssh/known_hosts` |
-| launchd | `dev.iosplus10.dropbear` and `dev.iosplus10.usbnetcfg`: plist in `/System/Library/LaunchDaemons/` and the same dictionary in `/System/Library/xpc/launchd.plist` under the `/System/Library/LaunchDaemons/<label>.plist` key (launchd on these ports reads only that cache; ios-flame: a `/Library/LaunchDaemons` key was ignored) |
-| configd | `/private/var/preferences/SystemConfiguration/preferences.plist`: service `1F05B0E7-0000-4000-8000-0000000000E0` "USB Ethernet", ue0, manual 192.168.7.2 / 255.255.255.0, router 192.168.7.1, DNS 1.1.1.1 8.8.8.8, first in the IPv4 service order of the current set; `NetworkInterfaces.plist`: ue0 (MAC 02:00:5e:77:ee:02, the phone side in slop patch 0075) |
+| launchd | `dev.iosplus10.dropbear` and `dev.iosplus10.laurelnet`; `dev.iosplus10.usbnetcfg` only with `USBNET_INTERNET=1`: plist in `/System/Library/LaunchDaemons/` and the same dictionary in `/System/Library/xpc/launchd.plist` under the `/System/Library/LaunchDaemons/<label>.plist` key (launchd on these ports reads only that cache; ios-flame: a `/Library/LaunchDaemons` key was ignored) |
+| configd | `/private/var/preferences/SystemConfiguration/preferences.plist`: service `1F05B0E7-0000-4000-8000-0000000000E0` "USB Ethernet", ue0, manual 192.168.7.2 / 255.255.255.0, PrimaryRank Last, last in the IPv4 service order of the current set, no router and no DNS (`USBNET_INTERNET=1`: router 192.168.7.1, DNS 1.1.1.1 8.8.8.8); `NetworkInterfaces.plist`: ue0 (MAC 02:00:5e:77:ee:02, the phone side in slop patch 0075) |
 
 The jobs:
 
 ```
 dev.iosplus10.dropbear   /usr/local/bin/dropbear -F -E -p 192.168.7.2:22 -r /private/etc/dropbear/dropbear_ed25519_host_key [-s]
                          RunAtLoad, KeepAlive, ThrottleInterval 10, root, stderr /private/var/log/iosplus10-dropbear.log
-dev.iosplus10.usbnetcfg  /usr/local/bin/usbnetcfg up
+dev.iosplus10.laurelnet  /usr/local/bin/laurelnet
+                         RunAtLoad, KeepAlive {SuccessfulExit false}, ThrottleInterval 60, log /private/var/log/iosplus10-laurelnet.log
+dev.iosplus10.usbnetcfg  /usr/local/bin/usbnetcfg up       (only USBNET_INTERNET=1 at the root build)
                          RunAtLoad, KeepAlive {SuccessfulExit false}, ThrottleInterval 10, log /private/var/log/iosplus10-usbnetcfg.log
 ```
 
 Logs go to files, not `/dev/console`: in slop's image work, jobs whose output pointed at
-`/dev/console` failed to launch (EACCES).
+`/dev/console` failed to launch (EACCES). `laurelnet` opens `/dev/console` itself for its line, as `metal_gate.c` does ([V] the
+`LAUREL METAL CLIENTS:` line reaches the USB log that way).
 
 **Host key: build time, else first boot.** With a host dropbearkey (the macOS build in
 `out/ssh/host/`, or `dropbearkey` in PATH on Linux) the key is generated on the host once and
@@ -128,10 +133,14 @@ job gets `-R` instead: dropbear generates `/private/etc/dropbear/dropbear_ed2551
 phone at the first connection (that connection is slower), and `ssh-phone.sh` keeps the first key
 it sees in `out/ssh/known_hosts.tofu`.
 
-**Login.** With a public key: key only (`-s`); `SSH_PASSWORD_AUTH=1` allows passwords too.
-Without a key: password logins are on, and the root password is the stock iOS one: `/etc/master.passwd`
-in 20H392 has `root:/smx7MYTQIi2M:...`, the DES hash of **`alpine`**. The script does not change
-`master.passwd`.
+**Login.** No setup: `root-add-ssh.py` makes `out/ssh/phone_ed25519` once and puts its public part on the root; `ssh-phone.sh` and
+`phone-ssh.sh` use it. Then key only (`-s`); `SSH_PASSWORD_AUTH=1` allows passwords too. A second key: `SSH_PUBKEY=FILE` or `~/.ssh/id_*.pub`.
+Without `ssh-keygen` and without a user key: password logins are on, and the root password is the stock iOS one: `/etc/master.passwd`
+in 20H392 has `root:/smx7MYTQIi2M:...`, the DES hash of **`alpine`** ([V] `perl -e 'print crypt("alpine","/s")'`). The script does not change
+`master.passwd`. A root built before the repo key (the image of 2026-11-01 21:57: [V] `laurel-full.log`: "no public key found", no `-s`)
+takes this password too: `ssh-phone.sh` gives it through `phone-askpass.sh` with no prompt (OpenSSH 8.4 or later; `PHONE_PASSWORD` changes it).
+Plain `ssh root@192.168.7.2` on such a root: type `alpine`. `Permission denied (publickey,password)` = the host has no key that fits, and no password came
+(no terminal, or a wrong one). This host has no `~/.ssh/id_*` [V], so a plain `ssh` without a terminal always gives this line.
 
 ## Use
 
@@ -139,19 +148,19 @@ On the host (the order does not matter; each step waits or can be repeated):
 
 ```sh
 make usblog                                  # sudo once in tmux: 192.168.7.1 on the link + kernel log
-scripts/net/share-internet.sh                # sudo: NAT from the default route (start)
+scripts/net/share-internet.sh                # sudo: NAT from the default route (start), then `usbnetcfg up` on the phone
 scripts/net/ssh-phone.sh wait                # until dropbear answers
 scripts/net/ssh-phone.sh                     # root shell
 scripts/net/ssh-phone.sh 'ps ax | head'      # one command
 scripts/net/ssh-phone.sh push file.txt /var/root/    # scp -O (dropbear has no SFTP server)
-scripts/net/ssh-phone.sh pull /private/var/log/iosplus10-usbnetcfg.log logs/
+scripts/net/ssh-phone.sh pull /private/var/log/iosplus10-laurelnet.log logs/
 scripts/net/ssh-phone.sh net                 # usbnetcfg show: configd's IPv4/DNS state
 scripts/net/share-internet.sh status
-scripts/net/share-internet.sh stop           # undo NAT and forwarding
+scripts/net/share-internet.sh stop           # undo NAT and forwarding, `usbnetcfg down` on the phone
 ```
 
 Plain `ssh root@192.168.7.2` works too (use `scp -O` for copies). `ssh-phone.sh` env:
-`PHONE_IP`, `PHONE_USER`, `SSH_KEY`, `SSH_OPTS`, `PHONE_KNOWN_HOSTS`. `phone-run.sh` and
+`PHONE_IP`, `PHONE_USER`, `SSH_KEY`, `SSH_OPTS`, `PHONE_KNOWN_HOSTS`, `PHONE_PASSWORD`. `phone-run.sh` and
 `phone-log.sh` use `ssh-phone.sh`, so the same env applies.
 
 ### Test loop: phone-run.sh and phone-log.sh
@@ -193,16 +202,15 @@ write no crash reports at all. The kernel's `CRASH ...` lines in the USB kernel 
 
 ### How iOS gets internet
 
-1. The kernel puts 192.168.7.2/24 on ue0 (slop patch 0075). Enough for SSH.
+1. The kernel puts 192.168.7.2/24 on ue0 (slop patch 0075). Enough for SSH and the log.
 2. configd does not configure ue0 by itself: on slop's image v15 the preferences.plist service
    alone gave no DNS and no traffic (slop NOTES.md 2026-10-18); bergamota and ios-flame saw the
-   same and fixed it by writing configd's *state* keys. `usbnetcfg up` (launchd, every boot)
-   waits up to 120 s for configd and ue0, then writes `State:/Network/Service/<id>/IPv4`
-   (address, mask, router 192.168.7.1, `InterfaceName` ue0), `.../DNS` (1.1.1.1, 8.8.8.8) and
-   `State:/Network/Interface/ue0/IPv4`. IPMonitor then makes ue0 the primary service: default
-   route via 192.168.7.1 and DNS for mDNSResponder. If ue0 is not primary after 5 s, usbnetcfg
-   adds the default route through a routing socket (IP works then; names need IPMonitor's DNS).
-   No ue0 within 120 s (USB network off): it exits 0, so launchd does not restart it.
+   same and fixed it by writing configd's *state* keys. `usbnetcfg up` (run by `share-internet.sh`; at each boot only with
+   `USBNET_INTERNET=1`) waits up to 120 s for configd and ue0, then writes `State:/Network/Service/<id>` (`PrimaryRank` Last),
+   `.../IPv4` (address, mask, router 192.168.7.1, `InterfaceName` ue0), `.../DNS` (1.1.1.1, 8.8.8.8) and
+   `State:/Network/Interface/ue0/IPv4`. IPMonitor then uses ue0 for the default route and DNS, if no other service has a router.
+   If no service is primary after 5 s, usbnetcfg adds the default route through a routing socket (IP works then; names need
+   IPMonitor's DNS). Never while Wi-Fi is primary. No ue0 within 120 s (USB network off): it exits 0, so launchd does not restart it.
 3. The host forwards and NATs 192.168.7.0/24 (`share-internet.sh`).
 
 `share-internet.sh` details: macOS: `sysctl net.inet.ip.forwarding=1`, rule
@@ -214,6 +222,21 @@ them), or an `nft` table `ip iosplus10-share` without iptables. The old forwardi
 uplink and the pf token are saved in `/var/run/iosplus10-share.state`; `stop` restores them.
 Nothing survives a host reboot. macOS Internet Sharing is not used: it would put its own DHCP
 subnet on the link.
+
+### ue0 and Wi-Fi
+
+Log `logs/laurel-boot-2235.txt` (main checkout), owner: "Wi-Fi is fine, but fast.com and speedtest don't load". Details: `laurel_sprout/wifi.md` "No page loads".
+Before this fix, `usbnetcfg up` ran at each boot and put ue0 first. So the phone sent its default route and its DNS (1.1.1.1, 8.8.8.8) to the host, also with Wi-Fi
+joined. The host has no NAT unless `share-internet.sh` runs, so nothing came back. Now a normal root does not publish ue0: SSH and the log do not need it.
+The next boot says the state itself:
+
+```
+LAUREL NET: on: default route en0 via 192.168.1.1, v6 en0 via fe80::1, dns 2 servers 192.168.1.1 8.8.8.8, reachability yes (flags 0x2)
+```
+
+`default route ue0`: the USB link has the route (`share-internet.sh` is on, and Wi-Fi has no router). `default route none`, `dns 0 servers`: no service has an address yet.
+
+A root that has the old job, on the running phone, no rebuild: `scripts/net/ssh-phone.sh /usr/local/bin/usbnetcfg down`, until the next boot.
 
 ### macOS Local Network privacy
 
@@ -241,9 +264,10 @@ make this work; the tool needs no change for it.
 ## Security notes
 
 - Reachable only on 192.168.7.2:22, the USB link to the host that is plugged in. Not bound to
-  other interfaces (the phone has none today).
-- With a key: public-key login only. Without a key: root with the publicly known password
+  other interfaces (en0 has its own address).
+- With a key (the default: the repo key): public-key login only. Without a key: root with the publicly known password
   `alpine`; anyone on the link can log in. Use a key.
+- `out/ssh/phone_ed25519` (git-ignored) is a private key without a passphrase: root on the phone. Keep it out of git and out of shared images.
 - dropbear runs as root, unsandboxed, as a platform binary; the shell can do everything. This
   port has no real iOS security model (AMFI stand-in, permissive sandbox, no SEP), so this is a
   bring-up tool, not hardening. TCP forwarding (`ssh -L/-R`) is on; add `-j -k` to the job

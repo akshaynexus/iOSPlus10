@@ -9,7 +9,10 @@
 #   scripts/net/ssh-phone.sh reboot [-f]              normal reboot (usbreboot normal)
 #   scripts/net/ssh-phone.sh net                      configd network state (usbnetcfg show)
 # Env: PHONE_IP (192.168.7.2), PHONE_USER (root), SSH_KEY (private key file), SSH_OPTS (more ssh options),
-# PHONE_KNOWN_HOSTS (known_hosts file to check strictly; default out/ssh/known_hosts).
+# PHONE_KNOWN_HOSTS (known_hosts file to check strictly; default out/ssh/known_hosts), PHONE_PASSWORD.
+# Login, no setup: the repo key out/ssh/phone_ed25519 (root-add-ssh.py makes it and puts it on the root). A root built before
+# that key, or without ssh-keygen, takes the stock iOS password: PHONE_PASSWORD, default alpine, given by phone-askpass.sh.
+# In a git worktree without its own out/ssh, the files of the main checkout are used (the one that built the root).
 # Host key: out/ssh/known_hosts (written by scripts/net/root-add-ssh.sh, checked strictly); if it is
 # missing (key made on the phone, dropbear -R), the first key seen is kept in out/ssh/known_hosts.tofu.
 # Your ~/.ssh/known_hosts is not used, so a new image does not cause host key warnings there.
@@ -17,17 +20,28 @@ set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 IP=${PHONE_IP:-192.168.7.2}
 U=${PHONE_USER:-root}
-KH=${PHONE_KNOWN_HOSTS:-$REPO/out/ssh/known_hosts}
+SSHD=$REPO/out/ssh
+if [ ! -f "$SSHD/known_hosts" ] && [ ! -f "$SSHD/phone_ed25519" ]; then
+  main=$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  main=${main%/.git}
+  if [ -n "$main" ] && [ -d "$main/out/ssh" ]; then SSHD=$main/out/ssh; fi
+fi
+KH=${PHONE_KNOWN_HOSTS:-$SSHD/known_hosts}
 if [ -f "$KH" ]; then hk="-o UserKnownHostsFile=$KH -o StrictHostKeyChecking=yes"
-else mkdir -p "$REPO/out/ssh"; hk="-o UserKnownHostsFile=$REPO/out/ssh/known_hosts.tofu -o StrictHostKeyChecking=accept-new"; fi
+else mkdir -p "$SSHD"; hk="-o UserKnownHostsFile=$SSHD/known_hosts.tofu -o StrictHostKeyChecking=accept-new"; fi
 opts="$hk -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o LogLevel=ERROR"
-[ -z "${SSH_KEY:-}" ] || opts="$opts -i $SSH_KEY -o IdentitiesOnly=yes"
-opts="$opts ${SSH_OPTS:-}"
+if [ -n "${SSH_KEY:-}" ]; then opts="$opts -i $SSH_KEY -o IdentitiesOnly=yes"
+elif [ -f "$SSHD/phone_ed25519" ]; then opts="$opts -i $SSHD/phone_ed25519"; fi
+# a password only if the phone asks for one (a root without the key); no prompt, so scripts and agents work too (OpenSSH 8.4 or later)
+SSH_ASKPASS=$REPO/scripts/net/phone-askpass.sh SSH_ASKPASS_REQUIRE=force
+export SSH_ASKPASS SSH_ASKPASS_REQUIRE
+opts="$opts -o PreferredAuthentications=publickey,password -o NumberOfPasswordPrompts=1 ${SSH_OPTS:-}"
 
 hint() { # after a failed connection
   echo "ssh-phone: no SSH on $U@$IP." >&2
   echo "  - Is iOS up with the USB network (negroniusb=2) and an SSH=1 root? Kernel log: make usblog" >&2
   echo "  - Does this host have 192.168.7.1 on the phone's interface? (sudo scripts/debug/usblog.sh sets it)" >&2
+  echo "  - 'Permission denied': this key is not on the root and the password is not ${PHONE_PASSWORD:-alpine}: rebuild the root (root-add-ssh.py) or set SSH_KEY or PHONE_PASSWORD." >&2
   if [ "$(uname -s)" = Darwin ]; then
     echo "  - macOS 'No route to host' with a working link: Local Network privacy blocks this terminal" >&2
     echo "    app. Allow it in System Settings > Privacy & Security > Local Network (docs/usb-network.md)." >&2

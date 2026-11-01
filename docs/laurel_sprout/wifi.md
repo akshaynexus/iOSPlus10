@@ -293,3 +293,79 @@ The numbers are the form, not results. How to read them:
 
 The output-queue model on this kernel (`if_fake.c` uses the same KPI; no driver of ours has). Whether FQ-CoDel's limits fit. Whether the firmware accepts 512 Rx buffers and 128 Tx frames at once (ath10k `HTT_RX_RING_SIZE_MAX` is 2048 [V htt.h]; our HTT setup has 1056 Tx descriptors [V]).
 That wifid and SpringBoard move the bars on event 39 ([V] by code, not seen running). The unit of `fw` in the line. Real throughput and whether pages load faster.
+
+## No page loads (2026-11-01, branch t3/laurel-safari-net, `userland/ssh/laurelnet.c`, patch 2888)
+
+Owner: "Wi-Fi is fine, but fast.com and speedtest don't load." Log: `logs/laurel-boot-2235.txt` (main checkout). Status: [V] builds, dry run PASS, [U] not run on the phone.
+
+### Cause: the USB link took the default route and DNS from Wi-Fi
+
+| Item | Evidence | Kind |
+| --- | --- | --- |
+| The root has a job that makes ue0 primary | `exec usbnetcfg` 22:35:51. Image of 21:57: job `dev.iosplus10.usbnetcfg up`; preferences: USB service first, router 192.168.7.1, DNS 1.1.1.1 8.8.8.8 (7z of the image). `usbnetcfg.c` waits for ue0, writes these keys, and adds the route by hand if ue0 is not primary | [V] |
+| The tool came with the SSH step, after the good boot | Boots with Wi-Fi joined: 19:07: 0 `exec usbnetcfg`, 148 `connectx` lines, 179 Mbps. 22:08 and 22:35: 1 `exec usbnetcfg`, 0 `connectx` lines, in spite of Safari and its web processes | [V] |
+| Nothing goes to en0 after the first minute | 22:38-22:47: `dns asked 0`, `connects 0`, `tcp sent 0` for all of the kernel. Safari started at 22:42:44 | [V] |
+| The host does no NAT | No `/var/run/iosplus10-share.state`, so `share-internet.sh` is not on. An IP packet from 192.168.7.2 has no way back | [V] state file, [I] no return |
+| ue0 was primary on the phone | IPMonitor's choice was not read: no SSH in that boot. `/private/var/log/iosplus10-usbnetcfg.log` has it. The `usbnetcfg down` test below decides it | [I] |
+| Why TCP is 0, not only en0's | No name resolves (the questions go to 1.1.1.1 through ue0), so no connection starts. `tcp sent` is the whole kernel's, loopback too | [I] |
+
+### Checked, not the cause
+
+- Output queue (2881), `wifi_txq`: [V] frames still go each minute (`v6 out 4-12`, `v4 out 0-2`). `q max 4-5`, `wait slots 0 ce 0 q 0`, `sender waited 0`, drop 0, `queue 0`, `left 0`, `in air 0`. A stalled queue shows a rising `wait q`, and no frames.
+  [V code] `ifnet_enqueue` wakes the start thread; `net_start` loops until `ifnet_dequeue` fails, keeps no state and never turns output off: nothing stays waiting after idle. A DNS frame in the queue would count at `net_tx_note` (`dns asked`) when it leaves; a frame cannot pass the v6 frames that left. [I] So `dns asked 0` means no DNS frame came to en0.
+  Not yet shown: the queue under a real burst (no traffic crossed it after 19:07). `wifi_txq=0` stays the comparison, if a page is slow after this fix.
+- Link: [V] VHT80 5 GHz, RSSI -30 to -41 dBm, fail 0, `v4 in` 90-123 frames a minute. The radio hears the AP.
+- Safari's crashes: below. Web processes and MobileSafari stay up, and `CRASH webbookmarksd` was also in boot 19:07, when pages loaded [V].
+- wifid: `sets 383`, `419`, `gets COUNTRY_CODE` REFUSED: [V] also in boot 19:07. `gets 103 CURRENT_NETWORK` answered while joined [V].
+- Content filter, `nesessionmanager`, `symptomsd`: [V] no failure line. [U] no line says that they are well: they log to os_log only. `connectx` necp lines: they come only from a connect, and there was none.
+- MTU: [V] 19:07 frames of 1505 bytes in average; no change since.
+
+### dns asked 24 answers 6
+
+[V] Only in the first minute (22:36:04-22:37:04), with `connects 1`, `tcp sent 6`, and `exec captiveagent` at 22:36:05. Then 0 for 10 minutes.
+[I] A client bound to en0, as the captive check, uses en0's own DNS servers from DHCP or the router's RA, also when another service is primary. This explains why it was only this minute. [V] The same router gives this host's Wi-Fi a global IPv6 address, so v4 and v6 servers are likely. mDNSResponder asks more than one server, and asks again [I].
+[U] The log cannot say which server had no answer, or if a question got none. Patch 2888 splits the count: `dns asked N (v6 N) answers N (v6 N)`. Boot-arg `net_names=1` gives each name.
+
+### Crashes (`scripts/debug/crash-symbolize.sh`, 20H392 cache)
+
+Both: uncaught exception: `abort` <- `demangling_terminate_handler` <- `_objc_terminate` <- `std::terminate` <- the first frame that may not throw. The stack under the throw is unwound, and the text goes to os_log, so the kernel line cannot say the reason.
+
+| Crash | Frames | Result |
+| --- | --- | --- |
+| `com.apple.Safari[335]` 22:42:47, once | `dispatch_once` <- SafariCore `-[NSFileManager _safari_getMobileSafariContainerDirectoryURL:isContainerized:]` <- `safari_mobileSafariContainerDirectoryURL` | [V] A Safari helper, not MobileSafari (the name is the first 16 characters; History and SafeBrowsing start in that second; which one [U]; in boot 19:07 both ran without a crash). [V disassembly 0x1accd9938] the block: `sandbox_container_path_for_pid`; our kernel answers ENOENT (op 4); then `[[LSApplicationRecord alloc] initWithBundleIdentifier:@"com.apple.mobilesafari" allowPlaceholder:NO error:] dataContainerURL`; nil is handled with a log. [I] The throw is inside LaunchServices. Not traced. Effect on a page: [I] none; Safari history may not save |
+| `webbookmarksd` every 56-108 s | `dispatch_mach_msg_async_reply_invoke` -> `dispatch_client_callout3` | [V] An uncaught exception in an XPC reply; 2 of these in boot 19:07 as well. Handler [U]: the frames are gone. Not a cause of this fault |
+
+Text of both, now that SSH works: `scripts/net/phone-log.sh webbookmarksd`, or `... com.apple.Safari.History com.apple.Safari.SafeBrowsing.Service`; read `Terminating app due to uncaught exception`.
+
+### What changed
+
+- `root-add-ssh.py`: no `usbnetcfg` job at boot. USB service without router and DNS, rank Last, last in the order. `share-internet.sh` runs `usbnetcfg up` / `down` over SSH; `usbnetcfg` writes `PrimaryRank` Last ([V] the string and the Last/Never values are in `configd` 20H392), and no longer adds a route while another service is primary. `USBNET_INTERNET=1` at the root build: the job at boot, for a phone with no Wi-Fi.
+- `laurelnet` (new): the status line. It wakes only when configd changes a key; no traffic. Kill switch `laurelnet=0`.
+- 2888: `dns asked N (v6 N) answers N (v6 N)`.
+- SSH: `docs/usb-network.md` "Login": repo key, stock password as fallback.
+
+### Build [V]
+
+Kernel on 7737e7d + this branch: `applied=299 known-skip=0 failed=0`, 0 LSE/RCpc, `printf-arg-check: OK`, 2 linker lines (stub rounds), sha256 8be3ddf608297eeb, series d2ddb8c409e44a87.
+`userland/ssh/build.sh` (Linux): `laurelnet` and `usbnetcfg` built, signed, 0 instructions newer than ARMv8.0. `root-dry-run.sh`: PASS, 13 features installed, 0 missing, `USB network + SSH login PASS`. `build-honest-test.sh`: 60 of 60.
+Host test (no phone): host dropbear + `phone-ssh.sh`: repo key logs in with `-s`; on a server without the key, the password path runs with no terminal and does not hang (`Permission denied (publickey,password)` for a wrong password).
+
+### Expected lines
+
+```
+LAUREL NET: on: default route en0 via 192.168.1.1, v6 en0 via fe80::1, dns 2 servers 192.168.1.1 8.8.8.8, reachability yes (flags 0x2)
+LAUREL WIFI: path | tcp sent 412 retrans 0 timeouts 0 dup in 0 | connects 22 | dns asked 18 (v6 6) answers 18 (v6 6) | v4 out .. in .. | v6 out .. in .. | sender waited 0 times
+connectx() - failed necp_set_socket_domain_attributes       (as in boot 19:07: only a note, the connect goes on)
+```
+
+The numbers are the form, not results. No `exec usbnetcfg` line. Before the join: `LAUREL NET: on: default route none, v6 none, dns 0 servers, reachability no (flags 0x0)`.
+
+### Owner's test
+
+1. **No build, on the phone that runs now, cable in, Wi-Fi joined:** `scripts/laurel/phone-ssh.sh '/usr/local/bin/usbnetcfg show; /usr/local/bin/usbnetcfg down; /usr/local/bin/usbnetcfg show'`. Login: this script gives `alpine`. Read the first `State:/Network/Global/IPv4`: `PrimaryInterface` ue0 proves the cause. After `down`: en0. Then open fast.com. If the page loads: cause proven. The fix lasts until the next boot.
+2. Rebuild: root (flash needs your approval) and kernel (for 2888 only). Boot, join. Read the `LAUREL NET:` line: `default route en0`. Open fast.com and speedtest.
+3. If `default route en0` and a page does not load: read `path` next: `dns asked` above 0 with `answers` 0: DNS on Wi-Fi; `connects` above 0 and `tcp sent` low: TCP. Then boot with `wifi_txq=0` and compare, and add `net_names=1`.
+
+### Unproven [U]
+
+That ue0 was primary in boot 22:35 (test 1 decides it). That pages load at full speed on the output-queue model. That IPMonitor honours `PrimaryRank` Last under `share-internet.sh` ([V] configd has the key; not run). `laurelnet` has never run: it is built and signed, and `SCNetworkReachabilityGetFlags` on the zero address is [I] the usual app check.

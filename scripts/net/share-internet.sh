@@ -4,8 +4,9 @@
 #                                                    interface of the default route)
 #   scripts/net/share-internet.sh stop               undo everything start did
 #   scripts/net/share-internet.sh status
-# Needs root (asks through sudo). The phone is 192.168.7.2 and uses 192.168.7.1 as router and
-# 1.1.1.1 / 8.8.8.8 as DNS (scripts/net/root-add-ssh.sh). This script keeps 192.168.7.1/24 on the
+# Needs root (asks through sudo). The phone is 192.168.7.2. Over SSH this script runs `usbnetcfg up` on the phone at start (192.168.7.1
+# as router, 1.1.1.1 / 8.8.8.8 as DNS, rank last: Wi-Fi with a router stays first) and `usbnetcfg down` at stop; a phone
+# without SSH: one line, the host side still works. This script keeps 192.168.7.1/24 on the
 # phone's interface (host MAC 02:00:5e:77:ee:01) if it is present, turns on IPv4 forwarding and adds:
 #   macOS: one pf NAT rule in the anchor com.apple/iosplus10-share (the stock /etc/pf.conf loads
 #          "com.apple/*" anchors), pf enabled with a reference token (pfctl -E / -X)
@@ -90,6 +91,17 @@ EOF
   *) echo "unsupported OS $OS" >&2; exit 1 ;;
   esac
   echo "internet sharing on: $NET -> $up (forwarding was $fwd). Undo: $0 stop"
+  phone_net up
+}
+
+# usbnetcfg on the phone, as the user who ran sudo (their key, their known_hosts). Best effort.
+phone_net() {
+  h=$(cd "$(dirname "$0")" && pwd)/ssh-phone.sh
+  if [ -n "${SUDO_USER:-}" ]; then r=$(sudo -u "$SUDO_USER" "$h" /usr/local/bin/usbnetcfg "$1" 2>&1); else r=$("$h" /usr/local/bin/usbnetcfg "$1" 2>&1); fi || {
+    echo "phone: usbnetcfg $1 not run (no SSH now): $(printf '%s' "$r" | tail -1). Later: scripts/net/ssh-phone.sh /usr/local/bin/usbnetcfg $1"
+    return 0
+  }
+  printf '%s\n' "$r"
 }
 
 stop() {
@@ -110,6 +122,7 @@ stop() {
   esac
   rm -f $STATE
   echo "internet sharing off (forwarding back to ${fwd:-0})"
+  phone_net down
 }
 
 status() {

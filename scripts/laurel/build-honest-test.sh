@@ -63,9 +63,10 @@ EOF
   cat > "$R/scripts/net/root-add-ssh.py" <<'EOF'
 import os, plistlib, sys
 r = sys.argv[1]
-os.makedirs(r + '/usr/local/bin', exist_ok=True); open(r + '/usr/local/bin/dropbearmulti', 'w').write('x')
+os.makedirs(r + '/usr/local/bin', exist_ok=True); open(r + '/usr/local/bin/dropbearmulti', 'w').write('x'); open(r + '/usr/local/bin/laurelnet', 'w').write('x')
 p = r + '/System/Library/xpc/launchd.plist'; d = plistlib.load(open(p, 'rb'))
 d['LaunchDaemons']['/System/Library/LaunchDaemons/dev.iosplus10.dropbear.plist'] = {'Label': 'dev.iosplus10.dropbear'}
+d['LaunchDaemons']['/System/Library/LaunchDaemons/dev.iosplus10.laurelnet.plist'] = {'Label': 'dev.iosplus10.laurelnet'}
 plistlib.dump(d, open(p, 'wb'), fmt=plistlib.FMT_BINARY)
 EOF
   : > "$R/external/ios-topaz/tools/mkiosroot.sh"; : > "$R/external/ios-topaz/tools/sweet-root-tweaks.py"
@@ -96,7 +97,7 @@ make_stages() {
   macho "$R/out/laurel/notch/root/usr/local/lib/liblaurel-notch.dylib" 6
   macho "$R/out/laurel/notch/root/usr/local/libexec/laurel-springboard" 2 /System/Library/CoreServices/SpringBoard.app/SpringBoard
   macho "$R/out/laurel/cell/root/usr/local/lib/liblaurel-cellbar.dylib" 6
-  echo x > "$R/out/ssh/ios/dropbearmulti"
+  echo x > "$R/out/ssh/ios/dropbearmulti"; echo x > "$R/out/ssh/ios/laurelnet"
   local X=$R/out/laurel/xnutils/root
   mkdir -p "$X/Applications/XNUtils.app" "$X/usr/local/libexec" "$X/usr/local/bin"
   echo x > "$X/Applications/XNUtils.app/XNUtils"; chmod +x "$X/Applications/XNUtils.app/XNUtils"; echo x > "$X/Applications/XNUtils.app/Info.plist"

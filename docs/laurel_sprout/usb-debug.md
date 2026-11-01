@@ -226,4 +226,4 @@ timer@f120000) must wake the core, and the resume path must re-init the GICR of 
 - `out/bin/op10tool bootlog [N]` (USB, a good boot), `scripts/laurel/phone-ssh.sh bootlog` (SSH), `scripts/laurel/log-pull.sh
   DIR` (adb from another system). `op10tool ctl log|time|settime|bootlog`.
 - SSH: `userland/ssh/build.sh` builds on Linux now (docs/usb-network.md "Build (Linux x86_64)"); `scripts/laurel/root.sh`
-  installs dropbear + tools when `out/ssh/ios` exists (SSH=0: none); `scripts/laurel/phone-ssh.sh` runs commands.
+  installs dropbear + tools when `out/ssh/ios` exists (SSH=0: none); `scripts/laurel/phone-ssh.sh` runs commands. Login needs no setup: repo key `out/ssh/phone_ed25519`, on an older root the password `alpine` without a prompt (docs/usb-network.md "Login").
