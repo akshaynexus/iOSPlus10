@@ -3,10 +3,10 @@ laurel 2775: one shared TrustZone peripheral-image (PAS) loader, bsd/dev/topaz_p
 diff -ruN a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files	2026-11-01 08:23:51.351988654 +0530
 +++ b/bsd/conf/files	2026-11-01 08:23:51.365283888 +0530
-@@ -140,6 +140,7 @@
- bsd/dev/laurel_cam.c			standard
- bsd/dev/laurel_cam_hw.c			standard
- bsd/dev/laurel_cam_cci.c			standard
+@@ -147,6 +147,7 @@
+ bsd/dev/laurel_cam_sensor.c			standard
+ bsd/dev/laurel_cam_stream.c			standard
+ bsd/dev/laurel_cam_ctl.c			standard
 +bsd/dev/topaz_pas.c			standard
  bsd/dev/sweet_usb.c			standard
  bsd/dev/mem.c				standard
