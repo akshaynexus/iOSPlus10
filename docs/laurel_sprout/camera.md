@@ -1,7 +1,7 @@
 # Mi A3 (laurel_sprout) camera: hardware, path decision, step 1
 
 Status 2026-11-01: step 1 (power + CCI + chip ID of all four cameras) is code, kernel patch 2770, built (249/249
-patches, 0 LSE). **2026-11-01 18:40: the Camera app ran on the phone; quality work after that: section 10.** **Boot 20:02: crash loop without Metal, photo path, black frames: section 11.** Step 2 (rear IMX586 RDI raw frames 1280x720, fps line, `camframe` picture over USB) is code, kernel
+patches, 0 LSE). **2026-11-01 18:40: the Camera app ran on the phone; quality work after that: section 10.** **Boot 20:02: crash loop without Metal, photo path, black frames: section 11.** **Why a streaming sensor shows no light, self-check of the signal: section 12.** Step 2 (rear IMX586 RDI raw frames 1280x720, fps line, `camframe` picture over USB) is code, kernel
 patch 2771, built (252/252 patches, 0 LSE), host-tested (section 8). Steps 3 + 4 (`/dev/negronicam`, mediaserverd plug-in, root step, ADT nodes) are code,
 kernel patch 2772 + 2903, built (259/259 patches, 0 LSE), host-tested (section 9). **None of this ran on the phone yet.**
 Labels: [V] read in a file or seen in a tool output (source given), [I] inference, [U] unknown.
@@ -670,3 +670,80 @@ Bad signs: `left alone` on hooks 10, 11; a new `CRASH mediaserverd` (symbolize i
 1. `userland/laurel/camera/build.sh`, `sudo scripts/laurel/root.sh`, flash userdata. No boot image needed for this change.
 2. Lit room, lens free. Open Camera: preview stays. Read `top` and the `picture:` line first.
 3. Shutter, open the photo in Photos. Keep the preview on for 2 minutes: footprint flat.
+
+## 12. Why the IMX586 stream shows no light: review and self-check (patch 2784, plug-in; 2026-11-01)
+
+Problem [V `logs/laurel-boot-2002.txt`]: 133 ms, 16x, `above black: mean 0, 1% over 8, top 9-10`. Status: code, built, host-tested. **Not run on the phone.**
+
+**Result: no fault in the code explains the dark frames. The cause stays unknown [U].** One real difference from stock was found and fixed (L12A mode); I have no evidence that it is the cause. The next boot separates the candidates: the lines below.
+
+### What was checked, with evidence
+
+| Point | Evidence | Result |
+| --- | --- | --- |
+| Rear power list | `camera-sensors.py` on all 3 libraries (`out/laurel/camera/sensors.txt`) = `lcam_rear_up` in `laurel_cam_core.h` = order in DT `eeprom0` (laurel dtsi 34-52); raw entries at `.data` 0x5e08 | [V] same steps, same delays. IMX586 qtech = sunny = IMX582: no difference by module |
+| VANA | [V] GPIO step only: TLMM 15 (`qcom,gpio-vana`, DT lines 15, 162). The DT's `cam_vana-supply` L3P (2.8 V) is PM8008, disabled in `trinket.dtsi` 3039-3045, and no library step uses it. So VANA comes from a switched regulator outside the DT. | **Input and voltage of that regulator: [U]**: no schematic, no DT node |
+| VDIG, VIO, VAF | [V] TLMM 14, 49, 123. VREG step = `cam_vio-supply` = L12A 1.8 V, the only PMIC rail of the list | Equal to the code. [V] QRD uses gpio 49 for PM8008 enable; on laurel it is CAM_VIO |
+| The pins | [V] `pinctrl-trinket.c`: 14, 15 WEST; 48, 49 SOUTH; 123 EAST = `lcam_tile`. Control word: OE bit 9, out bit 1 of the io word. [V] gpio 14/15 are QUP SE3: `qupv3_se3` is disabled in the DT, our BT is on 10-13 | No clash found |
+| **L12A load** | [V] Stock: `regulator_set_load(80000)` before enable (laurel `cam-vreg-op-mode`), over this rail's `hpm-min-load` 10 mA, gives RPM `lsmd` 7 (`pmic5-ldo`, `rpm-smd-regulator.c`). We sent only `uv` and `swen` | **The one difference. Fixed.** [U] what L12A feeds and whether it matters |
+| Delays, MCLK | [V] the same list. MCLK: [V] fps 45.4 at 1722 lines and 234 at 780 lines match the PLL registers of a 24 MHz INCK | MCLK right |
+| Tables | [V] qtech = sunny in init, modes 1, 2, 6 (`.data` diff: only mode 0 gets 6 more writes, PDAF data, a stock clock field). [V] no table writes 0x0100, 0x0104, 0x0600, 0x0601 (`cam7_test`). [V] the other stock settings: start = 0x0100 1, stop = 0x0100 0, hold = 0x0104 | Nothing is missing from the write path. The init line counts 239 bursts of the init table only; the mode table has its own |
+| Writes applied | [V] `write_table` stops at a NACK (`CCI write ... failed`): none in the log. [V] the registers work: fps, frame length (10416 lines at 7.9 fps) and gain (noise grows) follow. [U] every value: no read-back before this patch | Self-check: `table read-back` |
+| Exposure, gain | [V] stock `sensor_fill_exposure_array` (library `.text`): 0x0340, 0x0202, gain, digital 0x020e-0x0215, 0x3100 only for long exposures. Gain code clamp 0x3c0 = ours at 16x. Margin 48 = `vert_offset` | Same registers. 10368 + 48 = 10416: the frame holds the exposure |
+| Black level | [V] library color level info `.data` 0x6050: white 1023, pedestals 64, 64, 64, 64 (`cam7_test`) | 64 was [I], now [V] |
+| Test pattern on | [V] no table writes it; [I] the noise grows with the gain, a pattern has no noise | No. Read-back shows it |
+| RAW10, stride | [V] `lcam_raw10_px` and the plug-in's `cell`, `isp_raw_measure` read MIPI RAW10. [V] the size check passes. [I, strong] a wrong shift or stride cannot give mean 64 with top 74 in every frame: all bytes are near 16. A wrong unpack makes values vary, it does not flatten them | Not the unpack [I]. Colour bars prove it [next boot] |
+| Mean in the plug-in | [V] `cell` takes off `f->black`, cuts at 0; the kernel's own mean agrees (`mean 64`, 2 code paths) | Right. `1% over 8` in the kernel was a 16-step bin: fixed |
+| Library choice | [V] the kernel takes the qtech file first, the phone has a sunny depth camera; the used tables are equal | No effect. The qtech test pattern table holds another sensor's 0x5e00/0x4320; only sunny's 0x0600/0x0601 is real |
+
+Size of the gap [I, calculation]: 1.6 um binned, f/1.79, a 1 lux room gives about 30 electrons in 133 ms, about 20 steps at 16x. Mean 0 is under about 0.05 lux at the scene. Noise at top 9-10 is a normal read-out noise at 16x, so the ADC and PGA run. A dark scene means a covered lens: **a phone on a USB cable, screen up, lens on the table, fits every line of every log [I].** The torch was never on with frames running: 19:41:24 `dark` comes as the session starts, 20:17:13 before it.
+
+Open causes [U], in order: (a) lens on a table or covered; (b) VANA does not reach the pixels: input of the switched regulator, or a broken module; (c) a table value that did not stick.
+
+### The self-check (kernel `laurel_cam_light.c`, pure part `laurel_cam_light.h`; plug-in `isp_raw_measure`)
+
+It changes nothing that the frames need. A failed read gives a line and the frames go on. The colour bars are 150 ms of the boot self-check, once a boot, and the kept frame stays a real one.
+
+Expected lines [I]. At the boot, 2 s after the root:
+
+```
+LAUREL CAMERA: sensor: table read-back: 616 writes, N the same, M differ, 0 reads failed, T ms: 0x.... wrote .. read ..
+LAUREL CAMERA: sensor: test pattern: colour bars in memory: columns of the 4 Bayer places 0xcc 0xf0 0xf0 0xaa, levels L..H, Bayer RGGB as the library says: sensor -> MIPI -> VFE -> buffer -> RAW10 reading is right
+LAUREL CAMERA: rails (boot): RESET 48 ctl 0x200 out 1 in 1, VIO 49 ctl 0x200 out 1 in 1, VANA 15 ctl 0x200 out 1 in 1, VDIG 14 ctl 0x200 out 1 in 1, VAF 123 ctl 0x200 out 1 in 1
+LAUREL CAMERA: rails (boot): L12A: enable 0x80, 1800 mV, mode 7 (7 high power), status 0x..; PM6125 LDOs on (bit n = Ln): 0x...
+LAUREL CAMERA: sensor: read back (boot): stream 1 hold 0 frame count N, exposure 1674 gain code 0x300 digital 0x100, frame 1722 line 5376 shift 0
+LAUREL CAMERA: sensor: read back (boot): lines 0..5999 out 1920x1440 binning 0x44 mode 0x22 format 0xa0a lanes 3 test pattern 0 pedestal 64 temperature T; 0 reads failed
+LAUREL CAMERA: raw (boot): 1920x1440, 184320 samples: min A max B mean M (black 64); top 3 bits n0 n1 ... n7
+LAUREL CAMERA: raw (boot): Bayer places x10 ...; bytes of the 5-byte group b0 b1 b2 b3 b4; no signal: ... | signal: ...
+```
+
+Each session: the rails, read back and raw lines at frame 6, the raw line each 150 frames (5 s at 30 fps), plus from the plug-in, from the bytes it got:
+
+```
+LAUREL CAMERA: ios: raw as read: frame 6, 1920x1440 stride 2400, N samples: min A max B mean M (black 64); top 3 bits ...; bytes of the group ...
+```
+
+`spmi errors ... torch 0 camera 0, forced 0`: the new user. `rail: the RPM refused the L12A mode vote` only on a refusal. `temperature`, `pedestal`, the `mode 7` and the bars' levels are [I]: first read ever. Some table registers may read back differently by nature; a list that names many is not a fault by itself: read its addresses.
+
+### How to read the next boot
+
+| Lines | Means | Next |
+| --- | --- | --- |
+| `NO BARS` | Path or reading wrong (or the sensor took no pattern: then `test pattern 0` and a noise frame) | Look at `raw` bytes and places; the path, not the pixels |
+| Bars right, `signal:` in a lit room | The sensor was fine, the scene was dark | Picture work (section 10) goes on |
+| Bars right, `no signal` in a lit room, lens free, `raw` the same with a torch on a near white wall | The array gives nothing | Read `rails`: VANA `in 0` = pad not driven; L12A not on or `mode` not 7; `table read-back` list. All clean: the switched regulator's input or the module: [U] from here; a stock boot of this phone settles it |
+| `raw (session)` and `raw as read` differ | read() path | `laurel_cam_dev.c`, the ring |
+
+### Build and test [V]
+
+`scripts/laurel/cam-test.sh` + `tools/laurel-cam-test/cam7_test.c`: black noise = `no signal`, lit = `signal`, one byte off shows in the group's bytes, constant frame named, kernel numbers = plug-in numbers, all 4 Bayer orders found from bars, noise, flat frames and a wrong stride are not good bars, `1% over` real on black, stock data above. The patch: `scripts/laurel/camera-patch.sh BASE WORK 2784-laurel-camera-light`. Build numbers: `docs/notes.md`.
+
+### Test steps (owner approval for each partition write)
+
+1. **Boot image and root, both:** kernel: `scripts/laurel/uefi-image.sh`, `flash-boot.sh`. Plug-in: `userland/laurel/camera/build.sh`, `sudo scripts/laurel/root.sh`, flash userdata.
+2. First the boot lines (they do not need a scene: bars, read-back, rails).
+3. Hold the phone. Lens free, point it at a window or a lamp. Open Camera. 15 s (3 `raw` lines).
+4. Cover the lens with a finger 10 s, free it 10 s.
+5. Turn the flashlight on in the Camera app and hold the phone 10 cm from a white wall, 10 s.
+6. Report: `grep -a -E 'raw \(|raw as read|rails \(|read back|table read-back|test pattern' <log>`.
+7. Undo: `camera=0` is the kill switch for all of it.
