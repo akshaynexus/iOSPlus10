@@ -28,6 +28,15 @@ Bluetooth (2026-11-01 05:30, area G, built, NOT BOOTED): kernel 2600 (WCN3990 on
 EDL version, 3000000 baud, crbtfw21.tlv + crnv21.bin from bluetooth_b at run time, HCI reset, BD_ADDR; iOS transport as negroni),
 mkadt /arm-io/bluetooth, userland/laurel/bt + root-bt.sh. Next: boot, read `LAUREL BT: on|off:`, then bluetoothd log + a scan.
 Details: `docs/laurel_sprout/bluetooth.md`.
+Camera step 1 (2026-11-01 08:30, branch t3/laurel-camera, built, NOT BOOTED): Camera.app does not work (no frame path, no iOS
+side). Path decision: RDI raw frames (CSIPHY -> CSID -> ISPIF -> VFE0 RDI, no ISP/CPP, no firmware on this CAMSS generation) + the
+negroni/HakiOS mediaserverd plug-in with CPU ISP and the `NCFRAME1` device ABI. Sensors [V stock vendor libraries, DT,
+camera_config.xml]: rear IMX586 (or IMX582) 0x1a, depth GC2375H 0x17 / OV02A10 0x3d, front S5KGD1 0x2d, ultrawide S5K4H7 0x10.
+Kernel 2770: camss_top GDSC + CCI clocks (37.5 MHz) + CCI controller (polled), power-up order of each library (GPIO LDOs + L12A via
+the RPM), chip ID per slot, everything back as the boot left it; one `LAUREL CAMERA: on|off:` line, sysctl kern.laurel_camera, kill
+switch camera=0. Host test scripts/laurel/cam-test.sh 69/69. 249/249 patches (2760 context refreshed after 2720), 0 LSE, kernel
+sha256 e0707f0d.... Next: boot, read the `LAUREL CAMERA:` lines; then step 2 (IMX586 1280x720 RDI frames, tables from a root copy of
+the vendor libraries). Details: `docs/laurel_sprout/camera.md`.
 Flashing (2026-10-31 23:58): `fastboot boot` is refused by this ABL; the shim image goes to `boot_b` with
 `scripts/bg.sh laurel-flash scripts/laurel/flash-boot.sh`. The script runs `fastboot reboot bootloader` first:
 a session entered with Power+VolDown has a broken ABL USB state (garbled commands, uploads stall at 16 MiB); after the

@@ -4259,3 +4259,23 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - [V] Host test `scripts/laurel/test-cell.sh` (8 scenarios, simulated modem) found 2 bugs before any boot: the first `on`
   line came before provisioning finished and before the first signal answer.
 - Build [V]: kernel-linux.sh 246/246 patches, 0 LSE, no warnings in the new code. No root change for step 1.
+## Mi A3: camera step 1 = power + CCI + chip ID of the 4 cameras; patch 2770 (2026-11-01, camera agent, branch t3/laurel-camera; build + host test only, NOT BOOTED)
+- Details: docs/laurel_sprout/camera.md (hardware table, path decision, steps, expected lines).
+- [V] SM6125 CAMSS is the old gen1 (sdm660 type): CCI, CSIPHY v3.5, CSID v5.0, ISPIF v3.0, VFE48, CPP, JPEG; no ICP and no camera
+  firmware in the DT. Mainline Linux has no sm6125 camss/cci node, but its sdm660 code (camss-csid-4-7, -vfe-4-8, -ispif,
+  -csiphy-3ph-1-0) and i2c-qcom-cci cci_v2 (= the trinket DT timing values) are the register reference.
+- [V] Sensor facts live in the stock `/vendor/lib/libmmcamera_laurus_<sensor>.so`: data-only libraries, one sensor_lib_t in .data.
+  Layout: name[32]; u32 slave (8-bit form), freq, addr_type, data_type; u16 id_reg, id at +0x30; power-up 12 x 16-byte steps at
+  +0x5e08 (count +0x5ec8), power-down at +0x5ecc (count +0x5f8c); steps {type 0 CLK/1 GPIO/2 VREG, val, config, delay ms} with the
+  4.14 uapi enums; mode table = count + 0x60-byte records {x, y, line_length, frame_length, 0, vt_pixel_clk, ...}; register tables
+  {u16 addr, u16 data, u32 delay}. scripts/laurel/camera-sensors.py decodes it (camera-inventory.sh extracts from vendor.img).
+- [V] Mi A3 rails are GPIO-switched LDOs (the QRD PM8008 L1P-L5P are disabled in trinket.dtsi) + PM6125 L12A for VIO ("VREG VIO").
+  Front and ultrawide share CSIPHY2/CSID2 through a MIPI switch on gpio 114/115. MCLK3 is gpio 44 function 7 (not 1).
+- [V] The IMX586 init table sets INCK 0x0136 = 0x1800 (24 MHz); step 1 uses 19.2 MHz TCXO MCLK only for the ID read [I: fine for
+  I2C]; streaming needs 24 MHz (GPLL9 M/N 1/24).
+- Fix on the base: 2760's bsd/conf/files hunk did not apply after 2720 (laurel_rtc.c line); context refreshed, no code change.
+- Build [V]: kernel-linux.sh 249/249 patches, 0 LSE, no warnings in laurel_cam*.c; kernel sha256 e0707f0d...; cam-test 69/69 (9
+  library entries cross-checked against sensors.txt).
+- Next: boot (boot_b flash, owner), expect `LAUREL CAMERA: on: rear IMX586 (0x1a id 0x0586), depth ..., front S5KGD1 ...,
+  ultrawide S5K4H7 ...`; a NACK on one slot = check that slot's rail/reset pins. Then step 2 (RDI frames), step 3 (/dev node),
+  step 4 (iOS plug-in from userland/camera).

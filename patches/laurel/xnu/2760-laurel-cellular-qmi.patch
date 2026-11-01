@@ -3,10 +3,10 @@ laurel 2760: cellular step 1 on the Mi A3 (SM6125, modem MPSS.AT.4.3.1, dual nan
 diff -ruN a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -123,6 +123,7 @@
- bsd/dev/sweet_rpmh.c			standard
+@@ -124,6 +124,7 @@
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/laurel_reboot.c			standard
+ bsd/dev/laurel_rtc.c			standard
 +bsd/dev/laurel_cell.c			standard
  bsd/dev/laurel_bt.c			standard
  bsd/dev/laurel_bt_clk.c			standard
