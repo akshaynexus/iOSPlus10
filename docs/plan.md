@@ -14,6 +14,12 @@ other surfaces from wired pages), 2103 (native 720x1560 canvas at scale 2 by def
 `MU_RAM_LAYOUT=late` as the fallback; mkadt `--dram auto`. Review fixes 05:15: low RAM used last (vm_himemory_mode), spool 6 x 12 MiB,
 2102 merged into 2103. Test = boot_b flash (no fastboot boot). Next: boot, read `LAUREL RAM:`, `LAUREL SPOOL:`,
 `LAUREL FB CANVAS:`, `LAUREL FB CANVAS: first frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
++ 0102 (DarwinBoot shrinks the window instead of "NO WINDOW"); mkadt `--dram auto`. Next: boot, read `LAUREL RAM:`, `LAUREL SPOOL:`,
+`LAUREL FB CANVAS:`, `LAUREL FB: first iOS frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
+Bluetooth (2026-11-01 05:30, area G, built, NOT BOOTED): kernel 2600 (WCN3990 on QUP1 SE9 GENI UART, RPM rails, power pulses,
+EDL version, 3000000 baud, crbtfw21.tlv + crnv21.bin from bluetooth_b at run time, HCI reset, BD_ADDR; iOS transport as negroni),
+mkadt /arm-io/bluetooth, userland/laurel/bt + root-bt.sh. Next: boot, read `LAUREL BT: on|off:`, then bluetoothd log + a scan.
+Details: `docs/laurel_sprout/bluetooth.md`.
 Flashing (2026-10-31 23:58): `fastboot boot` is refused by this ABL; the shim image goes to `boot_b` with
 `scripts/bg.sh laurel-flash scripts/laurel/flash-boot.sh`. The script runs `fastboot reboot bootloader` first:
 a session entered with Power+VolDown has a broken ABL USB state (garbled commands, uploads stall at 16 MiB); after the

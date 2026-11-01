@@ -4028,3 +4028,18 @@ Details: `docs/laurel_sprout/battery-power.md`.
   battery self-check failures write the safe limits (SMB5 EE 0); safe limits before IOPMrootDomain will-sleep; kill
   switches laurelbatt=0/laurelchg=0 = no writes (previous limits stay). Build `areaD-k2306`: 231 patches, 0 LSE, kernel
   sha256 7bda8194... NOT BOOTED.
+
+## Mi A3: Bluetooth WCN3990 driver, patch 2600 (2026-11-01 05:30, area G, build only, NOT BOOTED)
+- Details: docs/laurel_sprout/bluetooth.md. One small file per step (bsd/dev/laurel_bt*.c, each < 310 lines) + LaurelBluetooth.cpp.
+  Third try: the first two agents were cut off while they wrote one large file; small files + `scripts/laurel/kcheck.sh`
+  (syntax-only compile with the recorded kernel compiler line, a few seconds) after each file worked.
+- [V Linux] WCN3990: no BT_EN; rails PM6125 L9/L16/L17/L23 (RPM "ldoa"), pulses 0xC0 at 2400 / 0xFC at 115200, EDL answers are
+  vendor events (04 ff), the 0xfc48 answer comes at the new speed, 0xfc14 takes the address in display order (btqca swaps).
+- [V] QUP1 SE9 0x4c90000, GPIO 10-13 EAST func 1, GCC vote 0x7900c bits 18-21 + 26, s4 RCG 0x39608 DFS. [I] 3000000 baud needs a
+  96 MHz DFS level; the driver checks the host clock before it tells the chip.
+- [V] The active slot is _b: firmware from FAT16 bluetooth_b first, then bluetooth_a (read-only, at run time, never in git).
+- iOS: negroni path (kernel control com.apple.uart.bluetooth, /dev/uart.bluetooth, /dev/btwake, vendor-command answers);
+  ADT /arm-io/bluetooth from mkadt.py (synthetic fallback address 02:4c:41:33:42:54); the kernel publishes the address in use
+  and hides the nub when off. Userland builds on Linux (userland/laurel/bt/build.sh), root.sh calls root-bt.sh (BT=0 skips).
+- Line to check on the next boot: `LAUREL BT: on: WCN3990 product 0x000a rom 0x0201, crbtfw21.tlv + crnv21.bin, 3000000 baud,
+  BD_ADDR ..` or `LAUREL BT: off: <why>` (+ `LAUREL BT: clk:/geni:/power:/chip:/fw:` step lines).

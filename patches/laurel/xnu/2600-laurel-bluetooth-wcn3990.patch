@@ -1,0 +1,2733 @@
+laurel 2600: Bluetooth on the Mi A3. WCN3990 over the GENI UART of QUP1 SE9 (0x4c90000, GPIO 10-13 qup14): GCC wrap 1 votes + s4 RCG (DFS levels or the Linux table), FIFO mode, polled, RTS/CTS. Power: PM6125 L9/L16/L17/L23 through the RPM (topaz_rpm_write), power pulses 0xC0 at 2400 and 0xFC at 115200 (no BT_EN). Bring-up as Linux hci_qca/btqca: EDL version (vendor event), 0xfc48 to 3000000 baud, crbtfw%02x.tlv rampatch + crnv%02x.bin NVM (speed tag 17) read at run time from the phone's FAT16 bluetooth_b (then _a) partition, HCI reset, BD_ADDR (the chip's own if unique, else the ADT local-mac-address, 0xfc14 + read back). iOS side (negroni 0332/0333/0336/0337 path): kernel control com.apple.uart.bluetooth, /dev/uart.bluetooth, /dev/cu.bluetooth, /dev/btwake, HCI answers for bluetoothd's Broadcom vendor commands, in-band sleep bytes. LaurelBluetooth.cpp: ADT /arm-io/bluetooth nub gets the address in use, or is hidden when Bluetooth is off. One line: 'LAUREL BT: on: WCN3990 product .. rom .., crbtfw21.tlv + crnv21.bin, 3000000 baud, BD_ADDR ..' or 'LAUREL BT: off: <why>'. Kill switch laurelbt=0. One small file per step (bsd/dev/laurel_bt*.c). Details: docs/laurel_sprout/bluetooth.md.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 05:15:56.526294173 +0530
++++ b/bsd/conf/files	2026-11-01 05:17:05.164822232 +0530
+@@ -121,6 +121,17 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/laurel_reboot.c			standard
++bsd/dev/laurel_bt.c			standard
++bsd/dev/laurel_bt_clk.c			standard
++bsd/dev/laurel_bt_uart.c			standard
++bsd/dev/laurel_bt_power.c			standard
++bsd/dev/laurel_bt_fat.c			standard
++bsd/dev/laurel_bt_fw.c			standard
++bsd/dev/laurel_bt_h4.c			standard
++bsd/dev/laurel_bt_hci.c			standard
++bsd/dev/laurel_bt_ios.c			standard
++bsd/dev/laurel_bt_ctl.c			standard
++bsd/dev/laurel_bt_dev.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff -ruN a/bsd/dev/laurel_bt.c b/bsd/dev/laurel_bt.c
+--- a/bsd/dev/laurel_bt.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt.c	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,183 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 6: start. On by default; kill switch laurelbt=0.
++ * STARTUP(EARLY_BOOT) starts two threads:
++ *   bring-up: wait for UFS (the firmware partition), rails, UART, power pulses, EDL version, 3000000 baud,
++ *     rampatch + NVM, HCI reset, BD_ADDR, then the iOS transport goes ready;
++ *   attach: wait for the root file system (devfs), then the kernel control and the /dev nodes (sends wait for
++ *     the bring-up), so bluetoothd finds them when launchd starts it.
++ * Result, one line: "LAUREL BT: on: WCN3990 product .. rom .., crbtfw21.tlv + crnv21.bin, 3000000 baud, BD_ADDR .."
++ * or "LAUREL BT: off: <reason>". Off = the /dev nodes go, the ADT "bluetooth" nub is hidden, sends fail; USB,
++ * UFS, Wi-Fi and the boot are not touched.
++ * BD_ADDR: the chip's own address when it is unique (not the NVM default); else the ADT /arm-io/bluetooth
++ * local-mac-address (scripts/laurel/mkadt.py); the address in use is then published to the nub for bluetoothd.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <kern/clock.h>
++#include <kern/startup.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "laurel_bt.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void IOSleep(unsigned int milliseconds);
++extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++extern vnode_t rootvnode;
++
++#define OPER_BAUD       3000000u
++#define UFS_WAIT_S      180u
++
++static volatile int lbt_state;                  /* 0 running, 1 on, -1 off */
++
++uint64_t
++lbt_us(void)
++{
++	uint64_t t, ns;
++
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns / 1000u;
++}
++
++void
++lbt_sleep_ms(uint32_t ms)
++{
++	IOSleep(ms);
++}
++
++static void
++off(const char *why)
++{
++	lbt_state = -1;
++	lbt_ios_fail(why);
++	lbt_dev_detach();
++	laurel_bt_adt_hide();
++	LBT_SAY("off: %s\n", why);
++}
++
++static bool
++wait_ufs(void)
++{
++	uint8_t b[16];
++
++	for (unsigned i = 0; i < UFS_WAIT_S * 2; i++) {
++		if (sweet_ufs_read_part("bluetooth_b", 0, b, sizeof(b)) != EAGAIN) {
++			return true;
++		}
++		IOSleep(500);
++	}
++	return false;
++}
++
++static void
++pick_addr(const uint8_t nvm[6], bool have_nvm, uint8_t out[6])
++{
++	uint8_t chip[6];
++	DTEntry node;
++	void const *prop = NULL;
++	unsigned int size = 0;
++	const char *why = "";
++
++	if (lbt_hci_read_bdaddr(chip) == 0 && lbt_addr_ok(chip) && !(have_nvm && memcmp(chip, nvm, 6) == 0)) {
++		memcpy(out, chip, 6);
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/arm-io/bluetooth", &node) == kSuccess &&
++	    SecureDTGetProperty(node, "local-mac-address", &prop, &size) == kSuccess && size >= 6 &&
++	    lbt_addr_ok(prop) && lbt_hci_bdaddr(prop, &why) == 0) {
++		memcpy(out, prop, 6);
++		return;
++	}
++	if (*why) {
++		LBT_SAY("addr: ADT address not set: %s\n", why);
++	}
++	memcpy(out, chip, 6);                   /* the chip keeps its address */
++}
++
++static void
++bringup(void)
++{
++	struct lbt_qca_version v;
++	const char *why = "";
++	char names[48];
++	uint8_t nvm[6], addr[6];
++	bool have_nvm = false;
++
++	if (!wait_ufs()) {
++		off("no UFS after 180 s (firmware partition not readable)");
++		return;
++	}
++	(void)lbt_power_rails(&why);            /* a refusal is logged; the version answer is the check */
++	if (lbt_uart_init(&why) || lbt_power_on(&why) || lbt_hci_version(&v, &why)) {
++		off(why);
++		return;
++	}
++	LBT_SAY("chip: product %#06x patch %#06x rom %#06x soc %#010x\n", v.product, v.patch, v.rom, v.soc);
++	if (lbt_hci_speed(OPER_BAUD, &why) ||
++	    lbt_fw_download(&v, (uint8_t)lbt_qca_baud_index(OPER_BAUD), nvm, &have_nvm, names, sizeof(names), &why) ||
++	    lbt_hci_reset(&why)) {
++		lbt_power_off();
++		off(why);
++		return;
++	}
++	pick_addr(nvm, have_nvm, addr);
++	laurel_bt_adt_publish(addr);
++	lbt_state = 1;
++	lbt_ios_start();
++	LBT_SAY("on: WCN3990 product %#06x rom %#06x, %s, %u baud, BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x\n",
++	    v.product, v.rom, names, lbt_uart_baud(), addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
++}
++
++static void
++bringup_thread(void *arg __unused, wait_result_t w __unused)
++{
++	bringup();
++	(void)thread_terminate(current_thread());
++}
++
++static void
++attach_thread(void *arg __unused, wait_result_t w __unused)
++{
++	for (unsigned ms = 0; rootvnode == NULLVP && ms < 600u * 1000u; ms += 50) {
++		IOSleep(50);
++	}
++	if (lbt_state < 0) {
++		laurel_bt_adt_hide();           /* kill switch or an early failure */
++	} else if (rootvnode != NULLVP) {
++		lbt_ctl_attach();
++		lbt_dev_attach();
++		if (lbt_state < 0) {
++			lbt_dev_detach();       /* the bring-up failed meanwhile */
++		}
++	}
++	(void)thread_terminate(current_thread());
++}
++
++static void
++laurel_bt_start(void)
++{
++	uint32_t on = 1;
++	thread_t th;
++
++	(void)PE_parse_boot_argn("laurelbt", &on, sizeof(on));
++	if (on == 0) {
++		lbt_state = -1;
++		LBT_SAY("off: laurelbt=0\n");
++	} else if (kernel_thread_start(bringup_thread, NULL, &th) != KERN_SUCCESS) {
++		lbt_state = -1;
++		LBT_SAY("off: no bring-up thread\n");
++	} else {
++		thread_deallocate(th);
++	}
++	if (kernel_thread_start(attach_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, laurel_bt_start);
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_clk.c b/bsd/dev/laurel_bt_clk.c
+--- a/bsd/dev/laurel_bt_clk.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_clk.c	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,196 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 1b: bring up QUP1 SE9 for the UART.
++ * Mappings, GCC branch votes (wrap 1 core/core_2x/AHB + s4), the s4 RCG (DFS levels as XBL left them, else the
++ * Linux table), pins GPIO 10-13 to qup14, GENI FIFO mode, 8N1 at 115200, RX command started.
++ * The self-check is here: no UART firmware in SE9, FIFO interface off, or a QUP clock that does not run =
++ * Bluetooth off with the reason (USB, UFS and the boot are not touched).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "laurel_bt.h"
++#include "laurel_bt_geni.h"
++
++#define QUP_HW_VER              0x4u
++#define PROTO_UART              2u
++#define PIN_FUNC_QUP14          1u
++
++/* clk-rcg2.c: CFG src 10:8, hid 4:0, mode 13:12; N register = ~(n - m) */
++static uint64_t
++rcg_rate(uint32_t cfg, uint32_t m, uint32_t notnm)
++{
++	static const uint64_t parent[8] = { 19200000, 600000000, 300000000, 0, 384000000, 0, 0, 0 };
++	uint64_t r = parent[(cfg >> 8) & 7u];
++	uint32_t hid = cfg & 0x1fu;
++
++	if (hid) {
++		r = r * 2u / (hid + 1u);
++	}
++	if ((cfg >> 12) & 3u) {
++		uint32_t mm = m & 0xffffu, nn = ((~notnm) & 0xffffu) + mm;
++		r = nn ? r * mm / nn : 0;
++	}
++	return r;
++}
++
++/* BRANCH_HALT_VOTED: CLK_OFF clears within 500 us of the vote */
++static bool
++branch_on(uint32_t cbcr)
++{
++	return lbt_wait_bits(u.gcc + cbcr, CLK_OFF, false, 500);
++}
++
++static int
++clocks(const char **why)
++{
++	vm_offset_t r = u.gcc + RCG;
++	uint32_t before = rd(u.vote);
++
++	wr(u.vote, before | VOTE_BITS);
++	if (!branch_on(CBCR_CORE) || !branch_on(CBCR_CORE2X) || !branch_on(CBCR_M_AHB)) {
++		LBT_SAY("clk: vote %#x -> %#x, CBCR core %#x core_2x %#x m_ahb %#x\n", before, rd(u.vote),
++		    rd(u.gcc + CBCR_CORE), rd(u.gcc + CBCR_CORE2X), rd(u.gcc + CBCR_M_AHB));
++		*why = "QUP1 core/AHB clocks do not run";
++		return ENXIO;
++	}
++	u.dfs = (rd(r + RCG_DFSR) & 1u) != 0;
++	u.levels = 0;
++	for (uint32_t l = 0; u.dfs && l < 8; l++) {
++		u.level_hz[l] = rcg_rate(rd(r + RCG_PERF(l)), rd(r + RCG_PERF_M(l)), rd(r + RCG_PERF_N(l)));
++		u.levels++;
++	}
++	LBT_SAY("clk: vote %#x -> %#x, s4 RCG cfg %#x, DFS %s (%u levels, top %llu Hz)\n", before, rd(u.vote),
++	    rd(r + RCG_CFG), u.dfs ? "on" : "off", u.levels, u.levels ? u.level_hz[u.levels - 1] : 0ull);
++	return 0;
++}
++
++static int
++geni_check(const char **why)
++{
++	uint32_t fw = rd(SE(GENI_FW_REVISION_RO)), ver = rd(u.qup + QUP_HW_VER);
++	uint32_t p0 = rd(SE(SE_HW_PARAM_0)), p1 = rd(SE(SE_HW_PARAM_1));
++	bool big = ver >= 0x30010000u;          /* QUP >= 3.1: FIFO depth in bits 23:16 */
++
++	u.tx_depth = (p0 >> 16) & (big ? 0xffu : 0x3fu);
++	u.rx_depth = (p1 >> 16) & (big ? 0xffu : 0x3fu);
++	/* msm_geni_serial.c UART_OVERSAMPLING 32; mainline halves it from QUP 2.5 */
++	u.sampling = ver >= 0x20050000u ? 16u : 32u;
++	LBT_SAY("geni: QUP %#x (oversampling %u), SE9 FW %#x, FIFO %u/%u words\n", ver, u.sampling, fw,
++	    u.tx_depth, u.rx_depth);
++	if (fw == 0xffffffffu || ((fw >> 8) & 0xffu) != PROTO_UART) {
++		*why = "QUP1 SE9 has no UART firmware";
++		return ENODEV;
++	}
++	if (rd(SE(GENI_IF_DISABLE_RO)) & 1u) {
++		*why = "QUP1 SE9 FIFO interface is off (GSI only)";
++		return ENODEV;
++	}
++	if (u.tx_depth < 4 || u.rx_depth < 4) {
++		*why = "QUP1 SE9 FIFO depth not usable";
++		return ENODEV;
++	}
++	return 0;
++}
++
++static void
++pins(void)
++{
++	/* trinket-pinctrl.dtsi qupv3_se9_4uart: CTS 10 + RX 13 no pull, RTS 11 pull-down, TX 12 pull-up, 2 mA */
++	static const uint32_t pull[4] = { 0u, 1u, 3u, 0u };
++
++	for (uint32_t i = 0; i < 4; i++) {
++		wr(u.tlmm + 0x1000u * i, PIN_FUNC_QUP14 << 2 | pull[i]);
++	}
++}
++
++static void
++s_cancel(void)
++{
++	if (rd(SE(GENI_STATUS)) & (1u << 12)) {
++		wr(SE(GENI_S_CMD_CTRL), CMD_CANCEL);
++		if (!lbt_wait_bits(SE(GENI_S_IRQ_STATUS), S_CMD_CANCEL, true, 2000)) {
++			wr(SE(GENI_S_CMD_CTRL), CMD_ABORT);
++			(void)lbt_wait_bits(SE(GENI_S_IRQ_STATUS), 1u << 5, true, 2000);
++		}
++	}
++	if (rd(SE(GENI_STATUS)) & 1u) {
++		wr(SE(GENI_M_CMD_CTRL), CMD_CANCEL);
++		(void)lbt_wait_bits(SE(GENI_M_IRQ_STATUS), M_CMD_CANCEL, true, 2000);
++	}
++}
++
++/* geni_se_init + geni_se_select_mode(FIFO) + msm_geni_serial_port_setup + set_termios (8N1, RTS/CTS) */
++static void
++geni_setup(void)
++{
++	s_cancel();
++	wr(SE(SE_GSI_EVENT_EN), 0);
++	wr(SE(GENI_M_IRQ_CLEAR), 0xffffffffu);
++	wr(SE(GENI_S_IRQ_CLEAR), 0xffffffffu);
++	wr(SE(DMA_TX_IRQ_CLR), 0xffffffffu);
++	wr(SE(DMA_RX_IRQ_CLR), 0xffffffffu);
++	wr(SE(SE_IRQ_EN), 0xffffffffu);
++	wr(SE(GENI_CGC_CTRL), rd(SE(GENI_CGC_CTRL)) | 0x7fu);
++	wr(SE(SE_DMA_GENERAL_CFG), rd(SE(SE_DMA_GENERAL_CFG)) | 0xfu);
++	wr(SE(GENI_OUTPUT_CTRL), 0x7fu);
++	wr(SE(GENI_FORCE_DEFAULT), 1u);
++	wr(SE(GENI_DMA_MODE_EN), rd(SE(GENI_DMA_MODE_EN)) & ~1u);
++	wr(SE(GENI_M_IRQ_EN), 0);               /* polled */
++	wr(SE(GENI_S_IRQ_EN), 0);
++	wr(SE(GENI_RX_WATERMARK), 2u);
++	wr(SE(GENI_RX_RFR_WATERMARK), u.rx_depth - 2u);
++	wr(SE(GENI_TX_WATERMARK), 0);
++	/* 8 bits, 4 per word, LSB first */
++	wr(SE(GENI_TX_PACKING_CFG0), 0x4380eu);
++	wr(SE(GENI_TX_PACKING_CFG1), 0xc3e0eu);
++	wr(SE(GENI_RX_PACKING_CFG0), 0x4380eu);
++	wr(SE(GENI_RX_PACKING_CFG1), 0xc3e0eu);
++	wr(SE(GENI_BYTE_GRAN), 0);
++	wr(SE(UART_RX_STALE_CNT), 10u * 16u);
++	wr(SE(UART_LOOPBACK_CFG), 0);
++	wr(SE(UART_TX_TRANS_CFG), 0);           /* CTS used */
++	wr(SE(UART_RX_TRANS_CFG), 0);
++	wr(SE(UART_TX_PARITY_CFG), 0);
++	wr(SE(UART_RX_PARITY_CFG), 0);
++	wr(SE(UART_TX_WORD_LEN), 8u);
++	wr(SE(UART_RX_WORD_LEN), 8u);
++	wr(SE(UART_TX_STOP_BIT_LEN), 0);
++	wr(SE(UART_MANUAL_RFR), 0);             /* RFR follows the RX FIFO watermark */
++}
++
++int
++lbt_uart_init(const char **why)
++{
++	int e;
++
++	u.gcc = lbt_map(GCC_QUP_PA, 0x700u);
++	u.vote = lbt_map(GCC_VOTE_PA, 4u);
++	u.tlmm = lbt_map(TLMM_PIN_PA(PIN_CTS), 0x4000u);
++	u.se = lbt_map(SE_PA, 0x4000u);
++	u.qup = lbt_map(QUP_PA, 0x2000u);
++	if (!u.gcc || !u.vote || !u.tlmm || !u.se || !u.qup) {
++		*why = "register mapping failed";
++		return ENOMEM;
++	}
++	if ((e = clocks(why)) != 0 || (e = geni_check(why)) != 0) {
++		return e;
++	}
++	pins();
++	geni_setup();
++	if (lbt_uart_set_baud(115200u) != 0) {
++		*why = "no QUP clock for 115200 baud";
++		return ERANGE;
++	}
++	if (!branch_on(CBCR_S4)) {
++		LBT_SAY("clk: s4 CBCR %#x\n", rd(u.gcc + CBCR_S4));
++		*why = "QUP1 SE9 clock does not run";
++		return ENXIO;
++	}
++	u.head = u.tail = 0;
++	/* UART_START_READ, param 0: RFR follows the watermark (Linux sets RFR_OPEN; polled here, so no loss) */
++	wr(SE(GENI_S_CMD0), 1u << 27);
++	LBT_SAY("uart: 115200 8N1 RTS/CTS, RX on (status %#x)\n", rd(SE(GENI_STATUS)));
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_ctl.c b/bsd/dev/laurel_bt_ctl.c
+--- a/bsd/dev/laurel_bt_ctl.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_ctl.c	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,167 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 5b: the kernel control that iOS bluetoothd opens
++ * (negroni 0332; bluetoothd 20H392 POSIX transport): socket(PF_SYSTEM, SOCK_STREAM, SYSPROTO_CONTROL), CTLIOCGINFO
++ * "com.apple.uart.bluetooth", connect; getsockopt TIOCGETA / setsockopt TIOCSETA (termios, stored only: the line
++ * stays at the bring-up speed with RTS/CTS); then plain H4 bytes both ways. Not privileged (bluetoothd and
++ * BlueTool run as mobile). Data toward the client is enqueued only by the RX thread (lbt_ctl_pump).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/termios.h>
++#include <sys/ttycom.h>
++#include <sys/kern_control.h>
++#include <sys/kpi_mbuf.h>
++#include "laurel_bt.h"
++
++#define CTL_NAME        "com.apple.uart.bluetooth"
++#define CTL_CHUNK       2048u
++
++static struct {
++	kern_ctl_ref ref;
++	volatile bool connected, full, kick;
++	uint32_t unit;
++	struct termios tio;
++	uint8_t buf[CTL_CHUNK];                 /* RX thread only */
++} c;
++
++static errno_t
++ctl_connect(kern_ctl_ref ref __unused, struct sockaddr_ctl *sac, void **unitinfo)
++{
++	errno_t e = lbt_ios_claim(1, sac->sc_unit);
++
++	if (e == 0) {
++		c.unit = sac->sc_unit;
++		c.full = false;
++		c.connected = true;
++	}
++	*unitinfo = NULL;
++	return e;
++}
++
++static errno_t
++ctl_disconnect(kern_ctl_ref ref __unused, u_int32_t unit, void *unitinfo __unused)
++{
++	if (c.connected && c.unit == unit) {
++		c.connected = false;
++		lbt_ios_release(1);
++	}
++	return 0;
++}
++
++static errno_t
++ctl_send(kern_ctl_ref ref __unused, u_int32_t unit, void *unitinfo __unused, mbuf_t m, int flags __unused)
++{
++	errno_t e = 0;
++
++	if (!c.connected || c.unit != unit) {
++		mbuf_freem(m);
++		return ENOTCONN;
++	}
++	for (mbuf_t n = m; n != NULL && !e; n = mbuf_next(n)) {
++		if (mbuf_len(n) > 0) {
++			e = lbt_ios_send((const uint8_t *)mbuf_data(n), (uint32_t)mbuf_len(n));
++		}
++	}
++	mbuf_freem(m);
++	return e;
++}
++
++static errno_t
++ctl_setopt(kern_ctl_ref ref __unused, u_int32_t unit __unused, void *unitinfo __unused, int opt, void *data,
++    size_t len)
++{
++	if ((unsigned)opt == (unsigned)TIOCSETA || (unsigned)opt == (unsigned)TIOCSETAW ||
++	    (unsigned)opt == (unsigned)TIOCSETAF) {
++		if (data == NULL || len < sizeof(struct termios)) {
++			return EINVAL;
++		}
++		memcpy(&c.tio, data, sizeof(struct termios));
++	}
++	return 0;
++}
++
++static errno_t
++ctl_getopt(kern_ctl_ref ref __unused, u_int32_t unit __unused, void *unitinfo __unused, int opt, void *data,
++    size_t *len)
++{
++	if ((unsigned)opt != (unsigned)TIOCGETA) {
++		return ENOTSUP;
++	}
++	if (data != NULL) {
++		if (*len < sizeof(struct termios)) {
++			return EINVAL;
++		}
++		c.tio.c_ispeed = c.tio.c_ospeed = lbt_uart_baud();
++		memcpy(data, &c.tio, sizeof(struct termios));
++	}
++	*len = sizeof(struct termios);
++	return 0;
++}
++
++static void
++ctl_rcvd(kern_ctl_ref ref __unused, u_int32_t unit, void *unitinfo __unused, int flags __unused)
++{
++	if (c.connected && c.unit == unit) {
++		c.full = false;
++		c.kick = true;
++	}
++}
++
++void
++lbt_ctl_wakeup(void)
++{
++	c.kick = true;
++}
++
++void
++lbt_ctl_pump(void)
++{
++	while (c.kick && c.connected && !c.full && lbt_ios_queued()) {
++		size_t space = 0;
++		errno_t e = ctl_getenqueuespace(c.ref, c.unit, &space);
++		uint32_t n;
++
++		if (e == 0 && space == 0) {
++			e = ENOBUFS;
++		}
++		if (e) {
++			c.full = e == ENOBUFS;  /* ctl_rcvd clears it */
++			return;
++		}
++		n = lbt_ios_take(c.buf, (uint32_t)MIN(space, (size_t)CTL_CHUNK));
++		if (n && (e = ctl_enqueuedata(c.ref, c.unit, c.buf, n, 0)) != 0) {
++			LBT_SAY("ctl: enqueue error %d (%u bytes lost)\n", e, n);
++			return;
++		}
++	}
++	if (!lbt_ios_queued()) {
++		c.kick = false;
++	}
++}
++
++void
++lbt_ctl_attach(void)
++{
++	struct kern_ctl_reg reg;
++	errno_t e;
++
++	bzero(&c.tio, sizeof(c.tio));
++	c.tio.c_cflag = CS8 | CREAD | CLOCAL | CRTSCTS;
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, CTL_NAME, sizeof(reg.ctl_name));
++	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM | CTL_FLAG_REG_EXTENDED;       /* not CTL_FLAG_PRIVILEGED */
++	reg.ctl_sendsize = 64u << 10;
++	reg.ctl_recvsize = 128u << 10;
++	reg.ctl_connect = ctl_connect;
++	reg.ctl_disconnect = ctl_disconnect;
++	reg.ctl_send = ctl_send;
++	reg.ctl_setopt = ctl_setopt;
++	reg.ctl_getopt = ctl_getopt;
++	reg.ctl_rcvd = ctl_rcvd;
++	if ((e = ctl_register(&reg, &c.ref)) != 0) {
++		LBT_SAY("ctl: %s not registered (error %d)\n", CTL_NAME, e);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_dev.c b/bsd/dev/laurel_bt_dev.c
+--- a/bsd/dev/laurel_bt_dev.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_dev.c	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,218 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 5c: the device nodes (negroni 0332).
++ * bluetoothd 20H392 main checks access("/dev/cu.bluetooth") / access("/dev/uart.bluetooth") before it starts the
++ * stack, and its H4BC transport opens /dev/btwake (a failure is only logged). So: /dev/uart.bluetooth and
++ * /dev/cu.bluetooth (one char device: raw H4 bytes, select/poll, TIOCGETA/TIOCSETA/FIONREAD) and /dev/btwake (open
++ * and close do nothing: the WCN3990 has no wake pin, the in-band sleep bytes do that job).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/select.h>
++#include <sys/termios.h>
++#include <sys/ttycom.h>
++#include <sys/filio.h>
++#include <sys/vnode.h>                  /* IO_NDELAY */
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include "laurel_bt.h"
++
++#define MINOR_UART      0
++#define MINOR_CU        1
++#define MINOR_WAKE      2
++
++static LCK_GRP_DECLARE(dev_grp, "laurel_bt_dev");
++static LCK_MTX_DECLARE(dev_lock, &dev_grp);
++
++static struct {
++	bool open;
++	void *node[3];
++	struct selinfo rsel;
++	struct termios tio;
++} d;
++
++void
++lbt_dev_wakeup(void)
++{
++	lck_mtx_lock(&dev_lock);
++	wakeup(&d);
++	selwakeup(&d.rsel);
++	lck_mtx_unlock(&dev_lock);
++}
++
++static int
++dev_open(dev_t dev, int flags __unused, int devtype __unused, struct proc *p __unused)
++{
++	int e;
++
++	if (minor(dev) == MINOR_WAKE) {
++		return 0;
++	}
++	if (minor(dev) > MINOR_CU) {
++		return ENXIO;
++	}
++	if ((e = lbt_ios_claim(2, 0)) == 0) {
++		d.open = true;
++	}
++	return e;
++}
++
++static int
++dev_close(dev_t dev, int flags __unused, int devtype __unused, struct proc *p __unused)
++{
++	if (minor(dev) <= MINOR_CU && d.open) {
++		d.open = false;
++		lbt_ios_release(2);
++		lbt_dev_wakeup();               /* a blocked reader sees the closed client */
++	}
++	return 0;
++}
++
++static int
++dev_read(dev_t dev, struct uio *uio, int ioflag)
++{
++	uint8_t b[1024];
++	uint32_t n = 0;
++	int e = 0;
++
++	if (minor(dev) > MINOR_CU) {
++		return ENODEV;
++	}
++	lck_mtx_lock(&dev_lock);
++	while (!e && (n = lbt_ios_take(b, (uint32_t)MIN((user_ssize_t)sizeof(b), uio_resid(uio)))) == 0) {
++		if (!d.open) {
++			e = EIO;
++		} else if (ioflag & IO_NDELAY) {
++			e = EWOULDBLOCK;
++		} else {
++			struct timespec ts = { 0, 50 * 1000 * 1000 };   /* bounded: no lost wakeup */
++			e = msleep(&d, &dev_lock, PZERO | PCATCH, "lbtrd", &ts);
++			e = e == EWOULDBLOCK ? 0 : e;
++		}
++	}
++	lck_mtx_unlock(&dev_lock);
++	return e ? e : uiomove((const char *)b, (int)n, uio);
++}
++
++static int
++dev_write(dev_t dev, struct uio *uio, int ioflag __unused)
++{
++	uint8_t b[1024];
++	int e = 0;
++
++	if (minor(dev) > MINOR_CU) {
++		return ENODEV;
++	}
++	while (uio_resid(uio) > 0 && !e) {
++		int n = (int)MIN((user_ssize_t)sizeof(b), uio_resid(uio));
++
++		if ((e = uiomove((char *)b, n, uio)) == 0) {
++			e = lbt_ios_send(b, (uint32_t)n);
++		}
++	}
++	return e;
++}
++
++static int
++dev_ioctl(dev_t dev, u_long cmd, caddr_t data, int flag __unused, struct proc *p __unused)
++{
++	if (minor(dev) > MINOR_CU) {
++		return ENOTTY;
++	}
++	switch (cmd) {
++	case TIOCGETA:
++		d.tio.c_ispeed = d.tio.c_ospeed = lbt_uart_baud();
++		memcpy(data, &d.tio, sizeof(struct termios));
++		return 0;
++	case TIOCSETA:
++	case TIOCSETAW:
++	case TIOCSETAF:
++		memcpy(&d.tio, data, sizeof(struct termios));   /* stored only: the line keeps its speed */
++		return 0;
++	case FIONREAD:
++		*(int *)data = (int)lbt_ios_queued();
++		return 0;
++	case FIONBIO:
++	case FIOASYNC:
++	case TIOCEXCL:
++	case TIOCNXCL:
++	case TIOCFLUSH:
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++dev_select(dev_t dev, int which, void *wql, struct proc *p)
++{
++	int ready = 0;
++
++	if (minor(dev) > MINOR_CU) {
++		return 0;
++	}
++	lck_mtx_lock(&dev_lock);
++	if (which == FREAD) {
++		ready = lbt_ios_queued() > 0 || !d.open;
++		if (!ready) {
++			selrecord(p, &d.rsel, wql);
++		}
++	} else if (which == FWRITE) {
++		ready = 1;
++	}
++	lck_mtx_unlock(&dev_lock);
++	return ready;
++}
++
++static const struct cdevsw dev_cdevsw = {
++	.d_open = dev_open,
++	.d_close = dev_close,
++	.d_read = dev_read,
++	.d_write = dev_write,
++	.d_ioctl = dev_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_ttys = NULL,
++	.d_select = dev_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type = 0,
++};
++
++void
++lbt_dev_attach(void)
++{
++	int major = cdevsw_add(-1, &dev_cdevsw);
++
++	bzero(&d.tio, sizeof(d.tio));
++	d.tio.c_cflag = CS8 | CREAD | CLOCAL | CRTSCTS;
++	if (major < 0) {
++		LBT_SAY("dev: cdevsw_add failed: no /dev nodes\n");
++		return;
++	}
++	d.node[0] = devfs_make_node(makedev(major, MINOR_UART), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.bluetooth");
++	d.node[1] = devfs_make_node(makedev(major, MINOR_CU), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "cu.bluetooth");
++	d.node[2] = devfs_make_node(makedev(major, MINOR_WAKE), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "btwake");
++	if (!d.node[0] || !d.node[1] || !d.node[2]) {
++		LBT_SAY("dev: node failed (uart %d cu %d btwake %d)\n", d.node[0] != NULL, d.node[1] != NULL,
++		    d.node[2] != NULL);
++	}
++}
++
++/* Bluetooth off: bluetoothd's access() check then finds no device ("No bluetooth on this device") */
++void
++lbt_dev_detach(void)
++{
++	for (unsigned i = 0; i < 3; i++) {
++		if (d.node[i]) {
++			devfs_remove(d.node[i]);
++			d.node[i] = NULL;
++		}
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_fat.c b/bsd/dev/laurel_bt_fat.c
+--- a/bsd/dev/laurel_bt_fat.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_fat.c	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,250 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 3a: the firmware files from the phone.
++ * The "bluetooth" partition (BTFM.bin of the stock ROM) is FAT16 with 4 KiB sectors and holds /image/crbtfw21.tlv
++ * and /image/crnv21.bin. Read-only through sweet_ufs_read_part (EAGAIN until UFS is up). The active slot of the
++ * Mi A3 is _b, so bluetooth_b first, then bluetooth_a. 8.3 names only (both files fit). Firmware never in git.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++#include "laurel_bt.h"
++
++extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++
++#define FAT_MAX         (256u << 10)
++#define FILE_MAX        (1u << 20)
++
++struct fat {
++	const char *part;
++	uint32_t bps, cluster_bytes, clusters, type, root_entries, fat_bytes, dir_bytes;
++	uint64_t fat_off, root_off, data_off;
++	uint8_t *fat, *dir;
++};
++
++static int
++rd(const struct fat *f, uint64_t off, void *dst, uint32_t len)
++{
++	return sweet_ufs_read_part(f->part, off, dst, len);
++}
++
++static int
++mount(struct fat *f, const uint8_t *bs, const char **why)
++{
++	uint32_t spc = bs[13], reserved = lbt_le16(bs + 14), nfats = bs[16], fatsz = lbt_le16(bs + 22);
++	uint32_t total = lbt_le16(bs + 19) ? lbt_le16(bs + 19) : lbt_le32(bs + 32), root_sectors;
++
++	f->bps = lbt_le16(bs + 11);
++	f->root_entries = lbt_le16(bs + 17);
++	if (bs[510] != 0x55 || bs[511] != 0xaa || (f->bps != 512 && f->bps != 1024 && f->bps != 2048 &&
++	    f->bps != 4096) || !spc || (spc & (spc - 1)) || !reserved || !nfats || nfats > 2) {
++		*why = "no FAT boot sector";
++		return EINVAL;
++	}
++	if (!fatsz || !f->root_entries) {
++		*why = "FAT32 (only FAT12/16 is read)";
++		return EINVAL;
++	}
++	root_sectors = (f->root_entries * 32u + f->bps - 1) / f->bps;
++	if (total <= reserved + nfats * fatsz + root_sectors) {
++		*why = "FAT sizes do not fit the volume";
++		return EINVAL;
++	}
++	f->clusters = (total - reserved - nfats * fatsz - root_sectors) / spc;
++	f->type = f->clusters < 4085 ? 12 : 16;
++	f->cluster_bytes = f->bps * spc;
++	f->fat_off = (uint64_t)reserved * f->bps;
++	f->fat_bytes = fatsz * f->bps;
++	f->root_off = f->fat_off + (uint64_t)nfats * f->fat_bytes;
++	f->data_off = f->root_off + (uint64_t)root_sectors * f->bps;
++	f->dir_bytes = MAX(f->root_entries * 32u, f->cluster_bytes);
++	if (f->clusters >= 65525 || f->fat_bytes > FAT_MAX || f->dir_bytes > FAT_MAX) {
++		*why = "FAT too large";
++		return EINVAL;
++	}
++	f->fat = kalloc_data(f->fat_bytes, Z_WAITOK | Z_ZERO);
++	f->dir = kalloc_data(f->dir_bytes, Z_WAITOK | Z_ZERO);
++	if (!f->fat || !f->dir) {
++		*why = "no memory";
++		return ENOMEM;
++	}
++	if (rd(f, f->fat_off, f->fat, f->fat_bytes)) {
++		*why = "FAT read failed";
++		return EIO;
++	}
++	return 0;
++}
++
++/* the next cluster after c, 0 at the end of the chain or on a bad entry */
++static uint32_t
++next(const struct fat *f, uint32_t c)
++{
++	uint32_t v, end = f->type == 16 ? 0xfff0u : 0xff0u;
++	uint64_t o = f->type == 16 ? (uint64_t)c * 2 : (uint64_t)c * 3 / 2;
++
++	if (c < 2 || c >= f->clusters + 2 || o + 2 > f->fat_bytes) {
++		return 0;
++	}
++	v = lbt_le16(f->fat + o);
++	if (f->type == 12) {
++		v = c & 1 ? v >> 4 : v & 0xfffu;
++	}
++	return v >= 2 && v < end && v < f->clusters + 2 ? v : 0;
++}
++
++/* "crbtfw21.tlv" -> "CRBTFW21TLV" */
++static bool
++name83(const char *n, char out[11])
++{
++	unsigned i = 0, j = 0;
++
++	memset(out, ' ', 11);
++	for (; n[i] && n[i] != '.'; i++, j++) {
++		if (j >= 8) {
++			return false;
++		}
++		out[j] = n[i] >= 'a' && n[i] <= 'z' ? n[i] - 32 : n[i];
++	}
++	for (i += n[i] == '.', j = 8; n[i]; i++, j++) {
++		if (j >= 11) {
++			return false;
++		}
++		out[j] = n[i] >= 'a' && n[i] <= 'z' ? n[i] - 32 : n[i];
++	}
++	return true;
++}
++
++/* look up name in a directory (cluster 0 = root); the 32-byte entry into e; 0 or ENOENT/EIO */
++static int
++lookup(const struct fat *f, uint32_t dir, const char *name, uint8_t e[32])
++{
++	char want[11];
++
++	if (!name83(name, want)) {
++		return ENOENT;
++	}
++	for (uint32_t steps = 0; steps <= f->clusters; steps++) {
++		uint32_t bytes = dir ? f->cluster_bytes : f->root_entries * 32u;
++		uint64_t off = dir ? f->data_off + (uint64_t)(dir - 2) * f->cluster_bytes : f->root_off;
++
++		if (rd(f, off, f->dir, bytes)) {
++			return EIO;
++		}
++		for (uint32_t o = 0; o + 32 <= bytes; o += 32) {
++			const uint8_t *d = f->dir + o;
++
++			if (d[0] == 0) {
++				return ENOENT;
++			}
++			if (d[0] == 0xe5 || (d[11] & 0x0f) == 0x0f || (d[11] & 0x08) || memcmp(d, want, 11)) {
++				continue;
++			}
++			memcpy(e, d, 32);
++			return 0;
++		}
++		if (dir == 0 || (dir = next(f, dir)) == 0) {
++			return ENOENT;
++		}
++	}
++	return ENOENT;
++}
++
++static int
++read_file(const struct fat *f, uint32_t c, uint32_t size, uint8_t *dst)
++{
++	uint32_t done = 0;
++
++	for (uint32_t steps = 0; done < size; steps++) {
++		uint32_t first = c, run = 1, part;
++
++		if (c < 2 || steps > f->clusters) {
++			return EIO;
++		}
++		while (done + run * f->cluster_bytes < size && next(f, c) == c + 1) {
++			c++;                    /* contiguous clusters in one read */
++			run++;
++		}
++		part = MIN(size - done, run * f->cluster_bytes);
++		if (rd(f, f->data_off + (uint64_t)(first - 2) * f->cluster_bytes, dst + done, part)) {
++			return EIO;
++		}
++		done += part;
++		c = done < size ? next(f, c) : 0;
++	}
++	return 0;
++}
++
++static int
++load_from(struct fat *f, const char *name, uint8_t **data, uint32_t *size, const char **why)
++{
++	uint8_t bs[512], e[32];
++	uint32_t cl;
++	int err;
++
++	if ((err = rd(f, 0, bs, sizeof(bs))) != 0) {
++		*why = err == EAGAIN ? "UFS not ready" : "partition not found";
++		return err;
++	}
++	if ((err = mount(f, bs, why)) != 0) {
++		return err;
++	}
++	if (!(lookup(f, 0, "image", e) == 0 && (e[11] & 0x10) && (cl = lbt_le16(e + 26)) >= 2 &&
++	    lookup(f, cl, name, e) == 0) && lookup(f, 0, name, e) != 0) {
++		*why = "file not in the partition";
++		return ENOENT;
++	}
++	*size = lbt_le32(e + 28);
++	cl = lbt_le16(e + 26);
++	if ((e[11] & 0x10) || !*size || *size > FILE_MAX || cl < 2) {
++		*why = "file empty or too large";
++		return EINVAL;
++	}
++	if ((*data = kalloc_data(*size, Z_WAITOK | Z_ZERO)) == NULL) {
++		*why = "no memory";
++		return ENOMEM;
++	}
++	if ((err = read_file(f, cl, *size, *data)) != 0) {
++		kfree_data(*data, *size);
++		*data = NULL;
++		*why = "file read failed";
++	}
++	return err;
++}
++
++int
++lbt_fat_load(const char *name, uint8_t **data, uint32_t *size, char part[16], const char **why)
++{
++	static const char *parts[] = { "bluetooth_b", "bluetooth_a" };
++	int err = ENOENT;
++
++	*data = NULL;
++	for (unsigned i = 0; i < 2; i++) {
++		struct fat f = { .part = parts[i] };
++
++		err = load_from(&f, name, data, size, why);
++		if (f.fat) {
++			kfree_data(f.fat, f.fat_bytes);
++		}
++		if (f.dir) {
++			kfree_data(f.dir, f.dir_bytes);
++		}
++		if (err == 0) {
++			strlcpy(part, parts[i], 16);
++			return 0;
++		}
++		if (err == EAGAIN) {
++			return err;
++		}
++	}
++	return err;
++}
++
++void
++lbt_fw_free(uint8_t *data, uint32_t size)
++{
++	if (data) {
++		kfree_data(data, size);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
+--- a/bsd/dev/laurel_bt_fw.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_fw.c	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,188 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 3b: rampatch + NVM download (Linux btqca.c
++ * qca_uart_setup / qca_download_firmware / qca_tlv_check_data for the WCN3990).
++ *   names: crbtfw%02x.tlv + crnv%02x.bin, %02x = ((rom & 0x0f00) >> 4) | (rom & 0x000f) (rom 0x0201 -> 21)
++ *   each file goes whole, in 243-byte EDL segments: HCI 0xfc00 {0x1e, len, bytes}
++ *   answers: vendor event 04 ff 03 00 04 <result>; download mode (rampatch byte 14) 1 or 3 = only the last
++ *   segment is answered, 0 or 2 = every one (the last one always)
++ *   NVM: tag 17 (HCI transport) byte 2 = the UART speed index (byte 1 on WCN3991 and newer); tag 2 = the NVM's
++ *   own address (little-endian). The in-band sleep and deep-sleep bits stay as the file has them (the transport
++ *   handles the in-band sleep bytes).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "laurel_bt.h"
++
++#define WCN3991_SOC     0x40014320u
++#define ACK_MS          2000u
++
++static int
++wait_ack(const char **why)
++{
++	uint8_t ev[64];
++	uint64_t end = lbt_us() + ACK_MS * 1000ull;
++
++	while (lbt_us() < end) {
++		uint32_t n = lbt_hci_event(ev, sizeof(ev), ACK_MS);
++		int a = n ? lbt_qca_tlv_ack(ev, n) : -1;
++
++		if (a == 1) {
++			return 0;
++		}
++		if (a == 0) {
++			LBT_SAY("fw: segment refused (result %#x)\n", ev[5]);
++			*why = "the chip refused a firmware segment";
++			return EIO;
++		}
++		/* a Command Complete for 0xfc00 or another event: not the answer */
++	}
++	*why = "no answer to a firmware segment";
++	return ETIMEDOUT;
++}
++
++static int
++send_file(const uint8_t *d, uint32_t n, bool every, const char **why)
++{
++	uint8_t cmd[2 + LBT_EDL_SEGMENT];
++
++	for (uint32_t off = 0; off < n;) {
++		uint32_t seg = MIN(n - off, LBT_EDL_SEGMENT);
++		bool last = off + seg >= n || seg < LBT_EDL_SEGMENT;
++		int e;
++
++		cmd[0] = LBT_EDL_TLV;
++		cmd[1] = (uint8_t)seg;
++		memcpy(cmd + 2, d + off, seg);
++		if ((e = lbt_hci_send(LBT_EDL_OP, cmd, (uint8_t)(seg + 2))) != 0) {
++			*why = "firmware segment not sent";
++			return e;
++		}
++		if ((every || last) && (e = wait_ack(why)) != 0) {
++			LBT_SAY("fw: stop at byte %u of %u\n", off, n);
++			return e;
++		}
++		off += seg;
++	}
++	return 0;
++}
++
++/* rampatch (TLV type 1): length, product; 0 or EINVAL. *every = each segment is answered */
++static int
++patch_check(const uint8_t *p, uint32_t n, const struct lbt_qca_version *v, bool *every, const char **why)
++{
++	if (n < 28 || p[0] != 1 || (lbt_le32(p) >> 8) != n - 4) {
++		*why = "not a TLV rampatch";
++		return EINVAL;
++	}
++	if (lbt_le16(p + 16) != (uint16_t)v->product) {
++		*why = "the rampatch is for another product";
++		return EINVAL;
++	}
++	if (lbt_le16(p + 18) != v->rom) {
++		LBT_SAY("fw: rampatch ROM build %#x, chip ROM %#x (sent anyway, as Linux does)\n", lbt_le16(p + 18), v->rom);
++	}
++	*every = !(p[14] == 1 || p[14] == 3);
++	return 0;
++}
++
++/* NVM (TLV type 2, or type 4 whose first member is type 2): every tag checked, then tag 17 gets the speed */
++static int
++nvm_prepare(uint8_t *d, uint32_t n, uint8_t baud, bool wcn3991, uint8_t addr[6], bool *have_addr)
++{
++	uint32_t base = 4, len, hci = 0;
++
++	*have_addr = false;
++	if (n < 8) {
++		return EINVAL;
++	}
++	if (d[0] == 4) {
++		if (d[4] != 2) {
++			return EINVAL;
++		}
++		base = 8;
++		len = lbt_le32(d + 4) >> 8;
++	} else if (d[0] == 2) {
++		len = lbt_le32(d) >> 8;
++	} else {
++		return EINVAL;
++	}
++	if (len > n - base) {
++		return EINVAL;
++	}
++	for (uint32_t off = base; off + 12 <= base + len;) {
++		uint32_t id = lbt_le16(d + off), tl = lbt_le16(d + off + 2);
++
++		if (tl > base + len - off - 12) {
++			return EINVAL;
++		}
++		if (id == 17) {
++			if (tl < 3 || hci) {
++				return EINVAL;
++			}
++			hci = off + 12;
++		} else if (id == 2 && tl == 6) {
++			for (unsigned i = 0; i < 6; i++) {
++				addr[i] = d[off + 12 + 5 - i];
++			}
++			*have_addr = true;
++		}
++		off += 12 + tl;
++	}
++	if (!hci) {
++		return EINVAL;
++	}
++	d[hci + (wcn3991 ? 1 : 2)] = baud;
++	return 0;
++}
++
++static int
++load(const char *name, uint8_t **d, uint32_t *n, char part[16], const char **why)
++{
++	int e;
++
++	if ((e = lbt_fat_load(name, d, n, part, why)) != 0) {
++		LBT_SAY("fw: %s: %s (errno %d)\n", name, *why, e);
++	}
++	return e;
++}
++
++int
++lbt_fw_download(const struct lbt_qca_version *v, uint8_t baud_idx, uint8_t nvm_addr[6], bool *have_addr,
++    char *names, size_t names_len, const char **why)
++{
++	unsigned rom = ((v->rom & 0x0f00u) >> 4) | (v->rom & 0x000fu);
++	bool wcn3991 = v->soc == WCN3991_SOC, every = true;
++	char tlv[24], nvm[24], part[16];
++	uint8_t *d = NULL;
++	uint32_t n = 0;
++	int e;
++
++	snprintf(tlv, sizeof(tlv), "crbtfw%02x.tlv", rom);
++	snprintf(nvm, sizeof(nvm), wcn3991 ? "crnv%02xu.bin" : "crnv%02x.bin", rom);
++	snprintf(names, names_len, "%s + %s", tlv, nvm);
++	if ((e = load(tlv, &d, &n, part, why)) != 0) {
++		return e;
++	}
++	if ((e = patch_check(d, n, v, &every, why)) == 0) {
++		LBT_SAY("fw: %s %u bytes from %s, mode %u\n", tlv, n, part, d[14]);
++		e = send_file(d, n, every, why);
++	}
++	lbt_fw_free(d, n);
++	if (e) {
++		return e;
++	}
++	if ((e = load(nvm, &d, &n, part, why)) != 0) {
++		return e;
++	}
++	if ((e = nvm_prepare(d, n, baud_idx, wcn3991, nvm_addr, have_addr)) != 0) {
++		*why = "NVM file format not known";
++	} else {
++		LBT_SAY("fw: %s %u bytes from %s, speed index %u\n", nvm, n, part, baud_idx);
++		e = send_file(d, n, true, why);
++	}
++	lbt_fw_free(d, n);
++	return e;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_geni.h b/bsd/dev/laurel_bt_geni.h
+--- a/bsd/dev/laurel_bt_geni.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_geni.h	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,114 @@
++/*
++ * laurel 2600: private to laurel_bt_uart.c + laurel_bt_clk.c: QUP1 SE9 addresses, GENI registers, UART state.
++ */
++#ifndef LAUREL_BT_GENI_H
++#define LAUREL_BT_GENI_H
++#include <machine/machine_routines.h>
++#include <kern/clock.h>              /* delay() */
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define MAP_ALIGN               0x4000u
++#define GCC_PA                  0x01400000u
++#define GCC_QUP_PA              (GCC_PA + 0x39000u)    /* CBCRs + the s4 RCG and its DFS registers */
++#define GCC_VOTE_PA             (GCC_PA + 0x7900cu)
++#define VOTE_BITS               (1u << 18 | 1u << 19 | 1u << 20 | 1u << 21 | 1u << 26)
++#define CBCR_CORE2X             0x014u
++#define CBCR_CORE               0x00cu
++#define CBCR_M_AHB              0x004u
++#define CBCR_S4                 0x604u
++#define RCG                     0x608u
++#define RCG_CFG                 0x04u
++#define RCG_M                   0x08u
++#define RCG_N                   0x0cu
++#define RCG_D                   0x10u
++#define RCG_DFSR                0x14u
++#define RCG_PERF(l)             (0x1cu + 4u * (l))
++#define RCG_PERF_M(l)           (0x5cu + 4u * (l))
++#define RCG_PERF_N(l)           (0x9cu + 4u * (l))
++#define CLK_OFF                 (1u << 31)
++#define TLMM_PIN_PA(n)          (0x00d00000u + 0x1000u * (n))  /* TLMM 0x400000 + EAST 0x900000 */
++#define PIN_CTS                 10u
++#define QUP_PA                  0x04cc0000u
++#define SE_PA                   0x04c90000u
++
++/* GENI SE registers (qcom-geni-se.h, msm_geni_serial.c) */
++#define GENI_FORCE_DEFAULT      0x020u
++#define GENI_OUTPUT_CTRL        0x024u
++#define GENI_CGC_CTRL           0x028u
++#define GENI_STATUS             0x040u          /* bit 0 M active, bit 12 S active */
++#define GENI_SER_M_CLK_CFG      0x048u
++#define GENI_SER_S_CLK_CFG      0x04cu
++#define GENI_IF_DISABLE_RO      0x064u
++#define GENI_FW_REVISION_RO     0x068u          /* bits 15:8 protocol, 2 = UART */
++#define GENI_CLK_SEL            0x07cu
++#define UART_LOOPBACK_CFG       0x22cu
++#define GENI_BYTE_GRAN          0x254u
++#define GENI_DMA_MODE_EN        0x258u
++#define UART_TX_TRANS_CFG       0x25cu          /* bit 1 CTS mask (1 = ignore CTS) */
++#define GENI_TX_PACKING_CFG0    0x260u
++#define GENI_TX_PACKING_CFG1    0x264u
++#define UART_TX_WORD_LEN        0x268u
++#define UART_TX_STOP_BIT_LEN    0x26cu
++#define UART_TX_TRANS_LEN       0x270u
++#define UART_RX_TRANS_CFG       0x280u
++#define GENI_RX_PACKING_CFG0    0x284u
++#define GENI_RX_PACKING_CFG1    0x288u
++#define UART_RX_WORD_LEN        0x28cu
++#define UART_RX_STALE_CNT       0x294u
++#define UART_TX_PARITY_CFG      0x2a4u
++#define UART_RX_PARITY_CFG      0x2a8u
++#define UART_MANUAL_RFR         0x2acu          /* bit 31 manual, bit 1 not ready */
++#define GENI_M_CMD0             0x600u
++#define GENI_M_CMD_CTRL         0x604u
++#define GENI_M_IRQ_STATUS       0x610u
++#define GENI_M_IRQ_EN           0x614u
++#define GENI_M_IRQ_CLEAR        0x618u
++#define GENI_S_CMD0             0x630u
++#define GENI_S_CMD_CTRL         0x634u
++#define GENI_S_IRQ_STATUS       0x640u
++#define GENI_S_IRQ_EN           0x644u
++#define GENI_S_IRQ_CLEAR        0x648u
++#define GENI_TX_FIFO            0x700u
++#define GENI_RX_FIFO            0x780u
++#define GENI_TX_FIFO_STATUS     0x800u
++#define GENI_RX_FIFO_STATUS     0x804u          /* bit 31 last, 30:28 last-word bytes, 24:0 words */
++#define GENI_TX_WATERMARK       0x80cu
++#define GENI_RX_WATERMARK       0x810u
++#define GENI_RX_RFR_WATERMARK   0x814u
++#define DMA_TX_IRQ_CLR          0xc44u
++#define DMA_RX_IRQ_CLR          0xd44u
++#define SE_GSI_EVENT_EN         0xe18u
++#define SE_IRQ_EN               0xe1cu
++#define SE_HW_PARAM_0           0xe24u
++#define SE_HW_PARAM_1           0xe28u
++#define SE_DMA_GENERAL_CFG      0xe30u
++#define M_CMD_DONE              (1u << 0)
++#define M_CMD_CANCEL            (1u << 4)
++#define S_CMD_CANCEL            (1u << 4)
++#define CMD_CANCEL              (1u << 2)
++#define CMD_ABORT               (1u << 1)
++#define CTS_MASK                (1u << 1)
++#define RX_RING                 4096u
++
++struct lbt_geni {
++	vm_offset_t gcc, vote, tlmm, se, qup;
++	uint32_t sampling, tx_depth, rx_depth, baud, levels;
++	bool dfs;
++	uint64_t level_hz[8];
++	uint8_t ring[RX_RING];
++	uint32_t head, tail;
++};
++extern struct lbt_geni lbt_u;
++#define u lbt_u
++
++static inline uint32_t
++lbt_rd(vm_offset_t a) { return *(volatile uint32_t *)a; }
++static inline void
++lbt_wr(vm_offset_t a, uint32_t v) { *(volatile uint32_t *)a = v; __asm__ volatile ("dsb sy" ::: "memory"); }
++#define SE(r)   (u.se + (r))
++#define rd lbt_rd
++#define wr lbt_wr
++vm_offset_t lbt_map(uint32_t pa, uint32_t size);
++bool lbt_wait_bits(vm_offset_t reg, uint32_t mask, bool set, uint32_t us);
++#endif /* LAUREL_BT_GENI_H */
+diff -ruN a/bsd/dev/laurel_bt.h b/bsd/dev/laurel_bt.h
+--- a/bsd/dev/laurel_bt.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt.h	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,167 @@
++/*
++ * laurel_sprout (Xiaomi Mi A3, SM6125): Bluetooth of the WCN3990 (laurel 2600). Shared declarations.
++ * Docs: iOSPlus10 docs/laurel_sprout/bluetooth.md.
++ *
++ * Files (one step each):
++ *   laurel_bt_clk.c    QUP1 SE9 bring-up: mappings, GCC votes, s4 RCG / DFS levels, pins, GENI FIFO mode
++ *   laurel_bt_uart.c   GENI UART data path on QUP1 SE9 0x4c90000: baud, FIFO TX/RX, flow control
++ *   laurel_bt_power.c  PM6125 rails L9/L16/L17/L23 over the RPM, WCN3990 power pulses (no BT_EN pin)
++ *   laurel_bt_fat.c    FAT12/16 reader of the "bluetooth_b/_a" partition (read-only, sweet_ufs_read_part)
++ *   laurel_bt_fw.c     crbtfw%02x.tlv rampatch + crnv%02x.bin NVM download (EDL 0xfc00), NVM baud tag
++ *   laurel_bt_h4.c     H4 framing, QCA vendor-event parsers, answers on the chip's behalf (negroni 0333/0336/0337)
++ *   laurel_bt_hci.c    bring-up HCI: EDL version, speed change 0xfc48, HCI reset, BD_ADDR 0xfc14
++ *   laurel_bt_ios.c    iOS transport core: RX thread, queue, TX framing, in-band sleep (negroni 0332)
++ *   laurel_bt_ctl.c    kernel control com.apple.uart.bluetooth (what bluetoothd opens, negroni 0332)
++ *   laurel_bt_dev.c    /dev/uart.bluetooth, /dev/cu.bluetooth, /dev/btwake (negroni 0332)
++ *   laurel_bt.c        start: STARTUP hook, kill switch laurelbt=0, bring-up thread, the one result line
++ *   iokit/Kernel/arm/LaurelBluetooth.cpp  the ADT "bluetooth" nub: real address on, hidden when off
++ * Protocol facts: Linux drivers/bluetooth/btqca.c + hci_qca.c (external/laurel-mainline).
++ * Firmware is read from the phone at run time; it is never in git.
++ */
++#ifndef LAUREL_BT_H
++#define LAUREL_BT_H
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++
++#define LBT_SAY(...)            printf("LAUREL BT: " __VA_ARGS__)
++
++/* ---- small helpers -------------------------------------------------------------------------- */
++
++static inline uint16_t
++lbt_le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++static inline uint32_t
++lbt_le32(const uint8_t *p)
++{
++	return lbt_le16(p) | (uint32_t)lbt_le16(p + 2) << 16;
++}
++
++uint64_t lbt_us(void);                          /* uptime in microseconds */
++void lbt_sleep_ms(uint32_t ms);
++
++/* A Bluetooth address that a device can have: not zero, not all ones, not a group address (display order). */
++static inline bool
++lbt_addr_ok(const uint8_t a[6])
++{
++	return (a[0] | a[1] | a[2] | a[3] | a[4] | a[5]) != 0 && (a[0] & 1) == 0 &&
++	       (a[0] & a[1] & a[2] & a[3] & a[4] & a[5]) != 0xff;
++}
++
++/* ---- UART (laurel_bt_uart.c) ----------------------------------------------------------------- */
++
++int lbt_uart_init(const char **why);            /* clocks, pins, GENI FIFO mode, 115200 8N1; 0 or errno */
++int lbt_uart_set_baud(uint32_t baud);           /* 0 or errno (no clock within 2 %) */
++uint32_t lbt_uart_baud(void);
++void lbt_uart_flow(bool on);                    /* false: RFR not ready + CTS ignored (hci_qca speed change) */
++int lbt_uart_write(const uint8_t *buf, uint32_t len);  /* 0 or errno; waits until sent (bounded) */
++uint32_t lbt_uart_read(uint8_t *buf, uint32_t max);    /* bytes now received, no wait */
++void lbt_uart_drop_rx(void);                    /* forget received bytes (after a power pulse) */
++
++/* ---- power (laurel_bt_power.c) --------------------------------------------------------------- */
++
++int lbt_power_rails(const char **why);          /* L9 1.8 V, L16 1.8 V, L17 1.304 V, L23 3.0 V; 0 or errno */
++int lbt_power_on(const char **why);             /* off pulse at 2400, on pulse at 115200, 100 ms boot */
++void lbt_power_off(void);                       /* off pulse (rails stay: shared with other users) */
++
++#define LBT_POWER_ON_PULSE      0xfcu           /* hci_qca.c QCA_WCN3990_POWERON_PULSE, sent at 115200 */
++#define LBT_POWER_OFF_PULSE     0xc0u           /* QCA_WCN3990_POWEROFF_PULSE, sent at 2400 */
++
++/* ---- H4 framing + QCA answers (laurel_bt_h4.c) ------------------------------------------------- */
++
++#define LBT_H4_MAX              4104u           /* ACL 5 + 4095 + slack */
++#define LBT_IBS_WAKE_ACK        0xfcu
++#define LBT_IBS_WAKE_IND        0xfdu
++#define LBT_IBS_SLEEP_IND       0xfeu
++
++struct lbt_h4 {
++	uint8_t bytes[LBT_H4_MAX];
++	uint32_t used, wanted, header;
++	bool complete;
++};
++
++/* 0 more bytes needed, 1 packet complete (bytes[0..used)), 2 an in-band sleep byte, -1 bad type, -2 too long */
++int lbt_h4_push(struct lbt_h4 *p, uint8_t byte);
++void lbt_h4_reset(struct lbt_h4 *p);
++/* The length of an H4 frame that begins at p (n bytes known), or 0 when more bytes are needed, -1 bad */
++int lbt_h4_frame_len(const uint8_t *p, uint32_t n);
++int lbt_cc_status(const uint8_t *e, size_t n, uint16_t opcode);   /* Command Complete status, or -1 */
++
++#define LBT_EDL_OP              0xfc00u
++#define LBT_EDL_VERSION         0x19u
++#define LBT_EDL_TLV             0x1eu
++#define LBT_EDL_SEGMENT         243u            /* MAX_SIZE_PER_TLV_SEGMENT */
++#define LBT_QCA_BDADDR_OP       0xfc14u
++#define LBT_QCA_BAUD_OP         0xfc48u
++
++struct lbt_qca_version {
++	uint32_t product, soc;
++	uint16_t patch, rom;
++};
++
++int lbt_qca_version_parse(const uint8_t *e, size_t n, struct lbt_qca_version *v);  /* 0 or -1 */
++int lbt_qca_tlv_ack(const uint8_t *e, size_t n);       /* 1 accepted, 0 refused, -1 not a TLV answer */
++bool lbt_is_vendor_event(const uint8_t *e, size_t n);
++
++/* Speeds: Linux enum qca_baudrate index for a baud rate, -1 if not one */
++int lbt_qca_baud_index(uint32_t baud);
++
++/* Answers on the chip's behalf for bluetoothd (negroni 0336/0337) */
++#define LBT_LOCAL_EVENT_MAX     16u
++struct lbt_shim {
++	bool mask_known, err_rd, err_wr;
++};
++unsigned lbt_local_answer(struct lbt_shim *s, const uint8_t *cmd, size_t n, uint8_t ev[LBT_LOCAL_EVENT_MAX]);
++unsigned lbt_fix_event(struct lbt_shim *s, uint8_t *e, size_t n);     /* bit 0 mask seen, bit 1 status rewritten */
++int lbt_fix_command(uint8_t *c, size_t n);                             /* 1 if changed */
++
++/* ---- FAT + firmware (laurel_bt_fat.c, laurel_bt_fw.c) ------------------------------------------ */
++
++/* /image/<name> (or /<name>) of the first bluetooth partition that has it: a kalloc_data buffer, or errno */
++int lbt_fat_load(const char *name, uint8_t **data, uint32_t *size, char part[16], const char **why);
++void lbt_fw_free(uint8_t *data, uint32_t size);
++
++/* rampatch + NVM for this chip at QCA speed index baud_idx; names[] gets "crbtfw21.tlv + crnv21.bin" */
++int lbt_fw_download(const struct lbt_qca_version *v, uint8_t baud_idx, uint8_t nvm_addr[6], bool *have_addr,
++    char *names, size_t names_len, const char **why);
++
++/* ---- bring-up HCI (laurel_bt_hci.c) ---------------------------------------------------------- */
++
++int lbt_hci_send(uint16_t op, const uint8_t *param, uint8_t plen);             /* one command, 0 or errno */
++/* The next HCI event within ms (other packets and sleep bytes skipped): its length (in ev), 0 on a timeout */
++uint32_t lbt_hci_event(uint8_t *ev, uint32_t max, uint32_t ms);
++/* send + wait for the Command Complete of op: its status (>= 0), or -errno */
++int lbt_hci_cmd(uint16_t op, const uint8_t *param, uint8_t plen, uint8_t *ev, uint32_t max, uint32_t *evn, uint32_t ms);
++int lbt_hci_version(struct lbt_qca_version *v, const char **why);
++int lbt_hci_speed(uint32_t baud, const char **why);     /* 0xfc48 + host speed, vendor event at the new speed */
++int lbt_hci_reset(const char **why);
++int lbt_hci_bdaddr(const uint8_t addr[6], const char **why);  /* display order; 0xfc14 then HCI reset */
++int lbt_hci_read_bdaddr(uint8_t addr[6]);                     /* 0x1009, display order; 0 or errno */
++
++/* ---- iOS transport (laurel_bt_ios.c, laurel_bt_ctl.c, laurel_bt_dev.c) ------------------------------------------ */
++
++void lbt_ctl_attach(void);                      /* laurel_bt_ctl.c: kernel control com.apple.uart.bluetooth */
++void lbt_ios_start(void);                       /* chip ready: RX thread on, sends go to the UART */
++void lbt_ios_fail(const char *why);             /* chip not ready: sends fail with EIO */
++/* the two client kinds share one owner slot: 0 none, 1 kernel control, 2 device */
++int lbt_ios_claim(uint32_t owner, uint32_t unit);       /* 0 or EBUSY */
++void lbt_ios_release(uint32_t owner);
++int lbt_ios_send(const uint8_t *b, uint32_t n);         /* userland H4 bytes toward the chip; 0 or errno */
++uint32_t lbt_ios_take(uint8_t *b, uint32_t max);        /* queued H4 bytes toward userland */
++uint32_t lbt_ios_queued(void);
++bool lbt_ios_ready(void);
++void lbt_dev_attach(void);                      /* laurel_bt_dev.c */
++void lbt_dev_detach(void);                      /* Bluetooth off: the /dev nodes go */
++void lbt_dev_wakeup(void);                      /* data queued for the device client */
++void lbt_ctl_wakeup(void);                      /* data queued for the control client: lbt_ctl_pump soon */
++void lbt_ctl_pump(void);                        /* RX thread only: queued bytes -> the control client */
++
++/* ---- ADT nub (iokit/Kernel/arm/LaurelBluetooth.cpp) ------------------------------------------- */
++
++void laurel_bt_adt_publish(const uint8_t addr[6]);     /* local-mac-address of IODeviceTree:/arm-io/bluetooth */
++void laurel_bt_adt_hide(void);                          /* BT off: no "bluetooth" service for bluetoothd */
++
++#endif /* LAUREL_BT_H */
+diff -ruN a/bsd/dev/laurel_bt_h4.c b/bsd/dev/laurel_bt_h4.c
+--- a/bsd/dev/laurel_bt_h4.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_h4.c	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,251 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 4a: H4 framing, the WCN3990 EDL answers, and the
++ * HCI answers given on the chip's behalf for iOS bluetoothd. No hardware access.
++ * H4 parser: from ios-apollo xnu 0136 (sweet_bt.h, MIT; from the Mi 10 port hackios-xnu-kernel-umi). Answers:
++ * negroni patches/xnu 0333/0336/0337 (this repo). QCA facts: Linux btqca.c / hci_qca.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "laurel_bt.h"
++
++void
++lbt_h4_reset(struct lbt_h4 *p)
++{
++	p->used = p->wanted = p->header = 0;
++	p->complete = false;
++}
++
++static uint32_t
++header_len(uint8_t type)
++{
++	switch (type) {
++	case 1:                                 /* command: type, opcode (2), length (1) */
++	case 3:                                 /* SCO: type, handle (2), length (1) */
++		return 4;
++	case 2:                                 /* ACL: type, handle (2), length (2) */
++	case 5:                                 /* ISO: type, handle (2), length (2, 14 bits) */
++		return 5;
++	case 4:                                 /* event: type, code, length (1) */
++		return 3;
++	default:
++		return 0;
++	}
++}
++
++static uint32_t
++payload_len(const uint8_t *b)
++{
++	switch (b[0]) {
++	case 1:
++	case 3:
++		return b[3];
++	case 4:
++		return b[2];
++	case 5:
++		return lbt_le16(b + 3) & 0x3fffu;
++	default:
++		return lbt_le16(b + 3);
++	}
++}
++
++int
++lbt_h4_frame_len(const uint8_t *p, uint32_t n)
++{
++	uint32_t h;
++
++	if (n == 0) {
++		return 0;
++	}
++	if ((h = header_len(p[0])) == 0) {
++		return -1;
++	}
++	if (n < h) {
++		return 0;
++	}
++	h += payload_len(p);
++	return h > LBT_H4_MAX ? -1 : (int)h;
++}
++
++int
++lbt_h4_push(struct lbt_h4 *p, uint8_t byte)
++{
++	if (p->complete) {
++		lbt_h4_reset(p);
++	}
++	if (p->used == 0) {
++		if (byte >= LBT_IBS_WAKE_ACK && byte <= LBT_IBS_SLEEP_IND) {
++			return 2;               /* in-band sleep byte, only between packets */
++		}
++		if ((p->header = header_len(byte)) == 0) {
++			return -1;
++		}
++		p->wanted = p->header;
++	}
++	p->bytes[p->used++] = byte;
++	if (p->used == p->header) {
++		uint32_t len = payload_len(p->bytes);
++
++		if (len > LBT_H4_MAX - p->header) {
++			lbt_h4_reset(p);
++			return -2;
++		}
++		p->wanted = p->header + len;
++	}
++	if (p->used == p->wanted) {
++		p->complete = true;
++		return 1;
++	}
++	return 0;
++}
++
++int
++lbt_cc_status(const uint8_t *e, size_t n, uint16_t opcode)
++{
++	if (n < 7 || e[0] != 4 || e[1] != 0x0e || (size_t)e[2] + 3 != n || lbt_le16(e + 4) != opcode) {
++		return -1;
++	}
++	return e[6];
++}
++
++bool
++lbt_is_vendor_event(const uint8_t *e, size_t n)
++{
++	return n >= 3 && e[0] == 4 && e[1] == 0xff && (size_t)e[2] + 3 == n;
++}
++
++/* 04 ff len 00 02 <product u32> <patch u16> <rom u16> <soc u32> [build string] (btqca.c qca_read_soc_version) */
++int
++lbt_qca_version_parse(const uint8_t *e, size_t n, struct lbt_qca_version *v)
++{
++	if (n < 17 || !lbt_is_vendor_event(e, n) || e[3] != 0x00 || e[4] != 0x02) {
++		return -1;
++	}
++	v->product = lbt_le32(e + 5);
++	v->patch = lbt_le16(e + 9);
++	v->rom = lbt_le16(e + 11);
++	v->soc = lbt_le32(e + 13);
++	return v->soc && v->rom ? 0 : -1;
++}
++
++/* 04 ff 03 00 04 <result> (btqca.c qca_tlv_send_segment) */
++int
++lbt_qca_tlv_ack(const uint8_t *e, size_t n)
++{
++	if (n != 6 || !lbt_is_vendor_event(e, n) || e[3] != 0x00 || e[4] != 0x04) {
++		return -1;
++	}
++	return e[5] == 0;
++}
++
++/* Linux enum qca_baudrate */
++int
++lbt_qca_baud_index(uint32_t baud)
++{
++	static const struct { uint32_t baud; uint8_t idx; } t[] = {
++		{ 115200, 0 }, { 230400, 5 }, { 460800, 7 }, { 921600, 10 }, { 1000000, 11 }, { 2000000, 13 },
++		{ 3000000, 14 }, { 3200000, 17 },
++	};
++
++	for (unsigned i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
++		if (t[i].baud == baud) {
++			return t[i].idx;
++		}
++	}
++	return -1;
++}
++
++/*
++ * bluetoothd (20H392) was written for Broadcom chips. Its vendor commands (OGF 0x3f) mean other things on a
++ * Qualcomm chip (0xfc48 = baud rate, 0xfc00 = EDL, 0xfc14 = BD address): none may reach the WCN3990. Each gets a
++ * Command Complete here: status from the table (0 = Broadcom writes without data, else 0x01 Unknown Command),
++ * then 8 bytes (byte 0 = the first parameter byte; _BCM_ByteStreamEventParser needs >= 2 bytes, negroni 0337).
++ * Also (negroni 0336, apollo 0141/0143): 0x0c5a/0x0c5b when the chip's mask lacks them (status 0), and 0x204a
++ * (extended advertising; once used, legacy LE commands get Command Disallowed): status 0, size 0.
++ */
++static const struct { uint16_t op; uint8_t status; } vsc[] = {
++	{ 0xfc01, 0 }, { 0xfc18, 0 }, { 0xfc1c, 0 }, { 0xfc1e, 0 }, { 0xfc27, 0 }, { 0xfc2e, 0 }, { 0xfc45, 0 },
++	{ 0xfc4c, 0 }, { 0xfc4e, 0 }, { 0xfc6d, 0 }, { 0xfd3c, 0 }, { 0xfce9, 0 }, { 0xfce2, 0 }, { 0xfd48, 0 },
++	{ 0xfd47, 0 },
++};
++
++unsigned
++lbt_local_answer(struct lbt_shim *s, const uint8_t *cmd, size_t n, uint8_t ev[LBT_LOCAL_EVENT_MAX])
++{
++	uint16_t op;
++	unsigned len;
++	uint8_t status = 0;
++
++	if (n < 4 || cmd[0] != 1 || (size_t)cmd[3] + 4 != n) {
++		return 0;
++	}
++	op = lbt_le16(cmd + 1);
++	bzero(ev, LBT_LOCAL_EVENT_MAX);
++	ev[0] = 4;
++	ev[1] = 0x0e;
++	ev[3] = 1;
++	ev[4] = cmd[1];
++	ev[5] = cmd[2];
++	if ((op >> 10) == 0x3f) {
++		status = 0x01;
++		for (unsigned i = 0; i < sizeof(vsc) / sizeof(vsc[0]); i++) {
++			if (vsc[i].op == op) {
++				status = vsc[i].status;
++			}
++		}
++		ev[7] = n > 4 ? cmd[4] : 0;
++		len = 7 + 8;
++	} else if (op == 0x204a) {
++		len = 8;
++	} else if (s->mask_known && ((op == 0x0c5a && !s->err_rd) || (op == 0x0c5b && !s->err_wr))) {
++		len = op == 0x0c5a ? 8 : 7;
++	} else {
++		return 0;
++	}
++	ev[6] = status;
++	ev[2] = (uint8_t)(len - 3);
++	return len;
++}
++
++/*
++ * Chip -> host fixes (in place): Read Local Supported Commands gets octet 18 bits 2/3 (answered here);
++ * 0x0c6d Write LE Host Support and 0x2007 LE Read Advertising Channel TX Power errors become status 0
++ * (negroni 0336/0337: bluetoothd stops its init on them).
++ */
++unsigned
++lbt_fix_event(struct lbt_shim *s, uint8_t *e, size_t n)
++{
++	unsigned r = 0;
++
++	if (n == 7 + 64 && lbt_cc_status(e, n, 0x1002) == 0) {
++		s->err_rd = (e[7 + 18] & 0x04) != 0;
++		s->err_wr = (e[7 + 18] & 0x08) != 0;
++		s->mask_known = true;
++		e[7 + 18] |= 0x0c;
++		r |= 1;
++	}
++	if (n >= 7 && e[0] == 4 && e[1] == 0x0e && e[2] + 3u == n && e[6] != 0) {
++		uint16_t op = lbt_le16(e + 4);
++
++		if (op == 0x0c6d || (op == 0x2007 && e[6] == 0x0c)) {
++			e[6] = 0;
++			if (op == 0x2007 && n >= 8) {
++				e[7] = 0;
++			}
++			r |= 2;
++		}
++	}
++	return r;
++}
++
++/* Write LE Host Support: Simultaneous_LE_Host must be 0x00 since Core 4.1 (negroni 0337) */
++int
++lbt_fix_command(uint8_t *c, size_t n)
++{
++	if (n >= 6 && c[0] == 1 && lbt_le16(c + 1) == 0x0c6d && c[3] >= 2 && c[5] != 0) {
++		c[5] = 0;
++		return 1;
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_hci.c b/bsd/dev/laurel_bt_hci.c
+--- a/bsd/dev/laurel_bt_hci.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_hci.c	2026-11-01 05:20:19.569761520 +0530
+@@ -0,0 +1,219 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 4b: the HCI of the bring-up (the bring-up thread
++ * owns the UART; the iOS transport starts after it). Linux hci_qca.c / btqca.c for the WCN3990:
++ *   EDL version 0xfc00 {0x19} -> vendor event (product, patch, rom, soc)
++ *   speed 0xfc48 {index}: flow control off (RFR not ready), command, 10 ms, host speed, flow control on, then the
++ *     chip's vendor event comes at the new speed within 100 ms (qca_set_speed, QCA_DROP_VENDOR_EVENT)
++ *   HCI reset 0x0c03; BD_ADDR 0xfc14 {6 bytes, display order} -> vendor event (qca_set_bdaddr); read back 0x1009
++ * In-band sleep bytes: a WAKE_IND from the chip gets a WAKE_ACK, the others are skipped.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "laurel_bt.h"
++
++static struct lbt_h4 rxp;                       /* bring-up thread only */
++
++int
++lbt_hci_send(uint16_t op, const uint8_t *param, uint8_t plen)
++{
++	uint8_t b[4 + 255];
++
++	b[0] = 1;
++	b[1] = (uint8_t)op;
++	b[2] = (uint8_t)(op >> 8);
++	b[3] = plen;
++	if (plen) {
++		memcpy(b + 4, param, plen);
++	}
++	return lbt_uart_write(b, 4u + plen);
++}
++
++uint32_t
++lbt_hci_event(uint8_t *ev, uint32_t max, uint32_t ms)
++{
++	uint64_t end = lbt_us() + (uint64_t)ms * 1000u;
++	uint8_t c;
++
++	for (;;) {
++		if (lbt_uart_read(&c, 1) == 0) {
++			if (lbt_us() >= end) {
++				return 0;
++			}
++			lbt_sleep_ms(1);
++			continue;
++		}
++		switch (lbt_h4_push(&rxp, c)) {
++		case 1:
++			if (rxp.bytes[0] == 4 && rxp.used <= max) {
++				memcpy(ev, rxp.bytes, rxp.used);
++				return rxp.used;
++			}
++			break;                  /* not an event (or too long for the caller): skipped */
++		case 2:
++			if (c == LBT_IBS_WAKE_IND) {
++				uint8_t ack = LBT_IBS_WAKE_ACK;
++				(void)lbt_uart_write(&ack, 1);
++			}
++			break;
++		case -1:
++		case -2:
++			lbt_h4_reset(&rxp);     /* out of step: start again at the next byte */
++			break;
++		default:
++			break;
++		}
++	}
++}
++
++int
++lbt_hci_cmd(uint16_t op, const uint8_t *param, uint8_t plen, uint8_t *ev, uint32_t max, uint32_t *evn, uint32_t ms)
++{
++	uint64_t end;
++	int e;
++
++	if ((e = lbt_hci_send(op, param, plen)) != 0) {
++		return -e;
++	}
++	end = lbt_us() + (uint64_t)ms * 1000u;
++	while (lbt_us() < end) {
++		uint32_t n = lbt_hci_event(ev, max, ms);
++		int st = n ? lbt_cc_status(ev, n, op) : -1;
++
++		if (st >= 0) {
++			*evn = n;
++			return st;
++		}
++		/* Command Status 04 0f 04 <status> <ncmd> <op> */
++		if (n == 7 && ev[1] == 0x0f && lbt_le16(ev + 5) == op && ev[3] != 0) {
++			*evn = n;
++			return ev[3];
++		}
++	}
++	return -ETIMEDOUT;
++}
++
++int
++lbt_hci_version(struct lbt_qca_version *v, const char **why)
++{
++	uint8_t p = LBT_EDL_VERSION, ev[260];
++
++	for (unsigned tries = 0; tries < 3; tries++) {
++		uint64_t end = lbt_us() + 500000u;
++
++		if (lbt_hci_send(LBT_EDL_OP, &p, 1) != 0) {
++			*why = "EDL version request not sent (CTS held: chip off?)";
++			return EIO;
++		}
++		while (lbt_us() < end) {
++			uint32_t n = lbt_hci_event(ev, sizeof(ev), 500);
++
++			if (n && lbt_qca_version_parse(ev, n, v) == 0) {
++				return 0;
++			}
++		}
++	}
++	*why = "no EDL version answer (chip not powered?)";
++	return ETIMEDOUT;
++}
++
++int
++lbt_hci_speed(uint32_t baud, const char **why)
++{
++	int idx = lbt_qca_baud_index(baud), e;
++	uint8_t p, ev[260];
++	uint64_t end;
++
++	if (idx < 0) {
++		*why = "speed not in the QCA table";
++		return EINVAL;
++	}
++	p = (uint8_t)idx;
++	/* the host clock first: the chip must not change speed if the host cannot follow */
++	uint32_t old = lbt_uart_baud();
++	if (lbt_uart_set_baud(baud) != 0 || lbt_uart_set_baud(old) != 0) {
++		(void)lbt_uart_set_baud(old);
++		*why = "no QUP clock for the speed";
++		return ERANGE;
++	}
++	lbt_uart_flow(false);
++	e = lbt_hci_send(LBT_QCA_BAUD_OP, &p, 1);
++	lbt_sleep_ms(10);
++	if (e == 0) {
++		e = lbt_uart_set_baud(baud);
++	}
++	lbt_uart_flow(true);
++	if (e) {
++		*why = "speed change not done on the host";
++		return e;
++	}
++	end = lbt_us() + 100000u;
++	while (lbt_us() < end) {
++		uint32_t n = lbt_hci_event(ev, sizeof(ev), 100);
++
++		if (n && lbt_is_vendor_event(ev, n)) {
++			return 0;
++		}
++	}
++	*why = "no answer at the new speed";
++	return ETIMEDOUT;
++}
++
++int
++lbt_hci_reset(const char **why)
++{
++	uint8_t ev[260];
++	uint32_t n;
++	int st = lbt_hci_cmd(0x0c03, NULL, 0, ev, sizeof(ev), &n, 2000);
++
++	if (st != 0) {
++		LBT_SAY("hci: reset status %d\n", st);
++		*why = "HCI reset failed";
++		return st < 0 ? -st : EIO;
++	}
++	return 0;
++}
++
++int
++lbt_hci_read_bdaddr(uint8_t addr[6])
++{
++	uint8_t ev[260];
++	uint32_t n;
++	int st = lbt_hci_cmd(0x1009, NULL, 0, ev, sizeof(ev), &n, 1000);
++
++	if (st != 0 || n != 13) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < 6; i++) {
++		addr[i] = ev[7 + 5 - i];        /* little-endian on the wire -> display order */
++	}
++	return 0;
++}
++
++int
++lbt_hci_bdaddr(const uint8_t addr[6], const char **why)
++{
++	uint8_t ev[260], back[6];
++	uint64_t end;
++	int e;
++
++	if ((e = lbt_hci_send(LBT_QCA_BDADDR_OP, addr, 6)) != 0) {
++		*why = "BD_ADDR command not sent";
++		return e;
++	}
++	end = lbt_us() + 1000000u;
++	while (lbt_us() < end) {
++		uint32_t n = lbt_hci_event(ev, sizeof(ev), 1000);
++
++		if (n && (lbt_is_vendor_event(ev, n) || lbt_cc_status(ev, n, LBT_QCA_BDADDR_OP) >= 0)) {
++			break;
++		}
++	}
++	if (lbt_hci_read_bdaddr(back) != 0 || memcmp(back, addr, 6) != 0) {
++		*why = "BD_ADDR not taken";
++		return EIO;
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_ios.c b/bsd/dev/laurel_bt_ios.c
+--- a/bsd/dev/laurel_bt_ios.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_ios.c	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,302 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 5a: the iOS H4 transport core (port of negroni 0332,
++ * smaller). One client at a time: the kernel control com.apple.uart.bluetooth (laurel_bt_ctl.c) or the device
++ * /dev/uart.bluetooth (laurel_bt_dev.c); a new client empties the queue and resets the per-client answers.
++ *   RX: a kernel thread polls the UART (SE9 has no interrupt wired here): 1 ms for 200 ms after traffic, 5 ms up
++ *       to 5 s, then 20 ms. RFR follows the RX FIFO, so the chip waits while the host does not read (no loss).
++ *       Whole H4 packets go to a 64 KiB queue (the UART is not read without room for one more packet); the
++ *       QCA in-band sleep bytes stay here (WAKE_IND -> WAKE_ACK).
++ *   TX: userland bytes are framed; each command goes through the answers of laurel_bt_h4.c (vendor commands
++ *       never reach the chip), then to the UART. After a SLEEP_IND, a WAKE_IND goes first (100 ms x 3 for the
++ *       WAKE_ACK, hci_qca.c IBS_WAKE_RETRANS_TIMEOUT_MS).
++ * Before the chip is ready a send waits up to 60 s; after a bring-up failure it fails with EIO.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include "laurel_bt.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++
++#define RXQ_SIZE        (64u << 10)
++#define RD_CHUNK        512u
++#define WAIT_READY_S    60
++
++static LCK_GRP_DECLARE(ios_grp, "laurel_bt");
++static LCK_MTX_DECLARE(ios_lock, &ios_grp);     /* state, queue, owner */
++static LCK_MTX_DECLARE(uart_lock, &ios_grp);    /* the UART helpers are not reentrant */
++static LCK_MTX_DECLARE(tx_lock, &ios_grp);      /* TX framing and packet order */
++
++static struct {
++	bool ready, failed, asleep, acked;
++	uint32_t owner, unit;
++	uint8_t q[RXQ_SIZE];
++	uint32_t qh, qt, qn;
++	struct lbt_shim shim;
++	struct lbt_h4 rx;                       /* RX thread only */
++	uint8_t tx[LBT_H4_MAX];                 /* tx_lock */
++	uint32_t txn;
++	uint64_t last_act;
++	uint32_t n_tx, n_rx, n_local, n_drop;
++} t;
++
++bool
++lbt_ios_ready(void)
++{
++	return t.ready;
++}
++
++/* ios_lock held */
++static void
++q_put(const uint8_t *p, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		t.q[t.qh] = p[i];
++		t.qh = (t.qh + 1u) % RXQ_SIZE;
++	}
++	t.qn += n;
++}
++
++uint32_t
++lbt_ios_take(uint8_t *b, uint32_t max)
++{
++	uint32_t n = 0;
++
++	lck_mtx_lock(&ios_lock);
++	while (n < max && t.qn) {
++		b[n++] = t.q[t.qt];
++		t.qt = (t.qt + 1u) % RXQ_SIZE;
++		t.qn--;
++	}
++	lck_mtx_unlock(&ios_lock);
++	return n;
++}
++
++uint32_t
++lbt_ios_queued(void)
++{
++	return t.qn;
++}
++
++/* one whole packet toward the client (dropped without a client or room) */
++static void
++deliver(const uint8_t *p, uint32_t n)
++{
++	uint32_t owner;
++
++	lck_mtx_lock(&ios_lock);
++	owner = t.owner;
++	if (owner && RXQ_SIZE - t.qn >= n) {
++		q_put(p, n);
++	} else {
++		t.n_drop++;
++		owner = 0;
++	}
++	lck_mtx_unlock(&ios_lock);
++	if (owner == 1) {
++		lbt_ctl_wakeup();
++	} else if (owner == 2) {
++		lbt_dev_wakeup();
++	}
++}
++
++static int
++uart_send(const uint8_t *p, uint32_t n)
++{
++	int e;
++
++	lck_mtx_lock(&uart_lock);
++	e = lbt_uart_write(p, n);
++	lck_mtx_unlock(&uart_lock);
++	return e;
++}
++
++static void
++ibs_wake(void)
++{
++	uint8_t w = LBT_IBS_WAKE_IND;
++
++	for (unsigned tries = 0; t.asleep && tries < 3; tries++) {
++		t.acked = false;
++		(void)uart_send(&w, 1);
++		for (unsigned ms = 0; ms < 100 && !t.acked; ms++) {
++			lbt_sleep_ms(1);
++		}
++	}
++	t.asleep = false;               /* go on even without the ACK (the chip wakes on the data) */
++}
++
++static void
++rx_byte(uint8_t c)
++{
++	switch (lbt_h4_push(&t.rx, c)) {
++	case 1:
++		if (t.rx.bytes[0] == 4) {
++			(void)lbt_fix_event(&t.shim, t.rx.bytes, t.rx.used);
++		}
++		t.n_rx++;
++		deliver(t.rx.bytes, t.rx.used);
++		break;
++	case 2:
++		if (c == LBT_IBS_SLEEP_IND) {
++			t.asleep = true;
++		} else if (c == LBT_IBS_WAKE_IND) {
++			uint8_t ack = LBT_IBS_WAKE_ACK;
++			t.asleep = false;
++			(void)uart_send(&ack, 1);
++		} else {
++			t.acked = true;
++			t.asleep = false;
++		}
++		break;
++	case -1:
++	case -2:
++		lbt_h4_reset(&t.rx);
++		break;
++	default:
++		break;
++	}
++}
++
++static void
++rx_thread(void *arg __unused, wait_result_t w __unused)
++{
++	static uint8_t b[RD_CHUNK];
++
++	for (;;) {
++		uint32_t n = 0;
++
++		if (RXQ_SIZE - t.qn >= LBT_H4_MAX + RD_CHUNK) {
++			lck_mtx_lock(&uart_lock);
++			n = lbt_uart_read(b, RD_CHUNK);
++			lck_mtx_unlock(&uart_lock);
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			rx_byte(b[i]);
++		}
++		lbt_ctl_pump();
++		uint64_t now = lbt_us();
++		if (n) {
++			t.last_act = now;
++		}
++		lbt_sleep_ms(now - t.last_act < 200000u ? 1 : now - t.last_act < 5000000u ? 5 : 20);
++	}
++}
++
++static int
++wait_ready(void)
++{
++	for (unsigned i = 0; !t.ready && !t.failed && i < WAIT_READY_S * 10; i++) {
++		lbt_sleep_ms(100);
++	}
++	return t.ready ? 0 : EIO;
++}
++
++/* one whole H4 frame from userland, tx_lock held */
++static int
++tx_frame(uint8_t *p, uint32_t n)
++{
++	uint8_t ev[LBT_LOCAL_EVENT_MAX];
++	unsigned len;
++
++	if (p[0] == 1) {
++		(void)lbt_fix_command(p, n);
++		if ((len = lbt_local_answer(&t.shim, p, n, ev)) != 0) {
++			t.n_local++;
++			t.last_act = lbt_us();
++			deliver(ev, len);
++			return 0;
++		}
++	}
++	if (t.asleep) {
++		ibs_wake();
++	}
++	t.n_tx++;
++	t.last_act = lbt_us();
++	return uart_send(p, n);
++}
++
++int
++lbt_ios_send(const uint8_t *b, uint32_t n)
++{
++	int e = wait_ready();
++
++	lck_mtx_lock(&tx_lock);
++	for (uint32_t i = 0; e == 0 && i < n; i++) {
++		int fl;
++
++		t.tx[t.txn++] = b[i];
++		fl = lbt_h4_frame_len(t.tx, t.txn);
++		if (fl < 0) {
++			t.txn = 0;              /* not an H4 frame start: drop the byte */
++		} else if (fl > 0 && t.txn == (uint32_t)fl) {
++			e = tx_frame(t.tx, t.txn);
++			t.txn = 0;
++		}
++	}
++	lck_mtx_unlock(&tx_lock);
++	return e;
++}
++
++int
++lbt_ios_claim(uint32_t owner, uint32_t unit)
++{
++	int e = 0;
++
++	lck_mtx_lock(&ios_lock);
++	if (t.failed) {
++		e = ENXIO;                      /* Bluetooth off */
++	} else if (t.owner) {
++		e = EBUSY;
++	} else {
++		t.owner = owner;
++		t.unit = unit;
++		t.qh = t.qt = t.qn = 0;
++		bzero(&t.shim, sizeof(t.shim));
++	}
++	lck_mtx_unlock(&ios_lock);
++	if (e == 0) {
++		lck_mtx_lock(&tx_lock);
++		t.txn = 0;
++		lck_mtx_unlock(&tx_lock);
++		LBT_SAY("ios: client %s connected\n", owner == 1 ? "control" : "device");
++	}
++	return e;
++}
++
++void
++lbt_ios_release(uint32_t owner)
++{
++	lck_mtx_lock(&ios_lock);
++	if (t.owner == owner) {
++		t.owner = 0;
++		t.qh = t.qt = t.qn = 0;
++	}
++	lck_mtx_unlock(&ios_lock);
++	LBT_SAY("ios: client gone (tx %u rx %u local %u dropped %u)\n", t.n_tx, t.n_rx, t.n_local, t.n_drop);
++}
++
++void
++lbt_ios_start(void)
++{
++	thread_t th;
++
++	if (kernel_thread_start(rx_thread, NULL, &th) != KERN_SUCCESS) {
++		lbt_ios_fail("no RX thread");
++		return;
++	}
++	thread_deallocate(th);
++	t.last_act = lbt_us();
++	t.ready = true;
++}
++
++void
++lbt_ios_fail(const char *why __unused)
++{
++	t.failed = true;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_power.c b/bsd/dev/laurel_bt_power.c
+--- a/bsd/dev/laurel_bt_power.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_power.c	2026-11-01 05:15:56.551294408 +0530
+@@ -0,0 +1,113 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 2: WCN3990 power.
++ * The WCN3990 has no BT_EN pin: the host turns on the rails, then sends power pulses on the UART TX line
++ * (Linux hci_qca.c qca_wcn3990_init / qca_send_power_pulse): 0xC0 at 2400 baud (off: the chip leaves any old
++ * state), 0xFC at 115200 (on), flow control off for each pulse, 100 ms for the chip to boot.
++ * Rails [V external/laurel-kernel-los trinket.dtsi bt_wcn3990]: vdd-io PM6125 L9 1.7-1.9 V, vdd-core L17 1.304 V,
++ * vdd-pa L23 3.0-3.4 V, vdd-xtal L16 1.7-1.9 V. They are RPM resources ("ldoa" n, keys "uv" + "swen"; the topaz
++ * TopazRpm.cpp writer, set 0 active + set 1 sleep, as TopazAudio does for L14). The rails are only turned on,
++ * never off: other blocks can share them.
++ * If the RPM link refuses (TopazRpm: "FIFOs used since boot"), the rails can still be on from the bootloader:
++ * the bring-up goes on and the EDL version request is the check (no answer = Bluetooth off with the reason).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "laurel_bt.h"
++
++extern bool topaz_soc_map(void);
++extern bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++
++#define RPM_LDOA                0x616f646cu     /* "ldoa" */
++#define RPM_KEY_UV              0x00007675u     /* "uv" */
++#define RPM_KEY_SWEN            0x6e657773u     /* "swen" */
++
++static const struct {
++	uint32_t ldo, uv;
++	const char *name;
++} rails[] = {
++	{ 9, 1800000, "L9 vdd-io" },
++	{ 16, 1800000, "L16 vdd-xtal" },
++	{ 17, 1304000, "L17 vdd-core" },
++	{ 23, 3000000, "L23 vdd-pa" },
++};
++
++int
++lbt_power_rails(const char **why)
++{
++	unsigned bad = 0;
++
++	/* topaz_soc_map maps APCS (the RPM doorbell); its answer is about the modem pool, not needed here */
++	(void)topaz_soc_map();
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		bool ok = true;
++
++		for (uint32_t set = 0; set <= 1; set++) {
++			ok &= topaz_rpm_write(set, RPM_LDOA, rails[i].ldo, RPM_KEY_UV, rails[i].uv);
++			ok &= topaz_rpm_write(set, RPM_LDOA, rails[i].ldo, RPM_KEY_SWEN, 1);
++		}
++		if (!ok) {
++			bad |= 1u << i;
++		}
++	}
++	if (bad) {
++		LBT_SAY("power: RPM refused rails (mask %#x of L9/L16/L17/L23): continue with the boot state\n", bad);
++		*why = "RPM refused the rails";
++		lbt_sleep_ms(10);
++		return EIO;
++	}
++	LBT_SAY("power: L9 1.8 V, L16 1.8 V, L17 1.304 V, L23 3.0 V on\n");
++	lbt_sleep_ms(10);
++	return 0;
++}
++
++/* qca_send_power_pulse: flow control off, one byte, wait until sent, flow control back on */
++static int
++pulse(uint8_t b)
++{
++	int e;
++
++	lbt_uart_flow(false);
++	e = lbt_uart_write(&b, 1);
++	lbt_uart_flow(true);
++	return e;
++}
++
++int
++lbt_power_on(const char **why)
++{
++	int e;
++
++	if ((e = lbt_uart_set_baud(2400u)) != 0) {
++		*why = "no QUP clock for 2400 baud";
++		return e;
++	}
++	if ((e = pulse(LBT_POWER_OFF_PULSE)) != 0) {
++		*why = "power-off pulse not sent";
++		return e;
++	}
++	lbt_sleep_ms(10);
++	if ((e = lbt_uart_set_baud(115200u)) != 0) {
++		*why = "no QUP clock for 115200 baud";
++		return e;
++	}
++	if ((e = pulse(LBT_POWER_ON_PULSE)) != 0) {
++		*why = "power-on pulse not sent";
++		return e;
++	}
++	lbt_sleep_ms(100);                      /* the SoC boots */
++	lbt_uart_drop_rx();                     /* bytes from the pulse time (Linux closes and opens the port) */
++	lbt_uart_flow(true);
++	return 0;
++}
++
++void
++lbt_power_off(void)
++{
++	if (lbt_uart_set_baud(2400u) == 0) {
++		(void)pulse(LBT_POWER_OFF_PULSE);
++	}
++	(void)lbt_uart_set_baud(115200u);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_uart.c b/bsd/dev/laurel_bt_uart.c
+--- a/bsd/dev/laurel_bt_uart.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_uart.c	2026-11-01 05:16:16.043477245 +0530
+@@ -0,0 +1,221 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 1: the GENI UART of QUP1 SE9 (0x4c90000, SPI 312).
++ * Polled FIFO mode (no interrupt, no DMA), RTS/CTS, 8N1. Not reentrant: one caller at a time (the bring-up
++ * thread, then laurel_bt_ios.c under its UART lock).
++ * Facts [V external/laurel-kernel-los]: trinket-qupv3.dtsi qupv3_se9_4uart (GCC_QUPV3_WRAP1_S4_CLK, wrap 1
++ * m/s AHB); gcc-trinket.c: s4 RCG 0x39608 (DFS_ENABLE_RCG), branch vote reg 0x7900c bit 26 (s4), 18 core_2x,
++ * 19 core, 20 m_ahb, 21 s_ahb (hwcg); CBCRs 0x39604 s4, 0x39014, 0x3900c, 0x39004, 0x39008; parents XO 19.2 MHz,
++ * GPLL0 early 600 MHz, GPLL0 aux2 300 MHz, GPLL6 384 MHz. pinctrl-trinket.c GPIO 10-13 EAST (0x900000), function
++ * qup14 = 1; trinket-pinctrl.dtsi: CTS/RX no pull, RTS pull-down, TX pull-up, 2 mA. Registers and the FIFO
++ * packing: msm_geni_serial.c / qcom-geni-se.h (same layout as negroni 0330). UART_OVERSAMPLING 32 (QUP < 2.5).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "laurel_bt.h"
++
++#include "laurel_bt_geni.h"
++
++struct lbt_geni lbt_u;
++
++
++vm_offset_t
++lbt_map(uint32_t pa, uint32_t size)
++{
++	uint32_t base = pa & ~(MAP_ALIGN - 1u), len = (pa + size - base + MAP_ALIGN - 1u) & ~(MAP_ALIGN - 1u);
++	vm_offset_t va = ml_io_map(base, len);
++	return va ? va + (pa - base) : 0;
++}
++
++bool
++lbt_wait_bits(vm_offset_t reg, uint32_t mask, bool set, uint32_t us)
++{
++	for (uint32_t t = 0; t <= us; t += 5) {
++		if (((rd(reg) & mask) != 0) == set) {
++			return true;
++		}
++		delay(5);
++	}
++	return false;
++}
++
++/* ftbl_gcc_qupv3_wrap0_s0_clk_src entries usable when DFS is off: rate, src, hid (2*div-1), m, n */
++static const struct { uint32_t hz; uint8_t src, hid; uint16_t m, n; } ftbl[] = {
++	{ 7372800, 2, 0, 384, 15625 }, { 14745600, 2, 0, 768, 15625 }, { 19200000, 0, 0, 0, 0 },
++	{ 29491200, 2, 0, 1536, 15625 }, { 32000000, 2, 0, 8, 75 }, { 48000000, 2, 0, 4, 25 },
++	{ 64000000, 2, 0, 16, 75 }, { 80000000, 2, 0, 4, 15 }, { 96000000, 2, 0, 8, 25 },
++};
++
++static bool
++rcg_program(unsigned i)
++{
++	vm_offset_t r = u.gcc + RCG;
++	uint32_t cfg = (rd(r + RCG_CFG) & ~(0x1fu | 7u << 8 | 3u << 12)) | (uint32_t)ftbl[i].src << 8 | ftbl[i].hid;
++
++	if (ftbl[i].n) {
++		wr(r + RCG_M, ftbl[i].m);
++		wr(r + RCG_N, ~(uint32_t)(ftbl[i].n - ftbl[i].m) & 0xffffu);
++		wr(r + RCG_D, ~(uint32_t)ftbl[i].n & 0xffffu);
++		cfg |= 2u << 12;                /* dual edge */
++	}
++	wr(r + RCG_CFG, cfg);
++	wr(r, rd(r) | 1u);                      /* CMD_UPDATE */
++	return lbt_wait_bits(r, 1u, false, 1000);
++}
++
++uint32_t
++lbt_uart_baud(void)
++{
++	return u.baud;
++}
++
++/* geni_se_clk_freq_match: the DFS level (or table rate) nearest to baud x sampling, within 2 % */
++int
++lbt_uart_set_baud(uint32_t baud)
++{
++	uint64_t want = (uint64_t)baud * u.sampling, best_d = ~0ull, best_hz = 0;
++	unsigned n = u.dfs ? u.levels : (unsigned)(sizeof(ftbl) / sizeof(ftbl[0])), best = 0;
++
++	for (unsigned i = 0; baud && i < n; i++) {
++		uint64_t hz = u.dfs ? u.level_hz[i] : ftbl[i].hz, div = hz ? (hz + want / 2) / want : 0;
++		uint64_t got = div ? hz / div : 0, d = want > got ? want - got : got - want;
++		if (div && div <= 0xfffu && d < best_d) {
++			best_d = d;
++			best = i;
++			best_hz = hz;
++		}
++	}
++	if (!best_hz || best_d * 50u > want) {
++		LBT_SAY("uart: no clock for %u baud (best %llu Hz)\n", baud, best_hz);
++		return ERANGE;
++	}
++	if (u.dfs) {
++		wr(SE(GENI_CLK_SEL), best & 7u);
++	} else if (!rcg_program(best)) {
++		LBT_SAY("uart: s4 RCG update did not end\n");
++		return ETIMEDOUT;
++	} else {
++		wr(SE(GENI_CLK_SEL), 0);
++	}
++	uint32_t div = (uint32_t)((best_hz + want / 2) / want);
++	wr(SE(GENI_SER_M_CLK_CFG), div << 4 | 1u);
++	wr(SE(GENI_SER_S_CLK_CFG), div << 4 | 1u);
++	u.baud = baud;
++	return 0;
++}
++
++static void
++rx_drain(void)
++{
++	uint32_t st = rd(SE(GENI_RX_FIFO_STATUS)), wc = st & 0x1ffffffu;
++
++	for (uint32_t i = 0; i < wc; i++) {
++		/* a word only when the ring has room: else the FIFO fills and RFR stops the chip (no loss) */
++		if ((u.tail + RX_RING - u.head - 1u) % RX_RING < 4u) {
++			break;
++		}
++		uint32_t w = rd(SE(GENI_RX_FIFO)), nb = 4;
++		if (i == wc - 1u && (st & (1u << 31))) {
++			nb = (st >> 28) & 7u;
++			nb = nb == 0 || nb > 4 ? 4 : nb;
++		}
++		for (uint32_t b = 0; b < nb; b++) {
++			u.ring[u.head] = (uint8_t)(w >> (8u * b));
++			u.head = (u.head + 1u) % RX_RING;
++		}
++	}
++	uint32_t s = rd(SE(GENI_S_IRQ_STATUS));
++	if (s) {
++		wr(SE(GENI_S_IRQ_CLEAR), s);
++	}
++	if (!(rd(SE(GENI_STATUS)) & (1u << 12))) {      /* the read command ended (break, error): start again */
++		wr(SE(GENI_S_CMD0), 1u << 27);
++	}
++}
++
++uint32_t
++lbt_uart_read(uint8_t *buf, uint32_t max)
++{
++	uint32_t n = 0;
++
++	rx_drain();
++	while (n < max && u.tail != u.head) {
++		buf[n++] = u.ring[u.tail];
++		u.tail = (u.tail + 1u) % RX_RING;
++	}
++	return n;
++}
++
++void
++lbt_uart_drop_rx(void)
++{
++	uint8_t b[64];
++
++	while (lbt_uart_read(b, sizeof(b))) {
++	}
++}
++
++static void
++m_cancel(void)
++{
++	wr(SE(GENI_M_CMD_CTRL), CMD_CANCEL);
++	if (!lbt_wait_bits(SE(GENI_M_IRQ_STATUS), M_CMD_CANCEL, true, 2000)) {
++		wr(SE(GENI_M_CMD_CTRL), CMD_ABORT);
++		(void)lbt_wait_bits(SE(GENI_M_IRQ_STATUS), 1u << 5, true, 2000);
++	}
++	wr(SE(GENI_M_IRQ_CLEAR), 0xffffffffu);
++}
++
++int
++lbt_uart_write(const uint8_t *buf, uint32_t len)
++{
++	/* wire time at 10 bits per byte + 100 ms for CTS held by the chip */
++	uint64_t limit = (uint64_t)len * 10u * 1000000u / (u.baud ? u.baud : 115200u) + 100000u, t0 = lbt_us();
++
++	if (!len) {
++		return 0;
++	}
++	if (rd(SE(GENI_STATUS)) & 1u) {
++		m_cancel();
++	}
++	wr(SE(GENI_M_IRQ_CLEAR), M_CMD_DONE);
++	wr(SE(UART_TX_TRANS_LEN), len);
++	wr(SE(GENI_M_CMD0), 1u << 27);          /* UART_START_TX */
++	/* i < len: wait for FIFO room, then one word; i >= len: wait for the command to end */
++	for (uint32_t i = 0;; i += 4) {
++		bool done = i >= len;
++
++		while (done ? !(rd(SE(GENI_M_IRQ_STATUS)) & M_CMD_DONE) :
++		    (rd(SE(GENI_TX_FIFO_STATUS)) & 0x0fffffffu) >= u.tx_depth) {
++			rx_drain();             /* RX keeps moving while TX waits for CTS */
++			if (lbt_us() - t0 > limit) {
++				LBT_SAY("uart: TX of %u bytes stalled at %u (CTS held?)\n", len, MIN(i, len));
++				m_cancel();
++				return ETIMEDOUT;
++			}
++			delay(2);
++		}
++		if (done) {
++			break;
++		}
++		uint32_t w = 0;
++		for (uint32_t b = 0; b < 4 && i + b < len; b++) {
++			w |= (uint32_t)buf[i + b] << (8u * b);
++		}
++		wr(SE(GENI_TX_FIFO), w);
++	}
++	wr(SE(GENI_M_IRQ_CLEAR), M_CMD_DONE);
++	return 0;
++}
++
++void
++lbt_uart_flow(bool on)
++{
++	uint32_t tx = rd(SE(UART_TX_TRANS_CFG));
++
++	wr(SE(UART_MANUAL_RFR), on ? 0u : (1u << 31 | 1u << 1));     /* on: RFR follows the RX FIFO */
++	wr(SE(UART_TX_TRANS_CFG), on ? (tx & ~CTS_MASK) : (tx | CTS_MASK));
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64	2026-11-01 05:15:56.527294182 +0530
++++ b/iokit/conf/files.arm64	2026-11-01 05:17:05.165433908 +0530
+@@ -13,6 +13,7 @@
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/TopazAudio.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/TopazRpm.cpp                                    optional iokitcpp
++iokit/Kernel/arm/LaurelBluetooth.cpp                             optional iokitcpp
+ iokit/Kernel/arm/SweetAMFIService.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/RedwoodWLAN.cpp                                 optional iokitcpp
+diff -ruN a/iokit/Kernel/arm/LaurelBluetooth.cpp b/iokit/Kernel/arm/LaurelBluetooth.cpp
+--- a/iokit/Kernel/arm/LaurelBluetooth.cpp	1970-01-01 05:30:00.000000000 +0530
++++ b/iokit/Kernel/arm/LaurelBluetooth.cpp	2026-11-01 05:15:56.552294417 +0530
+@@ -0,0 +1,54 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600): the ADT "bluetooth" nub for iOS bluetoothd.
++ * scripts/laurel/mkadt.py adds /arm-io/bluetooth (local-mac-address, transport-encoding 3 = H4BC, transport-speed
++ * 3000000); SweetPlatformExpert publishes every /arm-io child as a nub, so bluetoothd (20H392) finds a registry
++ * entry named "bluetooth" and reads those properties (negroni 0332, docs/bluetooth-plan.md section 4).
++ *   laurel_bt_adt_publish(addr): local-mac-address = the address the chip uses (display order, 6 bytes).
++ *   laurel_bt_adt_hide(): Bluetooth off: the nub leaves the device-tree plane and is terminated, so bluetoothd
++ *     sees no Bluetooth ("No bluetooth on this device", exit 0, no restart) instead of a transport that fails.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IORegistryEntry.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <libkern/c++/OSData.h>
++
++#define BT_PATH     "/arm-io/bluetooth"
++
++extern "C" void laurel_bt_adt_publish(const uint8_t addr[6]);
++extern "C" void laurel_bt_adt_hide(void);
++
++extern "C" void
++laurel_bt_adt_publish(const uint8_t addr[6])
++{
++	IORegistryEntry *e = IORegistryEntry::fromPath(BT_PATH, gIODTPlane);
++
++	if (e == NULL) {
++		IOLog("LAUREL BT: adt: no IODeviceTree:%s (bluetoothd finds the transport by /dev only)\n", BT_PATH);
++		return;
++	}
++	OSData *d = OSData::withBytes(addr, 6);
++	if (d != NULL) {
++		e->setProperty("local-mac-address", d);
++		d->release();
++	}
++	e->release();
++}
++
++extern "C" void
++laurel_bt_adt_hide(void)
++{
++	IORegistryEntry *e = IORegistryEntry::fromPath(BT_PATH, gIODTPlane);
++
++	if (e == NULL) {
++		return;
++	}
++	IOService *s = OSDynamicCast(IOService, e);
++	e->detachAll(gIODTPlane);
++	if (s != NULL && !s->isInactive()) {
++		s->terminate();
++	}
++	e->release();
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
