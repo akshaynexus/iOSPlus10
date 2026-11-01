@@ -4100,3 +4100,26 @@ Details: `docs/laurel_sprout/battery-power.md`.
   first (fail = `LAUREL GPU: off: zap shader failed: TrustZone has no PIL call for PAS 13: ...` at once); no shutdown before
   init_image, shutdown after a later failure; metadata in the TopazModem pool (0xE0000000+), GPU pool only as fallback; ms times.
 - Rule for new drivers: never `smc #0` for a SIP/PIL call outside topaz_scm() (PSCI and the reboot path are the exceptions).
+
+## Mi A3: "GL stall" at the Apple logo = lsd's first LaunchServices seed (ADT without /chosen MACs), not the GPU; mkadt.py MACs + 2155 GPU watchdog (2026-11-01 06:45, branch t3/laurel-gl-stall)
+- Details: docs/laurel_sprout/gpu.md section "GL stall".
+- [V] SMP backtraces (new tool `scripts/debug/smp-symbolize.sh LOG [PROC] [FROM-LINE]`: ipsw a2s on the 20H392 cache from the
+  Cryptex dmg mounted with apfs-fuse at out/mnt-cryptex, unslid with the logged slide, ~7 s per address, parallel + cached):
+  SpringBoard waits in a sync XPC to lsd (`_LSCopyServerStore`, `__LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__`)
+  from `CCSModuleRepository` (Control Center); backboardd has one thread in the same call (`prepareIsPackageValue`), all other
+  threads idle (CA render server, IOMFB server, Mesa queues). No thread in a RedwoodGPU call.
+- [V] The same SpringBoard stack in the 05:52 boot (GPU hung in the zap, no GL, CPU renderer); SpringBoard stops after
+  `IOK SpringBoard: path IODeviceTree:/buttons` in every boot of the root of 05:41 (05:52, 06:07, 06:12, 06:17, 06:29, 06:36).
+  05:29 (old root): lsd calls AMFI selector 6 one second after it starts and SpringBoard goes on; new root: never.
+- [V source] The laurel/topaz ADT has no `/chosen mac-address-wifi0/-bluetooth0/-ethernet0`; topaz's RedwoodWLAN is an
+  IO80211Controller, not an IONetworkController; the Wi-Fi firmware MAC reads 00:00:00:00:00:00.
+- [I, strong; same as negroni 1697e28, ios-flame mkadt.py:124, ios-redfin HANDOFF 590] MobileGestalt's WifiAddress waits 5 s
+  for an IONetworkController per answer; the first LS seed of a fresh /var asks once per bundle; LS clients wait for lsd for
+  many minutes. Each try was rebooted after 3-4 min. lsd's own stack is not measured.
+- Fix: mkadt.py writes the three /chosen MACs (02:4c:41:33:57:46 / :42:54 / :45:4e, locally administered). Boot image only.
+  If the Wi-Fi driver later sets en0's MAC, take it from /chosen mac-address-wifi0 so both agree.
+- 2155 (TopazAdreno.cpp): GPU watchdog (fence written back unchanged 3 s with work pending, while backboardd has GL -> one
+  `LAUREL GPU: off: GPU hang: ...` line, GPU off, SIGKILL to the GL backboardd) + sysctl `kern.laurel_gpu`; bbd_wrap.c runs
+  backboardd without the GL loader when it reads `off: ...`. Idle (no frames) is never a hang. Kill switch gpuwd=0.
+- [V] Kernel patch 2154 is taken by t3/laurel-gpu-upstream-opt (SMMU stage 1); 2155 applies with and without it.
+- [V] RedwoodGPU polls fences (no GPU IRQ); the display waits at most 100 ms per surface; no `TopazGPU: no answer` lines.

@@ -11,6 +11,10 @@
  *     renderer), and one line says so;
  *   - every decision goes to syslog and to /var/tmp/laurel-bbd.log (launchd sends stderr to /dev/null);
  *   - if the loader is not on the root, nothing is inserted;
+ *   - laurel 2155: no loader when the kernel says the GPU is off (sysctl kern.laurel_gpu = "off: <reason>": gpu=0,
+ *     a failed bring-up, or the GPU watchdog after a GPU hang). The watchdog kills the GL backboardd; launchd
+ *     starts this wrapper again, and backboardd comes back on CoreAnimation's software renderer at once (no 5 s
+ *     wait for RedwoodGPU in the loader). "" (not decided yet, early boot) or "on": the loader as before;
  *   - if the exec of the real backboardd fails, it tries /usr/libexec/backboardd.real (a second copy root-add-gpu.sh
  *     may leave) and then waits 10 s before it exits, so launchd does not spin.
  */
@@ -68,7 +72,7 @@ bootarg_zero(const char *args, const char *name)
 int
 main(int argc, char *argv[])
 {
-	char args[1024] = "", session[64] = "", old[64] = "";
+	char args[1024] = "", session[64] = "", old[64] = "", gpu[160] = "";
 	size_t len = sizeof(args) - 1;
 	long now = (long)time(NULL), then = 0;
 	int fast = 0, use_loader = 1;
@@ -78,6 +82,10 @@ main(int argc, char *argv[])
 	(void)sysctlbyname("kern.bootargs", args, &len, NULL, 0);
 	len = sizeof(session) - 1;
 	(void)sysctlbyname("kern.bootsessionuuid", session, &len, NULL, 0);
+	len = sizeof(gpu) - 1;
+	if (sysctlbyname("kern.laurel_gpu", gpu, &len, NULL, 0) != 0) {
+		gpu[0] = 0;                             /* (a kernel without 2155: as before) */
+	}
 
 	/* crash guard: count starts in a row that came fast after the one before, in this boot only */
 	if ((f = fopen(STATE, "r")) != NULL) {
@@ -101,6 +109,9 @@ main(int argc, char *argv[])
 	if (bootarg_zero(args, "gpu") || bootarg_zero(args, "gl")) {
 		use_loader = 0;
 		say("off: %s in the boot-args: no GL loader", bootarg_zero(args, "gpu") ? "gpu=0" : "gl=0");
+	} else if (strncmp(gpu, "off", 3) == 0) {
+		use_loader = 0;
+		say("off: the kernel turned the GPU off (%s): no GL loader, software renderer", gpu);
 	} else if (fast >= MAX_FAST) {
 		use_loader = 0;
 		char n[16];

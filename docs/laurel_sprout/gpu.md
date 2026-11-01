@@ -1,6 +1,6 @@
 # Mi A3 (laurel_sprout) GPU: Adreno 610 behind CoreAnimation's OpenGL ES renderer
 
-Status 2026-11-01 06:10: first boot with the zap files (05:52) hung in the zap SCM calls; 2153 fixes it (section "Zap hang").
+Status 2026-11-01 06:45: the 06:12/06:17 "GL stall" is lsd's first LaunchServices seed (ADT without /chosen MACs), not the GPU; mkadt.py fix + 2155 GPU watchdog, built, NOT BOOTED (section "GL stall"). Status 2026-11-01 06:10: first boot with the zap files (05:52) hung in the zap SCM calls; 2153 fixes it (section "Zap hang").
 2153 is built on Linux, **NOT BOOTED**. Before: 05:10 review fixes on top of laurel-int-1 (areas A, C, H).
 Labels: [V] read in source or measured on the host, [I] inference, [U] unknown.
 
@@ -90,6 +90,9 @@ no fallback.
   first (a failed call = GPU off at once); no `PAS_SHUTDOWN` before `init_image` (only after a failure that follows a good
   `init_image`); metadata in the TopazModem pool (0xE0000000+, where TZ read the ADSP and modem metadata), the GPU pool only
   when that pool is off; each SCM step logs its time.
+- **2155** `laurel-gpu-watchdog`: GPU hang watchdog (no fence progress for 3 s with work pending while backboardd has GL)
+  -> `LAUREL GPU: off: GPU hang: ...`, GPU off, GL backboardd killed, wrapper restarts it without GL; sysctl
+  `kern.laurel_gpu` (section "GL stall"). Kill switch `gpuwd=0`.
 - **2152** `laurel-fps-line`: `SWEET FPS:` is part of the GPU report: only while GL is loaded, 6 lines every second, then
   one every 10 s while frames come; `sweetfps=0` turns it off.
 
@@ -206,12 +209,81 @@ PAS sequences of different peripherals may interleave call by call (the ADSP aut
 init_image and auth_and_reset in this boot and both worked [V]), as Linux boots PIL peripherals in parallel; so 2153 does not wait
 for the modem or ADSP.
 
+## GL stall (boots 2026-11-01 06:12 and 06:17): not the GPU; lsd's first seed (ADT MACs) + 2155 GPU watchdog
+
+Report: after `LAUREL GPU: on` and `GL: backboardd opened the GPU`, redwood-gl frames 1-3 and RedwoodGPU submissions 1-3,
+then nothing from redwood-gl / RedwoodGPU / SWEET FB for minutes; the panel keeps the Apple logo.
+
+Observed [V `logs/usblog-20261101-001446.txt`, decoded with `scripts/debug/smp-symbolize.sh` and the 20H392 cache]:
+- Frames 1-3 are backboardd's own boot scene: 4 draws, one 720x1560 IOSurface + one 129x158 (the Apple logo) texture.
+  `redwood-gl` logs frames 1-40 one by one: frame 4 never ended. No `SWEET FPS` line (2152 needs a 1 s window of swaps).
+- backboardd at 06:18:36 (all 19 threads): main thread `CFRunLoopRunSpecific` in `mach_msg2_trap` (idle);
+  `CA::Render::Server::server_thread` and `CA::WindowServer::IOMFBServer::thread_body` idle in mach_msg; 5 Mesa threads
+  idle in `pthread_cond_wait` (not in the cache: libOSMesa); CoreBrightness idle. Two threads wait: t12
+  `_xpc_connection_send_message_with_reply_sync` <- `__LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__` <-
+  `_LSCopyServerStore` <- `LaunchServices::URLPropertyProvider::prepareIsPackageValue`, and t10 `dispatch_group_wait`
+  (backboardd main + 0x18a78). Same picture at 06:14:15 (boot 06:12).
+- SpringBoard at 06:18:36: t1 the same sync XPC to lsd (`_LSCopyServerStore` <- `_LSDBEnumeratorGetNextObject`); t0 (main)
+  waits for the os_unfair_lock of that LS context: `-[LSApplicationRecord initWithBundleIdentifier:...]` <-
+  `-[CCSModuleRepository _queue_filterModuleMetadataByAssociatedBundleAvailability:]` (Control Center modules). Its last
+  IOKit line is `IOK SpringBoard: path IODeviceTree:/buttons`; in the 05:29 boot the next ones came in the same second.
+- **The same SpringBoard stack at 05:54:10 and 05:56:10 (boot 05:52), where the GPU hung in the zap (no RedwoodGPU, no
+  GL, CPU renderer)**, and SpringBoard also stops at `/buttons` in the 06:07 boot (zap hang again, CPU renderer). Later
+  GL boots (06:29, 06:36) stop the same way. So the stall is not the GL path.
+- 05:29 (old root, LaunchServices database already built in earlier boots): `SWEET AMFI: user client selector 6 from
+  lsd` 1 s after lsd starts (ExtensionKit's signed extension cache, read while LS registers), SpringBoard through, lock
+  screen. Every boot of the root of 05:41 (new image, fresh /var, no LS database): no AMFI call from lsd, nothing
+  after `/buttons`.
+- The ADT (scripts/laurel/mkadt.py, from topaz's) has no `/chosen mac-address-wifi0/-bluetooth0/-ethernet0`, and
+  topaz's RedwoodWLAN publishes an `IO80211Controller` (an IOService), not an `IONetworkController`; the firmware MAC is
+  `00:00:00:00:00:00`.
+- GPU side [V source]: RedwoodGPU has no GPU interrupt (fences are polled every 200 us; no GIC SPI / RBBM_INT in use).
+  The display does not wait on GL: direct swaps go to the presenter thread (SwapEnd returns at once); `present()` waits
+  at most 100 ms per surface (`topaz_surface_drawn`); vsync notifications come from a timer. Waits of >= 1 s that time
+  out print `TopazGPU: no answer: ...`; none in these boots. No backboardd thread is in a RedwoodGPU call.
+
+Cause [I, strong]: lsd's first LaunchServices seed on the new root. MobileGestalt answers WifiAddress (and the old-style
+UniqueDeviceID) from `/chosen mac-address-*`; without them each answer waits 5 s for an IONetworkController that never
+comes, once per bundle (ios-flame tools/mkadt.py, ios-redfin HANDOFF 590, negroni 1697e28 "LaunchServices/installd stall":
+15+ min of Apple logo on the first boot). Every client of LS (SpringBoard, backboardd) waits for lsd meanwhile. The owner
+rebooted each try after 3-4 min, so the seed never finished. Not measured: lsd's own stack (the sampler only samples
+SpringBoard and backboardd by default).
+
+Fix: `scripts/laurel/mkadt.py` writes `/chosen mac-address-wifi0 = 02:4c:41:33:57:46`, `mac-address-bluetooth0 =
+02:4c:41:33:42:54` (the /arm-io/bluetooth fallback), `mac-address-ethernet0 = 02:4c:41:33:45:4e` (locally administered,
+not the phone's). New ADT = new boot image (uefi-image.sh); no root change. The half-built seed in /var needs nothing:
+lsd builds the database again. Check on the next boot: `SWEET AMFI: user client selector 6 from lsd` about 1 s after
+`exec lsd`, then SpringBoard lines after `/buttons` (`privilege 1007`, `/product`), redwood-gl frames past 3, `SWEET FPS`.
+If it still stops: boot once with `sweetsample=SpringBoard,backboardd,lsd` (the existing topaz sampler) and run
+`scripts/debug/smp-symbolize.sh LOG lsd`.
+
+### 2155 `laurel-gpu-watchdog` (a real GPU hang never freezes the UI)
+
+A frame-count watchdog would fire on every still screen (no change = no frame, as in this log). 2155 watches the GPU
+work instead (TopazAdreno.cpp, the GPU thread after `LAUREL GPU: on`): every 250 ms while backboardd has GL, if the last
+submission is not written back and the written-back number has not moved for 3 s, it is a hang. Then, once:
+`TopazGPU: watchdog: GPU hang: fence .. done .. rptr .. RBBM_STATUS ..` (registers + SMMU fault state),
+**`LAUREL GPU: off: GPU hang: submissions A-B not done, no progress for N ms; GL off, backboardd PID restarts on the CPU
+renderer`**, CP stopped and `ready = false` (RedwoodGPU refuses every call and new opens; `topaz_gpu_gl_active()` false:
+screen surfaces from ordinary memory, the display does not wait for the GPU), SIGKILL to the GL backboardd. launchd starts
+the wrapper again; it reads the new sysctl **`kern.laurel_gpu`** (`on`, `off: <reason>` for gpu=0, a failed bring-up step
+or the hang, empty while the GPU starts) and execs backboardd without the GL loader:
+`LAUREL BBD: off: the kernel turned the GPU off (off: GPU hang: ...): no GL loader, software renderer`
+(`/var/tmp/laurel-bbd.log`, syslog). The wrapper also skips the loader (and its 5 s RedwoodGPU wait) after a failed
+bring-up. Kill switch `gpuwd=0` (`LAUREL GPU WATCHDOG: off: boot-arg gpuwd=0`). [I] Risk: after the SIGKILL the dying
+backboardd's buffers are freed while the stopped CP may still hold their addresses (pass-through SMMU); CP_SQE_CNTL = 0
+stops new fetches. 2155 applies with and without the stage-1 patch 2154 (checked: 244/244 with 2154).
+
+Build 2026-11-01 06:38 [V]: kernel-linux.sh 243/243 patches, 0 LSE, `kernel.development.sweet.4k` sha256 a5dffb27...;
+gpu-userland.sh: backboardd.wrap 0 LSE (root files changed: `/usr/libexec/backboardd` only).
+
 ## Recovery (no UI after the GPU root)
 
 1. Boot with `gl=0` (backboardd without the loader, software renderer) or `gpu=0` (no GPU at all, no loader). Add the
    boot-arg to the UniXNU/DarwinBoot command line (`scripts/laurel/uefi-image.sh` boot-args) and `fastboot boot` the image.
 2. The wrapper turns the loader off by itself after 2 backboardd starts within 30 s of each other in one boot
-   (`/var/tmp/laurel-bbd.state`, line `LAUREL BBD: off: backboardd exited N times ...`).
+   (`/var/tmp/laurel-bbd.state`, line `LAUREL BBD: off: backboardd exited N times ...`), and when `kern.laurel_gpu`
+   says `off: ...` (2155: gpu=0, failed bring-up, GPU watchdog).
 3. If the wrapper itself fails to exec the real binary, it tries `/usr/libexec/backboardd.real`, then waits 10 s (launchd
    does not spin). root-add-gpu.sh refuses to install a wrapper that is not a signed thin arm64 executable naming
    `/usr/libexec/real/backboardd`; Apple's backboardd then stays in place.

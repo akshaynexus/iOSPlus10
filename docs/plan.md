@@ -668,3 +668,18 @@ Observed [V, USB log logs/usblog-20261101-001446.txt]:
   (screen surfaces from the GPU pool), AppleARMBacklight in use, first frame 31 s after boot.
 Next: BT in SE DMA mode (t3/laurel-bt-se-dma); GPU upstream sync + SMMU stage-1 + Metal optimisation (t3/laurel-gpu-upstream-opt);
 Wi-Fi MAC; charging stays supervised.
+
+## Mi A3: Apple-logo "GL stall" = lsd's first LaunchServices seed; ADT MACs + GPU watchdog 2155 (2026-11-01 06:45, branch t3/laurel-gl-stall)
+
+Observed [V, logs/usblog-20261101-001446.txt, SMP samples decoded with scripts/debug/smp-symbolize.sh]: in every boot of the
+root of 05:41 (GL on or off) SpringBoard waits in a sync XPC to lsd (`_LSCopyServerStore`, from Control Center's module
+repository) and stops after `IOK SpringBoard: path IODeviceTree:/buttons`; backboardd is idle except one thread in the same
+lsd call. Frames 1-3 are the boot scene; no GPU wait. Same stack in the 05:52 boot without GL.
+Cause [I, strong]: the ADT has no /chosen mac-address-wifi0/-bluetooth0/-ethernet0 and RedwoodWLAN is no IONetworkController,
+so MobileGestalt waits 5 s per WifiAddress answer during lsd's first seed of the fresh /var (negroni 1697e28, ios-flame).
+Done [V build]: scripts/laurel/mkadt.py writes the three MACs; kernel 2155 GPU watchdog + sysctl kern.laurel_gpu; bbd_wrap.c
+skips the GL loader when the kernel says the GPU is off. kernel-linux.sh 243/243 patches, 0 LSE; gpu-userland.sh 0 LSE.
+Not booted. Needs: new boot image (ADT + kernel) and `/usr/libexec/backboardd` (the wrapper) in the root (root-add-gpu.sh).
+Next: boot; expect `SWEET AMFI: user client selector 6 from lsd` ~1 s after `exec lsd`, SpringBoard past `/buttons`,
+redwood-gl frames past 3 and `SWEET FPS` lines. If not: `sweetsample=SpringBoard,backboardd,lsd`, then
+`scripts/debug/smp-symbolize.sh LOG lsd`.
