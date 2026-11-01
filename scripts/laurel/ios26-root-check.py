@@ -29,6 +29,12 @@ def nfd(p):
 
 
 byform = {nfd(k): k for k in want}
+# udisks mounts hfsplus with uid= and gid=: the kernel then shows those for every file. Owners were checked from the catalog by hfs-verify
+forced = False
+for ln in open('/proc/self/mounts'):
+    m = ln.split()
+    if m[1] == root and ('uid=' in m[3]):
+        forced = True
 extra = []
 for dirp, dirs, files in os.walk(rootb):
     rel = os.path.relpath(dirp, rootb)
@@ -44,13 +50,13 @@ for dirp, dirs, files in os.walk(rootb):
         seen += 1
         st = os.lstat(os.path.join(rootb, p))
         f = want[k]
-        if st.st_mode != int(f[1], 8) or st.st_uid != int(f[2]) or st.st_gid != int(f[3]):
+        if st.st_mode != int(f[1], 8) or (not forced and (st.st_uid != int(f[2]) or st.st_gid != int(f[3]))):
             bad.append(f'{p!r}: mode {st.st_mode:o} uid {st.st_uid} gid {st.st_gid}, manifest {f[1]} {f[2]} {f[3]}')
         elif f[0] == b'f' and st.st_size != int(f[5]):
             bad.append(f'{p!r}: size {st.st_size}, manifest {f[5]}')
         elif f[0] == b'l' and os.readlink(os.path.join(rootb, p)) != f[6]:
             bad.append(f'{p!r}: link {os.readlink(os.path.join(rootb, p))!r}, manifest {f[6]!r}')
-print(f'mount check: {seen} of {len(want)} manifest entries found with type, mode, owner, size or target; {len(extra)} extra; {len(bad)} differ')
+print(f'mount check: {seen} of {len(want)} manifest entries found with type, mode, {"" if forced else "owner, "}size or target; {len(extra)} extra; {len(bad)} differ' + (' (owner: the mount forces uid and gid; hfs-verify checked it in the catalog)' if forced else ''))
 if extra:
     print(' extra:', extra[:5])
 for b in bad[:20]:
@@ -85,7 +91,9 @@ for p, test in checks:
         fail += 1
         print('  layout missing or wrong type:', p)
 print(f'layout: {len(checks) - fail} of {len(checks)} paths good')
-dyld_seen = os.path.isfile(os.path.join(rootb, b'private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e'))
+# an absolute link: on this host it must be read against the mount
+lnk = os.readlink(os.path.join(rootb, b'private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld'))
+dyld_seen = lnk == b'/System/Library/Caches/com.apple.dyld' and os.path.isfile(rootb + lnk + b'/dyld_shared_cache_arm64e')
 print('the cryptex path of the cache reaches the file through its link:', dyld_seen)
 for must in (b'System/Library/LaunchDaemons', b'System/Library/Frameworks', b'Applications'):
     if not os.path.isdir(os.path.join(rootb, must)):

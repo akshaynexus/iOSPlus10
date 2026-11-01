@@ -92,6 +92,8 @@ No kernel change is needed. After an OTA flip iOS would read vendor_a of Lineage
 
 **Size [V measured].** The existing iOS 16 root: HFS+ 16 GiB, 12010 MiB used. iOS 16 donor images 7484 MB -> root 12010 MiB: 1.68 x. iOS 26 donor iPhone12,1 23F84, decrypted on disk 2026-11-02 (the userland agent's files, nothing downloaded here): OS 8409579520, SystemOS 5221908480, AppOS 14680064 bytes (encrypted in the IPSW: 7180648448, 2013265920). `dual-boot.sh size ios26`: root about 21.4 GiB [I: 1.68 x from iOS 16; not measured for iOS 26], + 8 GiB /private/var (`VAR_GIB=`, `EXPAND=`, `DONOR_BYTES=`) = **SIZE=30G, area 30.01 GiB**. `/data` has 104 GiB free [V], so 74 GiB stay for Android. iOS 16 alone: 16.01 GiB. The size is a parameter of `allocate`. The HFS+ size is `SIZE=` of root.sh; the area must be >= volume + 1 MiB header + 4 MiB + 4 KiB log (both tools refuse less).
 
+**Owner decision 2026-11-02: the iOS area is 32 GiB (30 % of userdata), not 30.01 GiB.** `CONFIRM=allocate dual-boot.sh allocate 32` = 34,359,738,368 bytes = 8,388,608 blocks. Off it: 256 header blocks (`LDB_RESERVED_BLOCKS`, 1 MiB) and 1025 log blocks (`LOG_BLOCKS`, 4 MiB + 4 KiB, `SWEET_LOG_BLOCKS`). **HFS+ volume: 34,354,491,392 bytes**, `dual-boot.sh size ios26`. The extent table is not in the area: it is in the ADT `/chosen laurel-dualboot`. `/private/var` is no separate volume: it is the free space of the one volume, measured in `ios26-root.md`. The 21.4 GiB estimate above was high: the real root data is in `ios26-root.md`.
+
 The one area holds one root. iOS 26 later = `remove`, `allocate` again, new table, new boot image.
 
 **Fallback if pinned files fail on the phone:** decision D4: shrink userdata. It needs a GPT write and an Android wipe. No script exists for it.
@@ -127,7 +129,7 @@ All script steps: `scripts/laurel/dual-boot.sh`. Each writing step needs `CONFIR
 | 1 | Owner | Settings -> System -> Developer options -> Rooted debugging on | a setting |
 | 2 | Agent | `adb root`, `dual-boot.sh status`, and `sha256sum` of `/dev/block/by-name/{modem,bluetooth,boot,dtbo}_b` against the stock ROM | nothing |
 | 3 | Agent | `dual-boot.sh size ios16` (later `ios26`) | nothing |
-| 4 | Owner yes, agent | `CONFIRM=allocate dual-boot.sh allocate 16.1`; it prints the extent count and writes `out/laurel/dualboot/table.ldbt` | a file in `/data` |
+| 4 | Owner yes, agent | `CONFIRM=allocate dual-boot.sh allocate 32` (owner decision); it prints the extent count and writes `out/laurel/dualboot/table.ldbt` | a file in `/data` |
 | 5 | Owner yes, agent | `CONFIRM=check-map dual-boot.sh check-map`: mapping proof, then immutable | that file |
 | 6 | Owner yes, agent | `CONFIRM=install dual-boot.sh install` (tmux: `scripts/bg.sh db-install ...`, 10 min for 12 GB): reads back by hash | raw sda15, only in the table |
 | 7 | Agent | `scripts/bg.sh db-image scripts/laurel/dual-boot.sh image`: boot image with the table. Root must also pass the usual `flash-check` | host only |
@@ -174,7 +176,7 @@ Daily use: step 9, step 11. To read the iOS log from Android: `dual-boot.sh logs
 | D3 | iOS writes slot attributes (GPT of the boot LUN) for a button "Android" | Not now. If wanted: a Mu or XNU piece with its own fence, later |
 | D4 | Fallback: shrink userdata (GPT write + Android wipe) | Only if pinned files fail on the phone |
 | D5 | Back up Android's data before step 8 | Yes: apps' data cannot be restored when the keys fail |
-| D6 | Area size: 16.1 GiB for iOS 16 now, or 30.1 GiB now to keep it for iOS 26 | 30.1: `SIZE=16G` root fits, later only a new volume |
+| D6 | Area size | **Decided by the owner, 2026-11-02: 32 GiB.** The iOS 16 `SIZE=16G` root fits too |
 
 ## 8. Build and test
 

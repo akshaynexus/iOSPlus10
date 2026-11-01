@@ -60,14 +60,17 @@ They compile; a merge can still be wrong in meaning.
 
 ## 4. For the lowered arm64e userland
 
-The userland branch (`t3/laurel-ios26-userland`) was not on origin at the last fetch, so its "kernel needs" list was not read. Design from the task:
+The two tracks are joined: `ios26-userland.md` sections 7.1-7.4 (state per item, truth test, what was found) and 8.2 (user-client ABI). This table is what the kernel does now:
 
 | Need | Kernel |
 |---|---|
 | Accept the userland | `ml_grade_binary`: `CPU_SUBTYPE_ARM64E` has grade 8 on this V8 host, below arm64 (10, 9). All `ptrauth_calls` exec gates compile out |
 | Shared region slide | **Bug fixed**: 12377 v3 and v5 wrote an auth rebase only inside `#if ptrauth_calls`, so a plain kernel left the raw value in the page. Now it writes the plain pointer (base 0005) |
-| Slide info v5 | the 12377 code, `TOPAZ_4K` as 0140 |
-| Undefined instruction hook | **`LAUREL PACEMU`** `osfmk/arm64/laurel_abi.c`, from `handle_uncategorized`: RETAA/B, BRAA/B(Z), BLRAA/B(Z), LDRAA/B, PACx, AUTx, XPAC, PACGA, LDAPUR, STLUR. LSE and LDAPR stay with topaz 0081. CASP, FP16, DotProd, FCMA and JSCVT stay undefined: the lowering must remove them. Kill switch `laurelpacemu=0` |
+| Slide info v5 | **`shared_region_pager_data_request` handles 16 KiB slide pages on 4 KiB VM pages** (a copy of the whole slide page). The 12377 code copied 16 KiB into a 4 KiB page |
+| Undefined instruction hook | **`LAUREL EMU`** `osfmk/arm64/laurel_abi.c` + `laurel_a64emu.c`, from `handle_uncategorized` and `handle_msr_trap`: PAC, LSE, CASP, RCpc, RCpc2, FP16, FCMA, DotProd, JSCVT, FHM, SHA3, SHA512, RDM, DIT, SB. Kill switches `laurelemu=0` (the 0081 path stays), `laurelpacemu=0`. This replaces the `LAUREL PACEMU` of the first version, which turned itself off at first use (ios26-userland.md 7.3) |
+| Copyio recovery | `copyio_recover_table_end` moved to the end of `machine_routines_asm.s`: the 0081 ranges were outside the table |
+| dyld flags, commpage | `LAUREL DYLD`, `LAUREL CPUID` |
+| User clients | IOSurface, IOMFB of 23F84: ios26-userland.md 8.2. **This kernel no longer answers an iOS 16 userland on these clients: the doc's section 8 line "the kernel reaches launchd of iOS 16" stops at the first surface** |
 
 ## 5. Donor: N104AP (owner decision 2026-11-02)
 
@@ -115,7 +118,7 @@ In boot order:
 4. **Timer and GIC** (`sleh_irq`, `pe_fiq.c`): same code as iOS 16, new `ml_interrupt_masked_debug` calls.
 5. **IOKit start**: `SweetPlatformExpert`, `SweetCPU`, `AppleCLCD`. API changes that `-w` hid.
 6. **Root mount**: hfs-715 on the new VFS; `rd=ufsroot0`.
-7. **launchd and later**: no iOS 26 root exists yet. Then dyld on a lowered cache, 83 subcaches, `LAUREL PACEMU` load, and the user-client ABIs (IOSurface, IOMFB, AppleKeyStore, Sandbox), which were never traced against 23F84 [U].
+7. **launchd and later**: the root exists (`ios26-root.md`), never run. Then dyld on a lowered cache, 83 subcaches, the first `LAUREL EMU` words, and the user-client ABIs, read from the frameworks (ios26-userland.md 8.2) but never run. Sandbox: not traced.
 
 ## 8. T1 test plan (only when the owner asks for a flash; not now)
 
@@ -125,4 +128,4 @@ Image: `scripts/bg.sh ios26-image scripts/laurel/ios26-image.sh`, output `out/la
 2. This ABL refused `fastboot boot` in `uefi-boot.md`; `cellular.md` section 8 uses it. Try `fastboot boot` first. Only if refused, ask again before a `boot_b` flash.
 3. Pass marks, photo of each: (a) UniXNU menu, then `DARWINBOOT: ARM64 va=0xfffffff007004000 pa=0xe1004000`; (b) white band; (c) kernel console: `Darwin Kernel Version 25.5.0`, `LAUREL BUILD: <commit> 315 patches, series ..., ios26_4k`, `LAUREL CPU: boot cpu mpidr=0x100`, `LAUREL RAM: on`; (d) `SWEET PRNG: HMAC-SHA256 registered`, `SWEET AMFI: built-in interface registered`, `SWEET pthread: libpthread-539.100.4 registered`; (e) USB ECM on the host and `op10tool ctl ping`, `logs/laurel-boot-*.log`; (f) bsd_init banner and the HFS root mount.
 4. Stop at the first panic. It is the result of T1. Copy the screen text to `docs/notes.md`, fix, rebuild, ask again.
-5. No root work in T1. With `rd=ufsroot0` the iOS 16 root on userdata may start, and the kernel reaches launchd of iOS 16: that is a kernel test, not the goal. If the root must stay untouched, boot without `ufsrw=1 rootrw=1`.
+5. No root work in T1. With `rd=ufsroot0` the iOS 16 root on userdata may start, and the kernel reaches launchd of iOS 16: that is a kernel test, not the goal. Since the 23F84 ABI port, IOSurface and IOMFB of that root fail: the test ends before the UI. If the root must stay untouched, boot without `ufsrw=1 rootrw=1`.

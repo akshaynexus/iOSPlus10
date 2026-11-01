@@ -24,8 +24,8 @@ Conditions, all required:
 
 | # | Condition | State |
 |---|---|---|
-| C1 | Kernel track: xnu-12377 for ARMv8.0 and 4 KiB pages with section 7 "kernel needs" | separate track, not boot-tested on this CPU |
-| C2 | Undefined-instruction emulation in the kernel for what the tool leaves (section 5) | not written |
+| C1 | Kernel track: xnu-12377 for ARMv8.0 and 4 KiB pages with section 7 "kernel needs" | compiled, section 7.1 has the state per item; never booted |
+| C2 | Undefined-instruction emulation in the kernel for what the tool leaves (section 5) | written and truth-tested on the host (section 7.1); never run in a kernel |
 | C3 | The compositor on Metal through Turnip + metal2vulkan on the Adreno 610, or a hook that gives `AccelServer::renderer` a GLES context | [U] neither tried: iOS 16 keeps backboardd on GL |
 | C4 | The commpage and `hw.optional` report ARMv8.0, so Apple's gated SME, SVE, AMX, MTE and SPRR code stays off | [I] zeta evidence, not tested here |
 | C5 | The owner accepts low speed. No number exists for this phone | [U] |
@@ -359,6 +359,56 @@ From this CPU's result and zeta's README. Not implemented here. The UniXNU patch
 10. **Stack:** the trampolines go 176 + 144 bytes below SP, past the red zone. Stack-limit checks stay the same as for a call.
 11. **Exclusive monitor:** `clrex` on exception return, as usual.
 
+### 7.1 State of each item (2026-11-02, branch `t3/laurel-ios26-needs`). Host and compile only: this kernel has never booted
+
+| # | Item | State | Evidence |
+|---|---|---|---|
+| 1 | 16 KiB slide pages on 4 KiB pages | **Done in code. The slide is tested on the host; the VM part is compile only. Signature check not active** | `shared_region_pager_data_request` reads the 4 pages of the slide page through `vm_fault_page`, slides a copy, keeps the page. `scripts/laurel/test-slide.sh` [V]: the kernel's own `vm_shared_region_slide_page_v5` on all 31,537 slide pages, 28,354,303 rebases, 0 differences; 21,248,666 rebases (75 %) are past the first 4 KiB, which the old code never slid. The pager calls `vm_page_validate_cs_mapped` for each page, but `cs_validate_range` returns at once under `TOPAZ_4K` (topaz 0140, as on iOS 16), so no hash is checked and "validate" of this item is not met. Code signing is not enforced on this port |
+| 2 | Auth rebases | Kept: harmless | The cache has 0. The merged code writes a plain pointer. The same test on the original cache: 10,069,319 auth entries become the expected plain pointer [V] |
+| 3 | Grading | No change | Lowered files are `CPU_SUBTYPE_ARM64_ALL` |
+| 4 | Code signing, trust | Page shift 12 accepted (`cs_validate_codedirectory`, `PAGE_SHIFT_4K`) [V code]. Trust: built-in AMFI marks every signed file of the root volume platform; trust caches stay off | `ios26-kernel.md` section 3. The merged trust cache is built (`ios26-root.md`) but no kernel code reads it |
+| 5 | Cache location, SIP | No change needed [V code + ADT]. `scdir_enforce` is 0 here (macOS target), the file is on the root volume, the owner check needs uid 0. `/chosen/asmb lp-sip0` = 0x6f has `CSR_ALLOW_UNRESTRICTED_FS` (read back from `mkadt.py --donor n104ap`) | Never run |
+| 6 | dyld flags | Done | `dyld_flags` default 0x8 on this kernel; low half to the commpage at `commpage_populate`, line `LAUREL DYLD: on`; a later `kern.dyld_flags` write by launchd keeps that low half. Bit 0x8 = skip libignition comes from zeta's text, not read in dyld here [I] |
+| 7 | Commpage, sysctls | Done | Bits come from the ID registers; `LAUREL CPUID: on` also clears the listed bits if a CPU reports them. `hw.cpufamily`, `hw.cpusubfamily`: unknown on a non-Apple MIDR [V code]. User page shift 14 [V code] |
+| 8 | EL0 emulation | Done, truth-tested | Section 7.2 |
+| 9 | Reach counts | Done | `LAUREL EMU: counts ...` each 60 s, only when a word trapped; 15 values |
+| 10 | Stack | No change | |
+| 11 | Exclusive monitor | Done | `clrex` after each emulated word: `locore.s` has none |
+
+### 7.2 The emulator (`tools/laurel-a64emu`, staged into `osfmk/arm64`; glue `laurel_abi.c`)
+
+Line at start: `LAUREL EMU: on: classes off 0x..`. Kill switches: `laurelemu=0` (the older 0081 LSE path stays), `laurelpacemu=0`. A class whose known answers fail turns off alone.
+
+- Runs on the saved registers (PCB), all integer: no FP register, no lock, no state between words. A word changes state only after its memory access worked.
+- A fault in the LL/SC goes through the copyio recovery table: the kernel abort path runs `vm_fault` for the user map, a failure gives EFAULT. Then a second `vm_fault` gets the real result: success runs the word again, else `EXC_BAD_ACCESS` with the real code and address, PC on the word, no register changed.
+- Addresses: bit 55 set or above `vm_map_max` is a fault and is never accessed; the top byte is ignored as TBI0.
+- A failed store-exclusive retries 4096 times, then returns to EL0 at the same word (memory with no exclusive monitor must not hold a thread in the kernel). Count `retry`.
+- `A` + `L`: also `dmb ish`, since an LSE word with both orders all earlier accesses before all later ones, and `ldaxr` + `stlxr` alone do not. **The trampolines of `a64-lower` have no such `dmb`** (section 4.1): correct for the C11 mapping, not for hand-written code that uses `*al` as a full barrier [I]. Reported, not changed.
+- LSE2: an unaligned atomic inside 16 bytes works, through LDXP on the block. Unaligned LDAPUR, STLUR and LDAPR inside 16 bytes: plain access with a barrier, so not single-copy atomic there.
+- Single step: a finished word clears the saved SS, so the step exception comes at the next instruction. A fault keeps it.
+
+Truth test, `scripts/laurel/test-a64emu.sh` [V]. One static AArch64 program runs one case stream twice: the real word on qemu `neoverse-v1` (`-cpu max` only for sysreg), and SIGILL + this C and asm on `-cpu cortex-a53`, which also proves the emulator uses nothing above ARMv8.0. Compared per case: x0-x30, SP, NZCV, V0-V31, FPSR, memory, outcome. Not `-cpu max` for the others: it also runs FPRCVT, FAMINMAX and FP8 words in the same opcode space. qemu is the truth here, not an A13.
+
+RESULT_TABLE
+
+Rules: 203 checks. Threads, real host threads on `-cpu cortex-a53`: LDADDAL trap x4 + user LL/SC x4: 1,600,000 of 1,600,000; a lock taken by CASAL trap x4 + LL/SC x4, plain counter under it: 1,600,000 of 1,600,000; CASP trap x4 + LDAXP/STLXP x4: pair 1,600,000 and 1,600,000, 0 torn reads.
+
+What this does not show: the kernel path (recovery table, `vm_fault`, exception delivery, PCB layout, preemption) never ran. PAC has no real truth for PACGA beyond its low half: our rule is 0, the same as the tool. FZ16 cannot be set on an A73: it is tested through the test's own FPCR value.
+
+### 7.3 Found while closing the gap
+
+| Finding | Where | State |
+|---|---|---|
+| The old PACEMU self-check expected `0xD71F0C41` to decode, and the decoder did not: PAC emulation turned itself off at first use | iOS 26 kernel | Fixed: new decoder |
+| PACEMU gave PACGA a hash, the tool gives 0: signer and checker would disagree | iOS 26 kernel | Fixed: 0 |
+| **topaz 0081 put its LSE fault ranges after `copyio_recover_table_end`: `find_copyio_recovery_entry` misses them, so a fault in an emulated LSE word (first write to a COW page) panics** [V: section 0x60 bytes longer than the table, 4 entries, in both kernels] | iOS 26 and **iOS 16** | Fixed on iOS 26 (table end moved). iOS 16 unchanged as ordered: owner decision |
+| topaz 0081 LDUMIN: `csel` uses the flags of `cmp w1, #6`, not of the values: the result is always the operand [V source; not run] | iOS 26 and **iOS 16** | iOS 26 does not reach it unless `laurelemu=0`. iOS 16 unchanged: owner decision |
+| 0081 sends a bad pointer to EXC_BAD_INSTRUCTION, not EXC_BAD_ACCESS | both | iOS 26 emulator: correct |
+
+### 7.4 What the kernel still does not do
+
+AMX, SME, SVE, MTE words: SIGILL with the word in the log, as section 7 asks. CSSC, BF16, I8MM, FlagM: not emulated; they stay gated or SIGILL. A 64-bit LDAPR unaligned across 16 bytes: alignment fault, as the architecture.
+
 ## 8. User-client ABI against iOS 16 (Step 4)
 
 `op10tool a64-abi` finds each `bl`/`b` to `IOConnectCall*`/`__mac_syscall` (direct, stub or island) and reads immediates before the call. [V, static, on
@@ -400,6 +450,56 @@ So: 23F84 backboardd with no Metal device gets **no renderer from its server pat
 | (a) Metal with metal2vulkan + Turnip (zeta's way) | The compositor's pipelines on `a6xx_gen1_low`: no sampler min/max, no HW multiview, GMEM 132 KiB [V metal.md section 3] | zeta: Home on A660, slow. On the A610 under iOS 16: apps run, backboardd does not [V plan.md, metal.md]. Glass and blur load the GPU far more [I] |
 | (b) Hook `AccelServer::renderer` in backboardd: make a `GLESContext` as iOS 16 did, on our EAGL shim | An injected dylib + symbol addresses for this build; `IOMFBDisplay::get_ctx` and others still want Metal | **Nobody tried** [U]. `GLESContext` has 46 symbols and may have gone stale. iOS 26 shaders for Liquid Glass have no GL form [I] |
 | (c) `CA::OGL::SW` software renderer | A hook that makes `SWContext` | Works on the CPU only. FP16 per pixel (section 4.3). Far too slow for full screen [I] |
+
+### 8.2 Layouts read from 23F84, and the kernel port (2026-11-02) [V static, against 20H392; `op10tool a64-dis`]. Never run
+
+Everything below is in the iOS 26 kernel only (`post/9000`). A value the framework reads is [V] for the offset; what the framework does with it at run time was not traced.
+
+**IOMobileFramebuffer SwapEnd.** `kern_SwapEnd` sends `obj + 24`, 0x588 bytes. So record offset = object offset - 24.
+
+| Field | 20H392 | 23F84 | Source |
+|---|---|---|---|
+| swap id | 0x50 | 0x98 | `kern_SwapBegin`: `str w8, [x19, #104]` / `#176` |
+| surface id, 4 layers | 0x54 | 0x9c | `kern_SwapSetLayer` |
+| rect a, 16 bytes per layer | 0x64 | 0xac | same |
+| rect b | 0xc4 | 0x10c | same |
+| enabled layer mask | 0x104 | 0x14c | same |
+
+Each is 0x48 later. The kernel copies these 5 fields into its old layout. **[U]: all other new bytes: not read by the kernel.** Selector 90 `kern_GetDotPitchFloat` gives the same integer as 28 [V: the library runs `ucvtf`]. Selectors 2, 87-89, 91, 92: accepted with zeros [U what they need]. `SWEET_FB_DOT_PITCH` stays 458.
+
+**IOSurface lock result.** Size 0xa68 -> **0xc68**. `_ioSurfaceClientCreateWithLockResult` copies it to client + 0x70 (20H392: + 0x68). Offsets from `_IOSurfaceClientGet*`:
+
+| Field | 20H392 | 23F84 |
+|---|---|---|
+| pixels, state, timestamps | 0, 8, 0x10 | same |
+| id | 0x18 u32 | same |
+| alloc size | 0x1c u32 | 0x20 **u64** |
+| width, height, bytes per row, offset | 0x20, 0x24, 0x28, 0x2c u32 | 0x28, 0x30, 0x38, 0x40 **u64** |
+| pixel format | 0x30 | 0x48 |
+| plane count | 0x38 | 0x58 |
+| bytes per element, element w, h | 0x40, 0x42, 0x43 | 0x60, 0x62, 0x63 |
+| cache mode | 0x44 | 0x64 |
+| parent id | 0x50 | 0x70 |
+| slice count | 0x54 | 0x74 |
+| protection options | 0x60 | 0x80 |
+| plane array, stride | 0x68, 0x80 | 0x88, **0x98** |
+| plane width, height | +0, +4 u32 | +0, +8 u64 |
+| plane offset, bytes per row, size | +0xc, +0x10, +0x14 u32 | +0x18, +0x20, +0x28 u64 |
+| plane bytes per element, w, h | +0x18, +0x1a, +0x1b | +0x30, +0x32, +0x33 |
+
+**[U]: rec + 0x50 in 23F84** (20H392 + 0x34 was a second alloc size): no accessor found; the kernel writes the alloc size there. Other accessors (compression, tile data, component names) read zero, as the kernel never filled them: the same as on iOS 16 [I].
+
+**Limits, selector 13.** Struct 0x18 -> 0x28; the ABI version u16 moved from +0x16 to +0x22, the framework compares it with 1 [V `__ioSurfaceConnectInternal`]. Alignments stay at +0, +4.
+
+**Values, selectors 9, 10, 11.** Header 8 -> 12 bytes: id +0, flag +8 (20H392: 9 bytes for selector 10, now 13). Reply of selector 10: seed +4, data +12.
+
+**Bulk attachments, selector 27.** 136 -> 160 bytes: fields 0x84 bytes, size +0x88, mask +0x90, id +0x98. In the state page at +0x34 (was +0x30, 0x70 bytes). 22 dirty bits, ranges from `_getDirtyMask`. YCbCr matrix: the framework now reads a byte at state + 110, which the kernel also writes. Timestamps: 5, and the detach code at +40 (was 4, +32) [V accessors]; the kernel keeps its area size.
+
+Selectors 54 `SetCoreVideoBridgedKeys`, 58 `QueryTransactionList`, 36 with a new scalar: the default path, accepted with zeros [U]. BindAccel offset +8 in the state page: not re-read in 23F84 [U].
+
+**AppleKeyStore.** No function moved to another selector in the kernel's list [V]: `a64-abi` showed "?" because 23F84 sets `w1` before an outlined call; disassembly gives 3, 6, 7, 11, 14, 17, 31 as before. The extra scalar is the last one in `aks_unlock_device`, `aks_unlock_bag`, `aks_set_system_with_passcode`, `aks_change_secret_epilogue` and `aks_change_secret_with_kek` [V]; the kernel reads the same positions, so **no code change**. New selectors 133-162: unsupported, logged. **[U]: 141, 144, 149, 151: cryptex seal calls. If a process needs them the first boot shows it.** `aks_create_bag` (2) and other outlined calls: argument shapes not re-read [U].
+
+**IOSurfaceAccelerator, IOGPU, Sandbox:** not ported here. Section 8 has the changes. IOGPU is only for a real IOGPU driver.
 
 ## 9. Zeta's state, and the next best real option
 

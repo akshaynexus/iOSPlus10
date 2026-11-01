@@ -68,7 +68,7 @@ echo "ios26-root: 4. fsck.hfsplus -f -n"
 # This Linux fsck says "Volume header needs minor repair" on every journaled volume, also a fresh mkfs.hfsplus -J, and still after its own repair [V 2026-11-02]. That one line is
 # not a finding. Any other indented line (an invalid or overlapped or illegal thing) is.
 fsck_rc=0; fsck.hfsplus -f -n "$IMG" 2>&1 | tee "$W/fsck.txt" | tail -12 || true
-if grep -E '^   [A-Z]' "$W/fsck.txt" | grep -vE '^   (Volume header needs minor repair|The volume name is)' | grep -q .; then fsck_rc=1; fi
+if grep -E '^   [A-Z]' "$W/fsck.txt" | grep -vE '^   (Volume header needs minor repair|The volume name is|Executing fsck_hfs)' | grep -q .; then fsck_rc=1; fi
 grep -q 'Checking volume information' "$W/fsck.txt" || fsck_rc=1
 echo "ios26-root: fsck findings beyond the known header line: $fsck_rc (0 = none)"
 echo "ios26-root: 5. read-only kernel mount"

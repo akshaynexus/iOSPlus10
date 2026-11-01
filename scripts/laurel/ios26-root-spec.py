@@ -239,8 +239,9 @@ def tweaks(t, a):
         with tempfile.NamedTemporaryFile(suffix='.plist') as tf:
             tf.write(t.read(j))
             tf.flush()
-            r1 = jetsam_widgets.patch(tf.name, 64)
-            r2 = jetsam_widgets.patch_daemon(tf.name, 'com.apple.lsd', 64)
+            short = os.path.basename(tf.name)
+            r1 = jetsam_widgets.patch(tf.name, 64).replace(short, '')
+            r2 = jetsam_widgets.patch_daemon(tf.name, 'com.apple.lsd', 64).replace(short, '')
             with open(tf.name, 'rb') as g:
                 t.write(j, g.read())
         t.audit('jetsam ' + os.path.basename(j).decode(), 'applied', f'{r1}; {r2}')
@@ -301,12 +302,15 @@ def im4p_payload(b):
 
 def trust_entries(path):
     p = im4p_payload(open(path, 'rb').read())
-    if struct.unpack('<I', p[:4])[0] != 1:
-        raise SystemExit(f'{path}: trust cache version {struct.unpack("<I", p[:4])[0]}')
+    ver = struct.unpack('<I', p[:4])[0]
+    # version 1: cdhash, hash type, flags. Version 2 (23F84): also constraint category and a reserved byte
+    size = {1: 22, 2: 24}.get(ver)
+    if size is None:
+        raise SystemExit(f'{path}: trust cache version {ver}')
     count = struct.unpack('<I', p[20:24])[0]
-    if len(p) != 24 + 22 * count:
+    if len(p) != 24 + size * count:
         raise SystemExit(f'{path}: {count} entries, {len(p)} bytes')
-    return {p[24 + i * 22:44 + i * 22]: p[44 + i * 22:46 + i * 22] for i in range(count)}
+    return {p[24 + i * size:44 + i * size]: p[44 + i * size:24 + (i + 1) * size].ljust(4, b'\0') for i in range(count)}
 
 
 def cd_hash_of(cd):
@@ -385,7 +389,7 @@ def trust(t, a, work):
             attr = ent.get(oh)
             if attr is None:
                 missing_attr += 1
-                attr = b'\x02\x00'
+                attr = b'\x02\x00\x00\x00'
             ent[nh] = attr
             new.append(nh)
             added += 1
@@ -406,13 +410,13 @@ def trust(t, a, work):
                     attr = ent.get(h, attr)
                 if attr is None:
                     missing_attr += 1
-                    attr = b'\x02\x00'
+                    attr = b'\x02\x00\x00\x00'
                 for h in nhs:
                     if h not in ent:
                         added += 1
                     ent[h] = attr
                     new.append(h)
-    blob = struct.pack('<I', 1) + b'\0' * 16 + struct.pack('<I', len(ent))
+    blob = struct.pack('<I', 2) + b'\0' * 16 + struct.pack('<I', len(ent))
     for h in sorted(ent):
         blob += h + ent[h]
     os.makedirs(os.path.join(work, 'trust'), exist_ok=True)
@@ -484,7 +488,7 @@ def main():
     t.n[cdir] = Node('l', 0o755, dirmeta.uid, dirmeta.gid, dirmeta.mtime, b'/' + DYLD)
     print(f'{cn} cache files at /{DYLD.decode()}')
     # cryptex-only paths at their root path
-    linked = 0
+    linked = through = 0
     for c in (b'OS', b'App'):
         pre = PRE + b'/' + c + b'/'
         for k in sorted(k for k in t.n if k.startswith(pre)):
@@ -492,13 +496,18 @@ def main():
             n = t.n[k]
             if n.kind == 'd' or rel in t.n or rel == DYLD:
                 continue
+            # a parent that is a symlink in the OS volume: it points into the cryptex, so the root path works already
+            parts = rel.split(b'/')
+            if any(b'/'.join(parts[:i]) in t.n and t.n[b'/'.join(parts[:i])].kind != 'd' for i in range(1, len(parts))):
+                through += 1
+                continue
             t.mkdirs(os.path.dirname(rel))
             if n.kind == 'l':
                 t.n[rel] = Node('l', n.mode, n.uid, n.gid, n.mtime, n.src)
             else:
                 t.n[rel] = Node('l', 0o755, 0, 0, n.mtime, b'/' + k)
             linked += 1
-    print(f'{linked} cryptex-only paths linked at the root')
+    print(f'{linked} cryptex-only paths linked at the root; {through} reached through a symlink of the OS volume')
     print('tweaks:')
     tweaks(t, a)
     trust(t, a, work)

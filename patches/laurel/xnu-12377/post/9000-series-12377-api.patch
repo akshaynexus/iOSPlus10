@@ -861,10 +861,10 @@ index 8800687..ae7f995 100644
  #define __USES_V_CRYPTO_INTRINSICS 0
 diff --git a/osfmk/arm64/laurel_abi.c b/osfmk/arm64/laurel_abi.c
 new file mode 100644
-index 0000000..109f61f
+index 0000000..178316c
 --- /dev/null
 +++ b/osfmk/arm64/laurel_abi.c
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,198 @@
 +/*
 + * laurel_abi.c: the Mi A3 kernel (Kryo 260, ARMv8.0, no PAC) runs the arm64e-derived iOS 26 userland.
 + *
@@ -1027,6 +1027,8 @@ index 0000000..109f61f
 +
 +	switch (a64emu_run(&c, word, &o)) {
 +	case A64EMU_OK:
++		/* the kernel's exclusive pair is over; no monitor state goes back to EL0 (no clrex in locore.s, this path says it itself) */
++		__asm__ volatile ("clrex");
 +		os_atomic_inc(&laurel_emu_count[o.cls], relaxed);
 +		laurel_emu_report();
 +		return true;
