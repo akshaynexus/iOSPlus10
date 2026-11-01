@@ -1,7 +1,8 @@
 # Bluetooth on the Mi A3 (laurel 2600)
 
 Patch: `patches/laurel/xnu/2600-laurel-bluetooth-wcn3990.patch` (range 2600-2699 is this area).
-Status: builds (kernel-linux.sh, 228/228 patches, 0 LSE). **Not tested on the phone yet.**
+Status: first boot 2026-11-01 05:52 stopped at `off: QUP1 SE9 FIFO interface is off (GSI only)`; fix in this patch
+(section "SE9 left in GSI mode"). Fix not booted yet.
 [V] = read in source, [I] = inference.
 
 ## Files (one step per file, each < 310 lines)
@@ -29,7 +30,8 @@ anchors exist before 2700, which applies after 2600).
 Syntax check of one file in a few seconds: `scripts/laurel/kcheck.sh bsd/dev/laurel_bt_uart.c` (records the
 compiler line once: `scripts/bg.sh kcheck scripts/laurel/kcheck.sh --record`).
 Edit loop: change the files in `out/laurel-kernel/xnu-src/...`, copy them to a `b/` tree next to an `a/` tree of
-the two conf files, `diff -ruN a b` below the description paragraph of the patch. `kernel-linux.sh` clones the
+the two conf files, `diff -ruN a b` below the description paragraph of the patch. For new files only:
+`scripts/laurel/patch-refresh-new.py PATCH TREE bsd/dev/laurel_bt_clk.c ...` replaces their hunks in place. `kernel-linux.sh` clones the
 xnu tree again on every run: make the patch first.
 
 ## Hardware [V external/laurel-kernel-los]
@@ -52,7 +54,8 @@ xnu tree again on every run: make the patch first.
 2. Rails: `topaz_soc_map()` (maps APCS, the RPM doorbell), then `topaz_rpm_write(set 0 and 1, "ldoa", n, "uv"/"swen")`
    for L9 1.8 V, L16 1.8 V, L17 1.304 V, L23 3.0 V. A refusal is logged and the bring-up goes on (the rails can be on
    from the bootloader); the EDL version answer is the check.
-3. UART: votes, CBCR checks, DFS levels, SE9 firmware = UART (protocol 2), FIFO interface on, pins, GENI FIFO mode,
+3. UART: votes, CBCR checks, DFS levels, SE9 firmware = UART (protocol 2), FIFO interface on (clear
+   SE_FIFO_IF_DISABLE when the boot left GSI, read back), pins, GENI FIFO mode,
    115200 8N1 RTS/CTS.
 4. Power: 0xC0 at 2400 baud, 0xFC at 115200 (flow control off for each pulse), 100 ms boot.
 5. EDL version `0xfc00 {0x19}` -> vendor event `04 ff len 00 02 product patch rom soc` (3 tries).
@@ -69,10 +72,45 @@ xnu tree again on every run: make the patch first.
 
 Firmware is read at run time from the phone; it is never in git.
 
+## SE9 left in GSI mode (boot 2026-11-01 05:52)
+
+Seen [V logs/usblog-20261101-001446.txt, 05:52:35-05:52:41]:
+
+```
+LAUREL BT: power: L9 1.8 V, L16 1.8 V, L17 1.304 V, L23 3.0 V on
+LAUREL BT: clk: vote 0x4020 -> 0x43c4020, s4 RCG cfg 0x100000, DFS off (0 levels, top 0 Hz)
+LAUREL BT: geni: QUP 0x20000000 (oversampling 32), SE9 FW 0x20c, FIFO 16/32 words
+LAUREL BT: off: QUP1 SE9 FIFO interface is off (GSI only)
+```
+
+- [V] The firmware in SE9 is UART (0x20c: protocol 2, version 0x0c). No firmware load is necessary.
+- [V Linux 6.18 external/laurel-mainline drivers/soc/qcom/qcom-geni-se.c] `GENI_IF_DISABLE_RO` (0x64) only shows the
+  writable `SE_FIFO_IF_DISABLE` (SE + 0x2008, bit 0). `geni_load_se_fw` writes it last: clear for FIFO, set for GSI,
+  after `geni_configure_xfer_mode` (FIFO: `SE_GENI_DMA_MODE_EN` bit 0 = 0, `SE_GSI_EVENT_EN` = 0) and `SE_DMA_IF_EN`
+  (0x2004) bit 0 = 1. `geni_load_se_firmware` always uses FIFO for UART. So the bit is a soft setting (case a), not a
+  GSI-only firmware.
+- [V 4.14 external/laurel-kernel-los] `msm_geni_serial.c` (`qcom,msm-geni-serial-hs`, SE9 `qupv3_se9_4uart`) never reads
+  the bit and uses SE_DMA for the BT port (`xfer_mode = SE_DMA`, console = FIFO). Only `spi-geni-qcom.c` reads it
+  (FIFO off -> GSI only). There is no GSI path for the UART in either kernel.
+- [I] The boot (XBL QUP loader or the UEFI GpiDxe/I2CDxe that Mu runs) leaves SE9 for GSI. Which one is not known.
+- Fix (`laurel_bt_clk.c` `fifo_if_on`, between the GENI check and the pins): when the RO bit is set, cancel the
+  sequencers, DMA mode off, GSI events off, DMA_IF_EN on, clear SE_FIFO_IF_DISABLE, read the RO bit again. Bit still set
+  = `off: QUP1 SE9 FIFO interface stays off (GSI only)` (only Bluetooth). Line: `geni: FIFO interface was off ...`.
+- [I] Risk: if a TrustZone xPU protects SE + 0x2000, the write is ignored (then the self-check turns BT off) or gives a
+  bus error. Linux writes the same register from the HLOS on other SoCs. Kill switch `laurelbt=0` skips all of BT.
+- Clock for 3000000 baud [V gcc-trinket.c, laurel_bt_uart.c]: DFS is off, so `lbt_uart_set_baud` uses the Linux table
+  (`ftbl_gcc_qupv3_wrap0_s0_clk_src`). 3000000 x 32 = 96 MHz = table entry `F(96000000, P_GPLL0_OUT_AUX2, 1, 8, 25)`
+  (GPLL0 aux2 300 MHz x 8/25, src 2 in `gcc_parent_map_1`), divider 1, exact. 115200 x 32 = 7.3728 MHz (entry 1,
+  divider 1). `lbt_hci_speed` programs 96 MHz and back before it sends 0xfc48 (a stuck RCG update = `off: no QUP clock
+  for the speed`, the chip keeps 115200). [I] 96 MHz needs the CX corner LOW (`rate_max` LOWER 75 MHz); no CX vote is
+  made, the boot corner is used.
+
 ## Log lines
 
 - `LAUREL BT: on: WCN3990 product 0x000a rom 0x0201, crbtfw21.tlv + crnv21.bin, 3000000 baud, BD_ADDR ..` [expected,
   not seen yet]
+- `LAUREL BT: geni: FIFO interface was off (GSI from boot): FIFO_IF_DISABLE 0x1 -> 0, DMA_IF_EN 0x1, RO 0` [expected;
+  only when the boot left GSI]. A RO value with bit 0 set = `off: QUP1 SE9 FIFO interface stays off (GSI only)`.
 - `LAUREL BT: off: <reason>`, e.g. `no EDL version answer (chip not powered?)`, `QUP1 SE9 has no UART firmware`,
   `QUP1 core/AHB clocks do not run`, `file not in the partition`, `laurelbt=0`.
 - Step lines: `LAUREL BT: clk: ...`, `geni: ...`, `uart: ...`, `power: ...`, `chip: ...`, `fw: ...`, `ios: client ...`.
@@ -108,9 +146,8 @@ and the boot are not touched.
 - TopazRpm refuses when Mu or ABL used the RPM FIFOs ("FIFOs used since boot"): then only the boot state of
   the rails counts. If L17/L23 are off, the result is `off: no EDL version answer`.
 - `topaz_soc_map()` waits up to 60 s for the modem partition (TopazModem's probe); the apcs mapping is made either way.
-- The DFS levels that XBL left in the s4 RCG are not known: 3000000 baud needs a 96 MHz level (oversampling 32).
-  Without one: `off: no QUP clock for the speed` (the chip is not told to change speed).
-- SE9 may hold no UART firmware if XBL did not load it (`off: QUP1 SE9 has no UART firmware`).
+- [V boot 05:52] DFS is off in the s4 RCG: the RCG table path is used (96 MHz for 3000000 baud, section above).
+- [V boot 05:52] SE9 holds UART firmware 0x20c, but in GSI mode: fixed by `fifo_if_on` (section above).
 - Area audio (`t3/laurel-audio-speaker-adsp` root-audio.sh) moves BTAudioHALPlugin.driver to HAL.disabled; with
   Bluetooth audio it may have to stay (negroni: `BTAUDIO=1`). Merge note: both root.sh hooks go after the
   boldtext line.

@@ -5,6 +5,9 @@ firmware extract, UEFI image). **NOT BOOTED.**
 Update 2026-11-01 06:40 (branch t3/laurel-gpu-upstream-opt): **2154 stage-1 SMMU tables** (on by default, fallback =
 pass-through), compiled-target flags + full ARMv8.0 check + dSYMs, eagl still-surface patch, upstream check
 ([upstream-2026-11-01.md](upstream-2026-11-01.md)). Built on Linux, **NOT BOOTED**.
+
+Status 2026-11-01 06:10: first boot with the zap files (05:52) hung in the zap SCM calls; 2153 fixes it (section "Zap hang").
+2153 is built on Linux, **NOT BOOTED**. Before: 05:10 review fixes on top of laurel-int-1 (areas A, C, H).
 Labels: [V] read in source or measured on the host, [I] inference, [U] unknown.
 
 ## What runs where
@@ -88,6 +91,11 @@ no fallback.
   screen-sized ones while GL is loaded, then LAUREL SURF wired pages, then contiguous below 4 GiB (mask 0xFFFFC000) only
   while the GPU is wanted, then ordinary memory. Trade-off [I]: wired-page surfaces are not shared with the GPU (not
   contiguous); eagl copies them into textures (topaz measured 3 ms of an 8 ms frame for glBindTexture copies).
+- **2153** `laurel-gpu-zap-scm-lock` (fix of the 05:52 zap hang, section "Zap hang" below): every GPU SCM call goes
+  through `topaz_scm()` (the one TrustZone lock of 2404, resume loop and EBUSY retry inside it); `PAS_IS_SUPPORTED(13)`
+  first (a failed call = GPU off at once); no `PAS_SHUTDOWN` before `init_image` (only after a failure that follows a good
+  `init_image`); metadata in the TopazModem pool (0xE0000000+, where TZ read the ADSP and modem metadata), the GPU pool only
+  when that pool is off; each SCM step logs its time.
 - **2152** `laurel-fps-line`: `SWEET FPS:` is part of the GPU report: only while GL is loaded, 6 lines every second, then
   one every 10 s while frames come; `sweetfps=0` turns it off.
 
@@ -233,8 +241,10 @@ check`. (On the kernel it finds 21 "instructions" in the K256 SHA table data in 
 ## Log lines to check (first boot)
 
 1. `TopazGPU: kernel RAM 0xe1004000+0xcc000000, GPU pool 0xc0000000+0x20000000 (ADT laurel-ram-reserved)`
-2. `TopazGPU: powered: RBBM_STATUS ...`, `TopazGPU: zap: metadata at 0xc...`, `zap: init_image and mem_setup ok`,
-   `TopazGPU: zap auth_and_reset: 0/0`
+2. `TopazGPU: powered: RBBM_STATUS ...`,
+   `TopazGPU: zap: PAS 13 is_supported 0/<x1> (0 ms), metadata 6860 bytes at 0xe00xx000 (modem pool)`,
+   `TopazGPU: zap: init_image and mem_setup ok (N ms), copying the segment`, `TopazGPU: zap auth_and_reset: 0/0 (N ms)`
+   (2153; without the modem pool: `... at 0xc0000000 (GPU pool: modem pool off)`)
 3. `TopazGPU: SMMU TTBR0 ... (identity)`, `TopazGPU: cp: SQE 32304 bytes (own, version 01001f0b)`, `CP up (ME_INIT, SET_SECURE_MODE 0), core 300 MHz`,
    `TopazGPU: fence test ok in N us`
 4. **`LAUREL GPU: on: Adreno 610 chip 0x06010000, core 300 MHz, zap PAS 13 at 0x57515000 (own a610_zap, 6860+2096 bytes), SQE own 01001f0b, SMMU stage 1, pool 0xc0000000+0x20000000; RedwoodGPU published`**
@@ -255,6 +265,47 @@ check`. (On the kernel it finds 21 "instructions" in the K256 SHA table data in 
 If the zap step fails with `TrustZone refused the zap shader: init_image ...`: the mdt is not this phone's (check
 `SHA256SUMS` against the vendor image) or the PAS id differs; `mem_setup`: the carve-out address is wrong (read the
 live FDT `gpu_zap` region).
+
+## Zap hang (boot 2026-11-01 05:52, fixed by 2153)
+
+Observed [V `logs/usblog-20261101-001446.txt`, the first boot with the zap files]:
+- 05:52:41 `TopazGPU: powered: RBBM_STATUS 00000001`, `TopazGPU: zap: metadata at 0xc0000000`, then no TopazGPU / LAUREL GPU
+  line until the log ends at 05:57:25. The next line in 2150 after the SCM calls is `zap: init_image and mem_setup ok` (or a
+  refusal line): so one of `PIL_SHUTDOWN`, `PIL_INIT_IMAGE`, `PIL_MEM_SETUP` (PAS 13) did not return.
+- Same second: ADSP PAS (TopazAudio) init_image ok (meta at 0xe0000000), mem_setup ok, auth_and_reset ok in 165 ms; modem PAS
+  init_image (meta at 0xe0003000) and mem_setup ok, `TopazModem: segments loaded` printed **one line after** the GPU's metadata
+  line, then the modem's `auth_and_reset: ret=0 res=0 resumes=35`. So the GPU's SCM calls went in while the modem's long
+  auth_and_reset was running and coming back to the normal world 35 times (INTERRUPTED, resumed with the session in x6).
+- Later SCM calls from other CPUs worked: `SCM assign e000e000+300000` (05:52:41), `53300000+4000`, `53304000+1fc000` (05:52:43).
+- `LAUREL THERMAL` after the hang: silver busy 0-3 %, gold 3-13 % (busiest core, HOST_CPU_LOAD_INFO ticks). A thread that spins in
+  the normal world (the old resume loop, max 100000 SMCs) shows as one 100 % core. None did.
+- backboardd fell back to the CPU renderer; first frame 68 s after boot (29 s in the 05:29 boot without zap files).
+
+Source [V]:
+- TopazAdreno.cpp (topaz 0901 + 2150) had its own `smc()`/`scm()` with **no lock**. 2404 put one lock over every TrustZone call
+  of TopazModem (`scm_call()`: the call + its resume loop, EBUSY retry) and TopazAudio uses it through `topaz_scm()`; TopazAdreno
+  was not changed. The only other `smc #0` users are PSCI (SweetCPU.cpp) and the reboot path (laurel_reboot.c).
+- Downstream 4.14 (`external/laurel-kernel-los/drivers/soc/qcom/scm.c`): `scm_call2` holds `scm_lock` (one global mutex) over
+  `__scm_call_armv8_64`, whose `do { smc } while (r0 == SCM_INTERRUPTED)` resume loop runs inside the lock; SCM_V2_EBUSY (-12) is
+  retried 30 ms later. Mainline `qcom_scm-smc.c` does the same with `qcom_scm_lock`.
+- Downstream zap load (`adreno_a6xx.c` -> `subsystem_get("a610_zap")` -> `subsys-pil-tz.c`, `qcom,pil-tz-generic`, pas-id 13):
+  init_image (metadata in a fresh DMA buffer, arginfo 2 args VAL+RW) -> mem_setup -> segments -> auth_and_reset. No
+  PAS_SHUTDOWN before init_image; PAS_SHUTDOWN only in `deinit_image` after a failure or at `subsystem_put`. It votes the crypto
+  bus bandwidth (`scm_pas_enable_bw`) around init/auth; the ADSP and modem PAS on this phone worked without that vote.
+  kgsl loads the zap only when the SMMU has a secure context bank (`mmu.secured`; trinket has one, SID 2), so the zap is needed.
+
+Cause: two CPUs in the TrustZone PIL service at the same time [V: the timing and the missing lock; I: what TZ does inside].
+The CPU with the GPU's call stayed in the secure world [I: the zero-busy thermal lines; a stuck CPU gets no normal-world timer
+ticks]: the GPU thread never returned, one of the 8 CPUs was lost (slower boot), and `op10tool ctl ping` got no pong after
+05:52:41 [I: ctl work queued on that CPU or waiting for an IPI to it; not measured]. The metadata at 0xC0000000 is not shown to be
+a cause (TZ answered nothing about it); 2153 moves it to the pool TZ read in the same boot anyway.
+
+Fix (2153, zap path only): see "Kernel patches". The lock does not abort a call that TZ never ends (no SMC can be aborted); it
+removes the parallel entry that started it. Residual risk [I]: if PAS 13 alone ever hangs inside TZ, the lock stays held and the
+modem/ADSP SCM calls after it wait too; the log then ends at `zap: PAS 13 is_supported` or `init_image` with no time printed.
+PAS sequences of different peripherals may interleave call by call (the ADSP auth_and_reset ran between the modem's
+init_image and auth_and_reset in this boot and both worked [V]), as Linux boots PIL peripherals in parallel; so 2153 does not wait
+for the modem or ADSP.
 
 ## Recovery (no UI after the GPU root)
 

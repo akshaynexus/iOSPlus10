@@ -1,4 +1,4 @@
-laurel 2700: vibration on the Mi A3. PMI632 LDO vibrator (ERM, SPMI SID 3, base 0x5700, 3000 mV) over an own SPMI lane (APID of PPID 0x357, EE 0 owner check; observer EXT_READL + rw-channel EXT_WRITEL; no state shared with sweet_spmi.c). Motor thread: overdrive start 3544 mV / 30 ms (Qualcomm default, kill switch laurel_haptic_od=0), minimum on-time 30 ms (50 ms without overdrive), duty limit (heat budget: 70 % sustainable, cut at 4000 ms, resume at 2000 ms), watchdog thread call (motor on + thread stalled 1 s = off). iOS: "vibrator" IOService (LaurelVibrator.cpp, port of negroni 0301: FigVibrator hertz_millisecs/repeat/stop) and /dev/redwood-haptic (topaz audio_plugin.c Actuator samples, S16LE mono 48 kHz -> 2 ms blocks -> on-windows). IODeviceTree:/product/haptics closed-loop = 1 (negroni 0302) only when the root has RedwoodAudio.driver + VirtualAudio.plugin. Self-check at start: 'LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)' or 'LAUREL HAPTIC: off: <why>'; 'LAUREL HAPTIC UI: on|off: <why>'. Kill switch laurel_haptic=0, laurel_haptic_ui=0. Details: docs/laurel_sprout/haptics.md.
+laurel 2700: vibration on the Mi A3. PMI632 LDO vibrator (ERM, SPMI SID 3, base 0x5700, 3000 mV) over an own SPMI lane (APID of PPID 0x357, EE 0 owner check; observer EXT_READL + rw-channel EXT_WRITEL; no state shared with sweet_spmi.c). Motor thread: overdrive start 3544 mV / 30 ms (Qualcomm default, kill switch laurel_haptic_od=0), minimum on-time 30 ms (50 ms without overdrive), duty limit (heat budget: 70 % sustainable, cut at 4000 ms, resume at 2000 ms), watchdog thread call (motor on + thread stalled 1 s = off). iOS: "vibrator" IOService (LaurelVibrator.cpp, port of negroni 0301: FigVibrator hertz_millisecs/repeat/stop) and /dev/redwood-haptic (topaz audio_plugin.c Actuator samples, S16LE mono 48 kHz -> 2 ms blocks -> on-windows). IODeviceTree:/product/haptics closed-loop = 1 (negroni 0302) only when the root has RedwoodAudio.driver + VirtualAudio.plugin. Self-check at start: 'LAUREL HAPTIC: on: PMI632 LDO vib SID3 0x5700 3000 mV (...)' or 'LAUREL HAPTIC: off: <why>'; 'LAUREL HAPTIC UI: on|off: <why>'. Repeat bounds (2026-11-01, endless vibration: iOS FigVibrator loops {[on, off], repeat} until its client stops it; a dictionary without TotalDuration gets a 31-day total): a repeat stops 60 s after its request when no new request comes (kill switch laurel_vib_cap=0 = the old 5 min), and a power/volume key press stops a running repeat (sweet_keys.c -> laurel_vibrator_key). Each request shape is logged once with the caller ('LAUREL VIBRATOR: request kind N from PROC: SHAPE'). Kill switch laurel_haptic=0, laurel_haptic_ui=0. Details: docs/laurel_sprout/haptics.md.
 
 diff -ruN a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files	2026-11-01 04:19:08.720234572 +0530
@@ -800,6 +800,25 @@ diff -ruN a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
 +	return 0;
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -15,6 +15,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern void laurel_vibrator_key(int key, int down);   /* laurel 2700: a key press silences a vibration loop */
+ void sweet_keys_init(void);
+ 
+ /* topaz (SM6225, sm6125.dtsi spmi_bus; PM6125 USID 0): PON 0x800, Vol+ = GPIO5 */
+@@ -117,6 +118,7 @@
+ 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
++				laurel_vibrator_key(k, state[k]);
+ 			}
+ 		}
+ 		keys_wait();
 diff -ruN a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
 --- a/iokit/conf/files.arm64	2026-11-01 04:19:08.723234601 +0530
 +++ b/iokit/conf/files.arm64	2026-11-01 04:23:22.363427382 +0530
@@ -813,8 +832,8 @@ diff -ruN a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
  iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
 diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrator.cpp
 --- a/iokit/Kernel/arm/LaurelVibrator.cpp	1970-01-01 05:30:00.000000000 +0530
-+++ b/iokit/Kernel/arm/LaurelVibrator.cpp	2026-11-01 04:23:21.881646320 +0530
-@@ -0,0 +1,239 @@
++++ b/iokit/Kernel/arm/LaurelVibrator.cpp
+@@ -0,0 +1,433 @@
 +/*
 + * laurel_sprout (Xiaomi Mi A3): the legacy iOS "vibrator" IOService (laurel 2700, port of negroni 0301)
 + * on the PMI632 LDO ERM motor of bsd/dev/laurel_haptic.c, and the closed-loop node (negroni 0302).
@@ -827,8 +846,24 @@ diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrato
 + * No user client. Here: pairs (state, ms); state = a dictionary with "intensity" > 0 or true = on,
 + * false or intensity 0 = off (an ERM on an LDO has no amplitude control worth using: lower voltages
 + * do not start it reliably). The steps run on our work loop timer; an on step asks
-+ * laurel_haptic_vib(ms + 10) so back-to-back on steps do not gap. repeat loops for at most 5 min;
++ * laurel_haptic_vib(ms + 10) so back-to-back on steps do not gap.
 + * laurel_haptic.c adds the minimum on-time, the overdrive start and the duty limit.
++ *
++ * Repeat (2026-11-01, endless vibration on the first SpringBoard boot) [V 20H392 MediaExperience,
++ * unslid]: FigVibrator's play (0x195a42a48) sends {[on, off], repeat = true} when the total is longer
++ * than one period, and the only end is a one-shot dispatch timer at the total (0x195a42fc0..0x195a43004,
++ * handler 0x195a43b34 sends the CFNumber 0). For a pattern dictionary without TotalDuration the caller
++ * (0x195a94448) sets the total to 2678400 s (31 days): the loop ends only when the iOS client calls
++ * FigVibratorStop (0x195a940dc). On the phone one such start came (400 ms on / 100 ms off, repeat 1)
++ * and no request after it, so the motor ran until the reboot. Two bounds, both features of this file:
++ *   - a repeating pattern stops LV_REPEAT_CAP_MS (60 s) after its start request when no new request
++ *     comes. 60 s: an incoming call rings at most about 30 s before the network diverts it (3GPP
++ *     no-reply timer 5..30 s), the Emergency SOS countdown is shorter; 60 s is 2x that margin [I].
++ *     Kill switch laurel_vib_cap=0 (then the old 5 min bound).
++ *   - a power or volume key press (bsd/dev/sweet_keys.c -> laurel_vibrator_key) stops a running
++ *     repeat, as iOS silences a ring with these keys. One-shot patterns are not touched.
++ * Each new request kind (its shape: classes, keys, element types) is logged once with the caller
++ * process, so the next boot shows what iOS sends.
 + *
 + * laurel_haptic_publish_closed_loop(): IODeviceTree:/product/haptics {closed-loop 1,
 + * supports-3rd-party-haptics 1} (D22 ADT values). Called by laurel_haptic.c only when the root has the
@@ -847,41 +882,57 @@ diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrato
 +#include <IOKit/IODeviceTreeSupport.h>
 +#include <libkern/c++/OSArray.h>
 +#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSCollectionIterator.h>
 +#include <libkern/c++/OSData.h>
 +#include <libkern/c++/OSDictionary.h>
 +#include <libkern/c++/OSNumber.h>
 +#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSSymbol.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <stdarg.h>
 +
 +extern "C" int laurel_haptic_start(void);
 +extern "C" int laurel_haptic_vib(uint32_t ms);
 +extern "C" int laurel_haptic_publish_closed_loop(void);
++extern "C" void laurel_vibrator_key(int key, int down);  /* bsd/dev/sweet_keys.c, keys thread */
++extern "C" void proc_selfname(char *buf, int size);
 +
 +#define LV_MAX_STEPS        64u
 +#define LV_MAX_STEP_MS      10000u
-+#define LV_REPEAT_MAX_MS    (5u * 60u * 1000u)
++#define LV_REPEAT_MAX_MS    (5u * 60u * 1000u)  /* with laurel_vib_cap=0 */
++#define LV_REPEAT_CAP_MS    60000u              /* a repeat with no new request ends here */
 +#define LV_LOG              16u
++#define LV_KINDS            16u                 /* request shapes logged once each */
 +
 +class LaurelVibrator : public IOService {
 +	OSDeclareDefaultStructors(LaurelVibrator);
 +public:
 +	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 +	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	void keyPress(int key);
 +private:
 +	struct Step { uint32_t ms; bool on; };
 +	IOWorkLoop *fLoop;
 +	IOCommandGate *fGate;
 +	IOTimerEventSource *fTimer;
 +	Step fSteps[LV_MAX_STEPS];
-+	uint32_t fCount, fNext, fElapsedMs, fCalls;
++	uint32_t fCount, fNext, fElapsedMs, fCalls, fCapMs, fCycleMs;
++	uint32_t fKind[LV_KINDS], fKinds;
 +	bool fRepeat, fRunning;
 +	static IOReturn gatedSet(OSObject *owner, void *arg0, void *, void *, void *);
++	static IOReturn gatedKey(OSObject *owner, void *arg0, void *, void *, void *);
 +	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
 +	IOReturn apply(OSObject *properties);
++	void logKind(OSObject *properties);
++	void onKey(int key);
 +	void runStep();
 +	void stopAll();
 +};
 +
 +OSDefineMetaClassAndStructors(LaurelVibrator, IOService);
++
++static LaurelVibrator * volatile gLaurelVibrator;
 +
 +bool
 +LaurelVibrator::start(IOService *provider)
@@ -892,6 +943,9 @@ diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrato
 +	if (!IOService::start(provider)) {
 +		return false;
 +	}
++	uint32_t cap = 1;
++	(void)PE_parse_boot_argn("laurel_vib_cap", &cap, sizeof(cap));
++	fCapMs = cap ? LV_REPEAT_CAP_MS : LV_REPEAT_MAX_MS;
 +	fLoop = IOWorkLoop::workLoop();
 +	fGate = fLoop ? IOCommandGate::commandGate(this, gatedSet) : NULL;
 +	fTimer = fLoop ? IOTimerEventSource::timerEventSource(this, timerFired) : NULL;
@@ -903,7 +957,10 @@ diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrato
 +	setName("vibrator");
 +	setProperty("LaurelHaptics", "PMI632 LDO ERM, SID3 0x5700 (laurel 2700)");
 +	registerService();
-+	IOLog("LAUREL VIBRATOR: on: published \"vibrator\" (FigVibrator hertz_millisecs)\n");
++	gLaurelVibrator = this;
++	IOLog("LAUREL VIBRATOR: on: published \"vibrator\" (FigVibrator hertz_millisecs; a repeat ends after %u s "
++	    "without a new request%s, or at a power/volume key press)\n", fCapMs / 1000u,
++	    cap ? "" : " (laurel_vib_cap=0)");
 +	return true;
 +}
 +
@@ -922,6 +979,111 @@ diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrato
 +	return static_cast<LaurelVibrator *>(owner)->apply(static_cast<OSObject *>(arg0));
 +}
 +
++/* ---- one log line per request shape ------------------------------------------------------------- */
++
++struct LVText {
++	char *p;
++	size_t n, used;
++	uint32_t hash;                  /* FNV-1a of the shape (types only, no values) */
++};
++
++static void lv_put(LVText &t, bool shape, const char *fmt, ...) __printflike(3, 4);
++
++static void
++lv_put(LVText &t, bool shape, const char *fmt, ...)
++{
++	char tmp[64];
++	va_list ap;
++	va_start(ap, fmt);
++	int w = vsnprintf(tmp, sizeof(tmp), fmt, ap);
++	va_end(ap);
++	if (w < 0) {
++		return;
++	}
++	size_t len = (size_t)w < sizeof(tmp) ? (size_t)w : sizeof(tmp) - 1;
++	if (shape) {
++		for (size_t i = 0; i < len; i++) {
++			t.hash = (t.hash ^ (uint8_t)tmp[i]) * 16777619u;
++		}
++	}
++	if (t.used + 1 < t.n) {
++		size_t room = t.n - 1 - t.used;
++		size_t c = len < room ? len : room;
++		memcpy(t.p + t.used, tmp, c);
++		t.used += c;
++		t.p[t.used] = 0;
++	}
++}
++
++/* shape text goes into the hash; values only into the line */
++static void
++lv_describe(LVText &t, OSObject *o, unsigned depth)
++{
++	if (o == NULL) {
++		lv_put(t, true, "null");
++	} else if (OSNumber *n = OSDynamicCast(OSNumber, o)) {
++		lv_put(t, true, "N");
++		lv_put(t, false, "%llu", n->unsigned64BitValue());
++	} else if (o == kOSBooleanTrue || o == kOSBooleanFalse) {
++		lv_put(t, true, "B");
++		lv_put(t, false, "%s", o == kOSBooleanTrue ? ":true" : ":false");
++	} else if (OSString *s = OSDynamicCast(OSString, o)) {
++		lv_put(t, true, "S");
++		lv_put(t, false, "\"%.24s\"", s->getCStringNoCopy());
++	} else if (OSData *d = OSDynamicCast(OSData, o)) {
++		lv_put(t, true, "D");
++		lv_put(t, false, "%u", d->getLength());
++	} else if (OSArray *a = OSDynamicCast(OSArray, o)) {
++		unsigned c = a->getCount();
++		lv_put(t, true, "[");
++		lv_put(t, false, "%u:", c);
++		for (unsigned i = 0; i < c && i < 4u && depth < 3u; i++) {
++			if (i) {
++				lv_put(t, true, ",");
++			}
++			lv_describe(t, a->getObject(i), depth + 1);
++		}
++		lv_put(t, false, "%s", c > 4u ? ",..." : "");
++		lv_put(t, true, "]");
++	} else if (OSDictionary *dict = OSDynamicCast(OSDictionary, o)) {
++		lv_put(t, true, "{");
++		OSCollectionIterator *it = depth < 3u ? OSCollectionIterator::withCollection(dict) : NULL;
++		bool first = true;
++		while (OSSymbol *k = it ? OSDynamicCast(OSSymbol, it->getNextObject()) : NULL) {
++			lv_put(t, true, "%s%.24s=", first ? "" : ",", k->getCStringNoCopy());
++			lv_describe(t, dict->getObject(k), depth + 1);
++			first = false;
++		}
++		OSSafeReleaseNULL(it);
++		lv_put(t, true, "}");
++	} else {
++		lv_put(t, true, "%s", o->getMetaClass()->getClassName());
++	}
++}
++
++void
++LaurelVibrator::logKind(OSObject *properties)
++{
++	char line[200];
++	LVText t = { line, sizeof(line), 0, 2166136261u };
++	line[0] = 0;
++	lv_describe(t, properties, 0);
++	for (uint32_t i = 0; i < fKinds; i++) {
++		if (fKind[i] == t.hash) {
++			return;
++		}
++	}
++	if (fKinds >= LV_KINDS) {
++		return;
++	}
++	fKind[fKinds++] = t.hash;
++	char who[32];
++	proc_selfname(who, sizeof(who));
++	IOLog("LAUREL VIBRATOR: request kind %u from %s: %s\n", fKinds, who, line);
++}
++
++/* ---- requests ----------------------------------------------------------------------------------- */
++
 +void
 +LaurelVibrator::stopAll()
 +{
@@ -934,9 +1096,10 @@ diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrato
 +LaurelVibrator::apply(OSObject *properties)
 +{
 +	bool log = fCalls++ < LV_LOG;
++	logKind(properties);
 +	if (OSDynamicCast(OSNumber, properties)) {
 +		if (log) {
-+			IOLog("LAUREL VIBRATOR: stop\n");
++			IOLog("LAUREL VIBRATOR: stop%s\n", fRunning ? " (a pattern was running)" : "");
 +		}
 +		stopAll();
 +		return kIOReturnSuccess;
@@ -945,13 +1108,14 @@ diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrato
 +	OSArray *a = d ? OSDynamicCast(OSArray, d->getObject("hertz_millisecs")) : NULL;
 +	if (!a) {
 +		if (log) {
-+			IOLog("LAUREL VIBRATOR: unknown request (%s)\n", properties ? properties->getMetaClass()->getClassName() : "null");
++			IOLog("LAUREL VIBRATOR: unknown request (%s): ignored\n",
++			    properties ? properties->getMetaClass()->getClassName() : "null");
 +		}
 +		return kIOReturnBadArgument;
 +	}
 +	stopAll();
 +	fCount = 0;
-+	uint32_t onMs = 0;
++	uint32_t onMs = 0, cycle = 0;
 +	for (unsigned i = 0; i + 1 < a->getCount() && fCount < LV_MAX_STEPS; i += 2) {
 +		OSObject *state = a->getObject(i);
 +		OSNumber *ms = OSDynamicCast(OSNumber, a->getObject(i + 1));
@@ -973,13 +1137,16 @@ diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrato
 +		fSteps[fCount].ms = t == 0 ? 1 : t > LV_MAX_STEP_MS ? LV_MAX_STEP_MS : (uint32_t)t;
 +		fSteps[fCount].on = on;
 +		onMs += on ? fSteps[fCount].ms : 0;
++		cycle += fSteps[fCount].ms;
 +		fCount++;
 +	}
 +	OSBoolean *rep = OSDynamicCast(OSBoolean, d->getObject("repeat"));
 +	fRepeat = rep == kOSBooleanTrue;
++	fCycleMs = cycle;
 +	if (log) {
-+		IOLog("LAUREL VIBRATOR: start: %u steps (first %u ms %s, %u ms on in all), repeat %d\n", fCount,
-+		    fCount ? fSteps[0].ms : 0, fCount && fSteps[0].on ? "on" : "off", onMs, fRepeat);
++		IOLog("LAUREL VIBRATOR: start: %u steps (first %u ms %s, %u ms on of %u ms), repeat %d%s\n", fCount,
++		    fCount ? fSteps[0].ms : 0, fCount && fSteps[0].on ? "on" : "off", onMs, cycle, fRepeat,
++		    fRepeat ? " (until iOS stops it, a key press, or the cap)" : "");
 +	}
 +	if (fCount == 0) {
 +		return kIOReturnBadArgument;
@@ -997,8 +1164,14 @@ diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrato
 +	if (!fRunning) {
 +		return;
 +	}
++	if (fRepeat && fElapsedMs >= fCapMs) {
++		IOLog("LAUREL VIBRATOR: repeat stopped: %u s and no new request (iOS sent no stop; %u cycles of %u ms)\n",
++		    fElapsedMs / 1000u, fCycleMs ? fElapsedMs / fCycleMs : 0, fCycleMs);
++		stopAll();
++		return;
++	}
 +	if (fNext >= fCount) {
-+		if (!fRepeat || fElapsedMs >= LV_REPEAT_MAX_MS) {
++		if (!fRepeat) {
 +			stopAll();
 +			return;
 +		}
@@ -1016,6 +1189,46 @@ diff -ruN a/iokit/Kernel/arm/LaurelVibrator.cpp b/iokit/Kernel/arm/LaurelVibrato
 +LaurelVibrator::timerFired(OSObject *owner, IOTimerEventSource *)
 +{
 +	static_cast<LaurelVibrator *>(owner)->runStep();
++}
++
++/* ---- keys --------------------------------------------------------------------------------------- */
++
++void
++LaurelVibrator::onKey(int k)
++{
++	if (!fRunning || !fRepeat) {
++		return;                         /* only a loop is silenced; a one-shot ends by itself */
++	}
++	static const char *const names[3] = { "power", "volume up", "volume down" };
++	IOLog("LAUREL VIBRATOR: repeat stopped by the %s key after %u ms (as iOS silences a ring)\n",
++	    k >= 0 && k < 3 ? names[k] : "?", fElapsedMs);
++	stopAll();
++}
++
++IOReturn
++LaurelVibrator::gatedKey(OSObject *owner, void *arg0, void *, void *, void *)
++{
++	static_cast<LaurelVibrator *>(owner)->onKey((int)(intptr_t)arg0);
++	return kIOReturnSuccess;
++}
++
++void
++LaurelVibrator::keyPress(int k)
++{
++	if (fGate) {
++		(void)fGate->runAction(gatedKey, (void *)(intptr_t)k);
++	}
++}
++
++/* the keys thread (no locks held), on every key change */
++extern "C" void
++laurel_vibrator_key(int key, int down)
++{
++	LaurelVibrator *v = gLaurelVibrator;
++	if (v == NULL || !down) {
++		return;
++	}
++	v->keyPress(key);
 +}
 +
 +/* IODeviceTree:/product/haptics as in the D22 ADT; 0 = published (or there already). */

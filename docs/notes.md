@@ -4075,3 +4075,60 @@ Details: `docs/laurel_sprout/battery-power.md`.
   counts 21 decodes in the K256 SHA table (data in __text), so the kernel keeps its own LSE check.
 - [V] metal2vulkan's cache defaults are a 256 MiB memo per process and 25 GiB on disk; flame/0018 + metal-env.sh cap them at
   32 MiB / 1 GiB for the Mi A3 (negroni unchanged).
+
+## Mi A3: endless vibration on the first SpringBoard boot = an iOS loop with no stop; 2700 repeat cap + key stop (2026-11-01 05:50, vibration agent, branch t3/laurel-vibration-endless)
+- Details: docs/laurel_sprout/haptics.md section "Repeat".
+- [V log 05:29] One `LAUREL VIBRATOR: start: 2 steps (first 400 ms on, 400 ms on in all), repeat 1` at 05:29:45 (2 s after three
+  power presses, same second as `exec AccessibilityUIServer`), then 146 plays (one per about 0.54 s, three duty cuts) and no other
+  vibrator request until the reboot at 05:31:10. The only stop was the one at 05:29:20, before the start.
+- [V 20H392 MediaExperience] FigVibrator play 0x195a42a48 sends `repeat = true` when total > period and ends the loop only with a
+  one-shot dispatch timer at the total (handler 0x195a43b34 -> stop 0x195a428b4 = bare CFNumber 0 from ctx+0x28). A pattern
+  dictionary without TotalDuration gets total 0x4a237a00 = 2678400 s (31 days) at 0x195a94448: then only the client's
+  FigVibratorStop (0x195a940dc) ends it. iOS 16 has no other stop form.
+- [V] D22 SystemSoundVibrationPatterns.plist: on 0.4 / off 0.1 = `Default` (TotalDuration 0.5, plays without repeat). ToneLibrary
+  has `Looped`/`OnDuration`/`OffDuration` strings and no `TotalDuration`.
+- [I] The client that started the loop and lost its stop is not known (triple press = Accessibility Shortcut or Emergency SOS;
+  or an alert that waits for its sound to end, with no audio route on laurel). The kernel now logs each request shape once with
+  the caller process (`LAUREL VIBRATOR: request kind K from PROC: SHAPE`).
+- Fix in 2700 (LaurelVibrator.cpp + one call in sweet_keys.c): a repeat stops 60 s after its request when no new request comes
+  (kill switch `laurel_vib_cap=0` = old 5 min), and a power/volume key-down stops a running repeat. 60 s [I]: a ring ends within
+  about 30 s (network no-reply divert, 3GPP 5..30 s), so 2x margin; an alarm's vibration also stops at 60 s on this port.
+- How to read the 20H392 shared cache on Linux (no ipsw): `apfs-fuse -o ro ~/op10-apple/20H392/087-86593-047.dmg out/mnt-cryptex`
+  (the Cryptex holds `System/Library/Caches/com.apple.dyld/`), then `scripts/debug/dsc-dis.py DIR dis VADDR LEN` (llvm-objdump, real
+  vaddrs), `read`, `str TEXT` (string -> vaddr + image). Root plists come from the HFS+ root without a mount:
+  `7z x ~/op10-apple/laurel-ios16-root.img 'iOSRoot/...'`.
+- Built 05:48 in the worktree: 241/241 patches applied, 0 LSE, no new warnings, kernel.development.sweet.4k sha256 42e4ea88...
+  NOT BOOTED. Next boot: expect `LAUREL VIBRATOR: on: ... a repeat ends after 60 s ...`, `request kind` lines, and a repeat ends
+  with `repeat stopped by the <key> key` or `repeat stopped: 60 s and no new request`.
+
+## Mi A3: Bluetooth stopped at "QUP1 SE9 FIFO interface is off (GSI only)"; 2600 turns the FIFO interface on (2026-11-01, BT agent, branch t3/laurel-bt-se9-fifo)
+- Details: docs/laurel_sprout/bluetooth.md section "SE9 left in GSI mode".
+- [V log 05:52:41] Rails on, clocks run (vote 0x43c4020), s4 DFS off, QUP 0x20000000, SE9 FW 0x20c (UART), FIFO 16/32 words,
+  then `off: QUP1 SE9 FIFO interface is off (GSI only)` (GENI_IF_DISABLE_RO 0x64 bit 0 = 1).
+- [V Linux 6.18 qcom-geni-se.c geni_load_se_fw] 0x64 only shows SE_FIFO_IF_DISABLE (SE + 0x2008, writable; clear = FIFO,
+  set = GSI), written last after the mode registers and SE_DMA_IF_EN (0x2004). UART is always FIFO there. So: a soft
+  setting, no firmware load and no GPI DMA path are necessary.
+- [V 4.14 laurel kernel] msm_geni_serial (BT port) uses SE_DMA and never reads the bit; only spi-geni-qcom reads it.
+- [I] Who sets GSI (XBL QUP loader or a UEFI DXE) is not known.
+- Fix: `fifo_if_on` in laurel_bt_clk.c (cancel, DMA mode off, GSI events off, DMA_IF_EN on, clear 0x2008 bit 0, read 0x64
+  again; still set = BT off only). Line `LAUREL BT: geni: FIFO interface was off (GSI from boot): ...`.
+- [V gcc-trinket.c] DFS off is not a problem: 3000000 x 32 = 96 MHz is an exact entry of the RCG table (GPLL0 aux2 300 MHz
+  x 8/25); lbt_hci_speed sets it and back before 0xfc48. [I] needs CX >= LOW (no CX vote made).
+- [I] Risk: an xPU on SE + 0x2000 can ignore the write (self-check -> off) or give a bus error. Kill switch laurelbt=0.
+- New helper: `scripts/laurel/patch-refresh-new.py PATCH TREE FILE...` replaces new-file hunks of a patch in place.
+## Mi A3: GPU start hung in the zap SCM calls = TopazAdreno's SMC without the TrustZone lock; 2153 (2026-11-01 06:10, branch t3/laurel-gpu-zap-hang)
+- Details: docs/laurel_sprout/gpu.md section "Zap hang".
+- [V log 05:52:41, usblog-20261101-001446] `TopazGPU: zap: metadata at 0xc0000000`, then no GPU line for > 4 min. The modem's
+  `segments loaded` comes one line later, then its `auth_and_reset ... resumes=35`: the GPU's PIL calls (PAS 13) went into
+  TrustZone while the modem's long call was interrupted/resumed. Other CPUs' SCM calls worked after it (assign at 05:52:41/43).
+- [V] `LAUREL THERMAL` after the hang: no core busy (silver 0-3 %, gold 3-13 %): no normal-world spin.
+- [V source] TopazAdreno.cpp (topaz 0901 + 2150) had its own unlocked smc()/scm(); 2404 locked only TopazModem's scm_call()
+  (TopazAudio uses it via topaz_scm()). Downstream scm.c (scm_lock) and mainline (qcom_scm_lock) hold one mutex over the SMC and
+  its INTERRUPTED resume loop. Downstream pil-tz never sends PAS_SHUTDOWN before init_image.
+- [I] The CPU with the GPU call stayed in the secure world (no ticks = 0 % busy); this lost CPU explains the slower first frame
+  (68 s, 29 s without zap files) and the dead `op10tool ctl ping` after 05:52:41 (not measured).
+- [V] On this TZ, PAS_IS_SUPPORTED answers x1 = 0 for the modem's PAS 4, which loads: x1 is no gate; only x0 != 0 is.
+- Fix 2153 (zap path only, TopazAdreno.cpp): all GPU SCM calls through topaz_scm() (shared lock + EBUSY retry); is_supported
+  first (fail = `LAUREL GPU: off: zap shader failed: TrustZone has no PIL call for PAS 13: ...` at once); no shutdown before
+  init_image, shutdown after a later failure; metadata in the TopazModem pool (0xE0000000+), GPU pool only as fallback; ms times.
+- Rule for new drivers: never `smc #0` for a SIP/PIL call outside topaz_scm() (PSCI and the reboot path are the exceptions).
