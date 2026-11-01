@@ -4322,3 +4322,26 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Next: boot (boot_b flash, owner), expect `LAUREL CAMERA: on: rear IMX586 (0x1a id 0x0586), depth ..., front S5KGD1 ...,
   ultrawide S5K4H7 ...`; a NACK on one slot = check that slot's rail/reset pins. Then step 2 (RDI frames), step 3 (/dev node),
   step 4 (iOS plug-in from userland/camera).
+
+## Mi A3: kernel log over the UI = the fbcon drew into surface 1 (2026-11-01 07:45 boot, branch t3/laurel-fb-text2, 2870)
+- Details: docs/laurel_sprout/gpu.md "Kernel log over the UI".
+- [V log 07:45:24] 2104 was active (`LAUREL FB HANDOFF: on`, `swap 2 shows surface 1 ... scanning it directly`); every swap
+  direct, no copy-path swap. GL frames alternate: `1 picture copied out` (glReadPixels into surface 1 = 0x5c000000) and
+  `1 drawn in place` (GPU-pool surface 2). One frame in two on the panel is 0x5c000000.
+- [V source + boot-args] `serial=3` + ADT `/sweet-fbcon` (reg 0x5c000000) -> arm_init switches the kernel console to the serial
+  ops; the only serial device is the fbcon (pe_serial.c), which draws every printf/IOLog line as white-on-black 2x text
+  straight into 0x5c000000. The video console (2104's shadow) gets no text with serial=3. So each kernel line was drawn
+  into the iOS frame on the panel until the next surface-1 frame; activity = more lines = more text.
+- Rule: with serial=3 "the kernel console" is the fbcon, not the video console. Any check that the console is off the
+  panel must look at both (`laurel_fbcon_state()` + `sweet_console_on_shadow()`).
+- Rule: the pipe's scanout address is written only by `AppleCLCD::scanFrom`, which now gets what the buffer holds; a new
+  caller must pass an honest LAUREL_SCAN_* value. Kernel text after the first iOS frame is refused (panic excepted).
+- Checked [V source], no other way: one pipe (VIG0/DMA0/DMA1 found at start), no other code maps the MDP; no wake/redraw
+  path scans a kernel buffer; sweet_early off when a serial device exists; kprintf ring-only (2014); no initialize_screen
+  after start; GPU-pool / scanout-slot surfaces zeroed at creation; 0x5c000000 cleared at AppleCLCD start (2104).
+- [I] The frozen boot screen after AppleCLCD start (shadow got no text) was the same cause; 2870 makes it follow the log.
+- Fix 2870 (after 2850: last patch on SweetFramebuffer.cpp): fbcon into the shadow at AppleCLCD start (muted at the first
+  iOS frame if it could not move; a panic draws and shows the buffer); scanout owner + refusal; shadow and flip buffers
+  cleared to black after the first iOS frame. Kill switch fbowner=0 (the fbcon move stays).
+- Built 08:08 in the worktree: 251/251 patches, 0 LSE, no warnings in the changed files, kernel.development.sweet.4k sha256
+  31d2ccf00451ff1726174c1cc4e56fae14106a209aa4869a9b6d15030e9a948a. NOT BOOTED.
