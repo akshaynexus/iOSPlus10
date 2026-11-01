@@ -1041,3 +1041,6 @@ Cause proven [V]: wired guard refused 239 surface creates from 23:31:25 (chronod
 Done: kernel 2916 (kept buffers first, 70 % for the app on the screen + chronod, `LAUREL WIRED: who:`, request 0x7b, seed moves of GPU writes push nothing), eagl 0006 + Mesa 0003 (`LAUREL BLANK`). Build: 308/308, 0 LSE, kernel 37beb26901de0f20; libtopaz-gl b1cd72f0449f97ed.
 Next (owner decides any flash): kernel + matched root; open Maps with the USB log on, no `usbnetcfg down`; read the table in gpu.md.
 
+
+## Rule from 2026-11-01 23:42: no flashing the Mi A3 unless the owner asks
+The owner moved to a custom Android ROM (`../customronxiaomi`). Code work and pushes continue. Older "next: flash" lines in this file wait for the owner's request. Next test when asked: `scripts/laurel/update-phone.sh` (no userdata wipe; never yet run on a phone) or `root-flash-test.sh` (erases /private/var). Wired-guard fix 2916 and root parts (eagl 0005/0006, Mesa 0002/0003, the RenderBox answer) have not run together on the phone.
