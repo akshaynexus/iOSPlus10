@@ -199,9 +199,36 @@ video_stabilization_type(id self, SEL selector)
 
 static IMP original_audio_source_start;
 
+/*
+ * laurel: the silence filled in by the audio source: off. This was the 2-2.7 GB of every `low swap' kill of mediaserverd, and most of a Gold core.
+ * [V boot 22:08, pid 384 22:19:20-23] the guard: VM tag 3 (malloc large) 293 -> 2013 MB in 3.5 s, about 600 MB/s, busiest thread 69-94 % in memset <- CMCapture+0x37bfc
+ * = -[BWAudioSourceNode _createSampleBufferForTimestampedAudioBufferList:audioBufferIndex:] + 236 (bzero of [buffer + 0x38] x bytes-per-frame) <- CMCapture+0xdbb8 =
+ * -[BWAudioSourceNode _generateSamples]. [V disassembly] [buffer + 0x38] is the silence the render callback (0x1a1ef081c) puts before a buffer when the audio's host time moved past
+ * the expected one by more than _ioprocTimeStampDeltaLimit: (the jump) x (the sample rate) frames. It is skipped when _silenceFramesFillingDisabled is set, the first test of that
+ * block and of -_generateSilenceIfNeeded too. What makes the time stamps of this phone's capture audio jump is [U]: the sound is right without it, the buffers just keep their own times.
+ * These methods are objc_direct (x0 tested, x1 not used, called by bl): the ivar is the only handle. By name: gone, one line and nothing else changes.
+ */
+static void
+audio_source_no_silence(id self)
+{
+	Ivar flag = class_getInstanceVariable(object_getClass(self), "_silenceFramesFillingDisabled");
+	static bool said;
+
+	if (flag != NULL) {
+		*(volatile BOOL *)((char *)self + ivar_getOffset(flag)) = YES;
+	}
+	if (!said) {
+		said = true;
+		say(flag != NULL ? "negroni: camera hooks: capture audio: no silence is filled in (its allocations killed mediaserverd)\n" :
+		    "negroni: camera hooks: capture audio: silence filling: off not possible: no _silenceFramesFillingDisabled in this BWAudioSourceNode\n");
+	}
+}
+
 static BOOL
 audio_source_start(id self, SEL selector, id *error)
 {
+	audio_source_no_silence(self);  /* (before the audio unit's first callback) */
+
 	BOOL started = ((BOOL (*)(id, SEL, id *))original_audio_source_start)(self, selector, error);
 	id made = error != NULL ? *error : NULL;
 	static bool said;
@@ -321,6 +348,52 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  */
 static IMP original_emit_sample_buffer;
 
+/*
+ * laurel: how long a moving picture has been on its way when each node hands it on: from the frame's end (its time stamp). The nodes' class names are constant strings of the images: a
+ * small table, no lock (a lost count once in a while is nothing for a line a second). Photographs (3000 wide and more) and sound are left out.
+ */
+#define GRAPH_NODES 12
+struct graph_node {
+	const char *name;
+	uint32_t count;
+	uint64_t ticks;
+};
+static struct graph_node graph_nodes[GRAPH_NODES];
+
+static void
+graph_note(id output, CMSampleBufferRef sample_buffer)
+{
+	CVImageBufferRef image = CMSampleBufferGetImageBuffer(sample_buffer);
+	CMTime pts;
+	id node;
+	const char *name;
+	uint64_t at, now;
+
+	if (image == NULL || CVPixelBufferGetWidth(image) >= 3000) {
+		return;
+	}
+	node = ((id (*)(id, SEL))objc_msgSend)(output, sel_registerName("node"));
+	name = node != nil ? object_getClassName(node) : NULL;
+	if (name == NULL) {
+		return;
+	}
+	pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
+	at = (pts.flags & kCMTimeFlags_Valid) ? CMClockConvertHostTimeToSystemUnits(pts) : 0;
+	now = mach_absolute_time();
+	for (unsigned i = 0; i < GRAPH_NODES; i++) {
+		struct graph_node *n = &graph_nodes[i];
+
+		if (n->name == NULL) {
+			n->name = name;
+		}
+		if (n->name == name) {
+			n->count++;
+			n->ticks += at != 0 && now > at ? now - at : 0;
+			return;
+		}
+	}
+}
+
 static void
 emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 {
@@ -334,7 +407,43 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		return;
 	}
 	time_photo_encoder(self, sample_buffer);
+	graph_note(self, sample_buffer);
 	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);
+}
+
+/* laurel: the speed line's nodes (camera_device.c): pictures each node gave in the last second and how old they were by then, oldest node first */
+void negronicam_graph_text(char *out, size_t size);
+
+void
+negronicam_graph_text(char *out, size_t size)
+{
+	size_t at = (size_t)snprintf(out, size, "nodes:");
+
+	for (unsigned pass = 0; pass < GRAPH_NODES; pass++) {
+		struct graph_node *best = NULL;
+
+		for (unsigned i = 0; i < GRAPH_NODES; i++) {
+			struct graph_node *n = &graph_nodes[i];
+
+			if (n->name != NULL && n->count != 0 && (best == NULL || n->ticks / n->count > best->ticks / best->count)) {
+				best = n;
+			}
+		}
+		if (best == NULL) {
+			break;
+		}
+		if (at + 2 < size) {
+			static mach_timebase_info_data_t tb;
+
+			if (tb.denom == 0) {
+				mach_timebase_info(&tb);
+			}
+			at += (size_t)snprintf(out + at, size - at, " %s %u x %.1f ms", best->name + (strncmp(best->name, "BW", 2) == 0 ? 2 : 0), best->count,
+			    (double)(best->ticks / best->count) * tb.numer / tb.denom / 1e6);
+		}
+		best->count = 0;
+		best->ticks = 0;
+	}
 }
 
 /*

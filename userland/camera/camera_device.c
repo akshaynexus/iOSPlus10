@@ -59,6 +59,7 @@
 #include <unistd.h>
 #include <os/log.h>
 #include "camera_isp.h"
+#include "camera_fast.h"
 
 /* userland/laurel/camera/build.sh (Mi A3): the rear IMX586 at 1280x720, kernel patch 2772 (docs/laurel_sprout/camera.md) */
 #ifdef LAUREL_CAMERA
@@ -88,20 +89,22 @@ void negronicam_memory_guard_session(void);
 void
 negronicam_console(const char *line, size_t n)
 {
-	static int console = -2;
+	/*
+	 * laurel: opened for each line. [V boots 18:40, 22:08] the first mediaserverd (pid 28) says its hooks at load, then not one line for its whole life, though its frames run and its
+	 * Metal bundle's first open at 22:13:57 prints. The fd of the load no longer reaches the console [I]; which step ended it is [U]. The lines are few.
+	 */
+	int console = open("/dev/console", O_WRONLY | O_NOCTTY | O_CLOEXEC);
 
-	if (console == -2) {
-		console = open("/dev/console", O_WRONLY | O_NOCTTY | O_CLOEXEC);
-	}
 	if (console >= 0) {
 		(void)write(console, line, n);
+		close(console);
 	}
 }
 
 void
 negronicam_say(const char *format, ...)
 {
-	char line[400];
+	char line[1100];        /* (the guard's stack: 400 cut it inside the third frame [V boot 22:08]) */
 	va_list ap;
 	int n = snprintf(line, sizeof(line), CAM_LINE_PREFIX);
 
@@ -533,6 +536,8 @@ struct stream {
 	int             torch;          /* Mi A3: /dev/laureltorch, opened at the first TorchLevel */
 	bool            torch_lit;      /* this stream lit it */
 	uint64_t        frames, stills_given;
+	bool            said_fast;
+	struct speed    speed;          /* laurel: the clock of the worker's stages, one line a second */
 };
 
 static struct stream *
@@ -963,7 +968,37 @@ struct render_job {
 	bool still;                     /* the photograph: every pixel of the sensor (isp_render_still_nv12) */
 	const uint8_t *cells;           /* Mi A3: the frame's cells as R, G, B (isp_render_cells), scaled up to the picture */
 	uint32_t cells_w, cells_h;
+	struct isp_fast *fast;          /* laurel: the moving picture from whole rows of cells (camera_fast.c) */
 };
+
+static void
+fast_cells_piece(void *context, size_t i)
+{
+	struct render_job *j = context;
+	uint32_t rows = (j->fast->ch + j->pieces - 1) / j->pieces, first = (uint32_t)i * rows;
+
+	isp_fast_cells(j->fast, j->isp, j->f, j->raw, first, first + rows, j->format == PF_420V);
+}
+
+static void
+fast_sharpen_piece(void *context, size_t i)
+{
+	struct render_job *j = context;
+	uint32_t rows = (j->fast->ch + j->pieces - 1) / j->pieces, first = (uint32_t)i * rows;
+
+	isp_fast_sharpen(j->fast, first, first + rows, j->gain);
+}
+
+static void
+fast_scale_piece(void *context, size_t i)
+{
+	struct render_job *j = context;
+	uint32_t rows = (j->height + j->pieces - 1) / j->pieces, first = (uint32_t)i * rows & ~1u, end = (first + rows + 1) & ~1u;
+
+	end = i + 1 == j->pieces || end > j->height ? j->height : end;
+	isp_fast_scale(j->fast, CVPixelBufferGetBaseAddressOfPlane(j->pb, 0), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0), CVPixelBufferGetBaseAddressOfPlane(j->pb, 1),
+	    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end, j->gain);
+}
 
 /* the cell image of one frame, in pieces (isp_scale_nv12 then scales it, 8-bit, far cheaper than the ISP's float path) */
 static void
@@ -1206,12 +1241,39 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		isp = &view;
 	}
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, 0, is_still, NULL, 0, 0 };
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, 0, is_still, NULL, 0, 0, NULL };
 	uint64_t began = mach_absolute_time();
 
 	job.gain = (f->gain_unity ? (float)f->gain / f->gain_unity : 1) * isp->digital;
 
 #ifdef LAUREL_CAMERA
+	static struct isp_fast fast;    /* (a stream at a time; 4 KB of tables, the planes when the first picture needs them) */
+
+	if (!job.still && pf != PF_BGRA && isp_fast_begin(&fast, isp, f, width, height, s->speed.step ? s->speed.step : 1)) {
+		uint64_t t0 = mach_absolute_time(), t1, t2;
+
+		/* (pieces taken as threads get free: a Silver core takes fewer rows than a Gold one and nobody waits for it long) */
+		job.fast = &fast;
+		job.pieces = 12;
+		if (fast.sequence != f->sequence) {
+			fast.sequence = f->sequence;
+			dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, fast_cells_piece);
+			t1 = mach_absolute_time();
+			dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, fast_sharpen_piece);
+			t2 = mach_absolute_time();
+			s->speed.ticks[SPEED_CELLS] += t1 - t0;
+			s->speed.ticks[SPEED_SHARPEN] += t2 - t1;
+			t0 = t2;
+		}
+		dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, fast_scale_piece);
+		s->speed.ticks[SPEED_SCALE] += mach_absolute_time() - t0;
+		s->speed.rendered++;
+		if (!s->said_fast) {
+			s->said_fast = true;
+			say("preview: whole rows of cells: %ux%u cells to %ux%u, every %u", fast.cw, fast.ch, width, height, fast.step);
+		}
+		goto rendered;
+	}
 	/*
 	 * The 1280x720 frame has 640x360 cells; the graph's preview is 1504x1128 or so. Every pixel of that through the float
 	 * path of render_line() would take the whole CPU: the cells go through the colour pipe once, then 8-bit bilinear.
@@ -1251,6 +1313,9 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		say("%s: %ux%u made of every pixel in %.0f ms", out->name, width, height,
 		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
 	}
+#ifdef LAUREL_CAMERA
+rendered:
+#endif
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
 	CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
@@ -1273,7 +1338,11 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		CVPixelBufferRelease(pb);
 		return false;
 	}
+	uint64_t handler_began = mach_absolute_time();
+
 	((pixel_buffer_handler)out->handler)(pb, pts);
+	s->speed.ticks[SPEED_HANDLER] += mach_absolute_time() - handler_began;
+	s->speed.given++;
 	/*
 	 * The moving picture's buffers are kept for HELD frames after they are given. The preview's pool
 	 * would otherwise hand a buffer straight back -- the graph lets go of it as soon as it has passed
@@ -1657,6 +1726,58 @@ turned_file(void)
 	return turned_flag;
 }
 
+/*
+ * laurel: one line a second while frames run: frames the sensor made, read and given, then each stage's time on the worker's clock, what the graph's nodes did with them
+ * (media_hooks.c) and the thread that is busiest now. The display is in backboardd: its own `redwood-gl: N frames in 10000 ms' line.
+ */
+extern void negronicam_graph_text(char *out, size_t size);
+extern void negronicam_busiest_text(char *out, size_t size);
+
+static void
+speed_line(struct stream *s, const struct negronicam_frame *f, const struct isp *isp)
+{
+	struct speed *z = &s->speed;
+	uint64_t now = mach_absolute_time();
+	static mach_timebase_info_data_t tb;
+	uint64_t ns;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	if (z->began == 0) {
+		z->began = now;
+		return;
+	}
+	ns = (now - z->began) * tb.numer / tb.denom;
+	if (ns < 1000000000ull) {
+		return;
+	}
+	uint32_t frames = z->frames ? z->frames : 1, rendered = z->rendered ? z->rendered : 1, given = z->given ? z->given : 1;
+#define SPEED_US(stage, per) ((uint32_t)(z->ticks[stage] * tb.numer / tb.denom / 1000u / (per)))
+	uint32_t render = SPEED_US(SPEED_CELLS, rendered) + SPEED_US(SPEED_SHARPEN, rendered) + SPEED_US(SPEED_SCALE, rendered);
+	char nodes[420], busy[300];
+
+	negronicam_graph_text(nodes, sizeof(nodes));
+	negronicam_busiest_text(busy, sizeof(busy));
+	say("speed: %.1f s: sensor %llu frames, read %u, given %u; us a frame: read %u, work %u (cells %u, sharpen %u, scale %u, handler %u); frame %.1f ms, exposure %.1f ms, gain %.1fx x %.2f, every %u cells; "
+	    "%s; %s", (double)ns / 1e9, (unsigned long long)(z->last_sequence - z->first_sequence + 1), z->frames, z->given, SPEED_US(SPEED_READ, frames),
+	    (uint32_t)(z->frame_ticks * tb.numer / tb.denom / 1000u / frames), SPEED_US(SPEED_CELLS, rendered), SPEED_US(SPEED_SHARPEN, rendered), SPEED_US(SPEED_SCALE, rendered),
+	    SPEED_US(SPEED_HANDLER, given), f->frame_lines * (double)f->line_ns / 1e6, f->exposure_lines * (double)f->line_ns / 1e6, (double)f->gain / f->gain_unity, isp->digital,
+	    z->step ? z->step : 1, nodes, busy);
+	uint32_t was = z->step ? z->step : 1, step = speed_next_step(z, render, z->rendered);
+
+	if (step != was) {
+		say("preview: %u cells a place from now: %u us of picture work a frame (over %u: half each way; under %u for %u s: back)", step, render, SPEED_HALF_OVER_US, SPEED_BACK_UNDER_US,
+		    SPEED_BACK_SECONDS);
+	}
+	memset(z->ticks, 0, sizeof(z->ticks));
+	z->frame_ticks = 0;
+	z->frames = z->given = z->rendered = 0;
+	z->first_sequence = 0;
+	z->began = now;
+#undef SPEED_US
+}
+
 static void *
 worker(void *context)
 {
@@ -1679,6 +1800,10 @@ worker(void *context)
 	int device = open(NEGRONICAM_DEVICE, O_RDWR), failures = 0;
 
 	pthread_setname_np("negroni-camera");
+#ifdef __APPLE__
+	/* laurel: the frames' thread as the render pieces it waits for; the default class lands on the Silver cores under load [I] */
+	(void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 	if (device < 0) {
 		say("no %s (%s): no frames; the device is refused from now on", NEGRONICAM_DEVICE, strerror(errno));
 		negronicam_failed = true;
@@ -1687,6 +1812,7 @@ worker(void *context)
 	}
 	turned_flag = access("/var/db/negronicam/turned", F_OK) == 0;
 	isp_init(&isp);
+	memset(&s->speed, 0, sizeof(s->speed));
 	while (s->running && failures < 5) {
 		ssize_t n;
 
@@ -1731,7 +1857,10 @@ worker(void *context)
 			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
 			continue;
 		}
+		uint64_t read_began = mach_absolute_time();
+
 		n = read(device, buffer, bytes);
+		s->speed.ticks[SPEED_READ] += mach_absolute_time() - read_began;
 		if (n < (ssize_t)sizeof(head) || (size_t)n != sizeof(head) + (size_t)((const struct negronicam_frame *)(const void *)buffer)->stride *
 		    ((const struct negronicam_frame *)(const void *)buffer)->height) {
 			if (n < 0 && errno == EIO) {
@@ -1747,6 +1876,7 @@ worker(void *context)
 		const struct negronicam_frame *f = (const void *)buffer;
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct negronicam_command c;
+		uint64_t work_began = mach_absolute_time();
 
 		bool still_frame = f->mode == 1, take_still = false;
 
@@ -1777,13 +1907,11 @@ worker(void *context)
 			preview_norm = frame_norm;
 			s->preview_w = f->sensor_w;
 			s->preview_h = f->sensor_h;
-			/* the longest frame: what the graph allows (MinimumFrameRate) and the kernel takes */
-			if (f->line_ns != 0) {
-				double most = 1e9 / ((s->min_fps > 1 ? s->min_fps : 15) * f->line_ns);
-
-				isp.max_frame_lines = most < f->frame_lines_max ? (uint32_t)most : f->frame_lines_max;
-				isp.max_frame_lines = isp.max_frame_lines < f->frame_lines_min ? f->frame_lines_min : isp.max_frame_lines;
-			}
+			/*
+			 * laurel: the preview stays at the mode's shortest frame (30 fps): past it AE takes gain, then digital gain. [V boot 22:08] the graph's MinimumFrameRate 15 gave
+			 * 66 ms frames in a dim room, and 133 ms before that: the sensor alone gave 7.5-15 fps.
+			 */
+			isp.max_frame_lines = f->frame_lines_min;
 			if (isp_ae(&isp, f, &st, &c)) {
 				(void)write(device, &c, sizeof(c));
 			}
@@ -1926,6 +2054,11 @@ worker(void *context)
 		if (s->frames == 60 || s->frames % 300 == 0) {
 			negronicam_memory_line(s->frames);      /* (camera_mem.c) */
 		}
+		s->speed.frames++;
+		s->speed.frame_ticks += mach_absolute_time() - work_began;
+		s->speed.first_sequence = s->speed.first_sequence ? s->speed.first_sequence : f->sequence;
+		s->speed.last_sequence = f->sequence;
+		speed_line(s, f, &isp);
 		if (s->frames == 1 || s->frames % 300 == 0) {
 			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black (1%% over %.0f); white balance R %.2f "
 			    "B %.2f, lux index %.0f, about %.0f K; %ux%u, lens %d", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,

@@ -10,6 +10,7 @@
 #  3. the H10ISP vtable versions (base 1, device 3, stream 2) = the layout camera_device.c builds
 #  4. every symbol camera_device.c / media_hooks.c finds with dlsym() is exported by some image
 #  5. the display-alignment seed: FigGetAlignmentForIOSurfaceOutputToDisplayService's code words and statics
+#  6. BWAudioSourceNode's _silenceFramesFillingDisabled: the ivar the audio source hook sets by name
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 C=${1:-$REPO/out/dsc/cache/dyld_shared_cache_arm64}
@@ -77,6 +78,11 @@ done
 for pair in DISPLAY_ALIGN_CHECKED:_planeBaseRequirement.checked DISPLAY_ALIGN_VALUE:_planeBaseRequirement.requirement; do
   a=$(def "${pair%%:*}"); got=$(ipsw dyld a2s "$C" "$a" 2>/dev/null | tail -1)
   case "$got" in *"${pair#*:}"*) log "OK   ${pair%%:*} $a = ${pair#*:}" ;; *) log "BAD  ${pair%%:*} $a is '$got'"; fail=1 ;; esac
+done
+# 6. the ivar audio_source_no_silence (media_hooks.c) sets by name, and the two objc_direct methods it stops
+sy=$(ipsw dyld symaddr "$C" --image CMCapture 2>/dev/null)
+for name in '_OBJC_IVAR_$_BWAudioSourceNode._silenceFramesFillingDisabled' '-[BWAudioSourceNode _generateSilenceIfNeeded]' '-[BWAudioSourceNode _createSampleBufferForTimestampedAudioBufferList:audioBufferIndex:]'; do
+  if printf '%s\n' "$sy" | grep -F -q -- "$name"; then log "OK   $name"; else log "BAD  $name not in CMCapture"; fail=1; fi
 done
 log "result: $([ $fail = 0 ] && echo PASS || echo FAIL) ($(date '+%Y-%m-%d %H:%M'), $C)"
 exit $fail

@@ -166,6 +166,15 @@ busiest_thread_text(char *out, size_t size)
 	mach_port_deallocate(mach_task_self(), self);
 }
 
+void negronicam_busiest_text(char *out, size_t size);
+
+/* (the speed line of camera_device.c) */
+void
+negronicam_busiest_text(char *out, size_t size)
+{
+	busiest_thread_text(out, size);
+}
+
 static bool
 footprint_now(uint64_t *footprint, uint64_t *compressed)
 {
@@ -215,7 +224,7 @@ static void
 guard_line(const char *why, uint64_t footprint, uint64_t compressed)
 {
 	malloc_statistics_t ms = { 0 };
-	char tags[96], metal[160], thread[320];
+	char tags[96], metal[160], thread[480];
 
 	malloc_zone_statistics(NULL, &ms);
 	tags_text(tags, sizeof(tags));

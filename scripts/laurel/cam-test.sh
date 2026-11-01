@@ -10,6 +10,7 @@
 #   client's own header (negronicam.h, layout compared at compile time) and ISP: session numbers, ring, limits, AE, colours, preview.
 # Quality (patch 2773): tools/laurel-cam-test/cam4_test.c.
 # Signal self-check (patch 2784: laurel_cam_light.h): tools/laurel-cam-test/cam7_test.c.
+# Speed (camera_fast.c): tools/laurel-cam-test/cam9_test.c.
 # The headers come from the patches (new files there), so the test checks exactly the code in the kernel.
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
@@ -65,4 +66,8 @@ ${CC:-cc} -O2 -Wall -Wextra -Wno-unused-parameter -I"$D" -I"$REPO/userland/camer
 ${CC:-cc} -O2 -Wall -Wextra -Wno-unused-parameter -I"$D" -I"$REPO/userland/camera" -o "$D/cam7_test" \
   "$REPO/tools/laurel-cam-test/cam7_test.c" "$REPO/userland/camera/camera_isp.c" "$REPO/userland/camera/camera_still.c" -lm
 "$D/cam7_test" "$OUT/laurel/camera/lib"
+# Speed (userland/camera/camera_fast.c, camera_fast.h): the fast preview = the old picture, stage times, AE capped at the shortest frame, the half-cell rule
+${CC:-cc} -O2 -Wall -Wextra -Wno-unused-parameter -I"$REPO/userland/camera" -o "$D/cam9_test" \
+  "$REPO/tools/laurel-cam-test/cam9_test.c" "$REPO/userland/camera/camera_fast.c" "$REPO/userland/camera/camera_isp.c" "$REPO/userland/camera/camera_still.c" -lm
+"$D/cam9_test"
 echo "cam-test: OK"

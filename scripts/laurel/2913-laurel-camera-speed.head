@@ -1,0 +1,2 @@
+laurel 2913: camera speed. /dev/negronicam read() copies through a new write-back, read-only mapping of the frame buffers after a clean + invalidate (self-check on the first frame, kill switch camera_cached=0) in place of the Normal NC mapping; a session starts at the shortest frame (long exposure of the last session comes back as gain); one line a second: frames, reads, us waiting, cleaning, copying. docs/laurel_sprout/camera.md section 13.
+

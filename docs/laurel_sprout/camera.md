@@ -675,7 +675,7 @@ Bad signs: `left alone` on hooks 10, 11; a new `CRASH mediaserverd` (symbolize i
 
 Problem [V `logs/laurel-boot-2002.txt`]: 133 ms, 16x, `above black: mean 0, 1% over 8, top 9-10`. Status: code, built, host-tested. **Not run on the phone.**
 
-**Result: no fault in the code explains the dark frames. The cause stays unknown [U].** One real difference from stock was found and fixed (L12A mode); I have no evidence that it is the cause. The next boot separates the candidates: the lines below.
+**Updated by section 13 [V 22:19:19]: the dark frames were dark scenes; the pixel array gives full white in light.** Result at that time: no fault in the code explains the dark frames. The cause stays unknown [U]. One real difference from stock was found and fixed (L12A mode); I have no evidence that it is the cause. The next boot separates the candidates: the lines below.
 
 ### What was checked, with evidence
 
@@ -747,3 +747,117 @@ LAUREL CAMERA: ios: raw as read: frame 6, 1920x1440 stride 2400, N samples: min 
 5. Turn the flashlight on in the Camera app and hold the phone 10 cm from a white wall, 10 s.
 6. Report: `grep -a -E 'raw \(|raw as read|rails \(|read back|table read-back|test pattern' <log>`.
 7. Undo: `camera=0` is the kill switch for all of it.
+
+## 13. "Heavily buggy, 1 or 2 fps": the signal is proven, the kills have a name, the preview budget (patch 2913, plug-in; boot 22:08, 2026-11-01)
+
+Owner: "Camera is heavily buggy." "Camera runs at 1 or 2 fps only, so it is too slow." Logs: `logs/laurel-boot-2208.txt` (to 22:16), `logs/laurel-boot-2208-panic.txt` (to 22:24, has the lit test), `logs/usblog.log`.
+Status: code, built, host-tested. **Not run on the phone: every statement about the phone's behaviour with these changes is [I].** Boot image and root, both.
+
+### Result 1: the pixel array works. No rail, sensor or analog change [V]
+
+`logs/laurel-boot-2208.txt` ends before the lit test: read `laurel-boot-2208-panic.txt`.
+
+| Time | Exposure, gain | raw, kernel | raw as read, focus | Scene |
+| --- | --- | --- | --- | --- |
+| 22:08:56 boot | 21 ms, 16x | max 112, mean 64.9, no signal | | [I] dark or covered |
+| 22:09:08 | 33 ms, 6.8x | max 66, mean 64.0, no signal | | boot, not in the owner's hands |
+| 22:13:58, 22:14:07 | 44 ms, 16x | max 108, 87, mean 65.4, no signal | frame 12: max 80 | [I] dark or covered |
+| **22:19:19** | 66 ms, 16x | **max 842, mean 87.9, Bayer x10 814 931 937 833, `signal: samples well above black`** | frame 10: **max 1023, mean 108.2**; `sweep: 48 0.3091 (green 128)`, 105 0.4739, 162 0.6124, 219 0.6095, 276 0.6210 | **lit** |
+| 22:19:20 | 66 ms, 16x | kernel: **mean 46, 1% over 584, top 959** | green falls 128 -> 83 as AE moves; sharpness has a peak | lit |
+| 22:19:27 | 116 ms, 16x | max 74, mean 64.1, no signal | frame 2 max 67 | [I] the requested lens-covered step: 7 s later, same session flow |
+| 22:19:30 | 133 ms, 16x | kernel: mean 0, top 10; line `no light on the sensor` | | [I] covered |
+| 22:25:13 boot | 21 ms, 16x | max 72, no signal | | boot |
+
+So the same sensor, rails and tables give clipped white and a real focus curve in light. Every older dark session was a dark scene (a lens down or covered); section 12's candidate (a) is right, (b) and (c) are rejected. Rails, VANA, XCLR, OTP and `L12A` need no change. `L12A: the PMIC does not answer this read` stays: the read is denied or not routed, and it has no effect on the picture.
+
+### Result 2: the `low swap` kills are the capture audio's silence, not Metal, not the filter strip [V]
+
+The memory guard ran in pid 384, 22:19:20-23 (metal.md section 12's question):
+
+```
+memory guard: growing: footprint 380 MB, malloc 319 MB; by VM tag: 3 293 MB ...; busiest thread "...rootQueue.47" 60%: vImage+0x2a070 Espresso+0x6cb68c
+memory guard: still growing past the limit: footprint 1965 MB, malloc 1850 MB; by VM tag: 3 2013 MB; Metal: 60 textures, 108 buffers 26 MB, 4 heaps 7 MB; busiest thread "...rootQueue.58" 74%: libsystem_platform.dylib+0x11f4 CMCapture+0x37bfc CMCapture+0xdb...
+low swap: killing largest compressed process with pid 384 (mediaserverd) and size 1837 MB
+```
+
+- VM tag 3 = malloc large: 293 -> 2013 MB in about 3.5 s, about 500 MB/s. Metal's counts are flat and small (24-26 MB of buffers). The guard's stop of the strip and the pipelines changed nothing: the growth went on.
+- Stack symbolized in the 20H392 cache (CMCapture base 0x1a1ee6000): `0x1a1f1dbfc` = `-[BWAudioSourceNode _createSampleBufferForTimestampedAudioBufferList:audioBufferIndex:] + 236`, just after the zeroing call of `[buffer + 0x38] x bytes per frame`. `0x1a1ef3bb8` = `-[BWAudioSourceNode _generateSamples]`. 5 of 7 samples, 69-94 % of a core.
+- The render callback (`0x1a1ef081c`): the audio's host time past `_nextExpectedHostTime` by more than `_ioprocTimeStampDeltaLimit` gives `[buffer + 0x38]` = (the jump) x (the sample rate) frames of silence. It is skipped when `_silenceFramesFillingDisabled` is set, as is all of `-_generateSilenceIfNeeded`.
+- This also explains the old correlation "the kill comes 3-4 s after the prewarm burst" (metal.md 12.1): audio is a deferred source node, as the prewarm is a deferred node. Sessions that never got that far did not grow. Pid 28 lost its lines (below), so its kill at 22:14:04 (2028 MB) has no stack; same time course, same size [I].
+- [U] Why this phone's capture audio time stamps jump. No line in the log shows the jump. The mic path is not changed.
+
+**Fix (`media_hooks.c`, `audio_source_no_silence`):** the hook on `-[BWAudioSourceNode start:]` sets `_silenceFramesFillingDisabled` by name, before the stock start. The methods are `objc_direct` (no method list entry, called by `bl`; same reason as `_logActiveSinkNodesAfterGraphStopTimeout` not found by name [I]), so the ivar is the handle. A missing ivar: one line, nothing else changes. `check-cache.sh` step 6 checks the names. Sound keeps its own times, with gaps as they are.
+
+### Result 3: why 1 or 2 fps. Numbers
+
+Reads per second, all from `ios session: end (...)` [V]:
+
+| Session | s | Sensor frames/s | Read/s | Notes |
+| --- | --- | --- | --- | --- |
+| 22:13:57-14:05 (pid 28) | 8 | 12.8 | **4.0**; after the first 30 frames: 14 reads in about 5.7 s = **2.5** | killed by `low swap`. The owner's 1-2 fps |
+| 22:14:06-08 (pid 384) | 2 | 9 | 5.5 | app closed |
+| 22:19:18-23 (pid 384, lit) | 6 | 12.7 | **4.8** | killed |
+| 22:19:26-32 (pid 403, covered) | 6 | 6.5 | 6.5 | sensor is the limit: 133 ms |
+| 22:25:24-29, 22:09:08-13 (at boot, no graph) | 5 | 26-29 | 1.2, 3.4 | [I] the exec storm of the boot; no ISP work here |
+
+Backboardd in the same windows: 25-36 frames/s, a frame 8.6-12.2 ms [V `redwood-gl`], surfaces drawn in place, no copy: the display is not the limit.
+
+| Stage | Time on the phone before | Evidence | After this change |
+| --- | --- | --- | --- |
+| Memory: 500 MB/s zeroed + compressed; a core in memset, a core in the compressor (`kernel_task`) | 1 + 1 of 8 cores, then the kill | [V] guard | 0 [I] |
+| Sensor frame | 66-133 ms in the dark (AE to MinimumFrameRate 15, and session start from the last session's 133 ms) | [V] `frame 5208 lines`, `frame 2: 132.7 ms` | 33.3 ms: AE capped at the shortest frame, then gain, digital gain to 4x. The session starts at the shortest frame, the rest as gain [V host] |
+| read() copy, 3.46 MB of Normal NC | **[U] never measured.** [I] 15-40 ms: NC loads have no fill or prefetch; 80-230 MB/s by experience on this class of core | none | Write-back alias + clean/invalidate: [I] 3-6 ms. Kernel line measures it |
+| ISP cells (960x720) | [V host] 27.6 ms one thread for all stages; x 5.6 (Geekbench 5 single i9-12900H / Gold) = [I] 155 ms of CPU. 8 fixed pieces: the slowest (a Silver core) sets the wall time: [I] at least 40 ms idle | cam9 | [V host] 7.1 ms, 3.9 x faster; [I] 40 ms of CPU, about 7-14 ms wall in 12 pieces |
+| 420f output | scale + NV12 + finish are in the row above | cam9 | scale 2.0 ms of the 7.1 |
+| CMCapture nodes, Metal strip | **[U]**. Espresso + vImage in 1 of 7 guard samples, 60 % of a core: a CPU inference node [I] | guard | Line `nodes:` below |
+| Delivery to backboardd, display | 25-36 fps, draws in place | [V] | no change |
+
+Honest estimate [I]: the worker (read + measure + picture) drops to about 15-25 ms a frame on free cores, so 30 fps is possible up to the graph's input. **Whether the graph holds 30 fps is unknown until the `nodes:` line.** The CPU also serves SpringBoard and widgets (gold busy 91 % in a busy minute [V `LAUREL THERMAL`]). If Espresso's node costs a core at each frame, that is the next fix. Expect 20-30 fps in light, after the first seconds.
+
+Not done, with the reason: **GPU ISP**: no Metal source compile on this path, and the CPU path has room by the numbers; first the phone's numbers. **Zero copy**: `mmap` of a character device is not a path here, and the cached copy gives most of it. **Smaller preview pool**: 1504x1128 comes from the iPhone X plist's preview size; a plist change without a phone to test is a risk for little gain.
+
+### Changes
+
+| Part | What |
+| --- | --- |
+| `media_hooks.c` | Silence off. `graph_note`: pictures per node and their age, from the emit hook |
+| `camera_fast.c`, `.h` (new) | Preview from whole rows of cells: RAW10 -> lines -> shading from gains every 32 cells -> matrix -> gamma table -> Y, Cb, Cr; sharpen on the cells' Y; bilinear per plane. Same numbers as `pipe_init` |
+| `camera_device.c` | 12 pieces, a Silver core takes fewer; worker at user-interactive QoS; AE cap 30 fps; `speed:` line; half cells if picture work is over 24 ms for a second, back after 5 s under 5 ms |
+| `camera_device.c` console | Opened for each line. [V] pid 28 (boots 18:40, 22:08) says its hooks at load, then nothing for its whole life, while its Metal bundle's own open at 22:13:57 prints. [I] the load's fd stopped reaching the console; which step is [U] |
+| `camera_device.c`, `camera_mem.c` | Line 400 -> 1100 chars: the guard's stack was cut in its third frame |
+| Patch 2913 | `read()`: write-back read-only alias of the buffers (`topaz_gpu_pool_map_cached`), clean + invalidate, self-check on the first frame, kill switch `camera_cached=0`; poll 1 ms; line a second; session starts at the shortest frame |
+
+### Other items of the log [V]
+
+- `read over`: 0 (the 4 buffers work). `NOT given`: 0. `no frame`: 0. VFE errors: 0 in all sessions.
+- Photo path: **not exercised**. No shutter in this boot: no `a photograph` line; only 19:34 has one. Sessions died first.
+- Metal in mediaserverd: device in 234-290 ms, dead-man cleared, `first texture over a surface with planes: fmt 540`, 0 pipeline failures, no `heap texture refused`, no `surface import refused`. `no new pipelines` once, from the guard at 22:19:23 (a wrong suspect). `memory at frame`: never reached (frame 60 was not read). Keep Metal.
+- The guard stays as a feature. Its limit action does nothing against this cause; with the cause gone the lines must stop.
+- Kernel panic hold 22:22:22, about 2.5 min after the last camera session: the log has no reason text. Not traced to the camera. [U]
+- `EXC_CORPSE_NOTIFY` for the process 1 s before each kill: 18:43:54, 22:14:03, 22:19:22. [I] from the memory pressure; the same line comes for many others.
+
+### Build and tests [V]
+
+`scripts/laurel/kernel-linux.sh` (job cama-kernel2, with mic 2920): 298/298 patches, 0 LSE. `userland/laurel/camera/build.sh`. `scripts/laurel/cam-test.sh` + `cam9_test.c`: fast = old picture (Y differs 0.00-0.17 of 255, chroma under 0.2, 4 Bayer orders, video range, shading + matrix, zoom, turned, half cells, 16x), AE capped: 30.0 fps at 16x + digital 4x, half-cell rule. `scripts/laurel/cam-leak-test.sh`: 600 pictures heap + 0, ASan clean; a false alarm fixed in it (under ASan heap() is always 0). `scripts/laurel/camera-cache-check.sh`. Only on a host: no sensor, no XNU, no CMCapture, no Kryo core ran; all timing on the phone is [I].
+
+### Expected lines [I]
+
+```
+LAUREL CAMERA: ios hooks: capture audio: no silence is filled in (its allocations killed mediaserverd)
+LAUREL CAMERA: read: cached copy: on: the 2 mappings agree on the first frame
+LAUREL CAMERA: ios: preview: whole rows of cells: 960x720 cells to 1504x1128, every 1
+LAUREL CAMERA: ios session: speed: 30 frames, 30 read in 1000 ms; us a read: waits W, clean C, copy N (cached)
+LAUREL CAMERA: ios: speed: 1.0 s: sensor 30 frames, read 30, given 30; us a frame: read R, work K (cells A, sharpen S, scale B, handler H); frame 33.3 ms, exposure E ms, gain G x D, every 1 cells; nodes: MultiFilterThumbnailNode 30 x M ms ...; busiest thread "x" N%: ...
+LAUREL CAMERA: ios: memory at frame 60: footprint N MB ...       (flat; no `memory guard: growing`)
+```
+
+Also from pid 28, the first time: `ios: the device made`, `memory guard: on`. No `low swap`.
+Bad signs: `no _silenceFramesFillingDisabled`; `memory guard: growing` (read the stack, now whole: the next allocator); `cached copy: off`; `every 2` (the picture work is over budget: read its numbers).
+
+### Test steps (owner approval for each partition write)
+
+1. **Boot image and root, both:** kernel: `scripts/laurel/uefi-image.sh`, `flash-boot.sh`. Plug-in: `userland/laurel/camera/build.sh`, `sudo scripts/laurel/root.sh`, flash userdata.
+2. Phone in the hand, lens free, in a lit room. Open Camera. Wait 2 minutes with the preview on. It must not flash or restart.
+3. Move the phone: judge the speed by eye. Press the shutter, open the photo in Photos.
+4. Report: `grep -a -E 'speed:|low swap|memory guard|cached copy|no silence|a photograph|encoded|CRASH mediaserverd' <log>`.
+5. Undo: `camera_cached=0` (only the copy), `camera=0` (all of it).
