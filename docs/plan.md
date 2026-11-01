@@ -654,3 +654,17 @@ Done [V build]: `fifo_if_on` clears it (after DMA mode off, GSI events off, DMA_
 241/241 patches, 0 LSE, kcheck syntax OK, kernel.development.sweet.4k sha256 1b59818b... Not booted.
 Next: boot; expect `LAUREL BT: geni: FIFO interface was off (GSI from boot): FIFO_IF_DISABLE 0x1 -> 0, ..., RO 0`, then
 `uart: 115200 8N1 RTS/CTS, RX on`, `chip: ...` and `on: WCN3990 ...`. Details: docs/laurel_sprout/bluetooth.md.
+
+## Mi A3: first combined phone tests on laurel-int-1 (2026-11-01 05:29-06:15, coordinator)
+
+Observed [V, USB log logs/usblog-20261101-001446.txt]:
+- 05:29 (A-J merged, old root): Mu -> UniXNU -> XNU -> SpringBoard. RAM window 3264 MiB (495 MiB below 4 GiB, used last), SPOOL
+  6 x 12 MiB, native 720x1560 canvas (first frame 29 s), touch FT3518, keys, audio (ADSP, MAX98937), Wi-Fi WLFW (MAC 00:..:00),
+  haptics. Endless vibration (iOS repeat with no stop) -> fixed in 2700 (60 s cap + key stop, eba6218).
+- 05:52 (new root: GPU, Metal, audio, BT userland): GPU start hung in the zap PAS call (no shared SCM lock) -> fixed by 2153 (cdec424).
+  BT off: SE9 left in GSI mode. Charger `on: ... zone 3 ... charging`, charge mode, thermal, backlight lines seen.
+- 06:07 (BT 228d505): the BT thread stalls at the first read of SE+0x2008 (register absent on this QUP [I]); no panic.
+- 06:12 (2153): `LAUREL GPU: on: Adreno 610 ... RedwoodGPU published`, `LAUREL METAL: on: Turnip a610 ...`, backboardd GL loaded
+  (screen surfaces from the GPU pool), AppleARMBacklight in use, first frame 31 s after boot.
+Next: BT in SE DMA mode (t3/laurel-bt-se-dma); GPU upstream sync + SMMU stage-1 + Metal optimisation (t3/laurel-gpu-upstream-opt);
+Wi-Fi MAC; charging stays supervised.
