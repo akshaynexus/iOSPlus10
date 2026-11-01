@@ -1023,3 +1023,9 @@ Build [V]: 307/307 patches, 0 failed, 0 LSE, printf-arg-check OK, kernel sha256 
 Facts [V firmware]: LTE at most (`device_config.xml` no NR letter), DSDS L+L, max_active_voice 1. MCFG reads only digests: no activation.
 Unproven: ONLINE at mode 5 ([U], the main risk, an assert stops Wi-Fi for the boot); registration; bars with real values; every data step; IPMonitor key names and Wi-Fi-first ranking [I]. Not built: LTE tag, Settings > Cellular, default SIM, network search, SMS, calls, APN setting.
 `ipa=0` stays default in uefi-image.sh. Next: normal image, then `IPA_TEST=1` image; section 11.6.
+
+## Mi A3: radio online, registration denied (2026-11-01 23:42, coordinator; last iOS flash, owner moved to Android)
+
+[V, logs/laurel-boot-radio.txt, IPA test image on the 22:xx root] IPA on; `DMS SET_OPERATING_MODE online: ok`, `operating mode online (raw 0)`; `modem radio technologies: GSM,UMTS,LTE` (no 5G); no modem crash in 2 min; `nas1/nas2 BIND_SUBSCRIPTION: ok`.
+Then at 23:43:59-23:44:37: card state USIM/7 -> USIM/6, `SIM1 present (USIM illegal), SIM2 present (USIM illegal); modem online; SIM1 registration denied rssi -104; SIM2 registration denied`. Cause unknown.
+Owner rule from now on: no flashing unless the owner asks. Code work goes on and is pushed to laurel-sprout.
