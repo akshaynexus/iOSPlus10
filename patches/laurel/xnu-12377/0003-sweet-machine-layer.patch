@@ -400,7 +400,7 @@ index 53f9ce5..55b3f19 100644
  cpu_timebase_init(boolean_t from_boot)
  {
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
-index 0554aa8..2495641 100644
+index 0554aa8..eb04389 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
 @@ -32,6 +32,7 @@
@@ -490,7 +490,7 @@ index 0554aa8..2495641 100644
  /*
   * Uncategorized exceptions are a catch-all for general execution errors.
   * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
-@@ -1191,6 +1264,12 @@ handle_uncategorized(arm_saved_state_t *state)
+@@ -1191,6 +1264,17 @@ handle_uncategorized(arm_saved_state_t *state)
  
  	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
  
@@ -498,12 +498,17 @@ index 0554aa8..2495641 100644
 +	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && sweet_emulate_lse(state, instr)) {
 +		return;
 +	}
++	/* laurel iOS 26: PAC instructions outside the hint space, LDAPUR, STLUR (osfmk/arm64/laurel_abi.c) */
++	extern bool laurel_abi_emulate(arm_saved_state_t *state, uint32_t instr);
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && laurel_abi_emulate(state, instr)) {
++		return;
++	}
 +#endif
 +
  #if CONFIG_DTRACE
  
  	if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
-@@ -3008,6 +3087,42 @@ sleh_irq(arm_saved_state_t *state)
+@@ -3008,6 +3092,42 @@ sleh_irq(arm_saved_state_t *state)
  #endif
  
  
@@ -546,7 +551,7 @@ index 0554aa8..2495641 100644
  	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
  
  #if USE_APPLEARMSMP
-@@ -3019,6 +3134,7 @@ sleh_irq(arm_saved_state_t *state)
+@@ -3019,6 +3139,7 @@ sleh_irq(arm_saved_state_t *state)
  	    cdp->interrupt_nub,
  	    cdp->interrupt_source);
  #endif

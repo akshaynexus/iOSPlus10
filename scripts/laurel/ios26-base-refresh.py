@@ -36,6 +36,8 @@ def main():
     tree = Path(args[0] if args else REPO / "out/laurel-kernel-ios26/src/xnu")
     def git(*a):
         return subprocess.run(["git", "-C", str(tree), *a], capture_output=True, text=True, encoding="latin-1", check=True).stdout
+    if not owned_only:
+        subprocess.run(["git", "-C", str(tree), "add", "-N", "."], check=True)   # new files show in git diff
     base = "" if owned_only else git("log", "--format=%h", "-n1", "--grep=base 0001-non-apple").strip()
     # series patches per file
     import importlib.util

@@ -62,6 +62,19 @@ sed -i -e 's|XCRUN = /usr/bin/xcrun|XCRUN = xcrun|' -e 's|HOST_CODESIGN\([[:spac
 sed -i 's|^#!/bin/csh -f$|#!/usr/bin/env -S csh -f|' "$XNU_SRC/SETUP/config/doconf"
 # stage 1 of setup-deps: mig, unifdef, tcsh, the SDK overlay; libplatform and firehose headers for 12377
 export PATCHES_DIR=$W/patches; mkdir -p "$PATCHES_DIR"
+# laurel 2912: what this run built (docs/laurel_sprout/build-honest.md). A copy of the sources: a later edit shows at the check.
+export LAUREL_STAMP_IOS26=1
+BS=$REPO/scripts/laurel/build-stamp.py
+rm -f "$PATCHES_DIR"/*
+python3 -I - "$BS" "$PATCHES_DIR" <<'PY'
+import importlib.util, shutil, sys
+s = importlib.util.spec_from_file_location('bs', sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+for n, p in m.ios26_files().items():
+    shutil.copy2(p, sys.argv[2] + '/' + n)
+PY
+STAMP=$(python3 -I "$BS" kernel-stamp "$W" "ios26_$PAGES")
+echo "kernel-ios26: this build: LAUREL BUILD: $STAMP"
+python3 -I "$BS" kernel-header "$STAMP" > "$XNU_SRC/bsd/dev/laurel_build_stamp.h"
 bash "$W/linux/setup-deps.sh" --stage1 > "$LOGD/stage1.log" 2>&1 || { tail -20 "$LOGD/stage1.log"; exit 1; }
 . "$REPO/scripts/laurel/ios26-sdk-overlay.sh"
 echo "kernel-ios26: setup done $(( $(date +%s) - T0 )) s"

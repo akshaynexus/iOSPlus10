@@ -316,7 +316,7 @@ index 8bebebb..9e1d757 100644
  #if XNU_VM_HAS_LOPAGE
  
 diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
-index 0b68829..12b4981 100644
+index 0b68829..0272fc1 100644
 --- a/osfmk/vm/vm_shared_region.c
 +++ b/osfmk/vm/vm_shared_region.c
 @@ -849,6 +849,11 @@ vm_shared_region_create(
@@ -339,3 +339,23 @@ index 0b68829..12b4981 100644
  
  	assert(!sub_map->disable_vmentry_reuse);
  	sub_map->is_nested_map = TRUE;
+@@ -3345,6 +3351,9 @@ vm_shared_region_slide_page_v3(
+ 			} else {
+ 				memcpy(rebaseLocation, &value, sizeof(value));
+ 			}
++#else /* !__has_feature(ptrauth_calls) */
++			/* laurel: this CPU has no PAC: an auth rebase of the lowered arm64e userland is a plain pointer */
++			memcpy(rebaseLocation, &value, sizeof(value));
+ #endif /* __has_feature(ptrauth_calls) */
+ 		} else {
+ 			// The new value for a rebase is the low 51-bits of the threaded value plus the slide.
+@@ -3564,6 +3573,9 @@ vm_shared_region_slide_page_v5(
+ 			} else {
+ 				memcpy(rebaseLocation, &value, sizeof(value));
+ 			}
++#else /* !__has_feature(ptrauth_calls) */
++			/* laurel: this CPU has no PAC: an auth rebase of the lowered arm64e userland is a plain pointer */
++			memcpy(rebaseLocation, &value, sizeof(value));
+ #endif /* __has_feature(ptrauth_calls) */
+ 		} else {
+ 			// the value already has the correct low bits, so just add in the high8 if it exists

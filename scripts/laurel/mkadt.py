@@ -40,7 +40,7 @@ UFS, buttons, D22AP /product) and changes what differs on the Mi A3:
     C 0xC0000000 + 4 GiB (they touch; bank A 0x40000000-0x7CC00000 holds every fixed carve-out). /chosen
     laurel-ram-reserved: device pools that must stay out of kernel RAM: 0xC0000000 + 512 MiB (Adreno GPU pool) and
     0xE0000000 + 16 MiB (TopazModem pool). Kernel patch 2100 checks the boot window against both.
-Usage: mkadt.py OUT.adt [--cores 8|4] [--boot gold|silver] [--dram BASE:SIZE|auto] [--mu-fd FD] [--darwinboot] [--dump]
+Usage: mkadt.py OUT.adt [--cores 8|4] [--boot gold|silver] [--dram BASE:SIZE|auto] [--mu-fd FD] [--darwinboot] [--dump] [--donor d22ap|n104ap]
 The D22AP /product node needs the iPhone X device tree $APPLE/d22ap.adt (default ~/op10-apple; Apple file,
 never in git; get it with scripts/ios16/fetch-d22ap-adt.sh). Without it the node is left out (warning).
 """
@@ -51,6 +51,11 @@ import sys
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 TOPAZ_TOOLS = os.path.join(REPO, 'external', 'ios-topaz', 'tools')
+if not os.path.isfile(os.path.join(TOPAZ_TOOLS, 'mkadt.py')):     # a worktree: the main checkout's reference repos
+    import subprocess
+    _main = subprocess.run(['git', '-C', REPO, 'worktree', 'list', '--porcelain'], capture_output=True, text=True).stdout.splitlines()
+    if _main:
+        TOPAZ_TOOLS = os.path.join(_main[0].split(' ', 1)[1], 'external', 'ios-topaz', 'tools')
 if not os.path.isfile(os.path.join(TOPAZ_TOOLS, 'mkadt.py')):
     sys.exit('mkadt: missing external/ios-topaz (scripts/setup/get-references.sh ios-topaz)')
 sys.path.insert(0, TOPAZ_TOOLS)
@@ -140,9 +145,17 @@ def cpu_nodes(cores, phandles, boot='gold'):
     return out
 
 
-D22AP_ADT = os.path.join(os.environ.get('APPLE', os.path.expanduser('~/op10-apple')), 'd22ap.adt')
+_APPLE = os.environ.get('APPLE', os.path.expanduser('~/op10-apple'))
+# The userland donor: identity and /product. d22ap = the iOS 16 kernel (default, unchanged). n104ap = the iOS 26 kernel
+# (owner decision 2026-11-02; values read from the ADT: docs/laurel_sprout/ios26-kernel.md; scripts/laurel/ios26-donor.sh).
+DONORS = {
+    'd22ap': dict(compatible='D22AP', model='iPhone10,3', target='D22', sub='D22AP', adt=os.path.join(_APPLE, 'd22ap.adt')),
+    'n104ap': dict(compatible='N104AP', model='iPhone12,1', target='N104', sub='N104AP',
+                   adt=os.path.join(_APPLE, 'ios26', '23F84-n104ap', 'n104ap.adt')),
+}
+DONOR = DONORS['d22ap']
 _topaz_product = topaz.d22ap_product
-topaz.d22ap_product = lambda: _topaz_product(D22AP_ADT)   # its default path is bound at import
+topaz.d22ap_product = lambda: _topaz_product(DONOR['adt'])   # its default path is bound at import
 
 
 def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwinboot=False):
@@ -151,7 +164,10 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
     root = topaz.build(seed=seed, native=True)
 
     root.props = [(k, f, v) for k, f, v in root.props]
-    setprop(root, 'compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,laurel_sprout') +
+    setprop(root, 'model', cstr(DONOR['model']))
+    setprop(root, 'target-type', cstr(DONOR['target']))
+    setprop(root, 'target-sub-type', cstr(DONOR['sub']))
+    setprop(root, 'compatible', cstr(DONOR['compatible']) + cstr(DONOR['model']) + cstr('xiaomi,laurel_sprout') +
             cstr('xiaomi,sweet') + cstr('qcom,trinket') + cstr('AppleARM'))
 
     chosen = find(root, 'chosen')
@@ -313,7 +329,11 @@ if __name__ == '__main__':
     ap.add_argument('--darwinboot', action='store_true')
     ap.add_argument('--build-stamp', help='/chosen laurel-image-build: the boot log line of kernel patch 2912 (scripts/laurel/build-stamp.py image-line)')
     ap.add_argument('--dump', action='store_true')
+    ap.add_argument('--donor', choices=sorted(DONORS), default='d22ap', help='userland donor: identity and /product (default the iOS 16 d22ap)')
     a = ap.parse_args()
+    DONOR = DONORS[a.donor]
+    if not os.path.isfile(DONOR['adt']):
+        sys.exit(f"mkadt: no donor ADT {DONOR['adt']}: {'scripts/laurel/ios26-donor.sh' if a.donor != 'd22ap' else 'scripts/ios16/fetch-d22ap-adt.sh'}")
     if a.dram == 'auto':
         if not a.mu_fd:
             sys.exit('mkadt: --dram auto needs --mu-fd FD')
