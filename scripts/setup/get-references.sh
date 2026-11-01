@@ -19,6 +19,10 @@ ios-sweet          https://github.com/akshaynexus/ios-sweet.git       45263bee51
 ios-sweet-upstream https://github.com/dipa-studio/ios-sweet.git       45263bee51df4a0f55cdf9c649af886399488ddb main
 UniXNU-ios26       https://github.com/none24smu/UniXNU.git            68c513467bb6c44106c053c410582c1d14f96dd7 ios26
 UniXNU-zeta        https://github.com/none24smu/UniXNU-zeta.git       eb489285a1d9153872f00c93ebb519a269b249b5 main
+IOS-26-Hot         https://github.com/nithinyadavamaraboina-online/IOS-26-Hot.git d249939b9c36380afaee1a76cf167aeee8347475 master
+hakios-dada        https://github.com/superboyyy/hakios-arm64e-dada.git f1ae906fcc43ba8f763663257724ba938fb820ab main
+AdrenoMetal        https://github.com/UniXNU/AdrenoMetal.git 831a9dcbd6ac7de89a11bdaf031e07b9aadfa3c8 main
+Bergamota          https://github.com/friendlycatt/Bergamota.git 23475744ca5cc6790037c8ebcf4b03662a24d922 develop
 UniXNU-pong        https://github.com/Chengdong-Yu/UniXNU-pong.git    ab74f075320fe54eee24d5d150386e5b0f0f427f main
 ios-sailfish       https://github.com/joranv1/ios-sailfish.git        6f27e41ff249f2680540ebe8ee5ab982c5e641c9
 bergamota          https://github.com/ry-diffusion/bergamota.git      0826e48c3d3f4bd9b0ab7d5af82ed92dfaeec425 develop

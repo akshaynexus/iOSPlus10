@@ -112,7 +112,15 @@ def check_airplay(root):
         bad.append('no job com.laurel.airplay')
     if os.environ.get('AIRDROP_LAN', '1') != '0' and not plist(root, 'private/var/Managed Preferences/mobile/com.apple.Sharing.plist').get('BrowseAllInterfaces'):
         bad.append('no BrowseAllInterfaces in the managed preferences')
+    if os.environ.get('AIRPLAY_LEGACY', '1') != '0' and plist(root, 'private/var/Managed Preferences/mobile/com.apple.airplay.plist').get('sessionProtocolOverride') != 'legacy':
+        bad.append('no sessionProtocolOverride in the managed preferences')
     return bad
+
+
+def check_awdl(root):
+    if '/System/Library/LaunchDaemons/com.laurel.awdl.plist' not in plist(root, 'System/Library/xpc/launchd.plist').get('LaunchDaemons', {}):
+        return ['no job com.laurel.awdl']
+    return []
 
 
 def check_ssh(root):
@@ -177,6 +185,8 @@ FEATURES = [
          root=['Applications/XNUtils.app/XNUtils', 'Applications/XNUtils.app/Info.plist', 'usr/local/libexec/powermenu-helper', 'usr/local/bin/pmregister'], check=check_xnutils),
     dict(name='airplay', switch='AIRPLAY', build='scripts/laurel/airplay-build.sh', stage=['out/laurel/airplay/root/usr/libexec/laurel-airplay'],
          trees=['out/laurel/airplay/root'], sources=['userland/laurel/airplay'], root=['usr/libexec/laurel-airplay'], check=check_airplay),
+    dict(name='awdl', switch='AWDL', build='scripts/laurel/awdl-build.sh', stage=['out/laurel/awdl/root/usr/libexec/laurel-awdld'],
+         trees=['out/laurel/awdl/root'], sources=['userland/laurel/awdl'], root=['usr/libexec/laurel-awdld'], check=check_awdl),
     dict(name='ssh', switch='SSH', build='userland/ssh/fetch.sh, fetch-sdk.sh, build.sh', stage=['out/ssh/ios/dropbearmulti', 'out/ssh/ios/laurelnet'], trees=['out/ssh/ios'],
          sources=['userland/ssh'], root=['usr/local/bin/dropbearmulti', 'usr/local/bin/laurelnet'], check=check_ssh),
 ]
