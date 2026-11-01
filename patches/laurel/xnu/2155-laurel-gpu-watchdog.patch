@@ -1,0 +1,139 @@
+laurel 2155: GPU watchdog + kern.laurel_gpu. While backboardd draws with GL, the GPU thread checks the fence every 250 ms: work pending and the written-back submission number unchanged for 3 s = a GPU hang (idle is never a hang: a still screen sends no work; RedwoodGPU polls fences, there is no GPU interrupt, so a hung core showed only as timed-out waits). Once: the TopazGPU register line, 'LAUREL GPU: off: GPU hang: submissions A-B not done, no progress for N ms; GL off, backboardd PID restarts on the CPU renderer', CP stopped and ready = false (RedwoodGPU refuses, topaz_gpu_gl_active() false: screen surfaces from ordinary memory), SIGKILL to the GL backboardd. New read-only sysctl kern.laurel_gpu = 'on' | 'off: <reason>' (gpu=0, bring-up step failed, GPU hang) | '' while the GPU starts; the backboardd wrapper (userland/laurel/gpu/bbd_wrap.c) reads it and runs backboardd without the GL loader when it is off (CPU renderer at once, no 5 s RedwoodGPU wait). Kill switch gpuwd=0. Found while checking the 2026-11-01 06:12/06:17 'GL stall' (docs/laurel_sprout/gpu.md 'GL stall'): that one was not the GPU (SpringBoard and backboardd wait for lsd), but nothing caught a real GPU hang before.
+
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 2a947e9..faa805c 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1341,6 +1341,8 @@ redwood_tl(const char *format, ...)
+ 
+ /* ---------------------------------------------------------------- start */
+ 
++void laurel_gpu_watchdog(void);                 /* laurel 2155 */
++
+ static void
+ topaz_adreno_thread(__unused void *param, __unused wait_result_t wr_)
+ {
+@@ -1370,7 +1372,115 @@ topaz_adreno_thread(__unused void *param, __unused wait_result_t wr_)
+ 	IOLog("LAUREL GPU: on: Adreno 610 chip 0x%08x, core %u MHz, %s, SMMU %s, %s %#llx+%#llx; RedwoodGPU published\n",
+ 	    CHIP_ID, core_mhz, fw_note, gpu_identity ? "pass-through" : "stage 1",
+ 	    gpu_midmem ? "kernel memory (midmem), no pool;" : "pool", gpu_pool_base, gpu_pool_size);
++	laurel_gpu_watchdog();                  /* laurel 2155: this thread watches the GPU from now on */
++}
++
++/* ---------------------------------------------------------------- laurel 2155: GPU watchdog, kern.laurel_gpu */
++
++/*
++ * A GPU hang must not leave the screen frozen. While backboardd draws with GL (topaz_gpu_gl_active), this
++ * thread looks at the fence every GPU_WATCH_MS: work pending (the last submission's number not written back
++ * yet) and the written-back number unchanged for GPU_HANG_MS = a hang. Idle (all done) is never a hang: a still
++ * screen sends no work. RedwoodGPU only polls the fence (no GPU interrupt, RBBM_INT unused), so a hung core would
++ * show only as timed-out waits; here it is caught even when nobody waits. Then, once:
++ *   - the TopazGPU registers line (redwood_gpu_report) and `LAUREL GPU: off: GPU hang: ...`;
++ *   - the GPU is off: CP stopped, ready = false (RedwoodGPU gives kIOReturnNotReady, opens are refused,
++ *     topaz_gpu_gl_active() is false: new screen surfaces from ordinary memory, the display does not wait);
++ *   - kern.laurel_gpu = "off: GPU hang: ..." and the GL backboardd gets SIGKILL. launchd starts the wrapper
++ *     (userland/laurel/gpu/bbd_wrap.c) again; it reads kern.laurel_gpu and execs backboardd without the GL
++ *     loader: CoreAnimation's software renderer, as with gl=0.
++ * Self-check: the watchdog reads the same fence that the bring-up's fence test proved (LAUREL GPU: on). Kill
++ * switch gpuwd=0 (line `LAUREL GPU WATCHDOG: off: boot-arg gpuwd=0`). 3 s is far above a frame's GPU time
++ * (topaz: under 10 ms at 300 MHz) [I: no submission measured above 100 ms].
++ */
++#include <sys/sysctl.h>
++#include <sys/proc.h>
++#include <sys/signal.h>
++
++extern "C" void RedwoodGPUStop(void);
++
++#define GPU_WATCH_MS    250
++#define GPU_HANG_MS     3000
++
++static char gpu_off_why[128];           /* why the watchdog turned the GPU off ("" = it did not) */
++static int gl_pid;                      /* the backboardd whose Mesa opened the GPU last */
++
++static void
++gpu_hang(uint32_t done, uint32_t last, uint64_t ms)
++{
++	redwood_gpu_report("watchdog: GPU hang");
++	snprintf(gpu_off_why, sizeof(gpu_off_why), "GPU hang: submissions %u-%u not done, no progress for %llu ms",
++	    done + 1, last, ms);
++	IOLog("LAUREL GPU: off: %s; GL off, backboardd %d restarts on the CPU renderer\n", gpu_off_why, gl_pid);
++	failed = true;
++	RedwoodGPUStop();                       /* CP stopped, ready = false (under RedwoodGPU's lock) */
++	if (gl_pid > 0) {
++		proc_signal(gl_pid, SIGKILL);
++	}
++}
++
++void
++laurel_gpu_watchdog(void)
++{
++	uint32_t on = 1, seen = 0;
++	uint64_t since = 0;                     /* mach time since when `seen` is the last done while work is pending */
++
++	(void)PE_parse_boot_argn("gpuwd", &on, sizeof(on));
++	if (on == 0) {
++		IOLog("LAUREL GPU WATCHDOG: off: boot-arg gpuwd=0\n");
++		return;
++	}
++	while (ready) {
++		IOSleep(GPU_WATCH_MS);
++		if (!topaz_gpu_gl_active() || mem.va == NULL) {
++			since = 0;
++			continue;
++		}
++		uint32_t last = seqno;
++		sweet_dcache_flush((vm_offset_t)mem.va, 64);
++		uint32_t done = *(volatile uint32_t *)mem.va;
++		uint64_t now = mach_absolute_time(), ns = 0;
++		if ((int32_t)(done - last) >= 0) {
++			since = 0;                      /* idle: all done */
++			continue;
++		}
++		if (since == 0 || done != seen) {
++			seen = done;                    /* new work, or progress */
++			since = now;
++			continue;
++		}
++		absolutetime_to_nanoseconds(now - since, &ns);
++		if (ns / NSEC_PER_MSEC >= GPU_HANG_MS) {
++			gpu_hang(done, last, ns / NSEC_PER_MSEC);
++			return;
++		}
++	}
++}
++
++/* kern.laurel_gpu: "on", "off: <reason>", or "" while the GPU starts (bbd_wrap.c reads it) */
++static int
++laurel_gpu_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char s[160];
++
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	if (killed) {
++		strlcpy(s, "off: boot-arg gpu=0", sizeof(s));
++	} else if (gpu_off_why[0] != 0) {
++		snprintf(s, sizeof(s), "off: %s", gpu_off_why);
++	} else if (failed) {
++		snprintf(s, sizeof(s), "off: %s failed", stage);
++	} else if (ready) {
++		strlcpy(s, "on", sizeof(s));
++	} else {
++		s[0] = 0;
++	}
++	return SYSCTL_OUT(req, s, strlen(s) + 1);
+ }
++SYSCTL_PROC(_kern, OID_AUTO, laurel_gpu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, laurel_gpu_sysctl, "A",
++    "laurel 2155: the Adreno 610: on, off: <reason>, empty while it starts");
+ 
+ /* laurel: the GPU is to be used (not killed by gpu=0, bring-up not failed): IOSurface placement asks this */
+ bool
+@@ -1408,6 +1518,7 @@ topaz_gpu_gl_active(void)
+ void
+ topaz_gpu_gl_opened(void)
+ {
++	gl_pid = proc_selfpid();                /* laurel 2155: the watchdog's GL client */
+ 	if (!gl_active && ready) {
+ 		gl_active = true;
+ 		IOLog("LAUREL GPU: GL: backboardd opened the GPU: its screen surfaces from the GPU pool, direct scanout off\n");

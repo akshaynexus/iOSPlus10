@@ -29,6 +29,13 @@ UFS, buttons, D22AP /product) and changes what differs on the Mi A3:
     "LAUREL RAM: off:" line.
   * /arm-io/bluetooth (kernel patch 2600): local-mac-address (fallback 02:4c:41:33:42:54, synthetic),
     transport-encoding 3 (H4BC), transport-speed 3000000, as the negroni [adt.bluetooth] node.
+  * /chosen mac-address-wifi0 / -bluetooth0 / -ethernet0 (locally administered, not the phone's): MobileGestalt
+    answers WifiAddress/BluetoothAddress/EthernetAddress from them. Without them each WifiAddress answer waits 5 s for
+    an IONetworkController that never comes (topaz's RedwoodWLAN publishes an IO80211Controller, no
+    IONetworkController), and the old-style UniqueDeviceID needs it: the first LaunchServices seed of a new root asks
+    once per bundle, lsd answers nobody for many minutes, SpringBoard (ControlCenter module repository) and backboardd
+    wait for lsd and the Apple logo stays (Mi A3 root of 2026-11-01 05:41, docs/laurel_sprout/gpu.md "GL stall";
+    negroni 1697e28 scripts/ios16/adt-extra.py, ios-flame tools/mkadt.py). bluetooth0 = the /arm-io/bluetooth fallback.
   * /chosen laurel-ram-banks (u64 base/size pairs): the DDR banks XNU may manage, B 0x80000000 + 1 GiB and
     C 0xC0000000 + 4 GiB (they touch; bank A 0x40000000-0x7CC00000 holds every fixed carve-out). /chosen
     laurel-ram-reserved: device pools that must stay out of kernel RAM: 0xC0000000 + 512 MiB (Adreno GPU pool) and
@@ -65,6 +72,8 @@ LAUREL_ECID = 0x4C415552454C0001       # 'LAUREL' + 1, synthetic (not the phone'
 # Bluetooth (patch 2600): fallback address, locally administered, synthetic (not the phone's), used only when the
 # WCN3990 has no unique address of its own; the speed the kernel leaves the chip at
 BT_ADDR = bytes.fromhex('024c41334254')   # 02:4c:41:33:42:54 ("LA3BT")
+WIFI_ADDR = bytes.fromhex('024c41335746')  # 02:4c:41:33:57:46 ("LA3WF"), /chosen mac-address-wifi0 (MobileGestalt)
+ETH_ADDR = bytes.fromhex('024c4133454e')   # 02:4c:41:33:45:4e ("LA3EN"), /chosen mac-address-ethernet0
 BT_SPEED = 3000000
 GOLD_HZ, SILVER_HZ = 2000000000, 1800000000   # SM6125: Gold 2.0 GHz, Silver 1.8 GHz [I: public spec; OSM LUT not read yet]
 
@@ -151,6 +160,10 @@ def build(cores=8, dram=(0x80000000, 0x40000000), seed=None, boot='gold', darwin
     setprop(chosen, 'display-scale', u32(2))
     setprop(chosen, 'laurel-ram-banks', b''.join(u64(b, sz) for b, sz in RAM_BANKS))   # laurel 2100 self-check
     setprop(chosen, 'laurel-ram-reserved', b''.join(u64(b, sz) for b, sz in RAM_RESERVED))
+    # MobileGestalt's network addresses (see the module docstring): no 5 s IONetworkController wait per answer
+    setprop(chosen, 'mac-address-wifi0', WIFI_ADDR)
+    setprop(chosen, 'mac-address-bluetooth0', BT_ADDR)
+    setprop(chosen, 'mac-address-ethernet0', ETH_ADDR)
     fw = 'laurel-uefi' if darwinboot else 'laurel-shim'
     setprop(chosen, 'firmware-version', cstr(fw))
     setprop(chosen, 'system-firmware-version', cstr(fw))
