@@ -4043,3 +4043,28 @@ Details: `docs/laurel_sprout/battery-power.md`.
   and hides the nub when off. Userland builds on Linux (userland/laurel/bt/build.sh), root.sh calls root-bt.sh (BT=0 skips).
 - Line to check on the next boot: `LAUREL BT: on: WCN3990 product 0x000a rom 0x0201, crbtfw21.tlv + crnv21.bin, 3000000 baud,
   BD_ADDR ..` or `LAUREL BT: off: <why>` (+ `LAUREL BT: clk:/geni:/power:/chip:/fw:` step lines).
+
+## Mi A3: endless vibration on the first SpringBoard boot = an iOS loop with no stop; 2700 repeat cap + key stop (2026-11-01 05:50, vibration agent, branch t3/laurel-vibration-endless)
+- Details: docs/laurel_sprout/haptics.md section "Repeat".
+- [V log 05:29] One `LAUREL VIBRATOR: start: 2 steps (first 400 ms on, 400 ms on in all), repeat 1` at 05:29:45 (2 s after three
+  power presses, same second as `exec AccessibilityUIServer`), then 146 plays (one per about 0.54 s, three duty cuts) and no other
+  vibrator request until the reboot at 05:31:10. The only stop was the one at 05:29:20, before the start.
+- [V 20H392 MediaExperience] FigVibrator play 0x195a42a48 sends `repeat = true` when total > period and ends the loop only with a
+  one-shot dispatch timer at the total (handler 0x195a43b34 -> stop 0x195a428b4 = bare CFNumber 0 from ctx+0x28). A pattern
+  dictionary without TotalDuration gets total 0x4a237a00 = 2678400 s (31 days) at 0x195a94448: then only the client's
+  FigVibratorStop (0x195a940dc) ends it. iOS 16 has no other stop form.
+- [V] D22 SystemSoundVibrationPatterns.plist: on 0.4 / off 0.1 = `Default` (TotalDuration 0.5, plays without repeat). ToneLibrary
+  has `Looped`/`OnDuration`/`OffDuration` strings and no `TotalDuration`.
+- [I] The client that started the loop and lost its stop is not known (triple press = Accessibility Shortcut or Emergency SOS;
+  or an alert that waits for its sound to end, with no audio route on laurel). The kernel now logs each request shape once with
+  the caller process (`LAUREL VIBRATOR: request kind K from PROC: SHAPE`).
+- Fix in 2700 (LaurelVibrator.cpp + one call in sweet_keys.c): a repeat stops 60 s after its request when no new request comes
+  (kill switch `laurel_vib_cap=0` = old 5 min), and a power/volume key-down stops a running repeat. 60 s [I]: a ring ends within
+  about 30 s (network no-reply divert, 3GPP 5..30 s), so 2x margin; an alarm's vibration also stops at 60 s on this port.
+- How to read the 20H392 shared cache on Linux (no ipsw): `apfs-fuse -o ro ~/op10-apple/20H392/087-86593-047.dmg out/mnt-cryptex`
+  (the Cryptex holds `System/Library/Caches/com.apple.dyld/`), then `scripts/debug/dsc-dis.py DIR dis VADDR LEN` (llvm-objdump, real
+  vaddrs), `read`, `str TEXT` (string -> vaddr + image). Root plists come from the HFS+ root without a mount:
+  `7z x ~/op10-apple/laurel-ios16-root.img 'iOSRoot/...'`.
+- Built 05:48 in the worktree: 241/241 patches applied, 0 LSE, no new warnings, kernel.development.sweet.4k sha256 42e4ea88...
+  NOT BOOTED. Next boot: expect `LAUREL VIBRATOR: on: ... a repeat ends after 60 s ...`, `request kind` lines, and a repeat ends
+  with `repeat stopped by the <key> key` or `repeat stopped: 60 s and no new request`.
