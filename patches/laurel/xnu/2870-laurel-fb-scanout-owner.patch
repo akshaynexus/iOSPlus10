@@ -1,0 +1,633 @@
+laurel 2870: scanout owner + fbcon off the panel. Owner bug 2026-11-01 07:45 (GL, SMMU stage 1, 2104 in): "the kernel log flashes ABOVE the iOS UI when you move or do anything" (white text on black). Cause [V, code + boot-args]: the laurel boot-args have serial=3 and the ADT has /sweet-fbcon (mkadt, reg 0x5c000000 720x1560), so arm_init switches the kernel console to the serial ops (cons_ops_index = SERIAL_CONS_OPS; 'Serial keyboard started' in the logs) and every printf/IOLog character goes _cnputs -> serial_putc_options -> uart_putc -> fbcon_transmit_data, which draws white (0xffffffff) on black (0xff000000) 2x glyphs and clears 2 rows per newline straight into the boot framebuffer 0x5c000000. That is AppleCLCD's surface 1: backboardd's GL copies every other frame into it (redwood-gl '1 picture copied out') and since 2104 the MDP scans it directly ('LAUREL FB HANDOFF: swap 2 shows surface 1 ... by scanning it directly'). Each kernel line during the UI was drawn into the frame on the panel until the next surface-1 frame overwrote it; more activity = more kernel lines = more text. The video console (2104's shadow) gets no text at all with serial=3, so 2104's self-check passed while the real console drew on the panel. Fix: (1) fbcon: AppleCLCD start moves it into the console shadow (laurel_fbcon_retarget; line LAUREL FBCON: on), the vsync copies the shadow into the boot console frames when the fbcon drew (laurel_fbcon_take_dirty: the boot log is live again after AppleCLCD start); at the first iOS frame a fbcon still on the boot framebuffer is muted; a panic always draws, cleans the rows and points the MDP at the buffer (laurel_fbcon_show_hook -> laurel_fb_panic_show). (2) scanout owner: scanFrom (the only writer of the pipe's SRC0_ADDR) gets what the buffer holds (iOS frame, black, kernel text, panic); the console shadow is always kernel text, a flip buffer holds what it was last filled with (fFlipHolds); after the first iOS frame a kernel-text scanout is refused (the panel keeps its frame), logged once per caller with the caller address (LAUREL FB OWNER: refused: ...), except in a panic. (3) once the first iOS frame is latched: the console shadow and both flip buffers (those not on the panel) are cleared to black (LAUREL FB OWNER: on: ...); the copy path also clears a back buffer that still holds kernel text. Kill switch fbowner=0 (no refusal, no clear; the fbcon move stays).
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b975a75..e9c70f4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -44,6 +44,24 @@ extern "C" void topaz_audio_init(void);
+ extern "C" void sweet_amfi_service_init(void);
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
++/* laurel 2870: the fbcon (pexpert/arm/pe_serial.c), the kernel console with serial=3 */
++extern "C" int laurel_fbcon_retarget(vm_offset_t va, uint32_t width, uint32_t height, uint32_t stride);
++extern "C" int laurel_fbcon_state(void);
++extern "C" int laurel_fbcon_take_dirty(void);
++extern "C" void laurel_fbcon_mute(void);
++extern "C" void (*laurel_fbcon_show_hook)(void);
++extern "C" unsigned panic_active(void);
++#define LAUREL_FBCON_REGISTERED 1
++#define LAUREL_FBCON_SHADOW     2
++#define LAUREL_FBCON_MUTED      4
++#define LAUREL_FBCON_CONSOLE    8
++/*
++ * laurel 2870 (scanout owner): what the buffer that the MDP is told to scan holds. After the first iOS frame
++ * only iOS frames (and black / faded iOS frames of a power-off) may reach the panel; kernel text (the console
++ * shadow, a flip buffer with a console frame, the boot framebuffer before it was handed to iOS) only in a panic.
++ */
++enum { LAUREL_SCAN_IOS = 0, LAUREL_SCAN_BLACK = 1, LAUREL_SCAN_TEXT = 2, LAUREL_SCAN_PANIC = 3 };
++static const char *const laurel_scan_names[] = { "iOS frame", "black", "kernel text", "panic screen" };
+ extern "C" void topaz_adreno_init(void);
+ extern "C" bool topaz_gpu_gl_active(void);          /* laurel 2150: backboardd's GL has the GPU (SWEET FPS, 2152) */           /* iokit/Kernel/arm/TopazAdreno.cpp (boot-arg gpu=1) */
+ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* RedwoodGPU.cpp */
+@@ -91,6 +109,8 @@ sweet_hold_set(SweetSurface **set, bool on)
+ class AppleCLCD;
+ static AppleCLCD *sweet_cons_fb;
+ static void sweet_cons_show(void);
++static AppleCLCD *laurel_panic_fb;      /* laurel 2870 */
++static void laurel_fb_panic_show(void);
+ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
+ class AppleCLCD;
+@@ -216,7 +236,7 @@ public:
+ 	void          showDirect(const uint8_t *rec, SweetSurface **held);
+ 	void          showPending(const uint8_t *rec, SweetSurface **held);
+ 	bool          directEligible(const uint8_t *rec, SweetSurface **held);
+-	void          scanFrom(uint64_t pa, uint32_t stride);
++	bool          scanFrom(uint64_t pa, uint32_t stride, int holds, const char *who);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -228,9 +248,9 @@ public:
+ 	uint64_t      fFlipPhys[2];
+ 	uint32_t      fFlipIdx;
+ 	bool          fConsShown;     /* console frames on the panel (no iOS frame yet) */
+-	void          flipFrom(const uint8_t *src, uint32_t srcStride);
++	bool          flipFrom(const uint8_t *src, uint32_t srcStride, int holds, const char *who);
+ 	uint8_t      *backBuffer(void) { return (uint8_t *)fFlip[fFlipIdx ^ 1]->getBytesNoCopy(); }
+-	void          flipBack(void);
++	bool          flipBack(int holds, const char *who);
+ 	IOBufferMemoryDescriptor *fCons;    /* console shadow frame (cached, contiguous) */
+ 	uint64_t      fConsPhys;
+ 	/*
+@@ -242,11 +262,24 @@ public:
+ 	bool          fFlipStale[2];
+ 	bool          fSurfaceTold;
+ 	void          consoleHandoff(void);
++	/*
++	 * laurel 2870 (scanout owner): fFlipHolds = what each flip buffer holds (LAUREL_SCAN_*), fScanHolds = what
++	 * the panel shows. fOwner 0 = kill switch fbowner=0 (no refusal, no clear at the handoff).
++	 */
++	int           fOwner;
++	uint8_t       fFlipHolds[2];
++	uint8_t       fScanHolds;
++	volatile UInt32 fHandoffClear;  /* 1: clear the kernel buffers once the first iOS frame is latched */
++	const char   *fRefusedBy[8];  /* callers already logged */
++	uint32_t      fRefused;
++	const char   *bufName(uint64_t pa);
++	void          ownerRefuse(uint64_t pa, int holds, const char *who, void *caller);
++	void          handoffClear(void);
+ 	const uint8_t *fLastVA;       /* last directly scanned frame (panel window) */
+ 	uint32_t      fLastStride;
+ 	SweetSurface *fLastSurf;      /* keeps fLastVA alive */
+ 	SweetSurface *fPendHold[4], *fShowHold[4], *fRetireHold[4];   /* in-use holds */
+-	void          fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step);
++	void          fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step, int holds);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+@@ -606,6 +639,8 @@ AppleCLCD::start(IOService *provider)
+ 	int native = laurel_fb_native(provider, fWidth, fHeight);       /* laurel 2103: native canvas by default */
+ 	uint32_t handoff = 1;                                           /* laurel 2104: console handoff */
+ 	fHandoff = !(PE_parse_boot_argn("fbhandoff", &handoff, sizeof(handoff)) && handoff == 0);
++	uint32_t owner = 1;                                             /* laurel 2870: scanout owner */
++	fOwner = !(PE_parse_boot_argn("fbowner", &owner, sizeof(owner)) && owner == 0);
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+@@ -746,9 +781,23 @@ AppleCLCD::start(IOService *provider)
+ 			sweet_cons_fb = this;
+ 			sweet_console_show_hook = sweet_cons_show;
+ 			sweet_console_retarget((vm_offset_t)c);
++			/*
++			 * laurel 2870: with serial=3 the kernel console is the fbcon, which drew into the boot
++			 * framebuffer (= surface 1, an iOS frame buffer from now on). It draws into the shadow too.
++			 */
++			int fbcon = laurel_fbcon_retarget((vm_offset_t)c, fWidth, fHeight, fRowBytes);
+ 			fConsShown = true;
+-			flipFrom(c, fRowBytes);
++			fFlipHolds[0] = fFlipHolds[1] = LAUREL_SCAN_TEXT;
++			flipFrom(c, fRowBytes, LAUREL_SCAN_TEXT, "boot console");
+ 			IOLog("SWEET FB: console double buffered (shadow %#llx)\n", fConsPhys);
++			if (fbcon) {
++				IOLog("LAUREL FBCON: on: the fbcon (%s) draws into the console shadow %#llx, no longer into the "
++				    "boot framebuffer %#llx (surface 1, iOS frames)\n",
++				    (laurel_fbcon_state() & LAUREL_FBCON_CONSOLE) ? "the kernel console, serial=3" : "kprintf only",
++				    fConsPhys, fPhys);
++			} else {
++				IOLog("LAUREL FBCON: off: no fbcon (no sweet-fbcon node): the video console is the kernel console\n");
++			}
+ 			/*
+ 			 * laurel 2104: the boot framebuffer is surface 1 now, a buffer backboardd draws into (GL
+ 			 * renders frames there). Clear the boot text in it once the MDP has left it, so a frame
+@@ -767,6 +816,8 @@ AppleCLCD::start(IOService *provider)
+ 		} else {
+ 			OSSafeReleaseNULL(fCons);
+ 		}
++		laurel_panic_fb = this;                         /* laurel 2870: fbcon panic text */
++		laurel_fbcon_show_hook = laurel_fb_panic_show;
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+@@ -847,7 +898,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			IOLockUnlock(fb->fLock);
+ 			if (first) {
+ 				bzero(fb->backBuffer(), (size_t)fb->fRowBytes * fb->fHeight);
+-				fb->flipBack();
++				fb->flipBack(LAUREL_SCAN_BLACK, "power-off black frame");
+ 			}
+ 			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 			return;
+@@ -863,15 +914,22 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			    fb->fConsShown ?
+ 			    (const uint8_t *)fb->fCons->getBytesNoCopy() : (const uint8_t *)fb->fPixels;
+ 			uint32_t srcStride = (!front && fb->fLastVA) ? fb->fLastStride : fb->fRowBytes;
++			/* laurel 2870: a faded frame holds what its source holds */
++			int holds = front ? fb->fFlipHolds[fb->fFlipIdx] : fb->fLastVA ? LAUREL_SCAN_IOS :
++			    fb->fConsShown ? LAUREL_SCAN_TEXT : fb->fHandedOff ? LAUREL_SCAN_IOS : LAUREL_SCAN_TEXT;
+ 			IOLockUnlock(fb->fLock);
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+-				fb->fadeStep(src, srcStride, step);
++				fb->fadeStep(src, srcStride, step, holds);
+ 			}
+ 			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 			return;
+ 		}
+-		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
+-			fb->scanFrom(fb->fBootSrc, fb->fBootStride);
++		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc &&
++		    !fb->scanFrom(fb->fBootSrc, fb->fBootStride, fb->fHandedOff ? LAUREL_SCAN_IOS : LAUREL_SCAN_TEXT,
++		    "power-off fade in the boot framebuffer")) {
++			IOLockUnlock(fb->fLock);
++			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++			return;
+ 		}
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+@@ -908,8 +966,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	bzero(fb->fRetireHold, sizeof(fb->fRetireHold));
+ 	IOLockUnlock(fb->fLock);
+ 	sweet_hold_set(retire, false);
+-	if (fb->fConsShown && sweet_console_copy_dirty(fb->backBuffer())) {
+-		fb->flipBack();
++	if (fb->fConsShown) {
++		/*
++		 * laurel 2870: the video console and the fbcon both draw into the shadow. The fbcon draws every
++		 * kernel line: its frames go out at the sweetfb_hz pace (a 4.5 MB copy each), not every tick.
++		 */
++		bool vc = sweet_console_copy_dirty(fb->backBuffer()) != 0;
++		bool fc = (count % fb->fFlushTicks) == 0 && laurel_fbcon_take_dirty() != 0 && fb->fCons != NULL;
++		if (fc && !vc) {
++			memcpy(fb->backBuffer(), fb->fCons->getBytesNoCopy(), (size_t)fb->fRowBytes * fb->fHeight);
++		}
++		if ((vc || fc) && fb->fConsShown) {
++			fb->flipBack(LAUREL_SCAN_TEXT, "boot console frame (vsync)");
++		}
+ 	}
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+@@ -1271,9 +1340,67 @@ AppleCLCD::showPending(const uint8_t *rec, SweetSurface **heldIn)
+ 	}
+ }
+ 
++/*
++ * laurel 2870 (scanout owner): the only place that sets the pipe's scanout address (SRC0_ADDR). `holds` is what
++ * the caller put into that buffer; the kernel's own buffers are checked by address: the console shadow always
++ * holds kernel text, a flip buffer holds what it was last filled with (fFlipHolds). After the first iOS frame a
++ * buffer with kernel text is refused (the panel keeps its frame), logged once per caller; a panic is let through.
++ * Kill switch fbowner=0.
++ */
++const char *
++AppleCLCD::bufName(uint64_t pa)
++{
++	if (pa != 0 && pa == fConsPhys) {
++		return "the console shadow";
++	}
++	if (fFlip[0] != NULL && pa == fFlipPhys[0]) {
++		return "flip buffer 0";
++	}
++	if (fFlip[1] != NULL && pa == fFlipPhys[1]) {
++		return "flip buffer 1";
++	}
++	if (pa == fPhys || pa == fBootSrc) {
++		return "the boot framebuffer (surface 1)";
++	}
++	return "an iOS surface";
++}
++
+ void
+-AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
++AppleCLCD::ownerRefuse(uint64_t pa, int holds, const char *who, void *caller)
++{
++	unsigned i;
++	fRefused++;
++	for (i = 0; i < sizeof(fRefusedBy) / sizeof(fRefusedBy[0]) && fRefusedBy[i] != NULL; i++) {
++		if (fRefusedBy[i] == who) {
++			return;         /* (logged once per caller) */
++		}
++	}
++	if (i < sizeof(fRefusedBy) / sizeof(fRefusedBy[0])) {
++		fRefusedBy[i] = who;
++	}
++	IOLog("LAUREL FB OWNER: refused: %s (caller %p) asked the panel to show %s %#llx (%s) after the iOS handoff; "
++	    "the panel keeps %s %#llx (%s); %u refused so far\n", who, caller, bufName(pa), (unsigned long long)pa,
++	    laurel_scan_names[holds & 3], bufName(fScanPhys), (unsigned long long)fScanPhys,
++	    laurel_scan_names[fScanHolds & 3], fRefused);
++}
++
++bool
++AppleCLCD::scanFrom(uint64_t pa, uint32_t stride, int holds, const char *who)
+ {
++	if (holds != LAUREL_SCAN_PANIC) {
++		if (pa != 0 && pa == fConsPhys) {
++			holds = LAUREL_SCAN_TEXT;
++		}
++		for (int i = 0; i < 2; i++) {
++			if (fFlip[i] != NULL && pa == fFlipPhys[i]) {
++				holds = fFlipHolds[i];
++			}
++		}
++	}
++	if (holds == LAUREL_SCAN_TEXT && fHandedOff && fOwner > 0 && !panic_active()) {
++		ownerRefuse(pa, holds, who, __builtin_return_address(0));
++		return false;
++	}
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -1281,6 +1408,8 @@ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fScanPhys = pa;
+ 	fScanStride = stride;
++	fScanHolds = (uint8_t)holds;
++	return true;
+ }
+ 
+ /*
+@@ -1697,12 +1826,30 @@ sweet_cons_show(void)
+ {
+ 	AppleCLCD *fb = sweet_cons_fb;
+ 	if (fb != NULL && fb->fVig0 != NULL && fb->fScanPhys != fb->fConsPhys) {
+-		fb->scanFrom(fb->fConsPhys, fb->fRowBytes);
++		fb->scanFrom(fb->fConsPhys, fb->fRowBytes, LAUREL_SCAN_PANIC, "panic (video console)");
++	}
++}
++
++/*
++ * laurel 2870: panic text of the fbcon (MMIO only, no locks): the console shadow, or the boot framebuffer when the
++ * fbcon could not move (no shadow).
++ */
++static void
++laurel_fb_panic_show(void)
++{
++	AppleCLCD *fb = laurel_panic_fb;
++	if (fb == NULL || fb->fVig0 == NULL || !panic_active()) {
++		return;
++	}
++	bool shadow = (laurel_fbcon_state() & LAUREL_FBCON_SHADOW) != 0 && fb->fConsPhys != 0;
++	uint64_t pa = shadow ? fb->fConsPhys : fb->fBootSrc;
++	if (fb->fScanPhys != pa) {
++		fb->scanFrom(pa, shadow ? fb->fRowBytes : fb->fBootStride, LAUREL_SCAN_PANIC, "panic (fbcon)");
+ 	}
+ }
+ 
+ void
+-AppleCLCD::fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step)
++AppleCLCD::fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step, int holds)
+ {
+ 	uint8_t *orig = (uint8_t *)fFadeOrig->getBytesNoCopy();
+ 	uint8_t *out = backBuffer();
+@@ -1724,21 +1871,28 @@ AppleCLCD::fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step)
+ 			o[x] = lo | (hi << 8);
+ 		}
+ 	}
+-	flipBack();
++	flipBack(holds, "power-off fade");
+ }
+ 
+-/* Clean the back buffer and point the MDP at it (latched at its vsync). */
+-void
+-AppleCLCD::flipBack(void)
++/*
++ * Clean the back buffer and point the MDP at it (latched at its vsync). laurel 2870: `holds` = what was just put
++ * into it; refused (kernel text after the handoff): the panel keeps the front buffer.
++ */
++bool
++AppleCLCD::flipBack(int holds, const char *who)
+ {
+ 	uint32_t idx = fFlipIdx ^ 1;
++	fFlipHolds[idx] = (uint8_t)holds;
+ 	sweet_dcache_clean((vm_offset_t)(uintptr_t)fFlip[idx]->getBytesNoCopy(), (unsigned)fFlip[idx]->getLength());
+-	scanFrom(fFlipPhys[idx], fRowBytes);
++	if (!scanFrom(fFlipPhys[idx], fRowBytes, holds, who)) {
++		return false;
++	}
+ 	fFlipIdx = idx;
++	return true;
+ }
+ 
+-void
+-AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
++bool
++AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride, int holds, const char *who)
+ {
+ 	uint8_t *dst = backBuffer();
+ 	if (srcStride == fRowBytes) {
+@@ -1748,7 +1902,7 @@ AppleCLCD::flipFrom(const uint8_t *src, uint32_t srcStride)
+ 			memcpy(dst + (uint64_t)y * fRowBytes, src + (uint64_t)y * srcStride, (size_t)fWidth * 4);
+ 		}
+ 	}
+-	flipBack();
++	return flipBack(holds, who);
+ }
+ 
+ /*
+@@ -1785,8 +1939,8 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 		 * flipped to a back buffer that still held a console frame from boot, so every frame drawn
+ 		 * into surface 1 showed the kernel log until the next frame.
+ 		 */
+-		if (fHandoff > 0 && (fPhys & 0xf) == 0 && fPhys + (uint64_t)fHeight * fRowBytes < (1ull << 32)) {
+-			scanFrom(fPhys, fRowBytes);
++		if (fHandoff > 0 && (fPhys & 0xf) == 0 && fPhys + (uint64_t)fHeight * fRowBytes < (1ull << 32) &&
++		    scanFrom(fPhys, fRowBytes, LAUREL_SCAN_IOS, "surface 1 frame (direct)")) {
+ 			ok = true;
+ 			IOLockLock(fLock);
+ 			if (fLastSurf != s) {
+@@ -1827,13 +1981,13 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 				 */
+ 				if (s->gpuPool) {
+ 					/* GPU pool memory (write-combined): the MDP scans the surface itself, no copy */
+-					scanFrom(pa, s->bytesPerRow);
++					scanFrom(pa, s->bytesPerRow, LAUREL_SCAN_IOS, "GPU-pool frame (direct)");
+ 				} else if (fFlip[0] != NULL) {
+ 					flipFrom((const uint8_t *)(va + s->offset + (uint64_t)oy * s->bytesPerRow + (uint64_t)ox * 4),
+-					    s->bytesPerRow);
++					    s->bytesPerRow, LAUREL_SCAN_IOS, "full-screen frame (copied)");
+ 				} else {
+ 					sweet_dcache_clean((vm_offset_t)(va + s->offset + (uint64_t)oy * s->bytesPerRow), (unsigned)((uint64_t)fHeight * s->bytesPerRow));
+-					scanFrom(pa, s->bytesPerRow);
++					scanFrom(pa, s->bytesPerRow, LAUREL_SCAN_IOS, "scanout-slot frame (direct)");
+ 				}
+ 				ok = true;
+ 				IOLockLock(fLock);
+@@ -1867,14 +2021,31 @@ extern "C" int sweet_console_on_shadow(void);       /* osfmk/console/video_conso
+ void
+ AppleCLCD::consoleHandoff(void)
+ {
++	/*
++	 * laurel 2870: the fbcon (the kernel console with serial=3) must not draw into the boot framebuffer either:
++	 * muted when it is still there (no shadow). Before any switch: its text in surface 1 was the 07:45 flash.
++	 */
++	int fbcon = laurel_fbcon_state();
++	if ((fbcon & LAUREL_FBCON_REGISTERED) && !(fbcon & LAUREL_FBCON_SHADOW)) {
++		laurel_fbcon_mute();
++		IOLog("LAUREL FBCON: on: the fbcon is still on the boot framebuffer %#llx (surface 1, no console shadow): it "
++		    "stops drawing (USB log keeps the text, a panic draws)\n", fPhys);
++	}
++	if (fOwner > 0 && fVig0 != NULL) {
++		fHandoffClear = 1;      /* (present() clears the kernel buffers once this frame is latched) */
++	} else if (fOwner == 0) {
++		IOLog("LAUREL FB OWNER: off: fbowner=0 (any buffer may be scanned, kernel buffers keep their text)\n");
++	}
+ 	if (fHandoff == 0) {
+ 		IOLog("LAUREL FB HANDOFF: off: fbhandoff=0 (kernel console frames may show on the panel)\n");
+ 		return;
+ 	}
+ 	if (sweet_console_on_shadow()) {
+ 		IOLog("LAUREL FB HANDOFF: on: first iOS frame owns the panel; kernel console only in its shadow %#llx "
+-		    "(not scanned, shown again only by a panic); surface 1 = boot framebuffer %#llx, scanned directly\n",
+-		    fConsPhys, fPhys);
++		    "(%s; not scanned, shown again only by a panic); surface 1 = boot framebuffer %#llx, scanned directly\n",
++		    fConsPhys, (fbcon & LAUREL_FBCON_CONSOLE) ? ((fbcon & LAUREL_FBCON_SHADOW) ? "console = fbcon, in the shadow" :
++		    "console = fbcon, muted") : (fbcon & LAUREL_FBCON_REGISTERED) ? "video console; fbcon kprintf only" :
++		    "video console", fPhys);
+ 	} else {
+ 		sweet_console_muted = 1;
+ 		IOLog("LAUREL FB HANDOFF: on: first iOS frame owns the panel; no console shadow (console drew into the "
+@@ -1882,6 +2053,48 @@ AppleCLCD::consoleHandoff(void)
+ 	}
+ }
+ 
++/*
++ * laurel 2870: once the first iOS frame is latched, the kernel's own frame buffers that are not on the panel are
++ * cleared to black: the console shadow (only a panic shows it again; the text since now is drawn on black) and
++ * both flip buffers (they held boot console frames). A flip buffer on the panel holds an iOS frame (copy path).
++ */
++static void
++laurel_fill_black(void *va, size_t size)
++{
++	for (size_t o = 0; o + 8 <= size; o += 8) {
++		*(volatile uint64_t *)((uint8_t *)va + o) = 0xff000000ff000000ull;
++	}
++	sweet_dcache_clean((vm_offset_t)(uintptr_t)va, (unsigned)size);
++}
++
++void
++AppleCLCD::handoffClear(void)
++{
++	if (fHandoffClear == 0 || (fCtl0 != NULL && (fCtl0[0x18 / 4] & fFlush) != 0)) {
++		return;         /* (not latched yet: the next frame tries again) */
++	}
++	if (!OSCompareAndSwap(1, 0, &fHandoffClear)) {
++		return;
++	}
++	size_t fsz = (size_t)fRowBytes * fHeight;
++	unsigned flips = 0;
++	for (int i = 0; i < 2; i++) {
++		if (fFlip[i] != NULL && fFlipPhys[i] != fScanPhys) {
++			laurel_fill_black(fFlip[i]->getBytesNoCopy(), fsz);
++			fFlipHolds[i] = LAUREL_SCAN_BLACK;
++			fFlipStale[i] = false;
++			flips++;
++		}
++	}
++	if (fCons != NULL) {
++		laurel_fill_black(fCons->getBytesNoCopy(), fsz);
++	}
++	IOLog("LAUREL FB OWNER: on: after the first iOS frame only iOS frames reach the panel (kernel text only in a "
++	    "panic); cleared to black: %s%#llx, %u flip buffer(s); panel on %s %#llx (%s)\n",
++	    fCons != NULL ? "console shadow " : "no console shadow ", (unsigned long long)fConsPhys, flips,
++	    bufName(fScanPhys), (unsigned long long)fScanPhys, laurel_scan_names[fScanHolds & 3]);
++}
++
+ /* laurel 2103: self-report of the canvas (see laurel_fb_native) */
+ static void
+ laurel_fb_first_frame(const uint8_t *rec, const char *path, uint32_t cw, uint32_t chh)
+@@ -1927,11 +2140,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 		(void)mask;
+ 		return;
+ 	}
+-	fConsShown = false;
++	/* laurel 2870: from the second iOS frame on (the first one is latched by then): clear the kernel buffers */
++	handoffClear();
+ 	if (!fHandedOff) {
+-		fHandedOff = true;
++		fHandedOff = true;              /* (first: a console flip racing with this frame is refused, 2870) */
++		__asm__ volatile ("dmb ish" ::: "memory");
++		fConsShown = false;
+ 		consoleHandoff();               /* laurel 2104: the first iOS frame owns the panel */
+ 	}
++	fConsShown = false;
+ 	if (directPresent(rec)) {
+ 		laurel_fb_first_frame(rec, "direct", fLogicalW, fLogicalH);     /* laurel 2103 */
+ 		if (!fConsolePaused) {
+@@ -1953,10 +2170,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 	 */
+ 	uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
+ 	if (fFlip[0] == NULL && fVig0 != NULL && fScanPhys != fBootSrc) {
+-		scanFrom(fBootSrc, fBootStride);
++		scanFrom(fBootSrc, fBootStride, LAUREL_SCAN_IOS, "copy path into the boot framebuffer");
+ 	}
+-	/* laurel 2104: a back buffer with a boot console frame in it is cleared before its first iOS frame */
+-	if (fFlip[0] != NULL && !fConsShown && fFlipStale[fFlipIdx ^ 1]) {
++	/*
++	 * laurel 2104: a back buffer with a boot console frame in it is cleared before its first iOS frame.
++	 * laurel 2870: also any back buffer that still holds kernel text (the layers may not cover all of it).
++	 */
++	if (fFlip[0] != NULL && !fConsShown &&
++	    (fFlipStale[fFlipIdx ^ 1] || fFlipHolds[fFlipIdx ^ 1] == LAUREL_SCAN_TEXT)) {
+ 		fFlipStale[fFlipIdx ^ 1] = false;
+ 		bzero(dst, (size_t)fRowBytes * fHeight);
+ 	}
+@@ -2051,7 +2272,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		s->release();
+ 	}
+ 	if (fFlip[0] != NULL) {
+-		flipBack();
++		flipBack(LAUREL_SCAN_IOS, "iOS frame (copy path)");
+ 	}
+ 	laurel_fb_first_frame(rec, "copy", fLogicalW, fLogicalH);               /* laurel 2103 */
+ }
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..f06a698 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -721,6 +721,44 @@ static volatile uint32_t *fbcon_base;
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
++/*
++ * laurel 2870 (fbcon off the panel): with serial=3 (the laurel boot-args) this fbcon IS the kernel console
++ * (arm_init: serialmode output + a serial device -> cons_ops = serial; the video console gets no text), and it
++ * drew every printf/IOLog line straight into the boot framebuffer 0x5c000000. That buffer is AppleCLCD's
++ * surface 1: backboardd's GL copies every other frame into it and the MDP scans it directly (2104), so each
++ * kernel line was drawn into a frame on the panel (white text on black, 2x font): "the kernel log flashes over
++ * the UI when anything moves". AppleCLCD moves the fbcon into its console shadow at start (laurel_fbcon_retarget,
++ * a cached buffer that only the boot console frames and a panic show) and mutes it at the first iOS frame if it
++ * could not move it. A panic always draws and asks AppleCLCD to show the buffer (laurel_fbcon_show_hook).
++ */
++#define LAUREL_FBCON_REGISTERED 1
++#define LAUREL_FBCON_SHADOW     2
++#define LAUREL_FBCON_MUTED      4
++#define LAUREL_FBCON_CONSOLE    8
++static volatile int fbcon_dirty;        /* drawn since AppleCLCD last copied the shadow */
++static int fbcon_shadow;                /* draws into AppleCLCD's console shadow (cached) */
++static int fbcon_muted;                 /* no drawing (a panic draws) */
++void (*laurel_fbcon_show_hook)(void);
++extern void sweet_dcache_clean(vm_offset_t addr, unsigned length);     /* osfmk/arm/caches.c */
++extern boolean_t console_is_serial(void);
++int laurel_fbcon_retarget(vm_offset_t va, uint32_t width, uint32_t height, uint32_t stride);
++int laurel_fbcon_state(void);
++int laurel_fbcon_take_dirty(void);
++void laurel_fbcon_mute(void);
++
++/* a panic: the text must be in memory (the shadow is cached) and on the panel */
++static void
++fbcon_panic_show(uint32_t row)
++{
++	if (fbcon_shadow && row < fbcon_rows) {
++		sweet_dcache_clean((vm_offset_t)(uintptr_t)(fbcon_base + row * 16 * FBCON_SCALE * (fbcon_stride / 4)),
++		    16 * FBCON_SCALE * fbcon_stride);
++	}
++	if (laurel_fbcon_show_hook != NULL) {
++		laurel_fbcon_show_hook();
++	}
++}
++
+ static void
+ fbcon_clear_row(uint32_t row)
+ {
+@@ -739,6 +777,10 @@ fbcon_newline(void)
+ 	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+ 	fbcon_clear_row(fbcon_row);
+ 	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++	if (panic_active()) {
++		fbcon_panic_show(fbcon_row);
++		fbcon_panic_show((fbcon_row + 1) % fbcon_rows);
++	}
+ }
+ 
+ static void
+@@ -761,6 +803,10 @@ fbcon_transmit_ready(void)
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++	if (fbcon_muted && !panic_active()) {
++		return;                         /* laurel 2870: the text is in the USB log only */
++	}
++	fbcon_dirty = 1;
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
+@@ -786,6 +832,62 @@ fbcon_transmit_data(uint8_t c)
+ 		}
+ 	}
+ 	fbcon_col++;
++	if (panic_active()) {
++		fbcon_panic_show(fbcon_row);
++	}
++}
++
++/*
++ * laurel 2870: AppleCLCD start. Draw from now on into va (its console shadow, same panel geometry), which already
++ * holds a copy of the boot framebuffer. Returns 0 when there is no fbcon.
++ */
++int
++laurel_fbcon_retarget(vm_offset_t va, uint32_t width, uint32_t height, uint32_t stride)
++{
++	if (fbcon_base == NULL || va == 0 || width < 8 * FBCON_SCALE || height < 2 * 16 * FBCON_SCALE ||
++	    stride < width * 4) {
++		return 0;
++	}
++	uint32_t rows = height / (16 * FBCON_SCALE), cols = width / (8 * FBCON_SCALE);
++	fbcon_width = width;
++	fbcon_height = height;
++	fbcon_stride = stride;
++	fbcon_cols = cols;
++	fbcon_rows = rows;
++	if (fbcon_row >= rows) {
++		fbcon_row = 0;
++	}
++	if (fbcon_col >= cols) {
++		fbcon_col = 0;
++	}
++	__asm__ volatile ("dmb ish" ::: "memory");
++	fbcon_base = (volatile uint32_t *)va;
++	fbcon_shadow = 1;
++	fbcon_dirty = 1;
++	return 1;
++}
++
++int
++laurel_fbcon_state(void)
++{
++	return (fbcon_base != NULL ? LAUREL_FBCON_REGISTERED : 0) | (fbcon_shadow ? LAUREL_FBCON_SHADOW : 0) |
++	       (fbcon_muted ? LAUREL_FBCON_MUTED : 0) |
++	       (fbcon_base != NULL && console_is_serial() ? LAUREL_FBCON_CONSOLE : 0);
++}
++
++/* AppleCLCD's vsync while the console frames are on the panel: anything drawn since the last call? */
++int
++laurel_fbcon_take_dirty(void)
++{
++	int d = fbcon_dirty;
++	fbcon_dirty = 0;
++	return d;
++}
++
++void
++laurel_fbcon_mute(void)
++{
++	fbcon_muted = 1;
+ }
+ 
+ static unsigned int

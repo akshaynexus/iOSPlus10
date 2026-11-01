@@ -108,6 +108,13 @@ no fallback.
   surface 1 (boot framebuffer, GL draws into it) is scanned directly instead of flipping to a back buffer with a boot
   console frame; 0x5c000000 cleared of boot text at start; at the first iOS frame `LAUREL FB HANDOFF:` and the console
   stays off the panel (panic excepted). Kill switch `fbhandoff=0`.
+- **2870** `laurel-fb-scanout-owner` (fix of the 07:45 "kernel log over the UI", section "Kernel log over the UI" below):
+  the fbcon (the kernel console with serial=3) moves from the boot framebuffer (surface 1) into the console shadow at
+  AppleCLCD start; every write of the pipe's scanout address says what the buffer holds, and after the first iOS frame a
+  buffer with kernel text is refused (`LAUREL FB OWNER: refused: ...`, once per caller; a panic is let through); the
+  console shadow and both flip buffers are cleared to black once the first iOS frame is on the panel. Kill switch
+  `fbowner=0` (no refusal, no clear; the fbcon move stays). Numbered after 2850: it must apply after every patch that
+  changes SweetFramebuffer.cpp.
 - **2152** `laurel-fps-line`: `SWEET FPS:` is part of the GPU report: only while GL is loaded, 6 lines every second, then
   one every 10 s while frames come; `sweetfps=0` turns it off.
 
@@ -529,6 +536,9 @@ Facts [V]:
 - [I] The boot text that the console drew into 0x5c000000 before the retarget stayed there; a surface-1 frame
   scanned directly would show it where GL had not drawn yet. 2104 clears it.
 
+Correction (2870, [V source]): with `serial=3` the kernel console is the fbcon, which drew into 0x5c000000 itself; the
+video console below gets no text. See "Kernel log over the UI".
+
 Fix 2104 `laurel-fb-console-handoff` (SweetFramebuffer.cpp, video_console.c):
 1. A single-layer swap of surface 1 is direct (presenter thread, like GPU-pool frames): the MDP scans 0x5c000000 itself.
 2. AppleCLCD start: after the MDP has latched the first console flip, the boot text in 0x5c000000 is cleared to black
@@ -556,6 +566,69 @@ Expected log lines (GL boot):
 - Fallback: `LAUREL FB HANDOFF: on: ...; no console shadow (...): console text off the panel (...)`;
   kill switch: `LAUREL FB HANDOFF: off: fbhandoff=0 ...`.
 Test: GL boot, leave the UI idle for 1 min, then scroll and stop: no kernel text at any time.
+
+## Kernel log over the UI (boot 2026-11-01 07:45, fixed by 2870)
+
+Owner report (GL on, SMMU stage 1, 2104 in): "the kernel log / white text on black background is still an issue";
+"when you move or do anything, the kernel log flashes ABOVE the iOS UI". Log `logs/usblog-20261101-001446.txt` (main
+checkout) from line ~59950 (07:45:11), also `logs/laurel-boot-20261101-074445.log`.
+
+Facts [V]:
+- 2104 was active: `LAUREL FB HANDOFF: on: ... shadow 0xe6ae0000 ...` (07:45:24) and `LAUREL FB HANDOFF: swap 2 shows
+  surface 1 (boot framebuffer 0x5c000000) by scanning it directly` (the line is glued to the end of a redwood-gl line).
+  No `SWEET FB: swap N layer` line: no swap took the copy path, every swap was direct (`SWEET FB: 1000 swaps (direct)`).
+- backboardd's frames alternate: 67 frames `1 picture copied out` (GL renders into a texture, `glReadPixels` into surface 1
+  = 0x5c000000, 47-62 ms "copying out") and 65 frames `1 drawn in place` (the GPU draws into a GPU-pool surface, id 2).
+  The MDP scans the one presented: one frame in two is 0x5c000000 itself.
+- The boot-args (`scripts/laurel/uefi-image.sh`, `shim.sh`) have `serial=3`; the ADT has `/sweet-fbcon` with reg
+  0x5c000000, 720x1560, stride 2880 (mkadt via topaz). `arm_init`: serialmode output + a serial device (the fbcon) ->
+  `switch_to_serial_console()`, so `cons_ops_index` = serial. Older logs show `Serial keyboard started` (serialmode input).
+- So every printf / IOLog character goes `_cnputs` -> `_cnputc` -> `serial_putc_options` -> `uart_putc` ->
+  `fbcon_transmit_data` (pexpert/arm/pe_serial.c): white 0xffffffff on black 0xff000000, 2x glyphs, 2 rows cleared per
+  newline, written straight into 0x5c000000. The video console (`vcputc`, 2104's shadow) gets no text at all with serial=3.
+- Result: each kernel line during the UI was drawn into the surface-1 frame on the panel (text over the UI) until the next
+  surface-1 copy-out overwrote it. Activity = more kernel lines (SWEET FPS, redwood-gl, SMMU fault, IOK) = more text.
+- 2104's self-check (`sweet_console_on_shadow`) looked only at the video console, so it passed.
+- Checked, no other path [V source]: the only writer of the pipe address is `AppleCLCD::scanFrom` (VIG0/DMA0/DMA1, one pipe;
+  no other code maps 0x5e05000/0x5e25000/0x5e27000); callers: start (console flip), vsync (console copy while
+  `fConsShown`, power-off black frame / fade), panic (`sweet_cons_show`), direct frames, copy path. No wake or "redraw"
+  path scans a kernel buffer; display on only sends DCS. `sweet_early` is off after arm_init when a serial device
+  exists. kprintf is ring-only (2014). No `initialize_screen` call after start. GPU-pool and scanout-slot surfaces are
+  zeroed at creation; 0x5c000000 is cleared at AppleCLCD start (2104), so no UEFI/DarwinBoot text stays in it.
+- [I] Before 2104 the same fbcon text was in 0x5c000000 too; the copy path then showed stale flip buffers instead, so the
+  07:20 flash was both causes. After AppleCLCD start the boot screen did not follow the log (the shadow got no text with
+  serial=3); 2870 makes it live again.
+
+Fix 2870 `laurel-fb-scanout-owner` (SweetFramebuffer.cpp, pe_serial.c):
+1. fbcon move: at AppleCLCD start, after the shadow got a copy of 0x5c000000, `laurel_fbcon_retarget()` points the fbcon at
+   the shadow (cached; same 720x1560 geometry). Line `LAUREL FBCON: on: the fbcon (the kernel console, serial=3) draws into
+   the console shadow 0x...`. The vsync copies the shadow into the boot console frame when the fbcon drew
+   (`laurel_fbcon_take_dirty`, at the sweetfb_hz pace). At the first iOS frame a fbcon that is still on 0x5c000000 (no
+   shadow) is muted (`LAUREL FBCON: on: the fbcon is still on the boot framebuffer ... stops drawing`).
+2. Panic: the fbcon always draws; in a panic it cleans the drawn rows and calls `laurel_fbcon_show_hook` ->
+   `laurel_fb_panic_show()` (MMIO only): the MDP scans the shadow (or 0x5c000000 if the fbcon did not move).
+3. Scanout owner: `scanFrom(pa, stride, holds, who)` is told what the buffer holds (iOS frame, black, kernel text, panic).
+   The console shadow is always kernel text; a flip buffer holds what it was last filled with (`fFlipHolds`). After the
+   first iOS frame kernel text is refused: the panel keeps its frame; one line per caller
+   `LAUREL FB OWNER: refused: <who> (caller 0x...) asked the panel to show <buffer> 0x... (kernel text) after the iOS
+   handoff; the panel keeps <buffer> 0x... (iOS frame); N refused so far`. A panic is let through.
+4. Clear: when the second iOS frame comes (the first is latched), the console shadow and the flip buffers that are not on
+   the panel are filled with black and cleaned: `LAUREL FB OWNER: on: after the first iOS frame only iOS frames reach the
+   panel (kernel text only in a panic); cleared to black: console shadow 0x..., 2 flip buffer(s); panel on ...`. The copy
+   path also clears a back buffer that still holds kernel text before it composes.
+Kill switch `fbowner=0`: no refusal, no clear (`LAUREL FB OWNER: off: fbowner=0 ...`); the fbcon move stays.
+
+Expected log lines (GL boot, serial=3):
+- `SWEET FB: console double buffered (shadow 0x...)`
+- `LAUREL FBCON: on: the fbcon (the kernel console, serial=3) draws into the console shadow 0x..., no longer into the
+  boot framebuffer 0x5c000000 (surface 1, iOS frames)`
+- `LAUREL FB HANDOFF: on: first iOS frame owns the panel; kernel console only in its shadow 0x... (console = fbcon, in
+  the shadow; not scanned, shown again only by a panic); surface 1 = boot framebuffer 0x5c000000, scanned directly`
+- `LAUREL FB OWNER: on: after the first iOS frame only iOS frames reach the panel ...; cleared to black: console shadow
+  0x..., 2 flip buffer(s); panel on an iOS surface 0x... (iOS frame)`
+- No `LAUREL FB OWNER: refused:` line. If one comes, it names the caller (a bug to fix there; the panel kept the iOS frame).
+Test: GL boot; the boot log must still move on the panel until the lock screen; then scroll, open apps, leave idle 1 min:
+no white text at any time. A panic must still show its text (not tested yet).
 
 ## Recovery (no UI after the GPU root)
 

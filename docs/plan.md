@@ -16,6 +16,15 @@ other surfaces from wired pages), 2103 (native 720x1560 canvas at scale 2 by def
 `LAUREL FB CANVAS:`, `LAUREL FB CANVAS: first frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
 + 0102 (DarwinBoot shrinks the window instead of "NO WINDOW"); mkadt `--dram auto`. Next: boot, read `LAUREL RAM:`, `LAUREL SPOOL:`,
 `LAUREL FB CANVAS:`, `LAUREL FB: first iOS frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
+Kernel log over the UI (2026-11-01 08:08, branch t3/laurel-fb-text2, built, NOT BOOTED): after 2104 the owner still saw
+white-on-black kernel text over the UI whenever something moved (boot 07:45). Cause [V source + boot-args]: `serial=3` makes
+the fbcon (pe_serial.c) the kernel console, and it drew every printf/IOLog line straight into 0x5c000000 = surface 1, which
+GL frames use and the MDP scans directly since 2104. Kernel 2870: fbcon moved into the console shadow at AppleCLCD start
+(muted if it cannot move; a panic draws and shows it), scanout owner (scanFrom refuses kernel text after the first iOS
+frame, `LAUREL FB OWNER: refused:` once per caller, panic excepted), shadow + flip buffers cleared to black after the first
+iOS frame; kill switch fbowner=0. 251/251 patches, 0 LSE, kernel sha256 31d2ccf0.... Next: GL boot, read `LAUREL FBCON: on:`
+and `LAUREL FB OWNER: on:`, no `refused` line, use the UI: no text. Details: `docs/laurel_sprout/gpu.md` "Kernel log over
+the UI".
 Console flash fix (2026-11-01 07:50, branch t3/laurel-fb-console-flash, built, NOT BOOTED): with GL, the idle UI showed
 kernel log text. Cause [V log + source]: backboardd presents surface 1 (= boot framebuffer 0x5c000000, GL draws into it)
 between GPU-pool frames; the copy path skipped it and flipped to a back buffer that still held a boot console frame. Kernel
