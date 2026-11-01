@@ -8,7 +8,7 @@ Output: the RWCISP02 file that isp_load_tuning (userland/camera/camera_isp.c) re
   default_preview: 6 colour matrices 0x30 bytes apart (9 floats, rows sum to 1), after the 10 u32 colour temperature limits
                    (hi/lo pairs 6500/7000, 5300/5800, 4200/4700, 3100/3600, 2500/2800)
   common:          lens shading sets, 884 floats (R, Gr, Gb, B, each 13 rows of 17; middle about 1, corners 3 to 4.4)
-Order of the matrices from the coldest to the warmest light [I: the warm ones have the smallest red and the largest blue coefficient]. The light of
+Order of the matrices from the coldest to the warmest light [I: the limits come in that order; the matrices themselves do not name a light]. The light of
 a shading set is not named in the file: [I] the sets are ordered by the corners' red over blue, which grows as the light gets warmer.
 No white balance reference points: the plug-in's grey world stays free. Exit 1 when something has another shape.
 """

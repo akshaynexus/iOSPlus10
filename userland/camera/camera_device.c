@@ -59,7 +59,6 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include <os/log.h>
-#include <objc/runtime.h>
 #include "camera_isp.h"
 
 /* userland/laurel/camera/build.sh (Mi A3): the rear IMX586 at 1280x720, kernel patch 2772 (docs/laurel_sprout/camera.md) */
@@ -942,17 +941,14 @@ finish_piece(void *context, size_t i)
  * call (pc = far = 0x1e9440158, lr just after the handler's blr, in deliver) 3 s after a low-swap kill of the process before it. The
  * cause is not known [U]. The first word of a live block is one of these classes; only that word is read.
  */
+extern void *_NSConcreteMallocBlock[], *_NSConcreteGlobalBlock[];
+
 static bool
 handler_alive(const struct output *out)
 {
-	static const void *malloc_block, *global_block;
 	const void *isa = *(const void *const *)out->handler;
 
-	if (malloc_block == NULL) {
-		malloc_block = dlsym(RTLD_DEFAULT, "_NSConcreteMallocBlock");
-		global_block = dlsym(RTLD_DEFAULT, "_NSConcreteGlobalBlock");
-	}
-	return malloc_block == NULL || isa == malloc_block || isa == global_block;
+	return isa == (const void *)_NSConcreteMallocBlock || isa == (const void *)_NSConcreteGlobalBlock;
 }
 
 static CVPixelBufferRef

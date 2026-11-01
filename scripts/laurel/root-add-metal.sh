@@ -10,7 +10,7 @@
 #   METAL_CLIENTS="..."   the processes that get a Metal device (/var/db/negronimetal/clients). Default: the probes only
 #                         ("metalprobe m2vtest carenderprobe layerprobe"), marked as the gate's list: at boot
 #                         /usr/libexec/laurel-metal-gate (userland/laurel/metal/metal_gate.c; launchd job com.laurel.metal-gate,
-#                         root, scripts/laurel/metal-gate-job.py) widens it to "* -backboardd" for all of iOS when the GPU runs
+#                         root, scripts/laurel/metal-gate-job.py) widens it to "* -backboardd -mediaserverd" for all of iOS when the GPU runs
 #                         with the stage-1 SMMU, the kernel registered the plug-in and m2vtest passes on this build; else it
 #                         stays the probes.
 #                         A list given here is the owner's: the gate leaves it alone. Steps by hand: docs/laurel_sprout/metal.md

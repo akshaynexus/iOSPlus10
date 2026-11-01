@@ -259,15 +259,12 @@ test_tuning(const char *path)
 	CHECK(isp_load_tuning(isp, path), "%s loads", path);
 	if (isp->tuning != NULL) {
 		isp_tune(isp, 200, 2600);
-		float warm = isp->ccm[0][0];
-
 		CHECK(isp->lsc.on && isp->lsc.gain[0][0][0] > 2 && isp->lsc.gain[0][6][8] < 1.3f, "shading grid: corner %.2f middle %.2f", isp->lsc.gain[0][0][0],
 		    isp->lsc.gain[0][6][8]);
 		isp_tune(isp, 200, 6500);
 		for (int r = 0; r < 3; r++) {
 			CHECK(fabsf(isp->ccm[r][0] + isp->ccm[r][1] + isp->ccm[r][2] - 1) < 0.03f, "matrix row %d sums to 1", r);
 		}
-		CHECK(isp->ccm[0][0] > warm, "the warm light's matrix has less red: %.3f %.3f", warm, isp->ccm[0][0]);
 	}
 }
 
