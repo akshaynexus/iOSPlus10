@@ -13,7 +13,10 @@
  *   The button: +[AVFlashlight hasFlashlight] = MGGetBoolAnswer("camera-flash") = IODeviceTree:/product/camera
  *   "flash" (the kernel's LaurelTorch.cpp publishes it only when this bundle is in the root).
  *
- * The laurel root has no camera driver and StartRecorderServer false (topaz sweet-root-tweaks.py), so mediaserverd
+ * One owner (2026-11-01, boot 18:40): a root with NegroniCamera.driver has its flashlight there (userland/camera/
+ * camera_device.c torch_set): that plug-in replaces the same method and starts the same server. This bundle is only for a
+ * root without it (CAMERA=0; scripts/laurel/root-flashlight.sh installs one or the other) and stands down when it sees it.
+ * Such a root has StartRecorderServer false (topaz sweet-root-tweaks.py), so mediaserverd
  * has no capture device vendor and starts no FigFlashlight server. This bundle (loaded by the HAL in mediaserverd,
  * as RedwoodAudio.driver; its factory gives the HAL no driver) does two things in mediaserverd:
  *   1. replaces +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor]: for calls from FigFlashlight code (by
@@ -49,6 +52,8 @@
 
 #define LF_DEVICE       "/dev/laureltorch"
 #define LF_OFF_FILE     "/var/db/laurel/flashlight-off"
+#define LF_CAMERA       "/System/Library/Audio/Plug-Ins/HAL/NegroniCamera.driver/NegroniCamera"
+#define LF_CAMERA_OFF   "/var/db/negronicam/off"        /* NEGRONICAM_OFF_FILE: that plug-in then does nothing */
 #define LF_CACHE_UUID   "8F970452-C9E3-3E88-B114-FEB1864BC9E0"  /* iOS 16.7.x 20H392 dyld_shared_cache_arm64 */
 #define LF_CACHE_BASE   0x180000000UL
 #define LF_VENDOR_IMP   0x1a1f40c84UL   /* +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor] */
@@ -292,9 +297,12 @@ lf_image_added(__unused const struct mach_header *header, __unused intptr_t slid
 		memcpy(&first, (const void *)imp, sizeof(first));
 	}
 	if (imp == NULL || (uintptr_t)imp != LF_VENDOR_IMP + lf_slide || first != LF_VENDOR_FIRST) {
-		say("LAUREL FLASHLIGHT: off: +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor] at %#lx (first word %#x), "
+		/* the first word is read only at the expected address: another image's replacement shows 0 here */
+		Dl_info info;
+		bool named = imp != NULL && dladdr((const void *)imp, &info) != 0 && info.dli_fname != NULL;
+		say("LAUREL FLASHLIGHT: off: +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor] is %#lx in %s (first word %#x), "
 		    "expected %#lx (%#x): left alone, no FigFlashlight server", imp ? (unsigned long)((uintptr_t)imp - lf_slide) : 0UL,
-		    first, LF_VENDOR_IMP, LF_VENDOR_FIRST);
+		    named ? info.dli_fname : "an unknown image", first, LF_VENDOR_IMP, LF_VENDOR_FIRST);
 		return;
 	}
 	lf_original_vendor = imp;
@@ -377,6 +385,10 @@ lf_init(void)
 	}
 	if (access(LF_OFF_FILE, F_OK) == 0) {
 		say("LAUREL FLASHLIGHT: off: %s exists", LF_OFF_FILE);
+		return;
+	}
+	if (access(LF_CAMERA, F_OK) == 0 && access(LF_CAMERA_OFF, F_OK) != 0) {
+		say("LAUREL FLASHLIGHT: off: NegroniCamera.driver is in the root: it owns the flashlight (LAUREL CAMERA: ios: the flashlight lines)");
 		return;
 	}
 	if (_dyld_get_shared_cache_uuid(uuid)) {

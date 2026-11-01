@@ -106,6 +106,9 @@ prewarm_portrait_filter(__unused id self, __unused SEL selector, __unused int ve
 
 extern int negroni_camera_device_create(const void *allocator, const void *options, void **out);
 extern volatile bool negronicam_failed;
+#ifdef LAUREL_CAMERA
+extern void negroni_camera_torch_start(void);   /* camera_device.c: the flashlight's owner in this process */
+#endif
 static IMP original_shared_vendor;
 
 /* +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor] */
@@ -745,6 +748,9 @@ negroni_camera_init(void)
 #endif
 		register_hevc_encoder();
 	}
+#ifdef LAUREL_CAMERA
+	negroni_camera_torch_start();
+#endif
 	previous_exception_handler = objc_setUncaughtExceptionHandler(uncaught_exception);
 	seed_display_alignment();
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */

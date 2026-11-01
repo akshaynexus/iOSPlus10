@@ -4524,3 +4524,21 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Handshake stays off by default (ipa=0 in uefi-image.sh + shim.sh): a modem firmware assert cannot be seen in advance. Test image: IPA_TEST=1.
 - Test pitfall: kstub.h makes `printf` the captured kernel printf; test code that must print uses fprintf(stdout, ...).
 - Worktree build: symlink external/ios-sweet-linux + ios-topaz from the main checkout, cp --reflink out/laurel-kernel/{deps,theos,cache,dl}.
+
+## Mi A3: boot 18:40 flashlight and slider dead; 2783 (one owner) and 2871 (panel read back) (2026-11-01 19:30, branch t3/laurel-torch-bl-fix; build only, NOT BOOTED)
+- Details: docs/laurel_sprout/torch.md, docs/laurel_sprout/brightness.md. Log: logs/laurel-boot-1840.txt (main checkout).
+- [V log] Flashlight button -> `LAUREL CAMERA: ios: the flashlight at 850 of 1000 NOT TAKEN (no torch driver)`: FigFlashlight reaches the camera plug-in's
+  stream. Two plug-ins replaced `+[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor]`; the one that loaded second (LaurelFlashlight) turned itself off.
+- [V code + llvm-nm] `first word 0` = not read (read only at the expected address). `at 0xfb320184` = IMP - slide: `_shared_vendor` of NegroniCamera.driver
+  (offset 0x14184, load address 0x102a04000). Lesson: a line with an unexpected address should name the image (dladdr): it does now.
+- [V code] LaurelFlashlight opens /dev/laureltorch before the hook, so its line proves the node exists and mediaserverd may open it. The button proves
+  `flash` was published, which needs the self-check. [U] LED not lit yet; no LAUREL TORCH line reached the USB log.
+- Rule now: a root has one owner of the flashlight: NegroniCamera.driver, else LaurelFlashlight.driver (root-flashlight.sh). Results lost before USB come up:
+  repeat them at the first open (2783) or in a line after USB is up (2871's second `on:` line).
+- [V log] Slider: iOS writes `brightness` + `FadePeriod 0` + `backlight-level` (same as 07:27). `only 3 backboardd sets lines` is the cap fLogged < 3. 52 writes for
+  one drag, 0 failed, settled 255. `brightness-nits = 0` once before the first `brightness`; IOMFBBrightnessLevel ignored after it. root-brightness.py broke nothing.
+- [V DT + code] Compared with Linux: packet bytes equal; DMA FIFO watermarks (0x50 bits 16, 20), line_no starting at 1, TPG FIFO reset, first `53 20` differed.
+  [U] Which of them matters, or whether something else does: DONE proves nothing about the panel. 2871 reads 0x0A / 0x52 / 0x54 back (self-check of the backlight,
+  picks transport and way; kill switch laurelbl_read=0). Decision table in brightness.md.
+- [V] userland/laurel/camera/build.sh failed at random with `symbol _image_added missing`: `nm | grep -q` under pipefail (grep's early exit SIGPIPEs nm). Fixed; same lesson as kernel-linux.sh.
+- Build [V]: 273/273 patches (72 laurel), 0 LSE, kernel.development.sweet.4k sha256 2271c044eb39beaa10a0cb7a99aa0e9981357625caf3ef99e21f8b5d3c173030; NegroniCamera.driver sha256 12e332d07c6555b0..., LaurelFlashlight.driver built.

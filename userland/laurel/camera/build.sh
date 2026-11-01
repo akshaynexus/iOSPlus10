@@ -83,7 +83,9 @@ minos=$($OTOOL -l "$X" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}
 [ "$minos" = "$MINOS" ] || { echo "camera: minos $minos, expected $MINOS" >&2; fail=1; }
 exports=$($NM -gU "$X" | awk '{print $NF}' | grep -v -x -e _NegroniCamera_Create -e __mh_bundle_header || true)
 [ -z "$exports" ] || { echo "camera: unexpected exports: $exports" >&2; fail=1; }
-$NM -gU "$X" | grep -q ' _NegroniCamera_Create$' || { echo "camera: factory not exported" >&2; fail=1; }
+# (no `nm | grep -q`: with pipefail grep's early exit SIGPIPEs nm and a symbol that is there reads as missing)
+syms=$($NM "$X")
+$NM -gU "$X" | grep ' _NegroniCamera_Create$' >/dev/null || { echo "camera: factory not exported" >&2; fail=1; }
 weak=$($NM -m "$X" 2>/dev/null | grep 'weak external' || true)
 [ -z "$weak" ] || { echo "camera: weak imports: $weak" >&2; fail=1; }
 libs=$($OTOOL -L "$X" | tail -n +2 | awk '{print $1}' | LC_ALL=C sort | tr '\n' ' ')
@@ -92,7 +94,7 @@ want="/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation /System
 for s in _shared_vendor _audio_source_start _video_stabilization_method _video_stabilization_type _quality_prioritization \
          _gnr_render _emit_sample_buffer _prewarm_portrait_filter _image_added _negroni_camera_init _negroni_camera_device_create \
          _worker _isp_render_nv12 _isp_render_still_nv12 _isp_scale_nv12 _isp_render_cells; do
-  $NM "$X" | grep -q " $s\$" || { echo "camera: symbol $s missing" >&2; fail=1; }
+  printf '%s\n' "$syms" | grep " $s\$" >/dev/null || { echo "camera: symbol $s missing" >&2; fail=1; }
 done
 grep -q -a '/dev/negronicam' "$X" || { echo "camera: no /dev/negronicam string" >&2; fail=1; }
 grep -q -a 'LAUREL CAMERA: ios' "$X" || { echo "camera: no LAUREL CAMERA line" >&2; fail=1; }

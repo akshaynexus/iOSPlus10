@@ -884,3 +884,14 @@ assert]: on IPA v4.2 the AP must allocate all GSI channels, the modem's too; 278
 gsi_test + gate_test. Not done: ipa=0 stays in uefi-image.sh + shim.sh: no self-check can see a modem firmware assert.
 Next: owner test `IPA_TEST=1 scripts/laurel/uefi-image.sh` + `fastboot boot`; evidence list in docs/laurel_sprout/cellular.md section 8. Then laurel_cell.c: read the DMS mode
 again (one old read blocks ONLINE).
+
+## Mi A3: flashlight one owner (2783, camera plug-in) + backlight reads the panel back (2871) built (2026-11-01 19:30, branch t3/laurel-torch-bl-fix; build only, NOT BOOTED)
+Owner, boot 18:40: Control Center flashlight and brightness slider do nothing; camera works.
+Flashlight [V log + code]: the button reaches the camera plug-in's stream, which only logged `NOT TAKEN`; LaurelFlashlight.driver saw the camera
+plug-in's hook on the same method and turned itself off. Now: the camera plug-in writes `/dev/laureltorch`, LaurelFlashlight.driver only in a root
+without it, the kernel's start results repeat at the first open. Cap 150 mA, auto-off, thermal off unchanged.
+Brightness [V log]: the slider reaches the kernel, 52 writes for one drag, 0 failed; root-brightness.py broke nothing; `brightness-nits = 0` and the
+cap do not stop it. [U] Why the panel does not follow: not settled by the log. 2871 aligns the send with Linux (FIFO watermarks off, line + 1, FIFO
+reset, `53 20` at start), adds the TPG FIFO path, reads 0x0A / 0x52 / 0x54 back at start and at each settled value and picks the way that works.
+Build: 273/273 patches (72 laurel), 0 LSE, kernel.development.sweet.4k sha256 2271c044eb39beaa10a0cb7a99aa0e9981357625caf3ef99e21f8b5d3c173030; NegroniCamera.driver sha256 12e332d07c6555b0..., LaurelFlashlight.driver built.
+Next: boot image with this kernel + root rebuild (root-flash-test.sh; owner approves the flash). Lines and the decision table: docs/laurel_sprout/brightness.md, torch.md.

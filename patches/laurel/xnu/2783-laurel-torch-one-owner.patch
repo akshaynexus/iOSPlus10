@@ -1,0 +1,277 @@
+laurel 2783: flashlight: one owner + the kernel's state visible. Boot 18:40 [V log]: the Control Center button reaches the camera plug-in's vendor ("the flashlight at 850 of 1000 NOT TAKEN"), LaurelFlashlight.driver sees that the camera plug-in replaced the same method first and turns itself off, and no LAUREL TORCH line reached the USB log. Now the camera plug-in (userland/camera/camera_device.c, LAUREL_CAMERA) writes /dev/laureltorch; LaurelFlashlight.driver is only for a root without it (scripts/laurel/root-flashlight.sh). Kernel: the button (IODeviceTree:/product/camera flash) with either plug-in in the root; mark HAL/laurel-flashlight-off (root TORCH=0) = no button. The start results are kept and repeated at the first open of /dev/laureltorch (`LAUREL TORCH: first open of /dev/laureltorch by mediaserverd; start result: LAUREL TORCH: on: ...`, `LAUREL TORCH: first open: LAUREL TORCH UI: on: ...`). The node is made also when the self-check failed (not with torch=0): read = state=off and the reason, write = EIO. Cap, auto-off, thermal off unchanged.
+
+diff --git a/bsd/dev/laurel_torch.c b/bsd/dev/laurel_torch.c
+index 78bbb28..e0e366b 100644
+--- a/bsd/dev/laurel_torch.c
++++ b/bsd/dev/laurel_torch.c
+@@ -38,10 +38,11 @@
+  *
+  * iOS: /dev/laureltorch (root:mobile 0660). write ASCII "0".."100" (percent, newline allowed; 0 = off); read
+  *   "level=P ma=M code=C lit=0|1 cap_ma=150 auto_off_s=600 faults=N state=on|off reason=...". The mediaserverd plug-in
+- *   userland/laurel/flashlight (LaurelFlashlight.driver) gives FigFlashlight (Control Center, AVFlashlight) a
+- *   device whose TorchLevel 0..1 lands here. LaurelTorch.cpp publishes IODeviceTree:/product/camera "flash"
+- *   (MobileGestalt camera-flash: the Control Center button) after the root mount, only when this driver is on and
+- *   the root has the plug-in.
++ *   NegroniCamera.driver (userland/camera, LAUREL_CAMERA; or LaurelFlashlight.driver in a root without it) gives
++ *   FigFlashlight (Control Center, AVFlashlight) a device whose TorchLevel 0..1 lands here. LaurelTorch.cpp publishes
++ *   IODeviceTree:/product/camera "flash" (MobileGestalt camera-flash: the Control Center button) after the root mount, only
++ *   when this driver is on and the root has one of the two. The node exists also when the driver is off (not with torch=0):
++ *   read tells why, write answers EIO, the first open logs the start results again.
+  * Log: "LAUREL TORCH: on: ..." / "LAUREL TORCH: off: <why>" once at start; "LAUREL TORCH: lit ..." and
+  *   "LAUREL TORCH: dark: <why>" for the first LT_LOG changes, every fault and every auto-off.
+  */
+@@ -132,6 +133,14 @@ static uint64_t lt_lit_since;
+ static uint32_t lt_faults, lt_said;
+ static uint8_t lt_mod_base;                     /* MOD_CTRL without bit 7, as found */
+ static char lt_reason[96] = "never lit";
++/*
++ * laurel 2783: the start results, repeated at the first open: the kernel log ring has often lost them before USB comes
++ * up (boot 18:40: no LAUREL TORCH line at all). Same idea as the Bluetooth firmware line.
++ */
++static char lt_start_line[300] = "LAUREL TORCH: off: not started";
++static char lt_ui_line[200] = "LAUREL TORCH UI: off: not decided yet";
++#define LT_START(...) do { snprintf(lt_start_line, sizeof(lt_start_line), __VA_ARGS__); printf("%s\n", lt_start_line); } while (0)
++#define LT_UI(...) do { snprintf(lt_ui_line, sizeof(lt_ui_line), __VA_ARGS__); printf("%s\n", lt_ui_line); } while (0)
+ static int lt_event;
+ 
+ static uint64_t
+@@ -413,11 +422,11 @@ lt_dev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ static int
+ lt_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	char text[200];
++	char text[460];
+ 	lck_mtx_lock(&lt_lock);
+ 	int len = snprintf(text, sizeof(text), "level=%u ma=%u code=%u lit=%d cap_ma=%u auto_off_s=%u faults=%u state=%s reason=%s\n",
+ 	    lt_lit ? lt_percent : 0, lt_lit ? lt_ma : 0, lt_lit ? lt_code : 0, lt_lit ? 1 : 0, LT_CAP_MA, LT_AUTO_OFF_S,
+-	    lt_faults, lt_ready && !lt_dead ? "on" : "off", lt_reason);
++	    lt_faults, lt_ready && !lt_dead ? "on" : "off", lt_ready ? lt_reason : lt_start_line);
+ 	lck_mtx_unlock(&lt_lock);
+ 	if (len < 0) {
+ 		return EIO;
+@@ -430,15 +439,34 @@ lt_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 	return uiomove(text + off, len - (int)off, uio);
+ }
+ 
++/* laurel 2783: the first open repeats the start results (the first user comes after USB is up) */
+ static int
+ lt_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	static bool said;
++	bool first;
++	lck_mtx_lock(&lt_lock);
++	first = !said;
++	said = true;
++	lck_mtx_unlock(&lt_lock);
++	if (first) {
++		char name[20];
++		proc_selfname(name, sizeof(name));
++		printf("LAUREL TORCH: first open of /dev/laureltorch by %s; start result: %s\n", name, lt_start_line);
++		printf("LAUREL TORCH: first open: %s\n", lt_ui_line);
++	}
++	return 0;
++}
++
++static int
++lt_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+ {
+ 	return 0;
+ }
+ 
+ static const struct cdevsw lt_cdevsw = {
+ 	.d_open = lt_dev_open,
+-	.d_close = lt_dev_open,
++	.d_close = lt_dev_close,
+ 	.d_read = lt_dev_read,
+ 	.d_write = lt_dev_write,
+ 	.d_ioctl = eno_ioctl,
+@@ -464,7 +492,14 @@ lt_exists(const char *path)
+ 	return true;
+ }
+ 
+-#define LT_PLUGIN       "/System/Library/Audio/Plug-Ins/HAL/LaurelFlashlight.driver/LaurelFlashlight"
++/*
++ * laurel 2783: one owner of the iOS side. The camera plug-in drives the torch when it is in the root (its vendor already
++ * answers FigFlashlight); LaurelFlashlight.driver only in a root without it (CAMERA=0). TORCH=0 at root build writes the mark.
++ */
++#define LT_HAL          "/System/Library/Audio/Plug-Ins/HAL/"
++#define LT_PLUGIN_CAM   LT_HAL "NegroniCamera.driver/NegroniCamera"
++#define LT_PLUGIN       LT_HAL "LaurelFlashlight.driver/LaurelFlashlight"
++#define LT_NO_BUTTON    LT_HAL "laurel-flashlight-off"
+ #define LT_GID_MOBILE   501
+ 
+ /* after the root mount (devfs is up then): the node, then the Control Center button (MobileGestalt camera-flash) */
+@@ -479,61 +514,55 @@ lt_root_thread(__unused void *arg, __unused wait_result_t wr)
+ 	int major = cdevsw_add(-1, &lt_cdevsw);
+ 	void *node = major < 0 ? NULL :
+ 	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, LT_GID_MOBILE, 0660, "laureltorch");
++	bool cam = rootvnode != NULLVP && lt_exists(LT_PLUGIN_CAM);
+ 	if (rootvnode == NULLVP) {
+-		printf("LAUREL TORCH UI: off: no root file system after %u s\n", waited / 1000u);
++		LT_UI("LAUREL TORCH UI: off: no root file system after %u s", waited / 1000u);
+ 	} else if (node == NULL) {
+-		printf("LAUREL TORCH UI: off: /dev/laureltorch not made (devfs)\n");
+-	} else if (!lt_exists(LT_PLUGIN)) {
+-		printf("LAUREL TORCH UI: off: no %s in the root (scripts/laurel/root-flashlight.sh): no Control Center button\n",
+-		    LT_PLUGIN);
++		LT_UI("LAUREL TORCH UI: off: /dev/laureltorch not made (devfs)");
++	} else if (!lt_ready) {
++		LT_UI("LAUREL TORCH UI: off: the torch is off (LAUREL TORCH line): /dev/laureltorch tells why, no Control Center button");
++	} else if (lt_exists(LT_NO_BUTTON)) {
++		LT_UI("LAUREL TORCH UI: off: root built with TORCH=0: no Control Center button");
++	} else if (!cam && !lt_exists(LT_PLUGIN)) {
++		LT_UI("LAUREL TORCH UI: off: no NegroniCamera.driver or LaurelFlashlight.driver in the root: no Control Center button");
+ 	} else if (laurel_torch_publish_flash() != 0) {
+-		printf("LAUREL TORCH UI: off: IODeviceTree:/product/camera flash not published\n");
++		LT_UI("LAUREL TORCH UI: off: IODeviceTree:/product/camera flash not published");
+ 	} else {
+-		printf("LAUREL TORCH UI: on: /dev/laureltorch, IODeviceTree:/product/camera flash (Control Center button; "
+-		    "mediaserverd LaurelFlashlight.driver -> FigFlashlight TorchLevel)\n");
++		LT_UI("LAUREL TORCH UI: on: /dev/laureltorch, IODeviceTree:/product/camera flash (Control Center button; mediaserverd %s "
++		    "-> TorchLevel)", cam ? "NegroniCamera.driver" : "LaurelFlashlight.driver");
+ 	}
+ 	(void)thread_terminate(current_thread());
+ }
+ 
+ /* ---- start, state, quiesce ------------------------------------------------------------------------------ */
+ 
+-int
+-laurel_torch_start(void)
++/* laurel 2783: the self-check; the caller makes the node in both cases, so the first open can tell the result */
++static int
++lt_start_check(void)
+ {
+-	static bool tried;
+-	uint32_t on = 1;
+ 	thread_t th;
+ 
+-	if (tried) {
+-		return lt_ready ? 0 : -1;
+-	}
+-	tried = true;
+-	(void)PE_parse_boot_argn("torch", &on, sizeof(on));
+-	if (on == 0) {
+-		printf("LAUREL TORCH: off: torch=0\n");
+-		return -1;
+-	}
+ 	if (sweet_spmi_register(SWEET_SPMI_TORCH) != 0) {
+-		printf("LAUREL TORCH: off: SPMI arbiter not ready (LAUREL SPMI line)\n");
++		LT_START("LAUREL TORCH: off: SPMI arbiter not ready (LAUREL SPMI line)");
+ 		return -1;
+ 	}
+ 	int owner = 8, chg_owner = 8;
+ 	int apid = sweet_spmi_apid(LT_SID, LT_BASE >> 8, &owner);
+ 	int chg = sweet_spmi_apid(LT_CHG_SID, LT_CHG_BASE >> 8, &chg_owner);
+ 	if (apid < 0) {
+-		printf("LAUREL TORCH: off: no SPMI APID for PMI632 SID3 0xd300 (PPID 0x%03x)\n", LT_PPID);
++		LT_START("LAUREL TORCH: off: no SPMI APID for PMI632 SID3 0xd300 (PPID 0x%03x)", LT_PPID);
+ 		return -1;
+ 	}
+ 	if (owner != 0) {
+-		printf("LAUREL TORCH: off: APID %d (SID3 0xd300) is owned by EE %d, not the apps EE 0\n", apid, owner);
++		LT_START("LAUREL TORCH: off: APID %d (SID3 0xd300) is owned by EE %d, not the apps EE 0", apid, owner);
+ 		return -1;
+ 	}
+ 	if (chg < 0) {
+-		printf("LAUREL TORCH: off: no SPMI APID for the charger flash boost SID2 0xa600 (VREG_OK cannot be read)\n");
++		LT_START("LAUREL TORCH: off: no SPMI APID for the charger flash boost SID2 0xa600 (VREG_OK cannot be read)");
+ 		return -1;
+ 	}
+ 	if (sweet_spmi_rw_map((unsigned)apid) != 0) {
+-		printf("LAUREL TORCH: off: rw channel of APID %d not mapped\n", apid);
++		LT_START("LAUREL TORCH: off: rw channel of APID %d not mapped", apid);
+ 		return -1;
+ 	}
+ 	lck_mtx_lock(&lt_lock);
+@@ -544,48 +573,68 @@ laurel_torch_start(void)
+ 	    lt_read(LT_REG_MOD_CTRL, &mod) != 0 || lt_read(LT_REG_EN_LED, &en) != 0 || lt_read(LT_REG_STATUS2, &st2) != 0 ||
+ 	    lt_read(LT_REG_TGR, &tgr) != 0 || lt_chg_read(LT_CHG_STATUS2, &vreg) != 0) {
+ 		lck_mtx_unlock(&lt_lock);
+-		printf("LAUREL TORCH: off: SPMI read of SID3 0xd300 / SID2 0xa600 failed (APID %d / %d)\n", apid, chg);
++		LT_START("LAUREL TORCH: off: SPMI read of SID3 0xd300 / SID2 0xa600 failed (APID %d / %d)", apid, chg);
+ 		return -1;
+ 	}
+ 	if (type == 0xffu || (type == 0 && sub == 0)) {
+ 		lck_mtx_unlock(&lt_lock);
+-		printf("LAUREL TORCH: off: SID3 0xd300 type 0x%02x subtype 0x%02x: no flash module\n", type, sub);
++		LT_START("LAUREL TORCH: off: SID3 0xd300 type 0x%02x subtype 0x%02x: no flash module", type, sub);
+ 		return -1;
+ 	}
+ 	lt_mod_base = (uint8_t)(mod & ~LT_MOD_EN);
+ 	/* the boot chain left it on: off first. Then the handshake: TGR_CURRENT 1 and back to 0 (module off: no light) */
+ 	if (((en & LT_EN_MASK) || (mod & LT_MOD_EN)) && lt_off_locked() != 0) {
+ 		lck_mtx_unlock(&lt_lock);
+-		printf("LAUREL TORCH: off: the boot chain left the flash module on (EN_LED %#x MOD_CTRL %#x) and the off failed\n",
++		LT_START("LAUREL TORCH: off: the boot chain left the flash module on (EN_LED %#x MOD_CTRL %#x) and the off failed",
+ 		    en, mod);
+ 		return -1;
+ 	}
+ 	if (lt_masked(LT_REG_EN_LED, LT_EN_MASK, 0) != 0 || lt_masked(LT_REG_TGR, LT_CODE_MASK, 1) != 0 ||
+ 	    lt_masked(LT_REG_TGR, LT_CODE_MASK, 0) != 0 || lt_read(LT_REG_TGR, &back) != 0 || (back & LT_CODE_MASK) != 0) {
+ 		lck_mtx_unlock(&lt_lock);
+-		printf("LAUREL TORCH: off: TGR_CURRENT write did not read back (was %#x, now %#x)\n", tgr, back);
++		LT_START("LAUREL TORCH: off: TGR_CURRENT write did not read back (was %#x, now %#x)", tgr, back);
+ 		return -1;
+ 	}
+ 	lt_lit = false;
+ 	lck_mtx_unlock(&lt_lock);
+ 	if (kernel_thread_start(lt_watch, NULL, &th) != KERN_SUCCESS) {
+-		printf("LAUREL TORCH: off: no watch thread\n");
++		LT_START("LAUREL TORCH: off: no watch thread");
+ 		return -1;
+ 	}
+ 	thread_deallocate(th);
+ 	lt_ready = true;
+ 	uint32_t ma_max = 0;
+ 	(void)lt_code_for(100, &ma_max);
+-	printf("LAUREL TORCH: on: PMI632 flash LED SID3 0xd300 (APID %d, type 0x%02x/0x%02x rev 0x%02x, EN_LED %#x MOD_CTRL %#x, "
++	LT_START("LAUREL TORCH: on: PMI632 flash LED SID3 0xd300 (APID %d, type 0x%02x/0x%02x rev 0x%02x, EN_LED %#x MOD_CTRL %#x, "
+ 	    "STATUS2 %#x, boost VREG %#x), LED1 torch 12.5 mA steps, 1..100 %% = 12..%u mA (DT max %u mA), auto-off %u s, "
+-	    "off at over-temperature or a fault; /dev/laureltorch after the root mount\n",
++	    "off at over-temperature or a fault; /dev/laureltorch after the root mount",
+ 	    apid, type, sub, rev, en, mod, st2, vreg, ma_max, LT_DT_MAX_MA, LT_AUTO_OFF_S);
++	return 0;
++}
++
++int
++laurel_torch_start(void)
++{
++	static bool tried;
++	uint32_t on = 1;
++	thread_t th;
++
++	if (tried) {
++		return lt_ready ? 0 : -1;
++	}
++	tried = true;
++	(void)PE_parse_boot_argn("torch", &on, sizeof(on));
++	if (on == 0) {
++		LT_START("LAUREL TORCH: off: torch=0");
++		return -1;              /* the kill switch: no node, no button */
++	}
++	int rc = lt_start_check();
+ 	if (kernel_thread_start(lt_root_thread, NULL, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+ 	} else {
+ 		printf("LAUREL TORCH UI: off: no root-wait thread (no /dev/laureltorch)\n");
+ 	}
+-	return 0;
++	return rc;
+ }
+ 
+ void
+diff --git a/iokit/Kernel/arm/LaurelTorch.cpp b/iokit/Kernel/arm/LaurelTorch.cpp
+index 67133b3..ef0fb47 100644
+--- a/iokit/Kernel/arm/LaurelTorch.cpp
++++ b/iokit/Kernel/arm/LaurelTorch.cpp
+@@ -7,8 +7,8 @@
+  * README, 20H392 disassembly]: +[AVFlashlight hasFlashlight] = MGGetBoolAnswer("camera-flash"); libMobileGestalt
+  * answers true when IODeviceTree:/product/camera has a property "flash" (presence only). Without it Control Center
+  * has no flashlight button. Called by laurel_torch.c after the root mount, only when the torch self-check passed and
+- * the root has the mediaserverd plug-in LaurelFlashlight.driver (userland/laurel/flashlight): with the button and
+- * no plug-in, Control Center would talk to a FigFlashlight server that is never started
++ * the root has a mediaserverd plug-in that owns the flashlight (NegroniCamera.driver, or LaurelFlashlight.driver in a
++ * root without it; laurel 2783): with the button and no plug-in, Control Center would talk to a FigFlashlight server that is never started
+  * (com.apple.coremedia.flashlight is a MachService of mediaserverd [V root plist]; the root has
+  * StartRecorderServer false, so mediaserverd starts no capture server itself).
+  * Not in scripts/laurel/mkadt.py on purpose (as /product/haptics in LaurelVibrator.cpp).
