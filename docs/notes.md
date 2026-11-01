@@ -4068,3 +4068,20 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Built 05:48 in the worktree: 241/241 patches applied, 0 LSE, no new warnings, kernel.development.sweet.4k sha256 42e4ea88...
   NOT BOOTED. Next boot: expect `LAUREL VIBRATOR: on: ... a repeat ends after 60 s ...`, `request kind` lines, and a repeat ends
   with `repeat stopped by the <key> key` or `repeat stopped: 60 s and no new request`.
+
+## Mi A3: GPU start hung in the zap SCM calls = TopazAdreno's SMC without the TrustZone lock; 2153 (2026-11-01 06:10, branch t3/laurel-gpu-zap-hang)
+- Details: docs/laurel_sprout/gpu.md section "Zap hang".
+- [V log 05:52:41, usblog-20261101-001446] `TopazGPU: zap: metadata at 0xc0000000`, then no GPU line for > 4 min. The modem's
+  `segments loaded` comes one line later, then its `auth_and_reset ... resumes=35`: the GPU's PIL calls (PAS 13) went into
+  TrustZone while the modem's long call was interrupted/resumed. Other CPUs' SCM calls worked after it (assign at 05:52:41/43).
+- [V] `LAUREL THERMAL` after the hang: no core busy (silver 0-3 %, gold 3-13 %): no normal-world spin.
+- [V source] TopazAdreno.cpp (topaz 0901 + 2150) had its own unlocked smc()/scm(); 2404 locked only TopazModem's scm_call()
+  (TopazAudio uses it via topaz_scm()). Downstream scm.c (scm_lock) and mainline (qcom_scm_lock) hold one mutex over the SMC and
+  its INTERRUPTED resume loop. Downstream pil-tz never sends PAS_SHUTDOWN before init_image.
+- [I] The CPU with the GPU call stayed in the secure world (no ticks = 0 % busy); this lost CPU explains the slower first frame
+  (68 s, 29 s without zap files) and the dead `op10tool ctl ping` after 05:52:41 (not measured).
+- [V] On this TZ, PAS_IS_SUPPORTED answers x1 = 0 for the modem's PAS 4, which loads: x1 is no gate; only x0 != 0 is.
+- Fix 2153 (zap path only, TopazAdreno.cpp): all GPU SCM calls through topaz_scm() (shared lock + EBUSY retry); is_supported
+  first (fail = `LAUREL GPU: off: zap shader failed: TrustZone has no PIL call for PAS 13: ...` at once); no shutdown before
+  init_image, shutdown after a later failure; metadata in the TopazModem pool (0xE0000000+), GPU pool only as fallback; ms times.
+- Rule for new drivers: never `smc #0` for a SIP/PIL call outside topaz_scm() (PSCI and the reboot path are the exceptions).
