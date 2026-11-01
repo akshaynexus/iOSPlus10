@@ -96,8 +96,104 @@ XNU now runs at 0xE1004000-0x1AD004000, mostly above 4 GiB, so nothing the ADSP 
 
 ## Not done / open
 
-- Microphone: the Mi A3 mics are analog on the WCD937x (Bolero TX macro 0x0a460000/VA 0x0a4a0000 + SoundWire), not on
-  I2S: a codec + SoundWire driver (weeks). `/dev/redwood-mic` does not exist; the plug-in's "Codec" input stays silent.
-- Headphones (WCD937x HPH + MBHC), earpiece (WCD937x EAR): same codec work.
+- Microphone: done, see "Microphone" below (patch 2920, built, not booted).
+- Headphones (WCD937x HPH + MBHC), earpiece (WCD937x EAR): not done. They share the codec and its rails, but need more:
+  the RX macro + RX SoundWire master, class-H, the jack sense (MBHC), and new HAL devices. See "Microphone": what is reusable.
 - Haptics: the plug-in's "Actuator" writes `/dev/redwood-haptic` (absent: PMI632 LDO vibrator is area work elsewhere).
 - No speaker protection (DSM): safe gains only. Louder needs the AFE DSM module + SEC_MI2S_TX IV feedback.
+
+## Microphone (patch 2920, plug-in `mic-input.patch`, 2026-11-01). Status: **built + host-tested, NOT BOOTED**
+
+Owner: "Voice input is not working." Cause [V]: no kernel `/dev/redwood-mic`, no codec driver. The plug-in's "Codec" input was
+already there and read silence.
+
+### The path [V, sources, not the phone]
+
+| Item | Value | Source |
+| --- | --- | --- |
+| Main mic | AMIC1, analog, MIC BIAS1 1.8 V | X laurel_sprout-trinket-audio.dtsi routing; trinket-audio-overlay.dtsi `cdc-micbias1-mv` (laurel has no override) |
+| Other mics | AMIC2 = headset, AMIC3 (ADC2 MUX INP3) = second mic | mixer_paths_qrd.xml `amic2`, `amic3`, `handset-mic` |
+| Codec | WCD937x. **SoundWire, not SPMI**: TX slave 0x01170223, RX slave 0x01170224 | trinket-audio-overlay.dtsi. Rouleur (SPMI) is not on this board. So `sweet_spmi.c` is not used |
+| Rails | L9A (static) + L14A (on demand), 1.8 V, RPM `ldoa` | same; trinket-regulator.dtsi |
+| Reset | GPIO 120, SOUTH, 0x978000: gpio, 16 mA, output | trinket-pinctrl.dtsi, pinctrl-trinket.c |
+| SoundWire pins | GPIO 106, 107, 108, EAST, function 1 `swr_tx`, 10 mA, bus hold (TLMM, not LPI on this board). Slew 0xD8E000 = 3 | same; `bolero` `slew_rate_reg1` |
+| Master | TX SoundWire 0x0a470000; port 2 = ADC1; codec port 0 | `qcom,swr-port-mapping`, `qcom,tx_swr_ch_map` |
+| Port timing | 50 rows x 16 cols, 9.6 MHz, ssp 6; `tx_frame_params_superset[1]`: si 3, off1 1, off2 0, lane 0 | swrm_port_config.h, swr-mstr-ctrl.c |
+| Digital | TX macro 0x0a460000: `TX SMIC MUX0` ADC0, `TX DEC0 MUX` SWR_MIC, DEC0, 48 kHz, gain +18 dB. VA macro 0x0a4a0000: fs-gen only (`qcom,va-without-decimation`) | mixer path `amic1` + defaults (`TX_DEC0 Volume` 102), tx-macro.c |
+| Analog gain | `ADC1 Volume` 12 | mixer path `amic1` |
+| Clocks | AFE clock 0x30c + 0x30d, 19.2 MHz. No `lpass_core_hw_vote` on trinket (sm6150 has it) | trinket-audio-overlay.dtsi |
+| AFE | TX_CDC_DMA_TX_3 0xB037, `AFE_PARAM_ID_CODEC_DMA_CONFIG`, 48 kHz 16-bit 1 ch, mask 1 (DEC0) | audio_platform_info_qrd.xml, mixer path `audio-record`, sm6150.c |
+| ADM / ASM | ADM record COPP (NULL topology), matrix TX; ASM session 2, open read v3, 8 reads of 20 ms | the APR commands of redwood_mic.c (works on redwood), q6asm.c, q6adm.c |
+
+Mi A3 differences from the redwood driver [V]: WCD937x has no TX clock rate register and no `TX_ANA_MODE`; the master is older
+(no `COMP_STATUS`, no HCTL write in the 4.14 driver); no LPASS votes; pins on the TLMM; DEC0 instead of DEC1; one codec DMA mask.
+
+### What runs
+
+- Kernel: patch 2920, `TopazAudio.cpp` includes `LaurelMic{Regs,Hw,Codec,Ring,Path,Stream,Dev}.inc`. Everything is on the audio thread,
+  because GLINK and APR have no locks. `mic_wait()` pumps GLINK and the speaker during the bring-up.
+- Boot: `mic_self_check()` runs the whole path once after the speaker's check. It does not need the speaker to be up.
+- Node `/dev/redwood-mic`, mode 0666, but `d_open` admits only `mediaserverd`, `audiomxd` or root. **Why:** every app runs as `mobile`, so the mode
+  bits cannot stop an app, and TCC sits above the HAL. An open by the audio server starts the path; close stops it (codec back in reset). A read never
+  waits: ring of 341 ms, reader kept 40 ms behind, what is missing is silence in the plug-in.
+- Capture gain: `ioctl _IOW('r', 2)`, eighths of a dB under the top: DEC0 gain 18 dB down to -6 dB. HAL: a volume control on the Codec input, 24 dB,
+  **no mute**: if VirtualAudio sets it to 0 the mic is quiet, not dead, and the rms line shows it.
+- Plug-in: `userland/laurel/audio/mic-input.patch` on the topaz source (only the volume control; "Codec" and `imic` were there).
+
+### Log lines
+
+```
+TopazAudio: /dev/redwood-mic: ready
+TopazAudio: mic: SoundWire 0x........, codec device 1, chip 0x.., variant 0x.
+LAUREL MIC: on: WCD937x TX device 1 (chip 0x.., variant 0x.), SoundWire 0x........, TX_CDC_DMA_TX_3 48 kHz mono (2 reads back in N ms)
+LAUREL MIC: off: <reason>                (mic=0, adsp=0, no clock, no WCD937x on SoundWire, DSP refused a command, N of 2 reads, 3 failed starts, ADSP fatal)
+TopazAudio: mic: recording N: path up in N ms
+LAUREL MIC: first capture: rms N (peak P, F frames)      (once per boot, 1 s of samples after the filter settled)
+TopazAudio: mic: recording N ended after N ms: F frames, rms R, peak P, N reads, N errors, N skipped, N dry
+TopazAudio: mic: codec 0x....: wrote 0x.., reads 0x..       (up to 8; not fatal: Android never reads these back)
+TopazAudio: mic: open refused for NAME
+```
+Plug-in (mediaserverd's stderr, only if a syslog relay shows it): `redwood: audio: the microphone is listened to (/dev/redwood-mic: open)`,
+`...first samples...`, `the capture gain is ...`, `the microphone stops: ...`.
+
+Reading the rms: 0 = no data at all (port wrong or decimator muted). A few tens or less, no change when you clap = noise floor only (apollo saw peak 197
+at the wrong routing): wrong mic, no bias, or a mux. Hundreds or more and it follows the voice: it works.
+
+### iOS side (task: can iOS see it)
+
+- Input route [V code, other ports]: VirtualAudio makes the built-in mic port from a device with UID "Codec" and a data source it knows (`imic`). The plug-in
+  has both. Both other ports with this plug-in and the D22 identity (redwood, apollo) record: hackios notes, "Voice Memos records and draws the wave";
+  apollo boot 93 "the audio recorder ... the mic is 100% working". Mi A3 has the same identity (`mkadt.py`: D22AP, iPhone10,3). **On this phone: [U].**
+- MobileGestalt `microphone` [I]: iOS answers it per product (D22), not from hardware. Nothing in this repo overrides it, and those two ports did not. Not read
+  on the Mi A3. Apollo used `mgcache-reset.txt` once around its first mic boot, cause unclear: if Voice Memos never starts I/O, reset the cache once.
+- TCC: `tccd` needs Sandbox ops 5/6: patch 2903 has them [V code]. With ENOENT there, every TCC request failed. Apollo's "red button does nothing" went away after
+  its sandbox fixes (boot 93) [I that it was the cause]. Expect a permission prompt for Voice Memos.
+- MediaSafetyNet [V hackios `rc.jobs.mic`]: mediaserverd stops a background recorder after about 9 s without the status bar pill. Test in the foreground app.
+- Siri + Dictation: need assistantd + Apple network services: not reachable, not tested.
+- `system-features.md` said "Voice Memos opens, records silence": no log line backs it. `logs/` has no plug-in lines (mediaserverd's stderr is not in the kernel log) [V].
+
+### Camera link
+
+`-[BWAudioSourceNode start:]` hook (`userland/camera/media_hooks.c`) does **not** block capture audio. It only changes the error 'nope' into success. The stock comment
+says the node's capture session goes through a brokered HAL plug-in that is absent; that may be a different plug-in from ours [U]. Removing the hook would bring back the
+preview bursts if 'nope' stays, so it **stays**. New line for the decision: `negroni: camera hooks: the session's audio source started: video records sound`, else the old
+`...there is no capture audio on this phone...`. Video with sound is therefore unproven. Hook 11 (a NULL sample buffer not passed on) stays too.
+
+### Headphones and earpiece (not done, did not block the mic)
+
+Reusable: rails, reset, SoundWire helpers, codec init. New work: the RX macro 0x0a440000, RX master 0x0a450000 (ports `rx_frame_params`, RX SWR pins), RDAC/EAR/HPH + class-H sequences, RX_CDC_DMA_RX_0
+(ASM + ADM + AFE), MBHC for the jack, and HAL devices VirtualAudio knows ("Receiver", "Headphones"). Mixer paths `handset`, `headphones` hold the routing.
+
+### Tests
+
+- Host: `scripts/laurel/mic-host-test.sh`: `hal_test.c` (the real plug-in with a mock node: what iOS sees, samples, short read, read error, mic off, gain, playback untouched) and `seq_test.c`
+  (2920's sequence on a register model; the expected values are the stock driver's, written out by hand; ring + rms). Passing proves the sequence and the plug-in, **not the chip, the DSP or iOS**.
+- Phone (flash kernel image + root; owner approves):
+  1. Boot. `grep "LAUREL MIC" usblog`: the `on` line. `off` names the step.
+  2. Play a sound: the speaker must still work (`LAUREL AUDIO: on`).
+  3. Open Voice Memos, allow the microphone, record 10 s while you talk. Expected: the timer + wave, orange dot; lines `mic: recording 1: path up`, `LAUREL MIC: first capture: rms N` with N in the hundreds.
+  4. Stop, play the memo back.
+  5. Clap near the bottom, then cover the mic: rms and peak in `recording N ended` must change.
+  6. Play music while recording: the speaker must not stop. A click at the path's start is expected ([I] the bring-up holds the audio thread for about 100 ms).
+  7. Camera video: which of the two camera hook lines comes.
+  8. Boot with `mic=0`: `LAUREL MIC: off: kill switch (boot-arg mic=0)`, the speaker works, Voice Memos records silence.

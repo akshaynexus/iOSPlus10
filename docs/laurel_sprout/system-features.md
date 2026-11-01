@@ -41,7 +41,7 @@ Actions: **ON** = enabled by this branch. **DRIVER** = needs a driver. **OFF** =
 | Motion: auto-rotate, Compass, Measure | [V] log: `gyro` -> none. Sensors are on the ADSP sensor hub | **DRIVER** (SSC client). Compass tag `magnetometer`, Measure tag `arkit`: [I] hidden or useless until then |
 | Auto-brightness | [V] log: `als` -> none. stk3x3x on the sensor hub (`brightness.md`) | **DRIVER**. `root-brightness.py` stays |
 | Location fix | locationd runs, switch on. No GNSS client: negroni 0397 is not ported | **DRIVER** (`negroni-ports.md` item 15) |
-| Microphone: Voice Memos, Siri, calls | `audio.md`: analog mics on WCD937x + SoundWire | **DRIVER**. Voice Memos opens, records silence |
+| Microphone: Voice Memos, Siri, calls | `audio.md` "Microphone": analog AMIC1 on WCD937x + SoundWire | **DRIVER built, not booted** (patch 2920). Voice Memos: test steps there. Siri: needs network services [U]. Calls: no cell path |
 | Front, depth, ultrawide cameras | `camera.md`: rear IMX586 only | **DRIVER** |
 | Hardware video decode | [V] log: `AppleVXD375/390` -> none | **DRIVER**. Wallpaper HEIC is solved by `root-wallpaper.sh` |
 | AirDrop, AWDL: `wifip2pd` | [V] 76 starts in 15 min, no crash line. `wifi.md` has no AWDL | **DRIVER**. Stays off (`root-tweaks-perf.py`); put back when AWDL comes |

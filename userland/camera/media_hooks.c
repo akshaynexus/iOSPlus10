@@ -189,6 +189,11 @@ video_stabilization_type(id self, SEL selector)
  * Only that one error is swallowed: a microphone that is there and fails for another reason still
  * takes the session down, as it should. (The kernel's own microphone, adsp=1 mic=4, is a different
  * path: AVAudioRecorder and Voice Memos record through it, and nothing here touches it.)
+ *
+ * This does not block capture audio. If the node starts, it passes through, and the line below says so.
+ * Mi A3 (kernel 2920 + RedwoodAudio's "Codec"): nobody has yet seen whether the node still comes back with
+ * 'nope' now that a microphone exists. Removing the hook would bring back the preview bursts if it does, so
+ * it stays until a phone's log shows one of the two lines (docs/laurel_sprout/audio.md "Microphone").
  */
 #define ERROR_NO_SUCH_THING     1852797029      /* 'nope' */
 
@@ -202,6 +207,10 @@ audio_source_start(id self, SEL selector, id *error)
 	static bool said;
 
 	if (started || made == NULL || ((long (*)(id, SEL))objc_msgSend)(made, sel_registerName("code")) != ERROR_NO_SUCH_THING) {
+		if (started && !said) {
+			said = true;
+			say("negroni: camera hooks: the session's audio source started: video records sound\n");
+		}
 		return started;
 	}
 	*error = NULL;                  /* (autoreleased by the capture stack: not ours to give back) */
