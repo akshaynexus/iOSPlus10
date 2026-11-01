@@ -36,6 +36,9 @@ decision we learned; add yours before you stop), `docs/plan.md` (status and next
   USB or the boot.
 - **Reply style:** ASD-STE100, STE-flavored (short sentences, active voice, technical terms and
   numbers unchanged).
+- **Merge first, then clean the worktree:** after a branch is merged into the port branch (`origin/laurel-sprout`), run
+  `scripts/clean-worktrees.sh --yes`. It keeps worktrees that are unmerged, dirty, unpushed, mounted or in use. Jobs with large
+  output limit it and check `df -h` first.
 - **Clean old builds after every new build.** The Mac disk is nearly full (a full disk breaks builds and
   the shared git index). After a new build succeeds, run `scripts/clean-builds.sh --yes` (keeps the 2
   newest kernels and the linked one, kernel trees changed in the last 3 h, `out/ios16`, `ios16-debug`;
