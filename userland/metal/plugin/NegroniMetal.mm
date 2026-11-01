@@ -1201,6 +1201,44 @@ static void watchdog_start(void)
 			     "extensions by default; RB_COLOR_MODE=%s)",
 			     (int)xr10, xr && *xr ? xr : "auto", getenv("RB_COLOR_MODE") ?: "(unset)");
 			/*
+			 * laurel: RenderBox's device (RB::Device ctor 0x1e6919634 [V]) keeps the highest of supportsFamily: Apple1..7 at +0x111; family > 2 is its
+			 * hasYCbCrFormats and hasXR10Formats [V 0x1e691bd78, 0x1e691bd9c, by their names in its description]. With them an opaque layer gets
+			 * RGB8_444_2P, '_RB4' (RB::ColorMode::pixel_format 0x1e68c94a8): m2v refuses a render pipeline on that format with
+			 * Unsupported(Format at Color(0)) (boot 22:08: chronod 'primitive_image', 'primitive_gradient', "draw skipped": widgets without their images and
+			 * gradients), and the window server has to convert every such surface. The A610 answers RenderBox "family 2": plain BGRA, the path its layers with alpha
+			 * take already. Only RenderBox's own calls, only this GPU. NEGRONIMETAL_RB_FAMILY=0 in NMTL_DIR/env is the kill switch.
+			 */
+			{
+				const char *rb_family = getenv("NEGRONIMETAL_RB_FAMILY");
+				NSString *gpu_name = [(id<MTLDevice>)device name];
+
+				if ((rb_family == NULL || rb_family[0] != '0') && [gpu_name rangeOfString:@"610"].location != NSNotFound) {
+					SEL family_sel = sel_registerName("supportsFamily:");
+					IMP family_was = class_getMethodImplementation(object_getClass(device), family_sel);
+
+					class_replaceMethod(object_getClass(device), family_sel,
+							    imp_implementationWithBlock(^BOOL(id me, NSInteger family) {
+								    void *caller = __builtin_return_address(0);
+
+								    if (family >= 1003 && family <= 1009) {
+									    Dl_info info = { 0 };
+
+									    if (dladdr(caller, &info) != 0 && info.dli_fname != NULL && strstr(info.dli_fname, "RenderBox") != NULL) {
+										    static bool told;
+										    if (!told) {
+											    told = true;
+											    nlog("RenderBox asks for GPU family Apple%d: NO, from 3 on (NegroniMetal answer, NEGRONIMETAL_RB_FAMILY=0 turns it off): opaque layers stay BGRA, no '_RB4'",
+												 (int)family - 1000);
+										    }
+										    return NO;
+									    }
+								    }
+								    return ((BOOL (*)(id, SEL, NSInteger))family_was)(me, family_sel, family);
+							    }),
+							    "B24@0:8q16");
+				}
+			}
+			/*
 			 * MetalPerformanceShaders (MPSCore, 20H392 selector references [V ipsw dyld macho --objc-refs]) asks the device these
 			 * feature flags; the frontend has no answer for them, and an unanswered selector is an NSInvalidArgumentException in the
 			 * caller. Each is an Apple-GPU feature the runtime does not claim: NO (MPS takes its plain kernels). Installed only when

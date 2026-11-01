@@ -61,9 +61,11 @@ void lsf_convert(const struct lsf_format *f, enum lsf_matrix matrix, bool linear
 /* What a picture holds, from up to 64 x 64 samples: how many are not black (A8: not clear), how many differ from the first. */
 struct lsf_contents {
 	uint32_t samples, lit, unlike;
+	uint8_t mean[3];        /* red, green, blue */
 };
 void lsf_contents_of_pixels(const struct lsf_format *f, const uint8_t *pixels, size_t row, uint32_t width, uint32_t height,
     struct lsf_contents *c);
+void lsf_contents_of_rb4(const struct lsf_plane *plane, uint32_t width, uint32_t height, struct lsf_contents *c);
 void lsf_contents_of_words(enum lsf_kind kind, const uint8_t *words, size_t row, uint32_t width, uint32_t height, struct lsf_contents *c);
 
 /* Four characters for the log, printable or dots. */

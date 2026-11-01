@@ -75,7 +75,7 @@ index 598fd67..726f089 100644
 +	IOReturn ret = kIOReturnSuccess;
 +
 +	if (s->wrapped || s->memory == NULL || s->kernelAddress() == 0) {
-+		ret = kIOReturnUnsupported;     /* (client memory starts inside a page: the old path knows it) */
++		ret = kIOReturnBadArgument;     /* (client memory starts inside a page: the old path knows it. Unsupported means: no request 0x7c here) */
 +	} else if (s->planeCount == 0 && request->plane == 0) {
 +		request->offset = s->offset;
 +		request->rowBytes = s->bytesPerRow;

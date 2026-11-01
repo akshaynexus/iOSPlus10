@@ -40,7 +40,7 @@ echo "gpu-userland: eagl_gen.h: $(grep -c '^static' "$O/eagl_gen.h" || true) gen
 # 2. libtopaz-gl.dylib: OpenGL ES behind EAGLContext (eagl.c) on Mesa's OSMesa (gl_osmesa.c)
 gpu_cc "$R$PREFIX/lib/libtopaz-gl.dylib" -dynamiclib -install_name $PREFIX/lib/libtopaz-gl.dylib -I"$O" -I"$U" -I"$REPO/userland/laurel/gpu" \
   -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc "$M/libOSMesa.8.dylib" \
-  "$EAGL" "$U/gl_osmesa.c" "$REPO/userland/laurel/gpu/surface_formats.c" 2> "$O/libtopaz-gl.log" || { cat "$O/libtopaz-gl.log"; gpu_die "libtopaz-gl did not build"; }
+  "$EAGL" "$U/gl_osmesa.c" "$REPO/userland/laurel/gpu/gl_plane.c" "$REPO/userland/laurel/gpu/surface_formats.c" 2> "$O/libtopaz-gl.log" || { cat "$O/libtopaz-gl.log"; gpu_die "libtopaz-gl did not build"; }
 # 3. libtopaz-inject.dylib: inserted into backboardd; loads libtopaz-gl once the kernel publishes RedwoodGPU
 gpu_cc "$R$PREFIX/lib/libtopaz-inject.dylib" -dynamiclib -install_name $PREFIX/lib/libtopaz-inject.dylib \
   -framework CoreFoundation -framework IOKit -lobjc "$U/topaz_inject.c" 2> "$O/inject.log" ||

@@ -2,12 +2,13 @@ laurel 2913: redwood_drm_plane() (request 0x7c kRedwoodPlane) and REDWOOD_DRM_AN
 
 --- a/redwood_drm.c	2026-11-01 22:42:42.024667286 +0530
 +++ b/redwood_drm.c	2026-11-01 22:42:42.032796448 +0530
-@@ -185,6 +185,21 @@
+@@ -185,6 +185,22 @@
  	return 0;
  }
  
 +/* laurel 2913: where one plane of an IOSurface is. 0, or -1 with errno (a kernel without request 0x7c) */
 +#define REDWOOD_GPU_PLANE       0x7c
++__attribute__((visibility("default"))) int redwood_drm_plane(int fd, struct redwood_drm_plane *plane);
 +int
 +redwood_drm_plane(int fd, struct redwood_drm_plane *plane)
 +{
