@@ -4100,3 +4100,19 @@ Details: `docs/laurel_sprout/battery-power.md`.
   first (fail = `LAUREL GPU: off: zap shader failed: TrustZone has no PIL call for PAS 13: ...` at once); no shutdown before
   init_image, shutdown after a later failure; metadata in the TopazModem pool (0xE0000000+), GPU pool only as fallback; ms times.
 - Rule for new drivers: never `smc #0` for a SIP/PIL call outside topaz_scm() (PSCI and the reboot path are the exceptions).
+## Mi A3: Bluetooth stopped in `fifo_if_on` (SE + 0x2008); 2600 uses SE DMA mode instead (2026-11-01 06:25, BT agent, branch t3/laurel-bt-se-dma)
+- Details: docs/laurel_sprout/bluetooth.md section "SE9 left in GSI mode".
+- [V log 06:07:26] With 228d505: `geni: QUP 0x20000000 ..., SE9 FW 0x20c, FIFO 16/32 words`, then no BT step line for 4 min
+  (no `uart:`, no `on:`/`off:`), no panic; `ios: client control connected` came. [I] The read of SE + 0x2008 stopped the CPU.
+- [V] Boots 06:12 / 06:17 have no BT step line, no TopazRpm and no THERMAL line: their early log is incomplete.
+- [V mainline qcom-geni-se.c / qcom_geni_serial.c] SE_DMA_IF_EN 0x2004 / SE_FIFO_IF_DISABLE 0x2008 are written only by
+  geni_load_se_fw, which runs only for an SE without firmware (GENI_SE_INVALID_PROTO). SE9 has UART FW 0x20c.
+- [V 4.14 laurel kernel] No QUP driver touches SE registers above 0xE40. BT port = SE_DMA (TX 0xc30-0xc58, RX 0xd30-0xd60,
+  RX_LEN_IN 0xd54; RX done = RX_DMA_DONE/RX_EOT after the stale count; re-arm with the same buffer). spi/i2c: FIFO interface
+  off = GSI only (they never pick SE_DMA then). [I] Android has the same XBL/ABL state, so SE_DMA very likely works with it off.
+- [V trinket-qupv3.dtsi] QUP1 DMA = apps SMMU stream 0x143 (`qcom,iommu-s1-bypass`). [V log] apps SMMU sCR0 0x00270406
+  (USFCFG = 1: an unmatched stream faults) -> `topaz_smmu_identity(0x143, 0, "QUP1 Bluetooth")` (as WLAN/audio, both OK).
+- [V] QUP_HW_VER 0x20000000 = v2.0.
+- Fix: laurel_bt_dma.c (SMMU identity, buffers from topaz_pool_alloc = contiguous Normal NC below 4 GiB, polled TX/RX with
+  limits, faults become the off reason); FIFO mode unchanged when the bit is 0. Build 242/242, 0 LSE. Not booted.
+- Rule [I]: on a QUP without HLOS firmware loading, never touch SE + 0x1000..0x2fff (FW RAM, CLK_CTRL, DMA_IF_EN, FIFO_IF_DISABLE).

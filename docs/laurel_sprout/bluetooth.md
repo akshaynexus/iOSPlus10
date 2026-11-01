@@ -1,8 +1,9 @@
 # Bluetooth on the Mi A3 (laurel 2600)
 
 Patch: `patches/laurel/xnu/2600-laurel-bluetooth-wcn3990.patch` (range 2600-2699 is this area).
-Status: first boot 2026-11-01 05:52 stopped at `off: QUP1 SE9 FIFO interface is off (GSI only)`; fix in this patch
-(section "SE9 left in GSI mode"). Fix not booted yet.
+Status: boot 2026-11-01 05:52 stopped at `off: QUP1 SE9 FIFO interface is off (GSI only)`. Boot 06:07 (228d505,
+writes to SE + 0x2004/0x2008) stopped after the `geni:` line. Now: SE DMA mode, no access to SE + 0x2000..0x2008
+(section "SE9 left in GSI mode"). SE DMA not booted yet.
 [V] = read in source, [I] = inference.
 
 ## Files (one step per file, each < 310 lines)
@@ -11,8 +12,9 @@ Status: first boot 2026-11-01 05:52 stopped at `off: QUP1 SE9 FIFO interface is 
 | --- | --- |
 | `bsd/dev/laurel_bt.h` | shared declarations |
 | `bsd/dev/laurel_bt_geni.h` | QUP1 SE9 addresses, GENI registers, UART state (private to clk + uart) |
-| `bsd/dev/laurel_bt_clk.c` | mappings, GCC votes, s4 RCG / DFS levels, pins, GENI FIFO mode, self-check |
+| `bsd/dev/laurel_bt_clk.c` | mappings, GCC votes, s4 RCG / DFS levels, pins, GENI FIFO or SE DMA mode, self-check |
 | `bsd/dev/laurel_bt_uart.c` | baud (DFS level or RCG table), FIFO TX/RX, flow control |
+| `bsd/dev/laurel_bt_dma.c` | SE DMA TX/RX (boot left the FIFO interface off): SMMU stream 0x143, pool buffers |
 | `bsd/dev/laurel_bt_power.c` | rails over the RPM, power pulses |
 | `bsd/dev/laurel_bt_fat.c` | FAT12/16 reader of `bluetooth_b` / `bluetooth_a` (read-only) |
 | `bsd/dev/laurel_bt_fw.c` | rampatch + NVM download, NVM speed tag |
@@ -54,9 +56,9 @@ xnu tree again on every run: make the patch first.
 2. Rails: `topaz_soc_map()` (maps APCS, the RPM doorbell), then `topaz_rpm_write(set 0 and 1, "ldoa", n, "uv"/"swen")`
    for L9 1.8 V, L16 1.8 V, L17 1.304 V, L23 3.0 V. A refusal is logged and the bring-up goes on (the rails can be on
    from the bootloader); the EDL version answer is the check.
-3. UART: votes, CBCR checks, DFS levels, SE9 firmware = UART (protocol 2), FIFO interface on (clear
-   SE_FIFO_IF_DISABLE when the boot left GSI, read back), pins, GENI FIFO mode,
-   115200 8N1 RTS/CTS.
+3. UART: votes, CBCR checks, DFS levels, SE9 firmware = UART (protocol 2), mode from GENI_IF_DISABLE_RO bit 0
+   (0 = FIFO, 1 = SE DMA: apps SMMU identity for stream 0x143, 4 KiB TX + 2 KiB RX buffers in the modem pool),
+   pins, 115200 8N1 RTS/CTS, RX command (DMA mode: the RX transfer is armed first).
 4. Power: 0xC0 at 2400 baud, 0xFC at 115200 (flow control off for each pulse), 100 ms boot.
 5. EDL version `0xfc00 {0x19}` -> vendor event `04 ff len 00 02 product patch rom soc` (3 tries).
 6. Speed: host clock checked first; flow off, `0xfc48 {14}`, 10 ms, host 3000000, flow on, vendor event within 100 ms.
@@ -84,20 +86,56 @@ LAUREL BT: off: QUP1 SE9 FIFO interface is off (GSI only)
 ```
 
 - [V] The firmware in SE9 is UART (0x20c: protocol 2, version 0x0c). No firmware load is necessary.
-- [V Linux 6.18 external/laurel-mainline drivers/soc/qcom/qcom-geni-se.c] `GENI_IF_DISABLE_RO` (0x64) only shows the
-  writable `SE_FIFO_IF_DISABLE` (SE + 0x2008, bit 0). `geni_load_se_fw` writes it last: clear for FIFO, set for GSI,
-  after `geni_configure_xfer_mode` (FIFO: `SE_GENI_DMA_MODE_EN` bit 0 = 0, `SE_GSI_EVENT_EN` = 0) and `SE_DMA_IF_EN`
-  (0x2004) bit 0 = 1. `geni_load_se_firmware` always uses FIFO for UART. So the bit is a soft setting (case a), not a
-  GSI-only firmware.
-- [V 4.14 external/laurel-kernel-los] `msm_geni_serial.c` (`qcom,msm-geni-serial-hs`, SE9 `qupv3_se9_4uart`) never reads
-  the bit and uses SE_DMA for the BT port (`xfer_mode = SE_DMA`, console = FIFO). Only `spi-geni-qcom.c` reads it
-  (FIFO off -> GSI only). There is no GSI path for the UART in either kernel.
-- [I] The boot (XBL QUP loader or the UEFI GpiDxe/I2CDxe that Mu runs) leaves SE9 for GSI. Which one is not known.
-- Fix (`laurel_bt_clk.c` `fifo_if_on`, between the GENI check and the pins): when the RO bit is set, cancel the
-  sequencers, DMA mode off, GSI events off, DMA_IF_EN on, clear SE_FIFO_IF_DISABLE, read the RO bit again. Bit still set
-  = `off: QUP1 SE9 FIFO interface stays off (GSI only)` (only Bluetooth). Line: `geni: FIFO interface was off ...`.
-- [I] Risk: if a TrustZone xPU protects SE + 0x2000, the write is ignored (then the self-check turns BT off) or gives a
-  bus error. Linux writes the same register from the HLOS on other SoCs. Kill switch `laurelbt=0` skips all of BT.
+- [V] QUP_HW_VER 0x20000000 = QUP v2.0 (major 31:28 = 2, minor 27:16 = 0).
+
+Boot 06:07 (commit 228d505, `fifo_if_on`: reads SE + 0x2008 / 0x2004 first, then writes them) [V
+logs/usblog-20261101-001446.txt 06:07:26-06:11:27]: the `geni:` line, then no other `LAUREL BT` step line for 4 min
+(no `geni: FIFO interface was off`, no `uart:`, no `on:` / `off:`). No panic. bluetoothd ran and
+`ios: client control connected` came (the attach thread is separate). [I] The BT thread stopped at an access in
+`fifo_if_on`, most likely the first read of SE + 0x2008 (a register that this QUP version does not decode, or that
+an xPU guards: the CPU stalls, as in the TrustZone hang of 2153). The boots at 06:12 and 06:17 show no BT step line at
+all (only `ios:` lines, and no TopazRpm/THERMAL lines either): their early log is incomplete; no fact from them.
+
+Source facts:
+- [V Linux 6.18 external/laurel-mainline qcom-geni-se.c] SE_DMA_IF_EN (0x2004) and SE_FIFO_IF_DISABLE (0x2008) are
+  written only in `geni_load_se_fw`. `qcom_geni_serial_port_setup` calls `geni_load_se_firmware` only when
+  GENI_FW_REVISION shows no protocol (`GENI_SE_INVALID_PROTO`): SoCs where the HLOS loads the SE firmware. SE9 has
+  firmware, so mainline would never touch the two registers here.
+- [V 4.14 external/laurel-kernel-los] `include/linux/qcom-geni-se.h`, `qcom-geni-se.c`, `msm_geni_serial.c`,
+  `spi-geni-qcom.c`, `i2c-qcom-geni.c` have no register above 0xE40 (SE_DMA_DEBUG_REG0). Nothing writes 0x2004/0x2008.
+- [V 4.14] The BT port (`qcom,msm-geni-serial-hs`, not the console) is always SE_DMA (`msm_geni_serial_port_setup`:
+  `xfer_mode = SE_DMA`, packing 8 bits x 4, RX buffer 2048 = DMA_RX_BUF_SIZE, UART_RX_STALE_CNT = 10 x 16 bits).
+  TX: `setup_tx` (UART_TX_TRANS_LEN, M_CMD UART_START_TX) + `geni_se_tx_dma_prep` (TX_IRQ_EN_SET 7, PTR_L/H 0xc30/0xc34,
+  ATTR 1 = EOT 0xc38, LEN 0xc3c); done = SE_DMA_TX_IRQ_STAT 0xc40 bit 0 TX_DMA_DONE. RX: `geni_se_rx_dma_start`
+  (RX_IRQ_EN_SET 7, PTR 0xd30/0xd34, ATTR 0, LEN 0xd3c) before UART_START_READ; a transfer ends with RX_DMA_DONE (bit 0)
+  or RX_EOT (bit 1) of 0xd40 when the line is idle for the stale count; bytes = SE_DMA_RX_LEN_IN 0xd54; the ISR re-arms
+  with the same buffer, the read command stays active. Bit 2 = SBE (bus error). Error path: FSM_RST 0xc58 / 0xd58, wait
+  RESET_DONE bit 3. `geni_se_select_dma_mode`: GSI_EVENT_EN 0, IRQ clears, SE_IRQ_EN all, GENI_DMA_MODE_EN bit 0 = 1.
+- [V 4.14] `spi-geni-qcom.c` and `i2c-qcom-geni.c` read GENI_IF_FIFO_DISABLE_RO: bit set = they use GSI only (they never
+  pick SE_DMA then). The UART driver never reads it. [I] The FIFO interface bit gates CPU access to the FIFO registers
+  (0x700/0x780); SE DMA uses the DMA interface, which GSI also needs. Same boot chain as Android (XBL + ABL; our Mu
+  build has no QUP DXE), where the 4.14 BT port works in SE_DMA, so SE_DMA very likely works with the bit set. Not
+  seen on this phone yet: the self-check below decides.
+- [V trinket-qupv3.dtsi:231] `qupv3_1` (QUP1 wrapper 0x4cc0000): `qcom,iommu-s1-bypass`, context
+  `iommus = <&apps_smmu 0x143 0x0>`: QUP1 DMA goes through the apps SMMU with stream 0x143.
+- [V boot log 05:52:01 / 06:07:26] `TopazModem: smmu: sCR0 00270406`: bit 10 USFCFG = 1, an unmatched stream faults. So
+  stream 0x143 needs an SMR + identity context: `topaz_smmu_identity(0x143, 0, ...)`, the same call that gives WLAN 0x80
+  and audio 0x41 `-> OK` on this phone.
+
+Fix (`laurel_bt_clk.c` + new `laurel_bt_dma.c`):
+- `fifo_if_on` is removed. No access to SE + 0x2000..0x2008 any more; only registers of the 4.14 driver.
+- GENI_IF_DISABLE_RO bit 0 = 0: FIFO mode as before. Bit 0 = 1: SE DMA mode (`geni_setup` sets GENI_DMA_MODE_EN bit 0).
+- `lbt_dma_init`: SMMU identity for 0x143 (else `off: apps SMMU: no identity stream for QUP1 (sid 0x143): SE DMA not
+  possible`); 4 KiB TX + 2 KiB RX from `topaz_pool_alloc` (modem pool 0xE0000000: contiguous, Normal NC, below 4 GiB, no
+  cache maintenance; else `off: no memory for SE DMA (modem pool off)`); an engine left active by the boot is reset.
+- TX: copy, dsb, TRANS_LEN + UART_START_TX, DMA PTR/ATTR/LEN; wait for TX_DMA_DONE and the end of the M command (the
+  last stop bit is out: needed before a baud change); the wait has the wire time + 100 ms limit; RX is polled meanwhile.
+- RX: one 2 KiB transfer armed; each read polls 0xd40: DONE/EOT -> LEN_IN bytes to the ring when it has room (else the
+  transfer waits, the RX FIFO fills, RFR stops the chip), clear, re-arm; the read command is started again if it ended.
+- Self-check: SBE on TX or RX, or a TX that does not finish while CTS is ignored (the 0xC0/0xFC power pulses), sets the
+  fault; the power-pulse and EDL-version failures then give it as the off reason, e.g.
+  `off: SE DMA TX does not finish with CTS ignored (SE DMA blocked?)` or `off: TX bus error (QUP1 stream 0x143 blocked by
+  the SMMU?)`. The EDL version answer stays the end-to-end check. Only Bluetooth turns off; `laurelbt=0` skips all of BT.
 - Clock for 3000000 baud [V gcc-trinket.c, laurel_bt_uart.c]: DFS is off, so `lbt_uart_set_baud` uses the Linux table
   (`ftbl_gcc_qupv3_wrap0_s0_clk_src`). 3000000 x 32 = 96 MHz = table entry `F(96000000, P_GPLL0_OUT_AUX2, 1, 8, 25)`
   (GPLL0 aux2 300 MHz x 8/25, src 2 in `gcc_parent_map_1`), divider 1, exact. 115200 x 32 = 7.3728 MHz (entry 1,
@@ -109,8 +147,13 @@ LAUREL BT: off: QUP1 SE9 FIFO interface is off (GSI only)
 
 - `LAUREL BT: on: WCN3990 product 0x000a rom 0x0201, crbtfw21.tlv + crnv21.bin, 3000000 baud, BD_ADDR ..` [expected,
   not seen yet]
-- `LAUREL BT: geni: FIFO interface was off (GSI from boot): FIFO_IF_DISABLE 0x1 -> 0, DMA_IF_EN 0x1, RO 0` [expected;
-  only when the boot left GSI]. A RO value with bit 0 set = `off: QUP1 SE9 FIFO interface stays off (GSI only)`.
+- SE DMA mode [expected, not seen yet], in this order:
+  `TopazModem: smmu: QUP1 Bluetooth identity (sid 143 mask 0) CB.. SMR..: SMR 80000143 S2CR 0000000. ... -> OK`,
+  `LAUREL BT: geni: FIFO interface off (boot left GSI): SE DMA mode, SMMU sid 0x143, buffers 0xe....000 (TX 4096, RX
+  2048), debug 0x.. -> 0x..`, `LAUREL BT: uart: 115200 8N1 RTS/CTS, SE DMA, RX on (status 0x....)`, then `chip:` and
+  `on:`. FIFO mode: the `uart:` line says `FIFO`.
+- `LAUREL BT: uart: DMA: <fault> (stat .., debug .., status ..)`: the first SE DMA fault (once), then `off: <fault>`.
+- `LAUREL BT: uart: DMA TX of N bytes stalled (stat .., status .., CTS used|ignored)`: a TX limit was reached.
 - `LAUREL BT: off: <reason>`, e.g. `no EDL version answer (chip not powered?)`, `QUP1 SE9 has no UART firmware`,
   `QUP1 core/AHB clocks do not run`, `file not in the partition`, `laurelbt=0`.
 - Step lines: `LAUREL BT: clk: ...`, `geni: ...`, `uart: ...`, `power: ...`, `chip: ...`, `fw: ...`, `ios: client ...`.
@@ -147,8 +190,12 @@ and the boot are not touched.
   the rails counts. If L17/L23 are off, the result is `off: no EDL version answer`.
 - `topaz_soc_map()` waits up to 60 s for the modem partition (TopazModem's probe); the apcs mapping is made either way.
 - [V boot 05:52] DFS is off in the s4 RCG: the RCG table path is used (96 MHz for 3000000 baud, section above).
-- [V boot 05:52] SE9 holds UART firmware 0x20c, but in GSI mode: fixed by `fifo_if_on` (section above).
+- [V boot 05:52] SE9 holds UART firmware 0x20c, but the FIFO interface is off: SE DMA mode (section above).
+- [I] SE DMA with the FIFO interface off is not seen yet. If the engine is blocked: `off: SE DMA TX does not finish
+  with CTS ignored ...` (BT only). The next step would then be GPI (GSI) DMA, which no Linux UART driver has.
+- [I] SE_IRQ_EN and the DMA IRQ enables are set as in Linux; SPI 312 is not enabled in the GIC (polled), so no
+  interrupt comes.
 - Area audio (`t3/laurel-audio-speaker-adsp` root-audio.sh) moves BTAudioHALPlugin.driver to HAL.disabled; with
   Bluetooth audio it may have to stay (negroni: `BTAUDIO=1`). Merge note: both root.sh hooks go after the
   boldtext line.
-- Polled RX: throughput is bounded by the RX FIFO per poll (RFR holds the chip; no loss).
+- Polled RX: FIFO mode: bounded by the RX FIFO per poll; SE DMA mode: 2 KiB per poll (RFR holds the chip; no loss).

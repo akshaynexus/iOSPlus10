@@ -1,15 +1,16 @@
-laurel 2600: Bluetooth on the Mi A3. WCN3990 over the GENI UART of QUP1 SE9 (0x4c90000, GPIO 10-13 qup14): GCC wrap 1 votes + s4 RCG (DFS levels or the Linux table), FIFO interface on (SE_FIFO_IF_DISABLE 0x2008: the boot leaves SE9 for GSI), FIFO mode, polled, RTS/CTS. Power: PM6125 L9/L16/L17/L23 through the RPM (topaz_rpm_write), power pulses 0xC0 at 2400 and 0xFC at 115200 (no BT_EN). Bring-up as Linux hci_qca/btqca: EDL version (vendor event), 0xfc48 to 3000000 baud, crbtfw%02x.tlv rampatch + crnv%02x.bin NVM (speed tag 17) read at run time from the phone's FAT16 bluetooth_b (then _a) partition, HCI reset, BD_ADDR (the chip's own if unique, else the ADT local-mac-address, 0xfc14 + read back). iOS side (negroni 0332/0333/0336/0337 path): kernel control com.apple.uart.bluetooth, /dev/uart.bluetooth, /dev/cu.bluetooth, /dev/btwake, HCI answers for bluetoothd's Broadcom vendor commands, in-band sleep bytes. LaurelBluetooth.cpp: ADT /arm-io/bluetooth nub gets the address in use, or is hidden when Bluetooth is off. One line: 'LAUREL BT: on: WCN3990 product .. rom .., crbtfw21.tlv + crnv21.bin, 3000000 baud, BD_ADDR ..' or 'LAUREL BT: off: <why>'. Kill switch laurelbt=0. One small file per step (bsd/dev/laurel_bt*.c). Details: docs/laurel_sprout/bluetooth.md.
+laurel 2600: Bluetooth on the Mi A3. WCN3990 over the GENI UART of QUP1 SE9 (0x4c90000, GPIO 10-13 qup14): GCC wrap 1 votes + s4 RCG (DFS levels or the Linux table), FIFO mode, or SE DMA mode when the boot left the CPU FIFO interface off (GENI_IF_DISABLE_RO bit 0; as the 4.14 kernel drives the BT port: TX/RX DMA, RX ended by the stale timeout; apps SMMU identity for the QUP1 stream 0x143; buffers in the modem pool below 4 GiB; SE + 0x2000..0x2008 never touched), polled, RTS/CTS. Power: PM6125 L9/L16/L17/L23 through the RPM (topaz_rpm_write), power pulses 0xC0 at 2400 and 0xFC at 115200 (no BT_EN). Bring-up as Linux hci_qca/btqca: EDL version (vendor event), 0xfc48 to 3000000 baud, crbtfw%02x.tlv rampatch + crnv%02x.bin NVM (speed tag 17) read at run time from the phone's FAT16 bluetooth_b (then _a) partition, HCI reset, BD_ADDR (the chip's own if unique, else the ADT local-mac-address, 0xfc14 + read back). iOS side (negroni 0332/0333/0336/0337 path): kernel control com.apple.uart.bluetooth, /dev/uart.bluetooth, /dev/cu.bluetooth, /dev/btwake, HCI answers for bluetoothd's Broadcom vendor commands, in-band sleep bytes. LaurelBluetooth.cpp: ADT /arm-io/bluetooth nub gets the address in use, or is hidden when Bluetooth is off. One line: 'LAUREL BT: on: WCN3990 product .. rom .., crbtfw21.tlv + crnv21.bin, 3000000 baud, BD_ADDR ..' or 'LAUREL BT: off: <why>'. Kill switch laurelbt=0. One small file per step (bsd/dev/laurel_bt*.c). Details: docs/laurel_sprout/bluetooth.md.
 
 diff -ruN a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files	2026-11-01 05:15:56.526294173 +0530
 +++ b/bsd/conf/files	2026-11-01 05:17:05.164822232 +0530
-@@ -121,6 +121,17 @@
+@@ -121,6 +121,18 @@
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/laurel_reboot.c			standard
 +bsd/dev/laurel_bt.c			standard
 +bsd/dev/laurel_bt_clk.c			standard
 +bsd/dev/laurel_bt_uart.c			standard
++bsd/dev/laurel_bt_dma.c			standard
 +bsd/dev/laurel_bt_power.c			standard
 +bsd/dev/laurel_bt_fat.c			standard
 +bsd/dev/laurel_bt_fw.c			standard
@@ -211,14 +212,15 @@ diff -ruN a/bsd/dev/laurel_bt.c b/bsd/dev/laurel_bt.c
 diff -ruN a/bsd/dev/laurel_bt_clk.c b/bsd/dev/laurel_bt_clk.c
 --- a/bsd/dev/laurel_bt_clk.c	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_bt_clk.c	2026-11-01 05:15:56.551294408 +0530
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,202 @@
 +/*
 + * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 1b: bring up QUP1 SE9 for the UART.
 + * Mappings, GCC branch votes (wrap 1 core/core_2x/AHB + s4), the s4 RCG (DFS levels as XBL left them, else the
-+ * Linux table), FIFO interface on (the boot leaves SE9 for GSI), pins GPIO 10-13 to qup14, GENI FIFO mode, 8N1 at
-+ * 115200, RX command started.
-+ * The self-check is here: no UART firmware in SE9, a FIFO interface that stays off, or a QUP clock that does not
-+ * run = Bluetooth off with the reason (USB, UFS and the boot are not touched).
++ * Linux table), pins GPIO 10-13 to qup14, GENI FIFO or SE DMA mode, 8N1 at 115200, RX command started.
++ * Mode: FIFO when the CPU FIFO interface is on; SE DMA (laurel_bt_dma.c, as the 4.14 kernel drives the BT port)
++ * when the boot left it off (GENI_IF_DISABLE_RO bit 0 = 1, seen 2026-11-01). SE + 0x2000..0x2008 are never touched.
++ * The self-check is here: no UART firmware in SE9, no SMMU stream / DMA memory for SE DMA, or a QUP clock that
++ * does not run = Bluetooth off with the reason (USB, UFS and the boot are not touched).
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -331,36 +333,7 @@ diff -ruN a/bsd/dev/laurel_bt_clk.c b/bsd/dev/laurel_bt_clk.c
 +	}
 +}
 +
-+/*
-+ * The boot firmware leaves SE9 for GSI: GENI_IF_DISABLE_RO bit 0 = 1 (seen 2026-11-01). It shows SE_FIFO_IF_DISABLE
-+ * (SE + 0x2008), which Linux writes last in geni_load_se_fw (clear = FIFO, set = GSI; UART is always FIFO),
-+ * after geni_configure_xfer_mode (DMA mode off, no GSI events) and DMA_IF_EN. The UART firmware stays loaded.
-+ * Self-check: the read-only bit must clear, else Bluetooth is off.
-+ */
-+static int
-+fifo_if_on(const char **why)
-+{
-+	uint32_t was = rd(SE(SE_FIFO_IF_DISABLE)), dma = rd(SE(SE_DMA_IF_EN)), ro;
-+
-+	if (!(rd(SE(GENI_IF_DISABLE_RO)) & FIFO_IF_DISABLE)) {
-+		return 0;
-+	}
-+	s_cancel();
-+	wr(SE(GENI_DMA_MODE_EN), rd(SE(GENI_DMA_MODE_EN)) & ~1u);
-+	wr(SE(SE_GSI_EVENT_EN), 0);
-+	wr(SE(SE_DMA_IF_EN), dma | 1u);
-+	wr(SE(SE_FIFO_IF_DISABLE), was & ~FIFO_IF_DISABLE);
-+	ro = rd(SE(GENI_IF_DISABLE_RO));
-+	LBT_SAY("geni: FIFO interface was off (GSI from boot): FIFO_IF_DISABLE %#x -> %#x, DMA_IF_EN %#x, RO %#x\n",
-+	    was, rd(SE(SE_FIFO_IF_DISABLE)), rd(SE(SE_DMA_IF_EN)), ro);
-+	if (ro & FIFO_IF_DISABLE) {
-+		*why = "QUP1 SE9 FIFO interface stays off (GSI only)";
-+		return ENODEV;
-+	}
-+	return 0;
-+}
-+
-+/* geni_se_init + geni_se_select_mode(FIFO) + msm_geni_serial_port_setup + set_termios (8N1, RTS/CTS) */
++/* geni_se_init + geni_se_select_mode(FIFO or SE_DMA) + msm_geni_serial_port_setup + set_termios (8N1, RTS/CTS) */
 +static void
 +geni_setup(void)
 +{
@@ -375,7 +348,8 @@ diff -ruN a/bsd/dev/laurel_bt_clk.c b/bsd/dev/laurel_bt_clk.c
 +	wr(SE(SE_DMA_GENERAL_CFG), rd(SE(SE_DMA_GENERAL_CFG)) | 0xfu);
 +	wr(SE(GENI_OUTPUT_CTRL), 0x7fu);
 +	wr(SE(GENI_FORCE_DEFAULT), 1u);
-+	wr(SE(GENI_DMA_MODE_EN), rd(SE(GENI_DMA_MODE_EN)) & ~1u);
++	/* geni_se_select_dma_mode: GENI_DMA_MODE_EN bit 0; the GSI events stay off (written above) */
++	wr(SE(GENI_DMA_MODE_EN), u.dma ? rd(SE(GENI_DMA_MODE_EN)) | 1u : rd(SE(GENI_DMA_MODE_EN)) & ~1u);
 +	wr(SE(GENI_M_IRQ_EN), 0);               /* polled */
 +	wr(SE(GENI_S_IRQ_EN), 0);
 +	wr(SE(GENI_RX_WATERMARK), 2u);
@@ -413,11 +387,15 @@ diff -ruN a/bsd/dev/laurel_bt_clk.c b/bsd/dev/laurel_bt_clk.c
 +		*why = "register mapping failed";
 +		return ENOMEM;
 +	}
-+	if ((e = clocks(why)) != 0 || (e = geni_check(why)) != 0 || (e = fifo_if_on(why)) != 0) {
++	if ((e = clocks(why)) != 0 || (e = geni_check(why)) != 0) {
 +		return e;
 +	}
++	u.dma = (rd(SE(GENI_IF_DISABLE_RO)) & FIFO_IF_DISABLE) != 0;
 +	pins();
-+	geni_setup();
++	geni_setup();                           /* sequencers cancelled, FIFO or DMA mode */
++	if (u.dma && (e = lbt_dma_init(why)) != 0) {
++		return e;
++	}
 +	if (lbt_uart_set_baud(115200u) != 0) {
 +		*why = "no QUP clock for 115200 baud";
 +		return ERANGE;
@@ -428,9 +406,12 @@ diff -ruN a/bsd/dev/laurel_bt_clk.c b/bsd/dev/laurel_bt_clk.c
 +		return ENXIO;
 +	}
 +	u.head = u.tail = 0;
++	if (u.dma) {
++		lbt_dma_rx_arm();               /* 4.14 start_rx_sequencer: the RX transfer before the command */
++	}
 +	/* UART_START_READ, param 0: RFR follows the watermark (Linux sets RFR_OPEN; polled here, so no loss) */
 +	wr(SE(GENI_S_CMD0), 1u << 27);
-+	LBT_SAY("uart: 115200 8N1 RTS/CTS, RX on (status %#x)\n", rd(SE(GENI_STATUS)));
++	LBT_SAY("uart: 115200 8N1 RTS/CTS, %s, RX on (status %#x)\n", u.dma ? "SE DMA" : "FIFO", rd(SE(GENI_STATUS)));
 +	return 0;
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
@@ -825,6 +806,237 @@ diff -ruN a/bsd/dev/laurel_bt_dev.c b/bsd/dev/laurel_bt_dev.c
 +			d.node[i] = NULL;
 +		}
 +	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_bt_dma.c b/bsd/dev/laurel_bt_dma.c
+--- a/bsd/dev/laurel_bt_dma.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_bt_dma.c	2026-11-01 07:00:00.000000000 +0530
+@@ -0,0 +1,227 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 1c: SE DMA mode of the QUP1 SE9 UART.
++ * Used when the boot left the CPU FIFO interface of SE9 off (GENI_IF_DISABLE_RO bit 0 = 1, boot 2026-11-01).
++ * The 4.14 laurel kernel drives the BT port the same way [V external/laurel-kernel-los msm_geni_serial.c]:
++ * xfer_mode = SE_DMA, setup_tx (UART_TX_TRANS_LEN, UART_START_TX) + geni_se_tx_dma_prep (IRQ_EN_SET 7, PTR, ATTR 1
++ * = EOT, LEN); RX: geni_se_rx_dma_start (PTR, ATTR 0, LEN 2048) before UART_START_READ; a transfer ends with
++ * RX_DMA_DONE / RX_EOT when the line is idle for UART_RX_STALE_CNT bit times; SE_DMA_RX_LEN_IN = bytes; re-arm.
++ * Polled: the DMA status bits are read, the GIC line (SPI 312) is not used.
++ * Memory: the modem pool (topaz_pool_alloc: physically contiguous, Normal NC, 0xE0000000 = below 4 GiB), so no
++ * cache maintenance. QUP1 is a bus master behind the apps SMMU [V trinket-qupv3.dtsi qupv3_1: iommus
++ * <&apps_smmu 0x143 0x0>, qcom,iommu-s1-bypass]; sCR0 0x00270406 on this phone has USFCFG = 1 (an unmatched
++ * stream faults), so the stream gets an identity context (topaz_smmu_identity, as WLAN 0x80 and audio 0x41).
++ * Self-check: the SMMU stream and the buffers here; a DMA bus error, or a TX that does not finish while CTS is
++ * ignored (the power pulses), sets u.fault, which becomes the off reason (laurel_bt_power.c, laurel_bt_hci.c).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "laurel_bt.h"
++#include "laurel_bt_geni.h"
++
++extern bool topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
++extern void *topaz_pool_alloc(uint64_t size, uint64_t *pa);
++
++#define QUP1_SID                0x143u
++#define DMA_IRQ_BITS            7u              /* DONE | EOT | SBE, as geni_se_*_dma_prep */
++#define M_ACTIVE                (1u << 0)
++#define S_ACTIVE                (1u << 12)
++#define UART_START              (1u << 27)      /* M: UART_START_TX, S: UART_START_READ (param 0) */
++
++static bool rx_dead;                            /* an RX bus error: no re-arm (no error storm) */
++
++static void
++fault(const char *why, uint32_t stat)
++{
++	if (!u.fault) {
++		u.fault = why;
++		LBT_SAY("uart: DMA: %s (stat %#x, debug %#x, status %#x)\n", why, stat, rd(SE(SE_DMA_DEBUG_REG0)),
++		    rd(SE(GENI_STATUS)));
++	}
++}
++
++/* SE_DMA_*_FSM_RST, then RESET_DONE within 2 ms (msm_geni_serial.c stop_tx_sequencer / stop_rx_sequencer) */
++static bool
++fsm_reset(uint32_t rst, uint32_t stat, uint32_t clr)
++{
++	wr(SE(rst), 1u);
++	bool ok = lbt_wait_bits(SE(stat), DMA_RESET_DONE, true, 2000);
++	wr(SE(clr), 0xffffffffu);
++	return ok;
++}
++
++int
++lbt_dma_init(const char **why)
++{
++	static uint8_t *pool;
++	static uint64_t pa;
++	uint32_t dbg = rd(SE(SE_DMA_DEBUG_REG0));
++
++	if (!topaz_smmu_identity(QUP1_SID, 0, "QUP1 Bluetooth")) {
++		*why = "apps SMMU: no identity stream for QUP1 (sid 0x143): SE DMA not possible";
++		return ENXIO;
++	}
++	if (!pool) {
++		pool = topaz_pool_alloc(DMA_TX_BUF + DMA_RX_BUF, &pa);  /* once per boot, never freed */
++	}
++	if (!pool) {
++		*why = "no memory for SE DMA (modem pool off)";
++		return ENOMEM;
++	}
++	if (pa + DMA_TX_BUF + DMA_RX_BUF > (1ull << 32)) {
++		*why = "SE DMA buffers above 4 GiB";
++		return ERANGE;
++	}
++	u.txb = pool;
++	u.txpa = pa;
++	u.rxb = pool + DMA_TX_BUF;
++	u.rxpa = pa + DMA_TX_BUF;
++	u.rx_armed = false;
++	u.fault = NULL;
++	rx_dead = false;
++	/* an engine left active by the boot: reset it (geni_setup has cancelled both sequencers) */
++	if ((dbg & 1u) && !fsm_reset(DMA_TX_FSM_RST, DMA_TX_IRQ_STAT, DMA_TX_IRQ_CLR)) {
++		*why = "SE DMA TX engine does not reset";
++		return EIO;
++	}
++	if ((dbg & 2u) && !fsm_reset(DMA_RX_FSM_RST, DMA_RX_IRQ_STAT, DMA_RX_IRQ_CLR)) {
++		*why = "SE DMA RX engine does not reset";
++		return EIO;
++	}
++	wr(SE(DMA_TX_IRQ_CLR), 0xffffffffu);
++	wr(SE(DMA_RX_IRQ_CLR), 0xffffffffu);
++	LBT_SAY("geni: FIFO interface off (boot left GSI): SE DMA mode, SMMU sid %#x, buffers %#llx (TX %u, RX %u), "
++	    "debug %#x -> %#x\n", QUP1_SID, pa, DMA_TX_BUF, DMA_RX_BUF, dbg, rd(SE(SE_DMA_DEBUG_REG0)));
++	return 0;
++}
++
++void
++lbt_dma_rx_arm(void)
++{
++	wr(SE(DMA_RX_IRQ_EN_SET), DMA_IRQ_BITS);
++	wr(SE(DMA_RX_PTR_L), (uint32_t)u.rxpa);
++	wr(SE(DMA_RX_PTR_H), (uint32_t)(u.rxpa >> 32));
++	wr(SE(DMA_RX_ATTR), 0);                 /* RX has no EOT buffer bit */
++	wr(SE(DMA_RX_LEN), DMA_RX_BUF);         /* wr() ends with dsb: the length goes last */
++	u.rx_armed = true;
++}
++
++/*
++ * A finished transfer (stale timeout or full buffer) goes to the ring when the ring has room; else it waits:
++ * the RX FIFO fills and RFR stops the chip (no loss). Then re-arm; restart the read command if it ended.
++ */
++void
++lbt_dma_rx_poll(void)
++{
++	uint32_t st = rd(SE(DMA_RX_IRQ_STAT));
++
++	if (st & DMA_SBE) {
++		fault("RX bus error (QUP1 stream 0x143 blocked by the SMMU?)", st);
++		wr(SE(DMA_RX_IRQ_CLR), st);
++		u.rx_armed = false;
++		rx_dead = true;
++		return;
++	}
++	if (st & (DMA_DONE | DMA_EOT)) {
++		if (u.rx_armed) {
++			uint32_t n = MIN(rd(SE(DMA_RX_LEN_IN)), DMA_RX_BUF);
++			uint32_t room = (u.tail + RX_RING - u.head - 1u) % RX_RING;
++
++			if (n > room) {
++				return;
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");     /* the status read before the data reads */
++			for (uint32_t i = 0; i < n; i++) {
++				u.ring[u.head] = u.rxb[i];
++				u.head = (u.head + 1u) % RX_RING;
++			}
++		}
++		u.rx_armed = false;
++	}
++	if (st) {
++		wr(SE(DMA_RX_IRQ_CLR), st);     /* also parity / break / reset-done bits */
++	}
++	if (rx_dead) {
++		return;
++	}
++	if (!u.rx_armed) {
++		lbt_dma_rx_arm();
++	}
++	if (!(rd(SE(GENI_STATUS)) & S_ACTIVE)) {         /* the read command ended (break, error): start again */
++		wr(SE(GENI_S_CMD0), UART_START);
++	}
++}
++
++/* msm_geni_serial.c stop_tx_sequencer: cancel (abort) the command, reset the TX engine when it is active */
++static void
++tx_stop(void)
++{
++	lbt_m_cancel();
++	if (rd(SE(SE_DMA_DEBUG_REG0)) & 1u) {
++		(void)fsm_reset(DMA_TX_FSM_RST, DMA_TX_IRQ_STAT, DMA_TX_IRQ_CLR);
++	}
++	wr(SE(DMA_TX_IRQ_CLR), 0xffffffffu);
++}
++
++static int
++tx_chunk(const uint8_t *buf, uint32_t len)
++{
++	/* wire time at 10 bits per byte + 100 ms for CTS held by the chip */
++	uint64_t limit = (uint64_t)len * 10u * 1000000u / (u.baud ? u.baud : 115200u) + 100000u, t0 = lbt_us();
++	uint32_t st;
++
++	memcpy(u.txb, buf, len);
++	__asm__ volatile ("dsb sy" ::: "memory");     /* the data before the DMA start */
++	if (rd(SE(GENI_STATUS)) & M_ACTIVE) {
++		tx_stop();
++	}
++	wr(SE(DMA_TX_IRQ_CLR), 0xffffffffu);
++	wr(SE(GENI_M_IRQ_CLEAR), 0xffffffffu);
++	wr(SE(UART_TX_TRANS_LEN), len);
++	wr(SE(GENI_M_CMD0), UART_START);
++	wr(SE(DMA_TX_IRQ_EN_SET), DMA_IRQ_BITS);
++	wr(SE(DMA_TX_PTR_L), (uint32_t)u.txpa);
++	wr(SE(DMA_TX_PTR_H), (uint32_t)(u.txpa >> 32));
++	wr(SE(DMA_TX_ATTR), 1u);                /* EOT: the command ends with this buffer */
++	wr(SE(DMA_TX_LEN), len);
++	/* done = the engine read the buffer (TX_DMA_DONE) and the command ended (the last stop bit is out) */
++	while (!((st = rd(SE(DMA_TX_IRQ_STAT))) & DMA_DONE) || (rd(SE(GENI_STATUS)) & M_ACTIVE)) {
++		if (st & DMA_SBE) {
++			fault("TX bus error (QUP1 stream 0x143 blocked by the SMMU?)", st);
++			tx_stop();
++			return EIO;
++		}
++		lbt_dma_rx_poll();              /* RX keeps moving while TX waits for CTS */
++		if (lbt_us() - t0 > limit) {
++			LBT_SAY("uart: DMA TX of %u bytes stalled (stat %#x, status %#x, CTS %s)\n", len, st,
++			    rd(SE(GENI_STATUS)), (rd(SE(UART_TX_TRANS_CFG)) & CTS_MASK) ? "ignored" : "used");
++			if (rd(SE(UART_TX_TRANS_CFG)) & CTS_MASK) {
++				/* CTS ignored: only the SE can stop it */
++				fault("SE DMA TX does not finish with CTS ignored (SE DMA blocked?)", st);
++			}
++			tx_stop();
++			return ETIMEDOUT;
++		}
++		delay(2);
++	}
++	wr(SE(DMA_TX_IRQ_CLR), st);
++	wr(SE(GENI_M_IRQ_CLEAR), 0xffffffffu);
++	return 0;
++}
++
++int
++lbt_dma_write(const uint8_t *buf, uint32_t len)
++{
++	for (uint32_t off = 0; off < len;) {
++		uint32_t n = MIN(len - off, DMA_TX_BUF);
++		int e = tx_chunk(buf + off, n);
++
++		if (e) {
++			return e;
++		}
++		off += n;
++	}
++	return 0;
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff -ruN a/bsd/dev/laurel_bt_fat.c b/bsd/dev/laurel_bt_fat.c
@@ -1276,9 +1488,10 @@ diff -ruN a/bsd/dev/laurel_bt_fw.c b/bsd/dev/laurel_bt_fw.c
 diff -ruN a/bsd/dev/laurel_bt_geni.h b/bsd/dev/laurel_bt_geni.h
 --- a/bsd/dev/laurel_bt_geni.h	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_bt_geni.h	2026-11-01 05:15:56.551294408 +0530
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,155 @@
 +/*
-+ * laurel 2600: private to laurel_bt_uart.c + laurel_bt_clk.c: QUP1 SE9 addresses, GENI registers, UART state.
++ * laurel 2600: private to laurel_bt_uart.c, laurel_bt_clk.c, laurel_bt_dma.c: QUP1 SE9 addresses, GENI and SE DMA
++ * registers, UART state.
 + */
 +#ifndef LAUREL_BT_GENI_H
 +#define LAUREL_BT_GENI_H
@@ -1355,17 +1568,40 @@ diff -ruN a/bsd/dev/laurel_bt_geni.h b/bsd/dev/laurel_bt_geni.h
 +#define GENI_TX_WATERMARK       0x80cu
 +#define GENI_RX_WATERMARK       0x810u
 +#define GENI_RX_RFR_WATERMARK   0x814u
++/*
++ * SE DMA (4.14 qcom-geni-se.h): the SE's own DMA engine, TX block 0xc30 + RX block 0xd30. Only registers that the
++ * 4.14 laurel kernel uses on this QUP (v2.0). Not SE + 0x2000..0x2008 (SE_GENI_CLK_CTRL, SE_DMA_IF_EN,
++ * SE_FIFO_IF_DISABLE): only mainline's SE firmware loader writes them; the BT thread stopped in the code that
++ * read 0x2008 (boot 2026-11-01 06:07).
++ */
++#define DMA_TX_PTR_L            0xc30u
++#define DMA_TX_PTR_H            0xc34u
++#define DMA_TX_ATTR             0xc38u          /* bit 0 EOT buffer */
++#define DMA_TX_LEN              0xc3cu
++#define DMA_TX_IRQ_STAT         0xc40u
 +#define DMA_TX_IRQ_CLR          0xc44u
++#define DMA_TX_IRQ_EN_SET       0xc4cu
++#define DMA_TX_FSM_RST          0xc58u
++#define DMA_RX_PTR_L            0xd30u
++#define DMA_RX_PTR_H            0xd34u
++#define DMA_RX_ATTR             0xd38u
++#define DMA_RX_LEN              0xd3cu
++#define DMA_RX_IRQ_STAT         0xd40u
 +#define DMA_RX_IRQ_CLR          0xd44u
++#define DMA_RX_IRQ_EN_SET       0xd4cu
++#define DMA_RX_LEN_IN           0xd54u
++#define DMA_RX_FSM_RST          0xd58u
 +#define SE_GSI_EVENT_EN         0xe18u
 +#define SE_IRQ_EN               0xe1cu
 +#define SE_HW_PARAM_0           0xe24u
 +#define SE_HW_PARAM_1           0xe28u
 +#define SE_DMA_GENERAL_CFG      0xe30u
-+/* qcom-geni-se.c (Linux 6.18) geni_load_se_fw: the writable side of GENI_IF_DISABLE_RO */
-+#define SE_DMA_IF_EN            0x2004u         /* bit 0 DMA interface on */
-+#define SE_FIFO_IF_DISABLE      0x2008u         /* bit 0 FIFO interface off (set for GSI) */
-+#define FIFO_IF_DISABLE         (1u << 0)
++#define SE_DMA_DEBUG_REG0       0xe40u          /* bit 0 TX active, bit 1 RX active */
++#define DMA_DONE                (1u << 0)       /* TX_DMA_DONE / RX_DMA_DONE */
++#define DMA_EOT                 (1u << 1)       /* RX: the stale timeout or the length ended the transfer */
++#define DMA_SBE                 (1u << 2)       /* bus error (an SMMU fault on the QUP stream) */
++#define DMA_RESET_DONE          (1u << 3)
++#define FIFO_IF_DISABLE         (1u << 0)       /* GENI_IF_DISABLE_RO: CPU FIFO access off (boot left GSI) */
 +#define M_CMD_DONE              (1u << 0)
 +#define M_CMD_CANCEL            (1u << 4)
 +#define S_CMD_CANCEL            (1u << 4)
@@ -1374,10 +1610,17 @@ diff -ruN a/bsd/dev/laurel_bt_geni.h b/bsd/dev/laurel_bt_geni.h
 +#define CTS_MASK                (1u << 1)
 +#define RX_RING                 4096u
 +
++#define DMA_TX_BUF              4096u
++#define DMA_RX_BUF              2048u           /* msm_geni_serial.c DMA_RX_BUF_SIZE */
++
 +struct lbt_geni {
 +	vm_offset_t gcc, vote, tlmm, se, qup;
 +	uint32_t sampling, tx_depth, rx_depth, baud, levels;
 +	bool dfs;
++	bool dma, rx_armed;                     /* SE DMA mode (FIFO interface off), an RX transfer is armed */
++	uint8_t *txb, *rxb;                     /* DMA buffers (modem pool, Normal NC, below 4 GiB) */
++	uint64_t txpa, rxpa;
++	const char *fault;                      /* first DMA fault, for the off line */
 +	uint64_t level_hz[8];
 +	uint8_t ring[RX_RING];
 +	uint32_t head, tail;
@@ -1394,18 +1637,25 @@ diff -ruN a/bsd/dev/laurel_bt_geni.h b/bsd/dev/laurel_bt_geni.h
 +#define wr lbt_wr
 +vm_offset_t lbt_map(uint32_t pa, uint32_t size);
 +bool lbt_wait_bits(vm_offset_t reg, uint32_t mask, bool set, uint32_t us);
++void lbt_m_cancel(void);
++/* laurel_bt_dma.c: SE DMA mode, used when the boot left the FIFO interface off */
++int lbt_dma_init(const char **why);             /* SMMU stream, buffers, DMA engines idle; 0 or errno */
++void lbt_dma_rx_arm(void);
++void lbt_dma_rx_poll(void);                     /* a finished RX transfer -> ring, then re-arm */
++int lbt_dma_write(const uint8_t *buf, uint32_t len);
 +#endif /* LAUREL_BT_GENI_H */
 diff -ruN a/bsd/dev/laurel_bt.h b/bsd/dev/laurel_bt.h
 --- a/bsd/dev/laurel_bt.h	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_bt.h	2026-11-01 05:15:56.551294408 +0530
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,169 @@
 +/*
 + * laurel_sprout (Xiaomi Mi A3, SM6125): Bluetooth of the WCN3990 (laurel 2600). Shared declarations.
 + * Docs: iOSPlus10 docs/laurel_sprout/bluetooth.md.
 + *
 + * Files (one step each):
-+ *   laurel_bt_clk.c    QUP1 SE9 bring-up: mappings, GCC votes, s4 RCG / DFS levels, pins, GENI FIFO mode
++ *   laurel_bt_clk.c    QUP1 SE9 bring-up: mappings, GCC votes, s4 RCG / DFS levels, pins, GENI FIFO or DMA mode
 + *   laurel_bt_uart.c   GENI UART data path on QUP1 SE9 0x4c90000: baud, FIFO TX/RX, flow control
++ *   laurel_bt_dma.c    SE DMA TX/RX (when the boot left the FIFO interface off): SMMU stream 0x143, pool buffers
 + *   laurel_bt_power.c  PM6125 rails L9/L16/L17/L23 over the RPM, WCN3990 power pulses (no BT_EN pin)
 + *   laurel_bt_fat.c    FAT12/16 reader of the "bluetooth_b/_a" partition (read-only, sweet_ufs_read_part)
 + *   laurel_bt_fw.c     crbtfw%02x.tlv rampatch + crnv%02x.bin NVM download (EDL 0xfc00), NVM baud tag
@@ -1454,13 +1704,14 @@ diff -ruN a/bsd/dev/laurel_bt.h b/bsd/dev/laurel_bt.h
 +
 +/* ---- UART (laurel_bt_uart.c) ----------------------------------------------------------------- */
 +
-+int lbt_uart_init(const char **why);            /* clocks, pins, GENI FIFO mode, 115200 8N1; 0 or errno */
++int lbt_uart_init(const char **why);            /* clocks, pins, FIFO or SE DMA mode, 115200 8N1; 0 or errno */
 +int lbt_uart_set_baud(uint32_t baud);           /* 0 or errno (no clock within 2 %) */
 +uint32_t lbt_uart_baud(void);
 +void lbt_uart_flow(bool on);                    /* false: RFR not ready + CTS ignored (hci_qca speed change) */
 +int lbt_uart_write(const uint8_t *buf, uint32_t len);  /* 0 or errno; waits until sent (bounded) */
 +uint32_t lbt_uart_read(uint8_t *buf, uint32_t max);    /* bytes now received, no wait */
 +void lbt_uart_drop_rx(void);                    /* forget received bytes (after a power pulse) */
++const char *lbt_uart_fault(void);               /* the first SE DMA fault (bus error, stuck engine), or NULL */
 +
 +/* ---- power (laurel_bt_power.c) --------------------------------------------------------------- */
 +
@@ -1930,7 +2181,7 @@ diff -ruN a/bsd/dev/laurel_bt_hci.c b/bsd/dev/laurel_bt_hci.c
 +		uint64_t end = lbt_us() + 500000u;
 +
 +		if (lbt_hci_send(LBT_EDL_OP, &p, 1) != 0) {
-+			*why = "EDL version request not sent (CTS held: chip off?)";
++			*why = lbt_uart_fault() ? lbt_uart_fault() : "EDL version request not sent (CTS held: chip off?)";
 +			return EIO;
 +		}
 +		while (lbt_us() < end) {
@@ -1941,7 +2192,7 @@ diff -ruN a/bsd/dev/laurel_bt_hci.c b/bsd/dev/laurel_bt_hci.c
 +			}
 +		}
 +	}
-+	*why = "no EDL version answer (chip not powered?)";
++	*why = lbt_uart_fault() ? lbt_uart_fault() : "no EDL version answer (chip not powered?)";
 +	return ETIMEDOUT;
 +}
 +
@@ -2440,7 +2691,7 @@ diff -ruN a/bsd/dev/laurel_bt_power.c b/bsd/dev/laurel_bt_power.c
 +		return e;
 +	}
 +	if ((e = pulse(LBT_POWER_OFF_PULSE)) != 0) {
-+		*why = "power-off pulse not sent";
++		*why = lbt_uart_fault() ? lbt_uart_fault() : "power-off pulse not sent";
 +		return e;
 +	}
 +	lbt_sleep_ms(10);
@@ -2449,7 +2700,7 @@ diff -ruN a/bsd/dev/laurel_bt_power.c b/bsd/dev/laurel_bt_power.c
 +		return e;
 +	}
 +	if ((e = pulse(LBT_POWER_ON_PULSE)) != 0) {
-+		*why = "power-on pulse not sent";
++		*why = lbt_uart_fault() ? lbt_uart_fault() : "power-on pulse not sent";
 +		return e;
 +	}
 +	lbt_sleep_ms(100);                      /* the SoC boots */
@@ -2470,11 +2721,12 @@ diff -ruN a/bsd/dev/laurel_bt_power.c b/bsd/dev/laurel_bt_power.c
 diff -ruN a/bsd/dev/laurel_bt_uart.c b/bsd/dev/laurel_bt_uart.c
 --- a/bsd/dev/laurel_bt_uart.c	1970-01-01 05:30:00.000000000 +0530
 +++ b/bsd/dev/laurel_bt_uart.c	2026-11-01 05:16:16.043477245 +0530
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,235 @@
 +/*
 + * laurel_sprout (Mi A3, SM6125) Bluetooth (laurel 2600), step 1: the GENI UART of QUP1 SE9 (0x4c90000, SPI 312).
-+ * Polled FIFO mode (no interrupt, no DMA), RTS/CTS, 8N1. Not reentrant: one caller at a time (the bring-up
-+ * thread, then laurel_bt_ios.c under its UART lock).
++ * Polled (no interrupt), RTS/CTS, 8N1. FIFO mode here; SE DMA mode (boot left the FIFO interface off) in
++ * laurel_bt_dma.c. Not reentrant: one caller at a time (the bring-up thread, then laurel_bt_ios.c under its UART
++ * lock).
 + * Facts [V external/laurel-kernel-los]: trinket-qupv3.dtsi qupv3_se9_4uart (GCC_QUPV3_WRAP1_S4_CLK, wrap 1
 + * m/s AHB); gcc-trinket.c: s4 RCG 0x39608 (DFS_ENABLE_RCG), branch vote reg 0x7900c bit 26 (s4), 18 core_2x,
 + * 19 core, 20 m_ahb, 21 s_ahb (hwcg); CBCRs 0x39604 s4, 0x39014, 0x3900c, 0x39004, 0x39008; parents XO 19.2 MHz,
@@ -2581,6 +2833,10 @@ diff -ruN a/bsd/dev/laurel_bt_uart.c b/bsd/dev/laurel_bt_uart.c
 +static void
 +rx_drain(void)
 +{
++	if (u.dma) {
++		lbt_dma_rx_poll();
++		return;
++	}
 +	uint32_t st = rd(SE(GENI_RX_FIFO_STATUS)), wc = st & 0x1ffffffu;
 +
 +	for (uint32_t i = 0; i < wc; i++) {
@@ -2629,8 +2885,14 @@ diff -ruN a/bsd/dev/laurel_bt_uart.c b/bsd/dev/laurel_bt_uart.c
 +	}
 +}
 +
-+static void
-+m_cancel(void)
++const char *
++lbt_uart_fault(void)
++{
++	return u.fault;
++}
++
++void
++lbt_m_cancel(void)
 +{
 +	wr(SE(GENI_M_CMD_CTRL), CMD_CANCEL);
 +	if (!lbt_wait_bits(SE(GENI_M_IRQ_STATUS), M_CMD_CANCEL, true, 2000)) {
@@ -2649,8 +2911,11 @@ diff -ruN a/bsd/dev/laurel_bt_uart.c b/bsd/dev/laurel_bt_uart.c
 +	if (!len) {
 +		return 0;
 +	}
++	if (u.dma) {
++		return lbt_dma_write(buf, len);
++	}
 +	if (rd(SE(GENI_STATUS)) & 1u) {
-+		m_cancel();
++		lbt_m_cancel();
 +	}
 +	wr(SE(GENI_M_IRQ_CLEAR), M_CMD_DONE);
 +	wr(SE(UART_TX_TRANS_LEN), len);
@@ -2664,7 +2929,7 @@ diff -ruN a/bsd/dev/laurel_bt_uart.c b/bsd/dev/laurel_bt_uart.c
 +			rx_drain();             /* RX keeps moving while TX waits for CTS */
 +			if (lbt_us() - t0 > limit) {
 +				LBT_SAY("uart: TX of %u bytes stalled at %u (CTS held?)\n", len, MIN(i, len));
-+				m_cancel();
++				lbt_m_cancel();
 +				return ETIMEDOUT;
 +			}
 +			delay(2);

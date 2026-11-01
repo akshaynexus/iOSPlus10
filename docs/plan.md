@@ -654,3 +654,16 @@ Done [V build]: `fifo_if_on` clears it (after DMA mode off, GSI events off, DMA_
 241/241 patches, 0 LSE, kcheck syntax OK, kernel.development.sweet.4k sha256 1b59818b... Not booted.
 Next: boot; expect `LAUREL BT: geni: FIFO interface was off (GSI from boot): FIFO_IF_DISABLE 0x1 -> 0, ..., RO 0`, then
 `uart: 115200 8N1 RTS/CTS, RX on`, `chip: ...` and `on: WCN3990 ...`. Details: docs/laurel_sprout/bluetooth.md.
+
+## Mi A3: Bluetooth SE DMA mode, no SE + 0x2000..0x2008 (2026-11-01 06:25, branch t3/laurel-bt-se-dma, patch 2600)
+
+Observed [V boot 06:07, 228d505]: `LAUREL BT: geni: QUP 0x20000000 ...`, then no BT step line for 4 min, no panic
+(`fifo_if_on` read/wrote SE + 0x2008/0x2004). [I] The access to 0x2008 stopped the CPU. [V source] Only mainline's SE
+firmware loader writes these registers (for an SE with no firmware); the 4.14 laurel kernel never does and drives the BT port
+in SE_DMA. Done [V build]: `fifo_if_on` removed; FIFO interface off -> SE DMA mode (new laurel_bt_dma.c: apps SMMU identity
+for the QUP1 stream 0x143, 4 KiB TX + 2 KiB RX in the modem pool, polled TX/RX, RX ended by the stale timeout, faults ->
+`off: <why>`). Kernel build: 242/242 patches, 0 LSE, kcheck syntax OK, kernel.development.sweet.4k sha256 3adfb8a1b055601b...
+Not booted. Next: boot; expect `TopazModem: smmu: QUP1 Bluetooth identity (sid 143 mask 0) ... -> OK`,
+`LAUREL BT: geni: FIFO interface off (boot left GSI): SE DMA mode, ...`, `uart: 115200 8N1 RTS/CTS, SE DMA, RX on`, `chip:`,
+`on: WCN3990 ...`. If `off: SE DMA TX does not finish with CTS ignored`: SE DMA is blocked with the FIFO interface off (then
+GPI DMA is the only path). Details: docs/laurel_sprout/bluetooth.md "SE9 left in GSI mode".
