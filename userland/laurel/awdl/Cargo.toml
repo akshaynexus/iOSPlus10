@@ -1,0 +1,26 @@
+# laurel-awdld: AWDL for AirDrop on the Mi A3: owly-awdl (MIT, t4t5/owly, pin in scripts/debug/awdl-sources.sh) over the kernel's vdev (patch 2932).
+# scripts/laurel/awdl-build.sh builds it. docs/laurel_sprout/airdrop-awdl.md.
+[package]
+name = "laurel-awdld"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "laurel_awdld"
+path = "src/lib.rs"
+
+[[bin]]
+name = "laurel-awdld"
+path = "src/main.rs"
+
+[dependencies]
+owly-awdl = { path = "../../../out/awdl-src/owly/crates/owly-awdl" }
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = true
+debug = 1
+
+[workspace]

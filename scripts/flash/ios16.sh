@@ -25,11 +25,13 @@ APPLE=${APPLE:-$HOME/op10-apple}
 I=$BACKUP/images
 O=${IOS16_OUT:-$OUT/ios16}       # e.g. IOS16_OUT=out/ios16-debug
 STEP=${1:-}; YES=${2:-}
-"$REPO/scripts/laurel/android-guard.sh" other-device   # this script is for the OnePlus 10 Pro; the Mi A3 holds Android
+G=$REPO/scripts/laurel/android-guard.sh
+"$G" other-device   # this script is for the OnePlus 10 Pro, and the phone must say so; the Mi A3 holds Android
 
 run() {
   echo "+ $*"
-  if [ "$YES" = --yes ]; then "$@"; else echo "  (dry run: add --yes to execute)"; fi
+  # each write asks again: the phone on the cable can have changed since the first check, or was off then
+  if [ "$YES" = --yes ]; then "$G" other-device-fastboot; "$@"; else echo "  (dry run: add --yes to execute)"; fi
 }
 need() { [ -f "$1" ] || { echo "missing $1" >&2; exit 1; }; }
 present() { [ -n "$(fastboot devices)" ] || { echo "no device in fastboot mode" >&2; exit 1; }; }

@@ -3,15 +3,17 @@ laurel 2950: Mi A3 dual boot: the iOS root in a pinned f2fs file of Android's /d
 The table comes from ADT /chosen laurel-dualboot (no boot-arg; laureldualboot=0 is only a kill switch). sweet_ufs_strategy and the console log thread go through
 ufs_disk_map, which clamps a request to one extent. ufs_write_blocks is the only place data goes out; it checks the raw LBA against the table again, without using
 the mapping. Self-check before anything can write: table rules, GPT agrees, area header, table identity, fingerprint of the Android filesystem (raw ciphertext of the
-superblock and both checkpoint heads, bound at the first boot after a seal: a change means Android ran or /data was formatted), HFS+ volume fits. Failure:
-"LAUREL DUALBOOT: off: reason", no write anywhere, restart after 30 s so that ABL falls back to Android.
+superblock and both checkpoint heads, compared at every boot; it was taken by ldbhelper seal on a frozen /data, in one period with the pin and FIEMAP check: a change
+means Android ran or /data was formatted), HFS+ volume fits. State BOUND only; the kernel never writes the header. Failure: "LAUREL DUALBOOT: off: reason", no write
+anywhere, restart after 30 s so that ABL falls back to Android.
 Without a table the partition must start with HFS+ (Android's f2fs has none): the console log used to write into the last 4 MiB of userdata whatever it held.
-sysctl kern.laurel_dualboot = 1 when on. Docs: docs/laurel_sprout/dual-boot.md. Host test: scripts/laurel/test-dualboot.sh. NOT BOOTED.
+sysctl kern.laurel_dualboot = 1 when on. The text LDB_KERNEL_MARKER says that this patch is in a kernel (uefi-image.sh, android-guard.sh). Docs: docs/laurel_sprout/dual-boot.md.
+Host test: scripts/laurel/test-dualboot.sh. NOT BOOTED.
 
 diff -ruN a/bsd/dev/laurel_dualboot.h b/bsd/dev/laurel_dualboot.h
 --- a/bsd/dev/laurel_dualboot.h	1970-01-01 05:30:00.000000000 +0530
-+++ b/bsd/dev/laurel_dualboot.h	2026-11-02 01:13:15.851003685 +0530
-@@ -0,0 +1,260 @@
++++ b/bsd/dev/laurel_dualboot.h	2026-11-02 02:02:00.147457578 +0530
+@@ -0,0 +1,267 @@
 +/*
 + * laurel 2950: Mi A3 dual boot: the iOS root lives in a pinned, preallocated f2fs file of Android's /data, and XNU reaches it
 + * by a table of raw extents on the userdata partition. A bug here corrupts Android data, so this file holds only arithmetic on the
@@ -33,9 +35,16 @@ diff -ruN a/bsd/dev/laurel_dualboot.h b/bsd/dev/laurel_dualboot.h
 +#define LDB_FP_BLOCKS       3u                  /* superblock block + both checkpoint pack heads */
 +#define LDB_TABLE_MAGIC     "LDBTABL1"
 +#define LDB_HDR_MAGIC       "LAURELDB"
-+#define LDB_VERSION         1u
-+#define LDB_STATE_FRESH     1u                  /* sealed on Android just before the switch; XNU has not seen it */
-+#define LDB_STATE_BOUND     2u                  /* XNU took the fingerprint of the Android filesystem */
++#define LDB_VERSION         1u                  /* of the table */
++#define LDB_HDR_VERSION     2u                  /* of the area header. Version 1 had a state FRESH, which passed against any filesystem. */
++/*
++ * One state lets the kernel write: BOUND. The fingerprint in it was taken by ldbhelper seal with /data frozen, right after the pin and FIEMAP check, in the
++ * same frozen period (docs/laurel_sprout/dual-boot.md, section "The fingerprint"). No other number passes. The kernel never writes this header.
++ */
++#define LDB_STATE_BOUND     2u
++#define LDB_STATE_OFF       3u                  /* written by ldbhelper when a seal fails after its header went out */
++/* Patch 2950 is in this kernel. uefi-image.sh and android-guard.sh search a kernel and a boot image for this exact text: a kernel without 2950 ignores the table and writes its log into /data. */
++#define LDB_KERNEL_MARKER   "LAUREL-2950-DUALBOOT-FENCE-V2-SEAL-AT-FREEZE"
 +
 +/* The blob of ADT /chosen laurel-dualboot, little endian: this header + count x struct ldb_extent. */
 +struct ldb_table {
@@ -52,13 +61,13 @@ diff -ruN a/bsd/dev/laurel_dualboot.h b/bsd/dev/laurel_dualboot.h
 +	uint64_t area_block, part_block, blocks;
 +};
 +
-+/* Area block 0: written raw by the Android helper (seal) and once by XNU (bind). Little endian. */
++/* Area block 0: written raw by the Android helper (seal, wipe). XNU only reads it. Little endian. */
 +struct ldb_header {
 +	char magic[8];
 +	uint32_t version, state;
 +	uint64_t table_id, table_hash, area_blocks, seal_generation;
 +	uint64_t fp_part_block[LDB_FP_BLOCKS];  /* where the Android filesystem must not have changed; outside the table */
-+	uint64_t fp_hash[LDB_FP_BLOCKS];        /* raw bytes (ciphertext); only valid in state BOUND */
++	uint64_t fp_hash[LDB_FP_BLOCKS];        /* raw bytes (ciphertext), read on a frozen /data */
 +	uint64_t hash;                          /* ldb_hash of this struct, this field zero */
 +};
 +
@@ -211,7 +220,7 @@ diff -ruN a/bsd/dev/laurel_dualboot.h b/bsd/dev/laurel_dualboot.h
 +	return pb < (uint64_t)-1 - t->part_first && ldb_lba_allowed(t, t->part_first + pb, 1);
 +}
 +
-+/* Reasons a header does not fit this table. state FRESH or BOUND only. */
++/* Reasons a header does not fit this table. State BOUND only. */
 +static inline const char *
 +ldb_header_check(const struct ldb_header *h, const struct ldb_table *t)
 +{
@@ -220,13 +229,13 @@ diff -ruN a/bsd/dev/laurel_dualboot.h b/bsd/dev/laurel_dualboot.h
 +			return "no header in the mapped area (not installed, or the blocks now hold something else)";
 +		}
 +	}
-+	if (h->version != LDB_VERSION || ldb_header_hash(h) != h->hash) {
++	if (h->version != LDB_HDR_VERSION || ldb_header_hash(h) != h->hash) {
 +		return "area header damaged";
 +	}
 +	if (h->table_id != t->table_id || h->table_hash != t->hash || h->area_blocks != t->area_blocks) {
 +		return "area header is for another table (rebuild the boot image)";
 +	}
-+	if (h->state != LDB_STATE_FRESH && h->state != LDB_STATE_BOUND) {
++	if (h->state != LDB_STATE_BOUND) {
 +		return "area is not sealed";
 +	}
 +	for (unsigned i = 0; i < LDB_FP_BLOCKS; i++) {
@@ -273,8 +282,8 @@ diff -ruN a/bsd/dev/laurel_dualboot.h b/bsd/dev/laurel_dualboot.h
 +
 +#endif /* LAUREL_DUALBOOT_H */
 diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
---- a/bsd/dev/sweet_ufs.c	2026-11-02 00:43:15.481214158 +0530
-+++ b/bsd/dev/sweet_ufs.c	2026-11-02 00:43:15.504015629 +0530
+--- a/bsd/dev/sweet_ufs.c	2026-11-02 01:49:37.404590118 +0530
++++ b/bsd/dev/sweet_ufs.c	2026-11-02 01:49:37.498612116 +0530
 @@ -17,6 +17,11 @@
   * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
   * against the partition bounds again right before it is issued, so nothing
@@ -306,14 +315,14 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 + * on: the self-check passed and the BSD disk is the area. present && !on: no write goes out (ufs_write_blocks).
 + */
 +static struct {
-+	bool present, on, bind_pending;
++	bool present, on;
 +	const struct ldb_table *t;
 +	struct ldb_header hdr;
-+	uint64_t hdr_lba;
-+	uint64_t fp_now[LDB_FP_BLOCKS];
 +	const char *why;
 +} ldb;
 +static int laurel_dualboot_on;
++/* uefi-image.sh and android-guard.sh refuse a kernel and a boot image without this text */
++__attribute__((used)) static const char laurel_dualboot_marker[] = LDB_KERNEL_MARKER;
 +SYSCTL_INT(_kern, OID_AUTO, laurel_dualboot, CTLFLAG_RD | CTLFLAG_LOCKED, &laurel_dualboot_on, 0,
 +    "laurel 2950: 1 = the root is the mapped area of Android's /data and writes are fenced to it");
 +
@@ -390,7 +399,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  			}
  		}
  		if (error) {
-@@ -832,6 +881,108 @@
+@@ -832,6 +881,92 @@
  	return on ? 0 : ENXIO;
  }
  
@@ -402,7 +411,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +ldb_self_check(const char *want)
 +{
 +	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
-+	uint64_t lba = 0;
++	uint64_t lba = 0, hdr_lba = 0;
 +	uint32_t run = 0, on = 1;
 +
 +	PE_parse_boot_argn("laureldualboot", &on, sizeof(on));
@@ -418,7 +427,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	if (ldb.t->part_first != su.first_block || ldb.t->part_blocks != su.nblocks) {
 +		return "the table's userdata is not the GPT's userdata";
 +	}
-+	if (ldb_map(ldb.t, 0, 1, &ldb.hdr_lba, &run) != 0 || ufs_read_blocks(ldb.hdr_lba, 1) != 0) {
++	if (ldb_map(ldb.t, 0, 1, &hdr_lba, &run) != 0 || ufs_read_blocks(hdr_lba, 1) != 0) {
 +		return "cannot read the area header";
 +	}
 +	memcpy(&ldb.hdr, b, sizeof(ldb.hdr));
@@ -430,8 +439,8 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +		if (ufs_read_blocks(su.first_block + ldb.hdr.fp_part_block[i], 1) != 0) {
 +			return "cannot read the Android filesystem fingerprint";
 +		}
-+		ldb.fp_now[i] = ldb_hash_add(LDB_HASH_INIT, b, UFS_BLOCK);
-+		if (ldb.hdr.state == LDB_STATE_BOUND && ldb.fp_now[i] != ldb.hdr.fp_hash[i]) {
++		/* every boot, every state that got here: ldb_header_check lets only BOUND through, and its fingerprint comes from the seal, on a frozen /data */
++		if (ldb_hash_add(LDB_HASH_INIT, b, UFS_BLOCK) != ldb.hdr.fp_hash[i]) {
 +			return "Android ran or /data was formatted since the last seal (the file may have moved): run dual-boot.sh switch on Android";
 +		}
 +	}
@@ -447,24 +456,8 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	    hfs > (ldb.t->area_blocks - LDB_RESERVED_BLOCKS - ((4u << 20) / UFS_BLOCK + 1)) * UFS_BLOCK) {
 +		return "the HFS+ volume is longer than the area";
 +	}
-+	ldb.bind_pending = ldb.hdr.state == LDB_STATE_FRESH;
 +	ldb.on = true;
 +	return NULL;
-+}
-+
-+/* laurel 2950: the first boot after a seal records the fingerprint. Goes through the fence like every write. */
-+static int
-+ldb_bind(void)
-+{
-+	for (unsigned i = 0; i < LDB_FP_BLOCKS; i++) {
-+		ldb.hdr.fp_hash[i] = ldb.fp_now[i];
-+	}
-+	ldb.hdr.state = LDB_STATE_BOUND;
-+	ldb.hdr.hash = ldb_header_hash(&ldb.hdr);
-+	bzero((void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
-+	memcpy((void *)(su.dma + DMA_BOUNCE), &ldb.hdr, sizeof(ldb.hdr));
-+	int error = ufs_write_blocks(ldb.hdr_lba, 1);
-+	return error ? error : ufs_sync_cache();
 +}
 +
 +/* laurel 2950: the ADT table, copied (ADT properties are only 4-byte aligned). No table: ldb.t stays NULL. */
@@ -499,7 +492,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  int
  sweet_ufs_init(void)
  {
-@@ -869,6 +1020,7 @@
+@@ -869,6 +1004,7 @@
  	su.dma_pa = ptoa_64(pn);
  	su.lun = 0;
  	su.secsize = DEV_BSIZE;
@@ -507,7 +500,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  
  	error = laurel_ufs_clock_check((uint64_t)reg[0]);        /* laurel 2009 */
  	if (error) {
-@@ -885,10 +1037,33 @@
+@@ -885,10 +1021,33 @@
  	if (!error) {
  		error = ufs_find_partition(want);
  	}
@@ -541,33 +534,20 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  
  	su.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
  	if (su.bmajor < 0) {
-@@ -903,6 +1078,25 @@
+@@ -903,6 +1062,12 @@
  	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
  	/* Only now, with the partition bounds known, can writes be allowed. */
  	su.writable = (rw != 0);
 +	if (ldb.on) {
-+		int e = 0;
-+		if (ldb.bind_pending && su.writable) {
-+			lck_mtx_lock(&sweet_ufs_lock);
-+			e = ldb_bind();
-+			lck_mtx_unlock(&sweet_ufs_lock);
-+		}
-+		if (e != 0) {
-+			ldb.on = false;
-+			su.writable = false;
-+			printf("LAUREL DUALBOOT: off: cannot record the fingerprint (error %d); no write anywhere\n", e);
-+			ldb.why = "the fingerprint write failed";
-+			return e;
-+		}
 +		laurel_dualboot_on = 1;
-+		printf("LAUREL DUALBOOT: on: root = %llu MiB in %u extents of userdata, table %llx, seal %llu%s, %s\n",
++		printf("LAUREL DUALBOOT: on: root = %llu MiB in %u extents of userdata, table %llx, seal %llu, %s (%s)\n",
 +		    su.nblocks * UFS_BLOCK >> 20, ldb.t->count, ldb.t->table_id, ldb.hdr.seal_generation,
-+		    ldb.bind_pending ? " (first boot after the seal)" : "", su.writable ? "writes fenced to the table" : "read-only");
++		    su.writable ? "writes fenced to the table" : "read-only", laurel_dualboot_marker);
 +	}
  	su.ready = true;
  	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
-@@ -1003,7 +1197,7 @@
+@@ -1003,7 +1168,7 @@
  static void
  sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
  {
@@ -576,7 +556,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	uint64_t flushed = 0, seq = 0;
  	void *bounce = (void *)(su.dma + DMA_BOUNCE);
  
-@@ -1026,8 +1220,14 @@
+@@ -1026,8 +1191,14 @@
  			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
  			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
  			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
@@ -592,7 +572,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
  		}
  		if (!error) {
-@@ -1035,9 +1235,14 @@
+@@ -1035,9 +1206,14 @@
  				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
  				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
  			};
@@ -610,7 +590,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  		}
  		if (!error) {
  			error = ufs_sync_cache();
-@@ -1089,6 +1294,18 @@
+@@ -1089,6 +1265,18 @@
  	if (!su.ready) {
  		int error = sweet_ufs_init();
  		if (error) {

@@ -1,6 +1,7 @@
 # Mi A3: AirPlay and AirDrop (2026-11-01, branch t3/laurel-airplay-airdrop)
 
 Owner: "AirPlay and AirDrop both aren't working: enable or fix them." iOS 16.7.16 20H392, WCN3990, firmware `WLAN.HL.3.0.2.c1-00050-QCAHLSWMTPLZ-1`.
+**Superseded in part (2026-11-01, later the same day): `airdrop-awdl.md`. AWDL is implemented through an IBSS vdev; AirPlay has a legacy session. Sections 1, 3, 4 and 6 below hold the state before that; the values in the example lines of section 6 were never measured.**
 Status: [V] builds, host tests and dry run pass. [U] not run on the phone. Labels: [V] read in source, a binary or a log; [I] inference; [U] unknown.
 Tools: `scripts/debug/air-re.sh` reads the Apple files into `out/air-re/` (git-ignored). Log: `logs/laurel-boot-2235.txt` (main checkout).
 

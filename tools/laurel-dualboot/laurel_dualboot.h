@@ -19,9 +19,16 @@
 #define LDB_FP_BLOCKS       3u                  /* superblock block + both checkpoint pack heads */
 #define LDB_TABLE_MAGIC     "LDBTABL1"
 #define LDB_HDR_MAGIC       "LAURELDB"
-#define LDB_VERSION         1u
-#define LDB_STATE_FRESH     1u                  /* sealed on Android just before the switch; XNU has not seen it */
-#define LDB_STATE_BOUND     2u                  /* XNU took the fingerprint of the Android filesystem */
+#define LDB_VERSION         1u                  /* of the table */
+#define LDB_HDR_VERSION     2u                  /* of the area header. Version 1 had a state FRESH, which passed against any filesystem. */
+/*
+ * One state lets the kernel write: BOUND. The fingerprint in it was taken by ldbhelper seal with /data frozen, right after the pin and FIEMAP check, in the
+ * same frozen period (docs/laurel_sprout/dual-boot.md, section "The fingerprint"). No other number passes. The kernel never writes this header.
+ */
+#define LDB_STATE_BOUND     2u
+#define LDB_STATE_OFF       3u                  /* written by ldbhelper when a seal fails after its header went out */
+/* Patch 2950 is in this kernel. uefi-image.sh and android-guard.sh search a kernel and a boot image for this exact text: a kernel without 2950 ignores the table and writes its log into /data. */
+#define LDB_KERNEL_MARKER   "LAUREL-2950-DUALBOOT-FENCE-V2-SEAL-AT-FREEZE"
 
 /* The blob of ADT /chosen laurel-dualboot, little endian: this header + count x struct ldb_extent. */
 struct ldb_table {
@@ -38,13 +45,13 @@ struct ldb_extent {
 	uint64_t area_block, part_block, blocks;
 };
 
-/* Area block 0: written raw by the Android helper (seal) and once by XNU (bind). Little endian. */
+/* Area block 0: written raw by the Android helper (seal, wipe). XNU only reads it. Little endian. */
 struct ldb_header {
 	char magic[8];
 	uint32_t version, state;
 	uint64_t table_id, table_hash, area_blocks, seal_generation;
 	uint64_t fp_part_block[LDB_FP_BLOCKS];  /* where the Android filesystem must not have changed; outside the table */
-	uint64_t fp_hash[LDB_FP_BLOCKS];        /* raw bytes (ciphertext); only valid in state BOUND */
+	uint64_t fp_hash[LDB_FP_BLOCKS];        /* raw bytes (ciphertext), read on a frozen /data */
 	uint64_t hash;                          /* ldb_hash of this struct, this field zero */
 };
 
@@ -197,7 +204,7 @@ ldb_part_block_mapped(const struct ldb_table *t, uint64_t pb)
 	return pb < (uint64_t)-1 - t->part_first && ldb_lba_allowed(t, t->part_first + pb, 1);
 }
 
-/* Reasons a header does not fit this table. state FRESH or BOUND only. */
+/* Reasons a header does not fit this table. State BOUND only. */
 static inline const char *
 ldb_header_check(const struct ldb_header *h, const struct ldb_table *t)
 {
@@ -206,13 +213,13 @@ ldb_header_check(const struct ldb_header *h, const struct ldb_table *t)
 			return "no header in the mapped area (not installed, or the blocks now hold something else)";
 		}
 	}
-	if (h->version != LDB_VERSION || ldb_header_hash(h) != h->hash) {
+	if (h->version != LDB_HDR_VERSION || ldb_header_hash(h) != h->hash) {
 		return "area header damaged";
 	}
 	if (h->table_id != t->table_id || h->table_hash != t->hash || h->area_blocks != t->area_blocks) {
 		return "area header is for another table (rebuild the boot image)";
 	}
-	if (h->state != LDB_STATE_FRESH && h->state != LDB_STATE_BOUND) {
+	if (h->state != LDB_STATE_BOUND) {
 		return "area is not sealed";
 	}
 	for (unsigned i = 0; i < LDB_FP_BLOCKS; i++) {

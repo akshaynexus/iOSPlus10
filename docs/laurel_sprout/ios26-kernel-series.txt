@@ -316,10 +316,11 @@
 2920-laurel-mic-wcd937x.patch                                  applied
 2930-laurel-wifi-awdl-header.patch                             applied
 2931-laurel-awdl-self-check.patch                              applied
+2932-laurel-awdl-radio.patch                                   applied+rules(1): glue
 2940-laurel-cell-radio-online.patch                            applied
 2941-laurel-ipa-data-path.patch                                applied+rules(1): glue
 2942-laurel-cell-data.patch                                    applied+rules(1): glue
 2943-laurel-cell-reject-cause.patch                            applied
 2950-laurel-dual-boot.patch                                    applied
 9000-series-12377-api.patch                                    post
-== series: 211 applied, 83 applied+rules, 0 replaced, 7 skipped, 11 base, 0 errors
+== series: 211 applied, 84 applied+rules, 0 replaced, 7 skipped, 11 base, 0 errors

@@ -2,7 +2,7 @@
 
 Goal: AirDrop between this phone and real Apple devices (send and receive).
 
-**Mi A3 (2026-11-01):** the WCN3990 path, the evidence and the state are in [docs/laurel_sprout/airplay-airdrop.md](laurel_sprout/airplay-airdrop.md). This file is the WCN6855 (negroni) plan.
+**Mi A3 (2026-11-01):** the WCN3990 path, the evidence and the state are in [docs/laurel_sprout/airdrop-awdl.md](laurel_sprout/airdrop-awdl.md) (IBSS vdev + owly-awdl; [U] not run). This file is the WCN6855 (negroni) plan; the IBSS path there may fit WCN6855 too [I].
 Marks: **[V]** seen (source given), **[I]** inference, **[U]** unknown (a test must answer it).
 
 Status (2026-10-27): patch 0347 grew from the AWDL probe into the **in-kernel AWDL engine** (path A): a kernel port of
