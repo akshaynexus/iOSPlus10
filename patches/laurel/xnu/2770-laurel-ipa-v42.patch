@@ -505,3 +505,585 @@ diff -ruN a/bsd/dev/laurel_ext4.h b/bsd/dev/laurel_ext4.h
 +#endif
 +
 +#endif
+diff -ruN a/bsd/dev/laurel_ipa_hw.c b/bsd/dev/laurel_ipa_hw.c
+--- a/bsd/dev/laurel_ipa_hw.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_hw.c	2026-11-01 08:07:01.460260953 +0530
+@@ -0,0 +1,211 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP side (laurel 2770): clock, SMMU, registers, local memory, SMEM.
++ * What the stock 4.14 driver does at probe + ipa3_post_init() before the modem's IPA driver talks to it
++ * (ipa_v3/ipa.c, ipa_utils.c: ipa3_init_hw, ipa3_enable_dcd, ipa3_set_resorce_groups_min_max_limits,
++ * _ipa_init_sram_v3, the empty filter/route tables of _ipa_init_flt4/rt4_v3, ipa3_cfg_route), without an AP
++ * data path: no GSI channels of our own. The tables that the stock driver copies with IPA immediate commands
++ * (a GSI channel) are written here through the SRAM direct-access window (the same bytes; hackios-scion did
++ * the same on SM7325). The modem programs its own part (filter/route entries, headers) after INIT_MODEM_DRIVER.
++ * Register access only after the RPM acked the IPA clock vote (an unclocked IPA hangs the bus).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "laurel_ipa_regs.h"
++
++extern bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++extern bool topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
++extern void *topaz_pool_alloc(uint64_t size, uint64_t *pa);
++extern void *topaz_smem_partition(uint16_t a, uint16_t b);
++extern void *topaz_smem_get(void *part, uint16_t item, uint32_t *size);
++extern void *topaz_smem_alloc(void *part, uint16_t item, uint32_t size);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define LOG(...)                printf("LaurelIPA: " __VA_ARGS__)
++
++static inline uint32_t rd(struct lipa_mem *m, uint32_t o) { return *(volatile uint32_t *)(m->regs + o); }
++static inline void wr(struct lipa_mem *m, uint32_t o, uint32_t v) { *(volatile uint32_t *)(m->regs + o) = v; }
++
++/* RPM_SMD_IPA_CLK (both sets, as the stock "core_clk" = ipa_clk, not ipa_a_clk) */
++bool
++lipa_clock_on(char *why, size_t wl)
++{
++	bool ok = true;
++
++	for (uint32_t set = 0; set <= 1; set++) {
++		ok &= topaz_rpm_write(set, LIPA_RPM_TYPE, 0, LIPA_RPM_KEY_RATE, LIPA_CLK_KHZ);
++	}
++	LOG("RPM ipa clock %u kHz (active + sleep set): %s\n", LIPA_CLK_KHZ, ok ? "acked" : "refused");
++	if (!ok) {
++		snprintf(why, wl, "RPM refused the IPA clock vote (ipa id 0, %u kHz)", LIPA_CLK_KHZ);
++	}
++	return ok;
++}
++
++/* apps SMMU: the IPA's AP and uC streams in bypass (identity), so table addresses are physical */
++bool
++lipa_smmu(char *why, size_t wl)
++{
++	if (!topaz_smmu_identity(LIPA_SMMU_SID_AP, 0, "IPA")) {
++		snprintf(why, wl, "apps SMMU: no identity stream for IPA SID 0x%x", LIPA_SMMU_SID_AP);
++		return false;
++	}
++	if (!topaz_smmu_identity(LIPA_SMMU_SID_UC, 0, "IPA uC")) {
++		LOG("SMMU: no stream for the IPA uC (SID 0x%x); the uC is the modem's, going on\n", LIPA_SMMU_SID_UC);
++	}
++	return true;
++}
++
++/* map the registers + SRAM window, read the version and the shared memory layout */
++bool
++lipa_regs_map(struct lipa_mem *m, char *why, size_t wl)
++{
++	if (m->regs == NULL) {
++		m->regs = (volatile uint8_t *)ml_io_map(LIPA_REG_PA, LIPA_REG_SIZE);
++	}
++	if (m->regs == NULL) {
++		snprintf(why, wl, "cannot map the IPA registers %x+%x", LIPA_REG_PA, LIPA_REG_SIZE);
++		return false;
++	}
++	uint32_t ver = rd(m, R_VERSION), sms = rd(m, R_SHARED_MEM_SIZE);
++	m->restricted = 8 * (sms >> 16);
++	m->size = 8 * (sms & 0xFFFF);
++	LOG("IPA_VERSION %08x, SHARED_MEM_SIZE %08x: %u bytes at offset 0x%x, IPA_STATE %08x\n", ver, sms, m->size,
++	    m->restricted, rd(m, R_STATE));
++	if (ver == 0 || ver == ~0u) {
++		snprintf(why, wl, "IPA_VERSION reads %08x (clock or power off?)", ver);
++		return false;
++	}
++	if (m->size < M_END || R_SRAM_DIRECT + m->restricted + M_END > LIPA_REG_SIZE) {
++		snprintf(why, wl, "IPA local memory %u bytes at 0x%x: smaller than the v4.2 layout (0x2000)", m->size,
++		    m->restricted);
++		return false;
++	}
++	return true;
++}
++
++static inline void
++sram(struct lipa_mem *m, uint32_t o, uint32_t v)
++{
++	wr(m, R_SRAM_DIRECT + m->restricted + o, v);
++}
++
++static void
++sram64(struct lipa_mem *m, uint32_t o, uint64_t v)
++{
++	sram(m, o, (uint32_t)v);
++	sram(m, o + 4, (uint32_t)(v >> 32));
++}
++
++/* _ipa_init_sram_v3 for v4.2: ipa3_sram_set_canary(x) writes 0xdeadbeef at x - 4 */
++static void
++sram_init(struct lipa_mem *m)
++{
++	static const uint16_t two[] = {         /* set_canary(ofst - 4) and set_canary(ofst) */
++		0x288, M_V4_FLT, 0x310, M_V6_FLT, 0x398, M_V4_RT, 0x420, M_V6_RT, M_MODEM_HDR, M_MODEM_PROC_CTX,
++		M_PDN_CONFIG, M_QUOTA_Q6,
++	};
++	for (uint32_t o = M_OFST_START; o < M_END; o += 4) {
++		sram(m, o, 0);                  /* below 0x280: the uC's shared area and info, left alone */
++	}
++	for (unsigned i = 0; i < sizeof(two) / sizeof(two[0]); i++) {
++		sram(m, two[i] - 8u, M_CANARY);
++		sram(m, two[i] - 4u, M_CANARY);
++	}
++	sram(m, M_UC_DESC_RAM - 4u, M_CANARY);
++	/* empty tables: filter = bitmap << 1, then one entry per filtering pipe; route = one entry per index; every
++	 * entry = the system address of an empty (zero) rule table (ipahal_flt/rt_generate_empty_img) */
++	uint32_t npipes = (uint32_t)__builtin_popcount(M_FLT_PIPES);
++	for (uint32_t t = 0; t < 2; t++) {
++		uint32_t f = t == 0 ? M_V4_FLT : M_V6_FLT, r = t == 0 ? M_V4_RT : M_V6_RT;
++		sram64(m, f, (uint64_t)M_FLT_PIPES << 1);
++		for (uint32_t i = 1; i <= npipes; i++) {
++			sram64(m, f + 8 * i, m->zero_pa);
++		}
++		for (uint32_t i = 0; i < M_RT_INDICES; i++) {
++			sram64(m, r + 8 * i, m->zero_pa);
++		}
++	}
++}
++
++bool
++lipa_hw_init(struct lipa_mem *m, char *why, size_t wl)
++{
++	if (m->zero_pa == 0 && topaz_pool_alloc(0x1000, &m->zero_pa) == NULL) {
++		snprintf(why, wl, "no pool memory for the empty rule table");
++		return false;
++	}
++	wr(m, R_BCR, V_BCR);
++	wr(m, R_CLKON_CFG, V_CLKON_OPEN);
++	wr(m, R_TX_CFG, rd(m, R_TX_CFG) & ~V_TX_PA_MASK_EN);
++	wr(m, R_QSB_MAX_WRITES, V_QSB_WRITES);
++	wr(m, R_QSB_MAX_READS, V_QSB_READS);
++	wr(m, R_COUNTER_CFG, V_COUNTER_GRAN);
++	wr(m, R_COMP_CFG, rd(m, R_COMP_CFG) | V_COMP_BITS);
++	wr(m, R_FILT_ROUT_HASH_EN, V_HASH_EN);
++	wr(m, R_IDLE_INDICATION_CFG, V_IDLE_INDICATION);
++	/* resource groups (group 0 = UL_DL only): src pkt contexts 3..63, descriptor lists 3, descriptor buffers
++	 * 10, HPS DMARs 1, ack entries 5; dst data sectors 3, DPS DMARs 1..63 */
++	static const uint32_t src[] = { 0x3F03, 0x0303, 0x0A0A, 0x0101, 0x0505 }, dst[] = { 0x0303, 0x3F01 };
++	for (uint32_t n = 0; n < 5; n++) {
++		wr(m, R_SRC_RSRC_GRP_01(n), src[n]);
++	}
++	for (uint32_t n = 0; n < 2; n++) {
++		wr(m, R_DST_RSRC_GRP_01(n), dst[n]);
++	}
++	sram_init(m);
++	wr(m, R_LOCAL_PKT_PROC_CNTXT, m->restricted + M_MODEM_PROC_CTX);
++	wr(m, R_ROUTE, V_ROUTE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	/* self-check: the values read back (a write to an IPA that is not clocked is lost) */
++	uint32_t comp = rd(m, R_COMP_CFG), grp = rd(m, R_SRC_RSRC_GRP_01(0)), can = rd(m, R_SRAM_DIRECT + m->restricted + M_UC_DESC_RAM - 4u);
++	LOG("registers set: COMP_CFG %08x, SRC_RSRC_GRP_01_0 %08x, ROUTE %08x, canary %08x, empty table %llx\n", comp,
++	    grp, rd(m, R_ROUTE), can, (unsigned long long)m->zero_pa);
++	if ((comp & V_COMP_BITS) != V_COMP_BITS || (grp & 0x3F3F) != 0x3F03 || can != M_CANARY) {
++		snprintf(why, wl, "IPA registers do not read back (COMP_CFG %08x, SRAM canary %08x)", comp, can);
++		return false;
++	}
++	return true;
++}
++
++/* GSI_STATUS bit 0: TrustZone enabled the GSI with the firmware it loaded */
++bool
++lipa_gsi_enabled(uint32_t *status)
++{
++	static volatile uint32_t *g;
++
++	if (g == NULL) {
++		g = (volatile uint32_t *)ml_io_map(LIPA_GSI_STATUS_PA & ~0xFFFu, 0x1000);
++	}
++	if (g == NULL) {
++		*status = 0;
++		return false;
++	}
++	*status = g[(LIPA_GSI_STATUS_PA & 0xFFFu) / 4];
++	return (*status & 1) != 0;
++}
++
++/* SMEM_IPA_FILTER_TABLE in the apps<->modem partition (the modem puts its filter tables there) */
++bool
++lipa_smem_item(char *why, size_t wl)
++{
++	void *part = topaz_smem_partition(0, 1);
++	uint32_t sz = 0;
++
++	if (part == NULL) {
++		snprintf(why, wl, "no SMEM apps<->modem partition for item %u", LIPA_SMEM_ITEM);
++		return false;
++	}
++	if (topaz_smem_get(part, LIPA_SMEM_ITEM, &sz) != NULL) {
++		LOG("SMEM item %u already there (%u bytes)\n", LIPA_SMEM_ITEM, sz);
++		return true;
++	}
++	if (topaz_smem_alloc(part, LIPA_SMEM_ITEM, LIPA_SMEM_SIZE) == NULL) {
++		snprintf(why, wl, "cannot allocate SMEM item %u (%u bytes)", LIPA_SMEM_ITEM, LIPA_SMEM_SIZE);
++		return false;
++	}
++	LOG("SMEM item %u allocated, %u bytes (modem filter tables)\n", LIPA_SMEM_ITEM, LIPA_SMEM_SIZE);
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ipa_qmi.c b/bsd/dev/laurel_ipa_qmi.c
+--- a/bsd/dev/laurel_ipa_qmi.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_qmi.c	2026-11-01 08:04:58.761949885 +0530
+@@ -0,0 +1,231 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP side (laurel 2770): the QMI service 0x31 messages, as the stock
++ * 4.14 driver (ipa_v3/ipa_qmi_service.c + _v01.c) sends and answers them. Pure functions (no state outside
++ * the caller's struct, no kernel calls): scripts/laurel/test-ipa.sh tests them on the host.
++ *  - client of the modem's service (Q6, instance 2): INIT_MODEM_DRIVER 0x21 with the v4.2 memory layout;
++ *  - our service (A5, instance 1) for the modem's client: INDICATION_REGISTER 0x20, INSTALL_FILTER_RULE 0x23
++ *    (answer echoes the rule ids), FILTER_INSTALLED_NOTIF 0x24, CONFIG 0x27, INIT_MODEM_DRIVER_CMPLT 0x35;
++ *  - indication MASTER_DRIVER_INIT_COMPLETE 0x22 when both INIT_MODEM_DRIVER and INDICATION_REGISTER are done.
++ * QMI over QRTR: 7-byte header (type, txn, message id, length), then TLVs (type u8, length u16, value).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "laurel_ipa_regs.h"
++
++#define QMI_REQ                 0
++#define QMI_RESP                2
++#define QMI_IND                 4
++
++#define MSG_IND_REGISTER        0x0020
++#define MSG_INIT_MODEM          0x0021
++#define MSG_MASTER_INIT_IND     0x0022
++#define MSG_INSTALL_FILTER      0x0023
++#define MSG_FILTER_NOTIF        0x0024
++#define MSG_CONFIG              0x0027
++#define MSG_INIT_CMPLT          0x0035
++
++#define MAX_Q6_RULES            35u             /* MAX_NUM_Q6_RULE */
++#define QMI_ERR_MALFORMED       0x0001
++
++struct mb { uint8_t *b; uint32_t n, cap; bool bad; };
++
++static void
++put(struct mb *m, const void *v, uint32_t len)
++{
++	if (m->bad || m->n + len > m->cap) {
++		m->bad = true;
++		return;
++	}
++	memcpy(m->b + m->n, v, len);
++	m->n += len;
++}
++
++static void
++hdr(struct mb *m, uint8_t type, uint16_t txn, uint16_t msg)
++{
++	uint8_t h[7] = { type, (uint8_t)txn, (uint8_t)(txn >> 8), (uint8_t)msg, (uint8_t)(msg >> 8), 0, 0 };
++	put(m, h, sizeof(h));
++}
++
++static void
++tlv(struct mb *m, uint8_t type, const void *v, uint16_t len)
++{
++	uint8_t t[3] = { type, (uint8_t)len, (uint8_t)(len >> 8) };
++	put(m, t, sizeof(t));
++	put(m, v, len);
++}
++
++static void
++tlv32(struct mb *m, uint8_t type, uint32_t a)
++{
++	tlv(m, type, &a, 4);                    /* arm64 and the host test: little endian, as QMI */
++}
++
++static void
++tlv32x2(struct mb *m, uint8_t type, uint32_t a, uint32_t b)
++{
++	uint32_t v[2] = { a, b };
++	tlv(m, type, v, 8);
++}
++
++static void
++result(struct mb *m, uint16_t res, uint16_t err)
++{
++	uint16_t v[2] = { res, err };
++	tlv(m, 0x02, v, 4);
++}
++
++/* the message length into the header: m->n, or 0 when it did not fit */
++static uint32_t
++done(struct mb *m)
++{
++	if (m->bad || m->n < 7) {
++		return 0;
++	}
++	uint16_t l = (uint16_t)(m->n - 7);
++	memcpy(m->b + 5, &l, 2);
++	return m->n;
++}
++
++/* TLV lookup after the 7-byte header */
++static const uint8_t *
++find(const uint8_t *d, uint32_t len, uint8_t type, uint16_t *tlen)
++{
++	for (uint32_t o = 7; o + 3 <= len;) {
++		uint16_t l = (uint16_t)(d[o + 1] | d[o + 2] << 8);
++		if (o + 3u + l > len) {
++			return NULL;
++		}
++		if (d[o] == type) {
++			*tlen = l;
++			return d + o + 3;
++		}
++		o += 3u + l;
++	}
++	return NULL;
++}
++
++/* ipa3_qmi_init_modem_send_sync_msg() for IPA_HW_v4_2: no hashed tables, no zip, first boot (no is_ssr_bootup) */
++uint32_t
++lipa_qmi_init_modem_req(uint8_t *out, uint32_t cap, uint16_t txn, uint32_t r)
++{
++	struct mb m = { out, 0, cap, false };
++
++	hdr(&m, QMI_REQ, txn, MSG_INIT_MODEM);
++	tlv32(&m, 0x10, LIPA_PLATFORM_ANDROID);
++	tlv32x2(&m, 0x11, M_MODEM_HDR + r, M_MODEM_HDR + r + M_MODEM_HDR_SIZE - 1);
++	tlv32x2(&m, 0x12, M_V4_RT + r, M_RT_MODEM_HI);
++	tlv32x2(&m, 0x13, M_V6_RT + r, M_RT_MODEM_HI);
++	tlv32(&m, 0x14, M_V4_FLT + r);
++	tlv32(&m, 0x15, M_V6_FLT + r);
++	tlv32x2(&m, 0x16, M_MODEM + r, M_MODEM_SIZE);
++	tlv32(&m, 0x17, M_CTRL_ENDPOINT);
++	tlv32x2(&m, 0x19, M_MODEM_PROC_CTX + r, M_MODEM_PROC_CTX + M_MODEM_PROC_CTX_SIZE + r - 1);
++	tlv32(&m, 0x1F, M_QUOTA_Q6 + r);
++	tlv32(&m, 0x20, M_QUOTA_Q6_SIZE);
++	tlv32(&m, 0x21, M_DROP_STATS + r);
++	tlv32(&m, 0x22, 0);                     /* stats_drop_size 0 on v4.2 */
++	return done(&m);
++}
++
++/* the modem's answer to INIT_MODEM_DRIVER: 0 success, 1 QMI error (err), -1 not this answer / malformed */
++int
++lipa_qmi_init_modem_resp(const uint8_t *d, uint32_t len, uint16_t *err)
++{
++	uint16_t l = 0;
++	const uint8_t *r;
++
++	if (len < 7 || d[0] != QMI_RESP || (d[3] | d[4] << 8) != MSG_INIT_MODEM) {
++		return -1;
++	}
++	r = find(d, len, 0x02, &l);
++	if (r == NULL || l < 4) {
++		return -1;
++	}
++	*err = (uint16_t)(r[2] | r[3] << 8);
++	return (r[0] | r[1] << 8) == 0 ? 0 : 1;
++}
++
++/* INSTALL_FILTER_RULE: echo the rule ids of filter_spec_ex_list (TLV 0x15: u8 count, then the elements; the
++ * rule_id is the u32 before the last byte (is_rule_hashable) of each element) in TLV 0x11 */
++static void
++filter_answer(struct lipa_srv *s, const uint8_t *d, uint32_t len, struct mb *m)
++{
++	uint16_t l = 0;
++	const uint8_t *v = find(d, len, 0x15, &l);
++	uint8_t ids[1 + 4 * MAX_Q6_RULES];
++	uint32_t n = 0, es = 0;
++
++	if (v != NULL && l >= 1 && v[0] != 0 && (uint32_t)(l - 1) % v[0] == 0 && (es = (uint32_t)(l - 1) / v[0]) >= 5) {
++		n = MIN((uint32_t)v[0], MAX_Q6_RULES);
++		for (uint32_t i = 0; i < n; i++) {
++			memcpy(ids + 1 + 4 * i, v + 1 + es * i + es - 5, 4);
++		}
++		result(m, 0, 0);
++		ids[0] = (uint8_t)n;
++		tlv(m, 0x11, ids, (uint16_t)(1 + 4 * n));
++	} else if (v != NULL && l >= 1 && v[0] != 0) {
++		result(m, 1, QMI_ERR_MALFORMED);        /* element size does not divide: refuse, do not guess */
++		return;
++	} else {
++		result(m, 0, 0);                        /* no ex list: rule_id_valid 0 */
++	}
++	s->filters = true;
++	s->rules += n;
++}
++
++/*
++ * One request of the modem's client to our service: the answer in out (its length; 0 = no answer: not a
++ * request, or a message the stock driver does not serve either), the message id in *msg_id.
++ */
++uint32_t
++lipa_qmi_serve(struct lipa_srv *s, const uint8_t *d, uint32_t len, uint8_t *out, uint32_t cap, uint16_t *msg_id)
++{
++	struct mb m = { out, 0, cap, false };
++	uint16_t txn, msg;
++
++	*msg_id = 0;
++	if (len < 7 || d[0] != QMI_REQ) {
++		return 0;
++	}
++	txn = (uint16_t)(d[1] | d[2] << 8);
++	msg = (uint16_t)(d[3] | d[4] << 8);
++	*msg_id = msg;
++	hdr(&m, QMI_RESP, txn, msg);
++	switch (msg) {
++	case MSG_IND_REGISTER:
++		s->ind_registered = true;
++		result(&m, 0, 0);
++		break;
++	case MSG_INSTALL_FILTER:
++		filter_answer(s, d, len, &m);
++		break;
++	case MSG_FILTER_NOTIF:
++		result(&m, 0, 0);
++		break;
++	case MSG_CONFIG:
++		s->configs++;
++		result(&m, 0, 0);
++		break;
++	case MSG_INIT_CMPLT:
++		s->init_cmplt = true;
++		result(&m, 0, 0);
++		break;
++	default:
++		return 0;
++	}
++	return done(&m);
++}
++
++/* MASTER_DRIVER_INIT_COMPLETE indication: TLV 0x02 master_driver_init_status = success */
++uint32_t
++lipa_qmi_master_ind(uint8_t *out, uint32_t cap, uint16_t txn)
++{
++	struct mb m = { out, 0, cap, false };
++
++	hdr(&m, QMI_IND, txn, MSG_MASTER_INIT_IND);
++	result(&m, 0, 0);
++	return done(&m);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ipa_regs.h b/bsd/dev/laurel_ipa_regs.h
+--- a/bsd/dev/laurel_ipa_regs.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_regs.h	2026-11-01 08:04:07.033489327 +0530
+@@ -0,0 +1,128 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2, AP side (laurel 2770): addresses, registers, memory layout and the
++ * functions shared by laurel_ipa.c (start, state, hooks), laurel_ipa_fw.c (firmware, PAS 15),
++ * laurel_ipa_hw.c (clock, SMMU, registers, local memory) and laurel_ipa_qmi.c (QMI service 0x31).
++ * Values: stock 4.14 kernel drivers/platform/msm/ipa/ipa_v3 (laurel-kernel-los) and trinket.dtsi;
++ * docs/laurel_sprout/cellular.md "Step 2 facts".
++ */
++#ifndef LAUREL_IPA_REGS_H
++#define LAUREL_IPA_REGS_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++/* ---- addresses (trinket.dtsi qcom,ipa@5800000; ipahal_get_reg_base() = 0x40000) */
++#define LIPA_REG_PA             0x05840000u     /* IPA registers = ipa-base + 0x40000 */
++#define LIPA_REG_SIZE           0x00010000u     /* registers + the SRAM direct-access window */
++#define LIPA_GSI_STATUS_PA      0x05823000u     /* GSI 0x5804000 + 0x1f000 (EE 0): bit 0 ENABLED */
++#define LIPA_FW_PA              0x57500000u     /* reserved pil_ipa_fw_mem (qcom,ipa_fws memory-region) */
++#define LIPA_FW_SIZE            0x00010000u
++#define LIPA_FW2_PA             0x57510000u     /* reserved pil_ipa_gsi_mem: second try */
++#define LIPA_FW2_SIZE           0x00005000u
++#define LIPA_PAS_ID             15u             /* qcom,ipa_fws qcom,pas-id */
++#define LIPA_SMMU_SID_AP        0xE0u           /* ipa_smmu_ap, mask 0 */
++#define LIPA_SMMU_SID_UC        0xE2u           /* ipa_smmu_uc, mask 0 */
++#define LIPA_SMEM_ITEM          497u            /* SMEM_IPA_FILTER_TABLE, apps<->modem partition */
++#define LIPA_SMEM_SIZE          0x2000u         /* IPA_SMEM_SIZE (no qcom,ipa-q6-smem-size in the DT) */
++
++/* ---- RPM SMD clock (clk-smd-rpm.c trinket ipa_clk: QCOM_SMD_RPM_IPA_CLK, id 0, key "KHz") */
++#define LIPA_RPM_TYPE           0x00617069u     /* "ipa" */
++#define LIPA_RPM_KEY_RATE       0x007A484Bu     /* "KHz" */
++#define LIPA_CLK_KHZ            201000u         /* IPA_V4_2_CLK_RATE_NOMINAL (svs2 50, svs 100, turbo 240 MHz) */
++
++/* ---- registers (offsets from LIPA_REG_PA; ipahal_reg.c, IPA_HW_v4_2 with inheritance) */
++#define R_VERSION               0x034
++#define R_COMP_CFG              0x03C           /* bit 7 GSI_MULTI_INORDER_RD_DIS, 8 _WR_DIS, 15 MULTI_AXI_MASTERS_DIS */
++#define R_CLKON_CFG             0x044           /* bit 28 OPEN_GLOBAL, 29 OPEN_GLOBAL_2X_CLK */
++#define R_ROUTE                 0x048
++#define R_SHARED_MEM_SIZE       0x054           /* [15:0] size, [31:16] base (restricted bytes), 8-byte units */
++#define R_QSB_MAX_WRITES        0x074           /* [3:0] QMB 0, [7:4] QMB 1 */
++#define R_QSB_MAX_READS         0x078           /* [3:0] QMB 0, [7:4] QMB 1 */
++#define R_STATE                 0x0A8
++#define R_FILT_ROUT_HASH_EN     0x148
++#define R_BCR                   0x1D0
++#define R_LOCAL_PKT_PROC_CNTXT  0x1E8
++#define R_COUNTER_CFG           0x1F0           /* [8:4] AGGR_GRANULARITY */
++#define R_TX_CFG                0x1FC           /* bit 12 PA_MASK_EN */
++#define R_IDLE_INDICATION_CFG   0x240           /* [15:0] debounce, bit 16 const non-idle */
++#define R_SRC_RSRC_GRP_01(n)    (0x400u + 0x20u * (n))  /* x_min [5:0] x_max [13:8] (group 0), y (group 1) */
++#define R_DST_RSRC_GRP_01(n)    (0x500u + 0x20u * (n))
++#define R_SRAM_DIRECT           0x7000          /* IPA_SW_AREA_RAM_DIRECT_ACCESS_n, n = byte offset / 4 */
++
++/* values of ipa3_init_hw() / ipa3_post_init() for IPA_HW_v4_2 */
++#define V_BCR                   0x00000000u     /* IPA_BCR_REG_VAL_v4_2 */
++#define V_CLKON_OPEN            ((1u << 28) | (1u << 29))
++#define V_TX_PA_MASK_EN         (1u << 12)
++#define V_QSB_WRITES            8u              /* ipa3_qmb_outstanding[IPA_4_2][DDR] = { reads 12, writes 8 } */
++#define V_QSB_READS             12u
++#define V_COUNTER_GRAN          (15u << 4)      /* GRAN_VALUE_500_USEC */
++#define V_COMP_BITS             ((1u << 7) | (1u << 8) | (1u << 15))
++#define V_HASH_EN               0x00000000u     /* IPA_FILT_ROUT_HASH_REG_VAL_v4_2: hashing off */
++#define V_IDLE_INDICATION       256u            /* ipa3_enable_dcd(): debounce 256, const non-idle off */
++#define V_ROUTE                 0x01100050u     /* default pipe 8 (APPS_LAN_CONS), local header table, retain */
++
++/* ---- local memory (ipa_4_2_mem_part; offsets from the start of the shared memory) */
++#define M_OFST_START            0x280u
++#define M_V4_FLT                0x290u          /* non-hashed; hashed tables have size 0 on v4.2 */
++#define M_V6_FLT                0x318u
++#define M_FLT_SIZE              0x78u
++#define M_V4_RT                 0x3A0u
++#define M_V6_RT                 0x428u
++#define M_RT_SIZE               0x78u
++#define M_RT_INDICES            15u             /* modem 0-7, apps 8-14 */
++#define M_RT_MODEM_HI           7u
++#define M_MODEM_HDR             0x4A8u
++#define M_MODEM_HDR_SIZE        0x140u
++#define M_MODEM_PROC_CTX        0x5F0u
++#define M_MODEM_PROC_CTX_SIZE   0x200u
++#define M_PDN_CONFIG            0x9F8u
++#define M_QUOTA_Q6              0xA50u
++#define M_QUOTA_Q6_SIZE         0x60u
++#define M_MODEM                 0xBF0u
++#define M_MODEM_SIZE            0x140Cu
++#define M_DROP_STATS            0xBF0u          /* stats_drop: size 0 on v4.2 */
++#define M_UC_DESC_RAM           0x2000u
++#define M_END                   0x2000u
++#define M_CANARY                0xDEADBEEFu
++#define M_FLT_PIPES             0x9Bu           /* ep_flt_bitmap: USB_PROD 0, APPS_WAN_PROD 1, WLAN1_PROD 3, Q6_WAN_PROD 4, ETH_PROD 7 */
++#define M_CTRL_ENDPOINT         9u              /* APPS_WAN_CONS: ctrl_comm_dest_end_pt */
++
++/* ---- QMI service 0x31 (ipa_qmi_service_v01.h) */
++#define LIPA_QMI_SVC            0x31u
++#define LIPA_QMI_INST_AP        0x0101u         /* QRTR instance word: version 1 | instance 1 << 8 (A5 service) */
++#define LIPA_QMI_INST_MODEM     0x0201u         /* version 1 | instance 2 << 8 (Q6 service) */
++#define LIPA_PORT_SERVER        0x4015u         /* our QRTR ports: AP server, client of the modem's service */
++#define LIPA_PORT_CLIENT        0x4016u
++#define LIPA_PLATFORM_ANDROID   3u              /* IPA_QMI_PLATFORM_TYPE_MSM_ANDROID_V01 */
++
++/* ---- shared functions */
++struct lipa_mem {
++	volatile uint8_t *regs;                 /* LIPA_REG_PA mapping */
++	uint32_t restricted;                    /* SHARED_MEM_SIZE base, bytes */
++	uint32_t size;                          /* SHARED_MEM_SIZE size, bytes */
++	uint64_t zero_pa;                       /* DDR "zero rule" the empty tables point to */
++};
++
++/* laurel_ipa_hw.c: one line reason in why on false */
++bool lipa_clock_on(char *why, size_t wl);
++bool lipa_smmu(char *why, size_t wl);
++bool lipa_regs_map(struct lipa_mem *m, char *why, size_t wl);
++bool lipa_hw_init(struct lipa_mem *m, char *why, size_t wl);
++bool lipa_gsi_enabled(uint32_t *status);
++bool lipa_smem_item(char *why, size_t wl);
++
++/* laurel_ipa_fw.c: the IPA firmware from the vendor partition through TrustZone PAS 15 */
++bool lipa_fw_load(char *why, size_t wl);
++
++/* laurel_ipa_qmi.c: message builders / handlers (pure: host-tested by scripts/laurel/test-ipa.sh) */
++uint32_t lipa_qmi_init_modem_req(uint8_t *out, uint32_t cap, uint16_t txn, uint32_t restricted);
++int lipa_qmi_init_modem_resp(const uint8_t *d, uint32_t len, uint16_t *err);
++struct lipa_srv {
++	bool ind_registered, init_cmplt, filters, ind_sent;
++	uint32_t rules, configs;
++};
++uint32_t lipa_qmi_serve(struct lipa_srv *s, const uint8_t *d, uint32_t len, uint8_t *out, uint32_t cap,
++    uint16_t *msg_id);
++uint32_t lipa_qmi_master_ind(uint8_t *out, uint32_t cap, uint16_t txn);
++
++#endif
