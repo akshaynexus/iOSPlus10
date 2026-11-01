@@ -20,9 +20,9 @@
 # linux,initrd-start/end), NegroniBootMemoryDxe publishes it as a block device, UniXNU reads \EFI\UniXNU\unixnu.toml.
 set -euo pipefail
 . "$(dirname "$0")/../lib/env.sh"
-W=$OUT/laurel/uefi
+W=${UEFI_W:-$OUT/laurel/uefi}    # own folder: scripts/laurel/ios26-image.sh
 STOCK=${STOCK_BOOT:-$HOME/laurel-backup/stock/images/boot.img}
-MU=$OUT/laurel/mu
+MU=${MU_DIR:-$OUT/laurel/mu}
 FD=${FD:-$MU/SILICIUM_UEFI-DEBUG.fd}
 SHIM=${SHIM:-$MU/BootShim.bin}
 KERNEL_BY_HAND=${KERNEL:-}
@@ -81,7 +81,7 @@ else
   elif [ -e "$REPO/config/laurel-android-data" ]; then
     echo "uefi-image: note: no extent table ($DUALBOOT_TABLE): this image cannot go on the phone while it holds Android (dual-boot.sh map makes the table)"
   fi
-  python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE" ${ADT_TABLE:+--dualboot-table "$ADT_TABLE"}   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
+  python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE" ${ADT_TABLE:+--dualboot-table "$ADT_TABLE"} ${MKADT_EXTRA:-}   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
   "$OUT/venv/bin/python3" "$REPO/scripts/laurel/mkdarwinboot.py" "$KERNEL" "$W/laurel.adt" "$W/payload.img" \
     --cmdline "$CMDLINE" --size-mib "$SIZE_MIB" --timeout 3
   printf '%s\n' "$CMDLINE" > "$W/cmdline.txt"

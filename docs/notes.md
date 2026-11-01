@@ -4903,3 +4903,19 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - Built [V] 2026-11-02 at 03c7ed146a: kernel-linux.sh 310/310 patches, 0 failed, 0 LSE/RCpc, printf-arg-check OK, kernel sha256 afab8ee2a6cd3c08...; test-dualboot.sh PASS: 11 op10tool tests, test_kernel 40496 checks 0 failed, 29 guard checks 0 failed; build-honest-test 60/60; root-update-test 94/94.
 - Worktree recipe for the test: symlink external/{ios-sweet-linux,ios-topaz} and reflink out/laurel-kernel/{deps,theos,cache,dl} from the main checkout, `AUDIT=1 scripts/laurel/kernel-linux.sh`, then scripts/laurel/test-dualboot.sh.
 
+## Mi A3: iOS 26 kernel, native Linux build (2026-11-02, branch t3/laurel-ios26-kernel; docs/laurel_sprout/ios26-kernel.md). Compile and link only, NEVER RUN
+Facts [V]:
+- xnu-12377.121.6 links on Linux with the iOS 16 recipe (ios-sweet-linux + clang 23 + theos ld64-609) + MacOSX 26.1 SDK + KDK 25F84 headers. A clean run takes about 75 s on 20 cores.
+- The same 309 patches: 293 apply (83 with rules), 11 are whole in the base, 5 skipped. Only 22 patches had a conflict in a three-way merge against the 8796 series; most cases were in files that the negroni port owns too.
+- Three-way merge beats text rules here: `apply-series.py --profile` walks the series on xnu-8796 (`src/shadow`) and gives `git merge-file` the file before and after each patch. A conflict is an ERROR, so nothing merges silently past a marker.
+- Python `iig` of xnu-linux-toolchain, not the SDK-header shim: 12377 has `.iig` files in `iokit/Tests` that no SDK has. It needs two fixes (`scripts/laurel/ios26-iig-fix.py`): array parameters, quote include.
+- `availability.pl` of AvailabilityVersions-157.2 is a wrapper: copy `availability` + `availability.dsl` next to it. `-mno-implicit-sme` is Apple-only. Stock clang registers `LIBKERN_ALWAYS_DESTROY` objects through `___cxa_atexit`, also with `-fno-use-cxa-atexit`. `XNU_KERNEL_PRIVATE=0` breaks: 12377 tests it with `#ifdef`.
+- armv80-check on a kernel counts data words as instructions: 21 on the iOS 16 kernel, 22 here (K256, lz4 constants, panic strings). `--data-syms` names them; the check stays active.
+Traps of 12377 that compile fine and fail at run time [V code]:
+- `vm_shared_region_slide_page_v3`/`_v5`: with no `ptrauth_calls` an auth rebase was never written to the page. Fixed in base 0005.
+- `pmap_construct_pte`: WCOMB outside `/chosen dram-base + dram-size` is Device-GRE (faults on unaligned access and DC ZVA). `dram-*` must be all of DRAM (N104AP ADT: 0x40000000 + 0x180000000). The iOS 16 ADT has the window there.
+- kmem random moved to `vm_map_store.c` (`crypto_random_*` with NULL `g_crypto_funcs`).
+- `sched_clutch.c` stir-the-pot: `#error` on LL/SC and a 16-byte CAS; 64 bits are enough for 8 CPUs.
+Donor [owner, 2026-11-02]: N104AP, iPhone12,1, `artwork-device-subtype` 0x700, scale 2. `mkadt.py --donor`; iOS 16 D22AP unchanged.
+Guess [I]: first failure is the 4K bootstrap in `start.s`/`arm_vm_init`, then kalloc startup with stock clang.
+Negroni series tool after the `--profile` change: same result as before it (`0401-negroni-ram-7g` is an ERROR with both: that patch changes base-owned files and is not listed in `patch-rules.py`; older than this work and not fixed here).

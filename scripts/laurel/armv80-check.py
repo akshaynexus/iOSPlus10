@@ -8,6 +8,9 @@ counts the instructions of each later extension. Hint-space instructions (PACIAS
 
   scripts/laurel/armv80-check.py FILE...         one line per file; exit 1 if any file has one
   scripts/laurel/armv80-check.py --self-test     the patterns find a sample of each class and miss v8.0 code
+  scripts/laurel/armv80-check.py --data-syms A,B FILE   an unstripped kernel: words under these symbols are data that the
+                                                 disassembler decodes (K256 table, jump tables, panic strings); they are
+                                                 counted apart and do not fail the check
 """
 import re
 import subprocess
@@ -40,15 +43,26 @@ PAT = [(name, re.compile(r"^(" + rx + r")(?=[\s,]|$)")) for name, rx in CLASSES]
 LINE = re.compile(r"^\s*[0-9a-f]+:\s+(.*)$")
 
 
+DATA_SYMS = set()
+DATA_HITS = {}
+
+
 def scan(text):
     counts, examples = {}, {}
+    cur = ""
     for raw in text.splitlines():
+        if raw.endswith(">:"):
+            cur = raw[raw.find("<") + 1:-2]
+            continue
         m = LINE.match(raw)
         if not m:
             continue
         ins = m.group(1).split("//")[0].split(";")[0].strip().lower()
         for name, rx in PAT:
             if rx.match(ins):
+                if cur in DATA_SYMS:
+                    DATA_HITS[cur] = DATA_HITS.get(cur, 0) + 1
+                    break
                 counts[name] = counts.get(name, 0) + 1
                 examples.setdefault(name, ins)
                 break
@@ -107,6 +121,9 @@ def self_test():
 
 
 def main(argv):
+    if len(argv) > 3 and argv[1] == "--data-syms":
+        DATA_SYMS.update(argv[2].split(","))
+        del argv[1:3]
     if argv[1:] == ["--self-test"]:
         return 0 if self_test() else 1
     if len(argv) < 2:
