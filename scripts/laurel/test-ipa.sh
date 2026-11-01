@@ -7,6 +7,8 @@
 #      is no image: out/ipa-fw/vendor.raw or vendor.img (or VENDOR_IMG=...). The image never goes into git.
 #   4. gsi_test: GSI channel allocation against a simulated GSI (stock order and command words, failure paths)
 #   5. gate_test: laurel_ipa.c + _link.c: no NEW_SERVER or INIT_MODEM_DRIVER before all self-checks passed
+#   6. ipa_cell_test: laurel_ipa*.c + laurel_cell.c (2760 + 2780 + 2786) together: ONLINE only after LAUREL IPA: on, also when the modem's first mode read says 5;
+#      a modem assert after INIT_MODEM_DRIVER leaves no ONLINE; ipa=0 keeps the radio off
 # macOS and Linux (needs cc; debugfs optional). Quick, foreground is fine.
 #   scripts/laurel/test-ipa.sh
 set -eu
@@ -53,12 +55,24 @@ $CC $CF -o "$D/gsi_test" "$T/gsi_test.c"
 # shellcheck disable=SC2086
 $CC $CF -o "$D/gate_test" "$T/gate_test.c"
 
+# laurel_cell.c as the kernel has it: the new file of 2760, then the hunks of 2780 and 2786
+extract "$REPO/patches/laurel/xnu/2760-laurel-cellular-qmi.patch" laurel_cell.c
+for p in "$P_IPA" "$REPO/patches/laurel/xnu/2786-laurel-cell-radio-state.patch"; do
+  awk '/^diff / {p = ($0 ~ /b\/bsd\/dev\/laurel_cell\.c$/)} p' "$p" | (cd "$D" && patch -s -p0 laurel_cell.c) || { echo "test-ipa: $(basename "$p") does not apply to laurel_cell.c" >&2; exit 1; }
+done
+# shellcheck disable=SC2086
+$CC $CF -c -o "$D/laurel_cell.o" "$D/laurel_cell.c"
+# shellcheck disable=SC2086
+$CC $CF -o "$D/ipa_cell_test" "$T/ipa_cell_test.c" "$D/laurel_cell.o"
+
 echo "== 1. QMI 0x31 messages"
 "$D/qmi_test"
 echo "== 4. GSI channels"
 "$D/gsi_test"
 echo "== 5. the gate before the handshake"
 "$D/gate_test"
+echo "== 6. IPA and cellular together"
+"$D/ipa_cell_test"
 
 IMG=${VENDOR_IMG:-}
 [ -n "$IMG" ] || for c in "$OUT/ipa-fw/vendor.raw" "$OUT/ipa-fw/vendor.img"; do [ -f "$c" ] && { IMG=$c; break; }; done

@@ -2,7 +2,7 @@
 # Install every Mi A3 root feature into a mounted root, then write the one table (scripts/laurel/root-manifest.py). root.sh calls it.
 #   scripts/laurel/root-features.sh MOUNTED_ROOT --inputs FILE --sidecar PATH
 # A step that fails or skips does not stop the next one: each feature gets its row. Exit 1 = a feature is missing (not by its own =0 switch).
-# Switches (one each; =0 = off): GPU METAL HEVC AUDIO BT CAMERA STATUSBAR NOTCH TORCH BRIGHTNESS XNUTILS SSH. Runs as the user too (test on a copy: no chown).
+# Switches (one each; =0 = off): GPU METAL HEVC AUDIO BT CAMERA STATUSBAR NOTCH CELL TORCH BRIGHTNESS XNUTILS SSH. Runs as the user too (test on a copy: no chown).
 # A new feature: one `feature` line here, one row in root-manifest.py FEATURES.
 set -uo pipefail
 R=${1:?usage: $0 MOUNTED_ROOT --inputs FILE --sidecar PATH}
@@ -34,6 +34,8 @@ feature camera env CAMERA="${CAMERA:-1}" bash "$L/root-camera.sh" "$R"
 # status bar at the native 720x1560 @2x screen (2103): UIKit's own provider override = _FixedSplit, else the red rdar:45025538 bar;
 # plus the waterdrop as SpringBoard's notch rect (liblaurel-notch.dylib + laurel-springboard). docs/laurel_sprout/rtc-statusbar.md B, C
 feature statusbar env STATUSBAR="${STATUSBAR:-1}" NOTCH="${NOTCH:-1}" python3 -I "$L/root-statusbar.py" "$R"
+# cellular bridge (kernel patch 2786): SIM, bars, network name in iOS; laurel-springboard above inserts it. docs/laurel_sprout/cellular.md section 9
+feature cell env CELL="${CELL:-1}" NOTCH="${NOTCH:-1}" STATUSBAR="${STATUSBAR:-1}" bash "$L/root-cell.sh" "$R"
 # flashlight (kernel patches 2781, 2783): one owner: NegroniCamera.driver when root-camera.sh put it in, else LaurelFlashlight.driver
 feature torch env TORCH="${TORCH:-1}" bash "$L/root-flashlight.sh" "$R"
 # auto-brightness off: no ambient light sensor for iOS (kernel 2201; docs/laurel_sprout/brightness.md)

@@ -26,13 +26,14 @@ if [ ! -x out/laurel-kernel/theos/toolchain/linux/iphone/bin/ld ]; then
 else
   "$L/kernel-linux.sh" > logs/stage-kernel.log 2>&1 & k=$!
 fi
-g=; m=; n=; c=; h=; a=; b=; f=; x=; s=
+g=; m=; n=; e=; c=; h=; a=; b=; f=; x=; s=
 if on GPU; then
   { [ -s out/laurel/gpu/firmware/a610_zap.mdt ] || "$L/gpu-firmware.sh"; } > logs/stage-gpufw.log 2>&1 || { echo "build-all: FAILED: gpu-firmware (logs/stage-gpufw.log)" >&2; exit 1; }
   "$L/gpu-userland.sh" > logs/stage-gpu.log 2>&1 & g=$!
 fi
 if on METAL; then "$L/metal-build.sh" > logs/stage-metal.log 2>&1 & m=$!; fi
 if on STATUSBAR && on NOTCH; then "$L/notch-build.sh" > logs/stage-notch.log 2>&1 & n=$!; fi
+if on STATUSBAR && on NOTCH && on CELL; then "$L/cell-build.sh" > logs/stage-cell.log 2>&1 & e=$!; fi
 if on CAMERA; then sh userland/laurel/camera/build.sh > logs/stage-cam.log 2>&1 & c=$!; fi
 if on HEVC; then "$L/hevc-build.sh" > logs/stage-hevc.log 2>&1 & h=$!; fi
 if on AUDIO; then userland/laurel/audio/build.sh > logs/stage-audio.log 2>&1 & a=$!; fi
@@ -44,7 +45,7 @@ if on SSH; then
   { userland/ssh/fetch.sh && { [ "$(uname -s)" != Linux ] || userland/ssh/fetch-sdk.sh; } && userland/ssh/build.sh; } > logs/stage-ssh.log 2>&1 & s=$!
 fi
 bad=
-for j in kernel:$k gpu:$g metal:$m notch:$n camera:$c hevc:$h audio:$a bt:$b flashlight:$f xnutils:$x ssh:$s; do
+for j in kernel:$k gpu:$g metal:$m notch:$n cell:$e camera:$c hevc:$h audio:$a bt:$b flashlight:$f xnutils:$x ssh:$s; do
   [ -n "${j#*:}" ] || continue
   wait "${j#*:}" || bad="$bad ${j%%:*}"
 done

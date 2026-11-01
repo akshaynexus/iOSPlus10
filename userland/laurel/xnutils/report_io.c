@@ -94,8 +94,10 @@ rp_sec_cell(struct rp *r)
 	const char *c = rp_kv(r, "cell.state"), *ipa = rp_kv(r, "ipa.state");
 	const struct rp_rec *s = rp_s(r, "LAUREL CELL");
 
-	if (c != NULL && strncmp(c, "on: ", 4) == 0) {
-		rp_section(r, "Cellular", "part", c + 4);       /* (SIM and modem facts only: the radio's state is in its row) */
+	if (c != NULL && strncmp(c, "part: ", 6) == 0) {
+		rp_section(r, "Cellular", "part", c + 6);       /* laurel 2786: the client reads the SIMs, the radio is not online */
+	} else if (c != NULL && strncmp(c, "on: ", 4) == 0 && strstr(c, "modem online") == NULL) {
+		rp_section(r, "Cellular", "part", c + 4);       /* (a kernel before 2786 says "on" for SIM facts only) */
 	} else if (c != NULL && c[0] != 0) {
 		rp_sysctl_section(r, "Cellular", c);
 	} else {
@@ -106,6 +108,7 @@ rp_sec_cell(struct rp *r)
 	rp_cut_row(r, "Modem mode", s, "modem mode");
 	rp_cut_row(r, "Radio", s, "radio ");
 	rp_cut_row(r, "Data", s, "data ");
+	rp_cut_row(r, "SMS, voice", s, "SMS, voice ");
 	rp_row(r, "IPA", ipa, -1);
 	rp_srow(r, "IPA line", rp_s(r, "LAUREL IPA"));
 	rp_row(r, "ICCID, IMSI, IMEI", "never shown here", -1);

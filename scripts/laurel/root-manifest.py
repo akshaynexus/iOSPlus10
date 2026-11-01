@@ -153,6 +153,9 @@ FEATURES = [
     dict(name='notch', switch='NOTCH', also_off='STATUSBAR', step='statusbar', build='scripts/laurel/notch-build.sh',
          stage=['out/laurel/notch/root/usr/local/lib/liblaurel-notch.dylib', 'out/laurel/notch/root/' + SB], trees=['out/laurel/notch/root'], sources=['userland/laurel/notch'],
          root=['usr/local/lib/liblaurel-notch.dylib', SB], check=check_notch),
+    dict(name='cell', switch='CELL', also_off=('NOTCH', 'STATUSBAR'), build='scripts/laurel/cell-build.sh',
+         stage=['out/laurel/cell/root/usr/local/lib/liblaurel-cellbar.dylib'], trees=['out/laurel/cell/root'], sources=['userland/laurel/cell'],
+         root=['usr/local/lib/liblaurel-cellbar.dylib'], check=check_notch),
     dict(name='brightness', switch='BRIGHTNESS', build='-', stage=[], trees=[], sources=[], root=[], check=check_brightness),
     dict(name='xnutils', switch='XNUTILS', build='scripts/laurel/xnutils-build.sh',
          stage=[XNU + 'Applications/XNUtils.app/XNUtils', XNU + 'usr/local/libexec/powermenu-helper', XNU + 'usr/local/bin/pmregister'],
@@ -163,7 +166,8 @@ FEATURES = [
 ]
 
 def off_by_switch(f):
-    for s in (f['switch'], f.get('also_off')):
+    also = f.get('also_off')
+    for s in (f['switch'],) + (also if isinstance(also, tuple) else (also,)):
         if s and os.environ.get(s, '1') == '0':
             return '%s=0' % s
     return None

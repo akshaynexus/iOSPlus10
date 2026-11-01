@@ -55,7 +55,9 @@ static inline void lck_mtx_unlock(lck_mtx_t *m) { (void)m; }
 
 /* sysctl: the handler is called by the test */
 struct sysctl_oid { int unused; };
-struct sysctl_req { char *out; size_t len; };
+struct sysctl_req { char *out; size_t len; const char *newptr; size_t newlen; };
+#define USER_ADDR_NULL          ((const char *)0)
+#define SYSCTL_IN(r, p, l)      (memcpy((p), (r)->newptr, (l)), 0)
 static inline int
 kt_sysctl_out(struct sysctl_req *r, const void *p, size_t l)
 {
@@ -69,6 +71,8 @@ kt_sysctl_out(struct sysctl_req *r, const void *p, size_t l)
 #define SYSCTL_PROC(...)        struct kt_sysctl_unused
 #define CTLTYPE_STRING          0
 #define CTLFLAG_RD              0
+#define CTLFLAG_RW              0
+#define CTLFLAG_ANYBODY         0
 #define CTLFLAG_LOCKED          0
 #define OID_AUTO                0
 

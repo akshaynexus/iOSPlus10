@@ -45,7 +45,8 @@ kern_return_t kernel_thread_start(thread_continue_t f, void *a, thread_t *t) { *
 void thread_deallocate(thread_t t) { (void)t; }
 kern_return_t thread_terminate(thread_t t) { (void)t; return KERN_SUCCESS; }
 
-/* QRTR: what reached the modem */
+/* QRTR: what reached the modem (ipa_cell_test.c adds its simulated UIM, DMS, NAS, WDS here) */
+static bool (*gate_qrtr_more)(uint32_t src, const void *d, uint32_t len);
 static int sent_server, sent_init, sent_other;
 void
 topaz_qrtr_data(uint32_t src, uint32_t node, uint32_t port, const void *d, uint32_t len)
@@ -54,7 +55,7 @@ topaz_qrtr_data(uint32_t src, uint32_t node, uint32_t port, const void *d, uint3
 	(void)node; (void)port; (void)len;
 	if (src == 0x4016 && b[3] == 0x21) {
 		sent_init++;
-	} else {
+	} else if (gate_qrtr_more == NULL || !gate_qrtr_more(src, d, len)) {
 		sent_other++;
 	}
 }
@@ -168,6 +169,7 @@ scenario_kill_switch(void)
 	CHECK(strstr(log_text, "off: boot-arg ipa=0") != NULL);
 }
 
+#ifndef GATE_NO_MAIN
 int
 main(void)
 {
@@ -190,3 +192,4 @@ main(void)
 	fprintf(stdout, bad == 0 ? "ok: gate: %d scenarios: no NEW_SERVER or INIT_MODEM_DRIVER before all self-checks passed\n" : "gate_test: %d scenarios, failures\n", n);
 	return bad != 0;
 }
+#endif
