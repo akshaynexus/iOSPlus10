@@ -1011,3 +1011,10 @@ Done: no `usbnetcfg` at boot, USB service without router or DNS, rank Last; `sha
 Not done, cause [U]: reason of the two sig 6 crashes: read over SSH now.
 Next: owner's test 1 (no build: `usbnetcfg show` + `down` on the running phone), then root + kernel build and flash (owner approves).
 
+
+## Mi A3: update the root in place, keep /private/var (2026-11-01, branch t3/laurel-root-update; host tests + read-only plan on the phone, NEVER RUN WRITING ON THE PHONE)
+Owner: "Flash the latest images, but don't wipe userdata, or just append, so I don't have to reconnect Wi-Fi and whatnot." Doc: docs/laurel_sprout/root-update.md.
+Done: `root-delta.py` in `root.sh` (stat snapshot after mkiosroot, delta after the table, `$APPLE/laurel-ios16-root.update`); `root-update.sh` (`--dry-run`, `--list`, `--rollback`, `--after-boot`; driver `rootupdate/`); `update-phone.sh` = `make laurel-update`; `root-flash-test.sh` stays for clean installs.
+Results [V]: root-update-test.sh 93/93 with GNU tools, 93/93 with toybox + dash; root-dry-run.sh PASS (13 features, 9740 paths, 593 MB on the copy); build-honest-test.sh 60/60; first update simulated with the real launchd.plist and /var plists of the 21:57 image.
+Unproven: real write on XNU/HFS+, `pmregister` on this root, `ctl reboot` after the commit; `sudo root.sh` itself was not run here (sudo needs a password), so owners and setuid of the real payload are not yet seen.
+Next: owner runs `scripts/bg.sh rupd-phone scripts/laurel/update-phone.sh` (or `BUILD=0` after a root.sh). First `scripts/laurel/root-update.sh --dry-run`.

@@ -46,7 +46,7 @@ SCRIPTS = ['scripts/laurel/root*.sh', 'scripts/laurel/root*.py', 'scripts/laurel
            'external/ios-topaz/tools/mkiosroot.sh', 'external/ios-topaz/tools/sweet-root-tweaks.py']
 
 
-NOT_INPUTS = ('root-flash-test.sh', 'root-dry-run.sh')     # they do not make the image
+NOT_INPUTS = ('root-flash-test.sh', 'root-dry-run.sh', 'root-update.sh', 'root-update-test.sh')     # they do not make the image
 
 
 def plist(root, rel):

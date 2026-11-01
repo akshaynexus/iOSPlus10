@@ -4825,3 +4825,16 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - Gotcha: `git status` shows reference symlinks in external/ as untracked (`external/ios-topaz/` in .gitignore matches a directory only). Add files by name.
 - Gotcha: a worktree kernel build: `ln -s` external/ios-sweet-linux and ios-topaz from main, `cp -a --reflink=always` of out/laurel-kernel/{deps,dl,theos,cache}. Root dry run: `cp -r --reflink=always` of the stages (not `-a`: a stage must be newer than its sources); `out/laurel/cell` needs `cell-build.sh`.
 
+
+## Mi A3: root update in place (2026-11-01, branch t3/laurel-root-update; details docs/laurel_sprout/root-update.md)
+- Decision: the file list is a stat diff inside `root.sh` (snapshot after mkiosroot, delta after the table), not a list per step: a new root step is covered with no work. A real payload needs `sudo root.sh`; `root-update.sh` itself needs no sudo and no mount.
+- **Gotcha: a plist in /private/var must never be replaced whole.** `.GlobalPreferences.plist` holds language and locale; `preferences.plist` holds the Wi-Fi service, and the stock root has no such file, so "base -> final" sees all of it as new: a dictionary merges key by key, only `NetworkServices/<id>` is ours whole.
+- [V phone 2026-11-01] Root: `/dev/ufsroot0 on / (hfs, local, journaled, noatime)`, 16777216 KiB, 3380908 KiB free, /private/var on the same device. Known networks: `/private/var/preferences/SystemConfiguration/com.apple.wifi.plist`. `df` is the stock BSD one (columns 2 and 4 = total, free).
+- [V 7z, image 21:57] `7z l -ba laurel-ios16-root.img` lists an HFS+ image with no sudo and no mount (318196 lines, prefix `iOSRoot/`). Only 32 files outside MobileAsset are in /private/var.
+- Gotcha: toybox `tar x` drops setuid without `p` (`FLAG(p) ? mode : mode&0777&~umask`). It chowns first, then chmods: `xpf --numeric-owner`.
+- Gotcha: `${R:?}` with R empty ends the shell: on the phone R is empty. `rmp()` in phone.sh checks the path instead.
+- Gotcha: a `check` that redirects to the same file as `expect` eats the output: root-update-test.sh keeps `$T/last`.
+- Gotcha: out/ssh/hostkeys in the main checkout has root-only files: `cp -r` of out/ssh fails; `root-add-ssh.py` then makes a new key in a worktree and rewrites that worktree's known_hosts: set PHONE_KNOWN_HOSTS to the main checkout's for the real phone. No `phone_ed25519` in the main checkout before the next `sudo root.sh`.
+- Gotcha: `uptime` is not on the phone. `op10tool ctl reboot` is a hard reset: `sync` first.
+- A root step that adds a state file in /private/var (the phone changes it): add it to `KEEP` in root-delta.py, else an update overwrites it.
+- Host test of phone scripts: `out/ssh/host/{toybox,dash}` are Linux builds of the phone's tools; ROOT_UPDATE_PHONE_PATH puts them alone in PATH.
