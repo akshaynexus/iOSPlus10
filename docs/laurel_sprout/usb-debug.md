@@ -23,6 +23,8 @@ SYSTEM_RESET; `poweroff` -> PSCI SYSTEM_OFF; `panic` -> `panic("requested over U
 Not ported: 0367 `bootlog` (the userdata ring). topaz 0047 already writes the console ring to the end of
 the UFS partition; a reader for it is future work.
 
+Patch 2951 (2026-11-02, both kernels; for a phone with no picture and no SSH, `ios26-first-boot.md`): `logall` -> `ok logall`, then all of the console ring on UDP 5140 (a failed send keeps its bytes now); `state` -> several datagrams, last line `end`: uptime, build, root, launchd and SSH, one `run` line per watched process (`pid n x rv t`), the last 8 execs, the last 12 exits with a status other than 0; `ps` -> `pid ppid name` per process, last line `end` (try-lock on the list: `ps busy` under load). In raw mode: `state early: no ue0 yet`. After a panic: `state panic: send logall`. Kill switch `laurelstate=0`. Lines: `LAUREL STATE: on: ...`, `LAUREL SSH: on: dropbear pid P, T s after launchd, ...`, `LAUREL SSH: off: launchd did not start dropbear in 300 s ...`.
+
 ## Panic over USB
 
 A panic ends in `laurel_usb_panic_hold()` (SweetPlatformExpert `kPEPanicDiagnosticsDone` /

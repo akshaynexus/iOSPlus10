@@ -7,7 +7,7 @@
 #   /usr/local/bin/{vkprobe,metalprobe,mslprobe,m2vtest,carenderprobe,layerprobe}
 #   /private/var/db/negronimetal/{clients,env,cache/,strikes/,metal.log,build.txt}
 # Clients: "*" minus four (below), backboardd included: 23F84 has no GL path (CA::WindowServer::AccelServer::renderer is Metal or nothing). So no gate job (iOS 16's laurel-metal-gate): a gate that widens the list after a test comes too late
-# for backboardd, and launchd.plist is signed here (launchd.plist.sig), so no job goes in without the kernel track's trust work. The self-check is the plug-in's (device open + self-test at each start; one LAUREL METAL26 line).
+# for backboardd, and this stack adds no job to launchd.plist (a job can go in with launchd_unsecure_cache=1: docs/laurel_sprout/ios26-first-boot.md). The self-check is the plug-in's (device open + self-test at each start; one LAUREL METAL26 line).
 # No GL wrapper: /usr/libexec/backboardd stays Apple's (the lowered copy). Kill switches: boot-arg negronimetal=0, file /private/var/db/negronimetal/off; both mean no renderer in backboardd (phone reachable, screen stays).
 # METAL_ENV="KEY=VALUE..." lines added to the env file. Kernel needs: docs/laurel_sprout/ios26-metal.md section 7.
 set -eu

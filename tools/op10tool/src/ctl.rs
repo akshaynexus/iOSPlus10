@@ -12,6 +12,7 @@
 //! `bootlog` (patch 0367; Mi A3 2900, same protocol) prints the boot log area and this boot's slot;
 //! `op10tool bootlog` fetches the logs. The Mi A3 (laurel) kernel speaks the same protocol (patches/laurel/xnu
 //! 2005, 2900, 2901; docs/laurel_sprout/usb-debug.md).
+//! Patch 2951: `state`, `ps`: text in several datagrams, last line "end"; `logall`: all of the console ring to the live log.
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -42,6 +43,12 @@ pub enum Command {
     Time,
     /// Send the console to the live log again: negroni the last 64 KiB, Mi A3 (2900) all from byte 0 (also after a panic)
     Log,
+    /// Send all of the console ring to the live log again (Mi A3 patch 2951; also after a panic)
+    Logall,
+    /// What the user processes did since boot: launchd, boot tasks, SSH, compositor, the last execs and bad exits (Mi A3 patch 2951)
+    State,
+    /// All processes of the kernel's list: pid ppid name (Mi A3 patch 2951)
+    Ps,
     /// The USB gadget's counters: frames, bytes, TX drops, RX frames per poll, TX batch size (patch 0361)
     Usbstats,
     /// The boot log area and this boot's slot (patch 0367); the logs themselves: `op10tool bootlog [N]`
@@ -65,6 +72,9 @@ impl Command {
             }
             Command::Time => "time".into(),
             Command::Log => "log".into(),
+            Command::Logall => "logall".into(),
+            Command::State => "state".into(),
+            Command::Ps => "ps".into(),
         }
     }
 }
@@ -130,7 +140,26 @@ pub fn run(cmd: Command, host: &str) -> Result<()> {
             }
             bail!("no pong from {phone} in 2 s")
         }
-        Command::Settime | Command::Time | Command::Log | Command::Usbstats | Command::Bootlog => {
+        Command::State | Command::Ps => {
+            // Several datagrams, the last line is "end". No side effect: ask again if the first try got nothing.
+            let deadline = start + Duration::from_secs(3);
+            let mut text = String::new();
+            let mut buf = [0u8; 1500];
+            while Instant::now() < deadline {
+                send()?;
+                sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+                text.clear();
+                while let Ok(n) = sock.recv(&mut buf) {
+                    text.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if text.ends_with("end\n") {
+                        print!("{text}");
+                        return Ok(());
+                    }
+                }
+            }
+            bail!("no whole reply from {phone} in 3 s (a kernel without patch 2951 replies \"error: unknown command\"): {}", text.trim())
+        }
+        Command::Settime | Command::Time | Command::Log | Command::Logall | Command::Usbstats | Command::Bootlog => {
             // No reset: resend every 500 ms like ping (each settime carries the host's time at sending).
             let deadline = start + Duration::from_secs(2);
             while Instant::now() < deadline {

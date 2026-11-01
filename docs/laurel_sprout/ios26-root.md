@@ -52,7 +52,7 @@ Same inputs, same bytes: the build hashes the spec, the changed files and each l
 - Preferences: key names of iOS 16; each marked [U] where 26 was not read.
 - `activation data ark`: **not-found**. The 23F84 OS volume has no mobileactivationd system container. The kernel path stays; enough on 26: [U].
 
-Not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils, SSH.
+Not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils. SSH and debugging: section 4.2.
 
 ## 4. AirDrop and AirPlay hook
 
@@ -75,6 +75,18 @@ After the merge: build those binaries, then `FORCE=1 scripts/laurel/ios26-root.s
 - **The sizes and hash in section 1 are from before this hook. The image changes.** Run `scripts/laurel/ios26-root-again.sh` again for the same-bytes proof.
 
 Test [V]: `--self-test`: `metal hook self-test: 15 of 15` with the real script on the real stage (bytes, owners, modes, clients, preference, no second stack), no backboardd, no stage. The jetsam step alone, on the plist of the last root: `146 extension limits raised`. **The full root with this hook was not built:** the owner rebuilds it.
+
+## 4.2 Debug hook (SSH without a picture)
+
+`ios26-root-spec.py` function `debug()` runs `scripts/laurel/root-debug-ios26.sh STAGE` before `air()` and `metal()`. It needs neither, and their failure does not remove it. What, why and what to read: `ios26-first-boot.md`.
+
+- The script uses `scripts/net/root-add-ssh.py` of iOS 16 with `SSH_IOS26=1` (default off: the iOS 16 root does not change). Stage input: launchd.plist, the account files, the list of stock commands of this tree. Binaries: `out/ssh/ios` of this checkout, else of the main checkout, and `out/laurel/debug/ios/ksysctl`.
+- One audit line each: `debug ssh`, `debug login`, `debug usb network`, `debug tools`, `debug jobs`, `debug-ios26`, then `root-manifest`. Also `ROOT_OUT=DIR` for a test next to a root in use.
+- It fails or `DEBUG26=0`: the root is built with one audit line `off debug-ios26`, and `ios26-root.sh` prints it at its end.
+- `/usr/share/laurel/root-manifest`: first line for `LAUREL BUILD: root ...` (patch 2912), with the commit's time, so the same commit gives the same bytes. It holds the kernel series of `out/laurel-kernel-ios26/out`: build the kernel first.
+- **Sizes and the hash of section 1 are from before these hooks. The image changes.** Run `ios26-root-again.sh` again.
+
+Tests [V]: section numbers in `docs/notes.md` entry "iOS 26 debug path".
 
 ## 5. What is not proven
 
