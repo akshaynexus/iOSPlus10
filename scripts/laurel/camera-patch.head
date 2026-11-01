@@ -1,0 +1,2 @@
+laurel 2773: camera quality on the Mi A3: real line time from the PLL registers (the library's vt_pixel_clk is wrong by 2.57x), 1920x1440 preview window and 4000x3000 photograph mode with a switch without a power-down, DW9800W lens motor over CCI, four-buffer ring, exposure in the header delayed as the sensor applies it, levels above black in the lines. docs/laurel_sprout/camera.md section 10.
+

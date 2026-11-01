@@ -11,7 +11,8 @@
  *            of the header's size gets the header only. EAGAIN on a time-out, EIO after a fault (then for
  *            the rest of the boot). The session ends after the last close or 1 s without a read.
  *   write()  struct negronicam_command: EXPOSURE (a lines, b gain x256 linear, c frame lines or 0) and SENSOR
- *            (only 1, the rear main, exists: others give ENODEV). KEEP and FOCUS are accepted and ignored.
+ *            (only 1, the rear main, exists: others give ENODEV). KEEP and (negroni) FOCUS are accepted and ignored.
+ *            Mi A3 (laurel 2773): FOCUS moves the lens (a: DAC position), MODE (a: 0 preview, 1 photograph) changes the frame's size.
  */
 #ifndef NEGRONICAM_H
 #define NEGRONICAM_H
@@ -41,8 +42,11 @@ struct negronicam_frame {
 	uint32_t        frame_lines_max; /* the longest frame it may be given */
 	uint32_t        margin;         /* exposure_lines is at most frame_lines - margin */
 	uint32_t        sensor;         /* 1: the rear main camera (HakiOS's numbering: the wide camera) */
-	uint32_t        focus;          /* NEGRONICAM_NO_FOCUS: no lens motor driver (AK7377) yet */
-	uint32_t        reserved[5];
+	uint32_t        focus;          /* the lens's DAC position; NEGRONICAM_NO_FOCUS: no lens motor */
+	/* Mi A3 (laurel 2773); 0 from a kernel without them (negroni 0318) */
+	uint32_t        mode;           /* 0 preview, 1 photograph */
+	uint32_t        focus_min, focus_max;   /* the lens motor's range (0, 0: not said) */
+	uint32_t        sensor_w, sensor_h;     /* the middle part of the sensor the frame shows, in its pixels (0: all) */
 };
 _Static_assert(sizeof(struct negronicam_frame) == 120, "the frame header is 120 bytes (kernel 0318)");
 
@@ -52,7 +56,8 @@ enum {
 	NEGRONICAM_EXPOSURE = 1,        /* a: lines, b: gain, c: frame lines (0: the shortest that holds the exposure) */
 	NEGRONICAM_KEEP = 2,            /* accepted and ignored by 0318 */
 	NEGRONICAM_SENSOR = 3,          /* a: which sensor; only 1 here */
-	NEGRONICAM_FOCUS = 4,           /* accepted and ignored by 0318 */
+	NEGRONICAM_FOCUS = 4,           /* a: the DAC position (accepted and ignored by 0318) */
+	NEGRONICAM_MODE = 5,            /* a: 0 preview, 1 photograph (Mi A3, laurel 2773) */
 };
 
 struct negronicam_command {

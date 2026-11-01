@@ -1,7 +1,7 @@
 # Mi A3 (laurel_sprout) camera: hardware, path decision, step 1
 
 Status 2026-11-01: step 1 (power + CCI + chip ID of all four cameras) is code, kernel patch 2770, built (249/249
-patches, 0 LSE). Step 2 (rear IMX586 RDI raw frames 1280x720, fps line, `camframe` picture over USB) is code, kernel
+patches, 0 LSE). **2026-11-01 18:40: the Camera app ran on the phone; quality work after that: section 10.** Step 2 (rear IMX586 RDI raw frames 1280x720, fps line, `camframe` picture over USB) is code, kernel
 patch 2771, built (252/252 patches, 0 LSE), host-tested (section 8). Steps 3 + 4 (`/dev/negronicam`, mediaserverd plug-in, root step, ADT nodes) are code,
 kernel patch 2772 + 2903, built (259/259 patches, 0 LSE), host-tested (section 9). **None of this ran on the phone yet.**
 Labels: [V] read in a file or seen in a tool output (source given), [I] inference, [U] unknown.
@@ -152,7 +152,7 @@ and the mm-camera ISP configuration in user space); UVC-style USB gadget (no hos
    only while a client reads, exposure + gain + frame length writes (IMX586 0x0202, 0x0204, 0x0340).
 4. **Done (code, section 9):** `userland/laurel/camera/build.sh` builds the plug-in on Linux, `root-camera.sh` installs it, `mkadt.py`
    adds the camera nodes. Test: Camera.app preview + photo.
-5. Later: front (S5KGD1, CSIPHY2 + switch: section 9), ultrawide, focus (DW9800W on M0), flash (PMI632), GPU demosaic.
+5. Later: front (S5KGD1, CSIPHY2 + switch: section 9), ultrawide, flash (PMI632), EEPROM calibration (AF, LSC, AWB), GPU demosaic. Focus: section 10.
 
 ## 6. Step 1 (patch 2770)
 
@@ -373,7 +373,7 @@ the main thread waits on the same `dispatch_once` in `didFinishLaunching`; so no
 - A session: first read -> bring-up of 2771; last close or 3 s without a read -> all off (sensor power-down, CSI, VFE, clocks, GDSC). The
   camera has no power otherwise. `camframe` still works when no session runs. A fault (no frame for 1 s) answers EIO until reboot and
   touches nothing else. Kill switch `camera=0` (no node).
-- Numbers [V library]: line 5376 at 392 MHz = 13714 ns. Mode 6 is 780 lines = 93.5 fps, 10 ms maximum exposure. A session sets frame
+- Numbers [V library, **wrong: section 10**, the library's clock is not the real one: line 5333 ns, 240 fps]: line 5376 at 392 MHz = 13714 ns. Mode 6 is 780 lines = 93.5 fps, 10 ms maximum exposure. A session sets frame
   length 2431 lines = 30 fps, maximum 9724 lines (7.5 fps); the margin is 48 lines.
 - Bayer: library filter 3 -> header 0 (RGGB) [I: enum]. Black 64 [I]. Android mount angle 90 for the rear [V camera_config.xml], so no half
   turn [I]; `/var/db/negronicam/turned` turns the picture if that is wrong.
@@ -452,3 +452,93 @@ How to read a stop: no `ios hooks:` line = the HAL did not load the bundle. `cap
 - Backboardd refill of 2.5 MB planes per frame through glTexImage2D (BGRA 11 MB took 120-145 ms, `eagl.c`): UI may drop while the camera runs. Next if so: BGRA preview for zero copy.
 - CPU load of 30 fps ISP on this SoC; the 2 s self-check at each boot stays.
 - Graph with a 16:9 sensor under a 4:3 format name: the format table stays the iPhone X names; the ISP crops.
+
+## 10. Camera quality after the first working boot (patch 2773, plug-in, root step; 2026-11-01)
+
+Owner, boot 18:40: "Camera is working but quite buggy and no proper focus or clarity." Log: `logs/laurel-boot-1840.txt` and `usblog-20261101-165828.txt`.
+Status: code, built, host-tested. **Not run on the phone: every statement about the phone's behaviour with these changes is [I].**
+
+### What the log shows [V] and the cause
+
+| Sign in the log | Cause | Fix |
+| --- | --- | --- |
+| `rear stream: ... at 234.0 fps` where the table said 93.5; 370 frames in 10 s at frame 4862 | The library's `vt_pixel_clk` is not the clock. INCK / 0x0305 x 0x0306-7 / 0x0303 / 0x0301 x 8 over line x frame gives whole rates for all 7 modes: 15, 30, 60, 90, 120, 30, 240 fps [V host test, both libraries]. Mode 6 is the 240 fps mode. So line = 5333 ns, not 13714 ns: AE's "66 ms" was 26 ms and the session ran at 77 fps, not 30 | `lcam_mode_vt_hz` (`laurel_cam_mode.h`), checked by `cam4_test` |
+| `low swap: killing largest compressed process with pid 28 (mediaserverd) and size 2689 MB` 18:43:56, pid 321 2485 MB 18:46:25; Camera drops, mediaserverd restarts | [V] footprint 15 MiB at 18:43:47, after a session that ran without a graph, and no surface growth (19 surfaces created). [V] each time the graph ran with Metal in mediaserverd: `surface import refused: no-copy buffer` and `heap texture refused: OutOfMemory(Heap)`, about 10 lines a second. [I, strong] CMCapture's GPU path. The exact allocation is [U] | `-mediaserverd` in the gate's list (`metal_gate.c`): no Metal in mediaserverd. HakiOS ran this capture graph with no Metal at all [V its docs/ru/metal.md: refusal not audible] [I here]. New line `memory at frame N: footprint M MB` |
+| `Data/Stack execution not permitted ... mediaserverd[pid 403]`, pc = far = 0x1e9440158, 18:46:30 | [V] lr 0x101971560 = bundle base 0x101964000 + 0xd560: just after the `blr x8` of the PixelBufferHandler call in `deliver`. The block's invoke word was a data pointer. Why is [U]; it came 4 s after a low-swap kill | `handler_alive`: the block's class word is checked; a dead handler gives `off:` for this output, not a crash |
+| `16 read over`, `70 read over` of 369 | A frame that ended while the reader copied was written over | 4 buffers, no frame lost to a copy (host test) |
+| `mean 64`, `green 0 above black` at 4814 lines and gain 16x in every session, `digital 4.00x` | **Not explained [U].** The stock exposure writer does the same writes (`fill_exposure_array` disassembled: group hold, 0x0340, 0x0202, 0x0204, then digital gain): the registers are right. Rail GPIOs and tiles equal the DT [V]. The real exposure was 2.57x shorter, far less than the gap. Candidates: scene or lens covered (the log has no picture), VANA rail input [I] | Lines now say levels above black: mean, 1 % over, top. AE does not start from a dark self-check any more. Next boot tells: `top` near 0 at full exposure = no light on the sensor (rail or cover); `top` high = the mean is only a dark room |
+| `frame 2: exposure 10.0 ms, gain 16.0x` at each session start | The session took the gain of the dark self-check | Start 16 ms x 2, or the last session's exposure |
+| Exposure pinned, overshoot | The header said a new exposure at once, the sensor applies it 2 frames later [I]; AE waited for ever for a value the kernel clamped | The header follows the sensor (2 frames); AE waits at most 8 frames |
+| `... found 0 (first word 0), expected 0x1a218a970; left alone` | [V] the method is in the cache (check-cache OK) but `class_getInstanceMethod` finds nothing at run time. A better log of a trap that did not happen. Harmless | One line: `is not found by name: the graph-stop log stays stock (not a fault)` |
+| `no colour tuning for the imx586` | None was made | `scripts/laurel/camera-tuning.py` at the root step |
+| `the first picture given (1504x1128)`: preview from 480x360 cells | Mode 6: 4:3 crop 960x720, 48 % of the sensor each way (2.1x zoom), magnified 3.1x | Section below |
+
+Stays unknown [U]: `stream: stop (0 frames, 0 pictures given)` 18:45:14 and 18:46:10 (a device was made and the graph stopped before it asked for streams: no error line); which of the above the owner meant by "buggy"; no shutter press in the log (no `StillImage` line), so the photo path has never run on this phone.
+`set (not used)` left: ExposureBias, RegionOfInterestForCameraControls (no spot metering), TemporalNoiseReduction, FaceDetection. The `an output not here` lines (Raw, Depth, ...) are as expected. Flashlight: branch t3/laurel-torch-bl-fix.
+
+### Modes
+
+| Session mode | Table | Frame | Part of the sensor | Rate | Use |
+| --- | --- | --- | --- | --- | --- |
+| window | mode 2 + CCS window registers | 1920x1440, 3.46 MB | 96 % x 96 % | 30 fps (shortest frame 1722 lines = 45 fps) | preview |
+| 1080 | mode 2 stock | 1920x1080 | 96 % x 72 % | 60 max | first fallback |
+| 720 | mode 6 stock | 1280x720 | 64 % x 48 % | 240 max | last fallback ([V] it ran on the phone) |
+| still | mode 1 stock | 4000x3000, 15 MB | all | 30 | photograph |
+
+Not used: mode 0 (8000x6000): 60 MB a frame, CSID above 200 MHz (8 Gbit/s needs about 250 MHz by the mainline rule), and its remosaic wants the module's QSC data [I]; modes 3-5: more bandwidth for the same picture.
+- Window: mode 2 line rate fits [V calc, host test]: 1920 x 10 / 4 lanes at 410 Mbit/s = 11.7 us < line 12.8 us. Registers are the standard CCS ones: Y start 0, Y end 5999, crop Y 30, height 1440, output 1440, frame 1722. **[I] The sensor takes this window: nothing tested it.** Self-check at boot: the frame's last line is written and the line after it is not (`lcam_tail_check`); no frames or another size falls to the next mode with the line `preview: mode N: off: ...`.
+- Photograph: shutter -> `MODE 1`: stream off, path off, mode table, path on, exposure scaled by the line times, stream on, no power-down, the lens stays. The plug-in takes the second frame, at the zoom that shows the preview's framing, `MODE 0`. No frames in 1 s: `photograph mode: off: no frames: photographs from the preview frames`, session goes on. [U] the AXI bus at 460 MB/s while lines arrive (no bus vote in this kernel): `ios session: mode 3 after N frames, VFE errors E` tells.
+- Buffers: 4 x 15.06 MB from the GPU pool (60 of 512 MiB, for good, at boot). No such room: `photograph mode: off: no 4 x N bytes in the GPU pool`, preview-size buffers.
+
+### Focus [V library data, I on the phone]
+
+DW9800W, 7-bit 0x0c on CCI M0, VAF gpio 123 (power list). `libactuator_dw9800.so` (sunny: `02=02 06=80 07=5e`, initial 381) or `libactuator_laurus_dw9800w_qtech.so` (qtech: `02=02 06=40 07=7a`, initial 150), chosen by the depth camera the scan found (camera_config.xml pairs them; this phone: OV02A10 = sunny [V log]). Position: register 3, 2 bytes, 10 bits. Range 48..960: the module's calibration is in its EEPROM (0x51, 8022 bytes) and is not read, so the search covers the whole stroke. The lens is set down in steps before power-off.
+Plug-in: `af_frame` (HakiOS, contrast on the green block means, already there) gets the range from the frames. First sweep at frame 20, continuous watch after, tap = `AutoFocusNow` + `AFWindowParams`. Metadata: `AFStatus` 2 during a sweep and its fine search (CMCapture holds a photograph back while it lasts [V HakiOS comment on `_stillImageCaptureInProgressSubstate...`]), 1 while it climbs, 0 at rest; `AFLocked`. From the shutter to the end of the photograph the lens does not move. **[U] Whether AVFoundation's `isAdjustingFocus` follows AFStatus: not seen in the cache's method names; no KVO test here.**
+
+### ISP
+
+- Black 64 as before (the chromatix was not read for it [I]). Lens shading and colour matrices from the phone's own `libchromatix_laurus_imx586_{sunny,qtech}_{common,default_preview}.so`, file `camera-imx586-{sunny,qtech}.isp` in the bundle, made at the root step, never in git. Sunny: 3 shading sets (corners x3.3 to x4.3), 6 matrices with the colour temperature limits of the file. The order of matrices and shading sets by colour temperature is [I]. No file: a fixed middle matrix of that tuning, no shading. The grid spans the whole sensor: `lsc_u/v` keep it right on a frame that shows a part.
+- White balance: grey world as before (no reference points parsed).
+- Photograph: 5x5 Malvar-He-Cutler demosaic on lens-shaded raw (`camera_still.c`), chroma [1 2 1] each way (twice over 8x gain), luma sharpened with coring that grows with the gain.
+- Preview: cells of the window (960x720) -> 8-bit bilinear -> luma sharpen, chroma only over 8x. CPU only: Metal stays out of mediaserverd, so the GPU is not used for this.
+
+### Build and host test [V]
+
+`scripts/laurel/kernel-linux.sh` (job camq-kernel): see `docs/notes.md`. `scripts/laurel/cam-test.sh`: + `cam4_test`: frame rates of all modes in both libraries, window numbers, motor data in both libraries, demosaic (flat grey in 4 orders, colour bars), shading on a part, finish, AE release, tuning file through the plug-in's loader. Only on a host: no sensor, XNU or CMCapture ran.
+`camera-inventory.sh` must run again: it now also takes the actuator and chromatix files. The patch: `scripts/laurel/camera-patch.sh BASE WORK`.
+
+### Expected lines [I]
+
+```
+LAUREL CAMERA: focus: libactuator_dw9800.so: DW9800 at 0xc, init 3 writes, initial code 381, 481 steps
+LAUREL CAMERA: sensor: session mode 0: table 2, 1920x1440, line 12800 ns at 420 MHz, shortest frame 1722 lines = 45 fps, 7680x5760 of the sensor
+LAUREL CAMERA: sensor: session mode 3: table 1, 4000x3000, line 10840 ns at 828 MHz, shortest frame 3074 lines = 30 fps, 8000x6000 of the sensor
+LAUREL CAMERA: rear stream: 1920x1440 RAW10 at 44.9 fps, frame N (kept for camframe), above black: mean M, 1% over B, top T; exposure ...
+-- open Camera --
+LAUREL CAMERA: ios session: start (rear IMX586 1920x1440, line 12800 ns, frame 2604 lines = 30 fps, photograph mode on)
+LAUREL CAMERA: focus: on: DAC 48..960, at 381, control 0x2
+LAUREL CAMERA: ios: the imx586's colour tuning from .../camera-imx586-sunny.isp: 1 colour matrices' lights, 1 lens shadings'
+LAUREL CAMERA: ios: memory at frame 60: footprint N MB                  (must stay flat; about 100 MB [I])
+LAUREL CAMERA: ios session: 30 frames in 1000 ms, 30 read, 1920x1440 exposure ...; above black: mean M, 1% over B, top T; VFE errors 0 (0)
+LAUREL CAMERA: ios: focus: sweep: 48 0.0012 ...
+LAUREL CAMERA: ios: focus: the lens at N after K moves (sharpness S)
+-- shutter --
+LAUREL CAMERA: ios: a photograph: the lens stays at N, the photograph mode asked for
+LAUREL CAMERA: ios session: mode 0 after N frames, VFE errors 0 (0): to mode 3
+LAUREL CAMERA: ios: StillImage: 4032x3024 made of every pixel in N ms
+LAUREL CAMERA: ios: the photograph is given (1 so far, 4000x3000 frame, level x1.00)
+LAUREL CAMERA: ios hooks: a photograph of 4032x3024 encoded in N ms
+LAUREL CAMERA: ios session: mode 3 after 2 frames, VFE errors 0 (0): to mode 0
+```
+
+No `low swap: ... mediaserverd`, and no `NMTL[n mediaserverd]` line.
+Bad signs: `focus: off: ...`; `preview: mode 0: off: ...` (the window failed); `photograph mode: off: ...`; `off: the graph's handler` (the old crash, stopped); `frames of 1280x720` (both 1920 modes failed); a crash at graph build with no Metal device (undo: below).
+
+### Test steps (owner approval for each partition write)
+
+1. `scripts/bg.sh cam-inv scripts/laurel/camera-inventory.sh` (new files), then the kernel, `userland/laurel/camera/build.sh`, and `scripts/laurel/gpu-userland.sh` (the gate).
+2. **Root and boot image: both.** Root: new plug-in, tuning files, actuator libraries, gate (`sudo scripts/laurel/root.sh`, flash userdata). Boot image: new kernel (`uefi-image.sh`, `flash-boot.sh`).
+3. Open Camera in a lit room, lens free. Compare the lines. Read `top` first.
+4. Tap on near and far objects: `focus: sweep` lines, picture sharp. Shutter: a photo; open it in Photos.
+5. Leave the preview on for 2 minutes: footprint flat, no `low swap`.
+6. Undo for parts: Metal back in mediaserverd: write `* -backboardd` in `/var/db/negronimetal/clients`, keep the first line. All: `camera=0`, or `CAMERA=0` root.

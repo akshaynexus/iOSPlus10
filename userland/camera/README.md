@@ -70,6 +70,8 @@ scripts/camera/check-cache.sh            # needs ipsw and out/dsc/cache/dyld_sha
 factory, without the hook functions, or with entitlements. It signs ad hoc (no entitlements; the AMFI stand-in
 treats signed files on the root as platform code, patch 0221). `PREVIEW_BIN=1` makes the scaler outputs full size.
 
+Mi A3 (2026-11-01, `docs/laurel_sprout/camera.md` section 10): `camera_still.c` (5x5 demosaic, finish), `camera_isp_int.h`, focus from the frames' range, `NEGRONICAM_MODE` for the photograph, tuning file per rear module; hook 9 is optional.
+
 ## Hooks (20H392, cache UUID 8F970452-C9E3-3E88-B114-FEB1864BC9E0, base 0x180000000)
 
 [V `scripts/camera/check-cache.sh`, PASS 2026-10-27]

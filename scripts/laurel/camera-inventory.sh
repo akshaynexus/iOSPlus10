@@ -19,6 +19,8 @@ mkdir -p "$D/lib" "$D/etc"
 
 if [ -d "$VENDOR" ]; then
   cp "$VENDOR"/libmmcamera_laurus_*.so "$D/lib/" 2>/dev/null || true
+  cp "$VENDOR"/libactuator_dw9800.so "$VENDOR"/libactuator_laurus_dw9800w_qtech.so "$VENDOR"/libchromatix_laurus_imx586_*_common.so \
+    "$VENDOR"/libchromatix_laurus_imx586_*_default_preview*.so "$D/lib/" 2>/dev/null || true
   cp "$VENDOR"/camera_config.xml "$D/etc/" 2>/dev/null || true
 else
   command -v debugfs >/dev/null || die "missing debugfs (e2fsprogs)"
@@ -31,7 +33,8 @@ else
       simg2img "$VENDOR" "$raw"
     fi
   fi
-  names=$(debugfs -R "ls -p /lib" "$raw" 2>/dev/null | awk -F/ '{print $6}' | grep -E '^libmmcamera_laurus_.*\.so$' || true)
+  # laurel 2773: + the rear lens motor's libraries and the rear modules' tuning (scripts/laurel/camera-tuning.py)
+  names=$(debugfs -R "ls -p /lib" "$raw" 2>/dev/null | awk -F/ '{print $6}' | grep -E '^(libmmcamera_laurus_.*|libactuator_dw9800|libactuator_laurus_dw9800w_qtech|libchromatix_laurus_imx586_(sunny|qtech)_(common|default_preview|default_preview_dw9800w))\.so$' || true)
   [ -n "$names" ] || die "no /lib/libmmcamera_laurus_*.so in $VENDOR"
   for n in $names; do debugfs -R "dump /lib/$n $D/lib/$n" "$raw" >/dev/null 2>&1; done
   debugfs -R "dump /etc/camera/camera_config.xml $D/etc/camera_config.xml" "$raw" >/dev/null 2>&1 || true

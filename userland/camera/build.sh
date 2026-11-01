@@ -27,7 +27,7 @@ mkdir -p "$B" "$W/host"
 
 "$ICC" -arch arm64 -isysroot "$SDK" -mios-version-min=$MINOS $CFLAGS -fblocks -bundle \
   -framework CoreFoundation -framework CoreMedia -framework CoreVideo -lobjc \
-  "$HERE/media_hooks.c" "$HERE/camera_device.c" "$HERE/camera_isp.c" -o "$B/NegroniCamera"
+  "$HERE/media_hooks.c" "$HERE/camera_device.c" "$HERE/camera_isp.c" "$HERE/camera_still.c" -o "$B/NegroniCamera"
 cp "$HERE/Info.plist" "$B/Info.plist"
 plutil -lint "$B/Info.plist" >/dev/null
 
@@ -60,7 +60,7 @@ if codesign -d --entitlements - "$B" 2>/dev/null | grep -q '<key>'; then echo "t
 (cd "$W/ios" && shasum -a 256 NegroniCamera.driver/NegroniCamera NegroniCamera.driver/Info.plist > SHA256SUMS)
 
 # host: the ISP code on macOS (the same sources): a self test and the dump renderer
-clang -O2 -Wall -Wextra -Wno-unused-parameter -I"$HERE" "$HERE/isp-host.c" "$HERE/camera_isp.c" -o "$W/host/isp-render"
+clang -O2 -Wall -Wextra -Wno-unused-parameter -I"$HERE" "$HERE/isp-host.c" "$HERE/camera_isp.c" "$HERE/camera_still.c" -o "$W/host/isp-render"
 "$W/host/isp-render" --selftest > "$W/host/isp-selftest.txt"
 cat "$W/host/isp-selftest.txt"
 

@@ -8,12 +8,14 @@
 #   (independent Python reading of the same layout), byte for byte.
 # Step 3 + 4 (patch 2772: laurel_cam_dev.h; userland/camera): tools/laurel-cam-test/cam3_test.c, a mock NCFRAME1 client with the
 #   client's own header (negronicam.h, layout compared at compile time) and ISP: session numbers, ring, limits, AE, colours, preview.
+# Quality (patch 2773): tools/laurel-cam-test/cam4_test.c.
 # The headers come from the patches (new files there), so the test checks exactly the code in the kernel.
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 P1=$REPO/patches/laurel/xnu/2770-laurel-camera.patch
 P2=$REPO/patches/laurel/xnu/2771-laurel-camera-rdi.patch
 P3=$REPO/patches/laurel/xnu/2772-laurel-camera-dev.patch
+P4=$REPO/patches/laurel/xnu/2773-laurel-camera-quality.patch
 D=$OUT/laurel-cam-test
 rm -rf "$D"
 mkdir -p "$D"
@@ -29,6 +31,9 @@ take "$P1" laurel_cam_core.h
 take "$P2" laurel_cam_lib.h
 take "$P2" laurel_cam_rdi.h
 take "$P3" laurel_cam_dev.h
+take "$P4" laurel_cam_mode.h
+# 2773 changes laurel_cam_dev.h of 2772: its part of the patch on the copy
+awk '/^diff -ruN a\/bsd\/dev\/laurel_cam_dev\.h /{p=1; print; next} /^diff /{p=0} p' "$P4" | (cd "$D" && patch -s -p3 laurel_cam_dev.h)
 ${CC:-cc} -O2 -Wall -Wextra -Werror -I"$D" -o "$D/cam_test" "$REPO/tools/laurel-cam-test/cam_test.c"
 "$D/cam_test" "$OUT/laurel/camera/sensors.txt"
 ${CC:-cc} -O2 -Wall -Wextra -Werror -I"$D" -o "$D/cam2_test" "$REPO/tools/laurel-cam-test/cam2_test.c"
@@ -45,6 +50,10 @@ for f in "$OUT"/laurel/camera/lib/libmmcamera_laurus_imx58*.so; do
 done
 [ "$n" -gt 0 ] || echo "cam-test: no stock libraries in out/laurel/camera/lib (camera-inventory.sh): table comparison skipped"
 ${CC:-cc} -O2 -Wall -Wextra -Wno-unused-parameter -I"$D" -I"$REPO/userland/camera" -o "$D/cam3_test" \
-  "$REPO/tools/laurel-cam-test/cam3_test.c" "$REPO/userland/camera/camera_isp.c" -lm
+  "$REPO/tools/laurel-cam-test/cam3_test.c" "$REPO/userland/camera/camera_isp.c" "$REPO/userland/camera/camera_still.c" -lm
 "$D/cam3_test"
+# Quality (patch 2773: laurel_cam_mode.h; userland/camera/camera_still.c): real frame rates of all modes, lens motor library, 5x5 demosaic, finish, tuning file
+${CC:-cc} -O2 -Wall -Wextra -Wno-unused-parameter -I"$D" -I"$REPO/userland/camera" -o "$D/cam4_test" \
+  "$REPO/tools/laurel-cam-test/cam4_test.c" "$REPO/userland/camera/camera_isp.c" "$REPO/userland/camera/camera_still.c" -lm
+"$D/cam4_test" "$OUT/laurel/camera/lib"
 echo "cam-test: OK"

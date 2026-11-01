@@ -77,6 +77,8 @@ struct isp {
 	float           wb[3];          /* the white balance's gains, green 1 */
 	float           digital;        /* more gain, for what AE cannot reach with the sensor's */
 	float           zoom;           /* the picture is the middle 1/zoom of the sensor each way (1: the whole of it) */
+	float           lsc_u, lsc_v;   /* the part of the sensor's width and height the frame shows, for the lens shading (0: all) */
+	uint32_t        asked_frames;   /* frames since AE last asked (a change the kernel clamped never shows: it stops waiting) */
 	bool            turned;         /* the picture turned half round (a sensor mounted the other way up) */
 	float           ccm[3][3];      /* the colour matrix, camera RGB (white balanced) to linear sRGB; rows sum to 1 */
 	struct isp_lsc  lsc;
@@ -133,6 +135,15 @@ void isp_scale_nv12(const uint8_t *rgb, uint32_t cw, uint32_t ch, uint8_t *y, si
 void isp_render_still_nv12(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, uint8_t *y,
     size_t y_stride, uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row,
     bool video_range);
+/* camera_still.c: one sensor line through the 5x5 demosaic (Malvar, He, Cutler), lens-shaded before the colours are made, as 8-bit R, G, B */
+void isp_mhc_row(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, uint32_t row, float *lines[5], int32_t tags[5],
+    uint8_t *rgb);
+/*
+ * camera_still.c: the finish of a picture, rows first_row to end_row of an NV12 picture: chroma noise down (3-tap each way, more with more
+ * gain) and luma sharpened with a coring that grows with the gain. Each row's filter reads its neighbours in place: fine at the seams of pieces.
+ */
+void isp_finish_rows(uint8_t *y, size_t y_stride, uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row,
+    uint32_t end_row, float gain, bool still);
 void isp_render_full_nv12(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
     uint8_t *uv, size_t uv_stride, uint32_t first_row, uint32_t end_row, bool video_range);
 /*
