@@ -9,7 +9,7 @@ use owly_awdl::frame::Frame;
 use owly_awdl::{Action, Channel, Config, Input, Ipv6Packet, MacAddr, Node, Presence, RadioConstraints, Time};
 
 use crate::ctl::{self, Ctl};
-use crate::run::{End, everyone, say, set_proof};
+use crate::run::{End, everyone, if_up_body, modem_stopped, say, set_proof};
 
 const MSG_STOP: u8 = 2;
 const MSG_TX_MGMT: u8 = 3;
@@ -39,7 +39,13 @@ fn transmit(ctl: &Ctl, frame: Frame, at: Time, node: &Node, now: Time, held: &mu
     }
 }
 
-pub(crate) fn run_node(ctl: &Ctl, mac: MacAddr, host: &str, freq: u16, share: bool, before: Proof) -> End {
+pub(crate) fn run_node(ctl: &Ctl, mac: MacAddr, host: &str, freq: u16, share: bool, before: Proof, typed: bool) -> End {
+    let end = node_loop(ctl, mac, host, freq, share, before, typed);
+    ctl::if_down(); // no radio under awdl0 now; the next session brings it up
+    end
+}
+
+fn node_loop(ctl: &Ctl, mac: MacAddr, host: &str, freq: u16, share: bool, before: Proof, typed: bool) -> End {
     let channel = Channel(owly_channel(freq));
     let presence = if share { Presence::Share } else { Presence::Fixed };
     let mut cfg = Config::new(mac, host, RadioConstraints { channel, presence });
@@ -136,7 +142,7 @@ pub(crate) fn run_node(ctl: &Ctl, mac: MacAddr, host: &str, freq: u16, share: bo
         // awdl0 only when AWDL has been heard: no frames, no interface
         if heard_any && !if_up {
             if_up = true;
-            match ctl.send(MSG_IF_UP, &mac.0).and_then(|()| ctl::ipv6_up()) {
+            match ctl.send(MSG_IF_UP, &if_up_body(mac, typed)).and_then(|()| ctl::ipv6_up()) {
                 Ok(()) => say("on: awdl0 up with its link-local address"),
                 Err(e) => {
                     say(&format!("off: awdl0: {e}"));
@@ -155,12 +161,11 @@ pub(crate) fn run_node(ctl: &Ctl, mac: MacAddr, host: &str, freq: u16, share: bo
             last_st = Instant::now();
             let st = ctl.status().unwrap_or_default();
             if st.fw_fatal != 0 {
-                say("off: the modem stopped while the AWDL vdev was on: Wi-Fi may be gone until the next boot");
-                return End::Fatal; // no proof: a `trying` state file stays
+                return modem_stopped(&st);
             }
             if !proved && epoch.elapsed() >= Duration::from_secs(policy::PROOF_S) {
                 proved = true;
-                set_proof(if share { Proof::SharedOk } else if before == Proof::SharedOk { Proof::SharedOk } else { Proof::AloneOk });
+                let _ = set_proof(if share || before == Proof::SharedOk { Proof::SharedOk } else { Proof::AloneOk });
             }
             if st.state != ctl::STATE_UP {
                 return End::Stop; // the kernel has ended it: en0 was first; it said so

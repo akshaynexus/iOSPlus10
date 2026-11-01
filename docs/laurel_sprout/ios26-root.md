@@ -1,0 +1,71 @@
+# Mi A3 iOS 26 root: HFS+ image, built on Linux
+
+Date: 2026-11-02. **Host only. This root has never booted. Nothing was written to a device.** Labels: [V] measured here, [I] inference, [U] unknown.
+
+```sh
+scripts/bg.sh ios26-root scripts/laurel/ios26-root.sh         # make laurel-ios26-root
+scripts/bg.sh ios26-again scripts/laurel/ios26-root-again.sh  # same bytes proof: build twice, third run must stop
+python3 -I scripts/laurel/ios26-root-spec.py --self-test      # the air hook, no donor files
+```
+
+Inputs: `DEV=n104ap` output of `scripts/ios26/fetch-os.sh`, `sysos-tree.sh`, `lower-userland.sh` (`ios26-userland.md` section 2). No sudo: read-only `apfs-fuse` mounts, `udisksctl` for the kernel mount. The negroni path is `scripts/ios26/root-macos.sh`; this build does not touch it.
+
+Output (Apple content, never in git): `~/op10-apple/ios26/23F84-n104ap/root/ios26-root.img`, `.manifest`, `report.txt`. Link: `out/ios26/root-n104ap`. Writing it to the phone is another step (`scripts/laurel/dual-boot.sh install`), and not done.
+
+## 1. Result [V]
+
+| Item | Value |
+|---|---|
+| Area | 32 GiB = 34,359,738,368 bytes (owner decision) |
+| Volume | Area minus 256 header blocks and 1,025 log blocks = **34,354,491,392 bytes** (`laurel_dualboot.h`, `SWEET_LOG_BLOCKS`). The extent table is in the ADT, not the area |
+| Real size on the host | About 18 GB (sparse) |
+| SHA-256 | `3e2eed0a099bc9c8eb08fcda3d94feaac12a09f0ba30c6c8863dde5d52f8bc22`, the same in three full builds (the last one after the air hook went into the spec script, an input of the build). A run with no change stops at "inputs unchanged" |
+| Content | 237,286 files, 2,705 symlinks, 231,112 folders, 17,510 MiB |
+| Free for `/private/var` | 14,253 MiB. `/private/var` is in the same volume |
+| `op10tool hfs-verify` | 237,286 SHA-256 match; extents do not overlap; bitmap exact |
+| `fsck.hfsplus -f -n` | OK. Only the known line "Volume header needs minor repair", which a fresh `mkfs.hfsplus -J` also gives |
+| Real kernel read-only mount | 471,103 of 471,103 entries: type, mode, size or target. 0 extra, 0 differ. Owner is forced by the mount, so `hfs-verify` checks owner in the catalog |
+| Layout | 11 of 11 paths |
+| SHA-256 through the mount | 85 cache files, launchd, dyld, launchd.plist, 3,000 sample files: 5,124 MiB, 0 differ |
+| Trust data | 7,090 entries, 3,490 new from the lowering, 56 with no original attribute. **The kernel does not read this file**: trust caches are off, built-in AMFI marks each signed file of the root |
+
+## 2. Layout
+
+| Path | Content |
+|---|---|
+| `/` | OS volume |
+| `/private/preboot/Cryptexes/OS`, `/App` | SystemOS and AppOS volumes |
+| `/System/Library/Caches/com.apple.dyld` | The lowered cache, real files. dyld looks here when libignition is skipped (kernel: `dyld_flags` 0x8) |
+| `/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld` | Symlink to the above (iOS 16: hard links) |
+| A file only in a cryptex | Symlink at its root path. A path under a symlink of the OS volume is skipped: the root path works already |
+
+The writer (`tools/op10tool/src/hfs.rs`) makes HFSX with journal flags set, so XNU makes the journal at mount. No hard links: a file with more than one APFS link becomes one copy per path. Extended attributes are not copied, as `rsync -aH` on iOS 16. Names are decomposed UTF-16, `:` stored as `/`.
+
+Same inputs, same bytes: the build hashes the spec, the changed files and each lowered file. A read that gets EIO from `apfs-fuse` under load tries again.
+
+## 3. Tweaks: audit per item
+
+`report.txt` and `/usr/share/laurel/ios26-root-audit.txt` have one line per item: `applied`, `kept`, `not-found` or `built`, with the reason.
+
+- launchd: `_PanicOnCrash` renamed in 9 jobs; CommCenter, the iOS 16 list, aned and three programs dropped; `CA_HEARTBEAT_RATE` 60 [U on 26]; `launchd.plist.sig` kept (it does not match, the same as the iOS 16 root that boots); cryptexd kept [U].
+- Containers, logd stores, plain system keybag, InterfaceNamer 10 s, MediaToolbox, jetsam widget limit: applied.
+- Preferences: key names of iOS 16; each marked [U] where 26 was not read.
+- `activation data ark`: **not-found**. The 23F84 OS volume has no mobileactivationd system container. The kernel path stays; enough on 26: [U].
+
+Not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, metal2vulkan, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils, SSH.
+
+## 4. AirDrop and AirPlay hook
+
+`ios26-root-spec.py` function `air()` calls `scripts/laurel/root-air-ios26.sh STAGE` (branch `t3/laurel-ios26-airdrop`, not merged here).
+
+- This build has no writable mount. So the script runs on a stage with the launchd.plist of this tree. What it leaves goes into the image, owner 0:0. A job it took out loses its plist too.
+- The script is not in the tree: no change, same bytes. So the image above has none of these parts.
+- The script fails (for example its binaries are not built): the root builds without them, with an audit line `off`.
+
+Tests [V]: `--self-test` 10 of 10 with a stand-in script (files, owners, a removed job, a failure, a missing script). The real script of `origin/t3/laurel-ios26-airdrop` on the real launchd.plist with `AWDL=0 AIRPLAY=0` gave 3 files, 677 jobs before and after. **With the switches on it was not run:** `out/laurel/awdl` and `out/laurel/airplay` are not built on this host.
+
+After the merge: build those binaries, then `FORCE=1 scripts/laurel/ios26-root.sh`. The image changes, and the proof of section 1 must run again.
+
+## 5. What is not proven
+
+Boot. launchd, dyld, AMFI, wifid and every other process accepting this root. That XNU's journal start on the phone accepts these flags: the Linux kernel mount proves the catalog, read-only, and not the XNU write path.

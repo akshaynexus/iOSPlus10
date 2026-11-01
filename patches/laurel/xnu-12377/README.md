@@ -14,6 +14,8 @@ order. A driver fix lands once. Nothing of 8796 is copied. Build: `scripts/laure
    `applied`, `applied+rules(N)`, `base: ...`, `skipped: REASON`, `ERROR: ...`. Any `ERROR` stops the build.
 4. **Post**: `post/9000-series-12377-api.patch`: 12377 API of files that the series creates, and the features below.
 
+`stage/0090-stage-a64emu.sh` copies the EL0 emulator from `tools/laurel-a64emu` (the same files as the host test `scripts/laurel/test-a64emu.sh`); the build stamp counts them. Edit them there, not in the tree.
+
 ## Where the differences live
 
 | Place | What |
@@ -41,3 +43,5 @@ a normal series patch on these files; both kernels get it, and no rule is needed
 
 `patches/xnu-12377/0001` has UniXNU-ios26 code (BSD-2-Clause-Patent, THIRD_PARTY_NOTICES.md). xnu changes: APSL 2.0. No Apple binary, KDK
 header or kernelcache is in git: they stay in `out/` and `~/op10-apple/`.
+
+Host tests of what lives in `post/9000`: `scripts/laurel/test-a64emu.sh` (emulator), `scripts/laurel/test-slide.sh` (slide on 4 KiB pages), `scripts/laurel/test-apple80211.sh` (23F84 Apple80211).

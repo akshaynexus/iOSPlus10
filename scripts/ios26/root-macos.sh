@@ -1,4 +1,5 @@
 #!/bin/bash
+# Mi A3: scripts/laurel/ios26-root.sh (works, Linux). This file stays for negroni.
 # STUB (written, never run): the iOS 26.5.2 (23F84, iPhone12,3 donor) root for negroni, HFS+ like the iOS 16 root
 # (scripts/ios16/root-macos.sh). Same layout idea: OS volume at /, SystemOS cryptex at
 # /private/preboot/Cryptexes/OS, AppOS cryptex at /private/preboot/Cryptexes/App, dyld shared cache hard-linked

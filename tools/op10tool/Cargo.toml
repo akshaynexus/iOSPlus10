@@ -19,6 +19,7 @@ rayon = "1.12.0"
 sha1_smol = "1"
 sha2 = "0.10"
 simple_asn1 = "0.6.4"
+unicode-normalization = "0.1"
 ureq = "2"
 zip = { version = "9.1.0", default-features = false, features = ["deflate-flate2"] }
 

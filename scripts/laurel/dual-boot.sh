@@ -210,7 +210,8 @@ size)
   "$TOOL" dualboot size --help >/dev/null
   case "${1:-ios26}" in
   ios26)  # iPhone12,1 23F84, the owner's donor. Decrypted image sizes as they are on disk (~/op10-apple/ios26/23F84-n104ap/os, 2026-11-02): OS, SystemOS, AppOS. EXPAND: root bytes per donor byte on the iOS 16 root
-    "$TOOL" dualboot size --donor-bytes "${DONOR_BYTES:-8409579520,5221908480,14680064}" --expand "${EXPAND:-1.68}" --var-gib "${VAR_GIB:-8}" ;;
+    # owner decision 2026-11-02: the iOS area is 32 GiB (30 % of userdata), so allocate 32. The volume is the area minus the header and log blocks.
+    "$TOOL" dualboot size --donor-bytes "${DONOR_BYTES:-8409579520,5221908480,14680064}" --expand "${EXPAND:-1.68}" --var-gib "${VAR_GIB:-8}" --area-gib "${AREA_GIB:-32}" ;;
   ios16)  # the existing root: 16 GiB HFS+ volume, 12010 MiB used, on the phone as it is
     "$TOOL" dualboot size --donor-bytes $((16 << 30)) --expand 1 --var-gib 0 ;;
   *) die "size: ios16 or ios26" ;;

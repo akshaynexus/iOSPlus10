@@ -202,6 +202,28 @@ awdl_radio_tests(void)
 		CHECK(lw_ar_ble_airdrop(adv, sizeof(adv)));
 		CHECK(!lw_ar_ble_airdrop(other, sizeof(other)) && !lw_ar_ble_airdrop(cmd, sizeof(cmd)) && !lw_ar_ble_airdrop(adv, 3));
 	}
+	/* en0 first in the queues that both use: WMIQ_LEN 8, TX_SLOTS 128 */
+	CHECK(lw_ar_wmi_room(0, 8) && lw_ar_wmi_room(3, 8) && !lw_ar_wmi_room(4, 8) && !lw_ar_wmi_room(8, 8));
+	CHECK(lw_ar_tx_room(63, 128, true) && !lw_ar_tx_room(64, 128, true));
+	CHECK(lw_ar_tx_room(111, 128, false) && !lw_ar_tx_room(112, 128, false));
+	/* no scan begins while the vdev starts; a running cell does not hold scans */
+	CHECK(lw_ar_holds_scan(LW_AR_CREATED) && lw_ar_holds_scan(LW_AR_PEERED) && lw_ar_holds_scan(LW_AR_STARTING));
+	CHECK(!lw_ar_holds_scan(LW_AR_OFF) && !lw_ar_holds_scan(LW_AR_UP) && !lw_ar_holds_scan(LW_AR_STOPPING) && !lw_ar_holds_scan(LW_AR_DELETING));
+	/* a data frame: en0's stays en0's in every state; vdev 1's never reaches en0's IP stack */
+	{
+		uint8_t en0_frame[32] = { 0x08, 0x02 };   /* From DS, an AP's */
+		uint8_t cell[32] = { 0x08, 0x00 };
+
+		memcpy(cell + 16, bssid, 6);
+		for (uint32_t st = LW_AR_OFF; st <= LW_AR_DELETING; st++) {
+			CHECK(lw_ar_data_route(st, 0, en0_frame, 32) == LW_AR_TO_EN0);
+			CHECK(lw_ar_data_route(st, 1, en0_frame, 32) == (st == LW_AR_UP ? LW_AR_TO_DAEMON : LW_AR_TO_NOBODY));
+		}
+		CHECK(lw_ar_data_route(LW_AR_UP, 0, cell, 32) == LW_AR_TO_DAEMON);
+		CHECK(lw_ar_data_route(LW_AR_STOPPING, 0, cell, 32) == LW_AR_TO_NOBODY);
+		CHECK(lw_ar_data_route(LW_AR_OFF, 0, cell, 32) == LW_AR_TO_EN0);   /* as before the radio: en0's own filters decide */
+	}
+	CHECK(LW_AR_IF_TYPED == 1);
 	memset(t, 0, sizeof(t));
 	CHECK(lw_ar_peer_find(t, mac) == -1 && lw_ar_peer_free(t) == 0);
 	memcpy(t[0].mac, mac, 6);

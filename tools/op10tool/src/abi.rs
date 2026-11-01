@@ -15,6 +15,7 @@ const CLIENTS: &[&str] = &[
     "IOSurface.framework/IOSurface",
     "IOSurfaceAccelerator.framework/IOSurfaceAccelerator",
     "IOMobileFramebuffer.framework/IOMobileFramebuffer",
+    "IO80211.framework/IO80211",
     "libaks",
     "AppleKeyStore",
     "MobileKeyBag.framework/MobileKeyBag",

@@ -152,6 +152,8 @@ Order of `switch`, each step with its real exit code:
 
 The HFS+ size is `SIZE=` of root.sh; the area must be >= volume + 1 MiB header + 4 MiB + 4 KiB log (both tools refuse less).
 
+**Owner decision 2026-11-02: the iOS area is 32 GiB (30 % of userdata), not 30.01 GiB.** `CONFIRM=allocate dual-boot.sh allocate 32` = 34,359,738,368 bytes = 8,388,608 blocks. Off it: 256 header blocks (`LDB_RESERVED_BLOCKS`, 1 MiB) and 1025 log blocks (`LOG_BLOCKS`, 4 MiB + 4 KiB, `SWEET_LOG_BLOCKS`). **HFS+ volume: 34,354,491,392 bytes**, `dual-boot.sh size ios26`. The extent table is not in the area: it is in the ADT `/chosen laurel-dualboot`. `/private/var` is no separate volume: it is the free space of the one volume, measured in `ios26-root.md`. The 21.4 GiB estimate above was high: the real root data is in `ios26-root.md`.
+
 The one area holds one root. iOS 26 later = `remove`, `allocate` again, new table, new boot image.
 
 **Fallback if pinned files fail on the phone:** decision D4: shrink userdata. It needs a GPT write and an Android wipe. No script exists for it.

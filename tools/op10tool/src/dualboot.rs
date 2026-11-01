@@ -333,9 +333,21 @@ pub fn size_plan(donor: &[u64], expand: f64, var_gib: u64) -> (u64, u64, u64) {
     (root, hfs_gib, area.div_ceil(2 << 20) * (2 << 20))
 }
 
-pub fn size(donor: &[u64], expand: f64, var_gib: u64) -> Result<()> {
+/// The largest HFS+ volume in an area of this many GiB: the area without the 1 MiB header blocks and the console log. The table is not in the area: it is in the ADT.
+pub fn volume_in_area(area_gib: u64) -> u64 {
+    ((area_gib << 30) / B - RESERVED_BLOCKS - LOG_BLOCKS) * B
+}
+
+pub fn size(donor: &[u64], expand: f64, var_gib: u64, area_gib: Option<u64>) -> Result<()> {
     ensure!(!donor.is_empty() && expand >= 1.0, "give --donor-bytes and an --expand of at least 1");
     let (root, hfs_gib, area) = size_plan(donor, expand, var_gib);
+    if let Some(a) = area_gib {
+        let v = volume_in_area(a);
+        println!("area {a} GiB = {} bytes: {RESERVED_BLOCKS} header blocks, {LOG_BLOCKS} log blocks -> HFS+ volume {v} bytes (SIZE={v})", a << 30);
+        println!("root files about {:.1} GiB ({} donor images x {expand}); /private/var gets the rest of the volume, about {:.1} GiB [I]", root as f64 / (1u64 << 30) as f64, donor.len(), (v.saturating_sub(root)) as f64 / (1u64 << 30) as f64);
+        ensure!(v >= root + (var_gib << 30), "{a} GiB does not hold the root and {var_gib} GiB for /private/var");
+        return Ok(());
+    }
     println!("root files about {:.1} GiB ({} donor images x {expand}), + {var_gib} GiB for /private/var -> HFS+ volume SIZE={hfs_gib}G", root as f64 / (1u64 << 30) as f64, donor.len());
     println!("area bytes {area} ({:.2} GiB): volume + 1 MiB header + 4 MiB console log, whole f2fs segments", area as f64 / (1u64 << 30) as f64);
     Ok(())
@@ -441,6 +453,13 @@ mod tests {
         assert!(area < (31 << 30));
         // bigger margin, bigger area: the parameter works
         assert!(size_plan(&[1 << 30], 1.5, 16).1 > size_plan(&[1 << 30], 1.5, 8).1);
+    }
+    #[test]
+    fn owner_area_32_gib() {
+        // owner decision: 32 GiB; 256 header + 1025 log blocks of 4096 bytes come off
+        assert_eq!(volume_in_area(32), (32u64 << 30) - (256 + 1025) * 4096);
+        assert_eq!(volume_in_area(32), 34354491392);
+        assert_eq!(volume_in_area(32) % 4096, 0);
     }
     #[test]
     fn usable_excludes_header_and_log() {
