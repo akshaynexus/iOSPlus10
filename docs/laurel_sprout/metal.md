@@ -256,4 +256,5 @@ Measured 2026-11-01 06:30 (gpu-upstream-opt: metal2vulkan 219f013, Turnip 0101+0
 | bridge staticlib (thin LTO, 4 CGUs, target-cpu cortex-a53) | 364 MB | 293 MB | 129 s rebuild |
 | NegroniMetal (stripped, in the bundle) | 26 834 768 bytes | 22 878 464 bytes | -15 %; dSYM `out/metal/NegroniMetal.dSYM` 206 MB |
 | m2vtest | 22 467 280 bytes | 21 498 656 bytes | |
+| metal2vulkan A/B, QuartzCore default.metallib (141 functions, vk12-floor profile, `scripts/metal/m2v-ab.sh`) | f6a96b7d: 117 translated (kernel 3/7, vertex 39/39, fragment 75/95), SPIR-V 1 906 384 bytes, 4.4 s | 219f013: 117 translated (same split), SPIR-V **788 556 bytes (-58.6 %)**, 4.2 s | same coverage, far less code for ir3 to compile and run [I: per-pixel cost follows the instruction count] |
 | check | PASS | PASS: 0102 in the tree; 8 Mach-O, minos 16.0, 0 instructions newer than ARMv8.0; import check vs 20H392 PASS (0 missing) | |

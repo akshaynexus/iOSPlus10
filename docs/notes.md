@@ -4073,6 +4073,9 @@ Details: `docs/laurel_sprout/battery-power.md`.
   inside the root staging dir; `gpu_dsym` now moves it to out/laurel/gpu/dsym.
 - [V] `scripts/laurel/armv80-check.py` (all post-v8.0 classes, self-test): 0 in every user-space binary; on the kernel it
   counts 21 decodes in the K256 SHA table (data in __text), so the kernel keeps its own LSE check.
+- [V scripts/metal/m2v-ab.sh] QuartzCore metallib, vk12-floor: f6a96b7d and 219f013 both translate 117/141; SPIR-V
+  1 906 384 -> 788 556 bytes (-58.6 %). The 20H392 metallibs are in the OS image 087-86698-044.dmg (apfs-fuse, read-only),
+  not in the SystemOS cryptex 087-86593-047.dmg (that one has the dyld cache).
 - [V] metal2vulkan's cache defaults are a 256 MiB memo per process and 25 GiB on disk; flame/0018 + metal-env.sh cap them at
   32 MiB / 1 GiB for the Mi A3 (negroni unchanged).
 
