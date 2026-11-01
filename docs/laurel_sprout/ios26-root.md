@@ -19,7 +19,7 @@ Output (Apple content, never in git): `~/op10-apple/ios26/23F84-n104ap/root/ios2
 | Area | 32 GiB = 34,359,738,368 bytes (owner decision) |
 | Volume | Area minus 256 header blocks and 1,025 log blocks = **34,354,491,392 bytes** (`laurel_dualboot.h`, `SWEET_LOG_BLOCKS`). The extent table is in the ADT, not the area |
 | Real size on the host | About 18 GB (sparse) |
-| SHA-256 | `3e2eed0a099bc9c8eb08fcda3d94feaac12a09f0ba30c6c8863dde5d52f8bc22`, the same in two full builds; the third run stops at "inputs unchanged" |
+| SHA-256 | `3e2eed0a099bc9c8eb08fcda3d94feaac12a09f0ba30c6c8863dde5d52f8bc22`, the same in three full builds (the last one after the air hook went into the spec script, an input of the build). A run with no change stops at "inputs unchanged" |
 | Content | 237,286 files, 2,705 symlinks, 231,112 folders, 17,510 MiB |
 | Free for `/private/var` | 14,253 MiB. `/private/var` is in the same volume |
 | `op10tool hfs-verify` | 237,286 SHA-256 match; extents do not overlap; bitmap exact |

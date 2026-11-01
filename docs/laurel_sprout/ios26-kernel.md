@@ -13,10 +13,10 @@ Series method and work flow: [`patches/laurel/xnu-12377/README.md`](../../patche
 |---|---|
 | Output | `out/laurel-kernel-ios26/out/kernel.ios26.development.sweet.4k` (+ `.unstripped`, `.stamp`, `SHA256SUMS`, `series-report.txt`) |
 | `file` | `Mach-O 64-bit arm64 executable, flags:<NOUNDEFS\|PIE>` |
-| Size | 20,104,248 bytes (unstripped 25,344,192) |
-| SHA-256 | `e9c14c5e7219dd9b1571e0c2d4ca24bbc45f7aee89d545d87f7066bed4b83b1b` |
+| Size | 20,157,632 bytes (unstripped 25,402,832), at commit 7d428f2 |
+| SHA-256 | `5b4698bbcee921f4c0b2d7a16117bdb639651cee61e82cbb107f696f817c9723` at commit 7d428f2 (the stamp holds the commit, so each commit gives a new hash) |
 | Link base | `0xfffffff007004000`, plain arm64, 0 chained rebases (`mkdarwinboot.py`) |
-| Stamp | `LAUREL BUILD: 18661e6c55 315 patches, series bd0958b2d49e5a2e, ios26_4k` (309 + base 5 + post 1) |
+| Stamp | `LAUREL BUILD: 7d428f2f03 316 patches, series 754cb97ce57373ad, ios26_4k` (309 + 7: base, post and stage files of `patches/laurel/xnu-12377`) |
 | Clean run | 66 s, 20 cores, clang 23.1.4; `build.log`: 0 `linker command failed` |
 | LSE/RCpc check (`kernel-linux.sh` regex) | `LSE/RCpc instructions in the kernel: 0` |
 | `armv80-check.py` | `0 instructions newer than ARMv8.0` (with `--data-syms`: 22 data words decode as instructions, under K256, lz4 and panic strings; the iOS 16 kernel has 21 under the same symbols) |
