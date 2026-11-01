@@ -1,0 +1,410 @@
+laurel 2156: one lock and hard rules for the GPU pool (TopazAdreno.cpp, 2150). Panic 2026-11-01 06:50:38 (first GL boot to the lock screen): gemNew's bzero took a translation fault at pool + 0x4000000, the end of the first 64 MiB chunk; the buffer was pool + 0x3f40000, 0x140000 bytes, from a free range pool + 0x3f40000 size 0x160000 (registers x12/x14/x13 in topaz_gpu_pool_alloc's range_alloc: entry 6 of 14) that crossed the chunk and its guard unit. Cause: nothing serialized pool_free[]: gemNew takes pool memory with no lock held, IOSurface create and SweetSurface::free (also on the framebuffer presenter thread that lets shown frames go) take and give with no lock, RedwoodGPU frees under gGPULock; two CPUs in range_alloc/range_free tear a range (the host test shows it with the old code). Fix: the bookkeeping moves to laurel_gpu_pool_core.h (plain C, host test scripts/laurel/gpu-pool-test.sh) under one mutex (laurel_gpu_pool_lock; gpu_chunk_va mapping too); lgp_alloc never gives a buffer outside one chunk or on a guard unit (a bad range is passed over and counted); lgp_free takes back only a buffer that is out, with its exact size (a start-unit length table): twice, wrong size, unaligned, outside the pool, guard unit, across a chunk, inside a buffer = refused, counted, first 8 logged with the caller (`LAUREL GPU POOL: free of PA+SIZE refused (N so far): REASON; caller ADDR`), the free list unchanged; free ranges merge only inside one chunk. gemNew zeroes through topaz_gpu_pool_clear (the chunk map that covers the whole buffer, checked under the lock). RedwoodGPU's 5-s buffers line ends with `; GPU pool F of T MB free in R ranges, N frees refused, L lost, B bad ranges passed over`. With 2154 (stage-1 SMMU): its VA = PA frees (redwood_gpu_address_free, address >= 0x80000000) go through the same checked pool_give_back; its self-test unit (alloc + give back GPU_POOL_UNIT) is a valid buffer.
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index d3fa332..7dde98a 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -59,2 +59,4 @@ bool topaz_gpu_midmem(void);
+ void topaz_gpu_gl_opened(void);                 /* laurel 2150 (TopazAdreno.cpp): backboardd's GL has the GPU */
++bool topaz_gpu_pool_clear(uint64_t pa, uint64_t size);  /* laurel 2156: zeroed through the chunk map that covers it all */
++void topaz_gpu_pool_note(char * s, size_t n);   /* laurel 2156: the pool part of the buffers line */
+ bool redwood_gpu_parameter(uint32_t which, uint64_t * value);
+@@ -828,3 +830,8 @@ RedwoodGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		}
+-		bzero(va, (size_t) size);
++		/* laurel 2156: zeroed only through the chunk map that covers all of it (pool buffers never cross a chunk) */
++		if (!topaz_gpu_pool_clear(pa, size)) {
++			IOLog("RedwoodGPU: pool buffer %#llx+%#llx has no kernel map that covers it: not used\n", pa, size);
++			redwood_gpu_address_free(pa, size);     /* (back to the pool; refused and counted there if not the pool's) */
++			return kIOReturnNoMemory;
++		}
+ 		IOMemoryDescriptor * pm = topaz_gpu_pool_md(pa, size);
+@@ -1168,4 +1175,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		absolutetime_to_nanoseconds(gGPUStat.making, &making);
+-		IOLog("RedwoodGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept)\n", gGPUStat.made,
+-		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20);
++		char pool[160];
++
++		topaz_gpu_pool_note(pool, sizeof(pool));       /* laurel 2156 */
++		IOLog("RedwoodGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept); %s\n", gGPUStat.made,
++		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20, pool);
+ 		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index faa805c..7f391cd 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -203,52 +203,20 @@ static uint64_t gpu_pool_base, gpu_pool_size;   /* 0: no pool (not placed yet, o
+ #define GPU_POOL_SIZE       gpu_pool_size
+ static uint8_t *gpu_chunk_va[GPU_POOL_CHUNKS];
+ static bool gpu_pool_ready;
+-static struct { uint64_t start, size; } pool_free[2048];
+-static unsigned pool_free_count;
+-
+-static void
+-range_free(void *table, unsigned *count, unsigned max, uint64_t address, uint64_t size)
+-{
+-	struct r { uint64_t start, size; } *f = (struct r *)table;
+-	unsigned at;
+-
+-	for (at = 0; at < *count && f[at].start < address; at++) {
+-	}
+-	if (at > 0 && f[at - 1].start + f[at - 1].size == address) {
+-		f[at - 1].size += size;
+-		if (at < *count && address + size == f[at].start) {
+-			f[at - 1].size += f[at].size;
+-			memmove(&f[at], &f[at + 1], (--*count - at) * sizeof(f[0]));
+-		}
+-	} else if (at < *count && address + size == f[at].start) {
+-		f[at].start = address;
+-		f[at].size += size;
+-	} else if (*count < max) {
+-		memmove(&f[at + 1], &f[at], (*count - at) * sizeof(f[0]));
+-		(*count)++;
+-		f[at].start = address;
+-		f[at].size = size;
+-	}
+-}
+-
+-static uint64_t
+-range_alloc(void *table, unsigned *count, uint64_t size)
+-{
+-	struct r { uint64_t start, size; } *f = (struct r *)table;
+-
+-	for (unsigned i = 0; i < *count; i++) {
+-		if (f[i].size >= size) {
+-			uint64_t address = f[i].start;
+-			f[i].start += size;
+-			f[i].size -= size;
+-			if (f[i].size == 0) {
+-				memmove(&f[i], &f[i + 1], (--*count - i) * sizeof(f[0]));
+-			}
+-			return address;
+-		}
+-	}
+-	return 0;
+-}
++/*
++ * laurel 2156: the pool's bookkeeping is laurel_gpu_pool_core.h (host test: scripts/laurel/gpu-pool-test.sh), under
++ * one lock. Before, nothing serialized it: gemNew takes pool memory with no lock held, IOSurface create and
++ * SweetSurface::free (also on the framebuffer's presenter thread, which lets shown frames go) give and take with no
++ * lock, RedwoodGPU's frees run under gGPULock. Two CPUs in range_alloc/range_free at once can tear a free range (the
++ * start of one, the size of another): the 2026-11-01 06:50:38 panic had pool_free[6] = pool + 0x3f40000, size 0x160000
++ * (x12 = -0x8000 + 6 * 16, x14 = 0x20000 left after 0x140000), across the chunk end 0x4000000, and gemNew's bzero
++ * faulted at the boundary (no mapping of chunk 1 behind chunk 0's). Now: the lock, a free must be exactly a buffer
++ * that is out (else refused and counted), and an allocation never gives a buffer across a chunk.
++ */
++#include "laurel_gpu_pool_core.h"
++static struct lgp gpu_pool;
++LCK_GRP_DECLARE(laurel_gpu_pool_grp, "laurel_gpu_pool");
++LCK_MTX_DECLARE(laurel_gpu_pool_lock, &laurel_gpu_pool_grp);  /* gpu_pool, gpu_chunk_va, gpu_pool_ready; nothing else taken inside */
+ 
+ /*
+  * A descriptor for pool memory. The cache mode goes into the descriptor itself:
+@@ -283,22 +251,18 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 	uint64_t pa;
+ 
+ 	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
+-	if (size > GPU_POOL_CHUNK - GPU_POOL_UNIT || gpu_pool_size == 0) {
++	if (size == 0 || size > GPU_POOL_CHUNK - GPU_POOL_UNIT || gpu_pool_size == 0) {
+ 		return 0;
+ 	}
++	lck_mtx_lock(&laurel_gpu_pool_lock);
+ 	if (!gpu_pool_ready) {
+-		/* one range per chunk, a unit short so that neighbours never merge: no buffer crosses a chunk */
+-		for (uint64_t c = 0; c < gpu_pool_size / GPU_POOL_CHUNK; c++) {
+-			range_free(pool_free, &pool_free_count, 2048, GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT);
+-		}
++		/* one range per chunk, a unit short (the guard); lgp_fits keeps every buffer inside one chunk */
++		lgp_init(&gpu_pool, GPU_POOL_BASE, GPU_POOL_SIZE);
+ 		gpu_pool_ready = true;
+ 	}
+-	pa = range_alloc(pool_free, &pool_free_count, size);
+-	if (pa == 0) {
+-		return 0;
+-	}
++	pa = lgp_alloc(&gpu_pool, size);
+ 	unsigned c = (unsigned)((pa - GPU_POOL_BASE) / GPU_POOL_CHUNK);
+-	if (gpu_chunk_va[c] == NULL) {
++	if (pa != 0 && gpu_chunk_va[c] == NULL) {
+ 		/* in the kernel map, not the small IO submap ml_io_map uses (64 MB there failed) */
+ 		IOMemoryDescriptor *md = topaz_gpu_pool_md(GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK);
+ 		IOMemoryMap *map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+@@ -308,16 +272,62 @@ topaz_gpu_pool_alloc(uint64_t size, void **va)
+ 		if (gpu_chunk_va[c] == NULL) {
+ 			OSSafeReleaseNULL(map);
+ 			OSSafeReleaseNULL(md);
+-			range_free(pool_free, &pool_free_count, 2048, pa, size);
+-			return 0;
++			(void)lgp_free(&gpu_pool, pa, size);
++			pa = 0;
+ 		}
+ 	}
+-	if (va != NULL) {
++	if (pa != 0 && va != NULL) {
+ 		*va = gpu_chunk_va[c] + (pa - GPU_POOL_BASE - c * GPU_POOL_CHUNK);
+ 	}
++	lck_mtx_unlock(&laurel_gpu_pool_lock);
+ 	return pa;
+ }
+ 
++/*
++ * laurel 2156: zero a buffer that is out, through its chunk's kernel mapping (the one that covers all of it: lgp
++ * buffers never cross a chunk). false: [pa, pa + size) is not such a buffer, nothing is written.
++ */
++extern "C" bool topaz_gpu_pool_clear(uint64_t pa, uint64_t size);
++bool
++topaz_gpu_pool_clear(uint64_t pa, uint64_t size)
++{
++	uint64_t whole = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
++	uint8_t *chunk = NULL;
++	unsigned c = 0;
++
++	if (gpu_pool_size == 0 || size == 0) {
++		return false;
++	}
++	lck_mtx_lock(&laurel_gpu_pool_lock);
++	if (gpu_pool_ready && lgp_is_out(&gpu_pool, pa, whole)) {
++		c = (unsigned)((pa - GPU_POOL_BASE) / GPU_POOL_CHUNK);
++		chunk = gpu_chunk_va[c];
++	}
++	lck_mtx_unlock(&laurel_gpu_pool_lock);
++	if (chunk == NULL) {
++		return false;
++	}
++	bzero(chunk + (pa - GPU_POOL_BASE - (uint64_t)c * GPU_POOL_CHUNK), (size_t)size);
++	return true;
++}
++
++/* laurel 2156: for RedwoodGPU's buffers line: free memory, ranges, frees refused/lost, ranges passed over */
++extern "C" void topaz_gpu_pool_note(char *s, size_t n);
++void
++topaz_gpu_pool_note(char *s, size_t n)
++{
++	if (gpu_pool_size == 0) {
++		snprintf(s, n, "no GPU pool");
++		return;
++	}
++	lck_mtx_lock(&laurel_gpu_pool_lock);
++	snprintf(s, n, "GPU pool %llu of %llu MB free in %u ranges, %u frees refused, %u lost, %u bad ranges passed over",
++	    (gpu_pool_ready ? gpu_pool.free_bytes : gpu_pool_size) >> 20, gpu_pool_size >> 20,
++	    gpu_pool_ready ? gpu_pool.count : (unsigned)(gpu_pool_size / GPU_POOL_CHUNK), gpu_pool.refused, gpu_pool.lost,
++	    gpu_pool.skipped);
++	lck_mtx_unlock(&laurel_gpu_pool_lock);
++}
++
+ static void pool_give_back(uint64_t pa, uint64_t size);
+ extern "C" void topaz_gpu_pool_free(uint64_t pa, uint64_t size);
+ void
+@@ -326,12 +336,32 @@ topaz_gpu_pool_free(uint64_t pa, uint64_t size)
+ 	pool_give_back(pa, size);
+ }
+ 
+-static void
++/*
++ * laurel 2156: only a buffer that is out goes back (lgp_free); anything else is refused, counted (RedwoodGPU's
++ * buffers line) and, the first 8 times, logged with the caller (always inlined: the caller of
++ * topaz_gpu_pool_free / redwood_gpu_address_free; KASLR is off here, llvm-nm -n names it); the free list stays as it is.
++ */
++static inline __attribute__((always_inline)) void
+ pool_give_back(uint64_t pa, uint64_t size)
+ {
++	const char *why = "the pool has given nothing out";
++	uint32_t n;
++
+ 	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
+-	if (gpu_pool_size != 0 && pa >= GPU_POOL_BASE && pa + size <= GPU_POOL_BASE + GPU_POOL_SIZE) {
+-		range_free(pool_free, &pool_free_count, 2048, pa, size);
++	if (gpu_pool_size == 0) {
++		return;                         /* no pool (midmem): the memory is the kernel's */
++	}
++	lck_mtx_lock(&laurel_gpu_pool_lock);
++	if (gpu_pool_ready) {
++		why = lgp_free(&gpu_pool, pa, size);
++	} else {
++		gpu_pool.refused++;
++	}
++	n = gpu_pool.refused;
++	lck_mtx_unlock(&laurel_gpu_pool_lock);
++	if (why != NULL && n <= 8) {
++		IOLog("LAUREL GPU POOL: free of %#llx+%#llx refused (%u so far): %s; caller %p\n", pa, size, n, why,
++		    __builtin_return_address(0));
+ 	}
+ }
+ static char pool_why[128];
+diff --git a/iokit/Kernel/arm/laurel_gpu_pool_core.h b/iokit/Kernel/arm/laurel_gpu_pool_core.h
+new file mode 100644
+index 0000000..f8e872f
+--- /dev/null
++++ b/iokit/Kernel/arm/laurel_gpu_pool_core.h
+@@ -0,0 +1,171 @@
++/*
++ * laurel 2156: the GPU pool's bookkeeping (TopazAdreno.cpp), plain C, so that a host test builds exactly this
++ * file: scripts/laurel/gpu-pool-test.sh (tools/gpu-pool-test/). The caller holds the pool lock around every call
++ * (TopazAdreno.cpp: laurel_gpu_pool_lock). GPU_POOL_UNIT, GPU_POOL_CHUNK and GPU_POOL_MAX come from the includer.
++ *
++ * The kernel maps the pool chunk by chunk (GPU_POOL_CHUNK each, on first use). A buffer across two chunks has no
++ * kernel mapping past the boundary: gemNew's bzero took a translation fault there (2026-11-01 06:50:38, buffer at
++ * pool offset 0x3f40000 + 0x140000, fault at 0x4000000). Rules, checked on every call (the seeding alone is not
++ * trusted):
++ *   - a buffer is unit aligned, inside the pool, inside one chunk and off the chunk's last unit (the guard);
++ *   - a free must be exactly a buffer that the pool gave out and did not get back yet (start, size); anything else
++ *     is refused and counted, and the free list stays as it is;
++ *   - free ranges merge only inside one chunk.
++ */
++#ifndef LAUREL_GPU_POOL_CORE_H
++#define LAUREL_GPU_POOL_CORE_H
++
++#define LGP_RANGES      2048
++#define LGP_UNITS       (GPU_POOL_MAX / GPU_POOL_UNIT)
++
++struct lgp {
++	uint64_t base, size;                    /* the pool; size 0: none */
++	struct { uint64_t start, size; } range[LGP_RANGES];  /* free ranges, sorted by start, none on a guard unit */
++	unsigned count;
++	uint16_t len[LGP_UNITS];                /* units of the buffer that starts at this unit; 0: none starts here */
++	uint64_t free_bytes;
++	uint32_t refused;                       /* frees refused (not a buffer that is out) */
++	uint32_t lost;                          /* frees taken back but not kept: the free list was full */
++	uint32_t skipped;                       /* free ranges passed over by an allocation: the buffer would cross a chunk */
++};
++
++/* [pa, pa + size) may be a buffer: unit aligned, inside the pool, inside one chunk, off its guard unit */
++static inline bool
++lgp_fits(const struct lgp *p, uint64_t pa, uint64_t size)
++{
++	uint64_t off = pa - p->base;
++
++	return p->size != 0 && pa >= p->base && size != 0 && size <= p->size && off <= p->size - size &&
++	       ((off | size) & (GPU_POOL_UNIT - 1)) == 0 &&
++	       (off & (GPU_POOL_CHUNK - 1)) + size <= GPU_POOL_CHUNK - GPU_POOL_UNIT;
++}
++
++/* the index of the first free range that starts at or after pa */
++static inline unsigned
++lgp_find(const struct lgp *p, uint64_t pa)
++{
++	unsigned lo = 0, hi = p->count;
++
++	while (lo < hi) {
++		unsigned mid = (lo + hi) / 2;
++		if (p->range[mid].start < pa) {
++			lo = mid + 1;
++		} else {
++			hi = mid;
++		}
++	}
++	return lo;
++}
++
++/* a checked range into the free list, merged with its neighbours of the same chunk; false: the list is full */
++static inline bool
++lgp_insert(struct lgp *p, uint64_t pa, uint64_t size)
++{
++	unsigned at = lgp_find(p, pa);
++	bool prev = at > 0 && p->range[at - 1].start + p->range[at - 1].size == pa &&
++	    lgp_fits(p, p->range[at - 1].start, p->range[at - 1].size + size);
++	uint64_t start = prev ? p->range[at - 1].start : pa, len = (prev ? p->range[at - 1].size : 0) + size;
++	bool next = at < p->count && pa + size == p->range[at].start && lgp_fits(p, start, len + p->range[at].size);
++
++	if (prev && next) {
++		p->range[at - 1].size = len + p->range[at].size;
++		memmove(&p->range[at], &p->range[at + 1], (p->count - at - 1) * sizeof(p->range[0]));
++		p->count--;
++	} else if (prev) {
++		p->range[at - 1].size = len;
++	} else if (next) {
++		p->range[at].start = pa;
++		p->range[at].size += size;
++	} else if (p->count < LGP_RANGES) {
++		memmove(&p->range[at + 1], &p->range[at], (p->count - at) * sizeof(p->range[0]));
++		p->range[at].start = pa;
++		p->range[at].size = size;
++		p->count++;
++	} else {
++		return false;
++	}
++	p->free_bytes += size;
++	return true;
++}
++
++/* the pool [base, base + size): one free range per whole chunk, its last unit left out (the guard) */
++static inline void
++lgp_init(struct lgp *p, uint64_t base, uint64_t size)
++{
++	memset(p, 0, sizeof(*p));
++	if ((base & (GPU_POOL_CHUNK - 1)) != 0) {
++		return;                         /* (gpu_pool_place takes only chunk-aligned ranges) */
++	}
++	p->base = base;
++	p->size = (size > GPU_POOL_MAX ? GPU_POOL_MAX : size) & ~(uint64_t)(GPU_POOL_CHUNK - 1);
++	for (uint64_t c = 0; c < p->size / GPU_POOL_CHUNK; c++) {
++		(void)lgp_insert(p, base + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT);
++	}
++}
++
++/* a buffer of size bytes (whole units), first fit: its start, or 0. Never one that lgp_fits refuses. */
++static inline uint64_t
++lgp_alloc(struct lgp *p, uint64_t size)
++{
++	for (unsigned i = 0; i < p->count; i++) {
++		uint64_t pa = p->range[i].start;
++
++		if (p->range[i].size < size) {
++			continue;
++		}
++		if (!lgp_fits(p, pa, size) || p->len[(pa - p->base) / GPU_POOL_UNIT] != 0) {
++			p->skipped++;           /* a bad range (no longer made, see lgp_free): passed over, never handed out */
++			continue;
++		}
++		p->range[i].start += size;
++		p->range[i].size -= size;
++		if (p->range[i].size == 0) {
++			memmove(&p->range[i], &p->range[i + 1], (p->count - i - 1) * sizeof(p->range[0]));
++			p->count--;
++		}
++		p->len[(pa - p->base) / GPU_POOL_UNIT] = (uint16_t)(size / GPU_POOL_UNIT);
++		p->free_bytes -= size;
++		return pa;
++	}
++	return 0;
++}
++
++/* [pa, pa + size) is a buffer that is out (given by lgp_alloc, not back yet) */
++static inline bool
++lgp_is_out(const struct lgp *p, uint64_t pa, uint64_t size)
++{
++	return lgp_fits(p, pa, size) && (uint64_t)p->len[(pa - p->base) / GPU_POOL_UNIT] * GPU_POOL_UNIT == size;
++}
++
++/* a buffer back. NULL: taken back; else why it is refused (counted in p->refused; nothing else changes). */
++static inline const char *
++lgp_free(struct lgp *p, uint64_t pa, uint64_t size)
++{
++	unsigned at;
++
++	if (!lgp_fits(p, pa, size)) {
++		p->refused++;
++		return "not a pool buffer (outside the pool, unaligned, across a chunk or on a guard unit)";
++	}
++	if (p->len[(pa - p->base) / GPU_POOL_UNIT] == 0) {
++		p->refused++;
++		return "not out (given back twice, or not from the pool)";
++	}
++	if (!lgp_is_out(p, pa, size)) {
++		p->refused++;
++		return "not the size it was given out with";
++	}
++	at = lgp_find(p, pa);
++	if ((at > 0 && p->range[at - 1].start + p->range[at - 1].size > pa) ||
++	    (at < p->count && p->range[at].start < pa + size)) {
++		p->refused++;
++		return "overlaps free memory";
++	}
++	p->len[(pa - p->base) / GPU_POOL_UNIT] = 0;
++	if (!lgp_insert(p, pa, size)) {
++		p->lost++;
++	}
++	return NULL;
++}
++
++#endif /* LAUREL_GPU_POOL_CORE_H */

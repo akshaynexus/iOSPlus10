@@ -100,6 +100,10 @@ no fallback.
 - **2155** `laurel-gpu-watchdog`: GPU hang watchdog (no fence progress for 3 s with work pending while backboardd has GL)
   -> `LAUREL GPU: off: GPU hang: ...`, GPU off, GL backboardd killed, wrapper restarts it without GL; sysctl
   `kern.laurel_gpu` (section "GL stall"). Kill switch `gpuwd=0`.
+- **2156** `laurel-gpu-pool-lock` (fix of the 06:50:38 pool panic, section "Pool panic" below): the GPU pool bookkeeping
+  (`laurel_gpu_pool_core.h`, host test `scripts/laurel/gpu-pool-test.sh`) under one mutex; no buffer across a 64 MiB
+  chunk (checked on every allocation); a free must be exactly a buffer that is out, else refused and counted; gemNew
+  zeroes through `topaz_gpu_pool_clear` (the chunk map that covers the whole buffer).
 - **2152** `laurel-fps-line`: `SWEET FPS:` is part of the GPU report: only while GL is loaded, 6 lines every second, then
   one every 10 s while frames come; `sweetfps=0` turns it off.
 
@@ -378,6 +382,61 @@ stops new fetches. 2155 applies with and without the stage-1 patch 2154 (checked
 
 Build 2026-11-01 06:38 [V]: kernel-linux.sh 243/243 patches, 0 LSE, `kernel.development.sweet.4k` sha256 a5dffb27...;
 gpu-userland.sh: backboardd.wrap 0 LSE (root files changed: `/usr/libexec/backboardd` only).
+
+## Pool panic (boot 2026-11-01 06:48, fixed by 2156)
+
+First boot where the GL UI reached the lock screen. At 06:50:38 (touch, Spotlight starts) the kernel panicked:
+`Kernel data abort` at `_bzero+0x44` (`dc zva`), lr `RedwoodGPUUserClient::gemNew+0x53c`, esr 0x96000047 (write,
+translation fault), far = x3 = x0 + 0xC0000. Log `logs/usblog-20261101-001446.txt` line 46702; kernel
+`out/laurel-kernel/out/kernel.development.sweet.4k` of the main checkout (KASLR off: the pc is the `llvm-nm -n` address).
+
+Observations [V registers + disassembly of that kernel]:
+- x23 = pa = 0xc3f40000 (pool + 0x3f40000), x19 = size 0x140000, so the buffer ends at pool + 0x4080000. The fault is at
+  pool + 0x4000000: the end of chunk 0. `topaz_gpu_pool_alloc` maps the pool in 64 MiB chunks; `va` is chunk 0's map + offset,
+  and chunk 0's map ends there.
+- bzero uses only x0-x4, so x9-x14 are still those of the inlined `range_alloc`: x12 = -0x8000 + 0x60 -> entry 6;
+  x11 = 7 -> 14 entries; x14 = 0x20000 = size left after 0x140000 -> the entry was **pool + 0x3f40000, size 0x160000**
+  (end pool + 0x40a0000); x13 = 0xc4080000 = its new start. That free range covered chunk 0's guard unit (0x3ff0000) and
+  ran into chunk 1. The seeding (one range per chunk, a unit short) cannot make such a range; only a bad free or a torn
+  update can.
+- [V source] Nothing serialized `pool_free[]`/`pool_free_count`/`gpu_chunk_va[]`. Callers: gemNew (no lock: it drops
+  gGPULock before the pool), SweetSurface create (no lock), SweetSurface::free (no lock; it also runs on the framebuffer's
+  presenter thread, which releases the shown frames, `sweet_hold_set` -> `release()`), RedwoodGPU frees (freeBuffer, reap,
+  dropKept, the gemNew error path) under gGPULock only. Eight CPUs.
+- [V source] All free sizes match their allocations (gemNew/kept: same `size`; surfaces: `poolSize` = `take`; both
+  rounded the same way); surface buffers are never given back by RedwoodGPU in pass-through; 2155 only stops the GPU.
+  So no wrong-size or double free was found in the code.
+- [V host test] `scripts/laurel/gpu-pool-test.sh` part 2a: the compiled loop loads `f[i].size` (ldr x14, [x8, #8]), compares,
+  and only then loads `f[i].start` (ldr x0, [x8]). A `range_free` on another CPU between the two loads that inserts a range
+  in front of i shifts the table: A takes the start of the range before it and stores (that start + size, the other
+  range's size - size). Example: W = pool + 0x3e00000 (128 KiB free), X = chunk 1: A gets pool + 0x3e00000 + 0x140000
+  (over used memory) and the table keeps **pool + 0x3f40000** size 0x3eb0000 across the chunk end; the next 0x140000
+  is the panic's buffer. Part 2b: 4 threads on the old code give two buffers on one unit after 50-300 operations.
+- [I] Cause: a torn free range from two CPUs in the pool at once. The exact interleaving on the phone is not known (the
+  panic shows only its result); the double allocation that comes with it also explains earlier garbage, if any is seen.
+
+Fix 2156 (TopazAdreno.cpp + RedwoodGPU.cpp + new `iokit/Kernel/arm/laurel_gpu_pool_core.h`):
+- One mutex `laurel_gpu_pool_lock` (LCK_MTX_DECLARE, ready at startup) over the free list, the per-unit length table and
+  the chunk maps. Nothing else is taken inside it; it is taken under gGPULock and hw_lock (never the other way).
+- `lgp_alloc`: first fit, but a buffer is only given if `lgp_fits` (unit aligned, in the pool, inside one chunk, off the
+  guard unit) and no buffer starts there; a range that fails is passed over and counted (`bad ranges passed over`).
+- `lgp_free`: only a buffer that is out, with the exact start and size (a uint16 length per start unit, 32 KiB): given back
+  twice, wrong size, unaligned, outside the pool, guard unit, across a chunk, inside a buffer, over free memory = refused,
+  counted, free list unchanged. A full free list (2048 ranges) loses the free, counted as `lost`.
+- Ranges merge only inside one chunk. gemNew zeroes through `topaz_gpu_pool_clear(pa, size)`: under the lock it checks that
+  the buffer is out and takes its chunk's map; else no write, the buffer goes back, gemNew fails with one line.
+- With 2154 (stage-1 SMMU, branch t3/laurel-gpu-upstream-opt): 2156 applies after it (checked: whole series + 2154 + 2156).
+  2154's VA = PA frees (`redwood_gpu_address_free`, address >= 0x80000000) go through the same checked `pool_give_back`; its
+  self-test unit (alloc + give back GPU_POOL_UNIT) is a valid buffer; its gemNew `goto scattered` (pool full) is before the
+  clear. A VA = PA free that is not a pool buffer is refused and counted, not merged.
+
+Lines to expect:
+- every 5 s with GL frames: `RedwoodGPU: buffers: N made in U us each, K kept ones given again (M MB kept); GPU pool F of 512
+  MB free in R ranges, 0 frees refused, 0 lost, 0 bad ranges passed over`.
+- only on a bad free (at most 8): `LAUREL GPU POOL: free of PA+SIZE refused (N so far): REASON; caller ADDR`
+  (ADDR = the caller of topaz_gpu_pool_free / redwood_gpu_address_free; `llvm-nm -n` the kernel).
+- only if gemNew gets a buffer it cannot clear (should never show): `RedwoodGPU: pool buffer PA+SIZE has no kernel map
+  that covers it: not used`.
 
 ## Recovery (no UI after the GPU root)
 
