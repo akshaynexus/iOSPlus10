@@ -15,6 +15,12 @@ static uint64_t writes, sync_count;
 static int fake_scsi(const uint8_t *cdb, uint8_t lun, uint32_t len, bool write, uint8_t *bounce);
 
 #include "sweet_ufs_host.c"
+/* compiled also against the old header (scripts/laurel/dualboot-tests-detect.sh): only names both have, and this */
+#ifndef LDB_HDR_VERSION
+#define LDB_HDR_VERSION LDB_VERSION
+#endif
+#define LEGACY_FRESH 1u                 /* the state of header version 1 that passed with no compare */
+#define STATE_OFF 3u
 
 /* The driver calls this one: test-dualboot.sh renames the real ufs_scsi to ufs_scsi_hw and the calls to ufs_scsi_fake. */
 static int
@@ -260,13 +266,17 @@ fresh_disk(uint32_t hfs_blocks, unsigned state)
 	struct ldb_header h;
 	memset(&h, 0, sizeof(h));
 	memcpy(h.magic, LDB_HDR_MAGIC, 8);
-	h.version = LDB_VERSION;
+	h.version = LDB_HDR_VERSION;
 	h.state = state;
 	h.table_id = TB->table_id;
 	h.table_hash = TB->hash;
 	h.area_blocks = AREA_BLOCKS;
 	h.seal_generation = 1;
 	memcpy(h.fp_part_block, FP, sizeof(FP));
+	/* as ldbhelper seal: the raw blocks, on a frozen /data */
+	for (unsigned i = 0; i < LDB_FP_BLOCKS; i++) {
+		h.fp_hash[i] = ldb_hash_add(LDB_HASH_INIT, disk + (PART_FIRST + FP[i]) * 4096, 4096);
+	}
 	h.hash = ldb_header_hash(&h);
 	CHECK(ldb_map(TB, 0, 1, &lba, &run) == 0, "map header");
 	memset(disk + lba * 4096, 0, 4096);
@@ -388,7 +398,7 @@ test_on(void)
 {
 	/* volume: all that fits */
 	uint32_t hfs = AREA_BLOCKS - LDB_RESERVED_BLOCKS - SWEET_LOG_BLOCKS;
-	fresh_disk(hfs, LDB_STATE_FRESH);
+	fresh_disk(hfs, LDB_STATE_BOUND);
 	reset_driver();
 	uint8_t *shadow = calloc(1, (AREA_BLOCKS - LDB_RESERVED_BLOCKS) * 4096ull);
 	uint8_t *before = malloc(DISK_BLOCKS * 4096ull);
@@ -401,17 +411,14 @@ test_on(void)
 	CHECK(su.ready && su.writable && ldb.on && laurel_dualboot_on == 1, "first boot state");
 	CHECK(su.nblocks == AREA_BLOCKS - LDB_RESERVED_BLOCKS, "BSD disk size");
 	CHECK(restarts == 0, "restart");
-	/* the bind: only the header block changed */
+	/* no write at boot: the kernel only reads the header */
 	struct ldb_header h;
 	uint64_t hdr_lba;
 	uint32_t run;
 	ldb_map(TB, 0, 1, &hdr_lba, &run);
 	memcpy(&h, disk + hdr_lba * 4096, sizeof(h));
-	CHECK(h.state == LDB_STATE_BOUND && ldb_header_check(&h, TB) == NULL, "header after bind");
-	CHECK(writes == 1, "bind wrote %llu blocks", (unsigned long long)writes);
-	for (unsigned i = 0; i < LDB_FP_BLOCKS; i++) {
-		CHECK(h.fp_hash[i] == ldb_hash_add(LDB_HASH_INIT, disk + (PART_FIRST + FP[i]) * 4096, 4096), "fingerprint %u", i);
-	}
+	CHECK(h.state == LDB_STATE_BOUND && ldb_header_check(&h, TB) == NULL, "header");
+	CHECK(writes == 0, "the boot wrote %llu blocks", (unsigned long long)writes);
 	/* shadow = what the BSD disk must read */
 	for (uint64_t b = 0; b < AREA_BLOCKS - LDB_RESERVED_BLOCKS; b++) {
 		uint64_t lba;
@@ -498,7 +505,7 @@ test_on(void)
 		}
 	}
 	CHECK(wrong == 0, "%llu blocks of the disk differ from the shadow", (unsigned long long)wrong);
-	printf("ok   on: bind, %u I/Os + %u refused past the end through sweet_ufs_strategy, log thread; 0 blocks outside the table changed\n", ios, rejected);
+	printf("ok   on: no write at boot, %u I/Os + %u refused past the end through sweet_ufs_strategy, log thread; 0 blocks outside the table changed\n", ios, rejected);
 
 	/* fence, called directly with every kind of bad address */
 	memset((void *)(su.dma + DMA_BOUNCE), 0xee, 8192);
@@ -539,12 +546,12 @@ test_on(void)
 		expect_off(name, "Android ran");
 		disk[b] ^= 1;
 	}
-	/* read-only boot of a FRESH area: no bind, no write at all */
-	fresh_disk(hfs, LDB_STATE_FRESH);
+	/* read-only boot: no write at all */
+	fresh_disk(hfs, LDB_STATE_BOUND);
 	reset_driver();
 	arg_ufsrw = 0;
 	uint64_t d0 = disk_hash();
-	CHECK(sweet_ufs_rootdev(&dev) == 0 && ldb.on && !su.writable && writes == 0 && disk_hash() == d0, "ufsrw=0");
+	CHECK(sweet_ufs_rootdev(&dev) == 0 && ldb.on && !su.writable && writes == 0 && disk_hash() == d0, "ufsrw=0: %s", ldb.why ? ldb.why : "");
 	struct fake_buf b = { .blkno = 0, .count = 4096, .flags = B_WRITE, .data = data };
 	sweet_ufs_strategy(&b);
 	CHECK(b.error == EROFS && disk_hash() == d0, "write in a read-only boot");
@@ -556,7 +563,7 @@ static void
 test_off(void)
 {
 	uint32_t hfs = 4096;
-#define CASE(name, setup, reason) do { fresh_disk(hfs, LDB_STATE_FRESH); reset_driver(); setup; if (adt_table == table_mem && TB->hash != 0) { adt_table_size = sizeof(*TB) + TB->count * sizeof(struct ldb_extent); } expect_off(name, reason); } while (0)
+#define CASE(name, setup, reason) do { fresh_disk(hfs, LDB_STATE_BOUND); reset_driver(); setup; if (adt_table == table_mem && TB->hash != 0) { adt_table_size = sizeof(*TB) + TB->count * sizeof(struct ldb_extent); } expect_off(name, reason); } while (0)
 	uint64_t lba;
 	uint32_t run;
 	CASE("kill switch laureldualboot=0", arg_dualboot = 0, "laureldualboot=0");
@@ -575,22 +582,22 @@ test_off(void)
 	CASE("no HFS+ in the area", memset(disk + lba * 4096 + 1024, 0x5a, 512), "HFS+");
 	CASE("HFS+ longer than the area", wr_be32(disk + lba * 4096 + 1024 + 44, AREA_BLOCKS), "longer");
 	CASE("HFS+ over the console log", wr_be32(disk + lba * 4096 + 1024 + 44, AREA_BLOCKS - LDB_RESERVED_BLOCKS - SWEET_LOG_BLOCKS + 1), "longer");
-	fresh_disk(hfs, LDB_STATE_FRESH);
+	fresh_disk(hfs, LDB_STATE_BOUND);
 	reset_driver();
 	adt_table_size = 10;
 	expect_off("table property too short", "size out of range");
-	fresh_disk(hfs, LDB_STATE_FRESH);
+	fresh_disk(hfs, LDB_STATE_BOUND);
 	reset_driver();
 	adt_table_size = 200000;
 	expect_off("table property too long", "size out of range");
 	/* a boot image without a table on a phone with Android: the old kernel wrote its log into the last 4 MiB of /data here */
-	fresh_disk(hfs, LDB_STATE_FRESH);
+	fresh_disk(hfs, LDB_STATE_BOUND);
 	reset_driver();
 	adt_table = NULL;
 	expect_off("no table, no HFS+ at the start of userdata (Android)", "no extent table");
 
 	/* single boot still works: no table, HFS+ at the start of the partition; log at the partition end, writes anywhere in the partition, not outside */
-	fresh_disk(hfs, LDB_STATE_FRESH);
+	fresh_disk(hfs, LDB_STATE_BOUND);
 	reset_driver();
 	adt_table = NULL;
 	uint8_t *v = disk + PART_FIRST * 4096ull + 1024;
@@ -606,6 +613,61 @@ test_off(void)
 	printf("ok   single boot with HFS+ works as before\n");
 }
 
+/*
+ * The property of the design: no header state lets a write through against a filesystem that changed since the seal. All header states x fingerprint blocks: only BOUND with
+ * all three blocks as sealed gives a root. Version 1 of this design had FRESH, which passed with no compare: a kernel that passes it fails here.
+ */
+static void
+set_header_state(unsigned state, unsigned version)
+{
+	uint64_t lba;
+	uint32_t run;
+	struct ldb_header h;
+	ldb_map(TB, 0, 1, &lba, &run);
+	memcpy(&h, disk + lba * 4096, sizeof(h));
+	h.state = state;
+	h.version = version;
+	h.hash = ldb_header_hash(&h);
+	memcpy(disk + lba * 4096, &h, sizeof(h));
+}
+static void
+test_property(void)
+{
+	static const unsigned states[] = { 0, LEGACY_FRESH, LDB_STATE_BOUND, STATE_OFF, 4, 0xffffffffu };
+	uint32_t hfs = 4096;
+	unsigned n = 0;
+	for (unsigned s = 0; s < sizeof(states) / sizeof(states[0]); s++) {
+		for (int changed = -1; changed < 3; changed++) {
+			fresh_disk(hfs, LDB_STATE_BOUND);
+			set_header_state(states[s], LDB_HDR_VERSION);
+			if (changed >= 0) {
+				/* a format or a checkpoint of Android, after the seal */
+				disk[(PART_FIRST + FP[changed]) * 4096 + 1100] ^= 0x40;
+			}
+			reset_driver();
+			uint64_t before = disk_hash();
+			dev_t dev = 0;
+			int e = sweet_ufs_rootdev(&dev);
+			bool may_go = states[s] == LDB_STATE_BOUND && changed < 0;
+			CHECK(may_go ? (e == 0 && ldb.on && su.writable) : (e != 0 && !ldb.on && !su.writable && restarts == 1),
+			    "state %u, fingerprint block %d changed: root %s (%s)", states[s], changed, e == 0 ? "given" : "refused", ldb.why ? ldb.why : "");
+			CHECK(writes == 0 && before == disk_hash(), "state %u, block %d: the boot wrote %llu blocks", states[s], changed, (unsigned long long)writes);
+			n++;
+		}
+	}
+	/* the old header version, FRESH, with an unchanged and a changed superblock */
+	fresh_disk(hfs, LDB_STATE_BOUND);
+	set_header_state(LEGACY_FRESH, 1);
+	reset_driver();
+	expect_off("header version 1, state FRESH", LDB_HDR_VERSION == 1 ? "not sealed" : "damaged");
+	fresh_disk(hfs, LDB_STATE_BOUND);
+	set_header_state(LEGACY_FRESH, 1);
+	disk[PART_FIRST * 4096ull + 1100] ^= 0x40;
+	reset_driver();
+	expect_off("FRESH with a changed superblock: no root, no write", LDB_HDR_VERSION == 1 ? "not sealed" : "damaged");
+	printf("ok   property: %u pairs of header state and fingerprint: a root only for BOUND with the fingerprint as sealed; no boot wrote a block\n", n);
+}
+
 int
 main(void)
 {
@@ -614,6 +676,7 @@ main(void)
 	test_table_rules();
 	test_on();
 	test_off();
+	test_property();
 	printf("test_kernel: %d checks passed, %d failed\n", passes, fails);
 	return fails ? 1 : 0;
 }

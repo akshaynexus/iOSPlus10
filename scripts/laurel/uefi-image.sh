@@ -48,6 +48,7 @@ CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 u
 for f in "$FD" "$SHIM" "$STOCK"; do [ -e "$f" ] || { echo "uefi-image: missing $f (scripts/laurel/mu-build.sh)" >&2; exit 1; }; done
 for t in mkbootimg unpack_bootimg gzip python3 uv; do command -v $t >/dev/null || { echo "uefi-image: missing $t" >&2; exit 1; }; done
 mkdir -p "$W"
+file_sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 # pyfatfs for the payload FAT (same venv as scripts/setup/native-tools.sh)
 if [ ! -x "$OUT/venv/bin/python3" ]; then uv venv -q "$OUT/venv"; VIRTUAL_ENV=$OUT/venv uv pip install -q pyfatfs pyyaml fdt "setuptools<81"; fi
 "$OUT/venv/bin/python3" -c 'import pyfatfs' 2>/dev/null || VIRTUAL_ENV=$OUT/venv uv pip install -q pyfatfs
@@ -77,6 +78,9 @@ else
   ADT_TABLE=
   if [ -f "$DUALBOOT_TABLE" ]; then
     "${OP10TOOL:-$OUT/bin/op10tool}" dualboot check "$DUALBOOT_TABLE" || { echo "uefi-image: FAILED: the extent table does not pass: no boot image" >&2; exit 1; }
+    # a kernel without 2950 ignores the table and writes its console log to the last 4 MiB + 4 KiB of /data. KERNEL= by hand (--no-repo) skips the series check, ios26-image.sh always sets KERNEL: this check is for all of them.
+    ldb_marker=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$REPO/tools/laurel-dualboot/laurel_dualboot.h")
+    [ -n "$ldb_marker" ] && LC_ALL=C grep -aqF "$ldb_marker" "$KERNEL" || { echo "uefi-image: FAILED: kernel $KERNEL has no patch 2950 of this version (text $ldb_marker): no boot image with a table" >&2; exit 1; }
     ADT_TABLE=$DUALBOOT_TABLE
   elif [ -e "$REPO/config/laurel-android-data" ]; then
     echo "uefi-image: note: no extent table ($DUALBOOT_TABLE): this image cannot go on the phone while it holds Android (dual-boot.sh map makes the table)"
@@ -101,7 +105,7 @@ ls -l "$IMG" "$W/kernel.gz" "$rd"
 if [ "${MU_ONLY:-0}" != 1 ]; then
   python3 -I "$BS" image-seal "$IMG" "$STAMP_LINE" "$KERNEL" "$FD" "$CMDLINE"
   # the sidecar android-guard.sh boot-image asks for
-  [ -z "${ADT_TABLE:-}" ] || printf 'image %s\ntable %s\n' "$(sha256sum "$IMG" | cut -d' ' -f1)" "$(sha256sum "$ADT_TABLE" | cut -d' ' -f1)" > "$IMG.dualboot"
+  [ -z "${ADT_TABLE:-}" ] || printf 'image %s\ntable %s\n' "$(file_sha "$IMG")" "$(file_sha "$ADT_TABLE")" > "$IMG.dualboot"
   echo "uefi-image: boot line: LAUREL BUILD: image $STAMP_LINE"
 fi
 echo "uefi-image: $IMG (FD $fdlen bytes$([ "${MU_ONLY:-0}" = 1 ] && echo ', Mu alone' || echo ", kernel $(basename "$KERNEL"), cpus=$CPUS, dram $DRAM, boot CPU Gold 0x100 after the PSCI hand-off (patch 2016)"))"
