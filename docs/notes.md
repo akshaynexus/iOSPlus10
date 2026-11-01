@@ -4259,3 +4259,24 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - [V] Host test `scripts/laurel/test-cell.sh` (8 scenarios, simulated modem) found 2 bugs before any boot: the first `on`
   line came before provisioning finished and before the first signal answer.
 - Build [V]: kernel-linux.sh 246/246 patches, 0 LSE, no warnings in the new code. No root change for step 1.
+## Mi A3: kernel log "flashes" on the idle GL UI = surface-1 frames flipped to a back buffer with a boot console frame; 2104 (2026-11-01 07:50, branch t3/laurel-fb-console-flash)
+- Details: docs/laurel_sprout/gpu.md section "Console flash".
+- [V log 07:20:52 boot, usblog-20261101-001446 lines 53628-55557] backboardd presents surface 1 (= AppleCLCD fSurface =
+  boot framebuffer 0x5c000000, GL draws into it: `RedwoodGPU: surface 1 ... shared at 0x5c000000`) between GPU-pool
+  frames: `SWEET FB: swap 6/8/.../70 layer 0 surface 1`. Every GL boot since 06:12 has such swaps.
+- [V source] Such a swap took the copy path, which skipped fSurface ("already on the panel") and flipped to the back
+  buffer. GPU-pool frames are scanned directly and never write the flip buffers, so they still held console frames from
+  boot: each surface-1 frame showed the old kernel log until the next GPU-pool frame. Without GL the direct frames go
+  through flipFrom (back buffer = a recent UI frame): no text.
+- [V source] After sweet_console_retarget the video console draws only into the cached shadow fCons (scanned only by
+  sweet_cons_show at a panic); kprintf is ring-only (2014); sweet_early is off after arm_init. So nothing draws text into
+  the scanout after the UI starts; the text was old frames.
+- Fix 2104: surface-1 swaps direct (MDP scans 0x5c000000); 0x5c000000 cleared of boot text at start after the first
+  console flip latched; copy path copies surface 1 and clears stale flip buffers; `LAUREL FB HANDOFF:` self-check at the
+  first iOS frame (console on its shadow, else muted; panic still draws). Kill switch fbhandoff=0.
+- Rule: a surface that the panel does not scan must never be "skipped" in a compose; any buffer the MDP may flip to must
+  hold an iOS frame (or black), never a kernel frame, once iOS presents.
+- Base fix: origin/laurel-int-1 1c04a5e did not build: 2720 and 2760 both add a line after laurel_reboot.c in
+  bsd/conf/files (`patch 2760 ... does not apply`, 247 of 249). 2760's hunk now has 2720's line as context.
+- Built 07:41 in the worktree: 249/249 patches applied, 0 LSE, no warnings in the changed files,
+  kernel.development.sweet.4k sha256 793f6122c78e2d8ef2b7b2ba73997f8cc82419d8de32231eb06f15bb25519658. NOT BOOTED.

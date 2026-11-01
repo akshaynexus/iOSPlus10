@@ -104,6 +104,10 @@ no fallback.
   (`laurel_gpu_pool_core.h`, host test `scripts/laurel/gpu-pool-test.sh`) under one mutex; no buffer across a 64 MiB
   chunk (checked on every allocation); a free must be exactly a buffer that is out, else refused and counted; gemNew
   zeroes through `topaz_gpu_pool_clear` (the chunk map that covers the whole buffer).
+- **2104** `laurel-fb-console-handoff` (fix of the 07:20:52 console flash, section "Console flash" below): a swap of
+  surface 1 (boot framebuffer, GL draws into it) is scanned directly instead of flipping to a back buffer with a boot
+  console frame; 0x5c000000 cleared of boot text at start; at the first iOS frame `LAUREL FB HANDOFF:` and the console
+  stays off the panel (panic excepted). Kill switch `fbhandoff=0`.
 - **2152** `laurel-fps-line`: `SWEET FPS:` is part of the GPU report: only while GL is loaded, 6 lines every second, then
   one every 10 s while frames come; `sweetfps=0` turns it off.
 
@@ -437,6 +441,57 @@ Lines to expect:
   (ADDR = the caller of topaz_gpu_pool_free / redwood_gpu_address_free; `llvm-nm -n` the kernel).
 - only if gemNew gets a buffer it cannot clear (should never show): `RedwoodGPU: pool buffer PA+SIZE has no kernel map
   that covers it: not used`.
+
+## Console flash (boot 2026-11-01 07:20:52, fixed by 2104)
+
+Owner report: GL works; when the UI is idle (no new GL frame) the panel shows kernel log text; the next frame covers it.
+Log: `logs/usblog-20261101-001446.txt` (main checkout), boot from line ~50948.
+
+Facts [V]:
+- AppleCLCD's `fSurface` (surface 1) is the boot framebuffer 0x5c000000 (`SWEET FB: AppleCLCD 720x1560 stride 2880 at
+  0x5c000000, default surface 1`). backboardd gets it from IOMFB (selector 4) and its GL draws frames into it:
+  `RedwoodGPU: surface 1 (720x1560 fmt 0x42475241 bpr 2880, 4505600 bytes) shared at 0x5c000000`.
+- backboardd presents surface 1 between GPU-pool frames: `SWEET FB: swap 6/8/10/32/34/38/40/42/50/52/64..70 layer 0
+  surface 1` (07:22:59-07:27:02). Every GL boot since 06:12 has these swaps; the CPU boot 05:29 has one (swap 7).
+- A swap of surface 1 is not GPU-pool, so it took the copy path. The copy path skipped `fSurface` ("already on the
+  panel": true only before the flip buffers), then `flipBack()` showed the back buffer.
+- With GL the GPU-pool frames are scanned directly (`scanFrom(pa)`), they never write the flip buffers. So both flip
+  buffers still held console frames from boot (`sweet_console_copy_dirty` while `fConsShown`). Every surface-1 frame
+  showed that old kernel log; the next GPU-pool frame covered it. Without GL the direct frames go through
+  `flipFrom()`, so the back buffer holds a recent UI frame and nothing is seen.
+- The video console itself does not draw into 0x5c000000 after `sweet_console_retarget()` (AppleCLCD start): it
+  draws into the cached shadow `fCons`, which only `sweet_cons_show()` (panic) scans. kprintf goes only to the ring
+  (2014). The early console (`sweet_early.c`) is off after arm_init.
+- [I] The boot text that the console drew into 0x5c000000 before the retarget stayed there; a surface-1 frame
+  scanned directly would show it where GL had not drawn yet. 2104 clears it.
+
+Fix 2104 `laurel-fb-console-handoff` (SweetFramebuffer.cpp, video_console.c):
+1. A single-layer swap of surface 1 is direct (presenter thread, like GPU-pool frames): the MDP scans 0x5c000000 itself.
+2. AppleCLCD start: after the MDP has latched the first console flip, the boot text in 0x5c000000 is cleared to black
+   (the console text is in the shadow).
+3. Copy path: surface 1 is copied into the back buffer like any surface (skipped only when the copy path composes into
+   0x5c000000 itself, no flip buffers); a flip buffer that still holds a boot console frame is cleared before its first
+   iOS frame.
+4. First iOS frame: one line `LAUREL FB HANDOFF:`. Self-check: the console draws into its shadow
+   (`sweet_console_on_shadow()`: shadow set, `vinfo.v_baseaddr` = shadow, paint hook in place). If not (no shadow, or
+   `initialize_screen()` put it back on the boot framebuffer), the console stops drawing (`sweet_console_muted`; text
+   still in the USB log; a panic draws).
+5. Panic screen unchanged: `_cnputs` draws when `panic_active()`, `sweet_flush_rows` cleans the rows and
+   `sweet_cons_show()` points the MDP at the shadow.
+6. Boot-time text before the UI stays (the console frames until the first iOS frame): it is the only screen output
+   when the boot stops before SpringBoard.
+Kill switch `fbhandoff=0`: no direct scan of surface 1, no clear, no self-check (the copy-path fix stays).
+
+Expected log lines (GL boot):
+- `SWEET FB: console double buffered (shadow 0x...)` (start, as before)
+- `LAUREL FB HANDOFF: on: first iOS frame owns the panel; kernel console only in its shadow 0x... (not scanned, shown
+  again only by a panic); surface 1 = boot framebuffer 0x5c000000, scanned directly`
+- `LAUREL FB HANDOFF: swap N shows surface 1 (boot framebuffer 0x5c000000) by scanning it directly` (once, at the first
+  surface-1 frame)
+- No `SWEET FB: swap N layer 0 surface 1 ...` lines any more (that line is logged only by the copy path).
+- Fallback: `LAUREL FB HANDOFF: on: ...; no console shadow (...): console text off the panel (...)`;
+  kill switch: `LAUREL FB HANDOFF: off: fbhandoff=0 ...`.
+Test: GL boot, leave the UI idle for 1 min, then scroll and stop: no kernel text at any time.
 
 ## Recovery (no UI after the GPU root)
 

@@ -16,6 +16,14 @@ other surfaces from wired pages), 2103 (native 720x1560 canvas at scale 2 by def
 `LAUREL FB CANVAS:`, `LAUREL FB CANVAS: first frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
 + 0102 (DarwinBoot shrinks the window instead of "NO WINDOW"); mkadt `--dram auto`. Next: boot, read `LAUREL RAM:`, `LAUREL SPOOL:`,
 `LAUREL FB CANVAS:`, `LAUREL FB: first iOS frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
+Console flash fix (2026-11-01 07:50, branch t3/laurel-fb-console-flash, built, NOT BOOTED): with GL, the idle UI showed
+kernel log text. Cause [V log + source]: backboardd presents surface 1 (= boot framebuffer 0x5c000000, GL draws into it)
+between GPU-pool frames; the copy path skipped it and flipped to a back buffer that still held a boot console frame. Kernel
+2104: surface-1 frames scanned directly, boot text cleared from 0x5c000000, stale flip buffers cleared, `LAUREL FB HANDOFF:`
+self-check (console only in its shadow, panic still draws); kill switch fbhandoff=0. Also 2760's bsd/conf/files hunk rebased
+on 2720 (laurel-int-1 1c04a5e did not apply: 247 of 249). 249/249 patches, 0 LSE, kernel sha256 793f6122.... Next: GL boot,
+read `LAUREL FB HANDOFF: on:` + `swap N shows surface 1`, leave the UI idle 1 min: no kernel text. Details:
+`docs/laurel_sprout/gpu.md` "Console flash".
 Clock + status bar (2026-11-01 07:30, branch t3/laurel-rtc-statusbar, built, NOT BOOTED): lock screen showed 1969-12-31 4 PM
 (no time source; usblog `settime: error: unknown command`) and the red rdar:45025538 bar. Kernel 2720: calendar from the PM6125
 RTC (SID 0 0x6000, via the one SPMI core, reads only) + own offset in /private/var/db/laurel_rtc, build-date floor, USB ctl
