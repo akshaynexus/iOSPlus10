@@ -2,7 +2,7 @@
 
 Goal (owner): SIM detection for both slots, network registration, mobile data and, if reachable, voice/SMS under
 iOS 16.7.16 (20H392, iPhone10,3 userland). Status 2026-11-01: step 1 (kernel QMI client: SIM 1/2 status, provisioning,
-modem facts; radio kept off by its IPA self-check) [V] builds on laurel-int-1, [V] host test 8/8, [U] not booted.
+modem facts; radio kept off by its IPA self-check) [V] builds on laurel-int-1, [V] host test 8/8, [V] booted (boot 20:02: LAUREL CELL: on; the kernel reads SIM state; iOS sees no SIM, half-done-audit.md row 3).
 
 Labels: [V] read in source, measured on the host, or in the 20H392 root; [I] inference; [U] unknown.
 Kernel patch: `patches/laurel/xnu/2760-laurel-cellular-qmi.patch` (new `bsd/dev/laurel_cell.c` + hooks in TopazModem.cpp).

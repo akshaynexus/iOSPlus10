@@ -2,7 +2,7 @@
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
 XNUtils round (2026-11-01 21:30, branch t3/laurel-xnutils, built + host test + dry run, NOT RUN ON THE PHONE): owner "build and install XNUtils as a system app, extend it with more info and stats".
-Done: native Linux build (xnutils-build.sh, in build-all.sh), system app + setuid helper in the root (root-xnutils.sh, XNUTILS=0 skips), 18 live sections every 2 s while visible, nothing when hidden; Copy + Share; Metal Auto/All/Probes/Off on the gate's files, GL switch = new file /private/var/db/laurelgl/off read by bbd_wrap.c; kernel 2911 `kern.laurel_stats`: parses the console ring on read + in the log thread, live values from driver variables.
+Done: native Linux build (xnutils-build.sh, in build-all.sh), system app + setuid helper in the root (root-xnutils.sh, XNUTILS=0 skips), 18 live sections every 2 s while visible, nothing when hidden; Copy + Share; Metal Auto/All/Probes/Off on the gate's files, GL switch = new file /private/var/db/laurelgl/off read by bbd_wrap.c; kernel 2912 `kern.laurel_stats`: parses the console ring on read + in the log thread, live values from driver variables.
 Results [V]: kernel 293/293 patches, 92 laurel, 0 LSE, sha256 763609fb...; app + helper + pmregister 0 instructions newer than ARMv8.0, no Metal link; xnutils-test.sh PASS on the sample and on the real boot 20:02 log (crash table = system-features.md); root-dry-run.sh PASS with XNUtils. Unproven: section 5 of docs/laurel_sprout/xnutils.md (app start, setuid path, layout, power actions).
 Next: root + boot image + flash (owner), docs/laurel_sprout/xnutils.md section 6.
 System features round (2026-11-01 20:45, branch t3/laurel-system-features, built + dry run, NOT BOOTED, root not built: needs sudo): owner "a lot of system apps and features are disabled".
@@ -914,7 +914,7 @@ Next: boot image with this kernel + root rebuild (root-flash-test.sh; owner appr
 
 ## Mi A3: camera quality (2026-11-01, branch t3/laurel-camera-quality, patch 2773; NOT BOOTED)
 Owner on the first working Camera app: "buggy, no proper focus or clarity". Found in the log [V]: real line time 2.57x shorter than the library says (fixed from the PLL registers), mediaserverd killed at 2.6 GB every 10 s (Metal out of mediaserverd [I]), a jump to data at the frame handler (guarded, cause [U]), 19 % of frames lost to copies (4 buffers). Added: 1920x1440 preview window at 96 % of the sensor with fallback to stock modes [I that the sensor takes it], 4000x3000 photograph mode switched without a power-down, DW9800W focus over CCI + contrast AF with AFStatus in the metadata, colour matrices + lens shading from the phone's stock tuning at the root step, 5x5 demosaic, sharpen, chroma filter. Open [U]: frames at black level in all sessions of that boot. Build 274/274, 0 LSE, cam-test OK, cache check PASS. Next: inventory again, root + boot image, owner test. Details: docs/laurel_sprout/camera.md section 10.
-## Mi A3: Wi-Fi stalls, page load and bars (2026-11-01, branch t3/laurel-wifi-stall, patches 2880-2886; build + host test, NOT BOOTED)
+## Mi A3: Wi-Fi stalls, page load and bars (2026-11-01, branch t3/laurel-wifi-stall, patches 2880-2886; build + host test; booted 20:02: on lines only, no join in that boot, so no traffic has crossed them)
 Owner: "fast.com and speedtest do not load fast enough, you made it worse, the signal level is wrong." Log 19:07.
 Causes [V log + code]: every lost frame (13715) = the one 128-frame Tx queue full, shared by all flows; scans 0.5 s and 7 s after the join, over the first fetches of a page; bars frozen at the join (iOS event 39 was never sent).
 [I] The fall after the burst = the speed test's end, the 16 s line gap = the line's own rule; [I] in the 40 s before the burst the CPU, not the link, was full (drop 0, 1.9-20 Mbps): crash loops and WebKit are the next suspects. The log has no DNS or TCP counters: new `path` line.
@@ -922,7 +922,7 @@ Done: en0 output queue with flow control (kill switch wifi_txq=0), Rx 1 copy, Tx
 Build: 280/280 patches (79 laurel), 0 LSE, kernel.development.sweet.4k sha256 f6d6b604dfe6cb05b9eaa4052b45854765b6b39e606add3101509d386cf2ebd6; wifi-phy-test.sh passes.
 Next: boot with this kernel; docs/laurel_sprout/wifi.md "Test": read `link` + `path` during fast.com; compare wifi_txq=0.
 
-## Mi A3: black screen after the lock, boot 19:34; display off keeps the panel awake (2026-11-01, branch t3/laurel-wake-blank, patch 2872; build only, NOT BOOTED)
+## Mi A3: black screen after the lock, boot 19:34; display off keeps the panel awake (2026-11-01, branch t3/laurel-wake-blank, patch 2872; booted 20:02: LAUREL PANEL: on; lock and wake not checked in a log)
 Owner: phone locked, screen never came back; iOS and the kernel alive. [I, strong] 2871's FIFO made 0x28/0x10 reach the panel for the first time; 0x11 + 0x29 with video running do not bring the picture back (power mode 0x9f -> 0x9d at the first sleep [V]). Suspects timing, frames, DBV: refuted by code and log; table in docs/laurel_sprout/brightness.md.
 Change: display off = fade to DBV 0 + black frame, no 0x28/0x10. Wake: one 0x0A with the light out, sleep-out sequence once only if the panel is off. Last direct iOS frame shown again if none is new. No reads after the start except that check.
 Build: 276/276 patches (75 laurel), 0 LSE, kernel sha256 9e57a0b5f9e35f81.... Next: boot image (`scripts/laurel/uefi-image.sh`) with this kernel, owner approves the flash, test in brightness.md. Open: real panel sleep (video stop, reset, whole on-command set, video start) if the battery needs it.
@@ -968,6 +968,13 @@ Done: Metal stays out; hooks 10 + 11 prepare that node without a filter and copy
 Not fixed, cause [U]: every frame so far holds noise only (mean 0, top 3-10 at up to 133 ms x 16x). Scene or VANA: the next boot in a lit room decides. Never seen on the phone: an `encoded` line, a saved photo, the 4000x3000 mode. Photo file is 4032x3024.
 Build: 291/291 patches, 0 LSE; plug-in sha256 320ac73d62013137...; cam-test, cam-leak-test OK; cache check PASS.
 Next: root + userdata flash (owner approves), docs/laurel_sprout/camera.md section 11 "Test steps".
+
+## Mi A3: honest build (2026-11-01, branch t3/laurel-build-honest, patch 2912; RESULTS below; NOT BOOTED)
+Owner: "a build must never look good when a part is missing". Docs: docs/laurel_sprout/build-honest.md. Audit rows 18, 19 fixed, 22 mostly, 20 listed.
+Linker lines [V]: 2 failed links per good build = DriverKit stub rounds. The kernel was new. Real hole found: the last relink can fail and leave the stub kernel.
+Done: kernel-linux.sh checks (this run's file, last round, embedded stamp, patches unchanged), patch 2912 boot lines, stamps on kernel, image, root; root.sh preflight, one feature table (12 rows) in the console and in /usr/share/laurel/root-manifest, exit 1 unless a feature has its own =0; no sparse image then; build-all.sh builds all (SSH, audio, BT, firmware new), names each failure; root-flash-test.sh checks before the phone; fsck no longer `|| true`; the race: main() + input hashes.
+Build [V, honest-all2, merge commit 66d75a4f47 on 4cbe2ec]: real `build-all.sh`, every stage: exit 0, 294/294 patches, 0 LSE, 2 linker lines (stub rounds), kernel sha256 64e552f178b8780f..., series 8c6e2af34bbd614d, Metal 145 s, check PASS. The first run (honest-all) stopped with `build-all: FAILED: metal` and no new image: this worktree lacked a submodule commit (notes.md gotcha). root-dry-run.sh on a copy of the 20H392 OS image with those stages: PASS, 12 installed, 0 off, 0 missing. build-honest-test.sh 58 of 58; xnutils-test.sh PASS. flash-check on the current ~/op10-apple image: refused (no sidecar). Not run: `sudo root.sh`, any boot.
+Next: owner's next `build-all.sh && root-flash-test.sh` needs the `SSH` stage to build once; read the 3 `LAUREL BUILD:` lines. Owner decides on `zet=5000`.
 
 ## Mi A3: mediaserverd with Metal (2026-11-01, branch t3/laurel-mediaserverd-metal; root only; built + host-tested, NOT BOOTED)
 

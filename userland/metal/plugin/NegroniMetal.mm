@@ -1,5 +1,5 @@
 /*
- * NegroniMetal.bundle: the Metal driver for the Adreno 730 of the OnePlus 10 Pro (iOS 16.7.16 20H392).
+ * NegroniMetal.bundle: the Metal driver for the Adreno 730 of the OnePlus 10 Pro and the Adreno 610 of the Mi A3 (iOS 16.7.16 20H392).
  *
  * Chain (docs/metal-design.md):
  *   Metal.framework _MTLRegisterDevices: IOServiceMatching("IOAcceleratorES") -> MetalPluginName "NegroniMetal" ->
@@ -116,7 +116,7 @@ __attribute__((constructor)) static void nmtl_error_mode(void)
 	/* Workaround environment variables (Chlorophyll):
 	 * - CA_USE_CGTEXTUREDATA=0: QuartzCore reads past mapped file for Apple GPU tiled layout in asset catalogs.
 	 * - CI_USE_MTL_DAG_FOR_CIKL_SRC=0: CoreImage crashes in +[CIKernel kernelsWithString:] / SBRendererService with empty argument list.
-	 * - CA_DISABLE_FRAMEBUFFER_COMPRESSION=1: Adreno 730 does not support Apple's GPU framebuffer compression.
+	 * - CA_DISABLE_FRAMEBUFFER_COMPRESSION=1: Adreno does not support Apple's GPU framebuffer compression.
 	 * (CA_FORCE_TRIPLE_BUFFERING was set here too: the 20H392 QuartzCore has no such string, only CA_LOG_TRIPLE_BUFFERING
 	 * [V out/metal/spi/QuartzCore.strings.txt], so it did nothing and is gone.)
 	 */

@@ -69,7 +69,7 @@ tail -n +"$((start_line + 1))" "$LOGF" > "$OUTLOG"
 n=$(wc -l < "$OUTLOG")
 say "captured $n lines -> $OUTLOG"
 echo "---- LAUREL/SWEET state lines"
-grep -E "LAUREL (USB|CPU|REBOOT|CTL|PANIC)|SWEET CPU: .*(alive|initialized)|SWEET USB: (running|configured|ECM)" "$OUTLOG" | tail -20
+grep -E "LAUREL (BUILD|USB|CPU|REBOOT|CTL|PANIC)|SWEET CPU: .*(alive|initialized)|SWEET USB: (running|configured|ECM)" "$OUTLOG" | tail -20
 if [ -n "$panic" ]; then
   echo "---- PANIC"; grep -n -A25 -m1 -E "panic\(cpu" "$OUTLOG" | head -40
 else

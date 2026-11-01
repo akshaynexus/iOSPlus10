@@ -1,7 +1,7 @@
 #!/bin/bash
 # XNUtils as a system app in the Mi A3 iOS 16 root (docs/laurel_sprout/xnutils.md). root.sh calls it; XNUTILS=0 skips.
 #   sudo scripts/laurel/root-xnutils.sh MOUNTED_ROOT
-# Input: out/laurel/xnutils/root from scripts/laurel/xnutils-build.sh (built here if missing; no toolchain = a warning, the root goes on).
+# Input: out/laurel/xnutils/root from scripts/laurel/xnutils-build.sh (built here if missing; no toolchain: exit 1, root.sh's table says `xnutils missing`).
 # Installs:
 #   /Applications/XNUtils.app                 root:wheel, folders 755, files 644, the executable 755
 #   /usr/local/libexec/powermenu-helper       root:mobile (0:501), 4750: setuid root, group mobile only. chown first: chown clears the bit
@@ -20,8 +20,8 @@ if [ "${XNUTILS:-1}" = 0 ]; then echo "$(ts) root-xnutils: skipped (XNUTILS=0)";
 if [ ! -x "$S/Applications/XNUtils.app/XNUtils" ]; then
   if [ -n "${SUDO_USER:-}" ]; then b() { sudo -u "$SUDO_USER" "$REPO/scripts/laurel/xnutils-build.sh"; }; else b() { "$REPO/scripts/laurel/xnutils-build.sh"; }; fi
   if ! b || [ ! -x "$S/Applications/XNUtils.app/XNUtils" ]; then
-    echo "$(ts) root-xnutils: WARNING: XNUtils could not be built (theos toolchain/SDK: scripts/laurel/kernel-linux.sh once); no XNUtils in this root" >&2
-    exit 0
+    echo "$(ts) root-xnutils: FAILED: XNUtils could not be built (theos toolchain/SDK: scripts/laurel/kernel-linux.sh once); no XNUtils in this root" >&2
+    exit 1
   fi
 fi
 root=1

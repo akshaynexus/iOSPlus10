@@ -11,6 +11,11 @@ set -eu
 APPLE=${APPLE:-$HOME/op10-apple}
 IMG=${1:-$APPLE/laurel-ios16-root.simg}
 [ -f "$IMG" ] || { echo "flash-root: missing $IMG (scripts/laurel/root.sh)" >&2; exit 1; }
+# The default image needs a root.sh run that ended well (its sidecar; root-flash-test.sh checks all of it). STALE_OK=1: flash it as it is.
+if [ $# = 0 ] && [ "${STALE_OK:-0}" != 1 ] && ! grep -qE '^status[[:space:]]+ok$' "${IMG%.simg}.manifest" 2>/dev/null; then
+  echo "flash-root: FAILED: ${IMG%.simg}.manifest does not say status ok: this image is not from a finished root.sh run. STALE_OK=1 to flash it as it is" >&2
+  exit 1
+fi
 ts() { date +%H:%M:%S; }
 cur() { lsusb | awk '/18d1:d00d/{print $4}'; }
 wait_dev() { while :; do c=$(cur); [ -n "$c" ] && [ "$c" != "$1" ] && { echo "$c"; return; }; sleep 1; done; }

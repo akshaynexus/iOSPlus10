@@ -1,7 +1,7 @@
 #!/bin/bash
 # Rear camera in the Mi A3 iOS 16 root (kernel: patches/laurel/xnu/2771 + 2772; docs/laurel_sprout/camera.md section 9).
 #   sudo scripts/laurel/root-camera.sh MOUNTED_ROOT        (root.sh step 2 calls this; CAMERA=0 skips)
-# macOS and Linux. Steps (idempotent; each step that cannot run is a warning: the root builds, only the camera stays off):
+# macOS and Linux. Steps (idempotent; a step that cannot run is a warning, and root.sh's table then says `camera missing` from the files):
 #  1. the phone's own stock sensor libraries (Xiaomi/Qualcomm files: never in git) to
 #     ROOT/usr/share/firmware/laurel-camera/libmmcamera_laurus_{imx586_qtech,imx586_sunny,imx582_qtech}.so from out/laurel/camera/lib/
 #     (scripts/laurel/camera-inventory.sh extracts them from the stock vendor image first). The kernel (laurel_cam_sensor.c)
@@ -52,7 +52,7 @@ if [ ! -f "$SRC/NegroniCamera" ]; then
   if [ -n "${SUDO_USER:-}" ]; then b() { sudo -u "$SUDO_USER" "$REPO/userland/laurel/camera/build.sh"; }; else b() { "$REPO/userland/laurel/camera/build.sh"; }; fi
   if ! b || [ ! -f "$SRC/NegroniCamera" ]; then
     echo "$(ts) root-camera: WARNING: NegroniCamera.driver could not be built (theos toolchain/SDK: run scripts/laurel/kernel-linux.sh once); no iOS camera in this root" >&2
-    exit 0
+    exit 1
   fi
 fi
 own() { [ "$(id -u)" != 0 ] || chown -R 0:0 "$@"; }
