@@ -203,7 +203,7 @@ Any authorized key can get root, as the owner's computer can today. USB debuggin
 
 | Step | Command | Result [V, host, 2026-11-02] |
 | --- | --- | --- |
-| Mu | `scripts/laurel/mu-build.sh` (private tree: `scripts/laurel/mu-private-tree.sh`, then `MU_TREE= UNIXNU_TREE= SETUP=0`) | FD 3,145,728 bytes (the fixed FV), FVMAIN_COMPACT 1,405,4xx used of it |
+| Mu | `scripts/laurel/mu-build.sh` (private tree: `scripts/laurel/mu-private-tree.sh`, then `MU_TREE= UNIXNU_TREE= SETUP=0`) | FD 3,145,728 bytes (the fixed FV), FVMAIN_COMPACT 1,405,456 used, 1,740,272 free |
 | Kernel iOS 16 | `scripts/laurel/kernel-linux.sh` | 314/314 patches, 0 failed, 0 LSE/RCpc, printf check OK, fence V3 text, 2955, 2956 |
 | Kernel iOS 26 | `scripts/laurel/kernel-ios26-linux.sh` | series 212 applied, 86 applied+rules, 7 skipped, 11 base, 0 errors, 0 LSE/RCpc, printf check OK. 2955 applied, 2956 applied+rules (3way `osfmk/kern/debug.c`) |
 | Images, both modes, iOS 16 and iOS 26 | `dual-boot.sh image`; `LAUREL_READONLY=0 ...-image.sh` | **52,867,072 bytes each** of 67,108,864 (boot_b 64 MiB). Header v2, os 17.0.0, 2026-10 = Lineage's. `dual-boot.sh image rw` refuses with no record: "no recorded result of a read-only boot of this kernel fence" |
