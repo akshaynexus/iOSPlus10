@@ -389,7 +389,22 @@ Line at start: `LAUREL EMU: on: classes off 0x..`. Kill switches: `laurelemu=0` 
 
 Truth test, `scripts/laurel/test-a64emu.sh` [V]. One static AArch64 program runs one case stream twice: the real word on qemu `neoverse-v1` (`-cpu max` only for sysreg), and SIGILL + this C and asm on `-cpu cortex-a53`, which also proves the emulator uses nothing above ARMv8.0. Compared per case: x0-x30, SP, NZCV, V0-V31, FPSR, memory, outcome. Not `-cpu max` for the others: it also runs FPRCVT, FAMINMAX and FP8 words in the same opcode space. qemu is the truth here, not an A13.
 
-RESULT_TABLE
+| Class | Cases | Mismatches |
+|---|---:|---:|
+| PAC | 1,000,010 | 0 |
+| LSE (all sizes, all orders, with unaligned inside 16 bytes) | 2,000,010 | 0 |
+| CASP | 1,000,010 | 0 |
+| RCpc, RCpc2 | 1,000,010 | 0 |
+| FP16 scalar and vector | 6,000,010 | 0 |
+| FP16 exhaustive: all 65,536 half values through each one-input word, 4 rounding modes, FZ16 off and on | 3,473,408 | 0 |
+| FCMA | 2,000,010 | 0 |
+| DotProd | 500,010 | 0 |
+| JSCVT | 1,000,010 | 0 |
+| FHM | 2,000,010 | 0 |
+| SHA3, SHA512 | 500,010 | 0 |
+| RDM | 1,000,010 | 0 |
+| System registers | 200,010 | 0 |
+| **Total** | **21,673,528** | **0** |
 
 Rules: 203 checks. Threads, real host threads on `-cpu cortex-a53`: LDADDAL trap x4 + user LL/SC x4: 1,600,000 of 1,600,000; a lock taken by CASAL trap x4 + LL/SC x4, plain counter under it: 1,600,000 of 1,600,000; CASP trap x4 + LDAXP/STLXP x4: pair 1,600,000 and 1,600,000, 0 torn reads.
 
@@ -404,6 +419,12 @@ What this does not show: the kernel path (recovery table, `vm_fault`, exception 
 | **topaz 0081 put its LSE fault ranges after `copyio_recover_table_end`: `find_copyio_recovery_entry` misses them, so a fault in an emulated LSE word (first write to a COW page) panics** [V: section 0x60 bytes longer than the table, 4 entries, in both kernels] | iOS 26 and **iOS 16** | Fixed on iOS 26 (table end moved). iOS 16 unchanged as ordered: owner decision |
 | topaz 0081 LDUMIN: `csel` uses the flags of `cmp w1, #6`, not of the values: the result is always the operand [V source; not run] | iOS 26 and **iOS 16** | iOS 26 does not reach it unless `laurelemu=0`. iOS 16 unchanged: owner decision |
 | 0081 sends a bad pointer to EXC_BAD_INSTRUCTION, not EXC_BAD_ACCESS | both | iOS 26 emulator: correct |
+| **`processor_start` on 12377 is `mov w0,#5; ret` (`processor_start_from_kext`), and SweetCPU panics on that result: the boot panics at the secondary CPUs** [V 12377 source, found through IOS-26-Hot 0136] | iOS 26, and the **negroni 12377 base 0004 has the same call** | Fixed on iOS 26: `ml_processor_register` moved into the `startAll` loop. Negroni: not changed, owner decision |
+| dyld pager: arm64e chained fixups did not compile with no PAC | iOS 26 kernel | Fixed from Hot 0129 idea: `signPointer` gives a plain pointer |
+| Spawn with an arm64e preference refused arm64 slices; shared region did not match arm64 and arm64e | iOS 26 kernel | Fixed |
+| libxpc `mach_port_is_connection_for_service` had no answer with no filter callbacks | iOS 26 kernel | Fixed: `KERN_SUCCESS` |
+| Sandbox ops 0x1c, 0x43, 0x4d of 23F84 | iOS 26 kernel | Added |
+| **Apple80211 of the 12377 tree had the iOS 16 sizes** (found by the AirDrop branch) | iOS 26 kernel | Fixed: section 8.3 |
 
 ### 7.4 What the kernel still does not do
 
@@ -487,7 +508,7 @@ Each is 0x48 later. The kernel copies these 5 fields into its old layout. **[U]:
 | plane offset, bytes per row, size | +0xc, +0x10, +0x14 u32 | +0x18, +0x20, +0x28 u64 |
 | plane bytes per element, w, h | +0x18, +0x1a, +0x1b | +0x30, +0x32, +0x33 |
 
-**[U]: rec + 0x50 in 23F84** (20H392 + 0x34 was a second alloc size): no accessor found; the kernel writes the alloc size there. Other accessors (compression, tile data, component names) read zero, as the kernel never filled them: the same as on iOS 16 [I].
+**rec + 0x50 closed [V]:** `_IOSurfaceClientFlushProcessorCaches` uses it as the length, so the alloc size is right. rec + 0x78 is `GetTraceID` (reads zero). Extended pixels: right +0x88, bottom +0x8c, left +0x90, top +0x94 of the plane array (zero here). Other accessors (compression, tile data, component names) read zero, as the kernel never filled them: the same as on iOS 16 [I].
 
 **Limits, selector 13.** Struct 0x18 -> 0x28; the ABI version u16 moved from +0x16 to +0x22, the framework compares it with 1 [V `__ioSurfaceConnectInternal`]. Alignments stay at +0, +4.
 
@@ -495,11 +516,59 @@ Each is 0x48 later. The kernel copies these 5 fields into its old layout. **[U]:
 
 **Bulk attachments, selector 27.** 136 -> 160 bytes: fields 0x84 bytes, size +0x88, mask +0x90, id +0x98. In the state page at +0x34 (was +0x30, 0x70 bytes). 22 dirty bits, ranges from `_getDirtyMask`. YCbCr matrix: the framework now reads a byte at state + 110, which the kernel also writes. Timestamps: 5, and the detach code at +40 (was 4, +32) [V accessors]; the kernel keeps its area size.
 
-Selectors 54 `SetCoreVideoBridgedKeys`, 58 `QueryTransactionList`, 36 with a new scalar: the default path, accepted with zeros [U]. BindAccel offset +8 in the state page: not re-read in 23F84 [U].
+Selector 54 `SetCoreVideoBridgedKeys`: a struct in, accepted [V shape, U effect]. Selector 58 `QueryTransactionList`: 5 scalars in, 3 out, zeros [V shape, U effect]. Selector 36 with a new scalar: default path, accepted with zeros [U]. BindAccel offset +8 in the state page: not re-read in 23F84 [U]. Traps: the direct calls of 23F84 IOSurface use trap numbers 2, 3, 4, 5 (scan of `mov w1` before `IOConnectTrap*`). 6-15 were not seen, so the extra traps of Hot were not taken.
 
-**AppleKeyStore.** No function moved to another selector in the kernel's list [V]: `a64-abi` showed "?" because 23F84 sets `w1` before an outlined call; disassembly gives 3, 6, 7, 11, 14, 17, 31 as before. The extra scalar is the last one in `aks_unlock_device`, `aks_unlock_bag`, `aks_set_system_with_passcode`, `aks_change_secret_epilogue` and `aks_change_secret_with_kek` [V]; the kernel reads the same positions, so **no code change**. New selectors 133-162: unsupported, logged. **[U]: 141, 144, 149, 151: cryptex seal calls. If a process needs them the first boot shows it.** `aks_create_bag` (2) and other outlined calls: argument shapes not re-read [U].
+**AppleKeyStore.** No function moved to another selector in the kernel's list [V]: `a64-abi` showed "?" because 23F84 sets `w1` before an outlined call; disassembly gives 3, 6, 7, 11, 14, 17, 31 as before. The extra scalar is the last one in `aks_unlock_device`, `aks_unlock_bag`, `aks_set_system_with_passcode`, `aks_change_secret_epilogue` and `aks_change_secret_with_kek` [V]; the kernel reads the same positions, so **no code change**. Selector 107 ported (Hot 0148; scalar 0). The key input may come inband or as a descriptor (`laurel_aks_key_in`, limit 1024). `aks_unwrap_key` has no scalar out (x6 = x7 = 0), so the scalar of Hot 0148 is not needed. Selector 142 is in Hot, not in the direct call list of N104AP: not added [U]. Other new selectors 133-162: unsupported, logged. **[U]: 141, 144, 149, 151: cryptex seal calls. If a process needs them the first boot shows it.** `aks_create_bag` (2) and other outlined calls: argument shapes not re-read [U].
 
 **IOSurfaceAccelerator, IOGPU, Sandbox:** not ported here. Section 8 has the changes. IOGPU is only for a real IOGPU driver.
+
+**IOS-26-Hot (d249939, MIT, self-reported, iPhone12,3 on SM8150) against N104AP 23F84 (same build), field by field:**
+
+| Item | Hot | 23F84 here | Which is right |
+|---|---|---|---|
+| Swap layer shift | +0x48, patch 0141 | +0x48 | Same |
+| Lock result | NOTES: 0xa68, 0xf60; patch 0142: 0xc68 | 0xc68 | Its patch and my reading. Its NOTES are wrong |
+| Lock selector | NOTES: 4 | 5 | 5 [V framework] |
+| Selectors 43..59 in the NOTES | no patch has them | 54, 58 only are new | No such work |
+| Limits, bulk, 22 fields | 0x28, 0xa0 | 0x28, 0xa0 | Same |
+| YCbCr byte | state + 0x2c | state + 110 | **Mine** [V the framework code reads a byte at state + 110] |
+| IOMFB 87-92 | no patch | accepted with zeros; 91, 92 give fSwapID; 90 as 28 | Mine by reading; effect [U] |
+| AKS extra scalar | last in the list | last in all calls read | Same |
+| AKS unwrap scalar out | yes | none | 23F84 code: none |
+| AMFI 0x5b | in 0148 | no reader found in the images tried | Not ported [U] |
+| Firehose 0134 | a fix | our header is right | Not needed here |
+| `ptrauth_disabled=1` string | added | our files are lowered, zeta's way | Not added |
+| Link event | 44 bytes, 0146 | 32 bytes: section 8.3 | **Mine** [V] |
+
+Nothing in Hot replaces the emulator: its CPU has LSE.
+
+### 8.3 Apple80211 for 23F84 (2026-11-02). Host test only. Never run
+
+`bsd/dev/redwood_apple80211.c`, `bsd/dev/redwood_sta.c`, `bsd/sys/redwood_sta.h`, iOS 26 kernel only (`post/9000`). `git diff 037cd81 -- patches/laurel/xnu` stays empty, so iOS 16 is byte-unchanged. All [V] from IO80211.framework of the N104AP cache unless marked. Test: `scripts/laurel/test-apple80211.sh`.
+
+| Request | iOS 16 | 23F84 | Fields |
+|---|---:|---:|---|
+| SCAN_REQ (10) | 5456 | **5528** | As before up to `short_ssid` +0x1548. New: `scan_uuid` text +0x154c (64 bytes, `__getScanData`, also kept at client + 2024), u64 +0x1590 [U meaning] |
+| SCAN_RESULT (11), CURRENT_NETWORK (103) | 1164 | **2272** | As before up to `elements_length` +138, elements +140 (room 2048, `strh w26,[sp,#186]`). New: `scan_uuid` +2188 (`__dispatchAsyncScanEvent` writes it into the request), TIMESTAMP +2256 [U unit, left 0], byte +2264 and word +2268 [U, read with the elements] |
+| ASSOCIATE (20) | 592 | **908** | `auth_lower` u32 +8, `auth_upper` u32 +0xc: all after them moved by 4. `ssid_length` +0x10, `ssid` +0x14, `bssid` +0x34, `key_version` +0x3c, `key_length` +0x40, `key_cipher` +0x44, `key` +0x4c. Cipher 10 = passphrase [V `str w8,[sp,#624]`]; cipher 6 = PMK is the old value, not re-read [I] |
+| Link event 4 | 32 | **32** | No change: `__dispatchLinkChangedEvent` 0x25ca9f348 is `cmp w2, #32` |
+| CARD_CAPABILITIES (12) | 13 | **21** | 0x25ca79cdc `mov w8,#21`; the framework walks 168 bits. Bits: the old ones. New bits stay 0 [U] |
+| COUNTRY_CODE (51) | refused | 3 bytes | Below |
+| SETs 365, 383, 473, 481, 483, 485, 512, 560, 564, 582 | refused | answered 0 | Nothing here acts on them. 365, 473, 481, 483, 485, 512, 560, 582 are numbers in wifid's code [V]; that each is a set: [I]. 564: `_Apple80211FilterMonitoringEvent` [V]. 383: only Hot's list [U] |
+
+**The link event: the brief said 44 from Hot 0146, and 44 is wrong for this event.** `cmp w2,#44` at 0x25ca90a7c is in `__dispatchObssMitInfoEvent` (keys `LAST_OBSS_STATS_TIME`, `SHOULD_APPLY_OBSS_MIT`). The real link dispatcher wants 32 bytes in the layout of iOS 16: down +0, rssi +4, snr +8, noise +10, involuntary +16, reason +20, subreason +24. Hot's 44-byte struct has a different layout, which that dispatcher would read wrongly. Not taken.
+
+**UUID.** The framework writes the UUID into each SCAN_RESULT request and does not read it from the answer [V: `__addScanResultToList` has no read of +2188]. The kernel gives back the UUID of the request; if empty, that of the last SCAN_REQ. So the statement "must give it back" (Hot 0145) is not needed by this framework, and it costs nothing.
+
+**Split scan.** IO80211 asks for a scan in stages (client + 236 counts them). A stage with only channels this radio does not have (6 GHz) got EINVAL at line 544, which ended the whole scan. Now: `no_radio` goes through the station thread, which waits 20 ms and posts the normal SCAN_DONE, with no radio time. SCAN_RESULT then gives EIO at once (the framework's end mark [V: `cmp w8,#5` after the read loop]). The 20 ms: the framework sets its "scan runs" byte (client + 232) after the request returns. A stage with real channels gets only its results: the station list keeps older entries, so SCAN_RESULT filters by the channels of that stage. Above 64 channels: every channel, as before. Passive stays: `what->passive = scan_type == 2`. No userland radio.
+
+**Country.** Hot gives a fixed "IN". Here: element 7 (first two bytes A-Z) of the joined network, else the strongest heard network that has one. None: EOPNOTSUPP. wifid can take that: it retries only on 16 and 61 (0x100024994) and otherwise gives the error to its caller [V to that call; what each caller does: I]. This is a name for wifid. It changes no channel and no power of the radio.
+
+**Not taken from Hot 0145, 0146:** the 44-byte link event; the fixed country; `noise = -95` (made up: `noise_known` stays 0, [U] whether wifid wants it); the 4 s scan cache; the flame userland radio; the iOS 16 fallback of sizes (this kernel answers the iOS 26 client, as IOSurface and IOMFB do); the filter of directed scans [U].
+
+Line at the first request: `LAUREL A80211: on: 23F84 sizes: SCAN_REQ 5528, SCAN_RESULT 2272, ASSOCIATE 908, CARD_CAPABILITIES 21, link 32`.
+
+Host test [V]: the real source with a fake station side and raw bytes at the offsets from the disassembly, so a wrong struct shows; ASan and UBSan on. 147 checks, 0 failures: sizes and fields 57, scan request 8, scan result 23, split scan 12, associate 11, link 4, capabilities 4, SETs 21, country 5, line 2. Then 14 of 14 code words of the cache at the addresses named. A wrong struct on purpose (16-bit auth fields) gave failures, so the test can fail. What this does not show: that wifid is content on a phone, or that any request order above is what wifid does at run time.
 
 ## 9. Zeta's state, and the next best real option
 

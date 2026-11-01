@@ -4936,3 +4936,21 @@ Traps of 12377 that compile fine and fail at run time [V code]:
 Donor [owner, 2026-11-02]: N104AP, iPhone12,1, `artwork-device-subtype` 0x700, scale 2. `mkadt.py --donor`; iOS 16 D22AP unchanged.
 Guess [I]: first failure is the 4K bootstrap in `start.s`/`arm_vm_init`, then kalloc startup with stock clang.
 Negroni series tool after the `--profile` change: same result as before it (`0401-negroni-ram-7g` is an ERROR with both: that patch changes base-owned files and is not listed in `patch-rules.py`; older than this work and not fixed here).
+
+## Mi A3: iOS 26 gap closed, root built (2026-11-02, branch t3/laurel-ios26-needs). HOST ONLY, NEVER RUN, nothing flashed. Details: docs/laurel_sprout/ios26-userland.md 7.1-7.4, 8.2, 8.3; ios26-root.md
+Facts [V]:
+- `_processor_start` on 12377 = `processor_start_from_kext` = `mov w0,#5; ret`; SweetCPU panicked on it. Fixed on iOS 26 (`ml_processor_register` in the startAll loop). Negroni 12377 base 0004 has the same call: not changed, owner decision.
+- topaz 0081 recovery ranges lie after `copyio_recover_table_end` in BOTH kernels (4 entries, 0x60 bytes): a fault in an emulated LSE word panics. Fixed on iOS 26; iOS 16 not changed, owner decision. 0081 LDUMIN uses stale flags [V source].
+- 23F84 Apple80211: SCAN_REQ 5528, SCAN_RESULT and CURRENT_NETWORK 2272, ASSOCIATE 908 (auth 32-bit, all later fields +4), CARD_CAPABILITIES 21, COUNTRY_CODE 3. **The link event stays 32 bytes**: `cmp w2,#44` at 0x25ca90a7c, which IOS-26-Hot 0146 reads as the link event, is `__dispatchObssMitInfoEvent`; `__dispatchLinkChangedEvent` 0x25ca9f348 has `cmp w2,#32`.
+- IOS-26-Hot NOTES.md is not reliable: 0xa68/0xf60, selector 4, selectors 43..59 disagree with its own patches and with 23F84. Read its patches, then the code.
+- Root area: 32 GiB less 256 + 1025 blocks = 34,354,491,392 bytes. The extent table is in the ADT.
+- apfs-fuse gives EIO under load: retry the read. Linux hfsplus mount with udisks forces uid and gid: check owners from the catalog.
+- HFS+ writer: hard links are not used; `:` is stored as `/`; names decomposed.
+- `test-dualboot.sh` runs flash-root.sh, flash-boot.sh and scripts/flash/{ios16,all,restore}.sh with fake adb and fastboot; `build-honest-test.sh` runs root-flash-test.sh the same way. Both record no real write, but know this before you run them under a "no flash scripts" order.
+Gotchas:
+- zsh: `$B:scripts/x` is a modifier, write `"${B}:scripts/x"`; `echo ==` fails; `$D` does not split. `pkill -f` matches its own shell.
+- llvm-objdump shows immediates in hex: grep `#0x233`, not `#563`. cache-dis.py shows decimal.
+- Dev tree flow: edit `out/laurel-kernel-ios26/src/xnu`, `git -C $X checkout bsd/dev/laurel_build_stamp.h`, `python3 -I scripts/laurel/ios26-base-refresh.py`, then a clean build. A full run recreates the tree: refresh first.
+- Host test of Apple80211 uses raw offsets from the disassembly, not the driver's structs: `scripts/laurel/test-apple80211.sh`.
+Open [U]: no boot of this kernel; TIMESTAMP unit at +2256 and bytes +2264, +2268 of a scan result; new capability bits; noise; AKS 141, 142, 144, 149, 151; IOMFB swap's other bytes; IOSurface 54, 58 effect; AMFI 0x5b; the air hook with real binaries.
+

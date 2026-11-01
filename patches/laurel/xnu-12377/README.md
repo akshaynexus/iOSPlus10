@@ -43,3 +43,5 @@ a normal series patch on these files; both kernels get it, and no rule is needed
 
 `patches/xnu-12377/0001` has UniXNU-ios26 code (BSD-2-Clause-Patent, THIRD_PARTY_NOTICES.md). xnu changes: APSL 2.0. No Apple binary, KDK
 header or kernelcache is in git: they stay in `out/` and `~/op10-apple/`.
+
+Host tests of what lives in `post/9000`: `scripts/laurel/test-a64emu.sh` (emulator), `scripts/laurel/test-slide.sh` (slide on 4 KiB pages), `scripts/laurel/test-apple80211.sh` (23F84 Apple80211).

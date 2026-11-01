@@ -5,7 +5,7 @@
 BG := scripts/bg.sh
 OS := $(shell uname -s)
 
-.PHONY: ipsw-cli laurel-ios26-kernel laurel-ios26-image laurel-ios26-root laurel-a64emu-test laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi laurel-update help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
+.PHONY: ipsw-cli laurel-ios26-kernel laurel-ios26-image laurel-ios26-root laurel-a64emu-test laurel-a80211-test laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi laurel-update help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
         kernel kernel-local kernel-ci xcode15 ssh devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog bootlog
 
 help:
@@ -133,6 +133,8 @@ laurel-ios26-root:
 	scripts/bg.sh ios26-root scripts/laurel/ios26-root.sh
 laurel-a64emu-test:
 	scripts/bg.sh a64emu-test scripts/laurel/test-a64emu.sh
+laurel-a80211-test:
+	scripts/bg.sh a80211-test scripts/laurel/test-apple80211.sh
 laurel-ios26-image:
 	$(BG) ios26-image scripts/laurel/ios26-image.sh
 # boot image out/laurel/uefi/laurel-uefi-boot.img (XNU payload); MU_ONLY=1: Mu UEFI alone (its boot menu)

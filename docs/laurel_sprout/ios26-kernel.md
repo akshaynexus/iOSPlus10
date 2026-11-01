@@ -60,7 +60,7 @@ They compile; a merge can still be wrong in meaning.
 
 ## 4. For the lowered arm64e userland
 
-The two tracks are joined: `ios26-userland.md` sections 7.1-7.4 (state per item, truth test, what was found) and 8.2 (user-client ABI). This table is what the kernel does now:
+The two tracks are joined: `ios26-userland.md` sections 7.1-7.4 (state per item, truth test, what was found), 8.2 (user-client ABI, IOS-26-Hot table) and 8.3 (Apple80211 of 23F84). Root: `ios26-root.md`. This table is what the kernel does now:
 
 | Need | Kernel |
 |---|---|

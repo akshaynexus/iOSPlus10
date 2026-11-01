@@ -17,6 +17,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | HakiOS userland (hackios-next; parts in `userland/negronigl/`) | the HakiOS authors | MIT |
 | HakiOS kernel `hakios.mpss.c` (RMTFS / TFTP / service-registry / QRTR name-service port in `patches/xnu/0397-negroni-gnss.patch`: `bsd/dev/negroni_gnss.c`; hackios-next 88513176) | the HakiOS authors | APSL 2.0 (as XNU) |
 | `external/ios-flame` | NWylynko, dipa-studio | MIT |
+| `external/IOS-26-Hot` (reference, read-only, d249939); ideas and short ports in `patches/laurel/xnu-12377` (patches 0129, 0136, 0137, 0140, 0148; ideas only: 0141, 0142, 0145, 0146) | dipa-studio | MIT (its patches are derived from APSL xnu) |
 | `external/metal2vulkan` | steelbrain | GPL-2.0-or-later OR LGPL-3.0-or-later |
 | `external/ios-sweet` & `external/ios-sweet-upstream` | dipa-studio | MIT |
 | `external/Chlorophyll` & `userland/metal/probes` | ry-diffusion / Chlorophyll authors | MIT |
@@ -139,6 +140,34 @@ POSSIBILITY OF SUCH DAMAGE.
 ## 3. MIT License
 
 Used by **hackios-xnu-userland**, **ios-sweet**, **ios-flame**, **Chlorophyll**, **ios-apollo**, **ios-s9**, and **op10tool**:
+
+### IOS-26-Hot (dipa-studio)
+
+Used in `patches/laurel/xnu-12377`: arm64e exec and shared region, SMP start, dyld pager fixups, libxpc check-in, sandbox and keystore selectors. Each was checked against 23F84 or xnu-12377 first; `docs/laurel_sprout/ios26-userland.md` 8.2, 8.3 list what was taken and what was not.
+
+```text
+MIT License
+
+Copyright (c) 2026 dipa-studio
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ### A. hackios-xnu-userland (OOSEX GANG)
 ```text

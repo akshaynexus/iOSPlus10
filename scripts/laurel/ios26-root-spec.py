@@ -428,7 +428,116 @@ def trust(t, a, work):
     t.audit('trust data', 'built', f'{"; ".join(srcs)}; merged {len(ent)} entries, {added} new from the lowering, {missing_attr} without an original attribute. The kernel does not read this file: trust caches are off, built-in AMFI marks every signed file on the root (ios26-kernel.md 3). It is the input if the kernel ever loads one')
 
 
+def air(t, work, script=None):
+    """AirDrop and AirPlay parts of scripts/laurel/root-air-ios26.sh (branch t3/laurel-ios26-airdrop). That script edits a mounted root; this build has no writable mount, so it runs
+    on a stage with the launchd.plist of this tree, and what it leaves there goes into the image. Not in this tree: nothing changes, and the image stays the same bytes. It fails: the
+    root is built without these parts, with one audit line."""
+    import shutil
+    import subprocess
+    script = script or os.path.join(REPO, 'scripts', 'laurel', 'root-air-ios26.sh')
+    if not os.path.exists(script):
+        print('  air-ios26: scripts/laurel/root-air-ios26.sh is not in this tree (not merged yet): no change to the root')
+        return
+    stage = os.path.join(work, 'air-stage')
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(os.path.join(stage, os.path.dirname(XPC)))
+    before = t.read(XPC)
+    with open(os.path.join(stage, XPC), 'wb') as f:
+        f.write(before)
+    os.chmod(os.path.join(stage, XPC), 0o644)
+    r = subprocess.run(['bash', script, stage], capture_output=True, text=True, preexec_fn=lambda: os.umask(0o022))
+    if r.returncode != 0:
+        t.audit('air-ios26', 'off', ((r.stderr or r.stdout).strip().splitlines() or ['no output'])[-1])
+        return
+    files = 0
+    for dirp, dirs, names in os.walk(stage):
+        rel = os.path.relpath(dirp, stage).encode()
+        rel = b'' if rel == b'.' else rel
+        if rel:
+            t.mkdirs(rel)
+        for n in sorted(names):
+            q = os.path.join(rel, n.encode()) if rel else n.encode()
+            full = os.path.join(dirp, n)
+            with open(full, 'rb') as f:
+                data = f.read()
+            if q == XPC.encode():
+                t.write(q, data)
+            else:
+                t.write(q, data, stat.S_IMODE(os.stat(full).st_mode), 0, 0)
+            files += 1
+    # a job the script took out: its plist goes too, as the script does on a mounted root
+    gone = set(plistlib.loads(before)['LaunchDaemons']) - set(plistlib.loads(t.read(XPC))['LaunchDaemons'])
+    for k in sorted(gone):
+        t.remove(k.lstrip('/').encode())
+    said = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ''
+    t.audit('air-ios26', 'applied', f'{files} files; jobs out: {sorted(k.split("/")[-1] for k in gone)}; {said}')
+    shutil.rmtree(stage, ignore_errors=True)
+
+
+def self_test():
+    """The air hook with a stand-in script: its files, owners, a removed job, a failure, a missing script. Host only, no donor files."""
+    import shutil
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        def tree():
+            work = os.path.join(d, 'w')
+            shutil.rmtree(work, ignore_errors=True)
+            os.makedirs(os.path.join(work, 'overlay'))
+            t = Tree(work)
+            src = os.path.join(d, 'launchd.plist')
+            jobs = {'LaunchDaemons': {'/System/Library/LaunchDaemons/com.apple.wifip2pd.plist': {'Label': 'p'}, '/System/Library/LaunchDaemons/a.plist': {'Label': 'a'}}}
+            with open(src, 'wb') as f:
+                plistlib.dump(jobs, f, fmt=plistlib.FMT_BINARY)
+            t.mkdirs(os.path.dirname(XPC).encode())
+            t.n[XPC.encode()] = Node('f', 0o644, 0, 0, 5, src.encode())
+            t.mkdirs(b'System/Library/LaunchDaemons')
+            t.n[b'System/Library/LaunchDaemons/com.apple.wifip2pd.plist'] = Node('f', 0o644, 0, 0, 5, src.encode())
+            return t, work
+        good = os.path.join(d, 'good.sh')
+        with open(good, 'w') as f:
+            f.write('''#!/bin/bash
+set -e
+R=$1
+mkdir -p "$R/usr/libexec" "$R/private/var/Managed Preferences/mobile"
+printf x > "$R/usr/libexec/laurel-awdld"; chmod 755 "$R/usr/libexec/laurel-awdld"
+printf y > "$R/private/var/Managed Preferences/mobile/com.apple.Sharing.plist"
+python3 -I - "$R/System/Library/xpc/launchd.plist" <<'E'
+import plistlib, sys
+p = sys.argv[1]
+d = plistlib.load(open(p, 'rb'))
+del d['LaunchDaemons']['/System/Library/LaunchDaemons/com.apple.wifip2pd.plist']
+plistlib.dump(d, open(p, 'wb'), fmt=plistlib.FMT_BINARY)
+E
+echo "laurel-root: air-ios26: fake"
+''')
+        t, w = tree()
+        air(t, w, good)
+        checks = [
+            t.n[b'usr/libexec/laurel-awdld'].mode == 0o755 and t.n[b'usr/libexec/laurel-awdld'].uid == 0,
+            t.read(b'private/var/Managed Preferences/mobile/com.apple.Sharing.plist') == b'y',
+            b'System/Library/LaunchDaemons/com.apple.wifip2pd.plist' not in t.n,
+            list(plistlib.loads(t.read(XPC))['LaunchDaemons']) == ['/System/Library/LaunchDaemons/a.plist'],
+            t.n[XPC.encode()].mode == 0o644,
+            any('applied' in x and 'fake' in x for x in t.audit_lines),
+        ]
+        bad = os.path.join(d, 'bad.sh')
+        with open(bad, 'w') as f:
+            f.write('#!/bin/bash\necho "laurel-root: air-ios26: missing x" >&2; exit 1\n')
+        t, w = tree()
+        n = dict(t.n)
+        air(t, w, bad)
+        checks += [set(t.n) == set(n), any(x.startswith('off') and 'missing x' in x for x in t.audit_lines)]
+        t, w = tree()
+        n = dict(t.n)
+        air(t, w, os.path.join(d, 'absent.sh'))
+        checks += [set(t.n) == set(n), not t.audit_lines]
+    print(f'air hook self-test: {sum(checks)} of {len(checks)}')
+    sys.exit(0 if all(checks) else 1)
+
+
 def main():
+    if sys.argv[1:] == ['--self-test']:
+        self_test()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for n in ('os', 'sys', 'app', 'tree', 'lowered', 'osdir', 'work'):
         ap.add_argument('--' + n, required=True)
@@ -510,6 +619,7 @@ def main():
     print(f'{linked} cryptex-only paths linked at the root; {through} reached through a symlink of the OS volume')
     print('tweaks:')
     tweaks(t, a)
+    air(t, work)
     trust(t, a, work)
     # a place for the reader of the first boot
     with open(os.path.join(work, 'audit.txt'), 'w') as f:
