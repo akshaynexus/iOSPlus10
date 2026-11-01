@@ -16,7 +16,10 @@
  *     starts this wrapper again, and backboardd comes back on CoreAnimation's software renderer at once (no 5 s
  *     wait for RedwoodGPU in the loader). "" (not decided yet, early boot) or "on": the loader as before;
  *   - if the exec of the real backboardd fails, it tries /usr/libexec/backboardd.real (a second copy root-add-gpu.sh
- *     may leave) and then waits 10 s before it exits, so launchd does not spin.
+ *     may leave) and then waits 10 s before it exits, so launchd does not spin;
+ *   - laurel 2158: it starts /usr/libexec/laurel-metal-gate (userland/laurel/metal/metal_gate.c, installed by
+ *     root-add-metal.sh) detached, without the loader in its environment; the gate runs once per boot (it checks that
+ *     itself) and decides which processes get the Metal device. backboardd does not wait for it.
  */
 #include <errno.h>
 #include <stdio.h>
@@ -26,6 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 
 #define REAL      "/usr/libexec/real/backboardd"
 #define LOADER    "/topaz/lib/libtopaz-inject.dylib"
@@ -33,6 +37,7 @@
 #define LOG       "/var/tmp/laurel-bbd.log"
 #define FAST_S    30
 #define MAX_FAST  2
+#define GATE      "/usr/libexec/laurel-metal-gate"
 
 static void
 say(const char *fmt, const char *a)
@@ -120,6 +125,21 @@ main(int argc, char *argv[])
 	} else if (access(LOADER, R_OK) != 0) {
 		use_loader = 0;
 		say("off: no %s on the root", LOADER);
+	}
+	if (access(GATE, X_OK) == 0) {
+		pid_t child = fork();
+
+		if (child == 0) {
+			setsid();
+			unsetenv("DYLD_INSERT_LIBRARIES");
+			if (fork() == 0) {
+				execl(GATE, GATE, (char *)NULL);
+			}
+			_exit(0);
+		}
+		if (child > 0) {
+			(void)waitpid(child, NULL, 0);
+		}
 	}
 	if (use_loader) {
 		setenv("DYLD_INSERT_LIBRARIES", LOADER, 1);

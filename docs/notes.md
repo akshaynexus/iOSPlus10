@@ -4372,3 +4372,28 @@ Details: `docs/laurel_sprout/battery-power.md`.
   NOTCH=0 restores it. Build: no warnings, ARMv8.0 only, links libobjc + libSystem only.
 - [U] launchd with ProgramArguments[0] = our program for a POSIXSpawnType App job (first boot shows it); time's vertical place.
 - Lesson: in `ipsw dyld symaddr` output, C functions appear only as "(regular) NAME" lines; statusbar-re.sh addr() reads both forms.
+
+## Mi A3: GL frames were copy- and cache-push-bound, not GPU-bound (2026-11-01 08:30, branch t3/laurel-gpu-zero-copy, 2158 + 2159)
+- Details: docs/laurel_sprout/gpu.md "Zero copy, cache upkeep, GPU time"; Metal gate: docs/laurel_sprout/metal.md 6.1.
+- [V log 07:45] backboardd alternates surface 2 (GPU pool, in place, 7-17 ms) and surface 1 (boot framebuffer, "a copy",
+  glReadPixels 31-62 ms). [V source] 2154's stage-1 surfaceBuffer() wanted 64 guard rows inside an IOBufferMemoryDescriptor;
+  the physical framebuffer has none. Rule: in stage 1 give the guard rows from one scratch page, never refuse a surface for it.
+- [V log] "13-16 MB out of the cache in 5-16 ms a submission", 100-400 submissions per 5 s (up to 43 % of wall time).
+  [V source] RedwoodGPUStart sets gpu_cached=1 when the SMMU translates, and submit() then pushes every own buffer Mesa
+  mapped (`seen`), pool (write-combined) ones included, at every submission; surfaces: "again after 4 ms" fired every time
+  because the push itself took > 4 ms. Rule: never push write-combined memory; push a surface per CPU write (seed), with a
+  slow safety period; measure periods from the end of the push.
+- eagl's write lock + unlock after a GPU draw moves the seed and so caused a push: request 0x7d (redwood_drm_surface_drawn)
+  moves the seed without that. [V source] "handing on" = time in glFlush (GEM_SUBMIT); "copying out" = glReadPixels;
+  "waiting" = eagl's fence-sync flush (another GEM_SUBMIT).
+- [V log] `LAUREL GPU SMMU: fault FSR 00000400` every 5 s = FSR.FORMAT only (read-only bits 10:9); test FSR & 0x800001FE.
+- [V source] stage-1 wrapped pictures went to the GPU from the page start (wrapDelta lost: 0x40 bytes off).
+- [V log] "the GPU worked 0 us" was a stub. 2159: CP_REG_TO_MEM CP_ALWAYS_ON_COUNTER + RB_DONE_TS stamps per submission,
+  CP perf counter 0 for the measured core clock. [U] whether RB_DONE_TS writes the counter on the A610 (Mesa fd6 relies on it).
+- GPU clock not raised: no TopazRpm line in the 07:45 boot, the AP's present CX vote unknown (a lower vote can brown out other
+  AP blocks), and frames were not GPU-bound. Next: read 2159's GPU busy %, then DCVS 300/600 (GPLL0/1) behind an RPM-ack +
+  measured-clock + TSENS self-check.
+- Metal: `/usr/libexec/laurel-metal-gate` (wrapper starts it once per boot) widens clients to "* -backboardd" after GPU on +
+  stage 1 + plug-in registered + m2vtest pass (kept per build; a test that never ended = fail).
+- Built 08:35 on Linux in the worktree: kernel 252/252 patches, 0 LSE, kernel.development.sweet.4k sha256 f83432141a1b7f8f...; Mesa 53 s (exports redwood_drm_surface_drawn), userland
+  4 Mach-O + gate 0 instructions newer than ARMv8.0; metal-build.sh check PASS (stage unchanged). NOT BOOTED.

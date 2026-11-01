@@ -1,0 +1,131 @@
+laurel 2158 (Mi A3): (1) a surface the GPU drew gets its new seed from the kernel (redwood_drm_surface_drawn, request 0x7d)
+instead of a write lock + unlock, so the kernel does not push it out of the CPU cache before the next submission; off by
+itself (LAUREL GL DRAWN line) without the Mesa/kernel side. (2) a frame-time line every 10 s while frames come:
+"redwood-gl: N frames in T ms (F a second); a frame A ms on average, the longest L ms, X over 16.7 ms, Y over 33.3 ms; on
+average H us handing on, W waiting, C copying out; ...". Applied by scripts/laurel/gpu-userland.sh after 0001.
+
+diff -ruN a/userland/gpu/eagl.c b/userland/gpu/eagl.c
+--- a/userland/gpu/eagl.c	2026-11-01 08:11:17.200488935 +0530
++++ b/userland/gpu/eagl.c	2026-11-01 08:11:51.684822389 +0530
+@@ -69,6 +69,8 @@
+ #include <string.h>
+ #include <sys/sysctl.h>
+ #include <unistd.h>
++#include <dlfcn.h>
++#include <errno.h>
+ 
+ #include "redwood_gl.h"
+ 
+@@ -824,6 +826,48 @@
+ 	e->upload_bytes += row * (size_t)image->height;
+ }
+ 
++/*
++ * laurel 2158: a surface the GPU has drawn into gets a new seed, so that whoever looks at the seed sees the new picture.
++ * A write lock and unlock did that, and told the kernel "the CPU wrote it": its next submission pushed the whole surface
++ * out of the cache (4.5 MB, 2-3 ms on these cores, per surface per frame). redwood_drm_surface_drawn (Mesa's redwood-drm,
++ * kernel request 0x7d) moves the seed and tells the kernel that no CPU write is behind it. Off by itself (one line) when
++ * libOSMesa or the kernel does not have it: then the lock, as before.
++ */
++static int (*surface_drawn_fn)(uint32_t surface, uint32_t *seed);
++static int surface_drawn_state;         /* 0: not asked yet, 1: on, -1: off */
++
++static void
++surface_seed_moves(IOSurfaceRef surface)
++{
++	if (surface_drawn_state == 0) {
++		surface_drawn_fn = (int (*)(uint32_t, uint32_t *))dlsym(RTLD_DEFAULT, "redwood_drm_surface_drawn");
++		surface_drawn_state = surface_drawn_fn != NULL ? 1 : -1;
++		if (surface_drawn_fn == NULL) {
++			say("LAUREL GL DRAWN: off: %s has no redwood_drm_surface_drawn: seeds by lock (the kernel pushes the "
++			    "surface out of the cache again)\n", redwood_gl_library());
++		}
++	}
++	if (surface_drawn_state > 0) {
++		static unsigned told;
++		int error = surface_drawn_fn(IOSurfaceGetID(surface), NULL);
++
++		if (error == 0) {
++			if (told++ == 0) {
++				say("LAUREL GL DRAWN: on: surfaces the GPU drew get their new seed from the kernel (request 0x7d), no "
++				    "cache push for them\n");
++			}
++			return;
++		}
++		if (error == ENOSYS || error == EIO) {
++			surface_drawn_state = -1;
++			say("LAUREL GL DRAWN: off: the kernel refused request 0x7d (error %d): seeds by lock\n", error);
++		}
++	}
++	if (IOSurfaceLock(surface, 0, NULL) == 0) {
++		IOSurfaceUnlock(surface, 0, NULL);
++	}
++}
++
+ /* What has been drawn into a texture, into its IOSurface, unless it is there (frame_end() waits for it). */
+ static void
+ target_to_surface(struct eagl *e, struct image *image)
+@@ -853,16 +897,12 @@
+ 		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+ 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+ 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
+-			IOSurfaceUnlock(surface, 0, NULL);
+-		}
++		surface_seed_moves(surface);
+ 		return;
+ 	}
+ 	if (image->shared) {
+ 		/* whoever looks at the surface's seed is to see that it has changed */
+-		if (IOSurfaceLock(surface, 0, NULL) == 0) {
+-			IOSurfaceUnlock(surface, 0, NULL);
+-		}
++		surface_seed_moves(surface);
+ 		return;
+ 	}
+ 	if (e->reader == 0) {
+@@ -1093,6 +1133,44 @@
+ 		    e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, after - e->began, e->flushing, waited - before,
+ 		    after - waited, e->attaching);
+ 	}
++	/*
++	 * laurel 2158: frame times every 10 s while frames come (the per-frame lines stop at frame 40, then every 20th):
++	 * frames a second as drawn here (SWEET FPS counts what the panel shows), the frame's own time (first draw to its
++	 * end), how many took longer than a 60 Hz and a 30 Hz frame, and where the time went.
++	 */
++	{
++		static struct {
++			uint64_t since, us, longest, flush, wait, copy;
++			unsigned frames, over16, over33, copied_frames, in_place, copied;
++		} w;
++		uint64_t took = after - e->began;
++
++		if (w.since == 0) {
++			w.since = e->began;
++		}
++		w.frames++;
++		w.us += took;
++		w.longest = took > w.longest ? took : w.longest;
++		w.over16 += took > 16667;
++		w.over33 += took > 33333;
++		w.flush += e->flushing;
++		w.wait += waited - before;
++		w.copy += after - waited;
++		w.copied_frames += copied != 0;
++		w.in_place += in_place;
++		w.copied += copied;
++		if (after - w.since >= 10000000) {
++			uint64_t ms = (after - w.since) / 1000;
++
++			say("redwood-gl: %u frames in %llu ms (%llu.%llu a second); a frame %llu.%llu ms on average, the longest %llu.%llu ms, "
++			    "%u over 16.7 ms, %u over 33.3 ms; on average %llu us handing on, %llu waiting, %llu copying out; %u frames "
++			    "with a picture copied out; %u pictures drawn in place, %u copied\n", w.frames, ms, w.frames * 1000ull / ms,
++			    w.frames * 10000ull / ms % 10, w.us / w.frames / 1000, w.us / w.frames / 100 % 10, w.longest / 1000,
++			    w.longest / 100 % 10, w.over16, w.over33, w.flush / w.frames, w.wait / w.frames, w.copy / w.frames,
++			    w.copied_frames, w.in_place, w.copied);
++			bzero(&w, sizeof(w));
++		}
++	}
+ 	if (e->frames == 30 || e->frames % 200 == 0) {
+ 		summary(e);
+ 	}

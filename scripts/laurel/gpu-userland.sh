@@ -14,7 +14,7 @@ gpu_need_toolchain
 gpu_fetch_sdk
 U=$TOPAZ/userland/gpu
 M=$G/mesa/out
-want=$(cat "$TOPAZ"/userland/mesa/*.patch "$TOPAZ"/userland/mesa/redwood-drm/* | gpu_sha256)
+want=$(gpu_mesa_inputs | gpu_sha256)
 if [ ! -s "$M/libOSMesa.8.dylib" ] || [ "$(cat "$M/built-from" 2>/dev/null)" != "$want" ]; then
   echo "gpu-userland: Mesa missing or older than the topaz Mesa patches: scripts/laurel/mesa-linux.sh"
   "$(dirname "$0")/mesa-linux.sh"
@@ -47,10 +47,14 @@ gpu_cc "$R$PREFIX/lib/libtopaz-inject.dylib" -dynamiclib -install_name $PREFIX/l
 # 4. the backboardd stand-in (ours): the loader only without gpu=0/gl=0 and after < 2 fast exits, execs /usr/libexec/real/backboardd
 gpu_cc "$R/usr/libexec/backboardd.wrap" "$REPO/userland/laurel/gpu/bbd_wrap.c" 2> "$O/bbd.log" ||
   { cat "$O/bbd.log"; gpu_die "bbd_wrap did not build"; }
+# 5. laurel 2158: the Metal client gate (userland/laurel/metal/metal_gate.c; root-add-metal.sh installs it, the wrapper starts it)
+gpu_cc "$R/usr/libexec/laurel-metal-gate" -framework CoreFoundation -framework IOKit "$REPO/userland/laurel/metal/metal_gate.c" \
+  2> "$O/gate.log" || { cat "$O/gate.log"; gpu_die "laurel-metal-gate did not build"; }
 cp "$M/libOSMesa.8.dylib" "$R$PREFIX/lib/"
 
 # ad-hoc signatures (the kernel's AMFI stand-in accepts them; the code directory hashes must still match)
-for f in "$R$PREFIX/lib/libtopaz-gl.dylib" "$R$PREFIX/lib/libtopaz-inject.dylib" "$R/usr/libexec/backboardd.wrap"; do
+for f in "$R$PREFIX/lib/libtopaz-gl.dylib" "$R$PREFIX/lib/libtopaz-inject.dylib" "$R/usr/libexec/backboardd.wrap" \
+    "$R/usr/libexec/laurel-metal-gate"; do
   gpu_dsym "$f"
   "$LDID" -S "$f"
   gpu_check_v80 "$f" || gpu_die "$(basename "$f") has ARMv8.1+ instructions"

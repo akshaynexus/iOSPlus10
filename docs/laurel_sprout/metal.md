@@ -1,6 +1,6 @@
 # Metal on the Mi A3 (Adreno 610): decision, interfaces, Linux build
 
-Status 2026-11-01 (AREA J). Labels: [V] seen in source, a binary or a log; [I] inference; [U] unknown.
+Status 2026-11-01 (AREA J); 08:30: Metal client gate, section 6.1. Labels: [V] seen in source, a binary or a log; [I] inference; [U] unknown.
 Built on Linux (CachyOS, 20 cores) [V]. **Not run on the phone yet**: the coordinator tests (section 8).
 
 ## 1. Decision: metal2vulkan + Turnip (negroni's NegroniMetal stack), unchanged
@@ -162,6 +162,27 @@ not run on the A610, and a failure in backboardd would freeze the UI that the so
 `METAL_CLIENTS="..."` replaces the list: `SpringBoard` after phone test 2, then `* -backboardd`, and `*` only after test 3
 passes. When B's GL wrapper is in the root (`/usr/libexec/real/backboardd`), a list with `*` gets `-backboardd` unless it
 names backboardd. A root that already has a list keeps it when `METAL_CLIENTS` is empty. `METAL_ENV=` adds env lines.
+
+### 6.1 Metal client gate (2026-11-01 08:30, laurel 2158 round; built, NOT BOOTED)
+
+With 2154 the kernel lets every process open RedwoodGPU (`LAUREL GPU SMMU: on: ... any process may open the GPU`), and the
+07:45 boot had `LAUREL METAL: on: Turnip a610 ...`. The default list stayed the probes. `/usr/libexec/laurel-metal-gate`
+(`userland/laurel/metal/metal_gate.c`, built by gpu-userland.sh, installed by root-add-metal.sh, started detached once per
+boot by the backboardd wrapper) widens it only after a self-check, in this order: `kern.laurel_gpu` = `on`; RedwoodGPU
+`LaurelGPUSMMU` = `stage 1`; IOAcceleratorES `MetalPluginName` = `NegroniMetal`; no `strikes/gpu-lost`; the clients file is the
+gate's (first line `# laurel-metal-gate`, written by root-add-metal.sh when `METAL_CLIENTS` is empty; an owner's list is never
+changed); `m2vtest` (compute, render, IOSurface import, all QuartzCore shaders through metal2vulkan + Turnip) exits 0 with
+`compute bad 0/1000, render bad 0/64, import bad 0/4096` within 240 s at nice 10. The result is kept per build (kernel version +
+size/time of NegroniMetal and Turnip) in `/var/db/negronimetal/gate`; a test that did not end (GPU watchdog, panic) is a fail for
+that build (`running KEY` left behind). Pass: `/var/db/negronimetal/clients` = `* -backboardd` + the probes, and
+`NegroniMetal.bundle/clients.local` the same when the root is writable (sandboxed apps read only the bundle). Fail: the probes.
+backboardd stays on the GL path (`-backboardd`). The plug-in's dead-man strikes still stop a process that crashes.
+Lines: `LAUREL METAL CLIENTS: on: m2vtest passed: QuartzCore: N functions, ...; GPU on, SMMU stage 1, plug-in registered:
+clients "* -backboardd" from the next process start (...)` or `LAUREL METAL CLIENTS: off: <reason>: clients stay the probes`
+(syslog, `/var/db/negronimetal/metal.log`, `/var/tmp/laurel-metal-gate.log`; m2vtest output in `/var/db/negronimetal/gate-m2vtest.log`).
+Who gains [I]: apps and daemons that call Metal themselves (WebKit GPU process, MapKit, CoreImage, games); CoreAnimation of
+apps renders in backboardd (GL) anyway. SpringBoard gets the device from the boot after the first pass (it starts before the
+test ends). Undo: write your own list (any first line other than the mark), or `METAL_CLIENTS=...` at root build.
 
 ## 5a. Compiled target and caches (2026-11-01, gpu-upstream-opt)
 

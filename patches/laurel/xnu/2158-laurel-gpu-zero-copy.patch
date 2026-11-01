@@ -1,0 +1,507 @@
+laurel 2158: zero-copy GPU surfaces with the stage-1 tables, and cache upkeep once per CPU write instead of per submission.
+Boot 07:45 (2154 + 2157, stage 1 on) [V logs/usblog-20261101-001446.txt]: (1) "-attachImage: texture 4 is IOSurface 1 (BGRA
+720 x 1560, 2880 bytes a row): a copy": with the tables RedwoodGPU took only surfaces whose IOBufferMemoryDescriptor holds 64
+guard rows; surface 1 (the boot framebuffer 0x5c000000, physical) has none, so every 2nd frame was read back with glReadPixels
+(31-55 ms "copying out"). (2) "13400-16648 KB out of the cache in 5283-15897 us a submission", up to 400 submissions in 5 s:
+the "push again after 4 ms" rule ran on every submission because the push itself took longer than 4 ms ("handing on" up to
+33 ms a frame). (3) "LAUREL GPU SMMU: fault FSR 00000400" every 5 s: FSR.FORMAT, no fault bit.
+Changes: RedwoodGPU maps the scratch page (TopazAdreno redwood_gpu_map_scratch) after every stage-1 surface that has no guard
+rows of its own (and the rest of the 64 KiB VA granule); a wrapped picture's buffer offset includes wrapDelta (2154 gave the
+page start); a surface whose maps are all write-combined (SweetSurface noCache: the physical framebuffer) is never pushed;
+kernel surfaces are pushed when the seed moved (a CPU write lock let go) or after 250 ms (writers that do not lock), wrapped
+client memory at most once per 16 ms, measured from the end of the push; a VA = PA (GPU pool, write-combined) GEM buffer
+is never pushed (stage 1 sets gpu_cached=1 for scattered buffers, so 2154 pushed every buffer Mesa had mapped, pool ones
+included, at every submission: most of the 13-16 MB); new request 0x7d (kRedwoodDrawn): the GPU drew a
+surface, its seed moves without a push; CPU_PREP waits for the buffer's own last submission; the SMMU fault line needs a
+fault bit. Kill switch gpuseed=0 (the old 4 ms push rule for every surface). Pass-through (gpu_smmu=0) is unchanged.
+New stats: "..., N surface pushes, M passed over (no CPU write since the last)" at the end of the RedwoodGPU 5 s line.
+
+diff -ruN a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp	2026-11-01 08:05:21.296152679 +0530
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp	2026-11-01 08:19:31.613536110 +0530
+@@ -64,6 +64,7 @@
+ uint64_t redwood_gpu_address(uint64_t size);
+ void redwood_gpu_address_free(uint64_t address, uint64_t size);
+ bool redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++bool redwood_gpu_map_scratch(uint64_t address, uint64_t size);   /* laurel 2158 (TopazAdreno.cpp) */
+ void redwood_gpu_mapped(void);
+ void redwood_gpu_unmap(uint64_t address, uint64_t size);
+ void redwood_gpu_to_memory(void * start, uint64_t size);
+@@ -94,6 +95,7 @@
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
++	kRedwoodDrawn           = 0x7d,         /* laurel 2158: the GPU has drawn into a surface: a new seed, no CPU write */
+ 	kRedwoodSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
+ 	kRedwoodShow            = 0x7f,         /* ours: pixels of the caller's onto the panel, to see a test's result */
+ };
+@@ -160,6 +162,10 @@
+ 	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
+ 	uint32_t width, height, pixelFormat, planes;    /* and what they are */
+ };
++struct redwood_drawn {
++	uint32_t surface;                       /* the IOSurface's ID */
++	uint32_t seed;                          /* back: its new seed */
++};
+ struct redwood_show {
+ 	uint64_t pixels;
+ 	uint32_t width, height, rowBytes, pad;
+@@ -183,6 +189,16 @@
+ #define GPU_PATIENCE_MS         5000            /* for a buffer or a submission that somebody waits for without a limit */
+ #define GPU_ASK_AGAIN_US        200             /* while waiting for the core: how long between two looks at how far it is */
+ #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
++/*
++ * laurel 2158: with the seed rule (gpuseed=1, the default) a kernel surface is pushed when its seed moved (a CPU
++ * write lock was let go), else at most every GPU_PUSH_SAFE_MS (for writers that do not lock); wrapped client
++ * memory (no lock is promised there) at most once a display frame. Measured from the end of the last push: the
++ * 07:45 boot pushed 13-16 MB per submission in 5-11 ms, so the next submission was always "4 ms later" and pushed
++ * everything again (up to 400 submissions in 5 s, about 40 % of backboardd's time).
++ */
++#define GPU_PUSH_SAFE_MS        250
++#define GPU_PUSH_FRAME_MS       16
++static TUNABLE(uint32_t, gGPUSeedRule, "gpuseed", 1);   /* kill switch gpuseed=0: the 4 ms rule above for every surface */
+ 
+ static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
+ static bool gGPUReported;
+@@ -194,6 +210,7 @@
+ 	uint64_t flushed;                       /* bytes sent out of the cache */
+ 	uint32_t submissions, commands, buffers, surfaces, waits, over;
+ 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
++	uint32_t pushes, clean;                 /* laurel 2158: surfaces pushed out of the cache, and passed over (no CPU write) */
+ 	uint64_t making;                        /* ... and the time it took to make the others */
+ } gGPUStat;
+ 
+@@ -370,6 +387,7 @@
+ 	SweetSurface *                  surface;        /* whose memory it is, when not its own */
+ 	uint64_t                        address;        /* the GPU's for it */
+ 	uint64_t                        size;
++	uint64_t                        span;           /* laurel 2158: GPU addresses taken (size + the scratch rows) */
+ 	uint32_t                        flags;
+ 	uint32_t                        seed;           /* the surface's when it was last pushed out of the cache, */
+ 	uint64_t                        pushed;         /* ... and when that was */
+@@ -387,7 +405,7 @@
+ struct gpu_left {
+ 	IOMemoryDescriptor *            memory;
+ 	SweetSurface *                  surface;
+-	uint64_t                        address, size;
++	uint64_t                        address, size, span;
+ 	uint32_t                        fence, flags;
+ };
+ #define GPU_LEFT                64
+@@ -435,13 +453,14 @@
+ 
+ 	struct gpu_buffer * buffer(uint32_t handle);
+ 	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle,
+-	    bool samePlace = false);
++	    bool samePlace = false, uint64_t guard = 0);
+ 	void freeBuffer(struct gpu_buffer * b);
+ 	bool keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags);
+ 	void dropKept(struct gpu_kept * k);
+ 	void reap(void);
+ 	IOReturn gemNew(struct msm_gem_new * request);
+ 	IOReturn surfaceBuffer(struct redwood_surface * request);
++	IOReturn surfaceDrawn(struct redwood_drawn * request);
+ 	IOReturn gemInfo(struct msm_gem_info * request);
+ 	IOReturn submit(struct msm_gem_submit * request);
+ 	IOReturn show(const struct redwood_show * request);
+@@ -524,6 +543,7 @@
+ 		left->surface = b->surface;
+ 		left->address = b->address;
+ 		left->size = b->size;
++		left->span = b->span;
+ 		left->fence = b->fence;
+ 		left->flags = b->flags;
+ 	} else {
+@@ -541,10 +561,10 @@
+ 		} else if (b->surface == NULL && redwood_gpu_ready() && keep(b->memory, b->kernel, b->address, b->size, b->flags)) {
+ 			b->memory = NULL;               /* (now the kept one's) */
+ 		} else if (redwood_gpu_ready()) {
+-			redwood_gpu_unmap(b->address, b->size);
++			redwood_gpu_unmap(b->address, b->span);
+ 			/* topaz: in pass-through the address is the memory itself; a surface's is the surface's, not the pool's */
+ 			if (!(redwood_gpu_identity() && b->surface != NULL)) {
+-				redwood_gpu_address_free(b->address, b->size);
++				redwood_gpu_address_free(b->address, b->span);
+ 			}
+ 		}
+ 		if (b->memory != NULL) {
+@@ -575,9 +595,9 @@
+ 		    keep(left->memory, NULL, left->address, left->size, left->flags)) {
+ 			left->memory = NULL;
+ 		} else if (redwood_gpu_ready()) {
+-			redwood_gpu_unmap(left->address, left->size);
++			redwood_gpu_unmap(left->address, left->span);
+ 			if (!(redwood_gpu_identity() && left->surface != NULL)) {
+-				redwood_gpu_address_free(left->address, left->size);
++				redwood_gpu_address_free(left->address, left->span);
+ 			}
+ 		}
+ 		if (left->memory != NULL) {
+@@ -667,10 +687,19 @@
+  */
+ struct gpu_buffer *
+ RedwoodGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint64_t size, uint32_t flags, uint32_t * handle,
+-    bool samePlace)
++    bool samePlace, uint64_t guard)
+ {
+ 	struct gpu_buffer * b = NULL;
+ 	bool mapped = true;
++	/*
++	 * laurel 2158: `guard` bytes of GPU addresses after the buffer, all on the scratch page (stage-1 tables only), and
++	 * the rest of the allocator's 64 KiB granule with them: a tile written or read past the end lands there.
++	 */
++	uint64_t span = size;
++
++	if (guard != 0 && !redwood_gpu_identity()) {
++		span = (size + guard + 0xffffull) & ~0xffffull;
++	}
+ 
+ 	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
+ 		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
+@@ -696,26 +725,33 @@
+ 		mapped = true;
+ 	} else if (b != NULL && samePlace && sameAddress(memory, from, size, &b->address)) {
+ 		/* laurel 2154: contiguous memory below 4 GiB (the GPU pool): VA = PA, entered into the tables below */
+-	} else if (b == NULL || (b->address = redwood_gpu_address(size)) == 0) {
++	} else if (b == NULL || (b->address = redwood_gpu_address(span)) == 0) {
+ 		IOLog("RedwoodGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
+ 		return NULL;
+ 	}
++	if (b->address >= kSamePlaceBase) {
++		span = size;                    /* (VA = PA: no room of ours after it) */
++	}
+ 	for (uint64_t offset = 0; offset < size && mapped && !redwood_gpu_identity(); offset += 4096) {
+ 		IOByteCount length = 0;
+ 		addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
+ 
+ 		mapped = phys != 0 && redwood_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
+ 	}
++	if (mapped && span > size) {
++		mapped = redwood_gpu_map_scratch(b->address + size, span - size);
++	}
+ 	redwood_gpu_mapped();
+ 	if (!mapped) {
+-		redwood_gpu_unmap(b->address, size);
++		redwood_gpu_unmap(b->address, span);
+ 		if (b->address < kSamePlaceBase) {
+-			redwood_gpu_address_free(b->address, size);     /* (VA = PA memory: the caller gives it back) */
++			redwood_gpu_address_free(b->address, span);     /* (VA = PA memory: the caller gives it back) */
+ 		}
+ 		IOLog("RedwoodGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
+ 		return NULL;
+ 	}
+ 	b->size = size;
++	b->span = redwood_gpu_identity() ? size : span;
+ 	b->flags = flags;
+ 	b->seed = 0;
+ 	b->pushed = 0;
+@@ -816,6 +852,7 @@
+ 			b->kernel = found->kernel;
+ 			b->address = found->address;
+ 			b->size = found->size;
++			b->span = found->size;          /* laurel 2158: (own buffers have no scratch rows) */
+ 			b->flags = found->flags;
+ 			fNextBuffer = h + 1;
+ 			fBufferCount++;
+@@ -990,16 +1027,34 @@
+ 	 * gpu_identity=0: the SMMU translates, the buffer's pages need not be contiguous. The GPU's
+ 	 * whole tiles past the last row need pages behind them (a fault otherwise): the 64 rows
+ 	 * SweetSurface allocates beyond the picture, when the descriptor has them.
++	 * laurel 2158: else the scratch page stands in for them (newBuffer `guard`), so every surface goes to the GPU as it
++	 * is: the boot framebuffer (surface 1, physical, no rows after it; the 07:45 boot copied each of its frames out
++	 * with glReadPixels, 31-55 ms), pool surfaces, wrapped pictures. A wrapped picture starts wrapDelta into its first
++	 * page: the GPU is told that offset (2154 gave the page start: every such texture 0x40 bytes off).
+ 	 */
++	uint64_t guard = 0;
++	uint32_t pixels = s->offset;
++
+ 	size = round_page_64(s->allocSize);
+-	if (!redwood_gpu_identity() && !s->wrapped) {
++	if (!redwood_gpu_identity()) {
+ 		IOBufferMemoryDescriptor * bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+ 		uint64_t want = round_page_64(s->allocSize + 64ull * s->bytesPerRow);
+-		if (bmd != NULL && bmd->getLength() >= want) {
++
++		if (s->wrapped) {
++			pixels = s->offset + s->wrapDelta;
++			size = round_page_64((uint64_t) s->wrapDelta + s->allocSize);
++			if (size > s->memory->getLength() || (pixels & 63) != 0) {
++				s->release();
++				return kIOReturnUnsupported;
++			}
++			guard = round_page_64(64ull * s->bytesPerRow);
++		} else if (bmd != NULL && bmd->getLength() >= want) {
+ 			size = want;
+-		} else if (!s->gpuPool) {
+-			s->release();
+-			return kIOReturnUnsupported;
++		} else {
++			if (size > s->memory->getLength()) {
++				size = s->memory->getLength() & ~(uint64_t) PAGE_MASK;
++			}
++			guard = round_page_64(64ull * s->bytesPerRow);
+ 		}
+ 	}
+ 	memory = IOSubMemoryDescriptor::withSubRange(s->memory, 0, size, kIODirectionInOut);
+@@ -1009,7 +1064,7 @@
+ 		return kIOReturnNoMemory;
+ 	}
+ 	request->size = size;
+-	request->offset = s->offset;
++	request->offset = pixels;
+ 	request->rowBytes = s->bytesPerRow;
+ 	request->width = s->width;
+ 	request->height = s->height;
+@@ -1033,7 +1088,7 @@
+ 	if (b != NULL) {
+ 		memory->release();
+ 		s->release();
+-	} else if ((b = newBuffer(s->memory, 0, size, 0, &request->handle)) != NULL) {
++	} else if ((b = newBuffer(s->memory, 0, size, 0, &request->handle, false, guard)) != NULL) {
+ 		b->memory = memory;
+ 		b->kernel = (uint8_t *) s->kernelAddress();
+ 		b->surface = s;
+@@ -1049,6 +1104,46 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * laurel 2158: the GPU has drawn into a surface (eagl.c, at a frame's end): its seed moves, as a CPU write lock would
++ * move it (whoever looks at the seed sees the new picture), but nothing is in the CPU's cache: when this client's
++ * buffer of it was pushed at the old seed, it is marked pushed at the new one, so the next submission does not push
++ * 4.5 MB again. A CPU write in between moved the seed first: then it is pushed as before.
++ */
++IOReturn
++RedwoodGPUUserClient::surfaceDrawn(struct redwood_drawn * request)
++{
++	SweetSurface * s = sweet_surface_copy(request->surface);
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	struct gpu_buffer * b = NULL;
++
++	IOLockLock(gGPULock);
++	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			b = &fBuffers[i];
++			break;
++		}
++	}
++	if (b == NULL) {
++		IOLockUnlock(gGPULock);
++		s->release();
++		return kIOReturnNotFound;       /* (only a surface this client has as a buffer: the GPU cannot have drawn others) */
++	}
++	volatile uint32_t * seed = (volatile uint32_t *) ((uint8_t *) s->state->getBytesNoCopy() + 0xc);
++	uint32_t was = *seed, now = (uint32_t) OSIncrementAtomic((volatile SInt32 *) seed) + 1;
++
++	if (gGPUSeedRule && b->seed == was && now == was + 1) {
++		b->seed = now;
++	}
++	IOLockUnlock(gGPULock);
++	request->seed = now;
++	s->release();
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ RedwoodGPUUserClient::gemInfo(struct msm_gem_info * request)
+ {
+@@ -1111,6 +1206,10 @@
+ 	 */
+ 	began = mach_absolute_time();
+ 	nanoseconds_to_absolutetime(GPU_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
++	uint64_t safe, frame;
++
++	nanoseconds_to_absolutetime(GPU_PUSH_SAFE_MS * NSEC_PER_MSEC, &safe);
++	nanoseconds_to_absolutetime(GPU_PUSH_FRAME_MS * NSEC_PER_MSEC, &frame);
+ 	for (uint32_t i = 0; i < request->nr_bos; i++) {
+ 		struct gpu_buffer * b = buffer(bos[i].handle);
+ 
+@@ -1120,19 +1219,38 @@
+ 		if (b->surface != NULL && b->surface->gpuPool) {
+ 			continue;                       /* topaz: GPU pool memory is write-combined: nothing in the cache */
+ 		}
++		if (b->surface != NULL && b->surface->noCache && gGPUSeedRule) {
++			continue;                       /* laurel 2158: the boot framebuffer: every map is write-combined */
++		}
+ 		if (b->surface != NULL) {
+ 			uint32_t seed = *(volatile uint32_t *) ((uint8_t *) b->surface->state->getBytesNoCopy() + 0xc);
++			uint64_t now = mach_absolute_time();
++			uint64_t period = !gGPUSeedRule ? again : b->surface->wrapped ? frame : safe;
+ 
+-			if (seed == b->seed && !b->seen && began - b->pushed < again) {
++			if (seed == b->seed && !b->seen && now - b->pushed < period) {
++				gGPUStat.clean++;
+ 				continue;
+ 			}
+ 			b->seed = seed;
+-			b->pushed = began;
++			redwood_gpu_to_memory(b->kernel, b->size);
++			gGPUStat.flushed += b->size;
++			gGPUStat.pushes++;
++			b->pushed = gGPUSeedRule ? mach_absolute_time() : began;        /* laurel 2158: from the push's end */
++			continue;
+ 		} else if (!b->seen || !gGPUCached) {
+ 			continue;
++		} else if (gGPUSeedRule && b->address >= kSamePlaceBase) {
++			/*
++			 * laurel 2158: a VA = PA buffer is the GPU pool's (write-combined, nobody maps it cached). With the stage-1
++			 * tables gpu_cached is 1 (for the scattered buffers), so 2154 pushed every buffer Mesa had mapped (its
++			 * command streams and upload buffers, all from the pool) at every submission: most of the 13-16 MB.
++			 */
++			gGPUStat.clean++;
++			continue;
+ 		}
+ 		redwood_gpu_to_memory(b->kernel, b->size);
+ 		gGPUStat.flushed += b->size;
++		gGPUStat.pushes++;
+ 	}
+ 	redwood_gpu_to_memory(NULL, 0);                 /* (and what was written last is in memory: a barrier) */
+ 	gGPUStat.flushing += mach_absolute_time() - began;
+@@ -1224,13 +1342,14 @@
+ 		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
+ 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
+ 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
+-		    "began; %u IOSurfaces taken as buffers in %llu us each; %u buffers, %llu MB\n",
++		    "began; %u IOSurfaces taken as buffers in %llu us each; %u buffers, %llu MB; %u surface pushes, %u passed over "
++		    "(no CPU write since the last, or write-combined)\n",
+ 		    gGPUStat.submissions, nanos / NSEC_PER_MSEC, gGPUStat.commands, gGPUStat.buffers,
+ 		    (gGPUStat.flushed >> 10) / gGPUStat.submissions, flushing / NSEC_PER_USEC / gGPUStat.submissions,
+ 		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000,
+ 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
+ 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
+-		    fBufferBytes >> 20);
++		    fBufferBytes >> 20, gGPUStat.pushes, gGPUStat.clean);
+ 		bzero(&gGPUStat, sizeof(gGPUStat));
+ 	}
+ 	IOLockUnlock(gGPULock);
+@@ -1308,6 +1427,7 @@
+ 		struct msm_submitqueue_query query;
+ 		struct drm_gem_close close;
+ 		struct redwood_surface surface;
++		struct redwood_drawn drawn;
+ 		struct redwood_show show;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+@@ -1338,14 +1458,25 @@
+ 	case kMsmGemInfo:
+ 		ret = gemInfo(&r.gemInfo);
+ 		break;
+-	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer: with all it has been given, here */
++	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer */
+ 		waitBegan = mach_absolute_time();
+ 		IOLockLock(gGPULock);
+ 		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
+-		if (!gpuWait(redwood_gpu_last(), patience)) {
+-			ret = kIOReturnBusy;
+-			if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
+-				waitOver(&r.cpuPrep.timeout, redwood_gpu_last());
++		{
++			/*
++			 * laurel 2158: the last submission that named this buffer (Linux msm_gem_cpu_prep waits for the
++			 * buffer's own fences); before, the last of all, so a CPU write into a texture waited for every frame
++			 * queued after its last use. A buffer this client does not have: all, as before.
++			 */
++			uint32_t h = r.cpuPrep.handle;
++			struct gpu_buffer * pb = (h != 0 && h <= GPU_BUFFERS && fBuffers[h - 1].memory != NULL) ? &fBuffers[h - 1] : NULL;
++			uint32_t fence = pb != NULL ? pb->fence : redwood_gpu_last();
++
++			if (fence != 0 && !gpuWait(fence, patience)) {
++				ret = kIOReturnBusy;
++				if (patience == 0 && !(r.cpuPrep.op & MSM_PREP_NOSYNC)) {
++					waitOver(&r.cpuPrep.timeout, fence);
++				}
+ 			}
+ 		}
+ 		IOLockUnlock(gGPULock);
+@@ -1392,6 +1523,9 @@
+ 	case kRedwoodSurface:
+ 		ret = surfaceBuffer(&r.surface);
+ 		break;
++	case kRedwoodDrawn:
++		ret = surfaceDrawn(&r.drawn);
++		break;
+ 	case kRedwoodShow:
+ 		ret = show(&r.show);
+ 		break;
+diff -ruN a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-11-01 08:05:21.298152697 +0530
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-11-01 08:05:30.853511102 +0530
+@@ -646,6 +646,7 @@
+ 	s->allocSize = (uint32_t)sweet_round_upage(bytesPerRow * height);
+ 	s->memory = IOMemoryDescriptor::withPhysicalAddress(phys, s->allocSize, kIODirectionInOut);
+ 	s->mapCache = kIOMapWriteCombineCache;
++	s->noCache = true;      /* laurel 2158: user maps and the kernel map (kernelAddress) are write-combined */
+ 	if (s->memory == NULL || !sweet_surface_publish(s)) {
+ 		s->release();
+ 		return NULL;
+diff -ruN a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h	2026-11-01 08:05:21.299152706 +0530
++++ b/iokit/Kernel/arm/SweetSurface.h	2026-11-01 08:05:30.852813516 +0530
+@@ -49,8 +49,9 @@
+ 	uint64_t                  poolSize;     /* bytes taken from the GPU pool (allocSize and a guard) */
+ 	uint32_t                  drawn;        /* topaz GPU: last submission naming this surface (RedwoodGPU.cpp) */
+ 	bool                      pagesWired;   /* laurel 2101: pageable buffer wired by prepare() (complete() in free) */
++	bool                      noCache;      /* laurel 2158: every map of it is write-combined (physical framebuffer): no cache upkeep */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; pagesWired = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; pagesWired = false; noCache = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp	2026-11-01 08:05:21.297152688 +0530
++++ b/iokit/Kernel/arm/TopazAdreno.cpp	2026-11-01 08:06:27.128830951 +0530
+@@ -1697,6 +1697,30 @@
+ 	return mmu_map(address, phys, read_only);
+ }
+ 
++/*
++ * laurel 2158: one page of the GPU's own, entered at every page of a range: the rows past a surface's end that the GPU
++ * writes and reads in whole tiles (64 rows at most), when the surface's memory has no such rows (the boot framebuffer,
++ * a wrapped picture, kernel surfaces made before the stage-1 tables). What lands there is never read by anybody.
++ */
++static struct kbuf scratch;
++extern "C" bool redwood_gpu_map_scratch(uint64_t address, uint64_t size);
++bool
++redwood_gpu_map_scratch(uint64_t address, uint64_t size)
++{
++	if (gpu_identity) {
++		return false;
++	}
++	if (scratch.va == NULL && !kbuf_alloc(&scratch, PAGE_SIZE)) {
++		return false;
++	}
++	for (uint64_t off = 0; off < size; off += 4096) {
++		if (!mmu_map(address + off, scratch.pa, false)) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ void
+ redwood_gpu_mapped(void)
+ {
+@@ -1760,13 +1784,17 @@
+ 	bzero(by, 7 * sizeof(uint32_t));
+ 	/* laurel 2154: a GPU access the tables refused (terminated, no stall): told, then cleared (FSR is write-1-to-clear) */
+ 	uint32_t fsr = (!gpu_identity && smmu != NULL) ? rd(smmu, SMMU_CB0 + 0x58) : 0;
+-	if (fsr != 0) {
++	/*
++	 * laurel 2158: only the fault bits. FORMAT (bits 10:9) is read-only and reads 2 (AArch64) all the time with the
++	 * stage-1 tables: the 07:45 boot logged "fault FSR 00000400 ..." every 5 s with no fault (FAR stale).
++	 */
++	if ((fsr & FSR_FAULTS) != 0) {
+ 		static uint32_t told;
+ 		if (told++ < 16) {
+ 			IOLog("LAUREL GPU SMMU: fault FSR %08x FAR %08x%08x FSYNR0 %08x (access refused, the GPU goes on)\n", fsr,
+ 			    rd(smmu, SMMU_CB0 + 0x64), rd(smmu, SMMU_CB0 + 0x60), rd(smmu, SMMU_CB0 + 0x68));
+ 		}
+-		wr(smmu, SMMU_CB0 + 0x58, fsr);
++		wr(smmu, SMMU_CB0 + 0x58, fsr & FSR_FAULTS);
+ 	}
+ }
+ 

@@ -1,0 +1,35 @@
+laurel 2158: redwood_drm_surface_drawn() (request 0x7d kRedwoodDrawn): eagl.c tells the kernel that the GPU drew a surface; applied by scripts/laurel/mesa-linux.sh to the copy of external/ios-topaz/userland/mesa/redwood-drm.
+
+diff -ruN a/redwood_drm.c b/redwood_drm.c
+--- a/redwood_drm.c	2026-11-01 08:10:42.830162248 +0530
++++ b/redwood_drm.c	2026-11-01 08:10:42.857978241 +0530
+@@ -185,6 +185,29 @@
+ 	return 0;
+ }
+ 
++/*
++ * laurel 2158 (eagl.c finds it with dlsym): the GPU has drawn into an IOSurface. The kernel moves the surface's
++ * seed, as a write lock would, and knows that no CPU write is behind it (no cache push for the next submission).
++ * 0, or an errno (ENOSYS: a kernel without request 0x7d).
++ */
++#define REDWOOD_GPU_DRAWN       0x7d
++__attribute__((visibility("default"))) int redwood_drm_surface_drawn(uint32_t surface, uint32_t *seed);
++int
++redwood_drm_surface_drawn(uint32_t surface, uint32_t *seed)
++{
++	struct { uint32_t surface, seed; } request = { surface, 0 };
++	int error;
++
++	if (connection == 0) {
++		return ENODEV;
++	}
++	error = call(REDWOOD_GPU_DRAWN, &request, sizeof(request));
++	if (error == 0 && seed != NULL) {
++		*seed = request.seed;
++	}
++	return error;
++}
++
+ int
+ drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
+ {
