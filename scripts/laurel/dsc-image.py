@@ -6,8 +6,9 @@
   dsc-image.py DIR strings IMAGE          "VADDR text" of the C strings in __cstring
   dsc-image.py DIR dis IMAGE              __text listing, with symbol names as labels
   dsc-image.py DIR fn IMAGE NAME|VADDR [N]  N instructions (default: to the next symbol): strings, symbols, stubs resolved
+  dsc-image.py DIR lst IMAGE              __text with function labels, every instruction resolved as in fn
 
-DIR = .../System/Library/Caches/com.apple.dyld. IMAGE = a unique part of the path. Sits next to scripts/debug/dsc-dis.py.
+DIR = .../System/Library/Caches/com.apple.dyld (dyld_shared_cache_arm64, or arm64e with slide info v5). IMAGE = a unique part of the path. Sits next to scripts/debug/dsc-dis.py.
 """
 import bisect, glob, os, re, shutil, struct, subprocess, sys, tempfile
 
@@ -32,7 +33,9 @@ class Cache:
                 self.symfile = h
         self.maps.sort(key=lambda m: m[0])
         self.starts = [m[0] for m in self.maps]
-        self.main = open(os.path.join(d, 'dyld_shared_cache_arm64'), 'rb')
+        name = 'dyld_shared_cache_arm64'
+        self.arm64e = not os.path.exists(os.path.join(d, name))   # iOS 26: dyld_shared_cache_arm64e, slide info v5
+        self.main = open(os.path.join(d, name + ('e' if self.arm64e else '')), 'rb')
         hdr = self.main.read(0x400)
         self.base = self.maps[0][0]
         io, ic = struct.unpack_from('<II', hdr, 0x1c0)
@@ -46,6 +49,10 @@ class Cache:
             self.main.seek(po)
             self.imgs.append((a, self.main.read(300).split(b'\0')[0].decode()))
         self.imgs.sort()
+
+    def ptr(self, raw):
+        """a pointer word of the file as a vaddr (arm64e: slide info v5, runtime offset + value add)"""
+        return (raw & 0x3ffffffff) + 0x180000000 if self.arm64e else raw & 0xfffffffff
 
     def read(self, va, n):
         i = bisect.bisect_right(self.starts, va) - 1
@@ -214,22 +221,50 @@ class Names:
             w = struct.unpack('<3I', self.c.read(va, 12))
         except Exception:
             return None
+        def adrp(word, at):
+            hi = ((word >> 29) & 3) | (((word >> 5) & 0x7ffff) << 2)
+            if hi & 0x100000:
+                hi -= 0x200000
+            return (at & ~0xfff) + (hi << 12)
+        # arm64e auth stub: adrp x17 / add x17, x17, #imm / ldr x16, [x17] / braa x16, x17
+        if w[0] & 0x9f00001f == 0x90000011 and w[1] & 0xffc003ff == 0x91000231:
+            slot = adrp(w[0], va) + ((w[1] >> 10) & 0xfff)
+            return self.c.ptr(struct.unpack('<Q', self.c.read(slot, 8))[0])
+        # adrp x16 / add x16, x16, #imm / br x16 (a direct island, also before an arm64e target)
         if w[0] & 0x9f00001f != 0x90000010 or w[2] != 0xd61f0200:
             return None
-        hi = ((w[0] >> 29) & 3) | (((w[0] >> 5) & 0x7ffff) << 2)
-        if hi & 0x100000:
-            hi -= 0x200000
-        page = (va & ~0xfff) + (hi << 12)
+        page = adrp(w[0], va)
         if w[1] & 0xffc003ff == 0x91000210:    # add x16, x16, #imm: a direct island
             return page + ((w[1] >> 10) & 0xfff)
         if w[1] & 0xffc003ff != 0xf9400210:    # ldr x16, [x16, #imm]
             return None
-        return struct.unpack('<Q', self.c.read(page + (((w[1] >> 10) & 0xfff) << 3), 8))[0] & 0xfffffffff
+        return self.c.ptr(struct.unpack('<Q', self.c.read(page + (((w[1] >> 10) & 0xfff) << 3), 8))[0])
+
+    def objc_stub(self, va):
+        """__objc_stubs: adrp x1 / ldr x1, [x1, #selref] / adrp x16.. : the selector name, else None"""
+        try:
+            w = struct.unpack('<2I', self.c.read(va, 8))
+        except Exception:
+            return None
+        if w[0] & 0x9f00001f != 0x90000001 or w[1] & 0xffc003ff != 0xf9400021:
+            return None
+        hi = ((w[0] >> 29) & 3) | (((w[0] >> 5) & 0x7ffff) << 2)
+        if hi & 0x100000:
+            hi -= 0x200000
+        ref = (va & ~0xfff) + (hi << 12) + (((w[1] >> 10) & 0xfff) << 3)
+        try:
+            b = self.c.read(self.c.ptr(struct.unpack('<Q', self.c.read(ref, 8))[0]), 200)
+        except Exception:
+            return None
+        return b[:b.find(0)].decode('latin1')
 
     def text(self, va):
         n = self.of(va)
         if n:
             return n
+        sel = self.objc_stub(va)
+        if sel:
+            return '[msgSend ' + sel + ']'
         t = self.stub(va)
         if t:
             return self.of(t) or '%#x' % t
@@ -240,11 +275,18 @@ class Names:
         e = b.find(0)
         if e >= 3 and all(32 <= x < 127 for x in b[:e]):
             return '"%s"' % b[:e].decode()
-        q = struct.unpack('<Q', b[:8])[0] & 0xfffffffff
+        q = self.c.ptr(struct.unpack('<Q', b[:8])[0])
         if q < self.c.base:
             return None
+        try:   # a selector reference
+            bb = self.c.read(q, 96)
+            e = bb.find(0)
+            if e >= 3 and all(32 <= x < 127 for x in bb[:e]):
+                return 'sel/str "%s"' % bb[:e].decode()
+        except Exception:
+            pass
         try:   # a CFString constant: isa, flags, data, length
-            d = struct.unpack('<Q', self.c.read(va + 16, 8))[0] & 0xfffffffff
+            d = self.c.ptr(struct.unpack('<Q', self.c.read(va + 16, 8))[0])
             bb = self.c.read(d, 96)
             e = bb.find(0)
             if e >= 2 and all(32 <= x < 127 for x in bb[:e]):
@@ -284,26 +326,34 @@ def cmd_fn(c, part, what, count):
                            check=True, capture_output=True, text=True).stdout
     finally:
         shutil.rmtree(tmp)
+    annotate(r.splitlines(), Names(c), addr, print)
+
+
+def annotate(lines, names, start, out, labels=None):
+    """One resolved line per instruction: strings, symbols, selector stubs. labels: vaddr -> function name."""
     regs = {}
-    for line in r.splitlines():
+    for line in lines:
         m = re.match(r'\s*([0-9a-f]+):\s+(\S+)\s*(.*)', line)
         if not m:
             continue
         v, op, args = int(m.group(1), 16), m.group(2), re.sub(r' *<_binary[^>]*>', '', m.group(3))
-        if v < addr:
+        if v < start:
             continue
+        if labels and v in labels:
+            out('\n%s:' % labels[v])
+            regs = {}
         note = ''
         a = re.match(r'(x\d+), (0x[0-9a-f]+)', args)
         if op == 'adrp' and a:
             regs[a.group(1)] = int(a.group(2), 16)
         elif op == 'add' and re.match(r'x\d+, x\d+, #', args):
-            d, s_, imm = re.match(r'(x\d+), (x\d+), #(\S+)', args).groups()
+            d, s_, imm = re.match(r'(x\d+), (x\d+), #([^,\s]+)', args).groups()
             if s_ in regs:
                 t = regs[s_] + int(imm, 0)
                 regs[d] = t
                 note = names.text(t) or '%#x' % t
         elif re.match(r'(ldr|ldrsw|ldrb|str|strb)$', op) and re.match(r'[xwqdsb]\d+, \[x\d+(, #\S+)?\]', args):
-            s_, imm = re.match(r'[xwqdsb]\d+, \[(x\d+)(?:, #(\S+))?\]', args).groups()
+            s_, imm = re.match(r'[xwqdsb]\d+, \[(x\d+)(?:, #([^\s\]]+))?\]', args).groups()
             if s_ in regs:
                 t = regs[s_] + int(imm or '0', 0)
                 note = names.text(t) or '%#x' % t
@@ -311,7 +361,28 @@ def cmd_fn(c, part, what, count):
             t = re.search(r'0x[0-9a-f]+', args)
             if t:
                 note = names.text(int(t.group(), 16)) or ''
-        print('%x: %-8s %-40s %s' % (v, op, args.split('//')[0].strip(), '; ' + note if note else ''))
+        out('%x: %-8s %-40s %s' % (v, op, args.split('//')[0].strip(), '; ' + note if note else ''))
+
+
+def cmd_lst(c, va):
+    """__text of one image, with function labels and every instruction resolved (a minute for a large image)."""
+    im = Image(c, va)
+    a, s = im.sects[('__TEXT', '__text')]
+    syms = {x[0]: x[2] for x in symbols(c, va)}
+    base = a & ~0xfff
+    tmp = tempfile.mkdtemp(prefix='dsc-image-')
+    try:
+        b, o = os.path.join(tmp, 'c.bin'), os.path.join(tmp, 'c.o')
+        with open(b, 'wb') as h:
+            h.write(c.read(base, s + a - base))
+        subprocess.run(['llvm-objcopy', '-I', 'binary', '-O', 'elf64-littleaarch64',
+                        '--rename-section=.data=.text,alloc,load,code', b, o], check=True)
+        p = subprocess.Popen(['llvm-objdump', '-d', '--no-show-raw-insn', '--triple=aarch64', '--adjust-vma=%#x' % base, o],
+                             stdout=subprocess.PIPE, text=True)
+        annotate(p.stdout, Names(c), a, print, syms)
+        p.wait()
+    finally:
+        shutil.rmtree(tmp)
 
 
 def main():
@@ -340,6 +411,8 @@ def main():
                     print('%#x %s' % (a + m.start(), m.group().decode().replace('\n', '\\n')))
     elif cmd == 'dis':
         cmd_dis(c, va)
+    elif cmd == 'lst':
+        cmd_lst(c, va)
     else:
         sys.exit(__doc__)
 
