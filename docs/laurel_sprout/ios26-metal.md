@@ -288,7 +288,7 @@ NMTL[.. backboardd]: LAUREL METAL26: first frame on a screen surface (720 x 1560
 NMTL[.. backboardd]: LAUREL METAL26: screen: L of 64 samples lit, ...
 ```
 
-Failure on iOS 26 has **no fallback**: `LAUREL METAL26: off: ...: CA::WindowServer::AccelServer::renderer has no renderer, the screen stays as it is`. USB log and SSH stay. There is no GL on 23F84 (`ios26-userland.md` 8.1).
+Failure on iOS 26 has **no fallback**: `LAUREL METAL26: off: ...: CA::WindowServer::AccelServer::renderer has no renderer, the screen stays as it is`. The USB log stays. The first-boot root has no SSH (`ios26-root.md`). There is no GL on 23F84 (`ios26-userland.md` 8.1).
 
 
 ## 10. Second Metal option, switch and bench
