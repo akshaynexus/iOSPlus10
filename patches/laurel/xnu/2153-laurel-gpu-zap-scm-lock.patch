@@ -1,0 +1,173 @@
+laurel 2153: the GPU zap shader no longer hangs the GPU start (boot 2026-11-01 05:52:41: 'TopazGPU: zap: metadata at 0xc0000000', then nothing for > 4 min, no CPU busy, CPU renderer after 68 s). Cause: TopazAdreno.cpp had its own smc()/scm() without the kernel's TrustZone lock (laurel 2404 added one lock to TopazModem's scm() for the modem and ADSP PAS; TopazAdreno was missed). Its PIL_SHUTDOWN/PIL_INIT_IMAGE for PAS 13 entered TrustZone from a second CPU while the modem's auth_and_reset was between two of its 35 interrupted resumes; that call never returned. Fix in the zap path only: (1) every GPU SCM call goes through topaz_scm() (TopazModem: one lock over the call and its resume loop, SCM_V2_EBUSY retried 100 x 30 ms, as downstream scm.c scm_lock / mainline qcom_scm_lock); the local smc() is removed. (2) No PAS_SHUTDOWN before init_image (nothing loaded PAS 13 in this boot; Linux pil-tz and mainline adreno zap_shader_load_mdt do not either); PAS_SHUTDOWN only after init_image succeeded and a later step failed (Linux pil_deinit_image_trusted). (3) Self-check: PAS_IS_SUPPORTED(13) first; a failed call (x0 != 0) turns the GPU off at once with 'LAUREL GPU: off: zap shader failed: TrustZone has no PIL call for PAS 13 ...' (x1 is not a gate: this TZ answers 0 for the modem's PAS 4, which loads). (4) The metadata goes into the TopazModem pool (0xE0000000-0xE1000000, where TrustZone read the ADSP and modem metadata in the same boot); the GPU pool (0xC0000000) only when that pool is off. (5) Each SCM step logs its time in ms.
+
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index fd1679d..2a947e9 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -101,6 +101,7 @@ uint32_t gpu_log;
+ #define PIL_MEM_SETUP       0x02
+ #define PIL_AUTH_RESET      0x05
+ #define PIL_SHUTDOWN        0x06
++#define PIL_IS_SUPPORTED    0x07
+ #define SCM_ARG_RW          2
+ 
+ #define RB_BYTES            0x8000
+@@ -566,35 +567,28 @@ power_up(void)
+ 
+ /* ---------------------------------------------------------------- TrustZone: the zap shader */
+ 
++/*
++ * laurel 2153: every TrustZone call goes through TopazModem's topaz_scm(): one lock for the whole kernel over
++ * the call and its resume loop (x0 = 1, session in x6), SCM_V2_EBUSY retried after 30 ms (laurel 2404, as
++ * downstream scm.c scm_lock and mainline qcom_scm_lock). The GPU's own unlocked smc() entered TrustZone while
++ * the modem's auth_and_reset was between two of its 35 resumes (boot 2026-11-01 05:52:41) and never came back.
++ */
++extern "C" uint64_t topaz_scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1);
++extern "C" bool     topaz_soc_map(void);
++extern "C" void    *topaz_pool_alloc(uint64_t size, uint64_t *pa);
++
+ static uint64_t
+-smc(uint64_t a[8])
++scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1)
+ {
+-	register uint64_t x0 __asm__("x0") = a[0], x1 __asm__("x1") = a[1], x2 __asm__("x2") = a[2],
+-	    x3 __asm__("x3") = a[3], x4 __asm__("x4") = a[4], x5 __asm__("x5") = a[5], x6 __asm__("x6") = a[6],
+-	    x7 __asm__("x7") = a[7];
+-	__asm__ volatile ("smc #0"
+-            : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
+-            :
+-            : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+-	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3; a[4] = x4; a[5] = x5; a[6] = x6; a[7] = x7;
+-	return x0;
++	return topaz_scm(fn, arginfo, a, b, c, res1);
+ }
+ 
+-static uint64_t
+-scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1)
++static uint32_t
++zap_ms(uint64_t since)
+ {
+-	uint64_t args[8] = { fn, arginfo, a, b, c, 0, 0, 0 };
+-	smc(args);
+-	for (int n = 0; args[0] == 1 && n < 100000; n++) {     /* interrupted: resume with the session in x6 */
+-		uint64_t session = args[6];
+-		uint64_t again[8] = { 1, arginfo, a, b, c, 0, session, 0 };
+-		memcpy(args, again, sizeof(args));
+-		smc(args);
+-	}
+-	if (res1 != NULL) {
+-		*res1 = args[1];
+-	}
+-	return args[0];
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
++	return (uint32_t)(ns / 1000000);
+ }
+ 
+ static bool
+@@ -603,7 +597,7 @@ zap_load(void)
+ 	void *mdt = NULL, *seg = NULL;
+ 	size_t mdt_size = 0, seg_size = 0;
+ 	struct kbuf meta = {};
+-	bool ok = false;
++	bool ok = false, pas_inited = false;
+ 
+ 	/*
+ 	 * laurel: the phone's own zap shader (topaz's embedded one is signed for khaje). Each loadable segment N
+@@ -658,29 +652,65 @@ zap_load(void)
+ 			IOLog("TopazGPU: %s\n", fw_note);
+ 			goto out;
+ 		}
+-		/* laurel: 4 KB pages (TOPAZ_4K): the 6860-byte metadata spans two; pool and midmem buffers are contiguous */
+-		if (mdt_size > 0x10000 || !kbuf_alloc(&meta, mdt_size)) {
+-			IOLog("TopazGPU: zap metadata of %zu bytes: no contiguous buffer\n", mdt_size);
++		/*
++		 * laurel 2153: the metadata (6860 bytes, two 4 KB pages, contiguous) goes where TrustZone already read
++		 * PAS metadata in this boot: the TopazModem pool (ADSP at 0xe0000000, modem at 0xe0003000, both
++		 * accepted). The GPU pool is the fallback only when that pool is off.
++		 */
++		uint64_t meta_pa = 0, t0;
++		uint8_t *meta_va = NULL;
++		const char *meta_where = "modem pool";
++		if (mdt_size > 0x10000) {
++			snprintf(fw_note, sizeof(fw_note), "zap metadata of %zu bytes is too large", mdt_size);
+ 			goto out;
+ 		}
+-		IOLog("TopazGPU: zap: metadata at %#llx\n", meta.pa);
+-		memcpy(meta.va, mdt, mdt_size);
+-		sweet_dcache_clean((vm_offset_t)meta.va, (unsigned)mdt_size);
++		if (topaz_soc_map()) {
++			meta_va = (uint8_t *)topaz_pool_alloc(mdt_size, &meta_pa);
++		}
++		if (meta_va == NULL || meta_pa + mdt_size > 0x100000000ull) {
++			if (!kbuf_alloc(&meta, mdt_size)) {
++				snprintf(fw_note, sizeof(fw_note), "no contiguous buffer for %zu bytes of zap metadata", mdt_size);
++				IOLog("TopazGPU: %s\n", fw_note);
++				goto out;
++			}
++			meta_va = meta.va;
++			meta_pa = meta.pa;
++			meta_where = "GPU pool: modem pool off";
++		}
++		memcpy(meta_va, mdt, mdt_size);
++		sweet_dcache_clean((vm_offset_t)meta_va, (unsigned)mdt_size);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+-		scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
+-		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta.pa, 0, &res);
++		/*
++		 * Self-check: TrustZone answers the PIL service for PAS 13 (fast call). On this TZ the answer in x1 is 0
++		 * even for the modem's PAS 4, which loads (topaz 0116 line 'PAS id 4 supported: ret=0 res=0'), so only
++		 * a failed call (x0 != 0) turns the GPU off. No PAS_SHUTDOWN before init_image: nothing loaded PAS 13 in
++		 * this boot (Linux pil-tz and mainline adreno do not shut down first either); shutdown only after
++		 * init_image succeeded and a later step failed (Linux pil_deinit_image_trusted).
++		 */
++		t0 = mach_absolute_time();
++		st = scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, GPU_PAS_ID, 0, 0, &res);
++		IOLog("TopazGPU: zap: PAS %u is_supported %llx/%llx (%u ms), metadata %zu bytes at %#llx (%s)\n", GPU_PAS_ID,
++		    st, res, zap_ms(t0), mdt_size, meta_pa, meta_where);
++		if (st != 0) {
++			snprintf(fw_note, sizeof(fw_note), "TrustZone has no PIL call for PAS %u: is_supported %llx",
++			    GPU_PAS_ID, st);
++			goto out;
++		}
++		t0 = mach_absolute_time();
++		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta_pa, 0, &res);
+ 		if (st != 0 || res != 0) {
+ 			snprintf(fw_note, sizeof(fw_note), "TrustZone refused the zap shader: init_image %llx/%llx", st, res);
+ 			IOLog("TopazGPU: zap init_image: %llx/%llx\n", st, res);
+ 			goto out;
+ 		}
++		pas_inited = true;
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, GPU_PAS_ID, ZAP_REGION, max_a - min_a, &res);
+ 		if (st != 0 || res != 0) {
+ 			snprintf(fw_note, sizeof(fw_note), "TrustZone mem_setup of %#llx: %llx/%llx", ZAP_REGION, st, res);
+ 			IOLog("TopazGPU: zap mem_setup: %llx/%llx\n", st, res);
+ 			goto out;
+ 		}
+-		IOLog("TopazGPU: zap: init_image and mem_setup ok, copying the segment\n");
++		IOLog("TopazGPU: zap: init_image and mem_setup ok (%u ms), copying the segment\n", zap_ms(t0));
+ 		volatile uint8_t *dst = (volatile uint8_t *)ml_io_map(ZAP_REGION, ZAP_REGION_SIZE);
+ 		if (dst == NULL) {
+ 			goto out;
+@@ -693,8 +723,9 @@ zap_load(void)
+ 			dst[at + i] = ((const uint8_t *)seg)[i];
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
++		t0 = mach_absolute_time();
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, GPU_PAS_ID, 0, 0, &res);
+-		IOLog("TopazGPU: zap auth_and_reset: %llx/%llx\n", st, res);
++		IOLog("TopazGPU: zap auth_and_reset: %llx/%llx (%u ms)\n", st, res, zap_ms(t0));
+ 		ok = st == 0 && res == 0;
+ 		if (!ok) {
+ 			snprintf(fw_note, sizeof(fw_note), "TrustZone refused the zap shader: auth_and_reset %llx/%llx", st, res);
+@@ -704,6 +735,10 @@ zap_load(void)
+ 		}
+ 	}
+ out:
++	if (pas_inited && !ok) {
++		uint64_t sres = 0, sst = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &sres);
++		IOLog("TopazGPU: zap: PAS %u shutdown after the failure: %llx/%llx\n", GPU_PAS_ID, sst, sres);
++	}
+ 	OSSafeReleaseNULL(meta.md);         /* (meta.md is NULL for pool memory: the pool keeps it, as before) */
+ 	topaz_fw_free(mdt, mdt_size);
+ 	topaz_fw_free(seg, seg_size);
