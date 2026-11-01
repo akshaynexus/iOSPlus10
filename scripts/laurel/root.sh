@@ -6,7 +6,8 @@
 #        dyld cache link, plain system keybag); 2. topaz sweet-root-tweaks.py (build 20H392 fixes, launchd,
 #        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped) and
 #        root-tweaks-boldtext.py, root-add-gpu.sh (GPU), root-add-metal.sh (Metal, METAL=0 skips), root-audio.sh
-#        (speaker HAL plug-in; AUDIO=0 skips) and root-bt.sh (Bluetooth userland; BT=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
+#        (speaker HAL plug-in; AUDIO=0 skips), root-bt.sh (Bluetooth userland; BT=0 skips) and root-statusbar.py
+#        (status bar provider for 360x780 pt; STATUSBAR=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
 # Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
 #   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg
@@ -79,6 +80,9 @@ METAL=${METAL:-1} sh "$REPO/scripts/laurel/root-add-metal.sh" "$mnt"
 AUDIO=${AUDIO:-1} bash "$REPO/scripts/laurel/root-audio.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-audio.sh failed; root built without audio" >&2
 # Bluetooth (kernel patch 2600): bluetoothd job back + the BlueTool stand-in; BT=0 skips
 BT=${BT:-1} bash "$REPO/scripts/laurel/root-bt.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-bt.sh failed; root built without Bluetooth" >&2
+# status bar at the native 720x1560 @2x screen (2103): UIKit's own provider override = _FixedSplit, else the red
+# rdar:45025538 bar (docs/laurel_sprout/rtc-statusbar.md); STATUSBAR=0 skips
+STATUSBAR=${STATUSBAR:-1} python3 -I "$REPO/scripts/laurel/root-statusbar.py" "$mnt"
 sync
 umount "$mnt"
 

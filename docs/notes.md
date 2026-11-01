@@ -4215,3 +4215,31 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Built 07:20 in the worktree: 245/245 patches applied, 0 LSE, no warnings in the changed files,
   kernel.development.sweet.4k sha256 5b85d8db1a57ba89cf143ff49db74504c90ae131c6da7f00bcaa09eff1b7487a. With 2154 added: 246/246, 0 LSE.
   NOT BOOTED.
+## Mi A3: lock screen at 1969-12-31 4 PM = no calendar source; red rdar:45025538 bar = no status bar provider for 720 px; 2720 + root-statusbar.py (2026-11-01 07:30, branch t3/laurel-rtc-statusbar)
+- Details: docs/laurel_sprout/rtc-statusbar.md.
+- [V photo 06:50] "Wednesday, December 31" ~4:02 PM = epoch 0 + uptime in PST; [V log] `usblog: settime: error: unknown command`.
+- [V source] SweetPlatformExpert had no getUTCTimeOfDay (IOPlatformExpert gives 0); 2005 had no settime.
+- [V source] PM6125 RTC_RW = SID 0 0x6000 (pm6125.dtsi `qcom,qpnp-rtc`, `qcom,qpnp-rtc-write = <0>`); 4.14 qpnp-rtc.c: subtype
+  0x6005 = 0x01, ctrl 0x6046 bit 7, counter 0x6048..0x604b LE, re-read byte 0 on carry. Android keeps the wall offset in
+  time_daemon (/data/vendor/time; init.qcom.rc), which the iOS root replaced: not reachable. [I] raw counter = time since the first
+  PMIC power-up (not wall time). [U] raw value and APID owner: the first boot prints them.
+- 2720: laurel_rtc.c (negroni 0203 port) via the one SPMI core (user SWEET_SPMI_RTC, reads only; PMIC never written), own offset
+  file /private/var/db/laurel_rtc, build-date floor; USB `settime` (queued from any context, applied by ud_thread with
+  clock_set_calendar_microtime, or taken at the calendar start) and `time`. The 2000 line is now `LAUREL IORTC: ...`.
+- Lesson: in the USB early mode the command server runs in a timer call (interrupt context): a command there must never block
+  (no clock set, no SPMI, no mutex); queue it and let ud_thread do it.
+- [V binary, UIKitCore 20H392 iPhone10,3; scripts/debug/statusbar-re.sh] `_Split` picks a class only when
+  `_nativeDisplayBounds.width` (px) is 828/1080/1125/1170/1242/1284 and the notch matches; else nil while SpringBoard/Jindo is on
+  -> "No status bar visual provider ... rdar://45025538" -> `_UIStatusBarVisualProvider_Fallback` (the red bar). Height is never
+  checked. `_FixedSplit` sizes itself from nativeBounds + the exclusion area. Override: NSUserDefaults suite com.apple.UIKit key
+  `UIStatusBarVisualProviderClassName` (embedded screens; class must conform to `_UIStatusBarVisualProvider`).
+- Fix (root, no kernel): scripts/laurel/root-statusbar.py writes `_UIStatusBarVisualProvider_FixedSplit` into com.apple.UIKit and
+  .GlobalPreferences of mobile and root (root.sh; STATUSBAR=0 skips). Keeps 2103 (720x1560 @2x) and 2200 (touch). Rejected:
+  1125x2436 @3x or 828x1792 @2x + scaling (no kernel scaler, 1.3-2.4x pixels on the A610), LegacyPhone/DynamicSplit (wrong
+  home-button / island identity), Jindo flag off (wide side effects).
+- Tool: scripts/debug/dsc-annotate.py names objc_msgSend stubs, class refs, strings and doubles in `ipsw dyld disass` output
+  (ipsw 3.1 fails on this cache's objc info: "objc_stringhash_t: unexpected EOF").
+- Built: 245/245 patches, 0 LSE, kernel.development.sweet.4k sha256 c895d70fe6d88f6172767cc22821fe1d2e23f80f37c6ab076ffbcc5f2298def4.
+  The 2 `linker command failed` lines in build.log are old (same in the main checkout's build.log). NOT BOOTED; root not rebuilt.
+- Next: boot image with 2720 + root rebuild (owner approves the userdata flash); read `LAUREL RTC: on|off:`, `LAUREL CTL: settime
+  ...: clock set`, `LAUREL RTC: saved offset`; next boot without the host must show the right date; photo: no red bar.

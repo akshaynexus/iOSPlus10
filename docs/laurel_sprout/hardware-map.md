@@ -22,6 +22,7 @@ DDR banks: not in the DT (ABL fills `memory`). Read them from the live FDT (root
 | Touch bus | QUP0 SE2 I2C 0x04a88000, SPI 329, GPIO 6/7 | Q trinket-qupv3.dtsi:125 | QUP0 SE2 | check clocks (0087) |
 | Touch IC | Goodix GT9883 @0x5d **or** FocalTech FT3518 @0x38; IRQ GPIO 88, reset 87, ts_vdd enable GPIO 83 | X touchscreen.dtsi | FT5452 | **FT3518 near FT5452; Goodix path from sweet (0063)**; detect at boot |
 | Keys | power + vol-down: PM6125 PON 0x800; vol-up: PM6125 GPIO 5 | Q pm6125.dtsi:32 | check | verify PMIC SIDs |
+| RTC | PM6125 RTC_RW SID 0 0x6000 (alarm 0x6100), `qcom,qpnp-rtc`, write off (`qpnp-rtc-write = <0>`); counter 0x6048, ctrl 0x6046 bit 7 | Q pm6125.dtsi:163 | none | done in 2720 (reads only, own offset file): `rtc-statusbar.md` |
 | Display | MDP 0x5e00000, DSI0 0x5e94000, PHY 0x5e94400, DISPCC 0x5f00000; Samsung s6e8fco or GVO r692a9 AMOLED, video mode, 720x1560@60, 4 lanes | Q trinket-sde.dtsi, X display/ | 1080x2400 LCD | **panel size, DCS backlight (max 2047), AMOLED on/off** |
 | Splash FB | 0x5c000000, 0xf00000 | Q trinket.dtsi:541 | same | stride 720*4 |
 | GPU | A610 kgsl 0x5900000, SPI 177, chipid 0x06010000; GPUCC 0x5990000; SMMU 0x59a0000; zap `a610_zap` PAS 13 @0x57515000; OPP 320-950 MHz; no GMU | Q trinket-gpu.dtsi | A610 | verify GPU/GPUCC/SMMU bases, zap address |

@@ -166,7 +166,8 @@ N 720x1560 ... -> 0x0`, no `vm_page_find_contiguous` lines, `LAUREL FB CANVAS: f
 Failure signs: no UniXNU menu (Mu 0101: a UEFI driver that cannot use RAM above 4 GiB; flash the previous image, then try the late
 layout),
 `WINDOW ... OF ...` on the screen (DarwinBoot shrank the window), `LAUREL RAM: off: ...`, a red status bar (no iOS layout for
-360x780 points: `sweetfb_native=0` returns to the cropped iPhone X canvas).
+360x780 points; fixed in the root by `scripts/laurel/root-statusbar.py`, docs/laurel_sprout/rtc-statusbar.md; `sweetfb_native=0`
+returns to the cropped iPhone X canvas).
 
 ## Boot CPU: Gold 0x100 after a PSCI hand-off at the kernel entry [decision 2026-11-01 03:40, patch 2016]
 
