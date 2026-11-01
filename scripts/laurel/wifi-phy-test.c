@@ -1,10 +1,12 @@
 /* Host test of LaurelWifiPhy.h + LaurelWifiLink.h: see scripts/laurel/wifi-phy-test.sh. */
 #include <stdbool.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include "LaurelWifiPhy.h"
 #include "LaurelWifiLink.h"
+#include "LaurelWifiPath.h"
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
@@ -42,6 +44,85 @@ beacon(uint8_t *b, bool ht, uint8_t sec, uint8_t vw, uint8_t seg0)
 		}
 	}
 	return n;
+}
+
+/* laurel 2880: LaurelWifiPath.h */
+static void
+path_tests(void)
+{
+	struct lw_ewma be = { 0 }, da = { 0 };
+	static const uint8_t ap[6] = { 0x3c, 0x6a, 0xd2, 1, 2, 3 };
+	uint8_t f[40] = { 0 };
+	uint64_t busy[LW_TX_SLOT_WORDS] = { 0 };
+
+	/* the first samples average, then a swing of 20 dB moves it little */
+	lw_ewma_add(&be, -38, 3);
+	CHECK(lw_ewma_dbm(&be) == -38);
+	lw_ewma_add(&be, -40, 3);
+	CHECK(lw_ewma_dbm(&be) == -39);
+	for (int i = 0; i < 50; i++) {
+		lw_ewma_add(&be, -38, 3);
+	}
+	CHECK(lw_ewma_dbm(&be) == -38);
+	lw_ewma_add(&be, -60, 3);
+	CHECK(lw_ewma_dbm(&be) >= -41 && lw_ewma_dbm(&be) <= -40);
+	/* never past its samples, also long runs and positive values */
+	da = (struct lw_ewma){ 0 };
+	for (int i = 0; i < 1000; i++) {
+		lw_ewma_add(&da, i % 2 ? -47 : -60, 6);
+		CHECK(lw_ewma_dbm(&da) <= -47 && lw_ewma_dbm(&da) >= -60);
+	}
+	/* the log's picture: beacons -38, data -47..-60: iOS gets the beacons while they are fresh, then the data, then the scan */
+	CHECK(lw_signal_pick(&be, 100, &da, -37) == lw_ewma_dbm(&be));
+	CHECK(lw_signal_pick(&be, LW_BEACON_FRESH_MS + 1, &da, -37) == lw_ewma_dbm(&da));
+	da = (struct lw_ewma){ 0 };
+	CHECK(lw_signal_pick(&be, LW_BEACON_FRESH_MS + 1, &da, -37) == -37);
+	be = (struct lw_ewma){ 0 };
+	CHECK(lw_signal_pick(&be, 0, &da, -37) == -37);
+	/* which frames count: QoS data to us from the AP; not multicast, not a null frame, not another AP's, not management */
+	f[0] = 0x88;
+	f[1] = 0x02;
+	memcpy(f + 10, ap, 6);
+	CHECK(lw_is_unicast_data(f, sizeof(f), ap));
+	CHECK(!lw_is_unicast_data(f, 23, ap));
+	f[4] = 0x01;
+	CHECK(!lw_is_unicast_data(f, sizeof(f), ap));
+	f[4] = 0x02;
+	f[0] = 0xC8;                                /* QoS null */
+	CHECK(!lw_is_unicast_data(f, sizeof(f), ap));
+	f[0] = 0x80;                                /* beacon */
+	CHECK(!lw_is_unicast_data(f, sizeof(f), ap));
+	f[0] = 0x08;
+	f[12] ^= 1;
+	CHECK(!lw_is_unicast_data(f, sizeof(f), ap));
+	/* the bars: iOS's own arithmetic against ours, from -100 to -20 dBm, except the two exact edges */
+	for (int rssi = -100; rssi <= -20; rssi++) {
+		float x = (float)rssi + 77.5f;
+		float scaled = x / (2 * fabsf(sqrtf(x * x + 450.0f))) + 0.5f;
+		float b = ceilf(scaled * 3.0f);
+
+		b = b < 1.0f ? 1.0f : b > 3.0f ? 3.0f : b;
+		if (rssi != -70 && rssi != -85) {
+			CHECK((uint32_t)b == lw_ios_bars(rssi));
+		}
+	}
+	CHECK(lw_ios_bars(-37) == 3 && lw_ios_bars(-60) == 3 && lw_ios_bars(-75) == 2 && lw_ios_bars(-90) == 1);
+	/* scans while joined: the log's scans 93 and 94 (0.5 s and 7 s after the join) and 95 (49 s after, 40 s after 94, a page loading) */
+	CHECK(lw_scan_defer(500, 700, 5));
+	CHECK(lw_scan_defer(7000, 5000, 5));
+	CHECK(lw_scan_defer(49000, 40000, 200));
+	CHECK(!lw_scan_defer(49000, 40000, 5));     /* idle */
+	CHECK(lw_scan_defer(49000, 10000, 5));
+	CHECK(!lw_scan_defer(300000, 130000, 15000));   /* a long download still scans at times */
+	/* Tx slots: all of them, each once, then none; a free slot comes back; a wrong id is ignored */
+	for (int i = 0; i < (int)LW_TX_SLOT_WORDS * 64; i++) {
+		CHECK(lw_slot_get(busy) == i);
+	}
+	CHECK(lw_slot_get(busy) == -1);
+	lw_slot_put(busy, 70);
+	lw_slot_put(busy, 5000);
+	CHECK(lw_slot_get(busy) == 70);
+	CHECK(lw_slot_get(busy) == -1);
 }
 
 int
@@ -126,6 +207,7 @@ main(void)
 	CHECK(r.kind == 0 && r.mbps10 == 540);
 	lw_rate_decode(0x04u << 24 | 1u << 4, 0, 0, &r);
 	CHECK(r.kind == 0 && r.mbps10 == 110);
+	path_tests();
 	printf(fails == 0 ? "wifi-phy-test: all checks passed\n" : "wifi-phy-test: %d checks FAILED\n", fails);
 	return fails != 0;
 }

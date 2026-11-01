@@ -1,0 +1,214 @@
+laurel 2886: Wi-Fi: iOS gets RSSI_CHANGED (39) with the smoothed signal, RSSI_BOUNDS (106) answered, request log budget per kind and per link.
+
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -191,9 +191,23 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct
+     offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements) == 0x8c,
+     "a scan's result as iOS 16.5 has it");
+ 
++/*
++ * laurel 2886: RSSI_CHANGED (39). IO80211 20H392 eventArray, its dispatcher at 0x1d3ed7f28 -> __dispatchlqmChangedEvent, length
++ * at least 180: a valid byte at 0 and the dBm at 4 become key "RSSI"; all else is behind valid bytes or flag bits that are 0
++ * here. wifid 0x10004f3f0 -> 0x10005cd14: RSSI -> SCALED_RSSI (0x10003f65c), what SBWiFiManager reads for the bars. Without
++ * this event the bars stay as they were at the link's start.
++ */
++struct apple80211_lqm {
++	uint8_t rssi_valid, unused_0[3];
++	int32_t rssi;
++	uint8_t unused_1[172];
++};
++
++_Static_assert(sizeof(struct apple80211_lqm) == 180, "the link quality event as iOS 16.7 reads it");
++
+ /* Apple80211's events (APPLE80211_M_...) */
+ enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+-       EVENT_SCAN_DONE = 10 };
++       EVENT_SCAN_DONE = 10, EVENT_RSSI_CHANGED = 39 };
+ 
+ static const char interface_name[16] = "en0";   /* (bsd/dev/redwood_net.c makes one interface, and that is its name) */
+ 
+@@ -433,6 +447,16 @@ get(struct apple80211req *request)
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+ 	}
++	case 106: {                             /* laurel 2886: IO80211 20H392 0x1d3ec639c: version 1 in, then RSSI_MIN, RSSI_MAX, RSSI_THRESHOLD */
++		struct {
++			uint32_t version;
++			int32_t minimum, maximum, threshold;
++		} answer = { .version = 1, .minimum = -95, .maximum = -20, .threshold = -80 };
++
++		/* wifid keeps them and logs them; the bars do not use them (0x10003f65c takes the RSSI alone) */
++		error = give(request, &answer, sizeof(answer));
++		break;
++	}
+ 	case 14: {                              /* laurel 2411: what the radio can do and what it does (apple80211_phymode_data) */
+ 		struct {
+ 			uint32_t version, modes, active;
+@@ -636,6 +660,8 @@ post(uint32_t code, const void *data, uint32_t length)
+ 	kev_post_msg(&message);
+ }
+ 
++static void note_link_changed(void);            /* laurel 2886 */
++
+ /* What the station side says has happened (bsd/dev/redwood_sta.c calls this, on its thread or the station's). */
+ void
+ redwood_apple80211_event(enum redwood_sta_event event, int status)
+@@ -664,6 +690,7 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+ 		post(EVENT_ASSOC_DONE, NULL, 0);
+ 		break;
+ 	case REDWOOD_STA_LINK: {
++		note_link_changed();
+ 		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
+ 			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
+ 		struct redwood_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+@@ -681,6 +708,15 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+ 	}
+ }
+ 
++/* laurel 2886: the signal as it is now, from the station's side (topaz_sta.c), in dBm */
++void
++redwood_apple80211_signal(int rssi)
++{
++	struct apple80211_lqm lqm = { .rssi_valid = 1, .rssi = rssi };
++
++	post(EVENT_RSSI_CHANGED, &lqm, sizeof(lqm));
++}
++
+ /* ---- the requests as they arrive --------------------------------------------------------------------- */
+ 
+ /*
+@@ -690,15 +726,33 @@ redwood_apple80211_event(enum redwood_sta_event event, int status)
+ static struct {
+ 	int32_t type;
+ 	bool set;
+-	unsigned times, answered;
++	unsigned times, answered, said;
+ 	int last_error;
+ } kinds[96];
+ static unsigned kind_count;
++static unsigned request_lines;
+ 
++/*
++ * laurel 2886: the first lines of each kind, and again after each change of the link: wifid asks CURRENT_NETWORK hundreds of
++ * times before the join, and a budget of 800 lines ended 4 minutes before the join of the log of 2026-11-01 19:07. So what
++ * it asks a joined radio, and what it gets, was not in the log. Joins, leaves, power and scans are always said.
++ */
+ static void
++note_link_changed(void)
++{
++	lck_mtx_lock(&apple80211_lock);
++	for (unsigned i = 0; i < kind_count; i++) {
++		kinds[i].said = 0;
++	}
++	request_lines = 0;
++	lck_mtx_unlock(&apple80211_lock);
++}
++
++static bool
+ note(const struct apple80211req *request, bool is_set, int error)
+ {
+ 	unsigned i;
++	bool say = is_set && (request->req_type == 10 || request->req_type == 19 || request->req_type == 20 || request->req_type == 22);
+ 
+ 	lck_mtx_lock(&apple80211_lock);
+ 	for (i = 0; i < kind_count && !(kinds[i].type == request->req_type && kinds[i].set == is_set); i++) {
+@@ -710,8 +764,13 @@ note(const struct apple80211req *request, bool is_set, int error)
+ 		kinds[i].times++;
+ 		kinds[i].answered += error == 0;
+ 		kinds[i].last_error = error != 0 ? error : kinds[i].last_error;
++		say = say || kinds[i].said < 4;
++		kinds[i].said++;
+ 	}
++	say = say && request_lines < 800;
++	request_lines += say;
+ 	lck_mtx_unlock(&apple80211_lock);
++	return say;
+ }
+ 
+ void
+@@ -736,7 +795,6 @@ redwood_apple80211_summary(void)
+ errno_t
+ redwood_apple80211_ioctl(u_long command, void *data)
+ {
+-	static unsigned said;
+ 	struct apple80211req *request = data;
+ 	char who[32] = "?", what[200] = "";
+ 	bool is_set = command == SIOCSA80211;
+@@ -747,10 +805,7 @@ redwood_apple80211_ioctl(u_long command, void *data)
+ 	}
+ 	proc_selfname(who, sizeof(who));
+ 	error = is_set ? set(request, what, sizeof(what)) : get(request);
+-	note(request, is_set, error);
+-	/* (a request that is repeated for ever is said a few hundred times) */
+-	if (said < 800) {
+-		said++;
++	if (note(request, is_set, error)) {
+ 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+ 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
+ 		    EOPNOTSUPP ? "REFUSED\n" : "");
+diff --git a/bsd/dev/topaz_sta.c b/bsd/dev/topaz_sta.c
+--- a/bsd/dev/topaz_sta.c
++++ b/bsd/dev/topaz_sta.c
+@@ -4,6 +4,7 @@
+  * made (a radio, link down: no data path yet) and the station attached, so that wifid finds a
+  * Wi-Fi interface and Settings can list what the scans hear. Joining is not there yet.
+  */
++#include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
+@@ -35,6 +36,8 @@ extern int topaz_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uin
+ extern int topaz_wlan_leave(void);
+ extern bool topaz_wlan_joined(void);
+ extern void topaz_wlan_link_now(uint8_t bssid[6], int *rssi, unsigned *mbps, int *mcs, unsigned *apple_phy);
++extern int topaz_wlan_signal_now(void);         /* laurel 2886: smoothed, dBm; 0: not joined */
++extern void redwood_apple80211_signal(int rssi);
+ /* laurel 2883: a place in the radio's queue for one frame (NULL: *why is REDWOOD_TX_FULL or _DOWN), then the frame is in it */
+ extern uint8_t *topaz_wlan_tx_reserve(int *why);
+ extern void topaz_wlan_tx_commit(size_t length);
+@@ -208,12 +211,43 @@ sta_link_changed(bool up)
+ 	}
+ }
+ 
++/*
++ * laurel 2886: the interface's thread asks every 2 to 10 ms. Every 5 s while joined: iOS is told the signal when it moved
++ * 2 dB or more, and at least every 30 s (real drivers tell it all the time: wifid's LQM). The value is smoothed in the radio.
++ */
++static unsigned
++sta_poll(void)
++{
++	static uint64_t next_ms, told_ms;
++	static int told;
++	uint64_t now_ns = 0, now_ms;
++	int rssi;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++	now_ms = now_ns / 1000000;
++	if (now_ms < next_ms) {
++		return 0;
++	}
++	next_ms = now_ms + 5000;
++	rssi = topaz_wlan_signal_now();
++	if (rssi == 0) {
++		told = 0;
++		return 0;
++	}
++	if (told == 0 || rssi - told >= 2 || told - rssi >= 2 || now_ms - told_ms >= 30000) {
++		told = rssi;
++		told_ms = now_ms;
++		redwood_apple80211_signal(rssi);
++	}
++	return 0;
++}
++
+ static struct redwood_net_link sta_link = {
+ 	.name = "wcn3988",
+ 	.wireless = true,
+ 	.up = false,
+ 	.transmit = sta_transmit,
+-	.poll = NULL,
++	.poll = sta_poll,
+ };
+ 
+ /* from the modem thread, once the radio is up: keep it short, the work goes on a thread */

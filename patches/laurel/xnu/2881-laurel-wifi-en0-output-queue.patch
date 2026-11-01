@@ -1,0 +1,289 @@
+laurel 2881: en0 has an output queue with flow control (was: frames straight to the driver, tail drop): a full radio queue stops the sender. Kill switch wifi_txq=0. topaz_sta: one copy into the radio's queue.
+
+diff --git a/bsd/dev/redwood_net.c b/bsd/dev/redwood_net.c
+--- a/bsd/dev/redwood_net.c
++++ b/bsd/dev/redwood_net.c
+@@ -22,8 +22,12 @@
+ #include <net/if_ether.h>
+ #include <net/if_media.h>
+ #include <net/if_types.h>
++#include <net/if_var.h>
++#include <net/classq/if_classq.h>
+ #include <net/kpi_interface.h>
+ #include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <netinet/tcp_var.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/kern_event.h>
+ #include <sys/kpi_mbuf.h>
+@@ -43,8 +47,12 @@ static ifnet_t net_ifp;
+ /* What has gone through: said once a minute while anything moves. */
+ static struct {
+ 	uint64_t sent, received, sent_bytes, received_bytes, dropped_out, dropped_in;
++	/* laurel 2881: why it was dropped; how often the sender waited for the radio */
++	uint64_t drop_full, drop_down, drop_big, drop_nomem, tx_waits;
+ } net_count;
+ 
++static bool net_flow_control;           /* laurel 2881: en0 has an output queue, a full radio makes its sender wait */
++
+ /*
+  * Boot-arg net_trace=N: a line in the log for each of the first N frames, either way.
+  * Boot-arg net_names=1: a line for every name asked of a DNS server and for every TCP connection
+@@ -118,32 +126,85 @@ trace_packet(mbuf_t packet, size_t length)
+ 
+ /* ---- the interface -------------------------------------------------------------------------------- */
+ 
+-/* The stack has a frame to send (a chain of mbufs that starts with the Ethernet header). */
+-static errno_t
+-net_output(ifnet_t ifp, mbuf_t packet)
++/* laurel 2881: what the link did with a frame, counted; `packet` is freed. */
++static void
++net_tx_done(ifnet_t ifp, mbuf_t packet, size_t length, int result)
+ {
+-	size_t length = mbuf_pkthdr_len(packet);
+-	bool sent = false;
+-
+-	if (length <= REDWOOD_NET_FRAME_MAX && net_link_up) {
+-		bpf_tap_out(ifp, DLT_EN10MB, packet, NULL, 0);
+-		trace_packet(packet, length);
+-		lck_mtx_lock(&net_tx_lock);
+-		sent = net_link->transmit(packet, length);
+-		lck_mtx_unlock(&net_tx_lock);
+-	}
+-	if (sent) {
++	if (result == REDWOOD_TX_SENT) {
+ 		net_count.sent++;
+ 		net_count.sent_bytes += length;
+ 		ifnet_stat_increment_out(ifp, 1, (uint32_t)length, 0);
+ 	} else {
+ 		net_count.dropped_out++;
++		if (result == REDWOOD_TX_FULL) {
++			net_count.drop_full++;
++		} else if (result == REDWOOD_TX_DOWN) {
++			net_count.drop_down++;
++		} else {
++			net_count.drop_big++;
++		}
+ 		ifnet_stat_increment_out(ifp, 0, 0, 1);
+ 	}
+ 	mbuf_freem(packet);
++}
++
++/* ... before it goes */
++static void
++net_tx_note(ifnet_t ifp, mbuf_t packet, size_t length)
++{
++	bpf_tap_out(ifp, DLT_EN10MB, packet, NULL, 0);
++	trace_packet(packet, length);
++}
++
++/*
++ * The legacy model (boot-arg wifi_txq=0, or the queue could not be made): the stack has a frame to send (a chain of
++ * mbufs that starts with the Ethernet header) and the frame goes now or never.
++ */
++static errno_t
++net_output(ifnet_t ifp, mbuf_t packet)
++{
++	size_t length = mbuf_pkthdr_len(packet);
++	int result = length > REDWOOD_NET_FRAME_MAX ? REDWOOD_TX_BAD : net_link_up ? REDWOOD_TX_SENT : REDWOOD_TX_DOWN;
++
++	if (result == REDWOOD_TX_SENT) {
++		net_tx_note(ifp, packet, length);
++		lck_mtx_lock(&net_tx_lock);
++		result = net_link->transmit(packet, length);
++		lck_mtx_unlock(&net_tx_lock);
++	}
++	net_tx_done(ifp, packet, length, result);
+ 	return 0;
+ }
+ 
++/*
++ * laurel 2881: the output queue's thread. The stack queues frames in the interface's class queue (FQ-CoDel: one queue per
++ * flow, so a bulk download's ACKs do not delay a DNS question or a SYN) and returns to TCP "the queue is full" (EQFULL, flow
++ * control), not a lost frame. This thread gives frames to the radio's short queue. When that is full it waits here: frames
++ * stay in the class queue, which stops the sender. Log 2026-11-01: 13715 frames lost at that point (dropped out = tx_drop).
++ */
++static void
++net_start(ifnet_t ifp)
++{
++	mbuf_t packet;
++
++	while (ifnet_dequeue(ifp, &packet) == 0) {
++		size_t length = mbuf_pkthdr_len(packet);
++		int result = length > REDWOOD_NET_FRAME_MAX ? REDWOOD_TX_BAD : net_link_up ? REDWOOD_TX_SENT : REDWOOD_TX_DOWN;
++
++		if (result == REDWOOD_TX_SENT) {
++			net_tx_note(ifp, packet, length);
++			while ((result = net_link->transmit(packet, length)) == REDWOOD_TX_FULL && net_link_up) {
++				net_count.tx_waits++;
++				delay_for_interval(200, NSEC_PER_USEC);
++			}
++			if (result == REDWOOD_TX_FULL) {
++				result = REDWOOD_TX_DOWN;
++			}
++		}
++		net_tx_done(ifp, packet, length, result);
++	}
++}
++
+ /* A frame has arrived. */
+ void
+ redwood_net_input(const uint8_t *frame, size_t length)
+@@ -176,6 +237,12 @@ redwood_net_input(const uint8_t *frame, size_t length)
+ 	ifnet_input(net_ifp, packet, &stats);
+ }
+ 
++bool
++redwood_net_flow_control(void)
++{
++	return net_flow_control;
++}
++
+ static unsigned net_ioctls_said;
+ 
+ static errno_t
+@@ -296,10 +363,10 @@ redwood_net_attach(const struct redwood_net_link *link)
+ 		.ver = IFNET_INIT_CURRENT_VERSION,
+ 		.len = sizeof(init),
+ 		/*
+-		 * The simple model: every frame straight to net_output(). And no Skywalk "nexus" made for
++		 * laurel 2881: the model with an output queue (net_start). And no Skywalk "nexus" made for
+ 		 * the interface by itself: sockets are all that is asked of it so far.
+ 		 */
+-		.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO,
++		.flags = IFNET_INIT_NX_NOAUTO,
+ 		.uniqueid = "redwood-en0",
+ 		.uniqueid_len = 11,
+ 		.name = "en",
+@@ -307,7 +374,7 @@ redwood_net_attach(const struct redwood_net_link *link)
+ 		.family = IFNET_FAMILY_ETHERNET,
+ 		.subfamily = link->wireless ? IFNET_SUBFAMILY_WIFI : IFNET_SUBFAMILY_ANY,
+ 		.type = IFT_ETHER,
+-		.output = net_output,
++		.start = net_start,
+ 		.demux = ether_demux,
+ 		.add_proto = ether_add_proto,
+ 		.del_proto = ether_del_proto,
+@@ -321,14 +388,31 @@ redwood_net_attach(const struct redwood_net_link *link)
+ 	ifnet_t ifp = NULL;
+ 	thread_t thread;
+ 	errno_t error;
++	uint32_t want_queue = 1;
+ 
++	PE_parse_boot_argn("wifi_txq", &want_queue, sizeof(want_queue));
+ 	if (net_link != NULL) {
+ 		printf("net: en0 is on %s already; %s is not attached\n", net_link->name, link->name);
+ 		return false;
+ 	}
+ 	net_link = link;
+ 	net_link_up = link->up;
+-	error = ifnet_allocate_extended(&init, &ifp);
++	if (want_queue != 0) {
++		error = ifnet_allocate_extended(&init, &ifp);
++		net_flow_control = error == 0;
++		printf("LAUREL WIFI: tx queue: %s", net_flow_control ? "on: output queue with flow control\n" : "off: ");
++		if (!net_flow_control) {
++			printf("the interface with an output queue cannot be made: error %d\n", error);
++		}
++	} else {
++		printf("LAUREL WIFI: tx queue: off: boot-arg wifi_txq=0\n");
++	}
++	if (!net_flow_control) {
++		init.flags |= IFNET_INIT_LEGACY;
++		init.start = NULL;
++		init.output = net_output;
++		error = ifnet_allocate_extended(&init, &ifp);
++	}
+ 	if (error != 0) {
+ 		printf("net: the interface cannot be made: error %d\n", error);
+ 		net_link = NULL;
+diff --git a/bsd/dev/topaz_sta.c b/bsd/dev/topaz_sta.c
+--- a/bsd/dev/topaz_sta.c
++++ b/bsd/dev/topaz_sta.c
+@@ -35,7 +35,10 @@ extern int topaz_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uin
+ extern int topaz_wlan_leave(void);
+ extern bool topaz_wlan_joined(void);
+ extern void topaz_wlan_link_now(uint8_t bssid[6], int *rssi, unsigned *mbps, int *mcs, unsigned *apple_phy);
+-extern bool topaz_wlan_transmit(const uint8_t *frame, size_t length);
++/* laurel 2883: a place in the radio's queue for one frame (NULL: *why is REDWOOD_TX_FULL or _DOWN), then the frame is in it */
++extern uint8_t *topaz_wlan_tx_reserve(int *why);
++extern void topaz_wlan_tx_commit(size_t length);
++extern void topaz_wlan_tx_limit(unsigned frames);
+ extern void (*topaz_wlan_rx_hook)(const uint8_t *frame, size_t length);
+ extern void (*topaz_wlan_link_hook)(bool up);
+ 
+@@ -174,14 +177,25 @@ static struct redwood_sta_ops sta_ops = {
+ 	.channels = sta_channels,
+ };
+ 
+-static bool
++/* laurel 2883: from the mbufs straight into the radio's queue: one copy. One sender at a time (redwood_net). */
++static int
+ sta_transmit(mbuf_t packet, size_t length)
+ {
+-	static uint8_t frame[REDWOOD_NET_FRAME_MAX];   /* (one sender at a time: redwood_net's tx lock) */
+-	if (length > sizeof(frame) || mbuf_copydata(packet, 0, length, frame) != 0) {
+-		return false;
++	int why = REDWOOD_TX_DOWN;
++	uint8_t *slot;
++
++	if (length < 14 || length > REDWOOD_NET_FRAME_MAX) {
++		return REDWOOD_TX_BAD;
++	}
++	slot = topaz_wlan_tx_reserve(&why);
++	if (slot == NULL) {
++		return why;
+ 	}
+-	return topaz_wlan_transmit(frame, length);
++	if (mbuf_copydata(packet, 0, length, slot) != 0) {
++		return REDWOOD_TX_BAD;
++	}
++	topaz_wlan_tx_commit(length);
++	return REDWOOD_TX_SENT;
+ }
+ 
+ static void
+@@ -216,6 +230,9 @@ sta_bring_up(__unused void *arg, __unused wait_result_t wr)
+ 	topaz_wlan_rx_hook = sta_rx;
+ 	topaz_wlan_link_hook = sta_link_changed;
+ 	if (redwood_net_attach(&sta_link)) {
++		if (!redwood_net_flow_control()) {
++			topaz_wlan_tx_limit(128);       /* laurel 2883: no queue before it: as 2410 */
++		}
+ 		redwood_sta_attach(&sta_ops);
+ 		printf("topaz wifi: en0 and the station are up for iOS\n");
+ 	}
+diff --git a/bsd/sys/redwood_net.h b/bsd/sys/redwood_net.h
+--- a/bsd/sys/redwood_net.h
++++ b/bsd/sys/redwood_net.h
+@@ -26,6 +26,8 @@
+ 
+ #define REDWOOD_NET_FRAME_MAX   1514
+ 
++enum { REDWOOD_TX_SENT, REDWOOD_TX_FULL, REDWOOD_TX_DOWN, REDWOOD_TX_BAD };
++
+ struct redwood_net_link {
+ 	const char *    name;           /* for the log */
+ 	uint8_t         address[6];     /* the interface's Ethernet address */
+@@ -34,10 +36,11 @@ struct redwood_net_link {
+ 	bool            up;             /* frames can pass from the start (else: wait for redwood_net_link_state()) */
+ 	/*
+ 	 * Send one frame: a chain of mbufs, `length` bytes in all, the Ethernet header first. The
+-	 * packet stays the caller's: copy it (mbuf_copydata()). Returns false if it had to be dropped.
++	 * packet stays the caller's: copy it (mbuf_copydata()). Returns what became of it: REDWOOD_TX_*.
++	 * REDWOOD_TX_FULL: try again, the link is draining (laurel 2881: the interface's sender waits).
+ 	 * Called by one thread at a time, never from interrupt context.
+ 	 */
+-	bool            (*transmit)(mbuf_t packet, size_t length);
++	int             (*transmit)(mbuf_t packet, size_t length);
+ 	/*
+ 	 * Optional. Look whether frames have arrived and call redwood_net_input() for each; returns
+ 	 * how many there were. The interface's thread calls it every 2 ms while frames are coming and
+@@ -51,6 +54,7 @@ struct redwood_net_link {
+ bool redwood_net_attach(const struct redwood_net_link *link);
+ /* A frame has arrived. Copied; the buffer is the caller's again on return. */
+ void redwood_net_input(const uint8_t *frame, size_t length);
++bool redwood_net_flow_control(void);    /* en0 has an output queue that stops its senders */
+ /* Frames can pass now / can no longer pass. */
+ void redwood_net_link_state(bool up);
+ 

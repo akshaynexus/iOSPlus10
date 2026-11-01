@@ -1,0 +1,210 @@
+laurel 2884: Wi-Fi Rx: 1 copy a frame (was 2), ring 512, batches; rate and RSSI from this station's data and the AP's beacons only, smoothed.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -27,6 +27,16 @@
+ #include "LaurelWifiLink.h"                     /* laurel 2407 */
+ #include "LaurelWifiPath.h"                     /* laurel 2880 */
+ 
++/* laurel 2884: real milliseconds (g_ms counts passes of the watch loop, about 0.8 a millisecond when idle) */
++static uint64_t
++lw_ms(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000;
++}
++
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #define LOG(fmt, ...)       IOLog("TopazModem: " fmt "\n", ##__VA_ARGS__)
+@@ -2879,6 +2889,7 @@ ce_poll(void)
+ 	}
+ 	for (uint32_t c = 0; c < CE_COUNT; c++) {
+ 		struct ce_state *s = &ce[c];
++		bool posted = false;
+ 		if (!ce_host_rx(c)) {
+ 			continue;
+ 		}
+@@ -2893,6 +2904,9 @@ ce_poll(void)
+ 			s->rx++;
+ 			htc_rx(c, s->rx_buf + (slot % RX_POST) * RX_BUF_SIZE, n);
+ 			ce_post(c);
++			posted = true;
++		}
++		if (posted) {                           /* laurel 2884: one register write per batch */
+ 			mb();
+ 			ce_wr(c, DR_WR_IDX, s->dst_wr);
+ 			any = true;
+@@ -3529,7 +3543,7 @@ scan_start(void)
+ #define H2T_FRAG_DESC_BANK_CFG 6
+ #define T2H_VERSION_CONF    0x00
+ #define T2H_RX_IN_ORD_PADDR_IND 0x12
+-#define HTT_RING_SIZE       256
++#define HTT_RING_SIZE       512                 /* laurel 2884: was 256: 17 ms at the 15000 frames/s of the log; a late poll loses no frames */
+ #define HTT_BUF_SIZE        2048
+ #define HTT_MAX_PENDING_TX  (1024 + 32)
+ #define HTT_EXT_DESC_SIZE   72
+@@ -3556,23 +3570,12 @@ static bool htt_send(const void *d, uint32_t len) { return htt_eid != 0xFF && ht
+ /* laurel 2410: what the status line says; the rate and the signal come from the rx descriptor (ath10k_htt_rx_h_ppdu) */
+ static uint64_t lw_rx_bytes, lw_tx_bytes;
+ static struct lw_rate lw_rx_rate;
+-static int lw_rx_rssi;
+ static uint32_t lw_tx_kbps, lw_nosnap;
+-
+-static void
+-lw_rx_sample(const uint8_t *b, uint32_t mlen)
+-{
+-	const uint8_t *pp = b + 4 * OFF_PPDU_START;
+-
+-	lw_rx_bytes += mlen;
+-	if ((lw_get32(b + 4 * OFF_ATTENTION) & 1) == 0) {
+-		return;                                 /* not the first MPDU: no PPDU fields */
+-	}
+-	if (pp[16] != 0x80 && pp[16] != 0) {        /* rssi_comb, above the noise floor */
+-		lw_rx_rssi = -95 + pp[16];
+-	}
+-	lw_rate_decode(lw_get32(pp + 20), lw_get32(pp + 24), lw_get32(pp + 28), &lw_rx_rate);
++extern "C" {
++void (*topaz_wlan_rx_flush_hook)(void);         /* laurel 2884: the frames so far go to the stack as one batch */
+ }
++static void lw_rx_sample(const uint8_t *b, uint32_t mlen);      /* laurel 2884: below s_bssid */
++static void lw_beacon_sample(const uint8_t *bssid, int rssi);
+ 
+ static void
+ htt_post(uint64_t pa)
+@@ -3714,6 +3717,9 @@ htt_rx(const uint8_t *p, uint32_t len)
+ 			htt_post(pa);                       /* recycle the same buffer */
+ 		}
+ 		htt_publish();
++		if (topaz_wlan_rx_flush_hook != NULL) {
++			topaz_wlan_rx_flush_hook();         /* laurel 2884: this message's frames, one wake of the input thread */
++		}
+ 	}
+ }
+ 
+@@ -3827,6 +3833,7 @@ scan_mgmt_rx(const uint8_t *t, uint32_t len)
+ 	}
+ 	b->seen++;
+ 	b->rssi = (int8_t)rssi;
++	lw_beacon_sample(f + 16, rssi);             /* laurel 2884 */
+ 	b->chan = (uint8_t)chan;
+ 	b->freq = (uint16_t)(chan == 14 ? 2484 : chan < 14 ? 2407 + 5 * chan : 5000 + 5 * chan);
+ 	b->last_ms = g_ms;
+@@ -4281,7 +4288,7 @@ static struct lw_link s_link;
+ static uint8_t s_legacy_bssid[6];               /* a join with HT/VHT failed on this AP: the next one is legacy */
+ static uint8_t lw_avoid_bssid[6];               /* laurel 2409: ... and a legacy join failed too: another AP first */
+ 
+-void (*topaz_wlan_rx_hook)(const uint8_t *frame, size_t length);
++void (*topaz_wlan_rx_hook)(const uint8_t header[14], const uint8_t *payload, size_t length);   /* laurel 2884: parts */
+ void (*topaz_wlan_link_hook)(bool up);
+ 
+ static uint8_t *w_p32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); return p + 4; }
+@@ -5094,7 +5101,7 @@ w_join_poll(void)
+ static void
+ w_rx_native(const uint8_t *f, uint32_t len)
+ {
+-	uint8_t e[14 + 1600];
++	uint8_t e[14 + 1600];                       /* laurel 2884: EAPOL only; other frames: one copy, into the mbuf */
+ 	if (len < 24 + 8 || (f[0] & 0x0C) != 0x08) {
+ 		return;                                 /* data frames only */
+ 	}
+@@ -5115,14 +5122,14 @@ w_rx_native(const uint8_t *f, uint32_t len)
+ 	memcpy(e, da, 6);
+ 	memcpy(e + 6, sa, 6);
+ 	memcpy(e + 12, llc + 6, 2);
+-	memcpy(e + 14, llc + 8, plen);
+ 	if (e[12] == 0x88 && e[13] == 0x8E) {
++		memcpy(e + 14, llc + 8, plen);
+ 		w_eapol_rx(e, 14 + plen);
+ 		return;
+ 	}
+ 	if (s_state == S_UP && topaz_wlan_rx_hook != NULL) {
+ 		rx_up++;
+-		topaz_wlan_rx_hook(e, 14 + plen);
++		topaz_wlan_rx_hook(e, llc + 8, plen);
+ 	}
+ }
+ 
+@@ -5277,6 +5284,11 @@ w_tx_pump(void)
+ 	return n;
+ }
+ 
++/* laurel 2884: the signal: smoothed, beacons and this station's data apart */
++static struct lw_ewma lw_sig_beacon, lw_sig_data;
++static uint64_t lw_sig_beacon_ms;
++static int lw_fw_rssi;
++
+ /* ---- laurel 2410: one line that says how the link goes; firmware's tx rate by WMI peer stats (self-check: "tx ?") */
+ #define CMD_REQUEST_STATS   0x16001
+ #define TAG_REQUEST_STATS   0x8F
+@@ -5311,6 +5323,7 @@ lw_stats_event(const uint8_t *t, uint32_t len)
+ 		const uint8_t *p = data + i * 20;       /* wmi_10x_peer_stats: mac, rssi, tx rate, rx rate */
+ 
+ 		if (memcmp(p, s_bssid, 6) == 0) {
++			lw_fw_rssi = (int)lw_get32(p + 8);  /* laurel 2884: for the line: its unit is not known yet */
+ 			lw_tx_kbps = lw_get32(p + 12);
+ 		}
+ 	}
+@@ -5319,15 +5332,53 @@ lw_stats_event(const uint8_t *t, uint32_t len)
+ static int
+ lw_rssi_now(void)
+ {
+-	if (lw_rx_rssi != 0) {
+-		return lw_rx_rssi;
+-	}
+-	for (uint32_t i = 0; i < nbss; i++) {
++	int heard = 0;
++
++	for (uint32_t i = 0; heard == 0 && i < nbss; i++) {
+ 		if (memcmp(bss[i].bssid, s_bssid, 6) == 0) {
+-			return bss[i].rssi;
++			heard = bss[i].rssi;
+ 		}
+ 	}
+-	return 0;
++	return lw_signal_pick(&lw_sig_beacon, lw_ms() - lw_sig_beacon_ms, &lw_sig_data, heard);
++}
++
++/*
++ * laurel 2884: rate and signal of this station's own data: multicast at 6 Mbps and frames of other kinds are no sign of
++ * either (log: "rx legacy mcs 0 6.0 Mbps" between "VHT mcs 9 433 Mbps"). The frame is the descriptor's payload.
++ */
++static void
++lw_rx_sample(const uint8_t *b, uint32_t mlen)
++{
++	const uint8_t *pp = b + 4 * OFF_PPDU_START;
++
++	lw_rx_bytes += mlen;
++	if ((lw_get32(b + 4 * OFF_ATTENTION) & 1) == 0) {
++		return;                                 /* not the first MPDU: no PPDU fields */
++	}
++	if (s_state != S_UP || !lw_is_unicast_data(b + 4 * OFF_MSDU_PAYLOAD, mlen, s_bssid)) {
++		return;
++	}
++	if (pp[16] != 0x80 && pp[16] != 0) {        /* rssi_comb, above the noise floor */
++		lw_ewma_add(&lw_sig_data, -95 + pp[16], 6);
++	}
++	lw_rate_decode(lw_get32(pp + 20), lw_get32(pp + 24), lw_get32(pp + 28), &lw_rx_rate);
++}
++
++/* laurel 2884: beacons and probe responses of the access point joined (WMI MGMT_RX: about 9 a second while joined, log) */
++static void
++lw_beacon_sample(const uint8_t *bssid, int rssi)
++{
++	if (s_state == S_UP && memcmp(bssid, s_bssid, 6) == 0) {
++		lw_ewma_add(&lw_sig_beacon, rssi, 3);
++		lw_sig_beacon_ms = lw_ms();
++	}
++}
++
++/* what iOS is told, every few seconds, when it has changed */
++extern "C" int
++topaz_wlan_signal_now(void)
++{
++	return s_state == S_UP ? lw_rssi_now() : 0;
+ }
+ 
+ static void

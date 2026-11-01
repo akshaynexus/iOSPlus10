@@ -187,3 +187,109 @@ Firmware accepts PEER_ASSOC with HT/VHT at these values; it starts Tx A-MPDU by 
 aggregation"]; A-MSDU in this Rx path (ath10k: one native-wifi frame per subframe, no pad on WCN3990 in this tree [V source]); 80 MHz on channels marked
 passive in our channel list; wifid accepts the new answers to RATE, MCS, PHY_MODE (layouts from old Apple headers + request sizes in the log [I]);
 the Tx rate unit of peer stats (kbit/s [I]); real throughput.
+
+## Stalls, page load, signal (2026-11-01, patches 2880-2886, branch t3/laurel-wifi-stall)
+
+Owner on the phone: "fast.com and speedtest do not load fast enough, you made it worse, and the Wi-Fi signal level is wrong."
+Log: `logs/laurel-boot-1907.txt`. Status: [V] builds, host test passes, [U] not run on the phone.
+Labels: [V] read in source or the log, [I] inference, [U] unknown.
+
+### What the log shows and what it cannot show
+
+| Time | Event | Kind |
+| --- | --- | --- |
+| 19:14:20 | Join 5220 MHz VHT80 | [V] |
+| 19:14:21-24 | Scan 93, 2.2 s, 39 msdus heard: starts 0.5 s after the join, when DHCP starts | [V scan], [I DHCP] |
+| 19:14:24-27 | Safari, WebKit.Networking; first `connectx` lines at 19:14:27 (46 in that second) | [V] |
+| 19:14:27-29 | Scan 94, 1.7 s, over Safari's first fetches. Reason: 100 frames/s or more was "traffic"; a page's start has fewer | [V] |
+| 19:14:30-19:15:10 | 40 s at 20, 9.5, 5.2, 1.9 Mbps, with drop 0, fail 0, link 292-433 Mbps. CPU at 19:15:00: gold 93 %, silver 70 % | [V] |
+| 19:15:09 | Scan 95 (0.44 s) during that load: 40 s after scan 94 | [V] |
+| 19:15:10-27 | Burst, 179 Mbps in one window: 148853 Rx frames in 10 s = 14900 frames/s. Tx 3500 frames/s + 533 lost | [V] |
+| 19:15:28 on | About 50 frames/s both ways; no more drops. 19:16:01: CPU gold 87 %, silver 82 % at 0.5 Mbps | [V] |
+
+- [V] All 13715 `dropped out` = `tx_drop` = 13715: each is the 128-frame queue full in `topaz_wlan_transmit`. No other reason.
+  Average frame out: 7829153 / 79271 = 99 bytes: nearly all TCP ACKs [I]. A lost ACK does little to a download; a lost SYN or DNS question costs 1 s or more.
+- [I] Why the owner's "worse": before 2405-2411 the link was too slow to fill the queue (`dropped: 0 out` in the old log). Now a burst fills it, and it is one queue
+  for all flows: a DNS question or a SYN of a new page is lost with the ACKs (13 % of frames in the burst). Scans at the start of a page are old, but they stayed.
+- [I] The collapse after the burst: the end of the test (fast.com stops by itself), not a stall: frames go both ways without drops or failures. The log has no TCP
+  counters, so this is not proven. The new `path` line proves or disproves it: retransmits and timeouts at a stall, none at the end of a test.
+- [V code + log] The 16 s gap at 19:15:36 is the line's rule, not a stalled thread: the next line came only when `lw_busy` was true at the 10 s mark, else 60 s. The burst
+  ended about 19:15:28; `SWEET FPS` at 19:15:30: 588 frames in 10 s, longest gap 53 ms. [U] The modem thread's own time: no `t=` line in that window. New field `gap max` shows it.
+- [V] "179 Mbps at 90 % CPU" is not measured: the two CPU lines are at 19:15:00 (5 Mbps) and 19:16:01 (0.5 Mbps). No CPU line lies in the burst. The CPU is that busy without
+  Wi-Fi traffic. New fields: `thread N %`, `N us a frame`.
+- [I] Page load: from 19:14:30 to 19:15:10 the network was not full (1.9-20 Mbps, 179 possible in the same minute, drop 0), and the CPU was. The largest limit of that phase is
+  likely not Wi-Fi: 8 WebContent starts in 34 s, `wifip2pd` started 16 times and `nanotimekitcompaniond` 14 times in 2 min 40 s (about every 10 s: a crash loop [I], not looked at here).
+  Not shown by the log: JS and render time, DNS time, TLS time. So this remains an inference: the owner's report stands, and the next log can separate them.
+- Not visible in this log [U]: DNS (`net_names` is off, no DNS counters), retransmits, IPv6 use, Happy Eyeballs delays. Checked, no sign of a problem: MTU: frames in average 1505 bytes
+  (Rx full size works); `dropped ... 0 in` (no mbuf failures at Rx); `connectx() - failed necp_set_socket_domain_attributes` (255 lines) only says that a tracker note failed, the connect goes on
+  (`uipc_socket.c`); `MiniIONetworkStack` is a registry stub for configd, no TCP in it; 179 Mbps shows that no TCP window limits it near that rate.
+
+### Candidates for the Tx queue full
+
+| Candidate | Result |
+| --- | --- |
+| 128-frame limit (2410) | [V] The place of all the drops. It is the symptom: the queue fills in 32 ms when its reader stops |
+| CE ring full | [V] No: no `htc: send on ep` line in the log |
+| HTT credits | [V] No: HTC endpoint without credit flow |
+| Firmware failures | [V] No: `fail 0` |
+| mbufs | [V] Rx no: `0 in`. Tx does not allocate |
+| Scan | [V] No: no scan in the two windows with most drops |
+| Tx A-MPDU not started | [U] The log has no count. `tx 433` says only the rate |
+| 64 Tx slots, or Rx work in the same thread | [I] One of them. In the burst the reader moved 3500 frames/s: either 64 slots per 18 ms of completions, or 32 frames per 9 ms pass. The log cannot separate them. The new `wait slots ... q ...` fields can. Both are changed |
+
+### What the patches do
+
+- 2881: en0 uses the output-queue model of the kernel (`.start`, FQ-CoDel), as real drivers do; it was `IFNET_INIT_LEGACY`: every frame straight to the driver, returned 0 when dropped.
+  A full radio queue makes the queue's thread wait (200 us steps); frames stay in the class queue; TCP gets EQFULL and flow control, not a lost frame; one flow's frames do not delay another's.
+  Kill switch `wifi_txq=0` (old model, 128 frames, tail drop). If the interface cannot be made: same model, one line.
+- 2882: Rx in parts: payload copied once, directly into the mbuf (was: stack, then mbuf). One `ifnet_input` per batch. Drops by reason. `path` line.
+- 2883: Tx 2 full copies (mbuf -> queue, queue -> firmware slot; was 5: + static frame, + pump frame, + 802.11 frame). Queue without lock, 64 frames. 128 Tx slots (was 64). CE room is checked before a slot is taken (was: a failed send logged one line per frame).
+- 2884: Rx ring 512 (was 256), 1 doorbell per batch. Rate and data RSSI only from unicast data of the AP joined. Beacons of that AP (WMI MGMT_RX, about 9/s in the log) in their own average.
+- 2885: Rx and Tx take turns: 16 messages of each CE, then up to 32 Tx frames; up to 8 turns or 2 ms per pass (was 1 turn per pass). Scan rule: none in the first 30 s of a link; with 20 frames/s or more: at most 1 in 120 s; idle: 1 in 20 s. Others are answered from what was heard.
+- 2886: RSSI_CHANGED event to iOS, RSSI_BOUNDS, log budget per kind.
+- Not changed: checksum offload [I: about 1.5 us per frame, 2 % of a core at the burst's rate; not worth a wrong accept]. Non-cacheable reads of the Rx buffers: the largest remaining copy cost [I]: cached Rx buffers need cache maintenance, not safe to change without the phone.
+
+### What iOS expects: read from iOS 16.7 20H392 (`scripts/debug/wifi-re.sh`, `wifi-xref.py`)
+
+| Item | Verified [V] |
+| --- | --- |
+| RSSI (16) | IO80211 `Apple80211CopyValue` 0x1d3ec470c: 52 bytes in, version 1, +4 radios, +8 unit, +0xc first radio; radios = 1: RSSI_CTL_AGR = +0xc. The layout in the code is right. 52 bytes agree with the log |
+| RATE (8), MCS (57) | Same function, shared case: the answer is the request's `req_val` (+0x14), a number. Code is right; error 6 in the log came before the join |
+| RSSI_BOUNDS (106) | 0x1d3ec639c: 16 bytes in, first word 1; RSSI_MIN +4, RSSI_MAX +8, RSSI_THRESHOLD +0xc. wifid 0x10004b8c8: logs them, keeps the threshold as `SignalStrengthThreshold`. The values -95, -20, -80 are a choice [I]; the bars do not use them |
+| CURRENT_NETWORK (103) | The 271 lines of 103 (`error 6`): the last at 19:09:51; the join was 19:14:20; the log budget of 800 ended at 19:09:57. ENXIO is right when not joined. [U] After the join: no line was left in the log; the new budget shows it |
+| Bars | wifid 0x10003f65c: scaled = 0.5 + x / (2 sqrt(x*x + 450)), x = RSSI + 77.5. SBWiFiManager `_updateSignalStrengthFromRawRSSI:andScaledRSSI:`: bars = ceil(3 * scaled), 1 to 3. So 3 bars above -70 dBm, 2 above -85 dBm, else 1 (host test compares this with the formula) |
+| Why the bars were wrong | wifid updates SCALED_RSSI (0x10005cd14) only from the link event and from event 39 RSSI_CHANGED (`eventArray`; dispatcher 0x1d3ed7f28 -> `__dispatchlqmChangedEvent`, wifid case 0x10004f3f0). The kernel never sent 39: the bars stayed at the value of the join's last frame. SpringBoard: `__WiFiDeviceLinkQualityChanged` |
+| Event 39 data | At least 180 bytes; byte 0 valid, +4 int32 dBm -> key `RSSI`; all else behind valid bytes or flag bits, 0 here. wifid reads the others with GetValueIfPresent |
+
+The signal: frames at 6 Mbps read -37/-38 dBm each time and the scan says -37; VHT data reads -47 to -60 at the same place [V log]. [I] the AP lowers power at high MCS. So iOS gets the beacon average (fresh for 3 s), then the data average, then the scan value.
+At -37 and at -60 iOS draws 3 bars either way. The owner's "wrong" was either the frozen value or a number read from the mixed line [U: the owner has not said which].
+
+### Expected lines
+
+```
+LAUREL WIFI: tx queue: on: output queue with flow control
+apple80211: wifid gets 106 (RSSI_BOUNDS), value 0, 16 bytes: answered
+apple80211: wifid gets 16 (RSSI), value 0, 52 bytes: answered          (after the join)
+apple80211: wifid gets 8 (RATE) ... answered ; gets 57 (MCS) ... answered ; gets 103 (CURRENT_NETWORK) ... answered
+LAUREL WIFI: link 5 GHz ch 44 5220 MHz, 80 MHz VHT QoS 1x1 | rx VHT mcs 9 sgi 80 MHz 433.3 Mbps | tx 433 Mbps | RSSI -38 dBm 3 bars (beacons -38, data -49, fw ..) | down 179.3 up 2.5 Mbps | frames rx .. tx .. fail 0 | drop 0 (full 0 down 0 big 0 nomem 0 queue 0 left 0, in 0) | wait slots .. ce .. q .., q max .., in air .. | thread ..%, pass max .. us, gap max .. ms, .. us a frame | nosnap 0 | scans 92 deferred 8
+LAUREL WIFI: path | tcp sent .. retrans .. timeouts .. dup in .. | connects .. | dns asked .. answers .. | v4 out .. in .. | v6 out .. in .. | sender waited .. times
+```
+
+The numbers are the form, not results. How to read them:
+`drop` with `full` above 0: only with `wifi_txq=0`. `queue`: FQ-CoDel dropped (normal at a low count). `left`: frames thrown away at a link loss.
+`wait slots` high: the firmware is slow to complete frames: look at A-MPDU next. `wait q` high and `slots` 0: the thread cannot keep up. `gap max` above 20 ms: the modem thread was starved.
+`rx legacy` no more between VHT values. `scans` does not rise in the first 30 s of a link.
+
+### Test
+
+1. Boot. Check `tx queue: on`. Join. `scans` must not rise for 30 s. Status bar: compare with the `bars` value of the line.
+2. Open fast.com. Read `link` + `path` lines during the page (before the test starts) and during the test. `drop` stays 0 or low, `dns asked` near `answers`, `retrans` low.
+3. After the test: does the page respond? If traffic falls with `timeouts` rising: a real stall. If without: the test has ended.
+4. Page speed: if `down` is low with `thread` low, `wait` flat, `dns` answered, `retrans` low, while the page is slow: Wi-Fi is not the limit; look at the CPU (crash loops above, WebKit).
+   Boot-arg `net_names=1` (exists) adds a line per DNS question and per TCP connect, with names.
+5. Compare `wifi_txq=0` in the same test: it gives the share of the output queue. If en0 stops sending with `tx queue: on` (`sender waited` rising, `down` 0): boot with `wifi_txq=0` and report it.
+
+### Unproven until the phone test [U]
+
+The output-queue model on this kernel (`if_fake.c` uses the same KPI; no driver of ours has). Whether FQ-CoDel's limits fit. Whether the firmware accepts 512 Rx buffers and 128 Tx frames at once (ath10k `HTT_RX_RING_SIZE_MAX` is 2048 [V htt.h]; our HTT setup has 1056 Tx descriptors [V]).
+That wifid and SpringBoard move the bars on event 39 ([V] by code, not seen running). The unit of `fw` in the line. Real throughput and whether pages load faster.

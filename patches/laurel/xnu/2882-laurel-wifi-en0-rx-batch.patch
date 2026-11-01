@@ -1,0 +1,279 @@
+laurel 2882: en0: Rx in two parts and in batches, one wake of the input thread; drops by reason; path line (TCP retransmits, DNS, IPv6, connects).
+
+diff --git a/bsd/dev/redwood_net.c b/bsd/dev/redwood_net.c
+--- a/bsd/dev/redwood_net.c
++++ b/bsd/dev/redwood_net.c
+@@ -49,6 +49,8 @@ static struct {
+ 	uint64_t sent, received, sent_bytes, received_bytes, dropped_out, dropped_in;
+ 	/* laurel 2881: why it was dropped; how often the sender waited for the radio */
+ 	uint64_t drop_full, drop_down, drop_big, drop_nomem, tx_waits;
++	/* laurel 2882: what the traffic is, for the status line */
++	uint64_t v4[2], v6[2], dns[2], connects;
+ } net_count;
+ 
+ static bool net_flow_control;           /* laurel 2881: en0 has an output queue, a full radio makes its sender wait */
+@@ -126,6 +128,45 @@ trace_packet(mbuf_t packet, size_t length)
+ 
+ /* ---- the interface -------------------------------------------------------------------------------- */
+ 
++/* laurel 2882: one frame's kinds, for the status line. way 0: in, 1: out. `have` bytes of it are at `eth`. */
++static void
++path_count(const uint8_t *eth, size_t have, int way)
++{
++	const uint8_t *ip = eth + ETHER_HDR_LEN, *l4;
++	uint16_t type;
++	unsigned proto;
++
++	if (have < ETHER_HDR_LEN + 1) {
++		return;
++	}
++	type = (uint16_t)(eth[12] << 8 | eth[13]);
++	if (type == ETHERTYPE_IP) {
++		net_count.v4[way]++;
++		if (have < ETHER_HDR_LEN + 20) {
++			return;
++		}
++		proto = ip[9];
++		l4 = ip + 4 * (ip[0] & 0xf);
++	} else if (type == ETHERTYPE_IPV6) {
++		net_count.v6[way]++;
++		if (have < ETHER_HDR_LEN + 40) {
++			return;
++		}
++		proto = ip[6];
++		l4 = ip + 40;
++	} else {
++		return;
++	}
++	if (l4 + 14 > eth + have) {
++		return;
++	}
++	if (proto == IPPROTO_UDP && (way != 0 ? l4[2] << 8 | l4[3] : l4[0] << 8 | l4[1]) == 53) {
++		net_count.dns[way]++;
++	} else if (proto == IPPROTO_TCP && way != 0 && (l4[13] & 0x12) == 0x02) {
++		net_count.connects++;
++	}
++}
++
+ /* laurel 2881: what the link did with a frame, counted; `packet` is freed. */
+ static void
+ net_tx_done(ifnet_t ifp, mbuf_t packet, size_t length, int result)
+@@ -148,12 +189,18 @@ net_tx_done(ifnet_t ifp, mbuf_t packet, size_t length, int result)
+ 	mbuf_freem(packet);
+ }
+ 
+-/* ... before it goes */
++/* ... before it goes: tap, trace, kinds */
+ static void
+ net_tx_note(ifnet_t ifp, mbuf_t packet, size_t length)
+ {
++	uint8_t start[ETHER_HDR_LEN + 60];
++	size_t have = length < sizeof(start) ? length : sizeof(start);
++
+ 	bpf_tap_out(ifp, DLT_EN10MB, packet, NULL, 0);
+ 	trace_packet(packet, length);
++	if (mbuf_copydata(packet, 0, have, start) == 0) {
++		path_count(start, have, 1);
++	}
+ }
+ 
+ /*
+@@ -205,36 +252,101 @@ net_start(ifnet_t ifp)
+ 	}
+ }
+ 
+-/* A frame has arrived. */
++/* laurel 2882: frames kept back for one call of ifnet_input: the input thread is woken once per batch. One link thread. */
++static mbuf_t rx_chain_head, rx_chain_tail;
++static uint32_t rx_chain_frames, rx_chain_bytes;
++
+ void
+-redwood_net_input(const uint8_t *frame, size_t length)
++redwood_net_input_flush(void)
+ {
+-	struct ifnet_stat_increment_param stats = { .packets_in = 1, .bytes_in = (uint32_t)length };
++	struct ifnet_stat_increment_param stats = { .packets_in = rx_chain_frames, .bytes_in = rx_chain_bytes };
++
++	if (rx_chain_head != NULL) {
++		mbuf_t head = rx_chain_head;
++
++		rx_chain_head = rx_chain_tail = NULL;
++		rx_chain_frames = rx_chain_bytes = 0;
++		ifnet_input(net_ifp, head, &stats);
++	}
++}
++
++/* A frame has arrived, in two parts: the Ethernet header, the rest. */
++void
++redwood_net_input_parts(const uint8_t header14[14], const uint8_t *payload, size_t rest)
++{
++	size_t length = ETHER_HDR_LEN + rest;
+ 	unsigned int chunks = 1;
+ 	mbuf_t packet = NULL;
+ 	char *header;
+ 
+-	trace_frame("in ", frame, length, length);
+-	if (net_ifp == NULL || length < ETHER_HDR_LEN || length > REDWOOD_NET_FRAME_MAX ||
+-	    mbuf_allocpacket(MBUF_DONTWAIT, length, &chunks, &packet) != 0) {
++	if (net_trace != 0 || net_names != 0) {
++		uint8_t start[192];
++		size_t have = length < sizeof(start) ? length : sizeof(start);
++
++		memcpy(start, header14, ETHER_HDR_LEN);
++		memcpy(start + ETHER_HDR_LEN, payload, have - ETHER_HDR_LEN);
++		trace_frame("in ", start, have, length);
++	}
++	if (net_ifp == NULL || length > REDWOOD_NET_FRAME_MAX) {
+ 		net_count.dropped_in++;
+ 		return;
+ 	}
+-	if (mbuf_copyback(packet, 0, length, frame, MBUF_DONTWAIT) != 0) {
++	if (mbuf_allocpacket(MBUF_DONTWAIT, length, &chunks, &packet) != 0) {
++		net_count.dropped_in++;
++		net_count.drop_nomem++;
++		return;
++	}
++	if (mbuf_copyback(packet, 0, ETHER_HDR_LEN, header14, MBUF_DONTWAIT) != 0 ||
++	    (rest != 0 && mbuf_copyback(packet, ETHER_HDR_LEN, rest, payload, MBUF_DONTWAIT) != 0)) {
+ 		mbuf_freem(packet);
+ 		net_count.dropped_in++;
++		net_count.drop_nomem++;
+ 		return;
+ 	}
+ 	/* as every Ethernet driver hands a frame up: the header noted and stepped over */
+ 	header = mbuf_data(packet);
++	path_count((const uint8_t *)header, mbuf_len(packet), 0);
+ 	mbuf_pkthdr_setrcvif(packet, net_ifp);
+ 	mbuf_pkthdr_setheader(packet, header);
+ 	mbuf_pkthdr_adjustlen(packet, -ETHER_HDR_LEN);
+-	mbuf_setdata(packet, header + ETHER_HDR_LEN, length - ETHER_HDR_LEN);
++	mbuf_setdata(packet, header + ETHER_HDR_LEN, mbuf_len(packet) - ETHER_HDR_LEN);
+ 	bpf_tap_in(net_ifp, DLT_EN10MB, packet, header, ETHER_HDR_LEN);
+ 	net_count.received++;
+ 	net_count.received_bytes += length;
+-	ifnet_input(net_ifp, packet, &stats);
++	if (rx_chain_head == NULL) {
++		rx_chain_head = packet;
++	} else {
++		mbuf_setnextpkt(rx_chain_tail, packet);
++	}
++	rx_chain_tail = packet;
++	rx_chain_frames++;
++	rx_chain_bytes += (uint32_t)length;
++	if (rx_chain_frames >= 32) {
++		redwood_net_input_flush();
++	}
++}
++
++/* A frame has arrived, whole. */
++void
++redwood_net_input(const uint8_t *frame, size_t length)
++{
++	if (length < ETHER_HDR_LEN) {
++		net_count.dropped_in++;
++		return;
++	}
++	redwood_net_input_parts(frame, frame + ETHER_HDR_LEN, length - ETHER_HDR_LEN);
++	redwood_net_input_flush();
++}
++
++void
++redwood_net_drops_get(uint64_t counts[6])
++{
++	counts[0] = net_count.drop_full;
++	counts[1] = net_count.drop_down;
++	counts[2] = net_count.drop_big;
++	counts[3] = net_count.drop_nomem;
++	counts[4] = net_flow_control && net_ifp != NULL ? net_ifp->if_snd->ifcq_dropcnt.packets : 0;
++	counts[5] = net_count.dropped_in;
+ }
+ 
+ bool
+@@ -243,6 +355,32 @@ redwood_net_flow_control(void)
+ 	return net_flow_control;
+ }
+ 
++/*
++ * laurel 2882: what the traffic is since the last line. TCP's numbers are the whole kernel's (loopback too). dns: UDP port
++ * 53 only (DNS over TLS or HTTPS is TCP); connects: SYN frames out, repeats count. What the status line cannot say itself.
++ */
++void
++redwood_net_path_line(void)
++{
++	static uint32_t tcp_sent, tcp_rexmt, tcp_rto, tcp_dup;
++	static uint64_t v4[2], v6[2], dns[2], connects, waits;
++	uint32_t s = tcpstat.tcps_sndtotal, r = tcpstat.tcps_sndrexmitpack, t = tcpstat.tcps_rexmttimeo, d = tcpstat.tcps_rcvduppack;
++
++	printf("LAUREL WIFI: path | tcp sent %u retrans %u timeouts %u dup in %u | connects %llu | dns asked %llu answers %llu | "
++	    "v4 out %llu in %llu | v6 out %llu in %llu | sender waited %llu times\n", s - tcp_sent, r - tcp_rexmt, t - tcp_rto, d - tcp_dup,
++	    net_count.connects - connects, net_count.dns[1] - dns[1], net_count.dns[0] - dns[0], net_count.v4[1] - v4[1],
++	    net_count.v4[0] - v4[0], net_count.v6[1] - v6[1], net_count.v6[0] - v6[0], net_count.tx_waits - waits);
++	tcp_sent = s;
++	tcp_rexmt = r;
++	tcp_rto = t;
++	tcp_dup = d;
++	memcpy(v4, net_count.v4, sizeof(v4));
++	memcpy(v6, net_count.v6, sizeof(v6));
++	memcpy(dns, net_count.dns, sizeof(dns));
++	connects = net_count.connects;
++	waits = net_count.tx_waits;
++}
++
+ static unsigned net_ioctls_said;
+ 
+ static errno_t
+diff --git a/bsd/dev/topaz_sta.c b/bsd/dev/topaz_sta.c
+--- a/bsd/dev/topaz_sta.c
++++ b/bsd/dev/topaz_sta.c
+@@ -39,7 +39,8 @@ extern void topaz_wlan_link_now(uint8_t bssid[6], int *rssi, unsigned *mbps, int
+ extern uint8_t *topaz_wlan_tx_reserve(int *why);
+ extern void topaz_wlan_tx_commit(size_t length);
+ extern void topaz_wlan_tx_limit(unsigned frames);
+-extern void (*topaz_wlan_rx_hook)(const uint8_t *frame, size_t length);
++extern void (*topaz_wlan_rx_hook)(const uint8_t header[14], const uint8_t *payload, size_t length);
++extern void (*topaz_wlan_rx_flush_hook)(void);
+ extern void (*topaz_wlan_link_hook)(bool up);
+ 
+ static struct redwood_sta_bss sta_joined_bss;
+@@ -198,12 +199,6 @@ sta_transmit(mbuf_t packet, size_t length)
+ 	return REDWOOD_TX_SENT;
+ }
+ 
+-static void
+-sta_rx(const uint8_t *frame, size_t length)
+-{
+-	redwood_net_input(frame, length);
+-}
+-
+ static void
+ sta_link_changed(bool up)
+ {
+@@ -227,7 +222,8 @@ sta_bring_up(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	topaz_wlan_address(sta_link.address);
+ 	memcpy(sta_ops.address, sta_link.address, 6);
+-	topaz_wlan_rx_hook = sta_rx;
++	topaz_wlan_rx_hook = redwood_net_input_parts;
++	topaz_wlan_rx_flush_hook = redwood_net_input_flush;
+ 	topaz_wlan_link_hook = sta_link_changed;
+ 	if (redwood_net_attach(&sta_link)) {
+ 		if (!redwood_net_flow_control()) {
+diff --git a/bsd/sys/redwood_net.h b/bsd/sys/redwood_net.h
+--- a/bsd/sys/redwood_net.h
++++ b/bsd/sys/redwood_net.h
+@@ -54,6 +54,15 @@ struct redwood_net_link {
+ bool redwood_net_attach(const struct redwood_net_link *link);
+ /* A frame has arrived. Copied; the buffer is the caller's again on return. */
+ void redwood_net_input(const uint8_t *frame, size_t length);
++/*
++ * laurel 2882: the same in two parts (the payload copied once, from wherever it is), kept back and handed to the stack
++ * as one chain by redwood_net_input_flush(): the caller flushes after each batch of its radio.
++ */
++void redwood_net_input_parts(const uint8_t header[14], const uint8_t *payload, size_t length);
++void redwood_net_input_flush(void);
++/* laurel 2882: frames that went nowhere and why: full, down, big, no memory, the output queue's own, in; and a line about the traffic */
++void redwood_net_drops_get(uint64_t counts[6]);
++void redwood_net_path_line(void);
+ bool redwood_net_flow_control(void);    /* en0 has an output queue that stops its senders */
+ /* Frames can pass now / can no longer pass. */
+ void redwood_net_link_state(bool up);
