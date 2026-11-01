@@ -35,6 +35,7 @@ DDR banks: not in the DT (ABL fills `memory`). Read them from the live FDT (root
 | Charger/gauge | PMI632 smb5 0x1000-0x1600, QG 0x4800; SMB1355 parallel | Q pmi632.dtsi:187-378 | check | verify 0091/0148 |
 | USB | DWC3 0x4e00000, SPI 255, QUSB2 PHY 0x1613000; high-speed only | Q trinket-usb.dtsi | check | verify |
 | UFS | 0x4804000, SPI 356, PHY 0x4807000 | Q trinket.dtsi:937 | same | none |
+| Camera | CAMSS gen1 (sdm660 type): CCI 0x5c0c000 SPI 207, CSIPHY0-2 0x1628000+0x1000 n, CSID0-3 0x5c30000+0x400 n, ISPIF 0x5c31000, VFE0/1 0x5c10000/0x5c14000 (vfe48), camss_top GDSC 0x145607c; rear IMX586 (or IMX582) 0x1a, depth GC2375H 0x17 / OV02A10 0x3d, front S5KGD1 0x2d, ultrawide S5K4H7 0x10; rails = GPIO LDOs + PM6125 L12A | Q trinket-camera.dtsi, X laurel_sprout-trinket-camera.dtsi, vendor libmmcamera_laurus_* | none | patch 2770 step 1 (chip IDs): `camera.md` |
 
 ## Reserved memory (laurel values)
 
