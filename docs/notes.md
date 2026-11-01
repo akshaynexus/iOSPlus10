@@ -4345,3 +4345,30 @@ Details: `docs/laurel_sprout/battery-power.md`.
   cleared to black after the first iOS frame. Kill switch fbowner=0 (the fbcon move stays).
 - Built 08:08 in the worktree: 251/251 patches, 0 LSE, no warnings in the changed files, kernel.development.sweet.4k sha256
   31d2ccf00451ff1726174c1cc4e56fae14106a209aa4869a9b6d15030e9a948a. NOT BOOTED.
+
+## Mi A3: top bar for the waterdrop = SpringBoard's notch rect from a screen-type table; liblaurel-notch.dylib (2026-11-01, branch t3/laurel-statusbar2, host test only, NOT BOOTED)
+- Details: docs/laurel_sprout/rtc-statusbar.md "C". Reproduce: scripts/debug/statusbar-re.sh (IPSW=, DSC= to reuse a mounted cache).
+- [V Lineage overlay] Waterdrop = `config_mainBuiltInDisplayCutout` 179.2 px wide at the top (curved shoulders), 74 px at y 31.3,
+  53 px deep -> {135.2, 0, 89.6, 26.5} pt at @2; rounded_corner_radius 75 px (37.5 pt); Android bar 35 dp (= 35 pt here).
+- [V 20H392] Status bar class and height: UIKit per process (FixedSplit by default key; `_Split +height` 47, Split1125 44,
+  Split1080 50). Notch rect, safe area, home affordance: SpringBoard's UISDisplayContext (sb_embeddedDisplayDefaultContext:
+  exclusionArea = sb_thisDeviceDisplayShape, displayEdgeInfo = sb_thisDeviceDisplayEdgeInfo), sent to every app.
+- [V 20H392] `__SBHScreenTypeLookup` needs equal bounds + scale (artwork subtype only narrows). 360x780 @2 matches nothing; the
+  gesture-phone fallback by bounds (430x932, 428x926, 414x896, 393x852, 390x844, 375x812) also fails -> type 4 D22Zoomed (320x693
+  @3). Its shape = iPhone X notch 627x90 px at x 249 / 3.516 = {70.8, 0, 178.3, 25.6} pt, centred for 320 pt; edge info top 38,
+  bottom 29, home affordance 21. => MobileGestalt cannot select a better type (no 360x780 entry for any artwork subtype).
+- [V 20H392] FixedSplit centres the time at notch.x / 2 + 0.15 x corner radius and ends the regions at (360 - notch width) / 2:
+  D22Zoomed shape -> time at x 41.5, 178 pt free centre; waterdrop -> time at x 73.5, 89.6 pt free centre.
+- [V 20H392] UIScreen _displayCornerRadius: internal default DisplayCornerRadiusOverride, initial device context, MobileGestalt
+  DeviceCornerRadius. 39 vs 37.5 = 0.2 pt of time position: not changed.
+- [V 20H392] `+sb_displayShapeForScreenType:` type encoding `@24@0:8Q16`; `__sb__mainScreenReferenceBounds/Scale` are what
+  SBHScreenTypeForCurrentDevice uses inside SpringBoard (no UIScreen).
+- Rejected: LegacyPhone (centred time under a 26.5 pt drop), Split1080/1125 overrides (fixed notch / 375 pt insets), MobileGestalt
+  cache edits (no effect on the type; corner radius too small to matter).
+- Done: liblaurel-notch.dylib (swizzles that method: waterdrop for the current type; self-check; one `LAUREL NOTCH: on|off:` line),
+  laurel-springboard (start program of com.apple.SpringBoard: DYLD_INSERT_LIBRARIES + exec Apple's SpringBoard; notch=0; crash
+  guard 2 fast exits), scripts/laurel/notch-build.sh, root-statusbar.py part 2 + `--check ROOT` + `--expect` (NOTCH=0 undo).
+- [V host] Install on a copy of the 20H392 launchd.plist: only ProgramArguments of com.apple.SpringBoard changes; idempotent;
+  NOTCH=0 restores it. Build: no warnings, ARMv8.0 only, links libobjc + libSystem only.
+- [U] launchd with ProgramArguments[0] = our program for a POSIXSpawnType App job (first boot shows it); time's vertical place.
+- Lesson: in `ipsw dyld symaddr` output, C functions appear only as "(regular) NAME" lines; statusbar-re.sh addr() reads both forms.

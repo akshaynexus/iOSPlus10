@@ -41,6 +41,14 @@ sets UIKit's own override `UIStatusBarVisualProviderClassName = _UIStatusBarVisu
 width -> nil provider -> red Fallback bar; read in UIKitCore 20H392). Needs a root rebuild + userdata flash (owner). Next: boot,
 read `LAUREL RTC: on|off:`, `LAUREL CTL: settime ...: clock set`, photo of the lock screen (date, no red bar).
 Details: `docs/laurel_sprout/rtc-statusbar.md`.
+Top bar for the waterdrop (2026-11-01, branch t3/laurel-statusbar2, host test only, NOT BOOTED): [V 20H392] the notch rect, safe area
+and home affordance come from SpringBoard's screen-type table; 360x780 @2 falls back to D22Zoomed (iPhone X notch 178 pt wide,
+centred for 320 pt) -> with FixedSplit the time sits at x 41.5. MobileGestalt cannot pick another type (bounds first). Done:
+liblaurel-notch.dylib in SpringBoard returns the Lineage waterdrop {135.2, 0, 89.6, 26.5} pt (time at x 73.5, group at 286.5,
+89.6 pt free centre); laurel-springboard start program (notch=0, crash guard); notch-build.sh; root-statusbar.py installs both +
+`--check ROOT` / `--expect`. Safe top 38 / bottom 29 / bar 47 stay. Next: `scripts/bg.sh sb2-build scripts/laurel/notch-build.sh`,
+root rebuild + userdata flash (owner), read `LAUREL NOTCH: on:` in /var/tmp/laurel-notch.log, photo of lock + home screen + an app.
+Details: `docs/laurel_sprout/rtc-statusbar.md` "C".
 Bluetooth (2026-11-01 05:30, area G, built, NOT BOOTED): kernel 2600 (WCN3990 on QUP1 SE9 GENI UART, RPM rails, power pulses,
 EDL version, 3000000 baud, crbtfw21.tlv + crnv21.bin from bluetooth_b at run time, HCI reset, BD_ADDR; iOS transport as negroni),
 mkadt /arm-io/bluetooth, userland/laurel/bt + root-bt.sh. Next: boot, read `LAUREL BT: on|off:`, then bluetoothd log + a scan.

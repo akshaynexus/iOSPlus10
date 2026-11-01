@@ -7,7 +7,8 @@
 #        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped) and
 #        root-tweaks-boldtext.py, root-add-gpu.sh (GPU), root-add-metal.sh (Metal, METAL=0 skips), root-audio.sh
 #        (speaker HAL plug-in; AUDIO=0 skips), root-bt.sh (Bluetooth userland; BT=0 skips) and root-statusbar.py
-#        (status bar provider for 360x780 pt; STATUSBAR=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
+#        (status bar provider for 360x780 pt + the waterdrop dylib for SpringBoard from out/laurel/notch, scripts/laurel/notch-build.sh;
+#        STATUSBAR=0 skips both, NOTCH=0 only the dylib); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
 # Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
 #   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg
@@ -81,8 +82,10 @@ AUDIO=${AUDIO:-1} bash "$REPO/scripts/laurel/root-audio.sh" "$mnt" || echo "$(ts
 # Bluetooth (kernel patch 2600): bluetoothd job back + the BlueTool stand-in; BT=0 skips
 BT=${BT:-1} bash "$REPO/scripts/laurel/root-bt.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-bt.sh failed; root built without Bluetooth" >&2
 # status bar at the native 720x1560 @2x screen (2103): UIKit's own provider override = _FixedSplit, else the red
-# rdar:45025538 bar (docs/laurel_sprout/rtc-statusbar.md); STATUSBAR=0 skips
-STATUSBAR=${STATUSBAR:-1} python3 -I "$REPO/scripts/laurel/root-statusbar.py" "$mnt"
+# rdar:45025538 bar; plus the waterdrop as SpringBoard's notch rect (liblaurel-notch.dylib + laurel-springboard from
+# out/laurel/notch, scripts/laurel/notch-build.sh; absent -> a note, Apple's D22Zoomed notch spacing). STATUSBAR=0 skips both,
+# NOTCH=0 only the dylib (docs/laurel_sprout/rtc-statusbar.md B, C)
+STATUSBAR=${STATUSBAR:-1} NOTCH=${NOTCH:-1} python3 -I "$REPO/scripts/laurel/root-statusbar.py" "$mnt"
 sync
 umount "$mnt"
 
