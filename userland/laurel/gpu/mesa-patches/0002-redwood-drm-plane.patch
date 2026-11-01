@@ -1,0 +1,43 @@
+laurel 2913: redwood_drm_plane() (request 0x7c kRedwoodPlane) and REDWOOD_DRM_ANY_LAYOUT: a texture of one plane of an IOSurface; applied by scripts/laurel/mesa-linux.sh to the copy of external/ios-topaz/userland/mesa/redwood-drm.
+
+--- a/redwood_drm.c	2026-11-01 22:42:42.024667286 +0530
++++ b/redwood_drm.c	2026-11-01 22:42:42.032796448 +0530
+@@ -185,6 +185,21 @@
+ 	return 0;
+ }
+ 
++/* laurel 2913: where one plane of an IOSurface is. 0, or -1 with errno (a kernel without request 0x7c) */
++#define REDWOOD_GPU_PLANE       0x7c
++int
++redwood_drm_plane(int fd, struct redwood_drm_plane *plane)
++{
++	int error = call(REDWOOD_GPU_PLANE, plane, sizeof(*plane));
++
++	(void)fd;
++	if (error != 0) {
++		errno = error;
++		return -1;
++	}
++	return 0;
++}
++
+ /*
+  * laurel 2158 (eagl.c finds it with dlsym): the GPU has drawn into an IOSurface. The kernel moves the surface's
+  * seed, as a write lock would, and knows that no CPU write is behind it (no cache push for the next submission).
+--- a/xf86drm.h	2026-11-01 22:42:42.023969484 +0530
++++ b/xf86drm.h	2026-11-01 22:42:42.032819182 +0530
+@@ -73,4 +73,14 @@
+ };
+ int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
+ 
++/* laurel 2913: struct redwood_plane in the kernel's RedwoodGPU.cpp */
++#define REDWOOD_DRM_ANY_LAYOUT  0x40000000u     /* in .surface: the buffer is the memory of the surface, whatever its layout */
++struct redwood_drm_plane {
++	uint32_t surface, plane;
++	uint32_t offset, row_bytes, width, height, bytes_per_element;   /* back */
++	uint32_t planes, pixel_format;
++	uint32_t seed_moves;                    /* back: GPU writes of other clients move the seed */
++};
++int redwood_drm_plane(int fd, struct redwood_drm_plane *plane);
++
+ #endif
