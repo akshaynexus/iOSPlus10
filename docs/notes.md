@@ -4512,3 +4512,15 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Gotcha: my patch numbers sit inside the series (2405-2411); later patches (2760, 2780) touch TopazModem.cpp at other lines. Forward declarations near line 860 would clash: mine are not there.
 - Build [V]: kernel-linux.sh 266/266 patches, 0 LSE, no warnings in the changed files, kernel sha256 782caf572f8e244c7569815dae55f8017464a70155e06162cc26f09fda215b06; `wifi-phy-test.sh` all checks passed (ASan + UBSan).
 - Next: owner test: wifi.md "Test". Compare `wifi_ht=0`, `wifi_scanlimit=0`, `wifi_band=0` to measure each cause.
+## Mi A3: IPA handshake crash = AP did not allocate the GSI channels; patch 2782 (2026-11-01, branch t3/laurel-ipa-gsi; build + host test only, NOT BOOTED)
+- Details: docs/laurel_sprout/cellular.md section 8 (cause, what is not the cause, self-checks, remaining risk, evidence for ipa=0, restart note).
+- [V] GSI 2.2 (IPA v4.2): ipa3_post_init -> ipa3_alloc_gsi_channel; pipe table (lowest enum per pipe): EE 0 channels 5,0,6,7,1,2,3,4,8,9; EE 1: 0,1,2,3,4;
+  EE 2: 0,1. Q6_CMD_PROD = pipe 5, channel 1 of EE 1 = CHID 1 of the assert. [I] cause of this assert; no boot yet.
+- [V] gsi_alloc_channel sends no CH ALLOCATE on GSI 2.2. Generic return code: CNTXT_SCRATCH_0 [7:5], 1 = success; stock only rejects 0 and 7.
+- [V] `local memory at 0x0` is right: SHARED_MEM_SIZE base 0. All INIT_MODEM_DRIVER TLVs = stock.
+- [V] `modem shutting down` = raw DMS mode 5 read once at ~450 ms; not a wrong decode, not the state later. laurel_cell.c never reads again and blocks
+  ONLINE on 5 or < 0: radio cannot go ONLINE after IPA on (open, not fixed).
+- Build [V]: kernel-linux.sh 264/264 patches, 0 failed, 0 LSE, no warnings in the IPA files, kernel sha256 674eb5e4681c2990...; test-ipa.sh PASS (vendor image part skipped: no image in the worktree), test-cell.sh 8/8.
+- Handshake stays off by default (ipa=0 in uefi-image.sh + shim.sh): a modem firmware assert cannot be seen in advance. Test image: IPA_TEST=1.
+- Test pitfall: kstub.h makes `printf` the captured kernel printf; test code that must print uses fprintf(stdout, ...).
+- Worktree build: symlink external/ios-sweet-linux + ios-topaz from the main checkout, cp --reflink out/laurel-kernel/{deps,theos,cache,dl}.

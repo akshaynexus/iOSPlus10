@@ -141,7 +141,7 @@ primary, online, `registered 404-45 Airtel LTE rssi -71 rsrp -98`, then hot swap
 modem never READY (no second line after a crash), no SIM. Result 2026-11-01: 8 of 8 pass. It found two bugs before the
 first boot (the first line came before provisioning, and before the first signal answer).
 
-## 6. Step 2 as built: IPA v4.2 AP side (patches 2775 + 2780; build + host test only, NOT BOOTED)
+## 6. Step 2 as built: IPA v4.2 AP side (patches 2775 + 2780; booted 2026-11-01 17:00: modem crash, section 8; 2782 changes the order below)
 
 ### Step 2 facts
 
@@ -247,3 +247,47 @@ interface with kernel ARP/DHCP answers because iOS configures pdp_ip only throug
    report the SMEM text; boot again with `ipa=0` (radio stays low power, as step 1).
 7. The GPU zap shader now loads through the shared PAS loader: the `TopazGPU: zap ...` lines must be the same as before
    and `LAUREL GPU: on`.
+8. Step 2 with 2782: `IPA_TEST=1 scripts/laurel/uefi-image.sh`, then `fastboot boot` (RAM, one boot; section 8).
+
+## 8. The modem assert in the IPA handshake (patch 2782, 2026-11-01)
+
+Phone [V, boot 17:00:47]: all AP steps passed; 105 ms after INIT_MODEM_DRIVER: `ipa_hal.c:6001: ... Failed to initialize GSI
+channel: CHID 1 errval 6`; Wi-Fi, cell and IPA off. Without INIT_MODEM_DRIVER [V, ipa=0 boot 17:03, boots of 07:45 + 08:12]: no assert.
+
+**Cause.** [V] GSI 2.2 needs the AP to allocate every channel, the modem's too, and 2780 never did: ipa.c ipa3_post_init "GSI 2.2
+requires to allocate all EE GSI channel during device bootup" -> ipa3_alloc_gsi_channel -> gsi_alloc_channel_ee; mainline gsi.c
+`modem_alloc = version == IPA_VERSION_4_2`, "hardware quirk". [V] gsi_alloc_channel sends no ALLOCATE on GSI 2.2 (it expects this
+step). [V] IPA_4_2 table: pipe 5 Q6_CMD_PROD = channel 1 of EE 1 = the CHID of the assert. [I] This is the cause of this assert: the
+firmware is closed, only a boot proves it. [I] errval 6 = GSI_STATUS_INVALID_PARAMS, from the AP's msm_gsi.h enum only.
+
+**Not the cause.** Timing [V]: Android writes /dev/ipa at early-boot; ipa3_qmi_service_init runs from the IPA ready callback, so
+INIT_MODEM_DRIVER always comes after post_init; ours: hardware ready at 98 ms, modem's 0x31:201 at 268 ms. `local memory at 0x0` [V]:
+SHARED_MEM_SIZE 00000415 = base 0, 8360 bytes; stock adds 8 * base, mainline too. All 13 TLVs = stock values (host test); no hash TLVs is
+right (trinket.dtsi qcom,ipa-fltrt-not-hashable); no 0x18 is right (first boot). [U] Android's modem boot moment relative to /dev/ipa.
+
+**Fix (2782).** New order: clock, SMMU, registers, firmware, GSI_STATUS, recheck, channels, local memory, SMEM 497, only then
+QMI. Channels (laurel_ipa_gsi.c): table in stock pipe order (10 AP, 5 modem, 2 uC; EE 0 by CH_CMD + context state, others by generic
+command + SCRATCH_0 code, polled: no GSI interrupt handler). Self-checks: version + layout + registers again after the firmware, channels
+per EE >= 10, ENABLED_PIPES >= 14, code 1 for each channel (stock also accepts 2-6), ERROR_LOG 0, every SRAM word read back, GSI_STATUS
+again before NEW_SERVER. A failure: `LAUREL IPA: off: <why>`, no message to the modem, Wi-Fi not touched. Host test: gsi_test, gate_test.
+
+**What no self-check covers (risk that stays).** The modem firmware runs its own IPA + GSI init after INIT_MODEM_DRIVER and asserts on any
+error; there is no restart, so Wi-Fi stops for that boot. The AP cannot read the modem's channels. Open points [U]: other modem channels and
+the steps after channel init; stock's AP command channel + immediate commands (HDR_INIT_LOCAL, table init) are replaced by SRAM writes;
+no AP consumer on pipe 9 (ctrl_comm_dest_end_pt); uC handlers. So **the handshake stays off by default**: uefi-image.sh + shim.sh pass ipa=0.
+
+**Evidence to remove ipa=0.** `IPA_TEST=1` image, `fastboot boot`, 3 boots, each with: `GSI channels allocated: 10 AP, 5 modem, 2 uC`;
+`modem answered INIT_MODEM_DRIVER: success`; `LAUREL IPA: on:`; `LAUREL WIFI: on` + Wi-Fi associated; no `modem crash reason` for 10 minutes.
+Expected [I], new lines only: `LaurelIPA: after the firmware: IPA_VERSION 0c030300, SHARED_MEM_SIZE 00000415: 8360 bytes at offset 0x0
+(same), .. pipes`, `LaurelIPA: GSI channels allocated: ...`, `LaurelIPA: self-check passed, hardware ready in .. ms (...)`.
+Off examples: `off: GSI channel 1 of EE 1 (pipe 5): ALLOCATE refused, code 7, GLOB_IRQ .., ERROR_LOG ..`. A new assert text = the next cause.
+
+**Modem restart (design note, not built).** It would make every modem assert cost seconds, not Wi-Fi for the boot: PAS 4 shutdown, SMEM GLINK +
+SMP2P reset, QRTR + WLFW state reset, modem load again; stock adds ipa3_q6_pre_shutdown_cleanup + gsi_halt_channel_ee and TLV 0x18 = 1.
+
+**`modem shutting down` in the cell line.** [V] The decode is right: only raw 5 gives this text; table = scion hakios.mpss.c:5212; message 0x2D;
+TLV 1, the same tlv() reads the revision correctly. [V] It is one old read: GET_OPERATING_MODE runs once, ~450 ms after modem start (and after
+SET); no DMS indication is registered; the 17:04:06 line repeats that value. [V] After the read: WLFW up at 730 ms, both USIMs reach ready,
+no FATAL. So 5 was the answer then; the modem is not shutting down. [I] 5 and error 0x4a (07:45; [I] info unavailable) are the modem's values
+before it has a mode. [V] Bug: laurel_cell.c blocks ONLINE on opmode 5 or < 0 and never reads again, so the radio cannot go ONLINE after
+`LAUREL IPA: on`. Not changed here: the first IPA test proves only the handshake. Fix later: read again every 10 s until online.
