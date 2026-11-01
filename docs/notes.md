@@ -4317,7 +4317,7 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - [V] The IMX586 init table sets INCK 0x0136 = 0x1800 (24 MHz); step 1 uses 19.2 MHz TCXO MCLK only for the ID read [I: fine for
   I2C]; streaming needs 24 MHz (GPLL9 M/N 1/24).
 - Fix on the base: 2760's bsd/conf/files hunk did not apply after 2720 (laurel_rtc.c line); context refreshed, no code change.
-- Build [V]: kernel-linux.sh 252/252 patches (merged laurel-int-1 16b1a73), 0 LSE, no warnings in laurel_cam*.c; kernel sha256 e0707f0d...; cam-test 69/69 (9
+- Build [V]: kernel-linux.sh 249/249 patches, 0 LSE, no warnings in laurel_cam*.c; kernel sha256 e0707f0d...; cam-test 69/69 (9
   library entries cross-checked against sensors.txt).
 - Next: boot (boot_b flash, owner), expect `LAUREL CAMERA: on: rear IMX586 (0x1a id 0x0586), depth ..., front S5KGD1 ...,
   ultrawide S5K4H7 ...`; a NACK on one slot = check that slot's rail/reset pins. Then step 2 (RDI frames), step 3 (/dev node),
