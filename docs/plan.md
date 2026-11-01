@@ -1,6 +1,9 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+Microphone round (2026-11-01, branch t3/laurel-mic, patch 2920 + plug-in mic-input.patch, built + host tests, NOT BOOTED): owner "Voice input is not working."
+Done: AMIC1 -> WCD937x ADC1 -> SoundWire TX -> TX macro DEC0 -> TX_CDC_DMA_TX_3 -> ADM -> ASM session 2 -> /dev/redwood-mic -> plug-in "Codec". On by default, mic=0, `LAUREL MIC: on|off`, `LAUREL MIC: first capture: rms N`. Capture gain (HAL + ioctl). XNUtils row. Camera hook stays, with a line that decides. Headphones + earpiece not done.
+Results [V]: 297/297 patches, 0 LSE, printf check OK, kernel sha256 570f52c889b9bece; plug-in 2a4afb9a810dc0ed; armv80-check kernel 21 (no new), plug-ins 0; mic-host-test + xnutils-test PASS. Nothing ran on the phone. Next: boot image + root flash (owner approves), docs/laurel_sprout/audio.md "Microphone", test steps.
 XNUtils round (2026-11-01 21:30, branch t3/laurel-xnutils, built + host test + dry run, NOT RUN ON THE PHONE): owner "build and install XNUtils as a system app, extend it with more info and stats".
 Done: native Linux build (xnutils-build.sh, in build-all.sh), system app + setuid helper in the root (root-xnutils.sh, XNUTILS=0 skips), 18 live sections every 2 s while visible, nothing when hidden; Copy + Share; Metal Auto/All/Probes/Off on the gate's files, GL switch = new file /private/var/db/laurelgl/off read by bbd_wrap.c; kernel 2912 `kern.laurel_stats`: parses the console ring on read + in the log thread, live values from driver variables.
 Results [V]: kernel 293/293 patches, 92 laurel, 0 LSE, sha256 763609fb...; app + helper + pmregister 0 instructions newer than ARMv8.0, no Metal link; xnutils-test.sh PASS on the sample and on the real boot 20:02 log (crash table = system-features.md); root-dry-run.sh PASS with XNUtils. Unproven: section 5 of docs/laurel_sprout/xnutils.md (app start, setuid path, layout, power actions).

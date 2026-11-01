@@ -155,7 +155,8 @@ rp_sec_audio(struct rp *r)
 	} else {
 		rp_row(r, "ADSP", NULL, -1);
 	}
-	rp_row(r, "Microphone", "no driver on this port", -1);
+	rp_srow(r, "Microphone", rp_s(r, "LAUREL MIC"));
+	rp_line(r, "Mic capture", rp_r(r, "LAUREL MIC: first capture"));
 }
 
 /* every "LAUREL X" state line */

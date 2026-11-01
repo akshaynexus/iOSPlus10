@@ -60,6 +60,8 @@
 20:03:16 LAUREL CAMERA: ios session: 30 frames in 1006 ms, 6 read, 1920x1440 exposure 2556 lines (32716 us) gain 1741/256, frame 2604 lines; above black: mean 0; VFE errors 0 (0)
 20:03:16 LAUREL CAMERA: ios: memory at frame 900: footprint 310 MB, malloc 20 MB; by VM tag: 1 2 MB
 20:03:17 LAUREL AUDIO: on: ADSP up (APR), MAX98937 rev 0x43, SEC_MI2S 48 kHz (2 periods back in 13 ms)
+20:03:17 LAUREL MIC: on: WCD937x TX device 1 (chip 0x01, variant 0x1), SoundWire 0x01050000, TX_CDC_DMA_TX_3 48 kHz mono (2 reads back in 41 ms)
+20:03:17 LAUREL MIC: first capture: rms 214 (peak 1830, 48000 frames)
 20:03:17 TopazAudio: t=0.031 adsp SMP2P item 443 appeared (340 bytes)
 20:03:17 TopazAudio: t=60.200 status: slave-kernel 00000006, qrtr node 5, 13 services, pd-mapper 4, apr rx 23 core 1, 0 frames in, 0 starts
 20:03:18 LAUREL RTC: on: 2026-11-01 20:02:30 UTC (raw 12345 + saved offset 678)

@@ -1,0 +1,30 @@
+laurel 2887: the Wi-Fi link status is three printf lines. One printf of 48 values overran os_log's 256-byte buffer: kernel panic log_encode.c:121 'log_fits_cmd' at the first link line of a session (phone 2026-11-01 22:22 and 22:26). 'LAUREL WIFI: link', 'traffic' and 'path cost'.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -5432,16 +5432,19 @@
+ 		absolutetime_to_nanoseconds(lw_gap_max_abs, &gap_ns);
+ 		redwood_net_drops_get(d);
+ 		/* laurel 2884 + 2884: signal smoothed (what iOS is told, the bars it draws, then each source), drops by reason, the Tx waits, what this thread costs */
++		/* laurel 2887: three lines: one printf of 48 values overran os_log's 256-byte buffer (log_encode.c:121 assert: kernel panic) */
+ 		printf("LAUREL WIFI: link %s GHz ch %u %u MHz, %u MHz %s%s %ux%u | rx %s mcs %u %s%u MHz %u.%u Mbps | tx %u Mbps%s | "
+-		    "RSSI %d dBm %u bars (beacons %d, data %d, fw %d) | down %llu.%llu up %llu.%llu Mbps | frames rx %u tx %u fail %u | "
+-		    "drop %llu (full %llu down %llu big %llu nomem %llu queue %llu left %u, in %llu) | wait slots %u ce %u q %u, q max %u, in air %u | "
+-		    "thread %llu%%, pass max %llu us, gap max %llu ms, %llu us a frame | nosnap %u | scans %u deferred %u\n",
++		    "RSSI %d dBm %u bars (beacons %d, data %d, fw %d)\n",
+ 		    s_freq >= 4900 ? "5" : "2.4", s_freq >= 4900 ? (s_freq - 5000) / 5 : (s_freq - 2407) / 5, s_freq, s_link.width,
+ 		    s_link.vht ? "VHT" : s_link.ht ? "HT" : "legacy", s_link.qos ? " QoS" : "", s_link.nss, s_link.nss, kinds[r->kind],
+ 		    r->mcs, r->sgi ? "sgi " : "", r->width, r->mbps10 / 10, r->mbps10 % 10, lw_tx_kbps / 1000, lw_tx_kbps != 0 ? "" : " ?",
+-		    rssi, lw_ios_bars(rssi), lw_ewma_dbm(&lw_sig_beacon), lw_ewma_dbm(&lw_sig_data), lw_fw_rssi,
++		    rssi, lw_ios_bars(rssi), lw_ewma_dbm(&lw_sig_beacon), lw_ewma_dbm(&lw_sig_data), lw_fw_rssi);
++		printf("LAUREL WIFI: traffic down %llu.%llu up %llu.%llu Mbps | frames rx %u tx %u fail %u | "
++		    "drop %llu (full %llu down %llu big %llu nomem %llu queue %llu left %u, in %llu)\n",
+ 		    down / 10, down % 10, up / 10, up % 10, rx_up, tx_sent, tx_fail,
+-		    d[0] + d[1] + d[2] + d[4] + lw_drop_left, d[0], d[1], d[2], d[3], d[4], lw_drop_left, d[5],
++		    d[0] + d[1] + d[2] + d[4] + lw_drop_left, d[0], d[1], d[2], d[3], d[4], lw_drop_left, d[5]);
++		printf("LAUREL WIFI: path cost wait slots %u ce %u q %u, q max %u, in air %u | "
++		    "thread %llu%%, pass max %llu us, gap max %llu ms, %llu us a frame | nosnap %u | scans %u deferred %u\n",
+ 		    lw_wait_slots, lw_wait_ce, lw_wait_q, lw_qmax, tx_sent - tx_done,
+ 		    work_ns * 100 / el, pass_ns / 1000, gap_ns / 1000000, frames != 0 ? work_ns / 1000 / frames : 0,
+ 		    lw_nosnap, lw_scans_real, lw_scans_deferred);

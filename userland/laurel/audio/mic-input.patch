@@ -1,0 +1,231 @@
+--- a/audio_plugin.c
++++ b/audio_plugin.c
+@@ -29,7 +29,9 @@
+  *   "Codec"     one input of one channel: on an iPhone, the audio codec that the built-in
+  *               microphones are on, of which the virtual audio device makes the built-in microphone
+  *               port; its samples come from the kernel, /dev/redwood-mic (the phone's main
+- *               microphone, boot-arg mic=4), which listens only while this input runs (see codec_read())
++ *               microphone; Mi A3: kernel patch 2920, on by default), which listens only while this input
++ *               runs (see codec_read()). The input has a volume control (AVAudioSession's input gain):
++ *               the kernel's capture gain, never silence (MIC_RANGE_DB under the top at scalar 0).
+  *
+  * CoreAudio's own null device ("Null_Device", described in the framework's Info.plist, playing
+  * into nowhere) stays as it is: it is the only device the virtual audio device takes while it
+@@ -197,10 +199,12 @@
+ 	OBJECT_CODEC, OBJECT_CODEC_INPUT,
+ 	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
+ 	OBJECT_CODEC_SOURCE,            /* the codec input's data source control: its microphones */
+-	OBJECT_LAST = OBJECT_CODEC_SOURCE
++	OBJECT_CODEC_VOLUME,            /* the codec input's volume control: the kernel's capture gain */
++	OBJECT_LAST = OBJECT_CODEC_VOLUME
+ };
+ 
+ #define VOLUME_RANGE_DB         48.0    /* from the loudest the kernel allows down to the quietest step above 0 */
++#define MIC_RANGE_DB            24.0    /* the capture gain: 0 dB (Android's level) down to this; no mute */
+ 
+ struct device {
+ 	AudioObjectID object;
+@@ -242,6 +246,7 @@
+ static UInt64 written, refused;         /* frames since the speaker's I/O started */
+ static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
+ static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
++static Float32 mic_volume = 1.0f;       /* the microphone's, 0 to 1 */
+ 
+ static void
+ say(const char *format, ...)
+@@ -275,6 +280,24 @@
+ 	return scalar < 0 ? 0 : scalar > 1 ? 1 : scalar;
+ }
+ 
++/* The capture gain's scale, a straight line of decibels too. */
++static Float32
++mic_scalar_to_db(Float32 scalar)
++{
++	scalar = scalar < 0 ? 0 : scalar > 1 ? 1 : scalar;
++	return (Float32)(-MIC_RANGE_DB * (1.0 - scalar));
++}
++
++static Float32
++mic_db_to_scalar(Float32 db)
++{
++	Float32 scalar = (Float32)(1.0 + db / MIC_RANGE_DB);
++
++	return scalar < 0 ? 0 : scalar > 1 ? 1 : scalar;
++}
++
++static void mic_volume_to_kernel(void);
++
+ /* The volume, to the kernel. With the lock held. */
+ static void
+ volume_to_kernel(void)
+@@ -410,7 +433,9 @@
+ #define LIST(x)         (v.u.words[v.size / sizeof(UInt32)] = (x), v.size += sizeof(UInt32))
+ #define STRING(x)       (v.u.string = (x), v.string = true, v.size = sizeof(CFStringRef))
+ #define FLOAT(x)        (v.u.decimal = (x), v.size = sizeof(Float32))
+-	if (object == OBJECT_SPEAKER_VOLUME) {
++	if (object == OBJECT_SPEAKER_VOLUME || object == OBJECT_CODEC_VOLUME) {
++		bool is_mic = object == OBJECT_CODEC_VOLUME;
++
+ 		switch (selector) {
+ 		case kAudioObjectPropertyBaseClass:
+ 			WORD(kAudioLevelControlClassID);
+@@ -419,25 +444,25 @@
+ 			WORD(kAudioVolumeControlClassID);
+ 			break;
+ 		case kAudioObjectPropertyOwner:
+-			WORD(OBJECT_SPEAKER);
++			WORD(is_mic ? OBJECT_CODEC : OBJECT_SPEAKER);
+ 			break;
+ 		case kAudioObjectPropertyOwnedObjects:
+ 			v.empty = true;
+ 			break;
+ 		case kAudioControlPropertyScope:
+-			WORD(kAudioObjectPropertyScopeOutput);
++			WORD(is_mic ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput);
+ 			break;
+ 		case kAudioControlPropertyElement:
+ 			WORD(0);
+ 			break;
+ 		case kAudioLevelControlPropertyScalarValue:
+-			FLOAT(volume);
++			FLOAT(is_mic ? mic_volume : volume);
+ 			break;
+ 		case kAudioLevelControlPropertyDecibelValue:
+-			FLOAT(scalar_to_db(volume));
++			FLOAT(is_mic ? mic_scalar_to_db(mic_volume) : scalar_to_db(volume));
+ 			break;
+ 		case kAudioLevelControlPropertyDecibelRange:
+-			v.u.range.mMinimum = -VOLUME_RANGE_DB;
++			v.u.range.mMinimum = is_mic ? -MIC_RANGE_DB : -VOLUME_RANGE_DB;
+ 			v.u.range.mMaximum = 0;
+ 			v.size = sizeof(AudioValueRange);
+ 			break;
+@@ -572,6 +597,7 @@
+ 			}
+ 			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeOutput) {
+ 				LIST(OBJECT_CODEC_SOURCE);
++				LIST(OBJECT_CODEC_VOLUME);
+ 			}
+ 			v.empty = v.size == 0;
+ 			break;
+@@ -581,6 +607,7 @@
+ 			}
+ 			if (d->object == OBJECT_CODEC) {
+ 				LIST(OBJECT_CODEC_SOURCE);
++				LIST(OBJECT_CODEC_VOLUME);
+ 			}
+ 			v.empty = v.size == 0;
+ 			break;
+@@ -695,7 +722,7 @@
+ 		return kAudioHardwareUnknownPropertyError;
+ 	}
+ 	/* the rate and the formats can be "set", to the ones there are; the volume can be set */
+-	if (object == OBJECT_SPEAKER_VOLUME) {
++	if (object == OBJECT_SPEAKER_VOLUME || object == OBJECT_CODEC_VOLUME) {
+ 		*settable = address->mSelector == kAudioLevelControlPropertyScalarValue ||
+ 		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
+ 	} else if (object == OBJECT_CODEC_SOURCE) {
+@@ -732,14 +759,20 @@
+ 	if (address == NULL || size == NULL || data == NULL || !has_property(driver, object, client, address)) {
+ 		return object < OBJECT_PLUGIN || object > OBJECT_LAST ? kAudioHardwareBadObjectError : kAudioHardwareUnknownPropertyError;
+ 	}
+-	if (object == OBJECT_SPEAKER_VOLUME && (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
++	if ((object == OBJECT_SPEAKER_VOLUME || object == OBJECT_CODEC_VOLUME) &&
++	    (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
+ 	    address->mSelector == kAudioLevelControlPropertyConvertDecibelsToScalar)) {
+ 		/* what is in the buffer, converted where it is */
+ 		if (room < sizeof(Float32)) {
+ 			return kAudioHardwareBadPropertySizeError;
+ 		}
+-		*(Float32 *)data = address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ?
+-		    scalar_to_db(*(Float32 *)data) : db_to_scalar(*(Float32 *)data);
++		if (object == OBJECT_CODEC_VOLUME) {
++			*(Float32 *)data = address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ?
++			    mic_scalar_to_db(*(Float32 *)data) : mic_db_to_scalar(*(Float32 *)data);
++		} else {
++			*(Float32 *)data = address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ?
++			    scalar_to_db(*(Float32 *)data) : db_to_scalar(*(Float32 *)data);
++		}
+ 		*size = sizeof(Float32);
+ 		return 0;
+ 	}
+@@ -797,6 +830,28 @@
+ 		}
+ 		return 0;
+ 	}
++	if (object == OBJECT_CODEC_VOLUME) {
++		AudioObjectPropertyAddress changed[2] = {
++			{ kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, 0 },
++			{ kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, 0 },
++		};
++		Float32 wanted;
++
++		if (size != sizeof(Float32)) {
++			return kAudioHardwareBadPropertySizeError;
++		}
++		wanted = *(const Float32 *)data;
++		wanted = address->mSelector == kAudioLevelControlPropertyDecibelValue ? mic_db_to_scalar(wanted) :
++		    wanted < 0 ? 0 : wanted > 1 ? 1 : wanted;
++		pthread_mutex_lock(&lock);
++		mic_volume = wanted;
++		mic_volume_to_kernel();
++		pthread_mutex_unlock(&lock);
++		if (host != NULL) {
++			host->PropertiesChanged(host, OBJECT_CODEC_VOLUME, 2, changed);
++		}
++		return 0;
++	}
+ 	if (object == OBJECT_CODEC_SOURCE) {
+ 		/* the one microphone there is */
+ 		return size == sizeof(UInt32) ? (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
+@@ -826,12 +881,28 @@
+ 	}
+ }
+ 
++/* (below: only while the input runs is the device open; codec_open() gives the kernel what was set before) */
++static int mic = -1;
++
++/* The capture gain, to the kernel. With the lock held. */
++static void
++mic_volume_to_kernel(void)
++{
++	struct redwood_audio_volume v = { (uint32_t)lround(-mic_scalar_to_db(mic_volume) * 8), 0 };
++
++	if (mic >= 0 && ioctl(mic, REDWOOD_MIC_SET_VOLUME, &v) < 0) {
++		say("redwood: audio: the capture gain could not be given to the kernel (%s)\n", strerror(errno));
++		return;
++	}
++	say("redwood: audio: the capture gain is %.3f: %.1f dB under the top%s\n", mic_volume, v.below / 8.0,
++	    mic >= 0 ? "" : " (when the input starts)");
++}
++
+ /*
+  * The microphone (the device "Codec"): /dev/redwood-mic is open while the input runs, and the kernel
+  * listens only while it is open. A read gives what has come and never waits; what it does not
+  * give is silence. Said when it starts and stops, with how much came.
+  */
+-static int mic = -1;
+ static UInt64 mic_frames, mic_heard, mic_short;
+ static int mic_peak;
+ 
+@@ -842,6 +913,9 @@
+ 	mic_frames = mic_heard = mic_short = 0;
+ 	mic_peak = 0;
+ 	say("redwood: audio: the microphone is listened to (/dev/redwood-mic: %s)\n", mic < 0 ? strerror(errno) : "open");
++	if (mic >= 0 && mic_volume < 1.0f) {
++		mic_volume_to_kernel();
++	}
+ }
+ 
+ static void
+--- a/redwood_audio.h
++++ b/redwood_audio.h
+@@ -36,6 +36,8 @@
+ 	uint32_t muted;
+ };
+ #define REDWOOD_AUDIO_SET_VOLUME _IOW('r', 1, struct redwood_audio_volume)
++/* On /dev/redwood-mic (Mi A3, kernel patch 2920): the capture gain, eighths of a dB under the top; muted is ignored. */
++#define REDWOOD_MIC_SET_VOLUME _IOW('r', 2, struct redwood_audio_volume)
+ 
+ #ifdef KERNEL
+ #include <stdbool.h>
