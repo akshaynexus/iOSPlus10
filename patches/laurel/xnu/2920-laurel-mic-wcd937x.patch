@@ -1,0 +1,1412 @@
+laurel 2920: the Mi A3 main microphone. Path from the stock tree + LineageOS mixer paths ("amic1"): AMIC1 + MIC BIAS1 1.8 V -> WCD937x ADC1 -> SoundWire TX (master 0x0a470000, slave 0x01170223, codec port 0 -> master port 2, 50 x 16 frame, si 3 off1 1) -> TX macro 0x0a460000 DEC0 -> AFE TX_CDC_DMA_TX_3 (0xB037, 48 kHz 16-bit mono, mask 1) -> ADM record COPP (NULL topology) -> ASM session 2 read, 8 x 20 ms periods in the pool (SID 0x41 identity, msw 1). Rails RPM L9A + L14A (no SPMI: the codec is a SoundWire device). Clocks AFE 0x30c + 0x30d 19.2 MHz: the macros are touched only after both are given. /dev/redwood-mic (the node RedwoodAudio.driver's "Codec" reads): open by the audio server (or root) starts the path, close stops it, read never waits, ioctl _IOW('r', 2) sets the capture gain (DEC0 digital gain 18 dB down to -6 dB). All on the audio thread; playback goes on between the steps. On by default; kill switch mic=0 (adsp=0 too); self-check at boot = the whole path once, 2 reads back in 500 ms; one line LAUREL MIC: on|off: reason; LAUREL MIC: first capture: rms N proves real samples. A failure turns off only the microphone (3 failed starts in a row: off). Details: docs/laurel_sprout/audio.md "Microphone".
+
+diff --git a/iokit/Kernel/arm/TopazAudio.cpp b/iokit/Kernel/arm/TopazAudio.cpp
+--- a/iokit/Kernel/arm/TopazAudio.cpp
++++ b/iokit/Kernel/arm/TopazAudio.cpp
+@@ -1591,12 +1591,17 @@
+ static uint32_t writes_done, write_errors, underflows, stale_events, wgen;
+ 
+ /* write-done events (on this thread, from glink_poll) */
++static bool mic_event(uint32_t opcode, uint32_t token, const uint32_t *p, uint32_t len);       /* LaurelMicStream.inc */
++
+ static bool
+ apr_event(uint8_t svc, uint32_t opcode, uint32_t token, const uint32_t *p, uint32_t len)
+ {
+ 	if (svc != APR_SVC_ASM) {
+ 		return false;
+ 	}
++	if (mic_event(opcode, token, p, len)) {
++		return true;
++	}
+ 	if ((opcode == ASM_WRITE_DONE_V2 || opcode == APR_BASIC_RSP) && (token & WRITE_TOKEN) != 0) {
+ 		uint32_t bit = 1u << (token & 31);
+ 		if (((token >> 8) & 0xFFFF) != wgen) {
+@@ -1997,6 +2002,16 @@
+ 	}
+ }
+ 
++/* ---------------------------------------------------------------- microphone (laurel 2920) */
++
++#include "LaurelMicRegs.inc"
++#include "LaurelMicHw.inc"
++#include "LaurelMicCodec.inc"
++#include "LaurelMicRing.inc"
++#include "LaurelMicPath.inc"
++#include "LaurelMicStream.inc"
++#include "LaurelMicDev.inc"
++
+ /* ---------------------------------------------------------------- self-check + thread */
+ 
+ /* the whole path once, with silence and the amp off: the DSP must give two periods back in 0.5 s */
+@@ -2047,6 +2062,7 @@
+ 		goto out;
+ 	}
+ 	audio_dev_init();                                   /* the node exists even if audio stays off */
++	mic_dev_init();                                     /* so does this one: an open says ENXIO while the mic is off */
+ 	if (killed) {
+ 		say_off("kill switch (boot-arg adsp=0 / laurelaudio=0)");
+ 		goto out;
+@@ -2101,6 +2117,7 @@
+ 		qrtr_poll();
+ 		apr_core_poll();
+ 		stream_poll();
++		mic_poll();
+ 		if (!tried && (core_state == 1 || ms() - up_since > 30000)) {
+ 			tried = true;
+ 			if (core_state != 1) {
+@@ -2115,7 +2132,7 @@
+ 				snprintf(why, sizeof(why), "periods at 0x%llx: the ADSP needs a PA below 4 GiB (the SID is in the upper word)",
+ 				    periods_pa);
+ 				say_off(why);
+-			} else if (!topaz_smmu_identity(AUDIO_SID, 0, "audio")) {
++			} else if (!audio_smmu()) {
+ 				say_off("apps SMMU: no identity context for the audio stream 0x41");
+ 			} else if (!path_check(&done_ms)) {
+ 				say_off(why);
+@@ -2124,10 +2141,20 @@
+ 				IOLog("LAUREL AUDIO: on: ADSP up (APR), MAX989%s7 rev 0x%02x, SEC_MI2S 48 kHz (2 periods back in %u ms)\n",
+ 				    amp == &amp27 ? "2" : "3", amp_rev, done_ms);
+ 			}
++			/* its own line, whatever the speaker's result: it needs only the ADSP */
++			if (core_state == 1) {
++				mic_self_check();
++			} else {
++				mic_say_off("the ADSP's APR core service never said READY");
++			}
+ 		}
+ 		if (*adsp_state & 1) {
+ 			LOG("t=%u.%03u *** ADSP FATAL (slave-kernel %08x) ***", T, *adsp_state);
+ 			crash_reason();
++			if (mic_ready) {
++				mic_running = false;
++				mic_say_off("ADSP fatal error");
++			}
+ 			if (stream_ready) {
+ 				amp_power(false);
+ 				stream_ready = false;
+@@ -2146,7 +2173,7 @@
+ 		if (busy) {
+ 			last_busy = ms();
+ 			IODelay(200);
+-		} else if (!playing && tried) {
++		} else if (!playing && tried && !mic_running) {
+ 			/* idle: 20 ms for 1 s after GLINK traffic, then 200 ms (5 wakeups/s); a write wakes us at once */
+ 			uint32_t wait = ms() - last_busy < 1000 ? 20 : 200;
+ 			assert_wait_timeout((event_t)&stream_wake_flag, THREAD_UNINT, wait, 1000 * NSEC_PER_USEC);
+@@ -2157,15 +2184,18 @@
+ 	}
+ out:
+ 	(void)adsp_up;
++	if (!mic_said) {
++		mic_say_off(killed ? "kill switch (boot-arg adsp=0 / laurelaudio=0)" : "the ADSP did not come up (see the LAUREL AUDIO line)");
++	}
+ 	thread_terminate(current_thread());
+ }
+ 
+-/* on by default; kill switch adsp=0 (or laurelaudio=0) */
++/* on by default; kill switch adsp=0 (or laurelaudio=0); mic=0 turns off only the microphone */
+ extern "C" void
+ topaz_audio_init(void)
+ {
+ 	static bool started;
+-	uint32_t on = 1, on2 = 1;
++	uint32_t on = 1, on2 = 1, on3 = 1;
+ 	thread_t thread;
+ 
+ 	if (started) {
+@@ -2175,6 +2205,8 @@
+ 	(void)PE_parse_boot_argn("adsp", &on, sizeof(on));
+ 	(void)PE_parse_boot_argn("laurelaudio", &on2, sizeof(on2));
+ 	killed = on == 0 || on2 == 0;
++	(void)PE_parse_boot_argn("mic", &on3, sizeof(on3));
++	mic_killed = on3 == 0;
+ 	/* CPU only (writer -> ring -> period_fill copies into the pool): may be above 4 GiB. What the ADSP
+ 	 * reads is in the pool (metadata, periods), the carve-out or SMEM, all below 4 GiB (checked). */
+ 	ring = (int16_t *)IOMallocZero(RING_FRAMES * 4);
+diff --git a/iokit/Kernel/arm/LaurelMicRegs.inc b/iokit/Kernel/arm/LaurelMicRegs.inc
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelMicRegs.inc
+@@ -0,0 +1,114 @@
++/*
++ * laurel 2920: the Mi A3 main microphone, hardware half (included by TopazAudio.cpp).
++ * Path, all from the stock tree (techpack/audio, trinket-audio-overlay.dtsi, trinket-pinctrl.dtsi) and
++ * LineageOS mixer_paths_qrd.xml "amic1": AMIC1 + MIC BIAS1 (1.8 V) -> WCD937x ADC1 ("ADC1 Volume" 12) ->
++ * SoundWire TX (master 0x0a470000, slave ID 0x01170223; codec port 0 -> master port 2) -> TX macro
++ * 0x0a460000 ("TX SMIC MUX0" ADC0, "TX DEC0 MUX" SWR_MIC, DEC0) -> TX_CDC_DMA_TX_3.
++ * No SPMI: the WCD937x is a SoundWire device, its rails are RPM LDOs (L9A, L14A).
++ * Rule from redwood_mic.c (the same chip family, works there): the macros are touched only after the
++ * ADSP gave their clocks (AFE clock 0x30c + 0x30d); a macro without its clock can hang the bus.
++ */
++#define MIC_TX_PA           0x0A460000u
++#define MIC_SWR_PA          0x0A470000u
++#define MIC_VA_PA           0x0A4A0000u
++#define MIC_PINS_PA         0x00D6A000u         /* TLMM EAST 0xd00000 + 106 * 0x1000: swr_tx 106..108 */
++#define MIC_RST_PA          0x00978000u         /* TLMM SOUTH 0x900000 + 120 * 0x1000: WCD937x reset */
++#define MIC_SLEW_PA         0x00D8E000u         /* DT bolero slew_rate_reg1, value 3 */
++#define MIC_PIN_ACTIVE      ((2u << 0) | (1u << 2) | (4u << 6))     /* bus hold, function 1 swr_tx, 10 mA */
++#define MIC_PIN_SLEEP       ((2u << 0) | (1u << 2) | (0u << 6))     /* bus hold, function 1 swr_tx, 2 mA */
++#define MIC_RST_CFG         ((7u << 6) | (1u << 9))                 /* gpio, 16 mA, output */
++
++/* TX macro (bolero-cdc-registers.h, offsets of TX_START_OFFSET) */
++#define TX_MCLK             0x000
++#define TX_FS_CNT           0x004
++#define TX_SWR_CTL          0x008
++#define TX_FREQ_MCLK        0x090
++#define TX_MUX0_CFG0        0x100
++#define TX_MUX0_CFG1        0x104
++#define TX0_PATH_CTL        0x400
++#define TX0_PATH_CFG0       0x404
++#define TX0_VOL             0x40C
++#define TX0_PATH_SEC2       0x418
++#define TX0_PATH_SEC7       0x42C
++#define VA_MCLK             0x000
++#define VA_FS_CNT           0x004
++#define VA_TOP_CFG0         0x080
++
++/* SoundWire master (swrm_registers.h) */
++#define SWRM_VERSION        0x0000
++#define SWRM_COMP_CFG       0x0004
++#define SWRM_SW_RESET       0x0008
++#define SWRM_INT_MASK       0x0204
++#define SWRM_INT_CLEAR      0x0208
++#define SWRM_CPU_INT_EN     0x0210
++#define SWRM_WR_CMD         0x0300
++#define SWRM_RD_CMD         0x0304
++#define SWRM_FIFO_CMD       0x0308
++#define SWRM_FIFO_STATUS    0x030C
++#define SWRM_FIFO_CFG       0x0314
++#define SWRM_RD_FIFO        0x0318
++#define SWRM_ENUM_CFG       0x0500
++#define SWRM_DEV_ID1(d)     (0x0530 + 8 * (d))
++#define SWRM_DEV_ID2(d)     (0x0534 + 8 * (d))
++#define SWRM_FRAME(b)       (0x101C + 0x40 * (b))
++#define SWRM_BUS_CTRL       0x1044
++#define SWRM_MCP_CFG        0x1048
++#define SWRM_MCP_STATUS     0x104C
++#define SWRM_SLV_STATUS     0x1090
++#define SWRM_PORT_CTRL(n, b)   (0x1124 + 0x100 * ((n) - 1) + 0x40 * (b))
++#define SWRM_PORT_CTRL2(n, b)  (0x1128 + 0x100 * ((n) - 1) + 0x40 * (b))
++#define SWRM_PORT_HCTRL(n, b)  (0x1134 + 0x100 * ((n) - 1) + 0x40 * (b))
++#define SWRM_INT_MASK_ALL   0x1FDFDu
++#define SWR_BROADCAST       0xF
++#define SWR_TX_SLAVE_ID     0x01170223u         /* DT wcd937x-tx-slave */
++/* frame words: rows 50 = code 1 << 3; cols 2 = 0, 16 = 7; ssp = 9.6 MHz x 2 / (rows x cols x 4 kHz) */
++#define SWR_FRAME_50_2      ((1u << 3) | 0u | (47u << 16))
++#define SWR_FRAME_50_16     ((1u << 3) | 7u | (5u << 16))
++/* slave registers */
++#define SWRS_INT_MASK_1     0x41
++#define SWRS_FRAME(b)       (0x60 + 0x10 * (b))
++#define SWRS_DIV2(b)        (0xE0 + 0x10 * (b))
++#define SWRS_CH_EN(p, b)    (0x120 + 0x100 * (p) + 0x10 * (b))
++#define SWRS_SAMPLE1(p, b)  (0x122 + 0x100 * (p) + 0x10 * (b))
++#define SWRS_OFF1(p, b)     (0x124 + 0x100 * (p) + 0x10 * (b))
++#define SWRS_OFF2(p, b)     (0x125 + 0x100 * (p) + 0x10 * (b))
++#define SWRS_LANE(p, b)     (0x128 + 0x100 * (p) + 0x10 * (b))
++
++/* WCD937x (wcd937x-registers.h, 0x3000 + ...) */
++#define WCD_ANA_BIAS        0x3001
++#define WCD_TX_CH1          0x300E
++#define WCD_TX_CH2          0x300F
++#define WCD_TX_CH3          0x3010
++#define WCD_TX_CH3_HPF      0x3011
++#define WCD_MICB1           0x3022
++#define WCD_MICB2           0x3023
++#define WCD_MICB3           0x3025
++#define WCD_VBG_ADJ         0x3029
++#define WCD_MICB1_TEST1     0x306B
++#define WCD_MICB1_TEST2     0x306C
++#define WCD_MICB2_TEST1     0x306E
++#define WCD_MICB2_TEST2     0x306F
++#define WCD_MICB3_TEST1     0x3071
++#define WCD_MICB3_TEST2     0x3072
++#define WCD_RX_OCP          0x30B6
++#define WCD_HPH_OCP         0x30CE
++#define WCD_SURGE           0x30E2
++#define WCD_SLEEP           0x3103
++#define WCD_LDO_CFG         0x312A
++#define WCD_CHIP_ID0        0x3401
++#define WCD_ANA_CLK         0x3408
++#define WCD_DIG_CLK         0x3409
++#define WCD_REQ             0x3457
++#define WCD_INT_LEVEL0      0x3474
++#define WCD_EFUSE0          0x34B0
++#define WCD_MICB_1800MV     ((1800 - 1000) / 50)
++#define WCD_ADC1_GAIN       12                  /* mixer path "amic1": ADC1 Volume */
++
++#define MIC_GAIN_DB         18                  /* TX_DEC0 Volume 102 in the mixer defaults: -84 + 102 dB */
++#define MIC_GAIN_MIN_DB     (MIC_GAIN_DB - 24)
++#define MIC_CODEC_PORT      0                   /* qcom,tx_swr_ch_map <0 ADC1 0x1 0 ADC1> */
++#define MIC_MASTER_PORT     2                   /* qcom,swr-port-mapping <2 ADC1 0x1> */
++
++#ifndef MIC_LOG
++#define MIC_LOG(...)        LOG(__VA_ARGS__)
++#endif
+diff --git a/iokit/Kernel/arm/LaurelMicHw.inc b/iokit/Kernel/arm/LaurelMicHw.inc
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelMicHw.inc
+@@ -0,0 +1,201 @@
++/* laurel 2920: MMIO, SoundWire master + WCD937x command helpers (register names: LaurelMicRegs.inc). */
++static volatile uint8_t *mtx, *mswr, *mva, *mpins, *mrst, *mslew;
++static char mic_why[96];
++static uint8_t swr_wid, swr_rid;
++static uint32_t mic_dev;                        /* the codec's number on the bus, 0 = none */
++static uint32_t swrm_version;
++
++/* provided by the includer: waits while GLINK and the speaker go on */
++static void mic_wait(unsigned milliseconds);
++
++static bool
++mic_fail(const char *what, uint32_t a, uint32_t b)
++{
++	if (mic_why[0] == 0) {
++		snprintf(mic_why, sizeof(mic_why), a == 0 && b == 0 ? "%s" : "%s (0x%x 0x%x)", what, a, b);
++	}
++	return false;
++}
++
++#ifndef MIC_HOST_TEST                                   /* the host test gives its own register model */
++static uint32_t
++mic_rd(volatile uint8_t *base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb sy");
++	return v;
++}
++
++static void
++mic_wr(volatile uint8_t *base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb sy");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dmb sy");
++}
++#endif
++
++/* a macro register's bits; those of `check' must read back */
++static bool
++mac_bits(volatile uint8_t *base, uint32_t off, uint32_t mask, uint32_t val, uint32_t check)
++{
++	uint32_t now = (mic_rd(base, off) & ~mask) | (val & mask), back;
++
++	mic_wr(base, off, now);
++	back = mic_rd(base, off);
++	return (back & check) == (now & check) || mic_fail(base == mva ? "VA macro write" : "TX macro write", off, back);
++}
++
++static bool
++mic_map_all(void)
++{
++	if (mtx == NULL) {
++		mtx = (volatile uint8_t *)ml_io_map(MIC_TX_PA, 0x1000);
++		mswr = (volatile uint8_t *)ml_io_map(MIC_SWR_PA, 0x2000);
++		mva = (volatile uint8_t *)ml_io_map(MIC_VA_PA, 0x1000);
++		mpins = (volatile uint8_t *)ml_io_map(MIC_PINS_PA, 0x3000);
++		mrst = (volatile uint8_t *)ml_io_map(MIC_RST_PA, 0x1000);
++		mslew = (volatile uint8_t *)ml_io_map(MIC_SLEW_PA, 0x1000);
++	}
++	return (mtx != NULL && mswr != NULL && mva != NULL && mpins != NULL && mrst != NULL && mslew != NULL) ||
++	       mic_fail("no mapping for the LPASS macros", 0, 0);
++}
++
++/* msm_cdc_pinctrl of wcd937x_reset(): low 20 us, high 20 us. The codec is off the bus until then. */
++static void
++mic_reset_pulse(void)
++{
++	mic_wr(mrst, 4, 0);
++	mic_wr(mrst, 0, MIC_RST_CFG);
++	IODelay(30);
++	mic_wr(mrst, 4, 2);
++	IODelay(30);
++}
++
++static void
++mic_pins(bool on)
++{
++	for (uint32_t i = 0; i < 3; i++) {
++		mic_wr(mpins, 0x1000 * i, on ? MIC_PIN_ACTIVE : MIC_PIN_SLEEP);
++	}
++	if (on) {
++		mic_wr(mslew, 0, 3);
++	}
++}
++
++/* va_macro_mclk_enable() (VA_MCLK widget) + tx_macro_mclk_enable() + tx_macro_swrm_clock() with the first reset */
++static bool
++mic_macro_clocks(void)
++{
++	mic_wr(mtx, TX_FREQ_MCLK, 1);                   /* 9.6 MHz; may read 0 (redwood): not checked */
++	return mac_bits(mva, VA_MCLK, 1, 1, 1) && mac_bits(mva, VA_FS_CNT, 1, 1, 1) && mac_bits(mva, VA_TOP_CFG0, 2, 2, 2) &&
++	       mac_bits(mtx, TX_MCLK, 1, 1, 1) && mac_bits(mtx, TX_FS_CNT, 1, 1, 1) &&
++	       mac_bits(mtx, TX_SWR_CTL, 2, 2, 0) && mac_bits(mtx, TX_SWR_CTL, 1, 1, 1) && mac_bits(mtx, TX_SWR_CTL, 2, 0, 0);
++}
++
++static void
++mic_macro_clocks_off(void)
++{
++	(void)mac_bits(mtx, TX_SWR_CTL, 1, 0, 0);
++	(void)mac_bits(mtx, TX_FS_CNT, 1, 0, 0);
++	(void)mac_bits(mtx, TX_MCLK, 1, 0, 0);
++	(void)mac_bits(mva, VA_TOP_CFG0, 2, 0, 0);
++	(void)mac_bits(mva, VA_FS_CNT, 1, 0, 0);
++	(void)mac_bits(mva, VA_MCLK, 1, 0, 0);
++}
++
++/* swrm_runtime_resume() + swrm_master_init(): 50 x 2 frame, auto enumeration */
++static void
++swrm_on(void)
++{
++	mic_wr(mswr, SWRM_SW_RESET, 1);
++	mic_wr(mswr, SWRM_SW_RESET, 1);
++	mic_wr(mswr, SWRM_FRAME(0), SWR_FRAME_50_2);
++	mic_wr(mswr, SWRM_ENUM_CFG, 1);
++	mic_wr(mswr, SWRM_MCP_CFG, (mic_rd(mswr, SWRM_MCP_CFG) & ~0x3E0000u) | (0x1Fu << 17));
++	mic_wr(mswr, SWRM_FIFO_CFG, 3);
++	mic_wr(mswr, SWRM_BUS_CTRL, 2);
++	mic_wr(mswr, SWRM_COMP_CFG, 2);
++	mic_wr(mswr, SWRM_COMP_CFG, 3);
++	mic_wr(mswr, SWRM_INT_CLEAR, 0xFFFFFFFFu);
++	mic_wr(mswr, SWRM_INT_MASK, SWRM_INT_MASK_ALL);
++	mic_wr(mswr, SWRM_CPU_INT_EN, SWRM_INT_MASK_ALL);
++	swrm_version = mic_rd(mswr, SWRM_VERSION);
++	IODelay(105);
++}
++
++static void
++swrm_off(void)
++{
++	mic_wr(mswr, SWRM_COMP_CFG, 0);
++	mic_wr(mswr, SWRM_INT_MASK, 0);
++	mic_wr(mswr, SWRM_CPU_INT_EN, 0);
++	mic_wr(mswr, SWRM_SW_RESET, 1);
++	mic_dev = 0;
++}
++
++/* SWR_REG_VAL_PACK. Ids 1..14: an empty FIFO reads 0, so id 0 could look like an answer (hackios review S-09). */
++static bool
++swr_put(uint32_t dev, uint32_t reg, uint32_t val, uint32_t id)
++{
++	uint32_t i;
++
++	for (i = 0; i < 20 && ((mic_rd(mswr, SWRM_FIFO_STATUS) >> 8) & 0x1F) >= 16; i++) {
++		IODelay(500);
++	}
++	if (i == 20) {
++		return mic_fail("SoundWire command FIFO full", reg, val);
++	}
++	mic_wr(mswr, SWRM_WR_CMD, (val << 24) | (dev << 20) | (id << 16) | reg);
++	IODelay(255);
++	return true;
++}
++
++static bool
++swr_wcmd(uint32_t dev, uint32_t reg, uint32_t val)
++{
++	swr_wid = swr_wid >= 14 ? 1 : swr_wid + 1;
++	return swr_put(dev, reg, val, swr_wid);
++}
++
++/* swrm_cmd_fifo_rd_cmd(), 3 retries; the last one clears the FIFO and asks again */
++static bool
++swr_read(uint32_t reg, uint8_t *val)
++{
++	uint32_t cmd, ans = 0;
++
++	swr_rid = swr_rid >= 14 ? 1 : swr_rid + 1;
++	cmd = (1u << 24) | (mic_dev << 20) | ((uint32_t)swr_rid << 16) | reg;
++	IODelay(105);
++	mic_wr(mswr, SWRM_RD_CMD, cmd);
++	IODelay(255);
++	for (uint32_t t = 0; t < 4; t++) {
++		ans = mic_rd(mswr, SWRM_RD_FIFO);
++		if (((ans >> 8) & 0xF) == swr_rid) {
++			*val = (uint8_t)ans;
++			return true;
++		}
++		IODelay(505);
++		if (t == 2) {
++			mic_wr(mswr, SWRM_FIFO_CMD, 1);
++			mic_wr(mswr, SWRM_RD_CMD, cmd);
++		}
++	}
++	return mic_fail("SoundWire read: no answer", reg, ans);
++}
++
++/* swrm_get_logical_dev_num(): the codec's TX device on the bus */
++static uint32_t
++swr_find_codec(unsigned wait_ms)
++{
++	for (unsigned t = 0; t <= wait_ms; t++) {
++		for (uint32_t d = 1; d <= 11; d++) {
++			uint32_t st = (mic_rd(mswr, SWRM_SLV_STATUS) >> (2 * d)) & 3;
++			if (mic_rd(mswr, SWRM_DEV_ID1(d)) == SWR_TX_SLAVE_ID && (st == 1 || st == 2)) {
++				return d;
++			}
++		}
++		mic_wait(1);
++	}
++	return 0;
++}
+diff --git a/iokit/Kernel/arm/LaurelMicCodec.inc b/iokit/Kernel/arm/LaurelMicCodec.inc
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelMicCodec.inc
+@@ -0,0 +1,215 @@
++/*
++ * laurel 2920: WCD937x + TX macro decimator 0 for ADC1, in the order of a recording under Android:
++ * wcd937x_bind() + wcd937x_init_reg(), MIC BIAS1, tx_macro_enable_dec(), ADC1 + ADC1 REQ, then
++ * swrm_slvdev_datapath_control(). A SoundWire read that gets no answer stops the start (the bus is dead). A codec
++ * register that reads back another value is said (first 8) and the start goes on: Android never reads them back, and
++ * some bits clear themselves on this chip family (redwood_mic.c); the "first capture" line tells if it matters.
++ */
++static uint32_t codec_mismatch;
++
++static void
++codec_said(uint32_t reg, uint8_t want, uint8_t got)
++{
++	if (codec_mismatch++ < 8) {
++		MIC_LOG("mic: codec 0x%04x: wrote 0x%02x, reads 0x%02x", reg, want, got);
++	}
++}
++
++static bool
++codec_put(uint32_t reg, uint8_t val)
++{
++	uint8_t back = 0;
++
++	if (!swr_wcmd(mic_dev, reg, val) || !swr_read(reg, &back)) {
++		return false;
++	}
++	if (back != val) {
++		codec_said(reg, val, back);
++	}
++	return true;
++}
++
++/* regmap_update_bits(): no write when the bits are right */
++static bool
++codec_bits(uint32_t reg, uint8_t mask, uint8_t val)
++{
++	uint8_t now = 0;
++
++	if (!swr_read(reg, &now)) {
++		return false;
++	}
++	if ((now & mask) == (val & mask)) {
++		return true;
++	}
++	if (!swr_wcmd(mic_dev, reg, (uint8_t)((now & ~mask) | (val & mask)))) {
++		return false;
++	}
++	if (!swr_read(reg, &now)) {
++		return false;
++	}
++	if ((now & mask) != (val & mask)) {
++		codec_said(reg, (uint8_t)((now & ~mask) | (val & mask)), now);
++	}
++	return true;
++}
++
++/* chip ID + variant, once the codec is on the bus: the self-check's proof that this is a WCD937x */
++static bool
++codec_identify(uint8_t *id0, uint8_t *efuse)
++{
++	return swr_read(WCD_CHIP_ID0, id0) && swr_read(WCD_EFUSE0, efuse);
++}
++
++static bool
++codec_init(void)
++{
++	/* wcd937x_bind(): edge interrupts; qcom,cdc-micbias1..3-mv 1800 */
++	for (uint32_t i = 0; i < 3; i++) {
++		if (!codec_put(WCD_INT_LEVEL0 + i, 0)) {
++			return false;
++		}
++	}
++	if (!codec_bits(WCD_MICB1, 0x3F, WCD_MICB_1800MV) || !codec_bits(WCD_MICB2, 0x3F, WCD_MICB_1800MV) ||
++	    !codec_bits(WCD_MICB3, 0x3F, WCD_MICB_1800MV)) {
++		return false;
++	}
++	/* wcd937x_init_reg() */
++	if (!codec_bits(WCD_SLEEP, 0x0E, 0x0E) || !codec_bits(WCD_SLEEP, 0x80, 0x80)) {
++		return false;
++	}
++	mic_wait(1);
++	if (!codec_bits(WCD_SLEEP, 0x40, 0x40)) {
++		return false;
++	}
++	mic_wait(1);
++	if (!codec_bits(WCD_LDO_CFG, 0x10, 0x00) || !codec_bits(WCD_VBG_ADJ, 0xF0, 0x80) || !codec_bits(WCD_ANA_BIAS, 0x80, 0x80) ||
++	    !codec_bits(WCD_ANA_BIAS, 0x40, 0x40)) {
++		return false;
++	}
++	mic_wait(10);
++	return codec_bits(WCD_ANA_BIAS, 0x40, 0x00) && codec_bits(WCD_HPH_OCP, 0xFF, 0x3A) && codec_bits(WCD_RX_OCP, 0x0F, 0x02) &&
++	       codec_bits(WCD_SURGE, 0xFF, 0xD9) && codec_bits(WCD_MICB1_TEST1, 0xFF, 0xFA) &&
++	       codec_bits(WCD_MICB2_TEST1, 0xFF, 0xFA) && codec_bits(WCD_MICB3_TEST1, 0xFF, 0xFA);
++}
++
++/* wcd937x_micbias_control(MIC_BIAS_1, MICB_ENABLE), wcd937x_codec_enable_adc(), wcd937x_enable_req() */
++static bool
++codec_adc1_on(void)
++{
++	if (!codec_bits(WCD_DIG_CLK, 0xE0, 0xE0) || !codec_bits(WCD_ANA_CLK, 0x10, 0x10) ||
++	    !codec_bits(WCD_MICB1_TEST2, 0x01, 0x01) || !codec_bits(WCD_MICB2_TEST2, 0x01, 0x01) ||
++	    !codec_bits(WCD_MICB3_TEST2, 0x01, 0x01) || !codec_bits(WCD_MICB1, 0xC0, 0x40)) {
++		return false;
++	}
++	mic_wait(1);
++	return codec_bits(WCD_TX_CH1, 0x1F, WCD_ADC1_GAIN) && codec_bits(WCD_DIG_CLK, 0x80, 0x80) &&
++	       codec_bits(WCD_ANA_CLK, 0x08, 0x08) && codec_bits(WCD_ANA_CLK, 0x10, 0x10) && codec_bits(WCD_REQ, 0x02, 0x02) &&
++	       codec_bits(WCD_REQ, 0x01, 0x00) && codec_bits(WCD_TX_CH2, 0x40, 0x40) && codec_bits(WCD_TX_CH3_HPF, 0x40, 0x40) &&
++	       codec_bits(WCD_DIG_CLK, 0x70, 0x70) && codec_bits(WCD_TX_CH1, 0x80, 0x80) && codec_bits(WCD_TX_CH2, 0x40, 0x00) &&
++	       codec_bits(WCD_TX_CH2, 0x80, 0x80) && codec_bits(WCD_TX_CH3, 0x80, 0x80);
++}
++
++/* POST_PMD of the same widgets: best effort, the codec goes into reset next */
++static void
++codec_adc1_off(void)
++{
++	(void)codec_bits(WCD_TX_CH1, 0x80, 0x00);
++	(void)codec_bits(WCD_TX_CH2, 0x80, 0x00);
++	(void)codec_bits(WCD_TX_CH3, 0x80, 0x00);
++	(void)codec_bits(WCD_DIG_CLK, 0x10, 0x00);
++	(void)codec_bits(WCD_ANA_CLK, 0x08, 0x00);
++	(void)codec_bits(WCD_MICB1, 0xC0, 0x00);
++	(void)codec_bits(WCD_ANA_CLK, 0x10, 0x00);
++	(void)codec_bits(WCD_DIG_CLK, 0x80, 0x00);
++}
++
++/*
++ * swrm_get_port_config() -> tx_frame_params_superset, index 1 (master port 2 = "TX1"):
++ * { si 3, off1 1, off2 0, hstart/hstop none, wd_len none, bp none, bgp none, lane 0 }
++ * swrm_copy_data_port_config(): the codec's port first, then the master's; the same in both banks.
++ */
++static bool
++swr_port_config(uint32_t b)
++{
++	return swr_wcmd(mic_dev, SWRS_CH_EN(MIC_CODEC_PORT, b), 1) && swr_wcmd(mic_dev, SWRS_SAMPLE1(MIC_CODEC_PORT, b), 3) &&
++	       swr_wcmd(mic_dev, SWRS_OFF1(MIC_CODEC_PORT, b), 1) && swr_wcmd(mic_dev, SWRS_OFF2(MIC_CODEC_PORT, b), 0) &&
++	       swr_wcmd(mic_dev, SWRS_LANE(MIC_CODEC_PORT, b), 0) &&
++	       (mic_wr(mswr, SWRM_PORT_CTRL(MIC_MASTER_PORT, b), (1u << 24) | (0u << 16) | (1u << 8) | 3u),
++	       mic_wr(mswr, SWRM_PORT_CTRL2(MIC_MASTER_PORT, b), 0),
++	       mic_wr(mswr, SWRM_PORT_HCTRL(MIC_MASTER_PORT, b), 0xF0), true);
++}
++
++/* swrm_slvdev_datapath_control(enable): ports in the idle bank, 50 x 16 frame, bank switch, ports in the other bank */
++static bool
++swr_datapath_on(void)
++{
++	uint32_t b = (mic_rd(mswr, SWRM_MCP_STATUS) & 1) ? 0 : 1;
++
++	mic_wr(mswr, SWRM_CPU_INT_EN, SWRM_INT_MASK_ALL);
++	if (!swr_wcmd(SWR_BROADCAST, SWRS_DIV2(b), 1) || !swr_port_config(b)) {
++		return false;
++	}
++	mic_wr(mswr, SWRM_FRAME(b), (mic_rd(mswr, SWRM_FRAME(b)) & ~0xFF07FFu) | SWR_FRAME_50_16);
++	if (!swr_put(SWR_BROADCAST, SWRS_FRAME(b), (1u << 3) | 7u, SWR_BROADCAST)) {
++		return false;
++	}
++	mic_wait(10);                                   /* no interrupt here: swrm_is_msm_variant()'s 10 ms */
++	if ((mic_rd(mswr, SWRM_MCP_STATUS) & 1) != b) {
++		return mic_fail("SoundWire bank switch did not happen", b, mic_rd(mswr, SWRM_MCP_STATUS));
++	}
++	return swr_port_config(b ? 0 : 1);
++}
++
++/* the mixer path's muxes, tx_macro_hw_params() 48 kHz, tx_macro_enable_dec() PRE_PMU + POST_PMU, tx_macro_init()'s SEC7 */
++static bool
++dec0_on(int gain_db)
++{
++	if (!mac_bits(mtx, TX0_PATH_SEC7, 0x3F, 0x0E, 0x3F) || !mac_bits(mtx, TX0_PATH_CFG0, 0x80, 0x00, 0x80) ||
++	    !mac_bits(mtx, TX_MUX0_CFG0, 0x0F, 0x01, 0x0F) || !mac_bits(mtx, TX_MUX0_CFG1, 0x03, 0x01, 0x03) ||
++	    !mac_bits(mtx, TX0_PATH_CTL, 0x0F, 0x04, 0x0F) || !mac_bits(mtx, TX0_PATH_CTL, 0x10, 0x10, 0x10) ||
++	    !mac_bits(mtx, TX0_PATH_CTL, 0x20, 0x20, 0x20) || !mac_bits(mtx, TX0_PATH_SEC2, 0x01, 0x00, 0x01) ||
++	    !mac_bits(mtx, TX0_PATH_CFG0, 0x60, 2u << 5, 0x60) || !mac_bits(mtx, TX0_PATH_SEC2, 0x02, 0x02, 0)) {
++		return false;
++	}
++	IODelay(1010);                                  /* "minimum 1 clk cycle" */
++	if (!mac_bits(mtx, TX0_PATH_SEC2, 0x02, 0x00, 0)) {
++		return false;
++	}
++	mic_wr(mtx, TX0_VOL, (uint32_t)(uint8_t)(int8_t)gain_db);      /* the gain goes after the decimator is on */
++	return true;
++}
++
++/* tx_macro_mute_update_callback(), 40 ms after on */
++static bool
++dec0_unmute(void)
++{
++	return mac_bits(mtx, TX0_PATH_CTL, 0x10, 0x00, 0x10);
++}
++
++/* tx_macro_tx_hpf_corner_freq_callback(), 300 ms after on: ADC1's hold off, the filter to its reset value 0 (4 Hz) */
++static bool
++dec0_settled(void)
++{
++	if (!codec_bits(WCD_TX_CH2, 0x40, 0x00) || !mac_bits(mtx, TX0_PATH_CFG0, 0x60, 0x00, 0x60) ||
++	    !mac_bits(mtx, TX0_PATH_SEC2, 0x03, 0x02, 0)) {
++		return false;
++	}
++	IODelay(1010);
++	return mac_bits(mtx, TX0_PATH_SEC2, 0x03, 0x01, 0);
++}
++
++static void
++dec0_off(void)
++{
++	(void)mac_bits(mtx, TX0_PATH_CTL, 0x10, 0x10, 0);
++	(void)mac_bits(mtx, TX0_PATH_CTL, 0x20, 0x00, 0);
++	(void)mac_bits(mtx, TX0_PATH_CTL, 0x10, 0x00, 0);
++	(void)mac_bits(mtx, TX_MUX0_CFG0, 0x0F, 0x00, 0);
++	(void)mac_bits(mtx, TX_MUX0_CFG1, 0x03, 0x00, 0);
++}
++
++static void
++dec0_gain(int gain_db)
++{
++	mic_wr(mtx, TX0_VOL, (uint32_t)(uint8_t)(int8_t)gain_db);
++}
+diff --git a/iokit/Kernel/arm/LaurelMicRing.inc b/iokit/Kernel/arm/LaurelMicRing.inc
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelMicRing.inc
+@@ -0,0 +1,106 @@
++/*
++ * laurel 2920: the ring between the ADSP's read periods and /dev/redwood-mic, and the level (host-tested:
++ * scripts/laurel/mic-host-test.sh). One writer (the audio thread), one reader (the audio server's I/O thread).
++ * A read never waits: it gives what has come, keeps the reader about 40 ms behind the DSP (20 ms periods) and
++ * gives nothing until that much is there; the plug-in makes up the rest with silence. Model: redwood_mic.c.
++ */
++#define MIC_RING_FRAMES     16384u              /* 341 ms; a power of two */
++#define MIC_RING_KEEP       1920u               /* 40 ms */
++#define MIC_RING_MOST       4800u               /* 100 ms waiting: the oldest is skipped */
++
++static int16_t *mic_ring;
++static volatile uint64_t mic_ring_w;            /* frames put in since boot */
++static uint64_t mic_ring_r;
++static bool mic_primed;
++static uint64_t mic_skipped, mic_dry;
++
++static void
++mic_ring_put(const int16_t *samples, uint32_t count)
++{
++	uint64_t at = mic_ring_w;
++
++	for (uint32_t i = 0; i < count; i++) {
++		mic_ring[(at + i) & (MIC_RING_FRAMES - 1)] = samples[i];
++	}
++	__atomic_store_n(&mic_ring_w, at + count, __ATOMIC_RELEASE);
++}
++
++/* a new reader starts at the writer's position */
++static void
++mic_ring_reset(void)
++{
++	mic_ring_r = __atomic_load_n(&mic_ring_w, __ATOMIC_ACQUIRE);
++	mic_primed = false;
++	mic_skipped = mic_dry = 0;
++}
++
++/* how many frames a read of `want' gets now (skips and priming done here); the caller copies with mic_ring_slice */
++static uint64_t
++mic_ring_ready(uint64_t want)
++{
++	uint64_t written = __atomic_load_n(&mic_ring_w, __ATOMIC_ACQUIRE), avail = written - mic_ring_r;
++
++	if (avail > MIC_RING_MOST) {
++		mic_skipped += avail - MIC_RING_KEEP;
++		mic_ring_r = written - MIC_RING_KEEP;
++		avail = MIC_RING_KEEP;
++	}
++	if (!mic_primed) {
++		if (avail < MIC_RING_KEEP) {
++			return 0;
++		}
++		mic_primed = true;
++	}
++	if (avail < want) {
++		mic_dry++;
++		mic_primed = false;
++	}
++	return avail < want ? avail : want;
++}
++
++/* the next contiguous piece of at most `most' frames: where it is, how long; then the reader has moved past it */
++static const int16_t *
++mic_ring_slice(uint64_t most, uint64_t *n)
++{
++	uint64_t at = mic_ring_r & (MIC_RING_FRAMES - 1);
++
++	*n = most < MIC_RING_FRAMES - at ? most : MIC_RING_FRAMES - at;
++	mic_ring_r += *n;
++	return &mic_ring[at];
++}
++
++struct mic_level {
++	uint64_t frames, squares;
++	uint32_t peak;
++};
++
++static void
++mic_level_add(struct mic_level *l, const int16_t *s, uint32_t count)
++{
++	for (uint32_t i = 0; i < count; i++) {
++		int32_t v = s[i];
++		uint32_t a = (uint32_t)(v < 0 ? -v : v);
++
++		l->squares += (uint64_t)((int64_t)v * v);
++		l->peak = a > l->peak ? a : l->peak;
++	}
++	l->frames += count;
++}
++
++static uint32_t
++mic_level_rms(const struct mic_level *l)
++{
++	uint64_t mean = l->frames != 0 ? l->squares / l->frames : 0;
++	uint32_t lo = 0, hi = 32769;
++
++	while (hi - lo > 1) {                           /* integer square root; rms <= 32768 */
++		uint32_t m = (lo + hi) / 2;
++
++		if ((uint64_t)m * m <= mean) {
++			lo = m;
++		} else {
++			hi = m;
++		}
++	}
++	return lo;
++}
+diff --git a/iokit/Kernel/arm/LaurelMicPath.inc b/iokit/Kernel/arm/LaurelMicPath.inc
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelMicPath.inc
+@@ -0,0 +1,284 @@
++/*
++ * laurel 2920: the Mi A3 main microphone, the DSP half and /dev/redwood-mic. All of it runs on the audio
++ * thread (GLINK + APR have no locks; playback goes on between the steps, mic_wait() pumps both).
++ * On by default, up only while the audio server has the device open; kill switch mic=0 (adsp=0 too).
++ * A failure turns off only the microphone. One result line, after a self-check at boot (the whole path once):
++ *   LAUREL MIC: on: WCD937x TX device N (chip 0x.., variant 0x..), SoundWire 0x.., TX_CDC_DMA_TX_3 48 kHz mono (2 reads back in N ms)
++ *   LAUREL MIC: off: <reason>
++ *   LAUREL MIC: first capture: rms N (peak P, F frames)      once per boot: real samples after the filter settled
++ */
++#define APR_MOD_DEV_IF      AFE_MOD_DEV_IF
++#define AFE_PARAM_CDC_DMA   0x000102B8u
++#define MIC_AFE_PORT        0xB037              /* TX_CDC_DMA_TX_3, mixer path "amic1" */
++#define MIC_DEC_MASK        (1u << 0)           /* DEC0: tx_macro_get_channel_map() -> active_channels_mask */
++#define AFE_CLK_TX_CORE     0x30C
++#define AFE_CLK_TX_NPL      0x30D
++#define CLK_19M2            19200000u
++#define ADM_PATH_RECORD     2
++#define ADM_MATRIX_TX       1
++#define ASM_OPEN_READ_V3    0x00010DB4u
++#define ASM_SET_ENCDEC      0x00010C10u
++#define ASM_ENC_CFG_V2      0x00010DA3u
++#define ASM_READ_V2         0x00010DACu
++#define ASM_READ_DONE_V2    0x00010D9Au
++#define MIC_SESSION         2                   /* the speaker's is 1 */
++#define MIC_ASM_PORT        ((MIC_SESSION << 8) | 1)
++#define MIC_PERIODS         8
++#define MIC_PERIOD_FRAMES   960                 /* 20 ms, one channel */
++#define MIC_READ_TOKEN      0x20000000u         /* | generation << 8 | period; writes have bit 31, core polls bit 30 */
++#define PCM_CHANNEL_FC      3
++#define RPM_LDOA            0x616F646Cu         /* "ldoa" */
++#define RPM_KEY_UV          0x00007675u         /* "uv" */
++#define RPM_KEY_SWEN        0x6E657773u         /* "swen" */
++#define RPM_KEY_LSMD        0x646D736Cu         /* "lsmd": LDO mode, pmic5-ldo: 7 HPM (laurel 2784) */
++#define RPM_LDO_HPM         7u
++#define MIC_FAILS_MAX       3
++
++extern "C" bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++extern "C" void proc_selfname(char *buf, int size);
++extern "C" uid_t kauth_getuid(void);
++
++static uint8_t *mic_mem;
++static uint64_t mic_mem_pa;
++static uint32_t mic_map_h, mic_copp_id, mic_gen;
++static volatile uint32_t mic_read_bits, mic_reads_done, mic_read_errors, mic_sizes[MIC_PERIODS];
++static bool mic_killed, mic_ready, mic_said, mic_running, mic_blocked, mic_clock[2], mic_stream, mic_copp, mic_port, mic_hw, mic_adc;
++static bool mic_rails_on, mic_first_done, mic_unmuted, mic_settled;
++static volatile uint32_t mic_want, mic_below, mic_vol_gen;
++static uint32_t mic_vol_seen, mic_fails, mic_next, mic_recordings;
++static unsigned mic_t_run, mic_t_read;
++static uint8_t mic_chip, mic_efuse;
++static struct mic_level mic_all, mic_first;
++
++/* the speaker's chain asks too: only one identity context */
++static bool
++audio_smmu(void)
++{
++	static bool tried, ok;
++
++	if (!tried) {
++		tried = true;
++		ok = topaz_smmu_identity(AUDIO_SID, 0, "audio");
++	}
++	return ok;
++}
++
++static void
++mic_wait(unsigned milliseconds)
++{
++	for (unsigned t = ms(); ms() - t < milliseconds;) {
++		(void)glink_poll();
++		stream_poll();
++		if (milliseconds > 1) {
++			IOSleep(1);
++		} else {
++			IODelay(200);
++		}
++	}
++}
++
++static void
++mic_say_off(const char *reason)
++{
++	mic_said = true;
++	mic_ready = false;
++	IOLog("LAUREL MIC: off: %s\n", reason);
++}
++
++static bool
++mic_dsp_fail(void)
++{
++	return mic_fail(why, 0, 0);                     /* the failed command's own text */
++}
++
++static bool
++mic_afe_clock(uint32_t index, bool on)
++{
++	struct afe_clk c = { 1, index == 0 ? (uint32_t)AFE_CLK_TX_CORE : (uint32_t)AFE_CLK_TX_NPL, CLK_19M2, 1 /* COUPLE_NO */, 0, on ? 1u : 0u };
++
++	return afe_svc_param(index == 0 ? "TX core clock" : "TX NPL clock", AFE_MOD_CLOCK, AFE_PARAM_CLOCK, &c, sizeof(c));
++}
++
++/*
++ * qcom,cdc-static-supplies L9A (also the panel's vddio), on-demand L14A (vdd-buck): both 1.8 V. Stock also sets a load
++ * (25 mA + 10 mA, 650 mA), which is HPM on a pmic5-ldo: a refused mode is said, not fatal. The votes stay on: apps has
++ * one vote per LDO, and L9A has other users.
++ */
++static bool
++mic_rails(void)
++{
++	bool ok = true, hpm = true;
++
++	if (mic_rails_on) {
++		return true;
++	}
++	for (uint32_t set = 0; set <= 1; set++) {
++		ok &= topaz_rpm_write(set, RPM_LDOA, 9, RPM_KEY_UV, 1800000);
++		hpm &= topaz_rpm_write(set, RPM_LDOA, 9, RPM_KEY_LSMD, RPM_LDO_HPM);
++		ok &= topaz_rpm_write(set, RPM_LDOA, 9, RPM_KEY_SWEN, 1);
++		ok &= topaz_rpm_write(set, RPM_LDOA, 14, RPM_KEY_UV, 1800000);
++		hpm &= topaz_rpm_write(set, RPM_LDOA, 14, RPM_KEY_LSMD, RPM_LDO_HPM);
++		ok &= topaz_rpm_write(set, RPM_LDOA, 14, RPM_KEY_SWEN, 1);
++	}
++	mic_rails_on = ok;
++	if (!hpm) {
++		LOG("mic: RPM refused HPM on L9A or L14A");
++	}
++	return ok || mic_fail("RPM refused the codec rails L9A/L14A", 0, 0);
++}
++
++/* what msm-pcm-q6 + q6asm + q6adm + msm-dai-cdc-dma do for a recording; redwood_mic.c dsp_path_on(), dsp_port_on() */
++static bool
++mic_dsp_on(void)
++{
++	struct { uint32_t mode, endpoint, topology, format; uint16_t bits, reserved; } __attribute__((packed))
++	rd = { 0, 0, 0x00010C68u /* POSTPROC NONE */, 0x00010DA5u /* MULTI_CHANNEL_PCM_V2 */, 16, 0 };
++	struct { uint32_t param, size, frames_per_buffer, block; uint16_t channels, bits; uint32_t rate; uint16_t is_signed, reserved; uint8_t map[8]; }
++	__attribute__((packed)) enc = { ASM_ENC_CFG_V2, 28, 0, 20, 1, 16, RATE, 1, 0, { PCM_CHANNEL_FC, 0, 0, 0, 0, 0, 0, 0 } };
++	struct { uint16_t flags, mode, ep1, ep2; uint32_t topology; uint16_t channels, bits; uint32_t rate; uint8_t map[8]; }
++	__attribute__((packed)) open = { 0, ADM_PATH_RECORD, MIC_AFE_PORT, 0xFFFF, 0x00010312u /* NULL_COPP */, 1, 16, RATE,
++		                         { PCM_CHANNEL_FC, 0, 0, 0, 0, 0, 0, 0 } };
++	struct { uint32_t matrix, sessions; uint16_t session, copps; uint16_t copp[2]; } __attribute__((packed))
++	route = { ADM_MATRIX_TX, 1, MIC_SESSION, 1, { 0, 0 } };
++	uint8_t m[16 + sizeof(struct afe_param) + 16];
++	struct afe_param *p = (struct afe_param *)(m + 16);
++	struct { uint32_t version, rate; uint16_t bits, format, channels, mask; } __attribute__((packed))
++	dma = { 1, RATE, 16, 0, 1, MIC_DEC_MASK };
++	uint16_t start[2] = { MIC_AFE_PORT, 0 };
++
++	if (mic_map_h == 0) {
++		struct { uint16_t pool, regions; uint32_t property; uint32_t lsw, msw, size; } __attribute__((packed))
++		map = { 3 /* SHMEM8_4K_POOL */, 1, 0, (uint32_t)mic_mem_pa, AUDIO_MSW, MIC_PERIODS * 4096 };
++		if (!cmd("ASM map mic periods", APR_SVC_ASM, 0, ASM_MAP, &map, sizeof(map), ASM_MAP_RSP)) {
++			return mic_dsp_fail();
++		}
++		mic_map_h = call_rsp[0];
++	}
++	if (!cmd("ASM open read", APR_SVC_ASM, MIC_ASM_PORT, ASM_OPEN_READ_V3, &rd, sizeof(rd), 0)) {
++		return mic_dsp_fail();
++	}
++	mic_stream = true;
++	if (!cmd("ASM encoder format", APR_SVC_ASM, MIC_ASM_PORT, ASM_SET_ENCDEC, &enc, sizeof(enc), 0) ||
++	    !cmd("ADM open record COPP", APR_SVC_ADM, MIC_AFE_PORT, ADM_OPEN_V5, &open, sizeof(open), ADM_OPEN_V5_RSP)) {
++		return mic_dsp_fail();
++	}
++	if (call_rsp[0] != 0) {
++		return mic_fail("ADM open record COPP refused", call_rsp[0], 0);
++	}
++	mic_copp = true;
++	mic_copp_id = call_rsp[1] & 0xFFFF;
++	route.copp[0] = (uint16_t)mic_copp_id;
++	if (!cmd("ADM route session 2", APR_SVC_ADM, 0, ADM_ROUTE_V5, &route, sizeof(route), 0)) {
++		return mic_dsp_fail();
++	}
++	bzero(m, sizeof(m));
++	*(uint16_t *)m = MIC_AFE_PORT;
++	*(uint16_t *)(m + 2) = (uint16_t)(sizeof(*p) + sizeof(dma));
++	p->module = APR_MOD_DEV_IF;
++	p->param = AFE_PARAM_CDC_DMA;
++	p->size = sizeof(dma);
++	memcpy(m + 16 + sizeof(*p), &dma, sizeof(dma));
++	if (!cmd("TX_CDC_DMA_TX_3 config", APR_SVC_AFE, 0, AFE_PORT_SET_PARAM, m, 16 + (uint32_t)sizeof(*p) + sizeof(dma), 0) ||
++	    !cmd("TX_CDC_DMA_TX_3 start", APR_SVC_AFE, 0, AFE_PORT_START, start, sizeof(start), 0)) {
++		return mic_dsp_fail();
++	}
++	mic_port = true;
++	return true;
++}
++
++static void
++mic_dsp_off(void)
++{
++	uint16_t stop[2] = { MIC_AFE_PORT, 0 };
++
++	if (mic_stream) {
++		(void)cmd("ASM close (mic)", APR_SVC_ASM, MIC_ASM_PORT, ASM_CLOSE, NULL, 0, 0);
++		mic_stream = false;
++	}
++	if (mic_copp) {
++		(void)cmd("ADM close (mic)", APR_SVC_ADM, (uint16_t)mic_copp_id, ADM_CLOSE_V5, NULL, 0, 0);
++		mic_copp = false;
++	}
++	if (mic_port) {
++		(void)cmd("TX_CDC_DMA_TX_3 stop", APR_SVC_AFE, 0, AFE_PORT_STOP, stop, sizeof(stop), 0);
++		mic_port = false;
++	}
++}
++
++static int
++mic_gain_db(void)
++{
++	int db = MIC_GAIN_DB - (int)(mic_below / 8);
++
++	return db < MIC_GAIN_MIN_DB ? MIC_GAIN_MIN_DB : db;
++}
++
++/* everything up to the stream's run, in a recording's order */
++static bool
++mic_path_up(void)
++{
++	mic_why[0] = 0;
++	if (!mic_rails()) {
++		return false;
++	}
++	mic_clock[0] = mic_afe_clock(0, true);
++	mic_clock[1] = mic_clock[0] && mic_afe_clock(1, true);
++	if (!mic_clock[1]) {
++		return mic_dsp_fail();                          /* no clock: the macros are not touched */
++	}
++	if (!mic_map_all()) {
++		return false;
++	}
++	mic_hw = true;
++	mic_reset_pulse();
++	mic_pins(true);
++	if (!mic_macro_clocks()) {
++		return false;
++	}
++	swrm_on();
++	mic_wait(5);                                            /* "5 ms for auto enumeration", wcd937x_bind() */
++	mic_dev = swr_find_codec(200);
++	if (mic_dev == 0) {
++		mic_reset_pulse();                              /* topaz's order: the master first, then the codec */
++		mic_dev = swr_find_codec(300);
++	}
++	if (mic_dev == 0) {
++		return mic_fail("no WCD937x TX device on SoundWire (version, device 1 ID)", swrm_version, mic_rd(mswr, SWRM_DEV_ID1(1)));
++	}
++	if (!swr_wcmd(SWR_BROADCAST, SWRS_INT_MASK_1, 4) || !codec_identify(&mic_chip, &mic_efuse)) {
++		return false;
++	}
++	LOG("mic: SoundWire 0x%08x, codec device %u, chip 0x%02x, variant 0x%x", swrm_version, mic_dev, mic_chip,
++	    (mic_efuse & 0x1E) >> 1);
++	if (!codec_init() || !mic_dsp_on() || !dec0_on(mic_gain_db())) {
++		return false;
++	}
++	mic_vol_seen = mic_vol_gen;
++	mic_adc = true;
++	return codec_adc1_on() && swr_datapath_on();
++}
++
++/* undoes what mic_path_up did, whatever it reached */
++static void
++mic_path_down(void)
++{
++	if (mic_adc) {
++		codec_adc1_off();
++		mic_adc = false;
++	}
++	mic_dsp_off();
++	if (mic_hw) {
++		dec0_off();
++		swrm_off();
++		mic_macro_clocks_off();
++		mic_pins(false);
++		mic_wr(mrst, 4, 0);                             /* the codec in reset */
++		mic_hw = false;
++	}
++	for (int i = 1; i >= 0; i--) {
++		if (mic_clock[i]) {
++			(void)mic_afe_clock((uint32_t)i, false);
++			mic_clock[i] = false;
++		}
++	}
++}
+diff --git a/iokit/Kernel/arm/LaurelMicStream.inc b/iokit/Kernel/arm/LaurelMicStream.inc
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelMicStream.inc
+@@ -0,0 +1,189 @@
++/* laurel 2920: the reads, the state machine on the audio thread, /dev/redwood-mic, the self-check. */
++static bool
++mic_send_read(uint32_t i)
++{
++	uint64_t a = mic_mem_pa + 4096ull * i;
++	uint32_t w[5] = { (uint32_t)a, AUDIO_MSW, mic_map_h, MIC_PERIOD_FRAMES * 2, i };
++
++	return apr_send(APR_SVC_ASM, MIC_ASM_PORT, MIC_READ_TOKEN | (mic_gen << 8) | i, ASM_READ_V2, w, sizeof(w));
++}
++
++/* called from apr_event() on this thread: false = not a read of ours */
++static bool
++mic_event(uint32_t opcode, uint32_t token, const uint32_t *p, uint32_t len)
++{
++	uint32_t i = token & 0xFF;
++
++	if ((token & 0xE0000000u) != MIC_READ_TOKEN || i >= MIC_PERIODS) {
++		return false;
++	}
++	if (((token >> 8) & 0xFFFF) != mic_gen) {
++		return true;                                    /* from a closed stream */
++	}
++	if (opcode == ASM_READ_DONE_V2) {
++		if (len < 24 || p[0] != 0) {
++			mic_read_errors++;
++		}
++		mic_sizes[i] = len >= 24 ? p[4] : 0;
++		mic_reads_done++;
++		mic_read_bits |= 1u << i;
++		return true;
++	}
++	if (opcode == APR_BASIC_RSP) {
++		if (len >= 8 && p[1] != 0) {                    /* refused outright: no read-done comes */
++			mic_read_errors++;
++			mic_sizes[i] = 0;
++			mic_read_bits |= 1u << i;
++		}
++		return true;
++	}
++	return false;
++}
++
++static bool
++mic_run(void)
++{
++	uint32_t run[3] = { 0, 0, 0 };
++
++	mic_gen = (mic_gen + 1) & 0xFFFF;
++	mic_read_bits = 0;
++	mic_reads_done = mic_read_errors = 0;
++	mic_next = 0;
++	mic_unmuted = mic_settled = false;
++	if (!cmd("ASM run (mic)", APR_SVC_ASM, MIC_ASM_PORT, ASM_RUN_V2, run, sizeof(run), 0)) {
++		return mic_dsp_fail();
++	}
++	mic_t_run = mic_t_read = ms();
++	for (uint32_t i = 0; i < MIC_PERIODS; i++) {
++		if (!mic_send_read(i)) {
++			return mic_fail("ASM read: GLINK queue full", i, 0);
++		}
++	}
++	return true;
++}
++
++/* the timed steps after the run; false = stop */
++static bool
++mic_timed(void)
++{
++	unsigned t = ms() - mic_t_run;
++
++	if (!mic_unmuted && t >= 40) {                          /* TX_MACRO_TX_UNMUTE_DELAY_MS */
++		mic_unmuted = true;
++		if (!dec0_unmute()) {
++			return false;
++		}
++	}
++	if (!mic_settled && t >= 300) {                         /* the HPF work's delay */
++		mic_settled = true;
++		if (!dec0_settled()) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++mic_period(uint32_t i)
++{
++	const int16_t *s = (const int16_t *)(mic_mem + 4096ull * i);
++	uint32_t got = mic_sizes[i] / 2;
++
++	got = got > MIC_PERIOD_FRAMES ? MIC_PERIOD_FRAMES : got;
++	mic_ring_put(s, got);
++	mic_level_add(&mic_all, s, got);
++	if (mic_settled && !mic_first_done) {
++		mic_level_add(&mic_first, s, got);
++		if (mic_first.frames >= RATE) {
++			mic_first_done = true;
++			IOLog("LAUREL MIC: first capture: rms %u (peak %u, %llu frames)\n", mic_level_rms(&mic_first), mic_first.peak,
++			    mic_first.frames);
++		}
++	}
++	if (!mic_send_read(i)) {
++		mic_read_bits |= 1u << i;                       /* GLINK queue full: again at the next poll */
++		mic_sizes[i] = 0;
++	}
++}
++
++static void
++mic_stop(const char *reason)
++{
++	mic_running = false;
++	if (reason != NULL) {
++		LOG("mic: recording %u broke off: %s", mic_recordings, reason);
++	}
++	LOG("mic: recording %u ended after %u ms: %llu frames, rms %u, peak %u, %u reads, %u errors, %llu skipped, %llu dry", mic_recordings,
++	    ms() - mic_t_run, mic_all.frames, mic_level_rms(&mic_all), mic_all.peak, mic_reads_done, mic_read_errors, mic_skipped, mic_dry);
++	mic_path_down();
++}
++
++static void
++mic_failed(void)
++{
++	char reason[96];
++
++	strlcpy(reason, mic_why[0] != 0 ? mic_why : "no reason known", sizeof(reason));
++	mic_blocked = true;                                     /* not again until the audio server opens the device again */
++	LOG("mic: start failed: %s", reason);
++	mic_path_down();
++	if (++mic_fails >= MIC_FAILS_MAX) {
++		mic_say_off(reason);
++	}
++}
++
++/* the audio thread, between GLINK polls */
++static void
++mic_poll(void)
++{
++	if (!mic_ready) {
++		return;
++	}
++	if (!mic_running) {
++		if (mic_want == 0) {
++			mic_blocked = false;
++		} else if (!mic_blocked) {
++			unsigned t = ms();
++
++			mic_recordings++;
++			bzero(&mic_all, sizeof(mic_all));
++			if (!mic_path_up() || !mic_run()) {
++				mic_failed();
++				return;
++			}
++			mic_running = true;
++			mic_fails = 0;
++			LOG("mic: recording %u: path up in %u ms", mic_recordings, ms() - t);
++		}
++		return;
++	}
++	if (mic_want == 0) {
++		mic_stop(NULL);
++		return;
++	}
++	if (!mic_timed()) {
++		mic_failed();
++		mic_running = false;
++		return;
++	}
++	if (mic_vol_seen != mic_vol_gen) {
++		mic_vol_seen = mic_vol_gen;
++		dec0_gain(mic_gain_db());
++		LOG("mic: gain %d dB", mic_gain_db());
++	}
++	while ((mic_read_bits & (1u << mic_next)) != 0) {
++		uint32_t i = mic_next;
++
++		mic_read_bits &= ~(1u << i);
++		mic_period(i);
++		mic_next = (mic_next + 1) % MIC_PERIODS;
++		mic_t_read = ms();
++	}
++	if (ms() - mic_t_read > 1500) {
++		mic_stop("no read back in 1.5 s");
++		mic_blocked = true;
++		if (++mic_fails >= MIC_FAILS_MAX) {
++			mic_say_off("the DSP stopped giving reads back");
++		}
++	}
++}
+diff --git a/iokit/Kernel/arm/LaurelMicDev.inc b/iokit/Kernel/arm/LaurelMicDev.inc
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelMicDev.inc
+@@ -0,0 +1,143 @@
++/* laurel 2920: /dev/redwood-mic and the microphone self-check. */
++/* ---------------------------------------------------------------- /dev/redwood-mic */
++
++#define MIC_SET_VOLUME      _IOW('r', 2, struct topaz_audio_volume_arg)
++
++/*
++ * Only the audio server may listen (and root, for a test tool): every app runs as mobile, so the
++ * mode bits cannot say this, and TCC is enforced above the HAL. An open by anything else would be a
++ * microphone without the permission prompt.
++ */
++static int
++mic_dev_open(dev_t, int, int, struct proc *)
++{
++	char name[32] = "";
++
++	if (!mic_ready || mic_ring == NULL) {
++		return ENXIO;
++	}
++	proc_selfname(name, sizeof(name));
++	if (strcmp(name, "mediaserverd") != 0 && strcmp(name, "audiomxd") != 0 && kauth_getuid() != 0) {
++		LOG("mic: open refused for %s", name);
++		return EACCES;
++	}
++	mic_ring_reset();
++	mic_want = 1;
++	thread_wakeup((event_t)&stream_wake_flag);
++	return 0;
++}
++
++static int
++mic_dev_close(dev_t, int, int, struct proc *)
++{
++	mic_want = 0;
++	thread_wakeup((event_t)&stream_wake_flag);
++	return 0;
++}
++
++static int
++mic_dev_read(dev_t, struct uio *uio, int)
++{
++	uint64_t ready;
++	int err = 0;
++
++	if (mic_ring == NULL || uio_resid(uio) < 2) {
++		return 0;
++	}
++	ready = mic_ring_ready((uint64_t)uio_resid(uio) / 2);
++	while (ready > 0 && err == 0) {
++		uint64_t n;
++		const int16_t *s = mic_ring_slice(ready, &n);
++
++		err = uiomove((char *)(uintptr_t)s, (int)(n * 2), uio);
++		ready -= n;
++	}
++	return err;
++}
++
++static int
++mic_dev_ioctl(dev_t, u_long c, caddr_t data, int, struct proc *)
++{
++	if (c != MIC_SET_VOLUME) {
++		return ENOTTY;
++	}
++	mic_below = ((const struct topaz_audio_volume_arg *)data)->below;
++	mic_vol_gen++;
++	return 0;
++}
++
++static const struct cdevsw mic_cdevsw = {
++	.d_open = mic_dev_open, .d_close = mic_dev_close, .d_read = mic_dev_read, .d_write = eno_rdwrt, .d_ioctl = mic_dev_ioctl,
++	.d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap,
++	.d_strategy = eno_strat, .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++/* the same order rule as audio_dev_init(). While the mic is off an open says ENXIO and the plug-in gives silence. */
++static void
++mic_dev_init(void)
++{
++	int major = cdevsw_add(-1, &mic_cdevsw);
++	void *node = major < 0 ? NULL : devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "redwood-mic");
++
++	LOG("/dev/redwood-mic: %s", node != NULL ? "ready" : "no node");
++	if (node == NULL) {
++		mic_killed = true;
++		mic_say_off("no /dev/redwood-mic node");
++	}
++}
++
++/* ---------------------------------------------------------------- self-check */
++
++/* the whole path once: the DSP must give two reads with samples back in 500 ms */
++static void
++mic_self_check(void)
++{
++	unsigned t;
++	uint32_t got = 0, n, dev;
++
++	if (mic_killed) {
++		if (!mic_said) {
++			mic_say_off("kill switch (boot-arg mic=0)");
++		}
++		return;
++	}
++	mic_ring = (int16_t *)IOMallocZero(MIC_RING_FRAMES * 2);
++	mic_mem = (uint8_t *)topaz_pool_alloc(MIC_PERIODS * 4096, &mic_mem_pa);
++	if (mic_ring == NULL || mic_mem == NULL) {
++		mic_say_off("no memory for the ring or the read periods");
++		return;
++	}
++	if (mic_mem_pa + MIC_PERIODS * 4096 > 0x100000000ull) {
++		mic_say_off("read periods above 4 GiB: the ADSP cannot reach them (the SID is in the upper word)");
++		return;
++	}
++	if (!audio_smmu()) {
++		mic_say_off("apps SMMU: no identity context for the audio stream 0x41");
++		return;
++	}
++	if (!mic_path_up() || !mic_run()) {
++		char reason[96];
++
++		strlcpy(reason, mic_why[0] != 0 ? mic_why : "no reason known", sizeof(reason));
++		mic_path_down();
++		mic_say_off(reason);
++		return;
++	}
++	for (t = ms(); mic_reads_done < 2 && ms() - t < 500;) {
++		mic_wait(1);
++	}
++	n = ms() - t;
++	dev = mic_dev;
++	got = mic_reads_done >= 2 ? mic_sizes[0] : 0;
++	if (mic_reads_done < 2 || mic_read_errors != 0 || got == 0) {
++		snprintf(mic_why, sizeof(mic_why), "TX_CDC_DMA_TX_3: %u of 2 reads in 500 ms, %u errors, %u bytes", mic_reads_done, mic_read_errors, got);
++		mic_path_down();
++		mic_say_off(mic_why);
++		return;
++	}
++	mic_path_down();
++	mic_ready = true;
++	mic_said = true;
++	IOLog("LAUREL MIC: on: WCD937x TX device %u (chip 0x%02x, variant 0x%x), SoundWire 0x%08x, TX_CDC_DMA_TX_3 48 kHz mono (2 reads back in %u ms)\n",
++	    dev, mic_chip, (mic_efuse & 0x1E) >> 1, swrm_version, n);
++}

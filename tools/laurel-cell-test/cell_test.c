@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 uint64_t kt_now_ns;
-static char said[16][400];                      /* LAUREL CELL lines */
+static char said[16][600];                      /* LAUREL CELL lines */
 static int nsaid;
 static char logbuf[16384];
 static uint32_t boot_cell = 1;
@@ -17,7 +17,7 @@ static uint32_t boot_cell = 1;
 int
 kt_printf(const char *fmt, ...)
 {
-	char b[600];
+	char b[800];
 	va_list ap;
 
 	va_start(ap, fmt);
@@ -48,6 +48,9 @@ static struct {
 	int opmode;
 	bool wide_bind_only, uim_silent, register_ok;
 	int prov_reqs, prov_session[4], prov_slot[4], set_online, binds[2];
+	int opmode_reads, opmode_err_left, opmode_later, opmode_after;   /* GET_OPERATING_MODE: errors first; the mode changes after opmode_after reads */
+	int set_refuse_left, bind_err_left[2], rsrp, rssi_only;          /* SET refused; BIND error 3; signal */
+	bool no_signal;
 } M;
 static uint32_t q_port[32], q_len[32];
 static uint8_t q_msg[32][512];
@@ -148,10 +151,26 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 		if (msg == 0x0023) {
 			put_tlv(tl, &tn, 0x01, "MPSS.AT.4.3.1.c1-00047", 22);
 		} else if (msg == 0x002D) {
-			uint8_t m = (uint8_t)M.opmode;
+			uint8_t m;
+			M.opmode_reads++;
+			if (M.opmode_err_left > 0) {
+				M.opmode_err_left--;
+				answer(src_port, 2, txn, msg, 0x4A, tl, 0);
+				return;
+			}
+			if (M.opmode_after != 0 && M.opmode_reads > M.opmode_after) {
+				M.opmode = M.opmode_later;
+				M.opmode_after = 0;
+			}
+			m = (uint8_t)M.opmode;
 			put_tlv(tl, &tn, 0x01, &m, 1);
 		} else if (msg == 0x002E) {
 			M.set_online++;
+			if (M.set_refuse_left != 0) {
+				M.set_refuse_left--;
+				answer(src_port, 2, txn, msg, 0x34, tl, 0);
+				return;
+			}
 			M.opmode = 0;
 		}
 		answer(src_port, 2, txn, msg, 0, tl, tn);
@@ -164,6 +183,11 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 				answer(src_port, 2, txn, msg, 0x0001, tl, 0);
 				return;
 			}
+			if (M.bind_err_left[sub] > 0) {
+				M.bind_err_left[sub]--;
+				answer(src_port, 2, txn, msg, 0x0003, tl, 0);
+				return;
+			}
 			M.binds[sub]++;
 		} else if (msg == 0x0024) {
 			uint8_t ss[6] = { (uint8_t)(M.register_ok ? 1 : 2), 1, 1, 2, 1, 8 };
@@ -171,11 +195,13 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 			put_tlv(tl, &tn, 0x01, ss, 6);
 			put_tlv(tl, &tn, 0x12, plmn, sizeof(plmn));
 		} else if (msg == 0x004F) {
-			int16_t rsrp = -98, snr = 50;
+			int16_t rsrp = (int16_t)M.rsrp, snr = 50;
 			uint8_t lte[6] = { (uint8_t)(int8_t)-71, (uint8_t)(int8_t)-10 };
 			memcpy(lte + 2, &rsrp, 2);
 			memcpy(lte + 4, &snr, 2);
-			put_tlv(tl, &tn, 0x14, lte, 6);
+			if (!M.no_signal) {
+				put_tlv(tl, &tn, 0x14, lte, 6);
+			}
 		}
 		answer(src_port, 2, txn, msg, 0, tl, tn);
 		break;
@@ -208,6 +234,7 @@ laurel_ipa_state(const char **why)
 
 #include "laurel_cell.c"
 #undef printf
+#include "cellbar_state.h"
 
 /* ---------------------------------------------------------------- driver */
 
@@ -259,8 +286,11 @@ modem_defaults(void)
 	M.idx[0] = M.idx[1] = 0xFFFF;
 	M.opmode = 1;                                       /* low power after boot */
 	M.register_ok = true;
+	M.rsrp = -98;
 	kt_now_ns = 5000000000ull;
 }
+
+#include "cell_test2.h"
 
 static void
 scenario(char s)
@@ -274,16 +304,16 @@ scenario(char s)
 		services(true);
 		run_ms(30000, true);
 		CHECK(nsaid == 1);
-		CHECK(strstr(last(), "LAUREL CELL: on: SIM1 present (USIM ready), SIM2 absent; modem low power; radio off: AP IPA side still starting") != NULL);
+		CHECK(strstr(last(), "LAUREL CELL: part: SIM1 present (USIM ready), SIM2 absent; modem low power; radio off: AP IPA side still starting") != NULL);
 		CHECK(M.prov_reqs == 1 && M.prov_session[0] == 0 && M.prov_slot[0] == 1);
 		CHECK(M.set_online == 0);
 		CHECK(M.binds[0] == 1 && M.binds[1] == 0);
-		CHECK(strstr(last(), "airtelgprs.com") != NULL);
+		CHECK(strstr(last(), "; data off: no AP GSI data pipes yet; SMS, voice off: not built") != NULL);
 		CHECK(strstr(logbuf, "modem revision MPSS.AT.4.3.1") != NULL);
 		{
 			char out[400];
-			struct sysctl_req r = { out, sizeof(out) };
-			CHECK(cell_sysctl(NULL, NULL, 0, &r) == 0 && strncmp(out, "on: SIM1 present", 16) == 0);
+			struct sysctl_req r = { out, sizeof(out), NULL, 0 };
+			CHECK(cell_sysctl(NULL, NULL, 0, &r) == 0 && strncmp(out, "part: SIM1 present", 18) == 0);
 		}
 		break;
 	case 'B':       /* both SIMs, NAS bind needs the 4-byte enum: primary slot 1, secondary slot 2 */
@@ -297,7 +327,7 @@ scenario(char s)
 		CHECK(M.prov_session[0] == 0 && M.prov_slot[0] == 1);
 		CHECK(M.prov_session[1] == 2 && M.prov_slot[1] == 2);
 		CHECK(M.binds[0] == 1 && M.binds[1] == 1);
-		CHECK(strstr(last(), "on: SIM1 present (USIM ready), SIM2 present (SIM PIN required); modem low power") != NULL);
+		CHECK(strstr(last(), "part: SIM1 present (USIM ready), SIM2 present (SIM PIN required); modem low power") != NULL);
 		break;
 	case 'C':       /* IPA up (step 2 self-check), SIM only in slot 2: online, registered, signal; then hot swap */
 		scen = "C online + hot swap";
@@ -307,7 +337,7 @@ scenario(char s)
 		run_ms(40000, true);
 		CHECK(M.prov_reqs == 1 && M.prov_session[0] == 0 && M.prov_slot[0] == 2);
 		CHECK(M.set_online == 1);
-		CHECK(strstr(last(), "on: SIM1 absent, SIM2 present (USIM ready); modem online; SIM2 registered 404-45 Airtel LTE rssi -71 rsrp -98") != NULL);
+		CHECK(strstr(last(), "on: SIM1 absent, SIM2 present (USIM ready); modem online; SIM2 registered 404-45 Airtel LTE rssi -71 rsrp -98 bars 2") != NULL);
 		{
 			int before = nsaid;
 			uint8_t ind[400];
@@ -352,10 +382,11 @@ scenario(char s)
 		scen = "H no SIM";
 		services(true);
 		run_ms(20000, true);
-		CHECK(strstr(last(), "LAUREL CELL: on: SIM1 absent, SIM2 absent; modem low power") != NULL);
+		CHECK(strstr(last(), "LAUREL CELL: part: SIM1 absent, SIM2 absent; modem low power") != NULL);
 		CHECK(M.prov_reqs == 0 && M.set_online == 0);
 		break;
 	default:
+		scenario2(s);
 		break;
 	}
 	if (fails) {
@@ -369,7 +400,7 @@ scenario(char s)
 int
 main(void)
 {
-	const char *all = "ABCDEFGH";
+	const char *all = "ABCDEFGHIJKLMNO";
 	int bad = 0;
 
 	for (const char *p = all; *p; p++) {

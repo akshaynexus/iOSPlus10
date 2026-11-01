@@ -4764,3 +4764,36 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Gotcha: eagl.c already has a member `box`: a new one is `screen_box`. GL_VIEWPORT, GL_BLEND are defined late in the file: new code early needs its own `#ifndef`.
 - Build: see the last line of this entry in docs/plan.md and the commit; `xnutils-test.sh` PASS with the new clock row.
 - Next: boot, one scroll + one Astronomy switch, read gpu.md "Lines at the next boot". Then decide: extensions off the Gold cores during touch, render thread priority, the TC.
+## Mi A3: cellular: mode bug fixed, bridge to iOS; patch 2786, userland/laurel/cell (2026-11-01, branch t3/laurel-cellular-online; build + host test, NOT BOOTED)
+- Details: docs/laurel_sprout/cellular.md section 9 (decision, what is not built), section 10 (lines of the phone test).
+- [V 20H392] Status bar data path: aggregator.telephonyDomain.data.primarySIMInfo <- STTelephonyStatusDomainDataProvider (SystemStatusServer framework) <- STTelephonyStateProvider. `_updateDataForSlot:` and `_SIMInfoForStateProvider:...` are objc_direct: not hookable. `subscriptionInfoForSlot:`, `isSIMPresentForSlot:`, `isCellularRadioCapabilityActive`, `isDualSIMEnabled`, `isRadioModuleDead` are real methods. STMutableTelephonySubscriptionInfo has all setters.
+- [V 20H392] `_updateSignalStrengthItem:...` block setters take (block, value). scion's form (block, data, value) is wrong here. The item is on with cellularServiceState 2 + capability + no airplane.
+- [V 20H392] Registration value: 2 in service, 1 searching, else none. Settings > Cellular: `requiredCapabilities cellular-data` in PreferencesUI Settings.plist; SBTelephonyManager reads contains-cellular-radio, CellularTelephonyCapability, cellular-data. [U] their answers on this root: the LAUREL CELLBAR on line prints two.
+- [V log] syslog does not reach the USB log: LAUREL NOTCH has 0 hits in boot 20:02. So a dylib line goes through a write sysctl (kern.laurel_cell_ui) too.
+- [V log 20:02] `nas1: BIND_SUBSCRIPTION error 0x3` at start: no retry before 2786. `exec CommCenterMobileHelper` = launchd job on notify events, about one a boot, no loop.
+- Gotcha: `grep` in this shell is ugrep and treats a pattern with a leading `-` as an option; `==` in a zsh echo fails. RE helpers are bash scripts: scripts/debug/cell-*.
+- Gotcha: a new feature row needs a fake stage script in build-honest-test.sh too (`cell-build`), or its build-all cases fail.
+- Worktree build: symlink external/{ios-topaz,ios-sweet-linux,hackios-scion,laurel-kernel-*}, reflink out/laurel-kernel/{deps,theos,cache,dl} + out/laurel/gpu/deps/sdks; `AUDIT=1` gives the tree at out/laurel-kernel/xnu-src/xnu-8796.141.3. Patch: out/celln-dev/{a,b}, scripts/laurel/cell-patch.sh.
+- Built [V, merged with 80072a9]: 297/297 patches, 0 LSE, printf-arg-check OK, kernel.development.sweet.4k sha256 010bc6a6ebc346dc...; liblaurel-cellbar (sha256 in out/laurel/cell/root.SHA256SUMS); test-cell 15/15; test-ipa PASS; build-honest-test 60/60; xnutils-test PASS. No root image: sudo needs a password here.
+- Next: section 10 step A, then step B. If ONLINE asserts in enl2_dl with the handshake passed, data pipes (9.4) come before ONLINE.
+
+## Mi A3: kernel panic log_encode.c:121 from one printf with 48 values (2026-11-01 22:22, 22:26)
+- [V log] Two panics, one at the first `LAUREL WIFI: link` line of a session; the text is glued to the end of that line:
+  `log_encode.c:121 Assertion failed: log_fits_cmd(ctx, cmd_sz)`. The owner's Control Center press was only coincidence [I].
+- [V code] os_log's kernel buffer is 256 bytes (OS_LOG_BUFFER_MAX_SIZE); each value costs 2 + 8 bytes, so about 24 values fit. 2885 made the
+  line 48 values. Patch 2887 splits it (`link`, `traffic`, `path cost`). `scripts/laurel/printf-arg-check.py` (limit 22) runs in every kernel build.
+- Panic text can sit glued at the end of a normal log line: search for `Assertion failed`, not only `panic(`.
+
+## Mi A3: microphone (2026-11-01, branch t3/laurel-mic, patch 2920 + plug-in mic-input.patch; built + host-tested, NOT BOOTED). Details: docs/laurel_sprout/audio.md "Microphone"
+- Owner: "Voice input is not working." [V] The plug-in's "Codec" input existed and read silence; the kernel had no `/dev/redwood-mic` and no codec driver.
+- [V sources] Path: AMIC1 + MIC BIAS1 1.8 V -> WCD937x ADC1 (gain 12) -> SoundWire TX 0x0a470000 (slave 0x01170223, codec port 0 -> master port 2, 50 x 16, si 3 off1 1 off2 0 lane 0) -> TX macro 0x0a460000 DEC0 (+18 dB) -> AFE TX_CDC_DMA_TX_3 0xB037 -> ADM record COPP -> ASM session 2. Rails RPM L9A + L14A (+ `lsmd` HPM). Reset GPIO 120. Pins GPIO 106-108 function 1.
+- **Not SPMI.** WCD937x is a SoundWire device; Rouleur (SPMI) is not on this board. `sweet_spmi.c` is not used, so the `spmi errors` line does not change.
+- Gotcha: trinket differs from redwood's driver: no LPASS votes (sm6150 has them, trinket DT does not); no `COMP_STATUS` in the 4.14 master driver (do not wait on it); RD FIFO count is at another bit position, so 2920 follows the 4.14 read (answer id in bits 8-11), not the FIFO status; pins on the TLMM, not LPI; DEC0, mask 1.
+- Gotcha: Android never reads back codec registers, and some bits self-clear on this family. A mismatch is logged (first 8), not fatal. A SoundWire read with no answer is fatal. A macro write that does not read back is fatal ([I] no clock).
+- Gotcha: all mic code stays on the audio thread (GLINK and APR have no locks). `mic_wait()` pumps GLINK + `stream_poll()`. Never call it inside an `apr_call`.
+- Gotcha: `/dev/redwood-mic` is 0666 but `d_open` admits only mediaserverd, audiomxd or root: every app runs as `mobile`, and TCC sits above the HAL. If the audio server has another name, the log says `mic: open refused for NAME`.
+- Gotcha: capture volume has no mute on purpose: nobody knows what VirtualAudio sets on an input volume control. Scalar 0 = -24 dB, so the rms line still shows real samples. [U] whether VirtualAudio touches it.
+- Camera: the `BWAudioSourceNode start:` hook does not block capture audio; it maps 'nope' to success. It stays. New line `the session's audio source started` decides. [U] whether 'nope' still comes.
+- iOS: [V code] route = "Codec" + `imic`; [V other ports' notes] redwood + apollo record with the D22 identity; [I] MobileGestalt `microphone` is per product; [V code] TCC needs Sandbox ops 5/6 (2903). [U] all of it on the Mi A3. `logs/` has no plug-in lines, so the old "Voice Memos records silence" had no log behind it.
+- Not done: headphones, earpiece (RX macro + RX SoundWire, class-H, MBHC, HAL devices). Second mic AMIC3 not used.
+- Built [V]: merge 32accf4 on 80072a9: 297/297 patches, 0 LSE/RCpc, printf-arg-check OK, 2 linker lines (stub rounds), 0 warnings in the mic + audio files, kernel.development.sweet.4k sha256 570f52c889b9bece, series 45d57a3047db7468; armv80-check kernel 21 (the same count as before: no new one); RedwoodAudio sha256 2a4afb9a810dc0ed (0 newer than ARMv8.0); NegroniCamera 9c75f34635665b47 (0). mic-host-test PASS, xnutils-test PASS.

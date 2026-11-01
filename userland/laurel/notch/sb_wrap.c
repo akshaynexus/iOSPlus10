@@ -14,6 +14,7 @@
  *     writes "on:" or "off:"; no such line = dyld did not load it;
  *   - if the exec fails, wait 10 s and exit (launchd does not spin).
  * Docs: docs/laurel_sprout/rtc-statusbar.md "C".
+ * Also inserts liblaurel-cellbar.dylib when it is on the root (no boot-arg cell=0); the crash guard covers both.
  */
 #include <errno.h>
 #include <stdio.h>
@@ -26,6 +27,7 @@
 
 #define REAL      "/System/Library/CoreServices/SpringBoard.app/SpringBoard"
 #define DYLIB     "/usr/local/lib/liblaurel-notch.dylib"
+#define CELLBAR   "/usr/local/lib/liblaurel-cellbar.dylib"      /* SIM, bars, network name: docs/laurel_sprout/cellular.md section 9 */
 #define STATE     "/var/tmp/laurel-sb.state"
 #define LOG       "/var/tmp/laurel-notch.log"
 #define FAST_S    30
@@ -69,10 +71,10 @@ bootarg_zero(const char *args, const char *name)
 int
 main(int argc, char *argv[])
 {
-	char args[1024] = "", session[64] = "", old[64] = "", n[16];
+	char args[1024] = "", session[64] = "", old[64] = "", n[16], list[128] = "";
 	size_t len = sizeof(args) - 1;
 	long now = (long)time(NULL), then = 0;
-	int fast = 0, use = 1;
+	int fast = 0, use = 1, cellbar;
 	FILE *f;
 
 	(void)argc;
@@ -109,9 +111,20 @@ main(int argc, char *argv[])
 		use = 0;
 		say("off: no %s on the root", DYLIB);
 	}
+	cellbar = fast < MAX_FAST && !bootarg_zero(args, "cell") && access(CELLBAR, R_OK) == 0;
 	if (use) {
-		setenv("DYLD_INSERT_LIBRARIES", DYLIB, 1);
+		strcpy(list, DYLIB);
 		say("%s inserted into SpringBoard (the dylib logs on/off at the first shape request)", DYLIB);
+	}
+	if (cellbar) {
+		if (list[0] != 0) {
+			strcat(list, ":");
+		}
+		strcat(list, CELLBAR);
+		say("%s inserted into SpringBoard (its own line: LAUREL CELLBAR)", CELLBAR);
+	}
+	if (list[0] != 0) {
+		setenv("DYLD_INSERT_LIBRARIES", list, 1);
 	} else {
 		unsetenv("DYLD_INSERT_LIBRARIES");
 	}

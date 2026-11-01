@@ -82,6 +82,7 @@ laurel-root: 9 installed, 1 off by their own switch, 1 missing: camera
 | flashlight | `TORCH=0` | its own plug-in only with `CAMERA=0` | one owner |
 | statusbar | `STATUSBAR=0` | none | provider key |
 | notch | `NOTCH=0` or `STATUSBAR=0` | `out/laurel/notch/root` | dylib, start program, SpringBoard job |
+| cell | `CELL=0`, or `NOTCH=0`, or `STATUSBAR=0` (`laurel-springboard` inserts it) | `out/laurel/cell/root` | dylib, SpringBoard job |
 | brightness | `BRIGHTNESS=0` | none | `BKEnableALS` false |
 | xnutils | `XNUTILS=0` | `out/laurel/xnutils/root` | app, helper (setuid, checked as root), pmregister |
 | ssh | `SSH=0` | `out/ssh/ios` | dropbear, its job |
