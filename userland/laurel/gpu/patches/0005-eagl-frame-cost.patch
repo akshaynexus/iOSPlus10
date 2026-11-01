@@ -1,0 +1,673 @@
+laurel 0005: frame cost in the GL layer: image_of() by hash (it scanned up to 512 images for each bind and draw), glFlush counted as GL, zero-copy planes for A008, L008, LA08, '_RB4' by the GPU (kernel 2913, Mesa 0002; one read-back per element size; a pass only when the seed moved), the contents line says not-looked-at instead of BLANK and gives the mean colour, LAUREL GL FLUSH and LAUREL GL THREAD lines. docs/laurel_sprout/gpu.md "Frame budget".
+
+--- a/userland/gpu/eagl.c
++++ b/userland/gpu/eagl.c
+@@ -58,7 +58,13 @@
+ #include <CoreFoundation/CoreFoundation.h>
+ #include <IOKit/IOKitLib.h>
+ #include <IOSurface/IOSurfaceRef.h>
++#include <dlfcn.h>
++#include <errno.h>
++#include <mach/mach.h>
+ #include <mach/mach_time.h>
++#include <mach/thread_policy.h>
++#include <pthread.h>
++#include <pthread/qos.h>
+ #include <objc/message.h>
+ #include <objc/runtime.h>
+ #include <stdarg.h>
+@@ -245,6 +251,9 @@
+ 	GLuint xr_source;               /* ... its memory as a texture of bytes, turned into the 8-bit picture by the GPU (xr_pass) */
+ 	unsigned xr_frame;              /* ... the frame that was last done in */
+ 	bool xr_checked;
++	GLuint xr_source2;              /* laurel 0005: '_RB4': the second plane */
++	bool xr_done;                   /* laurel 0005: its picture is there, as of `seed` */
++	uint16_t next;                  /* laurel 0005: the next image of its bucket (eagl.image_bucket), its index + 1 */
+ 	unsigned fills;                 /* ... times it was converted by the CPU (decoded_fill) */
+ 	struct lsf_contents contents;   /* what the surface held, last looked at */
+ 	uint8_t told;                   /* 0: the contents line is still to come; 1: said, and it was blank; 2: said, with something in it */
+@@ -257,6 +266,11 @@
+ 	unsigned long api;
+ 	struct image images[512];
+ 	unsigned image_count;
++	/*
++	 * laurel 0005: texture -> image, a hash: image_of() is called for each bind and each draw, and went through all of up to 512 images of about
++	 * 200 bytes: glBindTexture 20.7 us on average (7.2 s for 349429 binds, boot 22:08), and as much per draw.
++	 */
++	uint16_t image_bucket[1024];
+ 	GLuint framebuffer;             /* the one bound */
+ 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
+ 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
+@@ -304,6 +318,11 @@
+ 	GLuint xr_program, xr_framebuffer;      /* laurel 0004: xr_pass */
+ 	GLint xr_kind, xr_flip;
+ 	bool xr_failed;
++	GLuint rb4_program, check_program, check_texture, check_framebuffer;    /* laurel 0005 */
++	GLint rb4_flip, check_step;
++	uint32_t planes_checked;        /* laurel 0005: bytes-a-pixel 1, 2 of a plane: read back once */
++	bool box_wanted;                /* laurel 0005: the next frame's first box on the screen, for the LAUREL GL FLUSH line */
++	GLint screen_box[4];
+ 	unsigned contents_wanted;       /* images whose contents line has not come yet */
+ 	bool in_frame;
+ 	struct {                        /* what the line a frame gets with glframes=1 says (frame_end()) */
+@@ -395,6 +414,7 @@
+ static void xr_pass(struct eagl *e, struct image *image);
+ static bool format_first(uint32_t pixels, unsigned way);
+ static bool xr_setup(struct eagl *e, struct image *image);
++static bool rb4_setup(struct eagl *e, struct image *image);
+ 
+ static void
+ eagl_enter(struct eagl *e, unsigned offset)
+@@ -558,9 +578,9 @@
+ static struct image *
+ image_of(struct eagl *e, GLuint texture)
+ {
+-	for (unsigned i = 0; i < e->image_count; i++) {
+-		if (e->images[i].texture == texture) {
+-			return &e->images[i];
++	for (unsigned at = e->image_bucket[texture & 1023]; at != 0; at = e->images[at - 1].next) {
++		if (e->images[at - 1].texture == texture) {
++			return &e->images[at - 1];
+ 		}
+ 	}
+ 	return NULL;
+@@ -570,12 +590,15 @@
+ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
+ {
+ 	struct image *image = image_of(e, texture);
++	uint16_t next;
+ 
+ 	if (image == NULL) {
+ 		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
+ 			say("redwood-gl: more textures with IOSurfaces than there is room for\n");
+ 			return NULL;
+ 		}
++		next = e->image_bucket[texture & 1023];
++		e->image_bucket[texture & 1023] = (uint16_t)(e->image_count + 1);
+ 		image = &e->images[e->image_count++];
+ 	} else {
+ 		if (image->mirror != 0) {
+@@ -584,12 +607,17 @@
+ 		if (image->xr_source != 0) {
+ 			glDeleteTextures(1, &image->xr_source);
+ 		}
++		if (image->xr_source2 != 0) {
++			glDeleteTextures(1, &image->xr_source2);
++		}
+ 		if (image->told == 0 && e->contents_wanted != 0) {
+ 			e->contents_wanted--;
+ 		}
+ 		CFRelease(image->surface);
++		next = image->next;
+ 	}
+ 	memset(image, 0, sizeof(*image));
++	image->next = next;
+ 	image->texture = texture;
+ 	image->sub_ok = true;
+ 	image->told = 2;                /* (no contents line unless contents_watch() asks for one) */
+@@ -609,11 +637,30 @@
+ 		if (image->xr_source != 0) {
+ 			glDeleteTextures(1, &image->xr_source);
+ 		}
++		if (image->xr_source2 != 0) {
++			glDeleteTextures(1, &image->xr_source2);
++		}
+ 		if (image->told == 0 && e->contents_wanted != 0) {
+ 			e->contents_wanted--;
+ 		}
+ 		CFRelease(image->surface);
+-		*image = e->images[--e->image_count];
++		/* laurel 0005: out of its bucket; the last image moves into its slot, and whoever points at the last now points here */
++		unsigned self = (unsigned)(image - e->images) + 1, last = e->image_count;
++		uint16_t *link = &e->image_bucket[texture & 1023];
++
++		while (*link != self) {
++			link = &e->images[*link - 1].next;
++		}
++		*link = image->next;
++		e->image_count--;
++		if (self != last) {
++			link = &e->image_bucket[e->images[last - 1].texture & 1023];
++			while (*link != last) {
++				link = &e->images[*link - 1].next;
++			}
++			*link = (uint16_t)self;
++			*image = e->images[last - 1];
++		}
+ 	}
+ }
+ 
+@@ -732,16 +779,18 @@
+ {
+ 	static unsigned lines;
+ 	char name[5];
+-	bool blank = image->contents.lit == 0;
++	/* laurel 0005: 0 samples is "not looked at" (a 1-byte surface): 41 of the 61 "0 of 0 samples = BLANK" lines of boot 22:08 said nothing */
++	bool blank = image->contents.lit == 0 && image->contents.samples != 0;
+ 
+ 	image->told = blank ? 1 : 2;
+ 	if (lines++ >= 256) {
+ 		return;
+ 	}
+ 	lsf_name((uint32_t)IOSurfaceGetPixelFormat(image->surface), name);
+-	say("redwood-gl: contents: surface %u ('%s' %d x %d), texture %u, %s: %u of %u samples not black, %u unlike the first%s; %s%s\n",
++	say("redwood-gl: contents: surface %u ('%s' %d x %d), texture %u, %s: %u of %u samples not black, %u unlike the first, mean %u %u %u%s; %s%s\n",
+ 	    IOSurfaceGetID(image->surface), name, image->width, image->height, image->texture, when, image->contents.lit,
+-	    image->contents.samples, image->contents.unlike, blank ? " = BLANK, nothing drawn in it yet" : "",
++	    image->contents.samples, image->contents.unlike, image->contents.mean[0], image->contents.mean[1], image->contents.mean[2],
++	    blank ? " = BLANK, nothing drawn in it yet" : "",
+ 	    image->xr_source != 0 ? "converted by the GPU from " : image->decoded != NULL ? "converted by the CPU from " : "as it is",
+ 	    image->decoded != NULL ? image->decoded->what : "");
+ }
+@@ -762,7 +811,17 @@
+ 	const uint8_t *base = IOSurfaceGetBaseAddress(image->surface);
+ 	size_t row = IOSurfaceGetBytesPerRow(image->surface);
+ 
+-	if (base != NULL && IOSurfaceGetPlaneCount(image->surface) == 0 && IOSurfaceGetBytesPerElement(image->surface) == 4) {
++	if (image->decoded != NULL && image->decoded->kind == LSF_RGB8_2P && IOSurfaceGetPlaneCount(image->surface) == 2) {
++		/* laurel 0005: '_RB4' by the GPU: the planes, sampled */
++		struct lsf_plane plane[2];
++
++		(void)surface_planes(image->surface, plane);
++		if (plane[0].base != NULL && plane[1].base != NULL) {
++			sys_dcache_flush((void *)(uintptr_t)plane[0].base, plane[0].row * plane[0].height);
++			sys_dcache_flush((void *)(uintptr_t)plane[1].base, plane[1].row * plane[1].height);
++			lsf_contents_of_rb4(plane, (uint32_t)image->width, (uint32_t)image->height, &image->contents);
++		}
++	} else if (base != NULL && IOSurfaceGetPlaneCount(image->surface) == 0 && IOSurfaceGetBytesPerElement(image->surface) == 4) {
+ 		sys_dcache_flush((void *)(uintptr_t)base, row * (size_t)image->height);
+ 		lsf_contents_of_words(image->decoded != NULL ? (enum lsf_kind)image->decoded->kind : LSF_BGRA, base, row, (uint32_t)image->width,
+ 		    (uint32_t)image->height, &image->contents);
+@@ -890,6 +949,223 @@
+ }
+ 
+ /*
++ * laurel 0005: a texture of one plane of a surface, its own memory (kernel 2913: request 0x7c, Mesa: bits 32-39 of the image). 'A008', 'L008', 'LA08' were
++ * copied by the CPU at each attach: during a poster change CoreAnimation attaches a 720 x 1560 'A008' again every few frames (boot 22:12:40-22:12:51, glTexImage2D 1.75 s).
++ * Rows of 64 or no import. One read-back per element size: the GPU's and the CPU's bytes at 8 x 8 places must be equal, else CPU copies from then on, one line.
++ */
++#ifndef GL_VIEWPORT
++#define GL_VIEWPORT             0x0ba2
++#endif
++#ifndef GL_BLEND
++#define GL_BLEND                0x0be2
++#endif
++#ifndef GL_TEXTURE1
++#define GL_TEXTURE1             0x84c1
++#endif
++static GLuint vblur_program(const char *vertex, const char *fragment, const char *what);
++static const char *vblur_vertex_text(void);
++#define GL_ZERO_SWIZZLE         0
++#define GL_ONE_SWIZZLE          1
++#define GL_RED_COMPONENT        0x1903
++#define GL_GREEN_COMPONENT      0x1904
++#define GL_ALPHA_FORMAT         0x1906
++#define GL_LUMINANCE_FORMAT     0x1909
++#define GL_LUMINANCE_ALPHA_FORMAT 0x190a
++#define GL_SWIZZLE_R            0x8e42
++#define GL_SWIZZLE_G            0x8e43
++#define GL_SWIZZLE_B            0x8e44
++#define GL_SWIZZLE_A            0x8e45
++#define GL_COLOR_WRITEMASK      0x0c23
++#define FOURCC_A008             0x41303038u
++#define FOURCC_L008             0x4c303038u
++
++struct laurel_plane {                   /* struct redwood_plane in the kernel's RedwoodGPU.cpp */
++	uint32_t surface, plane, offset, row, width, height, bytes, planes, pixels, seed_moves;
++};
++static int (*plane_fn)(int fd, struct laurel_plane *plane);
++static int planes_state;                /* 0: not asked yet, 1: on, -1: off */
++static bool client_seeds;               /* the kernel moves the seed for GPU writes of other clients */
++extern int laurel_gl_plane_texture(uint32_t surface, unsigned plane);   /* gl_plane.c */
++
++static bool
++plane_info(IOSurfaceRef surface, unsigned plane, struct laurel_plane *p)
++{
++	if (planes_state == 0) {
++		plane_fn = (int (*)(int, struct laurel_plane *))dlsym(RTLD_DEFAULT, "redwood_drm_plane");
++		planes_state = plane_fn != NULL ? 1 : -1;
++		if (plane_fn == NULL) {
++			say("LAUREL GL PLANES: off: %s has no redwood_drm_plane: CPU copies\n", redwood_gl_library());
++		}
++	}
++	if (planes_state < 0) {
++		return false;
++	}
++	memset(p, 0, sizeof(*p));
++	p->surface = IOSurfaceGetID(surface);
++	p->plane = plane;
++	if (plane_fn(0, p) != 0) {
++		if (errno == ENOSYS || errno == EIO || errno == EOPNOTSUPP) {
++			planes_state = -1;
++			say("LAUREL GL PLANES: off: the kernel refuses request 0x7c (error %d): CPU copies\n", errno);
++		}
++		return false;
++	}
++	client_seeds = p->seed_moves != 0;
++	return (p->row & 63) == 0;
++}
++
++/* what xr_pass() and plane_check() change, and put back */
++struct gl_kept {
++	GLint view[4], box[4];
++	GLboolean scissored, blended, mask[4];
++};
++
++static void
++gl_keep(struct gl_kept *k)
++{
++	glGetIntegerv(GL_VIEWPORT, k->view);
++	glGetIntegerv(GL_SCISSOR_BOX, k->box);
++	glGetBooleanv(GL_COLOR_WRITEMASK, k->mask);
++	k->scissored = glIsEnabled(GL_SCISSOR_TEST);
++	k->blended = glIsEnabled(GL_BLEND);
++}
++
++static void
++gl_back(struct eagl *e, const struct gl_kept *k)
++{
++	glUseProgram(e->program);
++	glColorMask(k->mask[0], k->mask[1], k->mask[2], k->mask[3]);
++	(k->blended ? glEnable : glDisable)(GL_BLEND);
++	(k->scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
++	glScissor(k->box[0], k->box[1], k->box[2], k->box[3]);
++	glViewport(k->view[0], k->view[1], k->view[2], k->view[3]);
++	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
++}
++
++static const char plane_check_fragment[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "uniform highp sampler2D source;\n"
++    "uniform ivec2 steps;\n"
++    "layout(location = 0) out vec4 colour;\n"
++    "void main() { colour = texelFetch(source, ivec2(gl_FragCoord.xy) * steps, 0); }\n";
++
++/*
++ * With the plane's texture bound, swizzle still its own: 8 x 8 texels read by the GPU and by the CPU are the same. false: GL_FALSE to all sharing.
++ * (Read at once: a texture of the wrong rows shows garbage, nothing else would ever say so.)
++ */
++static bool
++plane_check(struct eagl *e, IOSurfaceRef surface, const struct laurel_plane *p)
++{
++	uint8_t got[8 * 8 * 4];
++	struct gl_kept kept;
++	GLint bound = 0;
++	unsigned sx = p->width > 8 ? (p->width - 1) / 7 : 1, sy = p->height > 8 ? (p->height - 1) / 7 : 1;
++	unsigned w = p->width < 8 ? p->width : 8, h = p->height < 8 ? p->height : 8;
++	bool good = true;
++
++	if (p->bytes == 0 || p->bytes > 2 || (e->planes_checked & (1u << p->bytes)) != 0) {
++		return true;
++	}
++	if (e->check_program == 0) {
++		e->check_program = vblur_program(vblur_vertex_text(), plane_check_fragment, "read back one plane");
++		if (e->check_program == 0) {
++			return true;    /* (no way to look: the rows are 64 as the kernel says) */
++		}
++		glGenTextures(1, &e->check_texture);
++		glGenFramebuffers(1, &e->check_framebuffer);
++		glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++		glBindTexture(GL_TEXTURE_2D, e->check_texture);
++		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
++		glBindFramebuffer(GL_FRAMEBUFFER, e->check_framebuffer);
++		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->check_texture, 0);
++		glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
++	}
++	e->planes_checked |= 1u << p->bytes;
++	gl_keep(&kept);
++	clear_now(e);
++	glBindFramebuffer(GL_FRAMEBUFFER, e->check_framebuffer);
++	glViewport(0, 0, 8, 8);
++	glDisable(GL_SCISSOR_TEST);
++	glDisable(GL_BLEND);
++	glColorMask(1, 1, 1, 1);
++	glUseProgram(e->check_program);
++	glUniform2i(glGetUniformLocation(e->check_program, "steps"), (GLint)sx, (GLint)sy);
++	glUniform1i(glGetUniformLocation(e->check_program, "source"), (GLint)e->unit);
++	glDrawArrays(GL_TRIANGLES, 0, 3);
++	glReadPixels(0, 0, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, got);
++	gl_back(e, &kept);
++	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
++		return true;
++	}
++	const uint8_t *base = IOSurfaceGetPlaneCount(surface) > 0 ? IOSurfaceGetBaseAddressOfPlane(surface, p->plane) : IOSurfaceGetBaseAddress(surface);
++
++	for (unsigned y = 0; good && base != NULL && y < h; y++) {
++		for (unsigned x = 0; good && x < w; x++) {
++			const uint8_t *cpu = base + p->row * (size_t)(y * sy) + (size_t)(x * sx) * p->bytes, *gpu = got + (y * 8u + x) * 4u;
++
++			if (gpu[0] != cpu[0] || (p->bytes == 2 && gpu[1] != cpu[1])) {
++				good = false;
++				say("LAUREL GL PLANES: off: surface %u, plane %u, %ux%u, %u bytes a row: texel %u,%u the GPU reads %u, memory holds %u: CPU copies\n",
++				    p->surface, p->plane, p->width, p->height, p->row, x * sx, y * sy, gpu[0], cpu[0]);
++			}
++		}
++	}
++	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
++	if (!good) {
++		planes_state = -1;
++	} else if (p->bytes == 1) {
++		say("LAUREL GL PLANES: on: surfaces of 1 and 2 bytes a pixel and the planes of '_RB4' are textures of their own memory, 64 texels read back equal; other clients' GPU writes move the seed: %s\n",
++		    client_seeds ? "yes" : "no");
++	}
++	return good;
++}
++
++static bool
++plane_shared(struct eagl *e, struct image *image)
++{
++	IOSurfaceRef surface = image->surface;
++	uint32_t pixels = (uint32_t)IOSurfaceGetPixelFormat(surface);
++	GLint swizzle[4];
++	struct laurel_plane p;
++
++	if (!share_surfaces || planes_state < 0 || image->invert || image->plane != 0 || image->to != GL_TEXTURE_2D || image->type != GL_UNSIGNED_BYTE ||
++	    IOSurfaceGetPlaneCount(surface) != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) {
++		return false;
++	}
++	/* (a small one is cheaper to copy than to map: 4 requests and a table entry against a few KB) */
++	if ((size_t)image->width * (size_t)image->height * IOSurfaceGetBytesPerElement(surface) < 32 * 1024) {
++		return false;
++	}
++	if (pixels == FOURCC_A008 && image->format == GL_ALPHA_FORMAT) {
++		swizzle[0] = swizzle[1] = swizzle[2] = GL_ZERO_SWIZZLE;
++		swizzle[3] = GL_RED_COMPONENT;
++	} else if (pixels == FOURCC_L008 && image->format == GL_LUMINANCE_FORMAT) {
++		swizzle[0] = swizzle[1] = swizzle[2] = GL_RED_COMPONENT;
++		swizzle[3] = GL_ONE_SWIZZLE;
++	} else if (pixels == 0x4c413038u /* 'LA08' */ && image->format == GL_LUMINANCE_ALPHA_FORMAT) {
++		swizzle[0] = swizzle[1] = swizzle[2] = GL_RED_COMPONENT;
++		swizzle[3] = GL_GREEN_COMPONENT;
++	} else {
++		return false;
++	}
++	if (!plane_info(surface, 0, &p) || !laurel_gl_plane_texture(p.surface, 0)) {
++		return false;
++	}
++	if (!plane_check(e, surface, &p)) {
++		return false;   /* (surface_to_texture gives the texture storage of its own) */
++	}
++	glTexParameteri(GL_TEXTURE_2D, GL_SWIZZLE_R, swizzle[0]);
++	glTexParameteri(GL_TEXTURE_2D, GL_SWIZZLE_G, swizzle[1]);
++	glTexParameteri(GL_TEXTURE_2D, GL_SWIZZLE_B, swizzle[2]);
++	glTexParameteri(GL_TEXTURE_2D, GL_SWIZZLE_A, swizzle[3]);
++	image->shared = true;
++	e->shared++;
++	return true;
++}
++
++/*
+  * Make a texture, which is bound, of its IOSurface's own memory, if that is what is asked for
+  * (the whole of a surface of blue-first pixels, the same way up) and the library can do it.
+  */
+@@ -1298,6 +1574,41 @@
+  * library has been waited for already.
+  */
+ static void frame_functions(struct eagl *e);
++
++/*
++ * laurel 0005: what the window's flushes did in Mesa (laurel_fd_stats, mesa-tree-patches/0002) and, at the first window, what thread draws.
++ */
++static void
++frame_cost_line(struct eagl *e, unsigned frames)
++{
++	static uint64_t *stats, was[5];
++	static int asked;
++
++	if (!asked) {
++		struct sched_param param = { 0 };
++		int policy = 0;
++		qos_class_t qos = QOS_CLASS_UNSPECIFIED;
++		int relative = 0;
++		thread_time_constraint_policy_data_t rt = { 0 };
++		mach_msg_type_number_t count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
++		boolean_t none = TRUE;
++
++		asked = 1;
++		stats = (uint64_t *)dlsym(RTLD_DEFAULT, "laurel_fd_stats");
++		(void)pthread_getschedparam(pthread_self(), &policy, &param);
++		(void)pthread_get_qos_class_np(pthread_self(), &qos, &relative);
++		(void)thread_policy_get(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&rt, &count, &none);
++		say("LAUREL GL THREAD: CoreAnimation draws on a thread of priority %d, policy %d, QoS %#x, %s; Mesa's own threads are user-interactive\n", param.sched_priority, policy,
++		    (unsigned)qos, none ? "not real time" : "real time");
++	}
++	if (stats != NULL && frames != 0) {
++		say("LAUREL GL FLUSH: %u frames: %llu batches in tiles (%llu tiles), %llu straight into memory, %llu with no draw; %llu us a frame in the batch code; a frame changes %d,%d %dx%d of the screen\n", frames,
++		    stats[0] - was[0], stats[1] - was[1], stats[2] - was[2], stats[4] - was[4], (stats[3] - was[3]) / 1000 / frames, e->screen_box[0], e->screen_box[1], e->screen_box[2], e->screen_box[3]);
++		memcpy(was, stats, sizeof(was));
++	}
++	e->box_wanted = true;
++}
++
+ static void
+ frame_end(struct eagl *e, bool finished)
+ {
+@@ -1377,6 +1688,7 @@
+ 		say("redwood-gl: frame %u: %u draws, and none into an IOSurface that is known here (framebuffer %u, texture %u)\n",
+ 		    e->frames, e->draws, e->framebuffer, e->colour);
+ 	}
++	e->gl_us += e->flushing;                /* laurel 0005: glFlush was left out: frame_end() ends the frame before the call ends ("8046 us outside GL" held 5.9 ms of it) */
+ 	e->all_calls += e->calls;
+ 	e->all_draws += e->draws;
+ 	e->all_triangles += e->triangles;
+@@ -1442,6 +1754,7 @@
+ 			    w.frames * 10000ull / ms % 10, w.us / w.frames / 1000, w.us / w.frames / 100 % 10, w.longest / 1000,
+ 			    w.longest / 100 % 10, w.over16, w.over33, w.flush / w.frames, w.wait / w.frames, w.copy / w.frames,
+ 			    w.copied_frames, w.in_place, w.copied);
++			frame_cost_line(e, w.frames);
+ 			bzero(&w, sizeof(w));
+ 		}
+ 	}
+@@ -1496,6 +1809,16 @@
+ 	}
+ 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
+ 		image->drawn = image->painted = true;
++		if (e->box_wanted && image->width >= 700 && image->height >= 1500) {
++			e->box_wanted = false;
++			if (glIsEnabled(GL_SCISSOR_TEST)) {
++				glGetIntegerv(GL_SCISSOR_BOX, e->screen_box);
++			} else {
++				e->screen_box[0] = e->screen_box[1] = 0;
++				e->screen_box[2] = image->width;
++				e->screen_box[3] = image->height;
++			}
++		}
+ 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
+ 			/* the display's picture (a surface of its size): where this frame first draws into it */
+ 			e->line.into_display++;
+@@ -2112,6 +2435,12 @@
+     "  }\n"
+     "}\n";
+ 
++static const char *
++vblur_vertex_text(void)
++{
++	return vblur_vertex;
++}
++
+ static GLuint
+ vblur_program(const char *vertex, const char *fragment, const char *what)
+ {
+@@ -2149,8 +2478,6 @@
+  * GPU: the surface's memory is a texture of bytes as for any surface (no copy), the program puts each word together again and writes
+  * the texture CoreAnimation reads. Once in a frame in which it is bound: a Metal client's GPU writes move no seed.
+  */
+-#define GL_COLOR_WRITEMASK      0x0c23
+-
+ static const char xr_fragment[] =
+     "#version 300 es\n"
+     "precision highp float;\n"
+@@ -2170,6 +2497,73 @@
+     "  else colour = vec4(c.bgr / 1023.0, float(w >> 30) / 3.0);\n"
+     "}\n";
+ 
++/*
++ * laurel 0005: '_RB4' (RenderBox RGB8_444_2P) by the GPU: the green plane and the blue-red plane are textures of their own memory, a shader writes the texture
++ * CoreAnimation reads, in the ring's order after what the client drew: no CPU read while its GPU writes, no copy. Boot 22:11:57: 32 textures refilled by the CPU, 98 ms in one frame.
++ */
++static const char rb4_fragment[] =
++    "#version 300 es\n"
++    "precision highp float;\n"
++    "uniform highp sampler2D green;\n"
++    "uniform highp sampler2D bluered;\n"
++    "uniform int flip;\n"
++    "layout(location = 0) out vec4 colour;\n"
++    "void main() {\n"
++    "  ivec2 at = ivec2(gl_FragCoord.xy);\n"
++    "  if (flip != 0) at.y = textureSize(green, 0).y - 1 - at.y;\n"
++    "  vec2 br = texelFetch(bluered, at, 0).rg;\n"
++    "  colour = vec4(br.g, texelFetch(green, at, 0).r, br.r, 1.0);\n"
++    "}\n";
++
++static bool
++rb4_setup(struct eagl *e, struct image *image)
++{
++	IOSurfaceRef surface = image->surface;
++	struct laurel_plane p0, p1;
++
++	if (!share_surfaces || e->xr_failed || IOSurfaceGetPlaneCount(surface) != 2 || !plane_info(surface, 0, &p0) || !plane_info(surface, 1, &p1) ||
++	    p0.bytes != 1 || p1.bytes != 2 || p0.width != (uint32_t)image->width || p0.height != (uint32_t)image->height ||
++	    p1.width != p0.width || p1.height != p0.height) {
++		return false;
++	}
++	if (e->rb4_program == 0) {
++		e->rb4_program = vblur_program(vblur_vertex, rb4_fragment, "'_RB4' planes to 8-bit pixels");
++		if (e->rb4_program == 0) {
++			e->xr_failed = true;
++			return false;
++		}
++		glUseProgram(e->rb4_program);
++		glUniform1i(glGetUniformLocation(e->rb4_program, "green"), 0);
++		glUniform1i(glGetUniformLocation(e->rb4_program, "bluered"), 1);
++		e->rb4_flip = glGetUniformLocation(e->rb4_program, "flip");
++		glUseProgram(e->program);
++	}
++	if (e->xr_framebuffer == 0) {
++		glGenFramebuffers(1, &e->xr_framebuffer);
++	}
++	glGenTextures(1, &image->xr_source);
++	glGenTextures(1, &image->xr_source2);
++	bool made = true;
++
++	for (unsigned i = 0; i < 2 && made; i++) {
++		glBindTexture(GL_TEXTURE_2D, i == 0 ? image->xr_source : image->xr_source2);
++		made = laurel_gl_plane_texture(p0.surface, i) && plane_check(e, surface, i == 0 ? &p0 : &p1);
++		if (made) {
++			glTexParameteri(GL_TEXTURE_2D, 0x2801, GL_NEAREST);
++			glTexParameteri(GL_TEXTURE_2D, 0x2800, GL_NEAREST);
++		}
++	}
++	glBindTexture(GL_TEXTURE_2D, image->texture);
++	if (!made) {
++		glDeleteTextures(1, &image->xr_source);
++		glDeleteTextures(1, &image->xr_source2);
++		image->xr_source = image->xr_source2 = 0;
++		return false;
++	}
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA, image->width, image->height, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
++	return true;
++}
++
+ /* with the texture of the image bound: true: it will be converted by the GPU. false: this is for the CPU */
+ static bool
+ xr_setup(struct eagl *e, struct image *image)
+@@ -2177,6 +2571,9 @@
+ 	uint8_t kind = image->decoded->kind;
+ 	bool made;
+ 
++	if (kind == LSF_RGB8_2P) {
++		return rb4_setup(e, image);     /* laurel 0005 */
++	}
+ 	if (!share_surfaces || e->xr_failed || (kind != LSF_XR_BGR10 && kind != LSF_BGR10A2 && kind != LSF_RGB10A2) ||
+ 	    IOSurfaceGetPlaneCount(image->surface) != 0 || IOSurfaceGetBytesPerElement(image->surface) != 4 ||
+ 	    (size_t)image->width != IOSurfaceGetWidth(image->surface) || (size_t)image->height != IOSurfaceGetHeight(image->surface)) {
+@@ -2215,18 +2612,23 @@
+ static void
+ xr_pass(struct eagl *e, struct image *image)
+ {
+-	GLint view[4], box[4];
+-	GLboolean scissored, blended, mask[4];
++	struct gl_kept kept;
++	uint32_t seed = IOSurfaceGetSeed(image->surface);
+ 
+ 	if (image->xr_frame == e->frames + 1) {
+ 		return;
+ 	}
++	/*
++	 * laurel 0005: a pass is a batch of its own, flushed on this thread: only when the surface changed. Kernel 2913 moves the seed for every submission of a
++	 * client that names the surface, a CPU writer has its lock; about once a second all the same (64 frames bound).
++	 */
++	if (client_seeds && image->xr_done && seed == image->seed && (e->frames + IOSurfaceGetID(image->surface)) % 64 != 0) {
++		return;
++	}
+ 	image->xr_frame = e->frames + 1;
+-	glGetIntegerv(GL_VIEWPORT, view);
+-	glGetIntegerv(GL_SCISSOR_BOX, box);
+-	glGetBooleanv(GL_COLOR_WRITEMASK, mask);
+-	scissored = glIsEnabled(GL_SCISSOR_TEST);
+-	blended = glIsEnabled(GL_BLEND);
++	image->xr_done = true;
++	image->seed = seed;
++	gl_keep(&kept);
+ 	clear_now(e);
+ 	glBindFramebuffer(GL_FRAMEBUFFER, e->xr_framebuffer);
+ 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+@@ -2241,6 +2643,10 @@
+ 			glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
+ 			glDeleteTextures(1, &image->xr_source);
+ 			image->xr_source = 0;
++			if (image->xr_source2 != 0) {
++				glDeleteTextures(1, &image->xr_source2);
++				image->xr_source2 = 0;
++			}
+ 			decoded_fill(e, image);
+ 			return;
+ 		}
+@@ -2249,21 +2655,26 @@
+ 	glDisable(GL_SCISSOR_TEST);
+ 	glDisable(GL_BLEND);
+ 	glColorMask(1, 1, 1, 1);
+-	glUseProgram(e->xr_program);
+-	glUniform1i(e->xr_kind, image->decoded->kind == LSF_XR_BGR10 ? 0 : image->decoded->kind == LSF_BGR10A2 ? 1 : 2);
+-	glUniform1i(e->xr_flip, image->invert);
++	if (image->xr_source2 != 0) {
++		glUseProgram(e->rb4_program);
++		glUniform1i(e->rb4_flip, image->invert);
++		glActiveTexture(GL_TEXTURE1);
++		glBindTexture(GL_TEXTURE_2D, image->xr_source2);
++	} else {
++		glUseProgram(e->xr_program);
++		glUniform1i(e->xr_kind, image->decoded->kind == LSF_XR_BGR10 ? 0 : image->decoded->kind == LSF_BGR10A2 ? 1 : 2);
++		glUniform1i(e->xr_flip, image->invert);
++	}
+ 	glActiveTexture(GL_TEXTURE0);
+ 	glBindTexture(GL_TEXTURE_2D, image->xr_source);
+ 	glDrawArrays(GL_TRIANGLES, 0, 3);
+ 	glBindTexture(GL_TEXTURE_2D, e->bound[0]);
++	if (image->xr_source2 != 0) {
++		glActiveTexture(GL_TEXTURE1);
++		glBindTexture(GL_TEXTURE_2D, e->bound[1]);
++	}
+ 	glActiveTexture(GL_TEXTURE0 + e->unit);
+-	glUseProgram(e->program);
+-	glColorMask(mask[0], mask[1], mask[2], mask[3]);
+-	(blended ? glEnable : glDisable)(GL_BLEND);
+-	(scissored ? glEnable : glDisable)(GL_SCISSOR_TEST);
+-	glScissor(box[0], box[1], box[2], box[3]);
+-	glViewport(view[0], view[1], view[2], view[3]);
+-	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
++	gl_back(e, &kept);
+ }
+ 
+ static struct vblur_chain *
+@@ -4052,7 +4463,7 @@
+ 			surface_changed(e, image);
+ 			surface_to_texture(e, image);
+ 		}
+-	} else if (!surface_shared(e, image)) {
++	} else if (!plane_shared(e, image) && !surface_shared(e, image)) {
+ 		surface_changed(e, image);              /* (what it adds up to now) */
+ 		surface_to_texture(e, image);
+ 	}

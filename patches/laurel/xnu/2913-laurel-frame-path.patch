@@ -1,0 +1,556 @@
+laurel 2913: the frame path. The clock of CoreAnimation follows the panel (INTF1 line + frame counter, on by default, kill switch sweetfb_lock=0; boot 22:08: 57 ticks a second against 60 panel frames). The presenter sleeps to the latch instead of 100 us looks, at priority 92. SWEET FPS keeps its text, its sums now restart with the window (boot 22:08: 14.4 s of waits in a 10 s line). New line LAUREL FRAME per window: tick period, frames/s while moving, gaps by missed panel frames, queue + fence + latch, touch to next flip. RedwoodGPU: the impossible "MHz while busy" is gone, a submission's lock wait and hold, the window server's kernel time. Request 0x7c + kRedwoodAnyLayout: a texture of each plane of an IOSurface (A008, L008, LA08, _RB4). A surface named by a client that is not the window server gets a new seed (kill switch gpuclientseed=0). docs/laurel_sprout/gpu.md "Frame budget".
+
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+index 598fd67..726f089 100644
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -98,6 +98,7 @@ enum {
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
++	kRedwoodPlane           = 0x7c,         /* laurel 2913: where one plane of an IOSurface is */
+ 	kRedwoodDrawn           = 0x7d,         /* laurel 2158: the GPU has drawn into a surface: a new seed, no CPU write */
+ 	kRedwoodSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
+ 	kRedwoodShow            = 0x7f,         /* ours: pixels of the caller's onto the panel, to see a test's result */
+@@ -182,6 +183,17 @@ struct redwood_show {
+ };
+ 
+ #define kRedwoodDescribe        0xffffffffu
++/*
++ * laurel 2913: in redwood_surface.surface: the buffer is the surface's memory whatever its layout. Who asks has read kRedwoodPlane and makes a texture of
++ * each plane: A008, L008, LA08 (1 and 2 bytes a pixel) and the two planes of '_RB4', rows of 64 as the GPU needs them.
++ */
++#define kRedwoodAnyLayout       0x40000000u
++struct redwood_plane {
++	uint32_t surface, plane;
++	uint32_t offset, rowBytes, width, height, bytesPerElement;      /* back */
++	uint32_t planes, pixelFormat;
++	uint32_t seedMoves;                     /* back: GPU writes of other clients move the seed (gpuclientseed) */
++};
+ 
+ #define MSM_INFO_GET_OFFSET     0
+ #define MSM_INFO_GET_IOVA       1
+@@ -210,6 +222,13 @@ struct redwood_show {
+ #define GPU_PUSH_SAFE_MS        250
+ #define GPU_PUSH_FRAME_MS       16
+ static TUNABLE(uint32_t, gGPUHostImport, "gpu_hostimport", 1);    /* laurel 2160, kill switch gpu_hostimport=0 */
++/*
++ * laurel 2913: a surface named in the submission of a client that is not the window server gets a new seed: what the window server converts or
++ * copies follows it without adding up the memory (that was 1 ms a frame, glBindTexture 7.2 s of 7400 frames, boot 22:08). Kill switch gpuclientseed=0.
++ */
++static TUNABLE(uint32_t, gGPUClientSeed, "gpuclientseed", 1);
++static uint64_t gWSCallTime;                    /* laurel 2913: the window server's requests, all of them: time here (mach ticks) */
++static uint32_t gWSCalls;
+ static TUNABLE(uint32_t, gGPUSeedRule, "gpuseed", 1);   /* kill switch gpuseed=0: the 4 ms rule above for every surface */
+ 
+ static IOLock * gGPULock;                       /* around everything that is the GPU's (redwood_gpu_...) */
+@@ -224,6 +243,7 @@ static struct {
+ 	uint32_t made, given_again;             /* buffers of their own made for programs, and of those kept ones given again */
+ 	uint32_t pushes, clean;                 /* laurel 2158: surfaces pushed out of the cache, and passed over (no CPU write) */
+ 	uint64_t making;                        /* ... and the time it took to make the others */
++	uint64_t lock_wait, held;               /* laurel 2913: a submission: before it had the lock, and with it */
+ } gGPUStat;
+ 
+ /* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
+@@ -488,6 +508,7 @@ class RedwoodGPUUserClient : public IOUserClient
+ 	void reap(void);
+ 	IOReturn gemNew(struct msm_gem_new * request);
+ 	IOReturn surfaceBuffer(struct redwood_surface * request);
++	IOReturn surfacePlane(struct redwood_plane * request);
+ 	IOReturn surfaceDrawn(struct redwood_drawn * request);
+ 	IOReturn hostPages(struct redwood_userptr * request);
+ 	IOReturn gemInfo(struct msm_gem_info * request);
+@@ -1015,9 +1036,46 @@ scattered:
+  * lock it gives buffers back under). Asked only to describe (kRedwoodDescribe), no buffer is made.
+  */
+ IOReturn
+-RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
++RedwoodGPUUserClient::surfacePlane(struct redwood_plane * request)
+ {
+ 	SweetSurface * s = sweet_surface_copy(request->surface);
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	IOReturn ret = kIOReturnSuccess;
++
++	if (s->wrapped || s->memory == NULL || s->kernelAddress() == 0) {
++		ret = kIOReturnBadArgument;     /* (client memory starts inside a page: the old path knows it. Unsupported means: no request 0x7c here) */
++	} else if (s->planeCount == 0 && request->plane == 0) {
++		request->offset = s->offset;
++		request->rowBytes = s->bytesPerRow;
++		request->width = s->width;
++		request->height = s->height;
++		request->bytesPerElement = s->bytesPerElement;
++	} else if (request->plane < s->planeCount && request->plane < SWEET_SURFACE_MAX_PLANES) {
++		const struct sweet_surface_plane * p = &s->planes[request->plane];
++
++		request->offset = p->offset;
++		request->rowBytes = p->bytesPerRow;
++		request->width = p->width;
++		request->height = p->height;
++		request->bytesPerElement = p->bytesPerElement;
++	} else {
++		ret = kIOReturnBadArgument;
++	}
++	request->planes = s->planeCount;
++	request->pixelFormat = s->pixelFormat;
++	request->seedMoves = gGPUClientSeed;
++	s->release();
++	return ret;
++}
++
++IOReturn
++RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
++{
++	bool anyLayout = (request->surface & kRedwoodAnyLayout) != 0;   /* laurel 2913 */
++	SweetSurface * s = sweet_surface_copy(request->surface & ~kRedwoodAnyLayout);
+ 	struct gpu_buffer * b = NULL;
+ 	IOMemoryDescriptor * memory;
+ 	uint64_t size, began = mach_absolute_time();
+@@ -1068,7 +1126,7 @@ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ 			}
+ 		}
+ 	}
+-	if (!s->gpuPool && (s->bytesPerElement != 4 || s->planeCount > 1 || (s->bytesPerRow & 63) != 0)) {
++	if (!anyLayout && !s->gpuPool && (s->bytesPerElement != 4 || s->planeCount > 1 || (s->bytesPerRow & 63) != 0)) {
+ 		s->release();
+ 		return kIOReturnUnsupported;
+ 	}
+@@ -1276,7 +1334,7 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 	struct msm_gem_submit_cmd * cmds = NULL;
+ 	uint64_t addresses[GPU_SUBMIT_CMDS];
+ 	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
+-	uint64_t began, nanos, again;
++	uint64_t began, nanos, again, lock_began;
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+ 	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
+@@ -1294,7 +1352,9 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		ret = kIOReturnVMError;
+ 		goto out;
+ 	}
++	lock_began = mach_absolute_time();              /* laurel 2913 */
+ 	IOLockLock(gGPULock);
++	gGPUStat.lock_wait += mach_absolute_time() - lock_began;
+ 	/*
+ 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
+ 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to
+@@ -1415,6 +1475,15 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 			b->fence = request->fence;
+ 			if (b->surface != NULL) {
+ 				b->surface->drawn = request->fence;
++				/* laurel 2913: (Turnip names all its buffers: a client that submits may move seeds it did not write; one that is quiet moves none) */
++				if (!fWindowServer && gGPUClientSeed && b->surface->state != NULL) {
++					volatile uint32_t * seed = (volatile uint32_t *) ((uint8_t *) b->surface->state->getBytesNoCopy() + 0xc);
++					uint32_t was = *seed, now = (uint32_t) OSIncrementAtomic((volatile SInt32 *) seed) + 1;
++
++					if (gGPUSeedRule && b->seed == was) {
++						b->seed = now;  /* (not a CPU write: no push for the writer) */
++					}
++				}
+ 			}
+ 		}
+ 	}
+@@ -1467,8 +1536,19 @@ RedwoodGPUUserClient::submit(struct msm_gem_submit * request)
+ 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
+ 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
+ 		    fBufferBytes >> 20, gGPUStat.pushes, gGPUStat.clean);
++		uint64_t lock_wait, held, ws_time;
++		uint32_t ws_calls = gWSCalls;
++
++		absolutetime_to_nanoseconds(gGPUStat.lock_wait, &lock_wait);
++		absolutetime_to_nanoseconds(gGPUStat.held, &held);
++		absolutetime_to_nanoseconds(gWSCallTime, &ws_time);
++		gWSCalls = 0;
++		gWSCallTime = 0;
++		IOLog("RedwoodGPU: a submission: %llu us before the lock, %llu us with it; the window server: %u requests, %llu us here in all\n",
++		    lock_wait / NSEC_PER_USEC / gGPUStat.submissions, held / NSEC_PER_USEC / gGPUStat.submissions, ws_calls, ws_time / NSEC_PER_USEC);
+ 		bzero(&gGPUStat, sizeof(gGPUStat));
+ 	}
++	gGPUStat.held += mach_absolute_time() - began;         /* laurel 2913 */
+ 	IOLockUnlock(gGPULock);
+ 	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
+ out:
+@@ -1546,6 +1626,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		struct msm_submitqueue_query query;
+ 		struct drm_gem_close close;
+ 		struct redwood_surface surface;
++		struct redwood_plane plane;
+ 		struct redwood_drawn drawn;
+ 		struct redwood_userptr userptr;
+ 		struct redwood_show show;
+@@ -1563,6 +1644,7 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 	}
+ 	bzero(&r, sizeof(r));
+ 	memcpy(&r, args->structureInput, size);
++	uint64_t called = fWindowServer ? mach_absolute_time() : 0;     /* laurel 2913 */
+ 
+ 	switch (selector) {
+ 	case kMsmGetParam:
+@@ -1643,6 +1725,9 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 	case kRedwoodSurface:
+ 		ret = surfaceBuffer(&r.surface);
+ 		break;
++	case kRedwoodPlane:
++		ret = surfacePlane(&r.plane);
++		break;
+ 	case kRedwoodDrawn:
+ 		ret = surfaceDrawn(&r.drawn);
+ 		break;
+@@ -1657,6 +1742,10 @@ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArgument
+ 		ret = kIOReturnUnsupported;
+ 		break;
+ 	}
++	if (called != 0) {
++		gWSCallTime += mach_absolute_time() - called;
++		gWSCalls++;
++	}
+ 	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
+ 		if (args->structureOutputSize > size) {
+ 			args->structureOutputSize = (uint32_t) size;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e88e735..3867fc3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -73,6 +73,22 @@ bool topaz_surface_drawn(SweetSurface *surface, uint64_t milliseconds);   /* Red
+  * one vsync after the next frame replaced it on the panel.
+  */
+ static uint64_t sweet_fps_tick;         /* mach time of the last vsync tick (SWEET FPS) */
++/*
++ * laurel 2913: where a frame's time goes between SwapEnd and the panel, and how the clock CoreAnimation follows runs. The numbers that
++ * SWEET FPS mixes (docs/laurel_sprout/gpu.md "Frame budget"). All times in mach ticks until the line.
++ */
++static struct laurel_frame_stats {
++	uint64_t tick_last, tick_sum, tick_worst;
++	uint32_t ticks, ticks_late;
++	uint64_t queue, fence, latch;   /* SwapEnd to the presenter; present's wait for the GPU; flush to latch */
++	uint32_t shown, missed;         /* flips; of those, latch later than one panel frame after the flush */
++	uint64_t moving;                /* the time between frames that are under 100 ms apart */
++	uint32_t moving_frames, gaps[4];        /* under 20, 36, 52 ms, longer: 0, 1, 2, 3 or more panel frames missed */
++	uint64_t touch;                 /* from a touch event to the next flip */
++	uint32_t touches;
++} lf;
++extern "C" kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority, thread_t *new_thread);
++extern "C" uint64_t laurel_touch_event_at;      /* bsd/dev/sweet_touch.c: mach time of the last finger event not yet followed by a flip */
+ 
+ /* boot-arg sweetfb_nohold=1 (a test): frames on the panel are not marked in use */
+ static bool
+@@ -216,7 +232,11 @@ public:
+ 	uint32_t      fVLockFrames;   /* INTF frame counter and time at the last measurement */
+ 	uint64_t      fVLockAt;
+ 	uint32_t      fPanelUS;       /* a panel frame, measured */
++	uint32_t      fVLockTold;     /* laurel 2913: the on line came */
++	uint32_t      fVLockBad;      /* laurel 2913: measurements in a row that make no sense */
++	uint32_t      fVLastFrames;   /* laurel 2913: the counter at the last tick */
+ 	uint32_t      vsyncNext(void);
++	uint32_t      latchLeftUS(void);      /* laurel 2913 */
+ 	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
+ 	uint32_t      fScanStride;
+ 	uint32_t      fBootSrc, fBootStride;
+@@ -229,6 +249,7 @@ public:
+ 	IOLock       *fQLock;
+ 	uint8_t       fQRec[2][SWEET_FB_SWAP_REC_SIZE];
+ 	SweetSurface *fQHeld[2][4];
++	uint64_t      fQAt[2];        /* laurel 2913: when SwapEnd gave the frame */
+ 	unsigned      fQFirst, fQWaiting;
+ 	bool          fQStarted;
+ 	void          presenter(void);
+@@ -891,15 +912,22 @@ AppleCLCD::start(IOService *provider)
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	uint32_t lock = 0;
+-	fVLock = PE_parse_boot_argn("sweetfb_lock", &lock, sizeof(lock)) && lock != 0 && fIntf1 != NULL && fVTotal > 100;
+-	fPanelUS = 8333;
++	/*
++	 * laurel 2913: the clock of CoreAnimation follows the panel (kill switch sweetfb_lock=0). Boot 22:08: 300 ticks took about 5.25 s (17.5 ms a tick,
++	 * 57 a second: 16.667 ms from the end of the handler, plus the timer's slack) against 315 panel frames (60 a second): the tick's phase ran
++	 * through the panel's about 3 times a second, so a frame that fitted one time missed the next latch the next time.
++	 */
++	uint32_t lock = 1;
++	(void)PE_parse_boot_argn("sweetfb_lock", &lock, sizeof(lock));
++	fVLock = lock != 0 && fIntf1 != NULL && fVTotal > 100;
++	fPanelUS = SWEET_FB_VSYNC_US;
+ 	IOLog("SWEET FB: vsync %s the panel (%u lines a frame)\n", fVLock ? "follows" : "does not follow", fVTotal);
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 	uint32_t sync = 0;
+ 	if (!(PE_parse_boot_argn("sweetfb_sync", &sync, sizeof(sync)) && sync != 0) && (fQLock = IOLockAlloc()) != NULL) {
+ 		thread_t thread;
+-		if (kernel_thread_start(&AppleCLCD::presenterMain, this, &thread) == KERN_SUCCESS) {
++		/* laurel 2913: above the user threads and the kernel's own pollers: it runs a few microseconds a frame, at the moment the flush must land */
++		if (kernel_thread_start_priority(&AppleCLCD::presenterMain, this, 92 /* BASEPRI_PREEMPT */, &thread) == KERN_SUCCESS) {
+ 			thread_deallocate(thread);
+ 			IOLog("SWEET FB: direct frames through a presenter thread (SwapEnd returns at once)\n");
+ 		} else {
+@@ -926,14 +954,33 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	sweet_fps_tick = now;
++	if (lf.tick_last != 0) {
++		uint64_t period = now - lf.tick_last;
++
++		lf.tick_sum += period;
++		lf.tick_worst = period > lf.tick_worst ? period : lf.tick_worst;
++		lf.ticks++;
++	}
++	lf.tick_last = now;
+ 	/*
+ 	 * What QuartzCore reads (darwin-redwood MiniIOMobileFramebuffer): three 64-bit numbers as six
+ 	 * halves -- the time of this refresh, the time it was presented, a counter. The counter came
+ 	 * first here: with CA_FORCE_TIMER its frame clock took the count for a time.
+ 	 */
++	uint64_t refresh = now;
++	if (fb->fVLock) {
++		/* laurel 2913: the time the refresh began, not when this timer came: CoreAnimation predicts the next one from it */
++		uint32_t line = fb->fIntf1[(0x800 + 0x0b0) / 4] & 0xffff;
++		uint64_t back = 0;
++
++		nanoseconds_to_absolutetime((uint64_t)line * fb->fPanelUS * 1000 / fb->fVTotal, &back);
++		if (line < fb->fVTotal / 2 && back < now) {
++			refresh = now - back;
++		}
++	}
+ 	uint64_t values[6] = {
+-		(uint32_t)now, (uint32_t)(now >> 32),
+-		(uint32_t)now, (uint32_t)(now >> 32),
++		(uint32_t)refresh, (uint32_t)(refresh >> 32),
++		(uint32_t)refresh, (uint32_t)(refresh >> 32),
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 	};
+ 
+@@ -1088,29 +1135,63 @@ AppleCLCD::vsyncNext(void)
+ 	uint32_t line = r[0x0b0 / 4] & 0xffff;
+ 	uint64_t ns;
+ 
++	/*
++	 * laurel 2913: the counter stands (panel off, a stopped timing engine: the line says nothing then): the plain timer for this tick. It
++	 * also comes here when a tick was early and is still in the panel frame of the last one: then the plain timer lands in the next.
++	 */
++	bool moved = frames != fVLastFrames;
++	fVLastFrames = frames;
++	if (fVLockAt == 0) {
++		fVLockFrames = frames;
++		fVLockAt = now;
++		return SWEET_FB_VSYNC_US;
++	}
+ 	absolutetime_to_nanoseconds(now - fVLockAt, &ns);
+-	if (fVLockAt != 0 && frames - fVLockFrames >= 60 && ns > 0) {
++	if (frames - fVLockFrames >= 60 && ns > 0) {
+ 		uint32_t us = (uint32_t)(ns / 1000 / (frames - fVLockFrames));
+-		if (us >= 5000 && us <= 20000) {
++		if (us >= 8000 && us <= 20000) {
+ 			fPanelUS = us;
++			fVLockBad = 0;
++			if (fVLockTold++ == 0) {
++				IOLog("LAUREL FRAME: on: the tick follows the panel: %u us a frame, %u lines (kill switch sweetfb_lock=0); the presenter sleeps to the latch\n",
++				    us, fVTotal);
++			}
++		} else if (++fVLockBad == 8) {
++			/* (a display that is off gives one bad number, not eight in a row) */
++			fVLock = false;
++			IOLog("LAUREL FRAME: off: the panel counter gives %u us a frame, 8 times in a row: the plain 16.667 ms timer\n", us);
++			return SWEET_FB_VSYNC_US;
+ 		}
+ 		fVLockFrames = frames;
+ 		fVLockAt = now;
+-	} else if (fVLockAt == 0) {
+-		fVLockFrames = frames;
++	} else if (ns > 4ull * NSEC_PER_SEC) {
++		fVLockFrames = frames;          /* (too few frames in 4 s: the display was off) */
+ 		fVLockAt = now;
+ 	}
+-	if (line >= fVTotal) {
+-		line = 0;
++	if (!moved || line >= fVTotal) {
++		return SWEET_FB_VSYNC_US;
+ 	}
+ 	uint32_t left = (uint32_t)((uint64_t)(fVTotal - line) * fPanelUS / fVTotal);
+ 	uint32_t next = left + 300;
+-	while (next < 12000) {
++	/* one tick per panel frame: a tick that came late does not get a second one right after it (topaz had 12 ms here, for its 127 Hz panel) */
++	while (next < fPanelUS / 2) {
+ 		next += fPanelUS;
+ 	}
+ 	return next;
+ }
+ 
++/* laurel 2913: microseconds to the next start of a panel frame; 0: not known */
++uint32_t
++AppleCLCD::latchLeftUS(void)
++{
++	if (!fVLock) {
++		return 0;
++	}
++	uint32_t line = fIntf1[(0x800 + 0x0b0) / 4] & 0xffff;
++
++	return line < fVTotal ? (uint32_t)((uint64_t)(fVTotal - line) * fPanelUS / fVTotal) : 0;
++}
++
+ /*
+  * The display's modes, the way CoreAnimation reads them (properties TimingElements and
+  * ColorElements; the current one is block 0x40 of selector 79): one timing, the presented size
+@@ -1223,6 +1304,38 @@ static uint64_t sweet_fb_swap_count;
+  */
+ static uint64_t sweet_fps_wait_ns, sweet_fps_after_ns;  /* this second: latch waits, tick-to-swap */
+ 
++/* laurel 2913: one window of the frame path; each line under the 255 bytes of one kernel log line */
++static void
++laurel_frame_line(uint64_t window_ns)
++{
++	uint64_t us[6] = {};
++
++	if (lf.ticks != 0) {
++		absolutetime_to_nanoseconds(lf.tick_sum / lf.ticks, &us[0]);
++		absolutetime_to_nanoseconds(lf.tick_worst, &us[1]);
++	}
++	if (lf.shown != 0) {
++		absolutetime_to_nanoseconds(lf.queue / lf.shown, &us[2]);
++		absolutetime_to_nanoseconds(lf.fence / lf.shown, &us[3]);
++		absolutetime_to_nanoseconds(lf.latch / lf.shown, &us[4]);
++	}
++	if (lf.touches != 0) {
++		absolutetime_to_nanoseconds(lf.touch / lf.touches, &us[5]);
++	}
++	uint64_t moving_ns = 0;
++
++	absolutetime_to_nanoseconds(lf.moving, &moving_ns);
++	IOLog("LAUREL FRAME: %u ticks of %llu us, worst %llu; moving: %llu.%llu frames/s for %llu ms of %llu; gaps <20 ms %u, <36 %u, <52 %u, longer %u\n",
++	    lf.ticks, us[0] / 1000, us[1] / 1000, moving_ns ? (uint64_t)lf.moving_frames * NSEC_PER_SEC / moving_ns : 0,
++	    moving_ns ? (uint64_t)lf.moving_frames * NSEC_PER_SEC * 10 / moving_ns % 10 : 0, moving_ns / 1000000, window_ns / 1000000,
++	    lf.gaps[0], lf.gaps[1], lf.gaps[2], lf.gaps[3]);
++	IOLog("LAUREL FRAME: after SwapEnd, %u flips: %llu us to the presenter, %llu us GPU fence, %llu us flush to latch, %u past one panel frame; touch to next flip %llu us (%u)\n",
++	    lf.shown, us[2] / 1000, us[3] / 1000, us[4] / 1000, lf.missed, us[5] / 1000, lf.touches);
++	bzero(&lf.queue, sizeof(lf) - __builtin_offsetof(struct laurel_frame_stats, queue));
++	lf.tick_sum = lf.tick_worst = 0;
++	lf.ticks = 0;
++}
++
+ static void
+ sweet_fps_count(void)
+ {
+@@ -1248,14 +1361,30 @@ sweet_fps_count(void)
+ 		absolutetime_to_nanoseconds(now - last, &gap);
+ 	}
+ 	last = now;
++	/*
++	 * laurel 2913: a pause over 500 ms starts a new window, and also its sums. They used to stay: boot 22:08 "356 frames in 10081 ms ... a
++	 * frame 40446 us in present + latch" is 14.4 s of one thread's waits in 10 s; the 26 ms "after the tick" (ticks are 17.5 ms apart) comes from the same sum.
++	 */
+ 	if (window == 0 || gap > 500000000ull) {
+ 		window = now;
+ 		frames = late = 0;
+ 		gap_max = 0;
++		sweet_fps_wait_ns = sweet_fps_after_ns = 0;
++		lf.tick_sum = lf.tick_worst = 0;
++		lf.ticks = 0;
++		bzero(&lf.queue, sizeof(lf) - __builtin_offsetof(struct laurel_frame_stats, queue));
+ 		return;
+ 	}
+ 	frames++;
+ 	late += gap > 20000000ull;
++	if (gap < 100000000ull) {
++		uint64_t abs_gap;
++
++		nanoseconds_to_absolutetime(gap, &abs_gap);
++		lf.moving += abs_gap;
++		lf.moving_frames++;
++	}
++	lf.gaps[gap < 20000000ull ? 0 : gap < 36000000ull ? 1 : gap < 52000000ull ? 2 : 3]++;
+ 	if (sweet_fps_tick != 0 && now > sweet_fps_tick) {
+ 		uint64_t after = 0;
+ 		absolutetime_to_nanoseconds(now - sweet_fps_tick, &after);
+@@ -1269,6 +1398,7 @@ sweet_fps_count(void)
+ 		    "came %llu us after the tick\n", frames, ns / 1000000, gap_max / 1000000, late,
+ 		    frames ? sweet_fps_wait_ns / 1000 / frames : 0, frames ? sweet_fps_after_ns / 1000 / frames : 0);
+ 		sweet_fps_wait_ns = sweet_fps_after_ns = 0;
++		laurel_frame_line(ns);
+ 		window = now;
+ 		frames = late = 0;
+ 		gap_max = 0;
+@@ -1310,6 +1440,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		unsigned slot = (fQFirst + fQWaiting) % 2;
+ 		memcpy(fQRec[slot], rec, SWEET_FB_SWAP_REC_SIZE);
+ 		memcpy(fQHeld[slot], held, sizeof(fQHeld[slot]));
++		fQAt[slot] = mach_absolute_time();
+ 		fQWaiting++;
+ 		IOLockWakeup(fQLock, fQRec, true);
+ 		IOLockUnlock(fQLock);
+@@ -1356,6 +1487,7 @@ AppleCLCD::presenter(void)
+ 		}
+ 		memcpy(rec, fQRec[fQFirst], sizeof(rec));
+ 		memcpy(held, fQHeld[fQFirst], sizeof(held));
++		lf.queue += mach_absolute_time() - fQAt[fQFirst];
+ 		IOLockUnlock(fQLock);
+ 		if (directEligible(rec, held)) {
+ 			showDirect(rec, held);
+@@ -1385,11 +1517,37 @@ AppleCLCD::showDirect(const uint8_t *rec, SweetSurface **heldIn)
+ 		sweet_hold_set(dropped, false);
+ 		uint64_t waited = mach_absolute_time(), wns = 0;  /* (present waits for the GPU too) */
+ 		present(rec);
+-		for (int t = 0; t < 250 && (fCtl0[0x18 / 4] & fFlush) != 0; t++) {
+-			IODelay(100);                           /* until the MDP has latched it */
++		/*
++		 * laurel 2913: until the MDP has latched it. Sleep to the panel frame's start, then look: before, 100 us at a time for up to a whole
++		 * panel frame (up to 160 wake-ups per frame at this thread's priority; kernel_task 17.2 s of the minute 22:14:55, 8.0 in a quiet one).
++		 */
++		uint64_t flushed = mach_absolute_time(), panel;
++		uint32_t left = (fCtl0[0x18 / 4] & fFlush) != 0 ? latchLeftUS() : 0;
++
++		if (left > 600) {
++			delay_for_interval(left - 300, NSEC_PER_USEC);
++		}
++		for (int t = 0; t < 500 && (fCtl0[0x18 / 4] & fFlush) != 0; t++) {
++			IODelay(50);
+ 		}
+-		absolutetime_to_nanoseconds(mach_absolute_time() - waited, &wns);
++		uint64_t latched = mach_absolute_time();
++
++		absolutetime_to_nanoseconds(latched - waited, &wns);
+ 		sweet_fps_wait_ns += wns;
++		nanoseconds_to_absolutetime(fPanelUS * 1000ull + 1000000ull, &panel);
++		lf.latch += latched - flushed;
++		lf.missed += latched - flushed > panel;
++		lf.shown++;
++		if (laurel_touch_event_at != 0) {
++			uint64_t since = latched - laurel_touch_event_at, limit;
++
++			laurel_touch_event_at = 0;
++			nanoseconds_to_absolutetime(200 * NSEC_PER_MSEC, &limit);
++			if (since < limit) {
++				lf.touch += since;
++				lf.touches++;
++			}
++		}
+ 		IOLockLock(fLock);
+ 		memcpy(shown, fShowHold, sizeof(shown));
+ 		memcpy(retired, fRetireHold, sizeof(retired));
+@@ -2350,7 +2508,9 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 		return false;
+ 	}
+ 	bool ok = false;
++	uint64_t fence_began = mach_absolute_time();
+ 	(void)topaz_surface_drawn(s, 100);
++	lf.fence += mach_absolute_time() - fence_began;         /* laurel 2913 */
+ 	if (s == fSurface) {
+ 		/*
+ 		 * laurel 2104: surface 1 is the boot framebuffer (backboardd's GL draws frames into it). The
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 6b0a550..e152ec8 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1905,8 +1905,12 @@ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7]
+ 		if (clk_ticks0 != 0 && ticks > clk_ticks0 && cycles >= clk_cycles0) {
+ 			uint64_t dc = cycles - clk_cycles0, dt = ticks - clk_ticks0, db = busy - clk_busy0;
+ 
+-			snprintf(clk_note, sizeof(clk_note), "GPU busy %llu.%llu %%, core %llu MHz while busy, %llu MHz over the window%s",
+-			    db * 100 / dt, db * 1000 / dt % 10, db ? dc * 192 / db / 10 : 0, dc * 192 / dt / 10,
++			/*
++			 * laurel 2913: CP_0 counts every core clock, busy or idle ("16300 MHz while busy" at 1.8 % busy, boot 22:08 = 300 MHz / 1.8 %):
++			 * no number here can be the clock while busy. The level comes from `gpu.level_mhz` and the LAUREL GPU CLOCK line.
++			 */
++			snprintf(clk_note, sizeof(clk_note), "GPU busy %llu.%llu %%, clock %llu MHz over the window%s",
++			    db * 100 / dt, db * 1000 / dt % 10, dc * 192 / dt / 10,
+ 			    ts_lost ? " (some submissions not timed)" : "");
+ 		}
+ 		clk_cycles0 = cycles;

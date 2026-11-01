@@ -108,6 +108,21 @@ main(void)
 			printf("ok   guess: %s\n", f->what);
 		}
 	}
+	{	/* laurel 0005: '_RB4' contents: the planes' means, red green blue */
+		static uint8_t green[64 * 64], bluered[64 * 64 * 2];
+		struct lsf_plane plane[2] = { { green, 64, 64, 64, 1 }, { bluered, 128, 64, 64, 2 } };
+		struct lsf_contents c;
+
+		memset(green, 100, sizeof(green));
+		for (size_t i = 0; i < sizeof(bluered); i += 2) {
+			bluered[i] = 50;
+			bluered[i + 1] = 200;
+		}
+		lsf_contents_of_rb4(plane, 64, 64, &c);
+		printf("%s contents rb4: %u samples, %u lit, mean %u %u %u\n", c.lit == c.samples && c.mean[0] == 200 && c.mean[1] == 100 && c.mean[2] == 50 ? "ok  " : "FAIL",
+		    c.samples, c.lit, c.mean[0], c.mean[1], c.mean[2]);
+		failed += !(c.lit == c.samples && c.mean[0] == 200 && c.mean[1] == 100 && c.mean[2] == 50);
+	}
 	{	/* contents: an empty picture says 0 lit; a picture with one lit cell says so */
 		enum { W = 128, H = 128 };
 		static uint8_t pixels[W * H * 4];

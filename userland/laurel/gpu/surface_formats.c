@@ -401,10 +401,20 @@ step_of(uint32_t size)
 	return step == 0 ? 1 : step;
 }
 
+/* laurel: the mean colour, red green blue: a false colour in a picture shows here (the purple of boot 22:08 has no other trace in a log) */
+static void
+lsf_mean(struct lsf_contents *c, const uint64_t sum[3])
+{
+	for (int i = 0; i < 3; i++) {
+		c->mean[i] = c->samples != 0 ? (uint8_t)(sum[i] / c->samples) : 0;
+	}
+}
+
 void
 lsf_contents_of_pixels(const struct lsf_format *f, const uint8_t *pixels, size_t row, uint32_t width, uint32_t height, struct lsf_contents *c)
 {
 	uint32_t sx = step_of(width), sy = step_of(height), first = 0;
+	uint64_t sum[3] = { 0, 0, 0 };
 	bool alpha = f != NULL && f->kind == LSF_A8;
 
 	memset(c, 0, sizeof(*c));
@@ -417,14 +427,19 @@ lsf_contents_of_pixels(const struct lsf_format *f, const uint8_t *pixels, size_t
 			}
 			c->lit += colour != 0;
 			c->unlike += colour != first;
+			sum[0] += (colour >> 16) & 255;
+			sum[1] += (colour >> 8) & 255;
+			sum[2] += colour & 255;
 		}
 	}
+	lsf_mean(c, sum);
 }
 
 void
 lsf_contents_of_words(enum lsf_kind kind, const uint8_t *words, size_t row, uint32_t width, uint32_t height, struct lsf_contents *c)
 {
 	uint32_t sx = step_of(width), sy = step_of(height), first = 0;
+	uint64_t sum[3] = { 0, 0, 0 };
 	const uint8_t *xr = xr_table();
 
 	memset(c, 0, sizeof(*c));
@@ -444,6 +459,36 @@ lsf_contents_of_words(enum lsf_kind kind, const uint8_t *words, size_t row, uint
 			}
 			c->lit += colour != 0;
 			c->unlike += colour != first;
+			sum[0] += (colour >> 16) & 255;
+			sum[1] += (colour >> 8) & 255;
+			sum[2] += colour & 255;
 		}
 	}
+	lsf_mean(c, sum);
+}
+
+/* '_RB4': plane 0 green bytes, plane 1 (blue, red) byte pairs */
+void
+lsf_contents_of_rb4(const struct lsf_plane *plane, uint32_t width, uint32_t height, struct lsf_contents *c)
+{
+	uint32_t sx = step_of(width), sy = step_of(height), first = 0;
+	uint64_t sum[3] = { 0, 0, 0 };
+
+	memset(c, 0, sizeof(*c));
+	for (uint32_t y = sy / 2; y < height; y += sy) {
+		for (uint32_t x = sx / 2; x < width; x += sx) {
+			const uint8_t *br = plane[1].base + plane[1].row * y + x * 2u;
+			uint32_t g = plane[0].base[plane[0].row * y + x], colour = (uint32_t)br[1] << 16 | g << 8 | br[0];
+
+			if (c->samples++ == 0) {
+				first = colour;
+			}
+			c->lit += colour != 0;
+			c->unlike += colour != first;
+			sum[0] += br[1];
+			sum[1] += g;
+			sum[2] += br[0];
+		}
+	}
+	lsf_mean(c, sum);
 }
