@@ -10,6 +10,9 @@ set -eu
 DEST=${REF_DIR:-$EXT}
 
 # NAME URL COMMIT [BRANCH]
+# hackios-xnu-kernel: renamed upstream to oosexgang/hakios-xnu-kernel (GitHub redirects the old URL). Its main branch
+# (a48d2b2, 2026-11-01) shares no history with d82c64a, and d82c64a has GPU work a48d2b2 lacks: keep d82c64a
+# (docs/laurel_sprout/upstream-2026-11-01.md; scripts/setup/upstream-check.sh compares the heads).
 TABLE='
 UniXNU-negroni     https://github.com/pawlickerr/UniXNU-negroni.git   f812002ae3e6b861d23007efdfd9f1c394934ba9 dev
 ios-sweet          https://github.com/akshaynexus/ios-sweet.git       45263bee51df4a0f55cdf9c649af886399488ddb main

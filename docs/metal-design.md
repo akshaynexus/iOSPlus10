@@ -176,7 +176,7 @@ Linux: the same scripts with an iPhoneOS SDK copied from a Mac in `SDK=`, clang/
 
 | Component | Pin | License |
 |---|---|---|
-| metal2vulkan | f6a96b7d (master, 2026-10-26; UniXNU and flame use 720ef1ce) + `userland/metal/patches/m2v-flame` (UniXNU 0001-0004 and flame 0100, 0101 rebased; 0005 is upstream) + `userland/metal/patches/m2v` 0001-0003 | GPL-2.0-or-later OR LGPL-3.0-or-later |
+| metal2vulkan | 219f013 (master, 2026-10-29; rollback f6a96b7d; UniXNU and flame use 720ef1ce) + `userland/metal/patches/m2v-flame` (UniXNU 0001-0004 and flame 0100, 0101 rebased; 0005 is upstream) + `userland/metal/patches/m2v` 0001-0002 (0003 dropped at 219f013: upstream default); f6a96b7d sets in `m2v-flame-f6a96b7d`, `m2v-f6a96b7d`; upstream table docs/laurel_sprout/upstream-2026-11-01.md | GPL-2.0-or-later OR LGPL-3.0-or-later |
 | frontend + bridge | ios-flame 745c434 `phone/metal2` (UniXNU NativeMetal ff0c70d, patched for iOS 16) | MIT |
 | Rust | 1.98.0 | - |
 | Turnip | from the GPU user-space build (Mesa 25.0.7 today; flame/UniXNU use 85fda3b3 + UniXNU patches) | MIT |

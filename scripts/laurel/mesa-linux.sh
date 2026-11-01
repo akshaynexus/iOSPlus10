@@ -82,15 +82,20 @@ INI
 DRIVERS=${DRIVERS:-softpipe,freedreno}
 B=$M/build-${DRIVERS//,/-}
 export PATH=$DEPS/venv/bin:$PATH
+# -O3 with debug info (kept in $DSYM, gpu_dsym); no LTO: the theos ld64 cannot read clang 23 bitcode [I].
+# A build directory made with other CPU flags is made again (the wrapper's flags are not in ninja's view).
+FLAGS_STAMP="$CPU_FLAGS O3 g"
+[ "$(cat "$B/.laurel-flags" 2>/dev/null)" = "$FLAGS_STAMP" ] || rm -rf "$B"
 if [ ! -f "$B/build.ninja" ]; then
   meson setup "$B" "$S" --cross-file "$M/cross.ini" --wrap-mode=nofallback \
-    --prefix=$PREFIX --libdir=lib --buildtype=release -Db_ndebug=true \
+    --prefix=$PREFIX --libdir=lib -Doptimization=3 -Ddebug=true -Db_ndebug=true \
     -Dplatforms= -Dgallium-drivers="$DRIVERS" -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
     -Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
     -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
     -Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
     -Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > "$M/meson-setup.log" 2>&1 ||
     { tail -30 "$M/meson-setup.log"; gpu_die "meson setup failed (log: $M/meson-setup.log)"; }
+  echo "$FLAGS_STAMP" > "$B/.laurel-flags"
 fi
 echo "mesa-linux: ninja -j$NPROC ($DRIVERS)"
 ninja -C "$B" -j"$NPROC" > "$M/ninja.log" 2>&1 || { grep -m 20 -E "error:|FAILED" "$M/ninja.log"; gpu_die "ninja failed (log: $M/ninja.log)"; }
@@ -98,7 +103,8 @@ ninja -C "$B" -j"$NPROC" > "$M/ninja.log" 2>&1 || { grep -m 20 -E "error:|FAILED
 O=$M/out
 L=$B/src/gallium/targets/osmesa/libOSMesa.8.dylib
 [ -s "$L" ] || gpu_die "no $L"
-"$STRIP" -x -o "$O/libOSMesa.8.dylib" "$L"
+cp "$L" "$O/libOSMesa.8.dylib"
+gpu_dsym "$O/libOSMesa.8.dylib"
 "$INSTALL_NAME_TOOL" -id $PREFIX/lib/libOSMesa.8.dylib "$O/libOSMesa.8.dylib"
 "$LDID" -S "$O/libOSMesa.8.dylib"
 "$NM" -gU "$O/libOSMesa.8.dylib" | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > "$O/exported-gl.txt"

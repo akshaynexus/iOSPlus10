@@ -1,0 +1,92 @@
+laurel (Mi A3, Adreno 610): Turnip 25.0.7 reports Vulkan 1.0 for a6xx gen1 "low" parts (no HW multiview; tu_device.cc
+apiVersion), and metal2vulkan refuses devices below Vulkan 1.2, so Metal found no device on the A610. On Darwin this
+reports what TU_DEBUG=noconform reports for the API level and multiview (Vulkan 1.3, KHR_multiview,
+EXT_shader_viewport_index_layer, maxMultiviewViewCount, maxViewports), nothing else. Parts with HW multiview
+(negroni A730, A6xx gen2+) are unchanged. Kill switch TU_DARWIN_API=0; one line "TU DARWIN API: on|off: ...".
+Applied after userland/turnip/mesa-patches by scripts/gpu/turnip-build.sh (TU_EXTRA_PATCHES, set by scripts/laurel/metal-build.sh).
+
+diff -ruN a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -51,6 +51,36 @@
+ 
+ uint64_t os_page_size = 4096;
+ 
++/*
++ * laurel (Mi A3, Adreno 610): the a6xx gen1 "low" parts (A605/A608/A610/A612) have no HW multiview, and upstream then
++ * reports Vulkan 1.0 (1.3 only with TU_DEBUG=noconform). metal2vulkan refuses any device below Vulkan 1.2
++ * (metal2vulkan-runtime device/create.rs), so Metal would find no device. On Darwin this reports what noconform reports
++ * for the API level and multiview (Vulkan 1.3, multiview and viewport index through Turnip's own lowering, no HW
++ * multiview); nothing else of noconform. Kill switch: TU_DARWIN_API=0 (upstream behaviour). One log line.
++ */
++static bool
++tu_darwin_full_api(const struct tu_physical_device *pdevice)
++{
++#if DETECT_OS_APPLE
++   static int on = -1;
++   if (pdevice->info->a6xx.has_hw_multiview)
++      return false;
++   if (on < 0) {
++      const char *e = getenv("TU_DARWIN_API");
++      on = !(e && strcmp(e, "0") == 0);
++      if (on)
++         mesa_logi("TU DARWIN API: on: Vulkan 1.3 on %s without HW multiview (multiview in Turnip's lowering)",
++                   pdevice->name);
++      else
++         mesa_logi("TU DARWIN API: off: TU_DARWIN_API=0: Vulkan 1.0 (metal2vulkan needs 1.2)");
++   }
++   return on;
++#else
++   (void) pdevice;
++   return false;
++#endif
++}
++
+ static int
+ tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
+ {
+@@ -197,7 +227,7 @@
+       .KHR_maintenance5 = true,
+       .KHR_maintenance6 = true,
+       .KHR_map_memory2 = true,
+-      .KHR_multiview = TU_DEBUG(NOCONFORM) ? true : device->info->a6xx.has_hw_multiview,
++      .KHR_multiview = (TU_DEBUG(NOCONFORM) || tu_darwin_full_api(device)) ? true : device->info->a6xx.has_hw_multiview,
+       .KHR_performance_query = TU_DEBUG(PERFC),
+       .KHR_pipeline_executable_properties = true,
+       .KHR_pipeline_library = true,
+@@ -311,7 +341,7 @@
+       .EXT_shader_module_identifier = true,
+       .EXT_shader_replicated_composites = true,
+       .EXT_shader_stencil_export = true,
+-      .EXT_shader_viewport_index_layer = TU_DEBUG(NOCONFORM) ? true : device->info->a6xx.has_hw_multiview,
++      .EXT_shader_viewport_index_layer = (TU_DEBUG(NOCONFORM) || tu_darwin_full_api(device)) ? true : device->info->a6xx.has_hw_multiview,
+       .EXT_subgroup_size_control = true,
+ #ifdef TU_USE_WSI_PLATFORM
+       .EXT_swapchain_maintenance1 = true,
+@@ -771,7 +801,7 @@
+ 
+    p->pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES;
+    p->maxMultiviewViewCount =
+-      (pdevice->info->a6xx.has_hw_multiview || TU_DEBUG(NOCONFORM)) ? MAX_VIEWPORTS : 1;
++      (pdevice->info->a6xx.has_hw_multiview || TU_DEBUG(NOCONFORM) || tu_darwin_full_api(pdevice)) ? MAX_VIEWPORTS : 1;
+    p->maxMultiviewInstanceIndex = INT_MAX;
+    p->protectedNoFault = false;
+    /* Our largest descriptors are 2 texture descriptors, or a texture and
+@@ -1020,7 +1050,7 @@
+    props->maxSamplerLodBias = 4095.0 / 256.0; /* [-16, 15.99609375] */
+    props->maxSamplerAnisotropy = 16;
+    props->maxViewports =
+-         (pdevice->info->a6xx.has_hw_multiview || TU_DEBUG(NOCONFORM)) ? MAX_VIEWPORTS : 1;
++         (pdevice->info->a6xx.has_hw_multiview || TU_DEBUG(NOCONFORM) || tu_darwin_full_api(pdevice)) ? MAX_VIEWPORTS : 1;
+    props->maxViewportDimensions[0] =
+       props->maxViewportDimensions[1] = MAX_VIEWPORT_SIZE;
+    props->viewportBoundsRange[0] = INT16_MIN;
+@@ -1071,7 +1101,7 @@
+    props->nonCoherentAtomSize = 64;
+ 
+    props->apiVersion =
+-      (pdevice->info->a6xx.has_hw_multiview || TU_DEBUG(NOCONFORM)) ?
++      (pdevice->info->a6xx.has_hw_multiview || TU_DEBUG(NOCONFORM) || tu_darwin_full_api(pdevice)) ?
+          ((pdevice->info->chip >= 7) ? TU_API_VERSION :
+             VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION))
+          : VK_MAKE_VERSION(1, 0, VK_HEADER_VERSION);

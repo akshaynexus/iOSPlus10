@@ -24,7 +24,25 @@ SDK_NAME=iPhoneOS16.5.sdk
 LAUREL_CHIP_ID=0x06010000
 # Turnip patches of this port, after userland/turnip/mesa-patches (scripts/gpu/turnip-build.sh TU_EXTRA_PATCHES):
 # 0101 caps maxMemoryAllocationSize/maxBufferSize at the kernel's RedwoodMaxBuffer (pass-through SMMU: < 64 MiB)
+# 0102 reports Vulkan 1.3 for the A610 (no HW multiview: upstream says 1.0, and metal2vulkan needs 1.2)
 export TU_EXTRA_PATCHES="$LMSRC/turnip-patches"
+# Compiled target (Kryo 260, ARMv8.0; measured choice: docs/laurel_sprout/metal.md "Compiled target"):
+#   C/C++/ObjC (Turnip, plug-in, probes): -mcpu=cortex-a53 (ISA floor and tuning) + the A53 erratum 835769 fix
+#   Turnip: -O3 (meson release) + ThinLTO through ld64.lld, debug info kept as a dSYM (out/gpu/turnip/*.dSYM)
+#   Rust (metal2vulkan + bridge): target-cpu cortex-a53, the same erratum fix, thin LTO, 4 codegen units
+# Only this port sets them: negroni builds (scripts/gpu, scripts/metal without metal-env.sh) are unchanged.
+LAUREL_CPU_FLAGS="-mcpu=cortex-a53 -mfix-cortex-a53-835769"
+export TU_CPU_FLAGS="$LAUREL_CPU_FLAGS"
+export TU_MESON_ARGS="-Db_lto=true -Db_lto_mode=thin -Ddebug=true"
+export NMTL_CPU_FLAGS="$LAUREL_CPU_FLAGS"
+export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C target-cpu=cortex-a53 -C target-feature=+fix-cortex-a53-835769"
+export CARGO_PROFILE_RELEASE_LTO=thin
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
+# metal2vulkan shader cache (translated functions, pipelines, Turnip's VkPipelineCache data = ir3 binaries) caps, read at
+# cargo time by flame/0018: 32 MiB memo per process (default 256 MiB: every Metal process has its own device), 1 GiB on
+# disk per cache directory (default 25 GiB).
+export NMB_SHADER_MEMO_MB=32
+export NMB_SHADER_DISK_MB=1024
 # Host tool floor (Linux): ld64.lld emits chained fixups by default from LLVM 18 on [I: older ones fail the Turnip check
 # late]; checked in laurel_metal_tools.
 LLVM_MIN=18

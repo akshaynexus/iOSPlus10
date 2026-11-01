@@ -4044,6 +4044,41 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Line to check on the next boot: `LAUREL BT: on: WCN3990 product 0x000a rom 0x0201, crbtfw21.tlv + crnv21.bin, 3000000 baud,
   BD_ADDR ..` or `LAUREL BT: off: <why>` (+ `LAUREL BT: clk:/geni:/power:/chip:/fw:` step lines).
 
+## Mi A3: GPU upstream sync, SMMU stage 1 (2154), Vulkan 1.3 for the A610, compiled target (2026-11-01 06:45, gpu-upstream-opt agent, branch t3/laurel-gpu-upstream-opt; build only, NOT BOOTED)
+- Upstream table: docs/laurel_sprout/upstream-2026-11-01.md (tool `scripts/setup/upstream-check.sh`).
+  [V] HakiOS moved its user space into `oosexgang/hakios-xnu-kernel` (renamed; `hakios-os` returns not found). Its main
+  (a48d2b2) has **no merge base** with our reference d82c64a, and lacks d82c64a/b4c5513 work (gpu_recover, ir3-shift-split,
+  ir3-ssbo-subdword): pins kept. [V] ios-flame, ios-topaz, hackios-umi, ios-redfin: no new commits. [V] scion 759b620:
+  eagl still surfaces every 8th frame (ported: userland/laurel/gpu/patches/0001); mkeagl/eagl_slots changes are comments.
+- [V] **Turnip 25.0.7 reports Vulkan 1.0 for the A610** (`tu_device.cc` apiVersion: 1.3 only with `has_hw_multiview` or
+  TU_DEBUG=noconform; A610 table: no HW multiview), and metal2vulkan refuses devices below 1.2: Metal could never have found
+  a device on the Mi A3. Fix: laurel Turnip 0102 (Darwin, parts without HW multiview: the noconform answers for API level
+  and multiview only; kill switch TU_DARWIN_API=0; `metal-build.sh check` checks it).
+- [V] Mesa 26.2.6 is out: keep 25.0.7 (OSMesa removed in 25.1; our patches fail 4-10 hunks; 26.x hides 13 extensions on
+  parts without multiview).
+- metal2vulkan f6a96b7d -> 219f013 (native-arithmetic round: emulations deleted; m2v/0003 dropped; flame/0017 API fix;
+  rollback sets kept, `fetch-sources.sh` picks by pin; flame patches `*-m2v-<c>` only when the pin contains <c>).
+  [I] fewer ALU ops per pixel; upstream measured +8-16 % encode CPU per draw (44d97aa, no switch): measure backboardd CPU.
+- Kernel 2154 (docs/laurel_sprout/gpu.md "SMMU stage 1"): pass-through bring-up first (topaz's proven path), then a live
+  switch of CB0 to the stage-1 tables with the CP idle (CP buffers at VA = PA, so CP_RB_BASE etc. stay valid), self-check
+  (read-back, fence at VA = PA, fence into a kernel page above 4 GiB at VA != PA, FSR 0), fallback to pass-through. With
+  it on, RedwoodGPU accepts every process, GEM from the pool first then scattered pages (256 MiB max), every surface gets
+  guard rows and no contiguous memory, no TLBIALL on map (HakiOS). Kill switch `gpu_smmu=0`. [V] 242 patches apply,
+  0 LSE/RCpc; [U] whether the trinket GPU SMMU (qsmmu-v500) accepts CB0 writes from EL1 and reaches DRAM above 4 GiB.
+- [V llvm-mca, scripts/laurel/cpu-tune-mca.sh] `-mtune=cortex-a73` makes hot blocks 1.9-2.2x slower on the A53 model and
+  <= 2.4 % faster on the A73 model: keep `-mcpu=cortex-a53` (+ `-mfix-cortex-a53-835769` [I: Kryo 260 Silver = A53 r0p4
+  derivative]). Rust: `-C target-cpu=cortex-a53 -C target-feature=+fix-cortex-a53-835769` (the llvm-args name does not
+  exist in Rust 1.98's LLVM [V error]); default for aarch64-apple-ios is apple-a7.
+- [V] clang with `-g` compiles and links in one step and makes `OUT.dSYM` itself (Darwin target, also on Linux): it ended up
+  inside the root staging dir; `gpu_dsym` now moves it to out/laurel/gpu/dsym.
+- [V] `scripts/laurel/armv80-check.py` (all post-v8.0 classes, self-test): 0 in every user-space binary; on the kernel it
+  counts 21 decodes in the K256 SHA table (data in __text), so the kernel keeps its own LSE check.
+- [V scripts/metal/m2v-ab.sh] QuartzCore metallib, vk12-floor: f6a96b7d and 219f013 both translate 117/141; SPIR-V
+  1 906 384 -> 788 556 bytes (-58.6 %). The 20H392 metallibs are in the OS image 087-86698-044.dmg (apfs-fuse, read-only),
+  not in the SystemOS cryptex 087-86593-047.dmg (that one has the dyld cache).
+- [V] metal2vulkan's cache defaults are a 256 MiB memo per process and 25 GiB on disk; flame/0018 + metal-env.sh cap them at
+  32 MiB / 1 GiB for the Mi A3 (negroni unchanged).
+
 ## Mi A3: endless vibration on the first SpringBoard boot = an iOS loop with no stop; 2700 repeat cap + key stop (2026-11-01 05:50, vibration agent, branch t3/laurel-vibration-endless)
 - Details: docs/laurel_sprout/haptics.md section "Repeat".
 - [V log 05:29] One `LAUREL VIBRATOR: start: 2 steps (first 400 ms on, 400 ms on in all), repeat 1` at 05:29:45 (2 s after three

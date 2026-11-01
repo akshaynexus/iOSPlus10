@@ -23,15 +23,23 @@ O=$G/obj
 R=$G/root
 rm -rf "$O" "$R"
 mkdir -p "$O" "$R$PREFIX/lib" "$R/usr/libexec"
+# topaz eagl.c + our patches (userland/laurel/gpu/patches: still surfaces summed every 8th frame, HakiOS 759b620)
+mkdir -p "$O/src/userland/gpu"
+cp "$U/eagl.c" "$O/src/userland/gpu/eagl.c"
+for p in "$REPO"/userland/laurel/gpu/patches/*.patch; do
+  [ -f "$p" ] || continue
+  patch -s --no-backup-if-mismatch -d "$O/src" -p1 < "$p" || gpu_die "patch $(basename "$p") does not apply to topaz eagl.c"
+done
+EAGL=$O/src/userland/gpu/eagl.c
 
 # 1. the EAGL dispatch table: one function per slot of -[EAGLContext getMacroContextPrivate]
-python3 -I "$SCION/userland/mkeagl.py" "$SCION/userland/src/eagl_slots.txt" "$M/gl.xml" "$M/exported-gl.txt" "$U/eagl.c" > "$O/eagl_gen.h"
+python3 -I "$SCION/userland/mkeagl.py" "$SCION/userland/src/eagl_slots.txt" "$M/gl.xml" "$M/exported-gl.txt" "$EAGL" > "$O/eagl_gen.h"
 echo "gpu-userland: eagl_gen.h: $(grep -c '^static' "$O/eagl_gen.h" || true) generated functions"
 
 # 2. libtopaz-gl.dylib: OpenGL ES behind EAGLContext (eagl.c) on Mesa's OSMesa (gl_osmesa.c)
 gpu_cc "$R$PREFIX/lib/libtopaz-gl.dylib" -dynamiclib -install_name $PREFIX/lib/libtopaz-gl.dylib -I"$O" -I"$U" \
   -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc "$M/libOSMesa.8.dylib" \
-  "$U/eagl.c" "$U/gl_osmesa.c" 2> "$O/libtopaz-gl.log" || { cat "$O/libtopaz-gl.log"; gpu_die "libtopaz-gl did not build"; }
+  "$EAGL" "$U/gl_osmesa.c" 2> "$O/libtopaz-gl.log" || { cat "$O/libtopaz-gl.log"; gpu_die "libtopaz-gl did not build"; }
 # 3. libtopaz-inject.dylib: inserted into backboardd; loads libtopaz-gl once the kernel publishes RedwoodGPU
 gpu_cc "$R$PREFIX/lib/libtopaz-inject.dylib" -dynamiclib -install_name $PREFIX/lib/libtopaz-inject.dylib \
   -framework CoreFoundation -framework IOKit -lobjc "$U/topaz_inject.c" 2> "$O/inject.log" ||
@@ -43,6 +51,7 @@ cp "$M/libOSMesa.8.dylib" "$R$PREFIX/lib/"
 
 # ad-hoc signatures (the kernel's AMFI stand-in accepts them; the code directory hashes must still match)
 for f in "$R$PREFIX/lib/libtopaz-gl.dylib" "$R$PREFIX/lib/libtopaz-inject.dylib" "$R/usr/libexec/backboardd.wrap"; do
+  gpu_dsym "$f"
   "$LDID" -S "$f"
   gpu_check_v80 "$f" || gpu_die "$(basename "$f") has ARMv8.1+ instructions"
 done

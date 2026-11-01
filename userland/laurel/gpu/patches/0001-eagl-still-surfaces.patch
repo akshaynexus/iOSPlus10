@@ -1,0 +1,35 @@
+laurel (Mi A3): topaz eagl.c, still surfaces summed every 8th frame after 120 equal looks (HakiOS/scion 759b620,
+the eagl half; staggered by surface ID). Applied by scripts/laurel/gpu-userland.sh to a copy of external/ios-topaz eagl.c.
+
+diff -ruN a/userland/gpu/eagl.c b/userland/gpu/eagl.c
+--- a/userland/gpu/eagl.c
++++ b/userland/gpu/eagl.c
+@@ -684,8 +684,18 @@
+ 	/*
+ 	 * Adding up 11 MB was 3-4 ms a frame (glBindTexture). A memory whose sum has stayed the
+ 	 * same for 30 looks in a row is added up every 2nd frame only, until it changes again (8 made app launches lag).
++	 * laurel (HakiOS/scion 759b620): one the same for STILL_LOOKS looks (about 2 s) is added up every STILL_EVERY
++	 * frames only, each surface in a frame of its own (by its ID), so the still ones (wallpaper, icons) do not all
++	 * fall into one frame; a change is seen at most STILL_EVERY frames (133 ms) late. Scion measured the sums at
++	 * more than half of the drawing thread; the A73/A53 cores of the Mi A3 are slower.
+ 	 */
+-	if (image->quiet >= 30 && image->looked != 0 && e->frames + 1 - image->looked < 2) {
++#define STILL_LOOKS     120
++#define STILL_EVERY     8
++	if (image->quiet >= STILL_LOOKS) {
++		if ((e->frames + IOSurfaceGetID(surface)) % STILL_EVERY != 0) {
++			return false;
++		}
++	} else if (image->quiet >= 30 && image->looked != 0 && e->frames + 1 - image->looked < 2) {
+ 		return false;
+ 	}
+ 	image->looked = e->frames + 1;
+@@ -695,7 +705,7 @@
+ 		sum ^= sum >> 29;
+ 	}
+ 	if (sum == image->sum) {
+-		image->quiet++;
++		image->quiet += image->quiet < STILL_LOOKS;     /* laurel: no wrap-around back to "every frame" */
+ 		return false;
+ 	}
+ 	image->sum = sum;

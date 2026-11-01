@@ -1,0 +1,18 @@
+ios-flame bridge patch 0100 (MIT, 745c434), rebased onto metal2vulkan f6a96b7d (applied unchanged).
+
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index 25c32549..b805ac82 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -63,8 +63,9 @@ use std::ptr::NonNull;
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+-/// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
+-pub(super) const BLOCK_BYTES: u64 = 64 << 20;
++/// The size of a pooled block, at most the device's `maxMemoryAllocationSize`. SweetMetal2: 8 MB, not 64: the A640's
++/// kernel backs every block with RAM at once, and each process paid 64 MB per memory class it touched.
++pub(super) const BLOCK_BYTES: u64 = 8 << 20;
+ 
+ /// The most empty pooled blocks a pool keeps for its next placements ([`Pool::release`]), at
+ /// most 128 MiB of empty memory a pool. In a pool the encodings place in, one of them is mostly
