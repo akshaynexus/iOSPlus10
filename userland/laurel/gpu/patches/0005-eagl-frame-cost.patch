@@ -142,7 +142,7 @@ laurel 0005: frame cost in the GL layer: image_of() by hash (it scanned up to 51
  	static unsigned lines;
  	char name[5];
 -	bool blank = image->contents.lit == 0;
-+	/* laurel 0005: 0 samples is "not looked at" (a 1-byte surface): the 56 "A008 ... 0 of 0 samples = BLANK" lines of boot 22:08 said nothing */
++	/* laurel 0005: 0 samples is "not looked at" (a 1-byte surface): 41 of the 61 "0 of 0 samples = BLANK" lines of boot 22:08 said nothing */
 +	bool blank = image->contents.lit == 0 && image->contents.samples != 0;
  
  	image->told = blank ? 1 : 2;

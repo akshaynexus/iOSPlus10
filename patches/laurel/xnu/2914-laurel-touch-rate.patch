@@ -45,7 +45,7 @@ index 332073d..b03e73b 100644
  	uint32_t mask = 0, seen = 0;
 -	int err = touch_read(0x38, 0, false, buf, sizeof(buf));
 +	/*
-+	 * laurel 2914: one finger is what a scroll is: its record and the next (15 bytes, 0.35 ms at 400 kHz) instead of 63 (1.4 ms). More fingers,
++	 * laurel 2914: one finger is what a scroll is: its record and the next (16 bytes, 0.36 ms at 400 kHz) instead of 63 (1.4 ms). More fingers,
 +	 * or the finger not in those two records: all of it.
 +	 */
 +	unsigned have = 16u;
@@ -113,7 +113,7 @@ index 332073d..b03e73b 100644
 +
 +	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &ms_ticks);
 +	if (fts && touch_read(0x38, 0x88, false, &rate_reg, 1) == 0) {
-+		printf("LAUREL TOUCH: finger down: latch every 2 ms, read on an edge, one finger 15 bytes of 400 kHz I2C; register 0x88 reads %u (stock driver never sets a rate)\n", rate_reg);
++		printf("LAUREL TOUCH: finger down: latch every 2 ms, read on an edge, one finger 16 bytes of 400 kHz I2C; register 0x88 reads %u (stock driver never sets a rate)\n", rate_reg);
 +	}
  	while (!st.dead) {
  		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */

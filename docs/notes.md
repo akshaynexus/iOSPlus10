@@ -4748,3 +4748,19 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Gotcha: the buffers are Normal NC: statistics copy a line to cached memory first (`lcam_light_raw`); byte-by-byte reads of a whole frame would hold the stream thread too long.
 - Gotcha: `collect` in `laurel_cam_stream.c` started each call with buffers 0, 1 in the VFE; two calls in one capture need the `wm_ring` state.
 - Built: kernel-linux.sh 293/293 patches, 0 LSE, no warning in the changed files, kernel.development.sweet.4k sha256 840f70f9799d4ae0...; NegroniCamera.driver sha256 b1f371f512523e94... (164368 bytes); cam-test: cam7 3610 checks, 0 failed; all older checks pass. Host only.
+
+## Mi A3: frame budget after boot 22:08; patches 2913, 2914, eagl 0005, Mesa 0002, plug-in (2026-11-01, branch t3/laurel-lag; built + host test, NOT BOOTED). Details: docs/laurel_sprout/gpu.md "Frame budget"
+- [V] `SWEET FPS` sums did not restart with a window that a 500 ms pause reset: 14.4 s of waits in a 10 s line. The 40 ms was not real; the idle line (15.4 ms: fence 1 ms + latch) is. Read SWEET FPS only in a window without a pause. New `LAUREL FRAME` has it apart.
+- [V] 300 ticks = 5.25 s (17.5 ms): `setTimeoutUS(16667)` from the end of the handler + timer slack; INTF1 counts 60 frames a second. sweetfb_lock existed from topaz, off, with a 12 ms floor for its 127 Hz panel: on a 60 Hz panel that floor skips a frame after a late tick. Now panel/2.
+- [V] `RBBM_PERFCTR_CP_0` counts all core clocks: over-the-window MHz is right, "while busy" never was. 
+- [V] glFlush in `profile` was outside "GL calls" (frame_end ends the frame before the call ends). Real split: GL 10.5 ms, CoreAnimation 2.15 ms.
+- [V] `image_of` scanned up to 512 images of about 200 bytes for each bind and draw: 20.7 us a bind. Now a hash; `gpu-surface-test.sh` cuts the 3 functions out of the patched eagl.c and tests them (ASan, 2 million steps).
+- [V] RB::Device+0x111 = highest `supportsFamily:` Apple1..7 (ctor 0x1e6919634). `hasYCbCrFormats` and `hasXR10Formats` = family > 2 (0x1e691bd78, 0x1e691bd9c). Tool: `IPSW=.../ipsw scripts/debug/render-re.sh RenderBox`, then `scripts/debug/dsc-annotate.py` names the selectors; `fusermount -u out/mnt-cryptex` after.
+- [V] `refused: render pipeline 'primitive_image' ... color0 fmt 542, depth fmt 260`: in the `native-metal: refused` lines, logged once per reason: easy to miss. They are one real cause of widgets without pictures.
+- [V host] `scripts/laurel/mesa-host-bench.sh`: Mesa on drm-shim, FD_GPU_ID=610: 80 draws 0.12-0.14 ms without TC; direct vs tiles about -10 %. On the phone 25-87 us a draw in glFlush: the factor is not explained; the next boot's `LAUREL GL FLUSH` + `RedwoodGPU: a submission` divide it. The first runs on a busy host gave 3x: run it on an idle host, 3 times.
+- Gotcha: `kernel-linux.sh` makes a new tree each run. To edit: reverse our patches, commit the rest as a baseline in the tree's git, apply ours, edit, `git diff` into the patch; an edit before the reverse makes it fail. A one-line change: edit the patch text.
+- Gotcha: Mesa host build on glibc >= 2.41: `once_flag` and `call_once` clash with Mesa's c11/threads.h; the script renames them in the host's copy only.
+- Gotcha: a plane request answering kIOReturnUnsupported would turn the whole feature off (ENOSYS = old kernel): wrapped surfaces answer BadArgument.
+- Gotcha: eagl.c already has a member `box`: a new one is `screen_box`. GL_VIEWPORT, GL_BLEND are defined late in the file: new code early needs its own `#ifndef`.
+- Build: see the last line of this entry in docs/plan.md and the commit; `xnutils-test.sh` PASS with the new clock row.
+- Next: boot, one scroll + one Astronomy switch, read gpu.md "Lines at the next boot". Then decide: extensions off the Gold cores during touch, render thread priority, the TC.

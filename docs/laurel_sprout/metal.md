@@ -528,3 +528,7 @@ Metal counts high and rising = ours. Counts flat, VM tag 1-11 (malloc) and a sta
 No device: `negroni: camera hooks: no Metal device in this process: the filter thumbnails go unfiltered, through the CPU`: read the gate's line.
 
 Rebuild: Metal stage + gate + camera plug-in = root (userdata) only: `scripts/laurel/metal-build.sh`, `scripts/laurel/gpu-userland.sh`, `userland/laurel/camera/build.sh`, `sudo scripts/laurel/root.sh`. No boot image.
+
+## 14. RenderBox and `_RB4` on the A610 (boot 22:08; plug-in; built, NOT BOOTED)
+
+chronod's `primitive_image` and `primitive_gradient` on fmt 542 + depth 260 are refused by m2v (`Unsupported(Format at Color(0))`): draws skipped, widgets without images and gradients. On a 610 `supportsFamily:` answers RenderBox NO from Apple3 on: `hasYCbCrFormats` and `hasXR10Formats` are off, opaque layers are BGRA. `NEGRONIMETAL_RB_FAMILY=0` turns it off. Evidence and addresses: gpu.md "Frame budget", Widgets.
