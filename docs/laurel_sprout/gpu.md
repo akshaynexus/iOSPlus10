@@ -842,13 +842,100 @@ LAUREL GPU CLOCK: on: last minute 300 MHz 41 s, 600 MHz 19 s, 37 raises, 0 hot r
 | `420f/v 422f/v 444f/v`, `xf20 x420 xf22 x422 xf44 x444`, `pf20 p420 pf22 p422 pf44 p444`, `xf4p`, `yuvs yuvf 2vuy 2vuf` | | BT.601/709/2020 by `IOSurfaceYCbCrMatrix`, range by OSType, chroma nearest | m2v ycbcr.rs. In the normal path CA samples the planes itself; this is for `-attachImage:` and refused forms |
 | any other | | by layout: one plane 4/8/16/2/1 bytes, or planes 1+2, 2+4, 4+1; one line `THIS OSTYPE IS NOT KNOWN, best effort` | |
 
-**GPU or CPU.** The kernel imports only one plane of 4-byte pixels with rows of 64 (`surfaceBuffer`). So: 32-bit word formats go as bytes through the existing zero-copy import, `xr_pass()` rebuilds the word in a shader and writes the texture CoreAnimation reads, once per frame in which the texture is bound (a Metal client's GPU writes move no seed). Self-check: import or framebuffer fails = one line, CPU from then on. All else (`_RB4` included): CPU, on seed change or a changed sum of all planes; `sys_dcache_flush` first, because another process's GPU wrote the memory. Widgets change rarely; the sum follows the still-surface rule (every 8th frame after 120 equal looks).
+**GPU or CPU.** (2913 + eagl 0005: also `_RB4` and A008, L008, LA08 by the GPU, section "Frame budget".) Before them the kernel imported only one plane of 4-byte pixels with rows of 64 (`surfaceBuffer`). So: 32-bit word formats go as bytes through the existing zero-copy import, `xr_pass()` rebuilds the word in a shader and writes the texture CoreAnimation reads, once per frame in which the texture is bound (a Metal client's GPU writes move no seed). Self-check: import or framebuffer fails = one line, CPU from then on. All else (`_RB4` included): CPU, on seed change or a changed sum of all planes; `sys_dcache_flush` first, because another process's GPU wrote the memory. Widgets change rarely; the sum follows the still-surface rule (every 8th frame after 120 equal looks).
 
 **What the kernel hides.** SweetSurface keeps `w30r`, `l10r`, `w30R`, `b3a8` as BGRA, for CPU clients (HackiOS): they read that back. So the OSType cannot say what a Metal client draws. flame/0020 writes the texture's pixel format into the surface value `LaurelMetalFormat`; `surface_drawn_as()` reads it. No heuristic: BGR10_XR's top bits are ones, a word reads as an opaque BGRA pixel.
 
 **Crash of 20:16:15 (backboardd sig 11).** Not a write to a read-only mapping: the signal address is 0x18, the `far` in the CRASH line is stale. [V dSYM] pc = `fd_bo_mark_for_dump(NULL)` <- `fd_bo_heap_alloc` <- `fd_bo_new_ring` <- `fd_submit_sp_new_ringbuffer` <- `build_prog_fb_rast` <- `fd6_draw_vbos` <- `tc_flush` <- `my_glFlush`. One line before it: `RedwoodGPU: a buffer of 4194304 bytes cannot be entered into the GPU's address space`. Chain [V source + log]: posters filled the 512 MiB pool (20:15:31: 14 MB free, 20:15:36: 0) -> `gemNew` falls to scattered pages -> a new L3 table is needed -> `table_alloc` -> `kbuf_alloc_low` takes 64 KiB from the same empty pool -> `mmu_map` false. Also the 17 lines of 8-9.7 MiB at 20:15:33-34 and Pride's `texture: OutOfMemory(Device)`.
 
 Fixes: kernel 2895: all page tables at once (8256 KiB at first use, 2048 L3 + 4 L2 + L1); the last 64 MiB of the pool only for backboardd. Mesa `mesa-tree-patches/0001`: no NULL block in the heap; on no memory cached buffers go back and the call waits (20 ms x 10, commands x 100); a command buffer that stays impossible ends the process with one line. Recovery as before: launchd restarts backboardd in the same second ([V] 20:16:15), the kernel takes its buffers back ([V] pool 12 -> 381 MB), 2 fast exits = software renderer (bbd_wrap).
+
+## Frame budget (boot 2026-11-01 22:08; patches 2913, 2914, eagl 0005, Mesa 0002, plug-in; built + host test, NOT BOOTED)
+
+Owner: "20 fps on average, high touch lag; Astronomy lags when switching, purple in parts; widgets intermittent". Log: `logs/laurel-boot-2208.txt`. **No line below proves a frame rate: a host build cannot.** `[V]` = read in the log or the code. `[I]` = inference.
+
+### The numbers that were wrong
+
+| Line | Said | Truth | Fix |
+|---|---|---|---|
+| `SWEET FPS ... 40446 us in present + latch` | 40 ms a frame | [V arithmetic] 356 x 40.4 ms = 14.4 s of one thread's waits in a 10 s window. A pause over 500 ms reset `frames`, not the sums. The honest window: idle, 100 frames, 15458 us (fence 988 us, latch about 14 ms) | 2913: the sums restart with the window |
+| `came 26063 us after the tick` | 26 ms | Same sum; ticks are 17.5 ms apart | 2913 |
+| `core 16300 MHz while busy` | | [V] CP_0 counts every core clock, busy or idle: 300 MHz / 1.8 % busy = 16300. No such number exists from this counter | 2913: `clock N MHz over the window`; the level comes from `LAUREL GPU CLOCK` |
+| `profile: 4612 us a frame in GL calls, 8046 outside` | CoreAnimation is the larger part | [V] glFlush was not counted: `frame_end` ends the frame before the call ends. Real: GL 10.5 ms, outside 2.15 ms | eagl 0005 |
+| `contents: ... 'A008' ... 0 of 0 samples = BLANK` | 41 of 61 BLANK lines (A008 26, 420f 12, LA08 3) | [V] 1-byte surfaces are not sampled: nothing was known | eagl 0005 |
+| `N frames in 10 s (F a second)` | "20 fps" | Mixes movement and pauses in one window | 2913: `moving: F frames/s for T ms of W` |
+
+### Budget of one frame in a scroll, boot 22:08
+
+21 of 28 redwood-gl windows had movement: 7003 frames, 32.9 a second, 19 % over 16.7 ms, 4 % over 33.3 ms [V].
+
+| Stage | Before | Evidence | Change | Line that proves it |
+|---|---|---|---|---|
+| Finger to HID event | Read each 12 ms (10 ms sleep + 2 ms sleep in the read); 8.4 ms late on average | [I from code]; 400 kHz [V], 63 bytes = 1.4 ms | 2914: latch each 2 ms, read on an edge, 16 bytes for one finger: at most 2.4 ms | `LAUREL TOUCH RATE`, `touch to next flip` |
+| HID to SpringBoard commit | SpringBoard 21.5 s a minute = 10 ms a frame at 35 a second | [V CPU TOP, I per frame]. Commit time: no line | None | [U] |
+| Wait for the tick | 17.5 ms period, 57 a second, against 60 panel frames: the phase runs through the panel 3 times a second | [V] 300 ticks in 5.25 s, 315 INTF1 frames | 2913: tick = panel frame + 0.3 ms | `LAUREL FRAME: on`, `N ticks of 16.7xx us` |
+| Render thread, CA | 2.15 ms | [V profile, corrected] | None | `redwood-gl: profile` |
+| glFlush | 5.9 ms (5.3 in the moving windows) | [V] 43.7 s of 7400 frames. [V dSYM 20:16:15] draw emission runs here (`fd6_draw_vbos <- tc_flush <- my_glFlush`) | Mesa 0002: no tiles (host: -10 % of Mesa); worker threads interactive | `LAUREL GL FLUSH`, `RedwoodGPU: a submission` |
+| glDrawElements | 1.53 ms, 68 draws | [V]. `image_of` went through up to 512 images per draw | eagl 0005: hash | `glDrawElements` in `profile` |
+| glTexImage2D | 1.31 ms; about 10 ms a frame in a poster change | [V] +1.75 s between 22:12:39 and 22:12:51 | eagl 0005: A008, L008, LA08 of 32 KiB or more are textures of their own memory | `glTexImage2D` in `profile` |
+| glBindTexture | 0.98 ms (20.7 us a bind) | [V]: scan + memory sums | eagl 0005: hash; 2913: a client's GPU write moves the seed, no sums for GPU conversions | `glBindTexture` in `profile` |
+| GPU | 2.05 ms a submission, 2.9 submissions a frame, 22 % busy at 300/600 | [V]: not the limit, but it is latency in front of the latch | Mesa 0002: A610 GMEM is 132 KiB [V], so 36 tiles for the screen [I from code] | `the GPU worked N us` |
+| Fence + latch | Latch: 100 us looks over up to one panel frame | [V code]. kernel_task 17.2 s a minute in use, 8.0 quiet | 2913: one sleep to the frame's start, priority 92 | `after SwapEnd: A us to the presenter, B fence, C latch`, kernel_task in `CPU TOP` |
+| Scanout | 16.7 ms top to bottom | panel | None | |
+
+Checked and not the limit [V]: buffers named (43 a submission, 21863 in 5 s) and cache upkeep (81 us a submission, 252 KB); the render thread's core (`frames ended on big cores 7357, little 43`); the GPU clock (`300 MHz 17 s, 600 MHz 42 s; busy 22 %`). Its priority is not known yet: `LAUREL GL THREAD` says it; nothing is raised before that line (a real-time thread can land on a Silver core under the Edge scheduler [I]).
+
+Touch to light before: about 8.4 + commit + 8.8 (tick) + 13.1 + fence + 8 (latch) + 8.3 = 60 to 75 ms without a missed frame [I].
+
+Host measure of Mesa alone: `scripts/laurel/mesa-host-bench.sh` (Mesa 25.0.7 on drm-shim, `FD_GPU_ID=610`, GMEM 132 KiB, no GPU, 8 programs, client arrays, 80 draws): 3 runs each, no threaded context: tiles 0.128-0.139 ms a frame, direct 0.117-0.123 ms. [V host] So direct rendering saves about 10 % of Mesa's CPU, not more. [I] The rule is for GPU time and DDR, which the host cannot show. On the phone a draw costs 25-87 us in glFlush against 1.6 us on the host: that factor is not explained yet ([I] A73 at 2 GHz, write-combined command buffers, cold caches, kernel calls). `LAUREL GL FLUSH` and `RedwoodGPU: a submission` split it at the next boot.
+
+Expected render thread after these changes: about 9-10 ms from 13.1 [I, sum of the rows above, not measured]. Frames of 200 draws or more (22:15:34: 229 draws, 23 ms) stay over 16.7 ms on this CPU [I].
+
+Not changed, and in the way of 60 frames: extension work on the same Gold cores (`CPU TOP`: WeatherWidget 44 s, CalendarWidgetEx 33 s, StocksWidget 21 s a minute at the worst); SpringBoard's own frame; the threaded context (kept: batches that overflow run in parallel; [V host] no clear gain or loss).
+
+### Widgets
+
+[V] `NMTL[100 chronod]: refused: render pipeline 'primitive_image' ... color0 fmt 542, depth fmt 260 ... Unsupported(Format at Color(0))`, also `primitive_gradient`; `FitnessWidget: draw skipped ... after a refused render pipeline`. **A widget that draws an image or a gradient loses those draws; a widget that draws text only is complete. That fits "intermittent" [I].**
+
+[V RenderBox 20H392] `RB::Device` ctor 0x1e6919634 keeps the highest `supportsFamily:` Apple1..7 at +0x111. Family > 2 is its `hasYCbCrFormats` and `hasXR10Formats` (0x1e691bd78, 0x1e691bd9c, names in its description). With them an opaque layer gets 542, `_RB4` (0x1e68c94a8). Plug-in (`NegroniMetal.mm`): on a 610, RenderBox's own calls get NO from Apple3 on. Layers stay plain BGRA, the path layers with alpha take already [V owner's photo, metal.md 12]. `NEGRONIMETAL_RB_FAMILY=0` in NMTL_DIR/env is the kill switch. Risk [I]: RenderBox on family 2 uses other shader variants; a new refusal line says so.
+
+Second cause, smaller [V]: 4 of the 24 `_RB4` surfaces were black at their first draw and full one frame later (surfaces 432, 916, 953, 1356: `fill 2, now drawn`): a flash of black. [I] The CPU conversion read the surface while the client's GPU could still write it; with no later frame the widget would stay as read. `_RB4` by the GPU runs in ring order after the client's work, and the seed brings the next pass.
+
+`_RB4` by the GPU, for what still arrives as `_RB4`: 2913 request 0x7c + `kRedwoodAnyLayout`, Mesa bits 32-39 of the image, eagl `rb4_setup`: green plane R8, blue-red plane RG8, a shader writes the texture CoreAnimation reads. A pass is a batch of its own: only when the seed moved (2913: a submission of a client that names the surface moves its seed; `gpuclientseed=0` turns that off), and once in 64 bound frames. Fallback: the CPU path, as before.
+
+Self-check: one read-back per element size: 64 texels by GPU and CPU must be equal, else `LAUREL GL PLANES: off: ...` and CPU copies.
+
+### Astronomy
+
+Switch lag, from the log [V]: `device ... in 197 ms`, `pipelines 6 compiled in 1052 ms, 0 from cache` (first use after a new root; `mediaserverd` at its second start: `1 from cache`, so the cache works), a `720 x 1560 A008` attached again every few frames, each a CPU copy (`surface 610`: textures 918, 1208, 1211, 1223, 1226, 1239 ... in 150 frames) and a new texture for each BGR10_XR surface, under pool pressure (`under 64 MiB free`, 81 of 512 MiB free). Fixed: the A008 copies; they also leave the pool. Not fixed: the first compile, one device per poster process.
+
+Purple: **cause [U]**. Checked: the debug colour of the variable blur is off by default [V eagl: `vblur_on == 2`]; `AegirPoster` has no refused pipeline [V]; the XR formula equals m2v's [V]. New: the `contents` line gives `mean R G B` of what the surface holds. Mean with R and B high and G low on the poster's surface = Metal drew it (m2v, Turnip). Normal mean, purple on the panel = composition (next step `gltrace_place` on that place).
+
+### The steady 10.0 frames a second
+
+[V] 100 ms apart, while ticks are 17.5 ms apart (6 ticks = 105 ms), and on average 8.6 ms after a tick: not tick-driven in the kernel, no kernel timer feeds it. 16-17 draws, 2 submissions, no Metal client. It started at 22:16:14; at 22:14:58-22:15:22 the same phone drew 0.5 a second. [I] A client's fixed-rate animation (Wi-Fi scan cycles run in the same time: a spinner in Settings). New: `a frame changes X,Y WxH of the screen` in `LAUREL GL FLUSH` names the place.
+
+### Lines at the next boot
+
+```
+LAUREL FRAME: on: the tick follows the panel: 16xxx us a frame, 1584 lines (kill switch sweetfb_lock=0); the presenter sleeps to the latch
+LAUREL FRAME: 600 ticks of 16xxx us, worst N; moving: F frames/s for T ms of W; gaps <20 ms A, <36 B, <52 C, longer D
+LAUREL FRAME: after SwapEnd, N flips: A us to the presenter, B us GPU fence, C us flush to latch, M past one panel frame; touch to next flip T us (K)
+RedwoodGPU: 512 submissions in 5079 ms: ... GPU busy 20.6 %, clock 495 MHz over the window
+RedwoodGPU: a submission: A us before the lock, B us with it; the window server: N requests, T us here in all
+LAUREL GL THREAD: CoreAnimation draws on a thread of priority P, policy X, QoS Q, real time or not; Mesa's own threads are user-interactive
+LAUREL GL PLANES: on: surfaces of 1 and 2 bytes a pixel and the planes of '_RB4' are textures of their own memory, 64 texels read back equal; other clients' GPU writes move the seed: yes
+LAUREL GL FLUSH: N frames: A batches in tiles (B tiles), C straight into memory, D with no draw; E us a frame in the batch code; a frame changes X,Y WxH of the screen
+LAUREL TOUCH: finger down: latch every 2 ms, read on an edge, one finger 16 bytes of 400 kHz I2C; register 0x88 reads N (stock driver never sets a rate)
+LAUREL TOUCH RATE: finger M ms: E edges (R a second), K reads of U us; a report reaches iOS at most 2 ms + the read after its edge
+NMTL[.. chronod]: RenderBox asks for GPU family Apple3: NO, from 3 on (...): opaque layers stay BGRA, no '_RB4'
+```
+
+Reading: `moving` near 60 and few `<36` gaps = smooth. `M past one panel frame` high = frames come after the latch. `R` tells the controller's real rate [U until then: the stock driver sets none; 0x88 is only read]. `LAUREL GL FLUSH` E + kernel `T` against `handing on`: the rest of glFlush is Mesa outside the batch code or waiting. No more `refused: render pipeline 'primitive_*' ... fmt 542`.
+
+### Kill switches
+
+`sweetfb_lock=0` (plain timer), `gpuclientseed=0`, `glenv=FD_MESA_DEBUG=gmem` (tiles), `NEGRONIMETAL_RB_FAMILY=0`. A planes failure turns itself off with one line. Touch: `sweettouchirq=0` as before.
 
 ## Recovery (no UI after the GPU root)
 

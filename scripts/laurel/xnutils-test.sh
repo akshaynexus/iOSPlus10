@@ -29,7 +29,7 @@ want() { grep -qF -- "$1" "$D/report.txt" || { echo "xnutils-test: FAIL: no '$1'
 if [ "$LOG" = "$S/test/sample.log" ]; then
   want 'Busy: 41.2 %'
   want 'Frame time (last logged): 54.1 ms'
-  want 'Measured core clock: 300 MHz while busy'
+  want 'Clock over the 5 s window: 297 MHz over the window (5 s ago)'
   want 'Pool free: 419 of 512 MB free in 7 ranges'
   want 'SMMU faults: 2, last: FSR'
   want 'FB owner refusals: 3'

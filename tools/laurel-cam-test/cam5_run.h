@@ -70,7 +70,8 @@ main(int argc, char **argv)
 	printf("cam5: pictures: %ld given: heap %+ld bytes = %+.1f bytes a picture, objects %+ld, live buffers %+ld (made %ld)\n", n, grown, (double)grown / (double)n,
 	    mock_live_objects - o0, mock_live_buffers - b0, mock_buffers_made);
 	/* (a kept pixel buffer more or less moves the sum by one buffer: 1504 x 1128 x 2) */
-	CHECK(grown - (mock_live_buffers - b0) * 1504 * 1128 * 2 < 64 * 1024, "the heap grows with the pictures: %ld bytes", grown);
+	/* (under AddressSanitizer heap() says 0 always: its own leak check is the test there; a buffer let go in this window then read as growth) */
+	CHECK((h0 == 0 && h1 == 0) || grown - (mock_live_buffers - b0) * 1504 * 1128 * 2 < 64 * 1024, "the heap grows with the pictures: %ld bytes", grown);
 	CHECK(mock_live_buffers <= HELD + 4 + 1, "live buffers %ld", mock_live_buffers);
 	CHECK(md_missing == 0, "%ld pictures without metadata", md_missing);
 #ifndef OLD_SOURCE

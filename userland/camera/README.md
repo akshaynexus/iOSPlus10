@@ -151,3 +151,7 @@ Also checked [V]: the H10ISP vtable versions in 20H392 are base 1, device 3, str
   level 64.
 - [I] Camera.app's behaviour with a vendor whose device create fails.
 - [I] Sensor mounting (picture turned or not), CPU time per preview frame (15 MB copy + 2016x1512 render, 8 pieces).
+
+## Speed (Mi A3, docs/laurel_sprout/camera.md section 13)
+
+`camera_fast.c`: the moving picture from whole rows of cells; `isp_render_cells` + `isp_scale_nv12` + `isp_finish_rows` stay for BGRA and a picture not larger than the cells. Line `speed:` once a second: each stage and each graph node.

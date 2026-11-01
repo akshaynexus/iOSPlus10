@@ -1,0 +1,178 @@
+laurel 2914: touch at the controller's rate. Finger down the TLMM latch is read every 2 ms and the panel on an edge; no edge for 20 ms (8 ms if none came yet): read anyway. One finger reads 16 bytes of I2C instead of 63, a long read sleeps 1 ms instead of 2. Before: a read every 12 ms, 8.4 ms late on average. New line LAUREL TOUCH RATE at the lift (at most one in 10 s): edges a second = the controller's real rate. Register 0x88 is only read. docs/laurel_sprout/gpu.md "Frame budget".
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 332073d..b03e73b 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -23,6 +23,7 @@ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
++uint64_t laurel_touch_event_at;         /* laurel 2914: the last finger event not yet followed by a flip (SweetFramebuffer: LAUREL FRAME line) */
+ 
+ /*
+  * laurel 2200 (Mi A3): two touch vendors (laurel_sprout-trinket-touchscreen.dtsi), detected at the probe:
+@@ -289,8 +290,12 @@ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+ 	touch_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
+ 	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+ 	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+-	if (nr > 8 && !st.probing) {
+-		touch_wait(2); /* sleep, do not spin, through most of the transfer */
++	/*
++	 * laurel 2914: 400 kHz: 22.5 us a byte. Only a long read sleeps, and 1 ms (touch_wait(2) slept at least 2 ms for a read of 1.4 ms, and for a read of
++	 * 15 bytes, 0.3 ms). The rest is looked at: at most 0.5 ms, while a finger is down.
++	 */
++	if (nr >= 56 && !st.probing) {
++		touch_wait(1);
+ 	}
+ 	int err = ETIMEDOUT;
+ 	for (unsigned i = 0; i < 5000; ++i) {
+@@ -471,6 +476,7 @@ touch_report(uint32_t mask, const int *x, const int *y)
+ 		if (mask & bit) {
+ 			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
+ 				sweet_hid_touch((int)id, 1, x[id], y[id]);
++				laurel_touch_event_at = mach_absolute_time();
+ 				st.s_down++;
+ 				st.s_lastx = x[id];
+ 				st.s_lasty = y[id];
+@@ -630,14 +636,30 @@ touch_latch_take(void)
+ static int
+ touch_focaltech(void)
+ {
+-	uint8_t buf[63];
++	uint8_t buf[63] = {0};
+ 	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+ 	uint32_t mask = 0, seen = 0;
+-	int err = touch_read(0x38, 0, false, buf, sizeof(buf));
++	/*
++	 * laurel 2914: one finger is what a scroll is: its record and the next (16 bytes, 0.36 ms at 400 kHz) instead of 63 (1.4 ms). More fingers,
++	 * or the finger not in those two records: all of it.
++	 */
++	unsigned have = 16u;
++	int err = touch_read(0x38, 0, false, buf, have);
+ 	if (err) {
+ 		return err;
+ 	}
+ 	unsigned n = buf[2] & 15u, active = 0;
++	if (n > 1u && n <= TOUCH_MAX) {
++		have = sizeof(buf);
++		err = touch_read(0x38, 0, false, buf, have);
++		if (err) {
++			return err;
++		}
++		n = buf[2] & 15u;
++	}
++again:
++	mask = seen = 0;
++	active = 0;
+ 	if (n || !st.s_frames) {
+ 		memcpy(st.s_raw, buf, sizeof(st.s_raw)); /* keep the last frame with contacts */
+ 	}
+@@ -671,7 +693,7 @@ touch_focaltech(void)
+ 		}
+ 		return EIO;
+ 	}
+-	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++	for (unsigned i = 0; i < TOUCH_MAX && 3u + 6u * (i + 1u) <= have; ++i) {
+ 		const uint8_t *p = buf + 3u + 6u * i;
+ 		unsigned id = p[2] >> 4, event = p[0] >> 6;
+ 		if (id >= TOUCH_MAX) {
+@@ -696,7 +718,20 @@ touch_focaltech(void)
+ 		mask |= 1u << id;
+ 		++active;
+ 	}
+-	(void)active;   /* topaz: byte 2 does not always match the records */
++	/* topaz: byte 2 does not always match the records. laurel 2914: so a short read that found less than it says reads all and looks again */
++	if (active < n && have < sizeof(buf)) {
++		have = sizeof(buf);
++		err = touch_read(0x38, 0, false, buf, have);
++		if (err) {
++			return err;
++		}
++		n = buf[2] & 15u;
++		if (n == 0 || n > TOUCH_MAX) {
++			touch_report(0, x, y);
++			return 0;
++		}
++		goto again;
++	}
+ 	touch_report(mask, x, y);
+ 	return 0;
+ }
+@@ -881,7 +916,17 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (fts && (fid1 != 0x54 || fid2 != 0x52)) {
+ 		printf("LAUREL TOUCH: FocalTech chip id %02x:%02x is not 54:52 (F9S FT3518); FT protocol used\n", fid1, fid2);
+ 	}
+-	unsigned errors = 0, ticks = 0, polls = 0;
++	unsigned errors = 0, polls = 0;
++	/* laurel 2914 */
++	uint64_t last_read = mach_absolute_time(), ms_ticks, down_at = 0, read_time = 0;
++	unsigned edges = 0, reads = 0;
++	uint8_t rate_reg = 0;
++	static uint64_t rate_told;
++
++	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &ms_ticks);
++	if (fts && touch_read(0x38, 0x88, false, &rate_reg, 1) == 0) {
++		printf("LAUREL TOUCH: finger down: latch every 2 ms, read on an edge, one finger 16 bytes of 400 kHz I2C; register 0x88 reads %u (stock driver never sets a rate)\n", rate_reg);
++	}
+ 	while (!st.dead) {
+ 		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */
+ 			panic("SWEET TOUCH stats: frames=%u errs=%u lasterr=%d maxn=%u hid down=%u up=%u last=%d,%d | "
+@@ -895,14 +940,45 @@ touch_thread(void *arg, wait_result_t result)
+ 		 * laurel 2200: read on a latched edge (or INT held low), always while a finger is down, else every
+ 		 * 100 ms. Contacts found by the 100 ms read with no edge ever latched: the latch is off.
+ 		 */
++		/*
++		 * laurel 2914: finger down the latch is looked at every 2 ms and the panel is read when it says that there is something new: a report
++		 * reaches iOS 1 ms (on average) + 0.35 ms after the edge, at the controller's own rate. Before: every 10 ms plus a read that slept 2 ms, so 12 ms apart
++		 * (83 a second) and 8.4 ms late on average, whatever came. No edge for a while, while down (the lift has one too): read anyway.
++		 */
+ 		bool edge = st.latch && touch_latch_take();
+-		bool low = st.irq_hint && !(touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u);
+-		bool timed = (++ticks % 10u) == 0;
++		bool low = st.irq_hint && !st.active && !(touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u);
++		uint64_t before_read = mach_absolute_time();
++		uint64_t idle = before_read - last_read;
++		bool timed = idle >= 100 * ms_ticks;
++		bool due = st.active && idle >= (edges != 0 ? 20u : 8u) * ms_ticks;
++
+ 		st.latched += edge ? 1u : 0u;
+-		if (!st.latch || st.active || edge || low || timed) {
++		edges += edge && st.active ? 1u : 0u;
++		if (!st.latch || edge || low || due || timed) {
+ 			uint32_t before = st.active;
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
+ 			    st.kind == TOUCH_GTX8 ? touch_gtx8() : touch_focaltech();
++			uint64_t read_done = mach_absolute_time();
++
++			last_read = read_done;
++			read_time += read_done - before_read;
++			reads++;
++			if (!before && st.active) {
++				down_at = read_done;
++				edges = 0;
++				reads = 1;
++				read_time = read_done - before_read;
++			} else if (before && !st.active && down_at != 0) {
++				uint64_t held_ms = (read_done - down_at) / ms_ticks;
++
++				/* (at most one line in 10 s) */
++				if (held_ms >= 300 && read_done - rate_told >= 10000 * ms_ticks) {
++					rate_told = read_done;
++					printf("LAUREL TOUCH RATE: finger %llu ms: %u edges (%llu a second), %u reads of %llu us; a report reaches iOS at most 2 ms + the read after its edge\n",
++					    held_ms, edges, edges * 1000ull / held_ms, reads, read_time * 1000 / ms_ticks / reads);
++				}
++				down_at = 0;
++			}
+ 			if (st.latch && !before && st.active && !edge && !low && !st.latched && ++st.missed == 3) {
+ 				st.latch = false;
+ 				printf("LAUREL TOUCH: IRQ latch off: GPIO 88 edge never latched in 3 touches; poll every 10 ms\n");
+@@ -920,7 +996,7 @@ touch_thread(void *arg, wait_result_t result)
+ 				errors = 0;
+ 			}
+ 		}
+-		touch_wait(10);
++		touch_wait(st.active && st.latch ? 2 : 10);
+ 	}
+ 	touch_report(0, st.x, st.y);
+ out:

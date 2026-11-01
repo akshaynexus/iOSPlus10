@@ -462,7 +462,7 @@ Status: built, host-tested. **Not run on the phone.** Labels: [V] log, disassemb
 
 ### 12.1 What the logs and the cache show
 
-The allocator is still **[U]**. No log has a memory line from inside the growth: the `memory:` step line came after these boots. What is known:
+**Found 2026-11-01 (boot 22:08, camera.md section 13) [V]: the allocator is `-[BWAudioSourceNode _createSampleBuffer...]`, the capture audio's silence. Not Metal.** The text below is the state before it. At that time: the allocator is still **[U]**. No log has a memory line from inside the growth: the `memory:` step line came after these boots. What is known:
 
 | Fact | Evidence |
 | --- | --- |
@@ -528,3 +528,7 @@ Metal counts high and rising = ours. Counts flat, VM tag 1-11 (malloc) and a sta
 No device: `negroni: camera hooks: no Metal device in this process: the filter thumbnails go unfiltered, through the CPU`: read the gate's line.
 
 Rebuild: Metal stage + gate + camera plug-in = root (userdata) only: `scripts/laurel/metal-build.sh`, `scripts/laurel/gpu-userland.sh`, `userland/laurel/camera/build.sh`, `sudo scripts/laurel/root.sh`. No boot image.
+
+## 14. RenderBox and `_RB4` on the A610 (boot 22:08; plug-in; built, NOT BOOTED)
+
+chronod's `primitive_image` and `primitive_gradient` on fmt 542 + depth 260 are refused by m2v (`Unsupported(Format at Color(0))`): draws skipped, widgets without images and gradients. On a 610 `supportsFamily:` answers RenderBox NO from Apple3 on: `hasYCbCrFormats` and `hasXR10Formats` are off, opaque layers are BGRA. `NEGRONIMETAL_RB_FAMILY=0` turns it off. Evidence and addresses: gpu.md "Frame budget", Widgets.

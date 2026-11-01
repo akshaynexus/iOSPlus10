@@ -30,8 +30,8 @@ rp_sec_gpu(struct rp *r)
 	} else {
 		rp_row(r, "Busy", sub != NULL ? "no number in the last 5 s line" : NULL, sub != NULL ? sub->age : -1);
 	}
-	rp_cut_row(r, "Measured core clock", sub, "core ");
-	rp_cut_row(r, "Over the 5 s window", sub, "while busy,");
+	/* laurel 2913: "clock N MHz over the window"; older kernels: "core N MHz while busy, M MHz over the window" (the first number was wrong) */
+	rp_cut_row(r, "Clock over the 5 s window", sub, sub != NULL && strstr(sub->text, "while busy,") != NULL ? "while busy," : "clock ");
 	if (rp_kv(r, "gpu.level_mhz") != NULL) {
 		rp_rowf(r, "Clock level now", -1, "%s MHz", rp_kv(r, "gpu.level_mhz"));
 	} else {

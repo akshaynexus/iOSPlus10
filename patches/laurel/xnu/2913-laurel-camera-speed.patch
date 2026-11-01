@@ -1,0 +1,239 @@
+laurel 2913: camera speed. /dev/negronicam read() copies through a new write-back, read-only mapping of the frame buffers after a clean + invalidate (self-check on the first frame, kill switch camera_cached=0) in place of the Normal NC mapping; a session starts at the shortest frame (long exposure of the last session comes back as gain); one line a second: frames, reads, us waiting, cleaning, copying. docs/laurel_sprout/camera.md section 13.
+
+diff -ruN a/bsd/dev/laurel_cam_ctl.c b/bsd/dev/laurel_cam_ctl.c
+--- a/bsd/dev/laurel_cam_ctl.c
++++ b/bsd/dev/laurel_cam_ctl.c
+@@ -23,7 +23,9 @@
+ extern void thread_deallocate(thread_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int topaz_root_mounted(void);
++#include <pexpert/pexpert.h>
+ extern uint64_t topaz_gpu_pool_alloc(uint64_t size, void **va);
++extern const void *topaz_gpu_pool_map_cached(uint64_t pa, uint64_t size);
+ extern bool topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
+ 
+ static int
+@@ -86,6 +88,20 @@
+ 		st.still_ok = false;
+ 		LCAM_SAY("photograph mode: off: no 4 x %u bytes in the GPU pool: photographs from the preview frames\n", st.cap);
+ 	}
++	{
++		/* laurel 2913: the reader's mapping (laurel_cam_dev.c). A failure leaves the uncached one: only slower. camera_cached=0: kill switch. */
++		uint32_t on = 1, got = 0;
++
++		(void)PE_parse_boot_argn("camera_cached", &on, sizeof(on));
++		for (unsigned i = 0; on != 0 && i < LST_NBUF; i++) {
++			st.ca[i] = topaz_gpu_pool_map_cached(st.pa[i], st.cap);
++			got += st.ca[i] != NULL;
++		}
++		if (got != LST_NBUF) {
++			memset(st.ca, 0, sizeof(st.ca));
++			LCAM_SAY("read: cached copy: off: %s: reads stay uncached\n", on != 0 ? "no write-back mapping of the buffers" : "boot-arg camera_cached=0");
++		}
++	}
+ 	lcam_vcm_load(lcam_depth_sunny);
+ 	lcam_mode_select(st.preview);
+ 	if (!topaz_smmu_identity(0x420, 0, "camera VFE") || !topaz_smmu_identity(0x421, 2, "camera VFE 2")) {
+diff -ruN a/bsd/dev/laurel_cam_dev.c b/bsd/dev/laurel_cam_dev.c
+--- a/bsd/dev/laurel_cam_dev.c
++++ b/bsd/dev/laurel_cam_dev.c
+@@ -66,11 +66,49 @@
+ 	return 0;
+ }
+ 
++/*
++ * laurel 2913: the reader's copy. Through the Normal NC mapping every load goes to DRAM with no line fill and no prefetcher, one 3.46 MB frame a time. A write-back, read-only mapping of the
++ * same buffer (nothing writes through it, so no line is ever dirty) is read after a clean + invalidate of the frame, which drops what speculation or the last read left of the old frame: the
++ * VFE has finished this buffer and leaves it alone until reading is -1. Self-check on the first frame: the two mappings show the same bytes, or this copy turns off with one line.
++ */
++static void
++ld_clean_invalidate(const uint8_t *p, size_t n)
++{
++	uint64_t ctr;
++	uintptr_t at, end = (uintptr_t)p + n, line;
++
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r" (ctr));
++	line = 4ul << ((ctr >> 16) & 0xf);
++	for (at = (uintptr_t)p & ~(line - 1); at < end; at += line) {
++		__asm__ volatile ("dc civac, %0" :: "r" (at));
++	}
++	__asm__ volatile ("dsb sy\n\tisb" ::: "memory");
++}
++
++static bool
++ld_cached_same(const uint8_t *nc, const uint8_t *wb, size_t n)
++{
++	static uint8_t a[256], b[256];          /* (cached copies: one reader at a time, the first frame only) */
++
++	for (unsigned i = 0; i < 16; i++) {
++		size_t at = (n - sizeof(a)) / 15 * i & ~(size_t)63;
++
++		memcpy(a, nc + at, sizeof(a));
++		memcpy(b, wb + at, sizeof(b));
++		if (memcmp(a, b, sizeof(a)) != 0) {
++			LCAM_SAY("read: cached copy: off: the frame differs at +%#lx between the mappings: reads stay uncached\n", (unsigned long)at);
++			return false;
++		}
++	}
++	LCAM_SAY("read: cached copy: on: the 2 mappings agree on the first frame\n");
++	return true;
++}
++
+ static int
+ ld_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+ 	struct lcam_nc_frame h;
+-	uint64_t t0 = lcam_dev_ms(), limit = NEXT_WAIT_MS;
++	uint64_t t0 = lcam_dev_ms(), limit = NEXT_WAIT_MS, abs0 = mach_absolute_time(), abs1 = 0, abs2 = 0, abs3 = 0;
+ 	int buf = -1, error;
+ 
+ 	lck_mtx_lock(&ld_lock);
+@@ -93,7 +131,7 @@
+ 			return EAGAIN;
+ 		}
+ 		lck_mtx_unlock(&ld_lock);
+-		lcam_sleep_ms(2);
++		lcam_sleep_ms(1);
+ 		lck_mtx_lock(&ld_lock);
+ 		d.want = true;                  /* (a session that was ending when this read began) */
+ 		d.last_read_ms = lcam_dev_ms();
+@@ -119,12 +157,36 @@
+ 	lck_mtx_unlock(&ld_lock);
+ 	error = uiomove((caddr_t)&h, (int)MIN((user_ssize_t)sizeof(h), uio_resid(uio)), uio);
+ 	if (body) {
+-		/* the kernel's Normal NC mapping of the GPU pool buffer: no cache maintenance */
++		const uint8_t *from = st.va[buf];
++		size_t n = (size_t)LST_BYTES;
++
++		abs1 = mach_absolute_time();
++		/* laurel 2913: write-back after a clean + invalidate; else the kernel's Normal NC mapping of the GPU pool buffer: no cache maintenance */
++		if (st.ca[buf] != NULL && !d.cached_off) {
++			ld_clean_invalidate(st.ca[buf], n);
++			if (!d.cached_checked) {
++				d.cached_checked = true;
++				d.cached_off = !ld_cached_same(st.va[buf], st.ca[buf], n);
++			}
++			from = d.cached_off ? from : st.ca[buf];
++		}
++		abs2 = mach_absolute_time();
+ 		if (error == 0 && uio_resid(uio) > 0) {
+-			error = uiomove((caddr_t)st.va[buf], (int)MIN((user_ssize_t)LST_BYTES, uio_resid(uio)), uio);
++			error = uiomove((caddr_t)(uintptr_t)from, (int)MIN((user_ssize_t)n, uio_resid(uio)), uio);
+ 		}
++		abs3 = mach_absolute_time();
++
++		uint64_t wait_ns, clean_ns, copy_ns;
++
++		absolutetime_to_nanoseconds(abs1 - abs0, &wait_ns);
++		absolutetime_to_nanoseconds(abs2 - abs1, &clean_ns);
++		absolutetime_to_nanoseconds(abs3 - abs2, &copy_ns);
+ 		lck_mtx_lock(&ld_lock);
+ 		d.ring.reading = -1;
++		d.speed_reads++;
++		d.speed_wait_ns += wait_ns;
++		d.speed_clean_ns += clean_ns;
++		d.speed_copy_ns += copy_ns;
+ 		lck_mtx_unlock(&ld_lock);
+ 	}
+ 	return error;
+diff -ruN a/bsd/dev/laurel_cam_sess.c b/bsd/dev/laurel_cam_sess.c
+--- a/bsd/dev/laurel_cam_sess.c
++++ b/bsd/dev/laurel_cam_sess.c
+@@ -65,6 +65,16 @@
+ 	x->lim.frame_max = x->lim.frame_max > 0xfff0u ? 0xfff0u : x->lim.frame_max;
+ 	x->lim.margin = LCAM_NC_MARGIN;
+ 	x->lines = x->line_ns ? (uint32_t)(exp_ns * 256u / x->gain / x->line_ns) : 0;
++	/*
++	 * laurel 2913: a session starts at the shortest frame: what the last one held in lines past it comes back as gain ([V boot 22:08] `frame 2: exposure 132.7 ms, gain 2.0x': the first
++	 * frames of each session at 7.5 fps, until AE had moved).
++	 */
++	if (x->lim.frame_min > x->lim.margin && x->lines > x->lim.frame_min - x->lim.margin) {
++		uint32_t room = x->lim.frame_min - x->lim.margin;
++
++		x->gain = (uint32_t)MIN((uint64_t)x->gain * x->lines / room, (uint64_t)LCAM_NC_GAIN_MAX);
++		x->lines = room;
++	}
+ 	x->frame = 0;
+ 	lcam_nc_clamp(&x->lim, &x->lines, &x->gain, &x->frame);
+ 	for (unsigned i = 0; i < EFFECT_FRAMES; i++) {
+@@ -136,7 +146,7 @@
+ 	struct lcam_clk_info ci = { 0, 0, 0, 0 };
+ 	const char *why = "", *end = "closed";
+ 	uint32_t errors = 0, bits = 0, slot, err, refill;
+-	uint64_t started, last, kicked = 0, reads = 0, exp_ns = st.last_exp_ns ? st.last_exp_ns : START_EXP_NS, shown = 0;
++	uint64_t started, last, kicked = 0, reads = 0, exp_ns = st.last_exp_ns ? st.last_exp_ns : START_EXP_NS, shown = 0, speed_at = 0, speed_frames = 0;
+ 	unsigned restarts = 0;
+ 	bool fault = false, tail_done = false;
+ 
+@@ -276,6 +286,23 @@
+ 				x.frame = af;
+ 			}
+ 		}
++		if (now - speed_at >= 1000u) {
++			uint64_t n, wait_ns, clean_ns, copy_ns;
++
++			lck_mtx_lock(&ld_lock);
++			n = d.speed_reads;
++			wait_ns = d.speed_wait_ns;
++			clean_ns = d.speed_clean_ns;
++			copy_ns = d.speed_copy_ns;
++			d.speed_reads = d.speed_wait_ns = d.speed_clean_ns = d.speed_copy_ns = 0;
++			lck_mtx_unlock(&ld_lock);
++			if (speed_at != 0 && n != 0) {
++				LCAM_SAY("ios session: speed: %llu frames, %llu read in %llu ms; us a read: waits %llu, clean %llu, copy %llu (%s)\n", frames - speed_frames, n, now - speed_at,
++				    wait_ns / n / 1000u, clean_ns / n / 1000u, copy_ns / n / 1000u, st.ca[0] != NULL && !d.cached_off ? "cached" : "uncached");
++			}
++			speed_at = now;
++			speed_frames = frames;
++		}
+ 		if (frames != shown) {
+ 			shown = frames;
+ 			lcam_light_session(frames, now - started, reads, x.lines, x.line_ns, x.gain, x.frame, ring.latest, errors, bits);
+diff -ruN a/bsd/dev/laurel_cam_st.h b/bsd/dev/laurel_cam_st.h
+--- a/bsd/dev/laurel_cam_st.h
++++ b/bsd/dev/laurel_cam_st.h
+@@ -33,6 +33,7 @@
+ 	uint64_t last_exp_ns;                   /* laurel 2773: exposure x gain/256 of the last session, 0: none */
+ 	uint64_t pa[LST_NBUF];
+ 	uint8_t *va[LST_NBUF];
++	const uint8_t *ca[LST_NBUF];            /* laurel 2913: the same buffers, write-back and read-only, for the reader's copy (NULL: not there) */
+ 	bool off, busy, request, tpg;           /* off = no more runs this boot */
+ 	bool light_done;                        /* laurel 2784: the self-check of the signal ran (once a boot) */
+ 	uint32_t gen, frames, fps10, mean, runs;
+@@ -65,6 +66,8 @@
+ 	} ask;
+ 	uint64_t reads;                         /* frames given to the reader */
+ 	uint32_t mode, focus, focus_min, focus_max, sensor_w, sensor_h;
++	bool cached_checked, cached_off;        /* laurel 2913: the reader's copy through the write-back mapping */
++	uint64_t speed_reads, speed_clean_ns, speed_copy_ns, speed_wait_ns;     /* of the frame reads since the last speed line */
+ };
+ extern struct lcam_dev_state lcam_dev;
+ #define ld_lock lcam_dev_lock
+diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -286,6 +286,24 @@
+ }
+ 
+ /*
++ * laurel 2913: a pool buffer once more, write-back and read-only, for a CPU reader of what a device wrote (the camera's frames, laurel_cam_dev.c): the reader cleans + invalidates before it
++ * reads. Nothing writes through it, so no line is dirty. Kept for good. NULL: no mapping.
++ */
++extern "C" const void *topaz_gpu_pool_map_cached(uint64_t pa, uint64_t size);
++const void *
++topaz_gpu_pool_map_cached(uint64_t pa, uint64_t size)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(pa, size, kIODirectionIn | (kIOCopybackCache << kIOMemoryBufferCacheShift), TASK_NULL);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapCopybackCache | kIOMapReadOnly) : NULL;
++
++	if (map == NULL) {
++		OSSafeReleaseNULL(md);
++		return NULL;
++	}
++	return (const void *)map->getVirtualAddress();
++}
++
++/*
+  * laurel 2156: zero a buffer that is out, through its chunk's kernel mapping (the one that covers all of it: lgp
+  * buffers never cross a chunk). false: [pa, pa + size) is not such a buffer, nothing is written.
+  */

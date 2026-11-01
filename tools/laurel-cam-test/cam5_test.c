@@ -40,6 +40,10 @@ static void *mock_dlsym(const char *n);
 int sysctlbyname(const char *n, void *o, size_t *os, void *i, size_t is) { return -1; }
 void negronicam_memory_line(uint64_t f) { (void)f; }
 void negronicam_memory_guard_session(void) { }
+#ifndef OLD_SOURCE
+void negronicam_graph_text(char *o, size_t n) { snprintf(o, n, "nodes:"); }
+void negronicam_busiest_text(char *o, size_t n) { snprintf(o, n, "no thread"); }
+#endif
 
 /* ---- the kernel ---- */
 #define PW 1920u

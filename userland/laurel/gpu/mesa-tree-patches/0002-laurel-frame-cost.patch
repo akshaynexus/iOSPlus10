@@ -1,0 +1,172 @@
+laurel: frame cost in Mesa. Worker threads at QoS user-interactive on Darwin. A picture of more than 2 tiles of a GMEM of 256 KiB or less is drawn straight into its memory (A610: 132 KiB; FD_MESA_DEBUG=gmem keeps tiles). laurel_fd_stats for the redwood-gl line. A plane of an IOSurface as a texture (bits 32-39 of the "image"). docs/laurel_sprout/gpu.md "Frame budget".
+
+--- a/src/util/u_queue.c
++++ b/src/util/u_queue.c
+@@ -31,6 +31,9 @@
+ #include "util/os_time.h"
+ #include "util/u_string.h"
+ #include "util/u_thread.h"
++#if defined(__APPLE__)
++#include <pthread/qos.h>
++#endif
+ #include "util/timespec.h"
+ #include "u_process.h"
+ 
+@@ -258,6 +261,14 @@
+    }
+ #endif
+ 
++#if defined(__APPLE__)
++   /*
++    * laurel: a new pthread on iOS is default QoS (priority 31): the Edge scheduler may keep it on a Silver core at 300 MHz while the window server's
++    * thread waits for it in glFlush (boot 22:08: 6 such threads in the backboardd sample, "handing on" up to 71 ms).
++    */
++   pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++#endif
++
+    if (strlen(queue->name) > 0) {
+       char name[16];
+       snprintf(name, sizeof(name), "%s%i", queue->name, thread_index);
+--- a/src/gallium/drivers/freedreno/freedreno_gmem.c
++++ b/src/gallium/drivers/freedreno/freedreno_gmem.c
+@@ -8,6 +8,7 @@
+ 
+ #include "pipe/p_state.h"
+ #include "util/format/u_format.h"
++#include "util/os_time.h"
+ #include "util/hash_table.h"
+ #include "util/macros.h"
+ #include "util/u_debug.h"
+@@ -693,12 +694,18 @@
+    }
+ }
+ 
++/*
++ * laurel: what a flush did, for the redwood-gl line (eagl.c finds it with dlsym). Only the drawing thread writes.
++ */
++__attribute__((visibility("default"))) uint64_t laurel_fd_stats[5];     /* tiled batches, tiles, direct batches, ns in here, non-draw batches */
++
+ void
+ fd_gmem_render_tiles(struct fd_batch *batch)
+ {
+    struct fd_context *ctx = batch->ctx;
+    struct pipe_framebuffer_state *pfb = &batch->framebuffer;
+    bool sysmem = false;
++   int64_t stats_began = os_time_get_nano();
+ 
+    ctx->submit_count++;
+ 
+@@ -722,7 +729,14 @@
+    }
+ 
+    if (ctx->emit_sysmem_prep && !batch->nondraw) {
+-      if (fd_autotune_use_bypass(&ctx->autotune, batch) && !FD_DBG(GMEM)) {
++      /*
++       * laurel: the A610 has 132 KiB of GMEM: 36 tiles for a 720 x 1560 picture, each a restore and a resolve when a layer blends. Without MSAA (nothing here
++       * uses it) a picture that needs more than 2 tiles is drawn straight into its memory, and the sample counters of autotune stay out of the batch.
++       * FD_MESA_DEBUG=gmem (boot-arg glenv=FD_MESA_DEBUG=gmem) is the kill switch. docs/laurel_sprout/gpu.md "Frame budget".
++       */
++      bool big = !FD_DBG(GMEM) && pfb->samples <= 1 && ctx->screen->gmemsize_bytes <= 256 * 1024 &&
++                 (uint64_t)pfb->width * pfb->height * 4 > (uint64_t)ctx->screen->gmemsize_bytes * 2;
++      if (big || (fd_autotune_use_bypass(&ctx->autotune, batch) && !FD_DBG(GMEM))) {
+          sysmem = true;
+       }
+ 
+@@ -774,6 +788,7 @@
+       render_sysmem(batch);
+       trace_end_render_pass(&batch->trace, batch->gmem);
+       ctx->stats.batch_sysmem++;
++      laurel_fd_stats[2]++;
+    } else {
+       struct fd_gmem_stateobj *gmem = lookup_gmem_state(batch, false, false);
+       batch->gmem_state = gmem;
+@@ -787,6 +802,8 @@
+       if (ctx->query_prepare)
+          ctx->query_prepare(batch, gmem->nbins_x * gmem->nbins_y);
+       render_tiles(batch, gmem);
++      laurel_fd_stats[0]++;
++      laurel_fd_stats[1] += gmem->nbins_x * gmem->nbins_y;
+       trace_end_render_pass(&batch->trace, batch->gmem);
+       batch->gmem_state = NULL;
+ 
+@@ -800,6 +817,8 @@
+    flush_ring(batch);
+ 
+    u_trace_flush(&batch->trace, NULL, U_TRACE_FRAME_UNKNOWN, false);
++   laurel_fd_stats[3] += os_time_get_nano() - stats_began;
++   laurel_fd_stats[4] += batch->nondraw;
+ }
+ 
+ /* Determine a worst-case estimate (ie. assuming we don't eliminate an
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -87,7 +87,7 @@
+ osmesa_create_screen(void);
+ 
+ extern struct pipe_resource *
+-osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
++osmesa_surface_resource(struct pipe_screen *screen, uint64_t surface);
+ 
+ 
+ 
+@@ -164,7 +164,7 @@
+                         struct st_egl_image *out)
+ {
+    out->texture = osmesa_surface_resource(fscreen->screen,
+-                                          (uint32_t)(uintptr_t)image);
++                                          (uint64_t)(uintptr_t)image);
+    if (!out->texture)
+       return false;
+    out->format = out->texture->format;
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -69,7 +69,7 @@
+ 
+ 
+ struct pipe_resource *
+-osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
++osmesa_surface_resource(struct pipe_screen *screen, uint64_t surface);
+ 
+ /*
+  * The memory of an IOSurface as a texture, to draw into and to draw with (Darwin on redwood):
+@@ -77,9 +77,39 @@
+  * the surface is not one plane of 32-bit pixels, blue first, in rows the GPU can address.
+  */
+ struct pipe_resource *
+-osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
++osmesa_surface_resource(struct pipe_screen *screen, uint64_t image)
+ {
+ #ifdef GALLIUM_FREEDRENO
++   /*
++    * laurel: bits 32-39 of the "image": plane + 1: that plane of the surface, 1 byte a pixel as red, 2 bytes as red + green, whatever the surface says it is
++    * (kernel 2913: request 0x7c, and the buffer is the surface's memory whatever its layout). The rows must suit the GPU (64): else NULL, eagl.c then uses the CPU.
++    */
++   uint32_t surface = (uint32_t)image;
++   unsigned plane = (unsigned)(image >> 32) & 0xff;
++   if (plane != 0) {
++      struct redwood_drm_plane p = { .surface = surface, .plane = plane - 1 };
++      struct redwood_drm_surface whole = { .surface = surface | REDWOOD_DRM_ANY_LAYOUT };
++      struct pipe_resource plane_templ = {
++         .target = PIPE_TEXTURE_2D,
++         .depth0 = 1,
++         .array_size = 1,
++         .bind = PIPE_BIND_SAMPLER_VIEW,
++      };
++      struct winsys_handle plane_handle = { .type = WINSYS_HANDLE_TYPE_FD };
++
++      if (gpu_fd < 0 || redwood_drm_plane(gpu_fd, &p) != 0 || redwood_drm_surface(gpu_fd, &whole) != 0)
++         return NULL;
++      if ((p.row_bytes & 63) != 0 || (p.bytes_per_element != 1 && p.bytes_per_element != 2))
++         return NULL;
++      plane_templ.format = p.bytes_per_element == 1 ? PIPE_FORMAT_R8_UNORM : PIPE_FORMAT_R8G8_UNORM;
++      plane_templ.width0 = p.width;
++      plane_templ.height0 = p.height;
++      plane_handle.handle = surface | REDWOOD_DRM_ANY_LAYOUT;
++      plane_handle.stride = p.row_bytes;
++      plane_handle.offset = p.offset;
++      plane_handle.size = whole.size;
++      return screen->resource_from_handle(screen, &plane_templ, &plane_handle, 0);
++   }
+    struct redwood_drm_surface s = { .surface = surface };
+    struct pipe_resource templ = {
+       .target = PIPE_TEXTURE_2D,
