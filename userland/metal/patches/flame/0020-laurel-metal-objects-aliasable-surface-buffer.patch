@@ -1,0 +1,248 @@
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.h b/phone/metal2/NativeBridgeMetalFrontend.h
+index ab65f0b..9b15873 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.h
++++ b/phone/metal2/NativeBridgeMetalFrontend.h
+@@ -21,6 +21,10 @@ size_t native_bridge_metal_status(char *out, size_t size);
+ // The pixel formats of the textures asked for (first eight distinct) and how many texture requests the runtime refused.
+ size_t native_bridge_metal_formats(char *out, size_t size);
+ size_t native_bridge_metal_telemetry(char *out, size_t size);
++// laurel (flame/0020): out: textures, of them over surfaces, buffers, buffer bytes, heaps, heap bytes, command buffers alive, of them in flight, pipelines.
++void native_bridge_metal_objects(int64_t out[9]);
++// laurel (flame/0020): true: no new pipelines in this process, one line, until false.
++void native_bridge_metal_stop_new_pipelines(bool stop);
+ // Structured cumulative artifact/driver-cache counters for offline qualification.
+ struct NmbShaderCacheStats;
+ bool native_bridge_metal_shader_cache_stats(struct NmbShaderCacheStats *out);
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index 8c4529d..8c8e2c8 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -42,6 +42,10 @@ static void (*gMissing)(const char *, const char *);
+ // What this device has been asked and refused, for the plugin's status line (native_bridge_metal_status): commits, render/compute pipelines made,
+ // refusals, and the last two refusals' texts. Counters only; nothing here changes a result.
+ static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted;
++// laurel (flame/0020): the Metal objects alive now, native_bridge_metal_objects: a client whose memory grows names them in its memory lines
++// (mediaserverd, 2026-11-01: 15 MiB -> 2.6 GB in 4 s, killed by the kernel, no count in the log). Bytes of a heap's buffers lie in the heap's.
++static std::atomic<int64_t> gLiveTextures,gLiveSurfaceTextures,gLiveBuffers,gLiveBufferBytes,gLiveHeaps,gLiveHeapBytes,gLiveCommandBuffers,gLivePipelines,gInFlightBuffers;
++static std::atomic<bool> gPipelinesStopped;
+ // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
+ // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
+ static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses;
+@@ -175,8 +179,7 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer);
+ - (id<MTLHeap>)heap {return _parentHeap;} \
+ - (BOOL)isAliasable {return NO;} \
+ - (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
+-- (void)waitUntilComplete {waitForResource(self);} \
+-- (void)makeAliasable {}   /* NegroniMetal: heap aliasing is not tracked; the memory simply stays owned */
++- (void)waitUntilComplete {waitForResource(self);}
+ @interface NBBuffer : NBObject
+ @property(nonatomic) NmbBuffer *handle;
+ @property(nonatomic) MTLResourceOptions options;
+@@ -199,8 +202,16 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer);
+ @property(nonatomic) NSUInteger heapOffset;
+ @end
+ @implementation NBBuffer
++- (void)setHandle:(NmbBuffer *)handle {
++ if(!_handle && handle){gLiveBuffers++;gLiveBufferBytes+=(int64_t)nmb_buffer_length(handle);}
++ _handle=handle;
++}
++// laurel (flame/0020): a heap whose resources are never made aliasable fills: FigMetalContext's prewarm makes a heap of 32 bytes (16 KiB here) and each
++// 1x1 texture aliasable at once. No-op before: 20 "heap texture: OutOfMemory(Heap)" lines per process in boots 18:40 and 19:34, and the prewarm gave up.
++- (void)makeAliasable {if(_parentHeap && !nmb_buffer_make_aliasable(_handle))noteRefused(@"heap buffer makeAliasable",lastError());}
+ - (void)dealloc {
+  if(_deallocator)noteNoCopyDealloc(self);   // NegroniMetal (flame/0006)
++ if(_handle){gLiveBuffers--;gLiveBufferBytes-=_parentHeap?0:(int64_t)nmb_buffer_length(_handle);}
+  const NSUInteger length=nmb_buffer_length(_handle);nmb_buffer_release(_handle);
+  if(_deallocator)_deallocator(_wrapped,length);
+  if(_surfaceOwner)CFRelease(_surfaceOwner);
+@@ -268,7 +279,10 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+  return true;
+ }
+ @implementation NBTexture
+-- (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
++- (void)setHandle:(NmbTexture *)handle {if(!_handle && handle)gLiveTextures++;_handle=handle;}
++- (void)setSurface:(IOSurfaceRef)surface {if(!_surface && surface)gLiveSurfaceTextures++;_surface=surface;}
++- (void)makeAliasable {if(_parentHeap && !nmb_texture_make_aliasable(_handle))noteRefused(@"heap texture makeAliasable",lastError());}
++- (void)dealloc {if(_handle)gLiveTextures--;if(_surface)gLiveSurfaceTextures--;nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
+ - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
+ - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)_descriptor.format;}
+ - (NSUInteger)width {return _descriptor.width;}
+@@ -555,7 +569,8 @@ static std::string quartzCoreCallers();
+ @property(nonatomic) NmbComputePipeline *handle;
+ @end
+ @implementation NBComputePipeline
+-- (void)dealloc {nmb_compute_pipeline_release(_handle);}
++- (void)setHandle:(NmbComputePipeline *)handle {if(!_handle && handle)gLivePipelines++;_handle=handle;}
++- (void)dealloc {if(_handle)gLivePipelines--;nmb_compute_pipeline_release(_handle);}
+ - (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
+ - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
+ // NegroniMetal: identity for argument tables (not used: no argument buffers here) and no separate shader memory to report
+@@ -566,7 +581,8 @@ static std::string quartzCoreCallers();
+ @property(nonatomic) NmbRenderPipeline *handle;
+ @end
+ @implementation NBRenderPipeline
+-- (void)dealloc {nmb_render_pipeline_release(_handle);}
++- (void)setHandle:(NmbRenderPipeline *)handle {if(!_handle && handle)gLivePipelines++;_handle=handle;}
++- (void)dealloc {if(_handle)gLivePipelines--;nmb_render_pipeline_release(_handle);}
+ // The threadgroup size a tile dispatch of this pipeline could use: the device's limit (no tile shaders are offered).
+ - (NSUInteger)maxTotalThreadsPerThreadgroup {
+  uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))return 0;
+@@ -1104,10 +1120,10 @@ static void scheduled(void *context);
+ @implementation NBCommandBuffer
+ - (instancetype)init {
+  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_presentedHandlers=[NSMutableArray array];_presents=[NSMutableArray array];_surfaces=[NSMutableSet set];_writtenSurfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+- if(self)createdUs=nowUs();
++ if(self){createdUs=nowUs();gLiveCommandBuffers++;}
+  return self;
+ }
+-- (void)dealloc {nmb_command_buffer_release(_handle);}
++- (void)dealloc {gLiveCommandBuffers--;nmb_command_buffer_release(_handle);}
+ - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
+ - (BOOL)retainedReferences {return YES;}
+ // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
+@@ -1300,6 +1316,7 @@ static void scheduled(void *context);
+  // release point. A retained completed command must not pin every old frame.
+  [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];
+  @synchronized(gInFlight){[gInFlight removeObject:self];}
++ gInFlightBuffers--;
+  for(NSArray *p in _presents) {
+   id dr = p[0];
+   double at = [p[1] doubleValue], after = [p[2] doubleValue];
+@@ -1340,6 +1357,7 @@ static void scheduled(void *context);
+  dispatch_group_enter(_handlers);
+  dispatch_group_enter(_schedulingHandlers);
+  @synchronized(gInFlight){[gInFlight addObject:self];}
++ gInFlightBuffers++;
+  if(!self.encodeFailure) {
+   flushSurfaces(_surfaces);
+   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
+@@ -1548,7 +1566,8 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+ // Metal heaps over the runtime's: an automatic heap places each resource, a placement heap takes an offset. Resources made from one keep it
+ // alive (their `heap`); a heap's resources share its storage mode, CPU cache mode and (here) hazard tracking mode.
+ @implementation NBHeap
+-- (void)dealloc {nmb_heap_release(_handle);}
++- (void)setHandle:(NmbHeap *)handle {if(!_handle && handle){gLiveHeaps++;gLiveHeapBytes+=(int64_t)nmb_heap_size(handle);}_handle=handle;}
++- (void)dealloc {if(_handle){gLiveHeaps--;gLiveHeapBytes-=(int64_t)nmb_heap_size(_handle);}nmb_heap_release(_handle);}
+ - (NSUInteger)size {return nmb_heap_size(_handle);}
+ - (NSUInteger)usedSize {return nmb_heap_used_size(_handle);}
+ - (NSUInteger)currentAllocatedSize {return nmb_heap_allocated_size(_handle);}
+@@ -1568,6 +1587,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+  NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
+  if(!handle){noteRefused(@"heap buffer",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
++ gLiveBufferBytes-=(int64_t)nmb_buffer_length(handle);   // laurel (flame/0020): its bytes are the heap's
+  buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {return [self bufferWithLength:length options:options offset:UINT64_MAX];}
+@@ -1883,6 +1903,14 @@ static NBTargetDeviceArch gTargetDeviceInfo={0,0,"NegroniMetal"};
+  NmbFence *handle=nmb_fence_new(gDevice);if(!handle)return nil;
+  NBFence *fence=[NBFence new];fence.handle=handle;return (id<MTLFence>)fence;
+ }
++// laurel (flame/0020): past the camera's memory limit (camera_mem.c) this process makes no new pipelines until the limit is lifted: one line, the caller gets its error.
++static bool pipelinesStopped(NSError **error) {
++ if(!gPipelinesStopped.load())return false;
++ static std::atomic<bool> told{false};
++ if(!told.exchange(true))NBLOG(@"native-metal: no new pipelines: this process is past its memory limit (one line)");
++ if(error)*error=nbError(@"no new pipelines: memory limit");
++ return true;
++}
+ - (id<MTLCommandQueue>)newCommandQueue {
+  NmbQueue *handle=nmb_queue_new(gDevice);if(!handle)return nil;
+  NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
+@@ -1976,6 +2004,15 @@ static NBTargetDeviceArch gTargetDeviceInfo={0,0,"NegroniMetal"};
+  return [[SweetTextureLayout alloc] initWithRow:row height:d.height texel:sweetTexelBytes(d.pixelFormat)];
+ }
+ - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {(void)count;return [(id<MTLDevice>)self newCommandQueue];}
++// laurel (flame/0020): -[CMMTLCommandQueue initWithCMMTLDevice:descriptor:] (20H392, CMImaging) asks this; the descriptor's count and logging change nothing here.
++- (id<MTLCommandQueue>)newCommandQueueWithDescriptor:(id)d {(void)d;return [(id<MTLDevice>)self newCommandQueue];}
++// laurel (flame/0020): -[FigMetalContext bindPixelBufferToMTLBuffer:] (20H392, CMImaging): the surface's pages as a buffer, the import textures over the surface share.
++- (id<MTLBuffer>)newBufferWithIOSurface:(IOSurfaceRef)surface {
++ if(!surface)return nil;
++ void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
++ if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1))return nil;
++ return (id<MTLBuffer>)surfaceBuffer(surface,base,(allocation+page-1)&~(page-1));
++}
+ - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+  NmbBuffer *handle=bufferWithRetries(@"buffer",length,&options,nullptr);
+  if(!handle)return nil;
+@@ -2297,6 +2334,7 @@ static std::string mslOptions(MTLCompileOptions *o) {
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
+                                                          reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
+  if(reflection)*reflection=nil;
++ if(pipelinesStopped(error))return nil;
+  if(![(id)function isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign function");return nil;}
+  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
+  const uint64_t pipelineBegan=nowUs();
+@@ -2307,6 +2345,7 @@ static std::string mslOptions(MTLCompileOptions *o) {
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
+                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
+  if(reflection)*reflection=nil;
++ if(pipelinesStopped(error))return nil;
+  NmbComputePipelineDescriptor p={};if(!computeDescriptor(d,&p,error))return nil;
+  std::vector<NmbBinaryArchive *> archives;
+  if(!pipelineArchives(d.binaryArchives,archives,error))return nil;
+@@ -2323,6 +2362,7 @@ static std::string mslOptions(MTLCompileOptions *o) {
+ - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
+                                                         reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {
+  if(reflection)*reflection=nil;
++ if(pipelinesStopped(error))return nil;
+  auto *p=new NmbRenderPipelineDescriptor();
+  if(!renderDescriptor(d,p,error)){delete p;return nil;}
+  std::vector<NmbBinaryArchive *> archives;
+@@ -2517,6 +2557,13 @@ static size_t native_bridge_metal_formats_locked(char *out,size_t size) {
+  for(unsigned i=0;i<gFormatCount && n>0 && (size_t)n<size;i++)n+=snprintf(out+n,size-(size_t)n,"%u ",gFormats[i]);
+  return n>0?(size_t)n:0;
+ }
++// laurel (flame/0020): the objects alive now, for memory lines. out: textures, of them over surfaces, buffers, buffer bytes, heaps, heap bytes, command buffers
++// alive, of them in flight, pipelines.
++extern "C" __attribute__((visibility("default"))) void native_bridge_metal_objects(int64_t out[9]) {
++ out[0]=gLiveTextures;out[1]=gLiveSurfaceTextures;out[2]=gLiveBuffers;out[3]=gLiveBufferBytes;out[4]=gLiveHeaps;out[5]=gLiveHeapBytes;
++ out[6]=gLiveCommandBuffers;out[7]=gInFlightBuffers;out[8]=gLivePipelines;
++}
++extern "C" __attribute__((visibility("default"))) void native_bridge_metal_stop_new_pipelines(bool stop) {gPipelinesStopped=stop;}
+ // The benchmark's rows (native_bridge_metal_benchmark), kept for the telemetry table.
+ static std::mutex gBenchLock;
+ static char gBench[4][96];
+diff --git a/phone/metal2/bridge/NativeMetalObjects.h b/phone/metal2/bridge/NativeMetalObjects.h
+index c4e6f3c..334c6d6 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.h
++++ b/phone/metal2/bridge/NativeMetalObjects.h
+@@ -97,6 +97,9 @@ NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, c
+ /* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. */
+ uint64_t nmb_texture_set_purgeable_state(const NmbTexture *, uint64_t state);
+ uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
++/* laurel (flame/0020): makeAliasable on a heap's resource; false: refused, nmb_last_error says why. */
++bool nmb_texture_make_aliasable(const NmbTexture *);
++bool nmb_buffer_make_aliasable(const NmbBuffer *);
+ void nmb_texture_release(NmbTexture *);
+ void nmb_texture_describe(const NmbTexture *, struct NmbTextureDescriptor *out);
+ bool nmb_texture_replace(NmbTexture *, const uint64_t region[6], uint64_t level, uint64_t slice, const void *bytes, uint64_t bytes_per_row,
+diff --git a/phone/metal2/bridge/NativeMetalObjects.rs b/phone/metal2/bridge/NativeMetalObjects.rs
+index 9cd09ba..334d759 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.rs
++++ b/phone/metal2/bridge/NativeMetalObjects.rs
+@@ -835,6 +835,24 @@ pub extern "C" fn nmb_texture_set_purgeable_state(texture: *const NmbTexture, st
+     })
+ }
+ 
++/// laurel (flame/0020): `makeAliasable` on a heap's texture: an automatic heap gives its range to the next resource (metal2vulkan's own rule).
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_texture_make_aliasable(texture: *const NmbTexture) -> bool {
++    guard(false, || {
++        get(texture)?.0.make_aliasable().map_err(e("make aliasable"))?;
++        Ok(true)
++    })
++}
++
++/// laurel (flame/0020): `makeAliasable` on a heap's buffer, as on a texture.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_buffer_make_aliasable(buffer: *const NmbBuffer) -> bool {
++    guard(false, || {
++        get(buffer)?.0.make_aliasable().map_err(e("make aliasable"))?;
++        Ok(true)
++    })
++}
++
+ /// `setPurgeableState:` on a buffer, as on a texture.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_buffer_set_purgeable_state(buffer: *const NmbBuffer, state: u64) -> u64 {

@@ -78,6 +78,7 @@
 void negronicam_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void negronicam_console(const char *line, size_t n);
 void negronicam_memory_line(uint64_t frame);
+void negronicam_memory_guard_session(void);
 
 /*
  * The camera's lines also go to /dev/console, so the kernel's USB log has them (as NegroniMetal's NMTL lines):
@@ -1981,6 +1982,7 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	s->running = true;
 	s->frames = 0;
 	say("stream: frames begin (format %d)", s->format_index);
+	negronicam_memory_guard_session();      /* (camera_mem.c) */
 	if (pthread_create(&s->worker, NULL, worker, o) != 0) {
 		s->running = false;
 		return ERR_UNSUPPORTED;

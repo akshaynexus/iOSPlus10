@@ -463,7 +463,7 @@ Status: code, built, host-tested. **Not run on the phone: every statement about 
 | Sign in the log | Cause | Fix |
 | --- | --- | --- |
 | `rear stream: ... at 234.0 fps` where the table said 93.5; 370 frames in 10 s at frame 4862 | The library's `vt_pixel_clk` is not the clock. INCK / 0x0305 x 0x0306-7 / 0x0303 / 0x0301 x 8 over line x frame gives whole rates for all 7 modes: 15, 30, 60, 90, 120, 30, 240 fps [V host test, both libraries]. Mode 6 is the 240 fps mode. So line = 5333 ns, not 13714 ns: AE's "66 ms" was 26 ms and the session ran at 77 fps, not 30 | `lcam_mode_vt_hz` (`laurel_cam_mode.h`), checked by `cam4_test` |
-| `low swap: killing largest compressed process with pid 28 (mediaserverd) and size 2689 MB` 18:43:56, pid 321 2485 MB 18:46:25; Camera drops, mediaserverd restarts | **Not in the plug-in's frame path, and not per frame: section "The memory of mediaserverd" below.** [I] CMCapture or Metal inside mediaserverd; the allocation is [U] | `-mediaserverd` in the gate's list (`metal_gate.c`) [I that this ends it]; line `memory at frame N: footprint, malloc, by VM tag` |
+| `low swap: killing largest compressed process with pid 28 (mediaserverd) and size 2689 MB` 18:43:56, pid 321 2485 MB 18:46:25; Camera drops, mediaserverd restarts | **Not in the plug-in's frame path, and not per frame: section "The memory of mediaserverd" below.** [I] CMCapture or Metal inside mediaserverd; the allocation is [U] | Later: Metal stays, memory guard (metal.md section 12); line `memory at frame N: footprint, malloc, by VM tag, Metal counts` |
 | `Data/Stack execution not permitted ... mediaserverd[pid 403]`, pc = far = 0x1e9440158, 18:46:30 | [V] lr 0x101971560 = bundle base 0x101964000 + 0xd560: just after the `blr x8` of the PixelBufferHandler call in `deliver`. The block's invoke word was a data pointer. Why is [U]; it came 4 s after a low-swap kill | `handler_alive`: the block's class word is checked; a dead handler gives `off:` for this output, not a crash |
 | `16 read over`, `70 read over` of 369 | A frame that ended while the reader copied was written over | 4 buffers, no frame lost to a copy (host test) |
 | `mean 64`, `green 0 above black` at 4814 lines and gain 16x in every session, `digital 4.00x` | **Not explained [U].** The stock exposure writer does the same writes (`fill_exposure_array` disassembled: group hold, 0x0340, 0x0202, 0x0204, then digital gain): the registers are right. Rail GPIOs and tiles equal the DT [V]. The real exposure was 2.57x shorter, far less than the gap. Candidates: scene or lens covered (the log has no picture), VANA rail input [I] | Lines now say levels above black: mean, 1 % over, top. AE does not start from a dark self-check any more. Next boot tells: `top` near 0 at full exposure = no light on the sensor (rail or cover); `top` high = the mean is only a dark room |
@@ -521,7 +521,7 @@ Plug-in: `af_frame` (HakiOS, contrast on the green block means, already there) g
 - Black 64 as before (the chromatix was not read for it [I]). Lens shading and colour matrices from the phone's own `libchromatix_laurus_imx586_{sunny,qtech}_{common,default_preview}.so`, file `camera-imx586-{sunny,qtech}.isp` in the bundle, made at the root step, never in git. Sunny: 3 shading sets (corners x3.3 to x4.3), 6 matrices with the colour temperature limits of the file. The order of matrices and shading sets by colour temperature is [I]. No file: a fixed middle matrix of that tuning, no shading. The grid spans the whole sensor: `lsc_u/v` keep it right on a frame that shows a part.
 - White balance: grey world as before (no reference points parsed).
 - Photograph: 5x5 Malvar-He-Cutler demosaic on lens-shaded raw (`camera_still.c`), chroma [1 2 1] each way (twice over 8x gain), luma sharpened with coring that grows with the gain.
-- Preview: cells of the window (960x720) -> 8-bit bilinear -> luma sharpen, chroma only over 8x. CPU only: Metal stays out of mediaserverd, so the GPU is not used for this.
+- Preview: cells of the window (960x720) -> 8-bit bilinear -> luma sharpen, chroma only over 8x. CPU only (the camera's own ISP; the filter strip uses Metal in mediaserverd: metal.md section 12).
 
 ### Build and host test [V]
 
@@ -553,7 +553,7 @@ LAUREL CAMERA: ios hooks: a photograph of 4032x3024 encoded in N ms
 LAUREL CAMERA: ios session: mode 3 after 2 frames, VFE errors 0 (0): to mode 0
 ```
 
-No `low swap: ... mediaserverd`, and no `NMTL[n mediaserverd]` line.
+No `low swap: ... mediaserverd`. (`NMTL[n mediaserverd]` lines are expected since metal.md section 12.)
 Bad signs: `focus: off: ...`; `preview: mode 0: off: ...` (the window failed); `photograph mode: off: ...`; `off: the graph's handler` (the old crash, stopped); `frames of 1280x720` (both 1920 modes failed); a crash at graph build with no Metal device (undo: below).
 
 ### Test steps (owner approval for each partition write)
@@ -563,7 +563,7 @@ Bad signs: `focus: off: ...`; `preview: mode 0: off: ...` (the window failed); `
 3. Open Camera in a lit room, lens free. Compare the lines. Read `top` first.
 4. Tap on near and far objects: `focus: sweep` lines, picture sharp. Shutter: a photo; open it in Photos.
 5. Leave the preview on for 2 minutes: footprint flat, no `low swap`.
-6. Undo for parts: Metal back in mediaserverd: write `* -backboardd` in `/var/db/negronimetal/clients`, keep the first line. All: `camera=0`, or `CAMERA=0` root.
+6. Undo for parts: Metal out of mediaserverd: write `* -backboardd -mediaserverd` in `/var/db/negronimetal/clients` as your own list (no gate mark in the first line). All: `camera=0`, or `CAMERA=0` root.
 
 ## 11. Crash loop without Metal, photo path, black frames (plug-in only; boot 20:02, 2026-11-01)
 
@@ -587,6 +587,8 @@ Status: code, built, mock-tested. **Not run on the phone: every statement about 
 - [U] HakiOS also takes the Metal device out of mediaserverd (`inject_media.c`) and has no such hook. Why it did not crash there is not known.
 
 ### Decision: Metal stays out of mediaserverd; the node goes without it
+
+**Replaced 2026-11-01 by the owner: mediaserverd has Metal.** metal.md section 12: clients `* -backboardd`, filters on the GPU, hooks 10 + 11 only with no device or past the memory guard's limit. The text below is the old reasoning; its evidence stays valid.
 
 Metal facts [V]: boot 19:34, Metal listed: 236 `NMTL[n mediaserverd]: surface import refused: no-copy buffer` (metal.md row 4: no surface import in this process), footprint 16 MiB at 19:42:01 -> `low swap ... 2607 MB` at 19:42:09, 1.7 s after the shutter; the photograph had just passed the noise reduction, no `encoded` line. Boot 20:02, Metal out: 0 `low swap` lines (but sessions lasted at most 40 frames, so this is no proof of a flat footprint: no `memory at frame` line was reached, that line comes at frame 60). [I] the thumbnail filter is the user of those imports: it takes every preview frame.
 

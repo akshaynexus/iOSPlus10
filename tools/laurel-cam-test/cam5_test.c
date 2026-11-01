@@ -39,6 +39,7 @@ static void *mock_dlsym(const char *n);
 
 int sysctlbyname(const char *n, void *o, size_t *os, void *i, size_t is) { return -1; }
 void negronicam_memory_line(uint64_t f) { (void)f; }
+void negronicam_memory_guard_session(void) { }
 
 /* ---- the kernel ---- */
 #define PW 1920u
