@@ -237,6 +237,7 @@ LAUREL NET: on: default route en0 via 192.168.1.1, v6 en0 via fe80::1, dns 2 ser
 `default route ue0`: the USB link has the route (`share-internet.sh` is on, and Wi-Fi has no router). `default route none`, `dns 0 servers`: no service has an address yet.
 
 A root that has the old job, on the running phone, no rebuild: `scripts/net/ssh-phone.sh /usr/local/bin/usbnetcfg down`, until the next boot.
+The lasting fix with the data kept: `scripts/laurel/root-update.sh` (`laurel_sprout/root-update.md` section 5). It does not run `down`: after `down` SSH may stop until a reboot (2026-11-01 23:10).
 
 ### macOS Local Network privacy
 

@@ -9,6 +9,7 @@
 # aggregated job and its limit, then root-xnutils.sh when XNUtils is built. Exit 0 = PASS. It does not build a root: that is `sudo scripts/laurel/root.sh`.
 # Then the feature step on that copy, with the real stages (FEATURES=0 skips): root-manifest.py preflight + root-features.sh, the same table
 # root.sh prints; a missing feature = exit 1. Folders the features only look for are empty copies: a real root has their files.
+# The update payload of root-update.sh on the same copy (root-delta.py): $W/update, listed at the end (no owners: this run is not root).
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 APPLE=${APPLE:-$HOME/op10-apple}
@@ -45,6 +46,7 @@ chmod -R u+w "$R"
 stock_apps=$(ls "$R/Applications" | wc -l)
 
 run() { python3 -I -c 'import os, runpy, sys; os.chown = lambda *a, **k: None; sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name="__main__")' "$@"; }
+python3 -I "$REPO/scripts/laurel/root-delta.py" snapshot "$R" "$W/update.new"
 run "$TOPAZ/sweet-root-tweaks.py" "$R"
 CA_HEARTBEAT=60 run "$REPO/scripts/ios16/root-tweaks-extra.py" "$R"
 run "$REPO/scripts/laurel/root-tweaks-perf.py" "$R"
@@ -127,5 +129,16 @@ if [ "${FEATURES:-1}" != 0 ]; then
   # the USB link must not take the default route or DNS from Wi-Fi; SSH works with the repo key (docs/usb-network.md)
   python3 -I "$REPO/scripts/net/usbnet-check.py" "$R" "$REPO/out/ssh/phone_ed25519.pub"
   echo "root-dry-run: feature step PASS: first line of the manifest: $(head -1 "$R/usr/share/laurel/root-manifest")"
+  python3 -I "$REPO/scripts/laurel/root-delta.py" make "$R" "$W/update.new"
+  python3 -I "$REPO/scripts/laurel/root-delta.py" seal "$W/update.new" "$W/update"
+  ROOT_UPDATE_DIR=$W/update "$REPO/scripts/laurel/root-update.sh" --list > "$W/update.list"
+  python3 -I - "$W/update.list" <<'EOF'
+import sys
+t = open(sys.argv[1]).read()
+need = ['/System/Library/xpc/launchd.plist', '/usr/local/bin/dropbearmulti', '/usr/local/libexec/powermenu-helper', '/private/var/root/.ssh/authorized_keys', '/Applications/XNUtils.app/XNUtils']
+bad = [n for n in need if n not in t]
+print('root-dry-run: update payload', 'FAIL: not in the list: ' + ' '.join(bad) if bad else 'PASS: ' + t.splitlines()[-1])
+sys.exit(1 if bad else 0)
+EOF
 fi
 echo "root-dry-run: PASS"

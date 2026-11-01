@@ -17,6 +17,7 @@
 #        STATUSBAR=0 skips both, NOTCH=0 only the dylib), root-flashlight.sh (the flashlight's one owner: camera plug-in, else its own plug-in; TORCH=0 = no button) and root-brightness.py
 #        (auto-brightness off; BRIGHTNESS=0 skips), root-xnutils.sh (XNUtils.app; XNUTILS=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
 # Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
+#         $APPLE/laurel-ios16-root.update: what our steps add or change on top of the stock root, for scripts/laurel/root-update.sh (root-delta.py; docs/laurel_sprout/root-update.md).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
 #   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg
 set -euo pipefail
@@ -30,6 +31,8 @@ APPLE=${APPLE:-$H/op10-apple}
 D=$APPLE/20H392
 IMG=$APPLE/laurel-ios16-root.img
 SIDECAR=${IMG%.img}.manifest
+UPD=${IMG%.img}.update
+DELTA=$REPO/scripts/laurel/root-delta.py
 TOPAZ=$REPO/external/ios-topaz/tools
 M=$REPO/scripts/laurel/root-manifest.py
 for t in apfs-fuse mkfs.hfsplus fsck.hfsplus rsync python3; do
@@ -46,6 +49,7 @@ trap 'umount "$mnt" 2>/dev/null || true; rmdir "$mnt" 2>/dev/null || true; rm -f
 python3 -I "$M" preflight --inputs "$INPUTS" || exit 1
 # from here the old image is not the current one: the sidecar says so until the end
 python3 -I "$M" begin "$SIDECAR"
+python3 -I "$DELTA" clean "$UPD" "$UPD.new"
 modprobe hfsplus
 
 echo "$(ts) laurel-root: 1/4 mkiosroot -> $IMG (${SIZE:-16G})"
@@ -60,6 +64,8 @@ fi
 
 echo "$(ts) laurel-root: 2/4 root tweaks (topaz sweet-root-tweaks.py)"
 mount -t hfsplus -o loop,force,rw "$IMG" "$mnt"
+# the stock root as mkiosroot made it: everything after this line is "ours" for an update in place
+python3 -I "$DELTA" snapshot "$mnt" "$UPD.new"
 python3 -I "$TOPAZ/sweet-root-tweaks.py" "$mnt"
 # negroni's tweaks on top (docs/laurel_sprout/negroni-ports.md "Userland / root image"): launchd drop list
 # (vmd: ~29k CommCenter retries per boot without a modem, the main idle CPU load; the ios-redfin Pixel 5 port
@@ -76,6 +82,11 @@ python3 -I "$REPO/scripts/laurel/root-system-features.py" "$mnt"
 # every feature, each with its row in the one table (scripts/laurel/root-features.sh; switches listed there)
 missing=0
 bash "$REPO/scripts/laurel/root-features.sh" "$mnt" --inputs "$INPUTS" --sidecar "$SIDECAR" || missing=1
+if [ "$missing" = 0 ] && ! python3 -I "$DELTA" make "$mnt" "$UPD.new"; then
+  python3 -I "$M" fail "$SIDECAR" "the update payload"
+  echo "$(ts) laurel-root: FAILED: root-delta.py make" >&2
+  exit 1
+fi
 sync
 umount "$mnt"
 if [ "$missing" != 0 ]; then
@@ -100,6 +111,7 @@ OP=$REPO/out/bin/op10tool
 "$OP" img2simg "$IMG" "$IMG.simg.partial" && mv "$IMG.simg.partial" "${IMG%.img}.simg"
 chown "$U": "$IMG" "${IMG%.img}.simg"
 python3 -I "$M" seal "$SIDECAR" "${IMG%.img}.simg"
+python3 -I "$DELTA" seal "$UPD.new" "$UPD"
 ls -l "$IMG" "${IMG%.img}.simg"
 echo "$(ts) laurel-root: done"
 }
