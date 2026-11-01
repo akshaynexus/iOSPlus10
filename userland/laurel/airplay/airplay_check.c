@@ -5,12 +5,13 @@
  * Sender side of iOS 16.7 20H392 [V strings, AirPlaySender and APTransport in the dyld cache]: mediaserverd (Mach service com.apple.airplay.sender.xpc)
  * browses _airplay._tcp and _raop._tcp. Here that is en0 only: no awdl0. What each stage needs, in the order of the line:
  *   IPv4 on en0, mDNSResponder browse, a receiver heard, the sender's Mach service;
- *   fp-setup (APAuthenticationClientFairPlay): com.apple.fairplayd.versioned; receivers that ask for it fail without it;
+ *   the session: sessionProtocolOverride=legacy (scripts/laurel/root-airplay-legacy.py) uses RAOP with the NTP clock and RSA or no key: no PTP, no FairPlay;
+ *   fp-setup (APAuthenticationClientFairPlay): com.apple.fairplayd.versioned; receivers that ask only for it fail without it;
  *   buffered audio (APSNetworkClockPTP): IOTimeSyncDomain in the kernel;
- *   mirroring: the encoder of AppleVideoEncoder.bundle, IOService AppleAVE2Driver.
+ *   mirroring: AppleVideoEncoder.bundle needs IOService AppleAVE2Driver; Apple's software encoder (H264VideoEncoder_CreateInstance, rtvc.sw) is in the cache.
  *
  * One line on the console (USB log) and in syslog, one more when it changes (at most 3 tries):
- *   LAUREL AIRPLAY: on: en0 192.168.1.5, default route en0, _airplay._tcp 2, _raop._tcp 3 heard; sender up; fp-setup off: ...; buffered audio off: ...; mirroring off: ...
+ *   LAUREL AIRPLAY: on: en0 192.168.1.5, default route en0, _airplay._tcp 2, _raop._tcp 3 heard; sender up; session legacy; fp-setup off: ...; buffered audio off: ...; hardware encoder no
  *   LAUREL AIRPLAY: off: <reason>
  * Kill switch: boot-arg airplay=0. A failure here cannot touch Wi-Fi: it only reads.
  */
@@ -222,7 +223,7 @@ main(void)
 {
 	char ip[64] = "";
 	time_t start = time(NULL);
-	bool sender, fp, ptp, ave, route;
+	bool sender, fp, ptp, ave, route, legacy;
 
 	if (switched_off()) {
 		say("off: boot-arg airplay=0");
@@ -239,6 +240,7 @@ main(void)
 	ptp = io_service("IOTimeSyncDomain");
 	ave = io_service("AppleAVE2Driver") || io_service("AppleAVEDriver");
 	route = default_route_is(ip);
+	legacy = access("/private/var/Managed Preferences/mobile/com.apple.airplay.plist", R_OK) == 0;
 	for (int t = 0; t < TRIES; t++) {
 		struct seen airplay = { 0 }, raop = { 0 };
 		int err;
@@ -254,8 +256,8 @@ main(void)
 		} else if (airplay.count + raop.count == 0) {
 			say("off: no receiver heard on en0 (%s, default route %s) in %d s: _airplay._tcp 0, _raop._tcp 0", ip, route ? "en0" : "not en0", BROWSE_S);
 		} else {
-			say("on: en0 %s, default route %s, _airplay._tcp %u, _raop._tcp %u heard; sender up; fp-setup %s; buffered audio %s; mirroring %s", ip, route ? "en0" : "not en0", airplay.count, raop.count,
-			    fp ? "on" : "off: no fairplayd", ptp ? "on" : "off: no IOTimeSyncDomain", ave ? "on" : "off: no AppleAVE2Driver (H.264 encoder)");
+			say("on: en0 %s, default route %s, _airplay._tcp %u, _raop._tcp %u heard; sender up; session %s; fp-setup %s; buffered audio %s; hardware encoder %s", ip, route ? "en0" : "not en0", airplay.count, raop.count,
+			    legacy ? "legacy" : "by receiver", fp ? "on" : "off: no fairplayd", ptp ? "on" : "off: no IOTimeSyncDomain", ave ? "yes" : "no");
 			return 0;
 		}
 	}

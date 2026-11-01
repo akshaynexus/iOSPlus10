@@ -1,6 +1,10 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+AirDrop over AWDL + AirPlay legacy round (2026-11-01, branch t3/laurel-airdrop-awdl, base origin/laurel-int-1, patch 2932, NOT RUN ON THE PHONE): owner "AirDrop was ported to Android, use its implementation; fix AirPlay properly". docs/laurel_sprout/airdrop-awdl.md.
+Done: IBSS vdev on AWDL's BSSID in the kernel (WMI mgmt Tx, HTT data, firmware peers; en0 first), `com.laurel.awdl` socket + `awdl0`, daemon `laurel-awdld` on owly-awdl (MIT), trigger from Everyone or AirDrop's BLE advertisement, state file against a repeat firmware assert; AirPlay `sessionProtocolOverride=legacy` (no PTP, no FairPlay for third-party receivers).
+[V] Google's transport is AWDL (NetSPI log). [V text] firmware rules from the qcacld injection work on WCN3990. [I] the cell gives ACK + BSSID filter as in Owly. [U] does VDEV_START work on an IBSS vdev; do foreign action frames pass; does the whole chain reach an iPhone. The old "no awdl0" decision is reversed.
+Results [V]: see that section in docs/notes.md. Next: first boot with this root, test steps in section 8 of the doc; Wi-Fi may be lost until reboot in that first test if the firmware asserts.
 AirPlay and AirDrop round (2026-11-01, branch t3/laurel-airplay-airdrop, patches 2930 + 2931, NOT RUN ON THE PHONE): owner "AirPlay and AirDrop both aren't working: enable or fix them". docs/laurel_sprout/airplay-airdrop.md.
 Done: `LAUREL AWDL` self-check (only looks at scanned frames; sends nothing; awdl=0); `laurel-airplay` job and `LAUREL AIRPLAY` line (airplay=0, AIRPLAY=0); AirDrop preferences for en0 (AIRDROP_LAN=0); wifip2pd stays out.
 [V] qcacld monitor device has no Tx, OWL needs injection; negroni 0347 has no data path and never ran. [I] no awdl0 is the right state now. [V] mirroring has no AppleAVE2Driver. [I] Apple TV/HomePod may fail at /fp-setup or PTP. [U] AirPlay audio on en0: no blocker found, no run log.

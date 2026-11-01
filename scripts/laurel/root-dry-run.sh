@@ -96,12 +96,29 @@ jobs = load('/System/Library/xpc/launchd.plist')['LaunchDaemons']
 job = jobs['/System/Library/LaunchDaemons/com.laurel.airplay.plist']
 prefs = load('/private/var/Managed Preferences/mobile/com.apple.Sharing.plist')
 ok = (job['KeepAlive'] is False and os.access(r + '/usr/libexec/laurel-airplay', os.X_OK) and prefs == {'BrowseAllInterfaces': True, 'RegisterAllInterfaces': True}
+      and load('/private/var/Managed Preferences/mobile/com.apple.airplay.plist') == {'sessionProtocolOverride': 'legacy'}
       and not any('wifip2pd' in k for k in jobs))
-print('root-dry-run: airplay: job once at boot, no KeepAlive; AirDrop LAN preferences; wifip2pd stays out:', 'OK' if ok else 'FAIL')
+print('root-dry-run: airplay: job once at boot, no KeepAlive; AirDrop LAN preferences; AirPlay legacy session; wifip2pd stays out:', 'OK' if ok else 'FAIL')
 sys.exit(0 if ok else 1)
 EOF
 else
   echo "root-dry-run: airplay: note: not built (scripts/laurel/airplay-build.sh)"
+fi
+# AWDL (root-awdl.sh), when it is built.
+if [ -x "$REPO/out/laurel/awdl/root/usr/libexec/laurel-awdld" ]; then
+  python3 -I "$REPO/scripts/laurel/root-awdl-job.py" --self-test
+  bash "$REPO/scripts/laurel/root-awdl.sh" "$R"
+  python3 -I - "$R" <<'EOF' || { echo "root-dry-run: FAIL: awdl"; exit 1; }
+import os, plistlib, sys
+r = sys.argv[1]
+jobs = plistlib.load(open(r + '/System/Library/xpc/launchd.plist', 'rb'))['LaunchDaemons']
+job = jobs['/System/Library/LaunchDaemons/com.laurel.awdl.plist']
+ok = job['KeepAlive'] is False and job['UserName'] == 'root' and os.access(r + '/usr/libexec/laurel-awdld', os.X_OK)
+print('root-dry-run: awdl: job, no KeepAlive, root, daemon installed:', 'OK' if ok else 'FAIL')
+sys.exit(0 if ok else 1)
+EOF
+else
+  echo "root-dry-run: awdl: note: not built (scripts/laurel/awdl-build.sh)"
 fi
 # XNUtils (root-xnutils.sh), when it is built. As the user: no owners, no setuid bit (the script says so).
 if [ -x "$REPO/out/laurel/xnutils/root/Applications/XNUtils.app/XNUtils" ]; then
