@@ -82,7 +82,7 @@ make_stages() {
   local G=$R/out/laurel/gpu/root B=$R/out/metal/stage/System/Library/Extensions/NegroniMetal.bundle C=$R/out/laurel/camera
   mkdir -p "$G/topaz/lib" "$G/usr/libexec" "$G/usr/share/firmware/laurel" "$B" "$R/out/metal/stage/usr/local/bin" "$R/out/laurel/hevc" "$R/out/laurel/audio/RedwoodAudio.driver" \
     "$R/out/laurel/bt" "$C/ios/NegroniCamera.driver" "$C/lib" "$R/out/laurel/flashlight/LaurelFlashlight.driver" "$R/out/laurel/notch/root/usr/local/lib" \
-    "$R/out/laurel/notch/root/usr/local/libexec" "$R/out/laurel/cell/root/usr/local/lib" "$R/out/ssh/ios"
+    "$R/out/laurel/notch/root/usr/local/libexec" "$R/out/laurel/cell/root/usr/local/lib" "$R/out/laurel/cell/root/usr/local/libexec" "$R/out/ssh/ios"
   for f in libOSMesa.8.dylib libtopaz-gl.dylib libtopaz-inject.dylib; do echo x > "$G/topaz/lib/$f"; done
   macho "$G/usr/libexec/backboardd.wrap" 2 /usr/libexec/real/backboardd; echo x > "$G/usr/libexec/laurel-metal-gate"
   echo x > "$G/usr/share/firmware/laurel/a610_zap.mdt"; echo x > "$G/usr/share/firmware/laurel/a610_zap.b00"
@@ -96,6 +96,7 @@ make_stages() {
   macho "$R/out/laurel/notch/root/usr/local/lib/liblaurel-notch.dylib" 6
   macho "$R/out/laurel/notch/root/usr/local/libexec/laurel-springboard" 2 /System/Library/CoreServices/SpringBoard.app/SpringBoard
   macho "$R/out/laurel/cell/root/usr/local/lib/liblaurel-cellbar.dylib" 6
+  macho "$R/out/laurel/cell/root/usr/local/libexec/laurel-celld" 2
   echo x > "$R/out/ssh/ios/dropbearmulti"
   local X=$R/out/laurel/xnutils/root
   mkdir -p "$X/Applications/XNUtils.app" "$X/usr/local/libexec" "$X/usr/local/bin"

@@ -2,7 +2,7 @@ laurel 2930: cellular: the radio goes online although DMS reports mode 5. Boot 2
 
 diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
 --- a/bsd/dev/laurel_cell.c	2026-11-01 23:19:26.768343129 +0530
-+++ b/bsd/dev/laurel_cell.c	2026-11-01 23:20:45.282779780 +0530
++++ b/bsd/dev/laurel_cell.c	2026-11-01 23:35:23.426157477 +0530
 @@ -68,6 +68,8 @@
  #define SVC_UIM             0x0B
  
@@ -95,7 +95,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  }
  
  /* is the state final enough for the first "on" line? */
-@@ -884,11 +910,52 @@
+@@ -884,11 +910,54 @@
  
  /* ---------------------------------------------------------------- DMS */
  
@@ -135,7 +135,9 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
 +		return;
 +	}
 +	for (unsigned i = 0; i < v[10] && 11u + i < l && n + 1 < sizeof(caps); i++) {
-+		n += snprintf(caps + n, sizeof(caps) - n, "%s%s", n != 0 ? "," : "", rat_name(v[11 + i]));
++		/* DMS's own enum: as NAS except 5G NR = 10 (libqmi QmiDmsRadioInterface) */
++		uint8_t r = v[11 + i];
++		n += snprintf(caps + n, sizeof(caps) - n, "%s%s", n != 0 ? "," : "", r == 10 ? "NR5G" : rat_name(r));
 +	}
 +}
 +
@@ -148,7 +150,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  
  	switch (msg) {
  	case DMS_GET_REVISION:
-@@ -900,32 +967,51 @@
+@@ -900,32 +969,51 @@
  			revision[l] = 0;
  			LOG("modem revision %s\n", revision);
  		}
@@ -214,7 +216,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  		qc_simple(C_DMS, DMS_GET_OPMODE);
  		break;
  	default:
-@@ -933,6 +1019,46 @@
+@@ -933,6 +1021,46 @@
  	}
  }
  
@@ -261,7 +263,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  /* ---------------------------------------------------------------- NAS */
  
  static void
-@@ -1040,6 +1166,9 @@
+@@ -1040,6 +1168,9 @@
  				return;
  			}
  		}
@@ -271,7 +273,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  		r->bound = true;
  		r->bind_ok = e == 0 || e == QMI_ERR_NO_EFFECT || i == C_NAS1;   /* primary without a binding = the modem's default subscription */
  		r->next = 0;
-@@ -1141,6 +1270,12 @@
+@@ -1141,6 +1272,12 @@
  			}
  		} else if (i == C_NAS1 || i == C_NAS2) {
  			nas_rx(i, msg, d, len, true);
@@ -284,7 +286,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  		}
  		report(now_ms());
  		return true;
-@@ -1192,6 +1327,15 @@
+@@ -1192,6 +1329,15 @@
  			qc_simple(C_UIM, UIM_GET_CARD_STATUS);
  		} else if (i == C_DMS && !rev_done) {
  			rev_done = true;
@@ -300,7 +302,7 @@ diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
  		} else if (i == C_WDS) {
  			wds_done = true;
  		} else if (i == C_NAS1 || i == C_NAS2) {
-@@ -1247,18 +1391,21 @@
+@@ -1247,18 +1393,21 @@
  	}
  	/* DMS: revision, operating mode, online when a SIM is in a provisioned session */
  	if (qc[C_DMS].up && qc[C_DMS].want == 0) {

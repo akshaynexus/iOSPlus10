@@ -28,6 +28,14 @@ for p in "$REPO"/patches/laurel/xnu/2780-laurel-ipa-v42.patch "$REPO"/patches/la
   [ -s "$D/cell-later.diff" ] && (cd "$D" && patch -s -p0 laurel_cell.c < cell-later.diff) ||
     { [ ! -s "$D/cell-later.diff" ] || { echo "test-cell: $(basename "$p") does not apply to laurel_cell.c" >&2; exit 1; }; }
 done
+# laurel 2932: the data client's new files
+for f in laurel_cell_data.c laurel_cell_data2.h laurel_cell_data.h laurel_pdp_text.h; do
+  awk -v f="$f" 'index($0, "+++ b/bsd/dev/" f) == 1 {p=1; next}
+       p && /^diff / {exit}
+       p && /^@@/ {next}
+       p && /^\+/ {print substr($0, 2)}' "$REPO/patches/laurel/xnu/2932-laurel-cell-data.patch" > "$D/$f"
+  [ -s "$D/$f" ] || { echo "test-cell: no $f in 2932" >&2; exit 1; }
+done
 for h in sys/param.h sys/systm.h sys/errno.h sys/sysctl.h kern/clock.h kern/locks.h pexpert/pexpert.h; do
   echo '#include "kstub.h"' > "$D/inc/$h"
 done
