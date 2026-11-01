@@ -230,6 +230,7 @@ boot-args against UniXNU's rule (`[A-Za-z0-9_.-]+` with optional `=[A-Za-z0-9_.,
 boot-args of the shim path are kept: `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0
 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1
 sweetfb_hz=30 sweetfb_stayon=1`.
+2026-11-01: `launchd_disable_all_timeouts=1` added (5 s extension check-in limit, metal.md section 11.2; `LAUNCHD_TIMEOUTS=1` builds without it).
 
 Boot image (v2, stock values: pagesize 4096, base 0, kernel 0x8000, ramdisk 0x1000000, tags 0x100, dtb 0x1f00000,
 os 11.0.0 / 2022-08, stock DTB): kernel.gz 1.36 MB, ramdisk = 48 MiB FAT, image 52,862,976 bytes [V]. The Mu-only

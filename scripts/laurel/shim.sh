@@ -23,7 +23,7 @@ case "$CORES" in 8) PAGES=4k ;; 4) PAGES=16k ;; *) echo "shim: CORES must be 8 o
 KERNEL=${KERNEL:-$OUT/laurel-kernel/out/kernel.development.sweet.$PAGES}
 DRAM=${DRAM:-0x80000000:0x40000000}
 # boot-args: topaz README set, root on userdata (rd=ufsroot0), kernel console kept on screen (no sweetfb_noconsole)
-CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_stayon=1 ipa=0"}
+CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 launchd_disable_all_timeouts=1 wdt=-1 sweetfb_hz=30 sweetfb_stayon=1 ipa=0"}
 # ipa=0: see scripts/laurel/uefi-image.sh (a modem assert in the IPA handshake stops Wi-Fi; docs/laurel_sprout/cellular.md section 8)
 
 for f in "$KERNEL" "$STOCK" "$TOPAZ/shim/shim.c"; do [ -e "$f" ] || { echo "shim: missing $f" >&2; exit 1; }; done

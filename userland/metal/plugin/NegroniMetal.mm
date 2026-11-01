@@ -570,6 +570,15 @@ static bool deadman_arm(char *path, size_t size)
 /* The device opened (or the open hangs): this start counts as unclean until it completes a command buffer. */
 static void deadman_mark(const char *path, const char *why)
 {
+	/*
+	 * A poster that just opened its device compiles its first pipelines on the main thread and launchd's extension watchdog (5 s, ns 7
+	 * code 3) kills it: boot 2026-11-01 18:45, AegirPoster 4 strikes in 20 s, no GPU fault, then no device and sig 6 for the rest of
+	 * the boot. A SIGKILL says nothing about the GPU: for a poster only a crash until the first completed command buffer is a strike.
+	 */
+	if (poster_process() && !strcmp(why, "device opened")) {
+		nlog("dead-man: on: a crash before the first completed command buffer is a strike (limit %ld), a kill is not", strike_limit());
+		return;
+	}
 	if (!write_strike_line(path))
 		nlog("dead-man: cannot write %s: %s", path, strerror(errno));
 	crash_unarm();
@@ -588,6 +597,7 @@ static void deadman_clear(const char *path, const char *why)
 {
 	if (!g_active_strike[0] || strcmp(g_active_strike, path) != 0)
 		return;
+	crash_unarm(); /* (a poster's handlers stay on until here, deadman_mark) */
 	unlink(path);
 	g_active_strike[0] = 0;
 	nlog("dead-man: strike cleared (%s)", why);
@@ -646,6 +656,69 @@ static void first_completion_watch(const char *path, double t_open)
 		if (done || ++ticks >= 480) {
 			dispatch_source_cancel(t);
 			free(sp);
+		}
+	});
+	dispatch_resume(t);
+}
+
+/*
+ * The memory rule's other half: a device client whose memory grows gets one line per step (+128 MiB, then +50 %), with the VM tags that
+ * hold the most. Boot 2026-11-01 18:43: "low swap: killing largest compressed process with pid 28 (mediaserverd) and size 2689 MB" 6 s
+ * after its device opened, and nothing in the log said what that memory was. VM tags: 1-9 malloc, 21-22 IOKit/IOSurface area
+ * (mach/vm_statistics.h).
+ */
+static void memory_step(long footprint_mb)
+{
+	enum { TAGS = 256 };
+	static uint64_t pages[TAGS];
+	memset(pages, 0, sizeof(pages));
+	vm_address_t at = 0;
+	vm_size_t size = 0;
+	natural_t depth = 0;
+	for (int walked = 0; walked < 100000; walked++, at += size) {
+		vm_region_submap_info_data_64_t info;
+		mach_msg_type_number_t n = VM_REGION_SUBMAP_INFO_COUNT_64;
+		if (vm_region_recurse_64(mach_task_self(), &at, &size, &depth, (vm_region_recurse_info_t)&info, &n) != KERN_SUCCESS)
+			break;
+		if (info.is_submap) {
+			depth++;
+			size = 0;
+			continue;
+		}
+		pages[info.user_tag & (TAGS - 1)] += info.pages_dirtied + info.pages_swapped_out;
+	}
+	char text[160] = "";
+	for (int top = 0; top < 4; top++) {
+		int best = 0;
+		for (int i = 1; i < TAGS; i++)
+			if (pages[i] > pages[best])
+				best = i;
+		if (!pages[best])
+			break;
+		char one[40];
+		snprintf(one, sizeof(one), " %d: %llu MiB", best, (unsigned long long)(pages[best] * (uint64_t)getpagesize() >> 20));
+		strlcat(text, one, sizeof(text));
+		pages[best] = 0;
+	}
+	nlog("memory: footprint %ld MiB; the most by VM tag:%s", footprint_mb, text);
+}
+
+static void memory_watch(void)
+{
+	long footprint = 0;
+	memory_limit_mb(&footprint);
+	static long next;
+	next = footprint + 128;
+	dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+	if (!t)
+		return;
+	dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, 200 * NSEC_PER_MSEC);
+	dispatch_source_set_event_handler(t, ^{
+		long now = 0;
+		memory_limit_mb(&now);
+		if (now >= next) {
+			memory_step(now);
+			next = now + (now / 2 > 128 ? now / 2 : 128);
 		}
 	});
 	dispatch_resume(t);
@@ -758,6 +831,7 @@ static void hook_surfaces(const char *turnip)
  * plain texture clear tells "GPU works, surface import does not" from "GPU does not work" in the log. No shaders:
  * load-action clears only, so no pipeline compile can stall it.
  */
+static double g_turnip_ms; /* dyld's work on Turnip alone, for the device line */
 static BOOL pixel_ok(uint32_t v) /* BGRA8 (0.25, 0.5, 0.75, 1) = 0xff4080bf, +-1 */
 {
 	int b = v & 0xff, g = (v >> 8) & 0xff, r = (v >> 16) & 0xff, a = v >> 24;
@@ -1035,6 +1109,10 @@ static void watchdog_start(void)
 				id dev = nil;
 				NSString *why = nil;
 				@try {
+					/* the same image metal2vulkan's loader opens next: this call times dyld alone */
+					double loading = CFAbsoluteTimeGetCurrent();
+					(void)dlopen(c->turnip, RTLD_LAZY | RTLD_LOCAL);
+					g_turnip_ms = (CFAbsoluteTimeGetCurrent() - loading) * 1000;
 					dev = native_bridge_metal_open(c->turnip, c->cache, c->registryID, missing);
 					if (!dev)
 						why = [NSString stringWithFormat:@"open refused: %s", nmb_last_error()];
@@ -1077,8 +1155,8 @@ static void watchdog_start(void)
 			nlog("device open/self-test still running after %ld ms: no Metal device (the strike stays; "
 			     "NEGRONIMETAL_OPEN_MS in %s/env changes the limit)", timeout_ms, NMTL_DIR);
 		else
-			nlog("device %s in %.0f ms (turnip %s, cache %s, self-test %s)%s%s",
-			     device ? [[device name] UTF8String] : "refused", ms, turnip.UTF8String, cache,
+			nlog("device %s in %.0f ms, of which %.0f ms loading Turnip (turnip %s, cache %s, self-test %s)%s%s",
+			     device ? [[device name] UTF8String] : "refused", ms, g_turnip_ms, turnip.UTF8String, cache,
 			     test ? "on" : "off", job.why ? ": " : "", job.why ? job.why.UTF8String : "");
 		if (device) {
 			deadman_mark(strike, "device opened");
@@ -1115,7 +1193,7 @@ static void watchdog_start(void)
 						    return xr10;
 					    }),
 					    "B16@0:8");
-			nlog("supportsExtendedXR10Formats = %d (NegroniMetal A730 answer, NEGRONIMETAL_XR10=%s: YES only in poster "
+			nlog("supportsExtendedXR10Formats = %d (NegroniMetal answer, NEGRONIMETAL_XR10=%s: YES only in poster "
 			     "extensions by default; RB_COLOR_MODE=%s)",
 			     (int)xr10, xr && *xr ? xr : "auto", getenv("RB_COLOR_MODE") ?: "(unset)");
 			/*
@@ -1143,7 +1221,7 @@ static void watchdog_start(void)
 				strlcat(added, *n, sizeof(added));
 			}
 			if (added[0])
-				nlog("MPS feature flags = NO (NegroniMetal A730 answer):%s", added);
+				nlog("MPS feature flags = NO (Apple-GPU features, NegroniMetal answer):%s", added);
 		}
 		Dl_info self_info = { 0 };
 		dladdr((void *)sm2_logs, &self_info);
@@ -1164,6 +1242,7 @@ static void watchdog_start(void)
 			setenv("CI_USE_MTL_DAG_FOR_CIKL_SRC", "0", 0);
 			deadman_clear_later(strike);
 			first_completion_watch(strike, CFAbsoluteTimeGetCurrent());
+			memory_watch();
 			const long wd = env_num("NEGRONIMETAL_WATCHDOG", -1); /* 1 / 0 force it on / off; default: backboardd only */
 			if (!strcmp(getprogname(), "backboardd"))
 				telemetry_loop();

@@ -4524,3 +4524,14 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Handshake stays off by default (ipa=0 in uefi-image.sh + shim.sh): a modem firmware assert cannot be seen in advance. Test image: IPA_TEST=1.
 - Test pitfall: kstub.h makes `printf` the captured kernel printf; test code that must print uses fprintf(stdout, ...).
 - Worktree build: symlink external/ios-sweet-linux + ios-topaz from the main checkout, cp --reflink out/laurel-kernel/{deps,theos,cache,dl}.
+## Mi A3: first Metal boot on the GPU, black wallpaper (2026-11-01 19:30, branch t3/laurel-metal-realgpu; built, NOT BOOTED)
+- Details: docs/laurel_sprout/metal.md section 11 (ranked causes, evidence, unproven, expected lines).
+- [V] Default wallpaper = id 7400 "WWDC 2022" (`/Library/Wallpaper/DefaultWallpapers~iphone.plist`, no iPhone10,3 entry), layers are HEIC. [V ios-flame HANDOFF 289] no HEVC hardware = ImageIO gives no data = black. Check other references' HANDOFF/NOTES first: the answer was there.
+- [V launchd 20H392] Extension kill "extension check-in timeout" = ns 7 code 3: `ExtensionWatchdog` true in the `__config` plist, `ExtensionWatchdogTimeout` default 5 s (data word 0x100071790), boot-arg `launchd_disable_all_timeouts=` turns it off, and also SIGTERM wait 3 -> 600 s, shutdown 30 s -> none.
+- [V] `low swap: killing largest compressed process` = a kill with no CRASH line (mediaserverd). grep it when a daemon restarts silently.
+- [V test] ld64.lld: a symbol `_x = 0` gets a rebase: a table pointer to it is the image base at run time, not NULL. Do not use absolute symbols for "NULL".
+- [V source] m2vtest's QuartzCore numbers are refusals counted with no function constants, not GPU results. Host corpus uses stand-ins, so the two differ.
+- New tool: `scripts/debug/crash-symbolize.sh LOG [PROCESS]` for CRASH lines (cache + main + NegroniMetal/Turnip offsets).
+- Worktree build: `git submodule update --init --reference <main>/external/metal2vulkan external/metal2vulkan`; a symlink there breaks git status. hackios-xnu-userland needs the main repo's objects as alternates (b4c5513). Reflink `out/laurel-kernel/{deps,theos,cache,dl}` and `out/laurel/gpu`.
+- Build [V]: metal-build.sh all exit 0 (219 s; 19 flame patches, check-imports PASS 0 missing, 8 Mach-O 0 instructions newer than ARMv8.0), kernel 272/272 patches 0 LSE, gpu-userland exit 0.
+

@@ -59,6 +59,9 @@ Rules (NegroniMetal.mm, 2026-10-25):
   process crashes (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGSYS, SIGABRT) during the open.
 * **No strike** when the process is killed (SIGKILL, e.g. launchd's "extension check-in timeout") before the device
   opened, or when the open is refused cleanly (a clean refusal also removes the old count).
+* **Posters (2026-11-01):** a name ending in `Poster`, `PosterExtension` or `PosterProvider` gets no strike file at the open, only a crash until
+  the first completed command buffer writes one: launchd's 5 s kill during the first pipelines says nothing about the GPU (Mi A3, 4 strikes in 20 s).
+  Log: `dead-man: on: a crash before the first completed command buffer is a strike (limit 4), a kill is not`.
 * **Strike cleared (clean start)** at the first command buffer that completes after the open (the self-test's command
   buffer does not count), 15 s after the open, or at `exit()`. Log: `dead-man: strike N armed (device opened, limit L)`,
   then `dead-man: strike cleared (first command buffer completed T ms after the device opened)`.
@@ -209,6 +212,8 @@ scheduled handlers until completion.
   processes named *Poster, *PosterExtension, *PosterProvider (AegirPoster throws CAMetalLayerInvalid with NO), NO elsewhere.
 * `RB_COLOR_MODE=fixed` (set by the plugin, 2026-10-27): RenderBox draws BGRA8, not two-plane XR10 surfaces (blank widgets).
   A line `RB_COLOR_MODE=` (empty) in the env file turns it off. docs/metal-widgets-2026-10-27.md section 8.
+  Mi A3 boot 2026-11-01 18:43 [V]: too late in chronod (RenderBox reads it once, before the first device): `_RB4` surfaces all the same. The Mi A3
+  root sets it in the launchd job (`scripts/laurel/metal-job-env.py`: chronod, SpringBoard). On negroni it is still the plugin's only: check there.
 * `NEGRONIMETAL_SURFACE_FLUSH=0|1` (env file): the per-command-buffer CPU cache invalidate (`dc civac`) over every
   IOSurface a command buffer rendered into, run on the completion thread in every process but backboardd. `0` = off
   everywhere, `1` = on everywhere, unset = unchanged (on except backboardd). m2v/0001 already invalidates every host import
