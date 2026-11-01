@@ -16,6 +16,9 @@ build() {
   cp -a out/metal/stage "$C/$where/stage"
   cp out/gpu/turnip/libvulkan_freedreno.dylib "$C/$where/"
   cp out/metal/bridge/ios/libnative_metal_bridge.a "$C/$where/"
+  # the default XNUtils: the same sources decide it, with XT_IOS26 unset
+  SDK=$REPO/out/laurel-metal/sdk/iPhoneOS16.5.sdk scripts/laurel/xnutils-build.sh > "$C/$where-xnutils.log" 2>&1 || { tail -20 "$C/$where-xnutils.log"; return 1; }
+  cp -a out/laurel/xnutils/root "$C/$where/xnutils"
 }
 trap 'git checkout -q "$head"' EXIT
 git checkout -q --detach "$base"

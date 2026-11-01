@@ -1,6 +1,11 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+iOS 26 compositor on Metal round (2026-11-02, branch t3/laurel-ios26-metal, not merged; HOST ONLY, NOTHING RUN ON THE PHONE, no pixel and no frame time exists): docs/laurel_sprout/ios26-metal.md. Owner decision: the compositor runs on Metal through metal2vulkan + Turnip on the A610.
+Done: 23F84 SPI port + two stacks (`default`: metal2vulkan 219f013 + flame-ios26; `hot`: IOS-26-Hot's metal2vulkan 720ef1ce + 19 patches), one bundle with a selector, one setting, fallback to the default with a failure count, XNUtils options screen and bench, pipeline table, present path, kernel needs, performance estimate [I], iOS 16 test option (never default). Results: section 1 and 10 of that page, RESULT lines in docs/notes.md.
+Open [U]: which stack is better; pictures; speed; CA's real `fixed_frag` keys. If the default stack fails on 23F84 there is no GL below it. Kernel needs K1-K7 belong to t3/laurel-ios26-needs.
+Next: merge when the owner agrees; iOS 16 test option on the phone when the owner asks; bench on the phone after the first iOS 26 boot.
+
 AirDrop over AWDL + AirPlay legacy round (2026-11-01, branch t3/laurel-airdrop-awdl, base origin/laurel-int-1, patch 2932, NOT RUN ON THE PHONE): owner "AirDrop was ported to Android, use its implementation; fix AirPlay properly". docs/laurel_sprout/airdrop-awdl.md.
 Done: IBSS vdev on AWDL's BSSID in the kernel (WMI mgmt Tx, HTT data, firmware peers; en0 first), `com.laurel.awdl` socket + `awdl0`, daemon `laurel-awdld` on owly-awdl (MIT), trigger from Everyone or AirDrop's BLE advertisement, state file against a repeat firmware assert; AirPlay `sessionProtocolOverride=legacy` (no PTP, no FairPlay for third-party receivers).
 [V] Google's transport is AWDL (NetSPI log). [V text] firmware rules from the qcacld injection work on WCN3990. [I] the cell gives ACK + BSSID filter as in Owly. [U] does VDEV_START work on an IBSS vdev; do foreign action frames pass; does the whole chain reach an iPhone. The old "no awdl0" decision is reversed.

@@ -13,7 +13,7 @@
 set -euo pipefail
 R=${1:?usage: $0 MOUNTED_ROOT}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-S=$REPO/out/laurel/xnutils/root
+S=${XNUTILS_ROOT:-$REPO/out/laurel/xnutils/root}    # XNUTILS_ROOT: the iOS 26 copy (root-add-metal-ios26.sh)
 ts() { date +%H:%M:%S; }
 if [ "${XNUTILS:-1}" = 0 ]; then echo "$(ts) root-xnutils: skipped (XNUTILS=0)"; exit 0; fi
 [ -d "$R/Applications" ] && [ -f "$R/System/Library/xpc/launchd.plist" ] || { echo "root-xnutils: $R is not an iOS root" >&2; exit 1; }

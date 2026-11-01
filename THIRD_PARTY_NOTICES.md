@@ -19,6 +19,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | HakiOS kernel `hakios.mpss.c` (RMTFS / TFTP / service-registry / QRTR name-service port in `patches/xnu/0397-negroni-gnss.patch`: `bsd/dev/negroni_gnss.c`; hackios-next 88513176) | the HakiOS authors | APSL 2.0 (as XNU) |
 | `external/ios-flame` | NWylynko, dipa-studio | MIT |
 | `external/metal2vulkan` | steelbrain | GPL-2.0-or-later OR LGPL-3.0-or-later |
+| `external/IOS-26-Hot` (d249939, reference; the `hot` stack: `scripts/laurel/ios26-metal-hot-build.sh` exports its `phone/metal2` frontend and metal2vulkan patch series at build time; ported frontend fixes in `userland/metal/patches/flame-ios26/`, `CABackdropLayer` bypass in `userland/metal/plugin/NegroniMetal.mm`) | dipa-studio (its `LICENSE`) | MIT |
 | `external/ios-sweet` & `external/ios-sweet-upstream` | dipa-studio | MIT |
 | `external/Chlorophyll` & `userland/metal/probes` | ry-diffusion / Chlorophyll authors | MIT |
 | `external/ios-apollo` | aTechGeekDev, dipa-studio | MIT |
@@ -167,6 +168,7 @@ SOFTWARE.
 ```
 
 ### B. ios-sweet / dipa-studio & derivatives
+This text also covers IOS-26-Hot (d249939), which carries the same notice in its `LICENSE`.
 ```text
 MIT License
 

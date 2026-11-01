@@ -72,6 +72,37 @@ if unshare -r true 2>/dev/null; then
   rc=0; h metal everything 2>/dev/null || rc=$?; [ $rc = 2 ] || { echo "xnutils-test: FAIL: a bad verb gives $rc, not 2" >&2; fail=1; }
   rc=0; "$D/helper" gl on 2>/dev/null || rc=$?; [ $rc = 5 ] || { echo "xnutils-test: FAIL: not root gives $rc, not 5" >&2; fail=1; }
   rc=0; h check >/dev/null || rc=$?; [ $rc = 3 ] || { echo "xnutils-test: FAIL: check without the sysctl gives $rc, not 3" >&2; fail=1; }
+  # The iOS 26 verbs (XT_IOS26: helper_ios26.c): the setting and its copy, the counts cleared, the env file's other lines kept, the bench without a compositor gives no number
+  ${CC:-cc} -g -O1 -Wall -Wextra -Wno-unused-parameter -fsanitize=address,undefined -I"$D/shim" -I"$S" -I"$S/test" -DXT_ROOT="\"$F\"" -DXT_IOS26=1 -Dsyscall=xt_no_syscall \
+    -include sys/types.h -include stdint.h -o "$D/helper26" "$S/helper.c" "$S/helper_files.c" "$S/helper_ios26.c" "$S/test/host_stubs.c" "$S/report_core.c" "$S/report_row.c" "$S/report_gfx.c" "$S/report_sys.c" "$S/report_io.c" 2>"$D/helper26.log" || { cat "$D/helper26.log"; exit 1; }
+  h26() { unshare -r "$D/helper26" "$@"; }
+  DB=$F/private/var/db/negronimetal; L2=$F/System/Library/Extensions/NegroniMetal.bundle/option.local
+  printf 'NEGRONIMETAL_OPEN_MS=60000\nTU_DEBUG=old\n' > "$DB/env"
+  mkdir -p "$DB/stack"; echo "hot 2 0" > "$DB/stack/state"; : > "$DB/stack/failed"; : > "$DB/stack/ok"
+  h26 metaloption hot; [ "$(cat "$DB/option")" = hot ] && [ "$(cat "$L2")" = hot ] && [ ! -e "$DB/stack/state" ] && [ ! -e "$DB/stack/failed" ] && [ ! -e "$DB/stack/ok" ] || { echo "xnutils-test: FAIL: metaloption hot" >&2; fail=1; }
+  h26 tumode sysmem; [ "$(grep -c '^TU_DEBUG=' "$DB/env")" = 1 ] && grep -qx TU_DEBUG=sysmem "$DB/env" && grep -qx NEGRONIMETAL_OPEN_MS=60000 "$DB/env" || { echo "xnutils-test: FAIL: tumode sysmem" >&2; fail=1; }
+  h26 tumode auto; ! grep -q '^TU_DEBUG=' "$DB/env" && grep -qx NEGRONIMETAL_OPEN_MS=60000 "$DB/env" || { echo "xnutils-test: FAIL: tumode auto" >&2; fail=1; }
+  h26 liveglass on; [ -f "$DB/live-glass" ] || { echo "xnutils-test: FAIL: liveglass on" >&2; fail=1; }
+  echo "default option hot failed in 2 starts of the compositor" > "$DB/stack/active"
+  ST=$(h26 metalstate); for w in OPTION=hot ACTIVE=default 'WHY=option hot failed in 2 starts of the compositor' TUMODE=auto GLASS=live; do printf '%s\n' "$ST" | grep -qxF "$w" || { echo "xnutils-test: FAIL: metalstate has no $w" >&2; fail=1; }; done
+  h26 liveglass off; [ ! -e "$DB/live-glass" ] || { echo "xnutils-test: FAIL: liveglass off" >&2; fail=1; }
+  h26 bench-begin; [ -f "$DB/stack/bench-on" ] || { echo "xnutils-test: FAIL: bench-begin" >&2; fail=1; }
+  [ "$(h26 bench-end)" = PRESENTS=none ] && [ ! -e "$DB/stack/bench-on" ] || { echo "xnutils-test: FAIL: bench-end without a compositor" >&2; fail=1; }
+  rc=0; h26 metaloption ../x 2>/dev/null || rc=$?; [ $rc = 2 ] || { echo "xnutils-test: FAIL: a bad option gives $rc, not 2" >&2; fail=1; }
+  rc=0; h metaloption hot 2>/dev/null || rc=$?; [ $rc = 2 ] || { echo "xnutils-test: FAIL: the default helper knows metaloption ($rc)" >&2; fail=1; }
+  # bench_core.h
+  cat > "$D/bench_core_test.c" <<'EOF'
+#include "bench_core.h"
+int main(void) {
+	double ms[100];
+	for (int i = 0; i < 100; i++) ms[i] = 100 - i;
+	struct xt_client c = xt_client_summary(ms, 100);
+	int ok = c.p50 == 50 && c.p95 == 95 && c.max == 100 && c.fps > 19.7 && c.fps < 19.9;
+	struct xt_client z = xt_client_summary(ms, 0);
+	return ok && z.fps == 0 && z.max == 0 ? 0 : 1;
+}
+EOF
+  ${CC:-cc} -g -O1 -Wall -Wextra -fsanitize=address,undefined -I"$S" -o "$D/bench_core_test" "$D/bench_core_test.c" && "$D/bench_core_test" || { echo "xnutils-test: FAIL: bench_core" >&2; fail=1; }
 else
   echo "xnutils-test: note: no user namespace: the helper's file verbs not tested"
 fi

@@ -1,0 +1,76 @@
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.h b/phone/metal2/NativeBridgeMetalFrontend.h
+index af846b8..b4527a2 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.h
++++ b/phone/metal2/NativeBridgeMetalFrontend.h
+@@ -8,6 +8,9 @@
+ extern "C" {
+ // Opens the process's one device: loader exports vkGetInstanceProcAddr (Turnip), cache is a writable shader-cache directory, registryID is the
+ // accelerator service's registry entry. missing (may be null) is told the class and selector of every unimplemented call.
++void native_bridge_metal_set_surface_hook(void (*hook)(const void *, uint64_t, uint32_t));
++void native_bridge_metal_progress(uint64_t out[4]);
++void native_bridge_metal_objects(int64_t out[9]);
+ id native_bridge_metal_open(const char *loader, const char *cache, uint64_t registryID, void (*missing)(const char *, const char *));
+ // Bare AIR bitcode as a library (the bridge's fixtures; Metal itself accepts only metallibs).
+ id native_bridge_metal_library_with_air(const void *bytes, size_t length);
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index cfe2aa9..ba7fe84 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -192,6 +192,10 @@ NB_RESOURCE_SPI
+ // caller-owned no-copy buffers do not enter this cache.
+ static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
+ static std::mutex gSurfaceImportLock;
++// Mi A3 (NegroniMetal plug-in): our Turnip imports a surface by ID through the msm stand-in, and the plug-in's two checks need these names (flame/0001, flame-bbd). Hot's Turnip has BoImport and needs none of it.
++static void (*gSurfaceHook)(const void *base,uint64_t bytes,uint32_t surface);
++extern "C" void native_bridge_metal_set_surface_hook(void (*hook)(const void *,uint64_t,uint32_t)) {gSurfaceHook=hook;}
++static std::mutex gScreenLock;static IOSurfaceRef gScreenSurface;
+ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  struct Key {uint64_t identity,address,bytes;};
+  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
+@@ -200,6 +204,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
+  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
+  if(buffer)return buffer;
++ if(gSurfaceHook)gSurfaceHook(base,bytes,IOSurfaceGetID(surface));
+  NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,base,bytes,MTLResourceStorageModeShared);
+  if(!handle){NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+  buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
+@@ -1453,6 +1458,14 @@ static void scheduled(void *context);
+ // After completion (or a refusal): invalidate the CPU's view of GPU-written imported surfaces, then completed handlers, once.
+ - (void)finish {
+  if(!self.failedLocally)flushSurfaces(_writtenSurfaces);
++ if(!self.failedLocally)
++  for(id written in _writtenSurfaces){
++   if(![written isKindOfClass:[NBTexture class]])continue;
++   IOSurfaceRef r=[(NBTexture *)written surface];
++   if(!r || IOSurfaceGetWidth(r)<700 || IOSurfaceGetHeight(r)<1500)continue;
++   std::lock_guard<std::mutex> lock(gScreenLock);
++   CFRetain(r);if(gScreenSurface)CFRelease(gScreenSurface);gScreenSurface=r;
++  }
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.
+  [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];
+@@ -2741,3 +2754,23 @@ extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  return native_bridge_metal_formats_locked(out,size);
+ }
++
++// Mi A3 (NegroniMetal plug-in): the same names as our other frontend.
++extern "C" IOSurfaceRef native_bridge_metal_copy_screen_surface(void) {
++ std::lock_guard<std::mutex> lock(gScreenLock);
++ if(gScreenSurface)CFRetain(gScreenSurface);
++ return gScreenSurface;
++}
++extern "C" void native_bridge_metal_progress(uint64_t out[4]) {
++ uint64_t pending=0,oldest=0;const uint64_t now=nowUs();
++ if(gInFlight)@synchronized(gInFlight){
++  for(NBCommandBuffer *commandBuffer in gInFlight) {
++   if(![commandBuffer isKindOfClass:[NBCommandBuffer class]] || commandBuffer.failedLocally)continue;
++   pending++;
++   const uint64_t at=commandBuffer.committedUs;
++   if(at && now>at && now-at>oldest)oldest=now-at;
++  }
++ }
++ out[0]=gCommits.load();out[1]=gCompleted.load();out[2]=pending;out[3]=oldest;
++}
++extern "C" __attribute__((visibility("default"))) void native_bridge_metal_objects(int64_t out[9]) {for(int i=0;i<9;i++)out[i]=0;}

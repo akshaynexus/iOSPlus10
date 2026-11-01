@@ -1017,6 +1017,74 @@ static const char *bbd_gl_reason(char *why, size_t size)
  * A frame reached the screen surface, and something is lit in it. No frame in 240 s (a cold first compile of the generic shader takes 25-45 s on this CPU [I], and more pipelines follow), or 30 s of black from the first frame on: on iOS 16 a mark and an exit (the next start takes GL);
  * on iOS 26 one line (there is nothing to fall back to). Runs in backboardd only.
  */
+#ifdef NMTL_IOS26
+#include "../../laurel/metal/option/present_stats.h"
+/* The selector's marks (userland/laurel/metal/option/option_rule.h). A stack other than the default ends this start on a failure: the next start takes the default. The default has nothing to go to, so it only logs. */
+static bool option_is_default(void)
+{
+	const char *o = getenv("NEGRONIMETAL_OPTION");
+	return o == NULL || !strcmp(o, "default");
+}
+static void option_mark(const char *name, const char *text)
+{
+	char p[300];
+	snprintf(p, sizeof(p), NMTL_DIR "/stack/%s", name);
+	if (FILE *f = fopen(p, "w")) {
+		fprintf(f, "%s\n", text);
+		fclose(f);
+	}
+}
+static void option_failed(const char *why)
+{
+	if (option_is_default())
+		return;
+	nlog("LAUREL METAL: off: stack %s: %s: restart on stack default", getenv("NEGRONIMETAL_OPTION"), why);
+	option_mark("failed", why);
+	_exit(0);
+}
+#endif
+#ifdef NMTL_IOS26
+extern "C" void native_bridge_metal_present_hist(uint64_t out[NMTL_PRESENT_BINS]);
+/* XNUtils' bench: while the file stack/bench-on exists, count this compositor's frames; at its removal write stack/bench-result. A cost of one access() in 500 ms when no bench runs. */
+static void *bench_serve(void *arg)
+{
+	(void)arg;
+	static uint64_t base[NMTL_PRESENT_BINS], cur[NMTL_PRESENT_BINS];
+	double t0 = 0;
+	bool on = false;
+	for (;;) {
+		usleep(500000);
+		const bool want = access(NMTL_DIR "/stack/bench-on", F_OK) == 0;
+		if (want && !on) {
+			native_bridge_metal_present_hist(base);
+			t0 = CFAbsoluteTimeGetCurrent();
+			on = true;
+		} else if (!want && on) {
+			native_bridge_metal_present_hist(cur);
+			struct nmtl_present_summary sum;
+			char text[240];
+			nmtl_present_summarize(cur, base, &sum);
+			nmtl_present_text(text, sizeof(text), &sum, CFAbsoluteTimeGetCurrent() - t0, getenv("NEGRONIMETAL_OPTION") ?: "default");
+			if (FILE *f = fopen(NMTL_DIR "/stack/bench-result.new", "w")) {
+				fputs(text, f);
+				fclose(f);
+				rename(NMTL_DIR "/stack/bench-result.new", NMTL_DIR "/stack/bench-result");
+			}
+			on = false;
+		}
+	}
+}
+static void bench_serve_start(void)
+{
+	pthread_t th;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	if (pthread_create(&th, &attr, bench_serve, NULL) != 0)
+		nlog("LAUREL METAL: off: no bench thread in this start");
+	pthread_attr_destroy(&attr);
+}
+#endif
 static void *bbd_screen_check(void *arg)
 {
 	(void)arg;
@@ -1042,6 +1110,7 @@ static void *bbd_screen_check(void *arg)
 				bbd_mark_off("no frame in 240 s");
 				_exit(0);
 #else
+				option_failed("no frame in 240 s");
 				return NULL;
 #endif
 			}
@@ -1071,8 +1140,20 @@ static void *bbd_screen_check(void *arg)
 			nlog(BBD_TAG ": screen: %u of 64 samples lit, %.0f s after the device opened; %llu command buffers completed", lit, now - t0, (unsigned long long)p[1]);
 		}
 		last_lit = lit;
-		if (lit)
+		if (lit) {
 			first_lit_wait = now;
+#ifdef NMTL_IOS26
+			/* Lit for 60 s: this start did not fail. A start that dies before that counts in the selector's rule, so a crash loop after the first frame ends too. Later black is the display's sleep, not a failure. */
+			static double lit_at;
+			if (lit_at == 0)
+				lit_at = now;
+			if (now - lit_at >= 60) {
+				option_mark("ok", "lit");
+				nlog(BBD_TAG ": on: stack %s: the screen is lit 60 s after the first frame", getenv("NEGRONIMETAL_OPTION") ?: "default");
+				return NULL;
+			}
+#endif
+		}
 #ifdef LAUREL_BBD_METAL
 		else if (now - first_lit_wait >= 30) {
 			bbd_mark_off("the screen surface stayed black for 30 s after a frame");
@@ -1083,7 +1164,9 @@ static void *bbd_screen_check(void *arg)
 			return NULL;
 		}
 #else
-		if (lines >= 12)
+		else if (now - first_lit_wait >= 30)
+			option_failed("the screen surface stayed black for 30 s after a frame");
+		if (now - t0 >= 300)
 			return NULL;
 #endif
 	}
@@ -1242,6 +1325,18 @@ static void watchdog_start(void)
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
 		NSString *bundlePath = [[NSBundle bundleForClass:[NMTL_CLASS class]] bundlePath];
+#ifdef NMTL_IOS26
+		{
+			/* this image is BUNDLE/options/<name>/NegroniMetal, loaded by the selector (userland/laurel/metal/option): the files are the bundle's */
+			Dl_info me = { 0 };
+			if (dladdr((void *)sm2_logs, &me) != 0 && me.dli_fname != NULL) {
+				NSString *path = @(me.dli_fname);
+				NSRange at = [path rangeOfString:@"/options/"];
+				if (at.location != NSNotFound)
+					bundlePath = [path substringToIndex:at.location];
+			}
+		}
+#endif
 #ifdef NMTL_HOST_TEST
 		if (const char *b = getenv("NMTL_HOST_BUNDLE")) /* the host test's stand-in for the bundle directory */
 			bundlePath = @(b);
@@ -1291,9 +1386,14 @@ static void watchdog_start(void)
 		}
 		/* shader + pipeline cache: NMTL_DIR/cache/<process>, else the sandboxed process's own cache directory */
 		char cache[256];
-		mkdir(NMTL_DIR "/cache", 0777);
-		chmod(NMTL_DIR "/cache", 0777);
-		snprintf(cache, sizeof(cache), NMTL_DIR "/cache/%s", getprogname());
+#ifdef NMTL_HOT
+#define NMTL_CACHE_DIR NMTL_DIR "/cache-hot"      /* another metal2vulkan: another cache */
+#else
+#define NMTL_CACHE_DIR NMTL_DIR "/cache"
+#endif
+		mkdir(NMTL_CACHE_DIR, 0777);
+		chmod(NMTL_CACHE_DIR, 0777);
+		snprintf(cache, sizeof(cache), NMTL_CACHE_DIR "/%s", getprogname());
 		mkdir(cache, 0777);
 		if (access(cache, W_OK) != 0) {
 			char dir[256];
@@ -1544,6 +1644,9 @@ static void watchdog_start(void)
 #if defined(LAUREL_BBD_METAL) || defined(NMTL_IOS26)
 			if (process_is_backboardd())
 				bbd_screen_check_start();
+#ifdef NMTL_IOS26
+				bench_serve_start();
+#endif
 #endif
 		} /* a clean refusal removed its strike file (deadman_refused); a hang keeps its strike (deadman_mark) */
 	});

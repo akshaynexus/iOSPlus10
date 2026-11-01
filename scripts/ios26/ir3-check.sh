@@ -11,7 +11,7 @@ C=$OUT/ios26/metal-corpus/ui/$lib
 [ -f "$C/results.tsv" ] || C=$OUT/ios26/metal-corpus/all/$lib
 A=$OUT/ios26/metallib/$lib
 H=$OUT/ios26/turnip-host
-W=$OUT/ios26/ir3/$lib
+W=${IR3_OUT:-$OUT/ios26/ir3}/$lib     # METAL_OUT + IR3_OUT: the same check on another stack (out/ios26/metal-hot)
 [ -f "$C/results.tsv" ] || { echo "ir3-check: no $C/results.tsv (scripts/ios26/metal-corpus.sh)" >&2; exit 1; }
 [ -f "$H/libvulkan_freedreno.so" ] || { echo "ir3-check: scripts/ios26/turnip-host.sh first" >&2; exit 1; }
 mkdir -p "$W"

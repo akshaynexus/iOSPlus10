@@ -1,0 +1,26 @@
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -195,6 +195,14 @@
+ // Mi A3 (NegroniMetal plug-in): our Turnip imports a surface by ID through the msm stand-in, and the plug-in's two checks need these names (flame/0001, flame-bbd). Hot's Turnip has BoImport and needs none of it.
+ static void (*gSurfaceHook)(const void *base,uint64_t bytes,uint32_t surface);
+ extern "C" void native_bridge_metal_set_surface_hook(void (*hook)(const void *,uint64_t,uint32_t)) {gSurfaceHook=hook;}
++// The compositor's frames for XNUtils' bench (NegroniMetal.mm): command buffers that wrote a screen-size surface, by ms from commit to GPU completion. The last bin holds 127 ms and more.
++static std::atomic<uint64_t> gPresentHist[128];
++static void notePresent(uint64_t committedUs) {
++ if(!committedUs)return;
++ const uint64_t now=nowUs(),ms=now>committedUs?(now-committedUs)/1000:0;
++ gPresentHist[ms>127?127:ms].fetch_add(1,std::memory_order_relaxed);
++}
++extern "C" void native_bridge_metal_present_hist(uint64_t out[128]) {for(int i=0;i<128;i++)out[i]=gPresentHist[i].load(std::memory_order_relaxed);}
+ static std::mutex gScreenLock;static IOSurfaceRef gScreenSurface;
+ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  struct Key {uint64_t identity,address,bytes;};
+@@ -1465,6 +1473,7 @@
+    if(!r || IOSurfaceGetWidth(r)<700 || IOSurfaceGetHeight(r)<1500)continue;
+    std::lock_guard<std::mutex> lock(gScreenLock);
+    CFRetain(r);if(gScreenSurface)CFRelease(gScreenSurface);gScreenSurface=r;
++   notePresent(self.committedUs);break;
+   }
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.

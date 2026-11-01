@@ -2,7 +2,7 @@
 # Entry point for the iOS 26 root build (root track): the Metal stack and the compositor on Metal, in a mounted, writable Mi A3 23F84 root. Replaces scripts/laurel/root-add-metal.sh on that path.
 #   METAL26=0                                   skips, one line
 #   sudo scripts/laurel/root-add-metal-ios26.sh MOUNTED_ROOT
-# Input: out/ios26/metal/stage (scripts/laurel/ios26-metal-build.sh; check: scripts/ios26/abi-check.py). Writes:
+# Input: out/ios26/metal-all/stage (scripts/laurel/ios26-metal-options.sh: both stacks + selector; check: scripts/ios26/abi-check.py). Writes:
 #   /System/Library/Extensions/NegroniMetal.bundle/{NegroniMetal,Info.plist,libvulkan_freedreno.dylib,clients,clients.local}   Metal.framework reads this folder [V 23F84 getMetalPluginClassForService]
 #   /usr/local/bin/{vkprobe,metalprobe,mslprobe,m2vtest,carenderprobe,layerprobe}
 #   /private/var/db/negronimetal/{clients,env,cache/,strikes/,metal.log,build.txt}
@@ -13,12 +13,12 @@
 set -eu
 R=${1:?usage: $0 MOUNTED_ROOT}
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-S=${METAL_STAGE:-$REPO/out/ios26/metal/stage}
+S=${METAL_STAGE:-$REPO/out/ios26/metal-all/stage}
 B=$S/System/Library/Extensions/NegroniMetal.bundle
 if [ "${METAL26:-1}" = 0 ]; then
   echo "laurel-root: metal26: off: METAL26=0: no compositor on this root"; exit 0
 fi
-for f in "$B/NegroniMetal" "$B/libvulkan_freedreno.dylib" "$B/Info.plist"; do
+for f in "$B/NegroniMetal" "$B/options/default/NegroniMetal" "$B/libvulkan_freedreno.dylib" "$B/Info.plist"; do
   [ -f "$f" ] || { echo "laurel-root: metal26: off: no ${f#$REPO/} (scripts/laurel/ios26-metal-build.sh): no compositor on this root"; exit 1; }
 done
 [ -d "$R/System/Library/Extensions" ] && [ -f "$R/usr/libexec/backboardd" ] || { echo "laurel-root: metal26: off: $R does not look like an iOS root"; exit 1; }
@@ -41,6 +41,14 @@ chmod 644 "$D/clients" "$R/System/Library/Extensions/NegroniMetal.bundle/clients
   if [ -n "${METAL_ENV:-}" ]; then printf '%s\n' "$METAL_ENV"; fi
 } > "$D/env"
 chmod 644 "$D/env"
+# The stack selector's folder (option_select.m) and its setting: no file means the default. Fresh root: nothing else to write. backboardd runs as mobile
+mkdir -p "$D/stack"; chmod 777 "$D/stack"
+# XNUtils with the switches + bench (scripts/laurel/ios26-metal-options.sh builds it). XNUTILS=0 skips, as on iOS 16; no build: one line, the rest of the root goes on
+if [ -x "$REPO/out/ios26/xnutils/root/Applications/XNUtils.app/XNUtils" ]; then
+  XNUTILS_ROOT=$REPO/out/ios26/xnutils/root sh -c '"$0" "$1"' "$REPO/scripts/laurel/root-xnutils.sh" "$R" || echo "laurel-root: metal26: off: root-xnutils.sh failed: no options screen on this root"
+else
+  echo "laurel-root: metal26: off: no out/ios26/xnutils: no options screen on this root (scripts/laurel/ios26-metal-options.sh)"
+fi
 # CA reads these once: a first boot must already pick 8-bit BGRA, no compressed framebuffer (IOS-26-Hot, wave 6: BGRA from boot 1). The plug-in sets them too, at its device open, which can be late [I].
 python3 -I - "$R" <<'PY'
 import os, plistlib, sys

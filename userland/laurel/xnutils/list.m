@@ -1,5 +1,8 @@
 /* The rows of the XNUtils screen: switches, actions, status line, the report's sections (tap a line to open it). */
 #import "vc.h"
+#ifdef XT_IOS26
+#import "bench.h"
+#endif
 
 static NSString *const kActions[] = { @"Clear Metal strikes", @"Restart UI (backboardd)", @"Copy report", @"Share report", @"Restart", @"Reboot to bootloader", @"Shut down" };
 
@@ -20,7 +23,11 @@ state_color(NSString *s)
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
+#ifdef XT_IOS26
+	if (section == 0) return 4;
+#else
 	if (section == 0) return 3;
+#endif
 	if (section == 1) return NUM_ACTIONS;
 	if (section == 2) return 1;
 	XTSection *s = self.sections[(NSUInteger)section - 3];
@@ -62,6 +69,15 @@ state_color(NSString *s)
 
 	if (ip.section == 0) {
 		c.selectionStyle = UITableViewCellSelectionStyleNone;
+#ifdef XT_IOS26
+		if (ip.row == 3) {
+			c.selectionStyle = UITableViewCellSelectionStyleDefault;
+			c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+			c.textLabel.text = @"Metal options and bench";
+			c.detailTextLabel.text = @"Stack, Turnip mode, live glass; the same scene on each, two runs side by side.";
+			return c;
+		}
+#endif
 		if (ip.row == 0) {
 			c.textLabel.text = @"Metal";
 			c.detailTextLabel.text = @"Auto: the gate tests at the next boot. All: every process but backboardd and mediaserverd. Probes: test tools only. Off: no device.";
@@ -109,6 +125,14 @@ state_color(NSString *s)
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
 	[tv deselectRowAtIndexPath:ip animated:NO];
+#ifdef XT_IOS26
+	if (ip.section == 0 && ip.row == 3) {
+		UINavigationController *n = [[UINavigationController alloc] initWithRootViewController:[[XTBenchController alloc] initWithStyle:UITableViewStyleInsetGrouped]];
+
+		[self presentViewController:n animated:YES completion:nil];
+		return;
+	}
+#endif
 	if (ip.section == 1) {
 		[self action:ip.row];
 	} else if (ip.section >= 3 && ip.row == 0) {

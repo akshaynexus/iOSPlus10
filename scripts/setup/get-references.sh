@@ -22,6 +22,7 @@ UniXNU-zeta        https://github.com/none24smu/UniXNU-zeta.git       eb489285a1
 IOS-26-Hot         https://github.com/nithinyadavamaraboina-online/IOS-26-Hot.git d249939b9c36380afaee1a76cf167aeee8347475 master
 hakios-dada        https://github.com/superboyyy/hakios-arm64e-dada.git f1ae906fcc43ba8f763663257724ba938fb820ab main
 AdrenoMetal        https://github.com/UniXNU/AdrenoMetal.git 831a9dcbd6ac7de89a11bdaf031e07b9aadfa3c8 main
+metal2vulkan-inferno https://github.com/MakrSas/metal2vulkan-inferno.git f9832cec3fe55d28069e3c8aa4bd307a7c0296c9
 Bergamota          https://github.com/friendlycatt/Bergamota.git 23475744ca5cc6790037c8ebcf4b03662a24d922 develop
 UniXNU-pong        https://github.com/Chengdong-Yu/UniXNU-pong.git    ab74f075320fe54eee24d5d150386e5b0f0f427f main
 ios-sailfish       https://github.com/joranv1/ios-sailfish.git        6f27e41ff249f2680540ebe8ee5ab982c5e641c9

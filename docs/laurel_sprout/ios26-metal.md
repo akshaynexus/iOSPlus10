@@ -15,6 +15,7 @@ Marks: **[V]** measured or read here (command, file, tool output). **[I]** infer
 | Do QuartzCore's 189 functions pass the compiler chain for FD610? | Yes, except 13 tile kernels and 2 `inplace_copy_*`, which CA does not ask on this device: FD610 answers `supportsTileShaders` 0, `supportsRasterOrderGroups` 0 [V host]. Liquid Glass compiles. CA's real `fixed_frag` specializations are **not** tested on the host: section 4.1 | [V host] |
 | Does the A610 have a hard limit that stops the compositor? | None found. Sampler min/max, HW multiview and GMEM are not asked for by any QuartzCore pipeline that fails | [V host], [I] for use |
 | Are pictures right? | **Unknown.** iOS 16 Metal has known black layers; zeta has black backgrounds. The host cannot say | [U] |
+| Is there a second stack to compare? | Yes: IOS-26-Hot's older metal2vulkan + patch series, built as `hot`, chosen by one setting, with a bench in XNUtils. The default stays ours; no number exists yet. Section 10 | [V host] |
 | Is it usable? | **Expect slow but real use with live glass off**: about 15 to 30 frames a second; live glass 4 to 10; section 8. IOS-26-Hot's self-reported 52.9 fps on an A640 on 23F84 moves this up from my first estimate; it does not prove it here | [I] |
 
 Blockers with evidence: section 4.3. The iOS 16 test option can answer the main unknown before the iOS 26 boot: section 6.
@@ -273,8 +274,8 @@ Memory: Hot reports a GPU pool of 416 to 593 of 944 MB with the bypass. At 0.4 o
 
 | Step | Command | Result |
 |---|---|---|
-| Build | `scripts/bg.sh ios26-metal scripts/laurel/ios26-metal-build.sh all` | `out/ios26/metal/stage`, checks: Mesa A610 entry, imports vs 23F84, abi-check, selector gap |
-| Install | `sudo scripts/laurel/root-add-metal-ios26.sh MOUNTED_ROOT` | bundle, probes, clients, env, CAEnable* preferences, jetsam |
+| Build | `scripts/bg.sh ios26-metal-all scripts/laurel/ios26-metal-options.sh` | `out/ios26/metal-all/stage`: selector + both stacks (`ios26-metal-build.sh`, `ios26-metal-hot-build.sh`); `out/ios26/xnutils/root`. Checks: Mesa A610 entry, imports vs 23F84, abi-check, selector gap |
+| Install | `sudo scripts/laurel/root-add-metal-ios26.sh MOUNTED_ROOT` | bundle, probes, clients, env, `stack/`, CAEnable* preferences, jetsam, XNUtils with the options screen |
 | Host chain | `scripts/ios26/metal-corpus.sh all`, `scripts/ios26/turnip-host.sh`, `scripts/ios26/ir3-check.sh` | evidence files |
 
 No launchd job, no wrapper. Clients: `* -chronod -cameracaptured -WidgetRenderer_Default -PosterBoard`: Hot's list on 23F84; those have CPU paths, and `_RB4` render targets remain open there. `METAL_CLIENTS=` replaces it. Lines at boot:
@@ -290,3 +291,136 @@ NMTL[.. backboardd]: LAUREL METAL26: screen: L of 64 samples lit, ...
 
 Failure on iOS 26 has **no fallback**: `LAUREL METAL26: off: ...: CA::WindowServer::AccelServer::renderer has no renderer, the screen stays as it is`. USB log and SSH stay. There is no GL on 23F84 (`ios26-userland.md` 8.1).
 
+
+## 10. Second Metal option, switch and bench
+
+**Nothing here ran on the phone. No fps number exists for either option.** The host can say what differs and what compiles. Only the bench on the phone can choose the better option.
+
+### 10.1 Candidates
+
+All candidates are metal2vulkan + Turnip. None was made for an A610.
+
+| Candidate | What is really different | License | Builds for 23F84 | Fits the A610 | Verdict |
+|---|---|---|---|---|---|
+| Ours (`default`): `out/ios26/metal` | metal2vulkan 219f013 (the newer one), ios-flame frontend + our `flame-ios26` patch (which takes the Hot fixes of section 3.1) | ios-flame MIT, metal2vulkan GPL-2.0-or-later OR LGPL-3.0-or-later | Yes [V host] | 141 of 154 pipelines made, FD610 [V host] | **The default** |
+| IOS-26-Hot `phone/metal2` (d249939): `out/ios26/metal-hot` | **Another translator:** metal2vulkan 720ef1ce (817 commits older than ours) + 19 own patches. Its frontend, same flame lineage, written for 23F84. The only one with a reported compositor run on 23F84 on a6xx (A640, their log) | MIT, metal2vulkan as above | Yes: all 19 patches apply, links with our plug-in + `hot-ios26` [V host]. We do not use its newer Mesa or `tu_knl_darwin` | 139 of 154 made, FD610 [V host] | **The real second option: `hot`** |
+| AdrenoMetal (831a9dc) | Same frontend lineage. The difference is its NativeAdreno KMD for an A740, which we cannot use: our Turnip goes through the msm stand-in on RedwoodGPU | MIT | Not tried: nothing new above the KMD | KMD: no | Not an option |
+| hakios-dada `gpu2/` (f1ae906) | metal2vulkan 720ef1c (the base of Hot), or 0dfdbcd + patches; Mesa 85fda3b; A830 | MIT, APSL | Not tried | Mesa + KMD aimed at A830: no | Not an option: same translator as Hot, no A610 path |
+| metal2vulkan-inferno (f9832ce, `make references`) | July snapshot of upstream, translator only, already in our submodule history. No frontend, no plug-in | LGPL-3.0-or-later | Not a stack | No | Not an option |
+
+Tested with `scripts/ios26/ir3-check.sh` on the real compile for FD610 (`IR3_OUT` per stack), compared by `scripts/ios26/stack-compare.py`. Output: `ios26-evidence/metal-stacks-summary.txt`, per pipeline `ios26-evidence/metal-stacks.tsv` [V host]:
+
+| Result | default | hot |
+|---|---:|---:|
+| Pipelines made (of 154; all 13 tile kernels refused by both) | **141** | 139 |
+| Refused only by this stack | none | `simple_rim_lpf`, `simple_rim_lph`: `TexelOffset` needs `Maintenance8` |
+| Fragment instructions, median of 128 | **93.5** | 194.5 |
+| Vertex instructions, median of 128 | **38** | 98 |
+| Fragment shaders that are smaller in this stack | 110 | 4 |
+| `ca_generic_lph_cph` fragment | 63,688 | **1,057** |
+| `ca_generic_lph_cpf` fragment | 55,193 | **4,570** |
+| `glass_background_lph` fragment | 837 | 937 |
+| `glass_background_sdf_lph` fragment | 1,703 | 2,780 |
+| `asg_frag_lph` fragment | 593 | 2,276 |
+
+What this says, and what it does not:
+
+- [V host] The two stacks differ in a large way. So a bench between them is a real comparison, not a label.
+- [V host] `hot` has about 2 times the median instructions per shader. On the 4 `ca_generic` fragment shaders `default` has 12 to 60 times the instructions of `hot`. Those are the 4 that `hot` wins.
+- [U] Which one wins on the phone. A static instruction count is not frame time. `ca_generic` uses function constants, and CA's real keys are not known on the host (section 4.1). If CA uses a key near my test key, `default` pays very much. If not, `hot` pays about 2 times on most layers. Cause of the difference on `ca_generic`: not found.
+- [I] Why `default` stays the default: it makes more pipelines, it has fewer instructions on 110 of 128, and it is the translator of the iOS 16 build. Against it: `hot` has a reported compositor run on a6xx on 23F84, and `default` has none. If `hot` wins the bench, change one word in the selector: `NMTL_OPTION_DEFAULT`, and swap the folder names in `ios26-metal-options.sh`.
+- [I] `simple_rim_*` is a Liquid Glass shader. With the bypass on (the default) CA should not ask it. With live glass on `hot`, expect a missing pipeline there.
+
+### 10.2 The setting and the selector
+
+| Item | Where |
+|---|---|
+| Bundle | `NegroniMetal.bundle/NegroniMetal` = the selector (`userland/laurel/metal/option/option_select.m`), class `NegroniMTLDevice`; the stacks are `options/default/NegroniMetal` and `options/hot/NegroniMetal`, class `NegroniMTLDeviceImpl`; Turnip is shared |
+| Setting | `/private/var/db/negronimetal/option`, first word: `default` or `hot`. A sandboxed process reads `BUNDLE/option.local`. Read once, at the device open |
+| State | `/private/var/db/negronimetal/stack/{state,ok,failed,active}` |
+| Build | `scripts/bg.sh ios26-metal-all scripts/laurel/ios26-metal-options.sh`, output `out/ios26/metal-all/stage` + `out/ios26/xnutils/root` |
+| Install | `root-add-metal-ios26.sh` takes that stage (section 9) |
+| Rule, host test | `option_rule.h`, `present_stats.h`; `scripts/laurel/option-rule-test.sh` |
+
+The two stacks are separate images because their Objective-C classes have the same names. One process never loads both. **So a change needs a process restart.** For the compositor: Restart UI, which XNUtils offers at each change. Without it, the old stack stays until the next start. A change causes no restart by itself.
+
+A bad or missing setting is the default.
+
+### 10.3 Failure goes back to the default
+
+Only backboardd counts. Its lines:
+
+```
+NMTL[.. backboardd]: LAUREL METAL: on: stack hot (setting hot)
+NMTL[.. backboardd]: LAUREL METAL26: on: stack hot: the screen is lit 60 s after the first frame
+NMTL[.. backboardd]: LAUREL METAL: off: option hot failed in 2 starts of the compositor: stack default
+NMTL[.. backboardd]: LAUREL METAL: off: stack hot: no frame in 240 s: restart on stack default
+NMTL[.. backboardd]: LAUREL METAL: off: stack hot: the screen surface stayed black for 30 s after a frame: restart on stack default
+NMTL[.. backboardd]: LAUREL METAL: off: stack hot gave no device: restart on stack default
+NMTL[.. backboardd]: LAUREL METAL: off: option hot does not load: <dyld text>: stack default
+NMTL[.. backboardd]: LAUREL METAL: off: option junk is not in this bundle: stack default
+```
+
+| Event | What happens | Time to the default |
+|---|---|---|
+| Setting missing, bad, or no such option | The default | At this start |
+| The image of the option does not load | The default, in this process: nothing of the other stack came in | At this start |
+| The option gives no device | `failed` mark, `_exit(0)`; launchd starts backboardd | Next start |
+| No frame on a screen surface in 240 s; or black for 30 s after a frame | `failed` mark, `_exit(0)` | 240 s or 30 s, plus one start |
+| Crash, a hang that the watchdog kills, or Restart UI before 60 s of lit screen | The next start counts one failure. **Two** failures: the default | Two starts |
+| Lit for 60 s | `ok` mark: the count goes to 0. The screen check of this start ends, so a later display sleep is no failure | - |
+
+The state stays until the setting is written again, so a loop cannot come back to the option by itself. To retry: choose the option again. XNUtils clears the counts.
+
+**If the default itself fails, there is no other path:** 23F84 has no GL (section 9). The selector cannot help there. This is not "never black" for the whole route. It is "an option never makes it worse than the default".
+
+Limits [I]:
+
+- Two Restart UI within 60 s of a start each count as a failure of a good option. The bench screen shows the reason, and a new choice clears it.
+- A sandboxed client cannot read the state. So when the compositor is back on the default, an app can still take the option through `option.local`. The app has its own strikes and does not affect the compositor.
+- On a read-only system volume `option.local` stays as it was. The helper prints `OPTION_LOCAL=not written`.
+- The lit check samples 64 pixels. A fully black start screen looks like a failure and goes to the default.
+
+### 10.4 XNUtils
+
+Build with `XNUTILS_IOS26=1` (`out/ios26/xnutils`). The default iOS 16 build has none of this: every part is under `XT_IOS26`.
+
+Switches section -> **Metal options and bench** (`userland/laurel/xnutils/bench.m`):
+
+| Row | Helper verb | Applies | Choices |
+|---|---|---|---|
+| Metal stack (shows the setting, what backboardd runs, and why) | `metaloption` | After Restart UI | `default`, `hot` |
+| Turnip mode: the `TU_DEBUG` line of the env file; both flags exist in Mesa 25.0.7 `tu_util.cc` [V] | `tumode` | After Restart UI; only processes that can read `/var/db` | `auto`, `sysmem`, `gmem` |
+| Glass: the bypass of section 4.2 | `liveglass` | Within 5 s | `off`, `on` |
+| Restart UI | `restart-ui` | - | - |
+
+Host test: `scripts/laurel/xnutils-test.sh`, the verbs on a folder as uid 0 of a user namespace.
+
+### 10.5 Bench
+
+**Run the bench**: 2 s warm-up, 12 s measured. One fixed scene: a gradient, 60 translucent cards moved by a fixed function of time, one blur bar. The app does not link Metal.
+
+| Number | Source | Means |
+|---|---|---|
+| `client_fps`, `client_p50/p95/max_ms` | `CADisplayLink` intervals in the app | How well the app gets its callbacks. **It can stay high while the compositor is slow**, so it is not the main number |
+| `present_fps`, `present_p50/p95/max_ms`, `presents` | backboardd: each command buffer that wrote a screen-size surface, ms from commit to GPU completion (frontend patches `0002`, both stacks; `NegroniMetal.mm` `bench_serve`) | **The main number** to compare |
+
+Each run appends one tab-separated line to `Documents/xnutils-bench.tsv`: date, stack, setting, Turnip, glass, scene, then the numbers. The screen lists the runs, newest first. A tap copies all. If backboardd does not answer in 3 s, the present fields are `-`, never a made-up value.
+
+Limits [I]: a frame that CA draws in more than one screen-size command buffer counts more than once, so compare `present_fps` between runs of this bench, not with other reports. Histogram bins are 1 ms; the last bin holds 127 ms and more. There is no panel number: `FPS (panel swaps)` in the report needs a kernel line that the iOS 26 kernel track does not promise. The compositor pays one `access()` each 500 ms, always.
+
+To compare: `default` + bypass, then `hot` + bypass, then each + `sysmem`; each after Restart UI and 60 s of idle. Keep the option with the higher `present_fps` and the lower p95.
+
+### 10.6 The tricks of the references, for the A610 (`a6xx_gen1_low`, 1 SP, GMEM 132 KiB)
+
+| Trick (source) | Fits the A610? | State here |
+|---|---|---|
+| Selective `CABackdropLayer` bypass (Hot) | **Yes, more than on the A640:** GPU time per frame is about 1.8 times at 300 MHz [I section 8], so each capture pass costs more | Ported, on by default, off with `live-glass` (section 4.2) |
+| Refusal of `MTLStitchedLibraryDescriptor` and dynamic libraries (Hot) | Yes: frontend matter, no GPU part | Ported (section 3.1) |
+| Function and library SHA-256 hashes, `NBResidencySet`, refusing encoders (Hot) | Yes: frontend matter | Ported (section 3.1) |
+| `SwapEnd` selector 5, 0x588 bytes; `IOSurface` sizes (Hot 0141, 0142) | Yes, same 23F84 | Kernel needs K4, K5; checked against the binary [V] |
+| Fence sleep: 50 us spin + 250 us sleeps (Hot 0151) | Yes, and more useful: a weak CPU pays more for polling [I] | Kernel need K7, not done here: the kernel track owns it |
+| Shader priming at boot (Hot) | With care: their 21 pipelines in 1.4 s were on an A76, warm. Ours are about 175 ms each cold [V iOS 16: 6 in 1052 ms], about 25 s for 139+ | Not ported. It needs a launchd job, and launchd.plist is signed (section 9). The persistent cache gives most of the gain after the first boot [I] |
+| Texture pool (Hot) | Unknown: it trades memory for speed, and our pool is 512 MiB | Not ported. Add it only if the bench shows allocation cost |
+| `nocb` debug flag (Hot) | Not in Mesa 25.0.7 [V] | Not usable |
+| `TU_FETCH_GMEM_MIN_DRAWS` (Hot) | Not in Mesa 25.0.7 [V] | Not usable. `tumode sysmem` and `gmem` are the real switches here |
