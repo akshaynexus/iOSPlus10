@@ -44,6 +44,9 @@ Gold cpufreq domain 0xf523000, PAS IDs (modem 4, ADSP 1, zap 13), touch bus QUP0
   topaz `userland/audio/audio_plugin.c:967-997` writes `/dev/redwood-haptic`; that kernel device (HackiOS) is not in
   topaz. Reference: our negroni haptics work (`docs/haptics-plan.md`).
 
+- **Cellular (dual SIM):** kernel QMI client on TopazModem's QRTR (UIM/NAS/DMS/WDS), patch 2760; radio ONLINE waits for
+  the IPA v4.2 AP side (step 2). Details: `docs/laurel_sprout/cellular.md`.
+
 ## Build order
 
 1. Kernel builds on Linux with the 201 topaz patches (scripts/laurel/kernel-linux.sh). Done when it links.

@@ -1,0 +1,1243 @@
+laurel 2760: cellular step 1 on the Mi A3 (SM6125, modem MPSS.AT.4.3.1, dual nano-SIM DSDS): a kernel QMI client on TopazModem's QRTR (GLINK IPCRTR over SMEM), bsd/dev/laurel_cell.c. One QRTR port per client (0x4010 UIM, 0x4011/0x4012 NAS for the primary/secondary subscription, 0x4013 DMS, 0x4014 WDS; below the tftp session ports 0x4100+), started by the modem's NEW_SERVER broadcasts, dropped on DEL_SERVER, requests matched by message id + txn, 10 s timeout, 2 tries. UIM 0x0B: REGISTER_EVENTS (card status), GET_CARD_STATUS for slot 1 and slot 2, card status indications (hot swap); when the modem did not provision a session itself, CHANGE_PROVISIONING_SESSION (first present card -> primary GW, second -> secondary GW, USIM before SIM, as qcrild/ModemManager/hackios-scion). DMS 0x02: GET_REVISION, GET_OPERATING_MODE. NAS 0x03: BIND_SUBSCRIPTION per client (1-byte enum, 4-byte on MALFORMED/INVALID_ARG), GET_SERVING_SYSTEM + GET_SIGNAL_INFO every 10 s when the modem is online. WDS 0x01: 3GPP profile 1 APN; START_NETWORK not sent. Radio self-check: SET_OPERATING_MODE online needs the AP side of IPA (INIT_MODEM_DRIVER over QMI 0x31), which this kernel does not have yet, so the modem stays in low power mode (SIM status works, registration/signal do not): hackios-scion (SM7325) saw the modem crash in enl2_dl seconds after ONLINE while its IPA task waited for the AP, and a modem crash here also stops Wi-Fi. TopazModem.cpp hooks: NEW_SERVER/DEL_SERVER -> laurel_cell_server, svc_rx -> laurel_cell_rx, modem_watch loop -> laurel_cell_poll, every modem failure path (modem=0, soc map, PAS boot, SMP2P, GLINK, crash, watch end) -> laurel_cell_off; topaz_qrtr_data/topaz_qrtr_services exported. One line 'LAUREL CELL: on: SIM1 present (USIM ready), SIM2 absent; modem low power; radio off: <why>' (again on a change of SIM/registration/PLMN/radio, not of signal) or 'LAUREL CELL: off: <why>'; sysctl kern.laurel_cell = the same text with the live signal. ICCID, IMSI and IMEI are never read or logged. Kill switch cell=0. Details: docs/laurel_sprout/cellular.md.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -123,6 +123,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/laurel_reboot.c			standard
++bsd/dev/laurel_cell.c			standard
+ bsd/dev/laurel_bt.c			standard
+ bsd/dev/laurel_bt_clk.c			standard
+ bsd/dev/laurel_bt_uart.c			standard
+diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
+--- a/bsd/dev/laurel_cell.c
++++ b/bsd/dev/laurel_cell.c
+@@ -0,0 +1,1094 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) cellular, step 1 (laurel 2760): a kernel QMI client for the modem's
++ * UIM, NAS, DMS and WDS services over TopazModem's QRTR (GLINK "IPCRTR" over SMEM). On by default;
++ * kill switch cell=0 (no QMI client at all).
++ *
++ * What it does (docs/laurel_sprout/cellular.md):
++ *  - UIM 0x0B: REGISTER_EVENTS (card status), GET_CARD_STATUS for slot 1 and slot 2 (dual nano-SIM,
++ *    DSDS); when the modem did not provision a session by itself, CHANGE_PROVISIONING_SESSION: the
++ *    first present card -> primary GW session, the second -> secondary GW session (as qcrild /
++ *    ModemManager do); card status indications (hot swap) are followed.
++ *  - DMS 0x02: GET_REVISION, GET_OPERATING_MODE. SET_OPERATING_MODE online only when a SIM has a
++ *    provisioned session AND the AP side of IPA is up (self-check ipa_up). Step 1 has no IPA driver,
++ *    so the radio stays in the mode the modem boots in (low power): SIM status works there (as in
++ *    Android's airplane mode), registration and signal do not. Why: hackios-scion (SM7325, same QMI/IPA
++ *    design) saw the modem crash in its LTE L2 task enl2_dl a few seconds after ONLINE while the modem's
++ *    IPA task waited for the AP (docs/ru/cellular.md runs 23-28); a modem crash here also stops Wi-Fi
++ *    (the WLAN firmware runs on the modem), and topaz has no modem restart.
++ *  - NAS 0x03: one client per subscription (BIND_SUBSCRIPTION primary / secondary); when the modem is
++ *    online: GET_SERVING_SYSTEM (registration, PLMN, radio) and GET_SIGNAL_INFO (rssi / rsrp) every 10 s.
++ *  - WDS 0x01: GET_PROFILE_SETTINGS of 3GPP profile 1 (the APN). START_NETWORK is NOT sent: this kernel
++ *    has no IPA/GSI data path, and a data call without the AP IPA side can make the modem restart,
++ *    which stops Wi-Fi too (the WLAN firmware runs on the modem).
++ * One QRTR port per client (QMI over QRTR has no QMI_CTL client ids): 0x4010-0x4014, below
++ * TopazModem's tftp session ports (0x4100+). Everything runs in the modem watch thread (TopazModem
++ * modem_watch calls laurel_cell_poll every loop and laurel_cell_rx for our ports): no lock is needed
++ * except for the status text that the sysctl kern.laurel_cell reads.
++ *
++ * Result line (also repeated when it changes: SIM, registration, PLMN or radio; not for signal changes):
++ *   "LAUREL CELL: on: SIM1 present (USIM ready), SIM2 absent; modem low power; radio off: <why>"     (step 1)
++ *   "LAUREL CELL: on: SIM1 present (USIM ready), SIM2 absent; modem online; SIM1 registered 404-45 LTE rssi -71 rsrp -98"
++ *   "LAUREL CELL: off: <reason>"
++ * Privacy: ICCID, IMSI and IMEI are never read or logged by this file.
++ * A failure turns off only the cellular client; the modem, Wi-Fi, USB and the boot go on.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++
++/* TopazModem.cpp (laurel 2760 hooks) */
++extern void topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len);
++extern uint32_t topaz_qrtr_services(void);
++
++/* ours, called by TopazModem.cpp */
++bool laurel_cell_enabled(void);
++void laurel_cell_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port, bool up);
++bool laurel_cell_rx(uint32_t dst_port, const uint8_t *d, uint32_t len);
++void laurel_cell_poll(bool ready, bool glink);
++void laurel_cell_off(const char *why);
++
++#define SAY(...)            printf("LAUREL CELL: " __VA_ARGS__)
++#define LOG(...)            printf("LaurelCell: " __VA_ARGS__)
++
++#define QMI_REQ             0
++#define QMI_RESP            2
++#define QMI_IND             4
++
++#define SVC_WDS             0x01
++#define SVC_DMS             0x02
++#define SVC_NAS             0x03
++#define SVC_UIM             0x0B
++
++/* message ids (libqmi qmi-service-*.json [V]; NAS BIND_SUBSCRIPTION from Qualcomm's NAS IDL [I]) */
++#define DMS_GET_REVISION    0x0023
++#define DMS_GET_OPMODE      0x002D
++#define DMS_SET_OPMODE      0x002E
++#define UIM_REGISTER_EVENTS 0x002E
++#define UIM_GET_CARD_STATUS 0x002F
++#define UIM_CARD_STATUS_IND 0x0032
++#define UIM_CHANGE_PROV     0x0038
++#define NAS_SERVING_SYSTEM  0x0024
++#define NAS_SIGNAL_INFO     0x004F
++#define NAS_BIND_SUBS       0x0045
++#define WDS_PROFILE_GET     0x002B
++
++#define QMI_ERR_MALFORMED   0x0001
++#define QMI_ERR_NO_EFFECT   0x001A
++#define QMI_ERR_INVALID_ARG 0x0030
++#define QMI_ERR_INVALID_CMD 0x0047
++
++#define REQ_TIMEOUT_MS      10000u
++#define REQ_TRIES           2u
++#define SVC_WAIT_MS         60000u              /* UIM service after modem READY */
++#define READY_WAIT_MS       90000u              /* modem READY after the modem thread started */
++#define REG_WAIT_MS         120000u             /* first "on" line at the latest this long after online */
++#define NAS_PERIOD_MS       10000u
++#define SAY_MIN_GAP_MS      10000u
++
++enum { C_UIM, C_NAS1, C_NAS2, C_DMS, C_WDS, C_N };
++
++struct qc {
++	const char *name;
++	uint32_t svc, port;                     /* service id, our QRTR port */
++	uint32_t node, sport;                   /* the modem's server */
++	bool up;
++	uint16_t txn, want;                     /* last txn; message waited for (0 = idle) */
++	uint64_t sent;                          /* ms */
++	uint8_t tries;
++	uint8_t buf[256];                       /* last request (for the retry) */
++	uint32_t len;
++};
++
++static struct qc qc[C_N] = {
++	[C_UIM]  = { .name = "uim",  .svc = SVC_UIM, .port = 0x4010 },
++	[C_NAS1] = { .name = "nas1", .svc = SVC_NAS, .port = 0x4011 },
++	[C_NAS2] = { .name = "nas2", .svc = SVC_NAS, .port = 0x4012 },
++	[C_DMS]  = { .name = "dms",  .svc = SVC_DMS, .port = 0x4013 },
++	[C_WDS]  = { .name = "wds",  .svc = SVC_WDS, .port = 0x4014 },
++};
++
++/* card status, per slot (0 = SIM1, 1 = SIM2) */
++#define SLOTS 2
++struct slot {
++	bool known;
++	uint8_t card;                           /* 0 absent, 1 present, 2 error */
++	uint8_t error;
++	bool app;                               /* a SIM/USIM application */
++	uint8_t app_type, app_state, aid_len, aid[32];
++	uint8_t prov_tries;
++	int sub;                                /* -1 none, 0 primary, 1 secondary subscription */
++};
++static struct slot slot[SLOTS];
++static uint16_t idx_gw[2] = { 0xFFFF, 0xFFFF };  /* primary / secondary GW app index (slot << 8 | app) */
++
++/* per subscription (0 primary = nas1, 1 secondary = nas2) */
++struct reg {
++	bool bound, bind_wide, valid, sig;      /* sig: one GET_SIGNAL_INFO answer since online */
++	uint8_t state, ps, rat;                 /* registration state, PS attach, radio interface */
++	uint16_t mcc, mnc;
++	bool mnc3;
++	char op[20];
++	int rssi, rsrp;                         /* dBm, 0 = unknown */
++	uint64_t next;                          /* next poll, ms */
++	uint8_t step;                           /* 0 serving system, 1 signal */
++};
++static struct reg reg[2];
++
++static int opmode = -1;                         /* DMS operating mode */
++static bool online_sent, rev_done, uim_events_done, wds_done;
++/*
++ * Self-check of the radio: the AP side of IPA (INIT_MODEM_DRIVER done over QMI 0x31, GSI up). No IPA
++ * driver in this kernel yet (step 2, docs/laurel_sprout/cellular.md), so this stays false and the
++ * modem is never set online.
++ */
++static bool ipa_up;
++static const char *radio_why = "no AP IPA driver yet (QMI 0x31 INIT_MODEM_DRIVER): ONLINE without it can crash "
++    "the modem and with it Wi-Fi";
++static char revision[48], apn[48];
++static uint64_t t_start, t_ready, t_online;
++static int state;                               /* 0 running, 1 said on, -1 said off */
++static bool enabled_read, enabled;
++static char said_key[400];                     /* = sizeof(status_text) */
++static uint64_t said_at;
++
++static LCK_GRP_DECLARE(cell_grp, "laurel_cell");
++static LCK_MTX_DECLARE(cell_lock, &cell_grp);
++static char status_text[400] = "not started";
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t t, ns;
++
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns / 1000000u;
++}
++
++static void
++set_status(const char *s)
++{
++	lck_mtx_lock(&cell_lock);
++	strlcpy(status_text, s, sizeof(status_text));
++	lck_mtx_unlock(&cell_lock);
++}
++
++static int
++cell_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char buf[sizeof(status_text)];
++
++	lck_mtx_lock(&cell_lock);
++	strlcpy(buf, status_text, sizeof(buf));
++	lck_mtx_unlock(&cell_lock);
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, laurel_cell, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, cell_sysctl, "A", "LAUREL cellular status (SIM 1/2, registration, signal; no ICCID/IMSI/IMEI)");
++
++bool
++laurel_cell_enabled(void)
++{
++	if (!enabled_read) {
++		uint32_t on = 1;
++		(void)PE_parse_boot_argn("cell", &on, sizeof(on));
++		enabled = on != 0;
++		enabled_read = true;
++		if (!enabled) {
++			state = -1;
++			SAY("off: boot-arg cell=0\n");
++			set_status("off: boot-arg cell=0");
++		}
++	}
++	return enabled;
++}
++
++static void __printflike(1, 2)
++cell_off(const char *fmt, ...)
++{
++	char why[200];
++	va_list ap;
++
++	if (state == -1) {
++		return;
++	}
++	va_start(ap, fmt);
++	vsnprintf(why, sizeof(why), fmt, ap);
++	va_end(ap);
++	state = -1;
++	SAY("off: %s\n", why);
++	char s[sizeof(status_text)];
++	snprintf(s, sizeof(s), "off: %s", why);
++	set_status(s);
++}
++
++void
++laurel_cell_off(const char *why)
++{
++	if (!laurel_cell_enabled()) {
++		return;
++	}
++	cell_off("%s", why);
++}
++
++/* ---------------------------------------------------------------- QMI messages */
++
++struct qb { uint8_t b[256]; uint32_t n; };
++
++static void
++qb_init(struct qb *m, uint16_t msg)
++{
++	bzero(m->b, 7);
++	m->b[0] = QMI_REQ;
++	memcpy(m->b + 3, &msg, 2);
++	m->n = 7;
++}
++
++static void
++qb_tlv(struct qb *m, uint8_t type, const void *v, uint16_t len)
++{
++	if (m->n + 3u + len > sizeof(m->b)) {
++		return;
++	}
++	m->b[m->n] = type;
++	memcpy(m->b + m->n + 1, &len, 2);
++	memcpy(m->b + m->n + 3, v, len);
++	m->n += 3u + len;
++}
++
++static void
++qc_send_raw(struct qc *c)
++{
++	memcpy(c->buf + 1, &c->txn, 2);
++	topaz_qrtr_data(c->port, c->node, c->sport, c->buf, c->len);
++	c->sent = now_ms();
++}
++
++static void
++qc_send(struct qc *c, struct qb *m)
++{
++	uint16_t l = (uint16_t)(m->n - 7), msg;
++
++	memcpy(m->b + 5, &l, 2);
++	memcpy(&msg, m->b + 3, 2);
++	memcpy(c->buf, m->b, m->n);
++	c->len = m->n;
++	c->txn = (uint16_t)(c->txn + 1 == 0 ? 1 : c->txn + 1);
++	c->want = msg;
++	c->tries = 1;
++	qc_send_raw(c);
++}
++
++static void
++qc_simple(int i, uint16_t msg)
++{
++	struct qb m;
++
++	qb_init(&m, msg);
++	qc_send(&qc[i], &m);
++}
++
++/* TLV lookup in a QMI message (7-byte header) */
++static const uint8_t *
++tlv(const uint8_t *d, uint32_t len, uint8_t type, uint16_t *tlen)
++{
++	uint32_t o = 7;
++
++	while (o + 3 <= len) {
++		uint16_t l;
++		memcpy(&l, d + o + 1, 2);
++		if (o + 3u + l > len) {
++			break;
++		}
++		if (d[o] == type) {
++			*tlen = l;
++			return d + o + 3;
++		}
++		o += 3u + l;
++	}
++	return NULL;
++}
++
++/* QMI result TLV 0x02: 0 = success, else the QMI error (0xFFFF: no result TLV) */
++static uint16_t
++qerr(const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0, r[2];
++	const uint8_t *v = tlv(d, len, 0x02, &l);
++
++	if (v == NULL || l < 4) {
++		return 0xFFFF;
++	}
++	memcpy(r, v, 4);
++	return r[0] == 0 ? 0 : (r[1] != 0 ? r[1] : 0xFFFE);
++}
++
++/* ---------------------------------------------------------------- texts */
++
++static const char *
++app_type_name(uint8_t t)
++{
++	switch (t) {
++	case 1: return "SIM";
++	case 2: return "USIM";
++	case 3: return "RUIM";
++	case 4: return "CSIM";
++	case 5: return "ISIM";
++	default: return "app";
++	}
++}
++
++static const char *
++app_state_name(uint8_t s)
++{
++	switch (s) {
++	case 1: return "detected";
++	case 2: return "PIN required";
++	case 3: return "PUK required";
++	case 4: return "personalization check";
++	case 5: return "PIN blocked";
++	case 6: return "illegal";
++	case 7: return "ready";
++	default: return "unknown state";
++	}
++}
++
++static const char *
++rat_name(uint8_t r)
++{
++	switch (r) {
++	case 1: return "CDMA";
++	case 2: return "EVDO";
++	case 4: return "GSM";
++	case 5: return "UMTS";
++	case 8: return "LTE";
++	case 9: return "TD-SCDMA";
++	case 12: return "NR5G";
++	default: return "no radio";
++	}
++}
++
++static const char *
++opmode_name(int m)
++{
++	switch (m) {
++	case 0: return "online";
++	case 1: return "low power";
++	case 2: return "factory test";
++	case 3: return "offline";
++	case 4: return "resetting";
++	case 5: return "shutting down";
++	case 6: return "persistent low power";
++	case 7: return "mode-only low power";
++	default: return "mode unknown";
++	}
++}
++
++/* ---------------------------------------------------------------- report */
++
++static bool
++sim_present(int s)
++{
++	return slot[s].known && slot[s].card == 1;
++}
++
++static int
++sub_slot(int sub)
++{
++	uint16_t i = idx_gw[sub];
++	if (i == 0xFFFF || (i >> 8) >= SLOTS) {
++		return -1;
++	}
++	return i >> 8;
++}
++
++/* the summary; key = the same without the signal values (a change of key = a new line) */
++static void
++summary(char *out, size_t max, bool with_signal)
++{
++	size_t n = 0;
++
++	out[0] = 0;
++	for (int s = 0; s < SLOTS; s++) {
++		struct slot *k = &slot[s];
++		const char *sep = s == 0 ? "" : ", ";
++		if (!k->known) {
++			n += snprintf(out + n, max - n, "%sSIM%d unknown", sep, s + 1);
++		} else if (k->card == 0) {
++			n += snprintf(out + n, max - n, "%sSIM%d absent", sep, s + 1);
++		} else if (k->card == 2) {
++			n += snprintf(out + n, max - n, "%sSIM%d card error %u", sep, s + 1, k->error);
++		} else if (!k->app) {
++			n += snprintf(out + n, max - n, "%sSIM%d present (no SIM/USIM application)", sep, s + 1);
++		} else {
++			n += snprintf(out + n, max - n, "%sSIM%d present (%s %s)", sep, s + 1, app_type_name(k->app_type),
++			    app_state_name(k->app_state));
++		}
++		if (n >= max) {
++			return;
++		}
++	}
++	n += snprintf(out + n, max - n, "; modem %s", opmode_name(opmode));
++	if (n < max && opmode != 0 && sub_slot(0) >= 0 && !ipa_up) {
++		n += snprintf(out + n, max - n, "; radio off: %s", radio_why);
++	}
++	for (int sub = 0; sub < 2 && n < max && opmode == 0; sub++) {
++		int s = sub_slot(sub);
++		struct reg *r = &reg[sub];
++		if (s < 0) {
++			continue;
++		}
++		if (!qc[sub == 0 ? C_NAS1 : C_NAS2].up) {
++			n += snprintf(out + n, max - n, "; SIM%d: no NAS service", s + 1);
++			continue;
++		}
++		if (!r->valid) {
++			n += snprintf(out + n, max - n, "; SIM%d: no serving system yet", s + 1);
++			continue;
++		}
++		switch (r->state) {
++		case 1:
++			n += snprintf(out + n, max - n, "; SIM%d registered %03u-%0*u %s%s%s", s + 1, r->mcc, r->mnc3 ? 3 : 2, r->mnc,
++			    r->op[0] ? r->op : "", r->op[0] ? " " : "", rat_name(r->rat));
++			break;
++		case 2:
++			n += snprintf(out + n, max - n, "; SIM%d searching", s + 1);
++			break;
++		case 3:
++			n += snprintf(out + n, max - n, "; SIM%d registration denied", s + 1);
++			break;
++		default:
++			n += snprintf(out + n, max - n, "; SIM%d not registered", s + 1);
++			break;
++		}
++		if (with_signal && n < max && r->rssi != 0) {
++			n += snprintf(out + n, max - n, " rssi %d", r->rssi);
++		}
++		if (with_signal && n < max && r->rsrp != 0) {
++			n += snprintf(out + n, max - n, " rsrp %d", r->rsrp);
++		}
++	}
++	if (n < max && sub_slot(0) >= 0 && qc[C_WDS].up && wds_done) {
++		n += snprintf(out + n, max - n, "; data off (no IPA path; APN \"%s\")", apn[0] ? apn : "?");
++	}
++}
++
++/* SET_OPERATING_MODE online sent, answer or GET_OPERATING_MODE not back yet */
++static bool
++online_pending(void)
++{
++	return online_sent && t_online == 0 && qc[C_DMS].up && qc[C_DMS].want != 0;
++}
++
++/* is the state final enough for the first "on" line? */
++static bool
++settled(uint64_t now)
++{
++	bool late = now - t_ready > SVC_WAIT_MS;        /* do not wait longer for DMS / WDS answers */
++
++	if (!slot[0].known || !slot[1].known || qc[C_UIM].want != 0) {
++		return false;                   /* card status or provisioning in flight */
++	}
++	if (qc[C_DMS].up && (opmode < 0 || online_pending()) && !late) {
++		return false;
++	}
++	if (sub_slot(0) >= 0 && qc[C_WDS].up && !wds_done && !late) {
++		return false;
++	}
++	if (sub_slot(0) < 0 || !ipa_up || opmode != 0) {
++		return true;                    /* no provisioned SIM, or the radio stays off: nothing more comes */
++	}
++	for (int sub = 0; sub < 2; sub++) {
++		if (sub_slot(sub) >= 0 && (!reg[sub].valid || !reg[sub].sig || reg[sub].state != 1)) {
++			return t_online != 0 && now - t_online > REG_WAIT_MS;
++		}
++	}
++	return true;
++}
++
++static void
++report(uint64_t now)
++{
++	char key[sizeof(status_text)], full[sizeof(status_text)];
++
++	summary(full, sizeof(full), true);
++	char s[sizeof(status_text)];
++	snprintf(s, sizeof(s), "%s: %s", state == 1 ? "on" : (state == -1 ? "off" : "starting"), full);
++	if (state != -1) {
++		set_status(s);
++	}
++	if (state == -1 || !settled(now)) {
++		return;
++	}
++	summary(key, sizeof(key), false);
++	if (state == 1 && (strcmp(key, said_key) == 0 || now - said_at < SAY_MIN_GAP_MS)) {
++		return;
++	}
++	state = 1;
++	strlcpy(said_key, key, sizeof(said_key));
++	said_at = now;
++	SAY("on: %s\n", full);
++	snprintf(s, sizeof(s), "on: %s", full);
++	set_status(s);
++}
++
++/* ---------------------------------------------------------------- UIM */
++
++/* card status TLV (0x10 of the response and of the indication), libqmi "Card Status" layout */
++static bool
++parse_card_status(const uint8_t *v, uint16_t l)
++{
++	uint32_t o = 0;
++	uint8_t cards;
++
++	if (l < 9) {
++		return false;
++	}
++	memcpy(&idx_gw[0], v + 0, 2);
++	memcpy(&idx_gw[1], v + 4, 2);
++	cards = v[8];
++	o = 9;
++	for (int s = 0; s < SLOTS; s++) {
++		slot[s].known = true;           /* a slot that is not listed is empty */
++		slot[s].card = 0;
++		slot[s].app = false;
++	}
++	for (unsigned c = 0; c < cards; c++) {
++		uint8_t apps;
++		if (o + 6 > l) {
++			return false;
++		}
++		struct slot *k = c < SLOTS ? &slot[c] : NULL;
++		if (k != NULL) {
++			k->card = v[o];
++			k->error = v[o + 4];
++		}
++		apps = v[o + 5];
++		o += 6;
++		for (unsigned a = 0; a < apps; a++) {
++			uint8_t type, st, aid_len;
++			if (o + 7 > l) {
++				return false;
++			}
++			type = v[o];
++			st = v[o + 1];
++			aid_len = v[o + 6];
++			if (o + 7u + aid_len + 7u > l) {
++				return false;
++			}
++			/* the first USIM wins, else the first SIM */
++			if (k != NULL && (type == 2 || (type == 1 && !k->app))) {
++				if (!k->app || k->app_type != 2) {
++					k->app = true;
++					k->app_type = type;
++					k->app_state = st;
++					k->aid_len = (uint8_t)MIN(aid_len, (uint8_t)sizeof(k->aid));
++					memcpy(k->aid, v + o + 7, k->aid_len);
++				}
++			}
++			o += 7u + aid_len + 7u;
++		}
++	}
++	for (int s = 0; s < SLOTS; s++) {
++		slot[s].sub = sub_slot(0) == s ? 0 : (sub_slot(1) == s ? 1 : -1);
++		if (slot[s].card != 1) {
++			slot[s].prov_tries = 0;         /* a new card gets its own tries */
++		}
++	}
++	return true;
++}
++
++static void
++uim_card_status(const uint8_t *d, uint32_t len, bool ind)
++{
++	uint16_t l = 0;
++	const uint8_t *v = tlv(d, len, 0x10, &l);
++
++	if (v == NULL || !parse_card_status(v, l)) {
++		if (!ind) {
++			cell_off("UIM card status: no or bad card status TLV (%u bytes)", len);
++		}
++		return;
++	}
++	LOG("card status%s: SIM1 card %u app %s/%u, SIM2 card %u app %s/%u, GW primary %04x secondary %04x\n",
++	    ind ? " (indication)" : "", slot[0].card, slot[0].app ? app_type_name(slot[0].app_type) : "-", slot[0].app_state,
++	    slot[1].card, slot[1].app ? app_type_name(slot[1].app_type) : "-", slot[1].app_state, idx_gw[0], idx_gw[1]);
++	/* a card left: its subscription's NAS data is old */
++	for (int sub = 0; sub < 2; sub++) {
++		if (sub_slot(sub) < 0) {
++			reg[sub].valid = reg[sub].sig = false;
++		}
++	}
++}
++
++/* the next provisioning step, if any: true when a request went out */
++static bool
++uim_provision(void)
++{
++	bool have_pri = idx_gw[0] != 0xFFFF, have_sec = idx_gw[1] != 0xFFFF;
++
++	for (int s = 0; s < SLOTS; s++) {
++		struct slot *k = &slot[s];
++		if (!sim_present(s) || !k->app || k->sub >= 0 || k->prov_tries >= 2 || k->app_state == 6) {
++			continue;
++		}
++		uint8_t session;
++		if (!have_pri) {
++			session = 0;            /* primary GW provisioning */
++		} else if (!have_sec) {
++			session = 2;            /* secondary GW provisioning (DSDS) */
++		} else {
++			continue;
++		}
++		struct qb m;
++		uint8_t chg[2] = { session, 1 };
++		uint8_t app[2 + sizeof(k->aid)];
++		app[0] = (uint8_t)(s + 1);      /* slot, 1-based */
++		app[1] = k->aid_len;
++		memcpy(app + 2, k->aid, k->aid_len);
++		qb_init(&m, UIM_CHANGE_PROV);
++		qb_tlv(&m, 0x01, chg, 2);
++		qb_tlv(&m, 0x10, app, (uint16_t)(2 + k->aid_len));
++		k->prov_tries++;
++		LOG("SIM%d: activate %s GW provisioning session (%s, try %u)\n", s + 1, session == 0 ? "primary" : "secondary",
++		    app_type_name(k->app_type), k->prov_tries);
++		qc_send(&qc[C_UIM], &m);
++		return true;
++	}
++	return false;
++}
++
++static void
++uim_rx(uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	uint16_t e = qerr(d, len);
++
++	switch (msg) {
++	case UIM_REGISTER_EVENTS:
++		uim_events_done = true;
++		if (e != 0) {
++			LOG("UIM REGISTER_EVENTS error 0x%x (hot swap not followed)\n", e);
++		}
++		qc_simple(C_UIM, UIM_GET_CARD_STATUS);
++		break;
++	case UIM_GET_CARD_STATUS:
++		if (e != 0) {
++			cell_off("UIM GET_CARD_STATUS error 0x%x", e);
++			return;
++		}
++		uim_card_status(d, len, false);
++		(void)uim_provision();
++		break;
++	case UIM_CHANGE_PROV:
++		if (e != 0 && e != QMI_ERR_NO_EFFECT) {
++			LOG("UIM CHANGE_PROVISIONING_SESSION error 0x%x\n", e);
++		}
++		qc_simple(C_UIM, UIM_GET_CARD_STATUS);
++		break;
++	default:
++		break;
++	}
++}
++
++/* ---------------------------------------------------------------- DMS */
++
++static void
++dms_rx(uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	uint16_t e = qerr(d, len), l = 0;
++	const uint8_t *v;
++
++	switch (msg) {
++	case DMS_GET_REVISION:
++		rev_done = true;
++		v = tlv(d, len, 0x01, &l);
++		if (e == 0 && v != NULL) {
++			l = (uint16_t)MIN((size_t)l, sizeof(revision) - 1);
++			memcpy(revision, v, l);
++			revision[l] = 0;
++			LOG("modem revision %s\n", revision);
++		}
++		qc_simple(C_DMS, DMS_GET_OPMODE);
++		break;
++	case DMS_GET_OPMODE:
++		v = tlv(d, len, 0x01, &l);
++		if (e == 0 && v != NULL && l >= 1) {
++			if (opmode != v[0]) {
++				LOG("operating mode %s\n", opmode_name(v[0]));
++			}
++			opmode = v[0];
++			if (opmode == 0 && t_online == 0) {
++				t_online = now_ms();
++			}
++		} else {
++			LOG("DMS GET_OPERATING_MODE error 0x%x\n", e);
++		}
++		break;
++	case DMS_SET_OPMODE:
++		if (e != 0 && e != QMI_ERR_NO_EFFECT) {
++			LOG("DMS SET_OPERATING_MODE online: error 0x%x (modem stays %s)\n", e, opmode_name(opmode));
++		} else {
++			LOG("DMS SET_OPERATING_MODE online: ok\n");
++		}
++		qc_simple(C_DMS, DMS_GET_OPMODE);
++		break;
++	default:
++		break;
++	}
++}
++
++/* ---------------------------------------------------------------- NAS */
++
++static void
++nas_bind(int i, bool wide)
++{
++	struct qb m;
++	uint32_t sub = i == C_NAS1 ? 0 : 1;
++
++	qb_init(&m, NAS_BIND_SUBS);
++	qb_tlv(&m, 0x01, &sub, wide ? 4 : 1);
++	qc_send(&qc[i], &m);
++}
++
++static void
++nas_serving(struct reg *r, const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0;
++	const uint8_t *v = tlv(d, len, 0x01, &l);
++
++	if (v == NULL || l < 5) {
++		return;
++	}
++	r->state = v[0];
++	r->ps = v[2];
++	r->rat = l >= 6 && v[4] != 0 ? v[5] : 0;
++	/* the highest radio interface in use (LTE over GSM) */
++	for (unsigned i = 1; i < v[4] && 5u + i < l; i++) {
++		if (v[5 + i] == 8 || v[5 + i] == 12) {
++			r->rat = v[5 + i];
++		}
++	}
++	r->valid = true;
++	r->op[0] = 0;
++	r->mnc3 = false;
++	v = tlv(d, len, 0x12, &l);                  /* current PLMN */
++	if (v != NULL && l >= 5) {
++		memcpy(&r->mcc, v, 2);
++		memcpy(&r->mnc, v + 2, 2);
++		r->mnc3 = r->mnc >= 100;
++		uint8_t dl = v[4], k = 0;
++		for (unsigned i = 0; i < dl && 5u + i < l && k + 1u < sizeof(r->op); i++) {
++			char ch = (char)v[5 + i];
++			if (ch >= 0x20 && ch < 0x7F) {
++				r->op[k++] = ch;
++			}
++		}
++		r->op[k] = 0;
++	} else {
++		r->mcc = r->mnc = 0;
++	}
++	v = tlv(d, len, 0x1C, &l);                  /* MNC PCS digit include status */
++	if (v != NULL && l >= 5) {
++		r->mnc3 = v[4] != 0;
++	}
++}
++
++static void
++nas_signal(struct reg *r, const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0;
++	const uint8_t *v;
++	int16_t s16;
++
++	r->rssi = r->rsrp = 0;
++	r->sig = true;
++	if ((v = tlv(d, len, 0x14, &l)) != NULL && l >= 4 && (r->rat == 8 || r->rat == 0)) {   /* LTE */
++		r->rssi = (int8_t)v[0];
++		memcpy(&s16, v + 2, 2);
++		r->rsrp = s16;
++	} else if ((v = tlv(d, len, 0x17, &l)) != NULL && l >= 2 && r->rat == 12) {            /* NR5G */
++		memcpy(&s16, v, 2);
++		r->rsrp = s16;
++	} else if ((v = tlv(d, len, 0x13, &l)) != NULL && l >= 1) {                            /* WCDMA */
++		r->rssi = (int8_t)v[0];
++	} else if ((v = tlv(d, len, 0x12, &l)) != NULL && l >= 1) {                            /* GSM */
++		r->rssi = (int8_t)v[0];
++	} else if ((v = tlv(d, len, 0x14, &l)) != NULL && l >= 4) {
++		r->rssi = (int8_t)v[0];
++		memcpy(&s16, v + 2, 2);
++		r->rsrp = s16;
++	}
++}
++
++static void
++nas_rx(int i, uint16_t msg, const uint8_t *d, uint32_t len, bool ind)
++{
++	struct reg *r = &reg[i == C_NAS1 ? 0 : 1];
++	uint16_t e = ind ? 0 : qerr(d, len);
++
++	switch (msg) {
++	case NAS_BIND_SUBS:
++		if (e == QMI_ERR_MALFORMED || e == QMI_ERR_INVALID_ARG) {
++			if (!r->bind_wide) {
++				r->bind_wide = true;    /* the enum as 4 bytes */
++				nas_bind(i, true);
++				return;
++			}
++		}
++		if (e != 0 && e != QMI_ERR_NO_EFFECT) {
++			LOG("%s: BIND_SUBSCRIPTION error 0x%x%s\n", qc[i].name, e,
++			    e == QMI_ERR_INVALID_CMD && i == C_NAS1 ? " (single-SIM modem config: default subscription)" : "");
++		}
++		r->bound = true;
++		r->next = 0;
++		break;
++	case NAS_SERVING_SYSTEM:
++		if (e == 0) {
++			nas_serving(r, d, len);
++		}
++		break;
++	case NAS_SIGNAL_INFO:
++		if (e == 0) {
++			nas_signal(r, d, len);
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++/* ---------------------------------------------------------------- WDS */
++
++static void
++wds_rx(uint16_t msg, const uint8_t *d, uint32_t len)
++{
++	uint16_t e = qerr(d, len), l = 0;
++	const uint8_t *v;
++
++	if (msg != WDS_PROFILE_GET) {
++		return;
++	}
++	wds_done = true;
++	v = tlv(d, len, 0x14, &l);
++	if (e == 0 && v != NULL) {
++		l = (uint16_t)MIN((size_t)l, sizeof(apn) - 1);
++		memcpy(apn, v, l);
++		apn[l] = 0;
++	}
++	LOG("WDS: 3GPP profile 1 %s%s%s; START_NETWORK not sent (no IPA/GSI data path in this kernel)\n",
++	    e == 0 ? "APN \"" : "error ", e == 0 ? apn : "", e == 0 ? "\"" : "");
++}
++
++/* ---------------------------------------------------------------- QRTR hooks */
++
++void
++laurel_cell_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port, bool up)
++{
++	if (!laurel_cell_enabled()) {
++		return;
++	}
++	for (int i = 0; i < C_N; i++) {
++		struct qc *c = &qc[i];
++		if (c->svc != svc) {
++			continue;
++		}
++		if (!up) {
++			if (c->up && c->node == node && c->sport == port) {
++				c->up = false;
++				c->want = 0;
++				LOG("%s: service %x gone\n", c->name, svc);
++			}
++			continue;
++		}
++		if (c->up) {
++			continue;               /* first instance wins */
++		}
++		c->node = node;
++		c->sport = port;
++		c->up = true;
++		c->want = 0;
++		LOG("%s: service %x:%x at node %u port %x, our port %x\n", c->name, svc, inst, node, port, c->port);
++	}
++}
++
++bool
++laurel_cell_rx(uint32_t dst_port, const uint8_t *d, uint32_t len)
++{
++	int i;
++	uint16_t txn, msg;
++
++	for (i = 0; i < C_N && qc[i].port != dst_port; i++) {
++	}
++	if (i == C_N) {
++		return false;
++	}
++	if (!laurel_cell_enabled() || len < 7 || (d[0] != QMI_RESP && d[0] != QMI_IND)) {
++		return true;
++	}
++	memcpy(&txn, d + 1, 2);
++	memcpy(&msg, d + 3, 2);
++	if (d[0] == QMI_IND) {
++		if (i == C_UIM && msg == UIM_CARD_STATUS_IND) {
++			uim_card_status(d, len, true);
++			if (qc[C_UIM].want == 0) {
++				(void)uim_provision();
++			}
++		} else if (i == C_NAS1 || i == C_NAS2) {
++			nas_rx(i, msg, d, len, true);
++		}
++		report(now_ms());
++		return true;
++	}
++	if (qc[i].want == 0 || msg != qc[i].want || txn != qc[i].txn) {
++		return true;                    /* late answer to a request we gave up on */
++	}
++	qc[i].want = 0;
++	switch (i) {
++	case C_UIM:
++		uim_rx(msg, d, len);
++		break;
++	case C_DMS:
++		dms_rx(msg, d, len);
++		break;
++	case C_WDS:
++		wds_rx(msg, d, len);
++		break;
++	default:
++		nas_rx(i, msg, d, len, false);
++		break;
++	}
++	report(now_ms());
++	return true;
++}
++
++/* ---------------------------------------------------------------- poll (modem watch thread) */
++
++static void
++timeouts(uint64_t now)
++{
++	for (int i = 0; i < C_N; i++) {
++		struct qc *c = &qc[i];
++		if (!c->up || c->want == 0 || now - c->sent < REQ_TIMEOUT_MS) {
++			continue;
++		}
++		if (c->tries < REQ_TRIES) {
++			c->tries++;
++			qc_send_raw(c);
++			continue;
++		}
++		LOG("%s: no answer to message 0x%x in %u s, %u tries\n", c->name, c->want, REQ_TIMEOUT_MS / 1000, REQ_TRIES);
++		uint16_t msg = c->want;
++		c->want = 0;
++		if (i == C_UIM && (msg == UIM_GET_CARD_STATUS || !slot[0].known)) {
++			cell_off("UIM service does not answer (message 0x%x, %u tries)", msg, REQ_TRIES);
++		} else if (i == C_UIM && msg == UIM_REGISTER_EVENTS) {
++			uim_events_done = true;
++			qc_simple(C_UIM, UIM_GET_CARD_STATUS);
++		} else if (i == C_DMS && !rev_done) {
++			rev_done = true;
++		} else if (i == C_WDS) {
++			wds_done = true;
++		} else if (i == C_NAS1 || i == C_NAS2) {
++			reg[i == C_NAS1 ? 0 : 1].bound = true;
++		}
++	}
++}
++
++void
++laurel_cell_poll(bool ready, bool glink)
++{
++	uint64_t now;
++
++	if (!laurel_cell_enabled() || state == -1) {
++		return;
++	}
++	now = now_ms();
++	if (t_start == 0) {
++		t_start = now;
++		set_status("starting: waiting for the modem");
++	}
++	if (!ready || !glink) {
++		if (now - t_start > READY_WAIT_MS) {
++			cell_off("modem not READY (or no GLINK) %u s after the modem thread started", READY_WAIT_MS / 1000);
++		}
++		return;
++	}
++	if (t_ready == 0) {
++		t_ready = now;
++	}
++	if (!qc[C_UIM].up) {
++		if (now - t_ready > SVC_WAIT_MS) {
++			cell_off("modem up, no QMI UIM service in %u s (%u QRTR services)", SVC_WAIT_MS / 1000, topaz_qrtr_services());
++		}
++		return;
++	}
++	timeouts(now);
++	if (state == -1) {
++		return;
++	}
++
++	/* UIM: events, card status */
++	if (qc[C_UIM].want == 0 && !uim_events_done) {
++		struct qb m;
++		uint32_t mask = 1;              /* card status */
++		qb_init(&m, UIM_REGISTER_EVENTS);
++		qb_tlv(&m, 0x01, &mask, 4);
++		qc_send(&qc[C_UIM], &m);
++	}
++	/* DMS: revision, operating mode, online when a SIM is in a provisioned session */
++	if (qc[C_DMS].up && qc[C_DMS].want == 0) {
++		if (!rev_done) {
++			qc_simple(C_DMS, DMS_GET_REVISION);
++		} else if (ipa_up && opmode > 0 && opmode != 4 && opmode != 5 && !online_sent && sub_slot(0) >= 0) {
++			struct qb m;
++			uint8_t mode = 0;
++			online_sent = true;
++			LOG("radio on: DMS SET_OPERATING_MODE online (was %s)\n", opmode_name(opmode));
++			qb_init(&m, DMS_SET_OPMODE);
++			qb_tlv(&m, 0x01, &mode, 1);
++			qc_send(&qc[C_DMS], &m);
++		}
++	}
++	/* NAS per subscription */
++	for (int sub = 0; sub < 2; sub++) {
++		int i = sub == 0 ? C_NAS1 : C_NAS2;
++		struct reg *r = &reg[sub];
++		if (!qc[i].up || qc[i].want != 0 || sub_slot(sub) < 0) {
++			continue;
++		}
++		if (!r->bound) {
++			nas_bind(i, r->bind_wide);
++			continue;
++		}
++		if (opmode != 0 || now < r->next) {
++			continue;
++		}
++		if (r->step == 0) {
++			qc_simple(i, NAS_SERVING_SYSTEM);
++			r->step = 1;
++		} else {
++			qc_simple(i, NAS_SIGNAL_INFO);
++			r->step = 0;
++			r->next = now + NAS_PERIOD_MS;
++		}
++	}
++	/* WDS: the APN of profile 1, once */
++	if (qc[C_WDS].up && qc[C_WDS].want == 0 && !wds_done && sub_slot(0) >= 0) {
++		struct qb m;
++		uint8_t p[2] = { 0, 1 };        /* 3GPP, profile 1 */
++		qb_init(&m, WDS_PROFILE_GET);
++		qb_tlv(&m, 0x01, p, 2);
++		qc_send(&qc[C_WDS], &m);
++	}
++	static uint64_t last_report;
++	if (now - last_report >= 1000) {
++		last_report = now;
++		report(now);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -864,6 +864,12 @@
+ static void w_assoc_mgmt_rx(const uint8_t *f, uint32_t len);
+ static void w_join_event(uint32_t id, const uint8_t *t, uint32_t len);
+ extern "C" void read_random(void *buffer, unsigned int numBytes);
++/* laurel 2760: the cellular QMI client (bsd/dev/laurel_cell.c) on our QRTR */
++extern "C" bool laurel_cell_enabled(void);
++extern "C" void laurel_cell_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port, bool up);
++extern "C" bool laurel_cell_rx(uint32_t dst_port, const uint8_t *d, uint32_t len);
++extern "C" void laurel_cell_poll(bool ready, bool glink);
++extern "C" void laurel_cell_off(const char *why);
+ 
+ /* ---------------------------------------------------------------- GLINK over SMEM */
+ 
+@@ -1207,6 +1213,12 @@
+ 			wlfw_arrive(c->c, c->d);
+ 		} else if (c->a != 0) {
+ 			LOG("t=%u ms: service %x:%x port %x %s", g_ms, c->a, c->b, c->d, svc_name(c->a));
++			laurel_cell_server(c->a, c->b, c->c, c->d, true);
++		}
++		break;
++	case QRTR_TYPE_DEL_SERVER:
++		if (c->a != 0 && c->a != QMI_SVC_WLFW) {
++			laurel_cell_server(c->a, c->b, c->c, c->d, false);
+ 		}
+ 		break;
+ 	case QRTR_TYPE_DATA:
+@@ -5121,6 +5133,9 @@
+ 	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
+ 		return tftp_session(dst_port, data, len);
+ 	}
++	if (laurel_cell_rx(dst_port, data, len)) {      /* laurel 2760: our cellular client ports 0x4010-0x4014 */
++		return true;
++	}
+ 	if (len < 7 || data[0] != QMI_REQ) {
+ 		return false;
+ 	}
+@@ -5138,6 +5153,19 @@
+ 	return false;
+ }
+ 
++/* laurel 2760: QRTR for bsd/dev/laurel_cell.c (called from the modem watch thread only) */
++extern "C" void
++topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len)
++{
++	qrtr_send(QRTR_TYPE_DATA, src_port, node, port, data, len);
++}
++
++extern "C" uint32_t
++topaz_qrtr_services(void)
++{
++	return q_srv_count;
++}
++
+ static void
+ svc_summary(void)
+ {
+@@ -5164,6 +5192,7 @@
+ 	if (out == NULL) {
+ 		LOG("cannot create SMP2P item %u", ITEM_SMP2P_OUT);
+ 		laurel_wifi(false, "cannot create SMP2P item %u", ITEM_SMP2P_OUT);
++		laurel_cell_off("cannot create the SMP2P item for the modem");
+ 		return;
+ 	}
+ 	ipa_out = smp2p_add_out(out, "ipa", 0);
+@@ -5174,6 +5203,7 @@
+ 			if (!glink) {
+ 				ready = false;  /* no retry */
+ 				laurel_wifi(false, "modem up, GLINK (IPCRTR over SMEM) did not start");
++				laurel_cell_off("modem up, GLINK (IPCRTR over SMEM) did not start");
+ 			}
+ 		}
+ 		if (glink) {
+@@ -5216,6 +5246,11 @@
+ 				}
+ 				LOG("modem crash reason: %s", why != NULL ? buf : "(none)");
+ 				laurel_wifi(false, "modem crashed: %s", why != NULL ? buf : "(no reason in SMEM)");
++				{
++					char cw[160];
++					snprintf(cw, sizeof(cw), "modem crashed: %s", why != NULL ? buf : "(no reason in SMEM)");
++					laurel_cell_off(cw);
++				}
+ 				if (glink) {
+ 					glink_summary();
+ 				}
+@@ -5225,6 +5260,7 @@
+ 		if (wifi_enabled()) {
+ 			laurel_wifi_watch(ms, ready || glink, sk_last == ~0u ? 0 : sk_last);
+ 		}
++		laurel_cell_poll(ready, glink);                 /* laurel 2760 */
+ 		if (ipa_in != NULL && ipa_out != NULL && *ipa_in != ipa_last) {
+ 			uint32_t v = *ipa_in;
+ 			if ((v & 1) && !(ipa_last != ~0u && (ipa_last & 1))) {
+@@ -5237,6 +5273,7 @@
+ 		IOSleep(1);
+ 	}
+ 	LOG("watch done: slave-kernel %08x, %s", sk_last, ready ? "READY" : "NOT ready");
++	laurel_cell_off("modem watch ended (boot-arg modem_watch): nobody serves the QMI clients");
+ 	if (glink) {
+ 		glink_summary();
+ 	}
+@@ -5622,6 +5659,7 @@
+ 	(void)pool_map;
+ 	if (!topaz_soc_map()) {
+ 		laurel_wifi(false, "%s", soc_why);
++		laurel_cell_off(soc_why);
+ 		thread_terminate(current_thread());
+ 		return;
+ 	}
+@@ -5643,6 +5681,9 @@
+ 		modem_watch(smem_partition(0, 1), watch);
+ 	} else {
+ 		laurel_wifi(false, "modem boot: %s", boot_why[0] != 0 ? boot_why : "failed");
++		char cw[160];
++		snprintf(cw, sizeof(cw), "modem boot: %s", boot_why[0] != 0 ? boot_why : "failed");
++		laurel_cell_off(cw);
+ 	}
+ 	/* keep the mappings: the modem uses SMEM from now on */
+ 	thread_terminate(current_thread());
+@@ -5665,8 +5706,10 @@
+ 	(void)PE_parse_boot_argn("modem", &on, sizeof(on));
+ 	if (on == 0) {
+ 		laurel_wifi(false, "boot-arg modem=0");
++		laurel_cell_off("boot-arg modem=0");
+ 		return;
+ 	}
++	(void)laurel_cell_enabled();                /* laurel 2760: the "off: boot-arg cell=0" line, early */
+ 	topaz_sta_init();                           /* private: bsd/dev/topaz_sta.c (en0 + Apple80211 for wifid) */
+ 	if (kernel_thread_start(topaz_modem_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);

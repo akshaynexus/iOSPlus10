@@ -4190,3 +4190,19 @@ Details: `docs/laurel_sprout/battery-power.md`.
   backboardd without the GL loader when it reads `off: ...`. Idle (no frames) is never a hang. Kill switch gpuwd=0.
 - [V] Kernel patch 2154 is taken by t3/laurel-gpu-upstream-opt (SMMU stage 1); 2155 applies with and without it.
 - [V] RedwoodGPU polls fences (no GPU IRQ); the display waits at most 100 ms per surface; no `TopazGPU: no answer` lines.
+## Mi A3: cellular step 1 = kernel QMI client (SIM 1/2, provisioning, modem facts), radio held off by an IPA self-check; patch 2760 (2026-11-01, cellular agent, branch t3/laurel-cellular-dual-sim; build + host test only, NOT BOOTED)
+- Details: docs/laurel_sprout/cellular.md.
+- [V 20H392 root, d22ap.adt] iPhone10,3 = Qualcomm MDM9655 "mav17" over PCIe. CommCenter matches IOKit `AppleBasebandPCI` /
+  `AppleBasebandPCIControl` (Intel: `AppleConvergedIPCICEBB*`), needs entitlements `com.apple.driver.AppleBasebandPCI*.user-access`,
+  links libQMIParserDynamic, libARI, libBBUpdaterDynamic, AppleBasebandManager; data on `pdp_ip0..15`; launchd job only with an
+  ADT `baseband` node (`_LimitLoadToDeviceTree`), the noncellular job without it. Path (a) (fake AppleBasebandPCI) = last.
+- [V DT] SM6125 IPA = v4.2 (`qcom,ipa-hw-ver = <16>`), 0x5800000 + GSI 0x5804000, SMMU SIDs 0xE0/0xE1/0xE2, firmware PAS 15
+  `ipa_fws.*` in **vendor.img** (not NON-HLOS). No AP-side SIM-detect GPIOs (the modem owns UIM hot swap). DSDS by prop.
+  NAS/WDS/DMS/UIM are user space on Android (qcrild/netmgrd): no kernel reference for those clients.
+- [V hackios-scion docs/ru/cellular.md] SM7325: ONLINE without the AP IPA handshake -> modem crash in `enl2_dl` seconds later;
+  handshake needs smp2p "ipa" = 3, platform_type 3, SMEM 497, rule_id offset 168; primary GW app is 0xFFFF until
+  CHANGE_PROVISIONING_SESSION. => our radio ONLINE waits for the IPA step (a modem crash also kills our Wi-Fi).
+- QRTR ports 0x4010-0x4014 for UIM/NAS1/NAS2/DMS/WDS: TopazModem's tftp session check takes dst ports 0x4100..0x140FF.
+- [V] Host test `scripts/laurel/test-cell.sh` (8 scenarios, simulated modem) found 2 bugs before any boot: the first `on`
+  line came before provisioning finished and before the first signal answer.
+- Build [V]: kernel-linux.sh 246/246 patches, 0 LSE, no warnings in the new code. No root change for step 1.

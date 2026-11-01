@@ -720,3 +720,18 @@ Not booted. Needs: new boot image (ADT + kernel) and `/usr/libexec/backboardd` (
 Next: boot; expect `SWEET AMFI: user client selector 6 from lsd` ~1 s after `exec lsd`, SpringBoard past `/buttons`,
 redwood-gl frames past 3 and `SWEET FPS` lines. If not: `sweetsample=SpringBoard,backboardd,lsd`, then
 `scripts/debug/smp-symbolize.sh LOG lsd`.
+
+## Mi A3: cellular step 1 built (2026-11-01, branch t3/laurel-cellular-dual-sim, patch 2760; build + host test, NOT BOOTED)
+
+Path decision (docs/laurel_sprout/cellular.md §4): (c) kernel QMI client + IPA + a data interface first, (b) a status-bar
+bridge later, (a) a fake AppleBasebandPCI for CommCenter last (CommCenter needs Apple's PCIe QMUX, BBUpdater boot and Apple
+QMI services [V strings / I effort]).
+Done [V build, V host test]: `bsd/dev/laurel_cell.c` on TopazModem's QRTR: UIM card status for SIM1 + SIM2, hot swap,
+provisioning (first card -> primary GW, second -> secondary GW), DMS revision + operating mode, NAS client per subscription,
+WDS profile-1 APN; one line `LAUREL CELL: on|off: ...`, sysctl `kern.laurel_cell`, kill switch `cell=0`. 246/246 patches,
+0 LSE. `scripts/laurel/test-cell.sh` 8/8.
+Not done: radio ONLINE / registration / signal (self-check `ipa_up` is false: no AP IPA side; scion: ONLINE without it crashed
+the modem, which here also stops Wi-Fi), data, SMS, voice, iOS UI. No root change.
+Next: boot; expect `LAUREL CELL: on: SIM1 present (USIM ready), SIM2 ...; modem low power; radio off: ...` and Wi-Fi unchanged.
+Then step 2: IPA v4.2 AP side (RPM IPA clock, PAS 15 from vendor, SMMU 0xE0, QMI 0x31 INIT_MODEM_DRIVER) -> `ipa_up` ->
+ONLINE -> registration + signal.
