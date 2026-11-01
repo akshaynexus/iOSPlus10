@@ -25,7 +25,7 @@ Mi A3 (laurel_sprout): the same sources build natively on Linux with `-DLAUREL_C
   (`scripts/ios16/adt-extra.py`, `ADT_CAM=1`). [I, from HakiOS `docs/ru/notes.md:1712-1722` and
   `xnuloader/loader.c:3125-3145,3226-3234`, not from our own disassembly of libMobileGestalt] MobileGestalt then
   answers `still-camera`, `rear-facing-camera` and `video-camera`. No `camera-front` (the IMX615 has no kernel
-  driver). No `flash` (no torch driver).
+  driver). No `flash` (no torch driver; Mi A3: the kernel publishes `flash`, patches 2781 + 2783).
 - [V] launchd: no job of the 20H392 root has `_LimitLoadToDeviceTree` `isp` or `camera` (the only ones: hilo,
   pearl-sep, wlan/marconi-wifi, twodbl). applecamerad and dietapplecamerad start on IOResources properties. The new
   nodes start no Apple camera daemon.
@@ -111,8 +111,8 @@ Also checked [V]: the H10ISP vtable versions in 20H392 are base 1, device 3, str
 
 ## Changes to the HakiOS sources
 
-- `camera_device.c`: one camera (back, kernel sensor 1) instead of back + front; no torch device (TorchLevel is
-  logged only); `/dev/negronicam` + header check (magic, RAW10, sizes); `negronicam_failed` (open failure, EIO,
+- `camera_device.c`: one camera (back, kernel sensor 1) instead of back + front; no torch device on negroni (TorchLevel is
+  logged only; the Mi A3 build, LAUREL_CAMERA, writes it to `/dev/laureltorch`); `/dev/negronicam` + header check (magic, RAW10, sizes); `negronicam_failed` (open failure, EIO,
   bad header, 5 failed reads, no memory; the worker then ends with `running` false and is joined at the next start)
   and the immediate refusal in `negroni_camera_device_create`; scaler outputs (preview, video) at most
   the sensor's 2x2 cells (`PREVIEW_BIN` 2: 2016x1512 for "Photo"), the StillImage output stays full size; tuning

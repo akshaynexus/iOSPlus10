@@ -9,7 +9,7 @@
 #        (speaker HAL plug-in; AUDIO=0 skips), root-bt.sh (Bluetooth userland; BT=0 skips), root-camera.sh (sensor tables, NegroniCamera.driver;
 #        CAMERA=0 skips), root-statusbar.py
 #        (status bar provider for 360x780 pt + the waterdrop dylib for SpringBoard from out/laurel/notch, scripts/laurel/notch-build.sh;
-#        STATUSBAR=0 skips both, NOTCH=0 only the dylib), root-flashlight.sh (flashlight plug-in; TORCH=0 skips) and root-brightness.py
+#        STATUSBAR=0 skips both, NOTCH=0 only the dylib), root-flashlight.sh (the flashlight's one owner: camera plug-in, else its own plug-in; TORCH=0 = no button) and root-brightness.py
 #        (auto-brightness off; BRIGHTNESS=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
 # Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
@@ -90,7 +90,7 @@ CAMERA=${CAMERA:-1} bash "$REPO/scripts/laurel/root-camera.sh" "$mnt" || echo "$
 # out/laurel/notch, scripts/laurel/notch-build.sh; absent -> a note, Apple's D22Zoomed notch spacing). STATUSBAR=0 skips both,
 # NOTCH=0 only the dylib (docs/laurel_sprout/rtc-statusbar.md B, C)
 STATUSBAR=${STATUSBAR:-1} NOTCH=${NOTCH:-1} python3 -I "$REPO/scripts/laurel/root-statusbar.py" "$mnt"
-# flashlight (kernel patch 2781): LaurelFlashlight.driver mediaserverd plug-in (FigFlashlight vendor + server); TORCH=0 skips
+# flashlight (kernel patches 2781, 2783): one owner: NegroniCamera.driver when root-camera.sh put it in, else LaurelFlashlight.driver; TORCH=0 = no button
 TORCH=${TORCH:-1} bash "$REPO/scripts/laurel/root-flashlight.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-flashlight.sh failed; root built without the flashlight" >&2
 # auto-brightness off: no ambient light sensor for iOS (kernel 2201; docs/laurel_sprout/brightness.md); BRIGHTNESS=0 skips
 BRIGHTNESS=${BRIGHTNESS:-1} python3 -I "$REPO/scripts/laurel/root-brightness.py" "$mnt"

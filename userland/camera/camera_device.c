@@ -11,7 +11,7 @@
  *
  * iOSPlus10 (NE2211): ONE camera, the rear main IMX789 (kernel sensor 1, /dev/negronicam of patch 0318,
  * negronicam=7); no front stream (the IMX615 has no kernel driver), no lens motor (focus NO_FOCUS: the
- * contrast AF below stays idle), no torch. When /dev/negronicam is absent, or answers EIO (a kernel fault),
+ * contrast AF below stays idle), the torch only on the Mi A3 (LAUREL_CAMERA: /dev/laureltorch). When /dev/negronicam is absent, or answers EIO (a kernel fault),
  * the device create function fails at once (negroni_camera_device_create): the vendor has no device and
  * Camera.app gets an error, not a wait.
  *
@@ -529,7 +529,8 @@ struct stream {
 	volatile bool   running;
 	volatile bool   graph_running;  /* the capture graph has started this stream: frames may be given out */
 	bool            worker_started;
-	int             torch;
+	int             torch;          /* Mi A3: /dev/laureltorch, opened at the first TorchLevel */
+	bool            torch_lit;      /* this stream lit it */
 	uint64_t        frames, stills_given;
 };
 
@@ -857,7 +858,67 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 	return 0;
 }
 
-/* the flashlight: TorchLevel (0 to 1). iOSPlus10: no torch driver yet: said, not acted on (no ADT "flash") */
+#ifdef LAUREL_CAMERA
+/*
+ * The flashlight on the Mi A3. Control Center and AVFlashlight reach this stream through FigFlashlight (this bundle's
+ * vendor, started by start_capture_servers), so this plug-in is the one owner of the iOS side. Kernel patches 2781 + 2783:
+ * /dev/laureltorch takes 0..100 %, 1..100 % = 12.5..150 mA; the cap, the auto-off (600 s) and the thermal off are the kernel's.
+ */
+#define TORCH_DEVICE    "/dev/laureltorch"
+#define TORCH_SAID_MAX  40u             /* lines per mediaserverd for levels the kernel took; refusals always */
+
+static bool
+torch_write(struct stream *s, uint32_t percent)
+{
+	char text[8];
+	int len = snprintf(text, sizeof(text), "%u\n", percent);
+
+	if (s->torch < 0) {
+		s->torch = open(TORCH_DEVICE, O_WRONLY | O_CLOEXEC);
+	}
+	return s->torch >= 0 && write(s->torch, text, (size_t)len) == len;
+}
+
+/* a stream that goes away (client gone) leaves no light behind */
+static void
+torch_off(struct stream *s)
+{
+	if (s->torch_lit) {
+		s->torch_lit = false;
+		say("the flashlight off: its stream went away (%s)", torch_write(s, 0) ? "done" : "REFUSED");
+	}
+}
+
+/*
+ * mediaserverd start: the first open of the device (the kernel repeats its start result then: the first LAUREL TORCH lines
+ * are often lost before USB is up), the state in our own line, and a light that a dead mediaserverd left on goes off.
+ */
+void
+negroni_camera_torch_start(void)
+{
+	char text[480];
+	int fd = open(TORCH_DEVICE, O_RDONLY | O_CLOEXEC);
+	ssize_t n;
+
+	if (fd < 0) {
+		say("the flashlight: off: %s does not open (errno %d): see the LAUREL TORCH lines", TORCH_DEVICE, errno);
+		return;
+	}
+	n = read(fd, text, sizeof(text) - 1);
+	close(fd);
+	text[n > 0 ? n : 0] = 0;
+	if (n > 0 && text[n - 1] == '\n') {
+		text[n - 1] = 0;
+	}
+	say("the flashlight: this plug-in owns it: %s: %s", TORCH_DEVICE, n > 0 ? text : "state not readable");
+	if (strstr(text, " lit=1 ") != NULL && (fd = open(TORCH_DEVICE, O_WRONLY | O_CLOEXEC)) >= 0) {
+		say("the flashlight was left on by the last mediaserverd: off (%s)", write(fd, "0\n", 2) == 2 ? "done" : "REFUSED");
+		close(fd);
+	}
+}
+#endif
+
+/* the flashlight: TorchLevel (0 to 1). Mi A3: above; otherwise no torch driver: said, not acted on (no ADT "flash") */
 static void
 torch_set(struct stream *s, CFTypeRef value)
 {
@@ -869,7 +930,24 @@ torch_set(struct stream *s, CFTypeRef value)
 	}
 	level = level < 0 ? 0 : level > 1 ? 1 : level;
 	thousandths = (uint32_t)(level * 1000 + 0.5f);
+#ifdef LAUREL_CAMERA
+	static uint32_t said;
+	/* 1..1000 -> 1..100 %, never 0 for a level above 0: 0 is off */
+	uint32_t percent = thousandths == 0 ? 0 : (thousandths + 5) / 10;
+	percent = thousandths != 0 && percent == 0 ? 1 : percent;
+	if (!torch_write(s, percent)) {
+		say("the flashlight at %u of 1000 NOT TAKEN: %s %s (errno %d): see the LAUREL TORCH lines", thousandths, TORCH_DEVICE,
+		    s->torch < 0 ? "does not open" : "refused it", errno);
+		return;
+	}
+	s->torch_lit = percent != 0;
+	if (said++ < TORCH_SAID_MAX) {
+		say("the flashlight at %u of 1000 -> %u %% of the 150 mA cap", thousandths, percent);
+	}
+#else
+	(void)s;
 	say("the flashlight at %u of 1000 NOT TAKEN (no torch driver)", thousandths);
+#endif
 }
 
 /* ---- the frames ------------------------------------------------------------------------------------- */
@@ -1931,6 +2009,9 @@ stream_add_attachments(CMBaseObjectRef o, CMSampleBufferRef sbuf, CFDictionaryRe
 static OSStatus
 stream_invalidate(CMBaseObjectRef o)
 {
+#ifdef LAUREL_CAMERA
+	torch_off(stream_of(o));
+#endif
 	(void)stream_stop(o);
 	return 0;
 }
@@ -1940,6 +2021,9 @@ stream_finalize(CMBaseObjectRef o)
 {
 	struct stream *s = stream_of(o);
 
+#ifdef LAUREL_CAMERA
+	torch_off(s);
+#endif
 	(void)stream_stop(o);
 	for (int i = 0; i < OUTPUTS; i++) {
 		if (s->out[i].config) {

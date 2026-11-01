@@ -1,19 +1,35 @@
 #!/bin/bash
-# The Mi A3 flashlight in the iOS 16 root (kernel side: patches/laurel/xnu/2781, /dev/laureltorch).
-#   sudo scripts/laurel/root-flashlight.sh MOUNTED_ROOT      (root.sh step 2 calls this; TORCH=0 skips)
-# Installs /System/Library/Audio/Plug-Ins/HAL/LaurelFlashlight.driver (root:wheel, 755/644): the mediaserverd plug-in
-# that gives FigFlashlight (Control Center, AVFlashlight) a torch device and starts its server
-# (userland/laurel/flashlight/README.md). The kernel publishes the Control Center button (IODeviceTree:/product/camera
-# flash) only when this file is in the root, so a root without it has no button. Works on macOS and Linux.
-# Needs out/laurel/flashlight/LaurelFlashlight.driver (userland/laurel/flashlight/build.sh; built here if missing).
-# A plug-in that cannot be built (no theos toolchain / SDK) is a warning: the root goes on without it.
-# Undo: delete the driver (or create /var/db/laurel/flashlight-off on the phone).
+# The Mi A3 flashlight in the iOS 16 root (kernel side: patches/laurel/xnu/2781 + 2783, /dev/laureltorch).
+#   sudo scripts/laurel/root-flashlight.sh MOUNTED_ROOT      (root.sh step 2 calls this, after root-camera.sh)
+# One owner of the iOS side (both plug-ins replace the same method; the second one to load turns itself off):
+#   NegroniCamera.driver in the root (the default): it owns the flashlight (userland/camera/camera_device.c torch_set);
+#     a LaurelFlashlight.driver from an older root is removed.
+#   no NegroniCamera.driver (CAMERA=0, or its build failed): installs /System/Library/Audio/Plug-Ins/HAL/LaurelFlashlight.driver
+#     (root:wheel, 755/644; userland/laurel/flashlight/README.md).
+#   TORCH=0: neither is used for the torch: writes the mark HAL/laurel-flashlight-off, the kernel then publishes no button.
+# The kernel publishes the Control Center button (IODeviceTree:/product/camera flash) only with one of the two in the root.
+# Works on macOS and Linux. Needs out/laurel/flashlight/LaurelFlashlight.driver for the second case (built here if missing;
+# a plug-in that cannot be built (no theos toolchain / SDK) is a warning: the root goes on without it).
+# Undo on the phone: /var/db/laurel/flashlight-off stops LaurelFlashlight; the boot-arg torch=0 stops the kernel side.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SRC=$REPO/out/laurel/flashlight/LaurelFlashlight.driver
 R=${1:?usage: $0 MOUNTED_ROOT}
-if [ "${TORCH:-1}" = 0 ]; then echo "root-flashlight: skipped (TORCH=0): no flashlight button"; exit 0; fi
 [ -d "$R/System/Library/xpc" ] || { echo "root-flashlight: $R is not an iOS root" >&2; exit 1; }
+HAL=$R/System/Library/Audio/Plug-Ins/HAL
+mkdir -p "$HAL"
+rm -f "$HAL/laurel-flashlight-off"
+if [ "${TORCH:-1}" = 0 ]; then
+  rm -rf "${HAL:?}/LaurelFlashlight.driver"
+  : > "$HAL/laurel-flashlight-off"
+  echo "root-flashlight: TORCH=0: no flashlight button (mark HAL/laurel-flashlight-off)"
+  exit 0
+fi
+if [ -f "$HAL/NegroniCamera.driver/NegroniCamera" ]; then
+  rm -rf "${HAL:?}/LaurelFlashlight.driver"
+  echo "root-flashlight: NegroniCamera.driver is in the root: it owns the flashlight; no LaurelFlashlight.driver"
+  exit 0
+fi
 if [ ! -f "$SRC/LaurelFlashlight" ]; then
   if [ -n "${SUDO_USER:-}" ]; then b() { sudo -u "$SUDO_USER" "$REPO/userland/laurel/flashlight/build.sh"; }; else b() { "$REPO/userland/laurel/flashlight/build.sh"; }; fi
   if ! b || [ ! -f "$SRC/LaurelFlashlight" ]; then
@@ -21,8 +37,6 @@ if [ ! -f "$SRC/LaurelFlashlight" ]; then
     exit 0
   fi
 fi
-HAL=$R/System/Library/Audio/Plug-Ins/HAL
-mkdir -p "$HAL"
 rm -rf "${HAL:?}/LaurelFlashlight.driver"
 cp -R "$SRC" "$HAL/LaurelFlashlight.driver"
 [ "$(id -u)" != 0 ] || chown -R 0:0 "$HAL/LaurelFlashlight.driver"

@@ -1,0 +1,341 @@
+laurel 2871: the backlight reads the panel back. Boots 07:20 (LP, no DMA line) and 18:40 (HS, DMA line): every slider write DONE, 0 failed [V log], the panel did not follow [V owner]. DONE says only that the DSI sent something. Send path now as Linux dsi_message_tx + kickoff_command + reset_cmd_fifo: DMA FIFO watermarks off (DSI_DMA_FIFO_CTRL 0x50 bits 16 and 20), the DMA line = 1 + v_bp + v_sw + v_active (Samsung 1568, GVO 1593), TPG DMA FIFO reset after each command, brightness control 0x53 0x20 at start (it was sent only at a wake). Second transport: the TPG FIFO (kickoff_fifo_command: no bus master). Self-check at start (dsiReadCheck): who answers DCS 0x0A: memory DMA LP, HS, FIFO; then which way (DT mode, other mode, each with and without the DMA line) makes 0x52 follow two written levels; that transport and way stay; the result is in both LAUREL BACKLIGHT: on: lines. Each settled-value line has `; panel holds DBV D, power 0xNN`; when 0x52 followed at start and does not now, the next way gets the level (at most 4 moves, one line). 3 reads without an answer = reads off, writes go on. A read's bus turnaround is always in the blanking (BTA_DONE bit 20, CMD_MODE_EN on until then). Kill switch laurelbl_read=0.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a8a4dcb..73d2813 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -310,6 +310,23 @@ public:
+ 	bool          fBlHs, fOnHs, fOffHs;   /* qcom,mdss-dsi-{brightness,on,off}-command-state == dsi_hs_mode */
+ 	uint32_t      fDsiSchedLine;  /* DSI_DMA_SCHEDULE_CTRL line (front porch start), 0 = not scheduled */
+ 	const char   *fDsiHow;        /* self-check result for the start line */
++	/* laurel 2871: the panel read back (DCS 0x0A, 0x52, 0x54), the transport and the way that works */
++	bool          fDsiFifo;       /* transport: the TPG FIFO instead of the memory DMA */
++	bool          fDsiBta;        /* this send ends with a bus turnaround: dsiSend waits for it */
++	bool          fDsiBtaDone;
++	bool          fDsiReadHs;     /* the mode of a read */
++	bool          fRdOn;          /* the panel answers reads */
++	bool          fRd52;          /* 0x52 followed a written level at start: it can judge a settled value */
++	uint32_t      fRdFails;       /* reads without an answer in a row */
++	uint32_t      fDsiLine;       /* the DMA line of the panel */
++	bool          fDsiDtHs, fDsiDtOnHs, fDsiDtOffHs;      /* the panel's DT modes */
++	uint32_t      fDsiWay, fDsiWayMoves;
++	uint32_t      dsiDcsRead(uint8_t cmd, uint8_t *out, uint32_t n);
++	bool          panelDbv(uint32_t *dbv);
++	bool          setPanelBctrl(void);
++	void          dsiWay(uint32_t way);
++	const char   *dsiWayName(uint32_t way);
++	void          dsiReadCheck(uint32_t level, char *how, size_t size);
+ 	/* laurel 2201: one line per settled value (blLog, 700 ms after the last request) */
+ 	thread_call_t fBlLogCall;
+ 	uint32_t      fBlValue;       /* 0..255 of the last request, ~0u: none since the last line */
+@@ -725,7 +742,11 @@ AppleCLCD::start(IOService *provider)
+ 	fBlHs = mode->bl_hs;
+ 	fOnHs = mode->on_hs;
+ 	fOffHs = mode->off_hs;
+-	fDsiSchedLine = mode->vbp + mode->vpw + LAUREL_PANEL_LINES;
++	/* laurel 2871: dsi_message_tx starts from line_no = 1: Samsung 1568, GVO 1593 */
++	fDsiLine = fDsiSchedLine = 1 + mode->vbp + mode->vpw + LAUREL_PANEL_LINES;
++	fDsiDtHs = mode->bl_hs;
++	fDsiDtOnHs = mode->on_hs;
++	fDsiDtOffHs = mode->off_hs;
+ 	fDsiHow = "no DSI";
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+@@ -1494,8 +1515,25 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	}
+ 	dsi_wr(fDsi, 0x004, ctrl | 4 | 1);              /* CMD_MODE_EN | DSI_EN */
+ 	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);   /* clear CMD_DMA_DONE */
+-	dsi_wr(fDsi, 0x15c, 0);                          /* no test pattern */
+-	dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
++	/*
++	 * laurel 2871: as dsi_ctrl_hw_cmn_kickoff_command: the DMA FIFO watermarks off (2201 left them as the boot chain did),
++	 * and the other transport Linux has: kickoff_fifo_command (no bus master: the words go in through the TPG FIFO).
++	 */
++	dsi_wr(fDsi, 0x050, dsi_rd(fDsi, 0x050) | (1u << 20) | (1u << 16));
++	if (fDsiFifo) {
++		dsi_wr(fDsi, 0x15c, (1u << 1) | (1u << 2) | (3u << 16));        /* CMD_DMA_TPG_EN, FIFO mode, custom pattern */
++		for (uint32_t i = 0; i < size; i += 4) {
++			uint32_t word;
++			memcpy(&word, p + i, 4);
++			dsi_wr(fDsi, 0x17c, word);
++		}
++		if ((size / 4) & 1) {
++			dsi_wr(fDsi, 0x17c, 0);                                 /* the hardware wants an even dword count */
++		}
++	} else {
++		dsi_wr(fDsi, 0x15c, 0);                                         /* no test pattern */
++		dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
++	}
+ 	dsi_wr(fDsi, 0x04c, size);
+ 	uint32_t dma = dsi_rd(fDsi, 0x03c);
+ 	/*
+@@ -1519,8 +1557,12 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 	 * so the packet goes out in the blanking and not into the active video. The DONE then comes up to one
+ 	 * frame (16.7 ms) later: wait up to 50 ms.
+ 	 */
+-	if (fDsiSchedLine != 0) {
+-		dsi_wr(fDsi, 0x100, (dsi_rd(fDsi, 0x100) & ~0xffffu) | (1u << 28) | (fDsiSchedLine & 0xffffu));
++	/* laurel 2871: a read's bus turnaround stays in the blanking in every way */
++	uint32_t line = fDsiBta ? fDsiLine : fDsiSchedLine;
++	if (line != 0) {
++		dsi_wr(fDsi, 0x100, (dsi_rd(fDsi, 0x100) & ~0xffffu) | (1u << 28) | (line & 0xffffu));
++	} else {
++		dsi_wr(fDsi, 0x100, dsi_rd(fDsi, 0x100) & ~(1u << 28));
+ 	}
+ 	dsi_wr(fDsi, 0x090, 1);                          /* SW trigger */
+ 	bool done = false;
+@@ -1538,7 +1580,22 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ 			    dsi_rd(fDsi, 0x110), dsi_rd(fDsi, 0x008), dsi_rd(fDsi, 0x0c4), (unsigned long long)fDsiBufPhys);
+ 		}
+ 	}
++	/* laurel 2871: a read: the panel answers after the DMA is done; CMD_MODE_EN stays on until then (bit 20 BTA_DONE) */
++	fDsiBtaDone = false;
++	if (fDsiBta && done) {
++		for (int i = 0; i < 250 && !fDsiBtaDone; i++) {
++			fDsiBtaDone = (dsi_rd(fDsi, 0x110) & (1u << 20)) != 0;
++			if (!fDsiBtaDone) {
++				IODelay(20);
++			}
++		}
++	}
+ 	dsi_wr(fDsi, 0x110, dsi_rd(fDsi, 0x110) | 1);
++	/* laurel 2871: as dsi_ctrl_hw_cmn_reset_cmd_fifo, after every command */
++	dsi_wr(fDsi, 0x15c, 0);
++	dsi_wr(fDsi, 0x1ec, 1);
++	IODelay(1);
++	dsi_wr(fDsi, 0x1ec, 0);
+ 	dsi_wr(fDsi, 0x03c, dma);
+ 	dsi_wr(fDsi, 0x004, ctrl);
+ 	if (trig != dsi_rd(fDsi, 0x084)) {
+@@ -1773,14 +1830,14 @@ AppleCLCD::blWork(thread_call_param_t p0, __unused thread_call_param_t p1)
+ bool
+ AppleCLCD::dsiSelfCheck(uint32_t level)
+ {
+-	static char how[64];
++	static char how[200];
+ 	uint32_t line = fDsiSchedLine;
+ 	bool hs = fBlHs;
+ 	if (setPanelLevel(level)) {
+ 		snprintf(how, sizeof(how), "DCS %s, DMA at line %u", fBlHs ? "HS" : "LP", line);
+-	} else if ((fDsiSchedLine = 0, dsi_wr(fDsi, 0x100, dsi_rd(fDsi, 0x100) & ~(1u << 28)), setPanelLevel(level))) {
++	} else if ((dsiWay(2), setPanelLevel(level))) {
+ 		snprintf(how, sizeof(how), "DCS %s, DMA unscheduled (line %u: no DONE)", fBlHs ? "HS" : "LP", line);
+-	} else if ((fBlHs = fOnHs = fOffHs = false, setPanelLevel(level))) {
++	} else if ((dsiWay(fDsiDtHs ? 3 : 2), setPanelLevel(level))) {
+ 		snprintf(how, sizeof(how), "DCS LP, DMA unscheduled (%s + line %u: no DONE)", hs ? "HS" : "LP", line);
+ 	} else {
+ 		snprintf(how, sizeof(how), "no DONE in HS/LP, with and without a DMA line");
+@@ -1788,10 +1845,155 @@ AppleCLCD::dsiSelfCheck(uint32_t level)
+ 		return false;
+ 	}
+ 	fDsiHow = how;
++	dsiReadCheck(level, how, sizeof(how));
+ 	fBlWrites = fBlFails = 0;
+ 	return true;
+ }
+ 
++/*
++ * laurel 2871: DCS read as dsi_message_rx + get_cmd_read_data (1..2 bytes: short response): max return size + the read with
++ * a bus turnaround in one send, always at the DMA line of the blanking. The answer is 1 word: type, data, data, ECC.
++ * Returns the bytes (0: no answer or an error report; the DSI's error bits are cleared, as dsi_ctrl_handle_error_status).
++ */
++uint32_t
++AppleCLCD::dsiDcsRead(uint8_t cmd, uint8_t *out, uint32_t n)
++{
++	uint8_t size[4] = { (uint8_t)n, 0, 0x37, 0x00 };        /* set max return packet size: not the last packet */
++	uint8_t read[4] = { cmd, 0, 0x06, 0xa0 };               /* DCS read: last, BTA */
++	uint32_t got = 0;
++	IOLockLock(fBlLock);
++	dsi_wr(fDsi, 0x1d4, 1);                                 /* clear RDBK_DATA */
++	IODelay(1);
++	dsi_wr(fDsi, 0x1d4, 0);
++	fDsiHsNow = fDsiReadHs;
++	fDsiBta = true;
++	bool done = dsiSend(size, read, sizeof(read));
++	fDsiBta = false;
++	uint32_t count = dsi_rd(fDsi, 0x1d4) >> 16;
++	uint32_t word = dsi_rd(fDsi, 0x06c);                    /* RDBK_DATA0, high byte first (ntohl in get_cmd_read_data) */
++	if (done && fDsiBtaDone && count != 0) {
++		uint8_t type = (uint8_t)(word >> 24);
++		if (type == 0x21 || type == 0x11) {
++			got = 1;
++		} else if (type == 0x22 || type == 0x12) {
++			got = n >= 2 ? 2 : 1;
++		}
++		if (got >= 1) {
++			out[0] = (uint8_t)(word >> 16);
++		}
++		if (got >= 2) {
++			out[1] = (uint8_t)(word >> 8);
++		}
++	}
++	dsi_wr(fDsi, 0x068, dsi_rd(fDsi, 0x068));               /* ack, lane 0, timeout status: write 1 to clear */
++	dsi_wr(fDsi, 0x0b4, dsi_rd(fDsi, 0x0b4));
++	dsi_wr(fDsi, 0x0c0, dsi_rd(fDsi, 0x0c0));
++	IOLockUnlock(fBlLock);
++	return got;
++}
++
++/* the panel's brightness register (DCS 0x52), high byte first as 0x51 writes it; false: no answer */
++bool
++AppleCLCD::panelDbv(uint32_t *dbv)
++{
++	uint8_t b[2] = { 0, 0 };
++	uint32_t n = dsiDcsRead(0x52, b, 2);
++	*dbv = n == 2 ? ((uint32_t)b[0] << 8 | b[1]) : b[0];
++	return n != 0;
++}
++
++bool
++AppleCLCD::setPanelBctrl(void)
++{
++	uint8_t bctrl[4] = { 0x53, 0x20, 0x15, 0x80 };          /* qcom,mdss-dsi-dimming-brightness-command: brightness control on */
++	IOLockLock(fBlLock);
++	fDsiHsNow = fBlHs;
++	bool done = dsiSend(bctrl, NULL, 0);
++	IOLockUnlock(fBlLock);
++	return done;
++}
++
++/* way 0 = as the panel's DT and Linux; 1 = the other mode; 2, 3 = both without the DMA line */
++void
++AppleCLCD::dsiWay(uint32_t way)
++{
++	fDsiWay = way & 3;
++	bool flip = (fDsiWay & 1) != 0;
++	fBlHs = fDsiDtHs != flip;
++	fOnHs = fDsiDtOnHs != flip;
++	fOffHs = fDsiDtOffHs != flip;
++	fDsiSchedLine = (fDsiWay & 2) ? 0 : fDsiLine;
++}
++
++const char *
++AppleCLCD::dsiWayName(uint32_t way)
++{
++	static const char * const names[4] = { "DT mode, DMA line", "other mode, DMA line", "DT mode, no DMA line", "other mode, no DMA line" };
++	return names[way & 3];
++}
++
++/*
++ * laurel 2871, the backlight's self-check: does the panel hold what we send? Boots 07:20 and 18:40: every write DONE, 0 failed
++ * [V log], the panel did not follow [V owner], in LP without a DMA line and in HS with it. DONE says only that the DSI sent
++ * something; nothing has ever proved that a packet arrived with the right bytes.
++ *  1. Who answers DCS 0x0A (power mode): the memory DMA in LP, in HS, or the FIFO (no bus master: bad DMA data cannot explain it).
++ *     The first that answers stays. None: writes go on as before, one line says so.
++ *  2. In which way does 0x52 follow two written levels? (Two: the boot chain's level could be ours by chance.) That way stays.
++ * The Samsung panel answers reads in video mode under Linux [V dsi_display_white_reg_read]. laurelbl_read=0: no reads.
++ */
++void
++AppleCLCD::dsiReadCheck(uint32_t level, char *how, size_t size)
++{
++	static const struct { bool fifo, hs; const char *name; } paths[] = {
++		{ false, false, "memory DMA, reads in LP" }, { false, true, "memory DMA, reads in HS" }, { true, false, "FIFO, reads in LP" },
++	};
++	uint32_t on = 1, way0 = fDsiWay, seen = 0;
++	uint8_t power = 0, control = 0;
++	char start[80];
++	strlcpy(start, how, sizeof(start));
++	(void)setPanelBctrl();                                  /* the wake sends it too; the boot chain may not have */
++	(void)PE_parse_boot_argn("laurelbl_read", &on, sizeof(on));
++	if (on == 0) {
++		snprintf(how, size, "%s, no panel reads (laurelbl_read=0)", start);
++		return;
++	}
++	const char *path = NULL;
++	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]) && path == NULL; i++) {
++		fDsiFifo = paths[i].fifo;
++		fDsiReadHs = paths[i].hs;
++		if (dsiDcsRead(0x0a, &power, 1) == 1) {
++			path = paths[i].name;
++		}
++	}
++	if (path == NULL) {
++		fDsiFifo = false;
++		fDsiReadHs = false;
++		snprintf(how, size, "%s, PANEL DOES NOT ANSWER READS (0x0A; memory DMA and FIFO): writes are blind", start);
++		return;
++	}
++	fRdOn = true;
++	(void)dsiDcsRead(0x54, &control, 1);
++	for (uint32_t i = 0; i < 4 && !fRd52; i++) {
++		uint32_t way = (way0 + i) & 3, a = 0, b = 0;
++		dsiWay(way);
++		(void)setPanelBctrl();
++		if (setPanelLevel(level + 16) && panelDbv(&a) && setPanelLevel(level) && panelDbv(&b)) {
++			seen = b;
++			fRd52 = a == level + 16 && b == level;
++		}
++	}
++	if (!fRd52) {
++		dsiWay(way0);
++		(void)setPanelBctrl();
++		(void)setPanelLevel(level);
++	}
++	snprintf(how, size, "%s, %s; panel power %#x, control %#x, DBV %s (%s)", start, path, power, control,
++	    fRd52 ? "follows the writes" : "DOES NOT FOLLOW the writes", dsiWayName(fDsiWay));
++	if (!fRd52) {
++		IOLog("LAUREL BACKLIGHT: panel 0x52 reads %#x after writing %#x in every way: the slider may not reach the panel\n", seen, level);
++	}
++}
++
+ /*
+  * laurel 2201 fix: one line per settled value (LAUREL_BL_LOG_MS after the last request; at most
+  * LAUREL_BL_LOG_MAX per boot, then every 50th): what was asked, the DBV, and how many panel writes since.
+@@ -1818,10 +2020,42 @@ AppleCLCD::blLog(thread_call_param_t p0, __unused thread_call_param_t p1)
+ 	if (n > LAUREL_BL_LOG_MAX && n % 50 != 0) {
+ 		return;
+ 	}
+-	IOLog("LAUREL BACKLIGHT: brightness %u of 255 from %s -> DBV %u (%u nits): %s, %u panel writes, %u failed\n",
++	/*
++	 * laurel 2871: what the panel holds now, in the same line (fPwrLock: no power change during the read). When 0x52 followed the
++	 * writes at start and does not now, the next way gets the level (at most 4 moves per boot; one more line says it).
++	 */
++	char held[120] = "";
++	if (!off && sent == target && fb->fRdOn && fb->fPwrLock != NULL && IOLockTryLock(fb->fPwrLock)) {
++		IOLockLock(fb->fLock);
++		bool away = fb->fPowerOff || fb->fBlHold;
++		IOLockUnlock(fb->fLock);
++		uint32_t dbv = 0;
++		uint8_t power = 0;
++		if (!away && fb->panelDbv(&dbv) && fb->dsiDcsRead(0x0a, &power, 1) == 1) {
++			fb->fRdFails = 0;
++			snprintf(held, sizeof(held), "; panel holds DBV %u, power %#x%s", dbv, power, dbv == target ? "" : " (NOT the asked DBV)");
++			IOLockLock(fb->fLock);
++			bool same = fb->fBlLevel == target && fb->fBlSent == target;
++			IOLockUnlock(fb->fLock);
++			if (dbv != target && same && fb->fRd52 && fb->fDsiWayMoves < 4) {
++				fb->fDsiWayMoves++;
++				fb->dsiWay(fb->fDsiWay + 1);
++				(void)fb->setPanelBctrl();
++				bool sentAgain = fb->setPanelLevel(target);
++				bool read = fb->panelDbv(&dbv);
++				IOLog("LAUREL BACKLIGHT: the panel lost the level: next way %s: %s, reads %u\n", fb->dsiWayName(fb->fDsiWay),
++				    sentAgain ? "sent" : "NO DONE", read ? dbv : 0);
++			}
++		} else if (!away && ++fb->fRdFails >= 3) {
++			fb->fRdOn = false;
++			IOLog("LAUREL BACKLIGHT: panel reads off: 3 without an answer in a row (writes go on)\n");
++		}
++		IOLockUnlock(fb->fPwrLock);
++	}
++	IOLog("LAUREL BACKLIGHT: brightness %u of 255 from %s -> DBV %u (%u nits): %s, %u panel writes, %u failed%s\n",
+ 	    value, from[0] ? from : "?", target, target * fb->fBlNits / (fb->fBlMax ? fb->fBlMax : 1),
+ 	    off ? "display off: kept for the wake" : sent == target ? "panel at it" : "panel still on its way",
+-	    writes, fails);
++	    writes, fails, held);
+ }
+ 
+ static void
+@@ -1957,9 +2191,10 @@ AppleCLCD::blPublisher(void *self, __unused wait_result_t result)
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(bl);
+-	IOLog("LAUREL BACKLIGHT: on: DCS max %u (%s), AppleARMBacklight %s (RedwoodGPU up: GPU renderer); slider 0..255 -> "
++	/* laurel 2871: with the self-check's result: the first line of the boot is often lost before USB comes up */
++	IOLog("LAUREL BACKLIGHT: on: DCS max %u (%s), %s; AppleARMBacklight %s (RedwoodGPU up: GPU renderer); slider 0..255 -> "
+ 	    "DBV max * (v/255)^2, one line per settled value; auto-brightness off: no ambient light sensor for iOS\n",
+-	    fb->fBlMax, panel, published ? "published" : "failed");
++	    fb->fBlMax, panel, fb->fDsiHow, published ? "published" : "failed");
+ 	fb->release();
+ }
+ 
