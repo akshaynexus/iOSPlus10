@@ -1,6 +1,9 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+Dual boot round (2026-11-02, branch t3/laurel-dual-boot, patch 2950; built + host-tested, NOTHING RUN ON THE PHONE): owner: LineageOS 24 + iOS without a wipe or GPT change; no flash until asked. Design + steps + recovery: docs/laurel_sprout/dual-boot.md.
+Choice: Lineage on slot a, Mu + XNU on boot_b + stock dtbo_b; root = pinned f2fs file in /data, written raw on sda15; XNU maps it from an ADT table. Found [V]: every existing kernel writes its console log into the last 4 MiB of userdata whatever it holds: a boot of one would damage Android; the guard and 2950 close that. All firmware in Lineage's OTA is byte-identical to stock. Size for iOS 26: 30.01 GiB [I expand 1.68].
+Next: owner decisions D1-D6 in that doc; first step is Rooted debugging, then read slot b.
 AirPlay and AirDrop round (2026-11-01, branch t3/laurel-airplay-airdrop, patches 2930 + 2931, NOT RUN ON THE PHONE): owner "AirPlay and AirDrop both aren't working: enable or fix them". docs/laurel_sprout/airplay-airdrop.md.
 Done: `LAUREL AWDL` self-check (only looks at scanned frames; sends nothing; awdl=0); `laurel-airplay` job and `LAUREL AIRPLAY` line (airplay=0, AIRPLAY=0); AirDrop preferences for en0 (AIRDROP_LAN=0); wifip2pd stays out.
 [V] qcacld monitor device has no Tx, OWL needs injection; negroni 0347 has no data path and never ran. [I] no awdl0 is the right state now. [V] mirroring has no AppleAVE2Driver. [I] Apple TV/HomePod may fail at /fp-setup or PTP. [U] AirPlay audio on en0: no blocker found, no run log.

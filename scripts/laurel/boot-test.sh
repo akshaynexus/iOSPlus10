@@ -29,6 +29,7 @@ ecm_if() { ip -o link | grep -i "$MAC" | awk -F': ' '{print $2}' | cut -d@ -f1; 
 fastboot_dev() { lsusb | awk '/18d1:d00d/{print $4}'; }
 newest_usblog() { ls -t "$REPO"/logs/usblog-*.txt 2>/dev/null | head -1; }
 
+[ "${NOFLASH:-0}" = 1 ] || "$REPO/scripts/laurel/android-guard.sh" boot-image "$IMG" || exit $?   # first, before any wait
 [ -x "$OP" ] || { say "missing $OP (make op10tool)"; exit 1; }
 tmux has-session -t usblog 2>/dev/null || { say "the USB log listener is not running: make usblog (then: tmux attach -t usblog, sudo password)"; exit 1; }
 LOGF=$(newest_usblog)

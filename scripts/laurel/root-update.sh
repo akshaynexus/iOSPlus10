@@ -18,12 +18,16 @@ SIDE=$APPLE/laurel-ios16-root.manifest
 SIMG=$APPLE/laurel-ios16-root.simg
 BOOTIMG=$REPO/out/laurel/uefi/laurel-uefi-boot.img
 case "${1:-}" in
---list|--rollback|--after-boot)
+--rollback)
+  "$REPO/scripts/laurel/android-guard.sh" running-ios
+  exec python3 -I "$MAIN" --dir "$UPD" "$@" ;;
+--list|--after-boot)
   exec python3 -I "$MAIN" --dir "$UPD" "$@" ;;
 --dry-run)
   python3 -I "$M" flash-check "$SIDE" "$SIMG" "$BOOTIMG" || echo "root-update: note: this root would not pass the gate of a real run"
   exec python3 -I "$MAIN" --dir "$UPD" --sidecar "$SIDE" "$@" ;;
 "")
+  "$REPO/scripts/laurel/android-guard.sh" running-ios   # dual boot: only an iOS with the fence on; docs/laurel_sprout/dual-boot.md
   python3 -I "$M" flash-check "$SIDE" "$SIMG" "$BOOTIMG" || { echo "root-update: nothing changed: the gate above failed" >&2; exit 1; }
   exec python3 -I "$MAIN" --dir "$UPD" --sidecar "$SIDE" ;;
 *)

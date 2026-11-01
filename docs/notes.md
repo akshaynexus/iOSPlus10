@@ -4891,3 +4891,14 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - Lesson: an owner on Android can answer the strongest question with no iOS boot: do the same SIMs register there, do 2 IMEIs show.
 - Test pitfall: a new DMS request before `radio_step` moved the first `part:` line earlier (report on the mode answer): new reads go behind the radio's steps. `count_of "(indication)"` also matched `card status (indication)`.
 - Worktree tip: `AUDIT=1 scripts/bg.sh ...` does not pass AUDIT through tmux: it ran a full build (~4 min with ccache). Use `scripts/bg.sh NAME env AUDIT=1 scripts/laurel/kernel-linux.sh`.
+
+## Mi A3: dual boot design + patch 2950 (2026-11-02, branch t3/laurel-dual-boot; built + host tests only, NOTHING RUN ON THE PHONE). Details: docs/laurel_sprout/dual-boot.md
+- [V] **Any existing kernel writes the console log to the last 4 MiB + 4 KiB of userdata every 10 s, unconditionally (sweet_log_thread). On a phone with Android that corrupts /data.** So an old boot image on boot_b is dangerous, also if the root never mounts. 2950: no table = the partition must start with HFS+; `android-guard.sh boot-image` refuses an image without a table while `config/laurel-android-data` exists.
+- [V phone] Lineage: slot _a, sda12 / sde16 / sde4. `adb root`: "ADB Root access is disabled by system setting". ro.debuggable = 0, ro.build.type = userdebug, cmdline buildvariant=user. No block device, slot or f2fs sysfs read without root. `bootctl` from shell: "Failed to get bootctl module".
+- [V] OTA holds 22 partitions; all firmware = the stock ROM files + zero padding (`scripts/laurel/ota-partitions.py`, payload hash); different: boot, dtbo, vbmeta, system, vendor. A plain hash of the file looks different: update_engine hashes the 4 KiB-padded partition image.
+- [V f2fs source] The pin ends: over gc_pin_file_thresh (2048) failed tries f2fs clears it. GET_PIN_FILE answers 0 for "not pinned" and for "no failures": use SET (idempotent, answers the count, EAGAIN over the limit). One FG GC of a pinned segment counts up to 512 tries. Encrypted files count in background GC too (move_data_block).
+- [V HAL source] set_active: 0x3F on the new slot (priority 3, active, 7 retries), the old slot loses only the active bit. [V ABL source] fallback needs successful = 1 and priority > 0.
+- Gotcha: `raw_read` and FIEMAP on btrfs: `cat a > b` makes a reflink: same physical blocks. A test of "file moved" needs new data. In zsh `$B` with spaces is one word: a failed compile looked like a pass until the test ran through `sh`.
+- Gotcha: the host test includes the real `sweet_ufs.c` with fake kernel headers (tools/laurel-dualboot/test): only `ufs_scsi` is replaced. Add a stub there when the driver gets a new call.
+- Built [V]: see docs/laurel_sprout/dual-boot.md section 8; test: scripts/laurel/test-dualboot.sh.
+

@@ -40,7 +40,7 @@ UFS, buttons, D22AP /product) and changes what differs on the Mi A3:
     C 0xC0000000 + 4 GiB (they touch; bank A 0x40000000-0x7CC00000 holds every fixed carve-out). /chosen
     laurel-ram-reserved: device pools that must stay out of kernel RAM: 0xC0000000 + 512 MiB (Adreno GPU pool) and
     0xE0000000 + 16 MiB (TopazModem pool). Kernel patch 2100 checks the boot window against both.
-Usage: mkadt.py OUT.adt [--cores 8|4] [--boot gold|silver] [--dram BASE:SIZE|auto] [--mu-fd FD] [--darwinboot] [--dump]
+Usage: mkadt.py OUT.adt [--cores 8|4] [--boot gold|silver] [--dram BASE:SIZE|auto] [--mu-fd FD] [--darwinboot] [--dualboot-table TABLE] [--dump]
 The D22AP /product node needs the iPhone X device tree $APPLE/d22ap.adt (default ~/op10-apple; Apple file,
 never in git; get it with scripts/ios16/fetch-d22ap-adt.sh). Without it the node is left out (warning).
 """
@@ -312,6 +312,7 @@ if __name__ == '__main__':
     ap.add_argument('--mu-fd', help='Mu FD for --dram auto (its "Kernel RAM" entry decides the window size)')
     ap.add_argument('--darwinboot', action='store_true')
     ap.add_argument('--build-stamp', help='/chosen laurel-image-build: the boot log line of kernel patch 2912 (scripts/laurel/build-stamp.py image-line)')
+    ap.add_argument('--dualboot-table', help='/chosen laurel-dualboot: the extent table of the iOS root on Android /data (kernel patch 2950, op10tool dualboot table)')
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
     if a.dram == 'auto':
@@ -325,6 +326,9 @@ if __name__ == '__main__':
     check(root, a.cores, a.boot, a.darwinboot)
     if a.build_stamp:
         setprop(find(root, 'chosen'), 'laurel-image-build', cstr(a.build_stamp))
+    if a.dualboot_table:
+        with open(a.dualboot_table, 'rb') as t:
+            setprop(find(root, 'chosen'), 'laurel-dualboot', t.read())
     blob = adt.serialize(root)
     adt.parse(blob)   # round trip
     with open(a.out, 'wb') as f:
