@@ -4838,3 +4838,7 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - Gotcha: `scripts/debug/air-re.sh`: `hfs-extract.py` fails with FileNotFoundError for one file unless its parent exists in OUTDIR. iOS SDK has no `bootstrap.h`: declare `bootstrap_look_up` by hand. `ipsw dyld macho IMAGE --strings` gives one image's strings; `dsc-dis.py str TEXT` names the image of a string.
 - Gotcha: a new root feature changes the counts in `build-honest-test.sh` (`14 installed`).
 - Built [V] on merge 6c1a1c6238 (base origin/laurel-sprout cad5efb): kernel-linux.sh 303/303 patches (102 laurel), 0 failed, 0 LSE/RCpc, printf-arg-check OK, 2 linker lines (stub rounds), kernel.development.sweet.4k sha256 703751fd0ee8443d, armv80-check 21 (same count as before). laurel-airplay sha256 682a7464ab4b8bce, 0 instructions newer than ARMv8.0, no warnings. wifi-phy-test passed; root-airplay-job and root-airdrop-lan self-tests passed; build-honest-test 60 of 60; root-dry-run (FEATURES=0) PASS. Full root not built: needs sudo.
+
+## Mi A3: patch 2914 (touch rate) parked: it broke touch on the phone (2026-11-01 23:19)
+- [V log] `touch 0 down at 310,1559 edge`, then `up` only 13 s later, out-of-order touch lines; the owner could not unlock. Finger events get lost with 2 ms latch + 16-byte read.
+- Parked in patches/laurel/parked/. Faster touch needs a rework: read the whole record when a second finger or a lift can occur, never lose a lift. The old path read every 12 ms.
