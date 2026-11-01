@@ -13,6 +13,7 @@ This repository, **iOSPlus10**, incorporates, links against, or builds with comp
 | `patches/xnu-12377/0001-non-apple-soc-base.patch`, `scripts/ios26/kdk-headers.py` (from UniXNU-ios26) | UniXNU contributors | BSD-2-Clause-Patent |
 | `external/Mu-Silicium-negroni` & submodules | Andrei Warkentin, Project Silicium, Microsoft Corp., ARM Ltd., Intel Corp., Apple Inc., Linux Foundation | BSD-2-Clause / Project Mu / EDK II |
 | `external/hackios-xnu-userland` | OOSEX GANG | MIT |
+| FFmpeg libavcodec + libavutil, hevc decoder only (fetched by `scripts/laurel/hevc-build.sh`, n7.1.1, commit db69d06eeeab; static in `HEVCH8.videodecoder`; not in git) | the FFmpeg developers | LGPL-2.1-or-later (see `docs/laurel_sprout/hevc.md` section 10: relinking, HEVC patents) |
 | HakiOS userland (hackios-next; parts in `userland/negronigl/`) | the HakiOS authors | MIT |
 | HakiOS kernel `hakios.mpss.c` (RMTFS / TFTP / service-registry / QRTR name-service port in `patches/xnu/0397-negroni-gnss.patch`: `bsd/dev/negroni_gnss.c`; hackios-next 88513176) | the HakiOS authors | APSL 2.0 (as XNU) |
 | `external/ios-flame` | NWylynko, dipa-studio | MIT |

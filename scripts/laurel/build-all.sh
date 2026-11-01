@@ -10,12 +10,14 @@ scripts/laurel/gpu-userland.sh > logs/stage-gpu.log 2>&1 & g=$!
 scripts/laurel/metal-build.sh > logs/stage-metal.log 2>&1 & m=$!
 scripts/laurel/notch-build.sh > logs/stage-notch.log 2>&1 & n=$!
 sh userland/laurel/camera/build.sh > logs/stage-cam.log 2>&1 & c=$!
+scripts/laurel/hevc-build.sh > logs/stage-hevc.log 2>&1 & h=$!
 r=0
 wait $k || r=kernel
 wait $g || r=gpu
 wait $m || r=metal
 wait $n || r=notch
 wait $c || r=camera
+wait $h || echo "build-all: hevc build failed (logs/stage-hevc.log): the root gets laurel-root: hevc: off, nothing else changes" >&2
 [ "$r" = 0 ] || { echo "build-all: $r failed (logs/stage-*.log)" >&2; exit 1; }
 scripts/laurel/uefi-image.sh > logs/stage-image.log 2>&1 || { echo "build-all: uefi-image failed" >&2; exit 1; }
 echo "build-all: done"

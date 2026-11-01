@@ -1,8 +1,10 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+HEVC round (2026-11-01 21:00, branch t3/laurel-heic-driver, built + host-tested, NOT BOOTED): owner "Do not convert HEIC to PNG; write a proper HEIC driver". PNG step removed. `HEVCH8.videodecoder` = FFmpeg 7.1.1 hevc in VideoToolbox's empty slot, rating ahead of Apple's VCPHEVC; `laurel_hevc=0` / HEVC=0 fall back to it.
+[V cache] The plan line below is wrong: 20H392 has a software HEVC decoder with no gate (VCPHEVC.videocodec, ARMv8.0 clean). Where HEIC fails on this phone: [U], no log shows it. Host: 48 images + 42 alpha images bit-exact with libde265; B-frame, 10-bit, mono clips PASS. Not run anywhere: NEON assembly. Next: root + boot, `docs/laurel_sprout/hevc.md` section 8 (its table splits decoder fault from CA/Metal fault).
 Real-GPU round (2026-11-01 19:30, branch t3/laurel-metal-realgpu, built, NOT BOOTED): boot 18:40 = first Metal on the GPU; owner: home wallpaper black.
-Most likely cause [I]: default wallpaper 7400 is HEIC layers, no HEVC decoder here (ios-flame found the same black layer) -> root-wallpaper.sh writes PNGs. Also: launchd's 5 s extension
+Most likely cause [I]: default wallpaper 7400 is HEIC layers, no HEVC decoder here (ios-flame found the same black layer) -> root-wallpaper.sh wrote PNGs (removed, see the HEVC round above). Also: launchd's 5 s extension
 kill loop (AegirPoster) -> boot-arg launchd_disable_all_timeouts=1, poster strike rule; device open 3-10 s [I flat lookups of 3312 weak imports] -> macho-weak-self.py;
 173 surface imports refused (kernel's GL rule) -> stand-in falls back to 0x49; RB_COLOR_MODE too late -> launchd job env; heap sizes from the runtime; one line per cause; gpuCoreCount 1.
 mediaserverd "low swap" kills: [I] camera frame leak, open. Needs root + boot image rebuild. Next: boot, metal.md section 11.5. Details: docs/laurel_sprout/metal.md section 11.

@@ -7,7 +7,7 @@
 #        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped) and
 #        root-tweaks-boldtext.py, root-add-gpu.sh (GPU), root-add-metal.sh (Metal, METAL=0 skips), root-audio.sh
 #        (speaker HAL plug-in; AUDIO=0 skips), root-bt.sh (Bluetooth userland; BT=0 skips), root-camera.sh (sensor tables, NegroniCamera.driver;
-#        CAMERA=0 skips), root-statusbar.py
+#        CAMERA=0 skips), root-hevc.sh (HEVC/HEIC decoder; HEVC=0 skips), root-statusbar.py
 #        (status bar provider for 360x780 pt + the waterdrop dylib for SpringBoard from out/laurel/notch, scripts/laurel/notch-build.sh;
 #        STATUSBAR=0 skips both, NOTCH=0 only the dylib), root-flashlight.sh (the flashlight's one owner: camera plug-in, else its own plug-in; TORCH=0 = no button) and root-brightness.py
 #        (auto-brightness off; BRIGHTNESS=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
@@ -81,8 +81,8 @@ bash "$REPO/scripts/laurel/root-add-gpu.sh" "$mnt"
 # scripts/laurel/metal-build.sh has staged them; METAL=0 skips. Without the stage it logs "metal: off" and goes on.
 # (AREA B's scripts/laurel/root-add-gpu.sh, GPU firmware + GL, goes before this line: Metal checks for B's backboardd wrapper)
 METAL=${METAL:-1} sh "$REPO/scripts/laurel/root-add-metal.sh" "$mnt"
-# stock wallpapers: HEIC layers as PNG (no HEVC decoder on this phone: black wallpaper; WALLPAPER_PNG=0 skips)
-bash "$REPO/scripts/laurel/root-wallpaper.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-wallpaper.sh failed; root build continues"
+# HEVC/HEIC: software decoder in VideoToolbox's empty HEVCH8 slot (docs/laurel_sprout/hevc.md); HEVC=0 skips: Apple's VCPHEVC alone
+HEVC=${HEVC:-1} bash "$REPO/scripts/laurel/root-hevc.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-hevc.sh failed; root built without our HEVC decoder" >&2
 # speaker audio (kernel patch 2500): RedwoodAudio.driver HAL plug-in, VirtualAudio back, BTAudio off
 AUDIO=${AUDIO:-1} bash "$REPO/scripts/laurel/root-audio.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-audio.sh failed; root built without audio" >&2
 # Bluetooth (kernel patch 2600): bluetoothd job back + the BlueTool stand-in; BT=0 skips
