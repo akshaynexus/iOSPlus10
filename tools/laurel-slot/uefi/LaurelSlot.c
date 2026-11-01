@@ -231,11 +231,16 @@ LaurelSlotSelfCheck (
   // The owner must see what happens with no key: at most 7 boots, then Android.
   //
   if ((Table.flags_b & LS_ACTIVE) && !(Table.flags_b & LS_SUCCESSFUL) && (LS_RETRIES (Table.flags_b) <= LS_REFILL_AT)) {
-    if (ReadImemWord () == LS_PANIC_WORD) {
-      UnicodeSPrint (Notice, NoticeSize, L"iOS panicked. Android after %u more boots", LS_RETRIES (Table.flags_b) + 1);
-    } else {
-      UnicodeSPrint (Notice, NoticeSize, L"Android after %u more boots: press a key to stay", LS_RETRIES (Table.flags_b) + 1);
-    }
+    //
+    // [V ABL] retries R: R more iOS boots, then Android. This boot is already counted.
+    //
+    UnicodeSPrint (
+      Notice,
+      NoticeSize,
+      L"%sAndroid after %u more boots: press a key to stay",
+      (ReadImemWord () == LS_PANIC_WORD) ? L"iOS panicked. " : L"",
+      LS_RETRIES (Table.flags_b)
+      );
   } else if (ReadImemWord () == LS_PANIC_WORD) {
     UnicodeSPrint (Notice, NoticeSize, L"The last iOS boot panicked");
   }

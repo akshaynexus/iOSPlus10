@@ -10,7 +10,7 @@ Owner requirement (2026-11-02): choose iOS or Android from the device, not only 
 
 | Way | What the owner does | What writes |
 | --- | --- | --- |
-| Power on, slot b active | Panel shows the UniXNU menu 5 s. No key: iOS. Volume keys select, Power boots. **No key in 7 boots in a row: ABL returns to Android by itself.** The menu says so at 4 boots left | one flag byte, only after a key press with at most 4 boots left (section 4) |
+| Power on, slot b active | Panel shows the UniXNU menu 5 s. No key: iOS. Volume keys select, Power boots. **No key in 7 boots in a row: ABL returns to Android by itself.** The menu says so from 3 boots left | one flag byte, only after a key press with at most 3 boots left (section 4) |
 | iOS -> Android | Restart iOS (any plain reboot), or iOS panics (reset after 30 s on the paths of section 4.1), or iOS hangs: hold Power until it resets. Then in the menu: Vol Down, Power, Power | Mu: one flag byte in the GPT. ABL does the rest at the reset |
 | Android -> iOS | One tap on the Quick Settings tile "Boot iOS" | the boot control HAL, then a normal Android reboot |
 
@@ -101,7 +101,7 @@ An earlier version counted input handles and checked for a GOP. That proved noth
 | GPT write refused, table odd, low battery | refill off, line on the log | same |
 | Keys work, XNU panics or hangs | section 4.1, menu | Owner: Vol Down, Power, Power. No computer |
 
-**The cost, plainly:** the owner must press a key about once per 4 iOS boots, or the phone is on Android after 7 boots with no key. The menu says it from 4 boots left: "Android after N more boots: press a key to stay". Any key counts, then Power to boot iOS.
+**The cost, plainly:** the owner must press a key about once per 4 iOS boots, or the phone is on Android after 7 boots with no key. The menu says it from 3 boots left: "Android after N more boots: press a key to stay". Any key counts, then Power to boot iOS.
 
 Numbers [V host test]: with a key in each menu, 100 iOS boots = 50 write commands (25 refills: 2 commands each, one flag byte). A broken Mu falls back within 7 boots from a full count, at least 4 from the lowest count after a refill point.
 
@@ -203,14 +203,14 @@ Any authorized key can get root, as the owner's computer can today. USB debuggin
 
 | Step | Command | Result [V, host, 2026-11-02] |
 | --- | --- | --- |
-| Mu | `scripts/laurel/mu-build.sh` (private tree: `scripts/laurel/mu-private-tree.sh`, then `MU_TREE= UNIXNU_TREE= SETUP=0`) | FD 3,145,728 bytes (the fixed FV), FVMAIN_COMPACT 1,404,888 used, 1,740,840 free. f1563f3b |
-| Kernel iOS 16 | `scripts/laurel/kernel-linux.sh` | 312/312 patches, 0 failed, 0 LSE/RCpc, printf check OK, fence V3 text. 7210b49c |
-| Kernel iOS 26 | `scripts/laurel/kernel-ios26-linux.sh` | series 212 applied, 84 applied+rules, 7 skipped, 11 base, 0 errors, 0 LSE/RCpc, fence V3 text. 336df6fe |
+| Mu | `scripts/laurel/mu-build.sh` (private tree: `scripts/laurel/mu-private-tree.sh`, then `MU_TREE= UNIXNU_TREE= SETUP=0`) | FD 3,145,728 bytes (the fixed FV), FVMAIN_COMPACT 1,405,4xx used of it |
+| Kernel iOS 16 | `scripts/laurel/kernel-linux.sh` | 314/314 patches, 0 failed, 0 LSE/RCpc, printf check OK, fence V3 text, 2955, 2956 |
+| Kernel iOS 26 | `scripts/laurel/kernel-ios26-linux.sh` | series 212 applied, 86 applied+rules, 7 skipped, 11 base, 0 errors, 0 LSE/RCpc, printf check OK. 2955 applied, 2956 applied+rules (3way `osfmk/kern/debug.c`) |
 | Images, both modes, iOS 16 and iOS 26 | `dual-boot.sh image`; `LAUREL_READONLY=0 ...-image.sh` | **52,867,072 bytes each** of 67,108,864 (boot_b 64 MiB). Header v2, os 17.0.0, 2026-10 = Lineage's. `dual-boot.sh image rw` refuses with no record: "no recorded result of a read-only boot of this kernel fence" |
-| APK | `scripts/laurel/switcher-build.sh` | 21,034 bytes, `apksigner verify` OK, target SDK 36, fence and sizes filled in. 96e71314 |
-| Host test | `scripts/bg.sh menu-test scripts/laurel/boot-menu-test.sh` | slot core 645 checks (ASan, UBSan) on the phone's dump; helper 27 cases; client 15 checks; TOML; mkbootimg header page; real images of 7 builds: **PASS** |
-| UEFI test | `scripts/bg.sh menu-qemu scripts/laurel/boot-menu-qemu.sh` | real `UniXNU.efi` on AAVMF, 720x1560, disks from the dump at 4096-byte blocks: 10 scenarios, 28 checks, **0 failures** |
-| Dual boot | `scripts/laurel/test-dualboot.sh` | PASS: `test_kernel` 42720 checks, helper 12, guard 70, `dual-boot-test` 73 (1 new: `image rw` passes the root's hash on) |
+| APK | `scripts/laurel/switcher-build.sh` | 25,187 bytes, `apksigner verify` OK, target SDK 36, fence, sizes, list and port filled in |
+| Host test | `scripts/bg.sh menu-test scripts/laurel/boot-menu-test.sh` | slot core 661 checks (ASan, UBSan) on the phone's dump; helper 52 cases; client 27 checks; TOML; mkbootimg header page; real images of 7 builds: **PASS** |
+| UEFI test | `scripts/bg.sh menu-qemu scripts/laurel/boot-menu-qemu.sh` | real `UniXNU.efi` on AAVMF, 720x1560, disks from the dump at 4096-byte blocks: 12 scenarios, 33 checks, **0 failures** |
+| Dual boot | `scripts/laurel/test-dualboot.sh` | PASS: `test_kernel` 42720 checks, helper 12, guard 70, `dual-boot-test` 73 |
 | Older tests | `build-honest-test.sh` 60/60 | PASS |
 
 What the host test holds for the flow: a read-only image, `BOOT_MENU=0` and `MU_ONLY=1` are refused by the helper as "not our image"; a writable image with no root mark is refused; a writable image with the root mark says "ready"; each has Lineage's OS field; a read-only image holds no `ufsrw=` or `rootrw=`, one entry, 3 s, no `laurelpanic`. Also a fake phone with: other OS field in boot_a, older fence, other root in `iosroot`, wrong partition number or size, a script with no build numbers.
@@ -221,17 +221,17 @@ What the host test holds:
 - 18 damaged or odd tables refused, 0 writes each: signature, revision, header CRC, other LBA, entry byte, entry count, entry size, entry LBA, in either copy; valid copies that differ in a GUID, a name, attribute byte 7, flags of another partition, a first LBA; two boot_a; no boot_b; block size; LUN size.
 - A model of ABL and the HAL [written from the source, so it proves the code against my reading, not against the phone]: 100 boots with refill; Android choice leads to slot a; broken Mu falls back; **a flag-only slot change is refused by the model's `ValidateSlotGuids`**; a cut at every block; a write error at each command.
 
-What the UEFI test holds [V real firmware, real `BlockIo`, `-no-reboot` sees the reset]: refill at 3, no write at 4; Vol-Down-Power-Power = `LAUREL SLOT: Android: a 73->73 b 3F->07: ok`, then the reset, 18 bytes changed, all allowed; held Enter chooses nothing; cancel writes nothing; refused on copies that differ, on two LUNs, on slot a active; a primary with a bad CRC is restored by the firmware before the menu; no keyboard = no refill. Screenshot `out/laurel/menu-qemu/menu.png`.
+What the UEFI test holds [V real firmware, real `BlockIo`, `-no-reboot` sees the reset]: **no key = no write at any count**; a key at 3 = refill, a key at 4 = no write; slot a not successful = refused, its byte unchanged; no keyboard = no refill; Vol-Down-Power-Power = `LAUREL SLOT: Android: a 73->73 b 3F->07: ok`, then the reset, 18 bytes changed, all allowed; held Enter chooses nothing; cancel writes nothing; refused on copies that differ, on two LUNs, on slot a active; a primary with a bad CRC is restored by the firmware before the menu. Not there: the panic word (no IMEM page), the battery protocol (absent: log line). Screenshot `out/laurel/menu-qemu/menu.png`.
 
-It does not hold: Qualcomm `UFSDxe`, `ButtonsDxe`, ABL, the panel.
+It does not hold: Qualcomm `UFSDxe`, `ButtonsDxe`, `ChargerExDxe`, ABL, the panel, IMEM.
 
-Kill switches: `BOOT_MENU=0 scripts/laurel/uefi-image.sh`: the old menu, no Android entry, Mu writes nothing. `laurelpowerhold=0`. Lines to read: `LAUREL SLOT: on|off: reason`, `LAUREL POWERKEY: on|off: reason`, `LAUREL SWITCH: ok|refused: reason`.
+Kill switches: `BOOT_MENU=0 scripts/laurel/uefi-image.sh`: the old menu, no Android entry, Mu writes nothing. `laurelpowerhold=0`. Lines to read: `LAUREL SLOT: on|off: reason`, `LAUREL POWERKEY: on|off: reason`, `LAUREL PANIC: reset in N s`, `LAUREL SWITCH: ok|refused: reason`, `LAUREL PORT: on|off: reason`.
 
 ## 8. Owner decisions
 
 | # | Decision | State |
 | --- | --- | --- |
-| O1 | **Mu writes the GPT of the boot LUN (LUN 4)**: one byte + CRCs in both copies, at each Android choice and after a key press at <= 4 boots left. Only in the writable image. D8 of `dual-boot.md` covers LUN 0 only. The window: section 3, the same as at every ABL retry. | Open. Recommendation: yes, no other design gives a device-side choice. `BOOT_MENU=0` is the way out |
+| O1 | **Mu writes the GPT of the boot LUN (LUN 4)**: one byte + CRCs in both copies, at each Android choice and after a key press at <= 3 boots left. Only in the writable image. D8 of `dual-boot.md` covers LUN 0 only. The window: section 3, the same as at every ABL retry. | Open. Recommendation: yes, no other design gives a device-side choice. `BOOT_MENU=0` is the way out |
 | O2 | Android -> iOS | **Decided: adbd, with less exposure.** Section 6.2 |
 | O3 | Patch 2955 sets a hold-Power reset for a hung kernel when nothing else has set it. No lasting effect in Android: [V `laurel_sprout-trinket-power.dtsi`] Android writes `pon_1` 4480 + 2000 ms hard reset at probe. So "hold until it resets": after a warm reboot from Android about 6.5 s, after a cold start with 2955 8.7 s | Open. Recommendation: yes |
 | O4 | The cost of the key gate: a key press once per about 4 iOS boots, or Android after 7 | Open. Later a stored "keys work" flag can lower this, when a store is proven |
@@ -243,7 +243,7 @@ Order of the first test. Each step is one flash or one tap, and the owner decide
 
 1. Steps 0-11 of `dual-boot.md` come first, with no menu. Then step 12: `dual-boot.sh image rw`, `flash-slot-b rw`. O1 must be decided before this flash; without O1 build with `BOOT_MENU=0`.
 2. **Menu on the panel, keys work?** `CONFIRM=switch dual-boot.sh switch rw`. Read: `LAUREL SLOT: on:`, a key moves the highlight. [U] the biggest open point for this feature.
-3. iOS by timeout, no key, reboot: the count falls, nothing written by Mu (`refill off: no key event`). Then at 4 boots left the notice, a key, Power: **retries back to 7?** `[U] WriteBlocks on the LUN in UEFI`, `[U] flags as seen by the next ABL`, `[U] GetBatteryVoltage from Mu`.
+3. iOS by timeout, no key, reboot: the count falls, nothing written by Mu (`refill off: no key event`). Then at 3 boots left the notice, a key, Power: **retries back to 7?** `[U] WriteBlocks on the LUN in UEFI`, `[U] flags as seen by the next ABL`, `[U] GetBatteryVoltage from Mu`.
 4. **Android from the menu.** [U] ABL's fallback when entered from Mu's byte; [V earlier on phone] from real retries. Android must open its data: `dual-boot.md` section 4.
 5. Hold Power until it resets, in a running iOS. `[U] the PMIC takes the S2 write from the kernel`. Linux writes the same registers [V], so [I] yes. Else Power + Vol Down. A panic with the cable out: the reset after 30 s (2956), and `The last iOS boot panicked` in the menu `[U] the word survives`.
 6. App: `LAUREL PORT: on` in logcat after a boot, `/proc/net/tcp*` shows 127.0.0.1 only; Check, dialog, root, `LAUREL SWITCH: ok`, adbd is shell after it. [U] everything real: properties set from the `su` domain, adbd's key dialog over TCP, `root:` and `unroot:` over TCP, Keystore RSA with `NONEwithRSA` on this TEE before the first unlock, the boot receiver on Android 17, the tile (`startActivityAndCollapse`), a 12 KB `shell:` line.

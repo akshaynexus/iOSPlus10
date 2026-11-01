@@ -5061,3 +5061,14 @@ Done: `debug()` hook, `scripts/laurel/root-debug-ios26.sh` (uses `root-add-ssh.p
 - Trap, my error: `scripts/debug/macho-xref.py` wrote `launchd.s`, `launchd.s.pkl` and the same for `launchd_cache_loader` beside its input, in `~/op10-apple/ios26/23F84-n104ap/lowered/macho/os`. A file there stops `ios26-root.sh`: "lowered file without a place in the volume". Removed (they stood from 03:54 to about 04:12 on 2026-11-02). The tool now writes to `out/macho-xref/`. **A root build started in that time and stopped with that line is this; run it again.**
 - Trap, my error: the first wire test of `ios26-diag.py` sent 6 lines `LAUREL BUILD: fake N` + 6 lines `exec launchd` over loopback to UDP 5140, and the running usblog of the owner wrote them to `logs/usblog-20261101-165828.txt` at 04:15:20 and 04:15:25. The file stays as it is: a live process writes it. The test now uses port 15140.
 Results: see plan.md. Not run: everything on the phone. Next (owner decides any flash): root rebuild with the commands of `ios26-first-boot.md` section 7, first boot, `make laurel-ios26-diag`.
+
+## Mi A3: boot menu after the independent review (2026-11-02, branch t3/laurel-boot-menu; host and QEMU only, nothing flashed)
+Full text: `docs/laurel_sprout/boot-menu.md`.
+- [V this phone's xbl_b, disassembly] The XBL loader has a backup GPT reader: 0xc258bac checks signature, header CRC, own LBA, entry CRC; caller 0xc2589c4 tries LBA 1, then block count - 1. So a torn primary does not end in EDL for its lookups. XBL Core and ABL behind it: not read.
+- [V phone] `update_engine_client` is not on Lineage 24, the daemon is. [V source] `adb_port` / ADB over network is gone from lineage-24.0. [V phone] `su` is permissive (`typepermissive su`), `service.adb.listen_addrs` and `persist.adb.tcp.port` have no own context (`default_prop`, readable by coredomain).
+- [V adb source] In adbd `tcp:N` = any address, `tcp:localhost:N` = loopback, and `service.adb.listen_addrs` wins over both port properties. It is not persist: a window at each boot.
+- [V code] `laurel_usb_panic_hold` returns with no USB, debug=0xc never sends kPEPanicRestartCPU, and PE_halt_restart is not set before SweetPlatformExpert::start: "reset after N s" held only with USB up. 2956 hooks panic_spin_forever.
+- A handle count or a GOP proves no working key or panel. Only a key event does. Then an unattended loop ends at ABL's retries with 0 writes by Mu.
+- bootctl: no = stdout 0, exit 70; a HAL error also exits 70. `|| refuse` hides the difference: use a three-way answer.
+- A helper's `return 1` inside a pipeline's left side loses the status and hashes nothing: e3b0c442 is the hash of empty. Seen in zsh by hand: `for x in $VAR` does not split in zsh.
+- Next: owner decisions O1, O3, O4, O5; then section 9.
