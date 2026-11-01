@@ -74,9 +74,10 @@ laurel_metal_tools() {
   done
   # lipo: llvm-lipo prints "arm64 " (a blank at the end); the negroni scripts compare the whole line
   command -v llvm-lipo > /dev/null || { echo "metal: missing llvm-lipo (pacman -S llvm / apt install llvm)" >&2; return 1; }
-  rm -f "$TOOLBIN/lipo"
-  printf '#!/bin/sh\nllvm-lipo "$@" | sed "s/ *$//"\n' > "$TOOLBIN/lipo"
-  chmod 755 "$TOOLBIN/lipo"
+  # parallel metal-build steps source this file: write a new file, then move it, so no step sees a missing or half-written lipo
+  printf '#!/bin/sh\nllvm-lipo "$@" | sed "s/ *$//"\n' > "$TOOLBIN/lipo.$$"
+  chmod 755 "$TOOLBIN/lipo.$$"
+  mv -f "$TOOLBIN/lipo.$$" "$TOOLBIN/lipo"
   for t in otool:llvm-otool install_name_tool:llvm-install-name-tool nm:llvm-nm; do
     command -v "${t#*:}" > /dev/null || { echo "metal: missing ${t#*:} (pacman -S llvm / apt install llvm)" >&2; return 1; }
     ln -sf "$(command -v "${t#*:}")" "$TOOLBIN/${t%%:*}"
