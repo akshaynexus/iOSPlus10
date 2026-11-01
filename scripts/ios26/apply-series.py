@@ -17,6 +17,8 @@ exit status 1, so a new iOS 16 patch that breaks on 12377 shows at once.
 --dev     a failing patch is applied with --reject; the result line lists the rejected files (to write rules)
 --commit  one git commit per step in XNU_DIR ("git diff HEAD" after an edit shows what a rule must do)
 --upto    stop before the first series patch whose name sorts at or after NNNN
+--profile FILE  another device's rules module (default patch-rules.py): BASE, STAGE_ENV, stage_scripts(), series(),
+          SHADOW (tree of the iOS 16 series for three-way merges; see scripts/laurel/ios26-series.py)
 """
 import argparse
 import fnmatch
@@ -33,9 +35,15 @@ P26 = REPO / "patches" / "xnu-12377"
 sys.path.insert(0, str(HERE))
 import importlib.util  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location("patch_rules", HERE / "patch-rules.py")
+# Profile: the rules module. Default = the negroni series (patch-rules.py). --profile FILE (or APPLY_SERIES_PROFILE)
+# gives another device its own series on the same tool; see scripts/laurel/ios26-series.py for the Mi A3.
+_prof = os.environ.get("APPLY_SERIES_PROFILE") or next(
+    (sys.argv[i + 1] for i, x in enumerate(sys.argv[:-1]) if x == "--profile"), str(HERE / "patch-rules.py"))
+_spec = importlib.util.spec_from_file_location("patch_rules", _prof)
 rules_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rules_mod)
+if hasattr(rules_mod, "P26"):
+    P26 = rules_mod.P26
 
 
 def slop_dir():
@@ -273,18 +281,56 @@ def git_apply(xnu, text, check_only=False, reject=False):
         os.unlink(path)
 
 
+def shadow_step(shadow, text):
+    """Three-way support: apply the original patch to the shadow tree (the iOS 16 series on its own xnu tag).
+    Returns ({path: text before}, {path: text after}, error). A patch the shadow refuses is an error: the series
+    itself is broken."""
+    _, secs = parse(text)
+    before = {}
+    for s in secs:
+        f = shadow / s.path
+        before[s.path] = f.read_text(encoding="latin-1") if f.exists() else None
+    r = git_apply(str(shadow), text)
+    if r.returncode:
+        return before, {}, (r.stderr or r.stdout).strip()[:200]
+    after = {}
+    for s in secs:
+        f = shadow / s.path
+        after[s.path] = f.read_text(encoding="latin-1") if f.exists() else None
+    return before, after, ""
+
+
+def merge3(xnu, path, base, ours):
+    """git merge-file: the iOS 16 change (base -> ours) on the 12377 file. Returns the number of conflicts (the tree
+    file holds the markers then), or -1 when the file is not in the tree."""
+    f = Path(xnu) / path
+    if not f.exists():
+        return -1
+    with tempfile.TemporaryDirectory() as d:
+        a, b = Path(d) / "base", Path(d) / "ours"
+        a.write_text(base or "", encoding="latin-1")
+        b.write_text(ours or "", encoding="latin-1")
+        r = subprocess.run(["git", "merge-file", "-L", "12377", "-L", "8796-before", "-L", "8796-after", str(f), str(a), str(b)],
+                           capture_output=True)
+    return r.returncode
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("xnu")
     ap.add_argument("--dev", action="store_true")
     ap.add_argument("--commit", action="store_true")
     ap.add_argument("--upto")
+    ap.add_argument("--profile")
     a = ap.parse_args()
     xnu = str(Path(a.xnu).resolve())
-    S = slop_dir()
+    S = slop_dir() if not hasattr(rules_mod, "series") else None
+    shadow = Path(rules_mod.SHADOW) if getattr(rules_mod, "SHADOW", None) else None
+    bases = {}   # owned file -> done
     skip, rules = rules_mod.SKIP, rules_mod.RULES
     bad = []
     count = {"applied": 0, "applied+rules": 0, "replaced": 0, "skipped": 0}
+    # (a profile with a shadow tree also counts "base": patches whose whole change is in the base)
     used_skip, used_replace = set(), set()
     rule_hits = [0] * len(rules)
 
@@ -300,14 +346,15 @@ def main():
                  "user.email=apply-series@localhost", "commit", "-q", "--allow-empty", "-m", msg], xnu)
 
     print(f"== base ({P26})")
-    for p in sorted(P26.glob("[0-9][0-9][0-9][0-9]-*.patch")):
+    base = rules_mod.BASE if hasattr(rules_mod, "BASE") else sorted(P26.glob("[0-9][0-9][0-9][0-9]-*.patch"))
+    for p in base:
         r = git_apply(xnu, p.read_text(encoding="latin-1"))
         res(p.name, "base" if r.returncode == 0 else "ERROR: base patch does not apply: " + r.stderr.strip()[:200])
         step("base " + p.name)
 
-    print(f"== stage scripts ({S})")
-    env = dict(os.environ, MACHINE_CONFIG="NEGRONI")
-    for s in sorted(S.glob("*.sh")):
+    print(f"== stage scripts ({S or 'profile'})")
+    env = dict(os.environ, **getattr(rules_mod, "STAGE_ENV", {"MACHINE_CONFIG": "NEGRONI"}))
+    for s in (rules_mod.stage_scripts() if hasattr(rules_mod, "stage_scripts") else sorted(S.glob("*.sh"))):
         if s.name in skip:
             used_skip.add(s.name)
             count["skipped"] += 1
@@ -318,13 +365,22 @@ def main():
         step("script " + s.name)
 
     print("== series (slop + patches/xnu)")
-    series = [p for p in S.glob("*.patch") if p.name != "0127-negroni-gpu-show.patch"]
-    series += list((REPO / "patches" / "xnu").glob("*.patch"))
+    if hasattr(rules_mod, "series"):
+        series = rules_mod.series()
+    else:
+        series = [p for p in S.glob("*.patch") if p.name != "0127-negroni-gpu-show.patch"]
+        series += list((REPO / "patches" / "xnu").glob("*.patch"))
     for p in sorted(series, key=lambda x: x.name):
         name = p.name
         if a.upto and name >= a.upto:
             print("stop before " + name)
             break
+        sh_before, sh_after = {}, {}
+        if shadow:
+            sh_before, sh_after, sherr = shadow_step(shadow, p.read_text(encoding="latin-1"))
+            if sherr:
+                res(name, "ERROR: the iOS 16 series itself does not apply (shadow tree): " + sherr)
+                continue
         if name in skip:
             used_skip.add(name)
             count["skipped"] += 1
@@ -375,6 +431,11 @@ def main():
         if owned_err:
             res(name, "ERROR: changes a file of the 12377 base: " + ", ".join(owned_err))
             continue
+        if not keep and shadow:     # a patch whose whole change lives in the base owns one result line
+            count["base"] = count.get("base", 0) + 1
+            res(name, "base: " + ", ".join(sorted(set(tags))))
+            step(name)
+            continue
         if not keep:
             res(name, "ERROR: nothing left after the base-owned files: add it to skip.txt (in 12377 base)")
             continue
@@ -389,12 +450,39 @@ def main():
             continue
         if not keep:
             r = subprocess.CompletedProcess([], 0, "", "")
+        elif shadow:
+            # one section at a time: a section that does not apply as text is merged three-way from the iOS 16 series
+            r = subprocess.CompletedProcess([], 0, "", "")
+            conflicts, merged = [], []
+            for s in keep:
+                rs = git_apply(xnu, render([], [s]))
+                if rs.returncode == 0:
+                    continue
+                isnew = any(l.startswith(("--- /dev/null", "new file")) for l in s.header)
+                if isnew or s.path not in sh_after:
+                    conflicts.append(s.path + " (does not apply: " + (rs.stderr.strip().splitlines() or ["?"])[0][:80] + ")")
+                    continue
+                c = merge3(xnu, s.path, sh_before[s.path], sh_after[s.path])
+                if c == 0:
+                    merged.append(s.path)
+                elif c < 0:
+                    conflicts.append(s.path + " (not in 12377)")
+                else:
+                    conflicts.append(s.path + f" ({c} conflicts)")
+            if merged:
+                tags.append("3way " + " ".join(merged))
+            if conflicts:
+                r = subprocess.CompletedProcess([], 1, "", "merge: " + "; ".join(conflicts))
         else:
             r = git_apply(xnu, text)
         if r.returncode == 0 or a.dev:
             gerr = [e for e in (apply_glue(xnu, s) for s in glue) if e]
             if gerr:
                 res(name, "ERROR: build-list lines: " + "; ".join(gerr))
+        if r.returncode and shadow:
+            res(name, "ERROR: " + r.stderr)
+            step(name + " (conflicts)")
+            continue
         if r.returncode:
             if a.dev:
                 rej = git_apply(xnu, text, reject=True)
@@ -424,6 +512,12 @@ def main():
             res(name, "applied")
         step(name)
 
+    step("series end")
+    for pp in getattr(rules_mod, "POST", []):
+        # a profile's 12377 API fixes of files that the series creates: one patch after the series
+        r = git_apply(xnu, pp.read_text(encoding="latin-1"))
+        res(pp.name, "post" if r.returncode == 0 else "ERROR: post patch does not apply: " + r.stderr.strip()[:200])
+        step("post " + pp.name)
     if not a.upto:
         for n in sorted(set(skip) - used_skip):
             res(n, "ERROR: skip.txt entry names no series patch (stale)")

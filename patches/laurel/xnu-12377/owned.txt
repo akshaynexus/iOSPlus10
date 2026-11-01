@@ -1,0 +1,26 @@
+# file, base patch, series patches whose change of that file the base holds (ios26-base-refresh.py)
+config/MASTER.arm64.sweet 0002 0006 0007 0008 0021 0026 0037 0057
+config/Private.arm64.exports 0002 0009
+config/Private.exports 0002 0009
+makedefs/MakeInc.def 0002 0001 0004 0081 0140
+pexpert/pexpert/arm64/Makefile 0002 0004
+pexpert/pexpert/arm64/board_config.h 0002 0004 0141
+osfmk/arm/arm_init.c 0003 0010 0012 2100
+osfmk/arm64/arm_vm_init.c 0003 0010 0011 0012 0140 0142
+osfmk/arm64/caches_asm.s 0003 0008
+osfmk/arm64/cpu.c 0003 0065 2004 2006
+osfmk/arm64/sleh.c 0003 0004 0017 0081
+osfmk/arm64/start.s 0003 0004 0008 0010 0065 0140 0142 2016
+pexpert/pexpert/arm/protos.h 0003 0003 0017
+pexpert/arm/pe_serial.c 0004 0003 0012 2870
+osfmk/console/serial_console.c 0004 0047 0067 0112
+osfmk/kern/startup.c 0004 2014
+iokit/Kernel/IOStartIOKit.cpp 0004 0128 2000 2720
+osfmk/prng/prng_random.c 0005 0014
+osfmk/vm/vm_map_store.c 0005 
+bsd/kern/kern_memorystatus.c 0005 0915
+osfmk/kern/zalloc.c 0005 0140
+osfmk/vm/vm_shared_region.c 0005 0140
+osfmk/vm/vm_page.h 0005 
+osfmk/vm/vm_resident.c 0005 
+osfmk/kern/sched_clutch.c 0005 
