@@ -4762,7 +4762,8 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - Decisions: no GPU ISP and no zero copy before the phone's numbers; AE cap 30 fps in preview (dark rooms get gain, not time). Half-cell step only if the picture work passes 24 ms.
 - Cached alias: write-back, read-only, `topaz_gpu_pool_map_cached` in TopazAdreno.cpp; clean + invalidate before each copy; the buffer is stable while `ring.reading` holds it. Patch number 2913: after all others, base = the full patched tree (`scripts/laurel/camera-patch.sh BASE WORK 2913-laurel-camera-speed`, also takes iokit/).
 - Worktree: symlink `external/{ios-sweet-linux,ios-topaz}`, `out/laurel-kernel/{cache,deps,theos,dl}`, `out/laurel-metal/ipsw`, `out/laurel/camera/{lib,etc}` to the main checkout.
-- Built: kernel-linux.sh 296/296 patches, 0 LSE, kernel.development.sweet.4k sha256 3b5158a5f4082220...; NegroniCamera.driver sha256 e662a7996a01ab04... (183648 bytes); cam-test OK (+ cam9), cam-leak-test OK, camera-cache-check PASS, 161 imports OK.
+- Built after the merge with mic 2920 + wifi 2887: kernel-linux.sh 298/298 patches, 0 LSE, boot line `LAUREL BUILD: a269b14267 298 patches, series cc5c09aa7a000c3c, 4k`, kernel.development.sweet.4k sha256 3005beabf9153f08...; NegroniCamera.driver sha256 d047e5251f21a0a0... (183648 bytes); cam-test OK (+ cam9), cam-leak-test OK, camera-cache-check PASS, 161 imports OK.
+- With mic 2920 the capture audio has real input for the first time: [U] whether the time stamps still jump; the silence stays off either way. Video sound keeps its own times.
 
 ## Mi A3: kernel panic log_encode.c:121 from one printf with 48 values (2026-11-01 22:22, 22:26)
 - [V log] Two panics, one at the first `LAUREL WIFI: link` line of a session; the text is glued to the end of that line:

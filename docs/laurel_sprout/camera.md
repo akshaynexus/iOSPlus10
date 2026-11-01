@@ -838,7 +838,7 @@ Not done, with the reason: **GPU ISP**: no Metal source compile on this path, an
 
 ### Build and tests [V]
 
-`scripts/laurel/kernel-linux.sh` (job cama-kernel): 296/296 patches, 0 LSE. `userland/laurel/camera/build.sh`. `scripts/laurel/cam-test.sh` + `cam9_test.c`: fast = old picture (Y differs 0.00-0.17 of 255, chroma under 0.2, 4 Bayer orders, video range, shading + matrix, zoom, turned, half cells, 16x), AE capped: 30.0 fps at 16x + digital 4x, half-cell rule. `scripts/laurel/cam-leak-test.sh`: 600 pictures heap + 0, ASan clean; a false alarm fixed in it (under ASan heap() is always 0). `scripts/laurel/camera-cache-check.sh`. Only on a host: no sensor, no XNU, no CMCapture, no Kryo core ran; all timing on the phone is [I].
+`scripts/laurel/kernel-linux.sh` (job cama-kernel2, with mic 2920): 298/298 patches, 0 LSE. `userland/laurel/camera/build.sh`. `scripts/laurel/cam-test.sh` + `cam9_test.c`: fast = old picture (Y differs 0.00-0.17 of 255, chroma under 0.2, 4 Bayer orders, video range, shading + matrix, zoom, turned, half cells, 16x), AE capped: 30.0 fps at 16x + digital 4x, half-cell rule. `scripts/laurel/cam-leak-test.sh`: 600 pictures heap + 0, ASan clean; a false alarm fixed in it (under ASan heap() is always 0). `scripts/laurel/camera-cache-check.sh`. Only on a host: no sensor, no XNU, no CMCapture, no Kryo core ran; all timing on the phone is [I].
 
 ### Expected lines [I]
 
