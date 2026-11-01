@@ -4596,3 +4596,19 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - [V code] Fixed hole: on the direct path fPending is not the last frame; a wake with no new iOS frame presented an old record or stayed black. Now the last direct frame is shown again.
 - Reads: start self-check + one per wake, with the light out. Settled-line read-back removed: 2 reads in use do not prove video-mode safety. `laurelbl_read=0` = no reads, FIFO writes.
 - Build [V]: kernel-linux.sh 276/276 patches, 0 failed, 0 LSE, no warnings in SweetFramebuffer.cpp, kernel.development.sweet.4k sha256 9e57a0b5f9e35f8127dca3f50ef196fb92eb3d669f0493bb488f0bf128c6bfa4.
+
+## Mi A3: GPU and CPU clocks; patches 2890-2892, root-tweaks-perf.py (2026-11-01, branch t3/laurel-clock-perf; build + host test only, NOT BOOTED)
+
+Details: docs/laurel_sprout/gpu.md "GPU clock by demand", battery-power.md "CPU response".
+- [V] One kernel log line ends after 255 bytes. Long statistics lines lose their end: the 2159 `GPU busy / core MHz` was in no log. Keep log lines below 240 bytes. So the GPU clock is still unmeasured; 2892 reads it.
+- [V] GPU busy at 300 MHz from the fields that do arrive (N us x M / window): 19-83 % in active 5 s windows of boot 19:34, Metal clients included.
+- [V] GPLL0 at the GPU = 600 MHz, so 600 MHz needs no PLL. CX `rwcx` id 0, MX `rwmx` id 0, key `vlvl`, NOM = 256 (not `smpa`).
+- [V] `TopazRpm: rpm_requests open` passes only with unused FIFOs: no earlier AP RPM vote exists. Vote NOM once and hold: the AP's other clocks need NOM in the Linux tables.
+- [V] GCC clock counter and MCCC period register read clocks without a GPU job (debugcc-trinket.c, clk-debug.c). The trinket DT has no rail statistics: a CX reader does not exist.
+- [I] Linux sends `clk0` id 2 `Enab` to enable RPM bus scaling; XNU does not. Without it a DDR vote may do nothing; with it, unvoted bus clocks may fall. Not sent. The `LAUREL DDR` line of the next boot decides.
+- [V] Linux scales DDR with the CPU on this SoC (bwmon + memlat in trinket.dtsi: Gold 1401 -> 1017 MHz DDR, 2016 -> 1804); XNU does not.
+- [V] Governor before 2890: 300 ms from idle to the top row; Silver held 1305 MHz at 0 % busy; backboardd frames 96 % on Gold, no UI-on-Silver problem. Host only: new 120 ms.
+- [V] Restart loops: wifip2pd, nanotimekitcompaniond every 10-11 s for the whole boot, no crash; syncdefaultsd 13 aborts in 4 min. Bound: at most about 2 % of a Gold core at the top clock [I]. They do not explain gold 87 % / silver 82 %: that window is the render path + a web page. Jobs dropped in the laurel root only.
+- Gotcha: patch numbers: another branch took 2880-2886 during this work; check `git fetch` before numbering. Gotcha: laurel_thermal.c passed 300 lines: split into headers.
+- Honest limit [I]: frames cost 9 ms of CPU (3 in GL calls, 6 outside) per the profile lines: CoreAnimation, Mesa, metal2vulkan on A73 at 2016 MHz. No clock change in this round touches that part except by holding Gold up. See plan.md.
+- Next: boot, read the lines, then decide: PLL levels (busy > 60 % at 600), RPM scaling (DDR low and no follow), PSCI idle states (power).

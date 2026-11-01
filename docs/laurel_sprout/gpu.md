@@ -1,5 +1,6 @@
 # Mi A3 (laurel_sprout) GPU: Adreno 610 behind CoreAnimation's OpenGL ES renderer
 
+Status 2026-11-01 (branch t3/laurel-clock-perf): 2892 GPU clock by demand 300 <-> 600 MHz + the split 5 s line; built on Linux, **NOT BOOTED** (section "GPU clock by demand").
 Status 2026-11-01 16:30 (t3/laurel-metal-everywhere: 2160, 2161, 2851, section "Kernel changes for Metal clients"); 08:30 (branch t3/laurel-gpu-zero-copy): 2158 zero-copy surfaces + cache push per CPU write, 2159 measured GPU busy/clock, eagl 0002, Metal client gate; built on Linux, **NOT BOOTED** (section "Zero copy, cache upkeep, GPU time").
 Status 2026-11-01 06:45: the 06:12/06:17 "GL stall" is lsd's first LaunchServices seed (ADT without /chosen MACs), not the GPU; mkadt.py fix + 2155 GPU watchdog, built, NOT BOOTED (section "GL stall"). Status 2026-11-01 06:10: first boot with the zap files (05:52) hung in the zap SCM calls; 2153 fixes it (section "Zap hang").
 Status 2026-11-01 05:10: review fixes on top of laurel-int-1 (areas A, C, H); built on Linux (kernel, Mesa, userland,
@@ -718,7 +719,7 @@ Expected lines (next GL boot):
 If `RedwoodGPU: N submissions` shows `(some submissions not timed)` and `the GPU worked 0 us`: RB_DONE_TS does not write the
 counter on the A610 [U]; the rest of 2158/2159 is not affected.
 
-### GPU clock (owner item 4): not raised in this round
+### GPU clock (owner item 4): not raised in this round (done later by 2892: section "GPU clock by demand")
 
 Facts [V]: kgsl trinket OPPs 320-950 MHz (table above); gfx3d votes vdd_cx (`gpucc-trinket.c` rate_max: LOWER 320, LOW 465,
 LOW_L1 600, NOMINAL 745, NOMINAL_L1 820, HIGH 900, HIGH_L1 950); the GX GDSC hangs off the same CX corner; TopazRpm has
@@ -746,6 +747,83 @@ LOW_L1 (192) acked, measured clock within 10 % after the switch, TSENS sensor 15
 - 2162: a SIGBUS names its file: `CRASH <name> file <path> size N, offset 0xO`. Only a log line.
 - GL frames 10-16 ms, 26-38 fps in this boot, 8-13 ms in the 15:27 reference [V]. The load differs (Metal clients, widgets, first boot at 100 % CPU); what part 2161 (CCU invalidate) has is [U].
 
+## GPU clock by demand (2892; built, NOT BOOTED)
+
+### What the logs say [V logs/laurel-boot-1934.txt]
+
+- **The core clock was never measured.** One kernel log line ends after 255 bytes: every long line in the boot stops at 264 characters of the USB log (9 of time stamp + 255). The 2159 line has `GPU busy B %, core C MHz while busy` at its end, so this text is in no log (`grep -c "GPU busy"` = 0 in every log of the main checkout). 2892 prints three short lines. So `300 MHz` in `LAUREL GPU: on` and `LAUREL METAL` is the programmed value, not a measurement.
+- The first fields of the line do reach the log. Busy % = N us x M submissions / window:
+
+| Time | Submissions / window | us each | Busy at 300 MHz |
+| --- | --- | --- | --- |
+| 19:41:32 | 493 / 5005 ms | 3997 | 39 % |
+| 19:41:43 | 834 / 5007 ms | 3637 | 61 % |
+| 19:42:03 | 957 / 5000 ms | 3598 | 69 % |
+| 19:42:29 | 714 / 5000 ms | 5734 | 83 % |
+| 19:43:08 | 343 / 5000 ms | 7745 | 53 % |
+| 19:43:14 | 249 / 5309 ms | 10190 | 48 % |
+
+  Other active windows 19-54 %. So the zero-copy agent's condition ("B above 60 % while the UI moves") is met in part. These numbers include the Metal clients' submissions, not only GL. The same boot, scrolling windows: GL frames 36-46 a second, a frame 7-13 ms on the CPU side, of which 2.4-5.7 ms "handing on", 0.5-0.9 ms "waiting" (the CPU rarely waits for the GPU) [V 10 s lines].
+
+### Source facts [V external/laurel-kernel-los]
+
+| Item | Value | File |
+| --- | --- | --- |
+| GPLL0 at the GPU's input | 600 MHz (`gcc_gpu_gpll0_clk_src` parent `gpll0_out_early`, `F(100000000, P_GPLL0_OUT_EARLY, 6)`) | gcc-trinket.c |
+| Levels | 320 465 600 745 820 900 950 MHz, bus level 4 7 8 9 10 11 11 (451 768 1017 1353 1555 1804 1804 MHz) | trinket-gpu.dtsi |
+| CX for gfx3d | 320 LOW_SVS 64, 465 SVS 128, 600 SVS_PLUS 192, 745 NOM 256, 820 NOM_PLUS 320, 900 TURBO 384, 950 TURBO_NO_CPR 416 | gpucc-trinket.c, vdd-level-trinket.h |
+| MX | PLL VCO up to 2 GHz: NOM (stock 600 MHz runs from PLL0) | gpucc-trinket.c |
+| RPM resources | CX = `rwcx` id 0, MX = `rwmx` id 0, key `vlvl` | pm6125-rpm-regulator.dtsi, rpm-smd-regulator.c |
+| Other AP clocks that XNU keeps as ABL set them | UFS AXI 200, ICE 300, UniPro 150, USB master 200 MHz: NOM; MDP up to 384 MHz: NOM; camera VFE 403-576 MHz: SVS_PLUS to TURBO | gcc-trinket.c, dispcc-trinket.c |
+| Read of the clocks | GCC clock counter (mux 0xDD + GPUCC mux 0xB, post divider 2); DDR: MCCC period register 0x447d220 (ps) | debugcc-trinket.c, clk-debug.c |
+| DDR vote | RPM `clk2` id 0 `KHz`; bus level MHz x 1000 kHz (8136000 KBps / 8 = 1017000) | clk-smd-rpm.c, trinket-bus.dtsi |
+| Linux at start | votes BIMC to INT_MAX, then `clk0` id 2 `Enab` = 1 in both sets (`clk_smd_rpm_enable_scaling`) | clk-smd-rpm.c |
+
+### Why the rail vote is safe now
+
+The zero-copy agent's two fears: nothing reads the CX vote, and a lower vote can brown out other blocks.
+- [V boot 19:34] `TopazRpm: rpm_requests open`: TopazRpm opens the link only if both FIFOs are unused since boot. So no AP code sent an RPM vote before TopazRpm in this boot; no AP vote exists that ours could replace. The RPM takes the maximum over its masters [I, its design].
+- [I] What the rail holds now is still unknown (no rail statistics in the trinket DT: no `rpm-rail-stats`). So the vote must not be able to lower the rail below what the AP needs: **NOM on CX and MX, once, before the first raise, held for the boot.** NOM is what the AP's running clocks need in the Linux tables (row above). 300 and 600 MHz both sit at or below NOM, so no rail moves between the levels. The order the owner asked for holds: rails up before the clock, clock down first, and the rails never go down.
+- Cost [I]: if the rail is below NOM today, idle power rises by the difference (not measured; no reader). The camera's VFE above 480 MHz still has no vote of its own (as today).
+- A later corner above NOM (820+ MHz) would be the first vote that goes up and down.
+
+### What 2892 does
+
+`iokit/Kernel/arm/LaurelGpuDcvs.cpp` + `laurel_gpu_clock_read.h`, a few hooks in TopazAdreno.cpp, the split line in RedwoodGPU.cpp. Own thread, started after `LAUREL GPU: on`.
+1. Self-check: GPU temperature from LAUREL THERMAL (30 s at most), clock read at 300 (10 % window), RPM MX then CX NOM acked, GPLL0 / 1, clock read at 600, one CP fence if the ring is idle, back to 300 and read again. The GCC counter is the check; the CP counter of 2159 is logged next to it and is the check only if the GCC counter does not count.
+2. Demand (50 ms tick): busy (2159 stamps) >= 50 % over a tick or a touch in the last 300 ms -> 600, with a read of the clock at each raise; below 20 % (of 600, = 40 % of 300) for 500 ms -> 300.
+3. Thermal: sensor 15; no 600 from 90 C until below 80 C; no reading counts as hot. (Linux trip `gpu-step` 95 C.)
+4. The GPU watchdog (2155): no fence progress for 1500 ms at 600 -> 300 MHz, the feature off, the 3 s count starts again. Only a hang that also stays at 300 turns the GPU off.
+5. Time per level a minute. Kill switch `gpudcvs=0`. Any failure: 300 MHz, one line, GPU on. Votes already sent stay (they only raise).
+`core_mhz` stays 300 for MSM_PARAM_MAX_FREQ and the `LAUREL GPU` / `LAUREL METAL` lines (the programmed base clock).
+
+Why only 600 now: no PLL (GPLL0 / 1), half the busy time if the work is bound by the core clock [I]. 745-950 MHz need PLL0 (recipe in the table at the top) and, above 745, a corner that goes up and down. Add them only when the 2892 lines show busy above about 60 % at 600 MHz while the UI moves.
+
+### DDR: held low? [U, the next boot says]
+
+- [V source] No XNU code votes BIMC: no `qcom,gpubw`, no CPU bwmon/memlat (Linux has them, battery-power.md), no `clk0` `Enab`. Only `ipa` KHz (2780), LDOs (`ldoa`).
+- [I] Linux enables RPM clock scaling at start; without that message the RPM may keep its bus clocks at the boot rates, and may ignore a vote. So DDR may be low or high, fixed. The `LAUREL DDR` line reads it (MCCC period, no write).
+- 2892: DDR >= 1017 MHz: no vote. Lower: one vote of 1017 MHz, read again. It follows: 1017 with GPU 600 or Gold >= 1400 MHz, else max(boot clock, 451), down only after 500 ms. It does not follow: `off`, no more votes. **`Enab` is not sent:** it could let the RPM lower SNOC, CNOC, MMRT and others that nobody votes for (display underrun, UFS) [I]. If the line says DDR is low and does not follow, the next step is `Enab` with votes for those clocks at their measured rates: an owner decision after that boot.
+
+### Expected lines
+
+```
+RedwoodGPU: 834 submissions in 5007 ms: 2890 command buffers and 32797 buffers named, 36 KB out of the cache in 23 us a submission; GPU busy 31.2 %, core 590 MHz while busy, 410 MHz over the window
+RedwoodGPU: the GPU worked 1820 us on each of 834 (...; 1518 ms in all)
+RedwoodGPU: 12 waits of 300 us, 3 over before they began; ...
+LAUREL DDR: on: 1353 MHz measured, not lower than the GPU's bus level (1017 MHz at 600 MHz): no vote needed       (or a vote line, or off: ...)
+LAUREL GPU CLOCK: on: GPLL0 300/600 MHz, measured GCC 300/600 CP 300/600 MHz, CP fence at 600 in 80 us; MX+CX NOM held; raise at 50 % busy or touch, lower below 20 % for 500 ms; no 600 from 90 C to 80 C
+LAUREL GPU CLOCK: on: last minute 300 MHz 41 s, 600 MHz 19 s, 37 raises, 0 hot refusals; busy 22 % of the time, gpu 48.1 C, DDR 1353 MHz
+```
+(Numbers are examples, not results.) Failures: `LAUREL GPU CLOCK: off: the clock at 300 does not measure 300 (a, b MHz); 300 MHz stays` (that line alone is news: the real clock, as in negroni's lesson), `RPM refused the MX/CX vote`, `no CP fence at 600 MHz`, `no GPU progress for 1500 ms at 600 MHz`.
+
+### Test
+
+1. Boot. Read `LAUREL GPU CLOCK: on` and `LAUREL DDR`: real clocks for the first time.
+2. Scroll Settings, open Safari, Control Center for 1 min. Compare the `GPU busy` and `SWEET FPS` lines with this table and with `gpudcvs=0` (kill switch boot) if the result is not clear.
+3. No hang, no panic, no `GPU hang` line. A long game-like load: `gpu N C` in the minute line, a refusal above 90 C.
+4. Reboot, a crash or a frozen panel right after the first scroll: `gpudcvs=0` and report it. That is the one failure the self-check cannot turn off: a clock that passes the check and later breaks a block.
+
 ## Recovery (no UI after the GPU root)
 
 1. Boot with `gl=0` (backboardd without the loader, software renderer) or `gpu=0` (no GPU at all, no loader), or
@@ -763,7 +841,7 @@ LOW_L1 (192) acked, measured clock within 10 % after the switch, TSENS sensor 15
 
 ## Risks [I]
 
-- CX rail / bus bandwidth: no RPM votes (as topaz). 300 MHz is inside the lowest CX level; BIMC bandwidth not voted.
+- CX rail / bus bandwidth: 2892 votes MX + CX NOM for the boot and DDR by the rule in "GPU clock by demand"; with `gpudcvs=0` no RPM votes (as topaz).
 - Pool region 0xC0000000-0xE0000000: reserved in Mu 0101 ("Pool RAM") and the ADT (area A); not measured on the phone.
 - SMMU pass-through: see "SMMU pass-through risk"; only backboardd may use the GPU. With 2154 on (default) this is the
   fallback only; the remaining risk is one shared GPU address space for all clients (no per-process tables).

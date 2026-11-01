@@ -72,6 +72,8 @@ python3 -I "$TOPAZ/sweet-root-tweaks.py" "$mnt"
 # CA heartbeat 60: the Mi A3 panel runs at 60 Hz (negroni's default 120 is for its 120 Hz panel).
 CA_HEARTBEAT=${CA_HEARTBEAT:-60} python3 -I "$REPO/scripts/ios16/root-tweaks-extra.py" "$mnt"
 python3 -I "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$mnt"
+# launchd jobs that only burn CPU on the Mi A3 (restart loops, docs/laurel_sprout/battery-power.md); PERF_DROP_JOBS= keeps them
+python3 -I "$REPO/scripts/laurel/root-tweaks-perf.py" "$mnt"
 # GPU user space (docs/laurel_sprout/gpu.md): Mesa + EAGL GL + backboardd loader + the phone's own GPU firmware, from
 # out/laurel/gpu/root (scripts/laurel/gpu-firmware.sh + gpu-userland.sh as the user first); skipped with a note when absent
 bash "$REPO/scripts/laurel/root-add-gpu.sh" "$mnt"

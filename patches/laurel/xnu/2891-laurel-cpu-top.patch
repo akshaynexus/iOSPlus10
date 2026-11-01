@@ -1,0 +1,145 @@
+laurel 2891: LAUREL CPU TOP minute line (new osfmk/kern/laurel_cputop.c): CPU seconds per task over the last minute, top 6, plus the time no live task explains ("ended tasks", the upper limit for restart loops and short-lived daemons). Part of the governor's status: off with laurelcpugov=0. Reads only.
+
+diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
+--- a/bsd/dev/laurel_thermal.c	2026-11-01 20:06:59.004233737 +0530
++++ b/bsd/dev/laurel_thermal.c	2026-11-01 20:06:58.998679128 +0530
+@@ -39,6 +39,7 @@
+ /* osfmk/kern/processor.c: the HOST_CPU_LOAD_INFO counters of one CPU */
+ extern void processor_cpu_load_info(processor_t processor, natural_t ticks[CPU_STATE_MAX]);
+ int laurel_cpufreq_start(void);
++extern void laurel_cpu_top_line(uint64_t busy_abs, uint32_t seconds, uint32_t cores);  /* osfmk/kern/laurel_cputop.c */
+ 
+ #define OSM_SILVER_PA   0x0f521000u
+ #define OSM_GOLD_PA     0x0f523000u
+@@ -193,6 +194,8 @@
+ 			ms_line = ms_all;
+ 			log_line("on");
+ 			rows_line();
++			laurel_cpu_top_line(busy_total_abs, 60, ml_get_topology_info()->num_cpus);      /* laurel 2891 */
++			busy_total_abs = 0;
+ 		}
+ 	}
+ }
+diff -ruN a/osfmk/conf/files b/osfmk/conf/files
+--- a/osfmk/conf/files	2026-11-01 19:59:50.295401619 +0530
++++ b/osfmk/conf/files	2026-11-01 20:01:31.360550323 +0530
+@@ -153,6 +153,7 @@
+ osfmk/kern/priority.c			standard
+ osfmk/kern/processor.c		standard
+ osfmk/kern/recount.c		standard
++osfmk/kern/laurel_cputop.c	standard
+ osfmk/kern/restartable.c		standard
+ osfmk/kern/sched_average.c		standard
+ #ifdef __AMP__
+diff -ruN a/osfmk/kern/laurel_cputop.c b/osfmk/kern/laurel_cputop.c
+--- a/osfmk/kern/laurel_cputop.c	1970-01-01 05:30:00.000000000 +0530
++++ b/osfmk/kern/laurel_cputop.c	2026-11-01 20:06:58.998182306 +0530
+@@ -0,0 +1,108 @@
++/*
++ * laurel 2891: which task burned the CPU, part of the governor's minute line. No log line said it [V boots 19:07, 19:34]: the
++ * LAUREL THERMAL line gives the busiest core per cluster only, so "gold 87 %, silver 82 %" had no name on it.
++ * CPU time per task from recount_task_usage (user + system, every thread that lived); the difference from one minute to the next, per
++ * pid. A task that ended between two lines leaves no number: the time that no live task explains is printed as "ended": the upper
++ * limit for short-lived daemons (restart loops, xpcproxy). Reads only; called by the governor thread once a minute.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/processor.h>
++#include <kern/recount.h>
++#include <kern/task.h>
++#include <mach/mach_time.h>
++
++extern char *proc_name_address(void *p);
++void laurel_cpu_top_line(uint64_t busy_abs, uint32_t seconds, uint32_t cores);
++
++#define TOP_TASKS       512u
++#define TOP_SHOWN       6u
++
++struct top_seen {
++	int      pid;
++	uint64_t abs;
++};
++struct top_row {
++	char     name[17];
++	uint64_t abs;
++};
++
++static struct top_seen seen_a[TOP_TASKS], seen_b[TOP_TASKS];
++static struct top_seen *seen = seen_a, *fresh = seen_b;
++static uint32_t seen_n;
++
++static uint64_t
++tenths(uint64_t abs)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / (NSEC_PER_SEC / 10);
++}
++
++void
++laurel_cpu_top_line(uint64_t busy_abs, uint32_t seconds, uint32_t cores)
++{
++	struct top_row top[TOP_SHOWN];
++	uint64_t live = 0;
++	uint32_t n = 0;
++	task_t t;
++
++	bzero(top, sizeof(top));
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, t, task_t, tasks) {
++		struct recount_usage u = { 0 };
++		void *bsd = get_bsdtask_info(t);
++
++		if (n >= TOP_TASKS || bsd == NULL) {
++			continue;
++		}
++		recount_task_usage(t, &u);
++		int pid = task_pid(t);
++		uint64_t now = u.ru_user_time_mach + u.ru_system_time_mach, was = 0;
++
++		for (uint32_t i = 0; i < seen_n; i++) {
++			if (seen[i].pid == pid) {
++				was = seen[i].abs;
++				break;
++			}
++		}
++		fresh[n].pid = pid;
++		fresh[n].abs = now;
++		n++;
++		uint64_t d = now > was ? now - was : 0;
++
++		live += d;
++		for (uint32_t i = 0; i < TOP_SHOWN; i++) {
++			if (d > top[i].abs) {
++				memmove(&top[i + 1], &top[i], (TOP_SHOWN - i - 1) * sizeof(top[0]));
++				top[i].abs = d;
++				strlcpy(top[i].name, proc_name_address(bsd), sizeof(top[i].name));
++				break;
++			}
++		}
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	struct top_seen *swap = seen;
++
++	seen = fresh;
++	fresh = swap;
++	seen_n = n;
++
++	char s[160];
++	int at = 0;
++
++	for (uint32_t i = 0; i < TOP_SHOWN && top[i].abs != 0 && at < (int)sizeof(s) - 28; i++) {
++		uint64_t d = tenths(top[i].abs);
++
++		at += scnprintf(s + at, sizeof(s) - at, "%s%s %llu.%llu", i ? ", " : "", top[i].name, d / 10, d % 10);
++	}
++	s[at] = 0;
++	uint64_t b = tenths(busy_abs), ended = tenths(busy_abs > live ? busy_abs - live : 0);
++
++	printf("LAUREL CPU TOP: %u s, busy %llu.%llu s of %u: %s; ended tasks %llu.%llu; %u tasks\n", seconds, b / 10, b % 10,
++	    seconds * cores, s, ended / 10, ended % 10, n);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

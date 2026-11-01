@@ -1,0 +1,587 @@
+laurel 2890: CPU governor response (bsd/dev/laurel_thermal.c split into pieces below 300 lines, new laurel_gov_core.h with the decision, host test scripts/laurel/gov-test.sh). Tick 100 -> 40 ms, window 300 -> 120 ms: a load from idle reaches the top row after 120 ms (was 300 ms, host only). Busy = wall - idle (the idle time is current when read; user + system lag behind). Silver floor row 0 ([V] 1305 MHz with 0 % busy for a whole boot; ABL's row is now its UI hold). Touch event: Gold at the cap and Silver at the ABL row for 500 ms, the thread woken at once (SweetHID.cpp). GPU work in the last 100 ms: Gold at 1401 MHz or more. New minute line: time per row. Kill switch as before: laurelcpugov=0.
+
+diff -ruN a/bsd/dev/laurel_gov_core.h b/bsd/dev/laurel_gov_core.h
+--- a/bsd/dev/laurel_gov_core.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_gov_core.h	2026-11-01 20:09:18.970704311 +0530
+@@ -0,0 +1,47 @@
++/*
++ * laurel 2890: the OSM governor's one decision, without kernel types, so that the host test
++ * (scripts/laurel/gov-test.sh) runs exactly this code. One step for one cluster.
++ *   busy  % of the busiest core over the last LGOV_WINDOW ticks (LGOV_TICK_MS each)
++ *   row   the row the cluster runs now; cap the thermal cap; floor the governor's lowest row (the cap wins)
++ *   hold  a row wanted by the UI right now (touch, GPU work); 0 = none
++ *   low   ticks in a row below LGOV_LO (kept by the caller)
++ * Before 2890 [V 2303]: 100 ms tick, 300 ms window, > 90 %: cap, > 70 %: +1 row. A load that starts on an idle core reads
++ * 33 %, 66 %, 100 %: the top row came 300 ms after the load, the first frames of a touch ran at 300 MHz.
++ */
++#ifndef LAUREL_GOV_CORE_H
++#define LAUREL_GOV_CORE_H
++#define LGOV_TICK_MS    40u
++#define LGOV_WINDOW     3u
++#define LGOV_JUMP       85u     /* a core full for 120 ms: the cap at once */
++#define LGOV_HI         60u     /* +2 rows */
++#define LGOV_LO         30u
++#define LGOV_DOWN_TICKS 8u      /* 320 ms below LGOV_LO: -1 row (as before: about 300 ms) */
++
++static inline unsigned
++lgov_next(unsigned busy, unsigned row, unsigned floor, unsigned cap, unsigned hold, unsigned *low)
++{
++	unsigned want = row;
++
++	if (busy > LGOV_JUMP) {
++		want = cap;
++		*low = 0;
++	} else if (busy > LGOV_HI) {
++		want = row + 2;
++		*low = 0;
++	} else if (busy < LGOV_LO) {
++		if (++*low >= LGOV_DOWN_TICKS && row > 0) {
++			want = row - 1;
++			*low = 0;
++		}
++	} else {
++		*low = 0;
++	}
++	if (hold > floor) {
++		floor = hold;
++	}
++	if (want < floor) {
++		want = floor;
++	}
++	return want > cap ? cap : want;
++}
++#endif
+diff -ruN a/bsd/dev/laurel_gov_loop.h b/bsd/dev/laurel_gov_loop.h
+--- a/bsd/dev/laurel_gov_loop.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_gov_loop.h	2026-11-01 20:06:58.996946798 +0530
+@@ -0,0 +1,84 @@
++/* laurel 2890 (a piece of laurel_thermal.c): load per core, one governor step, time per row. */
++static void
++sample_busy(void)
++{
++	const ml_topology_info_t *topo = ml_get_topology_info();
++	uint64_t now = mach_absolute_time(), wall = sampled ? now - wall_last : 0, ww = 0;
++
++	wall_last = now;
++	wall_d[win_at] = wall;
++	for (unsigned w = 0; w < GOV_WINDOW; w++) {
++		ww += wall_d[w];
++	}
++	cl_busy[CL_SILVER] = cl_busy[CL_GOLD] = 0;
++	for (unsigned i = 0; i < topo->num_cpus && i < GOV_MAX_CPUS; i++) {
++		unsigned c = ((topo->cpus[i].phys_id & 0xff00u) == 0x100u) ? CL_GOLD : CL_SILVER;
++		processor_t p = cpu_to_processor((int)topo->cpus[i].cpu_id);
++		natural_t ticks[CPU_STATE_MAX] = { 0 };
++		if (p == PROCESSOR_NULL) {
++			continue;
++		}
++		processor_cpu_load_info(p, ticks);
++		uint64_t idle = sampled ? (uint64_t)(ticks[CPU_STATE_IDLE] - cpu_idle_last[i]) * hz_tick_interval : 0, iw = 0;
++		cpu_idle_last[i] = ticks[CPU_STATE_IDLE];
++		cpu_idle_d[i][win_at] = idle;
++		busy_total_abs += wall > idle ? wall - idle : 0;
++		for (unsigned w = 0; w < GOV_WINDOW; w++) {
++			iw += cpu_idle_d[i][w];
++		}
++		uint32_t pct = ww == 0 || iw >= ww ? 0 : (uint32_t)((ww - iw) * 100 / ww);
++		if (pct > cl_busy[c]) {
++			cl_busy[c] = pct;
++		}
++	}
++	win_at = (win_at + 1) % GOV_WINDOW;
++	sampled = true;
++}
++
++static bool
++within_ms(uint64_t then, uint64_t now, uint32_t ms)
++{
++	uint64_t ns = 0;
++
++	if (then == 0) {
++		return false;
++	}
++	absolutetime_to_nanoseconds(now - then, &ns);
++	return ns < (uint64_t)ms * NSEC_PER_MSEC;
++}
++
++static void
++gov_step(void)
++{
++	uint64_t now = mach_absolute_time();
++	bool touch = within_ms(laurel_touch_at, now, TOUCH_HOLD_MS);
++	bool gpu = within_ms(laurel_gpu_last_work, now, GPU_HOLD_MS);
++
++	for (unsigned c = 0; c < CL_N; c++) {
++		/* a touch: Gold at its cap and Silver at ABL's row until the first frames are out; GPU work: Gold at UI_GOLD_KHZ */
++		uint32_t hold = touch ? (c == CL_GOLD ? cl_cap[c] : ui_row[c]) : (gpu && c == CL_GOLD ? ui_row[c] : 0);
++		unsigned low = cl_low[c];
++
++		wr_row(c, lgov_next(cl_busy[c], cl_row[c], lo_row(c), cl_cap[c], hold, &low));
++		cl_low[c] = low;
++	}
++}
++
++/* laurel 2890: the time in each row, a line a minute: the input for "was the CPU at speed while the UI moved" */
++static void
++rows_line(void)
++{
++	for (unsigned c = 0; c < CL_N; c++) {
++		char s[200];
++		int n = 0;
++
++		for (uint32_t r = 0; r < cl_rows[c] && n < (int)sizeof(s) - 24; r++) {
++			if (cl_row_ms[c][r] != 0) {
++				n += snprintf(s + n, sizeof(s) - n, " %u:%llu", cl_khz[c][r] / 1000, cl_row_ms[c][r] / 1000);
++			}
++			cl_row_ms[c][r] = 0;
++		}
++		printf("LAUREL CPUFREQ: on: %s MHz:seconds in the last minute:%s\n", cl_name[c], s);
++	}
++}
++
+diff -ruN a/bsd/dev/laurel_thermal.c b/bsd/dev/laurel_thermal.c
+--- a/bsd/dev/laurel_thermal.c	2026-11-01 19:59:50.287401401 +0530
++++ b/bsd/dev/laurel_thermal.c	2026-11-01 20:06:59.004233737 +0530
+@@ -10,9 +10,8 @@
+  *          the table ends at a repeated frequency; DCVS_PERF_STATE_DESIRED_REG(0) 0x920 = the row of the
+  *          cluster (no per-core DCVS on trinket).
+  *   load   processor_cpu_load_info() (the HOST_CPU_LOAD_INFO ticks): busy % of the busiest core of a
+- *          cluster over the last 300 ms. busy > 70 % -> +1 row (> 90 %: the cap at once), busy < 30 %
+- *          for 300 ms -> -1 row. The governor's floor = the row ABL left (negroni 0098 rule); the
+- *          thermal cap lowers the top row and may go below that floor, down to row 0 (the cap wins).
++ *          cluster over the last 120 ms; the decision is laurel_gov_core.h (laurel 2890). Floor = row 0; a
++ *          touch or GPU work holds a higher row; the thermal cap lowers the top row, down to row 0 (the cap wins).
+  *   TSENS  tsens0 (trinket.dtsi, "qcom,sm6150-tsens", TSENS v2): TM 0x4411000, SN_STATUS(n) = 0xa0 + 4n,
+  *          [11:0] signed 0.1 C, valid bit 21 (tsens2xxx.c), -40..125 C, a single sensor > 20 C above all
+  *          others ignored; sensors 6-8 cpuss (Silver), 9-12 Gold cores,
+@@ -33,8 +32,10 @@
+ #include <mach/machine.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "laurel_gov_core.h"    /* laurel 2890: the governor's decision (host test: scripts/laurel/gov-test.sh) */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint32_t hz_tick_interval;        /* osfmk/kern/clock.h (mach-only part) */
+ /* osfmk/kern/processor.c: the HOST_CPU_LOAD_INFO counters of one CPU */
+ extern void processor_cpu_load_info(processor_t processor, natural_t ticks[CPU_STATE_MAX]);
+ int laurel_cpufreq_start(void);
+@@ -48,12 +49,12 @@
+ #define TSENS_TM_PA     0x04411000u
+ #define TSENS_SENSORS   16u
+ 
+-#define GOV_TICK_MS     100u
+-#define GOV_WINDOW      3u
+-#define GOV_HI          70u
+-#define GOV_JUMP        90u
+-#define GOV_LO          30u
++#define GOV_TICK_MS     LGOV_TICK_MS
++#define GOV_WINDOW      LGOV_WINDOW
+ #define GOV_MAX_CPUS    8u
++#define UI_GOLD_KHZ     1400000u        /* laurel 2890: Gold floor while the GPU has work [I: a frame's CPU part in time] */
++#define TOUCH_HOLD_MS   500u
++#define GPU_HOLD_MS     100u
+ #define TH_HOT_DC       950
+ #define TH_CRIT_DC      1050
+ #define TH_COOL_DC      850
+@@ -70,10 +71,21 @@
+ static bool th_on;
+ static int th_cpu = -1000, th_gpu = -1000;
+ 
+-static uint32_t cpu_busy_last[GOV_MAX_CPUS], cpu_all_last[GOV_MAX_CPUS];
+-static uint32_t cpu_busy_d[GOV_MAX_CPUS][GOV_WINDOW], cpu_all_d[GOV_MAX_CPUS][GOV_WINDOW];
++/*
++ * laurel 2890: busy = wall time - idle time. The idle time is up to date when it is read (recount_processor_usage adds a running
++ * idle period); the user + system times are only committed at a kernel entry or a thread switch, so they lag behind on a core
++ * that runs one thread. Time in mach units.
++ */
++static uint32_t cpu_idle_last[GOV_MAX_CPUS];
++static uint64_t cpu_idle_d[GOV_MAX_CPUS][GOV_WINDOW], wall_d[GOV_WINDOW], wall_last;
+ static uint32_t win_at;
+ static bool sampled;
++static uint32_t ui_row[CL_N];                   /* the row wanted while the UI moves */
++static uint64_t cl_row_ms[CL_N][OSM_ROWS];      /* time in each row since the last line */
++static uint64_t busy_total_abs;                 /* all cores, for laurel 2891 */
++uint64_t laurel_gpu_last_work;                  /* mach time of the last GPU submission (TopazAdreno.cpp) */
++uint64_t laurel_touch_at;                       /* mach time of the last touch event (SweetHID.cpp) */
++#define GOV_EVENT       ((event_t)&laurel_touch_at)
+ 
+ /* the governor's lower bound: the ABL row, or the thermal cap when that is lower (the cap wins) */
+ static uint32_t
+@@ -126,172 +138,93 @@
+ 	}
+ 	cl_rows[c] = n;
+ 	uint32_t abl = *(volatile uint32_t *)(cl_base[c] + OSM_PERF_STATE);
+-	cl_floor[c] = abl < n ? abl : 0;
+-	cl_row[c] = cl_floor[c];
+-	cl_cap[c] = n - 1;
+-	return 0;
+-}
+-
+-static int
+-tsens_dC(unsigned n, int *dC)
+-{
+-	for (unsigned t = 0; t < 3; t++) {
+-		uint32_t code = *(volatile uint32_t *)(ts_base + 0xa0u + 4u * n);
+-		if (code & (1u << 21)) {
+-			int v = (int)(code & 0xfffu);
+-			if (v & 0x800) {
+-				v -= 0x1000;
++	/*
++	 * laurel 2890: the floor is row 0 on both clusters. [V boot 19:34] Gold runs row 0 (300 MHz) for minutes; Silver stayed at
++	 * ABL's row (1305 MHz) with 0 % busy for the whole boot. The ABL row is now the row Silver holds while the UI moves.
++	 */
++	cl_row[c] = abl < n ? abl : 0;
++	cl_floor[c] = 0;
++	ui_row[c] = cl_row[c];
++	if (c == CL_GOLD) {
++		ui_row[c] = 0;
++		for (uint32_t i = 0; i < n; i++) {
++			if (cl_khz[c][i] >= UI_GOLD_KHZ) {
++				ui_row[c] = i;
++				break;
+ 			}
+-			*dC = v;
+-			return 0;
+ 		}
+ 	}
+-	return -1;
++	cl_cap[c] = n - 1;
++	return 0;
+ }
+ 
+-/*
+- * CPU = the hottest of sensors 6-12 in -40..125 C, but one sensor more than 20 C above all the others
+- * is taken as an outlier (a bad read) and the second-hottest counts; GPU = sensor 15.
+- */
+-static void
+-read_temps(void)
+-{
+-	int top = -1000, second = -1000, gpu = -1000, v;
+-	for (unsigned n = 6; n <= 12; n++) {
+-		if (tsens_dC(n, &v) != 0 || v < -400 || v > 1250) {
+-			continue;
+-		}
+-		if (v > top) {
+-			second = top;
+-			top = v;
+-		} else if (v > second) {
+-			second = v;
+-		}
+-	}
+-	if (second > -1000 && top - second > 200) {
+-		top = second;
+-	}
+-	if (tsens_dC(15, &v) == 0 && v >= -400 && v <= 1250) {
+-		gpu = v;
+-	}
+-	th_cpu = top;
+-	th_gpu = gpu;
+-}
++#include "laurel_thermal_tsens.h"       /* tsens_dC, read_temps */
+ 
+-static void
+-sample_busy(void)
+-{
+-	const ml_topology_info_t *topo = ml_get_topology_info();
+-	cl_busy[CL_SILVER] = cl_busy[CL_GOLD] = 0;
+-	for (unsigned i = 0; i < topo->num_cpus && i < GOV_MAX_CPUS; i++) {
+-		unsigned c = ((topo->cpus[i].phys_id & 0xff00u) == 0x100u) ? CL_GOLD : CL_SILVER;
+-		processor_t p = cpu_to_processor((int)topo->cpus[i].cpu_id);
+-		natural_t ticks[CPU_STATE_MAX] = { 0 };
+-		if (p == PROCESSOR_NULL) {
+-			continue;
+-		}
+-		processor_cpu_load_info(p, ticks);
+-		uint32_t busy = ticks[CPU_STATE_USER] + ticks[CPU_STATE_SYSTEM] + ticks[CPU_STATE_NICE];
+-		uint32_t all = busy + ticks[CPU_STATE_IDLE];
+-		cpu_busy_d[i][win_at] = sampled ? busy - cpu_busy_last[i] : 0;
+-		cpu_all_d[i][win_at] = sampled ? all - cpu_all_last[i] : 0;
+-		cpu_busy_last[i] = busy;
+-		cpu_all_last[i] = all;
+-		uint32_t bw = 0, aw = 0;
+-		for (unsigned w = 0; w < GOV_WINDOW; w++) {
+-			bw += cpu_busy_d[i][w];
+-			aw += cpu_all_d[i][w];
+-		}
+-		uint32_t pct = aw ? bw * 100u / aw : 0;
+-		if (pct > cl_busy[c]) {
+-			cl_busy[c] = pct;
+-		}
+-	}
+-	win_at = (win_at + 1) % GOV_WINDOW;
+-	sampled = true;
+-}
++#include "laurel_gov_loop.h"            /* sample_busy, gov_step, rows_line */
+ 
+-static void
+-gov_step(void)
+-{
+-	for (unsigned c = 0; c < CL_N; c++) {
+-		uint32_t cap = cl_cap[c];
+-		if (cl_row[c] > cap) {
+-			wr_row(c, cap);
+-		} else if (cl_busy[c] > GOV_JUMP) {
+-			wr_row(c, cap);
+-			cl_low[c] = 0;
+-		} else if (cl_busy[c] > GOV_HI) {
+-			if (cl_row[c] < cap) {
+-				wr_row(c, cl_row[c] + 1);
+-			}
+-			cl_low[c] = 0;
+-		} else if (cl_busy[c] < GOV_LO) {
+-			if (++cl_low[c] >= GOV_WINDOW && cl_row[c] > lo_row(c)) {
+-				wr_row(c, cl_row[c] - 1);
+-				cl_low[c] = 0;
+-			}
+-		} else {
+-			cl_low[c] = 0;
+-		}
+-	}
+-}
+-
+-/* 1 s: the thermal caps; returns true when a cap changed */
+-static bool
+-thermal_step(uint32_t sec)
+-{
+-	if (!th_on) {
+-		return false;
+-	}
+-	read_temps();
+-	uint32_t g = cl_cap[CL_GOLD], s = cl_cap[CL_SILVER];
+-	if (th_cpu >= TH_HOT_DC) {
+-		if (cl_cap[CL_GOLD] > 0) {             /* the cap may go below the ABL row, down to row 0 */
+-			cl_cap[CL_GOLD]--;
+-		}
+-		if (th_cpu >= TH_CRIT_DC && cl_cap[CL_SILVER] > 0) {
+-			cl_cap[CL_SILVER]--;
+-		}
+-	} else if (th_cpu > -1000 && th_cpu < TH_COOL_DC && (sec & 1u) == 0) {
+-		if (cl_cap[CL_SILVER] + 1 < cl_rows[CL_SILVER]) {
+-			cl_cap[CL_SILVER]++;
+-		} else if (cl_cap[CL_GOLD] + 1 < cl_rows[CL_GOLD]) {
+-			cl_cap[CL_GOLD]++;
+-		}
+-	}
+-	return g != cl_cap[CL_GOLD] || s != cl_cap[CL_SILVER];
+-}
+-
+-static void
+-log_line(const char *why)
+-{
+-	printf("LAUREL THERMAL: %s: cpu %d.%d C gpu %d.%d C | silver %u MHz (busy %u%%, cap %u) gold %u MHz (busy %u%%, cap %u)\n",
+-	    why, th_cpu / 10, (th_cpu < 0 ? -th_cpu : th_cpu) % 10, th_gpu / 10, (th_gpu < 0 ? -th_gpu : th_gpu) % 10,
+-	    cl_khz[CL_SILVER][cl_row[CL_SILVER]] / 1000, cl_busy[CL_SILVER], cl_khz[CL_SILVER][cl_cap[CL_SILVER]] / 1000,
+-	    cl_khz[CL_GOLD][cl_row[CL_GOLD]] / 1000, cl_busy[CL_GOLD], cl_khz[CL_GOLD][cl_cap[CL_GOLD]] / 1000);
+-}
++#include "laurel_thermal_caps.h"        /* thermal_step, log_line */
+ 
+ __attribute__((noreturn)) static void
+ gov_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+-	uint32_t tick = 0;
++	uint64_t last = mach_absolute_time(), ms_all = 0, ms_th = 0, ms_line = 0;
++	uint32_t sec = 0;
++
+ 	sample_busy();
+ 	for (;;) {
+-		assert_wait_timeout((event_t)&tick, THREAD_UNINT, GOV_TICK_MS, NSEC_PER_MSEC);
++		assert_wait_timeout(GOV_EVENT, THREAD_UNINT, GOV_TICK_MS, NSEC_PER_MSEC);
+ 		thread_block(THREAD_CONTINUE_NULL);
+-		tick++;
++		uint64_t now = mach_absolute_time(), ns = 0;
++
++		absolutetime_to_nanoseconds(now - last, &ns);
++		last = now;
++		ms_all += ns / NSEC_PER_MSEC;
++		cl_row_ms[CL_SILVER][cl_row[CL_SILVER]] += ns / NSEC_PER_MSEC;
++		cl_row_ms[CL_GOLD][cl_row[CL_GOLD]] += ns / NSEC_PER_MSEC;
+ 		sample_busy();
+-		if (tick % 10u == 0 && thermal_step(tick / 10u)) {
+-			log_line("cap");
++		if (ms_all - ms_th >= 1000) {
++			ms_th = ms_all;
++			if (thermal_step(++sec)) {
++				log_line("cap");
++			}
+ 		}
+ 		gov_step();
+-		if (tick % 600u == 0) {
++		if (ms_all - ms_line >= 60000) {
++			ms_line = ms_all;
+ 			log_line("on");
++			rows_line();
+ 		}
+ 	}
+ }
+ 
++/* laurel 2890: from SweetHID.cpp, any touch event; wakes the governor at most every tick */
++void laurel_input_touch(void);
++void
++laurel_input_touch(void)
++{
++	uint64_t now = mach_absolute_time(), then = laurel_touch_at;
++
++	laurel_touch_at = now;
++	if (!within_ms(then, now, GOV_TICK_MS)) {
++		thread_wakeup(GOV_EVENT);
++	}
++}
++
++/* laurel 2892: GPU temperature for the GPU clock (-1000: no reading); the Gold clock for its DDR vote */
++int laurel_thermal_gpu_dC(void);
++int
++laurel_thermal_gpu_dC(void)
++{
++	return th_on ? th_gpu : -1000;
++}
++
++unsigned laurel_cpufreq_gold_mhz(void);
++unsigned
++laurel_cpufreq_gold_mhz(void)
++{
++	return cl_base[CL_GOLD] ? cl_khz[CL_GOLD][cl_row[CL_GOLD]] / 1000 : 0;
++}
++
+ int
+ laurel_cpufreq_start(void)
+ {
+@@ -341,7 +274,8 @@
+ 	}
+ 	thread_deallocate(thread);
+ 	started = 1;
+-	printf("LAUREL CPUFREQ: on: OSM governor, silver rows %u..%u (%u..%u MHz), gold rows %u..%u (%u..%u MHz), %u cpus\n",
++	printf("LAUREL CPUFREQ: on: OSM governor %u ms tick, UI hold gold %u MHz, silver %u MHz; silver rows %u..%u (%u..%u MHz), gold rows %u..%u (%u..%u MHz), %u cpus\n",
++	    GOV_TICK_MS, cl_khz[CL_GOLD][ui_row[CL_GOLD]] / 1000, cl_khz[CL_SILVER][ui_row[CL_SILVER]] / 1000,
+ 	    cl_floor[CL_SILVER], cl_rows[CL_SILVER] - 1, cl_khz[CL_SILVER][cl_floor[CL_SILVER]] / 1000,
+ 	    cl_khz[CL_SILVER][cl_rows[CL_SILVER] - 1] / 1000, cl_floor[CL_GOLD], cl_rows[CL_GOLD] - 1,
+ 	    cl_khz[CL_GOLD][cl_floor[CL_GOLD]] / 1000, cl_khz[CL_GOLD][cl_rows[CL_GOLD] - 1] / 1000, topo->num_cpus);
+diff -ruN a/bsd/dev/laurel_thermal_caps.h b/bsd/dev/laurel_thermal_caps.h
+--- a/bsd/dev/laurel_thermal_caps.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_thermal_caps.h	2026-11-01 20:09:18.970902047 +0530
+@@ -0,0 +1,36 @@
++/* laurel 2303 (a piece of laurel_thermal.c since 2890): the thermal caps and the status line. */
++/* 1 s: the thermal caps; returns true when a cap changed */
++static bool
++thermal_step(uint32_t sec)
++{
++	if (!th_on) {
++		return false;
++	}
++	read_temps();
++	uint32_t g = cl_cap[CL_GOLD], s = cl_cap[CL_SILVER];
++	if (th_cpu >= TH_HOT_DC) {
++		if (cl_cap[CL_GOLD] > 0) {             /* the cap may go below the ABL row, down to row 0 */
++			cl_cap[CL_GOLD]--;
++		}
++		if (th_cpu >= TH_CRIT_DC && cl_cap[CL_SILVER] > 0) {
++			cl_cap[CL_SILVER]--;
++		}
++	} else if (th_cpu > -1000 && th_cpu < TH_COOL_DC && (sec & 1u) == 0) {
++		if (cl_cap[CL_SILVER] + 1 < cl_rows[CL_SILVER]) {
++			cl_cap[CL_SILVER]++;
++		} else if (cl_cap[CL_GOLD] + 1 < cl_rows[CL_GOLD]) {
++			cl_cap[CL_GOLD]++;
++		}
++	}
++	return g != cl_cap[CL_GOLD] || s != cl_cap[CL_SILVER];
++}
++
++static void
++log_line(const char *why)
++{
++	printf("LAUREL THERMAL: %s: cpu %d.%d C gpu %d.%d C | silver %u MHz (busy %u%%, cap %u) gold %u MHz (busy %u%%, cap %u)\n",
++	    why, th_cpu / 10, (th_cpu < 0 ? -th_cpu : th_cpu) % 10, th_gpu / 10, (th_gpu < 0 ? -th_gpu : th_gpu) % 10,
++	    cl_khz[CL_SILVER][cl_row[CL_SILVER]] / 1000, cl_busy[CL_SILVER], cl_khz[CL_SILVER][cl_cap[CL_SILVER]] / 1000,
++	    cl_khz[CL_GOLD][cl_row[CL_GOLD]] / 1000, cl_busy[CL_GOLD], cl_khz[CL_GOLD][cl_cap[CL_GOLD]] / 1000);
++}
++
+diff -ruN a/bsd/dev/laurel_thermal_tsens.h b/bsd/dev/laurel_thermal_tsens.h
+--- a/bsd/dev/laurel_thermal_tsens.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_thermal_tsens.h	2026-11-01 20:09:18.970820535 +0530
+@@ -0,0 +1,47 @@
++/* laurel 2303 (a piece of laurel_thermal.c since 2890): TSENS reads. */
++static int
++tsens_dC(unsigned n, int *dC)
++{
++	for (unsigned t = 0; t < 3; t++) {
++		uint32_t code = *(volatile uint32_t *)(ts_base + 0xa0u + 4u * n);
++		if (code & (1u << 21)) {
++			int v = (int)(code & 0xfffu);
++			if (v & 0x800) {
++				v -= 0x1000;
++			}
++			*dC = v;
++			return 0;
++		}
++	}
++	return -1;
++}
++
++/*
++ * CPU = the hottest of sensors 6-12 in -40..125 C, but one sensor more than 20 C above all the others
++ * is taken as an outlier (a bad read) and the second-hottest counts; GPU = sensor 15.
++ */
++static void
++read_temps(void)
++{
++	int top = -1000, second = -1000, gpu = -1000, v;
++	for (unsigned n = 6; n <= 12; n++) {
++		if (tsens_dC(n, &v) != 0 || v < -400 || v > 1250) {
++			continue;
++		}
++		if (v > top) {
++			second = top;
++			top = v;
++		} else if (v > second) {
++			second = v;
++		}
++	}
++	if (second > -1000 && top - second > 200) {
++		top = second;
++	}
++	if (tsens_dC(15, &v) == 0 && v >= -400 && v <= 1250) {
++		gpu = v;
++	}
++	th_cpu = top;
++	th_gpu = gpu;
++}
++
+diff -ruN a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-01 19:59:50.288401429 +0530
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-11-01 20:06:58.999531943 +0530
+@@ -21,6 +21,7 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
++extern "C" void laurel_input_touch(void);       /* bsd/dev/laurel_thermal.c (laurel 2890) */
+ 
+ #include "IOHIDEventService.h"
+ #include "IOHIDEventServiceUserClient.h"
+@@ -484,6 +485,7 @@
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
++	laurel_input_touch();                   /* laurel 2890: CPU and GPU at speed before the first frame */
+ 	IOLockLock(fLock);
+ 	/* laurel 2200: panel pixels -> the presented display, as SweetFramebuffer.cpp lays it out */
+ 	int pw = sweet_hid_geo.pw, ph = sweet_hid_geo.ph, den = sweet_hid_geo.den ? sweet_hid_geo.den : 1;
+diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp	2026-11-01 19:59:50.290401483 +0530
++++ b/iokit/Kernel/arm/TopazAdreno.cpp	2026-11-01 20:06:58.997041743 +0530
+@@ -1844,6 +1844,8 @@
+ }
+ 
+ /* IBs then CACHE_FLUSH_TS writing the submission's number to mem+0 (TopazGpuW HwSubmit). 0: ring full. */
++extern "C" uint64_t laurel_gpu_last_work;       /* bsd/dev/laurel_thermal.c */
++
+ uint32_t
+ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+ {
+@@ -1852,6 +1854,7 @@
+ 	if (!ready) {
+ 		return 0;
+ 	}
++	laurel_gpu_last_work = mach_absolute_time();    /* laurel 2890: the governor holds Gold at speed while the GPU has work */
+ 	IOLockLock(hw_lock);
+ 	ts_account();
+ 	for (int spin = 0; ring_free() < need && spin < 20000; spin++) {

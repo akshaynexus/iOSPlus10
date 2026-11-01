@@ -1,5 +1,6 @@
 # Mi A3: battery, charger, charge-only boot, power off, thermal + cpufreq (area D, patches 2300-2303)
 
+Status 2026-11-01 (branch t3/laurel-clock-perf): 2890 + 2891 governor response and CPU top line, `root-tweaks-perf.py`; built, host test only, **NOT BOOTED** (section "CPU response").
 Status 2026-11-01 05:10: unattended-safety follow-up built on laurel-int-1 (`areaD-k2306`: 231 patches applied, 0 LSE;
 kernel sha256 7bda8194fc8e77b3867535c5a4202e25ce1023a988ccfcfb278eea475131c6bb). Final safety check of 58b85b8:
 SAFE-TO-TEST (supervised bench test); this follow-up is for unattended charging. NOT BOOTED. [V] = read in files / build,
@@ -144,6 +145,56 @@ bit 0 = power key, PS_HOLD_RST_CTL 0x85a (type: 1 warm, 4 shutdown, 7 hard), RST
   row/s, >= 105 C Silver too, < 85 C +1 row / 2 s. Linux DT trips: 110 C passive.
 - Lines: `LAUREL CPUFREQ: on: OSM governor, silver rows a..b (MHz..MHz), gold rows ...`, `LAUREL THERMAL: on: TSENS
   cpu N C gpu N C ...`, `LAUREL THERMAL: on|cap: cpu .. | silver N MHz (busy %, cap) gold ...` (a minute / on change).
+
+## CPU response and what burns the CPU (2890, 2891, root-tweaks-perf.py; built, NOT BOOTED)
+
+### Answers from the logs
+
+| Question | Answer | Evidence |
+| --- | --- | --- |
+| Gold at 2016 only under load? | Yes. 300 MHz at idle, 2016 under load | [V] 19:37-19:40 `gold 300 MHz (busy 6-13%)`, 19:15 `gold 2016 MHz (busy 93%)` |
+| Silver | Stayed at ABL's 1305 MHz with 0 % busy for minutes (the floor was ABL's row) | [V] every idle line of boots 19:07 and 19:34 |
+| UI threads on Silver? | No. Few frames end on Silver: 140 of 3200, most before the first 2000 frames (first-boot load) | [V] `redwood-gl: profile: ... frames ended on big cores 3060, little 140` |
+| Ramp-up | 300 ms from idle to the top: first 300 ms of a touch at 300 MHz (1/6.7 of the top) | [V source 2303] 100 ms tick, 300 ms window: 33 %, 66 %, 100 %. Host model (below). What frames this costs: [U], the time-per-row line tells |
+| Stuck low | 30-70 % busy holds any row: `gold 300 MHz (busy 62%)` | [V] 19:42:46; not during frames in that sample |
+| Busy reading | Lags on a core that runs one thread: user + system time is committed at kernel entries and switches | [V source] recount.c; idle time is current when read |
+| L3 / DDR with the CPU | No L3 clock on this SoC in the DT. **Linux does scale DDR with the CPU** (bwmon, memlat; LPDDR4X table: Gold 1401 MHz -> 1017, 1804 -> 1555, 2016 -> 1804 MHz DDR when memory bound; Silver 1420 -> 768). XNU has none of it. 2892 votes 1017 with Gold >= 1400 MHz only when `LAUREL DDR` shows that the RPM follows; 1555/1804 after that boot | [V source] trinket.dtsi cpu4-cpu-ddr-latmon; [U] the real DDR rate |
+| Idle states | WFI only. XNU idle = `wfi`; SweetCPU has no PSCI CPU_SUSPEND (`CPU halt/suspend is not implemented`). The DT has C3 `pc` (psci-cpu-mode 3), L2 and system states. No change here: it is power, not speed, and it needs its own patch (negroni 0383 is the model) | [V source] |
+| First boot | Spawns: 478 execs in minute 1 of boot 19:07 and 340 in boot 19:34; later 24-50 a minute. Who burned what: no per-task number existed; 2891 gives it | [V] exec lines |
+
+### What burns the CPU (ranking from the logs [I] until `LAUREL CPU TOP` is read)
+
+1. **The render path while the UI moves.** Boot 19:07: `gold 87-93 %, silver 70-82 %` at 19:15-19:16 goes with 54 frames a second, 800-960 GPU submissions in 5 s, 1189 redwood-gl + 492 NMTL + 534 SSDROP log lines in 2 min, WebContent started 8 times in 19:14 (a page in Safari). In the idle minutes before it: gold 6-12 %, silver 0 %.
+2. **First-boot work** (first minutes; no per-task number).
+3. **Wi-Fi scans until associated**: 14-16 scans a minute [V], gone once connected (19:15). The Wi-Fi area owns this.
+4. **Daemon restart loops.** `wifip2pd` 51 starts in 9 min and `nanotimekitcompaniond` 48 (median gap 10-11 s, boot 19:07; 36 and 35 in boot 19:34), each with an xpcproxy, with no CRASH line: they end on their own, launchd starts them again for the whole boot. `syncdefaultsd`: 14 starts, 13 CRASH sig 6, stops after 4 min (19:34; 9 starts in 19:07). Bound: the same loops run in the idle minutes above (at most 12 % of one Gold core at 300 MHz, sample once a minute): about 2 % of a Gold core at the top clock. **So they do not explain 87 / 82 %** (the Wi-Fi agent's lead). They do wake the governor: [I] each start can lift Gold for about 2 s with 2890 (down 1 row in 320 ms): a power cost at idle, the reason to drop them.
+   Why they exit: [U] (no log line). Cause of the 0.5 Mbps: not this; Wi-Fi area.
+
+`scripts/laurel/root-tweaks-perf.py` (called by root.sh, as root-tweaks-extra.py does for others): removes these three jobs from launchd.plist by program name. `PERF_DROP_JOBS="..."` changes the list, empty keeps all. `webbookmarksd` (5 starts, 4 crashes) stays: Safari may use it [I]. Host self-test only; the root is not rebuilt by this branch. Risk [I]: a client that waits for wifip2pd gets a missing service instead of a short-lived one; check Wi-Fi association and Settings after the next root.
+
+### 2890: governor
+
+- Tick 40 ms, window 120 ms; the decision is `bsd/dev/laurel_gov_core.h`: > 85 %: cap, > 60 %: +2 rows, < 30 % for 320 ms: -1 row. Host only (`scripts/laurel/gov-test.sh`, a modelled 100 % load from idle): old first raise 300 ms, top row 300 ms; new first raise 80 ms, top row 120 ms.
+- Busy = wall time - idle time.
+- Touch event (SweetHID.cpp): Gold at its cap and Silver at ABL's row for 500 ms; the thread wakes at once.
+- GPU submission in the last 100 ms: Gold at the first row from 1400 MHz (1401.6 in the DT table) [I: the frame's CPU part, 9 ms a frame in the profile lines, needs it].
+- Floor row 0 on both clusters. Thermal caps unchanged; the cap wins over floor and holds.
+- New minute lines: `LAUREL CPUFREQ: on: gold MHz:seconds in the last minute: 300:41 2016:12 ...`.
+- `laurel_thermal.c` is in pieces below 300 lines (`laurel_gov_loop.h`, `laurel_thermal_tsens.h`, `laurel_thermal_caps.h`).
+
+### 2891: CPU top line
+
+`LAUREL CPU TOP: 60 s, busy 34.2 s of 480: backboardd 12.1, SpringBoard 4.2, kernel_task 3.0, ...; ended tasks 1.2; 96 tasks` (example). Top 6 by CPU seconds in the minute (recount_task_usage, per pid). `ended tasks` = busy time no live task explains: the upper limit for restart loops. The first line after boot counts each task from its start. Off with `laurelcpugov=0`. Reads only; part of the governor's status line.
+
+### Risk [I]
+
+Silver at 300 MHz: background threads run slower until the 120 ms window lifts them; kernel threads that run on Silver (USB log) see the same. Gold ran at 300 MHz in every boot [V]; Silver below 1305 never ran under XNU [U]. More power during UI motion (Gold >= 1401 MHz) in exchange for frame time. Kill switch `laurelcpugov=0` (topaz pin of Gold at max, no governor).
+
+### Test
+
+1. Idle 2 min: `silver 300 MHz`, gold low in the rows line; UI normal.
+2. Scroll 1 min: rows line shows Gold at 1401+ for that time; compare `redwood-gl: ... over 16.7 ms` and `longest` with boot 19:34 (longest 58-229 ms, 22-93 frames over 16.7 ms in 10 s).
+3. Read `LAUREL CPU TOP` after first boot, idle and scrolling: this replaces the ranking above.
 
 ## Expected lines on the next boot
 

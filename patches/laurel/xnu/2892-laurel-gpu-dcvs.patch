@@ -1,0 +1,528 @@
+laurel 2892: GPU clock by demand, 300 <-> 600 MHz from GPLL0 (new iokit/Kernel/arm/LaurelGpuDcvs.cpp). Self-check before the UI: GPU temperature, clock read at 300 (GCC clock counter, CP counter next to it), MX+CX NOM vote through TopazRpm (held for the boot, never lowered), GPLL0 / 1, clock read at 600, CP fence, back to 300. Demand: busy >= 50 % over 50 ms or touch -> 600; below 20 % for 500 ms -> 300; thermal: no 600 from 90 C to 80 C (sensor 15). Watchdog: no fence progress for 1500 ms at 600 MHz -> 300 MHz, feature off. DDR: MCCC period register read; a vote only when it is below the wanted bus level and the RPM follows (LAUREL DDR line). Time per level a minute. The RedwoodGPU 5 s line is split in three: one log line ends after 255 bytes, so "GPU busy B %, core C MHz" never reached a log. Kill switch gpudcvs=0. Any failure: 300 MHz, GPU stays on.
+
+diff -ruN a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64	2026-11-01 19:59:50.294401592 +0530
++++ b/iokit/conf/files.arm64	2026-11-01 20:03:06.280918533 +0530
+@@ -13,6 +13,7 @@
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/TopazAudio.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/TopazRpm.cpp                                    optional iokitcpp
++iokit/Kernel/arm/LaurelGpuDcvs.cpp                               optional iokitcpp
+ iokit/Kernel/arm/LaurelBluetooth.cpp                             optional iokitcpp
+ iokit/Kernel/arm/LaurelMetal.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetAMFIService.cpp                            optional iokitcpp
+diff -ruN a/iokit/Kernel/arm/laurel_gpu_clock_read.h b/iokit/Kernel/arm/laurel_gpu_clock_read.h
+--- a/iokit/Kernel/arm/laurel_gpu_clock_read.h	1970-01-01 05:30:00.000000000 +0530
++++ b/iokit/Kernel/arm/laurel_gpu_clock_read.h	2026-11-01 20:06:58.998960278 +0530
+@@ -0,0 +1,124 @@
++/* laurel 2892 (a piece of LaurelGpuDcvs.cpp): clock reads and the DDR vote. */
++#define RD(b, o)        (*(volatile uint32_t *)((b) + (o)))
++#define WR(b, o, v)     do { __asm__ volatile("dsb sy" ::: "memory"); RD(b, o) = (v); __asm__ volatile("dsb sy" ::: "memory"); } while (0)
++
++/* clk-debug.c run_measurement: counts of the selected clock in `ticks` XO/4 ticks; 0: the counter did not finish */
++static uint32_t
++count_run(uint32_t ticks)
++{
++	WR(gcc, 0x62038, ticks);
++	for (int i = 0; (RD(gcc, 0x6203c) & (1u << 25)) != 0; i++) {
++		if (i > 2000) {
++			return 0;
++		}
++		IODelay(5);
++	}
++	WR(gcc, 0x62038, (1u << 20) | ticks);
++	for (int i = 0; (RD(gcc, 0x6203c) & (1u << 25)) == 0; i++) {
++		if (i > 2000) {
++			return 0;
++		}
++		IODelay(5);
++	}
++	uint32_t n = RD(gcc, 0x6203c) & 0x1ffffffu;
++
++	WR(gcc, 0x62038, ticks);
++	return n;
++}
++
++/* the gfx3d clock in MHz; 0: the counter does not count */
++static uint32_t
++gfx3d_mhz(void)
++{
++	const uint32_t full_ticks = 0x2000;     /* 1.7 ms */
++
++	WR(gpucc, 0x1568, (RD(gpucc, 0x1568) & ~0xffu) | 0xb);
++	WR(gpucc, 0x10fc, (RD(gpucc, 0x10fc) & ~3u) | 1u);      /* post divider 2 */
++	WR(gpucc, 0x1100, RD(gpucc, 0x1100) | 1u);
++	WR(gcc, 0x62000, (RD(gcc, 0x62000) & ~0x3ffu) | 0xdd);
++	WR(gcc, 0x30000, RD(gcc, 0x30000) & ~0xfu);
++	WR(gcc, 0x30004, RD(gcc, 0x30004) | 1u);
++	WR(gcc, 0x28008, RD(gcc, 0x28008) | 1u);
++	uint32_t a = count_run(0x1000), b = count_run(full_ticks);
++
++	WR(gcc, 0x28008, RD(gcc, 0x28008) & ~1u);
++	WR(gcc, 0x30004, RD(gcc, 0x30004) & ~1u);
++	WR(gpucc, 0x1100, RD(gpucc, 0x1100) & ~1u);
++	if (a == 0 || b == 0 || a == b) {
++		return 0;
++	}
++	return (uint32_t)(((uint64_t)b * 10 + 15) * 4800000 / (full_ticks * 10 + 35) / 1000000 * 2);
++}
++
++/* cycles of CP perf counter 0 over about 2 ms (laurel 2159); 0: not readable */
++static uint32_t
++cp_mhz(void)
++{
++	uint64_t b0, t0, c0, b1, t1, c1;
++
++	if (!laurel_gpu_counters(&b0, &t0, &c0)) {
++		return 0;
++	}
++	IODelay(2000);
++	if (!laurel_gpu_counters(&b1, &t1, &c1) || t1 <= t0 || c1 < c0) {
++		return 0;
++	}
++	return (uint32_t)((c1 - c0) * 192 / (t1 - t0) / 10);
++}
++
++static bool
++clock_right(uint32_t want, uint32_t *gcc_read, uint32_t *cp_read)
++{
++	*gcc_read = gfx3d_mhz();
++	*cp_read = cp_mhz();
++	uint32_t got = *gcc_read ? *gcc_read : *cp_read;
++
++	return got >= want * 9 / 10 && got <= want * 11 / 10;
++}
++
++static uint32_t
++ddr_mhz(void)
++{
++	uint32_t ps = RD(mccc, 0x220);
++
++	return ps >= 200 && ps <= 100000 ? 1000000u / ps : 0;   /* 10 MHz .. 5 GHz, else not a clock */
++}
++
++static void
++ddr_want(uint32_t mhz)
++{
++	mhz = mhz > ddr_boot ? mhz : ddr_boot;
++	if (ddr_vote != 0 && mhz != ddr_vote && topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, mhz * 1000)) {
++		ddr_vote = mhz;
++	}
++}
++
++static void
++ddr_start(void)
++{
++	ddr_boot = ddr_mhz();
++	if (ddr_boot == 0) {
++		IOLog("LAUREL DDR: off: the MCCC period register reads %u: no DDR clock known, no vote\n", RD(mccc, 0x220));
++	} else if (ddr_boot >= DDR_HIGH_MHZ) {
++		IOLog("LAUREL DDR: on: %u MHz measured, not lower than the GPU's bus level (%u MHz at 600 MHz): no vote needed\n",
++		    ddr_boot, DDR_HIGH_MHZ);
++	} else if (!topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, DDR_HIGH_MHZ * 1000)) {
++		IOLog("LAUREL DDR: off: %u MHz measured, RPM refused a vote of %u MHz\n", ddr_boot, DDR_HIGH_MHZ);
++	} else {
++		IOSleep(5);
++		uint32_t now = ddr_mhz();
++
++		/* (the register may read the controller clock, not the DDR clock: a clear rise also counts as "it follows") */
++		if (now >= DDR_HIGH_MHZ * 9 / 10 || now >= ddr_boot * 6 / 5) {
++			ddr_vote = DDR_HIGH_MHZ;
++			ddr_want(DDR_LOW_MHZ);
++			IOLog("LAUREL DDR: on: %u MHz at boot, a vote gave %u MHz, %u MHz now; %u MHz with GPU 600 MHz or Gold above %u MHz, never below the boot clock\n",
++			    ddr_boot, now, ddr_mhz(), DDR_HIGH_MHZ, GOLD_DDR_MHZ);
++		} else {
++			(void)topaz_rpm_write(RPM_ACTIVE, RPM_MEMC, 0, RPM_KHZ, ddr_boot * 1000);
++			IOLog("LAUREL DDR: off: %u MHz at boot, %u MHz after a vote of %u MHz: the RPM does not follow (AP sent no scaling enable); clock as it is\n",
++			    ddr_boot, now, DDR_HIGH_MHZ);
++		}
++	}
++}
++
+diff -ruN a/iokit/Kernel/arm/LaurelGpuDcvs.cpp b/iokit/Kernel/arm/LaurelGpuDcvs.cpp
+--- a/iokit/Kernel/arm/LaurelGpuDcvs.cpp	1970-01-01 05:30:00.000000000 +0530
++++ b/iokit/Kernel/arm/LaurelGpuDcvs.cpp	2026-11-01 20:06:58.999091621 +0530
+@@ -0,0 +1,261 @@
++/*
++ * laurel 2892: GPU clock by demand on the Mi A3 (Adreno 610, SM6125 "trinket"): 300 MHz (GPLL0 / 2, today's clock) <-> 600 MHz (GPLL0 / 1).
++ * Why [V boot 19:34, the "the GPU worked N us on each of M" fields]: GPU busy at 300 MHz is 20-83 % in the 5 s windows while the UI moves.
++ *
++ * Rails [V external/laurel-kernel-los]: gfx3d votes vdd_cx (gpucc-trinket.c rate_max: 320 LOW_SVS, 465 SVS, 600 SVS_PLUS, 745 NOM, ...);
++ * stock runs 600 from PLL0, so also MX NOM (PLL VCO above 1 GHz). pm6125-rpm-regulator.dtsi: VDD_CX = RPM "rwcx" id 0, VDD_MX = "rwmx" id 0,
++ * key "vlvl" (rpm-smd-regulator.c), levels qcom,rpm-smd-regulator.h: NOM = 256.
++ * The vote is NOM on both, once, before the first raise, and it is held for the boot: never lowered, so no later vote can take a rail
++ * from another block. Why NOM and not 192: XNU leaves the AP's other clocks as ABL set them and votes nothing for them; UFS AXI 200 MHz,
++ * ICE 300, UniPro 150, USB master 200 need NOM in gcc-trinket.c; the camera's VFE 403-576 MHz needs SVS_PLUS and more. A vote can only
++ * raise (the RPM takes the maximum over its masters), but a vote lower than what the rail holds now could let it fall
++ * as soon as the RPM aggregates again. Order: rails up first, then the clock; the clock goes down first (the rails stay).
++ *
++ * Clock check: the GCC clock counter (debugcc-trinket.c: GCC mux 0xDD, GPUCC mux 0xB, GPUCC post divider 2; clk-debug.c run_measurement).
++ * It needs no GPU work and also runs when the CP counter of laurel 2159 is gated. The CP counter is logged next to it and is the check
++ * only when the GCC counter does not count.
++ * DDR: the MCCC period register (0x447d200 + 0x20, ps) reads the clock [V clk-debug.c]. Stock bus levels: 320 MHz = 451, 600 MHz = 1017
++ * (trinket-gpu.dtsi). RPM "clk2" id 0 key "KHz". Sent only when the read says it is lower than wanted, never below the boot clock, and
++ * only while a read shows that the RPM follows. XNU sends no "clk0" id 2 "Enab" (clk_smd_rpm_enable_scaling): that message
++ * lets the RPM lower all its bus clocks that nobody votes for, so it stays out until the DDR line of a boot asks for it.
++ *
++ * Lines: LAUREL GPU CLOCK: on|off: ..., LAUREL DDR: on|off: ..., and the time per level once a minute. Kill switch gpudcvs=0.
++ * Any failure: 300 MHz, one line, the GPU stays on.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++
++extern "C" {
++vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++int laurel_thermal_gpu_dC(void);
++unsigned laurel_cpufreq_gold_mhz(void);
++extern uint64_t laurel_touch_at;
++void laurel_gpu_dcvs_start(void);
++bool laurel_gpu_dcvs_stall(void);
++/* TopazAdreno.cpp */
++bool laurel_gpu_core_div(uint32_t div);
++bool laurel_gpu_counters(uint64_t *busy, uint64_t *ticks, uint64_t *cycles);
++bool laurel_gpu_fence_check(uint64_t *us);
++bool redwood_gpu_ready(void);
++}
++
++#define RPM_ACTIVE      0u
++#define RPM_RWCX        0x78637772u     /* "rwcx" */
++#define RPM_RWMX        0x786d7772u     /* "rwmx" */
++#define RPM_VLVL        0x6c766c76u     /* "vlvl" */
++#define RPM_MEMC        0x326b6c63u     /* "clk2" */
++#define RPM_KHZ         0x007a484bu     /* "KHz" */
++#define LEVEL_NOM       256u
++
++#define TICK_MS         50u
++#define RAISE_PCT       50u             /* over one tick */
++#define LOWER_PCT       20u             /* of 600 MHz = 40 % of 300 MHz: below the raise mark, no ping-pong */
++#define LOWER_MS        500u
++#define TOUCH_MS        300u
++#define HOT_DC          900             /* no 600 MHz; the Linux trip gpu-step is 95 C */
++#define COOL_DC         800
++#define DDR_LOW_MHZ     451u            /* stock bus level for 320 MHz */
++#define DDR_HIGH_MHZ    1017u           /* stock bus level for 600 MHz */
++#define GOLD_DDR_MHZ    1400u
++
++static volatile uint8_t *gcc, *gpucc, *mccc;
++static uint32_t level;                  /* 0: 300 MHz, 1: 600 MHz */
++static volatile bool stalled;
++static uint32_t ddr_boot, ddr_vote;     /* MHz; ddr_vote 0: no vote is sent (no need, or the RPM does not follow) */
++
++#include "laurel_gpu_clock_read.h"      /* gfx3d_mhz, cp_mhz, clock_right, ddr_mhz, ddr_want, ddr_start */
++
++static bool
++off(uint32_t back, const char *why, uint32_t a, uint32_t b)
++{
++	if (back) {
++		(void)laurel_gpu_core_div(2);
++	}
++	level = 0;
++	IOLog("LAUREL GPU CLOCK: off: %s (%u, %u MHz); 300 MHz stays\n", why, a, b);
++	return false;
++}
++
++static bool
++self_check(void)
++{
++	uint32_t g300 = 0, c300 = 0, g600 = 0, c600 = 0, g_back = 0, c_back = 0;
++	uint64_t us = 0;
++
++	for (int i = 0; laurel_thermal_gpu_dC() <= -1000; i++) {
++		if (i >= 60) {
++			return off(0, "no GPU temperature from LAUREL THERMAL after 30 s", 0, 0);
++		}
++		IOSleep(500);
++	}
++	if (!clock_right(300, &g300, &c300)) {
++		return off(0, "the clock at 300 does not measure 300", g300, c300);
++	}
++	/* MX before CX: the order of the stock clock path (PLL first, then the RCG) */
++	if (!topaz_rpm_write(RPM_ACTIVE, RPM_RWMX, 0, RPM_VLVL, LEVEL_NOM) ||
++	    !topaz_rpm_write(RPM_ACTIVE, RPM_RWCX, 0, RPM_VLVL, LEVEL_NOM)) {
++		return off(0, "RPM refused the MX/CX vote NOM (TopazRpm lines)", g300, c300);
++	}
++	if (!laurel_gpu_core_div(1)) {
++		return off(1, "the RCG did not take GPLL0 / 1", g300, c300);
++	}
++	if (!clock_right(600, &g600, &c600)) {
++		return off(1, "the clock at 600 does not measure 600", g600, c600);
++	}
++	if (!laurel_gpu_fence_check(&us)) {
++		return off(1, "no CP fence at 600 MHz", g600, c600);
++	}
++	if (!laurel_gpu_core_div(2) || !clock_right(300, &g_back, &c_back)) {
++		return off(1, "the clock did not come back to 300", g_back, c_back);
++	}
++	IOLog("LAUREL GPU CLOCK: on: GPLL0 300/600 MHz, measured GCC %u/%u CP %u/%u MHz, CP fence at 600 in %llu us; MX+CX NOM held; raise at %u %% busy or touch, lower below %u %% for %u ms; no 600 from %d C to %d C\n",
++	    g300, g600, c300, c600, us, RAISE_PCT, LOWER_PCT, LOWER_MS, HOT_DC / 10, COOL_DC / 10);
++	return true;
++}
++
++/* one minute's time per level, when the GPU worked in it */
++static void
++minute_line(uint64_t ms[2], uint32_t raises, uint32_t busy_pct, uint32_t blocks)
++{
++	int dc = laurel_thermal_gpu_dC();
++
++	if (raises != 0 || ms[1] != 0 || busy_pct != 0) {
++		IOLog("LAUREL GPU CLOCK: on: last minute 300 MHz %llu s, 600 MHz %llu s, %u raises, %u hot refusals; busy %u %% of the time, gpu %d.%d C, DDR %u MHz\n",
++		    ms[0] / 1000, ms[1] / 1000, raises, blocks, busy_pct, dc / 10, (dc < 0 ? -dc : dc) % 10, ddr_mhz());
++	}
++}
++
++static void
++dcvs_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint64_t b0 = 0, t0 = 0, c = 0, lm_b0 = 0, lm_t0 = 0, ms[2] = { 0, 0 }, t_line = 0, touch_ns = (uint64_t)TOUCH_MS * NSEC_PER_MSEC;
++	uint32_t low_ms = 0, ddr_low_ms = 0, raises = 0, blocks = 0, g = 0, cp = 0;
++	bool hot = false;
++
++	ddr_start();
++	if (!self_check()) {
++		return;
++	}
++	(void)laurel_gpu_counters(&b0, &t0, &c);
++	lm_b0 = b0;
++	lm_t0 = t0;
++	while (redwood_gpu_ready()) {
++		IOSleep(TICK_MS);
++		if (stalled) {
++			IOLog("LAUREL GPU CLOCK: off: no GPU progress for 1500 ms at 600 MHz; 300 MHz stays\n");
++			return;
++		}
++		uint64_t b1, t1, ns = 0, now = mach_absolute_time();
++
++		if (!laurel_gpu_counters(&b1, &t1, &c) || t1 <= t0) {
++			continue;
++		}
++		uint32_t pct = (uint32_t)((b1 - b0) * 100 / (t1 - t0));
++
++		b0 = b1;
++		ms[level] += (t1 - t0) / 19200;
++		t_line += (t1 - t0) / 19200;
++		t0 = t1;
++		int dc = laurel_thermal_gpu_dC();
++
++		/* no reading counts as hot */
++		hot = dc <= -1000 || dc >= HOT_DC ? true : (dc < COOL_DC ? false : hot);
++		absolutetime_to_nanoseconds(now - laurel_touch_at, &ns);
++		bool touch = laurel_touch_at != 0 && ns < touch_ns;
++		bool want_up = pct >= RAISE_PCT || touch;
++
++		if (level == 0 && want_up && hot) {
++			blocks++;
++		} else if (level == 0 && want_up) {
++			if (!laurel_gpu_core_div(1)) {
++				off(1, "the RCG did not take GPLL0 / 1", 0, 0);
++				return;
++			}
++			if (!clock_right(600, &g, &cp)) {
++				off(1, "the clock at 600 does not measure 600", g, cp);
++				return;
++			}
++			level = 1;
++			low_ms = 0;
++			raises++;
++		} else if (level == 1) {
++			low_ms = pct < LOWER_PCT && !touch ? low_ms + TICK_MS : 0;
++			if (hot || low_ms >= LOWER_MS) {
++				if (!laurel_gpu_core_div(2)) {
++					off(0, "the RCG did not take GPLL0 / 2", 0, 0);
++					return;
++				}
++				level = 0;
++			}
++		}
++		unsigned gold = laurel_cpufreq_gold_mhz();
++
++		/* DDR up at once, down only after LOWER_MS (each vote is one RPM message) */
++		if (level == 1 || gold >= GOLD_DDR_MHZ) {
++			ddr_low_ms = 0;
++			ddr_want(DDR_HIGH_MHZ);
++		} else if ((ddr_low_ms += TICK_MS) >= LOWER_MS) {
++			ddr_low_ms = 0;
++			ddr_want(DDR_LOW_MHZ);
++		}
++		if (t_line >= 60000) {
++			minute_line(ms, raises, t1 > lm_t0 ? (uint32_t)((b1 - lm_b0) * 100 / (t1 - lm_t0)) : 0, blocks);
++			ms[0] = ms[1] = t_line = 0;
++			raises = blocks = 0;
++			lm_b0 = b1;
++			lm_t0 = t1;
++		}
++	}
++	IOLog("LAUREL GPU CLOCK: off: the GPU went off at %u MHz\n", level ? 600 : 300);
++}
++
++/*
++ * From the GPU watchdog (TopazAdreno.cpp) when the fence has not moved for 1500 ms: at 600 MHz go back to 300 MHz at once, long before the
++ * watchdog's 3 s turn the GPU off. true: the clock came down (the watchdog starts counting again).
++ */
++bool
++laurel_gpu_dcvs_stall(void)
++{
++	if (level == 0 || stalled) {
++		return false;
++	}
++	stalled = true;
++	(void)laurel_gpu_core_div(2);
++	level = 0;
++	return true;
++}
++
++void
++laurel_gpu_dcvs_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	(void)PE_parse_boot_argn("gpudcvs", &on, sizeof(on));
++	if (on == 0) {
++		IOLog("LAUREL GPU CLOCK: off: boot-arg gpudcvs=0; 300 MHz stays\n");
++		return;
++	}
++	gcc = (volatile uint8_t *)ml_io_map(0x01400000u, 0x80000);
++	gpucc = (volatile uint8_t *)ml_io_map(0x05990000u, 0x9000);
++	mccc = (volatile uint8_t *)ml_io_map(0x0447d000u, 0x1000);
++	if (gcc == NULL || gpucc == NULL || mccc == NULL) {
++		IOLog("LAUREL GPU CLOCK: off: clock registers not mapped; 300 MHz stays\n");
++		return;
++	}
++	if (kernel_thread_start(dcvs_thread, NULL, &thread) != KERN_SUCCESS) {
++		IOLog("LAUREL GPU CLOCK: off: no thread; 300 MHz stays\n");
++		return;
++	}
++	thread_deallocate(thread);
++}
++#else
++extern "C" void laurel_gpu_dcvs_start(void) {}
++extern "C" bool laurel_gpu_dcvs_stall(void) { return false; }
++#endif
+diff -ruN a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp	2026-11-01 19:59:50.292401537 +0530
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp	2026-11-01 20:06:59.003341114 +0530
+@@ -1433,17 +1433,23 @@
+ 		topaz_gpu_pool_note(pool, sizeof(pool));       /* laurel 2156 */
+ 		IOLog("RedwoodGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept); %s\n", gGPUStat.made,
+ 		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20, pool);
++		/*
++		 * laurel 2892: three lines. One kernel log line ends after 255 bytes [V boot 19:34: all the long lines stop at 255], so the end of
++		 * the old single line never reached a log: not one "GPU busy B %, core C MHz" was ever read.
++		 */
+ 		IOLog("RedwoodGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
+-		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
+-		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
+-		    "began; %u IOSurfaces taken as buffers in %llu us each; %u buffers, %llu MB; %u surface pushes, %u passed over "
+-		    "(no CPU write since the last, or write-combined); %s\n",
++		    "in %llu us a submission; %s\n",
+ 		    gGPUStat.submissions, nanos / NSEC_PER_MSEC, gGPUStat.commands, gGPUStat.buffers,
+ 		    (gGPUStat.flushed >> 10) / gGPUStat.submissions, flushing / NSEC_PER_USEC / gGPUStat.submissions,
+-		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000,
++		    redwood_gpu_clock_note());
++		IOLog("RedwoodGPU: the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
++		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all)\n",
++		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000);
++		IOLog("RedwoodGPU: %u waits of %llu us, %u over before they began; %u IOSurfaces taken as buffers in %llu us each; "
++		    "%u buffers, %llu MB; %u surface pushes, %u passed over\n",
+ 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
+ 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
+-		    fBufferBytes >> 20, gGPUStat.pushes, gGPUStat.clean, redwood_gpu_clock_note());
++		    fBufferBytes >> 20, gGPUStat.pushes, gGPUStat.clean);
+ 		bzero(&gGPUStat, sizeof(gGPUStat));
+ 	}
+ 	IOLockUnlock(gGPULock);
+diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp	2026-11-01 20:06:59.001179244 +0530
++++ b/iokit/Kernel/arm/TopazAdreno.cpp	2026-11-01 20:06:59.002090839 +0530
+@@ -1790,6 +1790,56 @@
+ 	ts_done = done;
+ }
+ 
++/* laurel 2892: what LaurelGpuDcvs.cpp needs from here; hw_lock around all of it */
++extern "C" bool laurel_gpu_core_div(uint32_t div);
++extern "C" bool laurel_gpu_counters(uint64_t *busy, uint64_t *ticks, uint64_t *cycles);
++extern "C" bool laurel_gpu_fence_check(uint64_t *us);
++
++bool
++laurel_gpu_core_div(uint32_t div)
++{
++	if (!ready || hw_lock == NULL) {
++		return false;
++	}
++	IOLockLock(hw_lock);
++	bool ok = rcg_set(0x101c, SRC_GPLL0, div);
++	IOLockUnlock(hw_lock);
++	return ok;
++}
++
++bool
++laurel_gpu_counters(uint64_t *busy, uint64_t *ticks, uint64_t *cycles)
++{
++	if (!ready || hw_lock == NULL) {
++		return false;
++	}
++	IOLockLock(hw_lock);
++	ts_account();
++	*busy = ts_busy;
++	*cycles = (uint64_t)gpu_rd(0x401) << 32 | gpu_rd(0x400);
++	*ticks = (uint64_t)gpu_rd(0x981) << 32 | gpu_rd(0x980);
++	IOLockUnlock(hw_lock);
++	return true;
++}
++
++/* one CP fence into a word of the fence page that nothing else reads; only with an idle ring (else no test: true, us = 0) */
++bool
++laurel_gpu_fence_check(uint64_t *us)
++{
++	bool ok = true;
++
++	*us = 0;
++	if (!ready || hw_lock == NULL || mem.va == NULL) {
++		return false;
++	}
++	IOLockLock(hw_lock);
++	if (gpu_rd(0x806) == wptr % RB_DWORDS) {
++		ok = cp_fence((volatile uint32_t *)(mem.va + 0x3c0), mem.iova + 0x3c0, 0x51a6e600, us);
++	}
++	IOLockUnlock(hw_lock);
++	return ok;
++}
++
+ extern "C" const char *redwood_gpu_clock_note(void);
+ const char *
+ redwood_gpu_clock_note(void)
+@@ -1936,6 +1986,8 @@
+ /* ---------------------------------------------------------------- start */
+ 
+ void laurel_gpu_watchdog(void);                 /* laurel 2155 */
++extern "C" void laurel_gpu_dcvs_start(void);    /* laurel 2892: LaurelGpuDcvs.cpp */
++extern "C" bool laurel_gpu_dcvs_stall(void);
+ 
+ static void
+ topaz_adreno_thread(__unused void *param, __unused wait_result_t wr_)
+@@ -1971,6 +2023,7 @@
+ 	IOLog("LAUREL GPU: on: Adreno 610 chip 0x%08x, core %u MHz, %s, SMMU %s, %s %#llx+%#llx; RedwoodGPU published\n",
+ 	    CHIP_ID, core_mhz, fw_note, gpu_identity ? "pass-through" : "stage 1",
+ 	    gpu_midmem ? "kernel memory (midmem), no pool;" : "pool", gpu_pool_base, gpu_pool_size);
++	laurel_gpu_dcvs_start();                /* laurel 2892: GPU clock by demand (own thread) */
+ 	laurel_gpu_watchdog();                  /* laurel 2155: this thread watches the GPU from now on */
+ }
+ 
+@@ -2049,6 +2102,11 @@
+ 			continue;
+ 		}
+ 		absolutetime_to_nanoseconds(now - since, &ns);
++		/* laurel 2892: no progress at 600 MHz: first the clock back to today's speed, and the 3 s count again */
++		if (ns / NSEC_PER_MSEC >= 1500 && laurel_gpu_dcvs_stall()) {
++			since = now;
++			continue;
++		}
+ 		if (ns / NSEC_PER_MSEC >= GPU_HANG_MS) {
+ 			gpu_hang(done, last, ns / NSEC_PER_MSEC);
+ 			return;

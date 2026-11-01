@@ -915,3 +915,15 @@ Next: boot with this kernel; docs/laurel_sprout/wifi.md "Test": read `link` + `p
 Owner: phone locked, screen never came back; iOS and the kernel alive. [I, strong] 2871's FIFO made 0x28/0x10 reach the panel for the first time; 0x11 + 0x29 with video running do not bring the picture back (power mode 0x9f -> 0x9d at the first sleep [V]). Suspects timing, frames, DBV: refuted by code and log; table in docs/laurel_sprout/brightness.md.
 Change: display off = fade to DBV 0 + black frame, no 0x28/0x10. Wake: one 0x0A with the light out, sleep-out sequence once only if the panel is off. Last direct iOS frame shown again if none is new. No reads after the start except that check.
 Build: 276/276 patches (75 laurel), 0 LSE, kernel sha256 9e57a0b5f9e35f81.... Next: boot image (`scripts/laurel/uefi-image.sh`) with this kernel, owner approves the flash, test in brightness.md. Open: real panel sleep (video stop, reset, whole on-command set, video start) if the battery needs it.
+
+## Mi A3: GPU and CPU clocks (2026-11-01, branch t3/laurel-clock-perf, patches 2890-2892; NOT BOOTED)
+Owner: "fix Metal fully and GPU and CPU acceleration fully". Done [built, host test only]: GPU 300 <-> 600 MHz by demand with MX+CX NOM held, clock read back, thermal cap; DDR read and vote rule; 5 s line split (the measured clock never reached a log: line cut at 255 bytes); CPU governor 120 ms to the top (was 300 ms, host only), touch and GPU-work holds, Silver floor row 0, time per row, `LAUREL CPU TOP`; three restart-loop jobs out of the root.
+What "fully" can mean on this GPU [I]:
+| Part | Gain to expect | Limit |
+| --- | --- | --- |
+| GPU 600 MHz | GPU time per submission up to half (3.6-10 ms now) when the core clock is the limit; less if DDR is the limit. Fewer late frames in heavy scenes. Not measured | A610 stock top is 950 MHz, 1 CCU, 132 KiB GMEM: a low-end part |
+| CPU ramp + holds | First frames after a touch: up to 6.7x more CPU clock in the first 120-300 ms. No change in steady scrolling if Gold was already high | A73 at 2016 MHz |
+| DDR vote | Unknown until `LAUREL DDR` is read: zero if DDR is already at 1017+ | RPM scaling |
+| Dropping 3 jobs | Under 2 % of a Gold core; idle power | - |
+Stays CPU-bound [V profile lines + I]: about 9 ms of CPU per frame (3 in GL, 6 outside: CoreAnimation), "handing on" 2.4-5.7 ms, metal2vulkan encode and shader translation, first-use shader compile. A clock raise does not remove these; the GPU rarely holds the CPU back ("waiting" 0.5-0.9 ms). Metal "fully" is not a clock matter: 8 of 21 QuartzCore shader pairs and 4 of 7 kernels still fail in m2vtest (19:36:55) [V], which metal.md tracks.
+Next: kernel + root + boot image, owner test (gpu.md and battery-power.md "Test"). Then decide from the lines: PLL levels, RPM scaling, PSCI idle states.
