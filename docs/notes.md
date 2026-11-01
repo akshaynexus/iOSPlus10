@@ -4871,3 +4871,12 @@ Full text: docs/laurel_sprout/camera.md section 13.
 ## Mi A3: patch 2914 (touch rate) parked: it broke touch on the phone (2026-11-01 23:19)
 - [V log] `touch 0 down at 310,1559 edge`, then `up` only 13 s later, out-of-order touch lines; the owner could not unlock. Finger events get lost with 2 ms latch + 16-byte read.
 - Parked in patches/laurel/parked/. Faster touch needs a rework: read the whole record when a second finger or a lift can occur, never lose a lift. The old path read every 12 ms.
+## Mi A3: Maps black, widgets (boot 2026-11-01 23:28; branch t3/laurel-metal-black; gpu.md "Black layers")
+- [V] Maps.app is in no log: no `exec Maps` up to 23:31:36, no NMTL line in metal.log. Do not read the BLANK lines of that boot as Maps. The maps in the log: FindMy, location prompt.
+- [V] 239 surface creates refused by the wired guard 2906 from 23:31:25 (1800-1827 MiB of 1795, poster gallery open), chronod 4 at 23:31:32-36, 0 in boot 22:08. [V QuartzCore] a refused create = nil drawable = black Metal layer. [I] Maps ran under this.
+- Gotcha: `contents ... 0 of 0 samples = BLANK` on eagl before 0005 = not looked at (42 of 62 lines). `first draw` black is normal for a new surface; "now drawn" needs the surface bound in every 128th frame. Read `LAUREL BLANK`.
+- Gotcha: a Metal client's write moves the seed: flame `-finish` (write lock + unlock, before present). The old sentence in gpu.md was wrong. Kernel 2915 moves it too at submit, by-ID surfaces only.
+- Gotcha: kernel seed moves made other clients push the surface: 2916 `gpuMoves`.
+- Gotcha: the USB log is a kernel UDP socket through the normal stack; it stopped after `usbnetcfg down` twice [V], a failed send has no line. [I] configd drops ue0's route or address.
+- Next boot decides: see the reading table in gpu.md. Kernel alone brings the guard change; `LAUREL BLANK` and the RenderBox answer need the root.
+

@@ -982,6 +982,8 @@ eagl **0006**, Mesa **0003**: `LAUREL BLANK`, at most one line in 5 s, for surfa
 
 Not changed: the guard's 55 % for others; kernel memory; any Metal path (no evidence of a fault).
 
+Build [V, cea447a]: kernel-linux.sh 308/308 patches, 0 failed, 0 LSE, printf-arg-check OK, kernel sha256 37beb26901de0f20..., series 0ce006e70a229e13; armv80-check on the kernel: 21 (SVE words in data, the same count as earlier kernels), 0 LSE. gpu-userland.sh + Mesa: libtopaz-gl b1cd72f0449f97ed, libOSMesa 29b469806232969a, exports `redwood_drm_surface_who`, armv80-check 0 on both. Host: gpu-surface-test.sh PASS (with the LAUREL BLANK list). metal-build.sh not run: no Metal source changed. Not run: root build, any boot.
+
 ### Lines at the next boot
 
 ```

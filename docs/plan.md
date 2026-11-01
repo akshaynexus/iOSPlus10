@@ -1035,3 +1035,9 @@ Unproven: ONLINE at mode 5 ([U], the main risk, an assert stops Wi-Fi for the bo
 [V, logs/laurel-boot-radio.txt, IPA test image on the 22:xx root] IPA on; `DMS SET_OPERATING_MODE online: ok`, `operating mode online (raw 0)`; `modem radio technologies: GSM,UMTS,LTE` (no 5G); no modem crash in 2 min; `nas1/nas2 BIND_SUBSCRIPTION: ok`.
 Then at 23:43:59-23:44:37: card state USIM/7 -> USIM/6, `SIM1 present (USIM illegal), SIM2 present (USIM illegal); modem online; SIM1 registration denied rssi -104; SIM2 registration denied`. Cause unknown.
 Owner rule from now on: no flashing unless the owner asks. Code work goes on and is pushed to laurel-sprout.
+
+## Mi A3: Maps black, widgets refused (2026-11-01, branch t3/laurel-metal-black; NOT BOOTED)
+Cause proven [V]: wired guard refused 239 surface creates from 23:31:25 (chronod 4), a refused create is a nil drawable. [I] Maps ran under it: Maps has no log at all. Path walked hop by hop, no break by source: gpu.md "Black layers".
+Done: kernel 2916 (kept buffers first, 70 % for the app on the screen + chronod, `LAUREL WIRED: who:`, request 0x7b, seed moves of GPU writes push nothing), eagl 0006 + Mesa 0003 (`LAUREL BLANK`). Build: 308/308, 0 LSE, kernel 37beb26901de0f20; libtopaz-gl b1cd72f0449f97ed.
+Next (owner decides any flash): kernel + matched root; open Maps with the USB log on, no `usbnetcfg down`; read the table in gpu.md.
+
