@@ -200,6 +200,7 @@ Design [V source of the patch; hardware behaviour I until the phone runs it]:
      there is no pool): a write that bypassed the tables lands in reserved RAM, never in MMIO, and fails the check
      (`the fence for VA .. landed at PA ..: the tables are bypassed`); FSR = 0;
   4. any failure: `SCTLR` back to pass-through, one more fence checks the CP, 2150's backboardd-only rule stays.
+     2157 changes steps 2-4 (stall during the check, recovery, logs): see "Stage-1 check failure" below.
 - **GPU VA layout** (one address space for all clients, kernel-managed addresses; Turnip/Mesa use GET_IOVA):
   `0x01000000-0x7fffffff` allocator (64 KiB granule, first fit): scattered buffers, IOSurfaces; `0x80000000-0xffffffff`
   VA = PA for contiguous memory below 4 GiB (CP buffers, GPU-pool GEM buffers), so the pool's bookkeeping (address =
@@ -221,6 +222,69 @@ Design [V source of the patch; hardware behaviour I until the phone runs it]:
   TrustZone memory.
 
 Kill switch: `gpu_smmu=0` (pass-through, 2150 behaviour). `gpu_identity` is no longer parsed: it is the result of the check.
+
+## Stage-1 check failure (boot 2026-11-01 07:19, fixed by 2157)
+
+Observed [V logs/usblog-20261101-001446.txt of the main checkout, kernel of that boot = 2154 + 2156]:
+
+- `07:19:32 LAUREL GPU POOL: free of 0x1000000+0xef000000 refused (1 so far): the pool has given nothing out; caller
+  0xfffffff007ae30f8` (= topaz_adreno_thread + 0x178, hw_start inlined). [V source] hw_start seeded the GPU VA
+  allocator with `redwood_gpu_address_free(VA_USER_START, VA_KERNEL - VA_USER_START)`; with `gpu_identity = 1` that call
+  is the pool's free, which 2156 now checks and refuses. 2154 and 2156 were written in parallel. Harmless (nothing
+  freed), but a wrong line and a wrong seed.
+- Zap ok, `SMMU TTBR0 c0000000 ... (identity)`, SQE at 0xc0010000, ring at 0xc0020000, CP up, fence test ok (356 us).
+- `07:19:35 TopazGPU: ring stuck: rptr 17 wptr 21 RBBM_STATUS 00800005 CP_HW_FAULT 00000000` and
+  `[ring] SMMU gfsr 00000000 CB0 FSR 00000400 FAR 00000000c0020040 FSYNR0 00040000`, then `THE GPU IS NOT STARTED`,
+  `LAUREL GPU: off: pass-through after the stage-1 check failed`, `LAUREL METAL: off`.
+- `07:21:10` same kernel with `gpu_smmu=0`: GPU on in pass-through, RedwoodGPU published, backlight on GPU renderer.
+
+Analysis:
+
+- [V source] The "ring stuck" line comes from the fallback in hw_start (`ring_idle` before its fence), after `back:`
+  had written FSR = 0xFFFFFFFF. So FSR 0x400 is only what the clear leaves: FORMAT (bits 10:9) = 2; the fault type
+  bits (TF/AFF/PF/EF/ASF) were lost. FAR survives a FSR clear: the fault was a CP read at 0xc0020040 = ring + 0x40,
+  dword 16 = the first dword of the check's first fence packet (wptr 16 -> 21). So the CP's first ring fetch through
+  the tables faulted; the check stopped at step 4 (the register read-back had passed, else no fence is sent).
+- [V source] `SCTLR_STAGE1` has no CFCFG: the faulting fetch was terminated. A terminated CP fetch leaves the CP hung
+  (rptr stays at 17, RBBM_STATUS busy); going back to pass-through does not wake it. The fallback then only checked
+  `ring_idle`, so the GPU went off instead of staying in pass-through (design said: GPU stays on).
+- [V source, CPU side] The table builder looks right on paper: T0SZ 32 + 4 KiB granule = walk from level 1 (4 entries),
+  l1[3] -> l2[3], l2[3][0] -> one l3 table for 0xc0000000-0xc01fffff, l3[0x20..0x27] = ring pages, PTE = PA | 0x643
+  (valid, page, AP[1], SH outer, AF, AttrIndx 0). TCR 0x00800020 = T0SZ 32, TG0 4 KiB, NC NSH walks, EPD1. The
+  differences from Linux arm_smmu_write_context_bank were: CBAR BPSHCFG 0 (reserved; Linux NSH = 3), VMID 0, TCR2
+  without AS / SEP (the 07:19 read-back of TCR2 was 0x61), and TCR before TCR2. [I] FORMAT 2 may mean an AArch32
+  long-descriptor walk (CBA2R0.VA64 not taken); IDR0 4c017e04 (S1TS, no ATOS: ATOSNS = 1, so no address translation
+  operation can test the tables without the GPU) and IDR2 00005511 (IAS/OAS 36 bit, AArch64 4 KiB granule supported).
+  The real fault type is unknown until the next boot: 2157 logs it before anything clears it.
+
+2157 (patch `2157-laurel-gpu-smmu-check-recover.patch`):
+
+1. `va_seed()`: the allocator's one range 0x01000000-0x7fffffff is set directly when the tables come up. Pass-through
+   uses no allocator: no seed in hw_start, no refused free line.
+2. The check logs each step: `check 1` CPU-side walk of every page of ring/SQE/fence to VA = PA (each table link must
+   hold the next table's PA); `check 2` the context bank as held (now with CBA2R0) and whether stall-on-fault took;
+   `check 3` CP fence at VA = PA; `check 4` CP fence to a kernel page at VA != PA. Linux's values and order (CBA2R, CBAR
+   0x0001f301, TCR2 0x00038011, TCR, TTBR0, MAIR0, SCTLR last).
+3. During the check, `SCTLR = M | TRE | AFE | CFRE | CFCFG | HUPCF`: a fault stalls the access. The fault is decoded
+   (`FSR .. (TF ... stalled format N) FAR .. FSYNR0 .. (level L, read|write[, table walk]) walk: entry .. at level N`)
+   before anything clears it. On failure `smmu_back()`: SCTLR pass-through, TLBIALL, FSR clear, and a stalled access to
+   our own memory (CP buffers or GPU pool, VA = PA) is retried (CB_RESUME TnR 0): it completes as a physical access
+   and the CP goes on. Any other stalled access is terminated (TnR 1). After a passed check: SCTLR without CFCFG
+   (terminate; a stall would block the GPU), as in 2154.
+4. `cp_recover()`: CP idle: one fence (`pass-through: the CP goes on`). CP hung: GPU power collapse (`power_up`, which
+   cycles GX and CX), zap resume (SCM SVC_BOOT 0x0a, state 0, id 0 = Linux `qcom_scm_set_remote_state(0, 0)`), SMMU
+   pass-through again (the SMMU is in the CX domain), `cp_start` with its fence test. No RBBM_SW_RESET: Linux
+   `a6xx_gpu_sw_reset` skips it on A610 ("11nm chips ... have hw issues with the reset line"). `cp_start` now keeps the
+   CP buffers on a second start (the old test `md == NULL` is always true for pool buffers).
+5. Page tables: 16 per 64 KiB pool unit (2154 took one pool unit per PAGE_SIZE chunk).
+
+Expected lines (next boot, default boot-args):
+`LAUREL GPU SMMU: check 1: tables at 0xc0000000: ring 0xc0020000+0x8000, ...`, `check 2: SCTLR 000001a7 ... CBA2R0
+00000001 ...; stall on fault yes`, then either `check 3`/`check 4`/`on: stage 1, ...` or
+`check failed: no fence write through the tables at VA = PA <fence page>: FSR ........ (...) FAR 0xc0020040 ...; context
+bank 0 back to pass-through, the stalled access retried there`, `pass-through: the CP goes on, fence at ...` (or the
+power-cycle lines), `TopazGPU: Adreno 610 ready`, `LAUREL GPU SMMU: off: <why>: pass-through ...`, `LAUREL GPU: on: ...
+SMMU pass-through`. The FSR/FSYNR0/walk text of the failure line is the input for the next fix of the tables.
 
 ## Compiled target (Kryo 260: A73 + A53, ARMv8.0)
 

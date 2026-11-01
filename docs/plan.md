@@ -762,3 +762,17 @@ Observed [V, usblog 07:20:52 boot, laurel-int-1 at e2c29b4 + EXTRA_ARGS=gpu_smmu
 Open: 2154 SMMU stage-1 faults on the CP ring and turns the GPU off (fix agent t3/laurel-smmu-pool-bt), so tests use
 gpu_smmu=0 until then; BT rampatch check rejects apbtfw10.tlv (same agent); RTC/status bar (2720 + root-statusbar.py, merged,
 needs a root rebuild); cellular step 1 (2760) merged, step 2 IPA in progress.
+## Mi A3: GPU stays on after a failed stage-1 check; Bluetooth picks cmbtfw12 (2026-11-01 07:45, branch t3/laurel-smmu-pool-bt, 2157 + 2600)
+
+Observed [V boot 07:19, usblog-20261101-001446]: `LAUREL GPU POOL: free of 0x1000000+0xef000000 refused` (2154's VA seed through
+2156's checked pool free), the stage-1 check's first ring fetch faulted at 0xc0020040 (terminated: CP hung), the fallback did not
+recover the CP, `LAUREL GPU: off`. Same kernel with gpu_smmu=0 (07:21): GPU on. BT: chip product 0x000f rom 0x0102, `off: the
+rampatch is for another product` (apbtfw10.tlv = product 0x000a).
+Done [V build, 248/248 patches, 0 LSE, no warnings in the changed files; sha256 64df80382164...]: 2157 `va_seed()` (no pool free),
+check steps logged with the decoded fault, stall-on-fault during the check + retry in pass-through, `cp_recover()` (fence, or power
+cycle + zap resume + CP start), Linux's context-bank values. 2600/2601: names from the EDL ROM version (Linux), the rampatch header
+picks the file (cmbtfw12.tlv + cmnv12.bin for this chip), NVM speed byte from the file. [V host test] scripts/laurel/bt-fw-test.sh.
+Not booted. Next: boot; expect `LAUREL GPU SMMU: check 1..2`, then `on: stage 1` or `check failed: ... FSR .. (..) ..` +
+`pass-through: the CP goes on` + `LAUREL GPU: on ... SMMU pass-through`; BT `fw: cmbtfw12.tlv ...` and `on: WCN39xx product 0x000f`.
+The failure line's FSR/FSYNR0/walk text decides the next table fix. Details: docs/laurel_sprout/gpu.md "Stage-1 check failure",
+docs/laurel_sprout/bluetooth.md "The chip is WCN3950 family".
