@@ -213,10 +213,10 @@ Expected lines:
 ```
 SWEET BATTERY: SPMI arb=0x50010000 APIDs=256, observer reads; PON APID 112 rw lane mapped
 LAUREL KEYS: on: power+vol-down polled (PON APID 112), vol-up polled (PM6125 GPIO5 APID 124); shared SPMI lock, a change needs 2 agreeing reads
-LAUREL SPMI: on: arbiter 0x50010000, 256 APIDs, one lock and one channel map for every transaction; users: pon keys battery haptic; spmi errors pon 0 keys 0 battery 0 haptic 0, forced 0
-LAUREL BATTERY: on: PMI632 QG soc N% ... icl N mA charging; spmi errors pon 0 keys 0 battery 0 haptic 0, forced 0
+LAUREL SPMI: on: arbiter 0x50010000, 256 APIDs, one lock and one channel map for every transaction; users: pon keys battery haptic rtc; spmi errors pon 0 keys 0 battery 0 haptic 0 rtc 0, forced 0
+LAUREL BATTERY: on: PMI632 QG soc N% ... icl N mA charging; spmi errors pon 0 keys 0 battery 0 haptic 0 rtc 0, forced 0
 ```
-The `LAUREL SPMI` line comes 60 s after the first SPMI init (users that started by then; the haptic user registers when
+(2720 adds the `rtc` user: laurel_rtc.c, PM6125 RTC_RW reads.) The `LAUREL SPMI` line comes 60 s after the first SPMI init (users that started by then; the haptic user registers when
 iOS opens the vibrator, so it can be missing there). The error counts repeat in the 5-minute `LAUREL BATTERY` line.
 Test: phone untouched for 5 min: no `SWEET KEYS: key=` line, error counts 0 (or a few, never a key event).
 

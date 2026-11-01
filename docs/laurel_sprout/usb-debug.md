@@ -16,8 +16,10 @@ The laurel kernel speaks the same USB protocol as negroni, so the negroni host t
 
 Commands: `ping` -> `pong`; `log` -> `ok log` (the last 64 KiB again); `reboot` / `bootloader` / `recovery`
 -> `ok <cmd>` then, 500 ms later, the IMEM restart reason of patch 2003 (`kern.laurel_reboot_mode`) + PSCI
-SYSTEM_RESET; `poweroff` -> PSCI SYSTEM_OFF; `panic` -> `panic("requested over USB")`. Unknown words
-(e.g. negroni's `settime`, `bootlog`, `usbstats`) get `error: unknown command`; usblog.sh tolerates that.
+SYSTEM_RESET; `poweroff` -> PSCI SYSTEM_OFF; `panic` -> `panic("requested over USB")`; `settime <s>[.<frac>]` ->
+`ok settime <s>.<us>`, then `LAUREL CTL: settime ...: clock set` (patch 2720; usblog.sh sends it at each interface up);
+`time` -> `time <s> rtc <raw> offset <n> source ...` (2720, docs/laurel_sprout/rtc-statusbar.md). Unknown words
+(e.g. negroni's `bootlog`, `usbstats`) get `error: unknown command`; usblog.sh tolerates that.
 Not ported: 0367 `bootlog` (the userdata ring). topaz 0047 already writes the console ring to the end of
 the UFS partition; a reader for it is future work.
 

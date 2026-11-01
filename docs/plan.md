@@ -16,6 +16,14 @@ other surfaces from wired pages), 2103 (native 720x1560 canvas at scale 2 by def
 `LAUREL FB CANVAS:`, `LAUREL FB CANVAS: first frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
 + 0102 (DarwinBoot shrinks the window instead of "NO WINDOW"); mkadt `--dram auto`. Next: boot, read `LAUREL RAM:`, `LAUREL SPOOL:`,
 `LAUREL FB CANVAS:`, `LAUREL FB: first iOS frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
+Clock + status bar (2026-11-01 07:30, branch t3/laurel-rtc-statusbar, built, NOT BOOTED): lock screen showed 1969-12-31 4 PM
+(no time source; usblog `settime: error: unknown command`) and the red rdar:45025538 bar. Kernel 2720: calendar from the PM6125
+RTC (SID 0 0x6000, via the one SPMI core, reads only) + own offset in /private/var/db/laurel_rtc, build-date floor, USB ctl
+`settime`/`time` (queued, set by ud_thread); 245/245 patches, 0 LSE, kernel sha256 c895d70f.... Root: `scripts/laurel/root-statusbar.py`
+sets UIKit's own override `UIStatusBarVisualProviderClassName = _UIStatusBarVisualProvider_FixedSplit` (720 px is no Split class
+width -> nil provider -> red Fallback bar; read in UIKitCore 20H392). Needs a root rebuild + userdata flash (owner). Next: boot,
+read `LAUREL RTC: on|off:`, `LAUREL CTL: settime ...: clock set`, photo of the lock screen (date, no red bar).
+Details: `docs/laurel_sprout/rtc-statusbar.md`.
 Bluetooth (2026-11-01 05:30, area G, built, NOT BOOTED): kernel 2600 (WCN3990 on QUP1 SE9 GENI UART, RPM rails, power pulses,
 EDL version, 3000000 baud, crbtfw21.tlv + crnv21.bin from bluetooth_b at run time, HCI reset, BD_ADDR; iOS transport as negroni),
 mkadt /arm-io/bluetooth, userland/laurel/bt + root-bt.sh. Next: boot, read `LAUREL BT: on|off:`, then bluetoothd log + a scan.
