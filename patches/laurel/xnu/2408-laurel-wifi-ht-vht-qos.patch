@@ -1,0 +1,221 @@
+laurel 2408: Wi-Fi: join with HT, VHT, QoS and the width of the AP. It was 11a/11g: 54 Mbit/s at most, no A-MPDU, no QoS (ath10k_peer_assoc_h_*). A failed join on an AP falls back to legacy on that AP.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -23,6 +23,7 @@
+ #include <sys/param.h>
+ #include <sys/errno.h>
+ #include "LaurelWifiPhy.h"                      /* laurel 2405 */
++#include "LaurelWifiLink.h"                     /* laurel 2407 */
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -4187,6 +4188,10 @@
+ static uint64_t s_replay;
+ static uint8_t *s_mgmt_va;
+ static uint64_t s_mgmt_pa;
++/* laurel 2408: the link this join uses (HT, VHT, QoS, width); all zero/legacy when the AP or the firmware has none */
++static struct lw_ap s_ap;
++static struct lw_link s_link;
++static uint8_t s_legacy_bssid[6];               /* a join with HT/VHT failed on this AP: the next one is legacy */
+ 
+ void (*topaz_wlan_rx_hook)(const uint8_t *frame, size_t length);
+ void (*topaz_wlan_link_hook)(bool up);
+@@ -4199,9 +4204,9 @@
+ {
+ 	uint8_t *c = wmi_put_tlv(p, TAG_CHANNEL, 24);
+ 	c = w_p32(c, freq);
+-	c = w_p32(c, freq);
++	c = w_p32(c, s_link.center != 0 ? s_link.center : freq);    /* laurel 2408: band_center_freq1 */
+ 	c = w_p32(c, 0);
+-	c = w_p32(c, freq < 4000 ? 1 : 0);
++	c = w_p32(c, s_link.mode);                  /* laurel 2408: ath10k chan_to_phymode (legacy: 11a/11g as before) */
+ 	c = w_p32(c, (40u << 8) | (40u << 16));
+ 	return w_p32(c, 40u << 8);
+ }
+@@ -4262,7 +4267,8 @@
+ 	bzero(m, sizeof(m));
+ 	*p++ = H2T_TX_FRM;
+ 	*p++ = (uint8_t)(TXF0_MAC_HDR | TXF0_NATIVE | (clear ? TXF0_NO_ENCRYPT : 0));
+-	p = put16(p, (uint16_t)(TXF1_TID_NONQOS | TXF1_POSTPONED));   /* vdev 0 */
++	/* laurel 2408: a QoS TID, or the firmware makes no A-MPDU (ath10k_htt_tx_get_tid); EAPOL as mac80211: TID 7 */
++	p = put16(p, (uint16_t)((s_link.qos ? (clear ? 7u << 6 : 0u) : TXF1_TID_NONQOS) | TXF1_POSTPONED));   /* vdev 0 */
+ 	p = put16(p, (uint16_t)len);
+ 	p = put16(p, (uint16_t)id);
+ 	p = put64(p, htt_bank_pa + (uint64_t)id * HTT_EXT_DESC_SIZE);
+@@ -4396,33 +4402,82 @@
+ static bool
+ w_peer_assoc(uint32_t caps)
+ {
+-	uint8_t m[4 + 76 + 4 + 16 + 4 + 4 + 16] = {}, *p, *r, rates[16];
+-	uint32_t n = w_ap_rates(rates), rl = (MIN(n, 16u) + 3) & ~3u;
++	uint8_t m[4 + 76 + 4 + 16 + 4 + 16 + 4 + 16] = {}, *p, *r, rates[16];
++	uint32_t n = w_ap_rates(rates), rl = (MIN(n, 16u) + 3) & ~3u, hl = (s_link.ht_rate_count + 3u) & ~3u;
+ 	p = wmi_put_tlv(m, TAG_PEER_ASSOC, 76);
+ 	p = w_pmac(p, s_bssid);
+ 	p = w_p32(p, 0);
+ 	p = w_p32(p, 1);                            /* new assoc */
+ 	p = w_p32(p, s_aid);
+-	p = w_p32(p, PEER_FLAG_AUTH | (s_rsn ? PEER_FLAG_NEED_PTK_4WAY : 0));
++	p = w_p32(p, PEER_FLAG_AUTH | (s_rsn ? PEER_FLAG_NEED_PTK_4WAY : 0) | s_link.peer_flags);
+ 	p = w_p32(p, caps);
+ 	p = w_p32(p, 1);                            /* listen interval */
+-	p += 4 * 6;                                 /* ht caps, max mpdu, density, rate caps; nss below */
+-	p -= 4 * 2;
+-	p = w_p32(p, 1);                            /* nss */
+-	p = w_p32(p, 0);                            /* vht caps */
+-	p = w_p32(p, s_freq < 4000 ? 1 : 0);        /* phy mode: 11g / 11a */
++	p = w_p32(p, s_link.ht_caps);               /* laurel 2408: ath10k_peer_assoc_h_ht/_vht/_phymode */
++	p = w_p32(p, s_link.max_mpdu);
++	p = w_p32(p, s_link.density);
++	p = w_p32(p, s_link.rate_caps);
++	p = w_p32(p, s_link.nss);
++	p = w_p32(p, s_link.vht_caps);
++	p = w_p32(p, s_link.mode);
+ 	p += 8;
+ 	p = w_p32(p, MIN(n, 16u));
+-	p = w_p32(p, 0);
++	p = w_p32(p, s_link.ht_rate_count);
+ 	r = wmi_put_tlv(p, TAG_ARRAY_BYTE, rl);
+ 	for (uint32_t i = 0; i < n && i < 16; i++) {
+ 		uint8_t v = rates[i] & 0x7F;
+ 		r[i] = (v == 2 || v == 4 || v == 11 || v == 22) ? (uint8_t)(v | 0x80) : v;
+ 	}
+ 	p = r + rl;
+-	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, 0);
+-	wmi_put_tlv(p, TAG_VHT_RATE_SET, 16);
+-	return wmi_send(CMD_PEER_ASSOC, m, 4 + 76 + 4 + rl + 4 + 4 + 16);
++	r = wmi_put_tlv(p, TAG_ARRAY_BYTE, hl);
++	memcpy(r, s_link.ht_rates, s_link.ht_rate_count);
++	p = wmi_put_tlv(r + hl, TAG_VHT_RATE_SET, 16);
++	p = w_p32(p, s_link.vht_rx_max);
++	p = w_p32(p, s_link.vht_rx_mcs);
++	p = w_p32(p, s_link.vht_tx_max);
++	w_p32(p, s_link.vht_tx_mcs);
++	return wmi_send(CMD_PEER_ASSOC, m, 4 + 76 + 4 + rl + 4 + hl + 4 + 16);
++}
++
++/* laurel 2408: ath10k_wmi_tlv_op_gen_vdev_wmm_conf: the AP's EDCA values, by BE, BK, VI, VO */
++#define CMD_VDEV_SET_WMM    0x500D
++#define TAG_VDEV_SET_WMM    0xC7
++#define CMD_PDEV_SET_PARAM  0x4003
++#define TAG_PDEV_SET_PARAM  0x52
++#define PDEV_PARAM_DYNAMIC_BW 0xA
++static bool
++w_vdev_wmm(void)
++{
++	uint8_t m[4 + 4 + 4 * 28] = {}, *p = wmi_put_tlv(m, TAG_VDEV_SET_WMM, 4 + 4 * 28);
++	uint32_t v[4][4];
++
++	lw_wmm_values(&s_ap, v);
++	p = w_p32(p, 0);
++	for (uint32_t a = 0; a < 4; a++) {
++		p = w_p32(p, 0);                        /* dummy (wmi_tlv_vdev_wmm_params) */
++		for (uint32_t i = 0; i < 4; i++) {
++			p = w_p32(p, v[a][i]);
++		}
++		p = w_p32(p, 0);                        /* acm */
++		p = w_p32(p, 0);                        /* no_ack */
++	}
++	return wmi_send(CMD_VDEV_SET_WMM, m, sizeof(m));
++}
++
++/* ath10k_start: dynamic bandwidth, once: lets the firmware fall back to 20 MHz on a busy 40/80 MHz channel */
++static void
++w_pdev_wide(void)
++{
++	static bool sent;
++	uint8_t m[4 + 12], *p;
++
++	if (!sent) {
++		sent = true;
++		p = wmi_put_tlv(m, TAG_PDEV_SET_PARAM, 12);
++		p = w_p32(p, 0);
++		p = w_p32(p, PDEV_PARAM_DYNAMIC_BW);
++		w_p32(p, 1);
++		(void)wmi_send(CMD_PDEV_SET_PARAM, m, sizeof(m));
++	}
+ }
+ 
+ static bool
+@@ -4498,6 +4553,16 @@
+ 		memcpy(p, s_rsn_ie, sizeof(s_rsn_ie));
+ 		p += sizeof(s_rsn_ie);
+ 	}
++	/* laurel 2408: without these the AP treats us as an 11a/g station: 54 Mbit/s, no A-MPDU, no QoS */
++	if (s_link.ht) {
++		p = lw_put_ht_cap(p, &lw_fw, s_freq >= 4900);
++	}
++	if (s_link.vht) {
++		p = lw_put_vht_cap(p, &lw_fw);
++	}
++	if (s_link.qos) {
++		p = lw_put_wmm(p);
++	}
+ 	s_assoc_req_len = (uint32_t)(p - f);
+ }
+ 
+@@ -4680,6 +4745,7 @@
+ 	}
+ 	s_state = S_IDLE;
+ 	s_ptk_set = false;
++	bzero(&s_link, sizeof(s_link));
+ }
+ 
+ static void
+@@ -4687,6 +4753,10 @@
+ {
+ 	if (result != 0) {
+ 		LOG("t=%u ms: join: failed (%d) in state %u", g_ms, result, s_state);
++		if (s_link.ht && result != EAUTH) {     /* laurel 2408: HT/VHT off for this AP only; wifid asks again */
++			memcpy(s_legacy_bssid, s_bssid, 6);
++			printf("LAUREL WIFI: HT/VHT: off for this AP: join failed (%d) in state %u\n", result, s_state);
++		}
+ 		w_teardown();
+ 	} else {
+ 		s_state = S_UP;
+@@ -4746,8 +4816,16 @@
+ 	}
+ 	s_msg1s = 0;
+ 	s_start_resp = false;
++	lw_parse_ap(s_body, s_body_len, &s_ap);
++	lw_choose(&lw_fw, &s_ap, s_freq, lw_ht_on && memcmp(s_legacy_bssid, s_bssid, 6) != 0, &s_link);
+ 	LOG("t=%u ms: join: %.*s %02x:%02x:%02x:**:**:** %u MHz %s", g_ms, (int)s_ssid_len, s_ssid, s_bssid[0], s_bssid[1],
+ 	    s_bssid[2], s_freq, s_rsn ? "WPA2" : "open");
++	printf("LAUREL WIFI: join: %u MHz, %u MHz wide (center %u), phy mode %u, %s%s, %u stream(s), AP: ht %u vht %u wmm %u\n", s_freq,
++	    s_link.width, s_link.center, s_link.mode, s_link.vht ? "VHT" : s_link.ht ? "HT" : "legacy", s_link.qos ? " QoS" : "",
++	    s_link.nss, s_ap.ht, s_ap.vht, s_ap.wmm);
++	if (s_link.ht) {
++		w_pdev_wide();
++	}
+ 	w_ps_off();
+ 	if (!w_vdev_start(s_freq, bcn, dtim)) {
+ 		w_join_end(EIO);
+@@ -4785,12 +4863,16 @@
+ 			w_join_end(ECONNREFUSED);
+ 			return;
+ 		}
++		if (s_link.qos) {
++			(void)w_vdev_wmm();                 /* laurel 2408: before the peer, as mac80211 conf_tx */
++		}
+ 		w_peer_assoc((uint32_t)(f[24] | f[25] << 8));
+ 		uint8_t m[20], *p = wmi_put_tlv(m, TAG_VDEV_UP, 16);
+ 		p = w_p32(p, 0);
+ 		p = w_p32(p, s_aid);
+ 		w_pmac(p, s_bssid);
+ 		wmi_send(CMD_VDEV_UP, m, sizeof(m));
++		w_ps_off();                             /* laurel 2408: again: a vdev that is up keeps the radio awake */
+ 		if (!s_rsn) {
+ 			w_peer_param(PEER_PARAM_AUTHORIZE, 1);
+ 			s_state = S_4WAY;                   /* (teardown order) */
+@@ -4886,6 +4968,9 @@
+ 		return;                                 /* data frames only */
+ 	}
+ 	uint32_t hl = ((f[1] & 3) == 3) ? 30 : 24;
++	if ((f[0] & 0x80) != 0) {                   /* laurel 2408: a QoS subtype: ath10k_htt_rx_nwifi_hdrlen rounds up to 4 */
++		hl = (hl + 2 + 3) & ~3u;
++	}
+ 	const uint8_t *da = f + 4, *sa = (f[1] & 2) ? f + 16 : f + 10;   /* from DS: addr3 is the source */
+ 	const uint8_t *llc = f + hl;
+ 	if (len < hl + 8 || llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03) {

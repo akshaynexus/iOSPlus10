@@ -1,0 +1,221 @@
+laurel 2410: Wi-Fi: one periodic line: band, channel, width, PHY rate, RSSI, throughput. Tx queue 128 frames. WMI peer stats for the tx rate.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -18,6 +18,7 @@
+ #if defined(SWEET)
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
++#include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/param.h>
+@@ -2986,7 +2987,7 @@
+ }
+ 
+ /* WMI waits here while the endpoint has no credit */
+-#define WMIQ_LEN 6
++#define WMIQ_LEN 8                              /* laurel 2410: a join sends 4 at once, and the status line 1 */
+ #define WMIQ_MAX 2040
+ static uint8_t wmiq[WMIQ_LEN][WMIQ_MAX];
+ static uint16_t wmiq_len[WMIQ_LEN];
+@@ -3539,6 +3540,27 @@
+ 
+ static bool htt_send(const void *d, uint32_t len) { return htt_eid != 0xFF && htc_send(htt_eid, d, len); }
+ 
++/* laurel 2410: what the status line says; the rate and the signal come from the rx descriptor (ath10k_htt_rx_h_ppdu) */
++static uint64_t lw_rx_bytes, lw_tx_bytes;
++static struct lw_rate lw_rx_rate;
++static int lw_rx_rssi;
++static uint32_t lw_tx_kbps, lw_nosnap;
++
++static void
++lw_rx_sample(const uint8_t *b, uint32_t mlen)
++{
++	const uint8_t *pp = b + 4 * OFF_PPDU_START;
++
++	lw_rx_bytes += mlen;
++	if ((lw_get32(b + 4 * OFF_ATTENTION) & 1) == 0) {
++		return;                                 /* not the first MPDU: no PPDU fields */
++	}
++	if (pp[16] != 0x80 && pp[16] != 0) {        /* rssi_comb, above the noise floor */
++		lw_rx_rssi = -95 + pp[16];
++	}
++	lw_rate_decode(lw_get32(pp + 20), lw_get32(pp + 24), lw_get32(pp + 28), &lw_rx_rate);
++}
++
+ static void
+ htt_post(uint64_t pa)
+ {
+@@ -3673,6 +3695,7 @@
+ 			uint16_t mlen;
+ 			memcpy(&mlen, d + 8, 2);
+ 			if (mlen <= HTT_BUF_SIZE - 4 * OFF_MSDU_PAYLOAD) {
++				lw_rx_sample(htt_buf + (pa - htt_buf_pa), mlen);
+ 				w_rx_native(htt_buf + (pa - htt_buf_pa) + 4 * OFF_MSDU_PAYLOAD, mlen);
+ 			}
+ 			htt_post(pa);                       /* recycle the same buffer */
+@@ -4645,7 +4668,11 @@
+ 	memcpy(f + 24, snap, 6);
+ 	memcpy(f + 30, e + 12, 2);                  /* ethertype */
+ 	memcpy(f + 32, e + 14, len - 14);
+-	return htt_tx_frame(f, (uint32_t)(len - 14 + 32), clear);
++	if (!htt_tx_frame(f, (uint32_t)(len - 14 + 32), clear)) {
++		return false;
++	}
++	lw_tx_bytes += len;
++	return true;
+ }
+ 
+ /* ---- WPA2 4-way handshake (EAPOL-Key, descriptor version 2: HMAC-SHA1-128 MIC, AES key wrap) */
+@@ -5054,6 +5081,7 @@
+ 	const uint8_t *da = f + 4, *sa = (f[1] & 2) ? f + 16 : f + 10;   /* from DS: addr3 is the source */
+ 	const uint8_t *llc = f + hl;
+ 	if (len < hl + 8 || llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03) {
++		lw_nosnap++;
+ 		return;
+ 	}
+ 	uint32_t plen = len - hl - 8;
+@@ -5159,7 +5187,7 @@
+ }
+ 
+ /* frames from the network stack wait here for the modem thread */
+-#define ETXQ 32
++#define ETXQ 128                                /* laurel 2410: was 32: a TCP burst past it is dropped, not delayed */
+ static struct { uint16_t len; uint8_t d[1514]; } etxq[ETXQ];
+ static volatile uint32_t etxq_head, etxq_tail;
+ static IOSimpleLock *etxq_lock;
+@@ -5190,7 +5218,7 @@
+ w_tx_pump(void)
+ {
+ 	static uint8_t one[1514];
+-	for (int n = 0; n < 16 && etxq_head != etxq_tail; n++) {
++	for (int n = 0; n < 32 && etxq_head != etxq_tail; n++) {
+ 		uint16_t len;
+ 		IOSimpleLockLock(etxq_lock);
+ 		uint32_t i = etxq_head % ETXQ;
+@@ -5211,6 +5239,105 @@
+ 	}
+ }
+ 
++/* ---- laurel 2410: one line that says how the link goes; firmware's tx rate by WMI peer stats (self-check: "tx ?") */
++#define CMD_REQUEST_STATS   0x16001
++#define TAG_REQUEST_STATS   0x8F
++#define WMI_EV_UPDATE_STATS 0x1D004
++#define TAG_STATS_EVENT     0x46
++#define WMI_STAT_PEER       1
++
++static void
++lw_stats_event(const uint8_t *t, uint32_t len)
++{
++	const uint8_t *ev = NULL, *data = NULL;
++	uint32_t dl = 0;
++
++	for (uint32_t o = 0; o + 4 <= len;) {
++		uint32_t l = lw_get16(t + o), tag = lw_get16(t + o + 2);
++
++		if (o + 4 + l > len) {
++			break;
++		}
++		if (tag == TAG_STATS_EVENT && l >= 24) {
++			ev = t + o + 4;
++		} else if (tag == TAG_ARRAY_BYTE && data == NULL) {
++			data = t + o + 4;
++			dl = l;
++		}
++		o += 4 + l;
++	}
++	if (ev == NULL || data == NULL || lw_get32(ev + 4) != 0 || lw_get32(ev + 8) != 0) {
++		return;                                 /* we ask for peers only; anything else has another layout */
++	}
++	for (uint32_t i = 0, n = lw_get32(ev + 12); i < n && (i + 1) * 20 <= dl; i++) {
++		const uint8_t *p = data + i * 20;       /* wmi_10x_peer_stats: mac, rssi, tx rate, rx rate */
++
++		if (memcmp(p, s_bssid, 6) == 0) {
++			lw_tx_kbps = lw_get32(p + 12);
++		}
++	}
++}
++
++static int
++lw_rssi_now(void)
++{
++	if (lw_rx_rssi != 0) {
++		return lw_rx_rssi;
++	}
++	for (uint32_t i = 0; i < nbss; i++) {
++		if (memcmp(bss[i].bssid, s_bssid, 6) == 0) {
++			return bss[i].rssi;
++		}
++	}
++	return 0;
++}
++
++static void
++lw_status_poll(void)
++{
++	static uint64_t last_ns, last_rx, last_tx;
++	static const char *const kinds[3] = { "legacy", "HT", "VHT" };
++	uint64_t now = 0;
++
++	if (s_state != S_UP) {
++		last_ns = 0;
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++	if (last_ns != 0 && now - last_ns < (lw_busy ? 10 : 60) * NSEC_PER_SEC) {
++		return;
++	}
++	if (last_ns != 0) {
++		uint64_t el = now - last_ns, down = (lw_rx_bytes - last_rx) * 80000 / el, up = (lw_tx_bytes - last_tx) * 80000 / el;
++		const struct lw_rate *r = &lw_rx_rate;
++
++		printf("LAUREL WIFI: link %s GHz ch %u %u MHz, %u MHz %s%s %ux%u | rx %s mcs %u %s%u MHz %u.%u Mbps | tx %u Mbps%s | "
++		    "RSSI %d dBm | down %llu.%llu up %llu.%llu Mbps | frames rx %u tx %u fail %u drop %u nosnap %u | scans %u deferred %u\n",
++		    s_freq >= 4900 ? "5" : "2.4", s_freq >= 4900 ? (s_freq - 5000) / 5 : (s_freq - 2407) / 5, s_freq, s_link.width,
++		    s_link.vht ? "VHT" : s_link.ht ? "HT" : "legacy", s_link.qos ? " QoS" : "", s_link.nss, s_link.nss, kinds[r->kind],
++		    r->mcs, r->sgi ? "sgi " : "", r->width, r->mbps10 / 10, r->mbps10 % 10, lw_tx_kbps / 1000, lw_tx_kbps != 0 ? "" : " ?",
++		    lw_rssi_now(), down / 10, down % 10, up / 10, up % 10, rx_up, tx_sent, tx_fail, tx_drop, lw_nosnap, lw_scans_real, lw_scans_deferred);
++	}
++	last_ns = now;
++	last_rx = lw_rx_bytes;
++	last_tx = lw_tx_bytes;
++	uint8_t m[8], *p = wmi_put_tlv(m, TAG_REQUEST_STATS, 4);
++	w_p32(p, WMI_STAT_PEER);
++	(void)wmi_send(CMD_REQUEST_STATS, m, sizeof(m));
++}
++
++/* what the Apple80211 side answers about the link: its real signal and rate, and the access point joined */
++extern "C" void
++topaz_wlan_link_now(uint8_t bssid[6], int *rssi, unsigned *mbps, int *mcs, unsigned *apple_phy)
++{
++	memcpy(bssid, s_bssid, 6);
++	*rssi = lw_rssi_now();
++	*mbps = lw_tx_kbps != 0 ? lw_tx_kbps / 1000 : lw_rx_rate.mbps10 / 10;
++	*mcs = lw_rx_rate.kind != 0 ? lw_rx_rate.mcs : -1;
++	/* apple80211_var.h: 11a 0x2, 11g 0x8, 11n 0x10, 11ac 0x80 */
++	*apple_phy = s_link.vht ? 0x80 : s_link.ht ? 0x10 : s_freq >= 4900 ? 0x2 : 0x8;
++}
++
+ static void
+ wmi_rx(const uint8_t *d, uint32_t len)
+ {
+@@ -5265,6 +5392,9 @@
+ 	case WMI_EV_MGMT_RX:
+ 		scan_mgmt_rx(d + 4, len - 4);
+ 		break;
++	case WMI_EV_UPDATE_STATS:
++		lw_stats_event(d + 4, len - 4);
++		break;
+ 	case 0x5001:                                /* VDEV_START_RESP */
+ 	case 0x6001:                                /* PEER_STA_KICKOUT */
+ 		w_join_event(id, d + 4, len - 4);
+@@ -5321,6 +5451,7 @@
+ 	if (api_ready) {
+ 		w_join_poll();
+ 		w_tx_pump();
++		lw_status_poll();
+ 	}
+ 	{
+ 		/* laurel 2409: frames in about a second (the loop's pass is about 1 ms) */

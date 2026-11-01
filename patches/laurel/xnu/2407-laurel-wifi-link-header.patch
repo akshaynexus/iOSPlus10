@@ -1,0 +1,205 @@
+laurel 2407: Wi-Fi: LaurelWifiLink.h: mode, width and peer arguments of a join, WMM values, rate of a PPDU (pure code).
+
+diff --git a/iokit/Kernel/arm/LaurelWifiLink.h b/iokit/Kernel/arm/LaurelWifiLink.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelWifiLink.h
+@@ -0,0 +1,198 @@
++/*
++ * laurel 2407: the join's mode, width and peer arguments from lw_fw + lw_ap (LaurelWifiPhy.h), the WMM
++ * values, and a received PPDU's rate. Pure code, as LaurelWifiPhy.h; host test scripts/laurel/wifi-phy-test.sh.
++ */
++#ifndef LAUREL_WIFI_LINK_H
++#define LAUREL_WIFI_LINK_H
++
++/* streams in a VHT map: the first with "not supported" (3) ends them */
++static inline uint32_t
++lw_vht_streams(uint16_t map)
++{
++	uint32_t n = 0;
++
++	while (n < 8 && ((map >> (2 * n)) & 3) != 3) {
++		n++;
++	}
++	return n;
++}
++
++static inline uint32_t
++lw_vht_map_limit(uint16_t map, uint32_t nss)
++{
++	uint32_t keep = (1u << (2 * nss)) - 1;
++
++	return (map & keep) | (0xFFFFu & ~keep);
++}
++
++/* the mode, the width and the peer's arguments for a join on `freq` MHz */
++static inline void
++lw_choose(const struct lw_fw *fw, const struct lw_ap *ap, uint32_t freq, bool allow, struct lw_link *l)
++{
++	bool band5 = freq >= 4900;
++
++	memset(l, 0, sizeof(*l));
++	l->freq = l->center = freq;
++	l->width = 20;
++	l->nss = 1;
++	l->mode = band5 ? LW_11A : LW_11G;
++	if (!allow || !fw->valid) {
++		return;
++	}
++	l->qos = ap->wmm || ap->ht;
++	l->peer_flags = l->qos ? LW_PEER_QOS : 0;
++	if (!ap->ht || !(fw->ht & LW_FW_HT_ENABLED)) {
++		return;
++	}
++	uint16_t own = lw_ht_cap_own(fw, band5);
++	uint32_t streams = 0, nss;
++
++	for (uint32_t i = 0; i < 4; i++) {
++		streams += ap->ht_mcs[i] != 0;
++	}
++	nss = lw_nss_own(fw) < streams ? lw_nss_own(fw) : streams;
++	nss = nss == 0 ? 1 : nss;
++	l->ht = true;
++	l->nss = (uint8_t)nss;
++	l->mode = band5 ? LW_HT20_5G : LW_HT20_2G;
++	l->ht_caps = ap->ht_cap & (own | LW_CAP_SMPS_OFF | LW_CAP_DSSS40);
++	l->ht_caps &= own & LW_CAP_RX_STBC ? ~0u : ~LW_CAP_TX_STBC;
++	l->ht_caps &= own & LW_CAP_TX_STBC ? ~0u : ~LW_CAP_RX_STBC;
++	l->max_mpdu = (1u << (13 + (ap->ampdu & 3))) - 1;
++	l->density = lw_density((ap->ampdu >> 2) & 7);
++	l->rate_caps = LW_RC_HT;
++	l->peer_flags |= LW_PEER_HT;
++	if (l->ht_caps & LW_CAP_LDPC) {
++		l->peer_flags |= LW_PEER_LDPC;
++	}
++	if (l->ht_caps & (LW_CAP_SGI20 | LW_CAP_SGI40)) {
++		l->rate_caps |= LW_RC_SGI;
++	}
++	if (l->ht_caps & LW_CAP_TX_STBC) {
++		l->rate_caps |= LW_RC_TX_STBC;
++		l->peer_flags |= LW_PEER_STBC;
++	}
++	if (l->ht_caps & LW_CAP_RX_STBC) {
++		l->rate_caps |= ((l->ht_caps & LW_CAP_RX_STBC) >> 8) << 6;
++		l->peer_flags |= LW_PEER_STBC;
++	}
++	for (uint32_t i = 0; i < 8 * nss && l->ht_rate_count < 16; i++) {
++		if (ap->ht_mcs[i / 8] & (1u << (i % 8))) {
++			l->ht_rates[l->ht_rate_count++] = (uint8_t)i;
++		}
++	}
++	if (band5 && ap->ht_40 && (ap->ht_cap & LW_CAP_40)) {
++		l->width = 40;
++		l->center = ap->ht_below ? freq - 10 : freq + 10;
++		l->mode = LW_HT40_5G;
++		l->rate_caps |= LW_RC_CW40;
++		l->peer_flags |= LW_PEER_40;
++	}
++	if (!band5 || !ap->vht || fw->vht == 0 || lw_vht_streams(ap->vht_rx) == 0) {
++		return;
++	}
++	l->vht = true;
++	l->mode = l->width == 40 ? LW_VHT40 : LW_VHT20;
++	l->vht_caps = (ap->vht_cap & LW_VHT_AS_IS) | (ap->vht_cap & lw_vht_cap_own(fw) & LW_VHT_SGI80);
++	l->vht_caps |= lw_vht_cap_own(fw) & LW_VHT_TXSTBC ? ap->vht_cap & LW_VHT_RXSTBC : 0;
++	l->vht_caps |= lw_vht_cap_own(fw) & LW_VHT_RXSTBC ? ap->vht_cap & LW_VHT_TXSTBC : 0;
++	uint32_t exp = (ap->vht_cap >> 23) & 7, vmax = (1u << (13 + exp)) - 1;
++
++	l->max_mpdu = vmax > l->max_mpdu ? vmax : l->max_mpdu;
++	l->peer_flags |= LW_PEER_VHT;
++	nss = lw_nss_own(fw) < lw_vht_streams(ap->vht_rx) ? lw_nss_own(fw) : lw_vht_streams(ap->vht_rx);
++	l->nss = (uint8_t)nss;
++	l->vht_rx_max = ap->vht_rx_max;
++	l->vht_rx_mcs = lw_vht_map_limit(ap->vht_rx, nss);
++	l->vht_tx_max = ap->vht_tx_max;
++	l->vht_tx_mcs = lw_vht_map_limit(ap->vht_tx, nss);
++	if (ap->vht_width >= 1 && ap->vht_seg0 != 0) {
++		uint32_t c = 5000 + 5 * (uint32_t)ap->vht_seg0;
++
++		if (ap->vht_width == 2) {               /* old 160 MHz form: seg0 is the 160 MHz centre */
++			c = freq > c ? c + 40 : c - 40;
++		}
++		/* the primary channel must be one of the 4 20 MHz channels in that 80 MHz */
++		if (freq + 30 >= c && freq <= c + 30 && (freq + 30 - c) % 20 == 0) {
++			l->width = 80;
++			l->center = c;
++			l->mode = LW_VHT80;
++			l->rate_caps |= LW_RC_CW40;
++			l->peer_flags |= LW_PEER_40 | LW_PEER_80;
++		}
++	}
++}
++
++/* WMM values by AC (BE, BK, VI, VO): cwmin, cwmax, aifs, txop; the AP's, or the 802.11 defaults */
++static inline void
++lw_wmm_values(const struct lw_ap *ap, uint32_t out[4][4])
++{
++	static const uint32_t def[4][4] = { { 15, 1023, 3, 0 }, { 15, 1023, 7, 0 }, { 7, 15, 2, 94 }, { 3, 7, 2, 47 } };
++
++	for (uint32_t a = 0; a < 4; a++) {
++		const uint8_t *r = ap->ac[a];
++
++		if (!ap->wmm_params || (r[0] & 0x0F) < 2) {
++			memcpy(out[a], def[a], sizeof(out[a]));
++			continue;
++		}
++		out[a][0] = (1u << (r[1] & 0x0F)) - 1;
++		out[a][1] = (1u << (r[1] >> 4)) - 1;
++		out[a][2] = r[0] & 0x0F;
++		out[a][3] = lw_get16(r + 2);
++	}
++}
++
++/* a PPDU's rate from the rx descriptor (ath10k_htt_rx_h_rates); 802.11 tables in 0.1 Mbit/s for 1 stream */
++static inline void
++lw_rate_decode(uint32_t info1, uint32_t info2, uint32_t info3, struct lw_rate *r)
++{
++	static const uint16_t ofdm[8] = { 480, 240, 120, 60, 540, 360, 180, 90 };
++	static const uint16_t cck[8] = { 110, 55, 20, 10, 110, 55, 20, 0 };
++	static const uint16_t ht20[10] = { 65, 130, 195, 260, 390, 520, 585, 650, 780, 867 };
++	static const uint16_t ht40[10] = { 135, 270, 405, 540, 810, 1080, 1215, 1350, 1620, 1800 };
++	static const uint16_t vht80[10] = { 293, 585, 878, 1170, 1755, 2340, 2633, 2925, 3510, 3900 };
++	uint32_t pre = info1 >> 24, mcs = 0, nss = 1;
++	const uint16_t *t;
++
++	memset(r, 0, sizeof(*r));
++	r->width = 20;
++	r->nss = 1;
++	if (pre == 0x4) {
++		uint32_t code = info1 & 7;
++
++		r->mbps10 = (info1 & (1u << 4)) ? cck[code] : ofdm[code];
++		return;
++	}
++	if (pre == 0x8 || pre == 0x9) {
++		r->kind = 1;
++		mcs = info2 & 0x1F;
++		nss = (mcs >> 3) + 1;
++		mcs &= 7;
++		r->width = (info2 >> 7) & 1 ? 40 : 20;
++		r->sgi = (info3 >> 7) & 1;
++	} else if (pre == 0xC || pre == 0xD) {
++		uint32_t bw = info2 & 3, group = (info2 >> 4) & 0x3F, stbc = (info2 >> 3) & 1, nsts = (info2 >> 10) & 7;
++
++		r->kind = 2;
++		r->width = bw == 0 ? 20 : bw == 1 ? 40 : 80;
++		r->sgi = info3 & 1;
++		if (group != 0 && group != 63) {
++			r->width = bw == 0 ? 20 : bw == 1 ? 40 : 80;    /* MU: no MCS in the descriptor */
++			return;
++		}
++		mcs = (info3 >> 4) & 0x0F;
++		nss = stbc ? (nsts >> 2) + 1 : nsts + 1;
++		if (mcs > 9) {
++			return;
++		}
++	} else {
++		return;
++	}
++	t = r->width == 80 ? vht80 : r->width == 40 ? ht40 : ht20;
++	r->mcs = (uint8_t)mcs;
++	r->nss = (uint8_t)nss;
++	r->mbps10 = (uint32_t)t[mcs] * nss;
++	r->mbps10 = r->sgi ? r->mbps10 * 10 / 9 : r->mbps10;
++}
++#endif /* LAUREL_WIFI_LINK_H */

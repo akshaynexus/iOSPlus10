@@ -696,6 +696,11 @@ exception, or ask for a macOS path (Xcode clang/ld/codesign in gpu-env.sh).
 - Open: fence IRQ (polled 200 us), GX/CX idle power collapse, CX/MX vote for > 300 MHz, 0x49 host import (possible now),
   HakiOS RedwoodGPU fixes G3/G4/G11/G13/G14, gpu_recover, metal2vulkan 6e88d18 warm start, per-process GPU tables.
 
+## Mi A3 Wi-Fi speed + 5 GHz: patches 2405-2411 built, NOT run on the phone (2026-11-01, branch t3/laurel-wifi-5ghz-speed)
+- Done: join with HT/VHT/QoS and the AP's width (was 11a/11g: 54 Mbit/s, no A-MPDU); scan = what wifid asks, limited while joined and under traffic (was 37 channels x 150 ms each time); 5 GHz first at -70 dBm or better (was strongest AP); real AP, RSSI, rate for wifid; `LAUREL WIFI: link ...` line each 10 s under traffic. Kill switches `wifi_ht=0`, `wifi_band=0`, `wifi_scanlimit=0`.
+- Results [V]: 266/266 patches, 0 LSE, kernel sha256 782caf57...; host test passed. [U] Speed on the phone not measured.
+- Next: owner test (docs/laurel_sprout/wifi.md "Speed and 5 GHz"): 5 GHz router, speed test, 3 `link` lines. Separate facts and estimates: the same section.
+
 ## Mi A3 Wi-Fi: patches 2400-2402 built (2026-11-01 04:35, area E, branch t3/laurel-wifi-modem-firmware)
 
 - Done [V build]: 2400 modem firmware through a runtime FAT16/FAT32 index of `modem_<active slot>` (GPT A/B bit; Mi A3: modem_b),
