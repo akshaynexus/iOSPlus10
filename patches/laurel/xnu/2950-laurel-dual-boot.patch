@@ -29,7 +29,7 @@ diff -ruN a/bsd/dev/laurel_dualboot.h b/bsd/dev/laurel_dualboot.h
 +#define LDB_ALIGN_BLOCKS    512u                /* 2 MiB */
 +#define LDB_LOG_BLOCKS      1025u               /* SWEET_LOG_BLOCKS: the console log takes the end of the partition */
 +/* Patch 2950 is in this kernel. uefi-image.sh and android-guard.sh search a kernel and a boot image for this exact text: a kernel without it takes userdata as its root. */
-+#define LDB_KERNEL_MARKER   "LAUREL-2950-IOSROOT-FENCE-V3"
++#define LDB_KERNEL_MARKER   "LAUREL-2950-IOSROOT-FENCE-V4"
 +
 +static inline uint32_t
 +ldb_crc32(const uint8_t *d, uint32_t len, uint32_t skip_at)
@@ -190,7 +190,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
   * outside the named partition can be written.
 + *
 + * laurel 2950 (Mi A3 dual boot, docs/laurel_sprout/dual-boot.md): the root is the GPT partition iosroot on LUN 0, nothing else. ufs_write_blocks refuses every block outside it.
-+ * No iosroot, or a GPT with an unexpected layout, or no HFS+ volume in it: no block goes out at all.
++ * No iosroot, or a GPT with an unexpected layout, or no HFS+ volume in it: no block goes out at all. The BSD disk ends before the console log at the end of iosroot.
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
@@ -203,7 +203,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  
  extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
  /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
-@@ -114,6 +119,18 @@
+@@ -114,6 +119,27 @@
  	bool ready;
  } su;
  
@@ -214,6 +214,15 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	const char *why;
 +} ldb;
 +static int laurel_dualboot_on;
++/*
++ * What the BSD disk (HFS on ufsroot0, /dev/rufsroot0) is: iosroot without the console log at its end. HFS writes its alternate volume header 1024 bytes before the end of the disk it is told of
++ * (hfs_vfsutils.c, HFS_ALT_SECTOR; hfs_vfsops.c hfs_sync_metadata). With all of iosroot that is the last block of the log.
++ */
++static uint64_t
++ldb_bsd_blocks(void)
++{
++	return su.nblocks > LDB_LOG_BLOCKS ? su.nblocks - LDB_LOG_BLOCKS : 0;
++}
 +/* uefi-image.sh and android-guard.sh refuse a kernel and a boot image without this text */
 +__attribute__((used)) static const char laurel_dualboot_marker[] = LDB_KERNEL_MARKER;
 +SYSCTL_INT(_kern, OID_AUTO, laurel_dualboot, CTLFLAG_RD | CTLFLAG_LOCKED, &laurel_dualboot_on, 0,
@@ -222,7 +231,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
  static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
  
-@@ -287,11 +304,13 @@
+@@ -287,11 +313,13 @@
  static int
  ufs_write_blocks(uint64_t lba, uint32_t count)
  {
@@ -238,7 +247,34 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  		return EPERM;
  	}
  	uint8_t cdb[10] = {
-@@ -832,13 +851,73 @@
+@@ -561,7 +589,7 @@
+ 	caddr_t vaddr = NULL;
+ 	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
+ 	uint32_t count = buf_count(bp);
+-	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++	uint64_t part_bytes = ldb_bsd_blocks() * UFS_BLOCK;     /* laurel 2950 */
+ 
+ 	bool rd = buf_flags(bp) & B_READ;
+ 
+@@ -645,7 +673,7 @@
+ 		*f = UFS_BLOCK;
+ 		return 0;
+ 	case DKIOCGETBLOCKCOUNT:
+-		*o = su.nblocks * UFS_BLOCK / su.secsize;
++		*o = ldb_bsd_blocks() * UFS_BLOCK / su.secsize;         /* laurel 2950 */
+ 		return 0;
+ 	case DKIOCISWRITABLE:
+ 		*f = su.writable;
+@@ -713,7 +741,7 @@
+ static int
+ sweet_ufs_psize(__unused dev_t dev)
+ {
+-	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
++	return su.ready ? (int)MIN(ldb_bsd_blocks() * UFS_BLOCK / su.secsize, INT_MAX) : -1;
+ }
+ 
+ static int
+@@ -832,13 +860,73 @@
  	return on ? 0 : ENXIO;
  }
  
@@ -313,15 +349,28 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	int error;
  
  	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
-@@ -847,7 +926,6 @@
+@@ -847,9 +935,18 @@
  		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
  		return ENXIO;
  	}
 -	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	/*
++	 * laurel 2950: only the text 1 opens writes. The number parser also takes ufsrw=0x1, 01, 2, 1k; here they mean read-only, and the host scripts count each of them as a writable image.
++	 * The bare name ufsrw gives the text 1 [V pexpert/gen/bootargs.c] and counts as writable in the scripts too.
++	 */
++	char rw_text[8] = "";
  	uint32_t rw = 0;
- 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+-	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
++	if (PE_parse_boot_arg_str("ufsrw", rw_text, sizeof(rw_text))) {
++		rw = rw_text[0] == '1' && rw_text[1] == '\0';
++		if (!rw && !(rw_text[0] == '0' && rw_text[1] == '\0')) {
++			printf("LAUREL DUALBOOT: ufsrw=%s is not the text 1: read-only\n", rw_text);
++		}
++	}
  	uint32_t cache = 0, wait = 0;
-@@ -884,6 +962,19 @@
+ 	PE_parse_boot_argn("ufscache", &cache, sizeof(cache));
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+@@ -884,6 +981,19 @@
  	}
  	if (!error) {
  		error = ufs_find_partition(want);
@@ -341,7 +390,7 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	}
  	lck_mtx_unlock(&sweet_ufs_lock);
  	if (error) {
-@@ -903,6 +994,10 @@
+@@ -903,6 +1013,10 @@
  	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rufsroot0");
  	/* Only now, with the partition bounds known, can writes be allowed. */
  	su.writable = (rw != 0);
@@ -352,7 +401,15 @@ diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  	su.ready = true;
  	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
  	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
-@@ -1089,6 +1184,16 @@
+@@ -941,6 +1055,7 @@
+ #define SWEET_LOG_SIZE          (4u << 20)
+ #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
+ #define SWEET_LOG_SECS          10u
++_Static_assert(SWEET_LOG_BLOCKS == LDB_LOG_BLOCKS, "laurel 2950: the BSD disk ends where the console log starts");
+ 
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+@@ -1089,6 +1204,16 @@
  	if (!su.ready) {
  		int error = sweet_ufs_init();
  		if (error) {

@@ -111,7 +111,7 @@ expect_calls() {
 R=$T/repo
 F=$R/config/laurel-android-data
 G=$R/scripts/laurel
-M=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$REPO/tools/laurel-dualboot/laurel_dualboot.h")
+M=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$SRC/tools/laurel-dualboot/laurel_dualboot.h")
 export HOME=$T/home
 LB=$HOME/laurel-backup/lineage-24.0-20261027; AB=$HOME/laurel-backup/android-20261102-0137
 mkdir -p "$LB" "$AB"
@@ -181,6 +181,20 @@ mkimg "$T/rw2.img" " LAURELESP $M ufsrw=1 rootrw=1 "; sidecar "$T/rw2.img" ro
 expect "RO gate boot-image: a writable image whose sidecar says ro: refused" 3 "can write" sh "$G/android-guard.sh" boot-image "$T/rw2.img"
 mkimg "$T/rw3.img" " LAURELESP $M "; printf 'image %s\n' "$(sha256sum "$T/rw3.img" | cut -d' ' -f1)" > "$T/rw3.img.dualboot"
 expect "RO gate boot-image: a sidecar with no mode counts as writable: refused" 3 "can write" sh "$G/android-guard.sh" boot-image "$T/rw3.img"
+# F7: any token of ufsrw or rootrw counts, whatever its value, unless the value is the literal 0. The kernel's number parser takes 0x1 and 01. A kernel's own text has these names only between NUL bytes.
+for tx in 'ufsrw=0x1' 'ufsrw=01' 'ufsrw=2' 'ufsrw=1k' 'ufsrw=00' 'rootrw=0x1' 'rootrw=01' 'ufsrw=' ' ufsrw ' ' rootrw '; do
+  mkimg "$T/f7.img" " LAURELESP $M args = \"rd=ufsroot0 $tx\" "; sidecar "$T/f7.img" ro
+  expect "F7 boot-image: '$tx' with a sidecar that says ro: refused" 3 "can write" sh "$G/android-guard.sh" boot-image "$T/f7.img"
+done
+mkimg "$T/f7ok.img" " LAURELESP $M args = \"rd=ufsroot0 ufsrw=0 rootrw=0\" "; sidecar "$T/f7ok.img" ro
+expect "[R] F7 boot-image: ufsrw=0 rootrw=0: read-only: goes" 0 "" sh "$G/android-guard.sh" boot-image "$T/f7ok.img"
+python3 -I - "$T/f7k.img" "$M" <<'PY'
+import struct, sys
+b = bytearray(4096); b[:8] = b'ANDROID!'; struct.pack_into('<I', b, 40, 2); struct.pack_into('<I', b, 44, 570425770)
+open(sys.argv[1], 'wb').write(bytes(b) + b' LAURELESP ' + sys.argv[2].encode() + b' \0ufsroot\0ufsrw\0ufscache\0root_device\0rootrw\0%s() VFS_RO\n')
+PY
+sidecar "$T/f7k.img" ro
+expect "[R] F7 boot-image: the names as a kernel holds them, between NUL bytes: read-only: goes" 0 "" sh "$G/android-guard.sh" boot-image "$T/f7k.img"
 mkdir -p "$R/out/laurel/dualboot"; printf 'ro-on %s x\n' "$M" > "$R/out/laurel/dualboot/first-boot.result"
 expect "RO gate boot-image: a result, Android not checked after it: refused" 3 "not opened its data" sh "$G/android-guard.sh" boot-image "$T/rw.img"
 printf 'ro-on %s x\nandroid-opened-after-ro x\n' "$M" > "$R/out/laurel/dualboot/first-boot.result"
@@ -230,6 +244,19 @@ if [ -z "${ONLY:-}" ] || case "S1 uefi-image.sh" in $ONLY) true ;; *) false ;; e
   if grep '^mkdarwinboot' "$T/calls" | grep -q 'ufsrw=1\|rootrw=1'; then bad_ "RO uefi-image.sh: LAUREL_READONLY=1 left ufsrw or rootrw"; else ok_ "RO uefi-image.sh: LAUREL_READONLY=1: no ufsrw, no rootrw in the command line"; fi
   ue env UEFI_W=$T/w FD=$T/mu/fd SHIM=$T/mu/shim STOCK_BOOT=$T/stock KERNEL=$K LINEAGE_BOOT=$T/nothing bash "$G/uefi-image.sh"
   case "$o" in *"no Lineage boot image"*) ok_ "S1 uefi-image.sh: no Lineage image: no boot image" ;; *) bad_ "S1 uefi-image.sh: no Lineage image" ;; esac
+fi
+if [ -z "${ONLY:-}" ] || case "F7 uefi-image.sh" in $ONLY) true ;; *) false ;; esac; then
+  for tx in ufsrw=0x1 ufsrw=01 rootrw=01 ufsrw; do
+    rm -f "$T/w/laurel-uefi-boot.img.dualboot"
+    ue $UE LAUREL_READONLY=1 EXTRA_ARGS="$tx" bash "$G/uefi-image.sh"
+    case "$o" in *"the command line can write"*) ok_ "F7 uefi-image.sh: LAUREL_READONLY=1 with $tx: no image" ;; *) bad_ "F7 uefi-image.sh: LAUREL_READONLY=1 with $tx" ;; esac
+    rm -f "$T/w/laurel-uefi-boot.img.dualboot"
+    ue $UE EXTRA_ARGS="$tx" bash "$G/uefi-image.sh"
+    if grep -q '^mode rw$' "$T/w/laurel-uefi-boot.img.dualboot" 2>/dev/null; then ok_ "F7 uefi-image.sh: $tx: the sidecar says rw"; else bad_ "F7 uefi-image.sh: $tx: the sidecar: $(cat "$T/w/laurel-uefi-boot.img.dualboot" 2>/dev/null)"; fi
+  done
+  rm -f "$T/w/laurel-uefi-boot.img.dualboot"
+  ue $UE LAUREL_READONLY=1 EXTRA_ARGS="ufsrw=0 rootrw=0" bash "$G/uefi-image.sh"
+  if grep -q '^mode ro$' "$T/w/laurel-uefi-boot.img.dualboot" 2>/dev/null; then ok_ "F7 uefi-image.sh: ufsrw=0 rootrw=0: the sidecar says ro"; else bad_ "F7 uefi-image.sh: ufsrw=0 rootrw=0"; fi
 fi
 # M2: the other phone must say who it is
 expect "M2 other-device: no phone on adb or fastboot: refused" 3 "OnePlus" env FAKE_ADB=off FAKE_FB=none sh "$G/android-guard.sh" other-device

@@ -33,17 +33,21 @@ cat > "$T/bin/adb" <<EOT
 T="$T"; P="$P"
 PPATH=\$T/pbin:\$T/tools
 fails() { case " \${FAKE_FAIL:-} " in *" \$1 "*) return 0 ;; esac; return 1; }
-rewrite() { printf '%s' "\$1" | sed -e "s#/data/#\$P/data/#g" -e "s#/dev/block/#\$P/dev/block/#g" -e "s#/sys/#\$P/sys/#g"; }
+# /tmp first: \$P itself can lie under /tmp, and each rule runs once on the text
+rewrite() { printf '%s' "\$1" | sed -e "s#^/tmp/#\$P/tmp/#" -e "s# /tmp/# \$P/tmp/#g" -e "s#/data/#\$P/data/#g" -e "s#/dev/block/#\$P/dev/block/#g" -e "s#/sys/#\$P/sys/#g"; }
 shortcmd() { printf '%s' "\$1" | sed -e 's/; _ldb_r=.*//'; }
 case "\$1" in
-get-state) echo "adb get-state" >> "\$T/calls"; fails adb-off && exit 1; echo device ;;
+get-state) echo "adb get-state" >> "\$T/calls"; fails adb-off && exit 1; echo "\${FAKE_STATE:-device}" ;;
 devices) echo "adb devices" >> "\$T/calls"; printf 'List of devices attached\n'; fails adb-off || printf 'FAKE\tdevice\n' ;;
 push)
   echo "adb push \$3" >> "\$T/calls"
   fails push && { echo "adb: push failed" >&2; exit 1; }
-  if [ "\$3" = /data/local/tmp/ldbhelper ]; then
+  case "\$3" in /data/*) [ -d "\$P/data/local/tmp" ] || { echo "adb: error: remote couldn't create file: No such file or directory" >&2; exit 1; } ;; esac
+  if [ "\${3##*/}" = ldbhelper ]; then
     LC_ALL=C grep -ao 'ldbhelper-version [0-9a-z]*' "\$2" | head -1 > "\$P/state/helper_version" || true
-    cp "\$T/fake-helper" "\$P/data/local/tmp/ldbhelper"
+    cp "\$T/fake-helper" "\$(rewrite "\$3")"
+    fails helper-noexec && chmod 000 "\$(rewrite "\$3")"
+    :
   else
     cp "\$2" "\$(rewrite "\$3")"
   fi ;;
@@ -91,7 +95,7 @@ c=\$1
 fails "drop:\$c" && { kill -9 \$PPID; exit 137; }
 fails "\$c" && { echo "ldbhelper: FAILED: \$c (fake)" >&2; exit 1; }
 case "\$c" in
-version) if fails stale-on-phone; then echo "ldbhelper-version 0000"; else cat "\$P/state/helper_version"; [ -s "\$P/state/helper_version" ] || echo "ldbhelper-version unversioned"; fi ;;
+version) fails helper-noexec && exit 126; if fails stale-on-phone; then echo "ldbhelper-version 0000"; else cat "\$P/state/helper_version"; [ -s "\$P/state/helper_version" ] || echo "ldbhelper-version unversioned"; fi ;;
 gpt-write) [ -n "\${FAKE_STOP:-}" ] && export LDB_TEST_STOP=\$FAKE_STOP; exec "\$T/real-helper" "\$@" ;;
 gpt-dump) exec "\$T/real-helper" "\$@" ;;
 esac
@@ -197,6 +201,7 @@ getvar)
   partition-size:userdata) echo "partition-size:userdata: \${FAKE_UD:-0x12e1}" >&2 ;;
   partition-size:iosroot) [ "\${FAKE_IR:-}" != none ] && echo "partition-size:iosroot: \${FAKE_IR:-0x817d8}" >&2 ;;
   esac ;;
+reboot) if [ "\${2:-}" = recovery ]; then case " \${FAKE_FAIL:-} " in *" fb-reboot-recovery "*) echo "FAILED (remote: 'unknown command')" >&2; exit 1 ;; esac; fi ;;
 esac
 exit 0
 EOT
@@ -253,7 +258,7 @@ PY
 sidecar() { printf 'image %s\nmode %s\nmarker %s\nos 17.0.0 2026-10\n' "$(sha256sum "$1" | cut -d' ' -f1)" "$2" "$M" > "$1.dualboot"; }
 reset() {
   rm -rf "$P" "$D" "$T/repo/out/laurel-ios26"
-  mkdir -p "$P/data/local/tmp" "$P/state" "$P/dev/block/by-name" "$P/sys/class/block/sda15" "$P/sys/class/block/sda16" "$P/sys/block/sda/queue" "$P/sys/block/dm-40/slaves/sda15"
+  mkdir -p "$P/data/local/tmp" "$P/tmp" "$P/state" "$P/dev/block/by-name" "$P/sys/class/block/sda15" "$P/sys/class/block/sda16" "$P/sys/block/sda/queue" "$P/sys/block/dm-40/slaves/sda15"
   mkdir -p "$D" "${ROIMG%/*}" "${RWIMG%/*}" "$H/android-20261102-0137" "$H/lineage-24.0-20261027" "$T/apple"
   : > "$T/calls"
   # the phone before the change: the old table
@@ -274,7 +279,12 @@ reset() {
   echo 1 > "$P/state/bootable0"; echo 1 > "$P/state/bootable1"; echo 1 > "$P/state/successful0"; echo 1 > "$P/state/successful1"
   echo $((1831432 * 8)) > "$P/sys/class/block/sda15/start"; echo "$SECTORS_OLD" > "$P/sys/class/block/sda15/size"
   echo "0-$SECTORS_OLD: default-key, aes-xts-plain64 - 0 8:15 0 3 allow_discards sector_size:4096 iv_large_sectors" > "$P/state/dm"
+  # steps 1 and 1b are done, unless a case takes them away
+  rec_backup "$H/android-20261102-0137"
+  printf 'recovery root x\n' > "$D/rehearsal.result"
 }
+# what step 1 records
+rec_backup() { { echo "$1"; sha256sum "$1/gpt-sda-head.bin" | cut -d' ' -f1; sha256sum "$1/gpt-sda-tail.bin" | cut -d' ' -f1; } > "$D/pre-write-backup"; }
 # the phone after the GPT write, the reboot and Format data: the kernel has the new table, f2fs of the new size
 f2fs_sb() {
   python3 -I - "$P/dev/block/dm-40" "$1" <<'PY'
@@ -374,6 +384,7 @@ import sys
 with open(sys.argv[1], 'r+b') as f:
     f.seek(2 * 4096 + 40); f.write(b'\x01')
 PY
+  rec_backup "$H/android-20261102-0137"
   run CONFIRM=gpt-write sh "$DB" gpt-write
   exit_not0; said "does not give a plan"; not_ran "helper gpt-write"; disk_is_old; done_
 fi
@@ -398,6 +409,263 @@ fi
 if start "GPT restore print: runs nothing, says that LUN 0 is erased"; then
   run sh "$DB" gpt-restore-print
   exit_is 0; said "ERASES ALL OF LUN 0"; said "partition:0"; not_ran "fastboot"; not_ran "adb"; done_
+fi
+if start "F9 restore print: each flash has -S 512M, each image a hash check from SHA256SUMS"; then
+  run sh "$DB" gpt-restore-print
+  exit_is 0; said "fastboot -S 512M flash partition:0"; said "fastboot -S 512M flash P"; said "SHA256SUMS"; said "sha256sum"
+  printf '%s\n' "$o" | grep -E '^ +fastboot flash ' && no "a plain fastboot flash in the text"; done_
+fi
+
+# ---- F2: gpt-restore from recovery: adb get-state says recovery, no /data there ----
+if start "F2 restore in recovery: state recovery, no /data: the helper runs from /tmp, the old layout comes back"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0; rm -rf "$P/data"; : > "$T/calls"
+  run CONFIRM=gpt-restore FAKE_STATE=recovery sh "$DB" gpt-restore
+  exit_is 0; said "Format data"; ran "adb push /tmp/ldbhelper"; not_ran "adb push /data"; tbl | grep -q '^userdata 1831432 30119930$' || no "not the old layout"; done_
+fi
+if start "F2 restore dry run in recovery: nothing written"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0; rm -rf "$P/data"; : > "$T/calls"
+  run FAKE_STATE=recovery sh "$DB" gpt-restore --dry-run
+  exit_is 0; said "dry run"; not_ran "helper gpt-write"; disk_is_new; done_
+fi
+if start "F2 the first write refuses recovery: nothing runs"; then
+  run CONFIRM=gpt-write FAKE_STATE=recovery sh "$DB" gpt-write
+  exit_not0; said "only in Android"; not_ran "helper"; disk_is_old; done_
+fi
+if start "F2 switch refuses recovery"; then
+  ready
+  run "$SW" FAKE_STATE=recovery sh "$DB" switch
+  exit_not0; said "only in Android"; not_ran "bootctl set-active"; done_
+fi
+if start "F2 restore in recovery with no root adb: stops, says so"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0
+  run CONFIRM=gpt-restore FAKE_STATE=recovery FAKE_UID=2000 sh "$DB" gpt-restore
+  exit_not0; said "not root"; disk_is_new; done_
+fi
+
+# ---- F3: the way back is made from the table on the disk ----
+if start "F3 restore after a slot change: only the last LBA of userdata and the iosroot slot change, by an independent diff"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0
+  python3 -I "$REPO/scripts/laurel/gpt-fake.py" slot-change "$P/dev/block/sda"
+  a0=$(python3 -I "$REPO/scripts/laurel/gpt-fake.py" entry "$P/dev/block/sda" system_a)
+  run CONFIRM=gpt-restore sh "$DB" gpt-restore
+  exit_is 0; said "only: last LBA of userdata"; tbl | grep -q '^userdata 1831432 30119930$' || no "not the old layout"; tbl | grep -q iosroot && no "iosroot is still there"; tbl | grep -q 'primary valid backup valid' || no "a copy is not valid"
+  [ "$(python3 -I "$REPO/scripts/laurel/gpt-fake.py" entry "$P/dev/block/sda" system_a)" = "$a0" ] || no "system_a changed"
+  d=$(python3 -I "$REPO/scripts/laurel/gpt-fake.py" tablediff "$D/gpt/before.head" "$D/gpt/before.tail" "$D/gpt/after.head" "$D/gpt/after.tail" | awk '{print $1, ($1 ~ /entries/) ? (($2 >= 1920 && $3 < 2048) ? "iosroot-slot" : ($2 >= 1832 && $3 < 1840) ? "userdata-last" : "OTHER") : (($2 >= 16 && $3 < 20) ? "hdr-crc" : ($2 >= 88 && $3 < 92) ? "entries-crc" : "OTHER")}' | sort -u | tr '\n' ';')
+  [ "$d" = "backup-entries iosroot-slot;backup-entries userdata-last;backup-header entries-crc;backup-header hdr-crc;primary-entries iosroot-slot;primary-entries userdata-last;primary-header entries-crc;primary-header hdr-crc;" ] || no "the independent diff: $d"; done_
+fi
+if start "F3 restore stopped after step 2, adb gone: the same command ends it"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0
+  python3 -I "$REPO/scripts/laurel/gpt-fake.py" slot-change "$P/dev/block/sda"
+  run CONFIRM=gpt-restore FAKE_STOP=2 sh "$DB" gpt-restore; exit_not0; disk_is_new
+  run CONFIRM=gpt-restore sh "$DB" gpt-restore; exit_is 0; tbl | grep -q '^userdata 1831432 30119930$' || no "not the old layout"; tbl | grep -q 'primary valid backup valid' || no "a copy is not valid"; done_
+fi
+if start "F3 restore with the old layout on the flash: nothing written"; then
+  run CONFIRM=gpt-restore sh "$DB" gpt-restore
+  exit_is 0; said "already"; not_ran "helper gpt-write"; disk_is_old; done_
+fi
+if start "F3 restore of a stopped gpt-write (primary old, backup new): refused, nothing written"; then
+  run CONFIRM=gpt-write FAKE_STOP=2 sh "$DB" gpt-write; exit_not0; : > "$T/calls"
+  run CONFIRM=gpt-restore sh "$DB" gpt-restore
+  exit_not0; said "stopped gpt-write"; not_ran "helper gpt-write"; done_
+fi
+
+# ---- F4: a half-written primary ----
+# the new table's primary blocks, then a stop before step 4, then one of them on the disk
+torn_setup() {
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0; cp "$D/gpt/after.head" "$T/new.head"
+  python3 -I "$REPO/scripts/laurel/gpt-fake.py" disk "$P/dev/block/sda"
+  run CONFIRM=gpt-write FAKE_STOP=3 sh "$DB" gpt-write
+  : > "$T/calls"
+}
+if start "F4 a torn primary, Android still up: --resume writes it from the plan: the new table"; then
+  torn_setup; python3 -I "$REPO/scripts/laurel/gpt-fake.py" block "$P/dev/block/sda" 1 "$T/new.head" 1
+  run CONFIRM=gpt-write sh "$DB" gpt-write --resume
+  exit_is 0; said "half written"; disk_is_new; tbl | grep -q 'primary valid backup valid' || no "a copy is not valid"; done_
+fi
+if start "F4 a torn primary, recovery: gpt-repair writes it from the backup, nothing else: the new table"; then
+  torn_setup; python3 -I "$REPO/scripts/laurel/gpt-fake.py" block "$P/dev/block/sda" 2 "$T/new.head" 2; rm -rf "$P/data"
+  run CONFIRM=gpt-repair FAKE_STATE=recovery sh "$DB" gpt-repair
+  exit_is 0; said "torn-backup-new"; said "after-gpt"; disk_is_new; tbl | grep -q 'primary valid backup valid' || no "a copy is not valid"; done_
+fi
+if start "F4 a torn primary, recovery: gpt-restore repairs first, then the old layout"; then
+  torn_setup; python3 -I "$REPO/scripts/laurel/gpt-fake.py" block "$P/dev/block/sda" 1 garbage; rm -rf "$P/data"
+  run CONFIRM=gpt-restore FAKE_STATE=recovery sh "$DB" gpt-restore
+  exit_is 0; said "from the backup copy"; said "Format data"; tbl | grep -q '^userdata 1831432 30119930$' || no "not the old layout"; tbl | grep -q 'primary valid backup valid' || no "a copy is not valid"; done_
+fi
+if start "F4 repair: a dry run writes nothing"; then
+  torn_setup; python3 -I "$REPO/scripts/laurel/gpt-fake.py" block "$P/dev/block/sda" 1 garbage; rm -rf "$P/data"
+  run FAKE_STATE=recovery sh "$DB" gpt-repair --dry-run
+  exit_is 0; said "dry run"; not_ran "helper gpt-write"; tbl | grep -q 'primary INVALID' || no "the primary changed"; done_
+fi
+if start "F4 no valid copy at all: refused, the last resort named"; then
+  python3 -I "$REPO/scripts/laurel/gpt-fake.py" block "$P/dev/block/sda" 1 garbage; python3 -I "$REPO/scripts/laurel/gpt-fake.py" block "$P/dev/block/sda" 30119935 garbage; rm -rf "$P/data"
+  run CONFIRM=gpt-restore FAKE_STATE=recovery sh "$DB" gpt-restore
+  exit_not0; said "neither copy"; said "gpt-restore-print"; not_ran "helper gpt-write"; done_
+fi
+
+# ---- F5: the backup of step 1 ----
+later_backup() {  # a backup made after the write: it holds the new table, and it is the newest folder
+  mkdir -p "$H/android-20261103-0900"; cp "$D/gpt/after.head" "$H/android-20261103-0900/gpt-sda-head.bin"; cp "$D/gpt/after.tail" "$H/android-20261103-0900/gpt-sda-tail.bin"; : > "$H/android-20261103-0900/SHA256SUMS"
+}
+if start "F5 a backup after the write is newer: restore, the print and check-slot-b use the one of step 1"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0; later_backup
+  run sh "$DB" gpt-restore-print; exit_is 0; said "android-20261102-0137"
+  run sh "$DB" check-slot-b; exit_is 0; said "android-20261102-0137"
+  run CONFIRM=gpt-restore sh "$DB" gpt-restore; exit_is 0; tbl | grep -q '^userdata 1831432 30119930$' || no "not the old layout"; done_
+fi
+if start "F5 a backup after the write is newer: --resume keeps the plan of step 1"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0; later_backup
+  run CONFIRM=gpt-write sh "$DB" gpt-write --resume; exit_is 0; said "nothing written"; done_
+fi
+if start "F5 step 1 records the backup, and a second run keeps it"; then
+  rm -f "$D/pre-write-backup"
+  run sh "$DB" gpt-write --dry-run; exit_is 0; said "pre-write backup on record"; [ "$(sed -n 1p "$D/pre-write-backup")" = "$H/android-20261102-0137" ] || no "the record: $(cat "$D/pre-write-backup")"
+  mkdir -p "$H/android-20261103-0900"; cp "$T/head" "$H/android-20261103-0900/gpt-sda-head.bin"; cp "$T/tail" "$H/android-20261103-0900/gpt-sda-tail.bin"
+  run sh "$DB" gpt-write --dry-run; exit_is 0; [ "$(sed -n 1p "$D/pre-write-backup")" = "$H/android-20261102-0137" ] || no "the record moved: $(cat "$D/pre-write-backup")"; done_
+fi
+if start "F5 no record: the write and the restore stop with a clear error, nothing runs on the phone"; then
+  rm -f "$D/pre-write-backup"
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_not0; said "no record of the pre-write backup"; not_ran "helper gpt-write"
+  run CONFIRM=gpt-restore sh "$DB" gpt-restore; exit_not0; said "no record of the pre-write backup"; not_ran "helper gpt-write"
+  run sh "$DB" gpt-restore-print; exit_not0; said "no record of the pre-write backup"; done_
+fi
+if start "F5 a dry run that does not match the phone records nothing"; then
+  rm -f "$D/pre-write-backup"
+  python3 -I "$REPO/scripts/laurel/gpt-fake.py" slot-change "$P/dev/block/sda"
+  run sh "$DB" gpt-write --dry-run; exit_not0; said "not the backup"; [ ! -f "$D/pre-write-backup" ] || no "a record"; done_
+fi
+if start "F5 the table files of the recorded backup changed: stops"; then
+  printf x >> "$H/android-20261102-0137/gpt-sda-head.bin"
+  run sh "$DB" gpt-restore-print; exit_not0; said "changed after step 1"; done_
+fi
+if start "F5 record-backup: a backup that holds the new table is refused"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0; later_backup; cp "$D/pre-write-backup" "$T/rec"
+  run sh "$DB" record-backup "$H/android-20261103-0900"; exit_not0; cmp -s "$T/rec" "$D/pre-write-backup" || no "the record changed"; done_
+fi
+
+# ---- F6: --resume on a phone with the new table ----
+if start "F6 --resume, the new table there: the record keeps every line, nothing is written"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0
+  printf 'gpt-written x\nandroid-opened x f2fs-bytes 1\ninstalled x y z\nro-on %s x\n' "$M" > "$RES"; cp "$RES" "$T/res0"; : > "$T/calls"
+  run CONFIRM=gpt-write sh "$DB" gpt-write --resume
+  exit_is 0; said "nothing written"; cmp -s "$T/res0" "$RES" || no "the record changed: $(cat "$RES")"; not_ran "helper gpt-write"; done_
+fi
+if start "F6 --resume after adb was lost right after the write: the new table there, the record gets its line"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0; rm -f "$RES"
+  run CONFIRM=gpt-write sh "$DB" gpt-write --resume
+  exit_is 0; grep -q '^gpt-written ' "$RES" || no "no record"; done_
+fi
+
+# ---- S5: one writer at a time on the phone ----
+if start "S5 a writer runs on the phone: --resume stops, disk unchanged"; then
+  run CONFIRM=gpt-write FAKE_STOP=2 sh "$DB" gpt-write; exit_not0
+  : > "$P/data/local/tmp/ldbhelper.plan.lock"
+  python3 -I - "$P/data/local/tmp/ldbhelper.plan.lock" env CONFIRM=gpt-write sh "$DB" gpt-write --resume > "$T/s5.out" 2>&1 <<'PY'
+import fcntl, subprocess, sys
+l = open(sys.argv[1], 'r+'); fcntl.flock(l, fcntl.LOCK_EX)
+sys.exit(subprocess.run(sys.argv[2:], stdin=subprocess.DEVNULL, close_fds=True).returncode)
+PY
+  rc=$?; o=$(cat "$T/s5.out"); exit_not0; said "another gpt-write"; tbl | grep -q '^userdata 1831432 30119930$' || no "the write went on"; 
+  run CONFIRM=gpt-write sh "$DB" gpt-write --resume; exit_is 0; disk_is_new; done_
+fi
+
+# ---- the rehearsal, and step 2's guard ----
+if start "S1 rehearsal: the guide, asks the phone nothing"; then
+  run sh "$DB" rehearsal
+  exit_is 0; said "FastbootCmds.c:2596"; said "writes its boot message to misc"; said "Enable ADB"; not_ran "adb"; not_ran "fastboot"; done_
+fi
+if start "S1 rehearsal reach: needs its word"; then
+  run sh "$DB" rehearsal reach
+  exit_is 4; said "CONFIRM=rehearsal-reach"; not_ran "fastboot"; done_
+fi
+if start "S1 rehearsal reach: ABL refuses: a record, the next step, exit 0"; then
+  rm -f "$D/rehearsal.result"
+  run CONFIRM=rehearsal-reach FAKE_FAIL=fb-reboot-recovery sh "$DB" rehearsal reach
+  exit_is 0; said "Power + Vol Up"; grep -q '^reach fastboot-reboot-recovery refused' "$D/rehearsal.result" || no "no record"; done_
+fi
+if start "S1 rehearsal reach: ABL accepts: a record"; then
+  rm -f "$D/rehearsal.result"
+  run CONFIRM=rehearsal-reach sh "$DB" rehearsal reach
+  exit_is 0; ran "fastboot reboot recovery"; grep -q '^reach fastboot-reboot-recovery accepted' "$D/rehearsal.result" || no "no record"; done_
+fi
+if start "S2 rehearsal recovery: root adb: a read-only dump from /tmp, a record, no write on the phone"; then
+  rm -f "$D/rehearsal.result"; rm -rf "$P/data"
+  before=$(sha256sum "$P/dev/block/sda" 2>/dev/null | cut -c1-16)
+  run FAKE_STATE=recovery sh "$DB" rehearsal recovery
+  exit_is 0; said "gives root adb"; ran "adb push /tmp/ldbhelper"; ran "helper gpt-dump"; not_ran "helper gpt-write"; grep -q '^recovery root ' "$D/rehearsal.result" || no "no record"; disk_is_old; done_
+fi
+if start "S2 rehearsal recovery: no root adb: a record, and the owner reads what it means"; then
+  rm -f "$D/rehearsal.result"
+  run FAKE_STATE=recovery FAKE_UID=2000 sh "$DB" rehearsal recovery
+  exit_is 0; said "GIVES NO ROOT ADB"; said "ERASES ALL OF LUN 0"; said "persist"; not_ran "helper"; grep -q '^recovery no-root' "$D/rehearsal.result" || no "no record"; done_
+fi
+if start "S2 rehearsal recovery: the helper does not run there: counts as no root"; then
+  rm -f "$D/rehearsal.result"
+  run FAKE_STATE=recovery FAKE_FAIL=helper-noexec sh "$DB" rehearsal recovery
+  exit_is 0; said "GIVES NO ROOT ADB"; grep -q '^recovery no-root' "$D/rehearsal.result" || no "no record"; done_
+fi
+if start "S2 rehearsal recovery: the phone is in Android: no record"; then
+  rm -f "$D/rehearsal.result"
+  run sh "$DB" rehearsal recovery
+  exit_not0; said "not recovery"; [ ! -f "$D/rehearsal.result" ] || no "a record"; done_
+fi
+if start "S2 rehearsal no-adb: a record, what it means"; then
+  rm -f "$D/rehearsal.result"
+  run sh "$DB" rehearsal no-adb
+  exit_is 0; said "ERASES ALL OF LUN 0"; grep -q '^recovery no-root' "$D/rehearsal.result" || no "no record"; not_ran "adb"; done_
+fi
+if start "S1 guard: step 2 with no rehearsal on record: refused, the phone is not asked"; then
+  rm -f "$D/rehearsal.result"
+  run CONFIRM=gpt-write sh "$DB" gpt-write
+  exit_not0; said "no rehearsal on record"; not_ran "adb"; disk_is_old; done_
+fi
+if start "S1 guard: a dry run says that step 2 refuses"; then
+  rm -f "$D/rehearsal.result"
+  run sh "$DB" gpt-write --dry-run
+  exit_is 0; said "step 2 refuses"; done_
+fi
+if start "S2 guard: recovery has no root: step 2 refuses until the owner's word, the text is shown"; then
+  printf 'recovery no-root: x\n' > "$D/rehearsal.result"
+  run CONFIRM=gpt-write sh "$DB" gpt-write
+  exit_not0; said "ERASES ALL OF LUN 0"; said "NO_RECOVERY_ROOT=lun-erase-accepted"; not_ran "helper gpt-write"; disk_is_old
+  run sh "$DB" gpt-write --dry-run; exit_is 0; said "ERASES ALL OF LUN 0"
+  run CONFIRM=gpt-write NO_RECOVERY_ROOT=lun-erase-accepted sh "$DB" gpt-write
+  exit_is 0; said "ERASES ALL OF LUN 0"; disk_is_new; done_
+fi
+if start "S1 after-gpt: ABL refuses fastboot reboot recovery: no failure, the next step is printed"; then
+  printf 'reach fastboot-reboot-recovery refused x\nrecovery root x\n' > "$D/rehearsal.result"
+  fb CONFIRM=after-gpt FAKE_FAIL=fb-reboot-recovery sh "$DB" after-gpt
+  exit_is 0; ran "fastboot reboot recovery"; said "ABL refused"; said "Power + Vol Up"; said "Format data"; said "reach fastboot-reboot-recovery refused"; done_
+fi
+
+# ---- a stale op10tool: the main checkout's out/bin/op10tool had no gpt command ----
+cat > "$T/stale-tool" <<'EOT'
+#!/bin/sh
+echo "error: unrecognized subcommand 'gpt'" >&2
+exit 2
+EOT
+chmod +x "$T/stale-tool"
+if start "O stale op10tool by hand: stops before the phone is asked, says how to build"; then
+  run OP10TOOL="$T/stale-tool" CONFIRM=gpt-write sh "$DB" gpt-write
+  exit_not0; said "no GPT support"; said "build-op10tool.sh"; not_ran "adb"; disk_is_old; done_
+fi
+for c in "gpt-write --dry-run" gpt-restore-print gpt-plan "rehearsal recovery"; do
+  if start "O stale op10tool: $c stops"; then
+    # shellcheck disable=SC2086
+    run OP10TOOL="$T/stale-tool" CONFIRM=gpt-restore sh "$DB" $c
+    exit_not0; said "no GPT support"; not_ran "helper"; done_
+  fi
+done
+if start "O stale out/bin/op10tool, no cargo: stops; with cargo: rebuilt, and the step goes on"; then
+  mkdir -p "$T/repo/out/bin"; cp "$T/stale-tool" "$T/repo/out/bin/op10tool"
+  run OP10TOOL= sh "$DB" gpt-plan
+  exit_not0; said "no GPT support"
+  mkdir -p "$T/repo/scripts/setup"; cp "$T/repo/scripts/setup/build-op10tool.sh" "$T/build.saved"
+  printf '#!/bin/sh\ncp "%s" "%s"\n' "$TOOL" "$T/repo/out/bin/op10tool" > "$T/repo/scripts/setup/build-op10tool.sh"; chmod +x "$T/repo/scripts/setup/build-op10tool.sh"
+  printf '#!/bin/sh\nexit 0\n' > "$T/bin/cargo"; chmod +x "$T/bin/cargo"
+  run sh -c 'unset OP10TOOL; exec sh "$0" gpt-plan' "$DB"
+  exit_is 0; said "building it now"; said "IOSROOT_BYTES="
+  rm -f "$T/bin/cargo"; cp "$T/build.saved" "$T/repo/scripts/setup/build-op10tool.sh"; rm -f "$T/repo/out/bin/op10tool"; done_
 fi
 
 # ---- after the write ----
@@ -664,7 +932,7 @@ if start "Helper: the phone reports another version: stops before any step"; the
 fi
 
 # ---- each writing step still needs its word ----
-for s in gpt-write after-gpt install flash-slot-b switch to-android gpt-restore; do
+for s in gpt-write after-gpt install flash-slot-b switch to-android gpt-restore gpt-repair; do
   if start "CONFIRM $s without its word: refused, adb not asked"; then
     run sh "$DB" "$s"
     exit_is 4; said "CONFIRM=$s"; not_ran "adb"; not_ran "fastboot"; done_

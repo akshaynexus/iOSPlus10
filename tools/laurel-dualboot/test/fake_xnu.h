@@ -101,6 +101,7 @@ struct cdevsw { void *d_open, *d_close, *d_read, *d_write, *d_ioctl, *d_stop, *d
 int SecureDTLookupEntry(void *, const char *, DTEntry *);
 int SecureDTGetProperty(DTEntry, const char *, void const **, unsigned int *);
 bool PE_parse_boot_argn(const char *, void *, int);
+bool PE_parse_boot_arg_str(const char *, char *, int);
 void lck_mtx_lock(int *);
 void lck_mtx_unlock(int *);
 int kmem_alloc_contig(void *, vm_offset_t *, size_t, unsigned long, ppnum_t, int, int, int);

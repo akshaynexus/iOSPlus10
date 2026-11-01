@@ -10,10 +10,11 @@ All script steps: `scripts/laurel/dual-boot.sh`. Each writing step needs `CONFIR
 
 | # | Who | Step | Writes |
 | --- | --- | --- | --- |
-| 0 | Owner yes, agent | Rooted debugging on (Settings -> System -> Developer options). A backup right before the first write: `scripts/backup/laurel-backup.sh` (rerun `data`; the wipe takes all app data). The newest backup with `gpt-sda-head.bin` is what the plan reads | a setting, files on the host |
-| 1 | Agent | `adb root`, `dual-boot.sh check-slot-b`, `dual-boot.sh gpt-write --dry-run`: device check, fresh on-disk table = backup, the exact commands, the table before and after | nothing |
+| 0 | Owner yes, agent | Rooted debugging on (Settings -> System -> Developer options). A backup right before the first write: `scripts/backup/laurel-backup.sh` (rerun `data`; the wipe takes all app data) | a setting, files on the host |
+| 1 | Agent | `adb root`, `dual-boot.sh gpt-write --dry-run`, `dual-boot.sh check-slot-b`: device check, fresh on-disk table = backup, the exact commands, the table before and after. **This step records the pre-write backup** in `out/laurel/dualboot/pre-write-backup`: the newest backup that equals the phone. Every later step uses that one, and only that one: a backup made after the write holds the new table. No record: a clear error. Another backup of the old table: `dual-boot.sh record-backup DIR` | a record on the host |
+| 1b | Owner, agent | **The rehearsal**: `dual-boot.sh rehearsal`, section 1b. How the phone reaches recovery; does recovery give root adb. Step 2 refuses with no result on record | no table block, no partition of ours; `misc` only if ABL accepts `fastboot reboot recovery` (ABL writes it) |
 | 2 | Owner yes, agent | `CONFIRM=gpt-write dual-boot.sh gpt-write`: the write, then read back past the page cache and compared with the plan, before any reboot | 4 table blocks + 2 superblock blocks of userdata |
-| 3 | Agent, right after | `adb reboot bootloader`, `CONFIRM=after-gpt dual-boot.sh after-gpt`: ABL must show the new sizes; reboots to recovery | nothing |
+| 3 | Agent, right after | `adb reboot bootloader`, `CONFIRM=after-gpt dual-boot.sh after-gpt`: ABL must show the new sizes; then `fastboot reboot recovery`. If ABL refuses that command, this step does not fail: it prints the next step for the owner | nothing |
 | 4 | Owner | Lineage recovery: Factory reset -> Format data / factory reset -> yes; Reboot system now. Android sets itself up. Unlock once; Rooted debugging on again (the wipe turned it off) | all of userdata, metadata |
 | 5 | Agent | `adb root`, `dual-boot.sh android-check`: new sizes, `/data` on the new size, f2fs block count fits, data open. A record on the host | nothing |
 | 6 | Owner yes, agent | `adb reboot bootloader`; `scripts/bg.sh db-install env CONFIRM=install scripts/laurel/dual-boot.sh install` (default the iOS 26 root). Android starts after it | `iosroot` only |
@@ -27,6 +28,29 @@ All script steps: `scripts/laurel/dual-boot.sh`. Each writing step needs `CONFIR
 If step 10 or any iOS boot fails: step 11, and work goes on the next day. No computer: the retries of slot b end after 7 boots and ABL returns to Android [V source, I this ABL]. A hanging kernel does not restart itself: hold Power for each boot, or use step 11.
 
 iOS 16 stays supported: `TARGET=ios16` in front of `image`, `flash-slot-b`, `install`, `switch`. It is not the first path. Its kernel also needs the new patch 2950.
+
+## 1b. The rehearsal, before step 2
+
+**Why.** The way back from a bad table runs in recovery: Android does not start with a bad primary. Nothing has shown that this way exists on this phone. [V ABL source, `out/laurel/abl-src/FastbootCmds.c:2596`, :3811] `reboot-recovery` is compiled only under `DYNAMIC_PARTITION_SUPPORT`, and this phone has plain `system_a`/`system_b` partitions [V backup], so [I] this ABL can refuse the command. [U] Does Lineage recovery give a root adb shell on this build. [V phone, notes] `ro.debuggable` = 0 in Android.
+
+**Steps** (`dual-boot.sh rehearsal` prints them):
+
+1. Step 1 first: it records the pre-write backup.
+2. `adb reboot bootloader`, then `CONFIRM=rehearsal-reach dual-boot.sh rehearsal reach`. It tries `fastboot reboot recovery` and records `accepted` or `refused`. A refusal changes nothing. **This is the one write in the rehearsal, and only if ABL accepts:** [V source] ABL writes its boot message to `misc` (`WriteRecoveryMessage`); [I] recovery clears it. The owner says yes to that first.
+3. Refused: Power + Vol Up by hand [I], or in Android `adb reboot recovery`. Note what worked.
+4. In Lineage recovery: Advanced -> Enable ADB [I from the Lineage menu; not seen on this phone]. `dual-boot.sh rehearsal recovery`: `adb get-state` must say `recovery`; `id -u`; the helper goes to `/tmp` (RAM) and runs; a read-only `gpt-dump` of `sda`; the result against the pre-write backup. It records `recovery root` or `recovery no-root`.
+5. No adb shows at all: `dual-boot.sh rehearsal no-adb` records `recovery no-root`.
+6. Recovery: Reboot system now. Then step 2.
+
+**What the result means.**
+
+| On record | Way back if Android does not start | Step 2 |
+| --- | --- | --- |
+| `recovery root` | `gpt-restore` or `gpt-repair` in recovery, with the helper, only the table blocks | goes |
+| `recovery no-root` | **Only `dual-boot.sh gpt-restore-print`: `fastboot flash partition:0` ERASES ALL OF LUN 0, needs the unlock_critical state [U], then every partition from the backup, `persist` included. `persist` is unique to this phone.** While Android still starts with root adb, `gpt-restore` works from Android | refuses, prints this text; goes only with the owner's word: `NO_RECOVERY_ROOT=lun-erase-accepted` |
+| nothing | not known | refuses |
+
+The rehearsal does not show that recovery starts when the primary is bad [U]: it runs on a good table. Recovery lives on `boot_a`, another LUN [V backup], so [I] it starts.
 
 ## 2. The layout
 
@@ -53,7 +77,7 @@ Boot selection is unchanged: A/B slots. Lineage on slot a, Mu + DarwinBoot + XNU
 | --- | --- | --- |
 | (b) ABL `fastboot flash partition:0 <gpt_both0-style image>` | [V QRD-Development/abl uefi.lnx.3.0.r12-rel `PartitionTableUpdate.c` `WriteGpt`: `/* Erase the entire card */ ErasePartition (BlockIo, ...)`, before the write. I this phone's ABL acts the same] **It erases all of LUN 0: ssd, persist, misc, keystore, frp, product_a/b, odm_a/b, oem, minidump, system_a/b, metadata, userdata.** `persist` is unique to the phone. [V] `partition` is a critical partition: needs the unlock_critical state [U on this phone]. [V] `PatchGpt` also rewrites the last entry and the usable range. No read-back. | **Rejected.** Last resort only: section 8 |
 | (a) `sgdisk` on the phone | [V AOSP `external/gptfdisk` `gpt.cc` `SaveGPTData`] Writes backup table, backup header, main table, main header, MBR, then asks the kernel to re-read (busy with `/data` mounted [I]). Warns at 32 slots (under 16 KiB, line 356). Needs several flags to keep the GUIDs and attributes of `userdata`. Rewrites the MBR. Its order is fine, but what it writes is known only afterwards | Not chosen. Useful as a read-only second look: `sgdisk -p /dev/block/sda` |
-| (c) `ldbhelper gpt-write` with a plan from `op10tool gpt plan` | Exact bytes, computed and checked on the host from the backup, with no phone. Each old block must equal the plan's before it is written. `O_DIRECT` + `O_SYNC`: each write and read goes past the page cache. No `BLKRRPART`. | **Chosen.** Of the three, it alone compares the planned bytes **before any reboot** with no extra tool |
+| (c) `ldbhelper gpt-write` with a plan from `op10tool gpt plan` | Exact bytes, computed and checked on the host from the backup, with no phone. Each old block must equal the plan's before it is written. `O_DIRECT` + `O_SYNC`: each write and read goes past the page cache; all bytes go through a 4096-aligned buffer (4.14 `fs/block_dev.c:227`, `:360` refuses memory, offset or length off the block). No `BLKRRPART`. One writer: `flock` on `PLAN.lock`, on the phone: a second `gpt-write` stops before it reads the device; the kernel drops the lock at any end of the process. | **Chosen.** Of the three, it alone compares the planned bytes **before any reboot** with no extra tool |
 
 Order of the writes (`tools/op10tool/src/gpt.rs` `plan_bytes`, `ldbhelper.c` `cmd_write`):
 
@@ -71,10 +95,20 @@ Then the helper reads all of it back, and the host reads it again with `gpt-dump
 | step 1 | old, valid | invalid | normal; Linux reads the primary [V] | `gpt-write --resume` |
 | step 2 | old, valid | new, valid | normal, old table | `gpt-write --resume` |
 | step 3 | old, valid | new, valid | old table; [I] `partition_wiped` true for raw block 0, so init formats `userdata` at the old size: Android restarts empty | `gpt-write --resume`. The wipe was approved |
-| inside step 4 | [U] one UFS command: the device may finish it or not | new, valid | if the primary is bad: no sda partitions, no `system_a`, Android does not start. [I] Mu or ABL `PartitionDxe` may restore the primary from the backup | section 8: helper from a root shell in recovery |
+| inside step 4 | [U] one UFS command: the device may finish it or not. Header and entries can each be old, new, or anything | new, valid | if the primary is bad: no sda partitions, no `system_a`, Android does not start. [I] Mu or ABL `PartitionDxe` may restore the primary from the backup | Android still up: `gpt-write --resume`. In recovery: `CONFIRM=gpt-repair dual-boot.sh gpt-repair` (the new table) or `CONFIRM=gpt-restore dual-boot.sh gpt-restore` (the old layout). The primary is written from the valid backup. No root in recovery: section 8, last row |
 | after step 4 | new | new | new table, no old superblock | steps 3, 4 of section 1 |
 
-`--resume` accepts only "the first steps new, the rest old, block for block". Anything else stops. Host tests cover a stop after steps 1, 2, 3. They do not show what UFS does at a power loss [U].
+The helper compares each block alone: LBA 1 and LBA 2 are two answers, not one. `--resume` accepts two forms. (a) "the first steps new, the rest old", block for block. (b) both backup blocks hold the plan's new bytes, and the primary is in any other state: the primary is written. **Anything else stops, and nothing is written**: a torn primary with a backup that is not the plan's new one; a backup block that is neither old nor new, even with a good primary. In that last case the old table still rules and Android starts: report it. Host tests cover a stop after steps 1, 2, 3 and each torn form. They do not show what UFS does at a power loss [U].
+
+**The way back is made from the table on the disk** (`op10tool gpt plan-restore`, `dual-boot.sh gpt-restore`). [V QRD-Development/abl uefi.lnx.3.0.r12-rel `PartitionTableUpdate.c`: `SwitchPtnSlots` line 651 `SwapPtnGuid`, `UpdatePartitionAttributes (PARTITION_GUID)`, `SetActiveSlot`; V LineageOS `boot_control.cpp`. I this phone's ABL acts the same] a slot change writes attributes and swaps type GUIDs of `_a`/`_b` entries, so after a slot change the disk is neither table of the first plan. The restore keeps those bytes. It reads the primary, sets the last LBA of `userdata` to the last usable block, empties slot 16, and recomputes the CRCs. `op10tool` compares byte by byte and refuses any other change; it also refuses a table that a slot change cannot explain (another range, another unique GUID, a change on a non-slot entry, a type GUID that is not of the pair). The result is then read back against the plan's bytes. With no slot change the result equals the pre-write backup, byte for byte. A stopped restore: the same command reads the primary again and goes on.
+
+| `op10tool gpt state` | What it is | `gpt-restore` | `gpt-repair` |
+| --- | --- | --- | --- |
+| `new` | valid primary with `iosroot`; the backup new or part of a stopped restore | restores | nothing to repair: stops |
+| `old` | both copies valid and equal, no `iosroot` | writes nothing | stops |
+| `old-backup-differs` | a valid primary without `iosroot`, another backup: a stopped `gpt-write` | stops: `gpt-write --resume` in Android | stops |
+| `torn-backup-new`, `torn-backup-old` | the primary is not valid, the backup is | repairs, then restores | repairs |
+| `broken`, `unknown` | no valid copy; or valid and no layout of this disk | stops: last resort | stops |
 
 **The running `/data` between the write and the wipe.** The running kernel keeps the old table until its reboot: no re-read is asked. `/data` stays mounted on the old range through dm-default-key. Its writes can land in what will be `iosroot`: nothing is there yet, and `install` comes later. The superblock is in memory; the zeroed copy on flash has no effect until the next mount. [V 4.14 tree] `f2fs_commit_super` has callers for resize, sysfs, an ioctl in `file.c`, and a few paths in `super.c`; a run of one before the reboot could write a valid superblock again: step 4 of section 1 still removes it. So: reboot right after the write. Android data written after the write is lost anyway.
 
@@ -106,7 +140,7 @@ The device-mapper target ends at the new size [V vold], so even a stale mount co
 **Can it reach the `LAUREL DUALBOOT: on` line?** [V code] Yes, if the iOS 26 kernel reaches its root device search. `sweet_ufs_rootdev` runs at the root search, and `sweet_ufs_init` prints the line before the root mounts, with or without `ufsrw`. [V host] Tested in the real driver of the iOS 16 tree; the iOS 26 tree carries the same patch and compiles. [U] **The iOS 26 kernel has never booted**: it can stop anywhere before that.
 
 **What it shows:**
-`LAUREL DUALBOOT: on: root = iosroot, LUN 0, first block 21633536, 8486395 blocks (33149 MiB), read-only (LAUREL-2950-IOSROOT-FENCE-V3)`
+`LAUREL DUALBOOT: on: root = iosroot, LUN 0, first block 21633536, 8486395 blocks (33149 MiB), read-only (LAUREL-2950-IOSROOT-FENCE-V4)`
 Or `LAUREL DUALBOOT: off: <reason>; no write anywhere`, then a restart after 30 s.
 
 **After that line** [V code for the first two, U for the rest]: `su.writable` is false, so `ufs_write_blocks` refuses all and the log thread does not start. `rootrw` is absent, so the root mounts read-only (`vfs_subr.c`). `launchd` starts with no writable `/private/var`. **Expect no UI.** It may hang or panic; that is not a failure of this step. The USB log and the screen are the only output: nothing is written to `iosroot`.
@@ -121,15 +155,17 @@ The SCSI layer knows four commands: TEST UNIT READY, READ(10), WRITE(10), SYNCHR
 
 | Writer | With 2950 |
 | --- | --- |
-| HFS+ on `ufsroot0`, `/dev/rufsroot0` | only inside `iosroot`, LUN 0 |
-| Console log thread: last 1025 blocks of the partition, every 10 s | the last 1025 blocks of `iosroot`. Only with `ufsrw=1` |
+| HFS+ on `ufsroot0`, `/dev/rufsroot0` | only inside `iosroot`, LUN 0, and before the console log: the BSD disk has `iosroot` minus 1025 blocks (`DKIOCGETBLOCKCOUNT`, psize, strategy). [V `hfs_vfsutils.c:354`, `hfs_vfsops.c:2311`] HFS writes its alternate header 1024 bytes before the end of the disk it is told of; with all of `iosroot` that was LBA 30119930, the last block of the log |
+| Console log thread: last 1025 blocks of the partition, every 10 s | the last 1025 blocks of `iosroot`. Only with `ufsrw=1`. No BSD read or write reaches them; from another system: `log-pull.sh`, which reads `iosroot` by its own size |
 | rmtfs (`TopazModem.cpp`) | writes answered ok, dropped; reads through `sweet_ufs_read_part`, read-only |
 | `sweet_ufs_read_part`, `_part_info` (modem, IPA, BT firmware) | read-only |
 | panic: `d_dump = eno_dump` | nothing |
 
 The self-check, all reads, before a write can happen (`ldb_self_check`, `laurel_dualboot.h`): both GPT copies valid (signature, header and entries CRC, each at the block it names) and equal; 32 slots, 16 used, no hole; each partition follows the one before; slots 14, 15, 16 = `metadata`, `userdata`, `iosroot`; no second `iosroot`; `iosroot` on 2 MiB, up to the last usable block, attributes 0; an HFS+ volume with room for the log. The rules are general: no block number of this one phone. A failure: one `off` line, no write anywhere, restart after 30 s. Kill switch `laureldualboot=0`.
 
-The fence compares each LBA with what the self-check found, and su's numbers too, and LUN 0, and stays shut if the self-check did not pass. `sweet_gpt_watch` panics if the GPT changes during the session. **A kernel without this patch takes `userdata` as its root and writes its log to the end of it**: `uefi-image.sh` refuses to build, and `android-guard.sh boot-image` refuses to flash, an image without the marker text `LAUREL-2950-IOSROOT-FENCE-V3`. The marker of the file design is refused too.
+**What opens writes.** [V `pexpert/gen/bootargs.c`] `PE_parse_boot_argn` takes `0x1`, `01`, `1k` as numbers, a bare name is 1, and the last token wins. The kernel now takes the text: only `ufsrw=1` and the bare `ufsrw` open writes; `ufsrw=0x1`, `01`, `2` give one line and a read-only boot. The scripts count wider: `uefi-image.sh` and `android-guard.sh` take any token of `ufsrw` or `rootrw` as writable unless its value is the literal `0` (`laurel_can_write`, `scripts/lib/laurel-layout.sh`). So an image the scripts call read-only has no token that opens writes in the kernel.
+
+The fence compares each LBA with what the self-check found, and su's numbers too, and LUN 0, and stays shut if the self-check did not pass. `sweet_gpt_watch` panics if the GPT changes during the session. **A kernel without this patch takes `userdata` as its root and writes its log to the end of it**: `uefi-image.sh` refuses to build, and `android-guard.sh boot-image` refuses to flash, an image without the marker text `LAUREL-2950-IOSROOT-FENCE-V4`. The marker of the file design and the V3 kernels (log in reach of HFS) are refused too.
 
 Below the kernel, not changed: Mu `PartitionDxe` writes a GPT only when one copy is invalid [V `Gpt.c`]; ABL writes slot attributes; Qualcomm DXE binaries are not audited.
 
@@ -152,10 +188,12 @@ Below the kernel, not changed: Mu `PartitionDxe` writes a GPT only when one copy
 | **Any failed iOS boot** | | **Power + Vol Down, `CONFIRM=to-android dual-boot.sh to-android`.** Or wait out the 7 retries with Power | Owner |
 | iOS line `LAUREL DUALBOOT: off: ...`, restart after 30 s | self-check said no; no block was written | as above; read the reason | Owner |
 | `gpt-write` says "not the backup" | the table changed since the backup (slot attributes?) | stop. Nothing written. A new backup of the table, a new decision | Agent |
-| `gpt-write` failed or adb lost, `Do not reboot` | a state of the plan or unknown | `CONFIRM=gpt-write dual-boot.sh gpt-write --resume`: goes on only from a state of the plan | Agent |
+| `gpt-write` failed or adb lost, `Do not reboot` | a state of the plan or unknown | `CONFIRM=gpt-write dual-boot.sh gpt-write --resume`: goes on only from a state of the plan (section 3). With the new table already there it writes nothing and leaves the record alone | Agent |
+| `another gpt-write runs on this phone` | a writer still runs: adb was lost, the helper was not | wait. Nothing was written by the second run. Then `--resume` | Agent |
+| Android does not start, recovery works, `gpt-write` was stopped in step 4 | a half-written primary | root adb in recovery: `CONFIRM=gpt-repair dual-boot.sh gpt-repair` (keeps the new table) or `CONFIRM=gpt-restore dual-boot.sh gpt-restore` | Agent, owner yes |
 | `gpt-write` refuses with EPERM | SELinux or a read-only LUN [U] | steps 1, 2 are refused first: nothing destroyed. Old table rules | Agent |
 | `after-gpt`: ABL shows other sizes | table not as planned | stop, do not format. Report it. `gpt-restore` needs Android or a root shell in recovery | Agent |
-| Recovery does not start from `after-gpt` | [U] `reboot-recovery` [V in ABL source] on this ABL | Power + Vol Up [I], or `fastboot reboot` and let init format (section 4) | Owner |
+| `after-gpt` says ABL refused `fastboot reboot recovery` | [V ABL source] the command is under `DYNAMIC_PARTITION_SUPPORT`. The sizes were right. The step does not fail | Power + Vol Up [I], or what the rehearsal recorded, or `fastboot reboot` and let init format (section 4) | Owner |
 | Android after the wipe: recovery prompt or logo loop | format did not run | Recovery: Format data again. Then `android-check` | Owner |
 | Android does not start after iOS: logo loop or asks for reset | [U] Keymaster or slot state | Power + Vol Down, `to-android`; report the log. Then Format data costs only what Android holds | Owner |
 | `android-check`: stale superblock | the format did not run | Recovery: Format data | Owner |
@@ -164,8 +202,8 @@ Below the kernel, not changed: Mu `PartitionDxe` writes a GPT only when one copy
 | Slot stuck, ABL in fastboot ("no alternate slot") | slot a not marked successful | `to-android` | Owner |
 | Android restarts on slot b without end, before the first `switch` | slot b is marked successful today | `to-android` | Owner |
 | `boot_b` must go back | | `ANDROID_IMAGE=1 scripts/laurel/flash-boot.sh ~/laurel-backup/lineage-24.0-20261027/boot.img`, and Lineage's `dtbo.img` to `dtbo_b`. Only Lineage's hash passes the guard | Agent, owner yes |
-| **The old table back** | a boot on the new table fails and the table is the suspect | Android or a root shell in recovery [U whether Lineage recovery gives one on this build]: `CONFIRM=gpt-restore dual-boot.sh gpt-restore`, then Format data | Agent, owner yes |
-| **The old table, no shell anywhere** | | **Fastboot cannot restore only the table.** `dual-boot.sh gpt-restore-print` prints the last resort, runs nothing: `fastboot flash partition:0` **erases all of LUN 0**, needs unlock_critical [U], then each partition from the backup, `persist` included: a separate owner decision. `gpt_both0.bin` of the stock ROM is **not** this table (other values in all 15 entries, usable range ends at 1831431): use the printed image | Owner |
+| **The old layout back** | a boot on the new table fails and the table is the suspect | Android, or a root shell in recovery (`adb get-state` says `recovery`; the helper goes to `/tmp`; the rehearsal says if it exists): `CONFIRM=gpt-restore dual-boot.sh gpt-restore`, then Format data. Slot attributes and type GUIDs stay as they are on the disk (section 3) | Agent, owner yes |
+| **The old table, no shell anywhere** | | **Fastboot cannot restore only the table.** `dual-boot.sh gpt-restore-print` prints the last resort, runs nothing: `fastboot -S 512M flash partition:0` **erases all of LUN 0**, needs unlock_critical [U], then each partition from the pre-write backup, each with a hash check against `SHA256SUMS`, each with `-S 512M` [V notes: plain `fastboot flash` hits the ABL download defect], `persist` included: a separate owner decision. `gpt_both0.bin` of the stock ROM is **not** this table (other values in all 15 entries, usable range ends at 1831431): use the printed image | Owner |
 
 ## 9. The old design, and why it was dropped
 
@@ -173,7 +211,9 @@ The root was a pinned, preallocated f2fs file in `/data`, written raw, reached b
 
 ## 10. Unproven: all of this needs the phone
 
-- [U] `gpt-write` on the real `/dev/block/sda`: SELinux of the `su` domain, `O_DIRECT`, `BLKROGET`. Host tests use a file.
+- [U] `gpt-write` on the real `/dev/block/sda`: SELinux of the `su` domain, `O_DIRECT`, `BLKROGET`, `flock` on the lock file. Host tests use a file; `test/dio_check.c` applies the O_DIRECT rule of 4.14 to the phone's own code: that shows the alignment, not the device.
+- [U] Lineage recovery: state `recovery`, root adb, `/tmp` allows an exec, `toybox` has what the helper's steps use. The rehearsal settles these. Not settled by it: does recovery start with a bad primary.
+- [U] What ABL r12 `SwitchPtnSlots` changes on this phone's ABL: `op10tool` allows attributes and a swapped type GUID on `_a`/`_b` entries, and stops on anything else.
 - [U] ABL reads the new table; `getvar partition-size:iosroot`; `fastboot flash iosroot` of a 34 GB sparse image in 512 MiB pieces (the 12 GB iOS 16 flash worked [V], and ABL can hang after it [V]).
 - [U] Format data + first boot give f2fs at the new size with metadata encryption (sources read: section 4).
 - [U] `by-name/iosroot` = sda16. [V] sde16 exists on this phone, so a partition 16 works in this kernel.
@@ -195,9 +235,9 @@ The root was a pinned, preallocated f2fs file in `/data`, written raw, reached b
 ## 12. Build and test
 
 - Kernel: `patches/laurel/xnu/2950-laurel-dual-boot.patch`, in both series. `scripts/laurel/kernel-ios26-linux.sh`, `scripts/laurel/kernel-linux.sh`.
-- Host test: `scripts/bg.sh db-test scripts/laurel/test-dualboot.sh` (needs the kernel tree: `AUDIT=1 scripts/laurel/kernel-linux.sh`). It runs: op10tool tests with the real layout from the backup when present; `sweet_ufs.c` over a RAM disk; `ldbhelper-test.sh` (a sparse disk, a stop after each step); `android-guard-test.sh`, `dual-boot-test.sh` (fake adb and fastboot; PATH holds no real one, checked first).
-- Do the tests find the defects: `scripts/bg.sh db-detect scripts/laurel/dualboot-tests-detect.sh`: each fix taken out of a copy; the test that names it must fail.
-- Tools (first `scripts/setup/build-op10tool.sh`: `out/bin/op10tool` needs the `gpt` command): `op10tool gpt {plan,same,verify-new,image}`, `tools/laurel-dualboot/ldbhelper.c`, `laurel_dualboot.h`, `scripts/lib/laurel-layout.sh`, `scripts/laurel/gpt-fake.py` (fixture: names and numbers, no bytes of a real table).
+- Host test: `scripts/bg.sh db-test scripts/laurel/test-dualboot.sh` (needs the kernel tree: `AUDIT=1 scripts/laurel/kernel-linux.sh`). It runs: op10tool tests with the real layout from the backup when present; `sweet_ufs.c` over a RAM disk; `ldbhelper-test.sh` (a sparse disk, a stop after each step, a torn primary, one writer, the phone's own code under `dio_check`); `android-guard-test.sh`, `dual-boot-test.sh` (fake adb and fastboot; PATH holds no real one, checked first).
+- Do the tests find the defects: `scripts/bg.sh db-detect scripts/laurel/dualboot-tests-detect.sh`: the new tests on the code before the fixes (`GPT_REV`, with its own helper and op10tool) must fail; each fix taken out of a copy, the test that names it must fail.
+- Tools: `dual-boot.sh` asks `op10tool gpt features` first. A stale binary: it runs `scripts/setup/build-op10tool.sh` if cargo is here and `OP10TOOL=` is not set, else it stops. `op10tool gpt {plan,same,verify-new,image,features,state,plan-restore,plan-repair,verify-plan}`, `tools/laurel-dualboot/ldbhelper.c`, `laurel_dualboot.h`, `test/dio_check.c`, `scripts/lib/laurel-layout.sh`, `scripts/laurel/gpt-fake.py` (fixture: names and numbers, no bytes of a real table). Patch 2950 from an edited tree: `scripts/laurel/dualboot-patch-refresh.py`.
 - Guard: `scripts/laurel/android-guard.sh`, flag `config/laurel-android-data`. `userdata`: refuses the old whole-partition flash (`root-flash-test.sh`, `fastboot-drain.py`). `flash-root.sh` writes only `iosroot` and checks the size first. `boot-image`: marker, Lineage header, read-only gate. `ANDROID_IMAGE=1`: only Lineage's hash from the backup, and no iOS text. `other-device` for the OnePlus scripts, with `test-boot.sh` now among them.
 
 Results: docs/plan.md, last entry.

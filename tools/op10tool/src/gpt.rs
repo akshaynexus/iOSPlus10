@@ -6,6 +6,9 @@
 //! test on the real layout reads the backup folder.
 //!
 //! The plan is a file for `ldbhelper gpt-write`: which blocks change, their bytes before and after, in the order that keeps a valid table at each moment.
+//!
+//! The way back is made from the table on the disk, not from the backup: ABL and the slot HAL change attributes and swap type GUIDs of the `_a`/`_b` partitions in both copies, so after any
+//! slot change the disk is neither of the two tables of the first plan. `plan-restore` changes only the last LBA of `userdata` and empties the `iosroot` slot. `plan-repair` writes a torn primary from a valid backup.
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -54,6 +57,9 @@ impl Layout {
         self.iosroot_last - self.iosroot_first + 1
     }
 }
+
+/// What dual-boot.sh asks of this binary (`gpt features`). A later change of the commands changes this text, so a stale out/bin/op10tool is seen before it is used.
+pub const FEATURES: &str = "ldb-gpt-2";
 
 /// One copy of the table as it lies on disk.
 pub struct Table {
@@ -104,20 +110,30 @@ fn read_dumps(head: &Path, tail: &Path) -> Result<Table> {
     })
 }
 
+/// One header with its entries, valid by itself: where it says it is, and its CRCs.
+fn check_copy(what: &str, h: &[u8], ent: &[u8], cur: u64, alt: u64, pe: u64) -> Result<()> {
+    ensure!(&h[..8] == b"EFI PART", "{what} header has no signature");
+    ensure!(u32_at(h, 8) == 0x10000 && u32_at(h, 12) == 92, "{what} header: revision or size is not the expected one");
+    ensure!(u32_at(h, 16) == hdr_crc(h), "{what} header CRC is wrong");
+    ensure!(u64_at(h, 24) == cur && u64_at(h, 32) == alt, "{what} header: LBA {} and {}, expected {cur} and {alt}", u64_at(h, 24), u64_at(h, 32));
+    ensure!(u64_at(h, 40) == FIRST_USABLE && u64_at(h, 48) == LAST_USABLE, "{what} header: usable {}..{}, expected {FIRST_USABLE}..{LAST_USABLE}", u64_at(h, 40), u64_at(h, 48));
+    ensure!(u64_at(h, 72) == pe, "{what} header: entries at LBA {}, expected {pe}", u64_at(h, 72));
+    ensure!(u32_at(h, 80) as usize == SLOTS && u32_at(h, 84) as usize == ESZ, "{what} header: {} slots of {} bytes, expected {SLOTS} of {ESZ}", u32_at(h, 80), u32_at(h, 84));
+    ensure!(u32_at(h, 88) == crc(&ent[..SLOTS * ESZ]), "{what} entries CRC is wrong");
+    ensure!(h[92..].iter().all(|x| *x == 0), "{what} header block: bytes after the header are not zero");
+    ensure!(ent[SLOTS * ESZ..].iter().all(|x| *x == 0), "{what} entries: the rest of the 16 KiB is not zero");
+    Ok(())
+}
+fn check_primary(t: &Table) -> Result<()> {
+    check_copy("primary", &t.hdr, &t.entries, 1, ALT_LBA, 2)
+}
+fn check_backup(t: &Table) -> Result<()> {
+    check_copy("backup", &t.bhdr, &t.bentries, ALT_LBA, 1, BACKUP_ENTRIES_LBA)
+}
 /// The fields both header copies must have, in any state of this plan.
 fn check_headers(t: &Table) -> Result<()> {
-    for (what, h, cur, alt, pe, ent) in [("primary", &t.hdr, 1, ALT_LBA, 2, &t.entries), ("backup", &t.bhdr, ALT_LBA, 1, BACKUP_ENTRIES_LBA, &t.bentries)] {
-        ensure!(&h[..8] == b"EFI PART", "{what} header has no signature");
-        ensure!(u32_at(h, 8) == 0x10000 && u32_at(h, 12) == 92, "{what} header: revision or size is not the expected one");
-        ensure!(u32_at(h, 16) == hdr_crc(h), "{what} header CRC is wrong");
-        ensure!(u64_at(h, 24) == cur && u64_at(h, 32) == alt, "{what} header: LBA {} and {}, expected {cur} and {alt}", u64_at(h, 24), u64_at(h, 32));
-        ensure!(u64_at(h, 40) == FIRST_USABLE && u64_at(h, 48) == LAST_USABLE, "{what} header: usable {}..{}, expected {FIRST_USABLE}..{LAST_USABLE}", u64_at(h, 40), u64_at(h, 48));
-        ensure!(u64_at(h, 72) == pe, "{what} header: entries at LBA {}, expected {pe}", u64_at(h, 72));
-        ensure!(u32_at(h, 80) as usize == SLOTS && u32_at(h, 84) as usize == ESZ, "{what} header: {} slots of {} bytes, expected {SLOTS} of {ESZ}", u32_at(h, 80), u32_at(h, 84));
-        ensure!(u32_at(h, 88) == crc(&ent[..SLOTS * ESZ]), "{what} entries CRC is wrong");
-        ensure!(h[92..].iter().all(|x| *x == 0), "{what} header block: bytes after the header are not zero");
-        ensure!(ent[SLOTS * ESZ..].iter().all(|x| *x == 0), "{what} entries: the rest of the 16 KiB is not zero");
-    }
+    check_primary(t)?;
+    check_backup(t)?;
     ensure!(t.hdr[56..72] == t.bhdr[56..72], "the disk GUIDs of the two headers differ");
     ensure!(t.entries == t.bentries, "the entries of the two copies differ");
     ensure!(t.mbr[510..512] == [0x55, 0xaa] && t.mbr[450] == 0xee, "no protective MBR");
@@ -211,6 +227,10 @@ fn fnv(d: &[u8]) -> u64 {
 ///   3     zero the old f2fs superblocks of userdata: when the new table is valid, no old superblock exists
 ///   4     primary header + entries in ONE write command: LBA 1, 2. Up to here the old table rules; after it the new one
 pub fn plan_bytes(from: &Table, to: &Table) -> Vec<u8> {
+    plan_steps(from, to, true)
+}
+/// zero: false only for the repair of a primary, which changes nothing else.
+fn plan_steps(from: &Table, to: &Table, zero: bool) -> Vec<u8> {
     let b = BLOCK as usize;
     let mut body = Vec::new();
     let mut steps = 0u32;
@@ -225,7 +245,9 @@ pub fn plan_bytes(from: &Table, to: &Table) -> Vec<u8> {
     };
     step(BACKUP_ENTRIES_LBA, 1, KIND_REPLACE, &[&from.bentries[..b], &to.bentries[..b]]);
     step(ALT_LBA, 1, KIND_REPLACE, &[&from.bhdr, &to.bhdr]);
-    step(USERDATA_FIRST, SB_BLOCKS, KIND_ZERO, &[]);
+    if zero {
+        step(USERDATA_FIRST, SB_BLOCKS, KIND_ZERO, &[]);
+    }
     step(1, 2, KIND_REPLACE, &[&from.hdr, &from.entries[..b], &to.hdr, &to.entries[..b]]);
     let mut o = Vec::with_capacity(body.len() + 32);
     o.extend_from_slice(b"LDBPLAN1");
@@ -250,8 +272,8 @@ fn print_table(t: &Table, title: &str) {
     println!("  primary header CRC {:#010x}, backup header CRC {:#010x}, entries CRC {:#010x}", u32_at(&t.hdr, 16), u32_at(&t.bhdr, 16), u32_at(&t.hdr, 88));
 }
 
-/// `gpt plan`: from dumps of the expected old table, the plan file. Prints both tables and the numbers. --reverse: the plan back from the new table to the old one.
-pub fn plan(head: &Path, tail: &Path, out: &Path, reverse: bool) -> Result<()> {
+/// `gpt plan`: from dumps of the expected old table, the plan file. Prints both tables and the numbers.
+pub fn plan(head: &Path, tail: &Path, out: &Path) -> Result<()> {
     let old = read_dumps(head, tail)?;
     check_old(&old)?;
     let l = Layout::new();
@@ -262,7 +284,7 @@ pub fn plan(head: &Path, tail: &Path, out: &Path, reverse: bool) -> Result<()> {
     let total = (LAST_USABLE - USERDATA_FIRST + 1) * BLOCK;
     println!("userdata {} -> {} bytes ({:.2} % of the old size)", total, (l.userdata_last - USERDATA_FIRST + 1) * BLOCK, (l.userdata_last - USERDATA_FIRST + 1) as f64 * BLOCK as f64 * 100.0 / total as f64);
     println!("IOSROOT_FIRST={} IOSROOT_LAST={} IOSROOT_BYTES={} IOSROOT_VOLUME_MAX={} USERDATA_LAST={}", l.iosroot_first, l.iosroot_last, l.iosroot_blocks() * BLOCK, (l.iosroot_blocks() - LOG_BLOCKS) * BLOCK, l.userdata_last);
-    let p = if reverse { plan_bytes(&new, &old) } else { plan_bytes(&old, &new) };
+    let p = plan_bytes(&old, &new);
     fs::write(out, &p).with_context(|| format!("{}", out.display()))?;
     println!("plan {}: {} bytes, {} steps, sha256 {:x}", out.display(), p.len(), u32_at(&p, 16), Sha256::digest(&p));
     Ok(())
@@ -292,6 +314,201 @@ pub fn verify_new(head: &Path, tail: &Path, ref_head: &Path, ref_tail: &Path) ->
     ensure!(got.hdr == want.hdr && got.entries == want.entries && got.bhdr == want.bhdr && got.bentries == want.bentries, "the table on the phone passes the rules but is not the planned bytes");
     print_table(&got, "on the phone:");
     println!("new table: both CRCs right, all other entries the same, userdata {}..{}, iosroot {}..{}", USERDATA_FIRST, l.userdata_last, l.iosroot_first, l.iosroot_last);
+    Ok(())
+}
+
+fn is_slot_name(n: &str) -> bool {
+    n.ends_with("_a") || n.ends_with("_b")
+}
+/// The entries belong to this disk: slots 1..15 hold what the reference (the pre-write backup) holds, except what a slot change may change: attributes and type GUID of `_a`/`_b` partitions.
+/// A type GUID there must be its own or the one of its pair: SwitchPtnSlots swaps them. The last LBA of `userdata` is not compared here.
+fn check_same_disk(e: &[u8], reference: &[u8]) -> Result<()> {
+    for (i, n) in NAMES.iter().enumerate() {
+        let (a, r) = (&e[i * ESZ..(i + 1) * ESZ], &reference[i * ESZ..(i + 1) * ESZ]);
+        ensure!(name_of(a) == *n, "slot {i} is '{}', expected '{n}'", name_of(a));
+        ensure!(a[16..32] == r[16..32], "{n}: the unique GUID is not the one of the backup");
+        ensure!(a[32..40] == r[32..40], "{n}: the first LBA is not the one of the backup");
+        ensure!(*n == "userdata" || a[40..48] == r[40..48], "{n}: the last LBA is not the one of the backup");
+        if is_slot_name(n) {
+            let pair = format!("{}{}", &n[..n.len() - 1], if n.ends_with("_a") { "b" } else { "a" });
+            let j = NAMES.iter().position(|x| *x == pair).with_context(|| format!("{n}: no pair"))?;
+            ensure!(a[..16] == r[..16] || a[..16] == reference[j * ESZ..j * ESZ + 16], "{n}: the type GUID is neither its own nor the one of {pair}");
+        } else {
+            ensure!(a[..16] == r[..16] && a[48..56] == r[48..56], "{n}: type GUID or attributes changed, and it is not a slot partition");
+        }
+    }
+    Ok(())
+}
+fn layout_is_new(e: &[u8], reference: &[u8]) -> Result<()> {
+    check_same_disk(e, reference)?;
+    let l = Layout::new();
+    ensure!(range_of(&e[14 * ESZ..15 * ESZ]) == (USERDATA_FIRST, l.userdata_last), "userdata is {:?}", range_of(&e[14 * ESZ..15 * ESZ]));
+    let i = &e[15 * ESZ..16 * ESZ];
+    ensure!(name_of(i) == "iosroot" && range_of(i) == (l.iosroot_first, l.iosroot_last), "slot 16 is '{}' {:?}, not iosroot", name_of(i), range_of(i));
+    ensure!(e[16 * ESZ..SLOTS * ESZ].iter().all(|x| *x == 0), "a slot after iosroot is not empty");
+    Ok(())
+}
+fn layout_is_old(e: &[u8], reference: &[u8]) -> Result<()> {
+    check_same_disk(e, reference)?;
+    ensure!(range_of(&e[14 * ESZ..15 * ESZ]) == (USERDATA_FIRST, LAST_USABLE), "userdata is {:?}", range_of(&e[14 * ESZ..15 * ESZ]));
+    ensure!(e[15 * ESZ..SLOTS * ESZ].iter().all(|x| *x == 0), "a slot after userdata is not empty");
+    Ok(())
+}
+/// The backup header of a valid primary, as a writer of this table makes it. Same fields, its own LBAs.
+fn backup_header_of(primary: &[u8]) -> Vec<u8> {
+    let mut h = primary.to_vec();
+    h[24..32].copy_from_slice(&ALT_LBA.to_le_bytes());
+    h[32..40].copy_from_slice(&1u64.to_le_bytes());
+    h[72..80].copy_from_slice(&BACKUP_ENTRIES_LBA.to_le_bytes());
+    let c = hdr_crc(&h);
+    h[16..20].copy_from_slice(&c.to_le_bytes());
+    h
+}
+fn primary_header_of(backup: &[u8]) -> Vec<u8> {
+    let mut h = backup.to_vec();
+    h[24..32].copy_from_slice(&1u64.to_le_bytes());
+    h[32..40].copy_from_slice(&ALT_LBA.to_le_bytes());
+    h[72..80].copy_from_slice(&2u64.to_le_bytes());
+    let c = hdr_crc(&h);
+    h[16..20].copy_from_slice(&c.to_le_bytes());
+    h
+}
+/// The table on the disk with the change undone: the last LBA of `userdata` back to the last usable block, slot 16 empty, the CRCs. Every other byte stays.
+fn restored(from: &Table) -> Table {
+    let mut e = from.entries.clone();
+    e[14 * ESZ + 40..14 * ESZ + 48].copy_from_slice(&LAST_USABLE.to_le_bytes());
+    e[15 * ESZ..16 * ESZ].fill(0);
+    let mut t = Table { mbr: from.mbr.clone(), hdr: from.hdr.clone(), entries: e.clone(), bhdr: from.bhdr.clone(), bentries: e };
+    fix_crcs(&mut t);
+    t
+}
+/// The proof of F3: byte by byte, the two tables differ only in what the restore must change. Returns the number of bytes that differ.
+fn prove_restore_diff(from: &Table, to: &Table) -> Result<usize> {
+    let mut n = 0;
+    let allowed_e = |o: usize| (14 * ESZ + 40..14 * ESZ + 48).contains(&o) || (15 * ESZ..16 * ESZ).contains(&o);
+    let allowed_h = |o: usize| (16..20).contains(&o) || (88..92).contains(&o);
+    for (what, a, b, ok) in [
+        ("primary header", &from.hdr, &to.hdr, &allowed_h as &dyn Fn(usize) -> bool),
+        ("backup header", &from.bhdr, &to.bhdr, &allowed_h as &dyn Fn(usize) -> bool),
+        ("primary entries", &from.entries, &to.entries, &allowed_e as &dyn Fn(usize) -> bool),
+        ("backup entries", &from.bentries, &to.bentries, &allowed_e as &dyn Fn(usize) -> bool),
+    ] {
+        ensure!(a.len() == b.len(), "{what}: the lengths differ");
+        for (o, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            if x != y {
+                ensure!(ok(o), "{what}: byte {o} changes, and only the last LBA of userdata, the iosroot slot and the CRCs may");
+                n += 1;
+            }
+        }
+    }
+    ensure!(from.mbr == to.mbr, "the MBR changes");
+    Ok(n)
+}
+
+/// `gpt state`: one word for the table on the disk. new: a valid primary with iosroot (the backup may be new, or part of a stopped restore: the helper decides by the plan). old: both copies valid and equal, no iosroot.
+/// old-backup-differs: a valid primary without iosroot and a backup that differs: a stopped gpt-write. torn-backup-new, torn-backup-old: the primary is not valid, the backup is, with that layout. broken: no valid copy. unknown: valid, but not this disk's layouts.
+pub fn state(head: &Path, tail: &Path, ref_head: &Path, ref_tail: &Path) -> Result<()> {
+    let t = read_dumps(head, tail)?;
+    let r = read_dumps(ref_head, ref_tail)?;
+    check_old(&r)?;
+    let w = if check_primary(&t).is_ok() {
+        if layout_is_new(&t.entries, &r.entries).is_ok() {
+            "new"
+        } else if layout_is_old(&t.entries, &r.entries).is_ok() {
+            if check_backup(&t).is_ok() && t.entries == t.bentries {
+                "old"
+            } else {
+                "old-backup-differs"
+            }
+        } else {
+            "unknown"
+        }
+    } else if check_backup(&t).is_ok() {
+        if layout_is_new(&t.bentries, &r.entries).is_ok() {
+            "torn-backup-new"
+        } else if layout_is_old(&t.bentries, &r.entries).is_ok() {
+            "torn-backup-old"
+        } else {
+            "unknown"
+        }
+    } else {
+        "broken"
+    };
+    println!("{w}");
+    Ok(())
+}
+
+/// `gpt plan-restore`: the plan back from the table on the disk (a dump read a moment ago). All that is read from the primary, so a run that stopped part way makes the same plan again.
+pub fn plan_restore(head: &Path, tail: &Path, ref_head: &Path, ref_tail: &Path, out: &Path) -> Result<()> {
+    let now = read_dumps(head, tail)?;
+    let r = read_dumps(ref_head, ref_tail)?;
+    check_old(&r)?;
+    check_primary(&now)?;
+    layout_is_new(&now.entries, &r.entries)?;
+    let from = Table { mbr: now.mbr.clone(), hdr: now.hdr.clone(), entries: now.entries.clone(), bhdr: backup_header_of(&now.hdr), bentries: now.entries.clone() };
+    let to = restored(&from);
+    let n = prove_restore_diff(&from, &to)?;
+    check_primary(&to)?;
+    check_backup(&to)?;
+    layout_is_old(&to.entries, &r.entries)?;
+    print_table(&from, "before (the table on the disk):");
+    print_table(&to, "after:");
+    println!("diff: {n} bytes in all, only: last LBA of userdata, the iosroot slot, the entries CRC and the header CRC of each copy. Attributes and type GUIDs of all other entries stay");
+    let p = plan_bytes(&from, &to);
+    fs::write(out, &p).with_context(|| format!("{}", out.display()))?;
+    println!("plan {}: {} bytes, {} steps, sha256 {:x}", out.display(), p.len(), u32_at(&p, 16), Sha256::digest(&p));
+    Ok(())
+}
+
+/// `gpt plan-repair`: a torn primary is written from a valid backup, and nothing else: the plan's steps for the backup hold its own bytes on both sides. Refuses when the primary is valid or the backup is not.
+pub fn plan_repair(head: &Path, tail: &Path, ref_head: &Path, ref_tail: &Path, out: &Path) -> Result<()> {
+    let now = read_dumps(head, tail)?;
+    let r = read_dumps(ref_head, ref_tail)?;
+    check_old(&r)?;
+    ensure!(check_primary(&now).is_err(), "the primary is valid: nothing to repair");
+    check_backup(&now).context("the primary is not valid and the backup is not valid: nothing to repair from")?;
+    ensure!(layout_is_new(&now.bentries, &r.entries).is_ok() || layout_is_old(&now.bentries, &r.entries).is_ok(), "the backup copy is valid but holds neither layout of this disk");
+    let from = Table { mbr: now.mbr.clone(), hdr: now.hdr.clone(), entries: now.entries.clone(), bhdr: now.bhdr.clone(), bentries: now.bentries.clone() };
+    let to = Table { mbr: now.mbr.clone(), hdr: primary_header_of(&now.bhdr), entries: now.bentries.clone(), bhdr: now.bhdr.clone(), bentries: now.bentries.clone() };
+    check_headers(&to)?;
+    print_table(&to, "after (from the backup copy):");
+    let p = plan_steps(&from, &to, false);
+    fs::write(out, &p).with_context(|| format!("{}", out.display()))?;
+    println!("plan {}: {} bytes, {} steps, sha256 {:x}", out.display(), p.len(), u32_at(&p, 16), Sha256::digest(&p));
+    Ok(())
+}
+
+/// `gpt verify-plan`: a dump read back holds each new block of this plan, and both copies are valid and equal.
+pub fn verify_plan(head: &Path, tail: &Path, plan_file: &Path) -> Result<()> {
+    let got = read_dumps(head, tail)?;
+    let p = fs::read(plan_file).with_context(|| format!("{}", plan_file.display()))?;
+    ensure!(p.len() >= 32 && &p[..8] == b"LDBPLAN1" && fnv(&p[32..]) == u64_at(&p, 24), "{}: not a plan", plan_file.display());
+    check_headers(&got)?;
+    let (mut o, mut blocks) = (32usize, 0);
+    let b = BLOCK as usize;
+    for _ in 0..u32_at(&p, 16) {
+        let (lba, n, kind) = (u64_at(&p, o), u32_at(&p, o + 8) as usize, u32_at(&p, o + 12));
+        o += 16;
+        if kind != KIND_REPLACE {
+            continue;
+        }
+        for k in 0..n {
+            let new = &p[o + n * b + k * b..o + n * b + (k + 1) * b];
+            let at = lba + k as u64;
+            let have = match at {
+                1 => &got.hdr[..],
+                2 => &got.entries[..b],
+                ALT_LBA => &got.bhdr[..],
+                BACKUP_ENTRIES_LBA => &got.bentries[..b],
+                _ => bail!("the plan names LBA {at}, no table block"),
+            };
+            ensure!(have == new, "LBA {at} on the disk is not the plan's new bytes");
+            blocks += 1;
+        }
+        o += 2 * n * b;
+    }
+    print_table(&got, "on the disk:");
+    println!("{blocks} table blocks equal the plan's new bytes, both copies valid and equal");
     Ok(())
 }
 
@@ -438,6 +655,84 @@ mod tests {
             fix_crcs(&mut n);
             assert!(check_new(&n, &old, Layout::new()).is_err(), "byte {i}");
         }
+    }
+
+    /// What a slot change does to the table [ABL SwitchPtnSlots, the HAL]: attributes of `_a`/`_b` entries, and the type GUIDs of a pair swapped, in both copies.
+    fn slot_change(t: &mut Table) {
+        for i in 0..NAMES.len() {
+            if is_slot_name(NAMES[i]) {
+                t.entries[i * ESZ + 48..i * ESZ + 56].copy_from_slice(&0x3f000000000000u64.to_le_bytes());
+            }
+        }
+        for (a, b) in [(5, 6), (7, 8), (11, 12)] {
+            for k in 0..16 {
+                t.entries.swap(a * ESZ + k, b * ESZ + k);
+            }
+        }
+        t.bentries = t.entries.clone();
+        fix_crcs(t);
+    }
+
+    #[test]
+    fn restore_after_a_slot_change_changes_only_its_own_bytes() {
+        let old = synth();
+        let mut n = apply(&old, Layout::new());
+        slot_change(&mut n);
+        let from = Table { mbr: n.mbr.clone(), hdr: n.hdr.clone(), entries: n.entries.clone(), bhdr: backup_header_of(&n.hdr), bentries: n.entries.clone() };
+        assert_eq!(from.bhdr, n.bhdr, "the backup header made from the primary is the one on the disk");
+        let to = restored(&from);
+        prove_restore_diff(&from, &to).unwrap();
+        check_headers(&to).unwrap();
+        layout_is_old(&to.entries, &old.entries).unwrap();
+        layout_is_new(&n.entries, &old.entries).unwrap();
+        // attributes and type GUIDs stay as they are on the disk, not as in the backup
+        assert_eq!(to.entries[5 * ESZ..14 * ESZ], n.entries[5 * ESZ..14 * ESZ]);
+        assert_ne!(to.entries[5 * ESZ..14 * ESZ], old.entries[5 * ESZ..14 * ESZ]);
+    }
+
+    #[test]
+    fn restore_with_no_slot_change_gives_the_backup_byte_for_byte() {
+        let old = synth();
+        let n = apply(&old, Layout::new());
+        let to = restored(&n);
+        assert_eq!(to.hdr, old.hdr);
+        assert_eq!(to.entries, old.entries);
+        assert_eq!(to.bhdr, old.bhdr);
+        assert_eq!(to.bentries, old.bentries);
+    }
+
+    #[test]
+    fn prove_restore_diff_refuses_any_other_byte() {
+        let n = apply(&synth(), Layout::new());
+        for i in [3usize, 14 * ESZ + 32, 14 * ESZ + 39, 14 * ESZ + 48, 13 * ESZ + 40, 16 * ESZ] {
+            let mut to = restored(&n);
+            to.entries[i] ^= 1;
+            assert!(prove_restore_diff(&n, &to).is_err(), "entry byte {i}");
+        }
+        for i in [24usize, 40, 60] {
+            let mut to = restored(&n);
+            to.hdr[i] ^= 1;
+            assert!(prove_restore_diff(&n, &to).is_err(), "header byte {i}");
+        }
+    }
+
+    #[test]
+    fn same_disk_refuses_what_a_slot_change_cannot_do() {
+        let old = synth();
+        let mut n = apply(&old, Layout::new());
+        slot_change(&mut n);
+        for (what, at, v) in [("non-slot attributes", 1 * ESZ + 48, 1u8), ("non-slot type", 2 * ESZ, 0x55), ("range", 5 * ESZ + 40, 0x55), ("unique GUID", 5 * ESZ + 20, 0x55), ("type GUID of no pair", 5 * ESZ + 3, 0x55)] {
+            let mut e = n.entries.clone();
+            e[at] ^= v;
+            assert!(check_same_disk(&e, &old.entries).is_err(), "{what}");
+        }
+    }
+
+    #[test]
+    fn primary_made_from_the_backup_is_the_primary() {
+        let n = apply(&synth(), Layout::new());
+        assert_eq!(primary_header_of(&n.bhdr), n.hdr);
+        assert_eq!(backup_header_of(&n.hdr), n.bhdr);
     }
 
     /// The real layout, when the backup is on this machine. No GPT bytes in git.

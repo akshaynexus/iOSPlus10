@@ -4,11 +4,11 @@
  *
  *   ldbhelper version                     the hash of this source (dual-boot.sh compares it after each push)
  *   ldbhelper gpt-dump DEV HEAD TAIL      the first and last 1 MiB of DEV to files, read past the page cache: the format of the backup
- *   ldbhelper gpt-write PLAN DEV          the steps of a plan of `op10tool gpt plan`: each old block must be what the plan says, each write is read back past the cache
+ *   ldbhelper gpt-write PLAN DEV          the steps of a plan of `op10tool gpt`: each old block must be what the plan says, each write is read back past the cache
  *
  * Why a helper and not sgdisk or dd: docs/laurel_sprout/dual-boot.md section 3. It changes the 4 blocks of the table and zeroes the 2 superblock blocks of userdata, nothing
  * else, and it never asks the kernel to read the table again: the running Android keeps the old table until its reboot.
- * Build: scripts/laurel/test-dualboot.sh (host, -DLDB_TEST_FILE: DEV is a file) and scripts/laurel/dual-boot.sh (phone).
+ * Build: scripts/laurel/test-dualboot.sh (host, -DLDB_TEST_FILE: DEV is a file; and the phone's own code for this host under test/dio_check.c: the O_DIRECT rules of 4.14) and scripts/laurel/dual-boot.sh (phone).
  */
 typedef unsigned char uint8_t;
 typedef unsigned int uint32_t;
@@ -26,7 +26,7 @@ typedef _Bool bool;
 __attribute__((used)) static const char helper_version[] = "ldbhelper-version " LDB_HELPER_VERSION;
 
 #if defined(__aarch64__)
-enum { SYS_ioctl = 29, SYS_openat = 56, SYS_close = 57, SYS_read = 63, SYS_write = 64, SYS_pread = 67, SYS_pwrite = 68, SYS_lseek = 62, SYS_fsync = 82, SYS_exit = 94 };
+enum { SYS_ioctl = 29, SYS_flock = 32, SYS_openat = 56, SYS_close = 57, SYS_read = 63, SYS_write = 64, SYS_pread = 67, SYS_pwrite = 68, SYS_lseek = 62, SYS_fsync = 82, SYS_exit = 94 };
 #define O_DIRECT_ 0x10000
 static long
 sc(long n, long a, long b, long c, long d)
@@ -37,7 +37,7 @@ sc(long n, long a, long b, long c, long d)
 }
 __asm__(".globl _start\n_start:\n  mov x0, sp\n  and sp, x0, #-16\n  b start_c\n");
 #elif defined(__x86_64__)
-enum { SYS_read = 0, SYS_write = 1, SYS_openat = 257, SYS_close = 3, SYS_lseek = 8, SYS_ioctl = 16, SYS_pread = 17, SYS_pwrite = 18, SYS_fsync = 74, SYS_exit = 231 };
+enum { SYS_read = 0, SYS_write = 1, SYS_openat = 257, SYS_close = 3, SYS_lseek = 8, SYS_ioctl = 16, SYS_pread = 17, SYS_pwrite = 18, SYS_flock = 73, SYS_fsync = 74, SYS_exit = 231 };
 #define O_DIRECT_ 0x4000
 static long
 sc(long n, long a, long b, long c, long d)
@@ -59,6 +59,8 @@ __asm__(".globl _start\n_start:\n  mov %rsp, %rdi\n  and $-16, %rsp\n  call star
 #define O_CREAT 0100
 #define O_TRUNC 01000
 #define O_SYNC 04010000
+#define LOCK_EX 2
+#define LOCK_NB 4
 #define BLK 4096u
 #define BLKSSZGET 0x1268ul
 #define BLKROGET 0x125eul
@@ -75,7 +77,9 @@ struct plan_step {
 	const uint8_t *oldb, *newb;
 };
 static uint8_t plan[64 * 1024] __attribute__((aligned(4096)));
+/* All device I/O goes through these three. 4.14 fs/block_dev.c:227, :360: O_DIRECT refuses memory, offset or length off the 4096-byte block: the plan's bytes must never be the buffer. */
 static uint8_t io[MAX_STEP_BLOCKS * BLK] __attribute__((aligned(4096)));
+static uint8_t wr[MAX_STEP_BLOCKS * BLK] __attribute__((aligned(4096)));
 static uint8_t dump[DUMP_BLOCKS * BLK] __attribute__((aligned(4096)));
 static struct plan_step steps[MAX_STEPS];
 __attribute__((unused)) static char **Envp;
@@ -210,8 +214,13 @@ dev_read(long fd, uint64_t lba, void *p, uint32_t blocks)
 static void
 dev_write(long fd, uint64_t lba, const void *p, uint32_t blocks)
 {
+	/* the bytes go through the aligned buffer: a plan holds them at offsets off the block */
+	if (blocks > MAX_STEP_BLOCKS) {
+		die("a write is larger than its buffer", 0);
+	}
+	memcpy(wr, p, blocks * BLK);
 	/* one pwrite on O_DIRECT is one command for a range this small; LBA 1 and 2 go out together */
-	long r = sc(SYS_pwrite, fd, (long)p, (long)(blocks * BLK), (long)(lba * BLK));
+	long r = sc(SYS_pwrite, fd, (long)wr, (long)(blocks * BLK), (long)(lba * BLK));
 	if (r != (long)(blocks * BLK)) {
 		die("raw write", r < 0 ? r : 0);
 	}
@@ -318,47 +327,83 @@ load_plan(const char *path, uint64_t disk)
 	return count;
 }
 /*
- * Each replace step is old or new. Allowed states: the first k replace steps new, the rest old: a run that stopped there. Anything else: not the table of this plan.
+ * Each block of a replace step is compared by itself: new, old or neither. A step is new or old when all its blocks are. Allowed: the first k replace steps new, the rest old: a
+ * run that stopped there. Also allowed: all steps new but the primary at LBA 1, and that one in any other state (one command can stop half done, and a block can hold anything):
+ * *torn = true; the backup holds the plan's new bytes, so the primary can be written from them. Anything else: not the table of this plan: nothing is written.
  * Returns the number of replace steps already done.
  */
 static uint32_t
-state_of(long fd, uint32_t count, uint32_t *replace_steps)
+state_of(long fd, uint32_t count, uint32_t *replace_steps, bool *torn)
 {
 	uint32_t done = 0, total = 0;
 	bool seen_old = false;
+	*torn = false;
 	for (uint32_t i = 0; i < count; i++) {
 		const struct plan_step *s = &steps[i];
 		if (s->kind != KIND_REPLACE) {
 			continue;
 		}
 		total++;
-		dev_read(fd, s->lba, io, s->blocks);
-		if (blk_eq(io, s->newb, s->blocks * BLK)) {
+		uint32_t n_new = 0, n_old = 0;
+		for (uint32_t k = 0; k < s->blocks; k++) {
+			dev_read(fd, s->lba + k, io, 1);
+			if (blk_eq(io, s->newb + k * BLK, BLK)) {
+				n_new++;
+			} else if (blk_eq(io, s->oldb + k * BLK, BLK)) {
+				n_old++;
+			} else {
+				out(2, "ldbhelper: LBA ");
+				num(2, s->lba + k);
+				out(2, " is neither the old nor the new bytes of the plan\n");
+			}
+		}
+		if (n_new == s->blocks) {
 			if (seen_old) {
 				die("the table on the device is not one this plan can leave: a later block is new and an earlier one old", 0);
 			}
 			done++;
-		} else if (blk_eq(io, s->oldb, s->blocks * BLK)) {
+		} else if (n_old == s->blocks) {
 			seen_old = true;
+		} else if (s->lba == 1 && !seen_old) {
+			*torn = true;
 		} else {
-			out(2, "ldbhelper: LBA ");
-			num(2, s->lba);
-			out(2, " is neither the old nor the new bytes of the plan\n");
 			die("the table on the device is not the one this plan was made from: nothing written by this run", 0);
 		}
 	}
 	*replace_steps = total;
 	return done;
 }
+/* S5: one writer. The kernel drops the lock when this process ends, also on a kill or a power cut, so a stale lock cannot exist. A second writer stops here, before any read of the device. */
+static void
+writer_lock(const char *planpath)
+{
+	static char path[256];
+	unsigned long n = slen(planpath);
+	if (n + 6 > sizeof(path)) {
+		die("the plan path is too long", 0);
+	}
+	memcpy(path, planpath, n);
+	memcpy(path + n, ".lock", 6);
+	long fd = open_or_die(path, O_RDWR | O_CREAT, 0600);
+	long r = sc(SYS_flock, fd, LOCK_EX | LOCK_NB, 0, 0);
+	if (r < 0) {
+		die("another gpt-write runs on this phone (it holds the lock): nothing written by this run. Wait for it to end", r);
+	}
+}
 static void
 cmd_write(const char *planpath, const char *dev)
 {
+	writer_lock(planpath);
 	long fd = open_dev(dev, O_RDWR | O_SYNC);
 	uint32_t count = load_plan(planpath, dev_blocks(fd)), total = 0;
-	uint32_t done = state_of(fd, count, &total), seen = 0;
+	bool torn = false;
+	uint32_t done = state_of(fd, count, &total, &torn), seen = 0;
 	if (done == total) {
 		out(1, "gpt-write: the device already holds the new table: nothing written\n");
 		return;
+	}
+	if (torn) {
+		out(1, "gpt-write: the primary is half written and the backup holds the new table: the primary is written from the plan's new bytes\n");
 	}
 	for (uint32_t i = 0; i < count; i++) {
 		const struct plan_step *s = &steps[i];
@@ -398,7 +443,7 @@ cmd_write(const char *planpath, const char *dev)
 #endif
 	}
 	/* all of it again, as a reader after this run sees it */
-	if (state_of(fd, count, &total) != total) {
+	if (state_of(fd, count, &total, &torn) != total) {
 		die("the new table does not read back in full", 0);
 	}
 	out(1, "gpt-write ok: new table on the device, read back past the cache. The running kernel keeps the old table until its reboot\n");

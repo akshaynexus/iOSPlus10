@@ -88,7 +88,7 @@ else
     OS_VERSION=$(boot_os_version "$os_raw"); OS_PATCH=$(boot_os_patch "$os_raw")
     # dual-boot.sh image: the read-only first boot. No write command can leave the kernel, and the root mounts read-only.
     [ "${LAUREL_READONLY:-0}" != 1 ] || CMDLINE=${CMDLINE/ ufsrw=1 rootrw=1/}
-    case " $CMDLINE " in *" ufsrw=1 "*|*" rootrw=1 "*) IMG_MODE=rw ;; *) IMG_MODE=ro ;; esac
+    if printf '%s\n' "$CMDLINE" | laurel_can_write; then IMG_MODE=rw; else IMG_MODE=ro; fi
     [ "${LAUREL_READONLY:-0}" != 1 ] || [ "$IMG_MODE" = ro ] || { echo "uefi-image: FAILED: LAUREL_READONLY=1, and the command line can write: $CMDLINE" >&2; exit 1; }
   fi
   python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE" ${MKADT_EXTRA:-}   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
