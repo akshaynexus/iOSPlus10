@@ -177,7 +177,7 @@ at the wrong routing): wrong mic, no bias, or a mux. Hundreds or more and it fol
 `-[BWAudioSourceNode start:]` hook (`userland/camera/media_hooks.c`) does **not** block capture audio. It only changes the error 'nope' into success. The stock comment
 says the node's capture session goes through a brokered HAL plug-in that is absent; that may be a different plug-in from ours [U]. Removing the hook would bring back the
 preview bursts if 'nope' stays, so it **stays**. New line for the decision: `negroni: camera hooks: the session's audio source started: video records sound`, else the old
-`...there is no capture audio on this phone...`. Video with sound is therefore unproven. Hook 11 (a NULL sample buffer not passed on) stays too.
+`...there is no capture audio on this phone...`. Video with sound is therefore unproven. The guard that does not pass on a NULL sample buffer (`emit_sample_buffer`) stays too.
 
 ### Headphones and earpiece (not done, did not block the mic)
 
