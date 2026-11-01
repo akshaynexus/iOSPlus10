@@ -17,7 +17,7 @@ NGL=$REPO/userland/negronigl            # our sources
 # The one Turnip-on-Darwin patch (userland/turnip owns it; scripts/gpu/turnip-build.sh applies every patch of that
 # directory). The GL tree gets this one too, so both trees carry the same Darwin changes (meson.build, tu_knl.cc).
 TURNIP_DARWIN_PATCH=$REPO/userland/turnip/mesa-patches/0001-turnip-darwin.patch
-G=$OUT/gpu                               # all build products
+G=${GPU_OUT:-$OUT/gpu}                   # all build products (GPU_OUT: scripts/laurel/ios26-metal-build.sh, a second tree)
 DL=$G/dl                                 # downloaded archive (untrusted until the hash matches)
 MESA_SRC=$G/mesa-$MESA_VERSION           # patched Mesa tree
 MESA_BUILD=$G/mesa-build-ios             # meson build directory (iOS arm64)

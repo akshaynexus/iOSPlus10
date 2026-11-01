@@ -1,0 +1,13 @@
+default: 141 made, 13 refused
+hot: 139 made, 15 refused
+refused only by default: none
+refused only by hot: simple_rim_lpf simple_rim_lph
+FRAG: 128 pipelines; instructions median default 93.5, hot 194.5; smaller in default 110, in hot 4, same 14
+VERT: 128 pipelines; instructions median default 38, hot 98; smaller in default 128, in hot 0, same 0
+ca_generic_lph_cph: default 63688, hot 1057
+ca_generic_lph_cpf: default 55193, hot 4570
+ca_generic_fetch_lph_cph: default 63855, hot 1129
+glass_background_lph: default 837, hot 937
+glass_background_sdf_lph: default 1703, hot 2780
+glass_foreground_lph: default 194, hot 370
+asg_frag_lph: default 593, hot 2276

@@ -95,9 +95,10 @@ cleanup; LOOP=; trap - EXIT
   echo "kernel read-only mount: $kmount"
   [ -f "$W/mount-check.txt" ] && cat "$W/mount-check.txt"
   echo "tweak audit:"; cat "$W/audit.txt"
-  echo "not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, metal2vulkan, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils, SSH"
+  echo "not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils, SSH"
 } > "$R/report.txt"
 ln -sfn "$R" "$OUT/ios26/root-$DEV"
+grep ' metal26:' "$W/audit.txt" || echo "off       metal26: no audit line"
 sha256sum "$IMG.manifest" "$W/spec"
 ls -l "$IMG"; du -h "$IMG"
 [ "$kmount" = ok ] && [ "$fsck_rc" = 0 ] && echo "ios26-root: done, all checks OK: $R/report.txt" || { echo "ios26-root: FINISHED with a failed check: $R/report.txt"; exit 1; }

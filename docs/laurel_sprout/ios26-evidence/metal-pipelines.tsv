@@ -1,0 +1,191 @@
+function	kind	role	translate	ir3 FD610	compile host ms	instr	nops	tex (cat5)	mem (cat6)	full regs (limit 48)	const vec4	verdict
+fixed_vert_lph_spc	vertex	CA's fixed-function shader (every layer, image, color)	pass	vertex: compiled with its fragment								supported (host)
+fixed_vert_lph_gen	vertex	CA's fixed-function shader (every layer, image, color)	pass	vertex: compiled with its fragment								supported (host)
+fixed_vert_lpf_spc	vertex	CA's fixed-function shader (every layer, image, color)	pass	vertex: compiled with its fragment								supported (host)
+fixed_vert_lpf_gen	vertex	CA's fixed-function shader (every layer, image, color)	pass	vertex: compiled with its fragment								supported (host)
+fixed_frag_lph_cph	fragment	CA's fixed-function shader (every layer, image, color)	pass	made	55.4	1	0	0	0	0	0	supported (host); this row has zero constants (no output, 1 instruction), so it says nothing: see the ca_generic row. Real specializations: not run
+fixed_frag_lph_cpf	fragment	CA's fixed-function shader (every layer, image, color)	pass	made	55.1	1	0	0	0	0	0	supported (host); this row has zero constants (no output, 1 instruction), so it says nothing: see the ca_generic row. Real specializations: not run
+dynamic_system_ootf_decimate	kernel	tone mapping	pass	made	2.1							supported (host)
+std_vert0_lpf	vertex	plain quads	pass	vertex: compiled with its fragment								supported (host)
+std_vert1_lpf	vertex	plain quads	pass	vertex: compiled with its fragment								supported (host)
+std_vert2_lpf	vertex	plain quads	pass	vertex: compiled with its fragment								supported (host)
+upsample_vert_lpf	vertex	blur upsample	pass	vertex: compiled with its fragment								supported (host)
+downsample_blur_vert_lpf	vertex	backdrop filter: blur downsample	pass	vertex: compiled with its fragment								supported (host)
+asg_vert_lpf	vertex	adaptive scale (ASG) image resample	pass	vertex: compiled with its fragment								supported (host)
+variable_blur_vert_lpf	vertex	backdrop filter: variable blur	pass	vertex: compiled with its fragment								supported (host)
+sdf_filter_vert_lpf	vertex	SDF generation (rounded rects, glass shapes)	pass	vertex: compiled with its fragment								supported (host)
+path_cubic_vert_0_lpf	vertex	path rendering (shapes)	pass	vertex: compiled with its fragment								supported (host)
+path_cubic_vert_1_lpf	vertex	path rendering (shapes)	pass	vertex: compiled with its fragment								supported (host)
+path_rect_vert_lpf	vertex	path rendering (shapes)	pass	vertex: compiled with its fragment								supported (host)
+path_stroke_curve_vert_lpf	vertex	path rendering (shapes)	pass	vertex: compiled with its fragment								supported (host)
+path_blit_vert_lpf	vertex	path rendering (shapes)	pass	vertex: compiled with its fragment								supported (host)
+buffer_image_blit_vert_lpf	vertex	image upload	pass	vertex: compiled with its fragment								supported (host)
+stroke_line_vert_lpf	vertex	strokes	pass	vertex: compiled with its fragment								supported (host)
+image_rect_blit_vert_lpf	vertex	image blit	pass	vertex: compiled with its fragment								supported (host)
+upsample_frag_lpf	fragment	blur upsample	pass	made	46.2	142	18	4	0	5	8	supported (host)
+resolve_blur_weight_frag_lpf	fragment	blur resolve	pass	made	32.3	59	33	2	0	4	8	supported (host)
+downsample_4_frag_lpf	fragment	blur / mip downsample	pass	made	31.8	42	7	4	0	24	4	supported (host)
+downsample_8_frag_lpf	fragment	blur / mip downsample	pass	made	54.1	124	9	16	0	16	8	supported (host)
+downsample_6_frag_lpf	fragment	blur / mip downsample	pass	made	52.7	56	8	6	0	24	4	supported (host)
+asg_frag_lpf	fragment	adaptive scale (ASG) image resample	pass	made	67.6	555	75	12	0	16	8	supported (host), costly: 555 instructions a pixel
+asg_75_frag_lpf	fragment	adaptive scale (ASG) image resample	pass	made	52.0	246	24	8	0	12	12	supported (host)
+asg_50_frag_lpf	fragment	adaptive scale (ASG) image resample	pass	made	54.0	309	33	12	0	16	8	supported (host), costly: 309 instructions a pixel
+downsample_blur_2_frag_lpf	fragment	backdrop filter: blur downsample	pass	made	21.3	61	8	7	0	24	4	supported (host)
+downsample_blur_4_frag_lpf	fragment	backdrop filter: blur downsample	pass	made	56.4	103	8	13	0	24	8	supported (host)
+narrow_blur_7_frag_lpf	fragment	backdrop filter: Gaussian blur	pass	made	42.5	55	10	4	0	24	8	supported (host)
+narrow_blur_11_frag_lpf	fragment	backdrop filter: Gaussian blur	pass	made	50.6	68	9	6	0	24	8	supported (host)
+narrow_blur_15_frag_lpf	fragment	backdrop filter: Gaussian blur	pass	made	53.3	82	9	8	0	24	8	supported (host)
+narrow_blur_19_frag_lpf	fragment	backdrop filter: Gaussian blur	pass	made	53.0	95	8	10	0	24	12	supported (host)
+narrow_blur_23_frag_lpf	fragment	backdrop filter: Gaussian blur	pass	made	49.6	109	8	12	0	24	12	supported (host)
+narrow_blur_27_frag_lpf	fragment	backdrop filter: Gaussian blur	pass	made	56.9	124	9	14	0	24	12	supported (host)
+single_pass_blur_3_lpf	fragment	small blur	pass	made	51.9	58	13	4	0	24	8	supported (host)
+variable_blur_downsample_frag_lpf	fragment	backdrop filter: variable blur	pass	made	34.5	98	5	13	0	12	8	supported (host)
+variable_blur_clamp_downsample_frag_lpf	fragment	backdrop filter: variable blur	pass	made	46.3	113	6	13	0	12	8	supported (host)
+variable_blur_frag_lpf	fragment	backdrop filter: variable blur	pass	made	54.8	122	42	6	0	24	8	supported (host)
+axial_shading_frag_lpf	fragment	gradient	pass	made	24.2	26	7	1	0	8	4	supported (host)
+radial_shading_frag_lpf	fragment	gradient	pass	made	33.8	59	18	2	0	12	8	supported (host)
+radial_complex_shading_frag_lpf	fragment	gradient	pass	made	25.6	162	63	2	0	16	12	supported (host)
+conic_shading_frag_lpf	fragment	gradient	pass	made	38.0	138	58	2	0	8	12	supported (host)
+chromatic_aberration_lpf	fragment	chromatic aberration filter	pass	made	32.6	78	24	3	0	24	8	supported (host)
+displacement_map_lpf	fragment	displacement filter	pass	made	52.0	36	14	2	0	16	4	supported (host)
+chromatic_aberration_map_lpf	fragment	chromatic aberration filter	pass	made	54.2	61	25	4	0	12	8	supported (host)
+alpha_smooth_threshold_lpf	fragment	alpha filters	pass	made	41.3	51	28	1	0	9	8	supported (host)
+alpha_threshold_lpf	fragment	alpha filters	pass	made	40.3	127	36	4	0	12	8	supported (host)
+p3_clamp_lpf	fragment	wide-gamut clamp	pass	made	54.4	169	55	7	0	3	8	supported (host)
+edr_clamp_lpf	fragment	EDR	pass	made	36.8	181	48	7	0	12	12	supported (host)
+color_edr_lpf	fragment	EDR	pass	made	26.3	164	69	5	0	8	8	supported (host)
+alpha_linear_premultiply_lpf	fragment	alpha filters	pass	made	51.6	139	47	7	0	3	4	supported (host)
+home_affordance_base_lpf	fragment	home bar	pass	made	30.7	71	11	2	0	12	8	supported (host)
+simple_rim_lpf	fragment	SDF rim light	pass	made	303.0	5936	3576	261	0	12	8	supported (host), heavy: 5936 instructions a pixel
+brim_init_lpf	fragment	SDF rim, jump flood	pass	made	30.2	91	40	5	0	3	8	supported (host)
+brim_jump_lpf	fragment	SDF rim, jump flood	pass	made	37.0	600	327	27	0	8	8	supported (host), costly: 600 instructions a pixel
+sdf_gen_field_lpf	fragment	SDF generation (rounded rects, glass shapes)	pass	made	54.5	77	30	3	0	6	8	supported (host)
+sdf_gen_gradients_lpf	fragment	SDF generation (rounded rects, glass shapes)	pass	made	50.7	72	27	5	0	6	8	supported (host)
+brim_outline_lpf	fragment	SDF rim, jump flood	pass	made	50.3	243	112	3	0	24	16	supported (host)
+rim_outline_lpf	fragment	SDF rim	pass	made	47.0	167	73	3	0	12	8	supported (host)
+edr_scale_lpf	fragment	EDR	pass	made	45.2	139	33	8	0	8	8	supported (host)
+luma_boost_lpf	fragment	luma	pass	made	50.2	42	22	2	0	6	8	supported (host)
+glass_background_lpf	fragment	Liquid Glass, backdrop refraction + blur	pass	made	82.6	632	299	11	0	24	32	supported (host), costly: 632 instructions a pixel
+glass_background_no_bleed_lpf	fragment	Liquid Glass, backdrop refraction + blur	pass	made	50.5	549	262	10	0	24	24	supported (host), costly: 549 instructions a pixel
+glass_background_sdf_lpf	fragment	Liquid Glass, backdrop refraction + blur	pass	made	124.8	1482	445	9	0	48	52	supported (host), heavy: 1482 instructions a pixel
+glass_background_sdf_no_bleed_lpf	fragment	Liquid Glass, backdrop refraction + blur	pass	made	110.5	1399	408	8	0	48	44	supported (host), heavy: 1399 instructions a pixel
+glass_foreground_lpf	fragment	Liquid Glass, top layer	pass	made	44.0	169	35	12	0	24	12	supported (host)
+glass_foreground_sdf_lpf	fragment	Liquid Glass, top layer	pass	made	96.5	654	99	11	0	48	28	supported (host), costly: 654 instructions a pixel
+path_cubic_frag_lpf	fragment	path rendering (shapes)	pass	made	35.1	1	0	0	0	0	0	supported (host)
+path_rect_frag_lpf	fragment	path rendering (shapes)	pass	made	30.6	1	0	0	0	0	0	supported (host)
+path_stroke_curve_frag_lpf	fragment	path rendering (shapes)	pass	made	33.0	1	0	0	0	0	0	supported (host)
+path_clear_frag_lpf	fragment	path rendering (shapes)	pass	made	21.8	1	0	0	0	0	0	supported (host)
+path_blit_frag_lpf	fragment	path rendering (shapes)	pass	made	42.9	63	10	1	0	6	4	supported (host)
+path_blit_frag_eo_lpf	fragment	path rendering (shapes)	pass	made	34.6	83	25	1	0	6	4	supported (host)
+buffer_image_blit_frag_lpf	fragment	image upload	pass	made	44.1	69	35	1	0	6	8	supported (host)
+attachment_clear_frag_lpf	fragment	clear	pass	made	21.1	5	0	0	0	1	0	supported (host)
+inplace_copy_lpf	fragment	framebuffer in-place copy (raster order groups)	unsupported: RasterOrderGroups; needs AnyOf([[Feature(FragmentShaderPi	not asked								fails, not needed if CA reads supportsRasterOrderGroups NO [I]: no pixel interlock on Turnip FD610
+stroke_line_frag_lpf	fragment	strokes	pass	made	41.4	62	8	0	0	5	4	supported (host)
+stroke_arc_frag_lpf	fragment	strokes	pass	made	33.3	87	37	12	0	8	8	supported (host)
+apply_apl_dimming_lpf	fragment	APL dimming	pass	made	35.6	30	9	2	0	8	8	supported (host)
+image_rect_blit_frag_lpf	fragment	image blit	pass	made	45.5	31	8	1	0	6	4	supported (host)
+variable_blur_copy_base_mip_compute	kernel	backdrop filter: variable blur	pass	made	2.4							supported (host)
+variable_blur_downsample_compute	kernel	backdrop filter: variable blur	pass	made	2.6							supported (host)
+variable_blur_downsample_compute_agx2	kernel	backdrop filter: variable blur	pass	made	5.1							supported (host)
+read_write_surf_compute	kernel	surface copy	pass	made	3.0							supported (host)
+compute_apl	kernel	APL (OLED dimming)	pass	made	6.5							supported (host)
+compute_apl_fast	kernel	APL (OLED dimming)	pass	made	4.6							supported (host)
+sum_apl_and_compute_dimming_factor	kernel	APL	pass	made	3.6							supported (host)
+rgb_to_420f	kernel	video conversion	pass	made	1.6							supported (host)
+compute_average_luma	kernel	average luma	pass	made	5.8							supported (host)
+compute_sum_luma	kernel	average luma	pass	made	5.2							supported (host)
+tile_downsample_1	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	0.7							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_downsample_2	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	0.7							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_downsample_4	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	0.8							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_downsample_8	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	0.6							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_simd_blur_27	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	1.1							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_simd_blur_23	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	1.3							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_simd_blur_19	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	1.0							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_simd_blur_15	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	0.9							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_simd_blur_11	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	0.7							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_simd_blur_7	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	1.2							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_simd_blur_5	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	1.0							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_average_luma	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	1.0							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+tile_average_luma_quad	kernel	Apple tile shader (imageblocks)	pass	refused: compute pipeline: Compile(NeedsInput(TileAttachments))	1.2							not used: supportsTileShaders NO (no Turnip imageblocks); CA has a render-pass path [I]
+std_vert0_lph	vertex	plain quads	pass	vertex: compiled with its fragment								supported (host)
+std_vert1_lph	vertex	plain quads	pass	vertex: compiled with its fragment								supported (host)
+std_vert2_lph	vertex	plain quads	pass	vertex: compiled with its fragment								supported (host)
+upsample_vert_lph	vertex	blur upsample	pass	vertex: compiled with its fragment								supported (host)
+downsample_blur_vert_lph	vertex	backdrop filter: blur downsample	pass	vertex: compiled with its fragment								supported (host)
+asg_vert_lph	vertex	adaptive scale (ASG) image resample	pass	vertex: compiled with its fragment								supported (host)
+variable_blur_vert_lph	vertex	backdrop filter: variable blur	pass	vertex: compiled with its fragment								supported (host)
+sdf_filter_vert_lph	vertex	SDF generation (rounded rects, glass shapes)	pass	vertex: compiled with its fragment								supported (host)
+path_cubic_vert_0_lph	vertex	path rendering (shapes)	pass	vertex: compiled with its fragment								supported (host)
+path_cubic_vert_1_lph	vertex	path rendering (shapes)	pass	vertex: compiled with its fragment								supported (host)
+path_rect_vert_lph	vertex	path rendering (shapes)	pass	vertex: compiled with its fragment								supported (host)
+path_stroke_curve_vert_lph	vertex	path rendering (shapes)	pass	vertex: compiled with its fragment								supported (host)
+path_blit_vert_lph	vertex	path rendering (shapes)	pass	vertex: compiled with its fragment								supported (host)
+buffer_image_blit_vert_lph	vertex	image upload	pass	vertex: compiled with its fragment								supported (host)
+stroke_line_vert_lph	vertex	strokes	pass	vertex: compiled with its fragment								supported (host)
+image_rect_blit_vert_lph	vertex	image blit	pass	vertex: compiled with its fragment								supported (host)
+read_surf_vert	vertex	surface readback	pass	vertex: compiled with its fragment								supported (host)
+upsample_frag_lph	fragment	blur upsample	pass	made	20.7	152	28	4	0	5	8	supported (host)
+resolve_blur_weight_frag_lph	fragment	blur resolve	pass	made	15.2	71	38	2	0	4	8	supported (host)
+downsample_4_frag_lph	fragment	blur / mip downsample	pass	made	33.3	42	7	4	0	24	4	supported (host)
+downsample_8_frag_lph	fragment	blur / mip downsample	pass	made	48.2	118	3	16	0	16	8	supported (host)
+downsample_6_frag_lph	fragment	blur / mip downsample	pass	made	22.4	56	8	6	0	16	4	supported (host)
+asg_frag_lph	fragment	adaptive scale (ASG) image resample	pass	made	78.9	593	61	12	0	24	12	supported (host), costly: 593 instructions a pixel
+asg_75_frag_lph	fragment	adaptive scale (ASG) image resample	pass	made	45.8	291	21	8	0	12	12	supported (host)
+asg_50_frag_lph	fragment	adaptive scale (ASG) image resample	pass	made	64.0	376	28	12	0	16	8	supported (host), costly: 376 instructions a pixel
+downsample_blur_2_frag_lph	fragment	backdrop filter: blur downsample	pass	made	47.4	61	8	7	0	16	4	supported (host)
+downsample_blur_4_frag_lph	fragment	backdrop filter: blur downsample	pass	made	40.3	103	8	13	0	24	8	supported (host)
+narrow_blur_7_frag_lph	fragment	backdrop filter: Gaussian blur	pass	made	47.3	80	19	4	0	16	8	supported (host)
+narrow_blur_11_frag_lph	fragment	backdrop filter: Gaussian blur	pass	made	26.4	94	19	6	0	24	8	supported (host)
+narrow_blur_15_frag_lph	fragment	backdrop filter: Gaussian blur	pass	made	23.3	108	19	8	0	24	8	supported (host)
+narrow_blur_19_frag_lph	fragment	backdrop filter: Gaussian blur	pass	made	25.2	122	19	10	0	24	12	supported (host)
+narrow_blur_23_frag_lph	fragment	backdrop filter: Gaussian blur	pass	made	24.6	136	19	12	0	24	12	supported (host)
+narrow_blur_27_frag_lph	fragment	backdrop filter: Gaussian blur	pass	made	49.2	150	19	14	0	24	12	supported (host)
+single_pass_blur_3_lph	fragment	small blur	pass	made	25.9	80	19	4	0	24	8	supported (host)
+variable_blur_downsample_frag_lph	fragment	backdrop filter: variable blur	pass	made	30.4	98	5	13	0	12	8	supported (host)
+variable_blur_clamp_downsample_frag_lph	fragment	backdrop filter: variable blur	pass	made	27.1	113	6	13	0	12	8	supported (host)
+variable_blur_frag_lph	fragment	backdrop filter: variable blur	pass	made	39.6	147	51	6	0	24	8	supported (host)
+axial_shading_frag_lph	fragment	gradient	pass	made	17.2	26	7	1	0	8	4	supported (host)
+radial_shading_frag_lph	fragment	gradient	pass	made	32.2	59	18	2	0	16	8	supported (host)
+radial_complex_shading_frag_lph	fragment	gradient	pass	made	36.5	166	65	2	0	16	12	supported (host)
+conic_shading_frag_lph	fragment	gradient	pass	made	18.9	138	58	2	0	8	12	supported (host)
+chromatic_aberration_lph	fragment	chromatic aberration filter	pass	made	19.2	81	15	3	0	16	8	supported (host)
+displacement_map_lph	fragment	displacement filter	pass	made	43.2	36	14	2	0	16	4	supported (host)
+chromatic_aberration_map_lph	fragment	chromatic aberration filter	pass	made	36.2	68	20	4	0	12	8	supported (host)
+alpha_smooth_threshold_lph	fragment	alpha filters	pass	made	19.6	63	36	1	0	9	8	supported (host)
+alpha_threshold_lph	fragment	alpha filters	pass	made	21.0	136	29	4	0	12	8	supported (host)
+p3_clamp_lph	fragment	wide-gamut clamp	pass	made	27.6	210	85	7	0	3	8	supported (host)
+edr_clamp_lph	fragment	EDR	pass	made	30.5	195	51	7	0	9	12	supported (host)
+color_edr_lph	fragment	EDR	pass	made	30.7	190	85	5	0	6	8	supported (host)
+alpha_linear_premultiply_lph	fragment	alpha filters	pass	made	25.5	178	77	7	0	3	4	supported (host)
+home_affordance_base_lph	fragment	home bar	pass	made	33.7	76	12	2	0	8	8	supported (host)
+simple_rim_lph	fragment	SDF rim light	pass	made	262.2	6066	3679	261	0	12	12	supported (host), heavy: 6066 instructions a pixel
+brim_init_lph	fragment	SDF rim, jump flood	pass	made	17.0	69	21	5	0	4	8	supported (host)
+brim_jump_lph	fragment	SDF rim, jump flood	pass	made	36.8	609	333	27	0	8	8	supported (host), costly: 609 instructions a pixel
+sdf_gen_field_lph	fragment	SDF generation (rounded rects, glass shapes)	pass	made	33.6	77	30	3	0	6	8	supported (host)
+sdf_gen_gradients_lph	fragment	SDF generation (rounded rects, glass shapes)	pass	made	45.4	72	27	5	0	6	8	supported (host)
+brim_outline_lph	fragment	SDF rim, jump flood	pass	made	37.4	277	128	3	0	24	16	supported (host)
+rim_outline_lph	fragment	SDF rim	pass	made	28.1	184	73	3	0	12	8	supported (host)
+edr_scale_lph	fragment	EDR	pass	made	32.3	179	67	8	0	5	8	supported (host)
+luma_boost_lph	fragment	luma	pass	made	42.2	38	19	2	0	8	8	supported (host)
+glass_background_lph	fragment	Liquid Glass, backdrop refraction + blur	pass	made	67.4	837	344	11	0	24	32	supported (host), costly: 837 instructions a pixel
+glass_background_no_bleed_lph	fragment	Liquid Glass, backdrop refraction + blur	pass	made	60.9	719	296	10	0	24	28	supported (host), costly: 719 instructions a pixel
+glass_background_sdf_lph	fragment	Liquid Glass, backdrop refraction + blur	pass	made	114.1	1703	491	9	0	48	56	supported (host), heavy: 1703 instructions a pixel
+glass_background_sdf_no_bleed_lph	fragment	Liquid Glass, backdrop refraction + blur	pass	made	105.0	1585	443	8	0	48	48	supported (host), heavy: 1585 instructions a pixel
+glass_foreground_lph	fragment	Liquid Glass, top layer	pass	made	30.3	194	27	12	0	24	16	supported (host)
+glass_foreground_sdf_lph	fragment	Liquid Glass, top layer	pass	made	86.2	686	86	11	0	48	28	supported (host), costly: 686 instructions a pixel
+path_cubic_frag_lph	fragment	path rendering (shapes)	pass	made	22.2	1	0	0	0	0	0	supported (host)
+path_rect_frag_lph	fragment	path rendering (shapes)	pass	made	23.8	1	0	0	0	0	0	supported (host)
+path_stroke_curve_frag_lph	fragment	path rendering (shapes)	pass	made	23.7	1	0	0	0	0	0	supported (host)
+path_clear_frag_lph	fragment	path rendering (shapes)	pass	made	20.5	1	0	0	0	0	0	supported (host)
+path_blit_frag_lph	fragment	path rendering (shapes)	pass	made	19.6	80	27	1	0	5	4	supported (host)
+path_blit_frag_eo_lph	fragment	path rendering (shapes)	pass	made	19.4	86	26	1	0	5	4	supported (host)
+buffer_image_blit_frag_lph	fragment	image upload	pass	made	24.7	93	49	1	0	4	8	supported (host)
+attachment_clear_frag_lph	fragment	clear	pass	made	21.3	5	0	0	0	1	0	supported (host)
+inplace_copy_lph	fragment	framebuffer in-place copy (raster order groups)	unsupported: RasterOrderGroups; needs AnyOf([[Feature(FragmentShaderPi	not asked								fails, not needed if CA reads supportsRasterOrderGroups NO [I]: no pixel interlock on Turnip FD610
+stroke_line_frag_lph	fragment	strokes	pass	made	22.2	62	8	0	0	5	4	supported (host)
+stroke_arc_frag_lph	fragment	strokes	pass	made	18.3	87	37	12	0	8	8	supported (host)
+apply_apl_dimming_lph	fragment	APL dimming	pass	made	17.2	31	10	2	0	8	8	supported (host)
+image_rect_blit_frag_lph	fragment	image blit	pass	made	26.1	31	8	1	0	6	4	supported (host)
+read_surf_frag	fragment	surface readback	pass	made	41.9	34	11	1	0	3	8	supported (host)
+read_surf_frag_rg_uint	fragment	surface readback	pass	made	29.4	66	19	1	0	3	8	supported (host)
+ca_generic_lph_cph (fixed_vert_lph_gen + fixed_frag_lph_cph, fc_generic=1)	fragment	CA's uber-shader: every draw until a specialized pipeline exists	pass	made	4610.1	63688	24552	304	140	48	504	supported (host), heavy: 63688 instructions in the binary, only the taken branches run

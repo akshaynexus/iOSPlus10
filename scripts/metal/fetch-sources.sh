@@ -63,6 +63,20 @@ for p in "$METAL"/patches/flame/*.patch; do
   echo "applied flame/$(basename "$p")"
 done
 
+# A second tree (scripts/laurel/ios26-metal-build.sh) adds its own frontend + bridge patches and metal2vulkan patches last. Unset: nothing.
+for d in ${METAL_EXTRA_FLAME:-}; do
+  for p in "$d"/*.patch; do
+    [ -f "$p" ] || continue
+    git -C "$FLAME_SRC" apply --whitespace=nowarn "$p" || { echo "$(basename "$p") does not apply" >&2; exit 1; }
+    echo "applied extra $(basename "$p")"
+  done
+done
+for p in ${METAL_EXTRA_M2V:+"$METAL_EXTRA_M2V"/*.patch}; do
+  [ -f "$p" ] || continue
+  git -C "$M2V" apply --whitespace=nowarn "$p" || { echo "$(basename "$p") does not apply" >&2; exit 1; }
+  echo "applied extra $(basename "$p")"
+done
+
 # 3. Rust toolchain
 if command -v rustup >/dev/null; then
   if ! rustup toolchain list | grep -q "^$RUST_TOOLCHAIN"; then

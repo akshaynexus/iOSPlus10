@@ -474,6 +474,119 @@ def air(t, work, script=None):
     shutil.rmtree(stage, ignore_errors=True)
 
 
+def metal(t, work, script=None):
+    """The default Metal stack: scripts/laurel/root-add-metal-ios26.sh (docs/laurel_sprout/ios26-metal.md section 9). That script writes to a root, and this build has no writable mount, so it runs on
+    a stage that has the plists it edits, and what it leaves goes into the image, owner 0:0, modes as it set them. It fails or it is off: the root is built with no compositor and one audit line
+    `off metal26`, and ios26-root.sh prints that line at its end. 23F84 has no GL path, so such a root shows no picture."""
+    import shutil
+    import subprocess
+    script = script or os.path.join(REPO, 'scripts', 'laurel', 'root-add-metal-ios26.sh')
+    stage = os.path.join(work, 'metal-stage')
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(os.path.join(stage, 'System/Library/Extensions'))
+    os.makedirs(os.path.join(stage, 'usr/libexec'))
+    marker = os.path.join(stage, 'usr/libexec/backboardd')      # the script's check that this is a root: the real one stays
+    if not t.exists('usr/libexec/backboardd'):
+        t.audit('metal26', 'off', 'no /usr/libexec/backboardd in the tree: no compositor on this root')
+        return
+    open(marker, 'wb').close()
+    jets = [k for k in t.n if k.startswith(b'System/Library/LaunchDaemons/com.apple.jetsamproperties.') and k.endswith(b'.plist')]
+    if jets:
+        os.makedirs(os.path.join(stage, 'System/Library/LaunchDaemons'))
+    for k in jets:
+        with open(os.path.join(stage.encode(), k), 'wb') as f:
+            f.write(t.read(k))
+    r = subprocess.run(['sh', script, stage], capture_output=True, text=True, preexec_fn=lambda: os.umask(0o022))
+    said = [x for x in (r.stdout + r.stderr).strip().splitlines() if 'laurel-root: metal26:' in x]
+    bundle = os.path.join(stage, 'System/Library/Extensions/NegroniMetal.bundle/NegroniMetal')
+    if r.returncode != 0 or not os.path.exists(bundle):
+        t.audit('metal26', 'off', said[-1] if said else ((r.stderr or r.stdout).strip().splitlines() or ['no output'])[-1])
+        shutil.rmtree(stage, ignore_errors=True)
+        return
+    os.unlink(marker)
+    prefs = {}
+    files = 0
+    for dirp, dirs, names in os.walk(stage):
+        dirs.sort()
+        rel = os.path.relpath(dirp, stage).encode()
+        rel = b'' if rel == b'.' else rel
+        if rel and rel not in t.n:
+            t.mkdirs(os.path.dirname(rel))
+            t.n[rel] = Node('d', stat.S_IMODE(os.stat(dirp).st_mode), 0, 0, t.mtime, b'')
+        for n in sorted(names):
+            q = os.path.join(rel, n.encode()) if rel else n.encode()
+            full = os.path.join(dirp, n)
+            with open(full, 'rb') as f:
+                data = f.read()
+            if q.endswith(b'/Library/Preferences/com.apple.backboardd.plist'):
+                prefs = plistlib.loads(data)    # the home folders have their own owners: merged below, not written from the stage
+            elif q in t.n and t.n[q].kind == 'f':
+                t.write(q, data)
+                files += 1
+            else:
+                t.write(q, data, stat.S_IMODE(os.stat(full).st_mode), 0, 0)
+                files += 1
+    if prefs:
+        merge_pref(t, 'com.apple.backboardd', prefs)
+    t.audit('metal26', 'applied', f'{files} files; {said[-1] if said else "no line"}')
+    shutil.rmtree(stage, ignore_errors=True)
+
+
+def metal_self_test(d):
+    """The hook with the real script on the real stage (out/ios26/metal/stage). None: no stage, not run."""
+    import shutil
+    S = os.environ.get('METAL_STAGE') or os.path.join(REPO, 'out/ios26/metal/stage')
+    work = os.path.join(d, 'mw')
+    os.makedirs(os.path.join(work, 'overlay'))
+    t = Tree(work)
+    src = os.path.join(d, 'bb')
+    open(src, 'wb').close()
+    t.mkdirs(b'usr/libexec')
+    t.mkdirs(b'private/var/mobile/Library/Preferences', 0o755, MOBILE, MOBILE)
+    t.n[b'usr/libexec/backboardd'] = Node('f', 0o755, 0, 0, 5, src.encode())
+    # no backboardd in the tree: off, no change
+    t0 = Tree(work)
+    metal(t0, work)
+    checks = [any(x.startswith('off') and 'metal26' in x for x in t0.audit_lines), not t0.n]
+    # no stage: off, no bundle
+    env = os.environ.get('METAL_STAGE')
+    t1 = Tree(work)
+    t1.mkdirs(b'usr/libexec')
+    t1.n[b'usr/libexec/backboardd'] = Node('f', 0o755, 0, 0, 5, src.encode())
+    os.environ['METAL_STAGE'] = os.path.join(d, 'absent')
+    metal(t1, work)
+    if env is None:
+        del os.environ['METAL_STAGE']
+    else:
+        os.environ['METAL_STAGE'] = env
+    checks += [any(x.startswith('off') and 'metal26' in x for x in t1.audit_lines), b'System/Library/Extensions/NegroniMetal.bundle/NegroniMetal' not in t1.n]
+    if not os.path.isdir(S):
+        print(f'metal hook self-test: {sum(checks)} of {len(checks)}; real stage not run: no {S}')
+        return all(checks)
+    metal(t, work)
+    B = b'System/Library/Extensions/NegroniMetal.bundle/'
+    db = b'private/var/db/negronimetal/'
+    with open(os.path.join(S, 'System/Library/Extensions/NegroniMetal.bundle/NegroniMetal'), 'rb') as f:
+        same = f.read() == t.read(B + b'NegroniMetal')
+    pref = b'private/var/mobile/Library/Preferences/com.apple.backboardd.plist'
+    checks += [
+        same,
+        t.n[B + b'NegroniMetal'].uid == 0,
+        t.n[B + b'libvulkan_freedreno.dylib'].mode & 0o111 != 0 or t.n[B + b'libvulkan_freedreno.dylib'].mode & 0o444 == 0o444,
+        t.n[db + b'cache'].mode == 0o1777 and t.n[db + b'strikes'].mode == 0o1777 and t.n[db + b'stack'].mode == 0o777,
+        t.n[db + b'metal.log'].mode == 0o666,
+        t.exists(db + b'clients') and t.exists(db + b'env') and t.exists(db + b'build.txt'),
+        b'-PosterBoard' in t.read(db + b'clients'),
+        t.n[b'usr/libexec/backboardd'].src == src.encode(),
+        t.n[pref].uid == MOBILE and plistlib.loads(t.read(pref))['CAEnableFramebufferCompression'] is False,
+        not t.exists(B + b'options') and not t.exists(b'Applications/XNUtils.app'),
+        any(x.startswith('applied') and 'metal26' in x for x in t.audit_lines),
+    ]
+    print(f'metal hook self-test: {sum(checks)} of {len(checks)}, real stage {S}; {[x for x in t.audit_lines if "metal26" in x][-1]}')
+    print('  ' + ' '.join(f'{i}:{"ok" if c else "FAIL"}' for i, c in enumerate(checks)))
+    return all(checks)
+
+
 def self_test():
     """The air hook with a stand-in script: its files, owners, a removed job, a failure, a missing script. Host only, no donor files."""
     import shutil
@@ -531,8 +644,9 @@ echo "laurel-root: air-ios26: fake"
         n = dict(t.n)
         air(t, w, os.path.join(d, 'absent.sh'))
         checks += [set(t.n) == set(n), not t.audit_lines]
-    print(f'air hook self-test: {sum(checks)} of {len(checks)}')
-    sys.exit(0 if all(checks) else 1)
+        print(f'air hook self-test: {sum(checks)} of {len(checks)}')
+        ok_metal = metal_self_test(d)
+    sys.exit(0 if all(checks) and ok_metal else 1)
 
 
 def main():
@@ -620,6 +734,7 @@ def main():
     print('tweaks:')
     tweaks(t, a)
     air(t, work)
+    metal(t, work)
     trust(t, a, work)
     # a place for the reader of the first boot
     with open(os.path.join(work, 'audit.txt'), 'w') as f:

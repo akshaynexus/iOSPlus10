@@ -1,0 +1,26 @@
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -109,6 +109,14 @@
+ // NegroniMetal (flame/0008): every refused buffer, texture, library or pipeline is logged once per (what, reason) text with what was
+ // asked for (length, options, descriptor), so the plugin log names the refusal; the counters go on. At most 128 texts.
+ static std::mutex gScreenLock;static IOSurfaceRef gScreenSurface;
++// The compositor's frames for XNUtils' bench (NegroniMetal.mm): command buffers that wrote a screen-size surface, by ms from commit to GPU completion. The last bin holds 127 ms and more.
++static std::atomic<uint64_t> gPresentHist[128];
++static void notePresent(uint64_t committedUs) {
++ if(!committedUs)return;
++ const uint64_t now=nowUs(),ms=now>committedUs?(now-committedUs)/1000:0;
++ gPresentHist[ms>127?127:ms].fetch_add(1,std::memory_order_relaxed);
++}
++extern "C" void native_bridge_metal_present_hist(uint64_t out[128]) {for(int i=0;i<128;i++)out[i]=gPresentHist[i].load(std::memory_order_relaxed);}
+ static std::mutex gRefuseLock;static NSMutableSet *gRefuseSeen;
+ static void noteRefused(NSString *what,NSString *reason) {
+  NSString *text=[NSString stringWithFormat:@"%@: %@",what,reason?:@"?"];
+@@ -1457,6 +1465,7 @@
+    if(IOSurfaceGetWidth(r)<700 || IOSurfaceGetHeight(r)<1500)continue;
+    std::lock_guard<std::mutex> lock(gScreenLock);
+    CFRetain(r);if(gScreenSurface)CFRelease(gScreenSurface);gScreenSurface=r;
++   notePresent(self.committedUs);break;
+   }
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.

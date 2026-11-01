@@ -8,8 +8,13 @@
 #include <unistd.h>
 #include "collect.h"
 #define PATH_BUF 4096
+#ifdef XT_IOS26
+#define XT_SHARED               /* helper_ios26.c writes with them */
+#else
+#define XT_SHARED static
+#endif
 
-static int
+XT_SHARED int
 ensure_dir(const char *dir, mode_t mode)
 {
 	struct stat st;
@@ -25,7 +30,7 @@ ensure_dir(const char *dir, mode_t mode)
 }
 
 /* TEXT into PATH at once: PATH.new in the same folder (root:wheel 644), then rename */
-static int
+XT_SHARED int
 write_file(const char *path, const char *text)
 {
 	char tmp[PATH_BUF];
@@ -56,7 +61,7 @@ write_file(const char *path, const char *text)
 	return 0;
 }
 
-static int
+XT_SHARED int
 remove_file(const char *path)
 {
 	if (unlink(path) != 0 && errno != ENOENT) {

@@ -17,7 +17,7 @@ import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CACHE = os.path.join(REPO, "out", "metal", "spi", "exports")
+CACHE = os.environ.get("METAL_EXPORTS_CACHE") or os.path.join(REPO, "out", "metal", "spi", "exports")
 
 # what "(from X)" names in nm -m output, as cache image paths (libSystem and libc++ re-export several images)
 IMAGES = {

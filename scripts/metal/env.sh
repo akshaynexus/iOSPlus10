@@ -3,7 +3,7 @@
 . "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../lib" && pwd)/env.sh"
 
 METAL=$REPO/userland/metal                 # our sources
-MOUT=$OUT/metal                            # all build products
+MOUT=${METAL_OUT:-$OUT/metal}              # all build products (METAL_OUT: scripts/laurel/ios26-metal-build.sh, a second tree)
 MSRC=$MOUT/src                             # fetched sources
 
 # metal2vulkan: AIR -> SPIR-V translator + Metal object model on Vulkan (Rust; GPL-2.0+ OR LGPL-3.0+)
@@ -20,7 +20,7 @@ FLAME_SRC=$MSRC/flame
 
 # Turnip (libvulkan_freedreno.dylib): the one staged copy, written and checked by scripts/gpu/turnip-build.sh.
 # Override with TURNIP_DYLIB=... when it lives elsewhere.
-TURNIP_DYLIB=${TURNIP_DYLIB:-$OUT/gpu/turnip/libvulkan_freedreno.dylib}
+TURNIP_DYLIB=${TURNIP_DYLIB:-${GPU_OUT:-$OUT/gpu}/turnip/libvulkan_freedreno.dylib}
 
 IOS_MIN=${IOS_MIN:-16.0}
 PLUGIN_NAME=${PLUGIN_NAME:-NegroniMetal}         # bundle /System/Library/Extensions/NegroniMetal.bundle

@@ -1,6 +1,12 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+iOS 26 compositor on Metal round (2026-11-02, branch t3/laurel-ios26-metal, not merged; HOST ONLY, NOTHING RUN ON THE PHONE, no pixel and no frame time exists): docs/laurel_sprout/ios26-metal.md. Owner decision: the compositor runs on Metal through metal2vulkan + Turnip on the A610.
+Done: 23F84 SPI port + two stacks (`default`: metal2vulkan 219f013 + flame-ios26; `hot`: IOS-26-Hot's metal2vulkan 720ef1ce + 19 patches), one bundle with a selector, one setting, fallback to the default with a failure count, XNUtils options screen and bench, pipeline table, present path, kernel needs, performance estimate [I], iOS 16 test option (never default). Results: section 1 and 10 of that page, RESULT lines in docs/notes.md.
+Open [U]: which stack is better; pictures; speed; CA's real `fixed_frag` keys. If the default stack fails on 23F84 there is no GL below it. Kernel needs K1-K7 belong to t3/laurel-ios26-needs.
+First-boot root [owner]: default stack only, through `metal()` in `ios26-root-spec.py`. Merged origin/laurel-sprout a5c2e5d. Second stack, selector, XNUtils screen, bench: built + host-tested, not in that root, no more work until after the first boot.
+Next: build the default stack in the checkout that builds the root, then rebuild the root (commands: docs/laurel_sprout/ios26-metal.md section 9); read the audit line `metal26`; first boot; then the bench.
+
 iOS 26 gap closed + root built (2026-11-02, branch t3/laurel-ios26-needs, pushed, NOT merged; HOST ONLY, NEVER RUN, nothing flashed): kernel emulator with qemu truth test (21,673,528 cases, 0 mismatches), 16 KiB slide pages on a 4 KiB kernel (28,354,303 rebases, 0 differences), dyld flags, commpage truth, reach counts, user-client ABI of 23F84 (IOSurface, IOMFB, AKS), ports checked against IOS-26-Hot (a boot panic at SMP start fixed), Apple80211 of 23F84 (147 host checks, 14 cache words), root image 34,354,491,392 bytes built twice to the same SHA-256, read through a real read-only mount: 471,103 of 471,103 entries. docs/laurel_sprout/ios26-userland.md 7.1-7.4, 8.2, 8.3; ios26-root.md.
 Next: owner decides (1) merge; (2) the iOS 16 and negroni findings: 0081 ranges, LDUMIN, negroni `processor_start`; (3) C3, the compositor (Metal on A610, GLES hook, or iPadOS 18), still open: this work does not make a boot certain; (4) after the airdrop branch merges: build its binaries and FORCE=1 the root; (5) first boot only when the owner asks for a flash.
 
