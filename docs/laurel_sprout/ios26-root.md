@@ -86,7 +86,7 @@ Test [V]: `--self-test`: `metal hook self-test: 15 of 15` with the real script o
 - `/usr/share/laurel/root-manifest`: first line for `LAUREL BUILD: root ...` (patch 2912), with the commit's time, so the same commit gives the same bytes. It holds the kernel series of `out/laurel-kernel-ios26/out`: build the kernel first.
 - **Sizes and the hash of section 1 are from before these hooks. The image changes.** Run `ios26-root-again.sh` again.
 
-Tests [V]: section numbers in `docs/notes.md` entry "iOS 26 debug path".
+Tests [V]: `--self-test`: `debug hook self-test: 27 of 27`, with the real binaries of `out/ssh/ios` and scratch keys (job, USB address only, owners, modes, links, kill switch, missing tool; the job stays when Metal and AirDrop fail); with `METAL_STAGE` of the real stage also `metal hook self-test: 15 of 15`. Real 23F84 build with `ROOT_OUT` (scratch path, the shared image was not touched), twice: no Metal stage (`off metal26`, `applied debug-ios26`), and with the Metal stage. Each: `hfs-verify` OK, `fsck` OK, kernel read-only mount 0 differ; job, binaries and keys read back from the image.
 
 ## 5. What is not proven
 
