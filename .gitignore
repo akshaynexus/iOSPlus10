@@ -11,6 +11,7 @@
 *.adt
 getvar*.txt
 backup/
+!scripts/backup/
 dumps/
 out/
 inputs/
@@ -56,3 +57,7 @@ external/*.partial/
 external/ios-sweet-umi/
 external/ios-topaz-evergo/
 external/ios-redfin/
+external/IOS-26-Hot/
+external/hakios-dada/
+external/AdrenoMetal/
+external/Bergamota/

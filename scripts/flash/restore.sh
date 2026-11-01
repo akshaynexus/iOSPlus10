@@ -7,7 +7,8 @@
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 I=$BACKUP/images
-"$REPO/scripts/laurel/android-guard.sh" other-device   # this script is for the OnePlus 10 Pro; the Mi A3 holds Android
+G=$REPO/scripts/laurel/android-guard.sh
+"$G" other-device   # this script is for the OnePlus 10 Pro, and the phone must say so; the Mi A3 holds Android
 [ "${CONFIRM:-}" = yes ] || { echo "this rewrites slot a boot partitions (and formats userdata): run with CONFIRM=yes" >&2; exit 1; }
 WIPE=yes; BOOT=$I/boot.img
 for a in "$@"; do
@@ -25,11 +26,12 @@ if fastboot getvar is-userspace 2>&1 | grep -q "is-userspace: yes"; then
   fastboot reboot bootloader; sleep 5
   i=0; until [ -n "$(fastboot devices)" ]; do i=$((i+1)); [ $i -lt 120 ] || exit 1; sleep 1; done
 fi
+"$G" other-device-fastboot   # again, right before the first write: the phone that reached fastboot is what gets written
 fastboot flash boot_a "$BOOT"
 fastboot flash vendor_boot_a "$I/vendor_boot.img"
 fastboot flash dtbo_a "$I/dtbo.img"
 fastboot flash vbmeta_a "$I/vbmeta.img"
-[ "$WIPE" = yes ] && fastboot -w
+if [ "$WIPE" = yes ]; then "$G" other-device-fastboot; fastboot -w; fi
 fastboot set_active a
 fastboot reboot
 echo "restored slot a to stock$( [ "$WIPE" = yes ] && echo ', userdata formatted')"
