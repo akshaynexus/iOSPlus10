@@ -1,12 +1,14 @@
 /*
- * usbnetcfg: make the USB Ethernet link (ue0) the network service iOS uses.
+ * usbnetcfg: internet for iOS through the host, over the USB Ethernet link (ue0).
  *
- * The kernel (negroniusb=2) already gives ue0 192.168.7.2/24. That is enough for SSH, but
- * iOS has no default route and no DNS servers: configd's IPConfiguration agent never
- * configures ue0 (the reference ports saw the same, even with a preferences.plist service).
- * This tool writes the dynamic-store keys that IPConfiguration would write for a manual
- * service. IPMonitor then makes ue0 the primary service (default route via the Mac) and
- * gives mDNSResponder the DNS servers.
+ * The kernel (negroniusb=2) already gives ue0 192.168.7.2/24. That is all SSH and the USB log need, so a
+ * normal root does not run this tool at boot: a default route through ue0 is a black hole without host
+ * NAT, and it takes the default route and DNS from Wi-Fi (laurel boot 2026-11-01 22:35: Wi-Fi joined,
+ * no DNS on en0, no page loads; docs/usb-network.md "ue0 and Wi-Fi").
+ *
+ * scripts/net/share-internet.sh runs "up" when the host NAT is on and "down" when it goes off. "up" writes
+ * the dynamic-store keys that IPConfiguration would write for a manual service, with PrimaryRank Last:
+ * IPMonitor uses ue0 for the default route and DNS only while no other service (Wi-Fi) has a router.
  *
  *   usbnetcfg [options] [up]   wait for configd + the interface, publish, check (default)
  *   usbnetcfg down             remove the keys
@@ -15,9 +17,9 @@
  *          -d DNS[,DNS2] (1.1.1.1,8.8.8.8) -s SERVICE-UUID -t WAIT-SECONDS (120) -n (no route
  *          fallback)
  *
- * If IPMonitor does not install a default route within a few seconds, "up" adds one through
- * a routing socket (connectivity by IP; names still need IPMonitor's DNS state).
- * Exit 0 when the keys are published or when the interface never appears (no USB network
+ * If no service at all is primary within a few seconds, "up" adds a default route through a routing
+ * socket (connectivity by IP; names still need IPMonitor's DNS state). Never while another service is
+ * primary. Exit 0 when the keys are published or when the interface never appears (no USB network
  * on this boot), so a launchd job with KeepAlive.SuccessfulExit=false does not loop.
  *
  * Approach from ios-flame phone/tools/netsvc.m (MIT, NWylynko/ios-flame); this file is our
@@ -264,6 +266,7 @@ main(int argc, char **argv)
 		return 1;
 	}
 
+	CFStringRef k_svc = fmt("State:/Network/Service/%s", service);
 	CFStringRef k_v4 = fmt("State:/Network/Service/%s/IPv4", service);
 	CFStringRef k_dns = fmt("State:/Network/Service/%s/DNS", service);
 	CFStringRef k_if = fmt("State:/Network/Interface/%s/IPv4", ifname);
@@ -293,20 +296,22 @@ main(int argc, char **argv)
 	if (!strcmp(cmd, "show")) {
 		print_value(st, CFSTR("State:/Network/Global/IPv4"));
 		print_value(st, CFSTR("State:/Network/Global/DNS"));
+		print_value(st, k_svc);
 		print_value(st, k_v4);
 		print_value(st, k_dns);
 		print_value(st, k_if);
 		return 0;
 	}
 	if (!strcmp(cmd, "down")) {
-		const void *keys[] = { k_v4, k_dns, k_if };
-		CFArrayRef rm = CFArrayCreate(NULL, keys, 3, &kCFTypeArrayCallBacks);
+		const void *keys[] = { k_svc, k_v4, k_dns, k_if };
+		CFArrayRef rm = CFArrayCreate(NULL, keys, 4, &kCFTypeArrayCallBacks);
 		Boolean ok = sc_set_multiple(st, NULL, rm, NULL);
 		printf("usbnetcfg: remove %s keys: %s\n", ifname, ok ? "ok" : sc_err());
 		return ok ? 0 : 1;
 	}
 
-	CFMutableDictionaryRef v4 = dict(), d = dict(), ifv4 = dict(), all = dict();
+	CFMutableDictionaryRef svc = dict(), v4 = dict(), d = dict(), ifv4 = dict(), all = dict();
+	put(svc, "PrimaryRank", str("Last"));   /* kSCPropNetServicePrimaryRank: Wi-Fi with a router goes first (configd 20H392 has the key) */
 	put(v4, "Addresses", list(addr));
 	put(v4, "SubnetMasks", list(mask));
 	put(v4, "Router", str(router));
@@ -315,11 +320,12 @@ main(int argc, char **argv)
 	put(d, "ServerAddresses", list(dns));
 	put(ifv4, "Addresses", list(addr));
 	put(ifv4, "SubnetMasks", list(mask));
+	CFDictionarySetValue(all, k_svc, svc);
 	CFDictionarySetValue(all, k_v4, v4);
 	CFDictionarySetValue(all, k_dns, d);
 	CFDictionarySetValue(all, k_if, ifv4);
 	Boolean ok = sc_set_multiple(st, all, NULL, NULL);
-	printf("usbnetcfg: publish %s %s/%s router %s dns %s (service %s): %s\n", ifname, addr, mask,
+	printf("usbnetcfg: publish %s %s/%s router %s dns %s, rank last (service %s): %s\n", ifname, addr, mask,
 	    router, dns, service, ok ? "ok" : sc_err());
 	if (!ok) {
 		return 1;
@@ -333,8 +339,10 @@ main(int argc, char **argv)
 	}
 	if (!strcmp(primary, ifname)) {
 		printf("usbnetcfg: %s is the primary interface\n", ifname);
+	} else if (primary[0] != 0) {
+		printf("usbnetcfg: primary interface is '%s': it stays first, %s is only the fallback\n", primary, ifname);
 	} else {
-		printf("usbnetcfg: primary interface is '%s', not %s\n", primary, ifname);
+		printf("usbnetcfg: no primary interface\n");
 		if (route_fallback) {
 			int r = add_default_route(router);
 			printf("usbnetcfg: default route via %s: %s\n", router,

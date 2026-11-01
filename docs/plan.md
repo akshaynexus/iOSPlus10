@@ -994,3 +994,11 @@ Done: kernel: mode read every 10 s until online (the blocker), NAS bind retries 
 Not built, and said so: data, SMS, voice, Settings pane content. Modem restart: not realistic blind, reasons in 9.5. A modem assert with `IPA_TEST=1` still stops Wi-Fi for that boot.
 Build [V, merged with 80072a9]: 297/297 patches, 0 LSE, printf-arg-check OK, kernel sha256 010bc6a6ebc346dc, series 6affe41bed8fd86f; armv80-check 21 (kernel, same count as before), dylib 0, laurel-springboard 0. test-cell 15/15, test-ipa PASS (vendor image part skipped), build-honest-test 60/60, xnutils-test PASS. Root image not built: no sudo here.
 Next: step A then step B of section 10, on the phone.
+
+## Mi A3: Wi-Fi up, no page loads; SSH login (2026-11-01, branch t3/laurel-safari-net, patch 2888, `userland/ssh/laurelnet.c`; build + dry run, NOT BOOTED)
+Owner: "Wi-Fi is fine, but fast.com and speedtest don't load." Docs: docs/laurel_sprout/wifi.md "No page loads", docs/usb-network.md "ue0 and Wi-Fi", "Login".
+Cause [V config and boots, I on the phone]: `usbnetcfg` (new in the root with SSH) gave default route and DNS to ue0, a host without NAT. Queue, link, Safari's crashes: not the cause.
+Done: no `usbnetcfg` at boot, USB service without router or DNS, rank Last; `share-internet.sh` runs it; `LAUREL NET:` line; `dns asked N (v6 N)`; repo SSH key, `alpine` fallback without a prompt.
+Not done, cause [U]: reason of the two sig 6 crashes: read over SSH now.
+Next: owner's test 1 (no build: `usbnetcfg show` + `down` on the running phone), then root + kernel build and flash (owner approves).
+

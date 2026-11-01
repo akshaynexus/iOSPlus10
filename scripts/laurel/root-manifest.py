@@ -107,7 +107,12 @@ def check_xnutils(root):
 
 
 def check_ssh(root):
-    return [] if job(root, 'dev.iosplus10.dropbear') else ['no dev.iosplus10.dropbear job in the launchd cache']
+    bad = [] if job(root, 'dev.iosplus10.dropbear') else ['no dev.iosplus10.dropbear job in the launchd cache']
+    if not job(root, 'dev.iosplus10.laurelnet'):
+        bad.append('no dev.iosplus10.laurelnet job in the launchd cache: no LAUREL NET line')
+    if job(root, 'dev.iosplus10.usbnetcfg') and os.environ.get('USBNET_INTERNET') != '1':
+        bad.append('dev.iosplus10.usbnetcfg job in the launchd cache: USB takes the default route and DNS from Wi-Fi')
+    return bad
 
 
 def need_flashlight():
@@ -161,8 +166,8 @@ FEATURES = [
          stage=[XNU + 'Applications/XNUtils.app/XNUtils', XNU + 'usr/local/libexec/powermenu-helper', XNU + 'usr/local/bin/pmregister'],
          trees=[XNU], sources=['userland/laurel/xnutils', 'userland/rebootapp'],
          root=['Applications/XNUtils.app/XNUtils', 'Applications/XNUtils.app/Info.plist', 'usr/local/libexec/powermenu-helper', 'usr/local/bin/pmregister'], check=check_xnutils),
-    dict(name='ssh', switch='SSH', build='userland/ssh/fetch.sh, fetch-sdk.sh, build.sh', stage=['out/ssh/ios/dropbearmulti'], trees=['out/ssh/ios'],
-         sources=['userland/ssh'], root=['usr/local/bin/dropbearmulti'], check=check_ssh),
+    dict(name='ssh', switch='SSH', build='userland/ssh/fetch.sh, fetch-sdk.sh, build.sh', stage=['out/ssh/ios/dropbearmulti', 'out/ssh/ios/laurelnet'], trees=['out/ssh/ios'],
+         sources=['userland/ssh'], root=['usr/local/bin/dropbearmulti', 'usr/local/bin/laurelnet'], check=check_ssh),
 ]
 
 def off_by_switch(f):

@@ -63,7 +63,7 @@ Built or host-tested only. No log line exists. Treat each as unknown, not as wor
 | 2895 + Mesa 0001, page tables and NULL fix | fixes sig 11 of backboardd at 20:16:15 and `cannot be entered` x16 | Cause in plan is [V] per its author; I saw the crash and the lines, and did not symbolize it | No `cannot be entered` under poster load |
 | 0004 + flame/0020, widgets and XR colours | "every format converted" | Not booted. Owner's blank widgets and false colours are open until then. Black wallpaper is [U] in the plan itself | `redwood-gl: contents` lines; the screen |
 | Camera crash fix (fc10042) | crash loop ended | Mock tests only | No `CRASH mediaserverd` during Camera |
-| 2880-2886 Wi-Fi path | stalls, bars | `on` lines are in boot 20:02, but no join in that boot. So no traffic has crossed them | `wifi.md` test steps, after a join |
+| 2880-2886 Wi-Fi path | stalls, bars | Boot 22:35 joined: light traffic crossed them, queue healthy. No page loaded: `usbnetcfg` took the default route (`wifi.md` "No page loads"). No burst has crossed them | `LAUREL NET:` line, then `wifi.md` test steps |
 | 2872 panel stays awake | black screen fix | `LAUREL PANEL: on` in boot 20:02. Wake not checked by me | Lock and unlock in a log |
 | 2902, 2904, 2905, 2906, 2910 | ports, grants | Merged 20:38, no line in any log. 2904 is a software keybag: unknown selectors answer unsupported | `LAUREL SSD/AKS/USB POLL/WIRED` |
 | 2302 charge mode, 2700 haptic UI line | built | No line in any log I searched | Their own lines |
