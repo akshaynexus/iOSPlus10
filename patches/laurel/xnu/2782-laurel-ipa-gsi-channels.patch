@@ -1,0 +1,915 @@
+laurel 2782: IPA v4.2 (GSI 2.2): the AP allocates all GSI channels, the modem's too, before QMI INIT_MODEM_DRIVER (ipa3_post_init -> ipa3_alloc_gsi_channel; mainline gsi.c modem_alloc): 2780 did not, and the modem firmware asserted ipa_hal.c:6001 "Failed to initialize GSI channel: CHID 1 errval 6" 105 ms after INIT_MODEM_DRIVER, which stopped Wi-Fi (USB log 2026-11-01 17:01). New: bsd/dev/laurel_ipa_gsi.c (gsi_register_device without an interrupt handler + channel table of ipa3_ep_mapping[IPA_4_2] in pipe order; polled: EE 0 channels GSI_CH_ALLOCATE + context state, EE 1/2 generic command ALLOCATE with return code 1 as the only proof). laurel_ipa_link.c = the QMI 0x31 part of laurel_ipa.c, unchanged but for its last look at GSI_STATUS before NEW_SERVER. Self-checks before the modem hears of the IPA: registers, version and SHARED_MEM_SIZE read again after the firmware (stock reads them after it), IPA_ENABLED_PIPES and channels per EE, every channel allocated, GSI ERROR_LOG 0, every local memory word read back, SMEM 497. A failure: LAUREL IPA: off: <why>, no message to the modem. A modem assert after INIT_MODEM_DRIVER remains possible: docs/laurel_sprout/cellular.md section 8; uefi-image.sh keeps ipa=0 until a phone boot shows the evidence listed there.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 17:14:24.479845958 +0530
++++ b/bsd/conf/files	2026-11-01 17:14:24.496846116 +0530
+@@ -130,7 +130,9 @@
+ bsd/dev/laurel_ext4_dir.c		standard
+ bsd/dev/laurel_ipa.c			standard
+ bsd/dev/laurel_ipa_fw.c			standard
++bsd/dev/laurel_ipa_gsi.c		standard
+ bsd/dev/laurel_ipa_hw.c			standard
++bsd/dev/laurel_ipa_link.c		standard
+ bsd/dev/laurel_ipa_qmi.c		standard
+ bsd/dev/laurel_bt.c			standard
+ bsd/dev/laurel_bt_clk.c			standard
+diff -ruN a/bsd/dev/laurel_ipa.c b/bsd/dev/laurel_ipa.c
+--- a/bsd/dev/laurel_ipa.c	2026-11-01 17:14:24.425845456 +0530
++++ b/bsd/dev/laurel_ipa.c	2026-11-01 17:21:16.359140057 +0530
+@@ -5,15 +5,20 @@
+  * Order (one IPA thread, started when the modem is READY with GLINK up; UFS must be readable):
+  *   1. RPM vote for the IPA clock, apps SMMU identity streams, registers (ipa3_init_hw)    laurel_ipa_hw.c
+  *   2. IPA/GSI firmware from vendor_<slot> /firmware/ipa_fws.* through TrustZone PAS 15     laurel_ipa_fw.c
+- *   3. GSI_STATUS bit 0 (TrustZone enabled the GSI), local memory tables, SMEM item 497     laurel_ipa_hw.c
+- * then in the modem watch thread (TopazModem calls laurel_ipa_poll / _rx / _server; QRTR is single-threaded there):
+- *   4. our QMI service 0x31 instance 1 (QRTR instance 0x101, port 0x4015, NEW_SERVER to the modem), and as client
++ *   3. GSI_STATUS bit 0 (TrustZone enabled the GSI), the firmware did not change the IPA     laurel_ipa_hw.c
++ *   4. all GSI channels allocated, the modem's too (laurel 2782; proof: return code 1)       laurel_ipa_gsi.c
++ *   5. local memory tables (every word read back), SMEM item 497                            laurel_ipa_hw.c
++ * All of 1-5 are the self-check. A step that fails or cannot be verified: "LAUREL IPA: off: <why>", and the modem never
++ * hears of the IPA, so it cannot assert on it. Only then, in the modem watch thread (laurel_ipa_link.c; TopazModem calls
++ * laurel_ipa_poll / _rx / _server; QRTR is single-threaded there):
++ *   6. our QMI service 0x31 instance 1 (QRTR instance 0x101, port 0x4015, NEW_SERVER to the modem), and as client
+  *      (port 0x4016) INIT_MODEM_DRIVER 0x21 to the modem's service 0x31 instance 2 (0x201); its answer, the modem's
+  *      INDICATION_REGISTER 0x20 (-> MASTER_DRIVER_INIT_COMPLETE indication 0x22) and INIT_MODEM_DRIVER_CMPLT 0x35
+- *   5. state on: laurel_ipa_state() is true, so laurel_cell.c may set the radio ONLINE.
++ *   7. state on: laurel_ipa_state() is true, so laurel_cell.c may set the radio ONLINE.
+  * SMP2P "ipa": the modem's clock query is answered 3 (valid + AP clock on) once the clock vote is acked, else 1.
+- * A modem crash or the end of the modem watch turns the IPA off (no restart, no loop). A failure turns off only the
+- * IPA (and so keeps the radio off); the modem, Wi-Fi, USB and the boot go on.
++ * A modem crash or the end of the modem watch turns the IPA off (no restart, no loop). A failure before step 6 turns off
++ * only the IPA (and so keeps the radio off); the modem, Wi-Fi, USB and the boot go on. After step 6 the modem firmware can
++ * still assert, and that stops Wi-Fi: no self-check covers it (docs/laurel_sprout/cellular.md section 8).
+  * Lines: "LAUREL IPA: on: ..." or "LAUREL IPA: off: <reason>"; sysctl kern.laurel_ipa has the same text.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -31,17 +36,11 @@
+ extern void thread_deallocate(thread_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void IOSleep(unsigned int milliseconds);
+-/* TopazModem.cpp (laurel 2760 / 2780 hooks) */
+-extern void topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len);
+-extern void topaz_qrtr_new_server(uint32_t svc, uint32_t inst, uint32_t port);
+ 
+ #define SAY(...)                printf("LAUREL IPA: " __VA_ARGS__)
+ #define LOG(...)                printf("LaurelIPA: " __VA_ARGS__)
+ 
+ #define GSI_WAIT_MS             1000u
+-#define SVC_WAIT_MS             60000u          /* modem's service 0x31 after the hardware is ready */
+-#define RESP_WAIT_MS            30000u          /* answer to INIT_MODEM_DRIVER */
+-#define CMPLT_WAIT_MS           60000u          /* INIT_MODEM_DRIVER_CMPLT after that answer */
+ 
+ enum { P_IDLE, P_HW, P_QMI, P_ON, P_OFF };
+ 
+@@ -50,21 +49,16 @@
+ /* under ipa_lock: written by the IPA thread and the watch thread */
+ static int phase = P_IDLE;
+ static bool clock_on;
+-static char status_text[240] = "not started";
++static char status_text[LIPA_STATUS_LEN] = "not started";
+ static char off_why[200], state_why[220];
+ 
+ /* watch thread only */
+-static bool enabled_read, enabled, announced, init_sent, resp_ok;
+-static uint32_t m_node, m_port, c_node, c_port;
+-static bool m_svc, c_known;
+-static uint16_t txn = 1;
+-static uint64_t t_hw, t_init, t_resp;
+-static struct lipa_srv srv;
++static bool enabled_read, enabled;
+ static struct lipa_mem mem;                     /* IPA thread until P_QMI, then read-only */
+ static uint32_t ipa_version;
+ 
+-static uint64_t
+-now_ms(void)
++uint64_t
++lipa_now_ms(void)
+ {
+ 	uint64_t t, ns;
+ 
+@@ -87,8 +81,8 @@
+     NULL, 0, ipa_sysctl, "A", "LAUREL IPA v4.2 AP side (on/off + reason)");
+ 
+ /* the one off line; later calls do nothing (no loop, no restart) */
+-static void
+-ipa_off(const char *why)
++void
++lipa_off(const char *why)
+ {
+ 	lck_mtx_lock(&ipa_lock);
+ 	if (phase == P_OFF) {
+@@ -112,16 +106,33 @@
+ 	return p;
+ }
+ 
+-/* from P_HW to P_QMI (only if nobody turned the IPA off meanwhile) */
+-static void
++/* from one phase to the next (only if nobody turned the IPA off meanwhile) */
++static bool
+ set_phase(int from, int to, const char *status)
+ {
++	bool done = false;
++
+ 	lck_mtx_lock(&ipa_lock);
+ 	if (phase == from) {
+ 		phase = to;
+ 		strlcpy(status_text, status, sizeof(status_text));
++		done = true;
+ 	}
+ 	lck_mtx_unlock(&ipa_lock);
++	return done;
++}
++
++bool
++lipa_link_active(void)
++{
++	int p = get_phase();
++	return p == P_QMI || p == P_ON;
++}
++
++bool
++lipa_set_on(const char *status)
++{
++	return set_phase(P_QMI, P_ON, status);
+ }
+ 
+ bool
+@@ -133,7 +144,7 @@
+ 		enabled = on != 0;
+ 		enabled_read = true;
+ 		if (!enabled) {
+-			ipa_off("boot-arg ipa=0");
++			lipa_off("boot-arg ipa=0");
+ 		}
+ 	}
+ 	return enabled;
+@@ -143,7 +154,7 @@
+ laurel_ipa_off(const char *why)
+ {
+ 	if (laurel_ipa_enabled()) {
+-		ipa_off(why);
++		lipa_off(why);
+ 	}
+ }
+ 
+@@ -170,13 +181,13 @@
+ 	return on ? 3u : 1u;
+ }
+ 
+-/* ---------------------------------------------------------------- the IPA thread: steps 1-3 */
++/* ---------------------------------------------------------------- the IPA thread: steps 1-5 (the self-check) */
+ 
+ static void
+ ipa_thread(void *arg __unused, wait_result_t w __unused)
+ {
+ 	char why[200] = "";
+-	uint64_t t0 = now_ms();
++	uint64_t t0 = lipa_now_ms();
+ 	uint32_t gsi = 0;
+ 
+ 	if (!lipa_clock_on(why, sizeof(why))) {
+@@ -199,141 +210,20 @@
+ 		snprintf(why, sizeof(why), "GSI not enabled %u ms after the firmware (GSI_STATUS %08x)", GSI_WAIT_MS, gsi);
+ 		goto off;
+ 	}
+-	if (!lipa_sram_init(&mem, why, sizeof(why)) || !lipa_smem_item(why, sizeof(why))) {
++	if (!lipa_fw_recheck(&mem, why, sizeof(why)) || !lipa_gsi_alloc(mem.pipes, why, sizeof(why)) ||
++	    !lipa_sram_init(&mem, why, sizeof(why)) || !lipa_smem_item(why, sizeof(why))) {
+ 		goto off;
+ 	}
+-	LOG("hardware ready in %llu ms (IPA_VERSION %08x, GSI_STATUS %08x); next: QMI 0x31 with the modem\n",
+-	    now_ms() - t0, ipa_version, gsi);
++	LOG("self-check passed, hardware ready in %llu ms (IPA_VERSION %08x, GSI_STATUS %08x); next: QMI 0x31 with the modem\n",
++	    lipa_now_ms() - t0, ipa_version, gsi);
+ 	set_phase(P_HW, P_QMI, "starting: QMI 0x31 handshake with the modem");
+ 	(void)thread_terminate(current_thread());
+ 	return;
+ off:
+-	ipa_off(why);
++	lipa_off(why);
+ 	(void)thread_terminate(current_thread());
+ }
+ 
+-/* ---------------------------------------------------------------- QMI 0x31: step 4 (watch thread) */
+-
+-void
+-laurel_ipa_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port, bool up)
+-{
+-	if (svc != LIPA_QMI_SVC || inst != LIPA_QMI_INST_MODEM || !laurel_ipa_enabled()) {
+-		return;
+-	}
+-	m_svc = up;
+-	m_node = node;
+-	m_port = port;
+-	LOG("modem QMI service 0x31:%x %s at node %u port %x\n", inst, up ? "up" : "gone", node, port);
+-}
+-
+-static void
+-send_master_ind(void)
+-{
+-	uint8_t b[32];
+-	uint32_t n = lipa_qmi_master_ind(b, sizeof(b), txn++);
+-
+-	if (n != 0 && c_known && !srv.ind_sent) {
+-		srv.ind_sent = true;
+-		topaz_qrtr_data(LIPA_PORT_SERVER, c_node, c_port, b, n);
+-		LOG("sent MASTER_DRIVER_INIT_COMPLETE to the modem's client (node %u port %x)\n", c_node, c_port);
+-	}
+-}
+-
+-bool
+-laurel_ipa_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d, uint32_t len)
+-{
+-	if (dst_port != LIPA_PORT_SERVER && dst_port != LIPA_PORT_CLIENT) {
+-		return false;
+-	}
+-	int ph = get_phase();
+-	if (!laurel_ipa_enabled() || (ph != P_QMI && ph != P_ON)) {
+-		return true;                    /* our port: nothing else serves it */
+-	}
+-	if (dst_port == LIPA_PORT_CLIENT) {
+-		uint16_t err = 0;
+-		int r = lipa_qmi_init_modem_resp(d, len, &err);
+-		if (r == 0 && !resp_ok) {
+-			resp_ok = true;
+-			t_resp = now_ms();
+-			LOG("modem answered INIT_MODEM_DRIVER: success (%llu ms)\n", t_resp - t_init);
+-			if (srv.ind_registered) {
+-				send_master_ind();
+-			}
+-		} else if (r == 1) {
+-			char w[96];
+-			snprintf(w, sizeof(w), "modem refused INIT_MODEM_DRIVER (QMI error %u)", err);
+-			ipa_off(w);
+-		}
+-		return true;
+-	}
+-	uint8_t out[180];
+-	uint16_t msg = 0;
+-	uint32_t n = lipa_qmi_serve(&srv, d, len, out, sizeof(out), &msg);
+-	if (msg == 0x20 && !c_known) {          /* INDICATION_REGISTER: the client the indication goes to */
+-		c_known = true;
+-		c_node = src_node;
+-		c_port = src_port;
+-	}
+-	if (n != 0) {
+-		topaz_qrtr_data(LIPA_PORT_SERVER, src_node, src_port, out, n);
+-	}
+-	LOG("modem request 0x%02x %s (rules %u, configs %u)\n", msg, n != 0 ? "answered" : "not served", srv.rules,
+-	    srv.configs);
+-	if (msg == 0x20 && resp_ok) {
+-		send_master_ind();
+-	}
+-	return true;
+-}
+-
+-static void
+-qmi_step(uint64_t now)
+-{
+-	if (!m_svc) {
+-		if (now - t_hw > SVC_WAIT_MS) {
+-			ipa_off("hardware ready, but the modem announced no QMI IPA service 0x31:201 in 60 s");
+-		}
+-		return;
+-	}
+-	if (!announced) {
+-		announced = true;
+-		topaz_qrtr_new_server(LIPA_QMI_SVC, LIPA_QMI_INST_AP, LIPA_PORT_SERVER);
+-		LOG("our QMI service 0x31:%x announced at port %x\n", LIPA_QMI_INST_AP, LIPA_PORT_SERVER);
+-	}
+-	if (!init_sent) {
+-		uint8_t b[160];
+-		uint32_t n = lipa_qmi_init_modem_req(b, sizeof(b), txn++, mem.restricted);
+-		if (n == 0) {
+-			ipa_off("INIT_MODEM_DRIVER does not fit its buffer");
+-			return;
+-		}
+-		init_sent = true;
+-		t_init = now;
+-		topaz_qrtr_data(LIPA_PORT_CLIENT, m_node, m_port, b, n);
+-		LOG("sent INIT_MODEM_DRIVER (%u bytes, local memory at 0x%x) to node %u port %x\n", n, mem.restricted,
+-		    m_node, m_port);
+-		return;
+-	}
+-	if (!resp_ok) {
+-		if (now - t_init > RESP_WAIT_MS) {
+-			ipa_off("modem did not answer INIT_MODEM_DRIVER in 30 s");
+-		}
+-		return;
+-	}
+-	if (!srv.init_cmplt) {
+-		if (now - t_resp > CMPLT_WAIT_MS) {
+-			ipa_off("modem sent no INIT_MODEM_DRIVER_CMPLT in 60 s after INIT_MODEM_DRIVER");
+-		}
+-		return;
+-	}
+-	char s[sizeof(status_text)];
+-	snprintf(s, sizeof(s), "on: v4.2 (IPA_VERSION %08x), firmware PAS %u, GSI up, modem driver init complete in "
+-	    "%llu ms%s", ipa_version, LIPA_PAS_ID, now - t_init, srv.ind_sent ? ", master init indication sent" : "");
+-	set_phase(P_QMI, P_ON, s);
+-	if (get_phase() == P_ON) {
+-		SAY("%s\n", s);
+-	}
+-}
+-
+ void
+ laurel_ipa_poll(bool ready, bool glink)
+ {
+@@ -348,7 +238,7 @@
+ 		strlcpy(status_text, "starting: clock, registers, firmware", sizeof(status_text));
+ 		lck_mtx_unlock(&ipa_lock);
+ 		if (kernel_thread_start(ipa_thread, NULL, &th) != KERN_SUCCESS) {
+-			ipa_off("cannot start the IPA thread");
++			lipa_off("cannot start the IPA thread");
+ 			return;
+ 		}
+ 		thread_deallocate(th);
+@@ -357,10 +247,6 @@
+ 	if (p != P_QMI) {
+ 		return;
+ 	}
+-	uint64_t now = now_ms();
+-	if (t_hw == 0) {
+-		t_hw = now;
+-	}
+-	qmi_step(now);
++	lipa_link_step(lipa_now_ms(), &mem, ipa_version);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ipa_gsi.c b/bsd/dev/laurel_ipa_gsi.c
+--- a/bsd/dev/laurel_ipa_gsi.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_gsi.c	2026-11-01 17:21:16.359344031 +0530
+@@ -0,0 +1,165 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP side (laurel 2782): the GSI channels. The AP must allocate them, the modem's
++ * too, before the modem initializes its channels. Stock 4.14: ipa3_post_init() "GSI 2.2 requires to allocate all EE GSI
++ * channel during device bootup" -> ipa3_alloc_gsi_channel() -> gsi_alloc_channel_ee(), after gsi_register_device() and
++ * before the AP sends QMI INIT_MODEM_DRIVER. Mainline gsi.c: "IPA v4.2 requires the AP to allocate channels for the modem"
++ * (a hardware quirk). Without it the modem firmware asserted: ipa_hal.c:6001 "Failed to initialize GSI channel: CHID 1
++ * errval 6" (USB log 2026-11-01 17:01; channel 1 of EE 1 = Q6_CMD_PROD; 6 = GSI_STATUS_INVALID_PARAMS in the AP's enum).
++ *
++ * Polled: nobody takes the GSI interrupt in this kernel. The generic command's return code is in CNTXT_SCRATCH_0; an AP
++ * channel's state is in its context. Only reads and writes through lipa_gsi_rd/wr (laurel_ipa_hw.c; the simulated GSI
++ * of tools/laurel-ipa-test/gsi_test.c in the host test).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "laurel_ipa_regs.h"
++
++extern void IOSleep(unsigned int milliseconds);
++
++#define LOG(...)                printf("LaurelIPA: " __VA_ARGS__)
++
++#define CMD_WAIT_MS             5000u           /* GSI_CMD_TIMEOUT (5 * HZ) */
++#define CH_STATE(v)             (((v) >> 20) & 0xFu)
++#define CH_NOT_ALLOCATED        0u
++#define CH_ALLOCATED            1u
++#define OP_GENERIC_ALLOC        2u              /* GSI_GEN_EE_CMD_ALLOC_CHANNEL */
++#define CODE_SUCCESS            1u              /* GSI_GEN_EE_CMD_RETURN_CODE_SUCCESS */
++#define GEN_CODE(v)             (((v) >> 5) & 7u)       /* struct gsi_ee_scratch generic_ee_cmd_return_code */
++#define GEN_CODE_MASK           (7u << 5)
++#define GP_INT1                 2u              /* CNTXT_GLOB_IRQ bit */
++#define TYPE_CH_CTRL_GLOB_EE    5u              /* CNTXT_TYPE_IRQ_MSK: CH_CTRL (0) + GLOB_EE (2) */
++
++/*
++ * ipa3_ep_mapping[IPA_4_2] in ipa3_alloc_gsi_channel()'s order: pipe 0, 1, ...; for each pipe the client that
++ * ipa3_get_client_by_pipe() finds first (lowest enum value, so no TEST_* client): { GSI channel, EE }.
++ * EE 0 = AP, 1 = modem (IPA_EE_Q6), 2 = uC (IPA_EE_UC).
++ */
++static const struct { uint8_t ch, ee; } pipe_ch[] = {
++	{ 5, 0 },       /*  0 USB_PROD */
++	{ 0, 0 },       /*  1 APPS_WAN_PROD */
++	{ 6, 0 },       /*  2 APPS_LAN_PROD */
++	{ 7, 0 },       /*  3 WLAN1_PROD */
++	{ 0, 1 },       /*  4 Q6_WAN_PROD */
++	{ 1, 1 },       /*  5 Q6_CMD_PROD: CHID 1 of the 17:01 assert */
++	{ 1, 0 },       /*  6 APPS_CMD_PROD */
++	{ 0, 2 },       /*  7 ETHERNET_PROD */
++	{ 2, 0 },       /*  8 APPS_LAN_CONS */
++	{ 3, 0 },       /*  9 APPS_WAN_CONS */
++	{ 2, 1 },       /* 10 Q6_WAN_CONS */
++	{ 3, 1 },       /* 11 Q6_LAN_CONS */
++	{ 4, 0 },       /* 12 USB_DPL_CONS */
++	{ 4, 1 },       /* 13 Q6_LTE_WIFI_AGGR_CONS: the last modem pipe */
++	{ 8, 0 },       /* 14 WLAN1_CONS */
++	{ 9, 0 },       /* 15 USB_CONS */
++	{ 1, 2 },       /* 16 ETHERNET_CONS */
++};
++#define PIPE_COUNT              (sizeof(pipe_ch) / sizeof(pipe_ch[0]))
++#define PIPES_MIN               14u             /* every modem pipe is below this */
++#define CH_MAX_USED             9u              /* highest channel number in the table */
++
++static void
++say_error(char *why, size_t wl, const char *what, uint32_t pipe, uint32_t ch, uint32_t ee, uint32_t value)
++{
++	snprintf(why, wl, "GSI channel %u of EE %u (pipe %u): %s %u, GLOB_IRQ %08x, ERROR_LOG %08x", ch, ee, pipe, what, value,
++	    lipa_gsi_rd(G_GLOB_IRQ_STTS), lipa_gsi_rd(G_ERROR_LOG));
++}
++
++/* gsi_alloc_ap_channel(): GSI_CH_ALLOCATE through our own EE; done when the context says ALLOCATED */
++static bool
++ap_alloc(uint32_t pipe, uint32_t ch, char *why, size_t wl)
++{
++	uint32_t st = CH_STATE(lipa_gsi_rd(G_CH_CNTXT_0(ch)));
++
++	if (st == CH_ALLOCATED) {
++		return true;
++	}
++	if (st != CH_NOT_ALLOCATED) {
++		say_error(why, wl, "before ALLOCATE the state is", pipe, ch, 0, st);
++		return false;
++	}
++	lipa_gsi_wr(G_CH_CMD, ch);              /* opcode GSI_CH_ALLOCATE = 0 in bits 31:24, channel in 7:0 */
++	for (uint32_t ms = 0; ms < CMD_WAIT_MS; ms++) {
++		st = CH_STATE(lipa_gsi_rd(G_CH_CNTXT_0(ch)));
++		if (st != CH_NOT_ALLOCATED) {
++			break;
++		}
++		IOSleep(1);
++	}
++	lipa_gsi_wr(G_SRC_CH_IRQ_CLR, 1u << ch);
++	if (st != CH_ALLOCATED) {
++		say_error(why, wl, "after ALLOCATE the state is", pipe, ch, 0, st);
++		return false;
++	}
++	return true;
++}
++
++/* gsi_alloc_channel_ee(): the generic command for another EE's channel. Only code SUCCESS counts: the AP cannot read
++ * the modem's channel state, so this code is the only proof (the stock driver also accepts codes 2-6; we do not) */
++static bool
++ee_alloc(uint32_t pipe, uint32_t ch, uint32_t ee, char *why, size_t wl)
++{
++	uint32_t en = lipa_gsi_rd(G_GLOB_IRQ_EN), code = 0;
++
++	lipa_gsi_wr(G_GLOB_IRQ_EN, en | GP_INT1);
++	lipa_gsi_wr(G_SCRATCH_0, lipa_gsi_rd(G_SCRATCH_0) & ~GEN_CODE_MASK);
++	lipa_gsi_wr(G_GENERIC_CMD, OP_GENERIC_ALLOC | ch << 5 | ee << 10);
++	for (uint32_t ms = 0; ms < CMD_WAIT_MS; ms++) {
++		code = GEN_CODE(lipa_gsi_rd(G_SCRATCH_0));
++		if (code != 0 || (lipa_gsi_rd(G_GLOB_IRQ_STTS) & GP_INT1) != 0) {
++			break;
++		}
++		IOSleep(1);
++	}
++	code = GEN_CODE(lipa_gsi_rd(G_SCRATCH_0));
++	if (code != CODE_SUCCESS) {
++		say_error(why, wl, code == 0 ? "no answer to ALLOCATE in 5 s, code" : "ALLOCATE refused, code", pipe, ch, ee, code);
++	}
++	lipa_gsi_wr(G_GLOB_IRQ_CLR, GP_INT1);
++	lipa_gsi_wr(G_GLOB_IRQ_EN, en & ~GP_INT1);
++	return code == CODE_SUCCESS;
++}
++
++/* gsi_register_device() (the parts without an interrupt handler) + ipa3_alloc_gsi_channel() */
++bool
++lipa_gsi_alloc(uint32_t pipes, char *why, size_t wl)
++{
++	uint32_t max_ch = (lipa_gsi_rd(G_HW_PARAM_2) >> 3) & 0x1Fu, n[3] = { 0, 0, 0 }, type, log;
++	bool ok = true;
++
++	if (max_ch <= CH_MAX_USED) {
++		snprintf(why, wl, "GSI has %u channels per EE (HW_PARAM_2 %08x), the v4.2 table needs %u", max_ch,
++		    lipa_gsi_rd(G_HW_PARAM_2), CH_MAX_USED + 1);
++		return false;
++	}
++	if (pipes < PIPES_MIN || pipes > 31) {
++		snprintf(why, wl, "IPA_ENABLED_PIPES is %u: the modem pipes of the v4.2 table need at least %u", pipes,
++		    PIPES_MIN);
++		return false;
++	}
++	lipa_gsi_wr(G_INTSET, 1);               /* GSI_INTR_IRQ: not MSI */
++	lipa_gsi_wr(G_MSI_LSB, 0);
++	lipa_gsi_wr(G_MSI_MSB, 0);
++	lipa_gsi_wr(G_ERROR_LOG, 0);
++	type = lipa_gsi_rd(G_TYPE_IRQ_MSK);
++	lipa_gsi_wr(G_TYPE_IRQ_MSK, type | TYPE_CH_CTRL_GLOB_EE);
++	for (uint32_t p = 0; p < pipes && p < PIPE_COUNT && ok; p++) {
++		uint32_t ch = pipe_ch[p].ch, ee = pipe_ch[p].ee;
++
++		ok = ee == 0 ? ap_alloc(p, ch, why, wl) : ee_alloc(p, ch, ee, why, wl);
++		n[ee] += ok ? 1 : 0;
++	}
++	lipa_gsi_wr(G_TYPE_IRQ_MSK, type);
++	if (!ok) {
++		return false;
++	}
++	log = lipa_gsi_rd(G_ERROR_LOG);
++	if (log != 0) {
++		snprintf(why, wl, "GSI ERROR_LOG %08x after the channel allocation", log);
++		return false;
++	}
++	LOG("GSI channels allocated: %u AP, %u modem, %u uC (%u pipes, %u channels per EE, ERROR_LOG 0)\n", n[0], n[1], n[2],
++	    pipes, max_ch);
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ipa_hw.c b/bsd/dev/laurel_ipa_hw.c
+--- a/bsd/dev/laurel_ipa_hw.c	2026-11-01 17:14:24.448845670 +0530
++++ b/bsd/dev/laurel_ipa_hw.c	2026-11-01 17:21:16.359515709 +0530
+@@ -6,6 +6,8 @@
+  * data path: no GSI channels of our own. The tables that the stock driver copies with IPA immediate commands
+  * (a GSI channel) are written here through the SRAM direct-access window (the same bytes; hackios-scion did
+  * the same on SM7325). The modem programs its own part (filter/route entries, headers) after INIT_MODEM_DRIVER.
++ * laurel 2782: after the firmware the version, layout and registers are read again (lipa_fw_recheck; the stock driver reads
++ * SHARED_MEM_SIZE only after the firmware), and every word of the local memory tables is read back.
+  * Register access only after the RPM acked the IPA clock vote (an unclocked IPA hangs the bus).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -57,6 +59,17 @@
+ 	return true;
+ }
+ 
++static bool
++mem_fits(struct lipa_mem *m, char *why, size_t wl)
++{
++	if (m->size < M_END || R_SRAM_DIRECT + m->restricted + M_END > LIPA_REG_SIZE) {
++		snprintf(why, wl, "IPA local memory %u bytes at 0x%x: smaller than the v4.2 layout (0x2000)", m->size,
++		    m->restricted);
++		return false;
++	}
++	return true;
++}
++
+ /* map the registers + SRAM window, read the version and the shared memory layout */
+ bool
+ lipa_regs_map(struct lipa_mem *m, char *why, size_t wl)
+@@ -69,7 +82,7 @@
+ 		return false;
+ 	}
+ 	uint32_t ver = rd(m, R_VERSION), sms = rd(m, R_SHARED_MEM_SIZE);
+-	m->restricted = 8 * (sms >> 16);
++	m->restricted = 8 * (sms >> 16);        /* _ipa_sram_settings_read_v3_0: 8-byte units; the base reads 0 on this SoC */
+ 	m->size = 8 * (sms & 0xFFFF);
+ 	LOG("IPA_VERSION %08x, SHARED_MEM_SIZE %08x: %u bytes at offset 0x%x, IPA_STATE %08x\n", ver, sms, m->size,
+ 	    m->restricted, rd(m, R_STATE));
+@@ -77,18 +90,26 @@
+ 		snprintf(why, wl, "IPA_VERSION reads %08x (clock or power off?)", ver);
+ 		return false;
+ 	}
+-	if (m->size < M_END || R_SRAM_DIRECT + m->restricted + M_END > LIPA_REG_SIZE) {
+-		snprintf(why, wl, "IPA local memory %u bytes at 0x%x: smaller than the v4.2 layout (0x2000)", m->size,
+-		    m->restricted);
+-		return false;
+-	}
+-	return true;
++	m->version = ver;
++	return mem_fits(m, why, wl);
+ }
+ 
++/* every word goes through here: a word that does not read back turns the IPA off (first one kept for the line) */
++static uint32_t sram_bad_ofs, sram_bad_val;
++static bool sram_bad;
++
+ static inline void
+ sram(struct lipa_mem *m, uint32_t o, uint32_t v)
+ {
++	uint32_t r;
++
+ 	wr(m, R_SRAM_DIRECT + m->restricted + o, v);
++	r = rd(m, R_SRAM_DIRECT + m->restricted + o);
++	if (r != v && !sram_bad) {
++		sram_bad = true;
++		sram_bad_ofs = o;
++		sram_bad_val = r;
++	}
+ }
+ 
+ static void
+@@ -176,6 +197,10 @@
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	uint32_t can = rd(m, R_SRAM_DIRECT + m->restricted + M_UC_DESC_RAM - 4u), route = rd(m, R_ROUTE);
+ 	LOG("local memory set: ROUTE %08x, canary %08x, empty table %llx\n", route, can, (unsigned long long)m->zero_pa);
++	if (sram_bad) {
++		snprintf(why, wl, "IPA local memory does not read back (%08x at 0x%x)", sram_bad_val, sram_bad_ofs);
++		return false;
++	}
+ 	if (can != M_CANARY) {
+ 		snprintf(why, wl, "IPA local memory does not read back (canary %08x at 0x%x)", can, M_UC_DESC_RAM - 4u);
+ 		return false;
+@@ -183,23 +208,62 @@
+ 	return true;
+ }
+ 
++/* after the firmware, before the channels (ipa3_post_init reads these here): nothing the v4.2 tables rely on changed */
++bool
++lipa_fw_recheck(struct lipa_mem *m, char *why, size_t wl)
++{
++	uint32_t ver = rd(m, R_VERSION), sms = rd(m, R_SHARED_MEM_SIZE), base = 8 * (sms >> 16), comp = rd(m, R_COMP_CFG);
++	uint32_t grp = rd(m, R_SRC_RSRC_GRP_01(0)), idle = rd(m, R_IDLE_INDICATION_CFG);
++
++	m->pipes = rd(m, R_ENABLED_PIPES);
++	LOG("after the firmware: IPA_VERSION %08x, SHARED_MEM_SIZE %08x: %u bytes at offset 0x%x%s, %u pipes\n", ver, sms,
++	    8 * (sms & 0xFFFF), base, base == m->restricted ? " (same)" : " (CHANGED)", m->pipes);
++	if (ver != m->version) {
++		snprintf(why, wl, "IPA_VERSION changed from %08x to %08x with the firmware", m->version, ver);
++		return false;
++	}
++	m->restricted = base;
++	m->size = 8 * (sms & 0xFFFF);
++	if (!mem_fits(m, why, wl)) {
++		return false;
++	}
++	if ((comp & V_COMP_BITS) != V_COMP_BITS || (grp & 0x3F3F) != 0x3F03 || (idle & 0xFFFF) != V_IDLE_INDICATION) {
++		snprintf(why, wl, "the firmware load changed the IPA registers (COMP_CFG %08x, SRC_RSRC_GRP %08x, IDLE %08x)",
++		    comp, grp, idle);
++		return false;
++	}
++	return true;
++}
++
++static volatile uint8_t *gsi_ee0;
++
+ /* GSI_STATUS bit 0: TrustZone enabled the GSI with the firmware it loaded */
+ bool
+ lipa_gsi_enabled(uint32_t *status)
+ {
+-	static volatile uint32_t *g;
+-
+-	if (g == NULL) {
+-		g = (volatile uint32_t *)ml_io_map(LIPA_GSI_STATUS_PA & ~0xFFFu, 0x1000);
++	if (gsi_ee0 == NULL) {
++		gsi_ee0 = (volatile uint8_t *)ml_io_map(LIPA_GSI_EE0_PA, LIPA_GSI_EE0_SIZE);
+ 	}
+-	if (g == NULL) {
++	if (gsi_ee0 == NULL) {
+ 		*status = 0;
+ 		return false;
+ 	}
+-	*status = g[(LIPA_GSI_STATUS_PA & 0xFFFu) / 4];
++	*status = lipa_gsi_rd(G_STATUS);
+ 	return (*status & 1) != 0;
+ }
+ 
++uint32_t
++lipa_gsi_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(gsi_ee0 + off);
++}
++
++void
++lipa_gsi_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(gsi_ee0 + off) = v;
++}
++
+ /* SMEM_IPA_FILTER_TABLE in the apps<->modem partition (the modem puts its filter tables there) */
+ bool
+ lipa_smem_item(char *why, size_t wl)
+diff -ruN a/bsd/dev/laurel_ipa_link.c b/bsd/dev/laurel_ipa_link.c
+--- a/bsd/dev/laurel_ipa_link.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_link.c	2026-11-01 17:21:16.359691195 +0530
+@@ -0,0 +1,164 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP side (laurel 2782): the QMI 0x31 handshake with the modem, in the modem watch
++ * thread (TopazModem calls laurel_ipa_server / _rx, laurel_ipa.c calls lipa_link_step). QRTR is single-threaded there.
++ *
++ * The gate: lipa_link_step runs only in the handshake phase, and laurel_ipa.c enters that phase only after every
++ * self-check passed (laurel_ipa.c ipa_thread). INIT_MODEM_DRIVER is the message that lets the modem touch the IPA: the
++ * modem initializes its GSI channels after it (crash 105 ms after it on 2026-11-01 17:01; no crash in the boots without it).
++ *
++ * What no self-check covers: the modem firmware's own IPA and GSI init is closed, and it asserts on any error, which
++ * stops Wi-Fi (docs/laurel_sprout/cellular.md section 8).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "laurel_ipa_regs.h"
++
++/* TopazModem.cpp (laurel 2760 / 2780 hooks) */
++extern void topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len);
++extern void topaz_qrtr_new_server(uint32_t svc, uint32_t inst, uint32_t port);
++
++#define SAY(...)                printf("LAUREL IPA: " __VA_ARGS__)
++#define LOG(...)                printf("LaurelIPA: " __VA_ARGS__)
++
++#define SVC_WAIT_MS             60000u          /* modem's service 0x31 after the hardware is ready */
++#define RESP_WAIT_MS            30000u          /* answer to INIT_MODEM_DRIVER */
++#define CMPLT_WAIT_MS           60000u          /* INIT_MODEM_DRIVER_CMPLT after that answer */
++
++/* watch thread only */
++static bool announced, init_sent, resp_ok;
++static uint32_t m_node, m_port, c_node, c_port;
++static bool m_svc, c_known;
++static uint16_t txn = 1;
++static uint64_t t_hw, t_init, t_resp;
++static struct lipa_srv srv;
++
++void
++laurel_ipa_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port, bool up)
++{
++	if (svc != LIPA_QMI_SVC || inst != LIPA_QMI_INST_MODEM || !laurel_ipa_enabled()) {
++		return;
++	}
++	m_svc = up;
++	m_node = node;
++	m_port = port;
++	LOG("modem QMI service 0x31:%x %s at node %u port %x\n", inst, up ? "up" : "gone", node, port);
++}
++
++static void
++send_master_ind(void)
++{
++	uint8_t b[32];
++	uint32_t n = lipa_qmi_master_ind(b, sizeof(b), txn++);
++
++	if (n != 0 && c_known && !srv.ind_sent) {
++		srv.ind_sent = true;
++		topaz_qrtr_data(LIPA_PORT_SERVER, c_node, c_port, b, n);
++		LOG("sent MASTER_DRIVER_INIT_COMPLETE to the modem's client (node %u port %x)\n", c_node, c_port);
++	}
++}
++
++bool
++laurel_ipa_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d, uint32_t len)
++{
++	if (dst_port != LIPA_PORT_SERVER && dst_port != LIPA_PORT_CLIENT) {
++		return false;
++	}
++	if (!laurel_ipa_enabled() || !lipa_link_active()) {
++		return true;                    /* our port: nothing else serves it */
++	}
++	if (dst_port == LIPA_PORT_CLIENT) {
++		uint16_t err = 0;
++		int r = lipa_qmi_init_modem_resp(d, len, &err);
++		if (r == 0 && !resp_ok) {
++			resp_ok = true;
++			t_resp = lipa_now_ms();
++			LOG("modem answered INIT_MODEM_DRIVER: success (%llu ms)\n", t_resp - t_init);
++			if (srv.ind_registered) {
++				send_master_ind();
++			}
++		} else if (r == 1) {
++			char w[96];
++			snprintf(w, sizeof(w), "modem refused INIT_MODEM_DRIVER (QMI error %u)", err);
++			lipa_off(w);
++		}
++		return true;
++	}
++	uint8_t out[180];
++	uint16_t msg = 0;
++	uint32_t n = lipa_qmi_serve(&srv, d, len, out, sizeof(out), &msg);
++	if (msg == 0x20 && !c_known) {          /* INDICATION_REGISTER: the client the indication goes to */
++		c_known = true;
++		c_node = src_node;
++		c_port = src_port;
++	}
++	if (n != 0) {
++		topaz_qrtr_data(LIPA_PORT_SERVER, src_node, src_port, out, n);
++	}
++	LOG("modem request 0x%02x %s (rules %u, configs %u)\n", msg, n != 0 ? "answered" : "not served", srv.rules,
++	    srv.configs);
++	if (msg == 0x20 && resp_ok) {
++		send_master_ind();
++	}
++	return true;
++}
++
++/* one step of the handshake; only in the handshake phase (all self-checks passed) */
++void
++lipa_link_step(uint64_t now, const struct lipa_mem *mem, uint32_t ipa_version)
++{
++	if (t_hw == 0) {
++		t_hw = now;
++	}
++	if (!m_svc) {
++		if (now - t_hw > SVC_WAIT_MS) {
++			lipa_off("hardware ready, but the modem announced no QMI IPA service 0x31:201 in 60 s");
++		}
++		return;
++	}
++	if (!announced) {
++		uint32_t gsi = 0;
++		if (!lipa_gsi_enabled(&gsi)) {          /* the last look before the modem may touch the IPA */
++			char w[96];
++			snprintf(w, sizeof(w), "GSI not enabled before INIT_MODEM_DRIVER (GSI_STATUS %08x)", gsi);
++			lipa_off(w);
++			return;
++		}
++		announced = true;
++		topaz_qrtr_new_server(LIPA_QMI_SVC, LIPA_QMI_INST_AP, LIPA_PORT_SERVER);
++		LOG("our QMI service 0x31:%x announced at port %x\n", LIPA_QMI_INST_AP, LIPA_PORT_SERVER);
++	}
++	if (!init_sent) {
++		uint8_t b[160];
++		uint32_t n = lipa_qmi_init_modem_req(b, sizeof(b), txn++, mem->restricted);
++		if (n == 0) {
++			lipa_off("INIT_MODEM_DRIVER does not fit its buffer");
++			return;
++		}
++		init_sent = true;
++		t_init = now;
++		topaz_qrtr_data(LIPA_PORT_CLIENT, m_node, m_port, b, n);
++		LOG("sent INIT_MODEM_DRIVER (%u bytes, local memory at 0x%x) to node %u port %x\n", n, mem->restricted,
++		    m_node, m_port);
++		return;
++	}
++	if (!resp_ok) {
++		if (now - t_init > RESP_WAIT_MS) {
++			lipa_off("modem did not answer INIT_MODEM_DRIVER in 30 s");
++		}
++		return;
++	}
++	if (!srv.init_cmplt) {
++		if (now - t_resp > CMPLT_WAIT_MS) {
++			lipa_off("modem sent no INIT_MODEM_DRIVER_CMPLT in 60 s after INIT_MODEM_DRIVER");
++		}
++		return;
++	}
++	char s[LIPA_STATUS_LEN];
++	snprintf(s, sizeof(s), "on: v4.2 (IPA_VERSION %08x), firmware PAS %u, GSI up, modem driver init complete in "
++	    "%llu ms%s", ipa_version, LIPA_PAS_ID, now - t_init, srv.ind_sent ? ", master init indication sent" : "");
++	if (lipa_set_on(s)) {
++		SAY("%s\n", s);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ipa_regs.h b/bsd/dev/laurel_ipa_regs.h
+--- a/bsd/dev/laurel_ipa_regs.h	2026-11-01 17:14:24.468845856 +0530
++++ b/bsd/dev/laurel_ipa_regs.h	2026-11-01 17:21:16.359780915 +0530
+@@ -1,6 +1,6 @@
+ /*
+  * laurel_sprout (Mi A3, SM6125) IPA v4.2, AP side (laurel 2780): addresses, registers, memory layout and the
+- * functions shared by laurel_ipa.c (start, state, hooks), laurel_ipa_fw.c (firmware, PAS 15),
++ * functions shared by laurel_ipa.c (start, state, hooks), laurel_ipa_link.c (handshake), laurel_ipa_gsi.c (channels), laurel_ipa_fw.c (firmware, PAS 15),
+  * laurel_ipa_hw.c (clock, SMMU, registers, local memory) and laurel_ipa_qmi.c (QMI service 0x31).
+  * Values: stock 4.14 kernel drivers/platform/msm/ipa/ipa_v3 (laurel-kernel-los) and trinket.dtsi;
+  * docs/laurel_sprout/cellular.md "Step 2 facts".
+@@ -14,7 +14,24 @@
+ /* ---- addresses (trinket.dtsi qcom,ipa@5800000; ipahal_get_reg_base() = 0x40000) */
+ #define LIPA_REG_PA             0x05840000u     /* IPA registers = ipa-base + 0x40000 */
+ #define LIPA_REG_SIZE           0x00010000u     /* registers + the SRAM direct-access window */
+-#define LIPA_GSI_STATUS_PA      0x05823000u     /* GSI 0x5804000 + 0x1f000 (EE 0): bit 0 ENABLED */
++#define LIPA_GSI_EE0_PA         0x05820000u     /* GSI 0x5804000 + 0x1c000: EE 0 channel contexts + EE 0 registers */
++#define LIPA_GSI_EE0_SIZE       0x00004000u
++/* ---- GSI EE 0 registers, offsets from LIPA_GSI_EE0_PA (gsi_reg_v1.h: the 0x1cxxx / 0x1fxxx offsets, n = 0) */
++#define G_CH_CNTXT_0(k)         (0x80u * (k))   /* [23:20] CHSTATE */
++#define G_STATUS                0x3000u         /* bit 0 ENABLED */
++#define G_CH_CMD                0x3008u
++#define G_GENERIC_CMD           0x3018u         /* [4:0] opcode, [9:5] channel, [13:10] EE */
++#define G_HW_PARAM_2            0x3040u         /* [7:3] channels per EE (GSI_V2_2) */
++#define G_TYPE_IRQ_MSK          0x3088u
++#define G_SRC_CH_IRQ_CLR        0x30A0u
++#define G_GLOB_IRQ_STTS         0x3100u
++#define G_GLOB_IRQ_EN           0x3108u
++#define G_GLOB_IRQ_CLR          0x3110u
++#define G_INTSET                0x3180u
++#define G_MSI_LSB               0x3188u
++#define G_MSI_MSB               0x318Cu
++#define G_ERROR_LOG             0x3200u
++#define G_SCRATCH_0             0x3400u         /* [7:5] generic command return code */
+ #define LIPA_FW_PA              0x57500000u     /* reserved pil_ipa_fw_mem (qcom,ipa_fws memory-region) */
+ #define LIPA_FW_SIZE            0x00010000u
+ #define LIPA_PAS_ID             15u             /* trinket.dtsi qcom,ipa_fws qcom,pas-id <0xf> [V] */
+@@ -30,6 +47,7 @@
+ 
+ /* ---- registers (offsets from LIPA_REG_PA; ipahal_reg.c, IPA_HW_v4_2 with inheritance) */
+ #define R_VERSION               0x034
++#define R_ENABLED_PIPES         0x038           /* ipa3_get_num_pipes() */
+ #define R_COMP_CFG              0x03C           /* bit 7 GSI_MULTI_INORDER_RD_DIS, 8 _WR_DIS, 15 MULTI_AXI_MASTERS_DIS */
+ #define R_CLKON_CFG             0x044           /* bit 28 OPEN_GLOBAL, 29 OPEN_GLOBAL_2X_CLK */
+ #define R_ROUTE                 0x048
+@@ -98,6 +116,8 @@
+ 	volatile uint8_t *regs;                 /* LIPA_REG_PA mapping */
+ 	uint32_t restricted;                    /* SHARED_MEM_SIZE base, bytes */
+ 	uint32_t size;                          /* SHARED_MEM_SIZE size, bytes */
++	uint32_t pipes;                         /* IPA_ENABLED_PIPES, read after the firmware */
++	uint32_t version;                       /* IPA_VERSION, read before the firmware */
+ 	uint64_t zero_pa;                       /* DDR "zero rule" the empty tables point to */
+ };
+ 
+@@ -106,10 +126,16 @@
+ bool lipa_smmu(char *why, size_t wl);
+ bool lipa_regs_map(struct lipa_mem *m, char *why, size_t wl);
+ bool lipa_hw_init(struct lipa_mem *m, char *why, size_t wl);        /* registers (ipa3_init_hw): before the fw */
++bool lipa_fw_recheck(struct lipa_mem *m, char *why, size_t wl);     /* after the fw: version, layout, registers, pipes */
+ bool lipa_sram_init(struct lipa_mem *m, char *why, size_t wl);      /* local memory tables: after GSI is up */
+ bool lipa_gsi_enabled(uint32_t *status);
++uint32_t lipa_gsi_rd(uint32_t off);                                 /* off: G_*; only after lipa_gsi_enabled() */
++void lipa_gsi_wr(uint32_t off, uint32_t v);
+ bool lipa_smem_item(char *why, size_t wl);
+ 
++/* laurel_ipa_gsi.c: the GSI channels of all EEs (GSI 2.2: the AP allocates the modem's too) */
++bool lipa_gsi_alloc(uint32_t pipes, char *why, size_t wl);
++
+ /* laurel_ipa_fw.c: the IPA firmware from the vendor partition through TrustZone PAS 15 */
+ bool lipa_fw_load(char *why, size_t wl);
+ 
+@@ -124,7 +150,15 @@
+     uint16_t *msg_id);
+ uint32_t lipa_qmi_master_ind(uint8_t *out, uint32_t cap, uint16_t txn);
+ 
+-/* laurel_ipa.c: called by TopazModem.cpp (modem watch thread) */
++/* laurel_ipa.c <-> laurel_ipa_link.c (QMI 0x31 handshake, watch thread) */
++#define LIPA_STATUS_LEN         240
++uint64_t lipa_now_ms(void);
++void lipa_off(const char *why);                 /* the one off line; later calls do nothing */
++bool lipa_link_active(void);                    /* handshake phase or on */
++bool lipa_set_on(const char *status);           /* handshake phase -> on; false if the IPA went off meanwhile */
++void lipa_link_step(uint64_t now, const struct lipa_mem *mem, uint32_t ipa_version);
++
++/* laurel_ipa.c, laurel_ipa_link.c: called by TopazModem.cpp (modem watch thread) */
+ bool laurel_ipa_enabled(void);                  /* boot-arg ipa (kill switch ipa=0) */
+ void laurel_ipa_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port, bool up);
+ bool laurel_ipa_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d, uint32_t len);

@@ -872,3 +872,10 @@ Next: boot image with this kernel + root rebuild (root.sh: root-flashlight.sh + 
 userdata flash). Check `LAUREL BACKLIGHT: on: ... DCS HS, DMA at line 1567`, move the slider (panel must follow, one
 `brightness N of 255 ... -> DBV` line per stop), `LAUREL TORCH: on:`, `LAUREL TORCH UI: on:`, `LAUREL FLASHLIGHT: on:`,
 Control Center flashlight tap. If the panel still does not follow: DCS read 0x52 (negroni 0293 port).
+
+## Mi A3: IPA handshake crash analysed, GSI channels added (2026-11-01, branch t3/laurel-ipa-gsi, patch 2782; NOT BOOTED)
+Phone [V]: modem assert `Failed to initialize GSI channel: CHID 1 errval 6` 105 ms after INIT_MODEM_DRIVER stopped Wi-Fi. Cause [V stock + mainline, I for this
+assert]: on IPA v4.2 the AP must allocate all GSI channels, the modem's too; 2780 did not. Done: 2782 (channels, self-checks before any message to the modem), host tests
+gsi_test + gate_test. Not done: ipa=0 stays in uefi-image.sh + shim.sh: no self-check can see a modem firmware assert.
+Next: owner test `IPA_TEST=1 scripts/laurel/uefi-image.sh` + `fastboot boot`; evidence list in docs/laurel_sprout/cellular.md section 8. Then laurel_cell.c: read the DMS mode
+again (one old read blocks ONLINE).
