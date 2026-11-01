@@ -1,0 +1,1918 @@
+laurel 2780: IPA v4.2 AP side (step 2 of cellular, docs/laurel_sprout/cellular.md section 6). New: bsd/dev/laurel_ext4.c + laurel_ext4_dir.c (read-only ext4 reader for the vendor partition), laurel_ipa_regs.h (addresses, registers, memory layout, QMI ids), laurel_ipa_hw.c (RPM IPA clock 201 MHz, SMMU SIDs 0xE0/0xE2 identity, ipa3_init_hw registers incl. BCR = 0, TX_CFG bit 12 cleared, IDLE_INDICATION_CFG = 256; after the firmware the v4.2 local memory tables through the SRAM direct window, SMEM item 497), laurel_ipa_fw.c (ipa_fws.mdt + .bNN from vendor_<active slot> through the ext4 reader, then the shared PAS loader of laurel 2775 with PAS 15 = trinket.dtsi qcom,ipa_fws qcom,pas-id <0xf>, region pil_ipa_fw_mem 0x57500000 + 0x10000), laurel_ipa_qmi.c (QMI 0x31 messages, pure, host-tested), laurel_ipa.c (IPA thread at modem READY: clock -> SMMU -> registers -> firmware -> GSI_STATUS bit 0 -> local memory -> SMEM 497; then in the modem watch thread NEW_SERVER 0x31:0x101 at port 0x4015, INIT_MODEM_DRIVER from port 0x4016 to the modem's 0x31:0x201, answers INDICATION_REGISTER / INSTALL_FILTER_RULE / FILTER_INSTALLED_NOTIF / CONFIG / INIT_MODEM_DRIVER_CMPLT, MASTER_DRIVER_INIT_COMPLETE indication; state on after the INIT_MODEM_DRIVER answer + CMPLT; one line 'LAUREL IPA: on|off: reason', sysctl kern.laurel_ipa, kill switch ipa=0). TopazModem.cpp: laurel_ipa_server/_rx/_poll hooks next to the laurel_cell ones, topaz_qrtr_new_server(), SMP2P 'ipa' answer from laurel_ipa_smp2p_answer() (3 = valid + AP clock on once the RPM vote is acked, else 1 as before), laurel_ipa_off() at every laurel_cell_off() (modem crash, watch end, modem=0, SoC map, PAS boot, GLINK): off, no restart. laurel_cell.c: the fixed ipa_up is now laurel_ipa_state(): SET_OPERATING_MODE online only when the IPA is on; the radio-off reason is the IPA's.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 08:23:51.370988847 +0530
++++ b/bsd/conf/files	2026-11-01 08:23:51.371988857 +0530
+@@ -125,6 +125,12 @@
+ bsd/dev/laurel_reboot.c			standard
+ bsd/dev/laurel_rtc.c			standard
+ bsd/dev/laurel_cell.c			standard
++bsd/dev/laurel_ext4.c			standard
++bsd/dev/laurel_ext4_dir.c		standard
++bsd/dev/laurel_ipa.c			standard
++bsd/dev/laurel_ipa_fw.c			standard
++bsd/dev/laurel_ipa_hw.c			standard
++bsd/dev/laurel_ipa_qmi.c		standard
+ bsd/dev/laurel_bt.c			standard
+ bsd/dev/laurel_bt_clk.c			standard
+ bsd/dev/laurel_bt_uart.c			standard
+diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
+--- a/bsd/dev/laurel_cell.c	2026-11-01 08:23:51.372988867 +0530
++++ b/bsd/dev/laurel_cell.c	2026-11-01 08:23:51.373988877 +0530
+@@ -9,9 +9,10 @@
+  *    first present card -> primary GW session, the second -> secondary GW session (as qcrild /
+  *    ModemManager do); card status indications (hot swap) are followed.
+  *  - DMS 0x02: GET_REVISION, GET_OPERATING_MODE. SET_OPERATING_MODE online only when a SIM has a
+- *    provisioned session AND the AP side of IPA is up (self-check ipa_up). Step 1 has no IPA driver,
+- *    so the radio stays in the mode the modem boots in (low power): SIM status works there (as in
+- *    Android's airplane mode), registration and signal do not. Why: hackios-scion (SM7325, same QMI/IPA
++ *    provisioned session AND the AP side of IPA is up (self-check ipa_up(): laurel_ipa_state() of
++ *    laurel 2780, laurel_ipa.c: INIT_MODEM_DRIVER done over QMI 0x31, GSI up). Until then the radio
++ *    stays in the mode the modem boots in (low power): SIM status works there (as in Android's
++ *    airplane mode), registration and signal do not. Why: hackios-scion (SM7325, same QMI/IPA
+  *    design) saw the modem crash in its LTE L2 task enl2_dl a few seconds after ONLINE while the modem's
+  *    IPA task waited for the AP (docs/ru/cellular.md runs 23-28); a modem crash here also stops Wi-Fi
+  *    (the WLAN firmware runs on the modem), and topaz has no modem restart.
+@@ -142,13 +143,17 @@
+ static int opmode = -1;                         /* DMS operating mode */
+ static bool online_sent, rev_done, uim_events_done, wds_done;
+ /*
+- * Self-check of the radio: the AP side of IPA (INIT_MODEM_DRIVER done over QMI 0x31, GSI up). No IPA
+- * driver in this kernel yet (step 2, docs/laurel_sprout/cellular.md), so this stays false and the
+- * modem is never set online.
++ * Self-check of the radio: the AP side of IPA (laurel 2780 laurel_ipa.c: firmware, GSI up, INIT_MODEM_DRIVER
++ * done over QMI 0x31). While it is not on, the modem is never set online; radio_why is its reason.
+  */
+-static bool ipa_up;
+-static const char *radio_why = "no AP IPA driver yet (QMI 0x31 INIT_MODEM_DRIVER): ONLINE without it can crash "
+-    "the modem and with it Wi-Fi";
++extern bool laurel_ipa_state(const char **why);
++static const char *radio_why = "";
++
++static bool
++ipa_up(void)
++{
++	return laurel_ipa_state(&radio_why);
++}
+ static char revision[48], apn[48];
+ static uint64_t t_start, t_ready, t_online;
+ static int state;                               /* 0 running, 1 said on, -1 said off */
+@@ -434,7 +439,7 @@
+ 		}
+ 	}
+ 	n += snprintf(out + n, max - n, "; modem %s", opmode_name(opmode));
+-	if (n < max && opmode != 0 && sub_slot(0) >= 0 && !ipa_up) {
++	if (n < max && opmode != 0 && sub_slot(0) >= 0 && !ipa_up()) {
+ 		n += snprintf(out + n, max - n, "; radio off: %s", radio_why);
+ 	}
+ 	for (int sub = 0; sub < 2 && n < max && opmode == 0; sub++) {
+@@ -500,7 +505,7 @@
+ 	if (sub_slot(0) >= 0 && qc[C_WDS].up && !wds_done && !late) {
+ 		return false;
+ 	}
+-	if (sub_slot(0) < 0 || !ipa_up || opmode != 0) {
++	if (sub_slot(0) < 0 || !ipa_up() || opmode != 0) {
+ 		return true;                    /* no provisioned SIM, or the radio stays off: nothing more comes */
+ 	}
+ 	for (int sub = 0; sub < 2; sub++) {
+@@ -1044,7 +1049,7 @@
+ 	if (qc[C_DMS].up && qc[C_DMS].want == 0) {
+ 		if (!rev_done) {
+ 			qc_simple(C_DMS, DMS_GET_REVISION);
+-		} else if (ipa_up && opmode > 0 && opmode != 4 && opmode != 5 && !online_sent && sub_slot(0) >= 0) {
++		} else if (ipa_up() && opmode > 0 && opmode != 4 && opmode != 5 && !online_sent && sub_slot(0) >= 0) {
+ 			struct qb m;
+ 			uint8_t mode = 0;
+ 			online_sent = true;
+diff -ruN a/bsd/dev/laurel_ext4.c b/bsd/dev/laurel_ext4.c
+--- a/bsd/dev/laurel_ext4.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ext4.c	2026-11-01 08:23:51.374988887 +0530
+@@ -0,0 +1,257 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) read-only ext4 reader (laurel 2780), part 1: volume, inodes, block map.
++ * For firmware that Android keeps in the vendor partition (vendor_b on our phone: /firmware/ipa_fws.mdt +
++ * .bNN, the IPA firmware). The stock vendor image is ext4 without 64bit, flex_bg or metadata_csum (dumpe2fs of
++ * V12.0.26.0.RFQMIXM: ext_attr dir_index filetype extent sparse_super large_file huge_file uninit_bg dir_nlink
++ * extra_isize; 4096-byte blocks, 256-byte inodes); the reader also takes 64bit / flex_bg / metadata_csum
++ * volumes (it does not check checksums). It reads the superblock, one group descriptor per inode, the inode
++ * and its extent tree (or ext2/3 direct + indirect blocks). No journal replay (a volume that needs recovery is
++ * read as it is, with a warning line). Every on-disk number is bounds-checked against the block size, the
++ * inode count and the volume size. Part 2 (directories, file read): laurel_ext4_dir.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++#define LEXT4_INTERNAL
++#include "laurel_ext4.h"
++
++#define EXT4_MAGIC              0xEF53
++#define EXT4_EXTENT_MAGIC       0xF30A
++
++#define INC_RECOVER             0x0004u
++#define INC_EXTENTS             0x0040u
++#define INC_64BIT               0x0080u
++#define INC_FLEX_BG             0x0200u
++#define INC_EA_INODE            0x0400u
++#define INC_CSUM_SEED           0x2000u
++#define INC_LARGEDIR            0x4000u
++#define INC_INLINE_DATA         0x8000u
++#define INC_CASEFOLD            0x20000u
++#define INC_KNOWN               (EXT4_INC_FILETYPE | INC_RECOVER | INC_EXTENTS | INC_64BIT | INC_FLEX_BG | \
++	                         INC_EA_INODE | INC_CSUM_SEED | INC_LARGEDIR | INC_INLINE_DATA | INC_CASEFOLD)
++
++#define MAX_DEPTH               5               /* extent tree */
++
++void
++lext4_why(char *why, size_t wl, const char *s)
++{
++	if (why != NULL && wl != 0) {
++		strlcpy(why, s, wl);
++	}
++}
++
++int
++lext4_rd_blk(struct lext4 *fs, uint64_t b, void *dst)
++{
++	if (b == 0 || b >= fs->blocks) {
++		return EIO;
++	}
++	return fs->rd(fs->ctx, b * fs->bsize, dst, fs->bsize);
++}
++
++int
++lext4_mount(struct lext4 *fs, lext4_read_fn rd, void *ctx, uint64_t volume_bytes, char *why, size_t wl)
++{
++	uint8_t sb[1024];
++	int e;
++
++	bzero(fs, sizeof(*fs));
++	fs->rd = rd;
++	fs->ctx = ctx;
++	if ((e = rd(ctx, 1024, sb, sizeof(sb))) != 0) {
++		lext4_why(why, wl, e == EAGAIN ? "partition not readable yet" : "superblock read failed");
++		return e;
++	}
++	if (lext4_g16(sb + 0x38) != EXT4_MAGIC) {
++		lext4_why(why, wl, "no ext4 superblock");
++		return EINVAL;
++	}
++	uint32_t log = lext4_g32(sb + 0x18), rev = lext4_g32(sb + 0x4C);
++	fs->incompat = lext4_g32(sb + 0x60);
++	if (log > 6) {
++		lext4_why(why, wl, "bad block size");
++		return EINVAL;
++	}
++	fs->bsize = 1024u << log;
++	fs->inodes_count = lext4_g32(sb + 0x00);
++	fs->blocks = lext4_g32(sb + 0x04);
++	fs->first_data_block = lext4_g32(sb + 0x14);
++	fs->blocks_per_group = lext4_g32(sb + 0x20);
++	fs->inodes_per_group = lext4_g32(sb + 0x28);
++	fs->inode_size = rev >= 1 ? lext4_g16(sb + 0x58) : 128;
++	fs->desc_size = 32;
++	if (fs->incompat & INC_64BIT) {
++		fs->blocks |= (uint64_t)lext4_g32(sb + 0x150) << 32;
++		fs->desc_size = lext4_g16(sb + 0xFE);
++	}
++	if (fs->incompat & ~INC_KNOWN) {
++		char s[64];
++		snprintf(s, sizeof(s), "ext4 incompat features %x not read", fs->incompat & ~INC_KNOWN);
++		lext4_why(why, wl, s);
++		return ENOTSUP;
++	}
++	if (fs->blocks_per_group == 0 || fs->inodes_per_group == 0 || fs->inode_size < 128 ||
++	    fs->inode_size > fs->bsize || (fs->inode_size & (fs->inode_size - 1)) != 0 || fs->desc_size < 32 ||
++	    fs->desc_size > 1024 || (fs->desc_size & (fs->desc_size - 1)) != 0 || fs->first_data_block >= fs->blocks ||
++	    fs->inodes_count == 0) {
++		lext4_why(why, wl, "ext4 superblock values out of range");
++		return EINVAL;
++	}
++	if (volume_bytes != 0 && fs->blocks > volume_bytes / fs->bsize) {
++		lext4_why(why, wl, "ext4 volume larger than its partition");
++		return EINVAL;
++	}
++	fs->groups = (uint32_t)((fs->blocks - fs->first_data_block + fs->blocks_per_group - 1) / fs->blocks_per_group);
++	if ((uint64_t)fs->groups * fs->inodes_per_group < fs->inodes_count) {
++		lext4_why(why, wl, "ext4 inode count does not fit the groups");
++		return EINVAL;
++	}
++	fs->blk = kalloc_data(fs->bsize, Z_WAITOK | Z_ZERO);
++	if (fs->blk == NULL) {
++		lext4_why(why, wl, "no memory");
++		return ENOMEM;
++	}
++	if (fs->incompat & INC_RECOVER) {
++		printf("LaurelExt4: WARNING: the volume's journal needs recovery; read as it is\n");
++	}
++	return 0;
++}
++
++void
++lext4_unmount(struct lext4 *fs)
++{
++	if (fs->blk != NULL) {
++		kfree_data(fs->blk, fs->bsize);
++		fs->blk = NULL;
++	}
++}
++
++int
++lext4_read_inode(struct lext4 *fs, uint32_t n, struct lext4_ino *in)
++{
++	uint8_t d[64], raw[160];
++	uint32_t g, idx;
++	uint64_t table, off;
++	int e;
++
++	if (n == 0 || n > fs->inodes_count) {
++		return EIO;
++	}
++	g = (n - 1) / fs->inodes_per_group;
++	idx = (n - 1) % fs->inodes_per_group;
++	if (g >= fs->groups) {
++		return EIO;
++	}
++	/* the group descriptor table starts in the block after the superblock's */
++	off = (uint64_t)(fs->first_data_block + 1) * fs->bsize + (uint64_t)g * fs->desc_size;
++	if ((e = fs->rd(fs->ctx, off, d, MIN(fs->desc_size, (uint32_t)sizeof(d)))) != 0) {
++		return e;
++	}
++	table = lext4_g32(d + 8);
++	if ((fs->incompat & INC_64BIT) && fs->desc_size >= 64) {
++		table |= (uint64_t)lext4_g32(d + 0x28) << 32;
++	}
++	off = (uint64_t)idx * fs->inode_size;
++	if (table == 0 || table >= fs->blocks || table + (off + fs->inode_size + fs->bsize - 1) / fs->bsize > fs->blocks) {
++		return EIO;
++	}
++	if ((e = fs->rd(fs->ctx, table * fs->bsize + off, raw, MIN(fs->inode_size, (uint32_t)sizeof(raw)))) != 0) {
++		return e;
++	}
++	in->mode = lext4_g16(raw + 0x00);
++	in->flags = lext4_g32(raw + 0x20);
++	in->size = lext4_g32(raw + 0x04) | (uint64_t)lext4_g32(raw + 0x6C) << 32;
++	memcpy(in->blk, raw + 0x28, sizeof(in->blk));
++	return 0;
++}
++
++/* extent tree: leaf entries (block, len, start), index entries (block, child) */
++static int64_t
++bmap_extents(struct lext4 *fs, const struct lext4_ino *in, uint64_t lb)
++{
++	const uint8_t *node = in->blk;
++	uint32_t node_len = sizeof(in->blk);
++
++	for (int level = 0; level <= MAX_DEPTH; level++) {
++		uint16_t n = lext4_g16(node + 2), depth = lext4_g16(node + 6);
++		if (lext4_g16(node) != EXT4_EXTENT_MAGIC || 12u + 12u * n > node_len || depth > MAX_DEPTH - level) {
++			return -EIO;
++		}
++		const uint8_t *e = node + 12;
++		if (depth == 0) {
++			for (uint16_t i = 0; i < n; i++, e += 12) {
++				uint32_t first = lext4_g32(e), len = lext4_g16(e + 4);
++				uint64_t start = (uint64_t)lext4_g16(e + 6) << 32 | lext4_g32(e + 8);
++				bool unwritten = len > 32768;
++				if (unwritten) {
++					len -= 32768;
++				}
++				if (lb >= first && lb < (uint64_t)first + len) {
++					uint64_t p = start + (lb - first);
++					if (unwritten) {
++						return 0;       /* allocated, not written: reads as zeros */
++					}
++					return p != 0 && p < fs->blocks ? (int64_t)p : -EIO;
++				}
++			}
++			return 0;
++		}
++		int pick = -1;
++		for (uint16_t i = 0; i < n; i++) {
++			if (lext4_g32(e + 12u * i) <= lb) {
++				pick = i;
++			}
++		}
++		if (pick < 0) {
++			return 0;
++		}
++		uint64_t child = (uint64_t)lext4_g16(e + 12u * pick + 8) << 32 | lext4_g32(e + 12u * pick + 4);
++		if (lext4_rd_blk(fs, child, fs->blk) != 0) {
++			return -EIO;
++		}
++		node = fs->blk;
++		node_len = fs->bsize;
++	}
++	return -EIO;
++}
++
++int64_t
++lext4_bmap(struct lext4 *fs, const struct lext4_ino *in, uint64_t lb)
++{
++	if (in->flags & EXT4_EXTENTS_FL) {
++		return bmap_extents(fs, in, lb);
++	}
++	/* ext2/3 block map: 12 direct, then single, double, triple indirect */
++	uint64_t per = fs->bsize / 4;
++	if (lb < 12) {
++		uint32_t p = lext4_g32(in->blk + 4 * lb);
++		return p < fs->blocks ? (int64_t)p : -EIO;
++	}
++	lb -= 12;
++	uint64_t span = per;
++	for (unsigned level = 1; level <= 3; level++) {
++		if (lb < span) {
++			uint32_t p = lext4_g32(in->blk + 4 * (11 + level));
++			for (unsigned l = level; l > 0; l--) {
++				if (p == 0) {
++					return 0;
++				}
++				if (lext4_rd_blk(fs, p, fs->blk) != 0) {
++					return -EIO;
++				}
++				uint64_t div = 1;
++				for (unsigned k = 1; k < l; k++) {
++					div *= per;
++				}
++				p = lext4_g32(fs->blk + 4 * ((lb / div) % per));
++			}
++			return p < fs->blocks ? (int64_t)p : -EIO;
++		}
++		lb -= span;
++		span *= per;
++	}
++	return -EIO;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ext4_dir.c b/bsd/dev/laurel_ext4_dir.c
+--- a/bsd/dev/laurel_ext4_dir.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ext4_dir.c	2026-11-01 08:23:51.374988887 +0530
+@@ -0,0 +1,153 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) read-only ext4 reader (laurel 2780), part 2: path lookup and file read.
++ * Directories are read linearly: an htree (dir_index) directory's index blocks look like one empty entry,
++ * so every name is still found in the leaf blocks. No symlinks, no inline data, no encryption.
++ * Part 1 (volume, inodes, block map): laurel_ext4.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++#define LEXT4_INTERNAL
++#include "laurel_ext4.h"
++
++#define MAX_COMPONENTS          16
++#define MAX_DIR_BYTES           (16u << 20)
++
++/* the inode of name in directory dir: 0 none, negative: -errno */
++static int64_t
++dir_find(struct lext4 *fs, const struct lext4_ino *dir, const char *name, size_t nlen)
++{
++	uint64_t nblk = (dir->size + fs->bsize - 1) / fs->bsize;
++	uint8_t *b;
++
++	if (dir->size > MAX_DIR_BYTES || (dir->flags & (EXT4_INLINE_DATA_FL | EXT4_ENCRYPT_FL))) {
++		return -ENOTSUP;
++	}
++	b = kalloc_data(fs->bsize, Z_WAITOK | Z_ZERO);
++	if (b == NULL) {
++		return -ENOMEM;
++	}
++	int64_t found = 0;
++	for (uint64_t lb = 0; lb < nblk && found == 0; lb++) {
++		int64_t p = lext4_bmap(fs, dir, lb);
++		if (p < 0) {
++			found = p;
++			break;
++		}
++		if (p == 0) {
++			continue;
++		}
++		if (lext4_rd_blk(fs, (uint64_t)p, b) != 0) {
++			found = -EIO;
++			break;
++		}
++		for (uint32_t o = 0; o + 8 <= fs->bsize;) {
++			uint32_t ino = lext4_g32(b + o), rec = lext4_g16(b + o + 4);
++			uint32_t nl = (fs->incompat & EXT4_INC_FILETYPE) ? b[o + 6] : lext4_g16(b + o + 6);
++			if (rec < 8 || (rec & 3) != 0 || o + rec > fs->bsize || 8 + nl > rec) {
++				break;                  /* bad entry: the rest of this block is skipped */
++			}
++			if (ino != 0 && nl == nlen && memcmp(b + o + 8, name, nlen) == 0) {
++				found = ino <= fs->inodes_count ? (int64_t)ino : -EIO;
++				break;
++			}
++			o += rec;
++		}
++	}
++	kfree_data(b, fs->bsize);
++	return found;
++}
++
++/* walk path from the root: 0 and the inode, or -errno with the reason in why */
++static int
++lookup(struct lext4 *fs, const char *path, struct lext4_ino *in, char *why, size_t wl)
++{
++	const char *p = path;
++	unsigned depth = 0;
++
++	if (lext4_read_inode(fs, EXT4_ROOT_INO, in) != 0) {
++		lext4_why(why, wl, "root inode not readable");
++		return -EIO;
++	}
++	for (;;) {
++		while (*p == '/') {
++			p++;
++		}
++		if (*p == 0) {
++			return 0;
++		}
++		const char *end = p;
++		while (*end != 0 && *end != '/') {
++			end++;
++		}
++		if ((in->mode & EXT4_S_IFMT) != EXT4_S_IFDIR || ++depth > MAX_COMPONENTS || end - p > 255) {
++			lext4_why(why, wl, "not a directory on the path");
++			return -ENOTDIR;
++		}
++		int64_t c = dir_find(fs, in, p, (size_t)(end - p));
++		if (c <= 0) {
++			lext4_why(why, wl, c == 0 ? "no such file" : "directory not readable");
++			return c == 0 ? -ENOENT : (int)c;
++		}
++		if (lext4_read_inode(fs, (uint32_t)c, in) != 0) {
++			lext4_why(why, wl, "inode not readable");
++			return -EIO;
++		}
++		p = end;
++	}
++}
++
++int64_t
++lext4_read_file(struct lext4 *fs, const char *path, void *dst, uint64_t max, char *why, size_t wl)
++{
++	struct lext4_ino in;
++	int e;
++
++	if (fs->blk == NULL) {
++		lext4_why(why, wl, "volume not mounted");
++		return -EINVAL;
++	}
++	if ((e = lookup(fs, path, &in, why, wl)) != 0) {
++		return e;
++	}
++	if ((in.mode & EXT4_S_IFMT) != EXT4_S_IFREG) {
++		lext4_why(why, wl, "not a regular file (symlinks are not followed)");
++		return -EINVAL;
++	}
++	if (in.flags & (EXT4_INLINE_DATA_FL | EXT4_ENCRYPT_FL)) {
++		lext4_why(why, wl, "inline or encrypted file");
++		return -ENOTSUP;
++	}
++	if (dst == NULL || max == 0) {
++		return (int64_t)in.size;
++	}
++	uint64_t want = MIN(in.size, max);
++	for (uint64_t done = 0; done < want;) {
++		uint64_t lb = done / fs->bsize;
++		uint32_t chunk = (uint32_t)MIN((uint64_t)fs->bsize, want - done);
++		int64_t pb = lext4_bmap(fs, &in, lb);
++		if (pb < 0) {
++			lext4_why(why, wl, "file block map not readable");
++			return pb;
++		}
++		if (pb == 0) {
++			bzero((uint8_t *)dst + done, chunk);
++		} else if (chunk == fs->bsize) {
++			if (lext4_rd_blk(fs, (uint64_t)pb, (uint8_t *)dst + done) != 0) {
++				lext4_why(why, wl, "file data read failed");
++				return -EIO;
++			}
++		} else {
++			if (lext4_rd_blk(fs, (uint64_t)pb, fs->blk) != 0) {
++				lext4_why(why, wl, "file data read failed");
++				return -EIO;
++			}
++			memcpy((uint8_t *)dst + done, fs->blk, chunk);
++		}
++		done += chunk;
++	}
++	return (int64_t)in.size;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ext4.h b/bsd/dev/laurel_ext4.h
+--- a/bsd/dev/laurel_ext4.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ext4.h	2026-11-01 08:23:51.374988887 +0530
+@@ -0,0 +1,71 @@
++/*
++ * laurel_sprout (Mi A3) read-only ext4 reader (laurel 2780): files of the phone's own vendor partition
++ * (vendor_a / vendor_b, raw ext4 on UFS) for the kernel, e.g. /firmware/ipa_fws.mdt. No write, no journal
++ * replay, no symlinks. The caller gives the block reader (sweet_ufs_read_part in the kernel, a file in the
++ * host test scripts/laurel/test-ipa.sh). Code: laurel_ext4.c (volume, inodes, block map) and
++ * laurel_ext4_dir.c (directories, file read).
++ */
++#ifndef LAUREL_EXT4_H
++#define LAUREL_EXT4_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++/* read len bytes at byte offset off of the volume: 0 or an errno */
++typedef int (*lext4_read_fn)(void *ctx, uint64_t off, void *dst, uint64_t len);
++
++struct lext4 {
++	lext4_read_fn rd;
++	void *ctx;
++	uint32_t bsize;                 /* block size, bytes */
++	uint32_t first_data_block, blocks_per_group, inodes_per_group, inodes_count;
++	uint32_t inode_size, desc_size, groups;
++	uint32_t incompat;
++	uint64_t blocks;
++	uint8_t *blk;                   /* one block, for extent / indirect nodes and partial file blocks */
++};
++
++/* 0, or an errno with the reason in why */
++int lext4_mount(struct lext4 *fs, lext4_read_fn rd, void *ctx, uint64_t volume_bytes, char *why, size_t whylen);
++
++/*
++ * The regular file at path ("/firmware/ipa_fws.mdt"): its size, and its first MIN(size, max) bytes in dst
++ * (dst may be NULL: size only). Negative: -errno, the reason in why (ENOENT: no such file).
++ */
++int64_t lext4_read_file(struct lext4 *fs, const char *path, void *dst, uint64_t max, char *why, size_t whylen);
++
++void lext4_unmount(struct lext4 *fs);
++
++#ifdef LEXT4_INTERNAL
++/* shared by laurel_ext4.c and laurel_ext4_dir.c only */
++#define EXT4_ROOT_INO           2
++#define EXT4_EXTENTS_FL         0x00080000u
++#define EXT4_INLINE_DATA_FL     0x10000000u
++#define EXT4_ENCRYPT_FL         0x00000800u
++#define EXT4_S_IFMT             0xF000
++#define EXT4_S_IFDIR            0x4000
++#define EXT4_S_IFREG            0x8000
++#define EXT4_INC_FILETYPE       0x0002u
++
++struct lext4_ino {
++	uint16_t mode;
++	uint32_t flags;
++	uint64_t size;
++	uint8_t blk[60];                /* i_block: extent header + 4 extents, or 15 block numbers */
++};
++
++static inline uint16_t lext4_g16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++static inline uint32_t
++lext4_g32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++void lext4_why(char *why, size_t wl, const char *s);
++int lext4_rd_blk(struct lext4 *fs, uint64_t b, void *dst);
++int lext4_read_inode(struct lext4 *fs, uint32_t n, struct lext4_ino *in);
++/* physical block of logical block lb (0 = hole or unwritten); negative: -errno */
++int64_t lext4_bmap(struct lext4 *fs, const struct lext4_ino *in, uint64_t lb);
++#endif
++
++#endif
+diff -ruN a/bsd/dev/laurel_ipa.c b/bsd/dev/laurel_ipa.c
+--- a/bsd/dev/laurel_ipa.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa.c	2026-11-01 08:23:51.374988887 +0530
+@@ -0,0 +1,366 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP side, step 2 of cellular (laurel 2780): what the stock 4.14 IPA driver
++ * (ipa_v3: ipa.c, ipa_qmi_service.c) does before the modem may go ONLINE. On by default; kill switch ipa=0.
++ *
++ * Order (one IPA thread, started when the modem is READY with GLINK up; UFS must be readable):
++ *   1. RPM vote for the IPA clock, apps SMMU identity streams, registers (ipa3_init_hw)    laurel_ipa_hw.c
++ *   2. IPA/GSI firmware from vendor_<slot> /firmware/ipa_fws.* through TrustZone PAS 15     laurel_ipa_fw.c
++ *   3. GSI_STATUS bit 0 (TrustZone enabled the GSI), local memory tables, SMEM item 497     laurel_ipa_hw.c
++ * then in the modem watch thread (TopazModem calls laurel_ipa_poll / _rx / _server; QRTR is single-threaded there):
++ *   4. our QMI service 0x31 instance 1 (QRTR instance 0x101, port 0x4015, NEW_SERVER to the modem), and as client
++ *      (port 0x4016) INIT_MODEM_DRIVER 0x21 to the modem's service 0x31 instance 2 (0x201); its answer, the modem's
++ *      INDICATION_REGISTER 0x20 (-> MASTER_DRIVER_INIT_COMPLETE indication 0x22) and INIT_MODEM_DRIVER_CMPLT 0x35
++ *   5. state on: laurel_ipa_state() is true, so laurel_cell.c may set the radio ONLINE.
++ * SMP2P "ipa": the modem's clock query is answered 3 (valid + AP clock on) once the clock vote is acked, else 1.
++ * A modem crash or the end of the modem watch turns the IPA off (no restart, no loop). A failure turns off only the
++ * IPA (and so keeps the radio off); the modem, Wi-Fi, USB and the boot go on.
++ * Lines: "LAUREL IPA: on: ..." or "LAUREL IPA: off: <reason>"; sysctl kern.laurel_ipa has the same text.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include "laurel_ipa_regs.h"
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void IOSleep(unsigned int milliseconds);
++/* TopazModem.cpp (laurel 2760 / 2780 hooks) */
++extern void topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len);
++extern void topaz_qrtr_new_server(uint32_t svc, uint32_t inst, uint32_t port);
++
++#define SAY(...)                printf("LAUREL IPA: " __VA_ARGS__)
++#define LOG(...)                printf("LaurelIPA: " __VA_ARGS__)
++
++#define GSI_WAIT_MS             1000u
++#define SVC_WAIT_MS             60000u          /* modem's service 0x31 after the hardware is ready */
++#define RESP_WAIT_MS            30000u          /* answer to INIT_MODEM_DRIVER */
++#define CMPLT_WAIT_MS           60000u          /* INIT_MODEM_DRIVER_CMPLT after that answer */
++
++enum { P_IDLE, P_HW, P_QMI, P_ON, P_OFF };
++
++static LCK_GRP_DECLARE(ipa_grp, "laurel_ipa");
++static LCK_MTX_DECLARE(ipa_lock, &ipa_grp);
++/* under ipa_lock: written by the IPA thread and the watch thread */
++static int phase = P_IDLE;
++static bool clock_on;
++static char status_text[240] = "not started";
++static char off_why[200], state_why[220];
++
++/* watch thread only */
++static bool enabled_read, enabled, announced, init_sent, resp_ok;
++static uint32_t m_node, m_port, c_node, c_port;
++static bool m_svc, c_known;
++static uint16_t txn = 1;
++static uint64_t t_hw, t_init, t_resp;
++static struct lipa_srv srv;
++static struct lipa_mem mem;                     /* IPA thread until P_QMI, then read-only */
++static uint32_t ipa_version;
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t t, ns;
++
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns / 1000000u;
++}
++
++static int
++ipa_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char buf[sizeof(status_text)];
++
++	lck_mtx_lock(&ipa_lock);
++	strlcpy(buf, status_text, sizeof(buf));
++	lck_mtx_unlock(&ipa_lock);
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, laurel_ipa, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, ipa_sysctl, "A", "LAUREL IPA v4.2 AP side (on/off + reason)");
++
++/* the one off line; later calls do nothing (no loop, no restart) */
++static void
++ipa_off(const char *why)
++{
++	lck_mtx_lock(&ipa_lock);
++	if (phase == P_OFF) {
++		lck_mtx_unlock(&ipa_lock);
++		return;
++	}
++	strlcpy(off_why, why, sizeof(off_why));
++	snprintf(state_why, sizeof(state_why), "AP IPA side off: %s", why);
++	snprintf(status_text, sizeof(status_text), "off: %s", why);
++	phase = P_OFF;
++	lck_mtx_unlock(&ipa_lock);
++	SAY("off: %s\n", why);
++}
++
++static int
++get_phase(void)
++{
++	lck_mtx_lock(&ipa_lock);
++	int p = phase;
++	lck_mtx_unlock(&ipa_lock);
++	return p;
++}
++
++/* from P_HW to P_QMI (only if nobody turned the IPA off meanwhile) */
++static void
++set_phase(int from, int to, const char *status)
++{
++	lck_mtx_lock(&ipa_lock);
++	if (phase == from) {
++		phase = to;
++		strlcpy(status_text, status, sizeof(status_text));
++	}
++	lck_mtx_unlock(&ipa_lock);
++}
++
++bool
++laurel_ipa_enabled(void)
++{
++	if (!enabled_read) {
++		uint32_t on = 1;
++		(void)PE_parse_boot_argn("ipa", &on, sizeof(on));
++		enabled = on != 0;
++		enabled_read = true;
++		if (!enabled) {
++			ipa_off("boot-arg ipa=0");
++		}
++	}
++	return enabled;
++}
++
++void
++laurel_ipa_off(const char *why)
++{
++	if (laurel_ipa_enabled()) {
++		ipa_off(why);
++	}
++}
++
++bool
++laurel_ipa_state(const char **why)
++{
++	lck_mtx_lock(&ipa_lock);
++	int p = phase;
++	lck_mtx_unlock(&ipa_lock);
++	if (why != NULL) {
++		/* state_why is written once, before phase = P_OFF, and never again */
++		*why = p == P_OFF ? state_why : p == P_ON ? "" : "AP IPA side still starting (QMI 0x31 INIT_MODEM_DRIVER not "
++		    "done): ONLINE without it can crash the modem and with it Wi-Fi";
++	}
++	return p == P_ON;
++}
++
++uint32_t
++laurel_ipa_smp2p_answer(void)
++{
++	lck_mtx_lock(&ipa_lock);
++	bool on = clock_on && phase != P_OFF;
++	lck_mtx_unlock(&ipa_lock);
++	return on ? 3u : 1u;
++}
++
++/* ---------------------------------------------------------------- the IPA thread: steps 1-3 */
++
++static void
++ipa_thread(void *arg __unused, wait_result_t w __unused)
++{
++	char why[200] = "";
++	uint64_t t0 = now_ms();
++	uint32_t gsi = 0;
++
++	if (!lipa_clock_on(why, sizeof(why))) {
++		goto off;
++	}
++	lck_mtx_lock(&ipa_lock);
++	clock_on = true;
++	lck_mtx_unlock(&ipa_lock);
++	if (!lipa_smmu(why, sizeof(why)) || !lipa_regs_map(&mem, why, sizeof(why))) {
++		goto off;
++	}
++	ipa_version = *(volatile uint32_t *)(mem.regs + R_VERSION);
++	if (!lipa_hw_init(&mem, why, sizeof(why)) || !lipa_fw_load(why, sizeof(why))) {
++		goto off;
++	}
++	for (uint32_t ms = 0; !lipa_gsi_enabled(&gsi) && ms < GSI_WAIT_MS; ms += 10) {
++		IOSleep(10);
++	}
++	if (!(gsi & 1)) {
++		snprintf(why, sizeof(why), "GSI not enabled %u ms after the firmware (GSI_STATUS %08x)", GSI_WAIT_MS, gsi);
++		goto off;
++	}
++	if (!lipa_sram_init(&mem, why, sizeof(why)) || !lipa_smem_item(why, sizeof(why))) {
++		goto off;
++	}
++	LOG("hardware ready in %llu ms (IPA_VERSION %08x, GSI_STATUS %08x); next: QMI 0x31 with the modem\n",
++	    now_ms() - t0, ipa_version, gsi);
++	set_phase(P_HW, P_QMI, "starting: QMI 0x31 handshake with the modem");
++	(void)thread_terminate(current_thread());
++	return;
++off:
++	ipa_off(why);
++	(void)thread_terminate(current_thread());
++}
++
++/* ---------------------------------------------------------------- QMI 0x31: step 4 (watch thread) */
++
++void
++laurel_ipa_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port, bool up)
++{
++	if (svc != LIPA_QMI_SVC || inst != LIPA_QMI_INST_MODEM || !laurel_ipa_enabled()) {
++		return;
++	}
++	m_svc = up;
++	m_node = node;
++	m_port = port;
++	LOG("modem QMI service 0x31:%x %s at node %u port %x\n", inst, up ? "up" : "gone", node, port);
++}
++
++static void
++send_master_ind(void)
++{
++	uint8_t b[32];
++	uint32_t n = lipa_qmi_master_ind(b, sizeof(b), txn++);
++
++	if (n != 0 && c_known && !srv.ind_sent) {
++		srv.ind_sent = true;
++		topaz_qrtr_data(LIPA_PORT_SERVER, c_node, c_port, b, n);
++		LOG("sent MASTER_DRIVER_INIT_COMPLETE to the modem's client (node %u port %x)\n", c_node, c_port);
++	}
++}
++
++bool
++laurel_ipa_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d, uint32_t len)
++{
++	if (dst_port != LIPA_PORT_SERVER && dst_port != LIPA_PORT_CLIENT) {
++		return false;
++	}
++	int ph = get_phase();
++	if (!laurel_ipa_enabled() || (ph != P_QMI && ph != P_ON)) {
++		return true;                    /* our port: nothing else serves it */
++	}
++	if (dst_port == LIPA_PORT_CLIENT) {
++		uint16_t err = 0;
++		int r = lipa_qmi_init_modem_resp(d, len, &err);
++		if (r == 0 && !resp_ok) {
++			resp_ok = true;
++			t_resp = now_ms();
++			LOG("modem answered INIT_MODEM_DRIVER: success (%llu ms)\n", t_resp - t_init);
++			if (srv.ind_registered) {
++				send_master_ind();
++			}
++		} else if (r == 1) {
++			char w[96];
++			snprintf(w, sizeof(w), "modem refused INIT_MODEM_DRIVER (QMI error %u)", err);
++			ipa_off(w);
++		}
++		return true;
++	}
++	uint8_t out[180];
++	uint16_t msg = 0;
++	uint32_t n = lipa_qmi_serve(&srv, d, len, out, sizeof(out), &msg);
++	if (msg == 0x20 && !c_known) {          /* INDICATION_REGISTER: the client the indication goes to */
++		c_known = true;
++		c_node = src_node;
++		c_port = src_port;
++	}
++	if (n != 0) {
++		topaz_qrtr_data(LIPA_PORT_SERVER, src_node, src_port, out, n);
++	}
++	LOG("modem request 0x%02x %s (rules %u, configs %u)\n", msg, n != 0 ? "answered" : "not served", srv.rules,
++	    srv.configs);
++	if (msg == 0x20 && resp_ok) {
++		send_master_ind();
++	}
++	return true;
++}
++
++static void
++qmi_step(uint64_t now)
++{
++	if (!m_svc) {
++		if (now - t_hw > SVC_WAIT_MS) {
++			ipa_off("hardware ready, but the modem announced no QMI IPA service 0x31:201 in 60 s");
++		}
++		return;
++	}
++	if (!announced) {
++		announced = true;
++		topaz_qrtr_new_server(LIPA_QMI_SVC, LIPA_QMI_INST_AP, LIPA_PORT_SERVER);
++		LOG("our QMI service 0x31:%x announced at port %x\n", LIPA_QMI_INST_AP, LIPA_PORT_SERVER);
++	}
++	if (!init_sent) {
++		uint8_t b[160];
++		uint32_t n = lipa_qmi_init_modem_req(b, sizeof(b), txn++, mem.restricted);
++		if (n == 0) {
++			ipa_off("INIT_MODEM_DRIVER does not fit its buffer");
++			return;
++		}
++		init_sent = true;
++		t_init = now;
++		topaz_qrtr_data(LIPA_PORT_CLIENT, m_node, m_port, b, n);
++		LOG("sent INIT_MODEM_DRIVER (%u bytes, local memory at 0x%x) to node %u port %x\n", n, mem.restricted,
++		    m_node, m_port);
++		return;
++	}
++	if (!resp_ok) {
++		if (now - t_init > RESP_WAIT_MS) {
++			ipa_off("modem did not answer INIT_MODEM_DRIVER in 30 s");
++		}
++		return;
++	}
++	if (!srv.init_cmplt) {
++		if (now - t_resp > CMPLT_WAIT_MS) {
++			ipa_off("modem sent no INIT_MODEM_DRIVER_CMPLT in 60 s after INIT_MODEM_DRIVER");
++		}
++		return;
++	}
++	char s[sizeof(status_text)];
++	snprintf(s, sizeof(s), "on: v4.2 (IPA_VERSION %08x), firmware PAS %u, GSI up, modem driver init complete in "
++	    "%llu ms%s", ipa_version, LIPA_PAS_ID, now - t_init, srv.ind_sent ? ", master init indication sent" : "");
++	set_phase(P_QMI, P_ON, s);
++	if (get_phase() == P_ON) {
++		SAY("%s\n", s);
++	}
++}
++
++void
++laurel_ipa_poll(bool ready, bool glink)
++{
++	if (!laurel_ipa_enabled()) {
++		return;
++	}
++	int p = get_phase();
++	if (p == P_IDLE && ready && glink) {
++		thread_t th;
++		lck_mtx_lock(&ipa_lock);
++		phase = P_HW;
++		strlcpy(status_text, "starting: clock, registers, firmware", sizeof(status_text));
++		lck_mtx_unlock(&ipa_lock);
++		if (kernel_thread_start(ipa_thread, NULL, &th) != KERN_SUCCESS) {
++			ipa_off("cannot start the IPA thread");
++			return;
++		}
++		thread_deallocate(th);
++		return;
++	}
++	if (p != P_QMI) {
++		return;
++	}
++	uint64_t now = now_ms();
++	if (t_hw == 0) {
++		t_hw = now;
++	}
++	qmi_step(now);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ipa_fw.c b/bsd/dev/laurel_ipa_fw.c
+--- a/bsd/dev/laurel_ipa_fw.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_fw.c	2026-11-01 08:23:51.374988887 +0530
+@@ -0,0 +1,226 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP side (laurel 2780): the IPA/GSI firmware. Android's kernel loads it
++ * with subsys-pil-tz ("ipa_fws", trinket.dtsi qcom,ipa_fws: qcom,pas-id <0xf>, memory-region pil_ipa_fw_mem
++ * 0x57500000 + 0x10000) after the IPA clock is on; TrustZone checks the signature and starts the GSI.
++ * Here: the same files from the phone's own vendor partition (vendor_a/_b, ext4, /firmware/ipa_fws.mdt + .bNN)
++ * through the read-only ext4 reader, then the shared PAS loader (topaz_pas.c, the zap shader's sequence).
++ * Stock layout: .mdt = .b00 (ELF header + 5 program headers, 0xd4 bytes) + .b01 (hash, 6808 bytes); loadable
++ * relocatable segments 2/3/4 at offsets 0 / 0x4000 / 0x4080, span 0x41c0 (page end 0x5000). Firmware never in git.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++#include "laurel_ext4.h"
++#include "laurel_ipa_regs.h"
++#include "topaz_pas.h"
++
++extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++extern int sweet_ufs_part_info(const char *want, uint64_t *attr, uint64_t *bytes);
++extern void IOSleep(unsigned int milliseconds);
++
++#define LOG(...)                printf("LaurelIPA: " __VA_ARGS__)
++#define GPT_ATTR_ACTIVE         (1ull << 50)
++#define FW_DIR                  "/firmware/"
++#define FW_SEGS                 8u              /* program headers we accept */
++#define FW_FILE_MAX             (256u << 10)
++
++struct ipa_fw {
++	char part[16];
++	struct lext4 fs;
++	uint8_t *mdt;
++	uint32_t mdt_len;
++	uint8_t *seg[FW_SEGS];
++	uint32_t seg_len[FW_SEGS], seg_filesz[FW_SEGS];
++};
++
++static int
++ufs_rd(void *ctx, uint64_t off, void *dst, uint64_t len)
++{
++	return sweet_ufs_read_part((const char *)ctx, off, dst, len);
++}
++
++/* one whole file (at most FW_FILE_MAX) into a new buffer; 0 or an errno, the reason in why */
++static int
++read_all(struct ipa_fw *f, const char *name, uint8_t **out, uint32_t *len, char *why, size_t wl)
++{
++	char path[48], w[96] = "";
++	int64_t n, m;
++
++	snprintf(path, sizeof(path), FW_DIR "%s", name);
++	n = lext4_read_file(&f->fs, path, NULL, 0, w, sizeof(w));
++	if (n < 0) {
++		snprintf(why, wl, "%s: %s: %s", f->part, path, w);
++		return (int)-n;
++	}
++	if (n == 0 || n > FW_FILE_MAX) {
++		snprintf(why, wl, "%s: %s has %lld bytes", f->part, path, (long long)n);
++		return EFBIG;
++	}
++	*out = (uint8_t *)kalloc_data((vm_size_t)n, Z_WAITOK);
++	if (*out == NULL) {
++		snprintf(why, wl, "no memory for %s (%lld bytes)", path, (long long)n);
++		return ENOMEM;
++	}
++	m = lext4_read_file(&f->fs, path, *out, (uint64_t)n, w, sizeof(w));
++	if (m != n) {
++		snprintf(why, wl, "%s: %s: read %lld of %lld bytes: %s", f->part, path, (long long)m, (long long)n, w);
++		kfree_data(*out, (vm_size_t)n);
++		*out = NULL;
++		return EIO;
++	}
++	*len = (uint32_t)n;
++	return 0;
++}
++
++static void
++fw_free(struct ipa_fw *f)
++{
++	for (uint32_t i = 0; i < FW_SEGS; i++) {
++		if (f->seg[i] != NULL) {
++			kfree_data(f->seg[i], f->seg_len[i]);
++			f->seg[i] = NULL;
++		}
++	}
++	if (f->mdt != NULL) {
++		kfree_data(f->mdt, f->mdt_len);
++		f->mdt = NULL;
++	}
++}
++
++static inline uint32_t g32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++
++/* the .mdt and every loadable segment file of one vendor partition; false = this partition does not have them */
++static bool
++fw_read(struct ipa_fw *f, char *why, size_t wl)
++{
++	uint64_t bytes = 0;
++	int e = sweet_ufs_part_info(f->part, NULL, &bytes);
++
++	if (e != 0 || lext4_mount(&f->fs, ufs_rd, f->part, bytes, why, wl) != 0) {
++		if (e != 0) {
++			snprintf(why, wl, "no partition %s (error %d)", f->part, e);
++		}
++		return false;
++	}
++	bool ok = read_all(f, "ipa_fws.mdt", &f->mdt, &f->mdt_len, why, wl) == 0;
++	uint32_t phoff = 0, phnum = 0, lo = 0, hi = 0;
++	if (ok && !topaz_pas_span(f->mdt, f->mdt_len, &lo, &hi)) {
++		snprintf(why, wl, "%s: ipa_fws.mdt is no ELF32 image with loadable segments", f->part);
++		ok = false;
++	}
++	if (ok) {
++		phoff = g32(f->mdt + 28);
++		phnum = (uint32_t)(f->mdt[44] | f->mdt[45] << 8);   /* topaz_pas_span checked both */
++	}
++	for (uint32_t i = 0; ok && i < phnum; i++) {
++		const uint8_t *ph = f->mdt + phoff + 32 * i;
++		if (g32(ph) != 1 || g32(ph + 20) == 0 || ((g32(ph + 24) >> 24) & 7) == 2) {
++			continue;               /* not loadable (ELF header, hash): as topaz_pas.c */
++		}
++		char name[16];
++		if (i >= FW_SEGS) {
++			snprintf(why, wl, "%s: ipa_fws.mdt has %u program headers (at most %u)", f->part, phnum, FW_SEGS);
++			ok = false;
++			break;
++		}
++		snprintf(name, sizeof(name), "ipa_fws.b%02u", i);
++		ok = read_all(f, name, &f->seg[i], &f->seg_len[i], why, wl) == 0;
++		f->seg_filesz[i] = g32(ph + 16);
++		if (ok && f->seg_len[i] < f->seg_filesz[i]) {
++			snprintf(why, wl, "%s: %s has %u bytes, its program header %u", f->part, name, f->seg_len[i],
++			    f->seg_filesz[i]);
++			ok = false;
++		}
++	}
++	lext4_unmount(&f->fs);
++	if (ok) {
++		LOG("fw: %s: ipa_fws.mdt %u bytes, segments at 0x%x-0x%x (PAS %u, region %x+%x)\n", f->part, f->mdt_len,
++		    lo, hi, LIPA_PAS_ID, LIPA_FW_PA, LIPA_FW_SIZE);
++	}
++	return ok;
++}
++
++/* topaz_pas.c callback: segment idx into the (zeroed, uncached) region at its offset */
++static int
++fw_seg(void *ctx, uint32_t idx, volatile uint8_t *dst, uint32_t room, char *why, size_t wl)
++{
++	struct ipa_fw *f = (struct ipa_fw *)ctx;
++
++	if (idx >= FW_SEGS || f->seg[idx] == NULL) {
++		snprintf(why, wl, "IPA firmware segment %u was not read", idx);
++		return ENOENT;
++	}
++	if (f->seg_filesz[idx] > room) {
++		snprintf(why, wl, "IPA firmware segment %u (%u bytes) passes the region end", idx, f->seg_filesz[idx]);
++		return EFBIG;
++	}
++	for (uint32_t i = 0; i < f->seg_filesz[idx]; i++) {
++		dst[i] = f->seg[idx][i];
++	}
++	return 0;
++}
++
++/* vendor_<active slot> first, then the other slot (the active slot from the GPT attributes of boot_a/_b) */
++static int
++fw_find(struct ipa_fw *f, char *why, size_t wl)
++{
++	uint64_t aa = 0, ab = 0;
++	int ea = EAGAIN, eb = EAGAIN;
++	char active = 'b', w0[160] = "";
++
++	for (int i = 0; i < 120 && (ea == EAGAIN || eb == EAGAIN); i++) {
++		ea = sweet_ufs_part_info("boot_a", &aa, NULL);
++		eb = sweet_ufs_part_info("boot_b", &ab, NULL);
++		if (ea == EAGAIN || eb == EAGAIN) {
++			IOSleep(500);
++		}
++	}
++	if (ea == EAGAIN || eb == EAGAIN) {
++		snprintf(why, wl, "UFS not readable after 60 s");
++		return -1;
++	}
++	if (ea == 0 && eb == 0 && ((aa ^ ab) & GPT_ATTR_ACTIVE) != 0) {
++		active = (aa & GPT_ATTR_ACTIVE) ? 'a' : 'b';
++	}
++	for (int k = 0; k < 2; k++) {
++		snprintf(f->part, sizeof(f->part), "vendor_%c", k == 0 ? active : (active == 'a' ? 'b' : 'a'));
++		if (fw_read(f, k == 0 ? w0 : why, k == 0 ? sizeof(w0) : wl)) {
++			return k;
++		}
++		LOG("fw: %s: %s\n", f->part, k == 0 ? w0 : why);
++		fw_free(f);
++	}
++	snprintf(why, wl, "no IPA firmware in vendor_a/_b: %s", w0);
++	return -1;
++}
++
++bool
++lipa_fw_load(char *why, size_t wl)
++{
++	struct ipa_fw *f = (struct ipa_fw *)kalloc_data(sizeof(*f), Z_WAITOK | Z_ZERO);
++	bool ok = false;
++
++	if (f == NULL) {
++		snprintf(why, wl, "no memory for the firmware state");
++		return false;
++	}
++	if (fw_find(f, why, wl) >= 0) {
++		struct topaz_pas p = {
++			.tag = "LaurelIPA: fw", .name = "IPA firmware", .pas_id = LIPA_PAS_ID,
++			.mdt = f->mdt, .mdt_len = f->mdt_len,
++			.region_pa = LIPA_FW_PA, .region_size = LIPA_FW_SIZE,
++			.ctx = f, .seg = fw_seg, .meta_alt = NULL,
++		};
++		int rc = topaz_pas_load(&p, why, wl);
++		ok = rc == 0;
++		if (!ok) {
++			LOG("fw: PAS %u load failed (%d): %s\n", LIPA_PAS_ID, rc, why);
++		}
++	}
++	fw_free(f);
++	kfree_data(f, sizeof(*f));
++	return ok;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ipa_hw.c b/bsd/dev/laurel_ipa_hw.c
+--- a/bsd/dev/laurel_ipa_hw.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_hw.c	2026-11-01 08:23:51.374988887 +0530
+@@ -0,0 +1,225 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP side (laurel 2780): clock, SMMU, registers, local memory, SMEM.
++ * What the stock 4.14 driver does at probe + ipa3_post_init() before the modem's IPA driver talks to it
++ * (ipa_v3/ipa.c, ipa_utils.c: ipa3_init_hw, ipa3_enable_dcd, ipa3_set_resorce_groups_min_max_limits,
++ * _ipa_init_sram_v3, the empty filter/route tables of _ipa_init_flt4/rt4_v3, ipa3_cfg_route), without an AP
++ * data path: no GSI channels of our own. The tables that the stock driver copies with IPA immediate commands
++ * (a GSI channel) are written here through the SRAM direct-access window (the same bytes; hackios-scion did
++ * the same on SM7325). The modem programs its own part (filter/route entries, headers) after INIT_MODEM_DRIVER.
++ * Register access only after the RPM acked the IPA clock vote (an unclocked IPA hangs the bus).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include "laurel_ipa_regs.h"
++
++extern bool topaz_rpm_write(uint32_t set, uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++extern bool topaz_smmu_identity(uint32_t sid, uint32_t mask, const char *name);
++extern void *topaz_pool_alloc(uint64_t size, uint64_t *pa);
++extern void *topaz_smem_partition(uint16_t a, uint16_t b);
++extern void *topaz_smem_get(void *part, uint16_t item, uint32_t *size);
++extern void *topaz_smem_alloc(void *part, uint16_t item, uint32_t size);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define LOG(...)                printf("LaurelIPA: " __VA_ARGS__)
++
++static inline uint32_t rd(struct lipa_mem *m, uint32_t o) { return *(volatile uint32_t *)(m->regs + o); }
++static inline void wr(struct lipa_mem *m, uint32_t o, uint32_t v) { *(volatile uint32_t *)(m->regs + o) = v; }
++
++/* RPM_SMD_IPA_CLK (both sets, as the stock "core_clk" = ipa_clk, not ipa_a_clk) */
++bool
++lipa_clock_on(char *why, size_t wl)
++{
++	bool ok = true;
++
++	for (uint32_t set = 0; set <= 1; set++) {
++		ok &= topaz_rpm_write(set, LIPA_RPM_TYPE, 0, LIPA_RPM_KEY_RATE, LIPA_CLK_KHZ);
++	}
++	LOG("RPM ipa clock %u kHz (active + sleep set): %s\n", LIPA_CLK_KHZ, ok ? "acked" : "refused");
++	if (!ok) {
++		snprintf(why, wl, "RPM refused the IPA clock vote (ipa id 0, %u kHz)", LIPA_CLK_KHZ);
++	}
++	return ok;
++}
++
++/* apps SMMU: the IPA's AP and uC streams in bypass (identity), so table addresses are physical */
++bool
++lipa_smmu(char *why, size_t wl)
++{
++	if (!topaz_smmu_identity(LIPA_SMMU_SID_AP, 0, "IPA")) {
++		snprintf(why, wl, "apps SMMU: no identity stream for IPA SID 0x%x", LIPA_SMMU_SID_AP);
++		return false;
++	}
++	if (!topaz_smmu_identity(LIPA_SMMU_SID_UC, 0, "IPA uC")) {
++		LOG("SMMU: no stream for the IPA uC (SID 0x%x); the uC is the modem's, going on\n", LIPA_SMMU_SID_UC);
++	}
++	return true;
++}
++
++/* map the registers + SRAM window, read the version and the shared memory layout */
++bool
++lipa_regs_map(struct lipa_mem *m, char *why, size_t wl)
++{
++	if (m->regs == NULL) {
++		m->regs = (volatile uint8_t *)ml_io_map(LIPA_REG_PA, LIPA_REG_SIZE);
++	}
++	if (m->regs == NULL) {
++		snprintf(why, wl, "cannot map the IPA registers %x+%x", LIPA_REG_PA, LIPA_REG_SIZE);
++		return false;
++	}
++	uint32_t ver = rd(m, R_VERSION), sms = rd(m, R_SHARED_MEM_SIZE);
++	m->restricted = 8 * (sms >> 16);
++	m->size = 8 * (sms & 0xFFFF);
++	LOG("IPA_VERSION %08x, SHARED_MEM_SIZE %08x: %u bytes at offset 0x%x, IPA_STATE %08x\n", ver, sms, m->size,
++	    m->restricted, rd(m, R_STATE));
++	if (ver == 0 || ver == ~0u) {
++		snprintf(why, wl, "IPA_VERSION reads %08x (clock or power off?)", ver);
++		return false;
++	}
++	if (m->size < M_END || R_SRAM_DIRECT + m->restricted + M_END > LIPA_REG_SIZE) {
++		snprintf(why, wl, "IPA local memory %u bytes at 0x%x: smaller than the v4.2 layout (0x2000)", m->size,
++		    m->restricted);
++		return false;
++	}
++	return true;
++}
++
++static inline void
++sram(struct lipa_mem *m, uint32_t o, uint32_t v)
++{
++	wr(m, R_SRAM_DIRECT + m->restricted + o, v);
++}
++
++static void
++sram64(struct lipa_mem *m, uint32_t o, uint64_t v)
++{
++	sram(m, o, (uint32_t)v);
++	sram(m, o + 4, (uint32_t)(v >> 32));
++}
++
++/* _ipa_init_sram_v3 for v4.2: ipa3_sram_set_canary(x) writes 0xdeadbeef at x - 4 */
++static void
++sram_init(struct lipa_mem *m)
++{
++	static const uint16_t two[] = {         /* set_canary(ofst - 4) and set_canary(ofst) */
++		0x288, M_V4_FLT, 0x310, M_V6_FLT, 0x398, M_V4_RT, 0x420, M_V6_RT, M_MODEM_HDR, M_MODEM_PROC_CTX,
++		M_PDN_CONFIG, M_QUOTA_Q6,
++	};
++	for (uint32_t o = M_OFST_START; o < M_END; o += 4) {
++		sram(m, o, 0);                  /* below 0x280: the uC's shared area and info, left alone */
++	}
++	for (unsigned i = 0; i < sizeof(two) / sizeof(two[0]); i++) {
++		sram(m, two[i] - 8u, M_CANARY);
++		sram(m, two[i] - 4u, M_CANARY);
++	}
++	sram(m, M_UC_DESC_RAM - 4u, M_CANARY);
++	/* empty tables: filter = bitmap << 1, then one entry per filtering pipe; route = one entry per index; every
++	 * entry = the system address of an empty (zero) rule table (ipahal_flt/rt_generate_empty_img) */
++	uint32_t npipes = (uint32_t)__builtin_popcount(M_FLT_PIPES);
++	for (uint32_t t = 0; t < 2; t++) {
++		uint32_t f = t == 0 ? M_V4_FLT : M_V6_FLT, r = t == 0 ? M_V4_RT : M_V6_RT;
++		sram64(m, f, (uint64_t)M_FLT_PIPES << 1);
++		for (uint32_t i = 1; i <= npipes; i++) {
++			sram64(m, f + 8 * i, m->zero_pa);
++		}
++		for (uint32_t i = 0; i < M_RT_INDICES; i++) {
++			sram64(m, r + 8 * i, m->zero_pa);
++		}
++	}
++}
++
++bool
++lipa_hw_init(struct lipa_mem *m, char *why, size_t wl)
++{
++	if (m->zero_pa == 0 && topaz_pool_alloc(0x1000, &m->zero_pa) == NULL) {
++		snprintf(why, wl, "no pool memory for the empty rule table");
++		return false;
++	}
++	wr(m, R_BCR, V_BCR);
++	wr(m, R_CLKON_CFG, V_CLKON_OPEN);
++	wr(m, R_TX_CFG, rd(m, R_TX_CFG) & ~V_TX_PA_MASK_EN);
++	wr(m, R_QSB_MAX_WRITES, V_QSB_WRITES);
++	wr(m, R_QSB_MAX_READS, V_QSB_READS);
++	wr(m, R_COUNTER_CFG, V_COUNTER_GRAN);
++	wr(m, R_COMP_CFG, rd(m, R_COMP_CFG) | V_COMP_BITS);
++	wr(m, R_FILT_ROUT_HASH_EN, V_HASH_EN);
++	wr(m, R_IDLE_INDICATION_CFG, V_IDLE_INDICATION);
++	/* resource groups (group 0 = UL_DL only): src pkt contexts 3..63, descriptor lists 3, descriptor buffers
++	 * 10, HPS DMARs 1, ack entries 5; dst data sectors 3, DPS DMARs 1..63 */
++	static const uint32_t src[] = { 0x3F03, 0x0303, 0x0A0A, 0x0101, 0x0505 }, dst[] = { 0x0303, 0x3F01 };
++	for (uint32_t n = 0; n < 5; n++) {
++		wr(m, R_SRC_RSRC_GRP_01(n), src[n]);
++	}
++	for (uint32_t n = 0; n < 2; n++) {
++		wr(m, R_DST_RSRC_GRP_01(n), dst[n]);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	/* self-check: the values read back (a write to an IPA that is not clocked is lost) */
++	uint32_t comp = rd(m, R_COMP_CFG), grp = rd(m, R_SRC_RSRC_GRP_01(0)), idle = rd(m, R_IDLE_INDICATION_CFG);
++	LOG("registers set: BCR %08x, TX_CFG %08x, COMP_CFG %08x, SRC_RSRC_GRP_01_0 %08x, IDLE_INDICATION_CFG %08x\n",
++	    rd(m, R_BCR), rd(m, R_TX_CFG), comp, grp, idle);
++	if ((comp & V_COMP_BITS) != V_COMP_BITS || (grp & 0x3F3F) != 0x3F03 || (idle & 0xFFFF) != V_IDLE_INDICATION) {
++		snprintf(why, wl, "IPA registers do not read back (COMP_CFG %08x, SRC_RSRC_GRP %08x)", comp, grp);
++		return false;
++	}
++	return true;
++}
++
++/* after the firmware (ipa3_post_init): local memory tables, header proc-ctx base, default route */
++bool
++lipa_sram_init(struct lipa_mem *m, char *why, size_t wl)
++{
++	sram_init(m);
++	wr(m, R_LOCAL_PKT_PROC_CNTXT, m->restricted + M_MODEM_PROC_CTX);
++	wr(m, R_ROUTE, V_ROUTE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint32_t can = rd(m, R_SRAM_DIRECT + m->restricted + M_UC_DESC_RAM - 4u), route = rd(m, R_ROUTE);
++	LOG("local memory set: ROUTE %08x, canary %08x, empty table %llx\n", route, can, (unsigned long long)m->zero_pa);
++	if (can != M_CANARY) {
++		snprintf(why, wl, "IPA local memory does not read back (canary %08x at 0x%x)", can, M_UC_DESC_RAM - 4u);
++		return false;
++	}
++	return true;
++}
++
++/* GSI_STATUS bit 0: TrustZone enabled the GSI with the firmware it loaded */
++bool
++lipa_gsi_enabled(uint32_t *status)
++{
++	static volatile uint32_t *g;
++
++	if (g == NULL) {
++		g = (volatile uint32_t *)ml_io_map(LIPA_GSI_STATUS_PA & ~0xFFFu, 0x1000);
++	}
++	if (g == NULL) {
++		*status = 0;
++		return false;
++	}
++	*status = g[(LIPA_GSI_STATUS_PA & 0xFFFu) / 4];
++	return (*status & 1) != 0;
++}
++
++/* SMEM_IPA_FILTER_TABLE in the apps<->modem partition (the modem puts its filter tables there) */
++bool
++lipa_smem_item(char *why, size_t wl)
++{
++	void *part = topaz_smem_partition(0, 1);
++	uint32_t sz = 0;
++
++	if (part == NULL) {
++		snprintf(why, wl, "no SMEM apps<->modem partition for item %u", LIPA_SMEM_ITEM);
++		return false;
++	}
++	if (topaz_smem_get(part, LIPA_SMEM_ITEM, &sz) != NULL) {
++		LOG("SMEM item %u already there (%u bytes)\n", LIPA_SMEM_ITEM, sz);
++		return true;
++	}
++	if (topaz_smem_alloc(part, LIPA_SMEM_ITEM, LIPA_SMEM_SIZE) == NULL) {
++		snprintf(why, wl, "cannot allocate SMEM item %u (%u bytes)", LIPA_SMEM_ITEM, LIPA_SMEM_SIZE);
++		return false;
++	}
++	LOG("SMEM item %u allocated, %u bytes (modem filter tables)\n", LIPA_SMEM_ITEM, LIPA_SMEM_SIZE);
++	return true;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ipa_qmi.c b/bsd/dev/laurel_ipa_qmi.c
+--- a/bsd/dev/laurel_ipa_qmi.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_qmi.c	2026-11-01 08:23:51.374988887 +0530
+@@ -0,0 +1,231 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP side (laurel 2780): the QMI service 0x31 messages, as the stock
++ * 4.14 driver (ipa_v3/ipa_qmi_service.c + _v01.c) sends and answers them. Pure functions (no state outside
++ * the caller's struct, no kernel calls): scripts/laurel/test-ipa.sh tests them on the host.
++ *  - client of the modem's service (Q6, instance 2): INIT_MODEM_DRIVER 0x21 with the v4.2 memory layout;
++ *  - our service (A5, instance 1) for the modem's client: INDICATION_REGISTER 0x20, INSTALL_FILTER_RULE 0x23
++ *    (answer echoes the rule ids), FILTER_INSTALLED_NOTIF 0x24, CONFIG 0x27, INIT_MODEM_DRIVER_CMPLT 0x35;
++ *  - indication MASTER_DRIVER_INIT_COMPLETE 0x22 when both INIT_MODEM_DRIVER and INDICATION_REGISTER are done.
++ * QMI over QRTR: 7-byte header (type, txn, message id, length), then TLVs (type u8, length u16, value).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "laurel_ipa_regs.h"
++
++#define QMI_REQ                 0
++#define QMI_RESP                2
++#define QMI_IND                 4
++
++#define MSG_IND_REGISTER        0x0020
++#define MSG_INIT_MODEM          0x0021
++#define MSG_MASTER_INIT_IND     0x0022
++#define MSG_INSTALL_FILTER      0x0023
++#define MSG_FILTER_NOTIF        0x0024
++#define MSG_CONFIG              0x0027
++#define MSG_INIT_CMPLT          0x0035
++
++#define MAX_Q6_RULES            35u             /* MAX_NUM_Q6_RULE */
++#define QMI_ERR_MALFORMED       0x0001
++
++struct mb { uint8_t *b; uint32_t n, cap; bool bad; };
++
++static void
++put(struct mb *m, const void *v, uint32_t len)
++{
++	if (m->bad || m->n + len > m->cap) {
++		m->bad = true;
++		return;
++	}
++	memcpy(m->b + m->n, v, len);
++	m->n += len;
++}
++
++static void
++hdr(struct mb *m, uint8_t type, uint16_t txn, uint16_t msg)
++{
++	uint8_t h[7] = { type, (uint8_t)txn, (uint8_t)(txn >> 8), (uint8_t)msg, (uint8_t)(msg >> 8), 0, 0 };
++	put(m, h, sizeof(h));
++}
++
++static void
++tlv(struct mb *m, uint8_t type, const void *v, uint16_t len)
++{
++	uint8_t t[3] = { type, (uint8_t)len, (uint8_t)(len >> 8) };
++	put(m, t, sizeof(t));
++	put(m, v, len);
++}
++
++static void
++tlv32(struct mb *m, uint8_t type, uint32_t a)
++{
++	tlv(m, type, &a, 4);                    /* arm64 and the host test: little endian, as QMI */
++}
++
++static void
++tlv32x2(struct mb *m, uint8_t type, uint32_t a, uint32_t b)
++{
++	uint32_t v[2] = { a, b };
++	tlv(m, type, v, 8);
++}
++
++static void
++result(struct mb *m, uint16_t res, uint16_t err)
++{
++	uint16_t v[2] = { res, err };
++	tlv(m, 0x02, v, 4);
++}
++
++/* the message length into the header: m->n, or 0 when it did not fit */
++static uint32_t
++done(struct mb *m)
++{
++	if (m->bad || m->n < 7) {
++		return 0;
++	}
++	uint16_t l = (uint16_t)(m->n - 7);
++	memcpy(m->b + 5, &l, 2);
++	return m->n;
++}
++
++/* TLV lookup after the 7-byte header */
++static const uint8_t *
++find(const uint8_t *d, uint32_t len, uint8_t type, uint16_t *tlen)
++{
++	for (uint32_t o = 7; o + 3 <= len;) {
++		uint16_t l = (uint16_t)(d[o + 1] | d[o + 2] << 8);
++		if (o + 3u + l > len) {
++			return NULL;
++		}
++		if (d[o] == type) {
++			*tlen = l;
++			return d + o + 3;
++		}
++		o += 3u + l;
++	}
++	return NULL;
++}
++
++/* ipa3_qmi_init_modem_send_sync_msg() for IPA_HW_v4_2: no hashed tables, no zip, first boot (no is_ssr_bootup) */
++uint32_t
++lipa_qmi_init_modem_req(uint8_t *out, uint32_t cap, uint16_t txn, uint32_t r)
++{
++	struct mb m = { out, 0, cap, false };
++
++	hdr(&m, QMI_REQ, txn, MSG_INIT_MODEM);
++	tlv32(&m, 0x10, LIPA_PLATFORM_ANDROID);
++	tlv32x2(&m, 0x11, M_MODEM_HDR + r, M_MODEM_HDR + r + M_MODEM_HDR_SIZE - 1);
++	tlv32x2(&m, 0x12, M_V4_RT + r, M_RT_MODEM_HI);
++	tlv32x2(&m, 0x13, M_V6_RT + r, M_RT_MODEM_HI);
++	tlv32(&m, 0x14, M_V4_FLT + r);
++	tlv32(&m, 0x15, M_V6_FLT + r);
++	tlv32x2(&m, 0x16, M_MODEM + r, M_MODEM_SIZE);
++	tlv32(&m, 0x17, M_CTRL_ENDPOINT);
++	tlv32x2(&m, 0x19, M_MODEM_PROC_CTX + r, M_MODEM_PROC_CTX + M_MODEM_PROC_CTX_SIZE + r - 1);
++	tlv32(&m, 0x1F, M_QUOTA_Q6 + r);
++	tlv32(&m, 0x20, M_QUOTA_Q6_SIZE);
++	tlv32(&m, 0x21, M_DROP_STATS + r);
++	tlv32(&m, 0x22, 0);                     /* stats_drop_size 0 on v4.2 */
++	return done(&m);
++}
++
++/* the modem's answer to INIT_MODEM_DRIVER: 0 success, 1 QMI error (err), -1 not this answer / malformed */
++int
++lipa_qmi_init_modem_resp(const uint8_t *d, uint32_t len, uint16_t *err)
++{
++	uint16_t l = 0;
++	const uint8_t *r;
++
++	if (len < 7 || d[0] != QMI_RESP || (d[3] | d[4] << 8) != MSG_INIT_MODEM) {
++		return -1;
++	}
++	r = find(d, len, 0x02, &l);
++	if (r == NULL || l < 4) {
++		return -1;
++	}
++	*err = (uint16_t)(r[2] | r[3] << 8);
++	return (r[0] | r[1] << 8) == 0 ? 0 : 1;
++}
++
++/* INSTALL_FILTER_RULE: echo the rule ids of filter_spec_ex_list (TLV 0x15: u8 count, then the elements; the
++ * rule_id is the u32 before the last byte (is_rule_hashable) of each element) in TLV 0x11 */
++static void
++filter_answer(struct lipa_srv *s, const uint8_t *d, uint32_t len, struct mb *m)
++{
++	uint16_t l = 0;
++	const uint8_t *v = find(d, len, 0x15, &l);
++	uint8_t ids[1 + 4 * MAX_Q6_RULES];
++	uint32_t n = 0, es = 0;
++
++	if (v != NULL && l >= 1 && v[0] != 0 && (uint32_t)(l - 1) % v[0] == 0 && (es = (uint32_t)(l - 1) / v[0]) >= 5) {
++		n = MIN((uint32_t)v[0], MAX_Q6_RULES);
++		for (uint32_t i = 0; i < n; i++) {
++			memcpy(ids + 1 + 4 * i, v + 1 + es * i + es - 5, 4);
++		}
++		result(m, 0, 0);
++		ids[0] = (uint8_t)n;
++		tlv(m, 0x11, ids, (uint16_t)(1 + 4 * n));
++	} else if (v != NULL && l >= 1 && v[0] != 0) {
++		result(m, 1, QMI_ERR_MALFORMED);        /* element size does not divide: refuse, do not guess */
++		return;
++	} else {
++		result(m, 0, 0);                        /* no ex list: rule_id_valid 0 */
++	}
++	s->filters = true;
++	s->rules += n;
++}
++
++/*
++ * One request of the modem's client to our service: the answer in out (its length; 0 = no answer: not a
++ * request, or a message the stock driver does not serve either), the message id in *msg_id.
++ */
++uint32_t
++lipa_qmi_serve(struct lipa_srv *s, const uint8_t *d, uint32_t len, uint8_t *out, uint32_t cap, uint16_t *msg_id)
++{
++	struct mb m = { out, 0, cap, false };
++	uint16_t txn, msg;
++
++	*msg_id = 0;
++	if (len < 7 || d[0] != QMI_REQ) {
++		return 0;
++	}
++	txn = (uint16_t)(d[1] | d[2] << 8);
++	msg = (uint16_t)(d[3] | d[4] << 8);
++	*msg_id = msg;
++	hdr(&m, QMI_RESP, txn, msg);
++	switch (msg) {
++	case MSG_IND_REGISTER:
++		s->ind_registered = true;
++		result(&m, 0, 0);
++		break;
++	case MSG_INSTALL_FILTER:
++		filter_answer(s, d, len, &m);
++		break;
++	case MSG_FILTER_NOTIF:
++		result(&m, 0, 0);
++		break;
++	case MSG_CONFIG:
++		s->configs++;
++		result(&m, 0, 0);
++		break;
++	case MSG_INIT_CMPLT:
++		s->init_cmplt = true;
++		result(&m, 0, 0);
++		break;
++	default:
++		return 0;
++	}
++	return done(&m);
++}
++
++/* MASTER_DRIVER_INIT_COMPLETE indication: TLV 0x02 master_driver_init_status = success */
++uint32_t
++lipa_qmi_master_ind(uint8_t *out, uint32_t cap, uint16_t txn)
++{
++	struct mb m = { out, 0, cap, false };
++
++	hdr(&m, QMI_IND, txn, MSG_MASTER_INIT_IND);
++	result(&m, 0, 0);
++	return done(&m);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ipa_regs.h b/bsd/dev/laurel_ipa_regs.h
+--- a/bsd/dev/laurel_ipa_regs.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_regs.h	2026-11-01 08:23:51.374988887 +0530
+@@ -0,0 +1,137 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2, AP side (laurel 2780): addresses, registers, memory layout and the
++ * functions shared by laurel_ipa.c (start, state, hooks), laurel_ipa_fw.c (firmware, PAS 15),
++ * laurel_ipa_hw.c (clock, SMMU, registers, local memory) and laurel_ipa_qmi.c (QMI service 0x31).
++ * Values: stock 4.14 kernel drivers/platform/msm/ipa/ipa_v3 (laurel-kernel-los) and trinket.dtsi;
++ * docs/laurel_sprout/cellular.md "Step 2 facts".
++ */
++#ifndef LAUREL_IPA_REGS_H
++#define LAUREL_IPA_REGS_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++/* ---- addresses (trinket.dtsi qcom,ipa@5800000; ipahal_get_reg_base() = 0x40000) */
++#define LIPA_REG_PA             0x05840000u     /* IPA registers = ipa-base + 0x40000 */
++#define LIPA_REG_SIZE           0x00010000u     /* registers + the SRAM direct-access window */
++#define LIPA_GSI_STATUS_PA      0x05823000u     /* GSI 0x5804000 + 0x1f000 (EE 0): bit 0 ENABLED */
++#define LIPA_FW_PA              0x57500000u     /* reserved pil_ipa_fw_mem (qcom,ipa_fws memory-region) */
++#define LIPA_FW_SIZE            0x00010000u
++#define LIPA_PAS_ID             15u             /* trinket.dtsi qcom,ipa_fws qcom,pas-id <0xf> [V] */
++#define LIPA_SMMU_SID_AP        0xE0u           /* ipa_smmu_ap, mask 0 */
++#define LIPA_SMMU_SID_UC        0xE2u           /* ipa_smmu_uc, mask 0 */
++#define LIPA_SMEM_ITEM          497u            /* SMEM_IPA_FILTER_TABLE, apps<->modem partition */
++#define LIPA_SMEM_SIZE          0x2000u         /* IPA_SMEM_SIZE (no qcom,ipa-q6-smem-size in the DT) */
++
++/* ---- RPM SMD clock (clk-smd-rpm.c trinket ipa_clk: QCOM_SMD_RPM_IPA_CLK, id 0, key "KHz") */
++#define LIPA_RPM_TYPE           0x00617069u     /* "ipa" */
++#define LIPA_RPM_KEY_RATE       0x007A484Bu     /* "KHz" */
++#define LIPA_CLK_KHZ            201000u         /* IPA_V4_2_CLK_RATE_NOMINAL (svs2 50, svs 100, turbo 240 MHz) */
++
++/* ---- registers (offsets from LIPA_REG_PA; ipahal_reg.c, IPA_HW_v4_2 with inheritance) */
++#define R_VERSION               0x034
++#define R_COMP_CFG              0x03C           /* bit 7 GSI_MULTI_INORDER_RD_DIS, 8 _WR_DIS, 15 MULTI_AXI_MASTERS_DIS */
++#define R_CLKON_CFG             0x044           /* bit 28 OPEN_GLOBAL, 29 OPEN_GLOBAL_2X_CLK */
++#define R_ROUTE                 0x048
++#define R_SHARED_MEM_SIZE       0x054           /* [15:0] size, [31:16] base (restricted bytes), 8-byte units */
++#define R_QSB_MAX_WRITES        0x074           /* [3:0] QMB 0, [7:4] QMB 1 */
++#define R_QSB_MAX_READS         0x078           /* [3:0] QMB 0, [7:4] QMB 1 */
++#define R_STATE                 0x0A8
++#define R_FILT_ROUT_HASH_EN     0x148
++#define R_BCR                   0x1D0
++#define R_LOCAL_PKT_PROC_CNTXT  0x1E8
++#define R_COUNTER_CFG           0x1F0           /* [8:4] AGGR_GRANULARITY */
++#define R_TX_CFG                0x1FC           /* bit 12 PA_MASK_EN */
++#define R_IDLE_INDICATION_CFG   0x240           /* [15:0] debounce, bit 16 const non-idle */
++#define R_SRC_RSRC_GRP_01(n)    (0x400u + 0x20u * (n))  /* x_min [5:0] x_max [13:8] (group 0), y (group 1) */
++#define R_DST_RSRC_GRP_01(n)    (0x500u + 0x20u * (n))
++#define R_SRAM_DIRECT           0x7000          /* IPA_SW_AREA_RAM_DIRECT_ACCESS_n, n = byte offset / 4 */
++
++/* values of ipa3_init_hw() / ipa3_post_init() for IPA_HW_v4_2 */
++#define V_BCR                   0x00000000u     /* IPA_BCR_REG_VAL_v4_2 */
++#define V_CLKON_OPEN            ((1u << 28) | (1u << 29))
++#define V_TX_PA_MASK_EN         (1u << 12)
++#define V_QSB_WRITES            8u              /* ipa3_qmb_outstanding[IPA_4_2][DDR] = { reads 12, writes 8 } */
++#define V_QSB_READS             12u
++#define V_COUNTER_GRAN          (15u << 4)      /* GRAN_VALUE_500_USEC */
++#define V_COMP_BITS             ((1u << 7) | (1u << 8) | (1u << 15))
++#define V_HASH_EN               0x00000000u     /* IPA_FILT_ROUT_HASH_REG_VAL_v4_2: hashing off */
++#define V_IDLE_INDICATION       256u            /* ipa3_enable_dcd(): debounce 256, const non-idle off */
++#define V_ROUTE                 0x01100050u     /* default pipe 8 (APPS_LAN_CONS), local header table, retain */
++
++/* ---- local memory (ipa_4_2_mem_part; offsets from the start of the shared memory) */
++#define M_OFST_START            0x280u
++#define M_V4_FLT                0x290u          /* non-hashed; hashed tables have size 0 on v4.2 */
++#define M_V6_FLT                0x318u
++#define M_FLT_SIZE              0x78u
++#define M_V4_RT                 0x3A0u
++#define M_V6_RT                 0x428u
++#define M_RT_SIZE               0x78u
++#define M_RT_INDICES            15u             /* modem 0-7, apps 8-14 */
++#define M_RT_MODEM_HI           7u
++#define M_MODEM_HDR             0x4A8u
++#define M_MODEM_HDR_SIZE        0x140u
++#define M_MODEM_PROC_CTX        0x5F0u
++#define M_MODEM_PROC_CTX_SIZE   0x200u
++#define M_PDN_CONFIG            0x9F8u
++#define M_QUOTA_Q6              0xA50u
++#define M_QUOTA_Q6_SIZE         0x60u
++#define M_MODEM                 0xBF0u
++#define M_MODEM_SIZE            0x140Cu
++#define M_DROP_STATS            0xBF0u          /* stats_drop: size 0 on v4.2 */
++#define M_UC_DESC_RAM           0x2000u
++#define M_END                   0x2000u
++#define M_CANARY                0xDEADBEEFu
++#define M_FLT_PIPES             0x9Bu           /* ep_flt_bitmap: USB_PROD 0, APPS_WAN_PROD 1, WLAN1_PROD 3, Q6_WAN_PROD 4, ETH_PROD 7 */
++#define M_CTRL_ENDPOINT         9u              /* APPS_WAN_CONS: ctrl_comm_dest_end_pt */
++
++/* ---- QMI service 0x31 (ipa_qmi_service_v01.h) */
++#define LIPA_QMI_SVC            0x31u
++#define LIPA_QMI_INST_AP        0x0101u         /* QRTR instance word: version 1 | instance 1 << 8 (A5 service) */
++#define LIPA_QMI_INST_MODEM     0x0201u         /* version 1 | instance 2 << 8 (Q6 service) */
++#define LIPA_PORT_SERVER        0x4015u         /* our QRTR ports: AP server, client of the modem's service */
++#define LIPA_PORT_CLIENT        0x4016u
++#define LIPA_PLATFORM_ANDROID   3u              /* IPA_QMI_PLATFORM_TYPE_MSM_ANDROID_V01 */
++
++/* ---- shared functions */
++struct lipa_mem {
++	volatile uint8_t *regs;                 /* LIPA_REG_PA mapping */
++	uint32_t restricted;                    /* SHARED_MEM_SIZE base, bytes */
++	uint32_t size;                          /* SHARED_MEM_SIZE size, bytes */
++	uint64_t zero_pa;                       /* DDR "zero rule" the empty tables point to */
++};
++
++/* laurel_ipa_hw.c: one line reason in why on false */
++bool lipa_clock_on(char *why, size_t wl);
++bool lipa_smmu(char *why, size_t wl);
++bool lipa_regs_map(struct lipa_mem *m, char *why, size_t wl);
++bool lipa_hw_init(struct lipa_mem *m, char *why, size_t wl);        /* registers (ipa3_init_hw): before the fw */
++bool lipa_sram_init(struct lipa_mem *m, char *why, size_t wl);      /* local memory tables: after GSI is up */
++bool lipa_gsi_enabled(uint32_t *status);
++bool lipa_smem_item(char *why, size_t wl);
++
++/* laurel_ipa_fw.c: the IPA firmware from the vendor partition through TrustZone PAS 15 */
++bool lipa_fw_load(char *why, size_t wl);
++
++/* laurel_ipa_qmi.c: message builders / handlers (pure: host-tested by scripts/laurel/test-ipa.sh) */
++uint32_t lipa_qmi_init_modem_req(uint8_t *out, uint32_t cap, uint16_t txn, uint32_t restricted);
++int lipa_qmi_init_modem_resp(const uint8_t *d, uint32_t len, uint16_t *err);
++struct lipa_srv {
++	bool ind_registered, init_cmplt, filters, ind_sent;
++	uint32_t rules, configs;
++};
++uint32_t lipa_qmi_serve(struct lipa_srv *s, const uint8_t *d, uint32_t len, uint8_t *out, uint32_t cap,
++    uint16_t *msg_id);
++uint32_t lipa_qmi_master_ind(uint8_t *out, uint32_t cap, uint16_t txn);
++
++/* laurel_ipa.c: called by TopazModem.cpp (modem watch thread) */
++bool laurel_ipa_enabled(void);                  /* boot-arg ipa (kill switch ipa=0) */
++void laurel_ipa_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port, bool up);
++bool laurel_ipa_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d, uint32_t len);
++void laurel_ipa_poll(bool ready, bool glink);
++uint32_t laurel_ipa_smp2p_answer(void);         /* SMP2P "ipa" answer: bit 0 valid, bit 1 AP IPA clock on */
++void laurel_ipa_off(const char *why);           /* modem crash, watch end, modem=0: off, no restart */
++/* for laurel_cell.c: true when the AP IPA side is on (radio may go ONLINE); else the reason in *why */
++bool laurel_ipa_state(const char **why);
++
++#endif
+diff -ruN a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp	2026-11-01 08:23:51.373988877 +0530
++++ b/iokit/Kernel/arm/TopazModem.cpp	2026-11-01 08:23:51.375988897 +0530
+@@ -870,6 +870,13 @@
+ extern "C" bool laurel_cell_rx(uint32_t dst_port, const uint8_t *d, uint32_t len);
+ extern "C" void laurel_cell_poll(bool ready, bool glink);
+ extern "C" void laurel_cell_off(const char *why);
++/* laurel 2780: the IPA v4.2 AP side (bsd/dev/laurel_ipa.c): its QMI 0x31 service + client on our QRTR, SMP2P "ipa" */
++extern "C" bool laurel_ipa_enabled(void);
++extern "C" void laurel_ipa_server(uint32_t svc, uint32_t inst, uint32_t node, uint32_t port, bool up);
++extern "C" bool laurel_ipa_rx(uint32_t src_node, uint32_t src_port, uint32_t dst_port, const uint8_t *d, uint32_t len);
++extern "C" void laurel_ipa_poll(bool ready, bool glink);
++extern "C" uint32_t laurel_ipa_smp2p_answer(void);
++extern "C" void laurel_ipa_off(const char *why);
+ 
+ /* ---------------------------------------------------------------- GLINK over SMEM */
+ 
+@@ -1214,11 +1221,13 @@
+ 		} else if (c->a != 0) {
+ 			LOG("t=%u ms: service %x:%x port %x %s", g_ms, c->a, c->b, c->d, svc_name(c->a));
+ 			laurel_cell_server(c->a, c->b, c->c, c->d, true);
++			laurel_ipa_server(c->a, c->b, c->c, c->d, true);
+ 		}
+ 		break;
+ 	case QRTR_TYPE_DEL_SERVER:
+ 		if (c->a != 0 && c->a != QMI_SVC_WLFW) {
+ 			laurel_cell_server(c->a, c->b, c->c, c->d, false);
++			laurel_ipa_server(c->a, c->b, c->c, c->d, false);
+ 		}
+ 		break;
+ 	case QRTR_TYPE_DATA:
+@@ -5133,6 +5142,9 @@
+ 	if (dst_port >= PORT_SESS && dst_port < PORT_SESS + 0x10000) {
+ 		return tftp_session(dst_port, data, len);
+ 	}
++	if (laurel_ipa_rx(src_node, src_port, dst_port, data, len)) {  /* laurel 2780: IPA QMI ports 0x4015/0x4016 */
++		return true;
++	}
+ 	if (laurel_cell_rx(dst_port, data, len)) {      /* laurel 2760: our cellular client ports 0x4010-0x4014 */
+ 		return true;
+ 	}
+@@ -5160,6 +5172,14 @@
+ 	qrtr_send(QRTR_TYPE_DATA, src_port, node, port, data, len);
+ }
+ 
++/* laurel 2780: announce one of our services to the modem (as svc_announce; the IPA's QMI 0x31 server) */
++extern "C" void
++topaz_qrtr_new_server(uint32_t svc, uint32_t inst, uint32_t port)
++{
++	struct qrtr_ctrl c = { QRTR_TYPE_NEW_SERVER, svc, inst, QRTR_NODE_APPS, port };
++	qrtr_send(QRTR_TYPE_NEW_SERVER, QRTR_PORT_CTRL, q_modem_node, QRTR_PORT_CTRL, &c, sizeof(c));
++}
++
+ extern "C" uint32_t
+ topaz_qrtr_services(void)
+ {
+@@ -5193,6 +5213,7 @@
+ 		LOG("cannot create SMP2P item %u", ITEM_SMP2P_OUT);
+ 		laurel_wifi(false, "cannot create SMP2P item %u", ITEM_SMP2P_OUT);
+ 		laurel_cell_off("cannot create the SMP2P item for the modem");
++		laurel_ipa_off("cannot create the SMP2P item for the modem");
+ 		return;
+ 	}
+ 	ipa_out = smp2p_add_out(out, "ipa", 0);
+@@ -5204,6 +5225,7 @@
+ 				ready = false;  /* no retry */
+ 				laurel_wifi(false, "modem up, GLINK (IPCRTR over SMEM) did not start");
+ 				laurel_cell_off("modem up, GLINK (IPCRTR over SMEM) did not start");
++				laurel_ipa_off("modem up, GLINK (IPCRTR over SMEM) did not start");
+ 			}
+ 		}
+ 		if (glink) {
+@@ -5250,6 +5272,7 @@
+ 					char cw[160];
+ 					snprintf(cw, sizeof(cw), "modem crashed: %s", why != NULL ? buf : "(no reason in SMEM)");
+ 					laurel_cell_off(cw);
++					laurel_ipa_off(cw);
+ 				}
+ 				if (glink) {
+ 					glink_summary();
+@@ -5261,12 +5284,15 @@
+ 			laurel_wifi_watch(ms, ready || glink, sk_last == ~0u ? 0 : sk_last);
+ 		}
+ 		laurel_cell_poll(ready, glink);                 /* laurel 2760 */
++		laurel_ipa_poll(ready, glink);                  /* laurel 2780: IPA thread at READY, then QMI 0x31 */
+ 		if (ipa_in != NULL && ipa_out != NULL && *ipa_in != ipa_last) {
+ 			uint32_t v = *ipa_in;
+ 			if ((v & 1) && !(ipa_last != ~0u && (ipa_last & 1))) {
+-				*ipa_out = 1;                   /* answer valid, AP IPA power off */
++				/* laurel 2780: bit 0 valid, bit 1 AP IPA clock on (ipa3_freeze_clock_vote_and_notify_modem) */
++				uint32_t a = laurel_ipa_smp2p_answer();
++				*ipa_out = a;
+ 				smp2p_kick();
+-				LOG("t=%u ms: answered IPA power query (%08x)", ms, v);
++				LOG("t=%u ms: answered IPA power query (%08x): %u (%s)", ms, v, a, (a & 2) ? "AP IPA clock on" : "AP IPA clock off");
+ 			}
+ 			ipa_last = v;
+ 		}
+@@ -5274,6 +5300,7 @@
+ 	}
+ 	LOG("watch done: slave-kernel %08x, %s", sk_last, ready ? "READY" : "NOT ready");
+ 	laurel_cell_off("modem watch ended (boot-arg modem_watch): nobody serves the QMI clients");
++	laurel_ipa_off("modem watch ended (boot-arg modem_watch): nobody serves the QMI clients");
+ 	if (glink) {
+ 		glink_summary();
+ 	}
+@@ -5660,6 +5687,7 @@
+ 	if (!topaz_soc_map()) {
+ 		laurel_wifi(false, "%s", soc_why);
+ 		laurel_cell_off(soc_why);
++		laurel_ipa_off(soc_why);
+ 		thread_terminate(current_thread());
+ 		return;
+ 	}
+@@ -5684,6 +5712,7 @@
+ 		char cw[160];
+ 		snprintf(cw, sizeof(cw), "modem boot: %s", boot_why[0] != 0 ? boot_why : "failed");
+ 		laurel_cell_off(cw);
++		laurel_ipa_off(cw);
+ 	}
+ 	/* keep the mappings: the modem uses SMEM from now on */
+ 	thread_terminate(current_thread());
+@@ -5707,9 +5736,11 @@
+ 	if (on == 0) {
+ 		laurel_wifi(false, "boot-arg modem=0");
+ 		laurel_cell_off("boot-arg modem=0");
++		laurel_ipa_off("boot-arg modem=0");
+ 		return;
+ 	}
+ 	(void)laurel_cell_enabled();                /* laurel 2760: the "off: boot-arg cell=0" line, early */
++	(void)laurel_ipa_enabled();                 /* laurel 2780: the "off: boot-arg ipa=0" line, early */
+ 	topaz_sta_init();                           /* private: bsd/dev/topaz_sta.c (en0 + Apple80211 for wifid) */
+ 	if (kernel_thread_start(topaz_modem_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);

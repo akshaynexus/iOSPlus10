@@ -195,6 +195,17 @@ topaz_qrtr_services(void)
 	return 7;
 }
 
+/* laurel 2780: the IPA state (laurel_ipa.c in the kernel); a scenario sets test_ipa_on */
+static bool test_ipa_on;
+bool laurel_ipa_state(const char **why);
+bool
+laurel_ipa_state(const char **why)
+{
+	*why = test_ipa_on ? "" : "AP IPA side still starting (QMI 0x31 INIT_MODEM_DRIVER not done): ONLINE without it "
+	    "can crash the modem and with it Wi-Fi";
+	return test_ipa_on;
+}
+
 #include "laurel_cell.c"
 #undef printf
 
@@ -263,7 +274,7 @@ scenario(char s)
 		services(true);
 		run_ms(30000, true);
 		CHECK(nsaid == 1);
-		CHECK(strstr(last(), "LAUREL CELL: on: SIM1 present (USIM ready), SIM2 absent; modem low power; radio off: no AP IPA driver") != NULL);
+		CHECK(strstr(last(), "LAUREL CELL: on: SIM1 present (USIM ready), SIM2 absent; modem low power; radio off: AP IPA side still starting") != NULL);
 		CHECK(M.prov_reqs == 1 && M.prov_session[0] == 0 && M.prov_slot[0] == 1);
 		CHECK(M.set_online == 0);
 		CHECK(M.binds[0] == 1 && M.binds[1] == 0);
@@ -290,7 +301,7 @@ scenario(char s)
 		break;
 	case 'C':       /* IPA up (step 2 self-check), SIM only in slot 2: online, registered, signal; then hot swap */
 		scen = "C online + hot swap";
-		ipa_up = true;
+		test_ipa_on = true;
 		M.sim[1].card = 1; M.sim[1].type = 2; M.sim[1].state = 7;
 		services(true);
 		run_ms(40000, true);

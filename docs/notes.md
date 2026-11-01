@@ -4397,3 +4397,25 @@ Details: `docs/laurel_sprout/battery-power.md`.
   stage 1 + plug-in registered + m2vtest pass (kept per build; a test that never ended = fail).
 - Built 08:35 on Linux in the worktree: kernel 252/252 patches, 0 LSE, kernel.development.sweet.4k sha256 f83432141a1b7f8f...; Mesa 53 s (exports redwood_drm_surface_drawn), userland
   4 Mach-O + gate 0 instructions newer than ARMv8.0; metal-build.sh check PASS (stage unchanged). NOT BOOTED.
+## Mi A3: cellular step 2 = IPA v4.2 AP side + one shared PAS loader; patches 2775 + 2780 (2026-11-01, cellular agent, branch t3/laurel-cellular-ipa3; build + host test only, NOT BOOTED)
+- Details: docs/laurel_sprout/cellular.md section 6 (facts table, steps, expected lines, risks).
+- Renumbered: the IPA patch was 2770 on t3/laurel-cellular-ipa2, but 2770 is the camera patch: now 2780. Its bsd/conf/files
+  hunk anchors on laurel_cell.c/laurel_bt.c (applies after 2770 unchanged).
+- [V] PAS id 15: trinket.dtsi `qcom,ipa_fws` (pil-tz-generic, pas-id <0xf>, pil_ipa_fw_mem); ipa.c loads "ipa_fws" with
+  subsystem_get() = subsys-pil-tz, after its SMMU attach, with the IPA clock voted.
+- [V] ipa_fws: `.mdt` 7020 = `.b00` (212) + `.b01` (hash 6808); loadable phdrs 2/3/4 at 0/0x4000/0x4080 (relocatable), span
+  0x41c0, mem_setup size 0x5000; hash phdr 1 (paddr 0x5000) is not loaded.
+- [V] INIT_MODEM_DRIVER TLV types 0x10-0x22 checked against ipa_qmi_service_v01.c; the v4.2 values against ipa_4_2_mem_part.
+- [V] Modem announces QMI 0x31:201 at node 0 port 0x19 ~270 ms after auth_and_reset (3 boots); the SMP2P "ipa" query did
+  not come in the 08:12 boot. SMP2P answer bits: 0 response complete, 1 clock on (ipa3_freeze_clock_vote_and_notify_modem).
+- 2775: `bsd/dev/topaz_pas.c` = the zap loader's TrustZone sequence as one function (struct topaz_pas: tag, name, PAS id,
+  .mdt, region, segment callback, metadata fallback). TopazAdreno zap_load is a caller (same TopazGPU lines). TopazAudio and
+  the modem PAS boot still have their own copies (not switched: they work; a later cleanup).
+- 2780 split laurel_ipa_hw.c: lipa_hw_init = registers only (ipa3_init_hw, before the fw); lipa_sram_init = tables after GSI
+  (ipa3_post_init). Self-checks: registers read back incl. IDLE_INDICATION_CFG 256; SRAM canary.
+- Host tests on Linux need: -DARM64_BOARD_CONFIG_SWEET (topaz_pas.c tests it before its includes), -Wno-format (uint64_t is
+  unsigned long on Linux), and `dsb sy` -> __sync_synchronize() on x86 (test-ipa.sh does it).
+- Build [V]: kernel-linux.sh 253/253 patches, 0 failed, 0 LSE, no warnings in the new files; kernel sha256 5a87216f4bf8bd1c...
+  test-ipa.sh PASS (qmi, pas 7 cases, ext4 = debugfs, lipa_fw_load end to end); test-cell.sh 8/8.
+- Next: boot (owner); read LaurelIPA / LAUREL IPA; if on, watch for a modem crash after ONLINE (Wi-Fi stops with it);
+  fallback `ipa=0`. Then step 3 (GSI channels, WDA/WDS data path).

@@ -1,0 +1,506 @@
+laurel 2775: one shared TrustZone peripheral-image (PAS) loader, bsd/dev/topaz_pas.c + topaz_pas.h: PAS_IS_SUPPORTED -> PAS_INIT_IMAGE(metadata = the whole .mdt) -> PAS_MEM_SETUP(region, page-aligned span of the loadable segments) -> zero the region, copy each loadable segment at p_paddr - lowest p_paddr (relocatable, as Linux mdt_loader) through a caller callback -> PAS_AUTH_AND_RESET; PAS_SHUTDOWN only when init_image passed and a later step failed (Linux pil_deinit_image_trusted). Every call goes through TopazModem's topaz_scm() (one lock, laurel 2404). Metadata in the TopazModem pool (below 4 GiB), an optional caller buffer when that pool is off. This is the documented sequence of Android's subsys-pil-tz.c / peripheral_loader.c and mainline qcom_scm_pas_*. The GPU zap shader (TopazAdreno.cpp zap_load, PAS 13, laurel 2153) is now a caller: same order, same TopazGPU log lines (tag 'TopazGPU: zap'), the GPU pool stays its metadata fallback, still only the first code segment; only the reason texts of three error paths changed wording ('zap shader layout', 'zap shader metadata', 'TopazGPU: zap: no contiguous buffer ...'). The IPA firmware (laurel 2780, PAS 15) is the second caller. TopazAudio and the modem loader keep their own code for now (not switched: no behaviour change there).
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 08:23:51.351988654 +0530
++++ b/bsd/conf/files	2026-11-01 08:23:51.365283888 +0530
+@@ -140,6 +140,7 @@
+ bsd/dev/laurel_cam.c			standard
+ bsd/dev/laurel_cam_hw.c			standard
+ bsd/dev/laurel_cam_cci.c			standard
++bsd/dev/topaz_pas.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff -ruN a/bsd/dev/topaz_pas.c b/bsd/dev/topaz_pas.c
+--- a/bsd/dev/topaz_pas.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/topaz_pas.c	2026-11-01 08:23:51.368988826 +0530
+@@ -0,0 +1,218 @@
++/*
++ * laurel 2775: the shared TrustZone peripheral-image (PAS) loader; interface and sources in topaz_pas.h.
++ * The steps, their order and the log lines are the ones of the GPU zap shader loader of laurel 2153
++ * (TopazAdreno.cpp zap_load), which is now a caller of this file.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include "topaz_pas.h"
++
++extern uint64_t topaz_scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1);
++extern bool topaz_soc_map(void);
++extern void *topaz_pool_alloc(uint64_t size, uint64_t *pa);
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_dcache_clean(vm_offset_t addr, unsigned length);
++extern void IOLog(const char *format, ...) __printflike(1, 2);
++
++#define SCM_FN(svc, cmd)        (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
++#define SCM_SVC_PIL             0x02
++#define PIL_INIT_IMAGE          0x01
++#define PIL_MEM_SETUP           0x02
++#define PIL_AUTH_RESET          0x05
++#define PIL_SHUTDOWN            0x06
++#define PIL_IS_SUPPORTED        0x07
++#define SCM_ARG_RW              2
++
++#define PT_LOAD                 1
++#define MDT_TYPE(flags)         (((flags) >> 24) & 7)
++#define MDT_TYPE_HASH           2
++#define META_MAX                0x10000u
++
++static inline uint32_t g32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++static inline uint16_t g16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
++
++static uint32_t
++ms_since(uint64_t t0)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return (uint32_t)(ns / 1000000);
++}
++
++/* loadable = PT_LOAD with memsz != 0 and not the hash segment (Linux pil / mdt_loader) */
++static bool
++loadable(const uint8_t *ph)
++{
++	return g32(ph) == PT_LOAD && g32(ph + 20) != 0 && MDT_TYPE(g32(ph + 24)) != MDT_TYPE_HASH;
++}
++
++static bool
++elf_ok(const uint8_t *m, size_t len, uint32_t *phoff, uint32_t *phnum)
++{
++	if (len < 52 || memcmp(m, "\177ELF\001", 5) != 0) {
++		return false;
++	}
++	*phoff = g32(m + 28);
++	*phnum = g16(m + 44);
++	return *phoff < len && *phnum != 0 && *phnum <= (len - *phoff) / 32;
++}
++
++bool
++topaz_pas_span(const uint8_t *m, size_t len, uint32_t *lo, uint32_t *hi)
++{
++	uint32_t phoff, phnum, min_a = 0xffffffffu, max_a = 0;
++
++	if (!elf_ok(m, len, &phoff, &phnum)) {
++		return false;
++	}
++	for (uint32_t i = 0; i < phnum; i++) {
++		const uint8_t *ph = m + phoff + 32 * i;
++		if (!loadable(ph)) {
++			continue;
++		}
++		uint64_t paddr = g32(ph + 12), end = (paddr + g32(ph + 20) + 0xfff) & ~0xfffull;
++		if (end > 0xffffffffull) {
++			return false;
++		}
++		min_a = (uint32_t)paddr < min_a ? (uint32_t)paddr : min_a;
++		max_a = (uint32_t)end > max_a ? (uint32_t)end : max_a;
++	}
++	*lo = min_a;
++	*hi = max_a;
++	return max_a > min_a;
++}
++
++/* the metadata into the modem pool (or the caller's buffer), cleaned to memory for TrustZone */
++static bool
++meta_place(const struct topaz_pas *p, uint64_t *pa, const char **where, char *why, size_t wl)
++{
++	uint8_t *va = NULL;
++
++	*where = "modem pool";
++	if (topaz_soc_map()) {
++		va = (uint8_t *)topaz_pool_alloc(p->mdt_len, pa);
++	}
++	if (va == NULL || *pa + p->mdt_len > 0x100000000ull) {
++		va = NULL;
++		if (p->meta_alt != NULL) {
++			*where = p->meta_alt(p->ctx, p->mdt_len, &va, pa);
++		}
++		if (va == NULL || *where == NULL) {
++			snprintf(why, wl, "no contiguous buffer for %zu bytes of %s metadata", p->mdt_len, p->name);
++			IOLog("%s: %s\n", p->tag, why);
++			return false;
++		}
++	}
++	memcpy(va, p->mdt, p->mdt_len);
++	sweet_dcache_clean((vm_offset_t)va, (unsigned)p->mdt_len);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return true;
++}
++
++/* zero the region, then each loadable segment at its offset from the lowest address */
++static int
++copy_segments(const struct topaz_pas *p, uint32_t lo, uint32_t *nseg, char *why, size_t wl)
++{
++	uint32_t phoff = g32(p->mdt + 28), phnum = g16(p->mdt + 44);
++	volatile uint8_t *dst = (volatile uint8_t *)ml_io_map((vm_offset_t)p->region_pa, p->region_size);
++
++	*nseg = 0;
++	if (dst == NULL) {
++		snprintf(why, wl, "cannot map the %s region %#llx", p->name, p->region_pa);
++		return EIO;
++	}
++	for (uint32_t i = 0; i < p->region_size; i += 4) {
++		*(volatile uint32_t *)(dst + i) = 0;
++	}
++	for (uint32_t i = 0; i < phnum; i++) {
++		const uint8_t *ph = p->mdt + phoff + 32 * i;
++		if (!loadable(ph)) {
++			continue;
++		}
++		uint32_t at = g32(ph + 12) - lo;
++		int e = p->seg(p->ctx, i, dst + at, p->region_size - at, why, wl);
++		if (e != 0) {
++			return e;
++		}
++		(*nseg)++;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return 0;
++}
++
++int
++topaz_pas_load(const struct topaz_pas *p, char *why, size_t wl)
++{
++	uint32_t lo = 0, hi = 0, nseg = 0;
++	uint64_t st, res = 0, meta_pa = 0, t0;
++	const char *where = NULL;
++	int rc;
++
++	if (!topaz_pas_span(p->mdt, p->mdt_len, &lo, &hi) || p->seg == NULL) {
++		snprintf(why, wl, "%s .mdt is no ELF32 image with loadable segments (%zu bytes)", p->name, p->mdt_len);
++		IOLog("%s: %s\n", p->tag, why);
++		return TOPAZ_PAS_ELAYOUT;
++	}
++	if (hi - lo > p->region_size) {
++		snprintf(why, wl, "%s layout %#x-%#x does not fit the %#x-byte carve-out", p->name, lo, hi, p->region_size);
++		IOLog("%s layout %#x-%#x does not fit the %#x-byte carve-out\n", p->tag, lo, hi, p->region_size);
++		return TOPAZ_PAS_ELAYOUT;
++	}
++	if (p->mdt_len > META_MAX) {
++		snprintf(why, wl, "%s metadata of %zu bytes is too large", p->name, p->mdt_len);
++		return TOPAZ_PAS_EMETA;
++	}
++	if (!meta_place(p, &meta_pa, &where, why, wl)) {
++		return TOPAZ_PAS_EMETA;
++	}
++	/*
++	 * Self-check: TrustZone answers the PIL service for this PAS id (fast call). On this TZ x1 is 0 even for
++	 * the modem's PAS 4, which loads (topaz 0116 'PAS id 4 supported: ret=0 res=0'), so only a failed call
++	 * (x0 != 0) stops here. No PAS_SHUTDOWN before init_image (Linux pil-tz and mainline do not either).
++	 */
++	t0 = mach_absolute_time();
++	st = topaz_scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, p->pas_id, 0, 0, &res);
++	IOLog("%s: PAS %u is_supported %llx/%llx (%u ms), metadata %zu bytes at %#llx (%s)\n", p->tag, p->pas_id, st,
++	    res, ms_since(t0), p->mdt_len, meta_pa, where);
++	if (st != 0) {
++		snprintf(why, wl, "TrustZone has no PIL call for PAS %u: is_supported %llx", p->pas_id, st);
++		return TOPAZ_PAS_ENOSUPPORT;
++	}
++	t0 = mach_absolute_time();
++	st = topaz_scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), p->pas_id, meta_pa, 0, &res);
++	if (st != 0 || res != 0) {
++		snprintf(why, wl, "TrustZone refused the %s: init_image %llx/%llx", p->name, st, res);
++		IOLog("%s init_image: %llx/%llx\n", p->tag, st, res);
++		return TOPAZ_PAS_EINIT;
++	}
++	st = topaz_scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, p->pas_id, p->region_pa, hi - lo, &res);
++	if (st != 0 || res != 0) {
++		snprintf(why, wl, "TrustZone mem_setup of %#llx: %llx/%llx", p->region_pa, st, res);
++		IOLog("%s mem_setup: %llx/%llx\n", p->tag, st, res);
++		rc = TOPAZ_PAS_ESETUP;
++		goto shutdown;
++	}
++	IOLog("%s: init_image and mem_setup ok (%u ms), copying the segment\n", p->tag, ms_since(t0));
++	if (copy_segments(p, lo, &nseg, why, wl) != 0) {
++		rc = TOPAZ_PAS_ECOPY;
++		goto shutdown;
++	}
++	t0 = mach_absolute_time();
++	st = topaz_scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, p->pas_id, 0, 0, &res);
++	IOLog("%s auth_and_reset: %llx/%llx (%u ms)\n", p->tag, st, res, ms_since(t0));
++	if (st == 0 && res == 0) {
++		return 0;
++	}
++	snprintf(why, wl, "TrustZone refused the %s: auth_and_reset %llx/%llx", p->name, st, res);
++	rc = TOPAZ_PAS_EAUTH;
++shutdown:
++	/* init_image passed and a later step failed (Linux pil_deinit_image_trusted) */
++	st = topaz_scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, p->pas_id, 0, 0, &res);
++	IOLog("%s: PAS %u shutdown after the failure: %llx/%llx\n", p->tag, p->pas_id, st, res);
++	return rc;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/topaz_pas.h b/bsd/dev/topaz_pas.h
+--- a/bsd/dev/topaz_pas.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/topaz_pas.h	2026-11-01 08:23:51.368988826 +0530
+@@ -0,0 +1,60 @@
++/*
++ * laurel 2775: one TrustZone peripheral-image loader (PAS) for the whole kernel, the sequence of Linux
++ * drivers/soc/qcom/subsys-pil-tz.c + peripheral_loader.c (4.14) and mainline mdt_loader.c / qcom_scm_pas_*:
++ *   PAS_IS_SUPPORTED -> PAS_INIT_IMAGE(metadata) -> PAS_MEM_SETUP(region, span) -> copy the loadable segments
++ *   -> PAS_AUTH_AND_RESET; PAS_SHUTDOWN only when init_image passed and a later step failed.
++ * Every call goes through topaz_scm() (TopazModem: one lock over the call and its resume loop, laurel 2404).
++ * The metadata (the whole .mdt: ELF header + program headers + hash) goes into the TopazModem pool (below
++ * 4 GiB, where TrustZone already read the ADSP and modem metadata); meta_alt gives another buffer when that
++ * pool is off. Users: the GPU zap shader (TopazAdreno.cpp, PAS 13) and the IPA firmware (laurel_ipa_fw.c,
++ * PAS 15). Relocatable images: segment N goes to region + (p_paddr - lowest p_paddr), as mdt_loader.
++ */
++#ifndef TOPAZ_PAS_H
++#define TOPAZ_PAS_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct topaz_pas {
++	const char *tag;                /* log prefix: "TopazGPU: zap", "LaurelIPA: fw" */
++	const char *name;               /* short name for the reason text: "zap", "IPA firmware" */
++	uint32_t pas_id;
++	const uint8_t *mdt;             /* the .mdt file (ELF32) */
++	size_t mdt_len;
++	uint64_t region_pa;             /* carve-out (DT reserved memory) */
++	uint32_t region_size;
++	void *ctx;
++	/*
++	 * Copy loadable segment idx (program header index; file .bNN) to dst, room bytes up to the end of the
++	 * region. The region is zeroed before (bss / memsz > filesz). 0, or an errno with the reason in why.
++	 */
++	int (*seg)(void *ctx, uint32_t idx, volatile uint8_t *dst, uint32_t room, char *why, size_t wl);
++	/* optional: a contiguous buffer below 4 GiB for the metadata when the modem pool is off; the log label */
++	const char *(*meta_alt)(void *ctx, size_t len, uint8_t **va, uint64_t *pa);
++};
++
++/* results: 0 = loaded and started */
++#define TOPAZ_PAS_ELAYOUT       (-1)    /* bad .mdt or the segments do not fit the region (no TrustZone call) */
++#define TOPAZ_PAS_EMETA         (-2)    /* no buffer for the metadata (no TrustZone call) */
++#define TOPAZ_PAS_ENOSUPPORT    (-3)    /* PAS_IS_SUPPORTED failed */
++#define TOPAZ_PAS_EINIT         (-4)    /* init_image refused (metadata / signature) */
++#define TOPAZ_PAS_ESETUP        (-5)    /* mem_setup refused */
++#define TOPAZ_PAS_ECOPY         (-6)    /* region map or segment copy failed */
++#define TOPAZ_PAS_EAUTH         (-7)    /* auth_and_reset refused */
++
++/* Load and start; the reason in why on a failure. Sleeps (SCM busy retry): thread context only. */
++int topaz_pas_load(const struct topaz_pas *p, char *why, size_t wl);
++
++/* lowest p_paddr and page-aligned end of the loadable segments of an ELF32 .mdt; false = none / bad */
++bool topaz_pas_span(const uint8_t *mdt, size_t len, uint32_t *lo, uint32_t *hi);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff -ruN a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp	2026-11-01 08:23:51.366988806 +0530
++++ b/iokit/Kernel/arm/TopazAdreno.cpp	2026-11-01 08:23:51.367988816 +0530
+@@ -627,12 +627,47 @@
+ 	return topaz_scm(fn, arginfo, a, b, c, res1);
+ }
+ 
+-static uint32_t
+-zap_ms(uint64_t since)
++/*
++ * laurel 2775: the TrustZone steps (is_supported, init_image, mem_setup, copy, auth_and_reset, shutdown after a
++ * failure) are the shared PAS loader bsd/dev/topaz_pas.c (also used by the IPA firmware, PAS 15); same order,
++ * same log lines. Here: the files, the one code segment, and the GPU pool as the metadata fallback.
++ */
++#include "../../../bsd/dev/topaz_pas.h"
++
++struct zap_ctx {
++	const void *seg;
++	size_t seg_size;
++	uint32_t seg_idx;
++	struct kbuf meta;
++};
++
++/* the code segment (only the first one is loaded, as before) */
++static int
++zap_seg(void *c, uint32_t idx, volatile uint8_t *dst, uint32_t room, char *why, size_t wl)
+ {
+-	uint64_t ns;
+-	absolutetime_to_nanoseconds(mach_absolute_time() - since, &ns);
+-	return (uint32_t)(ns / 1000000);
++	struct zap_ctx *z = (struct zap_ctx *)c;
++	(void)why; (void)wl;
++	if (idx != z->seg_idx) {
++		return 0;
++	}
++	uint32_t n = (uint32_t)(z->seg_size < room ? z->seg_size : room);
++	for (uint32_t i = 0; i < n; i++) {
++		dst[i] = ((const uint8_t *)z->seg)[i];
++	}
++	return 0;
++}
++
++/* the GPU pool when the modem pool is off (laurel 2153: 4 KB pages, contiguous) */
++static const char *
++zap_meta_alt(void *c, size_t len, uint8_t **va, uint64_t *pa)
++{
++	struct zap_ctx *z = (struct zap_ctx *)c;
++	if (!kbuf_alloc(&z->meta, len)) {
++		return NULL;
++	}
++	*va = z->meta.va;
++	*pa = z->meta.pa;
++	return "GPU pool: modem pool off";
+ }
+ 
+ static bool
+@@ -640,8 +675,8 @@
+ {
+ 	void *mdt = NULL, *seg = NULL;
+ 	size_t mdt_size = 0, seg_size = 0;
+-	struct kbuf meta = {};
+-	bool ok = false, pas_inited = false;
++	struct zap_ctx z = {};
++	bool ok = false;
+ 
+ 	/*
+ 	 * laurel: the phone's own zap shader (topaz's embedded one is signed for khaje). Each loadable segment N
+@@ -660,17 +695,11 @@
+ 	{
+ 		const uint8_t *m = (const uint8_t *)mdt;
+ 		uint32_t phoff = *(const uint32_t *)(m + 28), phnum = *(const uint16_t *)(m + 44);
+-		uint32_t min_a = 0xffffffff, max_a = 0, seg_paddr = 0;
+-		uint64_t st, res = 0;
+ 
+ 		for (uint32_t i = 0; i < phnum && phoff + 32 * (i + 1) <= mdt_size; i++) {
+ 			const uint8_t *ph = m + phoff + 32 * i;
+-			uint32_t paddr = *(const uint32_t *)(ph + 12), memsz = *(const uint32_t *)(ph + 20);
+-			uint32_t flags = *(const uint32_t *)(ph + 24);
++			uint32_t memsz = *(const uint32_t *)(ph + 20), flags = *(const uint32_t *)(ph + 24);
+ 			if (*(const uint32_t *)ph == 1 && memsz != 0 && ((flags >> 24) & 7) != 2) {
+-				min_a = paddr < min_a ? paddr : min_a;
+-				uint32_t end = (paddr + memsz + 0xfff) & ~0xfffu;
+-				max_a = end > max_a ? end : max_a;
+ 				if (seg == NULL) {
+ 					char name[64];
+ 					snprintf(name, sizeof(name), FW_DIR "a610_zap.b%02u", i);
+@@ -680,7 +709,7 @@
+ 						IOLog("TopazGPU: %s\n", fw_note);
+ 						goto out;
+ 					}
+-					seg_paddr = paddr;
++					z.seg_idx = i;
+ 				} else {
+ 					IOLog("TopazGPU: zap: more than one code segment: only the first is loaded\n");
+ 				}
+@@ -690,100 +719,22 @@
+ 			snprintf(fw_note, sizeof(fw_note), "a610_zap.mdt has no code segment");
+ 			goto out;
+ 		}
+-		if (max_a <= min_a || max_a - min_a > ZAP_REGION_SIZE) {
+-			snprintf(fw_note, sizeof(fw_note), "zap layout %#x-%#x does not fit the %#x-byte carve-out", min_a, max_a,
+-			    ZAP_REGION_SIZE);
+-			IOLog("TopazGPU: %s\n", fw_note);
+-			goto out;
+-		}
+-		/*
+-		 * laurel 2153: the metadata (6860 bytes, two 4 KB pages, contiguous) goes where TrustZone already read
+-		 * PAS metadata in this boot: the TopazModem pool (ADSP at 0xe0000000, modem at 0xe0003000, both
+-		 * accepted). The GPU pool is the fallback only when that pool is off.
+-		 */
+-		uint64_t meta_pa = 0, t0;
+-		uint8_t *meta_va = NULL;
+-		const char *meta_where = "modem pool";
+-		if (mdt_size > 0x10000) {
+-			snprintf(fw_note, sizeof(fw_note), "zap metadata of %zu bytes is too large", mdt_size);
+-			goto out;
+-		}
+-		if (topaz_soc_map()) {
+-			meta_va = (uint8_t *)topaz_pool_alloc(mdt_size, &meta_pa);
+-		}
+-		if (meta_va == NULL || meta_pa + mdt_size > 0x100000000ull) {
+-			if (!kbuf_alloc(&meta, mdt_size)) {
+-				snprintf(fw_note, sizeof(fw_note), "no contiguous buffer for %zu bytes of zap metadata", mdt_size);
+-				IOLog("TopazGPU: %s\n", fw_note);
+-				goto out;
+-			}
+-			meta_va = meta.va;
+-			meta_pa = meta.pa;
+-			meta_where = "GPU pool: modem pool off";
+-		}
+-		memcpy(meta_va, mdt, mdt_size);
+-		sweet_dcache_clean((vm_offset_t)meta_va, (unsigned)mdt_size);
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		/*
+-		 * Self-check: TrustZone answers the PIL service for PAS 13 (fast call). On this TZ the answer in x1 is 0
+-		 * even for the modem's PAS 4, which loads (topaz 0116 line 'PAS id 4 supported: ret=0 res=0'), so only
+-		 * a failed call (x0 != 0) turns the GPU off. No PAS_SHUTDOWN before init_image: nothing loaded PAS 13 in
+-		 * this boot (Linux pil-tz and mainline adreno do not shut down first either); shutdown only after
+-		 * init_image succeeded and a later step failed (Linux pil_deinit_image_trusted).
+-		 */
+-		t0 = mach_absolute_time();
+-		st = scm(SCM_FN(SCM_SVC_PIL, PIL_IS_SUPPORTED), 1, GPU_PAS_ID, 0, 0, &res);
+-		IOLog("TopazGPU: zap: PAS %u is_supported %llx/%llx (%u ms), metadata %zu bytes at %#llx (%s)\n", GPU_PAS_ID,
+-		    st, res, zap_ms(t0), mdt_size, meta_pa, meta_where);
+-		if (st != 0) {
+-			snprintf(fw_note, sizeof(fw_note), "TrustZone has no PIL call for PAS %u: is_supported %llx",
+-			    GPU_PAS_ID, st);
+-			goto out;
+-		}
+-		t0 = mach_absolute_time();
+-		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta_pa, 0, &res);
+-		if (st != 0 || res != 0) {
+-			snprintf(fw_note, sizeof(fw_note), "TrustZone refused the zap shader: init_image %llx/%llx", st, res);
+-			IOLog("TopazGPU: zap init_image: %llx/%llx\n", st, res);
+-			goto out;
+-		}
+-		pas_inited = true;
+-		st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, GPU_PAS_ID, ZAP_REGION, max_a - min_a, &res);
+-		if (st != 0 || res != 0) {
+-			snprintf(fw_note, sizeof(fw_note), "TrustZone mem_setup of %#llx: %llx/%llx", ZAP_REGION, st, res);
+-			IOLog("TopazGPU: zap mem_setup: %llx/%llx\n", st, res);
+-			goto out;
+-		}
+-		IOLog("TopazGPU: zap: init_image and mem_setup ok (%u ms), copying the segment\n", zap_ms(t0));
+-		volatile uint8_t *dst = (volatile uint8_t *)ml_io_map(ZAP_REGION, ZAP_REGION_SIZE);
+-		if (dst == NULL) {
+-			goto out;
+-		}
+-		for (uint32_t i = 0; i < ZAP_REGION_SIZE; i += 4) {
+-			*(volatile uint32_t *)(dst + i) = 0;
+-		}
+-		uint32_t at = seg_paddr - min_a, n = (uint32_t)(seg_size < ZAP_REGION_SIZE - at ? seg_size : ZAP_REGION_SIZE - at);
+-		for (uint32_t i = 0; i < n; i++) {
+-			dst[at + i] = ((const uint8_t *)seg)[i];
+-		}
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		t0 = mach_absolute_time();
+-		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, GPU_PAS_ID, 0, 0, &res);
+-		IOLog("TopazGPU: zap auth_and_reset: %llx/%llx (%u ms)\n", st, res, zap_ms(t0));
+-		ok = st == 0 && res == 0;
+-		if (!ok) {
+-			snprintf(fw_note, sizeof(fw_note), "TrustZone refused the zap shader: auth_and_reset %llx/%llx", st, res);
+-		} else {
++		z.seg = seg;
++		z.seg_size = seg_size;
++		struct topaz_pas p = {
++			.tag = "TopazGPU: zap", .name = "zap shader", .pas_id = GPU_PAS_ID,
++			.mdt = (const uint8_t *)mdt, .mdt_len = mdt_size,
++			.region_pa = ZAP_REGION, .region_size = ZAP_REGION_SIZE,
++			.ctx = &z, .seg = zap_seg, .meta_alt = zap_meta_alt,
++		};
++		ok = topaz_pas_load(&p, fw_note, sizeof(fw_note)) == 0;
++		if (ok) {
+ 			snprintf(fw_note, sizeof(fw_note), "zap PAS %u at %#llx (own a610_zap, %zu+%zu bytes)", GPU_PAS_ID, ZAP_REGION,
+ 			    mdt_size, seg_size);
+ 		}
+ 	}
+ out:
+-	if (pas_inited && !ok) {
+-		uint64_t sres = 0, sst = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &sres);
+-		IOLog("TopazGPU: zap: PAS %u shutdown after the failure: %llx/%llx\n", GPU_PAS_ID, sst, sres);
+-	}
+-	OSSafeReleaseNULL(meta.md);         /* (meta.md is NULL for pool memory: the pool keeps it, as before) */
++	OSSafeReleaseNULL(z.meta.md);       /* (NULL for pool memory: the pool keeps it, as before) */
+ 	topaz_fw_free(mdt, mdt_size);
+ 	topaz_fw_free(seg, seg_size);
+ 	return ok;

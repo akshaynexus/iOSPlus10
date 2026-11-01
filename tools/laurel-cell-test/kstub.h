@@ -12,7 +12,9 @@
 #include <string.h>
 #include <strings.h>
 
+#ifndef ARM64_BOARD_CONFIG_SWEET
 #define ARM64_BOARD_CONFIG_SWEET 1
+#endif
 #ifndef MIN
 #define MIN(a, b)               ((a) < (b) ? (a) : (b))
 #endif
