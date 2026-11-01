@@ -1,0 +1,185 @@
+laurel 2885: Wi-Fi: Rx and Tx take turns; no scan in the first 30 s of a link or while any traffic runs; link line: drops by reason, waits, thread cost.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3427,7 +3427,8 @@ static unsigned next_scan_ms;
+  */
+ static uint16_t lw_ask_freqs[NFREQ], lw_scan_freqs[NFREQ];
+ static volatile uint32_t lw_ask_n, lw_ask_dwell;
+-static uint32_t lw_scan_n, lw_scan_dwell, lw_scan_last_ms, lw_scans_real, lw_scans_deferred;
++static uint32_t lw_scan_n, lw_scan_dwell, lw_scans_real, lw_scans_deferred, lw_frames_s;
++static uint64_t lw_scan_real_ms, lw_up_ms;      /* laurel 2885: real time of the last scan, and of the link coming up */
+ static bool lw_joined, lw_busy;
+ 
+ static void
+@@ -3436,7 +3437,7 @@ lw_scan_take_ask(bool asked)
+ 	lw_scan_n = asked ? lw_ask_n : 0;
+ 	lw_scan_dwell = asked ? lw_ask_dwell : 0;
+ 	memcpy(lw_scan_freqs, lw_ask_freqs, sizeof(lw_scan_freqs));
+-	lw_scan_last_ms = g_ms;
++	lw_scan_real_ms = lw_ms();
+ 	lw_scans_real++;
+ }
+ 
+@@ -5284,6 +5285,9 @@ w_tx_pump(void)
+ 	return n;
+ }
+ 
++extern "C" void redwood_net_drops_get(uint64_t counts[6]);      /* laurel 2882: bsd/dev/redwood_net.c */
++extern "C" void redwood_net_path_line(void);
++static uint64_t lw_work_abs, lw_pass_max_abs, lw_gap_max_abs;   /* laurel 2885: time in the turns, longest pass, longest time between two passes */
+ /* laurel 2884: the signal: smoothed, beacons and this station's data apart */
+ static struct lw_ewma lw_sig_beacon, lw_sig_data;
+ static uint64_t lw_sig_beacon_ms;
+@@ -5384,29 +5388,71 @@ topaz_wlan_signal_now(void)
+ static void
+ lw_status_poll(void)
+ {
+-	static uint64_t last_ns, last_rx, last_tx;
++	static uint64_t last_ns, last_rx, last_tx, last_stats_ns, last_work;
++	static uint32_t last_frames;
+ 	static const char *const kinds[3] = { "legacy", "HT", "VHT" };
+ 	uint64_t now = 0;
+ 
+ 	if (s_state != S_UP) {
++		if (last_ns != 0) {                     /* laurel 2884: the next link starts afresh */
++			bzero(&lw_sig_beacon, sizeof(lw_sig_beacon));
++			bzero(&lw_sig_data, sizeof(lw_sig_data));
++			bzero(&lw_rx_rate, sizeof(lw_rx_rate));
++			lw_tx_kbps = 0;
++			lw_fw_rssi = 0;
++		}
+ 		last_ns = 0;
+ 		return;
+ 	}
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+-	if (last_ns != 0 && now - last_ns < (lw_busy ? 10 : 60) * NSEC_PER_SEC) {
++	if (last_ns == 0) {
++		lw_up_ms = now / 1000000;               /* laurel 2885 */
++		last_stats_ns = now;
++	}
++	/* laurel 2885: the first answer comes before any frame was sent ("tx 0 Mbps ?" in the first line): ask again */
++	if (last_ns != 0 && lw_tx_kbps == 0 && now - last_stats_ns >= 2 * NSEC_PER_SEC) {
++		last_stats_ns = now;
++		uint8_t q[8], *qp = wmi_put_tlv(q, TAG_REQUEST_STATS, 4);
++		w_p32(qp, WMI_STAT_PEER);
++		(void)wmi_send(CMD_REQUEST_STATS, q, sizeof(q));
++	}
++	/* laurel 2885: a burst that just ended is said on time too (log: a line 16 s after the last one looked like a stalled thread) */
++	if (last_ns != 0 && now - last_ns < (lw_busy || rx_up + tx_sent - last_frames >= 1000 ? 10 : 60) * NSEC_PER_SEC) {
+ 		return;
+ 	}
+ 	if (last_ns != 0) {
+ 		uint64_t el = now - last_ns, down = (lw_rx_bytes - last_rx) * 80000 / el, up = (lw_tx_bytes - last_tx) * 80000 / el;
+ 		const struct lw_rate *r = &lw_rx_rate;
+-
++		int rssi = lw_rssi_now();
++		uint64_t work_ns = 0, pass_ns = 0, gap_ns = 0, d[6];
++		uint32_t frames = rx_up + tx_sent - last_frames;
++
++		absolutetime_to_nanoseconds(lw_work_abs - last_work, &work_ns);
++		absolutetime_to_nanoseconds(lw_pass_max_abs, &pass_ns);
++		absolutetime_to_nanoseconds(lw_gap_max_abs, &gap_ns);
++		redwood_net_drops_get(d);
++		/* laurel 2884 + 2884: signal smoothed (what iOS is told, the bars it draws, then each source), drops by reason, the Tx waits, what this thread costs */
+ 		printf("LAUREL WIFI: link %s GHz ch %u %u MHz, %u MHz %s%s %ux%u | rx %s mcs %u %s%u MHz %u.%u Mbps | tx %u Mbps%s | "
+-		    "RSSI %d dBm | down %llu.%llu up %llu.%llu Mbps | frames rx %u tx %u fail %u drop %u nosnap %u | scans %u deferred %u\n",
++		    "RSSI %d dBm %u bars (beacons %d, data %d, fw %d) | down %llu.%llu up %llu.%llu Mbps | frames rx %u tx %u fail %u | "
++		    "drop %llu (full %llu down %llu big %llu nomem %llu queue %llu left %u, in %llu) | wait slots %u ce %u q %u, q max %u, in air %u | "
++		    "thread %llu%%, pass max %llu us, gap max %llu ms, %llu us a frame | nosnap %u | scans %u deferred %u\n",
+ 		    s_freq >= 4900 ? "5" : "2.4", s_freq >= 4900 ? (s_freq - 5000) / 5 : (s_freq - 2407) / 5, s_freq, s_link.width,
+ 		    s_link.vht ? "VHT" : s_link.ht ? "HT" : "legacy", s_link.qos ? " QoS" : "", s_link.nss, s_link.nss, kinds[r->kind],
+ 		    r->mcs, r->sgi ? "sgi " : "", r->width, r->mbps10 / 10, r->mbps10 % 10, lw_tx_kbps / 1000, lw_tx_kbps != 0 ? "" : " ?",
+-		    lw_rssi_now(), down / 10, down % 10, up / 10, up % 10, rx_up, tx_sent, tx_fail, tx_drop, lw_nosnap, lw_scans_real, lw_scans_deferred);
+-	}
++		    rssi, lw_ios_bars(rssi), lw_ewma_dbm(&lw_sig_beacon), lw_ewma_dbm(&lw_sig_data), lw_fw_rssi,
++		    down / 10, down % 10, up / 10, up % 10, rx_up, tx_sent, tx_fail,
++		    d[0] + d[1] + d[2] + d[4] + lw_drop_left, d[0], d[1], d[2], d[3], d[4], lw_drop_left, d[5],
++		    lw_wait_slots, lw_wait_ce, lw_wait_q, lw_qmax, tx_sent - tx_done,
++		    work_ns * 100 / el, pass_ns / 1000, gap_ns / 1000000, frames != 0 ? work_ns / 1000 / frames : 0,
++		    lw_nosnap, lw_scans_real, lw_scans_deferred);
++		redwood_net_path_line();
++		lw_qmax = 0;
++		lw_pass_max_abs = 0;
++		lw_gap_max_abs = 0;
++	}
++	last_work = lw_work_abs;
++	last_frames = rx_up + tx_sent;
++	last_stats_ns = now;
+ 	last_ns = now;
+ 	last_rx = lw_rx_bytes;
+ 	last_tx = lw_tx_bytes;
+@@ -5493,6 +5539,43 @@ wmi_rx(const uint8_t *d, uint32_t len)
+ 	}
+ }
+ 
++/*
++ * laurel 2885: Rx and Tx take turns. A turn: at most 16 messages of each copy engine (Tx completions come with the Rx
++ * indications on engine 1), then up to 32 frames of the Tx queue. It was one turn per pass of the loop: 32 Tx frames and 64
++ * free slots per 1 ms sleep plus all the Rx work, whatever came. Until nothing moves; at most 8 turns, 2 ms.
++ */
++#define LW_TURNS 8
++#define LW_TURN_NS (2 * NSEC_PER_MSEC)
++
++static void
++lw_data_turns(void)
++{
++	static uint64_t limit_abs;
++	static uint64_t last_end;
++	uint64_t t0 = mach_absolute_time(), now = t0;
++
++	if (last_end != 0 && t0 - last_end > lw_gap_max_abs) {
++		lw_gap_max_abs = t0 - last_end;
++	}
++	if (limit_abs == 0) {
++		nanoseconds_to_absolutetime(LW_TURN_NS, &limit_abs);
++	}
++	for (int turn = 0; turn < LW_TURNS; turn++) {
++		bool rx = ce_poll();
++		uint32_t tx = api_ready ? w_tx_pump() : 0;
++
++		now = mach_absolute_time();
++		if ((!rx && tx == 0) || now - t0 >= limit_abs) {
++			break;
++		}
++	}
++	last_end = now;
++	lw_work_abs += now - t0;
++	if (now - t0 > lw_pass_max_abs) {
++		lw_pass_max_abs = now - t0;
++	}
++}
++
+ /* from the watch loop */
+ static void
+ radio_poll(unsigned ms)
+@@ -5525,7 +5608,7 @@ radio_poll(unsigned ms)
+ 	if (!ce_up) {
+ 		return;
+ 	}
+-	(void)ce_poll();
++	lw_data_turns();
+ 	htt_poll();
+ 	if (scan_started && !api_ready) {
+ 		api_ready = true;
+@@ -5543,7 +5626,8 @@ radio_poll(unsigned ms)
+ 		/* laurel 2409: frames in about a second (the loop's pass is about 1 ms) */
+ 		static uint32_t mark_ms, mark_frames;
+ 		if (g_ms - mark_ms >= 1024) {
+-			lw_busy = rx_up + tx_sent - mark_frames >= 100;
++			lw_frames_s = rx_up + tx_sent - mark_frames;
++			lw_busy = lw_frames_s >= 100;
+ 			mark_frames = rx_up + tx_sent;
+ 			mark_ms = g_ms;
+ 		}
+@@ -5551,7 +5635,8 @@ radio_poll(unsigned ms)
+ 	if (scan_started && !scanning && api_scan_asked && (s_state == S_IDLE || s_state == S_UP)) {
+ 		api_scan_asked = false;
+ 		next_scan_ms = 0;
+-		if (lw_scanlimit_on && s_state == S_UP && lw_busy && g_ms - lw_scan_last_ms < 60000) {
++		/* laurel 2885: any traffic counts, and the time after a join (DHCP and the first page) */
++		if (lw_scanlimit_on && s_state == S_UP && lw_scan_defer(lw_ms() - lw_up_ms, lw_ms() - lw_scan_real_ms, lw_frames_s)) {
+ 			lw_scans_deferred++;                /* what was heard before answers it */
+ 			api_scans_done++;
+ 		} else {

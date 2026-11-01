@@ -1,0 +1,121 @@
+laurel 2880: Wi-Fi: LaurelWifiPath.h: smoothed signal, which frames count, iOS's bars, when a scan may run while joined, the Tx slots. Pure code, host test.
+
+diff --git a/iokit/Kernel/arm/LaurelWifiPath.h b/iokit/Kernel/arm/LaurelWifiPath.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelWifiPath.h
+@@ -0,0 +1,114 @@
++/*
++ * laurel 2880: what the Wi-Fi data path decides, pure code like LaurelWifiPhy.h and LaurelWifiLink.h; host test
++ * scripts/laurel/wifi-phy-test.sh: a smoothed signal, which frames count for it, the bars iOS draws from it, when a scan
++ * may run while joined, the Tx slots.
++ */
++#ifndef LAUREL_WIFI_PATH_H
++#define LAUREL_WIFI_PATH_H
++
++/* A smoothed dBm value in 1/256 dB. The first samples average; then each moves it by 1/2^shift. */
++struct lw_ewma {
++	int32_t v;
++	uint32_t n;
++};
++
++static inline void
++lw_ewma_add(struct lw_ewma *e, int dbm, uint32_t shift)
++{
++	uint32_t s = 0;
++
++	while (s < shift && (e->n + 1) >> (s + 1) != 0) {
++		s++;
++	}
++	e->v += (dbm * 256 - e->v) / (1 << s);
++	if (e->n < 0xFFFFFFFFu) {
++		e->n++;
++	}
++}
++
++static inline int
++lw_ewma_dbm(const struct lw_ewma *e)
++{
++	return e->v >= 0 ? (e->v + 128) / 256 : -((-e->v + 128) / 256);
++}
++
++/* A native-wifi frame with a payload, to this station alone, from that access point: what its rate and signal are about. */
++static inline bool
++lw_is_unicast_data(const uint8_t *f, uint32_t len, const uint8_t *bssid)
++{
++	if (len < 24 || (f[0] & 0x0C) != 0x08 || (f[0] & 0x40) != 0 || (f[4] & 1) != 0) {
++		return false;
++	}
++	return memcmp(f + 10, bssid, 6) == 0;
++}
++
++/*
++ * The level for iOS and the status line. Beacons first: log 2026-11-01 19:14-19:16: frames at 6 Mbps read -37/-38 dBm each
++ * time (the scan: -37), VHT data frames -47 to -60 dBm at the same place. Beacons do not move with the AP's rate.
++ */
++#define LW_BEACON_FRESH_MS 3000u
++
++static inline int
++lw_signal_pick(const struct lw_ewma *beacon, uint64_t beacon_age_ms, const struct lw_ewma *data, int heard)
++{
++	if (beacon->n != 0 && beacon_age_ms <= LW_BEACON_FRESH_MS) {
++		return lw_ewma_dbm(beacon);
++	}
++	return data->n != 0 ? lw_ewma_dbm(data) : heard;
++}
++
++/*
++ * The bars of iOS 16 20H392. wifid 0x10003f65c: scaled = 0.5 + x / (2 sqrt(x * x + 450)), x = rssi + 77.5.
++ * SBWiFiManager _updateSignalStrengthFromRawRSSI:andScaledRSSI:: bars = ceil(3 * scaled), at least 1, at most 3. So:
++ */
++static inline uint32_t
++lw_ios_bars(int rssi)
++{
++	return rssi > -70 ? 3 : rssi > -85 ? 2 : 1;
++}
++
++/*
++ * A scan while joined takes the radio off its channel. A page starts with few frames (DNS, a TLS handshake), so "under
++ * traffic" must not mean a bulk transfer only. Log 19:14:21-24 and 19:14:27-29: two scans in the first 9 s of the link, the
++ * second over the first fetch of Safari.
++ */
++#define LW_SCAN_AFTER_JOIN_MS 30000u    /* DHCP, the first pages */
++#define LW_SCAN_IDLE_MS       20000u
++#define LW_SCAN_ACTIVE_MS     120000u
++#define LW_SCAN_ACTIVE_FPS    20u       /* frames a second, both ways */
++
++static inline bool
++lw_scan_defer(uint64_t since_join_ms, uint64_t since_scan_ms, uint32_t frames_per_s)
++{
++	if (since_join_ms < LW_SCAN_AFTER_JOIN_MS) {
++		return true;
++	}
++	return since_scan_ms < (frames_per_s >= LW_SCAN_ACTIVE_FPS ? LW_SCAN_ACTIVE_MS : LW_SCAN_IDLE_MS);
++}
++
++/* The Tx slots: a bit each; -1: all busy. */
++#define LW_TX_SLOT_WORDS 2u
++
++static inline int
++lw_slot_get(uint64_t *busy)
++{
++	for (uint32_t w = 0; w < LW_TX_SLOT_WORDS; w++) {
++		if (~busy[w] != 0) {
++			uint32_t bit = (uint32_t)__builtin_ctzll(~busy[w]);
++
++			busy[w] |= 1ull << bit;
++			return (int)(w * 64 + bit);
++		}
++	}
++	return -1;
++}
++
++static inline void
++lw_slot_put(uint64_t *busy, uint32_t id)
++{
++	if (id / 64 < LW_TX_SLOT_WORDS) {
++		busy[id / 64] &= ~(1ull << (id % 64));
++	}
++}
++
++#endif /* LAUREL_WIFI_PATH_H */

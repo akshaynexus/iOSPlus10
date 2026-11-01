@@ -895,3 +895,11 @@ cap do not stop it. [U] Why the panel does not follow: not settled by the log. 2
 reset, `53 20` at start), adds the TPG FIFO path, reads 0x0A / 0x52 / 0x54 back at start and at each settled value and picks the way that works.
 Build: 273/273 patches (72 laurel), 0 LSE, kernel.development.sweet.4k sha256 2271c044eb39beaa10a0cb7a99aa0e9981357625caf3ef99e21f8b5d3c173030; NegroniCamera.driver sha256 12e332d07c6555b0..., LaurelFlashlight.driver built.
 Next: boot image with this kernel + root rebuild (root-flash-test.sh; owner approves the flash). Lines and the decision table: docs/laurel_sprout/brightness.md, torch.md.
+
+## Mi A3: Wi-Fi stalls, page load and bars (2026-11-01, branch t3/laurel-wifi-stall, patches 2880-2886; build + host test, NOT BOOTED)
+Owner: "fast.com and speedtest do not load fast enough, you made it worse, the signal level is wrong." Log 19:07.
+Causes [V log + code]: every lost frame (13715) = the one 128-frame Tx queue full, shared by all flows; scans 0.5 s and 7 s after the join, over the first fetches of a page; bars frozen at the join (iOS event 39 was never sent).
+[I] The fall after the burst = the speed test's end, the 16 s line gap = the line's own rule; [I] in the 40 s before the burst the CPU, not the link, was full (drop 0, 1.9-20 Mbps): crash loops and WebKit are the next suspects. The log has no DNS or TCP counters: new `path` line.
+Done: en0 output queue with flow control (kill switch wifi_txq=0), Rx 1 copy, Tx 2 copies, batches, 128 Tx slots, ring 512, Rx/Tx turns, no scan in the first 30 s or under any traffic, smoothed signal (beacons first), event 39 + RSSI_BOUNDS, drops by reason, thread cost, request log per link.
+Build: 280/280 patches (79 laurel), 0 LSE, kernel.development.sweet.4k sha256 f6d6b604dfe6cb05b9eaa4052b45854765b6b39e606add3101509d386cf2ebd6; wifi-phy-test.sh passes.
+Next: boot with this kernel; docs/laurel_sprout/wifi.md "Test": read `link` + `path` during fast.com; compare wifi_txq=0.

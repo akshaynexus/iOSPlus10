@@ -4542,3 +4542,18 @@ Details: `docs/laurel_sprout/battery-power.md`.
   picks transport and way; kill switch laurelbl_read=0). Decision table in brightness.md.
 - [V] userland/laurel/camera/build.sh failed at random with `symbol _image_added missing`: `nm | grep -q` under pipefail (grep's early exit SIGPIPEs nm). Fixed; same lesson as kernel-linux.sh.
 - Build [V]: 273/273 patches (72 laurel), 0 LSE, kernel.development.sweet.4k sha256 2271c044eb39beaa10a0cb7a99aa0e9981357625caf3ef99e21f8b5d3c173030; NegroniCamera.driver sha256 12e332d07c6555b0..., LaurelFlashlight.driver built.
+
+## Mi A3: Wi-Fi stalls + page load + bars: tail drop, scans at the start of a page, bars frozen at the join; patches 2880-2886 (2026-11-01, branch t3/laurel-wifi-stall; build + host test, NOT BOOTED)
+- Details, tables, expected lines, test: docs/laurel_sprout/wifi.md "Stalls, page load, signal". Log: logs/laurel-boot-1907.txt (main checkout).
+- [V] `net: dropped out` 13715 = `tx_drop` 13715: all at the 128-frame queue. No CE failure line, no HTT credits, `fail 0`, `0 in`, no scan in those windows. Tx A-MPDU, slots or thread: the log cannot separate them; new `wait` fields can.
+- [V] Scans 93 and 94 ran 0.5 s and 7 s after the join, over Safari's first fetches (rule was 100 frames/s). New rule in `lw_scan_defer`.
+- [V code] The 16 s line gap = the line's rule (`lw_busy` at the mark), not a stalled thread [I, log: FPS line]. No CPU line lies inside the burst: "179 Mbps at 90 % CPU" was not measured.
+- [V] iOS bars: wifid scale function 0x10003f65c, SpringBoard bars ceil(3*scaled): 3 above -70 dBm, 2 above -85 dBm. wifid updates SCALED_RSSI only from the link event and event 39 RSSI_CHANGED; we never sent 39: bars frozen at the join. RSSI/RATE/MCS layouts in the code were right; RSSI_BOUNDS layout confirmed.
+- [V] Frames at 6 Mbps read -37/-38, VHT data -47 to -60 at one place: iOS now gets the beacon average. [I] The "legacy 6 Mbps" samples in the old line are group-addressed data or frames of other kinds: the new sample takes unicast data of the AP only.
+- [V] The apple80211 request log budget (800) ended 4 min before the join: 103/16/8/57 after a join were never seen. Now 4 lines per kind, reset at each link change.
+- [V] Not a page-load cause: `connectx() - failed necp_set_socket_domain_attributes` only says a tracker note failed, MiniIONetworkStack (registry stub). [I] CPU is busy without Wi-Fi: gold 87 %, silver 82 % at 0.5 Mbps; wifip2pd and nanotimekitcompaniond restart about every 10 s: a lead, not looked at.
+- Gotcha: kernel-linux.sh replaces out/laurel-kernel/xnu-src: my stage commits there were lost. Keep a stage tree outside (I used out/wifi-stage, a small git repo with the changed files), make patches from it, `cmp` it with the build tree.
+- Gotcha: wifi-phy-test.sh makes the header from all `+` lines of its patch: a header patch must hold only that new file.
+- Gotcha: `git rebase --autosquash` in the stage tree stopped on conflict and `mkpatch` still ran on the old branch: check `git status` before making patches.
+- Build [V]: kernel-linux.sh 280/280 patches (79 laurel), 0 LSE, no warnings in the changed files, kernel sha256 f6d6b604dfe6cb05b9eaa4052b45854765b6b39e606add3101509d386cf2ebd6; wifi-phy-test.sh all checks passed (ASan + UBSan); bars checked against iOS's formula from -100 to -20 dBm.
+- Next: owner test, wifi.md "Test". Then decide from `wait` and `path`: A-MPDU, CPU, or DNS.

@@ -1,0 +1,280 @@
+laurel 2883: Wi-Fi Tx: 2 copies a frame (was 5), lock-free queue of 64 frames, 128 Tx slots (was 64), waits counted by reason.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -25,6 +25,7 @@
+ #include <sys/errno.h>
+ #include "LaurelWifiPhy.h"                      /* laurel 2405 */
+ #include "LaurelWifiLink.h"                     /* laurel 2407 */
++#include "LaurelWifiPath.h"                     /* laurel 2880 */
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -2733,7 +2734,7 @@ smmu_identity_locked(uint32_t sid, uint32_t mask, const char *name)
+ #define ATTR_DIS_INTR       0x08
+ #define RX_BUF_SIZE         2048
+ #define RX_POST             32
+-#define TX_SLOTS_MAX        64
++#define TX_SLOTS_MAX        128                 /* laurel 2883: was 64: one per Tx frame on the data engine */
+ 
+ struct ce_desc { uint64_t addr; uint16_t nbytes, flags; uint32_t toeplitz; } __attribute__((packed));
+ struct ce_attr { uint16_t src_n, src_max, dst_n, flags; };
+@@ -2900,6 +2901,18 @@ ce_poll(void)
+ 	return any;
+ }
+ 
++/* laurel 2883: room for one more message, as ce_send() below decides */
++static bool
++ce_has_room(uint32_t c)
++{
++	if (!ce_up || c >= CE_COUNT || !ce_host_tx(c)) {
++		return false;
++	}
++	struct ce_state *s = &ce[c];
++	uint32_t mask = s->src_n - 1, sw = ce_rri[c] & 0xFFFF;
++	return ((sw - 1 - s->src_wr) & mask) != 0 && ((s->src_wr - sw) & mask) < ce_tx_slots(c) - 1;
++}
++
+ static bool
+ ce_send(uint32_t c, const void *data, uint32_t len, uint32_t transfer_id)
+ {
+@@ -4298,7 +4311,7 @@ w_find_ie(const uint8_t *ies, uint32_t len, uint8_t id)
+ }
+ 
+ /* ---- HTT data TX (ath10k_htt_tx_64, native wifi) */
+-#define TX_SLOTS        64
++#define TX_SLOTS        (LW_TX_SLOT_WORDS * 64) /* laurel 2883: was 64, a limit of 64 frames in the air and in the firmware */
+ #define TX_SLOT_SIZE    2048
+ #define H2T_TX_FRM      1
+ #define TXF0_MAC_HDR    0x01
+@@ -4310,27 +4323,35 @@ w_find_ie(const uint8_t *ies, uint32_t len, uint8_t id)
+ #define T2H_TX_COMPL_IND 0x07
+ 
+ static uint8_t *tx_pool;
+-static uint64_t tx_pool_pa, tx_busy;
+-static uint32_t tx_sent, tx_done, tx_fail, tx_drop, rx_up;
++static uint64_t tx_pool_pa, tx_busy[LW_TX_SLOT_WORDS];
++static uint32_t tx_sent, tx_done, tx_fail, rx_up;
++static uint32_t lw_wait_slots, lw_wait_ce, lw_wait_q, lw_qmax;  /* laurel 2883: why the Tx queue waits; its fullest */
+ 
++/* laurel 2883: a frame in two parts, its 802.11 header (at least PREFETCH_LEN bytes in all with the body) and the rest, copied once */
+ static bool
+-htt_tx_frame(const uint8_t *f, uint32_t len, bool clear)
++htt_tx_frame(const uint8_t *hdr, uint32_t hlen, const uint8_t *body, uint32_t blen, bool clear)
+ {
+ 	uint8_t m[20 + 52], *p = m;
+-	uint32_t id, pf = (MIN(len, (uint32_t)PREFETCH_LEN) + 3) & ~3u;
++	uint32_t len = hlen + blen, pf = (MIN(len, (uint32_t)PREFETCH_LEN) + 3) & ~3u;
+ 	if (tx_pool == NULL) {
+ 		tx_pool = (uint8_t *)pool_alloc(TX_SLOTS * TX_SLOT_SIZE, &tx_pool_pa);
+ 	}
+-	if (tx_pool == NULL || htt_bank == NULL || htt_state != 2 || len > TX_SLOT_SIZE) {
++	if (tx_pool == NULL || htt_bank == NULL || htt_state != 2 || htt_eid == 0xFF || len > TX_SLOT_SIZE) {
+ 		return false;
+ 	}
+-	for (id = 0; id < TX_SLOTS && (tx_busy & (1ull << id)) != 0; id++) {
++	if (!ce_has_room(ep[htt_eid].ul)) {
++		lw_wait_ce++;
++		return false;
+ 	}
+-	if (id == TX_SLOTS) {
++	int got = lw_slot_get(tx_busy);
++	if (got < 0) {
++		lw_wait_slots++;
+ 		return false;
+ 	}
++	uint32_t id = (uint32_t)got;
+ 	uint64_t pa = tx_pool_pa + (uint64_t)id * TX_SLOT_SIZE;
+-	memcpy(tx_pool + id * TX_SLOT_SIZE, f, len);
++	memcpy(tx_pool + id * TX_SLOT_SIZE, hdr, hlen);
++	memcpy(tx_pool + id * TX_SLOT_SIZE + hlen, body, blen);
+ 	uint8_t *ext = htt_bank + id * HTT_EXT_DESC_SIZE;  /* frags[0] at +24: paddr_lo, paddr_hi16, len16 */
+ 	bzero(ext, HTT_EXT_DESC_SIZE);
+ 	uint32_t lo = (uint32_t)pa;
+@@ -4348,11 +4369,17 @@ htt_tx_frame(const uint8_t *f, uint32_t len, bool clear)
+ 	p = put16(p, (uint16_t)id);
+ 	p = put64(p, htt_bank_pa + (uint64_t)id * HTT_EXT_DESC_SIZE);
+ 	p = w_p32(p, 0xFFFF);                       /* peer id: invalid */
+-	memcpy(p, f, MIN(len, pf));
++	if (pf > hlen) {
++		bzero(p, pf);                           /* a short frame: pf is rounded up */
++		memcpy(p, hdr, hlen);
++		memcpy(p + hlen, body, MIN(blen, pf - hlen));
++	} else {
++		memcpy(p, hdr, pf);
++	}
+ 	if (!htt_send(m, 20 + pf)) {
++		lw_slot_put(tx_busy, id);
+ 		return false;
+ 	}
+-	tx_busy |= 1ull << id;
+ 	tx_sent++;
+ 	return true;
+ }
+@@ -4364,9 +4391,7 @@ htt_tx_compl(const uint8_t *p, uint32_t len)
+ 	for (uint32_t i = 0; i < n && 4 + 2 * (i + 1) <= len; i++) {
+ 		uint16_t id;
+ 		memcpy(&id, p + 4 + 2 * i, 2);
+-		if (id < TX_SLOTS) {
+-			tx_busy &= ~(1ull << id);
+-		}
++		lw_slot_put(tx_busy, id);
+ 	}
+ 	tx_done += n;
+ 	if (st != 0) {
+@@ -4654,8 +4679,8 @@ w_link(bool up)
+ static bool
+ w_tx_ether(const uint8_t *e, size_t len, bool clear)
+ {
+-	uint8_t f[TX_SLOT_SIZE];
+-	if (len < 14 || len - 14 + 24 + 8 > sizeof(f)) {
++	uint8_t f[32];                              /* laurel 2883: the header; the payload goes straight to the Tx slot */
++	if (len < 14 || len - 14 + 24 + 8 > TX_SLOT_SIZE) {
+ 		return false;
+ 	}
+ 	bzero(f, 24);
+@@ -4667,8 +4692,7 @@ w_tx_ether(const uint8_t *e, size_t len, bool clear)
+ 	static const uint8_t snap[6] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
+ 	memcpy(f + 24, snap, 6);
+ 	memcpy(f + 30, e + 12, 2);                  /* ethertype */
+-	memcpy(f + 32, e + 14, len - 14);
+-	if (!htt_tx_frame(f, (uint32_t)(len - 14 + 32), clear)) {
++	if (!htt_tx_frame(f, 32, e + 14, (uint32_t)(len - 14), clear)) {
+ 		return false;
+ 	}
+ 	lw_tx_bytes += len;
+@@ -5108,7 +5132,6 @@ int topaz_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid
+ int topaz_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t pmk[32]);
+ int topaz_wlan_leave(void);
+ bool topaz_wlan_joined(void);
+-bool topaz_wlan_transmit(const uint8_t *frame, size_t length);
+ }
+ 
+ static int w_join_with(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pmk);
+@@ -5187,56 +5210,71 @@ topaz_wlan_joined(void)
+ }
+ 
+ /* frames from the network stack wait here for the modem thread */
+-#define ETXQ 128                                /* laurel 2410: was 32: a TCP burst past it is dropped, not delayed */
++/*
++ * laurel 2883: one sender (redwood_net), one reader (this thread), no lock, no copy between them. The queue is short: what
++ * waits should wait in the interface's output queue, where one flow's frames do not delay another's. Log 2026-11-01:
++ * 13715 frames lost at a 128-frame queue (net: dropped out = tx_drop), with 0 CE failures and 0 firmware failures.
++ */
++#define ETXQ 128
+ static struct { uint16_t len; uint8_t d[1514]; } etxq[ETXQ];
+ static volatile uint32_t etxq_head, etxq_tail;
+-static IOSimpleLock *etxq_lock;
++static uint32_t etxq_limit = 64, lw_drop_left;
+ 
+-bool
+-topaz_wlan_transmit(const uint8_t *frame, size_t length)
++extern "C" void
++topaz_wlan_tx_limit(unsigned frames)
+ {
+-	if (s_state != S_UP || length < 14 || length > 1514 || etxq_lock == NULL) {
+-		return false;
++	etxq_limit = MIN(frames, (unsigned)ETXQ);
++}
++
++/* 1, 2: REDWOOD_TX_FULL, REDWOOD_TX_DOWN (sys/redwood_net.h, for C only) */
++extern "C" uint8_t *
++topaz_wlan_tx_reserve(int *why)
++{
++	if (s_state != S_UP || !api_ready) {
++		*why = 2;
++		return NULL;
+ 	}
+-	bool ok = false;
+-	IOSimpleLockLock(etxq_lock);
+-	if (etxq_tail - etxq_head < ETXQ) {
+-		uint32_t i = etxq_tail % ETXQ;
+-		etxq[i].len = (uint16_t)length;
+-		memcpy(etxq[i].d, frame, length);
+-		etxq_tail++;
+-		ok = true;
++	uint32_t used = etxq_tail - etxq_head;
++	if (used >= etxq_limit) {
++		lw_wait_q++;
++		*why = 1;
++		return NULL;
+ 	}
+-	IOSimpleLockUnlock(etxq_lock);
+-	if (!ok) {
+-		tx_drop++;
++	if (used >= lw_qmax) {
++		lw_qmax = used + 1;
+ 	}
+-	return ok;
++	return etxq[etxq_tail % ETXQ].d;
+ }
+ 
+-static void
++extern "C" void
++topaz_wlan_tx_commit(size_t length)
++{
++	etxq[etxq_tail % ETXQ].len = (uint16_t)length;
++	mb();                                       /* the frame before the index */
++	etxq_tail = etxq_tail + 1;
++}
++
++/* laurel 2883: frames gone to the firmware in this call; a full Tx path keeps its frames for the next turn */
++static uint32_t
+ w_tx_pump(void)
+ {
+-	static uint8_t one[1514];
+-	for (int n = 0; n < 32 && etxq_head != etxq_tail; n++) {
+-		uint16_t len;
+-		IOSimpleLockLock(etxq_lock);
++	uint32_t n = 0;
++
++	for (; n < 32 && etxq_head != etxq_tail; n++) {
++		if (s_state != S_UP) {
++			lw_drop_left += etxq_tail - etxq_head;
++			etxq_head = etxq_tail;              /* not joined: they are of no use */
++			break;
++		}
++		mb();                                   /* the frame after the index */
+ 		uint32_t i = etxq_head % ETXQ;
+-		len = etxq[i].len;
+-		memcpy(one, etxq[i].d, len);
+-		IOSimpleLockUnlock(etxq_lock);
+-		if (s_state != S_UP || !w_tx_ether(one, len, false)) {
+-			if (s_state != S_UP) {
+-				IOSimpleLockLock(etxq_lock);
+-				etxq_head = etxq_tail;          /* not joined: drop them */
+-				IOSimpleLockUnlock(etxq_lock);
+-			}
++		if (!w_tx_ether(etxq[i].d, etxq[i].len, false)) {
+ 			break;
+ 		}
+-		IOSimpleLockLock(etxq_lock);
+-		etxq_head++;
+-		IOSimpleLockUnlock(etxq_lock);
++		mb();                                   /* done with the frame, then its place is free */
++		etxq_head = etxq_head + 1;
+ 	}
++	return n;
+ }
+ 
+ /* ---- laurel 2410: one line that says how the link goes; firmware's tx rate by WMI peer stats (self-check: "tx ?") */
+@@ -5439,9 +5477,6 @@ radio_poll(unsigned ms)
+ 	(void)ce_poll();
+ 	htt_poll();
+ 	if (scan_started && !api_ready) {
+-		if (etxq_lock == NULL) {
+-			etxq_lock = IOSimpleLockAlloc();
+-		}
+ 		api_ready = true;
+ 		LOG("t=%u ms: wlan: radio ready for the rest of the kernel", g_ms);
+ 		if (topaz_wlan_ready_hook != NULL) {
+@@ -5450,7 +5485,7 @@ radio_poll(unsigned ms)
+ 	}
+ 	if (api_ready) {
+ 		w_join_poll();
+-		w_tx_pump();
++		(void)w_tx_pump();
+ 		lw_status_poll();
+ 	}
+ 	{
