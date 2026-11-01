@@ -1,5 +1,5 @@
 /*
- * Host test of the laurel 2770 ext4 reader (bsd/dev/laurel_ext4.c + laurel_ext4_dir.c, taken from the patch):
+ * Host test of the laurel 2780 ext4 reader (bsd/dev/laurel_ext4.c + laurel_ext4_dir.c, taken from the patch):
  *   ext4_test IMAGE OUTDIR PATH...
  * Reads each PATH from the raw ext4 IMAGE with the kernel code and writes it to OUTDIR/<basename>; prints
  * "PATH SIZE". test-ipa.sh compares the files with debugfs (when present) and checks the ELF layout.

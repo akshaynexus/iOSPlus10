@@ -83,7 +83,7 @@ scion (same Qualcomm QMI/IPA design, IPA 4.11) saw the modem go ONLINE and crash
 seconds later in every run until the AP IPA handshake passed. Our modem sees the smp2p "ipa" entry (topaz answers 1:
 valid, clock off) but nobody sends INIT_MODEM_DRIVER. A modem crash on the Mi A3 also stops Wi-Fi (WLAN firmware runs on
 the modem, topaz has no modem restart). Rule: a failure turns off only its feature. So SET_OPERATING_MODE online is gated
-by the self-check `ipa_up` (AP IPA side done), false until step 2. SIM status works in low power mode (Android shows SIM
+by the self-check `ipa_up()` = `laurel_ipa_state()` (AP IPA side done, patch 2780, section 6). SIM status works in low power mode (Android shows SIM
 data in airplane mode = low power) [I].
 
 ## 5. Step 1 as built (patch 2760)
@@ -141,19 +141,92 @@ primary, online, `registered 404-45 Airtel LTE rssi -71 rsrp -98`, then hot swap
 modem never READY (no second line after a crash), no SIM. Result 2026-11-01: 8 of 8 pass. It found two bugs before the
 first boot (the first line came before provisioning, and before the first signal answer).
 
-## 6. Step 2: IPA v4.2 AP side (next) [I plan]
+## 6. Step 2 as built: IPA v4.2 AP side (patches 2775 + 2780; build + host test only, NOT BOOTED)
 
-1. RPM vote for RPM_SMD_IPA_CLK (TopazRpm `topaz_rpm_write`, "clk2"/"ipa" key "KHz" [U exact resource]); smp2p "ipa" answer
-   3 (valid + clock on) when the clock is voted.
-2. IPA firmware PAS 15 (`ipa_fws.mdt`) from the phone's `vendor_b` (ext4: needs a small ext4 reader, or the files copied
-   into the iOS root by a root script) through `topaz_scm()` only.
-3. SMMU: stream 0xE0 (and 0xE2) identity through `topaz_smmu_identity` (one lock, 2404); IPA memory init with the v4.2
-   partition table of `ipa_v3/ipa_utils.c` (`ipa_4_2_mem_part` [U name]); SMEM item 497 (filter tables) only when the IPA
-   is up (scion: the item without a working IPA crashed the modem).
-4. QMI 0x31: our server (instance 1) + client of the modem's (instance 2): INIT_MODEM_DRIVER with the v4.2 layout and
-   platform_type of the downstream driver; answer INIT_MODEM_DRIVER_CMPLT, CONFIG, INSTALL_FILTER_RULE(_EX),
-   FILTER_INSTALLED_NOTIF; then `ipa_up = true` -> SET_OPERATING_MODE online -> NAS registration + signal.
-5. Self-check of every step, one line `LAUREL IPA: on|off: ...`; IPA off = radio stays off, Wi-Fi untouched.
+### Step 2 facts
+
+| Fact | Value | Source |
+| --- | --- | --- |
+| IPA firmware PAS id | 15 | [V] trinket.dtsi `qcom,ipa_fws { compatible "qcom,pil-tz-generic"; qcom,pas-id <0xf>; qcom,firmware-name "ipa_fws"; memory-region <&pil_ipa_fw_mem> }`; ipa.c `IPA_SUBSYSTEM_NAME "ipa_fws"`, loaded by `subsystem_get()` = subsys-pil-tz |
+| Firmware region | 0x57500000 + 0x10000 (pil_ipa_fw_mem) | [V] hardware-map.md, laurel_sprout-trinket-memory.dtsi |
+| Firmware files | vendor `/firmware/ipa_fws.mdt` 7020 = `.b00` 212 (ELF header + 5 phdrs) + `.b01` 6808 (hash); `.b02` 12040, `.b03` 128, `.b04` 320 | [V] test-ipa.sh (ext4 reader = debugfs, byte-equal) |
+| Segment layout | phdr 2 PT_LOAD paddr 0 filesz 0x2f08 memsz 0x4000; 3 at 0x4000 (0x80); 4 at 0x4080 (0x140); phdr 1 hash (type 2) at 0x5000 not loaded; all relocatable (flags bit 27) | [V] ELF of ipa_fws.mdt |
+| PAS span (mem_setup size) | 0x5000 (page end of 0x4080 + 0x140) | [V] pas_test |
+| QMI 0x31 INIT_MODEM_DRIVER TLVs | 0x10 platform 3, 0x11 hdr, 0x12/0x13 v4/v6 route (index hi 7), 0x14/0x15 v4/v6 filter, 0x16 modem mem 0xBF0+0x140C, 0x17 ctrl endpoint 9, 0x19 proc ctx, 0x1F/0x20 quota 0xA50/0x60, 0x21/0x22 drop stats 0xBF0/0; no 0x18 (first boot), no 0x1A (zip size 0), no 0x1B-0x1E (v4.2 tables not hashable) | [V] ipa_qmi_service.c + _v01.c TLV table + ipa_utils.c ipa_4_2_mem_part |
+| Init writes | BCR = 0, TX_CFG bit 12 (PA_MASK_EN) cleared, IDLE_INDICATION_CFG = 256 (debounce, const non-idle off), CLKON open, QSB 8/12, COMP_CFG bits 7/8/15, hashing off, resource groups | [V] ipa3_init_hw / ipa3_enable_dcd for IPA_HW_v4_2 |
+| Modem's QMI 0x31 service | instance 0x201, node 0, port 0x19, ~270 ms after auth_and_reset | [V] USB log 2026-11-01 07:21 / 07:45 / 08:12 boots |
+| SMP2P "ipa" query | not seen in the 08:12 boot (inbound item has 1 entry: slave-kernel) | [V] USB log; answer bits: 0 = response complete, 1 = clock on [V] ipa.c ipa3_freeze_clock_vote_and_notify_modem |
+
+### What runs (laurel_ipa.c)
+
+1. TopazModem's watch thread sees READY + GLINK -> the IPA thread starts: RPM IPA clock 201000 kHz (active + sleep set)
+   -> SMMU SIDs 0xE0 (and 0xE2) identity -> registers (`ipa3_init_hw`, read-back check) -> firmware: UFS (60 s
+   wait), active slot from the boot_a/boot_b GPT attribute, `vendor_<slot>` then the other, ext4 reader, `.mdt` +
+   loadable `.bNN` -> shared PAS loader (2775) PAS 15 -> GSI_STATUS bit 0 within 1 s -> local memory tables (SRAM
+   direct window, canary read-back) -> SMEM item 497 (0x2000 bytes).
+2. Watch thread: NEW_SERVER 0x31:0x101 at port 0x4015; INIT_MODEM_DRIVER from port 0x4016 to 0x31:0x201; our service
+   answers INDICATION_REGISTER, INSTALL_FILTER_RULE (echoes the rule ids), FILTER_INSTALLED_NOTIF, CONFIG,
+   INIT_MODEM_DRIVER_CMPLT; MASTER_DRIVER_INIT_COMPLETE goes to the client that registered for indications once
+   the INIT_MODEM_DRIVER answer is in (as ipa_qmi_service.c).
+3. On = INIT_MODEM_DRIVER answered success + CMPLT received. Then `laurel_ipa_state()` is true and laurel_cell.c sends
+   DMS SET_OPERATING_MODE online.
+4. Off (one line, no restart, the radio stays low power): ipa=0, any failed step, no service 0x31:201 60 s after the
+   hardware, no answer in 30 s, a QMI error, no CMPLT 60 s after the answer, modem crash, watch end, modem=0.
+5. SMP2P "ipa" query answer: 3 when the clock vote is acked and the IPA is not off, else 1 (as before). Answered once.
+
+Shared PAS loader (2775, `bsd/dev/topaz_pas.c`): is_supported -> init_image(.mdt in the TopazModem pool) -> mem_setup
+(region, span) -> zero region + copy segments at p_paddr - lowest -> auth_and_reset; shutdown only after init_image
+passed. All calls through `topaz_scm()` (one lock). Users: zap shader (PAS 13, same log lines as 2153) and IPA (PAS 15).
+TopazAudio and the modem loader keep their own code (not switched).
+
+### Expected lines (USB log)
+
+```
+LaurelIPA: RPM ipa clock 201000 kHz (active + sleep set): acked
+LaurelIPA: IPA_VERSION ........, SHARED_MEM_SIZE ........: 8192 bytes at offset 0x..., IPA_STATE ........
+LaurelIPA: registers set: BCR 00000000, TX_CFG ........, COMP_CFG ........, SRC_RSRC_GRP_01_0 00003f03, IDLE_INDICATION_CFG 00000100
+LaurelIPA: fw: vendor_b: ipa_fws.mdt 7020 bytes, segments at 0x0-0x5000 (PAS 15, region 57500000+10000)
+LaurelIPA: fw: PAS 15 is_supported 0/0 (0 ms), metadata 7020 bytes at 0xe00..000 (modem pool)
+LaurelIPA: fw: init_image and mem_setup ok (.. ms), copying the segment
+LaurelIPA: fw auth_and_reset: 0/0 (.. ms)
+LaurelIPA: local memory set: ROUTE ........, canary deadbeef, empty table e00.....
+LaurelIPA: SMEM item 497 allocated, 8192 bytes (modem filter tables)
+LaurelIPA: hardware ready in ... ms (IPA_VERSION ........, GSI_STATUS .......1); next: QMI 0x31 with the modem
+LaurelIPA: modem QMI service 0x31:201 up at node 0 port 19
+LaurelIPA: our QMI service 0x31:101 announced at port 4015
+LaurelIPA: sent INIT_MODEM_DRIVER (118 bytes, local memory at 0x...) to node 0 port 19
+LaurelIPA: modem answered INIT_MODEM_DRIVER: success (.. ms)
+LaurelIPA: modem request 0x20 answered (rules 0, configs 0)
+LaurelIPA: sent MASTER_DRIVER_INIT_COMPLETE to the modem's client (node 0 port ..)
+LaurelIPA: modem request 0x35 answered (rules 0, configs 0)
+LAUREL IPA: on: v4.2 (IPA_VERSION ........), firmware PAS 15, GSI up, modem driver init complete in ... ms, master init indication sent
+LaurelCell: radio on: DMS SET_OPERATING_MODE online (was low power)
+LAUREL CELL: on: SIM1 present (USIM ready), SIM2 absent; modem online; SIM1 registered ...
+```
+(The service line can come before the hardware lines: the modem announces 0x31:201 at ~270 ms.) Off examples:
+`LAUREL IPA: off: boot-arg ipa=0`, `off: TrustZone refused the IPA firmware: init_image .../...`,
+`off: GSI not enabled 1000 ms after the firmware (GSI_STATUS 00000000)`, `off: modem did not answer INIT_MODEM_DRIVER in 30 s`,
+`off: modem crashed: <SMEM 421 text>`. While the IPA is not on, the cell line says `radio off: AP IPA side still
+starting (...)` or `radio off: AP IPA side off: <reason>`. `sysctl kern.laurel_ipa` has the IPA text.
+
+### Host test [V]
+
+`scripts/laurel/test-ipa.sh` (kernel files taken from the patches): qmi_test (INIT_MODEM_DRIVER bytes for restricted
+0 and 0x2000, its answer: success / error / other message / cut TLV, our service: 6 messages, the indication);
+pas_test part 1 (synthetic image with the stock layout: order 7-1-2-5, span 0x5000, region and metadata bytes, 6 error
+paths: shutdown only after init_image passed); ext4 + pas_test part 2 with `out/ipa-fw/vendor.raw` (stock vendor, raw
+ext4; sparse needs simg2img; skipped with a note when absent): 6 files byte-equal to debugfs, `.mdt = .b00 + .b01`,
+`lipa_fw_load()` end to end with a simulated TrustZone (metadata = ipa_fws.mdt, region = .b02/.b03/.b04 at
+0/0x4000/0x4080). Result 2026-11-01: PASS. `scripts/laurel/test-cell.sh` (2760 + the 2780 laurel_cell.c hunks): 8 of 8.
+
+### Risks [I]
+
+- Modem crash when ONLINE: scion's modem crashed in `enl2_dl` after ONLINE without the AP IPA handshake; with it, a
+  wrong INIT_MODEM_DRIVER value or missing AP data pipes (step 3) can still crash the modem. A modem crash stops Wi-Fi
+  (WLAN firmware runs on the modem; no modem restart). Test with `ipa=0` as the fallback; `cell=0` also keeps the radio off.
+- No GSI channels of our own yet: `ctrl_comm_dest_end_pt` 9 (APPS_WAN_CONS) is announced but no AP pipe consumes it.
+- The SMP2P query answer 3 promises a held IPA clock: the vote is never removed.
+- The IPA thread writes IPA registers and SRAM while the modem runs (Linux does this before the modem boots).
 
 Step 3 (data): WDA SET_DATA_FORMAT (QMAP, embedded endpoint), WDS BIND_MUX_DATA_PORT, GSI channels for the
 modem<->AP endpoints, WDS START_NETWORK + GET_RUNTIME_SETTINGS, and an iOS interface. scion used an `en1` Ethernet
@@ -168,3 +241,9 @@ interface with kernel ARP/DHCP answers because iOS configures pdp_ip only throug
 4. Over SSH: `sysctl kern.laurel_cell`. Hot swap: pull a SIM tray: a new `LAUREL CELL: on:` line with `SIM? absent`.
 5. If `off: modem up, no QMI UIM service`: the `TopazModem: service ...` list at 3 s / 20 s (glink_summary) shows what the
    modem announced.
+6. Step 2 (patches 2775 + 2780, kernel only; the IPA firmware comes from the phone's vendor partition, no root change):
+   read the `LaurelIPA:` lines and the one `LAUREL IPA:` line. If `on`: the cell line must change to `modem online`
+   and later `registered`. Watch for `TopazModem: modem crash reason` within 60 s after ONLINE (then Wi-Fi stops too):
+   report the SMEM text; boot again with `ipa=0` (radio stays low power, as step 1).
+7. The GPU zap shader now loads through the shared PAS loader: the `TopazGPU: zap ...` lines must be the same as before
+   and `LAUREL GPU: on`.

@@ -16,6 +16,14 @@ other surfaces from wired pages), 2103 (native 720x1560 canvas at scale 2 by def
 `LAUREL FB CANVAS:`, `LAUREL FB CANVAS: first frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
 + 0102 (DarwinBoot shrinks the window instead of "NO WINDOW"); mkadt `--dram auto`. Next: boot, read `LAUREL RAM:`, `LAUREL SPOOL:`,
 `LAUREL FB CANVAS:`, `LAUREL FB: first iOS frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
+Cellular step 2 (2026-11-01, branch t3/laurel-cellular-ipa3, built + host-tested, NOT BOOTED): patch 2775 = one shared
+TrustZone PAS loader (`bsd/dev/topaz_pas.c`; the GPU zap shader is now its caller, same lines); patch 2780 (renumbered from
+2770, which is the camera) = IPA v4.2 AP side: IPA thread at modem READY (RPM clock, SMMU, registers, firmware PAS 15 from
+vendor_<slot> through the ext4 reader, GSI check, SRAM tables, SMEM 497), then QMI 0x31 (server 0x31:0x101 port 0x4015,
+INIT_MODEM_DRIVER to 0x31:0x201, CMPLT) -> `LAUREL IPA: on|off`, sysctl kern.laurel_ipa, kill switch ipa=0; laurel_cell
+sets the radio ONLINE only when `laurel_ipa_state()` is on. Results [V]: 253/253 patches, 0 LSE; test-ipa.sh PASS; test-cell 8/8.
+Next: boot; read the IPA lines; watch for a modem crash after ONLINE (stops Wi-Fi too); fallback ipa=0. Details:
+`docs/laurel_sprout/cellular.md` section 6.
 Console flash fix (2026-11-01 07:50, branch t3/laurel-fb-console-flash, built, NOT BOOTED): with GL, the idle UI showed
 kernel log text. Cause [V log + source]: backboardd presents surface 1 (= boot framebuffer 0x5c000000, GL draws into it)
 between GPU-pool frames; the copy path skipped it and flipped to a back buffer that still held a boot console frame. Kernel

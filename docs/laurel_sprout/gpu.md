@@ -77,6 +77,9 @@ PT_LOAD is #2 (paddr 0x5000, 0x830 bytes, relocatable) = `.b02`. Our `a630_sqe.f
 0x01001f0b), topaz's built-in one 32504 bytes. The kernel loads `/usr/share/firmware/laurel/a610_zap.mdt` + the `.bNN` of
 the loadable segment and `a630_sqe.fw` from the root; the SQE falls back to topaz's built-in one, the zap shader has
 no fallback.
+Since laurel 2775 the zap TrustZone steps (is_supported, init_image, mem_setup, copy, auth_and_reset, shutdown after a
+failure) are the shared PAS loader `bsd/dev/topaz_pas.c` (also used by the IPA firmware, PAS 15): same order and the
+same `TopazGPU: zap` lines; only three error reason texts changed wording [V code, NOT BOOTED].
 
 ## Kernel patches
 
