@@ -206,6 +206,12 @@ run_test(const char *library, int limit_s, int nice_value, char *why, size_t n)
 	char text[8192] = "";
 
 	mkdir(DB "/cache/m2vtest", 0755);
+	/* the QuartzCore run lists each refusal in its log (bridge NMB_LIST): quartzcore_causes() below */
+	if (strcmp(library, "/nonexistent") != 0) {
+		setenv("NMB_LIST", "1", 1);
+	} else {
+		unsetenv("NMB_LIST");
+	}
 	posix_spawn_file_actions_init(&fa);
 	posix_spawn_file_actions_addopen(&fa, 1, TESTLOG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	posix_spawn_file_actions_adddup2(&fa, 1, 2);
@@ -230,6 +236,8 @@ run_test(const char *library, int limit_s, int nice_value, char *why, size_t n)
 		return 0;
 	}
 	if ((fd = open(TESTLOG, O_RDONLY)) >= 0) {
+		off_t end = lseek(fd, 0, SEEK_END);     /* the end: the list comes before the result */
+		lseek(fd, end > (off_t)sizeof(text) - 1 ? end - ((off_t)sizeof(text) - 1) : 0, SEEK_SET);
 		ssize_t got = read(fd, text, sizeof(text) - 1);
 		text[got > 0 ? got : 0] = 0;
 		close(fd);
@@ -252,6 +260,54 @@ run_test(const char *library, int limit_s, int nice_value, char *why, size_t n)
 		*p = *p == '\n' ? ' ' : *p;
 	}
 	return 1;
+}
+
+/*
+ * m2vtest's QuartzCore step counts refusals (boot 2026-11-01 18:43: kernels 4, pairs 8) and the reasons stayed in the log file on the
+ * phone. One line per reason: count, first function, reason.
+ */
+static void
+quartzcore_causes(void)
+{
+	enum { CAUSES = 12 };
+	static struct { char why[160], first[80]; int count; } cause[CAUSES];
+	int used = 0, other = 0;
+	char line[900];
+	FILE *f = fopen(TESTLOG, "r");
+
+	if (f == NULL) {
+		return;
+	}
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char *why;
+		int i;
+
+		if ((strncmp(line, "kernel ", 7) != 0 && strncmp(line, "pair ", 5) != 0) || (why = strstr(line, ": ")) == NULL) {
+			continue;
+		}
+		*why = 0;
+		why += 2;
+		why[strcspn(why, "\n")] = 0;
+		for (i = 0; i < used && strncmp(cause[i].why, why, sizeof(cause[i].why) - 1) != 0; i++) {
+		}
+		if (i == used) {
+			if (used == CAUSES) {
+				other++;
+				continue;
+			}
+			snprintf(cause[i].why, sizeof(cause[i].why), "%s", why);
+			snprintf(cause[i].first, sizeof(cause[i].first), "%s", line);
+			used++;
+		}
+		cause[i].count++;
+	}
+	fclose(f);
+	for (int i = 0; i < used; i++) {
+		say("QuartzCore refused %d x (first %s): %s", cause[i].count, cause[i].first, cause[i].why);
+	}
+	if (other > 0) {
+		say("QuartzCore refused %d more, other reasons (" TESTLOG ")", other);
+	}
 }
 
 /* a mark from an earlier boot is stale (as in the plug-in's off_reason): 1 = the GPU was lost in this boot */
@@ -431,5 +487,6 @@ main(void)
 		save(&r);
 	}
 	say("%s %s", ok == 1 ? "QuartzCore shaders:" : "QuartzCore shaders: no result:", why);
+	quartzcore_causes();
 	return 0;
 }

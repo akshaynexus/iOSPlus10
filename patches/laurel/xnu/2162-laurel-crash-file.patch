@@ -1,0 +1,67 @@
+laurel 2162: a SIGBUS's CRASH lines name the mapped file.
+
+PosterBoard dies once on the first boot of every new root (boots 2026-11-01 07:26, 07:57, 18:44: sig 10 KERN_MEMORY_ERROR, a 48 KiB read-only
+mapping, in ImageIO's ATXReadPlugin, on the snapshot it has just written with saveUIImage:): a page-in failed, and the log could not say which
+file. New line after "CRASH <name> map (far inside) ...": "CRASH <name> file <path> size N, offset 0xO". Only for sig 10 and a file pager; the
+locks are held only to take a reference on the pager; the name lookup runs after they are dropped.
+diff -ruN a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -822,6 +822,7 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <vm/vm_shared_region.h>
++#include <vm/vm_object.h>     /* laurel 2162 */
+ #include <arm/thread.h>
+ 
+ /*
+@@ -880,17 +881,49 @@
+ 		vm_map_entry_t entry;
+ 		vm_map_lock_read(map);
+ 		bool inside = vm_map_lookup_entry(map, (vm_map_offset_t)far, &entry);
++		memory_object_t file = MEMORY_OBJECT_NULL;      /* laurel 2162: the mapped file of a SIGBUS */
++		uint64_t file_offset = 0;
+ 		for (int i = 0; i < 2 && entry != vm_map_to_entry(map); i++) {
+ 			printf("CRASH %s map%s 0x%llx-0x%llx prot %d/%d tag %d\n", name,
+ 			    inside && i == 0 ? " (far inside)" : (i == 0 ? " before far" : " after far"),
+ 			    (uint64_t)entry->vme_start, (uint64_t)entry->vme_end, entry->protection,
+ 			    entry->max_protection, (int)VME_ALIAS(entry));
+ 			if (inside) {
++				if (sig == 10 && !entry->is_sub_map && VME_OBJECT(entry) != VM_OBJECT_NULL) {
++					vm_object_t object = VME_OBJECT(entry), shadow;
++
++					file_offset = VME_OFFSET(entry) + (far - entry->vme_start);
++					vm_object_lock_shared(object);
++					while ((shadow = object->shadow) != VM_OBJECT_NULL) {
++						vm_object_lock_shared(shadow);
++						file_offset += object->vo_shadow_offset;
++						vm_object_unlock(object);
++						object = shadow;
++					}
++					if (!object->internal && object->pager_ready && object->pager != MEMORY_OBJECT_NULL) {
++						file = object->pager;
++						memory_object_reference(file);
++					}
++					vm_object_unlock(object);
++				}
+ 				break;
+ 			}
+ 			entry = entry->vme_next;
+ 		}
+ 		vm_map_unlock_read(map);
++		if (file != MEMORY_OBJECT_NULL) {
++			extern kern_return_t vnode_pager_get_object_name(memory_object_t, char *, vm_size_t, char *, vm_size_t, boolean_t *);
++			extern kern_return_t vnode_pager_get_object_size(memory_object_t, memory_object_offset_t *);
++			char path[256] = "", leaf[64] = "";
++			boolean_t truncated = FALSE;
++			memory_object_offset_t size = 0;
++
++			if (vnode_pager_get_object_name(file, path, sizeof(path), leaf, sizeof(leaf), &truncated) == KERN_SUCCESS) {
++				(void) vnode_pager_get_object_size(file, &size);
++				printf("CRASH %s file %s size %llu, offset 0x%llx\n", name, path, (uint64_t)size, file_offset);
++			}
++			memory_object_deallocate(file);
++		}
+ 	}
+ 	if (sig == 6 || sig == 5) {
+ 		sweet_crash_strings(name);

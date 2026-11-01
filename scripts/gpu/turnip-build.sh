@@ -180,6 +180,10 @@ done
 [ $fail = 0 ] || exit 1
 
 cp "$VK" "$OUTVK"
+# TU_WEAK_SELF=1 (scripts/laurel/metal-env.sh): the weak imports are looked up in this image only, not in every image of the process
+if [ "${TU_WEAK_SELF:-0}" = 1 ]; then
+  python3 -I "$(cd "$(dirname "$0")" && pwd)/../laurel/macho-weak-self.py" "$OUTVK"
+fi
 # debug info (TU_MESON_ARGS -Ddebug=true): kept next to it as a dSYM; scripts/metal/build.sh strips the bundle copy
 if [ -n "$TU_MESON_ARGS" ] && command -v dsymutil >/dev/null; then
   rm -rf "$OUTVK.dSYM"; dsymutil "$VK" -o "$OUTVK.dSYM" 2>/dev/null || echo "turnip: note: no dSYM"

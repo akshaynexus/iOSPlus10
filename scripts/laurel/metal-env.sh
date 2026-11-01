@@ -35,6 +35,8 @@ export TU_EXTRA_PATCHES="$LMSRC/turnip-patches"
 LAUREL_CPU_FLAGS="-mcpu=cortex-a53 -mfix-cortex-a53-835769"
 export TU_CPU_FLAGS="$LAUREL_CPU_FLAGS"
 export TU_MESON_ARGS="-Db_lto=true -Db_lto_mode=thin -Ddebug=true"
+# Turnip's ~3300 absent weak imports: no flat lookup at load (device open 3-10 s, docs/laurel_sprout/metal.md section 11)
+export TU_WEAK_SELF=1
 export NMTL_CPU_FLAGS="$LAUREL_CPU_FLAGS"
 export CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS="-C target-cpu=cortex-a53 -C target-feature=+fix-cortex-a53-835769"
 export CARGO_PROFILE_RELEASE_LTO=thin

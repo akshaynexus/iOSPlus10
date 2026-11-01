@@ -1,0 +1,120 @@
+laurel (Mi A3, boot 2026-11-01 18:40, first boot with Metal on the GPU; docs/laurel_sprout/metal.md section 11):
+- heapTextureSizeAndAlignWithDescriptor: the runtime's answer (nmb_device_heap_texture_size), not a linear estimate: mediaserverd had 41 x heap texture OutOfMemory(Heap).
+- gpuCoreCount = 1 on the Adreno 610 (Mesa FD610 num_ccu 1); the answers name the device, not "A730".
+- surface import and heap refusals: one line per cause (noteRefused) instead of one per call (180 lines in 6 minutes).
+
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index 441ca07..8c4529d 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -243,7 +243,11 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+  if(buffer)return buffer;
+  if(gSurfaceHook)gSurfaceHook(base,bytes,IOSurfaceGetID(surface));
+  NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,base,bytes,MTLResourceStorageModeShared);
+- if(!handle){NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
++ if(!handle){
++  const uint32_t type=IOSurfaceGetPixelFormat(surface);
++  noteRefused([NSString stringWithFormat:@"surface import (OSType 0x%08x, %zu planes)",type,IOSurfaceGetPlaneCount(surface)],lastError());
++  return nil;
++ }
+  buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
+  buffer.surfaceOwner=(IOSurfaceRef)CFRetain(surface);
+  if(key) {
+@@ -1562,7 +1566,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+ }
+ - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
+  NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
+- if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
++ if(!handle){noteRefused(@"heap buffer",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
+  buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
+ }
+@@ -1573,7 +1577,13 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
+ - (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
+  NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
+- if(!handle){NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
++ if(!handle){
++  static std::atomic<bool> told{false};
++  if(!told.exchange(true))NBLOG(@"native-metal: first heap texture refused: fmt %lu %lux%lu, heap %lu bytes, %lu used",(unsigned long)d.pixelFormat,(unsigned long)d.width,
++    (unsigned long)d.height,(unsigned long)nmb_heap_size(_handle),(unsigned long)nmb_heap_used_size(_handle));
++  noteRefused(@"heap texture",lastError());
++  return nil;
++ }
+  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+  texture.parentHeap=(id<MTLHeap>)self;texture.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLTexture>)texture;
+ }
+@@ -1891,6 +1901,11 @@ static NBTargetDeviceArch gTargetDeviceInfo={0,0,"NegroniMetal"};
+ - (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d {
+  const NSUInteger align=16384;
+  if(!d)return (MTLSizeAndAlign){align,align};
++ // laurel (boot 2026-11-01 18:40: mediaserverd 41 x heap texture OutOfMemory(Heap)): the answer placement really takes (Turnip's tiled size, alignment),
++ // not a linear estimate: a heap sized from the estimate was too small. The estimate stays for a descriptor the runtime cannot answer.
++ {NmbTextureDescriptor real;uint64_t size=0,alignment=0;
++  if(gDevice && textureDescriptor(d,&real) && nmb_device_heap_texture_size(gDevice,&real,&size,&alignment) && size)
++   return (MTLSizeAndAlign){(NSUInteger)size,(NSUInteger)alignment};}
+  uint64_t total=0,w=d.width?:1,h=d.height?:1,depth=d.depth?:1;
+  const uint64_t slices=(d.arrayLength?:1)*(d.textureType==MTLTextureTypeCube||d.textureType==MTLTextureTypeCubeArray?6:1);
+  const uint64_t levels=d.mipmapLevelCount?:1,samples=d.sampleCount?:1;
+@@ -2368,7 +2383,7 @@ static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!
+ // supports an amplification count of 2, else 1; isLargeMRTSupported, supportsComputeCompressedTextureWrite and supportsConditionalLoadStore
+ // are Apple-GPU features (no Vulkan form): NO.
+ static bool fallbackAnswer(const char *name,uint64_t *value) {
+- if(!strcmp(name,"gpuCoreCount")){*value=4;return true;}
++ if(!strcmp(name,"gpuCoreCount")){*value=gName && [gName containsString:@" 610"]?1:4;return true;} // laurel: Mesa FD610 num_ccu 1, FD730 4
+  if(!strcmp(name,"maxComputeThreadgroupMemory")){
+   if(!nmb_device_answer(gDevice,"maxThreadgroupMemoryLength",0,value) || !*value)*value=32768;
+   return true;
+@@ -2389,7 +2404,7 @@ static void installAnswers(Class cls) {
+   case NMB_ANSWER_COUNT: case NMB_ANSWER_FLAG:
+    if(!nmb_device_answer(gDevice,name,0,&value)){
+     if(!fallbackAnswer(name,&value)){NBLOG(@"native-metal: no device answer: %@",lastError());continue;}
+-    NBLOG(@"native-metal: %s = %llu (NegroniMetal A730 answer)",name,(unsigned long long)value);
++    NBLOG(@"native-metal: %s = %llu (NegroniMetal answer for %@)",name,(unsigned long long)value,gName);
+    }
+    // Extended-range 10-bit (XR10) framebuffers are withheld: this display chain presents 8-bit BGRX scanout only. The render server picks its
+    // wide-gamut 64-bit (and Apple-compressed) framebuffer when a device offers them, and the display driver could not show it (int-089: the
+diff --git a/phone/metal2/bridge/NativeMetalObjects.h b/phone/metal2/bridge/NativeMetalObjects.h
+index 38fa3be..c4e6f3c 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.h
++++ b/phone/metal2/bridge/NativeMetalObjects.h
+@@ -54,6 +54,7 @@ const char *nmb_device_answer_selector(size_t index, uint32_t *kind /* NMB_ANSWE
+ bool nmb_device_answer(const NmbDevice *, const char *selector, uint64_t arg, uint64_t *out); /* false: no answer, nmb_last_error says why */
+ size_t nmb_device_vendor_name(const NmbDevice *, char *out, size_t size);
+ size_t nmb_device_family_waivers(const NmbDevice *, char *out, size_t size); /* the target families' rows not met, one family per line */
++bool nmb_device_heap_texture_size(const NmbDevice *, const struct NmbTextureDescriptor *, uint64_t *size, uint64_t *align);
+ uint64_t nmb_device_linear_bytes_per_row(const NmbDevice *, uint64_t format, uint64_t width); /* 0: refused */
+ 
+ typedef struct NmbBinaryArchive NmbBinaryArchive;
+diff --git a/phone/metal2/bridge/NativeMetalObjects.rs b/phone/metal2/bridge/NativeMetalObjects.rs
+index 2a89622..9cd09ba 100644
+--- a/phone/metal2/bridge/NativeMetalObjects.rs
++++ b/phone/metal2/bridge/NativeMetalObjects.rs
+@@ -515,6 +515,27 @@ pub unsafe extern "C" fn nmb_device_answer(device: *const NmbDevice, selector: *
+     })
+ }
+ 
++/// `heapTextureSizeAndAlignWithDescriptor:`: what placing this texture in a heap takes on this device (laurel, 2026-11-01).
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_device_heap_texture_size(
++    device: *const NmbDevice,
++    descriptor: *const NmbTextureDescriptor,
++    size: *mut u64,
++    align: *mut u64,
++) -> bool {
++    guard(false, || {
++        let d = &get(device)?.0;
++        let descriptor = texture_descriptor(descriptor)?;
++        let answer = d.heap_texture_size_and_align(&descriptor).map_err(e("heap texture size"))?;
++        // SAFETY: the caller's words.
++        unsafe {
++            *size = answer.size;
++            *align = answer.align;
++        }
++        Ok(true)
++    })
++}
++
+ /// `requiredLinearTextureBytesPerRowForDescriptor:` (Apple SPI): a row of `width` texels of `format` rounded up to the format's
+ /// linear alignment, from the runtime's format description; 0, with the reason, for a format no buffer can back.
+ #[unsafe(no_mangle)]

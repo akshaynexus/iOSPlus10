@@ -79,6 +79,8 @@ bash "$REPO/scripts/laurel/root-add-gpu.sh" "$mnt"
 # scripts/laurel/metal-build.sh has staged them; METAL=0 skips. Without the stage it logs "metal: off" and goes on.
 # (AREA B's scripts/laurel/root-add-gpu.sh, GPU firmware + GL, goes before this line: Metal checks for B's backboardd wrapper)
 METAL=${METAL:-1} sh "$REPO/scripts/laurel/root-add-metal.sh" "$mnt"
+# stock wallpapers: HEIC layers as PNG (no HEVC decoder on this phone: black wallpaper; WALLPAPER_PNG=0 skips)
+bash "$REPO/scripts/laurel/root-wallpaper.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-wallpaper.sh failed; root build continues"
 # speaker audio (kernel patch 2500): RedwoodAudio.driver HAL plug-in, VirtualAudio back, BTAudio off
 AUDIO=${AUDIO:-1} bash "$REPO/scripts/laurel/root-audio.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-audio.sh failed; root built without audio" >&2
 # Bluetooth (kernel patch 2600): bluetoothd job back + the BlueTool stand-in; BT=0 skips

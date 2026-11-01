@@ -1190,6 +1190,48 @@ surface_at(uintptr_t p, uint64_t size)
 	return same ? id : 0;
 }
 
+/* One line per cause in a process (cause = a small number): laurel, 2026-11-01: a failure here said nothing, and metal2vulkan's refusal gave no reason. */
+static void
+host_import_note(unsigned cause, const char *text, uint32_t surface, void *pointer, unsigned long long size, int e)
+{
+	static uint32_t told;
+
+	if (cause >= 32 || (told & (1u << cause)))
+		return;
+	told |= 1u << cause;
+	ngl_log("negronigl: %s: surface %u, %p (+%llu), errno %d (one line per cause)", text, surface, pointer, size, e);
+}
+
+/* The caller's own pages through request 0x49 (kernel 0232 / laurel 2160), read-only when they cannot be written. */
+static int
+host_import_pages(uintptr_t p, uint64_t whole, uint32_t surface, uint32_t *handle, uint64_t *bo_size, bool *read_only)
+{
+	if (whole > NGL_USERPTR_MAX)
+		return EINVAL;
+	struct redwood_drm_userptr u = {.pointer = p, .size = whole};
+	int e = msm_call(NGL_MSM_SEL_USERPTR, &u, sizeof(u));
+	if (e == EIO) {
+		/* kIOReturnVMError: the pages are not writable. Import them read-only for the GPU. */
+		u = (struct redwood_drm_userptr){.pointer = p, .size = whole, .flags = NGL_USERPTR_READ_ONLY};
+		e = msm_call(NGL_MSM_SEL_USERPTR, &u, sizeof(u));
+		if (e == 0)
+			host_import_note(1, "host import: read-only pages, the GPU only reads them", surface, (void *)p, whole, 0);
+	}
+	if (e == ENOSYS) {
+		no_userptr_sel = true;
+		ngl_log("negronigl: USERPTR (selector 0x49): ENOSYS, kernel without 0232; only noted IOSurfaces import");
+		return ENOSYS;
+	}
+	if (e) {
+		host_import_note(e == EPERM ? 2 : e == ENOMEM ? 3 : 4, "USERPTR refused", surface, (void *)p, whole, e);
+		return e;
+	}
+	*handle = u.handle;
+	*bo_size = whole;
+	*read_only = (u.flags & NGL_USERPTR_READ_ONLY) != 0;
+	return 0;
+}
+
 int
 redwood_drm_host_import(int fd, void *pointer, uint64_t size, uint32_t *handle, uint64_t *bo_size, bool *read_only)
 {
@@ -1206,50 +1248,38 @@ redwood_drm_host_import(int fd, void *pointer, uint64_t size, uint32_t *handle, 
 	uint32_t id = surface_at(p, size);
 	if (!id) {
 		if (abi != NGL_ABI_MSM_STRUCT || no_userptr_sel) {
-			ngl_log("negronigl: host import of %p (+%llu): not a noted IOSurface, and no USERPTR (%s)", pointer,
-			    (unsigned long long)size, abi != NGL_ABI_MSM_STRUCT ? "scalar ABI" : "kernel without 0232");
+			host_import_note(0, abi != NGL_ABI_MSM_STRUCT ? "host import: not a noted IOSurface, scalar ABI" :
+			    "host import: not a noted IOSurface, kernel without 0232", 0, pointer, size, ENOSYS);
 			return ENOSYS;
 		}
-		if (whole > NGL_USERPTR_MAX)
-			return EINVAL;
-		struct redwood_drm_userptr u = {.pointer = p, .size = whole};
-		e = msm_call(NGL_MSM_SEL_USERPTR, &u, sizeof(u));
-		if (e == EIO) {
-			/* kIOReturnVMError: the pages are not writable. Import them read-only for the GPU. */
-			u = (struct redwood_drm_userptr){.pointer = p, .size = whole, .flags = NGL_USERPTR_READ_ONLY};
-			e = msm_call(NGL_MSM_SEL_USERPTR, &u, sizeof(u));
-			if (e == 0)
-				ngl_log("negronigl: host import of %p (+%llu): read-only pages, the GPU only reads them", pointer,
-				    (unsigned long long)whole);
-		}
-		if (e == ENOSYS) {
-			no_userptr_sel = true;
-			ngl_log("negronigl: USERPTR (selector 0x49): ENOSYS, kernel without 0232; only noted IOSurfaces import");
-			return ENOSYS;
-		}
-		if (e) {
-			ngl_log("negronigl: USERPTR of %p (+%llu): errno %d", pointer, (unsigned long long)whole, e);
-			return e;
-		}
-		*handle = u.handle;
-		*bo_size = whole;
-		*read_only = (u.flags & NGL_USERPTR_READ_ONLY) != 0;
-		return 0;
+		return host_import_pages(p, whole, 0, handle, bo_size, read_only);
 	}
 	if (abi == NGL_ABI_MSM_STRUCT) {
 		struct redwood_drm_surface s = {.surface = id};
 		e = msm_call(NGL_MSM_SEL_SURFACE, &s, sizeof(s));
-		if (e)
-			return e;
-		if (s.offset != 0 || s.size < size) {
+		if (e == 0 && (s.offset != 0 || s.size < size)) {
 			/* the surface's pixels must start at the buffer's first byte, as at its base address */
 			struct drm_gem_close c = {.handle = s.handle};
 			msm_call(NGL_MSM_SEL_GEM_CLOSE, &c, sizeof(c));
-			return EINVAL;
+			e = EINVAL;
 		}
-		*handle = s.handle;
-		*bo_size = s.size;
-		return 0;
+		if (e == 0) {
+			*handle = s.handle;
+			*bo_size = s.size;
+			return 0;
+		}
+		/*
+		 * laurel (boot 2026-11-01 18:40): the kernel's import by ID takes only one-plane 4-byte surfaces with 64-byte rows, its rule for
+		 * the GL path: chronod's '_RB4' widgets (2 planes), mediaserverd's '420f', SpringBoard's BGRA with 2784-byte rows all
+		 * failed here, 180 lines of "surface import refused". Turnip needs a GPU address, not the kernel's surface: with the
+		 * stage-1 tables the same memory goes as the client's own pages (0x49). A mapped IOSurface is whole pages.
+		 */
+		if (no_userptr_sel) {
+			host_import_note(5, "IOSurface: no import by ID, no USERPTR", id, pointer, whole, e);
+			return e;
+		}
+		host_import_note(6, "IOSurface: no import by ID, its pages go through USERPTR", id, pointer, whole, e);
+		return host_import_pages(p, whole, id, handle, bo_size, read_only);
 	}
 	e = ngl_drm_import_surface(id, handle, bo_size);
 	if (e == 0 && *bo_size < size) {

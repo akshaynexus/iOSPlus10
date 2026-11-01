@@ -1,6 +1,11 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+Real-GPU round (2026-11-01 19:30, branch t3/laurel-metal-realgpu, built, NOT BOOTED): boot 18:40 = first Metal on the GPU; owner: home wallpaper black.
+Most likely cause [I]: default wallpaper 7400 is HEIC layers, no HEVC decoder here (ios-flame found the same black layer) -> root-wallpaper.sh writes PNGs. Also: launchd's 5 s extension
+kill loop (AegirPoster) -> boot-arg launchd_disable_all_timeouts=1, poster strike rule; device open 3-10 s [I flat lookups of 3312 weak imports] -> macho-weak-self.py;
+173 surface imports refused (kernel's GL rule) -> stand-in falls back to 0x49; RB_COLOR_MODE too late -> launchd job env; heap sizes from the runtime; one line per cause; gpuCoreCount 1.
+mediaserverd "low swap" kills: [I] camera frame leak, open. Needs root + boot image rebuild. Next: boot, metal.md section 11.5. Details: docs/laurel_sprout/metal.md section 11.
 Target: Xiaomi Mi A3 (`laurel_sprout`, SM6125, ARMv8.0, no PAC, Adreno 610). iOS 16 first, iOS 26 later (research:
 no PAC, needs zeta-style PAC lowering). Done: device facts (`scripts/device/info.sh`), 7 pinned reference trees
 (ios-topaz, Mu-Silicium, MiCode `laurel-r-oss`, Lineage kernel/device/common, mainline), port plan with the topaz

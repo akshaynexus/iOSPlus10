@@ -1,0 +1,58 @@
+laurel (boot 2026-11-01 18:40): one line per surface format for what CoreAnimation shows and for what -attachImage refuses (36 '_RB4' lines in 5 minutes; a poster's XR10 surface would have said nothing past the first 24 surfaces).
+
+--- a/userland/gpu/eagl.c	2026-11-01 19:16:34.116112569 +0530
++++ b/userland/gpu/eagl.c	2026-11-01 19:16:34.173918534 +0530
+@@ -3573,6 +3573,24 @@
+ 	return e ? e->table : NULL;
+ }
+ 
++/* laurel: the first time a pixel format comes to a method, for a line per format: 16 formats, the rest count as seen */
++static bool
++format_first(uint32_t pixels, unsigned way)
++{
++	static uint32_t seen[2][16];
++
++	for (unsigned i = 0; i < 16; i++) {
++		if (seen[way][i] == pixels + 1) {
++			return false;
++		}
++		if (seen[way][i] == 0) {
++			seen[way][i] = pixels + 1;
++			return true;
++		}
++	}
++	return false;
++}
++
+ /* (the types are the method's own: the last three arrive on the stack, where sizes matter) */
+ static BOOL
+ my_texImageIOSurface(id self, SEL selector, IOSurfaceRef surface, unsigned long target, unsigned long internal,
+@@ -3595,6 +3613,13 @@
+ 		say("redwood-gl: -texImageIOSurface: target %#lx, texture %d: not done\n", target, texture);
+ 		return NO;
+ 	}
++	if (format_first(IOSurfaceGetPixelFormat(surface), 0)) {
++		/* one line per format (not only the first 24 surfaces): what reaches OpenGL ES, e.g. a poster's XR10 CAMetalLayer */
++		say("redwood-gl: a new kind of surface shown: '%.4s', %zu planes, %zu bytes a pixel, %zu a row, %zu x %zu: internal format %#lx, format %#lx, type %#lx\n",
++		    (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) }, IOSurfaceGetPlaneCount(surface),
++		    IOSurfaceGetBytesPerElement(surface), IOSurfaceGetBytesPerRow(surface), IOSurfaceGetWidth(surface),
++		    IOSurfaceGetHeight(surface), internal, format, type);
++	}
+ 	image->to = (GLenum)target;
+ 	image->internal = (GLenum)internal;
+ 	image->format = (GLenum)format;
+@@ -3644,8 +3669,12 @@
+ 	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0) ||
+ 	    IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0 ||
+ 	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
+-		say("redwood-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
+-		    (const char *)&(uint32_t){ __builtin_bswap32(pixels) });
++		/* laurel: one line per format: chronod's '_RB4' gave 36 of these in 5 minutes */
++		if (format_first(pixels, 1)) {
++			say("redwood-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s' (%zu planes, %zu bytes a pixel): not done; one line per format\n",
++			    target, texture, (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, IOSurfaceGetPlaneCount(surface),
++			    IOSurfaceGetBytesPerElement(surface));
++		}
+ 		return NO;
+ 	}
+ 	image->target = true;

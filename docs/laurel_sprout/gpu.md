@@ -739,6 +739,13 @@ LOW_L1 (192) acked, measured clock within 10 % after the switch, TSENS sensor 15
 - 2851: `LAUREL METAL` line prints the real RedwoodMaxBuffer. 2154 already set 256 MiB with the tables; Turnip 0101 reads it [V source].
 - 2155's watchdog (3 s with work pending and no fence move) now also sees Metal work while GL runs: one Metal submission above 3 s on this 300 MHz GPU turns the GPU off for the boot (GL -> software renderer, Metal -> nil) [I, by design; not seen].
 
+## First boot with Metal on the GPU (18:40; metal.md section 11; built, NOT BOOTED)
+
+- 0x7e (`surfaceBuffer`) keeps its GL rule (one plane, 4 bytes, rows of 64 unless GPU pool): 173 Metal imports failed on it [V log + source]. Turnip's stand-in now takes the caller's pages (0x49) for those. Kernel unchanged there; kill switch `gpu_hostimport=0`.
+- GL: `redwood-gl: a new kind of surface shown: ...` per pixel format; `-attachImage ... not done` once per format (eagl patch 0003).
+- 2162: a SIGBUS names its file: `CRASH <name> file <path> size N, offset 0xO`. Only a log line.
+- GL frames 10-16 ms, 26-38 fps in this boot, 8-13 ms in the 15:27 reference [V]. The load differs (Metal clients, widgets, first boot at 100 % CPU); what part 2161 (CCU invalidate) has is [U].
+
 ## Recovery (no UI after the GPU root)
 
 1. Boot with `gl=0` (backboardd without the loader, software renderer) or `gpu=0` (no GPU at all, no loader), or

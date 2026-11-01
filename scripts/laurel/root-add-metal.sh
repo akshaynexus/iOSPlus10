@@ -74,6 +74,8 @@ else
   python3 -I "$REPO/scripts/laurel/metal-gate-job.py" "$R" off
   echo "laurel-root: metal: no $G (scripts/laurel/gpu-userland.sh): clients stay as listed"
 fi
+# RenderBox reads RB_COLOR_MODE before the plug-in loads: in the jobs' own environment (chronod's widgets: plain BGRA, no '_RB4')
+python3 -I "$REPO/scripts/laurel/metal-job-env.py" "$R" on
 # Extensions with a Metal device: every extension point at least METAL_EXT_MB (default 64), posters METAL_POSTER_MB (default 128),
 # the Photos daemons at least 64 (docs/laurel_sprout/metal.md 6.3; jetsamproperties read by runningboardd and launchd at boot)
 for j in "$R"/System/Library/LaunchDaemons/com.apple.jetsamproperties.*.plist; do
