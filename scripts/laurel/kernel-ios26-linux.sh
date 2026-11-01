@@ -26,7 +26,7 @@ echo "kernel-ios26: $XNU_TAG SWEET $KERNEL_CONFIG PAGES=$PAGES jobs=$JOBS"; df -
 
 get_sdk() {
   local t=$W/dl/MacOSX$SDK_VER.sdk.tar.xz
-  [ -f "$t" ] || curl -fsSL --retry 5 -o "$t" "https://github.com/joseluisq/macosx-sdks/releases/download/$SDK_VER/MacOSX$SDK_VER.sdk.tar.xz"
+  [ -f "$t" ] || { curl -fsSL --retry 5 -o "$t.part" "https://github.com/joseluisq/macosx-sdks/releases/download/$SDK_VER/MacOSX$SDK_VER.sdk.tar.xz" && mv "$t.part" "$t"; }
   echo "$SDK_SHA256  $t" | sha256sum -c - >/dev/null || { echo "kernel-ios26: SDK checksum changed" >&2; return 1; }
   [ -d "$MACOS_SDK/usr/include" ] || tar -xJf "$t" -C "$DEPS"
 }
@@ -37,14 +37,14 @@ get_theos() {
   rm -rf "$THEOS"; git init -q "$THEOS"
   git -C "$THEOS" fetch -q --depth 1 https://github.com/theos/theos.git "$THEOS_SHA"; git -C "$THEOS" checkout -q FETCH_HEAD
   mkdir -p "$THEOS/toolchain"; local tc=$W/dl/iOSToolchain-x86_64.tar.xz
-  [ -f "$tc" ] || curl -fsSL --retry 5 -o "$tc" "$TOOLCHAIN_URL"
+  [ -f "$tc" ] || { curl -fsSL --retry 5 -o "$tc.part" "$TOOLCHAIN_URL" && mv "$tc.part" "$tc"; }
   echo "$TOOLCHAIN_SHA256  $tc" | sha256sum -c - || return 1
   tar -xJf "$tc" -C "$THEOS/toolchain/"
 }
 get_kdk() {
   [ -f "$KDKROOT/.kdk-headers" ] && return 0
   local d=$W/dl/Kernel_Debug_Kit_26.5.2_build_25F84.dmg
-  [ -f "$d" ] || curl -fsSL --retry 5 -o "$d" "$KDK_URL"
+  [ -f "$d" ] || { curl -fsSL --retry 5 -o "$d.part" "$KDK_URL" && mv "$d.part" "$d"; }
   echo "$KDK_SHA256  $d" | sha256sum -c - >/dev/null || { echo "kernel-ios26: KDK checksum changed" >&2; return 1; }
   python3 -I "$REPO/scripts/ios26/kdk-headers.py" --dmg "$d" "$KDKROOT"
 }
