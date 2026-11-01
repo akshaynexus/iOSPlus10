@@ -4669,3 +4669,19 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Tool: `dsc-dis.py` + `dsc-annotate.py` read the cache; a class's relative method list: selector base 0x18229979f in 20H392, entry size 12.
 - Build [V]: merged with origin/laurel-sprout 3ee7345. kernel-linux.sh 291/291 patches, 90 laurel, 0 failed, 0 LSE, sha256 fb4252a3fd2db69f... (no kernel change here); plug-in 164336 bytes, sha256 320ac73d62013137...; cam-test.sh OK; cam-leak-test.sh OK (cam5 + cam6); camera-cache-check.sh PASS, 11 hooks, 140 imports (run before the merge and the noise fix; neither changes the hook table or the imports).
 - Next: root (userdata) + owner test, section 11. No boot image for this change.
+
+## Mi A3: mediaserverd with Metal, filter strip on the GPU, memory guard (2026-11-01, branch t3/laurel-mediaserverd-metal; flame/0020, camera plug-in, gate; built, host-tested, NOT BOOTED)
+
+- Owner: mediaserverd must run with Metal. Gate list `* -backboardd`. Details: docs/laurel_sprout/metal.md section 12.
+- [V] All 4 low-swap kills come 3-4 s after the `heap texture refused` burst; no burst, no kill (2 processes). 650+ MB/s: not per frame. Kill size = compressor limit, says nothing about the source.
+- [V cache] Burst = `-[FigMetalContext prewarmInternalMetalShadersForFormatsList:]`: heap of 32 bytes, 1x1 textures, makeAliasable each; ours was empty. `NoTargets` line = `-[FigColorCubeMetalFilter prewarmMetalInternalShader]`: 2x2 over 8x8 '420f'. Both are harmless signs of the failed imports and aliasing, not proven causes.
+- [V host] Filter AIR -> SPIR-V 13 MiB. Runtime + bridge on Intel ANV over 3000 filter frames: +0.0 KiB a frame. 32 pipelines +11 MiB. Not Turnip, not ir3, not CMCapture.
+- [U] The allocator. The no-Metal boot does not clear Metal or blame it: there every session crashed in the thumbnail node before the later deferred nodes.
+- [V boot 20:02] The 0x49 fallback imports real '420f' and '_RB4' surfaces on the phone (SpringBoard, chronod), no refusal; not yet in mediaserverd.
+- Guard does not stop an allocation in progress in stock code; it names it in one boot (VM tags, Metal counts, busiest thread's stack). The next fix follows from those lines.
+- Tool: `ipsw dyld disass ... --cache out/re/dsc.a2s`: a read-only mount cannot hold the symbol cache, the default path fails with exit 0 and an empty file. `dyld macho IMAGE --objc` for classes.
+- Gotcha: zsh (the agent's shell) reads an `echo ====` as a command and stops; `/usr/bin/time` is absent here.
+- Worktree build needs: submodule init with --reference for metal2vulkan, ios-flame, hackios-xnu-userland (+ alternates to the main repo's modules for b4c5513); reflink out/laurel-kernel/{theos,deps}, out/laurel-metal/{sdk,ipsw}, out/laurel/gpu; symlink external/{ios-topaz,ios-sweet-linux,hackios-scion} (remove them before you stage).
+- Build [V]: metal-build.sh all: exit 0, flame/0020 applies, check-imports PASS (0 missing), check PASS (0 instructions newer than ARMv8.0); gpu-userland.sh: gate `* -backboardd`; camera build + isp selftest PASS; cam-leak-test OK (+ cam7); camera-cache-check PASS, 157 imports, 0 missing; armv80-check NegroniCamera + gate: 0. Kernel: no change, not rebuilt.
+- Next: root (userdata) + owner test: metal.md 12.5. No boot image.
+

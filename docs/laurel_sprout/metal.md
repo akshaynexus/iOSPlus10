@@ -401,3 +401,77 @@ Root build: `laurel-root: wallpaper: on: 48 HEIC layers as PNG (0 were already, 
 Phone: `NMTL[.. SpringBoard]: device Turnip Adreno (TM) 610 in N ms, of which M ms loading Turnip` (N well under 10138), `native-metal: gpuCoreCount = 1 (NegroniMetal answer for Turnip Adreno (TM) 610)`, `negronigl: IOSurface: no import by ID, its pages go through USERPTR: surface N, ... (one line per cause)`, `SWEET SURF: chronod create ... fmt 0x42475241 ... planes 0`, no `'_RB4'`, no `extension check-in timeout`, `LAUREL METAL CLIENTS: QuartzCore refused N x (first ...): <reason>`, `NMTL[.. AegirPoster]: dead-man: on: ...` + `pipelines N compiled`. If it still fails: `CRASH PosterBoard file <path> size N, offset 0x4`, `memory: footprint ...`, `native-metal: first heap texture refused: fmt ...`.
 
 Owner checks: home wallpaper and lock wallpaper (photo), widgets show content, wallpaper chooser, boot-to-UI time.
+
+## 12. mediaserverd with Metal: the 2.6 GB growth, the filter strip on the GPU, the memory guard (2026-11-01, branch t3/laurel-mediaserverd-metal)
+
+Owner's decision, not open: mediaserverd has Metal. The gate's list is `* -backboardd`. Hooks 10 + 11 (`media_hooks.c`) act only when the GPU self-check gave this process no device, or when the guard below stopped the strip.
+Status: built, host-tested. **Not run on the phone.** Labels: [V] log, disassembly or host run; [I] inference; [U] unknown.
+
+### 12.1 What the logs and the cache show
+
+The allocator is still **[U]**. No log has a memory line from inside the growth: the `memory:` step line came after these boots. What is known:
+
+| Fact | Evidence |
+| --- | --- |
+| [V] The kill comes 3 to 4 s after one event, in every process that lived that long: the burst of about 20 `heap texture refused` | burst -> kill: pid 28 18:43:52 -> :56; pid 321 18:46:22 -> :25; pid 382 19:41:48 -> :52; pid 391 19:42:05 -> :09 |
+| [V] No burst, no kill | pid 321 at 18:43:58-18:44:17 (349 frames, device open); pid 396 19:42:15-30. Pid 28 at 19:41:29 had the burst and crashed 5 s later with another fault (sig 10 in `deliver`), no kill |
+| [I] So this is not a leak per frame. 2.6 GB in 3-4 s is 650-870 MB/s compressed, against about 76 MB/s of frame data (1504x1128 420f, 30 fps). That rate needs a large fill, not small allocations | calculation from the row above |
+| [I] The kill size does not measure the growth: 2485-2689 MB in each process fits a compressor limit, whatever the frame count | [V] the 4 sizes; XNU's `no_paging_space_action` from memory, not read in this tree |
+| [V] The burst is the filter strip's prewarm. `-[FigMetalContext prewarmInternalMetalShadersForFormatsList:]` (CMImaging 0x1c789d054): heap of **32 bytes** (`setSize: 0x20`), 1x1 textures usage 7, `makeAliasable` on each. Our `makeAliasable` was an empty method, so the heap filled | disassembly |
+| [V] The single `command buffer refused: ... RenderPass(NoTargets)` (1 s after the burst, one per process) is the same prewarm: `-[FigColorCubeMetalFilter prewarmMetalInternalShader]`: an 8x8 '420f' `CVPixelBuffer`, a 2x2 texture over plane 0 (nil: import refused), `setTexture:nil`, `renderCommandEncoderWithDescriptor:` | MetalFilter.bundle 0x1f63b1abc.. |
+| [V] Then, in the stock order: `createKernels` (up to 48 + 2 render pipelines: three tables of 2 x 2 x 2 x 2 by the class's ivars, 6 function constants; the host test makes 32), `allocateResources` (cube textures), `setForegroundCubesWithNames:data:` (cubes from files through `BWColorLookupCache`) | disassembly of `prepareToProcess:`, `-[BWMultiFilterThumbnailNode prepareForCurrentConfigurationToBecomeLive]` |
+
+Rejected, each with its evidence:
+
+| Candidate | Result |
+| --- | --- |
+| AIR -> SPIR-V of the filter's shaders | [V host] one pair: peak 13 MiB in 0.02 s |
+| Runtime and bridge objects over the frames: imports, textures over planes, passes, commits | [V host] `scripts/metal/leak-test.sh`, 3000 frames on Intel ANV: +0.0 KiB a frame. 32 pipelines: +11 MiB |
+| Imports refused then copied each frame | [V] the refusal is `Unsupported(HostMemory)`: no copy path ran. Refusals per process do not scale with a fixed size; the kill also comes with only 50 refusals |
+| Surfaces | [V camera.md section 10] kernel memory, 0.2 new surfaces per frame |
+| GPU buffers (GEM) | [V] pool at 164-228 MiB free across the growth. Wired memory cannot be compressed either |
+| Fresh pages, recycle | [V source] buffers over 4 MiB lie in anonymous pages, imported and wired by 0x49, unmapped at free; parked at most 64 MiB for 1 s. No path found that keeps them. Wired pages are not compressed |
+
+Still open [U], the phone must say: ir3 on the filter's shaders; `FigColorCubeMetalFilter allocateResources`; another node of the deferred list. **Important:** the "no growth without Metal" evidence is weak. Without Metal every session died in the thumbnail node, so the later deferred nodes (`BWInferenceNode`, `BWPhotoEncoderNode`, ...) never ran. Metal may not be the cause at all [U].
+
+### 12.2 Surface imports [V on the phone for other processes]
+
+Boot 20:02 (patch 2160 + stand-in fallback), no `surface import refused` at all: `negronigl: IOSurface: no import by ID, its pages go through USERPTR` and `first texture over a surface with planes` for chronod '_RB4' and SpringBoard **'420f'** (4.5 MB). mediaserverd never ran with this build (`-mediaserverd`). [V host] '420f', '420v', 'x420' both planes, BGRA, and the prewarm's 2x2 target: made, no copy.
+
+### 12.3 Changes
+
+| Part | What |
+| --- | --- |
+| `metal_gate.c`, `root-add-metal.sh`, `metal-management.md` | `* -backboardd` |
+| flame/0020 | `makeAliasable` is real (new `nmb_texture_make_aliasable`, `nmb_buffer_make_aliasable`). [V host] 32-byte heap, 20 textures that each need more than half of it: 1 of 20 placed before, 20 of 20 after |
+| flame/0020: device answers FigMetalContext asks and we lacked | `newBufferWithIOSurface:` (`bindPixelBufferToMTLBuffer:`, same import as textures), `newCommandQueueWithDescriptor:` (`CMMTLCommandQueue`) |
+| flame/0020: counts | `native_bridge_metal_objects`: live textures, over surfaces, buffers + bytes, heaps + bytes, command buffers, in flight, pipelines |
+| flame/0020: stop | `native_bridge_metal_stop_new_pipelines`: new pipelines answer an error, one line |
+| `NegroniMetal.mm` | the `memory:` step line of every client has the counts |
+| `camera_mem.c`, `camera_mem_guard.h` | `memory at frame` has compressed + counts. **Guard** (kill switch: file `/var/db/negronicam/memguard-off`): 4 samples a second from the first session. One line at each +256 MB with VM tags, counts and the **busiest thread's stack**. At 768 MB: this session's strip goes through the CPU copy, no new Metal pipelines, one line. A new session under 576 MB lifts it. The process is not killed by us |
+| `media_hooks.c` | hooks 10 + 11 also obey the guard's flag |
+| Tests | `scripts/metal/leak-test.sh` + `userland/metal/tests/mediaserverd-leak.c` (`build-bridge.sh linux`), `tools/laurel-cam-test/cam7_test.c` (the guard's rule, in `cam-leak-test.sh`) |
+
+No kernel change, no Turnip change. **The guard does not stop an allocation that is in progress in stock code.** If the source is a node other than the strip, or a single large fill, memory can still reach the kernel's limit: then the guard's lines name it, and that is the next fix.
+
+### 12.4 FigColorCubeMetalFilter and FigMetalContext on the A610
+
+Every Metal selector these two images send was compared with the frontend [V]: 2 were absent (above). `+createMetalDevice` -> `MTLCreateSystemDefaultDevice`: the plug-in's device. A610 answers: flame/0019 (`gpuCoreCount` 1, sizes from the runtime). `enableHeapShrink`: not answered, the caller checks `respondsToSelector:`. `setBackgroundGPUPriority:` NO: return value not used in the path read. `newFunctionWithName:constantValues:pipelineLibrary:error:` ignores the library and compiles from AIR. `newPipelineLibraryWithFilePath:error:` stays `_MTLDevice`'s own: no crash in 4 sessions [V]. `supportsFamily:` 1004 is read only in `+[CMImagingShaderPrecompilation prewarmShaders]`, not in the filter's path. [U] whether `FigPreloadShaders` runs here: no caller found in the images read.
+
+### 12.5 Next boot: expected lines [I]
+
+```
+LAUREL METAL CLIENTS: on: ...; clients "* -backboardd" for every process that starts from now on
+NMTL[n mediaserverd]: device Turnip Adreno (TM) 610 in N ms ...
+negronigl: IOSurface: no import by ID, its pages go through USERPTR: surface N, ... (one line per cause)
+NMTL[n mediaserverd]: native-metal: first texture over a surface with planes: fmt 10, plane 0 of 2, OSType 0x34323066
+LAUREL CAMERA: ios: memory guard: on: 4 samples a second, a line at each +256 MB, limit 768 MB
+LAUREL CAMERA: ios: memory at frame 60: footprint N MB (compressed C MB), malloc M MB; by VM tag: ...; Metal: T textures (S over surfaces), B buffers N MB, H heaps N MB, C command buffers (I in flight), P pipelines
+```
+
+Good: no `heap texture` refusal, no `RenderPass(NoTargets)`, footprint flat, the strip shows filters. T and C stay small and flat.
+If it grows: `LAUREL CAMERA: ios: memory guard: growing: footprint ...; by VM tag ...; Metal: ...; busiest thread "x" N%: image+0x.. image+0x..`. Symbolize the frames: that names the allocator. Past 768 MB: `memory guard: limit: ...`, `native-metal: no new pipelines ...`.
+Metal counts high and rising = ours. Counts flat, VM tag 1-11 (malloc) and a stack in CMCapture or Espresso = stock code, then stop that node. A kill still means: `low swap` after `memory guard:` lines: read them.
+No device: `negroni: camera hooks: no Metal device in this process: the filter thumbnails go unfiltered, through the CPU`: read the gate's line.
+
+Rebuild: Metal stage + gate + camera plug-in = root (userdata) only: `scripts/laurel/metal-build.sh`, `scripts/laurel/gpu-userland.sh`, `userland/laurel/camera/build.sh`, `sudo scripts/laurel/root.sh`. No boot image.
