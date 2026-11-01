@@ -20,9 +20,9 @@
 # linux,initrd-start/end), NegroniBootMemoryDxe publishes it as a block device, UniXNU reads \EFI\UniXNU\unixnu.toml.
 set -euo pipefail
 . "$(dirname "$0")/../lib/env.sh"
-W=$OUT/laurel/uefi
+W=${UEFI_W:-$OUT/laurel/uefi}    # own folder: scripts/laurel/ios26-image.sh
 STOCK=${STOCK_BOOT:-$HOME/laurel-backup/stock/images/boot.img}
-MU=$OUT/laurel/mu
+MU=${MU_DIR:-$OUT/laurel/mu}
 FD=${FD:-$MU/SILICIUM_UEFI-DEBUG.fd}
 SHIM=${SHIM:-$MU/BootShim.bin}
 KERNEL_BY_HAND=${KERNEL:-}
@@ -71,7 +71,17 @@ else
   # no boot image from a kernel that is not proven: kernel-linux.sh stamps only what passed its checks
   python3 -I "$BS" kernel-check "$KERNEL" ${KERNEL_BY_HAND:+--no-repo} || { echo "uefi-image: FAILED: kernel not good: no boot image" >&2; rm -f "$W/laurel-uefi-boot.img.stamp"; exit 1; }
   STAMP_LINE=$(python3 -I "$BS" image-line "$KERNEL" "$FD")
-  python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE"   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
+  # laurel 2950: the iOS root on Android's /data (docs/laurel_sprout/dual-boot.md). No table: the image is for a phone with no Android; flash-boot.sh refuses it while config/laurel-android-data exists.
+  DUALBOOT_TABLE=${DUALBOOT_TABLE:-$OUT/laurel/dualboot/table.ldbt}
+  rm -f "$W/laurel-uefi-boot.img.dualboot"
+  ADT_TABLE=
+  if [ -f "$DUALBOOT_TABLE" ]; then
+    "${OP10TOOL:-$OUT/bin/op10tool}" dualboot check "$DUALBOOT_TABLE" || { echo "uefi-image: FAILED: the extent table does not pass: no boot image" >&2; exit 1; }
+    ADT_TABLE=$DUALBOOT_TABLE
+  elif [ -e "$REPO/config/laurel-android-data" ]; then
+    echo "uefi-image: note: no extent table ($DUALBOOT_TABLE): this image cannot go on the phone while it holds Android (dual-boot.sh map makes the table)"
+  fi
+  python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE" ${ADT_TABLE:+--dualboot-table "$ADT_TABLE"} ${MKADT_EXTRA:-}   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
   "$OUT/venv/bin/python3" "$REPO/scripts/laurel/mkdarwinboot.py" "$KERNEL" "$W/laurel.adt" "$W/payload.img" \
     --cmdline "$CMDLINE" --size-mib "$SIZE_MIB" --timeout 3
   printf '%s\n' "$CMDLINE" > "$W/cmdline.txt"
@@ -90,6 +100,8 @@ mkbootimg --header_version 2 --kernel "$W/kernel.gz" --ramdisk "$rd" --dtb "$W/s
 ls -l "$IMG" "$W/kernel.gz" "$rd"
 if [ "${MU_ONLY:-0}" != 1 ]; then
   python3 -I "$BS" image-seal "$IMG" "$STAMP_LINE" "$KERNEL" "$FD" "$CMDLINE"
+  # the sidecar android-guard.sh boot-image asks for
+  [ -z "${ADT_TABLE:-}" ] || printf 'image %s\ntable %s\n' "$(sha256sum "$IMG" | cut -d' ' -f1)" "$(sha256sum "$ADT_TABLE" | cut -d' ' -f1)" > "$IMG.dualboot"
   echo "uefi-image: boot line: LAUREL BUILD: image $STAMP_LINE"
 fi
 echo "uefi-image: $IMG (FD $fdlen bytes$([ "${MU_ONLY:-0}" = 1 ] && echo ', Mu alone' || echo ", kernel $(basename "$KERNEL"), cpus=$CPUS, dram $DRAM, boot CPU Gold 0x100 after the PSCI hand-off (patch 2016)"))"

@@ -14,6 +14,7 @@
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 F=$REPO/scripts/flash/ios16.sh
+"$REPO/scripts/laurel/android-guard.sh" other-device   # this script is for the OnePlus 10 Pro; the Mi A3 holds Android
 [ "${CONFIRM:-}" = yes ] || { echo "this writes boot_a, vendor_boot_a, vbmeta_a, dtbo_a and userdata: run with CONFIRM=yes" >&2; exit 1; }
 
 wait_fastboot() {   # $1 = yes (fastbootd) | no (bootloader)

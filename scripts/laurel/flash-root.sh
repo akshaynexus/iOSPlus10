@@ -8,6 +8,7 @@
 # script then stops and says so; the owner re-enters fastboot with Power+VolDown.
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
+"$REPO/scripts/laurel/android-guard.sh" userdata   # Android may be on userdata: docs/laurel_sprout/dual-boot.md
 APPLE=${APPLE:-$HOME/op10-apple}
 IMG=${1:-$APPLE/laurel-ios16-root.simg}
 [ -f "$IMG" ] || { echo "flash-root: missing $IMG (scripts/laurel/root.sh)" >&2; exit 1; }

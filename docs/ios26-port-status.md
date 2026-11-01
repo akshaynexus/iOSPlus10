@@ -4,6 +4,8 @@ Date: 2026-10-27. Branch `ios26-prep` (draft PR #1). No phone access in this wor
 result. Background and donor choice: [future-ios26.md](future-ios26.md). Boot test order for later:
 [ios26-boot-plan.md](ios26-boot-plan.md).
 
+**Mi A3 (SM6125):** this page is the negroni port. The Mi A3 iOS 26 kernel (plain arm64, Linux build, donor N104AP) is in [laurel_sprout/ios26-kernel.md](laurel_sprout/ios26-kernel.md).
+
 Marks: **[V]** verified here (command output, file, build log). **[I]** inference. **[U]** unknown.
 
 ## 1. Summary

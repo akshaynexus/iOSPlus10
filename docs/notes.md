@@ -4909,3 +4909,30 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - [V its text] zeta is past the launchd PAC faults: Home screen on SM8350, 8 cores, black backgrounds, 55-83 ms per present. Its `native-shared-region-*` patches are not in pinned UniXNU-ios26 68c5134.
 - [V api.ipsw.me] Newest plain arm64: iPadOS 18.7.11 22H384 (iPad7,11). iPhone X ends at 16.7.16, iPad 6 at 17.7.11. iPad 8 (A12) has 26.7.2 but it is arm64e.
 - [I] Trap cost about 2 µs, 7.5 M atomics/s per busy core: traps for LSE = about 15 times slower; trampolines about 7.5 %.
+## Mi A3: dual boot design + patch 2950 (2026-11-02, branch t3/laurel-dual-boot; built + host tests only, NOTHING RUN ON THE PHONE). Details: docs/laurel_sprout/dual-boot.md
+- [V] **Any existing kernel writes the console log to the last 4 MiB + 4 KiB of userdata every 10 s, unconditionally (sweet_log_thread). On a phone with Android that corrupts /data.** So an old boot image on boot_b is dangerous, also if the root never mounts. 2950: no table = the partition must start with HFS+; `android-guard.sh boot-image` refuses an image without a table while `config/laurel-android-data` exists.
+- [V phone] Lineage: slot _a, sda12 / sde16 / sde4. `adb root`: "ADB Root access is disabled by system setting". ro.debuggable = 0, ro.build.type = userdebug, cmdline buildvariant=user. No block device, slot or f2fs sysfs read without root. `bootctl` from shell: "Failed to get bootctl module".
+- [V] OTA holds 22 partitions; all firmware = the stock ROM files + zero padding (`scripts/laurel/ota-partitions.py`, payload hash); different: boot, dtbo, vbmeta, system, vendor. A plain hash of the file looks different: update_engine hashes the 4 KiB-padded partition image.
+- [V f2fs source] The pin ends: over gc_pin_file_thresh (2048) failed tries f2fs clears it. GET_PIN_FILE answers 0 for "not pinned" and for "no failures": use SET (idempotent, answers the count, EAGAIN over the limit). One FG GC of a pinned segment counts up to 512 tries. Encrypted files count in background GC too (move_data_block).
+- [V HAL source] set_active: 0x3F on the new slot (priority 3, active, 7 retries), the old slot loses only the active bit. [V ABL source] fallback needs successful = 1 and priority > 0.
+- Gotcha: `raw_read` and FIEMAP on btrfs: `cat a > b` makes a reflink: same physical blocks. A test of "file moved" needs new data. In zsh `$B` with spaces is one word: a failed compile looked like a pass until the test ran through `sh`.
+- Gotcha: the host test includes the real `sweet_ufs.c` with fake kernel headers (tools/laurel-dualboot/test): only `ufs_scsi` is replaced. Add a stub there when the driver gets a new call.
+- Built [V] 2026-11-02 at 03c7ed146a: kernel-linux.sh 310/310 patches, 0 failed, 0 LSE/RCpc, printf-arg-check OK, kernel sha256 afab8ee2a6cd3c08...; test-dualboot.sh PASS: 11 op10tool tests, test_kernel 40496 checks 0 failed, 29 guard checks 0 failed; build-honest-test 60/60; root-update-test 94/94.
+- Worktree recipe for the test: symlink external/{ios-sweet-linux,ios-topaz} and reflink out/laurel-kernel/{deps,theos,cache,dl} from the main checkout, `AUDIT=1 scripts/laurel/kernel-linux.sh`, then scripts/laurel/test-dualboot.sh.
+
+## Mi A3: iOS 26 kernel, native Linux build (2026-11-02, branch t3/laurel-ios26-kernel; docs/laurel_sprout/ios26-kernel.md). Compile and link only, NEVER RUN
+Facts [V]:
+- xnu-12377.121.6 links on Linux with the iOS 16 recipe (ios-sweet-linux + clang 23 + theos ld64-609) + MacOSX 26.1 SDK + KDK 25F84 headers. A clean run takes about 75 s on 20 cores.
+- The same 309 patches: 293 apply (83 with rules), 11 are whole in the base, 5 skipped. Only 22 patches had a conflict in a three-way merge against the 8796 series; most cases were in files that the negroni port owns too.
+- Three-way merge beats text rules here: `apply-series.py --profile` walks the series on xnu-8796 (`src/shadow`) and gives `git merge-file` the file before and after each patch. A conflict is an ERROR, so nothing merges silently past a marker.
+- Python `iig` of xnu-linux-toolchain, not the SDK-header shim: 12377 has `.iig` files in `iokit/Tests` that no SDK has. It needs two fixes (`scripts/laurel/ios26-iig-fix.py`): array parameters, quote include.
+- `availability.pl` of AvailabilityVersions-157.2 is a wrapper: copy `availability` + `availability.dsl` next to it. `-mno-implicit-sme` is Apple-only. Stock clang registers `LIBKERN_ALWAYS_DESTROY` objects through `___cxa_atexit`, also with `-fno-use-cxa-atexit`. `XNU_KERNEL_PRIVATE=0` breaks: 12377 tests it with `#ifdef`.
+- armv80-check on a kernel counts data words as instructions: 21 on the iOS 16 kernel, 22 here (K256, lz4 constants, panic strings). `--data-syms` names them; the check stays active.
+Traps of 12377 that compile fine and fail at run time [V code]:
+- `vm_shared_region_slide_page_v3`/`_v5`: with no `ptrauth_calls` an auth rebase was never written to the page. Fixed in base 0005.
+- `pmap_construct_pte`: WCOMB outside `/chosen dram-base + dram-size` is Device-GRE (faults on unaligned access and DC ZVA). `dram-*` must be all of DRAM (N104AP ADT: 0x40000000 + 0x180000000). The iOS 16 ADT has the window there.
+- kmem random moved to `vm_map_store.c` (`crypto_random_*` with NULL `g_crypto_funcs`).
+- `sched_clutch.c` stir-the-pot: `#error` on LL/SC and a 16-byte CAS; 64 bits are enough for 8 CPUs.
+Donor [owner, 2026-11-02]: N104AP, iPhone12,1, `artwork-device-subtype` 0x700, scale 2. `mkadt.py --donor`; iOS 16 D22AP unchanged.
+Guess [I]: first failure is the 4K bootstrap in `start.s`/`arm_vm_init`, then kalloc startup with stock clang.
+Negroni series tool after the `--profile` change: same result as before it (`0401-negroni-ram-7g` is an ERROR with both: that patch changes base-owned files and is not listed in `patch-rules.py`; older than this work and not fixed here).

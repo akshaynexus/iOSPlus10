@@ -60,9 +60,34 @@ def listdir_files(d):
     return sorted(n for n in os.listdir(d) if os.path.isfile(os.path.join(d, n))) if os.path.isdir(d) else []
 
 
+def external(name):
+    """external/NAME of this checkout, or of the main checkout (a worktree has no reference repos)."""
+    d = os.path.join(REPO, 'external', name)
+    if os.path.isdir(d) and os.listdir(d):
+        return d
+    out = git('worktree', 'list', '--porcelain')
+    return os.path.join(out.splitlines()[0].split(' ', 1)[1], 'external', name) if out else d
+
+
+def ios26_files():
+    """iOS 26 kernel (scripts/laurel/kernel-ios26-linux.sh, LAUREL_STAMP_IOS26=1): the same series + the 12377 parts."""
+    t, lp, p26 = os.path.join(external('ios-topaz'), 'xnu/patches'), os.path.join(REPO, 'patches/laurel/xnu'), os.path.join(REPO, 'patches/laurel/xnu-12377')
+    files = {n: os.path.join(t, n) for n in listdir_files(t) if n.endswith(('.patch', '.sh'))}
+    files.update({n: os.path.join(lp, n) for n in listdir_files(lp) if n.endswith('.patch')})
+    for d in (p26, os.path.join(p26, 'stage'), os.path.join(p26, 'post')):
+        files.update({n: os.path.join(d, n) for n in listdir_files(d) if n.endswith(('.patch', '.sh', '.txt'))})
+    files['0001-non-apple-soc-base.patch'] = os.path.join(REPO, 'patches/xnu-12377/0001-non-apple-soc-base.patch')
+    for s in ('scripts/laurel/ios26-series.py', 'scripts/laurel/ios26-env.sh', 'scripts/ios26/apply-series.py'):
+        files[os.path.basename(s)] = os.path.join(REPO, s)
+    return files
+
+
 def used_series(work):
     """What this run copied and applied: the copies, so a later edit of the sources does not change it."""
     items = []
+    if os.environ.get('LAUREL_STAMP_IOS26') == '1':
+        d = os.path.join(work, 'patches')
+        return [('patch', n, os.path.join(d, n)) for n in listdir_files(d)]
     p, f = os.path.join(work, 'patches'), os.path.join(work, 'linux/fixes')
     items += [('patch', n, os.path.join(p, n)) for n in listdir_files(p) if n.endswith(('.patch', '.sh'))]
     items += [('fix', n, os.path.join(f, n)) for n in listdir_files(f) if n.endswith('.patch')]
@@ -72,6 +97,8 @@ def used_series(work):
 
 def repo_series_items():
     """The same list from the sources in the repo (the copy steps of kernel-linux.sh: a laurel name overrides a topaz name)."""
+    if os.environ.get('LAUREL_STAMP_IOS26') == '1':
+        return [('patch', n, p) for n, p in sorted(ios26_files().items())]
     t = os.path.join(REPO, 'external/ios-topaz/xnu/patches')
     sl = os.path.join(REPO, 'external/ios-sweet-linux/linux/fixes')
     lp = os.path.join(REPO, 'patches/laurel/xnu')

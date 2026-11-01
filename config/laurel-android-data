@@ -1,0 +1,5 @@
+The Mi A3 holds Android (LineageOS 24) on userdata since 2026-11-02.
+While this file exists, no script may write the whole of userdata, and no boot image without an extent table may be flashed:
+such a kernel would write its console log into the last 4 MiB of Android's /data.
+scripts/laurel/android-guard.sh reads this file. The dual boot path: docs/laurel_sprout/dual-boot.md, scripts/laurel/dual-boot.sh.
+Delete this file only when the owner has said that Android's data on the phone is gone. It is a git change on purpose: the guard has no environment switch.

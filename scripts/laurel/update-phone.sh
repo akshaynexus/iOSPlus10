@@ -11,6 +11,7 @@ set -eu
 # main(): sh reads a function whole, so an edit of this file during the run cannot change what runs
 main() {
 cd "$(dirname "$0")/../.."
+scripts/laurel/android-guard.sh running-ios   # dual boot: only an iOS with the fence on; docs/laurel_sprout/dual-boot.md
 M=scripts/laurel/root-manifest.py
 APPLE=${APPLE:-$HOME/op10-apple}
 BOOTIMG=out/laurel/uefi/laurel-uefi-boot.img

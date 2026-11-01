@@ -10,6 +10,7 @@ mod camframe;
 mod census;
 mod ctl;
 mod dsc;
+mod dualboot;
 mod fat;
 mod im4p;
 mod img2simg;
@@ -29,7 +30,55 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum DualbootCmd {
+    /// `ldbhelper map` output -> validated extent table for ADT /chosen laurel-dualboot; refuses overlap, misalignment, holes, flags, or anything outside userdata
+    Table {
+        /// file with the helper's lines
+        #[arg(long)]
+        fiemap: PathBuf,
+        /// userdata first LBA in 4 KiB device blocks
+        #[arg(long, value_parser = parse_u64)]
+        part_first: u64,
+        /// userdata size in 4 KiB device blocks
+        #[arg(long, value_parser = parse_u64)]
+        part_blocks: u64,
+        /// table id; default random
+        #[arg(long, value_parser = parse_u64)]
+        id: Option<u64>,
+        #[arg(short = 'o')]
+        out: PathBuf,
+    },
+    /// All rules on an existing table; exit 1 when one fails
+    Check { table: PathBuf },
+    /// Summary and every extent
+    Show { table: PathBuf },
+    /// HFS+ image -> frames on stdout, for `adb exec-in ldbhelper write`; --index: the headers, for `ldbhelper verify`; --null: only the index and the checks
+    Stream {
+        table: PathBuf,
+        image: PathBuf,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        null: bool,
+    },
+    /// The area size to allocate: donor image bytes x expand + /private/var margin
+    Size {
+        #[arg(long, value_delimiter = ',', value_parser = parse_u64)]
+        donor_bytes: Vec<u64>,
+        #[arg(long, default_value_t = 1.68)]
+        expand: f64,
+        #[arg(long, default_value_t = 8)]
+        var_gib: u64,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
+    /// Mi A3 dual boot: extent table, image stream, size (docs/laurel_sprout/dual-boot.md)
+    Dualboot {
+        #[command(subcommand)]
+        cmd: DualbootCmd,
+    },
     /// Raw image -> Android sparse image (holes -> DONT_CARE, uniform blocks -> FILL, 4 KiB blocks)
     Img2simg { input: PathBuf, output: PathBuf },
     /// Android sparse image -> raw image (for checks)
@@ -227,6 +276,13 @@ fn parse_u64(s: &str) -> Result<u64, String> {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Dualboot { cmd } => match cmd {
+            DualbootCmd::Table { fiemap, part_first, part_blocks, id, out } => dualboot::make(&fiemap, part_first, part_blocks, id, &out),
+            DualbootCmd::Check { table } => dualboot::check(&table),
+            DualbootCmd::Show { table } => dualboot::show(&table),
+            DualbootCmd::Stream { table, image, index, null } => dualboot::stream(&table, &image, index.as_deref(), null),
+            DualbootCmd::Size { donor_bytes, expand, var_gib } => dualboot::size(&donor_bytes, expand, var_gib),
+        },
         Cmd::Img2simg { input, output } => img2simg::img2simg(&input, &output),
         Cmd::Simg2img { input, output } => img2simg::simg2img(&input, &output),
         Cmd::HfsSize { input, trim } => img2simg::hfs_size(&input, trim),

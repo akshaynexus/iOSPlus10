@@ -7,6 +7,7 @@
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 I=$BACKUP/images
+"$REPO/scripts/laurel/android-guard.sh" other-device   # this script is for the OnePlus 10 Pro; the Mi A3 holds Android
 [ "${CONFIRM:-}" = yes ] || { echo "this rewrites slot a boot partitions (and formats userdata): run with CONFIRM=yes" >&2; exit 1; }
 WIPE=yes; BOOT=$I/boot.img
 for a in "$@"; do

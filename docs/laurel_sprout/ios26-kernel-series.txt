@@ -1,0 +1,325 @@
+== base (patches/laurel/xnu-12377)
+0001-non-apple-soc-base.patch                                  base
+0002-sweet-machine-config.patch                                base
+0003-sweet-machine-layer.patch                                 base
+0004-sweet-platform-console.patch                              base
+0005-sweet-core.patch                                          base
+== stage scripts (profile)
+0019-stage-libpthread.sh                                       skipped: replaced: libpthread-514 is the xnu-8796 pair; patches/laurel/xnu-12377/stage/0019-stage-libpthread-539.sh stages the 12377 pair at the same path
+0020-stage-bearssl.sh                                          ran
+0026-stage-hfs.sh                                              skipped: replaced: hfs-627 is the xnu-8796 pair; patches/laurel/xnu-12377/stage/0026-stage-hfs-715.sh stages the 12377 pair at the same path
+0019-stage-libpthread-539.sh                                   ran
+0026-stage-hfs-715.sh                                          ran
+== series (slop + patches/xnu)
+0001-new-clang-drop-removed-auto-var-init-flag.patch           base: base 0002
+0002-new-clang-backport-UIO_STACKBUF.patch                     skipped: upstream: 12377 has UIO_STACKBUF (bsd/sys/uio_internal.h) and uses it at each call site
+0003-sweet-framebuffer-serial-console.patch                    base: base 0003, base 0004
+0004-sweet-machine-config.patch                                applied+rules(6): 3way osfmk/arm64/proc_reg.h, base 0002, base 0003
+0005-non-pac-build-fixes.patch                                 skipped: upstream: 12377 pmap.h names the field reserved11, no duplicate name to fix
+0006-sweet-master-config-open-source-asm-pmap.patch            base: base 0002
+0007-sweet-stub-apple-internal-headers.patch                   skipped: not needed: base 0001 guards sart.h, uat.h and tunables.s with XNU_MONITOR or APPLE_ARM64_ARCH_FAMILY; 12377 task.c has no t_kpc
+0008-sweet-fill-closed-lib-gaps-kpc-stub.patch                 applied+rules(6): base 0002, base 0003, drop_file
+0009-sweet-drop-apple-soc-only-exports.patch                   base: base 0002
+0010-sweet-early-framebuffer-debug.patch                       applied+rules(5): 3way osfmk/kern/debug.c, base 0003, glue
+0011-sweet-physmap-alignment-padding.patch                     base: base 0003
+0012-sweet-keep-debug-console-after-ttbr0.patch                applied+rules(4): 3way osfmk/arm64/Makefile, base 0003, base 0004
+0013-sweet-kmem-rng-without-corecrypto.patch                   skipped: in base 0005: 12377 moved the kmem guard-object random from vm_kern.c to vm_map_store.c; SplitMix64 code ported there
+0014-sweet-kernel-hmac-prng.patch                              base: base 0005, drop_file
+0015-sweet-unavailable-trust-cache-runtime.patch               applied+rules(1): sub
+0016-sweet-device-tree-platform-expert.patch                   applied+rules(1): glue
+0017-sweet-device-tree-virtual-timer-irq.patch                 applied+rules(2): base 0003
+0018-sweet-boot-cpu-driver.patch                               applied+rules(1): glue
+0019-sweet-builtin-pthread.patch                               applied+rules(2): 3way bsd/conf/Makefile.template, glue
+0020-sweet-portable-aes-cbc.patch                              applied+rules(1): glue
+0021-sweet-mockfs-ramdisk-root.patch                           applied+rules(1): base 0002
+0022-sweet-ramdisk-root-without-iomedia.patch                  applied
+0023-sweet-builtin-sha256-for-libkern.patch                    applied
+0024-sweet-mockfs-virtual-ramdisk-io.patch                     applied
+0025-sweet-builtin-amfi-no-entitlements.patch                  applied+rules(1): glue
+0026-sweet-builtin-hfs.patch                                   applied+rules(2): base 0002, glue
+0027-sweet-bearssl-md5.patch                                   applied+rules(1): glue
+0028-sweet-ufs-root-device.patch                               applied+rules(2): glue, vm_kern_xnu.h
+0029-sweet-unsealed-root-volume.patch                          applied
+0030-sweet-ufs-writes.patch                                    applied
+0031-sweet-read-write-root.patch                               applied
+0032-sweet-bearssl-sha1.patch                                  applied+rules(1): glue
+0033-sweet-bearssl-sha384-sha512.patch                         applied+rules(1): glue
+0034-sweet-ufs-dma-above-4g.patch                              applied
+0035-sweet-amfi-entitlements-platform-binaries.patch           applied+rules(1): glue
+0036-sweet-amfi-cs-signed.patch                                applied
+0037-sweet-config-bindfs.patch                                 base: base 0002
+0038-sweet-applekeystore.patch                                 applied+rules(1): glue
+0039-sweet-coredump-default-off.patch                          applied+rules(1): sub
+0040-sweet-iowatchdog.patch                                    applied+rules(1): glue
+0041-sweet-hfs-link-notes.patch                                applied
+0042-sweet-short-exec-log.patch                                applied
+0043-sweet-console-crash-log.patch                             applied+rules(1): 3way bsd/kern/kern_exit.c
+0044-sweet-crash-log-reason.patch                              applied
+0045-sweet-iowatchdog-pmu-primary.patch                        applied
+0046-sweet-iosurface-iomfb.patch                               applied+rules(1): glue
+0047-sweet-persistent-console-log.patch                        applied+rules(1): base 0004
+0048-sweet-devnull-tee.patch                                   applied
+0049-sweet-iokit-trace.patch                                   applied
+0050-sweet-sandbox-policy.patch                                applied
+0051-sweet-crash-heap-strings.patch                            applied
+0052-sweet-hfs-rename-swap.patch                               applied
+0053-sweet-crash-scan-springboard.patch                        applied
+0054-sweet-process-sampler.patch                               applied+rules(1): glue
+0055-sweet-aks-ext-state-sampler-depth.patch                   applied
+0056-sweet-fb-throttled-present.patch                          applied
+0057-sweet-no-ext-resolver.patch                               base: base 0002
+0058-sweet-hid-event-services.patch                            applied+rules(1): glue
+0059-sweet-iphone-identity.patch                               applied
+0060-sweet-keys-touch-drivers.patch                            applied+rules(1): glue
+0061-sweet-iphone-x-display-size.patch                         applied
+0062-sweet-touch-power-battery.patch                           applied+rules(1): glue
+0063-sweet-goodix-geni-packing.patch                           applied
+0064-sweet-priv-work-interval.patch                            applied
+0065-sweet-smp-psci.patch                                      applied+rules(3): 3way osfmk/arm64/machine_routines.c, base 0003
+0066-sweet-crash-fault-region.patch                            applied
+0067-sweet-console-mute.patch                                  applied+rules(1): base 0004
+0068-sweet-surface-lookup-cached.patch                         applied
+0069-sweet-ufs-faster.patch                                    applied
+0070-sweet-pid-hibernate.patch                                 applied+rules(2): rename_file, sub
+0071-sweet-touch-edge.patch                                    applied
+0072-sweet-usb-probe.patch                                     applied+rules(1): glue
+0073-sweet-usb-device-ep0.patch                                applied+rules(1): vm_kern_xnu.h
+0074-sweet-usb-vbus-override.patch                             applied
+0075-sweet-usb-ecm.patch                                       applied+rules(1): vm_kern_xnu.h
+0076-sweet-usb-rx-mbuf.patch                                   applied
+0077-sweet-usb-live-log.patch                                  applied
+0078-sweet-smp-8-cores.patch                                   applied
+0079-sweet-display-power.patch                                 applied
+0080-topaz-cpu-topology-skip-sweet-hw.patch                    applied
+0081-topaz-armv8.0-no-lse-no-pan.patch                         applied+rules(2): base 0002, base 0003
+0082-topaz-boot-on-gold-cpu.patch                              applied
+0083-topaz-touch-ft5452.patch                                  applied
+0084-topaz-touch-diag-panic.patch                              applied
+0085-topaz-fb-stayon.patch                                     applied
+0086-topaz-touch-ft-parser-stats.patch                         applied
+0087-topaz-touch-rcg-fix-keys.patch                            applied
+0088-topaz-gpt-watchdog.patch                                  applied
+0089-topaz-touch-ft-diag.patch                                 applied
+0090-topaz-touch-ff-frame-release.patch                        applied
+0091-topaz-battery-gauge-charger.patch                         applied+rules(1): glue
+0092-topaz-direct-mdp-scanout.patch                            applied
+0093-topaz-scanout-contiguous-ram.patch                        applied
+0094-topaz-cpufreq-max.patch                                   applied+rules(1): glue
+0095-topaz-wcomb-console-fb.patch                              applied
+0096-topaz-smooth-fade.patch                                   applied
+0097-topaz-unified-console-scanout.patch                       applied
+0098-topaz-intf1-refresh-diag.patch                            applied
+0099-topaz-surface-inuse-console-batch.patch                   applied
+0100-topaz-double-buffer-kernel-frames.patch                   applied
+0101-topaz-real-dcache-flush.patch                             applied
+0102-topaz-copy-and-flip.patch                                 applied
+0103-topaz-copy-path-back-buffer.patch                         applied
+0104-topaz-dsi-brightness.patch                                applied
+0105-topaz-applearmbacklight.patch                             applied
+0106-topaz-dcs-display-onoff.patch                             applied
+0107-topaz-local-dcache-clean.patch                            applied
+0110-topaz-backlight-optin.patch                               applied
+0111-topaz-real-dcache-ops.patch                               applied
+0112-topaz-console-log-filter.patch                            base: base 0004
+0113-topaz-modem-pas-boot.patch                                applied+rules(1): glue
+0114-topaz-iphonex-canvas-aligned.patch                        applied
+0115-topaz-modem-fw-from-modem-a.patch                         applied
+0116-topaz-modem-pas-supported-info.patch                      applied
+0117-topaz-modem-split-hash.patch                              applied
+0118-topaz-modem-glink-qrtr.patch                              applied
+0119-topaz-modem-early-log.patch                               applied
+0120-topaz-console-only.patch                                  applied
+0121-topaz-modem-host-services.patch                           applied
+0122-topaz-modem-wlfw.patch                                    applied
+0123-topaz-wlan-scan.patch                                     applied
+0124-topaz-wlfw-restart-cap-retry.patch                        applied
+0125-topaz-wlan-htt.patch                                      applied
+0126-topaz-wlan-api.patch                                      applied
+0127-topaz-sweetbusy.patch                                     applied+rules(1): glue
+0128-topaz-iokit-quiesce.patch                                 applied+rules(1): base 0004
+0129-topaz-wlan-station.patch                                  applied
+0130-topaz-wlan-join-pmk.patch                                 applied
+0131-topaz-sweetsurface-no-zero-clients.patch                  applied
+0132-topaz-sweetsurface-wrap-client.patch                      applied
+0133-topaz-sweetsurface-values.patch                           applied
+0134-topaz-sweetsurface-client-address.patch                   applied
+0135-topaz-sweetsurface-detach-allocsize.patch                 applied
+0136-topaz-sweetsurface-detach-views.patch                     applied
+0137-topaz-sweetsurface-zombie-state.patch                     applied
+0138-topaz-empty-ioacceleratores.patch                         applied
+0139-topaz-sweetsurface-publish-client-address.patch           applied
+0140-topaz-4k-pages.patch                                      applied+rules(6): 3way osfmk/arm/pmap/pmap.c, base 0002, base 0003, base 0005
+0141-topaz-amp-clusters.patch                                  applied+rules(1): base 0002
+0142-topaz-4k-early-console.patch                              applied+rules(2): base 0003
+0143-topaz-panel-sleep.patch                                   applied
+0144-topaz-audio-adsp.patch                                    applied+rules(1): glue
+0145-topaz-audio-codec.patch                                   applied+rules(1): glue
+0146-topaz-audio-stream.patch                                  applied
+0147-topaz-amfi-name.patch                                     applied
+0148-topaz-charger.patch                                       applied
+0149-topaz-sandbox-container-hook.patch                        applied
+0150-topaz-amfi-sysctl.patch                                   applied
+0151-topaz-amfi-service.patch                                  applied+rules(1): glue
+0152-topaz-display-off-black.patch                             applied
+0900-en0-Apple80211-for-wifid-over-the-Topaz.patch             applied+rules(1): glue
+0901-topaz-0108-Adreno-610-GPU-TopazGpuW-recipe-behind-da.patch applied+rules(1): glue
+0902-topaz-0109-AMFI-dyld-policy-answer-RedwoodWaitsForGP.patch applied
+0903-topaz-0111-GPU-memory-from-the-upper-DDR-bank-36-bit.patch applied
+0904-topaz-0112-GPU-kernel-buffers-from-ordinary-pages.patch   applied
+0905-topaz-0113-embedded-GPU-firmware-step-markers.patch       applied+rules(1): glue
+0906-topaz-0114-GPU-memory-cached-with-explicit-cache-mai.patch applied
+0907-topaz-0115-GPU-cache-maintenance-through-the-real-dc.patch applied
+0908-topaz-0116-GPU-kernel-buffers-from-a-pool-in-the-mid.patch applied
+0909-topaz-0117-SMMU-pass-through-test-mode-gpu_identity.patch applied
+0910-topaz-0118-Mesa-buffers-from-the-GPU-pool-in-pass-th.patch applied
+0911-topaz-0119-GPU-pool-mapped-in-64-MB-chunks.patch          applied
+0912-topaz-0120-GPU-pool-chunks-mapped-through-IOMemoryDe.patch applied
+0913-topaz-0121-log-GPU-clients.patch                          applied
+0914-topaz-0122-log-whether-backboardd-gets-DYLD_INSERT_L.patch applied
+0915-topaz-0123-no-jetsam-limit-for-backboardd.patch           base: base 0005
+0916-topaz-0125-GPU-memory-from-kernel-RAM-below-4-GiB-AD.patch applied
+0917-topaz-0126-GPU-pool-memory-write-combined-in-user-sp.patch applied
+0918-topaz-debug-log-dropped-SweetSurface-views-of-backbo.patch applied
+0919-topaz-private-kern.exec_inject-boot-arg-topaz_inject.patch applied
+0920-topaz-private-applog-applog_name-daemon-stdout-stder.patch applied+rules(1): 3way bsd/kern/kern_exec.c
+0921-topaz-private-applog_name-without-applog-1-os_log-to.patch applied
+0922-topaz-private-gpu_mhz-stock-OPPs-above-600-MHz-from-.patch applied
+0923-topaz-private-debug-say-why-a-surface-is-not-shared-.patch applied
+0924-topaz-private-screen-sized-surfaces-from-the-GPU-poo.patch applied
+0925-topaz-private-GPU-pool-declarations-at-the-top.patch      applied
+0926-topaz-private-a-surface-buffer-s-memory-is-not-given.patch applied
+0927-topaz-private-only-backboardd-s-screen-sized-surface.patch applied
+0928-topaz-private-no-scanout-slots-with-gpu-1-cached-mem.patch applied
+0929-topaz-private-no-cache-maintenance-for-GPU-pool-surf.patch applied
+0930-topaz-private-SpringBoard-screen-sized-surfaces-from.patch applied
+0931-Revert-topaz-private-SpringBoard-screen-sized-surfac.patch applied
+0932-topaz-private-GPU-pool-surfaces-get-64-rows-of-guard.patch applied
+0933-topaz-private-GPU-pool-frames-shown-at-swap-the-repl.patch applied
+0934-topaz-private-client-memory-surfaces-shared-with-the.patch applied
+0935-topaz-private-dev-redwood-audio-dev-topaz-audio-for-.patch applied+rules(1): glue
+0936-topaz-private-Sandbox-container-path-from-CFFIXED_US.patch applied+rules(1): glue
+0937-topaz-private-gpu-1-surfaces-physically-contiguous-u.patch applied
+0938-topaz-private-only-BGRA-surfaces-with-64-byte-aligne.patch applied
+0939-topaz-private-contiguous-surfaces-up-to-16-MB-so-ful.patch applied
+0940-topaz-private-64-guard-rows-behind-gpu-1-surfaces-GP.patch applied
+0941-topaz-private-boot-arg-sweetfb_lock-1-the-vsync-time.patch applied
+0942-topaz-private-SWEET-FPS-line-a-second-frames-swapped.patch applied
+0943-topaz-private-SWEET-FPS-also-shows-present-latch-tim.patch applied
+0944-topaz-private-boot-arg-sweetfb_nohold-1-test-frames-.patch applied
+0945-topaz-private-direct-frames-shown-by-a-presenter-thr.patch applied
+0946-topaz-private-SWEET-FPS-only-with-boot-arg-sweetfps-.patch applied
+0947-topaz-private-exec-inject-NAME-app-every-program-in-.patch applied
+0948-topaz-display-modes-60hz.patch                            applied
+0949-topaz-screen-surface-reserve.patch                        applied
+0950-topaz-touch-release-on-empty.patch                        applied
+2000-laurel-no-iortc-wait.patch                                base: base 0004
+2001-laurel-surface-plane-bpr.patch                            applied
+2002-laurel-fb-pipe-dicts.patch                                applied
+2003-laurel-power-off-restart.patch                            applied+rules(1): glue
+2004-laurel-cpu-soft-fail.patch                                applied+rules(1): base 0003
+2005-laurel-usb-ecm-ctl-panic.patch                            applied
+2006-laurel-usb-early-start.patch                              applied+rules(2): base 0003, vm_kern_xnu.h
+2007-laurel-usb-power-up-phy-stages.patch                      applied
+2008-laurel-fb-scanout-pipe.patch                              applied
+2009-laurel-ufs-clock-check.patch                              applied
+2011-laurel-boot-line-1024.patch                               skipped: upstream: 12377 BOOT_LINE_LENGTH is 1024 (pexpert/pexpert/arm64/boot.h)
+2012-laurel-boot-cpu-silver.patch                              applied
+2013-laurel-usb-timer-service.patch                            applied
+2014-laurel-klog-ring.patch                                    applied+rules(2): 3way pexpert/arm/pe_kprintf.c bsd/kern/bsd_init.c, base 0004
+2015-laurel-gic-redist-init.patch                              applied
+2016-laurel-boot-handoff-gold.patch                            applied+rules(1): base 0003
+2017-laurel-touch-pins.patch                                   applied
+2018-laurel-abl-reboot-reason.patch                            applied
+2100-laurel-ram-window.patch                                   applied+rules(2): base 0003, glue
+2101-laurel-surface-pool.patch                                 applied
+2103-laurel-fb-native-canvas.patch                             applied
+2104-laurel-fb-console-handoff.patch                           applied
+2150-laurel-gpu-trinket.patch                                  applied
+2151-laurel-gpu-surfaces.patch                                 applied
+2152-laurel-fps-line.patch                                     applied
+2153-laurel-gpu-zap-scm-lock.patch                             applied
+2154-laurel-gpu-smmu-stage1.patch                              applied
+2155-laurel-gpu-watchdog.patch                                 applied
+2156-laurel-gpu-pool-lock.patch                                applied
+2157-laurel-gpu-smmu-check-recover.patch                       applied
+2158-laurel-gpu-zero-copy.patch                                applied
+2159-laurel-gpu-time-clock.patch                               applied
+2160-laurel-gpu-host-pages.patch                               applied
+2161-laurel-gpu-submit-ccu.patch                               applied
+2162-laurel-crash-file.patch                                   applied
+2200-laurel-touch-panel-map.patch                              applied
+2201-laurel-backlight-panel-power.patch                        applied
+2202-laurel-keys-check.patch                                   applied
+2300-laurel-pmi632-spmi.patch                                  applied
+2301-laurel-battery-pmi632.patch                               applied+rules(1): glue
+2302-laurel-charge-mode-power-off.patch                        applied+rules(1): 3way bsd/kern/kern_exec.c
+2303-laurel-thermal-cpufreq.patch                              applied+rules(1): glue
+2400-laurel-modem-fw-fat-index.patch                           applied
+2401-laurel-wifi-mi-a3.patch                                   applied
+2402-laurel-wlfw-hl30-fallbacks.patch                          applied
+2403-laurel-rmtfs-iov-bounds.patch                             applied
+2404-laurel-soc-shared-locks.patch                             applied
+2405-laurel-wifi-phy-header.patch                              applied
+2406-laurel-wifi-caps.patch                                    applied
+2407-laurel-wifi-link-header.patch                             applied
+2408-laurel-wifi-ht-vht-qos.patch                              applied
+2409-laurel-wifi-band-scan.patch                               applied
+2410-laurel-wifi-status-line.patch                             applied
+2411-laurel-wifi-state-for-wifid.patch                         applied
+2500-laurel-audio-speaker-apr.patch                            applied
+2600-laurel-bluetooth-wcn3990.patch                            applied+rules(1): glue
+2700-laurel-pmi632-haptics.patch                               applied+rules(1): glue
+2710-laurel-spmi-one-lock.patch                                applied
+2720-laurel-rtc-calendar.patch                                 applied+rules(2): base 0004, glue
+2760-laurel-cellular-qmi.patch                                 applied+rules(1): glue
+2770-laurel-camera.patch                                       applied+rules(1): glue
+2771-laurel-camera-rdi.patch                                   applied+rules(1): glue
+2772-laurel-camera-dev.patch                                   applied+rules(1): glue
+2773-laurel-camera-quality.patch                               applied+rules(1): glue
+2775-laurel-pas-load.patch                                     applied+rules(1): glue
+2780-laurel-ipa-v42.patch                                      applied+rules(1): glue
+2781-laurel-pmi632-torch.patch                                 applied+rules(1): glue
+2782-laurel-ipa-gsi-channels.patch                             applied+rules(1): glue
+2783-laurel-torch-one-owner.patch                              applied
+2784-laurel-camera-light.patch                                 applied+rules(1): glue
+2786-laurel-cell-radio-state.patch                             applied
+2850-laurel-metal-registration.patch                           applied+rules(1): glue
+2851-laurel-metal-buffer-line.patch                            applied
+2870-laurel-fb-scanout-owner.patch                             applied+rules(1): base 0004
+2871-laurel-backlight-panel-check.patch                        applied
+2872-laurel-panel-stays-awake.patch                            applied
+2880-laurel-wifi-path-header.patch                             applied
+2881-laurel-wifi-en0-output-queue.patch                        applied
+2882-laurel-wifi-en0-rx-batch.patch                            applied
+2883-laurel-wifi-tx-path.patch                                 applied
+2884-laurel-wifi-rx-signal.patch                               applied
+2885-laurel-wifi-turns-scan-line.patch                         applied
+2886-laurel-wifi-signal-for-ios.patch                          applied
+2887-laurel-wifi-link-line-split.patch                         applied
+2888-laurel-wifi-dns-families.patch                            applied
+2890-laurel-cpu-response.patch                                 applied
+2891-laurel-cpu-top.patch                                      applied+rules(1): glue
+2892-laurel-gpu-dcvs.patch                                     applied+rules(1): glue
+2895-laurel-gpu-tables-pool-floor.patch                        applied
+2902-laurel-ufs-solid-state.patch                              applied
+2903-laurel-sandbox-privileges-extensions.patch                applied
+2904-laurel-aks-selectors-passcode.patch                       applied
+2905-laurel-usb-poll-txq-reset.patch                           applied
+2906-laurel-wired-guard.patch                                  applied+rules(1): glue
+2910-laurel-sandbox-entitlement-grants.patch                   applied
+2911-laurel-stats.patch                                        applied+rules(1): glue
+2912-laurel-build-stamp.patch                                  applied+rules(1): glue
+2913-laurel-camera-speed.patch                                 applied
+2914-laurel-touch-event-stamp.patch                            applied
+2915-laurel-frame-path.patch                                   applied
+2916-laurel-wired-screen-first.patch                           applied
+2920-laurel-mic-wcd937x.patch                                  applied
+2930-laurel-wifi-awdl-header.patch                             applied
+2931-laurel-awdl-self-check.patch                              applied
+2940-laurel-cell-radio-online.patch                            applied
+2941-laurel-ipa-data-path.patch                                applied+rules(1): glue
+2942-laurel-cell-data.patch                                    applied+rules(1): glue
+2943-laurel-cell-reject-cause.patch                            applied
+2950-laurel-dual-boot.patch                                    applied
+9000-series-12377-api.patch                                    post
+== series: 211 applied, 83 applied+rules, 0 replaced, 7 skipped, 11 base, 0 errors
