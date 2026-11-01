@@ -1,5 +1,5 @@
 #!/bin/sh
-# Host test of the Mi A3 dual boot (docs/laurel_sprout/dual-boot.md). No phone, no root, no write outside out/. Seconds.
+# Host test of the Mi A3 dual boot (docs/laurel_sprout/dual-boot.md). No phone, no root, no write outside out/. Some minutes: run it with scripts/bg.sh.
 #   scripts/laurel/test-dualboot.sh
 #   1. op10tool unit tests: FIEMAP -> table rules (overlap, alignment, outside userdata, holes, flags, damage).
 #   2. The same format in C: laurel_dualboot.h reads what op10tool wrote; refused by both.
