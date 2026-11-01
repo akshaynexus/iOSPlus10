@@ -1,0 +1,1418 @@
+laurel 2900: console head buffer, live log from byte 0, persistent boot log (port of negroni 0367).
+
+- The first 1 MiB of console text of every boot is kept in a head buffer that is never overwritten;
+  sweet_log_copy serves bytes the 4 MiB ring lost from it (a marker line covers a gap).
+- Live log (raw frames and ue0): starts at byte 0 once a frame from 192.168.7.1 came (before that the
+  host has no address and the datagrams were lost: the early kernel lines were missing); a failed
+  sock_send keeps its bytes; "log" resends everything from byte 0. In a panic the 10 s fallback stays.
+- Boot log: negroni 0367 slot area (8 slots x (header + 4 MiB ring), superblock "NEGRBLOG") at userdata
+  block N-28673, the same layout, so op10tool bootlog reads it unchanged. Self-check: the HFS+ volume
+  must end below the area; then a write gate opens for the area only (no ufsrw=1 needed). Header: boot
+  counter, state (running/panic/halt/restart), SpringBoard mark, kernel UUID/version, boot-args, PM6125
+  PON reasons of this power-on (why the boot before ended). Panic: polled write before the USB panic
+  hold. Halt/restart and the USB reset/poweroff commands write the end state.
+- USB commands "bootlog" and "bootlog read A C" (NBLD datagrams), /dev/laurelbootlog (root, 0400).
+- Line: LAUREL BOOTLOG: on: area at partition block ... | LAUREL BOOTLOG: off: <reason>; kill switch
+  laurelbootlog=0. The topaz single area (SWEETLOG, ufsrw=1) is written only when the boot log is off.
+
+Review fixes (area I review): M1 the live log stops a burst at half the TX queue and keeps its position, 1 ms
+pause per 32 datagrams, so command replies (pong, ok bootloader) always find room; `bootlog read` checks queue room
+("error: busy (TX queue)"); m5 `bootlog read` takes the UFS lock with a try-lock ("error: busy (UFS in use, ask again)");
+m4 the flush thread's error back-off has its own retry time.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b30196..06559bd 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -39,6 +39,8 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
++#include <sys/proc_internal.h>          /* laurel 2900: proc_iterate (SpringBoard mark) */
++#include "sweet_spmi.h"                 /* laurel 2900: PM6125 PON reasons for the boot log header */
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+@@ -141,6 +143,23 @@ dma_clean(uint32_t off, uint32_t len)
+ 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+ }
+ 
++/*
++ * laurel 2900 (port of negroni 0367): set by the panic path of the boot log
++ * (laurel_bootlog_panic): commands spin on the counter (no delay(): it
++ * waits with WFE in panic context) and print nothing (printf may take locks).
++ */
++static volatile bool ufs_polled_only;
++
++static void
++ufs_spin_us(uint32_t us)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &abs);
++	uint64_t end = mach_absolute_time() + abs;
++	while (mach_absolute_time() < end) {
++	}
++}
++
+ /*
+  * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+  * (to the device when write is set). Returns 0 or an errno.
+@@ -206,7 +225,8 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+-	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	/* laurel 2900: 1 s in the panic path (a dead host must not hold the panic USB mode back for long) */
++	nanoseconds_to_absolutetime(ufs_polled_only ? NSEC_PER_SEC : CMD_TIMEOUT_NS, &deadline);
+ 	deadline += mach_absolute_time();
+ 	bool sleepable = su.wait && su.ready && ml_get_interrupts_enabled() &&
+ 	    !ml_at_interrupt_context() && get_preemption_level() == 0;
+@@ -220,7 +240,9 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			if (!ufs_polled_only) {
++				printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			}
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -230,6 +252,8 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 			    TIMEOUT_URGENCY_SYS_CRITICAL, wake, 0) == THREAD_WAITING) {
+ 				thread_block(THREAD_CONTINUE_NULL);
+ 			}
++		} else if (ufs_polled_only) {
++			ufs_spin_us(1);
+ 		} else {
+ 			delay(1);
+ 		}
+@@ -249,6 +273,9 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
++		if (ufs_polled_only) {
++			return EIO;
++		}
+ 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+ 		return EIO;
+@@ -280,18 +307,28 @@ static uint64_t gpt_alt;                /* backup header LBA (last LBA of LUN0)
+ static uint32_t gpt_hcrc, gpt_ecrc, gpt_bhcrc;
+ static int gpt_chan;
+ 
++/*
++ * laurel 2900: the boot log area [ufs_log_lo, ufs_log_hi) (absolute device
++ * blocks; hi 0 = none). Set only after the HFS+ volume end was checked to
++ * lie below it (nbl_setup_locked). The boot log writes there with
++ * ufs_log_write_blocks(), also without ufsrw=1; nothing else uses this gate.
++ */
++static uint64_t ufs_log_lo, ufs_log_hi;
++
+ /*
+  * WRITE(10) of count device blocks from the bounce buffer to lba. The range
+  * must lie inside the partition: this is the only place data goes out.
+  */
+ static int
+-ufs_write_blocks(uint64_t lba, uint32_t count)
++ufs_write_checked(uint64_t lba, uint32_t count, bool allowed)
+ {
+-	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	if (!allowed || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+ 	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX ||
+ 	    lba < 6 || (gpt_alt && lba + count - 1 >= gpt_alt - 4)) {
+-		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
++		if (!ufs_polled_only) {
++			printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
++		}
+ 		return EPERM;
+ 	}
+ 	uint8_t cdb[10] = {
+@@ -302,6 +339,20 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
+ }
+ 
++static int
++ufs_write_blocks(uint64_t lba, uint32_t count)
++{
++	return ufs_write_checked(lba, count, su.writable);
++}
++
++/* laurel 2900: a write of the boot log: only inside its area, whatever ufsrw says. */
++static int
++ufs_log_write_blocks(uint64_t lba, uint32_t count)
++{
++	return ufs_write_checked(lba, count, ufs_log_hi > ufs_log_lo && count != 0 && lba >= ufs_log_lo &&
++	           count <= ufs_log_hi - ufs_log_lo && lba <= ufs_log_hi - count);
++}
++
+ static int
+ ufs_sync_cache(void)
+ {
+@@ -873,20 +924,24 @@ sweet_ufs_init(void)
+  * Persistent console log ("sweetlog"). Filming the phone screen is the only
+  * other way to see the console, so every character that reaches the
+  * console (kernel printf and /dev/console writes of daemons, both through
+- * _cnputs) is also kept in a 4 MiB ring, and once the partition is known
+- * and writable a thread copies new ring blocks to the LAST 4 MiB + 4 KiB of
+- * the partition every ufslogsecs seconds (default 10), far behind the HFS
+- * image at its start. Device block 0 of that area is a header:
+- *   "SWEETLOG" | u32 version 1 | u32 ring size | u64 total bytes written
+- *   | u64 flush sequence
+- * ring offset of byte n = n % ring size. Read it from a recovery with
+- * tools/sweet-log-pull.sh. Disabled with boot-arg sweetlog=0.
++ * _cnputs) is also kept in a 4 MiB ring.
++ *
++ * laurel 2900: also in a head buffer of the first 1 MiB of the boot that is
++ * never overwritten, so the early kernel lines are still there when the USB
++ * host connects late (the live log and the "log" command start at byte 0;
++ * sweet_log_copy serves the bytes the ring lost from the head). The ring
++ * goes into one slot of the boot log area per boot (see "Boot log" below);
++ * the topaz single area (the last 4 MiB + 4 KiB of the partition, header
++ * "SWEETLOG", ufsrw=1 only) is written only when the boot log area is not
++ * usable. Disabled with boot-arg sweetlog=0.
+  */
+ #define SWEET_LOG_SIZE          (4u << 20)
+ #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
+ #define SWEET_LOG_SECS          10u
++#define LAUREL_LOG_HEAD         (1u << 20)      /* laurel 2900: the first 1 MiB of every boot */
+ 
+ static char sweet_log_ring[SWEET_LOG_SIZE];
++static char laurel_log_head[LAUREL_LOG_HEAD];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+@@ -902,14 +957,20 @@ sweet_log_append(const char *c, int size)
+ 	}
+ 	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
+ 	for (int i = 0; i < size; i++) {
+-		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
++		uint64_t n = at + (uint64_t)i;
++		sweet_log_ring[n % SWEET_LOG_SIZE] = c[i];
++		if (n < LAUREL_LOG_HEAD) {
++			laurel_log_head[n] = c[i];
++		}
+ 	}
+ }
+ 
+ /*
+  * Copy console bytes [*pos, total) (at most max) for live log streaming
+- * (sweet_usb.c). A reader that fell more than the ring behind skips ahead.
+- * Returns the byte count; *pos advances.
++ * (sweet_usb.c). Returns the byte count; *pos advances. laurel 2900: bytes
++ * the ring no longer holds come from the head buffer (the first 1 MiB);
++ * between the head and the oldest ring byte one marker line is returned
++ * instead of the lost bytes.
+  */
+ uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ 
+@@ -917,8 +978,22 @@ uint32_t
+ sweet_log_copy(uint64_t *pos, char *out, uint32_t max)
+ {
+ 	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	if (*pos > total) {
++		*pos = total;
++	}
+ 	if (total - *pos > SWEET_LOG_SIZE) {
+-		*pos = total - SWEET_LOG_SIZE;
++		if (*pos < LAUREL_LOG_HEAD) {
++			uint32_t n = (uint32_t)MIN((uint64_t)max, (uint64_t)LAUREL_LOG_HEAD - *pos);
++			memcpy(out, laurel_log_head + *pos, n);
++			*pos += n;
++			return n;
++		}
++		/* 4 KiB margin: writers go on while this copies */
++		uint64_t from = total - SWEET_LOG_SIZE + UFS_BLOCK;
++		int w = snprintf(out, max, "\n[LAUREL LOG: console bytes %llu..%llu were overwritten before they were sent]\n",
++		    *pos, from);
++		*pos = from;
++		return w > 0 ? (uint32_t)MIN((uint32_t)w, max - 1) : 0;
+ 	}
+ 	uint32_t n = (uint32_t)MIN((uint64_t)max, total - *pos);
+ 	for (uint32_t i = 0; i < n; i++) {
+@@ -942,6 +1017,7 @@ struct sweet_log_header {
+ 	uint64_t total, seq;
+ };
+ 
++/* topaz 0047: the single area at the partition end (only when the boot log area is not usable) */
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -1002,14 +1078,796 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * Boot log (laurel 2900, port of negroni 0367, docs/laurel_sprout/usb-debug.md).
++ * The console ring of each boot goes into one slot of a reserved area at the
++ * end of userdata, so a boot that loses the USB link, hangs or resets can be
++ * read later: on the next boot over USB (op10tool bootlog), over SSH
++ * (/dev/laurelbootlog), or with a dd of userdata from any other system.
++ * On by default; it does not need ufsrw=1: ufs_log_write_blocks() writes
++ * only inside the area. Kill switch: laurelbootlog=0 (sweetlog=0 stops every
++ * console log write).
++ *
++ * The layout is the negroni one (op10tool bootlog reads both): area =
++ * NBL_AREA_BLOCKS device blocks at partition block N - 28673 (N = partition
++ * size in 4096-byte blocks; Mi A3 userdata: N = 28288256, HFS+ root image
++ * 16 GiB = 4194304 blocks), far behind the HFS+ volume and below the topaz
++ * area at N - 1025.
++ *   area block 0                      superblock (struct nbl_super, "NEGRBLOG")
++ *   area block 1 + i*NBL_SLOT_BLOCKS  slot i: header block (struct nbl_slot,
++ *                                     "NEGRBOOT"), then the 4 MiB console ring
++ * The rest of the area (1015 blocks) is reserved. The slot of a boot is the
++ * one after the slot with the highest boot counter. Self-check before any
++ * write: the HFS+ volume header (partition byte 1024) is read and the volume
++ * must end at or below the area. On negroni a second anchor (the WLAN area
++ * header) proves the layout; the Mi A3 has no such area, so the HFS+ end
++ * check alone opens the write gate (the area lies past the root volume,
++ * where nothing else writes).
++ *
++ * Flushes: every second in the first 5 min of uptime when the console has
++ * new text, then at most every 5 s (wear budget: more than 256 KiB in 10 s
++ * -> every 10 s for 20 s), else a header heartbeat every 30 s; each with
++ * SYNCHRONIZE CACHE. The panic path (laurel_bootlog_panic, from the platform
++ * expert before the USB panic hold) writes once more, polled, without the
++ * lock; halt, restart and the USB reset commands write the end state.
++ */
++#define NBL_AREA_BLOCKS     9216u                       /* 36 MiB */
++#define NBL_FROM_END        28673u                      /* negroni layout (op10tool bootlog FROM_END) */
++#define NBL_SLOTS           8u
++#define NBL_SLOT_BLOCKS     SWEET_LOG_BLOCKS            /* 1 header + 1024 ring blocks */
++#define NBL_VERSION         1u
++#define NBL_MIN_REL         16u
++#define NBL_HEARTBEAT_SECS  30u
++#define NBL_EARLY_SECS      300u
++#define NBL_LATE_SECS       5u
++#define NBL_BUDGET_BYTES    (256u << 10)
++#define NBL_BUDGET_SECS     10u
++#define NBL_SLOW_SECS       10u
++#define NBL_FLUSH_SECS      1u
++
++enum { NBL_RUNNING = 1, NBL_PANIC = 2, NBL_HALT = 3, NBL_RESTART = 4 };
++#define NBL_F_SPRINGBOARD   0x1u
++#define NBL_F_PANICLOG      0x2u
++
++struct nbl_super {
++	char magic[8];                  /* "NEGRBLOG" */
++	uint32_t version;               /* 1 */
++	uint32_t slots;                 /* 8 */
++	uint32_t slot_blocks;           /* 1025 */
++	uint32_t area_blocks;           /* 9216 */
++	uint32_t ring_size;             /* 4 MiB */
++	uint32_t from_end;              /* 28673: area start = partition end - from_end */
++	uint32_t crc;                   /* CRC-32 of the bytes before it */
++} __attribute__((packed));
++
++struct nbl_slot {
++	char magic[8];                  /*    0 "NEGRBOOT" */
++	uint32_t version;               /*    8 1 */
++	uint32_t hdr_size;              /*   12 sizeof(struct nbl_slot) */
++	uint64_t boot;                  /*   16 boot counter (1, 2, ...) */
++	uint32_t state;                 /*   24 NBL_RUNNING ... */
++	uint32_t flags;                 /*   28 NBL_F_* */
++	uint32_t ring_size;             /*   32 */
++	uint32_t flush_secs;            /*   36 */
++	uint64_t total;                 /*   40 console bytes of this boot */
++	uint64_t seq;                   /*   48 flush count */
++	uint64_t start_cal;             /*   56 calendar seconds at the slot start */
++	uint64_t last_cal;              /*   64 calendar seconds at the last flush (not updated in a panic) */
++	uint64_t last_up_ms;            /*   72 uptime at the last flush */
++	uint64_t sb_up_ms;              /*   80 uptime when SpringBoard ran (0: never) */
++	uint64_t end_up_ms;             /*   88 uptime of the end (panic/halt/restart) */
++	char uuid[40];                  /*   96 kernel UUID */
++	char kversion[256];             /*  136 kernel version string */
++	char bootargs[1024];            /*  392 */
++	char pon[256];                  /* 1416 PM6125 PON reasons at this power-on (why the boot before ended) */
++	char end[256];                  /* 1672 end text */
++	uint32_t crc;                   /* 1928 CRC-32 of bytes 0..1927 */
++} __attribute__((packed));
++_Static_assert(sizeof(struct nbl_slot) == 1932, "nbl_slot layout (op10tool bootlog)");
++_Static_assert(sizeof(struct nbl_super) == 36, "nbl_super layout (op10tool bootlog)");
++_Static_assert(1 + NBL_SLOTS * NBL_SLOT_BLOCKS == 8201 && 1 + NBL_SLOTS * NBL_SLOT_BLOCKS <= NBL_AREA_BLOCKS,
++    "boot log slots (op10tool bootlog)");
++
++static struct {
++	bool ok;                        /* area checked, slot chosen: the log runs */
++	volatile bool panic;            /* the panic path owns the host now */
++	bool running;                   /* the flush thread runs */
++	uint64_t lo;                    /* absolute device block of area block 0 */
++	uint64_t hfs_end;               /* HFS+ volume end, device blocks from the partition start */
++	uint32_t slot;
++	uint64_t flushed;               /* console bytes on the disk */
++	uint64_t last_write;            /* mach time of the last flush */
++	struct nbl_slot hdr;            /* this boot's header (under sweet_ufs_lock) */
++} nbl;
++
++extern char kernel_uuid_string[];
++/* version[]: <sys/systm.h> */
++extern int kdb_printf(const char *format, ...) __printflike(1, 2);
++
++/* CRC-32 (IEEE 802.3, the zlib / crc32fast value). */
++static uint32_t
++nbl_crc32(const void *buf, size_t n)
++{
++	const uint8_t *b = (const uint8_t *)buf;
++	uint32_t c = 0xffffffffu;
++	while (n--) {
++		c ^= *b++;
++		for (int k = 0; k < 8; k++) {
++			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1u)));
++		}
++	}
++	return ~c;
++}
++
++static uint64_t
++nbl_uptime_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static uint64_t
++nbl_slot_base(uint32_t slot)
++{
++	return nbl.lo + 1 + (uint64_t)slot * NBL_SLOT_BLOCKS;
++}
++
++static bool
++nbl_slot_valid(const struct nbl_slot *h)
++{
++	return memcmp(h->magic, "NEGRBOOT", 8) == 0 && h->version == NBL_VERSION &&
++	       h->hdr_size == sizeof(*h) && h->crc == nbl_crc32(h, offsetof(struct nbl_slot, crc));
++}
++
++static const char *
++nbl_state_name(uint32_t state)
++{
++	switch (state) {
++	case NBL_RUNNING: return "running";
++	case NBL_PANIC:   return "panic";
++	case NBL_HALT:    return "halt";
++	case NBL_RESTART: return "restart";
++	default:          return "?";
++	}
++}
++
++/*
++ * PM6125 PON reasons of this power-on (qpnp-power-on.c; GEN2 offsets 0xC0..
++ * when the PON subtype is >= 4, else GEN1 0x08..): they tell why the boot
++ * before this one ended. One line, raw values and the names of the set bits.
++ */
++static void
++nbl_pon_summary(char *buf, size_t size)
++{
++	static const char *const pon_names[8] = { "HARD_RESET", "SMPL", "RTC", "DC", "USB", "PON1", "CBL", "KPD" };
++	static const char *const off_names[16] = {
++		"SOFT", "PS_HOLD", "PMIC_WD", "GP1", "GP2", "KPDPWR_AND_RESIN", "RESIN_N", "KPDPWR_N",
++		NULL, NULL, NULL, "CHARGER", "TFT", "UVLO", "OTST3", "STAGE3",
++	};
++	static const char *const fault_names[16] = {
++		"GP_FAULT0", "GP_FAULT1", "GP_FAULT2", "GP_FAULT3", "MBG_FAULT", "OVLO", "UVLO", "AVDD_RB",
++		NULL, NULL, NULL, "FAULT_N", "PBS_WATCHDOG_TO", "PBS_NACK", "RESTART_PON", "OTST3",
++	};
++	uint8_t sub = 0, r[10] = { 0 };
++	char *o = buf;
++	size_t left = size;
++	int w;
++
++	buf[0] = 0;
++	if (sweet_spmi_init() != 0 || sweet_spmi_pon_read(0x805, &sub) != 0) {
++		snprintf(buf, size, "PON not readable");
++		return;
++	}
++	bool gen2 = sub >= 4;
++	/* 0 pon, 1 warm1, 2 warm2, 3 poff1, 4 poff2, 5 off, 6 fault1, 7 fault2, 8 s3 */
++	static const uint16_t g1[9] = { 0x808, 0x80a, 0x80b, 0x80c, 0x80d, 0, 0, 0, 0 };
++	static const uint16_t g2[9] = { 0x8c0, 0x8c2, 0x8c3, 0x8c5, 0x8c6, 0x8c7, 0x8c8, 0x8c9, 0x8ca };
++	for (int i = 0; i < 9; i++) {
++		uint16_t a = gen2 ? g2[i] : g1[i];
++		if (a != 0 && sweet_spmi_pon_read(a, &r[i]) != 0) {
++			snprintf(buf, size, "PON read of 0x%x failed", a);
++			return;
++		}
++	}
++#define NBL_SUM(...) do { w = snprintf(o, left, __VA_ARGS__); if (w > 0 && (size_t)w < left) { o += w; left -= (size_t)w; } } while (0)
++	NBL_SUM("gen%d pon=0x%02x", gen2 ? 2 : 1, r[0]);
++	bool first_pon = true;
++	for (int b = 0; b < 8; b++) {
++		if (r[0] & (1u << b)) {
++			NBL_SUM("%s%s", first_pon ? "(" : "|", pon_names[b]);
++			first_pon = false;
++		}
++	}
++	if (!first_pon) {
++		NBL_SUM(")");
++	}
++	uint16_t warm = (uint16_t)(r[1] | r[2] << 8), poff = (uint16_t)(r[3] | r[4] << 8);
++	uint16_t fault = (uint16_t)(r[6] | r[7] << 8);
++	const struct { const char *key; uint16_t v; const char *const *names; } f[3] = {
++		{ "warm", warm, off_names }, { "poff", poff, off_names }, { "fault", fault, fault_names },
++	};
++	for (int k = 0; k < 3; k++) {
++		if (k == 2 && !gen2) {
++			break;
++		}
++		NBL_SUM(" %s=0x%04x", f[k].key, f[k].v);
++		bool first = true;
++		for (int b = 0; b < 16; b++) {
++			if ((f[k].v & (1u << b)) && f[k].names[b] != NULL) {
++				NBL_SUM("%s%s", first ? "(" : "|", f[k].names[b]);
++				first = false;
++			}
++		}
++		if (!first) {
++			NBL_SUM(")");
++		}
++	}
++	if (gen2) {
++		NBL_SUM(" off=0x%02x s3=0x%02x", r[5], r[8]);
++	}
++#undef NBL_SUM
++}
++
++/*
++ * The ring from `flushed` to `total`, then this boot's header, then
++ * SYNCHRONIZE CACHE. With sweet_ufs_lock held, or in the panic path.
++ */
++static int
++nbl_write(uint64_t flushed, uint64_t total)
++{
++	uint64_t base = nbl_slot_base(nbl.slot);
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
++	int error = 0;
++
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_log_write_blocks(base + 1 + blk, n);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
++		nbl.hdr.total = total;
++		nbl.hdr.seq++;
++		nbl.hdr.last_up_ms = nbl_uptime_ms();
++		if (!nbl.panic) {
++			clock_sec_t s;
++			clock_usec_t us;
++			clock_get_calendar_microtime(&s, &us);
++			nbl.hdr.last_cal = (uint64_t)s;
++		}
++		nbl.hdr.crc = nbl_crc32(&nbl.hdr, offsetof(struct nbl_slot, crc));
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &nbl.hdr, sizeof(nbl.hdr));
++		error = ufs_log_write_blocks(base, 1);
++	}
++	if (!error) {
++		error = ufs_sync_cache();
++	}
++	nbl.last_write = mach_absolute_time();
++	return error;
++}
++
++/* SpringBoard marker: proc_iterate callback. */
++static int
++nbl_find_springboard(proc_t p, void *arg)
++{
++	char name[MAXCOMLEN + 1];
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, "SpringBoard") == 0) {
++		*(int *)arg = proc_pid(p);
++		return PROC_RETURNED_DONE;
++	}
++	return PROC_RETURNED;
++}
++
++static void
++nbl_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t heartbeat, sec, win_start = 0, win_bytes = 0, slow_until = 0, retry_at = 0;
++	bool first = true;
++
++	nanoseconds_to_absolutetime((uint64_t)NBL_HEARTBEAT_SECS * NSEC_PER_SEC, &heartbeat);
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &sec);
++	nbl.running = true;
++	for (;;) {
++		(void)tsleep(&sweet_log_chan, PZERO, "laurelbootlog", hz * (int)NBL_FLUSH_SECS);
++		if (!(nbl.hdr.flags & NBL_F_SPRINGBOARD)) {
++			int pid = 0;
++			proc_iterate(PROC_ALLPROCLIST, nbl_find_springboard, &pid, NULL, NULL);
++			if (pid > 0) {
++				uint64_t ms = nbl_uptime_ms();
++				lck_mtx_lock(&sweet_ufs_lock);
++				nbl.hdr.flags |= NBL_F_SPRINGBOARD;
++				nbl.hdr.sb_up_ms = ms;
++				lck_mtx_unlock(&sweet_ufs_lock);
++				printf("LAUREL BOOTLOG: boot %llu reached SpringBoard (pid %d) %llu.%03llu s after start\n",
++				    nbl.hdr.boot, pid, ms / 1000, ms % 1000);
++			}
++		}
++		/*
++		 * Wear budget (negroni review F1): new text every second in the first
++		 * NBL_EARLY_SECS of uptime, then at most every NBL_LATE_SECS; more than
++		 * NBL_BUDGET_BYTES in NBL_BUDGET_SECS: every NBL_SLOW_SECS for 2 windows.
++		 * A quiet console: header only, every NBL_HEARTBEAT_SECS. The first
++		 * flush (the backlog since kernel start) does not count.
++		 */
++		uint64_t now = mach_absolute_time();
++		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++		uint32_t every = NBL_FLUSH_SECS;
++		if (nbl_uptime_ms() >= (uint64_t)NBL_EARLY_SECS * 1000) {
++			every = NBL_LATE_SECS;
++		}
++		if (now < slow_until) {
++			every = NBL_SLOW_SECS;
++		}
++		uint64_t since = now - nbl.last_write;
++		if (now < retry_at || (total == nbl.flushed ? since < heartbeat : since < (uint64_t)every * sec)) {
++			continue;
++		}
++		lck_mtx_lock(&sweet_ufs_lock);
++		uint64_t before = nbl.flushed;
++		int error = nbl.panic ? EBUSY : nbl_write(nbl.flushed, total);
++		if (!error) {
++			nbl.flushed = total;
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (!error && !first) {
++			if (now - win_start >= (uint64_t)NBL_BUDGET_SECS * sec) {
++				win_start = now;
++				win_bytes = 0;
++			}
++			win_bytes += total - before;
++			if (win_bytes > NBL_BUDGET_BYTES) {
++				if (now >= slow_until) {
++					printf("LAUREL BOOTLOG: %llu KiB in %u s: flushes every %u s for a while\n",
++					    win_bytes >> 10, NBL_BUDGET_SECS, NBL_SLOW_SECS);
++				}
++				slow_until = now + 2ull * NBL_BUDGET_SECS * sec;
++				win_bytes = 0;
++				win_start = now;
++			}
++		}
++		first = false;
++		if (error) {
++			/* as laurel 2010: keep the thread, complain at most 20 times */
++			static uint32_t fails;
++			if (fails < 20) {
++				fails++;
++				printf("LAUREL BOOTLOG: flush failed (%d) (%s); retry in %u s\n", error,
++				    fails < 20 ? "kept" : "last complaint", NBL_SLOW_SECS);
++			}
++			retry_at = now + (uint64_t)NBL_SLOW_SECS * sec;   /* review m4: own back-off */
++		}
++	}
++}
++
++/*
++ * The panic path: wait (polled, at most 200 ms) for a command that the
++ * flush thread or the block device had in slot 0 when the other CPUs were
++ * stopped; clear the slot if it never completes.
++ */
++static void
++nbl_panic_take_host(void)
++{
++	uint64_t limit;
++	nanoseconds_to_absolutetime(200 * NSEC_PER_MSEC, &limit);
++	uint64_t end = mach_absolute_time() + limit;
++	while ((ufs_rd(REG_UTRLDBR) & 1) && mach_absolute_time() < end) {
++	}
++	if (ufs_rd(REG_UTRLDBR) & 1) {
++		ufs_wr(REG_UTRLCLR, ~1u);
++		ufs_spin_us(1000);
++	}
++	ufs_wr(REG_IS, ufs_rd(REG_IS));
++}
++
++/*
++ * negroni review F5: the panic path uses the host only if sweet_ufs_lock is
++ * free (tried once; it stays taken, the system does not run on), or if it is
++ * held while root writes are off (no ufsrw=1). A holder on a CPU that was
++ * not stopped could be in the middle of a root write with the shared bounce
++ * buffer: then no panic write (the USB panic mode still sends the log).
++ */
++static bool
++nbl_panic_enter(void)
++{
++	static int result = -1;
++
++	if (result >= 0) {
++		return result == 1;
++	}
++	if (!lck_mtx_try_lock(&sweet_ufs_lock) && su.writable) {
++		kdb_printf("LAUREL BOOTLOG: UFS busy at the panic (ufsrw=1): no panic write to the disk\n");
++		result = 0;
++		return false;
++	}
++	nbl.panic = true;
++	ufs_polled_only = true;
++	nbl_panic_take_host();
++	result = 1;
++	return true;
++}
++
++/* The last "panic(" line of the console ring (the panic string) into dst. */
++static void
++nbl_panic_line(char *dst, size_t size)
++{
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	uint64_t from = total > (256u << 10) ? total - (256u << 10) : 0, hit = UINT64_MAX;
++	static const char pat[] = "panic(";
++
++	for (uint64_t p = from; p + sizeof(pat) - 1 <= total; p++) {
++		uint32_t k = 0;
++		while (k < sizeof(pat) - 1 && sweet_log_ring[(p + k) % SWEET_LOG_SIZE] == pat[k]) {
++			k++;
++		}
++		if (k == sizeof(pat) - 1) {
++			hit = p;
++		}
++	}
++	size_t n = 0;
++	if (hit == UINT64_MAX) {
++		strlcpy(dst, "panic (no panic( line in the console ring)", size);
++		return;
++	}
++	for (uint64_t p = hit; p < total && n + 1 < size; p++) {
++		char c = sweet_log_ring[p % SWEET_LOG_SIZE];
++		if (c == '\n' || c == 0) {
++			break;
++		}
++		dst[n++] = (c >= 0x20 && c < 0x7f) ? c : '?';
++	}
++	dst[n] = 0;
++}
++
++/*
++ * From the platform expert at kPEPanicDiagnosticsDone, before the USB panic
++ * hold: the ring plus a panic header into this boot's slot. Interrupts are
++ * off and the other CPUs are stopped: no lock wait, polled commands.
++ */
++void laurel_bootlog_panic(void);
++
++void
++laurel_bootlog_panic(void)
++{
++	static bool done;
++
++	if (done || !nbl.ok || !su.ready) {
++		return;
++	}
++	done = true;
++	if (!nbl_panic_enter()) {
++		return;
++	}
++	nbl.hdr.state = NBL_PANIC;
++	nbl.hdr.flags |= NBL_F_PANICLOG;
++	nbl.hdr.end_up_ms = nbl_uptime_ms();
++	nbl_panic_line(nbl.hdr.end, sizeof(nbl.hdr.end));
++	int error = nbl_write(nbl.flushed, os_atomic_load(&sweet_log_total, relaxed));
++	kdb_printf("LAUREL BOOTLOG: panic log of boot %llu written to slot %u: %s\n", nbl.hdr.boot, nbl.slot,
++	    error ? "FAILED" : "ok");
++}
++
++/*
++ * The end of this boot: kind NBL_HALT (3) or NBL_RESTART (4), why = a short
++ * text. From the halt/restart path (SweetPlatformExpert.cpp) and the USB
++ * reset/power off commands (sweet_usb.c). Never from interrupt context; with
++ * preemption or interrupts off the lock is only tried (200 ms).
++ */
++void laurel_bootlog_end(unsigned kind, const char *why);
++
++void
++laurel_bootlog_end(unsigned kind, const char *why)
++{
++	bool locked = false;
++
++	if (!nbl.ok || !su.ready || nbl.panic || ml_at_interrupt_context()) {
++		return;
++	}
++	if (preemption_enabled() && ml_get_interrupts_enabled()) {
++		lck_mtx_lock(&sweet_ufs_lock);
++		locked = true;
++	} else {
++		uint64_t limit;
++		nanoseconds_to_absolutetime(200 * NSEC_PER_MSEC, &limit);
++		uint64_t end = mach_absolute_time() + limit;
++		while (!(locked = lck_mtx_try_lock(&sweet_ufs_lock)) && mach_absolute_time() < end) {
++		}
++		if (!locked) {
++			return;
++		}
++	}
++	nbl.hdr.state = kind == NBL_HALT ? NBL_HALT : NBL_RESTART;
++	strlcpy(nbl.hdr.end, why, sizeof(nbl.hdr.end));
++	nbl.hdr.end_up_ms = nbl_uptime_ms();
++	printf("LAUREL BOOTLOG: boot %llu ends: %s (%s)\n", nbl.hdr.boot, nbl_state_name(nbl.hdr.state), why);
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	if (nbl_write(nbl.flushed, total) == 0) {
++		nbl.flushed = total;
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++}
++
++/* Area blocks [blk, blk + count) into dst (count <= 4). 0 or an errno. Thread context; nowait: EBUSY if the UFS lock is taken. */
++int laurel_bootlog_read(uint32_t blk, uint32_t count, void *dst, bool nowait);
++
++int
++laurel_bootlog_read(uint32_t blk, uint32_t count, void *dst, bool nowait)
++{
++	if (!nbl.ok || count == 0 || count > 4 || blk >= NBL_AREA_BLOCKS || count > NBL_AREA_BLOCKS - blk) {
++		return EINVAL;
++	}
++	if (nbl.panic || ml_at_interrupt_context()) {
++		return EBUSY;
++	}
++	if (nowait) {
++		if (!lck_mtx_try_lock(&sweet_ufs_lock)) {
++			return EBUSY;
++		}
++	} else {
++		lck_mtx_lock(&sweet_ufs_lock);
++	}
++	int error = ufs_read_blocks(nbl.lo + blk, count);
++	if (!error) {
++		memcpy(dst, (const void *)(su.dma + DMA_BOUNCE), count * UFS_BLOCK);
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++/* One line for the USB "bootlog" command (keys as negroni: op10tool bootlog parses boot and slot). */
++void laurel_bootlog_info(char *buf, size_t size);
++
++void
++laurel_bootlog_info(char *buf, size_t size)
++{
++	if (!nbl.ok) {
++		snprintf(buf, size, "error: no boot log on this boot (see the LAUREL BOOTLOG line)");
++		return;
++	}
++	snprintf(buf, size, "bootlog v%u area %llu blocks %u slots %u slotblocks %u boot %llu slot %u state %s "
++	    "secs %u hfsend %llu running %d",
++	    NBL_VERSION, nbl.lo - su.first_block, NBL_AREA_BLOCKS, NBL_SLOTS, NBL_SLOT_BLOCKS, nbl.hdr.boot,
++	    nbl.slot, nbl_state_name(nbl.hdr.state), NBL_FLUSH_SECS, nbl.hfs_end, nbl.running ? 1 : 0);
++}
++
++/* /dev/laurelbootlog: the area as a read-only file (root only), for dd over SSH. */
++static int
++nbl_dev_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (flags & FWRITE) {
++		return EPERM;
++	}
++	return nbl.ok ? 0 : ENXIO;
++}
++
++static int
++nbl_dev_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++nbl_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint8_t *buf = kalloc_data(UFS_BLOCK, Z_WAITOK);
++	int error = 0;
++
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	while (uio_resid(uio) > 0 && !error) {
++		off_t off = uio_offset(uio);
++		if (off < 0) {
++			error = EINVAL;
++			break;
++		}
++		if (off >= (off_t)NBL_AREA_BLOCKS * UFS_BLOCK) {
++			break;
++		}
++		uint32_t in = (uint32_t)(off % UFS_BLOCK);
++		error = laurel_bootlog_read((uint32_t)(off / UFS_BLOCK), 1, buf, false);
++		if (!error) {
++			error = uiomove((const char *)buf + in, (int)MIN((user_ssize_t)(UFS_BLOCK - in), uio_resid(uio)), uio);
++		}
++	}
++	kfree_data(buf, UFS_BLOCK);
++	return error;
++}
++
++static const struct cdevsw nbl_cdevsw = {
++	.d_open = nbl_dev_open, .d_close = nbl_dev_close, .d_read = nbl_dev_read,
++	.d_write = eno_rdwrt, .d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset,
++	.d_ttys = NULL, .d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = 0,
++};
++
++/*
++ * HFS+ / HFSX volume end in device blocks from the partition start. vh = the
++ * volume header (partition byte 1024): signature at 0 ("H+" / "HX"), block
++ * size at 40, total blocks at 44, big endian. 0 = ok, -1 = not HFS+.
++ */
++static int
++nbl_hfs_end(const uint8_t *vh, uint64_t *end)
++{
++	uint32_t sig = (uint32_t)vh[0] << 8 | vh[1];
++	uint32_t bsize = (uint32_t)vh[40] << 24 | (uint32_t)vh[41] << 16 | (uint32_t)vh[42] << 8 | vh[43];
++	uint32_t nblk = (uint32_t)vh[44] << 24 | (uint32_t)vh[45] << 16 | (uint32_t)vh[46] << 8 | vh[47];
++	if ((sig != 0x482b && sig != 0x4858) || bsize < 512 || (bsize & (bsize - 1)) != 0 || nblk == 0) {
++		return -1;
++	}
++	*end = ((uint64_t)bsize * nblk + UFS_BLOCK - 1) / UFS_BLOCK;
++	return 0;
++}
++
++/*
++ * Checks the area and picks this boot's slot (with sweet_ufs_lock held). The
++ * write gate (ufs_log_lo/hi) opens only after the HFS+ check; the caller
++ * closes it again on any error.
++ */
++static int
++nbl_setup_locked(void)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	static struct nbl_slot prev[NBL_SLOTS];
++	bool valid[NBL_SLOTS] = { false };
++	int error;
++
++	if (su.nblocks < (uint64_t)NBL_FROM_END + NBL_MIN_REL) {
++		printf("LAUREL BOOTLOG: off: partition too small (%llu blocks)\n", su.nblocks);
++		return ENOSPC;
++	}
++	uint64_t rel = su.nblocks - NBL_FROM_END;
++	if ((error = ufs_read_blocks(su.first_block, 1)) != 0) {
++		printf("LAUREL BOOTLOG: off: partition block 0 not readable (%d)\n", error);
++		return error;
++	}
++	if (nbl_hfs_end(b + 1024, &nbl.hfs_end) != 0) {
++		printf("LAUREL BOOTLOG: off: no HFS+ volume header at the partition start (sig %#x)\n",
++		    (unsigned)(b[1024] << 8 | b[1025]));
++		return ENOENT;
++	}
++	if (nbl.hfs_end > rel) {
++		printf("LAUREL BOOTLOG: off: HFS+ volume ends at block %llu, past the area at block %llu\n",
++		    nbl.hfs_end, rel);
++		return EEXIST;
++	}
++	nbl.lo = su.first_block + rel;
++
++	struct nbl_super sb = {
++		.magic = { 'N', 'E', 'G', 'R', 'B', 'L', 'O', 'G' }, .version = NBL_VERSION, .slots = NBL_SLOTS,
++		.slot_blocks = NBL_SLOT_BLOCKS, .area_blocks = NBL_AREA_BLOCKS, .ring_size = SWEET_LOG_SIZE,
++		.from_end = NBL_FROM_END,
++	};
++	sb.crc = nbl_crc32(&sb, offsetof(struct nbl_super, crc));
++	if ((error = ufs_read_blocks(nbl.lo, 1)) != 0) {
++		printf("LAUREL BOOTLOG: off: area block 0 not readable (%d)\n", error);
++		return error;
++	}
++	bool fresh = memcmp(b, &sb, sizeof(sb)) != 0;
++
++	/* the check passed: open the write gate for the area only */
++	ufs_log_lo = nbl.lo;
++	ufs_log_hi = nbl.lo + NBL_AREA_BLOCKS;
++	if (fresh) {
++		/* new superblock, and all 8 slot headers zeroed (no stale header from older contents) */
++		bzero((void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
++		for (uint32_t i = 0; i < NBL_SLOTS && !error; i++) {
++			error = ufs_log_write_blocks(nbl_slot_base(i), 1);
++		}
++		if (!error) {
++			memcpy((void *)(su.dma + DMA_BOUNCE), &sb, sizeof(sb));
++			error = ufs_log_write_blocks(nbl.lo, 1);
++		}
++		if (error) {
++			printf("LAUREL BOOTLOG: off: superblock write failed (%d)\n", error);
++			return error;
++		}
++	}
++
++	uint64_t max_boot = 0;
++	uint32_t max_slot = NBL_SLOTS - 1;
++	for (uint32_t i = 0; i < NBL_SLOTS && !fresh; i++) {
++		if ((error = ufs_read_blocks(nbl_slot_base(i), 1)) != 0) {
++			printf("LAUREL BOOTLOG: off: slot %u header not readable (%d)\n", i, error);
++			return error;
++		}
++		memcpy(&prev[i], b, sizeof(prev[i]));
++		valid[i] = nbl_slot_valid(&prev[i]);
++		/* the strings come from the disk: terminate them before any printf */
++		prev[i].uuid[sizeof(prev[i].uuid) - 1] = 0;
++		prev[i].kversion[sizeof(prev[i].kversion) - 1] = 0;
++		prev[i].bootargs[sizeof(prev[i].bootargs) - 1] = 0;
++		prev[i].pon[sizeof(prev[i].pon) - 1] = 0;
++		prev[i].end[sizeof(prev[i].end) - 1] = 0;
++		if (valid[i] && prev[i].boot > max_boot) {
++			max_boot = prev[i].boot;
++			max_slot = i;
++		}
++	}
++	nbl.slot = (max_slot + 1) % NBL_SLOTS;
++
++	bzero(&nbl.hdr, sizeof(nbl.hdr));
++	memcpy(nbl.hdr.magic, "NEGRBOOT", 8);
++	nbl.hdr.version = NBL_VERSION;
++	nbl.hdr.hdr_size = sizeof(nbl.hdr);
++	nbl.hdr.boot = max_boot + 1;
++	nbl.hdr.state = NBL_RUNNING;
++	nbl.hdr.ring_size = SWEET_LOG_SIZE;
++	nbl.hdr.flush_secs = NBL_FLUSH_SECS;
++	clock_sec_t s;
++	clock_usec_t us;
++	clock_get_calendar_microtime(&s, &us);
++	nbl.hdr.start_cal = nbl.hdr.last_cal = (uint64_t)s;
++	strlcpy(nbl.hdr.uuid, kernel_uuid_string, sizeof(nbl.hdr.uuid));
++	strlcpy(nbl.hdr.kversion, version, sizeof(nbl.hdr.kversion));
++	strlcpy(nbl.hdr.bootargs, PE_boot_args(), sizeof(nbl.hdr.bootargs));
++	nbl_pon_summary(nbl.hdr.pon, sizeof(nbl.hdr.pon));
++	nbl.ok = true;
++
++	printf("LAUREL BOOTLOG: on: area at partition block %llu (%u blocks, HFS+ ends at %llu)%s; boot %llu -> slot %u; "
++	    "PON %s\n", rel, NBL_AREA_BLOCKS, nbl.hfs_end, fresh ? ", new superblock" : "", nbl.hdr.boot, nbl.slot,
++	    nbl.hdr.pon);
++	for (uint32_t k = 1; k <= NBL_SLOTS && !fresh; k++) {
++		uint32_t i = (max_slot + NBL_SLOTS + 1 - k) % NBL_SLOTS;  /* newest first */
++		if (!valid[i] || k > 3) {
++			continue;
++		}
++		const struct nbl_slot *h = &prev[i];
++		printf("LAUREL BOOTLOG: earlier boot %llu (slot %u): %s, last flush %llu s, %llu bytes, SpringBoard %s; %s\n",
++		    h->boot, i, h->state == NBL_RUNNING ? "no end mark (reset, hang or power loss)" : nbl_state_name(h->state),
++		    h->last_up_ms / 1000, h->total,
++		    (h->flags & NBL_F_SPRINGBOARD) ? "yes" : "no", h->end[0] ? h->end : "-");
++	}
++	return nbl_write(0, 0);
++}
++
+ static void
+ sweet_log_start(void)
+ {
+-	uint32_t on = 1;
++	uint32_t on = 1, bl = 1;
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
+-	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++	if (!on) {
++		printf("LAUREL BOOTLOG: off: sweetlog=0\n");
++		return;
++	}
++	PE_parse_boot_argn("laurelbootlog", &bl, sizeof(bl));
++	if (!bl) {
++		printf("LAUREL BOOTLOG: off: laurelbootlog=0\n");
++	} else {
++		lck_mtx_lock(&sweet_ufs_lock);
++		int error = nbl_setup_locked();
++		if (error || !nbl.ok) {
++			ufs_log_lo = ufs_log_hi = 0;    /* every failed setup closes the write gate */
++			nbl.ok = false;
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (nbl.ok) {
++			int major = cdevsw_add(-1, &nbl_cdevsw);
++			if (major >= 0) {
++				devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0400, "laurelbootlog");
++			}
++			if (kernel_thread_start(nbl_thread, NULL, &thread) == KERN_SUCCESS) {
++				thread_deallocate(thread);
++			} else {
++				printf("LAUREL BOOTLOG: no flush thread: only the panic and end writes\n");
++			}
++			return;
++		}
++		if (error == 0) {
++			printf("LAUREL BOOTLOG: off: area setup failed\n");
++		}
++	}
++	/* topaz 0047 fallback: the single area at the partition end, ufsrw=1 only */
++	if (!su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 128558a..fcaca16 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -115,7 +115,20 @@ static volatile bool ud_in_tc;          /* inside the callback: ring-only printf
+ static volatile uint64_t ud_tc_ticks;
+ static uint64_t ud_tc_period;
+ #define ud_nolock() (ud_in_panic || ud_in_tc)
+-static volatile bool ud_log_rewind;     /* "log" command: ud_log_thread sends the last 64 KiB again */
++static volatile bool ud_log_rewind;     /* "log" command: ud_log_thread sends the console from byte 0 again */
++/*
++ * laurel 2900: a frame from 192.168.7.1 (ARP or IPv4) came at least once this
++ * boot. Before that the host has no address (usblog.sh assigns it when the
++ * interface appears), so live log datagrams would be lost: the live log
++ * waits for this sign (usblog.sh sends "settime" and a keepalive at once;
++ * any op10tool ctl command also counts) and then starts at byte 0.
++ */
++static volatile bool ud_host_seen_once;
++/* laurel 2900: boot log (bsd/dev/sweet_ufs.c) */
++extern void laurel_bootlog_info(char *buf, size_t size);
++extern int laurel_bootlog_read(uint32_t blk, uint32_t count, void *dst, bool nowait);
++extern void laurel_bootlog_end(unsigned kind, const char *why);
++static char ud_ctl_why[48];             /* end text of the pending reset / power off */
+ static volatile uint64_t ud_log_sent;   /* console ring position that ud_log_thread has sent up to */
+ 
+ static int ud_panic_log(const char *fmt, ...) __printflike(1, 2);
+@@ -951,7 +964,12 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+  * ASCII command per datagram (trailing white space ignored), each logged
+  * as "LAUREL CTL:":
+  *   ping        reply "pong"
+- *   log         the live log sends the last 64 KiB of the console again
++ *   log         the live log sends the whole console again from byte 0
++ *               (the first 1 MiB from the head buffer, the rest from the
++ *               4 MiB ring; laurel 2900)
++ *   bootlog     one line: the boot log area and this boot's slot (2900)
++ *   bootlog read A C  area blocks A .. A+C-1 (C 1..4) as "NBLD" datagrams
++ *               (op10tool bootlog; ue0 mode only, not in raw or panic mode)
+  *   reboot      IMEM reason normal, PSCI SYSTEM_RESET (laurel_reboot.c)
+  *   bootloader  IMEM reason bootloader (ABL fastboot), then the reset
+  *   recovery    IMEM reason recovery, then the reset
+@@ -1063,13 +1081,12 @@ ud_udp_build(uint8_t *f, const uint8_t *dst_mac, const uint8_t *dst_ip, uint16_t
+ 	return len;
+ }
+ 
+-/* UDP datagram from 192.168.7.2:5141 back to the sender of req (a frame ud_ctl_input accepted). */
++/* UDP datagram (n bytes) from 192.168.7.2:5141 back to the sender of req (a frame ud_ctl_input accepted). */
+ static void
+-ud_ctl_reply(const uint8_t *req, const char *text)
++ud_ctl_send(const uint8_t *req, const void *data, uint32_t n)
+ {
+ 	const uint8_t *rip = req + ETHER_HDR_LEN;
+ 	const uint8_t *rudp = rip + (rip[0] & 0xfu) * 4;
+-	uint32_t n = (uint32_t)strlen(text);
+ 	uint32_t len = ETHER_HDR_LEN + 20 + 8 + n;
+ 	mbuf_t m = NULL;
+ 
+@@ -1082,12 +1099,113 @@ ud_ctl_reply(const uint8_t *req, const char *text)
+ 		printf("LAUREL CTL: no mbuf for the reply\n");
+ 		return;
+ 	}
+-	(void)ud_udp_build(mbuf_data(m), req + ETHER_ADDR_LEN, rip + 12, UD_CTL_PORT, ud_be16(rudp), text, n);
++	(void)ud_udp_build(mbuf_data(m), req + ETHER_ADDR_LEN, rip + 12, UD_CTL_PORT, ud_be16(rudp), data, n);
+ 	mbuf_setlen(m, len);
+ 	mbuf_pkthdr_setlen(m, len);
+ 	(void)ud_if_output(ud.ifp, m);
+ }
+ 
++static void
++ud_ctl_reply(const uint8_t *req, const char *text)
++{
++	ud_ctl_send(req, text, (uint32_t)strlen(text));
++}
++
++/* laurel 2900: any frame whose sender is 192.168.7.1 (ARP sender address or IPv4 source). */
++static void
++ud_note_host(const uint8_t *f, uint32_t len)
++{
++	uint16_t type = ud_be16(f + 12);
++	if ((type == ETHERTYPE_ARP && len >= ETHER_HDR_LEN + 28 && ud_be32(f + ETHER_HDR_LEN + 14) == UD_IP_HOST) ||
++	    (type == ETHERTYPE_IP && len >= ETHER_HDR_LEN + 20 && ud_be32(f + ETHER_HDR_LEN + 12) == UD_IP_HOST)) {
++		ud_host_seen_once = true;
++	}
++}
++
++/* Decimal number at *q (advanced past it); *ok = false without a digit or with more than 9 digits. */
++static uint32_t
++ud_parse_u32(const char **q, bool *ok)
++{
++	uint32_t v = 0;
++	const char *p = *q;
++	unsigned n = 0;
++	if (*p < '0' || *p > '9') {
++		*ok = false;
++	}
++	while (*p >= '0' && *p <= '9') {
++		if (++n > 9) {
++			*ok = false;
++			break;
++		}
++		v = v * 10 + (uint32_t)(*p++ - '0');
++	}
++	*q = p;
++	return v;
++}
++
++/*
++ * laurel 2900 (port of negroni 0367): boot log commands, ud_thread only.
++ *   bootlog          one text line (laurel_bootlog_info)
++ *   bootlog read A C area blocks A .. A+C-1 (C 1..4): 4 datagrams per block,
++ *                    each a 16-byte header "NBLD" | u32 block | u32 byte offset
++ *                    in the block | u32 length (little endian) and 1024 data bytes.
++ * Datagrams the TX queue drops are asked for again by the host (op10tool bootlog).
++ */
++#define UD_BOOTLOG_CHUNK 1024u
++
++static void
++ud_ctl_bootlog(const uint8_t *f, const char *cmd)
++{
++	static uint8_t blocks[4 * 4096];
++	static uint8_t dgram[16 + UD_BOOTLOG_CHUNK];
++	char reply[256];
++
++	if (cmd[7] == 0) {
++		laurel_bootlog_info(reply, sizeof(reply));
++		ud_ctl_reply(f, reply);
++		return;
++	}
++	const char *q = cmd + 13;
++	bool ok = true;
++	uint32_t blk = ud_parse_u32(&q, &ok);
++	if (*q == ' ') {
++		q++;
++	} else {
++		ok = false;
++	}
++	uint32_t count = ud_parse_u32(&q, &ok);
++	if (!ok || *q != 0 || count == 0 || count > 4) {
++		ud_ctl_reply(f, "error: bootlog read <area block> <count 1..4>");
++		return;
++	}
++	/* review M1/m5: 4 datagrams per block need room in the TX queue (replies keep theirs); never wait for the UFS lock */
++	if (ud.txq_count + 4 * count + 4 > UD_TXQ) {
++		ud_ctl_reply(f, "error: busy (TX queue)");
++		return;
++	}
++	int error = laurel_bootlog_read(blk, count, blocks, true);
++	if (error == EBUSY) {
++		ud_ctl_reply(f, "error: busy (UFS in use, ask again)");
++		return;
++	}
++	if (error) {
++		snprintf(reply, sizeof(reply), "error: bootlog read %u %u: %d", blk, count, error);
++		ud_ctl_reply(f, reply);
++		return;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		for (uint32_t off = 0; off < 4096; off += UD_BOOTLOG_CHUNK) {
++			uint32_t b = blk + i, n = UD_BOOTLOG_CHUNK;
++			memcpy(dgram, "NBLD", 4);
++			memcpy(dgram + 4, &b, 4);
++			memcpy(dgram + 8, &off, 4);
++			memcpy(dgram + 12, &n, 4);
++			memcpy(dgram + 16, blocks + i * 4096 + off, n);
++			ud_ctl_send(f, dgram, 16 + n);
++		}
++	}
++}
++
+ static void
+ ud_ctl_schedule(int action)
+ {
+@@ -1122,6 +1240,9 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ {
+ 	char cmd[32], reply[80];
+ 
++	if (len >= ETHER_HDR_LEN) {
++		ud_note_host(f, len);           /* laurel 2900 */
++	}
+ 	if (!ud.ctl_enabled || len < ETHER_HDR_LEN + 20 + 8 || ud_be16(f + 12) != ETHERTYPE_IP) {
+ 		return false;
+ 	}
+@@ -1159,7 +1280,12 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 	}
+ 	if (strcmp(cmd, "log") == 0) {
+ 		ud_log_rewind = true;
+-		ud_ctl_reply(f, "ok log");
++		snprintf(reply, sizeof(reply), "ok log (%llu console bytes from byte 0)", sweet_log_position());
++		ud_ctl_reply(f, reply);
++		return true;
++	}
++	if (strcmp(cmd, "bootlog") == 0 || strncmp(cmd, "bootlog read ", 13) == 0) {
++		ud_ctl_bootlog(f, cmd);         /* laurel 2900 */
+ 		return true;
+ 	}
+ 	if (ud.ctl_action != UD_CTL_NONE) {
+@@ -1174,6 +1300,7 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		return true;
+ 	}
+ 	if (strcmp(cmd, "poweroff") == 0) {
++		strlcpy(ud_ctl_why, "power off (USB command)", sizeof(ud_ctl_why));
+ 		printf("LAUREL CTL: power off in %u ms\n", UD_CTL_DELAY_MS);
+ 		ud_ctl_reply(f, "ok poweroff");
+ 		ud_ctl_schedule(UD_CTL_POWEROFF);
+@@ -1188,6 +1315,7 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		printf("LAUREL CTL: %s: mode %s %s, reset in %u ms\n", cmd, ud_ctl_resets[i].mode,
+ 		    set ? "set" : "NOT set", UD_CTL_DELAY_MS);
+ 		ud_ctl_reply(f, reply);
++		snprintf(ud_ctl_why, sizeof(ud_ctl_why), "reset (USB command %s)", cmd);
+ 		ud_ctl_schedule(UD_CTL_RESET);
+ 		return true;
+ 	}
+@@ -1209,9 +1337,11 @@ ud_ctl_poll(void)
+ 		panic("requested over USB");
+ 	}
+ 	if (action == UD_CTL_POWEROFF) {
++		laurel_bootlog_end(3, ud_ctl_why[0] ? ud_ctl_why : "power off (USB command)");    /* laurel 2900 */
+ 		laurel_power_off();             /* returns only if PSCI refused (logged there) */
+ 		return;
+ 	}
++	laurel_bootlog_end(4, ud_ctl_why[0] ? ud_ctl_why : "reset (USB command)");            /* laurel 2900 */
+ 	printf("LAUREL CTL: PSCI SYSTEM_RESET\n");
+ 	laurel_restart();
+ }
+@@ -1293,6 +1423,7 @@ ud_panic_rx(const uint8_t *f, uint32_t len)
+ 	if ((type == ETHERTYPE_ARP && len >= ETHER_HDR_LEN + 28 && ud_be32(f + ETHER_HDR_LEN + 14) == UD_IP_HOST) ||
+ 	    (type == ETHERTYPE_IP && len >= ETHER_HDR_LEN + 20 && ud_be32(f + ETHER_HDR_LEN + 12) == UD_IP_HOST)) {
+ 		ud_panic_host_seen = true;
++		ud_host_seen_once = true;       /* laurel 2900 */
+ 	}
+ 	if (type == ETHERTYPE_ARP) {
+ 		const uint8_t *a = f + ETHER_HDR_LEN;
+@@ -1329,10 +1460,12 @@ ud_panic_rx(const uint8_t *f, uint32_t len)
+ 		snprintf(text, sizeof(text), "pong%s", sfx);
+ 		reply = text;
+ 	} else if (strcmp(cmd, "log") == 0) {
+-		uint64_t end = sweet_log_position();
+-		ud_panic_pos = end > 65536 ? end - 65536 : 0;
+-		snprintf(text, sizeof(text), "ok log%s", sfx);
++		ud_panic_pos = 0;               /* laurel 2900: all of it (head buffer + ring) */
++		snprintf(text, sizeof(text), "ok log (%llu console bytes from byte 0)%s", sweet_log_position(), sfx);
+ 		reply = text;
++	} else if (strcmp(cmd, "bootlog") == 0 || strncmp(cmd, "bootlog read ", 13) == 0) {
++		reply = ud_in_panic ? "error: bootlog: not in panic mode (the panic is in the boot log slot)" :
++		    "error: bootlog: raw mode (before the ue0 attach); try again in a few seconds";
+ 	} else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "recovery") == 0 ||
+ 	    strcmp(cmd, "bootloader") == 0 || strcmp(cmd, "poweroff") == 0) {
+ 		if (busy) {
+@@ -1427,8 +1560,14 @@ ud_panic_tx_next(void)
+ 		return;
+ 	}
+ 	uint64_t now = mach_absolute_time();
+-	if (!ud_panic_host_seen && now - ud_panic_conf_at < ud_panic_host_wait) {
+-		return;                         /* the host may not have 192.168.7.1 yet */
++	/*
++	 * The host may not have 192.168.7.1 yet: wait for a frame from it. laurel
++	 * 2900: before a panic for ever (log datagrams sent before the host has its
++	 * address are lost: the early kernel lines were missing); in a panic at
++	 * most ud_panic_host_wait (10 s), as before.
++	 */
++	if (!ud_panic_host_seen && (!ud_in_panic || now - ud_panic_conf_at < ud_panic_host_wait)) {
++		return;
+ 	}
+ 	if (now - ud_panic_last < ud_panic_gap) {
+ 		return;                         /* pace: the host's UDP receive buffer is not unlimited */
+@@ -1993,8 +2132,10 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ /*
+  * Live console log over USB Ethernet: every 100 ms the new bytes of the
+  * console ring (bsd/dev/sweet_ufs.c) go as UDP datagrams to
+- * 192.168.7.1:5140 (on the PC: nc -ukl 5140). Starts with the last 64 KiB
+- * so the boot is included. Nothing here may print (it would feed itself).
++ * 192.168.7.1:5140 (on the PC: nc -ukl 5140). laurel 2900: starts at byte 0
++ * of the boot (the head buffer keeps the first 1 MiB) once a frame from the
++ * host came, and a failed send is sent again (the bytes stay unsent).
++ * Nothing here may print (it would feed itself).
+  * Boot-arg sweetusblog=0 disables it.
+  */
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+@@ -2006,9 +2147,8 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	static char chunk[1400];
+ 	socket_t so = NULL;
+ 	struct sockaddr_in to;
+-	uint64_t pos = sweet_log_position();
++	uint64_t pos = 0;                       /* laurel 2900: from byte 0 (was the last 64 KiB) */
+ 
+-	pos = pos > 65536 ? pos - 65536 : 0;
+ 	if (ud_log_from_raw) {
+ 		pos = ud_log_sent;              /* go on where the raw stream of early mode stopped */
+ 	}
+@@ -2020,20 +2160,26 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
+ 	for (;;) {
+ 		ud_sleep_ms(100);
+-		if (!ud.configured || ud_in_panic) {
++		if (!ud.configured || ud_in_panic || !ud_host_seen_once) {
+ 			continue;
+ 		}
+-		if (ud_log_rewind) {            /* "log" command */
++		if (ud_log_rewind) {            /* "log" command: all of it again (laurel 2900) */
+ 			ud_log_rewind = false;
+-			uint64_t end = sweet_log_position();
+-			pos = end > 65536 ? end - 65536 : 0;
++			pos = 0;
+ 		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
+ 			continue;
+ 		}
+-		uint32_t n;
+-		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
++		uint32_t n, burst = 0;
++		uint64_t at = pos;
++		/*
++		 * laurel 2900 review M1: a full resend (5 MiB) must not fill the TX queue:
++		 * stop at half of it (the rest stays for command replies: pong, ok
++		 * bootloader) and go on 100 ms later from the same byte; 1 ms pause every
++		 * 32 datagrams so ud_thread drains the queue in between.
++		 */
++		while (ud.txq_count < UD_TXQ / 2 && (n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+ 			struct msghdr msg = {
+ 				.msg_name = &to, .msg_namelen = sizeof(to),
+@@ -2041,9 +2187,14 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			};
+ 			size_t sent = 0;
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
+-				break;          /* no route/ARP yet: retry later */
++				pos = at;       /* no route/ARP yet: these bytes again later (laurel 2900) */
++				break;
+ 			}
++			at = pos;
+ 			ud_log_sent = pos;      /* the panic flush starts here */
++			if (++burst % 32 == 0) {
++				ud_sleep_ms(1);
++			}
+ 		}
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index ed3b4b7..b6b932e 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -16,6 +16,9 @@ int laurel_reboot_prepare(void);
+ void laurel_power_off(void);
+ void laurel_restart(void);
+ void laurel_usb_panic_hold(void);     /* laurel 2005: bsd/dev/sweet_usb.c; returns only without USB */
++/* laurel 2900: boot log end marks and the panic write (bsd/dev/sweet_ufs.c) */
++void laurel_bootlog_end(unsigned kind, const char *why);
++void laurel_bootlog_panic(void);
+ }
+ 
+ static int
+@@ -23,9 +26,11 @@ laurel_halt_restart(unsigned int type)
+ {
+ 	switch (type) {
+ 	case kPEHaltCPU:
++		laurel_bootlog_end(3, "halt (power off)");     /* laurel 2900: clean end mark */
+ 		laurel_power_off();
+ 		return -1;          /* returned: SYSTEM_OFF refused; XNU halts the CPU */
+ 	case kPERestartCPU:
++		laurel_bootlog_end(4, "restart (reboot)");     /* laurel 2900: clean end mark */
+ 		laurel_restart();
+ 		return -1;
+ 	case kPEPanicDiagnosticsDone:
+@@ -33,11 +38,14 @@ laurel_halt_restart(unsigned int type)
+ 		 * laurel 2005: the panic log is complete. With debug=0x4 (DB_NMI)
+ 		 * XNU never sends kPEPanicRestartCPU and spins for ever, so the
+ 		 * USB panic hold starts here: console ring to the host, commands.
++		 * laurel 2900: first the ring + panic header into the boot log slot.
+ 		 */
++		laurel_bootlog_panic();
+ 		laurel_usb_panic_hold();        /* returns only without USB */
+ 		return 0;
+ 	case kPEPanicRestartCPU:
+ 	case kPEPanicRestartCPUNoCallouts:
++		laurel_bootlog_panic();         /* once per boot (no-op if done at DiagnosticsDone) */
+ 		laurel_usb_panic_hold();        /* returns only without USB */
+ 		laurel_restart();
+ 		return -1;

@@ -4,7 +4,7 @@
  *   usbreboot [-n] [-f] bootloader|fastboot|recovery|normal
  *
  * A reboot mode other than "normal" needs kernel support: a writable string sysctl
- * kern.negroni_reboot_mode (or kern.sweet_reboot_mode, the bergamota interface of its patch
+ * kern.negroni_reboot_mode (or kern.laurel_reboot_mode, Mi A3 patch 2003, or kern.sweet_reboot_mode, the bergamota interface of its patch
  * 0137) that the kernel's restart path turns into the PMIC/IMEM reboot reason. The negroni
  * kernel (slop patches, 2026-10-24) has no such sysctl and no restart handler at all, so
  * reboot(2) may stop at "MACH Reboot". Without the sysctl the tool refuses unless -f is given.
@@ -20,7 +20,7 @@
 
 #define RB_AUTOBOOT 0	/* <sys/reboot.h>, not in the iPhoneOS SDK */
 
-static const char *names[] = { "kern.negroni_reboot_mode", "kern.sweet_reboot_mode" };
+static const char *names[] = { "kern.negroni_reboot_mode", "kern.sweet_reboot_mode", "kern.laurel_reboot_mode" };
 
 int
 main(int argc, char **argv)

@@ -4612,3 +4612,44 @@ Details: docs/laurel_sprout/gpu.md "GPU clock by demand", battery-power.md "CPU 
 - Gotcha: patch numbers: another branch took 2880-2886 during this work; check `git fetch` before numbering. Gotcha: laurel_thermal.c passed 300 lines: split into headers.
 - Honest limit [I]: frames cost 9 ms of CPU (3 in GL calls, 6 outside) per the profile lines: CoreAnimation, Mesa, metal2vulkan on A73 at 2016 MHz. No clock change in this round touches that part except by holding Gold up. See plan.md.
 - Next: boot, read the lines, then decide: PLL levels (busy > 60 % at 600), RPM scaling (DDR low and no follow), PSCI idle states (power).
+
+## Mi A3 area I (kernel infra, debug channel, generic negroni ports) 2026-11-01 04:10-04:50
+
+Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected lines: docs/laurel_sprout/usb-debug.md
+"Patches 2900-2906"). All built (226 patches, 0 LSE), none booted.
+- [V code] Cause of the missing early lines in the live log: raw frames were sent after a 10 s wait also without a sign of
+  the host (the host has no 192.168.7.1 yet: dropped), the ue0 thread started at the last 64 KiB, and a failed `sock_send`
+  lost its chunk. Fix 2900: wait for any frame from 192.168.7.1, start at byte 0, keep the bytes on a failed send, 1 MiB
+  head buffer, `ctl log` = everything.
+- [V code] Boot log = negroni 0367 layout at userdata N-28673, so `op10tool bootlog` needs no change. Its only safety
+  check on the Mi A3 is the HFS+ volume end (no WLAN area anchor as on negroni). The superblock is written at the first
+  boot with 2900 (8 slot headers zeroed): the area lies about 92 GiB behind the 16 GiB root, inside userdata only.
+- [V code] SweetPlatformExpert had no getUTCTimeOfDay: the calendar was the epoch + uptime until timed set it. 2901 reads the
+  PM6125 RTC (PPID 0x060, observer channel) and keeps an offset file /private/var/db/laurel_rtc.
+- [V log 03:58/03:59] Sandbox denials on the Mi A3: 1002 (logd, cloudd, healthd, rapportd, aggregated, symptomsd),
+  1007 SpringBoard, 12000/12001 identityservicesd + rapportd, 10001 cloudd/dasd/kernel_task, 10003 symptomsd, 1005 dasd;
+  tccd op 5. 2903 grants 1002/1007/12000 and ops 5/6 (the negroni set); the others stay denied.
+- [V build] The SSH userland builds on Linux: stock clang + theos ld64/ldid + theos/sdks iPhoneOS16.5 (pinned). Pitfalls:
+  toybox uses `--gc-sections` when the build host is not Darwin; GNU ar archives are ignored by ld64; the theos cctools
+  `ar` calls a missing `aarch64-apple-darwin14-ranlib` (use theos llvm-ar/llvm-ranlib).
+- [I] 0288 cpuidle not ported: trinket lpm-levels C3 = CPU_SUSPEND 0x40000003, needs a broadcast timer and a GICR
+  re-init on resume; too risky without a boot test (facts in usb-debug.md).
+- Phone needs (coordinator): one boot of the 2900-2906 kernel with usblog running; check the lines listed in
+  usb-debug.md; `op10tool ctl time`, `op10tool bootlog`; reboot once with `op10tool ctl reboot` and check the
+  `earlier boot 1 (slot 0): restart` line; for SSH: a root rebuilt with `scripts/laurel/root.sh` (out/ssh/ios present)
+  and flashed (owner approval: userdata), then `scripts/laurel/phone-ssh.sh 'uname -a'`.
+
+## Mi A3 system features (2026-11-01 20:45, branch t3/laurel-system-features; table: docs/laurel_sprout/system-features.md)
+
+- [V] A built root can be read without sudo: `7z l -ba ~/op10-apple/laurel-ios16-root.img` (paths start with `iOSRoot/`), `7z x ... iOSRoot/System/Library/xpc/launchd.plist`. Stock files: apfs-fuse as the user on a `.dmg` symlink.
+- [V] The boot logs have NUL bytes: use `grep -a`, or grep prints nothing.
+- [V] 20H392: 32 apps in staged_system_apps (487 MiB, 102 extensions), 141 in /Applications. The laurel root.sh had no staged step. launchd's AppExtensions cache has no staged path; negroni shows the extensions run from /Applications anyway (ExtensionKit flag off).
+- [V] launchd.plist of the 19:51 root: 10 stock jobs removed, 1 added (com.laurel.metal-gate). wifip2pd and nanotimekitcompaniond have no RunAtLoad/KeepAlive: clients and events start them, so their "loop" stops when the job is out.
+- [V] priv numbers: 10001 = NET_PRIVILEGED_SOCKET_DELEGATE (not traffic class), 10003 = NETWORK_STATISTICS, 12001 = SKYWALK_REGISTER_KERNEL_PIPE, 1003 = SYSTEM_OVERRIDE. Each daemon has the entitlement a real kernel asks for: `strings` of the binary shows it.
+- [V] CRASH `reason ns 1 code 7` = jetsam, process limit (driverkitd). `ns 2 code 6` = signal 6.
+- [V] syncdefaultsd and webbookmarksd die in `_objc_terminate`: an uncaught NSException; the text goes to os_log, not to the kernel log. Read it over SSH. [I] syncdefaultsd has a `getpwuid` fallback for its Library directory, so the nil of scion's message comes from elsewhere. webbookmarksd calls sandbox_container_path_for_pid in main, only for HOME: not the cause.
+- [V] bluetoothd's plist holds com.apple.BTAudioHALPlugin.xpc. The negroni trap came with bluetoothd absent. Not tested with it present, so the plug-in stays off by default.
+- [V] 2905 as written held the 200 us USB poll whenever usblog ran (every TX and event set last_active). Changed: only a received frame or an enumeration event sets it.
+- [I] Kernel-only rebuild here: 37 s with a reflink copy of main's deps/dl/theos/cache (`cp -a --reflink=always`, btrfs); AUDIT=1 leaves the patched tree in out/laurel-kernel/xnu-src.
+- Not done: gestalt answers on the phone (which of Phone, FaceTime, Compass, Watch, Measure show) [U]; the root build (sudo); no boot.
+

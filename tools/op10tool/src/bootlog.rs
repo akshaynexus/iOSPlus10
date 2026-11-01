@@ -3,7 +3,8 @@
 //!
 //! Area (userdata blocks N-28673 .. N-19458, 4096-byte blocks): block 0 = superblock "NEGRBLOG"; slot i at
 //! block 1 + i*1025 = header block "NEGRBOOT" + the 4 MiB console ring of that boot (byte n at ring offset
-//! n % 4 MiB). The layouts below must match struct nbl_super / struct nbl_slot in bsd/dev/negroni_ufs.c.
+//! n % 4 MiB). The layouts below must match struct nbl_super / struct nbl_slot in bsd/dev/negroni_ufs.c
+//! (and in bsd/dev/sweet_ufs.c of the Mi A3 kernel, patches/laurel/xnu/2900: the same layout and protocol).
 //!
 //! Sources: the USB command server (UDP 5141: "bootlog", "bootlog read A C"; works on a good boot without SSH),
 //! or `--file` with a dump of the area (`dd if=/dev/negronibootlog` over SSH: scripts/debug/bootlog-ssh.sh, or
@@ -393,7 +394,7 @@ pub fn run(a: Args) -> Result<()> {
         let kern = if s.uuid.is_empty() { None } else { kernel_by_uuid(&a.kernels, &s.uuid) };
         let path = a.out.join(format!("bootlog-{}.txt", s.boot));
         let mut head = String::new();
-        head += &format!("# NEGRONI boot log: boot {} (slot {}), state {}, {} flushes\n", s.boot, s.index, state_name(s.state), s.seq);
+        head += &format!("# boot log: boot {} (slot {}), state {}, {} flushes\n", s.boot, s.index, state_name(s.state), s.seq);
         head += &format!("# end: {end}\n");
         head += &format!(
             "# start {} UTC (phone clock), last flush {} UTC = uptime {:.1} s; SpringBoard {}; end mark at {}\n",
@@ -406,7 +407,7 @@ pub fn run(a: Args) -> Result<()> {
         head += &format!("# kernel UUID {}{}\n", s.uuid, kern.as_ref().map_or(String::new(), |p| format!(" = {}", p.display())));
         head += &format!("# kernel version {}\n", s.kversion);
         head += &format!("# boot-args {}\n", s.bootargs);
-        head += &format!("# PMIC PON log at this power-on (why the boot before ended): {}\n", if s.pon.is_empty() { "-" } else { &s.pon });
+        head += &format!("# PMIC PON at this power-on (why the boot before ended): {}\n", if s.pon.is_empty() { "-" } else { &s.pon });
         if let Some(n) = next {
             head += &format!("# PMIC PON log at the next power-on (boot {}): {}\n", n.boot, if n.pon.is_empty() { "-" } else { &n.pon });
         }

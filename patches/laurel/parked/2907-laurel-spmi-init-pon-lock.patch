@@ -1,0 +1,139 @@
+laurel 2907: sweet_spmi.c init once under a mutex, PON lane under a spinlock (review M2 of area I).
+
+- sweet_spmi_init(): the body moves to sp_init_locked(), called once under a static mutex; sp_ready is set last
+  (release) and read with acquire, so the platform expert (reboot self-check), SweetBattery and the boot log header
+  (2900) cannot race on sp_attempted/sp_ready. The public API is unchanged.
+- sweet_spmi_pon_read/_write: interrupts off + a spinlock around the one SPMI command (users: thread context, the USB
+  timer call, the panic hold). In a panic only a try-lock: a holder on a stopped CPU makes the PON access fail
+  (the reset still happens, without the ABL reason), it does not hang.
+- Kept apart from area D (2300, sweet_spmi.c battery/charger): this patch touches only the init function and the
+  two PON functions.
+
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 8868609..2d2bf2c 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -10,6 +10,8 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <kern/locks.h>             /* laurel 2907 */
++#include <kern/debug.h>             /* laurel 2907: panic_active() */
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -63,12 +65,56 @@ sp_find_apid(unsigned ppid)
+ 	return found;
+ }
+ 
++/*
++ * laurel 2907: one init under a mutex (callers: the platform expert's reboot
++ * self-check, SweetBattery, the boot log header in sweet_ufs.c); sp_ready is
++ * published last. The PON lane takes a spinlock with interrupts off (users:
++ * thread context, the USB timer call, the panic hold; in a panic only a
++ * try-lock: a holder on a stopped CPU makes the PON access fail, not hang).
++ */
++static LCK_GRP_DECLARE(sp_lck_grp, "sweet_spmi");
++static LCK_MTX_DECLARE(sp_init_mtx, &sp_lck_grp);
++static LCK_SPIN_DECLARE(sp_pon_spin, &sp_lck_grp);
++static int sp_init_locked(void);
++
+ int
+ sweet_spmi_init(void)
+ {
+-	if (sp_attempted) {
+-		return sp_ready ? 0 : -1;
++	if (__atomic_load_n(&sp_ready, __ATOMIC_ACQUIRE)) {
++		return 0;
+ 	}
++	lck_mtx_lock(&sp_init_mtx);
++	int rc = sp_attempted ? (sp_ready ? 0 : -1) : sp_init_locked();
++	lck_mtx_unlock(&sp_init_mtx);
++	return rc;
++}
++
++/* Interrupts off + the PON lane spinlock. false: busy in a panic (no access). */
++static bool
++sp_pon_lock(boolean_t *istate)
++{
++	*istate = ml_set_interrupts_enabled(FALSE);
++	if (panic_active()) {
++		if (!lck_spin_try_lock(&sp_pon_spin)) {
++			ml_set_interrupts_enabled(*istate);
++			return false;
++		}
++	} else {
++		lck_spin_lock(&sp_pon_spin);
++	}
++	return true;
++}
++
++static void
++sp_pon_unlock(boolean_t istate)
++{
++	lck_spin_unlock(&sp_pon_spin);
++	ml_set_interrupts_enabled(istate);
++}
++
++static int
++sp_init_locked(void)
++{
+ 	sp_attempted = true;
+ 	sp_lock = IOLockAlloc();
+ 	if (!sp_lock) {
+@@ -89,11 +135,11 @@ sweet_spmi_init(void)
+ 		    arb_version, sp_count);
+ 		return -1;
+ 	}
+-	sp_ready = true;
+ 	sp_pon_apid = sp_find_apid(SP_PON_PPID);
+ 	if (sp_pon_apid != SP_NO_APID) {
+ 		sp_pon_rw = ml_io_map(SP_RW_PA + 0x10000u * sp_pon_apid, 0x1000);
+ 	}
++	__atomic_store_n(&sp_ready, true, __ATOMIC_RELEASE);     /* laurel 2907: last */
+ 	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads; PON APID %u rw lane %s\n",
+ 	    arb_version, sp_count, sp_pon_apid, sp_pon_rw ? "mapped" : "none");
+ 	return 0;
+@@ -120,14 +166,19 @@ sweet_spmi_pon_read(unsigned addr, uint8_t *out)
+ 		return -1;
+ 	}
+ 	unsigned off = 0x80u * sp_pon_apid;
++	boolean_t istate;
++	if (!sp_pon_lock(&istate)) {
++		return -1;
++	}
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(sp_obs + off) = (1u << 27) | ((addr & 0xffu) << 4); /* EXT_READL, 1 byte */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+-	if (sp_pon_wait(sp_obs, off) != 0) {
+-		return -1;
++	int rc = sp_pon_wait(sp_obs, off);
++	if (rc == 0) {
++		*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+ 	}
+-	*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+-	return 0;
++	sp_pon_unlock(istate);
++	return rc;
+ }
+ 
+ int
+@@ -136,11 +187,17 @@ sweet_spmi_pon_write(unsigned addr, uint8_t val)
+ 	if (!sp_ready || !sp_pon_rw || (addr >> 8) != SP_PON_PPID) {
+ 		return -1;
+ 	}
++	boolean_t istate;
++	if (!sp_pon_lock(&istate)) {
++		return -1;
++	}
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 	*(volatile uint32_t *)(sp_pon_rw + 0x10u) = val;                               /* WDATA0 */
+ 	*(volatile uint32_t *)(sp_pon_rw + 0x00u) = (0u << 27) | ((addr & 0xffu) << 4); /* EXT_WRITEL, 1 byte */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+-	return sp_pon_wait(sp_pon_rw, 0);
++	int rc = sp_pon_wait(sp_pon_rw, 0);
++	sp_pon_unlock(istate);
++	return rc;
+ }
+ 
+ int

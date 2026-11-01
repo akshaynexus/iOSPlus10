@@ -1,0 +1,40 @@
+laurel 2902: UFS reports solid state to HFS (port of negroni 0204 bit 0).
+
+DKIOCISSOLIDSTATE = 1: HFS sets HFS_SSD, so no file relocation on open and no hot-file clustering on flash.
+Line "LAUREL SSD: on: ..." at the first query (HFS mount); kill switch laurelssd=0. Bit 1 of 0204 (hfs_clonefile
+fix) is 16 KiB-page only: the Mi A3 kernel has 4 KiB pages.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 06559bd..7f0bf7f 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -688,6 +688,29 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+ 		*o = 1;
+ 		return 0;
++	case DKIOCISSOLIDSTATE: {
++		/*
++		 * laurel 2902 (port of negroni 0204 bit 0): UFS is flash. Without
++		 * this HFS treats the root as a hard disk (no HFS_SSD): it relocates
++		 * ("defragments") fragmented files on open and runs hot-file
++		 * clustering, extra writes and CPU on flash for nothing. Negroni's
++		 * bit 1 (hfs_clonefile on 16 KiB pages) is not needed: this kernel
++		 * has 4 KiB pages. Kill switch: laurelssd=0.
++		 */
++		static int on = -1;
++		if (on < 0) {
++			int v = 1;
++			PE_parse_boot_argn("laurelssd", &v, sizeof(v));
++			on = v != 0;
++			printf("LAUREL SSD: %s\n", on ? "on: UFS reports solid state (HFS: no file relocation, no hot files)" :
++			    "off: laurelssd=0");
++		}
++		if (!on) {
++			return ENOTTY;
++		}
++		*f = 1;
++		return 0;
++	}
+ 	default:
+ 		return ENOTTY;
+ 	}

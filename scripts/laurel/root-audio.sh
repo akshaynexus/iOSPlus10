@@ -12,9 +12,10 @@
 #  2. VirtualAudio.plugin back from /Library/Audio/Plug-Ins/HAL.disabled (topaz's sweet-root-tweaks.py
 #     moves it there because without our "Speaker" + "Hawking" devices it crashed mediaserverd; with
 #     them it is what routes system sounds and ringtones to the speaker port)
-#  3. BTAudioHALPlugin.driver to /System/Library/Audio/Plug-Ins/HAL.disabled (no Bluetooth stack on
-#     the Mi A3; its factory's XPC to com.apple.BTAudioHALPlugin.xpc trapped mediaserverd on negroni,
-#     scripts/audio/root-add-audio.sh)
+#  3. BTAudioHALPlugin.driver to /System/Library/Audio/Plug-Ins/HAL.disabled: its factory's XPC to
+#     com.apple.BTAudioHALPlugin.xpc trapped mediaserverd on negroni, where bluetoothd was absent (scripts/audio/root-add-audio.sh).
+#     The Mi A3 root has bluetoothd now, which holds that service [V its plist], but no port has run the plug-in with it, and a
+#     trap stops all audio and the camera. BTAUDIO=1 keeps the plug-in in HAL: the test in docs/laurel_sprout/system-features.md.
 # Undo: delete the driver, move the two plug-ins back.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -98,7 +99,10 @@ fi
 # 3. BTAudioHALPlugin off
 BT=$HAL/BTAudioHALPlugin.driver
 BTOFF=$R/System/Library/Audio/Plug-Ins/HAL.disabled/BTAudioHALPlugin.driver
-if [ -d "$BT" ]; then
+if [ "${BTAUDIO:-0}" = 1 ]; then
+  if [ -d "$BTOFF" ] && [ ! -e "$BT" ]; then mv "$BTOFF" "$BT"; fi
+  echo "root-audio: BTAudioHALPlugin.driver stays in HAL (BTAUDIO=1)"
+elif [ -d "$BT" ]; then
   mkdir -p "$(dirname "$BTOFF")"
   rm -rf "$BTOFF"
   mv "$BT" "$BTOFF"
