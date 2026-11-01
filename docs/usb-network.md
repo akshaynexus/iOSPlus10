@@ -36,8 +36,20 @@ same time. Output `out/ssh/ios/`: `dropbearmulti` (dropbear, dropbearkey, dbclie
 `dash`, `toybox` (136 applets, list in `toybox.applets`), `usbnetcfg`, `usbreboot`, `oslogstream`,
 `SHA256SUMS`.
 
-Linux cannot build the iOS binaries (no iPhoneOS SDK). Copy `out/ssh/ios/` (and optionally
-`out/ssh/hostkeys/`) from a Mac; everything else (install, NAT, ssh) works on Linux.
+## Build (Linux x86_64, 2026-11-01)
+
+```sh
+scripts/bg.sh ssh-build sh -c 'userland/ssh/fetch.sh && userland/ssh/fetch-sdk.sh && userland/ssh/build.sh'
+```
+
+The same `build.sh`: stock clang compiles (`-target arm64-apple-ios16.0`), the theos toolchain that
+`scripts/laurel/kernel-linux.sh` installs (`out/laurel-kernel/theos`, or `THEOS=DIR`) links and checks
+(ld64 via `--ld-path`, lipo, otool, nm, strip, llvm-ar/llvm-ranlib for Darwin archives) and signs (`ldid -S`,
+XML + DER entitlements). SDK: iPhoneOS16.5.sdk from theos/sdks at a pinned commit (`userland/ssh/fetch-sdk.sh`
+-> `out/ssh/sdk/`, sparse clone of one directory; `IOS_SDK=DIR` for another). `out/ssh/host/` then holds Linux
+builds (dropbearkey for the host key at install time). Two Linux-host quirks handled in build.sh: toybox picks
+`--gc-sections` by the build host's `uname` (the iOS target gets `LDOPTIMIZE=-Wl,-dead_strip` and the Mach-O
+strip), and GNU `ar` archives are ignored by ld64.
 
 ### Build details
 

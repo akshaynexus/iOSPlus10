@@ -10,6 +10,12 @@ mechanically: each port is re-written on the topaz files as `patches/laurel/xnu/
 
 ## Port order
 
+Status 2026-11-01 (area I, merged by t3/laurel-system-features, built, not booted; parked in patches/laurel/parked/: 2900, 2901, 2907;
+system-features.md section 4): 0200 = 2000; 0388/0390 = 2002/2001;
+0211/0213/0214 = 2003/2018; 0367 + 0210/0360 USB = 2005 + 2900 (parked); 0203 + 0212 = 2720 (2901 parked); 0204 bit 0 = 2902; 0222 + 0386 = 2903 + 2910;
+0220 + 0221-aks-passcode = 2904; 0361 (poll only) + 0382 (USB poll only) + 0366 (reset ENDTRANSFER only) = 2905;
+0399 = 2906 (surfaces; GPU hooks open). Open: 0288 (trinket lpm-levels facts in usb-debug.md), 0361 ring, 0366 watchdog.
+
 | # | negroni | What | Why on the Mi A3 | topaz file |
 | --- | --- | --- | --- | --- |
 | 1 | 0200 | no IORTC wait | topaz waits 30 s for IORTC on every boot (topaz NOTES.md:216) | `iokit/Kernel/IOStartIOKit.cpp` |

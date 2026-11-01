@@ -1,6 +1,9 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+System features round (2026-11-01 20:45, branch t3/laurel-system-features, built + dry run, NOT BOOTED, root not built: needs sudo): owner "a lot of system apps and features are disabled".
+Main cause [V 7z of the 19:51 root]: root.sh never moved the 32 staged Apple apps (Calendar, Clock, Mail, Notes, Maps, Weather, ...) to /Applications; negroni and the other ports do. Done: root-system-features.py (32 apps; aggregated back = power log for Settings > Battery, limit 32 MiB), kernel 2910 (priv 10001, 12001, 1003 by entitlement), infra merge: 2902, 2904 (AKS selectors + passcode), 2905 (poll rule changed: the live log alone does not hold 200 us), 2906, SSH userland; parked 2900, 2901, 2907 (patches/laurel/parked). Stays off with reasons: CommCenter, vmd, fairplayd.H2, syncdefaultsd, activityawardsd, nanotimekit, wifip2pd, ReportCrash, spindump, tailspind, addaily, BTAudio (BTAUDIO=1).
+Results [V]: 291/291 patches, 0 LSE, kernel sha256 a60e5633...; root-dry-run.sh PASS: 532 -> 520 jobs, 173 apps, 0 staged. Next: root.sh + flash (owner), boot; read `laurel system:` lines, `LAUREL SANDBOX: ... entitled`, `LAUREL AKS:`, count the icons, Settings > Battery, `LAUREL CPU TOP` for aggregated. Table, costs, test steps: docs/laurel_sprout/system-features.md.
 Real-GPU round (2026-11-01 19:30, branch t3/laurel-metal-realgpu, built, NOT BOOTED): boot 18:40 = first Metal on the GPU; owner: home wallpaper black.
 Most likely cause [I]: default wallpaper 7400 is HEIC layers, no HEVC decoder here (ios-flame found the same black layer) -> root-wallpaper.sh writes PNGs. Also: launchd's 5 s extension
 kill loop (AegirPoster) -> boot-arg launchd_disable_all_timeouts=1, poster strike rule; device open 3-10 s [I flat lookups of 3312 weak imports] -> macho-weak-self.py;
@@ -927,3 +930,26 @@ What "fully" can mean on this GPU [I]:
 | Dropping 3 jobs | Under 2 % of a Gold core; idle power | - |
 Stays CPU-bound [V profile lines + I]: about 9 ms of CPU per frame (3 in GL, 6 outside: CoreAnimation), "handing on" 2.4-5.7 ms, metal2vulkan encode and shader translation, first-use shader compile. A clock raise does not remove these; the GPU rarely holds the CPU back ("waiting" 0.5-0.9 ms). Metal "fully" is not a clock matter: 8 of 21 QuartzCore shader pairs and 4 of 7 kernels still fail in m2vtest (19:36:55) [V], which metal.md tracks.
 Next: kernel + root + boot image, owner test (gpu.md and battery-power.md "Test"). Then decide from the lines: PLL levels, RPM scaling, PSCI idle states.
+
+## Mi A3 area I: debug channel, calendar, generic negroni ports (2026-11-01 04:50) [built, not booted]
+
+Done [V build]: patches 2900 (console head buffer, live log from byte 0 after the host's first frame, `ctl log` = all,
+boot log area N-28673 in the negroni 0367 format with `bootlog`/`bootlog read` and /dev/laurelbootlog, panic + end marks),
+2901 (PM6125 RTC calendar, saved offset, USB `settime`/`time`), 2902 (UFS solid state), 2903 (sandbox privileges
+1002/1007/12000 + extension tokens), 2904 (negroni AppleKeyStore: missing selectors + software passcode), 2905 (USB poll
+200 us / 4 ms / 20 ms, TX queue 128, ENDTRANSFER at bus reset), 2906 (wired guard for IOSurfaces). Kernel 226 patches,
+applied=226, 0 LSE. Host: userland/ssh builds on Linux (fetch-sdk.sh + build.sh), root.sh installs SSH, phone-ssh.sh,
+log-pull.sh reads the boot log area, op10tool texts. Not done: 0288 cpuidle, 0361 ring, 0366 watchdog.
+Next (coordinator, phone): boot it; check the LAUREL BOOTLOG/CALENDAR/SANDBOX/AKS/USB POLL/WIRED/SSD lines and that the live
+log starts with the first kernel line; `op10tool bootlog`; rebuild the root with SSH and flash it (owner approval).
+
+### Area I review fixes (2026-11-01, rebased on laurel-int-1)
+
+M1 live-log burst limit (half the TX queue, 1 ms per 32 datagrams; ctl replies keep room), M2 patch 2907 (SPMI init
+mutex, PON spinlock, try-lock in panic), M3 wired guard: backboardd/SpringBoard exempt, 55 % of the 2100 window
+(3264 MiB -> 1795 MiB), m4 flush retry time, m5 `bootlog read` try-lock + busy replies, m6 phone-ssh.sh exit code,
+m7 tuning boot-args removed (laurelrtcoff, laurelusb_pollus/_idle_ms/_nohost_ms, laurelaks bit mask, laurelaks_log);
+new kill switches laurelusb_poll=0, laurelaks_passcode=0. **Owner-approval exception to the "=0 kill switch only" rule:
+`laurelaks_reset=1`** (2904): ignores the stored software passcode for one boot, the only way back into a phone
+whose passcode is lost (no SEP, no other reset path). m9 TODO: RTC lane into sweet_spmi.c after area D merges.
+m10 host-wait behaviour documented in usb-debug.md.

@@ -2,9 +2,11 @@
 # Build the Mi A3 (laurel_sprout) iOS 16.7.16 root for userdata (rd=ufsroot0) on Linux, as a sparse image.
 #   scripts/bg.sh laurel-root sudo scripts/laurel/root.sh       (needs root: loop mounts, apfs-fuse, rsync -aH)
 # Input: $APPLE/20H392/*.dmg (scripts/ios16/fetch-dmgs.sh, op10tool ipsw-get; default APPLE=~/op10-apple).
+# SSH=1 (default, when out/ssh/ios exists): dropbear + tools (scripts/net/root-add-ssh.sh); SSH=0: none.
 # Steps: 1. external/ios-topaz/tools/mkiosroot.sh (case-sensitive journaled HFS+, OS + SystemOS/AppOS cryptexes,
 #        dyld cache link, plain system keybag); 2. topaz sweet-root-tweaks.py (build 20H392 fixes, launchd,
-#        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped) and
+#        CommCenter drop, Setup, migration) + negroni root-tweaks-extra.py (vmd etc. dropped), root-tweaks-perf.py (restart-loop jobs),
+#        root-system-features.py (32 staged apps to /Applications, aggregated back; docs/laurel_sprout/system-features.md) and
 #        root-tweaks-boldtext.py, root-add-gpu.sh (GPU), root-add-metal.sh (Metal, METAL=0 skips), root-audio.sh
 #        (speaker HAL plug-in; AUDIO=0 skips), root-bt.sh (Bluetooth userland; BT=0 skips), root-camera.sh (sensor tables, NegroniCamera.driver;
 #        CAMERA=0 skips), root-statusbar.py
@@ -74,6 +76,9 @@ CA_HEARTBEAT=${CA_HEARTBEAT:-60} python3 -I "$REPO/scripts/ios16/root-tweaks-ext
 python3 -I "$REPO/scripts/ios16/root-tweaks-boldtext.py" "$mnt"
 # launchd jobs that only burn CPU on the Mi A3 (restart loops, docs/laurel_sprout/battery-power.md); PERF_DROP_JOBS= keeps them
 python3 -I "$REPO/scripts/laurel/root-tweaks-perf.py" "$mnt"
+# system apps and jobs back (docs/laurel_sprout/system-features.md): the 32 staged Apple apps to /Applications, aggregated (power log for
+# Settings > Battery) back with a 32 MiB limit. STAGED_APPS=0, RESTORE_JOBS= and AGGREGATED_JETSAM_MB= turn parts off.
+python3 -I "$REPO/scripts/laurel/root-system-features.py" "$mnt"
 # GPU user space (docs/laurel_sprout/gpu.md): Mesa + EAGL GL + backboardd loader + the phone's own GPU firmware, from
 # out/laurel/gpu/root (scripts/laurel/gpu-firmware.sh + gpu-userland.sh as the user first); skipped with a note when absent
 bash "$REPO/scripts/laurel/root-add-gpu.sh" "$mnt"
@@ -98,6 +103,13 @@ STATUSBAR=${STATUSBAR:-1} NOTCH=${NOTCH:-1} python3 -I "$REPO/scripts/laurel/roo
 TORCH=${TORCH:-1} bash "$REPO/scripts/laurel/root-flashlight.sh" "$mnt" || echo "$(ts) laurel-root: WARNING: root-flashlight.sh failed; root built without the flashlight" >&2
 # auto-brightness off: no ambient light sensor for iOS (kernel 2201; docs/laurel_sprout/brightness.md); BRIGHTNESS=0 skips
 BRIGHTNESS=${BRIGHTNESS:-1} python3 -I "$REPO/scripts/laurel/root-brightness.py" "$mnt"
+# SSH (dropbear on 192.168.7.2:22, dash, toybox, usbreboot, oslogstream; docs/usb-network.md) when the iOS
+# builds exist (userland/ssh/build.sh, Linux or macOS). SSH=0: none. Host key and known_hosts as root-add-ssh.py.
+if [ "${SSH:-1}" = 1 ] && [ -x "$REPO/out/ssh/ios/dropbearmulti" ]; then
+  SSH=1 sh "$REPO/scripts/net/root-add-ssh.sh" "$mnt"
+elif [ "${SSH:-1}" = 1 ]; then
+  echo "$(ts) laurel-root: SSH skipped: no out/ssh/ios (userland/ssh/fetch.sh, fetch-sdk.sh, build.sh)"
+fi
 sync
 umount "$mnt"
 

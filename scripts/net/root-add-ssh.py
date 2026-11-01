@@ -198,10 +198,15 @@ def login(root):
 
 
 def host_dropbearkey():
-    """A dropbearkey that runs on this host: out/ssh/host (macOS build) or one in PATH."""
-    mac = os.path.join(OUT, 'host', 'dropbearmulti')
-    if sys.platform == 'darwin' and os.access(mac, os.X_OK):
-        return [mac, 'dropbearkey']
+    """A dropbearkey that runs on this host: out/ssh/host (userland/ssh/build.sh: a macOS build on macOS,
+    a Linux build on Linux) or one in PATH."""
+    mine = os.path.join(OUT, 'host', 'dropbearmulti')
+    if os.access(mine, os.X_OK):
+        with open(mine, 'rb') as f:
+            magic = f.read(4)
+        if (sys.platform == 'darwin' and magic in (b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe')) or \
+           (sys.platform.startswith('linux') and magic == b'\x7fELF'):
+            return [mine, 'dropbearkey']
     exe = shutil.which('dropbearkey')
     return [exe] if exe else None
 
@@ -213,7 +218,7 @@ def hostkey(root):
     tool = host_dropbearkey()
     if not os.path.exists(src):
         if tool is None:
-            print('ssh: no host dropbearkey (macOS build in out/ssh/host, or dropbearkey in PATH): '
+            print('ssh: no host dropbearkey (out/ssh/host from userland/ssh/build.sh, or dropbearkey in PATH): '
                   'the phone generates its host key at the first connection (-R)')
             return False
         os.makedirs(HOSTKEYS, exist_ok=True)

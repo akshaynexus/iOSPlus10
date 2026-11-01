@@ -7,8 +7,11 @@
 //! host's clock (reply "ok settime ..."), `time` asks "time" (reply "time <s> rtc <counter> offset <n> source ...").
 //! Panic mode (patch 0360, patches/xnu/README-panic.md): after a panic the kernel still answers ping
 //! ("pong (panic)"), log, reboot, bootloader, recovery and poweroff (replies end in "(panic)").
-//! `log` makes the kernel send the last 64 KiB of its console to the live log (UDP 5140) again.
-//! `bootlog` (patch 0367) prints the boot log area and this boot's slot; `op10tool bootlog` fetches the logs.
+//! `log` makes the kernel send the last 64 KiB of its console to the live log (UDP 5140) again (Mi A3 kernel,
+//! patch 2900: the whole console from byte 0; the first 1 MiB of every boot is kept).
+//! `bootlog` (patch 0367; Mi A3 2900, same protocol) prints the boot log area and this boot's slot;
+//! `op10tool bootlog` fetches the logs. The Mi A3 (laurel) kernel speaks the same protocol (patches/laurel/xnu
+//! 2005, 2900, 2901; docs/laurel_sprout/usb-debug.md).
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -37,7 +40,7 @@ pub enum Command {
     Settime,
     /// Show the phone's calendar, RTC counter and offset (no change)
     Time,
-    /// Send the last 64 KiB of the console to the live log again (also after a panic, patch 0360)
+    /// Send the console to the live log again: negroni the last 64 KiB, Mi A3 (2900) all from byte 0 (also after a panic)
     Log,
     /// The USB gadget's counters: frames, bytes, TX drops, RX frames per poll, TX batch size (patch 0361)
     Usbstats,

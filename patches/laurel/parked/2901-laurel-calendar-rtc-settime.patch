@@ -1,0 +1,856 @@
+laurel 2901: calendar from the PM6125 RTC, USB settime/time (port of negroni 0203 + 0212).
+
+- bsd/dev/laurel_rtc.c: SweetPlatformExpert::get/setUTCTimeOfDay. PM6125 RTC_RW (SPMI SID 0, peripheral
+  0x60, qpnp-rtc: ctrl 0x6046 bit 7, seconds 0x6048..0x604b) read over the arbiter v5 observer channel of
+  its APID (trinket bases as laurel 2018), never written (DT qcom,qpnp-rtc-write = <0>). Wall = RTC +
+  offset; the offset of the last set (settimeofday / USB settime) is saved in /private/var/db/laurel_rtc
+  and applied in bsd_init before launchd. Floor: the kernel build date. One line
+  "LAUREL CALENDAR: on: PM6125 RTC ..." or "LAUREL CALENDAR: off: <reason> (...)". Kill switch laurelrtc=0.
+- IOKitInitializeTime waits (10 s max) for the platform expert, so the calendar is not the epoch.
+- Command server: "settime S[.U]" (usblog.sh sends it at every connect) and "time". In raw mode (before the
+  ue0 attach) the settime value is kept and set at the attach, plus the time since it came.
+
+Review fixes: m7 no offset boot-arg (laurelrtc=0 is the only switch); m9 TODO: move the RTC lane into sweet_spmi.c
+after area D (2300) merges.
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 77e54cc..8443b4f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -400,6 +400,7 @@ bsd/kern/kern_credential.c		standard
+ bsd/kern/kern_crossarch.c		standard
+ bsd/kern/kern_cs.c			standard
+ bsd/kern/sweet_amfi.c			standard
++bsd/dev/laurel_rtc.c			standard
+ 
+ # Apple OSS hfs-627.100.6, staged by xnu/patches/0026-stage-hfs.sh
+ bsd/sweet_hfs/core/BTree.c		optional sweet_hfs
+diff --git a/bsd/dev/laurel_rtc.c b/bsd/dev/laurel_rtc.c
+new file mode 100644
+index 0000000..0773001
+--- /dev/null
++++ b/bsd/dev/laurel_rtc.c
+@@ -0,0 +1,607 @@
++/*
++ * laurel 2901: calendar (wall-clock) time on the Mi A3 (SM6125, PM6125 RTC).
++ * Port of negroni 0203 (bsd/dev/negroni_rtc.c) and 0212 (USB settime).
++ *
++ * Before this file SweetPlatformExpert had no getUTCTimeOfDay(): the
++ * IOPlatformExpert default returns 0, clock_initialize_calendar() moved the
++ * "UTC" time up to the uptime, and userland saw 1970 until timed/NTP ran.
++ *
++ * Sources, in this order:
++ *  1. The PM6125 RTC (SPMI SID 0, RTC_RW peripheral 0x60, DT
++ *     qcom,pm6125_rtc_rw@6000 "qcom,qpnp-rtc"; qpnp-rtc.c: ctrl 0x6046 bit 7
++ *     = enabled, 32-bit little-endian seconds at 0x6048..0x604b). Read like
++ *     qpnp_read_wrapper(): the 4 bytes, then byte 0 again; a smaller byte 0
++ *     means a carry during the read, so read once more. The DT has
++ *     qcom,qpnp-rtc-write = <0>: like Linux and Android (time_daemon) this
++ *     code never writes the RTC. Wall time = RTC + the offset saved in
++ *     /private/var/db/laurel_rtc (below). (negroni's offset boot-arg is not
++ *     ported: review m7, boot-args are =0 kill switches only.)
++ *     The read uses the SPMI arbiter v5 observer channel of the RTC APID
++ *     (trinket: core 0x1c40000, observer 0x3e00000, config 0x1c0a000, as
++ *     sweet_spmi.c after laurel 2018), mapped here: the RTC lane is used by
++ *     nobody else.
++ *  2. A floor: the kernel build date (00:00 UTC of __DATE__, minus one day
++ *     for the build host's time zone), or the last saved wall time if that
++ *     is later. The calendar never starts below the floor.
++ *  3. A set from outside: settimeofday() (timed, date(1)), or the host over
++ *     USB (UDP 5141 "settime", sweet_usb.c). Both end in
++ *     clock_set_calendar_microtime() -> PESetUTCTimeOfDay() ->
++ *     laurel_rtc_set(): the new offset = time - RTC is kept in memory and
++ *     written (thread call) to /private/var/db/laurel_rtc as text. At the
++ *     next boot laurel_rtc_load_saved() (bsd_init, after the root mount,
++ *     before launchd) applies it. If the RTC went backwards (counter reset)
++ *     the offset is not used; the saved wall time is a floor then. A failed
++ *     write (read-only root) is tried again every 30 s, 60 times.
++ * Self-check: the RTC APID is found, the ctrl register reads with bit 7 set
++ * and the counter reads twice. One line: "LAUREL CALENDAR: on: ..." or
++ * "LAUREL CALENDAR: off: <reason> (build-date floor + uptime)". Kill switch:
++ * boot-arg laurelrtc=0 (no PMIC access; the floor and settime still work).
++ *
++ * TODO (review m9): after area D (patch 2300, sweet_spmi.c reads/writes for the
++ * battery and charger) is merged, move lc_map/lc_read8 into sweet_spmi.c as a
++ * lane like the PON one; the own mapping here only avoids a merge conflict.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/fcntl.h>
++#include <sys/proc.h>
++#include <sys/mount.h>
++#include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <sys/kauth.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/thread_call.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++void laurel_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs);
++void laurel_rtc_set(clock_sec_t secs, clock_nsec_t nsecs);
++void laurel_rtc_load_saved(void);
++int laurel_calendar_settime(uint64_t secs, uint32_t usecs, char *reply, size_t size);
++void laurel_calendar_describe(char *reply, size_t size);
++
++#define LC_CORE_PA      0x01c40000u     /* SPMI arbiter v5 core: version at 0, APID count at 4, map at 0x900 */
++#define LC_OBS_PA       0x03e00000u     /* observer channels, EE 0, 0x80 per APID */
++#define LC_CFG_PA       0x01c0a000u     /* owner table at 0x700, 4 * APID, bits 2:0 = owner EE */
++#define LC_RTC_PPID     0x060u          /* SID 0, RTC_RW 0x6000 */
++#define LC_RTC_CTRL     0x46u           /* 0x6046, bit 7 = RTC enabled */
++#define LC_RTC_READ     0x48u           /* 0x6048..0x604b, seconds, little endian */
++#define LC_RTC_ENABLE   0x80u
++#define LC_NO_APID      0xffffu
++
++#define LC_FILE         "/private/var/db/laurel_rtc"
++#define LC_MIN_TIME     1577836800ull   /* 2020-01-01: smaller "settime" values are refused */
++#define LC_MAX_TIME     4102444800ull   /* 2100-01-01 */
++#define LC_RETRY_S      30
++#define LC_RETRIES      60
++
++static LCK_GRP_DECLARE(lc_grp, "laurel_rtc");
++static LCK_MTX_DECLARE(lc_lock, &lc_grp);
++
++static struct {
++	bool        inited;
++	bool        rtc_ok;          /* the RTC is mapped, enabled and was read */
++	bool        lane_dead;       /* a command timed out: never use the lane again */
++	vm_offset_t core, obs, cfg;
++	uint32_t    apid;
++	uint64_t    floor;           /* seconds */
++	int64_t     offset;          /* wall = RTC + offset (rtc_ok) */
++	const char *source;          /* where the current time came from */
++	uint64_t    soft_wall_ns;    /* wall time at soft_abs: the clock without the RTC */
++	uint64_t    soft_abs;
++	bool        set_this_boot;
++	bool        root_ready;      /* laurel_rtc_load_saved() ran: the file may be written */
++	bool        dirty;           /* the file does not hold the current offset */
++	unsigned    retries;
++	bool        saved_valid;
++	int64_t     saved_offset;
++	uint64_t    saved_wall;
++	uint32_t    saved_rtc;
++	bool        saved_has_rtc;
++	thread_call_t persist_call;
++} lc = { .apid = LC_NO_APID };
++
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Wdate-time"
++static const char lc_build_date[] = __DATE__;
++#pragma clang diagnostic pop
++
++static int64_t
++lc_days_from_civil(int64_t y, int m, int d)
++{
++	/* H. Hinnant's days_from_civil */
++	y -= m <= 2;
++	int64_t era = (y >= 0 ? y : y - 399) / 400;
++	int64_t yoe = y - era * 400;
++	int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
++	int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++	return era * 146097 + doe - 719468;
++}
++
++/* __DATE__ ("Nov  1 2026") as days since 1970-01-01; -1 if it does not parse. */
++static int64_t
++lc_build_days(void)
++{
++	static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
++	const char *s = lc_build_date;
++	int m = 0, d = 0, y = 0;
++
++	for (int i = 0; i < 12; i++) {
++		if (strncmp(s, months + 3 * i, 3) == 0) {
++			m = i + 1;
++		}
++	}
++	for (int i = 4; i < 6; i++) {
++		if (s[i] >= '0' && s[i] <= '9') {
++			d = d * 10 + (s[i] - '0');
++		}
++	}
++	for (int i = 7; i < 11; i++) {
++		if (s[i] < '0' || s[i] > '9') {
++			return -1;
++		}
++		y = y * 10 + (s[i] - '0');
++	}
++	if (m == 0 || d < 1 || d > 31 || y < 2024) {
++		return -1;
++	}
++	return lc_days_from_civil(y, m, d);
++}
++
++static uint32_t
++lc_rd(vm_offset_t base, unsigned off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* One RTC_RW register byte over the observer channel (EXT_READL, 1 byte). 0 = done. */
++static int
++lc_read8(uint8_t reg, uint8_t *v)
++{
++	if (lc.lane_dead || lc.apid == LC_NO_APID) {
++		return -1;
++	}
++	unsigned off = 0x80u * lc.apid;
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(lc.obs + off) = (1u << 27) | ((uint32_t)reg << 4);
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t st = lc_rd(lc.obs, off + 0x08u);
++		if (st & 1u) {
++			if (st & 0x0eu) {
++				return -1;
++			}
++			*v = (uint8_t)lc_rd(lc.obs, off + 0x18u);
++			return 0;
++		}
++		delay(1);
++	}
++	lc.lane_dead = true;
++	printf("LAUREL CALENDAR: SPMI read of 0x60%02x timed out: RTC lane off for this boot\n", reg);
++	return -1;
++}
++
++/* The 32-bit seconds counter, as qpnp-rtc.c. 0 = done. Caller holds lc_lock. */
++static int
++lc_rtc_raw(uint32_t *secs)
++{
++	uint8_t b[4], again;
++
++	for (int tries = 0; tries < 2; tries++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (lc_read8((uint8_t)(LC_RTC_READ + i), &b[i]) != 0) {
++				return -1;
++			}
++		}
++		if (lc_read8(LC_RTC_READ, &again) != 0) {
++			return -1;
++		}
++		if (again >= b[0]) {
++			*secs = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static uint64_t
++lc_abs_ns(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns;
++}
++
++static uint64_t
++lc_soft_now_ns(void)
++{
++	return lc.soft_wall_ns + lc_abs_ns(mach_absolute_time() - lc.soft_abs);
++}
++
++static void
++lc_soft_set(uint64_t wall_ns)
++{
++	lc.soft_wall_ns = wall_ns;
++	lc.soft_abs = mach_absolute_time();
++}
++
++/* The RTC_RW APID: the map entry with this PPID, owner EE 0 preferred. Returns the reason or NULL. */
++static const char *
++lc_map(void)
++{
++	lc.core = ml_io_map(LC_CORE_PA, 0x2000);
++	lc.cfg = ml_io_map(LC_CFG_PA, 0x1000);
++	lc.obs = ml_io_map(LC_OBS_PA, 0x10000);
++	if (!lc.core || !lc.cfg || !lc.obs) {
++		return "SPMI mapping failed";
++	}
++	uint32_t ver = lc_rd(lc.core, 0), count = lc_rd(lc.core, 4) & 0x7ffu;
++	if (ver < 0x50000000u || ver >= 0x70000000u || count == 0 || count > 512) {
++		return "SPMI arbiter is not v5";
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t map = lc_rd(lc.core, 0x900u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != LC_RTC_PPID) {
++			continue;
++		}
++		if (lc.apid == LC_NO_APID || (lc_rd(lc.cfg, 0x700u + 4u * i) & 7u) == 0) {
++			lc.apid = i;
++		}
++	}
++	return lc.apid == LC_NO_APID ? "RTC_RW 0x6000 not in the SPMI APID map" : NULL;
++}
++
++static void lc_persist(thread_call_param_t p0, thread_call_param_t p1);
++
++/* Once, in thread context, under lc_lock: boot-args, floor, SPMI mapping, first RTC read. */
++static void
++lc_init(void)
++{
++	int enabled = 1;
++	uint8_t ctrl = 0;
++	uint32_t raw = 0;
++	char why[96] = "";
++
++	if (lc.inited) {
++		return;
++	}
++	lc.inited = true;
++	lc.persist_call = thread_call_allocate_with_options(lc_persist, NULL, THREAD_CALL_PRIORITY_LOW, 0);
++
++	int64_t days = lc_build_days();
++	lc.floor = days > 0 ? (uint64_t)(days - 1) * 86400ull : 1761955200ull;   /* 2025-11-01 */
++	(void)PE_parse_boot_argn("laurelrtc", &enabled, sizeof(enabled));
++
++	if (!enabled) {
++		strlcpy(why, "laurelrtc=0", sizeof(why));
++	} else {
++		const char *e = lc_map();
++		if (e != NULL) {
++			strlcpy(why, e, sizeof(why));
++		} else if (lc_read8(LC_RTC_CTRL, &ctrl) != 0 || lc_rtc_raw(&raw) != 0) {
++			snprintf(why, sizeof(why), "RTC_RW APID %u not readable", lc.apid);
++		} else if (!(ctrl & LC_RTC_ENABLE)) {
++			snprintf(why, sizeof(why), "RTC not enabled (ctrl 0x%02x)", ctrl);
++		} else {
++			lc.rtc_ok = true;
++		}
++	}
++
++	uint64_t t;
++	if (lc.rtc_ok) {
++		int64_t off = 0;
++		t = (uint64_t)((int64_t)raw + off);
++		lc.source = "RTC counter (no offset yet)";
++		if ((int64_t)raw + off < 0 || t < lc.floor) {
++			t = lc.floor;
++			lc.source = "build-date floor (RTC counter below it)";
++		}
++		lc.offset = (int64_t)t - (int64_t)raw;
++		printf("LAUREL CALENDAR: on: PM6125 RTC APID %u, ctrl 0x%02x, counter %u s; boot calendar %llu s from the %s, "
++		    "offset %lld; floor %llu (build %s)\n", lc.apid, ctrl, raw, t, lc.source, lc.offset, lc.floor, lc_build_date);
++	} else {
++		t = lc.floor;
++		lc.source = "build-date floor (no RTC)";
++		printf("LAUREL CALENDAR: off: %s (calendar = build-date floor %llu + uptime until settime/timed)\n", why, t);
++	}
++	lc_soft_set(t * NSEC_PER_SEC);
++}
++
++/* SweetPlatformExpert::getUTCTimeOfDay(): thread context. */
++void
++laurel_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs)
++{
++	uint32_t raw;
++	uint64_t ns;
++
++	if (!preemption_enabled() || ml_at_interrupt_context()) {
++		/* cannot block: the last value + the uptime, unlocked */
++		ns = lc.inited ? lc_soft_now_ns() : 0;
++		*secs = (clock_sec_t)(ns / NSEC_PER_SEC);
++		*nsecs = (clock_nsec_t)(ns % NSEC_PER_SEC);
++		return;
++	}
++	lck_mtx_lock(&lc_lock);
++	lc_init();
++	if (lc.rtc_ok && lc_rtc_raw(&raw) == 0) {
++		ns = (uint64_t)((int64_t)raw + lc.offset) * NSEC_PER_SEC;
++		lc_soft_set(ns);
++	} else {
++		ns = lc_soft_now_ns();
++	}
++	lck_mtx_unlock(&lc_lock);
++	*secs = (clock_sec_t)(ns / NSEC_PER_SEC);
++	*nsecs = (clock_nsec_t)(ns % NSEC_PER_SEC);
++}
++
++/* SweetPlatformExpert::setUTCTimeOfDay(), from clock_set_calendar_microtime(): may block. */
++void
++laurel_rtc_set(clock_sec_t secs, clock_nsec_t nsecs)
++{
++	uint32_t raw;
++	bool schedule;
++
++	if (!preemption_enabled() || ml_at_interrupt_context()) {
++		return;
++	}
++	lck_mtx_lock(&lc_lock);
++	lc_init();
++	int64_t before = lc.offset;
++	lc_soft_set((uint64_t)secs * NSEC_PER_SEC + nsecs);
++	if (lc.rtc_ok && lc_rtc_raw(&raw) == 0) {
++		lc.offset = (int64_t)secs - (int64_t)raw;
++		if (lc.offset - before > 1 || before - lc.offset > 1) {
++			printf("LAUREL CALENDAR: time set to %lu s: RTC %u, offset %lld (was %lld)\n",
++			    (unsigned long)secs, raw, lc.offset, before);
++		}
++	} else {
++		printf("LAUREL CALENDAR: time set to %lu s (no RTC: clock from the uptime)\n", (unsigned long)secs);
++	}
++	lc.source = "set (settimeofday or USB settime)";
++	lc.set_this_boot = true;
++	lc.dirty = true;
++	lc.retries = 0;
++	schedule = lc.root_ready && lc.persist_call != NULL;
++	lck_mtx_unlock(&lc_lock);
++	if (schedule) {
++		thread_call_enter(lc.persist_call);
++	}
++}
++
++/* "key value" lines of the file. */
++static void
++lc_parse(char *text)
++{
++	char *p = text;
++
++	lc.saved_valid = false;
++	lc.saved_has_rtc = false;
++	lc.saved_wall = 0;
++	lc.saved_offset = 0;
++	if (strncmp(p, "laurel-rtc 1\n", 13) != 0) {
++		return;
++	}
++	while (*p != 0) {
++		char *key = p;
++		while (*p != 0 && *p != ' ' && *p != '\n') {
++			p++;
++		}
++		if (*p != ' ') {
++			if (*p == '\n') {
++				p++;
++			}
++			continue;
++		}
++		*p++ = 0;
++		bool neg = *p == '-';
++		if (neg) {
++			p++;
++		}
++		uint64_t v = 0;
++		while (*p >= '0' && *p <= '9') {
++			v = v * 10 + (uint64_t)(*p++ - '0');
++		}
++		if (strcmp(key, "offset") == 0) {
++			lc.saved_offset = neg ? -(int64_t)v : (int64_t)v;
++			lc.saved_valid = true;
++		} else if (strcmp(key, "rtc") == 0) {
++			lc.saved_rtc = (uint32_t)v;
++			lc.saved_has_rtc = true;
++		} else if (strcmp(key, "wall") == 0) {
++			lc.saved_wall = v;
++		}
++		while (*p != 0 && *p != '\n') {
++			p++;
++		}
++		if (*p == '\n') {
++			p++;
++		}
++	}
++}
++
++/* bsd_init, after the root mount and before launchd: the saved offset (or wall time as a floor). */
++void
++laurel_rtc_load_saved(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	char buf[160];
++	int resid = 0, error;
++	uint64_t apply = 0;
++	uint32_t raw = 0;
++	bool schedule;
++
++	bzero(buf, sizeof(buf));
++	error = vnode_open(LC_FILE, FREAD, 0, 0, &vp, ctx);
++	if (error == 0) {
++		error = vn_rdwr(UIO_READ, vp, buf, sizeof(buf) - 1, 0, UIO_SYSSPACE, IO_NODELOCKED,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		(void)vnode_close(vp, FREAD, ctx);
++	}
++
++	lck_mtx_lock(&lc_lock);
++	lc_init();
++	lc.root_ready = true;
++	if (error == 0) {
++		lc_parse(buf);
++	}
++	clock_sec_t now_s;
++	clock_usec_t now_us;
++	clock_get_calendar_microtime(&now_s, &now_us);
++	const char *what;
++	if (error != 0) {
++		what = error == ENOENT ? "no saved offset yet (" LC_FILE ")" : "saved offset not readable";
++	} else if (!lc.saved_valid) {
++		what = "saved file not understood: ignored";
++	} else if (lc.set_this_boot) {
++		what = "time already set this boot: saved offset not used";
++	} else if (lc.rtc_ok && lc_rtc_raw(&raw) == 0 && (!lc.saved_has_rtc || raw >= lc.saved_rtc) &&
++	    (int64_t)raw + lc.saved_offset > 0) {
++		apply = (uint64_t)((int64_t)raw + lc.saved_offset);
++		what = "RTC + saved offset";
++		if (apply < lc.saved_wall || apply < lc.floor) {
++			apply = MAX(lc.saved_wall, lc.floor);
++			what = "saved wall time (RTC + saved offset below it)";
++		}
++	} else if (lc.saved_wall > (uint64_t)now_s) {
++		apply = lc.saved_wall;
++		what = lc.rtc_ok ? "saved wall time as floor (RTC went backwards: offset not used)" :
++		    "saved wall time as floor (no RTC)";
++	} else {
++		what = "saved wall time is not later than the clock: not used";
++	}
++	if (apply != 0 && apply <= (uint64_t)now_s + 1 && apply + 1 >= (uint64_t)now_s) {
++		apply = 0;      /* already right */
++	}
++	printf("LAUREL CALENDAR: %s: %s (calendar %lu s%s%llu)\n", LC_FILE, what, (unsigned long)now_s,
++	    apply ? " -> " : "", apply ? apply : 0ull);
++	schedule = lc.dirty && lc.persist_call != NULL;
++	lck_mtx_unlock(&lc_lock);
++
++	if (apply != 0) {
++		clock_set_calendar_microtime((clock_sec_t)apply, 0);   /* -> laurel_rtc_set() */
++		lck_mtx_lock(&lc_lock);
++		lc.source = "saved offset (" LC_FILE ")";
++		lc.dirty = !(lc.saved_valid && lc.offset == lc.saved_offset);
++		schedule = lc.dirty;
++		lck_mtx_unlock(&lc_lock);
++	}
++	if (schedule) {
++		thread_call_enter(lc.persist_call);
++	}
++}
++
++/* Thread call: write the offset file (dirty only), try again later on an error (read-only root). */
++static void
++lc_persist(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	char text[160];
++	uint32_t raw = 0;
++	int resid = 0;
++
++	lck_mtx_lock(&lc_lock);
++	if (!lc.dirty) {
++		lck_mtx_unlock(&lc_lock);
++		return;
++	}
++	bool has_rtc = lc.rtc_ok && lc_rtc_raw(&raw) == 0;
++	int64_t offset = lc.offset;
++	uint64_t wall = has_rtc ? (uint64_t)((int64_t)raw + offset) : lc_soft_now_ns() / NSEC_PER_SEC;
++	if (has_rtc) {
++		snprintf(text, sizeof(text), "laurel-rtc 1\noffset %lld\nrtc %u\nwall %llu\n", offset, raw, wall);
++	} else {
++		snprintf(text, sizeof(text), "laurel-rtc 1\noffset 0\nwall %llu\n", wall);
++	}
++	lc.dirty = false;
++	lck_mtx_unlock(&lc_lock);
++
++	int error = vnode_open(LC_FILE, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, S_IRUSR | S_IWUSR,
++	    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error == 0) {
++		error = vn_rdwr(UIO_WRITE, vp, text, (int)strlen(text), 0, UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++		if (error == 0) {
++			error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++		}
++		(void)vnode_close(vp, FWRITE, ctx);
++	}
++
++	lck_mtx_lock(&lc_lock);
++	if (error == 0) {
++		lc.saved_valid = true;
++		lc.saved_offset = offset;
++		lc.saved_wall = wall;
++		lc.saved_rtc = raw;
++		lc.saved_has_rtc = has_rtc;
++		printf("LAUREL CALENDAR: saved offset %lld (wall %llu) to %s\n", has_rtc ? offset : 0ll, wall, LC_FILE);
++	} else if (!lc.dirty) {
++		lc.dirty = true;
++		if (lc.retries++ < LC_RETRIES) {
++			if (lc.retries == 1) {
++				printf("LAUREL CALENDAR: %s not written (error %d): again every %d s\n", LC_FILE, error, LC_RETRY_S);
++			}
++			uint64_t deadline;
++			clock_interval_to_deadline(LC_RETRY_S, NSEC_PER_SEC, &deadline);
++			thread_call_enter_delayed(lc.persist_call, deadline);
++		} else {
++			printf("LAUREL CALENDAR: %s not written (error %d): giving up until the next set\n", LC_FILE, error);
++		}
++	}
++	lck_mtx_unlock(&lc_lock);
++}
++
++/* USB "settime <secs>[.<usecs>]". 0 = set; the reply text goes into reply. Thread context. */
++int
++laurel_calendar_settime(uint64_t secs, uint32_t usecs, char *reply, size_t size)
++{
++	clock_sec_t old_s;
++	clock_usec_t old_us;
++
++	if (secs < LC_MIN_TIME || secs >= LC_MAX_TIME || usecs >= USEC_PER_SEC) {
++		snprintf(reply, size, "error: time %llu out of range", secs);
++		return -1;
++	}
++	clock_get_calendar_microtime(&old_s, &old_us);
++	clock_set_calendar_microtime((clock_sec_t)secs, (clock_usec_t)usecs);
++	lck_mtx_lock(&lc_lock);
++	lc.source = "USB settime";
++	snprintf(reply, size, "ok settime %llu (was %lu, %s offset %lld)", secs, (unsigned long)old_s,
++	    lc.rtc_ok ? "RTC" : "no RTC,", lc.rtc_ok ? lc.offset : 0ll);
++	lck_mtx_unlock(&lc_lock);
++	printf("LAUREL CALENDAR: USB settime %llu.%06u (calendar was %lu.%06u)\n", secs, usecs,
++	    (unsigned long)old_s, old_us);
++	return 0;
++}
++
++/* USB "time": the calendar and its source. Thread context. */
++void
++laurel_calendar_describe(char *reply, size_t size)
++{
++	clock_sec_t s;
++	clock_usec_t us;
++	uint32_t raw = 0;
++
++	clock_get_calendar_microtime(&s, &us);
++	lck_mtx_lock(&lc_lock);
++	lc_init();
++	bool has_rtc = lc.rtc_ok && lc_rtc_raw(&raw) == 0;
++	if (has_rtc) {
++		snprintf(reply, size, "time %lu rtc %u offset %lld source %s", (unsigned long)s, raw, lc.offset, lc.source);
++	} else {
++		snprintf(reply, size, "time %lu rtc none source %s", (unsigned long)s, lc.source);
++	}
++	lck_mtx_unlock(&lc_lock);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fcaca16..af53493 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -129,6 +129,11 @@ extern void laurel_bootlog_info(char *buf, size_t size);
+ extern int laurel_bootlog_read(uint32_t blk, uint32_t count, void *dst, bool nowait);
+ extern void laurel_bootlog_end(unsigned kind, const char *why);
+ static char ud_ctl_why[48];             /* end text of the pending reset / power off */
++/* laurel 2901: calendar (bsd/dev/laurel_rtc.c) */
++extern int laurel_calendar_settime(uint64_t secs, uint32_t usecs, char *reply, size_t size);
++extern void laurel_calendar_describe(char *reply, size_t size);
++static volatile bool ud_settime_pending;        /* raw mode: applied at the ue0 attach */
++static uint64_t ud_settime_us, ud_settime_at;   /* host time (us) and mach time of its arrival */
+ static volatile uint64_t ud_log_sent;   /* console ring position that ud_log_thread has sent up to */
+ 
+ static int ud_panic_log(const char *fmt, ...) __printflike(1, 2);
+@@ -970,6 +975,12 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+  *   bootlog     one line: the boot log area and this boot's slot (2900)
+  *   bootlog read A C  area blocks A .. A+C-1 (C 1..4) as "NBLD" datagrams
+  *               (op10tool bootlog; ue0 mode only, not in raw or panic mode)
++ *   settime S[.U]  set the calendar to S seconds (+U us) since 1970 UTC
++ *               (laurel 2901, bsd/dev/laurel_rtc.c keeps the RTC offset);
++ *               reply "ok settime S (was ..., RTC offset N)". In raw mode
++ *               (before the ue0 attach) the value is kept and applied at
++ *               the attach (+ the time since it came).
++ *   time        reply "time S rtc R offset N source ..." (no change)
+  *   reboot      IMEM reason normal, PSCI SYSTEM_RESET (laurel_reboot.c)
+  *   bootloader  IMEM reason bootloader (ABL fastboot), then the reset
+  *   recovery    IMEM reason recovery, then the reset
+@@ -1143,6 +1154,49 @@ ud_parse_u32(const char **q, bool *ok)
+ 	return v;
+ }
+ 
++/* laurel 2901: "settime S[.U]" -> microseconds since 1970. false = malformed. */
++static bool
++ud_parse_settime(const char *cmd, uint64_t *us)
++{
++	const char *q = cmd + 8;
++	uint64_t secs = 0;
++	uint32_t usecs = 0, digits = 0;
++	bool ok = *q >= '0' && *q <= '9';
++	while (*q >= '0' && *q <= '9' && secs < 100000000000ull) {
++		secs = secs * 10 + (uint64_t)(*q++ - '0');
++	}
++	if (*q == '.') {
++		for (q++; *q >= '0' && *q <= '9'; q++) {
++			if (digits < 6) {
++				usecs = usecs * 10 + (uint32_t)(*q - '0');
++				digits++;
++			}
++		}
++		for (; digits < 6; digits++) {
++			usecs *= 10;
++		}
++	}
++	*us = secs * USEC_PER_SEC + usecs;
++	return ok && *q == 0;
++}
++
++/* laurel 2901: a settime kept in raw mode, from a thread (ud_attach_thread). */
++static void
++ud_settime_apply_pending(void)
++{
++	char treply[160];
++	uint64_t ns;
++
++	if (!ud_settime_pending) {
++		return;
++	}
++	ud_settime_pending = false;
++	absolutetime_to_nanoseconds(mach_absolute_time() - ud_settime_at, &ns);
++	uint64_t us = ud_settime_us + ns / NSEC_PER_USEC;
++	(void)laurel_calendar_settime(us / USEC_PER_SEC, (uint32_t)(us % USEC_PER_SEC), treply, sizeof(treply));
++	printf("LAUREL CTL: settime from raw mode: %s\n", treply);
++}
++
+ /*
+  * laurel 2900 (port of negroni 0367): boot log commands, ud_thread only.
+  *   bootlog          one text line (laurel_bootlog_info)
+@@ -1288,6 +1342,21 @@ ud_ctl_input(const uint8_t *f, uint32_t len)
+ 		ud_ctl_bootlog(f, cmd);         /* laurel 2900 */
+ 		return true;
+ 	}
++	if (strcmp(cmd, "time") == 0 || strncmp(cmd, "settime ", 8) == 0) {
++		/* laurel 2901: calendar commands; no reset, so also allowed while one is pending */
++		char treply[160];
++		uint64_t us;
++		if (cmd[0] == 't') {
++			laurel_calendar_describe(treply, sizeof(treply));
++		} else if (!ud_parse_settime(cmd, &us)) {
++			snprintf(treply, sizeof(treply), "error: settime needs <unix seconds>[.<fraction>]");
++		} else {
++			(void)laurel_calendar_settime(us / USEC_PER_SEC, (uint32_t)(us % USEC_PER_SEC), treply, sizeof(treply));
++		}
++		printf("LAUREL CTL: %s\n", treply);
++		ud_ctl_reply(f, treply);
++		return true;
++	}
+ 	if (ud.ctl_action != UD_CTL_NONE) {
+ 		printf("LAUREL CTL: busy (a reset or panic is pending)\n");
+ 		ud_ctl_reply(f, "error: busy");
+@@ -1463,9 +1532,23 @@ ud_panic_rx(const uint8_t *f, uint32_t len)
+ 		ud_panic_pos = 0;               /* laurel 2900: all of it (head buffer + ring) */
+ 		snprintf(text, sizeof(text), "ok log (%llu console bytes from byte 0)%s", sweet_log_position(), sfx);
+ 		reply = text;
++	} else if (strncmp(cmd, "settime ", 8) == 0 && !ud_in_panic) {
++		/* laurel 2901: raw mode: no locks here; keep it for the ue0 attach (a thread) */
++		uint64_t us;
++		if (!ud_parse_settime(cmd, &us)) {
++			reply = "error: settime needs <unix seconds>[.<fraction>]";
++		} else {
++			ud_settime_us = us;
++			ud_settime_at = mach_absolute_time();
++			ud_settime_pending = true;
++			snprintf(text, sizeof(text), "ok settime %llu (pending: set at the ue0 attach)", us / USEC_PER_SEC);
++			reply = text;
++		}
+ 	} else if (strcmp(cmd, "bootlog") == 0 || strncmp(cmd, "bootlog read ", 13) == 0) {
+-		reply = ud_in_panic ? "error: bootlog: not in panic mode (the panic is in the boot log slot)" :
+-		    "error: bootlog: raw mode (before the ue0 attach); try again in a few seconds";
++		reply = ud_in_panic ? "error: bootlog: panic mode (the panic is in the boot log)" :
++		    "error: bootlog: raw mode, try again after the ue0 attach";
++	} else if (strcmp(cmd, "time") == 0) {
++		reply = "error: time: raw or panic mode (no locks here)";
+ 	} else if (strcmp(cmd, "reboot") == 0 || strcmp(cmd, "recovery") == 0 ||
+ 	    strcmp(cmd, "bootloader") == 0 || strcmp(cmd, "poweroff") == 0) {
+ 		if (busy) {
+@@ -2320,6 +2403,7 @@ ud_attach_thread(void *arg __unused, wait_result_t wr __unused)
+ 	ud_preply_count = 0;                    /* replies not sent yet: the host asks again */
+ 	lck_mtx_unlock(ud.lock);
+ 	printf("LAUREL USB: ue0 attached; %llu console bytes went out as raw frames\n", ud_panic_pos);
++	ud_settime_apply_pending();             /* laurel 2901 */
+ 	if (ud_livelog && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 9abff41..fb258ab 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1050,6 +1050,12 @@ bsd_init(void)
+ #endif /* CONFIG_IMAGEBOOT */
+ #endif /* CONFIG_BASESYSTEMROOT */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* laurel 2901: the saved RTC offset is on the root volume: apply it before launchd (bsd/dev/laurel_rtc.c) */
++	extern void laurel_rtc_load_saved(void);
++	laurel_rtc_load_saved();
++#endif
++
+ 	/* Initialize signal state for process 0. */
+ 	bsd_init_kprintf("calling siginit\n");
+ 	siginit(kernproc);
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index 8c75168..fa1339f 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -93,6 +93,15 @@ IOKitInitializeTime( void )
+ 	} else {
+ 		IOLog("LAUREL RTC: on: no IORTC wait, calendar from the platform\n");
+ 	}
++	/*
++	 * laurel 2901: the calendar comes from SweetPlatformExpert::getUTCTimeOfDay()
++	 * (bsd/dev/laurel_rtc.c). Without the platform expert PEGetUTCTimeOfDay()
++	 * gives 0 (the epoch): wait for it (normally registered long before bsd_init).
++	 */
++	t.tv_sec = 10;
++	if (IOService::waitForService(IOService::serviceMatching("IOPlatformExpert"), &t) == NULL) {
++		IOLog("LAUREL CALENDAR: no platform expert after 10 s: the calendar starts at the epoch\n");
++	}
+ // RTC is not present on this target
+ #elif !defined(BCM2837)
+ 	IOService::waitForService(
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index b6b932e..25e904b 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -19,6 +19,9 @@ void laurel_usb_panic_hold(void);     /* laurel 2005: bsd/dev/sweet_usb.c; retur
+ /* laurel 2900: boot log end marks and the panic write (bsd/dev/sweet_ufs.c) */
+ void laurel_bootlog_end(unsigned kind, const char *why);
+ void laurel_bootlog_panic(void);
++/* laurel 2901: calendar from the PM6125 RTC (bsd/dev/laurel_rtc.c) */
++void laurel_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs);
++void laurel_rtc_set(clock_sec_t secs, clock_nsec_t nsecs);
+ }
+ 
+ static int
+@@ -62,10 +65,29 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	void getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs) APPLE_KEXT_OVERRIDE;
++	void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * laurel 2901: calendar time = PM6125 RTC + a saved offset, or a build-date
++ * floor (bsd/dev/laurel_rtc.c). Without these the IOPlatformExpert default
++ * returned 0 and the calendar started at the epoch.
++ */
++void
++SweetPlatformExpert::getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs)
++{
++	laurel_rtc_get(secs, nsecs);
++}
++
++void
++SweetPlatformExpert::setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs)
++{
++	laurel_rtc_set(secs, nsecs);
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {

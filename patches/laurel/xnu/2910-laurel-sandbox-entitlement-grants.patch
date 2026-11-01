@@ -1,0 +1,51 @@
+laurel 2910: sandbox privileges by entitlement: socket delegate, kernel pipe, system override (on top of 2903).
+
+Boot 20:02 of 2026-11-01 still denied these three. Each binary carries the entitlement a real iOS kernel asks for [V strings
+of the 20H392 binaries]: 10001 PRIV_NET_PRIVILEGED_SOCKET_DELEGATE com.apple.private.network.socket-delegate (nsurlsessiond,
+cloudd, dasd, itunesstored, identityservicesd, mediaserverd), 12001 PRIV_SKYWALK_REGISTER_KERNEL_PIPE
+com.apple.private.skywalk.register-kernel-pipe (identityservicesd, rapportd), 1003 PRIV_SYSTEM_OVERRIDE
+com.apple.private.kernel.system-override (mediaserverd). No entitlement: still denied, with the first-denial line. Not granted:
+10003 PRIV_NET_PRIVILEGED_NETWORK_STATISTICS (symptomsd): no feature here, more wakeups. Kill switch: laurelsandbox=0, the switch
+of 2903. Line: "LAUREL SANDBOX: privileges 1002/1007/12000 + entitled 1003/10001/12001 on, extension tokens on", and one
+"LAUREL SANDBOX: <process> privilege <n> granted (first grant)" per privilege.
+
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -426,6 +426,17 @@
+  *   12000 PRIV_SKYWALK_REGISTER_USER_PIPE  register a Skywalk user pipe nexus.
+  *        identityservicesd, rapportd. Processes with the entitlement
+  *        com.apple.private.skywalk.register-user-pipe.
++ * laurel 2910: three more, by the entitlement each binary of 20H392 carries for
++ * it (docs/laurel_sprout/system-features.md; denied in boot 20:02 of 2026-11-01):
++ *   10001 PRIV_NET_PRIVILEGED_SOCKET_DELEGATE  a socket or NECP client acts for a
++ *        client app. nsurlsessiond, cloudd, dasd, itunesstored (background
++ *        URLSession downloads run for an app). com.apple.private.network.socket-delegate.
++ *   12001 PRIV_SKYWALK_REGISTER_KERNEL_PIPE  identityservicesd.
++ *        com.apple.private.skywalk.register-kernel-pipe.
++ *   1003 PRIV_SYSTEM_OVERRIDE  system_override(2) while the camera or audio runs.
++ *        mediaserverd. com.apple.private.kernel.system-override.
++ * Not granted: 10003 PRIV_NET_PRIVILEGED_NETWORK_STATISTICS (symptomsd; no feature
++ * here, more wakeups per socket event) and every process without the entitlement.
+  * The check is made on the current process, so only when the credential
+  * asked about is the current thread's.
+  */
+@@ -438,6 +449,9 @@
+ 	{ PRIV_GLOBAL_PROC_INFO, NULL },
+ 	{ PRIV_DARKBOOT, NULL },
+ 	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
++	{ PRIV_NET_PRIVILEGED_SOCKET_DELEGATE, "com.apple.private.network.socket-delegate" },    /* laurel 2910 */
++	{ PRIV_SKYWALK_REGISTER_KERNEL_PIPE, "com.apple.private.skywalk.register-kernel-pipe" }, /* laurel 2910 */
++	{ PRIV_SYSTEM_OVERRIDE, "com.apple.private.kernel.system-override" },                    /* laurel 2910 */
+ };
+ static uint32_t laurel_priv_granted_logged;
+ 
+@@ -532,7 +546,7 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
+-	printf("LAUREL SANDBOX: privileges 1002/1007/12000 %s, extension tokens %s\n",
++	printf("LAUREL SANDBOX: privileges 1002/1007/12000 + entitled 1003/10001/12001 %s, extension tokens %s\n",
+ 	    laurel_sandbox_privs ? "on" : "off (laurelsandbox=0)", laurel_sandbox_extensions ? "on" : "off (laurelsbext=0)");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
