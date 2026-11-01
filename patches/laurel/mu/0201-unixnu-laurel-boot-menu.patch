@@ -1,0 +1,231 @@
+laurel boot menu: UniXNU entry "Android" (action laurel-android), retries refill before an iOS boot only after a real key event, self-check line, Power-held guard, button text. docs/laurel_sprout/boot-menu.md.
+
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Boot.c b/package/UniXNUPkg/Library/UniXNULib/Boot.c
+index 4b1e737..db313d4 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Boot.c
++++ b/package/UniXNUPkg/Library/UniXNULib/Boot.c
+@@ -28,6 +28,21 @@ RunAction (
+     case UniXNUActionExit:
+       UniXNULog ("action: exit");
+       return EFI_SUCCESS;
++    case UniXNUActionLaurelAndroid:
++      {
++        //
++        // iOSPlus10 laurel: the flags are on the flash and verified, or this returns to the menu with the reason. ABL does the slot change at the reset.
++        //
++        EFI_STATUS  Status = LaurelSlotToAndroid ();
++
++        if (EFI_ERROR (Status)) {
++          return Status;
++        }
++
++        UniXNULog ("action: reset for Android");
++        gRT->ResetSystem (EfiResetCold, EFI_SUCCESS, 0, NULL);
++        break;
++      }
+     default:
+       break;
+   }
+@@ -55,6 +70,11 @@ RunXnu (
+   UNIXNU_LOADER_KEXT             *Kexts;
+   UINTN                         KextCount;
+ 
++  //
++  // iOSPlus10 laurel: this is the point a good Mu reaches; ABL's retries must go on falling for one that does not.
++  //
++  LaurelSlotRefill ();
++
+   Status = gBS->LocateProtocol (&gUniXNULoaderProtocolGuid, NULL, (VOID **)&Loader);
+   if (EFI_ERROR (Status)) {
+     UniXNULog ("xnu: no loader protocol installed; UniXNU does not provide one");
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Config.c b/package/UniXNUPkg/Library/UniXNULib/Config.c
+index 425adec..aca1b5d 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Config.c
++++ b/package/UniXNUPkg/Library/UniXNULib/Config.c
+@@ -1143,6 +1143,8 @@ AddEntry (
+       Entry->Action = UniXNUActionShutdown;
+     } else if (AsciiStrCmp (Action, "exit") == 0) {
+       Entry->Action = UniXNUActionExit;
++    } else if (AsciiStrCmp (Action, "laurel-android") == 0) {
++      Entry->Action = UniXNUActionLaurelAndroid;
+     } else {
+       ConfigError (Config, "%a: unknown action '%a'", Origin, Action);
+     }
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Internal.h b/package/UniXNUPkg/Library/UniXNULib/Internal.h
+index 71aa4b8..e2068e8 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Internal.h
++++ b/package/UniXNUPkg/Library/UniXNULib/Internal.h
+@@ -201,7 +201,8 @@ typedef enum {
+   UniXNUActionNone,
+   UniXNUActionReset,
+   UniXNUActionShutdown,
+-  UniXNUActionExit
++  UniXNUActionExit,
++  UniXNUActionLaurelAndroid   ///< iOSPlus10 laurel: LaurelSlot.c
+ } UNIXNU_ACTION;
+ 
+ typedef struct {
+@@ -596,4 +597,28 @@ UniXNUMenuConfirm (
+   OUT UINTN      *Choice
+   );
+ 
++//
++// iOSPlus10 laurel: LaurelSlot.c
++//
++extern CHAR16  gLaurelSlotWhy[96];
++
++VOID
++LaurelSlotSelfCheck (
++  IN  UNIXNU_CONFIG  *Config,
++  OUT CHAR16         *Notice,
++  IN  UINTN          NoticeSize
++  );
++
++EFI_STATUS
++LaurelSlotToAndroid (
++  VOID
++  );
++
++VOID
++LaurelSlotRefill (
++  VOID
++  );
++
++extern BOOLEAN  gLaurelKeyHeard;
++
+ #endif
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Main.c b/package/UniXNUPkg/Library/UniXNULib/Main.c
+index c1d76fe..49904be 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Main.c
++++ b/package/UniXNUPkg/Library/UniXNULib/Main.c
+@@ -105,6 +105,7 @@ UniXNURun (
+   UniXNUInjectAcpi (&Config, &Stats);
+ 
+   UniXNUUiInit (&Config, &Ui);
++  LaurelSlotSelfCheck (&Config, Ui.Notice, sizeof (Ui.Notice));
+   UnicodeSPrint (
+     Ui.Info,
+     sizeof (Ui.Info),
+@@ -154,7 +155,12 @@ UniXNURun (
+     // The payload returned or failed: back to the menu, without the
+     // countdown so a broken default cannot loop on a machine with input.
+     //
+-    UnicodeSPrint (Ui.Notice, sizeof (Ui.Notice), L"'%s' returned: %r", Entry->Title, Status);
++    if ((Entry->Type == UniXNUEntryAction) && (Entry->Action == UniXNUActionLaurelAndroid)) {
++      UnicodeSPrint (Ui.Notice, sizeof (Ui.Notice), L"%s", gLaurelSlotWhy);
++    } else {
++      UnicodeSPrint (Ui.Notice, sizeof (Ui.Notice), L"'%s' returned: %r", Entry->Title, Status);
++    }
++
+     UniXNULog ("menu: entry %u returned %r", (UINT32)Index, Status);
+     gBS->SetWatchdogTimer (0, 0, 0, NULL);
+     Countdown = FALSE;
+diff --git a/package/UniXNUPkg/Library/UniXNULib/Menu.c b/package/UniXNUPkg/Library/UniXNULib/Menu.c
+index 4f7fd52..ea3071b 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/Menu.c
++++ b/package/UniXNUPkg/Library/UniXNULib/Menu.c
+@@ -15,6 +15,16 @@
+ 
+ #define TICK_MS             100
+ #define DEFAULT_ROTATE_SEC  2
++//
++// iOSPlus10 laurel: the owner holds Power to reset a hung phone and may still hold it here. Power is Enter (ButtonsDxe). An Enter that comes before this many ms have
++// passed since the last Enter chooses nothing, so a held key cannot boot the default.
++//
++#define LAUREL_ENTER_GUARD_MS  1500
++
++//
++// iOSPlus10 laurel: a real key event in this menu. LaurelSlot.c refills the retries only with this set: a handle count proves nothing.
++//
++BOOLEAN  gLaurelKeyHeard;
+ 
+ #ifndef SCAN_SUSPEND
+ #define SCAN_SUSPEND  0x0102
+@@ -106,6 +116,7 @@ UniXNUMenuRun (
+   UINTN          RotateAccum;
+   INTN           LastShownSecond;
+   UINTN          Count;
++  INTN           GuardMs;
+ 
+   Count    = Config->EntryCount;
+   Selected = Config->DefaultIndex;
+@@ -132,7 +143,7 @@ UniXNUMenuRun (
+   UniXNUUiDrawStatus (
+     Ui,
+     1,
+-    HasInput ? L"Up/Down: select    Enter: boot    1-9: boot entry    Esc: stop timer"
++    HasInput ? L"Volume keys: select    Power: boot"
+              : L"No input device: the default entry boots when the timer ends"
+     );
+   if (Ui->Notice[0] != L'\0') {
+@@ -167,6 +178,7 @@ UniXNUMenuRun (
+     Events[EventCount++] = gST->ConIn->WaitForKey;
+   }
+ 
++  GuardMs         = LAUREL_ENTER_GUARD_MS;
+   UserActive      = FALSE;
+   RotateAccum     = 0;
+   LastShownSecond = -2;
+@@ -185,6 +197,7 @@ UniXNUMenuRun (
+ 
+     Previous = Selected;
+     if (Signaled == 0) {
++      GuardMs -= TICK_MS;
+       if (RemainingMs > 0) {
+         RemainingMs -= TICK_MS;
+         if (RemainingMs <= 0) {
+@@ -206,6 +219,12 @@ UniXNUMenuRun (
+         continue;
+       }
+ 
++      gLaurelKeyHeard = TRUE;
++      if ((GuardMs > 0) && ((Key.UnicodeChar == CHAR_CARRIAGE_RETURN) || (Key.ScanCode == SCAN_SUSPEND))) {
++        GuardMs = LAUREL_ENTER_GUARD_MS;
++        continue;
++      }
++
+       if (!UserActive) {
+         //
+         // The first key takes over: no more countdown or rotation, and the
+@@ -299,6 +318,7 @@ UniXNUMenuConfirm (
+       continue;
+     }
+ 
++    gLaurelKeyHeard = TRUE;
+     if (Items > 0) {
+       if (Key.ScanCode == SCAN_UP) {
+         Shown = (Shown + Items - 1) % Items;
+diff --git a/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf b/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf
+index bfdb3b3..e1bcc9f 100644
+--- a/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf
++++ b/package/UniXNUPkg/Library/UniXNULib/UniXNULib.inf
+@@ -20,6 +20,9 @@
+   Font.c
+   Inject.c
+   Kext.c
++  LaurelSlot.c
++  laurel_slot.c
++  laurel_slot.h
+   Logo.c
+   Main.c
+   Menu.c
+@@ -37,6 +40,7 @@
+   BaseMemoryLib
+   DebugLib
+   DevicePathLib
++  DxeServicesTableLib
+   FdtLib
+   MemoryAllocationLib
+   PcdLib
+diff --git a/package/UniXNUPkg/UniXNUPkg.dsc b/package/UniXNUPkg/UniXNUPkg.dsc
+index 2215c58..8a0c4f0 100644
+--- a/package/UniXNUPkg/UniXNUPkg.dsc
++++ b/package/UniXNUPkg/UniXNUPkg.dsc
+@@ -20,6 +20,7 @@
+ !include MdePkg/MdeLibs.dsc.inc
+ 
+ [LibraryClasses]
++  DxeServicesTableLib|MdePkg/Library/DxeServicesTableLib/DxeServicesTableLib.inf
+   BaseLib|MdePkg/Library/BaseLib/BaseLib.inf
+   BaseMemoryLib|MdePkg/Library/BaseMemoryLib/BaseMemoryLib.inf
+   DevicePathLib|MdePkg/Library/UefiDevicePathLib/UefiDevicePathLib.inf

@@ -11,6 +11,6 @@ DONOR=${DONOR:-n104ap}
 main=$(git -C "$REPO" worktree list --porcelain | sed -n '1s/^worktree //p')
 mu=$OUT/laurel/mu; [ -f "$mu/SILICIUM_UEFI-DEBUG.fd" ] || mu=$main/out/laurel/mu
 [ -d "$OUT/venv" ] || { [ -d "$main/out/venv" ] && ln -sfn "$main/out/venv" "$OUT/venv"; }
-export LAUREL_STAMP_IOS26=1 MU_DIR=$mu UEFI_W=${UEFI_W:-$OUT/laurel-ios26/uefi} MKADT_EXTRA="--donor $DONOR"
+export LAUREL_STAMP_IOS26=1 MU_DIR=$mu UEFI_W=${UEFI_W:-$OUT/laurel-ios26/uefi} MKADT_EXTRA="--donor $DONOR" ENTRY_TITLE=${ENTRY_TITLE:-iOS 26 (laurel XNU)}
 export KERNEL=${KERNEL:-$OUT/laurel-kernel-ios26/out/kernel.ios26.development.sweet.4k}
 exec "$REPO/scripts/laurel/uefi-image.sh" "$@"

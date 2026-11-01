@@ -4998,6 +4998,21 @@ Full text: `docs/laurel_sprout/ios26-airdrop.md`.
 - [V] `scripts/backup/laurel-backup.sh all`: 86 partitions + GPT heads, each compared with a hash made on the phone; /data 9172 entries, 1.4 GB. Output ~/laurel-backup/android-20261102-0137, 5.0 GB, mode 700, out of git. First backup of modemst1/2, fsg, fsc, persist, devinfo. /data is a file copy for salvage, not a block image: FBE keys stay in keymaster. Run `data` again right before the first phone write. No restore was tried.
 - `.gitignore` `backup/` hid `scripts/backup/`: fixed with an exception.
 
+## Mi A3: boot menu, dual boot chosen on the phone (2026-11-02, branch t3/laurel-boot-menu; host and QEMU only, nothing flashed, phone read only)
+Full text: `docs/laurel_sprout/boot-menu.md`.
+- [V source + strings in the phone's ABL] ABL refuses a slot whose boot and abl type GUIDs are equal (`ValidateSlotGuids`) or that does not match the UFS boot LUN. The HAL swaps the type GUID of all A/B partitions and moves the LUN. So **flags alone cannot select a slot**, and a Mu that wrote boot_a's active bit would leave the phone in fastboot.
+- Way that works: Mu writes boot_b retries = 0, successful = 0. ABL's `HandleActiveSlotUnbootable` does the whole change and resets: same state as 7 failed boots, a path this phone has shown. One byte + 2 CRCs per copy. After it boot_a 0x7F, boot_b 0x82; HAL's 0x3F clears it.
+- Retries: never set successful (a broken Mu would then never fall back). Refill to 7 at <= 3, only right before DarwinBoot, with screen and >= 2 input devices (the serial driver counts as 1).
+- [V dump] Every LUN reserves 16 KiB of entries (first usable LBA 6) though sde uses 8 KiB (64 entries) and the others 4 KiB: the backup entries lie at last LBA - 4, not last LBA - used blocks. Writes keep the run as ABL does.
+- [V phone] `hal_bootctl_client` = su system_server update_engine update_verifier vold snapshotctl: no app, also no priv-app, can call the HAL. No su binary on this build. `ro.debuggable=0` with `ro.build.type=userdebug`; root only through adbd + `adbroot_service`. Recovery menu has no slot item.
+- One-tap: normal app + on-device adb client to 127.0.0.1:5555 (`persist.adb.tcp.port`, [V strings adbd]), key in Keystore. Mark in boot_b's command line lets the phone verify image and dtbo with no host.
+- A held Power at the reset gives Enter in the menu: 1.5 s guard in UniXNU's Menu.c.
+- Panic: `laurelpanic=30` now in the default boot-args (it held for ever). Hang: new kernel patch 2955 sets PMIC S2 for Power alone, kept if something else has set it.
+- `scripts/lib/env.sh` exports `BACKUP` (= ~/op10-backup): a script's own `BACKUP=${BACKUP:-...}` gets the wrong folder. Name it otherwise.
+- UniXNU has its own QEMU harness: real menu, real `BlockIo` at 4096-byte blocks from the phone's dump, USB keyboard over QMP. `scripts/laurel/boot-menu-qemu.py`. AAVMF's PartitionDxe restored a primary with a bad CRC before the menu.
+- Mu builds without touching the shared tree: `scripts/laurel/mu-private-tree.sh` (btrfs reflink, own git dirs), then `MU_TREE= UNIXNU_TREE= SETUP=0 scripts/laurel/mu-build.sh`.
+Next: owner decisions O1-O5; the first phone test is section 9 (keys in the menu come first).
+
 ## Mi A3: dual boot on a real partition (2026-11-02, branch t3/laurel-dual-boot-fix2; built + host tests only, NOTHING RUN ON THE PHONE). Details: docs/laurel_sprout/dual-boot.md
 - Owner: drop the pinned file. `iosroot` on LUN 0, one GPT write + one wipe; first boot iOS 26. Numbers in one place: `scripts/lib/laurel-layout.sh`. `userdata` 1831432..21633535, `iosroot` 21633536..30119930, 34760273920 bytes.
 - [V, backup] LUN 0: 32 slots, 4 blocks reserved per copy (entries fill only the first). Numbering: slot index 14 = partition 15 = userdata = sda15; new index 15 = partition 16 = sda16. `system_a` has slot bits on LUN 0: the attributes in the table move with each slot switch, so "table = backup" holds only until the next switch.
@@ -5024,6 +5039,13 @@ Full text: `docs/laurel_sprout/ios26-airdrop.md`.
 - Decision [owner, 2026-11-02]: first boot is iOS 26, with the default stack only. Selector, Hot, XNUtils screen, bench: kept, not in that root, no more work until after the first boot.
 - Trap: `build.txt` had a date, which would have broken the root's same-bytes rule. Removed. A bundle built with class `NegroniMTLDeviceImpl` gets no device from a kernel that names `NegroniMTLDevice`: the plain default build now uses the kernel's name.
 - Guess [I]: `present_fps` counts command buffers that write a screen-size surface; one CA frame may be more than one. Use it only between runs of this bench.
+
+## Mi A3: boot menu merged with iosroot + read-only flow (2026-11-02, branch t3/laurel-boot-menu; host and QEMU only, nothing flashed)
+- S1 must hold for every image while `config/laurel-android-data` exists: moved in front of the MU_ONLY branch of `uefi-image.sh` (before: `MU_ONLY=1` still got 11.0.0). `mk()` is the one mkbootimg call. os_version, patch and the command line lie in the header page, so the app's hash over the rest is the same [V test].
+- The app cannot read the host's `first-boot.result`, so the flow is held by marks: read-only image = no menu, no refill, no marks (`LAUREL_READONLY=1` forces `BOOT_MENU=0`); the root mark comes only from `dual-boot.sh image`, and for `rw` only after its gate. Also on the phone: fence text, OS field against boot_a, layout numbers, first MiB of iosroot. A new fence needs a new APK.
+- `scripts/lib/laurel-layout.sh` sets `LAUREL_BACKUP=~/laurel-backup`: my tests' dump variable is now `GPT_DUMP`.
+- `scripts/laurel/shim.sh` keeps 11.0.0: it has no sidecar, so the guard refuses its image while the flag exists.
+Next: the owner's O1 before step 12 of dual-boot.md. Without it: `BOOT_MENU=0 dual-boot.sh image rw`.
 
 ## Mi A3 iOS 26: debug path of the first boot, SSH with no picture (2026-11-02, branch t3/laurel-ios26-debug; host only, NOT RUN)
 Why: 23F84 has no GL path. If Metal fails, no picture. So SSH, USB state and logs must work alone. Read `docs/laurel_sprout/ios26-first-boot.md` first.
@@ -5055,3 +5077,14 @@ Results: see plan.md. Not run: everything on the phone. Next (owner decides any 
 - The main checkout's out/bin/op10tool (Oct 31) has no `gpt`: `error: unrecognized subcommand 'gpt'`. `dual-boot.sh` now asks `op10tool gpt features` first.
 - A worktree build, this time: symlink external/{ios-sweet-linux,ios-topaz,IOS-26-Hot,ios-sweet,UniXNU-ios26,xnu-linux-toolchain,hackios-scion}, reflink out/laurel-kernel/{deps,theos,cache,dl} and out/laurel-kernel-ios26/{cache,deps,dl,kdk}. Remove the symlinks before you stage.
 - Not proven by anything here: all of the phone side (docs/plan.md, the entry of this round).
+
+## Mi A3: boot menu after the independent review (2026-11-02, branch t3/laurel-boot-menu; host and QEMU only, nothing flashed)
+Full text: `docs/laurel_sprout/boot-menu.md`.
+- [V this phone's xbl_b, disassembly] The XBL loader has a backup GPT reader: 0xc258bac checks signature, header CRC, own LBA, entry CRC; caller 0xc2589c4 tries LBA 1, then block count - 1. So a torn primary does not end in EDL for its lookups. XBL Core and ABL behind it: not read.
+- [V phone] `update_engine_client` is not on Lineage 24, the daemon is. [V source] `adb_port` / ADB over network is gone from lineage-24.0. [V phone] `su` is permissive (`typepermissive su`), `service.adb.listen_addrs` and `persist.adb.tcp.port` have no own context (`default_prop`, readable by coredomain).
+- [V adb source] In adbd `tcp:N` = any address, `tcp:localhost:N` = loopback, and `service.adb.listen_addrs` wins over both port properties. It is not persist: a window at each boot.
+- [V code] `laurel_usb_panic_hold` returns with no USB, debug=0xc never sends kPEPanicRestartCPU, and PE_halt_restart is not set before SweetPlatformExpert::start: "reset after N s" held only with USB up. 2956 hooks panic_spin_forever.
+- A handle count or a GOP proves no working key or panel. Only a key event does. Then an unattended loop ends at ABL's retries with 0 writes by Mu.
+- bootctl: no = stdout 0, exit 70; a HAL error also exits 70. `|| refuse` hides the difference: use a three-way answer.
+- A helper's `return 1` inside a pipeline's left side loses the status and hashes nothing: e3b0c442 is the hash of empty. Seen in zsh by hand: `for x in $VAR` does not split in zsh.
+- Next: owner decisions O1, O3, O4, O5; then section 9.

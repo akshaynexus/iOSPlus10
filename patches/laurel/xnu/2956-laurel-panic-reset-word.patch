@@ -1,0 +1,129 @@
+laurel 2956: a panic ends in a reset on every path with laurelpanic=N, also with no USB, with debug=0xc, and before SweetPlatformExpert::start (hook in panic_spin_forever); panic word in the IMEM restart word for the boot menu. Both kernels. docs/laurel_sprout/boot-menu.md.
+
+--- a/bsd/dev/laurel_reboot.c
++++ b/bsd/dev/laurel_reboot.c
+@@ -21,6 +21,7 @@
+ #include <sys/sysctl.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <machine/cpu_number.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/errno.h>
+ 
+@@ -102,6 +103,12 @@
+ };
+ 
+ static volatile uint32_t *lr_reason;      /* NULL: no IMEM reason (self-check failed) */
++/*
++ * laurel 2956: a panic ends in a reset on every path, and leaves a word for the boot menu. The IMEM restart word is ours already (qcom,msm-imem restart_reason@65c; Linux writes it too, nothing
++ * in ABL reads it [V ABL source, no 0x776655 there]). Mu reads it (tools/laurel-slot, LS_PANIC_WORD) and skips the retries refill, so ABL's count goes on. The next start of this kernel writes it back.
++ */
++#define LR_PANIC_WORD    0x4C504E43u
++static volatile int lr_in_panic;
+ static unsigned lr_mode;                   /* index in lr_modes */
+ static int lr_on;
+ 
+@@ -255,7 +262,7 @@
+ {
+ 	laurel_pmi632_release_input();
+ 	if (lr_reason != NULL) {
+-		*lr_reason = lr_modes[lr_mode].imem;
++		*lr_reason = (lr_in_panic && lr_mode == 0) ? LR_PANIC_WORD : lr_modes[lr_mode].imem;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
+ 	if (lr_modes[lr_mode].pon) {
+@@ -269,6 +276,56 @@
+ 	kdb_printf("LAUREL REBOOT: PSCI SYSTEM_RESET returned %lld\n", (long long)rc);
+ }
+ 
++/* laurel 2956: from kPEPanicBegin on. Before laurel_reboot_prepare there is no mapping: no word, and the menu's gate still needs a key. */
++void laurel_panic_mark(void);
++void
++laurel_panic_mark(void)
++{
++	lr_in_panic = 1;
++	if (lr_reason != NULL) {
++		*lr_reason = LR_PANIC_WORD;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++}
++
++/*
++ * laurel 2956: the last stop of a panic. laurel_usb_panic_hold returns when USB is not running, and with debug=0xc (DB_NMI, panicDebugging) XNU never sends kPEPanicRestartCPU: it
++ * spins. Called from kPEPanicDiagnosticsDone after the hold and from panic_spin_forever (osfmk/kern/debug.c), so it also works before SweetPlatformExpert::start, when PE_halt_restart is not set.
++ * laurelpanic=N: wait N s (the panel shows the panic), then reset. Not set or 0: returns, XNU spins as before. Counts the system counter directly: the timebase may not be set yet.
++ * A nested panic on this CPU resets at once. Another CPU spins: this one resets.
++ */
++void laurel_panic_final(void);
++void
++laurel_panic_final(void)
++{
++	static volatile int entries;
++	static volatile int cpu = -1;
++	int secs = 0;
++
++	laurel_panic_mark();
++	if (entries++ != 0) {
++		if (cpu == cpu_number()) {
++			(void)lr_psci(PSCI_SYSTEM_RESET);
++		}
++		return;
++	}
++	cpu = cpu_number();
++	PE_parse_boot_argn("laurelpanic", &secs, sizeof(secs));
++	if (secs <= 0) {
++		entries = 0;            /* no timed reset: the nested rule above must not reset either */
++		return;
++	}
++	kdb_printf("LAUREL PANIC: reset in %d s\n", secs);
++	uint64_t freq = __builtin_arm_rsr64("CNTFRQ_EL0");
++	uint64_t start = __builtin_arm_rsr64("CNTVCT_EL0");
++	while (__builtin_arm_rsr64("CNTVCT_EL0") - start < (uint64_t)secs * freq) {
++	}
++	if (lr_on) {
++		laurel_restart();
++	}
++	(void)lr_psci(PSCI_SYSTEM_RESET);
++}
++
+ /* kern.laurel_reboot_mode: the reason of the next restart. */
+ static int
+ lr_sysctl_mode(struct sysctl_oid *oidp __unused, void *arg1 __unused, int arg2 __unused,
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -15,6 +15,8 @@
+ int laurel_reboot_prepare(void);
+ void laurel_power_off(void);
+ void laurel_restart(void);
++void laurel_panic_mark(void);        /* laurel 2956: bsd/dev/laurel_reboot.c */
++void laurel_panic_final(void);
+ void laurel_usb_panic_hold(void);     /* laurel 2005: bsd/dev/sweet_usb.c; returns only without USB */
+ /* laurel 2720: calendar from the PM6125 RTC + saved offset (bsd/dev/laurel_rtc.c) */
+ void laurel_rtc_get(clock_sec_t *secs, clock_nsec_t *nsecs);
+@@ -52,9 +54,14 @@
+ 		 * USB panic hold starts here: console ring to the host, commands.
+ 		 */
+ 		laurel_usb_panic_hold();        /* returns only without USB */
++		laurel_panic_final();           /* laurel 2956: no USB, debug=0xc: laurelpanic=N still resets */
++		return 0;
++	case kPEPanicBegin:
++		laurel_panic_mark();            /* laurel 2956 */
+ 		return 0;
+ 	case kPEPanicRestartCPU:
+ 	case kPEPanicRestartCPUNoCallouts:
++		laurel_panic_mark();            /* laurel 2956 */
+ 		laurel_usb_panic_hold();        /* returns only without USB */
+ 		laurel_restart();
+ 		return -1;
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1158,6 +1158,9 @@
+ void
+ panic_spin_forever(void)
+ {
++	extern void laurel_panic_final(void);   /* laurel 2956: bsd/dev/laurel_reboot.c */
++
++	laurel_panic_final();
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+ 		/* On arm32, which doesn't have a WFE timeout, this may not return.  But that should be OK on this path. */

@@ -324,5 +324,7 @@
 2943-laurel-cell-reject-cause.patch                            applied
 2950-laurel-dual-boot.patch                                    applied
 2951-laurel-boot-state.patch                                   applied+rules(1): glue
+2955-laurel-power-hold-reset.patch                             applied
+2956-laurel-panic-reset-word.patch                             applied+rules(1): 3way osfmk/kern/debug.c
 9000-series-12377-api.patch                                    post
-== series: 211 applied, 85 applied+rules, 0 replaced, 7 skipped, 11 base, 0 errors
+== series: 212 applied, 86 applied+rules, 0 replaced, 7 skipped, 11 base, 0 errors

@@ -37,8 +37,6 @@ TOOL=${OP10TOOL:-$OUT/bin/op10tool}
 APPLE=${APPLE:-$HOME/op10-apple}
 TARGET=${TARGET:-ios26}
 STOCK_DTBO=${STOCK_DTBO:-$HOME/laurel-backup/stock/images/dtbo.img}
-# slot b firmware that the boot LUN switch makes live; boot_b, dtbo_b have their own check. vendor_b, system_b: not firmware of the boot chain, and big.
-FW_B="abl bluetooth cmnlib cmnlib64 devcfg dsp hyp imagefv keymaster modem qupfw rpm storsec tz uefisecapp xbl xbl_config vbmeta"
 
 say() { echo "dual-boot: $*"; }
 die() { echo "dual-boot: FAILED: $*" >&2; exit 1; }
@@ -488,7 +486,9 @@ image)
   fi
   case "$TARGET" in ios26) s=$REPO/scripts/laurel/ios26-image.sh ;; ios16) s=$REPO/scripts/laurel/uefi-image.sh ;; *) die "TARGET=$TARGET: ios26 or ios16" ;; esac
   ro=1; [ "$m" = ro ] || ro=0
-  env UEFI_W="${bi%/*}" LAUREL_READONLY=$ro "$s"
+  # the app on the phone compares iosroot with this mark (docs/laurel_sprout/boot-menu.md). No record: no mark, the app refuses the image
+  _inst=$(sed -n 's/^installed .* \([0-9a-f]\{64\}\)$/\1/p' "$RESULT" 2>/dev/null | tail -1)
+  env UEFI_W="${bi%/*}" LAUREL_READONLY=$ro IOSROOT_HEAD_SHA="$_inst" "$s"
   [ -f "$bi.dualboot" ] || die "no $bi.dualboot: config/laurel-android-data must exist for this build"
   grep -q "^mode $m\$" "$bi.dualboot" || die "the image was built as $(sed -n 's/^mode //p' "$bi.dualboot"), not $m"
   say "$bi: mode $m, $(sed -n 's/^os //p' "$bi.dualboot")"

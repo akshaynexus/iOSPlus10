@@ -1097,8 +1097,23 @@ Results [V, on the working tree of 3e6c5b9 with these changes, stamp `-dirty`]: 
 Not run: the phone; any firmware step; the full root; FEATURES=1; dyld, launchd or AMFI on these binaries.
 Next: kernel need 2: the iOS 26 Apple80211 ABI on `redwood_apple80211.c` (section 4.1, sizes checked on the N104AP cache). The owner decides any first try: `echo alone > /private/var/db/laurel-awdl.allow`, on iOS 16 first. No flash without the owner.
 
+## Mi A3: boot menu on the device (2026-11-02, branch t3/laurel-boot-menu, not merged; NOT RUN on the phone)
+Done: UniXNU menu with iOS + Android, 5 s to iOS; slot core (`tools/laurel-slot`), patch mu 0201, kernel 2955 (hold Power), Android app + helper (`tools/laurel-switcher`), image marks. Design and every result: `docs/laurel_sprout/boot-menu.md`.
+Results [V host]: Mu FD builds, FVMAIN_COMPACT 1,404,888 of 3,145,728. Images iOS 16 and iOS 26 each 52,867,072 of 67,108,864 bytes (boot_b). Kernels: iOS 16 312/312, iOS 26 series 0 errors, both 0 LSE/RCpc. boot-menu-test PASS: 645 checks on the phone's GPT dump, 18 damaged tables refused, 0 bytes outside flags + CRCs, helper 17 cases, client 15 checks. QEMU with the real EFI binary: 10 scenarios, 28 checks, 0 failures.
+Changed from the request: "Android" does not write boot_a's active bit; ABL rejects that. It sets boot_b retries to 0, ABL's own fallback does the change. Observation in boot-menu.md section 2.
+Owner decides: O1 GPT write in Mu; O2 app + TCP 5555 or Magisk; O3 hold-Power reset in the PMIC; O4 endless loop on a kernel that always panics; O5 panic reset after 30 s.
+Next: owner's decisions; merge after fix2 (`iosroot`); phone test in the order of section 9, keys in the menu first. About 1 hour if each step passes.
+
+## Mi A3: boot menu merged with origin/laurel-sprout 9cad90f (2026-11-02; NOT RUN on the phone)
+Done: merge; S1 in every image while the flag exists; read-only image has no menu and the app refuses it; the app needs a writable image from `dual-boot.sh image rw`. Results [V host]: both kernels 0 failed, 0 LSE/RCpc, fence V3; images 52,867,072 bytes, os 17.0.0, 2026-10 in both modes; test-dualboot, build-honest, boot-menu-test, boot-menu-qemu PASS. Numbers: `docs/laurel_sprout/boot-menu.md` section 7.
+Next: steps 0-11 of dual-boot.md, owner's O1 before step 12, then boot-menu.md section 9.
+
 ## Mi A3 iOS 26: debug path of the first boot (2026-11-02, branch t3/laurel-ios26-debug; host only, NOT RUN)
 Owner requirement: with no GL path on 23F84, the first-boot root must have SSH and the debug path of iOS 16, and all diagnosis must work with no screen. Doc: `docs/laurel_sprout/ios26-first-boot.md`.
 Results [V host, at merge 8a0e0be with origin/laurel-sprout 9cad90f]: root hook self-test: air 10/10, metal 15/15 (real stage), debug 27/27. `ios26-injected-check`: 8 of 8 tools, 0 missing libraries, 0 missing symbols, 0 instructions newer than ARMv8.0. iOS 26 kernel: 211 applied, 85 applied+rules, 7 skipped, 11 base, 0 errors, 0 compile errors, 0 linker failures, LSE/RCpc 0, armv80 0, printf OK; stamp `8a0e0be4a8 318 patches, series 976708e6c90c0ba7, ios26_4k`; sha256 7502878b. iOS 16 kernel: 312/312, LSE/RCpc 0, printf OK. `state-test` PASS (ASan, UBSan). `ios26-diag --self-test` 10/10, wire test 7/7 against a fake kernel. Real 23F84 root at a scratch path, without and with the Metal stage: hfs-verify, fsck, kernel mount OK; SSH job, tools and keys read back. Not built over the shared image.
 Observed limits: nothing ran on the phone. dyld 23F84 with opcode fixups, dropbear auth, configd and ue0 on 26: [U]. SSH cannot start before launchd's required boot tasks end: then `ctl state` is the path.
 Next: owner rebuilds the root (commands in section 7 of that doc); owner decides any flash.
+
+## Mi A3: boot menu, review fixes (2026-11-02, branch t3/laurel-boot-menu, merged with origin/laurel-sprout 017e63d; NOT RUN on the phone)
+Done: refill only after a real key event; slot a's byte never changed; kernel 2956 real panic reset + panic word, 2955 text; app holds every `switch` check with live android-opened evidence, three-way HAL answers, random port moved to loopback at boot, `unroot:` after each step; battery check before a GPT write; primary write 2 blocks. Observation: this XBL loader reads the backup GPT.
+Results [V host]: `docs/laurel_sprout/boot-menu.md` section 7. Next: owner O1, O3, O4, O5; dual-boot.md steps 0-11; then section 9, keys in the menu first.

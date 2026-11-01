@@ -4,6 +4,8 @@ Owner decisions 2026-11-02: iOS gets the partition `iosroot` on LUN 0. One GPT w
 
 **Nothing here has run on the phone. Not one write step was run.** Marks: [V] measured or read in a source, [I] inference, [U] unknown. The old design, and why it was dropped: section 9.
 
+**Choosing on the phone (menu in Mu, one-tap app in Android): `boot-menu.md`.** It comes after step 12: the read-only image has no menu, and the app refuses to start it.
+
 ## 1. The steps
 
 All script steps: `scripts/laurel/dual-boot.sh`. Each writing step needs `CONFIRM=<step>`. **Agents run no writing step until the owner asks for that step.**

@@ -24,6 +24,8 @@ stock ABL (boot_b, header v2, stock DTB)
   -> iOS 16.7.16 root on userdata (rd=ufsroot0, already flashed; never write userdata again)
 ```
 
+Dual boot: the menu has an entry "Android", 5 s to iOS, `laurelpanic=30`: `boot-menu.md`. `BOOT_MENU=0` builds the old menu.
+
 ## Build and flash
 
 | Step | Command | Output |

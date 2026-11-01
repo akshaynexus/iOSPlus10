@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.iosplus10.laurelswitcher" android:versionCode="2" android:versionName="2.0">
+    <!-- only for the loopback socket to the phone's own adbd -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <application android:label="Boot iOS" android:icon="@drawable/ic_ios" android:allowBackup="false">
+        <!-- exported only because a launcher entry must be: it does nothing with no tap by the owner -->
+        <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <!-- switches at once: only this app's tile may start it -->
+        <activity android:name=".GoActivity" android:exported="false" android:launchMode="singleTask" />
+        <service android:name=".BootIosTile" android:exported="true" android:label="Boot iOS" android:icon="@drawable/ic_ios"
+                 android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+        <!-- system broadcasts only. directBootAware: the first runs before the owner's first unlock -->
+        <receiver android:name=".BootLockReceiver" android:exported="false" android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
