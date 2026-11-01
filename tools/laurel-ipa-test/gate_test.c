@@ -85,6 +85,8 @@ lipa_gsi_enabled(uint32_t *st)
 	return *st != 0;
 }
 
+/* laurel 2941: the AP pipes: tools/laurel-ipa-test/data_test.c */
+void lipa_data_kick(const struct lipa_mem *m) { (void)m; }
 #include "laurel_ipa.c"
 #include "laurel_ipa_link.c"
 #include "laurel_ipa_qmi.c"

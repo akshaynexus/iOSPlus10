@@ -1,0 +1,21 @@
+laurel 2914: only the time stamp of the last finger event, for 2915's touch-to-panel number. The faster touch path (parked 2914-laurel-touch-rate) lost finger events on the phone (23:19).
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -23,6 +23,7 @@
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
++uint64_t laurel_touch_event_at;         /* laurel 2914: the last finger event not yet followed by a flip (2915 measures touch to panel) */
+ 
+ /*
+  * laurel 2200 (Mi A3): two touch vendors (laurel_sprout-trinket-touchscreen.dtsi), detected at the probe:
+@@ -471,6 +472,7 @@
+ 		if (mask & bit) {
+ 			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
+ 				sweet_hid_touch((int)id, 1, x[id], y[id]);
++				laurel_touch_event_at = mach_absolute_time();
+ 				st.s_down++;
+ 				st.s_lastx = x[id];
+ 				st.s_lasty = y[id];

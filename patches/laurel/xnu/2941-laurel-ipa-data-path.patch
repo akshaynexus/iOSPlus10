@@ -1,0 +1,551 @@
+laurel 2941: IPA v4.2 AP data path: event + transfer rings, endpoint config for pipes 1 (WAN_PROD), 9 (WAN_CONS), 8 (LAN_CONS): QMAP, polled, no AP command channel. Runs after "LAUREL IPA: on". Kill switch cell_data=0. Self-check: channel states, GSI ERROR_LOG. Docs: docs/laurel_sprout/cellular.md section 11. Host test: test-ipa.sh data_test. NOT PROVEN on a phone.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 23:19:26.770343151 +0530
++++ b/bsd/conf/files	2026-11-01 23:24:17.345368441 +0530
+@@ -134,6 +134,7 @@
+ bsd/dev/laurel_ipa.c			standard
+ bsd/dev/laurel_ipa_fw.c			standard
+ bsd/dev/laurel_ipa_gsi.c		standard
++bsd/dev/laurel_ipa_data.c		standard
+ bsd/dev/laurel_ipa_hw.c			standard
+ bsd/dev/laurel_ipa_link.c		standard
+ bsd/dev/laurel_ipa_qmi.c		standard
+diff -ruN a/bsd/dev/laurel_ipa.c b/bsd/dev/laurel_ipa.c
+--- a/bsd/dev/laurel_ipa.c	2026-11-01 23:19:26.769343140 +0530
++++ b/bsd/dev/laurel_ipa.c	2026-11-01 23:24:17.340693305 +0530
+@@ -244,6 +244,10 @@
+ 		thread_deallocate(th);
+ 		return;
+ 	}
++	if (p == P_ON) {
++		lipa_data_kick(&mem);           /* laurel 2941: the AP's data pipes, before the radio goes online */
++		return;
++	}
+ 	if (p != P_QMI) {
+ 		return;
+ 	}
+diff -ruN a/bsd/dev/laurel_ipa_data2.h b/bsd/dev/laurel_ipa_data2.h
+--- a/bsd/dev/laurel_ipa_data2.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_data2.h	2026-11-01 23:35:23.406634328 +0530
+@@ -0,0 +1,134 @@
++/*
++ * laurel 2941: second half of laurel_ipa_data.c: transmit, the polling thread, the state. One file with the first half (included there): the file limit of this repo's rule.
++ * The thread runs from "LAUREL IPA: on" until the IPA goes off (modem crash): no restart. Poll: 1 ms while packets flow, 10 ms after 200 quiet polls,
++ * 100 ms while no data session is up. Each wake up costs a few register reads; numbers on a phone: [U].
++ */
++#define POLL_BUSY_MS    1u
++#define POLL_QUIET_MS   10u
++#define POLL_IDLE_MS    100u
++#define QUIET_POLLS     200u
++
++extern void laurel_pdp_input(uint8_t mux, const uint8_t *ip, uint32_t len);
++extern bool laurel_pdp_session(void);           /* a data session is up */
++extern void laurel_pdp_work(void);              /* interface create / address changes, in this thread, not the modem watch thread */
++
++/* a slot for one packet, or NULL (ring full, not ready): the caller copies len bytes, then lipa_tx_end. Holds tx_lock between the two */
++uint8_t *
++lipa_tx_begin(uint32_t len)
++{
++	struct lch *c = TX;
++
++	if (data_state != 1 || len + 4 > c->bufsz) {
++		return NULL;
++	}
++	lck_mtx_lock(&tx_lock);
++	(void)ring_poll(c, NULL);
++	if (c->next - c->done >= (uint32_t)c->slots - 1u) {
++		c->drops++;
++		lck_mtx_unlock(&tx_lock);
++		return NULL;
++	}
++	return c->buf + (uint64_t)(c->next & (uint32_t)(c->slots - 1)) * c->bufsz + 4;
++}
++
++void
++lipa_tx_end(uint8_t mux, uint32_t len)
++{
++	struct lch *c = TX;
++	uint32_t s = c->next & (uint32_t)(c->slots - 1);
++	uint8_t *h = c->buf + (uint64_t)s * c->bufsz;
++
++	h[0] = 0;                               /* pad 0, data */
++	h[1] = mux;
++	h[2] = (uint8_t)(len >> 8);
++	h[3] = (uint8_t)len;
++	tre_fill(c, c->next, c->buf_pa + (uint64_t)s * c->bufsz, len + 4, TRE_TYPE_XFER | TRE_IEOT | TRE_BEI);
++	c->next++;
++	c->pkts++;
++	c->bytes += len;
++	doorbell(c);
++	lck_mtx_unlock(&tx_lock);
++}
++
++/* 0 setting up or not started, 1 ready, -1 off; why = the reason text */
++int
++laurel_ipa_data_state(const char **why)
++{
++	if (data_state == 0) {
++		const char *w = "";
++		/* the IPA is off for good (ipa=0, a failed self-check, modem crash): one line, the pipes will not come */
++		if (!laurel_ipa_state(&w) && strncmp(w, "AP IPA side off", 15) == 0) {
++			data_off(w);
++		}
++	}
++	if (why != NULL) {
++		*why = data_state == 1 ? "" : data_why;
++	}
++	return data_state;
++}
++
++void
++lipa_data_stats(char *out, size_t max)
++{
++	snprintf(out, max, "tx %llu pkts %llu B %llu full, rx %llu pkts %llu B %llu not data, lan %llu buffers, errors %llu/%llu/%llu",
++	    TX->pkts, TX->bytes, TX->drops, chs[1].pkts, chs[1].bytes, chs[1].drops, chs[2].pkts, TX->errs, chs[1].errs, chs[2].errs);
++}
++
++/* one poll of the RX rings + what the interface asked for; the number of events */
++uint32_t
++lipa_data_poll(void)
++{
++	uint32_t n = ring_poll(&chs[1], laurel_pdp_input);
++
++	n += ring_poll(&chs[2], NULL);
++	return n;
++}
++
++static void
++data_thread(void *arg, wait_result_t w __unused)
++{
++	char why[160] = "";
++	uint32_t quiet = 0;
++
++	if (!lipa_data_setup((const struct lipa_mem *)arg, why, sizeof(why))) {
++		data_off(why);
++		(void)thread_terminate(current_thread());
++		return;
++	}
++	data_state = 1;
++	LOG("ready: 3 pipes up, waiting for a data session\n");
++	while (lipa_link_active()) {
++		uint32_t n = lipa_data_poll();
++		laurel_pdp_work();
++		quiet = n != 0 ? 0 : (quiet < QUIET_POLLS ? quiet + 1 : quiet);
++		IOSleep(!laurel_pdp_session() ? POLL_IDLE_MS : (quiet >= QUIET_POLLS ? POLL_QUIET_MS : POLL_BUSY_MS));
++	}
++	data_off("the IPA went off");
++	/* laurel_cell_off ran first (TopazModem: cell, then IPA): the interface loses its addresses and configd its service; no thread polls after this */
++	IOSleep(100);
++	laurel_pdp_work();
++	(void)thread_terminate(current_thread());
++}
++
++/* laurel_ipa_poll calls this while the IPA is on: the setup in its own thread (GSI commands wait); once */
++void
++lipa_data_kick(const struct lipa_mem *m)
++{
++	thread_t th;
++	uint32_t on = 1;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	(void)PE_parse_boot_argn("cell_data", &on, sizeof(on));
++	if (on == 0) {
++		data_off("boot-arg cell_data=0");
++		return;
++	}
++	if (kernel_thread_start(data_thread, (void *)(uintptr_t)m, &th) != KERN_SUCCESS) {
++		data_off("cannot start the data thread");
++		return;
++	}
++	thread_deallocate(th);
++}
+diff -ruN a/bsd/dev/laurel_ipa_data.c b/bsd/dev/laurel_ipa_data.c
+--- a/bsd/dev/laurel_ipa_data.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ipa_data.c	2026-11-01 23:27:42.227972280 +0530
+@@ -0,0 +1,313 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) IPA v4.2 AP data path (laurel 2941): GSI event + transfer rings and endpoint config for the
++ * AP's three data pipes. On with the IPA (kill switch ipa=0), and cell_data=0 turns off only this. Sources: stock 4.14
++ * ipa_v3 (ipa_utils.c ipa3_ep_mapping[IPA_4_2], rmnet_ipa.c handle3_ingress_format / handle3_egress_format, ipa_dp.c
++ * ipa3_assign_policy), mainline drivers/net/ipa (data/ipa_data-v4.2.c, reg/gsi_reg-v4.0.c, reg/ipa_reg-v4.2.c, gsi.c,
++ * ipa_endpoint.c). hackios-scion hakios.ipa.c has the same polled shape for v4.11; it never carried a packet [V its docs].
++ *
++ *   pipe 1 APPS_WAN_PROD  GSI channel 0  AP -> IPA -> modem: QMAP header + IP packet (no checksum offload: the stack does it)
++ *   pipe 9 APPS_WAN_CONS  GSI channel 3  modem -> IPA -> AP: QMAP frames, aggregated up to 6 KB or 500 us in an 8 KB buffer
++ *   pipe 8 APPS_LAN_CONS  GSI channel 2  IPA default route (ROUTE register) and exceptions: counted, dropped; without a consumer the IPA could stall
++ * Not here: AP command channel (pipe 6). The tables are in local memory already (laurel_ipa_hw.c), and the modem fills the
++ * embedded pipe's filter table itself (trinket.dtsi qcom,modem-cfg-emb-pipe-flt: stock installs no AP rule on pipe 1 either).
++ * Channels are allocated by laurel_ipa_gsi.c (GSI 2.2 quirk): here event ring ALLOCATE + program + channel program + START.
++ * Polled by one thread, no GSI interrupt. All ring memory is the modem pool: Normal NC, below 4 GiB, the IPA's stream is identity.
++ * A failure: "LaurelIPA: data: off: <why>" and data stays off; the IPA handshake, the radio and Wi-Fi are not touched.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++#include "laurel_ipa_regs.h"
++
++extern void IOSleep(unsigned int milliseconds);
++extern void *topaz_pool_alloc(uint64_t size, uint64_t *pa);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern kern_return_t thread_terminate(thread_t);
++
++#define LOG(...)                printf("LaurelIPA: data: " __VA_ARGS__)
++
++#define RE_SIZE                 16u             /* GSI_RING_ELEMENT_SIZE */
++#define CMD_WAIT_MS             1000u
++#define TRE_IEOT                (1u << 9)
++#define TRE_BEI                 (1u << 10)
++#define TRE_TYPE_XFER           (2u << 16)
++#define CH_STATE(v)             (((v) >> 20) & 0xFu)
++#define ST_ALLOCATED            1u
++#define ST_STARTED              2u
++#define OP_ALLOCATE             0u
++#define OP_START                1u
++#define TX_SLOT                 2048u           /* one packet + QMAP header */
++#define RX_BUF                  8192u           /* IPA_GENERIC_RX_BUFF_BASE_SZ */
++
++struct lch {
++	const char *name;
++	uint8_t ch, ev, pipe;
++	bool tx;
++	uint16_t slots;                         /* power of two */
++	uint32_t bufsz;
++	volatile uint8_t *tre, *evr;
++	uint8_t *buf;
++	uint64_t tre_pa, ev_pa, buf_pa;
++	uint32_t next, done, ev_next;           /* free running */
++	uint64_t pkts, bytes, drops, errs;
++};
++static struct lch chs[LIPA_DATA_CH] = {
++	{ .name = "WAN_PROD", .ch = 0, .ev = 0, .pipe = 1, .tx = true, .slots = 128, .bufsz = TX_SLOT },
++	{ .name = "WAN_CONS", .ch = 3, .ev = 1, .pipe = 9, .tx = false, .slots = 64, .bufsz = RX_BUF },
++	{ .name = "LAN_CONS", .ch = 2, .ev = 2, .pipe = 8, .tx = false, .slots = 8, .bufsz = RX_BUF },
++};
++#define TX      (&chs[0])
++
++static const struct lipa_mem *pm;
++static LCK_GRP_DECLARE(data_grp, "laurel_ipa_data");
++static LCK_MTX_DECLARE(tx_lock, &data_grp);
++static volatile int data_state;                 /* 0 not ready, 1 ready, -1 off */
++static bool started;
++static char data_why[160] = "no AP GSI data pipes yet";
++
++static inline void ipa_wr(uint32_t o, uint32_t v) { *(volatile uint32_t *)(pm->regs + o) = v; }
++
++static void
++data_off(const char *why)
++{
++	strlcpy(data_why, why, sizeof(data_why));
++	data_state = -1;
++	LOG("off: %s\n", why);
++}
++
++static bool
++wait_state(bool ev, uint32_t n, uint32_t want, char *why, size_t wl, const char *what)
++{
++	uint32_t st = 0;
++
++	for (uint32_t ms = 0; ms < CMD_WAIT_MS; ms++) {
++		st = CH_STATE(lipa_gsi_rd(ev ? G_EV_CNTXT(n, 0) : G_CH_CNTXT(n, 0)));
++		if (st == want) {
++			break;
++		}
++		IOSleep(1);
++	}
++	lipa_gsi_wr(ev ? G_SRC_EV_CH_IRQ_CLR : G_SRC_CH_IRQ_CLR, 1u << n);
++	if (st != want) {
++		snprintf(why, wl, "%s %u: state %u, wanted %u, GLOB_IRQ %08x, ERROR_LOG %08x", what, n, st, want,
++		    lipa_gsi_rd(G_GLOB_IRQ_STTS), lipa_gsi_rd(G_ERROR_LOG));
++		return false;
++	}
++	return true;
++}
++
++/* gsi_evt_ring_program() + gsi_channel_program() for GSI 2.2. Channel scratch 0: stock "At IPA 4.0/4.1/4.2, we do not use MCS smart prefetch" */
++static bool
++rings_program(struct lch *c, char *why, size_t wl)
++{
++	uint32_t e = c->ev, n = c->ch, len = (uint32_t)c->slots * RE_SIZE;
++
++	if (CH_STATE(lipa_gsi_rd(G_EV_CNTXT(e, 0))) != ST_ALLOCATED) {
++		lipa_gsi_wr(G_EV_CH_CMD, e | OP_ALLOCATE << 24);
++		if (!wait_state(true, e, ST_ALLOCATED, why, wl, "event ring ALLOCATE")) {
++			return false;
++		}
++	}
++	lipa_gsi_wr(G_EV_CNTXT(e, 0), 2u /* GPI */ | 1u << 16 /* INTYPE IRQ */ | RE_SIZE << 24);
++	lipa_gsi_wr(G_EV_CNTXT(e, 1), len);
++	lipa_gsi_wr(G_EV_CNTXT(e, 2), (uint32_t)c->ev_pa);
++	lipa_gsi_wr(G_EV_CNTXT(e, 3), (uint32_t)(c->ev_pa >> 32));
++	lipa_gsi_wr(G_EV_CNTXT(e, 8), 32u /* MODT */ | 1u << 16 /* MODC: from the channel */);
++	for (uint32_t i = 9; i <= 13; i++) {
++		lipa_gsi_wr(G_EV_CNTXT(e, i), 0);
++	}
++	lipa_gsi_wr(G_EV_DOORBELL(e), (uint32_t)c->ev_pa + len - RE_SIZE);      /* "last processed": the ring's last entry */
++	if (CH_STATE(lipa_gsi_rd(G_CH_CNTXT(n, 0))) != ST_ALLOCATED) {
++		snprintf(why, wl, "channel %u is not ALLOCATED before its program: state %u", n, CH_STATE(lipa_gsi_rd(G_CH_CNTXT(n, 0))));
++		return false;
++	}
++	lipa_gsi_wr(G_CH_CNTXT(n, 0), 2u | (c->tx ? 1u << 3 : 0) | e << 14 | RE_SIZE << 24);
++	lipa_gsi_wr(G_CH_CNTXT(n, 1), len);
++	lipa_gsi_wr(G_CH_CNTXT(n, 2), (uint32_t)c->tre_pa);
++	lipa_gsi_wr(G_CH_CNTXT(n, 3), (uint32_t)(c->tre_pa >> 32));
++	lipa_gsi_wr(G_CH_QOS(n), 1u << 10);     /* USE_ESCAPE_BUF_ONLY (table GSI_ESCAPE_BUF_ONLY), WRR weight 0 */
++	lipa_gsi_wr(G_CH_SCRATCH(n, 0), 0);
++	lipa_gsi_wr(G_CH_SCRATCH(n, 1), 0);
++	lipa_gsi_wr(G_CH_SCRATCH(n, 2), 0);
++	lipa_gsi_wr(G_CH_SCRATCH(n, 3), lipa_gsi_rd(G_CH_SCRATCH(n, 3)) & 0xFFFFu);
++	return true;
++}
++
++/* one line of values: rmnet_ipa.c + ipa_endpoint.c; no checksum offload, no status towards the AP. Pipe 1's status goes to the modem's pipe 10
++ * (ipa3_assign_policy: "exception packets (i.e. QMAP commands) to be routed to modem") */
++static void
++endpoint_program(const struct lch *c)
++{
++	uint32_t p = c->pipe;
++
++	ipa_wr(R_ENDP_CFG(p), 0);
++	ipa_wr(R_ENDP_RSRC_GRP(p), 0);
++	if (c->tx) {
++		ipa_wr(R_ENDP_NAT(p), 0);
++		ipa_wr(R_ENDP_HDR(p), V_HDR_TX);
++		ipa_wr(R_ENDP_HDR_EXT(p), V_HDR_EXT_TX);
++		ipa_wr(R_ENDP_MODE(p), 0);      /* BASIC */
++		ipa_wr(R_ENDP_AGGR(p), 0);
++		ipa_wr(R_ENDP_DEAGGR(p), 0);
++		ipa_wr(R_ENDP_SEQ(p), V_SEQ_WAN_PROD);
++		ipa_wr(R_ENDP_STATUS(p), V_STATUS_TO_MODEM);
++		return;
++	}
++	ipa_wr(R_ENDP_HDR(p), p == 9 ? V_HDR_WAN_RX : 0);
++	ipa_wr(R_ENDP_HDR_EXT(p), p == 9 ? V_HDR_EXT_WAN_RX : V_HDR_EXT_LAN_RX);
++	ipa_wr(R_ENDP_METADATA_MASK(p), p == 9 ? V_METADATA_MASK : 0);
++	ipa_wr(R_ENDP_AGGR(p), p == 9 ? V_AGGR_WAN_RX : V_AGGR_LAN_RX);
++	ipa_wr(R_ENDP_HOL_EN(p), 0);
++	ipa_wr(R_ENDP_STATUS(p), 0);
++}
++
++static inline void
++tre_fill(struct lch *c, uint32_t i, uint64_t addr, uint32_t len, uint32_t flags)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(c->tre + (i & (uint32_t)(c->slots - 1)) * RE_SIZE);
++
++	t[0] = (uint32_t)addr;
++	t[1] = (uint32_t)(addr >> 32);
++	t[2] = len;                             /* len_opcode, reserved */
++	t[3] = flags;
++}
++
++static inline void
++doorbell(const struct lch *c)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	lipa_gsi_wr(G_CH_DOORBELL(c->ch), (uint32_t)c->tre_pa + (c->next & (uint32_t)(c->slots - 1)) * RE_SIZE);
++}
++
++static void
++rx_post(struct lch *c)
++{
++	uint32_t s = c->next & (uint32_t)(c->slots - 1);
++
++	tre_fill(c, c->next, c->buf_pa + (uint64_t)s * c->bufsz, c->bufsz, TRE_TYPE_XFER | TRE_IEOT);
++	c->next++;
++}
++
++/* QMAP frames in one RX buffer; pure, host-tested. Header: bit 7 command, bits 5:0 pad; mux; length (big endian) with the pad */
++void
++lipa_qmap_walk(const uint8_t *b, uint32_t len, lipa_rx_fn fn, uint64_t *pkts, uint64_t *drops)
++{
++	for (uint32_t at = 0; at + 4 <= len;) {
++		uint32_t pad = b[at] & 0x3Fu, pl = (uint32_t)b[at + 2] << 8 | b[at + 3];
++
++		if (pl == 0 || at + 4 + pl > len || pad >= pl) {
++			(*drops)++;
++			return;
++		}
++		if ((b[at] & 0x80u) == 0) {
++			(*pkts)++;
++			fn(b[at + 1], b + at + 4, pl - pad);
++		} else {
++			(*drops)++;             /* QMAP command: flow control, not used */
++		}
++		at += 4 + pl;
++	}
++}
++
++/* events since the last call; RX: frames to fn, the buffer again to the ring. Returns the work done */
++static uint32_t
++ring_poll(struct lch *c, lipa_rx_fn fn)
++{
++	uint32_t rp = lipa_gsi_rd(G_EV_CNTXT(c->ev, 4)), base = (uint32_t)c->ev_pa, mask = (uint32_t)c->slots - 1u, n = 0;
++
++	if (rp < base || rp >= base + (uint32_t)c->slots * RE_SIZE) {
++		if (c->errs++ == 0) {
++			LOG("%s: event pointer %08x outside the ring at %08x\n", c->name, rp, base);
++		}
++		return 0;
++	}
++	uint32_t idx = (rp - base) / RE_SIZE;
++	while ((c->ev_next & mask) != idx) {
++		volatile const uint32_t *e = (volatile const uint32_t *)(c->evr + (c->ev_next & mask) * RE_SIZE);
++		uint64_t xfer = (uint64_t)e[0] | (uint64_t)e[1] << 32;
++		uint32_t blen = e[2] & 0xFFFFu, slot = (uint32_t)((xfer - c->tre_pa) / RE_SIZE);
++
++		c->ev_next++;
++		n++;
++		if (xfer < c->tre_pa || slot >= c->slots) {
++			if (c->errs++ < 4) {
++				LOG("%s: event for TRE %llx outside the ring at %llx\n", c->name, (unsigned long long)xfer, (unsigned long long)c->tre_pa);
++			}
++			continue;
++		}
++		if (c->tx) {
++			c->done = c->done + ((slot + 1u - c->done) & mask);
++			continue;
++		}
++		c->done++;
++		if (blen > c->bufsz) {
++			blen = c->bufsz;
++		}
++		c->bytes += blen;
++		if (c->pipe == 9) {
++			lipa_qmap_walk(c->buf + (uint64_t)slot * c->bufsz, blen, fn, &c->pkts, &c->drops);
++		} else {
++			c->pkts++;              /* LAN: dropped */
++		}
++		rx_post(c);
++	}
++	if (n != 0) {
++		if (!c->tx) {
++			doorbell(c);
++		}
++		lipa_gsi_wr(G_EV_DOORBELL(c->ev), base + ((c->ev_next - 1u) & mask) * RE_SIZE);
++	}
++	return n;
++}
++
++/* the steps: memory for all three, then each ring + endpoint + START; the RX buffers go in after START (mainline gsi_channel_start + replenish) */
++bool
++lipa_data_setup(const struct lipa_mem *m, char *why, size_t wl)
++{
++	pm = m;
++	for (unsigned i = 0; i < LIPA_DATA_CH; i++) {
++		struct lch *c = &chs[i];
++
++		c->tre = topaz_pool_alloc((uint64_t)c->slots * RE_SIZE, &c->tre_pa);
++		c->evr = topaz_pool_alloc((uint64_t)c->slots * RE_SIZE, &c->ev_pa);
++		c->buf = topaz_pool_alloc((uint64_t)c->slots * c->bufsz, &c->buf_pa);
++		if (c->tre == NULL || c->evr == NULL || c->buf == NULL) {
++			snprintf(why, wl, "no pool memory for %s (%u bytes of buffers)", c->name, (uint32_t)c->slots * c->bufsz);
++			return false;
++		}
++	}
++	for (unsigned i = 0; i < LIPA_DATA_CH; i++) {
++		struct lch *c = &chs[i];
++
++		if (!rings_program(c, why, wl)) {
++			return false;
++		}
++		endpoint_program(c);
++		lipa_gsi_wr(G_CH_CMD, (uint32_t)c->ch | OP_START << 24);
++		if (!wait_state(false, c->ch, ST_STARTED, why, wl, "channel START")) {
++			return false;
++		}
++		if (!c->tx) {
++			while (c->next < (uint32_t)c->slots - 1u) {
++				rx_post(c);
++			}
++			doorbell(c);
++		}
++		LOG("%s: pipe %u, GSI channel %u, event ring %u started, %u slots of %u bytes at %llx\n", c->name, c->pipe, c->ch, c->ev,
++		    c->slots, c->bufsz, (unsigned long long)c->buf_pa);
++	}
++	uint32_t log = lipa_gsi_rd(G_ERROR_LOG);
++	if (log != 0) {
++		snprintf(why, wl, "GSI ERROR_LOG %08x after the channels started", log);
++		return false;
++	}
++	return true;
++}
++
++#include "laurel_ipa_data2.h"
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ipa_regs.h b/bsd/dev/laurel_ipa_regs.h
+--- a/bsd/dev/laurel_ipa_regs.h	2026-11-01 23:19:26.769343140 +0530
++++ b/bsd/dev/laurel_ipa_regs.h	2026-11-01 23:24:17.340393118 +0530
+@@ -18,6 +18,14 @@
+ #define LIPA_GSI_EE0_SIZE       0x00004000u
+ /* ---- GSI EE 0 registers, offsets from LIPA_GSI_EE0_PA (gsi_reg_v1.h: the 0x1cxxx / 0x1fxxx offsets, n = 0) */
+ #define G_CH_CNTXT_0(k)         (0x80u * (k))   /* [23:20] CHSTATE */
++#define G_CH_CNTXT(k, n)        (0x80u * (k) + 4u * (n))        /* laurel 2941 (gsi_reg-v4.0.c, n = 0..3) */
++#define G_CH_QOS(k)             (0x5Cu + 0x80u * (k))
++#define G_CH_SCRATCH(k, n)      (0x60u + 0x80u * (k) + 4u * (n))
++#define G_EV_CNTXT(e, n)        (0x1000u + 0x80u * (e) + 4u * (n))
++#define G_CH_DOORBELL(k)        (0x2000u + 8u * (k))
++#define G_EV_DOORBELL(e)        (0x2100u + 8u * (e))
++#define G_EV_CH_CMD             0x3010u
++#define G_SRC_EV_CH_IRQ_CLR     0x30A4u
+ #define G_STATUS                0x3000u         /* bit 0 ENABLED */
+ #define G_CH_CMD                0x3008u
+ #define G_GENERIC_CMD           0x3018u         /* [4:0] opcode, [9:5] channel, [13:10] EE */
+@@ -65,6 +73,30 @@
+ #define R_DST_RSRC_GRP_01(n)    (0x500u + 0x20u * (n))
+ #define R_SRAM_DIRECT           0x7000          /* IPA_SW_AREA_RAM_DIRECT_ACCESS_n, n = byte offset / 4 */
+ 
++/* laurel 2941: endpoint registers (reg/ipa_reg-v4.2.c) and the AP data pipes' values (laurel_ipa_data.c) */
++#define R_ENDP_CFG(p)           (0x808u + 0x70u * (p))
++#define R_ENDP_NAT(p)           (0x80Cu + 0x70u * (p))
++#define R_ENDP_HDR(p)           (0x810u + 0x70u * (p))
++#define R_ENDP_HDR_EXT(p)       (0x814u + 0x70u * (p))
++#define R_ENDP_METADATA_MASK(p) (0x818u + 0x70u * (p))
++#define R_ENDP_MODE(p)          (0x820u + 0x70u * (p))
++#define R_ENDP_AGGR(p)          (0x824u + 0x70u * (p))
++#define R_ENDP_HOL_EN(p)        (0x82Cu + 0x70u * (p))
++#define R_ENDP_DEAGGR(p)        (0x834u + 0x70u * (p))
++#define R_ENDP_RSRC_GRP(p)      (0x838u + 0x70u * (p))
++#define R_ENDP_SEQ(p)           (0x83Cu + 0x70u * (p))
++#define R_ENDP_STATUS(p)        (0x840u + 0x70u * (p))
++#define V_HDR_TX                0x00000044u     /* HDR_LEN 4, METADATA_VALID, metadata offset 0 ("modem want offset at 0!") */
++#define V_HDR_EXT_TX            0x00000001u     /* big endian */
++#define V_SEQ_WAN_PROD          0x00000806u     /* IPA_DPS_HPS_REP_SEQ_TYPE_PKT_PROCESS_NO_DEC_NO_UCP_DMAP */
++#define V_STATUS_TO_MODEM       0x00000015u     /* STATUS_EN, STATUS_ENDP 10 = Q6_WAN_CONS */
++#define V_HDR_WAN_RX            0x002800C4u     /* HDR_LEN 4, metadata at 1, packet size at 2 */
++#define V_HDR_EXT_WAN_RX        0x0000000Bu     /* big endian, pad valid, length with pad */
++#define V_HDR_EXT_LAN_RX        0x00000800u     /* pad to 4 */
++#define V_METADATA_MASK         0xFF000000u
++#define V_AGGR_WAN_RX           0x002004D1u     /* ENABLE_AGGR, GENERIC, 6 KB, 1 tick = 500 us (COUNTER_CFG), SW_EOF */
++#define V_AGGR_LAN_RX           0x000004D1u
++
+ /* values of ipa3_init_hw() / ipa3_post_init() for IPA_HW_v4_2 */
+ #define V_BCR                   0x00000000u     /* IPA_BCR_REG_VAL_v4_2 */
+ #define V_CLKON_OPEN            ((1u << 28) | (1u << 29))
+@@ -136,6 +168,19 @@
+ /* laurel_ipa_gsi.c: the GSI channels of all EEs (GSI 2.2: the AP allocates the modem's too) */
+ bool lipa_gsi_alloc(uint32_t pipes, char *why, size_t wl);
+ 
++/* laurel_ipa_data.c (laurel 2941): the AP's data pipes (WAN_PROD, WAN_CONS, LAN_CONS) */
++#define LIPA_DATA_CH            3u
++#define LIPA_MUX_ID             1u              /* QMAP mux of the data session */
++typedef void (*lipa_rx_fn)(uint8_t mux, const uint8_t *ip, uint32_t len);
++void lipa_qmap_walk(const uint8_t *b, uint32_t len, lipa_rx_fn fn, uint64_t *pkts, uint64_t *drops);
++bool lipa_data_setup(const struct lipa_mem *m, char *why, size_t wl);
++uint32_t lipa_data_poll(void);
++uint8_t *lipa_tx_begin(uint32_t len);
++void lipa_tx_end(uint8_t mux, uint32_t len);
++void lipa_data_stats(char *out, size_t max);
++void lipa_data_kick(const struct lipa_mem *m);
++int laurel_ipa_data_state(const char **why);
++
+ /* laurel_ipa_fw.c: the IPA firmware from the vendor partition through TrustZone PAS 15 */
+ bool lipa_fw_load(char *why, size_t wl);
+ 

@@ -44,18 +44,67 @@ scenario2(char s)
 		CHECK(M.opmode_reads >= 6);
 		CHECK(strstr(last(), "part: SIM1 present (USIM ready), SIM2 absent; modem low power") != NULL);
 		break;
-	case 'K':       /* the modem never leaves 5: after 60 s the line says so, no ONLINE; reads go on every 10 s */
+	case 'K':       /* boot 22:50: the modem says 5 and takes every request without a change: 6 rounds, bounded, then the line says so */
 		scen = "K mode stays 5";
 		test_ipa_on = true;
 		M.sim[0].card = 1; M.sim[0].type = 2; M.sim[0].state = 7;
-		M.opmode = 5;
+		M.opmode = 5; M.mode_sticky = true;
 		services(true);
-		run_ms(95000, true);
-		CHECK(M.set_online == 0);
-		CHECK(M.opmode_reads >= 8 && M.opmode_reads <= 12);
-		CHECK(strstr(last(), "part: SIM1 present (USIM ready), SIM2 absent; modem shutting down") != NULL);
+		run_ms(19000, true);
+		CHECK(M.set_online == 0 && M.set_lpm == 0);         /* grace time */
+		run_ms(4000, true);
+		CHECK(M.set_lpm == 1 && M.set_online == 1);         /* low power, then online despite 5 */
+		run_ms(400000, true);
+		CHECK(M.set_lpm == 6 && M.set_online == 6);
+		CHECK(strstr(logbuf, "DMS SET_OPERATING_MODE online: ok (reported shutting down, round 6 of 6)") != NULL);
+		CHECK(strstr(last(), "part: SIM1 present (USIM ready), SIM2 absent; modem shutting down; radio off: modem answered ONLINE ok 6 times") != NULL);
 		cellbar_parse(state_now(), &cs);
 		CHECK(!cs.radio_online && cs.sub[0].bars == 0 && cs.sub[0].reg == 0 && strcmp(cs.sub[0].sim, "ready") == 0);
+		CHECK(strstr(state_now(), "mode=shutting down\n") != NULL && strstr(state_now(), "caps=GSM,UMTS,LTE\n") != NULL);
+		break;
+	case 'P':       /* 5, low power refused (invalid transition, scion), online works: the refusal does not stop the round */
+		scen = "P low power refused, online ok";
+		test_ipa_on = true;
+		M.sim[0].card = 1; M.sim[0].type = 2; M.sim[0].state = 7;
+		M.opmode = 5; M.lpm_refuse = 0x3C;
+		services(true);
+		run_ms(60000, true);
+		CHECK(M.set_lpm == 1 && M.set_online == 1);
+		CHECK(strstr(logbuf, "DMS SET_OPERATING_MODE low power: error 0x3c") != NULL);
+		CHECK(strstr(logbuf, "operating mode online (raw 0") != NULL);
+		CHECK(strstr(last(), "on: SIM1 present (USIM ready), SIM2 absent; modem online; SIM1 registered") != NULL);
+		cellbar_parse(state_now(), &cs);
+		CHECK(cs.radio_online && cs.sub[0].reg == 2);
+		CHECK(strstr(state_now(), "sub0.plmn=404-45\nsub0.ps=1\n") != NULL && strstr(state_now(), "sub0.rsrp=-98\n") != NULL);
+		break;
+	case 'Q':       /* 5, everything refused: 6 rounds and the line has the error; no IPA: nothing asked at all */
+		scen = "Q all refused, then no IPA";
+		test_ipa_on = true;
+		M.sim[0].card = 1; M.sim[0].type = 2; M.sim[0].state = 7;
+		M.opmode = 5; M.lpm_refuse = 0x34; M.set_refuse_left = 100;
+		services(true);
+		run_ms(200000, true);
+		CHECK(M.set_online == 6 && M.set_lpm == 6);
+		CHECK(strstr(last(), "modem shutting down; radio off: modem refused ONLINE 6 times, error 0x34") != NULL);
+		break;
+	case 'R':       /* the mode indication: low power comes by itself: ONLINE without our low power; no IPA first: no SET */
+		scen = "R mode indication";
+		M.sim[0].card = 1; M.sim[0].type = 2; M.sim[0].state = 7;
+		M.opmode = 5;
+		services(true);
+		run_ms(30000, true);
+		CHECK(M.set_lpm == 0 && M.set_online == 0 && M.event_reports == 1);
+		CHECK(strstr(logbuf, "modem radio technologies: GSM,UMTS,LTE") != NULL);
+		{
+			uint8_t mode = 1, ind[8];
+			uint32_t n = 0;
+			put_tlv(ind, &n, 0x14, &mode, 1);
+			answer(0x4013, 4, 0, 0x0001, 0, ind, n);
+		}
+		test_ipa_on = true;
+		run_ms(5000, true);
+		CHECK(strstr(logbuf, "operating mode low power (raw 1, indication") != NULL);
+		CHECK(M.set_lpm == 0 && M.set_online == 1);
 		break;
 	case 'L':       /* the modem refuses ONLINE 2 times, then takes it; then a run where it always refuses: the line says so */
 		scen = "L ONLINE refused";
@@ -76,6 +125,7 @@ scenario2(char s)
 		run_ms(120000, true);
 		CHECK(M.set_online == 6);
 		CHECK(strstr(last(), "part: SIM1 present (USIM ready), SIM2 absent; modem low power; radio off: modem refused ONLINE 6 times, error 0x34") != NULL);
+		CHECK(M.set_lpm == 0);
 		break;
 	case 'N':       /* boot 20:02: BIND error 3 while UIM starts: asked again; nas2 never binds: no registration claimed for SIM2 */
 		scen = "N NAS bind retries";

@@ -105,6 +105,8 @@ Direct `flash-root.sh` with the default image needs `status ok`; a named image h
 
 Also fixed: `sudo` drops the environment, so `AUDIO=0 root-flash-test.sh` never reached `root.sh`. It now passes the switches (`root-manifest.py switches`).
 
+An update with the data kept: `scripts/laurel/root-update.sh` passes the same flash-check; its payload comes from the same `root.sh` run (`root-update.md`).
+
 ## 6. Watchdogs that are off by default
 
 Nothing was changed. Facts first, then what can be turned on. None of these can reset the phone: on this port nothing can.

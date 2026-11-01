@@ -1019,3 +1019,23 @@ Done: no `usbnetcfg` at boot, USB service without router or DNS, rank Last; `sha
 Not done, cause [U]: reason of the two sig 6 crashes: read over SSH now.
 Next: owner's test 1 (no build: `usbnetcfg show` + `down` on the running phone), then root + kernel build and flash (owner approves).
 
+
+## Mi A3: update the root in place, keep /private/var (2026-11-01, branch t3/laurel-root-update; host tests + read-only plan on the phone, NEVER RUN WRITING ON THE PHONE)
+Owner: "Flash the latest images, but don't wipe userdata, or just append, so I don't have to reconnect Wi-Fi and whatnot." Doc: docs/laurel_sprout/root-update.md.
+Done: `root-delta.py` in `root.sh` (stat snapshot after mkiosroot, delta after the table, `$APPLE/laurel-ios16-root.update`); `root-update.sh` (`--dry-run`, `--list`, `--rollback`, `--after-boot`; driver `rootupdate/`); `update-phone.sh` = `make laurel-update`; `root-flash-test.sh` stays for clean installs.
+Results [V, merged with d571276]: root-update-test.sh 94/94 with GNU tools, 94/94 with toybox + dash; build-honest-test.sh 60/60; root-dry-run.sh PASS with AIRPLAY=0 CELL=0 (12 installed, 2 off, 9739 paths, 593 MB; their stages are not built here); first update simulated with the real launchd.plist and /var plists of the 21:57 image. One read-only plan on the real phone, 52 s (root-update.md section 8).
+Unproven (root-update.md section 9): the whole write path on the phone, `pmregister`, `ctl reboot`, boot of an updated root; `sudo root.sh` was not run here, so no real payload exists yet.
+Next: only when the owner asks (rule: no flash, reboot or write unless asked): build-all + `sudo root.sh`, `scripts/laurel/root-update.sh --dry-run`, then `scripts/bg.sh rupd-phone scripts/laurel/update-phone.sh`.
+## Mi A3: radio online + mobile data built (2026-11-01, branch t3/laurel-cellular-radio, patches 2940-2942, `laurel-celld`; build + host tests, NOT BOOTED)
+Owner: network first. Phone [V boot 22:50]: IPA handshake passes, no crash, Wi-Fi on; DMS 5 for the whole boot blocked ONLINE. Docs: docs/laurel_sprout/cellular.md section 11 (cause table, risk per step, expected lines, test order).
+Done: 2940: no block on mode 5 after 20 s: low power + ONLINE, 6 bounded rounds, each answer one line; mode reason + hardware restricted, DMS indication, modem caps, NAS bind ok line, state keys. 2941: AP pipes 1, 9, 8 (GSI rings, endpoints, QMAP, polled). 2942: DPM, WDA, per-family WDS session, `pdp_ip0`, `kern.laurel_cell_net`. `laurel-celld` + launchd job: the service in configd.
+Build [V]: 307/307 patches, 0 failed, 0 LSE, printf-arg-check OK, kernel sha256 10eb748e318af1cf, series 65f59ea3a66db510; laurel-celld + liblaurel-cellbar armv80 clean; test-cell 23/23; test-ipa PASS (vendor part skipped); build-honest-test 60/60; xnutils-test PASS; root-cell.sh on the real 20H392 launchd cache: job in, 524 jobs. No root image: sudo needs a password here.
+Facts [V firmware]: LTE at most (`device_config.xml` no NR letter), DSDS L+L, max_active_voice 1. MCFG reads only digests: no activation.
+Unproven: ONLINE at mode 5 ([U], the main risk, an assert stops Wi-Fi for the boot); registration; bars with real values; every data step; IPMonitor key names and Wi-Fi-first ranking [I]. Not built: LTE tag, Settings > Cellular, default SIM, network search, SMS, calls, APN setting.
+`ipa=0` stays default in uefi-image.sh. Next: normal image, then `IPA_TEST=1` image; section 11.6.
+
+## Mi A3: radio online, registration denied (2026-11-01 23:42, coordinator; last iOS flash, owner moved to Android)
+
+[V, logs/laurel-boot-radio.txt, IPA test image on the 22:xx root] IPA on; `DMS SET_OPERATING_MODE online: ok`, `operating mode online (raw 0)`; `modem radio technologies: GSM,UMTS,LTE` (no 5G); no modem crash in 2 min; `nas1/nas2 BIND_SUBSCRIPTION: ok`.
+Then at 23:43:59-23:44:37: card state USIM/7 -> USIM/6, `SIM1 present (USIM illegal), SIM2 present (USIM illegal); modem online; SIM1 registration denied rssi -104; SIM2 registration denied`. Cause unknown.
+Owner rule from now on: no flashing unless the owner asks. Code work goes on and is pushed to laurel-sprout.
