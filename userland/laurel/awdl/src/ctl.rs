@@ -62,9 +62,11 @@ pub struct Status {
     pub mode_shared: u32,
     pub peers: u32,
     pub fw_fatal: u32,
+    pub off_age_ms: u32,
 }
 
 pub const STATE_OFF: u32 = 0;
+pub const STATE_STARTING: u32 = 3;
 pub const STATE_UP: u32 = 4;
 pub const WHY_START_STATUS: u32 = 5;
 pub const WHY_START_TIMEOUT: u32 = 6;
@@ -171,6 +173,25 @@ impl Drop for Ctl {
     fn drop(&mut self) {
         // SAFETY: our descriptor. The kernel ends the vdev when the socket closes.
         unsafe { close(self.fd) };
+    }
+}
+
+/// awdl0 down at the end of a session: no radio under it, so the stack must not send there. `ipv6_up` brings it back.
+pub fn if_down() {
+    // SAFETY: requests of the kernel's layout, zero but for the name.
+    unsafe {
+        let fd = socket(AF_INET6, SOCK_DGRAM, 0);
+        if fd < 0 {
+            return;
+        }
+        let mut ifr = [0u8; 32];
+        ifr[..5].copy_from_slice(b"awdl0");
+        if ioctl(fd, SIOCGIFFLAGS, ifr.as_mut_ptr()) == 0 {
+            let flags = i16::from_ne_bytes([ifr[16], ifr[17]]) & !IFF_UP;
+            ifr[16..18].copy_from_slice(&flags.to_ne_bytes());
+            let _ = ioctl(fd, SIOCSIFFLAGS, ifr.as_mut_ptr());
+        }
+        close(fd);
     }
 }
 

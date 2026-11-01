@@ -4952,3 +4952,14 @@ Traps of 12377 that compile fine and fail at run time [V code]:
 Donor [owner, 2026-11-02]: N104AP, iPhone12,1, `artwork-device-subtype` 0x700, scale 2. `mkadt.py --donor`; iOS 16 D22AP unchanged.
 Guess [I]: first failure is the 4K bootstrap in `start.s`/`arm_vm_init`, then kalloc startup with stock clang.
 Negroni series tool after the `--profile` change: same result as before it (`0401-negroni-ram-7g` is an ERROR with both: that patch changes base-owned files and is not listed in `patch-rules.py`; older than this work and not fixed here).
+
+## Mi A3 iOS 26 AirDrop and AirPlay (2026-11-02, t3/laurel-ios26-airdrop, host only)
+Full text: `docs/laurel_sprout/ios26-airdrop.md`.
+- A WLAN firmware assert ends `modem_watch`: Wi-Fi, cellular and IPA are off until reboot; no restart exists. So AWDL's untested steps wait for `/private/var/db/laurel-awdl.allow` (`alone`, then `shared`). `failed` in `laurel-awdl.state` stays until `rm`.
+- Trap: sharingd keeps `EveryoneModeUpdateTime` after Everyone mode ends; a search for the word "Everyone" is true for ever. Read `DiscoverableMode` from the plist.
+- Trap: WMI queue is 8 messages and a full queue drops the next one: AWDL uses at most half.
+- 23F84: no mediaserverd; `com.apple.airplay.sender.xpc` is gone (audiomxd: routes; airplayd: endpoints). `sessionProtocolOverride`, `BrowseAllInterfaces`, `RegisterAllInterfaces` remain. New Swift stack (`AirDropNW`): `requiredInterfaceSubtype = wifiAWDL` on connect, `requiredInterface` by the name `awdl0` on the server. `wifiAWDL` = `if_functional_type`: subfamily Wi-Fi + `IFEF_AWDL`, which brings ND6ALT: `nd6_alt_node_present` per peer.
+- `redwood_apple80211.c` in the 12377 tree still has iOS 16 sizes. N104AP IO80211 [V]: SCAN_REQ 0x1598, SCAN_RESULT 0x8e0, ASSOCIATE 0x38c, link event `cmp w2, #0x2c` at 0x25ca90a7c. IOS-26-Hot 0145 + 0146 have the changes (self-reported results); its wland radio does not fit our kernel radio. Fit list: section 4.1.
+- Tools: `scripts/debug/air-re-26.sh`, `scripts/debug/macho-xref.py` (needs `__oslogstring`, or Swift log strings are not found). `ipsw dyld image DSC` lists apps only; `dyld info --dylibs` lists dylibs. `ipsw dyld symaddr --in` takes `pattern`, about 3 to 4 minutes per binary here. `*.bin` is git-ignored: test vectors are `.bplist`.
+- Gotcha: zsh does not split `$X` in a command word, and `echo =====` is a syntax error there (`=cmd` expansion).
+- Guess [I]: first failure of a real AirDrop try is `WiFiP2PAWDLStateMonitor` in the send state machine with no wifip2pd, or the firmware's filter on foreign action frames.

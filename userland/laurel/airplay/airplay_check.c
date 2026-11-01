@@ -3,7 +3,9 @@
  * docs/laurel_sprout/airplay-airdrop.md. It changes nothing: Apple's sender in mediaserverd does the AirPlay work.
  *
  * Sender side of iOS 16.7 20H392 [V strings, AirPlaySender and APTransport in the dyld cache]: mediaserverd (Mach service com.apple.airplay.sender.xpc)
- * browses _airplay._tcp and _raop._tcp. Here that is en0 only: no awdl0. What each stage needs, in the order of the line:
+ * browses _airplay._tcp and _raop._tcp. iOS 26.5.2 23F84 [V launchd.plist, docs/laurel_sprout/ios26-airdrop.md]: no mediaserverd and no such service: audiomxd has the routes
+ * (com.apple.coremedia.routediscoverer.xpc), airplayd the endpoints (com.apple.airplay.endpoint.xpc). One binary for both: the kernel's major version chooses.
+ * Here that is en0 only. What each stage needs, in the order of the line:
  *   IPv4 on en0, mDNSResponder browse, a receiver heard, the sender's Mach service;
  *   the session: sessionProtocolOverride=legacy (scripts/laurel/root-airplay-legacy.py) uses RAOP with the NTP clock and RSA or no key: no PTP, no FairPlay;
  *   fp-setup (APAuthenticationClientFairPlay): com.apple.fairplayd.versioned; receivers that ask only for it fail without it;
@@ -23,6 +25,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -129,6 +132,17 @@ default_route_is(const char *ip)
 	return same;
 }
 
+/* iOS 26: kern.osrelease 25.x; iOS 16: 22.x */
+static bool
+ios26(void)
+{
+	char r[32] = "";
+	size_t len = sizeof(r) - 1;
+
+	(void)sysctlbyname("kern.osrelease", r, &len, NULL, 0);
+	return atoi(r) >= 25;
+}
+
 static bool
 mach_service(const char *name)
 {
@@ -224,6 +238,8 @@ main(void)
 	char ip[64] = "";
 	time_t start = time(NULL);
 	bool sender, fp, ptp, ave, route, legacy;
+	const bool is26 = ios26();
+	const char *missing = "com.apple.airplay.sender.xpc: mediaserverd has no AirPlay sender";
 
 	if (switched_off()) {
 		say("off: boot-arg airplay=0");
@@ -235,7 +251,14 @@ main(void)
 		}
 		sleep(5);
 	}
-	sender = mach_service("com.apple.airplay.sender.xpc");
+	if (is26) {
+		bool routes = mach_service("com.apple.coremedia.routediscoverer.xpc"), endpoints = mach_service("com.apple.airplay.endpoint.xpc");
+
+		sender = routes && endpoints;
+		missing = !routes ? "com.apple.coremedia.routediscoverer.xpc: audiomxd has no AirPlay routes" : "com.apple.airplay.endpoint.xpc: no airplayd job";
+	} else {
+		sender = mach_service("com.apple.airplay.sender.xpc");
+	}
 	fp = mach_service("com.apple.fairplayd.versioned");
 	ptp = io_service("IOTimeSyncDomain");
 	ave = io_service("AppleAVE2Driver") || io_service("AppleAVEDriver");
@@ -252,7 +275,7 @@ main(void)
 		if (err != 0) {
 			say("off: mDNSResponder refused the browse: error %d", err);
 		} else if (!sender) {
-			say("off: no com.apple.airplay.sender.xpc: mediaserverd has no AirPlay sender");
+			say("off: no %s", missing);
 		} else if (airplay.count + raop.count == 0) {
 			say("off: no receiver heard on en0 (%s, default route %s) in %d s: _airplay._tcp 0, _raop._tcp 0", ip, route ? "en0" : "not en0", BROWSE_S);
 		} else {

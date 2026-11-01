@@ -1,6 +1,7 @@
 # Mi A3: AirDrop over AWDL, AirPlay with no FairPlay and no PTP (2026-11-01, branch t3/laurel-airdrop-awdl)
 
 Owner: "AirDrop was ported to Android phones, so it is possible: search the web and use its implementation; fix AirPlay properly."
+**Audit 2026-11-02: `ios26-airdrop.md` section 1 lists 14 defects of this work, now fixed. The first start no longer runs by itself: see the risk text below.**
 Status: [V] kernel, daemon and root step build, host tests pass. **[U] nothing here has run on the phone.** Labels: [V] read in source, a binary or a log; [I] inference; [U] unknown.
 This file reverses section 4 of `airplay-airdrop.md` ("Decision: no awdl0"). That decision rested on "monitor Tx is the only path". It is not.
 
@@ -83,7 +84,7 @@ sharingd, mDNSResponder <--IPv6--> awdl0 (Ethernet) <--> laurel-awdld (owly-awdl
 - **Self-check, no fake state:** `awdl0` is made only after the first AWDL frame. `/private/var/db/laurel-awdl.state`: `trying-alone` before the first start, `alone-ok` after 10 s alive with no modem crash (`fw_fatal` in the status); the firmware refusing the vdev 3 times ends it until the next boot; a boot that finds `trying-*` stops the feature with one line (a firmware assert takes Wi-Fi until reboot, and en0 must not lose every boot). `rm` the file to try again.
 - **Sharing:** `BrowseAllInterfaces` + `RegisterAllInterfaces` (already in the root) make sharingd browse and serve on all interfaces [V disasm, `docs/airdrop-plan.md`]. mediaserverd and sharingd run as `mobile` [V launchd.plist]. awdl0 has no `IFEF_AWDL`: nothing treats it as Apple's [I].
 
-**Risk to Wi-Fi, stated plainly:** "a failure never touches Wi-Fi" holds for every failure the host can see. A firmware assert in VDEV_START would stop the modem until reboot; the driver has no restart. Limits: the first run needs AirDrop to be used and en0 not joined; the state file stops a second try. **The owner should do the first test on a boot where losing Wi-Fi until the next reboot is acceptable.** Kill switches: `awdl=0`, root `AWDL=0`.
+**Risk to Wi-Fi, stated plainly (corrected 2026-11-02):** a firmware assert stops the modem until reboot: Wi-Fi **and cellular** (`modem_watch` has no restart). So nothing that has not run on this firmware runs by itself: the line says `off: the IBSS vdev has never run on this firmware...`, and the owner allows one try: `echo alone > /private/var/db/laurel-awdl.allow` (later `shared`), or `AWDL_FIRST_TRY=` at the iOS 26 root step. A modem stop with the vdev on or within 10 s after it writes `failed`: off until `rm /private/var/db/laurel-awdl.state`. Kill switches: `awdl=0`, root `AWDL=0`.
 
 ## 5. wifip2pd
 
@@ -116,16 +117,19 @@ LAUREL AWDL: on: IBSS vdev up on channel 44, alone: no AWDL frame heard yet
 LAUREL AWDL: on: AWDL node up on channel 44 (alone)
 LAUREL AWDL: on: first AWDL frame heard on the vdev, channel 44, subtype 0: the firmware passes foreign action frames
 LAUREL AWDL: on: interface awdl0 made
+LAUREL AWDL: on: interface awdl0 made: Wi-Fi subfamily, IFEF_AWDL: error 0     (iOS 26, at the daemon's start)
 LAUREL AWDL: on: awdl0 up with its link-local address
 LAUREL AWDL: on: AWDL peer aa:bb:cc:dd:ee:ff class 2: Johns-iPhone
 LAUREL AWDL: off: the firmware refused VDEV_START of the IBSS vdev (3): en0 not touched
 LAUREL AWDL: off: no VDEV_START answer in 2 s on this MHz (5220): en0 not touched
-LAUREL AWDL: off: the firmware did not answer or the modem stopped during the start: Wi-Fi may be gone until the next boot; the state file keeps this off
-LAUREL AWDL: off: the modem stopped while the AWDL vdev was on: Wi-Fi may be gone until the next boot
+LAUREL AWDL: off: the firmware did not answer the vdev's start: the state file keeps this off, in case it has stopped
 LAUREL AWDL: off: the firmware refused the IBSS vdev 3 times: off until the next boot
 LAUREL AWDL: off: en0 needs the radio: a join or a change of AP comes first (5220): en0 not touched
 LAUREL AWDL: off: en0 is joined on a channel that AWDL does not use (AWDL needs 6, 44 or 149), and only one channel is possible
 LAUREL AWDL: off: the cell must run once with en0 not joined before it runs beside en0
+LAUREL AWDL: off: the IBSS vdev has never run on this firmware; a firmware assert would stop the modem (Wi-Fi and cellular) until the next boot: `echo alone > /private/var/db/laurel-awdl.allow` allows one try
+LAUREL AWDL: off: the cell beside a joined en0 has never run on this firmware; ...: `echo shared > /private/var/db/laurel-awdl.allow` allows one try
+LAUREL AWDL: off: the modem stopped while the AWDL vdev was on or just after: Wi-Fi and cellular are gone until the next boot; AWDL stays off for good
 LAUREL AWDL: off: the last start did not finish (trying-alone): the firmware may have stopped; `rm /private/var/db/laurel-awdl.state` tries again
 LAUREL AWDL: off: AirDrop is not in use: rx 812 mgmt 40 data, tx 410 mgmt 35 data, full 0
 LAUREL AWDL: off: boot-arg awdl=0
@@ -144,7 +148,7 @@ What would have to be true for AirDrop to complete, all [U]: (1) IBSS VDEV_START
 
 ## 8. Test steps (owner; no flash without your approval)
 
-Prepare: Build root with this branch (`build-all.sh`, then `root.sh`) and kernel. First boot: losing Wi-Fi until reboot must be acceptable.
+Prepare: Build root with this branch (`build-all.sh`, then `root.sh`) and kernel. First boot: losing Wi-Fi and cellular until reboot must be acceptable; only then `echo alone > /private/var/db/laurel-awdl.allow`.
 
 1. Boot. `scripts/debug/usblog.sh`. **Do not join Wi-Fi** (forget the network, or be out of range). Read `LAUREL AWDL: firmware:` after 5 minutes: real service bits.
 2. An iPhone beside the phone. On the Mi A3: AirDrop "Everyone for 10 Minutes". Expect `IBSS vdev up on channel 44`. No crash: 10 s later the state file says `alone-ok`: `scripts/laurel/phone-ssh.sh cat /private/var/db/laurel-awdl.state`.
