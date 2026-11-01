@@ -1,0 +1,1458 @@
+laurel 2932: AWDL radio for AirDrop: IBSS vdev 1 on AWDL's BSSID (WMI mgmt Tx, HTT data, firmware peers), kern control com.laurel.awdl, awdl0. en0 comes first. docs/laurel_sprout/airdrop-awdl.md
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -27,6 +27,7 @@
+ #include "LaurelWifiLink.h"                     /* laurel 2407 */
+ #include "LaurelWifiPath.h"                     /* laurel 2880 */
+ #include "LaurelWifiAwdl.h"                     /* laurel 2930 */
++#include "LaurelWifiAwdlRadio.h"                /* laurel 2932 */
+ 
+ /* laurel 2884: real milliseconds (g_ms counts passes of the watch loop, about 0.8 a millisecond when idle) */
+ static uint64_t
+@@ -3206,6 +3207,15 @@
+ #define LW_AWDL_LINE_MS (5u * 60 * 1000)        /* time for scans on 6, 44, 149 with an Apple device near */
+ static struct { bool on, said; uint32_t frames; uint64_t start_ms; } lw_awdl;
+ 
++/* laurel 2932: the AWDL radio (LaurelWifiAwdlRadio*.inc, below the WMI commands that it uses) */
++static bool ar_mgmt_rx(const uint32_t *hdr, const uint8_t *f, uint32_t len);
++static bool ar_data_rx(uint32_t vdev, const uint8_t *f, uint32_t len);
++static bool ar_event(uint32_t id, const uint8_t *t, uint32_t len);
++static bool ar_active(void);
++static bool ar_holds_scan(void);
++static bool lw_ar_tx_vdev;
++static volatile bool lw_modem_fatal;            /* the daemon must not take a crash for a good run */
++
+ static void
+ lw_fw_report(void)
+ {
+@@ -3727,8 +3736,10 @@
+ 			uint16_t mlen;
+ 			memcpy(&mlen, d + 8, 2);
+ 			if (mlen <= HTT_BUF_SIZE - 4 * OFF_MSDU_PAYLOAD) {
+-				lw_rx_sample(htt_buf + (pa - htt_buf_pa), mlen);
+-				w_rx_native(htt_buf + (pa - htt_buf_pa) + 4 * OFF_MSDU_PAYLOAD, mlen);
++				if (!ar_data_rx(p[4], htt_buf + (pa - htt_buf_pa) + 4 * OFF_MSDU_PAYLOAD, mlen)) {   /* laurel 2932: p[4] vdev (ath10k htt_rx_in_ord_ind) */
++					lw_rx_sample(htt_buf + (pa - htt_buf_pa), mlen);
++					w_rx_native(htt_buf + (pa - htt_buf_pa) + 4 * OFF_MSDU_PAYLOAD, mlen);
++				}
+ 			}
+ 			htt_post(pa);                       /* recycle the same buffer */
+ 		}
+@@ -3804,8 +3815,11 @@
+ 		return;
+ 	}
+ 	flen = MIN(hdr[4], flen);
++	if (ar_mgmt_rx(hdr, f, flen)) {                /* laurel 2932: the daemon's */
++		return;
++	}
+ 	if (lw_awdl.on && lw_awdl_frame(f, flen) && lw_awdl.frames++ == 0) {   /* laurel 2931: the frame goes on as before */
+-		printf("LAUREL AWDL: off: first AWDL frame heard (channel %u, subtype %u): the firmware passes them to the host; no data path yet\n", hdr[0], f[30]);
++		printf("LAUREL AWDL: first AWDL frame heard in a scan (channel %u, subtype %u): the firmware passes them to the host\n", hdr[0], f[30]);
+ 	}
+ 	if (flen >= 24 && (f[0] & 0x0C) == 0 && (f[0] >> 4) != 8 && (f[0] >> 4) != 5) {
+ 		w_assoc_mgmt_rx(f, flen);               /* auth, assoc response, deauth, disassoc */
+@@ -4390,7 +4404,8 @@
+ 	*p++ = H2T_TX_FRM;
+ 	*p++ = (uint8_t)(TXF0_MAC_HDR | TXF0_NATIVE | (clear ? TXF0_NO_ENCRYPT : 0));
+ 	/* laurel 2408: a QoS TID, or the firmware makes no A-MPDU (ath10k_htt_tx_get_tid); EAPOL as mac80211: TID 7 */
+-	p = put16(p, (uint16_t)((s_link.qos ? (clear ? 7u << 6 : 0u) : TXF1_TID_NONQOS) | TXF1_POSTPONED));   /* vdev 0 */
++	p = put16(p, (uint16_t)(lw_ar_tx_vdev ? (TXF1_TID_NONQOS | TXF1_POSTPONED | 1u) :        /* laurel 2932: vdev 1, the AWDL cell */
++	    ((s_link.qos ? (clear ? 7u << 6 : 0u) : TXF1_TID_NONQOS) | TXF1_POSTPONED)));   /* vdev 0 */
+ 	p = put16(p, (uint16_t)len);
+ 	p = put16(p, (uint16_t)id);
+ 	p = put64(p, htt_bank_pa + (uint64_t)id * HTT_EXT_DESC_SIZE);
+@@ -5064,7 +5079,7 @@
+ 	if (id == 0x5001 && l >= 16) {             /* VDEV_START_RESP {vdev, req, type, status} */
+ 		s_start_status = (int32_t)v[3];
+ 		s_start_resp = true;
+-	} else if (id == 0x6001 && s_state == S_UP) {   /* PEER_STA_KICKOUT */
++	} else if (id == 0x6001 && s_state == S_UP && l >= 8 && memcmp(v, s_bssid, 6) == 0) {   /* PEER_STA_KICKOUT; laurel 2932: of the AP only, not of an AWDL peer */
+ 		LOG("t=%u ms: join: peer kickout", g_ms);
+ 		w_teardown();
+ 	}
+@@ -5079,6 +5094,9 @@
+ 		w_teardown();
+ 	}
+ 	if (s_join_asked && !scanning) {
++		if (ar_active()) {                      /* laurel 2932: en0 first: ar_poll ends the AWDL vdev, then this join runs */
++			return;
++		}
+ 		s_join_asked = false;
+ 		w_teardown();
+ 		w_join_begin();
+@@ -5403,6 +5421,10 @@
+ 	return s_state == S_UP ? lw_rssi_now() : 0;
+ }
+ 
++#include "LaurelWifiAwdlRadio.inc"              /* laurel 2932 */
++#include "LaurelWifiAwdlRadio2.inc"
++#include "LaurelWifiAwdlRadio3.inc"
++
+ /* laurel 2931: the one summary line: what the firmware says of itself, and what the scans heard */
+ static void
+ lw_awdl_poll(void)
+@@ -5411,9 +5433,9 @@
+ 		return;
+ 	}
+ 	lw_awdl.said = true;
+-	printf("LAUREL AWDL: off: no AWDL data path: the vendor driver's monitor device has no Tx, OWL needs it; WMI mgmt-tx %s, offchan-tx %s, promisc %s, nan %s, nan-data %s; "
+-	    "%u AWDL frames in %u scans; wifip2pd stays out\n", wmi_svc(76) ? "yes" : "no", wmi_svc(123) ? "yes" : "no", wmi_svc(145) ? "yes" : "no",
+-	    wmi_svc(52) ? "yes" : "no", wmi_svc(96) ? "yes" : "no", lw_awdl.frames, scans);
++	printf("LAUREL AWDL: firmware: WMI mgmt-tx %s, offchan-tx %s, promisc %s, nan %s, nan-data %s, ibss-ps %s; %u AWDL frames in %u scans, %u on the vdev\n",
++	    wmi_svc(76) ? "yes" : "no", wmi_svc(123) ? "yes" : "no", wmi_svc(145) ? "yes" : "no",
++	    wmi_svc(52) ? "yes" : "no", wmi_svc(96) ? "yes" : "no", wmi_svc(59) ? "yes" : "no", lw_awdl.frames, scans, ar.heard);
+ }
+ 
+ static void
+@@ -5564,7 +5586,15 @@
+ 	case WMI_EV_UPDATE_STATS:
+ 		lw_stats_event(d + 4, len - 4);
+ 		break;
++	case 0x5002:                                /* laurel 2932: VDEV_STOPPED */
++		(void)ar_event(id, d + 4, len - 4);
++		break;
+ 	case 0x5001:                                /* VDEV_START_RESP */
++		if (ar_event(id, d + 4, len - 4)) {     /* laurel 2932: of vdev 1 */
++			break;
++		}
++		w_join_event(id, d + 4, len - 4);
++		break;
+ 	case 0x6001:                                /* PEER_STA_KICKOUT */
+ 		w_join_event(id, d + 4, len - 4);
+ 		break;
+@@ -5647,6 +5677,9 @@
+ 	if (scan_started && !api_ready) {
+ 		api_ready = true;
+ 		LOG("t=%u ms: wlan: radio ready for the rest of the kernel", g_ms);
++		if (lw_awdl.on) {
++			laurel_awdl_ctl_attach();           /* laurel 2932: the socket of laurel-awdld */
++		}
+ 		if (topaz_wlan_ready_hook != NULL) {
+ 			topaz_wlan_ready_hook();
+ 		}
+@@ -5656,6 +5689,7 @@
+ 		(void)w_tx_pump();
+ 		lw_status_poll();
+ 		lw_awdl_poll();
++		ar_poll();                              /* laurel 2932: nothing until the daemon asks */
+ 	}
+ 	{
+ 		/* laurel 2409: frames in about a second (the loop's pass is about 1 ms) */
+@@ -5667,7 +5701,7 @@
+ 			mark_ms = g_ms;
+ 		}
+ 	}
+-	if (scan_started && !scanning && api_scan_asked && (s_state == S_IDLE || s_state == S_UP)) {
++	if (scan_started && !scanning && api_scan_asked && (s_state == S_IDLE || s_state == S_UP) && !ar_holds_scan()) {   /* laurel 2932 */
+ 		api_scan_asked = false;
+ 		next_scan_ms = 0;
+ 		/* laurel 2885: any traffic counts, and the time after a join (DHCP and the first page) */
+@@ -5682,7 +5716,7 @@
+ 			}
+ 		}
+ 	}
+-	if (scan_started && !scanning && next_scan_ms != 0 && g_ms >= next_scan_ms) {
++	if (scan_started && !scanning && next_scan_ms != 0 && g_ms >= next_scan_ms && !ar_holds_scan()) {   /* laurel 2932 */
+ 		next_scan_ms = 0;
+ 		if (s_state != S_IDLE) {                /* laurel 2409: the first scans of a boot are for a radio not joined yet */
+ 			return;
+@@ -5843,6 +5877,7 @@
+ 			}
+ 			if (sk_last & 1) {
+ 				uint32_t sz = 0;
++				lw_modem_fatal = true;          /* laurel 2932 */
+ 				const char *why = (const char *)smem_get(smem_partition(SMEM_GLOBAL_HOST, SMEM_GLOBAL_HOST), ITEM_MSS_CRASH, &sz);
+ 				char buf[128] = {};
+ 				if (why != NULL) {
+diff --git a/bsd/dev/laurel_bt_h4.c b/bsd/dev/laurel_bt_h4.c
+--- a/bsd/dev/laurel_bt_h4.c
++++ b/bsd/dev/laurel_bt_h4.c
+@@ -9,6 +9,8 @@
+ #include <sys/systm.h>
+ #include "laurel_bt.h"
+ 
++extern void laurel_awdl_hci_note(const uint8_t *cmd, size_t n);
++
+ void
+ lbt_h4_reset(struct lbt_h4 *p)
+ {
+@@ -179,6 +181,7 @@
+ 	if (n < 4 || cmd[0] != 1 || (size_t)cmd[3] + 4 != n) {
+ 		return 0;
+ 	}
++	laurel_awdl_hci_note(cmd, n);           /* laurel 2932: an AirDrop advertisement starts the AWDL radio */
+ 	op = lbt_le16(cmd + 1);
+ 	bzero(ev, LBT_LOCAL_EVENT_MAX);
+ 	ev[0] = 4;
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -148,6 +148,7 @@
+ bsd/dev/laurel_bt_hci.c			standard
+ bsd/dev/laurel_bt_ios.c			standard
+ bsd/dev/laurel_bt_ctl.c			standard
++bsd/dev/laurel_awdl_ctl.c		standard
+ bsd/dev/laurel_bt_dev.c			standard
+ bsd/dev/laurel_cam.c			standard
+ bsd/dev/laurel_cam_hw.c			standard
+diff --git a/iokit/Kernel/arm/LaurelWifiAwdlRadio.h b/iokit/Kernel/arm/LaurelWifiAwdlRadio.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelWifiAwdlRadio.h
+@@ -0,0 +1,243 @@
++/*
++ * laurel 2932: the parts of the AWDL radio with no hardware in them: pure code like LaurelWifiPath.h, tested on the host by scripts/laurel/wifi-phy-test.sh.
++ * C and C++: bsd/dev/laurel_awdl_ctl.c and TopazModem.cpp both use it. docs/laurel_sprout/airdrop-awdl.md.
++ *
++ * The control socket com.laurel.awdl carries one datagram per message; the first byte is its kind. userland/laurel/awdl/src/ctl.rs is the other end.
++ */
++#ifndef LAUREL_WIFI_AWDL_RADIO_H
++#define LAUREL_WIFI_AWDL_RADIO_H
++
++#define LW_AR_CTL_NAME      "com.laurel.awdl"
++#define LW_AR_OPT_STATUS    1                   /* getsockopt: struct lw_ar_status */
++
++/* daemon -> kernel */
++enum {
++	LW_AR_MSG_START = 1,                        /* u16 freq (LE), mac[6], u8 may_share */
++	LW_AR_MSG_STOP = 2,
++	LW_AR_MSG_TX_MGMT = 3,                      /* an 802.11 action frame */
++	LW_AR_MSG_TX_DATA = 4,                      /* an 802.11 data frame, no QoS field */
++	LW_AR_MSG_PEER_ADD = 5,                     /* mac[6] */
++	LW_AR_MSG_PEER_DEL = 6,                     /* mac[6] */
++	LW_AR_MSG_IF_UP = 7,                        /* mac[6], then on iOS 26 one byte LW_AR_IF_TYPED: make awdl0 */
++	LW_AR_MSG_IP_IN = 8,                        /* an Ethernet frame for the IP stack */
++};
++
++/* kernel -> daemon: kind, rssi (i8), 2 bytes of zero, then the frame */
++enum {
++	LW_AR_EV_RX_MGMT = 0x81,
++	LW_AR_EV_RX_DATA = 0x82,
++	LW_AR_EV_IP_OUT = 0x83,
++};
++#define LW_AR_EV_HDR        4
++#define LW_AR_FRAME_MAX     2040                /* TX_SLOT_SIZE is 2048 */
++/*
++ * iOS 26 sharingd's connections set requiredInterfaceSubtype = wifiAWDL [V 23F84 sharingd 0x1006ceadc, docs/laurel_sprout/ios26-airdrop.md]. That is the kernel's
++ * if_functional_type(): subfamily Wi-Fi + IFEF_AWDL. So on iOS 26 awdl0 is typed as Apple's; IFEF_AWDL brings IFEF_IPV6_ND6ALT (no Neighbor Discovery: the kernel gets each peer by
++ * nd6_alt_node_present) and IFEF_RESTRICTED_RECV. iOS 16's sharingd has no such requirement: its awdl0 stays a plain Ethernet interface, as before.
++ */
++#define LW_AR_IF_TYPED      1
++
++enum lw_ar_state {
++	LW_AR_OFF, LW_AR_CREATED, LW_AR_PEERED, LW_AR_STARTING, LW_AR_UP, LW_AR_DOWNING, LW_AR_STOPPING, LW_AR_DELETING
++};
++
++/* why the radio is off; 0 = no reason (never started, or asked to stop) */
++enum lw_ar_reason {
++	LW_AR_WHY_NONE, LW_AR_WHY_NOT_READY, LW_AR_WHY_EN0_BUSY, LW_AR_WHY_EN0_OTHER_CHANNEL, LW_AR_WHY_SHARE_NOT_ALLOWED,
++	LW_AR_WHY_START_STATUS, LW_AR_WHY_START_TIMEOUT, LW_AR_WHY_WIFI_FIRST, LW_AR_WHY_BAD_ARGS
++};
++
++/* all 32-bit words, so that the daemon's struct has no padding question */
++struct lw_ar_status {
++	uint32_t state, freq, why, why_value;
++	uint32_t en0_state, en0_freq;               /* 0 idle, 1 joining, 2 joined */
++	uint32_t heard, rx_mgmt, rx_data, tx_mgmt, tx_data, tx_full;
++	uint32_t ble_age_s;                         /* since bluetoothd last set an AirDrop advertisement; 0xFFFFFFFF: never */
++	uint32_t mode_shared, peers, fw_fatal;      /* fw_fatal: the modem crashed, or the WLAN PD restarted, in this boot: the radio is gone until the next boot */
++	uint32_t off_age_ms;                        /* since the vdev last ended; 0xFFFFFFFF: it never ran. A crash just after the end may still be the vdev's */
++};
++
++static inline bool
++lw_ar_social(uint32_t freq)
++{
++	return freq == 2437 || freq == 5220 || freq == 5745;   /* channels 6, 44, 149 (AWDL-11) */
++}
++
++static inline uint32_t
++lw_ar_channel(uint32_t freq)
++{
++	return freq < 4000 ? (freq - 2407) / 5 : (freq - 5000) / 5;
++}
++
++/* a MAC of our own: unicast, locally administered, not all zero */
++static inline bool
++lw_ar_mac_ok(const uint8_t *m)
++{
++	return (m[0] & 1) == 0 && (m[0] & 2) != 0;
++}
++
++/*
++ * May the radio start now? en0 comes first, always. en0_state as in struct lw_ar_status.
++ * Not joined: the radio has the channel to itself. Joined on the same channel: it may share, when the daemon says so
++ * (only after this firmware has run the cell alone at least once). Else it waits.
++ */
++static inline enum lw_ar_reason
++lw_ar_may_start(uint32_t en0_state, uint32_t en0_freq, uint32_t freq, bool may_share)
++{
++	if (en0_state == 1) {
++		return LW_AR_WHY_EN0_BUSY;
++	}
++	if (en0_state == 2) {
++		if (en0_freq != freq) {
++			return LW_AR_WHY_EN0_OTHER_CHANNEL;
++		}
++		if (!may_share) {
++			return LW_AR_WHY_SHARE_NOT_ALLOWED;
++		}
++	}
++	return LW_AR_WHY_NONE;
++}
++
++/*
++ * en0 first, also for the queues that both use. WMI: 8 messages (WMIQ_LEN, a join sends 4 at once); a full queue DROPS the next command, and that could be en0's key or its
++ * join. So AWDL's commands wait at half of it, in AWDL's own queue. HTT Tx slots: beside a joined en0 AWDL may hold half, alone all but an eighth (a join needs room at once).
++ */
++static inline bool
++lw_ar_wmi_room(uint32_t queued, uint32_t capacity)
++{
++	return queued < capacity / 2;
++}
++
++static inline bool
++lw_ar_tx_room(uint32_t busy, uint32_t slots, bool shared)
++{
++	return busy < (shared ? slots / 2 : slots - slots / 8);
++}
++
++/* While the vdev starts, no scan begins (and no VDEV_START goes out during a scan): as a join, which also waits for !scanning. */
++static inline bool
++lw_ar_holds_scan(uint32_t state)
++{
++	return state == LW_AR_CREATED || state == LW_AR_PEERED || state == LW_AR_STARTING;
++}
++
++/* An AWDL data frame: no To DS, no From DS, BSSID 00:25:00:ff:94:73 in addr3. Native-wifi Rx keeps these fields. */
++static inline bool
++lw_ar_data_frame(const uint8_t *f, uint32_t len)
++{
++	static const uint8_t bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
++
++	return len >= 24 && (f[0] & 0x0C) == 0x08 && (f[1] & 3) == 0 && memcmp(f + 16, bssid, 6) == 0;
++}
++
++/* Where a data frame from the HTT ring goes. Vdev 1's frames never reach en0's IP stack, also in the moments when the vdev ends. */
++enum lw_ar_route { LW_AR_TO_EN0, LW_AR_TO_DAEMON, LW_AR_TO_NOBODY };
++
++static inline enum lw_ar_route
++lw_ar_data_route(uint32_t state, uint32_t vdev, const uint8_t *f, uint32_t len)
++{
++	bool ours = vdev == 1 || lw_ar_data_frame(f, len);
++
++	if (!ours) {
++		return LW_AR_TO_EN0;
++	}
++	if (state == LW_AR_UP) {
++		return LW_AR_TO_DAEMON;
++	}
++	return vdev == 1 || state != LW_AR_OFF ? LW_AR_TO_NOBODY : LW_AR_TO_EN0;
++}
++
++/* A Block Ack request from a peer on AWDL's BSSID: the daemon decides (AWDL-15). */
++static inline bool
++lw_ar_addba_frame(const uint8_t *f, uint32_t len)
++{
++	static const uint8_t bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
++
++	return len >= 26 && f[0] == 0xD0 && f[24] == 3 && f[25] == 0 && memcmp(f + 16, bssid, 6) == 0;
++}
++
++/* The beacon of the cell: the firmware's beacon offload needs a template (crash without one: qcacld injection notes). Returns its length. out: 64 bytes. */
++static inline uint32_t
++lw_ar_beacon(uint8_t *out, const uint8_t *mac, uint32_t freq, const char *ssid, uint32_t ssid_len)
++{
++	static const uint8_t bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
++	static const uint8_t rates5[8] = { 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c };
++	static const uint8_t rates2[8] = { 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
++	uint8_t *p = out;
++
++	memset(out, 0, 36);
++	out[0] = 0x80;                              /* beacon */
++	memset(out + 4, 0xff, 6);
++	memcpy(out + 10, mac, 6);
++	memcpy(out + 16, bssid, 6);
++	out[32] = 100;                              /* interval, TU */
++	out[34] = 0x02;                             /* capabilities: IBSS */
++	p = out + 36;
++	*p++ = 0;
++	*p++ = (uint8_t)ssid_len;
++	memcpy(p, ssid, ssid_len);
++	p += ssid_len;
++	*p++ = 1;
++	*p++ = 8;
++	memcpy(p, freq < 4000 ? rates2 : rates5, 8);
++	p += 8;
++	if (freq < 4000) {
++		*p++ = 3;
++		*p++ = 1;
++		*p++ = (uint8_t)lw_ar_channel(freq);
++	}
++	*p++ = 6;                                   /* IBSS parameter set: ATIM window 0 */
++	*p++ = 2;
++	*p++ = 0;
++	*p++ = 0;
++	return (uint32_t)(p - out);
++}
++
++/* An AirDrop advertisement in an HCI command from bluetoothd: LE Set Advertising Data (0x2008) or LE Set Extended Advertising Data (0x2037), Apple's 4C 00 and TLV type 5. */
++static inline bool
++lw_ar_ble_airdrop(const uint8_t *cmd, size_t n)
++{
++	uint16_t op;
++
++	if (n < 4 || cmd[0] != 1) {
++		return false;
++	}
++	op = (uint16_t)(cmd[1] | cmd[2] << 8);
++	if (op != 0x2008 && op != 0x2037) {
++		return false;
++	}
++	for (size_t i = 4; i + 3 < n; i++) {
++		if (cmd[i] == 0x4c && cmd[i + 1] == 0x00 && cmd[i + 2] == 0x05 && cmd[i - 1] == 0xff) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* The small table of AWDL peers: a mac per slot. Firmware peers: NUM_PEERS is 33. */
++#define LW_AR_PEERS 8
++struct lw_ar_peer { uint8_t mac[6]; bool used, assoc_done; uint64_t created_ms; };
++
++static inline int
++lw_ar_peer_find(const struct lw_ar_peer *t, const uint8_t *mac)
++{
++	for (int i = 0; i < LW_AR_PEERS; i++) {
++		if (t[i].used && memcmp(t[i].mac, mac, 6) == 0) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++static inline int
++lw_ar_peer_free(const struct lw_ar_peer *t)
++{
++	for (int i = 0; i < LW_AR_PEERS; i++) {
++		if (!t[i].used) {
++			return i;
++		}
++	}
++	return -1;
++}
++
++#endif /* LAUREL_WIFI_AWDL_RADIO_H */
+diff --git a/iokit/Kernel/arm/LaurelWifiAwdlRadio.inc b/iokit/Kernel/arm/LaurelWifiAwdlRadio.inc
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelWifiAwdlRadio.inc
+@@ -0,0 +1,272 @@
++/*
++ * laurel 2932: the AWDL radio: one IBSS vdev on AWDL's BSSID, on the modem thread. docs/laurel_sprout/airdrop-awdl.md.
++ * WMI and HTT only: action frames through WMI MGMT_TX on this vdev, data frames through HTT (native wifi) on this vdev, one firmware peer per AWDL peer.
++ * No monitor vdev: this firmware drops management Tx on one (qcacld injection notes), and a monitor vdev needs raw Rx decap at WMI INIT.
++ *
++ * Order and values: ath10k (add_interface: vdev + self peer; assign_vif_chanctx: start; bss_info_changed: ATIM, beacon template, up).
++ * Teardown: down, stop, then the peers, then the vdev: the firmware asserts when a self peer goes while the vdev is started (qcacld injection notes).
++ * Steps have a pause: a command on a vdev that the firmware has not made yet asserts (qcacld injection notes: 150 ms).
++ * en0 comes first: a join ends the radio first. The daemon starts it. Nothing here runs before the daemon asks. Kill switch awdl=0: no control socket.
++ */
++#define CMD_VDEV_DELETE     0x5002
++#define TAG_VDEV_DELETE     0x57
++#define CMD_VDEV_SET_PARAM  0x5008
++#define TAG_VDEV_SET_PARAM  0x5f
++#define VDEV_PARAM_ATIM     0x10
++#define CMD_BCN_TMPL        0x7003
++#define TAG_BCN_TMPL        0x67
++#define TAG_BCN_PRB_INFO    0x69
++#define EV_VDEV_STOPPED     0x5002
++#define CHAN_ADHOC_ALLOWED  (1u << 8)
++#define CHAN_ALLOW_HT       (1u << 11)
++#define AR_VDEV             1u
++#define AR_STEP_MS          150u
++#define AR_SSID             "awdl"
++#define AR_TXQ              64
++#define AR_MGMT_SLOTS       8u
++#define AR_MGMT_SLOT_SIZE   2048u
++
++static struct {
++	volatile uint32_t state, why, why_value;
++	volatile bool ask_start, ask_stop, may_share;
++	volatile uint16_t ask_freq;
++	uint8_t ask_mac[6], mac[6];
++	uint32_t freq;
++	bool shared;
++	uint64_t next_ms, off_ms;
++	bool ever;                                  /* the vdev has run in this boot */
++	bool chan_changed;                          /* ar_chan_list opened a channel: the list goes back at the end */
++	struct lw_ar_peer peers[LW_AR_PEERS];
++	uint8_t *mgmt_va;
++	uint64_t mgmt_pa;
++	uint32_t mgmt_next, desc;
++	volatile uint32_t heard, rx_mgmt, rx_data, tx_mgmt, tx_data, tx_full;
++	bool said_heard;
++} ar;
++
++/* one writer (the socket of the one daemon), one reader (this thread), as etxq */
++static struct { uint16_t len; uint8_t kind; uint8_t d[LW_AR_FRAME_MAX]; } ar_txq[AR_TXQ];
++static volatile uint32_t ar_txq_head, ar_txq_tail;
++
++extern "C" {
++void (*topaz_awdl_rx_hook)(unsigned kind, int rssi, const uint8_t *frame, size_t length);
++void laurel_awdl_ctl_attach(void);
++uint32_t laurel_awdl_ble_age_s(void);
++}
++
++static uint32_t
++ar_en0_state(void)
++{
++	if (s_state == S_UP) {
++		return 2;
++	}
++	return s_state == S_IDLE && !s_join_asked ? 0 : 1;
++}
++
++static bool
++ar_active(void)
++{
++	return ar.state != LW_AR_OFF;
++}
++
++static bool
++ar_holds_scan(void)
++{
++	return lw_ar_holds_scan(ar.state);
++}
++
++static uint32_t
++ar_tx_busy(void)
++{
++	uint32_t n = 0;
++
++	for (uint32_t w = 0; w < LW_TX_SLOT_WORDS; w++) {
++		n += (uint32_t)__builtin_popcountll(tx_busy[w]);
++	}
++	return n;
++}
++
++static void
++ar_vdev_cmd(uint32_t cmd, uint16_t tag)
++{
++	uint8_t m[8], *p = wmi_put_tlv(m, tag, 4);
++	w_p32(p, AR_VDEV);
++	wmi_send(cmd, m, sizeof(m));
++}
++
++/* every channel as the scan's list, this one open for the cell: scan_start marks them passive. freq 0: scan_start's list again */
++static void
++ar_chan_list(uint32_t freq)
++{
++	static uint8_t m[1536];
++	uint8_t *p = put32(wmi_put_tlv(m, TAG_SCAN_CHAN_LIST_CMD, 4), NFREQ), *c;
++
++	p = wmi_put_tlv(p, TAG_ARRAY_STRUCT, NFREQ * (4 + 24));
++	for (uint32_t i = 0; i < NFREQ; i++) {
++		uint32_t mode = scan_freqs[i] < 4000 ? 1 : 0, flags = mode | (1u << 11) | (scan_freqs[i] < 4000 ? 0 : (1u << 12));
++
++		flags |= scan_freqs[i] == freq ? CHAN_ADHOC_ALLOWED : (1u << 7);
++		c = wmi_put_tlv(p, TAG_CHANNEL, 24);
++		c = put32(c, scan_freqs[i]);
++		c = put32(c, scan_freqs[i]);
++		c = put32(c, 0);
++		c = put32(c, flags);
++		c = put32(c, (40u << 8) | (40u << 16));
++		p = put32(c, 40u << 8);
++	}
++	wmi_send(CMD_SCAN_CHAN_LIST, m, (uint32_t)(p - m));
++}
++
++static void
++ar_peer_cmd(uint32_t cmd, uint16_t tag, const uint8_t *mac, bool create)
++{
++	uint8_t m[4 + 16] = {}, *p = wmi_put_tlv(m, tag, create ? 16 : 12);
++	p = w_p32(p, AR_VDEV);
++	p = w_pmac(p, mac);
++	if (create) {
++		w_p32(p, 0);
++	}
++	wmi_send(cmd, m, create ? 20 : 16);
++}
++
++static void
++ar_vdev_start(void)
++{
++	uint8_t m[4 + 72 + 4 + 24 + 4] = {}, *p, *c;
++	/* 20 MHz HT alone; beside en0 the same channel spec as en0, so that the firmware has one channel to serve [I] */
++	uint32_t mode = ar.shared ? s_link.mode : (ar.freq >= 4900 ? LW_HT20_5G : LW_HT20_2G);
++	uint32_t center = ar.shared && s_link.center != 0 ? s_link.center : ar.freq;
++
++	p = wmi_put_tlv(m, TAG_VDEV_START, 72);
++	p = w_p32(p, AR_VDEV);
++	p = w_p32(p, 0);
++	p = w_p32(p, 100);                          /* beacon interval */
++	p = w_p32(p, 1);                            /* dtim */
++	p = w_p32(p, 0);
++	p = w_p32(p, sizeof(AR_SSID) - 1);
++	memcpy(p, AR_SSID, sizeof(AR_SSID) - 1);
++	p += 32 + 16;                               /* tx rate/power, noa, hw ack */
++	c = wmi_put_tlv(p, TAG_CHANNEL, 24);
++	c = w_p32(c, ar.freq);
++	c = w_p32(c, center);
++	c = w_p32(c, 0);
++	c = w_p32(c, mode | CHAN_ADHOC_ALLOWED | CHAN_ALLOW_HT);
++	c = w_p32(c, (40u << 8) | (40u << 16));
++	c = w_p32(c, 40u << 8);
++	wmi_put_tlv(c, TAG_ARRAY_STRUCT, 0);
++	wmi_send(CMD_VDEV_START, m, sizeof(m));
++}
++
++/* ath10k_wmi_tlv_op_gen_bcn_tmpl, ATIM as ath10k_control_ibss, up as ath10k_control_beaconing */
++static void
++ar_vdev_up(void)
++{
++	static const uint8_t bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
++	uint8_t s[4 + 12], b[4 + 8 + 4 + 12 + 4 + 64 + 4] = {}, u[20], bcn[64], *p;
++	uint32_t blen = lw_ar_beacon(bcn, ar.mac, ar.freq, AR_SSID, sizeof(AR_SSID) - 1), rl = (blen + 3) & ~3u;
++
++	p = wmi_put_tlv(s, TAG_VDEV_SET_PARAM, 12);
++	p = w_p32(p, AR_VDEV);
++	p = w_p32(p, VDEV_PARAM_ATIM);
++	w_p32(p, 0);
++	wmi_send(CMD_VDEV_SET_PARAM, s, sizeof(s));
++	p = wmi_put_tlv(b, TAG_BCN_TMPL, 12);
++	p = w_p32(p, AR_VDEV);
++	p = w_p32(p, 0);                            /* no TIM in an IBSS beacon */
++	p = w_p32(p, blen);
++	p = wmi_put_tlv(p, TAG_BCN_PRB_INFO, 8);
++	p = w_p32(p, 0);
++	p = w_p32(p, 0);
++	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, rl);
++	memcpy(p, bcn, blen);
++	wmi_send(CMD_BCN_TMPL, b, (uint32_t)(p - b) + rl);
++	p = wmi_put_tlv(u, TAG_VDEV_UP, 16);
++	p = w_p32(p, AR_VDEV);
++	p = w_p32(p, 0);
++	w_pmac(p, bssid);
++	wmi_send(CMD_VDEV_UP, u, sizeof(u));
++}
++
++/* a legacy + HT 20 MHz peer: an iPhone's unicast comes at HT rates (Owly setup.rs: a non-HT cell neither receives nor ACKs them) */
++static void
++ar_peer_assoc(const uint8_t *mac)
++{
++	static const uint8_t r5[8] = { 12, 18, 24, 36, 48, 72, 96, 108 };
++	static const uint8_t r2[12] = { 0x82, 0x84, 0x8b, 0x96, 12, 18, 24, 36, 48, 72, 96, 108 };
++	bool g = ar.freq < 4000;
++	uint32_t n = g ? 12 : 8, ht = 8;
++	uint8_t m[4 + 76 + 4 + 16 + 4 + 16 + 4 + 16] = {}, *p, *r;
++	uint32_t rl = (n + 3) & ~3u;
++
++	p = wmi_put_tlv(m, TAG_PEER_ASSOC, 76);
++	p = w_pmac(p, mac);
++	p = w_p32(p, AR_VDEV);
++	p = w_p32(p, 1);                            /* new assoc */
++	p = w_p32(p, 0);
++	p = w_p32(p, PEER_FLAG_AUTH | LW_PEER_QOS | LW_PEER_HT);
++	p = w_p32(p, 0x0002);                       /* capabilities: IBSS */
++	p = w_p32(p, 1);
++	p = w_p32(p, LW_CAP_SMPS_OFF | LW_CAP_SGI20);
++	p = w_p32(p, 0xFFFF);                       /* 64 KiB A-MPDU */
++	p = w_p32(p, 0);
++	p = w_p32(p, LW_RC_HT);
++	p = w_p32(p, 1);                            /* one stream */
++	p = w_p32(p, 0);
++	p = w_p32(p, g ? LW_HT20_2G : LW_HT20_5G);
++	p += 8;
++	p = w_p32(p, n);
++	p = w_p32(p, ht);
++	r = wmi_put_tlv(p, TAG_ARRAY_BYTE, rl);
++	memcpy(r, g ? r2 : r5, n);
++	p = r + rl;
++	r = wmi_put_tlv(p, TAG_ARRAY_BYTE, ht);
++	for (uint32_t i = 0; i < ht; i++) {
++		r[i] = (uint8_t)i;
++	}
++	wmi_put_tlv(r + ht, TAG_VHT_RATE_SET, 16);
++	wmi_send(CMD_PEER_ASSOC, m, 4 + 76 + 4 + rl + 4 + ht + 4 + 16);
++}
++
++static void
++ar_peer_authorize(const uint8_t *mac)
++{
++	uint8_t m[4 + 20], *p = wmi_put_tlv(m, TAG_PEER_SET_PARAM, 20);
++	p = w_p32(p, AR_VDEV);
++	p = w_pmac(p, mac);
++	p = w_p32(p, PEER_PARAM_AUTHORIZE);
++	w_p32(p, 1);
++	wmi_send(CMD_PEER_SET_PARAM, m, sizeof(m));
++}
++
++/* w_mgmt_tx on this vdev. A ring of DMA slots: this firmware sends no completion for such frames (qcacld injection notes), and the next frame must not overwrite one on its way. */
++static void
++ar_mgmt_tx(const uint8_t *f, uint32_t len)
++{
++	uint8_t m[4 + 28 + 4 + 64] = {}, *p, *slot;
++	uint32_t buf = (MIN(len, 64u) + 3) & ~3u;
++	uint64_t pa;
++
++	if (ar.mgmt_va == NULL) {
++		ar.mgmt_va = (uint8_t *)pool_alloc(AR_MGMT_SLOTS * AR_MGMT_SLOT_SIZE, &ar.mgmt_pa);
++	}
++	if (ar.mgmt_va == NULL || len > AR_MGMT_SLOT_SIZE - 8) {
++		return;
++	}
++	slot = ar.mgmt_va + ar.mgmt_next * AR_MGMT_SLOT_SIZE;
++	pa = ar.mgmt_pa + ar.mgmt_next * AR_MGMT_SLOT_SIZE;
++	ar.mgmt_next = (ar.mgmt_next + 1) % AR_MGMT_SLOTS;
++	bzero(slot, ((len + 3) & ~3u) + 4);
++	memcpy(slot, f, len);
++	mb();
++	p = wmi_put_tlv(m, TAG_MGMT_TX, 28);
++	p = w_p32(p, AR_VDEV);
++	p = w_p32(p, 0x8000 | (++ar.desc & 0x7FFF));
++	p = w_p32(p, 0);
++	p = put64(p, pa);
++	p = w_p32(p, len);
++	p = w_p32(p, buf);
++	p = wmi_put_tlv(p, TAG_ARRAY_BYTE, buf);
++	memcpy(p, slot, buf);
++	wmi_send(CMD_MGMT_TX_SEND, m, 4 + 28 + 4 + buf);
++	ar.tx_mgmt++;
++}
+diff --git a/iokit/Kernel/arm/LaurelWifiAwdlRadio2.inc b/iokit/Kernel/arm/LaurelWifiAwdlRadio2.inc
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelWifiAwdlRadio2.inc
+@@ -0,0 +1,211 @@
++/*
++ * laurel 2932: the AWDL radio, second part: the state machine (one pass per modem-loop pass), Rx routing and the C API for bsd/dev/laurel_awdl_ctl.c.
++ * Every line says one state change. "off" never touches en0: this file only uses vdev 1 and its peers.
++ */
++static void
++ar_say_off(enum lw_ar_reason why, uint32_t value, const char *text)
++{
++	ar.why = why;
++	ar.why_value = value;
++	printf("LAUREL AWDL: off: %s (%u): en0 not touched\n", text, value);
++}
++
++static void
++ar_begin_teardown(void)
++{
++	switch (ar.state) {
++	case LW_AR_CREATED:
++		ar_vdev_cmd(CMD_VDEV_DELETE, TAG_VDEV_DELETE);
++		ar.state = LW_AR_DELETING;
++		break;
++	case LW_AR_PEERED:
++		ar.next_ms = lw_ms();                   /* nothing started: on to the deletes */
++		ar.state = LW_AR_STOPPING;
++		break;
++	case LW_AR_STARTING:
++		ar_vdev_cmd(CMD_VDEV_STOP, TAG_VDEV_STOP);
++		ar.next_ms = lw_ms() + 500;
++		ar.state = LW_AR_STOPPING;
++		break;
++	case LW_AR_UP:
++		ar_vdev_cmd(CMD_VDEV_DOWN, TAG_VDEV_DOWN);
++		ar.next_ms = lw_ms() + 50;
++		ar.state = LW_AR_DOWNING;
++		break;
++	default:
++		return;
++	}
++}
++
++static void
++ar_tx_pump(void)
++{
++	for (uint32_t n = 0; n < 16 && ar_txq_head != ar_txq_tail; n++) {
++		uint32_t i = ar_txq_head % AR_TXQ;
++		const uint8_t *f = ar_txq[i].d;
++		uint32_t len = ar_txq[i].len;
++		int s;
++
++		mb();
++		if (ar_txq[i].kind != LW_AR_MSG_TX_DATA && !lw_ar_wmi_room(wmiq_tail - wmiq_head, WMIQ_LEN)) {
++			return;                             /* en0 first: this frame next time */
++		}
++		switch (ar_txq[i].kind) {
++		case LW_AR_MSG_TX_MGMT:
++			ar_mgmt_tx(f, len);
++			break;
++		case LW_AR_MSG_TX_DATA:
++			if (!lw_ar_tx_room(ar_tx_busy(), TX_SLOTS, ar.shared)) {
++				return;                         /* en0 first: this frame next time */
++			}
++			lw_ar_tx_vdev = true;               /* htt_tx_frame: this vdev, no QoS TID, no key */
++			{
++				bool sent = htt_tx_frame(f, 24, f + 24, len - 24, true);
++				lw_ar_tx_vdev = false;
++				if (!sent) {
++					return;                     /* no room in the firmware's queue: this frame next time */
++				}
++			}
++			ar.tx_data++;
++			break;
++		case LW_AR_MSG_PEER_ADD:
++			if (lw_ar_peer_find(ar.peers, f) < 0 && (s = lw_ar_peer_free(ar.peers)) >= 0) {
++				memcpy(ar.peers[s].mac, f, 6);
++				ar.peers[s].used = true;
++				ar.peers[s].assoc_done = false;
++				ar.peers[s].created_ms = lw_ms();
++				ar_peer_cmd(CMD_PEER_CREATE, TAG_PEER_CREATE, f, true);
++			}
++			break;
++		case LW_AR_MSG_PEER_DEL:
++			if ((s = lw_ar_peer_find(ar.peers, f)) >= 0) {
++				ar.peers[s].used = false;
++				ar_peer_cmd(CMD_PEER_DELETE, TAG_PEER_DELETE, f, false);
++			}
++			break;
++		default:
++			break;
++		}
++		mb();
++		ar_txq_head = ar_txq_head + 1;
++	}
++}
++
++static void
++ar_poll(void)
++{
++	uint64_t now = lw_ms();
++	bool idle_lost = !ar.shared && (s_join_asked || s_state != S_IDLE);
++	bool share_lost = ar.shared && (s_join_asked || s_state != S_UP || s_freq != ar.freq);
++
++	if (ar.state == LW_AR_OFF) {
++		if (ar.ask_stop) {
++			ar.ask_stop = false;
++			ar.ask_start = false;
++		}
++		if (ar.ask_start && !scanning) {
++			enum lw_ar_reason why;
++
++			ar.ask_start = false;
++			why = lw_ar_may_start(ar_en0_state(), s_freq, ar.ask_freq, ar.may_share);
++			if (why != LW_AR_WHY_NONE) {
++				ar.why = why;                   /* the daemon reads this and says its one line */
++				ar.why_value = s_freq;
++				return;
++			}
++			ar.why = LW_AR_WHY_NONE;
++			ar.freq = ar.ask_freq;
++			ar.shared = s_state == S_UP;
++			memcpy(ar.mac, ar.ask_mac, 6);
++			bzero(ar.peers, sizeof(ar.peers));
++			ar_txq_head = ar_txq_tail;
++			if (!ar.shared) {
++				ar_chan_list(ar.freq);
++				ar.chan_changed = true;
++			}
++			uint8_t v[4 + 20] = {}, *c = wmi_put_tlv(v, TAG_VDEV_CREATE_CMD, 20);
++			c = put32(c, AR_VDEV);
++			c = put32(c, 3);                    /* IBSS */
++			c = put32(c, 0);
++			memcpy(c, ar.mac, 6);
++			wmi_send(CMD_VDEV_CREATE, v, sizeof(v));
++			ar.next_ms = now + AR_STEP_MS;
++			ar.state = LW_AR_CREATED;
++			ar.ever = true;
++		}
++		return;
++	}
++	if (ar.state < LW_AR_DOWNING && (ar.ask_stop || idle_lost || share_lost)) {
++		if (!ar.ask_stop) {
++			ar_say_off(LW_AR_WHY_WIFI_FIRST, s_freq, "en0 needs the radio: a join or a change of AP comes first");
++		}
++		ar.ask_stop = false;
++		ar_begin_teardown();
++		return;
++	}
++	switch (ar.state) {
++	case LW_AR_CREATED:
++		if (now >= ar.next_ms) {
++			ar_peer_cmd(CMD_PEER_CREATE, TAG_PEER_CREATE, ar.mac, true);
++			ar.next_ms = now + AR_STEP_MS;
++			ar.state = LW_AR_PEERED;
++		}
++		break;
++	case LW_AR_PEERED:
++		if (now >= ar.next_ms && !scanning) {       /* no VDEV_START in a scan: as w_join_poll */
++			ar_vdev_start();
++			ar.next_ms = now + 2000;
++			ar.state = LW_AR_STARTING;
++		}
++		break;
++	case LW_AR_STARTING:
++		if (now >= ar.next_ms) {
++			ar_say_off(LW_AR_WHY_START_TIMEOUT, ar.freq, "no VDEV_START answer in 2 s on this MHz");
++			ar_begin_teardown();
++		}
++		break;
++	case LW_AR_UP:
++		ar_tx_pump();
++		for (int i = 0; i < LW_AR_PEERS; i++) {
++			if (ar.peers[i].used && !ar.peers[i].assoc_done && now - ar.peers[i].created_ms >= AR_STEP_MS && lw_ar_wmi_room(wmiq_tail - wmiq_head, WMIQ_LEN)) {
++				ar.peers[i].assoc_done = true;
++				ar_peer_assoc(ar.peers[i].mac);
++				ar_peer_authorize(ar.peers[i].mac);
++			}
++		}
++		break;
++	case LW_AR_DOWNING:
++		if (now >= ar.next_ms) {
++			ar_vdev_cmd(CMD_VDEV_STOP, TAG_VDEV_STOP);
++			ar.next_ms = now + 500;
++			ar.state = LW_AR_STOPPING;
++		}
++		break;
++	case LW_AR_STOPPING:                        /* the VDEV_STOPPED event moves next_ms to now */
++		if (now >= ar.next_ms) {
++			for (int i = 0; i < LW_AR_PEERS; i++) {
++				if (ar.peers[i].used) {
++					ar_peer_cmd(CMD_PEER_DELETE, TAG_PEER_DELETE, ar.peers[i].mac, false);
++					ar.peers[i].used = false;
++				}
++			}
++			ar_peer_cmd(CMD_PEER_DELETE, TAG_PEER_DELETE, ar.mac, false);
++			ar_vdev_cmd(CMD_VDEV_DELETE, TAG_VDEV_DELETE);
++			ar.next_ms = now + AR_STEP_MS;
++			ar.state = LW_AR_DELETING;
++		}
++		break;
++	case LW_AR_DELETING:
++		if (now >= ar.next_ms && !scanning) {       /* (a join waits for !scanning too: this adds no new wait for en0) */
++			if (ar.chan_changed) {
++				ar.chan_changed = false;
++				ar_chan_list(0);                    /* the channel goes back to passive: nothing of the cell stays */
++			}
++			ar.off_ms = now;
++			ar.state = LW_AR_OFF;
++		}
++		break;
++	default:
++		break;
++	}
++}
+diff --git a/iokit/Kernel/arm/LaurelWifiAwdlRadio3.inc b/iokit/Kernel/arm/LaurelWifiAwdlRadio3.inc
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelWifiAwdlRadio3.inc
+@@ -0,0 +1,158 @@
++/*
++ * laurel 2932: the AWDL radio, third part: firmware events, Rx routing and the C API for bsd/dev/laurel_awdl_ctl.c. docs/laurel_sprout/airdrop-awdl.md.
++ */
++/* VDEV_START_RESP or VDEV_STOPPED for vdev 1. Returns true when the event was this radio's. */
++static bool
++ar_event(uint32_t id, const uint8_t *t, uint32_t len)
++{
++	uint32_t v[4] = {};
++	uint16_t l = 0;
++
++	if (len < 8) {
++		return false;
++	}
++	memcpy(&l, t, 2);
++	if (len < 4u + l || l < 4) {
++		return false;
++	}
++	memcpy(v, t + 4, MIN((uint32_t)l, (uint32_t)sizeof(v)));
++	if (v[0] != AR_VDEV) {
++		return false;
++	}
++	if (id == 0x5001 && ar.state == LW_AR_STARTING) {
++		if (l >= 16 && v[3] != 0) {
++			ar_say_off(LW_AR_WHY_START_STATUS, v[3], "the firmware refused VDEV_START of the IBSS vdev");
++			ar_begin_teardown();
++		} else {
++			ar_vdev_up();
++			ar.state = LW_AR_UP;
++			ar.why = LW_AR_WHY_NONE;
++			printf("LAUREL AWDL: on: IBSS vdev up on channel %u, %s: no AWDL frame heard yet\n", lw_ar_channel(ar.freq),
++			    ar.shared ? "beside en0" : "alone");
++		}
++	} else if (id == EV_VDEV_STOPPED && ar.state == LW_AR_STOPPING) {
++		ar.next_ms = lw_ms();
++	}
++	return true;
++}
++
++/* An AWDL action frame on this vdev's channel goes to the daemon. Returns true when it was taken. */
++static bool
++ar_mgmt_rx(const uint32_t *hdr, const uint8_t *f, uint32_t len)
++{
++	if (ar.state != LW_AR_UP || !(lw_awdl_frame(f, len) || lw_ar_addba_frame(f, len))) {
++		return false;
++	}
++	ar.rx_mgmt++;
++	if (lw_awdl_frame(f, len)) {
++		ar.heard++;
++		if (!ar.said_heard) {
++			ar.said_heard = true;
++			printf("LAUREL AWDL: on: first AWDL frame heard on the vdev, channel %u, subtype %u: the firmware passes foreign action frames\n", hdr[0], f[30]);
++		}
++	}
++	if (topaz_awdl_rx_hook != NULL) {
++		topaz_awdl_rx_hook(LW_AR_EV_RX_MGMT, (int)hdr[1] - 95, f, len);
++	}
++	return true;
++}
++
++/* A native-wifi data frame from the HTT ring: this vdev's, or on AWDL's BSSID. */
++static bool
++ar_data_rx(uint32_t vdev, const uint8_t *f, uint32_t len)
++{
++	enum lw_ar_route r = lw_ar_data_route(ar.state, vdev, f, len);
++
++	if (r != LW_AR_TO_DAEMON) {
++		return r == LW_AR_TO_NOBODY;
++	}
++	ar.rx_data++;
++	if (topaz_awdl_rx_hook != NULL) {
++		topaz_awdl_rx_hook(LW_AR_EV_RX_DATA, 0, f, len);
++	}
++	return true;
++}
++
++/* ---- the C API */
++extern "C" int
++topaz_awdl_ask(unsigned kind, const uint8_t *d, size_t len)
++{
++	if (!api_ready) {
++		return ENXIO;
++	}
++	switch (kind) {
++	case LW_AR_MSG_START:
++		if (len < 9 || !lw_ar_mac_ok(d + 2) || memcmp(d + 2, our_mac, 6) == 0) {
++			return EINVAL;
++		}
++		ar.ask_freq = (uint16_t)(d[0] | d[1] << 8);
++		if (!lw_ar_social(ar.ask_freq)) {
++			return EINVAL;
++		}
++		memcpy(ar.ask_mac, d + 2, 6);
++		ar.may_share = d[8] != 0;
++		ar.why = LW_AR_WHY_NONE;
++		mb();
++		ar.ask_start = true;
++		return 0;
++	case LW_AR_MSG_STOP:
++		ar.ask_stop = true;
++		return 0;
++	case LW_AR_MSG_TX_MGMT:
++	case LW_AR_MSG_TX_DATA:
++		if (len < 24) {
++			return EINVAL;
++		}
++		break;
++	case LW_AR_MSG_PEER_ADD:
++	case LW_AR_MSG_PEER_DEL:
++		if (len != 6) {
++			return EINVAL;
++		}
++		break;
++	default:
++		return EINVAL;
++	}
++	if (ar.state != LW_AR_UP || len > LW_AR_FRAME_MAX) {
++		return ENOTCONN;
++	}
++	if (ar_txq_tail - ar_txq_head >= AR_TXQ) {
++		ar.tx_full++;
++		return ENOBUFS;
++	}
++	{
++		uint32_t i = ar_txq_tail % AR_TXQ;
++
++		ar_txq[i].kind = (uint8_t)kind;
++		ar_txq[i].len = (uint16_t)len;
++		memcpy(ar_txq[i].d, d, len);
++		mb();
++		ar_txq_tail = ar_txq_tail + 1;
++	}
++	return 0;
++}
++
++extern "C" void
++topaz_awdl_status(struct lw_ar_status *o)
++{
++	bzero(o, sizeof(*o));
++	o->state = ar.state;
++	o->freq = ar.freq;
++	o->why = ar.why;
++	o->why_value = ar.why_value;
++	o->en0_state = ar_en0_state();
++	o->en0_freq = s_freq;
++	o->heard = ar.heard;
++	o->rx_mgmt = ar.rx_mgmt;
++	o->rx_data = ar.rx_data;
++	o->tx_mgmt = ar.tx_mgmt;
++	o->tx_data = ar.tx_data;
++	o->tx_full = ar.tx_full;
++	o->ble_age_s = laurel_awdl_ble_age_s();
++	o->mode_shared = ar.shared;
++	o->fw_fatal = lw_modem_fatal || w_arrivals > 1;   /* the second: the WLAN PD restarted (wlfw_arrive): the vdevs are gone */
++	o->off_age_ms = !ar.ever ? 0xFFFFFFFFu : ar.state != LW_AR_OFF ? 0 : (uint32_t)MIN(lw_ms() - ar.off_ms, 0xFFFFFFFEull);
++	for (int i = 0; i < LW_AR_PEERS; i++) {
++		o->peers += ar.peers[i].used ? 1 : 0;
++	}
++}
+diff --git a/bsd/dev/laurel_awdl_ctl.c b/bsd/dev/laurel_awdl_ctl.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/laurel_awdl_ctl.c
+@@ -0,0 +1,350 @@
++/*
++ * laurel 2932: the kernel side of laurel-awdld (AirDrop on the Mi A3, docs/laurel_sprout/airdrop-awdl.md): the control socket com.laurel.awdl and the interface awdl0.
++ * awdl0 is a plain Ethernet interface with no IFEF_AWDL: its IP packets go to the daemon, which runs AWDL (owly-awdl) and sends them through the modem's vdev 1 (TopazModem.cpp).
++ * One client, root only. No client, or boot-arg awdl=0: nothing runs and nothing changes for en0. awdl0 is made only when the daemon has heard AWDL: no frames, no interface.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/clock.h>
++#include <libkern/libkern.h>
++#include <net/ethernet.h>
++#include <net/if.h>
++#include <net/if_dl.h>
++#include <net/if_ether.h>
++#include <net/if_private.h>
++#include <net/if_types.h>
++#include <net/kpi_interface.h>
++#include <netinet/in.h>
++#include <netinet6/in6_var.h>
++#include <netinet6/nd6.h>
++#include <sys/errno.h>
++#include <sys/kern_control.h>
++#include <sys/kern_event.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/param.h>
++#include <sys/sockio.h>
++#include <sys/systm.h>
++#include "../../iokit/Kernel/arm/LaurelWifiAwdlRadio.h"
++
++extern void (*topaz_awdl_rx_hook)(unsigned kind, int rssi, const uint8_t *frame, size_t length);
++extern int topaz_awdl_ask(unsigned kind, const uint8_t *d, size_t len);
++extern void topaz_awdl_status(struct lw_ar_status *o);
++void laurel_awdl_ctl_attach(void);
++void laurel_awdl_hci_note(const uint8_t *cmd, size_t n);
++uint32_t laurel_awdl_ble_age_s(void);
++
++static struct {
++	kern_ctl_ref ref;
++	volatile bool connected;
++	volatile uint32_t unit;
++	ifnet_t ifp;
++	bool typed;                                 /* LW_AR_IF_TYPED: Wi-Fi subfamily + IFEF_AWDL (iOS 26) */
++	uint8_t in[LW_AR_FRAME_MAX + 1];            /* ctl_send: one client, the socket lock is dropped around it */
++	uint8_t rx[LW_AR_FRAME_MAX + LW_AR_EV_HDR]; /* the modem thread */
++	volatile uint64_t ble_abs;
++} a;
++
++/* the IP stack's frame goes to the daemon */
++static errno_t
++awdl_output(ifnet_t ifp, mbuf_t m)
++{
++	size_t len = mbuf_pkthdr_len(m);
++	uint8_t *h;
++	errno_t e;
++
++	if (!a.connected || len > LW_AR_FRAME_MAX || mbuf_prepend(&m, LW_AR_EV_HDR, MBUF_DONTWAIT) != 0) {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	h = mbuf_data(m);
++	h[0] = LW_AR_EV_IP_OUT;
++	h[1] = h[2] = h[3] = 0;
++	e = ctl_enqueuembuf(a.ref, a.unit, m, CTL_DATA_EOR);
++	if (e != 0) {
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	ifnet_stat_increment_out(ifp, 1, (uint32_t)len, 0);
++	return 0;
++}
++
++static errno_t
++awdl_ioctl(ifnet_t ifp, u_long command, void *data)
++{
++	struct ifreq *request = data;
++
++	switch (command) {
++	case SIOCSIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++		ifnet_set_flags(ifp, (ifnet_flags(ifp) & IFF_UP) ? IFF_RUNNING : 0, IFF_RUNNING);
++		return 0;
++	case SIOCSIFMTU:
++		return request->ifr_mtu > ETHERMTU || request->ifr_mtu < IF_MINMTU ? EINVAL : ifnet_set_mtu(ifp, request->ifr_mtu);
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;                       /* every frame goes to the daemon anyway */
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static errno_t
++awdl_if_make(const uint8_t *mac, bool typed)
++{
++	struct ifnet_init_eparams init = {
++		.ver = IFNET_INIT_CURRENT_VERSION,
++		.len = sizeof(init),
++		.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO,
++		.uniqueid = "laurel-awdl0",
++		.uniqueid_len = 12,
++		.name = "awdl",
++		.unit = 0,
++		.family = IFNET_FAMILY_ETHERNET,
++		.subfamily = typed ? IFNET_SUBFAMILY_WIFI : IFNET_SUBFAMILY_ANY,
++		.type = IFT_ETHER,
++		.output = awdl_output,
++		.demux = ether_demux,
++		.add_proto = ether_add_proto,
++		.del_proto = ether_del_proto,
++		.check_multi = ether_check_multi,
++		.framer_extended = ether_frameout_extended,
++		.ioctl = awdl_ioctl,
++		.broadcast_addr = etherbroadcastaddr,
++		.broadcast_len = ETHER_ADDR_LEN,
++	};
++	ifnet_t ifp = NULL;
++	errno_t e;
++
++	if (a.ifp != NULL) {
++		return ifnet_set_lladdr(a.ifp, mac, ETHER_ADDR_LEN);
++	}
++	e = ifnet_allocate_extended(&init, &ifp);
++	if (e != 0) {
++		return e;
++	}
++	ifnet_set_addrlen(ifp, ETHER_ADDR_LEN);
++	ifnet_set_baudrate(ifp, 54 * 1000 * 1000);
++	ifnet_set_mtu(ifp, 1450);               /* as Owly's awdl0: the AWDL data header takes 16 bytes of a data frame */
++	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
++	ifnet_set_hdrlen(ifp, ETHER_HDR_LEN);
++	ifnet_set_offload(ifp, 0);
++	e = ifnet_attach(ifp, NULL);
++	if (e != 0) {
++		ifnet_release(ifp);
++		return e;
++	}
++	ifnet_set_lladdr(ifp, mac, ETHER_ADDR_LEN);
++	a.ifp = ifp;
++	a.typed = typed;
++	if (typed) {
++		e = ifnet_set_eflags(ifp, IFEF_AWDL, IFEF_AWDL);    /* with its mask: ND6ALT, RESTRICTED_RECV, LOCALNET_PRIVATE */
++		printf("LAUREL AWDL: on: interface awdl0 made: Wi-Fi subfamily, IFEF_AWDL: error %d\n", e);
++		return e;
++	}
++	printf("LAUREL AWDL: on: interface awdl0 made\n");
++	return 0;
++}
++
++/* IFEF_IPV6_ND6ALT: no Neighbor Discovery on the interface: the kernel learns a peer from here, its link-local address from its MAC, as Apple's driver does */
++static void
++awdl_neighbor(const uint8_t *mac, bool present)
++{
++	struct sockaddr_in6 sin6;
++	struct sockaddr_dl sdl;
++
++	if (a.ifp == NULL || !a.typed) {
++		return;
++	}
++	bzero(&sin6, sizeof(sin6));
++	sin6.sin6_len = sizeof(sin6);
++	sin6.sin6_family = AF_INET6;
++	sin6.sin6_addr.s6_addr[0] = 0xfe;
++	sin6.sin6_addr.s6_addr[1] = 0x80;
++	sin6.sin6_addr.s6_addr[8] = mac[0] ^ 2;
++	sin6.sin6_addr.s6_addr[9] = mac[1];
++	sin6.sin6_addr.s6_addr[10] = mac[2];
++	sin6.sin6_addr.s6_addr[11] = 0xff;
++	sin6.sin6_addr.s6_addr[12] = 0xfe;
++	sin6.sin6_addr.s6_addr[13] = mac[3];
++	sin6.sin6_addr.s6_addr[14] = mac[4];
++	sin6.sin6_addr.s6_addr[15] = mac[5];
++	bzero(&sdl, sizeof(sdl));
++	sdl.sdl_len = sizeof(sdl);
++	sdl.sdl_family = AF_LINK;
++	sdl.sdl_type = IFT_ETHER;
++	sdl.sdl_index = (u_short)ifnet_index(a.ifp);
++	sdl.sdl_alen = ETHER_ADDR_LEN;
++	memcpy(LLADDR(&sdl), mac, ETHER_ADDR_LEN);
++	if (present) {
++		(void)nd6_alt_node_present(a.ifp, &sin6, &sdl, IFNET_RSSI_UNKNOWN, IFNET_LQM_THRESH_UNKNOWN, IFNET_NPM_THRESH_UNKNOWN);
++	} else {
++		(void)nd6_alt_node_absent(a.ifp, &sin6, &sdl);
++	}
++}
++
++/* a frame from the daemon for the IP stack: as redwood_net_input_parts */
++static errno_t
++awdl_input(const uint8_t *frame, size_t length)
++{
++	struct ifnet_stat_increment_param stats = { .packets_in = 1, .bytes_in = (uint32_t)length };
++	unsigned int chunks = 1;
++	mbuf_t packet = NULL;
++	char *header;
++
++	if (a.ifp == NULL || length < ETHER_HDR_LEN) {
++		return ENXIO;
++	}
++	if (mbuf_allocpacket(MBUF_DONTWAIT, length, &chunks, &packet) != 0) {
++		return ENOBUFS;
++	}
++	if (mbuf_copyback(packet, 0, length, frame, MBUF_DONTWAIT) != 0) {
++		mbuf_freem(packet);
++		return ENOBUFS;
++	}
++	header = mbuf_data(packet);
++	mbuf_pkthdr_setrcvif(packet, a.ifp);
++	mbuf_pkthdr_setheader(packet, header);
++	mbuf_pkthdr_adjustlen(packet, -ETHER_HDR_LEN);
++	mbuf_setdata(packet, header + ETHER_HDR_LEN, mbuf_len(packet) - ETHER_HDR_LEN);
++	return ifnet_input(a.ifp, packet, &stats);
++}
++
++/* from the modem thread */
++static void
++awdl_rx(unsigned kind, int rssi, const uint8_t *frame, size_t length)
++{
++	if (!a.connected || length > LW_AR_FRAME_MAX) {
++		return;
++	}
++	a.rx[0] = (uint8_t)kind;
++	a.rx[1] = (uint8_t)(int8_t)rssi;
++	a.rx[2] = a.rx[3] = 0;
++	memcpy(a.rx + LW_AR_EV_HDR, frame, length);
++	(void)ctl_enqueuedata(a.ref, a.unit, a.rx, length + LW_AR_EV_HDR, CTL_DATA_EOR);   /* a full socket loses this frame: 802.11 has lost frames */
++}
++
++static errno_t
++ctl_connect(kern_ctl_ref ref __unused, struct sockaddr_ctl *sac, void **unitinfo)
++{
++	*unitinfo = NULL;
++	if (a.connected) {
++		return EBUSY;
++	}
++	a.unit = sac->sc_unit;
++	a.connected = true;
++	return 0;
++}
++
++static errno_t
++ctl_disconnect(kern_ctl_ref ref __unused, u_int32_t unit, void *unitinfo __unused)
++{
++	if (a.connected && a.unit == unit) {
++		a.connected = false;
++		(void)topaz_awdl_ask(LW_AR_MSG_STOP, NULL, 0);    /* the daemon died: the vdev goes */
++		if (a.ifp != NULL) {
++			ifnet_set_flags(a.ifp, 0, IFF_UP | IFF_RUNNING);
++		}
++	}
++	return 0;
++}
++
++static errno_t
++ctl_send(kern_ctl_ref ref __unused, u_int32_t unit, void *unitinfo __unused, mbuf_t m, int flags __unused)
++{
++	size_t len = mbuf_pkthdr_len(m);
++	errno_t e;
++
++	if (!a.connected || a.unit != unit) {
++		mbuf_freem(m);
++		return ENOTCONN;
++	}
++	if (len < 1 || len > sizeof(a.in) || mbuf_copydata(m, 0, len, a.in) != 0) {
++		mbuf_freem(m);
++		return EINVAL;
++	}
++	mbuf_freem(m);
++	switch (a.in[0]) {
++	case LW_AR_MSG_IF_UP:
++		e = (len == 7 || len == 8) && lw_ar_mac_ok(a.in + 1) ? awdl_if_make(a.in + 1, len == 8 && (a.in[7] & LW_AR_IF_TYPED) != 0) : EINVAL;
++		break;
++	case LW_AR_MSG_IP_IN:
++		e = awdl_input(a.in + 1, len - 1);
++		break;
++	default:
++		e = topaz_awdl_ask(a.in[0], a.in + 1, len - 1);
++		if (e == 0 && (a.in[0] == LW_AR_MSG_PEER_ADD || a.in[0] == LW_AR_MSG_PEER_DEL)) {
++			awdl_neighbor(a.in + 1, a.in[0] == LW_AR_MSG_PEER_ADD);
++		}
++		break;
++	}
++	return e;
++}
++
++static errno_t
++ctl_getopt(kern_ctl_ref ref __unused, u_int32_t unit __unused, void *unitinfo __unused, int opt, void *data, size_t *len)
++{
++	struct lw_ar_status s;
++
++	if (opt != LW_AR_OPT_STATUS) {
++		return ENOTSUP;
++	}
++	if (data != NULL) {
++		if (*len < sizeof(s)) {
++			return EINVAL;
++		}
++		topaz_awdl_status(&s);
++		memcpy(data, &s, sizeof(s));
++	}
++	*len = sizeof(s);
++	return 0;
++}
++
++void
++laurel_awdl_ctl_attach(void)
++{
++	struct kern_ctl_reg reg;
++	errno_t e;
++
++	bzero(&reg, sizeof(reg));
++	strlcpy(reg.ctl_name, LW_AR_CTL_NAME, sizeof(reg.ctl_name));
++	reg.ctl_flags = CTL_FLAG_PRIVILEGED | CTL_FLAG_REG_EXTENDED;
++	reg.ctl_sendsize = 256u << 10;
++	reg.ctl_recvsize = 256u << 10;
++	reg.ctl_connect = ctl_connect;
++	reg.ctl_disconnect = ctl_disconnect;
++	reg.ctl_send = ctl_send;
++	reg.ctl_getopt = ctl_getopt;
++	e = ctl_register(&reg, &a.ref);
++	if (e != 0) {
++		printf("LAUREL AWDL: off: control socket not registered: error %d\n", e);
++		return;
++	}
++	topaz_awdl_rx_hook = awdl_rx;
++}
++
++/* from the Bluetooth shim, each HCI command: the sign that sharingd wants AirDrop now */
++void
++laurel_awdl_hci_note(const uint8_t *cmd, size_t n)
++{
++	if (lw_ar_ble_airdrop(cmd, n)) {
++		a.ble_abs = mach_absolute_time();
++	}
++}
++
++uint32_t
++laurel_awdl_ble_age_s(void)
++{
++	uint64_t ns;
++
++	if (a.ble_abs == 0) {
++		return 0xFFFFFFFFu;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - a.ble_abs, &ns);
++	return (uint32_t)(ns / NSEC_PER_SEC);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

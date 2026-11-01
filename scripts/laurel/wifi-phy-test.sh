@@ -11,5 +11,7 @@ sed -n '/^@@/,$ s/^+//p' "$REPO"/patches/laurel/xnu/2405-laurel-wifi-phy-header.
 sed -n '/^@@/,$ s/^+//p' "$REPO"/patches/laurel/xnu/2407-laurel-wifi-link-header.patch > "$T/LaurelWifiLink.h"
 sed -n '/^@@/,$ s/^+//p' "$REPO"/patches/laurel/xnu/2880-laurel-wifi-path-header.patch > "$T/LaurelWifiPath.h"
 sed -n '/^@@/,$ s/^+//p' "$REPO"/patches/laurel/xnu/2930-laurel-wifi-awdl-header.patch > "$T/LaurelWifiAwdl.h"
+# one file of a patch with many: from its "+++ b/.../LaurelWifiAwdlRadio.h" line to the next "diff --git"
+awk '/^\+\+\+ b\/.*LaurelWifiAwdlRadio\.h/{on=1;next} /^diff --git/{on=0} on&&/^@@/{next} on{print substr($0,2)}' "$REPO"/patches/laurel/xnu/2932-laurel-awdl-radio.patch > "$T/LaurelWifiAwdlRadio.h"
 ${CC:-cc} -std=gnu11 -Wall -Wextra -Werror -g -fsanitize=address,undefined -I"$T" -o "$T/wifi-phy-test" "$REPO/scripts/laurel/wifi-phy-test.c" -lm
 "$T/wifi-phy-test"

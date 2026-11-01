@@ -8,6 +8,7 @@
 #include "LaurelWifiLink.h"
 #include "LaurelWifiPath.h"
 #include "LaurelWifiAwdl.h"
+#include "LaurelWifiAwdlRadio.h"
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
@@ -159,6 +160,81 @@ awdl_tests(void)
 	CHECK(!lw_awdl_frame(f, 40));
 }
 
+/* laurel 2932: en0 first; the frames that the radio takes; the beacon; the Bluetooth sign; the peer table */
+static void
+awdl_radio_tests(void)
+{
+	static const uint8_t bssid[6] = { 0x00, 0x25, 0x00, 0xff, 0x94, 0x73 };
+	const uint8_t mac[6] = { 0x02, 1, 2, 3, 4, 5 };
+	uint8_t f[64] = { 0x08 }, b[64];
+	struct lw_ar_peer t[LW_AR_PEERS];
+	uint32_t n;
+
+	CHECK(lw_ar_social(2437) && lw_ar_social(5220) && lw_ar_social(5745) && !lw_ar_social(5180) && !lw_ar_social(2412));
+	CHECK(lw_ar_channel(2437) == 6 && lw_ar_channel(5220) == 44 && lw_ar_channel(5745) == 149);
+	CHECK(lw_ar_may_start(1, 0, 5220, true) == LW_AR_WHY_EN0_BUSY);
+	CHECK(lw_ar_may_start(0, 0, 5220, false) == LW_AR_WHY_NONE);
+	CHECK(lw_ar_may_start(2, 5180, 5220, true) == LW_AR_WHY_EN0_OTHER_CHANNEL);
+	CHECK(lw_ar_may_start(2, 5220, 5220, false) == LW_AR_WHY_SHARE_NOT_ALLOWED);
+	CHECK(lw_ar_may_start(2, 5220, 5220, true) == LW_AR_WHY_NONE);
+	CHECK(lw_ar_mac_ok(mac));
+	CHECK(!lw_ar_mac_ok((const uint8_t[]){ 0x00, 1, 2, 3, 4, 5 }) && !lw_ar_mac_ok((const uint8_t[]){ 0x03, 1, 2, 3, 4, 5 }));
+	memcpy(f + 16, bssid, 6);
+	CHECK(lw_ar_data_frame(f, 24) && !lw_ar_data_frame(f, 23));
+	f[1] = 2;                               /* From DS: an AP's frame */
+	CHECK(!lw_ar_data_frame(f, 24));
+	f[1] = 0;
+	f[16] = 1;
+	CHECK(!lw_ar_data_frame(f, 24));
+	f[16] = 0;
+	f[0] = 0xD0;
+	f[24] = 3;
+	CHECK(lw_ar_addba_frame(f, 26) && !lw_ar_addba_frame(f, 25));
+	n = lw_ar_beacon(b, mac, 5220, "awdl", 4);
+	CHECK(n == 36 + 6 + 10 + 4 && b[0] == 0x80 && memcmp(b + 10, mac, 6) == 0 && memcmp(b + 16, bssid, 6) == 0 && b[34] == 2 && b[37] == 4);
+	n = lw_ar_beacon(b, mac, 2437, "awdl", 4);
+	CHECK(n == 36 + 6 + 10 + 3 + 4 && n <= 64 && b[36 + 6 + 10] == 3 && b[36 + 6 + 10 + 2] == 6);
+	{
+		const uint8_t adv[] = { 1, 0x08, 0x20, 12, 11, 2, 1, 6, 7, 0xff, 0x4c, 0x00, 0x05, 0x12, 0, 0 };
+		const uint8_t other[] = { 1, 0x08, 0x20, 12, 11, 2, 1, 6, 7, 0xff, 0x4c, 0x00, 0x10, 0x12, 0, 0 };
+		const uint8_t cmd[] = { 1, 0x06, 0x20, 12, 11, 2, 1, 6, 7, 0xff, 0x4c, 0x00, 0x05, 0x12, 0, 0 };
+
+		CHECK(lw_ar_ble_airdrop(adv, sizeof(adv)));
+		CHECK(!lw_ar_ble_airdrop(other, sizeof(other)) && !lw_ar_ble_airdrop(cmd, sizeof(cmd)) && !lw_ar_ble_airdrop(adv, 3));
+	}
+	/* en0 first in the queues that both use: WMIQ_LEN 8, TX_SLOTS 128 */
+	CHECK(lw_ar_wmi_room(0, 8) && lw_ar_wmi_room(3, 8) && !lw_ar_wmi_room(4, 8) && !lw_ar_wmi_room(8, 8));
+	CHECK(lw_ar_tx_room(63, 128, true) && !lw_ar_tx_room(64, 128, true));
+	CHECK(lw_ar_tx_room(111, 128, false) && !lw_ar_tx_room(112, 128, false));
+	/* no scan begins while the vdev starts; a running cell does not hold scans */
+	CHECK(lw_ar_holds_scan(LW_AR_CREATED) && lw_ar_holds_scan(LW_AR_PEERED) && lw_ar_holds_scan(LW_AR_STARTING));
+	CHECK(!lw_ar_holds_scan(LW_AR_OFF) && !lw_ar_holds_scan(LW_AR_UP) && !lw_ar_holds_scan(LW_AR_STOPPING) && !lw_ar_holds_scan(LW_AR_DELETING));
+	/* a data frame: en0's stays en0's in every state; vdev 1's never reaches en0's IP stack */
+	{
+		uint8_t en0_frame[32] = { 0x08, 0x02 };   /* From DS, an AP's */
+		uint8_t cell[32] = { 0x08, 0x00 };
+
+		memcpy(cell + 16, bssid, 6);
+		for (uint32_t st = LW_AR_OFF; st <= LW_AR_DELETING; st++) {
+			CHECK(lw_ar_data_route(st, 0, en0_frame, 32) == LW_AR_TO_EN0);
+			CHECK(lw_ar_data_route(st, 1, en0_frame, 32) == (st == LW_AR_UP ? LW_AR_TO_DAEMON : LW_AR_TO_NOBODY));
+		}
+		CHECK(lw_ar_data_route(LW_AR_UP, 0, cell, 32) == LW_AR_TO_DAEMON);
+		CHECK(lw_ar_data_route(LW_AR_STOPPING, 0, cell, 32) == LW_AR_TO_NOBODY);
+		CHECK(lw_ar_data_route(LW_AR_OFF, 0, cell, 32) == LW_AR_TO_EN0);   /* as before the radio: en0's own filters decide */
+	}
+	CHECK(LW_AR_IF_TYPED == 1);
+	memset(t, 0, sizeof(t));
+	CHECK(lw_ar_peer_find(t, mac) == -1 && lw_ar_peer_free(t) == 0);
+	memcpy(t[0].mac, mac, 6);
+	t[0].used = true;
+	CHECK(lw_ar_peer_find(t, mac) == 0 && lw_ar_peer_free(t) == 1);
+	for (int i = 0; i < LW_AR_PEERS; i++) {
+		t[i].used = true;
+	}
+	CHECK(lw_ar_peer_free(t) == -1);
+}
+
 int
 main(void)
 {
@@ -243,6 +319,7 @@ main(void)
 	CHECK(r.kind == 0 && r.mbps10 == 110);
 	path_tests();
 	awdl_tests();
+	awdl_radio_tests();
 	printf(fails == 0 ? "wifi-phy-test: all checks passed\n" : "wifi-phy-test: %d checks FAILED\n", fails);
 	return fails != 0;
 }

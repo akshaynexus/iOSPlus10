@@ -1,10 +1,11 @@
 #!/bin/sh
-# Host test of the Mi A3 dual boot (docs/laurel_sprout/dual-boot.md). No phone, no root, no write outside out/. Seconds.
+# Host test of the Mi A3 dual boot (docs/laurel_sprout/dual-boot.md). No phone, no root, no write outside out/. Some minutes: run it with scripts/bg.sh.
 #   scripts/laurel/test-dualboot.sh
 #   1. op10tool unit tests: FIEMAP -> table rules (overlap, alignment, outside userdata, holes, flags, damage).
 #   2. The same format in C: laurel_dualboot.h reads what op10tool wrote; refused by both.
 #   3. The real bsd/dev/sweet_ufs.c (the tree of `AUDIT=1 scripts/laurel/kernel-linux.sh` or a build) over a RAM disk: mapping, fence, self-checks, log thread, each failure = no block changed.
-#   4. The phone helper, built for this host: write/verify/read/seal on a fake partition file; refusals. (aarch64 build: compile check only.)
+#   4. The phone helper, built for this host: write/verify/read on a fake partition file; scripts/laurel/ldbhelper-test.sh: file checks, record, the frozen seal and its failures, wipe. (aarch64 build: compile check only.)
+#   6. scripts/laurel/android-guard-test.sh and scripts/laurel/dual-boot-test.sh: the scripts themselves, with a fake adb and fastboot. PATH holds no real adb or fastboot there.
 # Proves the code on the host. Nothing here proves anything about the phone.
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
@@ -44,6 +45,9 @@ $CC -std=gnu11 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefin
   -I"$D/k" -I"$T/test" -o "$D/test_kernel" "$T/test/test_kernel.c"
 ASAN_OPTIONS=detect_leaks=0 "$D/test_kernel" > "$D/test_kernel.out" 2>&1 || { grep -v '^SWEET' "$D/test_kernel.out" | tail -40; echo "test-dualboot: FAILED: test_kernel" >&2; exit 1; }
 grep -E '^ok|^test_kernel:' "$D/test_kernel.out"
+LDB_MARKER=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$T/laurel_dualboot.h")
+LC_ALL=C grep -aqF "$LDB_MARKER" "$D/test_kernel" || { echo "test-dualboot: FAILED: the kernel object has no marker text $LDB_MARKER" >&2; exit 1; }
+echo "ok   H1 the driver built with the marker holds the text: $LDB_MARKER"
 grep -E 'LAUREL DUALBOOT: (on|off)' "$D/test_kernel.out" | sed 's/^/     /' | sort -u
 
 echo "== 4. the phone helper"
@@ -109,8 +113,11 @@ with open(sys.argv[1], 'r+b') as f:
         f.seek(b * 4096); f.write(r.randbytes(4096))
 PY
 cp "$D/part.img" "$D/part.before"
-"$H" write "$D/table.ldbt" "$D/part.img" < "$D/root.frames" | sed 's/^/     /'
-"$H" verify "$D/table.ldbt" "$D/part.img" < "$D/root.idx" | sed 's/^/     /'
+# the frames against a fragmented synthetic table: no file behind it, so this test build skips the file checks here (those: ldbhelper-test.sh)
+: > "$D/nofile"
+NF="env LDB_TEST_FAULT=no-file-check"
+$NF "$H" write "$D/table.ldbt" "$D/part.img" "$D/nofile" < "$D/root.frames" | sed 's/^/     /'
+$NF "$H" verify "$D/table.ldbt" "$D/part.img" "$D/nofile" < "$D/root.idx" | sed 's/^/     /'
 python3 -I - "$D" <<'PY'
 import sys
 d = sys.argv[1]
@@ -155,7 +162,7 @@ open(sys.argv[1] + '.hdr', 'wb').write(b'LDBFRAME' + struct.pack('<QIIQ', 0, 1, 
 PY
 cp "$D/part.img" "$D/part.before"
 for e in evil.frames evil.frames.hdr; do
-  if "$H" write "$D/table.ldbt" "$D/part.img" < "$D/$e" > "$D/o" 2>&1; then echo "test-dualboot: FAILED: $e accepted" >&2; exit 1; fi
+  if $NF "$H" write "$D/table.ldbt" "$D/part.img" "$D/nofile" < "$D/$e" > "$D/o" 2>&1; then echo "test-dualboot: FAILED: $e accepted" >&2; exit 1; fi
   grep -q 'out of range' "$D/o" || { cat "$D/o"; exit 1; }
 done
 cmp "$D/part.before" "$D/part.img"
@@ -165,7 +172,7 @@ python3 -I - "$D/evil2" <<'PY'
 import struct, sys
 open(sys.argv[1], 'wb').write(b'LDBFRAME' + struct.pack('<QIIQ', 300, 1, 0, 12345) + bytes(4096))
 PY
-if "$H" write "$D/table.ldbt" "$D/part.img" < "$D/evil2" >/dev/null 2>&1; then echo "test-dualboot: FAILED: bad frame hash accepted" >&2; exit 1; fi
+if $NF "$H" write "$D/table.ldbt" "$D/part.img" "$D/nofile" < "$D/evil2" >/dev/null 2>&1; then echo "test-dualboot: FAILED: bad frame hash accepted" >&2; exit 1; fi
 cmp "$D/part.before" "$D/part.img"
 echo "ok   helper: a frame with a wrong hash is refused, partition identical"
 # check-map must not run over an installed root (the root is on the fake partition now): on a real file it would overwrite the image
@@ -173,34 +180,8 @@ if "$H" check-map "$D/table.ldbt" "$D/root.img" "$D/part.img" > "$D/o" 2>&1; the
 grep -q 'holds a root' "$D/o" || { cat "$D/o"; exit 1; }
 cmp "$D/part.before" "$D/part.img"
 echo "ok   helper: check-map refuses an area that holds a root"
-# seal: real FIEMAP of a real file on this filesystem (LDB_TEST_NO_PIN: the host has no f2fs), a fake f2fs superblock
-A=$D/area.bin
-head -c $((16 * 1024 * 1024)) /dev/urandom > "$A"; sync "$A"
-"$H" map "$A" > "$D/map.txt" 2>"$D/map.err" || true
-if grep -q '^extent' "$D/map.txt" && ! grep -qE '^extent [0-9]+ [0-9]+ [0-9]+ ([0-9]*[2-9]|[0-9]+[0-9])$' "$D/map.txt"; then
-  max=$(awk '/^extent/ {e = ($3 + $4) / 4096; if (e > m) m = e} END {printf "%d", m + 2000}' "$D/map.txt")
-  "$TOOL" dualboot table --fiemap "$D/map.txt" --part-first 4096 --part-blocks "$max" -o "$D/real.ldbt" | sed 's/^/     real FIEMAP -> /'
-  truncate -s $((max * 4096)) "$D/spart.img"
-  python3 -I - "$D/fs.img" <<'PY'
-import struct, sys
-b = bytearray(4096)
-b[1024:1028] = struct.pack('<I', 0xF2F52010); b[1024 + 20:1024 + 24] = struct.pack('<I', 9); b[1024 + 76:1024 + 80] = struct.pack('<I', 512)
-open(sys.argv[1], 'wb').write(b)
-PY
-  "$H" seal "$D/real.ldbt" "$D/spart.img" "$D/fs.img" "$A" | sed 's/^/     /'
-  "$H" seal "$D/real.ldbt" "$D/spart.img" "$D/fs.img" "$A" | grep -q 'generation 2' && echo "ok   seal: writes the header, the generation counts"
-  "$H" read "$D/real.ldbt" "$D/spart.img" 0 1 | head -c 8 | grep -q LAURELDB && echo "ok   read: the header is at area block 0"
-  # the file moved: another table must refuse
-  head -c $((16 * 1024 * 1024)) /dev/urandom > "$A.new"; sync "$A.new"
-  if "$H" seal "$D/real.ldbt" "$D/spart.img" "$D/fs.img" "$A.new" >"$D/o" 2>&1; then echo "test-dualboot: FAILED: seal of a moved file accepted" >&2; exit 1; fi
-  sed 's/^/     moved file: /' "$D/o"
-  echo "ok   seal: a file at other blocks is refused"
-  # no f2fs on the filesystem device
-  if "$H" seal "$D/real.ldbt" "$D/spart.img" "$A" "$A" >/dev/null 2>&1; then echo "test-dualboot: FAILED: seal without f2fs accepted" >&2; exit 1; fi
-  echo "ok   seal: a device without f2fs superblock is refused"
-else
-  echo "note seal test skipped: FIEMAP of this filesystem gives no plain extents ($(tr -d '\n' < "$D/map.err"))"
-fi
+# the refusals and the seal: a real file with real FIEMAP on this filesystem
+LDB_TEST_DIR=$D sh "$REPO/scripts/laurel/ldbhelper-test.sh" "$H" "$TOOL" || { echo "test-dualboot: FAILED: ldbhelper-test" >&2; exit 1; }
 echo "== 5. the table in the ADT, the way DarwinBoot hands it to the kernel"
 if [ -f "$EXT/ios-topaz/tools/mkadt.py" ]; then
   python3 "$REPO/scripts/laurel/mkadt.py" "$D/t.adt" --cores 8 --boot gold --dram 0x81000000:0x30000000 --darwinboot --dualboot-table "$D/table.ldbt" 2>&1 | sed 's/^/     /'
@@ -217,6 +198,7 @@ PY
 else
   echo "note ADT test skipped: no external/ios-topaz"
 fi
-echo "== 6. guards"
-sh "$REPO/scripts/laurel/android-guard-test.sh"
+echo "== 6. guards and the dual boot script, with a fake adb and fastboot"
+sh "$REPO/scripts/laurel/android-guard-test.sh" || { echo "test-dualboot: FAILED: android-guard-test" >&2; exit 1; }
+OP10TOOL=$TOOL sh "$REPO/scripts/laurel/dual-boot-test.sh" || { echo "test-dualboot: FAILED: dual-boot-test" >&2; exit 1; }
 echo "test-dualboot: PASS"

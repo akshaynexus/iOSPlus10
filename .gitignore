@@ -11,6 +11,7 @@
 *.adt
 getvar*.txt
 backup/
+!scripts/backup/
 dumps/
 out/
 inputs/
@@ -29,6 +30,7 @@ external/UniXNU-negroni/
 external/ios-sweet/
 external/ios-sweet-upstream/
 external/UniXNU-ios26/
+external/IOS-26-Hot/
 external/UniXNU-zeta/
 external/UniXNU-pong/
 external/ios-sailfish/
@@ -55,3 +57,7 @@ external/*.partial/
 external/ios-sweet-umi/
 external/ios-topaz-evergo/
 external/ios-redfin/
+external/IOS-26-Hot/
+external/hakios-dada/
+external/AdrenoMetal/
+external/Bergamota/
