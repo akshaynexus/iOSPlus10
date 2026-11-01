@@ -983,3 +983,11 @@ Owner's decision: Metal in mediaserverd. Done: clients `* -backboardd`; `makeAli
 ## Mi A3: camera: no light in the stream, review + self-check (2026-11-01, branch t3/laurel-camera-light, patch 2784; build + host test, NOT BOOTED)
 Result: no code fault explains the dark frames; cause [U]. Rails, delays, MCLK, tables, exposure, gain, pedestal and RAW10 reading equal stock or are right: evidence table in docs/laurel_sprout/camera.md section 12. One stock difference fixed: L12A high power mode vote. New self-check: rails from the pads and the PMIC, register read-back, all table values read back, the sensor's colour bars in memory, raw statistics in the kernel and in the plug-in.
 Next: boot image + root flash (owner approves), then the 5 scene steps of section 12: the lines decide scene, path, or the sensor's analog side.
+
+## Mi A3: cellular reaches iOS, IPA test prepared (2026-11-01, branch t3/laurel-cellular-online, patch 2786, `userland/laurel/cell`; build + host test, NOT BOOTED)
+Owner: "Cellular modem is not working or being detected." Docs: docs/laurel_sprout/cellular.md sections 9, 10. Audit rows 3, 4.
+Decision [V evidence in 9.1]: (b) SpringBoard bridge built; (c) data next, only after the IPA test; (a) CommCenter stays out (scion: 20 crashes on 2 drivers).
+Done: kernel: mode read every 10 s until online (the blocker), NAS bind retries (false SIM2 risk), `part:` line, `kern.laurel_cell_state` with bars only when registered. iOS: `liblaurel-cellbar.dylib` answers for `STTelephonyStateProvider`, so Apple's code makes bars, name and `No Service`.
+Not built, and said so: data, SMS, voice, Settings pane content. Modem restart: not realistic blind, reasons in 9.5. A modem assert with `IPA_TEST=1` still stops Wi-Fi for that boot.
+Build [V]: 296/296 patches, 0 LSE, kernel sha256 84d8f917f109bba4; armv80-check 21 (kernel, same count as before), dylib 0, laurel-springboard 0. test-cell 15/15, test-ipa PASS (vendor image part skipped), build-honest-test 60/60, xnutils-test PASS. Root image not built: no sudo here.
+Next: step A then step B of section 10, on the phone.

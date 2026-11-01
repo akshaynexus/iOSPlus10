@@ -4748,3 +4748,16 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Gotcha: the buffers are Normal NC: statistics copy a line to cached memory first (`lcam_light_raw`); byte-by-byte reads of a whole frame would hold the stream thread too long.
 - Gotcha: `collect` in `laurel_cam_stream.c` started each call with buffers 0, 1 in the VFE; two calls in one capture need the `wm_ring` state.
 - Built: kernel-linux.sh 293/293 patches, 0 LSE, no warning in the changed files, kernel.development.sweet.4k sha256 840f70f9799d4ae0...; NegroniCamera.driver sha256 b1f371f512523e94... (164368 bytes); cam-test: cam7 3610 checks, 0 failed; all older checks pass. Host only.
+
+## Mi A3: cellular: mode bug fixed, bridge to iOS; patch 2786, userland/laurel/cell (2026-11-01, branch t3/laurel-cellular-online; build + host test, NOT BOOTED)
+- Details: docs/laurel_sprout/cellular.md section 9 (decision, what is not built), section 10 (lines of the phone test).
+- [V 20H392] Status bar data path: aggregator.telephonyDomain.data.primarySIMInfo <- STTelephonyStatusDomainDataProvider (SystemStatusServer framework) <- STTelephonyStateProvider. `_updateDataForSlot:` and `_SIMInfoForStateProvider:...` are objc_direct: not hookable. `subscriptionInfoForSlot:`, `isSIMPresentForSlot:`, `isCellularRadioCapabilityActive`, `isDualSIMEnabled`, `isRadioModuleDead` are real methods. STMutableTelephonySubscriptionInfo has all setters.
+- [V 20H392] `_updateSignalStrengthItem:...` block setters take (block, value). scion's form (block, data, value) is wrong here. The item is on with cellularServiceState 2 + capability + no airplane.
+- [V 20H392] Registration value: 2 in service, 1 searching, else none. Settings > Cellular: `requiredCapabilities cellular-data` in PreferencesUI Settings.plist; SBTelephonyManager reads contains-cellular-radio, CellularTelephonyCapability, cellular-data. [U] their answers on this root: the LAUREL CELLBAR on line prints two.
+- [V log] syslog does not reach the USB log: LAUREL NOTCH has 0 hits in boot 20:02. So a dylib line goes through a write sysctl (kern.laurel_cell_ui) too.
+- [V log 20:02] `nas1: BIND_SUBSCRIPTION error 0x3` at start: no retry before 2786. `exec CommCenterMobileHelper` = launchd job on notify events, about one a boot, no loop.
+- Gotcha: `grep` in this shell is ugrep and treats a pattern with a leading `-` as an option; `==` in a zsh echo fails. RE helpers are bash scripts: scripts/debug/cell-*.
+- Gotcha: a new feature row needs a fake stage script in build-honest-test.sh too (`cell-build`), or its build-all cases fail.
+- Worktree build: symlink external/{ios-topaz,ios-sweet-linux,hackios-scion,laurel-kernel-*}, reflink out/laurel-kernel/{deps,theos,cache,dl} + out/laurel/gpu/deps/sdks; `AUDIT=1` gives the tree at out/laurel-kernel/xnu-src/xnu-8796.141.3. Patch: out/celln-dev/{a,b}, scripts/laurel/cell-patch.sh.
+- Built [V]: 296/296 patches, 0 LSE, kernel.development.sweet.4k sha256 84d8f917f109bba4...; liblaurel-cellbar (sha256 in out/laurel/cell/root.SHA256SUMS); test-cell 15/15; test-ipa PASS; build-honest-test 60/60; xnutils-test PASS. No root image: sudo needs a password here.
+- Next: section 10 step A, then step B. If ONLINE asserts in enl2_dl with the handshake passed, data pipes (9.4) come before ONLINE.

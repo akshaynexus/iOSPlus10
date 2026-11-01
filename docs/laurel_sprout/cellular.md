@@ -2,7 +2,8 @@
 
 Goal (owner): SIM detection for both slots, network registration, mobile data and, if reachable, voice/SMS under
 iOS 16.7.16 (20H392, iPhone10,3 userland). Status 2026-11-01: step 1 (kernel QMI client: SIM 1/2 status, provisioning,
-modem facts; radio kept off by its IPA self-check) [V] builds on laurel-int-1, [V] host test 8/8, [V] booted (boot 20:02: LAUREL CELL: on; the kernel reads SIM state; iOS sees no SIM, half-done-audit.md row 3).
+modem facts; radio kept off by its IPA self-check) [V] booted (boot 20:02: the kernel reads SIM state; iOS saw no SIM, half-done-audit.md row 3). The bridge to iOS and the online fix
+(section 9, patch 2786): built + host test, NOT BOOTED. Path decision, data, SMS, voice, Settings, modem restart: section 9. The IPA phone test: section 10.
 
 Labels: [V] read in source, measured on the host, or in the 20H392 root; [I] inference; [U] unknown.
 Kernel patch: `patches/laurel/xnu/2760-laurel-cellular-qmi.patch` (new `bsd/dev/laurel_cell.c` + hooks in TopazModem.cpp).
@@ -69,8 +70,8 @@ the BBU boot handshake and the Apple QMI extensions: months, with no reference.
 
 | Path | What | Verdict |
 | --- | --- | --- |
-| (a) native | kernel QMI client + an `AppleBasebandPCI` stand-in that speaks Apple QMUX to CommCenter | **last / research.** CommCenter needs BBUpdater boot, Apple QMI services and activation [I from §3]; no port did it [V] |
-| (b) bridge daemon | our daemon talks QMI (through the kernel) and feeds iOS (status bar, Settings) | **step 3.** Proven shape: scion's SpringBoard hook driven by sysctls [V] |
+| (a) native | kernel QMI client + an `AppleBasebandPCI` stand-in that speaks Apple QMUX to CommCenter | **last / research.** CommCenter needs BBUpdater boot, Apple QMI services and activation [I from §3]; no port did it [V]. Evidence again in section 9.1 |
+| (b) bridge daemon | our daemon talks QMI (through the kernel) and feeds iOS (status bar, Settings) | **built 2026-11-01, section 9**: a SpringBoard hook on STTelephonyStateProvider, no daemon. Shape from scion, another layer [V] |
 | (c) minimum viable | kernel QMI UIM/NAS/DMS/WDS client; IPA + a data interface | **first (chosen).** Everything stays in the kernel next to TopazModem's QRTR; no iOS daemon needed for SIM/registration/data |
 
 Order: (1) SIM status both slots + modem facts [done, this patch], (2) IPA v4.2 AP side -> radio ONLINE -> registration +
@@ -241,6 +242,7 @@ interface with kernel ARP/DHCP answers because iOS configures pdp_ip only throug
 4. Over SSH: `sysctl kern.laurel_cell`. Hot swap: pull a SIM tray: a new `LAUREL CELL: on:` line with `SIM? absent`.
 5. If `off: modem up, no QMI UIM service`: the `TopazModem: service ...` list at 3 s / 20 s (glink_summary) shows what the
    modem announced.
+   (Since 2786 the line starts with `part:` while the radio is not online; section 9.)
 6. Step 2 (patches 2775 + 2780, kernel only; the IPA firmware comes from the phone's vendor partition, no root change):
    read the `LaurelIPA:` lines and the one `LAUREL IPA:` line. If `on`: the cell line must change to `modem online`
    and later `registered`. Watch for `TopazModem: modem crash reason` within 60 s after ONLINE (then Wi-Fi stops too):
@@ -282,7 +284,7 @@ Expected [I], new lines only: `LaurelIPA: after the firmware: IPA_VERSION 0c0303
 (same), .. pipes`, `LaurelIPA: GSI channels allocated: ...`, `LaurelIPA: self-check passed, hardware ready in .. ms (...)`.
 Off examples: `off: GSI channel 1 of EE 1 (pipe 5): ALLOCATE refused, code 7, GLOB_IRQ .., ERROR_LOG ..`. A new assert text = the next cause.
 
-**Modem restart (design note, not built).** It would make every modem assert cost seconds, not Wi-Fi for the boot: PAS 4 shutdown, SMEM GLINK +
+**Modem restart (design note, not built; why not: section 9.5).** It would make every modem assert cost seconds, not Wi-Fi for the boot: PAS 4 shutdown, SMEM GLINK +
 SMP2P reset, QRTR + WLFW state reset, modem load again; stock adds ipa3_q6_pre_shutdown_cleanup + gsi_halt_channel_ee and TLV 0x18 = 1.
 
 **`modem shutting down` in the cell line.** [V] The decode is right: only raw 5 gives this text; table = scion hakios.mpss.c:5212; message 0x2D;
@@ -290,4 +292,140 @@ TLV 1, the same tlv() reads the revision correctly. [V] It is one old read: GET_
 SET); no DMS indication is registered; the 17:04:06 line repeats that value. [V] After the read: WLFW up at 730 ms, both USIMs reach ready,
 no FATAL. So 5 was the answer then; the modem is not shutting down. [I] 5 and error 0x4a (07:45; [I] info unavailable) are the modem's values
 before it has a mode. [V] Bug: laurel_cell.c blocks ONLINE on opmode 5 or < 0 and never reads again, so the radio cannot go ONLINE after
-`LAUREL IPA: on`. Not changed here: the first IPA test proves only the handshake. Fix later: read again every 10 s until online.
+`LAUREL IPA: on`. **Fixed by patch 2786 (section 9.2): read again every 10 s until online.**
+
+## 9. iOS side and the online fix (patch 2786 + `userland/laurel/cell`; 2026-11-01, built + host test, NOT BOOTED)
+
+Evidence commands: `scripts/debug/cell-statusbar-re.sh`, `cell-dis.sh`, `cell-method-list.py` (20H392 iPhone10,3 shared cache, output in `out/re-cell`).
+
+### 9.1 Path decision
+
+**(b) a status bar bridge, now. (c) data next, only after the IPA test. (a) CommCenter stays out.**
+
+| Path | Evidence | Decision |
+| --- | --- | --- |
+| (a) CommCenter + stand-in `AppleBasebandPCI` + QMI bridge | [V scion `userland/mkjobs.py`, 20 crashes with CommCenter's own log] 11 SIGSEGV after "Could not find AppleIPAppender service", 9 SIGABRT after "Unable to communicate with AppleBaseband driver": a stub of one driver leaves the other crash. [V 20H392] the job needs an ADT `baseband` node (`_LimitLoadToDeviceTree`); links `libBBUpdaterDynamic`, `libQMIParserDynamic`, Apple QMUX over PCIe pipes. [I] Apple QMI extensions, BB update boot and activation have no reference anywhere | Not now. Months, and no partial result on the screen |
+| (b) SpringBoard bridge from kernel state | [V 20H392, below] one small layer feeds every telephony reader in SpringBoard; [V scion] a SpringBoard hook on sysctls reached the bar on 16.5 | **Built.** Bars, network name, SIM text. Costs nothing when the radio is off |
+| (c) data: `pdp_ip0` or `en1`, IPA + rmnet + WDS | [V] the AP has no GSI rings, no event rings, no endpoint config, no AP command channel: 2782 only allocates channels. The handshake has never run with 2782 | **Next, after the IPA test passes.** Not built. Section 9.4 |
+
+Why not scion's exact hook. Scion replaced `-[SBStatusBarStateAggregator _updateSignalStrengthItem:withData:SIMInfo:barsGetter:barsSetter:]` and forced the item on, forced at least 1 bar, and forced the signal view's mode. On 20H392:
+
+- [V disassembly] the setter block takes `(block, value)`. Scion's call form is `(block, data, value)`: it would write the pointer as the bar count here.
+- [V disassembly] the updater turns the item on only with `SIMInfo.cellularServiceState == 2` and capability enabled and not airplane mode, and takes the bars from `SIMInfo.signalStrengthBars`. So the right place is the data, not the updater: then Apple's logic stays true.
+- [V] data path: `aggregator.telephonyDomain.data.primarySIMInfo`, published by `STTelephonyStatusDomainDataProvider` (made by the aggregator: `-telephonyDataProvider`), which asks `STTelephonyStateProvider`.
+- [V] the provider's `_updateDataForSlot:` and `_SIMInfoForStateProvider:...` are objc_direct (plain `bl`, not in the method list): cannot be replaced. What it calls is real ObjC (`cell-method-list.py`): `subscriptionInfoForSlot:`, `isSIMPresentForSlot:`, `isCellularRadioCapabilityActive`, `isDualSIMEnabled`, `isRadioModuleDead`.
+- [V] from those answers Apple's code makes `NO_SIM`, `LOCKED_SIM`, `BAD_SIM`, `NO_SERVICE`, `SEARCHING`, the operator's name, service state. Registration value 2 = in service, 1 = searching, else none [V `_serviceStateForStateProvider:...`].
+
+### 9.2 Kernel: patch 2786 (`bsd/dev/laurel_cell.c`)
+
+| Change | Why |
+| --- | --- |
+| DMS GET_OPERATING_MODE every 10 s until online, then every 60 s | [V boot 20:02] one read at ~450 ms said 5, blocked ONLINE for the boot |
+| No first line while the mode is 4, 5 or unknown (at most 60 s) | The first line said `modem shutting down`: the modem's value before it has a mode [I, section 8] |
+| ONLINE: 6 tries, each after the next mode read; then the line says `radio off: modem refused ONLINE 6 times, error 0x..` | [V scion] the modem answers "not ready" while it starts |
+| NAS BIND_SUBSCRIPTION: 6 tries, 10 s apart. `nas2` without a binding: no polls, no registration, `SIM2: NAS not bound to this SIM` | [V boot 20:02] `nas1: BIND_SUBSCRIPTION error 0x3`, never asked again. [I] an unbound `nas2` reads the primary subscription: a false SIM2 |
+| A NAS error clears old registration and signal | No old bars |
+| `part:` instead of `on:` while the radio is not online; the line names data, SMS and voice as off | Audit row 3 |
+| `kern.laurel_cell_state`: `state`, `radio`, `data`, `sms`, `voice`, `subN.slot`, `.sim`, `.reg`, `.bars`, `.rat`, `.op` | For the bridge. Written by the watch thread once a second |
+| Bars 0-4: only when registered and with a reading. LTE/NR RSRP -115/-105/-95/-85, GSM/WCDMA RSSI -107/-103/-97/-89 [I: Android's thresholds from memory, not in this repo] | Registered and no reading = 0 bars: no fake |
+| `kern.laurel_cell_ui` (write): the bridge's line for the USB log, 16 a boot, printable only | [V] syslog does not reach the USB log: `LAUREL NOTCH` has 0 hits in boot 20:02 |
+
+Never in any of these: ICCID, IMSI, IMEI, phone number.
+
+### 9.3 Bridge: `liblaurel-cellbar.dylib`
+
+`userland/laurel/cell/laurel_cellbar.c` + `cellbar_state.h` (parser, also compiled by `test-cell.sh` against the kernel's own text). Build: `scripts/laurel/cell-build.sh` (also in `build-all.sh`). Root: `scripts/laurel/root-cell.sh`, feature `cell` of the table (`CELL=0`; `NOTCH=0` or `STATUSBAR=0` also leave it out: their `laurel-springboard` inserts it). Boot-arg `cell=0`: not inserted.
+
+What it does: hooks the 5 methods above and `initWithServerHandle:stateProvider:`. Every 3 s on the main queue: reads the sysctl; on a change builds two `STMutableTelephonySubscriptionInfo` and calls Apple's `subscriptionInfoDidChangeForStateProvider:slot:` for slots 1, 2. One tick later it reads the published domain back: not equal = `off`, Apple's answers come back. Kernel state `off` (modem crash, `cell=0`): Apple's answers come back. Crash guard: `sb_wrap.c`, 2 fast SpringBoard exits = no dylib for the boot.
+
+| iOS item | State | Source |
+| --- | --- | --- |
+| Signal bars | Built. Only when the kernel says registered | SIM info `signalStrengthBars`, `cellularServiceState` |
+| Network name | Built. On a notched bar: Control Center and the lock screen [I]; the name or MCC-MNC | `operatorName` |
+| No SIM / SIM Locked / No Service / Searching | Built, Apple's own text | SIM status + registration |
+| Two rows of bars | Built, only when both SIMs are registered. [U] this layout on our 360 pt screen | `isDualSIMEnabled` |
+| LTE tag | Off, true: no data path | `dataConnectionType` 0 |
+| Settings > Cellular row | **Not built.** [V] the row needs capability `cellular-data` (`PreferencesUI Settings.plist`). [U] the answer on this root: the `on` line prints it. The pane reads CoreTelephony's XPC service = CommCenter: no simple path; empty pane expected [I] | XNUtils > Cellular shows the true state |
+| Data, SMS, voice, calls | **Not built, and said so** in the kernel line and XNUtils | - |
+| Airplane mode | Not wired to the modem. The bar hides the item [V], the modem stays as it is | Later: DMS low power |
+
+`exec CommCenterMobileHelper` [V job plist]: launchd job started on notify events (`purplebuddy.setupdone`, `ManagedConfiguration.profileListChanged`), no KeepAlive, `EnablePressuredExit`. It is a helper, not CommCenter. [V usblog] 10 `exec` lines in the whole log of many boots, 1 in boot 20:02: no restart loop. Not touched.
+
+### 9.4 Data: the next step (not built)
+
+The AP pipes are not reachable today. Order after the IPA test passes: GSI event + transfer rings for the AP's channels; AP command channel (pipe 5 CMD_PROD) + immediate commands (stock does it, 2780 uses SRAM writes); endpoint config + QMAP; WDA SET_DATA_FORMAT; WDS BIND_MUX_DATA_PORT; START_NETWORK + GET_RUNTIME_SETTINGS; an interface. Interface: `en1` with kernel ARP + DHCP answers as scion did [V, not proven by scion on the phone]; `pdp_ip0` is configured by CommCenter [V strings, I]. A data call can also assert the modem, so same rule: test image first.
+
+### 9.5 Modem restart: not built, and why
+
+Asked: "implement if realistic". Blind, it is not. The design is in section 8. What stops it [V code at this commit, `TopazModem.cpp`]:
+
+- The Wi-Fi + modem driver has about 100 file-level state variables, plus function statics (`laurel_wifi_watch`, `radio_poll`). `wlfw_arrive` resets WLFW only: `ce_up`, HTC, WMI, HTT, the station state have no reset.
+- `pool_alloc` has no free (16 MiB). CE rings, WMI host memory, HTT, TX, rmtfs would allocate again.
+- rmtfs memory goes to `MSS_MSA` + `NAV` by hyp-assign ("the modem owns it from now on"). [V scion] the reverse assign is refused at stop. WLFW MSA and TZ's XPU state after a crash: [U]. A wrong guess is an AP fault, and that breaks the rule "never the boot". Today a crash costs Wi-Fi only.
+- SMP2P item has SSR_ACK set; `modem_boot` refuses a modem that is not cold; the restart handshake has never run. WCN3990 and wifid after a restart: [U].
+- A host test cannot prove any firmware reaction here. So 300+ lines that first run during a real crash, each try needing a boot.
+
+Risk that stays (**stated**): after `INIT_MODEM_DRIVER` or ONLINE, a modem assert stops Wi-Fi until the next boot. No check can prevent it. It happens only with an `IPA_TEST=1` image. The USB log and user space go on [V usblog: lines after the 17:01 assert]. Do this when the IPA test shows asserts that need many boots, or data work starts.
+
+## 10. Phone test: lines to read
+
+Image and boot are the coordinator's job. Flash path: `scripts/laurel/flash-boot.sh` (`uefi-image.sh` says this ABL refuses `fastboot boot`; section 8 said RAM: use what the last boot used). One or two SIMs in, before the boot. Save the USB log.
+
+### Step A: normal image (`ipa=0`), the bridge and the mode fix. No Wi-Fi risk
+
+```
+LAUREL IPA: off: boot-arg ipa=0
+LaurelCell: operating mode low power
+LAUREL CELL: part: SIM1 present (USIM ready), SIM2 present (USIM ready); modem low power; radio off: AP IPA side off: boot-arg ipa=0; data off: no AP GSI data pipes yet; SMS, voice off: not built
+LAUREL CELLBAR: hooks in: waiting for SpringBoard's telephony domain
+LAUREL CELLBAR: on: domain follows the kernel: SIM one ready, reg 0, bars 0; MobileGestalt cellular-data N, CellularTelephonyCapability N (the Settings row needs the first)
+```
+
+Expected on the screen [I]: `No Service`, no bars, no longer `No SIM`. `LAUREL WIFI: on`, Wi-Fi joins as before. Over SSH: `sysctl kern.laurel_cell_state`, `cat /var/tmp/laurel-cellbar.log`.
+
+| Line | Meaning |
+| --- | --- |
+| `... modem shutting down; ...` as the final line, 60 s after the start | The modem really stays at 5. ONLINE is blocked with reason. New fact: tell the owner |
+| `LaurelCell: nas1: BIND_SUBSCRIPTION error 0x3`, then nothing wrong | Normal now: asked again, 10 s apart |
+| `... SIM2: NAS not bound to this SIM` (only online) | 6 refusals: SIM2 gets no bars, by design |
+| `LAUREL CELLBAR: off: no -[...]` or `no CoreTelephony ...` | The build differs from what section 9 read. Apple's bar stays |
+| `LAUREL CELLBAR: off: the telephony domain does not hold our state ...` | The layer does not work as read. Apple's bar stays |
+| `LAUREL CELLBAR: off: no STTelephonyStatusDomainDataProvider 120 s ...` | SpringBoard did not make it. Apple's bar stays |
+| `LAUREL NOTCH: off: SpringBoard exited ...` (in the log file) | Crash guard: a dylib crashed SpringBoard. Boot with `cell=0` to see which |
+| No `LAUREL CELLBAR` line | dyld did not load it, or the root has no feature `cell`: see `LAUREL BUILD: root ...` and the manifest |
+
+### Step B: `IPA_TEST=1 scripts/laurel/uefi-image.sh`: the handshake, then the radio
+
+Risk: a modem assert stops Wi-Fi for that one boot. Section 9.5. No fix for that here.
+
+Pass, in this order:
+
+```
+LaurelIPA: after the firmware: IPA_VERSION ........, SHARED_MEM_SIZE ........: 8360 bytes at offset 0x0 (same), .. pipes
+LaurelIPA: GSI channels allocated: 10 AP, 5 modem, 2 uC
+LaurelIPA: self-check passed, hardware ready in .. ms (...)
+LaurelIPA: sent INIT_MODEM_DRIVER (118 bytes, local memory at 0x0) to node 0 port 19
+LaurelIPA: modem answered INIT_MODEM_DRIVER: success (.. ms)
+LAUREL IPA: on: v4.2 (IPA_VERSION ........), firmware PAS 15, GSI up, modem driver init complete in ... ms, master init indication sent
+LaurelCell: radio on: DMS SET_OPERATING_MODE online (was low power, try 1)
+LaurelCell: DMS SET_OPERATING_MODE online: ok
+LaurelCell: operating mode online
+LAUREL CELL: on: SIM1 present (USIM ready), ...; modem online; SIM1 registered 404-45 Airtel LTE rssi -71 rsrp -98 bars 2; ...
+LAUREL WIFI: on: ...
+```
+Then 10 minutes with no `TopazModem: modem crash reason`, Wi-Fi joined, bars on the screen. 3 boots like this = the evidence of section 8 to remove `ipa=0`. Not one boot.
+
+Fail, first match:
+
+| Line | Meaning | Wi-Fi | Next |
+| --- | --- | --- | --- |
+| `LAUREL IPA: off: GSI channel N of EE M (pipe P): ALLOCATE refused, code ...` | AP self-check. No message went to the modem | Stays | Read `code`, `GLOB_IRQ`, `ERROR_LOG`; order or table of 2782 |
+| `LAUREL IPA: off: ...` any other step, before `sent INIT_MODEM_DRIVER` | AP self-check, same | Stays | The text names the step |
+| `modem crash reason: ...ipa_hal.c:6001...CHID 1 errval 6` | Same assert as 17:01: 2782 is not the cause, or not all of it | Off | Section 8 |
+| `modem crash reason:` with **any other text** before `answered` | **The next cause.** Save it word for word | Off | New cause in the IPA init |
+| `LAUREL IPA: off: modem refused INIT_MODEM_DRIVER (QMI error N)` | Clean refusal | Stays | A TLV value |
+| `LAUREL IPA: off: modem did not answer INIT_MODEM_DRIVER in 30 s` | Modem stuck in its handler [V scion: SMP2P "ipa"] | Stays [I] | `answered IPA power query` line? |
+| `LAUREL IPA: off: modem sent no INIT_MODEM_DRIVER_CMPLT in 60 s ...` | Modem's second half stopped | Stays [I] | Which `modem request 0x..` lines came |
+| `LAUREL CELL: part: ... radio off: modem refused ONLINE 6 times, error 0x..` | IPA passed, ONLINE not | Stays | 0x34 = not ready: which service does it wait for |
+| `modem crash reason:` within seconds after `online: ok`, e.g. `enl2_dl` | Radio needs AP data pipes (scion's crash, but handshake passed) | Off | Section 9.4 comes before ONLINE: gate ONLINE on it. New fact |
+| `SIM1 searching` or `not registered`, no crash | Radio works, no network yet. No bars, by design | Stays | Antenna, band, `registration denied` text |
