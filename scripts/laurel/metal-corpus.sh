@@ -42,17 +42,19 @@ all) L=$C/a610-all.txt
 *) echo "usage: $0 [ui|all]" >&2; exit 2 ;;
 esac
 export PROFILE
-stamp=$C/.run-start; : > "$stamp"
+stamp=$C/.run-start; : > "$stamp"; rm -f "$C/.stopped"
 SET=$L LIB_TIMEOUT=${LIB_TIMEOUT:-300} "$REPO/scripts/metal/shader-corpus-test.sh" run &
 run_pid=$!
 # the watcher: the whole process group of the run goes when the disk or the output passes its limit
 (
+  set +e +o pipefail            # (a failed du must not end the watcher: it did, in the first version)
   while kill -0 "$run_pid" 2>/dev/null; do
     now=$(find "$C/runs" -mindepth 1 -maxdepth 1 -type d -newer "$stamp" | head -1)
     used=0; [ -z "$now" ] || used=$(du -xsk "$now" | awk '{print int($1 / 1048576)}')
     tmp=$(du -xsk "$TMPD/metal2vulkan-repros" 2>/dev/null | awk '{print int($1 / 1048576)}'); tmp=${tmp:-0}
     if [ "$(free_gb "$C/runs")" -lt "$MIN_FREE_GB" ] || [ "$used" -ge "$MAX_OUT_GB" ] || [ "$tmp" -ge 1 ]; then
       echo "metal-corpus: STOPPED: free $(free_gb "$C/runs") GiB, output $used GiB, repro bundles in $TMPD $tmp GiB" >&2
+      : > "$C/.stopped"
       pkill -TERM -P "$run_pid" 2>/dev/null || true
       kill -TERM "$run_pid" 2>/dev/null || true
       exit 0
@@ -62,11 +64,13 @@ run_pid=$!
 ) &
 wait "$run_pid" || echo "metal-corpus: the run ended with an error (or the watcher stopped it)" >&2
 r=$(ls -1dt "$C"/runs/*-a610-"$set_name" | head -1)
+stopped=0; [ -f "$C/.stopped" ] && stopped=1
 # only the numbers stay
 find "$r" -type f ! -name '*.tsv' ! -name 'summary.txt' ! -name 'errors.txt' -delete
 find "$r" -mindepth 1 -type d -empty -delete
 echo "metal-corpus: kept $(du -sh "$r" | cut -f1) in $r"
 echo "metal-corpus: $r"
+[ "$stopped" = 0 ] || { echo "metal-corpus: no result: stopped by the disk watcher" >&2; exit 4; }
 grep -a 'functions=' "$r/summary.txt" || true
 if [ "$set_name" = ui ]; then
   B=$REPO/userland/metal/tests/shader-corpus-a610-ui.tsv
