@@ -4900,5 +4900,6 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - [V HAL source] set_active: 0x3F on the new slot (priority 3, active, 7 retries), the old slot loses only the active bit. [V ABL source] fallback needs successful = 1 and priority > 0.
 - Gotcha: `raw_read` and FIEMAP on btrfs: `cat a > b` makes a reflink: same physical blocks. A test of "file moved" needs new data. In zsh `$B` with spaces is one word: a failed compile looked like a pass until the test ran through `sh`.
 - Gotcha: the host test includes the real `sweet_ufs.c` with fake kernel headers (tools/laurel-dualboot/test): only `ufs_scsi` is replaced. Add a stub there when the driver gets a new call.
-- Built [V]: see docs/laurel_sprout/dual-boot.md section 8; test: scripts/laurel/test-dualboot.sh.
+- Built [V] 2026-11-02 at 03c7ed146a: kernel-linux.sh 310/310 patches, 0 failed, 0 LSE/RCpc, printf-arg-check OK, kernel sha256 afab8ee2a6cd3c08...; test-dualboot.sh PASS: 11 op10tool tests, test_kernel 40496 checks 0 failed, 29 guard checks 0 failed; build-honest-test 60/60; root-update-test 94/94.
+- Worktree recipe for the test: symlink external/{ios-sweet-linux,ios-topaz} and reflink out/laurel-kernel/{deps,theos,cache,dl} from the main checkout, `AUDIT=1 scripts/laurel/kernel-linux.sh`, then scripts/laurel/test-dualboot.sh.
 
