@@ -1,7 +1,7 @@
 # Mi A3 (laurel_sprout) camera: hardware, path decision, step 1
 
 Status 2026-11-01: step 1 (power + CCI + chip ID of all four cameras) is code, kernel patch 2770, built (249/249
-patches, 0 LSE). **2026-11-01 18:40: the Camera app ran on the phone; quality work after that: section 10.** Step 2 (rear IMX586 RDI raw frames 1280x720, fps line, `camframe` picture over USB) is code, kernel
+patches, 0 LSE). **2026-11-01 18:40: the Camera app ran on the phone; quality work after that: section 10.** **Boot 20:02: crash loop without Metal, photo path, black frames: section 11.** Step 2 (rear IMX586 RDI raw frames 1280x720, fps line, `camframe` picture over USB) is code, kernel
 patch 2771, built (252/252 patches, 0 LSE), host-tested (section 8). Steps 3 + 4 (`/dev/negronicam`, mediaserverd plug-in, root step, ADT nodes) are code,
 kernel patch 2772 + 2903, built (259/259 patches, 0 LSE), host-tested (section 9). **None of this ran on the phone yet.**
 Labels: [V] read in a file or seen in a tool output (source given), [I] inference, [U] unknown.
@@ -564,3 +564,107 @@ Bad signs: `focus: off: ...`; `preview: mode 0: off: ...` (the window failed); `
 4. Tap on near and far objects: `focus: sweep` lines, picture sharp. Shutter: a photo; open it in Photos.
 5. Leave the preview on for 2 minutes: footprint flat, no `low swap`.
 6. Undo for parts: Metal back in mediaserverd: write `* -backboardd` in `/var/db/negronimetal/clients`, keep the first line. All: `camera=0`, or `CAMERA=0` root.
+
+## 11. Crash loop without Metal, photo path, black frames (plug-in only; boot 20:02, 2026-11-01)
+
+Owner: "Photos do not get taken, and the camera flashes in and out for a few seconds." Earlier: "quite bad quality". Log: `logs/laurel-boot-2002.txt` (main checkout).
+Status: code, built, mock-tested. **Not run on the phone: every statement about the phone's behaviour with these changes is [I].** No kernel change: root (userdata) only.
+
+### The crash: a node that needs Metal [V]
+
+`scripts/debug/crash-symbolize.sh` (slide 0x20220000), 6 of 6 `CRASH mediaserverd` lines, one stack:
+
+```
+0x1c21672f0 CMCapture!-[BWMultiFilterThumbnailNode prepareForCurrentConfigurationToBecomeLive] + 296     far 0x8
+0x1c2186230 CMCapture!___65-[BWGraph startDeferredNodePrepareIfNeededWithCompletionHandler:]_block_invoke + 300
+            libdispatch ... _pthread_start
+```
+
+- Unslid 0x1a1f472ec `bl objc_msgSend$filterDescriptor` on ivar `_filter`, 0x1a1f472f0 `strb wzr, [x0, #0x8]`, no check. `_filter` is nil.
+- `_filter` = `[FigColorCubeMetalFilter new]` (`_loadAndConfigureFilterBundle` 0x1a1fc2c08, `MetalFilter.bundle`; its result is ignored at 0x1a1f471fc). `init` -> `initWithCommandQueue:nil` (0x1f63afab8) -> `-[FigMetalContext initWithbundle:andOptionalCommandQueue:]` -> `commonInitWithOptionalCommandQueue:` 0x1c789c328: `+createMetalDevice` nil -> `cbz` 0x1c789c340 -> error -> nil.
+- So this node, Camera.app's filter strip, needs Metal. `enableDeferredPrepareForNodesNotInPathOfSinkNode:` puts every node off the preview's path on a queue that runs after the first pictures: that is why each session gave pictures for about 1 s, then died. The app builds the session again: "flashes in and out". A shutter press never had a live session: no `a photograph` line in the boot.
+- Exact match with the Metal list: boot 20:02 `clients "* -backboardd -mediaserverd"`: 6 of 6 crashes, this stack, `NMTL[n mediaserverd]: not listed` in each process. Boots 18:40, 19:07, 19:34 (Metal listed): 0 of this stack.
+- [U] HakiOS also takes the Metal device out of mediaserverd (`inject_media.c`) and has no such hook. Why it did not crash there is not known.
+
+### Decision: Metal stays out of mediaserverd; the node goes without it
+
+Metal facts [V]: boot 19:34, Metal listed: 236 `NMTL[n mediaserverd]: surface import refused: no-copy buffer` (metal.md row 4: no surface import in this process), footprint 16 MiB at 19:42:01 -> `low swap ... 2607 MB` at 19:42:09, 1.7 s after the shutter; the photograph had just passed the noise reduction, no `encoded` line. Boot 20:02, Metal out: 0 `low swap` lines (but sessions lasted at most 40 frames, so this is no proof of a flat footprint: no `memory at frame` line was reached, that line comes at frame 60). [I] the thumbnail filter is the user of those imports: it takes every preview frame.
+
+Hooks 10 and 11 (`media_hooks.c`, guards as the others: address + first word, `check-cache.sh`):
+
+| Method | No Metal device | Metal device |
+| --- | --- | --- |
+| `-[BWMultiFilterThumbnailNode prepareForCurrentConfigurationToBecomeLive]` 0x1a1f471c8 | `[super prepare...]` only, no filter made | stock |
+| `-[BWMultiFilterThumbnailNode renderSampleBuffer:forInput:]` 0x1a208d600 | `_filter` nil: the stock method would emit a buffer nobody wrote. `camera_thumbs.c`: the picture in each place (output = width x height x filter count [V `didSelectFormat:forInput:`]), nearest sample, 420f/420v only, then `BWCMSampleBufferCreateCopyWithNewPixelBuffer` and `emitSampleBuffer:` | stock |
+
+Result: filter strip shows the scene with no effect [I]. Other deferred nodes read in the cache: `BWGNRNode` prepare (`FigCapturePixelConverter`), `BWPhotoEncoderNode`, `BWStillImageCoordinatorNode`: no such unchecked filter object. [U] the rest of the deferred list has never run without Metal: a next crash will name the next node.
+
+### Photo path
+
+Shutter -> `FigCaptureStillImageSettings qualityPrioritization` (hook: speed, one frame) -> `StillImageCaptureNow` on the stream -> `stills_wanted` -> `MODE 1` -> second frame of 4000x3000 -> `deliver` on `StillImage` (the graph's pool, its handler) -> `BWStillImageCoordinatorNode` -> `gnr_render` (hook) -> `BWPhotoEncoderNode` (VCPHEVC software HEIC, hook) -> Camera.app, Photos.
+
+- [V boot 19:34, old build, 1280x720 frames] `a photograph asked for`, `StillImage: 4032x3024`, `the photograph is given`, `goes past the noise reduction`. So the handler, pool and objects CMCapture needs do come from the real graph up to the GNR node. Never seen: `encoded`, a saved file, and all of this on the 2773 mode switch.
+- **File size [V code]: the file is 4032x3024.** The graph's format and pool are the iPhone X names; the sensor frame is 4000x3000, scaled 1.008x by `isp_render_still_nv12`. Changing the format name risks the plist match: not done.
+- Bug fixed: `deliver` was void, and a picture that found no buffer in the pool was counted as given (`stills_wanted--`, line `the photograph is given`). The graph then waited for ever. Now: tried again on the next frames, after 8 tries one line with what is missing, and the preview comes back.
+- Time: render + finish 226 ms on one host thread, flat frame [V]; on the phone [I] about 1 s. Under the kernel's 3 s rule. Mock (`cam5_dark.h`): pool refuses 10 asks, the photograph comes at the third try, mode out and back, lens still.
+
+### Is the picture real? No light in any frame so far
+
+All values of boot 20:02 [V], above black, 10-bit (white 959):
+
+| Time | Exposure | Gain | Mean | Top |
+| --- | --- | --- | --- | --- |
+| 20:02:59 self-check | 1674 lines = 21 ms | 16x | 0 | 7 |
+| 20:03:13 | 2556 lines = 33 ms | 6.8x | 0 | 3 |
+| 20:15:13 | 10368 lines = 133 ms | 16x | 0 | 10 |
+| 20:17:27 | 10368 lines = 133 ms | 16x | 0 | 9 |
+
+Older boots: `mean 64` (= black) at every session, since the first frame.
+
+- `1% over 8` means nothing: it was the middle of the lowest 16-step bin. Fixed in the plug-in's lines (1-step bins under 32). The kernel's line still reads 8 for a black frame.
+- Sharpness flat, and why [V calc + host test]: sharpness = steps of block means / mean squared. Noise cut off at black: `4 x 0.34 / 32 / 0.4^2 = 0.27`, whatever the noise's size and wherever the lens is. Log: 0.2795 to 0.2891 (one 0.2031 first). `cam6_test` repeats the old measure on such noise: 0.27 at every sigma. So the sweep measured noise only, with nothing in it about the lens: **the frame has no picture.**
+- Noise rises with gain (top 3 at 6.8x, 7-10 at 16x): the sensor's read-out runs [I].
+- Judgement: 133 ms x 16x would clip a lit room. Top 10 of 959 is no light on the pixels. **Cause [U]: I cannot tell from here:** (a) lens covered or a dark scene (the boot self-check at 20:02:59 may be the phone on a table; the sessions at 20:14-20:17 were in the owner's hands, scene unknown); (b) the pixels get no supply: VANA (gpio 15, equal to the DT [V]). Register tables are not the cause: qtech = sunny in modes 1, 2 and 6 [V this boot's diff], digital gains 1x, stock exposure writer the same [V section 10]. The owner's "bad quality" fits a noise picture, or a real picture in another scene; no picture file exists.
+- The torch was not on in these sessions [V]: `dark: off` 20:17:13, session 20:17:15.
+
+The next boot decides, one test: lit room, lens free, phone in the hand. New line `picture: no light on the sensor` with those numbers = (b), then read VANA and the sensor analog registers; no such line and `top` high = the scene was dark, and then the rest of the picture work applies. `scripts/laurel/cam-frame.sh` after the app closes gives the raw frame as a PNG.
+
+### AF scale
+
+- Noise term out of the measure: half the mean square of the difference of a cell's two greens is the noise's variance S; S / 8 is noise's share of the steps. Host [V]: noise only: 0.27 -> under 0.02; soft and sharp edges keep a ratio above 4.
+- Window under 4 steps above black: no scan, lens stays, AFStatus 0 (no photograph held back), line `focus: waits:`. A tap in the dark is done when light comes.
+- A sweep with sharpest under 1.15 x least sharp: lens back to its start, line `focus: the sweep is flat`. It used to end at the first place measured.
+
+### Build and tests [V]
+
+`userland/laurel/camera/build.sh`, `scripts/laurel/cam-test.sh`, `scripts/laurel/cam-leak-test.sh` (+ `cam5_dark.h`, `cam6_test.c`), `scripts/laurel/camera-cache-check.sh` (11 hooks; `check-cache.sh` now also looks in Metal), `scripts/laurel/kernel-linux.sh`: numbers in `docs/notes.md`. A mock is not CMCapture: the hooks' objc paths were compiled and checked against the cache, not run.
+
+### Expected lines [I]
+
+```
+LAUREL CAMERA: ios hooks: -[BWMultiFilterThumbnailNode prepareForCurrentConfigurationToBecomeLive] replaced (10 of 11)
+LAUREL CAMERA: ios hooks: -[BWMultiFilterThumbnailNode renderSampleBuffer:forInput:] replaced (11 of 11)
+-- open Camera --
+LAUREL CAMERA: ios hooks: no Metal device in this process: the filter thumbnails go unfiltered, through the CPU
+LAUREL CAMERA: ios: memory at frame 60: footprint N MB, malloc M MB; by VM tag: ...       (must stay flat; the first time this line is reached without Metal)
+LAUREL CAMERA: ios: picture: no light on the sensor: exposure E ms, gain G, green M above black, 1% over B, top T: ...   (only without light)
+LAUREL CAMERA: ios: focus: waits: green M above black in the window is noise ...           (only without light)
+LAUREL CAMERA: ios: focus: sweep: 48 0.0012 (green 140)                                    (in light)
+-- shutter --
+LAUREL CAMERA: ios: stream: a photograph asked for StillImageCaptureNow = ...
+LAUREL CAMERA: ios: a photograph: the lens stays at N, the photograph mode asked for
+LAUREL CAMERA: ios session: mode 0 after N frames, VFE errors 0 (0): to mode 3
+LAUREL CAMERA: ios: StillImage: 4032x3024 made of every pixel in N ms
+LAUREL CAMERA: ios: the photograph is given (1 so far, 4000x3000 frame, level x1.00)
+LAUREL CAMERA: ios hooks: a photograph goes past the noise reduction, which has nothing to do it with here
+LAUREL CAMERA: ios hooks: a photograph of 4032x3024 encoded in N ms
+```
+
+No `CRASH mediaserverd`, no `low swap`, no `ios session: end (closed) after 10 frames`.
+Bad signs: `left alone` on hooks 10, 11; a new `CRASH mediaserverd` (symbolize it: the next node); `filter thumbnails: off`; `a photograph NOT given`; `photograph mode: off`; no `encoded` line within about 30 s of the shutter (the encoder has never finished on this phone).
+
+### Test steps (owner approval for each partition write)
+
+1. `userland/laurel/camera/build.sh`, `sudo scripts/laurel/root.sh`, flash userdata. No boot image needed for this change.
+2. Lit room, lens free. Open Camera: preview stays. Read `top` and the `picture:` line first.
+3. Shutter, open the photo in Photos. Keep the preview on for 2 minutes: footprint flat.

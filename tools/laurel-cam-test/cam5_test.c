@@ -52,6 +52,8 @@ static struct {
 	long switches;
 	uint8_t *raw[2];
 	int amplitude;
+	volatile bool dark;     /* laurel: no light: noise cut at black, as boot 20:15 */
+	bool painted_dark;
 } k = { .lines = 1000, .gain = 256, .frame = 2604, .focus = 381 };
 #define BEST_FOCUS 600
 
@@ -71,6 +73,22 @@ paint(int mode)
 	uint32_t w = mode ? SW : PW, h = mode ? SH : PH, stride = w / 4 * 5;
 	int d = abs((int)k.focus - BEST_FOCUS), a = d > 400 ? 0 : 400 - d;
 
+	if (k.dark) {
+		if (k.painted_dark) {
+			return;
+		}
+		k.painted_dark = true;
+		for (uint32_t y = 0; y < h; y++) {
+			for (uint32_t x = 0; x < w; x++) {
+				put_px(k.raw[mode], stride, x, y, 64 + (uint32_t)(rand() % 4) - 1);     /* (63..66: mean under 1 above black) */
+			}
+		}
+		return;
+	}
+	if (k.painted_dark) {
+		k.painted_dark = false;
+		k.amplitude = -1;
+	}
 	if (k.amplitude == a && mode == 0) {
 		return;
 	}
@@ -216,4 +234,5 @@ static size_t heap(void) { struct mallinfo2 m = mallinfo2(); return m.uordblks +
 static void until_seq(uint64_t s) { while (k.seq < s) { usleep(2000); } }
 #define CHECK(c, ...) do { if (!(c)) { failed++; printf("FAILED line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 static unsigned failed;
+#include "cam5_dark.h"
 #include "cam5_run.h"

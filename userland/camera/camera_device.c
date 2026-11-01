@@ -1147,7 +1147,8 @@ frame_metadata(const struct isp *isp, const struct negronicam_frame *f, const st
 	return m;
 }
 
-static void
+/* true: the graph's handler has the picture (laurel: a photograph is asked for again on the next frame otherwise) */
+static bool
 deliver(struct stream *s, struct output *out, const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw,
     CFDictionaryRef metadata)
 {
@@ -1155,7 +1156,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	uint32_t pf, width, height;
 
 	if (pb == NULL) {
-		return;
+		return false;
 	}
 	pf = CVPixelBufferGetPixelFormatType(pb);
 	width = (uint32_t)CVPixelBufferGetWidth(pb);
@@ -1167,7 +1168,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 			    pf >> 8 & 255, pf & 255);
 		}
 		CVPixelBufferRelease(pb);
-		return;
+		return false;
 	}
 	if (pf != PF_BGRA && (CVPixelBufferGetBytesPerRowOfPlane(pb, 0) < width || CVPixelBufferGetBytesPerRowOfPlane(pb, 1) < width)) {
 		/*
@@ -1183,7 +1184,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 			    CVPixelBufferGetBytesPerRowOfPlane(pb, 0), CVPixelBufferGetBytesPerRowOfPlane(pb, 1));
 		}
 		CVPixelBufferRelease(pb);
-		return;
+		return false;
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
@@ -1269,7 +1270,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		    out->handler, *(void **)out->handler);
 		out->handler = NULL;    /* (not released: it is not ours to read any more) */
 		CVPixelBufferRelease(pb);
-		return;
+		return false;
 	}
 	((pixel_buffer_handler)out->handler)(pb, pts);
 	/*
@@ -1292,6 +1293,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		say("%s: the first picture given (%ux%u %c%c%c%c)", out->name, width, height, pf >> 24, pf >> 16 & 255,
 		    pf >> 8 & 255, pf & 255);
 	}
+	return true;
 }
 
 /*
@@ -1377,7 +1379,12 @@ struct af {
 	float           sum_sharpness, sum_level;
 	unsigned        measured;
 	int             near, far, step, fine;  /* laurel 2773: the lens motor's range, from the frames */
+	float           worst_sharpness;        /* laurel: the least sharp of a sweep: a flat sweep has no sharpest place */
+	bool            dark;                   /* laurel: the window holds noise: no focus until there is a picture */
 };
+
+#define AF_MIN_LEVEL    4.0f            /* green above black in the window, 10-bit steps: under it a measurement is noise */
+#define AF_FLAT         1.15f           /* a sweep whose sharpest is not this far over its least sharp shows nothing */
 
 /* what the graph is told (see frame_metadata): 2 a focus scan that a photograph waits for, 1 the slow continuous climb, 0 at rest */
 static int
@@ -1443,6 +1450,31 @@ af_frame(int device, struct af *af, const struct negronicam_frame *f, const uint
 	level = af->sum_level / af->measured;
 	af->sum_sharpness = af->sum_level = 0;
 	af->measured = 0;
+	/*
+	 * laurel: no picture to measure ([V] boot 20:15: green under 1 above black, the sweep flat at the noise's value). The lens stays
+	 * where it was before the scan, AFStatus is 0 so that a photograph is not held back, and a tap in the dark is done when light comes.
+	 */
+	if (level < AF_MIN_LEVEL) {
+		bool scanning = af->state != AF_WATCH && af->state != AF_STEADY;
+
+		if (!af->dark) {
+			af->dark = true;
+			say("focus: waits: green %.1f above black in the window is noise, no picture to focus on; the lens stays at %u", level,
+			    scanning ? af->start : af->at);
+		}
+		af->state = AF_STEADY;
+		af->steady = 0;
+		af->sharpness = 0;
+		if (scanning && af->start != 0) {
+			af_go(device, af, af->start);
+		}
+		return;
+	}
+	if (af->dark) {
+		af->dark = false;
+		af->now = af->sweep = true;
+		say("focus: a picture again (green %.1f above black): a sweep", level);
+	}
 	switch (af->state) {
 	case AF_WATCH:
 		if (locked || (af->sharpness > 0 && sharpness > af->sharpness * 0.6f && level > af->level * 0.7f &&
@@ -1474,8 +1506,10 @@ af_frame(int device, struct af *af, const struct negronicam_frame *f, const uint
 			af->sweep = false;
 			af->state = AF_SWEEP;
 			af->best_sharpness = -1;
+			af->worst_sharpness = -1;
 			af->worse = 0;
 			af->steps = 0;
+			af->start = af->at;
 			af->way = (int)af->at - af->near < af->far - (int)af->at ? 1 : -1;
 			af_go(device, af, (uint32_t)(af->way > 0 ? af->near : af->far));     /* (walked there a step at a time) */
 			return;
@@ -1519,7 +1553,8 @@ af_frame(int device, struct af *af, const struct negronicam_frame *f, const uint
 		return;
 	}
 	case AF_SWEEP:
-		say("focus: sweep: %u %.4f", af->at, sharpness);
+		say("focus: sweep: %u %.4f (green %.0f)", af->at, sharpness, level);
+		af->worst_sharpness = af->worst_sharpness < 0 || sharpness < af->worst_sharpness ? sharpness : af->worst_sharpness;
 		if (sharpness > af->best_sharpness) {
 			af->best = af->at;
 			af->best_sharpness = sharpness;
@@ -1529,6 +1564,13 @@ af_frame(int device, struct af *af, const struct negronicam_frame *f, const uint
 		}
 		if (af->worse < 2 && (int)af->at + af->way * af->step >= af->near && (int)af->at + af->way * af->step <= af->far) {
 			af_go(device, af, (uint32_t)((int)af->at + af->way * af->step));
+			return;
+		}
+		if (af->best_sharpness <= af->worst_sharpness * AF_FLAT) {
+			say("focus: the sweep is flat (%.4f to %.4f): nothing to focus on: the lens back at %u", af->worst_sharpness, af->best_sharpness,
+			    af->start);
+			af->state = AF_SETTLE;
+			af_go(device, af, af->start);
 			return;
 		}
 		af->state = AF_FINE_SEARCH;
@@ -1627,7 +1669,8 @@ worker(void *context)
 	uint32_t tuned_for = ~0u;
 	/* laurel 2773: a photograph: MODE 1, the frames of that mode (the second one has the sensor settled), MODE 0 */
 	enum { STILL_IDLE, STILL_ASKED } still_state = STILL_IDLE;
-	unsigned still_frames = 0, still_wait = 0;
+	unsigned still_frames = 0, still_wait = 0, still_fails = 0;
+	bool no_light = false;
 	double preview_norm = 0;
 	bool switched = false;
 	float lux = -1, cct = -1;
@@ -1743,6 +1786,17 @@ worker(void *context)
 			if (isp_ae(&isp, f, &st, &c)) {
 				(void)write(device, &c, sizeof(c));
 			}
+			/* laurel: said once a time: everything after the sensor runs on noise, and this says why the picture is black */
+			if (isp_no_light(f, &st) != no_light && s->frames >= 30) {
+				no_light = !no_light;
+				if (no_light) {
+					say("picture: no light on the sensor: exposure %.1f ms, gain %.1fx, green %.1f above black, 1%% over %.0f, top %u: the frames are "
+					    "noise, a photograph will be black (lens covered or a dark room; in a lit room the sensor gives no signal)",
+					    f->exposure_lines * (double)f->line_ns / 1e6, (double)f->gain / f->gain_unity, st.mean[1], st.bright, st.top);
+				} else {
+					say("picture: light again: green %.1f above black, 1%% over %.0f, top %u", st.mean[1], st.bright, st.top);
+				}
+			}
 			if (s->frames == 20) {
 				s->af_now = true;       /* (the first focus, once the exposure has settled) */
 			}
@@ -1798,6 +1852,8 @@ worker(void *context)
 
 			(void)write(device, &m, sizeof(m));     /* (nobody wants these any more) */
 		}
+		bool still_given = false, still_tried = false;
+
 		for (int i = 0; s->graph_running && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
 
@@ -1814,16 +1870,35 @@ worker(void *context)
 			if (still ? (s->stills_wanted == 0 || !take_still) : still_frame) {
 				continue;       /* (the moving pictures keep to the preview's frames) */
 			}
-			deliver(s, out, &isp, f, raw, metadata);
 			if (still) {
-				s->stills_wanted--;
-				say("the photograph is given (%llu so far, %ux%u frame, level x%.2f)", (unsigned long long)++s->stills_given,
-				    f->width, f->height, s->still_level);
+				still_tried = true;
+				still_given = deliver(s, out, &isp, f, raw, metadata);
+				if (still_given) {
+					s->stills_wanted--;
+					say("the photograph is given (%llu so far, %ux%u frame, level x%.2f)", (unsigned long long)++s->stills_given,
+					    f->width, f->height, s->still_level);
+				}
+			} else {
+				(void)deliver(s, out, &isp, f, raw, metadata);
 			}
 		}
 		if (take_still) {
 			still_frames = 0;
 			still_wait = 0;
+			/*
+			 * laurel: a picture not given (no buffer in the graph's pool, or the output not set yet) is tried again on the next frames;
+			 * counted as given, the graph waited for ever and the shutter stayed dead. After 8 tries the ask ends, or the preview would
+			 * stay away for ever in the photograph mode: no CMCapture error path is known [U], the line says it.
+			 */
+			still_fails = still_given ? 0 : still_fails + 1;
+			if (still_fails >= 8 && s->stills_wanted > 0) {
+				struct output *o = &s->out[2];
+
+				say("a photograph NOT given after %u tries: StillImage handler %s, configuration %s, %s", still_fails, o->handler ? "set" : "NONE",
+				    o->config ? "set" : "NONE", still_tried ? "the graph's pool or its buffers refused" : "not tried: no output");
+				s->stills_wanted--;
+				still_fails = 0;
+			}
 			if (s->stills_wanted == 0) {
 				struct negronicam_command m = { .command = NEGRONICAM_MODE, .a = 0 };
 

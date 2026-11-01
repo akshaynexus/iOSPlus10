@@ -22,7 +22,7 @@ MINOS=16.0
 BIN=${PREVIEW_BIN:-2}
 DEFS="-DLAUREL_CAMERA=1 -DPREVIEW_BIN=$BIN"
 CFLAGS="-O2 -Wall -Wextra -Wno-unused-parameter -Wno-four-char-constants -Wno-multichar -Wno-deprecated-declarations -fvisibility=hidden -fblocks $DEFS"
-FILES="media_hooks camera_device camera_isp camera_still camera_mem"
+FILES="media_hooks camera_device camera_isp camera_still camera_mem camera_thumbs"
 rm -rf "$W/ios" "$W/host"
 mkdir -p "$B" "$T" "$W/host"
 
@@ -30,7 +30,7 @@ if [ "$(uname -s)" = Darwin ] && xcrun -sdk iphoneos --show-sdk-path >/dev/null 
   SDK=$(xcrun -sdk iphoneos --show-sdk-path)
   CC=$(xcrun -sdk iphoneos --find clang)
   "$CC" -arch arm64 -isysroot "$SDK" -mios-version-min=$MINOS $CFLAGS -bundle -framework CoreFoundation -framework CoreMedia \
-    -framework CoreVideo -lobjc "$SRC/media_hooks.c" "$SRC/camera_device.c" "$SRC/camera_isp.c" "$SRC/camera_still.c" "$SRC/camera_mem.c" -o "$B/NegroniCamera"
+    -framework CoreVideo -lobjc "$SRC/media_hooks.c" "$SRC/camera_device.c" "$SRC/camera_isp.c" "$SRC/camera_still.c" "$SRC/camera_mem.c" "$SRC/camera_thumbs.c" -o "$B/NegroniCamera"
   NM="xcrun nm"; OTOOL="xcrun otool"
   sign() { codesign --force -s - "$1"; }
 else
@@ -94,7 +94,8 @@ want="/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation /System
 [ "$libs" = "$want" ] || { echo "camera: unexpected libraries: $libs" >&2; fail=1; }
 for s in _shared_vendor _audio_source_start _video_stabilization_method _video_stabilization_type _quality_prioritization \
          _gnr_render _emit_sample_buffer _prewarm_portrait_filter _image_added _negroni_camera_init _negroni_camera_device_create \
-         _worker _isp_render_nv12 _isp_render_still_nv12 _isp_scale_nv12 _isp_render_cells _isp_mhc_row _isp_finish_rows; do
+         _worker _isp_render_nv12 _isp_render_still_nv12 _isp_scale_nv12 _isp_render_cells _isp_mhc_row _isp_finish_rows \
+         _thumbnail_prepare _thumbnail_render _negronicam_thumbnails_fill; do
   printf '%s\n' "$syms" | grep " $s\$" >/dev/null || { echo "camera: symbol $s missing" >&2; fail=1; }
 done
 grep -q -a '/dev/negronicam' "$X" || { echo "camera: no /dev/negronicam string" >&2; fail=1; }

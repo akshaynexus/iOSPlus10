@@ -47,6 +47,7 @@
 #include "negronicam.h"
 
 extern void negronicam_console(const char *line, size_t n);     /* camera_device.c: to /dev/console (USB log) */
+extern bool negronicam_thumbnails_fill(CVImageBufferRef picture, CVPixelBufferRef out, unsigned count);        /* camera_thumbs.c */
 
 static void
 say(const char *format, ...)
@@ -366,6 +367,99 @@ register_hevc_encoder(void)
 }
 
 /*
+ * The filter thumbnails of Camera.app (BWMultiFilterThumbnailNode), the one node of the graph that cannot do without Metal.
+ * [V boot 20:14, 6 crashes, one stack; disassembly of 20H392] -prepareForCurrentConfigurationToBecomeLive, on the graph's deferred-
+ * prepare queue about a second after the stream starts, does `[_filter filterDescriptor]->x = 0` at 0x1a1f472f0 with no check. _filter is
+ * [FigColorCubeMetalFilter new]; its init reaches -[FigMetalContext commonInitWithOptionalCommandQueue:], where +createMetalDevice answers
+ * nil (0x1c789c340), and so it is nil: SIGSEGV at address 8. Metal stays out of this process: with it listed, boot 19:34 had 236 "surface
+ * import refused" lines of mediaserverd (no filter picture ever came out) and a low-swap kill at 2.6 GB two seconds after the shutter.
+ *
+ * With no Metal device: the node is prepared as a plain node (its filter never made), and each picture goes out unfiltered through the CPU
+ * (camera_thumbs.c): the output is one thumbnail per filter, one under the other, in one buffer. With a Metal device both are stock.
+ */
+static IMP original_thumbnail_prepare, original_thumbnail_render;
+
+static bool
+metal_device_here(void)
+{
+	static dispatch_once_t once;
+	static bool here;
+
+	dispatch_once(&once, ^{
+		id (*create)(void) = (id (*)(void))dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
+
+		here = create != NULL && create() != NULL;      /* (the device, when there is one, is kept for the process) */
+	});
+	return here;
+}
+
+static void
+thumbnail_prepare(id self, SEL selector)
+{
+	static bool said;
+
+	if (metal_device_here()) {
+		((void (*)(id, SEL))original_thumbnail_prepare)(self, selector);
+		return;
+	}
+	if (!said) {
+		said = true;
+		say("negroni: camera hooks: no Metal device in this process: the filter thumbnails go unfiltered, through the CPU\n");
+	}
+	struct objc_super up = { self, class_getSuperclass(objc_getClass("BWMultiFilterThumbnailNode")) };
+
+	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&up, selector);
+}
+
+/* an object ivar of the node, or the place of one (20H392: _filter, _filters, _mostRecentFormatDescription) */
+static void *
+node_ivar_place(id node, const char *name)
+{
+	Ivar ivar = class_getInstanceVariable(object_getClass(node), name);
+
+	return ivar != NULL ? (char *)node + ivar_getOffset(ivar) : NULL;
+}
+
+static void
+thumbnail_render(id self, SEL selector, CMSampleBufferRef sample_buffer, id input)
+{
+	id *filter = node_ivar_place(self, "_filter"), *filters = node_ivar_place(self, "_filters");
+	void *format = node_ivar_place(self, "_mostRecentFormatDescription");
+	static OSStatus (*copy_with)(CMSampleBufferRef, CVPixelBufferRef, void *, CMSampleBufferRef *);
+	static bool said;
+	id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+
+	if (filter == NULL || *filter != nil) {
+		((void (*)(id, SEL, CMSampleBufferRef, id))original_thumbnail_render)(self, selector, sample_buffer, input);
+		return;
+	}
+	if (copy_with == NULL) {
+		void *found = dlsym(RTLD_DEFAULT, "BWCMSampleBufferCreateCopyWithNewPixelBuffer");
+
+		copy_with = (OSStatus (*)(CMSampleBufferRef, CVPixelBufferRef, void *, CMSampleBufferRef *))found;
+	}
+	id output = send(self, sel_registerName("output"));
+	CVImageBufferRef picture = sample_buffer != NULL ? CMSampleBufferGetImageBuffer(sample_buffer) : NULL;
+	CVPixelBufferRef made = picture != NULL && output != nil && copy_with != NULL && format != NULL && filters != NULL ?
+	    (CVPixelBufferRef)send(send(output, sel_registerName("livePixelBufferPool")), sel_registerName("newPixelBuffer")) : NULL;
+	CMSampleBufferRef out = NULL;
+
+	if (made == NULL) {
+		return;
+	}
+	if (negronicam_thumbnails_fill(picture, made, *filters != nil ? (unsigned)CFArrayGetCount((CFArrayRef)*filters) : 1)) {
+		if (copy_with(sample_buffer, made, format, &out) == 0 && out != NULL) {
+			((void (*)(id, SEL, CMSampleBufferRef))objc_msgSend)(output, sel_registerName("emitSampleBuffer:"), out);
+			CFRelease(out);
+		}
+	} else if (!said) {
+		said = true;
+		say("negroni: camera hooks: filter thumbnails: off: a picture or thumbnail buffer that is not 8-bit two-plane YCbCr\n");
+	}
+	CVPixelBufferRelease(made);
+}
+
+/*
  * Diagnosis of "<<<< BWGraph >>>> -[BWGraph stop:]: Not all sink nodes became idle after waiting 10s": stop: then
  * logs the active sinks (only to the unified log), writes a stackshot report and traps (brk #1, sig 5; t27 18:36:29,
  * section 12). The trap stays; this replacement of -[BWGraph _logActiveSinkNodesAfterGraphStopTimeout] (called just
@@ -435,6 +529,10 @@ static struct replacement {
 	  (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
 	{ "BWGraph", "_logActiveSinkNodesAfterGraphStopTimeout", 0x1a218a970UL, 0xa9ba6ffcu,
 	  (IMP)log_active_sinks, &original_log_active_sinks, true, false },
+	{ "BWMultiFilterThumbnailNode", "prepareForCurrentConfigurationToBecomeLive", 0x1a1f471c8UL, 0xd10503ffu,
+	  (IMP)thumbnail_prepare, &original_thumbnail_prepare, true, false },
+	{ "BWMultiFilterThumbnailNode", "renderSampleBuffer:forInput:", 0x1a208d600UL, 0xd10143ffu,
+	  (IMP)thumbnail_render, &original_thumbnail_render, true, false },
 };
 
 static unsigned replaced, left_alone;

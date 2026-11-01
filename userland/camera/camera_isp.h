@@ -24,6 +24,7 @@ struct isp_stats {
 	double          bright;         /* the level of green that 1 % of the cells are above */
 	uint32_t        hist[64];       /* green above black, 16 steps a bin */
 	uint32_t        cells;
+	uint32_t        top;            /* the highest sample of any colour above black */
 	/*
 	 * Red over green and blue over green, lens-shaded, each cell's counted once however bright it is:
 	 * the mean of the cells none of whose colours is near white or near black, and of those of them
@@ -98,6 +99,11 @@ void isp_init(struct isp *isp);
 float isp_sharpness(const struct negronicam_frame *f, const uint8_t *raw, float x0, float y0, float x1, float y1, float *level);
 /* the levels, from every 4th cell of every 4th pair of lines (with the processor's lens shading and white balance, if isp) */
 void isp_measure(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, struct isp_stats *s);
+/*
+ * The frame is noise and nothing else: at 33 ms x 8x or more (a dark room's mean is well over 2 there [I: under about 1 lux at the
+ * lens]) the mean of green stays under 2 steps above black and no sample reaches 64.
+ */
+bool isp_no_light(const struct negronicam_frame *f, const struct isp_stats *s);
 /* the exposure for the frames to come: true, and the command filled in, when it should change */
 bool isp_ae(struct isp *isp, const struct negronicam_frame *f, const struct isp_stats *s, struct negronicam_command *c);
 /*

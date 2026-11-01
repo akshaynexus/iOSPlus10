@@ -73,8 +73,8 @@ isp_sharpness(const struct negronicam_frame *f, const uint8_t *raw, float x0, fl
 	uint32_t cx0 = (uint32_t)(x0 * cells_w), cx1 = (uint32_t)(x1 * cells_w), cy0 = (uint32_t)(y0 * cells_h),
 	    cy1 = (uint32_t)(y1 * cells_h);
 	float above[MAX_BLOCKS], here[MAX_BLOCKS];
-	double steps = 0, sum = 0;
-	uint32_t blocks_w, rows = 0, n = 0;
+	double steps = 0, sum = 0, pairs = 0;
+	uint32_t blocks_w, rows = 0, n = 0, pair_n = 0;
 	int r, b;
 
 	cell_places(f->bayer, &r, &b);
@@ -87,6 +87,12 @@ isp_sharpness(const struct negronicam_frame *f, const uint8_t *raw, float x0, fl
 	 * blocks: a cell's own noise is a quarter of itself in a block's mean, and the picture's edges are
 	 * not -- in the dark, at 32x and more, the steps from cell to cell were the noise's alone and the
 	 * focus went wherever it liked.
+	 *
+	 * laurel: what is left of the noise goes too. The block means still step by the noise, and over the square of the mean that
+	 * has almost one value whatever the noise's size and wherever the lens is: 4 x 0.34 / 32 / 0.4^2 = 0.27 for noise cut off at black
+	 * ([V] host test: 0.26 to 0.34 at sigma 8 to 1; boot 20:15: sweep 0.2859 0.2798 0.2806 0.2795, mean under 1). The two greens of a cell see the same light, so half the
+	 * mean square of their difference is the noise's variance S; a block mean has 32 greens, each direction's step 2 S / 32,
+	 * two directions per block: S / 8 of the steps is noise.
 	 */
 	for (uint32_t by = cy0; by + BLOCK <= cy1; by += BLOCK, rows++) {
 		for (uint32_t bx = 0; bx < blocks_w; bx++) {
@@ -96,11 +102,18 @@ isp_sharpness(const struct negronicam_frame *f, const uint8_t *raw, float x0, fl
 				const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
 
 				for (uint32_t cx = cx0 + bx * BLOCK; cx < cx0 + bx * BLOCK + BLOCK; cx++) {
-					int v[4];
+					int v[4], one = -1;
 
 					cell(top, f->stride, cx, v);
 					for (int i = 0; i < 4; i++) {
-						g += i != r && i != b ? (uint32_t)v[i] : 0;
+						if (i != r && i != b) {
+							g += (uint32_t)v[i];
+							if (one >= 0) {
+								pairs += (v[i] - one) * (v[i] - one);
+								pair_n++;
+							}
+							one = v[i];
+						}
 					}
 				}
 			}
@@ -121,7 +134,12 @@ isp_sharpness(const struct negronicam_frame *f, const uint8_t *raw, float x0, fl
 	if (level != NULL) {
 		*level = (float)mean;
 	}
-	return mean > 0 ? (float)(steps / n / (mean * mean)) : 0;
+	if (mean <= 0) {
+		return 0;
+	}
+	double noise = pair_n ? pairs / pair_n / 2 / 8 : 0, signal = steps / n - noise;
+
+	return signal > 0 ? (float)(signal / (mean * mean)) : 0;
 }
 
 void
@@ -130,6 +148,7 @@ isp_measure(const struct isp *isp, const struct negronicam_frame *f, const uint8
 	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
 	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 };
 	float gains[3] = { 1, 1, 1 };
+	uint32_t fine[32] = { 0 };      /* (green under 32, one step a bin: the 16-step bins read "8" for a black frame) */
 	int r, b;
 
 	memset(s, 0, sizeof(*s));
@@ -147,6 +166,8 @@ isp_measure(const struct isp *isp, const struct negronicam_frame *f, const uint8
 				top_v = v[i] > top_v ? v[i] : top_v;
 			}
 			g /= 2;
+			s->top = (uint32_t)top_v > s->top ? (uint32_t)top_v : s->top;
+			fine[g < 32 ? g : 31] += g < 32;
 			sum[0] += v[r];
 			sum[1] += g;
 			sum[2] += v[b];
@@ -206,9 +227,27 @@ isp_measure(const struct isp *isp, const struct negronicam_frame *f, const uint8
 		above += s->hist[i];
 		if (above * 100 >= (int)s->cells) {
 			s->bright = i * 16 + 8;
+			if (i < 2) {
+				above -= s->hist[i] + (i == 1 ? s->hist[0] : 0);
+				for (int j = 31; j >= 0; j--) {
+					above += fine[j];
+					if (above * 100 >= (int)s->cells) {
+						s->bright = j;
+						break;
+					}
+				}
+			}
 			break;
 		}
 	}
+}
+
+bool
+isp_no_light(const struct negronicam_frame *f, const struct isp_stats *s)
+{
+	double reach = f->exposure_lines * (double)f->line_ns / 1e9 * (f->gain_unity ? (double)f->gain / f->gain_unity : 1);
+
+	return reach >= 0.25 && s->mean[1] < 2 && s->top < 64;
 }
 
 /*

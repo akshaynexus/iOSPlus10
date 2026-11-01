@@ -61,7 +61,7 @@ for pair in __ZL29kH10ISPCaptureDeviceBaseClass:0x1 __ZL25kH10ISPCaptureDeviceCl
 done
 
 # 4. dlsym() targets: exported ("(regular)") by one of these images
-for img in CMCapture CMCaptureCore CoreMedia MediaToolbox VideoToolbox VCPHEVC.videocodec; do ipsw dyld symaddr "$C" --image "$img" 2>/dev/null >> "$T/exp.txt" || true; done
+for img in CMCapture CMCaptureCore CoreMedia MediaToolbox VideoToolbox VCPHEVC.videocodec Metal; do ipsw dyld symaddr "$C" --image "$img" 2>/dev/null >> "$T/exp.txt" || true; done
 syms=$(cat "$SRC/camera_device.c" "$SRC/media_hooks.c" | grep -o 'dlsym([^,]*, "[A-Za-z0-9_]*")' | sed -E 's/.*"([A-Za-z0-9_]+)".*/\1/' | sort -u)
 mdk=$(sed -n '/md_names\[MD_KEYS\] = {/,/};/p' "$SRC/camera_device.c" | grep -o '"kFig[A-Za-z0-9_]*"' | tr -d '"' | sort -u)
 for s in $syms $mdk; do

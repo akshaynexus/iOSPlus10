@@ -28,4 +28,10 @@ clang -O2 $BASE -o "$D/plain" $F
 # shellcheck disable=SC2086
 clang -O1 -fsanitize=address -fno-omit-frame-pointer $BASE -o "$D/asan" $F
 ASAN_OPTIONS=detect_leaks=1:allocator_may_return_null=1 LSAN_OPTIONS=max_leaks=20 "$D/asan" "$((N / 4))"
+if [ -z "${OLD:-}" ]; then
+  # the picture checks of boot 20:02 and the filter thumbnails
+  # shellcheck disable=SC2086
+  clang -O2 $BASE -o "$D/cam6" "$T/cam6_test.c" "$T/cam5_mock.c" "$T/cam5_mock_cv.c" "$SRC/camera_thumbs.c" "$SRC/camera_isp.c" "$SRC/camera_still.c" -lm
+  "$D/cam6"
+fi
 echo "cam-leak-test: OK${OLD:+ on $OLD}"

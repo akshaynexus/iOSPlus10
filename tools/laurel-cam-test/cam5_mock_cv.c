@@ -5,6 +5,7 @@
 #include "cam5_mock_int.h"
 
 /* ---- CoreMedia, CoreVideo ---- */
+volatile int mock_pool_refuse;
 CFStringRef kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
     kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2;
 
@@ -25,8 +26,15 @@ CFDictionaryRef mock_pool(uint32_t w, uint32_t h, uint32_t pf) { struct mock_obj
 int
 CVPixelBufferPoolCreatePixelBuffer(CFAllocatorRef a, CVPixelBufferPoolRef p, CVPixelBufferRef *out)
 {
-	struct mock_obj *o = mock_make(T_PB);
+	struct mock_obj *o;
 
+	/* (the 4032-wide pool only: a photograph that finds no buffer) */
+	if (p->w > 3000 && mock_pool_refuse > 0) {
+		mock_pool_refuse--;
+		*out = NULL;
+		return -1;
+	}
+	o = mock_make(T_PB);
 	o->w = p->w;
 	o->h = p->h;
 	o->pf = p->pf;

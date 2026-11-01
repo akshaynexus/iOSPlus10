@@ -101,6 +101,7 @@ main(int argc, char **argv)
 	CHECK(seen_status2 > scans && abs((int)k.focus - BEST_FOCUS) <= 60, "tap: lens at %u", k.focus);
 	CHECK(seen_status0_after > 0, "AFStatus does not come back to rest");
 	printf("cam5: tap: lens at %u, %ld pictures said a focus scan\n", k.focus, seen_status2);
+	dark_run(o);
 #endif
 	(void)stream_stop(o);
 	for (int i = 0; i < 4; i++) {

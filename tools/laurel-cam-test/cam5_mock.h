@@ -3,6 +3,7 @@
 #define CAM5_MOCK_H
 #include <CoreVideo/CoreVideo.h>
 extern long mock_live_objects, mock_live_buffers, mock_buffers_made;
+extern volatile int mock_pool_refuse;
 extern void *_NSConcreteMallocBlock[32], *_NSConcreteGlobalBlock[32];
 void mock_cv_init(void);
 void mock_dump_live(void);
