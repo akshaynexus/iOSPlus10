@@ -10,7 +10,7 @@ All script steps: `scripts/laurel/dual-boot.sh`. Each writing step needs `CONFIR
 
 | # | Who | Step | Writes |
 | --- | --- | --- | --- |
-| 0 | Owner | Keep `~/laurel-backup/android-20261102-0137` (has `data.tar.gz`; the wipe takes all app data). Settings -> System -> Developer options -> Rooted debugging on | a setting |
+| 0 | Owner yes, agent | Rooted debugging on (Settings -> System -> Developer options). A backup right before the first write: `scripts/backup/laurel-backup.sh` (rerun `data`; the wipe takes all app data). The newest backup with `gpt-sda-head.bin` is what the plan reads | a setting, files on the host |
 | 1 | Agent | `adb root`, `dual-boot.sh check-slot-b`, `dual-boot.sh gpt-write --dry-run`: device check, fresh on-disk table = backup, the exact commands, the table before and after | nothing |
 | 2 | Owner yes, agent | `CONFIRM=gpt-write dual-boot.sh gpt-write`: the write, then read back past the page cache and compared with the plan, before any reboot | 4 table blocks + 2 superblock blocks of userdata |
 | 3 | Agent, right after | `adb reboot bootloader`, `CONFIRM=after-gpt dual-boot.sh after-gpt`: ABL must show the new sizes; reboots to recovery | nothing |
@@ -188,7 +188,7 @@ The root was a pinned, preallocated f2fs file in `/data`, written raw, reached b
 | --- | --- | --- |
 | D1 | Rooted debugging | Done; on again after the wipe |
 | D2 | Lineage's Updater disabled. A sideload still writes slot b: `switch` refuses | Done |
-| D3 | iOS writes slot attributes for a button "Android" | Not now |
+| D3 | Selecting the OS from the device (owner requirement 2026-11-02), for example iOS writes slot attributes for a button "Android", and a switch on Android with no computer | **Not built here, and needed.** This branch needs a computer for `switch` and for the fast way back; with no computer only the 7 retries return to Android. A write of slot attributes from iOS needs its own fence: LUN 0 is the only LUN the fence allows, and only `iosroot` |
 | D8 | One GPT write on LUN 0, one data wipe | Approved 2026-11-02 |
 | D9 | First boot on the new partition is iOS 26 | Decided 2026-11-02 |
 
