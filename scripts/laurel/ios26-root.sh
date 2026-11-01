@@ -1,12 +1,12 @@
 #!/bin/bash
 # Mi A3 iOS 26.5.2 (23F84, iPhone12,1 N104AP) root: an HFS+ image, built on Linux with no Apple tool and no root access. It writes nothing to a device.
 #   scripts/bg.sh ios26-root scripts/laurel/ios26-root.sh
-#   FORCE=1     build again when the inputs did not change      AREA_GIB=32     the iOS area (owner decision 2026-11-02)      VAR_GIB=8   refuse less free space
+#   FORCE=1     build again when the inputs did not change      VAR_GIB=8   refuse less free space
 # Steps: 1. read-only apfs-fuse mounts of the three donor images; 2. scripts/laurel/ios26-root-spec.py: layout, lowered files, tweaks with an audit line per item,
 # trust data, spec; 3. op10tool hfs-build; 4. checks: op10tool hfs-verify (every file against its SHA-256), fsck.hfsplus -n, a real read-only kernel mount (udisks) with
 # scripts/laurel/ios26-root-check.py. Inputs: scripts/ios26/fetch-os.sh, sysos-tree.sh, lower-userland.sh with DEV=n104ap (docs/laurel_sprout/ios26-userland.md section 2).
 # Output (Apple content, never in git): $APPLE/ios26/23F84-n104ap/root/ios26-root.img + .manifest + report.txt; link out/ios26/root-n104ap.
-# Size: the area minus 256 header blocks and 1025 log blocks (tools/laurel-dualboot/laurel_dualboot.h, bsd/dev/sweet_ufs.c SWEET_LOG_BLOCKS). 32 GiB: 34354491392 bytes.
+# Size: IOS26_VOLUME_BYTES in scripts/lib/laurel-layout.sh, the one place: 34354491392 bytes. It must leave room for the console log in iosroot (34760273920 bytes).
 # Same inputs give the same bytes; a run with the same inputs checks the image and stops. Writing it to the phone is another step (scripts/laurel/dual-boot.sh install), not this one.
 # The negroni path is scripts/ios26/root-macos.sh; this script does not touch it.
 set -euo pipefail
@@ -22,20 +22,16 @@ R=$B/root
 W=$R/work
 IMG=$R/ios26-root.img
 TOOL=$OUT/bin/op10tool
-AREA_GIB=${AREA_GIB:-32}
 VAR_GIB=${VAR_GIB:-8}
 for t in apfs-fuse fusermount3 python3 fsck.hfsplus sha256sum; do command -v "$t" >/dev/null || { echo "ios26-root: missing $t" >&2; exit 1; }; done
 [ -x "$TOOL" ] || { echo "ios26-root: no $TOOL (scripts/setup/build-op10tool.sh)" >&2; exit 1; }
 for f in "$D/${OS_AEA%.aea}" "$D/${SYSOS%.aea}" "$D/$APPOS" "$L/dyld_shared_cache_arm64e" "$L/cdhashes.tsv"; do [ -s "$f" ] || { echo "ios26-root: missing $f" >&2; exit 1; }; done
-# the size comes from the two constants the kernel and the helper use
-RES=$(sed -n 's/^#define LDB_RESERVED_BLOCKS *\([0-9]*\)u.*/\1/p' "$REPO/tools/laurel-dualboot/laurel_dualboot.h")
-BLK=$(sed -n 's/^#define LDB_BLOCK *\([0-9]*\)u.*/\1/p' "$REPO/tools/laurel-dualboot/laurel_dualboot.h")
-LOGB=$(sed -n 's/^.*const LOG_BLOCKS: u64 = (4 << 20) \/ B + 1;.*$/1025/p' "$REPO/tools/op10tool/src/dualboot.rs")
-[ "$RES" = 256 ] && [ "$BLK" = 4096 ] && [ "$LOGB" = 1025 ] || { echo "ios26-root: the area constants changed: header $RES, block $BLK, log $LOGB: read dual-boot.md" >&2; exit 1; }
-SIZE=$(( (AREA_GIB << 30) - (RES + LOGB) * BLK ))
+. "$REPO/scripts/lib/laurel-layout.sh"
+SIZE=$IOS26_VOLUME_BYTES
+[ "$SIZE" -le "$IOSROOT_VOLUME_MAX" ] || { echo "ios26-root: volume $SIZE bytes does not fit iosroot: at most $IOSROOT_VOLUME_MAX" >&2; exit 1; }
 avail=$(df -k --output=avail "$APPLE" | tail -1)
 [ "$avail" -gt $((30 << 20)) ] || { echo "ios26-root: under 30 GiB free at $APPLE" >&2; exit 1; }
-echo "ios26-root: area $AREA_GIB GiB, volume $SIZE bytes (area - $RES header blocks - $LOGB log blocks), at least $VAR_GIB GiB free for /private/var"; df -h "$APPLE" | tail -1
+echo "ios26-root: iosroot $IOSROOT_BYTES bytes, volume $SIZE bytes, console log $LOG_BYTES bytes, margin $((IOSROOT_VOLUME_MAX - SIZE)) bytes, at least $VAR_GIB GiB free for /private/var"; df -h "$APPLE" | tail -1
 mkdir -p "$W" "$OUT/ios26"
 MNT=$OUT/ios26/mnt/root26; mkdir -p "$MNT/os" "$MNT/sys" "$MNT/app" "$MNT/ro"
 LOOP=
@@ -91,7 +87,7 @@ cleanup; LOOP=; trap - EXIT
 {
   echo "iOS 26 root, Mi A3: build $BUILD $DEV, $(date -u +%F)"
   echo "image $IMG: $(stat -c %s "$IMG") bytes, real $(du -k "$IMG" | cut -f1) KiB"
-  echo "area $AREA_GIB GiB = $((AREA_GIB << 30)) bytes; header $RES blocks, log $LOGB blocks; volume $SIZE bytes"
+  echo "iosroot $IOSROOT_BYTES bytes; log $LOG_BYTES bytes; volume $SIZE bytes; margin $((IOSROOT_VOLUME_MAX - SIZE)) bytes"
   echo "inputs $INPUTS"
   sed -n 2p "$IMG.manifest"
   cat "$W/verify.txt"

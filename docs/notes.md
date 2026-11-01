@@ -4997,3 +4997,16 @@ Full text: `docs/laurel_sprout/ios26-airdrop.md`.
 - [V] Owner decisions: updater off (`pm disable-user --user 0 org.lineageos.updater`; `pm enable` reverses it; a manual sideload still writes slot b), iOS area 32 GiB (30 % of userdata).
 - [V] `scripts/backup/laurel-backup.sh all`: 86 partitions + GPT heads, each compared with a hash made on the phone; /data 9172 entries, 1.4 GB. Output ~/laurel-backup/android-20261102-0137, 5.0 GB, mode 700, out of git. First backup of modemst1/2, fsg, fsc, persist, devinfo. /data is a file copy for salvage, not a block image: FBE keys stay in keymaster. Run `data` again right before the first phone write. No restore was tried.
 - `.gitignore` `backup/` hid `scripts/backup/`: fixed with an exception.
+
+## Mi A3: dual boot on a real partition (2026-11-02, branch t3/laurel-dual-boot-fix2; built + host tests only, NOTHING RUN ON THE PHONE). Details: docs/laurel_sprout/dual-boot.md
+- Owner: drop the pinned file. `iosroot` on LUN 0, one GPT write + one wipe; first boot iOS 26. Numbers in one place: `scripts/lib/laurel-layout.sh`. `userdata` 1831432..21633535, `iosroot` 21633536..30119930, 34760273920 bytes.
+- [V, backup] LUN 0: 32 slots, 4 blocks reserved per copy (entries fill only the first). Numbering: slot index 14 = partition 15 = userdata = sda15; new index 15 = partition 16 = sda16. `system_a` has slot bits on LUN 0: the attributes in the table move with each slot switch, so "table = backup" holds only until the next switch.
+- [V ABL r12 PartitionTableUpdate.c WriteGpt] **`fastboot flash partition:0` starts with "Erase the entire card": the whole LUN.** `PatchGpt` then rewrites last usable and the last entry (NumSectors - 6: matches 30119930). The stock `gpt_both0.bin` is 11 blocks with no userdata range: not a restore of this table. `partition` is critical: needs unlock_critical.
+- [V Lineage + AOSP bootctl.cpp] `is-slot-*`: true: stdout 1, exit 0; false: stdout 0, exit 70; HAL error: stderr text, exit 70. Only the output separates "no" from an error. `2>&1` and compare.
+- [V kernel 4.14 efi.c] no `gpt` boot-arg: a bad primary means no partitions; the backup is not read. Hence primary header + entries in one write command, last.
+- [V f2fs 4.14] `sanity_check_raw_super` has no compare with the device size: do not count on it for a stale superblock.
+- [V vbmeta in backup] `com.android.build.boot.security_patch` = 2022-08-01 in vbmeta_a, _b and Lineage's. Lineage's boot header: 17.0.0, 2026-10. ABL sends the vbmeta value when the TA has date support, else the header.
+- Gotcha: my shell here is zsh: `echo == x` fails (`=x` expansion), and `$A` with spaces is one word. Test scripts through `sh`. `IFS='|'` around a loop split a `$F` tool variable: use a function. `grep` here is ugrep: `command grep` for `-ac` on binaries. A worktree build: symlink external/{ios-sweet-linux,ios-topaz}, reflink out/laurel-kernel/{deps,theos,cache,dl}.
+- Gotcha: a safety check refuses a script line `rm -rf "$T/home"` (empty T = /home). Keep a test's fake HOME inside its fake phone folder.
+- Left for later, not on the iOS 26 first path: full read-back after `install`; the rest of `root-flash-test.sh`, `update-phone.sh` on the new layout (the guard refuses them while the flag exists); `dual-boot.sh logs`; a step to give the 383 MiB to the volume.
+

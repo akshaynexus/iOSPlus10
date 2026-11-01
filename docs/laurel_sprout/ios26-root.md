@@ -17,7 +17,7 @@ Output (Apple content, never in git): `~/op10-apple/ios26/23F84-n104ap/root/ios2
 | Item | Value |
 |---|---|
 | Area | 32 GiB = 34,359,738,368 bytes (owner decision) |
-| Volume | Area minus 256 header blocks and 1,025 log blocks = **34,354,491,392 bytes** (`laurel_dualboot.h`, `SWEET_LOG_BLOCKS`). The extent table is in the ADT, not the area |
+| Volume | **34,354,491,392 bytes** (`IOS26_VOLUME_BYTES`, `scripts/lib/laurel-layout.sh`). `iosroot` holds it with the console log; margin 401,584,128 bytes (dual-boot.md section 2). The extent table is in the ADT, not the area |
 | Real size on the host | About 18 GB (sparse) |
 | SHA-256 | `3e2eed0a099bc9c8eb08fcda3d94feaac12a09f0ba30c6c8863dde5d52f8bc22`, the same in three full builds (the last one after the air hook went into the spec script, an input of the build). A run with no change stops at "inputs unchanged" |
 | Content | 237,286 files, 2,705 symlinks, 231,112 folders, 17,510 MiB |
