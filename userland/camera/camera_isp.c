@@ -18,9 +18,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include "camera_isp.h"
+#include "camera_isp_int.h"
 
-#define WHITE           959             /* 1023 less the black level of 64 */
-#define LUT_WHITE       3836            /* WHITE in the gamma table's steps */
 
 void
 isp_init(struct isp *isp)
@@ -125,8 +124,6 @@ isp_sharpness(const struct negronicam_frame *f, const uint8_t *raw, float x0, fl
 	return mean > 0 ? (float)(steps / n / (mean * mean)) : 0;
 }
 
-static inline void lsc_at(const struct isp *isp, float u, float v, float g[3]);
-
 void
 isp_measure(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, struct isp_stats *s)
 {
@@ -229,9 +226,10 @@ isp_ae(struct isp *isp, const struct negronicam_frame *f, const struct isp_stats
 	uint32_t lines, gain, frame_lines = 0;
 	double digital = 1;
 
-	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
-		return false;                   /* (the last change not in the frames yet) */
+	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain) && ++isp->asked_frames < 8) {
+		return false;                   /* (the last change not in the frames yet; a value the kernel clamped never comes) */
 	}
+	isp->asked_frames = 0;
 	/* (the measured levels are the sensor's: digital gain is applied to the picture only) */
 	ratio = target / mean;
 	if (bright * ratio > 0.9 * WHITE && bright > 0) {
@@ -384,67 +382,6 @@ isp_set_ccm(struct isp *isp, const float m[9])
 {
 	for (int i = 0; i < 9; i++) {
 		isp->ccm[i / 3][i % 3] = m[i];
-	}
-}
-
-/*
- * The colour matrix with the white balance's and AE's gains folded in, in the gamma table's steps
- * (per 10-bit step above black): out[c] = sum over j of m[c][j] * value[j] (each value lens-shaded).
- */
-struct pipe {
-	float           m[3][3];
-	bool            identity;
-};
-
-static void
-pipe_init(const struct isp *isp, struct pipe *p)
-{
-	p->identity = true;
-	for (int c = 0; c < 3; c++) {
-		for (int j = 0; j < 3; j++) {
-			p->m[c][j] = isp->ccm[c][j] * isp->wb[j] * isp->digital * (LUT_WHITE / (float)WHITE);
-			p->identity = p->identity && (c == j ? isp->ccm[c][j] == 1 : isp->ccm[c][j] == 0);
-		}
-	}
-}
-
-static inline uint8_t
-curve(const struct isp *isp, float v)
-{
-	int i = (int)(v + 0.5f);
-
-	return isp->gamma[i < 0 ? 0 : i > 4095 ? 4095 : i];
-}
-
-static inline void
-pixel(const struct isp *isp, const struct pipe *p, float r, float g, float b, uint8_t *rgb)
-{
-	if (p->identity) {
-		rgb[0] = curve(isp, r * p->m[0][0]);
-		rgb[1] = curve(isp, g * p->m[1][1]);
-		rgb[2] = curve(isp, b * p->m[2][2]);
-		return;
-	}
-	rgb[0] = curve(isp, p->m[0][0] * r + p->m[0][1] * g + p->m[0][2] * b);
-	rgb[1] = curve(isp, p->m[1][0] * r + p->m[1][1] * g + p->m[1][2] * b);
-	rgb[2] = curve(isp, p->m[2][0] * r + p->m[2][1] * g + p->m[2][2] * b);
-}
-
-/* the lens shading's gains at (u, v), 0 to 1 across the sensor */
-static inline void
-lsc_at(const struct isp *isp, float u, float v, float g[3])
-{
-	float gx = u * (LSC_W - 1), gy = v * (LSC_H - 1);
-	int x = (int)gx, y = (int)gy;
-
-	x = x < 0 ? 0 : x > LSC_W - 2 ? LSC_W - 2 : x;
-	y = y < 0 ? 0 : y > LSC_H - 2 ? LSC_H - 2 : y;
-	float fx = gx - x, fy = gy - y;
-
-	for (int c = 0; c < 3; c++) {
-		const float (*t)[LSC_W] = isp->lsc.gain[c];
-
-		g[c] = (t[y][x] * (1 - fx) + t[y][x + 1] * fx) * (1 - fy) + (t[y + 1][x] * (1 - fx) + t[y + 1][x + 1] * fx) * fy;
 	}
 }
 
@@ -786,33 +723,20 @@ isp_render_full_nv12(const struct isp *isp, const struct negronicam_frame *f, co
 	}
 }
 
-/* one line (y) of the sensor demosaiced, as 8-bit R, G, B (the unpacked lines around it in this thread's l) */
-static void
-demosaic_row(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, uint32_t row, const int colour[4],
-    const struct pipe *p, int *const l[3], uint8_t *rgb)
-{
-	for (int i = 0; i < 3; i++) {
-		unpack_line(f, raw, (int)row - 1 + i, l[i]);
-	}
-	full_line(isp, f, (const int *const *)l, row, colour, p, rgb);
-}
-
 void
 isp_render_still_nv12(const struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
     uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
 {
 	uint32_t x0, y0, cw, ch, fw = f->width;
-	int colour[4];
-	struct pipe p;
-	static __thread int *lines[3];
+	static __thread float *lines[5];
 	static __thread uint8_t *rows[2], *out[2];
 	static __thread uint32_t have_fw, have_width;
-	int32_t cached[2] = { -1, -1 };
+	int32_t cached[2] = { -1, -1 }, tags[5] = { -1, -1, -1, -1, -1 };
 
 	if (fw > have_fw) {
-		for (int i = 0; i < 3; i++) {
+		for (int i = 0; i < 5; i++) {
 			free(lines[i]);
-			lines[i] = malloc(sizeof(int) * fw);
+			lines[i] = malloc(sizeof(float) * fw);
 		}
 		for (int i = 0; i < 2; i++) {
 			free(rows[i]);
@@ -827,12 +751,10 @@ isp_render_still_nv12(const struct isp *isp, const struct negronicam_frame *f, c
 		}
 		have_width = width;
 	}
-	if (lines[2] == NULL || rows[1] == NULL || out[1] == NULL) {
+	if (lines[0] == NULL || lines[1] == NULL || lines[2] == NULL || lines[3] == NULL || lines[4] == NULL || rows[1] == NULL || out[1] == NULL) {
 		return;
 	}
 	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
-	cfa(f->bayer, colour);
-	pipe_init(isp, &p);
 	float sx_step = 2.0f * cw / width, sy_step = 2.0f * ch / height;
 
 	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
@@ -854,7 +776,7 @@ isp_render_still_nv12(const struct isp *isp, const struct negronicam_frame *f, c
 				}
 				/* (into the slot the other line does not need: sy0's for sy1, and sy1's kept for sy0) */
 				slot[n] = n == 1 ? slot[0] ^ 1 : cached[0] == (int32_t)sy1 ? 1 : 0;
-				demosaic_row(isp, f, raw, want, colour, &p, lines, rows[slot[n]]);
+				isp_mhc_row(isp, f, raw, want, lines, tags, rows[slot[n]]);
 				cached[slot[n]] = (int32_t)want;
 			}
 			const uint8_t *a = rows[slot[0]], *b = rows[slot[1]];

@@ -20,7 +20,7 @@ static unsigned fails, checks;
 #define SAME(f) _Static_assert(offsetof(struct lcam_nc_frame, f) == offsetof(struct negronicam_frame, f), #f)
 SAME(magic); SAME(header_bytes); SAME(width); SAME(height); SAME(stride); SAME(format); SAME(bayer); SAME(black); SAME(sequence);
 SAME(time); SAME(exposure_lines); SAME(line_ns); SAME(gain); SAME(gain_unity); SAME(gain_max); SAME(frame_lines);
-SAME(frame_lines_min); SAME(frame_lines_max); SAME(margin); SAME(sensor); SAME(focus); SAME(reserved);
+SAME(frame_lines_min); SAME(frame_lines_max); SAME(margin); SAME(sensor); SAME(focus); SAME(mode); SAME(focus_min); SAME(focus_max); SAME(sensor_w); SAME(sensor_h);
 _Static_assert(sizeof(struct lcam_nc_frame) == sizeof(struct negronicam_frame), "header");
 _Static_assert(sizeof(struct lcam_nc_command) == sizeof(struct negronicam_command), "command");
 _Static_assert((int)LCAM_NC_EXPOSURE == (int)NEGRONICAM_EXPOSURE && (int)LCAM_NC_SENSOR == (int)NEGRONICAM_SENSOR &&
@@ -79,10 +79,9 @@ mock_vfe_done(uint32_t slot)
 {
 	uint32_t refill;
 
-	if (lcam_nc_ring_done(&dev.ring, slot, &refill)) {
-		dev.time += 33;
-		mock_frame(dev.buf[dev.ring.latest]);
-	}
+	lcam_nc_ring_done(&dev.ring, slot, &refill);
+	dev.time += 33;
+	mock_frame(dev.buf[dev.ring.latest]);
 }
 
 /* read(2): header only for a header-size buffer, else header + frame */
@@ -156,25 +155,22 @@ test_pure(void)
 	lcam_nc_clamp(&l, &a, &b, &c);
 	CHECK(a == 4 && c == f, "at least 4 lines, frame not under the shortest (%u %u)", a, c);
 
-	/* the ring: 3 distinct buffers, always; a buffer being read never goes back into the VFE */
+	/* the ring (laurel 2773): 4 distinct buffers, always; a buffer being read never goes back into the VFE; no frame lost to a read */
 	lcam_nc_ring_init(&ring);
-	for (unsigned i = 0; i < 1000; i++) {
+	for (uint32_t i = 0; i < 1000; i++) {
 		uint32_t slot = i & 1;
-		bool busy = (i % 7) == 3;
+		bool busy = i % 7 == 3;
 
 		ring.reading = busy ? (int)ring.latest : -1;
-		uint32_t latest = ring.latest, in = ring.cur[slot];
-		bool fresh = lcam_nc_ring_done(&ring, slot, &r);
+		uint32_t in = ring.cur[slot], reading = ring.latest;
 
-		CHECK(ring.cur[0] != ring.cur[1] && ring.cur[0] != ring.latest && ring.cur[1] != ring.latest, "three buffers (%u)", i);
-		if (busy) {
-			CHECK(!fresh && ring.latest == latest && r == in, "a read buffer stays out (%u)", i);
-		} else {
-			CHECK(fresh && ring.latest == in && r == latest, "the finished frame comes out (%u)", i);
-		}
+		lcam_nc_ring_done(&ring, slot, &r);
+		CHECK(ring.cur[0] != ring.cur[1] && ring.cur[0] != ring.latest && ring.cur[1] != ring.latest && ring.spare != ring.latest &&
+		    ring.spare != ring.cur[0] && ring.spare != ring.cur[1], "four buffers (%u)", i);
+		CHECK(ring.latest == in, "the finished frame comes out (%u)", i);
+		CHECK(r == ring.cur[slot] && (!busy || r != reading), "a read buffer stays out (%u)", i);
 	}
-	CHECK(ring.lost == 1000 / 7 + (1000 % 7 > 3) && ring.frames + ring.lost == 1000, "counts %llu %llu",
-	    (unsigned long long)ring.frames, (unsigned long long)ring.lost);
+	CHECK(ring.frames == 1000, "no frame lost: %llu", (unsigned long long)ring.frames);
 }
 
 /* ---- the client ----------------------------------------------------------------------------------------------- */

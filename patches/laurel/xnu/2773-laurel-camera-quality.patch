@@ -1,0 +1,1276 @@
+laurel 2773: camera quality on the Mi A3: real line time from the PLL registers (the library's vt_pixel_clk is wrong by 2.57x), 1920x1440 preview window and 4000x3000 photograph mode with a switch without a power-down, DW9800W lens motor over CCI, four-buffer ring, exposure in the header delayed as the sensor applies it, levels above black in the lines. docs/laurel_sprout/camera.md section 10.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -151,6 +151,7 @@
+ bsd/dev/laurel_cam_cci.c			standard
+ bsd/dev/laurel_cam_dev.c			standard
+ bsd/dev/laurel_cam_sess.c			standard
++bsd/dev/laurel_cam_vcm.c			standard
+ bsd/dev/laurel_cam_clk.c			standard
+ bsd/dev/laurel_cam_csi.c			standard
+ bsd/dev/laurel_cam_ispif.c			standard
+diff -ruN a/bsd/dev/laurel_cam.c b/bsd/dev/laurel_cam.c
+--- a/bsd/dev/laurel_cam.c
++++ b/bsd/dev/laurel_cam.c
+@@ -37,6 +37,7 @@
+ static LCK_GRP_DECLARE(lcam_grp, "laurel_camera");
+ static LCK_MTX_DECLARE(lcam_lock, &lcam_grp);
+ static char lcam_result[320] = "scan not done";
++bool lcam_depth_sunny;                  /* laurel 2773 */
+ static bool rail_warned;
+ 
+ /* append to a bounded text: never past len, always terminated */
+@@ -221,6 +222,7 @@
+ 		if (got) {
+ 			found++;
+ 			rear = i == 0 ? got : rear;
++			lcam_depth_sunny = lcam_depth_sunny || (i == 1 && strcmp(got->name, "OV02A10") == 0);
+ 			snprintf(part, sizeof(part), "%s %s (%#04x id %#06x)", s->role, got->name, got->addr, got->id);
+ 			LCAM_SAY("%s: %s chip ID %#06x at %#04x (CCI M%u), MCLK%u\n", s->role, got->name, got->id, got->addr,
+ 			    s->master, s->mclk);
+diff -ruN a/bsd/dev/laurel_cam_ctl.c b/bsd/dev/laurel_cam_ctl.c
+--- a/bsd/dev/laurel_cam_ctl.c
++++ b/bsd/dev/laurel_cam_ctl.c
+@@ -43,17 +43,51 @@
+ 		snprintf(line, len, "off: %s", why);
+ 		return ENOENT;
+ 	}
+-	for (unsigned i = 0; i < LST_NBUF; i++) {
+-		void *va = NULL;
+-		st.pa[i] = topaz_gpu_pool_alloc(LST_BYTES, &va);
+-		st.va[i] = va;
+-		if (st.pa[i] == 0 || va == NULL || st.pa[i] + LST_BYTES > 0x100000000ull) {
++	/* laurel 2773: the session's modes */
++	for (unsigned i = 0; i < LCAM_SM_N; i++) {
++		if (!lcam_mode_build(st.lib, i, &st.sm[i])) {
++			LCAM_SAY("sensor: no %s in the library\n", i == LCAM_SM_STILL ? "4000x3000 mode" : i == LCAM_SM_720 ? "1280x720 mode" : "1920x1080 mode");
++			continue;
++		}
++		LCAM_SAY("sensor: session mode %u: table %d, %ux%u, line %u ns at %u MHz, shortest frame %u lines = %u fps, "
++		    "%ux%u of the sensor\n", i, st.sm[i].k, st.sm[i].w, st.sm[i].h, st.sm[i].line_ns, st.sm[i].vt_hz / 1000000u,
++		    st.sm[i].frame, st.sm[i].line_ns ? (uint32_t)(1000000000ull / ((uint64_t)st.sm[i].frame * st.sm[i].line_ns)) : 0,
++		    st.sm[i].sensor_w, st.sm[i].sensor_h);
++	}
++	st.preview = st.sm[LCAM_SM_WINDOW].k >= 0 ? LCAM_SM_WINDOW : LCAM_SM_720;
++	if (st.sm[st.preview].k < 0) {
++		snprintf(line, len, "off: no preview mode in the library");
++		return ENOENT;
++	}
++	/* big enough for the photograph; when the GPU pool has no such room, for the preview: no photograph mode then */
++	st.still_ok = st.sm[LCAM_SM_STILL].k >= 0;
++	for (int pass = st.still_ok ? 0 : 1; pass < 2; pass++) {
++		bool good = true;
++
++		st.cap = (pass == 0 ? st.sm[LCAM_SM_STILL].bytes : st.sm[LCAM_SM_WINDOW].k >= 0 ? st.sm[LCAM_SM_WINDOW].bytes : st.sm[LCAM_SM_720].bytes) + LST_SLACK;
++		for (unsigned i = 0; good && i < LST_NBUF; i++) {
++			void *va = NULL;
++
++			st.pa[i] = topaz_gpu_pool_alloc(st.cap, &va);
++			st.va[i] = va;
++			good = st.pa[i] != 0 && va != NULL && st.pa[i] + st.cap <= 0x100000000ull;
++			if (good) {
++				bzero(va, st.cap);
++			}
++		}
++		if (good) {
++			break;
++		}
++		if (pass == 1) {
+ 			snprintf(line, len, "off: no frame buffer below 4 GiB from the GPU pool (gpu=0, or no "
+ 			    "/chosen laurel-ram-reserved in the ADT)");
+ 			return ENOMEM;          /* (buffers already taken stay with the camera: no free path needed) */
+ 		}
+-		bzero(va, LST_BYTES);
++		st.still_ok = false;
++		LCAM_SAY("photograph mode: off: no 4 x %u bytes in the GPU pool: photographs from the preview frames\n", st.cap);
+ 	}
++	lcam_vcm_load(lcam_depth_sunny);
++	lcam_mode_select(st.preview);
+ 	if (!topaz_smmu_identity(0x420, 0, "camera VFE") || !topaz_smmu_identity(0x421, 2, "camera VFE 2")) {
+ 		snprintf(line, len, "off: apps SMMU: no identity context for the VFE streams 0x420/0x421");
+ 		return ENXIO;
+@@ -73,9 +107,20 @@
+ 		return;
+ 	}
+ 	lcam_dev_publish();                     /* laurel 2772: before the self-check (mediaserverd starts soon after the root) */
+-	(void)lcam_capture(2000, line, sizeof(line));
+-	lcam_stream_say(line);
+-	st.off = strncmp(line, "off:", 4) == 0 || st.tpg;
++	/* laurel 2773: the best preview mode whose frames come, and come with its size; else the next (the mode of the first boots last) */
++	for (;;) {
++		lcam_mode_select(st.preview);
++		(void)lcam_capture(2000, line, sizeof(line));
++		lcam_stream_say(line);
++		st.off = strncmp(line, "off:", 4) == 0 || st.tpg;
++		if ((!st.off && st.size_ok) || st.preview == LCAM_SM_720) {
++			break;
++		}
++		LCAM_SAY("preview: mode %u: off: %s: the next one\n", st.preview, st.off ? "no frame" : "frames of another size");
++		st.preview = st.sm[st.preview + 1].k >= 0 ? st.preview + 1 : LCAM_SM_720;
++		st.tpg = false;
++		st.ae.max_lines = 0;
++	}
+ 	if (st.off) {
+ 		lcam_dev_off("the boot self-check got no frame (line above)");
+ 	}
+@@ -85,6 +130,7 @@
+ 			lcam_dev_session();
+ 		} else if (st.request) {
+ 			st.request = false;
++			lcam_mode_select(st.preview);
+ 			(void)lcam_capture(1500, line, sizeof(line));
+ 			lcam_stream_say(line);
+ 		}
+@@ -99,6 +145,7 @@
+ 
+ 	st.slot = s;
+ 	st.chip = chip;
++	st.cur = LCAM_SM_720;                   /* (until prepare: the sizes are 0, nothing reads them) */
+ 	if (kernel_thread_start(stream_thread, NULL, &th) != KERN_SUCCESS) {
+ 		st.off = true;
+ 		lcam_stream_say("off: no stream thread");
+diff -ruN a/bsd/dev/laurel_cam_dev.c b/bsd/dev/laurel_cam_dev.c
+--- a/bsd/dev/laurel_cam_dev.c
++++ b/bsd/dev/laurel_cam_dev.c
+@@ -6,8 +6,8 @@
+  *            newest frame not read yet; gives the 120-byte header, then as many frame bytes as fit. A buffer of the
+  *            header's size gets the header only. EAGAIN on a time-out, EIO after a fault (until reboot).
+  *   write()  struct lcam_nc_command: EXPOSURE (a lines, b gain x256, c frame lines or 0), SENSOR (only 1, the rear main
+- *            camera, exists: others give ENODEV), KEEP and FOCUS accepted and ignored.
+- * The camera has power only during a session (laurel_cam_sess.c): it ends after the last close or 3 s without a read
++ *            camera, exists: others give ENODEV), FOCUS (a DAC position), MODE (a: 0 preview, 1 photograph; laurel 2773), KEEP ignored.
++ * The camera has power only during a session (laurel_cam_sess.c): it ends after the last close or 6 s without a read
+  * (a photograph takes the reader that long), and everything goes off
+  * (sensor power-down, CSI, VFE, clocks, GDSC: laurel_cam_stream.c teardown). Only the stream thread touches the hardware;
+  * read and write only queue requests. A failure turns off only the camera: the node then answers EIO.
+@@ -104,7 +104,14 @@
+ 	h.exposure_lines = d.lines;
+ 	h.gain = d.gain;
+ 	h.frame_lines = d.frame;
++	h.mode = d.mode;
++	h.focus = d.focus;
++	h.focus_min = d.focus_min;
++	h.focus_max = d.focus_max;
++	h.sensor_w = d.sensor_w;
++	h.sensor_h = d.sensor_h;
+ 	d.given = d.ring.frames;
++	d.reads++;
+ 	bool body = uio_resid(uio) > (user_ssize_t)sizeof(h);
+ 	if (body) {
+ 		d.ring.reading = buf;           /* (the stream thread leaves this buffer alone until it is -1 again) */
+@@ -146,8 +153,18 @@
+ 		return 0;
+ 	case LCAM_NC_SENSOR:
+ 		return c.a == LCAM_NC_REAR ? 0 : ENODEV;
++	case LCAM_NC_FOCUS:             /* laurel 2773: a: the DAC position; the stream thread moves the lens */
++		lck_mtx_lock(&ld_lock);
++		d.ask.focus = c.a;
++		d.ask.focus_pending = true;
++		lck_mtx_unlock(&ld_lock);
++		return 0;
++	case LCAM_NC_MODE:              /* laurel 2773: a: 0 preview, 1 photograph (frames of the new mode follow) */
++		lck_mtx_lock(&ld_lock);
++		d.ask.mode = c.a ? 1 : 0;
++		lck_mtx_unlock(&ld_lock);
++		return 0;
+ 	case LCAM_NC_KEEP:
+-	case LCAM_NC_FOCUS:
+ 		if (c.bytes && uio_resid(uio) > 0) {
+ 			uio_update(uio, MIN((user_size_t)c.bytes, (user_size_t)uio_resid(uio)));
+ 		}
+@@ -185,7 +202,7 @@
+ 		LCAM_SAY("/dev/negronicam: off: no node (cdevsw %d)\n", major);
+ 		return;
+ 	}
+-	LCAM_SAY("/dev/negronicam: on: rear %s %ux%u RAW10, Bayer %s, black %u; open + read starts the camera, the last "
++	LCAM_SAY("/dev/negronicam: on: rear %s preview %ux%u RAW10, Bayer %s, black %u; open + read starts the camera, the last "
+ 	    "close stops it\n", st.chip->name, LST_W, LST_H, st.lib->filter == LCAM_BAYER_RGGB ? "RGGB" : "other", LCAM_NC_BLACK);
+ }
+ 
+diff -ruN a/bsd/dev/laurel_cam_dev.h b/bsd/dev/laurel_cam_dev.h
+--- a/bsd/dev/laurel_cam_dev.h
++++ b/bsd/dev/laurel_cam_dev.h
+@@ -32,11 +32,13 @@
+ 	uint32_t        gain, gain_unity, gain_max;
+ 	uint32_t        frame_lines, frame_lines_min, frame_lines_max, margin;
+ 	uint32_t        sensor, focus;
+-	uint32_t        reserved[5];
++	uint32_t        mode;                   /* laurel 2773: 0 preview, 1 photograph */
++	uint32_t        focus_min, focus_max;   /* the lens motor's range; NO_FOCUS in focus: no motor */
++	uint32_t        sensor_w, sensor_h;     /* the part of the sensor the frame shows */
+ };
+ _Static_assert(sizeof(struct lcam_nc_frame) == 120, "NCFRAME1 header");
+ 
+-enum { LCAM_NC_EXPOSURE = 1, LCAM_NC_KEEP = 2, LCAM_NC_SENSOR = 3, LCAM_NC_FOCUS = 4 };
++enum { LCAM_NC_EXPOSURE = 1, LCAM_NC_KEEP = 2, LCAM_NC_SENSOR = 3, LCAM_NC_FOCUS = 4, LCAM_NC_MODE = 5 };
+ 
+ struct lcam_nc_command {
+ 	uint32_t        command, bytes;         /* bytes: of what follows this structure */
+@@ -98,17 +100,16 @@
+ }
+ 
+ /*
+- * The frame buffers: two in the VFE (PING, PONG), one out: the newest finished frame, which readers copy from. A buffer
+- * that a reader copies from does not go back into the VFE: the frame that ended meanwhile is lost, its buffer is
+- * written again. So a reader never sees a torn frame and never holds up the VFE.
++ * The frame buffers (laurel 2773: four): two in the VFE (PING, PONG), the newest finished frame, and one more: a frame that ends
++ * while the reader copies the newest takes the fourth, so no frame is lost to a slow copy (boot 18:40: 70 of 369 frames were).
++ * A buffer a reader copies from never goes back into the VFE, so a reader never sees a torn frame.
+  */
+-#define LCAM_NC_NBUF            3u
++#define LCAM_NC_NBUF            4u
+ 
+ struct lcam_nc_ring {
+-	uint32_t cur[2], latest;                /* buffer index */
++	uint32_t cur[2], latest, spare;         /* buffer index */
+ 	int reading;                            /* buffer a reader copies from, -1 none */
+-	uint64_t frames;                        /* frames given (the sequence of `latest`) */
+-	uint64_t lost;                          /* frames written over because `latest` was being read */
++	uint64_t frames;                        /* frames finished (the sequence of `latest`) */
+ };
+ 
+ static inline void
+@@ -117,27 +118,25 @@
+ 	r->cur[0] = 0;
+ 	r->cur[1] = 1;
+ 	r->latest = 2;
++	r->spare = 3;
+ 	r->reading = -1;
+ 	r->frames = 0;
+-	r->lost = 0;
+ }
+ 
+-/* master `slot` finished a buffer: true = a new frame in r->latest; *refill = the buffer `slot` writes next */
+-static inline bool
++/* master `slot` finished a buffer: a new frame in r->latest; *refill = the buffer `slot` writes next, never the one being read */
++static inline void
+ lcam_nc_ring_done(struct lcam_nc_ring *r, uint32_t slot, uint32_t *refill)
+ {
+-	uint32_t done = r->cur[slot & 1u];
++	uint32_t done = r->cur[slot & 1u], next = r->latest;
+ 
+-	if (r->reading == (int)r->latest) {
+-		*refill = done;
+-		r->lost++;
+-		return false;
++	if (r->reading == (int)next) {
++		next = r->spare;
++		r->spare = r->latest;
+ 	}
+-	r->cur[slot & 1u] = r->latest;
+-	*refill = r->latest;
++	r->cur[slot & 1u] = next;
++	*refill = next;
+ 	r->latest = done;
+ 	r->frames++;
+-	return true;
+ }
+ 
+ static inline void
+diff -ruN a/bsd/dev/laurel_cam.h b/bsd/dev/laurel_cam.h
+--- a/bsd/dev/laurel_cam.h
++++ b/bsd/dev/laurel_cam.h
+@@ -91,7 +91,8 @@
+ struct lcam_mode;
+ int lcam_power(const struct lcam_slot *s, bool up, const char **why);  /* laurel_cam.c: power list (+ pins off) */
+ int lcam_sensor_load(const char *chip, const struct lcam_lib **lib, int *mode, const char **why);  /* sensor.c */
+-int lcam_sensor_start(const struct lcam_slot *s, const struct lcam_sensor *chip, const char **why);
++int lcam_sensor_start(const struct lcam_slot *s, const struct lcam_sensor *chip, int k, bool window, const char **why);
++int lcam_sensor_mode(int k, bool window);                /* laurel 2773: standby, then this mode's table */
+ int lcam_sensor_stream(bool on);
+ int lcam_sensor_exposure(uint32_t lines, uint32_t gain_code);
+ int lcam_sensor_frame_exposure(uint32_t lines, uint32_t gain_code, uint32_t frame_lines);  /* laurel 2772: + frame length */
+@@ -113,4 +114,14 @@
+ bool lcam_dev_wanted(void);
+ void lcam_dev_session(void);
+ 
++/* laurel 2773: laurel_cam_vcm.c, the lens motor */
++extern bool lcam_depth_sunny;                           /* laurel_cam.c: the depth camera of the scan was the OV02A10 */
++void lcam_vcm_load(bool sunny);
++void lcam_vcm_on(unsigned master);
++bool lcam_vcm_running(void);
++uint32_t lcam_vcm_pos(void);
++void lcam_vcm_range(uint32_t *lo, uint32_t *hi);
++void lcam_vcm_move(uint32_t pos);
++void lcam_vcm_off(void);
++
+ #endif /* LAUREL_CAM_H */
+diff -ruN a/bsd/dev/laurel_cam_mode.h b/bsd/dev/laurel_cam_mode.h
+--- a/bsd/dev/laurel_cam_mode.h
++++ b/bsd/dev/laurel_cam_mode.h
+@@ -0,0 +1,193 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2773): the sensor modes of a session and the lens motor's data. Pure (no kernel
++ * calls; host-tested by tools/laurel-cam-test/cam4_test.c against the stock libraries).
++ *
++ * The real pixel rate [V boot 2026-11-01 18:40: 234 fps at 780 lines, 37 fps at 4862 lines; the library said 93.5 fps]: the
++ * library's vt_pixel_clk field is not the sensor's clock. INCK / IVT_PREPLLCK_DIV * IVT_PLL_MPY / IVT_SYCK_DIV / IVT_PXCK_DIV x 8
++ * (the IMX586's 8 pixel pipes [I]) over line_length x frame_length gives whole frame rates for all 7 modes of the table:
++ * 15, 30, 60, 90, 120, 30, 240 fps. The wrong clock made every exposure 2.57 times shorter than AE believed and the session
++ * ran at 77 fps instead of 30.
++ *
++ * Preview: mode 2 (1920x1080, 4x4 binned) shows 72 % of the sensor's height and mode 6 (1280x720) only 64 % x 48 %. The window of
++ * LCAM_SM_WINDOW is mode 2 with the standard CCS window registers opened to the whole height: 1920x1440, 96 % of the sensor each
++ * way, the view of the photograph. The tail check of laurel_cam_stream.c tests its size at boot; a failure falls back to the stock
++ * mode 2, then mode 6. Photograph: mode 1 (4000x3000, 2x2 binned).
++ */
++#ifndef LAUREL_CAM_MODE_H
++#define LAUREL_CAM_MODE_H
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include "laurel_cam_lib.h"
++#include "laurel_cam_rdi.h"
++
++#define LCAM_PIXEL_PIPES        8u
++enum { LCAM_SM_WINDOW, LCAM_SM_1080, LCAM_SM_720, LCAM_SM_STILL, LCAM_SM_N };
++
++struct lcam_smode {
++	int             k;                      /* the library's mode; -1: not there */
++	bool            window;                 /* the table + lcam_window_regs */
++	uint16_t        w, h;
++	uint32_t        stride, bytes;
++	uint32_t        line, frame;            /* line length in pixel clocks, shortest frame in lines */
++	uint32_t        vt_hz, line_ns;
++	uint32_t        sensor_w, sensor_h;     /* the part of the 8000x6000 sensor the frame shows */
++};
++
++/* Mode 2 needs 222 lines of blanking (1302 - 1080): 1500 binned lines + 222 */
++#define LCAM_WINDOW_W           1920u
++#define LCAM_WINDOW_H           1440u
++#define LCAM_WINDOW_FRAME       1722u
++static const struct {
++	uint16_t reg;
++	uint8_t val;
++} lcam_window_regs[] = {
++	{ 0x0346, 0x00 }, { 0x0347, 0x00 },     /* Y_ADDR_START 0 */
++	{ 0x034a, 0x17 }, { 0x034b, 0x6f },     /* Y_ADDR_END 5999 */
++	{ 0x040a, 0x00 }, { 0x040b, 0x1e },     /* DIG_CROP_Y_OFFSET 30 of 1500 */
++	{ 0x040e, 0x05 }, { 0x040f, 0xa0 },     /* DIG_CROP_HEIGHT 1440 */
++	{ 0x034e, 0x05 }, { 0x034f, 0xa0 },     /* Y_OUTPUT_SIZE 1440 */
++	{ 0x0340, 0x06 }, { 0x0341, 0xba },     /* FRM_LENGTH_LINES 1722 */
++};
++
++/* the value of one register in a table of the library (k: mode or LCAM_LIB_INIT_MODE) */
++static inline bool
++lcam_table_value(const struct lcam_lib *l, int k, uint16_t reg, uint8_t *v)
++{
++	const uint8_t *e;
++	uint32_t n = lcam_lib_table(l, k, &e), d;
++	uint16_t a;
++	uint8_t x;
++	bool found = false;
++
++	for (uint32_t i = 0; i < n; i++) {
++		lcam_lib_entry(e, i, &a, &x, &d);
++		if (a == reg) {
++			*v = x;
++			found = true;           /* (the last write wins) */
++		}
++	}
++	return found;
++}
++
++/* the pixel rate of mode k from its PLL registers, 0 when one is not in the tables */
++static inline uint32_t
++lcam_mode_vt_hz(const struct lcam_lib *l, int k)
++{
++	uint8_t a = 0, b = 0, px, sy, pre, mh, ml;
++	uint64_t hz;
++
++	if (!lcam_table_value(l, LCAM_LIB_INIT_MODE, 0x0136, &a) || !lcam_table_value(l, LCAM_LIB_INIT_MODE, 0x0137, &b) ||
++	    !lcam_table_value(l, k, 0x0301, &px) || !lcam_table_value(l, k, 0x0303, &sy) || !lcam_table_value(l, k, 0x0305, &pre) ||
++	    !lcam_table_value(l, k, 0x0306, &mh) || !lcam_table_value(l, k, 0x0307, &ml) || px == 0 || sy == 0 || pre == 0) {
++		return 0;
++	}
++	hz = (uint64_t)a * 1000000u + (uint64_t)b * 1000000u / 256u;
++	hz = hz * (uint32_t)(mh << 8 | ml) / pre / sy / px * LCAM_PIXEL_PIPES;
++	return hz > 0xffffffffull ? 0 : (uint32_t)hz;
++}
++
++/* one session mode from the library: false when the library has no such mode */
++static inline bool
++lcam_mode_build(const struct lcam_lib *l, unsigned which, struct lcam_smode *s)
++{
++	static const uint16_t size[LCAM_SM_N][2] = { { 1920, 1080 }, { 1920, 1080 }, { 1280, 720 }, { 4000, 3000 } };
++	struct lcam_mode m;
++	int k = lcam_lib_find(l, size[which][0], size[which][1]);
++	uint8_t bin = 0x22;
++
++	s->k = -1;
++	if (k < 0 || lcam_lib_mode(l, (uint32_t)k, &m) != 0) {
++		return false;
++	}
++	s->k = k;
++	s->window = which == LCAM_SM_WINDOW;
++	s->w = which == LCAM_SM_WINDOW ? (uint16_t)LCAM_WINDOW_W : m.w;
++	s->h = which == LCAM_SM_WINDOW ? (uint16_t)LCAM_WINDOW_H : m.h;
++	s->stride = lcam_raw10_stride(s->w);
++	s->bytes = s->stride * s->h;
++	s->line = m.line;
++	s->frame = which == LCAM_SM_WINDOW ? LCAM_WINDOW_FRAME : m.frame;
++	s->vt_hz = lcam_mode_vt_hz(l, k);
++	s->vt_hz = s->vt_hz ? s->vt_hz : m.vt_pclk;     /* (the laurel_cam_sess.c line says which) */
++	s->line_ns = s->vt_hz ? (uint32_t)(((uint64_t)m.line * 1000000000ull + s->vt_hz / 2) / s->vt_hz) : 0;
++	(void)lcam_table_value(l, k, 0x0901, &bin);
++	s->sensor_w = (uint32_t)s->w * (bin >> 4);
++	s->sensor_h = (uint32_t)s->h * (bin & 0xfu);
++	return true;
++}
++
++/* mean above black and the level 1 in 100 samples are above, both above black, and the highest sample (the session lines) */
++static inline void
++lcam_raw10_levels(const uint8_t *buf, uint32_t w, uint32_t h, uint32_t step, uint32_t black, uint32_t *mean, uint32_t *bright,
++    uint32_t *top)
++{
++	uint32_t hist[64] = { 0 }, n = 0, stride = lcam_raw10_stride(w), above = 0;
++	uint64_t sum = 0;
++
++	*top = 0;
++	*bright = 0;
++	for (uint32_t y = 0; y < h; y += step) {
++		for (uint32_t x = 0; x < w; x += step) {
++			uint32_t v = lcam_raw10_px(buf, stride, x, y);
++
++			v = v > black ? v - black : 0;
++			sum += v;
++			*top = v > *top ? v : *top;
++			hist[v >> 4 > 63 ? 63 : v >> 4]++;
++			n++;
++		}
++	}
++	*mean = n ? (uint32_t)(sum / n) : 0;
++	for (int i = 63; i >= 0; i--) {
++		above += hist[i];
++		if (above * 100 >= n) {
++			*bright = (uint32_t)i * 16 + 8;
++			break;
++		}
++	}
++}
++
++/*
++ * ---- the lens motor's library ----------------------------------------------------------------------------------------
++ * /usr/share/firmware/laurel-camera/libactuator_{dw9800,laurus_dw9800w_qtech}.so, .data [V read from both files, stock vendor]:
++ *   0x80 u32 I2C address (8-bit form, 0x18: DW9800W at 7-bit 0x0c); 0x84 1 = 400 kHz; 0x94 DAC bits (10); 0xa4 position register (3)
++ *   0x15c u32 count of init writes, 0x160 + i x 0x18: u32 register, u32, u32 value (dw9800: 02=02 06=80 07=5e; qtech: 02=02 06=40 07=7a)
++ *   0x180c u16 initial code (381, 150), 0x1810 u16 steps (481, 400): defaults; the module's own calibration is in its EEPROM (not read here)
++ */
++#define LCAM_VCM_MAX_INIT       8u
++#define LCAM_VCM_DATA           0x1c0cu
++struct lcam_vcm_lib {
++	uint8_t         addr7, pos_reg, n;
++	uint8_t         reg[LCAM_VCM_MAX_INIT], val[LCAM_VCM_MAX_INIT];
++	uint16_t        initial, steps;
++};
++
++static inline int
++lcam_vcm_parse(const uint8_t *f, size_t len, struct lcam_vcm_lib *v)
++{
++	uint32_t off, size, n;
++	const uint8_t *d;
++
++	if (!lcam_elf_data(f, len, &off, &size) || size != LCAM_VCM_DATA) {
++		return 1;
++	}
++	d = f + off;
++	n = lcam_le32(d + 0x15c);
++	if (lcam_le32(d + 0x94) != 10 || n == 0 || n > LCAM_VCM_MAX_INIT || lcam_le32(d + 0x80) == 0 || lcam_le32(d + 0x80) > 0xff ||
++	    lcam_le32(d + 0xa4) > 0xff) {
++		return 1;
++	}
++	v->addr7 = (uint8_t)(lcam_le32(d + 0x80) >> 1);
++	v->pos_reg = (uint8_t)lcam_le32(d + 0xa4);
++	v->n = (uint8_t)n;
++	for (uint32_t i = 0; i < n; i++) {
++		v->reg[i] = (uint8_t)lcam_le32(d + 0x160 + i * 0x18u);
++		v->val[i] = (uint8_t)lcam_le32(d + 0x168 + i * 0x18u);
++	}
++	v->initial = lcam_le16(d + 0x180c);
++	v->steps = lcam_le16(d + 0x1810);
++	return v->initial > 1023 ? 1 : 0;
++}
++
++#endif /* LAUREL_CAM_MODE_H */
+diff -ruN a/bsd/dev/laurel_cam_sensor.c b/bsd/dev/laurel_cam_sensor.c
+--- a/bsd/dev/laurel_cam_sensor.c
++++ b/bsd/dev/laurel_cam_sensor.c
+@@ -18,6 +18,7 @@
+ #include "laurel_cam.h"
+ #include "laurel_cam_core.h"
+ #include "laurel_cam_lib.h"
++#include "laurel_cam_mode.h"
+ 
+ extern int topaz_fw_read(const char *path, void **data, size_t *size);
+ extern int topaz_root_mounted(void);
+@@ -134,8 +135,30 @@
+ 	return lcam_cci_write(slot->master, sensor->addr, b, 3);
+ }
+ 
++/* laurel 2773: standby, then the table of mode k (and the preview window of laurel_cam_mode.h); the receive path is off */
+ int
+-lcam_sensor_start(const struct lcam_slot *s, const struct lcam_sensor *chip, const char **why)
++lcam_sensor_mode(int k, bool window)
++{
++	uint32_t writes = 0;
++	int e;
++
++	if (!slot) {
++		return ENODEV;
++	}
++	(void)reg8(0x0100, 0);
++	if ((e = write_table(k, &writes)) != 0) {
++		return e;
++	}
++	for (unsigned i = 0; window && i < sizeof(lcam_window_regs) / sizeof(lcam_window_regs[0]); i++) {
++		if ((e = reg8(lcam_window_regs[i].reg, lcam_window_regs[i].val)) != 0) {
++			return e;
++		}
++	}
++	return 0;
++}
++
++int
++lcam_sensor_start(const struct lcam_slot *s, const struct lcam_sensor *chip, int k, bool window, const char **why)
+ {
+ 	uint8_t a[2], id[2];
+ 	uint32_t writes = 0;
+@@ -153,13 +176,13 @@
+ 		*why = e ? "no chip ID answer after the power-up" : "another chip ID after the power-up";
+ 		return e ? e : ENXIO;
+ 	}
+-	if ((e = write_table(LCAM_LIB_INIT_MODE, &writes)) != 0 || (e = write_table(lib_mode, &writes)) != 0) {
++	if ((e = write_table(LCAM_LIB_INIT_MODE, &writes)) != 0 || (e = lcam_sensor_mode(k, window)) != 0) {
+ 		*why = "a sensor table write failed (CCI)";
+ 		return e;
+ 	}
+ 	(void)reg8(0x0100, 0);                  /* standby until the receive path is ready */
+-	LCAM_SAY("sensor: %s from %s: init + mode %d in %u CCI writes, MCLK %u Hz\n", lib.name, lib_file, lib_mode,
+-	    writes, lcam_mclk_rate(s->mclk));
++	LCAM_SAY("sensor: %s from %s: init %u CCI writes, mode %d%s, MCLK %u Hz\n", lib.name, lib_file, writes, k,
++	    window ? " + preview window" : "", lcam_mclk_rate(s->mclk));
+ 	return 0;
+ }
+ 
+diff -ruN a/bsd/dev/laurel_cam_sess.c b/bsd/dev/laurel_cam_sess.c
+--- a/bsd/dev/laurel_cam_sess.c
++++ b/bsd/dev/laurel_cam_sess.c
+@@ -1,8 +1,9 @@
+ /*
+- * laurel_sprout (Mi A3, SM6125) camera (laurel 2772): one client session of /dev/negronicam, on the stream thread
+- * (laurel_cam_ctl.c): the bring-up of laurel 2771 with the frame length of 30 fps (mode 6 runs at 93.5 fps: its 10 ms
+- * exposure is too short for a room and the CPU ISP cannot use more frames), frames polled from the VFE every 1 ms, exposure
+- * requests of the client between frames, everything off at the end. The AE and white balance run in the client (camera_isp.c).
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2772, 2773): one client session of /dev/negronicam, on the stream thread
++ * (laurel_cam_ctl.c): the bring-up of laurel 2771 in the preview mode at 30 fps, frames polled from the VFE every 1 ms, exposure,
++ * focus and mode requests of the client between frames, everything off at the end. The AE, AF and white balance run in the client
++ * (camera_isp.c, camera_device.c). A photograph: MODE 1 switches the sensor to 4000x3000 without a power-down (the lens stays where
++ * it is), the client takes a frame and asks for MODE 0. A photograph mode without frames goes back to the preview: only it is off.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -19,12 +20,22 @@
+ 
+ #define NO_FRAME_FIRST_MS       2000u
+ #define NO_FRAME_MS             1000u
++#define START_EXP_NS            (16000000ull * 2u)      /* no session yet: 16 ms x 2 */
++#define EFFECT_FRAMES           2u                      /* [I] a sensor write between frames n and n + 1 shows in frame n + 2 */
++
++struct sess {
++	struct lcam_nc_limits lim;
++	uint32_t line_ns, lines, gain, frame, settle;
++	uint32_t eff[EFFECT_FRAMES][3];         /* what the frames in the sensor's pipe were exposed with: [0] is the newest frame's */
++	unsigned up;
++};
+ 
+ static void
+-session_end(const char *why, unsigned up, const struct lcam_nc_ring *r, uint32_t errors, uint32_t bits, bool fault)
++session_end(const char *why, unsigned up, const struct lcam_nc_ring *r, uint64_t reads, uint32_t errors, uint32_t bits, bool fault)
+ {
+ 	char line[sizeof(st.line)];
+ 
++	lcam_vcm_off();
+ 	lcam_stream_down(up);
+ 	lck_mtx_lock(&ld_lock);
+ 	d.running = false;
+@@ -37,59 +48,137 @@
+ 	st.runs++;
+ 	st.busy = false;
+ 	lck_mtx_unlock(&lst_lock);
+-	snprintf(line, sizeof(line), "ios session: end (%s) after %llu frames, %llu read over, VFE errors %u (%#x)%s", why,
+-	    r->frames, r->lost, errors, bits, fault ? "; FAULT: /dev/negronicam answers EIO until reboot" : "");
++	snprintf(line, sizeof(line), "ios session: end (%s) after %llu frames, %llu read, VFE errors %u (%#x)%s", why,
++	    r->frames, reads, errors, bits, fault ? "; FAULT: /dev/negronicam answers EIO until reboot" : "");
+ 	lcam_stream_say(line);
+ }
+ 
+-/* one client session, on the stream thread: from the first read to the last close or 1 s without a read */
++/* the limits of the mode selected, and the exposure in it nearest exp_ns (time x gain/256) */
++static void
++sess_mode(struct sess *x, uint64_t exp_ns)
++{
++	const struct lcam_smode *m = &st.sm[st.cur];
++
++	x->line_ns = m->line_ns;
++	x->lim.frame_min = lcam_nc_frame_lines(m->frame, x->line_ns, LCAM_NC_FPS);
++	x->lim.frame_max = x->lim.frame_min * LCAM_NC_FRAME_MULT;
++	x->lim.frame_max = x->lim.frame_max > 0xfff0u ? 0xfff0u : x->lim.frame_max;
++	x->lim.margin = LCAM_NC_MARGIN;
++	x->lines = x->line_ns ? (uint32_t)(exp_ns * 256u / x->gain / x->line_ns) : 0;
++	x->frame = 0;
++	lcam_nc_clamp(&x->lim, &x->lines, &x->gain, &x->frame);
++	for (unsigned i = 0; i < EFFECT_FRAMES; i++) {
++		x->eff[i][0] = x->lines;
++		x->eff[i][1] = x->gain;
++		x->eff[i][2] = x->frame;
++	}
++}
++
++/* publish the mode to the readers (lock held) */
++static void
++sess_publish(const struct sess *x)
++{
++	lcam_nc_ring_init(&d.ring);
++	d.lim = x->lim;
++	d.line_ns = x->line_ns;
++	d.lines = x->lines;
++	d.gain = x->gain;
++	d.frame = x->frame;
++	d.given = 0;
++	d.mode = st.cur == LCAM_SM_STILL ? 1 : 0;
++	d.sensor_w = st.sm[st.cur].sensor_w;
++	d.sensor_h = st.sm[st.cur].sensor_h;
++	d.focus = lcam_vcm_running() ? lcam_vcm_pos() : LCAM_NC_NO_FOCUS;
++	d.running = true;
++}
++
++/* to another session mode, sensor powered, lens where it is: 0, or an error with the path left off (the caller ends the session) */
++static int
++sess_switch(struct sess *x, unsigned to, const char **why)
++{
++	uint64_t exp_ns = (uint64_t)x->lines * x->line_ns * x->gain / 256u;
++	uint32_t wait_ms = x->frame * x->line_ns / 1000000u + 2u;
++	int e;
++
++	lck_mtx_lock(&ld_lock);
++	d.running = false;
++	for (unsigned t = 0; d.ring.reading >= 0 && t < 2000; t++) {
++		lck_mtx_unlock(&ld_lock);
++		lcam_sleep_ms(1);
++		lck_mtx_lock(&ld_lock);
++	}
++	lck_mtx_unlock(&ld_lock);
++	(void)lcam_sensor_stream(false);
++	lcam_sleep_ms(wait_ms > 150 ? 150 : wait_ms);
++	lcam_stream_path_off(&x->up);
++	lcam_mode_select(to);
++	if ((e = lcam_sensor_mode(st.sm[to].k, st.sm[to].window)) != 0) {
++		*why = "a sensor table write failed (CCI)";
++		return e;
++	}
++	if ((e = lcam_stream_path_on(&x->up, x->settle, why)) != 0) {
++		return e;
++	}
++	lcam_tail_clear();
++	sess_mode(x, exp_ns);
++	(void)lcam_sensor_frame_exposure(x->lines, lcam_nc_gain_code(x->gain), x->frame);
++	lck_mtx_lock(&ld_lock);
++	sess_publish(x);
++	lck_mtx_unlock(&ld_lock);
++	(void)lcam_sensor_stream(true);
++	return 0;
++}
++
++static void
++say_levels(uint64_t frames, uint64_t ms, uint64_t reads, const struct sess *x, unsigned latest, uint32_t errors, uint32_t bits)
++{
++	uint32_t mean, bright, top;
++
++	lcam_raw10_levels(st.va[latest], LST_W, LST_H, 8, LCAM_NC_BLACK, &mean, &bright, &top);
++	LCAM_SAY("ios session: %llu frames in %llu ms, %llu read, %ux%u exposure %u lines (%u us) gain %u/256, frame %u lines; above black: "
++	    "mean %u, 1%% over %u, top %u; VFE errors %u (%#x)\n", frames, ms, reads, LST_W, LST_H, x->lines,
++	    (uint32_t)((uint64_t)x->lines * x->line_ns / 1000u), x->gain, x->frame, mean, bright, top, errors, bits);
++}
++
++/* one client session, on the stream thread: from the first read to the last close or 3 s without a read */
+ void
+ lcam_dev_session(void)
+ {
++	struct sess x = { .up = 0 };
+ 	struct lcam_nc_ring ring;
+ 	struct lcam_clk_info ci = { 0, 0, 0, 0 };
+-	const char *why = "";
+-	unsigned up = 0;
+-	uint32_t settle = 0, errors = 0, bits = 0, slot, err, refill, lines, gain, frame;
+-	struct lcam_nc_limits lim;
+-	uint32_t line_ns = lcam_nc_line_ns(st.m.line, st.m.vt_pclk);
+-	uint64_t started, last;
+-	bool fault = false;
+-	const char *end = "closed";
++	const char *why = "", *end = "closed";
++	uint32_t errors = 0, bits = 0, slot, err, refill;
++	uint64_t started, last, reads = 0, exp_ns = st.last_exp_ns ? st.last_exp_ns : START_EXP_NS, shown = 0;
++	bool fault = false, tail_done = false;
+ 
+ 	lck_mtx_lock(&lst_lock);
+ 	st.busy = true;
+ 	st.gen++;
+ 	st.kept = -1;
+ 	lck_mtx_unlock(&lst_lock);
+-	lim.frame_min = lcam_nc_frame_lines(st.m.frame, line_ns, LCAM_NC_FPS);
+-	lim.frame_max = lim.frame_min * LCAM_NC_FRAME_MULT;
+-	lim.margin = LCAM_NC_MARGIN;
+-	LCAM_SAY("ios session: start (rear %s %ux%u, line %u ns, frame %u lines = %u fps)\n", st.chip->name, LST_W, LST_H,
+-	    line_ns, lim.frame_min, line_ns ? (uint32_t)(1000000000ull / ((uint64_t)lim.frame_min * line_ns)) : 0);
+-	if (lcam_stream_up(&up, &ci, &settle, &why) != 0) {
++	lcam_mode_select(st.preview);
++	x.gain = 2u * LCAM_NC_GAIN_UNITY;
++	sess_mode(&x, exp_ns);
++	LCAM_SAY("ios session: start (rear %s %ux%u, line %u ns, frame %u lines = %u fps, photograph mode %s)\n", st.chip->name, LST_W, LST_H,
++	    x.line_ns, x.lim.frame_min, x.line_ns ? (uint32_t)(1000000000ull / ((uint64_t)x.lim.frame_min * x.line_ns)) : 0,
++	    st.still_ok ? "on" : "off");
++	if (lcam_stream_up(&x.up, &ci, &x.settle, &why) != 0) {
+ 		LCAM_SAY("ios session: off: %s\n", why);
+ 		lcam_nc_ring_init(&ring);
+-		session_end("the bring-up failed", up, &ring, 0, 0, true);
++		session_end("the bring-up failed", x.up, &ring, 0, 0, 0, true);
+ 		return;
+ 	}
+-	/* from the exposure the last run ended with (x1024 -> x256) */
+-	lines = st.ae.lines ? st.ae.lines : lim.frame_min - lim.margin;
+-	gain = st.ae.gain ? st.ae.gain / 4u : 4u * LCAM_NC_GAIN_UNITY;
+-	frame = 0;
+-	lcam_nc_clamp(&lim, &lines, &gain, &frame);
+-	(void)lcam_sensor_frame_exposure(lines, lcam_nc_gain_code(gain), frame);
+-	lcam_nc_ring_init(&ring);
++	lcam_vcm_on(st.slot->master);
++	lcam_tail_clear();
++	(void)lcam_sensor_frame_exposure(x.lines, lcam_nc_gain_code(x.gain), x.frame);
+ 	lck_mtx_lock(&ld_lock);
+-	d.ring = ring;
+-	d.lim = lim;
+-	d.line_ns = line_ns;
+-	d.lines = lines;
+-	d.gain = gain;
+-	d.frame = frame;
+-	d.given = 0;
++	sess_publish(&x);
++	lcam_vcm_range(&d.focus_min, &d.focus_max);
++	d.reads = 0;
+ 	d.ask.pending = false;
+-	d.running = true;
++	d.ask.focus_pending = false;
++	d.ask.mode = 0;
+ 	d.last_read_ms = lcam_dev_ms();
+ 	lck_mtx_unlock(&ld_lock);
+ 	(void)lcam_sensor_stream(true);
+@@ -103,34 +192,77 @@
+ 			bits |= err;
+ 		}
+ 		lck_mtx_lock(&ld_lock);
+-		bool open = d.opened, idle = now - d.last_read_ms > LCAM_DEV_IDLE_MS, ask = false;
+-		uint32_t al = d.ask.lines, ag = d.ask.gain, af = d.ask.frame;
++		bool open = d.opened, idle = now - d.last_read_ms > LCAM_DEV_IDLE_MS, ask = false, move = d.ask.focus_pending;
++		uint32_t al = d.ask.lines, ag = d.ask.gain, af = d.ask.frame, to = d.ask.focus, want = d.ask.mode;
+ 		uint64_t frames = d.ring.frames;
++
++		d.ask.focus_pending = false;
+ 		if (got) {
+-			bool fresh = lcam_nc_ring_done(&d.ring, slot, &refill);
++			lcam_nc_ring_done(&d.ring, slot, &refill);
+ 			lcam_vfe_refill(slot, (uint32_t)st.pa[refill]);
+-			if (fresh) {
+-				d.time = mach_absolute_time();
+-				last = now;
+-				frames = d.ring.frames;
++			d.time = mach_absolute_time();
++			last = now;
++			frames = d.ring.frames;
++			for (unsigned i = 0; i + 1 < EFFECT_FRAMES; i++) {
++				memcpy(x.eff[i], x.eff[i + 1], sizeof(x.eff[i]));
+ 			}
++			x.eff[EFFECT_FRAMES - 1][0] = x.lines;
++			x.eff[EFFECT_FRAMES - 1][1] = x.gain;
++			x.eff[EFFECT_FRAMES - 1][2] = x.frame;
++			d.lines = x.eff[0][0];
++			d.gain = x.eff[0][1];
++			d.frame = x.eff[0][2];
+ 			ask = d.ask.pending;
+ 			d.ask.pending = false;
+ 		}
+ 		ring = d.ring;
++		reads = d.reads;
+ 		lck_mtx_unlock(&ld_lock);
+ 		if (!open || idle) {
+ 			end = open ? "nobody reads" : "closed";
+ 			break;
+ 		}
++		if (move) {
++			lcam_vcm_move(to);
++			lck_mtx_lock(&ld_lock);
++			d.focus = lcam_vcm_running() ? lcam_vcm_pos() : LCAM_NC_NO_FOCUS;
++			lck_mtx_unlock(&ld_lock);
++		}
++		unsigned kind = st.cur == LCAM_SM_STILL ? 1 : 0;
++
++		if (want != kind && (st.still_ok || want == 0)) {
++			unsigned next = want ? LCAM_SM_STILL : st.preview;
++
++			if (sess_switch(&x, next, &why) != 0) {
++				LCAM_SAY("ios session: off: mode switch: %s\n", why);
++				end = "the mode switch failed";
++				fault = true;
++				break;
++			}
++			last = lcam_dev_ms();
++			tail_done = false;
++			continue;
++		}
+ 		if (!got) {
+ 			if (now - last > (frames ? NO_FRAME_MS : NO_FRAME_FIRST_MS)) {
+ 				uint32_t pk, ecc, crc, irq, phy;
+ 				char vn[96];
++
+ 				lcam_csid_counts(&pk, &ecc, &crc, &irq, &phy);
+ 				lcam_vfe_note(vn, sizeof(vn));
+-				LCAM_SAY("ios session: no frame for %llu ms (CSID packets %u ECC %u CRC %u irq %#x, CSIPHY status "
+-				    "%#x, ISPIF %#x, %s)\n", now - last, pk, ecc, crc, irq, phy, lcam_ispif_status(), vn);
++				LCAM_SAY("ios session: no frame for %llu ms in mode %u (CSID packets %u ECC %u CRC %u irq %#x, CSIPHY status "
++				    "%#x, ISPIF %#x, %s)\n", now - last, st.cur, pk, ecc, crc, irq, phy, lcam_ispif_status(), vn);
++				if (st.cur == LCAM_SM_STILL) {
++					st.still_ok = false;
++					LCAM_SAY("photograph mode: off: no frames: photographs from the preview frames\n");
++					lck_mtx_lock(&ld_lock);
++					d.ask.mode = 0;
++					lck_mtx_unlock(&ld_lock);
++					if (sess_switch(&x, st.preview, &why) == 0) {
++						last = lcam_dev_ms();
++						continue;
++					}
++				}
+ 				end = "no frame";
+ 				fault = true;
+ 				break;
+@@ -138,30 +270,30 @@
+ 			lcam_sleep_ms(1);
+ 			continue;
+ 		}
++		if (!tail_done) {
++			tail_done = true;
++			if (!lcam_tail_check(st.va[ring.latest])) {
++				LCAM_SAY("ios session: mode %u: the first frame is not %ux%u\n", st.cur, LST_W, LST_H);
++			}
++		}
+ 		if (ask) {
+-			lcam_nc_clamp(&lim, &al, &ag, &af);
+-			if ((al != lines || ag != gain || af != frame) &&
++			lcam_nc_clamp(&x.lim, &al, &ag, &af);
++			if ((al != x.lines || ag != x.gain || af != x.frame) &&
+ 			    lcam_sensor_frame_exposure(al, lcam_nc_gain_code(ag), af) == 0) {
+-				/* [I] takes effect 2 frames later; the header says it now, as 0318 */
+-				lines = al;
+-				gain = ag;
+-				frame = af;
+-				lck_mtx_lock(&ld_lock);
+-				d.lines = lines;
+-				d.gain = gain;
+-				d.frame = frame;
+-				lck_mtx_unlock(&ld_lock);
++				x.lines = al;
++				x.gain = ag;
++				x.frame = af;
+ 			}
+ 		}
+-		if (frames == 30 || (frames && frames % 900 == 0)) {
+-			LCAM_SAY("ios session: %llu frames in %llu ms, %llu read over, exposure %u lines gain %u/256, frame %u lines, "
+-			    "mean %u, VFE errors %u (%#x)\n", frames, now - started, ring.lost, lines, gain, frame,
+-			    lcam_raw10_mean(st.va[ring.latest], LST_W, LST_H, 40), errors, bits);
++		if (frames != shown && (frames == 30 || (frames && frames % 900 == 0))) {
++			shown = frames;
++			say_levels(frames, now - started, reads, &x, ring.latest, errors, bits);
+ 		}
+ 	}
+ 	/* a read still copying only reads memory that stays allocated; the VFE stops writing in the teardown */
+-	st.ae.lines = st.ae.max_lines && lines > st.ae.max_lines ? st.ae.max_lines : lines;
+-	st.ae.gain = gain * 4u;
+-	session_end(end, up, &ring, errors, bits, fault);
++	if (ring.frames > 30) {
++		st.last_exp_ns = (uint64_t)x.lines * x.line_ns * x.gain / 256u;
++	}
++	session_end(end, x.up, &ring, reads, errors, bits, fault);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_cam_st.h b/bsd/dev/laurel_cam_st.h
+--- a/bsd/dev/laurel_cam_st.h
++++ b/bsd/dev/laurel_cam_st.h
+@@ -8,12 +8,15 @@
+ #include "laurel_cam_lib.h"
+ #include "laurel_cam_rdi.h"
+ #include "laurel_cam_dev.h"
++#include "laurel_cam_mode.h"
+ 
+-#define LST_NBUF            3
+-#define LST_W               1280u
+-#define LST_H               720u
+-#define LST_STRIDE          1600u                   /* lcam_raw10_stride(LST_W) */
+-#define LST_BYTES           (LST_STRIDE * LST_H)
++#define LST_NBUF            4                       /* laurel 2773: 2 in the VFE, the latest, 1 while a reader has the latest */
++/* laurel 2773: the size of the mode selected (laurel_cam_mode.h) */
++#define LST_W               ((uint32_t)st.sm[st.cur].w)
++#define LST_H               ((uint32_t)st.sm[st.cur].h)
++#define LST_STRIDE          (st.sm[st.cur].stride)
++#define LST_BYTES           (st.sm[st.cur].bytes)
++#define LST_SLACK           (64u * 1024u)           /* past the largest frame: a longer frame does not reach the next buffer */
+ #define LST_XML_ASSIGN      0x4320u                 /* camera_config.xml rear: CSIPHY lanes of D0..D3 */
+ #define LST_VERT_OFFSET     48u                     /* sensor library exp_gain_info vert_offset (.data 0x5fcc) */
+ 
+@@ -21,7 +24,12 @@
+ 	const struct lcam_slot *slot;
+ 	const struct lcam_sensor *chip;
+ 	const struct lcam_lib *lib;
+-	struct lcam_mode m;
++	struct lcam_mode m;                     /* of the mode selected */
++	struct lcam_smode sm[LCAM_SM_N];        /* laurel 2773 */
++	unsigned cur, preview;                  /* the mode selected; the best preview mode that works */
++	bool still_ok, size_ok;                 /* a photograph mode fits and works; the last capture's frames had the mode's size */
++	uint32_t cap;                           /* bytes of a buffer */
++	uint64_t last_exp_ns;                   /* laurel 2773: exposure x gain/256 of the last session, 0: none */
+ 	uint64_t pa[LST_NBUF];
+ 	uint8_t *va[LST_NBUF];
+ 	bool off, busy, request, tpg;           /* off = no more runs this boot */
+@@ -37,7 +45,7 @@
+ void lcam_stream_say(const char *s);
+ 
+ /* laurel 2772: /dev/negronicam (laurel_cam_dev.c, laurel_cam_sess.c); all fields under lcam_dev_lock */
+-#define LCAM_DEV_IDLE_MS        3000u           /* no read for this long: the session ends */
++#define LCAM_DEV_IDLE_MS        6000u           /* no read for this long: the session ends (laurel 2773: a 12 MP photograph on the CPU holds the reader for seconds) */
+ struct lcam_dev_state {
+ 	bool opened, want, running, broken;
+ 	uint64_t last_read_ms, given;
+@@ -49,11 +57,21 @@
+ 	struct {
+ 		bool pending;
+ 		uint32_t lines, gain, frame;
++		bool focus_pending;
++		uint32_t focus;
++		uint32_t mode;                  /* laurel 2773: 0 preview, 1 photograph */
+ 	} ask;
++	uint64_t reads;                         /* frames given to the reader */
++	uint32_t mode, focus, focus_min, focus_max, sensor_w, sensor_h;
+ };
+ extern struct lcam_dev_state lcam_dev;
+ #define ld_lock lcam_dev_lock
+ extern lck_mtx_t lcam_dev_lock;
+ uint64_t lcam_dev_ms(void);
++void lcam_mode_select(unsigned which);
++void lcam_tail_clear(void);
++bool lcam_tail_check(const uint8_t *buf);
++int lcam_stream_path_on(unsigned *up, uint32_t settle, const char **why);
++void lcam_stream_path_off(unsigned *up);
+ 
+ #endif /* LAUREL_CAM_ST_H */
+diff -ruN a/bsd/dev/laurel_cam_stream.c b/bsd/dev/laurel_cam_stream.c
+--- a/bsd/dev/laurel_cam_stream.c
++++ b/bsd/dev/laurel_cam_stream.c
+@@ -2,7 +2,7 @@
+  * laurel_sprout (Mi A3, SM6125) camera (laurel 2771), step 2: rear camera RDI raw frames.
+  * Thread (started by the step 1 scan when the rear sensor answered):
+  *   1. waits for the root (the sensor tables come from the stock library there, laurel_cam_sensor.c);
+- *   2. 3 frame buffers of 1280x720 RAW10 (1600 x 720 bytes) from the GPU pool (contiguous, below 4 GiB, Normal NC:
++ *   2. laurel 2773: 4 frame buffers of the largest mode from the GPU pool (contiguous, below 4 GiB, Normal NC:
+  *      the CPU reads what the VFE wrote without cache maintenance), apps SMMU streams 0x420 (mask 0) and 0x421
+  *      (mask 2) identity (topaz_smmu_identity: the VFE writes physical addresses);
+  *   3. one capture run of 2 s (the self-check): sensor on, VFE0 RDI0 + ISPIF + CSID1 + CSIPHY1, stream on, frames
+@@ -138,6 +138,94 @@
+ 	r->fps10 = lcam_fps10(r->frames, r->first, r->last);
+ }
+ 
++/* laurel 2773: which session mode the next bring-up or switch uses: the sizes (LST_*) and st.m follow it */
++void
++lcam_mode_select(unsigned which)
++{
++	const struct lcam_smode *sm = &st.sm[which];
++
++	st.cur = which;
++	(void)lcam_lib_mode(st.lib, (uint32_t)sm->k, &st.m);
++	st.m.frame = (uint16_t)sm->frame;
++	st.m.w = sm->w;
++	st.m.h = sm->h;
++}
++
++/*
++ * laurel 2773: the self-check of a mode's size. The write master stops only at the frame's end: the last line of a frame of the right
++ * size is written (black is 64, never 0), and the line after it is not. Frames shorter or longer are the sensor's answer to a window
++ * it does not take. The buffers are larger than any frame by LST_SLACK.
++ */
++void
++lcam_tail_clear(void)
++{
++	uint32_t tail = LST_BYTES - LST_STRIDE, n = 2 * LST_STRIDE;
++
++	for (unsigned i = 0; i < LST_NBUF; i++) {
++		if (tail + n <= st.cap) {
++			bzero(st.va[i] + tail, n);
++		}
++	}
++}
++
++bool
++lcam_tail_check(const uint8_t *buf)
++{
++	uint32_t tail = LST_BYTES - LST_STRIDE, seen = 0, past = 0;
++
++	if (tail + 2 * LST_STRIDE > st.cap) {
++		return true;                    /* (no room past it: the stock mode, the buffer is exactly its size) */
++	}
++	for (uint32_t i = 0; i < LST_STRIDE; i += 64) {
++		seen += buf[tail + i] != 0;
++		past += buf[tail + LST_STRIDE + i] != 0;
++	}
++	return seen * 2 > LST_STRIDE / 64 && past == 0;
++}
++
++/* laurel 2773: the receive path of one mode (VFE, ISPIF, CSID, CSIPHY) on and off; also for a switch without a sensor power-down */
++int
++lcam_stream_path_on(unsigned *up, uint32_t settle, const char **why)
++{
++	int e;
++
++	if ((e = lcam_vfe_on((uint32_t)st.pa[0], (uint32_t)st.pa[1], why)) != 0) {
++		return e;
++	}
++	*up |= S_VFE;
++	if ((e = lcam_ispif_on(why)) != 0) {
++		return e;
++	}
++	*up |= S_ISPIF;
++	if ((e = lcam_csid_on(st.lib->lanes, LST_XML_ASSIGN, st.m.dt, st.m.decode, false, (uint16_t)LST_W, (uint16_t)LST_H, why)) != 0) {
++		return e;
++	}
++	*up |= S_CSID;
++	if ((e = lcam_csiphy_on(st.lib->lanes, settle, why)) != 0) {
++		return e;
++	}
++	*up |= S_PHY;
++	return 0;
++}
++
++void
++lcam_stream_path_off(unsigned *up)
++{
++	if (*up & S_VFE) {
++		lcam_vfe_off();
++	}
++	if (*up & S_ISPIF) {
++		lcam_ispif_off();
++	}
++	if (*up & S_CSID) {
++		lcam_csid_off();
++	}
++	if (*up & S_PHY) {
++		lcam_csiphy_off();
++	}
++	*up &= ~(unsigned)(S_VFE | S_ISPIF | S_CSID | S_PHY);
++}
++
+ /* laurel 2772: everything up to "stream on" (also for the iOS session, laurel_cam_dev.c); on failure the caller tears *up down */
+ int
+ lcam_stream_up(unsigned *up_out, struct lcam_clk_info *ci, uint32_t *settle_out, const char **why)
+@@ -155,20 +243,11 @@
+ 	}
+ 	if (e == 0) {
+ 		up |= S_SENSOR;                 /* (the power-up list runs inside: its down list on any failure) */
+-		e = lcam_sensor_start(st.slot, st.chip, why);
++		e = lcam_sensor_start(st.slot, st.chip, st.sm[st.cur].k, st.sm[st.cur].window, why);
+ 	}
+ 	settle = lcam_settle(st.lib->settle, ci->timer_hz);
+-	if (e == 0 && (e = lcam_vfe_on((uint32_t)st.pa[0], (uint32_t)st.pa[1], why)) == 0) {
+-		up |= S_VFE;
+-	}
+-	if (e == 0 && (e = lcam_ispif_on(why)) == 0) {
+-		up |= S_ISPIF;
+-	}
+-	if (e == 0 && (e = lcam_csid_on(st.lib->lanes, LST_XML_ASSIGN, st.m.dt, st.m.decode, false, LST_W, LST_H, why)) == 0) {
+-		up |= S_CSID;
+-	}
+-	if (e == 0 && (e = lcam_csiphy_on(st.lib->lanes, settle, why)) == 0) {
+-		up |= S_PHY;
++	if (e == 0) {
++		e = lcam_stream_path_on(&up, settle, why);
+ 	}
+ 	*up_out = up;
+ 	*settle_out = settle;
+@@ -210,10 +289,12 @@
+ 		st.ae.lines = st.ae.max_lines;
+ 		st.ae.gain = 4 * LCAM_GAIN_ONE;         /* indoor start; the AE goes from here */
+ 	}
++	lcam_tail_clear();
+ 	(void)lcam_sensor_exposure(st.ae.lines, lcam_gain_code(st.ae.gain));
+ 	(void)lcam_sensor_stream(true);
+ 	collect(&r, ms, true);
+ 	(void)lcam_sensor_stream(false);
++	st.size_ok = r.frames > 0 && r.latest < LST_NBUF && lcam_tail_check(st.va[r.latest]);
+ 	if (r.frames == 0) {
+ 		uint32_t pk, ecc, crc, irq, phy;
+ 		char vn[96];
+@@ -233,9 +314,12 @@
+ 		r = t;
+ 		st.tpg = true;
+ 	} else {
+-		snprintf(line, len, "%ux%u RAW10 at %u.%u fps, frame %u (kept for camframe), mean %u, exposure %u lines "
+-		    "gain %u.%02ux, VFE errors %u (%#x); %s, MCLK %u Hz, CSIPHY1 %u lanes settle %#x (timer %u MHz), "
+-		    "VFE %u MHz, buffers %#llx", LST_W, LST_H, r.fps10 / 10, r.fps10 % 10, r.frames, st.mean, st.ae.lines,
++		uint32_t lm = 0, lb = 0, lt = 0;
++
++		lcam_raw10_levels(st.va[r.latest], LST_W, LST_H, 8, LCAM_AE_BLACK, &lm, &lb, &lt);
++		snprintf(line, len, "%ux%u RAW10%s at %u.%u fps, frame %u (kept for camframe), above black: mean %u, 1%% over %u, top %u; "
++		    "exposure %u lines gain %u.%02ux, VFE errors %u (%#x); %s, MCLK %u Hz, CSIPHY1 %u lanes settle %#x (timer %u MHz), "
++		    "VFE %u MHz, buffers %#llx", LST_W, LST_H, st.size_ok ? "" : " NOT OF THIS SIZE", r.fps10 / 10, r.fps10 % 10, r.frames, lm, lb, lt, st.ae.lines,
+ 		    st.ae.gain / 1024, (st.ae.gain % 1024) * 100 / 1024, r.errors, r.err_bits, lcam_sensor_file(),
+ 		    lcam_mclk_rate(st.slot->mclk), st.lib->lanes, settle, ci.timer_hz / 1000000, ci.vfe_hz / 1000000,
+ 		    st.pa[0]);
+diff -ruN a/bsd/dev/laurel_cam_vcm.c b/bsd/dev/laurel_cam_vcm.c
+--- a/bsd/dev/laurel_cam_vcm.c
++++ b/bsd/dev/laurel_cam_vcm.c
+@@ -0,0 +1,139 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) camera (laurel 2773): the rear lens motor, DW9800W at 7-bit 0x0c on CCI M0 (the sensor's master),
++ * powered with the sensor (VAF, gpio 123). Numbers from the stock actuator library on the root (laurel_cam_mode.h); which library:
++ * the depth camera tells the module set (camera_config.xml: OV02A10 goes with the sunny rear module and libactuator_dw9800, GC2375H
++ * with the qtech one). Used only on the stream thread (the CCI has no lock). A failure turns off focus only: the frames say NO_FOCUS.
++ * Lines: "LAUREL CAMERA: focus: on: ..." or "LAUREL CAMERA: focus: off: <reason>".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include "laurel_cam.h"
++#include "laurel_cam_core.h"
++#include "laurel_cam_mode.h"
++
++extern int topaz_fw_read(const char *path, void **data, size_t *size);
++
++#define LIB_DIR         "/usr/share/firmware/laurel-camera/"
++#define POS_MIN         48u             /* off the stops: the whole stroke, as the module's calibration is not read */
++#define POS_MAX         960u
++#define LAND_STEP       48u
++
++static struct lcam_vcm_lib vl;
++static bool loaded, running, said_off;
++static unsigned master;
++static uint32_t pos;
++
++void
++lcam_vcm_load(bool sunny)
++{
++	static const char *const files[2] = { "libactuator_laurus_dw9800w_qtech.so", "libactuator_dw9800.so" };
++	char path[128];
++	void *data = NULL;
++	size_t size = 0;
++	int e;
++
++	snprintf(path, sizeof(path), LIB_DIR "%s", files[sunny ? 1 : 0]);
++	if ((e = topaz_fw_read(path, &data, &size)) != 0) {
++		LCAM_SAY("focus: off: no %s (error %d; root step root-camera.sh)\n", path, e);
++		return;
++	}
++	if (lcam_vcm_parse(data, size, &vl) != 0) {
++		LCAM_SAY("focus: off: %s: another layout\n", files[sunny ? 1 : 0]);
++		return;
++	}
++	loaded = true;
++	pos = vl.initial < POS_MIN ? POS_MIN : vl.initial > POS_MAX ? POS_MAX : vl.initial;
++	LCAM_SAY("focus: %s: DW9800 at %#x, init %u writes, initial code %u, %u steps\n", files[sunny ? 1 : 0], vl.addr7, vl.n,
++	    vl.initial, vl.steps);
++}
++
++static int
++put(uint32_t p)
++{
++	uint8_t b[3] = { vl.pos_reg, (uint8_t)(p >> 8), (uint8_t)p };
++
++	return lcam_cci_write(master, vl.addr7, b, 3);
++}
++
++/* after the sensor's power-up: the motor's settings, then the lens where it was at the end of the last session */
++void
++lcam_vcm_on(unsigned m)
++{
++	uint8_t reg = 2, got = 0xff;
++	int e = ENODEV;
++
++	master = m;
++	if (!loaded) {
++		return;
++	}
++	for (unsigned i = 0; i < vl.n; i++) {
++		uint8_t b[2] = { vl.reg[i], vl.val[i] };
++
++		if ((e = lcam_cci_write(m, vl.addr7, b, 2)) != 0) {
++			break;
++		}
++	}
++	e = e ? e : put(pos);
++	if (e != 0) {
++		if (!said_off) {
++			said_off = true;
++			LCAM_SAY("focus: off: no answer at %#x on CCI M%u (error %d): fixed focus\n", vl.addr7, m, e);
++		}
++		return;
++	}
++	running = true;
++	(void)lcam_cci_write_read(m, vl.addr7, &reg, 1, &got, 1);
++	LCAM_SAY("focus: on: DAC %u..%u, at %u, control %#x\n", POS_MIN, POS_MAX, pos, got);
++}
++
++bool
++lcam_vcm_running(void)
++{
++	return running;
++}
++
++uint32_t
++lcam_vcm_pos(void)
++{
++	return pos;
++}
++
++void
++lcam_vcm_range(uint32_t *lo, uint32_t *hi)
++{
++	*lo = POS_MIN;
++	*hi = POS_MAX;
++}
++
++void
++lcam_vcm_move(uint32_t p)
++{
++	if (!running) {
++		return;
++	}
++	p = p < POS_MIN ? POS_MIN : p > POS_MAX ? POS_MAX : p;
++	if (put(p) == 0) {
++		pos = p;
++	}
++}
++
++/* before the sensor's power goes: the lens set down step by step, so that it does not knock against its stop */
++void
++lcam_vcm_off(void)
++{
++	uint32_t p = pos;
++
++	if (!running) {
++		return;
++	}
++	while (p > POS_MIN + LAND_STEP) {
++		p -= LAND_STEP;
++		(void)put(p);
++		lcam_sleep_ms(2);
++	}
++	running = false;                        /* (pos stays: the next session starts there) */
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

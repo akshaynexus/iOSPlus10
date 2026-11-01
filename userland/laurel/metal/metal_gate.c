@@ -5,8 +5,9 @@
  * its log there failed and no list could be written (boot 2026-11-01 15:27: no "exec m2vtest" in the log, AegirPoster aborts).
  *
  * The root's default list (/var/db/negronimetal/clients, scripts/laurel/root-add-metal.sh) is the probes only, because a
- * Metal device that half works makes CoreAnimation draw nothing. This gate widens it to "* -backboardd" (every process
- * but the GL window server) only when, in this order:
+ * Metal device that half works makes CoreAnimation draw nothing. This gate widens it to "* -backboardd -mediaserverd" (every process
+ * but the GL window server and the camera's mediaserverd: with a device, CMCapture's GPU path grew it by 2.6 GB in 9 s and the kernel
+ * killed it, boot 2026-11-01 18:40, docs/laurel_sprout/camera.md section 10) only when, in this order:
  *   1. the kernel has the GPU on (sysctl kern.laurel_gpu "on", laurel 2155) with the stage-1 SMMU tables (RedwoodGPU
  *      property LaurelGPUSMMU = "stage 1": in pass-through only backboardd may open the GPU, laurel 2150/2154);
  *   2. the kernel registered the plug-in (IOAcceleratorES MetalPluginName = NegroniMetal, laurel 2850);
@@ -52,7 +53,7 @@
 #define QC_LIB    "/System/Library/Frameworks/QuartzCore.framework/default.metallib"
 #define MARK      "# laurel-metal-gate"
 #define PROBES    "metalprobe m2vtest carenderprobe layerprobe"
-#define WIDE      "* -backboardd"
+#define WIDE      "* -backboardd -mediaserverd"
 #define PASS      "compute bad 0/1000, render bad 0/64, import bad 0/4096"
 #define WAIT_S    90            /* for the GPU and the plug-in registration after boot */
 #define QUICK_S   300           /* the self-test while the system boots (seconds when the system is idle) */

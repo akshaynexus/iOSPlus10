@@ -457,6 +457,13 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 		if (original != NULL && (uintptr_t)original == r->expected + slide) {
 			memcpy(&first, (const void *)original, sizeof(first));
 		}
+		if (original == NULL && r->original == &original_log_active_sinks) {
+			/* laurel 2773: only a better log for a trap that did not come; in this image the method is not found by name [V boot 18:40] */
+			left_alone++;
+			say("negroni: camera hooks: %c[%s %s] is not found by name: the graph-stop log stays stock (not a fault)\n",
+			    r->instance ? '-' : '+', r->class_name, r->selector);
+			continue;
+		}
 		if (original == NULL || (uintptr_t)original != r->expected + slide || first != r->first) {
 			left_alone++;
 			say("negroni: camera hooks: %c[%s %s]: found %#lx (first word %#x), expected %#lx (%#x); left alone\n",

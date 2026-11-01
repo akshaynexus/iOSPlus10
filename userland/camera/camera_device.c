@@ -48,6 +48,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <math.h>
 #include <pthread.h>
@@ -55,8 +56,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 #include <os/log.h>
+#include <objc/runtime.h>
 #include "camera_isp.h"
 
 /* userland/laurel/camera/build.sh (Mi A3): the rear IMX586 at 1280x720, kernel patch 2772 (docs/laurel_sprout/camera.md) */
@@ -64,9 +67,13 @@
 #define CAM_LINE_PREFIX "LAUREL CAMERA: ios: "
 #define CAM_SENSOR_NAME "IMX586"
 #define CAM_KERNEL_HINT "kernel patch 2772: see the LAUREL CAMERA lines of the boot, camera=0 or a failed self-check"
+#define SENSOR_FULL_W   8000u           /* laurel 2773: the lens shading grid spans the whole sensor */
+#define SENSOR_FULL_H   6000u
 #else
 #define CAM_LINE_PREFIX "negroni: camera: "
 #define CAM_SENSOR_NAME "IMX789"
+#define SENSOR_FULL_W   4000u           /* (the frames are the whole sensor: the header's sensor_w is 0) */
+#define SENSOR_FULL_H   3008u
 #define CAM_KERNEL_HINT "boot-arg negronicam=7, kernel patch 0318"
 #endif
 
@@ -515,6 +522,8 @@ struct stream {
 	bool            af_now;         /* a focus asked for (AutoFocusNow and the like): a search at the next frame */
 	bool            af_locked;      /* LockAFNow: no search but one asked for */
 	float           af_window[4];   /* AFWindowParams: where to focus, as fractions of the frame (x0, y0, x1, y1) */
+	float           still_level;    /* laurel 2773: the digital gain that brings a photograph frame to the preview's level */
+	uint32_t        preview_w, preview_h;   /* the part of the sensor the preview frames show */
 	struct output   out[OUTPUTS];
 	pthread_mutex_t lock;
 	pthread_t       worker;
@@ -836,9 +845,10 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		if (key_is(key, "AFWindowParams")) {
 			af_window(s, value);
 		} else if (key_is(key, "LockAFNow")) {
-			s->af_locked = true;
-		} else if (key_is(key, "AutoFocusNow") || key_is(key, "ContinuousAutoFocusNow") || key_is(key, "FocusNow") ||
-		    key_is(key, "PeakTrackingFocusNow")) {
+			s->af_locked = value != kCFBooleanFalse;
+		} else if (key_is(key, "ContinuousAutoFocusNow")) {
+			s->af_locked = false;   /* (laurel 2773: focus is continuous anyway: no sweep on each ask of the graph) */
+		} else if (key_is(key, "AutoFocusNow") || key_is(key, "FocusNow") || key_is(key, "PeakTrackingFocusNow")) {
 			s->af_locked = false;
 			s->af_now = true;
 		}
@@ -871,6 +881,7 @@ struct render_job {
 	const uint8_t *raw;
 	CVPixelBufferRef pb;
 	uint32_t format, width, height, pieces;
+	float gain;                     /* laurel 2773: the frame's whole gain, for the finish */
 	bool still;                     /* the photograph: every pixel of the sensor (isp_render_still_nv12) */
 	const uint8_t *cells;           /* Mi A3: the frame's cells as R, G, B (isp_render_cells), scaled up to the picture */
 	uint32_t cells_w, cells_h;
@@ -910,6 +921,38 @@ render_piece(void *context, size_t i)
 		    CVPixelBufferGetBaseAddressOfPlane(j->pb, 1), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end,
 		    j->format == PF_420V);
 	}
+}
+
+/* laurel 2773: chroma noise down, luma sharpened, after the picture is made (camera_still.c) */
+static void
+finish_piece(void *context, size_t i)
+{
+	struct render_job *j = context;
+	uint32_t rows = (j->height + j->pieces - 1) / j->pieces, first = (uint32_t)i * rows, end = first + rows;
+
+	first &= ~1u;
+	end = i + 1 == j->pieces ? j->height : end & ~1u;
+	isp_finish_rows(CVPixelBufferGetBaseAddressOfPlane(j->pb, 0), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0),
+	    CVPixelBufferGetBaseAddressOfPlane(j->pb, 1), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end, j->gain,
+	    j->still);
+}
+
+/*
+ * laurel 2773: a handler that is no longer a block is not called. [V boot 18:40] mediaserverd pid 403 died of a jump to data at this
+ * call (pc = far = 0x1e9440158, lr just after the handler's blr, in deliver) 3 s after a low-swap kill of the process before it. The
+ * cause is not known [U]. The first word of a live block is one of these classes; only that word is read.
+ */
+static bool
+handler_alive(const struct output *out)
+{
+	static const void *malloc_block, *global_block;
+	const void *isa = *(const void *const *)out->handler;
+
+	if (malloc_block == NULL) {
+		malloc_block = dlsym(RTLD_DEFAULT, "_NSConcreteMallocBlock");
+		global_block = dlsym(RTLD_DEFAULT, "_NSConcreteGlobalBlock");
+	}
+	return malloc_block == NULL || isa == malloc_block || isa == global_block;
 }
 
 static CVPixelBufferRef
@@ -990,7 +1033,8 @@ md_put(CFMutableDictionaryRef m, int key, CFTypeRef value)
 
 /* the frame's metadata, as H10ISP's stream gives them (see md_names) */
 static CFDictionaryRef
-frame_metadata(const struct isp *isp, const struct negronicam_frame *f, const struct isp_stats *st, CFStringRef port)
+frame_metadata(const struct isp *isp, const struct negronicam_frame *f, const struct isp_stats *st, CFStringRef port, int af_status,
+    bool af_locked)
 {
 	CFMutableDictionaryRef m;
 	double exposure = f->exposure_lines * (double)f->line_ns / 1e9, analog = f->gain_unity ? (double)f->gain / f->gain_unity : 1;
@@ -1012,13 +1056,14 @@ frame_metadata(const struct isp *isp, const struct negronicam_frame *f, const st
 	md_put(m, MD_FRAME_RATE, number_f(fps));
 	md_put(m, MD_LUX, number_i((int64_t)(lux + 0.5)));
 	md_put(m, MD_SNR, number_f(40 - 10 * log10(total < 1 ? 1 : total)));
-	md_put(m, MD_AF_STATUS, number_i(0));
+	/* (laurel 2773: AFStatus 2 is a coarse focus scan: -[BWFigVideoCaptureDevice ...] holds a photograph back while it lasts) */
+	md_put(m, MD_AF_STATUS, number_i(af_status));
 	md_put(m, MD_FOCUSING, number_i(0));
 	md_put(m, MD_AE_STABLE, CFRetain(kCFBooleanTrue));
 	md_put(m, MD_AE_LOCKED, CFRetain(kCFBooleanFalse));
 	md_put(m, MD_AWB_STABLE, CFRetain(kCFBooleanTrue));
 	md_put(m, MD_AWB_LOCKED, CFRetain(kCFBooleanFalse));
-	md_put(m, MD_AF_LOCKED, CFRetain(kCFBooleanFalse));
+	md_put(m, MD_AF_LOCKED, CFRetain(af_locked ? kCFBooleanTrue : kCFBooleanFalse));
 	/*
 	 * The zoom the picture was made with: the source node takes it for what the ISP applied
 	 * (-[BWMultiStreamCameraSourceNode _ispAppliedZoomFactorFromSampleBufferMetadataDictionary:outputIndex:])
@@ -1035,7 +1080,6 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	CVPixelBufferRef pb = output_buffer(out);
 	uint32_t pf, width, height;
 
-	(void)s;
 	if (pb == NULL) {
 		return;
 	}
@@ -1069,9 +1113,27 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA,
-		NULL, 0, 0 };
+	struct isp view;
+	bool is_still = strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA;
+
+	if (is_still && f->mode == 1) {
+		/*
+		 * laurel 2773: a frame of the photograph mode shows more of the sensor than the preview: the part the preview shows at this
+		 * zoom (the same framing), and the level the preview measured (the two binnings need not give the same [I]).
+		 */
+		double aspect = (double)width / height, sw = f->sensor_w, sh = f->sensor_h, pw = s->preview_w, ph = s->preview_h;
+		double still_view = sh * aspect < sw ? sh * aspect : sw, preview_view = ph * aspect < pw ? ph * aspect : pw;
+
+		view = *isp;
+		view.zoom = isp->zoom * (float)(preview_view > 0 && still_view > preview_view ? still_view / preview_view : 1);
+		view.digital = isp->digital * s->still_level;
+		isp = &view;
+	}
+
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, 0, is_still, NULL, 0, 0 };
 	uint64_t began = mach_absolute_time();
+
+	job.gain = (f->gain_unity ? (float)f->gain / f->gain_unity : 1) * isp->digital;
 
 #ifdef LAUREL_CAMERA
 	/*
@@ -1099,6 +1161,11 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	}
 #endif
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+#ifdef LAUREL_CAMERA
+	if (pf != PF_BGRA) {
+		dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, finish_piece);
+	}
+#endif
 	if (job.still) {
 		static mach_timebase_info_data_t tb;
 
@@ -1123,6 +1190,13 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 
 	CMTime pts = CMClockMakeHostTimeFromSystemUnits(f->time);
 
+	if (!handler_alive(out)) {
+		say("%s: off: the graph's handler %p is no longer a block (first word %p): no more pictures on this output", out->name,
+		    out->handler, *(void **)out->handler);
+		out->handler = NULL;    /* (not released: it is not ours to read any more) */
+		CVPixelBufferRelease(pb);
+		return;
+	}
 	((pixel_buffer_handler)out->handler)(pb, pts);
 	/*
 	 * The moving picture's buffers are kept for HELD frames after they are given. The preview's pool
@@ -1228,16 +1302,26 @@ struct af {
 	bool            sweep;          /* ... and the whole travel measured */
 	float           sum_sharpness, sum_level;
 	unsigned        measured;
+	int             near, far, step, fine;  /* laurel 2773: the lens motor's range, from the frames */
 };
+
+/* what the graph is told (see frame_metadata): 2 a focus scan that a photograph waits for, 1 the slow continuous climb, 0 at rest */
+static int
+af_status(const struct af *af)
+{
+	return af->state == AF_SWEEP || af->state == AF_FINE_SEARCH ? 2 : af->state == AF_CLIMB || af->state == AF_SETTLE ? 1 : 0;
+}
 
 static void
 af_go(int device, struct af *af, uint32_t target)
 {
 	struct negronicam_command c = { .command = NEGRONICAM_FOCUS };
 
-	af->target = target < AF_NEAR ? AF_NEAR : target > AF_FAR ? AF_FAR : target;
-	c.a = af->at < af->target ? (af->target - af->at > AF_STEP ? af->at + AF_STEP : af->target) :
-	    (af->at - af->target > AF_STEP ? af->at - AF_STEP : af->target);
+	uint32_t step = (uint32_t)af->step;
+
+	af->target = (int)target < af->near ? (uint32_t)af->near : (int)target > af->far ? (uint32_t)af->far : target;
+	c.a = af->at < af->target ? (af->target - af->at > step ? af->at + step : af->target) :
+	    (af->at - af->target > step ? af->at - step : af->target);
 	af->at = c.a;
 	/*
 	 * The lens settles in a few milliseconds; what is spoilt is the frame being exposed while it moved
@@ -1260,6 +1344,10 @@ af_frame(int device, struct af *af, const struct negronicam_frame *f, const uint
 	if (f->focus == NEGRONICAM_NO_FOCUS) {
 		return;
 	}
+	af->near = f->focus_max > f->focus_min ? (int)f->focus_min : AF_NEAR;
+	af->far = f->focus_max > f->focus_min ? (int)f->focus_max : AF_FAR;
+	af->step = (af->far - af->near) / 16 < 4 ? 4 : (af->far - af->near) / 16;
+	af->fine = af->step / 4 < 1 ? 1 : af->step / 4;
 	if (af->at == 0 && af->target == 0) {
 		af->at = af->target = f->focus;         /* (where the kernel put it) */
 	}
@@ -1314,22 +1402,22 @@ af_frame(int device, struct af *af, const struct negronicam_frame *f, const uint
 			af->best_sharpness = -1;
 			af->worse = 0;
 			af->steps = 0;
-			af->way = af->at - AF_NEAR < AF_FAR - af->at ? 1 : -1;
-			af_go(device, af, af->way > 0 ? AF_NEAR : AF_FAR);     /* (walked there a step at a time) */
+			af->way = (int)af->at - af->near < af->far - (int)af->at ? 1 : -1;
+			af_go(device, af, (uint32_t)(af->way > 0 ? af->near : af->far));     /* (walked there a step at a time) */
 			return;
 		}
 		af->state = AF_CLIMB;
 		af->best = af->start = af->at;
 		af->best_sharpness = sharpness;
-		af->way = af->at + AF_STEP > AF_FAR ? -1 : 1;
+		af->way = (int)af->at + af->step > af->far ? -1 : 1;
 		af->turned = false;
 		af->worse = 0;
 		af->steps = 0;
-		af_go(device, af, (uint32_t)((int)af->at + af->way * AF_STEP));
+		af_go(device, af, (uint32_t)((int)af->at + af->way * af->step));
 		return;
 	case AF_CLIMB: {
-		int next = (int)af->at + af->way * AF_STEP;
-		bool end = next < AF_NEAR || next > AF_FAR;
+		int next = (int)af->at + af->way * af->step;
+		bool end = next < af->near || next > af->far;
 
 		if (sharpness > af->best_sharpness * 1.02f) {
 			af->best = af->at;
@@ -1342,8 +1430,8 @@ af_frame(int device, struct af *af, const struct negronicam_frame *f, const uint
 			af_go(device, af, (uint32_t)next);
 			return;
 		}
-		next = (int)af->best - af->way * AF_STEP;
-		if (!af->turned && af->best == af->start && next >= AF_NEAR && next <= AF_FAR) {
+		next = (int)af->best - af->way * af->step;
+		if (!af->turned && af->best == af->start && next >= af->near && next <= af->far) {
 			/* not sharper that way at all: the other way, from where it started */
 			af->turned = true;
 			af->way = -af->way;
@@ -1352,8 +1440,8 @@ af_frame(int device, struct af *af, const struct negronicam_frame *f, const uint
 			return;
 		}
 		af->state = AF_FINE_SEARCH;
-		af->fine_to = af->best + 2 * AF_FINE > AF_FAR ? AF_FAR : af->best + 2 * AF_FINE;
-		af_go(device, af, af->best > 2 * AF_FINE + AF_NEAR ? af->best - 2 * AF_FINE : AF_NEAR);
+		af->fine_to = (int)af->best + 2 * af->fine > af->far ? (uint32_t)af->far : af->best + 2 * (uint32_t)af->fine;
+		af_go(device, af, (int)af->best > 2 * af->fine + af->near ? af->best - 2 * (uint32_t)af->fine : (uint32_t)af->near);
 		return;
 	}
 	case AF_SWEEP:
@@ -1365,21 +1453,21 @@ af_frame(int device, struct af *af, const struct negronicam_frame *f, const uint
 		} else if (sharpness < af->best_sharpness * 0.85f) {
 			af->worse++;
 		}
-		if (af->worse < 2 && (int)af->at + af->way * AF_STEP >= AF_NEAR && (int)af->at + af->way * AF_STEP <= AF_FAR) {
-			af_go(device, af, (uint32_t)((int)af->at + af->way * AF_STEP));
+		if (af->worse < 2 && (int)af->at + af->way * af->step >= af->near && (int)af->at + af->way * af->step <= af->far) {
+			af_go(device, af, (uint32_t)((int)af->at + af->way * af->step));
 			return;
 		}
 		af->state = AF_FINE_SEARCH;
-		af->fine_to = af->best + 2 * AF_FINE > AF_FAR ? AF_FAR : af->best + 2 * AF_FINE;
-		af_go(device, af, af->best > 2 * AF_FINE + AF_NEAR ? af->best - 2 * AF_FINE : AF_NEAR);
+		af->fine_to = (int)af->best + 2 * af->fine > af->far ? (uint32_t)af->far : af->best + 2 * (uint32_t)af->fine;
+		af_go(device, af, (int)af->best > 2 * af->fine + af->near ? af->best - 2 * (uint32_t)af->fine : (uint32_t)af->near);
 		return;
 	case AF_FINE_SEARCH:
 		if (sharpness > af->best_sharpness) {
 			af->best = af->at;
 			af->best_sharpness = sharpness;
 		}
-		if (af->at + AF_FINE <= af->fine_to) {
-			af_go(device, af, af->at + AF_FINE);
+		if (af->at + (uint32_t)af->fine <= af->fine_to) {
+			af_go(device, af, af->at + (uint32_t)af->fine);
 			return;
 		}
 		af->state = AF_SETTLE;
@@ -1410,17 +1498,32 @@ load_tuning(struct isp *isp, uint32_t sensor)
 	static const char *const names[] = { "none", "imx789" };
 #endif
 	char path[128];
+	const char *module = "";
 
 	if (sensor >= sizeof(names) / sizeof(names[0])) {
 		return;
 	}
-	snprintf(path, sizeof(path), "/System/Library/Audio/Plug-Ins/HAL/NegroniCamera.driver/camera-%s.isp", names[sensor]);
+#ifdef LAUREL_CAMERA
+	/* laurel 2773: the module set the kernel's scan found: the OV02A10 depth camera goes with the sunny rear module (camera_config.xml) */
+	char scan[320] = "";
+	size_t scan_size = sizeof(scan);
+
+	(void)sysctlbyname("kern.laurel_camera", scan, &scan_size, NULL, 0);
+	module = strstr(scan, "GC2375H") != NULL ? "-qtech" : "-sunny";
+#endif
+	snprintf(path, sizeof(path), "/System/Library/Audio/Plug-Ins/HAL/NegroniCamera.driver/camera-%s%s.isp", names[sensor], module);
 	if (isp_load_tuning(isp, path)) {
 		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", names[sensor], path,
 		    isp->tuning->ccm.lights, isp->tuning->lsc.lights);
 	} else {
+#ifdef LAUREL_CAMERA
+		/* laurel 2773: the root step gives the file (scripts/laurel/camera-tuning.py); without it a middle matrix of that tuning, no shading */
+		say("no colour tuning for the %s (%s): a fixed colour matrix, no lens shading", names[sensor], path);
+		isp_set_ccm(isp, (const float[9]){ 1.654f, -0.572f, -0.082f, -0.309f, 1.466f, -0.157f, 0.024f, -0.664f, 1.640f });
+#else
 		say("no colour tuning for the %s (%s): no colour matrix, no lens shading", names[sensor], path);
 		isp_set_ccm(isp, (const float[9]){ 1, 0, 0, 0, 1, 0, 0, 0, 1 });
+#endif
 		isp->lsc.on = false;
 	}
 }
@@ -1448,6 +1551,10 @@ worker(void *context)
 	uint8_t *buffer = NULL;
 	size_t bytes = 0;
 	uint32_t tuned_for = ~0u;
+	/* laurel 2773: a photograph: MODE 1, the frames of that mode (the second one has the sensor settled), MODE 0 */
+	enum { STILL_IDLE, STILL_ASKED } still_state = STILL_IDLE;
+	unsigned still_frames = 0, still_wait = 0;
+	double preview_norm = 0;
 	bool switched = false;
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
@@ -1495,6 +1602,8 @@ worker(void *context)
 				continue;
 			}
 			bytes = sizeof(head) + (size_t)head.stride * head.height;
+			/* (the frames of the photograph mode are larger: room for any; untouched pages cost nothing) */
+			bytes = bytes < 16u << 20 ? 16u << 20 : bytes;
 			buffer = malloc(bytes);
 			if (buffer == NULL) {
 				say("no memory for a frame of %zu bytes: no frames", bytes);
@@ -1505,7 +1614,8 @@ worker(void *context)
 			continue;
 		}
 		n = read(device, buffer, bytes);
-		if (n != (ssize_t)bytes) {
+		if (n < (ssize_t)sizeof(head) || (size_t)n != sizeof(head) + (size_t)((const struct negronicam_frame *)(const void *)buffer)->stride *
+		    ((const struct negronicam_frame *)(const void *)buffer)->height) {
 			if (n < 0 && errno == EIO) {
 				say("the kernel's camera has had a fault (EIO): no more frames; the device is refused from now on");
 				negronicam_failed = true;
@@ -1520,8 +1630,14 @@ worker(void *context)
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct negronicam_command c;
 
+		bool still_frame = f->mode == 1, take_still = false;
+
+		isp.lsc_u = f->sensor_w ? (float)f->sensor_w / SENSOR_FULL_W : 1;
+		isp.lsc_v = f->sensor_h ? (float)f->sensor_h / SENSOR_FULL_H : 1;
 		isp_measure(&isp, f, raw, &st);
-		isp_awb(&isp, &st);
+		if (!still_frame) {
+			isp_awb(&isp, &st);
+		}
 		if (f->sensor != tuned_for) {
 			tuned_for = f->sensor;
 			load_tuning(&isp, f->sensor);
@@ -1535,20 +1651,46 @@ worker(void *context)
 		isp_tune(&isp, lux, cct);
 		isp.zoom = s->zoom;
 		isp.turned = s->camera->turned != turned_file();
-		if (isp_ae(&isp, f, &st, &c)) {
-			(void)write(device, &c, sizeof(c));
+		/* the level per exposure: a photograph frame is brought to the preview's */
+		double frame_exposure = (double)f->exposure_lines * f->line_ns * f->gain / (f->gain_unity ? f->gain_unity : 1);
+		double frame_norm = frame_exposure > 0 ? st.mean[1] / frame_exposure : 0;
+
+		if (!still_frame) {
+			preview_norm = frame_norm;
+			s->preview_w = f->sensor_w;
+			s->preview_h = f->sensor_h;
+			/* the longest frame: what the graph allows (MinimumFrameRate) and the kernel takes */
+			if (f->line_ns != 0) {
+				double most = 1e9 / ((s->min_fps > 1 ? s->min_fps : 15) * f->line_ns);
+
+				isp.max_frame_lines = most < f->frame_lines_max ? (uint32_t)most : f->frame_lines_max;
+				isp.max_frame_lines = isp.max_frame_lines < f->frame_lines_min ? f->frame_lines_min : isp.max_frame_lines;
+			}
+			if (isp_ae(&isp, f, &st, &c)) {
+				(void)write(device, &c, sizeof(c));
+			}
+			if (s->frames == 20) {
+				s->af_now = true;       /* (the first focus, once the exposure has settled) */
+			}
+			if (s->af_now) {
+				s->af_now = false;
+				/* (whatever it was doing: at once, from the next frame) */
+				af.state = AF_STEADY;
+				af.now = true;
+				af.sweep = true;
+			}
+			/* the lens stays still from the shutter on: a photograph is taken where it is */
+			if (still_state == STILL_IDLE) {
+				af_frame(device, &af, f, raw, s->af_window, s->af_locked);
+			}
+		} else if (preview_norm > 0 && frame_norm > 0) {
+			float level = (float)(preview_norm / frame_norm);
+
+			s->still_level = level < 0.5f ? 0.5f : level > 8 ? 8 : level;
 		}
-		if (s->af_now) {
-			s->af_now = false;
-			/* (whatever it was doing: at once, from the next frame) */
-			af.state = AF_STEADY;
-			af.now = true;
-			af.sweep = true;
-		}
-		af_frame(device, &af, f, raw, s->af_window, s->af_locked);
 		s->frames++;
 
-		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port);
+		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port, af_status(&af), s->af_locked);
 
 		/*
 		 * Only once the graph has started the stream. Its PixelBufferHandler blocks hand the buffer
@@ -1566,6 +1708,22 @@ worker(void *context)
 			pthread_mutex_unlock(&s->metadata_lock);
 		}
 		pthread_mutex_lock(&s->lock);
+		if (still_state == STILL_IDLE && s->stills_wanted > 0) {
+			struct negronicam_command m = { .command = NEGRONICAM_MODE, .a = 1 };
+
+			still_state = STILL_ASKED;
+			still_frames = 0;
+			still_wait = 0;
+			(void)write(device, &m, sizeof(m));
+			say("a photograph: the lens stays at %u, the photograph mode asked for", f->focus);
+		} else if (still_state == STILL_ASKED) {
+			/* the second frame of the mode; if none comes (a kernel without the mode, or it failed), the frames there are */
+			take_still = still_frame ? ++still_frames >= 2 : ++still_wait >= 20;
+		} else if (still_frame) {
+			struct negronicam_command m = { .command = NEGRONICAM_MODE, .a = 0 };
+
+			(void)write(device, &m, sizeof(m));     /* (nobody wants these any more) */
+		}
 		for (int i = 0; s->graph_running && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
 
@@ -1579,23 +1737,47 @@ worker(void *context)
 			if (out->handler == NULL || out->config == NULL || !(out->enabled || i == 0)) {
 				continue;
 			}
-			if (still && s->stills_wanted == 0) {
-				continue;
+			if (still ? (s->stills_wanted == 0 || !take_still) : still_frame) {
+				continue;       /* (the moving pictures keep to the preview's frames) */
 			}
 			deliver(s, out, &isp, f, raw, metadata);
 			if (still) {
 				s->stills_wanted--;
-				say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
+				say("the photograph is given (%llu so far, %ux%u frame, level x%.2f)", (unsigned long long)++s->stills_given,
+				    f->width, f->height, s->still_level);
+			}
+		}
+		if (take_still) {
+			still_frames = 0;
+			still_wait = 0;
+			if (s->stills_wanted == 0) {
+				struct negronicam_command m = { .command = NEGRONICAM_MODE, .a = 0 };
+
+				still_state = STILL_IDLE;
+				(void)write(device, &m, sizeof(m));
 			}
 		}
 		pthread_mutex_unlock(&s->lock);
 		if (metadata != NULL) {
 			CFRelease(metadata);
 		}
+		if (s->frames == 60 || s->frames % 300 == 0) {
+			/*
+			 * laurel 2773: this process's memory, which the kernel watches: [V boot 18:40] "low swap: killing largest compressed process
+			 * with pid 28 (mediaserverd) and size 2689 MB" 9 s after a session began, and the camera was gone every 10 s.
+			 */
+			task_vm_info_data_t vm;
+			mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+
+			if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS) {
+				say("memory at frame %llu: footprint %llu MB", (unsigned long long)s->frames, (unsigned long long)(vm.phys_footprint >> 20));
+			}
+		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
-			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black; white balance R %.2f "
-			    "B %.2f, lux index %.0f, about %.0f K", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
-			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], isp.wb[0], isp.wb[2], lux, cct);
+			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black (1%% over %.0f); white balance R %.2f "
+			    "B %.2f, lux index %.0f, about %.0f K; %ux%u, lens %d", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
+			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], st.bright, isp.wb[0], isp.wb[2], lux, cct, f->width, f->height,
+			    f->focus == NEGRONICAM_NO_FOCUS ? -1 : (int)f->focus);
 		}
 	}
 	if (failures >= 5) {
@@ -1819,6 +2001,7 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	s->torch = -1;
 	s->min_fps = 2;
 	s->zoom = 1;
+	s->still_level = 1;
 	s->af_window[0] = s->af_window[1] = 0.3f;
 	s->af_window[2] = s->af_window[3] = 0.7f;
 	s->max_fps = 30;

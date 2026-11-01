@@ -16,6 +16,8 @@
 #  3. /var/db/negronicam (empty; files there: "off" no hooks, "noservers" no capture servers, "turned" picture half round)
 #  4. the MobileGestalt cache out: it may hold still-camera = false from a boot without the ADT node /arm-io/isp (it is made again
 #     at the next boot). The ADT nodes come from scripts/laurel/mkadt.py (boot image).
+#  5. laurel 2773: the rear lens motor's stock libraries (libactuator_*: the kernel reads them, laurel_cam_vcm.c) and the colour tuning of
+#     the plug-in, made from the stock chromatix libraries at this step (scripts/laurel/camera-tuning.py, never in git).
 # Undo: CAMERA=0 root, or remove System/Library/Audio/Plug-Ins/HAL/NegroniCamera.driver.
 set -euo pipefail
 R=${1:?usage: $0 MOUNTED_ROOT}
@@ -73,6 +75,26 @@ d = plistlib.load(open(sys.argv[1], 'rb')).get('MachServices', {})
 sys.exit(0 if 'com.apple.coremedia.capturesource' in d and 'com.apple.coremedia.capturesession' in d else 1)
 PY
 fi
+
+# 5. the lens motor's libraries (read by the kernel) and the colour tuning (read by the plug-in): no tuning = a fixed matrix, no lens shading
+for a in dw9800 laurus_dw9800w_qtech; do
+  f=$L/libactuator_$a.so
+  if [ -s "$f" ]; then
+    mkdir -p "$D"
+    install -m 644 "$f" "$D/"
+    [ "$(id -u)" != 0 ] || chown 0:0 "$D/$(basename "$f")"
+  else
+    echo "$(ts) root-camera: WARNING: no $f (scripts/laurel/camera-inventory.sh again): this module's lens stays where it falls: no focus" >&2
+  fi
+done
+for m in sunny qtech; do
+  if python3 -I "$REPO/scripts/laurel/camera-tuning.py" "$L" "$m" "$HAL/NegroniCamera.driver/camera-imx586-$m.isp"; then
+    own "$HAL/NegroniCamera.driver/camera-imx586-$m.isp"
+    chmod 644 "$HAL/NegroniCamera.driver/camera-imx586-$m.isp"
+  else
+    echo "$(ts) root-camera: WARNING: no colour tuning for the $m module: a fixed colour matrix, no lens shading" >&2
+  fi
+done
 
 # 3. the knob folder
 mkdir -p "$R/private/var/db/negronicam"

@@ -22,7 +22,7 @@ MINOS=16.0
 BIN=${PREVIEW_BIN:-2}
 DEFS="-DLAUREL_CAMERA=1 -DPREVIEW_BIN=$BIN"
 CFLAGS="-O2 -Wall -Wextra -Wno-unused-parameter -Wno-four-char-constants -Wno-multichar -Wno-deprecated-declarations -fvisibility=hidden -fblocks $DEFS"
-FILES="media_hooks camera_device camera_isp"
+FILES="media_hooks camera_device camera_isp camera_still"
 rm -rf "$W/ios" "$W/host"
 mkdir -p "$B" "$T" "$W/host"
 
@@ -30,7 +30,7 @@ if [ "$(uname -s)" = Darwin ] && xcrun -sdk iphoneos --show-sdk-path >/dev/null 
   SDK=$(xcrun -sdk iphoneos --show-sdk-path)
   CC=$(xcrun -sdk iphoneos --find clang)
   "$CC" -arch arm64 -isysroot "$SDK" -mios-version-min=$MINOS $CFLAGS -bundle -framework CoreFoundation -framework CoreMedia \
-    -framework CoreVideo -lobjc "$SRC/media_hooks.c" "$SRC/camera_device.c" "$SRC/camera_isp.c" -o "$B/NegroniCamera"
+    -framework CoreVideo -lobjc "$SRC/media_hooks.c" "$SRC/camera_device.c" "$SRC/camera_isp.c" "$SRC/camera_still.c" -o "$B/NegroniCamera"
   NM="xcrun nm"; OTOOL="xcrun otool"
   sign() { codesign --force -s - "$1"; }
 else
@@ -46,7 +46,8 @@ else
   done
   wait
   for s in $FILES; do [ -s "$T/$s.o" ] || { echo "camera: $s.c did not compile" >&2; exit 1; }; done
-  # link: .tbd stubs with exactly the symbols the objects need (two-level namespace, real install names)
+  # link: .tbd stubs with exactly the symbols the objects need (two-level namespace, real install names);
+  # -sdk_version: ld64 reads an SDK version from digits in the -syslibroot path otherwise (a worktree path has some)
   R=$T/sysroot
   FW=System/Library/Frameworks
   mkdir -p "$R/usr/lib" "$R/$FW/CoreFoundation.framework" "$R/$FW/CoreMedia.framework" "$R/$FW/CoreVideo.framework"
@@ -67,7 +68,7 @@ else
   tbd "$R/$FW/CoreMedia.framework/CoreMedia.tbd" /$FW/CoreMedia.framework/CoreMedia 1 1 "$(pick "$P_CM")"
   tbd "$R/$FW/CoreVideo.framework/CoreVideo.tbd" /$FW/CoreVideo.framework/CoreVideo 1 1 "$(pick "$P_CV")"
   "$TC/clang" -target arm64-apple-ios$MINOS -fuse-ld="$TC/ld" -B"$TC" -isysroot "$R" -nostdlib -bundle -lSystem -lobjc \
-    -framework CoreFoundation -framework CoreMedia -framework CoreVideo -Wl,-exported_symbol,_NegroniCamera_Create \
+    -framework CoreFoundation -framework CoreMedia -framework CoreVideo -Wl,-exported_symbol,_NegroniCamera_Create -Wl,-sdk_version,16.0 \
     "$T"/*.o -o "$B/NegroniCamera"
   NM="$TC/llvm-nm"; OTOOL="$TC/otool"
   sign() { "$TC/ldid" -S "$1"; }
@@ -83,16 +84,18 @@ minos=$($OTOOL -l "$X" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}
 [ "$minos" = "$MINOS" ] || { echo "camera: minos $minos, expected $MINOS" >&2; fail=1; }
 exports=$($NM -gU "$X" | awk '{print $NF}' | grep -v -x -e _NegroniCamera_Create -e __mh_bundle_header || true)
 [ -z "$exports" ] || { echo "camera: unexpected exports: $exports" >&2; fail=1; }
-$NM -gU "$X" | grep -q ' _NegroniCamera_Create$' || { echo "camera: factory not exported" >&2; fail=1; }
+grep -q ' _NegroniCamera_Create$' <<<"$($NM -gU "$X")" || { echo "camera: factory not exported" >&2; fail=1; }
 weak=$($NM -m "$X" 2>/dev/null | grep 'weak external' || true)
 [ -z "$weak" ] || { echo "camera: weak imports: $weak" >&2; fail=1; }
 libs=$($OTOOL -L "$X" | tail -n +2 | awk '{print $1}' | LC_ALL=C sort | tr '\n' ' ')
 want="/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation /System/Library/Frameworks/CoreMedia.framework/CoreMedia /System/Library/Frameworks/CoreVideo.framework/CoreVideo /usr/lib/libSystem.B.dylib /usr/lib/libobjc.A.dylib "
 [ "$libs" = "$want" ] || { echo "camera: unexpected libraries: $libs" >&2; fail=1; }
+# (nm's output in a variable: with pipefail, an early exit of grep -q SIGPIPEs nm and a symbol that is there counts as missing)
+all_syms=$($NM "$X")
 for s in _shared_vendor _audio_source_start _video_stabilization_method _video_stabilization_type _quality_prioritization \
          _gnr_render _emit_sample_buffer _prewarm_portrait_filter _image_added _negroni_camera_init _negroni_camera_device_create \
-         _worker _isp_render_nv12 _isp_render_still_nv12 _isp_scale_nv12 _isp_render_cells; do
-  $NM "$X" | grep -q " $s\$" || { echo "camera: symbol $s missing" >&2; fail=1; }
+         _worker _isp_render_nv12 _isp_render_still_nv12 _isp_scale_nv12 _isp_render_cells _isp_mhc_row _isp_finish_rows; do
+  grep -q " $s\$" <<<"$all_syms" || { echo "camera: symbol $s missing" >&2; fail=1; }
 done
 grep -q -a '/dev/negronicam' "$X" || { echo "camera: no /dev/negronicam string" >&2; fail=1; }
 grep -q -a 'LAUREL CAMERA: ios' "$X" || { echo "camera: no LAUREL CAMERA line" >&2; fail=1; }
@@ -103,7 +106,7 @@ rm -rf "$T"
   shasum -a 256 NegroniCamera.driver/NegroniCamera NegroniCamera.driver/Info.plist; } > SHA256SUMS)
 
 # host: the same ISP code: self test (RAW10 colour bars in each Bayer order) and the NCFRAME1 dump renderer
-${CC_HOST:-cc} -O2 -Wall -Wextra -Wno-unused-parameter -I"$SRC" "$SRC/isp-host.c" "$SRC/camera_isp.c" -lm -o "$W/host/isp-render"
+${CC_HOST:-cc} -O2 -Wall -Wextra -Wno-unused-parameter -I"$SRC" "$SRC/isp-host.c" "$SRC/camera_isp.c" "$SRC/camera_still.c" -lm -o "$W/host/isp-render"
 "$W/host/isp-render" --selftest > "$W/host/isp-selftest.txt"
 tail -3 "$W/host/isp-selftest.txt"
 echo "camera: $B ($(wc -c < "$X") bytes, minos $minos, PREVIEW_BIN $BIN)"
