@@ -38,12 +38,12 @@ Series = sha256 of kind + name + contents of every topaz and laurel patch, stage
 
 `uefi-image.sh` refuses a kernel without a good stamp (`build-stamp.py kernel-check`: stamp present, sha256 right, embedded line present, series = patches in the repo now). `KERNEL=path` by hand needs only its own stamp, for an older kernel on purpose. The image gets `laurel-uefi-boot.img.stamp` and the ADT property `/chosen laurel-image-build`.
 
-## 3. Boot lines (kernel patch 2911, `bsd/dev/laurel_build.c`)
+## 3. Boot lines (kernel patch 2912, `bsd/dev/laurel_build.c`)
 
 ```
 LAUREL BUILD: 1a2b3c4d5e 293 patches, series c8d95a7d925628a6, 4k
 LAUREL BUILD: image 1a2b3c4d5e 20261101T155328Z kernel-series c8d95a7d925628a6 fd 68fda27c: kernel series matches
-LAUREL BUILD: root 1a2b3c4d5e 20261101T160000Z kernel-series c8d95a7d925628a6 features 11 installed 11 off 0 missing 0: kernel series matches
+LAUREL BUILD: root 1a2b3c4d5e 20261101T160000Z kernel-series c8d95a7d925628a6 features 12 installed 12 off 0 missing 0: kernel series matches
 ```
 
 | Line | Source |
@@ -83,11 +83,12 @@ laurel-root: 9 installed, 1 off by their own switch, 1 missing: camera
 | statusbar | `STATUSBAR=0` | none | provider key |
 | notch | `NOTCH=0` or `STATUSBAR=0` | `out/laurel/notch/root` | dylib, start program, SpringBoard job |
 | brightness | `BRIGHTNESS=0` | none | `BKEnableALS` false |
+| xnutils | `XNUTILS=0` | `out/laurel/xnutils/root` | app, helper (setuid, checked as root), pmregister |
 | ssh | `SSH=0` | `out/ssh/ios` | dropbear, its job |
 
 New rule: **SSH is wanted by default.** Before, a Linux root silently had no SSH, because nothing built `out/ssh/ios` [V: the main checkout had no `out/ssh`]. `build-all.sh` now builds it (`honest-ssh`: passed on this host, 2026-11-01).
 
-Exit 1 when a feature is missing: no sparse image, the sidecar says `status failed`. Only the feature's own `NAME=0` leaves it out. To add XNUtils when it lands (branch `t3/laurel-xnutils`): one `feature` line in `root-features.sh`, one row in `FEATURES` of `root-manifest.py`, one stage line in `build-all.sh`.
+Exit 1 when a feature is missing: no sparse image, the sidecar says `status failed`. Only the feature's own `NAME=0` leaves it out. A new feature: one `feature` line in `root-features.sh`, one row in `FEATURES` of `root-manifest.py`, one stage line in `build-all.sh` (XNUtils came this way; a failed XNUtils build was a warning before).
 
 `fsck ... || true` is gone: `root-fsck.sh` repairs, verifies, and accepts only the known `Volume header needs minor repair` note of Linux fsck_hfs. A dirty volume stops the run.
 

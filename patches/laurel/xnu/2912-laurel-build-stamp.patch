@@ -1,4 +1,4 @@
-laurel 2911: the boot log proves which build runs (new bsd/dev/laurel_build.c). Lines: `LAUREL BUILD: <commit> <n> patches, series <hash>, <pages>` (generated header from kernel-linux.sh, which looks for this exact line in the linked kernel), `LAUREL BUILD: image ...` (/chosen laurel-image-build, uefi-image.sh), `LAUREL BUILD: root ...` (first line of /usr/share/laurel/root-manifest, root-manifest.py); each says whether its kernel series matches this kernel. Printed in bsd_init, at the root mount and again 30 s later, because a USB capture can start late. Owner request 2026-11-01: a build must never look good when a part is missing. Reads only. Kill switch laurelbuild=0.
+laurel 2912: the boot log proves which build runs (new bsd/dev/laurel_build.c). Lines: `LAUREL BUILD: <commit> <n> patches, series <hash>, <pages>` (generated header from kernel-linux.sh, which looks for this exact line in the linked kernel), `LAUREL BUILD: image ...` (/chosen laurel-image-build, uefi-image.sh), `LAUREL BUILD: root ...` (first line of /usr/share/laurel/root-manifest, root-manifest.py); each says whether its kernel series matches this kernel. Printed in bsd_init, at the root mount and again 30 s later, because a USB capture can start late. Owner request 2026-11-01: a build must never look good when a part is missing. Reads only. Kill switch laurelbuild=0.
 
 diff -ruN a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
@@ -9,14 +9,14 @@ diff -ruN a/bsd/conf/files b/bsd/conf/files
  bsd/dev/laurel_rtc.c			standard
 +bsd/dev/laurel_build.c			standard
  bsd/dev/laurel_wired.c			standard
+ bsd/dev/laurel_stats.c			standard
  bsd/dev/laurel_cell.c			standard
- bsd/dev/laurel_ext4.c			standard
 diff -ruN a/bsd/dev/laurel_build.c b/bsd/dev/laurel_build.c
 --- a/bsd/dev/laurel_build.c
 +++ b/bsd/dev/laurel_build.c
 @@ -0,0 +1,146 @@
 +/*
-+ * laurel 2911: which build runs. A phone log must prove it. docs/laurel_sprout/build-honest.md.
++ * laurel 2912: which build runs. A phone log must prove it. docs/laurel_sprout/build-honest.md.
 + *
 + *   LAUREL BUILD: <commit> <n> patches, series <16 hex>, <pages>
 + *   LAUREL BUILD: image <commit> <time> kernel-series <16 hex> fd <8 hex>: kernel series matches
@@ -169,7 +169,7 @@ diff -ruN a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
  
  	printf(copyright);
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+	/* laurel 2911: which build runs (bsd/dev/laurel_build.c): early, for a panic dump before the root. */
++	/* laurel 2912: which build runs (bsd/dev/laurel_build.c): early, for a panic dump before the root. */
 +	extern void laurel_build_early(void);
 +	laurel_build_early();
 +#endif
@@ -180,7 +180,7 @@ diff -ruN a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
  	/* laurel 2720: the saved RTC offset is on the root volume: apply it before launchd (bsd/dev/laurel_rtc.c). */
  	extern void laurel_rtc_load_saved(void);
  	laurel_rtc_load_saved();
-+	/* laurel 2911: the boot image and root stamps; again 30 s later, when the host USB log is attached. */
++	/* laurel 2912: the boot image and root stamps; again 30 s later, when the host USB log is attached. */
 +	extern void laurel_build_root(void);
 +	laurel_build_root();
  #endif

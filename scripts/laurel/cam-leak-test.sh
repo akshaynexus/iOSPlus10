@@ -33,5 +33,8 @@ if [ -z "${OLD:-}" ]; then
   # shellcheck disable=SC2086
   clang -O2 $BASE -o "$D/cam6" "$T/cam6_test.c" "$T/cam5_mock.c" "$T/cam5_mock_cv.c" "$SRC/camera_thumbs.c" "$SRC/camera_isp.c" "$SRC/camera_still.c" -lm
   "$D/cam6"
+  # the memory guard's rule
+  clang -O2 -Wall -I"$SRC" -o "$D/cam7" "$T/cam7_test.c"
+  "$D/cam7"
 fi
 echo "cam-leak-test: OK${OLD:+ on $OLD}"

@@ -5,6 +5,7 @@
  *
  * What it adds to topaz's (docs/laurel_sprout/gpu.md "Recovery"):
  *   - no loader with boot-arg gpu=0 or gl=0 (whole-word match, also as the first boot-arg);
+ *   - no loader while /private/var/db/laurelgl/off exists (the GL switch of XNUtils, docs/laurel_sprout/xnutils.md);
  *   - a crash guard: every start writes "<boot session> <starts in a row> <time>" to /var/tmp/laurel-bbd.state. A start
  *     less than FAST_S seconds after the previous one in the same boot counts as a fast exit of the one before; after
  *     MAX_FAST fast exits backboardd runs without the loader for the rest of this boot (CoreAnimation's software
@@ -34,6 +35,7 @@
 #define LOADER    "/topaz/lib/libtopaz-inject.dylib"
 #define STATE     "/var/tmp/laurel-bbd.state"
 #define LOG       "/var/tmp/laurel-bbd.log"
+#define GL_OFF    "/private/var/db/laurelgl/off"
 #define FAST_S    30
 #define MAX_FAST  2
 
@@ -118,6 +120,9 @@ main(int argc, char *argv[])
 	if (bootarg_zero(args, "gpu") || bootarg_zero(args, "gl")) {
 		use_loader = 0;
 		say("off: %s in the boot-args: no GL loader", bootarg_zero(args, "gpu") ? "gpu=0" : "gl=0");
+	} else if (access(GL_OFF, F_OK) == 0) {
+		use_loader = 0;
+		say("off: %s exists (the GL switch of XNUtils): no GL loader, software renderer", GL_OFF);
 	} else if (strncmp(gpu, "off", 3) == 0) {
 		use_loader = 0;
 		say("off: the kernel turned the GPU off (%s): no GL loader, software renderer", gpu);

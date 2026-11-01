@@ -15,7 +15,7 @@
 #        CAMERA=0 skips), root-hevc.sh (HEVC/HEIC decoder; HEVC=0 skips), root-statusbar.py
 #        (status bar provider for 360x780 pt + the waterdrop dylib for SpringBoard from out/laurel/notch, scripts/laurel/notch-build.sh;
 #        STATUSBAR=0 skips both, NOTCH=0 only the dylib), root-flashlight.sh (the flashlight's one owner: camera plug-in, else its own plug-in; TORCH=0 = no button) and root-brightness.py
-#        (auto-brightness off; BRIGHTNESS=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
+#        (auto-brightness off; BRIGHTNESS=0 skips), root-xnutils.sh (XNUtils.app; XNUTILS=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
 # Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
 #   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg

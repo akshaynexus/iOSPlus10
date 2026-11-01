@@ -700,7 +700,11 @@ static void memory_step(long footprint_mb)
 		strlcat(text, one, sizeof(text));
 		pages[best] = 0;
 	}
-	nlog("memory: footprint %ld MiB; the most by VM tag:%s", footprint_mb, text);
+	/* laurel (flame/0020): Metal's live objects, so a growth names them or clears them */
+	int64_t o[9];
+	native_bridge_metal_objects(o);
+	nlog("memory: footprint %ld MiB; the most by VM tag:%s; Metal: %lld textures (%lld over surfaces), %lld buffers %lld MiB, %lld heaps %lld MiB, %lld command buffers (%lld in flight), %lld pipelines",
+	     footprint_mb, text, (long long)o[0], (long long)o[1], (long long)o[2], (long long)(o[3] >> 20), (long long)o[4], (long long)(o[5] >> 20), (long long)o[6], (long long)o[7], (long long)o[8]);
 }
 
 static void memory_watch(void)

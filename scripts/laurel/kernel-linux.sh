@@ -63,7 +63,7 @@ echo "kernel-linux: topaz $(git -C "$TOPAZ" rev-parse --short HEAD), $(ls "$W"/p
 
 export TOP=$W PATCHES_DIR=$W/patches THEOS=$W/theos MACHINE_CONFIG=SWEET KERNEL_CONFIG=DEVELOPMENT JOBS=$NPROC
 PAGES=${PAGES:-4k}
-# laurel 2911: what this run builds, from the copies above: the boot line, and the check at the end (docs/laurel_sprout/build-honest.md)
+# laurel 2912: what this run builds, from the copies above: the boot line, and the check at the end (docs/laurel_sprout/build-honest.md)
 BS=$REPO/scripts/laurel/build-stamp.py
 STAMP=$(python3 -I "$BS" kernel-stamp "$W" "$PAGES")
 echo "kernel-linux: this build: LAUREL BUILD: $STAMP"
@@ -142,7 +142,7 @@ apply_and_deps() {
   return $rc
 }
 step patch+deps apply_and_deps || exit 1
-# the stamp header of patch 2911 (bsd/dev/laurel_build.c); apply-xnu made a new tree, so no old BUILD/ directory is left
+# the stamp header of patch 2912 (bsd/dev/laurel_build.c); apply-xnu made a new tree, so no old BUILD/ directory is left
 XNU_TREE=$W/xnu-src/$XNU_TAG
 python3 -I "$BS" kernel-header "$STAMP" > "$XNU_TREE/bsd/dev/laurel_build_stamp.h"
 

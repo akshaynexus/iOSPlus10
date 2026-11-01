@@ -2,7 +2,7 @@
 # Install every Mi A3 root feature into a mounted root, then write the one table (scripts/laurel/root-manifest.py). root.sh calls it.
 #   scripts/laurel/root-features.sh MOUNTED_ROOT --inputs FILE --sidecar PATH
 # A step that fails or skips does not stop the next one: each feature gets its row. Exit 1 = a feature is missing (not by its own =0 switch).
-# Switches (one each; =0 = off): GPU METAL HEVC AUDIO BT CAMERA STATUSBAR NOTCH TORCH BRIGHTNESS SSH. Runs as the user too (test on a copy: no chown).
+# Switches (one each; =0 = off): GPU METAL HEVC AUDIO BT CAMERA STATUSBAR NOTCH TORCH BRIGHTNESS XNUTILS SSH. Runs as the user too (test on a copy: no chown).
 # A new feature: one `feature` line here, one row in root-manifest.py FEATURES.
 set -uo pipefail
 R=${1:?usage: $0 MOUNTED_ROOT --inputs FILE --sidecar PATH}
@@ -38,6 +38,8 @@ feature statusbar env STATUSBAR="${STATUSBAR:-1}" NOTCH="${NOTCH:-1}" python3 -I
 feature torch env TORCH="${TORCH:-1}" bash "$L/root-flashlight.sh" "$R"
 # auto-brightness off: no ambient light sensor for iOS (kernel 2201; docs/laurel_sprout/brightness.md)
 feature brightness env BRIGHTNESS="${BRIGHTNESS:-1}" python3 -I "$L/root-brightness.py" "$R"
+# XNUtils (docs/laurel_sprout/xnutils.md): system app + setuid helper; live stats, Metal and GL switches, power actions
+feature xnutils env XNUTILS="${XNUTILS:-1}" bash "$L/root-xnutils.sh" "$R"
 # SSH (dropbear on 192.168.7.2:22, dash, toybox, usbreboot, oslogstream; docs/usb-network.md). Host key and known_hosts as root-add-ssh.py.
 if [ "${SSH:-1}" != 0 ]; then feature ssh env SSH=1 sh "$REPO/scripts/net/root-add-ssh.sh" "$R"; fi
 

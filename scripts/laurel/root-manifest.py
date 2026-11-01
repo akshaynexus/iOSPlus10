@@ -36,6 +36,7 @@ HAL = 'System/Library/Audio/Plug-Ins/HAL/'
 GPU = 'out/laurel/gpu/root/'
 METAL = 'out/metal/stage/System/Library/Extensions/NegroniMetal.bundle/'
 SB = 'usr/local/libexec/laurel-springboard'
+XNU = 'out/laurel/xnutils/root/'
 UIKIT = 'private/var/mobile/Library/Preferences/com.apple.UIKit.plist'
 BACKBOARD = 'private/var/mobile/Library/Preferences/com.apple.backboardd.plist'
 # Every script the root run reads. A change during the run means the image is not what this list says.
@@ -97,6 +98,14 @@ def check_brightness(root):
     return [] if plist(root, BACKBOARD).get('BKEnableALS') is False else ['BKEnableALS is not false']
 
 
+def check_xnutils(root):
+    # the helper's setuid bit is the point of it; a run as the user (a test on a copy) cannot set it
+    p = os.path.join(root, 'usr/local/libexec/powermenu-helper')
+    if os.geteuid() == 0 and os.path.isfile(p) and not os.stat(p).st_mode & 0o4000:
+        return ['powermenu-helper is not setuid']
+    return []
+
+
 def check_ssh(root):
     return [] if job(root, 'dev.iosplus10.dropbear') else ['no dev.iosplus10.dropbear job in the launchd cache']
 
@@ -145,6 +154,10 @@ FEATURES = [
          stage=['out/laurel/notch/root/usr/local/lib/liblaurel-notch.dylib', 'out/laurel/notch/root/' + SB], trees=['out/laurel/notch/root'], sources=['userland/laurel/notch'],
          root=['usr/local/lib/liblaurel-notch.dylib', SB], check=check_notch),
     dict(name='brightness', switch='BRIGHTNESS', build='-', stage=[], trees=[], sources=[], root=[], check=check_brightness),
+    dict(name='xnutils', switch='XNUTILS', build='scripts/laurel/xnutils-build.sh',
+         stage=[XNU + 'Applications/XNUtils.app/XNUtils', XNU + 'usr/local/libexec/powermenu-helper', XNU + 'usr/local/bin/pmregister'],
+         trees=[XNU], sources=['userland/laurel/xnutils', 'userland/rebootapp'],
+         root=['Applications/XNUtils.app/XNUtils', 'Applications/XNUtils.app/Info.plist', 'usr/local/libexec/powermenu-helper', 'usr/local/bin/pmregister'], check=check_xnutils),
     dict(name='ssh', switch='SSH', build='userland/ssh/fetch.sh, fetch-sdk.sh, build.sh', stage=['out/ssh/ios/dropbearmulti'], trees=['out/ssh/ios'],
          sources=['userland/ssh'], root=['usr/local/bin/dropbearmulti'], check=check_ssh),
 ]

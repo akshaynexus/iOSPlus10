@@ -6,7 +6,7 @@
 # out/laurel-root-dry/root, runs topaz sweet-root-tweaks.py, root-tweaks-extra.py, root-tweaks-perf.py, root-system-features.py
 # and bt-launchd.py on it in the order of root.sh (chown off: the user cannot make 0 or 501 files), then checks the result:
 # the job list against the expected list in docs/laurel_sprout/system-features.md, 32 apps moved, no staged app left, the
-# aggregated job and its limit. Exit 0 = PASS. It does not build a root: that is `sudo scripts/laurel/root.sh`.
+# aggregated job and its limit, then root-xnutils.sh when XNUtils is built. Exit 0 = PASS. It does not build a root: that is `sudo scripts/laurel/root.sh`.
 # Then the feature step on that copy, with the real stages (FEATURES=0 skips): root-manifest.py preflight + root-features.sh, the same table
 # root.sh prints; a missing feature = exit 1. Folders the features only look for are empty copies: a real root has their files.
 set -euo pipefail
@@ -80,9 +80,25 @@ if len(apps) - stock_apps != 32 or staged:
 for a in ('MobileCal', 'MobileMail', 'MobileNotes', 'MobileTimer', 'Weather', 'Maps'):
     if not os.path.isfile(f'{r}/Applications/{a}.app/Info.plist'):
         fail.append(f'{a}.app has no Info.plist')
-print('root-dry-run:', 'PASS' if not fail else 'FAIL: ' + '; '.join(fail))
+print('root-dry-run:', 'jobs + apps PASS' if not fail else 'FAIL: ' + '; '.join(fail))
 sys.exit(1 if fail else 0)
 EOF
+# XNUtils (root-xnutils.sh), when it is built. As the user: no owners, no setuid bit (the script says so).
+if [ -x "$REPO/out/laurel/xnutils/root/Applications/XNUtils.app/XNUtils" ]; then
+  bash "$REPO/scripts/laurel/root-xnutils.sh" "$R"
+  python3 -I - "$R" <<'EOF'
+import os, plistlib, stat, sys
+r = sys.argv[1]; a = r + '/Applications/XNUtils.app'
+info = plistlib.load(open(a + '/Info.plist', 'rb'))
+ok = (info['CFBundleIdentifier'] == 'dev.iosplus10.xnutils' and os.access(a + '/XNUtils', os.X_OK) and os.path.isfile(a + '/AppIcon60x60@2x.png')
+      and os.path.isfile(r + '/usr/local/libexec/powermenu-helper') and os.access(r + '/usr/local/bin/pmregister', os.X_OK)
+      and not os.path.exists(a + '.new') and stat.S_IMODE(os.stat(a + '/Info.plist').st_mode) == 0o644)
+print('root-dry-run: XNUtils', 'PASS' if ok else 'FAIL')
+sys.exit(0 if ok else 1)
+EOF
+else
+  echo "root-dry-run: XNUtils: note: not built (scripts/laurel/xnutils-build.sh)"
+fi
 
 if [ "${FEATURES:-1}" != 0 ]; then
   python3 -I "$REPO/scripts/laurel/root-manifest.py" preflight --inputs "$W/inputs"
@@ -90,3 +106,4 @@ if [ "${FEATURES:-1}" != 0 ]; then
   python3 -I "$REPO/scripts/laurel/root-manifest.py" inputs-check "$W/inputs"
   echo "root-dry-run: feature step PASS: first line of the manifest: $(head -1 "$R/usr/share/laurel/root-manifest")"
 fi
+echo "root-dry-run: PASS"

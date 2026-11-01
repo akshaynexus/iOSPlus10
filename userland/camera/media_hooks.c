@@ -371,11 +371,12 @@ register_hevc_encoder(void)
  * [V boot 20:14, 6 crashes, one stack; disassembly of 20H392] -prepareForCurrentConfigurationToBecomeLive, on the graph's deferred-
  * prepare queue about a second after the stream starts, does `[_filter filterDescriptor]->x = 0` at 0x1a1f472f0 with no check. _filter is
  * [FigColorCubeMetalFilter new]; its init reaches -[FigMetalContext commonInitWithOptionalCommandQueue:], where +createMetalDevice answers
- * nil (0x1c789c340), and so it is nil: SIGSEGV at address 8. Metal stays out of this process: with it listed, boot 19:34 had 236 "surface
- * import refused" lines of mediaserverd (no filter picture ever came out) and a low-swap kill at 2.6 GB two seconds after the shutter.
+ * nil (0x1c789c340), and so it is nil: SIGSEGV at address 8.
  *
- * With no Metal device: the node is prepared as a plain node (its filter never made), and each picture goes out unfiltered through the CPU
- * (camera_thumbs.c): the output is one thumbnail per filter, one under the other, in one buffer. With a Metal device both are stock.
+ * mediaserverd has Metal (owner's decision, 2026-11-01): with a device both methods are stock, and the filters run on the GPU. These replacements act only when the GPU
+ * self-check gave no device in this process (the Metal gate's list, the plug-in's strikes), or when the memory guard stopped the strip for this session (camera_mem.c): the node
+ * is prepared as a plain node (its filter never made), and each picture goes out unfiltered through the CPU (camera_thumbs.c): the output is one thumbnail per filter, one under
+ * the other, in one buffer. Each of the two cases says so in one line.
  */
 static IMP original_thumbnail_prepare, original_thumbnail_render;
 
@@ -393,13 +394,21 @@ metal_device_here(void)
 	return here;
 }
 
+extern volatile bool negronicam_filter_strip_off;        /* camera_mem.c: past the memory limit, this session */
+
 static void
 thumbnail_prepare(id self, SEL selector)
 {
 	static bool said;
 
-	if (metal_device_here()) {
+	if (metal_device_here() && !negronicam_filter_strip_off) {
 		((void (*)(id, SEL))original_thumbnail_prepare)(self, selector);
+		return;
+	}
+	if (metal_device_here()) {
+		struct objc_super above = { self, class_getSuperclass(objc_getClass("BWMultiFilterThumbnailNode")) };
+
+		((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&above, selector);
 		return;
 	}
 	if (!said) {
@@ -429,7 +438,7 @@ thumbnail_render(id self, SEL selector, CMSampleBufferRef sample_buffer, id inpu
 	static bool said;
 	id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
 
-	if (filter == NULL || *filter != nil) {
+	if (filter == NULL || (*filter != nil && !negronicam_filter_strip_off)) {
 		((void (*)(id, SEL, CMSampleBufferRef, id))original_thumbnail_render)(self, selector, sample_buffer, input);
 		return;
 	}

@@ -311,7 +311,7 @@ if __name__ == '__main__':
     ap.add_argument('--dram', default='0x80000000:0x40000000', help='BASE:SIZE, or auto (needs --mu-fd)')
     ap.add_argument('--mu-fd', help='Mu FD for --dram auto (its "Kernel RAM" entry decides the window size)')
     ap.add_argument('--darwinboot', action='store_true')
-    ap.add_argument('--build-stamp', help='/chosen laurel-image-build: the boot log line of kernel patch 2911 (scripts/laurel/build-stamp.py image-line)')
+    ap.add_argument('--build-stamp', help='/chosen laurel-image-build: the boot log line of kernel patch 2912 (scripts/laurel/build-stamp.py image-line)')
     ap.add_argument('--dump', action='store_true')
     a = ap.parse_args()
     if a.dram == 'auto':

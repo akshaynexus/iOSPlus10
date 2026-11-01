@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build the native Metal bridge (ios-flame phone/metal2/bridge/NativeMetalBridge.rs, UniXNU's MIT bridge over the
 # metal2vulkan runtime) as a static library: out/metal/bridge/<target>/libnative_metal_bridge.a
-#   scripts/metal/build-bridge.sh [ios|host]      (host: aarch64-apple-darwin, for checks on the Mac)
+#   scripts/metal/build-bridge.sh [ios|host|linux]      (host: aarch64-apple-darwin, for checks on the Mac; linux: the
+#   build host's triple, for the leak harness userland/metal/tests/mediaserverd-leak.c)
 # First: scripts/metal/fetch-sources.sh. Recipe: ios-flame tools/build-m2v-bridge.sh (MIT, 745c434).
 # Run in tmux: scripts/bg.sh metal-bridge scripts/metal/build-bridge.sh   (BRIDGE_TARGET_DIR=DIR: cargo target dir)
 set -euo pipefail
@@ -38,7 +39,8 @@ TOML
 case $target in
 ios)  triple=aarch64-apple-ios ;;
 host) triple=aarch64-apple-darwin ;;
-*) echo "target: ios or host" >&2; exit 1 ;;
+linux) triple=$(rustc "+$RUST_TOOLCHAIN" -vV | sed -n 's/^host: //p') ;;
+*) echo "target: ios, host or linux" >&2; exit 1 ;;
 esac
 export NMB_FIXTURE_AIR=$B/runtime_examples.air NMB_FC_AIR=$B/function_constant.air
 export IPHONEOS_DEPLOYMENT_TARGET=$IOS_MIN MACOSX_DEPLOYMENT_TARGET=14.0

@@ -4693,7 +4693,7 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Gotcha: `llvm-strip` refuses ld64's LC_SEGMENT_SPLIT_INFO on a dylib: use the theos `strip`. ffmpeg.org gave no tarball bytes here: pin by git commit. zsh: `echo =====` is an error, and `$VAR` with spaces does not split.
 - Refused by this session's permission check, so not done: running a prebuilt `ipsw`; fetching musl to run the arm64 test under qemu. So FFmpeg's NEON assembly has never run here. Owner decides.
 
-## Mi A3: honest build (2026-11-01, branch t3/laurel-build-honest, patch 2911). docs/laurel_sprout/build-honest.md
+## Mi A3: honest build (2026-11-01, branch t3/laurel-build-honest, patch 2912). docs/laurel_sprout/build-honest.md
 - [V] The `linker command failed` lines in a good kernel build are the DriverKit stub rounds of `build-with-iig.sh`: 2 failed links (build.log 2228, 2948), then `built kernel at` twice (3635 stubs, 6487 forwarding wrappers). `make` always ends `Error 2` (`check_all_exports`). Not a stale kernel. Never test the make exit code here.
 - [V] `apply-xnu.sh` deletes the xnu tree each run, so an old `BUILD/` kernel from an earlier run cannot exist. The real hole: round 3 fails after round 2 worked: `$K` stays with all DriverKit wrappers "unsupported" and `built kernel at` is already in the log. Test: `$K` must be newer than `iokit/DriverKit/OSObject.iig.cpp`.
 - Stamps: `kernel...4k.stamp`, `laurel-uefi-boot.img.stamp`, `$APPLE/laurel-ios16-root.manifest` (sidecar), `/usr/share/laurel/root-manifest`, ADT `/chosen laurel-image-build`. Series = patches + fixes + known-skips by name and contents.
@@ -4706,3 +4706,31 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Expected on the next boot (commit and times differ per build): `LAUREL BUILD: 6d170781ff 293 patches, series 2d00631deac21bf8, 4k`; `LAUREL BUILD: image 6d170781ff 20261101T155851Z kernel-series 2d00631deac21bf8 fd 68fda27c: kernel series matches`; `LAUREL BUILD: root ... features 11 installed 11 off 0 missing 0: kernel series matches`. Not seen on a phone yet.
 - Watchdogs: table in build-honest.md section 6. Nothing can reset the phone: IOWatchdog (topaz 0040) never fires, no APSS WDT driver. Only low-risk candidate: `zet=5000`, not booted.
 
+
+## Mi A3: mediaserverd with Metal, filter strip on the GPU, memory guard (2026-11-01, branch t3/laurel-mediaserverd-metal; flame/0020, camera plug-in, gate; built, host-tested, NOT BOOTED)
+
+- Owner: mediaserverd must run with Metal. Gate list `* -backboardd`. Details: docs/laurel_sprout/metal.md section 12.
+- [V] All 4 low-swap kills come 3-4 s after the `heap texture refused` burst; no burst, no kill (2 processes). 650+ MB/s: not per frame. Kill size = compressor limit, says nothing about the source.
+- [V cache] Burst = `-[FigMetalContext prewarmInternalMetalShadersForFormatsList:]`: heap of 32 bytes, 1x1 textures, makeAliasable each; ours was empty. `NoTargets` line = `-[FigColorCubeMetalFilter prewarmMetalInternalShader]`: 2x2 over 8x8 '420f'. Both are harmless signs of the failed imports and aliasing, not proven causes.
+- [V host] Filter AIR -> SPIR-V 13 MiB. Runtime + bridge on Intel ANV over 3000 filter frames: +0.0 KiB a frame. 32 pipelines +11 MiB. Not Turnip, not ir3, not CMCapture.
+- [U] The allocator. The no-Metal boot does not clear Metal or blame it: there every session crashed in the thumbnail node before the later deferred nodes.
+- [V boot 20:02] The 0x49 fallback imports real '420f' and '_RB4' surfaces on the phone (SpringBoard, chronod), no refusal; not yet in mediaserverd.
+- Guard does not stop an allocation in progress in stock code; it names it in one boot (VM tags, Metal counts, busiest thread's stack). The next fix follows from those lines.
+- Tool: `ipsw dyld disass ... --cache out/re/dsc.a2s`: a read-only mount cannot hold the symbol cache, the default path fails with exit 0 and an empty file. `dyld macho IMAGE --objc` for classes.
+- Gotcha: zsh (the agent's shell) reads an `echo ====` as a command and stops; `/usr/bin/time` is absent here.
+- Worktree build needs: submodule init with --reference for metal2vulkan, ios-flame, hackios-xnu-userland (+ alternates to the main repo's modules for b4c5513); reflink out/laurel-kernel/{theos,deps}, out/laurel-metal/{sdk,ipsw}, out/laurel/gpu; symlink external/{ios-topaz,ios-sweet-linux,hackios-scion} (remove them before you stage).
+- Build [V]: metal-build.sh all: exit 0, flame/0020 applies, check-imports PASS (0 missing), check PASS (0 instructions newer than ARMv8.0); gpu-userland.sh: gate `* -backboardd`; camera build + isp selftest PASS; cam-leak-test OK (+ cam7); camera-cache-check PASS, 157 imports, 0 missing; armv80-check NegroniCamera + gate: 0. Kernel: no change, not rebuilt.
+- Next: root (userdata) + owner test: metal.md 12.5. No boot image.
+
+## Mi A3: XNUtils as a system app with live stats; kern.laurel_stats (2026-11-01, branch t3/laurel-xnutils; built + host test + dry run, NOT RUN ON THE PHONE)
+- Details, table of sources, test steps: docs/laurel_sprout/xnutils.md. Sources: userland/laurel/xnutils; the OnePlus version in userland/rebootapp stays.
+- Decision [V]: no sysctl per driver. The 4 MiB console ring (sweet_ufs.c) already holds every driver line. 2911 parses new bytes at a read and in the log thread that wakes every 10 s: no hook in the print path, no driver work. Only 3 small readers of driver variables (thermal + governor, GPU level, Wi-Fi), because those lines come once a minute or stop at the line limit.
+- Gotcha [V]: the negroni helper's Restart UI finds no process here: Apple's backboardd runs from /usr/libexec/real/backboardd (bbd_wrap.c execs it). The Laurel helper takes both paths.
+- Gotcha [V]: on laurel nothing reads /var/db/negronigl: bbd_wrap.c had boot-args only. The GL switch is a new file /private/var/db/laurelgl/off, read at each start of backboardd.
+- Gotcha [V]: `NMTL[..]` lines + `RedwoodGPU: client X (open N)` are the only list of processes with a device. There is no close line: the report checks the name against the running processes ("running" or "exited").
+- Gotcha [V]: the slot key needs 3 words without a digit: with 2, `LAUREL CAMERA: ios session: start`, `: 30 frames` and `: end` shared a slot. With a word that has a digit dropped, `wake 3:` and `wake 4:` share one, as they must. Names in a key (`refused: backboardd`) make many slots: the report sums them (rp_count).
+- Gotcha: `sysctl -n` of an unknown name on an older kernel: the report says "this kernel has no kern.laurel_stats" and shows what files and system calls give.
+- Gotcha: a python heredoc inside a shell heredoc with the same delimiter ends early (zsh: "unmatched"). Use another delimiter. zsh is the agent shell here.
+- Tool: `scripts/laurel/xnutils-test.sh LOG` runs the table + report on any real log: a quick way to read one boot's state lines and crash table.
+- Build [V]: kernel-linux.sh 293/293, 0 LSE, sha256 763609fb4fb3b0fa...; xnutils-build.sh no warning, ARMv8.0 clean; xnutils-test.sh PASS; root-dry-run.sh PASS.
+- Next: owner test, xnutils.md section 6.
