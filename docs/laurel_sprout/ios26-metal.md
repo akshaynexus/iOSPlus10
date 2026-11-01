@@ -223,3 +223,70 @@ same bytes   libvulkan_freedreno.dylib, Info.plist, clients, CodeResources, care
 ```
 
 The third difference is the bridge `.a`, an input, not a staged file. The wrapper and the gate, compiled from base and head sources: `ios16-default-compat: 2 files: all the same bytes`. A base run before this one also gave another hash for these two binaries, so the UUID moves with each bridge build whatever the source is [V]: the Rust staticlib is not bit-reproducible here, and the code and data sections are the same.
+
+## 7. Kernel needs (for the xnu-12377 track, branch `t3/laurel-ios26-needs`). No kernel patch here
+
+| # | Need | Why | Evidence |
+|---|---|---|---|
+| K1 | Publish `IOAcceleratorES` with `MetalPluginName = NegroniMetal`, `MetalPluginClassName = NegroniMTLDevice` (port of laurel 2850) | Metal's match and CA's 300 x 100 ms poll are unchanged | [V] section 3 |
+| K2 | `RedwoodGPU` user client with the same msm ABI: 0x40-0x4c, 0x49 host pages, 0x7e surface import, 0x7d drawn; laurel 2160, 2161 | Turnip's KMD stand-in | [V] `metal.md` section 4 |
+| K3 | `topaz_gpu_gl_opened` stays keyed on process name `backboardd` | Pool surfaces, direct scanout off, watchdog follow Turnip with no change | [V] 2150, 2151, 2155 |
+| K4 | `IOMobileFramebuffer` SwapEnd: selector 5, 0x588 bytes, layers +0x48 | IOS-26-Hot 0141 reports the shift. Its text says "selector 4"; its code and the 23F84 binary say 5 [V] | [V] `kern_SwapEnd`; Hot [their boot] |
+| K5 | `IOSurfaceRootUserClient` sizes of 23F84: bulk attachments 132 bytes (struct 0x88 -> 0xa0), lookup results larger | Hot 0142 agrees with `ios26-userland.md` section 8 | both |
+| K6 | Display waits for a surface's GPU work as `topaz_surface_drawn` does, for surfaces imported by Turnip | Section 5 | [V] source |
+| K7 | Sleeping fence wait: short spin, then sleep woken by `CACHE_FLUSH_TS` IRQ | Hot 0151: 50 us + 250 us sleeps. Ours polls every 200 us. Fits the A610 better than the A640: a weak CPU pays more for polling [I] | Hot |
+| K8 | Vsync notification carries the refresh period | Hot 0121: CA's frame deadlines were always in the past without it | Hot; check ours |
+| K9 | Ad-hoc signatures with 4 KiB pages from `/System/Library/Extensions` and `/usr/local/bin` run in a platform process | Our files are `ldid -S`; the AMFI stand-in or a trust bundle must take them | [U] on 12377 |
+| K10 | `launchd.plist` is signed (`launchd.plist.sig`) [V]. To set `CA_DISABLE_FRAMEBUFFER_COMPRESSION=1` in the backboardd job, the track needs Hot's boot-arg `launchd_unsecure_cache=1` or its own trust | First-boot BGRA, as Hot. Preference files are the fallback already written | [V] file; Hot |
+| K11 | `work_interval` instance ops 6, 7, 8 | Hot, zeta: stripped ops that CA's work intervals call | Hot 0151 |
+
+## 8. Performance estimate. All [I]; no measured frame exists on this path
+
+Inputs [V Mesa table, kernel, logs]:
+
+| GPU | SP cores | Clock | Pixels | Report |
+|---|---:|---|---:|---|
+| A610 (ours) | 1 | 300 MHz, 600 by demand (2892, not booted) | 720 x 1560 = 1.12 M | GL on iOS 16: 32.9 fps moving, 10.5 ms in GL calls [V] |
+| A640 (IOS-26-Hot) | 2 | 675 MHz | 1125 x 2499 = 2.81 M | **52.9 fps Home swipe, 39.7 fps Settings scroll, live backdrop off** [their log, not verified] |
+| A660 (zeta) | 3 | 491 MHz [their table] | 2754 x 1892 = 5.21 M | **55-83 ms per present**, live glass, a full-frame GPU copy [their log] |
+
+Rule: GPU time per frame scales with pixels / (cores x clock). This ignores memory bandwidth, GMEM and shader mix, so it is a guide.
+
+| Against | GPU time ratio at 300 MHz | at 600 MHz | CPU time ratio |
+|---|---:|---:|---:|
+| A640 | 0.40 x 4.5 = **1.8** | **0.9** | **about 2 to 2.5** (A76 2.4-2.8 GHz with LSE vs A73 2.0 GHz with trampolines) |
+| A660 | 0.215 x 4.9 = **1.05** | **0.53** | **about 3 to 5** (X1; `ios26-userland.md`) |
+
+| Case | Their frame | Ours, half GPU + half CPU | fps |
+|---|---|---|---:|
+| Home swipe, live glass off, from A640 | 18.9 ms | 30-45 ms | **22-33** |
+| Settings scroll, live glass off, from A640 | 25.2 ms | 40-60 ms | **16-25** |
+| Live glass on, from A660 | 55-83 ms | 110-250 ms | **4-9** |
+
+So **zeta's 55-83 ms is not a floor for us**: its panel has 4.6 times our pixels and it copies each frame; our screen is scanned directly. But the shares GPU vs CPU are my assumption. If their frames are CPU-bound the numbers go down by up to 2 times. Other limits: our GMEM 132 KiB means 36 tiles against about 3 to 12 on theirs [I], so tiling is expensive here: sysmem may win, and framebuffer fetch on sysmem needs a flush per overlap (`sysmem_single_prim_mode`, 25.0.7) [V code]. Glass per pixel: 549 to 1703 instructions, at 1 core and 300 MHz about 8 instructions per clock [I] gives about 60 ms for a dock-sized region.
+
+Cold start: first frame after a new root likely 30 to 120 s [I]: 139+ pipelines at about 175 ms each on this CPU [V iOS 16: 6 in 1052 ms]. Warm: much less, through the persistent cache. Hot's prime job reports 21 pipelines in 1.4 s on an A76, warm.
+
+Memory: Hot reports a GPU pool of 416 to 593 of 944 MB with the bypass. At 0.4 of its pixels about 170 to 240 MB [I], inside our 512 MiB pool. With live glass add its 400-500 MB x 0.4: tight.
+
+## 9. Enable on iOS 26: entry points for the root track
+
+| Step | Command | Result |
+|---|---|---|
+| Build | `scripts/bg.sh ios26-metal scripts/laurel/ios26-metal-build.sh all` | `out/ios26/metal/stage`, checks: Mesa A610 entry, imports vs 23F84, abi-check, selector gap |
+| Install | `sudo scripts/laurel/root-add-metal-ios26.sh MOUNTED_ROOT` | bundle, probes, clients, env, CAEnable* preferences, jetsam |
+| Host chain | `scripts/ios26/metal-corpus.sh all`, `scripts/ios26/turnip-host.sh`, `scripts/ios26/ir3-check.sh` | evidence files |
+
+No launchd job, no wrapper. Clients: `* -chronod -cameracaptured -WidgetRenderer_Default -PosterBoard`: Hot's list on 23F84; those have CPU paths, and `_RB4` render targets remain open there. `METAL_CLIENTS=` replaces it. Lines at boot:
+
+```
+LAUREL METAL: on: Turnip a610 ...                         (kernel K1)
+NMTL[.. backboardd]: device Turnip Adreno (TM) 610 in N ms ...
+NMTL[.. backboardd]: LAUREL METAL26: on: Metal device Turnip Adreno (TM) 610 for the compositor
+NMTL[.. backboardd]: LAUREL GLASS: on: live CABackdropLayer capture off in backboardd (...)
+NMTL[.. backboardd]: LAUREL METAL26: first frame on a screen surface (720 x 1560, format 0x42475241) S s after the device opened
+NMTL[.. backboardd]: LAUREL METAL26: screen: L of 64 samples lit, ...
+```
+
+Failure on iOS 26 has **no fallback**: `LAUREL METAL26: off: ...: CA::WindowServer::AccelServer::renderer has no renderer, the screen stays as it is`. USB log and SSH stay. There is no GL on 23F84 (`ios26-userland.md` 8.1).
+

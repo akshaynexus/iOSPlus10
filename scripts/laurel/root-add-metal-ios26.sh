@@ -41,6 +41,23 @@ chmod 644 "$D/clients" "$R/System/Library/Extensions/NegroniMetal.bundle/clients
   if [ -n "${METAL_ENV:-}" ]; then printf '%s\n' "$METAL_ENV"; fi
 } > "$D/env"
 chmod 644 "$D/env"
+# CA reads these once: a first boot must already pick 8-bit BGRA, no compressed framebuffer (IOS-26-Hot, wave 6: BGRA from boot 1). The plug-in sets them too, at its device open, which can be late [I].
+python3 -I - "$R" <<'PY'
+import os, plistlib, sys
+root = sys.argv[1]
+for home in ("private/var/mobile", "private/var/root"):
+    d = os.path.join(root, home, "Library/Preferences")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "com.apple.backboardd.plist")
+    v = {}
+    if os.path.exists(p):
+        with open(p, "rb") as f:
+            v = plistlib.load(f)
+    v.update({"CAEnableDeepFramebuffer": False, "CAEnableFramebufferCompression": False, "CAEnableIOSurfaceCompression": False})
+    with open(p, "wb") as f:
+        plistlib.dump(v, f, fmt=plistlib.FMT_BINARY)
+print("laurel-root: metal26: CAEnable* false in com.apple.backboardd")
+PY
 # Extensions with a Metal device: as on iOS 16, every extension point at least 64 MiB, posters 128 (jetsam file of this donor: com.apple.jetsamproperties.N104.plist [V])
 for j in "$R"/System/Library/LaunchDaemons/com.apple.jetsamproperties.*.plist; do
   [ -f "$j" ] || continue
