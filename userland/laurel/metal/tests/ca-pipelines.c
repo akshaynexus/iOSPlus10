@@ -98,6 +98,19 @@ int main(int argc, char **argv)
 		printf("FAIL device: %s\n", nmb_last_error());
 		return 3;
 	}
+	/* the answers CoreAnimation's new_metal_context reads, from this device */
+	static const char *const asked[] = { "supportsRasterOrderGroups", "supportsNativeHardwareFP16", "supportsMemorylessRenderTargets", "supportsSIMDGroup", "supportsTileShaders",
+					     "supportsSIMDReduction", "supportsSIMDShuffleAndFill", "supportsYCBCRFormats12", "supportsYCBCRPackedFormats12", "supportsLossyCompression", NULL };
+	for (const char *const *q = asked; *q; q++) {
+		uint64_t v = 0;
+		bool have = nmb_device_answer(dev, *q, 0, &v);
+		printf("answer %s = %llu%s\n", *q, (unsigned long long)v, have ? "" : " (no answer of its own)");
+	}
+	for (uint64_t family = 1001; family <= 1010; family++) {
+		uint64_t v = 0;
+		bool have = nmb_device_answer(dev, "supportsFamily:", family, &v);
+		printf("answer supportsFamily:%llu = %llu%s\n", (unsigned long long)family, (unsigned long long)v, have ? "" : " (none)");
+	}
 	FILE *f = fopen(argv[3], "rb");
 	if (!f) {
 		perror(argv[3]);

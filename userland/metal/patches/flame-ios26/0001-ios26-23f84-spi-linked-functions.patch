@@ -1,8 +1,8 @@
 diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
-index d8f5903..bc98480 100644
+index 5ebeeab..4eff61a 100644
 --- a/phone/metal2/NativeBridgeMetalFrontend.mm
 +++ b/phone/metal2/NativeBridgeMetalFrontend.mm
-@@ -158,6 +158,7 @@ static void journal(const std::string &line) {
+@@ -159,6 +159,7 @@ static void journal(const std::string &line) {
  - (id<MTLDevice>)device {return gDeviceObject;}
  // Metal SPI (Metal Performance Shaders asks every encoder and command buffer): an identity for its traces.
  - (uint64_t)globalTraceObjectID {return (uint64_t)(uintptr_t)self;}
@@ -10,7 +10,7 @@ index d8f5903..bc98480 100644
  - (void)doesNotRecognizeSelector:(SEL)selector {
   if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
   noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
-@@ -179,7 +180,14 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer);
+@@ -180,7 +181,14 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer);
  - (id<MTLHeap>)heap {return _parentHeap;} \
  - (BOOL)isAliasable {return NO;} \
  - (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
@@ -26,7 +26,7 @@ index d8f5903..bc98480 100644
  @interface NBBuffer : NBObject
  @property(nonatomic) NmbBuffer *handle;
  @property(nonatomic) MTLResourceOptions options;
-@@ -202,6 +210,7 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer);
+@@ -203,6 +211,7 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer);
  @property(nonatomic) NSUInteger heapOffset;
  @end
  @implementation NBBuffer
@@ -34,7 +34,7 @@ index d8f5903..bc98480 100644
  - (void)setHandle:(NmbBuffer *)handle {
   if(!_handle && handle){gLiveBuffers++;gLiveBufferBytes+=(int64_t)nmb_buffer_length(handle);}
   _handle=handle;
-@@ -279,6 +288,24 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+@@ -280,6 +289,24 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
   return true;
  }
  @implementation NBTexture
@@ -59,20 +59,74 @@ index d8f5903..bc98480 100644
  - (void)setHandle:(NmbTexture *)handle {if(!_handle && handle)gLiveTextures++;_handle=handle;}
  - (void)setSurface:(IOSurfaceRef)surface {if(!_surface && surface)gLiveSurfaceTextures++;_surface=surface;}
  - (void)makeAliasable {if(_parentHeap && !nmb_texture_make_aliasable(_handle))noteRefused(@"heap texture makeAliasable",lastError());}
-@@ -430,6 +457,12 @@ static id<MTLArgumentEncoder> nbFunctionArgumentEncoder(NBFunction *function,NSU
+@@ -419,18 +446,42 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
+ @end
+ 
+ // ---- libraries, functions, states ----
+-@interface NBLibrary : NBObject
++@interface NBLibrary : NBObject {
++ @public
++ uint8_t _libraryHash[CC_SHA256_DIGEST_LENGTH];
++}
+ @property(nonatomic) NmbLibrary *handle;
++- (void)hashBytes:(const void *)bytes length:(size_t)length;
+ @end
+ @class NBFunction;
+ static id<MTLArgumentEncoder> nbFunctionArgumentEncoder(NBFunction *function,NSUInteger index);   // NegroniMetal (flame/0011)
+-@interface NBFunction : NBObject <MTLFunction>
++@interface NBFunction : NBObject <MTLFunction> {
++ @public
++ uint8_t _bitCodeHash[CC_SHA256_DIGEST_LENGTH];
++}
+ @property(nonatomic) NmbFunction *handle;
+ @property(nonatomic,copy) NSString *name;
+ @property(nonatomic) MTLFunctionType functionType;
  @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
  @end
  @implementation NBFunction
 +// iOS 26 RenderBox and CoreImage read these for their own checks: no reflection on this path (empty, as for a function with no arguments).
 +- (NSArray *)arguments {return @[];}
 +- (id)returnType {return nil;}
-+- (id)bitCodeHash {return nil;}
++// Ported from IOS-26-Hot (d249939, MIT): CoreImage and IconServices read 32 bytes through this pointer (-[_MTLFunctionInternal bitCodeHash] ABI), so no nil. -libraryData stays out on purpose:
++// its callers dereference an Apple C++ MTLLibraryData (Hot: "Battery" row falls back cleanly without it).
++- (void)hashWithLibrary:(const uint8_t *)library {
++ std::string buf((const char *)library,CC_SHA256_DIGEST_LENGTH);
++ buf+=self.name.UTF8String?:"";buf.push_back(0);buf+=std::to_string((uint64_t)self.functionType);buf.push_back(0);buf+=self.constantsText;
++ CC_SHA256(buf.data(),(CC_LONG)buf.size(),_bitCodeHash);
++}
++- (const void *)bitCodeHash {return _bitCodeHash;}
++- (const void *)baseFunctionHash {return _bitCodeHash;}
++- (const void *)functionConstantSpecializationHash {return _bitCodeHash;}
++- (NSUInteger)bitCodeFileSize {return 0;}
++- (NSData *)bitcodeData {return nil;}
 +- (NSArray *)importedLibraries {return @[];}
 +- (NSString *)filePath {return nil;}
  - (void)dealloc {nmb_function_release(_handle);}
  - (id<MTLDevice>)device {return gDeviceObject;}
  - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
-@@ -543,6 +576,13 @@ static std::string quartzCoreCallers();
+@@ -490,6 +541,12 @@ static uint64_t constantBytes(uint64_t type) {
+ }
+ static std::string quartzCoreCallers();
+ @implementation NBLibrary
++- (void)hashBytes:(const void *)bytes length:(size_t)length {
++ if(bytes && length)CC_SHA256(bytes,(CC_LONG)MIN(length,(size_t)0x40000000u),_libraryHash);
++ else {const uintptr_t tag=(uintptr_t)self;CC_SHA256(&tag,(CC_LONG)sizeof tag,_libraryHash);}
++}
++- (const void *)libraryId {return _libraryHash;}
++- (NSData *)bitCodeWithHash:(const void *)hash {(void)hash;return nil;}
+ - (void)dealloc {nmb_library_release(_handle);}
+ - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
+  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
+@@ -531,7 +588,7 @@ static std::string quartzCoreCallers();
+   if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
+  }
+  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+- function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
++ function.constantsText=text;[function hashWithLibrary:_libraryHash];if(error)*error=nil;return (id<MTLFunction>)function;
+ }
+ - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
+@@ -544,6 +601,13 @@ static std::string quartzCoreCallers();
  - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
  // The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
  // runtime does when the function is made.
@@ -86,7 +140,15 @@ index d8f5903..bc98480 100644
  - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
   if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
   if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
-@@ -573,6 +613,12 @@ static std::string quartzCoreCallers();
+@@ -563,6 +627,7 @@ static std::string quartzCoreCallers();
+  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
+  if(!handle)return nil;
+  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
++ [function hashWithLibrary:_libraryHash];
+  return (id<MTLFunction>)function;
+ }
+ @end
+@@ -574,6 +639,12 @@ static std::string quartzCoreCallers();
  - (void)dealloc {if(_handle)gLivePipelines--;nmb_compute_pipeline_release(_handle);}
  - (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
  - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
@@ -99,7 +161,7 @@ index d8f5903..bc98480 100644
  // NegroniMetal: identity for argument tables (not used: no argument buffers here) and no separate shader memory to report
  - (MTLResourceID)gpuResourceID {MTLResourceID r;r._impl=(uint64_t)(uintptr_t)self;return r;}
  - (NSUInteger)allocatedSize {return 0;}
-@@ -583,6 +629,13 @@ static std::string quartzCoreCallers();
+@@ -584,6 +655,13 @@ static std::string quartzCoreCallers();
  @implementation NBRenderPipeline
  - (void)setHandle:(NmbRenderPipeline *)handle {if(!_handle && handle)gLivePipelines++;_handle=handle;}
  - (void)dealloc {if(_handle)gLivePipelines--;nmb_render_pipeline_release(_handle);}
@@ -113,7 +175,7 @@ index d8f5903..bc98480 100644
  // The threadgroup size a tile dispatch of this pipeline could use: the device's limit (no tile shaders are offered).
  - (NSUInteger)maxTotalThreadsPerThreadgroup {
   uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))return 0;
-@@ -614,6 +667,7 @@ static std::string quartzCoreCallers();
+@@ -615,6 +693,7 @@ static std::string quartzCoreCallers();
  - (void)dealloc {nmb_event_release(_handle);}
  @end
  @interface NBSharedEvent : NBEvent
@@ -121,7 +183,7 @@ index d8f5903..bc98480 100644
  @end
  static void notified(void *context,uint64_t value);
  @implementation NBSharedEvent
-@@ -650,6 +704,7 @@ static void notified(void *context,uint64_t value) {
+@@ -651,6 +730,7 @@ static void notified(void *context,uint64_t value) {
  
  // ---- command buffers and encoders ----
  @interface NBQueue : NBObject
@@ -129,17 +191,34 @@ index d8f5903..bc98480 100644
  @property(nonatomic) NmbQueue *handle;
  @property(atomic,strong) dispatch_queue_t completionQueue;   // SPI: where command buffers' handlers run (nil: the runtime's thread)
  @end
-@@ -714,6 +769,9 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
+@@ -685,6 +765,7 @@ static void notified(void *context,uint64_t value) {
+ @property(nonatomic) MTLHeapType heapType;
+ @end
+ @interface NBEncoder : NBObject
++@property(nonatomic) BOOL refused;   // inert: the command buffer has failed already, later calls do nothing
+ @property(nonatomic) NmbEncoder *handle;
+ @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
+ @end
+@@ -715,12 +796,18 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
   }
  }
  @implementation NBEncoder
++- (void)barrierAfterQueueStages:(NSUInteger)after beforeStages:(NSUInteger)before {(void)after;(void)before;}
 +// Residency sets name memory to keep resident: every allocation here stays resident while it lives.
 +- (void)useResidencySet:(id)set {(void)set;}
 +- (void)useResidencySets:(const id __unsafe_unretained *)sets count:(NSUInteger)count {(void)sets;(void)count;}
  - (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
  - (bool)check:(bool)ok what:(const char *)what {
++ if(_refused)return false;
   if(!ok)[_commandBuffer refuse:[NSString stringWithFormat:@"%s: %@",what,lastError()]];
-@@ -813,6 +871,7 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
+  return ok;
+ }
+ - (void)endEncoding {
++ if(_refused)return;
+  NmbEncoder *handle=_handle;_handle=nullptr;
+  if(!handle){[_commandBuffer refuse:@"endEncoding twice"];return;}
+  [self check:nmb_encoder_end(handle) what:"endEncoding"];
+@@ -814,6 +901,7 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
  @end
  @implementation NBComputeEncoder
  - (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
@@ -147,18 +226,22 @@ index d8f5903..bc98480 100644
  - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
   if(![(id)state isKindOfClass:[NBComputePipeline class]]){_skipDispatches=YES;noteSkipped(state?@"foreign compute pipeline":@"nil compute pipeline",false);return;}
   if(!nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle])) {
-@@ -970,6 +1029,10 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
+@@ -971,6 +1059,14 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
  - (NSUInteger)tileWidth {return 0;}
  - (NSUInteger)tileHeight {return 0;}
  - (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {(void)t;(void)i;noteSkipped(@"tile shaders not supported",false);}
 +- (void)setTileBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {(void)b;(void)o;(void)i;noteSkipped(@"tile shaders not supported",true);}
 +- (void)setTileSamplerState:(id<MTLSamplerState>)st atIndex:(NSUInteger)i {(void)st;(void)i;noteSkipped(@"tile shaders not supported",true);}
 +- (void)setPointSize:(float)size {(void)size;}
++- (void)setViewports:(const MTLViewport *)v count:(NSUInteger)c {if(v && c)[self setViewport:v[0]];}     // IOS-26-Hot (MIT): one viewport and scissor on this path
++- (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)c {if(r && c)[self setScissorRect:r[0]];}
++- (void)memoryBarrierWithScope:(MTLBarrierScope)b afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {(void)b;(void)after;(void)before;}
++- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)c afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {(void)r;(void)c;(void)after;(void)before;}
 +- (void)setFragmentVisibleFunctionTable:(id)table atBufferIndex:(NSUInteger)i {(void)table;(void)i;noteSkipped(@"visible function tables not supported",true);}
  - (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;noteSkipped(@"tile shaders not supported",false);}
  - (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;noteSkipped(@"tile shaders not supported",false);}
  - (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;noteSkipped(@"tile shaders not supported",false);}
-@@ -1066,6 +1129,28 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
+@@ -1067,6 +1163,28 @@ static void noteNoCopyDealloc(__unsafe_unretained NBBuffer *buffer) {
   const uint64_t a[3]={so.x,so.y,so.z},size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
   [self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a,size,[(NBTexture *)d handle],ds,dl,b) what:"copyFromTexture:toTexture:"];
  }
@@ -187,13 +270,38 @@ index d8f5903..bc98480 100644
  - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
   if(![self textures:NB_OBJECTS(s,d) count:2])return;
   const NSUInteger levels=MIN(s.mipmapLevelCount,d.mipmapLevelCount),slices=MIN(s.arrayLength,d.arrayLength);
-@@ -1273,8 +1358,14 @@ static void scheduled(void *context);
+@@ -1203,9 +1321,12 @@ static void scheduled(void *context);
+ - (BOOL)commitAndWaitUntilSubmitted {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
+ - (CFTimeInterval)GPUStartTime {return nmb_command_buffer_gpu_time(_handle,false);}
+ - (CFTimeInterval)GPUEndTime {return nmb_command_buffer_gpu_time(_handle,true);}
++- (id)refuseEncoder:(NBEncoder *)encoder why:(NSString *)why {
++ [self refuse:why];encoder.refused=YES;encoder.commandBuffer=self;return encoder;
++}
+ - (id)encoder:(NBEncoder *)encoder handle:(NmbEncoder *)handle what:(NSString *)what {
+- if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
+- if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];return nil;}
++ if(self.committed)return [self refuseEncoder:encoder why:[what stringByAppendingString:@" after commit"]];
++ if(!handle)return [self refuseEncoder:encoder why:[NSString stringWithFormat:@"%@: %@",what,lastError()]];
+  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
+ }
+ - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
+@@ -1274,8 +1395,24 @@ static void scheduled(void *context);
  - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
  - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
  - (void)enqueue {}
 +// iOS 26 QuartzCore: the client tasks a render-server command buffer works for (attribution), and MetalTools' debug encoder.
 +- (void)setResponsibleTaskIDs:(const unsigned int *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 +- (id)debugCommandEncoder {return nil;}
++// IOS-26-Hot (MIT): more SPI of the same kind, each sent on 23F84: no state on this path.
++- (void)useInternalResidencySet:(id)set {(void)set;}
++- (void)useInternalResidencySets:(const id __unsafe_unretained *)sets count:(NSUInteger)count {(void)sets;(void)count;}
++- (void)barrierAfterQueueStages:(NSUInteger)after beforeStages:(NSUInteger)before {(void)after;(void)before;}
++- (void)dropResourceGroups:(const id __unsafe_unretained *)groups count:(NSUInteger)count {(void)groups;(void)count;}
++- (void)setResourceGroups:(const id __unsafe_unretained *)groups count:(NSUInteger)count {(void)groups;(void)count;}
++- (BOOL)isCommitted {return self.committed;}
++- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value agentMask:(uint64_t)mask {(void)mask;[self event:event value:value signal:true];}
++- (void)encodeSignalEventScheduled:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:true];}
++- (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value timeout:(uint32_t)timeout {(void)timeout;[self event:event value:value signal:false];}
 +- (void)useResidencySet:(id)set {(void)set;}
 +- (void)useResidencySets:(const id __unsafe_unretained *)sets count:(NSUInteger)count {(void)sets;(void)count;}
  - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
@@ -202,7 +310,7 @@ index d8f5903..bc98480 100644
   if(self.committed){[self refuse:@"event encoded after commit"];return;}
   NmbEvent *handle=[(NBEvent *)event handle];
   if(!(signal?nmb_command_buffer_signal_event(_handle,handle,value):nmb_command_buffer_wait_event(_handle,handle,value)))
-@@ -1448,8 +1539,25 @@ static void completed(void *context) {
+@@ -1457,8 +1594,39 @@ static void completed(void *context) {
  - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submission happens on the caller's thread here
  // setCompletionQueue: is the property's setter.
  // GPU priorities are not applied (one hardware queue): reported as not applied.
@@ -219,6 +327,20 @@ index d8f5903..bc98480 100644
 +- (BOOL)supportsBackgroundAppRole {return NO;}
 +- (void)insertDebugCaptureBoundary {}
 +- (void)addPerfSampleHandler:(id)handler {(void)handler;}
++// IOS-26-Hot (MIT): IOGPUMetalCommandQueue's plain answers
++- (NSUInteger)qosLevel {return 0;}
++- (dispatch_queue_t)commitQueue {return nil;}
++- (BOOL)commitSynchronously {return NO;}
++- (BOOL)commitsWithQoS {return NO;}
++- (BOOL)disableCrossQueueHazardTracking {return NO;}
++- (NSUInteger)maxCommandBufferCount {return 64;}
++- (BOOL)isOpenGLQueue {return NO;}
++- (void)dispatchAvailableCompletionNotifications {}
++- (NSArray *)availableCounters {return @[];}
++- (void)addInternalResidencySet:(id)set {(void)set;}
++- (void)addInternalResidencySets:(const id __unsafe_unretained *)sets count:(NSUInteger)count {(void)sets;(void)count;}
++- (void)removeInternalResidencySet:(id)set {(void)set;}
++- (void)removeInternalResidencySets:(const id __unsafe_unretained *)sets count:(NSUInteger)count {(void)sets;(void)count;}
 +- (BOOL)requestCounters:(id)counters withIndex:(NSUInteger)index {(void)counters;(void)index;return NO;}
 +- (void)setStatEnabled:(BOOL)enabled {(void)enabled;}
 +- (void)setStatLocations:(NSUInteger)locations {(void)locations;}
@@ -230,7 +352,7 @@ index d8f5903..bc98480 100644
  - (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {(void)d;return [self commandBuffer];}
  // NegroniMetal: SPI -finish waits for every command buffer of this queue that is committed and not yet complete
  - (void)finish {
-@@ -1540,7 +1648,39 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
+@@ -1549,7 +1717,39 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
   journal(line);
  }
  // A render pipeline descriptor in the bridge's form; false, with the error, for a function of another device.
@@ -271,7 +393,7 @@ index d8f5903..bc98480 100644
   if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
    if(error)*error=nbError(@"foreign function");return false;
   }
-@@ -1647,11 +1787,15 @@ static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipeline
+@@ -1656,11 +1856,15 @@ static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipeline
  @property(nonatomic) NmbBinaryArchive *handle;
  @end
  @implementation NBBinaryArchive
@@ -288,7 +410,71 @@ index d8f5903..bc98480 100644
   if(!ok)return failWith<BOOL>(error,@"archive render pipeline",NO);
   if(error)*error=nil;return YES;
  }
-@@ -2349,6 +2493,58 @@ static std::string mslOptions(MTLCompileOptions *o) {
+@@ -1771,6 +1975,37 @@ static id<MTLArgumentEncoder> nbFunctionArgumentEncoder(NBFunction *function,NSU
+ - (void)setIntersectionFunctionTables:(const id<MTLIntersectionFunctionTable> __unsafe_unretained [])t withRange:(NSRange)r {(void)t;(void)r;[self unbridged:"setIntersectionFunctionTables:"];}
+ @end
+ 
++// A residency set that keeps the list only (IOS-26-Hot, MIT): every allocation stays resident while it lives. _MTLDevice's own form makes Apple's class, which expects Apple's resources.
++@interface NBResidencySet : NBObject {
++ NSMutableSet *_allocations;
++}
++@end
++@implementation NBResidencySet
++- (instancetype)init {if((self=[super init]))_allocations=[NSMutableSet new];return self;}
++- (uint64_t)allocatedSize {
++ uint64_t total=0;
++ @synchronized(self){for(id a in _allocations)if([a respondsToSelector:@selector(allocatedSize)])total+=[(id<MTLResource>)a allocatedSize];}
++ return total;
++}
++- (NSUInteger)allocationCount {@synchronized(self){return _allocations.count;}}
++- (NSArray *)allAllocations {@synchronized(self){return _allocations.allObjects;}}
++- (NSArray *)allCommittedAllocations {return [self allAllocations];}
++- (BOOL)containsAllocation:(id)a {if(!a)return NO;@synchronized(self){return [_allocations containsObject:a];}}
++- (NSUInteger)countForAllocation:(id)a {return [self containsAllocation:a]?1:0;}
++- (void)addAllocation:(id)a {if(a)@synchronized(self){[_allocations addObject:a];}}
++- (void)addAllocations:(const id __unsafe_unretained [])as count:(NSUInteger)n {if(as)@synchronized(self){for(NSUInteger i=0;i<n;i++)if(as[i])[_allocations addObject:as[i]];}}
++- (void)removeAllocation:(id)a {if(a)@synchronized(self){[_allocations removeObject:a];}}
++- (void)removeAllocations:(const id __unsafe_unretained [])as count:(NSUInteger)n {if(as)@synchronized(self){for(NSUInteger i=0;i<n;i++)if(as[i])[_allocations removeObject:as[i]];}}
++- (void)removeAllAllocations {@synchronized(self){[_allocations removeAllObjects];}}
++- (uint64_t)currentGeneration {return 1;}
++- (void)setCurrentGeneration:(uint64_t)g {(void)g;}
++- (uint64_t)expiredGeneration {return 0;}
++- (void)setExpiredGeneration:(uint64_t)g {(void)g;}
++- (uint64_t)generationForAllocation:(id)a {return [self containsAllocation:a]?1:0;}
++- (void)commit {}
++- (void)requestResidency {}
++- (void)endResidency {}
++@end
+ @interface NBDeviceMethods : NSObject
+ @end
+ // Bytes of one texel of the uncompressed formats Core Animation and RenderBox use (4 for the rest).
+@@ -2115,14 +2350,14 @@ static NBTexture *textureOnSurfacePlane(NBBuffer *buffer,MTLTextureDescriptor *d
+  const uint64_t libraryBegan=nowUs();
+  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
+  if(!handle)return failWith<id<MTLLibrary>>(error,[NSString stringWithFormat:@"library (data, %zu bytes)",size],nil);
+- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
++ NBLibrary *library=[NBLibrary new];library.handle=handle;[library hashBytes:bytes length:size];if(error)*error=nil;return (id<MTLLibrary>)library;
+ }
+ - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
+  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
+  const uint64_t libraryBegan=nowUs();
+  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
+  if(!handle)return failWith<id<MTLLibrary>>(error,[NSString stringWithFormat:@"library %@ (%lu bytes)",path,(unsigned long)bytes.length],nil);
+- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
++ NBLibrary *library=[NBLibrary new];library.handle=handle;[library hashBytes:bytes.bytes length:bytes.length];if(error)*error=nil;return (id<MTLLibrary>)library;
+ }
+ - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
+  if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
+@@ -2307,7 +2542,7 @@ static std::string mslOptions(MTLCompileOptions *o) {
+         (unsigned long)source.length,(unsigned long)air.length,metallib?"metallib":"bare AIR",how,(unsigned long long)((translated-began)/1000),
+         (unsigned long long)((nowUs()-translated)/1000),getprogname());
+  journal(std::string("L source ")+std::to_string(source.length)+" chars -> "+std::to_string(air.length)+" bytes ("+how+")");
+- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
++ NBLibrary *library=[NBLibrary new];library.handle=handle;[library hashBytes:air.bytes length:air.length];if(error)*error=nil;return (id<MTLLibrary>)library;
+ }
+ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options completionHandler:(MTLNewLibraryCompletionHandler)handler {
+  NSError *error=nil;id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithSource:source options:options error:&error];
+@@ -2358,6 +2593,89 @@ static std::string mslOptions(MTLCompileOptions *o) {
   if(!handle)return failWith<id<MTLComputePipelineState>>(error,[NSString stringWithFormat:@"compute pipeline (%@)",[(id<MTLFunction>)function name]?:@"-"],nil);
   NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
  }
@@ -329,6 +515,37 @@ index d8f5903..bc98480 100644
 + [(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionNone
 +  completionHandler:^(id<MTLRenderPipelineState> state,MTLRenderPipelineReflection *reflection,NSError *error){(void)reflection;handler(state,error);}];
 +}
++- (id)newResidencySetWithDescriptor:(id)d error:(NSError **)error {
++ NBResidencySet *set=[NBResidencySet new];
++ if([d respondsToSelector:@selector(label)])set.label=[(NBObject *)d label];
++ if(error)*error=nil;
++ return set;
++}
++// IOS-26-Hot (MIT): _MTLDevice's stitched and dynamic forms schedule MTLCompilerStitchingRequest, which aborts in -[NBFunction libraryData] (iconservicesagent). Refused here, with an error the callers handle.
++- (id)newLibraryWithStitchedDescriptor:(id)descriptor error:(NSError **)error {
++ (void)descriptor;if(error)*error=nbError(@"stitched libraries are not supported");return nil;
++}
++- (void)newLibraryWithStitchedDescriptor:(id)descriptor completionHandler:(void (^)(id,NSError *))handler {
++ (void)descriptor;NSError *error=nbError(@"stitched libraries are not supported");
++ if(handler)dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{handler(nil,error);});
++}
++- (id)newLibraryWithStitchedDescriptorSPI:(id)descriptor error:(NSError **)error {return [self newLibraryWithStitchedDescriptor:descriptor error:error];}
++- (void)newLibraryWithStitchedDescriptorSPI:(id)descriptor completionHandler:(void (^)(id,NSError *))handler {[self newLibraryWithStitchedDescriptor:descriptor completionHandler:handler];}
++- (id)newDynamicLibrary:(id)library error:(NSError **)error {(void)library;if(error)*error=nbError(@"dynamic libraries are not supported");return nil;}
++- (id)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error {(void)url;if(error)*error=nbError(@"dynamic libraries are not supported");return nil;}
++// IOS-26-Hot (MIT): plain answers that _MTLDevice reads from Apple's tables
++- (BOOL)supportPriorityBand {return NO;}
++- (BOOL)supportsExplicitVisibilityGroups {return NO;}
++- (BOOL)supportsExtendedSamplerLODBiasRange {return NO;}
++- (BOOL)supportsMXU {return NO;}
++- (BOOL)supportsMeshShaders {return NO;}
++- (BOOL)supportsPerPlaneCompression {return NO;}
++- (BOOL)supportsPlacementSparse {return NO;}
++- (BOOL)supportsSampleCount:(NSUInteger)count {return [(id<MTLDevice>)self supportsTextureSampleCount:count];}
++- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane slice:(NSUInteger)slice {
++ if(slice!=0)return nil;
++ return [(id<MTLDevice>)self newTextureWithDescriptor:d iosurface:surface plane:plane];
++}
 +// CoreImage's private scalar query (zeta: SBRendererService aborted on it): the lowest profile; measured runtime answers stay authoritative.
 +- (NSUInteger)featureProfile {return 0;}
 +// iOS 26 IconRendering, RenderBox: a texture buffer's offset alignment is the linear one.
@@ -347,7 +564,7 @@ index d8f5903..bc98480 100644
  - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
                                                         reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
   if(reflection)*reflection=nil;
-@@ -2371,7 +2567,8 @@ static std::string mslOptions(MTLCompileOptions *o) {
+@@ -2380,7 +2698,8 @@ static std::string mslOptions(MTLCompileOptions *o) {
   if(reflection)*reflection=nil;
   if(pipelinesStopped(error))return nil;
   auto *p=new NmbRenderPipelineDescriptor();
@@ -357,6 +574,15 @@ index d8f5903..bc98480 100644
   std::vector<NmbBinaryArchive *> archives;
   if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
   const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+@@ -2540,7 +2859,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
+ // Bare AIR bitcode (no metallib wrapper), which Metal itself refuses: for the bridge's own fixtures only.
+ extern "C" id native_bridge_metal_library_with_air(const void *bytes,size_t length) {
+  NmbLibrary *handle=gDevice?nmb_library_new(gDevice,bytes,length,true):nullptr;if(!handle)return nil;
+- NBLibrary *library=[NBLibrary new];library.handle=handle;return library;
++ NBLibrary *library=[NBLibrary new];library.handle=handle;[library hashBytes:bytes length:length];return library;
+ }
+ extern "C" bool native_bridge_metal_shader_cache_stats(NmbShaderCacheStats *out) {
+  return gDevice && nmb_device_shader_cache_stats(gDevice,out);
 diff --git a/phone/metal2/bridge/NativeMetalObjects.h b/phone/metal2/bridge/NativeMetalObjects.h
 index 334c6d6..d0ca0cd 100644
 --- a/phone/metal2/bridge/NativeMetalObjects.h

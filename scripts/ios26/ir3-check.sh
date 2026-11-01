@@ -38,6 +38,7 @@ one() {
 export -f one; export W A REPO
 ls "$W"/rows/r???? | xargs -P "$NPROC" -n 1 bash -c 'one "$0"'
 cat "$W"/rows/r????.out | grep -E '^(ok|FAIL)' > "$W/result.tsv"
+grep -h -E '^answer ' "$W"/rows/r0000.out > "$W/answers.txt" || true
 { printf 'pipeline\tstage\tinstr\tnops\tmov\tcov\tdwords\thalf\tfull\tconstlen\tcat5\tcat6\tsstall\tsystall\tloops\n'; cat "$W"/rows/r????.stats; } > "$W/stats.tsv"
 rm -rf "$W/rows"
 echo "ir3-check: $(grep -c '^ok' "$W/result.tsv") made, $(grep -c '^FAIL' "$W/result.tsv") refused"

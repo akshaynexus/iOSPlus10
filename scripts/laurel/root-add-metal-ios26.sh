@@ -6,7 +6,7 @@
 #   /System/Library/Extensions/NegroniMetal.bundle/{NegroniMetal,Info.plist,libvulkan_freedreno.dylib,clients,clients.local}   Metal.framework reads this folder [V 23F84 getMetalPluginClassForService]
 #   /usr/local/bin/{vkprobe,metalprobe,mslprobe,m2vtest,carenderprobe,layerprobe}
 #   /private/var/db/negronimetal/{clients,env,cache/,strikes/,metal.log,build.txt}
-# Clients: "*", backboardd included: 23F84 has no GL path (CA::WindowServer::AccelServer::renderer is Metal or nothing). So no gate job (iOS 16's laurel-metal-gate): a gate that widens the list after a test comes too late
+# Clients: "*" minus four (below), backboardd included: 23F84 has no GL path (CA::WindowServer::AccelServer::renderer is Metal or nothing). So no gate job (iOS 16's laurel-metal-gate): a gate that widens the list after a test comes too late
 # for backboardd, and launchd.plist is signed here (launchd.plist.sig), so no job goes in without the kernel track's trust work. The self-check is the plug-in's (device open + self-test at each start; one LAUREL METAL26 line).
 # No GL wrapper: /usr/libexec/backboardd stays Apple's (the lowered copy). Kill switches: boot-arg negronimetal=0, file /private/var/db/negronimetal/off; both mean no renderer in backboardd (phone reachable, screen stays).
 # METAL_ENV="KEY=VALUE..." lines added to the env file. Kernel needs: docs/laurel_sprout/ios26-metal.md section 7.
@@ -23,13 +23,15 @@ for f in "$B/NegroniMetal" "$B/libvulkan_freedreno.dylib" "$B/Info.plist"; do
 done
 [ -d "$R/System/Library/Extensions" ] && [ -f "$R/usr/libexec/backboardd" ] || { echo "laurel-root: metal26: off: $R does not look like an iOS root"; exit 1; }
 python3 -I "$REPO/scripts/ios26/abi-check.py" "$S" > /dev/null || { echo "laurel-root: metal26: off: the stage fails scripts/ios26/abi-check.py"; exit 1; }
-METAL_CLIENTS="*" METAL=1 PLUGIN_NAME=NegroniMetal METAL_STAGE=$S sh "$REPO/scripts/metal/root-add-metal.sh" "$R"
+METAL_CLIENTS="$CLIENTS" METAL=1 PLUGIN_NAME=NegroniMetal METAL_STAGE=$S sh "$REPO/scripts/metal/root-add-metal.sh" "$R"
 D=$R/private/var/db/negronimetal
+# All of iOS but four processes with a CPU path on 23F84 (IOS-26-Hot d249939 --mtl2-clients, reported on an A640: RenderBox _RB4 render targets; cameracaptured): less GPU work and memory on the A610. METAL_CLIENTS=... replaces it.
+CLIENTS=${METAL_CLIENTS:-"* -chronod -cameracaptured -WidgetRenderer_Default -PosterBoard"}
 {
   echo "# Processes that get the NegroniMetal device, iOS 26 root (scripts/laurel/root-add-metal-ios26.sh). Every process: the compositor has no GL path on 23F84."
-  echo "*"
+  echo "$CLIENTS"
 } > "$D/clients"
-printf '*\n' > "$R/System/Library/Extensions/NegroniMetal.bundle/clients.local"
+printf '%s\n' "$CLIENTS" > "$R/System/Library/Extensions/NegroniMetal.bundle/clients.local"
 chmod 644 "$D/clients" "$R/System/Library/Extensions/NegroniMetal.bundle/clients.local"
 {
   echo "# KEY=VALUE lines for every Metal process (scripts/laurel/root-add-metal-ios26.sh)"
@@ -50,4 +52,4 @@ done
      printf '%s %s\n' "$(sha256sum "$f" | cut -c1-16)" "${f#.}"; done)
 } > "$D/build.txt"
 chmod 644 "$D/build.txt"
-echo "laurel-root: metal26: on: NegroniMetal.bundle (Turnip a610 + metal2vulkan), clients *, compositor on Metal, $(grep -c / "$D/build.txt") binaries, no GL fallback on 23F84"
+echo "laurel-root: metal26: on: NegroniMetal.bundle (Turnip a610 + metal2vulkan), clients $CLIENTS, compositor on Metal, $(grep -c / "$D/build.txt") binaries, no GL fallback on 23F84"

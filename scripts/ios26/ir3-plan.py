@@ -81,6 +81,9 @@ def main():
             ref.clear()
             ref.update(gen)
             row(f"ca_generic_{prec}", {"fc_generic": "53:1", "fc_vertex_layout": "49:0", "fc_has_attachment_0": "53:1"}, "fixed_vert_lph_gen", "-")
+            # fc_framebuffer_fetch=1: blending in the shader, what CA asks on an Apple family (IOS-26-Hot HANDOFF, iOS 16 log); memoryless indexes none (-1)
+            row(f"ca_generic_fetch_{prec}", {"fc_generic": "53:1", "fc_vertex_layout": "49:0", "fc_framebuffer_fetch": "53:1", "fc_has_attachment_0": "53:1",
+                                             "fc_memoryless_index0": "49:255", "fc_memoryless_index1": "49:255"}, "fixed_vert_lph_gen", "-")
             ref.clear()
             ref.update(ref_saved)
     print()

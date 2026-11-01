@@ -1014,7 +1014,7 @@ static const char *bbd_gl_reason(char *why, size_t size)
 }
 #endif
 /*
- * A frame reached the screen surface, and something is lit in it. No frame in 120 s, or 30 s of black from the first frame on: on iOS 16 a mark and an exit (the next start takes GL);
+ * A frame reached the screen surface, and something is lit in it. No frame in 240 s (a cold first compile of the generic shader takes 25-45 s on this CPU [I], and more pipelines follow), or 30 s of black from the first frame on: on iOS 16 a mark and an exit (the next start takes GL);
  * on iOS 26 one line (there is nothing to fall back to). Runs in backboardd only.
  */
 static void *bbd_screen_check(void *arg)
@@ -1030,7 +1030,7 @@ static void *bbd_screen_check(void *arg)
 		native_bridge_metal_progress(p);
 		IOSurfaceRef screen = native_bridge_metal_copy_screen_surface();
 		if (!screen) {
-			if (now - t0 >= 120) {
+			if (now - t0 >= 240) {
 				nlog(BBD_TAG ": %s: no frame on a screen surface %.0f s after the device opened (%llu command buffers completed, %llu pending)",
 #ifdef NMTL_IOS26
 				     "problem",
@@ -1039,7 +1039,7 @@ static void *bbd_screen_check(void *arg)
 #endif
 				     now - t0, (unsigned long long)p[1], (unsigned long long)p[2]);
 #ifdef LAUREL_BBD_METAL
-				bbd_mark_off("no frame in 120 s");
+				bbd_mark_off("no frame in 240 s");
 				_exit(0);
 #else
 				return NULL;
@@ -1099,6 +1099,63 @@ static void bbd_screen_check_start(void)
 	pthread_attr_destroy(&attr);
 }
 #endif /* LAUREL_BBD_METAL || NMTL_IOS26 */
+
+#ifdef NMTL_IOS26
+/*
+ * Live glass: selective CABackdropLayer bypass in backboardd and SpringBoard. Same hook as IOS-26-Hot d249939 phone/media/inject_sysfix.c (MIT), reported there on an Adreno 640 on 23F84: a live backdrop is a
+ * framebuffer readback plus a blur pyramid per frame; icons (pre-baked by iconservicesagent), pills and spring animations stay. On the A610 one glass_background pixel costs 549 to 1703 ir3 instructions [V host],
+ * with 1 SP core and a 300 to 600 MHz clock. On by default. The file NMTL_DIR/live-glass brings live glass back within 5 s. Not "Reduce Transparency". Limit [I]: the hook goes in when this process opens its device,
+ * so a layer made before that keeps its state until its next setEnabled:.
+ */
+static IMP g_cabd_is_enabled, g_cabd_set_enabled, g_cabd_init;
+static SEL g_cabd_set_sel;
+static bool live_glass(void)
+{
+	static int cached = -1;
+	static time_t last = 0;
+	const time_t now = time(NULL);
+	if (cached < 0 || now - last >= 5) {
+		last = now;
+		cached = access(NMTL_DIR "/live-glass", F_OK) == 0;
+	}
+	return cached != 0;
+}
+static BOOL glass_is_enabled(id self, SEL sel)
+{
+	return live_glass() && g_cabd_is_enabled ? ((BOOL (*)(id, SEL))g_cabd_is_enabled)(self, sel) : NO;
+}
+static void glass_set_enabled(id self, SEL sel, BOOL enabled)
+{
+	if (g_cabd_set_enabled)
+		((void (*)(id, SEL, BOOL))g_cabd_set_enabled)(self, sel, live_glass() ? enabled : NO);
+}
+static id glass_init(id self, SEL sel)
+{
+	id me = g_cabd_init ? ((id (*)(id, SEL))g_cabd_init)(self, sel) : self;
+	if (me && !live_glass() && g_cabd_set_enabled)
+		((void (*)(id, SEL, BOOL))g_cabd_set_enabled)(me, g_cabd_set_sel, NO);
+	return me;
+}
+static void glass_bypass_start(void)
+{
+	const char *name = getprogname() ?: "";
+	if (strcmp(name, "backboardd") != 0 && strcmp(name, "SpringBoard") != 0)
+		return;
+	Class cls = objc_getClass("CABackdropLayer");
+	Method is = cls ? class_getInstanceMethod(cls, sel_registerName("isEnabled")) : NULL;
+	g_cabd_set_sel = sel_registerName("setEnabled:");
+	Method set = cls ? class_getInstanceMethod(cls, g_cabd_set_sel) : NULL;
+	Method init = cls ? class_getInstanceMethod(cls, sel_registerName("init")) : NULL;
+	if (!is || !set || !init) {
+		nlog("LAUREL GLASS: off: no CABackdropLayer isEnabled, setEnabled: or init in this QuartzCore: live backdrops stay");
+		return;
+	}
+	g_cabd_is_enabled = method_setImplementation(is, (IMP)glass_is_enabled);
+	g_cabd_set_enabled = method_setImplementation(set, (IMP)glass_set_enabled);
+	g_cabd_init = method_setImplementation(init, (IMP)glass_init);
+	nlog("LAUREL GLASS: on: live CABackdropLayer capture off in %s (touch %s/live-glass to bring it back)", name, NMTL_DIR);
+}
+#endif
 
 /*
  * GPU-lost watchdog (backboardd; the design follows Chlorophyll inject/bgmtl_inject.m and docs/FIXES.md, MIT): once a second it
@@ -1355,6 +1412,9 @@ static void watchdog_start(void)
 #endif
 		if (device) {
 			deadman_mark(strike, "device opened");
+#ifdef NMTL_IOS26
+			glass_bypass_start();
+#endif
 			install_exception_log();
 		} else if (timed_out)
 			deadman_mark(strike, "device open hangs");

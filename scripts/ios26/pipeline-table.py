@@ -75,6 +75,8 @@ def main():
             verdict = "fails in ir3 or Vulkan: " + m[2][:70]
         elif kind == "vertex":
             verdict = "supported (host)"
+        elif n.startswith("fixed_frag"):
+            verdict = "supported (host); this row has zero constants (no output, 1 instruction), so it says nothing: see the ca_generic row. Real specializations: not run"
         elif instr >= 1000:
             verdict = "supported (host), heavy: %d instructions a pixel" % instr
         elif instr >= 300:
