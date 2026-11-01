@@ -316,10 +316,25 @@ index 8bebebb..9e1d757 100644
  #if XNU_VM_HAS_LOPAGE
  
 diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
-index 0b68829..0272fc1 100644
+index 0b68829..22211bb 100644
 --- a/osfmk/vm/vm_shared_region.c
 +++ b/osfmk/vm/vm_shared_region.c
-@@ -849,6 +849,11 @@ vm_shared_region_create(
+@@ -350,6 +350,14 @@ match_subtype(cpu_type_t cputype, cpu_subtype_t exist, cpu_subtype_t new)
+ 	    new == CPU_SUBTYPE_ARM64_ALL) {
+ 		return true;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* laurel: no PAC here: arm64, arm64e and lowered files use one region, one cache (IOS-26-Hot 0129) */
++	if (cputype == CPU_TYPE_ARM64 &&
++	    (exist == CPU_SUBTYPE_ARM64_ALL || exist == CPU_SUBTYPE_ARM64_V8 || exist == CPU_SUBTYPE_ARM64E) &&
++	    (new == CPU_SUBTYPE_ARM64_ALL || new == CPU_SUBTYPE_ARM64_V8 || new == CPU_SUBTYPE_ARM64E)) {
++		return true;
++	}
++#endif
+ 	return false;
+ }
+ 
+@@ -849,6 +857,11 @@ vm_shared_region_create(
  		goto done;
  	}
  
@@ -331,7 +346,7 @@ index 0b68829..0272fc1 100644
  	/* shared regions should always enforce code-signing */
  	vm_map_cs_enforcement_set(sub_map, true);
  	assert(vm_map_cs_enforcement(sub_map));
-@@ -856,6 +861,7 @@ vm_shared_region_create(
+@@ -856,6 +869,7 @@ vm_shared_region_create(
  	vm_map_cs_enforcement_set(config_map, true);
  	assert(vm_map_cs_enforcement(config_map));
  	assert(pmap_get_vm_map_cs_enforced(vm_map_pmap(config_map)));
@@ -339,7 +354,7 @@ index 0b68829..0272fc1 100644
  
  	assert(!sub_map->disable_vmentry_reuse);
  	sub_map->is_nested_map = TRUE;
-@@ -3345,6 +3351,9 @@ vm_shared_region_slide_page_v3(
+@@ -3345,6 +3359,9 @@ vm_shared_region_slide_page_v3(
  			} else {
  				memcpy(rebaseLocation, &value, sizeof(value));
  			}
@@ -349,7 +364,7 @@ index 0b68829..0272fc1 100644
  #endif /* __has_feature(ptrauth_calls) */
  		} else {
  			// The new value for a rebase is the low 51-bits of the threaded value plus the slide.
-@@ -3564,6 +3573,9 @@ vm_shared_region_slide_page_v5(
+@@ -3564,6 +3581,9 @@ vm_shared_region_slide_page_v5(
  			} else {
  				memcpy(rebaseLocation, &value, sizeof(value));
  			}

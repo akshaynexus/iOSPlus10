@@ -616,7 +616,19 @@ pub fn build(o: &BuildOpts) -> Result<()> {
                     let base = e.start as u64 * BS;
                     while off < e.size {
                         let want = ((e.size - off) as usize).min(buf.len());
-                        let n = f.read_at(&mut buf[..want], off).with_context(|| format!("read source of {}", String::from_utf8_lossy(&e.path)))?;
+                        // apfs-fuse gives a rare EIO under parallel reads (first root run: 0, second: 1 file). The same read works again; hfs-verify and the second build compare the bytes
+                        let mut tries = 0;
+                        let n = loop {
+                            match f.read_at(&mut buf[..want], off) {
+                                Ok(n) => break n,
+                                Err(err) if tries < 8 && err.raw_os_error() == Some(libc::EIO) => {
+                                    tries += 1;
+                                    eprintln!("hfs-build: EIO on {} at {off}, try {tries}", String::from_utf8_lossy(&e.path));
+                                    std::thread::sleep(std::time::Duration::from_millis(200 * tries));
+                                }
+                                Err(err) => return Err(err).with_context(|| format!("read source of {}", String::from_utf8_lossy(&e.path))),
+                            }
+                        };
                         ensure!(n != 0, "short source: {} at {off} of {}", String::from_utf8_lossy(&e.path), e.size);
                         h.update(&buf[..n]);
                         write_all_at(&img, &buf[..n], base + off)?;
