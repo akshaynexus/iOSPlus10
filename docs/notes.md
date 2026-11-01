@@ -4891,3 +4891,21 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - Lesson: an owner on Android can answer the strongest question with no iOS boot: do the same SIMs register there, do 2 IMEIs show.
 - Test pitfall: a new DMS request before `radio_step` moved the first `part:` line earlier (report on the mode answer): new reads go behind the radio's steps. `count_of "(indication)"` also matched `card status (indication)`.
 - Worktree tip: `AUDIT=1 scripts/bg.sh ...` does not pass AUDIT through tmux: it ran a full build (~4 min with ccache). Use `scripts/bg.sh NAME env AUDIT=1 scripts/laurel/kernel-linux.sh`.
+
+## Mi A3: iOS 26 userland on ARMv8.0: census and lowering (2026-11-02, branch t3/laurel-ios26-userland; host only, details docs/laurel_sprout/ios26-userland.md)
+
+- [V] Donor N104AP (iPhone12,1): ADT `artwork-scale-factor` 2, `artwork-device-subtype` 0x700. `display-scale` in `/chosen` is a 0 placeholder.
+- [V] tmux does not pass the caller's environment: `DEV=x scripts/bg.sh ...` is wrong. Use `scripts/bg.sh NAME env DEV=x SCRIPT`.
+- [V] Linux: `scripts/setup/get-ipsw-cli.sh` gives ipsw 3.1.741 in out/bin (SHA-256 checked); AEA decrypt works; `apfs-fuse` mounts both images with no root; `qemu-aarch64` needs an exec bit on the ELF.
+- [V] Apple's arm64e cache has **no VM gap** between text subcaches (0 of 100, only 6 gaps of 32 MiB between data mappings). Free r-x bytes outside sections: 12.4 MB. `.11` (WebCore) is short by 13 times.
+- [V] `__TEXT` of an image holds much data outside instruction sections (`__const`, `__cstring`). A sweep of the whole r-x mapping counts 10 M false SVE words. Sweep sections only.
+- [V] LLVM's `apple-a13` is a clean filter: words it cannot decode cannot run on a real iPhone 11, so Apple gates them. SME, SVE, MTE, BF16, I8MM, CSSC fall out. Exception: LLVM prints `smstart` for any CPU: treated by hand.
+- [V] An LSE trampoline must keep NZCV (CAS: `eor` + `cbnz`), keep the 128-byte red zone (frame 176; my 144 broke it and the qemu test caught it), and write back on a failed CASP.
+- [V] 78 % of proven LSE sites have x30 dead: `bl` to a shared trampoline is enough. The rest need a 16-byte stub per site.
+- [V] iOS 16 arm64 cache also has LSE (888 proven: libdispatch, libsystem_pthread, libsystem_platform) and it boots on this CPU: Apple gates them at run time there. arm64e code has LSE inline, ungated [I, by the counts: WebCore 164,753].
+- [V] `CA::WindowServer::AccelServer::renderer` (23F84) has no GLES fallback; `EAGLServer` is gone. `GLESContext` is built only from `gles_new_context` and `-[CARenderer _initWithEAGLContext:]`.
+- [V] QuartzCore `CA::OGL::SW` uses FP16 per pixel (SDF blend, samplers).
+- [V] IOSurface and IOMFB selector numbers stay iOS 16 -> 26; sizes grew: `kern_SwapEnd` 1132 -> 1416, `SetBulkAttachments` 136 -> 160, `UpdateNonBulkValueCache` 9 -> 13. AKS moved to `AppleKeyStore.framework`, `aks_unlock_device` 3 -> 4 scalars. OpenGLES exports: 580/580 same.
+- [V its text] zeta is past the launchd PAC faults: Home screen on SM8350, 8 cores, black backgrounds, 55-83 ms per present. Its `native-shared-region-*` patches are not in pinned UniXNU-ios26 68c5134.
+- [V api.ipsw.me] Newest plain arm64: iPadOS 18.7.11 22H384 (iPad7,11). iPhone X ends at 16.7.16, iPad 6 at 17.7.11. iPad 8 (A12) has 26.7.2 but it is arm64e.
+- [I] Trap cost about 2 µs, 7.5 M atomics/s per busy core: traps for LSE = about 15 times slower; trampolines about 7.5 %.

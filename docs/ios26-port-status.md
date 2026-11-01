@@ -44,10 +44,11 @@ Marks: **[V]** verified here (command output, file, build log). **[I]** inferenc
 | `port-table.py` | section 6 table from `series-report.txt` | [V] |
 | `kdk-headers.py` | headers-only KDKROOT from the remote KDK 26.5.2 (HTTP disk image), own `Kernel.h` | [V] 28 + 1 headers |
 | `ios16-ref-tree.sh`, `port-file.sh` | xnu-8796 reference trees; carry one file's iOS 16 change to a 12377 tree (for base patch work) | [V] |
-| `fetch-os.sh` | OS (7.4 GB AEA), SystemOS (2.0 GB AEA), AppOS cryptex + trust caches + root hashes, AEA decrypt | written, not run (needs 30 GiB free) |
+| `fetch-os.sh` | OS (7.4 GB AEA), SystemOS (2.0 GB AEA), AppOS cryptex + trust caches + root hashes, AEA decrypt; device by `DEV` (`donor.sh`: d421ap default, n104ap) | [V] run on Linux with `DEV=n104ap`, 2026-11-02 |
 | `root-macos.sh` | iOS 26 HFS+ root in the iOS 16 layout (cryptexes under `/private/preboot/Cryptexes`) | stub, refuses to run without `IOS26_ROOT_STUB_OK=1` |
 | `root-tweaks.py` | iOS 16 root tweaks with their iOS 26 state (`--report`) | stub |
 | `fetch-donor.sh`, `fetch-sysos.sh`, `ipsw-ls.py` | (from the research step) donor kernelcache/ADT, SystemOS cryptex, remote IPSW list | [V] earlier |
+| `sysos-tree.sh`, `macho-copy.py`, `lower-userland.sh`, `abi-compare.py`, `ios16-cache-copy.sh` | Mi A3 userland work: [laurel_sprout/ios26-userland.md](laurel_sprout/ios26-userland.md) | [V] Linux |
 
 Work flow for an iOS 16 patch that fails on 12377: `scripts/ios26/series-tree.sh --dev`, read its result line and
 the reject, write the smallest rule in `patch-rules.py` (or a skip line with a reason), run `series-tree.sh` until

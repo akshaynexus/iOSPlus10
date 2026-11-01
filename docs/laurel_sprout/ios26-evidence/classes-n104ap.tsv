@@ -1,0 +1,837 @@
+group	feature	mnemonic	a13	cache_linear	cache_proven	root_linear	root_proven	unique_words	units
+bf16	bf16	bfcvtn	false	656	656	0	0	90	1
+bf16	bf16	bfcvtn2	false	390	390	0	0	100	1
+bf16	bf16	bfcvt	false	133	133	0	0	13	1
+bf16	bf16	bfdot	false	3	0	0	0	3	1
+bf16	bf16	bfmlalt	false	3	0	0	0	2	1
+bf16	bf16	bfmlalb	false	1	0	0	0	1	1
+bti-hint	hint	bti c	true	186	186	1317	1317	1	27
+bti-hint	hint	bti j	true	11	11	854	854	1	7
+complxnum	complxnum	fcadd	true	16242	16239	0	0	105	2
+complxnum	complxnum	fcmla	true	8815	8806	0	0	917	5
+cssc	cssc	umin	false	370	368	0	0	196	2
+cssc	cssc	umax	false	74	64	0	0	60	2
+cssc	cssc	smin	false	44	41	0	0	33	3
+cssc	cssc	smax	false	23	19	0	0	20	2
+dotprod	dotprod	udot	true	546	545	0	0	79	3
+dotprod	dotprod	sdot	true	448	448	0	0	281	1
+faminmax	faminmax	famax	false	2	0	0	0	2	1
+fp16	fullfp16	fmla	true	17516	17514	0	0	8006	18
+fp16	fullfp16	fcmp	true	7821	7821	100	100	279	76
+fp16	fullfp16	fadd	true	7748	7748	0	0	1462	42
+fp16	fullfp16	fmul	true	7434	7432	0	0	3305	40
+fp16	fullfp16	ucvtf	true	5556	5553	0	0	589	42
+fp16	fullfp16	fmov	true	3600	3600	21	21	289	88
+fp16	fullfp16	fmax	true	2800	2800	0	0	1535	8
+fp16	fullfp16	fmin	true	2485	2485	0	0	613	8
+fp16	fullfp16	fcvtzu	true	2210	2208	0	0	187	19
+fp16	fullfp16	fcvtzs	true	1679	1678	0	0	118	34
+fp16	fullfp16	fsub	true	1419	1419	0	0	653	31
+fp16	fullfp16	fcmgt	true	1065	1065	0	0	310	9
+fp16	fullfp16	fcsel	true	1032	1031	4	4	331	52
+fp16	fullfp16	fmadd	true	1005	999	0	0	453	11
+fp16	fullfp16	fmls	true	768	763	0	0	460	9
+fp16	fullfp16	fneg	true	704	704	2	2	118	39
+fp16	fullfp16	fdiv	true	666	666	0	0	295	34
+fp16	fullfp16	fcmeq	true	645	645	0	0	240	12
+fp16	fullfp16	scvtf	true	509	506	2	2	132	28
+fp16	fullfp16	fmaxnm	true	477	477	0	0	135	19
+fp16	fullfp16	fminnm	true	300	300	0	0	95	9
+fp16	fullfp16	fsqrt	true	295	295	0	0	16	4
+fp16	fullfp16	faddp	true	242	242	0	0	93	11
+fp16	fullfp16	fabs	true	227	227	6	6	79	18
+fp16	fullfp16	fccmp	true	211	211	0	0	78	23
+fp16	fullfp16	frintm	true	195	195	0	0	49	12
+fp16	fullfp16	fcmge	true	182	182	0	0	93	7
+fp16	fullfp16	fcmlt	true	140	139	42	42	63	11
+fp16	fullfp16	fcvtns	true	128	128	0	0	52	4
+fp16	fullfp16	frsqrte	true	127	127	0	0	45	4
+fp16	fullfp16	frintz	true	119	119	0	0	28	10
+fp16	fullfp16	frecps	true	84	84	0	0	54	7
+fp16	fullfp16	frecpe	true	77	77	0	0	36	7
+fp16	fullfp16	frintp	true	68	68	0	0	10	11
+fp16	fullfp16	frintx	true	63	63	0	0	9	9
+fp16	fullfp16	facge	true	49	0	0	0	10	1
+fp16	fullfp16	frinta	true	42	42	0	0	4	8
+fp16	fullfp16	fmaxp	true	41	41	0	0	18	4
+fp16	fullfp16	frsqrts	true	24	24	0	0	14	4
+fp16	fullfp16	fmsub	true	23	19	0	0	12	4
+fp16	fullfp16	fcvtnu	true	18	18	0	0	10	1
+fp16	fullfp16	fabd	true	17	17	0	0	9	2
+fp16	fullfp16	fnmul	true	16	15	0	0	14	4
+fp16	fullfp16	fnmsub	true	15	10	6	0	9	8
+fp16	fullfp16	fnmadd	true	8	4	0	0	8	2
+fp16	fullfp16	fmulx	true	4	0	0	0	4	1
+fp16	fullfp16	fmaxv	true	3	3	0	0	1	3
+fp16	fullfp16	fmaxnmv	true	2	2	0	0	2	1
+fp16	fullfp16	fccmpe	true	2	0	0	0	2	1
+fp16	fullfp16	fcmle	true	2	2	0	0	2	1
+fp16	fullfp16	fcvtpu	true	1	1	0	0	1	1
+fp16	fullfp16	fminp	true	1	0	0	0	1	1
+fp16	fullfp16	fcvtau	true	1	1	0	0	1	1
+fp16fml	fp16fml	fmlal	true	59	56	0	0	31	2
+fp16fml	fp16fml	fmlal2	true	58	56	0	0	30	2
+fp16fml	fp16fml	fmlsl2	true	2	0	0	0	1	1
+fp16fml	fp16fml	fmlsl	true	1	0	0	0	1	1
+hbc	hbc	bc.hs	false	36	0	0	0	5	1
+hbc	hbc	bc.pl	false	21	0	0	0	9	2
+hbc	hbc	bc.hi	false	16	0	0	0	3	2
+hbc	hbc	bc.lo	false	13	0	0	0	11	2
+hbc	hbc	bc.mi	false	11	0	0	0	7	2
+hbc	hbc	bc.eq	false	11	0	0	0	6	1
+hbc	hbc	bc.lt	false	5	0	0	0	5	2
+hbc	hbc	bc.ne	false	5	0	0	0	3	2
+hbc	hbc	bc.gt	false	4	0	0	0	4	2
+hbc	hbc	bc.ls	false	4	0	0	0	4	1
+hbc	hbc	bc.le	false	2	0	0	0	2	1
+hbc	hbc	bc.ge	false	2	0	0	0	2	1
+hbc	hbc	bc.vs	false	2	0	0	0	2	1
+hbc	hbc	bc.nv	false	2	0	0	0	2	1
+hbc	hbc	bc.vc	false	1	0	0	0	1	1
+hbc	hbc	bc.al	false	1	0	0	0	1	1
+i8mm	i8mm	usdot	false	324	317	0	0	216	4
+i8mm	i8mm	usmmla	false	169	168	0	0	106	2
+i8mm	i8mm	sudot	false	4	0	0	0	2	1
+i8mm	i8mm	smmla	false	1	0	0	0	1	1
+jsconv	jsconv	fjcvtzs	true	461	461	0	0	35	2
+ls64	ls64	st64bv0	false	1	0	0	0	1	1
+lse	lse	ldadd	true	409178	409177	38978	38978	1563	625
+lse	lse	ldaddal	true	300322	300322	21880	21880	971	724
+lse	lse	ldaddl	true	37814	37814	1593	1593	143	41
+lse	lse	casl	true	11598	11597	454	454	301	86
+lse	lse	caslb	true	8014	8014	0	0	139	11
+lse	lse	casab	true	6988	6988	2	2	264	10
+lse	lse	casa	true	5735	5735	434	434	250	38
+lse	lse	swpal	true	5570	5570	2107	2107	281	139
+lse	lse	cas	true	5519	5519	495	495	326	131
+lse	lse	casal	true	3894	3893	573	573	668	255
+lse	lse	caspal	true	1825	1825	4	4	167	32
+lse	lse	swpalb	true	1345	1345	127	127	113	168
+lse	lse	ldclral	true	1044	1043	78	78	69	36
+lse	lse	ldsetal	true	886	886	98	98	132	67
+lse	lse	casalb	true	404	404	87	87	84	90
+lse	lse	casp	true	375	375	12	12	93	24
+lse	lse	ldaddalh	true	296	296	1	1	18	16
+lse	lse	casb	true	182	182	87	87	34	30
+lse	lse	ldset	true	174	174	185	185	50	44
+lse	lse	swpab	true	152	152	29	29	59	16
+lse	lse	swpl	true	149	148	220	220	87	30
+lse	lse	caspl	true	125	125	3	3	34	12
+lse	lse	swp	true	109	109	92	92	60	39
+lse	lse	ldclr	true	103	103	204	204	40	33
+lse	lse	ldadda	true	79	79	21	21	25	15
+lse	lse	swpb	true	66	66	7	7	12	23
+lse	lse	ldsetalb	true	65	64	10	10	24	26
+lse	lse	ldaddalb	true	61	61	7	7	23	24
+lse	lse	swpa	true	50	50	5	5	25	23
+lse	lse	ldsetalh	true	39	39	0	0	11	7
+lse	lse	ldclrl	true	37	37	44	44	21	22
+lse	lse	caspa	true	36	36	7	7	19	9
+lse	lse	ldclralb	true	28	26	13	13	16	17
+lse	lse	ldclralh	true	27	27	0	0	9	7
+lse	lse	ldeoral	true	22	21	3	3	20	11
+lse	lse	ldsetb	true	20	20	7	7	9	11
+lse	lse	ldseth	true	18	18	2	2	8	8
+lse	lse	ldeora	true	18	18	35	35	12	7
+lse	lse	ldclrb	true	17	15	7	7	8	12
+lse	lse	cash	true	16	15	18	18	15	15
+lse	lse	lduminlh	true	16	0	0	0	2	1
+lse	lse	ldaddb	true	14	13	7	7	10	9
+lse	lse	swpalh	true	13	12	0	0	10	5
+lse	lse	ldsetl	true	13	13	9	9	12	10
+lse	lse	casalh	true	12	12	2	2	8	5
+lse	lse	ldumaxlh	true	12	0	0	0	3	1
+lse	lse	ldeor	true	12	12	3	3	11	8
+lse	lse	ldseta	true	12	12	14	14	11	15
+lse	lse	ldeoralb	true	10	8	0	0	8	5
+lse	lse	ldclrh	true	10	9	2	2	7	7
+lse	lse	ldaddlb	true	9	9	1	1	7	5
+lse	lse	caslh	true	9	9	3	3	7	7
+lse	lse	swplb	true	8	7	1	1	8	6
+lse	lse	casah	true	8	8	0	0	5	3
+lse	lse	ldaddh	true	8	8	6	6	8	7
+lse	lse	ldeoralh	true	7	7	0	0	6	4
+lse	lse	ldeorl	true	7	7	4	4	9	7
+lse	lse	ldclra	true	7	6	0	0	6	4
+lse	lse	ldaddab	true	6	6	0	0	5	3
+lse	lse	ldsetab	true	6	4	0	0	5	4
+lse	lse	ldaddlh	true	6	6	0	0	5	3
+lse	lse	ldaddah	true	6	6	0	0	5	3
+lse	lse	ldumaxah	true	6	0	3	0	1	7
+lse	lse	ldumax	true	6	4	0	0	4	3
+lse	lse	ldsmina	true	6	4	0	0	4	2
+lse	lse	ldsminal	true	6	4	0	0	3	2
+lse	lse	ldeorb	true	5	4	0	0	5	4
+lse	lse	ldeorab	true	5	4	0	0	5	4
+lse	lse	ldeorh	true	5	3	0	0	5	4
+lse	lse	swpah	true	5	4	0	0	5	4
+lse	lse	ldsmin	true	5	4	0	0	3	2
+lse	lse	ldsmaxal	true	5	5	1	1	3	3
+lse	lse	ldumin	true	5	5	0	0	1	1
+lse	lse	ldeorlb	true	4	4	0	0	4	3
+lse	lse	ldsetlb	true	4	4	0	0	4	3
+lse	lse	ldclrlb	true	4	4	0	0	3	3
+lse	lse	ldclrab	true	4	4	0	0	3	3
+lse	lse	ldsmaxalb	true	4	2	0	0	2	2
+lse	lse	swph	true	4	4	2	2	5	4
+lse	lse	swplh	true	4	4	0	0	4	3
+lse	lse	ldsmax	true	4	4	0	0	2	1
+lse	lse	ldsmaxl	true	4	4	0	0	2	1
+lse	lse	ldsminl	true	4	4	0	0	2	1
+lse	lse	ldsmaxa	true	4	4	0	0	2	1
+lse	lse	ldsminb	true	3	2	0	0	2	2
+lse	lse	ldsminlb	true	3	2	0	0	2	2
+lse	lse	ldsmaxh	true	3	2	0	0	2	2
+lse	lse	ldeorlh	true	3	3	0	0	3	3
+lse	lse	ldsetlh	true	3	3	0	0	3	3
+lse	lse	ldclrlh	true	3	3	0	0	3	3
+lse	lse	ldeorah	true	3	3	0	0	3	3
+lse	lse	ldsetah	true	3	3	0	0	3	3
+lse	lse	ldclrah	true	3	3	0	0	3	3
+lse	lse	lduminb	true	2	0	0	0	2	1
+lse	lse	ldumaxb	true	2	0	0	0	2	2
+lse	lse	ldsmaxb	true	2	2	0	0	1	1
+lse	lse	ldsmaxlb	true	2	2	0	0	1	1
+lse	lse	ldsmaxab	true	2	2	0	0	1	1
+lse	lse	ldsminab	true	2	2	0	0	1	1
+lse	lse	ldsminalb	true	2	2	0	0	1	1
+lse	lse	ldsminh	true	2	2	0	0	1	1
+lse	lse	ldsmaxlh	true	2	2	0	0	1	1
+lse	lse	ldsminlh	true	2	2	0	0	1	1
+lse	lse	ldsmaxah	true	2	2	0	0	1	1
+lse	lse	ldsminah	true	2	2	0	0	1	1
+lse	lse	ldsmaxalh	true	2	2	0	0	1	1
+lse	lse	ldsminalh	true	2	2	0	0	1	1
+lse	lse	lduminal	true	2	0	0	0	2	1
+lse	lse	lduminlb	true	1	0	0	0	1	1
+lse	lse	ldumaxa	true	1	0	0	0	1	1
+lse	lse	ldumina	true	1	0	0	0	1	1
+lse128	lse128	ldsetpa	false	3	0	0	0	2	1
+lse128	lse128	ldsetpal	false	1	0	0	0	1	1
+lut	lut	luti4	false	5	0	0	0	4	1
+lut	lut	luti2	false	3	0	0	0	2	2
+mops	mops	cpymrt	false	2	0	0	0	1	1
+mops	mops	cpyfpwtn	false	1	0	0	0	1	1
+mops	mops	cpyfptrn	false	1	0	0	0	1	1
+mops	mops	cpyfmtwn	false	1	0	0	0	1	1
+mops	mops	cpyfmwtwn	false	1	0	0	0	1	1
+mops	mops	cpyfewt	false	1	0	0	0	1	1
+mops	mops	cpyfetrn	false	1	0	0	0	1	1
+mops	mops	cpyfewtn	false	1	0	0	0	1	1
+mops	mops	cpyfetn	false	1	0	0	0	1	1
+mops	mops	setm	false	1	0	0	0	1	1
+mops	mops	setmt	false	1	0	0	0	1	1
+mops	mops	cpyptrn	false	1	0	0	0	1	1
+mops	mops	cpyp	false	1	0	0	0	1	1
+mops	mops	cpymt	false	1	0	0	0	1	1
+mops	mops	cpymwn	false	1	0	0	0	1	1
+mops	mops	cpyertrn	false	1	0	0	0	1	1
+mte	mte	stg	false	420	406	47	47	40	11
+mte	mte	irg	false	402	402	14	14	35	8
+mte	mte	st2g	false	383	376	38	38	23	7
+mte	mte	stgp	false	121	0	0	0	76	1
+mte	mte	ldg	false	72	72	46	46	33	9
+mte	mte	subg	false	27	0	5	0	20	10
+mte	mte	addg	false	20	0	0	0	16	2
+mte	mte	gmi	false	13	13	11	11	7	4
+mte	mte	stzg	false	8	0	0	0	7	2
+mte	mte	stz2g	false	3	0	0	0	3	1
+mte	mte	subps	false	1	0	0	0	1	1
+other	other	fmla	false	18495	18492	0	0	161	12
+other	other	fmls	false	6720	6720	0	0	31	10
+other	other	fadd	false	4540	4540	0	0	30	10
+other	other	fcmla	true	2405	0	0	0	163	1
+other	other	maddpt	false	17	0	0	0	11	1
+other	other	ldlarh	true	12	0	0	0	7	2
+other	other	ldlar	true	10	0	0	0	8	2
+other	other	ldlarb	true	7	0	0	0	7	2
+other	other	stllrh	true	7	0	0	0	6	1
+other	other	rcwssetpal	false	4	0	0	0	2	1
+other	other	msubpt	false	4	0	0	0	3	1
+other	other	stllrb	true	3	0	0	0	2	3
+other	other	stllr	true	3	0	0	0	3	1
+other	other	smlall	false	3	0	0	0	2	2
+other	other	rcwclrpal	false	2	0	0	0	1	1
+other	other	luti2	false	2	0	0	0	2	1
+other	other	luti4	false	2	0	0	0	2	1
+other	other	rcwsswpp	false	2	0	0	0	2	1
+other	other	rcwssetpl	false	2	0	0	0	1	1
+other	other	rcwsswppl	false	2	0	0	0	1	1
+other	other	rcwsclrpl	false	2	0	0	0	1	1
+other	other	rcwsswppal	false	2	0	0	0	1	1
+other	other	rcwsetp	false	1	0	0	0	1	1
+other	other	setgpn	false	1	0	0	0	1	1
+other	other	setgetn	false	1	0	0	0	1	1
+other	other	addpt	false	1	0	0	0	1	1
+other	other	smlsll	false	1	0	0	0	1	1
+pac-hint	hint	pacibsp	true	8376938	8376245	2469356	2469199	1	7404
+pac-hint	hint	autibsp	true	3284192	3283611	1003086	1002968	1	7102
+pac-hint	hint	pacia1716	true	1689	1689	602	602	1	497
+pac-hint	hint	pacib1716	true	485	485	4	4	1	6
+pac-hint	hint	autib1716	true	1	1	0	0	1	1
+pac-nonhint	pauth	blraa	true	6485470	6485326	2285528	2285384	313	5721
+pac-nonhint	pauth	retab	true	5557657	5557450	1588591	1588536	1	7297
+pac-nonhint	pauth	autda	true	4906234	4906234	1558336	1558336	25	3714
+pac-nonhint	pauth	braa	true	4019031	4018730	1706867	1706581	153	7454
+pac-nonhint	pauth	pacia	true	2816459	2816459	793647	793647	27	6080
+pac-nonhint	pauth	pacda	true	2667536	2667536	817346	817346	31	6308
+pac-nonhint	pauth	xpacd	true	1411560	1411560	552474	552474	22	3514
+pac-nonhint	pauth	paciza	true	869653	869653	307658	307658	3	4438
+pac-nonhint	pauth	pacdb	true	422242	422242	199071	199071	15	2156
+pac-nonhint	pauth	blraaz	true	247968	247968	31689	31689	27	1814
+pac-nonhint	pauth	xpaci	true	33676	33676	3362	3362	27	287
+pac-nonhint	pauth	autdza	true	29383	29383	11073	11073	1	358
+pac-nonhint	pauth	autia	true	19611	19611	2346	2346	2	160
+pac-nonhint	pauth	autdb	true	15524	15524	1952	1952	14	174
+pac-nonhint	pauth	braaz	true	12951	12929	5151	5145	18	712
+pac-nonhint	pauth	autib	true	6986	6986	2116	2116	12	813
+pac-nonhint	pauth	pacib	true	2314	2314	8	8	15	12
+pac-nonhint	pauth	ldraa	true	1667	1649	0	0	61	3
+pac-nonhint	pauth	pacdza	true	850	850	2	2	1	9
+pac-nonhint	pauth	pacga	true	687	687	0	0	115	6
+pac-nonhint	pauth	autiza	true	382	382	161	161	1	24
+pac-nonhint	pauth	blrab	true	224	224	0	0	13	4
+pac-nonhint	pauth	brab	true	109	109	0	0	14	2
+pac-nonhint	pauth	ldrab	true	7	0	0	0	7	2
+rcpc-imm	rcpc-immo	ldapurh	true	26	0	0	0	14	2
+rcpc-imm	rcpc-immo	stlurh	true	20	0	0	0	9	2
+rcpc-imm	rcpc-immo	ldapursh	true	20	0	0	0	12	1
+rcpc-imm	rcpc-immo	ldapursb	true	15	1	1	1	11	3
+rcpc-imm	rcpc-immo	ldapursw	true	9	0	0	0	5	2
+rcpc-imm	rcpc-immo	ldapur	true	8	0	0	0	6	2
+rcpc-imm	rcpc-immo	ldapurb	true	5	0	0	0	4	1
+rcpc-imm	rcpc-immo	stlur	true	5	0	0	0	4	2
+rcpc-imm	rcpc-immo	stlurb	true	3	0	0	0	2	1
+rcpc-ldapr	rcpc	ldaprb	true	113668	113667	14670	14670	148	468
+rcpc-ldapr	rcpc	ldapr	true	20240	20240	1850	1850	365	265
+rcpc-ldapr	rcpc	ldaprh	true	45	45	1	1	17	9
+rcpc3	rcpc3	stlur	false	12	0	0	0	12	2
+rcpc3	rcpc3	ldapur	false	9	0	0	0	9	2
+rcpc3	rcpc3	stilp	false	3	0	0	0	3	1
+rdm	rdm	sqrdmlah	true	5	0	0	0	3	1
+rdm	rdm	sqrdmlsh	true	2	0	0	0	2	1
+sha3	sha3	sha512h2	true	240	240	80	80	9	8
+sha3	sha3	sha512h	true	240	240	80	80	10	8
+sha3	sha3	bcax	true	211	200	0	0	34	7
+sha3	sha3	xar	true	198	192	0	0	30	7
+sha3	sha3	sha512su1	true	193	192	64	64	17	9
+sha3	sha3	sha512su0	true	192	192	64	64	16	8
+sha3	sha3	eor3	true	86	81	0	0	14	8
+sha3	sha3	rax1	true	40	40	0	0	5	5
+sm4	sm4	sm3ss1	false	5	0	0	0	4	2
+sm4	sm4	sm3tt1a	false	1	0	0	0	1	1
+sme	sme	fmopa	false	10447	10401	3	0	1685	17
+sme	sme	mov	false	8066	8058	0	0	1282	17
+sme	sme	zero	false	7281	7275	0	0	13	16
+sme	sme	fmops	false	6332	6329	0	0	539	12
+sme	sme	st1d	false	2292	2288	0	0	95	12
+sme	sme	st1w	false	2072	2066	0	0	180	15
+sme	sme	ld1d	false	1016	1013	0	0	69	12
+sme	sme	ld1w	false	892	890	0	0	72	13
+sme	sme	revd	false	604	604	0	0	6	1
+sme	sme	rdsvl	false	425	425	0	0	12	14
+sme	sme	bfmopa	false	382	380	0	0	203	2
+sme	sme	st1h	false	267	258	0	0	20	3
+sme	sme	ld1b	false	208	203	0	0	19	3
+sme	sme	ld1h	false	137	128	0	0	15	2
+sme	sme	bfdot	false	42	0	0	0	17	1
+sme	sme	addsvl	false	33	31	0	0	3	17
+sme	sme	st1b	false	23	9	0	0	22	3
+sme	sme	umopa	false	21	0	0	0	11	1
+sme	sme	usmopa	false	19	0	0	0	10	1
+sme	sme	str	false	16	16	0	0	1	16
+sme	sme	ldr	false	15	15	0	0	1	15
+sme	sme	st1q	false	9	0	0	0	5	2
+sme	sme	smopa	false	6	0	0	0	3	1
+sme	sme	psel	false	4	0	0	0	2	1
+sme	sme	sumopa	false	2	0	0	0	1	1
+sme	sme	ld1q	false	2	0	0	0	2	1
+sme	sme	addspl	false	1	0	0	0	1	1
+sme	sme	bfmlalt	false	1	0	0	0	1	1
+sme	sme	bfmops	false	1	0	0	0	1	1
+sme	sme	smops	false	1	0	0	0	1	1
+sme	sme	sumops	false	1	0	0	0	1	1
+sme-f64f64	sme-f64f64	fmops	false	8069	8069	0	0	365	11
+sme-f64f64	sme-f64f64	fmopa	false	5195	5193	0	0	156	12
+sme-i16i64	sme-i16i64	usmopa	false	38	0	0	0	20	1
+sme-i16i64	sme-i16i64	umopa	false	21	0	0	0	12	1
+sme-i16i64	sme-i16i64	sumopa	false	4	0	0	0	3	1
+sme-i16i64	sme-i16i64	smopa	false	2	0	0	0	1	1
+sme-i16i64	sme-i16i64	sumops	false	2	0	0	0	2	1
+sme-i16i64	sme-i16i64	usmops	false	2	0	0	0	2	1
+sme-i16i64	sme-i16i64	smops	false	1	0	0	0	1	1
+sme-i16i64	sme-i16i64	umops	false	1	0	0	0	1	1
+sme2	sme2	ld1w	false	59220	59210	0	0	1441	13
+sme2	sme2	fmla	false	43177	43173	2	1	409	16
+sme2	sme2	mov	false	42121	41996	0	0	903	16
+sme2	sme2	ld1d	false	29476	29463	0	0	377	12
+sme2	sme2	whilelt	false	15374	15371	0	0	354	15
+sme2	sme2	fmls	false	13073	13072	0	0	136	12
+sme2	sme2	ptrue	false	10277	10277	3	3	12	17
+sme2	sme2	whilegt	false	6890	6890	0	0	47	13
+sme2	sme2	fadd	false	6886	6886	0	0	140	11
+sme2	sme2	st1w	false	6764	6681	0	0	680	13
+sme2	sme2	st1d	false	5739	5725	0	0	234	12
+sme2	sme2	zip	false	986	986	0	0	269	2
+sme2	sme2	ld1h	false	940	597	0	0	391	2
+sme2	sme2	luti4	false	607	225	0	0	145	1
+sme2	sme2	fmax	false	422	404	0	0	50	1
+sme2	sme2	st1h	false	399	311	0	0	145	3
+sme2	sme2	fsub	false	376	376	0	0	94	1
+sme2	sme2	uzp	false	316	316	0	0	10	2
+sme2	sme2	ldr	false	291	233	0	0	20	1
+sme2	sme2	whilelo	false	275	273	0	0	154	2
+sme2	sme2	fmin	false	271	269	0	0	49	1
+sme2	sme2	bfcvtn	false	258	258	0	0	37	1
+sme2	sme2	pext	false	210	210	0	0	50	1
+sme2	sme2	smopa	false	192	192	0	0	4	1
+sme2	sme2	ld1b	false	139	71	7	6	62	9
+sme2	sme2	bfmlal	false	128	126	0	0	72	2
+sme2	sme2	sqrshru	false	103	102	0	0	2	2
+sme2	sme2	fcvt	false	86	86	0	0	26	1
+sme2	sme2	fcvtn	false	84	84	0	0	13	1
+sme2	sme2	st1b	false	74	68	9	9	33	6
+sme2	sme2	bfcvt	false	58	58	0	0	15	1
+sme2	sme2	fmlal	false	54	48	0	0	27	2
+sme2	sme2	fdot	false	43	35	0	0	34	2
+sme2	sme2	smax	false	41	39	0	0	14	2
+sme2	sme2	smin	false	39	39	0	0	13	1
+sme2	sme2	bfdot	false	37	35	0	0	30	2
+sme2	sme2	bfmlsl	false	11	10	0	0	7	2
+sme2	sme2	whilehs	false	10	6	0	0	8	3
+sme2	sme2	stnt1d	false	9	0	0	0	9	2
+sme2	sme2	zero	false	9	9	0	0	1	1
+sme2	sme2	sel	false	9	0	0	0	6	2
+sme2	sme2	whilels	false	8	8	0	0	8	1
+sme2	sme2	stnt1w	false	8	0	0	0	7	2
+sme2	sme2	str	false	8	8	0	0	3	1
+sme2	sme2	stnt1h	false	7	0	0	0	6	2
+sme2	sme2	stnt1b	false	6	0	0	0	6	1
+sme2	sme2	ldnt1h	false	4	0	0	0	4	1
+sme2	sme2	ldnt1b	false	3	0	0	0	3	1
+sme2	sme2	smlall	false	3	0	0	0	2	2
+sme2	sme2	cntp	false	2	2	0	0	2	1
+sme2	sme2	bfmlslb	false	2	0	0	0	1	1
+sme2	sme2	bmopa	false	2	0	0	0	2	2
+sme2	sme2	smops	false	2	0	0	0	2	1
+sme2	sme2	umlsll	false	2	0	0	0	2	1
+sme2	sme2	bmops	false	1	0	0	0	1	1
+sme2	sme2	ldnt1w	false	1	0	0	0	1	1
+sme2	sme2	umlall	false	1	0	0	0	1	1
+sme2	sme2	usmlall	false	1	0	0	0	1	1
+sme2	sme2	sub	false	1	0	0	0	1	1
+sme2	sme2	sudot	false	1	0	0	0	1	1
+sme2	sme2	suvdot	false	1	0	0	0	1	1
+sme2	sme2	fmlsl	false	1	0	0	0	1	1
+sme2	sme2	sdot	false	1	0	0	0	1	1
+sme2	sme2	sclamp	false	1	0	0	0	1	1
+sme2	sme2	umlal	false	1	0	0	0	1	1
+sme2	sme2	smlal	false	1	0	0	0	1	1
+sme2	sme2	umlsl	false	1	0	0	0	1	1
+sme2	sme2	sqrshrn	false	1	0	0	0	1	1
+sme2p1	sme2p1	movaz	false	34	34	0	0	10	1
+sme2p1	sme2p1	ld3q	false	28	0	0	0	17	2
+sme2p1	sme2p1	ld4q	false	27	0	0	0	15	1
+sme2p1	sme2p1	st2q	false	4	0	0	0	3	1
+sme2p1	sme2p1	st3q	false	4	0	0	0	3	1
+sme2p1	sme2p1	orqv	false	1	0	0	0	1	1
+sme2p1	sme2p1	dupq	false	1	0	0	0	1	1
+sme2p1	sme2p1	tbxq	false	1	0	0	0	1	1
+sme2p1	sme2p1	zipq1	false	1	0	0	0	1	1
+sme2p1	sme2p1	uzpq1	false	1	0	0	0	1	1
+sme2p1	sme2p1	uzpq2	false	1	0	0	0	1	1
+sme2p1	sme2p1	fmaxnmqv	false	1	0	0	0	1	1
+sve	sve	mov	false	63326	63167	66	66	1018	22
+sve	sve	whilelt	false	18888	18843	0	0	537	15
+sve	sve	st1d	false	16180	16171	0	0	942	13
+sve	sve	st1w	false	15596	15576	0	0	1129	15
+sve	sve	fmul	false	13219	13218	0	0	738	15
+sve	sve	ld1w	false	12925	12847	0	0	1287	14
+sve	sve	ld1d	false	12846	12806	0	0	774	13
+sve	sve	ptrue	false	12201	12179	3	3	46	18
+sve	sve	tbl	false	7334	7331	0	0	928	15
+sve	sve	fadd	false	6625	6621	0	0	537	14
+sve	sve	fnmls	false	5980	0	0	0	365	3
+sve	sve	ldr	false	5335	5319	106	106	427	20
+sve	sve	fsub	false	4639	4639	0	0	395	2
+sve	sve	orr	false	2717	2714	0	0	43	16
+sve	sve	not	false	2715	2715	0	0	22	14
+sve	sve	fmov	false	1799	1761	0	0	63	16
+sve	sve	whilelo	false	1638	1636	6	6	499	6
+sve	sve	st1h	false	1566	1176	0	0	542	3
+sve	sve	fmax	false	1492	1480	0	0	216	1
+sve	sve	ld1h	false	1347	1236	0	0	724	4
+sve	sve	revw	false	1249	1249	0	0	10	2
+sve	sve	movprfx	false	1214	1066	0	0	70	2
+sve	sve	addvl	false	1161	1160	8	8	37	18
+sve	sve	fmin	false	1104	1098	0	0	212	1
+sve	sve	fmla	false	1011	1004	0	0	44	14
+sve	sve	str	false	1005	1000	61	61	208	18
+sve	sve	zip1	false	920	920	0	0	194	4
+sve	sve	sel	false	778	759	0	0	103	4
+sve	sve	ld1b	false	686	634	8	8	338	15
+sve	sve	pfalse	false	567	567	1	1	12	5
+sve	sve	ld1rd	false	551	548	0	0	105	12
+sve	sve	ld1rw	false	486	485	0	0	138	8
+sve	sve	fcmeq	false	346	0	0	0	135	1
+sve	sve	eor	false	326	323	0	0	64	4
+sve	sve	zip2	false	308	306	0	0	111	3
+sve	sve	st1b	false	276	264	6	6	168	7
+sve	sve	fnmla	false	243	0	0	0	117	2
+sve	sve	bic	false	221	199	0	0	35	1
+sve	sve	fcmne	false	204	0	0	0	77	1
+sve	sve	fabs	false	192	192	0	0	16	1
+sve	sve	cntp	false	189	189	3	3	18	3
+sve	sve	fsqrt	false	178	178	0	0	16	9
+sve	sve	prfb	false	176	174	0	0	45	2
+sve	sve	fdiv	false	168	168	0	0	22	8
+sve	sve	uzp1	false	158	136	0	0	76	2
+sve	sve	prfd	false	135	126	0	0	18	12
+sve	sve	fneg	false	130	130	0	0	18	1
+sve	sve	prfw	false	123	115	0	0	17	11
+sve	sve	and	false	90	87	0	0	61	2
+sve	sve	incb	false	87	85	0	0	49	3
+sve	sve	fdivr	false	86	86	0	0	12	13
+sve	sve	insr	false	68	68	0	0	2	5
+sve	sve	ldff1w	false	68	0	0	0	48	3
+sve	sve	fcmgt	false	65	0	0	0	18	1
+sve	sve	rev	false	64	64	0	0	28	1
+sve	sve	fcmlt	false	64	64	0	0	34	1
+sve	sve	ld1sb	false	63	0	0	0	40	2
+sve	sve	ld1rh	false	60	46	0	0	40	2
+sve	sve	ldff1sb	false	54	0	0	0	34	3
+sve	sve	fcmla	false	52	0	0	0	40	3
+sve	sve	fcmge	false	51	0	0	0	35	1
+sve	sve	ld1sh	false	44	0	0	0	28	2
+sve	sve	ld3w	false	39	0	0	0	21	1
+sve	sve	ldff1sh	false	36	0	0	0	26	3
+sve	sve	ld4w	false	36	0	0	0	18	2
+sve	sve	cmplt	false	34	18	0	0	22	2
+sve	sve	ld1rqd	false	34	0	0	0	18	2
+sve	sve	ld4d	false	34	0	0	0	18	1
+sve	sve	ldff1b	false	33	0	3	0	26	9
+sve	sve	ucvtf	false	31	31	0	0	3	1
+sve	sve	st2w	false	31	28	0	0	15	2
+sve	sve	cmplo	false	30	0	0	0	24	2
+sve	sve	ldff1d	false	29	0	0	0	17	1
+sve	sve	fmls	false	28	10	0	0	18	2
+sve	sve	ldnt1d	false	28	0	0	0	14	1
+sve	sve	ldff1h	false	25	0	3	0	17	9
+sve	sve	ld2w	false	25	0	0	0	13	1
+sve	sve	ldnf1w	false	25	0	0	0	13	1
+sve	sve	ldnf1sb	false	25	0	0	0	14	1
+sve	sve	rdvl	false	24	24	0	0	14	2
+sve	sve	cmphi	false	23	0	3	0	16	9
+sve	sve	cmphs	false	22	0	0	0	18	3
+sve	sve	uzp2	false	20	0	0	0	6	1
+sve	sve	ld1sw	false	20	0	0	0	20	2
+sve	sve	cmpeq	false	19	4	7	4	11	10
+sve	sve	ld2d	false	16	0	0	0	8	1
+sve	sve	smax	false	14	10	0	0	9	3
+sve	sve	prfh	false	14	0	1	0	10	3
+sve	sve	ldff1sw	false	14	0	0	0	13	1
+sve	sve	ldnf1sh	false	14	0	0	0	7	1
+sve	sve	ldnf1d	false	13	0	0	0	7	1
+sve	sve	subr	false	12	0	15	0	3	6
+sve	sve	smin	false	11	10	0	0	8	2
+sve	sve	faddv	false	11	11	0	0	4	2
+sve	sve	incw	false	10	10	0	0	6	1
+sve	sve	fminv	false	10	2	0	0	4	2
+sve	sve	inch	false	9	9	0	0	7	1
+sve	sve	cmpls	false	9	0	0	0	9	2
+sve	sve	fmaxnmv	false	9	0	0	0	2	1
+sve	sve	fmaxv	false	9	2	0	0	4	2
+sve	sve	ld1rsb	false	9	0	0	0	8	1
+sve	sve	ldnf1b	false	8	0	0	0	6	3
+sve	sve	decb	false	7	6	0	0	7	3
+sve	sve	cnth	false	7	7	0	0	5	1
+sve	sve	ext	false	7	0	0	0	6	3
+sve	sve	ld1rb	false	7	0	2	2	9	3
+sve	sve	stnt1h	false	7	0	3	0	2	8
+sve	sve	mla	false	6	0	0	0	5	3
+sve	sve	add	false	6	0	0	0	3	2
+sve	sve	ld1rqb	false	6	0	0	0	4	1
+sve	sve	cmpgt	false	5	0	0	0	5	1
+sve	sve	ptest	false	5	5	7	7	3	3
+sve	sve	ld1rqw	false	5	0	0	0	5	2
+sve	sve	st4h	false	5	0	0	0	4	2
+sve	sve	mls	false	4	0	0	0	3	3
+sve	sve	sub	false	4	0	0	0	1	2
+sve	sve	lsl	false	4	0	0	0	4	1
+sve	sve	asr	false	4	0	0	0	2	2
+sve	sve	decw	false	4	4	0	0	3	1
+sve	sve	cmpge	false	4	0	0	0	3	1
+sve	sve	uqincp	false	4	4	0	0	4	1
+sve	sve	incp	false	4	4	3	3	4	2
+sve	sve	fcmuo	false	4	0	0	0	3	1
+sve	sve	fmsb	false	4	0	0	0	3	2
+sve	sve	fnmad	false	4	0	0	0	3	1
+sve	sve	ld1rsh	false	4	0	0	0	4	1
+sve	sve	ld3d	false	4	0	0	0	3	1
+sve	sve	mad	false	3	0	0	0	3	1
+sve	sve	dech	false	3	3	0	0	3	1
+sve	sve	cmpne	false	3	0	0	0	3	1
+sve	sve	ftmad	false	3	0	0	0	2	1
+sve	sve	fmad	false	3	0	0	0	2	2
+sve	sve	fnmsb	false	3	0	0	0	3	1
+sve	sve	fcvt	false	3	0	0	0	2	1
+sve	sve	ldnt1h	false	3	0	0	0	2	1
+sve	sve	ldnf1sw	false	3	0	0	0	2	1
+sve	sve	st2b	false	3	0	0	0	3	1
+sve	sve	st4b	false	3	0	0	0	3	1
+sve	sve	st4w	false	3	0	0	0	3	1
+sve	sve	st2d	false	3	0	0	0	3	2
+sve	sve	adr	false	2	0	0	0	2	1
+sve	sve	msb	false	2	0	0	0	2	1
+sve	sve	index	false	2	0	0	0	2	1
+sve	sve	sabd	false	2	0	0	0	1	2
+sve	sve	brkb	false	2	2	3	3	3	2
+sve	sve	sdot	false	2	0	0	0	1	1
+sve	sve	fscale	false	2	0	0	0	1	1
+sve	sve	scvtf	false	2	0	0	0	1	1
+sve	sve	ldnt1b	false	2	0	0	0	2	1
+sve	sve	ld2b	false	2	0	0	0	2	1
+sve	sve	ld3b	false	2	0	0	0	2	1
+sve	sve	ld3h	false	2	0	0	0	2	1
+sve	sve	stnt1w	false	2	0	0	0	2	1
+sve	sve	st3w	false	2	0	0	0	2	1
+sve	sve	st4d	false	2	0	0	0	2	1
+sve	sve	saddv	false	1	0	0	0	1	1
+sve	sve	clz	false	1	0	0	0	1	1
+sve	sve	uqincb	false	1	0	0	0	1	1
+sve	sve	smaxv	false	1	1	0	0	1	1
+sve	sve	sminv	false	1	1	0	0	1	1
+sve	sve	cntw	false	1	1	0	0	1	1
+sve	sve	neg	false	1	0	0	0	1	1
+sve	sve	fexpa	false	1	0	0	0	1	1
+sve	sve	sqdecd	false	1	0	0	0	1	1
+sve	sve	ftssel	false	1	0	0	0	1	1
+sve	sve	trn2	false	1	0	0	0	1	1
+sve	sve	lastb	false	1	0	0	0	1	1
+sve	sve	whilele	false	1	0	0	0	1	1
+sve	sve	mul	false	1	0	0	0	1	1
+sve	sve	bics	false	1	0	0	0	1	1
+sve	sve	brkpas	false	1	0	0	0	1	1
+sve	sve	orn	false	1	0	0	0	1	1
+sve	sve	cmple	false	1	0	0	0	1	1
+sve	sve	sqadd	false	1	0	0	0	1	1
+sve	sve	orrs	false	1	0	0	0	1	1
+sve	sve	udot	false	1	0	0	0	1	1
+sve	sve	fcadd	false	1	0	0	0	1	1
+sve	sve	frsqrte	false	1	1	0	0	1	1
+sve	sve	frsqrts	false	1	0	0	0	1	1
+sve	sve	ftsmul	false	1	0	0	0	1	1
+sve	sve	fminnm	false	1	0	0	0	1	1
+sve	sve	facgt	false	1	0	0	0	1	1
+sve	sve	frecpe	false	1	0	0	0	1	1
+sve	sve	ld4b	false	1	0	0	0	1	1
+sve	sve	ld1rqh	false	1	0	0	0	1	1
+sve	sve	ld2h	false	1	0	0	0	1	1
+sve	sve	stnt1b	false	1	0	0	0	1	1
+sve	sve	st2h	false	1	0	0	0	1	1
+sve	sve	st3d	false	1	0	0	0	1	1
+sve	sve	cntb	false	0	0	4	4	1	1
+sve2	sve2	whilegt	false	6097	6096	0	0	169	15
+sve2	sve2	splice	false	117	75	0	0	88	1
+sve2	sve2	ext	false	74	31	0	0	59	6
+sve2	sve2	whilehi	false	65	43	5	5	49	5
+sve2	sve2	subhnb	false	26	0	0	0	10	1
+sve2	sve2	cmla	false	24	0	0	0	19	2
+sve2	sve2	sqdmlalt	false	23	0	0	0	10	1
+sve2	sve2	tbl	false	19	18	0	0	2	2
+sve2	sve2	subhnt	false	17	0	0	0	7	1
+sve2	sve2	smlalb	false	16	0	0	0	10	1
+sve2	sve2	addhnb	false	15	0	0	0	5	1
+sve2	sve2	addhnt	false	14	0	0	0	11	1
+sve2	sve2	umlalb	false	13	0	0	0	7	1
+sve2	sve2	raddhnt	false	13	0	0	0	12	1
+sve2	sve2	cdot	false	11	0	0	0	6	1
+sve2	sve2	whilege	false	10	6	0	0	8	3
+sve2	sve2	smlalt	false	10	0	0	0	9	1
+sve2	sve2	uaddwb	false	10	0	0	0	7	1
+sve2	sve2	raddhnb	false	8	0	0	0	6	1
+sve2	sve2	match	false	7	0	0	0	5	1
+sve2	sve2	sqdmulh	false	6	0	0	0	4	1
+sve2	sve2	smlslb	false	6	0	0	0	4	1
+sve2	sve2	sqrdcmlah	false	6	0	0	0	4	1
+sve2	sve2	umullb	false	6	0	0	0	3	1
+sve2	sve2	sqdmullb	false	6	0	0	0	4	1
+sve2	sve2	saddwt	false	6	0	0	0	3	1
+sve2	sve2	umlalt	false	5	0	0	0	4	1
+sve2	sve2	sqdmlalb	false	5	0	0	0	3	1
+sve2	sve2	sqdmlslb	false	5	0	0	0	3	1
+sve2	sve2	saddwb	false	5	0	0	0	4	1
+sve2	sve2	sqdmlslt	false	4	0	0	0	3	1
+sve2	sve2	sqrdmlsh	false	4	0	0	0	2	1
+sve2	sve2	umlslb	false	4	0	0	0	3	1
+sve2	sve2	smullb	false	4	0	0	0	2	1
+sve2	sve2	adclb	false	4	0	0	0	3	1
+sve2	sve2	histseg	false	4	0	0	0	3	1
+sve2	sve2	uaddwt	false	4	0	0	0	3	1
+sve2	sve2	ldnt1b	false	4	0	0	0	4	1
+sve2	sve2	sqrshl	false	3	0	0	0	2	1
+sve2	sve2	smlslt	false	3	0	0	0	2	1
+sve2	sve2	sqdmullt	false	3	0	0	0	3	1
+sve2	sve2	uabalt	false	3	0	0	0	2	2
+sve2	sve2	srshr	false	2	0	0	0	2	1
+sve2	sve2	smulh	false	2	0	0	0	2	1
+sve2	sve2	whilehs	false	2	0	0	0	2	1
+sve2	sve2	sqrdmulh	false	2	0	0	0	2	1
+sve2	sve2	sshllb	false	2	0	0	0	1	1
+sve2	sve2	sqrshrunt	false	2	0	0	0	2	1
+sve2	sve2	sabalb	false	2	0	0	0	1	1
+sve2	sve2	sabdlb	false	2	0	0	0	1	1
+sve2	sve2	ssubltb	false	2	0	0	0	2	1
+sve2	sve2	nmatch	false	2	0	0	0	2	1
+sve2	sve2	usublb	false	2	0	0	0	2	1
+sve2	sve2	sabdlt	false	2	0	0	0	2	1
+sve2	sve2	histcnt	false	2	0	0	0	1	1
+sve2	sve2	ldnt1sb	false	2	0	0	0	1	1
+sve2	sve2	ldnt1d	false	2	0	0	0	2	1
+sve2	sve2	stnt1b	false	2	0	0	0	2	1
+sve2	sve2	pmul	false	1	0	0	0	1	1
+sve2	sve2	umulh	false	1	0	0	0	1	1
+sve2	sve2	eor3	false	1	0	0	0	1	1
+sve2	sve2	sqshlu	false	1	0	0	0	1	1
+sve2	sve2	whilerw	false	1	0	0	0	1	1
+sve2	sve2	whilewr	false	1	0	0	0	1	1
+sve2	sve2	sqshlr	false	1	0	0	0	1	1
+sve2	sve2	sqrdmlah	false	1	0	0	0	1	1
+sve2	sve2	urshlr	false	1	0	0	0	1	1
+sve2	sve2	shsub	false	1	0	0	0	1	1
+sve2	sve2	umlslt	false	1	0	0	0	1	1
+sve2	sve2	mls	false	1	0	0	0	1	1
+sve2	sve2	shrnt	false	1	0	0	0	1	1
+sve2	sve2	sqshrunb	false	1	0	0	0	1	1
+sve2	sve2	sqrshrnb	false	1	0	0	0	1	1
+sve2	sve2	sqshrunt	false	1	0	0	0	1	1
+sve2	sve2	rshrnt	false	1	0	0	0	1	1
+sve2	sve2	eortb	false	1	0	0	0	1	1
+sve2	sve2	ssubwt	false	1	0	0	0	1	1
+sve2	sve2	uabdlt	false	1	0	0	0	1	1
+sve2	sve2	umullt	false	1	0	0	0	1	1
+sve2	sve2	ssublbt	false	1	0	0	0	1	1
+sve2	sve2	rsubhnb	false	1	0	0	0	1	1
+sve2	sve2	sabalt	false	1	0	0	0	1	1
+sve2	sve2	saddlbt	false	1	0	0	0	1	1
+sve2	sve2	ldnt1w	false	1	0	0	0	1	1
+sve2	sve2	ldnt1h	false	1	0	0	0	1	1
+sve2	sve2	stnt1h	false	1	0	0	0	1	1
+sve2	sve2	stnt1d	false	1	0	0	0	1	1
+sve2-bitperm	sve2-bitperm	bext	false	3	0	0	0	2	1
+sve2-sha3	sve2-sha3	rax1	false	1	0	0	0	1	1
+sve2-sm4	sve2-sm4	sm4ekey	false	1	0	0	0	1	1
+system	msr	msr TPIDR2_EL0, xzr	false	1251	1251	0	0	1	16
+system	smstart	smstart za	false	1247	1247	0	0	1	16
+system	mrs	mrs x8, TPIDR2_EL0	false	1207	1207	0	0	1	16
+system	smstart	smstart sm	false	1177	1177	0	0	1	16
+system	smstop	smstop za	false	1029	1029	0	0	1	16
+system	smstop	smstop sm	false	927	927	0	0	1	16
+system	dc	dc gva, x11	false	778	778	0	0	1	2
+system	msr	msr S3_6_C15_C1_5, x0	true	294	294	278	278	1	6
+system	mrs	mrs x9, S3_6_C15_C1_5	true	247	247	236	236	1	5
+system	dc	dc gva, x10	false	245	245	0	0	1	2
+system	msr	msr TCO, #0	false	240	240	31	31	1	9
+system	msr	msr TCO, #1	false	235	235	26	26	1	9
+system	dc	dc gva, x12	false	190	190	0	0	1	1
+system	mrs	mrs x8, S3_6_C15_C1_5	true	174	174	67	67	1	4
+system	dc	dc gva, x9	false	132	132	0	0	1	3
+system	msr	msr DIT, #1	true	87	87	6	6	1	10
+system	mrs	mrs x8, DIT	true	78	78	3	3	1	6
+system	msr	msr TPIDR2_EL0, x23	false	77	77	0	0	1	13
+system	msr	msr TPIDR2_EL0, x8	false	73	73	0	0	1	13
+system	msr	msr TPIDR2_EL0, x21	false	69	69	0	0	1	12
+system	dc	dc gva, x13	false	63	63	0	0	1	1
+system	mrs	mrs x10, S3_6_C15_C1_5	true	50	50	45	45	1	5
+system	mrs	mrs x9, TPIDR2_EL0	false	38	38	0	0	1	14
+system	dc	dc gva, x8	false	25	25	115	115	1	3
+system	mrs	mrs x16, TPIDR2_EL0	false	16	16	0	0	1	16
+system	mrs	mrs x14, TPIDR2_EL0	false	15	15	0	0	1	15
+system	msr	msr S3_5_C15_C11_6, x8	true	14	14	14	14	1	2
+system	msr	msr TPIDR2_EL0, x22	false	12	12	0	0	1	2
+system	msr	msr S3_5_C15_C1_4, x8	true	12	12	12	12	1	2
+system	dc	dc gva, x14	false	11	11	0	0	1	2
+system	msr	msr DIT, #0	true	9	9	6	6	1	10
+system	mrs	mrs x9, DIT	true	9	9	3	3	1	9
+system	dc	dc gva, x15	false	7	7	0	0	1	1
+system	dc	dc gva, x16	false	7	7	0	0	1	1
+system	sb	sb	false	6	6	4	4	1	10
+system	msr	msr S3_4_C15_C2_7, x0	true	5	5	0	0	1	2
+system	mrs	mrs x11, TPIDR2_EL0	false	5	5	0	0	1	2
+system	mrs	mrs x0, CNTVCTSS_EL0	false	4	4	1	1	1	4
+system	mrs	mrs x0, S3_4_C15_C10_6	true	4	4	1	1	1	4
+system	msr	msr S3_4_C15_C15_6, x8	true	3	3	0	0	1	1
+system	msr	msr S3_4_C15_C15_6, x9	true	3	3	0	0	1	1
+system	mrs	mrs x7, S2_6_C2_C10_1	true	3	0	0	0	1	1
+system	mrs	mrs x8, S3_4_C15_C15_6	true	3	3	0	0	1	1
+system	mrs	mrs x9, S3_4_C15_C15_6	true	3	3	0	0	1	1
+system	msr	msr S0_0_C0_C0_0, x0	true	2	0	0	0	1	1
+system	msr	msr TPIDR2_EL0, x10	false	2	2	0	0	1	1
+system	msr	msr S3_4_C15_C2_7, x2	true	2	2	0	0	1	1
+system	msr	msr S3_5_C15_C1_4, x9	true	2	2	2	2	1	2
+system	msr	msr S3_6_C15_C1_5, x2	true	2	2	0	0	1	1
+system	mrs	mrs x9, CNTVCTSS_EL0	false	2	2	0	0	1	2
+system	mrs	mrs x23, CNTVCTSS_EL0	false	2	2	0	0	1	1
+system	mrs	mrs x9, S3_4_C15_C2_7	true	2	2	0	0	1	1
+system	mrs	mrs x9, S3_4_C15_C10_6	true	2	2	0	0	1	2
+system	mrs	mrs x23, S3_4_C15_C10_6	true	2	2	0	0	1	1
+system	msr	msr S0_1_C1_C14_3, x12	true	1	0	0	0	1	1
+system	msr	msr S0_1_C8_C13_5, x7	true	1	0	0	0	1	1
+system	msr	msr S0_7_C0_C0_5, x13	true	1	0	0	0	1	1
+system	sys	sys #0, c10, c1, #2, x22	true	1	0	0	0	1	1
+system	sys	sys #0, c15, c9, #4, x0	true	1	0	0	0	1	1
+system	sys	sys #0, c15, c13, #4, x11	true	1	0	0	0	1	1
+system	tlbi	tlbi alle1	true	1	1	0	0	1	1
+system	msr	msr S2_3_C9_C13_6, x9	true	1	0	0	0	1	1
+system	msr	msr S3_0_C5_C10_2, x28	true	1	0	0	0	1	1
+system	msr	msr S3_0_C6_C15_1, x0	true	1	0	0	0	1	1
+system	msr	msr TPIDR2_EL0, x15	false	1	1	0	0	1	1
+system	msr	msr S3_4_C6_C4_4, x25	true	1	0	0	0	1	1
+system	mrs	mrs x0, DBGBVR7_EL1	true	1	0	0	0	1	1
+system	mrs	mrs x20, S2_0_C4_C15_2	true	1	0	0	0	1	1
+system	mrs	mrs x25, S2_0_C7_C11_6	true	1	0	0	0	1	1
+system	mrs	mrs x5, S2_0_C7_C13_0	true	1	0	0	0	1	1
+system	mrs	mrs x15, S2_2_C4_C6_3	true	1	0	0	0	1	1
+system	mrs	mrs x21, S2_4_C15_C2_5	true	1	0	0	0	1	1
+system	mrs	mrs x5, S2_6_C1_C6_0	true	1	0	0	0	1	1
+system	mrs	mrs x12, S3_1_C1_C8_0	true	1	0	0	0	1	1
+system	mrs	mrs x13, S3_1_C11_C2_0	true	1	0	0	0	1	1
+system	mrs	mrs x29, S3_2_C7_C13_1	true	1	0	0	0	1	1
+system	mrs	mrs x0, S3_2_C8_C3_3	true	1	0	0	0	1	1
+system	mrs	mrs x1, S3_3_C2_C1_3	true	1	0	0	0	1	1
+system	mrs	mrs x3, S3_3_C2_C13_5	true	1	0	0	0	1	1
+system	mrs	mrs x16, SVCR	false	1	1	0	0	1	1
+system	mrs	mrs x8, S3_3_C7_C5_7	true	1	0	0	0	1	1
+system	mrs	mrs x1, TPIDR2_EL0	false	1	1	0	0	1	1
+system	mrs	mrs x13, TPIDR2_EL0	false	1	1	0	0	1	1
+system	mrs	mrs x1, CNTVCTSS_EL0	false	1	1	0	0	1	1
+system	mrs	mrs x8, CNTVCTSS_EL0	false	1	1	1	1	1	2
+system	mrs	mrs x19, CNTVCTSS_EL0	false	1	1	0	0	1	1
+system	mrs	mrs x22, CNTVCTSS_EL0	false	1	1	0	0	1	1
+system	mrs	mrs x24, CNTVCTSS_EL0	false	1	1	0	0	1	1
+system	mrs	mrs x25, CNTVCTSS_EL0	false	1	1	0	0	1	1
+system	mrs	mrs x18, S3_4_C5_C4_7	true	1	0	0	0	1	1
+system	mrs	mrs x1, S3_4_C15_C2_7	true	1	1	0	0	1	1
+system	mrs	mrs x2, S3_4_C15_C2_7	true	1	1	0	0	1	1
+system	mrs	mrs x10, S3_4_C15_C2_7	true	1	1	0	0	1	1
+system	mrs	mrs x1, S3_4_C15_C10_6	true	1	1	0	0	1	1
+system	mrs	mrs x8, S3_4_C15_C10_6	true	1	1	1	1	1	2
+system	mrs	mrs x19, S3_4_C15_C10_6	true	1	1	0	0	1	1
+system	mrs	mrs x22, S3_4_C15_C10_6	true	1	1	0	0	1	1
+system	mrs	mrs x24, S3_4_C15_C10_6	true	1	1	0	0	1	1
+system	mrs	mrs x25, S3_4_C15_C10_6	true	1	1	0	0	1	1
+system	mrs	mrs x1, S3_5_C4_C9_0	true	1	0	0	0	1	1
+system	mrs	mrs x13, S3_6_C4_C13_1	true	1	0	0	0	1	1
+system	mrs	mrs x1, S3_6_C15_C1_5	true	1	1	0	0	1	1
+system	mrs	mrs x2, S3_6_C15_C1_5	true	1	1	0	0	1	1
+system	mrs	mrs x11, S3_6_C15_C1_5	true	1	1	0	0	1	1
+the	the	rcwswpal	false	4	0	0	0	2	1
+the	the	rcwclral	false	2	0	0	0	1	1
+the	the	rcwsetal	false	2	0	0	0	1	1
+the	the	rcwclr	false	1	0	0	0	1	1
+the	the	rcwswp	false	1	0	0	0	1	1
+the	the	rcwsetl	false	1	0	0	0	1	1
+the	the	rcwscasa	false	1	0	0	0	1	1
+the	the	rcwsclr	false	1	0	0	0	1	1
+the	the	rcwsswpl	false	1	0	0	0	1	1
+the	the	rcwssetal	false	1	0	0	0	1	1

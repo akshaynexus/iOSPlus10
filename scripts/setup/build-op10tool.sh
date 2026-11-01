@@ -6,5 +6,6 @@ set -eu
 . "$(dirname "$0")/../lib/env.sh"
 cargo build --release --manifest-path "$REPO/tools/op10tool/Cargo.toml" --target-dir "$OUT/cargo"
 mkdir -p "$OUT/bin"
+rm -f "$OUT/bin/op10tool"  # a running job may hold the old file
 cp "$OUT/cargo/release/op10tool" "$OUT/bin/op10tool"
 "$OUT/bin/op10tool" --version

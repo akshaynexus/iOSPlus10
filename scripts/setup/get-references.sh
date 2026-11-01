@@ -18,7 +18,7 @@ UniXNU-negroni     https://github.com/pawlickerr/UniXNU-negroni.git   f812002ae3
 ios-sweet          https://github.com/akshaynexus/ios-sweet.git       45263bee51df4a0f55cdf9c649af886399488ddb main
 ios-sweet-upstream https://github.com/dipa-studio/ios-sweet.git       45263bee51df4a0f55cdf9c649af886399488ddb main
 UniXNU-ios26       https://github.com/none24smu/UniXNU.git            68c513467bb6c44106c053c410582c1d14f96dd7 ios26
-UniXNU-zeta        https://github.com/none24smu/UniXNU-zeta.git       318b2ea45bca77ca6b7a91c00c87efc8a44597e1 main
+UniXNU-zeta        https://github.com/none24smu/UniXNU-zeta.git       eb489285a1d9153872f00c93ebb519a269b249b5 main
 UniXNU-pong        https://github.com/Chengdong-Yu/UniXNU-pong.git    ab74f075320fe54eee24d5d150386e5b0f0f427f main
 ios-sailfish       https://github.com/joranv1/ios-sailfish.git        6f27e41ff249f2680540ebe8ee5ab982c5e641c9
 bergamota          https://github.com/ry-diffusion/bergamota.git      0826e48c3d3f4bd9b0ab7d5af82ed92dfaeec425 develop

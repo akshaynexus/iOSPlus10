@@ -5,7 +5,7 @@
 BG := scripts/bg.sh
 OS := $(shell uname -s)
 
-.PHONY: laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi laurel-update help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
+.PHONY: ipsw-cli laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi laurel-update help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
         kernel kernel-local kernel-ci xcode15 ssh devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog bootlog
 
 help:
@@ -33,6 +33,8 @@ op10tool:
 	$(BG) op10tool scripts/setup/build-op10tool.sh
 references:
 	$(BG) references scripts/setup/get-references.sh
+ipsw-cli:
+	$(BG) ipsw-cli scripts/setup/get-ipsw-cli.sh
 colima:
 ifeq ($(OS),Darwin)
 	scripts/setup/colima-up.sh
