@@ -4454,3 +4454,17 @@ Details: `docs/laurel_sprout/battery-power.md`.
 - Gotcha: the macOS SDK's CVImageBuffer.h pulls the ApplicationServices umbrella, whose Security headers fail on an iOS target: `userland/laurel/camera/sdk-stub`.
 - Build [V]: 259/259 patches, 0 LSE, kernel sha256 04a59dd993aa...; NegroniCamera 74f5043092c3...; cam-test OK (cam3 2543 checks); camera-cache-check PASS (57 OK, 126 imports).
 - Next: owner boot: root + boot image; lines in camera.md section 9.
+## Mi A3: Wi-Fi 8 Mbit/s = legacy 11a/g link + full scans while joined; 5 GHz lost by "strongest AP"; patches 2405-2411 (2026-11-01, branch t3/laurel-wifi-5ghz-speed)
+- Details and test steps: docs/laurel_sprout/wifi.md "Speed and 5 GHz". Built; NOT run on the phone.
+- [V source] topaz's join is legacy only: PEER_ASSOC 11a/11g, no HT/VHT/WMM element in the assoc request, TID 16, 20 MHz. [I] largest limit: 54 Mbit/s without A-MPDU.
+- [V source + log 05:30:37] `sta_scan` ignored wifid's channels: 13 asked, 37 x 150 ms done, also while joined: 8 s off the channel of each 13 s.
+- [V source + log] `w_join_begin` took the strongest AP: same router -37 dBm on channel 5, -41 dBm on channel 44. wifid passes "any access point", so the kernel chooses. 5 GHz itself works: join at 5220 MHz [V 05:30:36].
+- [V source] `sta_join` gave wifid the first AP of the name: iOS can show the wrong band.
+- [V] Poll loop 0.79-0.95 passes/ms; `dropped: 0 out, 0 in`: polling and queues are not the limit at this speed. Not changed.
+- [V] `bdwlan.bin` (`scripts/laurel/bdwlan-info.py`): 8 bytes of file header, then length 26328 = file size, MAC zero (= the zero MAC in `LAUREL WIFI: on`), regDmn 0x809c; the other 30 files have 0. [I] 0x809c = China. Board id 0xff -> `bdwlan.bin` is correct. Not changed.
+- [V] WMI ids computed from the enums of ath10k wmi-tlv.h: PDEV_SET_PARAM 0x4003, VDEV_SET_WMM 0x500d, REQUEST_STATS 0x16001, UPDATE_STATS event 0x1d004; tags HAL_REG 0x21, STATS_EVENT 0x46, PDEV_SET_PARAM 0x52, VDEV_SET_WMM 0xc7, REQUEST_STATS 0x8f.
+- Gotcha: `g_ms` counts loop passes, not ms (0.79-0.95 pass/ms). Rates in the status line use mach_absolute_time.
+- Gotcha: a worktree has no reference repos: symlink `external/<ref>` and `out/laurel-kernel/{cache,deps,theos,dl}` to the main checkout. Do not read sources from the main checkout's `out/laurel-kernel/xnu-src`: another build can delete it at any time; `AUDIT=1 scripts/laurel/kernel-linux.sh` makes your own tree in about 1 minute. `git add` by name: the symlinks show as untracked.
+- Gotcha: my patch numbers sit inside the series (2405-2411); later patches (2760, 2780) touch TopazModem.cpp at other lines. Forward declarations near line 860 would clash: mine are not there.
+- Build [V]: kernel-linux.sh 266/266 patches, 0 LSE, no warnings in the changed files, kernel sha256 782caf572f8e244c7569815dae55f8017464a70155e06162cc26f09fda215b06; `wifi-phy-test.sh` all checks passed (ASan + UBSan).
+- Next: owner test: wifi.md "Test". Compare `wifi_ht=0`, `wifi_scanlimit=0`, `wifi_band=0` to measure each cause.

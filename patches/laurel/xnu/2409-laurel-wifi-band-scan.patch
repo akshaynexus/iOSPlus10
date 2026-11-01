@@ -1,0 +1,270 @@
+laurel 2409: Wi-Fi: 5 GHz first when heard at -70 dBm or better (was: strongest, so 2.4 GHz). A scan is what wifid asks for, limited while joined and under traffic (was: 37 channels x 150 ms for each request).
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -3392,12 +3392,42 @@
+ static volatile uint32_t api_scans_done;
+ static bool scan_started, scanning;
+ static unsigned next_scan_ms;
++/*
++ * laurel 2409: a scan asks for what wifid asked (its channels, its dwell). It was 37 channels x 150 ms for every
++ * request (log 2026-11-01: wifid asks 13 channels, the radio is off its channel 8 s of each 13 s, joined). While
++ * joined: dwell at most 110 ms, 100 ms back on the channel between two; under traffic at most one scan in 60 s.
++ */
++static uint16_t lw_ask_freqs[NFREQ], lw_scan_freqs[NFREQ];
++static volatile uint32_t lw_ask_n, lw_ask_dwell;
++static uint32_t lw_scan_n, lw_scan_dwell, lw_scan_last_ms, lw_scans_real, lw_scans_deferred;
++static bool lw_joined, lw_busy;
++
++static void
++lw_scan_take_ask(bool asked)
++{
++	lw_scan_n = asked ? lw_ask_n : 0;
++	lw_scan_dwell = asked ? lw_ask_dwell : 0;
++	memcpy(lw_scan_freqs, lw_ask_freqs, sizeof(lw_scan_freqs));
++	lw_scan_last_ms = g_ms;
++	lw_scans_real++;
++}
+ 
+ static bool
+ scan_send_start(void)
+ {
+ 	static uint8_t m[512];
+ 	uint8_t *p = m, *c;
++	uint32_t n = lw_scan_n != 0 ? lw_scan_n : NFREQ;
++	const uint16_t *fr = lw_scan_n != 0 ? lw_scan_freqs : scan_freqs;
++	uint32_t dwell = lw_scan_dwell != 0 ? lw_scan_dwell : lw_joined ? 110 : 150;
++
++	if (!lw_scanlimit_on) {                     /* as before */
++		n = NFREQ;
++		fr = scan_freqs;
++		dwell = 150;
++	} else if (lw_joined && dwell > 110) {
++		dwell = 110;
++	}
+ 	bzero(m, sizeof(m));
+ 	c = wmi_put_tlv(p, TAG_START_SCAN_CMD, 100);
+ 	c = put32(c, 0xA000 | (scans + 1));         /* scan_id */
+@@ -3406,8 +3436,8 @@
+ 	c = put32(c, 1);                            /* priority low */
+ 	c = put32(c, 0x001 | 0x002 | 0x004 | 0x008 | 0x100 | 0x010);   /* events */
+ 	c = put32(c, 50);                           /* dwell active */
+-	c = put32(c, 150);                          /* dwell passive */
+-	c = put32(c, 50);                           /* min rest */
++	c = put32(c, dwell);                        /* dwell passive */
++	c = put32(c, lw_scanlimit_on && lw_joined ? 100 : 50);  /* min rest */
+ 	c = put32(c, 500);                          /* max rest */
+ 	c = put32(c, 0);
+ 	c = put32(c, 0);
+@@ -3416,15 +3446,15 @@
+ 	c = put32(c, 5);                            /* probe delay */
+ 	c = put32(c, (0x01 | 0x10) ^ 0x20);         /* passive, chan stat; probe-req filter inverted on TLV */
+ 	c = put32(c, 0);
+-	c = put32(c, NFREQ);
++	c = put32(c, n);
+ 	c = put32(c, 1);                            /* bssids */
+ 	c = put32(c, 0);                            /* ssids */
+ 	c = put32(c, 0);                            /* ie_len */
+ 	c = put32(c, 3);                            /* num_probes */
+ 	p = c + 16;                                 /* mac addr + mask: zero */
+-	c = wmi_put_tlv(p, TAG_ARRAY_UINT32, NFREQ * 4);
+-	for (uint32_t i = 0; i < NFREQ; i++) {
+-		c = put32(c, scan_freqs[i]);
++	c = wmi_put_tlv(p, TAG_ARRAY_UINT32, n * 4);
++	for (uint32_t i = 0; i < n; i++) {
++		c = put32(c, fr[i]);
+ 	}
+ 	p = wmi_put_tlv(c, TAG_ARRAY_FIXED_STRUCT, 0);
+ 	c = wmi_put_tlv(p, TAG_ARRAY_FIXED_STRUCT, 8);  /* bssid: broadcast */
+@@ -3458,6 +3488,7 @@
+ 		p = put32(c, 40u << 8);
+ 	}
+ 	bool a = wmi_send(CMD_SCAN_CHAN_LIST, m, (uint32_t)(p - m));
++	lw_scan_take_ask(false);
+ 	uint8_t v[4 + 20] = {};
+ 	c = wmi_put_tlv(v, TAG_VDEV_CREATE_CMD, 20);
+ 	c = put32(c, 0);                            /* vdev 0 */
+@@ -3806,6 +3837,7 @@
+ int topaz_wlan_scan(void);
+ bool topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *bss);
+ void topaz_wlan_address(uint8_t address[6]);
++int topaz_wlan_scan_on(const uint16_t *freqs, unsigned count, unsigned dwell_ms);
+ }
+ 
+ static volatile bool api_scan_asked;
+@@ -3837,6 +3869,25 @@
+ 	return api_scans_done != before ? 0 : ETIMEDOUT;
+ }
+ 
++/* laurel 2409: only these channels (count 0: all of ours), so many ms on each (0: ours). One caller at a time. */
++int
++topaz_wlan_scan_on(const uint16_t *freqs, unsigned count, unsigned dwell_ms)
++{
++	uint32_t n = 0;
++
++	for (unsigned i = 0; i < count; i++) {
++		for (uint32_t k = 0; k < NFREQ && n < NFREQ; k++) {
++			if (scan_freqs[k] == freqs[i]) {
++				lw_ask_freqs[n++] = freqs[i];
++				break;
++			}
++		}
++	}
++	lw_ask_n = n;
++	lw_ask_dwell = dwell_ms > 150 ? 150 : dwell_ms;
++	return topaz_wlan_scan();
++}
++
+ bool
+ topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *out)
+ {
+@@ -4192,6 +4243,7 @@
+ static struct lw_ap s_ap;
+ static struct lw_link s_link;
+ static uint8_t s_legacy_bssid[6];               /* a join with HT/VHT failed on this AP: the next one is legacy */
++static uint8_t lw_avoid_bssid[6];               /* laurel 2409: ... and a legacy join failed too: another AP first */
+ 
+ void (*topaz_wlan_rx_hook)(const uint8_t *frame, size_t length);
+ void (*topaz_wlan_link_hook)(bool up);
+@@ -4743,6 +4795,7 @@
+ 	if (s_state == S_UP) {
+ 		w_link(false);
+ 	}
++	lw_joined = false;
+ 	s_state = S_IDLE;
+ 	s_ptk_set = false;
+ 	bzero(&s_link, sizeof(s_link));
+@@ -4756,10 +4809,15 @@
+ 		if (s_link.ht && result != EAUTH) {     /* laurel 2408: HT/VHT off for this AP only; wifid asks again */
+ 			memcpy(s_legacy_bssid, s_bssid, 6);
+ 			printf("LAUREL WIFI: HT/VHT: off for this AP: join failed (%d) in state %u\n", result, s_state);
++		} else if (result != EAUTH && result != ENOENT) {
++			memcpy(lw_avoid_bssid, s_bssid, 6);
+ 		}
++		lw_joined = false;
+ 		w_teardown();
+ 	} else {
+ 		s_state = S_UP;
++		lw_joined = true;
++		bzero(lw_avoid_bssid, 6);
+ 		LOG("t=%u ms: *** joined %.*s ***", g_ms, (int)s_ssid_len, s_ssid);
+ 		w_link(true);
+ 	}
+@@ -4771,11 +4829,30 @@
+ static void
+ w_join_begin(void)
+ {
+-	/* the AP: the strongest one heard with that name (or the BSSID asked for) */
+-	int best = -1;
++	/*
++	 * laurel 2409: the AP. wifid names none ("any access point"), so the choice is ours. It was the strongest: a
++	 * router's 2.4 GHz beats its 5 GHz by a few dB at any distance (log 2026-11-01: -37 against -41 dBm, one router).
++	 * Now: heard in the last minute first, then 5 GHz when it is at -70 dBm or better, then the strongest.
++	 * An AP where the last legacy join failed comes last.
++	 */
++	int best = -1, best_score = -100000, r24 = 0, r5 = 0;
+ 	for (uint32_t i = 0; i < nbss; i++) {
+-		if (bss[i].raw_ssid_len == s_ssid_len && memcmp(bss[i].raw_ssid, s_ssid, s_ssid_len) == 0 &&
+-		    (best < 0 || bss[i].rssi > bss[best].rssi)) {
++		if (bss[i].raw_ssid_len != s_ssid_len || memcmp(bss[i].raw_ssid, s_ssid, s_ssid_len) != 0) {
++			continue;
++		}
++		if (bss[i].freq >= 4900 && lw_fw.valid && !lw_5g_on) {
++			continue;
++		}
++		int score = bss[i].rssi + (g_ms - bss[i].last_ms <= 60000 ? 1000 : 0);
++		score += lw_band_on && bss[i].freq >= 4900 && bss[i].rssi >= -70 ? 100 : 0;
++		score -= memcmp(bss[i].bssid, lw_avoid_bssid, 6) == 0 ? 2000 : 0;
++		if (bss[i].freq >= 4900) {
++			r5 = r5 == 0 || bss[i].rssi > r5 ? bss[i].rssi : r5;
++		} else {
++			r24 = r24 == 0 || bss[i].rssi > r24 ? bss[i].rssi : r24;
++		}
++		if (score > best_score) {
++			best_score = score;
+ 			best = (int)i;
+ 		}
+ 	}
+@@ -4795,6 +4872,9 @@
+ 		w_join_end(ENOENT);
+ 		return;
+ 	}
++	if (r5 != 0 && r24 != 0) {
++		printf("LAUREL WIFI: band choice: %s GHz of this name: 2.4 GHz %d dBm, 5 GHz %d dBm\n", bss[best].freq >= 4900 ? "5" : "2.4", r24, r5);
++	}
+ 	memcpy(s_bssid, bss[best].bssid, 6);
+ 	s_freq = bss[best].freq;
+ 	s_body_len = bss[best].ie_len;
+@@ -5242,16 +5322,35 @@
+ 		w_join_poll();
+ 		w_tx_pump();
+ 	}
++	{
++		/* laurel 2409: frames in about a second (the loop's pass is about 1 ms) */
++		static uint32_t mark_ms, mark_frames;
++		if (g_ms - mark_ms >= 1024) {
++			lw_busy = rx_up + tx_sent - mark_frames >= 100;
++			mark_frames = rx_up + tx_sent;
++			mark_ms = g_ms;
++		}
++	}
+ 	if (scan_started && !scanning && api_scan_asked && (s_state == S_IDLE || s_state == S_UP)) {
+ 		api_scan_asked = false;
+ 		next_scan_ms = 0;
+-		scanning = scan_send_start();
+-		if (!scanning) {
++		if (lw_scanlimit_on && s_state == S_UP && lw_busy && g_ms - lw_scan_last_ms < 60000) {
++			lw_scans_deferred++;                /* what was heard before answers it */
+ 			api_scans_done++;
++		} else {
++			lw_scan_take_ask(true);
++			scanning = scan_send_start();
++			if (!scanning) {
++				api_scans_done++;
++			}
+ 		}
+ 	}
+ 	if (scan_started && !scanning && next_scan_ms != 0 && g_ms >= next_scan_ms) {
+ 		next_scan_ms = 0;
++		if (s_state != S_IDLE) {                /* laurel 2409: the first scans of a boot are for a radio not joined yet */
++			return;
++		}
++		lw_scan_take_ask(false);
+ 		scanning = scan_send_start();
+ 		LOG("t=%u ms: scan: passive scan %u %s", g_ms, scans + 1, scanning ? "requested" : "FAILED");
+ 	}
+diff --git a/bsd/dev/topaz_sta.c b/bsd/dev/topaz_sta.c
+--- a/bsd/dev/topaz_sta.c
++++ b/bsd/dev/topaz_sta.c
+@@ -27,6 +27,7 @@
+ extern void (*topaz_wlan_ready_hook)(void);
+ extern bool topaz_wlan_ready(void);
+ extern int topaz_wlan_scan(void);
++extern int topaz_wlan_scan_on(const uint16_t *freqs, unsigned count, unsigned dwell_ms);
+ extern bool topaz_wlan_heard(unsigned index, struct topaz_wlan_bss *bss);
+ extern void topaz_wlan_address(uint8_t address[6]);
+ extern int topaz_wlan_join(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t *pass, unsigned pass_len);
+@@ -54,9 +55,9 @@
+ }
+ 
+ static int
+-sta_scan(__unused const struct redwood_sta_scan *what)
++sta_scan(const struct redwood_sta_scan *what)
+ {
+-	return topaz_wlan_scan();
++	return topaz_wlan_scan_on(what->frequencies, what->frequency_count, what->dwell_ms);    /* laurel 2409 */
+ }
+ 
+ static void
+@@ -66,8 +67,8 @@
+ 	static struct redwood_sta_bss b;
+ 
+ 	for (unsigned i = 0; topaz_wlan_heard(i, &t); i++) {
+-		if (t.age_ms > 60000) {
+-			continue;                       /* not heard in the last minute */
++		if (t.age_ms > 180000) {
++			continue;                       /* laurel 2409: 3 minutes: wifid now scans a part of the channels at a time */
+ 		}
+ 		bzero(&b, sizeof(b));
+ 		memcpy(b.bssid, t.bssid, 6);

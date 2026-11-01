@@ -113,3 +113,77 @@ already in topaz; ath10k uses it for all WCN3990 firmware.
 - 2404 (shared with TopazAudio): one lock over every TrustZone call incl. the resume loop, SCM_V2_EBUSY retried
   (30 ms, 100 times); one lock over the SMMU stream setup; pool vs XNU RAM check. `topaz_part_fw_size/read` stay
   for TopazAudio (paths like `image/adsp.mdt`).
+
+## Speed and 5 GHz (2026-11-01, patches 2405-2411, branch t3/laurel-wifi-5ghz-speed)
+
+Owner: "Wi-Fi works but is not using 5 GHz properly, barely 8 Mbps to download." Status: [V] builds, [U] not run on the phone.
+
+### Causes: band choice and data-path speed are separate limits
+
+| # | Limit | Kind | Evidence | Fix |
+| --- | --- | --- | --- | --- |
+| 1 | Link is 11a/11g only: 54 Mbit/s at most, no A-MPDU, no QoS. Largest limit [I] | Speed | [V] `w_peer_assoc`: phy mode 11a/11g, no HT rates. `w_build_assoc_req`: no HT, VHT or WMM element. `htt_tx_frame`: TID 16 (non-QoS). `w_channel`: 20 MHz. ath10k has all of these (`ath10k_peer_assoc_h_ht/_vht/_phymode`, `ath10k_htt_tx_get_tid`) | 2405-2408 |
+| 2 | Each wifid scan was 37 channels x 150 ms, also while joined | Speed | [V] `sta_scan` dropped its argument. [V log 05:30:37-05:30:58] joined, wifid asks 13 channels: the scan takes 8 s of each 13 s. Traffic in that scan: 46-101 msdus | 2409 |
+| 3 | AP choice = strongest. wifid gives no AP ("any access point") | Band | [V] `w_join_begin`. [V log] one router (3c:6a:d2): channel 5 at -37 dBm, channel 44 at -41 dBm: 2.4 GHz wins at most distances. It joined 5220 MHz once [V 05:30:36]: 5 GHz itself works | 2409 |
+| 4 | wifid got the first AP of the name, not the AP joined: wrong channel and band in iOS | Band (report only) | [V] `sta_join` matched by name. RSSI was frozen at join; RATE, MCS, PHY_MODE refused [V log] | 2411 |
+| 5 | Tx queue 32 frames, a burst past it is dropped (upload) | Speed | [V] `topaz_wlan_transmit`; `net: so far ... dropped: 0 out, 0 in` [V log 16:59:51]: not hit in that run | 2410: 128 |
+
+Estimate [I]: 54 Mbit/s without aggregation gives about 25 Mbit/s of TCP on a clear channel; a busy channel, a lower AP rate and scan
+time bring it near 8 Mbit/s. No log has the owner's speed test with rates, so the share of each cause is not measured.
+
+### Checked, not a cause
+
+- [V] Polling: the loop runs 0.79-0.95 passes/ms (log: t= against wall clock). 16 CE1 messages and 16 Tx frames per pass give more
+  than 100 Mbit/s [I]. Interrupts are not needed for this. Tx pump is 32 per pass now.
+- [V] Copies: Rx 2, Tx 5, pool memory is Normal non-cacheable. At 8 Mbit/s this is no limit (`dropped: 0`); [I] it costs CPU above 100 Mbit/s.
+  Not changed. No checksum offload or TSO: `ifnet_set_offload(ifp, 0)`, also [I] no limit at this speed.
+- [V] Power save: `w_ps_off` before VDEV_START; now also after VDEV_UP.
+- [V] Board id 0xff: the firmware has no id in OTP, so `w_start_bdf` takes the default file `bdwlan.bin`; [I] this is what it is for.
+  `scripts/laurel/bdwlan-info.py`: all 31 files are 26328 bytes; `bdwlan.bin` has regulatory domain 0x809c, the others 0x0.
+  [I] 0x809c = country flag + 156 = China: channels 36-64 and 149-165; channels 100-140 may be refused. New line `LAUREL WIFI: radio: ... regulatory`
+  says what the firmware uses. Not changed: no evidence that it limits channel 44.
+- [V] MAC 00:00:00:00:00:00: the MAC field in `bdwlan.bin` is zero. The vdev uses our own locally administered MAC. No effect on speed.
+- [V] Scan is passive on 2.4 and 5 GHz: channels 44 and 161 are heard. Not 2.4 GHz only.
+- [U] `wifid sets 383` (4104 bytes, refused): meaning unknown; appears before and after the join, data flows without it.
+- [V] `rf_chains 1` in the log: 1 stream. Most we can reach: 433 Mbit/s PHY at VHT80 MCS 9.
+
+### What the patches do
+
+- 2405, 2407: `LaurelWifiPhy.h`, `LaurelWifiLink.h`: pure code, `scripts/laurel/wifi-phy-test.sh` runs it on the host (ASan + UBSan).
+- 2406: phy, HT, VHT caps and regulatory from WMI SERVICE_READY; one line per feature. Kill switches: `wifi_ht=0`, `wifi_band=0`, `wifi_scanlimit=0`.
+- 2408: VDEV_START with the AP's mode and width (VHT80/40/20, HT40/20, 20 MHz only on 2.4 GHz); assoc request with HT, VHT and WMM elements;
+  PEER_ASSOC with flags, HT/VHT rates and A-MPDU limits; WMM parameters from the beacon; TID 0 for data, 7 for EAPOL; dynamic bandwidth.
+  A join that fails with HT/VHT: that AP is legacy for the next join (one line). Beamforming is not offered (no vdev txbf setup).
+- 2409: 5 GHz first if heard at -70 dBm or better and in the last minute; an AP where a legacy join failed comes last. The scan uses wifid's
+  channels and dwell. While joined: dwell at most 110 ms, min rest 100 ms. Under traffic (100 frames/s or more): at most 1 scan in 60 s, other requests
+  are answered with what was heard. Scan results stay 3 minutes (was 1): wifid now scans parts of the band.
+- 2410: the status line; Rx rate and RSSI from the rx descriptor; Tx rate from WMI peer stats. 2411: real AP, RSSI, RATE, MCS, PHY_MODE for wifid.
+
+### Expected lines
+
+```
+LAUREL WIFI: radio: phy 0x3, 1 rf chains, ht 0x..., vht 0x..., vht mcs 0x..., regulatory 0x809c, 5 GHz ...-... MHz
+LAUREL WIFI: band choice: on: 5 GHz first when it is heard well
+LAUREL WIFI: HT/VHT: on: 1 stream(s), VHT on 5 GHz
+LAUREL WIFI: scan limit: on
+LAUREL WIFI: band choice: 5 GHz of this name: 2.4 GHz -37 dBm, 5 GHz -41 dBm
+LAUREL WIFI: join: 5220 MHz, 80 MHz wide (center 5210), phy mode 10, VHT QoS, 1 stream(s), AP: ht 1 vht 1 wmm 1
+LAUREL WIFI: link 5 GHz ch 44 5220 MHz, 80 MHz VHT QoS 1x1 | rx VHT mcs 9 sgi 80 MHz 433.3 Mbps | tx 433 Mbps | RSSI -44 dBm | down 95.2 up 1.1 Mbps | frames rx ... tx ... fail 0 drop 0 nosnap 0 | scans 8 deferred 3
+```
+
+The `link` line: each 10 s under traffic, else each 60 s. `tx 0 Mbps ?`: the firmware gave no peer stats. `nosnap` above 0 under traffic: the Rx header
+form differs from the code. The numbers above are the form, not results.
+
+### Test
+
+1. Router: same name on 2.4 and 5 GHz, 5 GHz on channel 36-48 at 80 MHz, WPA2. Start `scripts/debug/usblog.sh`. Join in Settings.
+2. Read `band choice` and `join`. In Settings the network must work; open a speed test in Safari or another download. Read 3 `link` lines during the download.
+3. Compare: `wifi_ht=0` (old link, new scan): gives the share of cause 1. `wifi_scanlimit=0`: the share of cause 2. `wifi_band=0`: old AP choice.
+4. If a join fails or there is no data with HT: `HT/VHT: off for this AP` gives the state; `wifi_ht=0` is the fallback for the whole radio.
+
+### Unproven until the phone test [U]
+
+Firmware accepts PEER_ASSOC with HT/VHT at these values; it starts Tx A-MPDU by itself and answers the AP's ADDBA [I: ath10k "Firmware offloads Tx
+aggregation"]; A-MSDU in this Rx path (ath10k: one native-wifi frame per subframe, no pad on WCN3990 in this tree [V source]); 80 MHz on channels marked
+passive in our channel list; wifid accepts the new answers to RATE, MCS, PHY_MODE (layouts from old Apple headers + request sizes in the log [I]);
+the Tx rate unit of peer stats (kbit/s [I]); real throughput.

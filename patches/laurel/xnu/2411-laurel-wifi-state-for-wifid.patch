@@ -1,0 +1,89 @@
+laurel 2411: Wi-Fi: wifid gets the AP joined (not the first of that name: wrong band), the real signal, the rate, the MCS and the PHY mode.
+
+diff --git a/bsd/dev/topaz_sta.c b/bsd/dev/topaz_sta.c
+--- a/bsd/dev/topaz_sta.c
++++ b/bsd/dev/topaz_sta.c
+@@ -34,6 +34,7 @@
+ extern int topaz_wlan_join_pmk(const uint8_t *ssid, unsigned ssid_len, const uint8_t *bssid, const uint8_t pmk[32]);
+ extern int topaz_wlan_leave(void);
+ extern bool topaz_wlan_joined(void);
++extern void topaz_wlan_link_now(uint8_t bssid[6], int *rssi, unsigned *mbps, int *mcs, unsigned *apple_phy);
+ extern bool topaz_wlan_transmit(const uint8_t *frame, size_t length);
+ extern void (*topaz_wlan_rx_hook)(const uint8_t *frame, size_t length);
+ extern void (*topaz_wlan_link_hook)(bool up);
+@@ -103,8 +104,14 @@
+ 	sta_last_error = error;
+ 	bzero(&sta_joined_bss, sizeof(sta_joined_bss));
+ 	if (error == 0) {
++		/* laurel 2411: the access point joined, not the first of that name: a router has one on each band */
++		uint8_t joined[6];
++		unsigned mbps, phy;
++		int rssi, mcs;
++
++		topaz_wlan_link_now(joined, &rssi, &mbps, &mcs, &phy);
+ 		for (unsigned i = 0; topaz_wlan_heard(i, &t); i++) {
+-			if (t.ssid_length == what->ssid_length && memcmp(t.ssid, what->ssid, t.ssid_length) == 0) {
++			if (memcmp(t.bssid, joined, 6) == 0) {
+ 				memcpy(sta_joined_bss.bssid, t.bssid, 6);
+ 				memcpy(sta_joined_bss.ssid, t.ssid, t.ssid_length);
+ 				sta_joined_bss.ssid_length = t.ssid_length;
+@@ -134,7 +141,14 @@
+ 	bzero(state, sizeof(*state));
+ 	state->phase = topaz_wlan_joined() ? REDWOOD_STA_JOINED : REDWOOD_STA_IDLE;
+ 	if (state->phase == REDWOOD_STA_JOINED) {
++		uint8_t bssid[6];
++		int rssi;
++
+ 		state->bss = sta_joined_bss;
++		topaz_wlan_link_now(bssid, &rssi, &state->rate_mbps, &state->mcs, &state->phy_mode);
++		if (rssi != 0) {                        /* laurel 2411: as it is now, not as it was at the join */
++			state->bss.rssi = (int16_t)rssi;
++		}
+ 	}
+ 	state->last_error = sta_last_error;
+ }
+diff --git a/bsd/dev/redwood_apple80211.c b/bsd/dev/redwood_apple80211.c
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -433,6 +433,29 @@
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+ 	}
++	case 14: {                              /* laurel 2411: what the radio can do and what it does (apple80211_phymode_data) */
++		struct {
++			uint32_t version, modes, active;
++		} answer = { .version = 1, .modes = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x80,
++			     .active = state->phase == REDWOOD_STA_JOINED ? state->phy_mode : 0x1 };
++
++		error = give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 8:                                 /* laurel 2411: its rate, Mbit/s (asked with no buffer: the value is the answer) */
++		if (state->phase != REDWOOD_STA_JOINED) {
++			error = ENXIO;
++		} else {
++			request->req_val = (int32_t)state->rate_mbps;
++		}
++		break;
++	case 57:                                /* laurel 2411: its MCS */
++		if (state->phase != REDWOOD_STA_JOINED || state->mcs < 0) {
++			error = ENXIO;
++		} else {
++			request->req_val = state->mcs;
++		}
++		break;
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != REDWOOD_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+diff --git a/bsd/sys/redwood_sta.h b/bsd/sys/redwood_sta.h
+--- a/bsd/sys/redwood_sta.h
++++ b/bsd/sys/redwood_sta.h
+@@ -58,6 +58,8 @@
+ 	enum redwood_sta_phase phase;
+ 	struct redwood_sta_bss bss;             /* the network joined or being joined */
+ 	int last_error;                         /* why the last join failed or the network was lost (an errno); 0: it was not */
++	unsigned rate_mbps, phy_mode;           /* laurel 2411: of the link joined (phy_mode: Apple80211's bit); 0: not known */
++	int mcs;                                /* ... -1: not known */
+ };
+ 
+ #define REDWOOD_STA_CHANNEL_PASSIVE     1u      /* the radio may only listen there */

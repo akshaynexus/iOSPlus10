@@ -1,0 +1,94 @@
+laurel 2406: Wi-Fi: read phy, HT, VHT and regulatory caps from WMI SERVICE_READY; one line per feature; kill switches wifi_ht=0, wifi_band=0, wifi_scanlimit=0.
+
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -22,6 +22,7 @@
+ #include <pexpert/pexpert.h>
+ #include <sys/param.h>
+ #include <sys/errno.h>
++#include "LaurelWifiPhy.h"                      /* laurel 2405 */
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+@@ -3148,6 +3149,52 @@
+ static bool wmi_init_sent, wmi_ready, wmi_seen_bmap, wmi_seen_reqs;
+ static uint8_t wmi_mac[6];
+ 
++/*
++ * laurel 2406: what the firmware says it can do. Each feature checks it here: no 11a -> no 5 GHz choice,
++ * no HT -> legacy joins. Kill switches wifi_ht=0 (HT, VHT, QoS), wifi_band=0 (no 5 GHz preference),
++ * wifi_scanlimit=0 (a scan while joined as it was). A failure here turns off that feature alone.
++ */
++#define TAG_HAL_REG_CAPS    0x21
++static struct lw_fw lw_fw;
++static bool lw_ht_on, lw_5g_on, lw_band_on, lw_scanlimit_on, lw_said;
++
++static bool
++lw_switch(const char *name)
++{
++	uint32_t v = 1;
++
++	(void)PE_parse_boot_argn(name, &v, sizeof(v));
++	return v != 0;
++}
++
++static void
++lw_fw_report(void)
++{
++	if (lw_said) {
++		return;
++	}
++	lw_said = true;
++	printf("LAUREL WIFI: radio: phy 0x%x, %u rf chains, ht 0x%x, vht 0x%x, vht mcs 0x%x, regulatory 0x%x, 5 GHz %u-%u MHz\n",
++	    lw_fw.phy, lw_fw.rf_chains, lw_fw.ht, lw_fw.vht, lw_fw.vht_mcs, lw_fw.rd, lw_fw.low5, lw_fw.high5);
++	lw_5g_on = !lw_fw.valid || lw_fw.phy == 0 || (lw_fw.phy & 1) != 0;   /* a firmware that says nothing keeps 5 GHz */
++	if (!lw_5g_on) {
++		printf("LAUREL WIFI: 5 GHz: off: firmware has no 11a (phy 0x%x, top %u MHz)\n", lw_fw.phy, lw_fw.high5);
++	}
++	lw_band_on = lw_5g_on && lw_switch("wifi_band");
++	printf("LAUREL WIFI: band choice: %s\n", lw_band_on ? "on: 5 GHz first when it is heard well" :
++	    lw_5g_on ? "off: boot-arg wifi_band=0" : "off: no 5 GHz");
++	lw_ht_on = lw_switch("wifi_ht");
++	if (!lw_ht_on) {
++		printf("LAUREL WIFI: HT/VHT: off: boot-arg wifi_ht=0\n");
++	} else if (!(lw_fw.ht & LW_FW_HT_ENABLED)) {
++		printf("LAUREL WIFI: HT/VHT: off: firmware says no HT (ht 0x%x)\n", lw_fw.ht);
++	} else {
++		printf("LAUREL WIFI: HT/VHT: on: %u stream(s)%s\n", lw_nss_own(&lw_fw), lw_fw.vht != 0 ? ", VHT on 5 GHz" : ", no VHT");
++	}
++	lw_scanlimit_on = lw_switch("wifi_scanlimit");
++	printf("LAUREL WIFI: scan limit: %s\n", lw_scanlimit_on ? "on" : "off: boot-arg wifi_scanlimit=0");
++}
++
+ static bool
+ wmi_svc(uint32_t bit)
+ {
+@@ -3204,6 +3251,19 @@
+ 			memcpy(&a0, v + 4, 4);
+ 			memcpy(&rf, v + 4 + 24 + 8, 4);
+ 			LOG("wmi: fw %08x abi %08x rf_chains %u", fw, a0, rf);
++			if (l >= 52) {                      /* wmi_tlv_svc_rdy_ev */
++				lw_fw.phy = lw_get32(v + 28);
++				lw_fw.rf_chains = lw_get32(v + 36);
++				lw_fw.ht = lw_get32(v + 40);
++				lw_fw.vht = lw_get32(v + 44);
++				lw_fw.vht_mcs = lw_get32(v + 48);
++				lw_fw.valid = true;
++			}
++		} else if (tag == TAG_HAL_REG_CAPS && l >= 36) {    /* hal_reg_capabilities: the board file's regulatory domain */
++			lw_fw.rd = lw_get32(v);
++			lw_fw.low5 = lw_get32(v + 28);
++			lw_fw.high5 = lw_get32(v + 32);
++			lw_fw.reg_valid = true;
+ 		} else if (tag == TAG_ARRAY_UINT32 && !wmi_seen_bmap) {
+ 			wmi_seen_bmap = true;
+ 			memcpy(wmi_svc_map, v, MIN((uint32_t)l, (uint32_t)sizeof(wmi_svc_map)));
+@@ -5007,6 +5067,7 @@
+ 	case WMI_EV_SERVICE_READY:
+ 		LOG("t=%u ms: wmi: SERVICE_READY, %u bytes", g_ms, len);
+ 		wmi_svc_ready(d + 4, len - 4);
++		lw_fw_report();
+ 		if (!wmi_init_sent) {
+ 			wmi_send_init();
+ 		}
