@@ -1,0 +1,507 @@
+laurel 2770: IPA v4.2 AP side (see docs/laurel_sprout/cellular.md)
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 08:00:44.716547510 +0530
++++ b/bsd/conf/files	2026-11-01 08:02:50.895825340 +0530
+@@ -125,6 +125,8 @@
+ bsd/dev/laurel_reboot.c			standard
+ bsd/dev/laurel_rtc.c			standard
+ bsd/dev/laurel_cell.c			standard
++bsd/dev/laurel_ext4.c			standard
++bsd/dev/laurel_ext4_dir.c		standard
+ bsd/dev/laurel_bt.c			standard
+ bsd/dev/laurel_bt_clk.c			standard
+ bsd/dev/laurel_bt_uart.c			standard
+diff -ruN a/bsd/dev/laurel_ext4.c b/bsd/dev/laurel_ext4.c
+--- a/bsd/dev/laurel_ext4.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ext4.c	2026-11-01 08:01:47.287692357 +0530
+@@ -0,0 +1,257 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) read-only ext4 reader (laurel 2770), part 1: volume, inodes, block map.
++ * For firmware that Android keeps in the vendor partition (vendor_b on our phone: /firmware/ipa_fws.mdt +
++ * .bNN, the IPA firmware). The stock vendor image is ext4 without 64bit, flex_bg or metadata_csum (dumpe2fs of
++ * V12.0.26.0.RFQMIXM: ext_attr dir_index filetype extent sparse_super large_file huge_file uninit_bg dir_nlink
++ * extra_isize; 4096-byte blocks, 256-byte inodes); the reader also takes 64bit / flex_bg / metadata_csum
++ * volumes (it does not check checksums). It reads the superblock, one group descriptor per inode, the inode
++ * and its extent tree (or ext2/3 direct + indirect blocks). No journal replay (a volume that needs recovery is
++ * read as it is, with a warning line). Every on-disk number is bounds-checked against the block size, the
++ * inode count and the volume size. Part 2 (directories, file read): laurel_ext4_dir.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++#define LEXT4_INTERNAL
++#include "laurel_ext4.h"
++
++#define EXT4_MAGIC              0xEF53
++#define EXT4_EXTENT_MAGIC       0xF30A
++
++#define INC_RECOVER             0x0004u
++#define INC_EXTENTS             0x0040u
++#define INC_64BIT               0x0080u
++#define INC_FLEX_BG             0x0200u
++#define INC_EA_INODE            0x0400u
++#define INC_CSUM_SEED           0x2000u
++#define INC_LARGEDIR            0x4000u
++#define INC_INLINE_DATA         0x8000u
++#define INC_CASEFOLD            0x20000u
++#define INC_KNOWN               (EXT4_INC_FILETYPE | INC_RECOVER | INC_EXTENTS | INC_64BIT | INC_FLEX_BG | \
++	                         INC_EA_INODE | INC_CSUM_SEED | INC_LARGEDIR | INC_INLINE_DATA | INC_CASEFOLD)
++
++#define MAX_DEPTH               5               /* extent tree */
++
++void
++lext4_why(char *why, size_t wl, const char *s)
++{
++	if (why != NULL && wl != 0) {
++		strlcpy(why, s, wl);
++	}
++}
++
++int
++lext4_rd_blk(struct lext4 *fs, uint64_t b, void *dst)
++{
++	if (b == 0 || b >= fs->blocks) {
++		return EIO;
++	}
++	return fs->rd(fs->ctx, b * fs->bsize, dst, fs->bsize);
++}
++
++int
++lext4_mount(struct lext4 *fs, lext4_read_fn rd, void *ctx, uint64_t volume_bytes, char *why, size_t wl)
++{
++	uint8_t sb[1024];
++	int e;
++
++	bzero(fs, sizeof(*fs));
++	fs->rd = rd;
++	fs->ctx = ctx;
++	if ((e = rd(ctx, 1024, sb, sizeof(sb))) != 0) {
++		lext4_why(why, wl, e == EAGAIN ? "partition not readable yet" : "superblock read failed");
++		return e;
++	}
++	if (lext4_g16(sb + 0x38) != EXT4_MAGIC) {
++		lext4_why(why, wl, "no ext4 superblock");
++		return EINVAL;
++	}
++	uint32_t log = lext4_g32(sb + 0x18), rev = lext4_g32(sb + 0x4C);
++	fs->incompat = lext4_g32(sb + 0x60);
++	if (log > 6) {
++		lext4_why(why, wl, "bad block size");
++		return EINVAL;
++	}
++	fs->bsize = 1024u << log;
++	fs->inodes_count = lext4_g32(sb + 0x00);
++	fs->blocks = lext4_g32(sb + 0x04);
++	fs->first_data_block = lext4_g32(sb + 0x14);
++	fs->blocks_per_group = lext4_g32(sb + 0x20);
++	fs->inodes_per_group = lext4_g32(sb + 0x28);
++	fs->inode_size = rev >= 1 ? lext4_g16(sb + 0x58) : 128;
++	fs->desc_size = 32;
++	if (fs->incompat & INC_64BIT) {
++		fs->blocks |= (uint64_t)lext4_g32(sb + 0x150) << 32;
++		fs->desc_size = lext4_g16(sb + 0xFE);
++	}
++	if (fs->incompat & ~INC_KNOWN) {
++		char s[64];
++		snprintf(s, sizeof(s), "ext4 incompat features %x not read", fs->incompat & ~INC_KNOWN);
++		lext4_why(why, wl, s);
++		return ENOTSUP;
++	}
++	if (fs->blocks_per_group == 0 || fs->inodes_per_group == 0 || fs->inode_size < 128 ||
++	    fs->inode_size > fs->bsize || (fs->inode_size & (fs->inode_size - 1)) != 0 || fs->desc_size < 32 ||
++	    fs->desc_size > 1024 || (fs->desc_size & (fs->desc_size - 1)) != 0 || fs->first_data_block >= fs->blocks ||
++	    fs->inodes_count == 0) {
++		lext4_why(why, wl, "ext4 superblock values out of range");
++		return EINVAL;
++	}
++	if (volume_bytes != 0 && fs->blocks > volume_bytes / fs->bsize) {
++		lext4_why(why, wl, "ext4 volume larger than its partition");
++		return EINVAL;
++	}
++	fs->groups = (uint32_t)((fs->blocks - fs->first_data_block + fs->blocks_per_group - 1) / fs->blocks_per_group);
++	if ((uint64_t)fs->groups * fs->inodes_per_group < fs->inodes_count) {
++		lext4_why(why, wl, "ext4 inode count does not fit the groups");
++		return EINVAL;
++	}
++	fs->blk = kalloc_data(fs->bsize, Z_WAITOK | Z_ZERO);
++	if (fs->blk == NULL) {
++		lext4_why(why, wl, "no memory");
++		return ENOMEM;
++	}
++	if (fs->incompat & INC_RECOVER) {
++		printf("LaurelExt4: WARNING: the volume's journal needs recovery; read as it is\n");
++	}
++	return 0;
++}
++
++void
++lext4_unmount(struct lext4 *fs)
++{
++	if (fs->blk != NULL) {
++		kfree_data(fs->blk, fs->bsize);
++		fs->blk = NULL;
++	}
++}
++
++int
++lext4_read_inode(struct lext4 *fs, uint32_t n, struct lext4_ino *in)
++{
++	uint8_t d[64], raw[160];
++	uint32_t g, idx;
++	uint64_t table, off;
++	int e;
++
++	if (n == 0 || n > fs->inodes_count) {
++		return EIO;
++	}
++	g = (n - 1) / fs->inodes_per_group;
++	idx = (n - 1) % fs->inodes_per_group;
++	if (g >= fs->groups) {
++		return EIO;
++	}
++	/* the group descriptor table starts in the block after the superblock's */
++	off = (uint64_t)(fs->first_data_block + 1) * fs->bsize + (uint64_t)g * fs->desc_size;
++	if ((e = fs->rd(fs->ctx, off, d, MIN(fs->desc_size, (uint32_t)sizeof(d)))) != 0) {
++		return e;
++	}
++	table = lext4_g32(d + 8);
++	if ((fs->incompat & INC_64BIT) && fs->desc_size >= 64) {
++		table |= (uint64_t)lext4_g32(d + 0x28) << 32;
++	}
++	off = (uint64_t)idx * fs->inode_size;
++	if (table == 0 || table >= fs->blocks || table + (off + fs->inode_size + fs->bsize - 1) / fs->bsize > fs->blocks) {
++		return EIO;
++	}
++	if ((e = fs->rd(fs->ctx, table * fs->bsize + off, raw, MIN(fs->inode_size, (uint32_t)sizeof(raw)))) != 0) {
++		return e;
++	}
++	in->mode = lext4_g16(raw + 0x00);
++	in->flags = lext4_g32(raw + 0x20);
++	in->size = lext4_g32(raw + 0x04) | (uint64_t)lext4_g32(raw + 0x6C) << 32;
++	memcpy(in->blk, raw + 0x28, sizeof(in->blk));
++	return 0;
++}
++
++/* extent tree: leaf entries (block, len, start), index entries (block, child) */
++static int64_t
++bmap_extents(struct lext4 *fs, const struct lext4_ino *in, uint64_t lb)
++{
++	const uint8_t *node = in->blk;
++	uint32_t node_len = sizeof(in->blk);
++
++	for (int level = 0; level <= MAX_DEPTH; level++) {
++		uint16_t n = lext4_g16(node + 2), depth = lext4_g16(node + 6);
++		if (lext4_g16(node) != EXT4_EXTENT_MAGIC || 12u + 12u * n > node_len || depth > MAX_DEPTH - level) {
++			return -EIO;
++		}
++		const uint8_t *e = node + 12;
++		if (depth == 0) {
++			for (uint16_t i = 0; i < n; i++, e += 12) {
++				uint32_t first = lext4_g32(e), len = lext4_g16(e + 4);
++				uint64_t start = (uint64_t)lext4_g16(e + 6) << 32 | lext4_g32(e + 8);
++				bool unwritten = len > 32768;
++				if (unwritten) {
++					len -= 32768;
++				}
++				if (lb >= first && lb < (uint64_t)first + len) {
++					uint64_t p = start + (lb - first);
++					if (unwritten) {
++						return 0;       /* allocated, not written: reads as zeros */
++					}
++					return p != 0 && p < fs->blocks ? (int64_t)p : -EIO;
++				}
++			}
++			return 0;
++		}
++		int pick = -1;
++		for (uint16_t i = 0; i < n; i++) {
++			if (lext4_g32(e + 12u * i) <= lb) {
++				pick = i;
++			}
++		}
++		if (pick < 0) {
++			return 0;
++		}
++		uint64_t child = (uint64_t)lext4_g16(e + 12u * pick + 8) << 32 | lext4_g32(e + 12u * pick + 4);
++		if (lext4_rd_blk(fs, child, fs->blk) != 0) {
++			return -EIO;
++		}
++		node = fs->blk;
++		node_len = fs->bsize;
++	}
++	return -EIO;
++}
++
++int64_t
++lext4_bmap(struct lext4 *fs, const struct lext4_ino *in, uint64_t lb)
++{
++	if (in->flags & EXT4_EXTENTS_FL) {
++		return bmap_extents(fs, in, lb);
++	}
++	/* ext2/3 block map: 12 direct, then single, double, triple indirect */
++	uint64_t per = fs->bsize / 4;
++	if (lb < 12) {
++		uint32_t p = lext4_g32(in->blk + 4 * lb);
++		return p < fs->blocks ? (int64_t)p : -EIO;
++	}
++	lb -= 12;
++	uint64_t span = per;
++	for (unsigned level = 1; level <= 3; level++) {
++		if (lb < span) {
++			uint32_t p = lext4_g32(in->blk + 4 * (11 + level));
++			for (unsigned l = level; l > 0; l--) {
++				if (p == 0) {
++					return 0;
++				}
++				if (lext4_rd_blk(fs, p, fs->blk) != 0) {
++					return -EIO;
++				}
++				uint64_t div = 1;
++				for (unsigned k = 1; k < l; k++) {
++					div *= per;
++				}
++				p = lext4_g32(fs->blk + 4 * ((lb / div) % per));
++			}
++			return p < fs->blocks ? (int64_t)p : -EIO;
++		}
++		lb -= span;
++		span *= per;
++	}
++	return -EIO;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ext4_dir.c b/bsd/dev/laurel_ext4_dir.c
+--- a/bsd/dev/laurel_ext4_dir.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ext4_dir.c	2026-11-01 08:02:06.449400430 +0530
+@@ -0,0 +1,153 @@
++/*
++ * laurel_sprout (Mi A3, SM6125) read-only ext4 reader (laurel 2770), part 2: path lookup and file read.
++ * Directories are read linearly: an htree (dir_index) directory's index blocks look like one empty entry,
++ * so every name is still found in the leaf blocks. No symlinks, no inline data, no encryption.
++ * Part 1 (volume, inodes, block map): laurel_ext4.c.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++#define LEXT4_INTERNAL
++#include "laurel_ext4.h"
++
++#define MAX_COMPONENTS          16
++#define MAX_DIR_BYTES           (16u << 20)
++
++/* the inode of name in directory dir: 0 none, negative: -errno */
++static int64_t
++dir_find(struct lext4 *fs, const struct lext4_ino *dir, const char *name, size_t nlen)
++{
++	uint64_t nblk = (dir->size + fs->bsize - 1) / fs->bsize;
++	uint8_t *b;
++
++	if (dir->size > MAX_DIR_BYTES || (dir->flags & (EXT4_INLINE_DATA_FL | EXT4_ENCRYPT_FL))) {
++		return -ENOTSUP;
++	}
++	b = kalloc_data(fs->bsize, Z_WAITOK | Z_ZERO);
++	if (b == NULL) {
++		return -ENOMEM;
++	}
++	int64_t found = 0;
++	for (uint64_t lb = 0; lb < nblk && found == 0; lb++) {
++		int64_t p = lext4_bmap(fs, dir, lb);
++		if (p < 0) {
++			found = p;
++			break;
++		}
++		if (p == 0) {
++			continue;
++		}
++		if (lext4_rd_blk(fs, (uint64_t)p, b) != 0) {
++			found = -EIO;
++			break;
++		}
++		for (uint32_t o = 0; o + 8 <= fs->bsize;) {
++			uint32_t ino = lext4_g32(b + o), rec = lext4_g16(b + o + 4);
++			uint32_t nl = (fs->incompat & EXT4_INC_FILETYPE) ? b[o + 6] : lext4_g16(b + o + 6);
++			if (rec < 8 || (rec & 3) != 0 || o + rec > fs->bsize || 8 + nl > rec) {
++				break;                  /* bad entry: the rest of this block is skipped */
++			}
++			if (ino != 0 && nl == nlen && memcmp(b + o + 8, name, nlen) == 0) {
++				found = ino <= fs->inodes_count ? (int64_t)ino : -EIO;
++				break;
++			}
++			o += rec;
++		}
++	}
++	kfree_data(b, fs->bsize);
++	return found;
++}
++
++/* walk path from the root: 0 and the inode, or -errno with the reason in why */
++static int
++lookup(struct lext4 *fs, const char *path, struct lext4_ino *in, char *why, size_t wl)
++{
++	const char *p = path;
++	unsigned depth = 0;
++
++	if (lext4_read_inode(fs, EXT4_ROOT_INO, in) != 0) {
++		lext4_why(why, wl, "root inode not readable");
++		return -EIO;
++	}
++	for (;;) {
++		while (*p == '/') {
++			p++;
++		}
++		if (*p == 0) {
++			return 0;
++		}
++		const char *end = p;
++		while (*end != 0 && *end != '/') {
++			end++;
++		}
++		if ((in->mode & EXT4_S_IFMT) != EXT4_S_IFDIR || ++depth > MAX_COMPONENTS || end - p > 255) {
++			lext4_why(why, wl, "not a directory on the path");
++			return -ENOTDIR;
++		}
++		int64_t c = dir_find(fs, in, p, (size_t)(end - p));
++		if (c <= 0) {
++			lext4_why(why, wl, c == 0 ? "no such file" : "directory not readable");
++			return c == 0 ? -ENOENT : (int)c;
++		}
++		if (lext4_read_inode(fs, (uint32_t)c, in) != 0) {
++			lext4_why(why, wl, "inode not readable");
++			return -EIO;
++		}
++		p = end;
++	}
++}
++
++int64_t
++lext4_read_file(struct lext4 *fs, const char *path, void *dst, uint64_t max, char *why, size_t wl)
++{
++	struct lext4_ino in;
++	int e;
++
++	if (fs->blk == NULL) {
++		lext4_why(why, wl, "volume not mounted");
++		return -EINVAL;
++	}
++	if ((e = lookup(fs, path, &in, why, wl)) != 0) {
++		return e;
++	}
++	if ((in.mode & EXT4_S_IFMT) != EXT4_S_IFREG) {
++		lext4_why(why, wl, "not a regular file (symlinks are not followed)");
++		return -EINVAL;
++	}
++	if (in.flags & (EXT4_INLINE_DATA_FL | EXT4_ENCRYPT_FL)) {
++		lext4_why(why, wl, "inline or encrypted file");
++		return -ENOTSUP;
++	}
++	if (dst == NULL || max == 0) {
++		return (int64_t)in.size;
++	}
++	uint64_t want = MIN(in.size, max);
++	for (uint64_t done = 0; done < want;) {
++		uint64_t lb = done / fs->bsize;
++		uint32_t chunk = (uint32_t)MIN((uint64_t)fs->bsize, want - done);
++		int64_t pb = lext4_bmap(fs, &in, lb);
++		if (pb < 0) {
++			lext4_why(why, wl, "file block map not readable");
++			return pb;
++		}
++		if (pb == 0) {
++			bzero((uint8_t *)dst + done, chunk);
++		} else if (chunk == fs->bsize) {
++			if (lext4_rd_blk(fs, (uint64_t)pb, (uint8_t *)dst + done) != 0) {
++				lext4_why(why, wl, "file data read failed");
++				return -EIO;
++			}
++		} else {
++			if (lext4_rd_blk(fs, (uint64_t)pb, fs->blk) != 0) {
++				lext4_why(why, wl, "file data read failed");
++				return -EIO;
++			}
++			memcpy((uint8_t *)dst + done, fs->blk, chunk);
++		}
++		done += chunk;
++	}
++	return (int64_t)in.size;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_ext4.h b/bsd/dev/laurel_ext4.h
+--- a/bsd/dev/laurel_ext4.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_ext4.h	2026-11-01 08:01:06.345773157 +0530
+@@ -0,0 +1,71 @@
++/*
++ * laurel_sprout (Mi A3) read-only ext4 reader (laurel 2770): files of the phone's own vendor partition
++ * (vendor_a / vendor_b, raw ext4 on UFS) for the kernel, e.g. /firmware/ipa_fws.mdt. No write, no journal
++ * replay, no symlinks. The caller gives the block reader (sweet_ufs_read_part in the kernel, a file in the
++ * host test scripts/laurel/test-ipa.sh). Code: laurel_ext4.c (volume, inodes, block map) and
++ * laurel_ext4_dir.c (directories, file read).
++ */
++#ifndef LAUREL_EXT4_H
++#define LAUREL_EXT4_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++/* read len bytes at byte offset off of the volume: 0 or an errno */
++typedef int (*lext4_read_fn)(void *ctx, uint64_t off, void *dst, uint64_t len);
++
++struct lext4 {
++	lext4_read_fn rd;
++	void *ctx;
++	uint32_t bsize;                 /* block size, bytes */
++	uint32_t first_data_block, blocks_per_group, inodes_per_group, inodes_count;
++	uint32_t inode_size, desc_size, groups;
++	uint32_t incompat;
++	uint64_t blocks;
++	uint8_t *blk;                   /* one block, for extent / indirect nodes and partial file blocks */
++};
++
++/* 0, or an errno with the reason in why */
++int lext4_mount(struct lext4 *fs, lext4_read_fn rd, void *ctx, uint64_t volume_bytes, char *why, size_t whylen);
++
++/*
++ * The regular file at path ("/firmware/ipa_fws.mdt"): its size, and its first MIN(size, max) bytes in dst
++ * (dst may be NULL: size only). Negative: -errno, the reason in why (ENOENT: no such file).
++ */
++int64_t lext4_read_file(struct lext4 *fs, const char *path, void *dst, uint64_t max, char *why, size_t whylen);
++
++void lext4_unmount(struct lext4 *fs);
++
++#ifdef LEXT4_INTERNAL
++/* shared by laurel_ext4.c and laurel_ext4_dir.c only */
++#define EXT4_ROOT_INO           2
++#define EXT4_EXTENTS_FL         0x00080000u
++#define EXT4_INLINE_DATA_FL     0x10000000u
++#define EXT4_ENCRYPT_FL         0x00000800u
++#define EXT4_S_IFMT             0xF000
++#define EXT4_S_IFDIR            0x4000
++#define EXT4_S_IFREG            0x8000
++#define EXT4_INC_FILETYPE       0x0002u
++
++struct lext4_ino {
++	uint16_t mode;
++	uint32_t flags;
++	uint64_t size;
++	uint8_t blk[60];                /* i_block: extent header + 4 extents, or 15 block numbers */
++};
++
++static inline uint16_t lext4_g16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++static inline uint32_t
++lext4_g32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++void lext4_why(char *why, size_t wl, const char *s);
++int lext4_rd_blk(struct lext4 *fs, uint64_t b, void *dst);
++int lext4_read_inode(struct lext4 *fs, uint32_t n, struct lext4_ino *in);
++/* physical block of logical block lb (0 = hole or unwritten); negative: -errno */
++int64_t lext4_bmap(struct lext4 *fs, const struct lext4_ino *in, uint64_t lb);
++#endif
++
++#endif
