@@ -1,5 +1,6 @@
 # Mi A3 (laurel_sprout) GPU: Adreno 610 behind CoreAnimation's OpenGL ES renderer
 
+Status 2026-11-01 08:30 (branch t3/laurel-gpu-zero-copy): 2158 zero-copy surfaces + cache push per CPU write, 2159 measured GPU busy/clock, eagl 0002, Metal client gate; built on Linux, **NOT BOOTED** (section "Zero copy, cache upkeep, GPU time").
 Status 2026-11-01 06:45: the 06:12/06:17 "GL stall" is lsd's first LaunchServices seed (ADT without /chosen MACs), not the GPU; mkadt.py fix + 2155 GPU watchdog, built, NOT BOOTED (section "GL stall"). Status 2026-11-01 06:10: first boot with the zap files (05:52) hung in the zap SCM calls; 2153 fixes it (section "Zap hang").
 Status 2026-11-01 05:10: review fixes on top of laurel-int-1 (areas A, C, H); built on Linux (kernel, Mesa, userland,
 firmware extract, UEFI image). **NOT BOOTED.**
@@ -108,6 +109,9 @@ no fallback.
   surface 1 (boot framebuffer, GL draws into it) is scanned directly instead of flipping to a back buffer with a boot
   console frame; 0x5c000000 cleared of boot text at start; at the first iOS frame `LAUREL FB HANDOFF:` and the console
   stays off the panel (panic excepted). Kill switch `fbhandoff=0`.
+- **2158** `laurel-gpu-zero-copy` and **2159** `laurel-gpu-time-clock`: section "Zero copy, cache upkeep, GPU time" below
+  (scratch guard page, cache push per CPU write, request 0x7d, per-buffer CPU_PREP, measured GPU busy/clock). Kill switch
+  `gpuseed=0` (2158's push rule).
 - **2152** `laurel-fps-line`: `SWEET FPS:` is part of the GPU report: only while GL is loaded, 6 lines every second, then
   one every 10 s while frames come; `sweetfps=0` turns it off.
 
@@ -557,10 +561,106 @@ Expected log lines (GL boot):
   kill switch: `LAUREL FB HANDOFF: off: fbhandoff=0 ...`.
 Test: GL boot, leave the UI idle for 1 min, then scroll and stop: no kernel text at any time.
 
+## Zero copy, cache upkeep, GPU time (boot 2026-11-01 07:45, fixed by 2158 + 2159; Metal gate)
+
+Owner report: "GPU acceleration ... is still CPU rendered". Log `logs/usblog-20261101-001446.txt` (main checkout) from 07:45:11
+(kernel 2154 + 2156 + 2157 + 2104, stage 1 on).
+
+Observed [V log]:
+- `LAUREL GPU SMMU: on: stage 1 ...`, `LAUREL GPU: on ... SMMU stage 1`, `LAUREL METAL: on: Turnip a610 ...`.
+- Frames alternate between surface 2 (backboardd, GPU pool: `0 pictures copied out, 1 drawn in place`, 7-17 ms) and
+  surface 1 (`-attachImage: texture 4 is IOSurface 1 ('BGRA' 720 x 1560, 2880 bytes a row): a copy`; `1 picture copied out`,
+  31-62 ms "copying out"). Frame 1020: 59196 us, 31083 copying out; frame 1060: 70588 us, 27966 handing on, 35335 copying out.
+- Every 5 s line: `13400-16648 KB out of the cache in 5283-15897 us a submission`, 100-400 submissions in 5 s. Examples:
+  07:49:14 299 x 6216 us = 1.86 s of 5 s; 07:50:49 400 x 5419 us = 2.17 s of 5 s (43 %).
+- `the GPU worked 0 us on each of 0` in every line; `core 300 MHz` is the programmed value, not a measured one.
+- `LAUREL GPU SMMU: fault FSR 00000400 FAR 0001126404822902 FSYNR0 00040021` every 5 s, always the same values.
+- `SWEET FPS: 201 frames in 10045 ms, ... 159 late; a frame: 9626 us in present + latch`.
+
+Causes [V source unless marked]:
+1. **Surface 1 copied out.** With the tables, `surfaceBuffer()` took only surfaces whose IOBufferMemoryDescriptor holds the
+   64 guard rows (2154). Surface 1 is the boot framebuffer (`sweet_surface_create_physical`, a physical descriptor, no rows
+   after it): refused, so eagl.c read every surface-1 frame back with glReadPixels. In pass-through it was shared
+   (`RedwoodGPU: surface 1 ... shared at 0x5c000000`, earlier boots). "copying out" = glReadPixels (eagl `target_to_surface`).
+2. **"handing on" = the kernel's cache push in GEM_SUBMIT.** "handing on" is the time in glFlush (eagl `my_glFlush`), and
+   glFlush ends in GEM_SUBMIT. (a) RedwoodGPUStart sets `gpu_cached = 1` when the SMMU translates (for scattered buffers), and
+   submit() pushes every own buffer that Mesa has mapped (`b->seen`) when gpu_cached is 1: command streams, upload and
+   staging buffers, nearly all from the write-combined GPU pool, at **every** submission. (b) Surfaces: the "again after
+   4 ms" rule; the push itself takes longer than 4 ms, so every next submission pushed them again. [I] (a) is most of the
+   13-16 MB: early frames (07:45:24-31) had no CPU-memory surface imported and still pushed 16 MB per submission.
+   "waiting" (5-13 ms on in-place frames) is eagl's fence-sync flush: one more GEM_SUBMIT with the same push.
+3. The fault line: FSR bits 10:9 are FORMAT (read-only, 2 = AArch64 with the tables); no fault bit is set. False alarm.
+4. A wrapped picture (`SWEET SURF: wrap image ... at +0x40`, BGRA, 64-byte rows) was given to the GPU from its page start in
+   stage 1: its texture is 0x40 bytes off [V source; not seen on the screen].
+5. CPU_PREP waited for the last submission of all, not of the buffer.
+
+Fix, kernel **2158** `laurel-gpu-zero-copy` (RedwoodGPU.cpp, TopazAdreno.cpp, SweetSurface.{h,cpp}):
+- `redwood_gpu_map_scratch()`: one GPU-owned page entered at every page after a stage-1 surface that has no guard rows of
+  its own (64 rows rounded to pages, plus the rest of the 64 KiB VA granule). So every BGRA surface with 64-byte rows goes to
+  the GPU as it is: the boot framebuffer, pool surfaces, wrapped pictures (offset = wrapDelta + offset, 64-byte aligned or
+  refused). Bergamota's "zero page after each surface BO" (docs/gpu-status.md review), done with one page for all.
+- Cache push: never for a VA = PA buffer (GPU pool) or a surface whose maps are all write-combined (`SweetSurface::noCache`,
+  the physical framebuffer); a kernel surface when its seed moved (a CPU write lock let go) or after 250 ms (writers that do
+  not lock); wrapped client memory at most every 16 ms; times from the end of the push.
+- Request **0x7d `kRedwoodDrawn`**: "the GPU drew this surface": the seed moves (whoever watches it sees the new picture) and the
+  buffer counts as pushed at the new seed when nothing else moved it. Before, eagl.c did a write lock + unlock for that, which
+  made the next submission push the surface again.
+- CPU_PREP waits for the buffer's own last submission (Linux `msm_gem_cpu_prep`).
+- SMMU fault line only with a fault bit (`FSR_FAULTS`).
+- Kill switch `gpuseed=0`: the old push rule (4 ms, gpu_cached buffers, write-combined surfaces too). Pass-through: unchanged.
+
+Fix, kernel **2159** `laurel-gpu-time-clock` (TopazAdreno.cpp, RedwoodGPU.cpp): every submission is framed by CP time stamps of
+the always-on counter (CP_REG_TO_MEM of CP_ALWAYS_ON_COUNTER 0x980 before the IBs, CP_EVENT_WRITE RB_DONE_TS with the
+timestamp bit after them, as Mesa's fd6 time queries; 128 slots at fence page + 0x400). Done submissions are added up (union of
+[start, end]) into the existing "the GPU worked N us on each of M (histogram)" fields; CP perf counter 0 (ALWAYS_COUNT, already
+selected by hw_init_regs) over the busy time gives the measured core clock. +10 ring dwords per submission. A stamp that is not
+written is not counted (`some submissions not timed`); the GPU work is unchanged.
+
+User space (scripts/laurel/gpu-userland.sh, mesa-linux.sh):
+- `userland/laurel/gpu/mesa-patches/0001-redwood-drm-surface-drawn.patch`: Mesa's redwood-drm exports
+  `redwood_drm_surface_drawn(surface, &seed)` (request 0x7d). mesa-linux.sh applies it and checks the export.
+- `userland/laurel/gpu/patches/0002-eagl-gpu-drawn-seed-frame-times.patch`: eagl.c moves the seed of a GPU-drawn target with
+  it (one `LAUREL GL DRAWN: on|off:` line; off = the lock as before), and logs frame times every 10 s.
+- The display path [V source]: GPU-pool frames and (2104) surface-1 frames are scanned directly by the MDP (`scanFrom`); no CPU
+  copy into the scanout. With 2158 surface 1 is drawn by the GPU (eagl's GPU blit into its mirror texture) like surface 2.
+
+Expected effect [I, from the 07:45 numbers]: no "copying out" frames (was 31-62 ms on every 2nd frame); "handing on" and
+"waiting" down to Mesa's own flush time (frames 3-13 of 07:45: 0.1-0.8 ms handing on before the pushes grew), i.e. the
+5.3-15.9 ms push per submission gone (24-43 % of backboardd's wall time in the 5 s windows above). The GPU busy % from 2159
+then says whether the 300 MHz clock limits anything.
+
+Expected lines (next GL boot):
+- `|backboardd| LAUREL GL DRAWN: on: surfaces the GPU drew get their new seed from the kernel (request 0x7d), no cache push for them`
+- `redwood-gl: -attachImage: texture N is IOSurface 1 ('BGRA' 720 x 1560, 2880 bytes a row): a texture, copied into its memory by the GPU`
+- frame lines with `0 pictures copied out, 1 drawn in place` for every frame.
+- every 10 s: `redwood-gl: N frames in T ms (F a second); a frame A ms on average, the longest L ms, X over 16.7 ms, Y over
+  33.3 ms; on average H us handing on, W waiting, C copying out; 0 frames with a picture copied out; ...`
+- every 5 s: `RedwoodGPU: N submissions ... K KB out of the cache in U us a submission; the GPU worked G us on each of M (...);
+  ...; P surface pushes, Q passed over (no CPU write since the last, or write-combined); GPU busy B %, core C MHz while busy,
+  W MHz over the window`. K should be near 0 while nothing CPU-draws; C should read about 300.
+- no `LAUREL GPU SMMU: fault` line unless a real fault.
+- Metal gate (metal.md section 6): `LAUREL METAL CLIENTS: on: ...` or `off: <reason>` (syslog, /var/tmp/laurel-metal-gate.log).
+If `RedwoodGPU: N submissions` shows `(some submissions not timed)` and `the GPU worked 0 us`: RB_DONE_TS does not write the
+counter on the A610 [U]; the rest of 2158/2159 is not affected.
+
+### GPU clock (owner item 4): not raised in this round
+
+Facts [V]: kgsl trinket OPPs 320-950 MHz (table above); gfx3d votes vdd_cx (`gpucc-trinket.c` rate_max: LOWER 320, LOW 465,
+LOW_L1 600, NOMINAL 745, NOMINAL_L1 820, HIGH 900, HIGH_L1 950); the GX GDSC hangs off the same CX corner; TopazRpm has
+`topaz_rpm_write()`, but no TopazRpm line in the 07:45 boot (its link state is not known [U]) and nothing reads the RPM's
+present CX corner. Why not now [I]: an AP vote replaces the AP's earlier CX vote (ABL/UEFI may have voted higher for the
+display or storage clocks); voting a lower corner than that can brown out other AP blocks, and a GPU clock above 320 MHz
+without a confirmed CX corner can fail silently (negroni lesson: wrong clocks went unseen for days). Also the 07:45 frames
+were CPU/copy bound (above), not GPU bound. Next step: boot 2158 + 2159, read `GPU busy B %` and `core C MHz`; when B stays
+above ~60 % during scrolling, add GPU DCVS 300/600 MHz (600 = GPLL0 / 1, no PLL) behind a self-check: RPM link up, CX vote
+LOW_L1 (192) acked, measured clock within 10 % after the switch, TSENS sensor 15 (LAUREL THERMAL `gpu`) below 85 C, back to
+300 at 95 C. Kill switch `gpudcvs=0`.
+
 ## Recovery (no UI after the GPU root)
 
 1. Boot with `gl=0` (backboardd without the loader, software renderer) or `gpu=0` (no GPU at all, no loader), or
-   `gpu_smmu=0` (GPU on, stage-1 tables off: 2150's pass-through and backboardd-only rule). Add the
+   `gpu_smmu=0` (GPU on, stage-1 tables off: 2150's pass-through and backboardd-only rule), or `gpuseed=0` (2158: the old
+   cache push rule; for pictures that look stale). Add the
    boot-arg to the UniXNU/DarwinBoot command line (`scripts/laurel/uefi-image.sh` boot-args) and `fastboot boot` the image.
 2. The wrapper turns the loader off by itself after 2 backboardd starts within 30 s of each other in one boot
    (`/var/tmp/laurel-bbd.state`, line `LAUREL BBD: off: backboardd exited N times ...`), and when `kern.laurel_gpu`

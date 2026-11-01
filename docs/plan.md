@@ -16,6 +16,18 @@ other surfaces from wired pages), 2103 (native 720x1560 canvas at scale 2 by def
 `LAUREL FB CANVAS:`, `LAUREL FB CANVAS: first frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
 + 0102 (DarwinBoot shrinks the window instead of "NO WINDOW"); mkadt `--dram auto`. Next: boot, read `LAUREL RAM:`, `LAUREL SPOOL:`,
 `LAUREL FB CANVAS:`, `LAUREL FB: first iOS frame`, photo of the lock screen. Details: `docs/laurel_sprout/uefi-boot.md` "RAM, memory map".
+GPU zero copy (2026-11-01 08:35, branch t3/laurel-gpu-zero-copy, built, NOT BOOTED): owner "still CPU rendered". Causes [V log
+07:45 + source]: (1) surface 1 (boot framebuffer) refused by 2154's stage-1 import (no guard rows) -> glReadPixels 31-62 ms every
+2nd frame; (2) GEM_SUBMIT pushed 13-16 MB out of the CPU cache per submission (gpu_cached=1 in stage 1 pushed every mapped Mesa
+buffer, write-combined pool ones too; surface "4 ms" rule re-fired because the push took > 4 ms): 24-43 % of wall time;
+(3) "the GPU worked 0 us" stub; (4) false SMMU fault line. Kernel 2158 (scratch guard page, push per CPU write, request 0x7d,
+per-buffer CPU_PREP, wrapDelta offset; kill switch gpuseed=0), 2159 (CP time stamps: GPU busy %, measured core clock); Mesa
+redwood-drm 0001 + eagl 0002 (GPU-drawn seed, frame-time line every 10 s); Metal client gate (m2vtest self-check at boot ->
+clients "* -backboardd"). GPU clock not raised (RPM/CX state unknown, frames not GPU-bound): next after 2159's numbers.
+Build: kernel 252/252, 0 LSE; userland 0 ARMv8.1+; metal check PASS. Needs: new boot image (kernel) + root rebuild
+(libOSMesa, libtopaz-gl, backboardd wrapper, laurel-metal-gate, clients mark). Next: boot, read `LAUREL GL DRAWN: on`,
+`0 pictures copied out` on every frame, the 10 s `redwood-gl: N frames ...` line, `KB out of the cache` near 0, `GPU busy`,
+`core C MHz`, `LAUREL METAL CLIENTS:`. Details: `docs/laurel_sprout/gpu.md` "Zero copy, cache upkeep, GPU time".
 Console flash fix (2026-11-01 07:50, branch t3/laurel-fb-console-flash, built, NOT BOOTED): with GL, the idle UI showed
 kernel log text. Cause [V log + source]: backboardd presents surface 1 (= boot framebuffer 0x5c000000, GL draws into it)
 between GPU-pool frames; the copy path skipped it and flipped to a back buffer that still held a boot console frame. Kernel

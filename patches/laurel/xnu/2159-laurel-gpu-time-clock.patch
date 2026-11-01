@@ -1,0 +1,197 @@
+laurel 2159: measured GPU busy time and core clock in the RedwoodGPU 5 s line.
+Boot 07:45 [V]: "the GPU worked 0 us on each of 0 (0 under 0.1 ms, ...)" in every line: redwood_gpu_worked() was a stub, so
+nothing said whether a frame waits for the GPU or for the CPU, and the core clock (300 MHz from GPLL0 / 2) was never measured
+(negroni lesson: the A730 ran at about 5 MHz for days). Each submission is now framed by two CP time stamps of the always-on
+counter (19.2 MHz) in the fence page (CP_REG_TO_MEM CP_ALWAYS_ON_COUNTER before the IBs, CP_EVENT_WRITE RB_DONE_TS after
+them, as Mesa/Turnip time queries on a6xx); done submissions are added up under hw_lock (busy = union of [start, end]) and fill
+the existing "the GPU worked N us on each of M (histogram)" fields. CP perf counter 0 (ALWAYS_COUNT, already selected by
+hw_init_regs) gives the core clock: cycles over the busy time and over the wall time of the window. New end of the line:
+"; GPU busy B %, core C MHz while busy, W MHz over the window". A stamp that is not written (or > 1 s) is not counted and the
+line says "(some submissions not timed)"; the GPU work itself is unchanged. 10 more ring dwords per submission.
+
+diff -ruN b/iokit/Kernel/arm/RedwoodGPU.cpp c/iokit/Kernel/arm/RedwoodGPU.cpp
+--- b/iokit/Kernel/arm/RedwoodGPU.cpp	2026-11-01 08:19:31.613536110 +0530
++++ c/iokit/Kernel/arm/RedwoodGPU.cpp	2026-11-01 08:19:31.623575499 +0530
+@@ -73,6 +73,7 @@
+ bool redwood_gpu_done(uint32_t fence);
+ uint32_t redwood_gpu_last(void);
+ void redwood_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
++const char * redwood_gpu_clock_note(void);       /* laurel 2159: GPU busy % and the measured core clock */
+ void redwood_gpu_report(const char * why);
+ void redwood_gpu_stop(void);
+ 
+@@ -1343,13 +1344,13 @@
+ 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
+ 		    "%u under 1, %u under 2, %u under 4, %u longer; %llu ms in all); %u waits of %llu us, %u over before they "
+ 		    "began; %u IOSurfaces taken as buffers in %llu us each; %u buffers, %llu MB; %u surface pushes, %u passed over "
+-		    "(no CPU write since the last, or write-combined)\n",
++		    "(no CPU write since the last, or write-combined); %s\n",
+ 		    gGPUStat.submissions, nanos / NSEC_PER_MSEC, gGPUStat.commands, gGPUStat.buffers,
+ 		    (gGPUStat.flushed >> 10) / gGPUStat.submissions, flushing / NSEC_PER_USEC / gGPUStat.submissions,
+ 		    timed ? worked / timed : 0, timed, by[0], by[1], by[2], by[3], by[4], by[5], by[6], worked / 1000,
+ 		    gGPUStat.waits, gGPUStat.waits ? waiting / NSEC_PER_USEC / gGPUStat.waits : 0, gGPUStat.over,
+ 		    gGPUStat.surfaces, gGPUStat.surfaces ? taking / NSEC_PER_USEC / gGPUStat.surfaces : 0, fBufferCount,
+-		    fBufferBytes >> 20, gGPUStat.pushes, gGPUStat.clean);
++		    fBufferBytes >> 20, gGPUStat.pushes, gGPUStat.clean, redwood_gpu_clock_note());
+ 		bzero(&gGPUStat, sizeof(gGPUStat));
+ 	}
+ 	IOLockUnlock(gGPULock);
+diff -ruN b/iokit/Kernel/arm/TopazAdreno.cpp c/iokit/Kernel/arm/TopazAdreno.cpp
+--- b/iokit/Kernel/arm/TopazAdreno.cpp	2026-11-01 08:06:27.128830951 +0530
++++ c/iokit/Kernel/arm/TopazAdreno.cpp	2026-11-01 08:10:03.107273498 +0530
+@@ -1776,12 +1776,104 @@
+ 	return seqno;
+ }
+ 
++/*
++ * laurel 2159: what the GPU worked. Each submission is framed by two CP time stamps of the always-on counter
++ * (19.2 MHz) in the fence page: CP_REG_TO_MEM of CP_ALWAYS_ON_COUNTER when the CP reaches the submission (start)
++ * and an RB_DONE_TS event after its IBs (written when the pipeline is done: end), as Mesa/Turnip time queries do on
++ * a6xx. Done submissions are added up here (with hw_lock: from submit and from the 5 s line): busy time = the union
++ * of [start, end] (a start before the previous end counts from that end). The core clock is measured too (negroni
++ * lesson: the A730 ran at 5 MHz for days and nobody saw it): CP perf counter 0 (CP_PERFCTR_CP_SEL0 = 0, ALWAYS_COUNT,
++ * set by hw_init_regs) counts core cycles; cycles over the window's busy time and over its wall time.
++ */
++#define TS_BASE         0x400u                          /* in the fence page: TS_SLOTS x {start, end} */
++#define TS_SLOTS        128u
++#define RB_DONE_TS      22u
++#define CP_REG_TO_MEM   0x3e
++#define EVENT_TS        (1u << 30)                      /* CP_EVENT_WRITE_0_TIMESTAMP: the event writes to the address */
++static uint32_t ts_done;                                /* the last fence added up */
++static uint64_t ts_prev_end, ts_busy, ts_lost;          /* (always-on ticks) */
++static uint32_t ts_count, ts_by[7];
++static uint64_t clk_cycles0, clk_ticks0, clk_busy0;     /* at the last line */
++static char clk_note[128];
++
++static void
++ts_account(void)
++{
++	if (mem.va == NULL || !ready) {
++		return;
++	}
++	sweet_dcache_flush((vm_offset_t)mem.va, 64);
++	uint32_t done = *(volatile uint32_t *)mem.va;
++
++	if ((int32_t)(done - seqno) > 0 || (int32_t)(ts_done - seqno) > 0) {
++		ts_done = (int32_t)(done - seqno) > 0 ? seqno : done;   /* (a self-check's magic, or the CP started again) */
++		return;
++	}
++	if ((int32_t)(done - ts_done) <= 0) {
++		return;
++	}
++	if (done - ts_done > TS_SLOTS - 1) {
++		ts_lost += done - ts_done - (TS_SLOTS - 1);     /* (slots used again before they were read) */
++		ts_done = done - (TS_SLOTS - 1);
++	}
++	sweet_dcache_flush((vm_offset_t)(mem.va + TS_BASE), TS_SLOTS * 16);
++	for (uint32_t f = ts_done + 1; (int32_t)(done - f) >= 0; f++) {
++		volatile uint64_t *slot = (volatile uint64_t *)(mem.va + TS_BASE + (f % TS_SLOTS) * 16);
++		uint64_t start = slot[0], end = slot[1];
++
++		if (end == 0 || end < start || end - start > 19200000ull) {
++			ts_lost++;                              /* (not written, or not believable: more than 1 s) */
++			continue;
++		}
++		if (start < ts_prev_end) {
++			start = ts_prev_end < end ? ts_prev_end : end;
++		}
++		uint64_t us = (end - start) * 10 / 192;
++		ts_busy += end - start;
++		ts_prev_end = end;
++		ts_count++;
++		ts_by[us < 100 ? 0 : us < 250 ? 1 : us < 500 ? 2 : us < 1000 ? 3 : us < 2000 ? 4 : us < 4000 ? 5 : 6]++;
++	}
++	ts_done = done;
++}
++
++extern "C" const char *redwood_gpu_clock_note(void);
++const char *
++redwood_gpu_clock_note(void)
++{
++	return clk_note;
++}
++
+ void
+ redwood_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+ {
+ 	*microseconds = 0;
+ 	*submissions = 0;
+ 	bzero(by, 7 * sizeof(uint32_t));
++	if (ready && gpu != NULL && hw_lock != NULL) {
++		IOLockLock(hw_lock);
++		ts_account();
++		uint64_t cycles = (uint64_t)gpu_rd(0x401) << 32 | gpu_rd(0x400);       /* RBBM_PERFCTR_CP_0 */
++		uint64_t ticks = (uint64_t)gpu_rd(0x981) << 32 | gpu_rd(0x980);        /* CP_ALWAYS_ON_COUNTER */
++		uint64_t busy = ts_busy;
++
++		*microseconds = (busy - clk_busy0) * 10 / 192;
++		*submissions = ts_count;
++		memcpy(by, ts_by, sizeof(ts_by));
++		ts_count = 0;
++		bzero(ts_by, sizeof(ts_by));
++		if (clk_ticks0 != 0 && ticks > clk_ticks0 && cycles >= clk_cycles0) {
++			uint64_t dc = cycles - clk_cycles0, dt = ticks - clk_ticks0, db = busy - clk_busy0;
++
++			snprintf(clk_note, sizeof(clk_note), "GPU busy %llu.%llu %%, core %llu MHz while busy, %llu MHz over the window%s",
++			    db * 100 / dt, db * 1000 / dt % 10, db ? dc * 192 / db / 10 : 0, dc * 192 / dt / 10,
++			    ts_lost ? " (some submissions not timed)" : "");
++		}
++		clk_cycles0 = cycles;
++		clk_ticks0 = ticks;
++		clk_busy0 = busy;
++		IOLockUnlock(hw_lock);
++	}
+ 	/* laurel 2154: a GPU access the tables refused (terminated, no stall): told, then cleared (FSR is write-1-to-clear) */
+ 	uint32_t fsr = (!gpu_identity && smmu != NULL) ? rd(smmu, SMMU_CB0 + 0x58) : 0;
+ 	/*
+@@ -1802,12 +1894,13 @@
+ uint32_t
+ redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+ {
+-	uint32_t need = 4 * count + 5;
++	uint32_t need = 4 * count + 5 + 4 + 5;          /* laurel 2159: + the two time stamps */
+ 
+ 	if (!ready) {
+ 		return 0;
+ 	}
+ 	IOLockLock(hw_lock);
++	ts_account();
+ 	for (int spin = 0; ring_free() < need && spin < 20000; spin++) {
+ 		IODelay(100);
+ 	}
+@@ -1815,16 +1908,31 @@
+ 		IOLockUnlock(hw_lock);
+ 		return 0;
+ 	}
++	if (++seqno == 0) {
++		seqno = 1;
++	}
++	uint32_t fence = seqno;
++	uint64_t slot = mem.iova + TS_BASE + (fence % TS_SLOTS) * 16;
++	volatile uint64_t *cpu_slot = (volatile uint64_t *)(mem.va + TS_BASE + (fence % TS_SLOTS) * 16);
++
++	cpu_slot[0] = 0;
++	cpu_slot[1] = 0;
++	sweet_dcache_flush((vm_offset_t)cpu_slot, 16);
++	emit(pkt7(CP_REG_TO_MEM, 3));                   /* laurel 2159: start = CP_ALWAYS_ON_COUNTER, 64 bit */
++	emit(0x980 | (2u << 18) | (1u << 30));
++	emit((uint32_t)slot);
++	emit((uint32_t)(slot >> 32));
+ 	for (uint32_t i = 0; i < count; i++) {
+ 		emit(pkt7(CP_INDIRECT_BUFFER, 3));
+ 		emit((uint32_t)addresses[i]);
+ 		emit((uint32_t)(addresses[i] >> 32));
+ 		emit(words[i]);
+ 	}
+-	if (++seqno == 0) {
+-		seqno = 1;
+-	}
+-	uint32_t fence = seqno;
++	emit(pkt7(CP_EVENT_WRITE, 4));                  /* end: RB_DONE_TS writes the counter when the pipeline is done */
++	emit(RB_DONE_TS | EVENT_TS);
++	emit((uint32_t)(slot + 8));
++	emit((uint32_t)((slot + 8) >> 32));
++	emit(0);
+ 	emit(pkt7(CP_EVENT_WRITE, 4));
+ 	emit(CACHE_FLUSH_TS);
+ 	emit((uint32_t)mem.iova);

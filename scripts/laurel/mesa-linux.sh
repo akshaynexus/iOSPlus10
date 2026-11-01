@@ -43,6 +43,11 @@ if [ "${CLEAN:-0}" = 1 ] || [ ! -d "$S" ] || [ "$(cat "$S/.laurel-patches" 2>/de
 fi
 rm -rf "$S/src/redwood-drm"
 cp -R "$TOPAZ/userland/mesa/redwood-drm" "$S/src/redwood-drm"
+# our redwood-drm changes (userland/laurel/gpu/mesa-patches: 0001 redwood_drm_surface_drawn for kernel request 0x7d)
+for p in "$LAUREL_MESA_PATCHES"/*.patch; do
+  [ -f "$p" ] || continue
+  patch -s --no-backup-if-mismatch -d "$S/src/redwood-drm" -p1 < "$p" || gpu_die "patch $(basename "$p") does not apply to redwood-drm"
+done
 
 # 3. compiler wrappers (meson wants one program per language) and the cross file
 # --ld-path only on link lines: on a compile-only line clang warns "argument unused", and meson's
@@ -109,7 +114,8 @@ gpu_dsym "$O/libOSMesa.8.dylib"
 "$LDID" -S "$O/libOSMesa.8.dylib"
 "$NM" -gU "$O/libOSMesa.8.dylib" | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > "$O/exported-gl.txt"
 cp "$S/src/mapi/glapi/registry/gl.xml" "$O/gl.xml"
-cat "$TOPAZ"/userland/mesa/*.patch "$TOPAZ"/userland/mesa/redwood-drm/* | gpu_sha256 > "$O/built-from"
+gpu_mesa_inputs | gpu_sha256 > "$O/built-from"
 gpu_check_v80 "$O/libOSMesa.8.dylib" || gpu_die "libOSMesa has ARMv8.1+ instructions"
+"$NM" -gU "$O/libOSMesa.8.dylib" | grep -q ' _redwood_drm_surface_drawn$' || gpu_die "libOSMesa does not export redwood_drm_surface_drawn"
 file "$O/libOSMesa.8.dylib"
 echo "mesa-linux: $O/libOSMesa.8.dylib, $(wc -c < "$O/libOSMesa.8.dylib" | tr -d ' ') bytes, $(wc -l < "$O/exported-gl.txt") gl* functions, $(( $(date +%s) - T0 )) s"

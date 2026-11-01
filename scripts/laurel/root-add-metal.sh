@@ -8,9 +8,12 @@
 # without them it logs "LAUREL METAL: off: ... missing" and CoreAnimation keeps its current renderer.
 #   sudo METAL=1 scripts/laurel/root-add-metal.sh MOUNTED_ROOT
 #   METAL_CLIENTS="..."   the processes that get a Metal device (/var/db/negronimetal/clients). Default: the probes only
-#                         ("metalprobe m2vtest carenderprobe layerprobe"), because Turnip has not run on the A610 yet.
-#                         Widen it step by step after the phone tests of docs/laurel_sprout/metal.md section 8:
-#                         "SpringBoard" (after test 2), then "* -backboardd", then "*" (only after test 3 passes).
+#                         ("metalprobe m2vtest carenderprobe layerprobe"), marked as the gate's list: at boot
+#                         /usr/libexec/laurel-metal-gate (laurel 2158, userland/laurel/metal/metal_gate.c, started by the
+#                         backboardd wrapper) widens it to "* -backboardd" when the GPU runs with the stage-1 SMMU, the
+#                         kernel registered the plug-in and m2vtest passes on this build; else it stays the probes.
+#                         A list given here is the owner's: the gate leaves it alone. Steps by hand: docs/laurel_sprout/metal.md
+#                         section 8 ("SpringBoard", then "* -backboardd", then "*" only after test 3 passes).
 #                         When AREA B's GL wrapper for backboardd is in the root (/usr/libexec/real/backboardd), a "*"
 #                         list gets "-backboardd" added unless it names backboardd itself (GL owns backboardd there).
 #   METAL_ENV="TU_DEBUG=sysmem"              lines added to /var/db/negronimetal/env (Turnip/metal2vulkan settings)
@@ -40,6 +43,8 @@ if [ -e "$R/usr/libexec/real/backboardd" ] && printf ' %s ' "$clients" | grep -q
 fi
 if [ -n "${METAL_CLIENTS:-}" ] || [ $had_clients = 0 ]; then
   {
+    # the default list is the gate's (first line "# laurel-metal-gate"): it widens it after its self-check
+    [ -z "${METAL_CLIENTS:-}" ] && echo "# laurel-metal-gate: root default (probes only) until the gate's self-check passes"
     echo "# Processes that get the NegroniMetal Metal device (scripts/laurel/root-add-metal.sh, METAL_CLIENTS)."
     echo "# Names separated by blanks, \"*\" = all, \"-NAME\" = never NAME. Laurel default: the probes only, until the"
     echo "# phone tests of docs/laurel_sprout/metal.md section 8 pass."
@@ -50,6 +55,16 @@ fi
 echo "laurel-root: metal: clients = $(grep -v '^#' "$D/clients" | tr '\n' ' ')"
 if [ -n "${METAL_ENV:-}" ]; then
   printf '%s\n' "$METAL_ENV" >> "$D/env"
+fi
+# laurel 2158: the Metal client gate (built by scripts/laurel/gpu-userland.sh; the backboardd wrapper starts it once per boot)
+G=$REPO/out/laurel/gpu/root/usr/libexec/laurel-metal-gate
+if [ -s "$G" ]; then
+  install -m 755 "$G" "$R/usr/libexec/laurel-metal-gate"
+  [ "$(id -u)" != 0 ] || chown 0:0 "$R/usr/libexec/laurel-metal-gate"
+  echo "laurel-root: metal: /usr/libexec/laurel-metal-gate installed (clients widened at boot after its self-check)"
+else
+  rm -f "$R/usr/libexec/laurel-metal-gate"
+  echo "laurel-root: metal: no $G (scripts/laurel/gpu-userland.sh): clients stay as listed"
 fi
 # what was built, for the log on the phone side (metal.log names no build)
 {
