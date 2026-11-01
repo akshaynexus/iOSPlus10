@@ -1,5 +1,5 @@
 #!/bin/sh
-# Mi A3: read the persistent console logs from the userdata partition over adb, from another system
+# Mi A3: read the persistent console logs from the iosroot partition over adb, from another system
 # (a recovery on boot_b, or Android with root: owner approval, docs/backup-and-restore.md). Only reads.
 #   scripts/laurel/log-pull.sh logs/laurel-pull-$(date +%H%M)
 # 1. The boot log area of kernel patch 2900 (parked, patches/laurel/parked/; negroni 0367 layout): 9216 blocks at partition block
@@ -7,29 +7,15 @@
 #    Decoded with op10tool bootlog --file into OUT/bootlog-<boot>.txt.
 # 2. If that area was never written (kernel before 2900, or "LAUREL BOOTLOG: off"): the topaz 0047 area,
 #    the last 1025 blocks ("SWEETLOG", ufsrw=1), decoded with external/ios-topaz/tools/sweet-log.py.
-# With a partition `iosroot` only the last 1025 blocks of it are read (next lines). Reads with no write; the next iOS boot overwrites this log within seconds, so read it before that boot.
+# Reads with no write; the next iOS boot overwrites this log within seconds, so read it before that boot.
 # On a running iOS with SSH the same area comes from /dev/laurelbootlog: scripts/laurel/phone-ssh.sh bootlog.
 # Over USB without SSH (a good boot): out/bin/op10tool bootlog.
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 out=${1:?usage: log-pull.sh OUTDIR}
 mkdir -p "$out"
-# The iOS root in its own partition `iosroot` (branch t3/laurel-dual-boot-fix2, patch 2950, LDB_LOG_BLOCKS): the console log is its last 1025 blocks. iOS 26 first boot: docs/laurel_sprout/ios26-first-boot.md.
-ios=$(adb shell 'for d in /dev/block/by-name/iosroot /dev/block/bootdevice/by-name/iosroot; do [ -e $d ] && readlink -f $d && break; done' | tr -d '\r')
-if [ -n "$ios" ]; then
-  bytes=$(adb shell blockdev --getsize64 "$ios" | tr -d '\r')
-  n=$((bytes / 4096))
-  skip=$((n - 1025))
-  adb exec-out "dd if=$ios bs=4096 skip=$skip count=1025 2>/dev/null" > "$out/sweetlog.bin"
-  echo "log-pull: $ios (iosroot): $bytes bytes, log blocks $skip..$((skip + 1024)) -> $out/sweetlog.bin" >&2
-  [ "$(wc -c < "$out/sweetlog.bin" | tr -d ' ')" = $((1025 * 4096)) ] || { echo "log-pull: short read: no root on adb? (adb root, or su)" >&2; exit 2; }
-  head -c 8 "$out/sweetlog.bin" | grep -q SWEETLOG || { echo "log-pull: no SWEETLOG header at the end of iosroot: this boot never flushed (needs ufsrw=1 and a kernel past the root mount)" >&2; exit 2; }
-  python3 -I "${SWEETLOG_TOOL:-$EXT/ios-topaz/tools/sweet-log.py}" "$out/sweetlog.bin" "$out/sweetlog.txt"
-  echo "log-pull: $out/sweetlog.txt"
-  exit 0
-fi
-dev=$(adb shell 'for d in /dev/block/by-name/userdata /dev/block/bootdevice/by-name/userdata; do [ -e $d ] && readlink -f $d && break; done' | tr -d '\r')
-[ -n "$dev" ] || { echo "log-pull: userdata block device not found over adb" >&2; exit 1; }
+dev=$(adb shell 'for d in /dev/block/by-name/iosroot /dev/block/bootdevice/by-name/iosroot; do [ -e $d ] && readlink -f $d && break; done' | tr -d '\r')
+[ -n "$dev" ] || { echo "log-pull: iosroot block device not found over adb" >&2; exit 1; }
 bytes=$(adb shell blockdev --getsize64 "$dev" | tr -d '\r')
 n=$((bytes / 4096))
 skip=$((n - 28673))

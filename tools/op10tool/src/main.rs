@@ -10,7 +10,7 @@ mod camframe;
 mod census;
 mod ctl;
 mod dsc;
-mod dualboot;
+mod gpt;
 mod fat;
 mod hfs;
 mod im4p;
@@ -31,57 +31,58 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum DualbootCmd {
-    /// `ldbhelper map` output -> validated extent table for ADT /chosen laurel-dualboot; refuses overlap, misalignment, holes, flags, or anything outside userdata
-    Table {
-        /// file with the helper's lines
+enum GptCmd {
+    /// Dumps of the old table -> plan for `ldbhelper gpt-write`; refuses any other layout. Prints the table before and after
+    Plan {
         #[arg(long)]
-        fiemap: PathBuf,
-        /// userdata first LBA in 4 KiB device blocks
-        #[arg(long, value_parser = parse_u64)]
-        part_first: u64,
-        /// userdata size in 4 KiB device blocks
-        #[arg(long, value_parser = parse_u64)]
-        part_blocks: u64,
-        /// table id; default random
-        #[arg(long, value_parser = parse_u64)]
-        id: Option<u64>,
+        head: PathBuf,
+        #[arg(long)]
+        tail: PathBuf,
         #[arg(short = 'o')]
         out: PathBuf,
+        /// the plan back from the new table to the old one
+        #[arg(long)]
+        reverse: bool,
     },
-    /// All rules on an existing table; exit 1 when one fails
-    Check { table: PathBuf },
-    /// Summary and every extent
-    Show { table: PathBuf },
-    /// HFS+ image -> frames on stdout, for `adb exec-in ldbhelper write`; --index: the headers, for `ldbhelper verify`; --null: only the index and the checks
-    Stream {
-        table: PathBuf,
-        image: PathBuf,
+    /// Two dumps hold the same table, byte for byte
+    Same {
         #[arg(long)]
-        index: Option<PathBuf>,
+        head: PathBuf,
         #[arg(long)]
-        null: bool,
+        tail: PathBuf,
+        #[arg(long)]
+        ref_head: PathBuf,
+        #[arg(long)]
+        ref_tail: PathBuf,
     },
-    /// The area size to allocate: donor image bytes x expand + /private/var margin
-    Size {
-        /// The owner's area in GiB: print the largest HFS+ volume it holds (header and log subtracted)
+    /// A dump read back from the phone is the planned new table
+    VerifyNew {
         #[arg(long)]
-        area_gib: Option<u64>,
-        #[arg(long, value_delimiter = ',', value_parser = parse_u64)]
-        donor_bytes: Vec<u64>,
-        #[arg(long, default_value_t = 1.68)]
-        expand: f64,
-        #[arg(long, default_value_t = 8)]
-        var_gib: u64,
+        head: PathBuf,
+        #[arg(long)]
+        tail: PathBuf,
+        #[arg(long)]
+        ref_head: PathBuf,
+        #[arg(long)]
+        ref_tail: PathBuf,
+    },
+    /// gpt_both0-style image of the old table. `fastboot flash partition:0` of it ERASES ALL OF LUN 0: last resort
+    Image {
+        #[arg(long)]
+        head: PathBuf,
+        #[arg(long)]
+        tail: PathBuf,
+        #[arg(short = 'o')]
+        out: PathBuf,
     },
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Mi A3 dual boot: extent table, image stream, size (docs/laurel_sprout/dual-boot.md)
-    Dualboot {
+    /// Mi A3 dual boot: the one GPT change on LUN 0, from dumps, with no phone (docs/laurel_sprout/dual-boot.md)
+    Gpt {
         #[command(subcommand)]
-        cmd: DualbootCmd,
+        cmd: GptCmd,
     },
     /// Raw image -> Android sparse image (holes -> DONT_CARE, uniform blocks -> FILL, 4 KiB blocks)
     Img2simg { input: PathBuf, output: PathBuf },
@@ -310,12 +311,11 @@ fn parse_u64(s: &str) -> Result<u64, String> {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Dualboot { cmd } => match cmd {
-            DualbootCmd::Table { fiemap, part_first, part_blocks, id, out } => dualboot::make(&fiemap, part_first, part_blocks, id, &out),
-            DualbootCmd::Check { table } => dualboot::check(&table),
-            DualbootCmd::Show { table } => dualboot::show(&table),
-            DualbootCmd::Stream { table, image, index, null } => dualboot::stream(&table, &image, index.as_deref(), null),
-            DualbootCmd::Size { donor_bytes, expand, var_gib, area_gib } => dualboot::size(&donor_bytes, expand, var_gib, area_gib),
+        Cmd::Gpt { cmd } => match cmd {
+            GptCmd::Plan { head, tail, out, reverse } => gpt::plan(&head, &tail, &out, reverse),
+            GptCmd::Same { head, tail, ref_head, ref_tail } => gpt::same(&head, &tail, &ref_head, &ref_tail),
+            GptCmd::VerifyNew { head, tail, ref_head, ref_tail } => gpt::verify_new(&head, &tail, &ref_head, &ref_tail),
+            GptCmd::Image { head, tail, out } => gpt::image(&head, &tail, &out),
         },
         Cmd::Img2simg { input, output } => img2simg::img2simg(&input, &output),
         Cmd::Simg2img { input, output } => img2simg::simg2img(&input, &output),

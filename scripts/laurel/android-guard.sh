@@ -1,16 +1,17 @@
 #!/bin/sh
 # Mi A3: refuse what would damage Android's data on userdata. Called by every script that can write it. Exit 0 = go on; exit 3 = refused, one message, nothing done.
 #   android-guard.sh userdata                a write of the whole partition (flash-root.sh, root-flash-test.sh, fastboot-drain.py)
-#   android-guard.sh boot-image IMG          a flash of a boot image (flash-boot.sh, boot-test.sh): IMG must carry an extent table and the kernel of patch 2950
+#   android-guard.sh boot-image IMG          a flash of a boot image (flash-boot.sh, boot-test.sh): IMG needs the kernel of patch 2950, Lineage's header, and the gate of the writable boot
 #   android-guard.sh running-ios             a write through a running iOS (root-update.sh, update-phone.sh): that iOS must have the fence on
 #   android-guard.sh other-device            a script for the OnePlus 10 Pro (scripts/flash/*): the phone must say it is that phone, over adb or fastboot. Off, in iOS, no answer: refused
 #   android-guard.sh other-device-fastboot   the same, in fastboot only: right before a write (the phone on the cable can have changed since the first check)
 # Refused when config/laurel-android-data exists or when the phone itself shows Android over adb. There is no environment switch: removing the flag is a git change
 # (the owner says Android's data is gone), and a phone that shows Android on adb is refused even then.
-# boot-image: a plain Android boot image (restore) goes with ANDROID_IMAGE=1, which is named in the command and works for no iOS image.
+# boot-image: Lineage's own boot image (restore) goes with ANDROID_IMAGE=1. The hash must be the one in the backup, and the image must hold no iOS text.
 # Dual boot path: docs/laurel_sprout/dual-boot.md.
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
+. "$REPO/scripts/lib/laurel-layout.sh"
 FLAG=$REPO/config/laurel-android-data
 PATHWAY="dual boot path: docs/laurel_sprout/dual-boot.md, scripts/laurel/dual-boot.sh"
 # What the OnePlus 10 Pro NE2211 says: ro.product.device OP516FL1 (docs/backup-and-restore.md); fastboot product taro [I: SoC name, not read in this repo].
@@ -75,21 +76,35 @@ userdata)
 boot-image)
   img=${2:?boot-image needs IMG}
   if [ "${ANDROID_IMAGE:-0}" = 1 ]; then
-    # the promise of ANDROID_IMAGE=1 is checked: no UniXNU payload in the image
-    if LC_ALL=C grep -aq 'LAURELESP' "$img"; then refuse "ANDROID_IMAGE=1, but $img holds an iOS payload"; fi
+    # What ANDROID_IMAGE=1 promises is checked. The text: a shim image has none of the UniXNU label (mkdarwinboot.py), so that label alone proves nothing.
+    if LC_ALL=C grep -aqE 'LAURELESP|rd=ufsroot0|ufsrw=|rootrw=|Darwin Kernel Version|xnu-[0-9]+\.|SWEETXNU|LAUREL BUILD' "$img"; then refuse "ANDROID_IMAGE=1, but $img holds an iOS payload"; fi
+    # The hash decides: only Lineage's boot image, as the backup lists it. A shim with a compressed kernel has no text to find. Then ufsrw=1 inside it writes to userdata.
+    got=$(sha "$img"); ok=
+    for f in "$LAUREL_BACKUP"/lineage-*/SHA256SUMS; do [ -f "$f" ] && grep -qE "^$got  boot\.img$" "$f" && ok=1; done
+    for f in "$LAUREL_BACKUP"/android-*/SHA256SUMS; do [ -f "$f" ] && grep -qE "^$got  boot_a\.img$" "$f" && ok=1; done
+    [ -n "$ok" ] || refuse "ANDROID_IMAGE=1, but $img (sha256 $got) is not Lineage's boot image in $LAUREL_BACKUP (lineage-*/SHA256SUMS boot.img, android-*/SHA256SUMS boot_a.img)"
     exit 0
   fi
   if ! flag_says && ! android_live; then exit 0; fi
-  [ -f "$img.dualboot" ] || refuse "$img has no extent table: its kernel would treat userdata as an iOS root (build it after dual-boot.sh map; a plain Android image: ANDROID_IMAGE=1)"
+  [ -f "$img.dualboot" ] || refuse "$img was not built for this phone (no $img.dualboot; build it with dual-boot.sh image; Lineage's own image: ANDROID_IMAGE=1)"
   got=$(sha "$img")
   want=$(sed -n 's/^image //p' "$img.dualboot")
-  [ "$got" = "$want" ] || refuse "$img changed after its table was added ($img.dualboot does not match): build it again"
-  # The sidecar proves the ADT has a table. It says nothing about the kernel: one without patch 2950 ignores the table, and ufsrw=1 is in the default command line,
-  # so it writes its console log to the last 4 MiB + 4 KiB of /data. The text is searched in the image itself: the kernel lies in the payload FAT uncompressed.
+  [ "$got" = "$want" ] || refuse "$img changed after it was built ($img.dualboot does not match): build it again"
+  # A kernel without patch 2950 takes userdata as its root, and with ufsrw=1 it writes its console log there. The text is searched in the image: the kernel lies in the payload FAT uncompressed.
   m=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$REPO/tools/laurel-dualboot/laurel_dualboot.h")
   [ -n "$m" ] || refuse "no LDB_KERNEL_MARKER in tools/laurel-dualboot/laurel_dualboot.h"
-  LC_ALL=C grep -aqF "$m" "$img" || refuse "$img holds no kernel with patch 2950 ($m): that kernel ignores the table and writes its log into /data. Build the kernel, then the image"
-  LC_ALL=C grep -aqF 'laurel-dualboot' "$img" || refuse "$img has no /chosen laurel-dualboot in its ADT"
+  LC_ALL=C grep -aqF "$m" "$img" || refuse "$img holds no kernel with patch 2950 ($m): that kernel takes userdata as its root and writes its log into Android's data. Build the kernel, then the image"
+  # S1: ABL gives TrustZone the OS version from this header (VerifiedBoot.c): the same as Lineage's. docs/laurel_sprout/dual-boot.md, keys.
+  lb=$(laurel_backup_dir 'lineage-*')/boot.img
+  [ -f "$lb" ] || refuse "no Lineage boot image in $LAUREL_BACKUP/lineage-*: the header of $img cannot be compared"
+  [ "$(boot_os_raw "$img")" = "$(boot_os_raw "$lb")" ] || refuse "$img has OS version field $(boot_os_raw "$img"), Lineage ($lb) has $(boot_os_raw "$lb"): build it again with dual-boot.sh image"
+  # The read-only first boot: an image with ufsrw=1 needs the recorded result. The boot-args lie as plain text in the payload FAT. A sidecar with no mode line counts as writable.
+  mode=$(sed -n 's/^mode //p' "$img.dualboot")
+  if [ "$mode" != ro ] || LC_ALL=C grep -aqE 'ufsrw=[1-9]|rootrw=[1-9]' "$img"; then
+    r=$REPO/out/laurel/dualboot/first-boot.result
+    grep -q "^ro-on $m " "$r" 2>/dev/null || refuse "$img can write (ufsrw=1), and no read-only boot of this kernel fence has a recorded result (dual-boot.sh ro-result LOG; $r)"
+    grep -q '^android-opened-after-ro ' "$r" 2>/dev/null || refuse "$img can write (ufsrw=1), and Android has not opened its data after the read-only iOS boot (dual-boot.sh android-check; $r)"
+  fi
   ;;
 running-ios)
   if ! flag_says && ! android_live; then exit 0; fi

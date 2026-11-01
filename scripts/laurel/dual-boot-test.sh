@@ -1,10 +1,10 @@
 #!/bin/sh
 # Host test of scripts/laurel/dual-boot.sh itself: a fake adb, fastboot and phone drive the real script through each failure path. Each case proves the next step did not run.
 #   scripts/laurel/dual-boot-test.sh [TREE]     TREE: where the scripts under test come from (default: this repo). scripts/laurel/dualboot-tests-detect.sh gives it the old code.
-#   OP10TOOL=path (default out/cargo/release/op10tool)   a real op10tool: tables and frame streams are real
+#   OP10TOOL=path (default out/cargo/release/op10tool)   a real op10tool, and a real helper built for this host (-DLDB_TEST_FILE): plans and GPT writes are real, on a sparse file
 # The real adb and fastboot cannot be reached: PATH is $T/bin (fakes) + $T/tools (symlinks to a short list of tools, adb and fastboot not among them), and the test checks that first.
 # The scripts run from a copy in a temp folder, so out/ of this repo is not touched. Proves the script on the host. Nothing here proves anything about the phone.
-# Test names with [R] are regressions: the old code passed them too. Each other test failed on the old code (scripts/laurel/dualboot-tests-detect.sh).
+# scripts/laurel/dualboot-tests-detect.sh shows that these tests find the defects.
 set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SRC=${1:-$REPO}
@@ -47,6 +47,14 @@ push)
   else
     cp "\$2" "\$(rewrite "\$3")"
   fi ;;
+pull)
+  echo "adb pull \$2" >> "\$T/calls"
+  fails pull && exit 1
+  cp "\$(rewrite "\$2")" "\$3" ;;
+reboot)
+  echo "adb reboot \${2:-}" >> "\$T/calls"
+  fails adb-reboot && exit 1
+  exit 0 ;;
 shell)
   shift
   echo "adb shell \$(shortcmd "\$*")" >> "\$T/calls"
@@ -84,37 +92,8 @@ fails "drop:\$c" && { kill -9 \$PPID; exit 137; }
 fails "\$c" && { echo "ldbhelper: FAILED: \$c (fake)" >&2; exit 1; }
 case "\$c" in
 version) if fails stale-on-phone; then echo "ldbhelper-version 0000"; else cat "\$P/state/helper_version"; [ -s "\$P/state/helper_version" ] || echo "ldbhelper-version unversioned"; fi ;;
-alloc) : > "\$2"; cat "\$P/state/fiemap" ;;
-map) [ -e "\$2" ] || { echo "ldbhelper: FAILED: \$2 (errno 2)" >&2; exit 1; }; cat "\$P/state/fiemap" ;;
-check-map) echo "check-map ok: 64 samples" ;;
-lock) echo locked ;;
-write)
-  if [ -f "\$P/state/no-result" ]; then exit 0; fi
-  n=\$(python3 -I -c '
-import struct, sys
-f = sys.stdin.buffer; n = 0
-while True:
-    h = f.read(32)
-    if len(h) < 32: sys.exit(9)
-    b, fl = struct.unpack("<II", h[16:24])
-    if b == 0: break
-    n += 1
-    if not fl & 1: f.read(b * 4096)
-print(n)') || { echo "ldbhelper: FAILED: frame header (fake)" >&2; exit 1; }
-  fails write-short && n=\$((n - 1))
-  echo "write ok: \$n frames, 0 blocks"
-  echo "helper write end" >> "\$T/calls" ;;
-verify)
-  n=\$((\$(wc -c) / 32 - 1))
-  if fails verify-wrong; then echo "verify: \$n frames, 3 wrong"; echo "ldbhelper: FAILED: the raw blocks are not the image" >&2; exit 1; fi
-  echo "verify: \$n frames, 0 wrong" ;;
-read) fails read-empty && exit 1; head -c 4198400 /dev/zero ;;
-seal)
-  echo "sealed: generation 1, pin failures 0, /data frozen, reboot now"
-  echo sealed > "\$P/state/sealed"
-  kill -9 \$PPID; exit 137 ;;
-wipe) rm -f "\$4"; echo removed ;;
-unlink-only) rm -f "\$2"; echo removed ;;
+gpt-write) [ -n "\${FAKE_STOP:-}" ] && export LDB_TEST_STOP=\$FAKE_STOP; exec "\$T/real-helper" "\$@" ;;
+gpt-dump) exec "\$T/real-helper" "\$@" ;;
 esac
 EOT
 chmod +x "$T/bin/adb" "$T/fake-helper"
@@ -126,15 +105,21 @@ ro.product.device) echo "\${FAKE_DEVICE:-laurel_sprout}" ;;
 ro.boot.slot_suffix) echo "_\$(cat "\$P/state/running")" ;;
 ro.build.version.release) echo 15 ;;
 ro.lineage.version) echo 22.2 ;;
+sys.boot_completed) echo "\${FAKE_BOOTED:-1}" ;;
+sys.user.0.ce_available) echo "\${FAKE_CE:-true}" ;;
+ro.crypto.state) echo encrypted ;;
 esac
 EOT
 cat > "$T/pbin/id" <<'EOT'
 #!/bin/sh
 echo "${FAKE_UID:-0}"
 EOT
-cat > "$T/pbin/readlink" <<'EOT'
+cat > "$T/pbin/readlink" <<EOT
 #!/bin/sh
-echo /dev/block/sda15
+case "\$2" in
+*iosroot) [ -e "$P/state/new-table" ] || exit 1; echo /dev/block/sda16 ;;
+*) echo /dev/block/sda15 ;;
+esac
 EOT
 cat > "$T/pbin/dmctl" <<EOT
 #!/bin/sh
@@ -182,8 +167,11 @@ case "\$1" in
 get-current-slot) cat "\$S/current" ;;
 get-active-boot-slot) fails bootctl-read && exit 1; cat "\$S/active" ;;
 get-number-slots) echo 2 ;;
-is-slot-bootable) [ "\$(cat "\$S/bootable\$2")" = 1 ] ;;
-is-slot-marked-successful) [ "\$(cat "\$S/successful\$2")" = 1 ] ;;
+is-slot-bootable) fails "bootctl-error\$2" && { echo "Error calling isSlotBootable()" >&2; exit 70; }; if [ "\$(cat "\$S/bootable\$2")" = 1 ]; then echo 1; else echo 0; exit 70; fi ;;
+is-slot-marked-successful)
+  # AOSP and LineageOS bootctl.cpp: true: 1, exit 0. false: 0, exit 70. HAL error: text on stderr, exit 70
+  fails "bootctl-error\$2" && { echo "Error calling isSlotMarkedSuccessful()" >&2; exit 70; }
+  if [ "\$(cat "\$S/successful\$2")" = 1 ]; then echo 1; else echo 0; exit 70; fi ;;
 set-active-boot-slot)
   fails "set-active\$2" && { echo "bootctl: failed" >&2; exit 1; }
   # boot_control.cpp [V doc]: byte 0x3F for the new slot (successful clear, 7 retries); the other slot only loses its active bit
@@ -206,6 +194,8 @@ getvar)
     if [ -n "\${FAKE_PRODUCT_AFTER_FLASH:-}" ] && [ "\$n" -gt 0 ]; then echo "product: \$FAKE_PRODUCT_AFTER_FLASH" >&2
     elif [ "\${FAKE_PRODUCT:-laurel_sprout}" != none ]; then echo "product: \${FAKE_PRODUCT:-laurel_sprout}" >&2; fi ;;
   current-slot) echo "current-slot: \${FAKE_SLOT:-a}" >&2 ;;
+  partition-size:userdata) echo "partition-size:userdata: \${FAKE_UD:-0x12e1}" >&2 ;;
+  partition-size:iosroot) [ "\${FAKE_IR:-}" != none ] && echo "partition-size:iosroot: \${FAKE_IR:-0x817d8}" >&2 ;;
   esac ;;
 esac
 exit 0
@@ -223,15 +213,14 @@ echo "ok   real adb and fastboot cannot be reached: PATH holds fakes and a short
 
 DB=$T/repo/scripts/laurel/dual-boot.sh
 D=$T/repo/out/laurel/dualboot
-# 64 MiB area in two extents
-FIEMAP1="pin-failures 0
-extent 0 $((70000 * 4096)) $((8192 * 4096)) 0
-extent $((8192 * 4096)) $((40000 * 4096)) $((8192 * 4096)) 1"
-FIEMAP2="pin-failures 0
-extent 0 $((90000 * 4096)) $((8192 * 4096)) 0
-extent $((8192 * 4096)) $((40000 * 4096)) $((8192 * 4096)) 1"
-START=$((0x10000)); SECTORS=226307992
-DMLINE="0-$SECTORS: default-key, aes-xts-plain64 - 0 8:15 0 3 allow_discards sector_size:4096 iv_large_sectors"
+RES=$D/first-boot.result
+export HOME=$P/home
+H=$HOME/laurel-backup
+SECTORS_OLD=226307992; UD_BYTES=81109417984; IR_BYTES=34760273920; UD_SEC=$((UD_BYTES / 512))
+# the helper for real, on the fake disk: its own test is ldbhelper-test.sh
+clang -std=gnu11 -O1 -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -no-pie -fuse-ld=lld -w -DLDB_TEST_FILE -o "$T/real-helper" "$SRC/tools/laurel-dualboot/ldbhelper.c" 2>/dev/null
+[ -x "$T/real-helper" ] || { echo "FAIL no real helper"; exit 1; }
+python3 -I "$REPO/scripts/laurel/gpt-fake.py" dumps "$T/head" "$T/tail"
 python3 -I - "$T/root.img" <<'PY'
 import struct, sys
 blocks = 2048
@@ -247,36 +236,72 @@ with open(sys.argv[1], 'wb') as f:
     f.seek(2 * 4096); f.write(bm)
     f.seek(100 * 4096); f.write(b'\x55' * 8192)
 PY
-printf 'not an image, and big enough to read its header area ......' > "$T/bad.img"; truncate -s 8192 "$T/bad.img"
 head -c 4096 /dev/urandom > "$T/dtbo.img"
-export STOCK_DTBO="$T/dtbo.img" OP10TOOL="$TOOL" APPLE="$T/apple" WRITE_WAIT=2
-M=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$REPO/tools/laurel-dualboot/laurel_dualboot.h")
-IMG=$T/repo/out/laurel/uefi/laurel-uefi-boot.img
+export STOCK_DTBO="$T/dtbo.img" OP10TOOL="$TOOL" APPLE="$T/apple"
+M=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$SRC/tools/laurel-dualboot/laurel_dualboot.h")
+ROIMG=$T/repo/out/laurel-ios26/uefi-ro/laurel-uefi-boot.img
+RWIMG=$T/repo/out/laurel-ios26/uefi-rw/laurel-uefi-boot.img
+FW="abl bluetooth cmnlib cmnlib64 devcfg dsp hyp imagefv keymaster modem qupfw rpm storsec tz uefisecapp xbl xbl_config vbmeta"
+# a boot image header with the OS field of Lineage 17.0.0, 2026-10 (raw 0x220001aa), then TEXT
+mkimg() {
+  python3 -I - "$1" "$2" "${3:-570425770}" <<'PY'
+import struct, sys
+b = bytearray(4096); b[:8] = b'ANDROID!'; struct.pack_into('<I', b, 40, 2); struct.pack_into('<I', b, 44, int(sys.argv[3]))
+open(sys.argv[1], 'wb').write(bytes(b) + sys.argv[2].encode())
+PY
+}
+sidecar() { printf 'image %s\nmode %s\nmarker %s\nos 17.0.0 2026-10\n' "$(sha256sum "$1" | cut -d' ' -f1)" "$2" "$M" > "$1.dualboot"; }
 reset() {
-  rm -rf "$P"
-  mkdir -p "$P/data/laurel-ios" "$P/data/local/tmp" "$P/state" "$P/dev/block/by-name" "$P/sys/class/block/sda15" "$P/sys/block/sda/queue" "$P/sys/block/dm-40/slaves/sda15"
-  mkdir -p "$D" "$T/repo/out/laurel/uefi"
-  rm -f "$D/table.ldbt" "$D/table.new" "$D/map.txt" "$D/root.idx" "$D/stream.rc" "$IMG" "$IMG.dualboot"
+  rm -rf "$P" "$D" "$T/repo/out/laurel-ios26"
+  mkdir -p "$P/data/local/tmp" "$P/state" "$P/dev/block/by-name" "$P/sys/class/block/sda15" "$P/sys/class/block/sda16" "$P/sys/block/sda/queue" "$P/sys/block/dm-40/slaves/sda15"
+  mkdir -p "$D" "${ROIMG%/*}" "${RWIMG%/*}" "$H/android-20261102-0137" "$H/lineage-24.0-20261027" "$T/apple"
   : > "$T/calls"
-  echo "$START" > "$P/sys/class/block/sda15/start"; echo "$SECTORS" > "$P/sys/class/block/sda15/size"; echo 8:15 > "$P/sys/class/block/sda15/dev"
-  echo 4096 > "$P/sys/block/sda/queue/logical_block_size"
-  printf '%s\n' "$DMLINE" > "$P/state/dm"
+  # the phone before the change: the old table
+  cp "$T/head" "$H/android-20261102-0137/gpt-sda-head.bin"; cp "$T/tail" "$H/android-20261102-0137/gpt-sda-tail.bin"
+  python3 -I "$REPO/scripts/laurel/gpt-fake.py" disk "$P/dev/block/sda"
+  echo $((30119936 * 8)) > "$P/sys/block/sda/size"; echo 4096 > "$P/sys/block/sda/queue/logical_block_size"
+  : > "$H/android-20261102-0137/SHA256SUMS"
+  for f in $FW; do
+    printf 'firmware %s\n' "$f" > "$P/dev/block/by-name/${f}_b"
+    printf '%s  %s_b.img\n' "$(sha256sum "$P/dev/block/by-name/${f}_b" | cut -d' ' -f1)" "$f" >> "$H/android-20261102-0137/SHA256SUMS"
+  done
+  mkimg "$H/lineage-24.0-20261027/boot.img" "linux kernel"
+  printf '%s  boot.img\n' "$(sha256sum "$H/lineage-24.0-20261027/boot.img" | cut -d' ' -f1)" > "$H/lineage-24.0-20261027/SHA256SUMS"
+  cp "$H/lineage-24.0-20261027/boot.img" "$P/dev/block/by-name/boot_a"
+  echo 8:15 > "$P/sys/class/block/sda15/dev"
   echo "/dev/block/dm-40 on /data type f2fs (rw,background_gc=on,discard,mode=adaptive)" > "$P/state/mount"
-  printf '%s\n' "$FIEMAP1" > "$P/state/fiemap"
   echo a > "$P/state/running"; echo 0 > "$P/state/current"; echo 0 > "$P/state/active"
   echo 1 > "$P/state/bootable0"; echo 1 > "$P/state/bootable1"; echo 1 > "$P/state/successful0"; echo 1 > "$P/state/successful1"
-  : > "$P/dev/block/by-name/userdata"
+  echo $((1831432 * 8)) > "$P/sys/class/block/sda15/start"; echo "$SECTORS_OLD" > "$P/sys/class/block/sda15/size"
+  echo "0-$SECTORS_OLD: default-key, aes-xts-plain64 - 0 8:15 0 3 allow_discards sector_size:4096 iv_large_sectors" > "$P/state/dm"
 }
-# the phone after allocate, check-map, install, image, flash-slot-b
-sealed_ready() {
-  : > "$P/data/laurel-ios/root.area"
-  printf '%s\n' "$FIEMAP1" > "$T/map1.txt"
-  "$TOOL" dualboot table --fiemap "$T/map1.txt" --part-first $((START / 8)) --part-blocks $((SECTORS / 8)) -o "$D/table.ldbt" >/dev/null
-  printf 'ANDROID! LAURELESP laurel-dualboot %s\n' "$M" > "$IMG"
-  printf 'image %s\ntable %s\n' "$(sha256sum "$IMG" | cut -d' ' -f1)" "$(sha256sum "$D/table.ldbt" | cut -d' ' -f1)" > "$IMG.dualboot"
-  cp "$IMG" "$P/dev/block/by-name/boot_b"; cp "$STOCK_DTBO" "$P/dev/block/by-name/dtbo_b"
+# the phone after the GPT write, the reboot and Format data: the kernel has the new table, f2fs of the new size
+f2fs_sb() {
+  python3 -I - "$P/dev/block/dm-40" "$1" <<'PY'
+import struct, sys
+b = bytearray(4096); struct.pack_into('<I', b, 1024, 0xF2F52010); struct.pack_into('<Q', b, 1024 + 36, int(sys.argv[2]))
+open(sys.argv[1], 'wb').write(b)
+PY
 }
-with_table() { sealed_ready; }
+formatted() {
+  : > "$P/state/new-table"
+  echo $((1831432 * 8)) > "$P/sys/class/block/sda15/start"; echo "$UD_SEC" > "$P/sys/class/block/sda15/size"
+  echo $((21633536 * 8)) > "$P/sys/class/block/sda16/start"; echo $((8486395 * 8)) > "$P/sys/class/block/sda16/size"
+  echo "0-$UD_SEC: default-key, aes-xts-plain64 - 0 8:15 0 3 allow_discards sector_size:4096 iv_large_sectors" > "$P/state/dm"
+  f2fs_sb $((UD_BYTES / 4096))
+}
+# after android-check, install, image, flash-slot-b
+ready() {
+  formatted
+  printf 'gpt-written x\nandroid-opened x f2fs-bytes %s\n' "$UD_BYTES" > "$RES"
+  cp "$T/root.img" "$P/dev/block/by-name/iosroot"
+  head -c 1048576 "$T/root.img" > "$T/first1m"
+  printf 'installed x %s %s\n' "$T/root.img" "$(sha256sum "$T/first1m" | cut -d' ' -f1)" >> "$RES"
+  mkimg "$ROIMG" " boot args: rd=ufsroot0 $M LAURELESP"; sidecar "$ROIMG" ro
+  cp "$ROIMG" "$P/dev/block/by-name/boot_b"; cp "$STOCK_DTBO" "$P/dev/block/by-name/dtbo_b"
+}
+rwimage() { mkimg "$RWIMG" " boot args: rd=ufsroot0 ufsrw=1 rootrw=1 $M LAURELESP"; sidecar "$RWIMG" rw; cp "$RWIMG" "$P/dev/block/by-name/boot_b"; }
+THELINE="LAUREL DUALBOOT: on: root = iosroot, LUN 0, first block 21633536, 8486395 blocks (33149 MiB), read-only ($M)"
 # the command under test
 run() { rc=0; o=$(env "$@" 2>&1 < /dev/null) || rc=$?; }
 # ---- one test ----
@@ -289,6 +314,9 @@ ran() { grep -qF -- "$1" "$T/calls" || no "did not run: $1"; }
 not_ran() { ! grep -qF -- "$1" "$T/calls" || no "ran: $1"; }
 state_is() { [ "$(cat "$P/state/$1")" = "$2" ] || no "state $1 = $(cat "$P/state/$1"), wanted $2"; }
 order() { awk -v a="$1" -v b="$2" 'index($0, a) && !x {x = NR} index($0, b) && !y {y = NR} END {exit !(x && y && x < y)}' "$T/calls" || no "wanted '$1' before '$2'"; }
+tbl() { python3 -I "$REPO/scripts/laurel/gpt-fake.py" check "$P/dev/block/sda"; }
+disk_is_old() { tbl | grep -q '^userdata 1831432 30119930$' && tbl | grep -q 'sb data' || no "the table on the disk changed"; }
+disk_is_new() { tbl | grep -q '^iosroot 21633536 30119930$' || no "no iosroot on the disk"; }
 done_() {
   if [ -z "$bad" ]; then echo "ok   $name"; else
     fails=$((fails + 1)); echo "FAIL $name: $bad"
@@ -296,304 +324,348 @@ done_() {
   fi
 }
 SW="CONFIRM=switch"
+FBU=$(printf '0x%x' "$UD_BYTES"); FBI=$(printf '0x%x' "$IR_BYTES")
+fb() { run "FAKE_UD=$FBU" "FAKE_IR=$FBI" "$@"; }
 
-# ---- C1: the real remote status ----
-if start "C1 allocate: file exists: stops, no alloc"; then
-  : > "$P/data/laurel-ios/root.area"
-  run CONFIRM=allocate sh "$DB" allocate 1
-  exit_not0; said "exists"; not_ran "helper alloc"; done_
+# ---- the GPT write ----
+if start "GPT plan: host only, shows both tables, needs no phone"; then
+  run FAKE_FAIL=adb-off sh "$DB" gpt-plan
+  exit_is 0; said "before:"; said "after:"; said "IOSROOT_BYTES=$IR_BYTES"; not_ran "adb"; done_
 fi
-if start "C1 allocate: exists test lost (adb gone): stops, no alloc"; then
-  run CONFIRM=allocate FAKE_FAIL=drop:alloc sh "$DB" allocate 1
-  exit_not0; [ ! -f "$D/table.ldbt" ] || no "a table was left"; not_ran "helper map"; done_
+if start "GPT dry run: device check, fresh table, the exact commands, before and after; nothing written"; then
+  run sh "$DB" gpt-write --dry-run
+  exit_is 0; said "before:"; said "after:"; said "byte for byte"; said "gpt-write /data/local/tmp/ldbhelper.plan /dev/block/sda"; not_ran "helper gpt-write"; disk_is_old; done_
 fi
-if start "C1 check-map fails on the phone: no lock, exit not 0"; then
-  with_table
-  run CONFIRM=check-map FAKE_FAIL=check-map sh "$DB" check-map
-  exit_not0; ran "helper check-map"; not_ran "helper lock"; done_
+if start "GPT write: all well: new table read back, a record, no reboot by the script"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write
+  exit_is 0; ran "helper gpt-write"; said "gpt-write ok"; said "both CRCs right"; disk_is_new; grep -q '^gpt-written ' "$RES" || no "no record"; not_ran "adb reboot"
+  [ "$(grep -n 'helper gpt-dump' "$T/calls" | tail -1 | cut -d: -f1)" -gt "$(grep -n '^helper gpt-write' "$T/calls" | cut -d: -f1)" ] || no "no read after the write"; done_
 fi
-if start "C1 check-map: adb drops, no marker: no lock"; then
-  with_table
-  run CONFIRM=check-map FAKE_FAIL=drop:check-map sh "$DB" check-map
-  exit_not0; ran "helper check-map"; not_ran "helper lock"; done_
+if start "GPT write: the phone is another phone: nothing runs"; then
+  run CONFIRM=gpt-write FAKE_DEVICE=OP516FL1 sh "$DB" gpt-write
+  exit_not0; said "not the Mi A3"; not_ran "helper"; disk_is_old; done_
 fi
-if start "C1 lock fails: exit not 0"; then
-  with_table
-  run CONFIRM=check-map FAKE_FAIL=lock sh "$DB" check-map
-  exit_not0; ran "helper lock"; done_
+if start "GPT write: adb is not root: nothing runs"; then
+  run CONFIRM=gpt-write FAKE_UID=2000 sh "$DB" gpt-write
+  exit_not0; said "not root"; not_ran "helper"; disk_is_old; done_
 fi
-if start "C1 switch: set-active fails: no seal, no reboot, slot a"; then
-  with_table
-  run "$SW" FAKE_FAIL=set-active1 sh "$DB" switch
-  exit_not0; not_ran "helper seal"; not_ran "adb reboot"; state_is active 0; done_
+if start "GPT write: slot b active: nothing runs"; then
+  echo 1 > "$P/state/active"
+  run CONFIRM=gpt-write sh "$DB" gpt-write
+  exit_not0; not_ran "helper gpt-write"; disk_is_old; done_
 fi
-if start "C1 switch: seal fails: back on slot a, marked successful, no reboot"; then
-  with_table
-  run "$SW" FAKE_FAIL=seal sh "$DB" switch
-  exit_not0; ran "helper seal"; not_ran "adb reboot"; state_is active 0; state_is successful0 1; ran "bootctl mark-boot-successful"; done_
+if start "GPT write: sda has another size: nothing runs"; then
+  echo 123 > "$P/sys/block/sda/size"
+  run CONFIRM=gpt-write sh "$DB" gpt-write
+  exit_not0; said "the plan is for"; not_ran "helper gpt-write"; disk_is_old; done_
 fi
-if start "C1 install: write fails on the phone (exec-in says 0): no verify, exit not 0"; then
-  with_table
-  run CONFIRM=install FAKE_FAIL=write sh "$DB" install "$T/root.img"
-  exit_not0; ran "adb exec-in"; not_ran "helper verify"; said "write failed"; done_
+if start "GPT write: the table on the phone differs from the backup: nothing written"; then
+  python3 -I - "$P/dev/block/sda" <<'PY'
+import sys
+with open(sys.argv[1], 'r+b') as f:
+    f.seek(2 * 4096 + 5 * 128 + 48); f.write(b'\x01')
+PY
+  run CONFIRM=gpt-write sh "$DB" gpt-write
+  exit_not0; said "not the backup"; not_ran "helper gpt-write"; done_
 fi
-if start "C1 install: the phone never writes a result: no verify, exit not 0"; then
-  with_table; : > "$P/state/no-result"
-  rm -f "$P/data/local/tmp/ldbhelper.result"
-  run CONFIRM=install sh "$DB" install "$T/root.img"
-  exit_not0; not_ran "helper verify"; done_
+if start "GPT write: the backup dump is another layout: no plan"; then
+  python3 -I - "$H/android-20261102-0137/gpt-sda-head.bin" <<'PY'
+import sys
+with open(sys.argv[1], 'r+b') as f:
+    f.seek(2 * 4096 + 40); f.write(b'\x01')
+PY
+  run CONFIRM=gpt-write sh "$DB" gpt-write
+  exit_not0; said "does not give a plan"; not_ran "helper gpt-write"; disk_is_old; done_
 fi
-if start "C1 install: verify sees wrong blocks: exit not 0, not 'installed'"; then
-  with_table
-  run CONFIRM=install FAKE_FAIL=verify-wrong sh "$DB" install "$T/root.img"
-  exit_not0; ran "helper verify"; case "$o" in *"installed "*) no "said installed" ;; esac; done_
+if start "GPT write: the helper fails on the phone: exit not 0, no record"; then
+  run CONFIRM=gpt-write FAKE_FAIL=gpt-write sh "$DB" gpt-write
+  exit_not0; said "Do not reboot"; [ ! -f "$RES" ] || no "a record"; disk_is_old; done_
 fi
-if start "C1 install: exec-in returns before the phone ends: the host waits, verify comes after the write"; then
-  with_table
-  run CONFIRM=install FAKE_LATE=1 WRITE_WAIT=30 sh "$DB" install "$T/root.img"
-  exit_is 0; order "helper write end" "helper verify"; done_
+if start "GPT write: adb lost during the write: exit not 0, no record"; then
+  run CONFIRM=gpt-write FAKE_FAIL=drop:gpt-write sh "$DB" gpt-write
+  exit_not0; [ ! -f "$RES" ] || no "a record"; done_
 fi
-if start "C1 install: the phone wrote fewer frames than sent: no verify"; then
-  with_table
-  run CONFIRM=install FAKE_FAIL=write-short sh "$DB" install "$T/root.img"
-  exit_not0; not_ran "helper verify"; done_
+if start "GPT write: stopped after step 2: a plain run refuses, --resume ends it"; then
+  run CONFIRM=gpt-write FAKE_STOP=2 sh "$DB" gpt-write
+  exit_not0; run CONFIRM=gpt-write sh "$DB" gpt-write
+  exit_not0; said "--resume"; run CONFIRM=gpt-write sh "$DB" gpt-write --resume
+  exit_is 0; disk_is_new; tbl | grep -q 'sb zero' || no "superblocks not zero"; done_
 fi
-if start "C1 install: op10tool stream fails, stale index on disk: exit not 0, not 'installed'"; then
-  with_table
-  "$TOOL" dualboot stream "$D/table.ldbt" "$T/root.img" --index "$D/root.idx" >/dev/null 2>&1
-  run CONFIRM=install sh "$DB" install "$T/bad.img"
-  exit_not0; case "$o" in *"installed "*) no "said installed" ;; esac; done_
+if start "GPT restore: back to the old table by the same helper"; then
+  run CONFIRM=gpt-write sh "$DB" gpt-write; exit_is 0
+  run CONFIRM=gpt-restore sh "$DB" gpt-restore; exit_is 0; said "Format data"; tbl | grep -q '^userdata 1831432 30119930$' || no "not the old table"; done_
 fi
-if start "C1 install: all well: exit 0, says the frames were read back"; then
-  with_table
-  run CONFIRM=install sh "$DB" install "$T/root.img"
-  exit_is 0; order "adb exec-in" "helper verify"; said "0 wrong"; done_
-fi
-if start "C1 logs: read fails on the phone (exec-out says 0): exit not 0"; then
-  with_table
-  run FAKE_FAIL=read-empty sh "$DB" logs "$T/log.bin"
-  exit_not0; done_
+if start "GPT restore print: runs nothing, says that LUN 0 is erased"; then
+  run sh "$DB" gpt-restore-print
+  exit_is 0; said "ERASES ALL OF LUN 0"; said "partition:0"; not_ran "fastboot"; not_ran "adb"; done_
 fi
 
-# ---- C2: the seal comes last, and there is no clean reboot ----
-if start "C2 switch: slot b first, seal reboots itself, no 'adb reboot'"; then
-  with_table
-  run "$SW" sh "$DB" switch
-  exit_is 0; order "bootctl set-active-boot-slot 1" "helper seal"; not_ran "adb reboot"; state_is active 1; state_is sealed sealed; state_is successful1 0; done_
+# ---- after the write ----
+if start "After GPT: OnePlus in fastboot: no reboot"; then
+  run CONFIRM=after-gpt FAKE_PRODUCT=taro sh "$DB" after-gpt
+  exit_not0; not_ran "fastboot reboot"; done_
 fi
-if start "C2 switch: slot b stays marked successful: ABL cannot count down: no seal, back on a"; then
-  with_table
-  run "$SW" FAKE_FAIL=keep-successful sh "$DB" switch
-  exit_not0; not_ran "helper seal"; state_is active 0; done_
+if start "After GPT: ABL sees no iosroot: stops"; then
+  run CONFIRM=after-gpt FAKE_IR=none sh "$DB" after-gpt
+  exit_not0; said "no partition iosroot"; not_ran "fastboot reboot"; done_
 fi
-if start "C2 switch: slot a not marked successful: no fallback target: nothing done"; then
-  with_table; echo 0 > "$P/state/successful0"
-  run "$SW" sh "$DB" switch
-  exit_not0; not_ran "bootctl set-active-boot-slot"; not_ran "helper seal"; done_
+if start "After GPT: ABL sees other sizes: stops"; then
+  run CONFIRM=after-gpt "FAKE_IR=$FBI" FAKE_UD=0x1000 sh "$DB" after-gpt
+  exit_not0; not_ran "fastboot reboot"; done_
 fi
-
-# ---- C3 ----
-if start "C3 install: the helper gets the file and runs after the dm check"; then
-  with_table
-  run CONFIRM=install sh "$DB" install "$T/root.img"
-  exit_is 0; ran "helper write /data/local/tmp/ldbhelper.table /dev/block/by-name/userdata /data/laurel-ios/root.area"; done_
+if start "After GPT: right sizes: recovery, and the text says Format data"; then
+  fb CONFIRM=after-gpt sh "$DB" after-gpt
+  exit_is 0; ran "fastboot reboot recovery"; said "Format data"; done_
 fi
-if start "C3 install: device-mapper changed: no raw write"; then
-  with_table; echo "0-$SECTORS: default-key, aes-xts-plain64 - 0 8:15 8 3" > "$P/state/dm"
-  run CONFIRM=install sh "$DB" install "$T/root.img"
-  exit_not0; not_ran "adb exec-in"; done_
+if start "Android check: all well: a record"; then
+  formatted; : > "$RES"
+  run sh "$DB" android-check
+  exit_is 0; grep -q '^android-opened ' "$RES" || no "no record"; done_
 fi
-if start "C3 install: table of another partition: no raw write"; then
-  with_table; echo $((START + 4096)) > "$P/sys/class/block/sda15/start"
-  run CONFIRM=install sh "$DB" install "$T/root.img"
-  exit_not0; said "not for this userdata"; not_ran "adb exec-in"; done_
+if start "Android check: a stale superblock, old size: stops, no record"; then
+  formatted; : > "$RES"; f2fs_sb 28288499
+  run sh "$DB" android-check
+  exit_not0; said "stale superblock"; ! grep -q '^android-opened ' "$RES" || no "a record"; done_
 fi
-
-# ---- H2 ----
-if start "H2 remove: zeroes by the helper, then the table goes; text says so"; then
-  with_table
-  run CONFIRM=remove sh "$DB" remove
-  exit_is 0; ran "helper wipe"; [ ! -f "$D/table.ldbt" ] || no "table left"; [ ! -e "$P/data/laurel-ios/root.area" ] || no "file left"; said "header zero"; done_
+if start "Android check: the dm target has the old size: stops"; then
+  formatted; : > "$RES"; echo "0-$SECTORS_OLD: default-key, aes-xts-plain64 - 0 8:15 0 3" > "$P/state/dm"
+  run sh "$DB" android-check
+  exit_not0; said "new userdata has"; ! grep -q '^android-opened ' "$RES" || no "a record"; done_
 fi
-if start "H2 remove: slot b active, Android still on a: refused"; then
-  with_table; echo 1 > "$P/state/active"
-  run CONFIRM=remove sh "$DB" remove
-  exit_not0; said "slot b is active"; not_ran "helper wipe"; not_ran "phone rm"; [ -f "$D/table.ldbt" ] || no "table gone"; [ -e "$P/data/laurel-ios/root.area" ] || no "file gone"; done_
+if start "Android check: the kernel has the old table: stops"; then
+  : > "$RES"
+  run sh "$DB" android-check
+  exit_not0; said "iosroot"; ! grep -q '^android-opened ' "$RES" || no "a record"; done_
 fi
-if start "H2 remove: the delete fails: the table stays"; then
-  with_table
-  run CONFIRM=remove "FAKE_FAIL=wipe chattr rm" sh "$DB" remove
-  exit_not0; [ -f "$D/table.ldbt" ] || no "table gone"; done_
-fi
-if start "H2 remove --unverified: no raw write, the file goes"; then
-  with_table
-  run CONFIRM=remove sh "$DB" remove --unverified
-  exit_is 0; not_ran "helper wipe"; ran "helper unlink-only"; done_
+if start "Android check: data not open yet: stops"; then
+  formatted; : > "$RES"
+  run FAKE_CE=false sh "$DB" android-check
+  exit_not0; said "not open"; ! grep -q '^android-opened ' "$RES" || no "a record"; done_
 fi
 
-# ---- M1 ----
-if start "M1 flash-slot-b: OnePlus in fastboot: nothing written"; then
-  with_table
-  run CONFIRM=flash-slot-b FAKE_PRODUCT=taro sh "$DB" flash-slot-b
+# ---- install ----
+if start "Install: no record that Android opened its data: nothing"; then
+  fb CONFIRM=install sh "$DB" install "$T/root.img"
+  exit_not0; said "android-check"; not_ran "fastboot"; done_
+fi
+if start "Install: writes iosroot, in sparse pieces, never userdata"; then
+  printf 'android-opened x\n' > "$RES"
+  fb CONFIRM=install sh "$DB" install "$T/root.img"
+  exit_is 0; ran "fastboot -S 512M flash iosroot"; not_ran "flash userdata"; grep -q '^installed ' "$RES" || no "no record"; done_
+fi
+if start "Install: an image over the limit: nothing"; then
+  printf 'android-opened x\n' > "$RES"; truncate -s 34760273920 "$T/big.img"
+  fb CONFIRM=install sh "$DB" install "$T/big.img"
+  exit_not0; said "at most"; not_ran "fastboot"; rm -f "$T/big.img"; done_
+fi
+if start "Install: OnePlus in fastboot: nothing written"; then
+  printf 'android-opened x\n' > "$RES"
+  fb CONFIRM=install FAKE_PRODUCT=taro sh "$DB" install "$T/root.img"
+  exit_not0; not_ran "fastboot flash"; not_ran "-S 512M"; done_
+fi
+if start "Install: ABL sees no iosroot: nothing written"; then
+  printf 'android-opened x\n' > "$RES"
+  run CONFIRM=install "FAKE_UD=$FBU" FAKE_IR=none sh "$DB" install "$T/root.img"
+  exit_not0; not_ran "fastboot flash"; not_ran "-S 512M"; done_
+fi
+
+# ---- flash-slot-b ----
+if start "Flash slot b: OnePlus in fastboot: nothing written"; then
+  ready
+  fb CONFIRM=flash-slot-b FAKE_PRODUCT=taro sh "$DB" flash-slot-b
   exit_not0; said "not say it is the Mi A3"; not_ran "fastboot flash"; not_ran "fastboot reboot"; done_
 fi
-if start "M1 flash-slot-b: no answer to getvar: nothing written"; then
-  with_table
-  run CONFIRM=flash-slot-b FAKE_PRODUCT=none sh "$DB" flash-slot-b
+if start "Flash slot b: two phones: nothing written"; then
+  ready
+  fb CONFIRM=flash-slot-b FAKE_FB=two sh "$DB" flash-slot-b
   exit_not0; not_ran "fastboot flash"; done_
 fi
-if start "M1 flash-slot-b: two phones in fastboot: nothing written"; then
-  with_table
-  run CONFIRM=flash-slot-b FAKE_FB=two sh "$DB" flash-slot-b
-  exit_not0; not_ran "fastboot flash"; done_
-fi
-if start "M1 flash-slot-b: the phone changes after the first flash: no second write"; then
-  with_table
-  run CONFIRM=flash-slot-b FAKE_PRODUCT_AFTER_FLASH=taro sh "$DB" flash-slot-b
+if start "Flash slot b: the phone changes after the first flash: no second write"; then
+  ready
+  fb CONFIRM=flash-slot-b FAKE_PRODUCT_AFTER_FLASH=taro sh "$DB" flash-slot-b
   exit_not0; ran "fastboot flash boot_b"; not_ran "fastboot flash dtbo_b"; done_
 fi
-if start "[R] M1 flash-slot-b: Mi A3: both written"; then
-  with_table
-  run CONFIRM=flash-slot-b sh "$DB" flash-slot-b
-  exit_is 0; ran "fastboot flash boot_b"; ran "fastboot flash dtbo_b"; done_
+if start "Flash slot b: the read-only image: both written"; then
+  ready
+  fb CONFIRM=flash-slot-b sh "$DB" flash-slot-b
+  exit_is 0; ran "fastboot flash boot_b $ROIMG"; ran "fastboot flash dtbo_b"; done_
 fi
-if start "M1 to-android: OnePlus in fastboot: no set_active"; then
+if start "RO gate: flash-slot-b rw with no read-only result: refused"; then
+  ready; rwimage
+  fb CONFIRM=flash-slot-b sh "$DB" flash-slot-b rw
+  exit_not0; said "read-only boot"; not_ran "fastboot flash"; done_
+fi
+if start "RO gate: image rw with no result: refused before any build"; then
+  ready
+  run sh "$DB" image rw
+  exit_not0; said "read-only boot"; done_
+fi
+if start "RO gate: a writable image named as the read-only path: refused by its text"; then
+  ready; mkimg "$ROIMG" " ufsrw=1 rootrw=1 $M LAURELESP"; sidecar "$ROIMG" ro; cp "$ROIMG" "$P/dev/block/by-name/boot_b"
+  run "$SW" sh "$DB" switch
+  exit_not0; said "can write"; not_ran "bootctl set-active"; done_
+fi
+
+# ---- switch ----
+if start "Switch: all well: slot b, normal reboot; no freeze, no seal"; then
+  ready
+  run "$SW" sh "$DB" switch
+  exit_is 0; order "bootctl set-active-boot-slot 1" "adb reboot"; state_is active 1; state_is successful1 0; said "Back to Android"; not_ran "helper"; done_
+fi
+if start "S3 switch: xbl_b differs from the backup: refused before set-active"; then
+  ready; echo other > "$P/dev/block/by-name/xbl_b"
+  run "$SW" sh "$DB" switch
+  exit_not0; said "xbl_b"; not_ran "bootctl set-active"; not_ran "adb reboot"; done_
+fi
+if start "S3 switch: another firmware differs (abl_b): refused before set-active"; then
+  ready; echo other > "$P/dev/block/by-name/abl_b"
+  run "$SW" sh "$DB" switch
+  exit_not0; said "abl_b"; not_ran "bootctl set-active"; done_
+fi
+if start "S3 switch: a firmware cannot be read: refused"; then
+  ready; rm -f "$P/dev/block/by-name/tz_b"
+  run "$SW" sh "$DB" switch
+  exit_not0; not_ran "bootctl set-active"; done_
+fi
+if start "S3 check-slot-b: read-only, all equal"; then
+  run sh "$DB" check-slot-b
+  exit_is 0; said "equal the backup"; not_ran "set-active"; done_
+fi
+if start "F5 switch: bootctl error on slot b's successful bit: stops, no reboot"; then
+  ready
+  run "$SW" FAKE_FAIL=bootctl-error1 sh "$DB" switch
+  exit_not0; said "not a yes and not a no"; not_ran "adb reboot"; done_
+fi
+if start "F5 switch: bootctl error on slot a: stops before any write"; then
+  ready
+  run "$SW" FAKE_FAIL=bootctl-error0 sh "$DB" switch
+  exit_not0; said "not a yes and not a no"; not_ran "bootctl set-active"; done_
+fi
+if start "F5 a real no (stdout 0, exit 70) is a no: slot a not successful: refused with that reason"; then
+  ready; echo 0 > "$P/state/successful0"
+  run "$SW" sh "$DB" switch
+  exit_not0; said "not marked successful"; not_ran "bootctl set-active"; done_
+fi
+if start "Switch: slot b stays marked successful: back on slot a, no reboot"; then
+  ready
+  run "$SW" FAKE_FAIL=keep-successful sh "$DB" switch
+  exit_not0; state_is active 0; not_ran "adb reboot"; ran "bootctl mark-boot-successful"; done_
+fi
+if start "Switch: set-active fails: no reboot, slot a"; then
+  ready
+  run "$SW" FAKE_FAIL=set-active1 sh "$DB" switch
+  exit_not0; not_ran "adb reboot"; state_is active 0; done_
+fi
+if start "Switch: adb reboot fails: back on slot a"; then
+  ready
+  run "$SW" FAKE_FAIL=adb-reboot sh "$DB" switch
+  exit_not0; state_is active 0; done_
+fi
+if start "Switch: Android runs on slot b after a manual update: refused"; then
+  ready; echo b > "$P/state/running"; echo 1 > "$P/state/current"; echo 1 > "$P/state/active"
+  run "$SW" sh "$DB" switch
+  exit_not0; said "not on slot a"; not_ran "bootctl set-active"; done_
+fi
+if start "Switch: boot_b is no longer the image (a sideload): refused"; then
+  ready; echo "lineage boot image" > "$P/dev/block/by-name/boot_b"
+  run "$SW" sh "$DB" switch
+  exit_not0; said "boot_b"; said "sideload"; not_ran "bootctl set-active"; done_
+fi
+if start "Switch: dtbo_b is no longer stock: refused"; then
+  ready; echo "lineage dtbo" > "$P/dev/block/by-name/dtbo_b"
+  run "$SW" sh "$DB" switch
+  exit_not0; said "dtbo_b"; not_ran "bootctl set-active"; done_
+fi
+if start "Switch: an image without the fence kernel: refused"; then
+  ready; mkimg "$ROIMG" " LAURELESP"; sidecar "$ROIMG" ro; cp "$ROIMG" "$P/dev/block/by-name/boot_b"
+  run "$SW" sh "$DB" switch
+  exit_not0; said "patch 2950"; not_ran "bootctl set-active"; done_
+fi
+if start "S1 switch: an image with another OS field than Lineage: refused"; then
+  ready; mkimg "$ROIMG" " rd=ufsroot0 $M" 369099112; sidecar "$ROIMG" ro; cp "$ROIMG" "$P/dev/block/by-name/boot_b"
+  run "$SW" sh "$DB" switch
+  exit_not0; said "OS version field"; not_ran "bootctl set-active"; done_
+fi
+if start "S1 switch: boot_a on the phone has a newer header (a sideload) than the image: refused"; then
+  ready; mkimg "$P/dev/block/by-name/boot_a" "linux" 570425771
+  run "$SW" sh "$DB" switch
+  exit_not0; said "boot_a"; not_ran "bootctl set-active"; done_
+fi
+if start "Switch: iosroot does not hold the root: refused"; then
+  ready; echo garbage > "$P/dev/block/by-name/iosroot"
+  run "$SW" sh "$DB" switch
+  exit_not0; said "installed root"; not_ran "bootctl set-active"; done_
+fi
+if start "Switch: the kernel has the old table: refused"; then
+  ready; rm -f "$P/state/new-table"
+  run "$SW" sh "$DB" switch
+  exit_not0; not_ran "bootctl set-active"; done_
+fi
+
+# ---- the read-only result ----
+if start "RO result: the right line: recorded"; then
+  ready; printf 'x\n%s\n' "$THELINE" > "$T/log"
+  run sh "$DB" ro-result "$T/log"
+  exit_is 0; grep -q "^ro-on $M " "$RES" || no "no record"; done_
+fi
+if start "RO result: an off line after it: no record"; then
+  ready; printf '%s\nLAUREL DUALBOOT: off: x; no write anywhere\n' "$THELINE" > "$T/log"
+  run sh "$DB" ro-result "$T/log"
+  exit_not0; said "said no"; ! grep -q '^ro-on ' "$RES" || no "a record"; done_
+fi
+if start "RO result: a line of a writable boot: no record"; then
+  ready; printf 'LAUREL DUALBOOT: on: root = iosroot, LUN 0, first block 21633536, 8486395 blocks (33149 MiB), writes fenced to this partition (%s)\n' "$M" > "$T/log"
+  run sh "$DB" ro-result "$T/log"
+  exit_not0; ! grep -q '^ro-on ' "$RES" || no "a record"; done_
+fi
+if start "RO result: other numbers: no record"; then
+  ready; printf 'LAUREL DUALBOOT: on: root = iosroot, LUN 0, first block 21633537, 8486395 blocks (33149 MiB), read-only (%s)\n' "$M" > "$T/log"
+  run sh "$DB" ro-result "$T/log"
+  exit_not0; ! grep -q '^ro-on ' "$RES" || no "a record"; done_
+fi
+if start "RO result: no line: no record"; then
+  ready; echo nothing > "$T/log"
+  run sh "$DB" ro-result "$T/log"
+  exit_not0; said "no LAUREL DUALBOOT line"; done_
+fi
+if start "RO gate: a result but Android not checked after it: rw refused"; then
+  ready; rwimage; printf '%s\n' "$THELINE" > "$T/log"; run sh "$DB" ro-result "$T/log"
+  fb CONFIRM=flash-slot-b sh "$DB" flash-slot-b rw
+  exit_not0; said "android-check"; not_ran "fastboot flash"; done_
+fi
+if start "RO gate: result + Android opened after it: rw goes"; then
+  ready; rwimage; printf '%s\n' "$THELINE" > "$T/log"; run sh "$DB" ro-result "$T/log"
+  run sh "$DB" android-check; exit_is 0
+  fb CONFIRM=flash-slot-b sh "$DB" flash-slot-b rw
+  exit_is 0; ran "fastboot flash boot_b $RWIMG"; done_
+fi
+
+# ---- back to Android ----
+if start "To Android: OnePlus in fastboot: no set_active"; then
   run CONFIRM=to-android FAKE_PRODUCT=taro sh "$DB" to-android
   exit_not0; not_ran "fastboot set_active"; not_ran "fastboot reboot"; done_
 fi
-if start "[R] M1 to-android: Mi A3: set_active a"; then
+if start "To Android: Mi A3: set_active a, reboot, says what is next"; then
   run CONFIRM=to-android sh "$DB" to-android
-  exit_is 0; ran "fastboot set_active a"; done_
+  exit_is 0; ran "fastboot set_active a"; order "fastboot set_active a" "fastboot reboot"; said "android-check"; done_
 fi
 
-# ---- M3 ----
-if start "M3 helper: a stale binary is rebuilt when a source changes"; then
-  with_table
+# ---- helper version ----
+if start "Helper: a stale binary is rebuilt when the source changes"; then
   mkdir -p "$D"; printf 'stale' > "$D/ldbhelper-arm64"; chmod +x "$D/ldbhelper-arm64"
-  run CONFIRM=check-map sh "$DB" check-map
+  run sh "$DB" gpt-write --dry-run
   exit_is 0
   grep -q 'ldbhelper-version [0-9a-f]\{32\}' "$P/state/helper_version" || no "the pushed helper has no source hash: $(cat "$P/state/helper_version")"
   done_
 fi
-if start "M3 helper: the phone reports another version: stops before any step"; then
-  with_table
-  run CONFIRM=check-map FAKE_FAIL=stale-on-phone sh "$DB" check-map
-  exit_not0; not_ran "helper check-map"; done_
-fi
-
-# ---- M4 ----
-if start "M4 map: the same blocks keep the table id, other blocks get a new one"; then
-  with_table; : > "$P/data/laurel-ios/root.area"
-  a=$("$TOOL" dualboot check "$D/table.ldbt" | sed -n 's/.* id \([0-9a-f]*\),.*/\1/p')
-  run sh "$DB" map; exit_is 0
-  b=$("$TOOL" dualboot check "$D/table.ldbt" | sed -n 's/.* id \([0-9a-f]*\),.*/\1/p')
-  [ "$a" = "$b" ] || no "same blocks: id $a -> $b"
-  printf '%s\n' "$FIEMAP2" > "$P/state/fiemap"
-  run sh "$DB" map; exit_is 0
-  c=$("$TOOL" dualboot check "$D/table.ldbt" | sed -n 's/.* id \([0-9a-f]*\),.*/\1/p')
-  [ "$a" != "$c" ] || no "other blocks kept id $a"
-  done_
-fi
-if start "M4 status: shows whether the file is encrypted"; then
-  : > "$P/data/laurel-ios/root.area"
-  run FAKE_LSATTR=----i---------E--- sh "$DB" status
-  exit_is 0; said "ENCRYPTED"; done_
-fi
-if start "M4 status: says not encrypted"; then
-  : > "$P/data/laurel-ios/root.area"
-  run sh "$DB" status
-  exit_is 0; said "not encrypted"; done_
-fi
-
-# ---- S5: the exact line from the phone, and what is not that ----
-if start "S5 check_dm: the phone's line passes"; then
-  with_table; : > "$P/data/laurel-ios/root.area"
-  run sh "$DB" map
-  exit_is 0; said "whole of userdata"; said "8:15"; done_
-fi
-if start "[R] S5 check_dm: header line of dmctl is no second target"; then
-  with_table; : > "$P/data/laurel-ios/root.area"
-  printf 'Targets in the device:\n%s\n' "$DMLINE" > "$P/state/dm"
-  run sh "$DB" map
-  exit_is 0; done_
-fi
-if start "S5 check_dm: a target shorter than the partition: stops"; then
-  with_table; echo "0-226300000: default-key, aes-xts-plain64 - 0 8:15 0 3 allow_discards" > "$P/state/dm"
-  run CONFIRM=check-map sh "$DB" check-map
-  exit_not0; not_ran "helper check-map"; done_
-fi
-if start "S5 check_dm: another device: stops"; then
-  with_table; echo "0-$SECTORS: default-key, aes-xts-plain64 - 0 8:14 0 3 allow_discards" > "$P/state/dm"
-  run CONFIRM=check-map sh "$DB" check-map
-  exit_not0; not_ran "helper check-map"; done_
-fi
-if start "S5 check_dm: two targets: stops"; then
-  with_table; printf '0-1000: default-key, a - 0 8:15 0\n1000-%s: default-key, a - 0 8:15 1000\n' "$SECTORS" > "$P/state/dm"
-  run CONFIRM=check-map sh "$DB" check-map
-  exit_not0; not_ran "helper check-map"; done_
-fi
-if start "S5 check_dm: /data is not on sda15: stops"; then
-  with_table; rm -rf "$P/sys/block/dm-40/slaves/sda15"; mkdir -p "$P/sys/block/dm-40/slaves/sda14"
-  run CONFIRM=check-map sh "$DB" check-map
-  exit_not0; not_ran "helper check-map"; done_
-fi
-if start "S5 check_dm: dmctl fails: stops"; then
-  with_table; rm -f "$P/state/dm"
-  run CONFIRM=check-map sh "$DB" check-map
-  exit_not0; not_ran "helper check-map"; done_
-fi
-
-# ---- owner decision 2026-11-02: SIZE=32G by default, free margin, manual updates ----
-if start "SIZE allocate with no size: the default area is 32 GiB + 6 MiB"; then
-  run CONFIRM=allocate sh "$DB" allocate
-  exit_is 0; ran "helper alloc /data/laurel-ios/root.area 34366029824 "; said "not a partition"; done_
-fi
-if start "SIZE allocate: too little free /data: refused, gives the numbers"; then
-  # 44 GiB free - 32 GiB area = 12 GiB: under the 16 GiB margin
-  run CONFIRM=allocate FAKE_FREE_KB=$((44 * 1024 * 1024)) sh "$DB" allocate 32
-  exit_not0; said "44 GiB free"; said "16 GiB"; not_ran "helper alloc"; done_
-fi
-if start "[R] SIZE allocate: free /data cannot be read: refused"; then
-  cat > "$T/pbin/df.keep" < "$T/pbin/df"; printf '#!/bin/sh\nexit 1\n' > "$T/pbin/df"
-  run CONFIRM=allocate sh "$DB" allocate 32
-  exit_not0; not_ran "helper alloc"; cat "$T/pbin/df.keep" > "$T/pbin/df"; rm -f "$T/pbin/df.keep"; done_
-fi
-if start "SIZE size: names the owner default"; then
-  run sh "$DB" size ios26
-  exit_is 0; said "SIZE=32G"; said "not a partition"; done_
-fi
-if start "[R] UPDATE switch: Android runs on slot b after a manual update: refused"; then
-  with_table; echo b > "$P/state/running"; echo 1 > "$P/state/current"; echo 1 > "$P/state/active"
-  run "$SW" sh "$DB" switch
-  exit_not0; said "not on slot a"; not_ran "bootctl set-active"; not_ran "helper seal"; done_
-fi
-if start "UPDATE switch: update done, slot b active, reboot pending: refused"; then
-  with_table; echo 1 > "$P/state/active"
-  run "$SW" sh "$DB" switch
-  exit_not0; said "manual update"; not_ran "bootctl set-active"; not_ran "helper seal"; done_
-fi
-if start "UPDATE switch: boot_b is no longer the image (a sideload wrote it): refused"; then
-  with_table; echo "lineage boot image" > "$P/dev/block/by-name/boot_b"
-  run "$SW" sh "$DB" switch
-  exit_not0; said "boot_b"; said "sideload"; not_ran "bootctl set-active"; not_ran "helper seal"; done_
-fi
-if start "UPDATE switch: dtbo_b is no longer stock: refused"; then
-  with_table; echo "lineage dtbo" > "$P/dev/block/by-name/dtbo_b"
-  run "$SW" sh "$DB" switch
-  exit_not0; said "dtbo_b"; not_ran "bootctl set-active"; not_ran "helper seal"; done_
-fi
-if start "UPDATE switch: an image without the fence kernel: refused"; then
-  with_table
-  printf 'ANDROID! LAURELESP laurel-dualboot\n' > "$IMG"
-  printf 'image %s\ntable %s\n' "$(sha256sum "$IMG" | cut -d' ' -f1)" "$(sha256sum "$D/table.ldbt" | cut -d' ' -f1)" > "$IMG.dualboot"
-  cp "$IMG" "$P/dev/block/by-name/boot_b"
-  run "$SW" sh "$DB" switch
-  exit_not0; said "patch 2950"; not_ran "bootctl set-active"; done_
+if start "Helper: the phone reports another version: stops before any step"; then
+  run CONFIRM=gpt-write FAKE_FAIL=stale-on-phone sh "$DB" gpt-write
+  exit_not0; not_ran "helper gpt-write"; disk_is_old; done_
 fi
 
 # ---- each writing step still needs its word ----
-for s in allocate check-map install flash-slot-b switch to-android remove; do
-  if start "[R] CONFIRM $s without its word: refused, adb not asked"; then
+for s in gpt-write after-gpt install flash-slot-b switch to-android gpt-restore; do
+  if start "CONFIRM $s without its word: refused, adb not asked"; then
     run sh "$DB" "$s"
     exit_is 4; said "CONFIRM=$s"; not_ran "adb"; not_ran "fastboot"; done_
   fi

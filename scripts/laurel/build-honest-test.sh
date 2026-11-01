@@ -46,7 +46,7 @@ make_repo() {
   mkdir -p "$R"/scripts/{laurel,lib,bt,net,metal,ios16} "$R"/patches/laurel/xnu "$R"/patches/laurel/xnu-linux-fixes "$R"/external/ios-topaz/xnu/patches \
     "$R"/external/ios-topaz/tools "$R"/external/ios-sweet-linux/linux/fixes "$R"/logs "$A"
   cp "$REPO"/scripts/laurel/{root*.sh,root*.py,build-stamp.py,build-all.sh,android-guard.sh} "$R/scripts/laurel/"
-  cp "$REPO"/scripts/lib/env.sh "$R/scripts/lib/"
+  cp "$REPO"/scripts/lib/env.sh "$REPO"/scripts/lib/laurel-layout.sh "$R/scripts/lib/"
   cp "$REPO"/scripts/bt/bt-launchd.py "$R/scripts/bt/"
   cp "$REPO"/scripts/net/root-add-ssh.sh "$R/scripts/net/"
   cp "$REPO"/scripts/metal/root-add-metal.sh "$R/scripts/metal/"

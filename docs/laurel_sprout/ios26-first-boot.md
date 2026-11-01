@@ -110,7 +110,7 @@ Run section 1. Then:
 | `backboardd running`, no frame on the panel | Device up, no frame: `LAUREL METAL26: ...: no frame on a screen surface` | `ssh-metal.txt`; `LAUREL GPU:` lines; `LAUREL GPU WATCHDOG` |
 | `first frame on the panel`, still black | Frame reached the panel: `LAUREL METAL26: screen: 0 of 64 samples lit`, or backlight | `LAUREL BACKLIGHT:`, `LAUREL PANEL:` lines |
 
-Previous boot, when this boot says nothing: from Android, `scripts/laurel/log-pull.sh logs/laurel-pull-$(date +%H%M)` reads the last 1025 blocks of `iosroot` (`SWEETLOG`, needs `ufsrw=1`; the boot-args have it), read-only over adb with root. **Read it before the next iOS boot**: that boot overwrites it within seconds. The layout belongs to branch `t3/laurel-dual-boot-fix2`; patch 2950 is not edited here.
+Previous boot, when this boot says nothing: from Android, `scripts/laurel/log-pull.sh logs/laurel-pull-$(date +%H%M)` reads the last 1025 blocks of `iosroot` (`SWEETLOG`, needs `ufsrw=1`; the boot-args have it), read-only over adb with root. **Read it before the next iOS boot**: that boot overwrites it within seconds. The layout is `scripts/lib/laurel-layout.sh` and patch 2950 (`LDB_LOG_BLOCKS`); nothing here edits them.
 
 ## 6. Back to Android
 
