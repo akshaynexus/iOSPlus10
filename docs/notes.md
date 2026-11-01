@@ -4243,3 +4243,25 @@ Details: `docs/laurel_sprout/battery-power.md`.
   The 2 `linker command failed` lines in build.log are old (same in the main checkout's build.log). NOT BOOTED; root not rebuilt.
 - Next: boot image with 2720 + root rebuild (owner approves the userdata flash); read `LAUREL RTC: on|off:`, `LAUREL CTL: settime
   ...: clock set`, `LAUREL RTC: saved offset`; next boot without the host must show the right date; photo: no red bar.
+
+## Mi A3: stage-1 check failure turned the GPU off; BT chip is WCN3950 family (2026-11-01 07:45, branch t3/laurel-smmu-pool-bt, 2157 + 2600)
+- Details: docs/laurel_sprout/gpu.md "Stage-1 check failure", docs/laurel_sprout/bluetooth.md "The chip is WCN3950 family".
+- [V log 07:19] 2154's hw_start seeded the GPU VA allocator through `redwood_gpu_address_free` = the pool free in pass-through;
+  2156 refuses it (`free of 0x1000000+0xef000000 refused`, caller topaz_adreno_thread + 0x178). Fix: `va_seed()` sets the range.
+- [V source] The "ring stuck ... FSR 00000400" line came AFTER `back:` cleared FSR: only FORMAT (bits 10:9 = 2) is left; FAR
+  survives. Rule: read and log FSR/FAR/FSYNR0 before any FSR write. FAR 0xc0020040 = ring + 0x40 = the check's first fence.
+- [V source] A terminated CP fetch hangs the CP; going back to pass-through does not wake it. 2157 stalls faults during the
+  check (SCTLR.CFCFG) and retries the stalled access in pass-through (CB_RESUME TnR 0) only when it wanted our own memory
+  (CP buffers, GPU pool); else terminate + power cycle. [I] stall + retry-after-bypass is per the SMMUv2 design; not seen yet.
+- [V Linux] A610 has no usable RBBM_SW_RESET (a6xx_gpu_sw_reset skips it, "11nm ... reset line"); recovery = GPU power
+  collapse + zap resume (SCM SVC_BOOT 0x0a, args 0, 0) + re-init. The GPU SMMU is in the GPU CX domain: program it again.
+- [I] Cause of the ring fault still open: candidates CBA2R0.VA64 not taken (FORMAT 2), CBAR BPSHCFG 0 (reserved), TCR2
+  without AS/SEP. 2157 uses Linux's values and logs CBA2R0 + the decoded fault + the CPU-side walk of FAR.
+- [V BTFM.bin + Linux btqca] Mi A3 BT chip: product 0x000f, ROM 0x0102, soc 0x40070120 = WCN3950 family; Linux number =
+  ((rom & 0xf00) >> 4) | (rom & 0xf) from the ROM version (soc_ver low 16 bits), not the SoC id -> cmbtfw12.tlv (product
+  0x000f, ROM build 0x0102) + cmnv12.bin. apbtfw*/crbtfw* are product 0x000a. cmnv12 tag 17 = `15 11 22 00 2e 00`: speed
+  index in byte 1 [I], not byte 2.
+- Tool: scripts/laurel/bt-fw-test.sh (host test of laurel_bt_fw.c from the patch on the stock BTFM files; firmware stays in
+  out/bt-fw, git-ignored).
+- Built 07:45 in the worktree: 248/248 patches, 0 LSE, kernel.development.sweet.4k sha256
+  64df80382164024d78dd90f85d06fe6307e4246a095db80af2073af39b472f0b. NOT BOOTED.

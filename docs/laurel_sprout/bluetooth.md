@@ -206,7 +206,41 @@ and the boot are not touched.
   `fw: crbtfw12.tlv: file not in the partition`. The driver took the number from the ROM field.
 - [V BTFM.bin of V12.0.26.0.RFQMIXM, mdir] /image has apbtfw10/11.tlv, apnv10/11.bin, crbtfw11/20/21.tlv, crnv11/20/21.bin,
   cmbtfw10-12.tlv, cmnv10-12.bin.
-- [V Linux btqca qca_uart_setup] the number is ((soc & 0xf00) >> 4) | (soc & 0xf) = 0x10 for soc 0x40070120; the `ap` prefix
+- [WRONG, see the 07:19 section below] [Linux btqca qca_uart_setup] the number is ((soc & 0xf00) >> 4) | (soc & 0xf) = 0x10 for soc 0x40070120; the `ap` prefix
   is WCN3988. So the Mi A3 chip is a WCN3988 [I from the files present], not a WCN3990.
 - Fix (2600, laurel_bt_fw.c): number from the SoC version; crbtfw%02x first, then apbtfw%02x + apnv%02x. patch_check still
   checks the rampatch against the chip.
+
+## The chip is WCN3950 family: cmbtfw12.tlv + cmnv12.bin (boot 2026-11-01 07:19, laurel 2601 in patch 2600)
+
+- [V log 07:19:32] `LAUREL BT: chip: product 0x000f patch 0x0001 rom 0x0102 soc 0x40070120`, then
+  `LAUREL BT: off: the rampatch is for another product` (apbtfw10.tlv, picked by the 06:36 fix above).
+- [V BTFM.bin headers, `scripts/laurel/bt-fw-test.sh`; rampatch = Linux `struct tlv_type_patch`, product at byte 16,
+  ROM build at byte 18]: apbtfw10.tlv product 0x000a ROM build 0x0200; crbtfw20.tlv 0x000a/0x0200; crbtfw21.tlv and
+  apbtfw11.tlv 0x000a/0x0201; cmbtfw10/11/12.tlv product 0x000f, ROM build 0x0100/0x0101/0x0102. Only **cmbtfw12.tlv**
+  matches the chip (product 0x000f, ROM 0x0102).
+- [V Linux btqca.c qca_uart_setup, laurel-mainline] `soc_ver = (soc_id << 16) | rom_ver`, so its low 16 bits are the
+  **ROM version** (0x0102), not the SoC id. The 06:36 note above read it wrongly. Number: WCN3950 / WCN3990 / WCN3991
+  `((rom & 0xf00) >> 4) | (rom & 0xf)` = 0x12; WCN3988 `>> 5`; WCN3998 `((rom & 0xf000) >> 7) | (rom & 0xf)`. Prefix:
+  `cm` = WCN3950 (product 0x0f; NVM `cmnv%02x` + `t`/`s` for soc 0x40074130/0x40075130), `cr` = WCN3990/1/8, `ap` =
+  WCN3988. soc 0x40070120 is neither WCN3950 `t` nor `s`: `cmnv12.bin`. WCN3950 is below WCN3991 in Linux's enum: the
+  version answer has no extra byte (our parse is right) and the transport is the WCN399x one (power pulses, speeds).
+- [V Linux qca_tlv_check_data] Linux checks nothing in the rampatch header (it only reads the download mode). We keep a
+  product check (a rampatch of another family never goes to this chip) and prefer an exact ROM build.
+- Fix (`laurel_bt_fw.c`): every candidate (cm, cr, ap, WCN3998 cr) that exists in the partition is read once; its header
+  picks it: first product + ROM build match, else first product match (`sent anyway, as Linux does`). No match:
+  `off: no rampatch for this product in the firmware partition`, names tried in the line. TLV sanity: TLV length = size
+  - 4, total size <= TLV length, data length < total size.
+- NVM tag 17 (HCI transport). [V files] crnv21/apnv10: `82 01 11 08 04 ..`: byte 2 = 0x11 = speed index 3200000 (Linux
+  writes byte 2 below WCN3991, byte 1 from WCN3991). cmnv12.bin: `15 11 22 00 2e 00`: byte 1 = 0x11 (a speed index),
+  byte 2 = 0x22 (none; the table ends at 0x12). [I] the WCN3950 file puts the speed in byte 1; Linux writes byte 2 for
+  WCN3950 (it then also sets the speed with a command). Here the chip must come out of the NVM at our speed (HCI reset at
+  3000000 follows), so the speed goes to Linux's byte when that byte holds a speed index, else to the other byte when that
+  one does (a log line says so); neither: the NVM is refused.
+- Host test [V 2026-11-01]: `scripts/laurel/bt-fw-test.sh` builds `laurel_bt_fw.c` from the patch with stubs and runs it on
+  the stock files: Mi A3 chip -> `cmbtfw12.tlv + cmnv12.bin`, NVM tag 17 sent as `15 0e 22 00 2e 00`; WCN3990 (0x000a,
+  0x0201) -> `crbtfw21.tlv + crnv21.bin`, `82 01 0e ..`; unknown product -> off.
+- Expected on the phone [not seen yet]: `LAUREL BT: fw: cmbtfw12.tlv 43991 bytes from bluetooth_b, product 0x000f ROM
+  build 0x0102 patch 0x0002, mode 3`, `fw: NVM tag 17 byte 2 is 0x22 (no speed index), byte 1 is 0x11: the speed goes
+  there`, `fw: cmnv12.bin 2564 bytes from bluetooth_b, speed index 14 in tag 17 byte 1`, then
+  `on: WCN39xx product 0x000f rom 0x0102, cmbtfw12.tlv + cmnv12.bin, 3000000 baud, BD_ADDR ..`.
