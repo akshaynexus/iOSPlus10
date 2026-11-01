@@ -4812,3 +4812,18 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - iOS: [V code] route = "Codec" + `imic`; [V other ports' notes] redwood + apollo record with the D22 identity; [I] MobileGestalt `microphone` is per product; [V code] TCC needs Sandbox ops 5/6 (2903). [U] all of it on the Mi A3. `logs/` has no plug-in lines, so the old "Voice Memos records silence" had no log behind it.
 - Not done: headphones, earpiece (RX macro + RX SoundWire, class-H, MBHC, HAL devices). Second mic AMIC3 not used.
 - Built [V]: merge 32accf4 on 80072a9: 297/297 patches, 0 LSE/RCpc, printf-arg-check OK, 2 linker lines (stub rounds), 0 warnings in the mic + audio files, kernel.development.sweet.4k sha256 570f52c889b9bece, series 45d57a3047db7468; armv80-check kernel 21 (the same count as before: no new one); RedwoodAudio sha256 2a4afb9a810dc0ed (0 newer than ARMv8.0); NegroniCamera 9c75f34635665b47 (0). mic-host-test PASS, xnutils-test PASS.
+
+## Mi A3: cellular: radio online at DMS mode 5, AP data pipes, pdp_ip0; patches 2930-2932, laurel-celld (2026-11-01, branch t3/laurel-cellular-radio; build + host tests, NOT BOOTED)
+- Details: docs/laurel_sprout/cellular.md section 11 (cause table, risks per step, test order, expected lines).
+- [V boot 22:50] DMS: error 0x4a, ~6 ms later 5, then 5 to the end; USIMs ready, Wi-Fi up: so 5 is a report, not a modem going down. The note in cellular.md section 8 was wrong; corrected there.
+- [V log] MCFG at 7.8 s: reads only mbn_hw.dig + mbn_sw.dig, no .mbn: no activation needed by that reading.
+- [V log] nas1 BIND error 0x3 was one line at 400 ms; the retry passed silently. A success now has a line.
+- [V firmware, scripts/debug/modem-re.sh] device_config.xml: DSDS L+L, num_sims 2, max_active_voice 1, max_active_data 2, primary "C H G W L T": no 5G. sys_m "SMP2P graceful shutdown request" on entry master-kernel: our item did not have the entry.
+- [V stock ipa_dp.c] v4.2: GSI channel scratch 0 (no MCS prefetch); scion wrote word 0/1 and mainline words 2/3: not needed here. WAN_PROD status goes to Q6_WAN_CONS (pipe 10).
+- [V trinket.dtsi + ipa_dp.c] qcom,modem-cfg-emb-pipe-flt: the modem fills pipe 1's filter table; no AP rule, no AP command channel for that.
+- [V xnu] in6_domifattach returns EEXIST when PF_INET6 is attached: use proto_register_plumber + proto_plumb as if_utun.c, not ifnet_attach_protocol at create. Null framer is valid (dlil.c 6835). struct ifnet_stat_increment_param: field is dropped, not dropped_in.
+- Gotcha: cell_test.c includes laurel_cell.c and laurel_cell_data.c in one TU: same static name = one variable (enabled_read clash hid the cell_data=0 switch). Names are unique now.
+- Gotcha: after a modem crash no thread polls: data_thread applies laurel_pdp_work once at its end, or configd keeps a dead service.
+- master-kernel entry only with the IPA on: an ipa=0 image stays the one with Wi-Fi today.
+- Dev flow: out/crad-dev/{a,r,i,d} = before, 2930, 2931, 2932 (files at tree paths); scripts/laurel/crad-patch.sh NAME TITLE OLD NEW. Worktree needs external symlinks and reflinked out/laurel-kernel/{deps,theos,cache,dl}, out/laurel/gpu/deps.
+- Not read: dataConnectionType enum (LTE tag off), IPMonitor (key names from memory, [I]), SET_DUAL_STANDBY_PREF layout (not sent). Unproven: every step on the phone after the handshake.

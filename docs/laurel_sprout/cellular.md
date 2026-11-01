@@ -4,6 +4,7 @@ Goal (owner): SIM detection for both slots, network registration, mobile data an
 iOS 16.7.16 (20H392, iPhone10,3 userland). Status 2026-11-01: step 1 (kernel QMI client: SIM 1/2 status, provisioning,
 modem facts; radio kept off by its IPA self-check) [V] booted (boot 20:02: the kernel reads SIM state; iOS saw no SIM, half-done-audit.md row 3). The bridge to iOS and the online fix
 (section 9, patch 2786): built + host test, NOT BOOTED. Path decision, data, SMS, voice, Settings, modem restart: section 9. The IPA phone test: section 10.
+Status later on 2026-11-01: IPA handshake [V] passes on the phone (boot 22:50); DMS mode 5 blocked ONLINE. Radio online + data (2930-2932, `laurel-celld`): built + host test, NOT BOOTED, data [I] until a phone ping: **section 11, read it first.**
 
 Labels: [V] read in source, measured on the host, or in the 20H392 root; [I] inference; [U] unknown.
 Kernel patch: `patches/laurel/xnu/2760-laurel-cellular-qmi.patch` (new `bsd/dev/laurel_cell.c` + hooks in TopazModem.cpp).
@@ -287,6 +288,8 @@ Off examples: `off: GSI channel 1 of EE 1 (pipe 5): ALLOCATE refused, code 7, GL
 **Modem restart (design note, not built; why not: section 9.5).** It would make every modem assert cost seconds, not Wi-Fi for the boot: PAS 4 shutdown, SMEM GLINK +
 SMP2P reset, QRTR + WLFW state reset, modem load again; stock adds ipa3_q6_pre_shutdown_cleanup + gsi_halt_channel_ee and TLV 0x18 = 1.
 
+**CORRECTION (section 11, boot 22:50): 5 is not only an old value: DMS repeats it for the whole boot. The text below was wrong on that point.**
+
 **`modem shutting down` in the cell line.** [V] The decode is right: only raw 5 gives this text; table = scion hakios.mpss.c:5212; message 0x2D;
 TLV 1, the same tlv() reads the revision correctly. [V] It is one old read: GET_OPERATING_MODE runs once, ~450 ms after modem start (and after
 SET); no DMS indication is registered; the 17:04:06 line repeats that value. [V] After the read: WLFW up at 730 ms, both USIMs reach ready,
@@ -351,7 +354,7 @@ What it does: hooks the 5 methods above and `initWithServerHandle:stateProvider:
 
 `exec CommCenterMobileHelper` [V job plist]: launchd job started on notify events (`purplebuddy.setupdone`, `ManagedConfiguration.profileListChanged`), no KeepAlive, `EnablePressuredExit`. It is a helper, not CommCenter. [V usblog] 10 `exec` lines in the whole log of many boots, 1 in boot 20:02: no restart loop. Not touched.
 
-### 9.4 Data: the next step (not built)
+### 9.4 Data: the next step (built later: section 11, without the AP command channel, and `pdp_ip0`, not `en1`)
 
 The AP pipes are not reachable today. Order after the IPA test passes: GSI event + transfer rings for the AP's channels; AP command channel (pipe 5 CMD_PROD) + immediate commands (stock does it, 2780 uses SRAM writes); endpoint config + QMAP; WDA SET_DATA_FORMAT; WDS BIND_MUX_DATA_PORT; START_NETWORK + GET_RUNTIME_SETTINGS; an interface. Interface: `en1` with kernel ARP + DHCP answers as scion did [V, not proven by scion on the phone]; `pdp_ip0` is configured by CommCenter [V strings, I]. A data call can also assert the modem, so same rule: test image first.
 
@@ -385,7 +388,7 @@ Expected on the screen [I]: `No Service`, no bars, no longer `No SIM`. `LAUREL W
 
 | Line | Meaning |
 | --- | --- |
-| `... modem shutting down; ...` as the final line, 60 s after the start | The modem really stays at 5. ONLINE is blocked with reason. New fact: tell the owner |
+| `... modem shutting down; ...` as the final line, 60 s after the start | The modem really stays at 5 ([V] boot 22:50). With 2930 only in an `ipa=0` image; else section 11.6 |
 | `LaurelCell: nas1: BIND_SUBSCRIPTION error 0x3`, then nothing wrong | Normal now: asked again, 10 s apart |
 | `... SIM2: NAS not bound to this SIM` (only online) | 6 refusals: SIM2 gets no bars, by design |
 | `LAUREL CELLBAR: off: no -[...]` or `no CoreTelephony ...` | The build differs from what section 9 read. Apple's bar stays |
@@ -429,3 +432,120 @@ Fail, first match:
 | `LAUREL CELL: part: ... radio off: modem refused ONLINE 6 times, error 0x..` | IPA passed, ONLINE not | Stays | 0x34 = not ready: which service does it wait for |
 | `modem crash reason:` within seconds after `online: ok`, e.g. `enl2_dl` | Radio needs AP data pipes (scion's crash, but handshake passed) | Off | Section 9.4 comes before ONLINE: gate ONLINE on it. New fact |
 | `SIM1 searching` or `not registered`, no crash | Radio works, no network yet. No bars, by design | Stays | Antenna, band, `registration denied` text |
+
+## 11. Radio online + data: patches 2930, 2931, 2932 + `laurel-celld` (2026-11-01, build + host test, NOT BOOTED)
+
+Phone input [V, boot 22:50:54, `logs/laurel-boot-ipa.txt`]: the IPA handshake passes (`modem answered INIT_MODEM_DRIVER: success (21 ms)`, `LAUREL IPA: on`), no modem crash, Wi-Fi on. DMS says 5 for the whole boot, so 2786 never sends ONLINE. **Section 8's claim "5 is only an old value" is wrong.**
+
+Evidence tool: `scripts/debug/modem-re.sh` (stock NON-HLOS to `out/re-modem`, string table; no firmware in git).
+
+### 11.1 Why DMS says "shutting down"
+
+| Question | Result | Label |
+| --- | --- | --- |
+| Is the modem going down? | No. After the 5: both USIMs reach ready (app state 7), WLFW and Wi-Fi run, the modem serves 42 services, MCFG runs at 7.8 s | [V log] |
+| Does an AP path send a shutdown? | No. SMP2P: our item had only the `ipa` entry, not `master-kernel`, so bit 0 ("SMP2P graceful shutdown request" in `sys_m_smsm_mpss.c`) cannot be set. No SSCTL or sysmon client in `TopazModem.cpp` (0x2B is only a name). PIL shutdown only after a failed load | [V code, firmware strings] |
+| The sequence of answers | First read error 0x4A (`INFORMATION_UNAVAILABLE`), about 6 ms later raw 5, then 5 until the log ends at 22:52:47 | [V log] |
+| What 5 is | DMS maps the mode that CM reports; 5 = CM's `SYS_OPRT_MODE_PWROFF`, CM's start value, kept until a client asks for a mode | [I: Qualcomm enum names from memory; `ds_qmi_dms.c` and `cmph_send_oprt_mode` exist in the firmware, the code is not read] |
+| Does the modem wait for an AP service? | Announced by us: pd-mapper, tftp, rmtfs, IPA. All asked requests are answered. Time, thermal, sensors: the modem is the server, the AP the client, so it cannot wait for them. Memshare 0x34 (AP server, not ours): GPS and FTM clients only | [V log, DT] [I for memshare] |
+| PDC / MCFG activation? | The modem reads only `mcfg_hw/mbn_hw.dig` and `mcfg_sw/mbn_sw.dig` (32 bytes each) at 7.8 s and no `.mbn` after them: the digests match and the configs in EFS stay. No activation is needed by that reading. If the offline reason (below) says PRI misconfiguration, this changes | [V log] [I] |
+| Android's order | qcrild: `DMS SET_EVENT_REPORT`, then low power, then ONLINE on the framework's radio power request | [I from memory: qcrild is closed, not in this repo] |
+| Scion's order | OFFLINE boot; ONLINE error 52 (not ready) until tftp + servreg served; low power error 60; ONLINE then works | [V scion docs + `hakios.mpss.c:5311`] |
+
+Conclusion: **unknown until the next boot** whether ONLINE works at 5. Next-boot lines tell: raw mode, offline reason, hardware restricted, and the answer to each request.
+
+### 11.2 What 2930 does
+
+- `radio_step()`: 20 s after DMS came up, 5, 4 or an unknown mode no longer blocks. One round: low power, 2 s, ONLINE, each answer in one line, then a mode read. 6 rounds at most: 10 s after a refusal, 30 s after an `ok` that changes nothing. A refused low power does not stop the round. Mode 1, 6, 7: ONLINE directly.
+- The mode line has the raw value, offline reason (TLV 0x10), hardware restricted (TLV 0x11). `DMS SET_EVENT_REPORT` (TLV 0x14): the modem tells changes, the 10 s read stays.
+- `DMS GET_CAPABILITIES`: one line `modem radio technologies: ...`, state key `caps=`.
+- NAS: `nas1: BIND_SUBSCRIPTION primary: ok (retry N)`. **The 0x3 was not fatal**: [V log] one error line at 400 ms, and 2786 asks again after 10 s; a success had no line, so the log looked like a failure. Error 3 = `INTERNAL`, at the moment UIM starts [I].
+- SMP2P `master-kernel` = 0, before `ipa` (stock order, trinket.dtsi `modem_smp2p_out`). Only with the IPA on: an `ipa=0` image stays the image that has Wi-Fi today. [I] it may or may not change the mode.
+- State keys: `mode`, `caps`, `subN.plmn`, `subN.ps`, `subN.rsrp`, `subN.rssi`. No ICCID, IMSI, IMEI.
+
+**Radio technology: LTE at most.** [V firmware] `/policyman/device_config.xml`: "open Market DSDS with L+L", `num_sims="2" max_active_voice="1" max_active_data="2"`, `primary="C H G W L T"`: no NR letter; `NR5G*` appears only as 14 task name strings. On the phone: the `modem radio technologies` line [U until the boot].
+
+**DSDS.** [V firmware] L+L dual standby, one voice, config in `mcfg_hw/.../7+7_mode/sr_dsds`. NAS client per subscription: built in 2760 + 2786. Both SIMs in `kern.laurel_cell_state`. Dual standby preference: not sent; the modem's stored value applies [I]. `SET_DUAL_STANDBY_PREF` layout is not in this repo, so no blind request.
+
+### 11.3 What 2931 does: the AP data pipes
+
+`bsd/dev/laurel_ipa_data.c`, thread from `LAUREL IPA: on`, polled, kill switch `cell_data=0`.
+
+| Pipe | GSI channel, event ring | Slots | Values |
+| --- | --- | --- | --- |
+| 1 APPS_WAN_PROD | 0, 0 | 128 of 2 KB | HDR 0x44, HDR_EXT 1, SEQ 0x806, STATUS 0x15 (status to pipe 10), no aggregation |
+| 9 APPS_WAN_CONS | 3, 1 | 64 of 8 KB | HDR 0x2800C4, HDR_EXT 0xB, mask 0xFF000000, AGGR 0x2004D1 (6 KB, 500 us, EOF) |
+| 8 APPS_LAN_CONS | 2, 2 | 8 of 8 KB | HDR_EXT 0x800, AGGR 0x4D1: default route; counted and dropped |
+
+Sources: stock `ipa3_ep_mapping[IPA_4_2]`, `rmnet_ipa.c`, `ipa_dp.c`; mainline `ipa_data-v4.2.c`, `gsi.c`, `ipa_endpoint.c`. Decisions: channel scratch stays 0 (stock: no MCS prefetch on 4.2; scion and mainline write it); no AP command channel (tables are in SRAM; `qcom,modem-cfg-emb-pipe-flt`: the modem fills pipe 1's filter table, stock installs no AP rule there [V]); no checksum offload (4-byte QMAP, the stack computes); no status towards the AP. Memory: modem pool, about 1.4 MB. Poll: 1 ms with traffic, 10 ms after 200 quiet polls, 100 ms with no session: cost on a phone [U].
+
+### 11.4 What 2932 does: the session and `pdp_ip0`
+
+1. `laurel_cell_data.c`: DPM OPEN_PORT (embedded, interface 1, pipes 1 and 9), WDA SET_DATA_FORMAT (raw IP, QMAP, 16 packets or 6144 bytes). **These come before ONLINE**, as netmgrd before the RIL [I], at most 30 s. A WDA refusal: data off, radio goes on.
+2. One WDS client per family (ports 0x4019, 0x401A): BIND_MUX_DATA_PORT mux 1, SET_IP_FAMILY, START_NETWORK when NAS says registered, GET_CURRENT_SETTINGS. Gaps: 10 s, after 6 tries 60 s. Packet service indication: disconnected = this family goes down, START again.
+3. `laurel_pdp.c`: interface `pdp_ip0` (`IFNET_FAMILY_CELLULAR`, `IFT_CELLULAR`, point to point, raw IP, plumbers as `if_utun.c`). The data thread applies addresses by kernel ioctl. `kern.laurel_cell_net`: addresses + DNS.
+4. `userland/laurel/cell/laurel_celld.c`: launchd job `com.laurel.celld` (root, `scripts/laurel/celld-job.py`). Publishes `State:/Network/Service/<id>/{IPv4,IPv6,DNS,com.apple.CommCenter}`; IPMonitor chooses the primary service, writes the route and DNS. Key names and Wi-Fi-first ranking: [I] from memory of Apple's configd; the phone test decides.
+
+The data SIM: the modem's default subscription, primary session. Later tasks: `default-SIM` = WDS bind per subscription + NAS dual standby pref; network search = NAS PERFORM_NETWORK_SCAN; SMS, calls = WMS, VOICE clients. Each is one more client in the file pattern above, and state keys carry them to the UI.
+
+The status bar: the bridge reads `kern.laurel_cell_state` as before and shows bars when registered. **Data tag (LTE) stays off:** `setDataConnectionType:` 0: the enum for iOS 16 is not read yet. Settings > Cellular: not built.
+
+### 11.5 What each step risks
+
+A modem assert stops Wi-Fi until the next boot (9.5). The USB log and user space go on [V]. All of these run only without `ipa=0`: only `IPA_TEST=1` images. `uefi-image.sh` keeps `ipa=0`.
+
+| Step | Could assert? | Note |
+| --- | --- | --- |
+| `master-kernel` entry | [I] unlikely | Stock's state |
+| AP pipes | [I] unlikely: AP's own channels; a GSI error is on our EE. Wrong endpoint value: packets dropped | `off:` line on a failed self-check |
+| DPM, WDA | [I] unlikely: normal QMI errors | Scion saw errors, no assert |
+| Low power at mode 5 | [I] low: `CM denied LPM/Reset/Shutdown cmd` string exists | Error line |
+| **ONLINE at mode 5** | **[U], the main risk** | Scion's `enl2_dl` crash came without the handshake; handshake passes here |
+| START_NETWORK | **[U]** | First IPA data traffic for this modem |
+| First packets | **[U]** | UL filter rules are the modem's |
+
+### 11.6 Test order
+
+1. **Normal image first** (`ipa=0`, no Wi-Fi risk). `LaurelIPA: data: off: AP IPA side off: boot-arg ipa=0`, `LAUREL CELL DATA: off: AP IPA side off: boot-arg ipa=0`, `operating mode shutting down (raw 5, offline reason 0x.., hardware restricted N)`, `modem radio technologies: ...`, `nas1: BIND_SUBSCRIPTION primary: ok`, no `radio on:` line. Wi-Fi joins. Over SSH: `sysctl kern.laurel_cell_state kern.laurel_cell_net`.
+2. **`IPA_TEST=1` image, SIMs in, Wi-Fi on.** Expected, in this order:
+
+```
+LaurelIPA: data: WAN_PROD: pipe 1, GSI channel 0, event ring 0 started, 128 slots of 2048 bytes at ...
+LaurelIPA: data: WAN_CONS: pipe 9, GSI channel 3, event ring 1 started, 64 slots of 8192 bytes at ...
+LaurelIPA: data: LAN_CONS: pipe 8, GSI channel 2, event ring 2 started, 8 slots of 8192 bytes at ...
+LaurelIPA: data: ready: 3 pipes up, waiting for a data session
+LaurelData: DPM OPEN_PORT (pipes 1, 9): ok 0x0
+LaurelData: WDA SET_DATA_FORMAT: ok 0x0: link 2, up 5, down 5 (2 raw IP, 5 QMAP), down limit .. packets .. bytes
+LaurelData: ipv4: BIND_MUX_DATA_PORT mux 1: ok 0x0
+LaurelCell: radio on: DMS SET_OPERATING_MODE low power (reported shutting down, round 1)
+LaurelCell: DMS SET_OPERATING_MODE low power: ok 0x0 (reported shutting down, round 1 of 6)
+LaurelCell: operating mode low power (raw 1, offline reason 0x0, hardware restricted 0)
+LaurelCell: radio on: DMS SET_OPERATING_MODE online (reported low power, round 1)
+LaurelCell: DMS SET_OPERATING_MODE online: ok (reported low power, round 1 of 6)
+LaurelCell: operating mode online (raw 0, ...)
+LAUREL CELL: on: SIM1 present (USIM ready), SIM2 present (USIM ready); modem online; SIM1 registered ... LTE rssi .. rsrp .. bars N; SIM2 registered ...; data off: session not up yet; SMS, voice off: not built
+LaurelData: ipv4: START_NETWORK (default profile, try 1)
+LaurelData: ipv4: START_NETWORK: connected (ok 0x0)
+LaurelData: ipv4: address a.b.c.d mask ... gateway ... mtu ...
+LaurelData: interface pdp_ip0 attached (cellular, raw IP)
+LaurelData: pdp_ip0: IPv4 address set (error 0)
+LAUREL CELL DATA: on: pdp_ip0 IPv4, mux 1; the phone's ping proves it, not this line
+LAUREL CELLBAR: celld: configd has: pdp_ip0 IPv4
+```
+   The first lines of step 2 can come in another order (the threads are independent); `LaurelData: WDA` always comes before `radio on`.
+3. Bars on the screen. Over SSH: `ifconfig pdp_ip0`, `netstat -rn`, `ping -S <pdp_ip0 address> 8.8.8.8`: **the first real data proof.** Then Wi-Fi off in Settings: `LAUREL CELLBAR: celld: primary interface pdp_ip0`, a page in Safari, Siri. Wi-Fi on again: primary back to `en0`.
+4. 3 clean boots with `no modem crash` for 10 minutes: only then `ipa=0` goes (section 8).
+
+| Line | Meaning | Next |
+| --- | --- | --- |
+| `low power: error 0x3c`, then `online: ok` | As scion: normal | Read the next mode line |
+| `online: error 0x34`, 6 rounds | Modem not ready: says which service? Offline reason in the mode line | Offline reason, hardware restricted |
+| `modem answered ONLINE ok 6 times and stays in this mode` | The modem takes the request and does nothing. New fact | Report the mode line |
+| `hardware restricted 1` | RF calibration or thermal state [I] | No radio from AP code |
+| `modem crash reason:` after ONLINE | Save the text word for word. Wi-Fi off for the boot | Boot normal image |
+| `modem crash reason:` after `START_NETWORK` or on first packets | Data values | Report which line was last |
+| `WDA SET_DATA_FORMAT: error 0x46` and data off | Port not known: did DPM answer `ok`? | Read the DPM line |
+| `START_NETWORK: error 0xe, call end reason N, verbose M` | Network or APN refused; profile 1 APN `""` was read in boot 22:50 | Telephone APN: boot-arg or profile write comes next |
+| `primary interface` stays `none` with Wi-Fi off | IPMonitor did not take the keys | Dump `scutil` over SSH |
+
+Host tests [V]: `scripts/laurel/test-cell.sh` 23 of 23 (`mode stays 5`: 6 bounded rounds; low power refused; all refused; indication; session; v6 refused; WDA refused; crash; `cell_data=0`; the daemon's parser on the kernel's text). `scripts/laurel/test-ipa.sh` PASS with `data_test` (register values against the sources, RX frames, cut frame, ring wrap, TX, full ring, kill switch). They do not prove any firmware or hardware answer.
