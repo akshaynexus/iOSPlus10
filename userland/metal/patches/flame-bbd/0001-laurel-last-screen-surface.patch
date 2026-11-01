@@ -1,0 +1,39 @@
+diff --git a/phone/metal2/NativeBridgeMetalFrontend.mm b/phone/metal2/NativeBridgeMetalFrontend.mm
+index d8f5903..5ebeeab 100644
+--- a/phone/metal2/NativeBridgeMetalFrontend.mm
++++ b/phone/metal2/NativeBridgeMetalFrontend.mm
+@@ -108,6 +108,7 @@ static NSError *nbError(NSString *why) {
+ static NSString *lastError() {return [NSString stringWithUTF8String:nmb_last_error()];}
+ // NegroniMetal (flame/0008): every refused buffer, texture, library or pipeline is logged once per (what, reason) text with what was
+ // asked for (length, options, descriptor), so the plugin log names the refusal; the counters go on. At most 128 texts.
++static std::mutex gScreenLock;static IOSurfaceRef gScreenSurface;
+ static std::mutex gRefuseLock;static NSMutableSet *gRefuseSeen;
+ static void noteRefused(NSString *what,NSString *reason) {
+  NSString *text=[NSString stringWithFormat:@"%@: %@",what,reason?:@"?"];
+@@ -1312,6 +1313,14 @@ static void scheduled(void *context);
+  // refusal (nothing was written).
+  if(gSeedBump && !self.failedLocally)
+   for(id surface in _writtenSurfaces){IOSurfaceLock((__bridge IOSurfaceRef)surface,0,nullptr);IOSurfaceUnlock((__bridge IOSurfaceRef)surface,0,nullptr);}
++ // The last surface of screen size this process finished drawing (the compositor's check that a frame reached it, a plain copy of the reference; NegroniMetal.mm)
++ if(!self.failedLocally)
++  for(id surface in _writtenSurfaces){
++   IOSurfaceRef r=(__bridge IOSurfaceRef)surface;
++   if(IOSurfaceGetWidth(r)<700 || IOSurfaceGetHeight(r)<1500)continue;
++   std::lock_guard<std::mutex> lock(gScreenLock);
++   CFRetain(r);if(gScreenSurface)CFRelease(gScreenSurface);gScreenSurface=r;
++  }
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.
+  [_surfaces removeAllObjects];[_writtenSurfaces removeAllObjects];[_resourceOwners removeAllObjects];
+@@ -2540,6 +2549,11 @@ extern "C" bool native_bridge_metal_work_stats(uint64_t out[10]) {
+  return gDevice && nmb_device_work_stats(gDevice,out);
+ }
+ 
++extern "C" IOSurfaceRef native_bridge_metal_copy_screen_surface(void) {
++ std::lock_guard<std::mutex> lock(gScreenLock);
++ if(gScreenSurface)CFRetain(gScreenSurface);
++ return gScreenSurface;
++}
+ extern "C" void native_bridge_metal_progress(uint64_t out[4]) {
+  uint64_t pending=0,oldest=0;const uint64_t now=nowUs();
+  if(gInFlight)@synchronized(gInFlight){

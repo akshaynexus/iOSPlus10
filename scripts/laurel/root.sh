@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the Mi A3 (laurel_sprout) iOS 16.7.16 root for userdata (rd=ufsroot0) on Linux, as a sparse image.
+# Build the Mi A3 (laurel_sprout) iOS 16.7.16 root for the partition iosroot (rd=ufsroot0) on Linux, as a sparse image.
 #   scripts/bg.sh laurel-root sudo scripts/laurel/root.sh       (needs root: loop mounts, apfs-fuse, rsync -aH)
 # Input: $APPLE/20H392/*.dmg (scripts/ios16/fetch-dmgs.sh, op10tool ipsw-get; default APPLE=~/op10-apple).
 # SSH=1 (default, when out/ssh/ios exists): dropbear + tools (scripts/net/root-add-ssh.sh); SSH=0: none.
@@ -16,10 +16,10 @@
 #        (status bar provider for 360x780 pt + the waterdrop dylib for SpringBoard from out/laurel/notch, scripts/laurel/notch-build.sh;
 #        STATUSBAR=0 skips both, NOTCH=0 only the dylib), root-flashlight.sh (the flashlight's one owner: camera plug-in, else its own plug-in; TORCH=0 = no button) and root-brightness.py
 #        (auto-brightness off; BRIGHTNESS=0 skips), root-xnutils.sh (XNUtils.app; XNUTILS=0 skips); 3. fsck; 4. op10tool img2simg -> ios16-root.simg (owned by the user).
-# Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G (userdata is 108 GiB).
+# Output: $APPLE/laurel-ios16-root.img + .simg (Apple content: never in git). SIZE=16G; at most IOSROOT_VOLUME_MAX in scripts/lib/laurel-layout.sh.
 #         $APPLE/laurel-ios16-root.update: what our steps add or change on top of the stock root, for scripts/laurel/root-update.sh (root-delta.py; docs/laurel_sprout/root-update.md).
 # Flash (erases Android user data; owner confirms first): fastboot reboot bootloader, then
-#   fastboot -S 512M flash userdata $APPLE/laurel-ios16-root.simg
+#   scripts/laurel/dual-boot.sh install $APPLE/laurel-ios16-root.img
 set -euo pipefail
 # Everything is in main(): bash reads a function whole, so an edit of this file during the run cannot change what runs.
 main() {

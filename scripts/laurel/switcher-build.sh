@@ -15,8 +15,9 @@ JAR=$SDK/platforms/android-36/android.jar
 S=$REPO/tools/laurel-switcher
 O=$OUT/laurel/switcher
 rm -rf "$O/obj"; mkdir -p "$O/obj/classes" "$O/obj/dex"
+mkdir -p "$O/obj/assets"; "$REPO/scripts/laurel/switcher-asset.sh" "$O/obj/assets/to-ios.sh"
 "$BT/aapt2" compile --dir "$S/res" -o "$O/obj/res.zip"
-"$BT/aapt2" link -I "$JAR" --manifest "$S/AndroidManifest.xml" -A "$S/assets" --min-sdk-version 34 --target-sdk-version 36 -o "$O/obj/base.apk" "$O/obj/res.zip"
+"$BT/aapt2" link -I "$JAR" --manifest "$S/AndroidManifest.xml" -A "$O/obj/assets" --min-sdk-version 34 --target-sdk-version 36 -o "$O/obj/base.apk" "$O/obj/res.zip"
 javac -nowarn --release 17 -cp "$JAR" -d "$O/obj/classes" "$S"/src/org/iosplus10/laurelswitcher/*.java
 "$BT/d8" --release --min-api 34 --lib "$JAR" --output "$O/obj/dex" $(find "$O/obj/classes" -name '*.class')
 cp "$O/obj/base.apk" "$O/obj/unsigned.apk"

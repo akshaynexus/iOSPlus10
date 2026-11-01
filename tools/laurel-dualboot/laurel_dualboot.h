@@ -1,251 +1,154 @@
 /*
- * laurel 2950: Mi A3 dual boot: the iOS root lives in a pinned, preallocated f2fs file of Android's /data, and XNU reaches it
- * by a table of raw extents on the userdata partition. A bug here corrupts Android data, so this file holds only arithmetic on the
- * table: no I/O, no allocation, no f2fs parsing. The same file builds in the kernel (bsd/dev/sweet_ufs.c), in the phone helper
- * (tools/laurel-dualboot/ldbhelper.c) and in the host test (scripts/laurel/test-dualboot.sh). tools/op10tool/src/dualboot.rs writes
- * the same format and has the same rules. docs/laurel_sprout/dual-boot.md.
+ * laurel 2950: Mi A3 dual boot. The iOS root is the GPT partition `iosroot` on LUN 0 (docs/laurel_sprout/dual-boot.md). This file holds only rules on bytes: no I/O, no
+ * allocation. It builds in the kernel (bsd/dev/sweet_ufs.c) and in the host test (tools/laurel-dualboot/test). tools/op10tool/src/gpt.rs writes the same layout.
  *
- * Terms. Device block: 4096 bytes. Partition block: device block counted from the start of userdata (f2fs block address, because
- * f2fs on dm-default-key on userdata has no offset). LBA: device block counted from the start of LUN 0. Area block: block of the
- * mapped file. The first LDB_RESERVED_BLOCKS area blocks hold the header; the BSD disk ufsroot0 starts behind them.
+ * The rules are general, not the numbers of one phone, except the slot list around the new entry: 32 slots, 16 used, without a hole; slot 14 = metadata, 15 = userdata,
+ * 16 = iosroot; each partition follows the one before it with no overlap; iosroot starts on 2 MiB and ends at the last usable block; both copies valid and equal.
  */
 #ifndef LAUREL_DUALBOOT_H
 #define LAUREL_DUALBOOT_H
 
 #define LDB_BLOCK           4096u
-#define LDB_MAX_EXTENTS     4096u               /* a fresh allocation has far fewer; more = allocate again, not a bigger table */
-#define LDB_RESERVED_BLOCKS 256u                /* 1 MiB: header in block 0, the rest stays empty */
-#define LDB_MIN_PART_BLOCK  512u                /* f2fs: never the superblock segment (and the area is always in the main area) */
-#define LDB_FP_BLOCKS       3u                  /* superblock block + both checkpoint pack heads */
-#define LDB_TABLE_MAGIC     "LDBTABL1"
-#define LDB_HDR_MAGIC       "LAURELDB"
-#define LDB_VERSION         1u                  /* of the table */
-#define LDB_HDR_VERSION     2u                  /* of the area header. Version 1 had a state FRESH, which passed against any filesystem. */
-/*
- * One state lets the kernel write: BOUND. The fingerprint in it was taken by ldbhelper seal with /data frozen, right after the pin and FIEMAP check, in the
- * same frozen period (docs/laurel_sprout/dual-boot.md, section "The fingerprint"). No other number passes. The kernel never writes this header.
- */
-#define LDB_STATE_BOUND     2u
-#define LDB_STATE_OFF       3u                  /* written by ldbhelper when a seal fails after its header went out */
-/* Patch 2950 is in this kernel. uefi-image.sh and android-guard.sh search a kernel and a boot image for this exact text: a kernel without 2950 ignores the table and writes its log into /data. */
-#define LDB_KERNEL_MARKER   "LAUREL-2950-DUALBOOT-FENCE-V2-SEAL-AT-FREEZE"
+#define LDB_ROOT_NAME       "iosroot"
+#define LDB_GPT_SLOTS       32u
+#define LDB_GPT_ESZ         128u
+#define LDB_GPT_USED        16u
+#define LDB_ALIGN_BLOCKS    512u                /* 2 MiB */
+#define LDB_LOG_BLOCKS      1025u               /* SWEET_LOG_BLOCKS: the console log takes the end of the partition */
+/* Patch 2950 is in this kernel. uefi-image.sh and android-guard.sh search a kernel and a boot image for this exact text: a kernel without it takes userdata as its root. */
+#define LDB_KERNEL_MARKER   "LAUREL-2950-IOSROOT-FENCE-V3"
 
-/* The blob of ADT /chosen laurel-dualboot, little endian: this header + count x struct ldb_extent. */
-struct ldb_table {
-	char magic[8];
-	uint32_t version, block_size, count, reserved_blocks;
-	uint64_t part_first;                    /* LBA of userdata on LUN 0 */
-	uint64_t part_blocks;                   /* size of userdata */
-	uint64_t area_blocks;                   /* size of the mapped file */
-	uint64_t table_id;                      /* new for every allocation */
-	uint64_t hash;                          /* ldb_hash of the whole blob, this field zero */
-};
-
-struct ldb_extent {
-	uint64_t area_block, part_block, blocks;
-};
-
-/* Area block 0: written raw by the Android helper (seal, wipe). XNU only reads it. Little endian. */
-struct ldb_header {
-	char magic[8];
-	uint32_t version, state;
-	uint64_t table_id, table_hash, area_blocks, seal_generation;
-	uint64_t fp_part_block[LDB_FP_BLOCKS];  /* where the Android filesystem must not have changed; outside the table */
-	uint64_t fp_hash[LDB_FP_BLOCKS];        /* raw bytes (ciphertext), read on a frozen /data */
-	uint64_t hash;                          /* ldb_hash of this struct, this field zero */
-};
-
-_Static_assert(sizeof(struct ldb_table) == 64, "table header layout");
-_Static_assert(sizeof(struct ldb_extent) == 24, "extent layout");
-_Static_assert(sizeof(struct ldb_header) == 104, "area header layout");
-
-/* FNV-1a 64: not against an attacker; it finds a stale table, a moved file, a changed block. */
-static inline uint64_t
-ldb_hash_add(uint64_t h, const void *data, uint64_t len)
+static inline uint32_t
+ldb_crc32(const uint8_t *d, uint32_t len, uint32_t skip_at)
 {
-	const uint8_t *p = (const uint8_t *)data;
-	for (uint64_t i = 0; i < len; i++) {
-		h = (h ^ p[i]) * 0x100000001b3ull;
+	uint32_t c = 0xffffffffu;
+	for (uint32_t i = 0; i < len; i++) {
+		/* skip_at: the 4 bytes of a header's own CRC count as zero */
+		c ^= (i >= skip_at && i < skip_at + 4) ? 0 : d[i];
+		for (unsigned k = 0; k < 8; k++) {
+			c = (c >> 1) ^ (0xedb88320u & (0u - (c & 1)));
+		}
 	}
-	return h;
+	return ~c;
 }
-#define LDB_HASH_INIT 0xcbf29ce484222325ull
-
+static inline uint32_t
+ldb_le32(const uint8_t *p)
+{
+	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
 static inline uint64_t
-ldb_hash_zeroing(const void *data, uint64_t len, uint64_t field_off)
+ldb_le64(const uint8_t *p)
 {
-	static const uint8_t zero[8] = { 0 };
-	uint64_t h = ldb_hash_add(LDB_HASH_INIT, data, field_off);
-	h = ldb_hash_add(h, zero, 8);
-	return ldb_hash_add(h, (const uint8_t *)data + field_off + 8, len - field_off - 8);
+	return (uint64_t)ldb_le32(p) | (uint64_t)ldb_le32(p + 4) << 32;
 }
-
-static inline const struct ldb_extent *
-ldb_extents(const struct ldb_table *t)
+/* The name of a GPT entry against an ASCII name. */
+static inline bool
+ldb_name_is(const uint8_t *e, const char *name)
 {
-	return (const struct ldb_extent *)(const void *)(t + 1);
+	unsigned i = 0;
+	for (; name[i]; i++) {
+		if (e[56 + 2 * i] != (uint8_t)name[i] || e[57 + 2 * i] != 0) {
+			return false;
+		}
+	}
+	return i < 36 && e[56 + 2 * i] == 0 && e[57 + 2 * i] == 0;
 }
-
-static inline uint64_t
-ldb_table_hash(const void *blob, uint64_t len)
+static inline bool
+ldb_slot_empty(const uint8_t *e)
 {
-	return ldb_hash_zeroing(blob, len, __builtin_offsetof(struct ldb_table, hash));
+	for (unsigned i = 0; i < LDB_GPT_ESZ; i++) {
+		if (e[i]) {
+			return false;
+		}
+	}
+	return true;
 }
-
-static inline uint64_t
-ldb_header_hash(const struct ldb_header *h)
+/* One header with its entries. Returns NULL or the reason. */
+static inline const char *
+ldb_gpt_copy_check(const uint8_t *h, const uint8_t *entries, uint64_t lba)
 {
-	return ldb_hash_zeroing(h, sizeof(*h), __builtin_offsetof(struct ldb_header, hash));
+	static const char sig[9] = "EFI PART";
+	for (unsigned i = 0; i < 8; i++) {
+		if (h[i] != (uint8_t)sig[i]) {
+			return "a GPT copy has no signature";
+		}
+	}
+	if (ldb_le32(h + 12) != 92 || ldb_crc32(h, 92, 16) != ldb_le32(h + 16)) {
+		return "a GPT header has a wrong size or CRC";
+	}
+	if (ldb_le64(h + 24) != lba) {
+		return "a GPT header is not at the block it names";
+	}
+	if (ldb_le32(h + 80) != LDB_GPT_SLOTS || ldb_le32(h + 84) != LDB_GPT_ESZ) {
+		return "the GPT has an unexpected entry count";
+	}
+	if (ldb_crc32(entries, LDB_GPT_SLOTS * LDB_GPT_ESZ, 0xffffffffu) != ldb_le32(h + 88)) {
+		return "a GPT entry array has a wrong CRC";
+	}
+	return NULL;
 }
-
 /*
- * Every rule a table must pass. Returns NULL or the reason. The blob needs 8-byte alignment.
- * A hole in the area, an overlap, a block outside userdata, a wrong hash: refused.
+ * Both copies of the GPT of LUN 0 against the expected layout. ph, pe: primary header (at LBA 1) and entries; bh, be: backup header and entries. Returns NULL or the reason;
+ * first, blocks: where iosroot lies. Attributes of slot partitions change at each slot switch (HAL, ABL): they are not compared with a number, but the two copies must agree.
  */
 static inline const char *
-ldb_table_check(const void *blob, uint64_t len)
+ldb_gpt_layout_check(const uint8_t *ph, const uint8_t *pe, const uint8_t *bh, const uint8_t *be, uint64_t *first, uint64_t *blocks)
 {
-	const struct ldb_table *t = (const struct ldb_table *)blob;
-
-	if (blob == NULL || len < sizeof(*t) || ((uintptr_t)blob & 7) != 0) {
-		return "table too short or not aligned";
+	const char *why = ldb_gpt_copy_check(ph, pe, 1);
+	if (why != NULL) {
+		return why;
 	}
-	for (unsigned i = 0; i < 8; i++) {
-		if (t->magic[i] != LDB_TABLE_MAGIC[i]) {
-			return "table has no magic";
+	uint64_t alt = ldb_le64(ph + 32);
+	why = ldb_gpt_copy_check(bh, be, alt);
+	if (why != NULL) {
+		return why;
+	}
+	if (ldb_le64(bh + 32) != 1) {
+		return "the backup GPT header does not name the primary";
+	}
+	for (unsigned i = 0; i < LDB_GPT_SLOTS * LDB_GPT_ESZ; i++) {
+		if (pe[i] != be[i]) {
+			return "the two GPT copies differ";
 		}
 	}
-	if (t->version != LDB_VERSION || t->block_size != LDB_BLOCK || t->reserved_blocks != LDB_RESERVED_BLOCKS) {
-		return "table version, block size or reserved size is not this kernel's";
+	uint64_t f_use = ldb_le64(ph + 40), l_use = ldb_le64(ph + 48), prev = f_use - 1;
+	if (ldb_le64(bh + 40) != f_use || ldb_le64(bh + 48) != l_use || l_use >= alt || f_use < 2) {
+		return "the usable range of the GPT is wrong";
 	}
-	if (t->count == 0 || t->count > LDB_MAX_EXTENTS) {
-		return "table extent count out of range";
-	}
-	if (len != sizeof(*t) + (uint64_t)t->count * sizeof(struct ldb_extent)) {
-		return "table length does not match its extent count";
-	}
-	if (ldb_table_hash(blob, len) != t->hash) {
-		return "table hash wrong";
-	}
-	if (t->part_first == 0 || t->part_blocks == 0 || t->part_first + t->part_blocks < t->part_first) {
-		return "table has no valid partition";
-	}
-	if (t->area_blocks <= LDB_RESERVED_BLOCKS || t->area_blocks > t->part_blocks) {
-		return "area size out of range";
-	}
-	const struct ldb_extent *e = ldb_extents(t);
-	uint64_t next = 0;
-	for (uint32_t i = 0; i < t->count; i++) {
-		if (e[i].blocks == 0 || e[i].area_block != next) {
-			return "area is not contiguous from block 0";
-		}
-		if (e[i].part_block < LDB_MIN_PART_BLOCK || e[i].part_block >= t->part_blocks ||
-		    e[i].blocks > t->part_blocks - e[i].part_block) {
-			return "extent outside userdata";
-		}
-		next += e[i].blocks;
-		if (next > t->area_blocks) {
-			return "extents longer than the area";
-		}
-		for (uint32_t k = 0; k < i; k++) {
-			if (e[i].part_block < e[k].part_block + e[k].blocks && e[k].part_block < e[i].part_block + e[i].blocks) {
-				return "two extents overlap on the partition";
+	for (unsigned i = 0; i < LDB_GPT_SLOTS; i++) {
+		const uint8_t *e = pe + i * LDB_GPT_ESZ;
+		if (i >= LDB_GPT_USED) {
+			if (!ldb_slot_empty(e)) {
+				return "the GPT has more entries than expected";
 			}
+			continue;
+		}
+		if (ldb_slot_empty(e)) {
+			return "the GPT has fewer entries than expected";
+		}
+		uint64_t a = ldb_le64(e + 32), b = ldb_le64(e + 40);
+		if (a != prev + 1 || b < a || b > l_use) {
+			return "the GPT entries are not one after the other";
+		}
+		prev = b;
+	}
+	const uint8_t *m = pe + 13 * LDB_GPT_ESZ, *u = pe + 14 * LDB_GPT_ESZ, *r = pe + 15 * LDB_GPT_ESZ;
+	if (!ldb_name_is(m, "metadata") || !ldb_name_is(u, "userdata") || !ldb_name_is(r, LDB_ROOT_NAME)) {
+		return "slots 14, 15, 16 of the GPT are not metadata, userdata, " LDB_ROOT_NAME;
+	}
+	for (unsigned i = 0; i < 13; i++) {
+		if (ldb_name_is(pe + i * LDB_GPT_ESZ, LDB_ROOT_NAME)) {
+			return "the GPT has a second " LDB_ROOT_NAME;
 		}
 	}
-	if (next != t->area_blocks) {
-		return "extents shorter than the area";
+	uint64_t a = ldb_le64(r + 32), b = ldb_le64(r + 40);
+	if (a % LDB_ALIGN_BLOCKS != 0 || b != l_use || ldb_le64(r + 48) != 0) {
+		return LDB_ROOT_NAME " is not on 2 MiB, does not end at the last usable block, or has attributes";
 	}
+	*first = a;
+	*blocks = b - a + 1;
 	return NULL;
 }
-
-/* Area block -> LBA and how many blocks are contiguous from there, at most want. 0, or -1 = not in the area. */
-static inline int
-ldb_map(const struct ldb_table *t, uint64_t area_block, uint32_t want, uint64_t *lba, uint32_t *run)
-{
-	const struct ldb_extent *e = ldb_extents(t);
-
-	if (want == 0) {
-		return -1;
-	}
-	for (uint32_t i = 0; i < t->count; i++) {
-		if (area_block >= e[i].area_block && area_block - e[i].area_block < e[i].blocks) {
-			uint64_t in = area_block - e[i].area_block, left = e[i].blocks - in;
-			*lba = t->part_first + e[i].part_block + in;
-			*run = left < want ? (uint32_t)left : want;
-			return 0;
-		}
-	}
-	return -1;
-}
-
-/* Write fence, separate from ldb_map on purpose: true only when every block of [lba, lba + count) is in one extent of the table. */
-static inline bool
-ldb_lba_allowed(const struct ldb_table *t, uint64_t lba, uint32_t count)
-{
-	const struct ldb_extent *e = ldb_extents(t);
-
-	if (count == 0 || lba < t->part_first || lba + count < lba) {
-		return false;
-	}
-	uint64_t pb = lba - t->part_first;
-	for (uint32_t i = 0; i < t->count; i++) {
-		if (pb >= e[i].part_block && pb - e[i].part_block < e[i].blocks) {
-			return count <= e[i].blocks - (pb - e[i].part_block);
-		}
-	}
-	return false;
-}
-
-/* Is this partition block inside the table? (the fingerprint blocks must not be) */
-static inline bool
-ldb_part_block_mapped(const struct ldb_table *t, uint64_t pb)
-{
-	return pb < (uint64_t)-1 - t->part_first && ldb_lba_allowed(t, t->part_first + pb, 1);
-}
-
-/* Reasons a header does not fit this table. State BOUND only. */
-static inline const char *
-ldb_header_check(const struct ldb_header *h, const struct ldb_table *t)
-{
-	for (unsigned i = 0; i < 8; i++) {
-		if (h->magic[i] != LDB_HDR_MAGIC[i]) {
-			return "no header in the mapped area (not installed, or the blocks now hold something else)";
-		}
-	}
-	if (h->version != LDB_HDR_VERSION || ldb_header_hash(h) != h->hash) {
-		return "area header damaged";
-	}
-	if (h->table_id != t->table_id || h->table_hash != t->hash || h->area_blocks != t->area_blocks) {
-		return "area header is for another table (rebuild the boot image)";
-	}
-	if (h->state != LDB_STATE_BOUND) {
-		return "area is not sealed";
-	}
-	for (unsigned i = 0; i < LDB_FP_BLOCKS; i++) {
-		if (h->fp_part_block[i] >= t->part_blocks || ldb_part_block_mapped(t, h->fp_part_block[i])) {
-			return "fingerprint block outside userdata or inside the area";
-		}
-	}
-	return NULL;
-}
-
-/* One piece of a request at byte position pos on the BSD disk (no reserved blocks counted): clamp it to one extent. See sweet_ufs_strategy. */
-static inline int
-ldb_piece(const struct ldb_table *t, uint64_t disk_block, uint32_t skip, uint32_t *want, uint32_t *blocks, uint64_t *lba)
-{
-	uint32_t run = 0;
-
-	if (ldb_map(t, disk_block + t->reserved_blocks, *blocks, lba, &run) != 0) {
-		return -1;
-	}
-	if (run < *blocks) {
-		*blocks = run;
-		*want = run * LDB_BLOCK - skip;
-	}
-	return 0;
-}
-
 /* HFS+ or HFSX volume header at byte 1024 of a block: volume bytes, or 0 when it is not one. Big endian on disk. */
 static inline uint64_t
 ldb_hfs_volume_bytes(const uint8_t *block)

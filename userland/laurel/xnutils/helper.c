@@ -48,6 +48,15 @@ int proc_pidpath(int pid, void *buffer, uint32_t buffersize); /* libproc, not in
 int xt_do_metal(const char *what);
 int xt_do_gl(int on);
 int xt_do_strikes_clear(void);
+#ifdef XT_IOS26
+/* helper_ios26.c */
+int xt_do_metaloption(const char *name);
+int xt_do_tumode(const char *flag);
+int xt_do_liveglass(int on);
+int xt_do_metalstate(void);
+int xt_do_bench_begin(void);
+int xt_do_bench_end(void);
+#endif
 
 static int
 caller_allowed(void)
@@ -224,6 +233,14 @@ main(int argc, char **argv)
 	for (size_t i = 0; arg == NULL && i < sizeof(plain) / sizeof(plain[0]); i++) {
 		plain_ok |= !strcmp(verb, plain[i]);
 	}
+#ifdef XT_IOS26
+	int option = arg != NULL && !strcmp(verb, "metaloption") && (!strcmp(arg, "default") || !strcmp(arg, "hot"));
+	int tumode = arg != NULL && !strcmp(verb, "tumode") && (!strcmp(arg, "auto") || !strcmp(arg, "sysmem") || !strcmp(arg, "gmem"));
+	int glass = arg != NULL && !strcmp(verb, "liveglass") && (!strcmp(arg, "on") || !strcmp(arg, "off"));
+	int state = arg == NULL && (!strcmp(verb, "metalstate") || !strcmp(verb, "bench-begin") || !strcmp(verb, "bench-end"));
+
+	plain_ok |= option || tumode || glass || state;
+#endif
 	if (!metal && !gl && !plain_ok) {
 		return usage();
 	}
@@ -241,6 +258,14 @@ main(int argc, char **argv)
 	if (gl) {
 		return xt_do_gl(!strcmp(arg, "on"));
 	}
+#ifdef XT_IOS26
+	if (option) return xt_do_metaloption(arg);
+	if (tumode) return xt_do_tumode(strcmp(arg, "auto") ? arg : NULL);
+	if (glass) return xt_do_liveglass(!strcmp(arg, "on"));
+	if (!strcmp(verb, "metalstate")) return xt_do_metalstate();
+	if (!strcmp(verb, "bench-begin")) return xt_do_bench_begin();
+	if (!strcmp(verb, "bench-end")) return xt_do_bench_end();
+#endif
 	if (!strcmp(verb, "restart")) return do_reboot(RB_AUTOBOOT);
 	if (!strcmp(verb, "shutdown")) return do_reboot(RB_HALT);
 	if (!strcmp(verb, "bootloader")) return do_bootloader();

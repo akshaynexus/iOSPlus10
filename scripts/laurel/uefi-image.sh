@@ -10,7 +10,8 @@
 #     Mu 0101 ("Kernel RAM" 0xE1000000 + 0xDF000000) or the late layout (MU_RAM_LAYOUT=late) gives 3264 MiB at
 #     0xE1004000 (kernel patch 2100); an older FD (Kernel RAM 0x81000000 + 0x3F000000) 768 MiB at 0x81004000
 #   CPUS=N (XNU cpus= boot-arg, default 8)   SIZE_MIB=48 (payload FAT)
-#   BOOT_MENU=1 (default): UniXNU menu with iOS + Android, 5 s to iOS, panic reset after 30 s, boot_b marked for the Android app; BOOT_MENU=0: as before (docs/laurel_sprout/boot-menu.md)
+#   BOOT_MENU=1 (default): UniXNU menu with iOS + Android, 5 s to iOS, panic reset after 30 s, boot_b marked for the Android app; BOOT_MENU=0: as before (docs/laurel_sprout/boot-menu.md).
+#   LAUREL_READONLY=1 (dual-boot.sh image): no ufsrw, no rootrw, and BOOT_MENU=0. IOSROOT_HEAD_SHA=sha256 of the first MiB of the installed root: the app's mark (dual-boot.sh image rw)
 #   ENTRY_TITLE=text: title of the iOS entry. STOCK_DTBO=path: the dtbo_b that the mark names (default ~/laurel-backup/stock/images/dtbo.img)
 # Output: out/laurel/uefi/laurel-uefi-boot.img (+ laurel.adt, payload.img, kernel.gz, cmdline.txt); MU_ONLY=1: laurel-mu-only-boot.img
 # Flash: scripts/bg.sh laurel-flash sh -c 'BOOT=reboot scripts/laurel/flash-boot.sh out/laurel/uefi/laurel-uefi-boot.img'
@@ -37,7 +38,7 @@ SIZE_MIB=${SIZE_MIB:-48}
 CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 launchd_disable_all_timeouts=1 wdt=-1 sweetfb_hz=60 ipa=0"}
 # ipa=0: phone test 2026-11-01 17:01: the IPA handshake crashed the modem (GSI channel 1 assert), which stops Wi-Fi too. 2782 adds the
 # missing channel allocation, but no self-check can see a modem firmware assert: ipa=0 stays until a phone boot shows the evidence in
-# docs/laurel_sprout/cellular.md section 8. That test: IPA_TEST=1 scripts/laurel/uefi-image.sh, then fastboot boot (RAM, one boot).
+# docs/laurel_sprout/cellular.md section 8. That test: IPA_TEST=1 scripts/laurel/uefi-image.sh, then a boot_b flash (this ABL refuses `fastboot boot`: line above and uefi-boot.md).
 [ "${IPA_TEST:-0}" != 1 ] || CMDLINE=${CMDLINE% ipa=0}
 # launchd_disable_all_timeouts=1: launchd kills an extension that has not checked in after 5 s (ExtensionWatchdogTimeout, a 5 in its data,
 # no plist key changes it on this port); here device open + first pipelines take longer at 300 MHz (boot 2026-11-01 18:45: AegirPoster 10
@@ -47,6 +48,8 @@ CMDLINE=${1:-"debug=0xc serial=3 cpus=$CPUS keepsyms=1 -noprogress rd=ufsroot0 u
 # EXTRA_ARGS: added to the boot-args, e.g. a kill switch for one test (EXTRA_ARGS=gpu_smmu=0)
 [ -z "${EXTRA_ARGS:-}" ] || CMDLINE="$CMDLINE $EXTRA_ARGS"
 BOOT_MENU=${BOOT_MENU:-1}
+# The read-only first boot writes nothing we control: no Android entry, no retries refill (Mu's GPT write), no marks, so the app cannot start it; `dual-boot.sh switch` and `to-android` are its way.
+[ "${LAUREL_READONLY:-0}" != 1 ] || BOOT_MENU=0
 ENTRY_TITLE=${ENTRY_TITLE:-iOS 16 (laurel XNU, TOPAZ_4K)}
 STOCK_DTBO=${STOCK_DTBO:-$HOME/laurel-backup/stock/images/dtbo.img}
 # a panic resets after 30 s, so the menu comes back with no computer (without it the panic hold stays until `op10tool ctl bootloader`); docs/laurel_sprout/usb-debug.md
@@ -66,6 +69,17 @@ fdlen=$(wc -c < "$FD" | tr -d ' ')
 cat "$SHIM" "$FD" > "$W/kernel.bin"
 gzip -9 -n -c "$W/kernel.bin" > "$W/kernel.gz"
 
+# S1: ABL gives TrustZone the OS version and patch level of the header it loaded: the same as Lineage's, read from the backup, for every image while the phone holds Android, Mu alone too.
+# docs/laurel_sprout/dual-boot.md, keys. mk() below is the one place that uses them. Without the flag: the stock values (the iOS-only phone).
+OS_VERSION=; OS_PATCH=
+if [ -e "$REPO/config/laurel-android-data" ]; then
+  . "$REPO/scripts/lib/laurel-layout.sh"
+  LINEAGE_BOOT=${LINEAGE_BOOT:-$(laurel_backup_dir 'lineage-*')/boot.img}
+  [ -f "$LINEAGE_BOOT" ] || { echo "uefi-image: FAILED: no Lineage boot image ($LINEAGE_BOOT): its header is an input of this image" >&2; exit 1; }
+  os_raw=$(boot_os_raw "$LINEAGE_BOOT")
+  OS_VERSION=$(boot_os_version "$os_raw"); OS_PATCH=$(boot_os_patch "$os_raw")
+fi
+
 # 2. ramdisk: UniXNU payload FAT (kernel + ADT + unixnu.toml), or an empty cpio for Mu alone
 if [ "${MU_ONLY:-0}" = 1 ]; then
   rd=$W/ramdisk-empty.cpio.gz
@@ -79,20 +93,20 @@ else
   # no boot image from a kernel that is not proven: kernel-linux.sh stamps only what passed its checks
   python3 -I "$BS" kernel-check "$KERNEL" ${KERNEL_BY_HAND:+--no-repo} || { echo "uefi-image: FAILED: kernel not good: no boot image" >&2; rm -f "$W/laurel-uefi-boot.img.stamp"; exit 1; }
   STAMP_LINE=$(python3 -I "$BS" image-line "$KERNEL" "$FD")
-  # laurel 2950: the iOS root on Android's /data (docs/laurel_sprout/dual-boot.md). No table: the image is for a phone with no Android; flash-boot.sh refuses it while config/laurel-android-data exists.
-  DUALBOOT_TABLE=${DUALBOOT_TABLE:-$OUT/laurel/dualboot/table.ldbt}
+  # laurel 2950: the iOS root is the partition iosroot (docs/laurel_sprout/dual-boot.md). A kernel without this text takes userdata as its root and writes its console log into Android's data.
+  ldb_marker=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$REPO/tools/laurel-dualboot/laurel_dualboot.h")
   rm -f "$W/laurel-uefi-boot.img.dualboot"
-  ADT_TABLE=
-  if [ -f "$DUALBOOT_TABLE" ]; then
-    "${OP10TOOL:-$OUT/bin/op10tool}" dualboot check "$DUALBOOT_TABLE" || { echo "uefi-image: FAILED: the extent table does not pass: no boot image" >&2; exit 1; }
-    # a kernel without 2950 ignores the table and writes its console log to the last 4 MiB + 4 KiB of /data. KERNEL= by hand (--no-repo) skips the series check, ios26-image.sh always sets KERNEL: this check is for all of them.
-    ldb_marker=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$REPO/tools/laurel-dualboot/laurel_dualboot.h")
-    [ -n "$ldb_marker" ] && LC_ALL=C grep -aqF "$ldb_marker" "$KERNEL" || { echo "uefi-image: FAILED: kernel $KERNEL has no patch 2950 of this version (text $ldb_marker): no boot image with a table" >&2; exit 1; }
-    ADT_TABLE=$DUALBOOT_TABLE
-  elif [ -e "$REPO/config/laurel-android-data" ]; then
-    echo "uefi-image: note: no extent table ($DUALBOOT_TABLE): this image cannot go on the phone while it holds Android (dual-boot.sh map makes the table)"
+  DUALBOOT=
+  if [ -e "$REPO/config/laurel-android-data" ]; then
+    DUALBOOT=1
+    # KERNEL= by hand (--no-repo) skips the series check, ios26-image.sh always sets KERNEL: this check is for all of them.
+    [ -n "$ldb_marker" ] && LC_ALL=C grep -aqF "$ldb_marker" "$KERNEL" || { echo "uefi-image: FAILED: kernel $KERNEL has no patch 2950 of this version (text $ldb_marker): no boot image" >&2; exit 1; }
+    # dual-boot.sh image: the read-only first boot. No write command can leave the kernel, and the root mounts read-only.
+    [ "${LAUREL_READONLY:-0}" != 1 ] || CMDLINE=${CMDLINE/ ufsrw=1 rootrw=1/}
+    case " $CMDLINE " in *" ufsrw=1 "*|*" rootrw=1 "*) IMG_MODE=rw ;; *) IMG_MODE=ro ;; esac
+    [ "${LAUREL_READONLY:-0}" != 1 ] || [ "$IMG_MODE" = ro ] || { echo "uefi-image: FAILED: LAUREL_READONLY=1, and the command line can write: $CMDLINE" >&2; exit 1; }
   fi
-  python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE" ${ADT_TABLE:+--dualboot-table "$ADT_TABLE"} ${MKADT_EXTRA:-}   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
+  python3 "$REPO/scripts/laurel/mkadt.py" "$W/laurel.adt" --cores 8 --boot gold --dram "$DRAM" --mu-fd "$FD" --darwinboot --build-stamp "$STAMP_LINE" ${MKADT_EXTRA:-}   # laurel 2016: Gold 0x100 is the boot CPU after the PSCI hand-off
   "$OUT/venv/bin/python3" "$REPO/scripts/laurel/mkdarwinboot.py" "$KERNEL" "$W/laurel.adt" "$W/payload.img" \
     --cmdline "$CMDLINE" --size-mib "$SIZE_MIB" --timeout "$([ "$BOOT_MENU" = 1 ] && echo 5 || echo 3)" --entry-title "$ENTRY_TITLE" $([ "$BOOT_MENU" = 1 ] && echo --android-entry)
   printf '%s\n' "$CMDLINE" > "$W/cmdline.txt"
@@ -106,27 +120,26 @@ unpack_bootimg --boot_img "$STOCK" --out "$W/stockboot" > "$W/stockboot.txt"
 [ -s "$W/stockboot/dtb" ] || { echo "uefi-image: no DTB in $STOCK" >&2; exit 1; }
 mk() { mkbootimg --header_version 2 --kernel "$W/kernel.gz" --ramdisk "$rd" --dtb "$W/stockboot/dtb" \
   --pagesize 4096 --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 --tags_offset 0x100 \
-  --dtb_offset 0x1f00000 --os_version 11.0.0 --os_patch_level 2022-08 --cmdline "$1" \
+  --dtb_offset 0x1f00000 --os_version "${OS_VERSION:-11.0.0}" --os_patch_level "${OS_PATCH:-2022-08}" --cmdline "$1" \
   -o "$IMG"; }
 mk "console=null"
-# what the Android app checks before it switches (tools/laurel-switcher/assets/to-ios.sh): this image is whole and ours, and which dtbo_b it needs. Neither ABL nor Mu reads these
-# words. The hash covers everything after the header page, which does not depend on the command line. [V] 16384 pages = boot_b.
+# what the Android app checks before it switches (tools/laurel-switcher/assets/to-ios.sh): this image is whole and ours, its mode, the dtbo_b it needs, the root it belongs to. Neither ABL
+# nor Mu reads these words. The hash covers everything after the header page. All that changes between the calls of mk(), and the S1 values, lie in that page. [V] 16384 pages = boot_b.
+# Only an image of `dual-boot.sh image rw` has the root's mark (IOSROOT_HEAD_SHA), and a read-only image has no marks: the app works only after the read-only flow (boot-menu.md section 6).
 if [ "${MU_ONLY:-0}" != 1 ] && [ "$BOOT_MENU" = 1 ]; then
   pages=$(( ($(wc -c < "$IMG") - 4096) / 4096 ))
   [ "$pages" -lt 16384 ] || { echo "uefi-image: FAILED: image is $pages pages + header; boot_b holds 16384 pages in all" >&2; exit 1; }
   img_sha=$(tail -c +4097 "$IMG" | { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; } | cut -d' ' -f1)
-  if [ -f "$STOCK_DTBO" ]; then
-    mk "console=null laurel_ios_image=$pages:$img_sha laurel_ios_dtbo=$(wc -c < "$STOCK_DTBO" | tr -d ' '):$(file_sha "$STOCK_DTBO")"
-  else
-    echo "uefi-image: note: no $STOCK_DTBO: the Android app refuses this image"
-    mk "console=null laurel_ios_image=$pages:$img_sha"
-  fi
+  marks="console=null laurel_ios_mode=${IMG_MODE:-none} laurel_ios_image=$pages:$img_sha"
+  if [ -f "$STOCK_DTBO" ]; then marks="$marks laurel_ios_dtbo=$(wc -c < "$STOCK_DTBO" | tr -d ' '):$(file_sha "$STOCK_DTBO")"; else echo "uefi-image: note: no $STOCK_DTBO: the Android app refuses this image"; fi
+  if [ -n "${IOSROOT_HEAD_SHA:-}" ]; then marks="$marks laurel_ios_root=1048576:$IOSROOT_HEAD_SHA"; else echo "uefi-image: note: no IOSROOT_HEAD_SHA (dual-boot.sh image rw sets it): the Android app refuses this image"; fi
+  mk "$marks"
 fi
 ls -l "$IMG" "$W/kernel.gz" "$rd"
 if [ "${MU_ONLY:-0}" != 1 ]; then
   python3 -I "$BS" image-seal "$IMG" "$STAMP_LINE" "$KERNEL" "$FD" "$CMDLINE"
   # the sidecar android-guard.sh boot-image asks for
-  [ -z "${ADT_TABLE:-}" ] || printf 'image %s\ntable %s\n' "$(file_sha "$IMG")" "$(file_sha "$ADT_TABLE")" > "$IMG.dualboot"
+  [ -z "${DUALBOOT:-}" ] || printf 'image %s\nmode %s\nmarker %s\nos %s %s\n' "$(file_sha "$IMG")" "$IMG_MODE" "$ldb_marker" "$OS_VERSION" "$OS_PATCH" > "$IMG.dualboot"
   echo "uefi-image: boot line: LAUREL BUILD: image $STAMP_LINE"
 fi
 echo "uefi-image: $IMG (FD $fdlen bytes$([ "${MU_ONLY:-0}" = 1 ] && echo ', Mu alone' || echo ", kernel $(basename "$KERNEL"), cpus=$CPUS, dram $DRAM, boot CPU Gold 0x100 after the PSCI hand-off (patch 2016)"))"

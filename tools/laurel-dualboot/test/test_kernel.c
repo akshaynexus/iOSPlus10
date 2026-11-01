@@ -1,27 +1,21 @@
 /*
- * Host test of the dual boot in the real driver: the patched bsd/dev/sweet_ufs.c is #included, its ufs_scsi is replaced by a RAM disk. Each case boots
- * sweet_ufs_init on a disk image with a GPT, an f2fs-like userdata and a fragmented area. What is proven: the mapping, the fence, the self-checks, and in every
- * failure: not one block of the disk changed. Not proven: anything about the phone.
+ * Host test of the dual boot in the real driver: the patched bsd/dev/sweet_ufs.c is #included, its ufs_scsi is replaced by a RAM disk. Each case runs sweet_ufs_init on a disk
+ * image with a GPT in the layout of the plan. What is proven: 0 blocks outside iosroot change under random I/O and the log thread; the fence; each unexpected GPT gives off, no
+ * write, a restart. Not proven: anything about the phone.
  */
 #include "fake_xnu.h"
 
 /* ---- RAM disk behind a fake SCSI layer ---- */
 #define DISK_BLOCKS  260000u
-#define PART_FIRST   0x1000u
-#define PART_BLOCKS  200000u
 #define GPT_ALT      (DISK_BLOCKS - 1)
+#define LAST_USABLE  (DISK_BLOCKS - 6)
+#define IOS_FIRST    128000u                 /* 250 x 2 MiB */
+#define IOS_BLOCKS   (LAST_USABLE - IOS_FIRST + 1)
 static uint8_t *disk;
 static uint64_t writes, sync_count;
 static int fake_scsi(const uint8_t *cdb, uint8_t lun, uint32_t len, bool write, uint8_t *bounce);
 
 #include "sweet_ufs_host.c"
-/* compiled also against the old header (scripts/laurel/dualboot-tests-detect.sh): only names both have, and this */
-#ifndef LDB_HDR_VERSION
-#define LDB_HDR_VERSION LDB_VERSION
-#endif
-#define LEGACY_FRESH 1u                 /* the state of header version 1 that passed with no compare */
-#define STATE_OFF 3u
-
 /* The driver calls this one: test-dualboot.sh renames the real ufs_scsi to ufs_scsi_hw and the calls to ufs_scsi_fake. */
 static int
 ufs_scsi_fake(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
@@ -65,8 +59,6 @@ fake_scsi(const uint8_t *cdb, uint8_t lun, uint32_t len, bool write, uint8_t *bo
 }
 
 /* ---- the fake machine ---- */
-static const void *adt_table;
-static unsigned adt_table_size;
 static int arg_ufsrw = 1, arg_dualboot = -1;
 static int restarts;
 static jmp_buf log_out;
@@ -82,11 +74,6 @@ SecureDTGetProperty(DTEntry e, const char *name, void const **v, unsigned int *s
 	if (strcmp((const char *)e, "/sweet-ufs") == 0 && strcmp(name, "reg") == 0) {
 		*v = ufs_reg;
 		*sz = sizeof(ufs_reg);
-		return 0;
-	}
-	if (strcmp((const char *)e, "/chosen") == 0 && strcmp(name, "laurel-dualboot") == 0 && adt_table != NULL) {
-		*v = adt_table;
-		*sz = adt_table_size;
 		return 0;
 	}
 	return 1;
@@ -185,102 +172,111 @@ wr_be32(uint8_t *p, uint32_t v)
 {
 	p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
 }
-
-/* A fragmented area, like a pinned allocation with neighbours: not sorted by partition block, some splits not 2 MiB aligned for the tests. */
-static const struct ldb_extent EXT[] = {
-	{ 0,      70000,  512 },
-	{ 512,    40000,  3584 },
-	{ 4096,   2048,   1 },                  /* a one-block extent */
-	{ 4097,   90000,  7903 },
-	{ 12000,  30000,  2 },
-	{ 12002,  120000, 12000 },
-};
-#define EXT_N (sizeof(EXT) / sizeof(EXT[0]))
-#define AREA_BLOCKS 24002u
-static uint64_t table_mem[(sizeof(struct ldb_table) + EXT_N * sizeof(struct ldb_extent)) / 8 + 1];
-static struct ldb_table *TB;
-static const uint64_t FP[3] = { 0, 512, 1024 };
-
 static void
-hash_table(void)
+wr64(uint8_t *p, uint64_t v)
 {
-	TB->hash = 0;
-	TB->hash = ldb_table_hash(table_mem, sizeof(*TB) + TB->count * sizeof(struct ldb_extent));
+	memcpy(p, &v, 8);
 }
 static void
-make_table(void)
+wr32(uint8_t *p, uint32_t v)
 {
-	TB = (struct ldb_table *)table_mem;
-	memset(table_mem, 0, sizeof(table_mem));
-	memcpy(TB->magic, LDB_TABLE_MAGIC, 8);
-	TB->version = LDB_VERSION;
-	TB->block_size = LDB_BLOCK;
-	TB->count = EXT_N;
-	TB->reserved_blocks = LDB_RESERVED_BLOCKS;
-	TB->part_first = PART_FIRST;
-	TB->part_blocks = PART_BLOCKS;
-	TB->area_blocks = AREA_BLOCKS;
-	TB->table_id = 0x1234567890abcdefull;
-	memcpy((void *)(TB + 1), EXT, sizeof(EXT));
-	hash_table();
+	memcpy(p, &v, 4);
+}
+static uint8_t *
+ent(unsigned i)
+{
+	return disk + 2 * 4096 + i * 128;
+}
+static uint8_t *
+bent(unsigned i)
+{
+	return disk + (DISK_BLOCKS - 5) * 4096 + i * 128;
+}
+static uint8_t *
+hdr(void)
+{
+	return disk + 4096;
+}
+static uint8_t *
+bhdr(void)
+{
+	return disk + GPT_ALT * 4096;
+}
+static void
+set_name(uint8_t *e, const char *n)
+{
+	memset(e + 56, 0, 72);
+	for (unsigned i = 0; n[i]; i++) {
+		e[56 + 2 * i] = (uint8_t)n[i];
+	}
+}
+static void
+set_ent(unsigned i, const char *n, uint64_t a, uint64_t b)
+{
+	uint8_t *e = ent(i);
+	memset(e, 0, 128);
+	memset(e, (int)i + 1, 32);
+	set_name(e, n);
+	wr64(e + 32, a);
+	wr64(e + 40, b);
+}
+/* the backup entries become a copy of the primary ones; both CRCs and both header CRCs right */
+static void
+seal_gpt(void)
+{
+	memcpy(bent(0), ent(0), 32 * 128);
+	uint32_t c = ldb_crc32(ent(0), 32 * 128, 0xffffffffu);
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t *h = i ? bhdr() : hdr();
+		wr32(h + 88, c);
+		wr32(h + 16, 0);
+		wr32(h + 16, ldb_crc32(h, 92, 16));
+	}
 }
 static void
 gpt(void)
 {
-	uint8_t *h = disk + 4096;
-	memcpy(h, "EFI PART", 8);
-	uint64_t alt = GPT_ALT, ent = 2;
-	uint32_t nent = 8, esz = 128;
-	memcpy(h + 32, &alt, 8);
-	memcpy(h + 72, &ent, 8);
-	memcpy(h + 80, &nent, 4);
-	memcpy(h + 84, &esz, 4);
-	uint8_t *e = disk + 2 * 4096;
-	memset(e, 0, 8 * 128);
-	const char *name = "userdata";
-	for (unsigned i = 0; name[i]; i++) {
-		e[56 + 2 * i] = (uint8_t)name[i];
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t *h = i ? bhdr() : hdr();
+		memset(h, 0, 4096);
+		memcpy(h, "EFI PART", 8);
+		wr32(h + 8, 0x10000);
+		wr32(h + 12, 92);
+		wr64(h + 24, i ? GPT_ALT : 1);
+		wr64(h + 32, i ? 1 : GPT_ALT);
+		wr64(h + 40, 6);
+		wr64(h + 48, LAST_USABLE);
+		memset(h + 56, 9, 16);
+		wr64(h + 72, i ? DISK_BLOCKS - 5 : 2);
+		wr32(h + 80, 32);
+		wr32(h + 84, 128);
 	}
-	uint64_t first = PART_FIRST, last = PART_FIRST + PART_BLOCKS - 1;
-	memcpy(e + 32, &first, 8);
-	memcpy(e + 40, &last, 8);
-	memcpy(disk + GPT_ALT * 4096, "EFI PART", 8);
+	memset(ent(0), 0, 4 * 4096);
+	memset(bent(0), 0, 4 * 4096);
+	uint64_t a = 6;
+	char n[8];
+	for (unsigned i = 0; i < 13; i++) {
+		snprintf(n, sizeof(n), "p%u", i);
+		set_ent(i, n, a, a + 99);
+		a += 100;
+	}
+	set_ent(13, "metadata", a, a + 99);
+	set_ent(14, "userdata", a + 100, IOS_FIRST - 1);
+	set_ent(15, LDB_ROOT_NAME, IOS_FIRST, LAST_USABLE);
+	seal_gpt();
 }
-/* The state of the phone after an install and a seal. */
 static void
-fresh_disk(uint32_t hfs_blocks, unsigned state)
+fresh_disk(uint32_t hfs_blocks)
 {
 	for (uint64_t i = 0; i < DISK_BLOCKS * 4096ull / 8; i++) {
 		((uint64_t *)disk)[i] = i * 0x9e3779b97f4a7c15ull;      /* "Android's ciphertext": nothing is zero */
 	}
 	gpt();
-	make_table();
-	uint64_t lba;
-	uint32_t run;
-	CHECK(ldb_map(TB, LDB_RESERVED_BLOCKS, 1, &lba, &run) == 0, "map root");
-	uint8_t *v = disk + lba * 4096 + 1024;
+	uint8_t *v = disk + IOS_FIRST * 4096ull + 1024;
 	memset(v, 0, 512);
 	v[0] = 'H'; v[1] = 'X'; v[3] = 5;
 	wr_be32(v + 40, 4096);
 	wr_be32(v + 44, hfs_blocks);
-	struct ldb_header h;
-	memset(&h, 0, sizeof(h));
-	memcpy(h.magic, LDB_HDR_MAGIC, 8);
-	h.version = LDB_HDR_VERSION;
-	h.state = state;
-	h.table_id = TB->table_id;
-	h.table_hash = TB->hash;
-	h.area_blocks = AREA_BLOCKS;
-	h.seal_generation = 1;
-	memcpy(h.fp_part_block, FP, sizeof(FP));
-	/* as ldbhelper seal: the raw blocks, on a frozen /data */
-	for (unsigned i = 0; i < LDB_FP_BLOCKS; i++) {
-		h.fp_hash[i] = ldb_hash_add(LDB_HASH_INIT, disk + (PART_FIRST + FP[i]) * 4096, 4096);
-	}
-	h.hash = ldb_header_hash(&h);
-	CHECK(ldb_map(TB, 0, 1, &lba, &run) == 0, "map header");
-	memset(disk + lba * 4096, 0, 4096);
-	memcpy(disk + lba * 4096, &h, sizeof(h));
 }
 static void
 reset_driver(void)
@@ -294,13 +290,15 @@ reset_driver(void)
 	restarts = 0;
 	arg_ufsrw = 1;
 	arg_dualboot = -1;
-	adt_table = table_mem;
-	adt_table_size = sizeof(*TB) + TB->count * sizeof(struct ldb_extent);
 }
 static uint64_t
 disk_hash(void)
 {
-	return ldb_hash_add(LDB_HASH_INIT, disk, DISK_BLOCKS * 4096ull);
+	uint64_t h = 0xcbf29ce484222325ull;
+	for (uint64_t i = 0; i < DISK_BLOCKS * 4096ull / 8; i++) {
+		h = (h ^ ((uint64_t *)disk)[i]) * 0x100000001b3ull;
+	}
+	return h;
 }
 
 /* Each way the self-check must say no: reason line, error, no write, disk identical, restart asked, nothing registered. */
@@ -313,132 +311,53 @@ expect_off(const char *name, const char *reason_part)
 	CHECK(e != 0, "%s: rootdev gave a root", name);
 	CHECK(writes == 0, "%s: %llu blocks written", name, (unsigned long long)writes);
 	CHECK(before == disk_hash(), "%s: the disk changed", name);
-	CHECK(!su.ready && !su.writable, "%s: driver ready or writable", name);
+	CHECK(!su.ready && !su.writable && !ldb.on, "%s: driver ready or writable", name);
 	CHECK(laurel_dualboot_on == 0, "%s: sysctl says on", name);
 	CHECK(restarts == 1, "%s: %d restarts", name, restarts);
 	CHECK(ldb.why != NULL && strstr(ldb.why, reason_part) != NULL, "%s: reason '%s'", name, ldb.why ? ldb.why : "(none)");
-	/* the fence is shut also for a direct call: a stray writer gets nothing */
+	/* the fence is shut also for a direct call: a stray writer gets nothing, in userdata or in iosroot */
 	su.writable = true;
+	su.first_block = IOS_FIRST;
+	su.nblocks = IOS_BLOCKS;
+	ldb.first = IOS_FIRST;                  /* not on: also stale numbers open nothing */
+	ldb.blocks = IOS_BLOCKS;
 	memset((void *)(su.dma + DMA_BOUNCE), 0xee, 4096);
-	CHECK(ufs_write_blocks(PART_FIRST + 70000, 1) == EPERM, "%s: fence open", name);
+	CHECK(ufs_write_blocks(IOS_FIRST + 100, 1) == EPERM, "%s: fence open", name);
+	CHECK(ufs_write_blocks(IOS_FIRST - 100, 1) == EPERM, "%s: fence open for userdata", name);
 	su.writable = false;
 	CHECK(before == disk_hash(), "%s: stray write", name);
 	printf("ok   %s\n", name);
 }
 
 static void
-test_table_rules(void)
-{
-	make_table();
-	uint64_t len = sizeof(*TB) + TB->count * sizeof(struct ldb_extent);
-	CHECK(ldb_table_check(table_mem, len) == NULL, "good table: %s", ldb_table_check(table_mem, len));
-	CHECK(ldb_table_check(table_mem, len - 1) != NULL, "short");
-	CHECK(ldb_table_check(NULL, len) != NULL, "null");
-	/* every byte matters */
-	for (uint64_t i = 0; i < len; i++) {
-		((uint8_t *)table_mem)[i] ^= 0x10;
-		CHECK(ldb_table_check(table_mem, len) != NULL, "byte %llu flipped", (unsigned long long)i);
-		((uint8_t *)table_mem)[i] ^= 0x10;
-	}
-	struct ldb_extent *e = (struct ldb_extent *)(TB + 1);
-#define BAD(setup, want) do { make_table(); e = (struct ldb_extent *)(TB + 1); setup; hash_table(); \
-	    const char *w = ldb_table_check(table_mem, len); CHECK(w != NULL && strstr(w, want), "%s -> %s", #setup, w ? w : "accepted"); } while (0)
-	BAD(e[1].part_block = 70100, "overlap");
-	BAD(e[3].part_block = 39000, "overlap");
-	BAD(e[5].part_block = PART_BLOCKS - 100, "outside");
-	BAD(e[5].part_block = PART_BLOCKS, "outside");
-	BAD(e[2].part_block = 100, "outside");
-	BAD(e[1].part_block = (uint64_t)-1 - 10, "outside");
-	BAD(e[1].blocks = 0, "contiguous");
-	BAD(e[2].area_block = 4097, "contiguous");
-	BAD(e[5].blocks = 11999, "shorter");
-	BAD(e[5].blocks = 12001, "longer");
-	BAD(TB->area_blocks = PART_BLOCKS + 1, "area size");
-	BAD(TB->area_blocks = LDB_RESERVED_BLOCKS, "area size");
-	BAD(TB->part_first = 0, "partition");
-	BAD(TB->reserved_blocks = 0, "reserved");
-	BAD(TB->block_size = 512, "block size");
-	BAD(TB->version = 2, "version");
-	BAD(TB->magic[0] = 'X', "magic");
-	make_table();
-	/* mapping and fence, every block of the area against the plain table */
-	for (uint64_t ab = 0; ab < AREA_BLOCKS; ab++) {
-		uint64_t lba = 0, want = 0;
-		uint32_t run = 0, left = 0;
-		for (unsigned i = 0; i < EXT_N; i++) {
-			if (ab >= EXT[i].area_block && ab < EXT[i].area_block + EXT[i].blocks) {
-				want = PART_FIRST + EXT[i].part_block + (ab - EXT[i].area_block);
-				left = (uint32_t)(EXT[i].blocks - (ab - EXT[i].area_block));
-			}
-		}
-		int r = ldb_map(TB, ab, 0xffffffffu, &lba, &run);
-		if (r != 0 || lba != want || run != left || !ldb_lba_allowed(TB, lba, run) || ldb_lba_allowed(TB, lba, run + 1)) {
-			CHECK(0, "area block %llu", (unsigned long long)ab);
-		}
-	}
-	passes++;
-	uint64_t lba;
-	uint32_t run;
-	CHECK(ldb_map(TB, AREA_BLOCKS, 1, &lba, &run) != 0, "past the end");
-	CHECK(ldb_map(TB, 0, 0, &lba, &run) != 0, "zero blocks");
-	CHECK(!ldb_lba_allowed(TB, PART_FIRST + 70000 - 1, 1), "before an extent");
-	CHECK(!ldb_lba_allowed(TB, PART_FIRST + 70000 + 512, 1), "after an extent");
-	CHECK(!ldb_lba_allowed(TB, PART_FIRST + 70000 - 1, 2), "half before");
-	CHECK(!ldb_lba_allowed(TB, PART_FIRST + 70000 + 511, 2), "half after");
-	CHECK(!ldb_lba_allowed(TB, 0, 1), "LBA 0");
-	CHECK(!ldb_lba_allowed(TB, PART_FIRST - 1, 1), "before userdata");
-	CHECK(!ldb_lba_allowed(TB, PART_FIRST + PART_BLOCKS, 1), "after userdata");
-	CHECK(!ldb_lba_allowed(TB, (uint64_t)-2, 8), "wrap");
-	CHECK(!ldb_lba_allowed(TB, PART_FIRST + 70000, 0), "zero");
-	printf("ok   table rules, map and fence on every area block\n");
-}
-
-static void
 test_on(void)
 {
-	/* volume: all that fits */
-	uint32_t hfs = AREA_BLOCKS - LDB_RESERVED_BLOCKS - SWEET_LOG_BLOCKS;
-	fresh_disk(hfs, LDB_STATE_BOUND);
+	uint32_t hfs = IOS_BLOCKS - SWEET_LOG_BLOCKS;       /* volume: all that fits */
+	fresh_disk(hfs);
 	reset_driver();
-	uint8_t *shadow = calloc(1, (AREA_BLOCKS - LDB_RESERVED_BLOCKS) * 4096ull);
+	uint8_t *shadow = malloc(IOS_BLOCKS * 4096ull);
 	uint8_t *before = malloc(DISK_BLOCKS * 4096ull);
 	memcpy(before, disk, DISK_BLOCKS * 4096ull);
+	memcpy(shadow, disk + IOS_FIRST * 4096ull, IOS_BLOCKS * 4096ull);
 	dev_t dev = 0;
-	CHECK(sweet_ufs_rootdev(&dev) == 0, "first boot: no root: %s", ldb.why ? ldb.why : "");
+	CHECK(sweet_ufs_rootdev(&dev) == 0, "boot: no root: %s", ldb.why ? ldb.why : "");
 	if (!ldb.on) {
 		return;
 	}
-	CHECK(su.ready && su.writable && ldb.on && laurel_dualboot_on == 1, "first boot state");
-	CHECK(su.nblocks == AREA_BLOCKS - LDB_RESERVED_BLOCKS, "BSD disk size");
-	CHECK(restarts == 0, "restart");
-	/* no write at boot: the kernel only reads the header */
-	struct ldb_header h;
-	uint64_t hdr_lba;
-	uint32_t run;
-	ldb_map(TB, 0, 1, &hdr_lba, &run);
-	memcpy(&h, disk + hdr_lba * 4096, sizeof(h));
-	CHECK(h.state == LDB_STATE_BOUND && ldb_header_check(&h, TB) == NULL, "header");
-	CHECK(writes == 0, "the boot wrote %llu blocks", (unsigned long long)writes);
-	/* shadow = what the BSD disk must read */
-	for (uint64_t b = 0; b < AREA_BLOCKS - LDB_RESERVED_BLOCKS; b++) {
-		uint64_t lba;
-		ldb_map(TB, b + LDB_RESERVED_BLOCKS, 1, &lba, &run);
-		memcpy(shadow + b * 4096, disk + lba * 4096, 4096);
-	}
-	/* random I/O through the real strategy: 512-byte units, any size, across extents and past the end */
+	CHECK(su.ready && su.writable && laurel_dualboot_on == 1 && su.lun == 0, "boot state");
+	CHECK(su.first_block == IOS_FIRST && su.nblocks == IOS_BLOCKS && ldb.first == IOS_FIRST && ldb.blocks == IOS_BLOCKS, "the root is iosroot");
+	CHECK(restarts == 0 && writes == 0, "a boot wrote %llu blocks", (unsigned long long)writes);
+	/* random I/O through the real strategy: 512-byte units, any size, near both ends often, and past the end */
 	uint32_t ios = 0, rejected = 0;
 	char *data = malloc(4u << 20), *back = malloc(4u << 20);
+	uint64_t total_secs = su.nblocks * 8;
 	for (int i = 0; i < 40000; i++) {
 		uint32_t secs = (rnd() % 8 == 0) ? (uint32_t)(rnd() % 8192 + 1) : (uint32_t)(rnd() % 64 + 1);
-		uint64_t total_secs = su.nblocks * 8;
-		/* near the extent ends more often: those are the hard cases */
-		uint64_t at;
-		if (rnd() % 2) {
-			const struct ldb_extent *x = &EXT[rnd() % EXT_N];
-			int64_t c = (int64_t)(x->area_block + x->blocks) - LDB_RESERVED_BLOCKS;
-			at = (uint64_t)(c < 1 ? 0 : c * 8 - (int64_t)(rnd() % 32));
-		} else {
-			at = rnd() % total_secs;
+		uint64_t at = rnd() % total_secs;
+		if (rnd() % 8 == 0) {
+			at = rnd() % 64;
+		} else if (rnd() % 8 == 0) {
+			at = total_secs - 1 - rnd() % 64;
 		}
 		bool wr = rnd() % 2;
 		struct fake_buf b = { .blkno = (int64_t)at, .count = secs * 512, .flags = wr ? B_WRITE : B_READ, .data = wr ? data : back };
@@ -451,9 +370,7 @@ test_on(void)
 		sweet_ufs_strategy(&b);
 		CHECK(b.done == 1, "biodone");
 		if (at + secs > total_secs) {
-			if (b.error != EINVAL) {
-				CHECK(0, "I/O past the end: error %d", b.error);
-			}
+			CHECK(b.error == EINVAL, "I/O past the end: error %d", b.error);
 			rejected++;
 			continue;
 		}
@@ -468,11 +385,16 @@ test_on(void)
 		}
 		ios++;
 	}
-	/* the console log: real thread body, several flushes, with wrap */
-	for (int round = 0; round < 3; round++) {
-		char line[4096];
-		memset(line, 'a' + round, sizeof(line));
-		for (int k = 0; k < 1500; k++) {
+	CHECK(memcmp(disk + IOS_FIRST * 4096ull, shadow, IOS_BLOCKS * 4096ull) == 0, "iosroot does not hold what was written");
+	/* the log thread, for real: it writes only the last 1025 blocks of iosroot */
+	char line[256];
+	memset(line, 'L', sizeof(line));
+	uint8_t *logb = malloc(SWEET_LOG_BLOCKS * 4096ull);
+	memcpy(logb, disk + (IOS_FIRST + IOS_BLOCKS - SWEET_LOG_BLOCKS) * 4096ull, SWEET_LOG_BLOCKS * 4096ull);
+	uint8_t *rest = malloc((IOS_BLOCKS - SWEET_LOG_BLOCKS) * 4096ull);
+	memcpy(rest, disk + IOS_FIRST * 4096ull, (IOS_BLOCKS - SWEET_LOG_BLOCKS) * 4096ull);
+	for (int k = 0; k < 3; k++) {
+		for (int j = 0; j < 64; j++) {
 			sweet_log_append(line, sizeof(line));
 		}
 		log_rounds = 2;
@@ -480,74 +402,41 @@ test_on(void)
 			sweet_log_thread(NULL, 0);
 		}
 	}
-	/* the outcome that matters: outside the table not one byte changed; inside it all is as the shadow says */
-	uint8_t *mask = calloc(DISK_BLOCKS, 1);
-	for (unsigned i = 0; i < EXT_N; i++) {
-		memset(mask + PART_FIRST + EXT[i].part_block, 1, EXT[i].blocks);
-	}
-	uint64_t changed_outside = 0;
+	CHECK(memcmp(disk + (IOS_FIRST + IOS_BLOCKS - SWEET_LOG_BLOCKS) * 4096ull, "SWEETLOG", 8) == 0, "no log header at the end of iosroot");
+	CHECK(memcmp(disk + IOS_FIRST * 4096ull, rest, (IOS_BLOCKS - SWEET_LOG_BLOCKS) * 4096ull) == 0, "the log thread wrote outside its last 1025 blocks");
+	/* outside iosroot: every block as before */
+	uint64_t outside = 0;
 	for (uint64_t b = 0; b < DISK_BLOCKS; b++) {
-		if (!mask[b] && memcmp(disk + b * 4096, before + b * 4096, 4096) != 0) {
-			changed_outside++;
+		if ((b < IOS_FIRST || b > LAST_USABLE) && memcmp(disk + b * 4096, before + b * 4096, 4096) != 0) {
+			outside++;
 		}
 	}
-	CHECK(changed_outside == 0, "%llu blocks outside the table changed", (unsigned long long)changed_outside);
-	/* the log area lies in the last area blocks; the log header carries its magic */
-	uint64_t log_base = su.nblocks - SWEET_LOG_BLOCKS, lba;
-	ldb_map(TB, log_base + LDB_RESERVED_BLOCKS, 1, &lba, &run);
-	CHECK(memcmp(disk + lba * 4096, "SWEETLOG", 8) == 0, "no log header at the end of the area");
-	/* the HFS part reads back identical from the disk */
-	uint64_t wrong = 0;
-	for (uint64_t b = 0; b < log_base; b++) {
-		ldb_map(TB, b + LDB_RESERVED_BLOCKS, 1, &lba, &run);
-		if (memcmp(disk + lba * 4096, shadow + b * 4096, 4096) != 0) {
-			wrong++;
-		}
-	}
-	CHECK(wrong == 0, "%llu blocks of the disk differ from the shadow", (unsigned long long)wrong);
-	printf("ok   on: no write at boot, %u I/Os + %u refused past the end through sweet_ufs_strategy, log thread; 0 blocks outside the table changed\n", ios, rejected);
-
+	CHECK(outside == 0, "%llu blocks outside iosroot changed", (unsigned long long)outside);
+	printf("ok   %u random I/Os + the log thread: 0 blocks outside iosroot changed (%u past the end refused)\n", ios, rejected);
 	/* fence, called directly with every kind of bad address */
-	memset((void *)(su.dma + DMA_BOUNCE), 0xee, 8192);
 	uint64_t h0 = disk_hash();
-	static const struct { uint64_t lba; uint32_t n; const char *what; } bad[] = {
-		{ 0, 1, "LBA 0" }, { 1, 1, "GPT header" }, { 2, 1, "GPT entries" }, { PART_FIRST - 1, 1, "before userdata" },
-		{ PART_FIRST, 1, "f2fs superblock" }, { PART_FIRST + 512, 1, "f2fs checkpoint" },
-		{ PART_FIRST + 70000 - 1, 2, "half before an extent" }, { PART_FIRST + 70000 + 511, 2, "half after an extent" },
-		{ PART_FIRST + PART_BLOCKS - 1, 1, "end of userdata, where the log used to go" }, { PART_FIRST + PART_BLOCKS - 1025, 1, "old log block" },
-		{ GPT_ALT, 1, "backup GPT" }, { 1ull << 40, 1, "far away" },
+	const struct { uint64_t lba; uint32_t n; const char *what; } bad[] = {
+		{ 0, 1, "MBR" }, { 1, 1, "primary GPT header" }, { 2, 1, "primary entries" }, { GPT_ALT, 1, "backup header" }, { DISK_BLOCKS - 5, 1, "backup entries" },
+		{ IOS_FIRST - 1, 1, "last block of userdata" }, { IOS_FIRST - 1, 2, "from userdata into iosroot" }, { 2000, 1, "inside userdata" },
+		{ 5, 1, "p0" }, { LAST_USABLE, 2, "past the last usable block" }, { LAST_USABLE + 1, 1, "behind iosroot" }, { IOS_FIRST, 0, "zero blocks" },
+		{ IOS_FIRST, 257, "more than the bounce buffer" }, { 0xffffffffffffff00ull, 512, "wrap" }, { UINT32_MAX + 1ull, 1, "over 32 bits" },
 	};
-	for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
 		CHECK(ufs_write_blocks(bad[i].lba, bad[i].n) == EPERM, "fence let through: %s", bad[i].what);
 	}
-	/* good address, wrong LUN */
 	su.lun = 1;
-	CHECK(ufs_write_blocks(PART_FIRST + 70000, 1) == EPERM, "fence on LUN 1");
+	CHECK(ufs_write_blocks(IOS_FIRST + 7, 1) == EPERM, "fence on LUN 1");
 	su.lun = 0;
 	CHECK(disk_hash() == h0, "fence: the disk changed");
-	/* the same blocks inside an extent pass */
-	CHECK(ufs_write_blocks(PART_FIRST + 70000 + 511, 1) == 0, "good block refused");
-	printf("ok   fence: %zu bad addresses refused directly, wrong LUN refused, a good block passes\n", sizeof(bad) / sizeof(bad[0]));
-
-	/* second boot: BOUND, nothing changed: on, no bind, no write */
-	memcpy(&h, disk + hdr_lba * 4096, sizeof(h));
-	reset_driver();
-	CHECK(sweet_ufs_rootdev(&dev) == 0, "second boot: %s", ldb.why ? ldb.why : "");
-	CHECK(ldb.on && writes == 0, "second boot wrote %llu", (unsigned long long)writes);
-	printf("ok   second boot: on, no write\n");
-
-	/* Android ran: its checkpoint changed. Each of the three blocks. */
-	for (unsigned i = 0; i < 3; i++) {
-		uint64_t b = (PART_FIRST + FP[i]) * 4096 + 77;
-		disk[b] ^= 1;
-		reset_driver();
-		char name[64];
-		snprintf(name, sizeof(name), "fingerprint block %u changed", i);
-		expect_off(name, "Android ran");
-		disk[b] ^= 1;
-	}
-	/* read-only boot: no write at all */
-	fresh_disk(hfs, LDB_STATE_BOUND);
+	/* a stale su must not open the fence: it compares with what the self-check found */
+	uint64_t keep = su.first_block, keepn = su.nblocks;
+	su.first_block = 100; su.nblocks = IOS_FIRST;
+	CHECK(ufs_write_blocks(2000, 1) == EPERM, "fence trusted a changed su");
+	su.first_block = keep; su.nblocks = keepn;
+	CHECK(ufs_write_blocks(IOS_FIRST + 7, 1) == 0, "good block refused");
+	printf("ok   fence: %zu bad addresses refused directly, wrong LUN refused, a changed su refused, a good block passes\n", sizeof(bad) / sizeof(bad[0]));
+	/* read-only boot: no write at all, the line says so */
+	fresh_disk(hfs);
 	reset_driver();
 	arg_ufsrw = 0;
 	uint64_t d0 = disk_hash();
@@ -555,117 +444,46 @@ test_on(void)
 	struct fake_buf b = { .blkno = 0, .count = 4096, .flags = B_WRITE, .data = data };
 	sweet_ufs_strategy(&b);
 	CHECK(b.error == EROFS && disk_hash() == d0, "write in a read-only boot");
+	CHECK(ufs_write_blocks(IOS_FIRST + 7, 1) == EPERM && disk_hash() == d0, "fence in a read-only boot");
 	printf("ok   ufsrw=0: on, read-only, no write\n");
-	free(shadow); free(before); free(mask); free(data); free(back);
+	free(shadow); free(before); free(data); free(back); free(logb); free(rest);
 }
 
 static void
 test_off(void)
 {
 	uint32_t hfs = 4096;
-#define CASE(name, setup, reason) do { fresh_disk(hfs, LDB_STATE_BOUND); reset_driver(); setup; if (adt_table == table_mem && TB->hash != 0) { adt_table_size = sizeof(*TB) + TB->count * sizeof(struct ldb_extent); } expect_off(name, reason); } while (0)
-	uint64_t lba;
-	uint32_t run;
+#define CASE(name, setup, reason) do { fresh_disk(hfs); reset_driver(); setup; expect_off(name, reason); } while (0)
 	CASE("kill switch laureldualboot=0", arg_dualboot = 0, "laureldualboot=0");
-	CASE("table damaged", ((uint8_t *)table_mem)[100] ^= 1, "hash");
-	CASE("table with an extent less", TB->count = 5; hash_table(), "shorter");
-	CASE("table of another partition first", TB->part_first = PART_FIRST + 8; hash_table(), "GPT");
-	CASE("table of another partition size", TB->part_blocks = PART_BLOCKS - 8; hash_table(), "GPT");
-	ldb_map(TB, 0, 1, &lba, &run);
-	CASE("no header: file never installed", memset(disk + lba * 4096, 0, 4096), "no header");
-	CASE("header damaged", disk[lba * 4096 + 40] ^= 1, "damaged");
-	CASE("header of another table (file allocated again, old boot image)", TB->table_id ^= 1; hash_table(), "another table");
-	CASE("header not sealed", { struct ldb_header h; memcpy(&h, disk + lba * 4096, sizeof(h)); h.state = 7; h.hash = ldb_header_hash(&h); memcpy(disk + lba * 4096, &h, sizeof(h)); }, "not sealed");
-	CASE("fingerprint block inside the area", { struct ldb_header h; memcpy(&h, disk + lba * 4096, sizeof(h)); h.fp_part_block[1] = 70000; h.hash = ldb_header_hash(&h); memcpy(disk + lba * 4096, &h, sizeof(h)); }, "fingerprint");
-	CASE("fingerprint block outside userdata", { struct ldb_header h; memcpy(&h, disk + lba * 4096, sizeof(h)); h.fp_part_block[2] = PART_BLOCKS; h.hash = ldb_header_hash(&h); memcpy(disk + lba * 4096, &h, sizeof(h)); }, "fingerprint");
-	ldb_map(TB, LDB_RESERVED_BLOCKS, 1, &lba, &run);
-	CASE("no HFS+ in the area", memset(disk + lba * 4096 + 1024, 0x5a, 512), "HFS+");
-	CASE("HFS+ longer than the area", wr_be32(disk + lba * 4096 + 1024 + 44, AREA_BLOCKS), "longer");
-	CASE("HFS+ over the console log", wr_be32(disk + lba * 4096 + 1024 + 44, AREA_BLOCKS - LDB_RESERVED_BLOCKS - SWEET_LOG_BLOCKS + 1), "longer");
-	fresh_disk(hfs, LDB_STATE_BOUND);
-	reset_driver();
-	adt_table_size = 10;
-	expect_off("table property too short", "size out of range");
-	fresh_disk(hfs, LDB_STATE_BOUND);
-	reset_driver();
-	adt_table_size = 200000;
-	expect_off("table property too long", "size out of range");
-	/* a boot image without a table on a phone with Android: the old kernel wrote its log into the last 4 MiB of /data here */
-	fresh_disk(hfs, LDB_STATE_BOUND);
-	reset_driver();
-	adt_table = NULL;
-	expect_off("no table, no HFS+ at the start of userdata (Android)", "no extent table");
-
-	/* single boot still works: no table, HFS+ at the start of the partition; log at the partition end, writes anywhere in the partition, not outside */
-	fresh_disk(hfs, LDB_STATE_BOUND);
-	reset_driver();
-	adt_table = NULL;
-	uint8_t *v = disk + PART_FIRST * 4096ull + 1024;
-	v[0] = 'H'; v[1] = '+'; v[2] = 0; v[3] = 4;
-	wr_be32(v + 40, 4096);
-	wr_be32(v + 44, 1000);
-	dev_t dev = 0;
-	CHECK(sweet_ufs_rootdev(&dev) == 0 && !ldb.present && !ldb.on, "single boot: %s", ldb.why ? ldb.why : "");
-	CHECK(su.first_block == PART_FIRST && su.nblocks == PART_BLOCKS, "single boot geometry");
-	CHECK(ufs_write_blocks(PART_FIRST + PART_BLOCKS - 1, 1) == 0, "single boot: last block");
-	CHECK(ufs_write_blocks(PART_FIRST + PART_BLOCKS, 1) == EPERM, "single boot: past the partition");
-	CHECK(ufs_write_blocks(PART_FIRST - 1, 1) == EPERM, "single boot: before the partition");
-	printf("ok   single boot with HFS+ works as before\n");
-}
-
-/*
- * The property of the design: no header state lets a write through against a filesystem that changed since the seal. All header states x fingerprint blocks: only BOUND with
- * all three blocks as sealed gives a root. Version 1 of this design had FRESH, which passed with no compare: a kernel that passes it fails here.
- */
-static void
-set_header_state(unsigned state, unsigned version)
-{
-	uint64_t lba;
-	uint32_t run;
-	struct ldb_header h;
-	ldb_map(TB, 0, 1, &lba, &run);
-	memcpy(&h, disk + lba * 4096, sizeof(h));
-	h.state = state;
-	h.version = version;
-	h.hash = ldb_header_hash(&h);
-	memcpy(disk + lba * 4096, &h, sizeof(h));
-}
-static void
-test_property(void)
-{
-	static const unsigned states[] = { 0, LEGACY_FRESH, LDB_STATE_BOUND, STATE_OFF, 4, 0xffffffffu };
-	uint32_t hfs = 4096;
-	unsigned n = 0;
-	for (unsigned s = 0; s < sizeof(states) / sizeof(states[0]); s++) {
-		for (int changed = -1; changed < 3; changed++) {
-			fresh_disk(hfs, LDB_STATE_BOUND);
-			set_header_state(states[s], LDB_HDR_VERSION);
-			if (changed >= 0) {
-				/* a format or a checkpoint of Android, after the seal */
-				disk[(PART_FIRST + FP[changed]) * 4096 + 1100] ^= 0x40;
-			}
-			reset_driver();
-			uint64_t before = disk_hash();
-			dev_t dev = 0;
-			int e = sweet_ufs_rootdev(&dev);
-			bool may_go = states[s] == LDB_STATE_BOUND && changed < 0;
-			CHECK(may_go ? (e == 0 && ldb.on && su.writable) : (e != 0 && !ldb.on && !su.writable && restarts == 1),
-			    "state %u, fingerprint block %d changed: root %s (%s)", states[s], changed, e == 0 ? "given" : "refused", ldb.why ? ldb.why : "");
-			CHECK(writes == 0 && before == disk_hash(), "state %u, block %d: the boot wrote %llu blocks", states[s], changed, (unsigned long long)writes);
-			n++;
-		}
-	}
-	/* the old header version, FRESH, with an unchanged and a changed superblock */
-	fresh_disk(hfs, LDB_STATE_BOUND);
-	set_header_state(LEGACY_FRESH, 1);
-	reset_driver();
-	expect_off("header version 1, state FRESH", LDB_HDR_VERSION == 1 ? "not sealed" : "damaged");
-	fresh_disk(hfs, LDB_STATE_BOUND);
-	set_header_state(LEGACY_FRESH, 1);
-	disk[PART_FIRST * 4096ull + 1100] ^= 0x40;
-	reset_driver();
-	expect_off("FRESH with a changed superblock: no root, no write", LDB_HDR_VERSION == 1 ? "not sealed" : "damaged");
-	printf("ok   property: %u pairs of header state and fingerprint: a root only for BOUND with the fingerprint as sealed; no boot wrote a block\n", n);
+	/* the table as it is today, before the plan: a kernel must take no root from it, also with an HFS+ volume in userdata */
+	CASE("no iosroot: the old table", { memset(ent(15), 0, 128); wr64(ent(14) + 40, LAST_USABLE); seal_gpt(); }, "no partition");
+	CASE("the name of the root differs", { set_name(ent(15), "iosroot2"); seal_gpt(); }, "no partition");
+	CASE("entry count 64", { wr32(hdr() + 80, 64); wr32(bhdr() + 80, 64); seal_gpt(); }, "");
+	CASE("entry count 16", { wr32(hdr() + 80, 16); wr32(bhdr() + 80, 16); wr32(hdr() + 16, 0); seal_gpt(); }, "");
+	CASE("a 17th entry", { set_ent(16, "x", LAST_USABLE, LAST_USABLE); seal_gpt(); }, "more entries");
+	CASE("a hole in the slots", { memset(ent(3), 0, 128); seal_gpt(); }, "fewer entries");
+	CASE("iosroot in another slot", { set_ent(14, LDB_ROOT_NAME, 1406, LAST_USABLE); memset(ent(15), 0, 128); seal_gpt(); }, "");
+	CASE("a second iosroot", { set_name(ent(2), LDB_ROOT_NAME); seal_gpt(); }, "");
+	CASE("userdata has another name", { set_name(ent(14), "data"); seal_gpt(); }, "not metadata");
+	CASE("metadata has another name", { set_name(ent(13), "meta"); seal_gpt(); }, "not metadata");
+	CASE("userdata overlaps iosroot", { wr64(ent(14) + 40, IOS_FIRST); seal_gpt(); }, "one after the other");
+	CASE("a gap before iosroot", { wr64(ent(14) + 40, IOS_FIRST - 2); seal_gpt(); }, "one after the other");
+	CASE("iosroot not on 2 MiB", { wr64(ent(14) + 40, IOS_FIRST); wr64(ent(15) + 32, IOS_FIRST + 1); seal_gpt(); }, "2 MiB");
+	CASE("iosroot does not reach the last usable block", { wr64(ent(15) + 40, LAST_USABLE - 1); seal_gpt(); }, "last usable");
+	CASE("iosroot past the last usable block", { wr64(ent(15) + 40, LAST_USABLE + 1); seal_gpt(); }, "one after the other");
+	CASE("iosroot has attributes", { wr64(ent(15) + 48, 1); seal_gpt(); }, "attributes");
+	CASE("primary header CRC", hdr()[16] ^= 1, "CRC");
+	CASE("primary entries CRC", ent(0)[40] ^= 1, "CRC");
+	CASE("backup header CRC", bhdr()[16] ^= 1, "CRC");
+	CASE("backup entries CRC", bent(0)[40] ^= 1, "CRC");
+	CASE("backup header gone", memset(bhdr(), 0, 92), "signature");
+	CASE("the two copies differ", { bent(4)[20] ^= 1; uint32_t c = ldb_crc32(bent(0), 32 * 128, 0xffffffffu); wr32(bhdr() + 88, c); wr32(bhdr() + 16, 0); wr32(bhdr() + 16, ldb_crc32(bhdr(), 92, 16)); }, "differ");
+	CASE("usable range differs", { wr64(bhdr() + 48, LAST_USABLE - 1); wr32(bhdr() + 16, 0); wr32(bhdr() + 16, ldb_crc32(bhdr(), 92, 16)); }, "usable");
+	CASE("no HFS+ volume in iosroot", disk[IOS_FIRST * 4096ull + 1024] = 0, "no HFS+");
+	CASE("the volume takes the log's room", hfs = IOS_BLOCKS - SWEET_LOG_BLOCKS + 1; wr_be32(disk + IOS_FIRST * 4096ull + 1024 + 44, hfs); hfs = 4096, "longer");
+	/* no GPT, and a read failure */
+	CASE("no GPT at all", memset(hdr(), 0, 4096), "no partition");
+#undef CASE
 }
 
 int
@@ -673,10 +491,8 @@ main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	disk = malloc(DISK_BLOCKS * 4096ull);
-	test_table_rules();
 	test_on();
 	test_off();
-	test_property();
 	printf("test_kernel: %d checks passed, %d failed\n", passes, fails);
 	return fails ? 1 : 0;
 }

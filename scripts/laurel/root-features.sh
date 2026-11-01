@@ -23,6 +23,8 @@ feature() {
 feature gpu env GPU="${GPU:-1}" bash "$L/root-add-gpu.sh" "$R"
 # Metal path (docs/laurel_sprout/metal.md): NegroniMetal.bundle (Turnip a610 + metal2vulkan) + probes. After gpu: it checks for the backboardd wrapper
 feature metal env METAL="${METAL:-1}" sh "$L/root-add-metal.sh" "$R"
+# Test option, never the default (docs/laurel_sprout/ios26-metal.md section 6): backboardd on Metal, GL stays the fallback
+if [ "${METAL_BACKBOARDD:-0}" = 1 ]; then feature bbdmetal sh "$L/root-add-bbd-metal.sh" "$R"; fi
 # HEVC/HEIC: software decoder in VideoToolbox's empty HEVCH8 slot (docs/laurel_sprout/hevc.md)
 feature hevc env HEVC="${HEVC:-1}" bash "$L/root-hevc.sh" "$R"
 # speaker audio (kernel patch 2500): RedwoodAudio.driver HAL plug-in, VirtualAudio back, BTAudio off

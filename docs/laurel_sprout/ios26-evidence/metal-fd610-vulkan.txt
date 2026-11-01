@@ -1,0 +1,13 @@
+ apiVersion = 1.3.305 (4206897)
+ deviceName = Turnip Adreno (TM) 610
+ driverID = DRIVER_ID_MESA_TURNIP
+ multiview = true
+ rasterizationOrderColorAttachmentAccess = true
+ rasterizationOrderDepthAttachmentAccess = true
+ rasterizationOrderStencilAttachmentAccess = true
+ samplerFilterMinmax = false
+ shaderFloat16 = true
+ storageBuffer16BitAccess = false
+ storageBuffer8BitAccess = false
+ storageBufferDescriptorSize = 64
+ VK_KHR_multiview : extension revision 1

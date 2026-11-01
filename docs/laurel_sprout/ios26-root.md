@@ -17,7 +17,7 @@ Output (Apple content, never in git): `~/op10-apple/ios26/23F84-n104ap/root/ios2
 | Item | Value |
 |---|---|
 | Area | 32 GiB = 34,359,738,368 bytes (owner decision) |
-| Volume | Area minus 256 header blocks and 1,025 log blocks = **34,354,491,392 bytes** (`laurel_dualboot.h`, `SWEET_LOG_BLOCKS`). The extent table is in the ADT, not the area |
+| Volume | **34,354,491,392 bytes** (`IOS26_VOLUME_BYTES`, `scripts/lib/laurel-layout.sh`). `iosroot` holds it with the console log; margin 401,584,128 bytes (dual-boot.md section 2). The extent table is in the ADT, not the area |
 | Real size on the host | About 18 GB (sparse) |
 | SHA-256 | `3e2eed0a099bc9c8eb08fcda3d94feaac12a09f0ba30c6c8863dde5d52f8bc22`, the same in three full builds (the last one after the air hook went into the spec script, an input of the build). A run with no change stops at "inputs unchanged" |
 | Content | 237,286 files, 2,705 symlinks, 231,112 folders, 17,510 MiB |
@@ -52,7 +52,7 @@ Same inputs, same bytes: the build hashes the spec, the changed files and each l
 - Preferences: key names of iOS 16; each marked [U] where 26 was not read.
 - `activation data ark`: **not-found**. The 23F84 OS volume has no mobileactivationd system container. The kernel path stays; enough on 26: [U].
 
-Not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, metal2vulkan, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils, SSH.
+Not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils, SSH.
 
 ## 4. AirDrop and AirPlay hook
 
@@ -65,6 +65,16 @@ Not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, meta
 Tests [V]: `--self-test` 10 of 10 with a stand-in script (files, owners, a removed job, a failure, a missing script). The real script of `origin/t3/laurel-ios26-airdrop` on the real launchd.plist with `AWDL=0 AIRPLAY=0` gave 3 files, 677 jobs before and after. **With the switches on it was not run:** `out/laurel/awdl` and `out/laurel/airplay` are not built on this host.
 
 After the merge: build those binaries, then `FORCE=1 scripts/laurel/ios26-root.sh`. The image changes, and the proof of section 1 must run again.
+
+## 4.1 Metal hook
+
+`ios26-root-spec.py` function `metal()` runs `scripts/laurel/root-add-metal-ios26.sh STAGE`. Input: `out/ios26/metal/stage` of the same checkout (`METAL_STAGE` selects another). Docs: `ios26-metal.md` section 9.
+
+- The stage has the jetsam plists, so the script edits them. What it leaves goes into the image, owner 0:0, modes as the script set them (`cache`, `strikes` 1777, `stack` 777, `metal.log` 666). The `com.apple.backboardd` preference goes through `merge_pref`, owner mobile.
+- No stage, or a failure: the root is built **with no compositor**, one audit line `off metal26`, and `ios26-root.sh` prints that line at its end. Read it. 23F84 has no GL path, so such a root shows no picture.
+- **The sizes and hash in section 1 are from before this hook. The image changes.** Run `scripts/laurel/ios26-root-again.sh` again for the same-bytes proof.
+
+Test [V]: `--self-test`: `metal hook self-test: 15 of 15` with the real script on the real stage (bytes, owners, modes, clients, preference, no second stack), no backboardd, no stage. The jetsam step alone, on the plist of the last root: `146 extension limits raised`. **The full root with this hook was not built:** the owner rebuilds it.
 
 ## 5. What is not proven
 

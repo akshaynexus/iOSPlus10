@@ -941,6 +941,305 @@ static void telemetry_loop(void)
 	});
 }
 
+#if defined(LAUREL_BBD_METAL) || defined(NMTL_IOS26)
+/*
+ * The compositor on Metal. Compiled in only for two builds, never in the default iOS 16 one:
+ *   -DLAUREL_BBD_METAL=1  the iOS 16 test option (scripts/laurel/ios16-bbd-metal-build.sh): CoreAnimation has a GL fallback (EAGLServer::renderer takes GL when no Metal device comes).
+ *   -DNMTL_IOS26=1        iOS 26 (scripts/laurel/ios26-metal-build.sh): no GL fallback in 23F84 (AccelServer::renderer), so the checks here log and do not exit.
+ * docs/laurel_sprout/ios26-metal.md sections 5 and 6.
+ */
+#ifdef NMTL_IOS26
+#define BBD_TAG "LAUREL METAL26"
+#else
+#define BBD_TAG "LAUREL BBD METAL"
+#endif
+extern "C" IOSurfaceRef native_bridge_metal_copy_screen_surface(void);
+static bool process_is_backboardd(void)
+{
+	return !strcmp(getprogname() ?: "", "backboardd");
+}
+#ifdef LAUREL_BBD_METAL
+#define BBD_FLAG NMTL_DIR "/backboardd-metal"
+#define BBD_OFF  NMTL_DIR "/strikes/backboardd-metal-off"
+#define BBD_BOOTS 3 /* this many boots with a failure: off until the mark is removed */
+/* "<boot session> <boots with a failure>": written here and by the wrapper (userland/laurel/gpu/bbd_wrap.c) */
+static void bbd_mark_off(const char *why)
+{
+	char had[64] = "";
+	int count = 0;
+	if (FILE *f = fopen(BBD_OFF, "r")) {
+		if (fscanf(f, "%63s %d", had, &count) != 2)
+			count = 0;
+		fclose(f);
+	}
+	if (strcmp(had, boot_id()) != 0)
+		count++;
+	if (FILE *f = fopen(BBD_OFF, "w")) {
+		fprintf(f, "%s %d\n", boot_id(), count);
+		fclose(f);
+	}
+	nlog(BBD_TAG ": off: %s: GL from the next start (boot %d of %d with a failure)", why, count, BBD_BOOTS);
+}
+/* May backboardd have Metal now? NULL = yes, else the reason for GL. Every other process goes by the clients files as always. */
+static const char *bbd_gl_reason(char *why, size_t size)
+{
+	if (access(BBD_FLAG, F_OK) != 0)
+		return strlcpy(why, "no " BBD_FLAG, size), why;
+	char state[16] = "new";
+	if (FILE *f = fopen(NMTL_DIR "/gate", "r")) {
+		if (fscanf(f, "%15s", state) != 1)
+			strlcpy(state, "new", sizeof(state));
+		fclose(f);
+	}
+	if (strcmp(state, "pass") != 0) {
+		snprintf(why, size, "the Metal gate has not passed on this build (state %s): backboardd takes Metal from the boot after a pass", state);
+		return why;
+	}
+	char had[64] = "";
+	int count = 0;
+	if (FILE *f = fopen(BBD_OFF, "r")) {
+		if (fscanf(f, "%63s %d", had, &count) != 2)
+			count = 0;
+		fclose(f);
+	}
+	if (count >= BBD_BOOTS) {
+		snprintf(why, size, "%d boots with a failure (rm %s to test again)", count, BBD_OFF);
+		return why;
+	}
+	if (strcmp(had, boot_id()) == 0) {
+		snprintf(why, size, "it failed in this boot already (%s)", BBD_OFF);
+		return why;
+	}
+	return NULL;
+}
+#endif
+/*
+ * A frame reached the screen surface, and something is lit in it. No frame in 240 s (a cold first compile of the generic shader takes 25-45 s on this CPU [I], and more pipelines follow), or 30 s of black from the first frame on: on iOS 16 a mark and an exit (the next start takes GL);
+ * on iOS 26 one line (there is nothing to fall back to). Runs in backboardd only.
+ */
+#ifdef NMTL_IOS26
+#include "../../laurel/metal/option/present_stats.h"
+/* The selector's marks (userland/laurel/metal/option/option_rule.h). A stack other than the default ends this start on a failure: the next start takes the default. The default has nothing to go to, so it only logs. */
+static bool option_is_default(void)
+{
+	const char *o = getenv("NEGRONIMETAL_OPTION");
+	return o == NULL || !strcmp(o, "default");
+}
+static void option_mark(const char *name, const char *text)
+{
+	char p[300];
+	snprintf(p, sizeof(p), NMTL_DIR "/stack/%s", name);
+	if (FILE *f = fopen(p, "w")) {
+		fprintf(f, "%s\n", text);
+		fclose(f);
+	}
+}
+static void option_failed(const char *why)
+{
+	if (option_is_default())
+		return;
+	nlog("LAUREL METAL: off: stack %s: %s: restart on stack default", getenv("NEGRONIMETAL_OPTION"), why);
+	option_mark("failed", why);
+	_exit(0);
+}
+#endif
+#ifdef NMTL_IOS26
+extern "C" void native_bridge_metal_present_hist(uint64_t out[NMTL_PRESENT_BINS]);
+/* XNUtils' bench: while the file stack/bench-on exists, count this compositor's frames; at its removal write stack/bench-result. A cost of one access() in 500 ms when no bench runs. */
+static void *bench_serve(void *arg)
+{
+	(void)arg;
+	static uint64_t base[NMTL_PRESENT_BINS], cur[NMTL_PRESENT_BINS];
+	double t0 = 0;
+	bool on = false;
+	for (;;) {
+		usleep(500000);
+		const bool want = access(NMTL_DIR "/stack/bench-on", F_OK) == 0;
+		if (want && !on) {
+			native_bridge_metal_present_hist(base);
+			t0 = CFAbsoluteTimeGetCurrent();
+			on = true;
+		} else if (!want && on) {
+			native_bridge_metal_present_hist(cur);
+			struct nmtl_present_summary sum;
+			char text[240];
+			nmtl_present_summarize(cur, base, &sum);
+			nmtl_present_text(text, sizeof(text), &sum, CFAbsoluteTimeGetCurrent() - t0, getenv("NEGRONIMETAL_OPTION") ?: "default");
+			if (FILE *f = fopen(NMTL_DIR "/stack/bench-result.new", "w")) {
+				fputs(text, f);
+				fclose(f);
+				rename(NMTL_DIR "/stack/bench-result.new", NMTL_DIR "/stack/bench-result");
+			}
+			on = false;
+		}
+	}
+}
+static void bench_serve_start(void)
+{
+	pthread_t th;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	if (pthread_create(&th, &attr, bench_serve, NULL) != 0)
+		nlog("LAUREL METAL: off: no bench thread in this start");
+	pthread_attr_destroy(&attr);
+}
+#endif
+static void *bbd_screen_check(void *arg)
+{
+	(void)arg;
+	const double t0 = CFAbsoluteTimeGetCurrent();
+	double first_lit_wait = -1;
+	unsigned last_lit = 65, lines = 0; /* (65: no sample count yet) */
+	for (;;) {
+		sleep(5);
+		const double now = CFAbsoluteTimeGetCurrent();
+		uint64_t p[4] = { 0 };
+		native_bridge_metal_progress(p);
+		IOSurfaceRef screen = native_bridge_metal_copy_screen_surface();
+		if (!screen) {
+			if (now - t0 >= 240) {
+				nlog(BBD_TAG ": %s: no frame on a screen surface %.0f s after the device opened (%llu command buffers completed, %llu pending)",
+#ifdef NMTL_IOS26
+				     "problem",
+#else
+				     "off",
+#endif
+				     now - t0, (unsigned long long)p[1], (unsigned long long)p[2]);
+#ifdef LAUREL_BBD_METAL
+				bbd_mark_off("no frame in 240 s");
+				_exit(0);
+#else
+				option_failed("no frame in 240 s");
+				return NULL;
+#endif
+			}
+			continue;
+		}
+		if (first_lit_wait < 0) {
+			first_lit_wait = now;
+			nlog(BBD_TAG ": first frame on a screen surface (%zu x %zu, format 0x%x) %.1f s after the device opened", IOSurfaceGetWidth(screen), IOSurfaceGetHeight(screen),
+			     (unsigned)IOSurfaceGetPixelFormat(screen), now - t0);
+		}
+		unsigned lit = 0;
+		const size_t w = IOSurfaceGetWidth(screen), h = IOSurfaceGetHeight(screen), row = IOSurfaceGetBytesPerRow(screen);
+		if (IOSurfaceLock(screen, kIOSurfaceLockReadOnly, NULL) == 0) {
+			const uint8_t *base = (const uint8_t *)IOSurfaceGetBaseAddress(screen);
+			for (size_t y = 0; base && y < 8; y++) {
+				for (size_t x = 0; x < 8; x++) {
+					const uint32_t pixel = *(const uint32_t *)(base + (h * (2 * y + 1) / 16) * row + (w * (2 * x + 1) / 16) * 4);
+					if (pixel & 0x00ffffff)
+						lit++;
+				}
+			}
+			IOSurfaceUnlock(screen, kIOSurfaceLockReadOnly, NULL);
+		}
+		CFRelease(screen);
+		if (lit != last_lit && lines < 12) {
+			lines++;
+			nlog(BBD_TAG ": screen: %u of 64 samples lit, %.0f s after the device opened; %llu command buffers completed", lit, now - t0, (unsigned long long)p[1]);
+		}
+		last_lit = lit;
+		if (lit) {
+			first_lit_wait = now;
+#ifdef NMTL_IOS26
+			/* Lit for 60 s: this start did not fail. A start that dies before that counts in the selector's rule, so a crash loop after the first frame ends too. Later black is the display's sleep, not a failure. */
+			static double lit_at;
+			if (lit_at == 0)
+				lit_at = now;
+			if (now - lit_at >= 60) {
+				option_mark("ok", "lit");
+				nlog(BBD_TAG ": on: stack %s: the screen is lit 60 s after the first frame", getenv("NEGRONIMETAL_OPTION") ?: "default");
+				return NULL;
+			}
+#endif
+		}
+#ifdef LAUREL_BBD_METAL
+		else if (now - first_lit_wait >= 30) {
+			bbd_mark_off("the screen surface stayed black for 30 s after a frame");
+			_exit(0);
+		}
+		if (now - t0 >= 300) {
+			nlog(BBD_TAG ": on: 5 min without a failure: this start stays on Metal (GL stays the fallback for the next start)");
+			return NULL;
+		}
+#else
+		else if (now - first_lit_wait >= 30)
+			option_failed("the screen surface stayed black for 30 s after a frame");
+		if (now - t0 >= 300)
+			return NULL;
+#endif
+	}
+}
+static void bbd_screen_check_start(void)
+{
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	pthread_t th;
+	if (pthread_create(&th, &attr, bbd_screen_check, NULL) != 0)
+		nlog(BBD_TAG ": no thread for the screen check");
+	pthread_attr_destroy(&attr);
+}
+#endif /* LAUREL_BBD_METAL || NMTL_IOS26 */
+
+#ifdef NMTL_IOS26
+/*
+ * Live glass: selective CABackdropLayer bypass in backboardd and SpringBoard. Same hook as IOS-26-Hot d249939 phone/media/inject_sysfix.c (MIT), reported there on an Adreno 640 on 23F84: a live backdrop is a
+ * framebuffer readback plus a blur pyramid per frame; icons (pre-baked by iconservicesagent), pills and spring animations stay. On the A610 one glass_background pixel costs 549 to 1703 ir3 instructions [V host],
+ * with 1 SP core and a 300 to 600 MHz clock. On by default. The file NMTL_DIR/live-glass brings live glass back within 5 s. Not "Reduce Transparency". Limit [I]: the hook goes in when this process opens its device,
+ * so a layer made before that keeps its state until its next setEnabled:.
+ */
+static IMP g_cabd_is_enabled, g_cabd_set_enabled, g_cabd_init;
+static SEL g_cabd_set_sel;
+static bool live_glass(void)
+{
+	static int cached = -1;
+	static time_t last = 0;
+	const time_t now = time(NULL);
+	if (cached < 0 || now - last >= 5) {
+		last = now;
+		cached = access(NMTL_DIR "/live-glass", F_OK) == 0;
+	}
+	return cached != 0;
+}
+static BOOL glass_is_enabled(id self, SEL sel)
+{
+	return live_glass() && g_cabd_is_enabled ? ((BOOL (*)(id, SEL))g_cabd_is_enabled)(self, sel) : NO;
+}
+static void glass_set_enabled(id self, SEL sel, BOOL enabled)
+{
+	if (g_cabd_set_enabled)
+		((void (*)(id, SEL, BOOL))g_cabd_set_enabled)(self, sel, live_glass() ? enabled : NO);
+}
+static id glass_init(id self, SEL sel)
+{
+	id me = g_cabd_init ? ((id (*)(id, SEL))g_cabd_init)(self, sel) : self;
+	if (me && !live_glass() && g_cabd_set_enabled)
+		((void (*)(id, SEL, BOOL))g_cabd_set_enabled)(me, g_cabd_set_sel, NO);
+	return me;
+}
+static void glass_bypass_start(void)
+{
+	const char *name = getprogname() ?: "";
+	if (strcmp(name, "backboardd") != 0 && strcmp(name, "SpringBoard") != 0)
+		return;
+	Class cls = objc_getClass("CABackdropLayer");
+	Method is = cls ? class_getInstanceMethod(cls, sel_registerName("isEnabled")) : NULL;
+	g_cabd_set_sel = sel_registerName("setEnabled:");
+	Method set = cls ? class_getInstanceMethod(cls, g_cabd_set_sel) : NULL;
+	Method init = cls ? class_getInstanceMethod(cls, sel_registerName("init")) : NULL;
+	if (!is || !set || !init) {
+		nlog("LAUREL GLASS: off: no CABackdropLayer isEnabled, setEnabled: or init in this QuartzCore: live backdrops stay");
+		return;
+	}
+	g_cabd_is_enabled = method_setImplementation(is, (IMP)glass_is_enabled);
+	g_cabd_set_enabled = method_setImplementation(set, (IMP)glass_set_enabled);
+	g_cabd_init = method_setImplementation(init, (IMP)glass_init);
+	nlog("LAUREL GLASS: on: live CABackdropLayer capture off in %s (touch %s/live-glass to bring it back)", name, NMTL_DIR);
+}
+#endif
+
 /*
  * GPU-lost watchdog (backboardd; the design follows Chlorophyll inject/bgmtl_inject.m and docs/FIXES.md, MIT): once a second it
  * reads the frontend's progress. When command buffers are pending and none completed for limit_s seconds (and the oldest pending
@@ -978,8 +1277,12 @@ static void *watchdog_main(void *arg)
 		} else {
 			nlog("GPU watchdog: cannot write %s: %s", NMTL_DIR "/strikes/gpu-lost", strerror(errno));
 		}
-		if (exit_on_loss)
+		if (exit_on_loss) {
+#ifdef LAUREL_BBD_METAL
+			bbd_mark_off("the GPU watchdog: no command buffer completed");
+#endif
 			_exit(0);
+		}
 		return NULL;
 	}
 }
@@ -1022,6 +1325,18 @@ static void watchdog_start(void)
 	static dispatch_once_t once;
 	dispatch_once(&once, ^{
 		NSString *bundlePath = [[NSBundle bundleForClass:[NMTL_CLASS class]] bundlePath];
+#ifdef NMTL_IOS26
+		{
+			/* this image is BUNDLE/options/<name>/NegroniMetal, loaded by the selector (userland/laurel/metal/option): the files are the bundle's */
+			Dl_info me = { 0 };
+			if (dladdr((void *)sm2_logs, &me) != 0 && me.dli_fname != NULL) {
+				NSString *path = @(me.dli_fname);
+				NSRange at = [path rangeOfString:@"/options/"];
+				if (at.location != NSNotFound)
+					bundlePath = [path substringToIndex:at.location];
+			}
+		}
+#endif
 #ifdef NMTL_HOST_TEST
 		if (const char *b = getenv("NMTL_HOST_BUNDLE")) /* the host test's stand-in for the bundle directory */
 			bundlePath = @(b);
@@ -1032,8 +1347,21 @@ static void watchdog_start(void)
 			nlog("%s: no Metal device", off);
 			return;
 		}
+#ifdef LAUREL_BBD_METAL
+		if (process_is_backboardd()) {
+			if (const char *gl = bbd_gl_reason(why, sizeof(why))) {
+				nlog(BBD_TAG ": off: %s: no Metal device, CoreAnimation takes GL", gl);
+				return;
+			}
+			nlog(BBD_TAG ": on: backboardd takes a Metal device; GL stays the fallback (a nil device, a crash, no frame, a black screen, a lost GPU)");
+		} else
+#endif
 		if (!listed()) {
 			nlog("not listed in %s/clients, %s/clients.local or %s: no Metal device", g_bundle, g_bundle, NMTL_DIR "/clients");
+#ifdef NMTL_IOS26
+			if (process_is_backboardd())
+				nlog(BBD_TAG ": off: backboardd is not listed: no renderer in the window server on 23F84");
+#endif
 			return;
 		}
 		if (bootarg_off()) {
@@ -1058,9 +1386,14 @@ static void watchdog_start(void)
 		}
 		/* shader + pipeline cache: NMTL_DIR/cache/<process>, else the sandboxed process's own cache directory */
 		char cache[256];
-		mkdir(NMTL_DIR "/cache", 0777);
-		chmod(NMTL_DIR "/cache", 0777);
-		snprintf(cache, sizeof(cache), NMTL_DIR "/cache/%s", getprogname());
+#ifdef NMTL_HOT
+#define NMTL_CACHE_DIR NMTL_DIR "/cache-hot"      /* another metal2vulkan: another cache */
+#else
+#define NMTL_CACHE_DIR NMTL_DIR "/cache"
+#endif
+		mkdir(NMTL_CACHE_DIR, 0777);
+		chmod(NMTL_CACHE_DIR, 0777);
+		snprintf(cache, sizeof(cache), NMTL_CACHE_DIR "/%s", getprogname());
 		mkdir(cache, 0777);
 		if (access(cache, W_OK) != 0) {
 			char dir[256];
@@ -1078,6 +1411,15 @@ static void watchdog_start(void)
 		CFPreferencesSetAppValue(CFSTR("CAEnableDeepFramebuffer"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
 		setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
 		load_env(); /* before deadman_arm: NMTL_DIR/env can set NEGRONIMETAL_STRIKE_LIMIT */
+#if defined(LAUREL_BBD_METAL) || defined(NMTL_IOS26)
+		if (process_is_backboardd()) {
+			/* CoreAnimation swaps after waitUntilScheduled: Apple's display waits on the surface, ours shows it at once. So scheduled = completed here: no half-drawn frame on the panel */
+			setenv("NEGRONIMETAL_SYNC", "1", 0);
+#ifdef LAUREL_BBD_METAL
+			setenv("NEGRONIMETAL_WATCHDOG_EXIT", "1", 0);
+#endif
+		}
+#endif
 		char strike[256];
 		if (!deadman_arm(strike, sizeof(strike)))
 			return;
@@ -1162,8 +1504,17 @@ static void watchdog_start(void)
 			nlog("device %s in %.0f ms, of which %.0f ms loading Turnip (turnip %s, cache %s, self-test %s)%s%s",
 			     device ? [[device name] UTF8String] : "refused", ms, g_turnip_ms, turnip.UTF8String, cache,
 			     test ? "on" : "off", job.why ? ": " : "", job.why ? job.why.UTF8String : "");
+#ifdef NMTL_IOS26
+		/* 23F84: AccelServer::renderer has no GL fallback: a nil device here means no renderer in the window server, so this one line is what a black screen reads as */
+		if (process_is_backboardd())
+			nlog(BBD_TAG ": %s: Metal device %s for the compositor%s%s", device ? "on" : "off", device ? [[device name] UTF8String] : "refused", job.why ? ": " : "",
+			     job.why ? job.why.UTF8String : (device ? "" : ": CA::WindowServer::AccelServer::renderer has no renderer, the screen stays as it is"));
+#endif
 		if (device) {
 			deadman_mark(strike, "device opened");
+#ifdef NMTL_IOS26
+			glass_bypass_start();
+#endif
 			install_exception_log();
 		} else if (timed_out)
 			deadman_mark(strike, "device open hangs");
@@ -1290,6 +1641,13 @@ static void watchdog_start(void)
 				telemetry_loop();
 			if (wd == 1 || (wd < 0 && !strcmp(getprogname(), "backboardd")))
 				watchdog_start();
+#if defined(LAUREL_BBD_METAL) || defined(NMTL_IOS26)
+			if (process_is_backboardd())
+				bbd_screen_check_start();
+#ifdef NMTL_IOS26
+				bench_serve_start();
+#endif
+#endif
 		} /* a clean refusal removed its strike file (deadman_refused); a hang keeps its strike (deadman_mark) */
 	});
 	if (!device) {

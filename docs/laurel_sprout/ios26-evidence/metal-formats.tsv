@@ -1,0 +1,21 @@
+MTLPixelFormat	name	use in CA	sampled	linear filter	color attachment	blend	storage	sampled over linear rows (an IOSurface)	verdict on FD610
+1	A8Unorm	masks, glyphs (image_parameters)	yes	yes	yes	yes	yes	yes	supported
+10	R8Unorm	masks, glyph atlas	yes	yes	yes	yes	yes	yes	supported
+25	R16Float	image_parameters	yes	yes	yes	yes	yes	yes	supported
+30	RG8Unorm	image_parameters; biplanar chroma	yes	yes	yes	yes	yes	yes	supported
+55	R32Float	image_parameters; attachment 2 of a tile path	yes	yes	yes	yes	yes	yes	supported
+60	RG16Unorm	image_parameters	yes	yes	yes	yes	yes	yes	supported
+65	RG16Float	image_parameters	yes	yes	yes	yes	yes	yes	supported
+70	RGBA8Unorm	images	yes	yes	yes	yes	yes	yes	supported
+80	BGRA8Unorm	framebuffer, layers, images	yes	yes	yes	yes	yes	yes	supported
+90	RGB10A2Unorm	image_parameters	yes	yes	yes	yes	yes	yes	supported
+94	BGR10A2Unorm	image_parameters, wide images	yes	yes	yes	yes	yes	yes	supported
+110	RGBA16Unorm	image_parameters	yes	yes	yes	yes	yes	yes	supported
+115	RGBA16Float	EDR, deep layers, attachment 1 of a tile path	yes	yes	yes	yes	yes	yes	supported
+125	RGBA32Float	image_parameters	yes	yes	yes	yes	yes	yes	supported
+240	GBGR422	video images	no	no	no	no	no	yes	supported over linear memory only (an IOSurface): sampled, no render target
+241	BGRG422	video images	no	no	no	no	no	yes	supported over linear memory only (an IOSurface): sampled, no render target
+500	BGRA8Unorm_sRGB-class	(sRGB form)	yes	yes	yes	yes	yes	yes	supported
+552	BGRA10_XR	wide color: only when supportsExtendedXR10Formats YES (not backboardd)	no	no	no	no	no	no	emulated by metal2vulkan (BGR10_XR); only asked in posters here
+554	BGR10_XR	wide color: same	no	no	no	no	no	no	emulated by metal2vulkan (BGR10_XR); only asked in posters here
+562	BGR10_XR_sRGB-class	wide color: same	no	no	no	no	no	no	emulated by metal2vulkan (BGR10_XR); only asked in posters here

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Flash a boot image to the Mi A3 (laurel_sprout) boot_b with plain fastboot, then reboot.
 #   scripts/bg.sh laurel-flash scripts/laurel/flash-boot.sh [BOOT.img]      (always in tmux: no timeout)
-#   default image out/laurel/laurel-boot.img; restore: BOOTIMG=~/laurel-backup/stock/images/boot.img
+#   default image out/laurel/laurel-boot.img. Restore Lineage: ANDROID_IMAGE=1 scripts/laurel/flash-boot.sh ~/laurel-backup/lineage-24.0-20261027/boot.img (only this image passes the guard)
 #   WAIT_NEW=1 (default): wait for a NEW fastboot USB connection first (put the phone in fastboot after start)
 #   REBOOT=0: do not reboot after the flash
 #   BOOT=continue (default): leave fastboot with 'fastboot continue' (ABL boots boot_b without a reset,
@@ -18,8 +18,9 @@
 set -eu
 . "$(dirname "$0")/../lib/env.sh"
 IMG=${1:-${BOOTIMG:-$OUT/laurel/laurel-boot.img}}
+[ "${ANDROID_IMAGE:-0}" != 1 ] || [ -n "${1:-}${BOOTIMG:-}" ] || { echo "flash-boot: ANDROID_IMAGE=1 needs a named image: the default $IMG is an iOS image" >&2; exit 1; }
 [ -f "$IMG" ] || { echo "flash-boot: missing $IMG" >&2; exit 1; }
-"$REPO/scripts/laurel/android-guard.sh" boot-image "$IMG"   # an iOS image without an extent table writes into Android's /data
+"$REPO/scripts/laurel/android-guard.sh" boot-image "$IMG"   # a kernel without patch 2950 writes into Android's data; ANDROID_IMAGE=1 passes only Lineage's own image
 ts() { date +%H:%M:%S; }
 cur() { lsusb | awk '/18d1:d00d/{print $4}'; }
 wait_dev() {   # wait for a fastboot device other than $1

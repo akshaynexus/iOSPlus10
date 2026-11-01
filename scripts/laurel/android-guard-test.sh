@@ -2,7 +2,7 @@
 # Host test of the Android guard: every script that can write userdata, with a fake adb, fastboot, lsusb and ssh that record every call. No phone is touched, also when one is on the cable.
 #   scripts/laurel/android-guard-test.sh [TREE]     (scripts/laurel/test-dualboot.sh runs it; TREE: the scripts under test, default this repo)
 # The real adb and fastboot cannot be reached: PATH is the fakes + a short list of tool links, without adb and fastboot; checked first. The scripts run from a copy in a temp folder.
-# Test names with [R] are regressions: the old code passed them too. Each other new test failed on the old code (scripts/laurel/dualboot-tests-detect.sh).
+# ONLY=glob runs the matching tests (scripts/laurel/dualboot-tests-detect.sh shows that these tests find the defects).
 set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 SRC=${1:-$REPO}
@@ -41,10 +41,12 @@ getvar)
     elif [ -n "\${FAKE_PRODUCT_AFTER_USERSPACE:-}" ] && grep -q '^fastboot getvar is-userspace' "\$T/calls"; then echo "product: \$FAKE_PRODUCT_AFTER_USERSPACE" >&2
     else echo "product: \${FAKE_PRODUCT:-laurel_sprout}" >&2; fi ;;
   is-userspace) echo "is-userspace: no" >&2 ;;
+  current-slot) echo "current-slot: a" >&2 ;;
   esac ;;
 esac
 exit 0
 EOT
+printf '#!/bin/sh\nsha256sum "$3"\n' > "$T/bin/shasum"
 for t in lsusb sudo ssh; do printf '#!/bin/sh\necho "%s $*" >> "%s/calls"\nexit 0\n' "$t" "$T" > "$T/bin/$t"; done
 cat > "$T/bin/adb" <<EOT
 #!/bin/sh
@@ -81,6 +83,7 @@ WRITES='^(fastboot (flash|erase|format|-w|-S|boot|set_active|reboot|--disable)|s
 # expect NAME EXIT TEXT CMD...: exit code, text in the output, and no fastboot write / no ssh write in the record
 expect() {
   name=$1; rc=$2; text=$3; shift 3
+  [ -z "${ONLY:-}" ] || case "$name" in $ONLY) ;; *) return 0 ;; esac
   : > "$T/calls"
   got=0; o=$("$@" 2>&1 < /dev/null) || got=$?
   n=$((n + 1))
@@ -95,6 +98,7 @@ expect() {
 # expect_calls NAME EXIT MUST_RUN MUST_NOT_RUN CMD...: writes are allowed here; the record decides
 expect_calls() {
   name=$1; rc=$2; must=$3; mustnot=$4; shift 4
+  [ -z "${ONLY:-}" ] || case "$name" in $ONLY) ;; *) return 0 ;; esac
   : > "$T/calls"
   got=0; o=$("$@" 2>&1 < /dev/null) || got=$?
   n=$((n + 1)); b=
@@ -108,58 +112,125 @@ R=$T/repo
 F=$R/config/laurel-android-data
 G=$R/scripts/laurel
 M=$(sed -n 's/^#define LDB_KERNEL_MARKER *"\([^"]*\)".*/\1/p' "$REPO/tools/laurel-dualboot/laurel_dualboot.h")
-FAKEIMG=$T/some.img; printf 'ANDROID!' > "$FAKEIMG"
-IOSIMG=$T/ios.img; printf 'ANDROID! LAURELESP laurel-dualboot ' > "$IOSIMG"
-sidecar() { printf 'image %s\n' "$(sha256sum "$1" | cut -d' ' -f1)" > "$1.dualboot"; }
+export HOME=$T/home
+LB=$HOME/laurel-backup/lineage-24.0-20261027; AB=$HOME/laurel-backup/android-20261102-0137
+mkdir -p "$LB" "$AB"
+# a boot image header with an OS field (Lineage: 17.0.0, 2026-10 = raw 0x220001aa), then TEXT
+mkimg() {
+  python3 -I - "$1" "$2" "${3:-570425770}" <<'PY'
+import struct, sys
+b = bytearray(4096); b[:8] = b'ANDROID!'; struct.pack_into('<I', b, 40, 2); struct.pack_into('<I', b, 44, int(sys.argv[3]))
+open(sys.argv[1], 'wb').write(bytes(b) + sys.argv[2].encode())
+PY
+}
+FAKEIMG=$T/some.img; mkimg "$FAKEIMG" "linux kernel"
+cp "$FAKEIMG" "$LB/boot.img"; printf '%s  boot.img\n' "$(sha256sum "$FAKEIMG" | cut -d' ' -f1)" > "$LB/SHA256SUMS"
+IOSIMG=$T/ios.img; mkimg "$IOSIMG" " LAURELESP "
+SHIMIMG=$T/shim.img; mkimg "$SHIMIMG" " shim, kernel compressed, no label"
+sidecar() { printf 'image %s\nmode %s\nmarker %s\nos 17.0.0 2026-10\n' "$(sha256sum "$1" | cut -d' ' -f1)" "${2:-ro}" "$M" > "$1.dualboot"; }
 # with the flag, adb shows Android
-expect "[R] flash-root.sh refused, names the dual boot path" 3 "dual-boot" sh "$G/flash-root.sh"
-expect "[R] flash-root.sh IMAGE refused" 3 "REFUSED" sh "$G/flash-root.sh" "$FAKEIMG"
+expect "flash-root.sh: not a sparse image: refused" 3 "not a sparse" sh "$G/flash-root.sh" "$FAKEIMG"
 expect "[R] root-flash-test.sh refused" 3 "dual-boot" sh "$G/root-flash-test.sh"
 expect "[R] update-phone.sh refused" 3 "dual-boot" sh "$G/update-phone.sh"
 expect "[R] root-update.sh refused" 3 "dual-boot" sh "$G/root-update.sh"
 expect "[R] root-update.sh --rollback refused" 3 "dual-boot" sh "$G/root-update.sh" --rollback
-expect "[R] flash-boot.sh: an image without a table refused" 3 "no extent table" env WAIT_NEW=0 sh "$G/flash-boot.sh" "$FAKEIMG"
-expect "[R] boot-test.sh: an image without a table refused" 3 "no extent table" env IMG="$FAKEIMG" sh "$G/boot-test.sh"
+expect "[R] flash-boot.sh: an image not built for this phone refused" 3 "not built for this phone" env WAIT_NEW=0 sh "$G/flash-boot.sh" "$FAKEIMG"
+expect "[R] boot-test.sh: an image not built for this phone refused" 3 "not built for this phone" env IMG="$FAKEIMG" sh "$G/boot-test.sh"
 expect "[R] fastboot-drain.py flash userdata refused" 3 "REFUSED" python3 -I "$G/fastboot-drain.py" flash userdata "$FAKEIMG"
 expect "[R] ios16.sh refused on the Mi A3" 3 "OnePlus" sh "$R/scripts/flash/ios16.sh" userdata --yes
 expect "[R] all.sh refused on the Mi A3" 3 "OnePlus" env CONFIRM=yes sh "$R/scripts/flash/all.sh"
 expect "[R] restore.sh refused on the Mi A3" 3 "OnePlus" env CONFIRM=yes sh "$R/scripts/flash/restore.sh"
 # the flag alone (phone off the cable or in fastboot), adb silent
 expect "[R] guard userdata: flag, no adb" 3 "config/laurel-android-data" env FAKE_ADB=off sh "$G/android-guard.sh" userdata
-expect "[R] flash-root.sh: flag, no adb" 3 "config/laurel-android-data" env FAKE_ADB=off sh "$G/flash-root.sh" "$FAKEIMG"
 expect "[R] running-ios: no answer" 3 "no answer" env FAKE_ADB=off sh "$G/android-guard.sh" running-ios
 expect "[R] running-ios: fence off" 3 "kern.laurel_dualboot=1" env FAKE_ADB=off FAKE_SYSCTL=0 sh "$G/android-guard.sh" running-ios
 # boot images
-expect "[R] boot-image: Android image with ANDROID_IMAGE=1 goes" 0 "" env ANDROID_IMAGE=1 sh "$G/android-guard.sh" boot-image "$FAKEIMG"
-expect "[R] boot-image: iOS image with ANDROID_IMAGE=1 refused" 3 "iOS payload" env ANDROID_IMAGE=1 sh "$G/android-guard.sh" boot-image "$IOSIMG"
-printf 'image 0000\n' > "$IOSIMG.dualboot"
+expect "[R] F2 boot-image: Lineage's image with ANDROID_IMAGE=1 goes" 0 "" env ANDROID_IMAGE=1 sh "$G/android-guard.sh" boot-image "$FAKEIMG"
+expect "[R] F2 boot-image: iOS image with ANDROID_IMAGE=1 refused" 3 "iOS payload" env ANDROID_IMAGE=1 sh "$G/android-guard.sh" boot-image "$IOSIMG"
+# F2: the label alone let a shim through
+expect "F2 boot-image: a shim image with no label, ANDROID_IMAGE=1: refused by its hash" 3 "not Lineage's boot image" env ANDROID_IMAGE=1 sh "$G/android-guard.sh" boot-image "$SHIMIMG"
+for tx in 'rd=ufsroot0' 'ufsrw=1' 'rootrw=1' 'Darwin Kernel Version 25.5.0' 'xnu-12377.121.6'; do
+  mkimg "$T/tx.img" " $tx "
+  # the hash listed too: the text alone must stop it
+  printf '%s  boot.img\n' "$(sha256sum "$T/tx.img" | cut -d' ' -f1)" >> "$LB/SHA256SUMS"
+  expect "F2 boot-image: '$tx' in the image with ANDROID_IMAGE=1, its hash in the backup list: refused" 3 "iOS payload" env ANDROID_IMAGE=1 sh "$G/android-guard.sh" boot-image "$T/tx.img"
+done
+mkimg "$T/a.img" "another linux"; printf '%s  boot_a.img\n' "$(sha256sum "$T/a.img" | cut -d' ' -f1)" > "$AB/SHA256SUMS"
+expect "[R] F2 boot-image: boot_a of the android backup goes" 0 "" env ANDROID_IMAGE=1 sh "$G/android-guard.sh" boot-image "$T/a.img"
+expect "F2 boot-image: no backup folder: refused" 3 "not Lineage's boot image" env ANDROID_IMAGE=1 HOME="$T/nohome" sh "$G/android-guard.sh" boot-image "$FAKEIMG"
+mkdir -p "$R/out/laurel"; cp "$SHIMIMG" "$R/out/laurel/laurel-boot.img"
+expect_calls "F2 flash-boot.sh: ANDROID_IMAGE=1 with no image named: no flash of the default shim" 1 "" "fastboot flash" env WAIT_NEW=0 ANDROID_IMAGE=1 timeout 8 sh "$G/flash-boot.sh"
+expect_calls "F2 flash-boot.sh: ANDROID_IMAGE=1 + BOOTIMG= the default shim: no flash" 3 "" "fastboot flash" env WAIT_NEW=0 ANDROID_IMAGE=1 BOOTIMG="$R/out/laurel/laurel-boot.img" timeout 8 sh "$G/flash-boot.sh"
+# the image of this phone
+mkimg "$IOSIMG" " LAURELESP "; printf 'image 0000\n' > "$IOSIMG.dualboot"
 expect "[R] boot-image: sidecar of another image refused" 3 "changed after" sh "$G/android-guard.sh" boot-image "$IOSIMG"
-# H1: a table proves nothing about the kernel
 sidecar "$IOSIMG"
-expect "H1 boot-image: table but a kernel without 2950: refused" 3 "patch 2950" sh "$G/android-guard.sh" boot-image "$IOSIMG"
-printf 'ANDROID! LAURELESP laurel-dualboot LAUREL-2950-OLD ' > "$IOSIMG.old"; sidecar "$IOSIMG.old"
-expect "H1 boot-image: another marker text (older 2950): refused" 3 "patch 2950" sh "$G/android-guard.sh" boot-image "$IOSIMG.old"
-printf 'ANDROID! LAURELESP %s ' "$M" > "$IOSIMG.noadt"; sidecar "$IOSIMG.noadt"
-expect "H1 boot-image: fence kernel, no table in the ADT: refused" 3 "laurel-dualboot" sh "$G/android-guard.sh" boot-image "$IOSIMG.noadt"
-printf 'ANDROID! LAURELESP laurel-dualboot %s ' "$M" > "$IOSIMG.good"; sidecar "$IOSIMG.good"
-expect "[R] boot-image: fence kernel with its table goes" 0 "" sh "$G/android-guard.sh" boot-image "$IOSIMG.good"
-# H1: the image build. KERNEL= by hand has only its own stamp: ios26-image.sh takes this path.
+expect "H1 boot-image: a kernel without 2950: refused" 3 "patch 2950" sh "$G/android-guard.sh" boot-image "$IOSIMG"
+mkimg "$IOSIMG.old" " LAURELESP LAUREL-2950-DUALBOOT-FENCE-V2-SEAL-AT-FREEZE "; sidecar "$IOSIMG.old"
+expect "H1 boot-image: the marker of the file design (kernel looks for a table): refused" 3 "patch 2950" sh "$G/android-guard.sh" boot-image "$IOSIMG.old"
+mkimg "$IOSIMG.good" " LAURELESP $M "; sidecar "$IOSIMG.good"
+expect "[R] boot-image: fence kernel, read-only, Lineage's header: goes" 0 "" sh "$G/android-guard.sh" boot-image "$IOSIMG.good"
+# S1
+mkimg "$T/s1.img" " LAURELESP $M " 369099112; sidecar "$T/s1.img"
+expect "S1 boot-image: the stock header 11.0.0, 2022-08: refused" 3 "OS version field" sh "$G/android-guard.sh" boot-image "$T/s1.img"
+expect "S1 boot-image: no Lineage backup to compare: refused" 3 "no Lineage boot image" env HOME="$T/nohome" sh "$G/android-guard.sh" boot-image "$IOSIMG.good"
+# read-only first
+mkimg "$T/rw.img" " LAURELESP $M ufsrw=1 rootrw=1 "; sidecar "$T/rw.img" rw
+expect "RO gate boot-image: a writable image, no result on record: refused" 3 "can write" sh "$G/android-guard.sh" boot-image "$T/rw.img"
+mkimg "$T/rw2.img" " LAURELESP $M ufsrw=1 rootrw=1 "; sidecar "$T/rw2.img" ro
+expect "RO gate boot-image: a writable image whose sidecar says ro: refused" 3 "can write" sh "$G/android-guard.sh" boot-image "$T/rw2.img"
+mkimg "$T/rw3.img" " LAURELESP $M "; printf 'image %s\n' "$(sha256sum "$T/rw3.img" | cut -d' ' -f1)" > "$T/rw3.img.dualboot"
+expect "RO gate boot-image: a sidecar with no mode counts as writable: refused" 3 "can write" sh "$G/android-guard.sh" boot-image "$T/rw3.img"
+mkdir -p "$R/out/laurel/dualboot"; printf 'ro-on %s x\n' "$M" > "$R/out/laurel/dualboot/first-boot.result"
+expect "RO gate boot-image: a result, Android not checked after it: refused" 3 "not opened its data" sh "$G/android-guard.sh" boot-image "$T/rw.img"
+printf 'ro-on %s x\nandroid-opened-after-ro x\n' "$M" > "$R/out/laurel/dualboot/first-boot.result"
+expect "[R] RO gate boot-image: result + Android: a writable image goes" 0 "" sh "$G/android-guard.sh" boot-image "$T/rw.img"
+printf 'ro-on OTHER-MARKER x\nandroid-opened-after-ro x\n' > "$R/out/laurel/dualboot/first-boot.result"
+expect "RO gate boot-image: the result of another fence kernel: refused" 3 "can write" sh "$G/android-guard.sh" boot-image "$T/rw.img"
+rm -f "$R/out/laurel/dualboot/first-boot.result"
+# the image build
 K=$T/kernel; ST="0123456789 1 patches, series 0123456789abcdef, 4k"
 mkdir -p "$T/w" "$T/mu" "$R/out/venv/bin" "$R/out/laurel/dualboot"
-printf '#!/bin/sh\nexit 0\n' > "$R/out/venv/bin/python3"; chmod +x "$R/out/venv/bin/python3"
-printf '#!/bin/sh\nexit 0\n' > "$T/bin/mkbootimg"; cp "$T/bin/mkbootimg" "$T/bin/unpack_bootimg"; cp "$T/bin/mkbootimg" "$T/bin/uv"; chmod +x "$T/bin/mkbootimg" "$T/bin/unpack_bootimg" "$T/bin/uv"
-printf 'x' > "$T/mu/fd"; printf 'x' > "$T/mu/shim"; printf 'x' > "$T/stock"; printf 'x' > "$T/table"
-printf '#!/bin/sh\nexit 0\n' > "$T/op10fake"; chmod +x "$T/op10fake"
+cat > "$R/out/venv/bin/python3" <<EOT
+#!/bin/sh
+case "\${1:-}" in
+-c) exit 0 ;;
+*mkdarwinboot.py) echo "mkdarwinboot \$*" >> "$T/calls"; printf 'payload' > "\$4" ;;
+esac
+exit 0
+EOT
+chmod +x "$R/out/venv/bin/python3"
+cat > "$T/bin/mkbootimg" <<EOT
+#!/bin/sh
+echo "mkbootimg \$*" >> "$T/calls"
+while [ \$# -gt 0 ]; do [ "\$1" = -o ] && mkimg_out=\$2; shift; done
+printf x > "\$mkimg_out"
+EOT
+cat > "$T/bin/unpack_bootimg" <<'EOT'
+#!/bin/sh
+mkdir -p "$4"; printf x > "$4/dtb"
+EOT
+printf '#!/bin/sh\nexit 0\n' > "$T/bin/uv"; chmod +x "$T/bin/mkbootimg" "$T/bin/unpack_bootimg" "$T/bin/uv"
+printf 'x' > "$T/mu/fd"; printf 'x' > "$T/mu/shim"; printf 'x' > "$T/stock"
 mk_kernel() {
   printf 'mach-o %s\nLAUREL BUILD: %s\n' "$1" "$ST" > "$K"
   printf 'stamp=%s\nseries=0123456789abcdef\nsha256=%s\n' "$ST" "$(sha256sum "$K" | cut -d' ' -f1)" > "$K.stamp"
 }
-UE="env UEFI_W=$T/w FD=$T/mu/fd SHIM=$T/mu/shim STOCK_BOOT=$T/stock KERNEL=$K DUALBOOT_TABLE=$T/table OP10TOOL=$T/op10fake"
+printf 'pass\n' > "$R/scripts/laurel/mkadt.py"   # the real one needs external/ios-topaz; it takes no part in these checks
+UE="env UEFI_W=$T/w FD=$T/mu/fd SHIM=$T/mu/shim STOCK_BOOT=$T/stock KERNEL=$K"
 mk_kernel "no marker here"
-expect "H1 uefi-image.sh: a table and a kernel without 2950: no image" 1 "no patch 2950" $UE bash "$G/uefi-image.sh"
+expect "H1 uefi-image.sh: a kernel without 2950: no image" 1 "no patch 2950" $UE bash "$G/uefi-image.sh"
 mk_kernel "$M"
-: > "$T/calls"; o=$($UE bash "$G/uefi-image.sh" 2>&1) || true; n=$((n + 1))
-case "$o" in *"no patch 2950"*) fails=$((fails + 1)); echo "FAIL uefi-image.sh: a kernel with the marker refused: $o" ;; *) echo "ok   [R] uefi-image.sh: a kernel with the marker passes this check" ;; esac
+ue() { : > "$T/calls"; o=$("$@" 2>&1) || true; n=$((n + 1)); }
+ok_() { echo "ok   $1"; }
+bad_() { fails=$((fails + 1)); echo "FAIL $1: $o"; sed 's/^/     calls: /' "$T/calls" | cut -c1-260 | tail -4; }
+if [ -z "${ONLY:-}" ] || case "S1 uefi-image.sh" in $ONLY) true ;; *) false ;; esac; then
+  ue $UE LAUREL_READONLY=1 bash "$G/uefi-image.sh"
+  if grep -q -- '--os_version 17.0.0 --os_patch_level 2026-10' "$T/calls"; then ok_ "S1 uefi-image.sh: the header carries Lineage's 17.0.0, 2026-10, read from the backup"; else bad_ "S1 uefi-image.sh: the header"; fi
+  if grep '^mkdarwinboot' "$T/calls" | grep -q 'ufsrw=1\|rootrw=1'; then bad_ "RO uefi-image.sh: LAUREL_READONLY=1 left ufsrw or rootrw"; else ok_ "RO uefi-image.sh: LAUREL_READONLY=1: no ufsrw, no rootrw in the command line"; fi
+  ue env UEFI_W=$T/w FD=$T/mu/fd SHIM=$T/mu/shim STOCK_BOOT=$T/stock KERNEL=$K LINEAGE_BOOT=$T/nothing bash "$G/uefi-image.sh"
+  case "$o" in *"no Lineage boot image"*) ok_ "S1 uefi-image.sh: no Lineage image: no boot image" ;; *) bad_ "S1 uefi-image.sh: no Lineage image" ;; esac
+fi
 # M2: the other phone must say who it is
 expect "M2 other-device: no phone on adb or fastboot: refused" 3 "OnePlus" env FAKE_ADB=off FAKE_FB=none sh "$G/android-guard.sh" other-device
 expect "M2 other-device: phone in fastboot with a wrong answer: refused" 3 "OnePlus" env FAKE_ADB=off FAKE_PRODUCT=unknown sh "$G/android-guard.sh" other-device
@@ -168,6 +239,12 @@ expect "[R] other-device: Mi A3 in fastboot: refused" 3 "OnePlus" env FAKE_ADB=o
 expect "[R] other-device: OnePlus on adb goes" 0 "" env FAKE_ADB=oneplus FAKE_FB=none sh "$G/android-guard.sh" other-device
 expect "[R] other-device: OnePlus in fastboot goes" 0 "" env FAKE_ADB=off FAKE_PRODUCT=taro sh "$G/android-guard.sh" other-device
 mkdir -p "$T/backup/images" "$T/backup/magisk" "$R/out/ios16"
+# F3: test-boot.sh, with the boot_a it would not flash again: it goes straight to fastboot boot
+mkdir -p "$R/out/t" "$R/out/s"; printf t > "$R/out/t/boot_a.img"; printf s > "$R/out/s/boot_a.img"; echo 'negroniusb_lost_reboot=30' > "$R/out/t/cmdline.txt"
+sha256sum "$R/out/s/boot_a.img" | cut -c1-64 > "$R/out/.boot_a.sha256"
+expect_calls "F3 test-boot.sh: the Mi A3 in fastboot: no fastboot boot" 3 "" "fastboot boot" env FAKE_ADB=off sh -c 'cd "$0" && sh scripts/flash/test-boot.sh out/t out/s' "$R"
+expect_calls "F3 test-boot.sh: the phone changes before the boot: no fastboot boot" 3 "" "fastboot boot" env FAKE_ADB=off FAKE_PRODUCT=unknown sh -c 'cd "$0" && sh scripts/flash/test-boot.sh out/t out/s' "$R"
+expect_calls "[R] F3 test-boot.sh: the OnePlus in fastboot: fastboot boot" 0 "fastboot boot" "" env FAKE_ADB=off FAKE_PRODUCT=taro sh -c 'cd "$0" && sh scripts/flash/test-boot.sh out/t out/s' "$R"
 for f in boot vendor_boot dtbo vbmeta; do printf 'x' > "$T/backup/images/$f.img"; done
 printf 'x' > "$R/out/ios16/boot_a.img"
 RS="env BACKUP=$T/backup CONFIRM=yes"
@@ -190,7 +267,7 @@ expect "M4 running-ios: PHONE_SSH cannot fake the fence" 3 "kern.laurel_dualboot
 expect "[R] running-ios: the kernel says fence on: goes" 0 "" env FAKE_ADB=off FAKE_SYSCTL=1 sh "$G/android-guard.sh" running-ios
 # the dual boot script itself: nothing that writes runs without its CONFIRM word
 D=$G/dual-boot.sh
-for s in allocate check-map install flash-slot-b switch to-android remove; do
+for s in gpt-write after-gpt install flash-slot-b switch to-android gpt-restore; do
   expect "[R] dual-boot.sh $s without CONFIRM refused" 4 "CONFIRM=$s" sh "$D" "$s"
 done
 echo "android-guard-test: $n checks, $fails failed"

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Mi A3: read the persistent console logs from the userdata partition over adb, from another system
+# Mi A3: read the persistent console logs from the iosroot partition over adb, from another system
 # (a recovery on boot_b, or Android with root: owner approval, docs/backup-and-restore.md). Only reads.
 #   scripts/laurel/log-pull.sh logs/laurel-pull-$(date +%H%M)
 # 1. The boot log area of kernel patch 2900 (parked, patches/laurel/parked/; negroni 0367 layout): 9216 blocks at partition block
@@ -13,8 +13,8 @@ set -eu
 . "$(dirname "$0")/../lib/env.sh"
 out=${1:?usage: log-pull.sh OUTDIR}
 mkdir -p "$out"
-dev=$(adb shell 'for d in /dev/block/by-name/userdata /dev/block/bootdevice/by-name/userdata; do [ -e $d ] && readlink -f $d && break; done' | tr -d '\r')
-[ -n "$dev" ] || { echo "log-pull: userdata block device not found over adb" >&2; exit 1; }
+dev=$(adb shell 'for d in /dev/block/by-name/iosroot /dev/block/bootdevice/by-name/iosroot; do [ -e $d ] && readlink -f $d && break; done' | tr -d '\r')
+[ -n "$dev" ] || { echo "log-pull: iosroot block device not found over adb" >&2; exit 1; }
 bytes=$(adb shell blockdev --getsize64 "$dev" | tr -d '\r')
 n=$((bytes / 4096))
 skip=$((n - 28673))

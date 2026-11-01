@@ -13,6 +13,14 @@ gpu_fetch_sdk
 S=$REPO/userland/laurel/xnutils
 OLD=$REPO/userland/rebootapp
 N=$OUT/laurel/xnutils
+# XNUTILS_IOS26=1: the iOS 26 root's copy, with the Metal options + bench (helper_ios26.c, bench.m). The default build has neither.
+XT_APP_EXTRA=() XT_HELPER_EXTRA=() XT_FLAGS=()
+if [ "${XNUTILS_IOS26:-0}" = 1 ]; then
+  N=$OUT/ios26/xnutils
+  XT_FLAGS=(-DXT_IOS26=1)
+  XT_APP_EXTRA=("$S/bench.m" -framework QuartzCore)
+  XT_HELPER_EXTRA=("$S/helper_ios26.c")
+fi
 R=$N/root
 A=$R/Applications/XNUtils.app
 DSYM=$N/dsym                      # (gpu_dsym writes here)
@@ -27,9 +35,9 @@ cc_log() { # NAME OUT ARGS...: warnings stop the build, as in notch-build.sh
   [ ! -s "$N/obj/$name.log" ] || { cat "$N/obj/$name.log"; gpu_die "compiler warnings in $name"; }
 }
 cc_log app "$A/XNUtils" -Wextra -Wno-unused-parameter -fobjc-arc -framework UIKit -framework Foundation -framework CoreGraphics \
-  "$S/main.m" "$S/list.m" "$S/stream.m"
+  "${XT_FLAGS[@]+"${XT_FLAGS[@]}"}" "$S/main.m" "$S/list.m" "$S/stream.m" "${XT_APP_EXTRA[@]+"${XT_APP_EXTRA[@]}"}"
 cc_log helper "$R/usr/local/libexec/powermenu-helper" -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -I"$S" \
-  -framework CoreFoundation -framework IOKit \
+  -framework CoreFoundation -framework IOKit "${XT_FLAGS[@]+"${XT_FLAGS[@]}"}" "${XT_HELPER_EXTRA[@]+"${XT_HELPER_EXTRA[@]}"}" \
   "$S/helper.c" "$S/helper_files.c" "$S/collect_ios.c" "$S/collect_files.c" "$S/collect_procs.c" "$S/collect_dev.c" \
   "$S/report_core.c" "$S/report_row.c" "$S/report_gfx.c" "$S/report_sys.c" "$S/report_io.c"
 cc_log pmregister "$R/usr/local/bin/pmregister" -fobjc-arc -framework Foundation "$OLD/pmregister.m"

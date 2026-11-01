@@ -58,10 +58,10 @@ step_fetch() {
   # Extracted again only when a pin or a patch changed (FORCE=1: always): a new extraction makes cargo build the
   # whole bridge again (5-6 min).
   command -v rustup > /dev/null || { echo "metal: rustup missing (https://rustup.rs)" >&2; exit 1; }
-  local stamp=$OUT/metal/src/.laurel-fetch want
+  local stamp=${METAL_OUT:-$OUT/metal}/src/.laurel-fetch want
   want=$( { git -C "$EXT/metal2vulkan" rev-parse HEAD; cat "$REPO/scripts/metal/env.sh" "$REPO/scripts/metal/fetch-sources.sh" \
     "$REPO"/userland/metal/patches/*/*.patch; } | sha256 | cut -c1-16)
-  if [ "${FORCE:-0}" = 1 ] || [ "$(cat "$stamp" 2>/dev/null)" != "$want" ] || [ ! -d "$OUT/metal/src/flame/phone/metal2" ]; then
+  if [ "${FORCE:-0}" = 1 ] || [ "$(cat "$stamp" 2>/dev/null)" != "$want" ] || [ ! -d "${METAL_OUT:-$OUT/metal}/src/flame/phone/metal2" ]; then
     "$REPO/scripts/metal/fetch-sources.sh"
     echo "$want" > "$stamp"
   else
@@ -103,7 +103,7 @@ step_plugin() {
   if [ $LINUX = 0 ]; then "$REPO/scripts/metal/build.sh"; return; fi   # macOS: negroni's build, unchanged
   dsc_mount
   # CMake reads the toolchain's CPU flags (NMTL_CPU_FLAGS) only when it configures: other flags = a new build directory
-  local b=$OUT/metal/build
+  local b=${METAL_OUT:-$OUT/metal}/build
   [ "$(cat "$b/.laurel-flags" 2>/dev/null)" = "$NMTL_CPU_FLAGS" ] || rm -rf "$b"
   mkdir -p "$b"; echo "$NMTL_CPU_FLAGS" > "$b/.laurel-flags"
   # scripts/metal/build.sh with our Linux toolchain file (clang -target arm64-apple-ios16.0 + ld64.lld)
@@ -112,7 +112,7 @@ step_plugin() {
 
 # The A610 facts this path depends on, read from the patched Turnip tree and the staged binaries.
 step_check() {
-  local fail=0 tu=$OUT/gpu/turnip/mesa-25.0.7 st=$OUT/metal/stage
+  local fail=0 tu=${GPU_OUT:-$OUT/gpu}/turnip/mesa-25.0.7 st=${METAL_OUT:-$OUT/metal}/stage
   command -v llvm-objdump > /dev/null && command -v llvm-otool > /dev/null || { echo "check: needs llvm-objdump, llvm-otool"; return 1; }
   if [ -d "$tu" ]; then
     python3 -I "$REPO/scripts/laurel/metal-a610.py" "$tu" "$LAUREL_CHIP_ID" || fail=1
