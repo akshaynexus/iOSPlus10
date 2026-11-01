@@ -4703,5 +4703,6 @@ Branch `t3/laurel-kernel-infra-ports`, patches 2900-2906 (details and expected l
 - Gotcha: an image from before this branch has no sidecar: flash-check refuses it; `STALE_OK=1` flashes it. So does an image from `root-audio.sh --image`.
 - Gotcha: a preflight in the main checkout fails as long as a source is newer than its stage; that is correct. Seen 2026-11-01: `userland/metal/tests/mediaserverd-leak.c`, `userland/camera/media_hooks.c`, `metal_gate.c`.
 - Gotcha for agents: the permission check refuses a `bash -c` script whose text has `rm`: use a script file or the Edit tool.
+- Expected on the next boot (commit and times differ per build): `LAUREL BUILD: 6d170781ff 293 patches, series 2d00631deac21bf8, 4k`; `LAUREL BUILD: image 6d170781ff 20261101T155851Z kernel-series 2d00631deac21bf8 fd 68fda27c: kernel series matches`; `LAUREL BUILD: root ... features 11 installed 11 off 0 missing 0: kernel series matches`. Not seen on a phone yet.
 - Watchdogs: table in build-honest.md section 6. Nothing can reset the phone: IOWatchdog (topaz 0040) never fires, no APSS WDT driver. Only low-risk candidate: `zet=5000`, not booted.
 
