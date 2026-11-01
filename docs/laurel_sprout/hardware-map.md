@@ -30,7 +30,7 @@ DDR banks: not in the DT (ABL fills `memory`). Read them from the live FDT (root
 | Bluetooth | WCN3990 over QUP1 SE9 HS-UART 0x4c90000, SPI 312, GPIO 10-13; supplies L9/L17/L23/L16 (PM6125); fw in `bluetooth_b` partition | Q trinket.dtsi:2048, trinket-qupv3.dtsi:252 | none | patch 2600 (build only): docs/laurel_sprout/bluetooth.md |
 | Audio | ADSP PAS 1 @0xab00000, region 0x55300000 (0x2200000); Bolero rx 0x0a440000, tx 0x0a460000, wsa 0x0a480000, va 0x0a4a0000; WCD937x (reset GPIO 120); speaker MAX98927 @0x3a on QUP0 SE1 I2C 0x04a84000 (reset GPIO 95), SEC_MI2S GPIO 125-128 | Q trinket-audio-overlay.dtsi, X audio.dtsi | ADSP + own codec | **codec + amp differ** |
 | Vibration | PMI632 LDO vibrator (ERM) `qcom,qpnp-vibrator-ldo`, SID 3, base 0x5700, 3.0 V | Q pmi632.dtsi:412 | none | **new driver**: SPMI write + iOS haptics glue |
-| PMICs | SPMI arb core 0x1c40000, chnls 0x1e00000, obsrvr 0x3e00000, intr 0x3f00000, cnfg 0x1c0a000; PM6125 SID 0/1, PMI632 SID 2/3 | Q trinket.dtsi:1948 | check | verify SIDs |
+| PMICs | SPMI arb core 0x1c40000, chnls 0x1e00000, obsrvr 0x3e00000, intr 0x3f00000, cnfg 0x1c0a000; PM6125 SID 0/1, PMI632 SID 2/3 | Q trinket.dtsi:1948 | check | verify SIDs; every SPMI user goes through `sweet_spmi.c` (one lock, 2710) |
 | Charger/gauge | PMI632 smb5 0x1000-0x1600, QG 0x4800; SMB1355 parallel | Q pmi632.dtsi:187-378 | check | verify 0091/0148 |
 | USB | DWC3 0x4e00000, SPI 255, QUSB2 PHY 0x1613000; high-speed only | Q trinket-usb.dtsi | check | verify |
 | UFS | 0x4804000, SPI 356, PHY 0x4807000 | Q trinket.dtsi:937 | same | none |

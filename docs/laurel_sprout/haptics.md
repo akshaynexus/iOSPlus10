@@ -18,13 +18,13 @@ New files: `bsd/dev/laurel_haptic.c`, `iokit/Kernel/arm/LaurelVibrator.cpp`. Tou
 
 ## SPMI [V code, I hardware]
 
-Own lane in `laurel_haptic.c`, no shared state with `sweet_spmi.c` (area D battery reads, 2018 PON lane):
-same arbiter bases as 2018 (core 0x1c40000, config 0x1c0a000, observer 0x3e00000 EE 0 0x80/APID, rw
-0x1e00000 0x10000/APID), APID of PPID 0x357 from the map table (0x900 + 4n), owner (0x700 + 4n) must be
-EE 0. Read = observer EXT_READL (cmd `1<<27 | off<<4 | n-1`, status +0x08, RDATA0 +0x18); write =
-rw-channel EXT_WRITEL (WDATA0 +0x10, cmd `off<<4 | n-1`). Same command format as the 2018 PON write that
-works on the phone. Each APID has its own command registers, so this lane and area D's lanes do not
-race. Overlap to know: both files hard-code the arbiter bases; if area D moves them, change both.
+2710: through the one SPMI core of `sweet_spmi.c` (one transaction lock and one channel map for every SPMI user;
+docs/laurel_sprout/battery-power.md "SPMI: one core"). APID of PPID 0x357 from the core's map, owner must be EE 0, the
+core maps its rw channel. Read = observer EXT_READL (cmd `1<<27 | off<<4 | n-1`, status +0x08, RDATA0 +0x18); write =
+rw-channel EXT_WRITEL (WDATA0 +0x10, cmd `off<<4 | n-1`). Same command format as the 2018 PON write that works on the
+phone. 2700 had its own lane and lock, with the claim "each APID has its own command registers, so the lanes do not
+race": wrong [V boot 06:17: status 0x9 DROPPED and crossed RDATA between users without one lock]. The watchdog no longer
+needs a try-lock: the core lock is held for one transaction only (interrupts off, <= ~1 ms).
 
 ## Motor policy
 

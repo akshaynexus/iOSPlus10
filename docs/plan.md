@@ -668,3 +668,12 @@ Observed [V, USB log logs/usblog-20261101-001446.txt]:
   (screen surfaces from the GPU pool), AppleARMBacklight in use, first frame 31 s after boot.
 Next: BT in SE DMA mode (t3/laurel-bt-se-dma); GPU upstream sync + SMMU stage-1 + Metal optimisation (t3/laurel-gpu-upstream-opt);
 Wi-Fi MAC; charging stays supervised.
+
+## Mi A3: phantom key presses fixed in the kernel (2026-11-01 06:40, branch t3/laurel-spmi-phantom-keys, patch 2710)
+
+Observed [V, USB log, boot 06:17]: power + vol-down / vol-up "presses" every 10 s with nobody at the phone; SPMI status 0x9
+(DROPPED). Cause: keys, battery/charger and vibrator used the SPMI arbiter without one lock [V source; I hardware model].
+Done: one SPMI core in sweet_spmi.c (one lock, one channel map, status check, timeout), all users moved to it; keys need 2
+agreeing clean polls. Built 243/243, 0 LSE (sha256 94981b65...). Not booted.
+Next: boot it; leave the phone untouched 5 min: no `SWEET KEYS: key=` line; `LAUREL SPMI: on: ... users: pon keys battery
+haptic; spmi errors ...` and the 5-min `LAUREL BATTERY` line show the error counts.

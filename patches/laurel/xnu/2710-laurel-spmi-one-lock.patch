@@ -1,0 +1,1259 @@
+laurel 2710: one SPMI core for every SPMI user (phantom key presses every 10 s). Boot 2026-11-01 06:17 (nobody at the phone): `SWEET KEYS: key=0 down=1 pon=0x7f` + key=2 at 06:19:17/27/37 (every 10 s = the charger guard timer / battery poll), vol-up `gpio4:c110=0x78/0x28/0x18` (bit 0 low = pressed) at :x5 every 10 s, and `SWEET KEYS: read error ... arb-status=0x9` (STATUS DONE + DROPPED). Cause: three SPMI users each had their own path to the same arbiter v5: sweet_keys.c (own map, no lock, polls PON APID 112 + GPIO5 APID 124 every 20 ms), sweet_spmi.c (IOLock for the battery; the PON and USBIN lanes without a lock) and laurel_haptic.c (own map, own mutex; "each APID has its own command registers, so the lanes do not race"). Two commands at the same time on two observer channels of EE 0 were dropped (0x9) or completed with the other command's RDATA (pon/gpio values that are battery data), and the keys thread took one bad read as a press. Linux spmi-pmic-arb.c holds one lock (pmic_arb->lock, raw spinlock, irqsave) over every transaction. New: sweet_spmi.c is the one core: one channel map (PPID -> APID, owner EE, read once at init, under a mutex), one transaction lock (LDXR/STXR word, interrupts off, held from the command store to the RDATA read; power off / restart / panic hold users run after a 5 ms wait without it, counted as forced), DONE wait 1 ms, FAILURE/DENIED/DROPPED = error, timeout poisons the APID. sweet_keys.c, laurel_haptic.c, the PON lane (laurel_reboot.c, laurel_pmi632.c), the USBIN lane and sweet_spmi_read/_write (battery, charger, ADC, SDAM, thermal) all use it. Keys: a key changes only after 2 agreeing valid polls (20 ms apart); a failed read never changes a key. Lines: `LAUREL SPMI: on: arbiter 0x50010000, 256 APIDs, one lock and one channel map for every transaction; users: pon keys battery haptic; spmi errors pon 0 keys 0 battery 0 haptic 0, forced 0` (60 s after the first SPMI init), the 5-min `LAUREL BATTERY: on: ...; spmi errors ...`, `LAUREL KEYS: on: ...; shared SPMI lock, a change needs 2 agreeing reads`. Kill switches unchanged (sweetkeys=0, laurel_haptic=0, laurelbatt=0). Details: docs/laurel_sprout/battery-power.md "SPMI: one core".
+
+diff -ruN a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,41 +1,80 @@
+ /*
+- * Battery adaptation of input/sweet_keys.c, observer EXT_READL.
+- * laurel 2300: plus owner-checked writes to a short list of PMI632 registers
+- * (charger limits, ADC conversion request, our SDAM record), see sweet_spmi_write.
+- * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
++ * The one SPMI core of the Mi A3 kernel (laurel 2710; first written as the battery adaptation of
++ * input/sweet_keys.c, observer EXT_READL).
++ *
++ * laurel 2710: every SPMI user of this kernel goes through this file: the PON lane (2018/2302 reboot
++ * and power off), the keys (sweet_keys.c), the battery, charger, ADC and SDAM (laurel_pmi632.c,
++ * SweetBattery.cpp, laurel_thermal.c) and the vibrator (laurel_haptic.c). One lock (sp_xfer_take) is
++ * held over each transaction, from the command store to the read of RDATA, as Linux spmi-pmic-arb.c
++ * holds pmic_arb->lock (raw spinlock, interrupts off) over pmic_arb_read_cmd / pmic_arb_write_cmd.
++ * One channel map (PPID -> APID, owner EE), read once from the arbiter at init.
++ * Why (boot 2026-11-01 06:17, logs/usblog-20261101-001446.txt): the keys thread had its own map and
++ * no lock; the battery and the vibrator had their own locks. Two commands on two observer channels
++ * at the same time gave status 0x9 (DONE + DROPPED) or a DONE with the RDATA of the other command:
++ * "SWEET KEYS: key=0 down=1 pon=0x7f" every 10 s (the charger guard / battery poll) with nobody
++ * at the phone.
++ *
++ * laurel 2300: owner-checked writes to a short list of PMI632 registers (charger limits, ADC
++ * conversion request, our SDAM record), see sweet_spmi_write.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
+ #include <machine/machine_routines.h>
+-#include <IOKit/IOLocks.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern boolean_t ml_set_interrupts_enabled(boolean_t);
+ 
+ /*
+  * laurel 2018 (Mi A3, SM6125 trinket.dtsi spmi@1c40000): core 0x1c40000, rw channels 0x1e00000
+  * (0x10000 per APID), observer 0x3e00000 (0x80 per APID, EE 0), config 0x1c0a000. Arbiter v5: the
+  * same layout as topaz (khaje), only the bases differ (the topaz bases 0x0c440000/0x0e600000 are
+  * not SPMI on trinket: "SWEET BATTERY: static fallback" on every Mi A3 boot before this patch).
+- * Adds the PON lane (sid 0, peripheral 0x08) for the restart reason: observer read + EXT_WRITEL on
+- * the rw channel, without the lock (own APID lane; usable in the panic hold).
++ * Channel registers (both kinds): CMD +0x00, WDATA0 +0x10, STATUS +0x08, RDATA0 +0x18.
++ * STATUS: bit 0 DONE, bit 1 FAILURE, bit 2 DENIED, bit 3 DROPPED (spmi-pmic-arb.c PMIC_ARB_STATUS_*).
+  */
+ #define SP_CORE_PA 0x01c40000u
+ #define SP_OBS_PA  0x03e00000u
+ #define SP_CFG_PA  0x01c0a000u
+ #define SP_RW_PA   0x01e00000u
+ #define SP_PON_PPID 0x008u
++#define SP_USBIN_PPID 0x213u
+ #define SP_NO_APID 0xffffu
++#define SP_MAX_APID 512u
++#define SP_ERR_BITS 0x0eu
++#define SP_TIMEOUT_US 1000u     /* spmi-pmic-arb.c PMIC_ARB_TIMEOUT_US */
++#define SP_LOCK_WAIT_US 5000u   /* a holder keeps the lock <= ~1 ms (one timed-out transaction) */
++
++static LCK_GRP_DECLARE(sp_grp, "sweet_spmi");
++static LCK_MTX_DECLARE(sp_map_mtx, &sp_grp);    /* init and the rw channel mappings (thread context) */
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+-static vm_offset_t sp_pon_rw;            /* rw channel lane of the PON APID, mapped at init */
++static vm_offset_t sp_rw[SP_MAX_APID];          /* rw channel page per APID (EE 0 owned only) */
++static uint16_t sp_apid_of[4096];               /* the channel map: PPID -> APID (SP_NO_APID: none) */
++static uint8_t sp_owner_of[SP_MAX_APID];        /* owner EE of each APID, cnfg 0x700 + 4n [2:0] */
+ static uint16_t sp_pon_apid = SP_NO_APID;
+-static IOLock *sp_lock;
++static uint32_t sp_version;
+ static unsigned sp_count;
+-static bool sp_attempted, sp_ready;
+-/* A timed-out command may complete late: never reuse that lane this boot. */
+-static bool sp_poisoned[512];
++static bool sp_attempted;
++static volatile bool sp_ready;
++/* A timed-out command may complete late: never reuse that APID this boot. */
++static volatile bool sp_poisoned[SP_MAX_APID];
++
++/* the transaction lock: one word, LDXR/STXR (no LSE: Kryo 260 is ARMv8.0), interrupts off */
++static volatile uint32_t sp_xfer_word;
++
++/* users and error counts (sweet_spmi_errors) */
++static const char *const sp_user_name[SWEET_SPMI_USERS] = {
++	"pon", "keys", "battery", "haptic",
++};
++static volatile uint32_t sp_registered;          /* bit per user */
++static volatile uint32_t sp_errs[SWEET_SPMI_USERS];
++static volatile uint32_t sp_forced;             /* emergency transactions that ran without the lock */
++static thread_call_t sp_summary_call;
+ 
+ static uint32_t
+ sp_rd(vm_offset_t base, unsigned off)
+@@ -45,111 +84,347 @@
+ 	return value;
+ }
+ 
+-static uint16_t
+-sp_find_apid(unsigned ppid)
++static uint64_t
++sp_us_to_abs(uint32_t us)
+ {
+-	uint16_t found = SP_NO_APID;
+-	for (unsigned i = 0; i < sp_count; ++i) {
+-		uint32_t map = sp_rd(sp_core, 0x900u + 4u * i);
+-		if (!map || ((map >> 8) & 0xfffu) != ppid) {
+-			continue;
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &abs);
++	return abs;
++}
++
++/*
++ * Take the transaction lock with the interrupts off (no preemption: a holder always ends its
++ * transaction within ~1 ms). emergency = power off / restart / panic hold: a holder that cannot run
++ * (CPU stopped in a panic) must not block the reset, so after SP_LOCK_WAIT_US the transaction runs
++ * without the lock (counted in sp_forced). Others give up (-1) after the same wait.
++ */
++static int
++sp_xfer_take(boolean_t *istate, bool emergency)
++{
++	*istate = ml_set_interrupts_enabled(FALSE);
++	uint64_t deadline = 0;
++	for (;;) {
++		uint32_t expected = 0;
++		if (__atomic_compare_exchange_n(&sp_xfer_word, &expected, 1u, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++			return 1;
+ 		}
+-		unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * i) & 7u;
+-		if (found == SP_NO_APID || owner == 0) {
+-			found = (uint16_t)i;
++		uint64_t now = mach_absolute_time();
++		if (deadline == 0) {
++			deadline = now + sp_us_to_abs(SP_LOCK_WAIT_US);
++		} else if (now > deadline) {
++			if (emergency) {
++				__atomic_fetch_add(&sp_forced, 1u, __ATOMIC_RELAXED);
++				return 0;       /* forced: do not release a lock we do not hold */
++			}
++			ml_set_interrupts_enabled(*istate);
++			return -1;
++		}
++		__asm__ volatile("yield");
++	}
++}
++
++static void
++sp_xfer_give(boolean_t istate, int held)
++{
++	if (held == 1) {
++		__atomic_store_n(&sp_xfer_word, 0u, __ATOMIC_RELEASE);
++	}
++	ml_set_interrupts_enabled(istate);
++}
++
++/* wait for DONE on a channel: 0 done, -1 done with FAILURE/DENIED/DROPPED (status in *st), -2 timeout */
++static int
++sp_wait_done(vm_offset_t ch, uint32_t *st)
++{
++	uint32_t status = 0;
++	for (unsigned i = 0; i < SP_TIMEOUT_US; ++i) {
++		status = sp_rd(ch, 0x08u);
++		if (status & 1u) {
++			*st = status;
++			return (status & SP_ERR_BITS) ? -1 : 0;
++		}
++		delay(1);
++	}
++	*st = status;
++	return -2;
++}
++
++static void
++sp_count_err(int user)
++{
++	if (user >= 0 && user < SWEET_SPMI_USERS) {
++		__atomic_fetch_add(&sp_errs[user], 1u, __ATOMIC_RELAXED);
++	}
++}
++
++/*
++ * One transaction under the lock. read: EXT_READL on the APID's observer channel (EE 0), write:
++ * EXT_WRITEL on the APID's rw channel. n = 1..4 bytes from reg. 0 ok, -1 failed (error bits, lock
++ * busy, unknown/poisoned APID), -2 timeout (the APID is poisoned for this boot).
++ */
++static int
++sp_xfer(int user, bool write, uint16_t apid, unsigned reg, uint8_t *buf, unsigned n, bool emergency, uint32_t *status)
++{
++	uint32_t st = 0;
++	if (status) {
++		*status = 0;
++	}
++	if (!sp_ready || apid >= sp_count || sp_poisoned[apid] || n == 0 || n > 4) {
++		sp_count_err(user);
++		return -1;
++	}
++	vm_offset_t ch = write ? sp_rw[apid] : sp_obs + 0x80u * apid;
++	if (!ch) {
++		sp_count_err(user);
++		return -1;
++	}
++	uint32_t cmd = ((write ? 0u : 1u) << 27) | ((reg & 0xffu) << 4) | ((n - 1u) & 7u);
++	uint32_t wdata = 0;
++	if (write) {
++		for (unsigned i = 0; i < n; i++) {
++			wdata |= (uint32_t)buf[i] << (8u * i);
+ 		}
+ 	}
+-	return found;
++	boolean_t istate;
++	int held = sp_xfer_take(&istate, emergency);
++	if (held < 0) {
++		sp_count_err(user);
++		return -1;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	if (write) {
++		*(volatile uint32_t *)(ch + 0x10u) = wdata;     /* WDATA0 */
++	}
++	*(volatile uint32_t *)ch = cmd;
++	__asm__ volatile("dsb osh" ::: "memory");
++	int rc = sp_wait_done(ch, &st);
++	uint32_t rdata = (rc == 0 && !write) ? sp_rd(ch, 0x18u) : 0;      /* RDATA0, still under the lock */
++	if (rc == -2) {
++		sp_poisoned[apid] = true;
++	}
++	sp_xfer_give(istate, held);
++	if (status) {
++		*status = st;
++	}
++	if (rc != 0) {
++		sp_count_err(user);
++		return rc;
++	}
++	if (!write) {
++		for (unsigned i = 0; i < n; i++) {
++			buf[i] = (uint8_t)(rdata >> (8u * i));
++		}
++	}
++	return 0;
++}
++
++static uint16_t
++sp_find_apid(unsigned ppid)
++{
++	return (sp_ready && ppid < 4096u) ? sp_apid_of[ppid] : SP_NO_APID;
++}
++
++/* map the rw channel of an EE 0 APID (thread context, sp_map_mtx) */
++static vm_offset_t
++sp_map_rw_locked(uint16_t apid)
++{
++	if (apid >= sp_count || sp_owner_of[apid] != 0) {
++		return 0;
++	}
++	if (!sp_rw[apid]) {
++		sp_rw[apid] = ml_io_map(SP_RW_PA + 0x10000u * apid, 0x1000);
++	}
++	return sp_rw[apid];
++}
++
++/* the startup line: arbiter, the one lock and the users that registered in the first 60 s */
++static void
++sp_summary_fire(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	char users[64];
++	sweet_spmi_users(users, sizeof(users));
++	char errs[96];
++	sweet_spmi_errors(errs, sizeof(errs));
++	printf("LAUREL SPMI: on: arbiter %#x, %u APIDs, one lock and one channel map for every transaction; users: %s; %s\n",
++	    sp_version, sp_count, users[0] ? users : "none", errs);
+ }
+ 
+ int
+ sweet_spmi_init(void)
+ {
++	lck_mtx_lock(&sp_map_mtx);
+ 	if (sp_attempted) {
++		lck_mtx_unlock(&sp_map_mtx);
+ 		return sp_ready ? 0 : -1;
+ 	}
+ 	sp_attempted = true;
+-	sp_lock = IOLockAlloc();
+-	if (!sp_lock) {
+-		return -1;
+-	}
+ 	sp_core = ml_io_map(SP_CORE_PA, 0x2000);
+ 	sp_cfg = ml_io_map(SP_CFG_PA, 0x1000);
+ 	sp_obs = ml_io_map(SP_OBS_PA, 0x10000); /* EE 0, 512 * 0x80 */
+ 	if (!sp_core || !sp_cfg || !sp_obs) {
+-		printf("SWEET BATTERY: SPMI mapping failed\n");
++		lck_mtx_unlock(&sp_map_mtx);
++		printf("LAUREL SPMI: off: arbiter mapping failed (keys, battery, vibrator and PON reason off)\n");
+ 		return -1;
+ 	}
+-	uint32_t arb_version = sp_rd(sp_core, 0);
++	sp_version = sp_rd(sp_core, 0);
+ 	sp_count = sp_rd(sp_core, 4) & 0x7ffu;
+-	if (arb_version < 0x50000000u || arb_version >= 0x70000000u ||
+-	    !sp_count || sp_count > 512) {
+-		printf("SWEET BATTERY: unsupported SPMI arb=%#x APIDs=%u\n",
+-		    arb_version, sp_count);
++	if (sp_version < 0x50000000u || sp_version >= 0x70000000u || !sp_count || sp_count > SP_MAX_APID) {
++		lck_mtx_unlock(&sp_map_mtx);
++		printf("LAUREL SPMI: off: arbiter %#x with %u APIDs is not v5 (keys, battery, vibrator and PON reason off)\n",
++		    sp_version, sp_count);
+ 		return -1;
+ 	}
++	/* the channel map: v5 can map one PPID more than once; the apps-owned (EE 0) entry wins */
++	for (unsigned p = 0; p < 4096u; ++p) {
++		sp_apid_of[p] = SP_NO_APID;
++	}
++	for (unsigned i = 0; i < sp_count; ++i) {
++		uint32_t map = sp_rd(sp_core, 0x900u + 4u * i);
++		unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * i) & 7u;
++		sp_owner_of[i] = (uint8_t)owner;
++		if (!map) {
++			continue;
++		}
++		unsigned ppid = (map >> 8) & 0xfffu;
++		if (sp_apid_of[ppid] == SP_NO_APID || owner == 0) {
++			sp_apid_of[ppid] = (uint16_t)i;
++		}
++	}
+ 	sp_ready = true;
+ 	sp_pon_apid = sp_find_apid(SP_PON_PPID);
+-	if (sp_pon_apid != SP_NO_APID) {
+-		sp_pon_rw = ml_io_map(SP_RW_PA + 0x10000u * sp_pon_apid, 0x1000);
++	vm_offset_t pon_rw = sp_pon_apid != SP_NO_APID ? sp_map_rw_locked(sp_pon_apid) : 0;
++	sp_summary_call = thread_call_allocate(sp_summary_fire, NULL);
++	lck_mtx_unlock(&sp_map_mtx);
++	if (sp_summary_call) {
++		uint64_t deadline;
++		clock_interval_to_deadline(60, NSEC_PER_SEC, &deadline);
++		thread_call_enter_delayed(sp_summary_call, deadline);
+ 	}
+ 	printf("SWEET BATTERY: SPMI arb=%#x APIDs=%u, observer reads; PON APID %u rw lane %s\n",
+-	    arb_version, sp_count, sp_pon_apid, sp_pon_rw ? "mapped" : "none");
++	    sp_version, sp_count, sp_pon_apid, pon_rw ? "mapped" : "none");
+ 	return 0;
+ }
+ 
+-/* laurel 2018: PON lane, no lock (its APID is used by nobody else in this kernel). */
+-static int
+-sp_pon_wait(vm_offset_t base, unsigned off)
++int
++sweet_spmi_register(int user)
+ {
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(base, off + 0x08u);
+-		if (status & 1u) {
+-			return (status & 0x0eu) ? -1 : 0;
++	if (user < 0 || user >= SWEET_SPMI_USERS || sweet_spmi_init() != 0) {
++		return -1;
++	}
++	__atomic_fetch_or(&sp_registered, 1u << user, __ATOMIC_RELAXED);
++	return 0;
++}
++
++void
++sweet_spmi_users(char *buf, size_t len)
++{
++	size_t at = 0;
++	if (!buf || !len) {
++		return;
++	}
++	buf[0] = 0;
++	for (int u = 0; u < SWEET_SPMI_USERS; ++u) {
++		if (sp_registered & (1u << u)) {
++			int w = snprintf(buf + at, len - at, "%s%s", at ? " " : "", sp_user_name[u]);
++			if (w < 0 || (size_t)w >= len - at) {
++				break;
++			}
++			at += (size_t)w;
+ 		}
+-		delay(1);
+ 	}
+-	return -1;
++}
++
++void
++sweet_spmi_errors(char *buf, size_t len)
++{
++	if (!buf || !len) {
++		return;
++	}
++	(void)snprintf(buf, len, "spmi errors pon %u keys %u battery %u haptic %u, forced %u",
++	    sp_errs[SWEET_SPMI_PON], sp_errs[SWEET_SPMI_KEYS], sp_errs[SWEET_SPMI_BATTERY],
++	    sp_errs[SWEET_SPMI_HAPTIC], sp_forced);
+ }
+ 
+ int
++sweet_spmi_apid(unsigned sid, unsigned peripheral, int *owner)
++{
++	if (!sp_ready || sid > 15 || peripheral > 0xff) {
++		return -1;
++	}
++	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
++	if (apid == SP_NO_APID) {
++		return -1;
++	}
++	if (owner) {
++		*owner = sp_owner_of[apid];
++	}
++	return apid;
++}
++
++int
++sweet_spmi_rw_map(unsigned apid)
++{
++	if (!sp_ready || apid >= sp_count) {
++		return -1;
++	}
++	lck_mtx_lock(&sp_map_mtx);
++	vm_offset_t rw = sp_map_rw_locked((uint16_t)apid);
++	lck_mtx_unlock(&sp_map_mtx);
++	return rw ? 0 : -1;
++}
++
++int
++sweet_spmi_ext_read(int user, unsigned apid, unsigned reg, uint8_t *buf, unsigned n, uint32_t *status)
++{
++	if (!buf || apid >= SP_MAX_APID) {
++		sp_count_err(user);
++		return -1;
++	}
++	return sp_xfer(user, false, (uint16_t)apid, reg, buf, n, false, status);
++}
++
++int
++sweet_spmi_ext_write(int user, unsigned apid, unsigned reg, const uint8_t *buf, unsigned n, bool emergency)
++{
++	if (!buf || apid >= SP_MAX_APID) {
++		sp_count_err(user);
++		return -1;
++	}
++	return sp_xfer(user, true, (uint16_t)apid, reg, (uint8_t *)(uintptr_t)buf, n, emergency, NULL);
++}
++
++/* laurel 2018: PON lane (PM6125 SID 0 0x800): also the power-off / restart / panic-hold path */
++int
+ sweet_spmi_pon_read(unsigned addr, uint8_t *out)
+ {
+ 	if (!sp_ready || sp_pon_apid == SP_NO_APID || (addr >> 8) != SP_PON_PPID || !out) {
+ 		return -1;
+ 	}
+-	unsigned off = 0x80u * sp_pon_apid;
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_obs + off) = (1u << 27) | ((addr & 0xffu) << 4); /* EXT_READL, 1 byte */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	if (sp_pon_wait(sp_obs, off) != 0) {
++	uint8_t v = 0;
++	if (sp_xfer(SWEET_SPMI_PON, false, sp_pon_apid, addr, &v, 1, true, NULL) != 0) {
+ 		return -1;
+ 	}
+-	*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++	*out = v;
+ 	return 0;
+ }
+ 
+ int
+ sweet_spmi_pon_write(unsigned addr, uint8_t val)
+ {
+-	if (!sp_ready || !sp_pon_rw || (addr >> 8) != SP_PON_PPID) {
++	if (!sp_ready || sp_pon_apid == SP_NO_APID || (addr >> 8) != SP_PON_PPID) {
+ 		return -1;
+ 	}
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_pon_rw + 0x10u) = val;                               /* WDATA0 */
+-	*(volatile uint32_t *)(sp_pon_rw + 0x00u) = (0u << 27) | ((addr & 0xffu) << 4); /* EXT_WRITEL, 1 byte */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	return sp_pon_wait(sp_pon_rw, 0);
++	return sp_xfer(SWEET_SPMI_PON, true, sp_pon_apid, addr, &val, 1, true, NULL) == 0 ? 0 : -1;
+ }
+ 
+ /*
+- * laurel 2300: the PMI632 (SID 2) battery, charger, ADC and SDAM blocks, and locked writes.
++ * laurel 2300: the PMI632 (SID 2) battery, charger, ADC and SDAM blocks, and owner-checked writes.
+  * Mi A3 PMICs (trinket.dtsi, pmi632.dtsi): PM6125 = SID 0/1, PMI632 = SID 2/3. Before this patch
+  * the reader took SID 0 only (the PM6150 map of sweet): no PMI632 register was reachable.
+  * Reads: observer channel (EE 0) of the peripheral's APID, any owner. Writes: the APID's rw channel,
+  * only when the ownership table (cnfg 0x700 + 4 * APID, [2:0]) gives the APID to EE 0 (apps), as
+  * spmi-pmic-arb.c pmic_arb_write_cmd checks; an APID owned by another EE is refused (-1), never
+- * forced. Both are limited to the peripherals below; the keys and the PON lane keep their own paths.
++ * forced. Both are limited to the peripherals below.
+  */
+ static bool
+ sp_read_allowed(unsigned sid, unsigned peripheral)
+@@ -185,21 +460,13 @@
+ 	}
+ }
+ 
+-static vm_offset_t sp_rw[512];          /* rw channel page per APID, mapped on the first write */
+-
+-static int
+-sp_wait_done(vm_offset_t base, unsigned off, uint16_t apid, unsigned sid, unsigned addr)
++static void
++sp_timeout_line(int rc, unsigned sid, unsigned addr)
+ {
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		uint32_t status = sp_rd(base, off + 0x08u);
+-		if (status & 1u) {
+-			return (status & 0x0eu) ? -1 : 0;
+-		}
+-		delay(1);
++	if (rc == -2) {
++		printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
++		    sid, addr, sp_find_apid((sid << 8) | (addr >> 8)));
+ 	}
+-	sp_poisoned[apid] = true;
+-	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
+-	return -1;
+ }
+ 
+ int
+@@ -209,43 +476,34 @@
+ 	if (!sp_ready || !out || addr > 0xffffu || !sp_read_allowed(sid, peripheral)) {
+ 		return -1;
+ 	}
+-	IOLockLock(sp_lock);
+ 	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+-	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+-		IOLockUnlock(sp_lock);
++	if (apid == SP_NO_APID) {
+ 		return -1;
+ 	}
+-	unsigned off = 0x80u * apid;
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_obs + off) = (1u << 27) | ((addr & 0xffu) << 4); /* EXT_READL, BC=0 */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	int rc = sp_wait_done(sp_obs, off, apid, sid, addr);
+-	if (rc == 0) {
+-		*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++	uint8_t v = 0;
++	int rc = sp_xfer(SWEET_SPMI_BATTERY, false, apid, addr, &v, 1, false, NULL);
++	sp_timeout_line(rc, sid, addr);
++	if (rc != 0) {
++		return -1;
+ 	}
+-	IOLockUnlock(sp_lock);
+-	return rc;
++	*out = v;
++	return 0;
+ }
+ 
+ int
+ sweet_spmi_owner(unsigned sid, unsigned peripheral)
+ {
+-	if (!sp_ready || sid > 15 || peripheral > 0xff) {
+-		return -1;
+-	}
+-	IOLockLock(sp_lock);
+-	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+-	int owner = apid == SP_NO_APID ? -1 : (int)(sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u);
+-	IOLockUnlock(sp_lock);
+-	return owner;
++	int owner = -1;
++	return sweet_spmi_apid(sid, peripheral, &owner) < 0 ? -1 : owner;
+ }
+ 
+ /*
+- * laurel 2300: PMI632 USBIN_CMD_IL (SID 2, 0x1340) on its own rw lane, no lock: the USB input suspend
+- * of the charger loop must be released in the power-off / restart path (panic hold, timer call), where
+- * the IOLock cannot be taken. Mapped once in thread context, only for an EE 0 APID.
++ * laurel 2300: PMI632 USBIN_CMD_IL (SID 2, 0x1340): the USB input suspend of the charger loop must be
++ * released in the power-off / restart path (panic hold, timer call). 2710: the same lock as every
++ * other transaction, taken as an emergency user (sp_xfer_take). Mapped once in thread context, only
++ * for an EE 0 APID.
+  */
+-static vm_offset_t sp_usbin_rw;
++static uint16_t sp_usbin_apid = SP_NO_APID;
+ 
+ int
+ sweet_spmi_usbin_lane_init(void)
+@@ -253,29 +511,24 @@
+ 	if (!sp_ready) {
+ 		return -1;
+ 	}
+-	if (sp_usbin_rw) {
++	if (sp_usbin_apid != SP_NO_APID) {
+ 		return 0;
+ 	}
+-	IOLockLock(sp_lock);
+-	uint16_t apid = sp_find_apid((2u << 8) | 0x13u);
+-	if (apid != SP_NO_APID && (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) == 0) {
+-		sp_usbin_rw = ml_io_map(SP_RW_PA + 0x10000u * apid, 0x1000);
++	uint16_t apid = sp_find_apid(SP_USBIN_PPID);
++	if (apid == SP_NO_APID || sweet_spmi_rw_map(apid) != 0) {
++		return -1;
+ 	}
+-	IOLockUnlock(sp_lock);
+-	return sp_usbin_rw ? 0 : -1;
++	sp_usbin_apid = apid;
++	return 0;
+ }
+ 
+ int
+ sweet_spmi_usbin_lane_write(unsigned reg, uint8_t val)
+ {
+-	if (!sp_usbin_rw || reg != 0x40u) {
++	if (sp_usbin_apid == SP_NO_APID || reg != 0x40u) {
+ 		return -1;
+ 	}
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_usbin_rw + 0x10u) = val;                 /* WDATA0 */
+-	*(volatile uint32_t *)(sp_usbin_rw + 0x00u) = (reg & 0xffu) << 4;  /* EXT_WRITEL, BC=0 */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	return sp_pon_wait(sp_usbin_rw, 0);
++	return sp_xfer(SWEET_SPMI_BATTERY, true, sp_usbin_apid, reg, &val, 1, true, NULL) == 0 ? 0 : -1;
+ }
+ 
+ int
+@@ -284,26 +537,12 @@
+ 	if (!sp_ready || addr > 0xffffu || !sp_write_allowed(sid, addr)) {
+ 		return -1;
+ 	}
+-	IOLockLock(sp_lock);
+ 	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
+-	if (apid == SP_NO_APID || sp_poisoned[apid] || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
+-		IOLockUnlock(sp_lock);
++	if (apid == SP_NO_APID || sp_owner_of[apid] != 0 || sweet_spmi_rw_map(apid) != 0) {
+ 		return -1;
+ 	}
+-	if (!sp_rw[apid]) {
+-		sp_rw[apid] = ml_io_map(SP_RW_PA + 0x10000u * apid, 0x1000);
+-		if (!sp_rw[apid]) {
+-			IOLockUnlock(sp_lock);
+-			return -1;
+-		}
+-	}
+-	vm_offset_t rw = sp_rw[apid];
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(rw + 0x10u) = val;                               /* WDATA0 */
+-	*(volatile uint32_t *)(rw + 0x00u) = ((addr & 0xffu) << 4);             /* EXT_WRITEL (0), BC=0 */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	int rc = sp_wait_done(rw, 0, apid, sid, addr);
+-	IOLockUnlock(sp_lock);
+-	return rc;
++	int rc = sp_xfer(SWEET_SPMI_BATTERY, true, apid, addr, &val, 1, false, NULL);
++	sp_timeout_line(rc, sid, addr);
++	return rc == 0 ? 0 : -1;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -1,25 +1,54 @@
+-/* Shared C/C++ interface. Init once, on the SweetBattery start thread. */
++/* Shared C/C++ interface of the one SPMI core (sweet_spmi.c). Init once from thread context. */
+ #ifndef SWEET_BATTERY_SPMI_H
+ #define SWEET_BATTERY_SPMI_H
+ #include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+-/* laurel 2018: PM6125 PON (sid 0, 0x800) over its own APID lane, no lock, usable in the
+- * panic hold and from a timer call: observer read and EXT_WRITEL. 0 success, -1 failure. */
++/* laurel 2018: PM6125 PON (sid 0, 0x800), usable in the panic hold and from a timer call:
++ * observer read and EXT_WRITEL. 2710: under the one SPMI lock (emergency user). 0 success, -1 failure. */
+ int sweet_spmi_pon_read(unsigned addr, uint8_t *out);
+ int sweet_spmi_pon_write(unsigned addr, uint8_t val);
+-/* laurel 2300: owner (EE) of a peripheral's APID, -1 when it has none. Thread context. */
++/* laurel 2300: owner (EE) of a peripheral's APID, -1 when it has none. */
+ int sweet_spmi_owner(unsigned sid, unsigned peripheral);
+ /* laurel 2300: one-byte write over the APID's rw channel; only EE 0 APIDs and the listed
+  * PMI632 registers (sweet_spmi.c sp_write_allowed). 0 success, -1 refused or failed. Thread context. */
+ int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
+-/* laurel 2300: lock-free lane to PMI632 USBIN_CMD_IL 0x1340 (reg 0x40 only); init in thread context. */
++/* laurel 2300: lane to PMI632 USBIN_CMD_IL 0x1340 (reg 0x40 only); init in thread context;
++ * the write is usable in the power-off / restart path (2710: emergency user of the one lock). */
+ int sweet_spmi_usbin_lane_init(void);
+ int sweet_spmi_usbin_lane_write(unsigned reg, uint8_t val);
++
++/*
++ * laurel 2710: the one SPMI core. Every SPMI user registers (sweet_spmi_register) and does each
++ * transaction through sweet_spmi_ext_read / _ext_write: one lock over the command, the wait for
++ * DONE (1 ms timeout) and the read of RDATA; STATUS FAILURE/DENIED/DROPPED = error. One channel
++ * map (PPID -> APID, owner EE) read at init. Return codes: 0 ok, -1 error, -2 timeout (APID off).
++ */
++enum {
++	SWEET_SPMI_PON = 0,     /* laurel_reboot.c, laurel_pmi632.c PON reasons, charge-mode power key */
++	SWEET_SPMI_KEYS,        /* sweet_keys.c */
++	SWEET_SPMI_BATTERY,     /* laurel_pmi632.c, SweetBattery.cpp, laurel_thermal.c (sweet_spmi_read/_write) */
++	SWEET_SPMI_HAPTIC,      /* laurel_haptic.c */
++	SWEET_SPMI_USERS
++};
++int sweet_spmi_register(int user);
++/* APID of PPID (sid << 8 | peripheral), -1 when none; *owner = owner EE when owner != NULL */
++int sweet_spmi_apid(unsigned sid, unsigned peripheral, int *owner);
++/* map the rw channel of an EE 0 APID (thread context); 0 ok, -1 not EE 0 / mapping failed */
++int sweet_spmi_rw_map(unsigned apid);
++/* n = 1..4 bytes at register reg (offset in the peripheral); *status = the channel STATUS when != NULL */
++int sweet_spmi_ext_read(int user, unsigned apid, unsigned reg, uint8_t *buf, unsigned n, uint32_t *status);
++/* emergency = power off / restart / panic hold: runs even when the lock stays busy for 5 ms */
++int sweet_spmi_ext_write(int user, unsigned apid, unsigned reg, const uint8_t *buf, unsigned n, bool emergency);
++/* "pon keys battery haptic" (registered users) and "spmi errors pon N keys N ..., forced N" */
++void sweet_spmi_users(char *buf, size_t len);
++void sweet_spmi_errors(char *buf, size_t len);
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,8 +1,8 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+  * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+- * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+- * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ * PMIC access is READ ONLY: observer EXT_READL through sweet_spmi.c (laurel 2710).
++ * No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -12,50 +12,36 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ extern void laurel_vibrator_key(int key, int down);   /* laurel 2700: a key press silences a vibration loop */
+ void sweet_keys_init(void);
+ 
+-/* topaz (SM6225, sm6125.dtsi spmi_bus; PM6125 USID 0): PON 0x800, Vol+ = GPIO5 */
+-#define KEYS_CORE_PA     0x01c40000u
+-#define KEYS_OBS_PA      0x03e00000u
+-#define KEYS_CNFG_PA     0x01c0a000u
++/*
++ * topaz (SM6225, sm6125.dtsi spmi_bus; PM6125 USID 0): PON 0x800, Vol+ = GPIO5.
++ * laurel 2710: the keys use the one SPMI core (sweet_spmi.c: one lock over each transaction, one
++ * channel map). Before, this file mapped the arbiter itself and polled without a lock; a battery,
++ * charger or vibrator command at the same time gave status 0x9 (DONE + DROPPED) or another
++ * command's RDATA: phantom presses (boot 2026-11-01 06:17: "key=0 down=1 pon=0x7f" every 10 s).
++ * A key changes state only after two polls in a row (20 ms apart) read the new state with DONE
++ * and no FAILURE/DENIED/DROPPED bit; a failed read never changes a key.
++ */
+ #define KEYS_PON_RT      0x0810u
+ #define KEYS_GPIO_RT     0xc410u
+ #define KEYS_NO_APID     0xffffu
++#define KEYS_STABLE      2u              /* agreeing valid polls before a change is reported */
+ 
+-static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
+-static uint32_t keys_version, keys_last_status;
++static uint32_t keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+ 
+-static uint32_t
+-keys_rd(vm_offset_t base, uint32_t off)
+-{
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return v;
+-}
+-
+-/* v5 can map one PPID more than once; prefer the apps-owned entry. */
+ static uint16_t
+-keys_find_apid(uint16_t ppid, uint32_t count)
++keys_find_apid(unsigned sid, unsigned peripheral)
+ {
+-	uint16_t found = KEYS_NO_APID;
+-	for (uint32_t i = 0; i < count; ++i) {
+-		uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
+-		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
+-			continue;
+-		}
+-		uint32_t owner = keys_rd(keys_cnfg, 0x700u + 4u * i) & 7u;
+-		if (found == KEYS_NO_APID || owner == 0) {
+-			found = (uint16_t)i;
+-		}
+-	}
+-	return found;
++	int apid = sweet_spmi_apid(sid, peripheral, NULL);
++	return apid < 0 ? KEYS_NO_APID : (uint16_t)apid;
+ }
+ 
+ static bool
+@@ -64,23 +50,12 @@
+ 	if (apid == KEYS_NO_APID) {
+ 		return false;
+ 	}
+-	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
+-	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
+-	__asm__ volatile("dsb osh" ::: "memory");
+-	for (unsigned i = 0; i < 1000; ++i) {
+-		keys_last_status = keys_rd(keys_obs, off + 0x08u);
+-		if (keys_last_status & 1u) {
+-			if (keys_last_status & 0x0eu) {
+-				return false;
+-			}
+-			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
+-			return true;
+-		}
+-		delay(1);
++	uint32_t st = 0;
++	int rc = sweet_spmi_ext_read(SWEET_SPMI_KEYS, apid, addr & 0xffu, out, 1, &st);
++	if (rc != 0) {
++		keys_last_status = st;  /* the status of the read that failed */
+ 	}
+-	return false;
++	return rc == 0;
+ }
+ 
+ static void
+@@ -95,25 +70,42 @@
+ static void
+ keys_thread(void *arg, wait_result_t result)
+ {
+-	int state[3] = {0, 0, 0};
++	int state[3] = {0, 0, 0}, cand[3] = {0, 0, 0};
++	unsigned seen[3] = {0, 0, 0};
+ 	unsigned errors = 0;
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
++		uint32_t pst = keys_last_status;
+ 		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+ 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+-		if (!pok || !gok) {
++		if ((!pok && keys_pon_apid != KEYS_NO_APID) || (!gok && keys_gpio_apid != KEYS_NO_APID)) {
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+-				    pok, gok, keys_last_status);
++				    pok, gok, pok ? keys_last_status : pst);
+ 			}
+ 		} else {
+ 			errors = 0;
+ 		}
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
++			if (!(k == 1 ? gok : pok)) {
++				seen[k] = 0;    /* a failed read breaks the run: no change from it */
++				continue;
++			}
++			if (now[k] == state[k]) {
++				seen[k] = 0;
++				continue;
++			}
++			if (seen[k] == 0 || now[k] != cand[k]) {
++				cand[k] = now[k];
++				seen[k] = 1;
++			} else {
++				seen[k]++;
++			}
++			if (seen[k] >= KEYS_STABLE) {
++				seen[k] = 0;
+ 				state[k] = now[k];
+ 				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+ 				    k, state[k], pon, gpio);
+@@ -139,31 +131,20 @@
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
+-	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+-	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+-	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+-	if (!keys_core || !keys_cnfg || !keys_obs) {
+-		printf("SWEET KEYS: MMIO mapping failed\n");
+-		return;
+-	}
+-	keys_version = keys_rd(keys_core, 0);
+-	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
+-	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
+-	    count == 0 || count > 512) {
+-		printf("SWEET KEYS: unsupported arbiter version=%#x apids=%u\n",
+-		    keys_version, count);
++	if (sweet_spmi_register(SWEET_SPMI_KEYS) != 0) {
++		printf("LAUREL KEYS: off: SPMI arbiter not ready (LAUREL SPMI line)\n");
+ 		return;
+ 	}
+-	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x0c4, count);
++	keys_pon_apid = keys_find_apid(0, 0x08);
++	keys_gpio_apid = keys_find_apid(0, 0xc4);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+ 	bool mok = keys_read(keys_gpio_apid, 0xc440, &mode);
+ 	bool eok = keys_read(keys_gpio_apid, 0xc446, &en);
+ 	bool sok = keys_read(keys_gpio_apid, 0xc405, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
++	printf("SWEET KEYS: pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	    keys_pon_apid, keys_gpio_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+@@ -182,12 +163,13 @@
+ 	 * GPIO 5 APID 124, power and volume down events reached SweetHIDButtons.
+ 	 */
+ 	if (pok || keys_gpio_apid != KEYS_NO_APID) {
+-		printf("LAUREL KEYS: on: power+vol-down %s (PON APID %u), vol-up %s (PM6125 GPIO5 APID %u)\n",
++		printf("LAUREL KEYS: on: power+vol-down %s (PON APID %u), vol-up %s (PM6125 GPIO5 APID %u); "
++		    "shared SPMI lock, a change needs %u agreeing reads\n",
+ 		    pok ? "polled" : "unreadable", keys_pon_apid,
+-		    keys_gpio_apid != KEYS_NO_APID ? "polled" : "withheld", keys_gpio_apid);
++		    keys_gpio_apid != KEYS_NO_APID ? "polled" : "withheld", keys_gpio_apid, KEYS_STABLE);
+ 	} else {
+-		printf("LAUREL KEYS: off: PMIC reads fail (arbiter %#x, PON APID %u, status %#x)\n",
+-		    keys_version, keys_pon_apid, keys_last_status);
++		printf("LAUREL KEYS: off: PMIC reads fail (PON APID %u, status %#x)\n",
++		    keys_pon_apid, keys_last_status);
+ 	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+diff -ruN a/bsd/dev/laurel_haptic.c b/bsd/dev/laurel_haptic.c
+--- a/bsd/dev/laurel_haptic.c
++++ b/bsd/dev/laurel_haptic.c
+@@ -7,12 +7,11 @@
+  * VREG_READY), VSET_LB/UB 0x40/0x41 (mV, 8 mV steps, 1504..3544 mV), EN_CTL 0x46 (bit 7 enable).
+  * Linux: min play 50 ms, enable -> poll VREG_READY 100 us steps for 1 ms (on a timeout: disable).
+  *
+- * SPMI: our own lane. The arbiter bases are the ones of laurel 2018 (sweet_spmi.c, trinket.dtsi
+- * spmi@1c40000, v5): core 0x1c40000 (APID map 0x900 + 4n), config 0x1c0a000 (owner 0x700 + 4n),
+- * observer 0x3e00000 (EE 0, 0x80 per APID), rw channels 0x1e00000 (0x10000 per APID). This file maps
+- * only the vibrator's APID (PPID 0x357) and takes its own lock: it shares no state with sweet_spmi.c
+- * (battery, area D; PON lane of 2018). Each APID has its own command registers, so the lanes do not
+- * race. Writes only when EE 0 (apps) owns the APID.
++ * SPMI: laurel 2710: through the one SPMI core (sweet_spmi.c: one lock over each transaction for every
++ * user, one channel map). Reads: EXT_READL on the APID's observer channel; writes: EXT_WRITEL on its rw
++ * channel, only when EE 0 (apps) owns the APID (PPID 0x357). 2700 had its own lane and lock ("each APID
++ * has its own command registers, so the lanes do not race"): wrong, boot 2026-11-01 06:17 showed DROPPED
++ * (status 0x9) and crossed RDATA between users without one lock (docs/laurel_sprout/battery-power.md).
+  *
+  * Motor policy (an ERM spins up slowly and coasts; it has no brake on an LDO):
+  *   overdrive   a start from rest (off >= LH_SPIN_MS) runs at LH_OD_MV for LH_OD_MS, then 3000 mV.
+@@ -63,8 +62,8 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern kern_return_t thread_terminate(thread_t);
+ 
+@@ -72,11 +71,6 @@
+ int laurel_haptic_vib(uint32_t ms);
+ int laurel_haptic_publish_closed_loop(void);     /* LaurelVibrator.cpp */
+ 
+-/* SPMI arbiter v5 of the SM6125 (same bases as sweet_spmi.c, laurel 2018) */
+-#define LH_CORE_PA      0x01c40000u
+-#define LH_CFG_PA       0x01c0a000u
+-#define LH_OBS_PA       0x03e00000u
+-#define LH_RW_PA        0x01e00000u
+ #define LH_SID          3u
+ #define LH_BASE         0x5700u
+ #define LH_PPID         ((LH_SID << 8) | (LH_BASE >> 8))        /* 0x357 */
+@@ -117,11 +111,10 @@
+ #define LH_WIN          64u             /* queued on-windows, power of two */
+ 
+ static LCK_GRP_DECLARE(lh_grp, "laurel_haptic");
+-static LCK_MTX_DECLARE(lh_spmi_lock, &lh_grp);  /* our APID lane */
+ static LCK_MTX_DECLARE(lh_lock, &lh_grp);       /* requests, windows, state below */
+ static LCK_MTX_DECLARE(lh_wlock, &lh_grp);      /* /dev stream clock */
+ 
+-static vm_offset_t lh_obs, lh_rw;               /* this APID's observer and rw channel */
++static volatile bool lh_lane;                   /* APID found, EE 0, rw channel mapped (sweet_spmi.c) */
+ static uint16_t lh_apid = LH_NO_APID;
+ static bool lh_ready;                           /* self-check passed, thread running */
+ static volatile bool lh_dead;                   /* turned off after a failure */
+@@ -162,90 +155,29 @@
+ 
+ /* ---- SPMI lane ---------------------------------------------------------------------------------- */
+ 
+-static uint32_t
+-lh_rd32(vm_offset_t a)
+-{
+-	uint32_t v = *(volatile uint32_t *)a;
+-	__asm__ volatile ("dmb oshld" ::: "memory");
+-	return v;
+-}
+-
+-static vm_offset_t
+-lh_map(uint32_t pa, uint32_t size)
+-{
+-	uint32_t page = pa & ~0xfffu;
+-	vm_offset_t va = ml_io_map(page, (vm_size_t)((pa - page) + size + 0xfffu) & ~(vm_size_t)0xfffu);
+-	return va ? va + (pa - page) : 0;
+-}
+-
+-/* 0 done, -1 error/denied, -2 timeout (lane poisoned by the caller) */
+-static int
+-lh_wait(vm_offset_t ch)
+-{
+-	for (unsigned i = 0; i < 1000; i++) {
+-		uint32_t st = lh_rd32(ch + 0x08u);
+-		if (st & 1u) {
+-			return (st & 0x0eu) ? -1 : 0;
+-		}
+-		delay(1);
+-	}
+-	return -2;
+-}
+-
+ static void lh_fail(const char *why);
+ 
+-/* read n (1..4) bytes at offset off of the vibrator peripheral */
++/* read n (1..4) bytes at offset off of the vibrator peripheral (sweet_spmi.c: one lock, DONE + no error bits) */
+ static int
+ lh_read(unsigned off, uint8_t *buf, unsigned n)
+ {
+-	if (n == 0 || n > 4) {
+-		return -1;
+-	}
+-	lck_mtx_lock(&lh_spmi_lock);
+-	vm_offset_t ch = lh_obs;
+-	if (ch == 0 || lh_dead) {
+-		lck_mtx_unlock(&lh_spmi_lock);
++	if (n == 0 || n > 4 || !lh_lane || lh_dead) {
+ 		return -1;
+ 	}
+-	__asm__ volatile ("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)ch = (1u << 27) | ((off & 0xffu) << 4) | ((n - 1u) & 7u);  /* EXT_READL */
+-	__asm__ volatile ("dsb osh" ::: "memory");
+-	int rc = lh_wait(ch);
+-	uint32_t d = rc == 0 ? lh_rd32(ch + 0x18u) : 0;        /* RDATA0 */
+-	lck_mtx_unlock(&lh_spmi_lock);
++	int rc = sweet_spmi_ext_read(SWEET_SPMI_HAPTIC, lh_apid, off, buf, n, NULL);
+ 	if (rc == -2) {
+ 		lh_fail("SPMI read timeout");
+ 	}
+-	if (rc == 0) {
+-		for (unsigned i = 0; i < n; i++) {
+-			buf[i] = (uint8_t)(d >> (8u * i));
+-		}
+-	}
+ 	return rc == 0 ? 0 : -1;
+ }
+ 
+ static int
+ lh_write(unsigned off, const uint8_t *buf, unsigned n)
+ {
+-	if (n == 0 || n > 4) {
++	if (n == 0 || n > 4 || !lh_lane || lh_dead) {
+ 		return -1;
+ 	}
+-	uint32_t d = 0;
+-	for (unsigned i = 0; i < n; i++) {
+-		d |= (uint32_t)buf[i] << (8u * i);
+-	}
+-	lck_mtx_lock(&lh_spmi_lock);
+-	vm_offset_t ch = lh_rw;
+-	if (ch == 0 || lh_dead) {
+-		lck_mtx_unlock(&lh_spmi_lock);
+-		return -1;
+-	}
+-	__asm__ volatile ("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(ch + 0x10u) = d;                                         /* WDATA0 */
+-	*(volatile uint32_t *)ch = (0u << 27) | ((off & 0xffu) << 4) | ((n - 1u) & 7u); /* EXT_WRITEL */
+-	__asm__ volatile ("dsb osh" ::: "memory");
+-	int rc = lh_wait(ch);
+-	lck_mtx_unlock(&lh_spmi_lock);
++	int rc = sweet_spmi_ext_write(SWEET_SPMI_HAPTIC, lh_apid, off, buf, n, false);
+ 	if (rc == -2) {
+ 		lh_fail("SPMI write timeout");
+ 	}
+@@ -303,27 +235,19 @@
+ 
+ /*
+  * After a failure: EN_CTL = 0 on the rw lane, outside lh_read/lh_write (they refuse once lh_dead).
+- * wait = false (watchdog): try_lock only, the motor thread may hold the lane; it then calls this
+- * with wait = true when it comes back. The bases stay mapped (another context may be in a call).
++ * 2710: the one SPMI lock is held only over one transaction (interrupts off, <= ~1 ms), so the watchdog
++ * (wait = false) and the motor thread (wait = true) both just write. The channel stays mapped.
+  */
+ static void
+-lh_off_raw(bool wait)
++lh_off_raw(bool wait __unused)
+ {
+-	if (lh_rw == 0) {
++	if (!lh_lane) {
+ 		return;
+ 	}
+-	if (wait) {
+-		lck_mtx_lock(&lh_spmi_lock);
+-	} else if (!lck_mtx_try_lock(&lh_spmi_lock)) {
+-		return;
+-	}
+-	*(volatile uint32_t *)(lh_rw + 0x10u) = 0;
+-	*(volatile uint32_t *)lh_rw = (LH_REG_EN_CTL & 0xffu) << 4;     /* EXT_WRITEL, 1 byte */
+-	__asm__ volatile ("dsb osh" ::: "memory");
+-	if (lh_wait(lh_rw) == 0) {
++	const uint8_t zero = 0;
++	if (sweet_spmi_ext_write(SWEET_SPMI_HAPTIC, lh_apid, LH_REG_EN_CTL, &zero, 1, false) == 0) {
+ 		lh_hw_on = false;
+ 	}
+-	lck_mtx_unlock(&lh_spmi_lock);
+ }
+ 
+ static void
+@@ -704,53 +628,37 @@
+ 		printf("LAUREL HAPTIC: off: laurel_haptic=0\n");
+ 		return -1;
+ 	}
+-	vm_offset_t core = lh_map(LH_CORE_PA, 0x2000), cfg = lh_map(LH_CFG_PA, 0x1000);
+-	if (!core || !cfg) {
+-		printf("LAUREL HAPTIC: off: SPMI arbiter not mapped\n");
+-		return -1;
+-	}
+-	uint32_t ver = lh_rd32(core), count = lh_rd32(core + 4u) & 0x7ffu;
+-	if (ver < 0x50000000u || ver >= 0x70000000u || count == 0 || count > 512u) {
+-		printf("LAUREL HAPTIC: off: SPMI arbiter %#x with %u APIDs is not v5\n", ver, count);
++	if (sweet_spmi_register(SWEET_SPMI_HAPTIC) != 0) {
++		printf("LAUREL HAPTIC: off: SPMI arbiter not ready (LAUREL SPMI line)\n");
+ 		return -1;
+ 	}
+-	unsigned owner = 8;
+-	for (unsigned i = 0; i < count; i++) {
+-		uint32_t map = lh_rd32(core + 0x900u + 4u * i);
+-		if (map == 0 || ((map >> 8) & 0xfffu) != LH_PPID) {
+-			continue;
+-		}
+-		unsigned o = lh_rd32(cfg + 0x700u + 4u * i) & 7u;
+-		if (lh_apid == LH_NO_APID || o == 0) {
+-			lh_apid = (uint16_t)i;
+-			owner = o;
+-		}
+-	}
+-	if (lh_apid == LH_NO_APID) {
++	int owner = 8;
++	int apid = sweet_spmi_apid(LH_SID, LH_BASE >> 8, &owner);
++	if (apid < 0) {
+ 		printf("LAUREL HAPTIC: off: no SPMI APID for PMI632 SID3 0x5700 (PPID 0x%03x)\n", LH_PPID);
+ 		return -1;
+ 	}
++	lh_apid = (uint16_t)apid;
+ 	if (owner != 0) {
+-		printf("LAUREL HAPTIC: off: APID %u (SID3 0x5700) is owned by EE %u, not the apps EE 0\n", lh_apid, owner);
++		printf("LAUREL HAPTIC: off: APID %u (SID3 0x5700) is owned by EE %d, not the apps EE 0\n", lh_apid, owner);
+ 		return -1;
+ 	}
+-	lh_obs = lh_map(LH_OBS_PA + 0x80u * lh_apid, 0x80);
+-	lh_rw = lh_map(LH_RW_PA + 0x10000u * lh_apid, 0x100);
++	lh_lane = sweet_spmi_rw_map(lh_apid) == 0;
+ 	uint8_t id[2] = { 0, 0 }, vs[2] = { 0, 0 }, en = 0, st = 0, back[2] = { 0, 0 };
+-	if (!lh_obs || !lh_rw || lh_read(LH_REG_TYPE, id, 2) != 0 || lh_read(LH_REG_VSET_LB, vs, 2) != 0 ||
++	if (!lh_lane || lh_read(LH_REG_TYPE, id, 2) != 0 || lh_read(LH_REG_VSET_LB, vs, 2) != 0 ||
+ 	    lh_read(LH_REG_EN_CTL, &en, 1) != 0 || lh_read(LH_REG_STATUS1, &st, 1) != 0) {
+ 		printf("LAUREL HAPTIC: off: SPMI read of SID3 0x5700 failed (APID %u)\n", lh_apid);
+-		lh_obs = lh_rw = 0;
++		lh_lane = false;
+ 		return -1;
+ 	}
+ 	if (id[0] == 0xffu || (id[0] == 0 && id[1] == 0)) {
+ 		printf("LAUREL HAPTIC: off: SID3 0x5700 type 0x%02x subtype 0x%02x: no peripheral\n", id[0], id[1]);
+-		lh_obs = lh_rw = 0;
++		lh_lane = false;
+ 		return -1;
+ 	}
+ 	if ((en & LH_EN) && lh_enable(false) != 0) {    /* the boot chain left it on */
+ 		printf("LAUREL HAPTIC: off: the boot chain left the LDO on and the disable failed\n");
+-		lh_obs = lh_rw = 0;
++		lh_lane = false;
+ 		return -1;
+ 	}
+ 	lh_hw_on = false;
+@@ -759,13 +667,13 @@
+ 	    (uint32_t)(back[0] | (back[1] << 8)) != LH_NOMINAL_MV) {
+ 		printf("LAUREL HAPTIC: off: VSET write did not read back (0x%02x%02x, was 0x%02x%02x)\n",
+ 		    back[1], back[0], vs[1], vs[0]);
+-		lh_obs = lh_rw = 0;
++		lh_lane = false;
+ 		return -1;
+ 	}
+ 	lh_wdog = thread_call_allocate(lh_wdog_fire, NULL);
+ 	if (lh_wdog == NULL || kernel_thread_start(lh_thread, NULL, &th) != KERN_SUCCESS) {
+ 		printf("LAUREL HAPTIC: off: no motor thread\n");
+-		lh_obs = lh_rw = 0;
++		lh_lane = false;
+ 		return -1;
+ 	}
+ 	thread_deallocate(th);
+diff -ruN a/bsd/dev/laurel_pmi632.c b/bsd/dev/laurel_pmi632.c
+--- a/bsd/dev/laurel_pmi632.c
++++ b/bsd/dev/laurel_pmi632.c
+@@ -48,7 +48,7 @@
+  *          system sleep: 500 mA / 4100 mV (the timer does not run while asleep). laurelbatt=0 /
+  *          laurelchg=0 are kill switches: no writes, the previous limits stay.
+  *          A USB input suspend left by an earlier boot is released at start (also with control off),
+- *          ours before a power off / restart (lock-free USBIN lane).
++ *          ours before a power off / restart (USBIN lane, emergency user of the one SPMI lock, laurel 2710).
+  *   Every write is read back; a failed write turns the charger control off (the reads stay).
+  * SMB1355 (parallel charger on QUP0 SE1 I2C) is not used: the PMI632 charges alone (max 3 A FCC).
+  *
+@@ -146,7 +146,7 @@
+ static int lp_last_temp = 250;
+ static uint64_t lp_temp_ok_ns;          /* last good NTC sample */
+ static bool lp_was_ext = true, lp_usb_susp;
+-static uint8_t lp_usb_cmd;              /* USBIN_CMD_IL without the suspend bit (for the lock-free release) */
++static uint8_t lp_usb_cmd;              /* USBIN_CMD_IL without the suspend bit (for the release at power off) */
+ static thread_call_t lp_guard_tc;
+ static bool lp_safe_pending;            /* a safe-limit write failed: the guard timer retries it every 10 s */
+ static unsigned lp_safe_tries;
+@@ -390,7 +390,7 @@
+ 		printf("LAUREL BATTERY: off: laurelbatt=0\n");
+ 		return -1;
+ 	}
+-	if (sweet_spmi_init() != 0) {
++	if (sweet_spmi_register(SWEET_SPMI_BATTERY) != 0) {
+ 		lp_state = 0;
+ 		printf("LAUREL BATTERY: off: SPMI arbiter not ready\n");
+ 		return -1;
+@@ -950,7 +950,7 @@
+ 	IOLockUnlock(lp_lock);
+ }
+ 
+-/* laurel 2301: power off / restart path (panic hold, timer call): no lock, kdb_printf only */
++/* laurel 2301: power off / restart path (panic hold, timer call): no lp_lock, kdb_printf only (2710: the SPMI write takes the one SPMI lock as an emergency user) */
+ void
+ laurel_pmi632_release_input(void)
+ {
+@@ -1102,10 +1102,12 @@
+ 	}
+ 	if (ns - lp_log_ns >= 300000000000ull || lp_log_ns == 0) {   /* a line every 5 min */
+ 		lp_log_ns = ns;
+-		printf("LAUREL BATTERY: on: PMI632 QG soc %d%% vbat %u mV ibat %d mA temp %d.%d C%s; usbin %s chg state %u icl %u mA%s\n",
++		char spmi[96];
++		sweet_spmi_errors(spmi, sizeof(spmi));          /* laurel 2710: SPMI errors since boot, per user */
++		printf("LAUREL BATTERY: on: PMI632 QG soc %d%% vbat %u mV ibat %d mA temp %d.%d C%s; usbin %s chg state %u icl %u mA%s; %s\n",
+ 		    pct, mv, ma, lp_last_temp / 10, (lp_last_temp < 0 ? -lp_last_temp : lp_last_temp) % 10,
+ 		    temp_ok ? "" : " (stale)", external ? "in" : "out", state, b->icl_ma,
+-		    charging ? " charging" : lp_held_full ? " full" : lp_usb_susp ? " input suspended" : "");
++		    charging ? " charging" : lp_held_full ? " full" : lp_usb_susp ? " input suspended" : "", spmi);
+ 	}
+ 	IOLockUnlock(lp_lock);
+ 	return 0;
+diff -ruN a/bsd/dev/laurel_reboot.c b/bsd/dev/laurel_reboot.c
+--- a/bsd/dev/laurel_reboot.c
++++ b/bsd/dev/laurel_reboot.c
+@@ -107,8 +107,8 @@
+ 			printf("LAUREL REBOOT: on without reason: IMEM read back 0x%08x\n", *r);
+ 		}
+ 	}
+-	/* laurel 2018: PON reason self-check (thread context: the SPMI init allocates a lock) */
+-	if (sweet_spmi_init() == 0) {
++	/* laurel 2018: PON reason self-check (thread context: the SPMI init maps the arbiter); 2710: registers the PON user */
++	if (sweet_spmi_register(SWEET_SPMI_PON) == 0) {
+ 		uint8_t sub = 0, spare = 0, ctl = 0;
+ 		if (sweet_spmi_pon_read(LR_PON_SUBTYPE, &sub) == 0 && sweet_spmi_pon_read(LR_PON_SPARE, &spare) == 0 &&
+ 		    sweet_spmi_pon_read(LR_PON_RST_CTL, &ctl) == 0) {
