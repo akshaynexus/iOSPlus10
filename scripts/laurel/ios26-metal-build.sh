@@ -11,13 +11,13 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 OUTDIR=${OUTDIR:-$REPO/out}
-export METAL_OUT=$OUTDIR/ios26/metal GPU_OUT=$OUTDIR/ios26/gpu
+export METAL_OUT=${METAL_OUT:-$OUTDIR/ios26/metal} GPU_OUT=$OUTDIR/ios26/gpu
 export METAL_EXTRA_FLAME="$REPO/userland/metal/patches/flame-ios26 $REPO/userland/metal/patches/flame-bbd"
 export METAL_EXPORTS_CACHE=$OUTDIR/ios26/metal-spi/exports
 export IOS_DSC=${IOS_DSC:-$HOME/op10-apple/ios26/23F84-n104ap/tree/cache/dyld_shared_cache_arm64e}
 # a CMake compile flag only (scripts/laurel/metal-env.sh sets NMTL_CPU_FLAGS; ours goes in after it through this variable)
 export NMTL_EXTRA_FLAGS="-DNMTL_IOS26=1"
-export PLUGIN_CLASS=NegroniMTLDeviceImpl   # the bundle's own class is the selector's: scripts/laurel/ios26-metal-options.sh
+export PLUGIN_CLASS=${PLUGIN_CLASS:-NegroniMTLDevice}   # the class that the kernel names (kernel need K1). ios26-metal-options.sh builds its own copy with another class
 mkdir -p "$METAL_OUT" "$GPU_OUT"
 # the Mesa archive and the build venv of the iOS 16 tree are inputs that do not change: shared (read only), when they exist
 for d in dl venv; do

@@ -214,16 +214,15 @@ What this test can learn: compositor pipelines on the real ir3 and GPU, frame ti
 
 ### 6.3 Default build unchanged
 
-`scripts/laurel/ios16-compat-run.sh 037cd81` builds the base and the head in this worktree, same paths, and compares raw and normalized (`macho-norm.py`) hashes. Result [V `logs/ios16-compat.log`, base 037cd81, head 87e778d]:
+`scripts/laurel/ios16-compat-run.sh BASE` builds the base and the head in this worktree, same paths, and compares raw and normalized (`macho-norm.py`) hashes. It now includes the default XNUtils. Result [V `logs/ios16-compat.log`, base 3d0be2f, head f1383db, which has the selector, bench and plug-in changes]:
 
 ```
-ios16-compat: 12 same bytes, 3 with a byte difference
-same code    NegroniMetal.bundle/NegroniMetal (differs in UUID and signature only)
-same code    usr/local/bin/m2vtest (differs in UUID and signature only)
-same bytes   libvulkan_freedreno.dylib, Info.plist, clients, CodeResources, carenderprobe, layerprobe, metalprobe, mslprobe, vkprobe, metallib-sweep.sh
+ios16-compat: 20 same bytes, 0 with a byte difference
 ```
 
-The third difference is the bridge `.a`, an input, not a staged file. The wrapper and the gate, compiled from base and head sources: `ios16-default-compat: 2 files: all the same bytes`. A base run before this one also gave another hash for these two binaries, so the UUID moves with each bridge build whatever the source is [V]: the Rust staticlib is not bit-reproducible here, and the code and data sections are the same.
+All 20: the default NegroniMetal and m2vtest, Turnip, the bridge `.a`, the probes, the list files, XNUtils.app, powermenu-helper, pmregister. NegroniMetal sha256 `ffe957362cffc0a4...` in both. Base and head are two real builds: the files have times 03:31:19 and 03:33:54.
+
+An earlier run (base 037cd81, head 87e778d) gave `12 same bytes, 3 with a byte difference`, where NegroniMetal and m2vtest were `same code (differs in UUID and signature only)`. Today's run does not have that difference. Later commits after f1383db change only iOS 26 scripts (the `ios26-*`, `root-add-metal-ios26.sh` and the root spec), which the default iOS 16 build does not read.
 
 ## 7. Kernel needs (for the xnu-12377 track, branch `t3/laurel-ios26-needs`). No kernel patch here
 
@@ -274,8 +273,8 @@ Memory: Hot reports a GPU pool of 416 to 593 of 944 MB with the bypass. At 0.4 o
 
 | Step | Command | Result |
 |---|---|---|
-| Build | `scripts/bg.sh ios26-metal-all scripts/laurel/ios26-metal-options.sh` | `out/ios26/metal-all/stage`: selector + both stacks (`ios26-metal-build.sh`, `ios26-metal-hot-build.sh`); `out/ios26/xnutils/root`. Checks: Mesa A610 entry, imports vs 23F84, abi-check, selector gap |
-| Install | `sudo scripts/laurel/root-add-metal-ios26.sh MOUNTED_ROOT` | bundle, probes, clients, env, `stack/`, CAEnable* preferences, jetsam, XNUtils with the options screen |
+| Build | `scripts/bg.sh ios26-metal scripts/laurel/ios26-metal-build.sh all` | `out/ios26/metal/stage`: the default stack. Class `NegroniMTLDevice`, as kernel need K1 names it. Checks: Mesa A610 entry, imports vs 23F84, abi-check, selector gap |
+| Install | **`scripts/bg.sh ios26-root scripts/laurel/ios26-root.sh`**: `ios26-root-spec.py` function `metal()` runs `root-add-metal-ios26.sh` on a stage and takes what it leaves into the image | bundle, probes, clients, env, `stack/`, CAEnable* preferences, jetsam. Audit line `applied metal26` or `off metal26`. No selector, no second stack, no XNUtils in this image |
 | Host chain | `scripts/ios26/metal-corpus.sh all`, `scripts/ios26/turnip-host.sh`, `scripts/ios26/ir3-check.sh` | evidence files |
 
 No launchd job, no wrapper. Clients: `* -chronod -cameracaptured -WidgetRenderer_Default -PosterBoard`: Hot's list on 23F84; those have CPU paths, and `_RB4` render targets remain open there. `METAL_CLIENTS=` replaces it. Lines at boot:
@@ -295,6 +294,8 @@ Failure on iOS 26 has **no fallback**: `LAUREL METAL26: off: ...: CA::WindowServ
 ## 10. Second Metal option, switch and bench
 
 **Nothing here ran on the phone. No fps number exists for either option.** The host can say what differs and what compiles. Only the bench on the phone can choose the better option.
+
+**State 2026-11-02, owner decision: first boot first. The first-boot root has the default stack only.** The second stack, selector, XNUtils screen and bench stay in the tree, built and host-tested, and are not in that root. Nothing more is added until after the first boot. To use them later: `scripts/bg.sh ios26-metal-all scripts/laurel/ios26-metal-options.sh` (it builds its own copy of the default stack in `out/ios26/metal-impl`, class `NegroniMTLDeviceImpl`), then `METAL_STAGE=$PWD/out/ios26/metal-all/stage scripts/laurel/ios26-root.sh`. XNUtils also needs a mounted root as root: `METAL26_XNUTILS=1 sudo scripts/laurel/root-add-metal-ios26.sh MOUNTED_ROOT`, because its helper is setuid.
 
 ### 10.1 Candidates
 
@@ -339,7 +340,7 @@ What this says, and what it does not:
 | Setting | `/private/var/db/negronimetal/option`, first word: `default` or `hot`. A sandboxed process reads `BUNDLE/option.local`. Read once, at the device open |
 | State | `/private/var/db/negronimetal/stack/{state,ok,failed,active}` |
 | Build | `scripts/bg.sh ios26-metal-all scripts/laurel/ios26-metal-options.sh`, output `out/ios26/metal-all/stage` + `out/ios26/xnutils/root` |
-| Install | `root-add-metal-ios26.sh` takes that stage (section 9) |
+| Install | Not in the first-boot root. `METAL_STAGE` selects that stage (start of this section) |
 | Rule, host test | `option_rule.h`, `present_stats.h`; `scripts/laurel/option-rule-test.sh` |
 
 The two stacks are separate images because their Objective-C classes have the same names. One process never loads both. **So a change needs a process restart.** For the compositor: Restart UI, which XNUtils offers at each change. Without it, the old stack stays until the next start. A change causes no restart by itself.

@@ -52,7 +52,7 @@ Same inputs, same bytes: the build hashes the spec, the changed files and each l
 - Preferences: key names of iOS 16; each marked [U] where 26 was not read.
 - `activation data ark`: **not-found**. The 23F84 OS volume has no mobileactivationd system container. The kernel path stays; enough on 26: [U].
 
-Not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, metal2vulkan, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils, SSH.
+Not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, audio HAL, Bluetooth userland, camera, HEVC, status bar, XNUtils, SSH.
 
 ## 4. AirDrop and AirPlay hook
 
@@ -65,6 +65,16 @@ Not in this image (iOS 16 stages with no iOS 26 build): Mesa and EAGL shim, meta
 Tests [V]: `--self-test` 10 of 10 with a stand-in script (files, owners, a removed job, a failure, a missing script). The real script of `origin/t3/laurel-ios26-airdrop` on the real launchd.plist with `AWDL=0 AIRPLAY=0` gave 3 files, 677 jobs before and after. **With the switches on it was not run:** `out/laurel/awdl` and `out/laurel/airplay` are not built on this host.
 
 After the merge: build those binaries, then `FORCE=1 scripts/laurel/ios26-root.sh`. The image changes, and the proof of section 1 must run again.
+
+## 4.1 Metal hook
+
+`ios26-root-spec.py` function `metal()` runs `scripts/laurel/root-add-metal-ios26.sh STAGE`. Input: `out/ios26/metal/stage` of the same checkout (`METAL_STAGE` selects another). Docs: `ios26-metal.md` section 9.
+
+- The stage has the jetsam plists, so the script edits them. What it leaves goes into the image, owner 0:0, modes as the script set them (`cache`, `strikes` 1777, `stack` 777, `metal.log` 666). The `com.apple.backboardd` preference goes through `merge_pref`, owner mobile.
+- No stage, or a failure: the root is built **with no compositor**, one audit line `off metal26`, and `ios26-root.sh` prints that line at its end. Read it. 23F84 has no GL path, so such a root shows no picture.
+- **The sizes and hash in section 1 are from before this hook. The image changes.** Run `scripts/laurel/ios26-root-again.sh` again for the same-bytes proof.
+
+Test [V]: `--self-test`: `metal hook self-test: 15 of 15` with the real script on the real stage (bytes, owners, modes, clients, preference, no second stack), no backboardd, no stage. The jetsam step alone, on the plist of the last root: `146 extension limits raised`. **The full root with this hook was not built:** the owner rebuilds it.
 
 ## 5. What is not proven
 
