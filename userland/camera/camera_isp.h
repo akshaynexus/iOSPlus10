@@ -153,6 +153,7 @@ void isp_render_full_nv12(const struct isp *isp, const struct negronicam_frame *
  */
 bool isp_lsc_from_flat(struct isp *isp, const struct negronicam_frame *f, const uint8_t *raw, float *min_ratio);
 void isp_set_ccm(struct isp *isp, const float m[9]);
+void isp_free_tuning(struct isp *isp);
 /* the tuning in PATH (tools/camtuning.py's) in place of the one there was: false, and none, if it is not one */
 bool isp_load_tuning(struct isp *isp, const char *path);
 /* the colour matrix and lens shading for a scene of this lux index and colour temperature, from the tuning */

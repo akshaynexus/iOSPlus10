@@ -48,7 +48,6 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <math.h>
 #include <pthread.h>
@@ -78,6 +77,7 @@
 
 void negronicam_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 void negronicam_console(const char *line, size_t n);
+void negronicam_memory_line(uint64_t frame);
 
 /*
  * The camera's lines also go to /dev/console, so the kernel's USB log has them (as NegroniMetal's NMTL lines):
@@ -1836,16 +1836,7 @@ worker(void *context)
 			CFRelease(metadata);
 		}
 		if (s->frames == 60 || s->frames % 300 == 0) {
-			/*
-			 * laurel 2773: this process's memory, which the kernel watches: [V boot 18:40] "low swap: killing largest compressed process
-			 * with pid 28 (mediaserverd) and size 2689 MB" 9 s after a session began, and the camera was gone every 10 s.
-			 */
-			task_vm_info_data_t vm;
-			mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-
-			if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS) {
-				say("memory at frame %llu: footprint %llu MB", (unsigned long long)s->frames, (unsigned long long)(vm.phys_footprint >> 20));
-			}
+			negronicam_memory_line(s->frames);      /* (camera_mem.c) */
 		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
 			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black (1%% over %.0f); white balance R %.2f "
@@ -1866,6 +1857,7 @@ worker(void *context)
 		negronicam_failed = true;
 		s->running = false;
 	}
+	isp_free_tuning(&isp);
 	free(buffer);
 	close(device);
 	say("the frames stopped (%llu)", s->frames);

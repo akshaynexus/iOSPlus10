@@ -273,7 +273,15 @@ diff -ruN a/bsd/dev/laurel_cam_dev.h b/bsd/dev/laurel_cam_dev.h
 diff -ruN a/bsd/dev/laurel_cam.h b/bsd/dev/laurel_cam.h
 --- a/bsd/dev/laurel_cam.h
 +++ b/bsd/dev/laurel_cam.h
-@@ -91,7 +91,8 @@
+@@ -81,6 +81,7 @@
+ int lcam_vfe_on(uint32_t ping, uint32_t pong, const char **why);        /* laurel_cam_vfe.c */
+ int lcam_vfe_poll(uint32_t *done_slot, uint32_t *err1);         /* 1: a write master 0 buffer is done */
+ void lcam_vfe_refill(uint32_t slot, uint32_t pa);
++void lcam_vfe_kick(void);
+ void lcam_vfe_off(void);
+ uint32_t lcam_vfe_version(void);
+ void lcam_vfe_note(char *s, size_t n);          /* status words for an error line */
+@@ -91,7 +92,8 @@
  struct lcam_mode;
  int lcam_power(const struct lcam_slot *s, bool up, const char **why);  /* laurel_cam.c: power list (+ pins off) */
  int lcam_sensor_load(const char *chip, const struct lcam_lib **lib, int *mode, const char **why);  /* sensor.c */
@@ -283,7 +291,7 @@ diff -ruN a/bsd/dev/laurel_cam.h b/bsd/dev/laurel_cam.h
  int lcam_sensor_stream(bool on);
  int lcam_sensor_exposure(uint32_t lines, uint32_t gain_code);
  int lcam_sensor_frame_exposure(uint32_t lines, uint32_t gain_code, uint32_t frame_lines);  /* laurel 2772: + frame length */
-@@ -113,4 +114,14 @@
+@@ -113,4 +115,14 @@
  bool lcam_dev_wanted(void);
  void lcam_dev_session(void);
  
@@ -753,7 +761,7 @@ diff -ruN a/bsd/dev/laurel_cam_sess.c b/bsd/dev/laurel_cam_sess.c
 +	d.running = true;
 +}
 +
-+/* to another session mode, sensor powered, lens where it is: 0, or an error with the path left off (the caller ends the session) */
++/* to a session mode (or the same again), sensor powered, lens where it is: 0, or an error with the path off (the caller ends the session) */
 +static int
 +sess_switch(struct sess *x, unsigned to, const char **why)
 +{
@@ -792,7 +800,6 @@ diff -ruN a/bsd/dev/laurel_cam_sess.c b/bsd/dev/laurel_cam_sess.c
 +say_levels(uint64_t frames, uint64_t ms, uint64_t reads, const struct sess *x, unsigned latest, uint32_t errors, uint32_t bits)
 +{
 +	uint32_t mean, bright, top;
-+
 +	lcam_raw10_levels(st.va[latest], LST_W, LST_H, 8, LCAM_NC_BLACK, &mean, &bright, &top);
 +	LCAM_SAY("ios session: %llu frames in %llu ms, %llu read, %ux%u exposure %u lines (%u us) gain %u/256, frame %u lines; above black: "
 +	    "mean %u, 1%% over %u, top %u; VFE errors %u (%#x)\n", frames, ms, reads, LST_W, LST_H, x->lines,
@@ -816,7 +823,8 @@ diff -ruN a/bsd/dev/laurel_cam_sess.c b/bsd/dev/laurel_cam_sess.c
 -	const char *end = "closed";
 +	const char *why = "", *end = "closed";
 +	uint32_t errors = 0, bits = 0, slot, err, refill;
-+	uint64_t started, last, reads = 0, exp_ns = st.last_exp_ns ? st.last_exp_ns : START_EXP_NS, shown = 0;
++	uint64_t started, last, kicked = 0, reads = 0, exp_ns = st.last_exp_ns ? st.last_exp_ns : START_EXP_NS, shown = 0;
++	unsigned restarts = 0;
 +	bool fault = false, tail_done = false;
  
  	lck_mtx_lock(&lst_lock);
@@ -871,7 +879,7 @@ diff -ruN a/bsd/dev/laurel_cam_sess.c b/bsd/dev/laurel_cam_sess.c
  	d.last_read_ms = lcam_dev_ms();
  	lck_mtx_unlock(&ld_lock);
  	(void)lcam_sensor_stream(true);
-@@ -103,34 +190,78 @@
+@@ -103,34 +190,82 @@
  			bits |= err;
  		}
  		lck_mtx_lock(&ld_lock);
@@ -919,10 +927,8 @@ diff -ruN a/bsd/dev/laurel_cam_sess.c b/bsd/dev/laurel_cam_sess.c
 +			lck_mtx_unlock(&ld_lock);
 +		}
 +		unsigned kind = st.cur == LCAM_SM_STILL ? 1 : 0;
-+
 +		if (want != kind && (st.still_ok || want == 0)) {
 +			unsigned next = want ? LCAM_SM_STILL : st.preview;
-+
 +			LCAM_SAY("ios session: mode %u after %llu frames, VFE errors %u (%#x): to mode %u\n", st.cur, frames, errors, bits, next);
 +			if (sess_switch(&x, next, &why) != 0) {
 +				LCAM_SAY("ios session: off: mode switch: %s\n", why);
@@ -935,39 +941,43 @@ diff -ruN a/bsd/dev/laurel_cam_sess.c b/bsd/dev/laurel_cam_sess.c
 +			continue;
 +		}
  		if (!got) {
++			/* laurel 2773: the reg update chain again after 3 frames' time, the receive path again after 1 s; only the 4th stop is a fault */
++			if (frames && now - last > 100 && now - kicked > 100) {
++				lcam_vfe_kick();
++				kicked = now;
++			}
  			if (now - last > (frames ? NO_FRAME_MS : NO_FRAME_FIRST_MS)) {
  				uint32_t pk, ecc, crc, irq, phy;
  				char vn[96];
++				unsigned back = st.cur == LCAM_SM_STILL ? st.preview : st.cur;
 +
  				lcam_csid_counts(&pk, &ecc, &crc, &irq, &phy);
  				lcam_vfe_note(vn, sizeof(vn));
 -				LCAM_SAY("ios session: no frame for %llu ms (CSID packets %u ECC %u CRC %u irq %#x, CSIPHY status "
 -				    "%#x, ISPIF %#x, %s)\n", now - last, pk, ecc, crc, irq, phy, lcam_ispif_status(), vn);
-+				LCAM_SAY("ios session: no frame for %llu ms in mode %u (CSID packets %u ECC %u CRC %u irq %#x, CSIPHY status "
-+				    "%#x, ISPIF %#x, %s)\n", now - last, st.cur, pk, ecc, crc, irq, phy, lcam_ispif_status(), vn);
++				LCAM_SAY("ios session: no frame for %llu ms in mode %u, restart %u (CSID packets %u ECC %u CRC %u irq %#x, CSIPHY status "
++				    "%#x, ISPIF %#x, %s)\n", now - last, st.cur, restarts, pk, ecc, crc, irq, phy, lcam_ispif_status(), vn);
 +				if (st.cur == LCAM_SM_STILL) {
 +					st.still_ok = false;
 +					LCAM_SAY("photograph mode: off: no frames: photographs from the preview frames\n");
 +					lck_mtx_lock(&ld_lock);
 +					d.ask.mode = 0;
 +					lck_mtx_unlock(&ld_lock);
-+					if (sess_switch(&x, st.preview, &why) == 0) {
-+						last = lcam_dev_ms();
-+						continue;
-+					}
++				}
++				if (restarts++ < 3 && sess_switch(&x, back, &why) == 0) {
++					last = lcam_dev_ms();
++					continue;
 +				}
  				end = "no frame";
  				fault = true;
  				break;
-@@ -138,30 +269,29 @@
+@@ -138,30 +273,27 @@
  			lcam_sleep_ms(1);
  			continue;
  		}
-+		if (!tail_done) {
++		if (!tail_done && !(tail_done = lcam_tail_check(st.va[ring.latest]))) {
 +			tail_done = true;
-+			if (!lcam_tail_check(st.va[ring.latest])) {
-+				LCAM_SAY("ios session: mode %u: the first frame is not %ux%u\n", st.cur, LST_W, LST_H);
-+			}
++			LCAM_SAY("ios session: mode %u: the first frame is not %ux%u\n", st.cur, LST_W, LST_H);
 +		}
  		if (ask) {
 -			lcam_nc_clamp(&lim, &al, &ag, &af);
@@ -1295,3 +1305,23 @@ diff -ruN a/bsd/dev/laurel_cam_vcm.c b/bsd/dev/laurel_cam_vcm.c
 +	running = false;                        /* (pos stays: the next session starts there) */
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_cam_vfe.c b/bsd/dev/laurel_cam_vfe.c
+--- a/bsd/dev/laurel_cam_vfe.c
++++ b/bsd/dev/laurel_cam_vfe.c
+@@ -173,6 +173,16 @@
+ 	return 0;
+ }
+ 
++/*
++ * laurel 2773: "pseudo SOF": each RDI reg update is asked for by the poll when it sees the last one. A lost link ends the chain: no status bit any more, the
++ * CSID still counts packets, no frame for ever ([V] boot 19:08: status 0 0, 62988 packets, EIO until reboot). The session asks again when frames stop.
++ */
++void
++lcam_vfe_kick(void)
++{
++	wr(vfe, VFE_REG_UPDATE, 0x2);
++}
++
+ void
+ lcam_vfe_refill(uint32_t slot, uint32_t pa)
+ {

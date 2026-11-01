@@ -111,15 +111,9 @@ isp_finish_rows(uint8_t *y, size_t y_stride, uint8_t *uv, size_t uv_stride, uint
 	 */
 	int amount = gain > 8 ? 1 : gain > 3 ? 2 : still ? 3 : 2;       /* in quarters */
 	int core = gain > 8 ? 6 : gain > 3 ? 4 : 2;
-	static __thread uint8_t *prev;
-	static __thread uint32_t have;
+	uint8_t prev[2 * 8192];         /* (on the stack: a buffer per dispatch thread would be lost when the thread ends) */
 
-	if (width > have) {
-		free(prev);
-		prev = malloc((size_t)width * 2);
-		have = prev != NULL ? width : 0;
-	}
-	if (prev == NULL || width < 3 || height < 3) {
+	if (width < 3 || height < 3 || width > 8192) {
 		return;
 	}
 	uint32_t r0 = first_row == 0 ? 1 : first_row, r1 = end_row >= height ? height - 1 : end_row;

@@ -378,6 +378,16 @@ crop(const struct isp *isp, const struct negronicam_frame *f, uint32_t width, ui
 }
 
 void
+isp_free_tuning(struct isp *isp)
+{
+	if (isp->tuning != NULL) {
+		free(isp->tuning->file);
+		free(isp->tuning);
+		isp->tuning = NULL;
+	}
+}
+
+void
 isp_set_ccm(struct isp *isp, const float m[9])
 {
 	for (int i = 0; i < 9; i++) {
@@ -691,20 +701,15 @@ isp_render_full_nv12(const struct isp *isp, const struct negronicam_frame *f, co
 	uint32_t width = f->width;
 	int colour[4];
 	struct pipe p;
-	static __thread int *lines[4];
-	static __thread uint8_t *rgb[2];
-	static __thread uint32_t have;
+	/* (per call, not per thread: a dispatch thread's buffers would be lost when the thread ends) */
+	int *lines[4];
+	uint8_t *rgb[2];
 
-	if (width > have) {
-		for (int i = 0; i < 4; i++) {
-			free(lines[i]);
-			lines[i] = malloc(sizeof(int) * width);
-		}
-		for (int i = 0; i < 2; i++) {
-			free(rgb[i]);
-			rgb[i] = malloc(3 * (size_t)width);
-		}
-		have = width;
+	for (int i = 0; i < 4; i++) {
+		lines[i] = malloc(sizeof(int) * width);
+	}
+	for (int i = 0; i < 2; i++) {
+		rgb[i] = malloc(3 * (size_t)width);
 	}
 	cfa(f->bayer, colour);
 	pipe_init(isp, &p);
@@ -721,6 +726,12 @@ isp_render_full_nv12(const struct isp *isp, const struct negronicam_frame *f, co
 		nv12_pair(rgb[0], rgb[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
 		    uv + (size_t)(row / 2) * uv_stride, video_range);
 	}
+	for (int i = 0; i < 4; i++) {
+		free(lines[i]);
+	}
+	for (int i = 0; i < 2; i++) {
+		free(rgb[i]);
+	}
 }
 
 void
@@ -728,31 +739,23 @@ isp_render_still_nv12(const struct isp *isp, const struct negronicam_frame *f, c
     uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
 {
 	uint32_t x0, y0, cw, ch, fw = f->width;
-	static __thread float *lines[5];
-	static __thread uint8_t *rows[2], *out[2];
-	static __thread uint32_t have_fw, have_width;
+	/* (per call, not per thread: a dispatch thread's buffers would be lost when the thread ends, about 1 MB a photograph) */
+	float *lines[5];
+	uint8_t *rows[2], *out[2];
 	int32_t cached[2] = { -1, -1 }, tags[5] = { -1, -1, -1, -1, -1 };
+	bool have = true;
 
-	if (fw > have_fw) {
-		for (int i = 0; i < 5; i++) {
-			free(lines[i]);
-			lines[i] = malloc(sizeof(float) * fw);
-		}
-		for (int i = 0; i < 2; i++) {
-			free(rows[i]);
-			rows[i] = malloc(3 * (size_t)fw);
-		}
-		have_fw = fw;
+	for (int i = 0; i < 5; i++) {
+		lines[i] = malloc(sizeof(float) * fw);
+		have = have && lines[i] != NULL;
 	}
-	if (width > have_width) {
-		for (int i = 0; i < 2; i++) {
-			free(out[i]);
-			out[i] = malloc(3 * (size_t)width);
-		}
-		have_width = width;
+	for (int i = 0; i < 2; i++) {
+		rows[i] = malloc(3 * (size_t)fw);
+		out[i] = malloc(3 * (size_t)width);
+		have = have && rows[i] != NULL && out[i] != NULL;
 	}
-	if (lines[0] == NULL || lines[1] == NULL || lines[2] == NULL || lines[3] == NULL || lines[4] == NULL || rows[1] == NULL || out[1] == NULL) {
-		return;
+	if (!have) {
+		goto done;
 	}
 	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
 	float sx_step = 2.0f * cw / width, sy_step = 2.0f * ch / height;
@@ -803,6 +806,14 @@ isp_render_still_nv12(const struct isp *isp, const struct negronicam_frame *f, c
 
 		nv12_pair(out[0], out[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
 		    uv + (size_t)(row / 2) * uv_stride, video_range);
+	}
+done:
+	for (int i = 0; i < 5; i++) {
+		free(lines[i]);
+	}
+	for (int i = 0; i < 2; i++) {
+		free(rows[i]);
+		free(out[i]);
 	}
 }
 
@@ -921,11 +932,7 @@ isp_load_tuning(struct isp *isp, const char *path)
 	const uint8_t *p, *end;
 	bool good = false;
 
-	if (isp->tuning != NULL) {
-		free(isp->tuning->file);
-		free(isp->tuning);
-		isp->tuning = NULL;
-	}
+	isp_free_tuning(isp);
 	if (t != NULL && fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 8 && st.st_size < (16 << 20) &&
 	    (t->file = malloc((size_t)st.st_size)) != NULL && read(fd, t->file, (size_t)st.st_size) == st.st_size) {
 		p = t->file;

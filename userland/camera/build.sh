@@ -27,7 +27,7 @@ mkdir -p "$B" "$W/host"
 
 "$ICC" -arch arm64 -isysroot "$SDK" -mios-version-min=$MINOS $CFLAGS -fblocks -bundle \
   -framework CoreFoundation -framework CoreMedia -framework CoreVideo -lobjc \
-  "$HERE/media_hooks.c" "$HERE/camera_device.c" "$HERE/camera_isp.c" "$HERE/camera_still.c" -o "$B/NegroniCamera"
+  "$HERE/media_hooks.c" "$HERE/camera_device.c" "$HERE/camera_isp.c" "$HERE/camera_still.c" "$HERE/camera_mem.c" -o "$B/NegroniCamera"
 cp "$HERE/Info.plist" "$B/Info.plist"
 plutil -lint "$B/Info.plist" >/dev/null
 

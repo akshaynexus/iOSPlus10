@@ -22,7 +22,7 @@ MINOS=16.0
 BIN=${PREVIEW_BIN:-2}
 DEFS="-DLAUREL_CAMERA=1 -DPREVIEW_BIN=$BIN"
 CFLAGS="-O2 -Wall -Wextra -Wno-unused-parameter -Wno-four-char-constants -Wno-multichar -Wno-deprecated-declarations -fvisibility=hidden -fblocks $DEFS"
-FILES="media_hooks camera_device camera_isp camera_still"
+FILES="media_hooks camera_device camera_isp camera_still camera_mem"
 rm -rf "$W/ios" "$W/host"
 mkdir -p "$B" "$T" "$W/host"
 
@@ -30,7 +30,7 @@ if [ "$(uname -s)" = Darwin ] && xcrun -sdk iphoneos --show-sdk-path >/dev/null 
   SDK=$(xcrun -sdk iphoneos --show-sdk-path)
   CC=$(xcrun -sdk iphoneos --find clang)
   "$CC" -arch arm64 -isysroot "$SDK" -mios-version-min=$MINOS $CFLAGS -bundle -framework CoreFoundation -framework CoreMedia \
-    -framework CoreVideo -lobjc "$SRC/media_hooks.c" "$SRC/camera_device.c" "$SRC/camera_isp.c" "$SRC/camera_still.c" -o "$B/NegroniCamera"
+    -framework CoreVideo -lobjc "$SRC/media_hooks.c" "$SRC/camera_device.c" "$SRC/camera_isp.c" "$SRC/camera_still.c" "$SRC/camera_mem.c" -o "$B/NegroniCamera"
   NM="xcrun nm"; OTOOL="xcrun otool"
   sign() { codesign --force -s - "$1"; }
 else

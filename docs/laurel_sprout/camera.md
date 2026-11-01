@@ -463,7 +463,7 @@ Status: code, built, host-tested. **Not run on the phone: every statement about 
 | Sign in the log | Cause | Fix |
 | --- | --- | --- |
 | `rear stream: ... at 234.0 fps` where the table said 93.5; 370 frames in 10 s at frame 4862 | The library's `vt_pixel_clk` is not the clock. INCK / 0x0305 x 0x0306-7 / 0x0303 / 0x0301 x 8 over line x frame gives whole rates for all 7 modes: 15, 30, 60, 90, 120, 30, 240 fps [V host test, both libraries]. Mode 6 is the 240 fps mode. So line = 5333 ns, not 13714 ns: AE's "66 ms" was 26 ms and the session ran at 77 fps, not 30 | `lcam_mode_vt_hz` (`laurel_cam_mode.h`), checked by `cam4_test` |
-| `low swap: killing largest compressed process with pid 28 (mediaserverd) and size 2689 MB` 18:43:56, pid 321 2485 MB 18:46:25; Camera drops, mediaserverd restarts | [V] footprint 15 MiB at 18:43:47, after a session that ran without a graph, and no surface growth (19 surfaces created). [V] each time the graph ran with Metal in mediaserverd: `surface import refused: no-copy buffer` and `heap texture refused: OutOfMemory(Heap)`, about 10 lines a second. [I, strong] CMCapture's GPU path. The exact allocation is [U] | `-mediaserverd` in the gate's list (`metal_gate.c`): no Metal in mediaserverd. HakiOS ran this capture graph with no Metal at all [V its docs/ru/metal.md: refusal not audible] [I here]. New line `memory at frame N: footprint M MB` |
+| `low swap: killing largest compressed process with pid 28 (mediaserverd) and size 2689 MB` 18:43:56, pid 321 2485 MB 18:46:25; Camera drops, mediaserverd restarts | **Not in the plug-in's frame path, and not per frame: section "The memory of mediaserverd" below.** [I] CMCapture or Metal inside mediaserverd; the allocation is [U] | `-mediaserverd` in the gate's list (`metal_gate.c`) [I that this ends it]; line `memory at frame N: footprint, malloc, by VM tag` |
 | `Data/Stack execution not permitted ... mediaserverd[pid 403]`, pc = far = 0x1e9440158, 18:46:30 | [V] lr 0x101971560 = bundle base 0x101964000 + 0xd560: just after the `blr x8` of the PixelBufferHandler call in `deliver`. The block's invoke word was a data pointer. Why is [U]; it came 4 s after a low-swap kill | `handler_alive`: the block's class word is checked; a dead handler gives `off:` for this output, not a crash |
 | `16 read over`, `70 read over` of 369 | A frame that ended while the reader copied was written over | 4 buffers, no frame lost to a copy (host test) |
 | `mean 64`, `green 0 above black` at 4814 lines and gain 16x in every session, `digital 4.00x` | **Not explained [U].** The stock exposure writer does the same writes (`fill_exposure_array` disassembled: group hold, 0x0340, 0x0202, 0x0204, then digital gain): the registers are right. Rail GPIOs and tiles equal the DT [V]. The real exposure was 2.57x shorter, far less than the gap. Candidates: scene or lens covered (the log has no picture), VANA rail input [I] | Lines now say levels above black: mean, 1 % over, top. AE does not start from a dark self-check any more. Next boot tells: `top` near 0 at full exposure = no light on the sensor (rail or cover); `top` high = the mean is only a dark room |
@@ -473,8 +473,29 @@ Status: code, built, host-tested. **Not run on the phone: every statement about 
 | `no colour tuning for the imx586` | None was made | `scripts/laurel/camera-tuning.py` at the root step |
 | `the first picture given (1504x1128)`: preview from 480x360 cells | Mode 6: 4:3 crop 960x720, 48 % of the sensor each way (2.1x zoom), magnified 3.1x | Section below |
 
+| 19:08:11 `ios session: no frame for 1001 ms (CSID packets 62988 ... VFE ... status 0 0 ...)`, then EIO until reboot | [V] sensor and CSID still run, the VFE has no status bit. [I] the polled chain of RDI reg updates ended ("pseudo SOF": each is asked for when the last is seen). Why at that moment is [U]; it came with backboardd's first GPU frame | `lcam_vfe_kick` after 100 ms, receive path restart after 1 s, 3 times; only then the fault |
+
 Stays unknown [U]: `stream: stop (0 frames, 0 pictures given)` 18:45:14 and 18:46:10 (a device was made and the graph stopped before it asked for streams: no error line); which of the above the owner meant by "buggy"; no shutter press in the log (no `StillImage` line), so the photo path has never run on this phone.
 `set (not used)` left: ExposureBias, RegionOfInterestForCameraControls (no spot metering), TemporalNoiseReduction, FaceDetection. The `an output not here` lines (Raw, Depth, ...) are as expected. Flashlight: branch t3/laurel-torch-bl-fix.
+
+### The memory of mediaserverd: the estimate of 4-5 MiB per frame is rejected
+
+[V] numbers (`logs/usblog-20261101-165828.txt`):
+
+| Time | Process, session | Frames | Memory |
+| --- | --- | --- | --- |
+| 18:41:10 | pid 28, no graph; Metal gate still closed (it opens 18:43:06) | 179 | footprint 15 MiB after it (NMTL line 18:43:47) |
+| 18:43:47-56 | pid 28, graph + first pictures, Metal device 18:43:50 | 299 | 2689 MB compressed, killed |
+| 18:43:58-44:08 | pid 321, 0 pictures given, Metal device 18:44:02 | 349 | not said |
+| 18:46:19-25 | pid 321, pictures, 175 frames | 175 | 2485 MB compressed in all, killed |
+| 19:34:56 | later boot, no graph, before the gate | 197 | no kill |
+
+- 2689 / (179 + 299) = 5.6 and 2485 / (349 + 175) = 4.7 MiB look like the estimate. But the first 179 frames kept nothing [V], so a constant rate per frame does not fit: pid 28's second session alone is at least 9.0 MiB per frame read (14 from the first surfaces at 18:43:50, about 190 frames). 9 s from 15 MiB to 2.6 GB is about 300 MB/s.
+- [V] Both kills come at about the same size, whatever the frame count (299 and 524 frames in those processes). Expected: "low swap" is a limit of the compressor. So the size says nothing about a per-frame rate. Growth could also be one large allocation at the start of the graph (for example shader or library work). The log cannot tell these apart [U].
+- **Not IOSurfaces** [V]: the kernel logs only the first 64 surface creates of a boot (patch 0046), and that limit was reached at 18:43:56, so counting those lines says nothing (an earlier version of this section did that: wrong). The surface numbers in `SSDROP` lines go on: from 1038 to at most 1070 across the 175 frames of 18:46:19-26, for all processes. Under 0.2 surfaces a frame, about 83 MB at most. Also, the surfaces are memory of `kernel_task` (patch 2101), not compressed memory of mediaserverd.
+- **Not the plug-in's frame path** [V host, mock]: `scripts/laurel/cam-leak-test.sh` runs the real `camera_device.c` + `camera_isp.c` over a mock of CoreFoundation, CoreVideo and `/dev/negronicam`, plain and with AddressSanitizer, on the current sources and on those of the phone at 18:40 (`OLD=9718fa2`; `userland/camera` last changed there 15:59): 600 frames without a graph: heap +0 bytes. 600 pictures with a graph that keeps 4 buffers: +2880 bytes in all (18:40 sources), objects +0, buffers +0, nothing left after the stop, no leak or use after free. **A mock is not CMCapture: this tests our retains and releases only.** Hooks: `emit_sample_buffer` and `gnr_render` allocate nothing [V source].
+- Small true leaks found and fixed on the way, none near that size: `static __thread` buffers of the photograph path (about 1 MB per photograph when dispatch threads end), 12 KB of tuning per stream start, and my own `isp_finish_rows` buffer.
+- What remains: the growth needs the graph and comes with Metal listed in each case in the log. Neither was ever off alone. The next boot decides: `memory at frame N: footprint F MB, malloc M MB; by VM tag: ...`. Flat = solved. Still growing with no `NMTL[n mediaserverd]` lines = not Metal, and the tag names the allocator.
 
 ### Modes
 
@@ -505,6 +526,7 @@ Plug-in: `af_frame` (HakiOS, contrast on the green block means, already there) g
 ### Build and host test [V]
 
 `scripts/laurel/kernel-linux.sh` (job camq-kernel): see `docs/notes.md`. `scripts/laurel/cam-test.sh`: + `cam4_test`: frame rates of all modes in both libraries, window numbers, motor data in both libraries, demosaic (flat grey in 4 orders, colour bars), shading on a part, finish, AE release, tuning file through the plug-in's loader. Only on a host: no sensor, XNU or CMCapture ran.
+`scripts/laurel/cam-leak-test.sh` (tmux, about 2 min): the memory test above, plus the whole photograph and tap flow against a mock kernel: 3 photographs (mode out and back, lens still, 4032 wide), first sweep and tap end within 4 DAC steps of the sharpest (604 for 600), AFStatus 2 in the scan and 0 after.
 `camera-inventory.sh` must run again: it now also takes the actuator and chromatix files. The patch: `scripts/laurel/camera-patch.sh BASE WORK`.
 
 ### Expected lines [I]
@@ -518,7 +540,7 @@ LAUREL CAMERA: rear stream: 1920x1440 RAW10 at 44.9 fps, frame N (kept for camfr
 LAUREL CAMERA: ios session: start (rear IMX586 1920x1440, line 12800 ns, frame 2604 lines = 30 fps, photograph mode on)
 LAUREL CAMERA: focus: on: DAC 48..960, at 381, control 0x2
 LAUREL CAMERA: ios: the imx586's colour tuning from .../camera-imx586-sunny.isp: 1 colour matrices' lights, 1 lens shadings'
-LAUREL CAMERA: ios: memory at frame 60: footprint N MB                  (must stay flat; about 100 MB [I])
+LAUREL CAMERA: ios: memory at frame 60: footprint N MB, malloc M MB; by VM tag: T n MB, ...      (again each 300 frames; must stay flat, about 100 MB [I])
 LAUREL CAMERA: ios session: 30 frames in 1000 ms, 30 read, 1920x1440 exposure ...; above black: mean M, 1% over B, top T; VFE errors 0 (0)
 LAUREL CAMERA: ios: focus: sweep: 48 0.0012 ...
 LAUREL CAMERA: ios: focus: the lens at N after K moves (sharpness S)
