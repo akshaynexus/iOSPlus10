@@ -9,11 +9,84 @@
 #include "Internal.h"
 #include "laurel_slot.h"
 
+#include <Pi/PiDxeCis.h>
+#include <Library/DxeServicesTableLib.h>
 #include <Protocol/BlockIo.h>
 
 STATIC ls_disk                mDisk;
 STATIC BOOLEAN                mEnabled;
 CHAR16                        gLaurelSlotWhy[96];
+
+//
+// The Qualcomm battery protocol, as ABL calls it on this phone: [V] the GUID and the text "Error getting battery voltage" are in the phone's ABL; layout from QcomPkg EFIChargerEx.h, same in QRD abl r12.
+//
+typedef struct {
+  UINT64        Revision;
+  EFI_STATUS    (EFIAPI *GetChargerPresence)(BOOLEAN *Present);
+  EFI_STATUS    (EFIAPI *GetBatteryPresence)(BOOLEAN *Present);
+  EFI_STATUS    (EFIAPI *GetBatteryVoltage)(UINT32 *MilliVolt);
+} LAUREL_CHARGER_EX;
+
+STATIC EFI_GUID  mChargerExGuid = { 0x6edc8a6d, 0x2663, 0x43cd, { 0x90, 0xff, 0x46, 0x21, 0xff, 0xd1, 0x0d, 0xf5 }};
+#define LAUREL_MIN_WRITE_MV  3600   // below this, and no charger: no GPT write. A power cut while the primary is written is the worst case: boot-menu.md section 3
+
+//
+// FALSE: the battery is low with no charger: no write. No protocol or a failed read: TRUE with a note, this check only lowers a risk.
+//
+STATIC
+BOOLEAN
+BatteryAllowsWrite (
+  OUT CHAR16  *Why,
+  IN  UINTN   WhySize
+  )
+{
+  LAUREL_CHARGER_EX  *C;
+  UINT32             Mv;
+  BOOLEAN            Plugged;
+
+  if (EFI_ERROR (gBS->LocateProtocol (&mChargerExGuid, NULL, (VOID **)&C))) {
+    UniXNULog ("LAUREL SLOT: battery: no protocol, not checked");
+    return TRUE;
+  }
+
+  Mv = 0;
+  if (EFI_ERROR (C->GetBatteryVoltage (&Mv)) || (Mv == 0)) {
+    UniXNULog ("LAUREL SLOT: battery: read failed, not checked");
+    return TRUE;
+  }
+
+  Plugged = FALSE;
+  if (EFI_ERROR (C->GetChargerPresence (&Plugged))) {
+    Plugged = FALSE;
+  }
+
+  UniXNULog ("LAUREL SLOT: battery %u mV, charger %a", Mv, Plugged ? "yes" : "no");
+  if ((Mv < LAUREL_MIN_WRITE_MV) && !Plugged) {
+    UnicodeSPrint (Why, WhySize, L"battery %u mV: connect the charger first", Mv);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+//
+// The word kernel patch 2956 leaves in IMEM at a panic. Read only if the firmware's memory map says the page is device memory (Mu "IMEM Cookie Base"); QEMU has no such page. The kernel writes
+// the word back to normal at its next start, so this needs no write here. Nothing here depends on it surviving the reset: without it the gate still needs a key.
+//
+STATIC
+UINT32
+ReadImemWord (
+  VOID
+  )
+{
+  EFI_GCD_MEMORY_SPACE_DESCRIPTOR  D;
+
+  if (EFI_ERROR (gDS->GetMemorySpaceDescriptor (LS_IMEM_RESTART_PA, &D)) || (D.GcdMemoryType != EfiGcdMemoryTypeMemoryMappedIo)) {
+    return 0;
+  }
+
+  return *(volatile UINT32 *)(UINTN)LS_IMEM_RESTART_PA;
+}
 
 STATIC INT32 BioRead (VOID *Ctx, ls_u64 Lba, ls_u32 Blocks, VOID *Buf)
 {
@@ -153,6 +226,19 @@ LaurelSlotSelfCheck (
     mDisk.block_size,
     mDisk.last_lba
     );
+
+  //
+  // The owner must see what happens with no key: at most 7 boots, then Android.
+  //
+  if ((Table.flags_b & LS_ACTIVE) && !(Table.flags_b & LS_SUCCESSFUL) && (LS_RETRIES (Table.flags_b) <= LS_REFILL_AT)) {
+    if (ReadImemWord () == LS_PANIC_WORD) {
+      UnicodeSPrint (Notice, NoticeSize, L"iOS panicked. Android after %u more boots", LS_RETRIES (Table.flags_b) + 1);
+    } else {
+      UnicodeSPrint (Notice, NoticeSize, L"Android after %u more boots: press a key to stay", LS_RETRIES (Table.flags_b) + 1);
+    }
+  } else if (ReadImemWord () == LS_PANIC_WORD) {
+    UnicodeSPrint (Notice, NoticeSize, L"The last iOS boot panicked");
+  }
 }
 
 //
@@ -184,6 +270,11 @@ LaurelSlotToAndroid (
     return EFI_NOT_READY;
   }
 
+  if (!BatteryAllowsWrite (gLaurelSlotWhy, sizeof (gLaurelSlotWhy))) {
+    UniXNULog ("LAUREL SLOT: Android refused: %s", gLaurelSlotWhy);
+    return EFI_NOT_READY;
+  }
+
   Status = ls_commit (&mDisk, NewA, NewB, &Written);
   UniXNULog ("LAUREL SLOT: Android: a %02x->%02x b %02x->%02x: %a", Table.flags_a, NewA, Table.flags_b, NewB, ls_status_text (Status));
   if (Status != LS_OK) {
@@ -195,8 +286,9 @@ LaurelSlotToAndroid (
 }
 
 //
-// Before an iOS boot, only when the menu did run with a screen and keys: retries of slot b back to 7 at or below LS_REFILL_AT. A Mu that does not reach this point
-// never writes, so ABL's count goes on and it falls back to Android. A failure here does not stop iOS.
+// Before an iOS boot: retries of slot b back to 7 at or below LS_REFILL_AT, only after a real key event in this menu and with no panic word (ls_refill_gate). Everything else writes nothing, so
+// ABL's count goes on and it falls back to Android with no computer: a Mu that does not get here, a dark panel, dead keys, nobody at the phone, a panic loop.
+// A failure here does not stop iOS.
 //
 VOID
 LaurelSlotRefill (
@@ -209,17 +301,15 @@ LaurelSlotRefill (
   CONST CHAR8  *Why;
   ls_status    Status;
   INT32        Written;
-  VOID         *Gop;
+  CHAR16       Low[64];
 
   if (!mEnabled) {
     return;
   }
 
-  //
-  // Input: the serial console driver (SimpleTextInOutSerial) always counts as one device, so the side keys (ButtonsDxe) make at least 2.
-  //
-  if (EFI_ERROR (gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, &Gop)) || (UniXNUMenuInputDevices () < 2)) {
-    UniXNULog ("LAUREL SLOT: refill off: no screen or no side keys (%u input devices), ABL keeps counting", (UINT32)UniXNUMenuInputDevices ());
+  Why = "?";
+  if (ls_refill_gate (gLaurelKeyHeard ? 1 : 0, ReadImemWord (), &Why) != 0) {
+    UniXNULog ("LAUREL SLOT: refill off: %a, ABL keeps counting", Why);
     return;
   }
 
@@ -235,6 +325,11 @@ LaurelSlotRefill (
   }
 
   if ((NewA == Table.flags_a) && (NewB == Table.flags_b)) {
+    return;
+  }
+
+  if (!BatteryAllowsWrite (Low, sizeof (Low))) {
+    UniXNULog ("LAUREL SLOT: refill off: %s", Low);
     return;
   }
 

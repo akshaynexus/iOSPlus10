@@ -254,15 +254,30 @@ def lines(text):
     return [l.split("UNIXNU: ", 1)[1] for l in text.splitlines() if "UNIXNU: " in l and ("LAUREL" in l or "menu:" in l or "action:" in l)]
 
 
-def s_timeout_refill(w, esp, dump):
-    n = "1-refill-at-3"
+KEYS_THEN_IOS = [("menu: shown", 2.0, "down"), ("menu: shown", 0.3, "up"), ("menu: shown", 0.5, "ret")]
+
+
+def s_no_key_no_refill(w, esp, dump):
+    n = "1-no-key-no-refill"
     d = Disk(f"{w}/{n}.img", dump, "sde")
     other = Disk(f"{w}/{n}-sdb.img", dump, "sdb")
     d.set_flags(0x73, 0x1F)  # b active, retries 3
     snap = d.snapshot()
-    t, _ = run(n, w, esp, [other, d], [], stop_on=r"LAUREL SLOT: refill: .*\n[\s\S]*no loader protocol")
+    t, _ = run(n, w, esp, [other, d], [], stop_on=r"no loader protocol", screenshot=True)
     check(n, "LAUREL SLOT: on:" in t, "self-check line")
     check(n, "menu: timeout, booting default 0" in t, "timeout boots iOS")
+    check(n, "refill off: no key event in this menu" in t, "no refill with no key")
+    check(n, not d.changed_since(snap), "disk changed with no key")
+    print(n, lines(t), flush=True)
+
+
+def s_refill_after_key(w, esp, dump):
+    n = "1b-refill-after-key"
+    d = Disk(f"{w}/{n}.img", dump, "sde")
+    d.set_flags(0x73, 0x1F)
+    snap = d.snapshot()
+    t, _ = run(n, w, esp, [d], KEYS_THEN_IOS, stop_on=r"LAUREL SLOT: refill: .*\n[\s\S]*no loader protocol")
+    check(n, "menu: enter, booting 0" in t, "iOS by key")
     check(n, "refill: b 1F->3F: ok" in t, "refill line")
     check(n, d.flags(0) == (0x73, 0x3F) and d.flags(1) == (0x73, 0x3F), f"flags {d.flags(0)} {d.flags(1)}")
     check(n, d.valid(), "CRCs after")
@@ -276,9 +291,20 @@ def s_no_write_at_4(w, esp, dump):
     d = Disk(f"{w}/{n}.img", dump, "sde")
     d.set_flags(0x73, 0x27)  # retries 4
     snap = d.snapshot()
-    t, _ = run(n, w, esp, [d], [], stop_on=r"no loader protocol")
+    t, _ = run(n, w, esp, [d], KEYS_THEN_IOS, stop_on=r"no loader protocol")
     check(n, "refill:" not in t, "no refill write")
     check(n, not d.changed_since(snap), "disk changed")
+    print(n, lines(t), flush=True)
+
+
+def s_a_not_successful(w, esp, dump):
+    n = "2b-slot-a-not-successful"
+    d = Disk(f"{w}/{n}.img", dump, "sde")
+    d.set_flags(0x33, 0x3F)  # slot a: successful clear
+    snap = d.snapshot()
+    t, _ = run(n, w, esp, [d], [("menu: shown", 2.0, "down"), ("menu: shown", 0.5, "ret"), ("menu: shown", 1.5, "ret")], stop_on=r"Android refused")
+    check(n, "Android refused: slot a is not marked successful" in t, "refusal")
+    check(n, not d.changed_since(snap), "disk changed: slot a's state must stay")
     print(n, lines(t), flush=True)
 
 
@@ -287,7 +313,7 @@ def s_android(w, esp, dump):
     d = Disk(f"{w}/{n}.img", dump, "sde")
     d.set_flags(0x73, 0x3F)
     snap = d.snapshot()
-    t, ex = run(n, w, esp, [d], [("menu: shown", 2.0, "down"), ("menu: shown", 0.5, "ret"), ("menu: shown", 1.5, "ret")], stop_on=r"action: reset for Android", screenshot=True)
+    t, ex = run(n, w, esp, [d], [("menu: shown", 2.0, "down"), ("menu: shown", 0.5, "ret"), ("menu: shown", 1.5, "ret")], stop_on=r"action: reset for Android")
     check(n, "LAUREL SLOT: Android: a 73->73 b 3F->07: ok" in t, "Android line")
     check(n, "action: reset for Android" in t, "reset")
     check(n, d.flags(0) == (0x73, 0x07) and d.flags(1) == (0x73, 0x07), f"flags {d.flags(0)} {d.flags(1)}")
@@ -369,12 +395,12 @@ def s_repair_primary(w, esp, dump):
 
 
 def s_no_keys(w, esp, dump):
-    n = "10-no-keys"
+    n = "10-no-keyboard"
     d = Disk(f"{w}/{n}.img", dump, "sde")
     d.set_flags(0x73, 0x17)  # retries 2
     snap = d.snapshot()
     t, _ = run(n, w, esp, [d], [], keyboard=False, stop_on=r"no loader protocol")
-    check(n, "LAUREL SLOT: refill off: no screen or no side keys" in t, "no refill without keys")
+    check(n, "refill off: no key event" in t, "no refill without keys")
     check(n, not d.changed_since(snap), "disk changed")
     print(n, lines(t), flush=True)
 
@@ -392,11 +418,11 @@ def main():
     shutil.copy(efi, esp / "EFI/BOOT/BOOTAA64.EFI")
     (esp / "Payloads/kernel.macho").write_bytes(b"\0" * 4096)
     (esp / "EFI/UniXNU/unixnu.toml").write_text(TOML.format(timeout=5, title="iOS 26 (laurel XNU)", cmdline="-v") + AE)
-    scenarios = [s_timeout_refill, s_no_write_at_4, s_android, s_held_power, s_cancel, s_refused_copies, s_refused_two_luns, s_plan_refused, s_repair_primary, s_no_keys]
+    scenarios = [s_no_key_no_refill, s_refill_after_key, s_no_write_at_4, s_a_not_successful, s_android, s_held_power, s_cancel, s_refused_copies, s_refused_two_luns, s_plan_refused, s_repair_primary, s_no_keys]
     with concurrent.futures.ThreadPoolExecutor(5) as ex:
         for f in concurrent.futures.as_completed([ex.submit(s, str(work), str(esp), dump) for s in scenarios]):
             f.result()
-    ppm = work / "3-android/menu.ppm"
+    ppm = work / "1-no-key-no-refill/menu.ppm"
     if ppm.exists():
         sys.path.insert(0, str(REPO))
         data = ppm.read_bytes()

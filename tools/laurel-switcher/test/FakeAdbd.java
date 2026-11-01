@@ -19,7 +19,7 @@ final class FakeAdbd implements AutoCloseable {
     final Map<String, String> env;
     final List<java.security.interfaces.RSAPublicKey> trusted = new ArrayList<>();
     volatile boolean root = false, rootAllowed = true, acceptNewKeys = true;
-    volatile int connections = 0, keysOffered = 0;
+    volatile int connections = 0, keysOffered = 0, unrootCount = 0, strangers = 0;
     final List<String> errors = Collections.synchronizedList(new ArrayList<>());
     final List<String> services = Collections.synchronizedList(new ArrayList<>());
 
@@ -63,7 +63,12 @@ final class FakeAdbd implements AutoCloseable {
                 in.readFully(h);
                 ByteBuffer b = ByteBuffer.wrap(h).order(ByteOrder.LITTLE_ENDIAN);
                 int cmd = b.getInt(), a0 = b.getInt(), a1 = b.getInt(), len = b.getInt(), sum = b.getInt(), magic = b.getInt();
-                if (magic != ~cmd) { errors.add("bad magic"); return; }
+                if (magic != ~cmd) {
+                    // like real adbd: a stranger on the port is dropped. It is an error only inside a connection that began with CNXN
+                    if (token != null) errors.add("bad magic " + java.util.HexFormat.of().formatHex(h));
+                    else strangers++;
+                    return;
+                }
                 byte[] d = new byte[len];
                 in.readFully(d);
                 int mysum = 0;
@@ -113,6 +118,11 @@ final class FakeAdbd implements AutoCloseable {
                             root = true;
                             return; // adbd dies; the socket closes
                         }
+                    } else if (svc.equals("unroot:")) {
+                        send(o, WRTE, remote, a0, "restarting adbd as non root\n".getBytes(StandardCharsets.UTF_8));
+                        root = false;
+                        unrootCount++;
+                        return;
                     } else if (svc.startsWith("shell:")) {
                         String c = svc.substring(6);
                         ProcessBuilder pb = new ProcessBuilder("/bin/sh", "-c", c).redirectErrorStream(true);
@@ -126,6 +136,13 @@ final class FakeAdbd implements AutoCloseable {
                             send(o, WRTE, remote, a0, out);
                         }
                         send(o, CLSE, remote, a0, new byte[0]);
+                        // the fake setprop leaves this when ctl.restart adbd ran after service.adb.root 0: adbd is shell after the restart
+                        java.nio.file.Path mark = java.nio.file.Paths.get(env.get("FAKE_STATE"), "adbd-unroot");
+                        if (java.nio.file.Files.exists(mark)) {
+                            java.nio.file.Files.delete(mark);
+                            root = false;
+                            return;
+                        }
                     } else {
                         send(o, CLSE, remote, a0, new byte[0]);
                     }

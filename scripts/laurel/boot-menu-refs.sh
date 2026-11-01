@@ -25,3 +25,21 @@ get abl-BootLinux.c "$A/Library/BootLib/BootLinux.c"
 get abl-LinuxLoader.c "$A/Application/LinuxLoader/LinuxLoader.c"
 get abl-FastbootCmds.c "$A/Library/FastbootLib/FastbootCmds.c"
 ls -l "$D"
+L=$RAW/LineageOS
+for b in lineage-24.0 lineage-23.2 lineage-23.0; do
+  get "adb-$b-main.cpp" "$L/android_packages_modules_adb/$b/daemon/main.cpp" || true
+  [ -s "$D/adb-$b-main.cpp" ] && { AB=$b; break; }
+done
+AB=${AB:-lineage-23.2}
+get adb-main.cpp "$L/android_packages_modules_adb/$AB/daemon/main.cpp"
+get adb-socket_spec.cpp "$L/android_packages_modules_adb/$AB/socket_spec.cpp"
+get adb-transport_fd.cpp "$L/android_packages_modules_adb/$AB/transport_fd.cpp"
+get adb-transport_server.cpp "$L/android_packages_modules_adb/$AB/transport_server.cpp" "$L/android_packages_modules_adb/$AB/transport_local.cpp"
+get adb-restart_service.cpp "$L/android_packages_modules_adb/$AB/daemon/restart_service.cpp"
+for b in lineage-24.0 lineage-23.2 lineage-23.0; do
+  get "AdbService-$b.java" "$L/android_frameworks_base/$b/services/core/java/com/android/server/adb/AdbService.java"
+  get "AdbDebuggingManager-$b.java" "$L/android_frameworks_base/$b/services/core/java/com/android/server/adb/AdbDebuggingManager.java"
+  get "LineageSettings-$b.java" "$L/android_lineage-sdk/$b/sdk/src/java/lineageos/providers/LineageSettings.java" "$L/android_lineage-sdk/$b/sdk/src/java/lineageos/providers/LineageSettings.java"
+  [ -s "$D/AdbService-$b.java" ] && break
+done
+ls -l "$D" | tail -14

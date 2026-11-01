@@ -392,7 +392,15 @@ static void test_plans(void)
   ls_u8 a, b; const char *why = "";
   CHECK(ls_plan_android(0x73, 0x3F, &a, &b, &why) == 0 && a == 0x73 && b == 0x07, "android normal: %#x %#x", a, b);
   CHECK(ls_plan_android(0x73, 0x7F, &a, &b, &why) == 0 && b == 0x07, "android clears successful of b");
-  CHECK(ls_plan_android(0x83 | 0x38, 0x3F, &a, &b, &why) == 0 && a == (0x43 | 0x38), "android repairs a: %#x", a);
+  /* P7: slot a's state stays; what ABL needs: successful, not unbootable, priority > 0 */
+  CHECK(ls_plan_android(0x73, 0x3F, &a, &b, &why) == 0 && a == 0x73, "android leaves a alone");
+  CHECK(ls_plan_android(0x33, 0x3F, &a, &b, &why) != 0, "android: a not successful refused");
+  CHECK(ls_plan_android(0xF3, 0x3F, &a, &b, &why) != 0, "android: a unbootable refused");
+  /* P4, P6: the gate */
+  CHECK(ls_refill_gate(1, 0x77665501, &why) == 0, "gate: key, normal word");
+  CHECK(ls_refill_gate(0, 0x77665501, &why) != 0, "gate: no key");
+  CHECK(ls_refill_gate(1, LS_PANIC_WORD, &why) != 0, "gate: key, panic word");
+  CHECK(ls_refill_gate(0, 0, &why) != 0, "gate: no key, no word");
   CHECK(ls_plan_android(0x77, 0x7B, &a, &b, &why) != 0, "android: b not active");
   CHECK(ls_plan_android(0x77, 0x3F, &a, &b, &why) != 0, "android: both active");
   CHECK(ls_plan_android(0x70, 0x3F, &a, &b, &why) != 0, "android: a priority 0");
@@ -420,7 +428,20 @@ static void test_cycle(void)
   g_boot_lun = 1;
   CHECK(abl_boot(d) == 0, "dump state boots slot a");
   hal_set_active(d, 1);
-  /* iOS in daily use: 100 boots, menu reached each time */
+  /* P4: nobody at the phone, panic loop or hang loop: no key, so no refill and no write by Mu: ABL returns to Android */
+  {
+    int writes0 = d->writes, boots = 0;
+    while ((r = abl_boot(d)) == 1 && boots < 20) {
+      boots++;
+      CHECK(ls_refill_gate(0, boots % 2 ? LS_PANIC_WORD : 0x77665501, &why) != 0, "gate lets an unattended boot refill");
+    }
+    CHECK(r == 0, "unattended loop ended on slot %d after %d boots", r, boots);
+    CHECK(boots == 7, "unattended loop: %d boots", boots);
+    CHECK(d->writes == writes0, "Mu wrote in an unattended loop: %d", d->writes - writes0);
+    printf("unattended boots with no key: %d iOS boots, 0 writes by Mu, then slot a\n", boots);
+    hal_set_active(d, 1);
+  }
+  /* iOS in daily use with a key in each menu: 100 boots, menu reached each time */
   for (i = 0; i < 100; i++) {
     r = abl_boot(d);
     CHECK(r == 1, "iOS boot %d went to slot %d", i, r);

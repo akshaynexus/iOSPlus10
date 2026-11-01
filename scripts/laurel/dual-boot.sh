@@ -29,8 +29,6 @@ TOOL=${OP10TOOL:-$OUT/bin/op10tool}
 APPLE=${APPLE:-$HOME/op10-apple}
 TARGET=${TARGET:-ios26}
 STOCK_DTBO=${STOCK_DTBO:-$HOME/laurel-backup/stock/images/dtbo.img}
-# slot b firmware that the boot LUN switch makes live; boot_b, dtbo_b have their own check. vendor_b, system_b: not firmware of the boot chain, and big.
-FW_B="abl bluetooth cmnlib cmnlib64 devcfg dsp hyp imagefv keymaster modem qupfw rpm storsec tz uefisecapp xbl xbl_config vbmeta"
 
 say() { echo "dual-boot: $*"; }
 die() { echo "dual-boot: FAILED: $*" >&2; exit 1; }

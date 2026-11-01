@@ -143,10 +143,19 @@ int ls_plan_android(ls_u8 a, ls_u8 b, ls_u8 *new_a, ls_u8 *new_b, const char **w
 {
   if (!(b & LS_ACTIVE)) { *why = "slot b is not active"; return -1; }
   if (a & LS_ACTIVE) { *why = "both slots are active"; return -1; }
-  if ((a & LS_PRIO_MASK) == 0) { *why = "slot a has priority 0"; return -1; }
-  /* ABL takes only a successful slot as the fallback. The owner chose Android on the panel, so an old failure of slot a does not stop this choice */
-  *new_a = (ls_u8)((a | LS_SUCCESSFUL) & ~LS_UNBOOTABLE);
+  if ((a & LS_PRIO_MASK) == 0) { *why = "slot a has priority 0: fastboot set_active a"; return -1; }
+  /* [V ABL HandleActiveSlotUnbootable] only a successful, not unbootable slot is a fallback target. Not forced: that would hide a broken Android */
+  if (!(a & LS_SUCCESSFUL)) { *why = "slot a is not marked successful: fastboot set_active a"; return -1; }
+  if (a & LS_UNBOOTABLE) { *why = "slot a is marked unbootable: fastboot set_active a"; return -1; }
+  *new_a = a;
   *new_b = (ls_u8)(b & ~(LS_RETRY_MASK | LS_SUCCESSFUL));
+  return 0;
+}
+
+int ls_refill_gate(int key_heard, ls_u32 imem_word, const char **why)
+{
+  if (imem_word == LS_PANIC_WORD) { *why = "the last iOS boot panicked"; return -1; }
+  if (!key_heard) { *why = "no key event in this menu"; return -1; }
   return 0;
 }
 
@@ -198,11 +207,16 @@ ls_status ls_commit(const ls_disk *d, ls_u8 new_a, ls_u8 new_b, int *written)
     *written = 1;
     if (d->read(d->ctx, backup_lba, run_blocks, g_check) || !same(g_check, g_run, run_bytes)) return LS_ERR_WRITE_BACKUP;
   }
-  /* 2. primary: header, then entries, one command, as ABL writes it at every retry count (UpdatePartitionAttributes) */
+  /* 2. primary: header, then entries up to the block with the last flag byte, one command: the shortest window in which the primary is not valid. ABL writes the same way at every retry, with more blocks */
   if (t.flags_a != new_a || t.flags_b != new_b) {
+    ls_u32 top = t.index_a > t.index_b ? t.index_a : t.index_b;
+    ls_u32 ent_blocks = (top * ENTRY_SIZE + FLAG_BYTE) / bs + 1;
+    /* the entry CRC covers the whole array: apply() works on the whole array, the blocks after ent_blocks do not change */
     apply(g_hdr_p, g_ent_p, &t, new_a, new_b);
+    run_blocks = 1 + ent_blocks;
+    run_bytes = run_blocks * bs;
     copy(g_run, g_hdr_p, bs);
-    copy(g_run + bs, g_ent_p, t.entries_blocks * bs);
+    copy(g_run + bs, g_ent_p, ent_blocks * bs);
     if (d->write(d->ctx, 1, run_blocks, g_run) || d->flush(d->ctx)) return LS_ERR_WRITE_PRIMARY;
     *written = 1;
     if (d->read(d->ctx, 1, run_blocks, g_check) || !same(g_check, g_run, run_bytes)) return LS_ERR_WRITE_PRIMARY;

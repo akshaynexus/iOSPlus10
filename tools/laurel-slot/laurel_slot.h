@@ -27,6 +27,10 @@ typedef UINT8 ls_u8; typedef UINT16 ls_u16; typedef UINT32 ls_u32; typedef UINT6
 #define LS_RETRY_MAX     7u  /* what the HAL and ABL write */
 #define LS_REFILL_AT     3u  /* the menu writes again only at or below this: one GPT write per 4 boots, and a broken Mu still has at least 3 boots to fall */
 
+/* IMEM restart_reason (0x0C125000 + 0x65C, the word the kernel writes anyway, laurel_reboot.c). Kernel patch 2956 writes this value at a panic */
+#define LS_IMEM_RESTART_PA  0x0C12565Cu
+#define LS_PANIC_WORD       0x4C504E43u  /* 'LPNC' */
+
 #define LS_MAX_BLOCK     4096u
 #define LS_MAX_ENTRIES   16384u /* ABL's MAX_PARTITION_ENTRIES_SZ */
 
@@ -73,11 +77,16 @@ ls_status ls_load(const ls_disk *d, ls_table *t);
  * ls_plan_android: the way from slot b to slot a [V ABL source; V strings in the phone's ABL]. ABL refuses a slot whose boot and abl type GUIDs are equal
  * (ValidateSlotGuids) and a slot that does not match the UFS boot LUN, so flags alone cannot select slot a. But a slot with successful = 0 and retries = 0
  * sends ABL into HandleActiveSlotUnbootable: it marks that slot unbootable, takes the successful slot, swaps the GUIDs of all A/B partitions, sets the boot
- * LUN and resets. So: b = retries 0, successful 0. a must be a fallback target: successful, not unbootable, priority > 0. Same state as 7 failed boots.
+ * LUN and resets. So: b = retries 0, successful 0. What ABL needs of slot a: successful, not unbootable, priority > 0. If not, this refuses: slot a's state stays, a
+ * broken Android stays visible, and ABL would stop in fastboot anyway. Same state of slot b as 7 failed boots. Slot a's byte is never changed.
  *
  * ls_plan_refill: retries of b back to 7 when they are at LS_REFILL_AT or lower. The successful bit stays clear: ABL keeps counting, so a broken Mu that
  * never reaches the menu falls back to slot a after its retries.
+ *
+ * ls_refill_gate: may this boot refill at all? Only after a real key event in this menu (a handle count proves nothing: ButtonsDxe can install and give no event, a GOP can
+ * exist on a dark panel), and not when the last iOS boot left the panic word. No: ABL's count goes on, and it returns to Android with no computer.
  */
+int ls_refill_gate(int key_heard, ls_u32 imem_word, const char **why);
 int ls_plan_android(ls_u8 a, ls_u8 b, ls_u8 *new_a, ls_u8 *new_b, const char **why);
 int ls_plan_refill(ls_u8 a, ls_u8 b, ls_u8 *new_a, ls_u8 *new_b, const char **why);
 
