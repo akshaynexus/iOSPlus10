@@ -320,5 +320,6 @@
 2941-laurel-ipa-data-path.patch                                applied+rules(1): glue
 2942-laurel-cell-data.patch                                    applied+rules(1): glue
 2943-laurel-cell-reject-cause.patch                            applied
+2950-laurel-dual-boot.patch                                    applied
 9000-series-12377-api.patch                                    post
-== series: 210 applied, 83 applied+rules, 0 replaced, 7 skipped, 11 base, 0 errors
+== series: 211 applied, 83 applied+rules, 0 replaced, 7 skipped, 11 base, 0 errors
