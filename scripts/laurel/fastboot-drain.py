@@ -19,7 +19,7 @@ answer), so it refuses uploads ("download size is more than max allowed") and bo
 here drains first, then reads its own replies (INFO lines printed) until OKAY/FAIL/DATA.
 Optional --probe sends one 'getvar:product' after the drain and prints the answer.
 """
-import argparse, ctypes, fcntl, glob, os, struct, sys, time
+import argparse, ctypes, fcntl, glob, os, struct, subprocess, sys, time
 
 USBDEVFS_BULK = 0xC0185502            # _IOWR('U', 2, struct usbdevfs_bulktransfer), 64-bit
 USBDEVFS_CLAIMINTERFACE = 0x8004550F  # _IOR('U', 15, unsigned int)
@@ -148,6 +148,19 @@ def main():
     ap.add_argument('--piece', type=int, default=8, help='sparse piece size in MiB for flash')
     ap.add_argument('cmd', nargs='*')
     a = ap.parse_args()
+    if len(a.cmd) == 3 and a.cmd[0] == 'flash':
+        # docs/laurel_sprout/dual-boot.md: the same guard as flash-root.sh and flash-boot.sh, before the phone is touched
+        guard = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'android-guard.sh')
+        if a.cmd[1].startswith(('userdata', 'metadata')):
+            check = ['sh', guard, 'userdata']
+        elif a.cmd[1].startswith('boot'):
+            check = ['sh', guard, 'boot-image', a.cmd[2]]
+        else:
+            check = None
+        if check is not None:
+            rc = subprocess.run(check, check=False).returncode
+            if rc != 0:
+                sys.exit(rc)
     path, itf, ep_in, ep_out = find(a.serial)
     fd = os.open(path, os.O_RDWR)
     fcntl.ioctl(fd, USBDEVFS_CLAIMINTERFACE, struct.pack('I', itf))

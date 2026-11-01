@@ -13,6 +13,7 @@ set -eu
 # main(): sh reads a function whole, so an edit of this file during the run cannot change what runs
 main() {
 cd "$(dirname "$0")/../.."
+scripts/laurel/android-guard.sh userdata   # before sudo and the root build: docs/laurel_sprout/dual-boot.md
 M=scripts/laurel/root-manifest.py
 APPLE=${APPLE:-$HOME/op10-apple}
 SIMG=$APPLE/laurel-ios16-root.simg

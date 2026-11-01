@@ -1,8 +1,8 @@
 #!/bin/sh
 # Host test of the cellular QMI client of patches 2760 + 2780 + 2786 (bsd/dev/laurel_cell.c): a simulated modem answers
-# UIM / DMS / NAS / WDS requests; 15 scenarios (one SIM in low power, dual SIM with secondary provisioning,
+# UIM / DMS / NAS / WDS requests; 26 scenarios (one SIM in low power, dual SIM with secondary provisioning,
 # online + registration + hot swap with the IPA state (laurel_ipa_state, patch 2780) forced on, no UIM service, UIM silent, cell=0,
-# modem never READY, no SIM; 2786: mode 5 then online, mode error, ONLINE refused, NAS bind retries, bars rule; 2940: mode stays 5 (6 bounded rounds), low power refused, all refused, mode indication; + the
+# modem never READY, no SIM; 2786: mode 5 then online, mode error, ONLINE refused, NAS bind retries, bars rule; 2940: mode stays 5 (6 bounded rounds), low power refused, all refused, mode indication; 2943: reject causes, IMEI verdict, no digit in any output; + the
 # SpringBoard bridge's parser (userland/laurel/cell/cellbar_state.h) on the kernel's own text). macOS and Linux (needs cc). Quick, foreground is fine.
 #   scripts/laurel/test-cell.sh [PATCH]
 #     PATCH  default patches/laurel/xnu/2760-laurel-cellular-qmi.patch
@@ -22,12 +22,19 @@ awk '/^\+\+\+ b\/bsd\/dev\/laurel_cell\.c$/ {p=1; next}
 [ -s "$D/laurel_cell.c" ] || { echo "no bsd/dev/laurel_cell.c in $PATCH" >&2; exit 1; }
 # later patches that change laurel_cell.c (2780: the radio waits for laurel_ipa_state()): their hunks on top
 for p in "$REPO"/patches/laurel/xnu/2780-laurel-ipa-v42.patch "$REPO"/patches/laurel/xnu/2786-laurel-cell-radio-state.patch \
-    "$REPO"/patches/laurel/xnu/2940-laurel-cell-radio-online.patch "$REPO"/patches/laurel/xnu/2942-laurel-cell-data.patch; do
+    "$REPO"/patches/laurel/xnu/2940-laurel-cell-radio-online.patch "$REPO"/patches/laurel/xnu/2942-laurel-cell-data.patch \
+    "$REPO"/patches/laurel/xnu/2943-laurel-cell-reject-cause.patch; do
   [ -f "$p" ] && [ "$PATCH" = "$REPO/patches/laurel/xnu/2760-laurel-cellular-qmi.patch" ] || continue
   awk '/^diff / {p = ($0 ~ /b\/bsd\/dev\/laurel_cell\.c$/)} p' "$p" > "$D/cell-later.diff"
   [ -s "$D/cell-later.diff" ] && (cd "$D" && patch -s -p0 laurel_cell.c < cell-later.diff) ||
     { [ ! -s "$D/cell-later.diff" ] || { echo "test-cell: $(basename "$p") does not apply to laurel_cell.c" >&2; exit 1; }; }
 done
+# laurel 2943: why the network refuses (a new file, included by laurel_cell.c)
+awk 'index($0, "+++ b/bsd/dev/laurel_cell_why.h") == 1 {p=1; next}
+     p && /^diff / {exit}
+     p && /^@@/ {next}
+     p && /^\+/ {print substr($0, 2)}' "$REPO/patches/laurel/xnu/2943-laurel-cell-reject-cause.patch" > "$D/laurel_cell_why.h"
+[ -s "$D/laurel_cell_why.h" ] || { echo "test-cell: no laurel_cell_why.h in 2943" >&2; exit 1; }
 # laurel 2942: the data client's new files
 for f in laurel_cell_data.c laurel_cell_data2.h laurel_cell_data.h laurel_pdp_text.h; do
   awk -v f="$f" 'index($0, "+++ b/bsd/dev/" f) == 1 {p=1; next}

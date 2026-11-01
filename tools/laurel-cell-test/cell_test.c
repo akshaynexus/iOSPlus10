@@ -59,6 +59,11 @@ static struct {
 	uint32_t dpm_pipes[2];                                           /* laurel 2942: the data session */
 	int wda_sets, wda_err, wds_bind[2], wds_family[2], wds_start[2], start_family[2], start_err[2], wds_mux;
 	bool online_after_format;
+	/* laurel 2943 */
+	const char *imei, *svn;
+	int ids_err, ids_reads, reg_ind[2], reg_ind_err, sys_reads[2], sel_reads[2], why_err, reg_state;
+	uint8_t rej_cause[2], rej_dom[2];
+	bool rej_umts_too, sys_cut;
 } M;
 static int m_fails;
 #define CHECK_M(c) do { if (!(c)) { fprintf(stderr, "FAIL modem check line %d: %s\n", __LINE__, #c); m_fails++; } } while (0)
@@ -125,6 +130,8 @@ card_status_tlv(uint8_t *o)
 	return t;
 }
 
+#include "cell_test4a.h"
+
 /* laurel_cell.c -> modem */
 void
 topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len)
@@ -165,6 +172,18 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 			put_tlv(tl, &tn, 0x01, cap, sizeof(cap));
 		} else if (msg == 0x0023) {
 			put_tlv(tl, &tn, 0x01, "MPSS.AT.4.3.1.c1-00047", 22);
+		} else if (msg == 0x0025) {
+			M.ids_reads++;
+			if (M.ids_err != 0) {
+				answer(src_port, 2, txn, msg, (uint16_t)M.ids_err, tl, 0);
+				return;
+			}
+			if (M.imei != NULL) {
+				put_tlv(tl, &tn, 0x11, M.imei, (uint16_t)strlen(M.imei));
+			}
+			if (M.svn != NULL) {
+				put_tlv(tl, &tn, 0x13, M.svn, (uint16_t)strlen(M.svn));
+			}
 		} else if (msg == 0x002D) {
 			uint8_t m;
 			M.opmode_reads++;
@@ -222,7 +241,7 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 			}
 			M.binds[sub]++;
 		} else if (msg == 0x0024) {
-			uint8_t ss[6] = { (uint8_t)(M.register_ok ? 1 : 2), 1, 1, 2, 1, 8 };
+			uint8_t ss[6] = { (uint8_t)(M.reg_state != 0 ? M.reg_state : (M.register_ok ? 1 : 2)), 1, 1, 2, 1, 8 };
 			uint8_t plmn[5 + 6] = { 0x94, 0x01, 45, 0, 6, 'A', 'i', 'r', 't', 'e', 'l' };   /* 404 */
 			put_tlv(tl, &tn, 0x01, ss, 6);
 			put_tlv(tl, &tn, 0x12, plmn, sizeof(plmn));
@@ -234,6 +253,9 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 			if (!M.no_signal) {
 				put_tlv(tl, &tn, 0x14, lte, 6);
 			}
+		} else if (msg == 0x0003 || msg == 0x0034 || msg == 0x004D) {
+			why_answer(src_port, txn, msg, sub, d);
+			return;
 		}
 		answer(src_port, 2, txn, msg, 0, tl, tn);
 		break;
@@ -417,6 +439,7 @@ modem_defaults(void)
 
 #include "cell_test2.h"
 #include "cell_test3.h"
+#include "cell_test4.h"
 
 static void
 scenario(char s)
@@ -514,6 +537,7 @@ scenario(char s)
 	default:
 		scenario2(s);
 		scenario3(s);
+		scenario4(s);
 		break;
 	}
 	fails += m_fails;
@@ -528,7 +552,7 @@ scenario(char s)
 int
 main(void)
 {
-	const char *all = "ABCDEFGHIJKLMNOPQRSTUVW";
+	const char *all = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 	int bad = 0;
 
 	for (const char *p = all; *p; p++) {

@@ -1,0 +1,506 @@
+laurel 2916: a surface for the screen is refused last, the memory that costs only time goes first; who holds the wired pages; who created a surface. Boot 2026-11-01 23:28 [V logs/laurel-boot-maps.txt]: the poster gallery took the wired pages over 2906's limit (1800-1827 MiB of 1795, 54 MiB free), 239 creates of a real size answered kIOReturnNoMemory from 23:31:25 on (PosterBoard 172, Pride 31, Aegir 20, Collections 12, chronod 4 at 23:31:32-36; 0 in boot 22:08), and a nil CAMetalLayer drawable is a black layer [V QuartzCore 20H392 get_unused_drawable: create_iosurface_with_pixel_format, cbz at 0x188385c84]. Maps started after 23:31:36 (no exec line, no NMTL line before it) [V]. Changes: (1) laurel_wired_allow: every client's kept GPU buffers but the window server's go back first (redwood_gpu_give_back_kept, at most twice a second; also from gemNew before a buffer goes to scattered pages), line LAUREL GPU KEPT. (2) Two limits: 55 % as before, 70 % for the app on the screen (TASK_FOREGROUND_APPLICATION or jetsam band >= foreground) and chronod; a name with Poster stays at 55 %; lines "above the limit for what is on the screen", "REFUSED, A LAYER STAYS BLACK". Kill switch laurelwiredshown=0. (3) "LAUREL WIRED: who:" at most every 10 s while over the limit: bytes and count of buffer surfaces by creator, GPU clients' buffers, own pages, kept. (4) Request 0x7b kRedwoodWho: the name of the process that created a surface (eagl 0006 LAUREL BLANK). (5) 2915's seed move for a client's GPU write is no CPU write for anybody: SweetSurface::gpuMoves is taken out of the seed in the push rule (boot 23:28: 2019 KB out of the cache a submission on average, 34089 at the worst, against 534 and 7719 in boot 22:08; [I] the share of this cause is not known). docs/laurel_sprout/gpu.md "Black layers".
+
+--- a/bsd/dev/laurel_wired.c
++++ b/bsd/dev/laurel_wired.c
+@@ -28,16 +28,122 @@
+ #include <mach/vm_param.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/OSAtomic.h>
++#include <sys/proc_internal.h>
++#include <sys/kern_memorystatus.h>
++#include <kern/policy_internal.h>
++#include <kern/clock.h>
++#include <mach/task_policy.h>
+ 
+ #define LAUREL_WIRED_PERCENT     55
+ #define LAUREL_WIRED_WINDOW_MIB  3264u          /* laurel 2100 RAM window (for the log line) */
++/*
++ * laurel 2916: what is on the screen goes on up to 70 %. Boot 2026-11-01 23:28: the poster gallery (PosterBoard, AegirPoster, Pride, Collections)
++ * took the wired pages to 1827 MiB; 239 creates refused from 23:31:25 on, the last ones chronod's widgets. A refused CAMetalLayer drawable is nil
++ * (QuartzCore 20H392 get_unused_drawable 0x188385c84): a black layer. The rest (the map, the widget) stays black until the pages come back.
++ * 70 % of 3264 MiB leaves 979 MiB for pageable memory and the compressor [I: negroni froze with the pageable memory gone; no measured floor].
++ */
++#define LAUREL_WIRED_SHOWN_PERCENT 70
+ 
+ extern unsigned int vm_page_wire_count;
+ extern unsigned int vm_page_free_count;
+ 
+ bool laurel_wired_allow(uint64_t bytes, const char *what);
++int laurel_wired_who_slot(const char *name);
++void laurel_wired_who_note(int slot, int64_t bytes);
++extern uint64_t redwood_gpu_give_back_kept(void);       /* laurel 2916: RedwoodGPU.cpp: bytes given back */
++extern void redwood_gpu_held(uint64_t *buffers, uint64_t *host, uint64_t *kept, uint32_t *clients);
++
++/*
++ * laurel 2916: who holds the buffer surfaces, by the name of the process that created them. No lock: a slot is claimed once, the counts are atomic;
++ * the last slot takes all further names. Only for the lines below.
++ */
++#define LAUREL_WHO_SLOTS 40
++static struct laurel_who {
++	volatile uint32_t state;        /* 0 free, 1 being named, 2 named */
++	char name[20];
++	volatile int64_t bytes;
++	volatile int32_t count;
++} laurel_who[LAUREL_WHO_SLOTS];
++
++int
++laurel_wired_who_slot(const char *name)
++{
++	for (int i = 0; i < LAUREL_WHO_SLOTS - 1; i++) {
++		uint32_t state = __atomic_load_n(&laurel_who[i].state, __ATOMIC_ACQUIRE);
++
++		if (state == 0) {
++			uint32_t free_state = 0;
++
++			if (__atomic_compare_exchange_n(&laurel_who[i].state, &free_state, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++				strlcpy(laurel_who[i].name, name, sizeof(laurel_who[i].name));
++				__atomic_store_n(&laurel_who[i].state, 2, __ATOMIC_RELEASE);
++				return i;
++			}
++			state = __atomic_load_n(&laurel_who[i].state, __ATOMIC_ACQUIRE);
++		}
++		while (state == 1) {
++			state = __atomic_load_n(&laurel_who[i].state, __ATOMIC_ACQUIRE);
++		}
++		if (strncmp(laurel_who[i].name, name, sizeof(laurel_who[i].name) - 1) == 0) {
++			return i;
++		}
++	}
++	return LAUREL_WHO_SLOTS - 1;
++}
++
++void
++laurel_wired_who_note(int slot, int64_t bytes)
++{
++	if (slot >= 0 && slot < LAUREL_WHO_SLOTS) {
++		__atomic_add_fetch(&laurel_who[slot].bytes, bytes, __ATOMIC_RELAXED);
++		__atomic_add_fetch(&laurel_who[slot].count, bytes > 0 ? 1 : -1, __ATOMIC_RELAXED);
++	}
++}
++
++/* One line, at most every 10 s while something is refused: the 5 largest holders, and what the GPU clients hold. */
++static void
++laurel_wired_holders(uint64_t wired)
++{
++	static uint64_t last;
++	uint64_t now = mach_absolute_time(), ten, then = __atomic_load_n(&last, __ATOMIC_RELAXED);
++	bool told[LAUREL_WHO_SLOTS] = { false };
++	int64_t all = 0;
++	char text[220];
++	int used = 0;
++	uint64_t buffers = 0, host = 0, kept = 0;
++	uint32_t clients = 0;
++
++	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &ten);
++	if ((then != 0 && now - then < ten) || !__atomic_compare_exchange_n(&last, &then, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++		return;
++	}
++	for (int i = 0; i < LAUREL_WHO_SLOTS; i++) {
++		all += laurel_who[i].bytes;
++	}
++	text[0] = 0;
++	for (int n = 0; n < 5; n++) {
++		int top = -1;
++
++		for (int i = 0; i < LAUREL_WHO_SLOTS; i++) {
++			if (!told[i] && laurel_who[i].bytes > 0 && (top < 0 || laurel_who[i].bytes > laurel_who[top].bytes)) {
++				top = i;
++			}
++		}
++		if (top < 0 || used >= (int)sizeof(text)) {
++			break;
++		}
++		told[top] = true;
++		used += snprintf(text + used, sizeof(text) - (size_t)used, "%s%s %lld MiB in %d", n == 0 ? "" : ", ",
++		    top == LAUREL_WHO_SLOTS - 1 ? "(others)" : laurel_who[top].name, laurel_who[top].bytes >> 20, laurel_who[top].count);
++	}
++	redwood_gpu_held(&buffers, &host, &kept, &clients);
++	printf("LAUREL WIRED: who: %llu MiB wired: surfaces %lld MiB (%s); %u GPU clients: buffers %llu MiB (with surfaces they name), of which their own pages %llu MiB; kept %llu MiB\n",
++	    wired >> 20, all >> 20, text, clients, buffers >> 20, host >> 20, kept >> 20);
++}
+ 
+ static uint64_t laurel_wired_limit;            /* bytes; 0 = off */
++static uint64_t laurel_wired_shown_limit;      /* laurel 2916: for what is on the screen */
++static uint32_t laurel_wired_shown_used, laurel_wired_shown_refusals;
+ static int      laurel_wired_state;            /* 0 not started, 1 on, 2 off */
+ static bool     laurel_wired_near;
+ static uint32_t laurel_wired_refusals;
+@@ -61,12 +167,15 @@
+ 		laurel_wired_state = 2;
+ 		return;
+ 	}
++	uint32_t shown = 1;
++	PE_parse_boot_argn("laurelwiredshown", &shown, sizeof(shown));
++	laurel_wired_shown_limit = shown ? max_mem / 100 * LAUREL_WIRED_SHOWN_PERCENT : limit;
+ 	__atomic_store_n(&laurel_wired_limit, limit, __ATOMIC_RELEASE);
+ 	laurel_wired_state = 1;
+-	printf("LAUREL WIRED: on: buffer surfaces refused above %llu MiB wired = %u%% of max_mem %llu MiB (%s); "
++	printf("LAUREL WIRED: on: buffer surfaces refused above %llu MiB wired = %u%% of max_mem %llu MiB (%s), above %llu MiB for the app on the screen and chronod; "
+ 	    "backboardd and SpringBoard exempt; %llu MiB wired, %llu MiB free now\n", limit >> 20, LAUREL_WIRED_PERCENT,
+ 	    max_mem >> 20, (max_mem >> 20) == LAUREL_WIRED_WINDOW_MIB ? "the 2100 window" : "not the 3264 MiB 2100 window",
+-	    wired >> 20, ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20);
++	    laurel_wired_shown_limit >> 20, wired >> 20, ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20);
+ }
+ 
+ bool
+@@ -92,10 +201,47 @@
+ 		}
+ 		return true;
+ 	}
++	/*
++	 * laurel 2916: first what costs only time: every GPU client's kept buffers, not the window server's (up to 160 MiB each, for 60 s; in the pool they push later buffers
++	 * into wired pages, boot 23:28: pool 26 to 58 MiB free, while kept buffers lay in it). At most twice a second.
++	 */
++	(void)redwood_gpu_give_back_kept();
++	wired = (uint64_t)vm_page_wire_count * PAGE_SIZE;
++	if (wired + bytes <= limit) {
++		return true;
++	}
++	/*
++	 * laurel 2916: the app on the screen (role or jetsam band) and chronod's widgets go on up to the higher limit. Posters do not: they ask again
++	 * and again (PosterBoard 172 refused creates in 11 s) and hold the most.
++	 */
++	proc_t p = current_proc();
++	int role = proc_get_effective_task_policy(current_task(), TASK_POLICY_ROLE), band = p->p_memstat_effectivepriority;
++	bool shown = strnstr(who, "Poster", sizeof(who)) == NULL && (strcmp(who, "chronod") == 0 || role == TASK_FOREGROUND_APPLICATION ||
++	    band >= JETSAM_PRIORITY_FOREGROUND);
++
++	laurel_wired_holders(wired);
++	if (shown && wired + bytes <= laurel_wired_shown_limit) {
++		uint32_t used = (uint32_t)OSIncrementAtomic((volatile SInt32 *)&laurel_wired_shown_used) + 1;
++
++		if (used <= 4 || (used & 255) == 0) {
++			printf("LAUREL WIRED: above the limit for what is on the screen: %s of %llu KiB for %s (role %d, band %d): %llu MiB wired, limit %llu MiB, %llu MiB free (%u so far)\n",
++			    what, bytes >> 10, who, role, band, wired >> 20, laurel_wired_shown_limit >> 20, ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20, used);
++		}
++		return true;
++	}
++	if (shown) {
++		uint32_t m = (uint32_t)OSIncrementAtomic((volatile SInt32 *)&laurel_wired_shown_refusals) + 1;
++
++		if (m <= 8 || (m & 63) == 0) {
++			printf("LAUREL WIRED: REFUSED, A LAYER STAYS BLACK: %s of %llu KiB for %s (role %d, band %d): %llu MiB wired, limit %llu MiB, %llu MiB free (refusal %u)\n",
++			    what, bytes >> 10, who, role, band, wired >> 20, laurel_wired_shown_limit >> 20, ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20, m);
++		}
++		return false;
++	}
+ 	uint32_t n = (uint32_t)OSIncrementAtomic((volatile SInt32 *)&laurel_wired_refusals) + 1;
+ 	if (n <= 8 || (n & 255) == 0) {
+-		printf("LAUREL WIRED: refused %s of %llu KiB for %s: %llu MiB wired, limit %llu MiB, %llu MiB free (refusal %u)\n",
+-		    what, bytes >> 10, who, wired >> 20, limit >> 20, ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20, n);
++		printf("LAUREL WIRED: refused %s of %llu KiB for %s (role %d, band %d): %llu MiB wired, limit %llu MiB, %llu MiB free (refusal %u)\n",
++		    what, bytes >> 10, who, role, band, wired >> 20, limit >> 20, ((uint64_t)vm_page_free_count * PAGE_SIZE) >> 20, n);
+ 	}
+ 	return false;
+ }
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -50,8 +50,12 @@
+ 	uint32_t                  drawn;        /* topaz GPU: last submission naming this surface (RedwoodGPU.cpp) */
+ 	bool                      pagesWired;   /* laurel 2101: pageable buffer wired by prepare() (complete() in free) */
+ 	bool                      noCache;      /* laurel 2158: every map of it is write-combined (physical framebuffer): no cache upkeep */
++	char                      who[20];      /* laurel 2916: the process that created it */
++	int32_t                   whoSlot;      /* laurel 2916: its line in the wired guard's list, -1: not counted there */
++	uint64_t                  whoBytes;
++	uint32_t                  gpuMoves;     /* laurel 2916: seed moves that are other clients' GPU writes: no CPU write, no cache push for them */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; pagesWired = false; noCache = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { who[0] = 0; whoSlot = -1; whoBytes = 0; gpuMoves = 0; scanoutPhys = 0; scanoutSlot = -1; values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; drawn = 0; gpuPool = false; poolSize = 0; pagesWired = false; noCache = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -127,6 +127,8 @@
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ extern "C" bool laurel_wired_allow(uint64_t bytes, const char *what);     /* laurel 2906: bsd/dev/laurel_wired.c */
++extern "C" int laurel_wired_who_slot(const char *name);                   /* laurel 2916 */
++extern "C" void laurel_wired_who_note(int slot, int64_t bytes);
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ /* topaz scanout: at most 6 contiguous 16 MiB surfaces */
+@@ -469,6 +471,7 @@
+ void
+ SweetSurface::free()
+ {
++	laurel_wired_who_note(whoSlot, -(int64_t)whoBytes);     /* laurel 2916 (slot -1: no effect) */
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+@@ -1347,6 +1350,13 @@
+ 		unsigned at;
+ 
+ 		proc_selfname(who, sizeof(who));
++		/* laurel 2916: who holds it: the wired guard's list and request 0x7b */
++		strlcpy(s->who, who, sizeof(s->who));
++		if (!s->wrapped && !s->gpuPool && s->memory != NULL && OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
++			s->whoBytes = s->memory->getLength();
++			s->whoSlot = laurel_wired_who_slot(who);
++			laurel_wired_who_note(s->whoSlot, (int64_t)s->whoBytes);
++		}
+ 		for (const char *c = who; *c != 0; c++) {
+ 			kind = (kind ^ (uint8_t)*c) * 16777619u;
+ 		}
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -98,6 +98,7 @@
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
++	kRedwoodWho             = 0x7b,         /* laurel 2916: which process created a surface */
+ 	kRedwoodPlane           = 0x7c,         /* laurel 2913: where one plane of an IOSurface is */
+ 	kRedwoodDrawn           = 0x7d,         /* laurel 2158: the GPU has drawn into a surface: a new seed, no CPU write */
+ 	kRedwoodSurface         = 0x7e,         /* ours: an IOSurface's memory as a buffer */
+@@ -183,6 +184,10 @@
+ };
+ 
+ #define kRedwoodDescribe        0xffffffffu
++struct redwood_who {                           /* laurel 2916: redwood_drm_surface_who() */
++	uint32_t surface;
++	char name[20];                          /* back; empty: not made by a create (a wrapped picture, the boot framebuffer) */
++};
+ /*
+  * laurel 2913: in redwood_surface.surface: the buffer is the surface's memory whatever its layout. Who asks has read kRedwoodPlane and makes a texture of
+  * each plane: A008, L008, LA08 (1 and 2 bytes a pixel) and the two planes of '_RB4', rows of 64 as the GPU needs them.
+@@ -480,6 +485,11 @@
+ #define GPU_KEEP_FROM           (256u << 10)    /* bytes: smaller ones are not worth it */
+ static TUNABLE(uint32_t, gGPUKeep, "gpu_keep", 1);      /* boot-arg gpu_keep=0 (a test): none kept; gpu_keep=2: kept ones cleared when given again */
+ 
++class RedwoodGPUUserClient;
++extern "C" uint64_t redwood_gpu_give_back_kept(void);          /* laurel 2916 */
++extern "C" void redwood_gpu_held(uint64_t * buffers, uint64_t * host, uint64_t * kept, uint32_t * clients);
++#define GPU_CLIENTS 64
++static RedwoodGPUUserClient * gGPUClients[GPU_CLIENTS];        /* laurel 2916: under gGPULock: for the kept buffers of all */
+ class RedwoodGPUUserClient : public IOUserClient
+ {
+ 	OSDeclareDefaultStructors(RedwoodGPUUserClient);
+@@ -509,6 +519,7 @@
+ 	IOReturn gemNew(struct msm_gem_new * request);
+ 	IOReturn surfaceBuffer(struct redwood_surface * request);
+ 	IOReturn surfacePlane(struct redwood_plane * request);
++	IOReturn surfaceWho(struct redwood_who * request);
+ 	IOReturn surfaceDrawn(struct redwood_drawn * request);
+ 	IOReturn hostPages(struct redwood_userptr * request);
+ 	IOReturn gemInfo(struct msm_gem_info * request);
+@@ -516,6 +527,8 @@
+ 	IOReturn show(const struct redwood_show * request);
+ 
+ public:
++	uint64_t giveBackKept(void);    /* laurel 2916: with the lock held */
++	void held(uint64_t * buffers, uint64_t * host, uint64_t * kept);
+ 	virtual bool initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties) APPLE_KEXT_OVERRIDE;
+ 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+ 	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+@@ -571,6 +584,17 @@
+ 	if (fBuffers != NULL && strcmp(name, "backboardd") == 0) {
+ 		topaz_gpu_gl_opened();                  /* only backboardd's Mesa opens the GPU: GL is loaded */
+ 	}
++	if (fBuffers != NULL) {
++		/* laurel 2916 (a 65th client's kept buffers end as before: oldest first, 60 s) */
++		IOLockLock(gGPULock);
++		for (uint32_t i = 0; i < GPU_CLIENTS; i++) {
++			if (gGPUClients[i] == NULL) {
++				gGPUClients[i] = this;
++				break;
++			}
++		}
++		IOLockUnlock(gGPULock);
++	}
+ 	return fBuffers != NULL;
+ }
+ 
+@@ -680,6 +704,11 @@
+ 			}
+ 		}
+ 		reap();
++		for (uint32_t i = 0; i < GPU_CLIENTS; i++) {
++			if (gGPUClients[i] == this) {
++				gGPUClients[i] = NULL;  /* laurel 2916 */
++			}
++		}
+ 		for (uint32_t i = 0; i < GPU_KEPT; i++) {
+ 			dropKept(&fKept[i]);
+ 		}
+@@ -697,6 +726,15 @@
+ void
+ RedwoodGPUUserClient::free(void)
+ {
++	if (gGPULock != NULL) {
++		IOLockLock(gGPULock);
++		for (uint32_t i = 0; i < GPU_CLIENTS; i++) {
++			if (gGPUClients[i] == this) {
++				gGPUClients[i] = NULL;  /* laurel 2916: (a client whose close never ran) */
++			}
++		}
++		IOLockUnlock(gGPULock);
++	}
+ 	if (fBuffers != NULL) {
+ 		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
+ 		fBuffers = NULL;
+@@ -835,6 +873,29 @@
+ 	fKeptBytes -= k->size;
+ }
+ 
++/* laurel 2916: with the lock held. A kept buffer is nobody's: the GPU is done with it. */
++uint64_t
++RedwoodGPUUserClient::giveBackKept(void)
++{
++	uint64_t bytes = fKeptBytes;
++
++	if (fWindowServer) {
++		return 0;                       /* (its frames lean on them: 6.8 ms against 9.3-10, rc.jobs.fps; it holds the pool's last 64 MiB as well) */
++	}
++	for (uint32_t i = 0; i < GPU_KEPT; i++) {
++		dropKept(&fKept[i]);
++	}
++	return bytes;
++}
++
++void
++RedwoodGPUUserClient::held(uint64_t * buffers, uint64_t * host, uint64_t * kept)
++{
++	*buffers += fBufferBytes;
++	*host += fHostBytes;
++	*kept += fKeptBytes;
++}
++
+ /* With the lock held, the GPU done with the buffer: kept if it is worth it (those kept longest make way). */
+ bool
+ RedwoodGPUUserClient::keep(IOMemoryDescriptor * memory, uint8_t * kernel, uint64_t address, uint64_t size, uint32_t flags)
+@@ -957,6 +1018,10 @@
+ 		/* laurel 2895: the last 64 MiB of the pool are the window server's: the desktop must draw when posters fill the rest */
+ 		uint64_t pa = 0;
+ 
++		/* laurel 2916: kept buffers make way before a new one goes to wired pages (the lock is not held here) */
++		if (!ident && !fWindowServer && !topaz_gpu_pool_room(size, 64ull << 20)) {
++			(void) redwood_gpu_give_back_kept();
++		}
+ 		if (ident || fWindowServer || topaz_gpu_pool_room(size, 64ull << 20)) {
+ 			pa = topaz_gpu_pool_alloc(size, &va);
+ 		} else {
+@@ -1072,6 +1137,19 @@
+ }
+ 
+ IOReturn
++RedwoodGPUUserClient::surfaceWho(struct redwood_who * request)
++{
++	SweetSurface * s = sweet_surface_copy(request->surface);
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	strlcpy(request->name, s->who, sizeof(request->name));
++	s->release();
++	return kIOReturnSuccess;
++}
++
++IOReturn
+ RedwoodGPUUserClient::surfaceBuffer(struct redwood_surface * request)
+ {
+ 	bool anyLayout = (request->surface & kRedwoodAnyLayout) != 0;   /* laurel 2913 */
+@@ -1295,8 +1373,8 @@
+ 	volatile uint32_t * seed = (volatile uint32_t *) ((uint8_t *) s->state->getBytesNoCopy() + 0xc);
+ 	uint32_t was = *seed, now = (uint32_t) OSIncrementAtomic((volatile SInt32 *) seed) + 1;
+ 
+-	if (gGPUSeedRule && b->seed == was && now == was + 1) {
+-		b->seed = now;
++	if (gGPUSeedRule && b->seed == was - s->gpuMoves && now == was + 1) {
++		b->seed = now - s->gpuMoves;    /* laurel 2916: b->seed counts without the moves of other clients' GPU writes */
+ 	}
+ 	IOLockUnlock(gGPULock);
+ 	request->seed = now;
+@@ -1394,7 +1472,8 @@
+ 			continue;                       /* laurel 2158: the boot framebuffer: every map is write-combined */
+ 		}
+ 		if (b->surface != NULL) {
+-			uint32_t seed = *(volatile uint32_t *) ((uint8_t *) b->surface->state->getBytesNoCopy() + 0xc);
++			/* laurel 2916: a seed moved by a client's GPU write (below) is no CPU write: nothing to push (boot 23:28: 34 MB a submission) */
++			uint32_t seed = *(volatile uint32_t *) ((uint8_t *) b->surface->state->getBytesNoCopy() + 0xc) - b->surface->gpuMoves;
+ 			uint64_t now = mach_absolute_time();
+ 			uint64_t period = !gGPUSeedRule ? again : b->surface->wrapped ? frame : safe;
+ 
+@@ -1478,11 +1557,9 @@
+ 				/* laurel 2913: (Turnip names all its buffers: a client that submits may move seeds it did not write; one that is quiet moves none) */
+ 				if (!fWindowServer && gGPUClientSeed && b->surface->state != NULL) {
+ 					volatile uint32_t * seed = (volatile uint32_t *) ((uint8_t *) b->surface->state->getBytesNoCopy() + 0xc);
+-					uint32_t was = *seed, now = (uint32_t) OSIncrementAtomic((volatile SInt32 *) seed) + 1;
+ 
+-					if (gGPUSeedRule && b->seed == was) {
+-						b->seed = now;  /* (not a CPU write: no push for the writer) */
+-					}
++					b->surface->gpuMoves++;         /* (under the lock; laurel 2916: first, so that a look between sees at worst a CPU write) */
++					(void) OSIncrementAtomic((volatile SInt32 *) seed);
+ 				}
+ 			}
+ 		}
+@@ -1627,6 +1704,7 @@
+ 		struct drm_gem_close close;
+ 		struct redwood_surface surface;
+ 		struct redwood_plane plane;
++		struct redwood_who who;
+ 		struct redwood_drawn drawn;
+ 		struct redwood_userptr userptr;
+ 		struct redwood_show show;
+@@ -1728,6 +1806,9 @@
+ 	case kRedwoodPlane:
+ 		ret = surfacePlane(&r.plane);
+ 		break;
++	case kRedwoodWho:
++		ret = surfaceWho(&r.who);
++		break;
+ 	case kRedwoodDrawn:
+ 		ret = surfaceDrawn(&r.drawn);
+ 		break;
+@@ -1754,3 +1835,51 @@
+ 	}
+ 	return ret;
+ }
++
++/*
++ * laurel 2916: the kept buffers of every client go back: for the wired guard before it refuses a surface, and for gemNew before a buffer goes to wired
++ * pages. At most twice a second. Takes the lock: not from under it. No line per call: one when it gives back, the first 4 and then every 64th.
++ */
++extern "C" uint64_t
++redwood_gpu_give_back_kept(void)
++{
++	static uint64_t last;
++	static uint32_t times;
++	uint64_t now = mach_absolute_time(), half, then = __atomic_load_n(&last, __ATOMIC_RELAXED), bytes = 0;
++	uint32_t clients = 0;
++
++	nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &half);
++	if (gGPULock == NULL || (then != 0 && now - then < half) || !__atomic_compare_exchange_n(&last, &then, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
++		return 0;
++	}
++	IOLockLock(gGPULock);
++	for (uint32_t i = 0; i < GPU_CLIENTS; i++) {
++		if (gGPUClients[i] != NULL) {
++			uint64_t one = gGPUClients[i]->giveBackKept();
++
++			bytes += one;
++			clients += one != 0;
++		}
++	}
++	IOLockUnlock(gGPULock);
++	if (bytes != 0 && (times++ < 4 || (times & 63) == 0)) {
++		IOLog("LAUREL GPU KEPT: gave back %llu MiB of kept buffers of %u clients: memory is short (call %u)\n", bytes >> 20, clients, times);
++	}
++	return bytes;
++}
++
++extern "C" void
++redwood_gpu_held(uint64_t * buffers, uint64_t * host, uint64_t * kept, uint32_t * clients)
++{
++	if (gGPULock == NULL) {
++		return;
++	}
++	IOLockLock(gGPULock);
++	for (uint32_t i = 0; i < GPU_CLIENTS; i++) {
++		if (gGPUClients[i] != NULL) {
++			gGPUClients[i]->held(buffers, host, kept);
++			(*clients)++;
++		}
++	}
++	IOLockUnlock(gGPULock);
++}

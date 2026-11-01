@@ -19,7 +19,7 @@ use std::path::Path;
 const B: u64 = Block::SIZE as u64;
 
 /// Data regions (start, end) in bytes; the whole file if SEEK_DATA is not supported.
-fn data_ranges(f: &File, size: u64) -> Vec<(u64, u64)> {
+pub(crate) fn data_ranges(f: &File, size: u64) -> Vec<(u64, u64)> {
     let fd = f.as_raw_fd();
     let mut out = Vec::new();
     let mut pos: i64 = 0;
@@ -42,7 +42,7 @@ fn data_ranges(f: &File, size: u64) -> Vec<(u64, u64)> {
 /// sparsely in the raw image: as DONT_CARE the flash left the old userdata bytes there. 2026-10-27: 79 MiB in 20296
 /// such blocks; SleepWidgetExtension's zero __DATA page (file 0x8000-0xc000) read back as old bytes on the phone,
 /// cs_invalid_page + sig 11 at a pointer from that page (docs/metal-widgets-2026-10-27.md section 3).
-fn hfs_allocated(f: &mut File) -> Result<Option<(Vec<u8>, u64)>> {
+pub(crate) fn hfs_allocated(f: &mut File) -> Result<Option<(Vec<u8>, u64)>> {
     let mut h = [0u8; 512];
     f.seek(SeekFrom::Start(1024))?;
     if f.read_exact(&mut h).is_err() || !(&h[0..2] == b"HX" || &h[0..2] == b"H+") { return Ok(None); }

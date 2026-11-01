@@ -45,7 +45,7 @@ EOF
 make_repo() {
   mkdir -p "$R"/scripts/{laurel,lib,bt,net,metal,ios16} "$R"/patches/laurel/xnu "$R"/patches/laurel/xnu-linux-fixes "$R"/external/ios-topaz/xnu/patches \
     "$R"/external/ios-topaz/tools "$R"/external/ios-sweet-linux/linux/fixes "$R"/logs "$A"
-  cp "$REPO"/scripts/laurel/{root*.sh,root*.py,build-stamp.py,build-all.sh} "$R/scripts/laurel/"
+  cp "$REPO"/scripts/laurel/{root*.sh,root*.py,build-stamp.py,build-all.sh,android-guard.sh} "$R/scripts/laurel/"
   cp "$REPO"/scripts/lib/env.sh "$R/scripts/lib/"
   cp "$REPO"/scripts/bt/bt-launchd.py "$R/scripts/bt/"
   cp "$REPO"/scripts/net/root-add-ssh.sh "$R/scripts/net/"
@@ -217,6 +217,8 @@ mv "$S" "$S.s"; expect "no sidecar (an old image)" 1 "not from a checked root.sh
 echo "== root-flash-test: nothing touches the phone before the checks pass"
 mkdir -p "$BIN"
 for t in lsusb fastboot; do printf '#!/bin/sh\necho "%s called" >> "%s/phone"\nexit 1\n' "$t" "$T" > "$BIN/$t"; chmod +x "$BIN/$t"; done
+# the guard asks adb whether Android is on the cable (a real phone may be): this test is about a phone with no Android, no flag file in the fake repo
+printf '#!/bin/sh\nexit 1\n' > "$BIN/adb"; chmod +x "$BIN/adb"
 printf '#!/bin/sh\necho "sudo: $*" >> "%s/sudo.args"\nshift\nexit 7\n' "$T" > "$BIN/sudo"; chmod +x "$BIN/sudo"
 rft() { env PATH="$BIN:$PATH" APPLE="$A" "$@" sh "$R/scripts/laurel/root-flash-test.sh"; }
 echo x >> "$SIMG"

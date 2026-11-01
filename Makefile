@@ -5,7 +5,7 @@
 BG := scripts/bg.sh
 OS := $(shell uname -s)
 
-.PHONY: laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi laurel-update help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
+.PHONY: ipsw-cli laurel-ios26-kernel laurel-ios26-image laurel-mu laurel-kernel laurel-uefi-image laurel-flash-uefi laurel-update help status tools op10tool colima image references backup-ota backup-dump mu mu-prepare mu-build mu-build-macos \
         kernel kernel-local kernel-ci xcode15 ssh devicetree dmgs boot root simg ios16 flash flash-boot flash-restore boot-debug flash-boot-debug usblog bootlog
 
 help:
@@ -20,6 +20,7 @@ help:
 	@echo "flash:   make flash CONFIRM=yes | flash-boot CONFIRM=yes (no userdata) | flash-restore CONFIRM=yes"
 	@echo "debug:   make usblog | bootlog (boot log of the last 8 boots, patch 0367)"
 	@echo "laurel:  make laurel-mu | laurel-kernel | laurel-uefi-image [MU_ONLY=1] | laurel-flash-uefi | laurel-update  (Mi A3, docs/laurel_sprout/uefi-boot.md, root-update.md)"
+	@echo "         make laurel-ios26-kernel | laurel-ios26-image  (Mi A3 iOS 26 kernel, Linux native, docs/laurel_sprout/ios26-kernel.md; nothing is flashed)"
 	@echo "status:  make status"
 
 status:
@@ -33,6 +34,8 @@ op10tool:
 	$(BG) op10tool scripts/setup/build-op10tool.sh
 references:
 	$(BG) references scripts/setup/get-references.sh
+ipsw-cli:
+	$(BG) ipsw-cli scripts/setup/get-ipsw-cli.sh
 colima:
 ifeq ($(OS),Darwin)
 	scripts/setup/colima-up.sh
@@ -121,6 +124,12 @@ laurel-mu:
 	$(BG) laurel-mu scripts/laurel/mu-build.sh DEBUG
 laurel-kernel:
 	$(BG) laurel-kernel scripts/laurel/kernel-linux.sh
+
+laurel-ios26-kernel:
+	$(BG) ios26-kernel scripts/laurel/kernel-ios26-linux.sh
+
+laurel-ios26-image:
+	$(BG) ios26-image scripts/laurel/ios26-image.sh
 # boot image out/laurel/uefi/laurel-uefi-boot.img (XNU payload); MU_ONLY=1: Mu UEFI alone (its boot menu)
 laurel-uefi-image:
 	MU_ONLY=$(MU_ONLY) scripts/laurel/uefi-image.sh

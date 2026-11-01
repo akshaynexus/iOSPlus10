@@ -101,7 +101,7 @@ get_theos() {
   git -C "$THEOS" checkout -q FETCH_HEAD
   mkdir -p "$THEOS/toolchain" "$W/dl"
   local tc=$W/dl/iOSToolchain-x86_64.tar.xz
-  [ -f "$tc" ] || curl -fsSL --retry 5 -o "$tc" "$TOOLCHAIN_URL"
+  [ -f "$tc" ] || { curl -fsSL --retry 5 -o "$tc.part" "$TOOLCHAIN_URL" && mv "$tc.part" "$tc"; }
   echo "$TOOLCHAIN_SHA256  $tc" | sha256sum -c - || { echo "kernel-linux: toolchain checksum changed" >&2; return 1; }
   tar -xJf "$tc" -C "$THEOS/toolchain/"
 }
@@ -121,7 +121,7 @@ fetch_all() {
   get_theos > "$LOGD/theos.log" 2>&1 & local a=$!
   bash linux/setup-sdk.sh > "$LOGD/sdk.log" 2>&1 & local b=$!
   get_xnu > "$LOGD/xnu-fetch.log" 2>&1 & local c=$!
-  waitall $a $b $c || { tail -5 "$LOGD/theos.log" "$LOGD/sdk.log" "$LOGD/xnu-fetch.log" >&2; return 1; }
+  waitall $a $b $c || { tail -n 5 "$LOGD/theos.log" "$LOGD/sdk.log" "$LOGD/xnu-fetch.log" >&2; return 1; }
 }
 step fetch fetch_all || exit 1
 

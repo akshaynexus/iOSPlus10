@@ -25,6 +25,7 @@ APPLE=${APPLE:-$HOME/op10-apple}
 I=$BACKUP/images
 O=${IOS16_OUT:-$OUT/ios16}       # e.g. IOS16_OUT=out/ios16-debug
 STEP=${1:-}; YES=${2:-}
+"$REPO/scripts/laurel/android-guard.sh" other-device   # this script is for the OnePlus 10 Pro; the Mi A3 holds Android
 
 run() {
   echo "+ $*"

@@ -14,7 +14,11 @@ it as a block device, UniXNU finds unixnu.toml on it. Needs pyfatfs (out/venv, s
 import os, re, shutil, sys, tempfile
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-sys.path.insert(0, os.path.join(REPO, 'external', 'ios-topaz', 'tools'))
+_tools = os.path.join(REPO, 'external', 'ios-topaz', 'tools')
+if not os.path.isdir(_tools):     # a worktree: the main checkout's reference repos
+    import subprocess
+    _tools = os.path.join(subprocess.run(['git', '-C', REPO, 'worktree', 'list', '--porcelain'], capture_output=True, text=True).stdout.splitlines()[0].split(' ', 1)[1], 'external', 'ios-topaz', 'tools')
+sys.path.insert(0, _tools)
 from mkpayload import parse_macho, apply_chained_fixups  # noqa: E402
 
 TOML = '''version = 1

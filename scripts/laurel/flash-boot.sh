@@ -19,6 +19,7 @@ set -eu
 . "$(dirname "$0")/../lib/env.sh"
 IMG=${1:-${BOOTIMG:-$OUT/laurel/laurel-boot.img}}
 [ -f "$IMG" ] || { echo "flash-boot: missing $IMG" >&2; exit 1; }
+"$REPO/scripts/laurel/android-guard.sh" boot-image "$IMG"   # an iOS image without an extent table writes into Android's /data
 ts() { date +%H:%M:%S; }
 cur() { lsusb | awk '/18d1:d00d/{print $4}'; }
 wait_dev() {   # wait for a fastboot device other than $1

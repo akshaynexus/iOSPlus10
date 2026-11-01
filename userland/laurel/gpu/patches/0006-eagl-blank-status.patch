@@ -1,0 +1,295 @@
+laurel 0006: LAUREL BLANK: surfaces that stay black, by process and format, memory sample and GPU sample (64 texels read through the GPU), at most one line in 5 s. Kernel 2916 request 0x7b names the process (Mesa redwood_drm_surface_who); older kernel: "?". The "first draw" lines of contents stay; a first-draw black drawable that fills within 2 s only counts. plane_check's setup becomes check_setup. docs/laurel_sprout/gpu.md "Black layers".
+
+--- a/userland/gpu/eagl.c
++++ b/userland/gpu/eagl.c
+@@ -74,6 +74,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/sysctl.h>
++#include <time.h>
+ #include <unistd.h>
+ #include <dlfcn.h>
+ #include <errno.h>
+@@ -324,6 +325,9 @@
+ 	bool box_wanted;                /* laurel 0005: the next frame's first box on the screen, for the LAUREL GL FLUSH line */
+ 	GLint screen_box[4];
+ 	unsigned contents_wanted;       /* images whose contents line has not come yet */
++	struct lsf_blanks blanks;       /* laurel 0006: surfaces black at a first draw, for the LAUREL BLANK line */
++	uint64_t blank_line_ms;
++	unsigned blank_lines;
+ 	bool in_frame;
+ 	struct {                        /* what the line a frame gets with glframes=1 says (frame_end()) */
+ 		bool taken, boxed;      /* the first draw or clear into the display's picture seen; scissored */
+@@ -773,9 +777,31 @@
+ 	    IOSurfaceGetHeight(surface), image->decoded->guess ? "THIS OSTYPE IS NOT KNOWN, best effort: " : "converted from ", image->decoded->what);
+ }
+ 
++static uint64_t
++blank_now_ms(void)
++{
++	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000u;
++}
++
++/* laurel 0006: which process created a surface (kernel 2916, request 0x7b); "?" with an older kernel or Mesa */
++static void
++blank_who(uint32_t surface, char *name, size_t size)
++{
++	static int (*who_fn)(uint32_t, char *, size_t);
++	static int state;
++
++	if (state == 0) {
++		who_fn = (int (*)(uint32_t, char *, size_t))dlsym(RTLD_DEFAULT, "redwood_drm_surface_who");
++		state = who_fn != NULL ? 1 : -1;
++	}
++	if (state < 0 || who_fn(surface, name, size) != 0 || name[0] == 0) {
++		strlcpy(name, "?", size);
++	}
++}
++
+ /* A line for the owner's log: what a surface holds at the first draw with it, and when a blank one fills: */
+ static void
+-contents_say(struct image *image, const char *when)
++contents_say(struct eagl *e, struct image *image, const char *when)
+ {
+ 	static unsigned lines;
+ 	char name[5];
+@@ -783,6 +809,16 @@
+ 	bool blank = image->contents.lit == 0 && image->contents.samples != 0;
+ 
+ 	image->told = blank ? 1 : 2;
++	if (blank) {
++		struct lsf_blank *fresh = lsf_blank_note(&e->blanks, IOSurfaceGetID(image->surface), (uint32_t)IOSurfaceGetPixelFormat(image->surface),
++		    (uint32_t)image->width, (uint32_t)image->height, blank_now_ms());
++
++		if (fresh != NULL) {
++			blank_who(fresh->surface, fresh->who, sizeof(fresh->who));
++		}
++	} else if (image->contents.samples != 0) {
++		(void)lsf_blank_filled(&e->blanks, IOSurfaceGetID(image->surface), blank_now_ms());
++	}
+ 	if (lines++ >= 256) {
+ 		return;
+ 	}
+@@ -847,12 +883,12 @@
+ 			}
+ 			e->contents_wanted--;
+ 			snprintf(when, sizeof(when), "frame %u, first draw with it", e->frames + 1);
+-			contents_say(image, when);
++			contents_say(e, image, when);
+ 		} else if (image->told == 1 && again && (image->decoded == NULL || image->xr_source != 0)) {
+ 			contents_of_memory(image);
+ 			if (image->contents.lit != 0) {
+ 				snprintf(when, sizeof(when), "frame %u, now drawn", e->frames + 1);
+-				contents_say(image, when);
++				contents_say(e, image, when);
+ 			}
+ 		}
+ 	}
+@@ -914,7 +950,7 @@
+ 		char when[48];
+ 
+ 		snprintf(when, sizeof(when), "frame %u, fill %u, now drawn", e->frames + 1, image->fills);
+-		contents_say(image, when);
++		contents_say(e, image, when);
+ 	}
+ }
+ 
+@@ -1050,6 +1086,31 @@
+     "layout(location = 0) out vec4 colour;\n"
+     "void main() { colour = texelFetch(source, ivec2(gl_FragCoord.xy) * steps, 0); }\n";
+ 
++/* laurel 0005, 0006: the program and the 8 x 8 target that read a texture through the GPU */
++static bool
++check_setup(struct eagl *e)
++{
++	GLint bound = 0;
++
++	if (e->check_program != 0) {
++		return true;
++	}
++	e->check_program = vblur_program(vblur_vertex_text(), plane_check_fragment, "read back one plane");
++	if (e->check_program == 0) {
++		return false;
++	}
++	glGenTextures(1, &e->check_texture);
++	glGenFramebuffers(1, &e->check_framebuffer);
++	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++	glBindTexture(GL_TEXTURE_2D, e->check_texture);
++	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
++	glBindFramebuffer(GL_FRAMEBUFFER, e->check_framebuffer);
++	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->check_texture, 0);
++	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
++	return true;
++}
++
+ /*
+  * With the plane's texture bound, swizzle still its own: 8 x 8 texels read by the GPU and by the CPU are the same. false: GL_FALSE to all sharing.
+  * (Read at once: a texture of the wrong rows shows garbage, nothing else would ever say so.)
+@@ -1059,7 +1120,6 @@
+ {
+ 	uint8_t got[8 * 8 * 4];
+ 	struct gl_kept kept;
+-	GLint bound = 0;
+ 	unsigned sx = p->width > 8 ? (p->width - 1) / 7 : 1, sy = p->height > 8 ? (p->height - 1) / 7 : 1;
+ 	unsigned w = p->width < 8 ? p->width : 8, h = p->height < 8 ? p->height : 8;
+ 	bool good = true;
+@@ -1067,20 +1127,8 @@
+ 	if (p->bytes == 0 || p->bytes > 2 || (e->planes_checked & (1u << p->bytes)) != 0) {
+ 		return true;
+ 	}
+-	if (e->check_program == 0) {
+-		e->check_program = vblur_program(vblur_vertex_text(), plane_check_fragment, "read back one plane");
+-		if (e->check_program == 0) {
+-			return true;    /* (no way to look: the rows are 64 as the kernel says) */
+-		}
+-		glGenTextures(1, &e->check_texture);
+-		glGenFramebuffers(1, &e->check_framebuffer);
+-		glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+-		glBindTexture(GL_TEXTURE_2D, e->check_texture);
+-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+-		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+-		glBindFramebuffer(GL_FRAMEBUFFER, e->check_framebuffer);
+-		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, e->check_texture, 0);
+-		glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
++	if (!check_setup(e)) {
++		return true;    /* (no way to look: the rows are 64 as the kernel says) */
+ 	}
+ 	e->planes_checked |= 1u << p->bytes;
+ 	gl_keep(&kept);
+@@ -1797,6 +1845,125 @@
+ 	}
+ }
+ 
++/*
++ * laurel 0006: 64 texels of a texture as the GPU reads them, how many are not black: a stale CPU view and an empty import look alike in the memory
++ * sample alone. -1: no way to look. One draw and a read-back: at most 4 a line, a line at most every 5 s, and only when something stayed black.
++ */
++#ifndef GL_TEXTURE_MIN_FILTER
++#define GL_TEXTURE_MIN_FILTER 0x2801
++#endif
++#ifndef GL_LINEAR
++#define GL_LINEAR 0x2601
++#endif
++static int
++blank_gpu_look(struct eagl *e, const struct image *image)
++{
++	uint8_t got[8 * 8 * 4];
++	struct gl_kept kept;
++	GLint bound = 0, filter = GL_LINEAR;
++	unsigned sx = image->width > 8 ? (unsigned)(image->width - 1) / 7 : 1, sy = image->height > 8 ? (unsigned)(image->height - 1) / 7 : 1;
++	int lit = 0;
++
++	if (image->to != GL_TEXTURE_2D || image->width < 8 || image->height < 8 || !check_setup(e)) {
++		return -1;
++	}
++	gl_keep(&kept);
++	clear_now(e);
++	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
++	glBindTexture(GL_TEXTURE_2D, image->texture);
++	glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &filter);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);      /* (a mip filter on one level is an incomplete texture: all black) */
++	glBindFramebuffer(GL_FRAMEBUFFER, e->check_framebuffer);
++	glViewport(0, 0, 8, 8);
++	glDisable(GL_SCISSOR_TEST);
++	glDisable(GL_BLEND);
++	glColorMask(1, 1, 1, 1);
++	glUseProgram(e->check_program);
++	glUniform2i(glGetUniformLocation(e->check_program, "steps"), (GLint)sx, (GLint)sy);
++	glUniform1i(glGetUniformLocation(e->check_program, "source"), (GLint)e->unit);
++	glDrawArrays(GL_TRIANGLES, 0, 3);
++	glReadPixels(0, 0, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, got);
++	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
++	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
++	gl_back(e, &kept);
++	for (unsigned i = 0; i < 64; i++) {
++		lit += (got[i * 4] | got[i * 4 + 1] | got[i * 4 + 2]) != 0;
++	}
++	return lit;
++}
++
++/*
++ * laurel 0006: surfaces that stay black: by process and format, with what the memory holds now and what the GPU reads. The contents lines say only
++ * "black at the first draw", and that is every new drawable (boot 23:28: surface 605 black on 2 textures, then 4221 of 4225), and "now drawn" came
++ * only when the surface was bound in every 128th frame.
++ */
++static void
++blank_line(struct eagl *e)
++{
++	uint64_t now = blank_now_ms();
++	char text[640];
++	size_t used = 0;
++	unsigned black = 0, named = 0, looks = 0;
++	struct lsf_blank b;
++
++	if (now - e->blank_line_ms < 5000 || e->blank_lines >= 512) {
++		return;
++	}
++	e->blank_line_ms = now;
++	text[0] = 0;
++	while (lsf_blank_take(&e->blanks, now, 2000, &b)) {
++		IOSurfaceRef surface = IOSurfaceLookup(b.surface);
++		struct image *image = NULL, none;
++		char name[5];
++		int gpu = -1;
++
++		if (surface == NULL) {
++			black++;
++			if (named++ < 5 && used < sizeof(text) - 96) {
++				lsf_name(b.pixels, name);
++				used += (size_t)snprintf(text + used, sizeof(text) - used, "%s%s '%s' %ux%u id %u: gone", named > 1 ? "; " : "", b.who, name, b.width, b.height, b.surface);
++			}
++			continue;
++		}
++		for (unsigned i = 0; i < e->image_count; i++) {
++			if (e->images[i].surface == surface && !e->images[i].target) {
++				image = &e->images[i];  /* (the last one made: the one drawn with) */
++			}
++		}
++		if (image == NULL) {
++			memset(&none, 0, sizeof(none));
++			none.surface = surface;
++			none.width = (GLsizei)b.width;
++			none.height = (GLsizei)b.height;
++			image = &none;
++		}
++		contents_of_memory(image);
++		if (image != &none && looks < 4) {
++			looks++;
++			gpu = blank_gpu_look(e, image);
++		}
++		if (image->contents.lit != 0 && gpu != 0) {
++			e->blanks.filled++;
++		} else {
++			black++;
++			if (named++ < 5 && used < sizeof(text) - 96) {
++				lsf_name(b.pixels, name);
++				used += (size_t)snprintf(text + used, sizeof(text) - used, "%s%s '%s' %ux%u id %u: memory %u of %u, GPU %d of 64", named > 1 ? "; " : "", b.who, name, b.width,
++				    b.height, b.surface, image->contents.lit, image->contents.samples, gpu);
++			}
++		}
++		CFRelease(surface);
++	}
++	if (black != 0) {
++		e->blank_lines++;
++		say("LAUREL BLANK: %u surfaces stay black: %s%s; since the last line %u black at a first draw, %u filled, on average in %llu ms%s\n", black, text, named > 5 ? "; more" : "",
++		    e->blanks.seen, e->blanks.filled, e->blanks.filled != 0 ? (unsigned long long)(e->blanks.filled_ms / e->blanks.filled) : 0ull,
++		    e->blank_lines == 1 ? " (memory 0 + GPU 0: the client drew nothing or black; memory 0 + GPU lit: a stale CPU view; memory lit + GPU 0: the import or the texture; GPU -1: no texture to look at)" : "");
++		e->blanks.seen = e->blanks.filled = 0;
++		e->blanks.filled_ms = 0;
++	}
++}
++
+ /* Something is about to be drawn into the framebuffer that is bound. */
+ static void
+ drawing(struct eagl *e)
+@@ -1807,6 +1974,9 @@
+ 	if (e->contents_wanted != 0 || e->frames % 128 == 0) {
+ 		contents_at_draw(e);
+ 	}
++	if (e->blanks.count != 0 && e->frames % 16 == 0) {
++		blank_line(e);
++	}
+ 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
+ 		image->drawn = image->painted = true;
+ 		if (e->box_wanted && image->width >= 700 && image->height >= 1500) {

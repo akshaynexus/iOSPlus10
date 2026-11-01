@@ -1,9 +1,16 @@
 //! op10tool: the binary-heavy tools of iOSPlus10 in one cross-platform CLI (macOS, Linux).
 //! Simple glue stays in shell/Python under scripts/.
 
+mod a64;
+mod a64test;
+mod abi;
+mod lower;
 mod bootlog;
 mod camframe;
+mod census;
 mod ctl;
+mod dsc;
+mod dualboot;
 mod fat;
 mod im4p;
 mod img2simg;
@@ -23,7 +30,55 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum DualbootCmd {
+    /// `ldbhelper map` output -> validated extent table for ADT /chosen laurel-dualboot; refuses overlap, misalignment, holes, flags, or anything outside userdata
+    Table {
+        /// file with the helper's lines
+        #[arg(long)]
+        fiemap: PathBuf,
+        /// userdata first LBA in 4 KiB device blocks
+        #[arg(long, value_parser = parse_u64)]
+        part_first: u64,
+        /// userdata size in 4 KiB device blocks
+        #[arg(long, value_parser = parse_u64)]
+        part_blocks: u64,
+        /// table id; default random
+        #[arg(long, value_parser = parse_u64)]
+        id: Option<u64>,
+        #[arg(short = 'o')]
+        out: PathBuf,
+    },
+    /// All rules on an existing table; exit 1 when one fails
+    Check { table: PathBuf },
+    /// Summary and every extent
+    Show { table: PathBuf },
+    /// HFS+ image -> frames on stdout, for `adb exec-in ldbhelper write`; --index: the headers, for `ldbhelper verify`; --null: only the index and the checks
+    Stream {
+        table: PathBuf,
+        image: PathBuf,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        null: bool,
+    },
+    /// The area size to allocate: donor image bytes x expand + /private/var margin
+    Size {
+        #[arg(long, value_delimiter = ',', value_parser = parse_u64)]
+        donor_bytes: Vec<u64>,
+        #[arg(long, default_value_t = 1.68)]
+        expand: f64,
+        #[arg(long, default_value_t = 8)]
+        var_gib: u64,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
+    /// Mi A3 dual boot: extent table, image stream, size (docs/laurel_sprout/dual-boot.md)
+    Dualboot {
+        #[command(subcommand)]
+        cmd: DualbootCmd,
+    },
     /// Raw image -> Android sparse image (holes -> DONT_CARE, uniform blocks -> FILL, 4 KiB blocks)
     Img2simg { input: PathBuf, output: PathBuf },
     /// Android sparse image -> raw image (for checks)
@@ -68,6 +123,92 @@ enum Cmd {
     },
     /// Extract the payload of an IM4P (raw or LZFSE)
     Im4p { input: PathBuf, output: PathBuf },
+    /// Census of a dyld shared cache and Mach-O tree on an ARMv8.0 CPU (needs llvm-mc): classes, LSE, PAC, slide info, layout
+    A64Census {
+        /// Main dyld_shared_cache_arm64e file (subcaches next to it)
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Tree of Mach-O files; all arm64e slices are counted (repeatable)
+        #[arg(long)]
+        root: Vec<PathBuf>,
+        /// Output folder
+        #[arg(long)]
+        out: PathBuf,
+        /// Use at most N root files, evenly spaced (0 = all)
+        #[arg(long, default_value_t = 0)]
+        sample: usize,
+        /// Count every arm64 slice, not only arm64e (for a lowered tree)
+        #[arg(long)]
+        all_slices: bool,
+    },
+    /// Run each LSE form natively (qemu -cpu max) and through its trampoline (qemu -cpu cortex-a53); compare every register, NZCV, red zone and memory
+    A64Selftest {
+        /// Extra words, one hex per line (lse-words.txt of a64-lower)
+        #[arg(long)]
+        words: Option<PathBuf>,
+        /// Work folder
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write a lowered copy of a dyld shared cache for an ARMv8.0 CPU (never in place): PAC, RCpc, LSE trampolines, DIT, auth rebases, new signatures
+    A64Lower {
+        /// Main dyld_shared_cache_arm64e file (subcaches next to it)
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// One Mach-O file or a tree of them (repeatable)
+        #[arg(long)]
+        macho: Vec<PathBuf>,
+        /// New output folder
+        #[arg(long)]
+        out: PathBuf,
+        /// Comma list: all, pac, rcpc, lse, sysreg, slide
+        #[arg(long, default_value = "all")]
+        rules: String,
+        /// Code-signature page shift of the output (12 for a 4 KiB kernel; 0 keeps the file's own and rehashes in place)
+        #[arg(long, default_value_t = 0)]
+        page_shift: u32,
+        /// Image never loaded on this device (substring, repeatable): its __text becomes trampoline space and it is not lowered
+        #[arg(long)]
+        dead_image: Vec<String>,
+        /// Plan only: report the numbers and write no output
+        #[arg(long)]
+        plan: bool,
+    },
+    /// Check a lowered copy against the original: only allowed word changes, trampolines valid on cortex-a73, signatures, slide chains
+    A64Verify {
+        /// Main cache file of the original
+        #[arg(long)]
+        orig: PathBuf,
+        /// Output folder of a64-lower
+        #[arg(long)]
+        lowered: PathBuf,
+        /// Same list as a64-lower --dead-image
+        #[arg(long)]
+        dead_image: Vec<String>,
+        /// Tree of the original Mach-O files: also check `lowered/macho`
+        #[arg(long)]
+        macho_orig: Option<PathBuf>,
+    },
+    /// Trace IOConnectCall* and sandbox selectors of named images in a dyld shared cache; dump symbols and strings
+    A64Abi {
+        #[arg(long)]
+        cache: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Disassemble a function of a cache image, or list callers of a symbol (--xref)
+    A64Dis {
+        #[arg(long)]
+        cache: PathBuf,
+        #[arg(long)]
+        image: String,
+        #[arg(long)]
+        symbol: String,
+        #[arg(long)]
+        xref: bool,
+        #[arg(long, default_value_t = 200)]
+        count: usize,
+    },
     /// Command to the negroni or Mi A3 kernel over USB Ethernet (UDP 5141): ping, reboot, bootloader, recovery, poweroff, panic, settime, time, log, bootlog
     Ctl {
         #[arg(value_enum)]
@@ -135,6 +276,13 @@ fn parse_u64(s: &str) -> Result<u64, String> {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Dualboot { cmd } => match cmd {
+            DualbootCmd::Table { fiemap, part_first, part_blocks, id, out } => dualboot::make(&fiemap, part_first, part_blocks, id, &out),
+            DualbootCmd::Check { table } => dualboot::check(&table),
+            DualbootCmd::Show { table } => dualboot::show(&table),
+            DualbootCmd::Stream { table, image, index, null } => dualboot::stream(&table, &image, index.as_deref(), null),
+            DualbootCmd::Size { donor_bytes, expand, var_gib } => dualboot::size(&donor_bytes, expand, var_gib),
+        },
         Cmd::Img2simg { input, output } => img2simg::img2simg(&input, &output),
         Cmd::Simg2img { input, output } => img2simg::simg2img(&input, &output),
         Cmd::HfsSize { input, trim } => img2simg::hfs_size(&input, trim),
@@ -146,6 +294,14 @@ fn main() -> Result<()> {
         }
         Cmd::Fatls { image, paths, part_bytes } => fat::run(&image, &paths, part_bytes),
         Cmd::Im4p { input, output } => im4p::run(&input, &output),
+        Cmd::A64Census { cache, root, out, sample, all_slices } => census::run(cache.as_deref(), &root, &out, sample, all_slices),
+        Cmd::A64Selftest { words, out } => a64test::run(words.as_deref(), &out),
+        Cmd::A64Lower { cache, macho, out, rules, page_shift, dead_image, plan } => {
+            lower::run(cache.as_deref(), &macho, &out, &rules, page_shift, &dead_image, plan)
+        }
+        Cmd::A64Verify { orig, lowered, dead_image, macho_orig } => lower::verify(&orig, &lowered, &dead_image, macho_orig.as_deref()),
+        Cmd::A64Abi { cache, out } => abi::run(&cache, &out),
+        Cmd::A64Dis { cache, image, symbol, xref, count } => abi::dis(&cache, &image, &symbol, xref, count, std::path::Path::new("out/ios26/tmp-dis")),
         Cmd::Ctl { command, host } => ctl::run(command, &host),
         Cmd::Camframe { host, out, no_capture, raw, width, height, bayer } => {
             camframe::run(camframe::Args { host, out, no_capture, raw, width, height, bayer })

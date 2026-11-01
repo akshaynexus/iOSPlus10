@@ -14,6 +14,7 @@ set -eu
 TEST=${1:-}
 SAFE=${SAFE:-out/ios16-safe}
 F=scripts/flash/ios16.sh
+scripts/laurel/android-guard.sh other-device   # this script is for the OnePlus 10 Pro; the Mi A3 holds Android
 mode() { fastboot getvar is-userspace 2>&1 | sed -n 's/^is-userspace: //p'; }
 until fastboot devices 2>/dev/null | grep -q fastboot; do sleep 2; done
 [ "$(mode)" = no ] || { fastboot reboot bootloader; sleep 5; until [ "$(mode)" = no ]; do sleep 2; done; }

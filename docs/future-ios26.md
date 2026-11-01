@@ -1,5 +1,8 @@
 # Future: iOS 26 on negroni (donor device, kernel source, patch port)
 
+This file is the **negroni** plan (PAC CPU, donor iPhone12,3). The Mi A3 (no PAC, no LSE, donor iPhone12,1): [laurel_sprout/ios26-userland.md](laurel_sprout/ios26-userland.md).
+Linux: `hdiutil` below becomes `scripts/ios26/sysos-tree.sh` (apfs-fuse), `ipsw` comes from `scripts/setup/get-ipsw-cli.sh`.
+
 Date: 2026-10-27. Research only. No phone write, no kernel build, no change in `external/`.
 
 Marks: **[V]** verified (command output, file, source line, IPSW content). **[I]** inference or

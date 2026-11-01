@@ -492,3 +492,55 @@ lsf_contents_of_rb4(const struct lsf_plane *plane, uint32_t width, uint32_t heig
 	}
 	lsf_mean(c, sum);
 }
+
+/* laurel 0006 */
+struct lsf_blank *
+lsf_blank_note(struct lsf_blanks *b, uint32_t surface, uint32_t pixels, uint32_t width, uint32_t height, uint64_t now_ms)
+{
+	b->seen++;
+	for (unsigned i = 0; i < b->count; i++) {
+		if (b->list[i].surface == surface) {
+			return NULL;
+		}
+	}
+	if (b->count == LSF_BLANKS) {
+		b->lost++;
+		return NULL;
+	}
+	struct lsf_blank *n = &b->list[b->count++];
+
+	memset(n, 0, sizeof(*n));
+	n->surface = surface;
+	n->pixels = pixels;
+	n->width = width;
+	n->height = height;
+	n->since_ms = now_ms;
+	return n;
+}
+
+bool
+lsf_blank_filled(struct lsf_blanks *b, uint32_t surface, uint64_t now_ms)
+{
+	for (unsigned i = 0; i < b->count; i++) {
+		if (b->list[i].surface == surface) {
+			b->filled++;
+			b->filled_ms += now_ms - b->list[i].since_ms;
+			b->list[i] = b->list[--b->count];
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+lsf_blank_take(struct lsf_blanks *b, uint64_t now_ms, uint64_t age, struct lsf_blank *out)
+{
+	for (unsigned i = 0; i < b->count; i++) {
+		if (now_ms - b->list[i].since_ms >= age) {
+			*out = b->list[i];
+			b->list[i] = b->list[--b->count];
+			return true;
+		}
+	}
+	return false;
+}

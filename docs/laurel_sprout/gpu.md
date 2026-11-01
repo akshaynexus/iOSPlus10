@@ -842,7 +842,7 @@ LAUREL GPU CLOCK: on: last minute 300 MHz 41 s, 600 MHz 19 s, 37 raises, 0 hot r
 | `420f/v 422f/v 444f/v`, `xf20 x420 xf22 x422 xf44 x444`, `pf20 p420 pf22 p422 pf44 p444`, `xf4p`, `yuvs yuvf 2vuy 2vuf` | | BT.601/709/2020 by `IOSurfaceYCbCrMatrix`, range by OSType, chroma nearest | m2v ycbcr.rs. In the normal path CA samples the planes itself; this is for `-attachImage:` and refused forms |
 | any other | | by layout: one plane 4/8/16/2/1 bytes, or planes 1+2, 2+4, 4+1; one line `THIS OSTYPE IS NOT KNOWN, best effort` | |
 
-**GPU or CPU.** (2913 + eagl 0005: also `_RB4` and A008, L008, LA08 by the GPU, section "Frame budget".) Before them the kernel imported only one plane of 4-byte pixels with rows of 64 (`surfaceBuffer`). So: 32-bit word formats go as bytes through the existing zero-copy import, `xr_pass()` rebuilds the word in a shader and writes the texture CoreAnimation reads, once per frame in which the texture is bound (a Metal client's GPU writes move no seed). Self-check: import or framebuffer fails = one line, CPU from then on. All else (`_RB4` included): CPU, on seed change or a changed sum of all planes; `sys_dcache_flush` first, because another process's GPU wrote the memory. Widgets change rarely; the sum follows the still-surface rule (every 8th frame after 120 equal looks).
+**GPU or CPU.** (2913 + eagl 0005: also `_RB4` and A008, L008, LA08 by the GPU, section "Frame budget".) Before them the kernel imported only one plane of 4-byte pixels with rows of 64 (`surfaceBuffer`). So: 32-bit word formats go as bytes through the existing zero-copy import, `xr_pass()` rebuilds the word in a shader and writes the texture CoreAnimation reads, once per frame in which the texture is bound (corrected in "Black layers": a Metal client's write does move the seed). Self-check: import or framebuffer fails = one line, CPU from then on. All else (`_RB4` included): CPU, on seed change or a changed sum of all planes; `sys_dcache_flush` first, because another process's GPU wrote the memory. Widgets change rarely; the sum follows the still-surface rule (every 8th frame after 120 equal looks).
 
 **What the kernel hides.** SweetSurface keeps `w30r`, `l10r`, `w30R`, `b3a8` as BGRA, for CPU clients (HackiOS): they read that back. So the OSType cannot say what a Metal client draws. flame/0020 writes the texture's pixel format into the surface value `LaurelMetalFormat`; `surface_drawn_as()` reads it. No heuristic: BGR10_XR's top bits are ones, a word reads as an opaque BGRA pixel.
 
@@ -936,6 +936,80 @@ Reading: `moving` near 60 and few `<36` gaps = smooth. `M past one panel frame` 
 ### Kill switches
 
 `sweetfb_lock=0` (plain timer), `gpuclientseed=0`, `glenv=FD_MESA_DEBUG=gmem` (tiles), `NEGRONIMETAL_RB_FAMILY=0`. A planes failure turns itself off with one line. Touch: `sweettouchirq=0` as before.
+
+## Black layers (boot 2026-11-01 23:28; patches 2916, eagl 0006, Mesa 0003; built + host test, NOT BOOTED)
+
+Owner: "Maps shows a map, but all in black. Widgets are failing to render again." Kernel 4ec4584, root 21:57 (3fba60e). Logs: `logs/laurel-boot-maps.txt` (ends 23:31:36), `logs/phone/metal.log` (pulled 23:31), good boot `logs/laurel-boot-2208.txt`. **No line below proves a map on the screen: a host build cannot.** [V] log, source or binary. [I] inference. [U] unknown.
+
+### First fact: Maps is in no log
+
+[V] No `exec Maps`, no `NMTL[n Maps]` in the USB log up to 23:31:36 or in metal.log. The stream stops at 23:31:36, the interface goes at 23:41:42: the Maps test is in those 10 minutes. The maps that are in the log: FindMy (pid 293, 23:30:21) and the location prompt (pid 294, 23:30:24), both MapKit.
+
+### Cause that is proven: the wired guard refuses surfaces
+
+[V] `LAUREL WIRED: refused`: 1800 MiB wired of 1795 at 23:31:25, 1827 at 23:31:28, 51-54 MiB free. 246 lines `create ... -> 0xe00002bd`: 7 of size 0x0 (PosterBoard, as in earlier boots), 239 of a real size: PosterBoard 172, Pride 31, Aegir 20, Collections 12, **chronod 4 (271x109, 23:31:32-36)**. They go on to the last line of the log. Boot 22:08: 0. Same guard, same limit; near the limit there too (1619 MiB at 22:15:34), and no refusal. Gallery open in this boot: AegirPoster 23:30:57 and 23:31:19, PridePoster, CollectionsPoster.
+
+- Widgets: **a refused chronod surface is a widget that does not render.** [V] 4 lines. [I] that is what the owner saw: the log ends 4 s later.
+- Maps: [V QuartzCore 20H392] `get_unused_drawable` 0x188385c80 `create_iosurface_with_pixel_format`, `cbz x0` at 0x188385c84: no surface, no drawable. `nextDrawable` then waits and answers nil. The Metal layer is black while the rest of the app draws. [I] Maps ran under this: it started after 23:31:36, the refusals were running then, nothing in the log says the wired pages came back.
+- [U] who holds 1800 MiB. Surfaces and scattered GPU buffers count, and kernel memory of about 300 tasks. New line `LAUREL WIRED: who:` says it.
+
+### The path, hop by hop
+
+| Hop | Evidence | Verdict |
+|---|---|---|
+| Metal client to Turnip | [V] FindMy and the prompt: device open, first command buffer completed, `0 failed`, no `refused`, no `draw skipped`. `pipelines 5`, `6`. No `primitive_*` line in this boot's USB log | no break seen |
+| A map can draw in this boot | [V] surfaces 574, 573 (540x360) at 23:30:27, 3 s after the prompt's device: 4824 of 4824 lit, 4501 unlike. [I] that is the prompt's map: 270x180 points at 2x; no line links the surface to the process | fits: VectorKit draws when it gets surfaces |
+| Into the surface: import | [V] BGRA with rows of 64 by ID (0x7e); others by USERPTR (0x49), `errno 78` = refused layout, 3 lines, not a failure | as designed |
+| Cache: GPU write against CPU lines | [V source] the kernel zeroes a surface through a cached map, so dirty lines can exist. They go: 0x49 at import, 0x7e at the first submission (`pushed` 0), flame `flushSurfaces` (`dc civac`) at commit and at completion. Nothing dirties them after that. So no write-back over GPU pixels | no break by source. Run time: `LAUREL BLANK` |
+| Seed | [V flame `-finish`] every client but backboardd: write lock + unlock of each written surface **before** `present`. So a Metal client's write moves the seed, by ID or USERPTR. [V 2915] the kernel also moves it at submission, by ID only. 0x7d: eagl only. **Correction: "a Metal client's GPU writes move no seed" (above, GPU or CPU) is wrong while the seed bump is on** | no break |
+| Present | [V flame] `present` runs in `-finish`, after the GPU's completion. So a drawable is not shown before it is drawn | no break |
+| backboardd's texture: old eagl, new kernel | [V] `_RB4` 14 lines lit, 0 black; `converted by the GPU` lit (1080, 1135); 0x7c and 0x7b are new requests, the others did not change. The lag agent's statement holds | no break |
+| `contents` itself | [V eagl 0004, on the phone] `sys_dcache_flush` before the sample: not a stale CPU view. **42 of the 62 BLANK lines are `0 of 0`: A008 36, 420f 6: not looked at** (eagl 0005 fixes the text). 20 lines remain: 19 BGRA surfaces, 9 lit later. For 10 no later line: the follow-up needs the surface bound in every 128th frame, so they prove nothing | the line is weak: 0006 |
+| Format, MSAA, memoryless | [V] BGRA8 and sRGB are plain; `resolveTexture` and store actions reach m2v; memoryless = transient attachment. [U] run with VectorKit on the A610 | no evidence either way |
+| RenderBox family answer | [V] not on the phone: the root is older. Not the cause | excluded |
+| GPU pool | [V] 26-135 MiB free; no `cannot be entered`, no `OutOfMemory`, 0 frees refused. Under the floor buffers go to scattered pages: they work, and they count as wired. **[I] that is the link: pool full -> scattered -> wired -> surfaces refused.** Kept buffers (81 MB in one client's line, up to 160 MiB a client, 60 s) lie in the pool meanwhile | no silent failure; fuel for the guard |
+
+### Changes
+
+Kernel **2916** `laurel-wired-screen-first`:
+1. Before a refusal, and before a buffer goes to scattered pages: the kept buffers of all clients but backboardd go back (at most twice a second). `LAUREL GPU KEPT: gave back N MiB ...`. Costs only time.
+2. Two limits. 55 % as before. 70 % (2284 MiB) for the app on the screen (role foreground or jetsam band >= foreground) and chronod. A name with `Poster` stays at 55 %: posters ask again and again and hold the most. Kill switch `laurelwiredshown=0`. [I] 70 % leaves 979 MiB for pageable memory; negroni's freeze has no measured floor.
+3. `LAUREL WIRED: who:` at most every 10 s while over the limit.
+4. Request 0x7b: who created a surface.
+5. A seed move from a client's GPU write is no CPU write: `gpuMoves` leaves it out of the push rule. [V] 2019 KB out of the cache a submission on average, 34089 at the worst, against 534 and 7719 in boot 22:08. [I] the share of this cause; the two boots did different work.
+
+eagl **0006**, Mesa **0003**: `LAUREL BLANK`, at most one line in 5 s, for surfaces black at a first draw and not lit 2 s later: process, format, size, id, memory sample, 64 texels read **through the GPU**.
+
+Not changed: the guard's 55 % for others; kernel memory; any Metal path (no evidence of a fault).
+
+Build [V, cea447a]: kernel-linux.sh 308/308 patches, 0 failed, 0 LSE, printf-arg-check OK, kernel sha256 37beb26901de0f20..., series 0ce006e70a229e13; armv80-check on the kernel: 21 (SVE words in data, the same count as earlier kernels), 0 LSE. gpu-userland.sh + Mesa: libtopaz-gl b1cd72f0449f97ed, libOSMesa 29b469806232969a, exports `redwood_drm_surface_who`, armv80-check 0 on both. Host: gpu-surface-test.sh PASS (with the LAUREL BLANK list). metal-build.sh not run: no Metal source changed. Not run: root build, any boot.
+
+### Lines at the next boot
+
+```
+LAUREL WIRED: on: buffer surfaces refused above 1795 MiB wired = 55% of max_mem 3264 MiB (the 2100 window), above 2284 MiB for the app on the screen and chronod; ...
+LAUREL WIRED: who: W MiB wired: surfaces S MiB (PosterBoard A MiB in N, AegirPoster ...); C GPU clients: buffers B MiB (with surfaces they name), of which their own pages H MiB; kept K MiB
+LAUREL GPU KEPT: gave back N MiB of kept buffers of M clients: memory is short (call T)
+LAUREL WIRED: above the limit for what is on the screen: surface of 4688 KiB for Maps (role R, band B): ...
+LAUREL WIRED: refused surface of 4688 KiB for PosterBoard (role R, band B): ...
+LAUREL WIRED: REFUSED, A LAYER STAYS BLACK: surface of 4688 KiB for Maps (role R, band B): ...
+|backboardd| LAUREL BLANK: N surfaces stay black: Maps 'BGRA' 720x1560 id I: memory L of 4225, GPU G of 64; ...; since the last line X black at a first draw, Y filled, on average in Z ms
+```
+
+Reading, for Maps:
+
+| Lines | Meaning | Next step |
+|---|---|---|
+| `REFUSED, A LAYER STAYS BLACK ... Maps` | still short at 70 %: the `who:` line names the holder | reduce that holder |
+| `refused ... Maps (role R, band B)`, no `above the limit` | role and band do not mark Maps as on the screen | use what R and B say |
+| `LAUREL BLANK: Maps ...: memory 0, GPU 0`, no refusal | Maps got its surface and drew black or nothing: the Metal path | VectorKit: pipelines, MSAA, textures |
+| `memory 0, GPU lit` | a stale CPU view; the screen should be right | the sampler |
+| `memory lit, GPU 0` | import or texture in backboardd | eagl |
+| no line, black on the panel | CoreAnimation draws it another way | `gltrace_place` |
+
+### USB log stream
+
+[V source] The live log is a kernel UDP socket through the normal stack (`ud_log_thread`, `sock_send`). A failed send has no line, it tries again in 100 ms. [V] It stopped right after `exec usbnetcfg` at 23:10:29 and 23:31:36; the jobs at boot (`up`) did not stop it. `down` removes the ue0 keys from configd's state. [I] configd then takes the route or the address of ue0, so every send fails. Not fixed here (root and net: other agents). Do not run `usbnetcfg down` while the log is needed.
 
 ## Recovery (no UI after the GPU root)
 
