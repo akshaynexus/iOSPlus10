@@ -1,0 +1,1189 @@
+laurel 2942: cellular data session: DPM OPEN_PORT, WDA SET_DATA_FORMAT before ONLINE, per family WDS BIND_MUX + SET_IP_FAMILY + START_NETWORK + GET_CURRENT_SETTINGS; interface pdp_ip0 (bsd/dev/laurel_pdp.c) with addresses by kernel ioctl, kern.laurel_cell_net for laurel_celld (configd). Lines LaurelData and LAUREL CELL DATA. Host test: test-cell.sh. NOT PROVEN on a phone: [I] until a ping.
+
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-01 23:24:17.345368441 +0530
++++ b/bsd/conf/files	2026-11-01 23:27:42.202969570 +0530
+@@ -129,6 +129,8 @@
+ bsd/dev/laurel_wired.c			standard
+ bsd/dev/laurel_stats.c			standard
+ bsd/dev/laurel_cell.c			standard
++bsd/dev/laurel_cell_data.c			standard
++bsd/dev/laurel_pdp.c			standard
+ bsd/dev/laurel_ext4.c			standard
+ bsd/dev/laurel_ext4_dir.c		standard
+ bsd/dev/laurel_ipa.c			standard
+diff -ruN a/bsd/dev/laurel_cell.c b/bsd/dev/laurel_cell.c
+--- a/bsd/dev/laurel_cell.c	2026-11-01 23:35:23.426646471 +0530
++++ b/bsd/dev/laurel_cell.c	2026-11-01 23:35:23.427086955 +0530
+@@ -55,6 +55,8 @@
+ void laurel_cell_poll(bool ready, bool glink);
+ void laurel_cell_off(const char *why);
+ 
++#include "laurel_cell_data.h"                   /* laurel 2942: the data session */
++
+ #define SAY(...)            printf("LAUREL CELL: " __VA_ARGS__)
+ #define LOG(...)            printf("LaurelCell: " __VA_ARGS__)
+ 
+@@ -98,6 +100,7 @@
+ #define ONLINE_TRIES        6u                  /* laurel 2940: rounds of (low power when needed, then online), 10 s apart, 30 s after an "ok" that changes nothing */
+ #define MODE_GRACE_MS       20000u              /* laurel 2940: mode 4, 5 or unknown this long after DMS came up: ask all the same */
+ #define LPM_GAP_MS          2000u               /* low power answered -> online */
++#define FORMAT_WAIT_MS      30000u              /* laurel 2942: the data format before the radio (as netmgrd before the RIL), at most this long */
+ #define ONLINE_RECHECK_MS   30000u
+ #define BIND_TRIES          6u                  /* NAS BIND_SUBSCRIPTION: UIM still starting answers an error */
+ #define SAY_MIN_GAP_MS      10000u
+@@ -196,6 +199,12 @@
+ 	return ns / 1000000u;
+ }
+ 
++uint64_t
++lcd_now_ms(void)
++{
++	return now_ms();
++}
++
+ static void
+ set_status(const char *s)
+ {
+@@ -265,7 +274,7 @@
+ 			buf[i] = '.';
+ 		}
+ 	}
+-	if (lines++ < 16) {
++	if (lines++ < 32) {             /* laurel 2942: laurel-celld writes here too */
+ 		printf("LAUREL CELLBAR: %s\n", buf);
+ 	}
+ 	return 0;
+@@ -305,6 +314,7 @@
+ 	va_end(ap);
+ 	state = -1;
+ 	SAY("off: %s\n", why);
++	lcd_off(why);
+ 	char s[sizeof(status_text)];
+ 	snprintf(s, sizeof(s), "off: %s", why);
+ 	set_status(s);
+@@ -588,9 +598,11 @@
+ 			n += snprintf(out + n, max - n, " bars %d", reg_bars(r));
+ 		}
+ 	}
+-	/* what is not built, in the line: nobody must read "on" as calls or data */
++	/* what is not built, in the line: nobody must read "on" as calls; data: only what the session says */
+ 	if (n < max) {
+-		n += snprintf(out + n, max - n, "; data off: no AP GSI data pipes yet");
++		char dt[200];
++		lcd_summary(dt, sizeof(dt));
++		n += snprintf(out + n, max - n, "; %s", dt);
+ 	}
+ 	if (n < max) {
+ 		(void)snprintf(out + n, max - n, "; SMS, voice off: not built");
+@@ -649,8 +661,8 @@
+ 	size_t n = 0;
+ 	const char *st = state == -1 ? "off" : (state == 0 ? "starting" : "on");
+ 
+-	n += snprintf(out + n, max - n, "state=%s\nradio=%s\ndata=off\nsms=off\nvoice=off\nmode=%s\ncaps=%s\n", st,
+-	    state != -1 && opmode == 0 ? "online" : "off", opmode_name(opmode), caps);
++	n += snprintf(out + n, max - n, "state=%s\nradio=%s\ndata=%s\nsms=off\nvoice=off\nmode=%s\ncaps=%s\n", st,
++	    state != -1 && opmode == 0 ? "online" : "off", lcd_state_key(), opmode_name(opmode), caps);
+ 	for (int sub = 0; sub < 2 && n < max; sub++) {
+ 		int s = sub_view_slot(sub);
+ 		const struct reg *r = &reg[sub];
+@@ -1039,6 +1051,9 @@
+ 	if (early && now - t_dms < MODE_GRACE_MS) {
+ 		return false;
+ 	}
++	if (!lcd_format_done() && now - t_dms < FORMAT_WAIT_MS) {
++		return false;
++	}
+ 	if (!lpm_done && online_tries >= ONLINE_TRIES) {
+ 		return false;
+ 	}
+@@ -1212,7 +1227,7 @@
+ 		memcpy(apn, v, l);
+ 		apn[l] = 0;
+ 	}
+-	LOG("WDS: 3GPP profile 1 %s%s%s; START_NETWORK not sent (no AP GSI data pipes in this kernel)\n",
++	LOG("WDS: 3GPP profile 1 %s%s%s\n",
+ 	    e == 0 ? "APN \"" : "error ", e == 0 ? apn : "", e == 0 ? "\"" : "");
+ }
+ 
+@@ -1224,6 +1239,7 @@
+ 	if (!laurel_cell_enabled()) {
+ 		return;
+ 	}
++	lcd_server(svc, node, port, up);
+ 	for (int i = 0; i < C_N; i++) {
+ 		struct qc *c = &qc[i];
+ 		if (c->svc != svc) {
+@@ -1257,7 +1273,7 @@
+ 	for (i = 0; i < C_N && qc[i].port != dst_port; i++) {
+ 	}
+ 	if (i == C_N) {
+-		return false;
++		return laurel_cell_enabled() && lcd_rx(dst_port, d, len);
+ 	}
+ 	if (!laurel_cell_enabled() || len < 7 || (d[0] != QMI_RESP && d[0] != QMI_IND)) {
+ 		return true;
+@@ -1414,6 +1430,8 @@
+ 			qc_simple(C_DMS, DMS_GET_OPMODE);
+ 		}
+ 	}
++	/* laurel 2942: the data session, on the modem's default subscription (primary) */
++	lcd_poll(now, sub_slot(0) >= 0 && reg[0].valid && reg[0].state == 1 && (!reg[0].bound || reg[0].bind_ok));
+ 	/* NAS per subscription */
+ 	for (int sub = 0; sub < 2; sub++) {
+ 		int i = sub == 0 ? C_NAS1 : C_NAS2;
+diff -ruN a/bsd/dev/laurel_cell_data2.h b/bsd/dev/laurel_cell_data2.h
+--- a/bsd/dev/laurel_cell_data2.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_cell_data2.h	2026-11-01 23:27:42.199054428 +0530
+@@ -0,0 +1,383 @@
++/*
++ * laurel 2942: second half of laurel_cell_data.c (included there): the steps of a data session and the hooks for laurel_cell.c.
++ */
++
++static void
++ask_dpm(void)
++{
++	uint8_t m[64], v[1 + 16] = { 1 };
++	uint32_t w[4] = { EP_EMBEDDED, EP_IFACE, PIPE_TO_MODEM, PIPE_FROM_MODEM };
++
++	memcpy(v + 1, w, 16);
++	d_send(D_DPM, MSG_DPM_OPEN, m, m_tlv(m, 7, 0x11, v, sizeof(v)));
++}
++
++static void
++ask_wda(void)
++{
++	uint8_t m[96];
++	uint32_t n = 7, x;
++	uint32_t ep[2] = { EP_EMBEDDED, EP_IFACE };
++
++	x = 2;              n = m_tlv(m, n, 0x11, &x, 4);       /* raw IP */
++	x = 5;              n = m_tlv(m, n, 0x12, &x, 4);       /* QMAP up */
++	n = m_tlv(m, n, 0x13, &x, 4);                           /* QMAP down */
++	x = DL_MAX_PKTS;    n = m_tlv(m, n, 0x15, &x, 4);
++	x = DL_MAX_BYTES;   n = m_tlv(m, n, 0x16, &x, 4);
++	n = m_tlv(m, n, 0x17, ep, 8);
++	d_send(D_WDA, MSG_WDA_FORMAT, m, n);
++}
++
++static void
++ask_call(int ci, uint64_t now)
++{
++	struct call *c = &calls[ci];
++	int di = D_WDS4 + ci;
++	uint8_t m[48];
++	uint32_t n = 7;
++
++	switch (c->step) {
++	case CALL_BIND: {
++		uint32_t ep[2] = { EP_EMBEDDED, EP_IFACE };
++		uint8_t mux = LCD_MUX_ID;
++		n = m_tlv(m, n, 0x10, ep, 8);
++		n = m_tlv(m, n, 0x11, &mux, 1);
++		d_send(di, MSG_WDS_BIND_MUX, m, n);
++		break;
++	}
++	case CALL_FAMILY:
++		n = m_tlv(m, n, 0x01, &c->family, 1);
++		d_send(di, MSG_WDS_FAMILY, m, n);
++		break;
++	case CALL_STARTING:
++		n = m_tlv(m, n, 0x19, &c->family, 1);
++		d_send(di, MSG_WDS_START, m, n);
++		c->starts++;
++		LOGD("%s: START_NETWORK (default profile, try %u)\n", dc[di].name, c->starts);
++		break;
++	case CALL_SETTINGS: {
++		uint32_t mask = SETTINGS_MASK;
++		n = m_tlv(m, n, 0x10, &mask, 4);
++		d_send(di, MSG_WDS_SETTINGS, m, n);
++		break;
++	}
++	default:
++		break;
++	}
++	(void)now;
++}
++
++static void
++say_on_line(void)
++{
++	bool v4 = calls[0].step == CALL_UP, v6 = calls[1].step == CALL_UP;
++
++	if ((v4 || v6) && !said_on) {
++		said_on = true;
++		SAYD("on: pdp_ip0%s%s, mux %u; the phone's ping proves it, not this line\n", v4 ? " IPv4" : "", v6 ? " IPv6" : "", LCD_MUX_ID);
++	} else if (!v4 && !v6) {
++		said_on = false;
++	}
++}
++
++static void
++call_settings(int ci, const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0;
++	const uint8_t *v;
++
++	if (ci == 0) {
++		uint32_t ip = get32(d, len, 0x1E), mask = get32(d, len, 0x21), gw = get32(d, len, 0x20);
++		uint32_t dns1 = get32(d, len, 0x15), dns2 = get32(d, len, 0x16), mtu = get32(d, len, 0x29);
++
++		LOGD("ipv4: address %u.%u.%u.%u mask %u.%u.%u.%u gateway %u.%u.%u.%u mtu %u\n", ip >> 24, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255,
++		    mask >> 24, (mask >> 16) & 255, (mask >> 8) & 255, mask & 255, gw >> 24, (gw >> 16) & 255, (gw >> 8) & 255, gw & 255, mtu);
++		if (ip == 0) {
++			LOGD("ipv4: no address in the settings: this family stays down\n");
++			return;
++		}
++		laurel_pdp_set4(true, ip, mask, gw, dns1, dns2, mtu);
++	} else {
++		static const uint8_t zero[17];
++		const uint8_t *a = (v = d_tlv(d, len, 0x25, &l)) != NULL && l >= 17 ? v : zero;
++		const uint8_t *g = (v = d_tlv(d, len, 0x26, &l)) != NULL && l >= 17 ? v : zero;
++		const uint8_t *d1 = (v = d_tlv(d, len, 0x27, &l)) != NULL && l >= 16 ? v : zero;
++		const uint8_t *d2 = (v = d_tlv(d, len, 0x28, &l)) != NULL && l >= 16 ? v : zero;
++		uint32_t mtu = get32(d, len, 0x29);
++
++		LOGD("ipv6: address %02x%02x:%02x%02x:...:%02x%02x/%u mtu %u\n", a[0], a[1], a[2], a[3], a[14], a[15], a[16], mtu);
++		if (memcmp(a, zero, 16) == 0) {
++			LOGD("ipv6: no address in the settings: this family stays down\n");
++			return;
++		}
++		laurel_pdp_set6(true, a, a[16], g, d1, d2, mtu);
++	}
++	calls[ci].step = CALL_UP;
++	say_on_line();
++}
++
++static void
++call_rx(int ci, uint16_t msg, uint16_t e, const uint8_t *d, uint32_t len, uint64_t now)
++{
++	struct call *c = &calls[ci];
++	const char *name = dc[D_WDS4 + ci].name;
++
++	switch (msg) {
++	case MSG_WDS_BIND_MUX:
++		LOGD("%s: BIND_MUX_DATA_PORT mux %u: %s0x%x\n", name, LCD_MUX_ID, e == 0 ? "ok " : "error ", e);
++		c->step = CALL_FAMILY;  /* a refusal: scion's modem starts the session all the same */
++		break;
++	case MSG_WDS_FAMILY:
++		LOGD("%s: SET_IP_FAMILY: %s0x%x\n", name, e == 0 ? "ok " : "error ", e);
++		c->step = CALL_IDLE;
++		break;
++	case MSG_WDS_START: {
++		uint16_t l = 0, reason = 0, tech = 0;
++		const uint8_t *v = d_tlv(d, len, 0x10, &l);
++
++		if (v != NULL && l >= 2) {
++			memcpy(&reason, v, 2);
++		}
++		v = d_tlv(d, len, 0x11, &l);            /* verbose: type u16, reason u16 */
++		if (v != NULL && l >= 4) {
++			memcpy(&tech, v + 2, 2);
++		}
++		if (e == 0 || e == QMI_NO_EFFECT) {
++			c->handle = get32(d, len, 0x01);
++			LOGD("%s: START_NETWORK: connected (%s0x%x)\n", name, e == 0 ? "ok " : "already up ", e);
++			c->step = CALL_SETTINGS;
++			break;
++		}
++		if (e != c->last_err || reason != c->last_reason || c->starts <= 3) {
++			LOGD("%s: START_NETWORK: error 0x%x, call end reason %u, verbose %u (try %u)\n", name, e, reason, tech, c->starts);
++		}
++		c->last_err = e;
++		c->last_reason = reason;
++		c->step = CALL_IDLE;
++		c->next = now + (c->starts < START_FAST_TRIES ? START_GAP_MS : START_GAP_LONG_MS);
++		break;
++	}
++	case MSG_WDS_SETTINGS:
++		if (e == 0) {
++			c->step = CALL_IDLE;    /* unless the settings hold an address */
++			c->next = now + START_GAP_MS;
++			call_settings(ci, d, len);
++		} else {
++			LOGD("%s: GET_CURRENT_SETTINGS: error 0x%x\n", name, e);
++			c->step = CALL_IDLE;
++			c->next = now + START_GAP_MS;
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++/* the session ended: the interface loses this family; the next START comes when NAS says registered */
++static void
++call_status_ind(int ci, const uint8_t *d, uint32_t len, uint64_t now)
++{
++	struct call *c = &calls[ci];
++	uint16_t l = 0, reason = 0;
++	const uint8_t *v = d_tlv(d, len, 0x01, &l);
++
++	if (v == NULL || l < 1 || v[0] != 1) {
++		return;
++	}
++	v = d_tlv(d, len, 0x10, &l);
++	if (v != NULL && l >= 2) {
++		memcpy(&reason, v, 2);
++	}
++	LOGD("%s: disconnected, call end reason %u\n", dc[D_WDS4 + ci].name, reason);
++	if (ci == 0) {
++		laurel_pdp_set4(false, 0, 0, 0, 0, 0, 0);
++	} else {
++		laurel_pdp_set6(false, NULL, 0, NULL, NULL, NULL, 0);
++	}
++	c->step = CALL_IDLE;
++	c->next = now + START_GAP_MS;
++	say_on_line();
++}
++
++/* ---- hooks of laurel_cell.c */
++
++void
++lcd_server(uint32_t svc, uint32_t node, uint32_t port, bool up)
++{
++	for (int i = 0; i < D_N; i++) {
++		struct dc *c = &dc[i];
++
++		if (c->svc != svc) {
++			continue;
++		}
++		if (!up) {
++			if (c->up && c->node == node && c->sport == port) {
++				c->up = false;
++				c->want = 0;
++			}
++		} else if (!c->up) {
++			c->node = node;
++			c->sport = port;
++			c->up = true;
++			c->want = 0;
++		}
++	}
++}
++
++bool
++lcd_rx(uint32_t dst_port, const uint8_t *d, uint32_t len)
++{
++	int i;
++	uint16_t txn, msg;
++
++	for (i = 0; i < D_N && dc[i].port != dst_port; i++) {
++	}
++	if (i == D_N) {
++		return false;
++	}
++	if (len < 7 || st == ST_OFF) {
++		return true;
++	}
++	memcpy(&txn, d + 1, 2);
++	memcpy(&msg, d + 3, 2);
++	uint64_t now = lcd_now_ms();
++	if (d[0] == 4) {
++		if (i >= D_WDS4 && msg == MSG_WDS_STATUS_IND) {
++			call_status_ind(i - D_WDS4, d, len, now);
++		}
++		return true;
++	}
++	if (d[0] != 2 || dc[i].want != msg || txn != dc[i].txn) {
++		return true;
++	}
++	dc[i].want = 0;
++	uint16_t e = d_err(d, len);
++	if (i == D_DPM) {
++		LOGD("DPM OPEN_PORT (pipes %u, %u): %s0x%x\n", PIPE_TO_MODEM, PIPE_FROM_MODEM, e == 0 || e == QMI_NO_EFFECT ? "ok " : "error ", e);
++		st = ST_WDA;            /* a refusal: Android's own order goes on; WDA tells */
++	} else if (i == D_WDA) {
++		LOGD("WDA SET_DATA_FORMAT: %s0x%x: link %u, up %u, down %u (2 raw IP, 5 QMAP), down limit %u packets %u bytes\n",
++		    e == 0 ? "ok " : "error ", e, get32(d, len, 0x11), get32(d, len, 0x12), get32(d, len, 0x13), get32(d, len, 0x15), get32(d, len, 0x16));
++		if (e != 0) {
++			char why[80];
++			snprintf(why, sizeof(why), "WDA SET_DATA_FORMAT error 0x%x", e);
++			data_off_line(why);
++			return true;
++		}
++		st = ST_CALLS;
++	} else {
++		call_rx(i - D_WDS4, msg, e, d, len, now);
++	}
++	return true;
++}
++
++/* the steps; registered: NAS on the data subscription. Every client: one request at a time, a lost answer = one retry, then on with the next step */
++void
++lcd_poll(uint64_t now, bool registered)
++{
++	const char *why = "";
++
++	if (st == ST_OFF) {
++		return;
++	}
++	if (!data_enabled()) {
++		data_off_line("boot-arg cell_data=0");
++		return;
++	}
++	if (st == ST_WAIT) {
++		int ds = laurel_ipa_data_state(&why);
++
++		if (ds < 0) {
++			data_off_line(why);
++		} else if (ds == 1) {
++			st = ST_DPM;
++		}
++		if (st != ST_DPM) {
++			return;
++		}
++	}
++	for (int i = 0; i < D_N; i++) {
++		struct dc *c = &dc[i];
++
++		if (c->up && c->want != 0 && now - c->sent >= TIMEOUT_MS) {
++			if (c->tries < 2) {
++				c->tries++;
++				c->sent = now;
++				topaz_qrtr_data(c->port, c->node, c->sport, c->buf, c->len);
++			} else {
++				LOGD("%s: no answer to message 0x%x, 2 tries\n", c->name, c->want);
++				c->want = 0;
++				if (i == D_DPM) {
++					st = ST_WDA;
++				} else if (i == D_WDA) {
++					data_off_line("WDA SET_DATA_FORMAT: no answer");
++				} else {
++					calls[i - D_WDS4].step = calls[i - D_WDS4].step < CALL_IDLE ? calls[i - D_WDS4].step + 1 : CALL_IDLE;
++					calls[i - D_WDS4].next = now + START_GAP_MS;
++				}
++			}
++		}
++	}
++	if (st == ST_DPM && dc[D_DPM].want == 0) {
++		if (dc[D_DPM].up) {
++			ask_dpm();
++		} else if (dc[D_WDA].up) {
++			st = ST_WDA;    /* no DPM service in this firmware: WDA tells whether it matters */
++		}
++	} else if (st == ST_WDA && dc[D_WDA].up && dc[D_WDA].want == 0) {
++		ask_wda();
++	} else if (st == ST_CALLS) {
++		for (int ci = 0; ci < 2; ci++) {
++			struct call *c = &calls[ci];
++			if (!dc[D_WDS4 + ci].up || dc[D_WDS4 + ci].want != 0) {
++				continue;
++			}
++			if (c->step == CALL_IDLE && registered && now >= c->next) {
++				c->step = CALL_STARTING;
++			}
++			if (c->step != CALL_IDLE && c->step != CALL_UP) {
++				ask_call(ci, now);
++			}
++		}
++	}
++}
++
++/* DPM + WDA answered (or there is nothing to wait for): the radio may go online. Android's netmgrd sets the format before the RIL's ONLINE */
++bool
++lcd_format_done(void)
++{
++	return st == ST_OFF || st == ST_CALLS;
++}
++
++void
++lcd_off(const char *why)
++{
++	data_off_line(why);
++	laurel_pdp_set4(false, 0, 0, 0, 0, 0, 0);
++	laurel_pdp_set6(false, NULL, 0, NULL, NULL, NULL, 0);
++}
++
++/* the text in the cell line and the state keys */
++void
++lcd_summary(char *out, size_t max)
++{
++	bool v4 = calls[0].step == CALL_UP, v6 = calls[1].step == CALL_UP;
++
++	if (st == ST_OFF) {
++		snprintf(out, max, "data off: %s", off_why);
++	} else if (v4 || v6) {
++		snprintf(out, max, "data on: pdp_ip0%s%s", v4 ? " IPv4" : "", v6 ? " IPv6" : "");
++	} else if (st == ST_WAIT) {
++		const char *why = "";
++		(void)laurel_ipa_data_state(&why);
++		snprintf(out, max, "data off: %s", why);
++	} else {
++		snprintf(out, max, "data off: session not up yet");
++	}
++}
++
++const char *
++lcd_state_key(void)
++{
++	return calls[0].step == CALL_UP || calls[1].step == CALL_UP ? "on" : "off";
++}
+diff -ruN a/bsd/dev/laurel_cell_data.c b/bsd/dev/laurel_cell_data.c
+--- a/bsd/dev/laurel_cell_data.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_cell_data.c	2026-11-01 23:30:35.438355034 +0530
+@@ -0,0 +1,164 @@
++/*
++ * laurel_sprout (Mi A3) cellular data (laurel 2942): the QMI side of a data session. Called from laurel_cell.c in the modem watch thread (one thread).
++ * Order as Android's netmgrd + ModemManager's "ipa" port: DPM OPEN_PORT (embedded port 1, IPA pipes 1 and 9), WDA SET_DATA_FORMAT (raw IP in QMAP, no
++ * checksum), then per IP family one WDS client: BIND_MUX_DATA_PORT (mux 1), SET_IP_FAMILY, START_NETWORK once NAS says registered, GET_CURRENT_SETTINGS.
++ * Layouts: libqmi qmi-service-{dpm,wda,wds}.json as used by hackios-scion hakios.mpss.c [V]; scion never saw a packet on them [V its docs]: on this phone all
++ * of it is [I] until a ping. One QRTR port per client: 0x4017-0x401A. A failed step is one line; data stays off; radio, Wi-Fi and the boot are not touched.
++ * The data SIM: the modem's default subscription (primary). The later "default SIM" task binds the WDS clients to another one; there is no such choice yet.
++ * Lines: "LaurelData: <step>: ..." and "LAUREL CELL DATA: on: pdp_ip0 IPv4 ..." or "LAUREL CELL DATA: off: <why>". cell_data=0 is the kill switch.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "laurel_cell_data.h"
++
++#define SAYD(...)           printf("LAUREL CELL DATA: " __VA_ARGS__)
++#define LOGD(...)           printf("LaurelData: " __VA_ARGS__)
++
++enum { D_DPM, D_WDA, D_WDS4, D_WDS6, D_N };
++enum { ST_WAIT, ST_DPM, ST_WDA, ST_CALLS, ST_OFF };
++enum { CALL_BIND, CALL_FAMILY, CALL_IDLE, CALL_STARTING, CALL_SETTINGS, CALL_UP };
++
++#define MSG_DPM_OPEN        0x0020
++#define MSG_WDA_FORMAT      0x0020
++#define MSG_WDS_START       0x0020
++#define MSG_WDS_STATUS_IND  0x0022
++#define MSG_WDS_SETTINGS    0x002D
++#define MSG_WDS_FAMILY      0x004D
++#define MSG_WDS_BIND_MUX    0x00A2
++#define EP_EMBEDDED         4u
++#define EP_IFACE            1u
++#define PIPE_TO_MODEM       1u                  /* APPS_WAN_PROD: the modem's receiving end */
++#define PIPE_FROM_MODEM     9u                  /* APPS_WAN_CONS */
++#define DL_MAX_PKTS         16u
++#define DL_MAX_BYTES        6144u               /* V_AGGR_WAN_RX byte limit */
++#define SETTINGS_MASK       0xA310u             /* DNS, IP address, gateway, MTU, IP family */
++#define TIMEOUT_MS          10000u
++#define START_GAP_MS        10000u
++#define START_GAP_LONG_MS   60000u
++#define START_FAST_TRIES    6u
++
++struct dc {
++	const char *name;
++	uint32_t svc, port, node, sport;
++	bool up;
++	uint16_t txn, want;
++	uint64_t sent;
++	uint8_t tries, buf[160];
++	uint32_t len;
++};
++static struct dc dc[D_N] = {
++	[D_DPM]  = { .name = "dpm", .svc = 0x2F, .port = 0x4017 },
++	[D_WDA]  = { .name = "wda", .svc = 0x1A, .port = 0x4018 },
++	[D_WDS4] = { .name = "ipv4", .svc = 0x01, .port = 0x4019 },
++	[D_WDS6] = { .name = "ipv6", .svc = 0x01, .port = 0x401A },
++};
++struct call {
++	uint8_t step, family;
++	uint32_t handle, starts;
++	uint64_t next;
++	uint16_t last_err, last_reason;
++};
++static struct call calls[2] = { { .family = 4 }, { .family = 6 } };
++static int st = ST_WAIT;
++static bool data_on_read, data_on, said_on;
++static char off_why[160];
++
++static bool
++data_enabled(void)
++{
++	if (!data_on_read) {
++		uint32_t on = 1;
++		(void)PE_parse_boot_argn("cell_data", &on, sizeof(on));
++		data_on = on != 0;
++		data_on_read = true;
++	}
++	return data_on;
++}
++
++static void
++data_off_line(const char *why)
++{
++	if (st == ST_OFF) {
++		return;
++	}
++	st = ST_OFF;
++	strlcpy(off_why, why, sizeof(off_why));
++	SAYD("off: %s\n", why);
++}
++
++/* ---- requests: one at a time per client */
++
++static uint32_t
++m_tlv(uint8_t *m, uint32_t n, uint8_t type, const void *v, uint16_t len)
++{
++	m[n] = type;
++	memcpy(m + n + 1, &len, 2);
++	memcpy(m + n + 3, v, len);
++	return n + 3u + len;
++}
++
++static void
++d_send(int i, uint16_t msg, uint8_t *m, uint32_t n)
++{
++	struct dc *c = &dc[i];
++	uint16_t l = (uint16_t)(n - 7);
++
++	m[0] = 0;
++	memcpy(m + 3, &msg, 2);
++	memcpy(m + 5, &l, 2);
++	c->txn = (uint16_t)(c->txn + 1 == 0 ? 1 : c->txn + 1);
++	memcpy(m + 1, &c->txn, 2);
++	memcpy(c->buf, m, n);
++	c->len = n;
++	c->want = msg;
++	c->tries = 1;
++	c->sent = lcd_now_ms();
++	topaz_qrtr_data(c->port, c->node, c->sport, m, n);
++}
++
++/* TLV lookup + QMI result: as laurel_cell.c */
++static const uint8_t *
++d_tlv(const uint8_t *d, uint32_t len, uint8_t type, uint16_t *tl)
++{
++	for (uint32_t o = 7; o + 3 <= len;) {
++		uint16_t l;
++		memcpy(&l, d + o + 1, 2);
++		if (o + 3u + l > len) {
++			return NULL;
++		}
++		if (d[o] == type) {
++			*tl = l;
++			return d + o + 3;
++		}
++		o += 3u + l;
++	}
++	return NULL;
++}
++
++static uint16_t
++d_err(const uint8_t *d, uint32_t len)
++{
++	uint16_t l = 0, r[2];
++	const uint8_t *v = d_tlv(d, len, 0x02, &l);
++
++	if (v == NULL || l < 4) {
++		return 0xFFFF;
++	}
++	memcpy(r, v, 4);
++	return r[0] == 0 ? 0 : (r[1] != 0 ? r[1] : 0xFFFE);
++}
++
++static inline uint32_t
++get32(const uint8_t *d, uint32_t len, uint8_t type)
++{
++	uint16_t l = 0;
++	uint32_t x = 0;
++	const uint8_t *v = d_tlv(d, len, type, &l);
++
++	if (v != NULL && l >= 4) {
++		memcpy(&x, v, 4);
++	}
++	return x;
++}
++
++#include "laurel_cell_data2.h"
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_cell_data.h b/bsd/dev/laurel_cell_data.h
+--- a/bsd/dev/laurel_cell_data.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_cell_data.h	2026-11-01 23:27:42.160971500 +0530
+@@ -0,0 +1,27 @@
++/*
++ * laurel 2942: declarations of the cellular data client (laurel_cell_data.c), the interface (laurel_pdp.c), for laurel_cell.c and the host test.
++ */
++#ifndef LAUREL_CELL_DATA_H
++#define LAUREL_CELL_DATA_H
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++#define LCD_MUX_ID      1u      /* = LIPA_MUX_ID */
++#define QMI_NO_EFFECT   0x001A
++
++extern void topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *data, uint32_t len);
++extern int laurel_ipa_data_state(const char **why);
++uint64_t lcd_now_ms(void);
++
++void lcd_server(uint32_t svc, uint32_t node, uint32_t port, bool up);
++bool lcd_rx(uint32_t dst_port, const uint8_t *d, uint32_t len);
++void lcd_poll(uint64_t now, bool registered);
++bool lcd_format_done(void);
++void lcd_off(const char *why);
++void lcd_summary(char *out, size_t max);
++const char *lcd_state_key(void);
++
++void laurel_pdp_set4(bool up, uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns1, uint32_t dns2, uint32_t mtu);
++void laurel_pdp_set6(bool up, const uint8_t *ip, uint8_t plen, const uint8_t *gw, const uint8_t *dns1, const uint8_t *dns2, uint32_t mtu);
++#endif
+diff -ruN a/bsd/dev/laurel_pdp2.h b/bsd/dev/laurel_pdp2.h
+--- a/bsd/dev/laurel_pdp2.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_pdp2.h	2026-11-01 23:33:10.954828771 +0530
+@@ -0,0 +1,166 @@
++/*
++ * laurel 2942: second half of laurel_pdp.c (included there): addresses by kernel socket ioctls, and kern.laurel_cell_net for laurel_celld (text: laurel_pdp_text.h).
++ */
++
++static errno_t
++set_addr4(const struct pdp_v4 *a, bool add)
++{
++	socket_t so = NULL;
++	struct ifaliasreq r;
++	errno_t e = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++
++	if (e != 0) {
++		return e;
++	}
++	bzero(&r, sizeof(r));
++	snprintf(r.ifra_name, sizeof(r.ifra_name), "pdp_ip0");
++	struct sockaddr_in *s = (struct sockaddr_in *)&r.ifra_addr;
++	s->sin_len = sizeof(*s);
++	s->sin_family = AF_INET;
++	s->sin_addr.s_addr = htonl(a->ip);
++	if (add) {
++		e = proto_plumb(PF_INET, ifp);
++		if (e == 0 || e == EEXIST) {
++			s = (struct sockaddr_in *)&r.ifra_mask;
++			s->sin_len = sizeof(*s);
++			s->sin_family = AF_INET;
++			s->sin_addr.s_addr = htonl(a->mask != 0 ? a->mask : 0xFFFFFFFFu);
++			s = (struct sockaddr_in *)&r.ifra_broadaddr;     /* the far end on a point to point interface */
++			s->sin_len = sizeof(*s);
++			s->sin_family = AF_INET;
++			s->sin_addr.s_addr = htonl(a->gw != 0 ? a->gw : a->ip);
++			e = sock_ioctl(so, SIOCAIFADDR, &r);
++		}
++	} else {
++		struct ifreq q;
++		bzero(&q, sizeof(q));
++		strlcpy(q.ifr_name, r.ifra_name, sizeof(q.ifr_name));
++		memcpy(&q.ifr_addr, &r.ifra_addr, sizeof(struct sockaddr_in));
++		e = sock_ioctl(so, SIOCDIFADDR, &q);
++	}
++	sock_close(so);
++	return e;
++}
++
++static errno_t
++set_addr6(const struct pdp_v6 *a, bool add)
++{
++	socket_t so = NULL;
++	struct in6_aliasreq_64 r;
++	errno_t e = sock_socket(PF_INET6, SOCK_DGRAM, 0, NULL, NULL, &so);
++
++	if (e != 0) {
++		return e;
++	}
++	bzero(&r, sizeof(r));
++	snprintf(r.ifra_name, sizeof(r.ifra_name), "pdp_ip0");
++	r.ifra_addr.sin6_len = sizeof(r.ifra_addr);
++	r.ifra_addr.sin6_family = AF_INET6;
++	memcpy(&r.ifra_addr.sin6_addr, a->ip, 16);
++	if (add) {
++		r.ifra_prefixmask.sin6_len = sizeof(r.ifra_prefixmask);
++		r.ifra_prefixmask.sin6_family = AF_INET6;
++		for (unsigned b = 0; b < a->plen && b < 128; b++) {
++			((uint8_t *)&r.ifra_prefixmask.sin6_addr)[b / 8] |= (uint8_t)(0x80u >> (b % 8));
++		}
++		r.ifra_flags = IN6_IFF_NODAD;   /* the network gave the address; there is no one else on this link */
++		r.ifra_lifetime.ia6t_vltime = ND6_INFINITE_LIFETIME;
++		r.ifra_lifetime.ia6t_pltime = ND6_INFINITE_LIFETIME;
++		e = sock_ioctl(so, SIOCAIFADDR_IN6_64, &r);     /* in6_control plumbs PF_INET6 itself (in6_domifattach) */
++	} else {
++		struct in6_ifreq q;
++		bzero(&q, sizeof(q));
++		strlcpy(q.ifr_name, r.ifra_name, sizeof(q.ifr_name));
++		memcpy(&q.ifr_addr, &r.ifra_addr, sizeof(struct sockaddr_in6));
++		e = sock_ioctl(so, SIOCDIFADDR_IN6, &q);
++	}
++	sock_close(so);
++	return e;
++}
++
++static void
++net_text_make(void)
++{
++	char t[sizeof(net_text)];
++
++	pdp_text(t, sizeof(t), &have4, &have6);
++	lck_mtx_lock(&pdp_lock);
++	strlcpy(net_text, t, sizeof(net_text));
++	lck_mtx_unlock(&pdp_lock);
++}
++
++static int
++net_sysctl(__unused struct sysctl_oid *o, __unused void *a1, __unused int a2, struct sysctl_req *req)
++{
++	char buf[sizeof(net_text)];
++
++	lck_mtx_lock(&pdp_lock);
++	strlcpy(buf, net_text, sizeof(buf));
++	lck_mtx_unlock(&pdp_lock);
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, laurel_cell_net, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, net_sysctl, "A", "LAUREL cellular data session: interface, addresses, DNS (for laurel_celld)");
++
++/* in the IPA data thread: one change at a time, one line each */
++void
++laurel_pdp_work(void)
++{
++	struct pdp_v4 w4;
++	struct pdp_v6 w6;
++	errno_t e;
++
++	lck_mtx_lock(&pdp_lock);
++	if (!dirty) {
++		lck_mtx_unlock(&pdp_lock);
++		return;
++	}
++	dirty = false;
++	w4 = want4;
++	w6 = want6;
++	lck_mtx_unlock(&pdp_lock);
++	if (failed || (ifp == NULL && !w4.up && !w6.up)) {
++		return;
++	}
++	if (ifp == NULL && !if_create()) {
++		failed = true;
++		LOG("off: cannot make interface pdp_ip0\n");
++		return;
++	}
++	if (have4.up && (!w4.up || w4.ip != have4.ip)) {
++		e = set_addr4(&have4, false);
++		LOG("pdp_ip0: IPv4 address removed (error %d)\n", e);
++		have4.up = false;
++	}
++	if (have6.up && (!w6.up || memcmp(w6.ip, have6.ip, 16) != 0)) {
++		e = set_addr6(&have6, false);
++		LOG("pdp_ip0: IPv6 address removed (error %d)\n", e);
++		have6.up = false;
++	}
++	if (w4.up || w6.up) {
++		uint32_t mtu = w4.up && w4.mtu != 0 ? w4.mtu : (w6.up && w6.mtu != 0 ? w6.mtu : 1500);
++		ifnet_set_mtu(ifp, mtu);
++		ifnet_set_flags(ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	}
++	if (w4.up && !have4.up) {
++		e = set_addr4(&w4, true);
++		LOG("pdp_ip0: IPv4 address %s (error %d)\n", e == 0 ? "set" : "NOT set", e);
++		have4 = w4;
++		have4.up = e == 0;
++	} else if (w4.up) {
++		have4 = w4;
++	}
++	if (w6.up && !have6.up) {
++		e = set_addr6(&w6, true);
++		LOG("pdp_ip0: IPv6 address %s (error %d)\n", e == 0 ? "set" : "NOT set", e);
++		have6 = w6;
++		have6.up = e == 0;
++	} else if (w6.up) {
++		have6 = w6;
++	}
++	session = have4.up || have6.up;
++	if (!session) {
++		ifnet_set_flags(ifp, 0, IFF_RUNNING);
++	}
++	net_text_make();
++}
+diff -ruN a/bsd/dev/laurel_pdp.c b/bsd/dev/laurel_pdp.c
+--- a/bsd/dev/laurel_pdp.c	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_pdp.c	2026-11-01 23:33:10.954609841 +0530
+@@ -0,0 +1,242 @@
++/*
++ * laurel_sprout (Mi A3) cellular data (laurel 2942): the iOS interface pdp_ip0 (IFT_CELLULAR, raw IP, point to point): the name CommCenter uses on an iPhone.
++ * laurel_cell_data2.h stores the session's settings (watch thread); laurel_pdp_work() applies them in the IPA data thread: interface on first use, addresses
++ * by kernel socket ioctls. No default route here: userland/laurel/cell/laurel_celld.c publishes kern.laurel_cell_net to configd, and IPMonitor picks the
++ * primary service (Wi-Fi first when it is up [I until the phone test]). Plumbing like if_utun.c; the packets go through laurel_ipa_data.c, QMAP mux 1.
++ * [I] until a phone ping. A failure: one line, data off; nothing else is touched.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/socket.h>
++#include <sys/sockio.h>
++#include <sys/sysctl.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <kern/locks.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++#include <netinet/in_var.h>
++#include <netinet6/in6_var.h>
++#include <netinet6/nd6.h>
++#include "laurel_ipa_regs.h"
++#include "laurel_pdp_text.h"
++
++#define LOG(...)                printf("LaurelData: " __VA_ARGS__)
++#define BAUD                    150000000ull    /* LTE cat 7 downlink */
++
++static LCK_GRP_DECLARE(pdp_grp, "laurel_pdp");
++static LCK_MTX_DECLARE(pdp_lock, &pdp_grp);
++
++/* under pdp_lock: what the session says; the applied copy is the data thread's */
++static struct pdp_v4 want4, have4;
++static struct pdp_v6 want6, have6;
++static bool dirty;
++static ifnet_t ifp;
++static bool failed;
++static volatile bool session;
++static char net_text[640] = "state=off\n";
++
++/* ---- interface callbacks */
++
++static errno_t
++pdp_output(ifnet_t i, mbuf_t m)
++{
++	size_t len = mbuf_pkthdr_len(m);
++	uint8_t *p = lipa_tx_begin((uint32_t)len);
++
++	if (p == NULL) {
++		ifnet_stat_increment_out(i, 0, 0, 1);
++		mbuf_freem(m);
++		return ENOBUFS;
++	}
++	(void)mbuf_copydata(m, 0, len, p);
++	lipa_tx_end(LIPA_MUX_ID, (uint32_t)len);
++	ifnet_stat_increment_out(i, 1, (uint32_t)len, 0);
++	mbuf_freem(m);
++	return 0;
++}
++
++static errno_t
++pdp_demux(__unused ifnet_t i, mbuf_t m, __unused char *hdr, protocol_family_t *proto)
++{
++	const uint8_t *d = mbuf_data(m);
++
++	if (mbuf_len(m) < 1) {
++		return ENOENT;
++	}
++	switch (d[0] >> 4) {
++	case 4:
++		*proto = PF_INET;
++		return 0;
++	case 6:
++		*proto = PF_INET6;
++		return 0;
++	default:
++		return ENOENT;
++	}
++}
++
++static errno_t
++pdp_add_proto(__unused ifnet_t i, protocol_family_t proto, __unused const struct ifnet_demux_desc *a, __unused u_int32_t n)
++{
++	return proto == PF_INET || proto == PF_INET6 ? 0 : ENOPROTOOPT;
++}
++
++static errno_t
++pdp_del_proto(__unused ifnet_t i, __unused protocol_family_t proto)
++{
++	return 0;
++}
++
++static errno_t
++pdp_ioctl(ifnet_t i, u_long cmd, __unused void *data)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(i, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static errno_t
++pdp_proto_input(__unused ifnet_t i, protocol_family_t proto, mbuf_t m, __unused char *hdr)
++{
++	if (proto_input(proto, m) != 0) {
++		mbuf_freem(m);
++	}
++	return 0;
++}
++
++static errno_t
++pdp_pre_output(__unused ifnet_t i, __unused protocol_family_t proto, __unused mbuf_t *m, __unused const struct sockaddr *dest,
++    __unused void *route, __unused char *type, __unused char *lladdr)
++{
++	return 0;
++}
++
++static errno_t
++pdp_attach_proto(ifnet_t i, protocol_family_t proto)
++{
++	struct ifnet_attach_proto_param p;
++
++	bzero(&p, sizeof(p));
++	p.input = pdp_proto_input;
++	p.pre_output = pdp_pre_output;
++	errno_t e = ifnet_attach_protocol(i, proto, &p);
++	return e == EEXIST ? 0 : e;
++}
++
++/* from the data thread (lipa_data_poll): one IP packet of mux 1 */
++void
++laurel_pdp_input(uint8_t mux, const uint8_t *ip, uint32_t len)
++{
++	mbuf_t m = NULL;
++	struct ifnet_stat_increment_param st = { 0 };
++
++	if (ifp == NULL || !session || mux != LIPA_MUX_ID || len == 0) {
++		return;
++	}
++	if (mbuf_allocpacket(MBUF_DONTWAIT, len, NULL, &m) != 0 || mbuf_copyback(m, 0, len, ip, MBUF_DONTWAIT) != 0) {
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++		st.dropped = 1;
++		(void)ifnet_stat_increment(ifp, &st);
++		return;
++	}
++	mbuf_pkthdr_setrcvif(m, ifp);
++	mbuf_pkthdr_setheader(m, mbuf_data(m));
++	st.packets_in = 1;
++	st.bytes_in = len;
++	(void)ifnet_input(ifp, m, &st);
++}
++
++bool
++laurel_pdp_session(void)
++{
++	return session;
++}
++
++/* ---- settings */
++
++void
++laurel_pdp_set4(bool up, uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns1, uint32_t dns2, uint32_t mtu)
++{
++	lck_mtx_lock(&pdp_lock);
++	want4 = (struct pdp_v4){ up, ip, mask, gw, dns1, dns2, mtu };
++	dirty = true;
++	lck_mtx_unlock(&pdp_lock);
++}
++
++void
++laurel_pdp_set6(bool up, const uint8_t *ip, uint8_t plen, const uint8_t *gw, const uint8_t *dns1, const uint8_t *dns2, uint32_t mtu)
++{
++	lck_mtx_lock(&pdp_lock);
++	bzero(&want6, sizeof(want6));
++	want6.up = up;
++	if (up) {
++		memcpy(want6.ip, ip, 16);
++		want6.plen = plen == 0 || plen > 128 ? 64 : plen;
++		memcpy(want6.gw, gw, 16);
++		memcpy(want6.dns1, dns1, 16);
++		memcpy(want6.dns2, dns2, 16);
++		want6.mtu = mtu;
++	}
++	dirty = true;
++	lck_mtx_unlock(&pdp_lock);
++}
++
++static bool
++if_create(void)
++{
++	struct ifnet_init_eparams init;
++
++	(void)proto_register_plumber(PF_INET, IFNET_FAMILY_CELLULAR, pdp_attach_proto, NULL);
++	(void)proto_register_plumber(PF_INET6, IFNET_FAMILY_CELLULAR, pdp_attach_proto, NULL);
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "laurel-pdp-ip0";
++	init.uniqueid_len = sizeof("laurel-pdp-ip0") - 1;
++	init.name = "pdp_ip";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_CELLULAR;
++	init.type = IFT_CELLULAR;
++	init.output = pdp_output;
++	init.demux = pdp_demux;
++	init.add_proto = pdp_add_proto;
++	init.del_proto = pdp_del_proto;
++	init.ioctl = pdp_ioctl;
++	if (ifnet_allocate_extended(&init, &ifp) != 0) {
++		ifp = NULL;
++		return false;
++	}
++	ifnet_set_hdrlen(ifp, 0);
++	ifnet_set_addrlen(ifp, 0);
++	ifnet_set_mtu(ifp, 1500);
++	ifnet_set_baudrate(ifp, BAUD);
++	ifnet_set_flags(ifp, IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST, 0xFFFF);
++	if (ifnet_attach(ifp, NULL) != 0) {
++		ifnet_release(ifp);
++		ifp = NULL;
++		return false;
++	}
++	LOG("interface pdp_ip0 attached (cellular, raw IP)\n");
++	return true;
++}
++
++#include "laurel_pdp2.h"
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff -ruN a/bsd/dev/laurel_pdp_text.h b/bsd/dev/laurel_pdp_text.h
+--- a/bsd/dev/laurel_pdp_text.h	1970-01-01 05:30:00.000000000 +0530
++++ b/bsd/dev/laurel_pdp_text.h	2026-11-01 23:33:10.941190557 +0530
+@@ -0,0 +1,49 @@
++/*
++ * laurel 2942: the text of kern.laurel_cell_net: pure, so the host test (scripts/laurel/test-cell.sh) feeds the daemon's parser (userland/laurel/cell/celld_net.h) with
++ * the kernel's own text. Keys: state=on|off, if, mtu, v4, v4.mask, v4.gw, v4.dns (0-2), v6, v6.plen, v6.gw, v6.dns (0-2). Never a SIM or modem identity.
++ */
++#ifndef LAUREL_PDP_TEXT_H
++#define LAUREL_PDP_TEXT_H
++struct pdp_v4 { bool up; uint32_t ip, mask, gw, dns1, dns2, mtu; };
++struct pdp_v6 { bool up; uint8_t ip[16], plen, gw[16], dns1[16], dns2[16]; uint32_t mtu; };
++
++static size_t
++text_ip6(char *o, size_t max, const char *key, const uint8_t *a)
++{
++	size_t n = (size_t)snprintf(o, max, "%s=", key);
++
++	for (unsigned i = 0; i < 16 && n < max; i += 2) {
++		n += (size_t)snprintf(o + n, max - n, "%x%s", (unsigned)a[i] << 8 | a[i + 1], i < 14 ? ":" : "\n");
++	}
++	return n;
++}
++
++static size_t
++text_ip4(char *o, size_t max, const char *key, uint32_t a)
++{
++	return (size_t)snprintf(o, max, "%s=%u.%u.%u.%u\n", key, a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255);
++}
++
++static void
++pdp_text(char *t, size_t max, const struct pdp_v4 *a4, const struct pdp_v6 *a6)
++{
++	static const uint8_t zero[16];
++	size_t n = (size_t)snprintf(t, max, "state=%s\nif=pdp_ip0\nmtu=%u\n", a4->up || a6->up ? "on" : "off",
++	    a4->up && a4->mtu != 0 ? a4->mtu : (a6->up && a6->mtu != 0 ? a6->mtu : 1500));
++
++	if (a4->up && n < max) {
++		n += text_ip4(t + n, max - n, "v4", a4->ip);
++		n += n < max ? text_ip4(t + n, max - n, "v4.mask", a4->mask != 0 ? a4->mask : 0xFFFFFFFFu) : 0;
++		n += n < max ? text_ip4(t + n, max - n, "v4.gw", a4->gw != 0 ? a4->gw : a4->ip) : 0;
++		n += n < max && a4->dns1 != 0 ? text_ip4(t + n, max - n, "v4.dns", a4->dns1) : 0;
++		n += n < max && a4->dns2 != 0 ? text_ip4(t + n, max - n, "v4.dns", a4->dns2) : 0;
++	}
++	if (a6->up && n < max) {
++		n += text_ip6(t + n, max - n, "v6", a6->ip);
++		n += n < max ? (size_t)snprintf(t + n, max - n, "v6.plen=%u\n", a6->plen) : 0;
++		n += n < max && memcmp(a6->gw, zero, 16) != 0 ? text_ip6(t + n, max - n, "v6.gw", a6->gw) : 0;
++		n += n < max && memcmp(a6->dns1, zero, 16) != 0 ? text_ip6(t + n, max - n, "v6.dns", a6->dns1) : 0;
++		n += n < max && memcmp(a6->dns2, zero, 16) != 0 ? text_ip6(t + n, max - n, "v6.dns", a6->dns2) : 0;
++	}
++}
++#endif

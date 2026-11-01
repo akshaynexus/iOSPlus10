@@ -85,6 +85,26 @@ for a in ('MobileCal', 'MobileMail', 'MobileNotes', 'MobileTimer', 'Weather', 'M
 print('root-dry-run:', 'jobs + apps PASS' if not fail else 'FAIL: ' + '; '.join(fail))
 sys.exit(1 if fail else 0)
 EOF
+# AirPlay and AirDrop on en0 (root-airplay.sh), when it is built.
+if [ -x "$REPO/out/laurel/airplay/root/usr/libexec/laurel-airplay" ]; then
+  python3 -I "$REPO/scripts/laurel/root-airplay-job.py" --self-test
+  python3 -I "$REPO/scripts/laurel/root-airdrop-lan.py" --self-test
+  bash "$REPO/scripts/laurel/root-airplay.sh" "$R"
+  python3 -I - "$R" <<'EOF' || { echo "root-dry-run: FAIL: airplay"; exit 1; }
+import os, plistlib, sys
+r = sys.argv[1]
+load = lambda p: plistlib.load(open(r + p, 'rb'))
+jobs = load('/System/Library/xpc/launchd.plist')['LaunchDaemons']
+job = jobs['/System/Library/LaunchDaemons/com.laurel.airplay.plist']
+prefs = load('/private/var/Managed Preferences/mobile/com.apple.Sharing.plist')
+ok = (job['KeepAlive'] is False and os.access(r + '/usr/libexec/laurel-airplay', os.X_OK) and prefs == {'BrowseAllInterfaces': True, 'RegisterAllInterfaces': True}
+      and not any('wifip2pd' in k for k in jobs))
+print('root-dry-run: airplay: job once at boot, no KeepAlive; AirDrop LAN preferences; wifip2pd stays out:', 'OK' if ok else 'FAIL')
+sys.exit(0 if ok else 1)
+EOF
+else
+  echo "root-dry-run: airplay: note: not built (scripts/laurel/airplay-build.sh)"
+fi
 # XNUtils (root-xnutils.sh), when it is built. As the user: no owners, no setuid bit (the script says so).
 if [ -x "$REPO/out/laurel/xnutils/root/Applications/XNUtils.app/XNUtils" ]; then
   bash "$REPO/scripts/laurel/root-xnutils.sh" "$R"

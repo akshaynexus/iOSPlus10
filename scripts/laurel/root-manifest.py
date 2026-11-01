@@ -106,6 +106,15 @@ def check_xnutils(root):
     return []
 
 
+def check_airplay(root):
+    bad = []
+    if '/System/Library/LaunchDaemons/com.laurel.airplay.plist' not in plist(root, 'System/Library/xpc/launchd.plist').get('LaunchDaemons', {}):
+        bad.append('no job com.laurel.airplay')
+    if os.environ.get('AIRDROP_LAN', '1') != '0' and not plist(root, 'private/var/Managed Preferences/mobile/com.apple.Sharing.plist').get('BrowseAllInterfaces'):
+        bad.append('no BrowseAllInterfaces in the managed preferences')
+    return bad
+
+
 def check_ssh(root):
     bad = [] if job(root, 'dev.iosplus10.dropbear') else ['no dev.iosplus10.dropbear job in the launchd cache']
     if not job(root, 'dev.iosplus10.laurelnet'):
@@ -159,13 +168,15 @@ FEATURES = [
          stage=['out/laurel/notch/root/usr/local/lib/liblaurel-notch.dylib', 'out/laurel/notch/root/' + SB], trees=['out/laurel/notch/root'], sources=['userland/laurel/notch'],
          root=['usr/local/lib/liblaurel-notch.dylib', SB], check=check_notch),
     dict(name='cell', switch='CELL', also_off=('NOTCH', 'STATUSBAR'), build='scripts/laurel/cell-build.sh',
-         stage=['out/laurel/cell/root/usr/local/lib/liblaurel-cellbar.dylib'], trees=['out/laurel/cell/root'], sources=['userland/laurel/cell'],
-         root=['usr/local/lib/liblaurel-cellbar.dylib'], check=check_notch),
+         stage=['out/laurel/cell/root/usr/local/lib/liblaurel-cellbar.dylib', 'out/laurel/cell/root/usr/local/libexec/laurel-celld'], trees=['out/laurel/cell/root'], sources=['userland/laurel/cell'],
+         root=['usr/local/lib/liblaurel-cellbar.dylib', 'usr/local/libexec/laurel-celld'], check=check_notch),
     dict(name='brightness', switch='BRIGHTNESS', build='-', stage=[], trees=[], sources=[], root=[], check=check_brightness),
     dict(name='xnutils', switch='XNUTILS', build='scripts/laurel/xnutils-build.sh',
          stage=[XNU + 'Applications/XNUtils.app/XNUtils', XNU + 'usr/local/libexec/powermenu-helper', XNU + 'usr/local/bin/pmregister'],
          trees=[XNU], sources=['userland/laurel/xnutils', 'userland/rebootapp'],
          root=['Applications/XNUtils.app/XNUtils', 'Applications/XNUtils.app/Info.plist', 'usr/local/libexec/powermenu-helper', 'usr/local/bin/pmregister'], check=check_xnutils),
+    dict(name='airplay', switch='AIRPLAY', build='scripts/laurel/airplay-build.sh', stage=['out/laurel/airplay/root/usr/libexec/laurel-airplay'],
+         trees=['out/laurel/airplay/root'], sources=['userland/laurel/airplay'], root=['usr/libexec/laurel-airplay'], check=check_airplay),
     dict(name='ssh', switch='SSH', build='userland/ssh/fetch.sh, fetch-sdk.sh, build.sh', stage=['out/ssh/ios/dropbearmulti', 'out/ssh/ios/laurelnet'], trees=['out/ssh/ios'],
          sources=['userland/ssh'], root=['usr/local/bin/dropbearmulti', 'usr/local/bin/laurelnet'], check=check_ssh),
 ]

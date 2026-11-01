@@ -4813,6 +4813,20 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - Not done: headphones, earpiece (RX macro + RX SoundWire, class-H, MBHC, HAL devices). Second mic AMIC3 not used.
 - Built [V]: merge 32accf4 on 80072a9: 297/297 patches, 0 LSE/RCpc, printf-arg-check OK, 2 linker lines (stub rounds), 0 warnings in the mic + audio files, kernel.development.sweet.4k sha256 570f52c889b9bece, series 45d57a3047db7468; armv80-check kernel 21 (the same count as before: no new one); RedwoodAudio sha256 2a4afb9a810dc0ed (0 newer than ARMv8.0); NegroniCamera 9c75f34635665b47 (0). mic-host-test PASS, xnutils-test PASS.
 
+## Mi A3: cellular: radio online at DMS mode 5, AP data pipes, pdp_ip0; patches 2940-2942, laurel-celld (2026-11-01, branch t3/laurel-cellular-radio; build + host tests, NOT BOOTED)
+- Details: docs/laurel_sprout/cellular.md section 11 (cause table, risks per step, test order, expected lines).
+- [V boot 22:50] DMS: error 0x4a, ~6 ms later 5, then 5 to the end; USIMs ready, Wi-Fi up: so 5 is a report, not a modem going down. The note in cellular.md section 8 was wrong; corrected there.
+- [V log] MCFG at 7.8 s: reads only mbn_hw.dig + mbn_sw.dig, no .mbn: no activation needed by that reading.
+- [V log] nas1 BIND error 0x3 was one line at 400 ms; the retry passed silently. A success now has a line.
+- [V firmware, scripts/debug/modem-re.sh] device_config.xml: DSDS L+L, num_sims 2, max_active_voice 1, max_active_data 2, primary "C H G W L T": no 5G. sys_m "SMP2P graceful shutdown request" on entry master-kernel: our item did not have the entry.
+- [V stock ipa_dp.c] v4.2: GSI channel scratch 0 (no MCS prefetch); scion wrote word 0/1 and mainline words 2/3: not needed here. WAN_PROD status goes to Q6_WAN_CONS (pipe 10).
+- [V trinket.dtsi + ipa_dp.c] qcom,modem-cfg-emb-pipe-flt: the modem fills pipe 1's filter table; no AP rule, no AP command channel for that.
+- [V xnu] in6_domifattach returns EEXIST when PF_INET6 is attached: use proto_register_plumber + proto_plumb as if_utun.c, not ifnet_attach_protocol at create. Null framer is valid (dlil.c 6835). struct ifnet_stat_increment_param: field is dropped, not dropped_in.
+- Gotcha: cell_test.c includes laurel_cell.c and laurel_cell_data.c in one TU: same static name = one variable (enabled_read clash hid the cell_data=0 switch). Names are unique now.
+- Gotcha: after a modem crash no thread polls: data_thread applies laurel_pdp_work once at its end, or configd keeps a dead service.
+- master-kernel entry only with the IPA on: an ipa=0 image stays the one with Wi-Fi today.
+- Dev flow: out/crad-dev/{a,r,i,d} = before, 2930, 2931, 2932 (files at tree paths); scripts/laurel/crad-patch.sh NAME TITLE OLD NEW. Worktree needs external symlinks and reflinked out/laurel-kernel/{deps,theos,cache,dl}, out/laurel/gpu/deps.
+- Not read: dataConnectionType enum (LTE tag off), IPMonitor (key names from memory, [I]), SET_DUAL_STANDBY_PREF layout (not sent). Unproven: every step on the phone after the handshake.
 ## Mi A3: Wi-Fi up, no page loads (2026-11-01, branch t3/laurel-safari-net; details docs/laurel_sprout/wifi.md "No page loads", docs/usb-network.md "ue0 and Wi-Fi")
 - Owner: "Wi-Fi is fine, but fast.com and speedtest don't load." Log logs/laurel-boot-2235.txt (main checkout): after the first minute `dns asked 0`, `connects 0`, `tcp sent 0`.
 - **Gotcha: `usbnetcfg up` at boot makes ue0 first: default route via 192.168.7.1, DNS 1.1.1.1 / 8.8.8.8, through a host with no NAT.** [V] The tool came to the laurel root with SSH (Linux roots had no SSH before 21:57): boot 19:07 has 0 `exec usbnetcfg` and 148 `connectx` lines, boots 22:08 and 22:35 have 1 and 0. [I] ue0 was primary: not read from the phone. Test on the running phone: `scripts/laurel/phone-ssh.sh '/usr/local/bin/usbnetcfg show; /usr/local/bin/usbnetcfg down'`.
@@ -4838,3 +4852,20 @@ Full text: docs/laurel_sprout/camera.md section 13.
 - Gotcha: `uptime` is not on the phone. `op10tool ctl reboot` is a hard reset: `sync` first.
 - A root step that adds a state file in /private/var (the phone changes it): add it to `KEEP` in root-delta.py, else an update overwrites it.
 - Host test of phone scripts: `out/ssh/host/{toybox,dash}` are Linux builds of the phone's tools; ROOT_UPDATE_PHONE_PATH puts them alone in PATH.
+## Mi A3: AirPlay and AirDrop (2026-11-01, branch t3/laurel-airplay-airdrop, patches 2930 + 2931, userland/laurel/airplay; built + host tests, NOT RUN ON THE PHONE; docs/laurel_sprout/airplay-airdrop.md)
+- Owner: "AirPlay and AirDrop both aren't working: enable or fix them." Result: AWDL stays off by the evidence. AirPlay: no static blocker found; no fix without a run log; a check gives that log's first answer. AirDrop on en0 is the one new function.
+- [V] qcacld-3.0 for this phone: `/* Monitor mode net_device_ops, doesnot Tx ... */`, no `ndo_start_xmit`. OWL needs monitor mode with injection (`external/owl/README.md`). So OWL as it stands cannot run. Not a proof about the firmware: AWDL data frames through an IBSS vdev are [U].
+- [V] Negroni's 0347 (2230 lines, WCN6855) was never run and has no AWDL data path; it answers only `AWDL_SYNC_ENABLED` to wifip2pd. Not ported: awdl0 without data carries nothing.
+- [V] Gotcha: stock `com.apple.wifip2pd.plist` has only `MachServices` + `EnablePressuredExit`, no KeepAlive. The "restart loop" is a client asking again; [I] 10 s is launchd's throttle. Removing the job stops it.
+- [V] Gotcha: there is no `airplayd` here: the sender is in mediaserverd (`com.apple.airplay.sender.xpc`). The USB log has no os_log of it: only `scripts/net/phone-log.sh -g AirPlay mediaserverd` (oslogstream) shows AirPlay's own lines.
+- [V] Gotcha: Control Center's `AirPlayMirroringModule.bundle` requires only `arm64`; no MobileGestalt key hides the button. `AirPlayCapability` is not a key in libMobileGestalt (MD5 hash search). `_MobileGestalt_get_airplayMirroringCapability` exists; the value on this phone is [U].
+- [I] Boots 22:08 and 22:35 had ue0 first (t3/laurel-safari-net). Test AirPlay only with that fix.
+- [V] Missing on this port: `IOTimeSyncDomain` (PTP clock), `AppleAVE2Driver` (encoder), fairplayd + its user client (`/fp-setup`). `fairplayd` must stay out: locationd deadlock.
+- [V] `root-airdrop-lan.py`: `BrowseAllInterfaces` + `RegisterAllInterfaces` in `/private/var/Managed Preferences/mobile/com.apple.Sharing.plist`. Peers: opendrop, not normal iPhones [I].
+- Gotcha: `scripts/debug/air-re.sh`: `hfs-extract.py` fails with FileNotFoundError for one file unless its parent exists in OUTDIR. iOS SDK has no `bootstrap.h`: declare `bootstrap_look_up` by hand. `ipsw dyld macho IMAGE --strings` gives one image's strings; `dsc-dis.py str TEXT` names the image of a string.
+- Gotcha: a new root feature changes the counts in `build-honest-test.sh` (`14 installed`).
+- Built [V] on merge 6c1a1c6238 (base origin/laurel-sprout cad5efb): kernel-linux.sh 303/303 patches (102 laurel), 0 failed, 0 LSE/RCpc, printf-arg-check OK, 2 linker lines (stub rounds), kernel.development.sweet.4k sha256 703751fd0ee8443d, armv80-check 21 (same count as before). laurel-airplay sha256 682a7464ab4b8bce, 0 instructions newer than ARMv8.0, no warnings. wifi-phy-test passed; root-airplay-job and root-airdrop-lan self-tests passed; build-honest-test 60 of 60; root-dry-run (FEATURES=0) PASS. Full root not built: needs sudo.
+
+## Mi A3: patch 2914 (touch rate) parked: it broke touch on the phone (2026-11-01 23:19)
+- [V log] `touch 0 down at 310,1559 edge`, then `up` only 13 s later, out-of-order touch lines; the owner could not unlock. Finger events get lost with 2 ms latch + 16-byte read.
+- Parked in patches/laurel/parked/. Faster touch needs a rework: read the whole record when a second finger or a lift can occur, never lose a lift. The old path read every 12 ms.

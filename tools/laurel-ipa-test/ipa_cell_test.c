@@ -12,6 +12,13 @@ extern void laurel_cell_poll(bool ready, bool glink);
 extern void laurel_cell_off(const char *why);
 uint32_t topaz_qrtr_services(void);
 uint32_t topaz_qrtr_services(void) { return 9; }
+/* laurel 2942: the data client is real; no AP pipes in this test */
+int laurel_ipa_data_state(const char **why);
+int laurel_ipa_data_state(const char **why) { if (why != NULL) { *why = "no AP GSI data pipes yet"; } return -1; }
+void laurel_pdp_set4(bool up, uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns1, uint32_t dns2, uint32_t mtu);
+void laurel_pdp_set4(bool up, uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns1, uint32_t dns2, uint32_t mtu) { (void)up; (void)ip; (void)mask; (void)gw; (void)dns1; (void)dns2; (void)mtu; }
+void laurel_pdp_set6(bool up, const uint8_t *ip, uint8_t plen, const uint8_t *gw, const uint8_t *dns1, const uint8_t *dns2, uint32_t mtu);
+void laurel_pdp_set6(bool up, const uint8_t *ip, uint8_t plen, const uint8_t *gw, const uint8_t *dns1, const uint8_t *dns2, uint32_t mtu) { (void)up; (void)ip; (void)plen; (void)gw; (void)dns1; (void)dns2; (void)mtu; }
 
 static int opmode = 5, reads, set_online;
 static uint64_t online_at, ipa_on_at;

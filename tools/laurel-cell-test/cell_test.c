@@ -12,7 +12,7 @@ uint64_t kt_now_ns;
 static char said[16][600];                      /* LAUREL CELL lines */
 static int nsaid;
 static char logbuf[16384];
-static uint32_t boot_cell = 1;
+static uint32_t boot_cell = 1, boot_cell_data = 1;
 
 int
 kt_printf(const char *fmt, ...)
@@ -37,6 +37,10 @@ PE_parse_boot_argn(const char *name, void *val, int size)
 		memcpy(val, &boot_cell, 4);
 		return 1;
 	}
+	if (strcmp(name, "cell_data") == 0 && size == 4) {
+		memcpy(val, &boot_cell_data, 4);
+		return 1;
+	}
 	return 0;
 }
 
@@ -50,8 +54,14 @@ static struct {
 	int prov_reqs, prov_session[4], prov_slot[4], set_online, binds[2];
 	int opmode_reads, opmode_err_left, opmode_later, opmode_after;   /* GET_OPERATING_MODE: errors first; the mode changes after opmode_after reads */
 	int set_refuse_left, bind_err_left[2], rsrp, rssi_only;          /* SET refused; BIND error 3; signal */
-	bool no_signal;
+	bool no_signal, mode_sticky;
+	int set_lpm, lpm_refuse, event_reports;                          /* laurel 2940: SET low power; its error; SET_EVENT_REPORT with mode reporting */
+	uint32_t dpm_pipes[2];                                           /* laurel 2942: the data session */
+	int wda_sets, wda_err, wds_bind[2], wds_family[2], wds_start[2], start_family[2], start_err[2], wds_mux;
+	bool online_after_format;
 } M;
+static int m_fails;
+#define CHECK_M(c) do { if (!(c)) { fprintf(stderr, "FAIL modem check line %d: %s\n", __LINE__, #c); m_fails++; } } while (0)
 static uint32_t q_port[32], q_len[32];
 static uint8_t q_msg[32][512];
 static int q_n;
@@ -148,7 +158,12 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 		answer(src_port, 2, txn, msg, 0, tl, tn);
 		break;
 	case 0x4013:                                        /* DMS */
-		if (msg == 0x0023) {
+		if (msg == 0x0001) {
+			M.event_reports += d[7] == 0x14 && d[10] == 1;
+		} else if (msg == 0x0020) {
+			static const uint8_t cap[14] = { 0x00, 0x75, 0x12, 0x03, 0x00, 0x10, 0x5E, 0x5F, 1, 1, 3, 4, 5, 8 };
+			put_tlv(tl, &tn, 0x01, cap, sizeof(cap));
+		} else if (msg == 0x0023) {
 			put_tlv(tl, &tn, 0x01, "MPSS.AT.4.3.1.c1-00047", 22);
 		} else if (msg == 0x002D) {
 			uint8_t m;
@@ -164,6 +179,20 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 			}
 			m = (uint8_t)M.opmode;
 			put_tlv(tl, &tn, 0x01, &m, 1);
+			{
+				uint16_t why = 0;
+				put_tlv(tl, &tn, 0x10, &why, 2);
+				put_tlv(tl, &tn, 0x11, &m, 1);
+			}
+		} else if (msg == 0x002E && d[10] == 1) {
+			M.set_lpm++;
+			if (M.lpm_refuse != 0) {
+				answer(src_port, 2, txn, msg, (uint16_t)M.lpm_refuse, tl, 0);
+				return;
+			}
+			if (!M.mode_sticky) {
+				M.opmode = 1;
+			}
 		} else if (msg == 0x002E) {
 			M.set_online++;
 			if (M.set_refuse_left != 0) {
@@ -171,7 +200,10 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 				answer(src_port, 2, txn, msg, 0x34, tl, 0);
 				return;
 			}
-			M.opmode = 0;
+			if (!M.mode_sticky) {
+				M.opmode = 0;
+			}
+			M.online_after_format = M.wda_sets > 0;
 		}
 		answer(src_port, 2, txn, msg, 0, tl, tn);
 		break;
@@ -210,6 +242,63 @@ topaz_qrtr_data(uint32_t src_port, uint32_t node, uint32_t port, const void *dat
 		put_tlv(tl, &tn, 0x14, "airtelgprs.com", 14);
 		answer(src_port, 2, txn, msg, 0, tl, tn);
 		break;
+	case 0x4017:                                        /* laurel 2942: DPM */
+		if (d[7] == 0x11 && d[10] == 1) {
+			uint32_t w[4];
+			memcpy(w, d + 11, 16);
+			CHECK_M(w[0] == 4 && w[1] == 1);
+			M.dpm_pipes[0] = w[2];
+			M.dpm_pipes[1] = w[3];
+		}
+		answer(src_port, 2, txn, msg, 0, tl, 0);
+		break;
+	case 0x4018: {                                      /* WDA */
+		uint32_t link = 2, ul = 5;
+		M.wda_sets++;
+		put_tlv(tl, &tn, 0x11, &link, 4);
+		put_tlv(tl, &tn, 0x12, &ul, 4);
+		put_tlv(tl, &tn, 0x13, &ul, 4);
+		answer(src_port, 2, txn, msg, (uint16_t)M.wda_err, tl, tn);
+		break;
+	}
+	case 0x4019:
+	case 0x401A: {                                      /* WDS, one client per family */
+		int f = src_port == 0x4019 ? 0 : 1;
+		if (msg == 0x00A2) {
+			M.wds_bind[f]++;
+			M.wds_mux = d[21];                  /* TLV 0x10 (3 + 8 bytes), then TLV 0x11 */
+		} else if (msg == 0x004D) {
+			M.wds_family[f] = d[10];
+		} else if (msg == 0x0020) {
+			uint32_t h = 0x1000u + (uint32_t)f;
+			uint16_t reason = 12;
+			M.wds_start[f]++;
+			M.start_family[f] = d[10];
+			if (M.start_err[f] != 0) {
+				put_tlv(tl, &tn, 0x10, &reason, 2);
+				answer(src_port, 2, txn, msg, (uint16_t)M.start_err[f], tl, tn);
+				return;
+			}
+			put_tlv(tl, &tn, 0x01, &h, 4);
+		} else if (msg == 0x002D && f == 0) {
+			uint32_t v;
+			v = 0x0A000002; put_tlv(tl, &tn, 0x1E, &v, 4);
+			v = 0xFFFFFFFC; put_tlv(tl, &tn, 0x21, &v, 4);
+			v = 0x0A000001; put_tlv(tl, &tn, 0x20, &v, 4);
+			v = 0x08080808; put_tlv(tl, &tn, 0x15, &v, 4);
+			v = 1430;       put_tlv(tl, &tn, 0x29, &v, 4);
+		} else if (msg == 0x002D) {
+			uint8_t a[17] = { 0x24, 0x01 }, g[17] = { 0xFE, 0x80 }, n1[16] = { 0x20, 0x01 };
+			uint32_t v = 1430;
+			a[15] = 2; a[16] = 64; g[15] = 1; g[16] = 64; n1[15] = 0x88;
+			put_tlv(tl, &tn, 0x25, a, 17);
+			put_tlv(tl, &tn, 0x26, g, 17);
+			put_tlv(tl, &tn, 0x27, n1, 16);
+			put_tlv(tl, &tn, 0x29, &v, 4);
+		}
+		answer(src_port, 2, txn, msg, 0, tl, tn);
+		break;
+	}
 	default:
 		break;
 	}
@@ -232,9 +321,38 @@ laurel_ipa_state(const char **why)
 	return test_ipa_on;
 }
 
+/* laurel 2942: the AP pipes and the interface are stand-ins here; data_test.c tests the pipes. Default: no pipes, as an image without them */
+static int test_data_state = -1;
+int
+laurel_ipa_data_state(const char **why)
+{
+	if (why != NULL) {
+		*why = "no AP GSI data pipes yet";
+	}
+	return test_data_state;
+}
+static struct { bool up; uint32_t ip, mask, gw, dns1, dns2, mtu; } P4;
+static struct { bool up; uint8_t ip[16], plen, gw[16], dns1[16], dns2[16]; uint32_t mtu; } P6;
+void
+laurel_pdp_set4(bool up, uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns1, uint32_t dns2, uint32_t mtu)
+{
+	P4.up = up; P4.ip = ip; P4.mask = mask; P4.gw = gw; P4.dns1 = dns1; P4.dns2 = dns2; P4.mtu = mtu;
+}
+void
+laurel_pdp_set6(bool up, const uint8_t *ip, uint8_t plen, const uint8_t *gw, const uint8_t *dns1, const uint8_t *dns2, uint32_t mtu)
+{
+	P6.up = up;
+	if (up) {
+		memcpy(P6.ip, ip, 16); P6.plen = plen; memcpy(P6.gw, gw, 16); memcpy(P6.dns1, dns1, 16); memcpy(P6.dns2, dns2, 16); P6.mtu = mtu;
+	}
+}
+
 #include "laurel_cell.c"
+#include "laurel_cell_data.c"
+#include "laurel_pdp_text.h"
 #undef printf
 #include "cellbar_state.h"
+#include "celld_net.h"
 
 /* ---------------------------------------------------------------- driver */
 
@@ -273,6 +391,13 @@ services(bool uim)
 	laurel_cell_server(0x45, 0x101, 0, 0x34, true);     /* WLFW: not ours */
 }
 
+static void
+data_services(void)
+{
+	laurel_cell_server(0x2F, 0x101, 0, 0x40, true);
+	laurel_cell_server(0x1A, 0x101, 0, 0x41, true);
+}
+
 static const char *
 last(void)
 {
@@ -291,6 +416,7 @@ modem_defaults(void)
 }
 
 #include "cell_test2.h"
+#include "cell_test3.h"
 
 static void
 scenario(char s)
@@ -387,8 +513,10 @@ scenario(char s)
 		break;
 	default:
 		scenario2(s);
+		scenario3(s);
 		break;
 	}
+	fails += m_fails;
 	if (fails) {
 		fprintf(stderr, "---- log of %s:\n%s", scen, logbuf);
 	} else {
@@ -400,7 +528,7 @@ scenario(char s)
 int
 main(void)
 {
-	const char *all = "ABCDEFGHIJKLMNO";
+	const char *all = "ABCDEFGHIJKLMNOPQRSTUVW";
 	int bad = 0;
 
 	for (const char *p = all; *p; p++) {

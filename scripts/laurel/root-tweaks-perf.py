@@ -11,7 +11,8 @@ its label. A name that has no job prints one line and is no error (the root may 
 Evidence [V logs/laurel-boot-1907.txt, laurel-boot-1934.txt of 2026-11-01]:
   nanotimekitcompaniond  48 starts in 9 min, median gap 11 s, no CRASH line: Apple Watch face companion; no watch here.
   wifip2pd               51 starts in 9 min, median gap 10 s, no CRASH line: Wi-Fi Direct / AWDL daemon; the Mi A3 port has
-                         no AWDL code (wifi.md has none). Put it back (PERF_DROP_JOBS) when AWDL comes (docs/airdrop-plan.md, negroni).
+                         no AWDL here: no awdl0, no AWDL data path (docs/laurel_sprout/airplay-airdrop.md: the evidence and when it may come back;
+                         the kernel's LAUREL AWDL line must say "on" first).
   syncdefaultsd          13 CRASH sig 6 in the first 4 min of boot 19:34, then launchd gives up.
 Each start also runs one xpcproxy. [I] Cost: small on average (bound in the doc), but each start wakes the governor.
 """

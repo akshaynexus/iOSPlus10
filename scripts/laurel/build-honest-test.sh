@@ -59,6 +59,7 @@ if sys.argv[2] == os.environ.get('FAKE_NO_TUNING'):
 open(sys.argv[3], 'w').write('x')
 EOF
   printf 'import sys\n' > "$R/scripts/laurel/metal-gate-job.py"; cp "$R/scripts/laurel/metal-gate-job.py" "$R/scripts/laurel/metal-job-env.py"
+  cp "$REPO/scripts/laurel/celld-job.py" "$R/scripts/laurel/celld-job.py"     # real: it edits the fake root's launchd cache
   printf 'print("stub")\n' > "$R/scripts/ios16/jetsam_widgets.py"; : > "$R/scripts/ios16/root-tweaks-extra.py"; : > "$R/scripts/ios16/root-tweaks-boldtext.py"
   cat > "$R/scripts/net/root-add-ssh.py" <<'EOF'
 import os, plistlib, sys
@@ -74,7 +75,7 @@ EOF
   echo laurel > "$R/patches/laurel/xnu/2000-c.patch"; echo fix > "$R/patches/laurel/xnu-linux-fixes/0100-d.patch"; echo skips > "$R/patches/laurel/known-skips.txt"
   for f in 0001-kalloc-stock-clang-void-ptr.patch 0003-corecrypto-sha256-asm-operands.patch; do echo "$f" > "$R/external/ios-sweet-linux/linux/fixes/$f"; done
   for d in userland/laurel/gpu userland/laurel/metal userland/laurel/hevc userland/laurel/audio userland/laurel/bt userland/bluetooth userland/laurel/camera \
-           userland/camera userland/laurel/flashlight userland/laurel/notch userland/laurel/cell userland/laurel/xnutils userland/rebootapp userland/ssh; do mkdir -p "$R/$d"; echo src > "$R/$d/src.c"; done
+           userland/camera userland/laurel/flashlight userland/laurel/notch userland/laurel/cell userland/laurel/xnutils userland/laurel/airplay userland/rebootapp userland/ssh; do mkdir -p "$R/$d"; echo src > "$R/$d/src.c"; done
   echo gate > "$R/userland/laurel/metal/metal_gate.c"
   find "$R/userland" "$R/patches" "$R/external" -type f -exec touch -d '2 days ago' {} +
   git -C "$R" init -q; git -C "$R" add -A scripts patches userland; git -C "$R" -c user.name=t -c user.email=t@t commit -qm fake
@@ -83,7 +84,7 @@ make_stages() {
   local G=$R/out/laurel/gpu/root B=$R/out/metal/stage/System/Library/Extensions/NegroniMetal.bundle C=$R/out/laurel/camera
   mkdir -p "$G/topaz/lib" "$G/usr/libexec" "$G/usr/share/firmware/laurel" "$B" "$R/out/metal/stage/usr/local/bin" "$R/out/laurel/hevc" "$R/out/laurel/audio/RedwoodAudio.driver" \
     "$R/out/laurel/bt" "$C/ios/NegroniCamera.driver" "$C/lib" "$R/out/laurel/flashlight/LaurelFlashlight.driver" "$R/out/laurel/notch/root/usr/local/lib" \
-    "$R/out/laurel/notch/root/usr/local/libexec" "$R/out/laurel/cell/root/usr/local/lib" "$R/out/ssh/ios"
+    "$R/out/laurel/notch/root/usr/local/libexec" "$R/out/laurel/cell/root/usr/local/lib" "$R/out/laurel/cell/root/usr/local/libexec" "$R/out/ssh/ios"
   for f in libOSMesa.8.dylib libtopaz-gl.dylib libtopaz-inject.dylib; do echo x > "$G/topaz/lib/$f"; done
   macho "$G/usr/libexec/backboardd.wrap" 2 /usr/libexec/real/backboardd; echo x > "$G/usr/libexec/laurel-metal-gate"
   echo x > "$G/usr/share/firmware/laurel/a610_zap.mdt"; echo x > "$G/usr/share/firmware/laurel/a610_zap.b00"
@@ -97,11 +98,13 @@ make_stages() {
   macho "$R/out/laurel/notch/root/usr/local/lib/liblaurel-notch.dylib" 6
   macho "$R/out/laurel/notch/root/usr/local/libexec/laurel-springboard" 2 /System/Library/CoreServices/SpringBoard.app/SpringBoard
   macho "$R/out/laurel/cell/root/usr/local/lib/liblaurel-cellbar.dylib" 6
+  macho "$R/out/laurel/cell/root/usr/local/libexec/laurel-celld" 2
   echo x > "$R/out/ssh/ios/dropbearmulti"; echo x > "$R/out/ssh/ios/laurelnet"
   local X=$R/out/laurel/xnutils/root
   mkdir -p "$X/Applications/XNUtils.app" "$X/usr/local/libexec" "$X/usr/local/bin"
   echo x > "$X/Applications/XNUtils.app/XNUtils"; chmod +x "$X/Applications/XNUtils.app/XNUtils"; echo x > "$X/Applications/XNUtils.app/Info.plist"
   echo x > "$X/usr/local/libexec/powermenu-helper"; echo x > "$X/usr/local/bin/pmregister"
+  mkdir -p "$R/out/laurel/airplay/root/usr/libexec"; echo x > "$R/out/laurel/airplay/root/usr/libexec/laurel-airplay"; chmod +x "$R/out/laurel/airplay/root/usr/libexec/laurel-airplay"
 }
 make_root() {
   rm -rf -- "$ROOT"
@@ -169,14 +172,14 @@ expect "hevc source newer than its stage" 1 "hevc: stage is older than userland/
 touch -d '2 days ago' "$R/userland/laurel/hevc/src.c"; touch "$R/out/laurel/hevc/HEVCH8.videodecoder"
 echo "== features on a copy of a fake root"
 man preflight --inputs "$T/in" > /dev/null
-expect "all installed, exit 0" 0 "13 installed, 0 off by their own switch, 0 missing" features env
+expect "all installed, exit 0" 0 "14 installed, 0 off by their own switch, 0 missing" features env
 expect "root manifest: first line + table" 0 "kernel-series" head -1 "$ROOT/usr/share/laurel/root-manifest"
 expect "root manifest: rows" 0 "feature	camera	installed" cat "$ROOT/usr/share/laurel/root-manifest"
 make_root; mv "$R/out/laurel/hevc/HEVCH8.videodecoder" "$T/h"; printf '#!/bin/sh\nexit 1\n' > "$R/scripts/laurel/hevc-build.sh"; chmod +x "$R/scripts/laurel/hevc-build.sh"
 expect "hevc build failed: missing, exit 1, reason from its step" 1 "hevc        missing" features env
 cp "$T/o" "$T/o.hevc"; expect "... its reason" 0 "hevc-build.sh failed" cat "$T/o.hevc"
 mv "$T/h" "$R/out/laurel/hevc/HEVCH8.videodecoder"
-make_root; expect "HEVC=0 CAMERA=0 BT=0: off, exit 0; flashlight falls to its own plug-in" 0 "10 installed, 3 off by their own switch, 0 missing" features env HEVC=0 CAMERA=0 BT=0
+make_root; expect "HEVC=0 CAMERA=0 BT=0: off, exit 0; flashlight falls to its own plug-in" 0 "11 installed, 3 off by their own switch, 0 missing" features env HEVC=0 CAMERA=0 BT=0
 expect "... LaurelFlashlight in the root" 0 "" test -f "$ROOT/System/Library/Audio/Plug-Ins/HAL/LaurelFlashlight.driver/LaurelFlashlight"
 make_root; expect "camera without one colour tuning: missing, the file named" 1 "camera-imx586-qtech.isp" features env FAKE_NO_TUNING=qtech
 make_root; rm -f "$R/out/laurel/gpu/root/topaz/lib/libtopaz-gl.dylib"
@@ -184,7 +187,7 @@ expect "no GPU stage: missing, and Metal says what it says" 1 "gpu         missi
 echo x > "$R/out/laurel/gpu/root/topaz/lib/libtopaz-gl.dylib"
 make_root; rm -rf -- "$ROOT/Library/Audio/Tunings"; expect "audio without speaker tunings: missing" 1 "Library/Audio/Tunings/D22" features env
 make_root; expect "again all installed" 0 "0 missing" features env
-make_root; expect "CELL=0: off, exit 0" 0 "12 installed, 1 off by their own switch, 0 missing" features env CELL=0
+make_root; expect "CELL=0: off, exit 0" 0 "13 installed, 1 off by their own switch, 0 missing" features env CELL=0
 make_root; expect "NOTCH=0: cell off with it, exit 0" 0 "cell        off" features env NOTCH=0
 make_root
 echo "== the race: a script changed during the run"
@@ -230,7 +233,7 @@ mv "$T/bt.saved" "$R/out/laurel/bt"
 echo "== build-all with stub stages"
 mkdir -p "$R/userland/ssh" "$R/userland/laurel/camera" "$R/userland/laurel/audio" "$R/userland/laurel/bt" "$R/out/laurel-kernel/theos/toolchain/linux/iphone/bin"
 printf '#!/bin/sh\n' > "$R/out/laurel-kernel/theos/toolchain/linux/iphone/bin/ld"; chmod +x "$R/out/laurel-kernel/theos/toolchain/linux/iphone/bin/ld"
-for s in scripts/laurel/{camera-inventory,gpu-firmware,gpu-userland,metal-build,notch-build,cell-build,hevc-build,xnutils-build,kernel-linux,uefi-image}.sh userland/laurel/{camera,audio,bt,flashlight}/build.sh userland/ssh/{fetch,fetch-sdk,build}.sh; do
+for s in scripts/laurel/{camera-inventory,gpu-firmware,gpu-userland,metal-build,notch-build,cell-build,hevc-build,xnutils-build,airplay-build,kernel-linux,uefi-image}.sh userland/laurel/{camera,audio,bt,flashlight}/build.sh userland/ssh/{fetch,fetch-sdk,build}.sh; do
   mkdir -p "$(dirname "$R/$s")"; printf '#!/bin/sh\nexit 0\n' > "$R/$s"; chmod +x "$R/$s"
 done
 git -C "$R" add -A scripts userland; git -C "$R" -c user.name=t -c user.email=t@t commit -qm stubs

@@ -1,6 +1,10 @@
 # Plan and status
 
 ## Branch `laurel-sprout`: Xiaomi Mi A3 port (2026-10-31)
+AirPlay and AirDrop round (2026-11-01, branch t3/laurel-airplay-airdrop, patches 2930 + 2931, NOT RUN ON THE PHONE): owner "AirPlay and AirDrop both aren't working: enable or fix them". docs/laurel_sprout/airplay-airdrop.md.
+Done: `LAUREL AWDL` self-check (only looks at scanned frames; sends nothing; awdl=0); `laurel-airplay` job and `LAUREL AIRPLAY` line (airplay=0, AIRPLAY=0); AirDrop preferences for en0 (AIRDROP_LAN=0); wifip2pd stays out.
+[V] qcacld monitor device has no Tx, OWL needs injection; negroni 0347 has no data path and never ran. [I] no awdl0 is the right state now. [V] mirroring has no AppleAVE2Driver. [I] Apple TV/HomePod may fail at /fp-setup or PTP. [U] AirPlay audio on en0: no blocker found, no run log.
+Results [V]: see the airplay-airdrop section in docs/notes.md. Next: root with t3/laurel-safari-net merged, boot, test steps in section 7 of the doc; the log decides the AirPlay fix; `first AWDL frame heard` decides whether the IBSS test is worth doing.
 Microphone round (2026-11-01, branch t3/laurel-mic, patch 2920 + plug-in mic-input.patch, built + host tests, NOT BOOTED): owner "Voice input is not working."
 Done: AMIC1 -> WCD937x ADC1 -> SoundWire TX -> TX macro DEC0 -> TX_CDC_DMA_TX_3 -> ADM -> ASM session 2 -> /dev/redwood-mic -> plug-in "Codec". On by default, mic=0, `LAUREL MIC: on|off`, `LAUREL MIC: first capture: rms N`. Capture gain (HAL + ioctl). XNUtils row. Camera hook stays, with a line that decides. Headphones + earpiece not done.
 Results [V]: 297/297 patches, 0 LSE, printf check OK, kernel sha256 570f52c889b9bece; plug-in 2a4afb9a810dc0ed; armv80-check kernel 21 (no new), plug-ins 0; mic-host-test + xnutils-test PASS. Nothing ran on the phone. Next: boot image + root flash (owner approves), docs/laurel_sprout/audio.md "Microphone", test steps.
@@ -1018,3 +1022,16 @@ Done: `root-delta.py` in `root.sh` (stat snapshot after mkiosroot, delta after t
 Results [V]: root-update-test.sh 93/93 with GNU tools, 93/93 with toybox + dash; root-dry-run.sh PASS (13 features, 9740 paths, 593 MB on the copy); build-honest-test.sh 60/60; first update simulated with the real launchd.plist and /var plists of the 21:57 image.
 Unproven: real write on XNU/HFS+, `pmregister` on this root, `ctl reboot` after the commit; `sudo root.sh` itself was not run here (sudo needs a password), so owners and setuid of the real payload are not yet seen.
 Next: owner runs `scripts/bg.sh rupd-phone scripts/laurel/update-phone.sh` (or `BUILD=0` after a root.sh). First `scripts/laurel/root-update.sh --dry-run`.
+## Mi A3: radio online + mobile data built (2026-11-01, branch t3/laurel-cellular-radio, patches 2940-2942, `laurel-celld`; build + host tests, NOT BOOTED)
+Owner: network first. Phone [V boot 22:50]: IPA handshake passes, no crash, Wi-Fi on; DMS 5 for the whole boot blocked ONLINE. Docs: docs/laurel_sprout/cellular.md section 11 (cause table, risk per step, expected lines, test order).
+Done: 2940: no block on mode 5 after 20 s: low power + ONLINE, 6 bounded rounds, each answer one line; mode reason + hardware restricted, DMS indication, modem caps, NAS bind ok line, state keys. 2941: AP pipes 1, 9, 8 (GSI rings, endpoints, QMAP, polled). 2942: DPM, WDA, per-family WDS session, `pdp_ip0`, `kern.laurel_cell_net`. `laurel-celld` + launchd job: the service in configd.
+Build [V]: 307/307 patches, 0 failed, 0 LSE, printf-arg-check OK, kernel sha256 10eb748e318af1cf, series 65f59ea3a66db510; laurel-celld + liblaurel-cellbar armv80 clean; test-cell 23/23; test-ipa PASS (vendor part skipped); build-honest-test 60/60; xnutils-test PASS; root-cell.sh on the real 20H392 launchd cache: job in, 524 jobs. No root image: sudo needs a password here.
+Facts [V firmware]: LTE at most (`device_config.xml` no NR letter), DSDS L+L, max_active_voice 1. MCFG reads only digests: no activation.
+Unproven: ONLINE at mode 5 ([U], the main risk, an assert stops Wi-Fi for the boot); registration; bars with real values; every data step; IPMonitor key names and Wi-Fi-first ranking [I]. Not built: LTE tag, Settings > Cellular, default SIM, network search, SMS, calls, APN setting.
+`ipa=0` stays default in uefi-image.sh. Next: normal image, then `IPA_TEST=1` image; section 11.6.
+
+## Mi A3: radio online, registration denied (2026-11-01 23:42, coordinator; last iOS flash, owner moved to Android)
+
+[V, logs/laurel-boot-radio.txt, IPA test image on the 22:xx root] IPA on; `DMS SET_OPERATING_MODE online: ok`, `operating mode online (raw 0)`; `modem radio technologies: GSM,UMTS,LTE` (no 5G); no modem crash in 2 min; `nas1/nas2 BIND_SUBSCRIPTION: ok`.
+Then at 23:43:59-23:44:37: card state USIM/7 -> USIM/6, `SIM1 present (USIM illegal), SIM2 present (USIM illegal); modem online; SIM1 registration denied rssi -104; SIM2 registration denied`. Cause unknown.
+Owner rule from now on: no flashing unless the owner asks. Code work goes on and is pushed to laurel-sprout.

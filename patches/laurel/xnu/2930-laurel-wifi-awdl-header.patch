@@ -1,0 +1,23 @@
+laurel 2930: Wi-Fi: LaurelWifiAwdl.h: is this management frame an AWDL action frame (pure code, host test).
+
+diff --git a/iokit/Kernel/arm/LaurelWifiAwdl.h b/iokit/Kernel/arm/LaurelWifiAwdl.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/LaurelWifiAwdl.h
+@@ -0,0 +1,16 @@
++/*
++ * laurel 2930: is this management frame an AWDL action frame? Pure code like LaurelWifiPath.h, tested on the host by
++ * scripts/laurel/wifi-phy-test.sh. Layout from external/owl/src/frame.h (seemoo-lab/owl): no OWL code is copied.
++ * Action frame (0xD0): category 127 (vendor) at 24, OUI 00:17:f2 at 25, type 8 at 28, version at 29, subtype at 30 (PSF 0, MIF 3).
++ */
++#ifndef LAUREL_WIFI_AWDL_H
++#define LAUREL_WIFI_AWDL_H
++
++static inline bool
++lw_awdl_frame(const uint8_t *f, uint32_t len)
++{
++	return len >= 31 && f[0] == 0xD0 && f[24] == 127 && f[25] == 0x00 && f[26] == 0x17 && f[27] == 0xF2 && f[28] == 8 &&
++	       (f[30] == 0 || f[30] == 3);
++}
++
++#endif /* LAUREL_WIFI_AWDL_H */
