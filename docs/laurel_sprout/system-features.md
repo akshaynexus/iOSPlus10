@@ -44,7 +44,7 @@ Actions: **ON** = enabled by this branch. **DRIVER** = needs a driver. **OFF** =
 | Microphone: Voice Memos, Siri, calls | `audio.md` "Microphone": analog AMIC1 on WCD937x + SoundWire | **DRIVER built, not booted** (patch 2920). Voice Memos: test steps there. Siri: needs network services [U]. Calls: no cell path |
 | Front, depth, ultrawide cameras | `camera.md`: rear IMX586 only | **DRIVER** |
 | Hardware video decode | [V] log: `AppleVXD375/390` -> none | **DRIVER**. Wallpaper HEIC is solved by `root-wallpaper.sh` |
-| AirDrop, AWDL: `wifip2pd` | [V] 76 starts in 15 min, no crash line. `wifi.md` has no AWDL | **DRIVER**. Stays off (`root-tweaks-perf.py`); put back when AWDL comes |
+| AirDrop, AWDL: `wifip2pd` | [V] 76 starts in 15 min, no crash line. No AWDL data path on this firmware (`airplay-airdrop.md`) | **DRIVER, off by the evidence**. `LAUREL AWDL: off: ...`. `wifip2pd` stays out (`root-tweaks-perf.py`). AirDrop on en0 only (`root-airdrop-lan.py`) |
 | Face ID, Touch ID | [V] log: `ApplePearlSEPDriver`, `pearl-sep` -> none. No SEP | **DRIVER**. Passcode only |
 | USB accessories, MagSafe, thermal/`ApplePPM` | [V] log: `IOAccessoryManager`, `AppleHPMDevice`, `ApplePPM` -> 0 | **DRIVER**, no user request |
 

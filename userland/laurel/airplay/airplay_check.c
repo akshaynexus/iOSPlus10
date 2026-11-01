@@ -10,7 +10,7 @@
  *   mirroring: the encoder of AppleVideoEncoder.bundle, IOService AppleAVE2Driver.
  *
  * One line on the console (USB log) and in syslog, one more when it changes (at most 3 tries):
- *   LAUREL AIRPLAY: on: en0 192.168.1.5, _airplay._tcp 2, _raop._tcp 3 heard; sender up; fp-setup off: ...; buffered audio off: ...; mirroring off: ...
+ *   LAUREL AIRPLAY: on: en0 192.168.1.5, default route en0, _airplay._tcp 2, _raop._tcp 3 heard; sender up; fp-setup off: ...; buffered audio off: ...; mirroring off: ...
  *   LAUREL AIRPLAY: off: <reason>
  * Kill switch: boot-arg airplay=0. A failure here cannot touch Wi-Fi: it only reads.
  */
@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <syslog.h>
 #include <time.h>
@@ -100,6 +101,31 @@ en0_ipv4(char *out, size_t n)
 	}
 	freeifaddrs(all);
 	return found;
+}
+
+/*
+ * Does the default route go through en0? A UDP connect() picks the route and sends nothing. docs/laurel_sprout/wifi.md "No page loads": with ue0 first, no name
+ * resolves over Wi-Fi. A receiver on the LAN is on-link either way, so this is one word on the line, not a verdict.
+ */
+static bool
+default_route_is(const char *ip)
+{
+	struct sockaddr_in to = { .sin_len = sizeof(to), .sin_family = AF_INET, .sin_port = htons(9) }, me;
+	socklen_t len = sizeof(me);
+	char got[64] = "";
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	bool same = false;
+
+	if (fd < 0) {
+		return false;
+	}
+	to.sin_addr.s_addr = htonl(0x01010101);
+	if (connect(fd, (struct sockaddr *)&to, sizeof(to)) == 0 && getsockname(fd, (struct sockaddr *)&me, &len) == 0 &&
+	    inet_ntop(AF_INET, &me.sin_addr, got, sizeof(got)) != NULL) {
+		same = strcmp(got, ip) == 0;
+	}
+	close(fd);
+	return same;
 }
 
 static bool
@@ -196,7 +222,7 @@ main(void)
 {
 	char ip[64] = "";
 	time_t start = time(NULL);
-	bool sender, fp, ptp, ave;
+	bool sender, fp, ptp, ave, route;
 
 	if (switched_off()) {
 		say("off: boot-arg airplay=0");
@@ -212,6 +238,7 @@ main(void)
 	fp = mach_service("com.apple.fairplayd.versioned");
 	ptp = io_service("IOTimeSyncDomain");
 	ave = io_service("AppleAVE2Driver") || io_service("AppleAVEDriver");
+	route = default_route_is(ip);
 	for (int t = 0; t < TRIES; t++) {
 		struct seen airplay = { 0 }, raop = { 0 };
 		int err;
@@ -225,9 +252,9 @@ main(void)
 		} else if (!sender) {
 			say("off: no com.apple.airplay.sender.xpc: mediaserverd has no AirPlay sender");
 		} else if (airplay.count + raop.count == 0) {
-			say("off: no receiver heard on en0 (%s) in %d s: _airplay._tcp 0, _raop._tcp 0", ip, BROWSE_S);
+			say("off: no receiver heard on en0 (%s, default route %s) in %d s: _airplay._tcp 0, _raop._tcp 0", ip, route ? "en0" : "not en0", BROWSE_S);
 		} else {
-			say("on: en0 %s, _airplay._tcp %u, _raop._tcp %u heard; sender up; fp-setup %s; buffered audio %s; mirroring %s", ip, airplay.count, raop.count,
+			say("on: en0 %s, default route %s, _airplay._tcp %u, _raop._tcp %u heard; sender up; fp-setup %s; buffered audio %s; mirroring %s", ip, route ? "en0" : "not en0", airplay.count, raop.count,
 			    fp ? "on" : "off: no fairplayd", ptp ? "on" : "off: no IOTimeSyncDomain", ave ? "on" : "off: no AppleAVE2Driver (H.264 encoder)");
 			return 0;
 		}

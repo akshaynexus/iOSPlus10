@@ -169,14 +169,14 @@ expect "hevc source newer than its stage" 1 "hevc: stage is older than userland/
 touch -d '2 days ago' "$R/userland/laurel/hevc/src.c"; touch "$R/out/laurel/hevc/HEVCH8.videodecoder"
 echo "== features on a copy of a fake root"
 man preflight --inputs "$T/in" > /dev/null
-expect "all installed, exit 0" 0 "13 installed, 0 off by their own switch, 0 missing" features env
+expect "all installed, exit 0" 0 "14 installed, 0 off by their own switch, 0 missing" features env
 expect "root manifest: first line + table" 0 "kernel-series" head -1 "$ROOT/usr/share/laurel/root-manifest"
 expect "root manifest: rows" 0 "feature	camera	installed" cat "$ROOT/usr/share/laurel/root-manifest"
 make_root; mv "$R/out/laurel/hevc/HEVCH8.videodecoder" "$T/h"; printf '#!/bin/sh\nexit 1\n' > "$R/scripts/laurel/hevc-build.sh"; chmod +x "$R/scripts/laurel/hevc-build.sh"
 expect "hevc build failed: missing, exit 1, reason from its step" 1 "hevc        missing" features env
 cp "$T/o" "$T/o.hevc"; expect "... its reason" 0 "hevc-build.sh failed" cat "$T/o.hevc"
 mv "$T/h" "$R/out/laurel/hevc/HEVCH8.videodecoder"
-make_root; expect "HEVC=0 CAMERA=0 BT=0: off, exit 0; flashlight falls to its own plug-in" 0 "10 installed, 3 off by their own switch, 0 missing" features env HEVC=0 CAMERA=0 BT=0
+make_root; expect "HEVC=0 CAMERA=0 BT=0: off, exit 0; flashlight falls to its own plug-in" 0 "11 installed, 3 off by their own switch, 0 missing" features env HEVC=0 CAMERA=0 BT=0
 expect "... LaurelFlashlight in the root" 0 "" test -f "$ROOT/System/Library/Audio/Plug-Ins/HAL/LaurelFlashlight.driver/LaurelFlashlight"
 make_root; expect "camera without one colour tuning: missing, the file named" 1 "camera-imx586-qtech.isp" features env FAKE_NO_TUNING=qtech
 make_root; rm -f "$R/out/laurel/gpu/root/topaz/lib/libtopaz-gl.dylib"
@@ -184,7 +184,7 @@ expect "no GPU stage: missing, and Metal says what it says" 1 "gpu         missi
 echo x > "$R/out/laurel/gpu/root/topaz/lib/libtopaz-gl.dylib"
 make_root; rm -rf -- "$ROOT/Library/Audio/Tunings"; expect "audio without speaker tunings: missing" 1 "Library/Audio/Tunings/D22" features env
 make_root; expect "again all installed" 0 "0 missing" features env
-make_root; expect "CELL=0: off, exit 0" 0 "12 installed, 1 off by their own switch, 0 missing" features env CELL=0
+make_root; expect "CELL=0: off, exit 0" 0 "13 installed, 1 off by their own switch, 0 missing" features env CELL=0
 make_root; expect "NOTCH=0: cell off with it, exit 0" 0 "cell        off" features env NOTCH=0
 make_root
 echo "== the race: a script changed during the run"
